@@ -61,14 +61,10 @@ impl Network for ChannelNetwork {
     }
 
     fn broadcast(&mut self, message: Message) {
-        let me_bytes = self.me.to_bytes();
-        for (key_bytes, inbox) in self.all_inboxes.iter() {
-            if *key_bytes != me_bytes {
-                inbox
-                    .lock()
-                    .unwrap()
-                    .push_back((self.me, message.clone()));
-            }
+        // hotstuff_rs expects the proposer to receive its own broadcast
+        // (the algorithm thread waits for a Proposal even if it is the proposer).
+        for (_key_bytes, inbox) in self.all_inboxes.iter() {
+            inbox.lock().unwrap().push_back((self.me, message.clone()));
         }
     }
 

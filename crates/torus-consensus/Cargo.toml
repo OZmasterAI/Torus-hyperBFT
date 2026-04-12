@@ -6,7 +6,6 @@ license.workspace = true
 
 [dependencies]
 torus-types = { workspace = true }
-torus-bridge = { workspace = true }
 torus-state = { workspace = true }
 hotstuff_rs = { workspace = true }
 rocksdb = { workspace = true }

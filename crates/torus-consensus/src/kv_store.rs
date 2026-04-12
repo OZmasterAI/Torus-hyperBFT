@@ -119,10 +119,8 @@ impl KVStore for RocksKVStore {
             .expect("cf_consensus_meta missing");
         let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
         let mut batch = rocksdb::WriteBatch::default();
-        for item in iter {
-            if let Ok((key, _)) = item {
-                batch.delete_cf(cf, &key);
-            }
+        for (key, _) in iter.flatten() {
+            batch.delete_cf(cf, &key);
         }
         if !batch.is_empty() {
             self.db.write(batch).expect("RocksDB clear failed");
@@ -159,8 +157,10 @@ mod tests {
         assert_eq!(store.get(b"key2").unwrap(), b"value2");
 
         // Snapshot reads
-        let snap = store.snapshot();
-        assert_eq!(snap.get(b"key1").unwrap(), b"value1");
+        {
+            let snap = store.snapshot();
+            assert_eq!(snap.get(b"key1").unwrap(), b"value1");
+        }
 
         // Delete
         let mut wb = RocksWriteBatch::new();
