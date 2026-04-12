@@ -7,5 +7,9 @@ license.workspace = true
 [dependencies]
 torus-types = { workspace = true }
 torus-state = { workspace = true }
-# Heavy deps added when implementing (task 1.3):
-# revm, alloy-eips
+revm = { workspace = true }
+alloy-primitives = { workspace = true }
+sha3 = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
