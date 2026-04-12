@@ -51,10 +51,11 @@ Phase 3                                                              ███�
 
 | ID | Task | Dependencies | Effort | Week |
 |---|---|---|---|---|
-| **1.1** | **Workspace scaffold** | None | 1 week | W1 |
+| **1.1** | **Workspace scaffold** (includes `torus-telemetry` crate) | None | 1 week | W1 |
 | 1.1.1 | Create Cargo workspace with all crate stubs | — | 2 days | W1 |
 | 1.1.2 | Define `torus-types`: Block, BlockHeader, StateDiff, ChainConfig | — | 2 days | W1 |
 | 1.1.3 | CI setup: cargo check, clippy, test, fmt | 1.1.1 | 1 day | W1 |
+| 1.1.4 | `torus-telemetry` crate: Prometheus metrics registry, `tracing` subscriber setup, `/health` endpoint | 1.1.1 | 2 days | W1 |
 | **1.2** | **State layer (torus-state)** | 1.1 | 3 weeks | W2-W4 |
 | 1.2.1 | RocksDB wrapper with column family layout | 1.1.2 | 3 days | W2 |
 | 1.2.2 | Implement revm `Database` trait over RocksDB | 1.2.1 | 4 days | W2-W3 |
@@ -78,6 +79,7 @@ Phase 3                                                              ███�
 | 1.4.3 | Implement hotstuff_rs `Network` trait (in-process channels for testing) | 1.4.2 | 2 days | W4 |
 | 1.4.4 | 4-node in-process consensus test (blocks producing) | 1.4.3 | 3 days | W4-W5 |
 | 1.4.5 | Validator set configuration from genesis | 1.4.2 | 2 days | W5 |
+| 1.4.6 | **Transport spike:** hotstuff_rs Network trait ↔ libp2p adapter prototype (de-risk R7) | 1.4.3 | 5 days | W5-W6 |
 | **1.5** | **Consensus-execution bridge (torus-bridge)** | 1.3, 1.4 | 4 weeks | W6-W9 |
 | 1.5.1 | Block proposal construction: pull from mempool, construct TorusBlock | 1.3.3, 1.4.2 | 3 days | W6 |
 | 1.5.2 | Block validation pipeline: execute EVM txs, verify state root | 1.5.1, 1.2.4 | 5 days | W7 |
@@ -99,7 +101,7 @@ Phase 3                                                              ███�
 | 1.7.6 | Kademlia DHT: peer discovery | 1.7.1 | 2 days | W9 |
 | **1.8** | **RPC layer (torus-rpc)** | 1.3, 1.6 | 3 weeks | W9-W11 |
 | 1.8.1 | jsonrpsee server setup with module registration | — | 2 days | W9 |
-| 1.8.2 | Core eth_* methods: chainId, blockNumber, getBalance, getCode, getStorageAt | 1.8.1 | 3 days | W9-W10 |
+| 1.8.2 | Core eth_* methods: chainId, blockNumber, getBalance, getCode, getStorageAt, getTransactionCount, gasPrice, maxPriorityFeePerGas, net_version, web3_clientVersion | 1.8.1 | 4 days | W9-W10 |
 | 1.8.3 | Transaction methods: sendRawTransaction, getTransactionByHash, getTransactionReceipt | 1.8.2 | 3 days | W10 |
 | 1.8.4 | Block methods: getBlockByNumber, getBlockByHash | 1.8.2 | 2 days | W10 |
 | 1.8.5 | Execution methods: eth_call, eth_estimateGas | 1.8.2 | 3 days | W10-W11 |
@@ -120,7 +122,8 @@ Phase 3                                                              ███�
 | 1.10.7 | Gas accounting: verify EIP-1559 fee behavior | 1.10.1 | 2 days | W14 |
 | 1.10.8 | State root consistency: all 4 validators agree on every block | 1.10.1 | 3 days | W14 |
 | 1.10.9 | Performance baseline: TPS benchmark, latency measurement | 1.10.1 | 2 days | W14-W15 |
-| 1.10.10 | Bug fix buffer | 1.10.1 | 5 days | W15 |
+| 1.10.10 | 24-hour soak test at 500 TPS — monitor memory, disk, RocksDB compaction, latency drift | 1.10.9 | 3 days | W15 |
+| 1.10.11 | Bug fix buffer (findings from integration + soak testing) | 1.10.1 | 5 days | W15-W16 |
 | **1.11** | **Basic staking (Phase 1 subset)** | 1.5 | 2 weeks | W10-W11 |
 | 1.11.1 | Delegate/undelegate state management | 1.2.1 | 3 days | W10 |
 | 1.11.2 | Epoch-based validator set rotation | 1.11.1, 1.4.5 | 3 days | W10-W11 |
@@ -137,9 +140,9 @@ Track A (State + EVM):
       ■■ ████████████ ██████████
       1.1  1.2           1.3
 
-Track B (Consensus):
-            ██████████████
-               1.4
+Track B (Consensus + Transport Spike):
+            ██████████████████
+               1.4 + 1.4.6
 
 Track C (Bridge): ──────────────────── dependent on A+B
                               ████████████████
@@ -162,7 +165,9 @@ Track G (Integration):
                                                 1.9   1.10  1.11
 ```
 
-**Parallelism:** Tracks A+B+D can run concurrently in weeks 1-6. Track C (bridge) is the critical convergence point. Tracks E+F can proceed once bridge works.
+**Parallelism:** Tracks A+B+D can run concurrently in weeks 1-6. Track C (bridge) is the critical convergence point. Tracks E+F can proceed once bridge works. Transport spike (1.4.6) runs in parallel with bridge work to de-risk the libp2p ↔ hotstuff_rs integration before Track E.
+
+**Telemetry:** `torus-telemetry` (1.1.4) is set up in W1. All subsequent crates should add metrics as part of their acceptance criteria — this is not a separate task per crate, just a "task is done when it has metrics" standard.
 
 ---
 
@@ -301,8 +306,10 @@ Track G (Integration):
 | 3.5.2 | Block explorer frontend (basic) | 3.5.1 | 5 days | M14-M15 |
 | 3.5.3 | Faucet for testnet | — | 2 days | M15 |
 | 3.5.4 | CLI wallet tool | 1.8 | 3 days | M15 |
-| 3.5.5 | Monitoring: Prometheus metrics + Grafana dashboards | — | 3 days | M15-M16 |
+| 3.5.5 | Monitoring: Grafana dashboards (consensus, EVM, p2p, order book metrics from torus-telemetry) | 1.1.4 | 3 days | M14-M15 |
 | 3.5.6 | Node operator documentation | — | 3 days | M16 |
+| 3.5.7 | State pruning: background pruner for pruned nodes, `--archive` flag for full retention (see tech-req §6.4) | 1.2 | 5 days | M15 |
+| 3.5.8 | Alerting rules: missed blocks, consensus stalls, disk >80%, memory leak detection | 3.5.5 | 2 days | M15 |
 | **3.6** | **Public testnet** | 3.2, 3.5 | 6 weeks | M15-M17 |
 | 3.6.1 | Testnet genesis with 8-12 validators | 3.2 | 2 days | M15 |
 | 3.6.2 | External validator onboarding | 3.6.1 | 5 days | M15-M16 |
@@ -389,7 +396,7 @@ Critical path: MonadBFT must complete before audit starts (M15). Audit findings 
 | ID | Risk | Probability | Impact | Mitigation |
 |---|---|---|---|---|
 | R6 | Matching engine fails to meet 200k/sec target | Medium | High | Prototype and benchmark in isolation (2.1.6, M7). If under target, dedicated hardening phase (2.1b, M7-M8): SIMD, cache-friendly layout, profiling-driven rework. Pivot data structures if BTreeMap is the bottleneck. |
-| R7 | libp2p integration with hotstuff_rs is non-trivial | Medium | High | Start with in-process channels for testing. Swap to libp2p gradually. |
+| R7 | libp2p integration with hotstuff_rs is non-trivial | Medium | High | Transport spike (task 1.4.6, W5-W6) runs in parallel with bridge work to surface issues early. Start with in-process channels for testing (1.4.3). Swap to libp2p using spike findings. |
 | R8 | Cross-VM precompile state consistency | Medium | High | EVM always reads one-block-old native state (like Hyperliquid). Test extensively. |
 | R9 | No IBC support limits ecosystem adoption | Low | Medium | Accept for v1. Plan IBC module for v2 (post-mainnet). |
 | R10 | Hiring: Rust + blockchain engineers are scarce | High | High | Start with 2 strong hires. Target Reth/Lighthouse/Solana alumni. Budget competitive compensation. |
@@ -555,10 +562,10 @@ Critical path: MonadBFT must complete before audit starts (M15). Audit findings 
 
 | Phase | Tasks | Total Effort | Calendar Time | Team Size |
 |---|---|---|---|---|
-| Phase 1 | 42 tasks | ~75 engineer-weeks | 15 weeks | 3-4 |
+| Phase 1 | 46 tasks | ~80 engineer-weeks | 16 weeks | 3-4 |
 | Phase 2 | 50 tasks | ~115 engineer-weeks | 28 weeks | 3-4 |
-| Phase 3 | 37 tasks | ~90 engineer-weeks | 24 weeks | 3-5 + auditors |
-| **Total** | **129 tasks** | **~280 engineer-weeks** | **18 months** | **3-5** |
+| Phase 3 | 40 tasks | ~95 engineer-weeks | 24 weeks | 3-5 + auditors |
+| **Total** | **136 tasks** | **~290 engineer-weeks** | **18 months** | **3-5** |
 
 **Note on team sizing:** Phase 1's critical path is 15 weeks, but 75 engineer-weeks
 requires 3-4 engineers for full parallelism across tracks A-D. With only 2 engineers,

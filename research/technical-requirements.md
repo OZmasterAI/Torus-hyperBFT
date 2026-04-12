@@ -211,7 +211,8 @@ torus-hyperbft/
 │   ├── torus-mempool/            # Transaction pool
 │   ├── torus-economics/          # Staking, fees, governance
 │   ├── torus-types/              # Shared types, primitives
-│   └── torus-genesis/            # Genesis parsing and chain config
+│   ├── torus-genesis/            # Genesis parsing and chain config
+│   └── torus-telemetry/          # Prometheus metrics, tracing, /health
 ├── bin/
 │   └── torus/                    # CLI binary (wraps torus-node)
 ├── tests/
@@ -520,6 +521,9 @@ pub struct TorusBlock {
 
 #[derive(BorshSerialize, BorshDeserialize, Clone)]
 pub struct TorusBlockHeader {
+    /// Block height — populated from hotstuff_rs Block.height during bridge processing.
+    /// Stored here so the commit pipeline and RPC layer don't need the hotstuff_rs Block handle.
+    pub height: u64,
     pub timestamp: u64,
     pub proposer: Address,
     /// State root after executing all actions in this block
@@ -543,8 +547,27 @@ pub struct TorusBlockHeader {
     /// Validator set hash for this epoch
     pub validator_set_hash: B256,
 }
-// Note: height and parent come from hotstuff_rs Block.height and Block.justify
-// respectively — no duplication needed.
+// Note: height is populated from hotstuff_rs Block.height during bridge processing
+// (see §9.1, §9.2). Parent block is determined via hotstuff_rs Block.justify — not
+// stored in TorusBlockHeader since it's only needed during consensus, not execution.
+
+/// Block body — the non-header payload, stored separately in cf_block_bodies.
+#[derive(BorshSerialize, BorshDeserialize, Clone)]
+pub struct TorusBlockBody {
+    pub native_actions: Vec<NativeAction>,
+    pub evm_transactions: Vec<Bytes>,
+    pub core_writer_actions: Vec<CoreWriterAction>,
+}
+
+impl TorusBlock {
+    pub fn body(&self) -> TorusBlockBody {
+        TorusBlockBody {
+            native_actions: self.native_actions.clone(),
+            evm_transactions: self.evm_transactions.clone(),
+            core_writer_actions: self.core_writer_actions.clone(),
+        }
+    }
+}
 ```
 
 ### 3.3 Validator Set Management
@@ -770,13 +793,17 @@ impl FixedPoint {
     pub fn raw(&self) -> i128 { self.0 }
 
     /// Multiply two FixedPoints: (a * b) / SCALE
+    /// Uses ethnum::i256 to avoid i128 overflow on intermediate product.
     pub fn mul(self, other: Self) -> Self {
-        Self((self.0 as i256 * other.0 as i256 / Self::SCALE as i256) as i128)
+        use ethnum::i256;
+        Self((i256::from(self.0) * i256::from(other.0) / i256::from(Self::SCALE)).as_i128())
     }
 
     /// Divide two FixedPoints: (a * SCALE) / b
+    /// Uses ethnum::i256 to avoid i128 overflow on intermediate product.
     pub fn div(self, other: Self) -> Self {
-        Self((self.0 as i256 * Self::SCALE as i256 / other.0 as i256) as i128)
+        use ethnum::i256;
+        Self((i256::from(self.0) * i256::from(Self::SCALE) / i256::from(other.0)).as_i128())
     }
 }
 ```
@@ -933,6 +960,9 @@ pub enum NativeAction {
     SubmitProposal(Proposal),
     Vote { proposal_id: u64, option: VoteOption },
 
+    // === Oracle ===
+    SubmitOraclePrices(OracleSubmission),
+
     // === Validator ===
     RegisterValidator { pubkey: PublicKey, commission: u16 },
     UpdateCommission { new_rate: u16 },
@@ -1083,6 +1113,8 @@ cf_fee_config                    | "current" (static key)   | FeeConfig (borsh)
 cf_treasury                      | "balance" (static key)   | U256 (32 bytes)
 cf_dev_pool                      | DeployerAddress          | DevPoolEntry (borsh)
 ─────────────────────────────────┼──────────────────────────┼─────────────────────────
+cf_core_writer_queue             | BlockNumber (8 B BE)     | Vec<CoreWriterAction> (borsh)
+─────────────────────────────────┼──────────────────────────┼─────────────────────────
 cf_consensus_meta                | Various keys             | hotstuff_rs internal state
 cf_trie_nodes                    | NodeHash (32 bytes)      | MPT node (raw bytes)
 cf_trie_accounts                 | HashedAddress (32 B)     | Account trie leaf
@@ -1157,6 +1189,12 @@ trie CFs (`cf_native_trie_nodes`, `cf_native_trie_accounts`).
 
 This design allows EVM state proofs to work unchanged (standard `eth_getProof`) while also
 providing verifiable proofs over native state via `torus_getProof`.
+
+**Scope clarification:** `cf_receipts`, `cf_logs`, `cf_logs_bloom`, `cf_tx_hash_to_location`,
+`cf_block_headers`, `cf_block_bodies`, and `cf_block_hash_to_number` are **auxiliary data** —
+NOT included in either the EVM or native state root. They are deterministically derived from
+block execution and can be reconstructed by replaying the chain. Only mutable account/storage
+state is committed to the state root.
 
 ### 6.4 Pruning Strategy
 
@@ -1398,6 +1436,59 @@ impl BlockProposer {
 }
 ```
 
+### 9.1b StateOverlay (copy-on-write validation buffer)
+
+The `StateOverlay` is the core abstraction used during block validation. It buffers all
+state mutations (EVM + native) so the base `StateDb` is never modified until commit.
+Validators use this to execute a proposed block speculatively and verify its state root
+without persisting anything.
+
+```rust
+/// Copy-on-write state overlay for block validation.
+/// Wraps a read-only reference to the parent state and accumulates writes.
+pub struct StateOverlay<'a> {
+    parent: &'a StateDb,
+    /// Pending EVM state changes (accounts, storage, code)
+    evm_changes: HashMap<Address, AccountOverlay>,
+    /// Pending native state changes (orders, positions, balances, staking)
+    native_changes: NativeStateChanges,
+    /// Combined state diffs for commit (populated after validation succeeds)
+    collected_diffs: Vec<StateDiff>,
+}
+
+impl<'a> StateOverlay<'a> {
+    pub fn new(parent: &'a StateDb) -> Self { /* ... */ }
+
+    /// Read: check overlay first, fall back to parent state.
+    pub fn get_account(&self, addr: Address) -> Option<AccountInfo> { /* ... */ }
+    pub fn get_storage(&self, addr: Address, slot: U256) -> U256 { /* ... */ }
+    pub fn get_native_balance(&self, addr: Address) -> U256 { /* ... */ }
+    pub fn get_position(&self, addr: Address, market: MarketId) -> Option<Position> { /* ... */ }
+
+    /// Write: record changes in overlay, never touch parent.
+    pub fn set_account(&mut self, addr: Address, info: AccountInfo) { /* ... */ }
+    pub fn set_storage(&mut self, addr: Address, slot: U256, value: U256) { /* ... */ }
+    pub fn set_native_balance(&mut self, addr: Address, balance: U256) { /* ... */ }
+
+    /// Compute composite state root over all accumulated changes.
+    /// Uses reth-trie for EVM root (§6.2) and native Merkle tree for native root (§6.3).
+    pub fn compute_state_root(&self) -> Result<B256> { /* ... */ }
+
+    /// Extract collected diffs for the commit pipeline.
+    pub fn into_diffs(self) -> Vec<StateDiff> { self.collected_diffs }
+}
+
+/// StateOverlay implements revm Database trait so the EVM executor can read/write
+/// through it during validation without touching the base state.
+impl Database for StateOverlay<'_> {
+    type Error = TorusDbError;
+    fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> { /* ... */ }
+    fn code_by_hash(&mut self, code_hash: B256) -> Result<Bytecode, Self::Error> { /* ... */ }
+    fn storage(&mut self, address: Address, index: StorageKey) -> Result<StorageValue, Self::Error> { /* ... */ }
+    fn block_hash(&mut self, number: u64) -> Result<B256, Self::Error> { /* ... */ }
+}
+```
+
 ### 9.2 Block Validation Pipeline
 
 ```rust
@@ -1477,7 +1568,7 @@ impl BlockCommitter {
 
         // 2. Write block header and body
         batch.put_cf(cf_block_headers, block.header.height.to_be_bytes(), &block.header.encode());
-        batch.put_cf(cf_block_bodies, block.header.height.to_be_bytes(), &block.body.encode());
+        batch.put_cf(cf_block_bodies, block.header.height.to_be_bytes(), &block.body().encode());
 
         // 3. Write receipts and logs
         for (i, receipt) in validated.receipts.iter().enumerate() {
@@ -1533,26 +1624,35 @@ Address Range          | Purpose                  | Direction
 Read precompiles allow EVM contracts to query native state:
 
 ```rust
+/// Torus precompile function signature. Registered into revm via
+/// append_handler_register_box() (see §4.2). Each precompile captures
+/// a snapshot of core state and is injected into the precompile map.
+///
+/// Note: revm v19 does not expose a `StatefulPrecompile` trait directly.
+/// Precompiles are registered as closures or function pointers via the
+/// handler's PreExecutionHandler::load_precompiles. Verify exact API
+/// against revm v19.2.0 docs before implementation.
+
 /// Example: Read order book precompile at 0x0800
-impl StatefulPrecompile for OrderBookPrecompile {
-    fn call(
-        &self,
-        input: &Bytes,     // ABI-encoded: (market_id, depth)
-        gas_limit: u64,
-        context: &PrecompileContext,
-    ) -> PrecompileResult {
+struct OrderBookPrecompile {
+    core_state: Arc<CoreStateSnapshot>,
+}
+
+impl OrderBookPrecompile {
+    fn call(&self, input: &Bytes, gas_limit: u64) -> PrecompileResult {
         // Decode ABI input
         let (market_id, depth) = abi_decode(input)?;
 
         // Read from native state (always one block behind)
-        let snapshot = self.core_state.snapshot();
-        let book = snapshot.get_order_book(market_id)?;
+        let book = self.core_state.get_order_book(market_id)?;
 
         // Encode response as ABI
         let (bids, asks) = book.top_levels(depth);
         let output = abi_encode(&(bids, asks));
 
-        Ok(PrecompileOutput { output, gas_used: 3000 })
+        // Gas cost scales with depth: base 1000 + 200 per level
+        let gas_used = 1000 + (depth as u64 * 200);
+        Ok(PrecompileOutput { output, gas_used })
     }
 }
 ```
@@ -1598,8 +1698,8 @@ Direct asset transfer between EVM and native layers without wrapped tokens:
 ```rust
 /// Lockbox precompile: transfer TRS between EVM balance and native balance.
 /// Each native token has a lockbox at 0x2000...{token_index}.
-impl StatefulPrecompile for LockboxPrecompile {
-    fn call(&self, input: &Bytes, gas_limit: u64, ctx: &PrecompileContext) -> PrecompileResult {
+impl LockboxPrecompile {
+    fn call(&self, input: &Bytes, gas_limit: u64) -> PrecompileResult {
         let (direction, amount) = abi_decode(input)?;
         match direction {
             Direction::EvmToNative => {
@@ -1929,11 +2029,11 @@ Pin exact versions following Hyperliquid's approach. Avoid floating semver.
 | Crate | Version | Purpose | License |
 |---|---|---|---|
 | `libp2p` | `=0.56.0` | P2P networking (umbrella) | MIT |
-| `libp2p-gossipsub` | `=0.49.x` | Pub/sub messaging | MIT |
-| `libp2p-kad` | (workspace) | Peer discovery (DHT) | MIT |
-| `libp2p-quic` | `=0.13.x` | QUIC transport | MIT |
-| `libp2p-request-response` | (workspace) | Block sync req/resp | MIT |
-| `libp2p-connection-limits` | `=0.6.0` | Connection management | MIT |
+
+Sub-crates (`gossipsub`, `kad`, `quic`, `request-response`, `connection-limits`) are
+re-exported by the `libp2p` umbrella crate at 0.56. Do **not** depend on separate
+`libp2p-*` crates — use `libp2p = { version = "=0.56.0", features = [...] }` with the
+features listed below. Separate sub-crate dependencies would conflict with the umbrella.
 
 Features: `tokio, tcp, noise, yamux, quic, gossipsub, kad, request-response, cbor, identify, connection-limits, allow-block-list, macros, dns`
 
@@ -1965,6 +2065,7 @@ Features: `server, client, macros`
 | `k256` | `=0.13.4` | secp256k1 (Ethereum signing) | Apache-2.0/MIT |
 | `sha3` | `=0.10.8` | Keccak-256 hashing | Apache-2.0/MIT |
 | `ed25519-dalek` | `=2.1.1` | Ed25519 (validator signing) | BSD-3 |
+| `ethnum` | `=1.5.0` | 256-bit integer types (i256/u256) | MIT |
 
 ### Testing
 
