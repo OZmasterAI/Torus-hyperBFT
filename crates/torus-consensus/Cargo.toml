@@ -7,4 +7,13 @@ license.workspace = true
 [dependencies]
 torus-types = { workspace = true }
 torus-bridge = { workspace = true }
+torus-state = { workspace = true }
 hotstuff_rs = { workspace = true }
+rocksdb = { workspace = true }
+serde_json = { workspace = true }
+ed25519-dalek = { workspace = true }
+sha2 = "0.10"
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

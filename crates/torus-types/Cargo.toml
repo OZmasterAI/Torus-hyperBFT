@@ -11,3 +11,4 @@ alloy-rlp = { workspace = true }
 serde = { workspace = true }
 borsh = { workspace = true }
 ethnum = { workspace = true }
+k256 = { workspace = true }
