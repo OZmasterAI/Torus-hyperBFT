@@ -895,7 +895,7 @@ pub enum NativeAction {
 
     // === Governance ===
     SubmitProposal(Proposal),
-    Vote { proposal_id: u64, option: VoteOption, weight_override: Option<U256> },
+    Vote { proposal_id: u64, option: VoteOption },
 
     // === Validator ===
     RegisterValidator { pubkey: PublicKey, commission: u16 },
@@ -994,7 +994,40 @@ pub fn compute_state_root(
 
 **Strategy:** Incremental updates via prefix sets. Only trie paths affected by the current block's state diffs are recomputed. Requires `HashedAccounts`, `HashedStorages`, `AccountsTrie`, and `StoragesTrie` column families (following reth's table layout).
 
-### 6.3 Pruning Strategy
+### 6.3 Native State Root
+
+The EVM state root (§6.2) only covers EVM accounts and storage. Native state (order books,
+positions, balances, staking, governance) must also be committed to a verifiable root.
+
+**Approach: Composite state root**
+
+```rust
+/// Final block state root = keccak256(evm_state_root || native_state_root)
+pub fn compute_composite_state_root(
+    evm_root: B256,
+    native_root: B256,
+) -> B256 {
+    let mut data = [0u8; 64];
+    data[..32].copy_from_slice(evm_root.as_slice());
+    data[32..].copy_from_slice(native_root.as_slice());
+    keccak256(&data)
+}
+```
+
+The native state root is computed over a separate Merkle tree covering all native column
+families (`cf_native_*`, `cf_staking_*`, `cf_governance_*`, `cf_fee_config`, `cf_treasury`,
+`cf_dev_pool`). This tree uses the same reth-trie infrastructure with a dedicated set of
+trie CFs (`cf_native_trie_nodes`, `cf_native_trie_accounts`).
+
+This design allows EVM state proofs to work unchanged (standard `eth_getProof`) while also
+providing verifiable proofs over native state via `torus_getProof`.
+
+### 6.4 Pruning Strategy
+
+Two node modes: **pruned** (default, validators and standard RPC) and **archive** (`--archive` flag,
+for bridges, DeFi protocols, and block explorers that need historical state proofs).
+
+**Pruned node (default):**
 
 | Data Type | Retention | Rationale |
 |---|---|---|
@@ -1002,10 +1035,18 @@ pub fn compute_state_root(
 | Block headers | Forever | Required for chain verification |
 | Block bodies | Last 1,000,000 blocks | Sync and replay |
 | Receipts | Last 1,000,000 blocks | RPC query support |
-| Trie nodes (historical) | Last 256 blocks | eth_getProof support |
+| Trie nodes (historical) | Last 256 blocks | eth_getProof for recent blocks |
 | Order book snapshots | Every 10,000 blocks | State recovery |
 
-Pruning runs as a background task, compacting RocksDB after deletion.
+**Archive node (`--archive`):**
+
+| Data Type | Retention | Rationale |
+|---|---|---|
+| All of the above | Forever | Full historical state |
+| Trie nodes (all) | Forever | eth_getProof at any block height |
+
+Pruning runs as a background task on pruned nodes, compacting RocksDB after deletion.
+Archive nodes skip pruning entirely.
 
 ---
 
@@ -1070,7 +1111,7 @@ let swarm = SwarmBuilder::with_new_identity()
     .with_behaviour(|key| {
         let gossipsub = gossipsub::Behaviour::new(
             MessageAuthenticity::Signed(key.clone()),
-            gossipsub::Config::default()
+            gossipsub::ConfigBuilder::default()
                 .heartbeat_interval(Duration::from_millis(500))
                 .max_transmit_size(256 * 1024)  // 256 KB
                 .build()?,
@@ -1081,7 +1122,7 @@ let swarm = SwarmBuilder::with_new_identity()
             kad::store::MemoryStore::new(peer_id),
         );
 
-        let request_response = request_response::cbor::Behaviour::new(
+        let request_response = request_response::Behaviour::new(
             [(StreamProtocol::new("/torus/sync/1.0"), ProtocolSupport::Full)],
             Default::default(),
         );
@@ -1124,6 +1165,7 @@ Required for MetaMask and Foundry compatibility:
 | `eth_getTransactionReceipt` | P0 | Receipt by tx hash |
 | `eth_getLogs` | P0 | Filter logs by block range, address, topics |
 | `eth_gasPrice` | P0 | Current gas price suggestion |
+| `eth_maxPriorityFeePerGas` | P0 | EIP-1559 priority fee suggestion (required by MetaMask) |
 | `eth_feeHistory` | P1 | EIP-1559 fee history |
 | `eth_getBlockTransactionCountByNumber` | P1 | Tx count in block |
 | `eth_getTransactionByBlockNumberAndIndex` | P1 | Tx by position |
@@ -1204,14 +1246,14 @@ impl BlockProposer {
         // 4. Construct block
         TorusBlock {
             header: TorusBlockHeader {
-                parent_hash: parent.block_hash(),
-                height: parent.height + 1,
                 timestamp,
                 proposer,
                 // state_root computed during validation
                 state_root: B256::ZERO,
                 ..Default::default()
             },
+            // Note: height and parent_hash come from hotstuff_rs Block,
+            // not from TorusBlockHeader (see §3.2)
             native_actions,
             evm_transactions: evm_txs,
             core_writer_actions,
@@ -1443,20 +1485,30 @@ impl StatefulPrecompile for LockboxPrecompile {
 
 ### 11.1 Permanent Staking State Machine
 
+Permanent staking is **separate from validator delegation**. Any address can lock TRS tokens
+from their liquid balance forever. No validator selection required. Permanently staked tokens
+earn inflationary rewards and contribute to the total staked supply for validator selection
+weight calculations (boosting overall network security).
+
 ```
-                    MsgDelegate
-    Unstaked ──────────────────────► Delegated (standard)
-        ▲                               │
-        │ MsgUndelegate                  │ MsgPermanentStake
-        │ (7-day queue)                  ▼
-        │                          Permanently Staked
-        │                          ┌──────────────────┐
-        │                          │ Cannot undelegate │
-        └──── (impossible) ────────│ 5% APY rewards   │
-                                   │ 1.5x gov weight  │
-                                   │ Tracked per-addr  │
-                                   └──────────────────┘
+    Liquid Balance ──PermanentStake──► Permanently Staked
+                                       ┌──────────────────────────┐
+                                       │ Cannot unlock (forever)   │
+                                       │ 5% APY (inflationary mint)│
+                                       │ 1.5x governance weight    │
+                                       │ Counts toward total stake  │
+                                       │ Tracked per-address        │
+              (impossible) ◄───────────│                            │
+                                       └──────────────────────────┘
+
+    Liquid Balance ──Delegate──► Delegated (to validator)
+        ▲                            │
+        │ Undelegate (7-day queue)   │ Earns share of validator fee income
+        └────────────────────────────┘
 ```
+
+Note: These are two independent mechanisms. A user can permanently stake AND delegate
+separately — the tokens used for each come from the liquid balance independently.
 
 ```rust
 pub struct PermanentStaking {
@@ -1465,35 +1517,70 @@ pub struct PermanentStaking {
 }
 
 impl PermanentStaking {
-    /// Lock tokens permanently. Irreversible.
+    /// Lock tokens permanently from liquid balance. Irreversible.
+    /// Separate from validator delegation — no validator field needed.
     pub fn permanent_stake(
         &mut self,
         state: &mut StateDb,
         staker: Address,
         amount: U256,
     ) -> Result<()> {
-        // 1. Verify staker has sufficient delegated balance
-        // 2. Move from standard delegation to permanent record
+        // 1. Verify staker has sufficient liquid (non-delegated) balance
+        // 2. Debit liquid balance, credit permanent stake record
         // 3. Update total_permanent_stake
         // 4. Emit PermanentStakeEvent
     }
 
     /// Distribute 5% annual rewards to permanent stakers.
-    /// Called at epoch boundaries.
+    /// Called at epoch boundaries. Rewards are inflationary (chain mints new TRS).
     pub fn distribute_rewards(
         &self,
         state: &mut StateDb,
         blocks_in_epoch: u64,
     ) -> Result<U256> {
-        // Annual rate: 5% (0.05)
-        // Per-epoch rate: 0.05 * (blocks_in_epoch / blocks_per_year)
+        // Annual rate: 500 bps (5%)
+        // Per-epoch rate: 500 * blocks_in_epoch / (blocks_per_year * 10000)
         // Mint new TRS proportional to each staker's permanent balance
         // Does NOT auto-compound (rewards go to liquid balance)
     }
 }
 ```
 
-### 11.2 Fee Split Logic
+### 11.2 Delegator Reward Distribution
+
+Standard DPoS delegation: delegators earn a share of validator fee income.
+
+```rust
+pub struct DelegatorRewards;
+
+impl DelegatorRewards {
+    /// Distribute the validator's fee share to delegators.
+    /// Called after fee split assigns the validator portion.
+    pub fn distribute(
+        state: &mut StateDb,
+        validator: Address,
+        validator_fee_share: U256,
+    ) -> Result<()> {
+        let commission_bps = state.get_validator_commission(validator);
+        let commission = validator_fee_share * commission_bps / 10000;
+        let delegator_pool = validator_fee_share - commission;
+
+        // Validator keeps commission
+        state.credit_balance(validator, commission);
+
+        // Remaining pool distributed pro-rata to delegators by stake weight
+        for (delegator, stake) in state.get_delegations(validator) {
+            let share = delegator_pool * stake / state.get_total_delegation(validator);
+            state.credit_balance(delegator, share);
+        }
+    }
+}
+```
+
+Delegator rewards come entirely from the validator's fee split share — no additional
+inflation. This is separate from permanent staking rewards (which are inflationary).
+
+### 11.3 Fee Split Logic
 
 Porting the proven `x/fees` design from torus-chain:
 
@@ -1517,31 +1604,58 @@ pub struct FeeRatios {
 
 impl FeeSplitter {
     pub fn split(&self, total_fees: U256, epoch: u64, proposer: Address) -> FeeDistribution {
-        let progress = min(epoch, self.transition_epochs) as f64 / self.transition_epochs as f64;
+        // IMPORTANT: No floating-point arithmetic — all integer basis-point math
+        // for cross-validator determinism.
+        let clamped_epoch = min(epoch, self.transition_epochs);
 
-        // Linear interpolation
-        let burn_bps = lerp(self.start_ratios.burn_bps, self.end_ratios.burn_bps, progress);
-        let validator_bps = lerp(self.start_ratios.validator_bps, self.end_ratios.validator_bps, progress);
-        let treasury_bps = lerp(self.start_ratios.treasury_bps, self.end_ratios.treasury_bps, progress);
+        // Integer linear interpolation: start + (end - start) * clamped / total
+        // All values are u16 basis points, intermediate math uses u64 to avoid overflow
+        let burn_bps = lerp_bps(self.start_ratios.burn_bps, self.end_ratios.burn_bps,
+                                clamped_epoch, self.transition_epochs);
+        let validator_bps = lerp_bps(self.start_ratios.validator_bps, self.end_ratios.validator_bps,
+                                     clamped_epoch, self.transition_epochs);
+        let treasury_bps = lerp_bps(self.start_ratios.treasury_bps, self.end_ratios.treasury_bps,
+                                    clamped_epoch, self.transition_epochs);
 
-        let burn = total_fees * burn_bps / 10000;
-        let validator = total_fees * validator_bps / 10000;
-        let treasury = total_fees * treasury_bps / 10000;
-        let dev_pool = total_fees - burn - validator - treasury; // remainder
+        let burn = total_fees * U256::from(burn_bps) / U256::from(10000u16);
+        let validator = total_fees * U256::from(validator_bps) / U256::from(10000u16);
+        let treasury = total_fees * U256::from(treasury_bps) / U256::from(10000u16);
+        let dev_pool = total_fees - burn - validator - treasury; // remainder, no rounding loss
 
         FeeDistribution { burn, validator: (proposer, validator), treasury, dev_pool }
     }
 }
+
+/// Integer-only linear interpolation in basis points.
+/// Returns: start + (end - start) * numerator / denominator
+/// Handles both increasing and decreasing interpolation.
+fn lerp_bps(start: u16, end: u16, numerator: u64, denominator: u64) -> u16 {
+    if denominator == 0 { return end; }
+    if start <= end {
+        let delta = (end - start) as u64;
+        start + ((delta * numerator) / denominator) as u16
+    } else {
+        let delta = (start - end) as u64;
+        start - ((delta * numerator) / denominator) as u16
+    }
+}
 ```
 
-### 11.3 Governance Weight Calculation
+The validator fee share is distributed to the proposing validator, who then splits
+it with their delegators via the DelegatorRewards mechanism (see §11.2).
+
+### 11.4 Governance Weight Calculation
+
+Voting power is computed automatically by the chain — voters cannot override their weight.
 
 ```rust
 pub struct GovernanceWeight;
 
 impl GovernanceWeight {
     /// Calculate voting power for an address.
-    /// Permanent stakers get 1.5x multiplier.
+    /// Permanently staked tokens get 1.5x multiplier.
+    /// Standard delegated tokens get 1x weight.
+    /// This is computed by the chain, not user-supplied.
     pub fn voting_power(
         state: &StateDb,
         voter: Address,
@@ -1550,8 +1664,8 @@ impl GovernanceWeight {
         let permanent_stake = state.get_permanent_stake(voter);
 
         // Standard delegated tokens: 1x weight
-        // Permanently staked tokens: 1.5x weight
-        let weight = standard_stake + (permanent_stake * 3 / 2);
+        // Permanently staked tokens: 1.5x weight (integer: * 3 / 2, rounds down)
+        let weight = standard_stake + (permanent_stake * U256::from(3u64) / U256::from(2u64));
 
         weight
     }

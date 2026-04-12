@@ -37,7 +37,7 @@ Phase 3                                                              ███�
 
 | Phase | Duration | Goal | Team |
 |---|---|---|---|
-| **Phase 1** | Months 1-5 | 4-validator devnet with EVM + basic staking | 2-3 Rust engineers |
+| **Phase 1** | Months 1-5 | 4-validator devnet with EVM + basic staking | 3-4 Rust engineers |
 | **Phase 2** | Months 6-12 | Native CLOB + dual-VM + economics modules | 3-4 Rust engineers |
 | **Phase 3** | Months 12-18 | Security audit + testnet + mainnet prep | 3-5 engineers + auditors |
 
@@ -120,7 +120,7 @@ Phase 3                                                              ███�
 | **1.11** | **Basic staking (Phase 1 subset)** | 1.5 | 2 weeks | W13-W14 |
 | 1.11.1 | Delegate/undelegate state management | 1.2.1 | 3 days | W13 |
 | 1.11.2 | Epoch-based validator set rotation | 1.11.1, 1.4.5 | 3 days | W13-W14 |
-| 1.11.3 | Basic staking reward distribution (flat rate, no permanent) | 1.11.2 | 2 days | W14 |
+| 1.11.3 | Delegator reward distribution (share of validator fee income, minus commission) | 1.11.2 | 2 days | W14 |
 | 1.11.4 | Staking RPC endpoints | 1.11.1, 1.8.1 | 2 days | W14 |
 
 ### Phase 1 Parallel Tracks
@@ -201,28 +201,34 @@ Track G (Integration):
 | 2.5.1 | Native mempool: action types, priority ordering | — | 3 days | M9 |
 | 2.5.2 | Block proposal: include native actions + EVM txs | 2.5.1 | 3 days | M9-M10 |
 | 2.5.3 | Block validation: execute native → EVM → lockbox → CoreWriter | 2.5.2 | 5 days | M10 |
-| 2.5.4 | State root includes native state | 2.5.3 | 3 days | M10 |
+| 2.5.4 | Composite state root: build native Merkle tree, combine with EVM root (see tech-req §6.3) | 2.5.3 | 3 weeks | M10 |
 | 2.5.5 | Determinism tests: all validators agree with mixed workload | 2.5.4 | 4 days | M10 |
 | **2.6** | **Permanent staking** | Phase 1.11 | 3 weeks | M9-M10 |
-| 2.6.1 | Permanent stake locking mechanism (irreversible) | 1.11.1 | 3 days | M9 |
+| 2.6.1 | Permanent stake locking from liquid balance (irreversible, separate from delegation) | 1.2.1 | 3 days | M9 |
 | 2.6.2 | 5% annual inflation rewards for permanent stakers | 2.6.1 | 3 days | M9-M10 |
 | 2.6.3 | Non-auto-compounding reward distribution | 2.6.2 | 2 days | M10 |
 | 2.6.4 | Permanent stake state in genesis | 2.6.1 | 1 day | M10 |
 | 2.6.5 | Integration tests: stake, earn, governance weight | 2.6.3 | 3 days | M10 |
 | **2.7** | **Fee split module** | Phase 1 | 2 weeks | M10 |
-| 2.7.1 | FeeSplitter with linear interpolation (1825-epoch transition) | — | 3 days | M10 |
+| 2.7.1 | FeeSplitter with integer basis-point interpolation (no f64, 1825-epoch transition) | — | 3 days | M10 |
 | 2.7.2 | Burn mechanism (send to zero address) | 2.7.1 | 1 day | M10 |
-| 2.7.3 | Validator proposer reward distribution | 2.7.1 | 2 days | M10 |
+| 2.7.3 | Validator proposer reward + delegator redistribution (commission model) | 2.7.1 | 3 days | M10 |
 | 2.7.4 | Treasury accumulation | 2.7.1 | 1 day | M10 |
 | 2.7.5 | Developer pool: gas usage tracking per deployer | 2.7.1 | 3 days | M10 |
 | 2.7.6 | Fee split unit tests + epoch transition tests | 2.7.5 | 2 days | M10 |
 | **2.8** | **Governance** | 2.6 | 3 weeks | M10-M11 |
 | 2.8.1 | Proposal submission and storage | — | 3 days | M10 |
-| 2.8.2 | Voting with standard weight | 2.8.1 | 2 days | M10-M11 |
-| 2.8.3 | 1.5x vote weight for permanent stakers | 2.8.2, 2.6.1 | 2 days | M11 |
+| 2.8.2 | Voting with chain-computed weight (no user-supplied override) | 2.8.1 | 2 days | M10-M11 |
+| 2.8.3 | 1.5x auto-computed vote weight for permanent stakers | 2.8.2, 2.6.1 | 2 days | M11 |
 | 2.8.4 | Proposal types: param changes, treasury spends, market listing | 2.8.1 | 3 days | M11 |
 | 2.8.5 | Proposal execution (apply approved changes) | 2.8.4 | 3 days | M11 |
 | 2.8.6 | Governance RPC endpoints | 2.8.5 | 2 days | M11 |
+| **2.8b** | **Oracle price feed system** | 2.1 | 3 weeks | M8-M9 |
+| 2.8b.1 | Oracle submission: validators submit external exchange prices | 1.4 | 4 days | M8 |
+| 2.8b.2 | Oracle aggregation: stake-weighted median across validators | 2.8b.1 | 3 days | M8-M9 |
+| 2.8b.3 | Oracle staleness detection and fallback | 2.8b.2 | 2 days | M9 |
+| 2.8b.4 | Oracle manipulation resistance (outlier rejection) | 2.8b.2 | 3 days | M9 |
+| 2.8b.5 | Oracle integration tests | 2.8b.4 | 3 days | M9 |
 | **2.9** | **Torus-specific RPC** | 2.1, 2.6, 2.8 | 2 weeks | M11 |
 | 2.9.1 | torus_getOrderBook, torus_getPosition, torus_getBalances | 2.1 | 3 days | M11 |
 | 2.9.2 | torus_getMarkets, torus_getTradeHistory | 2.1 | 2 days | M11 |
@@ -265,16 +271,17 @@ Track G (Integration):
 | 3.2.3 | Commission rate management | 3.2.2 | 2 days | M14 |
 | 3.2.4 | Validator set transition: consensus continuity during rotation | 3.2.2 | 4 days | M14 |
 | 3.2.5 | Integration tests: validator joins, leaves, gets jailed | 3.2.4 | 3 days | M14 |
-| **3.3** | **MonadBFT enhancements** | Phase 1 | 6 weeks | M13-M15 |
-| 3.3.1 | Tail-fork resistance: reproposal mechanism | 1.4 | 5 days | M13 |
-| 3.3.2 | No-Endorsement Certificate (NEC) | 3.3.1 | 4 days | M13-M14 |
-| 3.3.3 | Speculative finality: execute after 1 QC | 3.3.2 | 5 days | M14 |
-| 3.3.4 | Speculative rollback mechanism | 3.3.3 | 4 days | M14-M15 |
-| 3.3.5 | Active PaceMaker with leader reputation | 3.3.2 | 4 days | M15 |
-| 3.3.6 | Consensus safety proofs (TLA+ or similar) | 3.3.5 | 8 days | M15 |
-| **3.4** | **External audit** | 3.1, 3.2 | 3-6 months | M14-M18 |
-| 3.4.1 | Audit firm selection and scoping | — | 2 weeks | M14 |
-| 3.4.2 | Consensus safety audit | 3.3 | 4 weeks | M15-M16 |
+| **3.3** | **MonadBFT enhancements** (complete BEFORE audit) | Phase 1 | 8 weeks | M12-M14 |
+| 3.3.1 | Fork hotstuff_rs for pacemaker modification | 1.4 | 5 days | M12 |
+| 3.3.2 | Tail-fork resistance: reproposal mechanism | 3.3.1 | 5 days | M12-M13 |
+| 3.3.3 | No-Endorsement Certificate (NEC) | 3.3.2 | 5 days | M13 |
+| 3.3.4 | Speculative finality: execute after 1 QC | 3.3.3 | 5 days | M13 |
+| 3.3.5 | Speculative rollback mechanism | 3.3.4 | 5 days | M13-M14 |
+| 3.3.6 | Active PaceMaker with leader reputation (requires hotstuff_rs fork) | 3.3.3 | 8 days | M14 |
+| 3.3.7 | Consensus safety proofs (TLA+ or similar) | 3.3.6 | 8 days | M14 |
+| **3.4** | **External audit** (starts after MonadBFT complete) | 3.1, 3.2, 3.3 | 3-6 months | M15-M18 |
+| 3.4.1 | Audit firm selection and scoping | — | 2 weeks | M15 |
+| 3.4.2 | Consensus safety audit (includes MonadBFT changes) | 3.3 | 4 weeks | M15-M16 |
 | 3.4.3 | EVM correctness audit | Phase 1 | 3 weeks | M15-M16 |
 | 3.4.4 | Economic model audit (game theory review) | 2.6, 2.7 | 2 weeks | M16 |
 | 3.4.5 | Fix audit findings | 3.4.2-3.4.4 | 4 weeks | M16-M17 |
@@ -327,16 +334,19 @@ Critical path: 1.1 → 1.2 → 1.3 → 1.5 → 1.9 → 1.10 = 15 weeks
 2.1 Order Book ──► 2.2 Margin ──► 2.3 Liquidations ──► 2.5 Bridge Integration ──► 2.10 Testing
    (M6-M7)          (M7-M8)        (M8-M9)               (M9-M10)                  (M11-M12)
 
-Critical path: 2.1 → 2.2 → 2.3 → 2.5 → 2.10 = 7 months
+Critical path: 2.1 → 2.2 → 2.3 → 2.5 → 2.10 = 7 months (zero slack — any delay cascades)
 ```
+
+**Warning:** Phase 2 critical path exactly fills the 7-month window. Budget 4-6 weeks
+slack by starting oracle work (2.8b) and precompiles (2.4) in parallel with order book.
 
 ### Phase 3 Critical Path
 
 ```
-3.1 Security ──► 3.4 Audit ──► 3.4.5 Fixes ──► 3.6 Testnet ──► 3.7 Mainnet
-   (M12-M14)      (M14-M16)     (M16-M17)       (M15-M17)       (M17-M18)
+3.3 MonadBFT ──► 3.1 Security ──► 3.4 Audit ──► 3.4.5 Fixes ──► 3.6 Testnet ──► 3.7 Mainnet
+   (M12-M14)       (M12-M14)       (M15-M16)     (M16-M17)       (M15-M17)       (M17-M18)
 
-Critical path: Audit findings determine timeline
+Critical path: MonadBFT must complete before audit starts (M15). Audit findings determine tail.
 ```
 
 ### Blocking Dependencies
@@ -486,7 +496,6 @@ Critical path: Audit findings determine timeline
 - [ ] 4-node devnet running in Docker Compose
 - [ ] MetaMask connects, sends TRS, shows balance
 - [ ] Foundry `forge script` deploys and interacts with contracts
-- [ ] Block explorer shows blocks and transactions
 - [ ] eth_getLogs returns correct event logs
 - [ ] WebSocket subscriptions deliver newHeads
 - [ ] Block sync: new node catches up from genesis
@@ -536,10 +545,14 @@ Critical path: Audit findings determine timeline
 
 | Phase | Tasks | Total Effort | Calendar Time | Team Size |
 |---|---|---|---|---|
-| Phase 1 | 42 tasks | ~75 engineer-weeks | 15 weeks | 2-3 |
-| Phase 2 | 43 tasks | ~100 engineer-weeks | 28 weeks | 3-4 |
-| Phase 3 | 35 tasks | ~80 engineer-weeks | 24 weeks | 3-5 + auditors |
-| **Total** | **120 tasks** | **~255 engineer-weeks** | **18 months** | **2-5** |
+| Phase 1 | 42 tasks | ~75 engineer-weeks | 15 weeks | 3-4 |
+| Phase 2 | 50 tasks | ~115 engineer-weeks | 28 weeks | 3-4 |
+| Phase 3 | 37 tasks | ~90 engineer-weeks | 24 weeks | 3-5 + auditors |
+| **Total** | **129 tasks** | **~280 engineer-weeks** | **18 months** | **3-5** |
+
+**Note on team sizing:** Phase 1's critical path is 15 weeks, but 75 engineer-weeks
+requires 3-4 engineers for full parallelism across tracks A-D. With only 2 engineers,
+realistic calendar time extends to ~25 weeks. Budget 3 engineers minimum for Phase 1.
 
 ## Appendix B: Technology Comparison — Why These Choices
 
