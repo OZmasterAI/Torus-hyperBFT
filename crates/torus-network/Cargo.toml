@@ -1,0 +1,10 @@
+[package]
+name = "torus-network"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+torus-types = { workspace = true }
+# Heavy dep added when implementing (task 1.5):
+# libp2p

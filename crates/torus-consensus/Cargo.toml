@@ -1,0 +1,10 @@
+[package]
+name = "torus-consensus"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+torus-types = { workspace = true }
+torus-bridge = { workspace = true }
+hotstuff_rs = { workspace = true }

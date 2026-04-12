@@ -1,0 +1,10 @@
+[package]
+name = "torus-state"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+torus-types = { workspace = true }
+# Heavy deps added when implementing (task 1.2):
+# alloy-primitives, rocksdb, reth-trie, reth-primitives

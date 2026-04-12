@@ -1,0 +1,13 @@
+[package]
+name = "torus-types"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+alloy-primitives = { workspace = true }
+alloy-consensus = { workspace = true }
+alloy-rlp = { workspace = true }
+serde = { workspace = true }
+borsh = { workspace = true }
+ethnum = { workspace = true }

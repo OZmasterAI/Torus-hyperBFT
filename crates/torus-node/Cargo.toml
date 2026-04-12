@@ -1,0 +1,19 @@
+[package]
+name = "torus-node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+torus-types = { workspace = true }
+torus-state = { workspace = true }
+torus-evm = { workspace = true }
+torus-core = { workspace = true }
+torus-consensus = { workspace = true }
+torus-bridge = { workspace = true }
+torus-network = { workspace = true }
+torus-rpc = { workspace = true }
+torus-mempool = { workspace = true }
+torus-economics = { workspace = true }
+torus-genesis = { workspace = true }
+torus-telemetry = { workspace = true }

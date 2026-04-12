@@ -1,0 +1,12 @@
+[package]
+name = "torus-bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+torus-types = { workspace = true }
+torus-evm = { workspace = true }
+torus-core = { workspace = true }
+torus-state = { workspace = true }
+torus-economics = { workspace = true }

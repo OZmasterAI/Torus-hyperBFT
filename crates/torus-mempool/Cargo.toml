@@ -1,0 +1,9 @@
+[package]
+name = "torus-mempool"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+torus-types = { workspace = true }
+torus-state = { workspace = true }

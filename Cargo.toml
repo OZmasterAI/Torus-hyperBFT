@@ -1,0 +1,95 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/torus-types",
+    "crates/torus-state",
+    "crates/torus-evm",
+    "crates/torus-core",
+    "crates/torus-consensus",
+    "crates/torus-bridge",
+    "crates/torus-network",
+    "crates/torus-rpc",
+    "crates/torus-mempool",
+    "crates/torus-economics",
+    "crates/torus-genesis",
+    "crates/torus-telemetry",
+    "crates/torus-node",
+]
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+version = "0.1.0"
+
+[workspace.dependencies]
+# Internal crates
+torus-types = { path = "crates/torus-types" }
+torus-state = { path = "crates/torus-state" }
+torus-evm = { path = "crates/torus-evm" }
+torus-core = { path = "crates/torus-core" }
+torus-consensus = { path = "crates/torus-consensus" }
+torus-bridge = { path = "crates/torus-bridge" }
+torus-network = { path = "crates/torus-network" }
+torus-rpc = { path = "crates/torus-rpc" }
+torus-mempool = { path = "crates/torus-mempool" }
+torus-economics = { path = "crates/torus-economics" }
+torus-genesis = { path = "crates/torus-genesis" }
+torus-telemetry = { path = "crates/torus-telemetry" }
+torus-node = { path = "crates/torus-node" }
+
+# Consensus
+hotstuff_rs = "=0.4.0"
+
+# EVM
+revm = "37"
+
+# Ethereum types (alloy)
+alloy-primitives = { version = "1.5", features = ["serde"] }
+alloy-consensus = "1.8"
+alloy-eips = "1.8"
+alloy-rlp = "0.3"
+
+# State / Trie — reth-trie and reth-primitives are not published to crates.io.
+# Will be added as git deps when implementing torus-state (task 1.2).
+
+# Storage
+rocksdb = "0.24"
+
+# Networking
+libp2p = { version = "=0.56.0", features = [
+    "tokio", "tcp", "noise", "yamux", "quic", "gossipsub", "kad",
+    "request-response", "cbor", "identify", "macros", "dns",
+] }
+# Note: libp2p-allow-block-list and libp2p-connection-limits are always-on deps, not features
+
+# RPC
+jsonrpsee = { version = "=0.26.0", features = ["server", "client", "macros"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+borsh = { version = "1", features = ["derive"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Logging / Telemetry
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+prometheus-client = "0.24"
+
+# Crypto
+k256 = "0.13"
+sha3 = "0.10"
+ed25519-dalek = "2"
+ethnum = "1.5"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Testing
+proptest = "1"
+criterion = "0.5"
+tempfile = "3"

@@ -1,0 +1,9 @@
+[package]
+name = "torus-economics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+torus-types = { workspace = true }
+torus-state = { workspace = true }
