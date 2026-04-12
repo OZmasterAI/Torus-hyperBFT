@@ -40,8 +40,8 @@ torus-node = { path = "crates/torus-node" }
 # Consensus
 hotstuff_rs = "=0.4.0"
 
-# EVM
-revm = "37"
+# EVM — pinned to 36 to match reth v2.0.0 (revm 37 not yet adopted by reth)
+revm = "36"
 
 # Ethereum types (alloy)
 alloy-primitives = { version = "1.5", features = ["serde"] }
@@ -49,8 +49,10 @@ alloy-consensus = "1.8"
 alloy-eips = "1.8"
 alloy-rlp = "0.3"
 
-# State / Trie — reth-trie and reth-primitives are not published to crates.io.
-# Will be added as git deps when implementing torus-state (task 1.2).
+# State / Trie — reth crates are not published to crates.io; pulled from git.
+# reth v2.0.0 (Apr 2026) uses revm 36 + alloy-primitives 1.5.6 — compatible with our pins.
+reth-trie = { git = "https://github.com/paradigmxyz/reth", tag = "v2.0.0", default-features = false }
+reth-trie-common = { git = "https://github.com/paradigmxyz/reth", tag = "v2.0.0", default-features = false }
 
 # Storage
 rocksdb = "0.24"
