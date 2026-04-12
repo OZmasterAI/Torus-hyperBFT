@@ -388,7 +388,7 @@ Critical path: MonadBFT must complete before audit starts (M15). Audit findings 
 
 | ID | Risk | Probability | Impact | Mitigation |
 |---|---|---|---|---|
-| R6 | Matching engine fails to meet 200k/sec target | Medium | High | Profile in isolation before integration. Study Hyperliquid's architecture decisions. Consider SIMD, memory-mapped order book. |
+| R6 | Matching engine fails to meet 200k/sec target | Medium | High | Prototype and benchmark in isolation (2.1.6, M7). If under target, dedicated hardening phase (2.1b, M7-M8): SIMD, cache-friendly layout, profiling-driven rework. Pivot data structures if BTreeMap is the bottleneck. |
 | R7 | libp2p integration with hotstuff_rs is non-trivial | Medium | High | Start with in-process channels for testing. Swap to libp2p gradually. |
 | R8 | Cross-VM precompile state consistency | Medium | High | EVM always reads one-block-old native state (like Hyperliquid). Test extensively. |
 | R9 | No IBC support limits ecosystem adoption | Low | Medium | Accept for v1. Plan IBC module for v2 (post-mainnet). |
