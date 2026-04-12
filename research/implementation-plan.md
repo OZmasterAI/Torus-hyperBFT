@@ -68,6 +68,10 @@ Phase 3                                                              ███�
 | 1.3.4 | EIP-1559 base fee calculation (update per block) | 1.3.3 | 2 days | W5 |
 | 1.3.5 | Log and bloom filter generation | 1.3.3 | 2 days | W6 |
 | 1.3.6 | Ethereum General State Tests (GST) suite pass | 1.3.3 | 4 days | W6 |
+| **1.3b** | **Native action transaction format** | 1.1 | 1 week | W4-W5 |
+| 1.3b.1 | EIP-712 domain separator and typed data hash for NativeAction enum | 1.1.2 | 2 days | W4 |
+| 1.3b.2 | SignedNativeAction envelope: nonce (timestamp-based), signature, sender recovery | 1.3b.1 | 2 days | W4-W5 |
+| 1.3b.3 | Native action validation: signature, nonce dedup, replay protection (chain_id) | 1.3b.2 | 1 day | W5 |
 | **1.4** | **Consensus integration (torus-consensus)** | 1.1 | 3 weeks | W3-W5 |
 | 1.4.1 | Implement hotstuff_rs `KVStore` trait over RocksDB | 1.2.1 | 2 days | W3 |
 | 1.4.2 | Implement hotstuff_rs `App` trait (stub: echo blocks) | 1.4.1 | 3 days | W3-W4 |
@@ -117,11 +121,11 @@ Phase 3                                                              ███�
 | 1.10.8 | State root consistency: all 4 validators agree on every block | 1.10.1 | 3 days | W14 |
 | 1.10.9 | Performance baseline: TPS benchmark, latency measurement | 1.10.1 | 2 days | W14-W15 |
 | 1.10.10 | Bug fix buffer | 1.10.1 | 5 days | W15 |
-| **1.11** | **Basic staking (Phase 1 subset)** | 1.5 | 2 weeks | W13-W14 |
-| 1.11.1 | Delegate/undelegate state management | 1.2.1 | 3 days | W13 |
-| 1.11.2 | Epoch-based validator set rotation | 1.11.1, 1.4.5 | 3 days | W13-W14 |
-| 1.11.3 | Delegator reward distribution (share of validator fee income, minus commission) | 1.11.2 | 2 days | W14 |
-| 1.11.4 | Staking RPC endpoints | 1.11.1, 1.8.1 | 2 days | W14 |
+| **1.11** | **Basic staking (Phase 1 subset)** | 1.5 | 2 weeks | W10-W11 |
+| 1.11.1 | Delegate/undelegate state management | 1.2.1 | 3 days | W10 |
+| 1.11.2 | Epoch-based validator set rotation | 1.11.1, 1.4.5 | 3 days | W10-W11 |
+| 1.11.3 | Delegator reward distribution (share of validator fee income, minus commission) | 1.11.2 | 2 days | W11 |
+| 1.11.4 | Staking RPC endpoints | 1.11.1, 1.8.1 | 2 days | W11 |
 
 ### Phase 1 Parallel Tracks
 
@@ -177,7 +181,13 @@ Track G (Integration):
 | 2.1.4 | Order modification and cancel-all | 2.1.2 | 2 days | M6 |
 | 2.1.5 | Matching engine unit tests (1000+ test cases) | 2.1.4 | 5 days | M6-M7 |
 | 2.1.6 | Matching engine benchmarks (target: 200k orders/sec) | 2.1.4 | 3 days | M7 |
-| **2.2** | **Margin engine** | 2.1 | 4 weeks | M7-M8 |
+| **2.1b** | **Order book hardening** | 2.1 | 4 weeks | M7-M8 |
+| 2.1b.1 | Performance profiling and optimization (SIMD, cache-friendly layout) | 2.1.6 | 5 days | M7 |
+| 2.1b.2 | Edge case testing: dust orders, self-trade prevention, overflow | 2.1.5 | 4 days | M7 |
+| 2.1b.3 | Fuzz testing with proptest (randomized order sequences) | 2.1b.2 | 3 days | M7-M8 |
+| 2.1b.4 | Determinism tests: same order sequence → same state on all validators | 2.1b.2 | 3 days | M8 |
+| 2.1b.5 | Rework from profiling findings | 2.1b.1 | 5 days | M8 |
+| **2.2** | **Margin engine** | 2.1b | 4 weeks | M8-M9 |
 | 2.2.1 | Cross-margin model | 2.1.1 | 4 days | M7 |
 | 2.2.2 | Isolated-margin model | 2.2.1 | 3 days | M7 |
 | 2.2.3 | Margin tier system (leverage limits by notional) | 2.2.1 | 3 days | M7-M8 |
@@ -242,9 +252,9 @@ Track G (Integration):
 | 2.10.4 | Lockbox: transfer assets between VMs | 2.4.5 | 2 days | M12 |
 | 2.10.5 | Staking lifecycle: delegate → permanent → earn → governance | 2.6, 2.8 | 3 days | M12 |
 | 2.10.6 | Fee flow: EVM gas + trading fees → 4-way split | 2.7 | 2 days | M12 |
-| 2.10.7 | Stress test: sustained 10k orders/sec with 4 validators | 2.1 | 3 days | M12 |
-| 2.10.8 | Chaos testing: validator crashes, network partitions | — | 3 days | M12 |
-| 2.10.9 | Bug fix buffer | — | 5 days | M12 |
+| 2.10.7 | Stress test: sustained 10k orders/sec with 4 validators | 2.1 | 3 days | M12 wk1 |
+| 2.10.8 | Chaos testing: validator crashes, network partitions | — | 3 days | M12 wk1-2 |
+| 2.10.9 | Bug fix buffer (findings from stress/chaos testing) | 2.10.8 | 5 days | M12 wk3-4 |
 
 ---
 
@@ -304,7 +314,7 @@ Track G (Integration):
 | 3.7.1 | Mainnet genesis creation | 3.6 | 3 days | M17 |
 | 3.7.2 | Validator coordination and key ceremonies | 3.7.1 | 5 days | M17 |
 | 3.7.3 | Final performance benchmarks | 3.7.1 | 3 days | M17-M18 |
-| 3.7.4 | Upgrade mechanism design (binary versioning) | — | 3 days | M18 |
+| 3.7.4 | Upgrade mechanism: hard fork at governance-approved height (scope: binary versioning only) | — | 3 days | M18 |
 | 3.7.5 | Disaster recovery procedures | 3.1.6 | 3 days | M18 |
 | 3.7.6 | Mainnet launch | All | — | M18 |
 

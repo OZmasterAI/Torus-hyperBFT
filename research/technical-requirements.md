@@ -748,7 +748,42 @@ pub struct Log {
 
 ## 5. Native Execution Layer (torus-core)
 
-### 5.1 Order Book Matching Engine
+### 5.1 Fixed-Point Numeric Type
+
+All prices and quantities use a custom fixed-point integer type for full cross-validator
+determinism. No floating-point arithmetic anywhere in consensus-critical code.
+
+```rust
+/// Fixed-point decimal with 8 implicit decimal places.
+/// Stored as i128 internally. 1.00000000 = 100_000_000.
+/// Follows Hyperliquid's pattern of implicit decimal scaling.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, BorshSerialize, BorshDeserialize)]
+pub struct FixedPoint(i128);
+
+impl FixedPoint {
+    pub const DECIMALS: u32 = 8;
+    pub const SCALE: i128 = 100_000_000;  // 10^8
+    pub const ZERO: Self = Self(0);
+    pub const ONE: Self = Self(Self::SCALE);
+
+    pub fn from_raw(raw: i128) -> Self { Self(raw) }
+    pub fn raw(&self) -> i128 { self.0 }
+
+    /// Multiply two FixedPoints: (a * b) / SCALE
+    pub fn mul(self, other: Self) -> Self {
+        Self((self.0 as i256 * other.0 as i256 / Self::SCALE as i256) as i128)
+    }
+
+    /// Divide two FixedPoints: (a * SCALE) / b
+    pub fn div(self, other: Self) -> Self {
+        Self((self.0 as i256 * Self::SCALE as i256 / other.0 as i256) as i128)
+    }
+}
+```
+
+All `FixedPoint` operations are deterministic integer arithmetic. No `rust_decimal`, no `f64`.
+
+### 5.2 Order Book Matching Engine
 
 **Architecture:** Price-time priority Central Limit Order Book (CLOB), modeled on Hyperliquid's HyperCore.
 
@@ -763,18 +798,18 @@ pub struct OrderBook {
     /// Order index for O(1) cancel lookups
     pub order_index: HashMap<OrderId, OrderRef>,
     /// Tick size (minimum price increment)
-    pub tick_size: Decimal,
+    pub tick_size: FixedPoint,
     /// Lot size (minimum quantity increment)
-    pub lot_size: Decimal,
+    pub lot_size: FixedPoint,
 }
 
 pub struct Order {
     pub id: OrderId,
     pub trader: Address,
     pub side: Side,              // Buy or Sell
-    pub price: Decimal,
-    pub remaining_qty: Decimal,
-    pub original_qty: Decimal,
+    pub price: FixedPoint,
+    pub remaining_qty: FixedPoint,
+    pub original_qty: FixedPoint,
     pub order_type: OrderType,
     pub time_in_force: TimeInForce,
     pub timestamp: u64,          // Consensus timestamp for ordering
@@ -791,7 +826,7 @@ pub struct Order {
 6. If partial fill and GTC: insert remainder into book
 7. Emit `TradeEvent` for each fill
 
-### 5.2 Order Types
+### 5.3 Order Types
 
 | Type | Enum Variant | Behavior |
 |---|---|---|
@@ -807,7 +842,7 @@ pub struct Order {
 - `FOK` (Fill-Or-Kill): Fill entirely or reject entirely.
 - `PostOnly`: Must make liquidity; rejected if crosses spread.
 
-### 5.3 Margin Model
+### 5.4 Margin Model
 
 ```rust
 pub struct MarginEngine {
@@ -818,15 +853,15 @@ pub enum MarginMode {
     /// Shared collateral across all positions
     Cross,
     /// Dedicated collateral per position
-    Isolated { margin_per_position: HashMap<MarketId, Decimal> },
+    Isolated { margin_per_position: HashMap<MarketId, FixedPoint> },
 }
 
 /// Margin check result
 pub struct MarginCheck {
-    pub initial_margin_required: Decimal,    // To open position
-    pub maintenance_margin_required: Decimal, // To keep position
-    pub available_margin: Decimal,
-    pub margin_ratio: Decimal,               // equity / notional
+    pub initial_margin_required: FixedPoint,    // To open position
+    pub maintenance_margin_required: FixedPoint, // To keep position
+    pub available_margin: FixedPoint,
+    pub margin_ratio: FixedPoint,               // equity / notional
     pub is_liquidatable: bool,               // maintenance breached
 }
 ```
@@ -840,7 +875,7 @@ pub struct MarginCheck {
 | $5M - $10M | 10x | 10% |
 | $10M+ | 5x | 20% |
 
-### 5.4 Liquidation Engine
+### 5.5 Liquidation Engine
 
 ```rust
 pub struct LiquidationEngine;
@@ -850,7 +885,7 @@ impl LiquidationEngine {
     /// Called every block after execution.
     pub fn check_liquidations(
         positions: &[Position],
-        oracle_prices: &HashMap<MarketId, Decimal>,
+        oracle_prices: &HashMap<MarketId, FixedPoint>,
     ) -> Vec<LiquidationAction>;
 
     /// Execute liquidation: close position at oracle price.
@@ -863,13 +898,13 @@ impl LiquidationEngine {
 
 pub enum LiquidationAction {
     /// Standard liquidation: force-close at oracle price
-    ForcedClose { position: PositionId, price: Decimal },
+    ForcedClose { position: PositionId, price: FixedPoint },
     /// Auto-Deleverage: force-reduce profitable counter-positions
     ADL { position: PositionId, counter_positions: Vec<PositionId> },
 }
 ```
 
-### 5.5 Native Action Types
+### 5.6 Native Action Types
 
 ```rust
 /// All native (non-EVM) actions processed by torus-core.
@@ -880,7 +915,8 @@ pub enum NativeAction {
     PlaceOrder(PlaceOrderParams),
     CancelOrder { order_id: OrderId },
     CancelAllOrders { market_id: Option<MarketId> },
-    ModifyOrder { order_id: OrderId, new_price: Option<Decimal>, new_qty: Option<Decimal> },
+    ModifyOrder { order_id: OrderId, new_price: Option<FixedPoint>,
+        new_qty: Option<FixedPoint> },
 
     // === Transfers ===
     TransferToPerp { amount: U256 },       // Spot -> Perp balance
@@ -909,6 +945,106 @@ pub enum NativeAction {
     DelistMarket { market_id: MarketId },
 }
 ```
+
+### 5.7 Native Action Signing (EIP-712)
+
+Native actions use **EIP-712 typed structured data signing** over secp256k1 (same key as EVM),
+following Hyperliquid's proven pattern. Users have one key for both VMs.
+
+```rust
+/// Signed native action envelope. Submitted via torus_submitNativeAction RPC.
+#[derive(Serialize, Deserialize)]
+pub struct SignedNativeAction {
+    /// The action payload
+    pub action: NativeAction,
+    /// Millisecond timestamp nonce (not sequential — allows out-of-order processing)
+    pub nonce: u64,
+    /// EIP-712 signature (r, s, v) over the typed data hash
+    pub signature: Signature,
+}
+
+impl SignedNativeAction {
+    /// Recover sender address from EIP-712 signature.
+    pub fn recover_sender(&self) -> Result<Address> {
+        let domain = eip712_domain();
+        let struct_hash = self.action.eip712_hash();
+        let signing_hash = eip712_signing_hash(domain, struct_hash);
+        ecrecover(signing_hash, &self.signature)
+    }
+}
+
+/// EIP-712 domain separator for native actions.
+fn eip712_domain() -> EIP712Domain {
+    EIP712Domain {
+        name: "Torus",
+        version: "1",
+        chain_id: U256::from(7777),  // Replay protection
+        verifying_contract: Address::ZERO,
+    }
+}
+```
+
+**Design choices (following Hyperliquid):**
+- **Nonce is timestamp-based (ms)**, not sequential — simplifies order cancellation
+  and allows concurrent action submission without nonce coordination
+- **Sender recovered from signature** — no explicit `from` field
+- **EIP-712 domain includes chain_id** — prevents replay across mainnet/testnet
+- **Same secp256k1 key as EVM** — MetaMask and all EVM wallets work natively
+
+### 5.8 Oracle Price Feed
+
+Validator-submitted price feed following Hyperliquid's model. Validators run price
+feed bots that submit external exchange prices; the chain aggregates via stake-weighted median.
+
+```rust
+/// Oracle price submission from a validator.
+pub struct OracleSubmission {
+    pub validator: Address,
+    pub prices: Vec<(MarketId, FixedPoint)>,
+    pub timestamp: u64,
+    pub source_weights: Vec<(ExchangeId, u8)>,  // e.g., Binance=3, OKX=2, Bybit=2
+}
+
+pub struct OracleAggregator;
+
+impl OracleAggregator {
+    /// Compute final oracle price from validator submissions.
+    /// Stake-weighted median across all validator submissions.
+    pub fn aggregate(
+        submissions: &[OracleSubmission],
+        validator_stakes: &HashMap<Address, U256>,
+    ) -> HashMap<MarketId, FixedPoint> {
+        // For each market:
+        // 1. Collect (price, stake_weight) from each validator
+        // 2. Sort by price
+        // 3. Walk from lowest price, accumulating stake weight
+        // 4. Median = price where cumulative weight crosses 50% of total
+        // Deterministic: all validators compute same result
+    }
+
+    /// Reject outlier submissions (>5% deviation from current median).
+    pub fn filter_outliers(
+        submissions: &[OracleSubmission],
+        current_prices: &HashMap<MarketId, FixedPoint>,
+    ) -> Vec<OracleSubmission>;
+
+    /// Detect staleness: reject prices older than 10 seconds.
+    pub fn check_staleness(submission: &OracleSubmission, block_time: u64) -> bool;
+}
+```
+
+**Oracle configuration (per market, governance-adjustable):**
+
+| Parameter | Default | Description |
+|---|---|---|
+| `max_staleness_ms` | 10,000 | Reject prices older than this |
+| `outlier_threshold_bps` | 500 | Reject submissions >5% from median |
+| `min_submissions` | 3 | Minimum validators needed for valid price |
+| `update_frequency` | Every block | Prices refreshed each block |
+
+**External exchange weights** (following Hyperliquid):
+Binance (3), OKX (2), Bybit (2), Kraken (1), KuCoin (1), Gate (1), MEXC (1), Torus (1).
+Final price per validator = weighted median across their exchange feeds.
 
 ---
 
@@ -1136,7 +1272,7 @@ let swarm = SwarmBuilder::with_new_identity()
 
 - **Bootstrap nodes:** Hardcoded list of seed nodes for initial peer discovery
 - **Kademlia DHT:** Peer discovery after bootstrap
-- **Connection limits:** Max 50 peers (validators prioritized)
+- **Connection limits:** Max 100 peers (configurable, validators prioritized)
 - **Peer scoring:** Track message delivery rate, penalize spam, reward reliable peers
 - **Ban list:** Peers sending invalid messages get temporarily banned (exponential backoff)
 
@@ -1850,9 +1986,13 @@ Features: `server, client, macros`
 | EVM spec level | Cancun (no EIP-4844) | Same as Hyperliquid. Blobs not needed on L1. |
 | Signing algorithm (validators) | Ed25519 | Fast verification, used by hotstuff_rs |
 | Signing algorithm (EVM txs) | secp256k1 (ECDSA) | Ethereum compatibility |
+| Signing algorithm (native actions) | EIP-712 over secp256k1 | Same key as EVM, MetaMask-compatible, Hyperliquid pattern |
+| Numeric type (prices/quantities) | Custom FixedPoint (i128, 8 decimals) | Fully deterministic, no f64, Hyperliquid pattern |
+| Oracle model | Validator-submitted stake-weighted median | No external deps, Hyperliquid pattern |
+| Chain upgrade mechanism | Hard fork at governance-approved height | Simple, all nodes upgrade simultaneously |
 | Block size limit | 2 MB (native) + 30M gas (EVM) | Balance throughput vs. propagation |
 | State snapshot interval | Every 10,000 blocks | Fast node bootstrap |
-| Chain ID | 7777 (mainnet), 7778 (testnet) | Unique, not conflicting with existing chains |
+| Chain ID | 7777 (mainnet), 7778 (testnet) | Verify unregistered at chainlist.org before mainnet |
 
 ## Appendix B: Hyperliquid Reference Architecture
 
