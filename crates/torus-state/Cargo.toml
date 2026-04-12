@@ -7,8 +7,12 @@ license.workspace = true
 [dependencies]
 torus-types = { workspace = true }
 alloy-primitives = { workspace = true }
+alloy-rlp = { workspace = true }
+revm = { workspace = true }
+rocksdb = { workspace = true }
 reth-trie = { workspace = true }
 reth-trie-common = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true }
+tempfile = { workspace = true }
