@@ -9,10 +9,12 @@ torus-types = { workspace = true }
 torus-state = { workspace = true }
 torus-economics = { workspace = true }
 thiserror = { workspace = true }
+borsh = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
 proptest = { workspace = true }
+tempfile = { workspace = true }
 
 [[bench]]
 name = "order_book"

@@ -36,6 +36,10 @@ pub const CF_FEE_CONFIG: &str = "cf_fee_config";
 pub const CF_TREASURY: &str = "cf_treasury";
 pub const CF_DEV_POOL: &str = "cf_dev_pool";
 
+// Oracle
+pub const CF_NATIVE_ORACLE: &str = "cf_native_oracle";
+pub const CF_NATIVE_TRADES: &str = "cf_native_trades";
+
 // Other
 pub const CF_CORE_WRITER_QUEUE: &str = "cf_core_writer_queue";
 pub const CF_CONSENSUS_META: &str = "cf_consensus_meta";
@@ -71,6 +75,8 @@ pub const ALL_CF_NAMES: &[&str] = &[
     CF_FEE_CONFIG,
     CF_TREASURY,
     CF_DEV_POOL,
+    CF_NATIVE_ORACLE,
+    CF_NATIVE_TRADES,
     CF_CORE_WRITER_QUEUE,
     CF_CONSENSUS_META,
     CF_TRIE_NODES,

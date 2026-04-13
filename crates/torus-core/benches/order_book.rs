@@ -189,6 +189,45 @@ fn bench_mixed_workload(c: &mut Criterion) {
     });
 }
 
+/// Insert into a book with 1000 existing ask levels.
+fn bench_deep_book_insert(c: &mut Criterion) {
+    c.bench_function("deep_book_1000_levels_insert", |b| {
+        b.iter_custom(|iters| {
+            let mut ob = new_book();
+            for level in 0..1000i64 {
+                ob.place_order(
+                    limit_sell(fp(1000 + level), fp(10)),
+                    addr((level % 200) as u8 + 1),
+                    level as u64,
+                );
+            }
+            let start = std::time::Instant::now();
+            for i in 0..iters {
+                let price = fp(500 + (i % 500) as i64);
+                ob.place_order(black_box(limit_buy(price, fp(1))), addr(0), 1000 + i);
+            }
+            start.elapsed()
+        });
+    });
+}
+
+/// Single-level match throughput (hot path).
+fn bench_hot_path_match(c: &mut Criterion) {
+    c.bench_function("hot_path_single_level_match", |b| {
+        b.iter_custom(|iters| {
+            let mut ob = new_book();
+            for i in 0..iters {
+                ob.place_order(limit_sell(fp(100), fp(1)), addr(1), i * 2);
+            }
+            let start = std::time::Instant::now();
+            for i in 0..iters {
+                ob.place_order(black_box(limit_buy(fp(100), fp(1))), addr(0), i * 2 + 1);
+            }
+            start.elapsed()
+        });
+    });
+}
+
 criterion_group!(
     benches,
     bench_place_no_match,
@@ -197,5 +236,7 @@ criterion_group!(
     bench_cancel,
     bench_cancel_all,
     bench_mixed_workload,
+    bench_deep_book_insert,
+    bench_hot_path_match,
 );
 criterion_main!(benches);

@@ -162,6 +162,16 @@ impl OrderBook {
         let order_id = self.alloc_id();
         let side = if params.is_buy { Side::Buy } else { Side::Sell };
 
+        // Dust order rejection (2.1b.2): qty must be >= lot_size
+        if params.quantity < self.lot_size {
+            return PlaceResult {
+                order_id,
+                status: OrderStatus::Rejected,
+                fills: vec![],
+                self_trade_cancels: vec![],
+            };
+        }
+
         // Stop orders → store in pending_stops
         match params.order_type {
             OrderType::StopMarket { trigger } => {
@@ -478,6 +488,38 @@ impl OrderBook {
     /// Number of pending stop orders.
     pub fn pending_stop_count(&self) -> usize {
         self.pending_stops.len()
+    }
+
+    /// Verify internal book invariants. Panics if any invariant is violated.
+    /// Used by fuzz tests and determinism tests.
+    pub fn verify_invariants(&self) {
+        // Invariant 1: no crossed orders
+        if let (Some(bid), Some(ask)) = (self.best_bid(), self.best_ask()) {
+            assert!(bid < ask, "Crossed book: best_bid={bid} >= best_ask={ask}");
+        }
+        // Invariant 2: order_count matches actual orders in bids + asks
+        let bid_orders: usize = self.bids.values().map(|q| q.len()).sum();
+        let ask_orders: usize = self.asks.values().map(|q| q.len()).sum();
+        assert_eq!(
+            self.order_index.len(),
+            bid_orders + ask_orders,
+            "order_index({}) != bids({bid_orders}) + asks({ask_orders})",
+            self.order_index.len()
+        );
+        // Invariant 3: all resting quantities > 0
+        for queue in self.bids.values().chain(self.asks.values()) {
+            for order in queue {
+                assert!(
+                    order.remaining_qty > FixedPoint::ZERO,
+                    "Order {} has non-positive remaining qty",
+                    order.id
+                );
+            }
+        }
+        // Invariant 4: no empty price levels
+        for queue in self.bids.values().chain(self.asks.values()) {
+            assert!(!queue.is_empty(), "Empty price level in book");
+        }
     }
 
     // ========================================================================
@@ -1762,5 +1804,53 @@ mod tests {
         assert_eq!(ob.order_count(), 1);
         assert_eq!(ob.best_bid(), Some(fp(101)));
         assert_ne!(r.order_id, r2.order_id); // new ID
+    }
+
+    // ====================================================================
+    // 2.1b.2 — Dust order rejection
+    // ====================================================================
+
+    #[test]
+    fn dust_order_rejected() {
+        // lot_size = 1.0, so 0.5 is dust
+        let mut ob = OrderBook::new(1, fp_frac(0, 1), fp(1));
+        let r = ob.place_order(limit_buy(fp(100), fp_frac(0, 50_000_000)), addr(1), 1);
+        assert_eq!(r.status, OrderStatus::Rejected);
+        assert!(r.fills.is_empty());
+        assert_eq!(ob.order_count(), 0);
+    }
+
+    #[test]
+    fn dust_order_exact_lot_size_accepted() {
+        let mut ob = OrderBook::new(1, fp_frac(0, 1), fp(1));
+        let r = ob.place_order(limit_buy(fp(100), fp(1)), addr(1), 1);
+        assert_eq!(r.status, OrderStatus::Resting);
+        assert_eq!(ob.order_count(), 1);
+    }
+
+    #[test]
+    fn dust_stop_order_rejected() {
+        let mut ob = OrderBook::new(1, fp_frac(0, 1), fp(1));
+        let params = PlaceOrderParams {
+            market_id: 1,
+            is_buy: true,
+            price: FixedPoint::ZERO,
+            quantity: fp_frac(0, 50_000_000),
+            order_type: OrderType::StopMarket { trigger: fp(100) },
+            time_in_force: TimeInForce::GTC,
+            reduce_only: false,
+            client_order_id: None,
+        };
+        let r = ob.place_order(params, addr(1), 1);
+        assert_eq!(r.status, OrderStatus::Rejected);
+        assert_eq!(ob.pending_stop_count(), 0);
+    }
+
+    #[test]
+    fn dust_market_order_rejected() {
+        let mut ob = OrderBook::new(1, fp_frac(0, 1), fp(1));
+        ob.place_order(limit_sell(fp(100), fp(10)), addr(1), 1);
+        let r = ob.place_order(market_buy(fp_frac(0, 50_000_000)), addr(2), 2);
+        assert_eq!(r.status, OrderStatus::Rejected);
     }
 }
