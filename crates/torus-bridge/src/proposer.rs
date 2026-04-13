@@ -6,11 +6,12 @@ use torus_evm::{
     calc_next_block_base_fee, BlockEnvCfg, BlockExecResult, EvmExecutor, DEFAULT_BLOCK_GAS_LIMIT,
 };
 use torus_state::StateDb;
-use torus_types::{TorusBlock, TorusBlockHeader};
+use torus_types::{SignedNativeAction, TorusBlock, TorusBlockHeader};
 
 use crate::decode::{decode_all_txs, DecodedTx};
 use crate::error::BridgeError;
-use crate::state_root::compute_post_bundle_state_root;
+use crate::native_executor::{sort_native_actions, NativeExecContext, NativeExecutor};
+use crate::state_root::{compute_full_composite_root, compute_native_state_root, compute_post_bundle_state_root};
 
 /// Result of a block proposal.
 pub struct ProposedBlock {
@@ -102,6 +103,117 @@ impl BlockProposer {
                 validator_set_hash: parent.validator_set_hash,
             },
             native_actions: vec![],
+            evm_transactions,
+            core_writer_actions: vec![],
+        };
+
+        Ok(ProposedBlock { block, exec_result })
+    }
+
+    /// Build a block containing both native actions and EVM transactions.
+    ///
+    /// Native actions are sorted into deterministic execution order per tech-req:
+    ///   1. Cancellations (pre-EVM)
+    ///   2. Non-GTC orders (pre-EVM)
+    ///   3. EVM transactions
+    ///   4. GTC limit orders (post-EVM)
+    ///   5-10: CoreWriter drain, lockbox, oracle, governance, liquidation, fees
+    ///         (executed during validation, not proposal)
+    ///
+    /// Senders are recovered from EIP-712 signatures on SignedNativeActions.
+    pub fn build_block_with_native(
+        &self,
+        state_db: &StateDb,
+        evm_executor: &EvmExecutor,
+        parent: &TorusBlockHeader,
+        signed_native_actions: Vec<SignedNativeAction>,
+        evm_transactions: Vec<Vec<u8>>,
+        timestamp: u64,
+        proposer: Address,
+    ) -> Result<ProposedBlock, BridgeError> {
+        let next_base_fee = calc_next_block_base_fee(
+            parent.evm_gas_used,
+            parent.evm_gas_limit,
+            parent.base_fee_per_gas,
+        );
+
+        let block_height = parent.height + 1;
+        let gas_limit = if parent.evm_gas_limit == 0 {
+            DEFAULT_BLOCK_GAS_LIMIT
+        } else {
+            parent.evm_gas_limit
+        };
+
+        // Recover senders from EIP-712 signatures.
+        let mut sender_actions = Vec::with_capacity(signed_native_actions.len());
+        let mut native_actions_for_block = Vec::with_capacity(signed_native_actions.len());
+        for signed in &signed_native_actions {
+            let sender = signed
+                .recover_sender()
+                .map_err(|e| BridgeError::SignatureRecovery(format!("{e}")))?;
+            sender_actions.push((sender, signed.action.clone()));
+            native_actions_for_block.push(signed.action.clone());
+        }
+
+        // Sort into pre-EVM and post-EVM groups.
+        let (pre_evm, post_evm) = sort_native_actions(&sender_actions);
+
+        // Create native execution context.
+        let mut ctx = NativeExecContext::new(
+            state_db.clone(),
+            block_height,
+            timestamp,
+            parent.epoch,
+            0, // epoch_length — set by caller in production
+            0, // max_validators
+            proposer,
+            Address::ZERO,
+            Address::ZERO,
+        );
+
+        // Phase 1: Execute pre-EVM native actions (cancellations, non-GTC orders).
+        NativeExecutor::execute_batch(&mut ctx, &pre_evm);
+
+        // Phase 2: Execute EVM transactions.
+        let decoded_txs = decode_all_txs(&evm_transactions)?;
+        let tx_envs: Vec<_> = decoded_txs.iter().map(|d| d.tx_env.clone()).collect();
+
+        let block_cfg = BlockEnvCfg {
+            number: block_height,
+            timestamp,
+            beneficiary: proposer,
+            gas_limit,
+            base_fee: next_base_fee,
+        };
+
+        let mut exec_result = evm_executor.execute_block(state_db, &block_cfg, tx_envs)?;
+        set_receipt_metadata(&mut exec_result, &decoded_txs, block_height);
+
+        // Phase 3: Execute post-EVM native actions (GTC orders, lockbox, oracle, etc.).
+        NativeExecutor::execute_batch(&mut ctx, &post_evm);
+
+        // Compute composite state root.
+        let native_root = compute_native_state_root(state_db);
+        let state_root = compute_full_composite_root(state_db, &exec_result.bundle, native_root)?;
+        let receipts_root = compute_receipts_root(&exec_result.receipts);
+
+        let block = TorusBlock {
+            header: TorusBlockHeader {
+                height: block_height,
+                timestamp,
+                proposer,
+                state_root,
+                receipts_root,
+                logs_bloom: exec_result.logs_bloom,
+                evm_gas_used: exec_result.gas_used,
+                evm_gas_limit: gas_limit,
+                native_action_count: native_actions_for_block.len() as u32,
+                evm_tx_count: evm_transactions.len() as u32,
+                base_fee_per_gas: next_base_fee,
+                epoch: parent.epoch,
+                validator_set_hash: parent.validator_set_hash,
+            },
+            native_actions: native_actions_for_block,
             evm_transactions,
             core_writer_actions: vec![],
         };

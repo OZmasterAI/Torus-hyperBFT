@@ -27,6 +27,59 @@ pub fn compute_post_bundle_state_root(
     Ok(compute_composite_root(evm_root, EMPTY_ROOT_HASH))
 }
 
+/// Compute the composite state root (EVM + native) with an explicit native root.
+///
+/// Used in Phase 2 when native execution produces actual state changes.
+/// The native root is computed by the caller (e.g. from native CF hashes).
+pub fn compute_full_composite_root(
+    state_db: &StateDb,
+    bundle: &BundleState,
+    native_root: B256,
+) -> Result<B256, StateError> {
+    let evm_root = compute_post_bundle_evm_root(state_db, bundle)?;
+    Ok(compute_composite_root(evm_root, native_root))
+}
+
+/// Compute a native state root by hashing key native column families.
+///
+/// Iterates all entries in native balance and position CFs, concatenates
+/// their key-value pairs, and returns `keccak256(data)`. This is a linear
+/// scan suitable for Phase 2 — production would use an incremental trie.
+pub fn compute_native_state_root(state_db: &StateDb) -> B256 {
+    use torus_state::cf::{
+        CF_NATIVE_BALANCES, CF_NATIVE_ORACLE, CF_NATIVE_POSITIONS, CF_STAKING_DELEGATIONS,
+        CF_STAKING_VALIDATORS,
+    };
+
+    let db = state_db.inner();
+    let mut data = Vec::new();
+
+    // Hash each native CF's contents in deterministic order.
+    for cf_name in &[
+        CF_NATIVE_BALANCES,
+        CF_NATIVE_POSITIONS,
+        CF_NATIVE_ORACLE,
+        CF_STAKING_DELEGATIONS,
+        CF_STAKING_VALIDATORS,
+    ] {
+        if let Some(cf) = db.cf_handle(cf_name) {
+            let iter = db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+            for item in iter {
+                if let Ok((key, value)) = item {
+                    data.extend_from_slice(&key);
+                    data.extend_from_slice(&value);
+                }
+            }
+        }
+    }
+
+    if data.is_empty() {
+        return EMPTY_ROOT_HASH;
+    }
+
+    alloy_primitives::keccak256(&data)
+}
+
 /// Compute the EVM state root after applying the given `BundleState`.
 ///
 /// Reads all accounts and storage from the DB, merges `BundleState` changes

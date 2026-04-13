@@ -15,6 +15,7 @@ alloy-primitives = { workspace = true }
 alloy-consensus = { workspace = true, features = ["k256"] }
 alloy-rlp = { workspace = true }
 revm = { workspace = true }
+rocksdb = { workspace = true }
 sha2 = "0.10"
 serde_json = { workspace = true }
 tracing = { workspace = true }

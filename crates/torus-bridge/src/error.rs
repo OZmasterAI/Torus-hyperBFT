@@ -23,6 +23,12 @@ pub enum BridgeError {
     InvalidBlock(String),
     /// Serialization / deserialization error.
     Serialization(String),
+    /// Native action execution error.
+    NativeExecution(String),
+    /// Core module error (order book, margin, liquidation, oracle).
+    Core(torus_core::error::CoreError),
+    /// Economics module error (staking, governance, rewards).
+    Economics(torus_economics::EconomicsError),
 }
 
 impl fmt::Display for BridgeError {
@@ -41,6 +47,9 @@ impl fmt::Display for BridgeError {
             }
             Self::InvalidBlock(msg) => write!(f, "invalid block: {msg}"),
             Self::Serialization(e) => write!(f, "serialization error: {e}"),
+            Self::NativeExecution(e) => write!(f, "native execution error: {e}"),
+            Self::Core(e) => write!(f, "core error: {e}"),
+            Self::Economics(e) => write!(f, "economics error: {e}"),
         }
     }
 }
@@ -50,6 +59,8 @@ impl std::error::Error for BridgeError {
         match self {
             Self::Evm(e) => Some(e),
             Self::State(e) => Some(e),
+            Self::Core(e) => Some(e),
+            Self::Economics(e) => Some(e),
             _ => None,
         }
     }
@@ -64,5 +75,17 @@ impl From<torus_evm::EvmError> for BridgeError {
 impl From<torus_state::StateError> for BridgeError {
     fn from(e: torus_state::StateError) -> Self {
         Self::State(e)
+    }
+}
+
+impl From<torus_core::error::CoreError> for BridgeError {
+    fn from(e: torus_core::error::CoreError) -> Self {
+        Self::Core(e)
+    }
+}
+
+impl From<torus_economics::EconomicsError> for BridgeError {
+    fn from(e: torus_economics::EconomicsError) -> Self {
+        Self::Economics(e)
     }
 }
