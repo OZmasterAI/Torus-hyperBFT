@@ -318,8 +318,96 @@ pub const TRANSITION_EPOCHS: u64 = 1825;
 pub const FEE_START_BURN_BPS: u16 = 1000;
 pub const FEE_START_VALIDATOR_BPS: u16 = 0;
 pub const FEE_START_TREASURY_BPS: u16 = 4500;
+pub const FEE_START_DEV_POOL_BPS: u16 = 4500;
 
 /// Fee split end ratios (bps).
 pub const FEE_END_BURN_BPS: u16 = 2500;
 pub const FEE_END_VALIDATOR_BPS: u16 = 2500;
 pub const FEE_END_TREASURY_BPS: u16 = 2500;
+pub const FEE_END_DEV_POOL_BPS: u16 = 2500;
+
+// ============================================================================
+// Fee Split Result (2.7)
+// ============================================================================
+
+/// Result of splitting fees into four buckets. All values sum exactly to the input.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FeeSplitResult {
+    pub burn: U256,
+    pub validators: U256,
+    pub treasury: U256,
+    pub dev_pool: U256,
+}
+
+// ============================================================================
+// Dev Pool Entry (2.7.5)
+// ============================================================================
+
+/// Tracks gas usage for a single deployer in one epoch.
+/// Key: deployer Address (20 bytes). Value: borsh-encoded.
+#[derive(Clone, Debug)]
+pub struct DevPoolEntry {
+    pub deployer: Address,
+    pub total_gas_used: u64,
+    pub contracts: Vec<Address>,
+}
+
+impl BorshSerialize for DevPoolEntry {
+    fn serialize<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+        borsh_write_address(&self.deployer, writer)?;
+        BorshSerialize::serialize(&self.total_gas_used, writer)?;
+        BorshSerialize::serialize(&(self.contracts.len() as u32), writer)?;
+        for addr in &self.contracts {
+            borsh_write_address(addr, writer)?;
+        }
+        Ok(())
+    }
+}
+
+impl BorshDeserialize for DevPoolEntry {
+    fn deserialize_reader<R: Read>(reader: &mut R) -> io::Result<Self> {
+        let deployer = borsh_read_address(reader)?;
+        let total_gas_used = u64::deserialize_reader(reader)?;
+        let len = u32::deserialize_reader(reader)? as usize;
+        let mut contracts = Vec::with_capacity(len);
+        for _ in 0..len {
+            contracts.push(borsh_read_address(reader)?);
+        }
+        Ok(Self {
+            deployer,
+            total_gas_used,
+            contracts,
+        })
+    }
+}
+
+// ============================================================================
+// Supply Tracker (2.7.2 — burn tracking)
+// ============================================================================
+
+/// Tracks cumulative burned and treasury amounts.
+/// Key: static "supply" key in CF_TREASURY. Value: borsh-encoded.
+#[derive(Clone, Debug)]
+pub struct SupplyTracker {
+    pub cumulative_burned: U256,
+    pub cumulative_treasury: U256,
+}
+
+impl BorshSerialize for SupplyTracker {
+    fn serialize<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+        borsh_write_u256(&self.cumulative_burned, writer)?;
+        borsh_write_u256(&self.cumulative_treasury, writer)?;
+        Ok(())
+    }
+}
+
+impl BorshDeserialize for SupplyTracker {
+    fn deserialize_reader<R: Read>(reader: &mut R) -> io::Result<Self> {
+        let cumulative_burned = borsh_read_u256(reader)?;
+        let cumulative_treasury = borsh_read_u256(reader)?;
+        Ok(Self {
+            cumulative_burned,
+            cumulative_treasury,
+        })
+    }
+}

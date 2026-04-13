@@ -70,6 +70,8 @@ pub struct Genesis {
     pub markets: Vec<serde_json::Value>,
     #[serde(default)]
     pub precompiles: HashMap<String, String>,
+    #[serde(default)]
+    pub permanent_stakes: Vec<GenesisPermanentStake>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -139,6 +141,12 @@ pub struct GenesisAccount {
     pub balance: String,
     #[serde(default)]
     pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GenesisPermanentStake {
+    pub address: String,
+    pub amount: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -288,7 +296,24 @@ impl Genesis {
             info!(%address, stake = %validator.stake, "seeded genesis validator");
         }
 
-        // 4. Compute state root
+        // 4. Seed permanent stakes into CF_STAKING_PERMANENT
+        for ps in &self.permanent_stakes {
+            let address = parse_address(&ps.address)?;
+            let amount = parse_u256(&ps.amount)?;
+            // Borsh-encode PermanentStakeInfo: address(20) + amount(32 BE) + locked_at_block(8 LE)
+            let mut data = Vec::with_capacity(60);
+            data.extend_from_slice(address.as_slice()); // 20 bytes
+            data.extend_from_slice(&amount.to_be_bytes::<32>()); // 32 bytes
+            data.extend_from_slice(&0u64.to_le_bytes()); // 8 bytes, block 0
+            state_db.put_cf_raw(
+                torus_state::cf::CF_STAKING_PERMANENT,
+                address.as_slice(),
+                &data,
+            )?;
+            info!(%address, %amount, "seeded genesis permanent stake");
+        }
+
+        // 5. Compute state root
         let state_root = compute_state_root_from_db(state_db)?;
         info!(%state_root, "genesis state root computed");
         Ok(state_root)

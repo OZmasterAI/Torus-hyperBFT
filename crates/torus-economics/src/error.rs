@@ -47,4 +47,10 @@ pub enum EconomicsError {
 
     #[error("no rewards to claim for {0}")]
     NoRewards(Address),
+
+    #[error("permanent stake amount must be non-zero")]
+    ZeroPermanentStake,
+
+    #[error("deployer {0} not found in dev pool")]
+    DeployerNotFound(Address),
 }

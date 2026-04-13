@@ -1,6 +1,8 @@
-//! Delegator reward distribution and fee split logic (task 1.11.3).
+//! Delegator reward distribution and fee split logic (tasks 1.11.3, 2.7).
 
 use alloy_primitives::{Address, U256};
+use borsh::BorshDeserialize;
+use torus_state::cf::CF_TREASURY;
 
 use crate::staking::StakingManager;
 use crate::types::*;
@@ -168,6 +170,172 @@ pub fn lerp_bps(start: u16, end: u16, numerator: u64, denominator: u64) -> u16 {
     } else {
         let delta = (start - end) as u64;
         start - ((delta * numerator) / denominator) as u16
+    }
+}
+
+// ============================================================================
+// FeeSplitter (task 2.7)
+// ============================================================================
+
+/// Static key for the supply tracker in CF_TREASURY.
+const SUPPLY_TRACKER_KEY: &[u8] = b"supply_tracker";
+
+/// Splits block fees into burn/validators/treasury/dev_pool with BPS interpolation,
+/// executes burn, credits treasury, and distributes validator rewards with commission.
+pub struct FeeSplitter;
+
+impl FeeSplitter {
+    /// Split total fees into four buckets using interpolated BPS ratios.
+    /// burn + validators + treasury are computed via BPS; dev_pool gets the remainder
+    /// so the sum is exactly `total_fees` (no rounding loss).
+    pub fn split_fees(total_fees: U256, epoch: u64) -> FeeSplitResult {
+        if total_fees.is_zero() {
+            return FeeSplitResult {
+                burn: U256::ZERO,
+                validators: U256::ZERO,
+                treasury: U256::ZERO,
+                dev_pool: U256::ZERO,
+            };
+        }
+
+        let bps_10000 = U256::from(10_000u32);
+
+        let burn_bps = lerp_bps(FEE_START_BURN_BPS, FEE_END_BURN_BPS, epoch, TRANSITION_EPOCHS);
+        let validator_bps = lerp_bps(
+            FEE_START_VALIDATOR_BPS,
+            FEE_END_VALIDATOR_BPS,
+            epoch,
+            TRANSITION_EPOCHS,
+        );
+        let treasury_bps = lerp_bps(
+            FEE_START_TREASURY_BPS,
+            FEE_END_TREASURY_BPS,
+            epoch,
+            TRANSITION_EPOCHS,
+        );
+
+        let burn = total_fees * U256::from(burn_bps) / bps_10000;
+        let validators = total_fees * U256::from(validator_bps) / bps_10000;
+        let treasury = total_fees * U256::from(treasury_bps) / bps_10000;
+        let dev_pool = total_fees - burn - validators - treasury;
+
+        FeeSplitResult {
+            burn,
+            validators,
+            treasury,
+            dev_pool,
+        }
+    }
+
+    /// Burn tokens by deducting from the cumulative supply tracker.
+    /// No balance is credited anywhere — tokens are destroyed.
+    pub fn execute_burn(staking: &StakingManager, amount: U256) -> Result<()> {
+        if amount.is_zero() {
+            return Ok(());
+        }
+        let mut tracker = Self::get_supply_tracker(staking)?;
+        tracker.cumulative_burned += amount;
+        Self::put_supply_tracker(staking, &tracker)?;
+        tracing::info!(%amount, cumulative = %tracker.cumulative_burned, "tokens burned");
+        Ok(())
+    }
+
+    /// Distribute the validator portion of fees to the block proposer.
+    /// Proposer keeps commission_rate; remaining goes to delegators pro-rata.
+    pub fn distribute_validator_rewards(
+        staking: &StakingManager,
+        proposer: &Address,
+        amount: U256,
+    ) -> Result<()> {
+        if amount.is_zero() {
+            return Ok(());
+        }
+
+        let val = match staking.get_validator(proposer)? {
+            Some(v) => v,
+            None => {
+                // No validator record — credit full amount to proposer balance.
+                staking.credit_balance(proposer, amount)?;
+                return Ok(());
+            }
+        };
+
+        let bps_10000 = U256::from(10_000u32);
+        let commission = amount * U256::from(val.commission_bps) / bps_10000;
+        let delegator_pool = amount - commission;
+
+        // Proposer keeps commission.
+        if !commission.is_zero() {
+            staking.credit_rewards(*proposer, commission)?;
+        }
+
+        // If no delegators, proposer gets everything.
+        if delegator_pool.is_zero() || val.total_delegated.is_zero() {
+            if !delegator_pool.is_zero() {
+                staking.credit_rewards(*proposer, delegator_pool)?;
+            }
+            return Ok(());
+        }
+
+        let delegations = staking.delegations_for_validator(proposer)?;
+        let total_delegated = val.total_delegated;
+
+        let mut distributed = U256::ZERO;
+        let last_idx = delegations.len().saturating_sub(1);
+
+        for (i, del) in delegations.iter().enumerate() {
+            let share = if i == last_idx {
+                // Last delegator gets remainder to avoid rounding dust.
+                delegator_pool - distributed
+            } else {
+                delegator_pool * del.amount / total_delegated
+            };
+            if !share.is_zero() {
+                staking.credit_rewards(del.delegator, share)?;
+                distributed += share;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Credit treasury address and update cumulative tracker.
+    pub fn credit_treasury(
+        staking: &StakingManager,
+        treasury_address: &Address,
+        amount: U256,
+    ) -> Result<()> {
+        if amount.is_zero() {
+            return Ok(());
+        }
+        staking.credit_balance(treasury_address, amount)?;
+        let mut tracker = Self::get_supply_tracker(staking)?;
+        tracker.cumulative_treasury += amount;
+        Self::put_supply_tracker(staking, &tracker)?;
+        Ok(())
+    }
+
+    /// Get the supply tracker from CF_TREASURY.
+    pub fn get_supply_tracker(staking: &StakingManager) -> Result<SupplyTracker> {
+        match staking
+            .state_db()
+            .get_cf_raw(CF_TREASURY, SUPPLY_TRACKER_KEY)?
+        {
+            Some(data) => Ok(SupplyTracker::try_from_slice(&data)
+                .map_err(|e| EconomicsError::Borsh(e.to_string()))?),
+            None => Ok(SupplyTracker {
+                cumulative_burned: U256::ZERO,
+                cumulative_treasury: U256::ZERO,
+            }),
+        }
+    }
+
+    fn put_supply_tracker(staking: &StakingManager, tracker: &SupplyTracker) -> Result<()> {
+        let data = borsh::to_vec(tracker).map_err(|e| EconomicsError::Borsh(e.to_string()))?;
+        staking
+            .state_db()
+            .put_cf_raw(CF_TREASURY, SUPPLY_TRACKER_KEY, &data)?;
+        Ok(())
     }
 }
 
