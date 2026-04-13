@@ -53,6 +53,13 @@ impl StateDb {
         &self.db
     }
 
+    /// Get a shared handle to the underlying RocksDB instance.
+    ///
+    /// Used by [`torus_consensus::RocksKVStore::new`] which needs `Arc<DB>`.
+    pub fn db_arc(&self) -> Arc<DB> {
+        self.db.clone()
+    }
+
     fn cf(&self, name: &str) -> Result<&ColumnFamily, StateError> {
         self.db
             .cf_handle(name)

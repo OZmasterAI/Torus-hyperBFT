@@ -1,5 +1,269 @@
 //! Torus-hyperBFT node binary — wires all crates together.
+//!
+//! Startup: CLI → tracing → StateDb → genesis init → build components → replica → RPC → signal wait.
 
-fn main() {
-    println!("torus-node v{}", env!("CARGO_PKG_VERSION"));
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
+use clap::Parser;
+use ed25519_dalek::SigningKey;
+use hotstuff_rs::replica::{Configuration, Replica, ReplicaSpec};
+use hotstuff_rs::types::data_types::{BufferSize, ChainID, EpochLength};
+use tracing::{error, info, warn};
+
+use torus_consensus::{RocksKVStore, TorusApp};
+use torus_evm::EvmExecutor;
+use torus_genesis::Genesis;
+use torus_mempool::{Mempool, MempoolConfig};
+use torus_network::{LibP2PNetwork, NetworkConfig};
+use torus_rpc::{BlockNotifier, RpcServer};
+use torus_state::StateDb;
+use torus_types::ChainConfig;
+
+// ---------------------------------------------------------------------------
+// CLI
+// ---------------------------------------------------------------------------
+
+#[derive(Parser)]
+#[command(
+    name = "torus-node",
+    version,
+    about = "Torus-hyperBFT validator node"
+)]
+struct Cli {
+    /// Path to genesis.json (required for first run)
+    #[arg(long)]
+    genesis: Option<PathBuf>,
+
+    /// RocksDB data directory
+    #[arg(long, default_value = "./data")]
+    data_dir: PathBuf,
+
+    /// Ed25519 signing key (64-char hex, 32 bytes)
+    #[arg(long)]
+    validator_key: String,
+
+    /// libp2p listen multiaddr
+    #[arg(long, default_value = "/ip4/0.0.0.0/udp/30333/quic-v1")]
+    p2p_listen: String,
+
+    /// Comma-separated bootstrap peer multiaddrs (with /p2p/<peer_id> suffix)
+    #[arg(long)]
+    p2p_peers: Option<String>,
+
+    /// JSON-RPC listen address
+    #[arg(long, default_value = "0.0.0.0:8545")]
+    rpc_addr: String,
+
+    /// Log level (trace, debug, info, warn, error)
+    #[arg(long, default_value = "info")]
+    log_level: String,
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn decode_hex_key(hex_str: &str) -> Result<[u8; 32], Box<dyn std::error::Error>> {
+    let hex_str = hex_str.strip_prefix("0x").unwrap_or(hex_str);
+    if hex_str.len() != 64 {
+        return Err(format!("validator key must be 64 hex chars, got {}", hex_str.len()).into());
+    }
+    let bytes: Vec<u8> = (0..hex_str.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex_str[i..i + 2], 16))
+        .collect::<Result<Vec<_>, _>>()?;
+    let arr: [u8; 32] = bytes.try_into().map_err(|_| "key must be 32 bytes")?;
+    Ok(arr)
+}
+
+fn default_chain_config() -> ChainConfig {
+    use alloy_primitives::U256;
+    ChainConfig {
+        chain_id: torus_evm::TORUS_CHAIN_ID,
+        chain_name: "torus".to_string(),
+        evm_gas_limit: 30_000_000,
+        base_fee_per_gas: 1_000_000_000,
+        epoch_length: 100_000,
+        max_validators: 21,
+        min_stake: U256::from(10_000u64) * U256::from(10u64).pow(U256::from(18u64)),
+        fee_burn_bps: 1000,
+        fee_validator_bps: 0,
+        fee_treasury_bps: 4500,
+        fee_dev_pool_bps: 4500,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+
+#[tokio::main]
+async fn main() {
+    let cli = Cli::parse();
+
+    // 1. Tracing
+    std::env::set_var("RUST_LOG", &cli.log_level);
+    torus_telemetry::init_tracing(false);
+    info!(
+        version = env!("CARGO_PKG_VERSION"),
+        data_dir = %cli.data_dir.display(),
+        "starting torus-node"
+    );
+
+    if let Err(e) = run(cli).await {
+        error!(%e, "node exited with error");
+        std::process::exit(1);
+    }
+}
+
+async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+    // 2. Parse validator key
+    let key_bytes = decode_hex_key(&cli.validator_key)?;
+    let signing_key = SigningKey::from_bytes(&key_bytes);
+    let verifying_key = signing_key.verifying_key();
+    info!(
+        pubkey = hex::encode(verifying_key.as_bytes()),
+        "loaded validator key"
+    );
+
+    // 3. Open StateDb
+    std::fs::create_dir_all(&cli.data_dir)?;
+    let state_db = StateDb::open(&cli.data_dir)?;
+    info!("state database opened");
+
+    // 4. Genesis initialization
+    let chain_config = if let Some(genesis_path) = &cli.genesis {
+        let genesis = Genesis::from_file(genesis_path)?;
+        let config = genesis.chain_config();
+
+        // Only initialize if DB is empty (first run)
+        let existing_accounts = state_db.all_accounts()?;
+        if existing_accounts.is_empty() {
+            info!(genesis = %genesis_path.display(), "initializing from genesis");
+            let state_root = genesis.initialize(&state_db)?;
+            info!(%state_root, "genesis state seeded");
+
+            // Initialize hotstuff_rs replica
+            let (app_state, vs_state) = genesis.to_hotstuff_genesis()?;
+            let init_kv = RocksKVStore::new(state_db.db_arc());
+            Replica::initialize(init_kv, app_state, vs_state);
+            info!("consensus replica initialized with genesis validator set");
+        } else {
+            info!("database already initialized, skipping genesis");
+        }
+
+        config
+    } else {
+        info!("no genesis file provided, using default chain config");
+        default_chain_config()
+    };
+
+    info!(
+        chain_id = chain_config.chain_id,
+        epoch_length = chain_config.epoch_length,
+        gas_limit = chain_config.evm_gas_limit,
+        "chain configuration loaded"
+    );
+
+    // 5. Build components
+    let app = TorusApp::new(state_db.clone(), &chain_config);
+    let kv_store = RocksKVStore::new(state_db.db_arc());
+
+    // Mempool
+    let mempool_config = MempoolConfig {
+        chain_id: chain_config.chain_id,
+        block_gas_limit: chain_config.evm_gas_limit,
+        ..MempoolConfig::default()
+    };
+    let mempool = Arc::new(Mempool::new(state_db.clone(), mempool_config));
+
+    // EVM executor
+    let executor = Arc::new(EvmExecutor::new(chain_config.chain_id));
+
+    // Network
+    let listen_addr = cli.p2p_listen.parse()
+        .map_err(|e| format!("invalid p2p-listen multiaddr: {e}"))?;
+
+    let network_config = NetworkConfig {
+        listen_addr,
+        ..NetworkConfig::default()
+    };
+
+    let (network, _tx_gossip) = LibP2PNetwork::new(network_config, verifying_key).await?;
+    info!(listen = %cli.p2p_listen, "p2p network started");
+
+    // Dial bootstrap peers
+    if let Some(peers_str) = &cli.p2p_peers {
+        for addr_str in peers_str.split(',').filter(|s| !s.is_empty()) {
+            match addr_str.trim().parse() {
+                Ok(addr) => {
+                    network.dial(addr);
+                    info!(peer = addr_str.trim(), "dialing bootstrap peer");
+                }
+                Err(e) => warn!(peer = addr_str.trim(), %e, "invalid peer multiaddr, skipping"),
+            }
+        }
+    }
+
+    // 6. Consensus configuration
+    let hs_config = Configuration::builder()
+        .me(signing_key)
+        .chain_id(ChainID::new(chain_config.chain_id))
+        .epoch_length(EpochLength::new(chain_config.epoch_length as u32))
+        .max_view_time(Duration::from_millis(2000))
+        .progress_msg_buffer_capacity(BufferSize::new(1024))
+        .block_sync_request_limit(10)
+        .block_sync_server_advertise_time(Duration::new(10, 0))
+        .block_sync_response_timeout(Duration::new(3, 0))
+        .block_sync_blacklist_expiry_time(Duration::new(10, 0))
+        .block_sync_trigger_min_view_difference(2)
+        .block_sync_trigger_timeout(Duration::new(60, 0))
+        .log_events(false)
+        .build();
+
+    // 7. Start replica
+    let _replica = ReplicaSpec::builder()
+        .app(app)
+        .network(network)
+        .kv_store(kv_store)
+        .configuration(hs_config)
+        .build()
+        .start();
+    info!("consensus replica started");
+
+    // 8. Start RPC server
+    let rpc_addr: SocketAddr = cli.rpc_addr.parse()?;
+    let notifier = BlockNotifier::new();
+    let rpc_server = RpcServer::new(
+        state_db.clone(),
+        mempool,
+        executor,
+        chain_config.chain_id,
+        notifier,
+    );
+    let (_rpc_handle, actual_addr) = rpc_server.start(rpc_addr).await?;
+    info!(%actual_addr, "JSON-RPC server started");
+
+    // 9. Metrics (optional telemetry endpoint)
+    let metrics = Arc::new(torus_telemetry::Metrics::new());
+    let metrics_addr: SocketAddr = "0.0.0.0:9090".parse().unwrap();
+    tokio::spawn(torus_telemetry::serve_metrics(metrics_addr, metrics));
+    info!(%metrics_addr, "telemetry server started");
+
+    // 10. Wait for shutdown signal
+    info!("node is running — press Ctrl+C to shut down");
+    tokio::signal::ctrl_c().await?;
+    info!("shutdown signal received, stopping...");
+
+    Ok(())
+}
+
+// Hex encoding helper for logging (no external hex crate needed)
+mod hex {
+    pub fn encode(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
 }

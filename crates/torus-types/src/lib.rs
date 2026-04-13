@@ -68,6 +68,51 @@ impl std::ops::Div for FixedPoint {
     }
 }
 
+impl std::ops::Add for FixedPoint {
+    type Output = Self;
+    fn add(self, rhs: Self) -> Self {
+        Self(self.0 + rhs.0)
+    }
+}
+
+impl std::ops::Sub for FixedPoint {
+    type Output = Self;
+    fn sub(self, rhs: Self) -> Self {
+        Self(self.0 - rhs.0)
+    }
+}
+
+impl std::ops::Neg for FixedPoint {
+    type Output = Self;
+    fn neg(self) -> Self {
+        Self(-self.0)
+    }
+}
+
+impl std::ops::AddAssign for FixedPoint {
+    fn add_assign(&mut self, rhs: Self) {
+        self.0 += rhs.0;
+    }
+}
+
+impl std::ops::SubAssign for FixedPoint {
+    fn sub_assign(&mut self, rhs: Self) {
+        self.0 -= rhs.0;
+    }
+}
+
+impl std::fmt::Display for FixedPoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let whole = self.0 / Self::SCALE;
+        let frac = (self.0 % Self::SCALE).unsigned_abs();
+        if self.0 < 0 && whole == 0 {
+            write!(f, "-0.{frac:08}")
+        } else {
+            write!(f, "{whole}.{frac:08}")
+        }
+    }
+}
+
 // ============================================================================
 // Cryptographic Primitives
 // ============================================================================
@@ -263,6 +308,13 @@ pub struct PlaceOrderParams {
 pub enum OrderType {
     Limit,
     Market,
+    StopMarket {
+        trigger: FixedPoint,
+    },
+    StopLimit {
+        trigger: FixedPoint,
+        limit: FixedPoint,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -273,6 +325,15 @@ pub enum TimeInForce {
     IOC,
     /// Fill-or-kill.
     FOK,
+    /// Post-only: rejected if would immediately match.
+    PostOnly,
+}
+
+/// Order side.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Side {
+    Buy,
+    Sell,
 }
 
 // ============================================================================

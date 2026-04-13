@@ -11,8 +11,8 @@ use k256::ecdsa::{RecoveryId, SigningKey, VerifyingKey};
 
 use crate::{
     FixedPoint, MarketId, MarketListing, MarketParams, NativeAction, OracleSubmission, OrderId,
-    PlaceOrderParams, Proposal, ProposalAction, PublicKey, Signature, SignedNativeAction,
-    VoteOption,
+    OrderType, PlaceOrderParams, Proposal, ProposalAction, PublicKey, Signature,
+    SignedNativeAction, VoteOption,
 };
 
 // ============================================================================
@@ -222,7 +222,12 @@ fn hash_place_order(p: &PlaceOrderParams, nonce: u64) -> B256 {
     buf.extend_from_slice(&encode_bool(p.is_buy));
     buf.extend_from_slice(&encode_i128(p.price.raw()));
     buf.extend_from_slice(&encode_i128(p.quantity.raw()));
-    buf.extend_from_slice(&encode_u8(p.order_type as u8));
+    buf.extend_from_slice(&encode_u8(match p.order_type {
+        OrderType::Limit => 0,
+        OrderType::Market => 1,
+        OrderType::StopMarket { .. } => 2,
+        OrderType::StopLimit { .. } => 3,
+    }));
     buf.extend_from_slice(&encode_u8(p.time_in_force as u8));
     buf.extend_from_slice(&encode_bool(p.reduce_only));
     buf.extend_from_slice(&encode_u64(coid));

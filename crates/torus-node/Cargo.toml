@@ -17,3 +17,22 @@ torus-mempool = { workspace = true }
 torus-economics = { workspace = true }
 torus-genesis = { workspace = true }
 torus-telemetry = { workspace = true }
+
+# CLI
+clap = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Serialization
+serde_json = { workspace = true }
+
+# Crypto
+ed25519-dalek = { workspace = true }
+
+# Consensus
+hotstuff_rs = { workspace = true }

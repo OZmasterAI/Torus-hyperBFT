@@ -1,0 +1,116 @@
+{
+    "chain_id": 7778,
+    "chain_name": "torus-devnet",
+    "timestamp": 1700000000,
+    "consensus": {
+        "protocol": "hotstuff",
+        "epoch_length": 100,
+        "timeout_base_ms": 500,
+        "timeout_max_ms": 30000
+    },
+    "evm": {
+        "spec_id": "cancun",
+        "gas_limit": 30000000,
+        "base_fee_initial": 1000000000,
+        "chain_id": 7778
+    },
+    "economics": {
+        "fee_split": {
+            "start": { "burn": 1000, "validator": 0, "treasury": 4500, "dev_pool": 4500 },
+            "end": { "burn": 2500, "validator": 2500, "treasury": 2500, "dev_pool": 2500 },
+            "transition_epochs": 1825
+        },
+        "permanent_staking": {
+            "annual_rate_bps": 500,
+            "governance_multiplier_bps": 15000
+        },
+        "validator": {
+            "min_self_delegation": "10000000000000000000000",
+            "max_validators": 21,
+            "unbonding_period_blocks": 604800,
+            "max_commission_bps": 5000,
+            "max_commission_change_bps": 100
+        }
+    },
+    "validators": [
+        {
+            "address": "0x1000000000000000000000000000000000000001",
+            "pubkey": "0xcecc1507dc1ddd7295951c290888f095adb9044d1b73d696e6df065d683bd4fc",
+            "stake": "1000000000000000000000000",
+            "commission_bps": 500
+        },
+        {
+            "address": "0x2000000000000000000000000000000000000002",
+            "pubkey": "0x6b79c57e6a095239282c04818e96112f3f03a4001ba97a564c23852a3f1ea5fc",
+            "stake": "1000000000000000000000000",
+            "commission_bps": 500
+        },
+        {
+            "address": "0x3000000000000000000000000000000000000003",
+            "pubkey": "0xdadbd184a2d526f1ebdd5c06fdad9359b228759b4d7f79d66689fa254aad8546",
+            "stake": "1000000000000000000000000",
+            "commission_bps": 500
+        },
+        {
+            "address": "0x4000000000000000000000000000000000000004",
+            "pubkey": "0x9be3287795907809407e14439ff198d5bfc7dce6f9bc743cb369146f610b4801",
+            "stake": "1000000000000000000000000",
+            "commission_bps": 500
+        }
+    ],
+    "accounts": [
+        {
+            "address": "0xf000000000000000000000000000000000000001",
+            "balance": "1000000000000000000000000000",
+            "note": "treasury"
+        },
+        {
+            "address": "0xf000000000000000000000000000000000000002",
+            "balance": "500000000000000000000000000",
+            "note": "dev_pool"
+        },
+        {
+            "address": "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-0 (hardhat #0)"
+        },
+        {
+            "address": "0x70997970c51812dc3a010c7d01b50e0d17dc79c8",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-1 (hardhat #1)"
+        },
+        {
+            "address": "0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-2 (hardhat #2)"
+        },
+        {
+            "address": "0x90f79bf6eb2c4f870365e785982e1f101e93b906",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-3 (hardhat #3)"
+        },
+        {
+            "address": "0x15d34aaf54267db7d7c367839aaf71a00a2c6a65",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-4 (hardhat #4)"
+        },
+        {
+            "address": "0x9965507d1a55bcc2695c58ba16fb37d819b0a4dc",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-5 (hardhat #5)"
+        },
+        {
+            "address": "0x976ea74026e726554db657fa54763abd0c3a0aa9",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-6 (hardhat #6)"
+        },
+        {
+            "address": "0x14dc79964da2c08dda4c5d09d47b49dc8de5f3e2",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-7 (hardhat #7)"
+        }
+    ],
+    "evm_alloc": {},
+    "markets": [],
+    "precompiles": {}
+}

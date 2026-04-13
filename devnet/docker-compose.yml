@@ -1,0 +1,109 @@
+version: "3.8"
+
+# 4-node Torus devnet
+# Validator signing keys (deterministic devnet keys — DO NOT use in production):
+#   validator-0: 0100000000000000000000000000000000000000000000000000000000000000
+#   validator-1: 0200000000000000000000000000000000000000000000000000000000000000
+#   validator-2: 0300000000000000000000000000000000000000000000000000000000000000
+#   validator-3: 0400000000000000000000000000000000000000000000000000000000000000
+
+services:
+  validator-0:
+    build:
+      context: ..
+      dockerfile: devnet/Dockerfile
+    command:
+      - --genesis=/genesis/genesis.json
+      - --data-dir=/data
+      - --validator-key=0100000000000000000000000000000000000000000000000000000000000000
+      - --p2p-listen=/ip4/0.0.0.0/udp/30333/quic-v1
+      - --rpc-addr=0.0.0.0:8545
+      - --log-level=info
+    volumes:
+      - ./genesis.json:/genesis/genesis.json:ro
+      - validator-0-data:/data
+    ports:
+      - "30333:30333/udp"
+      - "8545:8545"
+      - "9090:9090"
+    networks:
+      - torus-devnet
+
+  validator-1:
+    build:
+      context: ..
+      dockerfile: devnet/Dockerfile
+    command:
+      - --genesis=/genesis/genesis.json
+      - --data-dir=/data
+      - --validator-key=0200000000000000000000000000000000000000000000000000000000000000
+      - --p2p-listen=/ip4/0.0.0.0/udp/30334/quic-v1
+      - --p2p-peers=/ip4/validator-0/udp/30333/quic-v1
+      - --rpc-addr=0.0.0.0:8545
+      - --log-level=info
+    volumes:
+      - ./genesis.json:/genesis/genesis.json:ro
+      - validator-1-data:/data
+    ports:
+      - "30334:30334/udp"
+      - "8546:8545"
+    networks:
+      - torus-devnet
+    depends_on:
+      - validator-0
+
+  validator-2:
+    build:
+      context: ..
+      dockerfile: devnet/Dockerfile
+    command:
+      - --genesis=/genesis/genesis.json
+      - --data-dir=/data
+      - --validator-key=0300000000000000000000000000000000000000000000000000000000000000
+      - --p2p-listen=/ip4/0.0.0.0/udp/30335/quic-v1
+      - --p2p-peers=/ip4/validator-0/udp/30333/quic-v1
+      - --rpc-addr=0.0.0.0:8545
+      - --log-level=info
+    volumes:
+      - ./genesis.json:/genesis/genesis.json:ro
+      - validator-2-data:/data
+    ports:
+      - "30335:30335/udp"
+      - "8547:8545"
+    networks:
+      - torus-devnet
+    depends_on:
+      - validator-0
+
+  validator-3:
+    build:
+      context: ..
+      dockerfile: devnet/Dockerfile
+    command:
+      - --genesis=/genesis/genesis.json
+      - --data-dir=/data
+      - --validator-key=0400000000000000000000000000000000000000000000000000000000000000
+      - --p2p-listen=/ip4/0.0.0.0/udp/30336/quic-v1
+      - --p2p-peers=/ip4/validator-0/udp/30333/quic-v1
+      - --rpc-addr=0.0.0.0:8545
+      - --log-level=info
+    volumes:
+      - ./genesis.json:/genesis/genesis.json:ro
+      - validator-3-data:/data
+    ports:
+      - "30336:30336/udp"
+      - "8548:8545"
+    networks:
+      - torus-devnet
+    depends_on:
+      - validator-0
+
+volumes:
+  validator-0-data:
+  validator-1-data:
+  validator-2-data:
+  validator-3-data:
+
+networks:
+  torus-devnet:
+    driver: bridge

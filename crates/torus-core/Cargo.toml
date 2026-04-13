@@ -8,3 +8,12 @@ license.workspace = true
 torus-types = { workspace = true }
 torus-state = { workspace = true }
 torus-economics = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+proptest = { workspace = true }
+
+[[bench]]
+name = "order_book"
+harness = false
