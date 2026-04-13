@@ -2,6 +2,7 @@
 
 use alloy_primitives::{Address, Bloom, B256, U256};
 use serde::{Deserialize, Serialize};
+use torus_types::FixedPoint;
 
 use crate::error::RpcError;
 
@@ -227,4 +228,85 @@ pub struct LogFilter {
     pub to_block: Option<String>,
     pub address: Option<serde_json::Value>,
     pub topics: Option<Vec<Option<serde_json::Value>>>,
+}
+
+// ============================================================================
+// FixedPoint hex helper
+// ============================================================================
+
+/// Format a FixedPoint as a hex string of its raw i128 value.
+pub fn hex_fp(v: FixedPoint) -> String {
+    let raw = v.raw();
+    if raw >= 0 {
+        format!("{:#x}", raw as u128)
+    } else {
+        format!("-{:#x}", (-raw) as u128)
+    }
+}
+
+// ============================================================================
+// Torus Native RPC Response Types
+// ============================================================================
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcOrderBook {
+    pub market_id: String,
+    pub bids: Vec<RpcPriceLevel>,
+    pub asks: Vec<RpcPriceLevel>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcPriceLevel {
+    pub price: String,
+    pub quantity: String,
+    pub order_count: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcPosition {
+    pub market_id: String,
+    pub side: String,
+    pub size: String,
+    pub entry_price: String,
+    pub unrealized_pnl: String,
+    pub realized_pnl: String,
+    pub margin: String,
+    pub margin_mode: String,
+    pub liquidation_price: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcBalances {
+    pub native_balance: String,
+    pub evm_balance: String,
+    pub total_margin_used: String,
+    pub available_balance: String,
+    pub permanent_stake: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcMarketInfo {
+    pub market_id: String,
+    pub base_asset: String,
+    pub quote_asset: String,
+    pub lot_size: String,
+    pub tick_size: String,
+    pub status: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcTrade {
+    pub trade_id: String,
+    pub market_id: String,
+    pub price: String,
+    pub quantity: String,
+    pub side: String,
+    pub block_number: String,
+    pub timestamp: String,
 }

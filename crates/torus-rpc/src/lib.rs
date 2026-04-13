@@ -6,6 +6,7 @@
 pub mod error;
 pub mod eth;
 pub mod net;
+pub mod torus;
 pub mod types;
 pub mod web3;
 
@@ -23,6 +24,7 @@ use torus_state::StateDb;
 
 use crate::eth::EthApiServer;
 use crate::net::NetApiServer;
+use crate::torus::TorusApiServer;
 use crate::web3::Web3ApiServer;
 
 /// Broadcast channels for WebSocket subscriptions.
@@ -111,6 +113,7 @@ impl RpcServer {
         module.merge(EthApiServer::into_rpc(self.state.clone()))?;
         module.merge(NetApiServer::into_rpc(self.state.clone()))?;
         module.merge(Web3ApiServer::into_rpc(self.state.clone()))?;
+        module.merge(TorusApiServer::into_rpc(self.state.clone()))?;
         let handle = server.start(module);
         Ok((handle, local_addr))
     }
@@ -541,6 +544,388 @@ mod tests {
         assert_eq!(result.oldest_block, hex_u64(2));
         assert_eq!(result.gas_used_ratio.len(), 3);
         assert_eq!(result.base_fee_per_gas.len(), 4);
+        handle.stop().unwrap();
+    }
+
+    // ========================================================================
+    // Torus namespace tests (2.9.1 + 2.9.2)
+    // ========================================================================
+
+    use borsh::BorshSerialize;
+    use torus_core::position::{MarginType, NativeBalance, Position, PositionManager};
+    use torus_core::precompiles::{write_order_book_snapshot, OrderBookSnapshot, PriceLevel};
+    use torus_state::cf::{CF_NATIVE_MARKETS, CF_NATIVE_TRADES};
+    use torus_types::FixedPoint;
+
+    fn fp(v: i64) -> FixedPoint {
+        FixedPoint::from_raw(v as i128 * FixedPoint::SCALE)
+    }
+
+    fn store_market(state: &StateDb, market_id: u64, base: &str, quote: &str) {
+        let mut data = Vec::new();
+        BorshSerialize::serialize(&base.to_string(), &mut data).unwrap();
+        BorshSerialize::serialize(&quote.to_string(), &mut data).unwrap();
+        let lot_raw: i128 = FixedPoint::SCALE; // 1.0
+        let tick_raw: i128 = FixedPoint::SCALE / 100; // 0.01
+        let margin_raw: i128 = FixedPoint::SCALE / 10; // 0.1
+        BorshSerialize::serialize(&lot_raw, &mut data).unwrap();
+        BorshSerialize::serialize(&tick_raw, &mut data).unwrap();
+        BorshSerialize::serialize(&margin_raw, &mut data).unwrap();
+        state
+            .put_cf_raw(CF_NATIVE_MARKETS, &market_id.to_be_bytes(), &data)
+            .unwrap();
+    }
+
+    fn store_trade(
+        state: &StateDb,
+        market_id: u64,
+        trade_id: u128,
+        price_raw: i128,
+        qty_raw: i128,
+        side: u8,
+        block: u64,
+        ts: u64,
+        index: u32,
+    ) {
+        let mut key = Vec::with_capacity(20);
+        key.extend_from_slice(&market_id.to_be_bytes());
+        key.extend_from_slice(&block.to_be_bytes());
+        key.extend_from_slice(&index.to_be_bytes());
+
+        let mut data = Vec::new();
+        BorshSerialize::serialize(&trade_id, &mut data).unwrap();
+        BorshSerialize::serialize(&price_raw, &mut data).unwrap();
+        BorshSerialize::serialize(&qty_raw, &mut data).unwrap();
+        BorshSerialize::serialize(&side, &mut data).unwrap();
+        BorshSerialize::serialize(&block, &mut data).unwrap();
+        BorshSerialize::serialize(&ts, &mut data).unwrap();
+        state.put_cf_raw(CF_NATIVE_TRADES, &key, &data).unwrap();
+    }
+
+    #[tokio::test]
+    async fn torus_get_order_book_with_orders() {
+        let (_dir, state, mempool, executor) = setup();
+        let snapshot = OrderBookSnapshot {
+            bids: vec![
+                PriceLevel {
+                    price: fp(50000),
+                    quantity: fp(10),
+                },
+                PriceLevel {
+                    price: fp(49900),
+                    quantity: fp(5),
+                },
+            ],
+            asks: vec![
+                PriceLevel {
+                    price: fp(50100),
+                    quantity: fp(8),
+                },
+                PriceLevel {
+                    price: fp(50200),
+                    quantity: fp(3),
+                },
+            ],
+        };
+        write_order_book_snapshot(&state, 1, &snapshot).unwrap();
+        let (handle, addr) = start_server(state, mempool, executor).await;
+        use jsonrpsee::core::client::ClientT;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+        let book: RpcOrderBook = client
+            .request("torus_getOrderBook", jsonrpsee::rpc_params!["0x1"])
+            .await
+            .unwrap();
+        assert_eq!(book.bids.len(), 2);
+        assert_eq!(book.asks.len(), 2);
+        assert_eq!(book.bids[0].price, hex_fp(fp(50000)));
+        assert_eq!(book.asks[0].price, hex_fp(fp(50100)));
+        handle.stop().unwrap();
+    }
+
+    #[tokio::test]
+    async fn torus_get_order_book_empty() {
+        let (_dir, state, mempool, executor) = setup();
+        let (handle, addr) = start_server(state, mempool, executor).await;
+        use jsonrpsee::core::client::ClientT;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+        let book: RpcOrderBook = client
+            .request("torus_getOrderBook", jsonrpsee::rpc_params!["0x99"])
+            .await
+            .unwrap();
+        assert!(book.bids.is_empty());
+        assert!(book.asks.is_empty());
+        handle.stop().unwrap();
+    }
+
+    #[tokio::test]
+    async fn torus_get_position_open() {
+        let (_dir, state, mempool, executor) = setup();
+        let trader = Address::from([0x11; 20]);
+        let pm = PositionManager::new(state.clone());
+        pm.put_position(&Position {
+            trader,
+            market_id: 1,
+            is_long: true,
+            size: fp(5),
+            entry_price: fp(50000),
+            realized_pnl: fp(100),
+            isolated_margin: fp(2500),
+            margin_type: MarginType::Isolated,
+        })
+        .unwrap();
+        let (handle, addr) = start_server(state, mempool, executor).await;
+        use jsonrpsee::core::client::ClientT;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+        let pos: Option<RpcPosition> = client
+            .request(
+                "torus_getPosition",
+                jsonrpsee::rpc_params![hex_address(trader), "0x1"],
+            )
+            .await
+            .unwrap();
+        let pos = pos.unwrap();
+        assert_eq!(pos.side, "long");
+        assert_eq!(pos.size, hex_fp(fp(5)));
+        assert_eq!(pos.entry_price, hex_fp(fp(50000)));
+        assert_eq!(pos.realized_pnl, hex_fp(fp(100)));
+        assert_eq!(pos.margin_mode, "isolated");
+        handle.stop().unwrap();
+    }
+
+    #[tokio::test]
+    async fn torus_get_position_none() {
+        let (_dir, state, mempool, executor) = setup();
+        let trader = Address::from([0x22; 20]);
+        let (handle, addr) = start_server(state, mempool, executor).await;
+        use jsonrpsee::core::client::ClientT;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+        let pos: Option<RpcPosition> = client
+            .request(
+                "torus_getPosition",
+                jsonrpsee::rpc_params![hex_address(trader), "0x1"],
+            )
+            .await
+            .unwrap();
+        assert!(pos.is_none());
+        handle.stop().unwrap();
+    }
+
+    #[tokio::test]
+    async fn torus_get_balances_basic() {
+        let (_dir, state, mempool, executor) = setup();
+        let trader = Address::from([0x33; 20]);
+        // Set native balance
+        let pm = PositionManager::new(state.clone());
+        pm.put_native_balance(
+            &trader,
+            &NativeBalance {
+                available: fp(10000),
+                order_margin: fp(500),
+            },
+        )
+        .unwrap();
+        // Set EVM balance
+        state
+            .put_account(
+                &trader,
+                &AccountInfo {
+                    balance: U256::from(2_000_000_000_000_000_000u128),
+                    nonce: 0,
+                    code_hash: B256::ZERO,
+                    code: None,
+                    account_id: None,
+                },
+            )
+            .unwrap();
+        let (handle, addr) = start_server(state, mempool, executor).await;
+        use jsonrpsee::core::client::ClientT;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+        let bal: RpcBalances = client
+            .request(
+                "torus_getBalances",
+                jsonrpsee::rpc_params![hex_address(trader)],
+            )
+            .await
+            .unwrap();
+        // native_balance = available + order_margin = 10500
+        assert_eq!(bal.native_balance, hex_fp(fp(10000) + fp(500)));
+        assert_eq!(
+            bal.evm_balance,
+            hex_u256(U256::from(2_000_000_000_000_000_000u128))
+        );
+        // total_margin_used = order_margin (no positions)
+        assert_eq!(bal.total_margin_used, hex_fp(fp(500)));
+        assert_eq!(bal.available_balance, hex_fp(fp(10000)));
+        handle.stop().unwrap();
+    }
+
+    #[tokio::test]
+    async fn torus_get_balances_with_margin() {
+        let (_dir, state, mempool, executor) = setup();
+        let trader = Address::from([0x44; 20]);
+        let pm = PositionManager::new(state.clone());
+        pm.put_native_balance(
+            &trader,
+            &NativeBalance {
+                available: fp(8000),
+                order_margin: fp(1000),
+            },
+        )
+        .unwrap();
+        // Open position with isolated margin
+        pm.put_position(&Position {
+            trader,
+            market_id: 1,
+            is_long: true,
+            size: fp(2),
+            entry_price: fp(50000),
+            realized_pnl: FixedPoint::ZERO,
+            isolated_margin: fp(500),
+            margin_type: MarginType::Isolated,
+        })
+        .unwrap();
+        let (handle, addr) = start_server(state, mempool, executor).await;
+        use jsonrpsee::core::client::ClientT;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+        let bal: RpcBalances = client
+            .request(
+                "torus_getBalances",
+                jsonrpsee::rpc_params![hex_address(trader)],
+            )
+            .await
+            .unwrap();
+        // total_margin_used = order_margin(1000) + isolated(500) = 1500
+        assert_eq!(bal.total_margin_used, hex_fp(fp(1500)));
+        handle.stop().unwrap();
+    }
+
+    #[tokio::test]
+    async fn torus_get_markets() {
+        let (_dir, state, mempool, executor) = setup();
+        store_market(&state, 1, "BTC", "USD");
+        store_market(&state, 2, "ETH", "USD");
+        store_market(&state, 3, "SOL", "USD");
+        let (handle, addr) = start_server(state, mempool, executor).await;
+        use jsonrpsee::core::client::ClientT;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+        let markets: Vec<RpcMarketInfo> = client
+            .request("torus_getMarkets", jsonrpsee::rpc_params![])
+            .await
+            .unwrap();
+        assert_eq!(markets.len(), 3);
+        assert_eq!(markets[0].base_asset, "BTC");
+        assert_eq!(markets[1].base_asset, "ETH");
+        assert_eq!(markets[2].base_asset, "SOL");
+        assert_eq!(markets[0].status, "active");
+        handle.stop().unwrap();
+    }
+
+    #[tokio::test]
+    async fn torus_get_trade_history() {
+        let (_dir, state, mempool, executor) = setup();
+        let price = 50000i64 as i128 * FixedPoint::SCALE;
+        let qty = 1i128 * FixedPoint::SCALE;
+        store_trade(&state, 1, 100, price, qty, 0, 10, 1700000010, 0);
+        store_trade(&state, 1, 101, price + FixedPoint::SCALE, qty, 1, 11, 1700000011, 0);
+        store_trade(&state, 1, 102, price - FixedPoint::SCALE, qty, 0, 12, 1700000012, 0);
+        let (handle, addr) = start_server(state, mempool, executor).await;
+        use jsonrpsee::core::client::ClientT;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+        let trades: Vec<RpcTrade> = client
+            .request(
+                "torus_getTradeHistory",
+                jsonrpsee::rpc_params!["0x1", 100u32],
+            )
+            .await
+            .unwrap();
+        assert_eq!(trades.len(), 3);
+        // Most recent first
+        assert_eq!(trades[0].trade_id, hex_u128(102));
+        assert_eq!(trades[1].trade_id, hex_u128(101));
+        assert_eq!(trades[2].trade_id, hex_u128(100));
+        handle.stop().unwrap();
+    }
+
+    #[tokio::test]
+    async fn torus_get_trade_history_with_limit() {
+        let (_dir, state, mempool, executor) = setup();
+        let price = 50000i64 as i128 * FixedPoint::SCALE;
+        let qty = 1i128 * FixedPoint::SCALE;
+        for i in 0..5u32 {
+            store_trade(
+                &state,
+                1,
+                i as u128,
+                price,
+                qty,
+                0,
+                i as u64,
+                1700000000 + i as u64,
+                0,
+            );
+        }
+        let (handle, addr) = start_server(state, mempool, executor).await;
+        use jsonrpsee::core::client::ClientT;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+        let trades: Vec<RpcTrade> = client
+            .request(
+                "torus_getTradeHistory",
+                jsonrpsee::rpc_params!["0x1", 2u32],
+            )
+            .await
+            .unwrap();
+        assert_eq!(trades.len(), 2);
+        handle.stop().unwrap();
+    }
+
+    #[tokio::test]
+    async fn torus_invalid_market_id() {
+        let (_dir, state, mempool, executor) = setup();
+        let (handle, addr) = start_server(state, mempool, executor).await;
+        use jsonrpsee::core::client::ClientT;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+        let result = client
+            .request::<RpcOrderBook, _>("torus_getOrderBook", jsonrpsee::rpc_params!["not_hex"])
+            .await;
+        assert!(result.is_err());
+        handle.stop().unwrap();
+    }
+
+    #[tokio::test]
+    async fn torus_invalid_trader_address() {
+        let (_dir, state, mempool, executor) = setup();
+        let (handle, addr) = start_server(state, mempool, executor).await;
+        use jsonrpsee::core::client::ClientT;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+        let result = client
+            .request::<Option<RpcPosition>, _>(
+                "torus_getPosition",
+                jsonrpsee::rpc_params!["invalid_addr", "0x1"],
+            )
+            .await;
+        assert!(result.is_err());
         handle.stop().unwrap();
     }
 }
