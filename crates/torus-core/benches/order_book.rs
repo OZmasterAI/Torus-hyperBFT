@@ -6,7 +6,7 @@ use torus_core::order_book::{OrderBook, OrderStatus};
 use torus_types::{Address, FixedPoint, OrderType, PlaceOrderParams, TimeInForce};
 
 fn fp(n: i64) -> FixedPoint {
-    FixedPoint::from_raw(n * FixedPoint::SCALE)
+    FixedPoint::from_raw(n as i128 * FixedPoint::SCALE)
 }
 
 fn addr(n: u8) -> Address {
@@ -51,11 +51,7 @@ fn bench_place_no_match(c: &mut Criterion) {
             let start = std::time::Instant::now();
             for i in 0..iters {
                 let price = fp(1000 + (i % 1000) as i64);
-                ob.place_order(
-                    black_box(limit_buy(price, fp(1))),
-                    addr((i % 200) as u8),
-                    i,
-                );
+                ob.place_order(black_box(limit_buy(price, fp(1))), addr((i % 200) as u8), i);
             }
             start.elapsed()
         });
@@ -72,11 +68,7 @@ fn bench_place_immediate_match(c: &mut Criterion) {
             }
             let start = std::time::Instant::now();
             for i in 0..iters {
-                ob.place_order(
-                    black_box(limit_buy(fp(100), fp(1))),
-                    addr(0),
-                    iters + i,
-                );
+                ob.place_order(black_box(limit_buy(fp(100), fp(1))), addr(0), iters + i);
             }
             start.elapsed()
         });

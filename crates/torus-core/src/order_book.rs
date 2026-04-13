@@ -78,6 +78,7 @@ pub enum OrderStatus {
 
 /// A pending stop order awaiting trigger.
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 struct StopOrder {
     id: OrderId,
     trader: Address,
@@ -209,15 +210,13 @@ impl OrderBook {
         }
 
         // PostOnly: reject if would cross the spread
-        if params.time_in_force == TimeInForce::PostOnly {
-            if self.would_cross(side, params.price) {
-                return PlaceResult {
-                    order_id,
-                    status: OrderStatus::Rejected,
-                    fills: vec![],
-                    self_trade_cancels: vec![],
-                };
-            }
+        if params.time_in_force == TimeInForce::PostOnly && self.would_cross(side, params.price) {
+            return PlaceResult {
+                order_id,
+                status: OrderStatus::Rejected,
+                fills: vec![],
+                self_trade_cancels: vec![],
+            };
         }
 
         let is_market = matches!(params.order_type, OrderType::Market);
@@ -253,15 +252,15 @@ impl OrderBook {
         };
 
         // FOK: pre-check full fill availability
-        if params.time_in_force == TimeInForce::FOK {
-            if !self.can_fill_completely(side, params.price, params.quantity, trader, is_market) {
-                return PlaceResult {
-                    order_id,
-                    status: OrderStatus::Rejected,
-                    fills: vec![],
-                    self_trade_cancels: vec![],
-                };
-            }
+        if params.time_in_force == TimeInForce::FOK
+            && !self.can_fill_completely(side, params.price, params.quantity, trader, is_market)
+        {
+            return PlaceResult {
+                order_id,
+                status: OrderStatus::Rejected,
+                fills: vec![],
+                self_trade_cancels: vec![],
+            };
         }
 
         // Execute matching
@@ -510,7 +509,7 @@ impl OrderBook {
                         &mut self.order_index,
                         &mut self.trader_orders,
                     );
-                    if self.asks.get(&best_ask).map_or(true, VecDeque::is_empty) {
+                    if self.asks.get(&best_ask).is_none_or(|q| q.is_empty()) {
                         self.asks.remove(&best_ask);
                     }
                 }
@@ -534,7 +533,7 @@ impl OrderBook {
                         &mut self.order_index,
                         &mut self.trader_orders,
                     );
-                    if self.bids.get(&best_bid).map_or(true, VecDeque::is_empty) {
+                    if self.bids.get(&best_bid).is_none_or(|q| q.is_empty()) {
                         self.bids.remove(&best_bid);
                     }
                 }
@@ -623,8 +622,8 @@ impl OrderBook {
     /// Would placing an order at `price` cross the spread?
     fn would_cross(&self, side: Side, price: FixedPoint) -> bool {
         match side {
-            Side::Buy => self.best_ask().map_or(false, |ask| price >= ask),
-            Side::Sell => self.best_bid().map_or(false, |bid| price <= bid),
+            Side::Buy => self.best_ask().is_some_and(|ask| price >= ask),
+            Side::Sell => self.best_bid().is_some_and(|bid| price <= bid),
         }
     }
 
@@ -744,11 +743,11 @@ mod tests {
 
     // Helpers
     fn fp(n: i64) -> FixedPoint {
-        FixedPoint::from_raw(n * FixedPoint::SCALE)
+        FixedPoint::from_raw(n as i128 * FixedPoint::SCALE)
     }
 
     fn fp_frac(whole: i64, frac_8: i64) -> FixedPoint {
-        FixedPoint::from_raw(whole * FixedPoint::SCALE + frac_8)
+        FixedPoint::from_raw(whole as i128 * FixedPoint::SCALE + frac_8 as i128)
     }
 
     fn addr(n: u8) -> Address {
@@ -1317,16 +1316,12 @@ mod tests {
         // Trader 1 places a sell
         ob.place_order(limit_sell(fp(100), fp(10)), addr(1), 1);
 
-        // Same trader places a buy → self-trade, maker cancelled
+        // Same trader places a buy → self-trade, maker cancelled, buyer rests
         let r = ob.place_order(limit_buy(fp(100), fp(5)), addr(1), 2);
         assert_eq!(r.self_trade_cancels.len(), 1);
         assert!(r.fills.is_empty());
-        assert_eq!(ob.order_count(), 0); // maker cancelled, buyer rests? No...
-
-        // The buy had no fills and remaining qty > 0 with GTC, so it rests
-        // But the sell was cancelled. Let's check.
         assert_eq!(r.status, OrderStatus::Resting);
-        assert_eq!(ob.order_count(), 1); // the buy order rests
+        assert_eq!(ob.order_count(), 1); // maker cancelled, buy rests (GTC)
         assert_eq!(ob.best_bid(), Some(fp(100)));
     }
 
@@ -1529,11 +1524,11 @@ mod tests {
         let mut ob = book();
         assert_eq!(ob.last_trade_price(), None);
 
-        ob.place_order(limit_sell(fp(100), fp(10)), addr(1), 1);
+        ob.place_order(limit_sell(fp(100), fp(5)), addr(1), 1);
         ob.place_order(limit_buy(fp(100), fp(5)), addr(2), 2);
         assert_eq!(ob.last_trade_price(), Some(fp(100)));
 
-        ob.place_order(limit_sell(fp(101), fp(10)), addr(3), 3);
+        ob.place_order(limit_sell(fp(101), fp(5)), addr(3), 3);
         ob.place_order(limit_buy(fp(101), fp(5)), addr(4), 4);
         assert_eq!(ob.last_trade_price(), Some(fp(101)));
     }
