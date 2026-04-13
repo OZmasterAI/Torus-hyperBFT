@@ -1,7 +1,7 @@
 //! Error types for the torus-core execution engine.
 
 use thiserror::Error;
-use torus_types::{FixedPoint, MarketId, OrderId};
+use torus_types::{FixedPoint, MarketId, OrderId, U256};
 
 #[derive(Debug, Error)]
 pub enum CoreError {
@@ -58,6 +58,9 @@ pub enum CoreError {
     // Lockbox errors
     #[error("insufficient native balance: have {have}, need {need}")]
     InsufficientNativeBalance { have: FixedPoint, need: FixedPoint },
+
+    #[error("insufficient EVM balance: have {have}, need {need}")]
+    InsufficientEvmBalance { have: U256, need: U256 },
 
     // Precompile errors
     #[error("invalid precompile input: {0}")]

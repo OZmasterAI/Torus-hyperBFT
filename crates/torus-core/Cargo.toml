@@ -8,6 +8,8 @@ license.workspace = true
 torus-types = { workspace = true }
 torus-state = { workspace = true }
 torus-economics = { workspace = true }
+alloy-primitives = { workspace = true }
+rocksdb = { workspace = true }
 thiserror = { workspace = true }
 borsh = { workspace = true }
 
