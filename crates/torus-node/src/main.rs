@@ -22,6 +22,8 @@ use torus_rpc::{BlockNotifier, RpcServer};
 use torus_state::StateDb;
 use torus_types::ChainConfig;
 
+mod keystore;
+
 // ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
@@ -33,6 +35,9 @@ use torus_types::ChainConfig;
     about = "Torus-hyperBFT validator node"
 )]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+
     /// Path to genesis.json (required for first run)
     #[arg(long)]
     genesis: Option<PathBuf>,
@@ -41,9 +46,21 @@ struct Cli {
     #[arg(long, default_value = "./data")]
     data_dir: PathBuf,
 
-    /// Ed25519 signing key (64-char hex, 32 bytes)
+    /// Ed25519 signing key (64-char hex) [DEPRECATED: use --keystore]
     #[arg(long)]
-    validator_key: String,
+    validator_key: Option<String>,
+
+    /// Path to encrypted keystore file (Phase 3: 3.1.8)
+    #[arg(long)]
+    keystore: Option<PathBuf>,
+
+    /// Path to passphrase file for automated deployments (Phase 3: 3.1.8)
+    #[arg(long)]
+    passphrase_file: Option<PathBuf>,
+
+    /// Restore database from a snapshot before starting (Phase 3: 3.1.6)
+    #[arg(long)]
+    restore_from_snapshot: Option<PathBuf>,
 
     /// libp2p listen multiaddr
     #[arg(long, default_value = "/ip4/0.0.0.0/udp/30333/quic-v1")]
@@ -60,6 +77,16 @@ struct Cli {
     /// Log level (trace, debug, info, warn, error)
     #[arg(long, default_value = "info")]
     log_level: String,
+}
+
+#[derive(clap::Subcommand)]
+enum Command {
+    /// Generate a new validator keypair and write an encrypted keystore file.
+    Keygen {
+        /// Output path for the keystore file
+        #[arg(long, default_value = "./validator.keystore")]
+        output: PathBuf,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -104,6 +131,25 @@ fn default_chain_config() -> ChainConfig {
 async fn main() {
     let cli = Cli::parse();
 
+    // Handle keygen subcommand before tracing init
+    if let Some(Command::Keygen { output }) = &cli.command {
+        eprintln!("Generating new validator keypair...");
+        eprint!("Enter passphrase: ");
+        let passphrase = read_passphrase_stdin();
+        match keystore::generate_keystore(output, &passphrase) {
+            Ok(key) => {
+                let vk = key.verifying_key();
+                eprintln!("Keystore written to: {}", output.display());
+                eprintln!("Public key: {}", hex::encode(vk.as_bytes()));
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("Error generating keystore: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     // 1. Tracing
     std::env::set_var("RUST_LOG", &cli.log_level);
     torus_telemetry::init_tracing(false);
@@ -119,15 +165,51 @@ async fn main() {
     }
 }
 
+/// Read a passphrase from stdin (no echo if terminal).
+fn read_passphrase_stdin() -> String {
+    let mut buf = String::new();
+    std::io::stdin().read_line(&mut buf).unwrap_or(0);
+    buf.trim().to_string()
+}
+
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
-    // 2. Parse validator key
-    let key_bytes = decode_hex_key(&cli.validator_key)?;
-    let signing_key = SigningKey::from_bytes(&key_bytes);
+    // 2. Load validator key (keystore preferred, raw hex deprecated)
+    let signing_key = if let Some(keystore_path) = &cli.keystore {
+        let passphrase = if let Some(pf) = &cli.passphrase_file {
+            std::fs::read_to_string(pf)
+                .map_err(|e| format!("cannot read passphrase file: {e}"))?
+                .trim()
+                .to_string()
+        } else {
+            eprint!("Enter keystore passphrase: ");
+            read_passphrase_stdin()
+        };
+        let key = keystore::load_keystore(keystore_path, &passphrase)?;
+        info!("loaded validator key from keystore");
+        key
+    } else if let Some(hex_key) = &cli.validator_key {
+        warn!("--validator-key is deprecated and insecure (visible in ps/history). Use --keystore instead.");
+        let key_bytes = decode_hex_key(hex_key)?;
+        SigningKey::from_bytes(&key_bytes)
+    } else {
+        return Err("either --keystore or --validator-key must be provided".into());
+    };
     let verifying_key = signing_key.verifying_key();
     info!(
         pubkey = hex::encode(verifying_key.as_bytes()),
         "loaded validator key"
     );
+
+    // 2b. Restore from snapshot if requested (Phase 3: 3.1.6)
+    if let Some(snapshot_path) = &cli.restore_from_snapshot {
+        info!(snapshot = %snapshot_path.display(), "restoring database from snapshot...");
+        let meta = StateDb::restore_from_snapshot(snapshot_path, &cli.data_dir)?;
+        info!(
+            block_height = meta.block_height,
+            "database restored from snapshot, resuming from block {}",
+            meta.block_height
+        );
+    }
 
     // 3. Open StateDb
     std::fs::create_dir_all(&cli.data_dir)?;

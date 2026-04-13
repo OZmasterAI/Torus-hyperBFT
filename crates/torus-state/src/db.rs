@@ -42,6 +42,11 @@ impl StateDb {
         Ok(Self { db: Arc::new(db) })
     }
 
+    /// Wrap an already-opened RocksDB instance (e.g., a read-only snapshot DB).
+    pub fn from_existing_db(db: DB) -> Self {
+        Self { db: Arc::new(db) }
+    }
+
     /// Destroy the database at the given path (for testing).
     pub fn destroy(path: &Path) -> Result<(), StateError> {
         DB::destroy(&Options::default(), path)?;

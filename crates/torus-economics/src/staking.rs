@@ -6,8 +6,8 @@
 use alloy_primitives::{Address, U256};
 use borsh::BorshDeserialize;
 use torus_state::cf::{
-    CF_JAIL_VOTES, CF_SLASH_RECORDS, CF_STAKING_DELEGATIONS, CF_STAKING_PERMANENT,
-    CF_STAKING_REWARDS, CF_STAKING_VALIDATORS,
+    CF_CONSENSUS_META, CF_JAIL_VOTES, CF_SLASH_RECORDS, CF_STAKING_DELEGATIONS,
+    CF_STAKING_PERMANENT, CF_STAKING_REWARDS, CF_STAKING_VALIDATORS,
 };
 use torus_state::StateDb;
 
@@ -801,6 +801,144 @@ impl StakingManager {
         Ok(delegations)
     }
 
+    // ========================================================================
+    // Key Rotation (Phase 3: 3.1.8)
+    // ========================================================================
+
+    /// Submit a key rotation request. The rotation takes effect at the next epoch
+    /// boundary. Must be signed by the current key (verified by caller).
+    pub fn submit_key_rotation(
+        &self,
+        validator_addr: Address,
+        new_pubkey: [u8; 32],
+        current_epoch: u64,
+        current_block: u64,
+    ) -> Result<()> {
+        let val = self
+            .get_validator(&validator_addr)?
+            .ok_or(EconomicsError::ValidatorNotFound(validator_addr))?;
+
+        // Cannot rotate while jailed or tombstoned
+        if val.status == ValidatorStatus::Jailed {
+            return Err(EconomicsError::CannotRotateWhileJailed(validator_addr));
+        }
+        if val.status == ValidatorStatus::Tombstoned {
+            return Err(EconomicsError::ValidatorTombstoned(validator_addr));
+        }
+
+        // Check no pending rotation already exists
+        if self.get_pending_rotation(&validator_addr)?.is_some() {
+            return Err(EconomicsError::KeyRotationAlreadyPending(validator_addr));
+        }
+
+        // Check new pubkey isn't already in use
+        let all_validators = self.all_validators()?;
+        for v in &all_validators {
+            if v.pubkey == new_pubkey {
+                return Err(EconomicsError::PubkeyAlreadyInUse);
+            }
+        }
+
+        // Store pending rotation
+        let rotation = PendingKeyRotation {
+            validator: validator_addr,
+            new_pubkey,
+            effective_epoch: current_epoch + 1,
+            submitted_at_block: current_block,
+        };
+        self.put_pending_rotation(&validator_addr, &rotation)?;
+
+        tracing::info!(
+            %validator_addr,
+            effective_epoch = current_epoch + 1,
+            "key rotation submitted"
+        );
+        Ok(())
+    }
+
+    /// Apply all pending key rotations for the given epoch. Called at epoch boundary.
+    /// Returns the list of validators whose keys were rotated.
+    pub fn apply_pending_rotations(&self, epoch: u64) -> Result<Vec<(Address, [u8; 32])>> {
+        let mut applied = Vec::new();
+
+        // Scan all pending rotations
+        let rotations = self.all_pending_rotations()?;
+
+        for rotation in rotations {
+            if rotation.effective_epoch == epoch {
+                // Apply: update the validator's pubkey
+                let mut val = match self.get_validator(&rotation.validator)? {
+                    Some(v) => v,
+                    None => continue,
+                };
+                let old_pubkey = val.pubkey;
+                val.pubkey = rotation.new_pubkey;
+                self.put_validator(&rotation.validator, &val)?;
+
+                // Remove the pending rotation
+                self.delete_pending_rotation(&rotation.validator)?;
+
+                applied.push((rotation.validator, rotation.new_pubkey));
+                tracing::info!(
+                    validator = %rotation.validator,
+                    old_pubkey = hex::encode(old_pubkey),
+                    new_pubkey = hex::encode(rotation.new_pubkey),
+                    "key rotation applied at epoch {epoch}"
+                );
+            }
+        }
+
+        Ok(applied)
+    }
+
+    /// Get a pending key rotation for a validator.
+    pub fn get_pending_rotation(&self, addr: &Address) -> Result<Option<PendingKeyRotation>> {
+        let key = pending_rotation_key(addr);
+        match self.state_db.get_cf_raw(CF_CONSENSUS_META, &key)? {
+            Some(data) => Ok(Some(
+                PendingKeyRotation::try_from_slice(&data)
+                    .map_err(|e| EconomicsError::Borsh(e.to_string()))?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    fn put_pending_rotation(&self, addr: &Address, rotation: &PendingKeyRotation) -> Result<()> {
+        let key = pending_rotation_key(addr);
+        let data = borsh::to_vec(rotation).map_err(|e| EconomicsError::Borsh(e.to_string()))?;
+        self.state_db.put_cf_raw(CF_CONSENSUS_META, &key, &data)?;
+        Ok(())
+    }
+
+    fn delete_pending_rotation(&self, addr: &Address) -> Result<()> {
+        let key = pending_rotation_key(addr);
+        self.state_db.delete_cf_raw(CF_CONSENSUS_META, &key)?;
+        Ok(())
+    }
+
+    fn all_pending_rotations(&self) -> Result<Vec<PendingKeyRotation>> {
+        let db = self.state_db.inner();
+        let cf = db.cf_handle(CF_CONSENSUS_META).ok_or_else(|| {
+            EconomicsError::State(torus_state::StateError::MissingColumnFamily(
+                CF_CONSENSUS_META.to_string(),
+            ))
+        })?;
+        let prefix = b"pending_rotation:";
+        let iter = db.prefix_iterator_cf(cf, prefix);
+        let mut rotations = Vec::new();
+        for item in iter {
+            let (key, value) =
+                item.map_err(|e| EconomicsError::State(torus_state::StateError::RocksDb(e)))?;
+            if !key.starts_with(prefix) {
+                break;
+            }
+            let rotation = PendingKeyRotation::try_from_slice(&value)
+                .map_err(|e| EconomicsError::Borsh(e.to_string()))?;
+            rotations.push(rotation);
+        }
+        Ok(rotations)
+    }
+
     /// Read all permanent stakes (full scan).
     pub fn all_permanent_stakes(&self) -> Result<Vec<PermanentStakeInfo>> {
         let db = self.state_db.inner();
@@ -844,6 +982,19 @@ pub fn jail_vote_key(target: &Address, voter: &Address) -> [u8; 40] {
     key[..20].copy_from_slice(target.as_slice());
     key[20..].copy_from_slice(voter.as_slice());
     key
+}
+
+/// Build key for pending key rotation: "pending_rotation:" ++ address(20).
+fn pending_rotation_key(addr: &Address) -> Vec<u8> {
+    let mut key = b"pending_rotation:".to_vec();
+    key.extend_from_slice(addr.as_slice());
+    key
+}
+
+mod hex {
+    pub fn encode(bytes: impl AsRef<[u8]>) -> String {
+        bytes.as_ref().iter().map(|b| format!("{b:02x}")).collect()
+    }
 }
 
 // ============================================================================

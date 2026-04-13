@@ -1,7 +1,10 @@
 use std::time::Duration;
 
 use libp2p::swarm::NetworkBehaviour;
-use libp2p::{gossipsub, identify, kad, request_response, StreamProtocol};
+use libp2p::{
+    allow_block_list, connection_limits, gossipsub, identify, kad, request_response,
+    StreamProtocol,
+};
 
 use crate::codec::BorshCodec;
 use crate::sync::{SyncRequest, SyncResponse};
@@ -16,10 +19,21 @@ pub struct TorusBehaviour {
     pub sync_proto: request_response::cbor::Behaviour<SyncRequest, SyncResponse>,
     pub kademlia: kad::Behaviour<kad::store::MemoryStore>,
     pub identify: identify::Behaviour,
+    /// Connection limits enforcement (Phase 3: 3.1.7).
+    pub connection_limits: connection_limits::Behaviour,
+    /// Peer block list for banning (Phase 3: 3.1.7).
+    pub block_list: allow_block_list::Behaviour<allow_block_list::BlockedPeers>,
 }
 
 impl TorusBehaviour {
     pub fn new(key: &libp2p::identity::Keypair) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::with_limits(key, 100)
+    }
+
+    pub fn with_limits(
+        key: &libp2p::identity::Keypair,
+        max_peers: usize,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let peer_id = key.public().to_peer_id();
 
         // GossipSub
@@ -60,12 +74,28 @@ impl TorusBehaviour {
         let identify =
             identify::Behaviour::new(identify::Config::new("/torus/1.0".into(), key.public()));
 
+        // Connection limits (Phase 3: 3.1.7)
+        // 80% inbound, 20% reserved for outbound
+        let max_inbound = (max_peers * 80) / 100;
+        let max_outbound = max_peers - max_inbound;
+        let limits = connection_limits::ConnectionLimits::default()
+            .with_max_established_incoming(Some(max_inbound as u32))
+            .with_max_established_outgoing(Some(max_outbound as u32))
+            .with_max_established(Some(max_peers as u32))
+            .with_max_established_per_peer(Some(2));
+        let connection_limits = connection_limits::Behaviour::new(limits);
+
+        // Block list (Phase 3: 3.1.7)
+        let block_list = allow_block_list::Behaviour::default();
+
         Ok(Self {
             gossipsub,
             direct,
             sync_proto,
             kademlia,
             identify,
+            connection_limits,
+            block_list,
         })
     }
 }

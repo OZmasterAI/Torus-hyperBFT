@@ -12,7 +12,12 @@ use tracing::{debug, info, warn};
 
 use crate::behaviour::{TorusBehaviour, TorusBehaviourEvent, CONSENSUS_TOPIC, TX_TOPIC};
 use crate::codec::{DirectRequest, DirectResponse};
+use crate::config::NetworkConfig;
 use crate::peer::PeerMap;
+use crate::peer_scoring::{
+    ConsensusRateLimiter, PeerScoring, PENALTY_INVALID_CONSENSUS_MSG, PENALTY_INVALID_TX,
+    PENALTY_EXCESSIVE_RATE, REWARD_BLOCK_RELAY,
+};
 use crate::tx_gossip::TxGossipState;
 
 pub enum NetworkCommand {
@@ -45,11 +50,22 @@ enum SwarmAction {
 }
 
 pub async fn run_swarm(
+    swarm: Swarm<TorusBehaviour>,
+    command_rx: mpsc::UnboundedReceiver<NetworkCommand>,
+    tx_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    shared: Arc<SharedState>,
+    local_key: VerifyingKey,
+) {
+    run_swarm_with_config(swarm, command_rx, tx_rx, shared, local_key, &NetworkConfig::default()).await
+}
+
+pub async fn run_swarm_with_config(
     mut swarm: Swarm<TorusBehaviour>,
     mut command_rx: mpsc::UnboundedReceiver<NetworkCommand>,
     mut tx_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     shared: Arc<SharedState>,
     local_key: VerifyingKey,
+    config: &NetworkConfig,
 ) {
     let consensus_topic = gossipsub::IdentTopic::new(CONSENSUS_TOPIC);
     let tx_topic = gossipsub::IdentTopic::new(TX_TOPIC);
@@ -61,7 +77,20 @@ pub async fn run_swarm(
         warn!("Failed to subscribe to tx topic: {e:?}");
     }
 
-    let mut tx_gossip_state = TxGossipState::new(60, 100);
+    let mut tx_gossip_state = TxGossipState::new(
+        config.tx_dedup_window_secs,
+        config.tx_rate_limit_per_peer,
+    );
+    let mut consensus_rate_limiter = ConsensusRateLimiter::new(config.consensus_rate_limit_per_peer);
+    let mut peer_scoring = PeerScoring::new(config.ban_list_path.clone());
+
+    // Block any previously banned peers
+    for peer_id in peer_scoring.permanently_banned_peers() {
+        swarm.behaviour_mut().block_list.block_peer(peer_id);
+    }
+
+    let max_consensus_msg_size = config.max_consensus_message_size;
+    let max_tx_msg_size = config.max_tx_message_size;
 
     loop {
         let action = tokio::select! {
@@ -72,7 +101,16 @@ pub async fn run_swarm(
 
         match action {
             SwarmAction::Event(event) => {
-                handle_event(*event, &mut swarm, &shared, &mut tx_gossip_state);
+                handle_event(
+                    *event,
+                    &mut swarm,
+                    &shared,
+                    &mut tx_gossip_state,
+                    &mut consensus_rate_limiter,
+                    &mut peer_scoring,
+                    max_consensus_msg_size,
+                    max_tx_msg_size,
+                );
             }
             SwarmAction::Command(Some(cmd)) => {
                 handle_command(*cmd, &mut swarm, &shared, &local_key, &consensus_topic);
@@ -100,6 +138,10 @@ fn handle_event(
     swarm: &mut Swarm<TorusBehaviour>,
     shared: &SharedState,
     tx_gossip_state: &mut TxGossipState,
+    consensus_rate_limiter: &mut ConsensusRateLimiter,
+    peer_scoring: &mut PeerScoring,
+    max_consensus_msg_size: usize,
+    max_tx_msg_size: usize,
 ) {
     match event {
         SwarmEvent::Behaviour(TorusBehaviourEvent::Gossipsub(gossipsub::Event::Message {
@@ -107,10 +149,55 @@ fn handle_event(
             message,
             ..
         })) => {
+            // Check if peer is banned (Phase 3: 3.1.7)
+            if peer_scoring.is_banned(&propagation_source) {
+                return;
+            }
+
             let consensus_hash = gossipsub::IdentTopic::new(CONSENSUS_TOPIC).hash();
             if message.topic == consensus_hash {
-                handle_consensus_gossip(&message.data, shared);
+                // Message size validation (Phase 3: 3.1.7)
+                if message.data.len() > max_consensus_msg_size {
+                    warn!(
+                        peer = %propagation_source,
+                        size = message.data.len(),
+                        "oversized consensus message rejected"
+                    );
+                    peer_scoring.penalize(
+                        &propagation_source,
+                        PENALTY_INVALID_CONSENSUS_MSG,
+                        "oversized consensus message",
+                    );
+                    return;
+                }
+
+                // Consensus rate limiting (Phase 3: 3.1.7)
+                if !consensus_rate_limiter.check_and_increment(&propagation_source) {
+                    peer_scoring.penalize(
+                        &propagation_source,
+                        PENALTY_EXCESSIVE_RATE,
+                        "consensus message rate exceeded",
+                    );
+                    return;
+                }
+
+                handle_consensus_gossip(&message.data, shared, peer_scoring, &propagation_source);
             } else {
+                // TX message size validation (Phase 3: 3.1.7)
+                if message.data.len() > max_tx_msg_size {
+                    warn!(
+                        peer = %propagation_source,
+                        size = message.data.len(),
+                        "oversized tx message rejected"
+                    );
+                    peer_scoring.penalize(
+                        &propagation_source,
+                        PENALTY_INVALID_TX,
+                        "oversized tx message",
+                    );
+                    return;
+                }
+
                 let tx_hash: [u8; 32] = Keccak256::digest(&message.data).into();
                 if tx_gossip_state.should_accept(tx_hash, propagation_source) {
                     debug!("Received new tx from {propagation_source}");
@@ -122,14 +209,27 @@ fn handle_event(
                 request_response::Message::Request {
                     request, channel, ..
                 },
+            peer,
             ..
         })) => {
+            // Check if peer is banned (Phase 3: 3.1.7)
+            if peer_scoring.is_banned(&peer) {
+                let _ = swarm
+                    .behaviour_mut()
+                    .direct
+                    .send_response(channel, DirectResponse);
+                return;
+            }
+
             if let Ok(msg) =
                 hotstuff_rs::networking::messages::Message::try_from_slice(&request.payload)
             {
                 if let Ok(sender_vk) = VerifyingKey::from_bytes(&request.sender_key) {
                     shared.inbound.lock().unwrap().push_back((sender_vk, msg));
+                    peer_scoring.reward(&peer, REWARD_BLOCK_RELAY);
                 }
+            } else {
+                peer_scoring.penalize(&peer, PENALTY_INVALID_CONSENSUS_MSG, "malformed direct message");
             }
             let _ = swarm
                 .behaviour_mut()
@@ -141,12 +241,24 @@ fn handle_event(
             info,
             ..
         })) => {
+            // Don't add banned peers to Kademlia
+            if peer_scoring.is_banned(&peer_id) {
+                return;
+            }
             for addr in info.listen_addrs {
                 swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
             }
         }
         SwarmEvent::NewListenAddr { address, .. } => info!("Listening on {address}"),
-        SwarmEvent::ConnectionEstablished { peer_id, .. } => debug!("Connected to {peer_id}"),
+        SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+            if peer_scoring.is_banned(&peer_id) {
+                // BUG FIX (3.1): Disconnect banned peers that slip through
+                let _ = swarm.disconnect_peer_id(peer_id);
+                debug!("Disconnected banned peer {peer_id}");
+            } else {
+                debug!("Connected to {peer_id}");
+            }
+        }
         SwarmEvent::ConnectionClosed { peer_id, .. } => debug!("Disconnected from {peer_id}"),
         _ => {}
     }
@@ -205,9 +317,15 @@ fn handle_command(
     }
 }
 
-fn handle_consensus_gossip(data: &[u8], shared: &SharedState) {
+fn handle_consensus_gossip(
+    data: &[u8],
+    shared: &SharedState,
+    peer_scoring: &mut PeerScoring,
+    source: &PeerId,
+) {
     if data.len() < 33 {
         warn!("Consensus message too short ({} bytes)", data.len());
+        peer_scoring.penalize(source, PENALTY_INVALID_CONSENSUS_MSG, "consensus message too short");
         return;
     }
     let sender_bytes: [u8; 32] = data[..32].try_into().unwrap();
@@ -216,15 +334,18 @@ fn handle_consensus_gossip(data: &[u8], shared: &SharedState) {
         Ok(vk) => vk,
         Err(_) => {
             warn!("Invalid sender key in consensus gossip");
+            peer_scoring.penalize(source, PENALTY_INVALID_CONSENSUS_MSG, "invalid sender key");
             return;
         }
     };
     match hotstuff_rs::networking::messages::Message::try_from_slice(msg_bytes) {
         Ok(msg) => {
             shared.inbound.lock().unwrap().push_back((sender_vk, msg));
+            peer_scoring.reward(source, REWARD_BLOCK_RELAY);
         }
         Err(e) => {
             warn!("Failed to deserialize consensus message: {e}");
+            peer_scoring.penalize(source, PENALTY_INVALID_CONSENSUS_MSG, "malformed consensus message");
         }
     }
 }

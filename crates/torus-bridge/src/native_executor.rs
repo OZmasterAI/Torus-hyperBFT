@@ -211,6 +211,9 @@ impl NativeExecutor {
             }
             NativeAction::JailVote { target } => Self::exec_jail_vote(ctx, sender, target),
             NativeAction::UnjailSelf => Self::exec_unjail_self(ctx, sender),
+            NativeAction::RotateValidatorKey { new_pubkey } => {
+                Self::exec_rotate_key(ctx, sender, new_pubkey)
+            }
 
             // ---- Admin (governance-gated, stubs) ----
             NativeAction::UpdateMarketParams { .. } => {
@@ -399,6 +402,23 @@ impl NativeExecutor {
         match ctx.staking.unjail(sender, ctx.block_height) {
             Ok(()) => NativeActionResult::ok("unjail_self", 2000),
             Err(e) => NativeActionResult::err("unjail_self", e.to_string()),
+        }
+    }
+
+    fn exec_rotate_key(
+        ctx: &mut NativeExecContext,
+        sender: &Address,
+        new_pubkey: &torus_types::PublicKey,
+    ) -> NativeActionResult {
+        let current_epoch = ctx.block_height / ctx.epoch_length.max(1);
+        match ctx.staking.submit_key_rotation(
+            *sender,
+            new_pubkey.0,
+            current_epoch,
+            ctx.block_height,
+        ) {
+            Ok(()) => NativeActionResult::ok("rotate_validator_key", 5000),
+            Err(e) => NativeActionResult::err("rotate_validator_key", e.to_string()),
         }
     }
 

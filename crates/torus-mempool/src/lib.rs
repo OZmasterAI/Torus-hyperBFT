@@ -49,6 +49,9 @@ pub struct MempoolConfig {
     pub native_pool_max_size: usize,
     /// Max pending native actions per sender in the pool.
     pub native_per_sender_cap: usize,
+    // ---- Memory budget (Phase 3: 3.1.7) ----
+    /// Maximum combined memory for EVM + native pools in bytes (0 = unlimited).
+    pub max_memory_bytes: usize,
 }
 
 impl Default for MempoolConfig {
@@ -66,6 +69,7 @@ impl Default for MempoolConfig {
             native_per_block_cap: rate_limit::NATIVE_PER_BLOCK_CAP,
             native_pool_max_size: rate_limit::NATIVE_POOL_MAX_SIZE,
             native_per_sender_cap: rate_limit::NATIVE_PER_SENDER_CAP,
+            max_memory_bytes: 64 * 1024 * 1024, // 64 MB default
         }
     }
 }
@@ -77,6 +81,8 @@ pub struct Mempool {
     rate_tracker: RwLock<rate_limit::RateTracker>,
     state: StateDb,
     config: MempoolConfig,
+    /// Approximate total memory used by pooled transactions (Phase 3: 3.1.7).
+    memory_used: std::sync::atomic::AtomicUsize,
 }
 
 impl Mempool {
@@ -98,6 +104,7 @@ impl Mempool {
             rate_tracker: RwLock::new(tracker),
             state,
             config,
+            memory_used: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -113,6 +120,17 @@ impl Mempool {
 
         let hash = entry.hash;
         let sender = entry.sender;
+        let tx_size = raw_rlp.len();
+
+        // Memory budget check (Phase 3: 3.1.7).
+        if self.config.max_memory_bytes > 0 {
+            let current = self
+                .memory_used
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if current + tx_size > self.config.max_memory_bytes {
+                return Err(MempoolError::PoolFull);
+            }
+        }
 
         // Rate limit check (Task 3.1.4).
         {
@@ -137,6 +155,10 @@ impl Mempool {
             self.config.max_per_sender,
             self.config.replacement_bump_pct,
         )?;
+
+        // Track memory usage (Phase 3: 3.1.7)
+        self.memory_used
+            .fetch_add(tx_size, std::sync::atomic::Ordering::Relaxed);
 
         tracing::debug!(tx_hash = %hash, "evm tx added to mempool");
         Ok(hash)
@@ -214,6 +236,12 @@ impl Mempool {
     /// Current native pool size.
     pub fn native_pool_size(&self) -> usize {
         self.native.read().unwrap().size()
+    }
+
+    /// Approximate total memory used by pooled transactions (Phase 3: 3.1.7).
+    pub fn memory_used(&self) -> usize {
+        self.memory_used
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Drain both pools for a block proposal.

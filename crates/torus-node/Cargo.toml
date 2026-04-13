@@ -32,10 +32,19 @@ tracing-subscriber = { workspace = true }
 alloy-primitives = { workspace = true }
 
 # Serialization
+serde = { workspace = true }
 serde_json = { workspace = true }
 
 # Crypto
 ed25519-dalek = { workspace = true }
+aes-gcm = { workspace = true }
+argon2 = { workspace = true }
+rand = { workspace = true }
+hex = { workspace = true }
+sha2 = { workspace = true }
 
 # Consensus
 hotstuff_rs = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

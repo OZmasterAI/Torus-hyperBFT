@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use libp2p::{Multiaddr, PeerId};
 
 /// Configuration for the Torus p2p network layer.
@@ -19,6 +21,10 @@ pub struct NetworkConfig {
     pub tx_rate_limit_per_peer: u32,
     /// Transaction dedup window in seconds.
     pub tx_dedup_window_secs: u64,
+    /// Consensus message rate limit per peer (msg/sec) (Phase 3: 3.1.7).
+    pub consensus_rate_limit_per_peer: u32,
+    /// Path to the peer ban list JSON file (Phase 3: 3.1.7).
+    pub ban_list_path: Option<PathBuf>,
 }
 
 impl Default for NetworkConfig {
@@ -32,6 +38,8 @@ impl Default for NetworkConfig {
             max_tx_message_size: 128 * 1024,
             tx_rate_limit_per_peer: 100,
             tx_dedup_window_secs: 60,
+            consensus_rate_limit_per_peer: 50,
+            ban_list_path: None,
         }
     }
 }

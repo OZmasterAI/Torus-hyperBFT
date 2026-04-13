@@ -199,6 +199,9 @@ pub fn eip712_struct_hash(action: &NativeAction, nonce: u64) -> B256 {
         NativeAction::UpdateCommission { new_rate } => hash_update_commission(*new_rate, nonce),
         NativeAction::JailVote { target } => hash_jail_vote(target, nonce),
         NativeAction::UnjailSelf => hash_unjail_self(nonce),
+        NativeAction::RotateValidatorKey { new_pubkey } => {
+            hash_rotate_validator_key(new_pubkey, nonce)
+        }
         NativeAction::UpdateMarketParams { market_id, params } => {
             hash_update_market_params(*market_id, params, nonce)
         }
@@ -427,6 +430,16 @@ fn hash_unjail_self(nonce: u64) -> B256 {
     let th = keccak256("UnjailSelf(uint64 nonce)");
     let mut buf = Vec::with_capacity(2 * 32);
     buf.extend_from_slice(&th.0);
+    buf.extend_from_slice(&encode_u64(nonce));
+    keccak256(&buf)
+}
+
+fn hash_rotate_validator_key(new_pubkey: &PublicKey, nonce: u64) -> B256 {
+    let th = keccak256("RotateValidatorKey(bytes32 newPubkey,uint64 nonce)");
+    let pk = B256::from(new_pubkey.0);
+    let mut buf = Vec::with_capacity(3 * 32);
+    buf.extend_from_slice(&th.0);
+    buf.extend_from_slice(&encode_bytes32(&pk));
     buf.extend_from_slice(&encode_u64(nonce));
     keccak256(&buf)
 }

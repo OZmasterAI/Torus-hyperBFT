@@ -515,6 +515,49 @@ impl BorshDeserialize for SlashRecord {
     }
 }
 
+// ============================================================================
+// Key Rotation Types (Phase 3: 3.1.8)
+// ============================================================================
+
+/// Pending key rotation for a validator. Stored in CF_CONSENSUS_META with
+/// key prefix "pending_rotation:" ++ validator address (20 bytes).
+#[derive(Clone, Debug)]
+pub struct PendingKeyRotation {
+    pub validator: Address,
+    pub new_pubkey: [u8; 32],
+    pub effective_epoch: u64,
+    pub submitted_at_block: u64,
+}
+
+impl BorshSerialize for PendingKeyRotation {
+    fn serialize<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+        borsh_write_address(&self.validator, writer)?;
+        writer.write_all(&self.new_pubkey)?;
+        BorshSerialize::serialize(&self.effective_epoch, writer)?;
+        BorshSerialize::serialize(&self.submitted_at_block, writer)?;
+        Ok(())
+    }
+}
+
+impl BorshDeserialize for PendingKeyRotation {
+    fn deserialize_reader<R: Read>(reader: &mut R) -> io::Result<Self> {
+        let validator = borsh_read_address(reader)?;
+        let mut new_pubkey = [0u8; 32];
+        reader.read_exact(&mut new_pubkey)?;
+        let effective_epoch = u64::deserialize_reader(reader)?;
+        let submitted_at_block = u64::deserialize_reader(reader)?;
+        Ok(Self {
+            validator,
+            new_pubkey,
+            effective_epoch,
+            submitted_at_block,
+        })
+    }
+}
+
+/// Key rotation cooldown: cannot rotate again for 1 epoch after rotation.
+pub const KEY_ROTATION_COOLDOWN_EPOCHS: u64 = 1;
+
 /// A jail vote record. Stored in CF_JAIL_VOTES.
 /// Key: target(20) ++ voter(20) = 40 bytes.
 #[derive(Clone, Debug)]

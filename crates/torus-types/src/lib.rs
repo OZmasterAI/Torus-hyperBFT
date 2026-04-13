@@ -266,6 +266,9 @@ pub enum NativeAction {
         target: Address,
     },
     UnjailSelf,
+    RotateValidatorKey {
+        new_pubkey: PublicKey,
+    },
 
     // === Admin (governance-gated) ===
     UpdateMarketParams {

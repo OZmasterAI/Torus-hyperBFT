@@ -16,6 +16,7 @@ pub mod bridge;
 pub mod codec;
 pub mod config;
 pub mod peer;
+pub mod peer_scoring;
 pub mod swarm;
 pub mod sync;
 pub mod tx_gossip;

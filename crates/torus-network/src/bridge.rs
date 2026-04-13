@@ -13,7 +13,7 @@ use tracing::warn;
 use crate::behaviour::TorusBehaviour;
 use crate::config::NetworkConfig;
 use crate::peer::PeerMap;
-use crate::swarm::{run_swarm, NetworkCommand, SharedState};
+use crate::swarm::{run_swarm_with_config, NetworkCommand, SharedState};
 use crate::tx_gossip::TxGossipHandle;
 
 /// libp2p-based Network implementation for hotstuff_rs.
@@ -42,11 +42,13 @@ impl LibP2PNetwork {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (tx_tx, tx_rx) = mpsc::unbounded_channel();
 
+        let max_peers = config.max_peers;
         let mut swarm = SwarmBuilder::with_new_identity()
             .with_tokio()
             .with_quic()
             .with_behaviour(|key| {
-                TorusBehaviour::new(key).expect("failed to create TorusBehaviour")
+                TorusBehaviour::with_limits(key, max_peers)
+                    .expect("failed to create TorusBehaviour")
             })
             .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?
             .with_swarm_config(|cfg| {
@@ -67,7 +69,12 @@ impl LibP2PNetwork {
         }
 
         let shared_clone = shared.clone();
-        tokio::spawn(run_swarm(swarm, command_rx, tx_rx, shared_clone, local_key));
+        let config_clone = config.clone();
+        tokio::spawn(async move {
+            run_swarm_with_config(
+                swarm, command_rx, tx_rx, shared_clone, local_key, &config_clone,
+            ).await
+        });
 
         let network = Self { command_tx, shared };
         let tx_handle = TxGossipHandle { tx_sender: tx_tx };

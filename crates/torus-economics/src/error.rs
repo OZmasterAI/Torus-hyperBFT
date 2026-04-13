@@ -97,4 +97,18 @@ pub enum EconomicsError {
         have: U256,
         minimum: U256,
     },
+
+    // Key rotation errors (Phase 3: 3.1.8)
+
+    #[error("validator {0} already has a pending key rotation")]
+    KeyRotationAlreadyPending(Address),
+
+    #[error("pubkey already in use by another validator")]
+    PubkeyAlreadyInUse,
+
+    #[error("validator {0} is in key rotation cooldown")]
+    KeyRotationCooldown(Address),
+
+    #[error("validator {0} cannot rotate key while jailed")]
+    CannotRotateWhileJailed(Address),
 }
