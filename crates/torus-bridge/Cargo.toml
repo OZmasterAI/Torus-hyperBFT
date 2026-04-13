@@ -10,3 +10,16 @@ torus-evm = { workspace = true }
 torus-core = { workspace = true }
 torus-state = { workspace = true }
 torus-economics = { workspace = true }
+
+alloy-primitives = { workspace = true }
+alloy-consensus = { workspace = true, features = ["k256"] }
+alloy-rlp = { workspace = true }
+revm = { workspace = true }
+sha2 = "0.10"
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+k256 = { workspace = true }
+alloy-eips = { workspace = true }

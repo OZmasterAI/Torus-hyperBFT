@@ -91,7 +91,7 @@ fn four_node_consensus_produces_and_commits_blocks() {
             let count = commit_counts[i].clone();
 
             ReplicaSpec::builder()
-                .app(TorusApp)
+                .app(TorusApp::stub())
                 .network(networks[i].clone())
                 .kv_store(kv_stores[i].clone())
                 .configuration(config)

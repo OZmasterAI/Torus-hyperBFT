@@ -7,3 +7,14 @@ license.workspace = true
 [dependencies]
 torus-types = { workspace = true }
 torus-state = { workspace = true }
+alloy-primitives = { workspace = true }
+alloy-consensus = { workspace = true, features = ["k256"] }
+alloy-eips = { workspace = true }
+alloy-rlp = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+k256 = { workspace = true }
+sha3 = { workspace = true }
+revm = { workspace = true }

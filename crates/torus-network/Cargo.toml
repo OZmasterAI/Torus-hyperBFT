@@ -6,5 +6,17 @@ license.workspace = true
 
 [dependencies]
 torus-types = { workspace = true }
-# Heavy dep added when implementing (task 1.5):
-# libp2p
+hotstuff_rs = { workspace = true }
+ed25519-dalek = { workspace = true }
+borsh = "0.10"  # must match hotstuff_rs borsh version
+serde = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+libp2p = { workspace = true }
+sha3 = { workspace = true }
+futures = "0.3"
+async-trait = "0.1"
+
+[dev-dependencies]
+tokio = { workspace = true }
+tracing-subscriber = { workspace = true }

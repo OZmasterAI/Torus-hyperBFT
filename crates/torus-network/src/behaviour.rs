@@ -1,0 +1,71 @@
+use std::time::Duration;
+
+use libp2p::swarm::NetworkBehaviour;
+use libp2p::{gossipsub, identify, kad, request_response, StreamProtocol};
+
+use crate::codec::BorshCodec;
+use crate::sync::{SyncRequest, SyncResponse};
+
+pub const CONSENSUS_TOPIC: &str = "/torus/consensus/1.0";
+pub const TX_TOPIC: &str = "/torus/transactions/1.0";
+
+#[derive(NetworkBehaviour)]
+pub struct TorusBehaviour {
+    pub gossipsub: gossipsub::Behaviour,
+    pub direct: request_response::Behaviour<BorshCodec>,
+    pub sync_proto: request_response::cbor::Behaviour<SyncRequest, SyncResponse>,
+    pub kademlia: kad::Behaviour<kad::store::MemoryStore>,
+    pub identify: identify::Behaviour,
+}
+
+impl TorusBehaviour {
+    pub fn new(key: &libp2p::identity::Keypair) -> Result<Self, Box<dyn std::error::Error>> {
+        let peer_id = key.public().to_peer_id();
+
+        // GossipSub
+        let gossipsub_config = gossipsub::ConfigBuilder::default()
+            .heartbeat_interval(Duration::from_millis(500))
+            .max_transmit_size(256 * 1024)
+            .validation_mode(gossipsub::ValidationMode::Strict)
+            .build()
+            .map_err(|e| format!("gossipsub config: {e}"))?;
+        let gossipsub = gossipsub::Behaviour::new(
+            gossipsub::MessageAuthenticity::Signed(key.clone()),
+            gossipsub_config,
+        )
+        .map_err(|e| format!("gossipsub: {e}"))?;
+
+        // Direct message request-response (borsh codec)
+        let direct = request_response::Behaviour::<BorshCodec>::new(
+            [(
+                StreamProtocol::new("/torus/direct/1.0"),
+                request_response::ProtocolSupport::Full,
+            )],
+            request_response::Config::default().with_request_timeout(Duration::from_secs(10)),
+        );
+
+        // Block sync request-response (cbor codec)
+        let sync_proto = request_response::cbor::Behaviour::<SyncRequest, SyncResponse>::new(
+            [(
+                StreamProtocol::new("/torus/sync/1.0"),
+                request_response::ProtocolSupport::Full,
+            )],
+            request_response::Config::default().with_request_timeout(Duration::from_secs(10)),
+        );
+
+        // Kademlia DHT
+        let kademlia = kad::Behaviour::new(peer_id, kad::store::MemoryStore::new(peer_id));
+
+        // Identify protocol
+        let identify =
+            identify::Behaviour::new(identify::Config::new("/torus/1.0".into(), key.public()));
+
+        Ok(Self {
+            gossipsub,
+            direct,
+            sync_proto,
+            kademlia,
+            identify,
+        })
+    }
+}
