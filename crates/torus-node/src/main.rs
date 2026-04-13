@@ -244,7 +244,10 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         chain_config.chain_id,
         notifier,
     );
-    let (_rpc_handle, actual_addr) = rpc_server.start(rpc_addr).await?;
+    let (_rpc_handle, actual_addr) = rpc_server
+        .start(rpc_addr)
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error> { e })?;
     info!(%actual_addr, "JSON-RPC server started");
 
     // 9. Metrics (optional telemetry endpoint)
