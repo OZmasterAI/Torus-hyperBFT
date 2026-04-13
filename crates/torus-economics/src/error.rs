@@ -53,4 +53,33 @@ pub enum EconomicsError {
 
     #[error("deployer {0} not found in dev pool")]
     DeployerNotFound(Address),
+
+    // Governance errors (task 2.8)
+
+    #[error("proposal {0} not found")]
+    ProposalNotFound(u64),
+
+    #[error("proposal {0} is not active")]
+    ProposalNotActive(u64),
+
+    #[error("already voted on proposal {proposal_id}")]
+    AlreadyVoted { voter: Address, proposal_id: u64 },
+
+    #[error("insufficient stake to submit proposal: have {have}, need {need}")]
+    InsufficientProposalStake { have: U256, need: U256 },
+
+    #[error("proposal title too long: {len} chars, max {max}")]
+    TitleTooLong { len: usize, max: usize },
+
+    #[error("proposal description too long: {len} chars, max {max}")]
+    DescriptionTooLong { len: usize, max: usize },
+
+    #[error("voter {0} has no voting weight")]
+    NoVotingWeight(Address),
+
+    #[error("proposal {0} voting period has not ended")]
+    VotingNotEnded(u64),
+
+    #[error("treasury insufficient balance: have {have}, need {need}")]
+    InsufficientTreasury { have: U256, need: U256 },
 }
