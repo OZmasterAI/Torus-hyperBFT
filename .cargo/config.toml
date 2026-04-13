@@ -4,7 +4,6 @@ rustflags = ["-C", "link-arg=-fuse-ld=mold"]
 
 [build]
 jobs = 6
-rustc-wrapper = "/home/crab/.cargo/bin/sccache"
 
 [profile.dev]
 split-debuginfo = "unpacked"
