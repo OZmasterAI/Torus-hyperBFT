@@ -108,7 +108,7 @@ pub fn resolve_block_tag(tag: &str, latest: u64) -> Result<u64, RpcError> {
 // Response types
 // ============================================================================
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RpcBlock {
     pub number: String,
@@ -134,7 +134,7 @@ pub struct RpcBlock {
     pub mix_hash: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RpcTransaction {
     pub hash: String,
@@ -158,7 +158,7 @@ pub struct RpcTransaction {
     pub max_priority_fee_per_gas: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RpcReceipt {
     pub transaction_hash: String,
@@ -178,7 +178,7 @@ pub struct RpcReceipt {
     pub tx_type: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RpcLog {
     pub address: String,
@@ -192,7 +192,7 @@ pub struct RpcLog {
     pub removed: bool,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FeeHistory {
     pub oldest_block: String,

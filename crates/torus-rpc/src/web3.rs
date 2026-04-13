@@ -23,7 +23,7 @@ impl Web3ApiServer for RpcState {
 
     async fn sha3(&self, data: String) -> RpcResult<String> {
         // Input is hex-encoded, decode first then keccak256.
-        let bytes = parse_bytes(&data).map_err(|e| jsonrpsee::types::ErrorObjectOwned::from(e))?;
+        let bytes = parse_bytes(&data).map_err(jsonrpsee::types::ErrorObjectOwned::from)?;
         let hash = alloy_primitives::keccak256(&bytes);
         Ok(hex_b256(hash))
     }

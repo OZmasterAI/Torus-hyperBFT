@@ -46,9 +46,7 @@ impl From<RpcError> for ErrorObjectOwned {
             RpcError::State(_)
             | RpcError::Evm(_)
             | RpcError::Mempool(_)
-            | RpcError::Internal(_) => {
-                ErrorObjectOwned::owned(-32603, err.to_string(), None::<()>)
-            }
+            | RpcError::Internal(_) => ErrorObjectOwned::owned(-32603, err.to_string(), None::<()>),
         }
     }
 }
