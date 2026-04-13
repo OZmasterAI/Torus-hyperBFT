@@ -21,24 +21,15 @@ pub enum MempoolError {
         need: U256,
     },
     /// Wrong chain ID.
-    InvalidChainId {
-        have: Option<u64>,
-        want: u64,
-    },
+    InvalidChainId { have: Option<u64>, want: u64 },
     /// Transaction already exists in the pool.
     DuplicateTx(B256),
     /// Pool is full and the transaction doesn't outbid the cheapest.
     PoolFull,
     /// Replacement transaction doesn't meet the minimum gas price bump.
-    ReplacementUnderpriced {
-        need_min: u128,
-        got: u128,
-    },
+    ReplacementUnderpriced { need_min: u128, got: u128 },
     /// Transaction gas limit exceeds block gas limit.
-    GasLimitExceeded {
-        tx_gas: u64,
-        block_gas: u64,
-    },
+    GasLimitExceeded { tx_gas: u64, block_gas: u64 },
     /// State read error during validation.
     State(String),
 }
@@ -52,9 +43,15 @@ impl fmt::Display for MempoolError {
                 sender,
                 have,
                 minimum,
-            } => write!(f, "nonce too low for {sender}: have {have}, minimum {minimum}"),
+            } => write!(
+                f,
+                "nonce too low for {sender}: have {have}, minimum {minimum}"
+            ),
             Self::InsufficientBalance { sender, have, need } => {
-                write!(f, "insufficient balance for {sender}: have {have}, need {need}")
+                write!(
+                    f,
+                    "insufficient balance for {sender}: have {have}, need {need}"
+                )
             }
             Self::InvalidChainId { have, want } => {
                 write!(f, "wrong chain_id: have {have:?}, want {want}")

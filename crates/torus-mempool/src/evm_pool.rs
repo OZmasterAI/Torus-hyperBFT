@@ -170,7 +170,10 @@ impl EvmPool {
             hash,
         });
         self.by_hash.insert(hash, (sender, nonce));
-        self.by_sender.entry(sender).or_default().insert(nonce, entry);
+        self.by_sender
+            .entry(sender)
+            .or_default()
+            .insert(nonce, entry);
         self.size += 1;
 
         Ok(replaced)

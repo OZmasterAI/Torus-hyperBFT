@@ -259,15 +259,30 @@ mod tests {
         fund(&state, &addr, U256::from(10u64.pow(18)), 0);
 
         pool.add_evm_tx(create_eip1559_tx(
-            &k, 2, 1_000_000_000, 100_000_000, 21_000, U256::ZERO,
+            &k,
+            2,
+            1_000_000_000,
+            100_000_000,
+            21_000,
+            U256::ZERO,
         ))
         .unwrap();
         pool.add_evm_tx(create_eip1559_tx(
-            &k, 0, 3_000_000_000, 300_000_000, 21_000, U256::ZERO,
+            &k,
+            0,
+            3_000_000_000,
+            300_000_000,
+            21_000,
+            U256::ZERO,
         ))
         .unwrap();
         pool.add_evm_tx(create_eip1559_tx(
-            &k, 1, 2_000_000_000, 200_000_000, 21_000, U256::ZERO,
+            &k,
+            1,
+            2_000_000_000,
+            200_000_000,
+            21_000,
+            U256::ZERO,
         ))
         .unwrap();
         assert_eq!(pool.evm_pool_size(), 3);
@@ -363,20 +378,35 @@ mod tests {
         fund(&state, &addr, U256::from(10u64.pow(18)), 0);
 
         pool.add_evm_tx(create_eip1559_tx(
-            &k, 0, 1_000_000_000, 100_000_000, 21_000, U256::ZERO,
+            &k,
+            0,
+            1_000_000_000,
+            100_000_000,
+            21_000,
+            U256::ZERO,
         ))
         .unwrap();
         assert_eq!(pool.evm_pool_size(), 1);
 
         let err = pool
             .add_evm_tx(create_eip1559_tx(
-                &k, 0, 1_050_000_000, 105_000_000, 21_000, U256::ZERO,
+                &k,
+                0,
+                1_050_000_000,
+                105_000_000,
+                21_000,
+                U256::ZERO,
             ))
             .unwrap_err();
         assert!(matches!(err, MempoolError::ReplacementUnderpriced { .. }));
 
         pool.add_evm_tx(create_eip1559_tx(
-            &k, 0, 1_200_000_000, 120_000_000, 21_000, U256::ZERO,
+            &k,
+            0,
+            1_200_000_000,
+            120_000_000,
+            21_000,
+            U256::ZERO,
         ))
         .unwrap();
         assert_eq!(pool.evm_pool_size(), 1);
@@ -409,28 +439,28 @@ mod tests {
         assert_eq!(pool.evm_pool_size(), 3);
 
         let k4 = key(14);
-        fund(
-            &state,
-            &address_from_key(&k4),
-            U256::from(10u64.pow(18)),
-            0,
-        );
+        fund(&state, &address_from_key(&k4), U256::from(10u64.pow(18)), 0);
         pool.add_evm_tx(create_eip1559_tx(
-            &k4, 0, 5_000_000_000, 500_000_000, 21_000, U256::ZERO,
+            &k4,
+            0,
+            5_000_000_000,
+            500_000_000,
+            21_000,
+            U256::ZERO,
         ))
         .unwrap();
         assert_eq!(pool.evm_pool_size(), 3);
 
         let k5 = key(15);
-        fund(
-            &state,
-            &address_from_key(&k5),
-            U256::from(10u64.pow(18)),
-            0,
-        );
+        fund(&state, &address_from_key(&k5), U256::from(10u64.pow(18)), 0);
         let err = pool
             .add_evm_tx(create_eip1559_tx(
-                &k5, 0, 500_000_000, 50_000_000, 21_000, U256::ZERO,
+                &k5,
+                0,
+                500_000_000,
+                50_000_000,
+                21_000,
+                U256::ZERO,
             ))
             .unwrap_err();
         assert!(matches!(err, MempoolError::PoolFull));
@@ -450,16 +480,31 @@ mod tests {
         fund(&state, &addr, U256::from(10u64.pow(18)), 0);
 
         pool.add_evm_tx(create_eip1559_tx(
-            &k, 0, 1_000_000_000, 100_000_000, 21_000, U256::ZERO,
+            &k,
+            0,
+            1_000_000_000,
+            100_000_000,
+            21_000,
+            U256::ZERO,
         ))
         .unwrap();
         pool.add_evm_tx(create_eip1559_tx(
-            &k, 1, 1_000_000_000, 100_000_000, 21_000, U256::ZERO,
+            &k,
+            1,
+            1_000_000_000,
+            100_000_000,
+            21_000,
+            U256::ZERO,
         ))
         .unwrap();
         let err = pool
             .add_evm_tx(create_eip1559_tx(
-                &k, 2, 1_000_000_000, 100_000_000, 21_000, U256::ZERO,
+                &k,
+                2,
+                1_000_000_000,
+                100_000_000,
+                21_000,
+                U256::ZERO,
             ))
             .unwrap_err();
         assert!(matches!(err, MempoolError::PoolFull));
@@ -476,7 +521,12 @@ mod tests {
 
         for i in 0..3u64 {
             pool.add_evm_tx(create_eip1559_tx(
-                &k, i, 1_000_000_000, 100_000_000, 21_000, U256::ZERO,
+                &k,
+                i,
+                1_000_000_000,
+                100_000_000,
+                21_000,
+                U256::ZERO,
             ))
             .unwrap();
         }
@@ -492,26 +542,26 @@ mod tests {
         let pool = Mempool::new(state.clone(), MempoolConfig::default());
 
         let ka = key(40);
-        fund(
-            &state,
-            &address_from_key(&ka),
-            U256::from(10u64.pow(18)),
-            0,
-        );
+        fund(&state, &address_from_key(&ka), U256::from(10u64.pow(18)), 0);
         pool.add_evm_tx(create_eip1559_tx(
-            &ka, 0, 1_000_000_000, 100_000_000, 21_000, U256::ZERO,
+            &ka,
+            0,
+            1_000_000_000,
+            100_000_000,
+            21_000,
+            U256::ZERO,
         ))
         .unwrap();
 
         let kb = key(41);
-        fund(
-            &state,
-            &address_from_key(&kb),
-            U256::from(10u64.pow(18)),
-            0,
-        );
+        fund(&state, &address_from_key(&kb), U256::from(10u64.pow(18)), 0);
         pool.add_evm_tx(create_eip1559_tx(
-            &kb, 0, 5_000_000_000, 500_000_000, 21_000, U256::ZERO,
+            &kb,
+            0,
+            5_000_000_000,
+            500_000_000,
+            21_000,
+            U256::ZERO,
         ))
         .unwrap();
 
@@ -566,14 +616,14 @@ mod tests {
         let pool = Mempool::new(state.clone(), MempoolConfig::default());
 
         let k = key(50);
-        fund(
-            &state,
-            &address_from_key(&k),
-            U256::from(10u64.pow(18)),
-            0,
-        );
+        fund(&state, &address_from_key(&k), U256::from(10u64.pow(18)), 0);
         pool.add_evm_tx(create_eip1559_tx(
-            &k, 0, 1_000_000_000, 100_000_000, 21_000, U256::ZERO,
+            &k,
+            0,
+            1_000_000_000,
+            100_000_000,
+            21_000,
+            U256::ZERO,
         ))
         .unwrap();
 
@@ -590,14 +640,14 @@ mod tests {
         let pool = Mempool::new(state.clone(), MempoolConfig::default());
 
         let k = key(60);
-        fund(
-            &state,
-            &address_from_key(&k),
-            U256::from(10u64.pow(18)),
-            0,
-        );
+        fund(&state, &address_from_key(&k), U256::from(10u64.pow(18)), 0);
         pool.add_evm_tx(create_eip1559_tx(
-            &k, 0, 1_000_000_000, 100_000_000, 21_000, U256::ZERO,
+            &k,
+            0,
+            1_000_000_000,
+            100_000_000,
+            21_000,
+            U256::ZERO,
         ))
         .unwrap();
 
