@@ -14,6 +14,7 @@ members = [
     "crates/torus-genesis",
     "crates/torus-telemetry",
     "crates/torus-node",
+    "crates/torus-integration-tests",
 ]
 
 [workspace.package]

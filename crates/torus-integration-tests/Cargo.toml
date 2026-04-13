@@ -1,0 +1,23 @@
+[package]
+name = "torus-integration-tests"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dev-dependencies]
+torus-core = { workspace = true }
+torus-economics = { workspace = true }
+torus-bridge = { workspace = true }
+torus-rpc = { workspace = true }
+torus-evm = { workspace = true }
+torus-state = { workspace = true }
+torus-mempool = { workspace = true }
+torus-types = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tempfile = { workspace = true }
+jsonrpsee = { workspace = true }
+serde_json = { workspace = true }
+alloy-primitives = { workspace = true }
+borsh = { workspace = true }
+tracing = { workspace = true }
+revm = { workspace = true }
