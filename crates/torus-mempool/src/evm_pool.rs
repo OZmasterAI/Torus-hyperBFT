@@ -1,4 +1,4 @@
-use alloy_primitives::{Address, B256, U256};
+use alloy_primitives::{keccak256, Address, B256, U256};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
 
@@ -43,6 +43,10 @@ impl PartialOrd for TxPriority {
 }
 
 /// Heap entry for the drain k-way merge (max-heap by gas price).
+///
+/// Task 3.1.5 (anti-MEV): `shuffle_key` is a deterministic tiebreaker derived
+/// from the parent block hash. Within the same gas price tier, this randomizes
+/// ordering so an attacker cannot guarantee placement relative to a victim's tx.
 #[derive(Eq, PartialEq)]
 struct DrainEntry {
     max_fee_per_gas: u128,
@@ -50,6 +54,7 @@ struct DrainEntry {
     sender: Address,
     nonce: u64,
     gas_limit: u64,
+    shuffle_key: u64,
 }
 
 impl Ord for DrainEntry {
@@ -57,6 +62,7 @@ impl Ord for DrainEntry {
         self.max_fee_per_gas
             .cmp(&other.max_fee_per_gas)
             .then_with(|| self.max_priority_fee.cmp(&other.max_priority_fee))
+            .then_with(|| self.shuffle_key.cmp(&other.shuffle_key))
     }
 }
 
@@ -64,6 +70,17 @@ impl PartialOrd for DrainEntry {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
+}
+
+/// Compute a deterministic shuffle key for anti-MEV ordering.
+/// Derived from parent_hash + sender + nonce so all nodes produce identical order.
+fn compute_shuffle_key(parent_hash: &B256, sender: &Address, nonce: u64) -> u64 {
+    let mut data = [0u8; 60]; // 32 (hash) + 20 (address) + 8 (nonce)
+    data[..32].copy_from_slice(parent_hash.as_slice());
+    data[32..52].copy_from_slice(sender.as_slice());
+    data[52..60].copy_from_slice(&nonce.to_be_bytes());
+    let hash = keccak256(&data);
+    u64::from_be_bytes(hash.as_slice()[..8].try_into().unwrap())
 }
 
 /// Inner EVM transaction pool (not thread-safe — wrapped by Mempool).
@@ -201,7 +218,15 @@ impl EvmPool {
     /// For each sender, starts with their lowest-nonce tx. Picks highest gas price
     /// across all senders, advances that sender's pointer, repeats until gas budget
     /// is exhausted. Returns raw RLP bytes for inclusion in `TorusBlock`.
-    pub fn drain(&mut self, gas_budget: u64) -> Vec<Vec<u8>> {
+    ///
+    /// Task 3.1.4: `per_sender_limit` caps txs per address in a single block.
+    /// Task 3.1.5: `parent_hash` seeds deterministic same-price shuffling (anti-MEV).
+    pub fn drain(
+        &mut self,
+        gas_budget: u64,
+        per_sender_limit: usize,
+        parent_hash: &B256,
+    ) -> Vec<Vec<u8>> {
         let mut heap = BinaryHeap::new();
         for (sender, txs) in &self.by_sender {
             if let Some((&nonce, entry)) = txs.iter().next() {
@@ -211,6 +236,7 @@ impl EvmPool {
                     sender: *sender,
                     nonce,
                     gas_limit: entry.gas_limit,
+                    shuffle_key: compute_shuffle_key(parent_hash, sender, nonce),
                 });
             }
         }
@@ -218,8 +244,15 @@ impl EvmPool {
         let mut result = Vec::new();
         let mut gas_used: u64 = 0;
         let mut to_remove = Vec::new();
+        let mut sender_counts: HashMap<Address, usize> = HashMap::new();
 
         while let Some(top) = heap.pop() {
+            // Per-sender-per-block limit (Task 3.1.4): leave excess in pool.
+            let count = sender_counts.get(&top.sender).copied().unwrap_or(0);
+            if count >= per_sender_limit {
+                continue;
+            }
+
             if gas_used.saturating_add(top.gas_limit) > gas_budget {
                 continue;
             }
@@ -242,8 +275,9 @@ impl EvmPool {
                     .unwrap(),
             );
             result.push(raw);
+            *sender_counts.entry(top.sender).or_insert(0) += 1;
 
-            // Advance: push next nonce for this sender
+            // Advance: push next nonce for this sender.
             let next_nonce = top.nonce + 1;
             if let Some(next) = self
                 .by_sender
@@ -256,6 +290,7 @@ impl EvmPool {
                     sender: top.sender,
                     nonce: next_nonce,
                     gas_limit: next.gas_limit,
+                    shuffle_key: compute_shuffle_key(parent_hash, &top.sender, next_nonce),
                 });
             }
         }

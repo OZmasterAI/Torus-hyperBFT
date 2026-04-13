@@ -494,7 +494,9 @@ impl TorusApiServer for RpcState {
         let hash = keccak256(&action_bytes);
 
         // Submit to mempool native action pool.
-        self.mempool.add_native_action(action);
+        self.mempool
+            .add_native_action(action)
+            .map_err(|e| ErrorObjectOwned::from(RpcError::Internal(format!("mempool: {e}"))))?;
 
         Ok(hex_b256(hash))
     }

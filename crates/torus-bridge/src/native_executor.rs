@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use alloy_primitives::Address;
+use alloy_primitives::{Address, B256};
 use torus_core::liquidation::LiquidationEngine;
 use torus_core::lockbox::{fp_to_u256, u256_to_fp, Lockbox};
 use torus_core::margin::MarketMarginConfig;
@@ -502,6 +502,9 @@ impl NativeExecutor {
     // ========================================================================
 
     /// Drain and execute CoreWriter actions queued from the previous block.
+    ///
+    /// Task 3.1.5 (anti-MEV): Asserts the one-block delay is enforced — all
+    /// drained actions must have been queued in a strictly earlier block.
     pub fn drain_core_writer(ctx: &mut NativeExecContext) -> Vec<NativeActionResult> {
         let queued = match CoreWriterQueue::drain(&ctx.state_db, ctx.block_height) {
             Ok(actions) => actions,
@@ -510,6 +513,25 @@ impl NativeExecutor {
 
         let mut results = Vec::with_capacity(queued.len());
         for qa in &queued {
+            // BUG FIX (3.1): CoreWriter delay guard — skip any action that was
+            // queued in the current or a future block (should never happen, but
+            // guards against bypass bugs).
+            if qa.block_queued >= ctx.block_height {
+                tracing::error!(
+                    queued_block = qa.block_queued,
+                    current_block = ctx.block_height,
+                    "BUG (3.1): CoreWriter action from current/future block — skipping"
+                );
+                results.push(NativeActionResult::err(
+                    "core_writer",
+                    format!(
+                        "action queued in block {} cannot execute in block {}",
+                        qa.block_queued, ctx.block_height
+                    ),
+                ));
+                continue;
+            }
+
             let action = core_writer_to_native(qa);
             let result = Self::execute(ctx, &qa.trader, &action);
             results.push(result);
@@ -709,6 +731,11 @@ pub fn classify_action(action: &NativeAction) -> ActionCategory {
 ///
 /// Pre-EVM:  cancellations, non-GTC orders
 /// Post-EVM: GTC orders, lockbox, oracle, governance, staking, other
+///
+/// Task 3.1.5 (anti-MEV): Within each category, actions are sorted by
+/// (sender_address, action_content_hash) for determinism. This prevents a
+/// validator-proposer from manipulating within-category ordering by choosing
+/// submission order.
 pub fn sort_native_actions(
     actions: &[(Address, NativeAction)],
 ) -> (Vec<(Address, NativeAction)>, Vec<(Address, NativeAction)>) {
@@ -723,11 +750,32 @@ pub fn sort_native_actions(
         }
     }
 
-    // Stable sort within each group by category.
-    pre_evm.sort_by_key(|(_, a)| classify_action(a));
-    post_evm.sort_by_key(|(_, a)| classify_action(a));
+    // Deterministic sort: (category, sender, action_content_hash).
+    sort_deterministic(&mut pre_evm);
+    sort_deterministic(&mut post_evm);
 
     (pre_evm, post_evm)
+}
+
+/// Deterministic sort key for a native action.
+fn action_sort_key(sender: &Address, action: &NativeAction) -> (ActionCategory, Address, B256) {
+    let category = classify_action(action);
+    let hash = alloy_primitives::keccak256(format!("{:?}", action).as_bytes());
+    (category, *sender, hash)
+}
+
+/// Sort actions deterministically by (category, sender, action_content_hash).
+fn sort_deterministic(actions: &mut Vec<(Address, NativeAction)>) {
+    // Pre-compute sort keys to avoid repeated hashing during sort.
+    let mut keyed: Vec<_> = actions
+        .drain(..)
+        .map(|(s, a)| {
+            let key = action_sort_key(&s, &a);
+            (key, (s, a))
+        })
+        .collect();
+    keyed.sort_by(|a, b| a.0.cmp(&b.0));
+    actions.extend(keyed.into_iter().map(|(_, pair)| pair));
 }
 
 // ============================================================================

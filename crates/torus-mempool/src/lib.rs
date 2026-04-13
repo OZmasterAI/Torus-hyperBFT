@@ -9,6 +9,7 @@
 pub mod error;
 pub mod evm_pool;
 pub mod native_pool;
+pub mod rate_limit;
 pub mod validate;
 
 use std::sync::RwLock;
@@ -33,6 +34,21 @@ pub struct MempoolConfig {
     pub chain_id: u64,
     /// Block gas limit for validation.
     pub block_gas_limit: u64,
+    // ---- Rate limiting (Task 3.1.4) ----
+    /// Sliding window size in blocks for rate tracking.
+    pub rate_window_blocks: u64,
+    /// Max EVM txs per sender within the rate window.
+    pub evm_rate_limit_per_window: u32,
+    /// Max native actions per sender within the rate window.
+    pub native_rate_limit_per_window: u32,
+    /// Max EVM txs per sender per block.
+    pub evm_per_block_cap: usize,
+    /// Max native actions per sender per block.
+    pub native_per_block_cap: usize,
+    /// Max total native pool size.
+    pub native_pool_max_size: usize,
+    /// Max pending native actions per sender in the pool.
+    pub native_per_sender_cap: usize,
 }
 
 impl Default for MempoolConfig {
@@ -43,6 +59,13 @@ impl Default for MempoolConfig {
             replacement_bump_pct: 10,
             chain_id: 7777,
             block_gas_limit: 30_000_000,
+            rate_window_blocks: rate_limit::RATE_WINDOW_BLOCKS,
+            evm_rate_limit_per_window: rate_limit::EVM_RATE_LIMIT_PER_WINDOW,
+            native_rate_limit_per_window: rate_limit::NATIVE_RATE_LIMIT_PER_WINDOW,
+            evm_per_block_cap: rate_limit::EVM_PER_BLOCK_CAP,
+            native_per_block_cap: rate_limit::NATIVE_PER_BLOCK_CAP,
+            native_pool_max_size: rate_limit::NATIVE_POOL_MAX_SIZE,
+            native_per_sender_cap: rate_limit::NATIVE_PER_SENDER_CAP,
         }
     }
 }
@@ -51,6 +74,7 @@ impl Default for MempoolConfig {
 pub struct Mempool {
     evm: RwLock<evm_pool::EvmPool>,
     native: RwLock<native_pool::NativePool>,
+    rate_tracker: RwLock<rate_limit::RateTracker>,
     state: StateDb,
     config: MempoolConfig,
 }
@@ -58,16 +82,27 @@ pub struct Mempool {
 impl Mempool {
     /// Create a new mempool backed by the given state database.
     pub fn new(state: StateDb, config: MempoolConfig) -> Self {
+        let native_pool = native_pool::NativePool::new(
+            config.native_pool_max_size,
+            config.native_per_sender_cap,
+            config.native_per_block_cap,
+        );
+        let tracker = rate_limit::RateTracker::new(
+            config.rate_window_blocks,
+            config.evm_rate_limit_per_window,
+            config.native_rate_limit_per_window,
+        );
         Self {
             evm: RwLock::new(evm_pool::EvmPool::new()),
-            native: RwLock::new(native_pool::NativePool::new()),
+            native: RwLock::new(native_pool),
+            rate_tracker: RwLock::new(tracker),
             state,
             config,
         }
     }
 
     /// Submit a raw RLP-encoded EVM transaction.
-    /// Decodes, validates, and inserts. Returns the transaction hash on success.
+    /// Decodes, validates, checks rate limit, and inserts. Returns the tx hash.
     pub fn add_evm_tx(&self, raw_rlp: Vec<u8>) -> Result<B256, MempoolError> {
         let entry = validate::validate_evm_tx(
             &raw_rlp,
@@ -77,6 +112,19 @@ impl Mempool {
         )?;
 
         let hash = entry.hash;
+        let sender = entry.sender;
+
+        // Rate limit check (Task 3.1.4).
+        {
+            let tracker = self.rate_tracker.read().unwrap();
+            if tracker.is_evm_rate_limited(&sender) {
+                return Err(MempoolError::RateLimited {
+                    sender,
+                    window: self.config.rate_window_blocks,
+                });
+            }
+        }
+
         let mut pool = self.evm.write().unwrap();
 
         if pool.contains(&hash) {
@@ -106,9 +154,11 @@ impl Mempool {
     /// Drain EVM transactions for a block proposal.
     /// Selects highest-gas-price transactions that fit within `gas_limit`,
     /// respecting per-sender nonce ordering. Removes selected txs from the pool.
-    pub fn drain_evm(&self, gas_limit: u64) -> Vec<Vec<u8>> {
+    ///
+    /// `parent_hash` seeds deterministic same-price shuffling (anti-MEV, Task 3.1.5).
+    pub fn drain_evm(&self, gas_limit: u64, parent_hash: B256) -> Vec<Vec<u8>> {
         let mut pool = self.evm.write().unwrap();
-        pool.drain(gas_limit)
+        pool.drain(gas_limit, self.config.evm_per_block_cap, &parent_hash)
     }
 
     /// Current EVM pool size.
@@ -116,20 +166,46 @@ impl Mempool {
         self.evm.read().unwrap().size()
     }
 
-    /// Submit a signed native action.
-    pub fn add_native_action(&self, action: SignedNativeAction) {
+    /// Submit a signed native action. Recovers the sender from the EIP-712 signature.
+    pub fn add_native_action(&self, action: SignedNativeAction) -> Result<(), MempoolError> {
+        let sender = action
+            .recover_sender()
+            .map_err(|e| MempoolError::SignatureRecovery(e.to_string()))?;
+        self.submit_native_action(sender, action)
+    }
+
+    /// Submit a native action with a known sender (pre-verified by caller).
+    pub fn submit_native_action(
+        &self,
+        sender: alloy_primitives::Address,
+        action: SignedNativeAction,
+    ) -> Result<(), MempoolError> {
+        // Rate limit check — exempt oracle/governance actions (Task 3.1.4).
+        if !rate_limit::is_exempt_action(&action.action) {
+            let tracker = self.rate_tracker.read().unwrap();
+            if tracker.is_native_rate_limited(&sender) {
+                return Err(MempoolError::RateLimited {
+                    sender,
+                    window: self.config.rate_window_blocks,
+                });
+            }
+        }
+
         let mut pool = self.native.write().unwrap();
-        pool.insert(action);
+        pool.insert(sender, action)?;
+        tracing::debug!(%sender, "native action added to mempool");
+        Ok(())
     }
 
     /// Drain native actions for a block proposal.
     /// Returns up to `limit` actions in priority order (cancels first).
+    /// Per-sender-per-block caps are enforced internally.
     pub fn drain_native(&self, limit: usize) -> Vec<SignedNativeAction> {
         let mut pool = self.native.write().unwrap();
         pool.drain(limit)
     }
 
-    /// Re-insert previously drained native actions.
+    /// Re-insert previously drained native actions (e.g., after reorg).
     pub fn reinsert_native(&self, actions: Vec<SignedNativeAction>) {
         let mut pool = self.native.write().unwrap();
         pool.reinsert(actions);
@@ -141,14 +217,29 @@ impl Mempool {
     }
 
     /// Drain both pools for a block proposal.
+    ///
+    /// `parent_hash` seeds EVM tx anti-MEV shuffling (Task 3.1.5).
     pub fn drain_for_block(
         &self,
         native_limit: usize,
         evm_gas_limit: u64,
+        parent_hash: B256,
     ) -> (Vec<SignedNativeAction>, Vec<Vec<u8>>) {
         let native = self.drain_native(native_limit);
-        let evm = self.drain_evm(evm_gas_limit);
+        let evm = self.drain_evm(evm_gas_limit, parent_hash);
         (native, evm)
+    }
+
+    /// Record which senders had txs/actions included in a committed block.
+    /// Updates the sliding-window rate tracker. Call after each block commit.
+    pub fn notify_block_committed(
+        &self,
+        block_height: u64,
+        evm_senders: &[alloy_primitives::Address],
+        native_senders: &[alloy_primitives::Address],
+    ) {
+        let mut tracker = self.rate_tracker.write().unwrap();
+        tracker.record_block(block_height, evm_senders, native_senders);
     }
 }
 
@@ -287,7 +378,7 @@ mod tests {
         .unwrap();
         assert_eq!(pool.evm_pool_size(), 3);
 
-        let drained = pool.drain_evm(30_000_000);
+        let drained = pool.drain_evm(30_000_000, B256::ZERO);
         assert_eq!(drained.len(), 3);
         assert_eq!(pool.evm_pool_size(), 0);
     }
@@ -531,7 +622,7 @@ mod tests {
             .unwrap();
         }
 
-        let drained = pool.drain_evm(42_000);
+        let drained = pool.drain_evm(42_000, B256::ZERO);
         assert_eq!(drained.len(), 2);
         assert_eq!(pool.evm_pool_size(), 1);
     }
@@ -565,11 +656,11 @@ mod tests {
         ))
         .unwrap();
 
-        let drained = pool.drain_evm(21_000);
+        let drained = pool.drain_evm(21_000, B256::ZERO);
         assert_eq!(drained.len(), 1);
         assert_eq!(pool.evm_pool_size(), 1);
 
-        let rest = pool.drain_evm(30_000_000);
+        let rest = pool.drain_evm(30_000_000, B256::ZERO);
         assert_eq!(rest.len(), 1);
     }
 
@@ -584,22 +675,35 @@ mod tests {
             r: [0u8; 32],
             s: [0u8; 32],
         };
+        let sender = Address::repeat_byte(0xAA);
 
-        pool.add_native_action(SignedNativeAction {
-            action: NativeAction::ClaimRewards,
-            nonce: 1,
-            signature: sig.clone(),
-        });
-        pool.add_native_action(SignedNativeAction {
-            action: NativeAction::CancelOrder { order_id: 42 },
-            nonce: 2,
-            signature: sig.clone(),
-        });
-        pool.add_native_action(SignedNativeAction {
-            action: NativeAction::ClaimRewards,
-            nonce: 3,
-            signature: sig,
-        });
+        pool.submit_native_action(
+            sender,
+            SignedNativeAction {
+                action: NativeAction::ClaimRewards,
+                nonce: 1,
+                signature: sig.clone(),
+            },
+        )
+        .unwrap();
+        pool.submit_native_action(
+            sender,
+            SignedNativeAction {
+                action: NativeAction::CancelOrder { order_id: 42 },
+                nonce: 2,
+                signature: sig.clone(),
+            },
+        )
+        .unwrap();
+        pool.submit_native_action(
+            sender,
+            SignedNativeAction {
+                action: NativeAction::ClaimRewards,
+                nonce: 3,
+                signature: sig,
+            },
+        )
+        .unwrap();
 
         let drained = pool.drain_native(2);
         assert_eq!(drained.len(), 2);
@@ -627,7 +731,7 @@ mod tests {
         ))
         .unwrap();
 
-        let drained = pool.drain_evm(30_000_000);
+        let drained = pool.drain_evm(30_000_000, B256::ZERO);
         assert_eq!(pool.evm_pool_size(), 0);
 
         pool.reinsert_evm(drained);
@@ -651,20 +755,96 @@ mod tests {
         ))
         .unwrap();
 
-        pool.add_native_action(SignedNativeAction {
-            action: torus_types::NativeAction::ClaimRewards,
-            nonce: 1,
-            signature: torus_types::Signature {
-                v: 27,
-                r: [0; 32],
-                s: [0; 32],
+        let sender = Address::repeat_byte(0xBB);
+        pool.submit_native_action(
+            sender,
+            SignedNativeAction {
+                action: torus_types::NativeAction::ClaimRewards,
+                nonce: 1,
+                signature: torus_types::Signature {
+                    v: 27,
+                    r: [0; 32],
+                    s: [0; 32],
+                },
             },
-        });
+        )
+        .unwrap();
 
-        let (native, evm) = pool.drain_for_block(10, 30_000_000);
+        let (native, evm) = pool.drain_for_block(10, 30_000_000, B256::ZERO);
         assert_eq!(evm.len(), 1);
         assert_eq!(native.len(), 1);
         assert_eq!(pool.evm_pool_size(), 0);
         assert_eq!(pool.native_pool_size(), 0);
+    }
+
+    #[test]
+    fn evm_per_block_cap_enforced() {
+        let (_dir, state) = setup();
+        let config = MempoolConfig {
+            evm_per_block_cap: 2,
+            ..MempoolConfig::default()
+        };
+        let pool = Mempool::new(state.clone(), config);
+
+        let k = key(70);
+        let addr = address_from_key(&k);
+        fund(&state, &addr, U256::from(10u64.pow(18)), 0);
+
+        for i in 0..5u64 {
+            pool.add_evm_tx(create_eip1559_tx(
+                &k,
+                i,
+                1_000_000_000,
+                100_000_000,
+                21_000,
+                U256::ZERO,
+            ))
+            .unwrap();
+        }
+        assert_eq!(pool.evm_pool_size(), 5);
+
+        // Per-block cap = 2: only 2 drained, 3 remain.
+        let drained = pool.drain_evm(30_000_000, B256::ZERO);
+        assert_eq!(drained.len(), 2);
+        assert_eq!(pool.evm_pool_size(), 3);
+    }
+
+    #[test]
+    fn anti_mev_same_gas_different_parent_hash() {
+        let (_dir, state) = setup();
+        let config = MempoolConfig {
+            evm_per_block_cap: 10,
+            ..MempoolConfig::default()
+        };
+
+        // Create two senders with the same gas price.
+        let ka = key(80);
+        let kb = key(81);
+        fund(&state, &address_from_key(&ka), U256::from(10u64.pow(18)), 0);
+        fund(&state, &address_from_key(&kb), U256::from(10u64.pow(18)), 0);
+
+        // Submit with identical gas prices.
+        let pool1 = Mempool::new(state.clone(), config.clone());
+        pool1
+            .add_evm_tx(create_eip1559_tx(&ka, 0, 1_000_000_000, 100_000_000, 21_000, U256::ZERO))
+            .unwrap();
+        pool1
+            .add_evm_tx(create_eip1559_tx(&kb, 0, 1_000_000_000, 100_000_000, 21_000, U256::ZERO))
+            .unwrap();
+
+        let pool2 = Mempool::new(state.clone(), config);
+        pool2
+            .add_evm_tx(create_eip1559_tx(&ka, 0, 1_000_000_000, 100_000_000, 21_000, U256::ZERO))
+            .unwrap();
+        pool2
+            .add_evm_tx(create_eip1559_tx(&kb, 0, 1_000_000_000, 100_000_000, 21_000, U256::ZERO))
+            .unwrap();
+
+        // Same parent hash → same ordering (deterministic).
+        let hash_a = B256::repeat_byte(0x11);
+        let d1 = pool1.drain_evm(30_000_000, hash_a);
+        let d2 = pool2.drain_evm(30_000_000, hash_a);
+        assert_eq!(d1.len(), 2);
+        assert_eq!(d1, d2, "same parent hash must give same order");
     }
 }
