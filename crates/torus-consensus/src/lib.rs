@@ -11,8 +11,10 @@ pub mod app;
 pub mod genesis;
 pub mod kv_store;
 pub mod network;
+pub mod slashing;
 
 pub use app::TorusApp;
 pub use genesis::GenesisConfig;
 pub use kv_store::RocksKVStore;
 pub use network::ChannelNetwork;
+pub use slashing::{DoubleSignDetector, DoubleSignEvidence, DowntimeTracker};

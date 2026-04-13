@@ -209,8 +209,8 @@ impl NativeExecutor {
             NativeAction::UpdateCommission { .. } => {
                 NativeActionResult::ok("update_commission", 0)
             }
-            NativeAction::JailVote { .. } => NativeActionResult::ok("jail_vote", 0),
-            NativeAction::UnjailSelf => NativeActionResult::ok("unjail_self", 0),
+            NativeAction::JailVote { target } => Self::exec_jail_vote(ctx, sender, target),
+            NativeAction::UnjailSelf => Self::exec_unjail_self(ctx, sender),
 
             // ---- Admin (governance-gated, stubs) ----
             NativeAction::UpdateMarketParams { .. } => {
@@ -375,6 +375,30 @@ impl NativeExecutor {
         match ctx.staking.claim_rewards(*sender) {
             Ok(_) => NativeActionResult::ok("claim_rewards", 1500),
             Err(e) => NativeActionResult::err("claim_rewards", e.to_string()),
+        }
+    }
+
+    fn exec_jail_vote(
+        ctx: &mut NativeExecContext,
+        sender: &Address,
+        target: &Address,
+    ) -> NativeActionResult {
+        match ctx
+            .staking
+            .record_jail_vote(*sender, *target, ctx.block_height)
+        {
+            Ok(jailed) => {
+                let gas = if jailed { 5000 } else { 2000 };
+                NativeActionResult::ok("jail_vote", gas)
+            }
+            Err(e) => NativeActionResult::err("jail_vote", e.to_string()),
+        }
+    }
+
+    fn exec_unjail_self(ctx: &mut NativeExecContext, sender: &Address) -> NativeActionResult {
+        match ctx.staking.unjail(sender, ctx.block_height) {
+            Ok(()) => NativeActionResult::ok("unjail_self", 2000),
+            Err(e) => NativeActionResult::err("unjail_self", e.to_string()),
         }
     }
 

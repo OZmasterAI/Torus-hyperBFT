@@ -82,4 +82,19 @@ pub enum EconomicsError {
 
     #[error("treasury insufficient balance: have {have}, need {need}")]
     InsufficientTreasury { have: U256, need: U256 },
+
+    // Slashing & Jailing errors (Phase 3: 3.1)
+
+    #[error("validator {0} is not jailed")]
+    ValidatorNotJailed(Address),
+
+    #[error("validator {0} unjail cooldown not expired")]
+    UnjailCooldownNotExpired(Address),
+
+    #[error("validator {address} cannot unjail: self_stake {have} below minimum {minimum}")]
+    UnjailInsufficientStake {
+        address: Address,
+        have: U256,
+        minimum: U256,
+    },
 }

@@ -40,6 +40,10 @@ pub const CF_DEV_POOL: &str = "cf_dev_pool";
 pub const CF_NATIVE_ORACLE: &str = "cf_native_oracle";
 pub const CF_NATIVE_TRADES: &str = "cf_native_trades";
 
+// Slashing & Jailing (Phase 3: 3.1)
+pub const CF_SLASH_RECORDS: &str = "cf_slash_records";
+pub const CF_JAIL_VOTES: &str = "cf_jail_votes";
+
 // Other
 pub const CF_CORE_WRITER_QUEUE: &str = "cf_core_writer_queue";
 pub const CF_CONSENSUS_META: &str = "cf_consensus_meta";
@@ -77,6 +81,8 @@ pub const ALL_CF_NAMES: &[&str] = &[
     CF_DEV_POOL,
     CF_NATIVE_ORACLE,
     CF_NATIVE_TRADES,
+    CF_SLASH_RECORDS,
+    CF_JAIL_VOTES,
     CF_CORE_WRITER_QUEUE,
     CF_CONSENSUS_META,
     CF_TRIE_NODES,

@@ -8,11 +8,13 @@ publish = false
 torus-core = { workspace = true }
 torus-economics = { workspace = true }
 torus-bridge = { workspace = true }
+torus-consensus = { workspace = true }
 torus-rpc = { workspace = true }
 torus-evm = { workspace = true }
 torus-state = { workspace = true }
 torus-mempool = { workspace = true }
 torus-types = { workspace = true }
+ed25519-dalek = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tempfile = { workspace = true }
 jsonrpsee = { workspace = true }

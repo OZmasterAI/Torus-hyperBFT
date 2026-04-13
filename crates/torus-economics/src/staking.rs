@@ -6,9 +6,12 @@
 use alloy_primitives::{Address, U256};
 use borsh::BorshDeserialize;
 use torus_state::cf::{
-    CF_STAKING_DELEGATIONS, CF_STAKING_PERMANENT, CF_STAKING_REWARDS, CF_STAKING_VALIDATORS,
+    CF_JAIL_VOTES, CF_SLASH_RECORDS, CF_STAKING_DELEGATIONS, CF_STAKING_PERMANENT,
+    CF_STAKING_REWARDS, CF_STAKING_VALIDATORS,
 };
 use torus_state::StateDb;
+
+use crate::rewards::FeeSplitter;
 
 use crate::error::EconomicsError;
 use crate::types::*;
@@ -88,10 +91,14 @@ impl StakingManager {
             return Ok(());
         }
 
-        // Validator must exist and not be tombstoned.
+        // Validator must exist and not be jailed or tombstoned.
         let mut val = self
             .get_validator(&validator)?
             .ok_or(EconomicsError::ValidatorNotFound(validator))?;
+        // BUG FIX (3.1): Block delegations to Jailed validators, not just Tombstoned
+        if val.status == ValidatorStatus::Jailed {
+            return Err(EconomicsError::ValidatorJailed(validator));
+        }
         if val.status == ValidatorStatus::Tombstoned {
             return Err(EconomicsError::ValidatorTombstoned(validator));
         }
@@ -277,6 +284,325 @@ impl StakingManager {
 
         val.commission_bps = new_rate;
         self.put_validator(&validator, &val)?;
+        Ok(())
+    }
+
+    // ========================================================================
+    // Slashing (Phase 3: 3.1.1)
+    // ========================================================================
+
+    /// Slash a validator by `fraction_bps` basis points. Reduces self_stake and
+    /// every delegation proportionally. Burns slashed tokens. Auto-jails if
+    /// self_stake drops below MIN_SELF_DELEGATION.
+    pub fn slash(
+        &self,
+        validator_addr: Address,
+        fraction_bps: u16,
+        reason: SlashReason,
+        current_block: u64,
+    ) -> Result<U256> {
+        let mut val = self
+            .get_validator(&validator_addr)?
+            .ok_or(EconomicsError::ValidatorNotFound(validator_addr))?;
+
+        let bps_10000 = U256::from(10_000u32);
+        let fraction = U256::from(fraction_bps);
+
+        // Slash self_stake
+        let self_slash = val.self_stake * fraction / bps_10000;
+        val.self_stake -= self_slash;
+        let mut total_slashed = self_slash;
+
+        // Slash all delegations proportionally
+        let delegations = self.delegations_for_validator(&validator_addr)?;
+        let mut total_del_slashed = U256::ZERO;
+
+        for del in &delegations {
+            let del_slash = del.amount * fraction / bps_10000;
+            if !del_slash.is_zero() {
+                let mut updated_del = del.clone();
+                updated_del.amount -= del_slash;
+                let del_key = delegation_key(&del.delegator, &validator_addr);
+                self.put_delegation_raw(&del_key, &updated_del)?;
+                total_del_slashed += del_slash;
+                total_slashed += del_slash;
+            }
+        }
+
+        // Update total_delegated
+        val.total_delegated = val.total_delegated.saturating_sub(total_del_slashed);
+
+        // Auto-jail if self_stake drops below minimum
+        if val.self_stake < MIN_SELF_DELEGATION
+            && val.status != ValidatorStatus::Tombstoned
+            && val.status != ValidatorStatus::Jailed
+        {
+            val.status = ValidatorStatus::Jailed;
+            val.jailed_until = Some(current_block + JAIL_DURATION_BLOCKS);
+            tracing::info!(%validator_addr, "auto-jailed: self_stake below minimum after slash");
+        }
+
+        self.put_validator(&validator_addr, &val)?;
+
+        // Burn slashed amount
+        if !total_slashed.is_zero() {
+            FeeSplitter::execute_burn(self, total_slashed)?;
+        }
+
+        // Record slash for audit
+        self.put_slash_record(
+            &validator_addr,
+            current_block,
+            &SlashRecord {
+                validator: validator_addr,
+                slash_fraction_bps: fraction_bps,
+                slashed_amount: total_slashed,
+                reason,
+                block_height: current_block,
+            },
+        )?;
+
+        tracing::info!(
+            %validator_addr, %total_slashed, fraction_bps,
+            "validator slashed"
+        );
+        Ok(total_slashed)
+    }
+
+    // ========================================================================
+    // Jailing (Phase 3: 3.1.2)
+    // ========================================================================
+
+    /// Jail a validator with a cooldown duration.
+    pub fn jail_validator(
+        &self,
+        validator_addr: &Address,
+        duration_blocks: u64,
+        current_block: u64,
+    ) -> Result<()> {
+        let mut val = self
+            .get_validator(validator_addr)?
+            .ok_or(EconomicsError::ValidatorNotFound(*validator_addr))?;
+
+        if val.status == ValidatorStatus::Tombstoned {
+            return Err(EconomicsError::ValidatorTombstoned(*validator_addr));
+        }
+
+        val.status = ValidatorStatus::Jailed;
+        val.jailed_until = Some(current_block + duration_blocks);
+        self.put_validator(validator_addr, &val)?;
+
+        tracing::info!(%validator_addr, until = current_block + duration_blocks, "validator jailed");
+        Ok(())
+    }
+
+    /// Tombstone a validator permanently (for double-sign). Cannot be undone.
+    pub fn tombstone_validator(&self, validator_addr: &Address) -> Result<()> {
+        let mut val = self
+            .get_validator(validator_addr)?
+            .ok_or(EconomicsError::ValidatorNotFound(*validator_addr))?;
+
+        val.status = ValidatorStatus::Tombstoned;
+        val.jailed_until = None;
+        self.put_validator(validator_addr, &val)?;
+
+        tracing::info!(%validator_addr, "validator tombstoned");
+        Ok(())
+    }
+
+    /// Record a jail vote from `voter` against `target`. Returns true if
+    /// the >2/3 threshold was reached and the target was jailed.
+    pub fn record_jail_vote(
+        &self,
+        voter: Address,
+        target: Address,
+        current_block: u64,
+    ) -> Result<bool> {
+        // Voter must be an active validator
+        let voter_val = self
+            .get_validator(&voter)?
+            .ok_or(EconomicsError::ValidatorNotFound(voter))?;
+        if voter_val.status != ValidatorStatus::Active {
+            return Err(EconomicsError::ValidatorNotFound(voter));
+        }
+
+        // Target must exist and not be tombstoned
+        let target_val = self
+            .get_validator(&target)?
+            .ok_or(EconomicsError::ValidatorNotFound(target))?;
+        if target_val.status == ValidatorStatus::Tombstoned {
+            return Err(EconomicsError::ValidatorTombstoned(target));
+        }
+
+        // Store vote
+        let vkey = jail_vote_key(&target, &voter);
+        let vote = JailVoteRecord {
+            voter,
+            target,
+            stake_weight: voter_val.total_stake(),
+            block_height: current_block,
+        };
+        let data = borsh::to_vec(&vote).map_err(|e| EconomicsError::Borsh(e.to_string()))?;
+        self.state_db.put_cf_raw(CF_JAIL_VOTES, &vkey, &data)?;
+
+        // Tally all non-expired votes for this target
+        let total_vote_weight = self.tally_jail_votes(&target, current_block)?;
+
+        // Compute total active validator stake for 2/3 threshold
+        let total_active_stake = self.total_active_stake()?;
+
+        // Check >2/3 threshold: vote_weight * 3 > active_stake * 2
+        if total_vote_weight * U256::from(3u64) > total_active_stake * U256::from(2u64) {
+            self.slash(target, DOWNTIME_SLASH_BPS, SlashReason::JailVote, current_block)?;
+            self.jail_validator(&target, JAIL_DURATION_BLOCKS, current_block)?;
+            tracing::info!(%target, "jail vote threshold reached, validator jailed");
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+
+    /// Tally non-expired jail votes for a target. Cleans up expired votes.
+    fn tally_jail_votes(&self, target: &Address, current_block: u64) -> Result<U256> {
+        let db = self.state_db.inner();
+        let cf = db.cf_handle(CF_JAIL_VOTES).ok_or_else(|| {
+            EconomicsError::State(torus_state::StateError::MissingColumnFamily(
+                CF_JAIL_VOTES.to_string(),
+            ))
+        })?;
+
+        let prefix = target.as_slice();
+        let iter = db.prefix_iterator_cf(cf, prefix);
+        let mut total_weight = U256::ZERO;
+        let mut expired_keys = Vec::new();
+
+        for item in iter {
+            let (key, value) =
+                item.map_err(|e| EconomicsError::State(torus_state::StateError::RocksDb(e)))?;
+            if !key.starts_with(prefix) {
+                break;
+            }
+            let vote = JailVoteRecord::try_from_slice(&value)
+                .map_err(|e| EconomicsError::Borsh(e.to_string()))?;
+
+            if current_block > vote.block_height + JAIL_VOTE_EXPIRY_BLOCKS {
+                expired_keys.push(key.to_vec());
+                continue;
+            }
+
+            total_weight += vote.stake_weight;
+        }
+
+        // Clean up expired votes
+        for key in &expired_keys {
+            self.state_db.delete_cf_raw(CF_JAIL_VOTES, key)?;
+        }
+
+        Ok(total_weight)
+    }
+
+    /// Compute total stake of all Active validators.
+    fn total_active_stake(&self) -> Result<U256> {
+        let all = self.all_validators()?;
+        Ok(all
+            .iter()
+            .filter(|v| v.status == ValidatorStatus::Active)
+            .map(|v| v.total_stake())
+            .fold(U256::ZERO, |acc, s| acc + s))
+    }
+
+    /// Clear all jail votes targeting a validator (called on unjail).
+    pub fn clear_jail_votes(&self, target: &Address) -> Result<()> {
+        let db = self.state_db.inner();
+        let cf = db.cf_handle(CF_JAIL_VOTES).ok_or_else(|| {
+            EconomicsError::State(torus_state::StateError::MissingColumnFamily(
+                CF_JAIL_VOTES.to_string(),
+            ))
+        })?;
+
+        let prefix = target.as_slice();
+        let iter = db.prefix_iterator_cf(cf, prefix);
+        let mut keys = Vec::new();
+
+        for item in iter {
+            let (key, _) =
+                item.map_err(|e| EconomicsError::State(torus_state::StateError::RocksDb(e)))?;
+            if !key.starts_with(prefix) {
+                break;
+            }
+            keys.push(key.to_vec());
+        }
+
+        for key in &keys {
+            self.state_db.delete_cf_raw(CF_JAIL_VOTES, key)?;
+        }
+
+        Ok(())
+    }
+
+    // ========================================================================
+    // Unjail (Phase 3: 3.1.3)
+    // ========================================================================
+
+    /// Unjail a validator. Requirements:
+    /// - Status must be Jailed (NOT Tombstoned)
+    /// - Cooldown expired (current_block >= jailed_until)
+    /// - self_stake >= MIN_SELF_DELEGATION
+    /// Sets status to Candidate (must wait for next epoch to become Active).
+    pub fn unjail(&self, validator_addr: &Address, current_block: u64) -> Result<()> {
+        let mut val = self
+            .get_validator(validator_addr)?
+            .ok_or(EconomicsError::ValidatorNotFound(*validator_addr))?;
+
+        if val.status == ValidatorStatus::Tombstoned {
+            return Err(EconomicsError::ValidatorTombstoned(*validator_addr));
+        }
+        if val.status != ValidatorStatus::Jailed {
+            return Err(EconomicsError::ValidatorNotJailed(*validator_addr));
+        }
+
+        // Check cooldown
+        if let Some(jailed_until) = val.jailed_until {
+            if current_block < jailed_until {
+                return Err(EconomicsError::UnjailCooldownNotExpired(*validator_addr));
+            }
+        }
+
+        // Check self_stake
+        if val.self_stake < MIN_SELF_DELEGATION {
+            return Err(EconomicsError::UnjailInsufficientStake {
+                address: *validator_addr,
+                have: val.self_stake,
+                minimum: MIN_SELF_DELEGATION,
+            });
+        }
+
+        // Set to Candidate — must wait for next epoch to re-enter active set
+        val.status = ValidatorStatus::Candidate;
+        val.jailed_until = None;
+        self.put_validator(validator_addr, &val)?;
+
+        // Clear pending jail votes
+        self.clear_jail_votes(validator_addr)?;
+
+        tracing::info!(%validator_addr, "validator unjailed → Candidate");
+        Ok(())
+    }
+
+    // ========================================================================
+    // Slash record persistence
+    // ========================================================================
+
+    fn put_slash_record(
+        &self,
+        validator: &Address,
+        block_height: u64,
+        record: &SlashRecord,
+    ) -> Result<()> {
+        let key = slash_record_key(validator, block_height);
+        let data = borsh::to_vec(record).map_err(|e| EconomicsError::Borsh(e.to_string()))?;
+        self.state_db
+            .put_cf_raw(CF_SLASH_RECORDS, &key, &data)?;
         Ok(())
     }
 
@@ -504,6 +830,22 @@ pub fn delegation_key(delegator: &Address, validator: &Address) -> [u8; 40] {
     key
 }
 
+/// Build the 28-byte slash record key: validator(20) ++ block_height(8 BE).
+pub fn slash_record_key(validator: &Address, block_height: u64) -> [u8; 28] {
+    let mut key = [0u8; 28];
+    key[..20].copy_from_slice(validator.as_slice());
+    key[20..28].copy_from_slice(&block_height.to_be_bytes());
+    key
+}
+
+/// Build the 40-byte jail vote key: target(20) ++ voter(20).
+pub fn jail_vote_key(target: &Address, voter: &Address) -> [u8; 40] {
+    let mut key = [0u8; 40];
+    key[..20].copy_from_slice(target.as_slice());
+    key[20..].copy_from_slice(voter.as_slice());
+    key
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -679,6 +1021,334 @@ mod tests {
             mgr.claim_rewards(user),
             Err(EconomicsError::NoRewards(_))
         ));
+    }
+
+    fn wei(tokens: u64) -> U256 {
+        U256::from(tokens) * U256::from(10u64).pow(U256::from(18u64))
+    }
+
+    // ====================================================================
+    // Slashing tests (3.1.1)
+    // ====================================================================
+
+    #[test]
+    fn slash_reduces_stake_proportionally() {
+        let (_dir, mgr) = setup();
+        let validator = addr(1);
+        let delegator = addr(2);
+
+        fund_account(&mgr, &validator, wei(100_000));
+        fund_account(&mgr, &delegator, wei(100_000));
+
+        mgr.register_validator(validator, [1u8; 32], 500, wei(50_000))
+            .unwrap();
+        mgr.delegate(delegator, validator, wei(50_000)).unwrap();
+
+        // Slash 5% (500 bps)
+        let slashed = mgr
+            .slash(validator, 500, SlashReason::DoubleSign, 100)
+            .unwrap();
+
+        let val = mgr.get_validator(&validator).unwrap().unwrap();
+        // self_stake: 50_000 * 0.95 = 47_500
+        assert_eq!(val.self_stake, wei(47_500));
+        // total_delegated: 50_000 * 0.95 = 47_500
+        assert_eq!(val.total_delegated, wei(47_500));
+        // Total slashed: 100_000 * 0.05 = 5_000
+        assert_eq!(slashed, wei(5_000));
+    }
+
+    #[test]
+    fn slash_burns_tokens() {
+        let (_dir, mgr) = setup();
+        let validator = addr(1);
+
+        fund_account(&mgr, &validator, wei(100_000));
+        mgr.register_validator(validator, [1u8; 32], 500, wei(50_000))
+            .unwrap();
+
+        let slashed = mgr
+            .slash(validator, 500, SlashReason::Downtime, 100)
+            .unwrap();
+
+        // Verify burn was recorded
+        let tracker = crate::rewards::FeeSplitter::get_supply_tracker(&mgr).unwrap();
+        assert_eq!(tracker.cumulative_burned, slashed);
+    }
+
+    #[test]
+    fn slash_below_min_triggers_auto_jail() {
+        let (_dir, mgr) = setup();
+        let validator = addr(1);
+
+        // Register with exactly the minimum stake
+        fund_account(&mgr, &validator, MIN_SELF_DELEGATION);
+        mgr.register_validator(validator, [1u8; 32], 500, MIN_SELF_DELEGATION)
+            .unwrap();
+
+        // Slash 5% — brings self_stake below minimum
+        mgr.slash(validator, 500, SlashReason::Downtime, 100)
+            .unwrap();
+
+        let val = mgr.get_validator(&validator).unwrap().unwrap();
+        assert_eq!(val.status, ValidatorStatus::Jailed);
+        assert!(val.jailed_until.is_some());
+    }
+
+    // ====================================================================
+    // Jailing tests (3.1.2)
+    // ====================================================================
+
+    #[test]
+    fn jail_sets_status_and_jailed_until() {
+        let (_dir, mgr) = setup();
+        let validator = addr(1);
+
+        fund_account(&mgr, &validator, wei(100_000));
+        mgr.register_validator(validator, [1u8; 32], 500, wei(50_000))
+            .unwrap();
+
+        mgr.jail_validator(&validator, JAIL_DURATION_BLOCKS, 1000)
+            .unwrap();
+
+        let val = mgr.get_validator(&validator).unwrap().unwrap();
+        assert_eq!(val.status, ValidatorStatus::Jailed);
+        assert_eq!(val.jailed_until, Some(1000 + JAIL_DURATION_BLOCKS));
+    }
+
+    #[test]
+    fn tombstone_is_permanent() {
+        let (_dir, mgr) = setup();
+        let validator = addr(1);
+
+        fund_account(&mgr, &validator, wei(100_000));
+        mgr.register_validator(validator, [1u8; 32], 500, wei(50_000))
+            .unwrap();
+
+        mgr.tombstone_validator(&validator).unwrap();
+
+        let val = mgr.get_validator(&validator).unwrap().unwrap();
+        assert_eq!(val.status, ValidatorStatus::Tombstoned);
+        assert_eq!(val.jailed_until, None);
+
+        // Cannot unjail a tombstoned validator
+        let err = mgr.unjail(&validator, 999_999).unwrap_err();
+        assert!(matches!(err, EconomicsError::ValidatorTombstoned(_)));
+    }
+
+    #[test]
+    fn delegate_to_jailed_rejected() {
+        let (_dir, mgr) = setup();
+        let validator = addr(1);
+        let delegator = addr(2);
+
+        fund_account(&mgr, &validator, wei(100_000));
+        fund_account(&mgr, &delegator, wei(100_000));
+
+        mgr.register_validator(validator, [1u8; 32], 500, wei(50_000))
+            .unwrap();
+        mgr.jail_validator(&validator, JAIL_DURATION_BLOCKS, 100)
+            .unwrap();
+
+        let err = mgr.delegate(delegator, validator, wei(1_000)).unwrap_err();
+        assert!(matches!(err, EconomicsError::ValidatorJailed(_)));
+    }
+
+    #[test]
+    fn undelegate_from_jailed_allowed() {
+        let (_dir, mgr) = setup();
+        let validator = addr(1);
+        let delegator = addr(2);
+
+        fund_account(&mgr, &validator, wei(100_000));
+        fund_account(&mgr, &delegator, wei(100_000));
+
+        mgr.register_validator(validator, [1u8; 32], 500, wei(50_000))
+            .unwrap();
+        mgr.delegate(delegator, validator, wei(10_000)).unwrap();
+
+        // Jail the validator
+        mgr.jail_validator(&validator, JAIL_DURATION_BLOCKS, 100)
+            .unwrap();
+
+        // Delegators can still undelegate from jailed validators
+        mgr.undelegate(delegator, validator, wei(10_000), 200)
+            .unwrap();
+
+        let val = mgr.get_validator(&validator).unwrap().unwrap();
+        assert_eq!(val.total_delegated, U256::ZERO);
+    }
+
+    // ====================================================================
+    // Unjail tests (3.1.3)
+    // ====================================================================
+
+    #[test]
+    fn unjail_after_cooldown_succeeds() {
+        let (_dir, mgr) = setup();
+        let validator = addr(1);
+
+        fund_account(&mgr, &validator, wei(100_000));
+        mgr.register_validator(validator, [1u8; 32], 500, wei(50_000))
+            .unwrap();
+
+        mgr.jail_validator(&validator, JAIL_DURATION_BLOCKS, 1000)
+            .unwrap();
+
+        // Unjail after cooldown
+        let unjail_block = 1000 + JAIL_DURATION_BLOCKS;
+        mgr.unjail(&validator, unjail_block).unwrap();
+
+        let val = mgr.get_validator(&validator).unwrap().unwrap();
+        assert_eq!(val.status, ValidatorStatus::Candidate);
+        assert_eq!(val.jailed_until, None);
+    }
+
+    #[test]
+    fn unjail_before_cooldown_rejected() {
+        let (_dir, mgr) = setup();
+        let validator = addr(1);
+
+        fund_account(&mgr, &validator, wei(100_000));
+        mgr.register_validator(validator, [1u8; 32], 500, wei(50_000))
+            .unwrap();
+
+        mgr.jail_validator(&validator, JAIL_DURATION_BLOCKS, 1000)
+            .unwrap();
+
+        // Try to unjail before cooldown
+        let err = mgr.unjail(&validator, 1000 + JAIL_DURATION_BLOCKS - 1).unwrap_err();
+        assert!(matches!(err, EconomicsError::UnjailCooldownNotExpired(_)));
+    }
+
+    #[test]
+    fn unjail_insufficient_stake_rejected() {
+        let (_dir, mgr) = setup();
+        let validator = addr(1);
+
+        // Register with minimum stake
+        fund_account(&mgr, &validator, MIN_SELF_DELEGATION);
+        mgr.register_validator(validator, [1u8; 32], 500, MIN_SELF_DELEGATION)
+            .unwrap();
+
+        // Slash to bring below minimum, then jail
+        mgr.slash(validator, 500, SlashReason::Downtime, 100).unwrap();
+
+        let val = mgr.get_validator(&validator).unwrap().unwrap();
+        assert_eq!(val.status, ValidatorStatus::Jailed);
+
+        // Try to unjail — insufficient stake
+        let err = mgr
+            .unjail(&validator, 100 + JAIL_DURATION_BLOCKS + 1)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            EconomicsError::UnjailInsufficientStake { .. }
+        ));
+    }
+
+    #[test]
+    fn unjail_tombstoned_rejected() {
+        let (_dir, mgr) = setup();
+        let validator = addr(1);
+
+        fund_account(&mgr, &validator, wei(100_000));
+        mgr.register_validator(validator, [1u8; 32], 500, wei(50_000))
+            .unwrap();
+        mgr.tombstone_validator(&validator).unwrap();
+
+        let err = mgr.unjail(&validator, 999_999).unwrap_err();
+        assert!(matches!(err, EconomicsError::ValidatorTombstoned(_)));
+    }
+
+    #[test]
+    fn full_jail_unjail_lifecycle() {
+        let (_dir, mgr) = setup();
+        let validator = addr(1);
+
+        fund_account(&mgr, &validator, wei(100_000));
+        mgr.register_validator(validator, [1u8; 32], 500, wei(50_000))
+            .unwrap();
+
+        // Jail at block 1000
+        mgr.jail_validator(&validator, JAIL_DURATION_BLOCKS, 1000)
+            .unwrap();
+        let val = mgr.get_validator(&validator).unwrap().unwrap();
+        assert_eq!(val.status, ValidatorStatus::Jailed);
+
+        // Wait for cooldown, then unjail
+        let unjail_block = 1000 + JAIL_DURATION_BLOCKS;
+        mgr.unjail(&validator, unjail_block).unwrap();
+        let val = mgr.get_validator(&validator).unwrap().unwrap();
+        assert_eq!(val.status, ValidatorStatus::Candidate);
+        assert_eq!(val.jailed_until, None);
+    }
+
+    #[test]
+    fn jail_vote_accumulation_and_threshold() {
+        let (_dir, mgr) = setup();
+        // Create 4 validators with equal stake
+        let v1 = addr(1);
+        let v2 = addr(2);
+        let v3 = addr(3);
+        let target = addr(4);
+
+        for v in [v1, v2, v3, target] {
+            fund_account(&mgr, &v, wei(100_000));
+            mgr.register_validator(v, [v.0[0]; 32], 500, wei(25_000))
+                .unwrap();
+        }
+        // Set all to Active status
+        for v in [v1, v2, v3, target] {
+            let mut val = mgr.get_validator(&v).unwrap().unwrap();
+            val.status = ValidatorStatus::Active;
+            mgr.put_validator(&v, &val).unwrap();
+        }
+
+        // v1 votes to jail target — not enough (25% < 66.7%)
+        let jailed = mgr.record_jail_vote(v1, target, 100).unwrap();
+        assert!(!jailed);
+
+        // v2 votes too — still not enough (50% < 66.7%)
+        let jailed = mgr.record_jail_vote(v2, target, 101).unwrap();
+        assert!(!jailed);
+
+        // v3 votes — threshold reached (75% > 66.7%)
+        let jailed = mgr.record_jail_vote(v3, target, 102).unwrap();
+        assert!(jailed);
+
+        let val = mgr.get_validator(&target).unwrap().unwrap();
+        assert_eq!(val.status, ValidatorStatus::Jailed);
+    }
+
+    #[test]
+    fn expired_jail_votes_ignored() {
+        let (_dir, mgr) = setup();
+        let v1 = addr(1);
+        let v2 = addr(2);
+        let v3 = addr(3);
+        let target = addr(4);
+
+        for v in [v1, v2, v3, target] {
+            fund_account(&mgr, &v, wei(100_000));
+            mgr.register_validator(v, [v.0[0]; 32], 500, wei(25_000))
+                .unwrap();
+        }
+        for v in [v1, v2, v3, target] {
+            let mut val = mgr.get_validator(&v).unwrap().unwrap();
+            val.status = ValidatorStatus::Active;
+            mgr.put_validator(&v, &val).unwrap();
+        }
+
+        // v1 votes early
+        mgr.record_jail_vote(v1, target, 100).unwrap();
+        // v2 votes early
+        mgr.record_jail_vote(v2, target, 101).unwrap();
+
+        // Much later (past expiry), v3 votes — old votes expired, not enough
+        let late_block = 100 + JAIL_VOTE_EXPIRY_BLOCKS + 1;
+        let jailed = mgr.record_jail_vote(v3, target, late_block).unwrap();
+        assert!(!jailed);
     }
 
     #[test]

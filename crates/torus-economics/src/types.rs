@@ -327,6 +327,31 @@ pub const FEE_END_TREASURY_BPS: u16 = 2500;
 pub const FEE_END_DEV_POOL_BPS: u16 = 2500;
 
 // ============================================================================
+// Slashing & Jailing Constants (Phase 3: 3.1)
+// ============================================================================
+
+/// Double-sign slash fraction: 500 bps (5%).
+pub const DOUBLE_SIGN_SLASH_BPS: u16 = 500;
+
+/// Downtime slash fraction: 10 bps (0.1%).
+pub const DOWNTIME_SLASH_BPS: u16 = 10;
+
+/// Double-sign evidence window: 100 views.
+pub const EVIDENCE_WINDOW_VIEWS: u64 = 100;
+
+/// Downtime detection window: 1000 blocks.
+pub const DOWNTIME_WINDOW_BLOCKS: u64 = 1000;
+
+/// Downtime signing threshold: 50%.
+pub const DOWNTIME_THRESHOLD_PCT: u64 = 50;
+
+/// Jail duration for downtime: 28,800 blocks (~2 days at 6s blocks).
+pub const JAIL_DURATION_BLOCKS: u64 = 28_800;
+
+/// Jail vote expiry: 14,400 blocks (~1 day).
+pub const JAIL_VOTE_EXPIRY_BLOCKS: u64 = 14_400;
+
+// ============================================================================
 // Fee Split Result (2.7)
 // ============================================================================
 
@@ -408,6 +433,119 @@ impl BorshDeserialize for SupplyTracker {
         Ok(Self {
             cumulative_burned,
             cumulative_treasury,
+        })
+    }
+}
+
+// ============================================================================
+// Slashing Types (Phase 3: 3.1)
+// ============================================================================
+
+/// Reason for a validator slash event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlashReason {
+    DoubleSign,
+    Downtime,
+    JailVote,
+}
+
+impl BorshSerialize for SlashReason {
+    fn serialize<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+        let disc: u8 = match self {
+            Self::DoubleSign => 0,
+            Self::Downtime => 1,
+            Self::JailVote => 2,
+        };
+        writer.write_all(&[disc])
+    }
+}
+
+impl BorshDeserialize for SlashReason {
+    fn deserialize_reader<R: Read>(reader: &mut R) -> io::Result<Self> {
+        let mut buf = [0u8; 1];
+        reader.read_exact(&mut buf)?;
+        match buf[0] {
+            0 => Ok(Self::DoubleSign),
+            1 => Ok(Self::Downtime),
+            2 => Ok(Self::JailVote),
+            x => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid SlashReason discriminant: {x}"),
+            )),
+        }
+    }
+}
+
+/// Audit record of a slash event. Stored in CF_SLASH_RECORDS.
+/// Key: validator(20) ++ block_height(8 BE) = 28 bytes.
+#[derive(Clone, Debug)]
+pub struct SlashRecord {
+    pub validator: Address,
+    pub slash_fraction_bps: u16,
+    pub slashed_amount: U256,
+    pub reason: SlashReason,
+    pub block_height: u64,
+}
+
+impl BorshSerialize for SlashRecord {
+    fn serialize<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+        borsh_write_address(&self.validator, writer)?;
+        BorshSerialize::serialize(&self.slash_fraction_bps, writer)?;
+        borsh_write_u256(&self.slashed_amount, writer)?;
+        BorshSerialize::serialize(&self.reason, writer)?;
+        BorshSerialize::serialize(&self.block_height, writer)?;
+        Ok(())
+    }
+}
+
+impl BorshDeserialize for SlashRecord {
+    fn deserialize_reader<R: Read>(reader: &mut R) -> io::Result<Self> {
+        let validator = borsh_read_address(reader)?;
+        let slash_fraction_bps = u16::deserialize_reader(reader)?;
+        let slashed_amount = borsh_read_u256(reader)?;
+        let reason = SlashReason::deserialize_reader(reader)?;
+        let block_height = u64::deserialize_reader(reader)?;
+        Ok(Self {
+            validator,
+            slash_fraction_bps,
+            slashed_amount,
+            reason,
+            block_height,
+        })
+    }
+}
+
+/// A jail vote record. Stored in CF_JAIL_VOTES.
+/// Key: target(20) ++ voter(20) = 40 bytes.
+#[derive(Clone, Debug)]
+pub struct JailVoteRecord {
+    pub voter: Address,
+    pub target: Address,
+    pub stake_weight: U256,
+    pub block_height: u64,
+}
+
+impl BorshSerialize for JailVoteRecord {
+    fn serialize<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+        borsh_write_address(&self.voter, writer)?;
+        borsh_write_address(&self.target, writer)?;
+        borsh_write_u256(&self.stake_weight, writer)?;
+        BorshSerialize::serialize(&self.block_height, writer)?;
+        Ok(())
+    }
+}
+
+impl BorshDeserialize for JailVoteRecord {
+    fn deserialize_reader<R: Read>(reader: &mut R) -> io::Result<Self> {
+        let voter = borsh_read_address(reader)?;
+        let target = borsh_read_address(reader)?;
+        let stake_weight = borsh_read_u256(reader)?;
+        let block_height = u64::deserialize_reader(reader)?;
+        Ok(Self {
+            voter,
+            target,
+            stake_weight,
+            block_height,
         })
     }
 }
