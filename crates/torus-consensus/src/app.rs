@@ -6,15 +6,18 @@
 
 use sha2::{Digest, Sha256};
 
+use ed25519_dalek::VerifyingKey;
 use hotstuff_rs::app::{
     App, ProduceBlockRequest, ProduceBlockResponse, ValidateBlockRequest, ValidateBlockResponse,
 };
-use hotstuff_rs::types::data_types::{CryptoHash, Data, Datum};
+use hotstuff_rs::types::data_types::{CryptoHash, Data, Datum, Power};
+use hotstuff_rs::types::update_sets::ValidatorSetUpdates;
 
 use torus_bridge::{BlockProposer, BlockValidator};
+use torus_economics::{EpochManager, StakingManager};
 use torus_evm::{EvmExecutor, TORUS_CHAIN_ID};
 use torus_state::StateDb;
-use torus_types::{Address, TorusBlock, TorusBlockHeader};
+use torus_types::{Address, ChainConfig, TorusBlock, TorusBlockHeader, ValidatorSet};
 
 use crate::kv_store::RocksKVStore;
 
@@ -29,11 +32,16 @@ pub struct TorusApp {
     evm_executor: EvmExecutor,
     proposer_address: Address,
     last_header: TorusBlockHeader,
+    staking: StakingManager,
+    epoch_length: u64,
+    max_validators: u32,
+    last_validator_set: ValidatorSet,
 }
 
 impl TorusApp {
-    /// Create a new `TorusApp` with the given state database.
-    pub fn new(state_db: StateDb) -> Self {
+    /// Create a new `TorusApp` with the given state database and chain config.
+    pub fn new(state_db: StateDb, config: &ChainConfig) -> Self {
+        let staking = StakingManager::new(state_db.clone());
         Self {
             state_db,
             proposer: BlockProposer::new(TORUS_CHAIN_ID),
@@ -41,16 +49,95 @@ impl TorusApp {
             evm_executor: EvmExecutor::new(TORUS_CHAIN_ID),
             proposer_address: Address::ZERO,
             last_header: torus_bridge::genesis_parent_header(),
+            staking,
+            epoch_length: config.epoch_length,
+            max_validators: config.max_validators,
+            last_validator_set: ValidatorSet {
+                validators: vec![],
+                epoch: 0,
+            },
         }
     }
 
     /// Create a stub `TorusApp` without a database (for consensus-only tests).
     pub fn stub() -> Self {
-        // Open an in-memory temp path — tests using `stub()` don't exercise EVM.
-        let dir = std::env::temp_dir().join(format!("torus-stub-{}", std::process::id()));
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("torus-stub-{}-{}", std::process::id(), id));
         let _ = std::fs::create_dir_all(&dir);
         let state_db = StateDb::open(&dir).expect("open stub state db");
-        Self::new(state_db)
+        let config = ChainConfig {
+            chain_id: TORUS_CHAIN_ID,
+            chain_name: "torus-test".to_string(),
+            evm_gas_limit: 30_000_000,
+            base_fee_per_gas: 1_000_000_000,
+            epoch_length: 100,
+            max_validators: 4,
+            min_stake: torus_economics::MIN_SELF_DELEGATION,
+            fee_burn_bps: 1000,
+            fee_validator_bps: 0,
+            fee_treasury_bps: 4500,
+            fee_dev_pool_bps: 4500,
+        };
+        Self::new(state_db, &config)
+    }
+
+    /// Compute validator set updates at epoch boundary.
+    fn epoch_validator_set_updates(&mut self, height: u64) -> Option<ValidatorSetUpdates> {
+        if !EpochManager::is_epoch_boundary(height, self.epoch_length) {
+            return None;
+        }
+
+        let epoch = EpochManager::epoch_for_block(height, self.epoch_length);
+        let new_set = match EpochManager::compute_new_validator_set(
+            &self.staking,
+            self.max_validators,
+            epoch,
+        ) {
+            Ok(set) => set,
+            Err(e) => {
+                tracing::error!(%e, "failed to compute validator set at epoch boundary");
+                return None;
+            }
+        };
+
+        let diff = EpochManager::compute_validator_set_diff(&self.last_validator_set, &new_set);
+        if diff.is_empty() {
+            self.last_validator_set = new_set;
+            return None;
+        }
+
+        // Update validator statuses in state.
+        if let Err(e) = EpochManager::update_validator_statuses(&self.staking, &new_set) {
+            tracing::error!(%e, "failed to update validator statuses");
+        }
+
+        let mut updates = ValidatorSetUpdates::new();
+
+        for v in &diff.inserts {
+            if let Ok(vk) = VerifyingKey::from_bytes(&v.pubkey.0) {
+                updates.insert(vk, Power::new(v.power));
+            }
+        }
+
+        for addr in &diff.deletes {
+            // Look up the pubkey for the deleted validator.
+            if let Ok(Some(val)) = self.staking.get_validator(addr) {
+                if let Ok(vk) = VerifyingKey::from_bytes(&val.pubkey) {
+                    updates.delete(vk);
+                }
+            }
+        }
+
+        tracing::info!(
+            epoch,
+            inserts = diff.inserts.len(),
+            deletes = diff.deletes.len(),
+            "epoch boundary: validator set updated"
+        );
+        self.last_validator_set = new_set;
+        Some(updates)
     }
 
     fn hash_datum(bytes: &[u8]) -> [u8; 32] {
@@ -59,7 +146,10 @@ impl TorusApp {
         hasher.finalize().into()
     }
 
-    fn do_validate(&self, request: ValidateBlockRequest<RocksKVStore>) -> ValidateBlockResponse {
+    fn do_validate(
+        &mut self,
+        request: ValidateBlockRequest<RocksKVStore>,
+    ) -> ValidateBlockResponse {
         let block = request.proposed_block();
         let datums = block.data.vec();
 
@@ -87,17 +177,22 @@ impl TorusApp {
                 .validator
                 .validate_block(&torus_block, &self.state_db, &self.evm_executor)
             {
-                Ok(_validated) => ValidateBlockResponse::Valid {
-                    app_state_updates: None,
-                    validator_set_updates: None,
-                },
+                Ok(_validated) => {
+                    let validator_set_updates =
+                        self.epoch_validator_set_updates(torus_block.header.height);
+                    ValidateBlockResponse::Valid {
+                        app_state_updates: None,
+                        validator_set_updates,
+                    }
+                }
                 Err(_) => ValidateBlockResponse::Invalid,
             }
         } else {
-            // Empty block — always valid.
+            // Empty block — check epoch boundary.
+            let validator_set_updates = self.epoch_validator_set_updates(torus_block.header.height);
             ValidateBlockResponse::Valid {
                 app_state_updates: None,
-                validator_set_updates: None,
+                validator_set_updates,
             }
         }
     }
@@ -136,11 +231,14 @@ impl App<RocksKVStore> for TorusApp {
 
         self.last_header = block.header.clone();
 
+        // Check for epoch boundary and compute validator set updates.
+        let validator_set_updates = self.epoch_validator_set_updates(block.header.height);
+
         ProduceBlockResponse {
             data_hash: CryptoHash::new(hash),
             data: Data::new(vec![Datum::new(encoded)]),
             app_state_updates: None,
-            validator_set_updates: None,
+            validator_set_updates,
         }
     }
 
