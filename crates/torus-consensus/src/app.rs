@@ -83,11 +83,10 @@ impl TorusApp {
 
         // If the block has EVM transactions, validate via the bridge.
         if !torus_block.evm_transactions.is_empty() {
-            match self.validator.validate_block(
-                &torus_block,
-                &self.state_db,
-                &self.evm_executor,
-            ) {
+            match self
+                .validator
+                .validate_block(&torus_block, &self.state_db, &self.evm_executor)
+            {
                 Ok(_validated) => ValidateBlockResponse::Valid {
                     app_state_updates: None,
                     validator_set_updates: None,

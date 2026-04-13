@@ -21,9 +21,8 @@ use torus_state::StateDb;
 use torus_types::TorusBlockHeader;
 
 const KECCAK_EMPTY: B256 = B256::new([
-    0xc5, 0xd2, 0x46, 0x01, 0x86, 0xf7, 0x23, 0x3c, 0x92, 0x7e, 0x7d, 0xb2, 0xdc, 0xc7, 0x03,
-    0xc0, 0xe5, 0x00, 0xb6, 0x53, 0xca, 0x82, 0x27, 0x3b, 0x7b, 0xfa, 0xd8, 0x04, 0x5d, 0x85,
-    0xa4, 0x70,
+    0xc5, 0xd2, 0x46, 0x01, 0x86, 0xf7, 0x23, 0x3c, 0x92, 0x7e, 0x7d, 0xb2, 0xdc, 0xc7, 0x03, 0xc0,
+    0xe5, 0x00, 0xb6, 0x53, 0xca, 0x82, 0x27, 0x3b, 0x7b, 0xfa, 0xd8, 0x04, 0x5d, 0x85, 0xa4, 0x70,
 ]);
 
 // ---- Test helpers ----
@@ -123,11 +122,7 @@ impl TestHarness {
         }
     }
 
-    fn propose(
-        &self,
-        evm_txs: Vec<Vec<u8>>,
-        proposer: Address,
-    ) -> ProposedBlock {
+    fn propose(&self, evm_txs: Vec<Vec<u8>>, proposer: Address) -> ProposedBlock {
         self.proposer
             .build_block(
                 &self.db,
@@ -214,25 +209,23 @@ fn full_pipeline_single_transfer() {
     assert!(validated.receipts[0].status, "transfer should succeed");
 
     // Commit
-    let block_hash = BlockCommitter::commit_block(
-        &h.db,
-        block,
-        &validated.bundle,
-        &validated.receipts,
-    )
-    .expect("commit should succeed");
+    let block_hash =
+        BlockCommitter::commit_block(&h.db, block, &validated.bundle, &validated.receipts)
+            .expect("commit should succeed");
     assert_ne!(block_hash, B256::ZERO);
 
     // Verify state was persisted: Bob should have received value.
     let bob_acct = h.db.get_account(&bob).unwrap();
-    assert!(bob_acct.is_some(), "Bob's account should exist after commit");
+    assert!(
+        bob_acct.is_some(),
+        "Bob's account should exist after commit"
+    );
     assert_eq!(bob_acct.unwrap().balance, U256::from(1_000_000u64));
 
     // Verify block stored in CF.
-    let stored = h
-        .db
-        .get_cf_raw(torus_state::cf::CF_BLOCK_HEADERS, &1u64.to_be_bytes())
-        .unwrap();
+    let stored =
+        h.db.get_cf_raw(torus_state::cf::CF_BLOCK_HEADERS, &1u64.to_be_bytes())
+            .unwrap();
     assert!(stored.is_some(), "block header should be stored");
 }
 
@@ -262,7 +255,14 @@ fn state_root_determinism_two_validators() {
 
     // Propose on validator 1
     let proposed = proposer
-        .build_block(&db1, &executor, &parent, vec![rlp.clone()], 1_000_000, Address::ZERO)
+        .build_block(
+            &db1,
+            &executor,
+            &parent,
+            vec![rlp.clone()],
+            1_000_000,
+            Address::ZERO,
+        )
         .expect("propose on v1");
 
     // Validate on validator 1
@@ -303,7 +303,14 @@ fn multi_block_chain() {
     let rlp1 = build_signed_transfer(&sk, bob, U256::from(1_000_000u64), 0, base_fee);
     let proposed1 = h
         .proposer
-        .build_block(&h.db, &h.executor, &parent, vec![rlp1], 1_000_000, Address::ZERO)
+        .build_block(
+            &h.db,
+            &h.executor,
+            &parent,
+            vec![rlp1],
+            1_000_000,
+            Address::ZERO,
+        )
         .unwrap();
     let v1 = h
         .validator
@@ -316,7 +323,14 @@ fn multi_block_chain() {
     let rlp2 = build_signed_transfer(&sk, bob, U256::from(2_000_000u64), 1, base_fee);
     let proposed2 = h
         .proposer
-        .build_block(&h.db, &h.executor, &parent, vec![rlp2], 2_000_000, Address::ZERO)
+        .build_block(
+            &h.db,
+            &h.executor,
+            &parent,
+            vec![rlp2],
+            2_000_000,
+            Address::ZERO,
+        )
         .unwrap();
     let v2 = h
         .validator

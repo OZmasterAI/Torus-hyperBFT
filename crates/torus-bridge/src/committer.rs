@@ -5,8 +5,7 @@ use alloy_primitives::B256;
 use revm::database::BundleState;
 
 use torus_state::cf::{
-    CF_BLOCK_BODIES, CF_BLOCK_HASH_TO_NUMBER, CF_BLOCK_HEADERS, CF_RECEIPTS,
-    CF_TX_HASH_TO_LOCATION,
+    CF_BLOCK_BODIES, CF_BLOCK_HASH_TO_NUMBER, CF_BLOCK_HEADERS, CF_RECEIPTS, CF_TX_HASH_TO_LOCATION,
 };
 use torus_state::db::StateDb;
 use torus_types::{Receipt, TorusBlock};
@@ -40,8 +39,8 @@ impl BlockCommitter {
 
         // 4. Store block body.
         let body = block.body();
-        let body_bytes = serde_json::to_vec(&body)
-            .map_err(|e| BridgeError::Serialization(e.to_string()))?;
+        let body_bytes =
+            serde_json::to_vec(&body).map_err(|e| BridgeError::Serialization(e.to_string()))?;
         state_db.put_cf_raw(CF_BLOCK_BODIES, &height_key, &body_bytes)?;
 
         // 5. Store receipts (key = height(8) || tx_index(4)).
@@ -55,11 +54,7 @@ impl BlockCommitter {
         }
 
         // 6. Block hash → number index.
-        state_db.put_cf_raw(
-            CF_BLOCK_HASH_TO_NUMBER,
-            block_hash.as_slice(),
-            &height_key,
-        )?;
+        state_db.put_cf_raw(CF_BLOCK_HASH_TO_NUMBER, block_hash.as_slice(), &height_key)?;
 
         // 7. Tx hash → location index (height(8) || tx_index(4)).
         for (i, _tx_bytes) in block.evm_transactions.iter().enumerate() {
