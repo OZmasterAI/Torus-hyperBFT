@@ -2,6 +2,7 @@
 
 use std::sync::atomic::Ordering;
 
+use alloy_primitives::keccak256;
 use borsh::BorshDeserialize;
 use jsonrpsee::core::{async_trait, RpcResult};
 use jsonrpsee::proc_macros::rpc;
@@ -11,9 +12,13 @@ use rocksdb::IteratorMode;
 use torus_core::oracle::{OracleConfig, OracleManager};
 use torus_core::position::PositionManager;
 use torus_core::precompiles::OrderBookSnapshot;
+use torus_economics::governance::{GovernanceManager, ProposalStatus, ProposalType};
+use torus_economics::staking::StakingManager;
+use torus_economics::types::ValidatorStatus;
 use torus_economics::PermanentStakeInfo;
 use torus_state::cf::{
-    CF_NATIVE_MARKETS, CF_NATIVE_ORDER_BOOKS, CF_NATIVE_TRADES, CF_STAKING_PERMANENT,
+    CF_GOVERNANCE_PROPOSALS, CF_NATIVE_MARKETS, CF_NATIVE_ORDER_BOOKS, CF_NATIVE_TRADES,
+    CF_STAKING_PERMANENT,
 };
 use torus_types::FixedPoint;
 
@@ -80,32 +85,32 @@ pub trait TorusApi {
         limit: Option<u32>,
     ) -> RpcResult<Vec<RpcTrade>>;
 
-    // --- 2.9.3: Staking (stub — batch 7b) ---
+    // --- 2.9.3: Staking ---
     #[method(name = "getStakingInfo")]
-    async fn get_staking_info(&self, address: String) -> RpcResult<serde_json::Value>;
+    async fn get_staking_info(&self, address: String) -> RpcResult<RpcStakingInfo>;
 
     #[method(name = "getValidators")]
-    async fn get_validators(&self) -> RpcResult<serde_json::Value>;
+    async fn get_validators(&self) -> RpcResult<Vec<RpcValidatorInfo>>;
 
     #[method(name = "getEpoch")]
-    async fn get_epoch(&self) -> RpcResult<serde_json::Value>;
+    async fn get_epoch(&self) -> RpcResult<RpcEpochInfo>;
 
     #[method(name = "getDelegations")]
-    async fn get_delegations(&self, delegator: String) -> RpcResult<serde_json::Value>;
+    async fn get_delegations(&self, delegator: String) -> RpcResult<Vec<RpcDelegation>>;
 
-    // --- 2.9.4: Submission (stub — batch 7b) ---
+    // --- 2.9.4: Submission ---
     #[method(name = "submitNativeAction")]
     async fn submit_native_action(&self, signed_action: String) -> RpcResult<String>;
 
-    // --- 2.9.5: Governance (stub — batch 7b) ---
+    // --- 2.9.5: Governance ---
     #[method(name = "getProposal")]
-    async fn get_proposal(&self, proposal_id: u64) -> RpcResult<serde_json::Value>;
+    async fn get_proposal(&self, proposal_id: u64) -> RpcResult<Option<RpcProposal>>;
 
     #[method(name = "getProposals")]
-    async fn get_proposals(&self, status: Option<String>) -> RpcResult<serde_json::Value>;
+    async fn get_proposals(&self, status: Option<String>) -> RpcResult<Vec<RpcProposal>>;
 
     #[method(name = "getGovernanceParams")]
-    async fn get_governance_params(&self) -> RpcResult<serde_json::Value>;
+    async fn get_governance_params(&self) -> RpcResult<RpcGovernanceParams>;
 }
 
 // ============================================================================
@@ -359,73 +364,261 @@ impl TorusApiServer for RpcState {
         Ok(trades)
     }
 
-    // === 2.9.3: Staking stubs ===
+    // === 2.9.3: Staking ===
 
-    async fn get_staking_info(&self, _address: String) -> RpcResult<serde_json::Value> {
-        Err(ErrorObjectOwned::owned(
-            -32601,
-            "torus_getStakingInfo not yet implemented",
-            None::<()>,
-        ))
+    async fn get_staking_info(&self, address: String) -> RpcResult<RpcStakingInfo> {
+        let addr = parse_address(&address).map_err(ErrorObjectOwned::from)?;
+        let staking = StakingManager::new(self.state.clone());
+        let info = torus_economics::queries::get_staking_info(&staking, addr)
+            .map_err(|e| RpcError::Internal(e.to_string()))
+            .map_err(ErrorObjectOwned::from)?;
+
+        let delegated = info
+            .delegated
+            .iter()
+            .map(|(v, amt)| RpcDelegation {
+                validator: hex_address(*v),
+                amount: hex_u256(*amt),
+            })
+            .collect();
+
+        let unbonding = info
+            .unbonding
+            .iter()
+            .map(|u| RpcUnbonding {
+                amount: hex_u256(u.amount),
+                release_block: hex_u64(u.release_block),
+            })
+            .collect();
+
+        Ok(RpcStakingInfo {
+            delegated,
+            permanent_stake: hex_u256(info.permanent_stake),
+            pending_rewards: hex_u256(info.pending_rewards),
+            unbonding,
+        })
     }
 
-    async fn get_validators(&self) -> RpcResult<serde_json::Value> {
-        Err(ErrorObjectOwned::owned(
-            -32601,
-            "torus_getValidators not yet implemented",
-            None::<()>,
-        ))
+    async fn get_validators(&self) -> RpcResult<Vec<RpcValidatorInfo>> {
+        let staking = StakingManager::new(self.state.clone());
+        let validators = torus_economics::queries::get_validators(&staking)
+            .map_err(|e| RpcError::Internal(e.to_string()))
+            .map_err(ErrorObjectOwned::from)?;
+
+        // Also fetch full ValidatorState for status info.
+        let all_states = staking
+            .all_validators()
+            .map_err(|e| RpcError::Internal(e.to_string()))
+            .map_err(ErrorObjectOwned::from)?;
+
+        let result = validators
+            .into_iter()
+            .map(|v| {
+                let status = all_states
+                    .iter()
+                    .find(|s| s.address == v.address)
+                    .map(|s| match s.status {
+                        ValidatorStatus::Candidate => "candidate",
+                        ValidatorStatus::Active => "active",
+                        ValidatorStatus::Jailed => "jailed",
+                        ValidatorStatus::Tombstoned => "tombstoned",
+                    })
+                    .unwrap_or("unknown");
+
+                RpcValidatorInfo {
+                    address: hex_address(v.address),
+                    pubkey: format!("0x{}", hex::encode(v.pubkey.0)),
+                    power: hex_u64(v.power),
+                    commission_bps: v.commission_bps,
+                    status: status.to_string(),
+                }
+            })
+            .collect();
+
+        Ok(result)
     }
 
-    async fn get_epoch(&self) -> RpcResult<serde_json::Value> {
-        Err(ErrorObjectOwned::owned(
-            -32601,
-            "torus_getEpoch not yet implemented",
-            None::<()>,
-        ))
+    async fn get_epoch(&self) -> RpcResult<RpcEpochInfo> {
+        let current_height = self.latest_height.load(Ordering::Relaxed);
+        // Default epoch length; in production this comes from ChainConfig.
+        let epoch_length = 100u64;
+        let info = torus_economics::queries::get_epoch_info(current_height, epoch_length);
+
+        Ok(RpcEpochInfo {
+            current_epoch: hex_u64(info.current_epoch),
+            epoch_start_block: hex_u64(info.epoch_start_block),
+            epoch_end_block: hex_u64(info.epoch_end_block),
+            blocks_remaining: hex_u64(info.blocks_remaining),
+            epoch_length: hex_u64(info.epoch_length),
+        })
     }
 
-    async fn get_delegations(&self, _delegator: String) -> RpcResult<serde_json::Value> {
-        Err(ErrorObjectOwned::owned(
-            -32601,
-            "torus_getDelegations not yet implemented",
-            None::<()>,
-        ))
+    async fn get_delegations(&self, delegator: String) -> RpcResult<Vec<RpcDelegation>> {
+        let addr = parse_address(&delegator).map_err(ErrorObjectOwned::from)?;
+        let staking = StakingManager::new(self.state.clone());
+        let delegations = torus_economics::queries::get_delegations(&staking, addr)
+            .map_err(|e| RpcError::Internal(e.to_string()))
+            .map_err(ErrorObjectOwned::from)?;
+
+        Ok(delegations
+            .into_iter()
+            .map(|(v, amt)| RpcDelegation {
+                validator: hex_address(v),
+                amount: hex_u256(amt),
+            })
+            .collect())
     }
 
-    // === 2.9.4: Submission stub ===
+    // === 2.9.4: Submission ===
 
-    async fn submit_native_action(&self, _signed_action: String) -> RpcResult<String> {
-        Err(ErrorObjectOwned::owned(
-            -32601,
-            "torus_submitNativeAction not yet implemented",
-            None::<()>,
-        ))
+    async fn submit_native_action(&self, signed_action: String) -> RpcResult<String> {
+        // Decode hex → bytes.
+        let bytes = parse_bytes(&signed_action).map_err(ErrorObjectOwned::from)?;
+
+        // Deserialize JSON bytes → SignedNativeAction (serde, not borsh).
+        let action: torus_types::SignedNativeAction = serde_json::from_slice(&bytes)
+            .map_err(|e| RpcError::InvalidParams(format!("invalid action encoding: {e}")))
+            .map_err(ErrorObjectOwned::from)?;
+
+        // Validate signature — recover sender address.
+        // TODO: Add nonce/chain-id validation once wall-clock time is available in RPC context.
+        let _sender = action
+            .recover_sender()
+            .map_err(|e| RpcError::InvalidParams(format!("signature verification failed: {e:?}")))
+            .map_err(ErrorObjectOwned::from)?;
+
+        // Compute action hash for the receipt.
+        let action_bytes = serde_json::to_vec(&action)
+            .map_err(|e| RpcError::Internal(format!("serialize action: {e}")))
+            .map_err(ErrorObjectOwned::from)?;
+        let hash = keccak256(&action_bytes);
+
+        // Submit to mempool native action pool.
+        self.mempool.add_native_action(action);
+
+        Ok(hex_b256(hash))
     }
 
-    // === 2.9.5: Governance stubs ===
+    // === 2.9.5: Governance ===
 
-    async fn get_proposal(&self, _proposal_id: u64) -> RpcResult<serde_json::Value> {
-        Err(ErrorObjectOwned::owned(
-            -32601,
-            "torus_getProposal not yet implemented",
-            None::<()>,
-        ))
+    async fn get_proposal(&self, proposal_id: u64) -> RpcResult<Option<RpcProposal>> {
+        let gov = GovernanceManager::new(self.state.clone());
+        let proposal = gov
+            .get_proposal(proposal_id)
+            .map_err(|e| RpcError::Internal(e.to_string()))
+            .map_err(ErrorObjectOwned::from)?;
+
+        Ok(proposal.map(map_proposal))
     }
 
-    async fn get_proposals(&self, _status: Option<String>) -> RpcResult<serde_json::Value> {
-        Err(ErrorObjectOwned::owned(
-            -32601,
-            "torus_getProposals not yet implemented",
-            None::<()>,
-        ))
+    async fn get_proposals(&self, status: Option<String>) -> RpcResult<Vec<RpcProposal>> {
+        let gov = GovernanceManager::new(self.state.clone());
+
+        let proposals = match status {
+            Some(s) => {
+                let ps = parse_proposal_status(&s).map_err(ErrorObjectOwned::from)?;
+                gov.get_proposals_by_status(ps)
+                    .map_err(|e| RpcError::Internal(e.to_string()))
+                    .map_err(ErrorObjectOwned::from)?
+            }
+            None => {
+                // Return all proposals by iterating the CF directly.
+                let db = self.state.inner();
+                let cf = db
+                    .cf_handle(CF_GOVERNANCE_PROPOSALS)
+                    .ok_or_else(|| {
+                        RpcError::Internal("missing CF_GOVERNANCE_PROPOSALS".into())
+                    })
+                    .map_err(ErrorObjectOwned::from)?;
+                let iter = db.iterator_cf(cf, IteratorMode::Start);
+                let mut all = Vec::new();
+                for item in iter {
+                    let (key, value) = item
+                        .map_err(|e| RpcError::Internal(format!("rocksdb: {e}")))
+                        .map_err(ErrorObjectOwned::from)?;
+                    if key.len() != 8 {
+                        continue;
+                    }
+                    let proposal =
+                        torus_economics::governance::Proposal::try_from_slice(&value)
+                            .map_err(|e| {
+                                RpcError::Internal(format!("borsh decode proposal: {e}"))
+                            })
+                            .map_err(ErrorObjectOwned::from)?;
+                    all.push(proposal);
+                }
+                all
+            }
+        };
+
+        Ok(proposals.into_iter().map(map_proposal).collect())
     }
 
-    async fn get_governance_params(&self) -> RpcResult<serde_json::Value> {
-        Err(ErrorObjectOwned::owned(
-            -32601,
-            "torus_getGovernanceParams not yet implemented",
-            None::<()>,
-        ))
+    async fn get_governance_params(&self) -> RpcResult<RpcGovernanceParams> {
+        let gov = GovernanceManager::new(self.state.clone());
+        let params = gov
+            .get_governance_params()
+            .map_err(|e| RpcError::Internal(e.to_string()))
+            .map_err(ErrorObjectOwned::from)?;
+
+        Ok(RpcGovernanceParams {
+            voting_period_blocks: hex_u64(params.voting_period_blocks),
+            quorum_bps: hex_u64(params.quorum_bps),
+            min_proposal_stake: hex_u256(params.min_proposal_stake),
+            permanent_weight_multiplier: format!(
+                "{}/{}",
+                params.permanent_weight_multiplier_num,
+                params.permanent_weight_multiplier_den
+            ),
+        })
+    }
+}
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+fn map_proposal(p: torus_economics::governance::Proposal) -> RpcProposal {
+    let proposal_type = match p.proposal_type {
+        ProposalType::ParameterChange => "ParameterChange",
+        ProposalType::TreasurySpend => "TreasurySpend",
+        ProposalType::MarketListing => "MarketListing",
+        ProposalType::TextProposal => "TextProposal",
+    };
+
+    let status = match p.status {
+        ProposalStatus::Pending => "Pending",
+        ProposalStatus::Active => "Active",
+        ProposalStatus::Passed => "Passed",
+        ProposalStatus::Rejected => "Rejected",
+        ProposalStatus::Executed => "Executed",
+        ProposalStatus::Expired => "Expired",
+    };
+
+    RpcProposal {
+        id: p.id,
+        proposer: hex_address(p.proposer),
+        title: p.title,
+        description: p.description,
+        proposal_type: proposal_type.to_string(),
+        status: status.to_string(),
+        votes_for: hex_u256(p.votes_for),
+        votes_against: hex_u256(p.votes_against),
+        start_block: hex_u64(p.start_block),
+        end_block: hex_u64(p.end_block),
+    }
+}
+
+fn parse_proposal_status(s: &str) -> Result<ProposalStatus, RpcError> {
+    match s.to_lowercase().as_str() {
+        "pending" => Ok(ProposalStatus::Pending),
+        "active" => Ok(ProposalStatus::Active),
+        "passed" => Ok(ProposalStatus::Passed),
+        "rejected" => Ok(ProposalStatus::Rejected),
+        "executed" => Ok(ProposalStatus::Executed),
+        "expired" => Ok(ProposalStatus::Expired),
+        _ => Err(RpcError::InvalidParams(format!(
+            "unknown proposal status: {s}"
+        ))),
     }
 }

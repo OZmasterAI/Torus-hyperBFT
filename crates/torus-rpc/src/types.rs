@@ -310,3 +310,78 @@ pub struct RpcTrade {
     pub block_number: String,
     pub timestamp: String,
 }
+
+// ============================================================================
+// Torus Staking RPC Response Types (2.9.3)
+// ============================================================================
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcStakingInfo {
+    pub delegated: Vec<RpcDelegation>,
+    pub permanent_stake: String,
+    pub pending_rewards: String,
+    pub unbonding: Vec<RpcUnbonding>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcDelegation {
+    pub validator: String,
+    pub amount: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcUnbonding {
+    pub amount: String,
+    pub release_block: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcValidatorInfo {
+    pub address: String,
+    pub pubkey: String,
+    pub power: String,
+    pub commission_bps: u16,
+    pub status: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcEpochInfo {
+    pub current_epoch: String,
+    pub epoch_start_block: String,
+    pub epoch_end_block: String,
+    pub blocks_remaining: String,
+    pub epoch_length: String,
+}
+
+// ============================================================================
+// Torus Governance RPC Response Types (2.9.5)
+// ============================================================================
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcProposal {
+    pub id: u64,
+    pub proposer: String,
+    pub title: String,
+    pub description: String,
+    pub proposal_type: String,
+    pub status: String,
+    pub votes_for: String,
+    pub votes_against: String,
+    pub start_block: String,
+    pub end_block: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcGovernanceParams {
+    pub voting_period_blocks: String,
+    pub quorum_bps: String,
+    pub min_proposal_stake: String,
+    pub permanent_weight_multiplier: String,
+}

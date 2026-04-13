@@ -27,3 +27,5 @@ thiserror = "2"
 [dev-dependencies]
 tempfile = { workspace = true }
 revm = { workspace = true }
+k256 = { workspace = true }
+sha3 = { workspace = true }
