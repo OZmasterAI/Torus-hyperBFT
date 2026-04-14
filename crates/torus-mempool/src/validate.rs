@@ -76,6 +76,18 @@ pub fn validate_evm_tx(
         });
     }
 
+    // FIX EVM-FIND-08: Reject nonces too far in the future to prevent griefing.
+    // Without this, an attacker can fill a sender's per-account queue with
+    // far-future nonces, blocking legitimate transactions.
+    const MAX_NONCE_GAP: u64 = 64;
+    if tx_nonce > state_nonce + MAX_NONCE_GAP {
+        return Err(MempoolError::NonceTooFar {
+            sender,
+            have: tx_nonce,
+            max: state_nonce + MAX_NONCE_GAP,
+        });
+    }
+
     // Balance check: gas_limit * max_fee_per_gas + value
     let (max_fee, priority_fee) = extract_gas_price(&tx);
     let value = tx.value();

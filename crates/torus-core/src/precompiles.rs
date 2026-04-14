@@ -35,6 +35,24 @@ pub const ADDR_CORE_WRITER: u16 = 0x0810;
 pub const ADDR_CORE_WRITER_STAKING: u16 = 0x0811;
 pub const ADDR_LOCKBOX: u16 = 0x0820;
 
+/// FIX EVM-PF-10: Gas costs for Torus precompiles.
+/// Read-only queries (cold SLOAD equivalent).
+pub const GAS_PRECOMPILE_READ: u64 = 2_600;
+/// State-mutating writes (SSTORE equivalent range).
+pub const GAS_PRECOMPILE_WRITE: u64 = 20_000;
+/// Complex operations (governance, liquidation).
+pub const GAS_PRECOMPILE_COMPLEX: u64 = 50_000;
+
+/// Gas cost for a precompile by address ID.
+pub const fn precompile_gas(id: u16) -> u64 {
+    match id {
+        0x0800..=0x0803 => GAS_PRECOMPILE_READ,
+        0x0810..=0x0811 => GAS_PRECOMPILE_WRITE,
+        0x0820 => GAS_PRECOMPILE_WRITE,
+        _ => 0,
+    }
+}
+
 /// Convert a precompile ID to a 20-byte Ethereum address.
 pub const fn precompile_address(id: u16) -> Address {
     let b = id.to_be_bytes();

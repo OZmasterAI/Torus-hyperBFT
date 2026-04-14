@@ -114,17 +114,19 @@ impl EvmPool {
     }
 
     /// Insert a validated transaction.
-    /// Returns the hash of any replaced transaction (same sender+nonce).
+    /// Returns (replaced_hash, freed_bytes) — freed_bytes is the total raw RLP size
+    /// of any evicted or replaced transactions (FIX EVM-FIND-02).
     pub fn insert(
         &mut self,
         entry: EvmPoolEntry,
         max_pool_size: usize,
         max_per_sender: usize,
         replacement_bump_pct: u64,
-    ) -> Result<Option<B256>, MempoolError> {
+    ) -> Result<(Option<B256>, usize), MempoolError> {
         let hash = entry.hash;
         let sender = entry.sender;
         let nonce = entry.nonce;
+        let mut freed_bytes = 0usize;
 
         if self.by_hash.contains_key(&hash) {
             return Err(MempoolError::DuplicateTx(hash));
@@ -144,9 +146,12 @@ impl EvmPool {
                     });
                 }
                 let old_hash = existing.hash;
+                let old_fee = existing.max_fee_per_gas;
+                let old_priority = existing.max_priority_fee;
+                freed_bytes = existing.raw_rlp.len();
                 self.by_price.remove(&TxPriority {
-                    max_fee_per_gas: existing.max_fee_per_gas,
-                    max_priority_fee: existing.max_priority_fee,
+                    max_fee_per_gas: old_fee,
+                    max_priority_fee: old_priority,
                     hash: old_hash,
                 });
                 self.by_hash.remove(&old_hash);
@@ -174,7 +179,9 @@ impl EvmPool {
                 if entry.max_fee_per_gas <= lowest.max_fee_per_gas {
                     return Err(MempoolError::PoolFull);
                 }
-                self.remove_by_hash(&lowest.hash);
+                if let Some(evicted) = self.remove_by_hash(&lowest.hash) {
+                    freed_bytes += evicted.raw_rlp.len();
+                }
             } else {
                 return Err(MempoolError::PoolFull);
             }
@@ -193,7 +200,7 @@ impl EvmPool {
             .insert(nonce, entry);
         self.size += 1;
 
-        Ok(replaced)
+        Ok((replaced, freed_bytes))
     }
 
     /// Remove a transaction by hash.

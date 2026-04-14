@@ -146,11 +146,26 @@ impl BlockProposer {
         // FIX CONS-PF-02: Recover senders from EIP-712 signatures.
         // SignedNativeActions are kept intact in the block so validators can
         // independently verify signatures during consensus validation.
+        // FIX ECON-FIND-03: Check persistent nonces to prevent replay.
         let mut sender_actions = Vec::with_capacity(signed_native_actions.len());
+        let mut consumed_nonces: Vec<(Address, u64)> = Vec::new();
         for signed in &signed_native_actions {
             let sender = signed
                 .recover_sender()
                 .map_err(|e| BridgeError::SignatureRecovery(format!("{e}")))?;
+            // Replay check: skip actions with already-consumed nonces.
+            let mut nonce_key = [0u8; 28];
+            nonce_key[..20].copy_from_slice(sender.as_slice());
+            nonce_key[20..28].copy_from_slice(&signed.nonce.to_be_bytes());
+            if state_db
+                .get_cf_raw(torus_state::cf::CF_NATIVE_NONCES, &nonce_key)
+                .unwrap_or(None)
+                .is_some()
+            {
+                tracing::warn!(%sender, nonce = signed.nonce, "skipping replayed native action");
+                continue;
+            }
+            consumed_nonces.push((sender, signed.nonce));
             sender_actions.push((sender, signed.action.clone()));
         }
 
@@ -202,6 +217,18 @@ impl BlockProposer {
 
         // Phase 7: Epoch boundary check.
         NativeExecutor::process_epoch_boundary(&mut ctx);
+
+        // FIX ECON-FIND-03: Persist consumed nonces for replay protection.
+        for (sender, nonce) in &consumed_nonces {
+            let mut nonce_key = [0u8; 28];
+            nonce_key[..20].copy_from_slice(sender.as_slice());
+            nonce_key[20..28].copy_from_slice(&nonce.to_be_bytes());
+            let _ = state_db.put_cf_raw(
+                torus_state::cf::CF_NATIVE_NONCES,
+                &nonce_key,
+                &block_height.to_be_bytes(),
+            );
+        }
 
         // Compute composite state root.
         let native_root = compute_native_state_root(state_db)?;

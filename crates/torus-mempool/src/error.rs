@@ -40,6 +40,10 @@ pub enum MempoolError {
     DuplicateNativeAction,
     /// Sender has too many pending native actions in the pool.
     NativeSenderQueueFull { sender: Address },
+    /// FIX EVM-FIND-05: Native action validation failed (chain ID, nonce freshness, signature).
+    NativeValidationFailed(String),
+    /// FIX EVM-FIND-08: Transaction nonce is too far in the future.
+    NonceTooFar { sender: Address, have: u64, max: u64 },
 }
 
 impl fmt::Display for MempoolError {
@@ -80,6 +84,12 @@ impl fmt::Display for MempoolError {
             Self::DuplicateNativeAction => write!(f, "duplicate native action"),
             Self::NativeSenderQueueFull { sender } => {
                 write!(f, "too many pending native actions for {sender}")
+            }
+            Self::NativeValidationFailed(e) => {
+                write!(f, "native action validation failed: {e}")
+            }
+            Self::NonceTooFar { sender, have, max } => {
+                write!(f, "nonce too far in future for {sender}: have {have}, max {max}")
             }
         }
     }

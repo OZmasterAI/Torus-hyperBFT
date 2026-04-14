@@ -180,13 +180,30 @@ impl BlockValidator {
     ) -> Result<ValidatedBlock, BridgeError> {
         // FIX CONS-PF-02: Recover senders from EIP-712 signatures in each
         // SignedNativeAction. If any signature is invalid, reject the block.
+        // FIX ECON-FIND-03: Check persistent nonces to prevent replay.
         let mut sender_actions = Vec::with_capacity(block.native_actions.len());
+        let mut consumed_nonces: Vec<(Address, u64)> = Vec::new();
         for (i, signed) in block.native_actions.iter().enumerate() {
             let sender = signed.recover_sender().map_err(|e| {
                 BridgeError::InvalidBlock(format!(
                     "native action {i}: invalid EIP-712 signature: {e}"
                 ))
             })?;
+            // Replay check: reject blocks containing replayed nonces.
+            let mut nonce_key = [0u8; 28];
+            nonce_key[..20].copy_from_slice(sender.as_slice());
+            nonce_key[20..28].copy_from_slice(&signed.nonce.to_be_bytes());
+            if state_db
+                .get_cf_raw(torus_state::cf::CF_NATIVE_NONCES, &nonce_key)
+                .unwrap_or(None)
+                .is_some()
+            {
+                return Err(BridgeError::InvalidBlock(format!(
+                    "native action {i}: replayed nonce {} for sender {sender}",
+                    signed.nonce,
+                )));
+            }
+            consumed_nonces.push((sender, signed.nonce));
             sender_actions.push((sender, signed.action.clone()));
         }
 
@@ -253,6 +270,18 @@ impl BlockValidator {
 
         // Phase 9: Epoch boundary check.
         NativeExecutor::process_epoch_boundary(&mut ctx);
+
+        // FIX ECON-FIND-03: Persist consumed nonces for replay protection.
+        for (sender, nonce) in &consumed_nonces {
+            let mut nonce_key = [0u8; 28];
+            nonce_key[..20].copy_from_slice(sender.as_slice());
+            nonce_key[20..28].copy_from_slice(&nonce.to_be_bytes());
+            let _ = state_db.put_cf_raw(
+                torus_state::cf::CF_NATIVE_NONCES,
+                &nonce_key,
+                &block.header.height.to_be_bytes(),
+            );
+        }
 
         // Compute composite state root (EVM bundle + native state).
         let native_root = compute_native_state_root(state_db)?;

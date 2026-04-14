@@ -149,7 +149,7 @@ impl Mempool {
             return Err(MempoolError::DuplicateTx(hash));
         }
 
-        pool.insert(
+        let (_replaced, freed_bytes) = pool.insert(
             entry,
             self.config.max_pool_size,
             self.config.max_per_sender,
@@ -159,6 +159,11 @@ impl Mempool {
         // Track memory usage (Phase 3: 3.1.7)
         self.memory_used
             .fetch_add(tx_size, std::sync::atomic::Ordering::Relaxed);
+        // FIX EVM-FIND-02: Decrement for evicted/replaced transactions.
+        if freed_bytes > 0 {
+            self.memory_used
+                .fetch_sub(freed_bytes, std::sync::atomic::Ordering::Relaxed);
+        }
 
         tracing::debug!(tx_hash = %hash, "evm tx added to mempool");
         Ok(hash)
@@ -180,7 +185,14 @@ impl Mempool {
     /// `parent_hash` seeds deterministic same-price shuffling (anti-MEV, Task 3.1.5).
     pub fn drain_evm(&self, gas_limit: u64, parent_hash: B256) -> Vec<Vec<u8>> {
         let mut pool = self.evm.write().unwrap();
-        pool.drain(gas_limit, self.config.evm_per_block_cap, &parent_hash)
+        let drained = pool.drain(gas_limit, self.config.evm_per_block_cap, &parent_hash);
+        // FIX EVM-FIND-02: Decrement memory for drained transactions.
+        let drained_bytes: usize = drained.iter().map(|tx| tx.len()).sum();
+        if drained_bytes > 0 {
+            self.memory_used
+                .fetch_sub(drained_bytes, std::sync::atomic::Ordering::Relaxed);
+        }
+        drained
     }
 
     /// Current EVM pool size.
@@ -188,16 +200,22 @@ impl Mempool {
         self.evm.read().unwrap().size()
     }
 
-    /// Submit a signed native action. Recovers the sender from the EIP-712 signature.
+    /// Submit a signed native action. Full EIP-712 validation: signature, chain ID, nonce freshness.
+    /// FIX EVM-FIND-05: Calls validate() instead of just recover_sender().
     pub fn add_native_action(&self, action: SignedNativeAction) -> Result<(), MempoolError> {
+        let current_time_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before epoch")
+            .as_millis() as u64;
         let sender = action
-            .recover_sender()
-            .map_err(|e| MempoolError::SignatureRecovery(e.to_string()))?;
+            .validate(current_time_ms, self.config.chain_id)
+            .map_err(|e| MempoolError::NativeValidationFailed(e.to_string()))?;
         self.submit_native_action(sender, action)
     }
 
-    /// Submit a native action with a known sender (pre-verified by caller).
-    pub fn submit_native_action(
+    /// FIX EVM-FIND-15: Renamed from submit_native_action and restricted to pub(crate).
+    /// Internal method for inserting a native action with a pre-verified sender.
+    pub(crate) fn submit_native_action(
         &self,
         sender: alloy_primitives::Address,
         action: SignedNativeAction,
@@ -874,5 +892,65 @@ mod tests {
         let d2 = pool2.drain_evm(30_000_000, hash_a);
         assert_eq!(d1.len(), 2);
         assert_eq!(d1, d2, "same parent hash must give same order");
+    }
+
+    // ---- FIX EVM-FIND-02: memory_used decremented on drain ----
+
+    #[test]
+    fn memory_used_decremented_on_drain() {
+        let (_dir, state) = setup();
+        let config = MempoolConfig {
+            max_memory_bytes: 1024 * 1024, // 1 MB
+            ..MempoolConfig::default()
+        };
+        let pool = Mempool::new(state.clone(), config);
+
+        let k = key(90);
+        let addr = address_from_key(&k);
+        fund(&state, &addr, U256::from(10u64.pow(18)), 0);
+
+        // Add transactions and track memory
+        for i in 0..3u64 {
+            pool.add_evm_tx(create_eip1559_tx(
+                &k, i, 1_000_000_000, 100_000_000, 21_000, U256::ZERO,
+            )).unwrap();
+        }
+
+        let mem_after_add = pool.memory_used();
+        assert!(mem_after_add > 0, "memory should be tracked after adds");
+
+        // Drain all
+        let drained = pool.drain_evm(30_000_000, B256::ZERO);
+        assert_eq!(drained.len(), 3);
+
+        let mem_after_drain = pool.memory_used();
+        assert_eq!(mem_after_drain, 0, "memory should be zero after draining all txs");
+
+        // Add more — must succeed, not PoolFull
+        pool.add_evm_tx(create_eip1559_tx(
+            &k, 0, 1_000_000_000, 100_000_000, 21_000, U256::ZERO,
+        )).unwrap();
+        assert_eq!(pool.evm_pool_size(), 1);
+    }
+
+    // ---- FIX EVM-FIND-08: future nonce rejection ----
+
+    #[test]
+    fn reject_nonce_too_far_in_future() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state.clone(), MempoolConfig::default());
+
+        let k = key(91);
+        let addr = address_from_key(&k);
+        fund(&state, &addr, U256::from(10u64.pow(18)), 0);
+
+        // Nonce 65 is beyond MAX_NONCE_GAP (64) from state nonce 0
+        let raw = create_eip1559_tx(&k, 65, 1_000_000_000, 100_000_000, 21_000, U256::ZERO);
+        let err = pool.add_evm_tx(raw).unwrap_err();
+        assert!(matches!(err, MempoolError::NonceTooFar { .. }));
+
+        // Nonce 64 should still be accepted
+        let raw = create_eip1559_tx(&k, 64, 1_000_000_000, 100_000_000, 21_000, U256::ZERO);
+        pool.add_evm_tx(raw).unwrap();
     }
 }

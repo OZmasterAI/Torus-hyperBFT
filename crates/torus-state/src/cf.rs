@@ -44,6 +44,10 @@ pub const CF_NATIVE_TRADES: &str = "cf_native_trades";
 pub const CF_SLASH_RECORDS: &str = "cf_slash_records";
 pub const CF_JAIL_VOTES: &str = "cf_jail_votes";
 
+// Replay protection (FIX ECON-FIND-03)
+/// Consumed EIP-712 nonces. Key: sender(20) ++ nonce(8 BE). Value: block_height(8 BE).
+pub const CF_NATIVE_NONCES: &str = "cf_native_nonces";
+
 // Other
 pub const CF_CORE_WRITER_QUEUE: &str = "cf_core_writer_queue";
 pub const CF_CONSENSUS_META: &str = "cf_consensus_meta";
@@ -83,6 +87,7 @@ pub const ALL_CF_NAMES: &[&str] = &[
     CF_NATIVE_TRADES,
     CF_SLASH_RECORDS,
     CF_JAIL_VOTES,
+    CF_NATIVE_NONCES,
     CF_CORE_WRITER_QUEUE,
     CF_CONSENSUS_META,
     CF_TRIE_NODES,

@@ -22,6 +22,26 @@ pub type MarketId = u64;
 // Fixed-Point Numeric Type (§5.1)
 // ============================================================================
 
+/// Arithmetic error for checked FixedPoint operations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArithmeticError {
+    Overflow,
+    Underflow,
+    DivisionByZero,
+}
+
+impl std::fmt::Display for ArithmeticError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Overflow => write!(f, "arithmetic overflow"),
+            Self::Underflow => write!(f, "arithmetic underflow"),
+            Self::DivisionByZero => write!(f, "division by zero"),
+        }
+    }
+}
+
+impl std::error::Error for ArithmeticError {}
+
 /// Fixed-point decimal with 8 implicit decimal places.
 /// Stored as i128 internally. 1.00000000 = 100_000_000.
 /// Follows Hyperliquid's pattern of implicit decimal scaling.
@@ -36,6 +56,8 @@ impl FixedPoint {
     pub const SCALE: i128 = 100_000_000; // 10^8
     pub const ZERO: Self = Self(0);
     pub const ONE: Self = Self(Self::SCALE);
+    pub const MAX: Self = Self(i128::MAX);
+    pub const MIN: Self = Self(i128::MIN);
 
     pub fn from_raw(raw: i128) -> Self {
         Self(raw)
@@ -44,41 +66,77 @@ impl FixedPoint {
     pub fn raw(&self) -> i128 {
         self.0
     }
+
+    /// Checked addition. Returns `Err(ArithmeticError::Overflow)` on overflow.
+    pub fn checked_add(self, rhs: Self) -> Result<Self, ArithmeticError> {
+        self.0
+            .checked_add(rhs.0)
+            .map(FixedPoint)
+            .ok_or(ArithmeticError::Overflow)
+    }
+
+    /// Checked subtraction. Returns `Err(ArithmeticError::Underflow)` on underflow.
+    pub fn checked_sub(self, rhs: Self) -> Result<Self, ArithmeticError> {
+        self.0
+            .checked_sub(rhs.0)
+            .map(FixedPoint)
+            .ok_or(ArithmeticError::Underflow)
+    }
+
+    /// Checked multiplication with i256 intermediate to avoid overflow.
+    pub fn checked_mul(self, rhs: Self) -> Result<Self, ArithmeticError> {
+        use ethnum::i256;
+        let result = i256::from(self.0) * i256::from(rhs.0) / i256::from(Self::SCALE);
+        if result > i256::from(i128::MAX) || result < i256::from(i128::MIN) {
+            return Err(ArithmeticError::Overflow);
+        }
+        Ok(FixedPoint(result.as_i128()))
+    }
+
+    /// Checked division with i256 intermediate.
+    /// Returns `Err(ArithmeticError::DivisionByZero)` on zero divisor.
+    pub fn checked_div(self, rhs: Self) -> Result<Self, ArithmeticError> {
+        if rhs.0 == 0 {
+            return Err(ArithmeticError::DivisionByZero);
+        }
+        use ethnum::i256;
+        let result = i256::from(self.0) * i256::from(Self::SCALE) / i256::from(rhs.0);
+        if result > i256::from(i128::MAX) || result < i256::from(i128::MIN) {
+            return Err(ArithmeticError::Overflow);
+        }
+        Ok(FixedPoint(result.as_i128()))
+    }
 }
 
 impl std::ops::Mul for FixedPoint {
     type Output = Self;
-
-    /// Multiply two FixedPoints: (a * b) / SCALE.
-    /// Uses ethnum::i256 to avoid i128 overflow on intermediate product.
-    fn mul(self, other: Self) -> Self {
-        use ethnum::i256;
-        Self((i256::from(self.0) * i256::from(other.0) / i256::from(Self::SCALE)).as_i128())
+    fn mul(self, rhs: Self) -> Self {
+        self.checked_mul(rhs)
+            .expect("FixedPoint multiplication overflow")
     }
 }
 
 impl std::ops::Div for FixedPoint {
     type Output = Self;
-
-    /// Divide two FixedPoints: (a * SCALE) / b.
-    /// Uses ethnum::i256 to avoid i128 overflow on intermediate product.
-    fn div(self, other: Self) -> Self {
-        use ethnum::i256;
-        Self((i256::from(self.0) * i256::from(Self::SCALE) / i256::from(other.0)).as_i128())
+    fn div(self, rhs: Self) -> Self {
+        self.checked_div(rhs)
+            .expect("FixedPoint division error")
     }
 }
 
 impl std::ops::Add for FixedPoint {
     type Output = Self;
     fn add(self, rhs: Self) -> Self {
-        Self(self.0 + rhs.0)
+        self.checked_add(rhs)
+            .expect("FixedPoint addition overflow")
     }
 }
 
 impl std::ops::Sub for FixedPoint {
     type Output = Self;
     fn sub(self, rhs: Self) -> Self {
-        Self(self.0 - rhs.0)
+        self.checked_sub(rhs)
+            .expect("FixedPoint subtraction underflow")
     }
 }
 
@@ -91,13 +149,15 @@ impl std::ops::Neg for FixedPoint {
 
 impl std::ops::AddAssign for FixedPoint {
     fn add_assign(&mut self, rhs: Self) {
-        self.0 += rhs.0;
+        *self = self.checked_add(rhs)
+            .expect("FixedPoint addition overflow");
     }
 }
 
 impl std::ops::SubAssign for FixedPoint {
     fn sub_assign(&mut self, rhs: Self) {
-        self.0 -= rhs.0;
+        *self = self.checked_sub(rhs)
+            .expect("FixedPoint subtraction underflow");
     }
 }
 
@@ -801,5 +861,54 @@ mod tests {
         let three = FixedPoint::from_raw(3 * FixedPoint::SCALE);
         let result = ten / three;
         assert_eq!(result.raw(), 333_333_333);
+    }
+
+    // ---- Checked arithmetic tests (ECON-PF-01, ECON-PF-02) ----
+
+    #[test]
+    fn checked_add_overflow_returns_error() {
+        let result = FixedPoint::MAX.checked_add(FixedPoint::from_raw(1));
+        assert_eq!(result, Err(ArithmeticError::Overflow));
+    }
+
+    #[test]
+    fn checked_sub_underflow_returns_error() {
+        let result = FixedPoint::MIN.checked_sub(FixedPoint::from_raw(1));
+        assert_eq!(result, Err(ArithmeticError::Underflow));
+    }
+
+    #[test]
+    fn checked_div_by_zero_returns_error() {
+        let result = FixedPoint::ONE.checked_div(FixedPoint::ZERO);
+        assert_eq!(result, Err(ArithmeticError::DivisionByZero));
+    }
+
+    #[test]
+    fn checked_arithmetic_normal_operations() {
+        let one = FixedPoint::ONE;
+        let two = FixedPoint::from_raw(2 * FixedPoint::SCALE);
+
+        assert_eq!(one.checked_add(one).unwrap(), two);
+        assert_eq!(two.checked_sub(one).unwrap(), one);
+        assert_eq!(one.checked_mul(two).unwrap(), two);
+        assert_eq!(two.checked_div(two).unwrap(), one);
+    }
+
+    #[test]
+    #[should_panic(expected = "FixedPoint addition overflow")]
+    fn add_operator_panics_on_overflow() {
+        let _ = FixedPoint::MAX + FixedPoint::from_raw(1);
+    }
+
+    #[test]
+    #[should_panic(expected = "FixedPoint subtraction underflow")]
+    fn sub_operator_panics_on_underflow() {
+        let _ = FixedPoint::MIN - FixedPoint::from_raw(1);
+    }
+
+    #[test]
+    #[should_panic(expected = "FixedPoint division error")]
+    fn div_operator_panics_on_zero() {
+        let _ = FixedPoint::ONE / FixedPoint::ZERO;
     }
 }
