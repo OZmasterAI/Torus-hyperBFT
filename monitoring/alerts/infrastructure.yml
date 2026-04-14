@@ -1,0 +1,60 @@
+# Prometheus alerting rules for host infrastructure.
+#
+# NOTE: These rules require node_exporter running on the same host.
+# Install from: https://github.com/prometheus/node_exporter
+# Default metrics endpoint: http://localhost:9100/metrics
+#
+# If node_exporter is not installed, these rules will simply never fire
+# (absent metrics evaluate to no result, not to an alert).
+
+groups:
+  - name: torus_infrastructure
+    rules:
+      - alert: DiskSpaceHigh
+        expr: (node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"}) < 0.2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Root filesystem < 20% free"
+          description: >
+            The root filesystem has less than 20% available space.
+            The Torus node stores all state in RocksDB which grows over time.
+            Consider enabling pruning, expanding the disk, or moving the
+            data directory to a larger volume.
+
+      - alert: DiskSpaceCritical
+        expr: (node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"}) < 0.05
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Root filesystem < 5% free — imminent exhaustion"
+          description: >
+            The root filesystem is nearly full. RocksDB may fail to write
+            and the node will crash. Immediately free space or expand storage.
+
+      - alert: MemoryHigh
+        expr: (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) < 0.2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Available memory < 20%"
+          description: >
+            Less than 20% of system memory is available. RocksDB uses
+            memory-mapped files and block cache. Heavy swapping will
+            degrade consensus performance. Consider increasing RAM or
+            tuning RocksDB cache settings.
+
+      - alert: HighCPU
+        expr: 100 - (avg by(instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 90
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "CPU usage > 90% for 5 minutes"
+          description: >
+            Sustained high CPU usage may cause consensus timeouts and
+            missed blocks. Check for runaway processes, high transaction
+            volume, or RocksDB compaction storms.

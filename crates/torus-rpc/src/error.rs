@@ -29,6 +29,9 @@ pub enum RpcError {
 
     #[error("internal error: {0}")]
     Internal(String),
+
+    #[error("historical data unavailable: block {block} has been pruned. Connect to an archive node for historical queries.")]
+    DataPruned { block: u64 },
 }
 
 impl From<RpcError> for ErrorObjectOwned {
@@ -42,6 +45,9 @@ impl From<RpcError> for ErrorObjectOwned {
             }
             RpcError::TooManyResults { .. } => {
                 ErrorObjectOwned::owned(-32005, err.to_string(), None::<()>)
+            }
+            RpcError::DataPruned { .. } => {
+                ErrorObjectOwned::owned(-32000, err.to_string(), None::<()>)
             }
             RpcError::State(_)
             | RpcError::Evm(_)

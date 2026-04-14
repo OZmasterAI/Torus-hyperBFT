@@ -181,8 +181,6 @@ fn read_passphrase_stdin() -> String {
     buf.trim().to_string()
 }
 
-use std::sync::atomic::AtomicU64;
-
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // Validate pruning flags
     if cli.archive && cli.retention_blocks.is_some() {
@@ -341,6 +339,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         chain_config.chain_id,
         notifier,
     );
+    // Extract shared handles before start() consumes the server
+    let latest_height_handle = rpc_server.latest_height();
+    let pruned_up_to_handle = rpc_server.pruned_up_to();
     let (_rpc_handle, actual_addr) = rpc_server
         .start(rpc_addr)
         .await
@@ -354,7 +355,6 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     info!(%metrics_addr, "telemetry server started");
 
     // 10. Background pruner (if pruning enabled)
-    let pruned_up_to = Arc::new(AtomicU64::new(0));
     if let Some(retention) = cli.retention_blocks {
         let pruner_config = PrunerConfig {
             retention_blocks: retention,
@@ -363,9 +363,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         let mut pruner = StatePruner::new(
             state_db.clone(),
             pruner_config,
-            pruned_up_to.clone(),
+            pruned_up_to_handle,
         );
-        let latest_for_pruner = rpc_server.latest_height();
+        let latest_for_pruner = latest_height_handle.clone();
         info!(retention_blocks = retention, "background pruner enabled");
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(30));

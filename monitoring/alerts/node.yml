@@ -1,0 +1,54 @@
+# Prometheus alerting rules for Torus node health metrics.
+# These rules use metrics exported by torus-telemetry on :9090/metrics.
+
+groups:
+  - name: torus_node
+    rules:
+      - alert: LowPeerCount
+        expr: torus_peers_connected < 3
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Low peer count ({{ $value }} peers)"
+          description: >
+            The node has fewer than 3 connected peers for over 5 minutes.
+            This reduces consensus participation reliability and may indicate
+            network issues. Check firewall rules (UDP 30333 must be open),
+            bootstrap peer addresses, and libp2p connectivity.
+
+      - alert: LowPeerCountCritical
+        expr: torus_peers_connected < 1
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No connected peers"
+          description: >
+            The node has zero connected peers. It cannot participate in
+            consensus or receive new blocks. Verify network configuration,
+            firewall rules, and bootstrap peer addresses.
+
+      - alert: DatabaseLargeWarning
+        expr: torus_db_size_bytes > 100e9
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Database exceeds 100 GB"
+          description: >
+            The RocksDB data directory has grown past 100 GB. Consider
+            enabling pruning with --retention-blocks to reclaim disk space,
+            or ensure adequate disk capacity. Current size: {{ $value | humanize1024 }}B.
+
+      - alert: DatabaseLargeCritical
+        expr: torus_db_size_bytes > 200e9
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Database exceeds 200 GB"
+          description: >
+            The RocksDB data directory has grown past 200 GB. Disk exhaustion
+            is imminent if not addressed. Enable pruning with --retention-blocks
+            or expand storage immediately. Current size: {{ $value | humanize1024 }}B.

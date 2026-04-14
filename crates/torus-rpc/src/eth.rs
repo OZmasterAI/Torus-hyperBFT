@@ -82,6 +82,15 @@ fn err(e: RpcError) -> ErrorObjectOwned {
     e.into()
 }
 
+/// Check if the requested block height has been pruned and return a clear error.
+fn check_pruned(state: &RpcState, height: u64) -> Result<(), ErrorObjectOwned> {
+    let pruned = state.pruned_up_to.load(Relaxed);
+    if pruned > 0 && height < pruned {
+        return Err(err(RpcError::DataPruned { block: height }));
+    }
+    Ok(())
+}
+
 pub(crate) fn get_header_with_hash(
     state: &RpcState,
     height: u64,
@@ -574,6 +583,7 @@ impl EthApiServer for RpcState {
             return Err(err(RpcError::Internal("invalid tx location".into())));
         }
         let height = u64::from_be_bytes(location[..8].try_into().unwrap());
+        check_pruned(self, height)?;
         let tx_index = u32::from_be_bytes(location[8..12].try_into().unwrap());
         let body = match get_body(self, height).map_err(err)? {
             Some(b) => b,
@@ -608,6 +618,7 @@ impl EthApiServer for RpcState {
             return Err(err(RpcError::Internal("invalid tx location".into())));
         }
         let height = u64::from_be_bytes(location[..8].try_into().unwrap());
+        check_pruned(self, height)?;
         let tx_index = u32::from_be_bytes(location[8..12].try_into().unwrap());
         let mut receipt_key = [0u8; 12];
         receipt_key[..8].copy_from_slice(&height.to_be_bytes());
@@ -695,6 +706,10 @@ impl EthApiServer for RpcState {
             Some(h) => h,
             None => return Ok(None),
         };
+        // Check pruning when full body data is needed
+        if (full_txs || header.evm_tx_count > 0) && header.evm_tx_count > 0 {
+            check_pruned(self, height)?;
+        }
         let body = if full_txs || header.evm_tx_count > 0 {
             get_body(self, height).map_err(err)?
         } else {
@@ -792,6 +807,8 @@ impl EthApiServer for RpcState {
             Some(b) => resolve_block_tag(b, latest).map_err(err)?,
             None => latest,
         };
+        // Check if the requested range includes pruned blocks
+        check_pruned(self, from)?;
         const MAX_LOGS: usize = 10_000;
         let mut all_logs = Vec::new();
         for height in from..=to {

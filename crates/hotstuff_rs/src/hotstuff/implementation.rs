@@ -554,8 +554,31 @@ impl<N: Network> HotStuff<N> {
             self.seen_proposals.insert(proposal_key, proposal.block.hash);
         }
 
+        // MonadBFT B2: validate NEC if present.
+        // Check NEC BEFORE reproposal — per paper Alg 5 VALIDPROPOSAL line 15,
+        // IsFreshProposal is checked first. A valid NEC makes the proposal fresh
+        // regardless of tc.high_tip_is_winner.
+        let has_valid_nec = if let Some(ref nec) = proposal.nec {
+            if !valid_nec(nec, block_tree)? {
+                match self.proposal_status {
+                    ProposalStatus::WaitingForProposal => {
+                        self.proposal_status = ProposalStatus::OneLeaderProposed { leader: *origin }
+                    }
+                    ProposalStatus::OneLeaderProposed { leader: _ } => {
+                        self.proposal_status = ProposalStatus::AllLeadersProposed
+                    }
+                    _ => {}
+                }
+                return Ok(());
+            }
+            true
+        } else {
+            false
+        };
+
         // MonadBFT: validate reproposal TC if present.
-        if proposal.is_reproposal() {
+        // Skip this check if the proposal has a valid NEC (it's fresh, not a reproposal).
+        if !has_valid_nec && proposal.is_reproposal() {
             if let Some(ref tc) = proposal.tc {
                 let tc_valid = tc.is_correct(block_tree)?
                     && self.view_info.view == tc.view + 1
@@ -573,22 +596,6 @@ impl<N: Network> HotStuff<N> {
                     return Ok(());
                 }
             } else {
-                return Ok(());
-            }
-        }
-
-        // MonadBFT B2: validate NEC if present.
-        if let Some(ref nec) = proposal.nec {
-            if !valid_nec(nec, block_tree)? {
-                match self.proposal_status {
-                    ProposalStatus::WaitingForProposal => {
-                        self.proposal_status = ProposalStatus::OneLeaderProposed { leader: *origin }
-                    }
-                    ProposalStatus::OneLeaderProposed { leader: _ } => {
-                        self.proposal_status = ProposalStatus::AllLeadersProposed
-                    }
-                    _ => {}
-                }
                 return Ok(());
             }
         }
@@ -680,7 +687,9 @@ impl<N: Network> HotStuff<N> {
                 // MonadBFT B2: Record which block we voted for (used by NE processing).
                 block_tree.set_last_voted_proposal(self.view_info.view, proposal.block.hash)?;
 
-                // MonadBFT: Update local_tip only for fresh proposals (not reproposals).
+                // MonadBFT: Update local_tip (paper Alg 1, line 13: local_tip ← GetTip(p)).
+                // For fresh proposals: tip is the proposal itself.
+                // For reproposals: tip is tc.high_tip (paper Alg 6, line 15).
                 if !proposal.is_reproposal() && vote_phase == Phase::Generic {
                     use crate::pacemaker::types::TipInfo;
                     let tip = TipInfo {
@@ -691,6 +700,13 @@ impl<N: Network> HotStuff<N> {
                         view: self.view_info.view,
                     };
                     block_tree.set_local_tip(&tip)?;
+                } else if proposal.is_reproposal() {
+                    // Reproposal: set local_tip to tc.high_tip per paper GetTip().
+                    if let Some(ref tc) = proposal.tc {
+                        if let Some(ref tip) = tc.high_tip {
+                            block_tree.set_local_tip(tip)?;
+                        }
+                    }
                 }
 
                 Event::PhaseVote(PhaseVoteEvent {
