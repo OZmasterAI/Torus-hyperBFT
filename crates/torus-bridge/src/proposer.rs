@@ -143,15 +143,15 @@ impl BlockProposer {
             parent.evm_gas_limit
         };
 
-        // Recover senders from EIP-712 signatures.
+        // FIX CONS-PF-02: Recover senders from EIP-712 signatures.
+        // SignedNativeActions are kept intact in the block so validators can
+        // independently verify signatures during consensus validation.
         let mut sender_actions = Vec::with_capacity(signed_native_actions.len());
-        let mut native_actions_for_block = Vec::with_capacity(signed_native_actions.len());
         for signed in &signed_native_actions {
             let sender = signed
                 .recover_sender()
                 .map_err(|e| BridgeError::SignatureRecovery(format!("{e}")))?;
             sender_actions.push((sender, signed.action.clone()));
-            native_actions_for_block.push(signed.action.clone());
         }
 
         // Sort into pre-EVM and post-EVM groups.
@@ -218,13 +218,13 @@ impl BlockProposer {
                 logs_bloom: exec_result.logs_bloom,
                 evm_gas_used: exec_result.gas_used,
                 evm_gas_limit: gas_limit,
-                native_action_count: native_actions_for_block.len() as u32,
+                native_action_count: signed_native_actions.len() as u32,
                 evm_tx_count: evm_transactions.len() as u32,
                 base_fee_per_gas: next_base_fee,
                 epoch: parent.epoch,
                 validator_set_hash: parent.validator_set_hash,
             },
-            native_actions: native_actions_for_block,
+            native_actions: signed_native_actions,
             evm_transactions,
             core_writer_actions: vec![],
         };

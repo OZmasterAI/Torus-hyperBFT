@@ -136,10 +136,15 @@ pub struct PublicKey(pub [u8; 32]);
 
 /// Canonical Torus block — serialized into hotstuff_rs Data field.
 /// Each TorusBlock becomes a single Datum in the library's Vec<Datum>.
+///
+/// FIX CONS-PF-02: native_actions contains `SignedNativeAction` (with EIP-712
+/// signatures) so that validators can independently recover senders and verify
+/// authorization. Previously stored bare `NativeAction` which made the proposer
+/// a trusted party for native action authorization.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TorusBlock {
     pub header: TorusBlockHeader,
-    pub native_actions: Vec<NativeAction>,
+    pub native_actions: Vec<SignedNativeAction>,
     /// EVM transactions (RLP-encoded, signed).
     pub evm_transactions: Vec<Vec<u8>>,
     /// CoreWriter action queue (from previous block's EVM).
@@ -201,7 +206,7 @@ impl TorusBlockHeader {
 /// Block body — the non-header payload, stored separately in cf_block_bodies.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TorusBlockBody {
-    pub native_actions: Vec<NativeAction>,
+    pub native_actions: Vec<SignedNativeAction>,
     pub evm_transactions: Vec<Vec<u8>>,
     pub core_writer_actions: Vec<CoreWriterAction>,
 }

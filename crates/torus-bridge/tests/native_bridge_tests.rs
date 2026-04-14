@@ -357,12 +357,12 @@ fn empty_native_actions_evm_only() {
         core_writer_actions: vec![],
     };
 
-    // Use validate_block_with_native with empty senders.
+    // FIX CONS-PF-02: validate_block_with_native now recovers senders from
+    // SignedNativeActions in the block (no separate senders parameter).
     let result = validator.validate_block_with_native(
         &block,
         &state_db,
         &evm_executor,
-        &[],
     );
 
     // Will fail on state root mismatch (B256::ZERO != computed root), which is
@@ -602,11 +602,11 @@ fn proposer_validator_pipeline_parity() {
         .expect("proposer should succeed");
 
     // Validate the proposed block with the validator.
+    // FIX CONS-PF-02: senders recovered from block's SignedNativeActions.
     let validated = validator.validate_block_with_native(
         &proposed.block,
         &state_db,
         &evm_executor,
-        &[],  // no native senders
     );
 
     // The validator should accept the block (state roots match).

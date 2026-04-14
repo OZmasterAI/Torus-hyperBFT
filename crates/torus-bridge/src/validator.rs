@@ -157,6 +157,10 @@ impl BlockValidator {
 
     /// Validate a block with the full native + EVM execution pipeline.
     ///
+    /// FIX CONS-PF-02: Recovers senders from the EIP-712 signatures embedded
+    /// in each `SignedNativeAction` in the block. This ensures validators
+    /// independently verify authorization rather than trusting the proposer.
+    ///
     /// Execution order per tech-req:
     ///   1. Native cancellations
     ///   2. Native non-GTC orders (IOC, FOK, market)
@@ -168,30 +172,23 @@ impl BlockValidator {
     ///   8. Governance actions + process_pending_proposals
     ///   9. Liquidation checks
     ///   10. Fee distribution + epoch check
-    ///
-    /// `native_senders` provides the recovered sender address for each entry
-    /// in `block.native_actions` (matched 1:1 by index).
     pub fn validate_block_with_native(
         &self,
         block: &TorusBlock,
         state_db: &StateDb,
         evm_executor: &EvmExecutor,
-        native_senders: &[Address],
     ) -> Result<ValidatedBlock, BridgeError> {
-        if native_senders.len() != block.native_actions.len() {
-            return Err(BridgeError::InvalidBlock(format!(
-                "native_senders length {} != native_actions length {}",
-                native_senders.len(),
-                block.native_actions.len()
-            )));
+        // FIX CONS-PF-02: Recover senders from EIP-712 signatures in each
+        // SignedNativeAction. If any signature is invalid, reject the block.
+        let mut sender_actions = Vec::with_capacity(block.native_actions.len());
+        for (i, signed) in block.native_actions.iter().enumerate() {
+            let sender = signed.recover_sender().map_err(|e| {
+                BridgeError::InvalidBlock(format!(
+                    "native action {i}: invalid EIP-712 signature: {e}"
+                ))
+            })?;
+            sender_actions.push((sender, signed.action.clone()));
         }
-
-        // Build (sender, action) pairs.
-        let sender_actions: Vec<(Address, _)> = native_senders
-            .iter()
-            .zip(block.native_actions.iter())
-            .map(|(s, a)| (*s, a.clone()))
-            .collect();
 
         // Sort into pre-EVM and post-EVM groups.
         let (pre_evm, post_evm) = sort_native_actions(&sender_actions);

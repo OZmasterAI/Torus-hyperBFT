@@ -15,10 +15,22 @@ use hotstuff_rs::types::data_types::{CryptoHash, Data, Datum, Power};
 use hotstuff_rs::types::update_sets::ValidatorSetUpdates;
 
 use torus_bridge::{BlockProposer, BlockValidator};
-use torus_economics::{EpochManager, StakingManager};
+use torus_economics::{EpochManager, SlashReason, StakingManager};
 use torus_evm::{EvmExecutor, TORUS_CHAIN_ID};
 use torus_state::StateDb;
 use torus_types::{Address, ChainConfig, TorusBlock, TorusBlockHeader, ValidatorSet};
+
+/// FIX CONS-PF-08: Buffered slash intent recorded during speculative rollback.
+/// Applied to DB only when the next block is produced/validated (i.e., the chain
+/// has moved forward past the equivocation). Discarded if the app is reconstructed
+/// from DB state (meaning the entire speculative chain was abandoned).
+#[derive(Clone, Debug)]
+struct PendingSlash {
+    validator: Address,
+    fraction_bps: u16,
+    reason: SlashReason,
+    tombstone: bool,
+}
 
 use crate::kv_store::RocksKVStore;
 
@@ -41,6 +53,9 @@ pub struct TorusApp {
     /// Prevents the double-call bug where produce_block mutates state and validate_block
     /// sees stale state, causing the proposer to halt at epoch boundaries.
     cached_vs_updates: Option<(u64, Option<ValidatorSetUpdates>)>,
+    /// FIX CONS-PF-08: Buffered slash intents from speculative rollbacks.
+    /// Applied to DB when the next block is produced or validated.
+    pending_slashes: Vec<PendingSlash>,
 }
 
 impl TorusApp {
@@ -62,6 +77,7 @@ impl TorusApp {
                 epoch: 0,
             },
             cached_vs_updates: None,
+            pending_slashes: Vec::new(),
         }
     }
 
@@ -87,6 +103,46 @@ impl TorusApp {
             fee_dev_pool_bps: 4500,
         };
         Self::new(state_db, &config)
+    }
+
+    /// FIX CONS-PF-08: Flush any buffered slash intents to DB.
+    /// Called at the start of produce_block and do_validate — by the time the
+    /// chain asks us to build or validate the next block, the equivocation
+    /// evidence is no longer speculative.
+    fn flush_pending_slashes(&mut self) {
+        for slash in self.pending_slashes.drain(..) {
+            match self.staking.slash(
+                slash.validator,
+                slash.fraction_bps,
+                slash.reason.clone(),
+                0,
+            ) {
+                Ok(amount) => {
+                    tracing::info!(
+                        %slash.validator,
+                        %amount,
+                        reason = ?slash.reason,
+                        "flushed buffered slash to DB"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        %slash.validator,
+                        %e,
+                        "CRITICAL: failed to flush buffered slash"
+                    );
+                }
+            }
+            if slash.tombstone {
+                if let Err(e) = self.staking.tombstone_validator(&slash.validator) {
+                    tracing::error!(
+                        %slash.validator,
+                        %e,
+                        "CRITICAL: failed to tombstone equivocating leader"
+                    );
+                }
+            }
+        }
     }
 
     /// Compute validator set updates at epoch boundary.
@@ -221,6 +277,9 @@ impl TorusApp {
         &mut self,
         request: ValidateBlockRequest<RocksKVStore>,
     ) -> ValidateBlockResponse {
+        // FIX CONS-PF-08: Flush any buffered slashes before validating.
+        self.flush_pending_slashes();
+
         let block = request.proposed_block();
         let datums = block.data.vec();
 
@@ -242,32 +301,47 @@ impl TorusApp {
             Err(_) => return ValidateBlockResponse::Invalid,
         };
 
-        // If the block has EVM transactions, validate via the bridge.
-        if !torus_block.evm_transactions.is_empty() {
-            match self
-                .validator
+        // FIX CONS-PF-02: Validate native actions AND EVM transactions.
+        // Previously only EVM transactions were validated; native actions were
+        // accepted without signature verification, allowing a malicious proposer
+        // to forge arbitrary staking/governance operations.
+        let has_native = !torus_block.native_actions.is_empty();
+        let has_evm = !torus_block.evm_transactions.is_empty();
+
+        let validation_result = if has_native {
+            // Block has native actions: use the full native+EVM pipeline which
+            // recovers senders from EIP-712 signatures and validates state root.
+            self.validator
+                .validate_block_with_native(&torus_block, &self.state_db, &self.evm_executor)
+        } else if has_evm {
+            // EVM-only block (no native actions).
+            self.validator
                 .validate_block(&torus_block, &self.state_db, &self.evm_executor)
-            {
-                Ok(_validated) => {
-                    // FIX CONS-PF-05: Update last_header during validation, not production.
-                    self.last_header = torus_block.header.clone();
-                    let validator_set_updates =
-                        self.epoch_validator_set_updates(torus_block.header.height);
-                    ValidateBlockResponse::Valid {
-                        app_state_updates: None,
-                        validator_set_updates,
-                    }
-                }
-                Err(_) => ValidateBlockResponse::Invalid,
-            }
         } else {
+            // Empty block — no execution to validate.
             // FIX CONS-PF-05: Update last_header during validation, not production.
             self.last_header = torus_block.header.clone();
-            // Empty block — check epoch boundary.
             let validator_set_updates = self.epoch_validator_set_updates(torus_block.header.height);
-            ValidateBlockResponse::Valid {
+            return ValidateBlockResponse::Valid {
                 app_state_updates: None,
                 validator_set_updates,
+            };
+        };
+
+        match validation_result {
+            Ok(_validated) => {
+                // FIX CONS-PF-05: Update last_header during validation, not production.
+                self.last_header = torus_block.header.clone();
+                let validator_set_updates =
+                    self.epoch_validator_set_updates(torus_block.header.height);
+                ValidateBlockResponse::Valid {
+                    app_state_updates: None,
+                    validator_set_updates,
+                }
+            }
+            Err(e) => {
+                tracing::warn!(%e, "block validation failed");
+                ValidateBlockResponse::Invalid
             }
         }
     }
@@ -278,6 +352,9 @@ impl App<RocksKVStore> for TorusApp {
         &mut self,
         _request: ProduceBlockRequest<RocksKVStore>,
     ) -> ProduceBlockResponse {
+        // FIX CONS-PF-08: Flush any buffered slashes before producing a new block.
+        self.flush_pending_slashes();
+
         // Phase 1: produce empty blocks (no mempool integration yet).
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -372,30 +449,20 @@ impl App<RocksKVStore> for TorusApp {
             }
         };
 
-        // FIX CONS-PF-08: Buffer slash intent — don't write to DB during speculative
-        // execution. For now, log at error level so failures are visible.
-        // TODO: Implement proper slash buffering with commit/rollback semantics.
-        match self.staking.slash(
-            leader_addr,
-            500,
-            torus_economics::SlashReason::DoubleSign,
-            0,
-        ) {
-            Ok(slashed_amount) => {
-                tracing::info!(
-                    %leader_addr,
-                    %slashed_amount,
-                    "equivocating leader slashed (5%) after speculative rollback"
-                );
-            }
-            Err(e) => {
-                tracing::error!(%leader_addr, %e, "CRITICAL: failed to slash equivocating leader");
-            }
-        }
-
-        if let Err(e) = self.staking.tombstone_validator(&leader_addr) {
-            tracing::error!(%leader_addr, %e, "CRITICAL: failed to tombstone equivocating leader");
-        }
+        // FIX CONS-PF-08: Buffer slash intent instead of writing to DB during
+        // speculative execution. The buffer is flushed at the start of the next
+        // produce_block or do_validate call, ensuring the slash only persists
+        // once the chain has moved forward past the equivocation event.
+        self.pending_slashes.push(PendingSlash {
+            validator: leader_addr,
+            fraction_bps: 500, // 5%
+            reason: SlashReason::DoubleSign,
+            tombstone: true,
+        });
+        tracing::info!(
+            %leader_addr,
+            "equivocation slash buffered (5% + tombstone) — will apply on next block"
+        );
 
         tracing::info!(
             rolled_back_block = ?block,
