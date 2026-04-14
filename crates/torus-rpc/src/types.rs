@@ -385,3 +385,15 @@ pub struct RpcGovernanceParams {
     pub min_proposal_stake: String,
     pub permanent_weight_multiplier: String,
 }
+
+// ============================================================================
+// Block Body Response (for explorer indexing)
+// ============================================================================
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcBlockBody {
+    pub block_number: String,
+    pub native_actions: Vec<serde_json::Value>,
+    pub native_action_count: u32,
+}

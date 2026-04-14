@@ -17,8 +17,8 @@ use torus_economics::staking::StakingManager;
 use torus_economics::types::ValidatorStatus;
 use torus_economics::PermanentStakeInfo;
 use torus_state::cf::{
-    CF_GOVERNANCE_PROPOSALS, CF_NATIVE_MARKETS, CF_NATIVE_ORDER_BOOKS, CF_NATIVE_TRADES,
-    CF_STAKING_PERMANENT,
+    CF_BLOCK_BODIES, CF_GOVERNANCE_PROPOSALS, CF_NATIVE_MARKETS, CF_NATIVE_ORDER_BOOKS,
+    CF_NATIVE_TRADES, CF_STAKING_PERMANENT,
 };
 use torus_types::FixedPoint;
 
@@ -111,6 +111,10 @@ pub trait TorusApi {
 
     #[method(name = "getGovernanceParams")]
     async fn get_governance_params(&self) -> RpcResult<RpcGovernanceParams>;
+
+    // --- Block body (native actions for explorer indexing) ---
+    #[method(name = "getBlockBody")]
+    async fn get_block_body(&self, block_number: u64) -> RpcResult<Option<RpcBlockBody>>;
 }
 
 // ============================================================================
@@ -573,6 +577,28 @@ impl TorusApiServer for RpcState {
                 params.permanent_weight_multiplier_den
             ),
         })
+    }
+
+    async fn get_block_body(&self, block_number: u64) -> RpcResult<Option<RpcBlockBody>> {
+        let key = block_number.to_be_bytes();
+        let data = match self.state.get_cf_raw(CF_BLOCK_BODIES, &key) {
+            Ok(Some(d)) => d,
+            Ok(None) => return Ok(None),
+            Err(e) => return Err(ErrorObjectOwned::from(RpcError::State(e))),
+        };
+        let body: torus_types::TorusBlockBody = serde_json::from_slice(&data)
+            .map_err(|e| RpcError::Internal(format!("body decode: {e}")))
+            .map_err(ErrorObjectOwned::from)?;
+        let native_actions: Vec<serde_json::Value> = body
+            .native_actions
+            .iter()
+            .map(|a| serde_json::to_value(a).unwrap_or_default())
+            .collect();
+        Ok(Some(RpcBlockBody {
+            block_number: hex_u64(block_number),
+            native_actions,
+            native_action_count: body.native_actions.len() as u32,
+        }))
     }
 }
 

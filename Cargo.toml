@@ -16,6 +16,7 @@ members = [
     "crates/torus-node",
     "crates/torus-integration-tests",
     "crates/hotstuff_rs",
+    "crates/torus-explorer",
 ]
 
 [workspace.package]
