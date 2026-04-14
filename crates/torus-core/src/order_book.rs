@@ -10,12 +10,17 @@
 //! - Deterministic: same input sequence → same state
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::io::{self, Read as IoRead, Write as IoWrite};
 
+use borsh::{BorshDeserialize, BorshSerialize};
 use torus_types::{
     Address, FixedPoint, MarketId, OrderId, OrderType, PlaceOrderParams, Side, TimeInForce,
 };
 
 use crate::error::CoreError;
+use crate::position::{borsh_read_address, borsh_read_fp, borsh_write_address, borsh_write_fp};
+
+const MAX_ORDERS_PER_TRADER_PER_MARKET: usize = 200;
 
 // ============================================================================
 // Types
@@ -172,9 +177,57 @@ impl OrderBook {
             };
         }
 
+        // FIX 7 (ECON-FIND-10): Limit orders must have positive price
+        if matches!(params.order_type, OrderType::Limit) && params.price <= FixedPoint::ZERO {
+            return PlaceResult {
+                order_id,
+                status: OrderStatus::Rejected,
+                fills: vec![],
+                self_trade_cancels: vec![],
+            };
+        }
+
+        // FIX 8 (ECON-FIND-11): Enforce tick size for limit orders
+        if matches!(params.order_type, OrderType::Limit) && self.tick_size > FixedPoint::ZERO {
+            if params.price.raw() % self.tick_size.raw() != 0 {
+                return PlaceResult {
+                    order_id,
+                    status: OrderStatus::Rejected,
+                    fills: vec![],
+                    self_trade_cancels: vec![],
+                };
+            }
+        }
+
+        // FIX 10 (ECON-FIND-17): Limit orders per trader per market
+        let trader_order_count = self.trader_orders.get(&trader).map_or(0, |ids| ids.len());
+        if trader_order_count >= MAX_ORDERS_PER_TRADER_PER_MARKET {
+            return PlaceResult {
+                order_id,
+                status: OrderStatus::Rejected,
+                fills: vec![],
+                self_trade_cancels: vec![],
+            };
+        }
+
         // Stop orders → store in pending_stops
         match params.order_type {
             OrderType::StopMarket { trigger } => {
+                // FIX 9 (ECON-FIND-12): Validate trigger direction
+                if let Some(current_price) = self.last_trade_price {
+                    let invalid_trigger = match side {
+                        Side::Buy => trigger <= current_price,
+                        Side::Sell => trigger >= current_price,
+                    };
+                    if invalid_trigger {
+                        return PlaceResult {
+                            order_id,
+                            status: OrderStatus::Rejected,
+                            fills: vec![],
+                            self_trade_cancels: vec![],
+                        };
+                    }
+                }
                 self.pending_stops.push(StopOrder {
                     id: order_id,
                     trader,
@@ -196,6 +249,21 @@ impl OrderBook {
                 };
             }
             OrderType::StopLimit { trigger, limit } => {
+                // FIX 9 (ECON-FIND-12): Validate trigger direction
+                if let Some(current_price) = self.last_trade_price {
+                    let invalid_trigger = match side {
+                        Side::Buy => trigger <= current_price,
+                        Side::Sell => trigger >= current_price,
+                    };
+                    if invalid_trigger {
+                        return PlaceResult {
+                            order_id,
+                            status: OrderStatus::Rejected,
+                            fills: vec![],
+                            self_trade_cancels: vec![],
+                        };
+                    }
+                }
                 self.pending_stops.push(StopOrder {
                     id: order_id,
                     trader,
@@ -420,6 +488,10 @@ impl OrderBook {
         }
         if let Some(q) = new_qty {
             replacement.remaining_qty = q;
+            // FIX 21 (ECON-FIND-28): Update original_qty when quantity increases
+            if q > replacement.original_qty {
+                replacement.original_qty = q;
+            }
         }
         replacement.id = order_id;
 
@@ -436,6 +508,16 @@ impl OrderBook {
     // ========================================================================
     // Query Methods
     // ========================================================================
+
+    /// Get the next order ID counter value.
+    pub fn next_order_id(&self) -> OrderId {
+        self.next_id
+    }
+
+    /// Set the next order ID counter (for global ID coordination across markets).
+    pub fn set_next_order_id(&mut self, id: OrderId) {
+        self.next_id = id;
+    }
 
     /// Best (highest) bid price.
     pub fn best_bid(&self) -> Option<FixedPoint> {
@@ -772,6 +854,370 @@ impl OrderBook {
         }
 
         self.triggering_stops = false;
+    }
+}
+
+// ============================================================================
+// FIX 1 (ECON-FIND-02): Borsh Serialization for OrderBook
+// ============================================================================
+
+impl BorshSerialize for Order {
+    fn serialize<W: IoWrite>(&self, w: &mut W) -> io::Result<()> {
+        w.write_all(&self.id.to_be_bytes())?;
+        borsh_write_address(&self.trader, w)?;
+        w.write_all(&[match self.side {
+            Side::Buy => 0u8,
+            Side::Sell => 1u8,
+        }])?;
+        borsh_write_fp(&self.price, w)?;
+        borsh_write_fp(&self.remaining_qty, w)?;
+        borsh_write_fp(&self.original_qty, w)?;
+        // OrderType discriminant + variant data
+        match &self.order_type {
+            OrderType::Limit => w.write_all(&[0u8])?,
+            OrderType::Market => w.write_all(&[1u8])?,
+            OrderType::StopMarket { trigger } => {
+                w.write_all(&[2u8])?;
+                borsh_write_fp(trigger, w)?;
+            }
+            OrderType::StopLimit { trigger, limit } => {
+                w.write_all(&[3u8])?;
+                borsh_write_fp(trigger, w)?;
+                borsh_write_fp(limit, w)?;
+            }
+        }
+        // TimeInForce
+        w.write_all(&[match self.time_in_force {
+            TimeInForce::GTC => 0u8,
+            TimeInForce::IOC => 1u8,
+            TimeInForce::FOK => 2u8,
+            TimeInForce::PostOnly => 3u8,
+        }])?;
+        w.write_all(&self.timestamp.to_be_bytes())?;
+        w.write_all(&[u8::from(self.reduce_only)])?;
+        // Option<u64>
+        match self.client_order_id {
+            None => w.write_all(&[0u8])?,
+            Some(cid) => {
+                w.write_all(&[1u8])?;
+                w.write_all(&cid.to_be_bytes())?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl BorshDeserialize for Order {
+    fn deserialize_reader<R: IoRead>(r: &mut R) -> io::Result<Self> {
+        let mut id_buf = [0u8; 16];
+        r.read_exact(&mut id_buf)?;
+        let id = u128::from_be_bytes(id_buf);
+
+        let trader = borsh_read_address(r)?;
+
+        let mut side_buf = [0u8; 1];
+        r.read_exact(&mut side_buf)?;
+        let side = if side_buf[0] == 0 {
+            Side::Buy
+        } else {
+            Side::Sell
+        };
+
+        let price = borsh_read_fp(r)?;
+        let remaining_qty = borsh_read_fp(r)?;
+        let original_qty = borsh_read_fp(r)?;
+
+        let mut ot_buf = [0u8; 1];
+        r.read_exact(&mut ot_buf)?;
+        let order_type = match ot_buf[0] {
+            0 => OrderType::Limit,
+            1 => OrderType::Market,
+            2 => {
+                let trigger = borsh_read_fp(r)?;
+                OrderType::StopMarket { trigger }
+            }
+            3 => {
+                let trigger = borsh_read_fp(r)?;
+                let limit = borsh_read_fp(r)?;
+                OrderType::StopLimit { trigger, limit }
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid OrderType discriminant",
+                ))
+            }
+        };
+
+        let mut tif_buf = [0u8; 1];
+        r.read_exact(&mut tif_buf)?;
+        let time_in_force = match tif_buf[0] {
+            0 => TimeInForce::GTC,
+            1 => TimeInForce::IOC,
+            2 => TimeInForce::FOK,
+            3 => TimeInForce::PostOnly,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid TimeInForce discriminant",
+                ))
+            }
+        };
+
+        let mut ts_buf = [0u8; 8];
+        r.read_exact(&mut ts_buf)?;
+        let timestamp = u64::from_be_bytes(ts_buf);
+
+        let mut ro_buf = [0u8; 1];
+        r.read_exact(&mut ro_buf)?;
+        let reduce_only = ro_buf[0] != 0;
+
+        let mut cid_tag = [0u8; 1];
+        r.read_exact(&mut cid_tag)?;
+        let client_order_id = if cid_tag[0] == 0 {
+            None
+        } else {
+            let mut cid_buf = [0u8; 8];
+            r.read_exact(&mut cid_buf)?;
+            Some(u64::from_be_bytes(cid_buf))
+        };
+
+        Ok(Order {
+            id,
+            trader,
+            side,
+            price,
+            remaining_qty,
+            original_qty,
+            order_type,
+            time_in_force,
+            timestamp,
+            reduce_only,
+            client_order_id,
+        })
+    }
+}
+
+impl BorshSerialize for StopOrder {
+    fn serialize<W: IoWrite>(&self, w: &mut W) -> io::Result<()> {
+        w.write_all(&self.id.to_be_bytes())?;
+        borsh_write_address(&self.trader, w)?;
+        w.write_all(&self.market_id.to_be_bytes())?;
+        w.write_all(&[match self.side {
+            Side::Buy => 0u8,
+            Side::Sell => 1u8,
+        }])?;
+        borsh_write_fp(&self.trigger_price, w)?;
+        match &self.limit_price {
+            None => w.write_all(&[0u8])?,
+            Some(lp) => {
+                w.write_all(&[1u8])?;
+                borsh_write_fp(lp, w)?;
+            }
+        }
+        borsh_write_fp(&self.quantity, w)?;
+        w.write_all(&[match self.time_in_force {
+            TimeInForce::GTC => 0u8,
+            TimeInForce::IOC => 1u8,
+            TimeInForce::FOK => 2u8,
+            TimeInForce::PostOnly => 3u8,
+        }])?;
+        w.write_all(&self.timestamp.to_be_bytes())?;
+        w.write_all(&[u8::from(self.reduce_only)])?;
+        match self.client_order_id {
+            None => w.write_all(&[0u8])?,
+            Some(cid) => {
+                w.write_all(&[1u8])?;
+                w.write_all(&cid.to_be_bytes())?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl BorshDeserialize for StopOrder {
+    fn deserialize_reader<R: IoRead>(r: &mut R) -> io::Result<Self> {
+        let mut id_buf = [0u8; 16];
+        r.read_exact(&mut id_buf)?;
+        let id = u128::from_be_bytes(id_buf);
+
+        let trader = borsh_read_address(r)?;
+
+        let mut mid_buf = [0u8; 8];
+        r.read_exact(&mut mid_buf)?;
+        let market_id = u64::from_be_bytes(mid_buf);
+
+        let mut side_buf = [0u8; 1];
+        r.read_exact(&mut side_buf)?;
+        let side = if side_buf[0] == 0 {
+            Side::Buy
+        } else {
+            Side::Sell
+        };
+
+        let trigger_price = borsh_read_fp(r)?;
+
+        let mut lp_tag = [0u8; 1];
+        r.read_exact(&mut lp_tag)?;
+        let limit_price = if lp_tag[0] == 0 {
+            None
+        } else {
+            Some(borsh_read_fp(r)?)
+        };
+
+        let quantity = borsh_read_fp(r)?;
+
+        let mut tif_buf = [0u8; 1];
+        r.read_exact(&mut tif_buf)?;
+        let time_in_force = match tif_buf[0] {
+            0 => TimeInForce::GTC,
+            1 => TimeInForce::IOC,
+            2 => TimeInForce::FOK,
+            3 => TimeInForce::PostOnly,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid TimeInForce discriminant",
+                ))
+            }
+        };
+
+        let mut ts_buf = [0u8; 8];
+        r.read_exact(&mut ts_buf)?;
+        let timestamp = u64::from_be_bytes(ts_buf);
+
+        let mut ro_buf = [0u8; 1];
+        r.read_exact(&mut ro_buf)?;
+        let reduce_only = ro_buf[0] != 0;
+
+        let mut cid_tag = [0u8; 1];
+        r.read_exact(&mut cid_tag)?;
+        let client_order_id = if cid_tag[0] == 0 {
+            None
+        } else {
+            let mut cid_buf = [0u8; 8];
+            r.read_exact(&mut cid_buf)?;
+            Some(u64::from_be_bytes(cid_buf))
+        };
+
+        Ok(StopOrder {
+            id,
+            trader,
+            market_id,
+            side,
+            trigger_price,
+            limit_price,
+            quantity,
+            time_in_force,
+            timestamp,
+            reduce_only,
+            client_order_id,
+        })
+    }
+}
+
+impl BorshSerialize for OrderBook {
+    fn serialize<W: IoWrite>(&self, w: &mut W) -> io::Result<()> {
+        w.write_all(&self.market_id.to_be_bytes())?;
+        borsh_write_fp(&self.tick_size, w)?;
+        borsh_write_fp(&self.lot_size, w)?;
+        w.write_all(&self.next_id.to_be_bytes())?;
+
+        // last_trade_price: Option<FixedPoint>
+        match &self.last_trade_price {
+            None => w.write_all(&[0u8])?,
+            Some(ltp) => {
+                w.write_all(&[1u8])?;
+                borsh_write_fp(ltp, w)?;
+            }
+        }
+
+        // Collect all resting orders from bids and asks
+        let order_count: u32 =
+            (self.bids.values().map(|q| q.len()).sum::<usize>()
+                + self.asks.values().map(|q| q.len()).sum::<usize>()) as u32;
+        w.write_all(&order_count.to_be_bytes())?;
+
+        // Write bids (price ascending from BTreeMap iteration, but order within level is FIFO)
+        for queue in self.bids.values() {
+            for order in queue {
+                order.serialize(w)?;
+            }
+        }
+        // Write asks
+        for queue in self.asks.values() {
+            for order in queue {
+                order.serialize(w)?;
+            }
+        }
+
+        // Write pending stops
+        let stop_count = self.pending_stops.len() as u32;
+        w.write_all(&stop_count.to_be_bytes())?;
+        for stop in &self.pending_stops {
+            stop.serialize(w)?;
+        }
+
+        Ok(())
+    }
+}
+
+impl BorshDeserialize for OrderBook {
+    fn deserialize_reader<R: IoRead>(r: &mut R) -> io::Result<Self> {
+        let mut mid_buf = [0u8; 8];
+        r.read_exact(&mut mid_buf)?;
+        let market_id = u64::from_be_bytes(mid_buf);
+
+        let tick_size = borsh_read_fp(r)?;
+        let lot_size = borsh_read_fp(r)?;
+
+        let mut nid_buf = [0u8; 16];
+        r.read_exact(&mut nid_buf)?;
+        let next_id = u128::from_be_bytes(nid_buf);
+
+        let mut ltp_tag = [0u8; 1];
+        r.read_exact(&mut ltp_tag)?;
+        let last_trade_price = if ltp_tag[0] == 0 {
+            None
+        } else {
+            Some(borsh_read_fp(r)?)
+        };
+
+        // Read orders and rebuild the book
+        let mut oc_buf = [0u8; 4];
+        r.read_exact(&mut oc_buf)?;
+        let order_count = u32::from_be_bytes(oc_buf) as usize;
+
+        let mut book = OrderBook {
+            market_id,
+            bids: BTreeMap::new(),
+            asks: BTreeMap::new(),
+            order_index: HashMap::new(),
+            trader_orders: HashMap::new(),
+            pending_stops: Vec::new(),
+            tick_size,
+            lot_size,
+            next_id,
+            last_trade_price,
+            triggering_stops: false,
+        };
+
+        for _ in 0..order_count {
+            let order = Order::deserialize_reader(r)?;
+            book.insert_order(order);
+        }
+
+        // Read pending stops
+        let mut sc_buf = [0u8; 4];
+        r.read_exact(&mut sc_buf)?;
+        let stop_count = u32::from_be_bytes(sc_buf) as usize;
+
+        for _ in 0..stop_count {
+            let stop = StopOrder::deserialize_reader(r)?;
+            book.pending_stops.push(stop);
+        }
+
+        Ok(book)
     }
 }
 
@@ -1852,5 +2298,185 @@ mod tests {
         ob.place_order(limit_sell(fp(100), fp(10)), addr(1), 1);
         let r = ob.place_order(market_buy(fp_frac(0, 50_000_000)), addr(2), 2);
         assert_eq!(r.status, OrderStatus::Rejected);
+    }
+
+    // ====================================================================
+    // FIX 7 — Price validation for limit orders
+    // ====================================================================
+
+    #[test]
+    fn reject_zero_price_limit() {
+        let mut ob = book();
+        let r = ob.place_order(limit_buy(FixedPoint::ZERO, fp(10)), addr(1), 1);
+        assert_eq!(r.status, OrderStatus::Rejected);
+        assert_eq!(ob.order_count(), 0);
+    }
+
+    #[test]
+    fn reject_negative_price_limit() {
+        let mut ob = book();
+        let r = ob.place_order(
+            limit_buy(FixedPoint::from_raw(-100 * FixedPoint::SCALE), fp(10)),
+            addr(1),
+            1,
+        );
+        assert_eq!(r.status, OrderStatus::Rejected);
+        assert_eq!(ob.order_count(), 0);
+    }
+
+    // ====================================================================
+    // FIX 8 — Tick size enforcement
+    // ====================================================================
+
+    #[test]
+    fn reject_tick_size_violation() {
+        // Book with tick_size = 1.0 (fp(1))
+        let mut ob = OrderBook::new(1, fp(1), fp_frac(0, 1));
+        // Price 100.5 doesn't align to tick_size 1.0
+        // raw = 100 * SCALE + SCALE/2 = 10050000000
+        // tick_size raw = 1 * SCALE = 100000000
+        // 10050000000 % 100000000 = 50000000 != 0 => rejected
+        let r = ob.place_order(
+            limit_buy(fp_frac(100, FixedPoint::SCALE as i64 / 2), fp(10)),
+            addr(1),
+            1,
+        );
+        assert_eq!(r.status, OrderStatus::Rejected);
+    }
+
+    #[test]
+    fn accept_valid_tick_size() {
+        let mut ob = OrderBook::new(1, fp(1), fp_frac(0, 1));
+        let r = ob.place_order(limit_sell(fp(100), fp(10)), addr(1), 1);
+        assert_eq!(r.status, OrderStatus::Resting);
+    }
+
+    // ====================================================================
+    // FIX 9 — Stop order trigger direction validation
+    // ====================================================================
+
+    #[test]
+    fn reject_buy_stop_below_market() {
+        let mut ob = book();
+        // Create a last trade price by executing a fill
+        ob.place_order(limit_sell(fp(100), fp(5)), addr(1), 1);
+        ob.place_order(market_buy(fp(5)), addr(2), 2);
+        // last_trade_price is now 100
+
+        // Buy stop with trigger at 90 (below current) should be rejected
+        let r = ob.place_order(
+            PlaceOrderParams {
+                market_id: 1,
+                is_buy: true,
+                price: FixedPoint::ZERO,
+                quantity: fp(5),
+                order_type: OrderType::StopMarket { trigger: fp(90) },
+                time_in_force: TimeInForce::GTC,
+                reduce_only: false,
+                client_order_id: None,
+            },
+            addr(3),
+            3,
+        );
+        assert_eq!(r.status, OrderStatus::Rejected);
+    }
+
+    #[test]
+    fn accept_buy_stop_above_market() {
+        let mut ob = book();
+        ob.place_order(limit_sell(fp(100), fp(5)), addr(1), 1);
+        ob.place_order(market_buy(fp(5)), addr(2), 2);
+
+        // Buy stop with trigger at 110 (above current) should be accepted
+        let r = ob.place_order(
+            PlaceOrderParams {
+                market_id: 1,
+                is_buy: true,
+                price: FixedPoint::ZERO,
+                quantity: fp(5),
+                order_type: OrderType::StopMarket { trigger: fp(110) },
+                time_in_force: TimeInForce::GTC,
+                reduce_only: false,
+                client_order_id: None,
+            },
+            addr(3),
+            3,
+        );
+        assert_eq!(r.status, OrderStatus::PendingTrigger);
+    }
+
+    // ====================================================================
+    // FIX 10 — Max orders per trader per market
+    // ====================================================================
+
+    #[test]
+    fn reject_excess_orders_per_trader() {
+        let mut ob = book();
+        // Place MAX_ORDERS_PER_TRADER_PER_MARKET orders
+        for i in 0..MAX_ORDERS_PER_TRADER_PER_MARKET {
+            let price = fp(100) + FixedPoint::from_raw(i as i128 * FixedPoint::SCALE);
+            let r = ob.place_order(limit_sell(price, fp(1)), addr(1), i as u64);
+            assert_eq!(r.status, OrderStatus::Resting, "order {i} should rest");
+        }
+        // Next order should be rejected
+        let r = ob.place_order(limit_sell(fp(500), fp(1)), addr(1), 999);
+        assert_eq!(r.status, OrderStatus::Rejected);
+        // Different trader can still place
+        let r = ob.place_order(limit_sell(fp(500), fp(1)), addr(2), 999);
+        assert_eq!(r.status, OrderStatus::Resting);
+    }
+
+    // ====================================================================
+    // FIX 21 — original_qty updated on modify increase
+    // ====================================================================
+
+    #[test]
+    fn modify_increase_updates_original_qty() {
+        let mut ob = book();
+        ob.place_order(limit_sell(fp(100), fp(10)), addr(1), 1);
+
+        let modified = ob.modify_order(1, None, Some(fp(20))).unwrap();
+        assert_eq!(modified.remaining_qty, fp(20));
+        assert_eq!(modified.original_qty, fp(20)); // FIX 21: should be updated
+
+        // Verify on book too
+        let on_book = ob.get_order(1).unwrap();
+        assert_eq!(on_book.original_qty, fp(20));
+    }
+
+    // ====================================================================
+    // FIX 1 — Borsh serialization roundtrip
+    // ====================================================================
+
+    #[test]
+    fn order_book_serialize_deserialize_roundtrip() {
+        let mut ob = book();
+
+        // Place some orders
+        ob.place_order(limit_sell(fp(100), fp(10)), addr(1), 1);
+        ob.place_order(limit_sell(fp(101), fp(5)), addr(2), 2);
+        ob.place_order(limit_buy(fp(99), fp(8)), addr(3), 3);
+        ob.place_order(limit_buy(fp(98), fp(3)), addr(4), 4);
+
+        let original_count = ob.order_count();
+        let original_bid = ob.best_bid();
+        let original_ask = ob.best_ask();
+
+        // Serialize
+        let data = borsh::to_vec(&ob).unwrap();
+
+        // Deserialize
+        let restored: OrderBook = OrderBook::try_from_slice(&data).unwrap();
+
+        assert_eq!(restored.order_count(), original_count);
+        assert_eq!(restored.best_bid(), original_bid);
+        assert_eq!(restored.best_ask(), original_ask);
+        assert_eq!(restored.market_id, ob.market_id);
+
+        // Verify specific orders
+        assert!(restored.get_order(1).is_some());
+        assert_eq!(restored.get_order(1).unwrap().remaining_qty, fp(10));
+        assert!(restored.get_order(3).is_some());
+        assert_eq!(restored.get_order(3).unwrap().remaining_qty, fp(8));
     }
 }

@@ -14,6 +14,21 @@ pub enum CoreError {
     #[error("invalid price: must be positive for limit orders")]
     InvalidPrice,
 
+    #[error("price {price} not aligned to tick size {tick_size}")]
+    InvalidTickSize {
+        price: FixedPoint,
+        tick_size: FixedPoint,
+    },
+
+    #[error("invalid trigger price for stop order")]
+    InvalidTriggerPrice,
+
+    #[error("max orders per trader exceeded: {count} >= {max}")]
+    MaxOrdersExceeded { count: usize, max: usize },
+
+    #[error("invalid oracle price for market {market_id}: must be positive")]
+    InvalidOraclePrice { market_id: MarketId },
+
     #[error("dust order: quantity {qty} below lot size {lot_size}")]
     DustOrder {
         qty: FixedPoint,

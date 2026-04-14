@@ -11,6 +11,7 @@ torus-core = { workspace = true }
 torus-state = { workspace = true }
 torus-economics = { workspace = true }
 
+borsh = { workspace = true }
 alloy-primitives = { workspace = true }
 alloy-consensus = { workspace = true, features = ["k256"] }
 alloy-rlp = { workspace = true }

@@ -185,7 +185,9 @@ impl MarginEngine {
         let bal = positions.get_native_balance(trader)?;
         let all_pos = positions.positions_for_trader(trader)?;
 
-        let mut equity = bal.available;
+        // FIX 3 (ECON-FIND-08): Subtract order_margin to avoid double-counting
+        // funds committed to open orders as free equity.
+        let mut equity = bal.available - bal.order_margin;
         for pos in &all_pos {
             if pos.margin_type != MarginType::Cross {
                 continue;
@@ -217,7 +219,8 @@ impl MarginEngine {
                 let lev_fp = FixedPoint::from_raw(max_lev as i128 * FixedPoint::SCALE);
                 let initial = notional / lev_fp;
                 // Maintenance = initial * maintenance_factor_bps / 10000
-                let maint_num = FixedPoint::from_raw(config.maintenance_factor_bps as i128);
+                // FIX 4 (ECON-PF-10): Scale maint_num correctly as a FixedPoint value
+                let maint_num = FixedPoint::from_raw(config.maintenance_factor_bps as i128 * FixedPoint::SCALE);
                 let bps_denom = FixedPoint::from_raw(10_000 * FixedPoint::SCALE);
                 total = total + initial * maint_num / bps_denom;
             }
@@ -235,7 +238,8 @@ impl MarginEngine {
         let max_lev = effective_max_leverage(&config.tiers, notional);
         let lev_fp = FixedPoint::from_raw(max_lev as i128 * FixedPoint::SCALE);
         let initial_margin = notional / lev_fp;
-        let maint_num = FixedPoint::from_raw(config.maintenance_factor_bps as i128);
+        // FIX 4 (ECON-PF-10): Scale maint_num correctly as a FixedPoint value
+        let maint_num = FixedPoint::from_raw(config.maintenance_factor_bps as i128 * FixedPoint::SCALE);
         let bps_denom = FixedPoint::from_raw(10_000 * FixedPoint::SCALE);
         let maintenance = initial_margin * maint_num / bps_denom;
 
@@ -415,5 +419,100 @@ mod tests {
         assert_eq!(effective_max_leverage(&tiers, fp(500_000)), 20);
         assert_eq!(effective_max_leverage(&tiers, fp(5_000_000)), 10);
         assert_eq!(effective_max_leverage(&tiers, fp(50_000_000)), 5);
+    }
+
+    // FIX 3: Cross-margin equity subtracts order_margin
+    #[test]
+    fn cross_margin_equity_deducts_order_margin() {
+        let (_dir, pm) = setup();
+        let trader = addr(1);
+
+        pm.put_native_balance(
+            &trader,
+            &NativeBalance {
+                available: fp(10_000),
+                order_margin: fp(3_000),
+            },
+        )
+        .unwrap();
+
+        let oracle_prices: Vec<(u64, FixedPoint)> = vec![];
+        let equity =
+            MarginEngine::cross_margin_equity(&pm, &trader, &oracle_prices).unwrap();
+        // equity = available - order_margin = 10000 - 3000 = 7000
+        assert_eq!(equity, fp(7_000));
+    }
+
+    // FIX 4: Maintenance margin BPS scaling is correct
+    #[test]
+    fn maintenance_margin_correct_scaling() {
+        let (_dir, pm) = setup();
+        let trader = addr(1);
+
+        pm.put_native_balance(
+            &trader,
+            &NativeBalance {
+                available: fp(100_000),
+                order_margin: FixedPoint::ZERO,
+            },
+        )
+        .unwrap();
+
+        // Position: 1 BTC at $50,000
+        pm.put_position(&Position {
+            trader,
+            market_id: 1,
+            is_long: true,
+            size: fp(1),
+            entry_price: fp(50_000),
+            realized_pnl: FixedPoint::ZERO,
+            isolated_margin: FixedPoint::ZERO,
+            margin_type: MarginType::Cross,
+        })
+        .unwrap();
+
+        let config = MarketMarginConfig::new(1, 50);
+        // maintenance_factor_bps = 5000 (50%)
+        let oracle_prices = vec![(1u64, fp(50_000))];
+
+        let maint = MarginEngine::total_maintenance_margin(
+            &pm,
+            &trader,
+            &config,
+            &oracle_prices,
+        )
+        .unwrap();
+
+        // Notional = 1 * 50000 = 50000
+        // Tier: 50000 <= 100000 → max_leverage = 50
+        // Initial = 50000 / 50 = 1000
+        // Maintenance = 1000 * 5000 / 10000 = 500
+        assert_eq!(maint, fp(500));
+    }
+
+    // FIX 4: Isolated maintenance check with correct BPS
+    #[test]
+    fn isolated_maintenance_correct_bps() {
+        let pos = Position {
+            trader: addr(1),
+            market_id: 1,
+            is_long: true,
+            size: fp(1),
+            entry_price: fp(50_000),
+            realized_pnl: FixedPoint::ZERO,
+            isolated_margin: fp(600), // above 500 maintenance
+            margin_type: MarginType::Isolated,
+        };
+        let config = MarketMarginConfig::new(1, 50);
+
+        // At mark price 50000: maintenance = 500, isolated_margin + upnl = 600 + 0 = 600
+        assert!(MarginEngine::check_isolated_maintenance(&pos, fp(50_000), &config));
+
+        // With less margin: 400 < 500 → should fail
+        let pos2 = Position {
+            isolated_margin: fp(400),
+            ..pos.clone()
+        };
+        assert!(!MarginEngine::check_isolated_maintenance(&pos2, fp(50_000), &config));
     }
 }

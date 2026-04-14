@@ -83,6 +83,22 @@ pub enum EconomicsError {
     #[error("treasury insufficient balance: have {have}, need {need}")]
     InsufficientTreasury { have: U256, need: U256 },
 
+    #[error("governance parameter not modifiable: {0}")]
+    ParameterNotModifiable(String),
+
+    #[error("invalid parameter value for {key}: {reason}")]
+    InvalidParameterValue { key: String, reason: String },
+
+    #[error("proposal {proposal_id} timelock not expired: executable after block {executable_after}, current {current_block}")]
+    TimelockNotExpired {
+        proposal_id: u64,
+        executable_after: u64,
+        current_block: u64,
+    },
+
+    #[error("proposal {0} not in Passed status")]
+    ProposalNotPassed(u64),
+
     // Slashing & Jailing errors (Phase 3: 3.1)
 
     #[error("validator {0} is not jailed")]

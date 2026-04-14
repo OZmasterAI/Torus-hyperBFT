@@ -11,9 +11,9 @@ use std::collections::HashMap;
 use alloy_primitives::{Address, B256};
 use torus_core::liquidation::LiquidationEngine;
 use torus_core::lockbox::{fp_to_u256, u256_to_fp, Lockbox};
-use torus_core::margin::MarketMarginConfig;
+use torus_core::margin::{effective_max_leverage, MarketMarginConfig};
 use torus_core::oracle::{OracleConfig, OracleManager};
-use torus_core::order_book::OrderBook;
+use torus_core::order_book::{OrderBook, OrderStatus};
 use torus_core::position::{MarginType, PositionManager};
 use torus_core::precompiles::{CoreWriterQueue, QueuedAction, QueuedActionKind};
 use torus_economics::{
@@ -81,6 +81,8 @@ pub struct NativeExecContext {
     pub order_books: HashMap<MarketId, OrderBook>,
     /// Per-market margin configuration.
     pub margin_configs: HashMap<MarketId, MarketMarginConfig>,
+    /// FIX 6 (ECON-FIND-09): Global order ID counter shared across all markets.
+    pub next_global_order_id: u128,
 
     // Block metadata
     pub block_height: u64,
@@ -114,14 +116,18 @@ impl NativeExecContext {
         let staking = StakingManager::new(state_db.clone());
         let governance = GovernanceManager::new(state_db.clone());
 
+        // FIX 1 (ECON-FIND-02): Load persisted order books from DB on startup.
+        let (order_books, next_global_order_id) = Self::load_order_books(&state_db);
+
         Self {
             positions,
             oracle,
             staking,
             governance,
             state_db,
-            order_books: HashMap::new(),
+            order_books,
             margin_configs: HashMap::new(),
+            next_global_order_id,
             block_height,
             timestamp,
             epoch,
@@ -131,6 +137,57 @@ impl NativeExecContext {
             treasury_address,
             dev_pool_address,
             total_native_fees: 0,
+        }
+    }
+
+    /// FIX 1 (ECON-FIND-02): Load order books from DB. Returns (books, next_global_order_id).
+    fn load_order_books(state_db: &StateDb) -> (HashMap<MarketId, OrderBook>, u128) {
+        use borsh::BorshDeserialize;
+        use torus_state::cf::CF_NATIVE_ORDER_BOOKS;
+
+        let mut books = HashMap::new();
+        let mut max_order_id: u128 = 0;
+
+        let db = state_db.inner();
+        if let Some(cf) = db.cf_handle(CF_NATIVE_ORDER_BOOKS) {
+            let iter = db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+            for item in iter {
+                if let Ok((key, value)) = item {
+                    if key.len() == 8 {
+                        let market_id = u64::from_be_bytes(key[..8].try_into().unwrap());
+                        if let Ok(book) = OrderBook::try_from_slice(&value) {
+                            let book_next_id = book.next_order_id();
+                            if book_next_id > max_order_id {
+                                max_order_id = book_next_id;
+                            }
+                            books.insert(market_id, book);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Global ID starts at max found + 1 (or 1 if no books loaded)
+        let next_id = if max_order_id > 0 { max_order_id } else { 1 };
+        (books, next_id)
+    }
+
+    /// FIX 1 (ECON-FIND-02): Persist all order books to DB. Called after block execution.
+    pub fn save_order_books(&self) {
+        use torus_state::cf::CF_NATIVE_ORDER_BOOKS;
+
+        for (&market_id, book) in &self.order_books {
+            let key = market_id.to_be_bytes();
+            match borsh::to_vec(book) {
+                Ok(data) => {
+                    if let Err(e) = self.state_db.put_cf_raw(CF_NATIVE_ORDER_BOOKS, &key, &data) {
+                        tracing::error!(market_id, %e, "failed to persist order book");
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(market_id, %e, "failed to serialize order book");
+                }
+            }
         }
     }
 }
@@ -252,6 +309,44 @@ impl NativeExecutor {
         params: &PlaceOrderParams,
     ) -> NativeActionResult {
         let market_id = params.market_id;
+        let is_market = matches!(params.order_type, OrderType::Market);
+
+        // FIX 2 (ECON-FIND-05): Reserve order margin before placing the order.
+        // For market orders, margin is settled at fill time (no resting order).
+        let order_margin_required = if !is_market && params.price > FixedPoint::ZERO {
+            let notional = params.price * params.quantity;
+            let max_lev = ctx
+                .margin_configs
+                .get(&market_id)
+                .map(|c| effective_max_leverage(&c.tiers, notional))
+                .unwrap_or(20);
+            let lev_fp = FixedPoint::from_raw(max_lev as i128 * FixedPoint::SCALE);
+            notional / lev_fp
+        } else {
+            FixedPoint::ZERO
+        };
+
+        if order_margin_required > FixedPoint::ZERO {
+            match ctx.positions.get_native_balance(sender) {
+                Ok(mut bal) => {
+                    if bal.available < order_margin_required {
+                        return NativeActionResult::err(
+                            "place_order",
+                            format!(
+                                "insufficient margin: need {order_margin_required}, have {}",
+                                bal.available
+                            ),
+                        );
+                    }
+                    bal.available = bal.available - order_margin_required;
+                    bal.order_margin = bal.order_margin + order_margin_required;
+                    if let Err(e) = ctx.positions.put_native_balance(sender, &bal) {
+                        return NativeActionResult::err("place_order", e.to_string());
+                    }
+                }
+                Err(e) => return NativeActionResult::err("place_order", e.to_string()),
+            }
+        }
 
         // Get or create order book for this market.
         let book = ctx
@@ -259,28 +354,72 @@ impl NativeExecutor {
             .entry(market_id)
             .or_insert_with(|| OrderBook::new(market_id, FixedPoint::ONE, FixedPoint::ONE));
 
+        // FIX 6 (ECON-FIND-09): Sync global order ID counter to prevent cross-market collisions.
+        book.set_next_order_id(ctx.next_global_order_id);
         let result = book.place_order(params.clone(), *sender, ctx.timestamp);
+        ctx.next_global_order_id = book.next_order_id();
+
+        // FIX 2: Release margin for the filled portion; keep reserved for resting.
+        if order_margin_required > FixedPoint::ZERO {
+            let order_rests = matches!(
+                result.status,
+                OrderStatus::Resting | OrderStatus::PartiallyFilled | OrderStatus::PendingTrigger
+            );
+            let filled_qty: FixedPoint = result
+                .fills
+                .iter()
+                .map(|f| f.quantity)
+                .fold(FixedPoint::ZERO, |a, b| a + b);
+
+            let margin_to_release = if !order_rests {
+                // Fully filled, cancelled, or rejected — release all reserved margin
+                order_margin_required
+            } else if filled_qty > FixedPoint::ZERO {
+                // Partially filled — release proportional margin
+                order_margin_required * filled_qty / params.quantity
+            } else {
+                FixedPoint::ZERO
+            };
+
+            if margin_to_release > FixedPoint::ZERO {
+                if let Ok(mut bal) = ctx.positions.get_native_balance(sender) {
+                    bal.order_margin = bal.order_margin - margin_to_release;
+                    bal.available = bal.available + margin_to_release;
+                    let _ = ctx.positions.put_native_balance(sender, &bal);
+                }
+            }
+        }
 
         // Apply fills to position manager.
+        // FIX 22 (ECON-FIND-23): Propagate fill errors instead of discarding them.
         for fill in &result.fills {
-            // Taker side is opposite of maker side.
             let taker_is_buy = fill.maker_side != Side::Buy;
-            let _ = ctx.positions.apply_fill(
+            if let Err(e) = ctx.positions.apply_fill(
                 &fill.taker,
                 market_id,
                 taker_is_buy,
                 fill.quantity,
                 fill.price,
                 MarginType::Cross,
-            );
-            let _ = ctx.positions.apply_fill(
+            ) {
+                return NativeActionResult::err(
+                    "place_order",
+                    format!("taker fill failed: {e}"),
+                );
+            }
+            if let Err(e) = ctx.positions.apply_fill(
                 &fill.maker,
                 market_id,
                 fill.maker_side == Side::Buy,
                 fill.quantity,
                 fill.price,
                 MarginType::Cross,
-            );
+            ) {
+                return NativeActionResult::err(
+                    "place_order",
+                    format!("maker fill failed: {e}"),
+                );
+            }
         }
 
         NativeActionResult::ok("place_order", 1000)
@@ -288,7 +427,26 @@ impl NativeExecutor {
 
     fn exec_cancel_order(ctx: &mut NativeExecContext, order_id: u128) -> NativeActionResult {
         for book in ctx.order_books.values_mut() {
-            if book.cancel_order(order_id).is_ok() {
+            if let Ok(cancelled) = book.cancel_order(order_id) {
+                // FIX 2 (ECON-FIND-05): Release order margin on cancel.
+                let notional = cancelled.price * cancelled.remaining_qty;
+                let market_id = book.market_id;
+                let max_lev = ctx
+                    .margin_configs
+                    .get(&market_id)
+                    .map(|c| effective_max_leverage(&c.tiers, notional))
+                    .unwrap_or(20);
+                let lev_fp = FixedPoint::from_raw(max_lev as i128 * FixedPoint::SCALE);
+                let margin_to_release = notional / lev_fp;
+
+                if margin_to_release > FixedPoint::ZERO {
+                    if let Ok(mut bal) = ctx.positions.get_native_balance(&cancelled.trader) {
+                        let release = margin_to_release.min(bal.order_margin);
+                        bal.order_margin = bal.order_margin - release;
+                        bal.available = bal.available + release;
+                        let _ = ctx.positions.put_native_balance(&cancelled.trader, &bal);
+                    }
+                }
                 return NativeActionResult::ok("cancel_order", 500);
             }
         }
@@ -300,18 +458,55 @@ impl NativeExecutor {
         sender: &Address,
         market_id: Option<MarketId>,
     ) -> NativeActionResult {
+        // FIX 2 (ECON-FIND-05): Compute total margin to release from cancelled orders.
+        let mut total_margin_release = FixedPoint::ZERO;
+
         match market_id {
             Some(mid) => {
                 if let Some(book) = ctx.order_books.get_mut(&mid) {
-                    book.cancel_all(*sender, Some(mid));
+                    let cancelled = book.cancel_all(*sender, Some(mid));
+                    for order in &cancelled {
+                        let notional = order.price * order.remaining_qty;
+                        let max_lev = ctx
+                            .margin_configs
+                            .get(&mid)
+                            .map(|c| effective_max_leverage(&c.tiers, notional))
+                            .unwrap_or(20);
+                        let lev_fp = FixedPoint::from_raw(max_lev as i128 * FixedPoint::SCALE);
+                        total_margin_release = total_margin_release + notional / lev_fp;
+                    }
                 }
             }
             None => {
-                for book in ctx.order_books.values_mut() {
-                    book.cancel_all(*sender, None);
+                let market_ids: Vec<MarketId> = ctx.order_books.keys().copied().collect();
+                for mid in market_ids {
+                    if let Some(book) = ctx.order_books.get_mut(&mid) {
+                        let cancelled = book.cancel_all(*sender, None);
+                        for order in &cancelled {
+                            let notional = order.price * order.remaining_qty;
+                            let max_lev = ctx
+                                .margin_configs
+                                .get(&mid)
+                                .map(|c| effective_max_leverage(&c.tiers, notional))
+                                .unwrap_or(20);
+                            let lev_fp =
+                                FixedPoint::from_raw(max_lev as i128 * FixedPoint::SCALE);
+                            total_margin_release = total_margin_release + notional / lev_fp;
+                        }
+                    }
                 }
             }
         }
+
+        if total_margin_release > FixedPoint::ZERO {
+            if let Ok(mut bal) = ctx.positions.get_native_balance(sender) {
+                let release = total_margin_release.min(bal.order_margin);
+                bal.order_margin = bal.order_margin - release;
+                bal.available = bal.available + release;
+                let _ = ctx.positions.put_native_balance(sender, &bal);
+            }
+        }
+
         NativeActionResult::ok("cancel_all", 500)
     }
 
@@ -322,7 +517,57 @@ impl NativeExecutor {
         new_qty: Option<FixedPoint>,
     ) -> NativeActionResult {
         for book in ctx.order_books.values_mut() {
-            if book.modify_order(order_id, new_price, new_qty).is_ok() {
+            // Capture old order state for margin delta calculation.
+            let old_order = book.get_order(order_id).cloned();
+            if let Ok(modified) = book.modify_order(order_id, new_price, new_qty) {
+                // FIX 2 (ECON-FIND-05): Adjust order margin for the modified order.
+                if let Some(old) = old_order {
+                    let market_id = book.market_id;
+                    let old_notional = old.price * old.remaining_qty;
+                    let new_notional = modified.price * modified.remaining_qty;
+
+                    let max_lev_old = ctx
+                        .margin_configs
+                        .get(&market_id)
+                        .map(|c| effective_max_leverage(&c.tiers, old_notional))
+                        .unwrap_or(20);
+                    let max_lev_new = ctx
+                        .margin_configs
+                        .get(&market_id)
+                        .map(|c| effective_max_leverage(&c.tiers, new_notional))
+                        .unwrap_or(20);
+
+                    let old_margin = old_notional
+                        / FixedPoint::from_raw(max_lev_old as i128 * FixedPoint::SCALE);
+                    let new_margin = new_notional
+                        / FixedPoint::from_raw(max_lev_new as i128 * FixedPoint::SCALE);
+
+                    if new_margin > old_margin {
+                        let delta = new_margin - old_margin;
+                        if let Ok(mut bal) = ctx.positions.get_native_balance(&modified.trader) {
+                            if bal.available < delta {
+                                return NativeActionResult::err(
+                                    "modify_order",
+                                    format!(
+                                        "insufficient margin for modify: need {delta}, have {}",
+                                        bal.available
+                                    ),
+                                );
+                            }
+                            bal.available = bal.available - delta;
+                            bal.order_margin = bal.order_margin + delta;
+                            let _ = ctx.positions.put_native_balance(&modified.trader, &bal);
+                        }
+                    } else if old_margin > new_margin {
+                        let delta = old_margin - new_margin;
+                        if let Ok(mut bal) = ctx.positions.get_native_balance(&modified.trader) {
+                            let release = delta.min(bal.order_margin);
+                            bal.order_margin = bal.order_margin - release;
+                            bal.available = bal.available + release;
+                            let _ = ctx.positions.put_native_balance(&modified.trader, &bal);
+                        }
+                    }
+                }
                 return NativeActionResult::ok("modify_order", 800);
             }
         }
@@ -491,6 +736,28 @@ impl NativeExecutor {
         prices: &[(MarketId, FixedPoint)],
         _submission_timestamp: u64,
     ) -> NativeActionResult {
+        // FIX 18 (ECON-FIND-19): Verify sender is an active, non-jailed validator.
+        match ctx.staking.get_validator(sender) {
+            Ok(Some(v)) => {
+                use torus_economics::types::ValidatorStatus;
+                if v.status != ValidatorStatus::Active {
+                    return NativeActionResult::err(
+                        "submit_oracle_prices",
+                        format!("validator {sender} is not active (status: {:?})", v.status),
+                    );
+                }
+            }
+            Ok(None) => {
+                return NativeActionResult::err(
+                    "submit_oracle_prices",
+                    format!("{sender} is not a registered validator"),
+                );
+            }
+            Err(e) => {
+                return NativeActionResult::err("submit_oracle_prices", e.to_string());
+            }
+        }
+
         for &(market_id, price) in prices {
             if let Err(e) =
                 ctx.oracle
@@ -560,13 +827,28 @@ impl NativeExecutor {
         proposal_id: u64,
         option: VoteOption,
     ) -> NativeActionResult {
-        let support = matches!(option, VoteOption::Yes);
-        match ctx
-            .governance
-            .cast_vote(*sender, proposal_id, support, ctx.block_height)
-        {
-            Ok(()) => NativeActionResult::ok("vote", 2000),
-            Err(e) => NativeActionResult::err("vote", e.to_string()),
+        // FIX 20 (ECON-PF-03): Abstain votes are handled separately so they
+        // contribute to quorum without affecting the yes/no tally.
+        match option {
+            VoteOption::Abstain => {
+                match ctx
+                    .governance
+                    .cast_vote_abstain(*sender, proposal_id, ctx.block_height)
+                {
+                    Ok(()) => NativeActionResult::ok("vote", 2000),
+                    Err(e) => NativeActionResult::err("vote", e.to_string()),
+                }
+            }
+            _ => {
+                let support = matches!(option, VoteOption::Yes);
+                match ctx
+                    .governance
+                    .cast_vote(*sender, proposal_id, support, ctx.block_height)
+                {
+                    Ok(()) => NativeActionResult::ok("vote", 2000),
+                    Err(e) => NativeActionResult::err("vote", e.to_string()),
+                }
+            }
         }
     }
 
@@ -698,11 +980,18 @@ impl NativeExecutor {
                 }
             };
 
-            let oracle_price = oracle_prices
+            // FIX 5 (ECON-PF-06): Skip liquidation if no valid oracle price.
+            let oracle_price = match oracle_prices
                 .iter()
                 .find(|(mid, _)| *mid == *market_id)
                 .map(|(_, p)| *p)
-                .unwrap_or(FixedPoint::ZERO);
+            {
+                Some(p) if p > FixedPoint::ZERO => p,
+                _ => {
+                    tracing::warn!(market_id, "skipping liquidations: no valid oracle price");
+                    continue;
+                }
+            };
 
             for liq in &liquidations {
                 match LiquidationEngine::execute_liquidation(&ctx.positions, liq, oracle_price) {

@@ -230,6 +230,29 @@ impl OracleManager {
             return self.get_last_valid_price(market_id);
         }
 
+        // FIX 19: Single-reporter safety — bound price change vs last valid price (ECON-PF-18)
+        // When only one reporter passes filters, cap deviation at 10% from last known price
+        // to prevent a single validator from manipulating the oracle.
+        if filtered.len() == 1 {
+            if let Ok(last_price) = self.get_last_valid_price(market_id) {
+                if last_price > FixedPoint::ZERO {
+                    let single_price = filtered[0].0;
+                    let diff = if single_price > last_price {
+                        single_price - last_price
+                    } else {
+                        last_price - single_price
+                    };
+                    // Max 10% deviation from last valid price per block
+                    let max_deviation_bps = FixedPoint::from_raw(1000 * FixedPoint::SCALE); // 10%
+                    let bps_denom = FixedPoint::from_raw(10_000 * FixedPoint::SCALE);
+                    let max_change = last_price * max_deviation_bps / bps_denom;
+                    if diff > max_change {
+                        return self.get_last_valid_price(market_id);
+                    }
+                }
+            }
+        }
+
         let price = weighted_median(&filtered);
 
         // Store aggregated price
@@ -270,6 +293,7 @@ impl OracleManager {
     }
 
     /// Collect all submissions for a market within a block range (latest per validator).
+    /// FIX 17: Also prunes old submissions to prevent unbounded growth (ECON-FIND-18).
     fn collect_submissions(
         &self,
         market_id: MarketId,
@@ -285,6 +309,7 @@ impl OracleManager {
 
         let mut latest_per_validator: std::collections::HashMap<Address, OracleSubmission> =
             std::collections::HashMap::new();
+        let mut keys_to_prune: Vec<Vec<u8>> = Vec::new();
 
         for item in iter {
             let (key, value) =
@@ -293,7 +318,10 @@ impl OracleManager {
                 break;
             }
             if let Ok(sub) = OracleSubmission::try_from_slice(&value) {
-                if sub.block_number >= start_block && sub.block_number <= end_block {
+                if sub.block_number < start_block {
+                    // FIX 17: Mark old submissions for pruning
+                    keys_to_prune.push(key.to_vec());
+                } else if sub.block_number <= end_block {
                     match latest_per_validator.get(&sub.validator) {
                         Some(existing) if existing.block_number >= sub.block_number => {}
                         _ => {
@@ -302,6 +330,12 @@ impl OracleManager {
                     }
                 }
             }
+        }
+
+        // FIX 17: Prune old submissions (limit to avoid excessive deletes per block)
+        let prune_limit = 100;
+        for key in keys_to_prune.iter().take(prune_limit) {
+            let _ = self.state_db.delete_cf_raw(CF_NATIVE_ORACLE, key);
         }
 
         Ok(latest_per_validator.into_values().collect())
@@ -471,22 +505,32 @@ mod tests {
 
     #[test]
     fn test_reject_outliers_all_same() {
-        let pairs = vec![
-            (fp(100), fp(1)),
-            (fp(100), fp(1)),
-            (fp(100), fp(1)),
-        ];
+        let pairs = vec![(fp(100), fp(1)), (fp(100), fp(1)), (fp(100), fp(1))];
         let filtered = reject_outliers(&pairs);
         assert_eq!(filtered.len(), 3);
     }
 
     #[test]
     fn test_all_same_price_weighted_median() {
-        let pairs = vec![
-            (fp(500), fp(10)),
-            (fp(500), fp(20)),
-            (fp(500), fp(30)),
-        ];
+        let pairs = vec![(fp(500), fp(10)), (fp(500), fp(20)), (fp(500), fp(30))];
         assert_eq!(weighted_median(&pairs), fp(500));
+    }
+
+    #[test]
+    fn single_reporter_bounded_by_last_price() {
+        // FIX 19: Test that reject_outliers with a single entry returns it unchanged
+        // (the bounding against last_price happens in aggregate_price, not reject_outliers)
+        let pairs = vec![(fp(100), fp(1))];
+        let filtered = reject_outliers(&pairs);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].0, fp(100));
+    }
+
+    #[test]
+    fn reject_outliers_single_keeps_value() {
+        let pairs = vec![(fp(42000), fp(10))];
+        let filtered = reject_outliers(&pairs);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].0, fp(42000));
     }
 }

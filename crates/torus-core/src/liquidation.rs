@@ -58,6 +58,9 @@ pub struct AdlResult {
 
 const INSURANCE_FUND_KEY: &[u8] = b"insurance_fund";
 
+/// Liquidation penalty rate in basis points (e.g., 250 = 2.5%)
+const DEFAULT_LIQUIDATION_PENALTY_BPS: i128 = 250;
+
 // ============================================================================
 // LiquidationEngine
 // ============================================================================
@@ -83,9 +86,13 @@ impl LiquidationEngine {
             // Check cross-margin positions as a group
             let has_cross = all_pos.iter().any(|p| p.margin_type == MarginType::Cross);
             if has_cross {
-                if let Some(liq) =
-                    Self::check_cross_liquidation(positions, trader, &all_pos, config, oracle_prices)?
-                {
+                if let Some(liq) = Self::check_cross_liquidation(
+                    positions,
+                    trader,
+                    &all_pos,
+                    config,
+                    oracle_prices,
+                )? {
                     liquidations.extend(liq);
                 }
             }
@@ -93,8 +100,7 @@ impl LiquidationEngine {
             // Check isolated positions individually
             for pos in &all_pos {
                 if pos.margin_type == MarginType::Isolated {
-                    if let Some(liq) =
-                        Self::check_isolated_liquidation(pos, config, oracle_prices)?
+                    if let Some(liq) = Self::check_isolated_liquidation(pos, config, oracle_prices)?
                     {
                         liquidations.push(liq);
                     }
@@ -151,9 +157,10 @@ impl LiquidationEngine {
             .find(|(mid, _)| *mid == pos.market_id)
             .map(|(_, p)| *p);
 
+        // FIX 5: Reject zero/negative oracle prices (ECON-PF-06)
         let mark = match mark {
-            Some(p) => p,
-            None => return Ok(None), // No oracle price, skip
+            Some(p) if p > FixedPoint::ZERO => p,
+            _ => return Ok(None), // No valid oracle price, skip
         };
 
         if MarginEngine::check_isolated_maintenance(pos, mark, config) {
@@ -166,7 +173,8 @@ impl LiquidationEngine {
         let max_lev = effective_max_leverage(&config.tiers, notional);
         let lev_fp = FixedPoint::from_raw(max_lev as i128 * FixedPoint::SCALE);
         let initial_margin = notional / lev_fp;
-        let maint_num = FixedPoint::from_raw(config.maintenance_factor_bps as i128);
+        let maint_num =
+            FixedPoint::from_raw(config.maintenance_factor_bps as i128 * FixedPoint::SCALE);
         let bps_denom = FixedPoint::from_raw(10_000 * FixedPoint::SCALE);
         let maintenance = initial_margin * maint_num / bps_denom;
 
@@ -187,12 +195,31 @@ impl LiquidationEngine {
         liquidation: &Liquidation,
         oracle_price: FixedPoint,
     ) -> Result<LiquidationResult, CoreError> {
+        // FIX 5: Reject zero/negative oracle prices (ECON-PF-06)
+        if oracle_price <= FixedPoint::ZERO {
+            return Err(CoreError::InvalidOraclePrice {
+                market_id: liquidation.market_id,
+            });
+        }
+
         let pos = &liquidation.position;
         let pnl = pos.unrealized_pnl(oracle_price);
+        let notional = pos.notional(oracle_price);
 
-        // Credit/debit PnL to trader balance
+        // FIX 11: Compute and credit liquidation penalty to insurance fund (ECON-FIND-04)
+        let penalty_bps = FixedPoint::from_raw(DEFAULT_LIQUIDATION_PENALTY_BPS * FixedPoint::SCALE);
+        let bps_denom = FixedPoint::from_raw(10_000 * FixedPoint::SCALE);
+        let liquidation_penalty = notional * penalty_bps / bps_denom;
+
+        // Credit insurance fund
+        let state_db = positions.state_db();
+        let mut fund_balance = Self::get_insurance_fund(state_db)?;
+        fund_balance = fund_balance + liquidation_penalty;
+        Self::set_insurance_fund(state_db, fund_balance)?;
+
+        // Credit/debit PnL to trader balance, minus the penalty
         let mut bal = positions.get_native_balance(&pos.trader)?;
-        bal.available = bal.available + pnl;
+        bal.available = bal.available + pnl - liquidation_penalty;
 
         // For isolated margin, return isolated_margin to balance before accounting
         if pos.margin_type == MarginType::Isolated {
@@ -357,8 +384,37 @@ impl LiquidationEngine {
             return Ok(()); // No traders to spread across
         }
 
-        for (trader, size) in &traders_with_size {
-            let share = *size / total_size;
+        // FIX 12: Filter out traders with insufficient balance (ECON-FIND-13)
+        // Only include traders whose available balance covers at least 2x their
+        // share of the loss, preventing cascading into already-underwater accounts.
+        let two = FixedPoint::from_raw(2 * FixedPoint::SCALE);
+        let eligible_traders: Vec<(Address, FixedPoint)> = traders_with_size
+            .into_iter()
+            .filter(|(trader, size)| {
+                let share = *size / total_size;
+                let deduction = remaining_loss * share;
+                if let Ok(bal) = positions.get_native_balance(trader) {
+                    bal.available >= deduction * two
+                } else {
+                    false
+                }
+            })
+            .collect();
+
+        // Recalculate total_size for eligible traders only
+        let mut eligible_total_size = FixedPoint::ZERO;
+        for (_, size) in &eligible_traders {
+            eligible_total_size = eligible_total_size + *size;
+        }
+
+        if eligible_total_size <= FixedPoint::ZERO || eligible_traders.is_empty() {
+            // No eligible traders — loss becomes protocol deficit
+            // (absorbed by insurance fund recovery over time)
+            return Ok(());
+        }
+
+        for (trader, size) in &eligible_traders {
+            let share = *size / eligible_total_size;
             let deduction = remaining_loss * share;
             let mut bal = positions.get_native_balance(trader)?;
             bal.available = bal.available - deduction;
@@ -371,11 +427,9 @@ impl LiquidationEngine {
     /// Get insurance fund balance from state.
     fn get_insurance_fund(state_db: &StateDb) -> Result<FixedPoint, CoreError> {
         match state_db.get_cf_raw(CF_NATIVE_BALANCES, INSURANCE_FUND_KEY)? {
-            Some(data) if data.len() == 16 => {
-                Ok(FixedPoint::from_raw(i128::from_be_bytes(
-                    data.try_into().unwrap(),
-                )))
-            }
+            Some(data) if data.len() == 16 => Ok(FixedPoint::from_raw(i128::from_be_bytes(
+                data.try_into().unwrap(),
+            ))),
             _ => Ok(FixedPoint::ZERO),
         }
     }
@@ -388,5 +442,215 @@ impl LiquidationEngine {
             &amount.raw().to_be_bytes(),
         )?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::position::NativeBalance;
+    use torus_state::StateDb;
+
+    fn setup() -> (tempfile::TempDir, PositionManager) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = StateDb::open(dir.path()).unwrap();
+        (dir, PositionManager::new(db))
+    }
+
+    fn addr(n: u8) -> Address {
+        Address::new([n; 20])
+    }
+
+    fn fp(v: i64) -> FixedPoint {
+        FixedPoint::from_raw(v as i128 * FixedPoint::SCALE)
+    }
+
+    #[test]
+    fn reject_zero_oracle_price_liquidation() {
+        let (_dir, pm) = setup();
+        let liq = Liquidation {
+            trader: addr(1),
+            market_id: 1,
+            position: Position {
+                trader: addr(1),
+                market_id: 1,
+                is_long: true,
+                size: fp(1),
+                entry_price: fp(50000),
+                realized_pnl: FixedPoint::ZERO,
+                isolated_margin: FixedPoint::ZERO,
+                margin_type: MarginType::Cross,
+            },
+            shortfall: fp(100),
+            margin_type: MarginType::Cross,
+        };
+        let result = LiquidationEngine::execute_liquidation(&pm, &liq, FixedPoint::ZERO);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn reject_negative_oracle_price_liquidation() {
+        let (_dir, pm) = setup();
+        let liq = Liquidation {
+            trader: addr(1),
+            market_id: 1,
+            position: Position {
+                trader: addr(1),
+                market_id: 1,
+                is_long: true,
+                size: fp(1),
+                entry_price: fp(50000),
+                realized_pnl: FixedPoint::ZERO,
+                isolated_margin: FixedPoint::ZERO,
+                margin_type: MarginType::Cross,
+            },
+            shortfall: fp(100),
+            margin_type: MarginType::Cross,
+        };
+        let neg_price = FixedPoint::from_raw(-1 * FixedPoint::SCALE);
+        let result = LiquidationEngine::execute_liquidation(&pm, &liq, neg_price);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn insurance_fund_credited_on_liquidation() {
+        let (_dir, pm) = setup();
+        let trader = addr(1);
+        // Setup: trader has a losing long position
+        pm.put_native_balance(
+            &trader,
+            &NativeBalance {
+                available: fp(10000),
+                order_margin: FixedPoint::ZERO,
+            },
+        )
+        .unwrap();
+        pm.put_position(&Position {
+            trader,
+            market_id: 1,
+            is_long: true,
+            size: fp(1),
+            entry_price: fp(50000),
+            realized_pnl: FixedPoint::ZERO,
+            isolated_margin: FixedPoint::ZERO,
+            margin_type: MarginType::Cross,
+        })
+        .unwrap();
+
+        let liq = Liquidation {
+            trader,
+            market_id: 1,
+            position: Position {
+                trader,
+                market_id: 1,
+                is_long: true,
+                size: fp(1),
+                entry_price: fp(50000),
+                realized_pnl: FixedPoint::ZERO,
+                isolated_margin: FixedPoint::ZERO,
+                margin_type: MarginType::Cross,
+            },
+            shortfall: fp(100),
+            margin_type: MarginType::Cross,
+        };
+
+        // Liquidate at 49000 (loss of 1000)
+        let _result = LiquidationEngine::execute_liquidation(&pm, &liq, fp(49000)).unwrap();
+
+        // Insurance fund should have been credited with penalty
+        let fund = LiquidationEngine::get_insurance_fund(pm.state_db()).unwrap();
+        assert!(fund > FixedPoint::ZERO, "insurance fund should be credited");
+
+        // Penalty = notional * 250 / 10000 = 49000 * 0.025 = 1225
+        let expected_penalty = fp(1225);
+        assert_eq!(fund, expected_penalty);
+    }
+
+    #[test]
+    fn socialized_loss_excludes_low_balance_traders() {
+        let (_dir, pm) = setup();
+        let t1 = addr(1);
+        let t2 = addr(2);
+        let t3 = addr(3);
+
+        // t1: healthy balance
+        pm.put_native_balance(
+            &t1,
+            &NativeBalance {
+                available: fp(10000),
+                order_margin: FixedPoint::ZERO,
+            },
+        )
+        .unwrap();
+        pm.put_position(&Position {
+            trader: t1,
+            market_id: 1,
+            is_long: true,
+            size: fp(1),
+            entry_price: fp(50000),
+            realized_pnl: FixedPoint::ZERO,
+            isolated_margin: FixedPoint::ZERO,
+            margin_type: MarginType::Cross,
+        })
+        .unwrap();
+
+        // t2: very low balance (should be excluded)
+        pm.put_native_balance(
+            &t2,
+            &NativeBalance {
+                available: fp(10),
+                order_margin: FixedPoint::ZERO,
+            },
+        )
+        .unwrap();
+        pm.put_position(&Position {
+            trader: t2,
+            market_id: 1,
+            is_long: true,
+            size: fp(1),
+            entry_price: fp(50000),
+            realized_pnl: FixedPoint::ZERO,
+            isolated_margin: FixedPoint::ZERO,
+            margin_type: MarginType::Cross,
+        })
+        .unwrap();
+
+        // t3: healthy balance
+        pm.put_native_balance(
+            &t3,
+            &NativeBalance {
+                available: fp(10000),
+                order_margin: FixedPoint::ZERO,
+            },
+        )
+        .unwrap();
+        pm.put_position(&Position {
+            trader: t3,
+            market_id: 1,
+            is_long: true,
+            size: fp(1),
+            entry_price: fp(50000),
+            realized_pnl: FixedPoint::ZERO,
+            isolated_margin: FixedPoint::ZERO,
+            margin_type: MarginType::Cross,
+        })
+        .unwrap();
+
+        // Socialize a loss of 1000
+        LiquidationEngine::socialize_loss(&pm, 1, fp(1000), &[t1, t2, t3]).unwrap();
+
+        // t2 should NOT have been debited (low balance excluded)
+        let bal_t2 = pm.get_native_balance(&t2).unwrap();
+        assert_eq!(
+            bal_t2.available,
+            fp(10),
+            "low-balance trader should be excluded from socialized loss"
+        );
+
+        // t1 and t3 should share the loss
+        let bal_t1 = pm.get_native_balance(&t1).unwrap();
+        let bal_t3 = pm.get_native_balance(&t3).unwrap();
+        assert!(bal_t1.available < fp(10000));
+        assert!(bal_t3.available < fp(10000));
     }
 }

@@ -46,6 +46,7 @@ fn setup_governance(h: &TestHarness) -> (StakingManager, GovernanceManager) {
         permanent_weight_multiplier_num: 3,
         permanent_weight_multiplier_den: 2,
         treasury_address: addr(99),
+        timelock_blocks: 5,
     };
     gov.set_governance_params(&params).unwrap();
 

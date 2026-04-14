@@ -45,6 +45,7 @@ fn setup() -> (tempfile::TempDir, GovernanceManager, StakingManager) {
         permanent_weight_multiplier_num: 3,
         permanent_weight_multiplier_den: 2,
         treasury_address: addr(99),
+        timelock_blocks: 10, // short for tests
     };
     gov.set_governance_params(&params).unwrap();
 
