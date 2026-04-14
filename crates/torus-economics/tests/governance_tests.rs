@@ -365,7 +365,11 @@ fn execute_parameter_change() {
         .unwrap();
     gov.cast_vote(addr(2), id, true, 10).unwrap();
 
+    // FIX 15: finalize sets Passed with timelock, execute_proposal runs after timelock
     let outcome = gov.finalize_proposal(id, 101).unwrap();
+    assert_eq!(outcome, ProposalOutcome::Passed(id));
+
+    let outcome = gov.execute_proposal(id, 120).unwrap(); // after timelock (101 + 5)
     assert_eq!(outcome, ProposalOutcome::Executed(id));
 
     // Verify parameter updated in CF_FEE_CONFIG.
@@ -402,7 +406,10 @@ fn execute_treasury_spend() {
         .unwrap();
     gov.cast_vote(addr(2), id, true, 10).unwrap();
 
+    // FIX 15: finalize → Passed, then execute after timelock
     let outcome = gov.finalize_proposal(id, 101).unwrap();
+    assert_eq!(outcome, ProposalOutcome::Passed(id));
+    let outcome = gov.execute_proposal(id, 120).unwrap();
     assert_eq!(outcome, ProposalOutcome::Executed(id));
 
     // Verify treasury debited.
@@ -443,7 +450,10 @@ fn execute_treasury_spend_insufficient() {
         .unwrap();
     gov.cast_vote(addr(2), id, true, 10).unwrap();
 
-    let result = gov.finalize_proposal(id, 101);
+    // FIX 15: finalize succeeds (Passed), execution fails at execute_proposal
+    let outcome = gov.finalize_proposal(id, 101).unwrap();
+    assert_eq!(outcome, ProposalOutcome::Passed(id));
+    let result = gov.execute_proposal(id, 120);
     assert!(matches!(
         result,
         Err(EconomicsError::InsufficientTreasury { .. })
@@ -469,7 +479,10 @@ fn execute_market_listing() {
         .unwrap();
     gov.cast_vote(addr(2), id, true, 10).unwrap();
 
+    // FIX 15: finalize → Passed, then execute after timelock
     let outcome = gov.finalize_proposal(id, 101).unwrap();
+    assert_eq!(outcome, ProposalOutcome::Passed(id));
+    let outcome = gov.execute_proposal(id, 120).unwrap();
     assert_eq!(outcome, ProposalOutcome::Executed(id));
 
     // Verify market created in CF_NATIVE_MARKETS.
