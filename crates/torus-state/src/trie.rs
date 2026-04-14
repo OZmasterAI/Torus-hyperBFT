@@ -82,3 +82,42 @@ pub fn compute_composite_root(evm_root: B256, native_root: B256) -> B256 {
     data[32..].copy_from_slice(native_root.as_slice());
     alloy_primitives::keccak256(data)
 }
+
+/// Compute the native state root by hashing key native column families.
+///
+/// Iterates entries with length-framed key-value pairs to prevent hash
+/// collisions, then returns `keccak256(data)`. Iterator errors are propagated.
+pub fn compute_native_state_root_from_db(db: &StateDb) -> Result<B256, StateError> {
+    use crate::cf::{
+        CF_NATIVE_BALANCES, CF_NATIVE_ORACLE, CF_NATIVE_POSITIONS, CF_STAKING_DELEGATIONS,
+        CF_STAKING_VALIDATORS,
+    };
+
+    let raw = db.inner();
+    let mut data = Vec::new();
+
+    for cf_name in &[
+        CF_NATIVE_BALANCES,
+        CF_NATIVE_POSITIONS,
+        CF_NATIVE_ORACLE,
+        CF_STAKING_DELEGATIONS,
+        CF_STAKING_VALIDATORS,
+    ] {
+        if let Some(cf) = raw.cf_handle(cf_name) {
+            let iter = raw.iterator_cf(cf, rocksdb::IteratorMode::Start);
+            for item in iter {
+                let (key, value) = item?;
+                data.extend_from_slice(&(key.len() as u32).to_le_bytes());
+                data.extend_from_slice(&key);
+                data.extend_from_slice(&(value.len() as u32).to_le_bytes());
+                data.extend_from_slice(&value);
+            }
+        }
+    }
+
+    if data.is_empty() {
+        return Ok(EMPTY_ROOT_HASH);
+    }
+
+    Ok(alloy_primitives::keccak256(&data))
+}

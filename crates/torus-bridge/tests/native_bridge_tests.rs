@@ -321,8 +321,8 @@ fn deterministic_native_execution() {
     }
 
     // Same native state root.
-    let root1 = compute_native_state_root(&db1);
-    let root2 = compute_native_state_root(&db2);
+    let root1 = compute_native_state_root(&db1).unwrap();
+    let root2 = compute_native_state_root(&db2).unwrap();
     assert_eq!(root1, root2, "deterministic execution should yield identical native roots");
 }
 
@@ -505,7 +505,7 @@ fn composite_root_changes_with_native_state() {
     let (_dir, state_db) = open_test_db();
 
     // Compute root before any native actions.
-    let root_before = compute_native_state_root(&state_db);
+    let root_before = compute_native_state_root(&state_db).unwrap();
 
     // Execute a native action that writes to state (deposit to native).
     // First, fund an EVM account.
@@ -523,7 +523,7 @@ fn composite_root_changes_with_native_state() {
     torus_core::lockbox::Lockbox::deposit_to_native(&state_db, &addr(1), fp_amount).unwrap();
 
     // Compute root after native state change.
-    let root_after = compute_native_state_root(&state_db);
+    let root_after = compute_native_state_root(&state_db).unwrap();
     assert_ne!(
         root_before, root_after,
         "native root should change after deposit_to_native"

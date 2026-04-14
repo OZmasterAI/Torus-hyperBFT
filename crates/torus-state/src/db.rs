@@ -6,7 +6,7 @@ use std::sync::Arc;
 use alloy_primitives::{Address, Bytes, B256, U256};
 use revm::bytecode::Bytecode;
 use revm::state::AccountInfo;
-use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, Options, DB};
+use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, Options, WriteBatch, DB};
 
 use crate::cf::*;
 use crate::error::StateError;
@@ -69,6 +69,17 @@ impl StateDb {
         self.db
             .cf_handle(name)
             .ok_or_else(|| StateError::MissingColumnFamily(name.to_string()))
+    }
+
+    /// Get a column family handle by name (public, for WriteBatch usage).
+    pub fn cf_handle(&self, name: &str) -> Result<&ColumnFamily, StateError> {
+        self.cf(name)
+    }
+
+    /// Atomically apply a WriteBatch to the database.
+    pub fn write(&self, batch: WriteBatch) -> Result<(), StateError> {
+        self.db.write(batch)?;
+        Ok(())
     }
 
     // ---- Account operations (cf_accounts) ----
@@ -291,7 +302,7 @@ impl revm::DatabaseRef for StateDb {
 // ---- Encoding helpers ----
 
 /// Encode AccountInfo as 72 bytes: balance(32 BE) + nonce(8 BE) + code_hash(32).
-fn encode_account_info(info: &AccountInfo) -> [u8; 72] {
+pub fn encode_account_info(info: &AccountInfo) -> [u8; 72] {
     let mut buf = [0u8; 72];
     buf[..32].copy_from_slice(&info.balance.to_be_bytes::<32>());
     buf[32..40].copy_from_slice(&info.nonce.to_be_bytes());
@@ -300,7 +311,7 @@ fn encode_account_info(info: &AccountInfo) -> [u8; 72] {
 }
 
 /// Decode AccountInfo from 72 bytes.
-fn decode_account_info(data: &[u8]) -> Result<AccountInfo, StateError> {
+pub fn decode_account_info(data: &[u8]) -> Result<AccountInfo, StateError> {
     if data.len() != 72 {
         return Err(StateError::InvalidData(format!(
             "account data len {} != 72",
@@ -317,7 +328,7 @@ fn decode_account_info(data: &[u8]) -> Result<AccountInfo, StateError> {
 }
 
 /// Build a 52-byte storage key: address(20) ++ slot(32 BE).
-fn storage_key(address: &Address, index: &U256) -> [u8; 52] {
+pub fn storage_key(address: &Address, index: &U256) -> [u8; 52] {
     let mut key = [0u8; 52];
     key[..20].copy_from_slice(address.as_slice());
     key[20..52].copy_from_slice(&index.to_be_bytes::<32>());

@@ -3,7 +3,7 @@
 use std::sync::atomic::Ordering::Relaxed;
 
 use alloy_consensus::{transaction::SignerRecoverable, Transaction as _, TxEnvelope};
-use alloy_primitives::{keccak256, Address, Bytes, TxKind, B256, U256};
+use alloy_primitives::{Address, Bytes, TxKind, B256, U256};
 use alloy_rlp::Decodable;
 use jsonrpsee::core::{async_trait, RpcResult, SubscriptionResult};
 use jsonrpsee::proc_macros::rpc;
@@ -97,13 +97,15 @@ pub(crate) fn get_header_with_hash(
 ) -> Result<Option<(TorusBlockHeader, B256, Vec<u8>)>, RpcError> {
     let key = height.to_be_bytes();
     match state.state.get_cf_raw(CF_BLOCK_HEADERS, &key)? {
-        Some(bytes) => {
-            let header: TorusBlockHeader = serde_json::from_slice(&bytes)
+        Some(bytes) if bytes.len() > 32 => {
+            // Format: block_hash(32) || header_json (set by commit_block, FIX 1).
+            let hash = B256::from_slice(&bytes[..32]);
+            let json_bytes = &bytes[32..];
+            let header: TorusBlockHeader = serde_json::from_slice(json_bytes)
                 .map_err(|e| RpcError::Internal(format!("header decode: {e}")))?;
-            let hash = keccak256(&bytes);
             Ok(Some((header, hash, bytes)))
         }
-        None => Ok(None),
+        _ => Ok(None),
     }
 }
 

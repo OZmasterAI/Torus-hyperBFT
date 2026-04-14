@@ -143,13 +143,21 @@ impl RpcServer {
     }
 }
 
-/// Scan CF_BLOCK_HEADERS to find the highest consecutive block.
+/// Find the latest block height using a reverse iterator on CF_BLOCK_HEADERS.
+///
+/// FIX 9 (EVM-FIND-14): Previous implementation scanned from block 0 upward (O(N)).
+/// Now uses a reverse iterator to find the last key in O(1).
 pub fn find_latest_height(state: &StateDb) -> u64 {
-    let mut height: u64 = 0;
-    while let Ok(Some(_)) = state.get_cf_raw(CF_BLOCK_HEADERS, &height.to_be_bytes()) {
-        height += 1;
+    let Ok(cf) = state.cf_handle(CF_BLOCK_HEADERS) else {
+        return 0;
+    };
+    let mut iter = state.inner().iterator_cf(cf, rocksdb::IteratorMode::End);
+    match iter.next() {
+        Some(Ok((key, _))) if key.len() == 8 => {
+            u64::from_be_bytes(key[..8].try_into().unwrap())
+        }
+        _ => 0,
     }
-    height.saturating_sub(1)
 }
 
 /// Public helper to update latest height after committing a new block.
@@ -188,10 +196,14 @@ mod tests {
     }
 
     fn store_header(state: &StateDb, header: &TorusBlockHeader) -> B256 {
-        let bytes = serde_json::to_vec(header).unwrap();
-        let hash = alloy_primitives::keccak256(&bytes);
+        // Match commit_block format: block_hash(32) || header_json.
+        let json_bytes = serde_json::to_vec(header).unwrap();
+        let hash = alloy_primitives::keccak256(&header.canonical_header_bytes());
+        let mut data = Vec::with_capacity(32 + json_bytes.len());
+        data.extend_from_slice(hash.as_slice());
+        data.extend_from_slice(&json_bytes);
         state
-            .put_cf_raw(CF_BLOCK_HEADERS, &header.height.to_be_bytes(), &bytes)
+            .put_cf_raw(CF_BLOCK_HEADERS, &header.height.to_be_bytes(), &data)
             .unwrap();
         state
             .put_cf_raw(

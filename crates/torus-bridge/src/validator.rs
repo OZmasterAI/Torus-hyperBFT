@@ -40,12 +40,51 @@ impl BlockValidator {
     }
 
     /// Validate a proposed block against the current state.
+    ///
+    /// FIX CONS-PF-14: If `parent_header` is provided, verify base_fee using EIP-1559
+    /// recalculation from parent block data.
     pub fn validate_block(
         &self,
         block: &TorusBlock,
         state_db: &StateDb,
         evm_executor: &EvmExecutor,
     ) -> Result<ValidatedBlock, BridgeError> {
+        self.validate_block_inner(block, state_db, evm_executor, None)
+    }
+
+    /// Validate with parent header for base_fee verification.
+    pub fn validate_block_with_parent(
+        &self,
+        block: &TorusBlock,
+        state_db: &StateDb,
+        evm_executor: &EvmExecutor,
+        parent_header: &torus_types::TorusBlockHeader,
+    ) -> Result<ValidatedBlock, BridgeError> {
+        self.validate_block_inner(block, state_db, evm_executor, Some(parent_header))
+    }
+
+    fn validate_block_inner(
+        &self,
+        block: &TorusBlock,
+        state_db: &StateDb,
+        evm_executor: &EvmExecutor,
+        parent_header: Option<&torus_types::TorusBlockHeader>,
+    ) -> Result<ValidatedBlock, BridgeError> {
+        // FIX CONS-PF-14: Verify base_fee using EIP-1559 if parent is available.
+        if let Some(parent) = parent_header {
+            let expected_base_fee = torus_evm::calc_next_block_base_fee(
+                parent.evm_gas_used,
+                parent.evm_gas_limit,
+                parent.base_fee_per_gas,
+            );
+            if block.header.base_fee_per_gas != expected_base_fee {
+                return Err(BridgeError::InvalidBlock(format!(
+                    "base_fee mismatch: header={}, expected={} (EIP-1559 from parent)",
+                    block.header.base_fee_per_gas, expected_base_fee
+                )));
+            }
+        }
+
         let decoded_txs = decode_all_txs(&block.evm_transactions)?;
         let tx_envs: Vec<_> = decoded_txs.iter().map(|d| d.tx_env.clone()).collect();
 
@@ -70,6 +109,23 @@ impl BlockValidator {
             return Err(BridgeError::InvalidBlock(format!(
                 "gas used mismatch: header={}, executed={}",
                 block.header.evm_gas_used, exec_result.gas_used
+            )));
+        }
+
+        // FIX CONS-PF-13: Verify receipts_root by recomputing from execution results.
+        let computed_receipts_root = crate::proposer::compute_receipts_root(&exec_result.receipts);
+        if computed_receipts_root != block.header.receipts_root {
+            return Err(BridgeError::InvalidBlock(format!(
+                "receipts_root mismatch: header={}, computed={}",
+                block.header.receipts_root, computed_receipts_root
+            )));
+        }
+
+        // FIX CONS-PF-13: Verify logs_bloom matches execution results.
+        if exec_result.logs_bloom != block.header.logs_bloom {
+            return Err(BridgeError::InvalidBlock(format!(
+                "logs_bloom mismatch: header={}, computed={}",
+                block.header.logs_bloom, exec_result.logs_bloom
             )));
         }
 
@@ -202,7 +258,7 @@ impl BlockValidator {
         NativeExecutor::process_epoch_boundary(&mut ctx);
 
         // Compute composite state root (EVM bundle + native state).
-        let native_root = compute_native_state_root(state_db);
+        let native_root = compute_native_state_root(state_db)?;
         let computed_root =
             compute_full_composite_root(state_db, &exec_result.bundle, native_root)?;
 

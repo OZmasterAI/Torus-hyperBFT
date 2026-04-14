@@ -159,7 +159,7 @@ fn test_state_recovery_after_crash() {
             let _ = block;
         }
 
-        state_root_before = compute_native_state_root(&state_db);
+        state_root_before = compute_native_state_root(&state_db).unwrap();
 
         // "Crash" — drop state_db, positions, ctx. Only the file system persists.
     }
@@ -170,7 +170,7 @@ fn test_state_recovery_after_crash() {
         let positions = PositionManager::new(state_db.clone());
 
         // State root should be identical.
-        let state_root_after = compute_native_state_root(&state_db);
+        let state_root_after = compute_native_state_root(&state_db).unwrap();
         assert_eq!(
             state_root_before, state_root_after,
             "State root must survive crash"
@@ -290,7 +290,7 @@ fn test_replay_determinism() {
             NativeExecutor::process_governance(&mut ctx);
             NativeExecutor::distribute_fees(&mut ctx, 0);
 
-            let root = compute_native_state_root(&state_db);
+            let root = compute_native_state_root(&state_db).unwrap();
             roots.push(root);
 
             ctx.block_height += 1;
@@ -512,7 +512,7 @@ fn test_empty_block() {
     );
 
     // State root should be computable.
-    let root = compute_native_state_root(&h.state_db);
+    let root = compute_native_state_root(&h.state_db).unwrap();
     // Empty DB gives EMPTY_ROOT_HASH, non-empty gives a keccak hash.
     // Either way, it should not panic.
     assert_eq!(root.len(), 32, "State root should be 32 bytes");
@@ -526,7 +526,7 @@ fn test_all_actions_fail() {
     let unfunded = addr(99); // no balance
 
     // Record initial state root.
-    let root_before = compute_native_state_root(&h.state_db);
+    let root_before = compute_native_state_root(&h.state_db).unwrap();
 
     let mut ctx = h.exec_context(1);
 
@@ -567,7 +567,7 @@ fn test_all_actions_fail() {
     assert!(!batch.results[3].success);
 
     // State root should be unchanged (only CancelAll might have run as a no-op).
-    let root_after = compute_native_state_root(&h.state_db);
+    let root_after = compute_native_state_root(&h.state_db).unwrap();
     assert_eq!(
         root_before, root_after,
         "State should not change when all actions fail"

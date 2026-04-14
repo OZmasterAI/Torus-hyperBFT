@@ -204,7 +204,7 @@ impl BlockProposer {
         NativeExecutor::process_epoch_boundary(&mut ctx);
 
         // Compute composite state root.
-        let native_root = compute_native_state_root(state_db);
+        let native_root = compute_native_state_root(state_db)?;
         let state_root = compute_full_composite_root(state_db, &exec_result.bundle, native_root)?;
         let receipts_root = compute_receipts_root(&exec_result.receipts);
 
@@ -248,7 +248,7 @@ fn set_receipt_metadata(
 }
 
 /// Deterministic receipts root: keccak256 of serde-serialised receipts.
-fn compute_receipts_root(receipts: &[torus_types::Receipt]) -> B256 {
+pub(crate) fn compute_receipts_root(receipts: &[torus_types::Receipt]) -> B256 {
     if receipts.is_empty() {
         return B256::ZERO;
     }

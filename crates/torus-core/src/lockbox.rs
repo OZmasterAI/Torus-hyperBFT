@@ -2,8 +2,13 @@
 //!
 //! Transfers are IMMEDIATE (not queued like CoreWriter) because they only
 //! move balances without affecting order book or staking state.
+//!
+//! FIX 5 (ECON-PF-04): Both deposit and withdraw now use a `WriteBatch`
+//! so the debit and credit are applied atomically. A crash between two
+//! individual writes could previously cause permanent fund loss or duplication.
 
 use borsh::BorshDeserialize;
+use rocksdb::WriteBatch;
 use torus_state::cf::{CF_ACCOUNTS, CF_NATIVE_BALANCES};
 use torus_state::StateDb;
 use torus_types::{Address, FixedPoint, U256};
@@ -21,7 +26,7 @@ const KECCAK_EMPTY: [u8; 32] = [
 pub struct Lockbox;
 
 impl Lockbox {
-    /// Transfer from EVM balance to native balance (immediate).
+    /// Transfer from EVM balance to native balance (immediate, atomic).
     ///
     /// Debits msg.sender's EVM balance, credits their native balance.
     /// Both sides use the same 8-decimal FixedPoint denomination.
@@ -45,18 +50,26 @@ impl Lockbox {
             });
         }
 
-        // Debit EVM balance
-        set_evm_balance(state_db, trader, evm_balance - evm_amount)?;
-
         // Credit native balance
         let mut native_bal = get_native_balance(state_db, trader)?;
         native_bal.available = native_bal.available + amount;
-        put_native_balance(state_db, trader, &native_bal)?;
 
+        // Atomic write: debit EVM + credit native in one WriteBatch.
+        let mut batch = WriteBatch::default();
+        let cf_accounts = state_db.cf_handle(CF_ACCOUNTS)?;
+        let cf_native = state_db.cf_handle(CF_NATIVE_BALANCES)?;
+
+        let evm_data = build_evm_balance_update(state_db, trader, evm_balance - evm_amount)?;
+        batch.put_cf(cf_accounts, trader.as_slice(), &evm_data);
+
+        let native_data = borsh::to_vec(&native_bal).map_err(|e| CoreError::Borsh(e.to_string()))?;
+        batch.put_cf(cf_native, trader.as_slice(), &native_data);
+
+        state_db.write(batch)?;
         Ok(())
     }
 
-    /// Transfer from native balance to EVM balance (immediate).
+    /// Transfer from native balance to EVM balance (immediate, atomic).
     ///
     /// Debits native balance, credits EVM balance.
     pub fn withdraw_from_native(
@@ -80,13 +93,24 @@ impl Lockbox {
         // Debit native balance
         let mut updated_bal = native_bal;
         updated_bal.available = updated_bal.available - amount;
-        put_native_balance(state_db, trader, &updated_bal)?;
 
         // Credit EVM balance
         let evm_amount = fp_to_u256(amount);
         let evm_balance = get_evm_balance(state_db, trader)?;
-        set_evm_balance(state_db, trader, evm_balance + evm_amount)?;
 
+        // Atomic write: debit native + credit EVM in one WriteBatch.
+        let mut batch = WriteBatch::default();
+        let cf_accounts = state_db.cf_handle(CF_ACCOUNTS)?;
+        let cf_native = state_db.cf_handle(CF_NATIVE_BALANCES)?;
+
+        let native_data =
+            borsh::to_vec(&updated_bal).map_err(|e| CoreError::Borsh(e.to_string()))?;
+        batch.put_cf(cf_native, trader.as_slice(), &native_data);
+
+        let evm_data = build_evm_balance_update(state_db, trader, evm_balance + evm_amount)?;
+        batch.put_cf(cf_accounts, trader.as_slice(), &evm_data);
+
+        state_db.write(batch)?;
         Ok(())
     }
 }
@@ -103,13 +127,13 @@ fn get_evm_balance(state_db: &StateDb, address: &Address) -> Result<U256, CoreEr
     }
 }
 
-/// Update EVM balance in CF_ACCOUNTS, preserving nonce and code_hash.
+/// Build a 72-byte EVM account record with the given balance, preserving nonce and code_hash.
 /// Creates the account record if it doesn't exist.
-fn set_evm_balance(
+fn build_evm_balance_update(
     state_db: &StateDb,
     address: &Address,
     new_balance: U256,
-) -> Result<(), CoreError> {
+) -> Result<Vec<u8>, CoreError> {
     let mut data = match state_db.get_cf_raw(CF_ACCOUNTS, address.as_slice())? {
         Some(d) if d.len() == 72 => d,
         _ => {
@@ -120,8 +144,7 @@ fn set_evm_balance(
         }
     };
     data[..32].copy_from_slice(&new_balance.to_be_bytes::<32>());
-    state_db.put_cf_raw(CF_ACCOUNTS, address.as_slice(), &data)?;
-    Ok(())
+    Ok(data)
 }
 
 // ============================================================================
@@ -135,16 +158,6 @@ fn get_native_balance(state_db: &StateDb, trader: &Address) -> Result<NativeBala
         ),
         None => Ok(NativeBalance::default()),
     }
-}
-
-fn put_native_balance(
-    state_db: &StateDb,
-    trader: &Address,
-    bal: &NativeBalance,
-) -> Result<(), CoreError> {
-    let data = borsh::to_vec(bal).map_err(|e| CoreError::Borsh(e.to_string()))?;
-    state_db.put_cf_raw(CF_NATIVE_BALANCES, trader.as_slice(), &data)?;
-    Ok(())
 }
 
 // ============================================================================

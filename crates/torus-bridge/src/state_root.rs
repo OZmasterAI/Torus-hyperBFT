@@ -42,10 +42,15 @@ pub fn compute_full_composite_root(
 
 /// Compute a native state root by hashing key native column families.
 ///
-/// Iterates all entries in native balance and position CFs, concatenates
-/// their key-value pairs, and returns `keccak256(data)`. This is a linear
-/// scan suitable for Phase 2 — production would use an incremental trie.
-pub fn compute_native_state_root(state_db: &StateDb) -> B256 {
+/// Iterates all entries in native balance and position CFs with length-framed
+/// key-value pairs, and returns `keccak256(data)`. Length framing prevents
+/// hash collisions between entries with different key/value boundaries.
+///
+/// Iterator errors are propagated — a DB error must fail loudly rather than
+/// silently omitting entries and producing an incorrect root.
+pub fn compute_native_state_root(
+    state_db: &StateDb,
+) -> Result<B256, torus_state::error::StateError> {
     use torus_state::cf::{
         CF_NATIVE_BALANCES, CF_NATIVE_ORACLE, CF_NATIVE_POSITIONS, CF_STAKING_DELEGATIONS,
         CF_STAKING_VALIDATORS,
@@ -65,33 +70,53 @@ pub fn compute_native_state_root(state_db: &StateDb) -> B256 {
         if let Some(cf) = db.cf_handle(cf_name) {
             let iter = db.iterator_cf(cf, rocksdb::IteratorMode::Start);
             for item in iter {
-                if let Ok((key, value)) = item {
-                    data.extend_from_slice(&key);
-                    data.extend_from_slice(&value);
-                }
+                // FIX 8: Propagate iterator errors instead of silently skipping.
+                let (key, value) = item?;
+                // FIX 2: Length-frame each element to prevent hash collisions.
+                // ("ab","cd") and ("a","bcd") now produce different byte sequences.
+                data.extend_from_slice(&(key.len() as u32).to_le_bytes());
+                data.extend_from_slice(&key);
+                data.extend_from_slice(&(value.len() as u32).to_le_bytes());
+                data.extend_from_slice(&value);
             }
         }
     }
 
     if data.is_empty() {
-        return EMPTY_ROOT_HASH;
+        return Ok(EMPTY_ROOT_HASH);
     }
 
-    alloy_primitives::keccak256(&data)
+    Ok(alloy_primitives::keccak256(&data))
 }
 
 /// Compute the EVM state root after applying the given `BundleState`.
 ///
-/// Reads all accounts and storage from the DB, merges `BundleState` changes
-/// in memory, and computes the MPT root. O(n) in total state size —
-/// suitable for genesis and testing.
+/// FIX 7 (EVM-PF-03): Streams accounts directly from the DB iterator into
+/// the BTreeMap instead of collecting into an intermediate Vec first.
+/// This halves peak memory during state root computation.
 fn compute_post_bundle_evm_root(
     state_db: &StateDb,
     bundle: &BundleState,
 ) -> Result<B256, StateError> {
-    // 1. Load all existing accounts.
-    let existing = state_db.all_accounts()?;
-    let mut accounts: BTreeMap<Address, AccountInfo> = existing.into_iter().collect();
+    // 1. Stream existing accounts directly into BTreeMap (no intermediate Vec).
+    use torus_state::cf::CF_ACCOUNTS;
+    use torus_state::db::decode_account_info;
+
+    let mut accounts: BTreeMap<Address, AccountInfo> = BTreeMap::new();
+    let cf = state_db.cf_handle(CF_ACCOUNTS)?;
+    let iter = state_db.inner().iterator_cf(cf, rocksdb::IteratorMode::Start);
+    for item in iter {
+        let (key, value) = item?;
+        if key.len() != 20 {
+            return Err(StateError::InvalidData(format!(
+                "account key len {} != 20",
+                key.len()
+            )));
+        }
+        let address = Address::from_slice(&key);
+        let info = decode_account_info(&value)?;
+        accounts.insert(address, info);
+    }
 
     // 2. Apply bundle account changes.
     for (addr, bundle_acct) in &bundle.state {

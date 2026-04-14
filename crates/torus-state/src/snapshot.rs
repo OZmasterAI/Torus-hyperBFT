@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::cf::ALL_CF_NAMES;
 use crate::db::StateDb;
 use crate::error::StateError;
-use crate::trie::compute_state_root_from_db;
+use crate::trie::{compute_composite_root, compute_native_state_root_from_db, compute_state_root_from_db};
 
 /// Metadata recorded alongside a snapshot.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -130,8 +130,11 @@ impl StateDb {
 
         let snapshot_db = StateDb::from_existing_db(db);
 
-        // Recompute state root from snapshot data
-        let computed_root = compute_state_root_from_db(&snapshot_db)?;
+        // FIX 6 (EVM-PF-11): Recompute the *composite* root (EVM + native) to
+        // compare like-for-like against metadata.state_root which is the composite root.
+        let evm_root = compute_state_root_from_db(&snapshot_db)?;
+        let native_root = compute_native_state_root_from_db(&snapshot_db)?;
+        let computed_root = compute_composite_root(evm_root, native_root);
 
         let verified = computed_root == metadata.state_root;
         let error = if verified {
@@ -174,13 +177,34 @@ impl StateDb {
         let metadata: SnapshotMetadata = serde_json::from_str(&metadata_json)
             .map_err(|e| StateError::InvalidData(format!("parse metadata: {e}")))?;
 
-        // Remove existing data directory if it exists
-        if data_dir.exists() {
-            std::fs::remove_dir_all(data_dir)?;
+        // FIX 4 (EVM-FIND-06): Atomic directory swap.
+        // A crash between remove_dir_all and copy_dir_recursive would leave no
+        // data directory at all. Instead: copy to temp, rename old → .old,
+        // rename temp → data_dir. At every point at least one valid dir exists.
+        let temp_dir = data_dir.with_extension("restoring");
+        let old_dir = data_dir.with_extension("old");
+
+        // Clean up leftover dirs from any previous failed restore.
+        if temp_dir.exists() {
+            std::fs::remove_dir_all(&temp_dir)?;
+        }
+        if old_dir.exists() {
+            std::fs::remove_dir_all(&old_dir)?;
         }
 
-        // Copy snapshot to data directory
-        copy_dir_recursive(snapshot_path, data_dir)?;
+        // Step 1: Copy snapshot to temp location (data_dir still intact).
+        copy_dir_recursive(snapshot_path, &temp_dir)?;
+
+        // Step 2: Atomic swap — rename is atomic on the same filesystem.
+        if data_dir.exists() {
+            std::fs::rename(data_dir, &old_dir)?;
+        }
+        std::fs::rename(&temp_dir, data_dir)?;
+
+        // Step 3: Cleanup old data (non-critical — failure is safe).
+        if old_dir.exists() {
+            let _ = std::fs::remove_dir_all(&old_dir);
+        }
 
         tracing::info!(
             snapshot = %snapshot_path.display(),
@@ -327,11 +351,18 @@ mod tests {
         }
     }
 
+    /// Compute the composite state root (EVM + native) matching what verify_snapshot expects.
+    fn composite_root_from_db(db: &StateDb) -> B256 {
+        let evm_root = compute_state_root_from_db(db).unwrap();
+        let native_root = compute_native_state_root_from_db(db).unwrap();
+        compute_composite_root(evm_root, native_root)
+    }
+
     #[test]
     fn create_snapshot_and_verify_passes() {
         let dir = TempDir::new().unwrap();
         let db = make_test_db(dir.path());
-        let state_root = compute_state_root_from_db(&db).unwrap();
+        let state_root = composite_root_from_db(&db);
 
         let snap_dir = TempDir::new().unwrap();
         let snap_path = snap_dir.path().join("snap1");
@@ -348,7 +379,7 @@ mod tests {
     fn verify_detects_corrupted_snapshot() {
         let dir = TempDir::new().unwrap();
         let db = make_test_db(dir.path());
-        let state_root = compute_state_root_from_db(&db).unwrap();
+        let state_root = composite_root_from_db(&db);
 
         let snap_dir = TempDir::new().unwrap();
         let snap_path = snap_dir.path().join("snap_corrupt");
@@ -374,7 +405,7 @@ mod tests {
     fn restore_from_valid_snapshot() {
         let dir = TempDir::new().unwrap();
         let db = make_test_db(dir.path());
-        let state_root = compute_state_root_from_db(&db).unwrap();
+        let state_root = composite_root_from_db(&db);
 
         let snap_dir = TempDir::new().unwrap();
         let snap_path = snap_dir.path().join("snap_restore");
@@ -401,7 +432,7 @@ mod tests {
     fn restore_rejects_corrupted_snapshot() {
         let dir = TempDir::new().unwrap();
         let db = make_test_db(dir.path());
-        let state_root = compute_state_root_from_db(&db).unwrap();
+        let state_root = composite_root_from_db(&db);
 
         let snap_dir = TempDir::new().unwrap();
         let snap_path = snap_dir.path().join("snap_bad");
@@ -424,7 +455,7 @@ mod tests {
     fn auto_snapshot_prunes_old_ones() {
         let dir = TempDir::new().unwrap();
         let db = make_test_db(dir.path());
-        let state_root = compute_state_root_from_db(&db).unwrap();
+        let state_root = composite_root_from_db(&db);
 
         let snap_base = TempDir::new().unwrap();
         let config = SnapshotConfig {
