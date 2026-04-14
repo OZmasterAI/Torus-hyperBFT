@@ -111,4 +111,18 @@ pub enum EconomicsError {
 
     #[error("validator {0} cannot rotate key while jailed")]
     CannotRotateWhileJailed(Address),
+
+    // Dynamic validator set errors (Phase 3: 3.2)
+
+    #[error("validator registration not approved by governance for {0}")]
+    ValidatorNotWhitelisted(Address),
+
+    #[error("validator whitelist entry expired for {0}")]
+    WhitelistExpired(Address),
+
+    #[error("validator {0} commission cooldown not expired")]
+    CommissionCooldownNotExpired(Address),
+
+    #[error("rotation would reduce active set below BFT minimum ({have} -> {need})")]
+    BelowMinimumActiveSet { have: usize, need: usize },
 }

@@ -364,6 +364,10 @@ pub enum ProposalAction {
         key: String,
         value: String,
     },
+    /// Whitelist a candidate address for validator registration (Phase 3: 3.2.1).
+    ValidatorRegistration {
+        candidate: Address,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

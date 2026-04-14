@@ -586,6 +586,7 @@ fn map_proposal(p: torus_economics::governance::Proposal) -> RpcProposal {
         ProposalType::TreasurySpend => "TreasurySpend",
         ProposalType::MarketListing => "MarketListing",
         ProposalType::TextProposal => "TextProposal",
+        ProposalType::ValidatorRegistration => "ValidatorRegistration",
     };
 
     let status = match p.status {

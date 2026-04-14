@@ -85,6 +85,8 @@ pub struct ValidatorState {
     pub total_delegated: U256,
     pub status: ValidatorStatus,
     pub jailed_until: Option<u64>,
+    /// Block height of last commission change (Phase 3: 3.2.3 cooldown).
+    pub last_commission_change_block: Option<u64>,
 }
 
 impl ValidatorState {
@@ -102,6 +104,7 @@ impl BorshSerialize for ValidatorState {
         borsh_write_u256(&self.total_delegated, writer)?;
         BorshSerialize::serialize(&self.status, writer)?;
         BorshSerialize::serialize(&self.jailed_until, writer)?;
+        BorshSerialize::serialize(&self.last_commission_change_block, writer)?;
         Ok(())
     }
 }
@@ -116,6 +119,7 @@ impl BorshDeserialize for ValidatorState {
         let total_delegated = borsh_read_u256(reader)?;
         let status = ValidatorStatus::deserialize_reader(reader)?;
         let jailed_until = Option::<u64>::deserialize_reader(reader)?;
+        let last_commission_change_block = Option::<u64>::deserialize_reader(reader)?;
         Ok(Self {
             address,
             pubkey,
@@ -124,6 +128,7 @@ impl BorshDeserialize for ValidatorState {
             total_delegated,
             status,
             jailed_until,
+            last_commission_change_block,
         })
     }
 }
@@ -558,6 +563,15 @@ impl BorshDeserialize for PendingKeyRotation {
 /// Key rotation cooldown: cannot rotate again for 1 epoch after rotation.
 pub const KEY_ROTATION_COOLDOWN_EPOCHS: u64 = 1;
 
+/// Commission change cooldown: 28,800 blocks (~2 days at 6s blocks).
+pub const COMMISSION_COOLDOWN_BLOCKS: u64 = 28_800;
+
+/// Validator whitelist expiry: 604,800 blocks (~7 days at 1 block/sec).
+pub const WHITELIST_EXPIRY_BLOCKS: u64 = 604_800;
+
+/// Minimum number of active validators for BFT liveness (3f+1 where f=1).
+pub const MIN_ACTIVE_VALIDATORS: usize = 4;
+
 /// A jail vote record. Stored in CF_JAIL_VOTES.
 /// Key: target(20) ++ voter(20) = 40 bytes.
 #[derive(Clone, Debug)]
@@ -589,6 +603,41 @@ impl BorshDeserialize for JailVoteRecord {
             target,
             stake_weight,
             block_height,
+        })
+    }
+}
+
+// ============================================================================
+// Validator Whitelist (Phase 3: 3.2.1)
+// ============================================================================
+
+/// Governance-approved validator candidate. Stored in CF_CONSENSUS_META
+/// with key prefix "validator_whitelist:" ++ candidate address (20 bytes).
+#[derive(Clone, Debug)]
+pub struct ValidatorWhitelistEntry {
+    pub candidate: Address,
+    pub approved_at_block: u64,
+    pub expires_at_block: u64,
+}
+
+impl BorshSerialize for ValidatorWhitelistEntry {
+    fn serialize<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+        borsh_write_address(&self.candidate, writer)?;
+        BorshSerialize::serialize(&self.approved_at_block, writer)?;
+        BorshSerialize::serialize(&self.expires_at_block, writer)?;
+        Ok(())
+    }
+}
+
+impl BorshDeserialize for ValidatorWhitelistEntry {
+    fn deserialize_reader<R: Read>(reader: &mut R) -> io::Result<Self> {
+        let candidate = borsh_read_address(reader)?;
+        let approved_at_block = u64::deserialize_reader(reader)?;
+        let expires_at_block = u64::deserialize_reader(reader)?;
+        Ok(Self {
+            candidate,
+            approved_at_block,
+            expires_at_block,
         })
     }
 }

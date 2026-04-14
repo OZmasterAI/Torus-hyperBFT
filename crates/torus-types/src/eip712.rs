@@ -494,6 +494,9 @@ fn hash_proposal_action(action: &ProposalAction) -> B256 {
             buf.extend_from_slice(&encode_string(value));
             keccak256(&buf)
         }
+        ProposalAction::ValidatorRegistration { candidate } => {
+            keccak256(encode_address(candidate))
+        }
     }
 }
 

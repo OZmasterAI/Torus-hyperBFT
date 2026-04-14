@@ -74,6 +74,7 @@ impl StakingManager {
             total_delegated: U256::ZERO,
             status: ValidatorStatus::Candidate,
             jailed_until: None,
+            last_commission_change_block: None,
         };
         self.put_validator(&sender, &state)?;
 
@@ -266,8 +267,14 @@ impl StakingManager {
     // Commission updates
     // ========================================================================
 
-    /// Update validator commission rate. Enforces max 5000 bps and max 100 bps change.
-    pub fn update_commission(&self, validator: Address, new_rate: u16) -> Result<()> {
+    /// Update validator commission rate. Enforces max 5000 bps, max 100 bps change,
+    /// and cooldown period between changes (Phase 3: 3.2.3).
+    pub fn update_commission(
+        &self,
+        validator: Address,
+        new_rate: u16,
+        current_block: u64,
+    ) -> Result<()> {
         if new_rate > MAX_COMMISSION_BPS {
             return Err(EconomicsError::CommissionTooHigh { rate_bps: new_rate });
         }
@@ -282,8 +289,18 @@ impl StakingManager {
             return Err(EconomicsError::CommissionChangeTooLarge { delta });
         }
 
+        // BUG FIX (3.2): Enforce commission cooldown — prevents rapid ramping
+        if let Some(last_change) = val.last_commission_change_block {
+            if current_block < last_change + COMMISSION_COOLDOWN_BLOCKS {
+                return Err(EconomicsError::CommissionCooldownNotExpired(validator));
+            }
+        }
+
         val.commission_bps = new_rate;
+        val.last_commission_change_block = Some(current_block);
         self.put_validator(&validator, &val)?;
+
+        tracing::info!(%validator, new_rate, "commission updated");
         Ok(())
     }
 
@@ -1514,22 +1531,35 @@ mod tests {
             .unwrap();
 
         // Valid: change by 100 bps.
-        mgr.update_commission(validator, 600).unwrap();
+        mgr.update_commission(validator, 600, 100).unwrap();
         let val = mgr.get_validator(&validator).unwrap().unwrap();
         assert_eq!(val.commission_bps, 600);
 
         // Invalid: change by more than 100 bps.
-        let result = mgr.update_commission(validator, 800);
+        let result = mgr.update_commission(validator, 800, 100 + COMMISSION_COOLDOWN_BLOCKS);
         assert!(matches!(
             result,
             Err(EconomicsError::CommissionChangeTooLarge { .. })
         ));
 
         // Invalid: exceeds max.
-        let result = mgr.update_commission(validator, 5001);
+        let result = mgr.update_commission(validator, 5001, 100 + COMMISSION_COOLDOWN_BLOCKS);
         assert!(matches!(
             result,
             Err(EconomicsError::CommissionTooHigh { .. })
         ));
+
+        // Invalid: cooldown not expired.
+        let result = mgr.update_commission(validator, 650, 100 + 1);
+        assert!(matches!(
+            result,
+            Err(EconomicsError::CommissionCooldownNotExpired(..))
+        ));
+
+        // Valid: after cooldown.
+        mgr.update_commission(validator, 650, 100 + COMMISSION_COOLDOWN_BLOCKS)
+            .unwrap();
+        let val = mgr.get_validator(&validator).unwrap().unwrap();
+        assert_eq!(val.commission_bps, 650);
     }
 }

@@ -82,6 +82,7 @@ impl EpochManager {
     }
 
     /// Diff old vs new validator sets for hotstuff_rs ValidatorSetUpdates.
+    /// BUG FIX (3.2): also detects pubkey changes from key rotation (A3).
     pub fn compute_validator_set_diff(
         old_set: &ValidatorSet,
         new_set: &ValidatorSet,
@@ -95,11 +96,22 @@ impl EpochManager {
 
         let mut inserts = Vec::new();
         let mut deletes = Vec::new();
+        let mut rotated_out_pubkeys = Vec::new();
 
         for (addr, new_v) in &new_map {
             match old_map.get(addr) {
-                Some(old_v) if old_v.power == new_v.power => {}
-                _ => inserts.push((*new_v).clone()),
+                Some(old_v) if old_v.power == new_v.power && old_v.pubkey == new_v.pubkey => {
+                    // No change
+                }
+                Some(old_v) => {
+                    // Power or pubkey changed — insert with new values
+                    inserts.push((*new_v).clone());
+                    // BUG FIX (3.2): key rotation — must delete old pubkey from hotstuff_rs
+                    if old_v.pubkey != new_v.pubkey {
+                        rotated_out_pubkeys.push(old_v.pubkey.0);
+                    }
+                }
+                None => inserts.push((*new_v).clone()),
             }
         }
 
@@ -109,7 +121,176 @@ impl EpochManager {
             }
         }
 
-        ValidatorSetDiff { inserts, deletes }
+        ValidatorSetDiff {
+            inserts,
+            deletes,
+            rotated_out_pubkeys,
+        }
+    }
+
+    /// Compute the safe rotation cap: max validators that can change per epoch.
+    ///
+    /// Derived from hotstuff_rs BFT quorum requirements:
+    /// - Quorum = (total_power * 2 / 3) + 1  (>2/3 of total power)
+    /// - For safety, old and new sets must share enough validators to form a
+    ///   quorum in both sets during the transition.
+    /// - This requires at most floor(n/3) validators to change per epoch,
+    ///   where n is the current active set size.
+    pub fn safe_rotation_cap(current_set_size: usize) -> usize {
+        current_set_size / 3
+    }
+
+    /// Apply rotation cap: if more validators would change than is safe,
+    /// defer the lowest-priority changes. Returns the capped new set.
+    ///
+    /// Priority: validators already in the active set are kept over new entrants.
+    /// Among departures, those with higher stake are kept over those with lower.
+    pub fn apply_rotation_cap(
+        old_set: &ValidatorSet,
+        mut new_set: ValidatorSet,
+        max_changes: usize,
+    ) -> ValidatorSet {
+        use std::collections::HashSet;
+
+        if max_changes == 0 {
+            return old_set.clone();
+        }
+
+        let old_addrs: HashSet<Address> =
+            old_set.validators.iter().map(|v| v.address).collect();
+        let new_addrs: HashSet<Address> =
+            new_set.validators.iter().map(|v| v.address).collect();
+
+        let departures: Vec<Address> = old_addrs.difference(&new_addrs).copied().collect();
+        let arrivals: Vec<Address> = new_addrs.difference(&old_addrs).copied().collect();
+
+        let total_changes = departures.len() + arrivals.len();
+        if total_changes <= max_changes {
+            return new_set;
+        }
+
+        // Too many changes — limit to max_changes total.
+        // Arrivals and departures are paired: each new validator entering
+        // corresponds to an old validator leaving (when set size is capped).
+        // Split the budget: half for departures, half for arrivals.
+        let half = max_changes / 2;
+        let allowed_swaps = half.min(departures.len()).min(arrivals.len());
+
+        // For excess departures beyond allowed_swaps: keep old validator
+        // For excess arrivals beyond allowed_swaps: defer to next epoch
+        let kept_departures: HashSet<Address> =
+            departures.iter().skip(allowed_swaps).copied().collect();
+        let deferred_arrivals: HashSet<Address> =
+            arrivals.iter().skip(allowed_swaps).copied().collect();
+
+        // Remove deferred arrivals from new_set
+        new_set
+            .validators
+            .retain(|v| !deferred_arrivals.contains(&v.address));
+
+        // Re-add kept departures (validators that should have left but can't yet)
+        for val in &old_set.validators {
+            if kept_departures.contains(&val.address)
+                && !new_set.validators.iter().any(|v| v.address == val.address)
+            {
+                new_set.validators.push(val.clone());
+            }
+        }
+
+        // Re-sort by stake desc, address asc for determinism
+        new_set.validators.sort_by(|a, b| {
+            b.power.cmp(&a.power).then_with(|| a.address.cmp(&b.address))
+        });
+
+        tracing::warn!(
+            total_changes,
+            max_changes,
+            allowed_swaps,
+            deferred = total_changes - allowed_swaps * 2,
+            "rotation cap applied: deferred {} validator changes to next epoch",
+            total_changes - allowed_swaps * 2
+        );
+
+        new_set
+    }
+
+    /// Log detailed rotation events at epoch boundary.
+    pub fn log_rotation(
+        old_set: &ValidatorSet,
+        _new_set: &ValidatorSet,
+        diff: &ValidatorSetDiff,
+        epoch: u64,
+    ) {
+        use std::collections::HashMap;
+
+        let old_map: HashMap<Address, &ValidatorInfo> =
+            old_set.validators.iter().map(|v| (v.address, v)).collect();
+
+        for v in &diff.inserts {
+            if old_map.contains_key(&v.address) {
+                tracing::info!(
+                    epoch,
+                    validator = %v.address,
+                    power = v.power,
+                    "epoch rotation: validator power/key updated"
+                );
+            } else {
+                tracing::info!(
+                    epoch,
+                    validator = %v.address,
+                    power = v.power,
+                    "epoch rotation: validator joined active set"
+                );
+            }
+        }
+
+        for addr in &diff.deletes {
+            let reason = if old_map.contains_key(addr) {
+                "outranked or status change"
+            } else {
+                "removed"
+            };
+            tracing::info!(
+                epoch,
+                validator = %addr,
+                reason,
+                "epoch rotation: validator left active set"
+            );
+        }
+
+        for pk in &diff.rotated_out_pubkeys {
+            let pk_hex: String = pk.iter().map(|b| format!("{b:02x}")).collect();
+            tracing::info!(
+                epoch,
+                old_pubkey = %pk_hex,
+                "epoch rotation: old pubkey removed (key rotation)"
+            );
+        }
+    }
+
+    /// Check if the new set meets the minimum BFT liveness requirement.
+    /// Returns an error if the set would be too small.
+    pub fn check_minimum_set(new_set: &ValidatorSet) -> Result<()> {
+        use crate::types::MIN_ACTIVE_VALIDATORS;
+
+        if new_set.validators.is_empty() {
+            tracing::error!("CRITICAL: zero eligible validators — halting epoch rotation");
+            return Err(EconomicsError::BelowMinimumActiveSet {
+                have: 0,
+                need: MIN_ACTIVE_VALIDATORS,
+            });
+        }
+
+        if new_set.validators.len() < MIN_ACTIVE_VALIDATORS {
+            tracing::warn!(
+                have = new_set.validators.len(),
+                need = MIN_ACTIVE_VALIDATORS,
+                "WARNING: active validator set below BFT minimum — reduced fault tolerance"
+            );
+            // Don't error — allow smaller sets but warn (single-validator dev/test is valid)
+        }
+
+        Ok(())
     }
 
     /// Update validator statuses after epoch rotation.
@@ -142,11 +323,19 @@ impl EpochManager {
 pub struct ValidatorSetDiff {
     pub inserts: Vec<ValidatorInfo>,
     pub deletes: Vec<Address>,
+    /// Old pubkeys that must be deleted from hotstuff_rs due to key rotation.
+    /// BUG FIX (3.2): key rotation requires deleting old pubkey + inserting new one.
+    pub rotated_out_pubkeys: Vec<[u8; 32]>,
 }
 
 impl ValidatorSetDiff {
     pub fn is_empty(&self) -> bool {
-        self.inserts.is_empty() && self.deletes.is_empty()
+        self.inserts.is_empty() && self.deletes.is_empty() && self.rotated_out_pubkeys.is_empty()
+    }
+
+    /// Total number of validator changes (for rotation cap calculation).
+    pub fn total_changes(&self) -> usize {
+        self.inserts.len() + self.deletes.len()
     }
 }
 

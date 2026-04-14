@@ -184,7 +184,7 @@ impl NativeExecutor {
 
             // ---- Governance ----
             NativeAction::SubmitProposal(proposal) => {
-                Self::exec_submit_proposal(ctx, sender, &proposal.title, &proposal.description)
+                Self::exec_submit_proposal(ctx, sender, proposal)
             }
             NativeAction::Vote {
                 proposal_id,
@@ -202,12 +202,12 @@ impl NativeExecutor {
                 Self::exec_withdraw_from_native(ctx, sender, *amount)
             }
 
-            // ---- Validator management (stubs for Phase 2) ----
-            NativeAction::RegisterValidator { .. } => {
-                NativeActionResult::ok("register_validator", 0)
+            // ---- Validator management ----
+            NativeAction::RegisterValidator { pubkey, commission } => {
+                Self::exec_register_validator(ctx, sender, pubkey, *commission)
             }
-            NativeAction::UpdateCommission { .. } => {
-                NativeActionResult::ok("update_commission", 0)
+            NativeAction::UpdateCommission { new_rate } => {
+                Self::exec_update_commission(ctx, sender, *new_rate)
             }
             NativeAction::JailVote { target } => Self::exec_jail_vote(ctx, sender, target),
             NativeAction::UnjailSelf => Self::exec_unjail_self(ctx, sender),
@@ -405,6 +405,65 @@ impl NativeExecutor {
         }
     }
 
+    fn exec_register_validator(
+        ctx: &mut NativeExecContext,
+        sender: &Address,
+        pubkey: &torus_types::PublicKey,
+        commission: u16,
+    ) -> NativeActionResult {
+        // Phase 3 (3.2.1): Check governance whitelist before registration
+        match ctx.governance.is_whitelisted(sender, ctx.block_height) {
+            Ok(true) => {}
+            Ok(false) => {
+                return NativeActionResult::err(
+                    "register_validator",
+                    format!("validator registration not approved by governance for {sender}"),
+                );
+            }
+            Err(e) => return NativeActionResult::err("register_validator", e.to_string()),
+        }
+
+        // Determine self-stake: sender's full balance is used as self-stake
+        let self_stake = match ctx.state_db.get_account(sender) {
+            Ok(Some(acct)) => acct.balance,
+            Ok(None) => {
+                return NativeActionResult::err(
+                    "register_validator",
+                    "sender account not found".to_string(),
+                );
+            }
+            Err(e) => return NativeActionResult::err("register_validator", e.to_string()),
+        };
+
+        match ctx
+            .staking
+            .register_validator(*sender, pubkey.0, commission, self_stake)
+        {
+            Ok(()) => {
+                // Consume the whitelist entry after successful registration
+                if let Err(e) = ctx.governance.consume_whitelist(sender) {
+                    tracing::warn!(%sender, %e, "failed to consume whitelist entry");
+                }
+                NativeActionResult::ok("register_validator", 5000)
+            }
+            Err(e) => NativeActionResult::err("register_validator", e.to_string()),
+        }
+    }
+
+    fn exec_update_commission(
+        ctx: &mut NativeExecContext,
+        sender: &Address,
+        new_rate: u16,
+    ) -> NativeActionResult {
+        match ctx
+            .staking
+            .update_commission(*sender, new_rate, ctx.block_height)
+        {
+            Ok(()) => NativeActionResult::ok("update_commission", 2000),
+            Err(e) => NativeActionResult::err("update_commission", e.to_string()),
+        }
+    }
+
     fn exec_rotate_key(
         ctx: &mut NativeExecContext,
         sender: &Address,
@@ -450,14 +509,44 @@ impl NativeExecutor {
     fn exec_submit_proposal(
         ctx: &mut NativeExecContext,
         sender: &Address,
-        title: &str,
-        description: &str,
+        proposal: &torus_types::Proposal,
     ) -> NativeActionResult {
+        // Convert torus_types::ProposalAction to torus_economics::governance::ExecutionPayload
+        use torus_economics::governance::ExecutionPayload;
+        use torus_types::ProposalAction;
+
+        let execution_payload = match &proposal.action {
+            ProposalAction::ParameterChange { key, value } => {
+                Some(ExecutionPayload::ParameterChange {
+                    param_key: key.clone(),
+                    new_value: value.clone(),
+                })
+            }
+            ProposalAction::ListMarket(listing) => Some(ExecutionPayload::MarketListing {
+                market_id: 0, // auto-assigned
+                base_asset: listing.base_asset.clone(),
+                quote_asset: listing.quote_asset.clone(),
+                lot_size: listing.lot_size,
+                tick_size: listing.tick_size,
+                initial_margin: torus_types::FixedPoint::from_raw(
+                    listing.maintenance_margin_bps as i128 * torus_types::FixedPoint::SCALE / 10000,
+                ),
+            }),
+            ProposalAction::UpdateMarketParams { .. } | ProposalAction::DelistMarket { .. } => {
+                None // text-only for now
+            }
+            ProposalAction::ValidatorRegistration { candidate } => {
+                Some(ExecutionPayload::ValidatorRegistration {
+                    candidate: *candidate,
+                })
+            }
+        };
+
         match ctx.governance.submit_proposal(
             *sender,
-            title.to_string(),
-            description.to_string(),
-            None,
+            proposal.title.clone(),
+            proposal.description.clone(),
+            execution_payload,
             ctx.block_height,
         ) {
             Ok(_id) => NativeActionResult::ok("submit_proposal", 5000),

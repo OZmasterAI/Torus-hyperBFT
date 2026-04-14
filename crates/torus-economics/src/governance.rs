@@ -80,6 +80,8 @@ pub enum ProposalType {
     TreasurySpend,
     MarketListing,
     TextProposal,
+    /// Whitelist a candidate for validator registration (Phase 3: 3.2.1).
+    ValidatorRegistration,
 }
 
 impl BorshSerialize for ProposalType {
@@ -89,6 +91,7 @@ impl BorshSerialize for ProposalType {
             Self::TreasurySpend => 1,
             Self::MarketListing => 2,
             Self::TextProposal => 3,
+            Self::ValidatorRegistration => 4,
         };
         writer.write_all(&[disc])
     }
@@ -103,6 +106,7 @@ impl BorshDeserialize for ProposalType {
             1 => Ok(Self::TreasurySpend),
             2 => Ok(Self::MarketListing),
             3 => Ok(Self::TextProposal),
+            4 => Ok(Self::ValidatorRegistration),
             x => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("invalid ProposalType discriminant: {x}"),
@@ -183,6 +187,10 @@ pub enum ExecutionPayload {
         tick_size: FixedPoint,
         initial_margin: FixedPoint,
     },
+    /// Whitelist a candidate address for validator registration (Phase 3: 3.2.1).
+    ValidatorRegistration {
+        candidate: Address,
+    },
 }
 
 impl BorshSerialize for ExecutionPayload {
@@ -221,6 +229,10 @@ impl BorshSerialize for ExecutionPayload {
                 BorshSerialize::serialize(&lot_size.raw(), writer)?;
                 BorshSerialize::serialize(&tick_size.raw(), writer)?;
                 BorshSerialize::serialize(&initial_margin.raw(), writer)?;
+            }
+            Self::ValidatorRegistration { candidate } => {
+                writer.write_all(&[3u8])?;
+                borsh_write_address(candidate, writer)?;
             }
         }
         Ok(())
@@ -265,6 +277,10 @@ impl BorshDeserialize for ExecutionPayload {
                     tick_size,
                     initial_margin,
                 })
+            }
+            3 => {
+                let candidate = borsh_read_address(reader)?;
+                Ok(Self::ValidatorRegistration { candidate })
             }
             x => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -539,6 +555,9 @@ impl GovernanceManager {
             Some(ExecutionPayload::ParameterChange { .. }) => ProposalType::ParameterChange,
             Some(ExecutionPayload::TreasurySpend { .. }) => ProposalType::TreasurySpend,
             Some(ExecutionPayload::MarketListing { .. }) => ProposalType::MarketListing,
+            Some(ExecutionPayload::ValidatorRegistration { .. }) => {
+                ProposalType::ValidatorRegistration
+            }
             None => ProposalType::TextProposal,
         };
 
@@ -677,7 +696,7 @@ impl GovernanceManager {
 
         // Execute if there's a payload.
         if let Some(ref payload) = proposal.execution_payload {
-            self.execute_payload(payload, &params)?;
+            self.execute_payload(payload, &params, current_block)?;
             proposal.status = ProposalStatus::Executed;
             self.put_proposal(&proposal)?;
             tracing::info!(proposal_id, "proposal executed");
@@ -716,6 +735,7 @@ impl GovernanceManager {
         &self,
         payload: &ExecutionPayload,
         params: &GovernanceParams,
+        current_block: u64,
     ) -> Result<()> {
         match payload {
             ExecutionPayload::ParameterChange {
@@ -777,6 +797,21 @@ impl GovernanceManager {
                 self.state_db.put_cf_raw(CF_NATIVE_MARKETS, &key, &data)?;
 
                 tracing::info!(market_id, base_asset, quote_asset, "market listed via governance");
+            }
+            ExecutionPayload::ValidatorRegistration { candidate } => {
+                use crate::types::{ValidatorWhitelistEntry, WHITELIST_EXPIRY_BLOCKS};
+
+                let entry = ValidatorWhitelistEntry {
+                    candidate: *candidate,
+                    approved_at_block: current_block,
+                    expires_at_block: current_block + WHITELIST_EXPIRY_BLOCKS,
+                };
+                self.put_validator_whitelist(candidate, &entry)?;
+                tracing::info!(
+                    %candidate,
+                    expires = current_block + WHITELIST_EXPIRY_BLOCKS,
+                    "validator registration whitelisted via governance"
+                );
             }
         }
         Ok(())
@@ -863,6 +898,59 @@ impl GovernanceManager {
             borsh::to_vec(params).map_err(|e| EconomicsError::Borsh(e.to_string()))?;
         self.state_db
             .put_cf_raw(CF_FEE_CONFIG, GOVERNANCE_PARAMS_KEY, &data)?;
+        Ok(())
+    }
+
+    // ========================================================================
+    // Validator whitelist (Phase 3: 3.2.1)
+    // ========================================================================
+
+    /// Check if a candidate address is whitelisted for validator registration.
+    pub fn is_whitelisted(&self, candidate: &Address, current_block: u64) -> Result<bool> {
+        match self.get_validator_whitelist(candidate)? {
+            Some(entry) => Ok(current_block <= entry.expires_at_block),
+            None => Ok(false),
+        }
+    }
+
+    /// Get a validator whitelist entry.
+    pub fn get_validator_whitelist(
+        &self,
+        candidate: &Address,
+    ) -> Result<Option<crate::types::ValidatorWhitelistEntry>> {
+        use crate::types::ValidatorWhitelistEntry;
+        use torus_state::cf::CF_CONSENSUS_META;
+
+        let key = whitelist_key(candidate);
+        match self.state_db.get_cf_raw(CF_CONSENSUS_META, &key)? {
+            Some(data) => Ok(Some(
+                ValidatorWhitelistEntry::try_from_slice(&data)
+                    .map_err(|e| EconomicsError::Borsh(e.to_string()))?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    /// Store a validator whitelist entry.
+    fn put_validator_whitelist(
+        &self,
+        candidate: &Address,
+        entry: &crate::types::ValidatorWhitelistEntry,
+    ) -> Result<()> {
+        use torus_state::cf::CF_CONSENSUS_META;
+
+        let key = whitelist_key(candidate);
+        let data = borsh::to_vec(entry).map_err(|e| EconomicsError::Borsh(e.to_string()))?;
+        self.state_db.put_cf_raw(CF_CONSENSUS_META, &key, &data)?;
+        Ok(())
+    }
+
+    /// Consume (delete) a validator whitelist entry after registration.
+    pub fn consume_whitelist(&self, candidate: &Address) -> Result<()> {
+        use torus_state::cf::CF_CONSENSUS_META;
+
+        let key = whitelist_key(candidate);
+        self.state_db.delete_cf_raw(CF_CONSENSUS_META, &key)?;
         Ok(())
     }
 
@@ -1003,5 +1091,12 @@ pub fn vote_key(proposal_id: u64, voter: &Address) -> [u8; 28] {
     let mut key = [0u8; 28];
     key[..8].copy_from_slice(&proposal_id.to_be_bytes());
     key[8..28].copy_from_slice(voter.as_slice());
+    key
+}
+
+/// Build key for validator whitelist: "validator_whitelist:" ++ address(20).
+fn whitelist_key(candidate: &Address) -> Vec<u8> {
+    let mut key = b"validator_whitelist:".to_vec();
+    key.extend_from_slice(candidate.as_slice());
     key
 }

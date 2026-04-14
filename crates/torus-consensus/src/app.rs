@@ -84,12 +84,21 @@ impl TorusApp {
     }
 
     /// Compute validator set updates at epoch boundary.
+    ///
+    /// Phase 3 (3.2): applies pending key rotations, enforces rotation cap
+    /// derived from BFT safety requirements, and checks minimum set size.
     fn epoch_validator_set_updates(&mut self, height: u64) -> Option<ValidatorSetUpdates> {
         if !EpochManager::is_epoch_boundary(height, self.epoch_length) {
             return None;
         }
 
         let epoch = EpochManager::epoch_for_block(height, self.epoch_length);
+
+        // Phase 3 (3.2.4): Apply pending key rotations BEFORE computing new set
+        if let Err(e) = self.staking.apply_pending_rotations(epoch) {
+            tracing::error!(%e, "failed to apply pending key rotations");
+        }
+
         let new_set = match EpochManager::compute_new_validator_set(
             &self.staking,
             self.max_validators,
@@ -102,14 +111,35 @@ impl TorusApp {
             }
         };
 
-        let diff = EpochManager::compute_validator_set_diff(&self.last_validator_set, &new_set);
-        if diff.is_empty() {
-            self.last_validator_set = new_set;
+        // Phase 3 (3.2.4): Check minimum set size
+        if let Err(e) = EpochManager::check_minimum_set(&new_set) {
+            tracing::error!(%e, "epoch rotation aborted: set too small");
             return None;
         }
 
+        // Phase 3 (3.2.4): Apply rotation cap derived from BFT safety
+        // hotstuff_rs quorum = (2/3 * total_power) + 1, so max floor(n/3)
+        // validators can change per epoch to maintain quorum overlap.
+        let cap = EpochManager::safe_rotation_cap(self.last_validator_set.validators.len());
+        let capped_set = if cap > 0 {
+            EpochManager::apply_rotation_cap(&self.last_validator_set, new_set.clone(), cap)
+        } else {
+            // First epoch or empty set — no cap needed
+            new_set.clone()
+        };
+
+        let diff =
+            EpochManager::compute_validator_set_diff(&self.last_validator_set, &capped_set);
+        if diff.is_empty() {
+            self.last_validator_set = capped_set;
+            return None;
+        }
+
+        // Phase 3 (3.2.2): Log detailed rotation events
+        EpochManager::log_rotation(&self.last_validator_set, &capped_set, &diff, epoch);
+
         // Update validator statuses in state.
-        if let Err(e) = EpochManager::update_validator_statuses(&self.staking, &new_set) {
+        if let Err(e) = EpochManager::update_validator_statuses(&self.staking, &capped_set) {
             tracing::error!(%e, "failed to update validator statuses");
         }
 
@@ -130,13 +160,38 @@ impl TorusApp {
             }
         }
 
+        // BUG FIX (3.2): Handle key rotations — delete old pubkeys
+        for old_pk in &diff.rotated_out_pubkeys {
+            if let Ok(vk) = VerifyingKey::from_bytes(old_pk) {
+                updates.delete(vk);
+            }
+        }
+
+        // Phase 3 (3.2.4): Warn if new validators are not known peers
+        for v in &diff.inserts {
+            let is_new = !self
+                .last_validator_set
+                .validators
+                .iter()
+                .any(|old| old.address == v.address);
+            if is_new {
+                tracing::warn!(
+                    epoch,
+                    validator = %v.address,
+                    "new active validator — ensure peer connectivity for consensus messages"
+                );
+            }
+        }
+
         tracing::info!(
             epoch,
             inserts = diff.inserts.len(),
             deletes = diff.deletes.len(),
+            key_rotations = diff.rotated_out_pubkeys.len(),
+            active_set_size = capped_set.validators.len(),
             "epoch boundary: validator set updated"
         );
-        self.last_validator_set = new_set;
+        self.last_validator_set = capped_set;
         Some(updates)
     }
 
