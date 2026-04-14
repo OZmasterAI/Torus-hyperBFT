@@ -17,6 +17,8 @@ members = [
     "crates/torus-integration-tests",
     "crates/hotstuff_rs",
     "crates/torus-explorer",
+    "tools/faucet",
+    "tools/wallet",
 ]
 
 [workspace.package]
@@ -99,6 +101,9 @@ hex = "0.4"
 
 # CLI
 clap = { version = "4", features = ["derive"] }
+
+# HTTP client
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # Testing
 proptest = "1"
