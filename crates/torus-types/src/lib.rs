@@ -701,6 +701,19 @@ pub struct ChainConfig {
     pub fee_dev_pool_bps: u32,
 }
 
+impl ChainConfig {
+    /// FIX CONS-PF-04: Validate chain configuration parameters.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.epoch_length == 0 {
+            return Err("epoch_length must be >= 1".to_string());
+        }
+        if self.max_validators == 0 {
+            return Err("max_validators must be >= 1".to_string());
+        }
+        Ok(())
+    }
+}
+
 // ============================================================================
 // Receipt / Log (§4)
 // ============================================================================

@@ -252,6 +252,7 @@ fn is_fresh_proposal_with_tc_high_qc() {
             signatures: SignatureSet::new(0),
         }),
         high_tip_is_winner: false,
+        voter_metadata: vec![],
     };
     let proposal = Proposal {
         chain_id: ChainID::new(0),
@@ -281,6 +282,7 @@ fn is_not_fresh_for_reproposal() {
         high_tip: None,
         high_qc: None,       // No high_qc
         high_tip_is_winner: true, // high_tip wins
+        voter_metadata: vec![],
     };
     let proposal = Proposal {
         chain_id: ChainID::new(0),

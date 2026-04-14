@@ -160,6 +160,12 @@ impl StakingManager {
         // Reduce active delegation.
         delegation.amount -= amount;
 
+        // FIX ECON-FIND-30: Cap unbonding entries to prevent DoS via queue bloat.
+        const MAX_UNBONDING_ENTRIES: usize = 100;
+        if delegation.unbonding.len() >= MAX_UNBONDING_ENTRIES {
+            return Err(EconomicsError::TooManyUnbondingEntries { delegator, validator });
+        }
+
         // Add unbonding entry.
         delegation.unbonding.push(UnbondingEntry {
             amount,
@@ -346,8 +352,13 @@ impl StakingManager {
             }
         }
 
-        // Update total_delegated
-        val.total_delegated = val.total_delegated.saturating_sub(total_del_slashed);
+        // FIX ECON-FIND-27: Recompute total_delegated from actual delegation amounts
+        // instead of using a running counter, to avoid dust rounding divergence.
+        let updated_delegations = self.delegations_for_validator(&validator_addr)?;
+        val.total_delegated = updated_delegations
+            .iter()
+            .map(|d| d.amount)
+            .fold(U256::ZERO, |a, b| a + b);
 
         // Auto-jail if self_stake drops below minimum
         if val.self_stake < MIN_SELF_DELEGATION
@@ -507,7 +518,12 @@ impl StakingManager {
                 continue;
             }
 
-            total_weight += vote.stake_weight;
+            // FIX ECON-FIND-24: Use current stake, not stored vote-time stake.
+            let current_weight = match self.get_validator(&vote.voter) {
+                Ok(Some(v)) if v.status == ValidatorStatus::Active => v.total_stake(),
+                _ => U256::ZERO, // Voter no longer active — don't count
+            };
+            total_weight += current_weight;
         }
 
         // Clean up expired votes
@@ -603,6 +619,27 @@ impl StakingManager {
         self.clear_jail_votes(validator_addr)?;
 
         tracing::info!(%validator_addr, "validator unjailed → Candidate");
+        Ok(())
+    }
+
+    // ========================================================================
+    // Self-stake top-up (ECON-FIND-28)
+    // ========================================================================
+
+    /// Top up a validator's self_stake. Allows recovery from a slash that
+    /// dropped self_stake below MIN_SELF_DELEGATION. Works even when jailed.
+    pub fn top_up_self_stake(&self, validator_addr: Address, amount: U256) -> Result<()> {
+        if amount.is_zero() {
+            return Ok(());
+        }
+        let mut val = self
+            .get_validator(&validator_addr)?
+            .ok_or(EconomicsError::ValidatorNotFound(validator_addr))?;
+        // Allow top-up even when jailed (the whole point is to recover)
+        self.debit_balance(&validator_addr, amount)?;
+        val.self_stake += amount;
+        self.put_validator(&validator_addr, &val)?;
+        tracing::info!(%validator_addr, %amount, "self-stake topped up");
         Ok(())
     }
 
@@ -771,6 +808,13 @@ impl StakingManager {
         Ok(validators)
     }
 
+    /// FIX CONS-FIND-01: Look up a validator by their consensus public key.
+    /// Returns the validator's Ethereum address and state if found.
+    pub fn find_validator_by_pubkey(&self, pubkey: &[u8; 32]) -> Result<Option<ValidatorState>> {
+        let all = self.all_validators()?;
+        Ok(all.into_iter().find(|v| &v.pubkey == pubkey))
+    }
+
     /// Read all delegations for a specific delegator (prefix scan on delegator address).
     pub fn delegations_for_delegator(&self, delegator: &Address) -> Result<Vec<Delegation>> {
         let db = self.state_db.inner();
@@ -875,6 +919,11 @@ impl StakingManager {
 
     /// Apply all pending key rotations for the given epoch. Called at epoch boundary.
     /// Returns the list of validators whose keys were rotated.
+    /// Apply all pending key rotations for the given epoch. Called at epoch boundary.
+    ///
+    /// FIX CONS-FIND-09: This function deletes rotations from DB. The caller
+    /// (epoch_validator_set_updates) MUST cache results per height to prevent
+    /// double-application when called from both produce_block and validate_block.
     pub fn apply_pending_rotations(&self, epoch: u64) -> Result<Vec<(Address, [u8; 32])>> {
         let mut applied = Vec::new();
 
@@ -1561,5 +1610,227 @@ mod tests {
             .unwrap();
         let val = mgr.get_validator(&validator).unwrap().unwrap();
         assert_eq!(val.commission_bps, 650);
+    }
+
+    // ====================================================================
+    // FIX 27: Slash dust rounding — total_delegated recomputed
+    // ====================================================================
+
+    #[test]
+    fn slash_dust_delegation_total_delegated_stays_consistent() {
+        let (_dir, mgr) = setup();
+        let validator = addr(1);
+        let delegator = addr(2);
+
+        fund_account(&mgr, &validator, wei(100_000));
+        fund_account(&mgr, &delegator, wei(100_000));
+
+        mgr.register_validator(validator, [1u8; 32], 500, wei(50_000))
+            .unwrap();
+
+        // Delegate a dust amount (1 wei) that will round to zero when slashed
+        mgr.delegate(delegator, validator, U256::from(1u64))
+            .unwrap();
+
+        // Slash 10 bps (0.1%) — 1 * 10 / 10000 = 0, rounds to zero
+        mgr.slash(validator, 10, SlashReason::Downtime, 100)
+            .unwrap();
+
+        let val = mgr.get_validator(&validator).unwrap().unwrap();
+        let delegations = mgr.delegations_for_validator(&validator).unwrap();
+        let sum_delegated: U256 = delegations.iter().map(|d| d.amount).fold(U256::ZERO, |a, b| a + b);
+
+        // total_delegated must match actual sum of delegation amounts
+        assert_eq!(val.total_delegated, sum_delegated,
+            "total_delegated diverged from sum of delegations after dust slash");
+    }
+
+    // ====================================================================
+    // FIX 28: top_up_self_stake allows recovery after slash
+    // ====================================================================
+
+    #[test]
+    fn top_up_self_stake_basic() {
+        let (_dir, mgr) = setup();
+        let validator = addr(1);
+
+        fund_account(&mgr, &validator, wei(100_000));
+        mgr.register_validator(validator, [1u8; 32], 500, wei(50_000))
+            .unwrap();
+
+        let top_up = wei(5_000);
+        mgr.top_up_self_stake(validator, top_up).unwrap();
+
+        let val = mgr.get_validator(&validator).unwrap().unwrap();
+        assert_eq!(val.self_stake, wei(55_000));
+    }
+
+    #[test]
+    fn top_up_self_stake_while_jailed_then_unjail() {
+        let (_dir, mgr) = setup();
+        let validator = addr(1);
+
+        // Register with minimum self_stake, extra balance for top-up
+        fund_account(&mgr, &validator, wei(100_000));
+        mgr.register_validator(validator, [1u8; 32], 500, MIN_SELF_DELEGATION)
+            .unwrap();
+
+        // Slash 5% to drop below MIN_SELF_DELEGATION (auto-jails)
+        mgr.slash(validator, 500, SlashReason::Downtime, 100)
+            .unwrap();
+        let val = mgr.get_validator(&validator).unwrap().unwrap();
+        assert_eq!(val.status, ValidatorStatus::Jailed);
+        assert!(val.self_stake < MIN_SELF_DELEGATION);
+
+        // Top up while jailed to restore self_stake above minimum
+        let deficit = MIN_SELF_DELEGATION - val.self_stake + U256::from(1u64);
+        mgr.top_up_self_stake(validator, deficit).unwrap();
+
+        let val = mgr.get_validator(&validator).unwrap().unwrap();
+        assert!(val.self_stake >= MIN_SELF_DELEGATION);
+
+        // Now unjail should succeed after cooldown
+        let unjail_block = 100 + JAIL_DURATION_BLOCKS;
+        mgr.unjail(&validator, unjail_block).unwrap();
+
+        let val = mgr.get_validator(&validator).unwrap().unwrap();
+        assert_eq!(val.status, ValidatorStatus::Candidate);
+    }
+
+    #[test]
+    fn top_up_self_stake_zero_is_noop() {
+        let (_dir, mgr) = setup();
+        let validator = addr(1);
+
+        fund_account(&mgr, &validator, wei(100_000));
+        mgr.register_validator(validator, [1u8; 32], 500, wei(50_000))
+            .unwrap();
+
+        mgr.top_up_self_stake(validator, U256::ZERO).unwrap();
+        let val = mgr.get_validator(&validator).unwrap().unwrap();
+        assert_eq!(val.self_stake, wei(50_000));
+    }
+
+    #[test]
+    fn top_up_self_stake_insufficient_balance() {
+        let (_dir, mgr) = setup();
+        let validator = addr(1);
+
+        // Fund exactly enough for registration, nothing left over
+        fund_account(&mgr, &validator, MIN_SELF_DELEGATION);
+        mgr.register_validator(validator, [1u8; 32], 500, MIN_SELF_DELEGATION)
+            .unwrap();
+
+        let result = mgr.top_up_self_stake(validator, wei(1));
+        assert!(matches!(result, Err(EconomicsError::InsufficientBalance { .. })));
+    }
+
+    // ====================================================================
+    // FIX 29: Jail vote uses current stake weight
+    // ====================================================================
+
+    #[test]
+    fn jail_vote_uses_current_stake_not_vote_time() {
+        let (_dir, mgr) = setup();
+        let v1 = addr(1);
+        let v2 = addr(2);
+        let v3 = addr(3);
+        let target = addr(4);
+
+        for v in [v1, v2, v3, target] {
+            fund_account(&mgr, &v, wei(200_000));
+            mgr.register_validator(v, [v.0[0]; 32], 500, wei(25_000))
+                .unwrap();
+        }
+        for v in [v1, v2, v3, target] {
+            let mut val = mgr.get_validator(&v).unwrap().unwrap();
+            val.status = ValidatorStatus::Active;
+            mgr.put_validator(&v, &val).unwrap();
+        }
+
+        // v1 and v2 vote at blocks 100-101
+        mgr.record_jail_vote(v1, target, 100).unwrap();
+        mgr.record_jail_vote(v2, target, 101).unwrap();
+
+        // Now slash v1 and v2 heavily, reducing their stake
+        mgr.slash(v1, 9000, SlashReason::Downtime, 102).unwrap();
+        mgr.slash(v2, 9000, SlashReason::Downtime, 103).unwrap();
+
+        // v3 votes — but with v1+v2 slashed, their current weight is small,
+        // so total should NOT reach 2/3 of active stake anymore
+        // (v1: 2500, v2: 2500, v3: 25000 = 30000 vs total active ~55000+25000=80000ish)
+        // Actually let's verify the behavior by checking the vote passes or not
+        // The key point: it uses current stake, not vote-time stake.
+        let jailed = mgr.record_jail_vote(v3, target, 104).unwrap();
+
+        // With old code (stored weights): v1(25000) + v2(25000) + v3(25000) = 75000
+        //   vs total_active = ~55000 (slashed validators still active).
+        //   75000*3 > 55000*2 → would jail
+        // With fix (current weights): v1(~2500) + v2(~2500) + v3(25000) = ~30000
+        //   vs total_active = ~55000.
+        //   30000*3 = 90000 vs 55000*2 = 110000 → should NOT jail
+        assert!(!jailed, "jail vote should not pass when voters' stakes were slashed");
+    }
+
+    // ====================================================================
+    // FIX 30: Unbonding queue length cap
+    // ====================================================================
+
+    #[test]
+    fn unbonding_queue_cap_enforced() {
+        let (_dir, mgr) = setup();
+        let validator = addr(1);
+        let delegator = addr(2);
+
+        fund_account(&mgr, &validator, wei(100_000));
+        fund_account(&mgr, &delegator, wei(100_000));
+
+        mgr.register_validator(validator, [1u8; 32], 500, wei(50_000))
+            .unwrap();
+        mgr.delegate(delegator, validator, wei(50_000)).unwrap();
+
+        // Fill up unbonding queue to the cap
+        let small = U256::from(1u64);
+        for i in 0..100u64 {
+            mgr.undelegate(delegator, validator, small, 1000 + i)
+                .unwrap();
+        }
+
+        // 101st should fail
+        let result = mgr.undelegate(delegator, validator, small, 2000);
+        assert!(
+            matches!(result, Err(EconomicsError::TooManyUnbondingEntries { .. })),
+            "expected TooManyUnbondingEntries error"
+        );
+    }
+
+    #[test]
+    fn unbonding_queue_cap_allows_after_processing() {
+        let (_dir, mgr) = setup();
+        let validator = addr(1);
+        let delegator = addr(2);
+
+        fund_account(&mgr, &validator, wei(100_000));
+        fund_account(&mgr, &delegator, wei(100_000));
+
+        mgr.register_validator(validator, [1u8; 32], 500, wei(50_000))
+            .unwrap();
+        mgr.delegate(delegator, validator, wei(50_000)).unwrap();
+
+        // Fill up to cap
+        let small = U256::from(1u64);
+        for i in 0..100u64 {
+            mgr.undelegate(delegator, validator, small, 1000 + i)
+                .unwrap();
+        }
+
+        // Process all matured unbondings (release all of them)
+        let release_block = 1100 + UNBONDING_PERIOD;
+        mgr.process_unbonding(delegator, validator, release_block)
+            .unwrap();
+
+        // Now we should be able to undelegate again
+        mgr.undelegate(delegator, validator, small, release_block + 1)
+            .unwrap();
     }
 }

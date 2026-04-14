@@ -419,6 +419,9 @@ pub struct NoEndorsementCertificate {
 /// 1. nec.high_tip_qc_view < nec.view - 1 (the skipped block was NOT in the
 ///    immediately preceding view — otherwise there's no gap to recover from)
 /// 2. The signatures contain 2f+1 valid signatures over (nec.view, nec.high_tip_qc_view)
+/// 3. FIX CONS-PF-07: NEC signers must be non-voting validators (not in voter_set).
+///    MonadBFT tail-fork resistance requires NECs to only come from validators who
+///    did not vote in the current view.
 pub fn valid_nec<K: KVStore>(
     nec: &NoEndorsementCertificate,
     block_tree: &BlockTreeSingleton<K>,
@@ -429,12 +432,16 @@ pub fn valid_nec<K: KVStore>(
     }
 
     // Condition 2: verify 2f+1 valid signatures.
+    // FIX CONS-FIND-15: During validator set transition, validate against the
+    // validator set that was active when the NEC was produced. The previous code
+    // had a dead branch returning committed_validator_set() in both cases.
     let validator_set_state = block_tree.validator_set_state()?;
     let validator_set = if validator_set_state.update_decided() {
         validator_set_state.committed_validator_set()
     } else {
-        // During speculation, accept from either set.
-        validator_set_state.committed_validator_set()
+        // During transition, use the previous validator set (the one that was
+        // active when the NEC was produced).
+        validator_set_state.previous_validator_set()
     };
 
     Ok(is_nec_correctly_signed(nec, validator_set))
@@ -503,6 +510,10 @@ pub fn is_fresh_proposal(proposal: &Proposal) -> bool {
 ///
 /// Incrementally collects NE signatures from validators who did not vote for
 /// the high_tip block, forming an NEC when 2f+1 are collected.
+///
+/// FIX CONS-PF-07: Tracks a voter set to reject NE signatures from validators
+/// who voted for the high_tip block. MonadBFT's tail-fork resistance requires
+/// that NEC signers did NOT vote in the current view.
 #[derive(Clone)]
 pub struct NECollector {
     view: ViewNumber,
@@ -510,6 +521,9 @@ pub struct NECollector {
     validator_set: ValidatorSet,
     signature_set: SignatureSet,
     signature_set_power: TotalPower,
+    /// Set of validators known to have voted for the high_tip block.
+    /// NE signatures from these validators are rejected.
+    voters: std::collections::HashSet<ed25519_dalek::VerifyingKey>,
 }
 
 impl NECollector {
@@ -525,7 +539,14 @@ impl NECollector {
             validator_set,
             signature_set: SignatureSet::new(n),
             signature_set_power: TotalPower::new(0),
+            voters: std::collections::HashSet::new(),
         }
+    }
+
+    /// Register a validator as having voted for the high_tip block.
+    /// NE signatures from this validator will be rejected.
+    pub fn register_voter(&mut self, voter: ed25519_dalek::VerifyingKey) {
+        self.voters.insert(voter);
     }
 
     /// Collect an NE signature from a validator.
@@ -539,6 +560,11 @@ impl NECollector {
     ) -> Option<NoEndorsementCertificate> {
         // Verify the NE is for the correct view and high_tip_qc_view.
         if ne_view != self.view || ne_high_tip_qc_view != self.high_tip_qc_view {
+            return None;
+        }
+
+        // FIX CONS-PF-07: Reject NE from validators who voted for the high_tip block.
+        if self.voters.contains(signer) {
             return None;
         }
 

@@ -297,7 +297,21 @@ impl<N: Network> BlockSyncClient<N> {
                 None => BlockHeight::new(0),
             };
 
+        // FIX CONS-FIND-06: bound the sync loop to prevent DoS from malicious servers.
+        const MAX_SYNC_ITERATIONS: u32 = 1000;
+        let sync_session_deadline = Instant::now() + Duration::from_secs(30);
+        let mut iterations = 0u32;
+
         loop {
+            iterations += 1;
+            if iterations > MAX_SYNC_ITERATIONS {
+                log::warn!("sync session hit max iteration limit: {iterations}");
+                break;
+            }
+            if Instant::now() >= sync_session_deadline {
+                log::warn!("sync session hit time deadline after {iterations} iterations");
+                break;
+            }
             let request = BlockSyncRequest {
                 chain_id: self.config.chain_id,
                 start_height: if let Some(height) = block_tree.highest_committed_block_height()? {
@@ -447,6 +461,15 @@ impl<N: Network> BlockSyncClient<N> {
                 }
             }
         }
+
+        // Reached iteration or time limit — end sync session gracefully.
+        Event::EndSync(EndSyncEvent {
+            timestamp: SystemTime::now(),
+            peer: *peer,
+            blocks_synced,
+        })
+        .publish(&self.event_publisher);
+        Ok(())
     }
 }
 

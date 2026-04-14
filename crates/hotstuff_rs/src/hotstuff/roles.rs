@@ -272,3 +272,30 @@ pub(crate) fn new_view_recipients(
         },
     )
 }
+
+/// FIX CONS-PF-10: Reputation-weighted new_view recipients.
+pub(crate) fn new_view_recipients_with_reputation(
+    new_view: &NewView,
+    validator_set_state: &ValidatorSetState,
+    reputation: Option<&crate::hotstuff::types::LeaderReputation>,
+) -> (VerifyingKey, Option<VerifyingKey>) {
+    use crate::pacemaker::implementation::select_leader_with_reputation;
+    let select = |view, vs: &crate::types::validator_set::ValidatorSet| match reputation {
+        Some(rep) => select_leader_with_reputation(view, vs, rep),
+        None => select_leader(view, vs),
+    };
+    (
+        select(
+            new_view.view + 1,
+            validator_set_state.committed_validator_set(),
+        ),
+        if validator_set_state.update_decided() {
+            None
+        } else {
+            Some(select(
+                new_view.view + 1,
+                validator_set_state.previous_validator_set(),
+            ))
+        },
+    )
+}

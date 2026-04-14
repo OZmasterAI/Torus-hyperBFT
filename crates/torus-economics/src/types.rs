@@ -560,8 +560,10 @@ impl BorshDeserialize for PendingKeyRotation {
     }
 }
 
-/// Key rotation cooldown: cannot rotate again for 1 epoch after rotation.
-pub const KEY_ROTATION_COOLDOWN_EPOCHS: u64 = 1;
+// FIX ECON-FIND-29: Removed dead constant KEY_ROTATION_COOLDOWN_EPOCHS.
+// submit_key_rotation only checks for existing pending rotation, not cooldown.
+// If cooldown enforcement is desired, add a `last_rotation_epoch` field to
+// ValidatorState and check it in submit_key_rotation.
 
 /// Commission change cooldown: 28,800 blocks (~2 days at 6s blocks).
 pub const COMMISSION_COOLDOWN_BLOCKS: u64 = 28_800;

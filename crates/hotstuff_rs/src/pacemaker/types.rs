@@ -50,6 +50,12 @@ pub struct TimeoutCertificate {
     pub high_tip: Option<TipInfo>,
     pub high_qc: Option<PhaseCertificate>,
     pub high_tip_is_winner: bool,
+
+    /// Per-voter signed metadata for TC signature verification.
+    /// Each entry corresponds to the same position as in `signatures`:
+    /// (optional local_tip block hash, optional (highest_qc view, highest_qc block hash)).
+    /// This enables TC verification to reconstruct per-voter message bytes.
+    pub voter_metadata: Vec<(Option<CryptoHash>, Option<(ViewNumber, CryptoHash)>)>,
 }
 
 impl Certificate for TimeoutCertificate {
@@ -83,20 +89,38 @@ impl Certificate for TimeoutCertificate {
             return false;
         }
 
+        let base_msg = (self.chain_id, self.view).try_to_vec().unwrap();
+
         // Check whether every signature is correct and tally up their powers.
         let mut total_power: TotalPower = TotalPower::new(0);
-        for (signature, (signer, power)) in self
+        for (idx, (signature, (_signer, power))) in self
             .signatures
             .iter()
             .zip(validator_set.validators_and_powers())
+            .enumerate()
         {
             if let Some(signature) = signature {
                 if let Ok(signature) = Signature::from_slice(&signature.bytes()) {
-                    if signer
-                        .verify(
-                            &(self.chain_id, self.view).try_to_vec().unwrap(),
-                            &signature,
-                        )
+                    // Reconstruct the per-voter message bytes including their
+                    // local_tip and highest_qc metadata (bound by their signature).
+                    let msg = if idx < self.voter_metadata.len() {
+                        let (ref tip_hash, ref qc_summary) = self.voter_metadata[idx];
+                        let mut m = base_msg.clone();
+                        if let Some(ref hash) = tip_hash {
+                            m.extend_from_slice(&hash.bytes());
+                        }
+                        if let Some((qc_view, ref qc_block)) = qc_summary {
+                            m.extend_from_slice(&qc_view.int().to_be_bytes());
+                            m.extend_from_slice(&qc_block.bytes());
+                        }
+                        m
+                    } else {
+                        // Backward compatibility: no voter_metadata, use base message.
+                        base_msg.clone()
+                    };
+
+                    if _signer
+                        .verify(&msg, &signature)
                         .is_ok()
                     {
                         total_power += power;
@@ -127,6 +151,9 @@ pub(crate) struct TimeoutVoteCollector {
     signature_set: SignatureSet,
     high_tip: Option<TipInfo>,
     high_qc: Option<PhaseCertificate>,
+    /// Per-voter metadata: (optional local_tip hash, optional (highest_qc view, highest_qc block)).
+    /// Indexed by validator position, enables TC signature verification.
+    voter_metadata: Vec<(Option<CryptoHash>, Option<(ViewNumber, CryptoHash)>)>,
 }
 
 impl Collector for TimeoutVoteCollector {
@@ -144,6 +171,7 @@ impl Collector for TimeoutVoteCollector {
             signature_set: SignatureSet::new(n),
             high_tip: None,
             high_qc: None,
+            voter_metadata: vec![(None, None); n],
         }
     }
 
@@ -180,6 +208,13 @@ impl Collector for TimeoutVoteCollector {
                 self.signature_set.set(pos, Some(vote.signature));
                 self.signature_set_power += *self.validator_set.power(signer).unwrap();
 
+                // Store per-voter signed metadata for TC signature verification.
+                let tip_hash = vote.local_tip.as_ref().map(|t| t.block_hash);
+                let qc_summary = vote.highest_qc.as_ref().map(|q| (q.view, q.block));
+                if pos < self.voter_metadata.len() {
+                    self.voter_metadata[pos] = (tip_hash, qc_summary);
+                }
+
                 // MonadBFT: track high_tip and high_qc
                 if let Some(ref tip) = vote.local_tip {
                     if self.high_tip.is_none() || tip.view > self.high_tip.as_ref().unwrap().view {
@@ -207,6 +242,7 @@ impl Collector for TimeoutVoteCollector {
                         high_tip: self.high_tip.clone(),
                         high_qc: self.high_qc.clone(),
                         high_tip_is_winner,
+                        voter_metadata: self.voter_metadata.clone(),
                     };
                     return Some(collected_tc);
                 }

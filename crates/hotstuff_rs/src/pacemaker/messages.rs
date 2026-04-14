@@ -43,8 +43,12 @@ impl PacemakerMessage {
         local_tip: Option<TipInfo>,
         highest_qc: Option<crate::hotstuff::types::PhaseCertificate>,
     ) -> PacemakerMessage {
-        let message = &(chain_id, view).try_to_vec().unwrap();
-        let signature = keypair.sign(message);
+        // Sign the full message including local_tip and highest_qc to prevent
+        // MITM substitution of these fields.
+        let message = TimeoutVote::build_message_bytes(
+            chain_id, view, &local_tip, &highest_qc,
+        );
+        let signature = keypair.sign(&message);
 
         PacemakerMessage::TimeoutVote(TimeoutVote {
             chain_id,
@@ -131,9 +135,37 @@ pub struct TimeoutVote {
     pub highest_qc: Option<crate::hotstuff::types::PhaseCertificate>,
 }
 
+impl TimeoutVote {
+    /// Build the signed message bytes for a TimeoutVote, including local_tip
+    /// and highest_qc to prevent MITM substitution of these fields.
+    fn build_message_bytes(
+        chain_id: ChainID,
+        view: ViewNumber,
+        local_tip: &Option<TipInfo>,
+        highest_qc: &Option<PhaseCertificate>,
+    ) -> Vec<u8> {
+        let mut bytes = (chain_id, view).try_to_vec().unwrap();
+        // Include local_tip block hash to bind it to the signature.
+        if let Some(ref tip) = local_tip {
+            bytes.extend_from_slice(&tip.block_hash.bytes());
+        }
+        // Include highest_qc view and block hash to bind them to the signature.
+        if let Some(ref qc) = highest_qc {
+            bytes.extend_from_slice(&qc.view.int().to_be_bytes());
+            bytes.extend_from_slice(&qc.block.bytes());
+        }
+        bytes
+    }
+}
+
 impl SignedMessage for TimeoutVote {
     fn message_bytes(&self) -> Vec<u8> {
-        (self.chain_id, self.view).try_to_vec().unwrap()
+        TimeoutVote::build_message_bytes(
+            self.chain_id,
+            self.view,
+            &self.local_tip,
+            &self.highest_qc,
+        )
     }
 
     fn signature_bytes(&self) -> SignatureBytes {

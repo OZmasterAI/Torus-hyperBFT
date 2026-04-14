@@ -8,7 +8,7 @@
 //! Main type: [`Pacemaker`].
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::mpsc::Sender,
     time::{Duration, Instant, SystemTime},
 };
@@ -249,15 +249,32 @@ impl<N: Network> Pacemaker<N> {
         // 2. Check whether the `TimeoutVote` is cryptographically correct.
         // MonadBFT: accept timeout votes for ALL views (not just epoch-change views).
         if timeout_vote.is_correct(origin) {
-            // MonadBFT Bracha amplification: count timeout votes per view.
+            // MonadBFT Bracha amplification: accumulate voting power per view.
             if timeout_vote.view >= self.view_info.view {
-                let count = self.state.bracha_timeout_counts
+                // Deduplicate: skip if this voter already contributed to this view.
+                let voter_key = origin.to_bytes();
+                let voters = self.state.bracha_timeout_voters
                     .entry(timeout_vote.view)
-                    .or_insert(0);
-                *count += 1;
+                    .or_insert_with(BTreeSet::new);
+                if !voters.contains(&voter_key) {
+                    voters.insert(voter_key);
+                    // Look up voter's power and accumulate.
+                    let voter_power = validator_set_state
+                        .committed_validator_set()
+                        .power(origin)
+                        .map(|p| p.int())
+                        .unwrap_or(0);
+                    let accumulated = self.state.bracha_timeout_power
+                        .entry(timeout_vote.view)
+                        .or_insert(0);
+                    *accumulated += voter_power;
+                }
+                let accumulated_power = *self.state.bracha_timeout_power
+                    .get(&timeout_vote.view)
+                    .unwrap_or(&0);
                 let total_power = validator_set_state.committed_validator_set().total_power().int() as u64;
                 let f = if total_power > 0 { (total_power - 1) / 3 } else { 0 };
-                if *count == f + 1
+                if accumulated_power >= f + 1
                     && is_validator(&self.config.keypair.public(), &validator_set_state)
                     && self.state.last_timeout_vote_view.map_or(true, |v| v < timeout_vote.view)
                 {
@@ -398,9 +415,10 @@ impl<N: Network> Pacemaker<N> {
         let progress_certificate = advance_view.progress_certificate.clone();
         let is_valid = match &progress_certificate {
             ProgressCertificate::PhaseCertificate(pc) => pc.is_correct(block_tree)?,
+            // FIX CONS-FIND-18: Accept TCs in AdvanceView for ANY view, not just
+            // epoch-change views. TCs are valid for liveness at any view.
             ProgressCertificate::TimeoutCertificate(tc) => {
                 tc.is_correct(&block_tree)?
-                    && is_epoch_change_view(&tc.view, self.config.epoch_length)
             }
         };
 
@@ -559,7 +577,10 @@ struct PacemakerState {
 
     /// The view in which this replica last broadcasted an [`AdvanceView`] message.
     last_advance_view: Option<ViewNumber>,
-    bracha_timeout_counts: BTreeMap<ViewNumber, u64>,
+    /// Bracha timeout amplification: accumulated voting power per view.
+    bracha_timeout_power: BTreeMap<ViewNumber, u64>,
+    /// Bracha timeout amplification: dedup set of voters per view (by key bytes).
+    bracha_timeout_voters: BTreeMap<ViewNumber, BTreeSet<[u8; 32]>>,
     last_timeout_vote_view: Option<ViewNumber>,
 }
 
@@ -601,7 +622,8 @@ impl PacemakerState {
                 validator_set_state,
             ),
             last_advance_view: None,
-            bracha_timeout_counts: BTreeMap::new(),
+            bracha_timeout_power: BTreeMap::new(),
+            bracha_timeout_voters: BTreeMap::new(),
             last_timeout_vote_view: None,
         }
     }
@@ -801,13 +823,23 @@ pub fn select_leader_with_reputation(
 }
 
 /// Check whether `view` is an epoch-change view given the configured `epoch_length`.
+/// FIX CONS-FIND-20: Guard against epoch_length=0 to prevent division by zero.
 fn is_epoch_change_view(view: &ViewNumber, epoch_length: EpochLength) -> bool {
-    view.int() % (epoch_length.int() as u64) == 0
+    let el = epoch_length.int() as u64;
+    if el == 0 {
+        return false;
+    }
+    view.int() % el == 0
 }
 
 /// Compute the current epoch based on the current `view` and the configured `epoch_length`.
+/// FIX CONS-FIND-20: Guard against epoch_length=0 to prevent division by zero.
 fn epoch(view: ViewNumber, epoch_length: EpochLength) -> u64 {
-    view.int().div_ceil(epoch_length.int() as u64)
+    let el = epoch_length.int() as u64;
+    if el == 0 {
+        return 0;
+    }
+    view.int().div_ceil(el)
 }
 
 /// Tests if the number of times each validator is selected as a leader is proportional to its power.

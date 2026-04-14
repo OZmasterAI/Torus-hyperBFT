@@ -33,7 +33,6 @@
 //! broadcasting [`BlockSyncAdvertiseMessage`]s.
 
 use std::{
-    cmp::max,
     sync::mpsc::{Receiver, Sender, TryRecvError},
     thread::{self, JoinHandle},
     time::{Duration, Instant, SystemTime},
@@ -120,7 +119,7 @@ impl<N: Network + 'static, K: KVStore> BlockSyncServer<N, K> {
                 let bt_snapshot = self.block_tree_camera.snapshot();
                 let blocks_res = bt_snapshot.blocks_from_height_to_newest(
                     start_height,
-                    max(limit, self.config.request_limit),
+                    std::cmp::min(limit, self.config.request_limit),
                 );
                 let highest_pc_res = bt_snapshot.highest_pc();
 

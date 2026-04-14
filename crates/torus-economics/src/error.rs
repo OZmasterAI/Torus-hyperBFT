@@ -125,4 +125,12 @@ pub enum EconomicsError {
 
     #[error("rotation would reduce active set below BFT minimum ({have} -> {need})")]
     BelowMinimumActiveSet { have: usize, need: usize },
+
+    // Unbonding queue cap (ECON-FIND-30)
+
+    #[error("too many unbonding entries for {delegator} -> {validator} (max 100)")]
+    TooManyUnbondingEntries {
+        delegator: Address,
+        validator: Address,
+    },
 }

@@ -400,6 +400,28 @@ impl<K: KVStore> BlockTreeSingleton<K> {
         self.write(wb);
         Ok(())
     }
+
+    /// FIX CONS-FIND-16: Atomically set both highest_view_voted and last_voted_proposal
+    /// in a single WriteBatch to prevent inconsistency on crash between writes.
+    pub fn set_vote_state_atomic(
+        &mut self,
+        view: ViewNumber,
+        block: CryptoHash,
+    ) -> Result<(), BlockTreeError> {
+        use borsh::BorshSerialize;
+        let mut wb: BlockTreeWriteBatch<K::WriteBatch> = BlockTreeWriteBatch::new();
+        wb.set_highest_view_phase_voted(view)?;
+        wb.0.set(
+            &variables::LAST_VOTED_PROPOSAL,
+            &(view, block).try_to_vec()
+                .map_err(|err| KVSetError::SerializeValueError {
+                    key: Key::HighestTC,
+                    source: err,
+                })?,
+        );
+        self.write(wb);
+        Ok(())
+    }
 }
 
 /// Helper functions called by [BlockTree::update].

@@ -135,9 +135,23 @@ impl DoubleSignDetector {
     }
 
     /// Record an observed phase vote. Returns evidence if a double-sign is detected.
+    /// FIX CONS-FIND-08: Verify vote signature BEFORE storing to prevent slot poisoning.
     pub fn record_vote(&mut self, vote: &ObservedPhaseVote) -> Option<DoubleSignEvidence> {
         if vote.chain_id != self.chain_id {
             return None;
+        }
+
+        // FIX CONS-FIND-08: Verify the vote's signature before storing.
+        // Without this, a malicious node can forge a vote attributed to validator X,
+        // poisoning the slot so the real vote triggers unprovable equivocation evidence.
+        let vk = match VerifyingKey::from_bytes(&vote.signer) {
+            Ok(vk) => vk,
+            Err(_) => return None, // Invalid public key — reject
+        };
+        let msg = vote.signed_message();
+        let sig = ed25519_dalek::Signature::from_bytes(&vote.signature);
+        if vk.verify(&msg, &sig).is_err() {
+            return None; // Invalid signature — don't store forged votes
         }
 
         self.prune(vote.view);

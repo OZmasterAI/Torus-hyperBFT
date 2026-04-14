@@ -32,7 +32,7 @@ use crate::{
             HotStuffMessage, NEMessage, NERequest, NewView, Nudge, PhaseVote, Proposal,
             ProposalRequest, ProposalResponse,
         },
-        roles::{is_phase_voter, is_proposer, new_view_recipients},
+        roles::{is_phase_voter, is_proposer, new_view_recipients_with_reputation},
         types::{valid_nec, NECollector, Phase, PhaseVoteCollector},
     },
     networking::{
@@ -49,7 +49,7 @@ use crate::{
     },
 };
 
-use super::roles::{phase_vote_recipient, phase_vote_recipient_with_reputation, is_proposer_with_reputation};
+use super::roles::{phase_vote_recipient_with_reputation, is_proposer_with_reputation};
 
 /// A single participant in the HotStuff subprotocol.
 ///
@@ -156,7 +156,9 @@ impl<N: Network> HotStuff<N> {
             highest_pc: block_tree.highest_pc()?,
         };
 
-        match new_view_recipients(&new_view, &validator_set_state) {
+        // FIX CONS-PF-10: Use reputation-weighted leader for NewView routing.
+        let reputation = block_tree.leader_reputation().ok();
+        match new_view_recipients_with_reputation(&new_view, &validator_set_state, reputation.as_ref()) {
             (committed_vs_leader, None) => self
                 .sender_handle
                 .send::<HotStuffMessage>(committed_vs_leader, new_view.clone().into()),
@@ -196,10 +198,13 @@ impl<N: Network> HotStuff<N> {
         .publish(&self.event_publisher);
 
         // 4. If I am a proposer for the new view, then broadcast a `Proposal` or a `Nudge`.
-        if is_proposer(
+        // FIX CONS-FIND-12: Use reputation-weighted proposer check.
+        let reputation = block_tree.leader_reputation().ok();
+        if is_proposer_with_reputation(
             &self.config.keypair.public(),
             self.view_info.view,
             &validator_set_state,
+            reputation.as_ref(),
         ) {
             // If a chain of consecutive views of voting for a validator-set-updating block has been interrupted, then
             // re-propose an existing block.
@@ -679,13 +684,14 @@ impl<N: Network> HotStuff<N> {
                     proposal.block.hash,
                     vote_phase,
                 );
-                let vote_recipient = phase_vote_recipient(&phase_vote, &validator_set_state);
+                // FIX CONS-FIND-13: Use reputation-weighted vote recipient.
+                let reputation = block_tree.leader_reputation().ok();
+                let vote_recipient = phase_vote_recipient_with_reputation(&phase_vote, &validator_set_state, reputation.as_ref());
                 self.sender_handle
                     .send::<HotStuffMessage>(vote_recipient, phase_vote.clone().into());
 
-                block_tree.set_highest_view_phase_voted(self.view_info.view)?;
-                // MonadBFT B2: Record which block we voted for (used by NE processing).
-                block_tree.set_last_voted_proposal(self.view_info.view, proposal.block.hash)?;
+                // FIX CONS-FIND-16: Atomic write of vote state to prevent crash inconsistency.
+                block_tree.set_vote_state_atomic(self.view_info.view, proposal.block.hash)?;
 
                 // MonadBFT: Update local_tip (paper Alg 1, line 13: local_tip ← GetTip(p)).
                 // For fresh proposals: tip is the proposal itself.
@@ -813,7 +819,9 @@ impl<N: Network> HotStuff<N> {
                 nudge.justify.block,
                 vote_phase,
             );
-            let vote_recipient = phase_vote_recipient(&vote, &validator_set_state);
+            // FIX CONS-FIND-13: Use reputation-weighted vote recipient.
+            let reputation = block_tree.leader_reputation().ok();
+            let vote_recipient = phase_vote_recipient_with_reputation(&vote, &validator_set_state, reputation.as_ref());
             self.sender_handle
                 .send::<HotStuffMessage>(vote_recipient, vote.clone().into());
 
@@ -904,11 +912,14 @@ impl<N: Network> HotStuff<N> {
                     .update_validator_sets(&validator_set_state);
 
                 // MonadBFT: Backup QC broadcast.
+                // FIX CONS-FIND-12: Use reputation-weighted proposer check.
+                let reputation = block_tree.leader_reputation().ok();
                 if new_pc.phase.is_generic()
-                    && is_proposer(
+                    && is_proposer_with_reputation(
                         &self.config.keypair.public(),
                         self.view_info.view,
                         &validator_set_state,
+                        reputation.as_ref(),
                     )
                 {
                     use crate::pacemaker::messages::ProgressCertificate;
@@ -1007,7 +1018,7 @@ impl<N: Network> HotStuff<N> {
         &mut self,
         resp: ProposalResponse,
         _origin: &VerifyingKey,
-        _block_tree: &mut BlockTreeSingleton<K>,
+        block_tree: &mut BlockTreeSingleton<K>,
         _app: &mut impl App<K>,
     ) -> Result<(), HotStuffError> {
         if resp.view != self.view_info.view {
@@ -1028,6 +1039,15 @@ impl<N: Network> HotStuff<N> {
             } else {
                 return Ok(());
             }
+        }
+
+        // Validate the block before reproposing: check hash/justify correctness
+        // and safety invariants (safe_pc, block justify type).
+        if !resp.proposal.block.is_correct(block_tree)? {
+            return Ok(());
+        }
+        if !safe_block(&resp.proposal.block, block_tree, self.config.chain_id)? {
+            return Ok(());
         }
 
         // Cancel recovery — we got the block. Repropose it (Case 4).
@@ -1101,12 +1121,20 @@ impl<N: Network> HotStuff<N> {
                 signature,
             };
 
-            // Send to the leader of this view.
+            // FIX CONS-FIND-11: Use reputation-weighted leader for NE routing.
             let validator_set_state = block_tree.validator_set_state()?;
-            let leader = crate::pacemaker::implementation::select_leader(
-                req.view,
-                validator_set_state.committed_validator_set(),
-            );
+            let reputation = block_tree.leader_reputation().ok();
+            let leader = match reputation.as_ref() {
+                Some(rep) => crate::pacemaker::implementation::select_leader_with_reputation(
+                    req.view,
+                    validator_set_state.committed_validator_set(),
+                    rep,
+                ),
+                None => crate::pacemaker::implementation::select_leader(
+                    req.view,
+                    validator_set_state.committed_validator_set(),
+                ),
+            };
             self.sender_handle.send::<HotStuffMessage>(leader, ne.into());
             self.ne_sent_views.insert(req.view);
         }

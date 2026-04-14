@@ -300,24 +300,20 @@ impl<CL: Collector> ActiveCollectorPair<CL> {
         }
 
         // Else, if the latest validator set update has **not** been decided, and the latest VSS' **PVS** is
-        // different from the current PVS collector's validator set, decide what to replace the collector 
+        // different from the current PVS collector's validator set, decide what to replace the collector
         // pair's PVS collector with:
         else if self.pvs_collector.is_none() ||
             latest_vss.previous_validator_set() != self.pvs_collector.as_ref().expect("if `pvs_collector` is `None`, execution should have short-circuited before reaching here").validator_set() {
 
-            // If the latest VSS' PVS is the same as the current CVS collector's validator set, then replace
-            // the current PVS collector with the current CVS collector.
-            self.pvs_collector = Some(if latest_vss.previous_validator_set() == self.cvs_collector.validator_set() {
-                self.cvs_collector.clone()
-            }
-            // Else, if it is not the same, then replace the current PVS collector with a new collector.
-            else {
-                CL::new(
-                    self.cvs_collector.chain_id(),
-                    self.cvs_collector.view(),
-                    latest_vss.previous_validator_set().clone(),
-                )
-            });
+            // Always create a fresh PVS collector to prevent vote double-counting.
+            // Previously, when PVS matched CVS, the CVS collector was cloned -- carrying
+            // over already-counted votes and their accumulated power. This could allow
+            // the PVS to reach quorum with fewer unique voters than required.
+            self.pvs_collector = Some(CL::new(
+                self.cvs_collector.chain_id(),
+                self.cvs_collector.view(),
+                latest_vss.previous_validator_set().clone(),
+            ));
 
             is_updated = true;
         }

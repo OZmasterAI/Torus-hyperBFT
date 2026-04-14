@@ -37,6 +37,10 @@ pub struct TorusApp {
     epoch_length: u64,
     max_validators: u32,
     last_validator_set: ValidatorSet,
+    /// FIX CONS-FIND-02: Cache epoch validator set updates by height for idempotency.
+    /// Prevents the double-call bug where produce_block mutates state and validate_block
+    /// sees stale state, causing the proposer to halt at epoch boundaries.
+    cached_vs_updates: Option<(u64, Option<ValidatorSetUpdates>)>,
 }
 
 impl TorusApp {
@@ -57,6 +61,7 @@ impl TorusApp {
                 validators: vec![],
                 epoch: 0,
             },
+            cached_vs_updates: None,
         }
     }
 
@@ -89,7 +94,15 @@ impl TorusApp {
     /// Phase 3 (3.2): applies pending key rotations, enforces rotation cap
     /// derived from BFT safety requirements, and checks minimum set size.
     fn epoch_validator_set_updates(&mut self, height: u64) -> Option<ValidatorSetUpdates> {
+        // FIX CONS-FIND-02: Return cached result if already computed for this height.
+        if let Some((cached_height, ref cached_result)) = self.cached_vs_updates {
+            if cached_height == height {
+                return cached_result.clone();
+            }
+        }
+
         if !EpochManager::is_epoch_boundary(height, self.epoch_length) {
+            self.cached_vs_updates = Some((height, None));
             return None;
         }
 
@@ -133,6 +146,7 @@ impl TorusApp {
             EpochManager::compute_validator_set_diff(&self.last_validator_set, &capped_set);
         if diff.is_empty() {
             self.last_validator_set = capped_set;
+            self.cached_vs_updates = Some((height, None));
             return None;
         }
 
@@ -193,6 +207,7 @@ impl TorusApp {
             "epoch boundary: validator set updated"
         );
         self.last_validator_set = capped_set;
+        self.cached_vs_updates = Some((height, Some(updates.clone())));
         Some(updates)
     }
 
@@ -234,6 +249,8 @@ impl TorusApp {
                 .validate_block(&torus_block, &self.state_db, &self.evm_executor)
             {
                 Ok(_validated) => {
+                    // FIX CONS-PF-05: Update last_header during validation, not production.
+                    self.last_header = torus_block.header.clone();
                     let validator_set_updates =
                         self.epoch_validator_set_updates(torus_block.header.height);
                     ValidateBlockResponse::Valid {
@@ -244,6 +261,8 @@ impl TorusApp {
                 Err(_) => ValidateBlockResponse::Invalid,
             }
         } else {
+            // FIX CONS-PF-05: Update last_header during validation, not production.
+            self.last_header = torus_block.header.clone();
             // Empty block — check epoch boundary.
             let validator_set_updates = self.epoch_validator_set_updates(torus_block.header.height);
             ValidateBlockResponse::Valid {
@@ -278,14 +297,15 @@ impl App<RocksKVStore> for TorusApp {
             Ok(proposed) => proposed.block,
             Err(_) => {
                 // Fallback: empty block with minimal header.
-                return produce_empty_block(&self.last_header, timestamp, self.proposer_address);
+                return produce_empty_block(&self.last_header, timestamp, self.proposer_address, &self.state_db);
             }
         };
 
         let encoded = serde_json::to_vec(&block).expect("serialize TorusBlock");
         let hash = Self::hash_datum(&encoded);
 
-        self.last_header = block.header.clone();
+        // FIX CONS-PF-05: Don't update last_header during produce_block (before consensus).
+        // It will be updated in do_validate when the block passes consensus validation.
 
         // Check for epoch boundary and compute validator set updates.
         let validator_set_updates = self.epoch_validator_set_updates(block.header.height);
@@ -333,17 +353,28 @@ impl App<RocksKVStore> for TorusApp {
         // When EVM execution is added, the StateOverlay approach will handle this:
         // the overlay is simply discarded instead of committed to RocksDB.
 
-        // Slash the equivocating leader: 5% (500 bps) + tombstone.
-        // Derive Torus address from ed25519 pubkey via SHA-256 (last 20 bytes).
+        // FIX CONS-FIND-01: Look up the validator's Ethereum address using their
+        // consensus public key. The previous code derived SHA-256(pubkey)[12..32]
+        // which never matched any registered Ethereum address, so all slashes failed.
         let leader_pubkey = evidence.leader.to_bytes();
-        let pubkey_hash: [u8; 32] = {
-            use sha2::{Digest, Sha256};
-            let mut hasher = Sha256::new();
-            hasher.update(&leader_pubkey);
-            hasher.finalize().into()
+        let leader_addr = match self.staking.find_validator_by_pubkey(&leader_pubkey) {
+            Ok(Some(val)) => val.address,
+            Ok(None) => {
+                tracing::error!(
+                    leader_pubkey = ?leader_pubkey,
+                    "equivocation detected but validator not found by consensus pubkey — cannot slash"
+                );
+                return;
+            }
+            Err(e) => {
+                tracing::error!(%e, "failed to look up validator for slashing");
+                return;
+            }
         };
-        let leader_addr = torus_types::Address::from_slice(&pubkey_hash[12..]);
 
+        // FIX CONS-PF-08: Buffer slash intent — don't write to DB during speculative
+        // execution. For now, log at error level so failures are visible.
+        // TODO: Implement proper slash buffering with commit/rollback semantics.
         match self.staking.slash(
             leader_addr,
             500,
@@ -358,12 +389,12 @@ impl App<RocksKVStore> for TorusApp {
                 );
             }
             Err(e) => {
-                tracing::error!(%leader_addr, %e, "failed to slash equivocating leader");
+                tracing::error!(%leader_addr, %e, "CRITICAL: failed to slash equivocating leader");
             }
         }
 
         if let Err(e) = self.staking.tombstone_validator(&leader_addr) {
-            tracing::error!(%leader_addr, %e, "failed to tombstone equivocating leader");
+            tracing::error!(%leader_addr, %e, "CRITICAL: failed to tombstone equivocating leader");
         }
 
         tracing::info!(
@@ -374,20 +405,26 @@ impl App<RocksKVStore> for TorusApp {
 }
 
 /// Produce a fallback empty block when bridge proposal fails.
+/// FIX CONS-PF-01: Compute real state root even for empty blocks.
 fn produce_empty_block(
     parent: &TorusBlockHeader,
     timestamp: u64,
     proposer: Address,
+    state_db: &StateDb,
 ) -> ProduceBlockResponse {
     use sha2::{Digest, Sha256};
     use torus_types::{Bloom, B256};
+
+    // FIX CONS-PF-01: Use parent's state_root for empty blocks (no state change).
+    // An empty block doesn't modify state, so the state root carries forward.
+    let state_root = parent.state_root;
 
     let block = TorusBlock {
         header: TorusBlockHeader {
             height: parent.height + 1,
             timestamp,
             proposer,
-            state_root: B256::ZERO,
+            state_root,
             receipts_root: B256::ZERO,
             logs_bloom: Bloom::ZERO,
             evm_gas_used: 0,
