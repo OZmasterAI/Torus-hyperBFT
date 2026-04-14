@@ -5,6 +5,60 @@
 **Reference**: arXiv:2502.20692 (Sections 4, Appendix A)
 **Date**: 2026-04-14
 
+## Paper Reference (Step 2)
+
+arXiv:2502.20692v3, "MonadBFT: Fast, Responsive, Fork-Resistant Streamlined
+Consensus" by Jalalzai, Babel, Komatovic, et al. (Category Labs).
+
+Paper's formal proofs (Appendix A):
+- **Theorem 1 (Safety)**: No two correct validators commit different blocks at
+  the same log position. Proved via Lemmas 1-5 (vote uniqueness, QC uniqueness,
+  local_tip alignment, inductive extension of fresh proposals).
+- **Theorem 2 (Tail-forking resistance)**: If a non-equivocating leader's fresh
+  proposal gets f+1 honest votes, all future committed blocks extend it.
+  Proved via Lemmas 6-8 (NE impossibility, inductive proposal extension).
+- **Corollary 1 (Speculative reversion)**: Speculative commit can only conflict
+  with an irrevocable commit if the leader equivocated.
+
+### Divergences: Paper vs Our Implementation
+
+**Divergence 1 — local_tip update on reproposals**:
+- Paper (Alg 1, line 13): `local_tip ← GetTip(p)` for ALL proposals.
+  GetTip returns `p.tc.high_tip` for reproposals (Alg 6, line 15).
+- Our code (`implementation.rs:684`): `if !proposal.is_reproposal()` — only
+  updates local_tip for fresh proposals. Reproposals leave local_tip unchanged.
+- **Impact**: When a validator votes for a reproposal but doesn't update
+  local_tip, its subsequent timeout messages will report a stale tip. This
+  could affect high_tip selection in the next TC. It's a liveness concern
+  (the correct block might not be reproposed in the next round) but NOT
+  a safety issue — the locking mechanism still prevents conflicting commits.
+
+**Divergence 2 — NEC-backed fresh proposal rejected as reproposal**:
+- Paper (Alg 5, VALIDPROPOSAL, line 15): checks `IsFreshProposal(p)` FIRST.
+  If fresh, validates the tip. Only falls through to reproposal path if NOT
+  fresh.
+- Our code (`implementation.rs:558`): checks `is_reproposal()` first, which
+  returns true whenever `tc.high_tip_is_winner=true`, regardless of NEC
+  presence. A fresh proposal with NEC + TC (where high_tip_is_winner) is
+  incorrectly treated as a reproposal and rejected (block doesn't match
+  high_tip).
+- **Impact**: RECOVER's NEC path (Case 5 in paper, Alg 4 lines 19-23) produces
+  proposals that validators reject. The ProposalResponse path (Case 4)
+  still works. Liveness degradation under specific failure scenarios, NOT
+  a safety issue.
+
+### Existing HotStuff TLA+ Specs (Step 3)
+
+- **EDHotStuff** (github.com/ausimnull/EDHotStuff): PlusCal spec of Event-
+  Driven HotStuff. Contains EDHotStuff.tla and Hotstuff.tla. Models the
+  base protocol without MonadBFT extensions (no NEC, no speculative commit,
+  no reproposal). Useful as structural reference for message-set modeling
+  and quorum formation patterns.
+- **oracle/bft-consensus-agda**: Formal verification of BFT consensus in Agda
+  (discontinued). Published paper on the approach.
+- **crytic/whipstaff**: TLA+/PlusCal for CBC Casper (binary consensus). Not
+  directly applicable but shows BFT modeling patterns.
+
 ## System Model
 
 - **n** validators, up to **f** Byzantine, where n = 3f + 1
