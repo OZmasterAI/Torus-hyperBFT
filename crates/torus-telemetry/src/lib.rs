@@ -38,6 +38,9 @@ pub struct Metrics {
 
     // Network metrics
     pub peers_connected: Gauge,
+
+    // Database metrics
+    pub db_size_bytes: Gauge,
 }
 
 impl Metrics {
@@ -121,6 +124,13 @@ impl Metrics {
             peers_connected.clone(),
         );
 
+        let db_size_bytes = Gauge::default();
+        registry.register(
+            "torus_db_size_bytes",
+            "Total RocksDB data directory size in bytes",
+            db_size_bytes.clone(),
+        );
+
         Self {
             registry,
             blocks_committed,
@@ -134,6 +144,7 @@ impl Metrics {
             mempool_evm_size,
             mempool_native_size,
             peers_connected,
+            db_size_bytes,
         }
     }
 

@@ -19,7 +19,7 @@ use torus_genesis::Genesis;
 use torus_mempool::{Mempool, MempoolConfig};
 use torus_network::{LibP2PNetwork, NetworkConfig};
 use torus_rpc::{BlockNotifier, RpcServer};
-use torus_state::StateDb;
+use torus_state::{PrunerConfig, StateDb, StatePruner};
 use torus_types::ChainConfig;
 
 mod keystore;
@@ -77,6 +77,15 @@ struct Cli {
     /// Log level (trace, debug, info, warn, error)
     #[arg(long, default_value = "info")]
     log_level: String,
+
+    /// Archive mode: retain all historical data (default). Mutually exclusive with --retention-blocks.
+    #[arg(long)]
+    archive: bool,
+
+    /// Enable pruning: keep only the last N blocks of historical data (block bodies and receipts).
+    /// Older data is removed to save disk space. Cannot be used with --archive.
+    #[arg(long)]
+    retention_blocks: Option<u64>,
 }
 
 #[derive(clap::Subcommand)]
@@ -172,7 +181,13 @@ fn read_passphrase_stdin() -> String {
     buf.trim().to_string()
 }
 
+use std::sync::atomic::AtomicU64;
+
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+    // Validate pruning flags
+    if cli.archive && cli.retention_blocks.is_some() {
+        return Err("cannot set both --archive and --retention-blocks".into());
+    }
     // 2. Load validator key (keystore preferred, raw hex deprecated)
     let signing_key = if let Some(keystore_path) = &cli.keystore {
         let passphrase = if let Some(pf) = &cli.passphrase_file {
@@ -335,10 +350,59 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // 9. Metrics (optional telemetry endpoint)
     let metrics = Arc::new(torus_telemetry::Metrics::new());
     let metrics_addr: SocketAddr = "0.0.0.0:9090".parse().unwrap();
-    tokio::spawn(torus_telemetry::serve_metrics(metrics_addr, metrics));
+    tokio::spawn(torus_telemetry::serve_metrics(metrics_addr, metrics.clone()));
     info!(%metrics_addr, "telemetry server started");
 
-    // 10. Wait for shutdown signal
+    // 10. Background pruner (if pruning enabled)
+    let pruned_up_to = Arc::new(AtomicU64::new(0));
+    if let Some(retention) = cli.retention_blocks {
+        let pruner_config = PrunerConfig {
+            retention_blocks: retention,
+            ..PrunerConfig::default()
+        };
+        let mut pruner = StatePruner::new(
+            state_db.clone(),
+            pruner_config,
+            pruned_up_to.clone(),
+        );
+        let latest_for_pruner = rpc_server.latest_height();
+        info!(retention_blocks = retention, "background pruner enabled");
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                interval.tick().await;
+                let current = latest_for_pruner.load(std::sync::atomic::Ordering::Relaxed);
+                if current == 0 {
+                    continue;
+                }
+                match pruner.maybe_prune(current) {
+                    Ok(0) => {}
+                    Ok(n) => info!(pruned_blocks = n, "background pruner cycle complete"),
+                    Err(e) => warn!(%e, "background pruner error"),
+                }
+                // Yield to avoid starving other tasks
+                tokio::task::yield_now().await;
+            }
+        });
+    } else {
+        info!("archive mode: pruning disabled (all historical data retained)");
+    }
+
+    // 11. Background DB size metric updater
+    {
+        let data_dir = cli.data_dir.clone();
+        let db_gauge = metrics.db_size_bytes.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                let size = torus_state::dir_size_bytes(&data_dir);
+                db_gauge.set(size as i64);
+            }
+        });
+    }
+
+    // 12. Wait for shutdown signal
     info!("node is running — press Ctrl+C to shut down");
     tokio::signal::ctrl_c().await?;
     info!("shutdown signal received, stopping...");
