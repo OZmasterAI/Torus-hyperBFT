@@ -168,7 +168,7 @@ pub struct SignatureBytes([u8; 64]);
 
 impl SignatureBytes {
     /// Create a new `SignatureBytes` wrapping `bytes`.
-    pub(crate) fn new(bytes: [u8; 64]) -> Self {
+    pub fn new(bytes: [u8; 64]) -> Self {
         Self(bytes)
     }
 
@@ -337,7 +337,7 @@ impl SignatureSet {
     }
 
     /// Create a new `SignatureSet` initially containing `len` `None`s.
-    pub(crate) fn new(len: usize) -> Self {
+    pub fn new(len: usize) -> Self {
         Self(vec![None; len])
     }
 

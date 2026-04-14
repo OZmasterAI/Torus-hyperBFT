@@ -504,7 +504,7 @@ pub fn is_fresh_proposal(proposal: &Proposal) -> bool {
 /// Incrementally collects NE signatures from validators who did not vote for
 /// the high_tip block, forming an NEC when 2f+1 are collected.
 #[derive(Clone)]
-pub(crate) struct NECollector {
+pub struct NECollector {
     view: ViewNumber,
     high_tip_qc_view: ViewNumber,
     validator_set: ValidatorSet,
@@ -513,7 +513,7 @@ pub(crate) struct NECollector {
 }
 
 impl NECollector {
-    pub(crate) fn new(
+    pub fn new(
         view: ViewNumber,
         high_tip_qc_view: ViewNumber,
         validator_set: ValidatorSet,
@@ -530,7 +530,7 @@ impl NECollector {
 
     /// Collect an NE signature from a validator.
     /// Returns an NEC if 2f+1 signatures have been collected.
-    pub(crate) fn collect(
+    pub fn collect(
         &mut self,
         signer: &VerifyingKey,
         ne_view: ViewNumber,

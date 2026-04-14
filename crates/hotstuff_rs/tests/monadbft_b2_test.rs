@@ -12,7 +12,7 @@ use hotstuff_rs::hotstuff::types::{
 use hotstuff_rs::hotstuff::messages::Proposal;
 use hotstuff_rs::pacemaker::types::TimeoutCertificate;
 use hotstuff_rs::types::block::Block;
-use hotstuff_rs::types::crypto_primitives::SigningKey;
+use hotstuff_rs::types::crypto_primitives::{Signer, SigningKey};
 use hotstuff_rs::types::data_types::*;
 use hotstuff_rs::types::update_sets::ValidatorSetUpdates;
 use hotstuff_rs::types::validator_set::ValidatorSet;
@@ -52,7 +52,8 @@ fn sign_ne(
     high_tip_qc_view: ViewNumber,
 ) -> SignatureBytes {
     let msg = (view, high_tip_qc_view).try_to_vec().unwrap();
-    keypair.sign(&msg)
+    let sig = keypair.sign(&msg);
+    SignatureBytes::new(sig.to_bytes())
 }
 
 // ============================================================================
