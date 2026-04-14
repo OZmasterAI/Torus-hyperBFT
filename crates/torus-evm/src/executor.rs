@@ -6,6 +6,8 @@ use revm::database::{BundleState, State};
 use revm::primitives::hardfork::SpecId;
 use revm::{Context, ExecuteCommitEvm, MainBuilder, MainContext};
 
+use crate::precompile_provider::TorusPrecompiles;
+
 use torus_state::StateDb;
 use torus_types::{Log as TorusLog, Receipt};
 
@@ -107,7 +109,9 @@ impl EvmExecutor {
             .modify_block_chained(|b| apply_block_env(b, block_cfg))
             .with_db(state);
 
-        let mut evm = ctx.build_mainnet();
+        let mut evm = ctx
+            .build_mainnet()
+            .with_precompiles(TorusPrecompiles::new(SpecId::CANCUN, state_db, block_cfg.number));
         let result = evm.transact_commit(tx).map_err(map_evm_err)?;
 
         let tx_result = build_tx_result(&result);
@@ -146,7 +150,9 @@ impl EvmExecutor {
             .modify_block_chained(|b| apply_block_env(b, block_cfg))
             .with_db(state);
 
-        let mut evm = ctx.build_mainnet();
+        let mut evm = ctx
+            .build_mainnet()
+            .with_precompiles(TorusPrecompiles::new(SpecId::CANCUN, state_db, block_cfg.number));
 
         let mut receipts = Vec::with_capacity(transactions.len());
         let mut cumulative_gas: u64 = 0;

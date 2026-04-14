@@ -59,6 +59,17 @@ pub const fn precompile_address(id: u16) -> Address {
     Address::new([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, b[0], b[1]])
 }
 
+/// All Torus precompile addresses (for EVM warm-address injection).
+pub const ALL_PRECOMPILE_ADDRESSES: [Address; 7] = [
+    precompile_address(ADDR_ORDER_BOOK_READER),
+    precompile_address(ADDR_BALANCE_READER),
+    precompile_address(ADDR_ORACLE_READER),
+    precompile_address(ADDR_STAKING_READER),
+    precompile_address(ADDR_CORE_WRITER),
+    precompile_address(ADDR_CORE_WRITER_STAKING),
+    precompile_address(ADDR_LOCKBOX),
+];
+
 /// Check whether an address is a Torus precompile.
 pub fn is_precompile(address: &Address) -> bool {
     let bytes = address.as_slice();

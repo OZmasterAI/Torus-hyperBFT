@@ -311,6 +311,186 @@ fn transfer_block_has_zero_bloom() {
     assert_eq!(result.logs_bloom, Bloom::ZERO);
 }
 
+// ---------------------------------------------------------------------------
+// 9. Torus precompile: BalanceReader via EVM
+// ---------------------------------------------------------------------------
+#[test]
+fn precompile_balance_reader_via_evm() {
+    let (_dir, db) = open_test_db();
+
+    // Fund ALICE for gas.
+    let ten_eth = U256::from(10_000_000_000_000_000_000u128);
+    db.put_account(&ALICE, &test_account(ten_eth)).unwrap();
+
+    // Write BOB's EVM balance directly to cf_accounts (72-byte record:
+    // balance(32 BE) + nonce(8) + code_hash(32)).
+    let bob_evm_balance = U256::from(5_000_000_000_000_000_000u128);
+    let mut account_data = vec![0u8; 72];
+    account_data[..32].copy_from_slice(&bob_evm_balance.to_be_bytes::<32>());
+    account_data[40..72].copy_from_slice(KECCAK_EMPTY.as_slice());
+    db.put_cf_raw("cf_accounts", BOB.as_slice(), &account_data)
+        .unwrap();
+
+    // BalanceReader precompile at 0x0801.
+    let precompile_addr =
+        Address::new([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x08, 0x01]);
+
+    // Build calldata: getBalances(address) selector + BOB padded.
+    let sig_hash = alloy_primitives::keccak256("getBalances(address)".as_bytes());
+    let mut calldata = Vec::with_capacity(36);
+    calldata.extend_from_slice(&sig_hash[..4]);
+    let mut padded = [0u8; 32];
+    padded[12..32].copy_from_slice(BOB.as_slice());
+    calldata.extend_from_slice(&padded);
+
+    let block_cfg = default_block_cfg();
+    let tx = TxEnv {
+        caller: ALICE,
+        gas_limit: 100_000,
+        gas_price: block_cfg.base_fee as u128,
+        kind: TxKind::Call(precompile_addr),
+        value: U256::ZERO,
+        data: Bytes::from(calldata),
+        nonce: 0,
+        chain_id: Some(TORUS_CHAIN_ID),
+        ..Default::default()
+    };
+
+    let executor = EvmExecutor::new(TORUS_CHAIN_ID);
+    let (result, _bundle) = executor.execute_tx(&db, &block_cfg, tx).unwrap();
+
+    assert!(result.success, "precompile call should succeed");
+    // BalanceReader returns (uint128, uint128, uint128, uint128) = 128 bytes.
+    assert_eq!(
+        result.output.len(),
+        128,
+        "BalanceReader returns 4 uint128 values"
+    );
+
+    // Second word (offset 32..64) = EVM balance (u128 in high 16 bytes of word).
+    let evm_bal = u128::from_be_bytes(result.output[48..64].try_into().unwrap());
+    assert_eq!(
+        evm_bal, 5_000_000_000_000_000_000u128,
+        "EVM balance should match what we wrote"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 10. Torus precompile: unknown selector reverts
+// ---------------------------------------------------------------------------
+#[test]
+fn precompile_unknown_selector_reverts() {
+    let (_dir, db) = open_test_db();
+
+    let ten_eth = U256::from(10_000_000_000_000_000_000u128);
+    db.put_account(&ALICE, &test_account(ten_eth)).unwrap();
+
+    // OrderBookReader precompile at 0x0800 — call with bogus selector.
+    let precompile_addr =
+        Address::new([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x08, 0x00]);
+
+    let block_cfg = default_block_cfg();
+    let tx = TxEnv {
+        caller: ALICE,
+        gas_limit: 100_000,
+        gas_price: block_cfg.base_fee as u128,
+        kind: TxKind::Call(precompile_addr),
+        value: U256::ZERO,
+        data: Bytes::from(vec![0xDE, 0xAD, 0xBE, 0xEF]),
+        nonce: 0,
+        chain_id: Some(TORUS_CHAIN_ID),
+        ..Default::default()
+    };
+
+    let executor = EvmExecutor::new(TORUS_CHAIN_ID);
+    let (result, _bundle) = executor.execute_tx(&db, &block_cfg, tx).unwrap();
+
+    // Precompile errors map to revert.
+    assert!(!result.success, "bogus selector should revert");
+}
+
+// ---------------------------------------------------------------------------
+// 11. Torus precompile: gas metering
+// ---------------------------------------------------------------------------
+#[test]
+fn precompile_charges_correct_gas() {
+    let (_dir, db) = open_test_db();
+
+    let ten_eth = U256::from(10_000_000_000_000_000_000u128);
+    db.put_account(&ALICE, &test_account(ten_eth)).unwrap();
+
+    // BalanceReader (read-only) costs GAS_PRECOMPILE_READ = 2600.
+    let precompile_addr =
+        Address::new([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x08, 0x01]);
+
+    let sig_hash = alloy_primitives::keccak256("getBalances(address)".as_bytes());
+    let mut calldata = Vec::with_capacity(36);
+    calldata.extend_from_slice(&sig_hash[..4]);
+    let mut padded = [0u8; 32];
+    padded[12..32].copy_from_slice(BOB.as_slice());
+    calldata.extend_from_slice(&padded);
+
+    let block_cfg = default_block_cfg();
+    let tx = TxEnv {
+        caller: ALICE,
+        gas_limit: 100_000,
+        gas_price: block_cfg.base_fee as u128,
+        kind: TxKind::Call(precompile_addr),
+        value: U256::ZERO,
+        data: Bytes::from(calldata),
+        nonce: 0,
+        chain_id: Some(TORUS_CHAIN_ID),
+        ..Default::default()
+    };
+
+    let executor = EvmExecutor::new(TORUS_CHAIN_ID);
+    let (result, _bundle) = executor.execute_tx(&db, &block_cfg, tx).unwrap();
+
+    assert!(result.success);
+    // Gas = 21000 (base) + 2600 (precompile read) + calldata costs.
+    // Just verify gas_used includes base tx + precompile cost.
+    assert!(
+        result.gas_used >= 21_000 + 2_600,
+        "gas should include base tx (21k) + precompile read (2.6k), got {}",
+        result.gas_used,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 12. Standard Ethereum precompile (ecrecover) still works
+// ---------------------------------------------------------------------------
+#[test]
+fn standard_precompile_ecrecover_still_works() {
+    let (_dir, db) = open_test_db();
+
+    let ten_eth = U256::from(10_000_000_000_000_000_000u128);
+    db.put_account(&ALICE, &test_account(ten_eth)).unwrap();
+
+    // ecrecover at 0x01. Send 128 bytes of zeros — it returns empty output
+    // (invalid signature) but the tx succeeds, confirming EthPrecompiles
+    // still functions alongside TorusPrecompiles.
+    let ecrecover_addr = Address::with_last_byte(0x01);
+
+    let block_cfg = default_block_cfg();
+    let tx = TxEnv {
+        caller: ALICE,
+        gas_limit: 100_000,
+        gas_price: block_cfg.base_fee as u128,
+        kind: TxKind::Call(ecrecover_addr),
+        value: U256::ZERO,
+        data: Bytes::from(vec![0u8; 128]),
+        nonce: 0,
+        chain_id: Some(TORUS_CHAIN_ID),
+        ..Default::default()
+    };
+
+    let executor = EvmExecutor::new(TORUS_CHAIN_ID);
+    let (result, _bundle) = executor.execute_tx(&db, &block_cfg, tx).unwrap();
+
+    // ecrecover with all-zero inputs returns empty (invalid sig) but succeeds.
+    assert!(result.success, "ecrecover should not crash");
+}
+
 /// Convenience module for hex decoding in tests.
 mod hex {
     pub fn decode(s: &str) -> Result<Vec<u8>, String> {
