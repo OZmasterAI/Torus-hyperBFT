@@ -15,6 +15,7 @@ members = [
     "crates/torus-telemetry",
     "crates/torus-node",
     "crates/torus-integration-tests",
+    "crates/hotstuff_rs",
 ]
 
 [workspace.package]
@@ -38,8 +39,8 @@ torus-genesis = { path = "crates/torus-genesis" }
 torus-telemetry = { path = "crates/torus-telemetry" }
 torus-node = { path = "crates/torus-node" }
 
-# Consensus
-hotstuff_rs = "=0.4.0"
+# Consensus (local fork of hotstuff_rs v0.4.0 with MonadBFT extensions)
+hotstuff_rs = { path = "crates/hotstuff_rs" }
 
 # EVM — pinned to 36 to match reth v2.0.0 (revm 37 not yet adopted by reth)
 revm = "36"
