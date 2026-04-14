@@ -83,7 +83,8 @@ impl BlockProposer {
         let state_root = compute_post_bundle_state_root(state_db, &exec_result.bundle)?;
 
         // 7. Compute receipts root (deterministic hash of serialised receipts).
-        let receipts_root = compute_receipts_root(&exec_result.receipts);
+        let receipts_root = compute_receipts_root(&exec_result.receipts)
+            .map_err(|e| BridgeError::Serialization(format!("receipts: {e}")))?;
 
         // 8. Assemble block.
         let block = TorusBlock {
@@ -207,7 +208,8 @@ impl BlockProposer {
         NativeExecutor::execute_batch(&mut ctx, &post_evm);
 
         // Phase 4: Drain and execute CoreWriter queue from previous block.
-        NativeExecutor::drain_core_writer(&mut ctx);
+        // FIX EVM-FIND-12: Propagate drain errors — a failed drain means missing actions.
+        NativeExecutor::drain_core_writer(&mut ctx)?;
 
         // Phase 5: Process pending governance proposals.
         NativeExecutor::process_governance(&mut ctx);
@@ -233,7 +235,8 @@ impl BlockProposer {
         // Compute composite state root.
         let native_root = compute_native_state_root(state_db)?;
         let state_root = compute_full_composite_root(state_db, &exec_result.bundle, native_root)?;
-        let receipts_root = compute_receipts_root(&exec_result.receipts);
+        let receipts_root = compute_receipts_root(&exec_result.receipts)
+            .map_err(|e| BridgeError::Serialization(format!("receipts: {e}")))?;
 
         let block = TorusBlock {
             header: TorusBlockHeader {
@@ -275,12 +278,16 @@ fn set_receipt_metadata(
 }
 
 /// Deterministic receipts root: keccak256 of serde-serialised receipts.
-pub(crate) fn compute_receipts_root(receipts: &[torus_types::Receipt]) -> B256 {
+///
+/// FIX EVM-FIND-16: Returns `Result` instead of panicking on serialization failure.
+pub(crate) fn compute_receipts_root(
+    receipts: &[torus_types::Receipt],
+) -> Result<B256, serde_json::Error> {
     if receipts.is_empty() {
-        return B256::ZERO;
+        return Ok(B256::ZERO);
     }
-    let data = serde_json::to_vec(receipts).expect("serialize receipts");
-    alloy_primitives::keccak256(&data)
+    let data = serde_json::to_vec(receipts)?;
+    Ok(alloy_primitives::keccak256(&data))
 }
 
 /// Genesis-compatible default parent header (height 0).

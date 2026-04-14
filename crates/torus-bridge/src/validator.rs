@@ -113,7 +113,8 @@ impl BlockValidator {
         }
 
         // FIX CONS-PF-13: Verify receipts_root by recomputing from execution results.
-        let computed_receipts_root = crate::proposer::compute_receipts_root(&exec_result.receipts);
+        let computed_receipts_root = crate::proposer::compute_receipts_root(&exec_result.receipts)
+            .map_err(|e| BridgeError::Serialization(format!("receipts: {e}")))?;
         if computed_receipts_root != block.header.receipts_root {
             return Err(BridgeError::InvalidBlock(format!(
                 "receipts_root mismatch: header={}, computed={}",
@@ -258,7 +259,8 @@ impl BlockValidator {
         NativeExecutor::execute_batch(&mut ctx, &post_evm);
 
         // Phase 4: Drain and execute CoreWriter queue from previous block.
-        NativeExecutor::drain_core_writer(&mut ctx);
+        // FIX EVM-FIND-12: Propagate drain errors — a failed drain means missing actions.
+        NativeExecutor::drain_core_writer(&mut ctx)?;
 
         // Phase 5-7: Oracle aggregation, governance processing, liquidation checks
         // are driven by the block-level helpers. In production, market lists and
