@@ -18,6 +18,7 @@ serde_json = { workspace = true }
 alloy-primitives = { workspace = true }
 alloy-rlp = { workspace = true }
 alloy-consensus = { workspace = true }
+alloy-eips = { workspace = true }
 tracing = { workspace = true }
 borsh = { workspace = true }
 rocksdb = { workspace = true }

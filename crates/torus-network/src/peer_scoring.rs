@@ -42,17 +42,29 @@ struct PeerScore {
     last_update: Instant,
 }
 
-/// Consensus message rate limiter per peer.
-pub struct ConsensusRateLimiter {
-    counts: HashMap<PeerId, (u32, Instant)>,
-    limit_per_sec: u32,
+/// Token bucket state for a single peer.
+struct TokenBucket {
+    tokens: f64,
+    last_refill: Instant,
 }
+
+/// Consensus message rate limiter per peer using token bucket algorithm
+/// (Batch EK: CONS-FIND-19). Prevents 2x burst that tumbling windows allow.
+pub struct ConsensusRateLimiter {
+    buckets: HashMap<PeerId, TokenBucket>,
+    max_tokens: f64,
+    refill_rate: f64, // tokens per second
+}
+
+/// Stale bucket entries older than this are cleaned up.
+const RATE_LIMITER_CLEANUP_AGE: Duration = Duration::from_secs(300);
 
 impl ConsensusRateLimiter {
     pub fn new(limit_per_sec: u32) -> Self {
         Self {
-            counts: HashMap::new(),
-            limit_per_sec,
+            buckets: HashMap::new(),
+            max_tokens: limit_per_sec as f64,
+            refill_rate: limit_per_sec as f64,
         }
     }
 
@@ -60,16 +72,30 @@ impl ConsensusRateLimiter {
     /// Returns false if rate exceeded.
     pub fn check_and_increment(&mut self, peer: &PeerId) -> bool {
         let now = Instant::now();
-        let entry = self.counts.entry(*peer).or_insert((0, now));
-        if now.duration_since(entry.1) >= Duration::from_secs(1) {
-            entry.0 = 0;
-            entry.1 = now;
+        let max = self.max_tokens;
+        let rate = self.refill_rate;
+        let bucket = self.buckets.entry(*peer).or_insert(TokenBucket {
+            tokens: max,
+            last_refill: now,
+        });
+        // Refill tokens based on elapsed time
+        let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
+        bucket.tokens = (bucket.tokens + elapsed * rate).min(max);
+        bucket.last_refill = now;
+        // Try to consume one token
+        if bucket.tokens >= 1.0 {
+            bucket.tokens -= 1.0;
+            true
+        } else {
+            false
         }
-        if entry.0 >= self.limit_per_sec {
-            return false;
-        }
-        entry.0 += 1;
-        true
+    }
+
+    /// Remove stale bucket entries for peers not seen recently (Batch EK: CONS-FIND-21-24).
+    pub fn cleanup_stale(&mut self) {
+        let now = Instant::now();
+        self.buckets
+            .retain(|_, b| now.duration_since(b.last_refill) < RATE_LIMITER_CLEANUP_AGE);
     }
 }
 
@@ -204,6 +230,20 @@ impl PeerScoring {
         }
     }
 
+    /// Remove stale score entries and expired temp bans (Batch EK: CONS-FIND-21-24).
+    /// Should be called periodically from the event loop.
+    pub fn cleanup_stale(&mut self, stale_age: Duration) {
+        let now = Instant::now();
+        // Remove score entries for peers not seen in a long time and not banned
+        self.scores
+            .retain(|peer, entry| {
+                now.duration_since(entry.last_update) < stale_age
+                    || self.perm_bans.contains_key(peer)
+            });
+        // Purge expired temp bans
+        self.temp_bans.retain(|_, until| now < *until);
+    }
+
     /// Save ban list to JSON file.
     fn save_bans(&self) {
         let path = match &self.ban_file {
@@ -321,8 +361,65 @@ mod tests {
         for _ in 0..50 {
             assert!(limiter.check_and_increment(&peer));
         }
-        // 51st should be rejected
+        // 51st should be rejected (token bucket starts with 50 tokens)
         assert!(!limiter.check_and_increment(&peer));
+    }
+
+    #[test]
+    fn token_bucket_refills_over_time() {
+        let mut limiter = ConsensusRateLimiter::new(10);
+        let peer = test_peer(10);
+        // Exhaust all tokens
+        for _ in 0..10 {
+            assert!(limiter.check_and_increment(&peer));
+        }
+        assert!(!limiter.check_and_increment(&peer));
+        // Manually advance the last_refill to simulate time passing
+        if let Some(bucket) = limiter.buckets.get_mut(&peer) {
+            bucket.last_refill -= Duration::from_millis(500);
+        }
+        // Should have ~5 tokens refilled (10/sec * 0.5s)
+        for _ in 0..5 {
+            assert!(limiter.check_and_increment(&peer));
+        }
+        // Next should fail
+        assert!(!limiter.check_and_increment(&peer));
+    }
+
+    #[test]
+    fn token_bucket_no_2x_burst() {
+        // The old tumbling window allowed 2x burst at window boundaries.
+        // Token bucket should not: after exhausting tokens, even a small
+        // time advance only refills proportionally.
+        let mut limiter = ConsensusRateLimiter::new(100);
+        let peer = test_peer(11);
+        // Exhaust all tokens
+        for _ in 0..100 {
+            assert!(limiter.check_and_increment(&peer));
+        }
+        // Simulate 10ms passing — should refill ~1 token, not 100
+        if let Some(bucket) = limiter.buckets.get_mut(&peer) {
+            bucket.last_refill -= Duration::from_millis(10);
+        }
+        assert!(limiter.check_and_increment(&peer)); // ~1 token
+        assert!(!limiter.check_and_increment(&peer)); // depleted again
+    }
+
+    #[test]
+    fn rate_limiter_cleanup_stale() {
+        let mut limiter = ConsensusRateLimiter::new(10);
+        let active = test_peer(12);
+        let stale = test_peer(13);
+        limiter.check_and_increment(&active);
+        limiter.check_and_increment(&stale);
+        assert_eq!(limiter.buckets.len(), 2);
+        // Mark stale peer's bucket as old
+        if let Some(bucket) = limiter.buckets.get_mut(&stale) {
+            bucket.last_refill -= RATE_LIMITER_CLEANUP_AGE + Duration::from_secs(1);
+        }
+        limiter.cleanup_stale();
+        assert_eq!(limiter.buckets.len(), 1);
+        assert!(limiter.buckets.contains_key(&active));
     }
 
     #[test]

@@ -1,4 +1,12 @@
 //! `eth_*` JSON-RPC namespace — Ethereum-compatible RPC methods.
+//!
+//! ## Missing standard endpoints (Batch EK: FIX 16)
+//! The following commonly-used endpoints are not yet implemented.
+//! jsonrpsee returns -32601 (Method not found) for any unlisted method.
+//! - `eth_getBlockReceipts` — batch receipt retrieval
+//! - `eth_feeHistory` — implemented but reward percentiles are stubbed
+//! - `debug_traceTransaction` — execution tracing
+//! - `eth_createAccessList` — EIP-2930 access list generation
 
 use std::sync::atomic::Ordering::Relaxed;
 
@@ -202,6 +210,16 @@ fn build_call_tx_env(call: &CallRequest) -> Result<TxEnv, RpcError> {
     })
 }
 
+/// Convert an alloy AccessList to RPC format (Batch EK: EVM-FIND-17).
+fn rpc_access_list(al: &alloy_eips::eip2930::AccessList) -> Vec<RpcAccessListItem> {
+    al.iter()
+        .map(|item| RpcAccessListItem {
+            address: hex_address(item.address),
+            storage_keys: item.storage_keys.iter().map(|k| hex_b256(*k)).collect(),
+        })
+        .collect()
+}
+
 fn decode_envelope_and_sender(raw: &[u8]) -> Result<(TxEnvelope, Address), RpcError> {
     let envelope = TxEnvelope::decode(&mut &raw[..])
         .map_err(|e| RpcError::Internal(format!("tx rlp decode: {e}")))?;
@@ -220,69 +238,88 @@ fn build_rpc_tx(
 ) -> RpcTransaction {
     let tx_hash = *envelope.tx_hash();
     let to = envelope.to().map(hex_address);
-    let (v_val, r_val, s_val, tx_type, max_fee, max_priority, gas_price) = match envelope {
-        TxEnvelope::Legacy(signed) => {
-            let sig = signed.signature();
-            (
-                if sig.v() { 0x1cu64 } else { 0x1bu64 },
-                sig.r(),
-                sig.s(),
-                0u8,
-                None,
-                None,
-                Some(signed.tx().gas_price),
-            )
-        }
-        TxEnvelope::Eip2930(signed) => {
-            let sig = signed.signature();
-            (
-                if sig.v() { 1u64 } else { 0 },
-                sig.r(),
-                sig.s(),
-                1u8,
-                None,
-                None,
-                Some(signed.tx().gas_price),
-            )
-        }
-        TxEnvelope::Eip1559(signed) => {
-            let sig = signed.signature();
-            let tx = signed.tx();
-            (
-                if sig.v() { 1u64 } else { 0 },
-                sig.r(),
-                sig.s(),
-                2u8,
-                Some(tx.max_fee_per_gas),
-                Some(tx.max_priority_fee_per_gas),
-                None,
-            )
-        }
-        TxEnvelope::Eip4844(signed) => {
-            let sig = signed.signature();
-            (
-                if sig.v() { 1u64 } else { 0 },
-                sig.r(),
-                sig.s(),
-                3u8,
-                None,
-                None,
-                None,
-            )
-        }
-        TxEnvelope::Eip7702(signed) => {
-            let sig = signed.signature();
-            (
-                if sig.v() { 1u64 } else { 0 },
-                sig.r(),
-                sig.s(),
-                4u8,
-                None,
-                None,
-                None,
-            )
-        }
-    };
+    // FIX 10 (EVM-FIND-17): Include accessList for EIP-2930+ txs.
+    // FIX 12 (EVM-FIND-18): Use EIP-155 v value for legacy txs with chain_id.
+    let (v_val, r_val, s_val, tx_type, max_fee, max_priority, gas_price, access_list) =
+        match envelope {
+            TxEnvelope::Legacy(signed) => {
+                let sig = signed.signature();
+                let recovery_id = if sig.v() { 1u64 } else { 0u64 };
+                let v = match signed.tx().chain_id {
+                    Some(chain_id) => chain_id * 2 + 35 + recovery_id,
+                    None => 27 + recovery_id,
+                };
+                (
+                    v,
+                    sig.r(),
+                    sig.s(),
+                    0u8,
+                    None,
+                    None,
+                    Some(signed.tx().gas_price),
+                    None,
+                )
+            }
+            TxEnvelope::Eip2930(signed) => {
+                let sig = signed.signature();
+                let al = rpc_access_list(&signed.tx().access_list);
+                (
+                    if sig.v() { 1u64 } else { 0 },
+                    sig.r(),
+                    sig.s(),
+                    1u8,
+                    None,
+                    None,
+                    Some(signed.tx().gas_price),
+                    Some(al),
+                )
+            }
+            TxEnvelope::Eip1559(signed) => {
+                let sig = signed.signature();
+                let tx = signed.tx();
+                let al = rpc_access_list(&tx.access_list);
+                (
+                    if sig.v() { 1u64 } else { 0 },
+                    sig.r(),
+                    sig.s(),
+                    2u8,
+                    Some(tx.max_fee_per_gas),
+                    Some(tx.max_priority_fee_per_gas),
+                    None,
+                    Some(al),
+                )
+            }
+            TxEnvelope::Eip4844(signed) => {
+                let sig = signed.signature();
+                let tx = signed.tx().tx();
+                let al = rpc_access_list(&tx.access_list);
+                (
+                    if sig.v() { 1u64 } else { 0 },
+                    sig.r(),
+                    sig.s(),
+                    3u8,
+                    Some(tx.max_fee_per_gas),
+                    Some(tx.max_priority_fee_per_gas),
+                    None,
+                    Some(al),
+                )
+            }
+            TxEnvelope::Eip7702(signed) => {
+                let sig = signed.signature();
+                let tx = signed.tx();
+                let al = rpc_access_list(&tx.access_list);
+                (
+                    if sig.v() { 1u64 } else { 0 },
+                    sig.r(),
+                    sig.s(),
+                    4u8,
+                    Some(tx.max_fee_per_gas),
+                    Some(tx.max_priority_fee_per_gas),
+                    None,
+                    Some(al),
+                )
+            }
+        };
     let display_gas_price = gas_price
         .map(hex_u128)
         .unwrap_or_else(|| max_fee.map(hex_u128).unwrap_or_else(|| "0x0".into()));
@@ -305,8 +342,13 @@ fn build_rpc_tx(
         chain_id: envelope.chain_id().map(hex_u64),
         max_fee_per_gas: max_fee.map(hex_u128),
         max_priority_fee_per_gas: max_priority.map(hex_u128),
+        access_list,
     }
 }
+
+/// Empty trie root: keccak256(rlp("")) = keccak256(0x80).
+const EMPTY_TRIE_ROOT: &str =
+    "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421";
 
 fn build_rpc_block(
     header: &TorusBlockHeader,
@@ -369,7 +411,21 @@ fn build_rpc_block(
         nonce: "0x0000000000000000".into(),
         sha3_uncles: EMPTY_UNCLES_HASH.into(),
         logs_bloom: hex_bloom(&header.logs_bloom),
-        transactions_root: hex_b256(B256::ZERO),
+        // FIX 11 (EVM-PF-17): Compute transactions root from tx hashes.
+        // Uses keccak256(concat(tx_hashes)) as an approximation — not a full
+        // Merkle Patricia Trie, but sufficient for non-light-client verification.
+        transactions_root: match body_opt {
+            Some(body) if !body.evm_transactions.is_empty() => {
+                let mut buf = Vec::new();
+                for raw in &body.evm_transactions {
+                    if let Ok((env, _)) = decode_envelope_and_sender(raw) {
+                        buf.extend_from_slice(env.tx_hash().as_slice());
+                    }
+                }
+                hex_b256(alloy_primitives::keccak256(&buf))
+            }
+            _ => EMPTY_TRIE_ROOT.into(),
+        },
         state_root: hex_b256(header.state_root),
         receipts_root: hex_b256(header.receipts_root),
         miner: hex_address(header.proposer),
@@ -562,6 +618,11 @@ impl EthApiServer for RpcState {
 
     async fn send_raw_transaction(&self, data: String) -> RpcResult<String> {
         let bytes = parse_bytes(&data).map_err(err)?;
+        // FIX 14 (EVM-FIND-19): Rate-limit at submission time, not commit time.
+        let (_, sender) = decode_envelope_and_sender(&bytes).map_err(err)?;
+        if !self.tx_submit_limiter.check_sender(&sender) {
+            return Err(err(RpcError::TxSubmitRateLimit));
+        }
         let hash = self
             .mempool
             .add_evm_tx(bytes)
@@ -745,7 +806,12 @@ impl EthApiServer for RpcState {
 
     async fn call(&self, tx: CallRequest, block: String) -> RpcResult<String> {
         let latest = self.latest_height.load(Relaxed);
-        let _height = resolve_block_tag(&block, latest).map_err(err)?;
+        let height = resolve_block_tag(&block, latest).map_err(err)?;
+        // FIX 7 (EVM-PF-14): Use the resolved block height, not always latest.
+        // We only support latest state — return a clear error for historical queries.
+        if height != latest {
+            return Err(err(RpcError::HistoricalStateUnavailable { block: height }));
+        }
         let block_env = if latest > 0 {
             match get_header_with_hash(self, latest).map_err(err)? {
                 Some((h, _, _)) => block_env_from_header(&h),
@@ -754,20 +820,45 @@ impl EthApiServer for RpcState {
         } else {
             BlockEnvCfg::default()
         };
-        let tx_env = build_call_tx_env(&tx).map_err(err)?;
+        let mut tx_env = build_call_tx_env(&tx).map_err(err)?;
+        // FIX 13 (EVM-PF-18): Default nonce to account's current nonce, not 0.
+        if tx.nonce.is_none() {
+            let caller = tx_env.caller;
+            tx_env.nonce = self
+                .state
+                .get_account(&caller)
+                .ok()
+                .flatten()
+                .map(|a| a.nonce)
+                .unwrap_or(0);
+        }
         let (result, _) = self
             .executor
             .execute_tx(&self.state, &block_env, tx_env)
             .map_err(|e| err(RpcError::Evm(e.to_string())))?;
+        // FIX 15: Return revert reason when execution fails.
+        if !result.success {
+            return Err(err(RpcError::ExecutionReverted {
+                data: if result.output.is_empty() {
+                    None
+                } else {
+                    Some(format!("0x{}", hex::encode(&result.output)))
+                },
+            }));
+        }
         Ok(hex_bytes(&result.output))
     }
 
     async fn estimate_gas(&self, tx: CallRequest, block: Option<String>) -> RpcResult<String> {
         let latest = self.latest_height.load(Relaxed);
-        let _height = match block {
+        let height = match block {
             Some(b) => resolve_block_tag(&b, latest).map_err(err)?,
             None => latest,
         };
+        // FIX 7 (EVM-PF-14): Consistent block-tag handling.
+        if height != latest {
+            return Err(err(RpcError::HistoricalStateUnavailable { block: height }));
+        }
         let block_env = if latest > 0 {
             match get_header_with_hash(self, latest).map_err(err)? {
                 Some((h, _, _)) => block_env_from_header(&h),
@@ -779,13 +870,32 @@ impl EthApiServer for RpcState {
         let mut lo: u64 = 21_000;
         let mut hi: u64 = DEFAULT_BLOCK_GAS_LIMIT;
         let mut tx_env = build_call_tx_env(&tx).map_err(err)?;
+        // FIX 13 (EVM-PF-18): Default nonce to account's current nonce.
+        if tx.nonce.is_none() {
+            let caller = tx_env.caller;
+            tx_env.nonce = self
+                .state
+                .get_account(&caller)
+                .ok()
+                .flatten()
+                .map(|a| a.nonce)
+                .unwrap_or(0);
+        }
         tx_env.gas_limit = hi;
         let (result, _) = self
             .executor
             .execute_tx(&self.state, &block_env, tx_env)
             .map_err(|e| err(RpcError::Evm(e.to_string())))?;
+        // FIX 8 (EVM-FIND-10): Return error on revert instead of gas used.
+        // FIX 15: Include revert reason in error data.
         if !result.success {
-            return Ok(hex_u64(result.gas_used));
+            return Err(err(RpcError::ExecutionReverted {
+                data: if result.output.is_empty() {
+                    None
+                } else {
+                    Some(format!("0x{}", hex::encode(&result.output)))
+                },
+            }));
         }
         while lo + 1 < hi {
             let mid = lo + (hi - lo) / 2;
@@ -809,6 +919,15 @@ impl EthApiServer for RpcState {
             Some(b) => resolve_block_tag(b, latest).map_err(err)?,
             None => latest,
         };
+        // FIX 9 (EVM-PF-15): Reject queries spanning too many blocks.
+        const MAX_LOG_BLOCK_RANGE: u64 = 10_000;
+        let range = to.saturating_sub(from);
+        if range > MAX_LOG_BLOCK_RANGE {
+            return Err(err(RpcError::BlockRangeTooLarge {
+                range,
+                max: MAX_LOG_BLOCK_RANGE,
+            }));
+        }
         // Check if the requested range includes pruned blocks
         check_pruned(self, from)?;
         const MAX_LOGS: usize = 10_000;

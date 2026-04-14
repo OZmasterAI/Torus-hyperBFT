@@ -32,6 +32,22 @@ pub enum RpcError {
 
     #[error("historical data unavailable: block {block} has been pruned. Connect to an archive node for historical queries.")]
     DataPruned { block: u64 },
+
+    /// EVM execution reverted (Batch EK: EVM-FIND-10).
+    #[error("execution reverted")]
+    ExecutionReverted { data: Option<String> },
+
+    /// Block range too large for eth_getLogs (Batch EK: EVM-PF-15).
+    #[error("block range {range} exceeds maximum of {max}")]
+    BlockRangeTooLarge { range: u64, max: u64 },
+
+    /// Historical state not available — only latest supported (Batch EK: EVM-PF-14).
+    #[error("historical state not available at block {block}, only 'latest' is supported")]
+    HistoricalStateUnavailable { block: u64 },
+
+    /// Transaction submission rate limit exceeded (Batch EK: EVM-FIND-19).
+    #[error("rate limit exceeded for sender")]
+    TxSubmitRateLimit,
 }
 
 impl From<RpcError> for ErrorObjectOwned {
@@ -43,11 +59,18 @@ impl From<RpcError> for ErrorObjectOwned {
             RpcError::BlockNotFound | RpcError::TxNotFound => {
                 ErrorObjectOwned::owned(-32001, err.to_string(), None::<()>)
             }
-            RpcError::TooManyResults { .. } => {
+            RpcError::TooManyResults { .. } | RpcError::BlockRangeTooLarge { .. } => {
                 ErrorObjectOwned::owned(-32005, err.to_string(), None::<()>)
             }
-            RpcError::DataPruned { .. } => {
+            RpcError::DataPruned { .. } | RpcError::HistoricalStateUnavailable { .. } => {
                 ErrorObjectOwned::owned(-32000, err.to_string(), None::<()>)
+            }
+            RpcError::ExecutionReverted { ref data } => {
+                // EIP-3: code 3 with revert data
+                ErrorObjectOwned::owned(3, err.to_string(), data.clone())
+            }
+            RpcError::TxSubmitRateLimit => {
+                ErrorObjectOwned::owned(-32005, err.to_string(), None::<()>)
             }
             RpcError::State(_)
             | RpcError::Evm(_)

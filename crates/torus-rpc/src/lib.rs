@@ -10,9 +10,11 @@ pub mod torus;
 pub mod types;
 pub mod web3;
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use alloy_primitives::B256;
 use jsonrpsee::server::{ServerBuilder, ServerHandle};
@@ -64,6 +66,41 @@ impl Default for BlockNotifier {
     }
 }
 
+/// Per-sender transaction submission rate limiter (Batch EK: EVM-FIND-19).
+/// Counts submissions at send_raw_transaction time, not at block commit time.
+#[derive(Clone)]
+pub struct TxSubmitLimiter {
+    /// (count, window_start) per sender address.
+    inner: Arc<Mutex<HashMap<alloy_primitives::Address, (u32, Instant)>>>,
+    max_per_window: u32,
+}
+
+impl TxSubmitLimiter {
+    pub fn new(max_per_window: u32) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+            max_per_window,
+        }
+    }
+
+    /// Returns true if the sender is within rate limits. Increments the counter.
+    pub fn check_sender(&self, sender: &alloy_primitives::Address) -> bool {
+        let now = Instant::now();
+        let mut map = self.inner.lock().unwrap();
+        let entry = map.entry(*sender).or_insert((0, now));
+        // 10-second sliding window
+        if now.duration_since(entry.1) >= std::time::Duration::from_secs(10) {
+            entry.0 = 0;
+            entry.1 = now;
+        }
+        if entry.0 >= self.max_per_window {
+            return false;
+        }
+        entry.0 += 1;
+        true
+    }
+}
+
 /// Shared state for all RPC handlers.
 #[derive(Clone)]
 pub struct RpcState {
@@ -75,6 +112,8 @@ pub struct RpcState {
     pub(crate) notifier: BlockNotifier,
     /// Block height up to which historical data has been pruned (0 = archive mode).
     pub(crate) pruned_up_to: Arc<AtomicU64>,
+    /// Per-sender tx submission rate limiter (Batch EK: EVM-FIND-19).
+    pub(crate) tx_submit_limiter: TxSubmitLimiter,
 }
 
 /// JSON-RPC server combining eth, net, and web3 namespaces.
@@ -101,6 +140,7 @@ impl RpcServer {
                 latest_height: Arc::new(AtomicU64::new(latest)),
                 notifier,
                 pruned_up_to: Arc::new(AtomicU64::new(0)),
+                tx_submit_limiter: TxSubmitLimiter::new(50), // 50 tx per 10s per sender
             },
         }
     }

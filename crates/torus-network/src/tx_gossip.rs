@@ -57,6 +57,9 @@ impl TxGossipState {
     fn cleanup_expired(&mut self, now: Instant) {
         self.seen
             .retain(|_, ts| now.duration_since(*ts) < self.dedup_window);
+        // Also clean up stale per-peer rate entries (Batch EK: CONS-FIND-21-24).
+        self.peer_rates
+            .retain(|_, rate| now.duration_since(rate.window_start) < self.dedup_window);
     }
 }
 

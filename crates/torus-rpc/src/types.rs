@@ -157,6 +157,17 @@ pub struct RpcTransaction {
     pub chain_id: Option<String>,
     pub max_fee_per_gas: Option<String>,
     pub max_priority_fee_per_gas: Option<String>,
+    /// EIP-2930/1559 access list (Batch EK: EVM-FIND-17).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub access_list: Option<Vec<RpcAccessListItem>>,
+}
+
+/// A single entry in an EIP-2930 access list.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcAccessListItem {
+    pub address: String,
+    pub storage_keys: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
