@@ -73,6 +73,8 @@ pub struct RpcState {
     pub(crate) chain_id: u64,
     pub(crate) latest_height: Arc<AtomicU64>,
     pub(crate) notifier: BlockNotifier,
+    /// Block height up to which historical data has been pruned (0 = archive mode).
+    pub(crate) pruned_up_to: Arc<AtomicU64>,
 }
 
 /// JSON-RPC server combining eth, net, and web3 namespaces.
@@ -98,8 +100,25 @@ impl RpcServer {
                 chain_id,
                 latest_height: Arc::new(AtomicU64::new(latest)),
                 notifier,
+                pruned_up_to: Arc::new(AtomicU64::new(0)),
             },
         }
+    }
+
+    /// Get a shared handle to the latest block height atomic.
+    pub fn latest_height(&self) -> Arc<AtomicU64> {
+        self.state.latest_height.clone()
+    }
+
+    /// Set the pruned-up-to height for RPC error handling.
+    pub fn set_pruned_up_to(&self, pruned: Arc<AtomicU64>) {
+        let val = pruned.load(Ordering::Relaxed);
+        self.state.pruned_up_to.store(val, Ordering::Relaxed);
+    }
+
+    /// Get a shared handle to the pruned-up-to atomic.
+    pub fn pruned_up_to(&self) -> Arc<AtomicU64> {
+        self.state.pruned_up_to.clone()
     }
 
     /// Start the RPC server on the given address.
