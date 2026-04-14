@@ -116,6 +116,8 @@ impl<N: Network> Pacemaker<N> {
                         self.config.chain_id,
                         cur_view,
                         block_tree.highest_tc()?,
+                        block_tree.local_tip()?,
+                        block_tree.highest_qc_for_timeout()?,
                     );
                     self.sender
                         .broadcast(Message::from(pacemaker_message.clone()));
@@ -131,9 +133,27 @@ impl<N: Network> Pacemaker<N> {
                 // We extend the view timeout so that we will broadcast a `TimeoutVote` when this view times out again.
                 self.extend_view()?
 
-            // 1.2. Else, if the current view is not a normal view, simply update the Pacemaker instance's local
-            // view the next view.
+            // 1.2. MonadBFT: broadcast TimeoutVote before advancing on normal view timeout.
             } else {
+                if is_validator(&self.config.keypair.public(), &validator_set_state) {
+                    let pacemaker_message = PacemakerMessage::timeout_vote(
+                        &self.config.keypair,
+                        self.config.chain_id,
+                        cur_view,
+                        block_tree.highest_tc()?,
+                        block_tree.local_tip()?,
+                        block_tree.highest_qc_for_timeout()?,
+                    );
+                    self.sender
+                        .broadcast(Message::from(pacemaker_message.clone()));
+                    if let PacemakerMessage::TimeoutVote(timeout_vote) = pacemaker_message {
+                        Event::TimeoutVote(TimeoutVoteEvent {
+                            timestamp: SystemTime::now(),
+                            timeout_vote,
+                        })
+                        .publish(&self.event_publisher)
+                    }
+                }
                 self.update_view(cur_view + 1, &validator_set_state)?;
             }
 
@@ -226,11 +246,41 @@ impl<N: Network> Pacemaker<N> {
             return Ok(());
         };
 
-        // 2. Check whether the `TimeoutVote` is cryptographically correct and the current view is an Epoch-Change
-        //    View.
-        if timeout_vote.is_correct(origin)
-            && is_epoch_change_view(&timeout_vote.view, self.config.epoch_length)
-        {
+        // 2. Check whether the `TimeoutVote` is cryptographically correct.
+        // MonadBFT: accept timeout votes for ALL views (not just epoch-change views).
+        if timeout_vote.is_correct(origin) {
+            // MonadBFT Bracha amplification: count timeout votes per view.
+            if timeout_vote.view >= self.view_info.view {
+                let count = self.state.bracha_timeout_counts
+                    .entry(timeout_vote.view)
+                    .or_insert(0);
+                *count += 1;
+                let total_power = validator_set_state.committed_validator_set().total_power().int() as u64;
+                let f = if total_power > 0 { (total_power - 1) / 3 } else { 0 };
+                if *count == f + 1
+                    && is_validator(&self.config.keypair.public(), &validator_set_state)
+                    && self.state.last_timeout_vote_view.map_or(true, |v| v < timeout_vote.view)
+                {
+                    let own_timeout = PacemakerMessage::timeout_vote(
+                        &self.config.keypair,
+                        self.config.chain_id,
+                        timeout_vote.view,
+                        block_tree.highest_tc()?,
+                        block_tree.local_tip()?,
+                        block_tree.highest_qc_for_timeout()?,
+                    );
+                    self.sender.broadcast(Message::from(own_timeout.clone()));
+                    if let PacemakerMessage::TimeoutVote(ref tv) = own_timeout {
+                        Event::TimeoutVote(TimeoutVoteEvent {
+                            timestamp: SystemTime::now(),
+                            timeout_vote: tv.clone(),
+                        })
+                        .publish(&self.event_publisher);
+                    }
+                    self.state.last_timeout_vote_view = Some(timeout_vote.view);
+                }
+            }
+
             let fallback_tc = match &timeout_vote.highest_tc {
                 Some(tc) if tc.is_correct(block_tree)? => Some(tc.clone()),
                 _ => None,
@@ -501,6 +551,8 @@ struct PacemakerState {
 
     /// The view in which this replica last broadcasted an [`AdvanceView`] message.
     last_advance_view: Option<ViewNumber>,
+    bracha_timeout_counts: BTreeMap<ViewNumber, u64>,
+    last_timeout_vote_view: Option<ViewNumber>,
 }
 
 impl PacemakerState {
@@ -541,6 +593,8 @@ impl PacemakerState {
                 validator_set_state,
             ),
             last_advance_view: None,
+            bracha_timeout_counts: BTreeMap::new(),
+            last_timeout_vote_view: None,
         }
     }
 

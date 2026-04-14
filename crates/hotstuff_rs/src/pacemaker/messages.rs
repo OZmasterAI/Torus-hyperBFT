@@ -19,7 +19,7 @@ use crate::{
     },
 };
 
-use super::types::TimeoutCertificate;
+use super::types::{TimeoutCertificate, TipInfo};
 
 /// Enum wrapper around any kind of message sent between replicas as part of the Pacemaker subprotocol.
 #[derive(Clone, BorshSerialize, BorshDeserialize)]
@@ -40,6 +40,8 @@ impl PacemakerMessage {
         chain_id: ChainID,
         view: ViewNumber,
         highest_tc: Option<TimeoutCertificate>,
+        local_tip: Option<TipInfo>,
+        highest_qc: Option<crate::hotstuff::types::PhaseCertificate>,
     ) -> PacemakerMessage {
         let message = &(chain_id, view).try_to_vec().unwrap();
         let signature = keypair.sign(message);
@@ -49,6 +51,8 @@ impl PacemakerMessage {
             view,
             signature,
             highest_tc,
+            local_tip,
+            highest_qc,
         })
     }
 
@@ -121,6 +125,10 @@ pub struct TimeoutVote {
     /// The current highest timeout certificate of the sending replica, i.e., the the one with the highest
     /// [`view`](TimeoutCertificate::view).
     pub highest_tc: Option<TimeoutCertificate>,
+
+    // MonadBFT fields
+    pub local_tip: Option<TipInfo>,
+    pub highest_qc: Option<crate::hotstuff::types::PhaseCertificate>,
 }
 
 impl SignedMessage for TimeoutVote {

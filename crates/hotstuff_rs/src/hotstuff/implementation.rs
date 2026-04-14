@@ -196,6 +196,7 @@ impl<N: Network> HotStuff<N> {
                     chain_id: self.config.chain_id,
                     view: self.view_info.view,
                     block,
+                    tc: None,
                 };
                 self.sender_handle
                     .broadcast::<HotStuffMessage>(proposal.clone().into());
@@ -207,6 +208,24 @@ impl<N: Network> HotStuff<N> {
                 .publish(&self.event_publisher);
 
                 return Ok(());
+            }
+
+            // MonadBFT: Check if the previous view timed out and produced a TC.
+            if let Some(tc) = block_tree.highest_tc()? {
+                if tc.view + 1 == self.view_info.view {
+                    if let Some(proposal) = self.create_proposal_based_on_tc(
+                        &tc, block_tree, app,
+                    )? {
+                        self.sender_handle
+                            .broadcast::<HotStuffMessage>(proposal.clone().into());
+                        Event::Propose(ProposeEvent {
+                            timestamp: SystemTime::now(),
+                            proposal,
+                        })
+                        .publish(&self.event_publisher);
+                        return Ok(());
+                    }
+                }
             }
 
             // Otherwise, propose a new block or nudge based on highest_pc.
@@ -244,6 +263,7 @@ impl<N: Network> HotStuff<N> {
                         chain_id: self.config.chain_id,
                         view: self.view_info.view,
                         block,
+                        tc: None,
                     };
                     self.sender_handle
                         .broadcast::<HotStuffMessage>(proposal.clone().into());
@@ -275,6 +295,29 @@ impl<N: Network> HotStuff<N> {
         }
 
         Ok(())
+    }
+
+    /// MonadBFT Algorithm 4: CREATEPROPOSALBASEDONTC.
+    fn create_proposal_based_on_tc<K: KVStore>(
+        &self,
+        tc: &crate::pacemaker::types::TimeoutCertificate,
+        block_tree: &mut BlockTreeSingleton<K>,
+        _app: &mut impl App<K>,
+    ) -> Result<Option<Proposal>, HotStuffError> {
+        if tc.high_tip_is_winner {
+            if let Some(ref tip) = tc.high_tip {
+                if let Some(block) = block_tree.block(&tip.block_hash)? {
+                    return Ok(Some(Proposal {
+                        chain_id: self.config.chain_id,
+                        view: self.view_info.view,
+                        block,
+                        tc: Some(tc.clone()),
+                    }));
+                }
+                // Case 5: leader lacks the block. TODO(B2): NEC recovery.
+            }
+        }
+        Ok(None)
     }
 
     /// Process a newly received message for the current view according to the HotStuff subprotocol.
@@ -352,6 +395,29 @@ impl<N: Network> HotStuff<N> {
             proposal: proposal.clone(),
         })
         .publish(&self.event_publisher);
+
+        // MonadBFT: validate reproposal TC if present.
+        if proposal.is_reproposal() {
+            if let Some(ref tc) = proposal.tc {
+                let tc_valid = tc.is_correct(block_tree)?
+                    && self.view_info.view == tc.view + 1
+                    && tc.high_tip.as_ref().map_or(false, |tip| tip.block_hash == proposal.block.hash);
+                if !tc_valid {
+                    match self.proposal_status {
+                        ProposalStatus::WaitingForProposal => {
+                            self.proposal_status = ProposalStatus::OneLeaderProposed { leader: *origin }
+                        }
+                        ProposalStatus::OneLeaderProposed { leader: _ } => {
+                            self.proposal_status = ProposalStatus::AllLeadersProposed
+                        }
+                        _ => {}
+                    }
+                    return Ok(());
+                }
+            } else {
+                return Ok(());
+            }
+        }
 
         // 1. Check if block is correct and safe.
         if !proposal.block.is_correct(block_tree)?
@@ -437,6 +503,20 @@ impl<N: Network> HotStuff<N> {
                     .send::<HotStuffMessage>(vote_recipient, phase_vote.clone().into());
 
                 block_tree.set_highest_view_phase_voted(self.view_info.view)?;
+
+                // MonadBFT: Update local_tip only for fresh proposals (not reproposals).
+                if !proposal.is_reproposal() && vote_phase == Phase::Generic {
+                    use crate::pacemaker::types::TipInfo;
+                    let tip = TipInfo {
+                        block_hash: proposal.block.hash,
+                        block_height: proposal.block.height,
+                        block_justify: proposal.block.justify.clone(),
+                        block_data_hash: proposal.block.data_hash,
+                        view: self.view_info.view,
+                    };
+                    block_tree.set_local_tip(&tip)?;
+                }
+
                 Event::PhaseVote(PhaseVoteEvent {
                     timestamp: SystemTime::now(),
                     vote: phase_vote.clone(),
@@ -617,6 +697,22 @@ impl<N: Network> HotStuff<N> {
                 let _ = self
                     .phase_vote_collectors
                     .update_validator_sets(&validator_set_state);
+
+                // MonadBFT: Backup QC broadcast.
+                if new_pc.phase.is_generic()
+                    && is_proposer(
+                        &self.config.keypair.public(),
+                        self.view_info.view,
+                        &validator_set_state,
+                    )
+                {
+                    use crate::pacemaker::messages::ProgressCertificate;
+                    let advance_msg = crate::pacemaker::messages::PacemakerMessage::advance_view(
+                        ProgressCertificate::PhaseCertificate(new_pc.clone()),
+                    );
+                    self.sender_handle
+                        .broadcast::<crate::networking::messages::Message>(advance_msg.into());
+                }
             }
         }
 

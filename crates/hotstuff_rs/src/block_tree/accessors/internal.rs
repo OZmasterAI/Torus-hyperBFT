@@ -1186,3 +1186,50 @@ impl<W: WriteBatch> BlockTreeWriteBatch<W> {
 pub enum KVSetError {
     SerializeValueError { key: Key, source: std::io::Error },
 }
+
+/// MonadBFT methods on BlockTreeSingleton.
+impl<K: KVStore> BlockTreeSingleton<K> {
+    /// Get the validator's local_tip: the header of the latest fresh proposal it voted for.
+    pub fn local_tip(&self) -> Result<Option<crate::pacemaker::types::TipInfo>, BlockTreeError> {
+        use borsh::BorshDeserialize;
+        if let Some(bytes) = self.0.get(&variables::LOCAL_TIP) {
+            let tip = crate::pacemaker::types::TipInfo::deserialize(&mut bytes.as_slice())
+                .map_err(|err| KVGetError::DeserializeValueError {
+                    key: Key::HighestTC,
+                    source: err,
+                })?;
+            Ok(Some(tip))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Set the validator's local_tip after voting for a fresh proposal.
+    pub fn set_local_tip(&mut self, tip: &crate::pacemaker::types::TipInfo) -> Result<(), BlockTreeError> {
+        use borsh::BorshSerialize;
+        let mut wb: BlockTreeWriteBatch<K::WriteBatch> = BlockTreeWriteBatch::new();
+        wb.0.set(
+            &variables::LOCAL_TIP,
+            &tip.try_to_vec()
+                .map_err(|err| KVSetError::SerializeValueError {
+                    key: Key::HighestTC,
+                    source: err,
+                })?,
+        );
+        self.write(wb);
+        Ok(())
+    }
+
+    /// Get the highest QC for inclusion in a timeout vote.
+    pub fn highest_qc_for_timeout(&self) -> Result<Option<crate::hotstuff::types::PhaseCertificate>, BlockTreeError> {
+        let highest_pc = self.highest_pc()?;
+        if highest_pc.is_genesis_pc() {
+            return Ok(None);
+        }
+        let local_tip = self.local_tip()?;
+        match local_tip {
+            Some(tip) if highest_pc.view < tip.view => Ok(None),
+            _ => Ok(Some(highest_pc)),
+        }
+    }
+}

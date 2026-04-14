@@ -1,12 +1,15 @@
 /*
     Copyright © 2023, ParallelChain Lab
     Licensed under the Apache License, Version 2.0: http://www.apache.org/licenses/LICENSE-2.0
+    MonadBFT extensions added by Torus Project.
 */
 
 //! Types specific to the Pacemaker protocol.
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use ed25519_dalek::Verifier;
+
+use crate::hotstuff::types::PhaseCertificate;
 
 use crate::{
     block_tree::{
@@ -21,6 +24,16 @@ use crate::{
     },
 };
 
+/// Compact representation of a block header for timeout messages (MonadBFT).
+#[derive(Clone, BorshSerialize, BorshDeserialize, PartialEq, Eq)]
+pub struct TipInfo {
+    pub block_hash: CryptoHash,
+    pub block_height: BlockHeight,
+    pub block_justify: PhaseCertificate,
+    pub block_data_hash: CryptoHash,
+    pub view: ViewNumber,
+}
+
 /// Cryptographic proof that at least a quorum of validators have sent a [`TimeoutVote`] for the same
 /// view.
 #[derive(Clone, BorshSerialize, BorshDeserialize, PartialEq, Eq)]
@@ -33,6 +46,10 @@ pub struct TimeoutCertificate {
 
     /// Signatures of the `TimeoutVote`s that were collected to produce this `TimeoutCertificate`.
     pub signatures: SignatureSet,
+    // MonadBFT fields
+    pub high_tip: Option<TipInfo>,
+    pub high_qc: Option<PhaseCertificate>,
+    pub high_tip_is_winner: bool,
 }
 
 impl Certificate for TimeoutCertificate {
@@ -108,6 +125,8 @@ pub(crate) struct TimeoutVoteCollector {
     validator_set: ValidatorSet,
     signature_set_power: TotalPower,
     signature_set: SignatureSet,
+    high_tip: Option<TipInfo>,
+    high_qc: Option<PhaseCertificate>,
 }
 
 impl Collector for TimeoutVoteCollector {
@@ -123,6 +142,8 @@ impl Collector for TimeoutVoteCollector {
             validator_set,
             signature_set_power: TotalPower::new(0),
             signature_set: SignatureSet::new(n),
+            high_tip: None,
+            high_qc: None,
         }
     }
 
@@ -159,14 +180,34 @@ impl Collector for TimeoutVoteCollector {
                 self.signature_set.set(pos, Some(vote.signature));
                 self.signature_set_power += *self.validator_set.power(signer).unwrap();
 
-                // If inserting the vote makes the signature set form a quorum, then create a TimeoutCertificate.
+                // MonadBFT: track high_tip and high_qc
+                if let Some(ref tip) = vote.local_tip {
+                    if self.high_tip.is_none() || tip.view > self.high_tip.as_ref().unwrap().view {
+                        self.high_tip = Some(tip.clone());
+                    }
+                }
+                if let Some(ref qc) = vote.highest_qc {
+                    if self.high_qc.is_none() || qc.view > self.high_qc.as_ref().unwrap().view {
+                        self.high_qc = Some(qc.clone());
+                    }
+                }
+
                 if self.signature_set_power >= self.validator_set.quorum() {
+                    let max_tip_view = self.high_tip.as_ref().map(|t| t.view);
+                    let max_qc_view = self.high_qc.as_ref().map(|q| q.view);
+                    let high_tip_is_winner = match (max_tip_view, max_qc_view) {
+                        (Some(tv), Some(qv)) => tv > qv,
+                        (Some(_), None) => true,
+                        _ => false,
+                    };
                     let collected_tc = TimeoutCertificate {
                         chain_id: self.chain_id,
                         view: self.view,
                         signatures: self.signature_set.clone(),
+                        high_tip: self.high_tip.clone(),
+                        high_qc: self.high_qc.clone(),
+                        high_tip_is_winner,
                     };
-
                     return Some(collected_tc);
                 }
             }

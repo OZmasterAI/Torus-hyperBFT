@@ -19,6 +19,8 @@ use crate::{
     },
 };
 
+use crate::pacemaker::types::TimeoutCertificate;
+
 use super::types::{Phase, PhaseCertificate};
 
 /// Every kind of message sent between replicas as part of the HotStuff subprotocol.
@@ -122,6 +124,15 @@ pub struct Proposal {
 
     /// A `Block` extending the chain identified by `chain_id`.
     pub block: Block,
+    // MonadBFT: TC from the previous view (present for reproposals)
+    pub tc: Option<TimeoutCertificate>,
+}
+
+impl Proposal {
+    /// Returns true if this proposal is a reproposal (MonadBFT Case 4).
+    pub fn is_reproposal(&self) -> bool {
+        self.tc.as_ref().map_or(false, |tc| tc.high_tip_is_winner)
+    }
 }
 
 /// Message broadcasted by a leader in `view` to "nudge" other validators to participate in the voting
