@@ -53,6 +53,16 @@ fn make_ctx(state_db: StateDb) -> NativeExecContext {
     )
 }
 
+/// Fund a trader with native balance for order margin (Batch IJ: FIX 2 requires margin).
+fn fund_native(ctx: &NativeExecContext, trader: &Address, amount: FixedPoint) {
+    use torus_core::position::NativeBalance;
+    let bal = NativeBalance {
+        available: amount,
+        order_margin: FixedPoint::ZERO,
+    };
+    ctx.positions.put_native_balance(trader, &bal).unwrap();
+}
+
 // ============================================================================
 // Test: Action classification
 // ============================================================================
@@ -245,6 +255,7 @@ fn execute_batch_continues_on_failure() {
 fn execute_place_order_succeeds() {
     let (_dir, state_db) = open_test_db();
     let mut ctx = make_ctx(state_db);
+    fund_native(&ctx, &addr(1), fp(1_000_000));
 
     let action = NativeAction::PlaceOrder(PlaceOrderParams {
         market_id: 1,
@@ -309,6 +320,10 @@ fn deterministic_native_execution() {
 
     let mut ctx1 = make_ctx(db1.clone());
     let mut ctx2 = make_ctx(db2.clone());
+    fund_native(&ctx1, &addr(1), fp(1_000_000));
+    fund_native(&ctx1, &addr(2), fp(1_000_000));
+    fund_native(&ctx2, &addr(1), fp(1_000_000));
+    fund_native(&ctx2, &addr(2), fp(1_000_000));
 
     let result1 = NativeExecutor::execute_batch(&mut ctx1, &actions);
     let result2 = NativeExecutor::execute_batch(&mut ctx2, &actions);
@@ -385,6 +400,7 @@ fn empty_native_actions_evm_only() {
 fn native_only_block_no_evm() {
     let (_dir, state_db) = open_test_db();
     let mut ctx = make_ctx(state_db);
+    fund_native(&ctx, &addr(1), fp(1_000_000));
 
     // Execute native actions with no EVM transactions.
     let actions = vec![
@@ -413,6 +429,8 @@ fn native_only_block_no_evm() {
 fn cancel_executes_before_new_orders() {
     let (_dir, state_db) = open_test_db();
     let mut ctx = make_ctx(state_db);
+    fund_native(&ctx, &addr(1), fp(1_000_000));
+    fund_native(&ctx, &addr(2), fp(1_000_000));
 
     // First place an order to create something to cancel.
     let place = NativeAction::PlaceOrder(PlaceOrderParams {
@@ -467,6 +485,8 @@ fn cancel_executes_before_new_orders() {
 fn batch_accumulates_gas() {
     let (_dir, state_db) = open_test_db();
     let mut ctx = make_ctx(state_db);
+    fund_native(&ctx, &addr(1), fp(1_000_000));
+    fund_native(&ctx, &addr(2), fp(1_000_000));
 
     let actions = vec![
         (addr(1), NativeAction::PlaceOrder(PlaceOrderParams {
