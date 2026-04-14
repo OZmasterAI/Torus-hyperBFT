@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use borsh::{BorshDeserialize, BorshSerialize};
 use ed25519_dalek::Verifier;
 
-use super::messages::PhaseVote;
+use super::messages::{PhaseVote, Proposal};
 use crate::{
     block_tree::{
         accessors::internal::{BlockTreeError, BlockTreeSingleton},
@@ -386,6 +386,188 @@ impl Collector for PhaseVoteCollector {
 
                     return Some(collected_pc);
                 }
+            }
+        }
+
+        None
+    }
+}
+
+// ============================================================================
+// MonadBFT B2: No-Endorsement Certificate (NEC) and related types
+// ============================================================================
+
+/// No-Endorsement Certificate (NEC): proof that a block can be safely skipped.
+///
+/// An NEC consists of 2f+1 signatures from validators who did NOT vote for the
+/// high_tip block. Since a QC requires 2f+1 voters and an NEC requires 2f+1
+/// non-voters, both cannot coexist (2f+1 + 2f+1 > 3f+1 = n), so if an NEC
+/// forms, the block could never have gotten a QC and skipping it is safe.
+#[derive(Clone, BorshSerialize, BorshDeserialize, PartialEq, Eq)]
+pub struct NoEndorsementCertificate {
+    /// The view this NEC is for (tc.view + 1).
+    pub view: ViewNumber,
+    /// View of the QC inside the high_tip's block header.
+    pub high_tip_qc_view: ViewNumber,
+    /// Aggregated signatures of 2f+1 validators over (view, high_tip_qc_view).
+    pub signatures: SignatureSet,
+}
+
+/// VALIDNEC: Check that a No-Endorsement Certificate is well-formed and has a quorum.
+///
+/// Validity conditions:
+/// 1. nec.high_tip_qc_view < nec.view - 1 (the skipped block was NOT in the
+///    immediately preceding view — otherwise there's no gap to recover from)
+/// 2. The signatures contain 2f+1 valid signatures over (nec.view, nec.high_tip_qc_view)
+pub fn valid_nec<K: KVStore>(
+    nec: &NoEndorsementCertificate,
+    block_tree: &BlockTreeSingleton<K>,
+) -> Result<bool, BlockTreeError> {
+    // Condition 1: the high_tip's QC view must be strictly less than nec.view - 1.
+    if nec.view.int() == 0 || nec.high_tip_qc_view >= nec.view - 1 {
+        return Ok(false);
+    }
+
+    // Condition 2: verify 2f+1 valid signatures.
+    let validator_set_state = block_tree.validator_set_state()?;
+    let validator_set = if validator_set_state.update_decided() {
+        validator_set_state.committed_validator_set()
+    } else {
+        // During speculation, accept from either set.
+        validator_set_state.committed_validator_set()
+    };
+
+    Ok(is_nec_correctly_signed(nec, validator_set))
+}
+
+/// Check if the NEC's signatures are correct and form a quorum.
+fn is_nec_correctly_signed(nec: &NoEndorsementCertificate, validator_set: &ValidatorSet) -> bool {
+    if nec.signatures.len() != validator_set.len() {
+        return false;
+    }
+
+    let mut total_power = TotalPower::new(0);
+    let ne_message_bytes = (nec.view, nec.high_tip_qc_view).try_to_vec().unwrap();
+
+    for (signature, (signer, power)) in nec
+        .signatures
+        .iter()
+        .zip(validator_set.validators_and_powers())
+    {
+        if let Some(signature) = signature {
+            if let Ok(sig) = Signature::from_slice(&signature.bytes()) {
+                if signer.verify(&ne_message_bytes, &sig).is_ok() {
+                    total_power += power;
+                } else {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+        }
+    }
+
+    total_power >= validator_set.quorum()
+}
+
+/// MonadBFT ISFRESHPROPOSAL: determines if a proposal contains a fresh block
+/// (not a reproposal), which qualifies for speculative commit.
+///
+/// A proposal is "fresh" if ANY of:
+/// 1. Happy path: the block's QC is from the immediately preceding view
+///    (p.block.justify.view == p.view - 1)
+/// 2. NEC: an NEC proves the skipped block is safe to abandon
+/// 3. TC high_qc: the TC's highest QC resolves the view without reproposal
+pub fn is_fresh_proposal(proposal: &Proposal) -> bool {
+    // Condition 1: happy path — QC from immediately preceding view.
+    if proposal.view.int() > 0 && proposal.block.justify.view == proposal.view - 1 {
+        return true;
+    }
+
+    // Condition 2: NEC proves the skipped block is safe.
+    if proposal.nec.is_some() {
+        return true;
+    }
+
+    // Condition 3: TC's high_qc resolves the view.
+    if let Some(ref tc) = proposal.tc {
+        if tc.high_qc.is_some() && !tc.high_tip_is_winner {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Collector for No-Endorsement (NE) messages during RECOVER.
+///
+/// Incrementally collects NE signatures from validators who did not vote for
+/// the high_tip block, forming an NEC when 2f+1 are collected.
+#[derive(Clone)]
+pub(crate) struct NECollector {
+    view: ViewNumber,
+    high_tip_qc_view: ViewNumber,
+    validator_set: ValidatorSet,
+    signature_set: SignatureSet,
+    signature_set_power: TotalPower,
+}
+
+impl NECollector {
+    pub(crate) fn new(
+        view: ViewNumber,
+        high_tip_qc_view: ViewNumber,
+        validator_set: ValidatorSet,
+    ) -> Self {
+        let n = validator_set.len();
+        Self {
+            view,
+            high_tip_qc_view,
+            validator_set,
+            signature_set: SignatureSet::new(n),
+            signature_set_power: TotalPower::new(0),
+        }
+    }
+
+    /// Collect an NE signature from a validator.
+    /// Returns an NEC if 2f+1 signatures have been collected.
+    pub(crate) fn collect(
+        &mut self,
+        signer: &VerifyingKey,
+        ne_view: ViewNumber,
+        ne_high_tip_qc_view: ViewNumber,
+        signature: SignatureBytes,
+    ) -> Option<NoEndorsementCertificate> {
+        // Verify the NE is for the correct view and high_tip_qc_view.
+        if ne_view != self.view || ne_high_tip_qc_view != self.high_tip_qc_view {
+            return None;
+        }
+
+        // Verify the signer is in the validator set.
+        if let Some(pos) = self.validator_set.position(signer) {
+            // Don't double-count.
+            if self.signature_set.get(pos).is_some() {
+                return None;
+            }
+
+            // Verify signature.
+            let ne_message_bytes = (ne_view, ne_high_tip_qc_view).try_to_vec().unwrap();
+            if let Ok(sig) = Signature::from_slice(&signature.bytes()) {
+                if signer.verify(&ne_message_bytes, &sig).is_err() {
+                    return None;
+                }
+            } else {
+                return None;
+            }
+
+            self.signature_set.set(pos, Some(signature));
+            self.signature_set_power += *self.validator_set.power(signer).unwrap();
+
+            if self.signature_set_power >= self.validator_set.quorum() {
+                return Some(NoEndorsementCertificate {
+                    view: self.view,
+                    high_tip_qc_view: self.high_tip_qc_view,
+                    signatures: self.signature_set.clone(),
+                });
             }
         }
 

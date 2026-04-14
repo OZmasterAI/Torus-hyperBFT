@@ -21,7 +21,7 @@ use crate::{
 
 use crate::pacemaker::types::TimeoutCertificate;
 
-use super::types::{Phase, PhaseCertificate};
+use super::types::{NoEndorsementCertificate, Phase, PhaseCertificate};
 
 /// Every kind of message sent between replicas as part of the HotStuff subprotocol.
 #[derive(Clone, BorshSerialize, BorshDeserialize)]
@@ -37,6 +37,20 @@ pub enum HotStuffMessage {
 
     /// See [`NewView`].
     NewView(NewView),
+
+    // MonadBFT B2: NEC recovery messages
+    /// Request for the high_tip block from validators during RECOVER.
+    ProposalRequest(ProposalRequest),
+
+    /// Response containing the requested block.
+    ProposalResponse(ProposalResponse),
+
+    /// Request for No-Endorsement attestations during RECOVER.
+    NERequest(NERequest),
+
+    /// A single No-Endorsement attestation from a validator who did not vote
+    /// for the high_tip block.
+    NE(NEMessage),
 }
 
 impl HotStuffMessage {
@@ -47,6 +61,10 @@ impl HotStuffMessage {
             HotStuffMessage::Nudge(Nudge { chain_id, .. }) => *chain_id,
             HotStuffMessage::PhaseVote(PhaseVote { chain_id, .. }) => *chain_id,
             HotStuffMessage::NewView(NewView { chain_id, .. }) => *chain_id,
+            HotStuffMessage::ProposalRequest(ProposalRequest { chain_id, .. }) => *chain_id,
+            HotStuffMessage::ProposalResponse(ProposalResponse { chain_id, .. }) => *chain_id,
+            HotStuffMessage::NERequest(NERequest { chain_id, .. }) => *chain_id,
+            HotStuffMessage::NE(NEMessage { chain_id, .. }) => *chain_id,
         }
     }
 
@@ -57,6 +75,10 @@ impl HotStuffMessage {
             HotStuffMessage::Nudge(Nudge { view, .. }) => *view,
             HotStuffMessage::PhaseVote(PhaseVote { view, .. }) => *view,
             HotStuffMessage::NewView(NewView { view, .. }) => *view,
+            HotStuffMessage::ProposalRequest(ProposalRequest { view, .. }) => *view,
+            HotStuffMessage::ProposalResponse(ProposalResponse { view, .. }) => *view,
+            HotStuffMessage::NERequest(NERequest { view, .. }) => *view,
+            HotStuffMessage::NE(NEMessage { view, .. }) => *view,
         }
     }
 
@@ -67,6 +89,10 @@ impl HotStuffMessage {
             HotStuffMessage::Nudge(_) => mem::size_of::<Nudge>() as u64,
             HotStuffMessage::PhaseVote(_) => mem::size_of::<PhaseVote>() as u64,
             HotStuffMessage::NewView(_) => mem::size_of::<NewView>() as u64,
+            HotStuffMessage::ProposalRequest(_) => mem::size_of::<ProposalRequest>() as u64,
+            HotStuffMessage::ProposalResponse(_) => mem::size_of::<ProposalResponse>() as u64,
+            HotStuffMessage::NERequest(_) => mem::size_of::<NERequest>() as u64,
+            HotStuffMessage::NE(_) => mem::size_of::<NEMessage>() as u64,
         }
     }
 }
@@ -126,6 +152,8 @@ pub struct Proposal {
     pub block: Block,
     // MonadBFT: TC from the previous view (present for reproposals)
     pub tc: Option<TimeoutCertificate>,
+    // MonadBFT B2: NEC proving the skipped block is safe to abandon
+    pub nec: Option<NoEndorsementCertificate>,
 }
 
 impl Proposal {
@@ -268,4 +296,75 @@ pub struct NewView {
 
     /// The sending replica's `highest_pc`.
     pub highest_pc: PhaseCertificate,
+}
+
+// ============================================================================
+// MonadBFT B2: NEC recovery message types
+// ============================================================================
+
+/// Request for the high_tip block during RECOVER (Algorithm 7).
+/// Sent point-to-point to κ = f+1 validators.
+#[derive(Clone, BorshSerialize, BorshDeserialize)]
+pub struct ProposalRequest {
+    pub chain_id: ChainID,
+    /// The view the requesting leader is in (tc.view + 1).
+    pub view: ViewNumber,
+    pub tc: TimeoutCertificate,
+}
+
+/// Response containing the requested block.
+/// Sent point-to-point back to the requesting leader.
+#[derive(Clone, BorshSerialize, BorshDeserialize)]
+pub struct ProposalResponse {
+    pub chain_id: ChainID,
+    /// The view this response is for (tc.view + 1).
+    pub view: ViewNumber,
+    pub proposal: Proposal,
+}
+
+/// Request for No-Endorsement attestations during RECOVER.
+/// Broadcast to ALL validators.
+#[derive(Clone, BorshSerialize, BorshDeserialize)]
+pub struct NERequest {
+    pub chain_id: ChainID,
+    /// The view this NE request is for (tc.view + 1).
+    pub view: ViewNumber,
+    pub tc: TimeoutCertificate,
+}
+
+/// A single No-Endorsement attestation from a validator.
+/// Sent point-to-point to the leader performing RECOVER.
+#[derive(Clone, BorshSerialize, BorshDeserialize)]
+pub struct NEMessage {
+    pub chain_id: ChainID,
+    /// The view this NE is for (tc.view + 1).
+    pub view: ViewNumber,
+    /// View of the QC inside the high_tip's block header.
+    pub high_tip_qc_view: ViewNumber,
+    /// Signature over (view, high_tip_qc_view).
+    pub signature: SignatureBytes,
+}
+
+impl From<ProposalRequest> for HotStuffMessage {
+    fn from(req: ProposalRequest) -> Self {
+        HotStuffMessage::ProposalRequest(req)
+    }
+}
+
+impl From<ProposalResponse> for HotStuffMessage {
+    fn from(resp: ProposalResponse) -> Self {
+        HotStuffMessage::ProposalResponse(resp)
+    }
+}
+
+impl From<NERequest> for HotStuffMessage {
+    fn from(req: NERequest) -> Self {
+        HotStuffMessage::NERequest(req)
+    }
+}
+
+impl From<NEMessage> for HotStuffMessage {
+    fn from(ne: NEMessage) -> Self {
+        HotStuffMessage::NE(ne)
+    }
 }

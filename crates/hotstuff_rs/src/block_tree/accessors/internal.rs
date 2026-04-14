@@ -306,7 +306,7 @@ impl<K: KVStore> BlockTreeSingleton<K> {
             update_locked_pc = Some(new_locked_pc)
         }
 
-        // 3. Commit block(s) if needed.
+        // 3. Commit block(s) if needed (MonadBFT 2-chain irrevocable commit).
         if let Some(block) = invariants::block_to_commit(justify, &self)? {
             committed_blocks = self.commit(&mut wb, &block)?;
         }
@@ -317,6 +317,11 @@ impl<K: KVStore> BlockTreeSingleton<K> {
         }
 
         self.write(wb);
+
+        // MonadBFT B2: Promote irrevocably committed blocks from speculative list.
+        for (block_hash, _) in &committed_blocks {
+            let _ = self.promote_speculative_to_irrevocable(block_hash);
+        }
 
         Self::publish_update_block_tree_events(
             event_publisher,
@@ -1231,5 +1236,115 @@ impl<K: KVStore> BlockTreeSingleton<K> {
             Some(tip) if highest_pc.view < tip.view => Ok(None),
             _ => Ok(Some(highest_pc)),
         }
+    }
+
+    /// MonadBFT B2: Get the (view, block_hash) of the last proposal this validator voted for.
+    pub fn last_voted_proposal(&self) -> Result<Option<(ViewNumber, CryptoHash)>, BlockTreeError> {
+        use borsh::BorshDeserialize;
+        if let Some(bytes) = self.0.get(&variables::LAST_VOTED_PROPOSAL) {
+            let pair = <(ViewNumber, CryptoHash)>::deserialize(&mut bytes.as_slice())
+                .map_err(|err| KVGetError::DeserializeValueError {
+                    key: Key::HighestTC, // reuse key enum
+                    source: err,
+                })?;
+            Ok(Some(pair))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// MonadBFT B2: Record the (view, block_hash) of the proposal we just voted for.
+    pub fn set_last_voted_proposal(&mut self, view: ViewNumber, block: CryptoHash) -> Result<(), BlockTreeError> {
+        use borsh::BorshSerialize;
+        let mut wb: BlockTreeWriteBatch<K::WriteBatch> = BlockTreeWriteBatch::new();
+        wb.0.set(
+            &variables::LAST_VOTED_PROPOSAL,
+            &(view, block).try_to_vec()
+                .map_err(|err| KVSetError::SerializeValueError {
+                    key: Key::HighestTC,
+                    source: err,
+                })?,
+        );
+        self.write(wb);
+        Ok(())
+    }
+
+    /// MonadBFT B2: Get the list of speculatively committed blocks.
+    pub fn speculative_commits(&self) -> Result<Vec<CryptoHash>, BlockTreeError> {
+        use borsh::BorshDeserialize;
+        if let Some(bytes) = self.0.get(&variables::SPECULATIVE_COMMITS) {
+            let hashes = Vec::<CryptoHash>::deserialize(&mut bytes.as_slice())
+                .map_err(|err| KVGetError::DeserializeValueError {
+                    key: Key::HighestTC,
+                    source: err,
+                })?;
+            Ok(hashes)
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    /// MonadBFT B2: Add a block to the speculative commits list.
+    pub fn add_speculative_commit(&mut self, block: CryptoHash) -> Result<(), BlockTreeError> {
+        use borsh::BorshSerialize;
+        let mut commits = self.speculative_commits()?;
+        if !commits.contains(&block) {
+            commits.push(block);
+            let mut wb: BlockTreeWriteBatch<K::WriteBatch> = BlockTreeWriteBatch::new();
+            wb.0.set(
+                &variables::SPECULATIVE_COMMITS,
+                &commits.try_to_vec()
+                    .map_err(|err| KVSetError::SerializeValueError {
+                        key: Key::HighestTC,
+                        source: err,
+                    })?,
+            );
+            self.write(wb);
+        }
+        Ok(())
+    }
+
+    /// MonadBFT B2: Remove irrevocably committed blocks from speculative list.
+    pub fn promote_speculative_to_irrevocable(&mut self, block: &CryptoHash) -> Result<(), BlockTreeError> {
+        use borsh::BorshSerialize;
+        let mut commits = self.speculative_commits()?;
+        commits.retain(|b| b != block);
+        let mut wb: BlockTreeWriteBatch<K::WriteBatch> = BlockTreeWriteBatch::new();
+        wb.0.set(
+            &variables::SPECULATIVE_COMMITS,
+            &commits.try_to_vec()
+                .map_err(|err| KVSetError::SerializeValueError {
+                    key: Key::HighestTC,
+                    source: err,
+                })?,
+        );
+        self.write(wb);
+        Ok(())
+    }
+
+    /// MonadBFT B2: Query whether a block is speculatively committed (but not yet irrevocable).
+    pub fn is_speculatively_committed(&self, block: &CryptoHash) -> Result<bool, BlockTreeError> {
+        Ok(self.speculative_commits()?.contains(block))
+    }
+
+    /// MonadBFT B2: Query whether a block is irrevocably committed.
+    pub fn is_irrevocably_committed(&self, block: &CryptoHash) -> Result<bool, BlockTreeError> {
+        if let Some(highest) = self.highest_committed_block()? {
+            if let (Some(block_height), Some(highest_height)) = (
+                self.block_height(block)?,
+                self.block_height(&highest)?,
+            ) {
+                return Ok(block_height <= highest_height);
+            }
+        }
+        Ok(false)
+    }
+
+    /// MonadBFT B2: Get the latest speculatively committed block not yet irrevocable.
+    /// B3 will use this for rollback.
+    pub fn latest_speculative_non_irrevocable(&self) -> Result<Option<CryptoHash>, BlockTreeError> {
+        let commits = self.speculative_commits()?;
+        // Return the last one added (most recent).
+        Ok(commits.last().cloned())
     }
 }

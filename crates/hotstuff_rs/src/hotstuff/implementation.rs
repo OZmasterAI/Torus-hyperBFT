@@ -8,7 +8,8 @@
 //!
 //! Main type: [`HotStuff`].
 
-use std::{sync::mpsc::Sender, time::SystemTime};
+use std::{collections::HashSet, sync::mpsc::Sender, time::SystemTime};
+use borsh::BorshSerialize;
 
 use ed25519_dalek::VerifyingKey;
 
@@ -27,9 +28,12 @@ use crate::{
         ReceiveProposalEvent, StartViewEvent,
     },
     hotstuff::{
-        messages::{HotStuffMessage, NewView, Nudge, PhaseVote, Proposal},
+        messages::{
+            HotStuffMessage, NEMessage, NERequest, NewView, Nudge, PhaseVote, Proposal,
+            ProposalRequest, ProposalResponse,
+        },
         roles::{is_phase_voter, is_proposer, new_view_recipients},
-        types::{Phase, PhaseVoteCollector},
+        types::{valid_nec, NECollector, Phase, PhaseVoteCollector},
     },
     networking::{
         network::{Network, ValidatorSetUpdateHandle},
@@ -39,7 +43,7 @@ use crate::{
     types::{
         block::Block,
         crypto_primitives::Keypair,
-        data_types::{BlockHeight, ChainID},
+        data_types::{BlockHeight, ChainID, ViewNumber},
         signed_messages::{ActiveCollectorPair, Certificate, SignedMessage},
         validator_set::ValidatorSetState,
     },
@@ -75,6 +79,10 @@ pub(crate) struct HotStuff<N: Network> {
     sender_handle: SenderHandle<N>,
     validator_set_update_handle: ValidatorSetUpdateHandle<N>,
     event_publisher: Option<Sender<Event>>,
+    /// MonadBFT B2: NEC recovery state for async block retrieval / NEC formation.
+    recovery_state: RecoveryState,
+    /// MonadBFT B2: views for which this validator has already sent an NE message.
+    ne_sent_views: HashSet<ViewNumber>,
 }
 
 impl<N: Network> HotStuff<N> {
@@ -101,6 +109,8 @@ impl<N: Network> HotStuff<N> {
             sender_handle,
             validator_set_update_handle,
             event_publisher,
+            recovery_state: RecoveryState::None,
+            ne_sent_views: HashSet::new(),
         }
     }
 
@@ -164,6 +174,8 @@ impl<N: Network> HotStuff<N> {
         //    votes for the new view.
         self.view_info = new_view_info;
         self.proposal_status = ProposalStatus::WaitingForProposal;
+        // MonadBFT B2: Cancel any pending recovery when entering a new view.
+        self.recovery_state = RecoveryState::None;
         self.phase_vote_collectors = <ActiveCollectorPair<PhaseVoteCollector>>::new(
             self.config.chain_id,
             self.view_info.view,
@@ -197,6 +209,7 @@ impl<N: Network> HotStuff<N> {
                     view: self.view_info.view,
                     block,
                     tc: None,
+                    nec: None,
                 };
                 self.sender_handle
                     .broadcast::<HotStuffMessage>(proposal.clone().into());
@@ -264,6 +277,7 @@ impl<N: Network> HotStuff<N> {
                         view: self.view_info.view,
                         block,
                         tc: None,
+                    nec: None,
                     };
                     self.sender_handle
                         .broadcast::<HotStuffMessage>(proposal.clone().into());
@@ -298,23 +312,77 @@ impl<N: Network> HotStuff<N> {
     }
 
     /// MonadBFT Algorithm 4: CREATEPROPOSALBASEDONTC.
+    ///
+    /// Case 3 (high_qc wins): fresh proposal extending high_qc — handled by caller.
+    /// Case 4 (high_tip wins, block available): repropose the block.
+    /// Case 5 (high_tip wins, block NOT available): initiate RECOVER (Algorithm 7).
+    ///   RECOVER is async: sends ProposalRequest/NERequest, stores RecoveryState,
+    ///   returns None. The event loop handles responses via on_receive_proposal_response
+    ///   and on_receive_ne. If the view timer expires, recovery is abandoned.
     fn create_proposal_based_on_tc<K: KVStore>(
-        &self,
+        &mut self,
         tc: &crate::pacemaker::types::TimeoutCertificate,
         block_tree: &mut BlockTreeSingleton<K>,
         _app: &mut impl App<K>,
     ) -> Result<Option<Proposal>, HotStuffError> {
         if tc.high_tip_is_winner {
             if let Some(ref tip) = tc.high_tip {
+                // Case 4: leader has the block — repropose.
                 if let Some(block) = block_tree.block(&tip.block_hash)? {
                     return Ok(Some(Proposal {
                         chain_id: self.config.chain_id,
                         view: self.view_info.view,
                         block,
                         tc: Some(tc.clone()),
+                        nec: None,
                     }));
                 }
-                // Case 5: leader lacks the block. TODO(B2): NEC recovery.
+
+                // Case 5: leader lacks the block — initiate RECOVER (Algorithm 7).
+                // This is async: we send requests and return None. The event loop
+                // handles responses to complete the proposal.
+                let validator_set_state = block_tree.validator_set_state()?;
+                let validator_set = validator_set_state.committed_validator_set().clone();
+                let total_power = validator_set.total_power().int() as u64;
+                let f = if total_power > 0 { (total_power - 1) / 3 } else { 0 };
+                let kappa = (f + 1) as usize; // κ = f+1 guarantees at least one honest responder
+
+                // Step 1: Send ProposalRequest to κ validators (prefer those from TC's tips_views).
+                let req = ProposalRequest {
+                    chain_id: self.config.chain_id,
+                    view: self.view_info.view,
+                    tc: tc.clone(),
+                };
+                let mut sent_count = 0;
+                for (vk, _power) in validator_set.validators_and_powers() {
+                    if sent_count >= kappa { break; }
+                    if vk != self.config.keypair.public() {
+                        self.sender_handle.send::<HotStuffMessage>(
+                            vk,
+                            req.clone().into(),
+                        );
+                        sent_count += 1;
+                    }
+                }
+
+                // Step 2: Broadcast NERequest to ALL validators.
+                let ne_req = NERequest {
+                    chain_id: self.config.chain_id,
+                    view: self.view_info.view,
+                    tc: tc.clone(),
+                };
+                self.sender_handle.broadcast::<HotStuffMessage>(ne_req.into());
+
+                // Step 3: Store recovery state for async completion.
+                let high_tip_qc_view = tip.block_justify.view;
+                self.recovery_state = RecoveryState::Recovering {
+                    tc: tc.clone(),
+                    ne_collector: NECollector::new(
+                        self.view_info.view,
+                        high_tip_qc_view,
+                        validator_set,
+                    ),
+                };
             }
         }
         Ok(None)
@@ -370,6 +438,19 @@ impl<N: Network> HotStuff<N> {
             HotStuffMessage::NewView(new_view) => {
                 self.on_receive_new_view(new_view, origin, block_tree)
             }
+            // MonadBFT B2: NEC recovery messages
+            HotStuffMessage::ProposalRequest(req) => {
+                self.on_receive_proposal_request(req, origin, block_tree)
+            }
+            HotStuffMessage::ProposalResponse(resp) => {
+                self.on_receive_proposal_response(resp, origin, block_tree, app)
+            }
+            HotStuffMessage::NERequest(req) => {
+                self.on_receive_ne_request(req, origin, block_tree)
+            }
+            HotStuffMessage::NE(ne) => {
+                self.on_receive_ne(ne, origin, block_tree, app)
+            }
         }
     }
 
@@ -415,6 +496,22 @@ impl<N: Network> HotStuff<N> {
                     return Ok(());
                 }
             } else {
+                return Ok(());
+            }
+        }
+
+        // MonadBFT B2: validate NEC if present.
+        if let Some(ref nec) = proposal.nec {
+            if !valid_nec(nec, block_tree)? {
+                match self.proposal_status {
+                    ProposalStatus::WaitingForProposal => {
+                        self.proposal_status = ProposalStatus::OneLeaderProposed { leader: *origin }
+                    }
+                    ProposalStatus::OneLeaderProposed { leader: _ } => {
+                        self.proposal_status = ProposalStatus::AllLeadersProposed
+                    }
+                    _ => {}
+                }
                 return Ok(());
             }
         }
@@ -503,6 +600,8 @@ impl<N: Network> HotStuff<N> {
                     .send::<HotStuffMessage>(vote_recipient, phase_vote.clone().into());
 
                 block_tree.set_highest_view_phase_voted(self.view_info.view)?;
+                // MonadBFT B2: Record which block we voted for (used by NE processing).
+                block_tree.set_last_voted_proposal(self.view_info.view, proposal.block.hash)?;
 
                 // MonadBFT: Update local_tip only for fresh proposals (not reproposals).
                 if !proposal.is_reproposal() && vote_phase == Phase::Generic {
@@ -685,6 +784,19 @@ impl<N: Network> HotStuff<N> {
                 let committed_validator_set_updates =
                     block_tree.update(&new_pc, &self.event_publisher)?;
 
+
+                // MonadBFT B2: Speculative commit — 1-QC for fresh proposals.
+                // A block qualifies for speculative commit if it was a fresh
+                // proposal (happy path: justify.view == pc.view - 1).
+                // Speculative commit means "probably final, can only revert if
+                // leader equivocated." Actual rollback is B3.
+                if new_pc.phase.is_generic() && new_pc.view.int() > 0 {
+                    if let Ok(block_justify) = block_tree.block_justify(&new_pc.block) {
+                        if block_justify.view == new_pc.view - 1 {
+                            let _ = block_tree.add_speculative_commit(new_pc.block);
+                        }
+                    }
+                }
                 if let Some(vs_updates) = committed_validator_set_updates {
                     self.validator_set_update_handle
                         .update_validator_set(vs_updates)
@@ -761,6 +873,236 @@ impl<N: Network> HotStuff<N> {
 
         Ok(())
     }
+
+    // ========================================================================
+    // MonadBFT B2: NEC recovery message handlers
+    // ========================================================================
+
+    /// PROCESSNEREQUST: On receiving a ProposalRequest, respond with the block if we have it.
+    fn on_receive_proposal_request<K: KVStore>(
+        &mut self,
+        req: ProposalRequest,
+        origin: &VerifyingKey,
+        block_tree: &mut BlockTreeSingleton<K>,
+    ) -> Result<(), HotStuffError> {
+        if req.view != self.view_info.view {
+            return Ok(());
+        }
+        // If we have the requested high_tip block, send it back.
+        if let Some(ref tip) = req.tc.high_tip {
+            if let Some(block) = block_tree.block(&tip.block_hash)? {
+                let response = ProposalResponse {
+                    chain_id: req.chain_id,
+                    view: req.view,
+                    proposal: Proposal {
+                        chain_id: req.chain_id,
+                        view: req.view,
+                        block,
+                        tc: Some(req.tc.clone()),
+                        nec: None,
+                    },
+                };
+                self.sender_handle.send::<HotStuffMessage>(*origin, response.into());
+            }
+        }
+        Ok(())
+    }
+
+    /// On receiving a ProposalResponse during RECOVER: if we're recovering,
+    /// use the block to complete the reproposal (Case 4 equivalent).
+    fn on_receive_proposal_response<K: KVStore>(
+        &mut self,
+        resp: ProposalResponse,
+        _origin: &VerifyingKey,
+        _block_tree: &mut BlockTreeSingleton<K>,
+        _app: &mut impl App<K>,
+    ) -> Result<(), HotStuffError> {
+        if resp.view != self.view_info.view {
+            return Ok(());
+        }
+        // Only process if we are currently recovering.
+        let is_recovering = matches!(self.recovery_state, RecoveryState::Recovering { .. });
+        if !is_recovering {
+            return Ok(());
+        }
+
+        // Verify the block matches what the TC expects.
+        if let RecoveryState::Recovering { ref tc, .. } = self.recovery_state {
+            if let Some(ref tip) = tc.high_tip {
+                if resp.proposal.block.hash != tip.block_hash {
+                    return Ok(());
+                }
+            } else {
+                return Ok(());
+            }
+        }
+
+        // Cancel recovery — we got the block. Repropose it (Case 4).
+        let tc = if let RecoveryState::Recovering { ref tc, .. } = self.recovery_state {
+            tc.clone()
+        } else {
+            return Ok(());
+        };
+        self.recovery_state = RecoveryState::None;
+
+        let proposal = Proposal {
+            chain_id: self.config.chain_id,
+            view: self.view_info.view,
+            block: resp.proposal.block,
+            tc: Some(tc),
+            nec: None,
+        };
+        self.sender_handle.broadcast::<HotStuffMessage>(proposal.clone().into());
+        Event::Propose(ProposeEvent {
+            timestamp: SystemTime::now(),
+            proposal,
+        })
+        .publish(&self.event_publisher);
+
+        Ok(())
+    }
+
+    /// PROCESSNEREQUST: On receiving an NERequest, check if we voted for the
+    /// high_tip block. If NOT, sign and send an NE message.
+    fn on_receive_ne_request<K: KVStore>(
+        &mut self,
+        req: NERequest,
+        _origin: &VerifyingKey,
+        block_tree: &mut BlockTreeSingleton<K>,
+    ) -> Result<(), HotStuffError> {
+        if req.view != self.view_info.view {
+            return Ok(());
+        }
+
+        // Guard: no duplicate NE per view per validator.
+        if self.ne_sent_views.contains(&req.view) {
+            return Ok(());
+        }
+
+        // Check if we voted for the high_tip block in the timed-out view.
+        let did_vote_for_high_tip = if let Some(ref tip) = req.tc.high_tip {
+            match block_tree.last_voted_proposal()? {
+                Some((voted_view, voted_block)) => {
+                    voted_view == req.tc.view && voted_block == tip.block_hash
+                }
+                None => false, // Never voted — safe to send NE.
+            }
+        } else {
+            false
+        };
+
+        if did_vote_for_high_tip {
+            return Ok(()); // Voted for it — do NOT send NE.
+        }
+
+        // Sign (view, high_tip_qc_view) and send NE.
+        if let Some(ref tip) = req.tc.high_tip {
+            let high_tip_qc_view = tip.block_justify.view;
+            let ne_message_bytes = (req.view, high_tip_qc_view).try_to_vec().unwrap();
+            let signature = self.config.keypair.sign(&ne_message_bytes);
+
+            let ne = NEMessage {
+                chain_id: self.config.chain_id,
+                view: req.view,
+                high_tip_qc_view,
+                signature,
+            };
+
+            // Send to the leader of this view.
+            let validator_set_state = block_tree.validator_set_state()?;
+            let leader = crate::pacemaker::implementation::select_leader(
+                req.view,
+                validator_set_state.committed_validator_set(),
+            );
+            self.sender_handle.send::<HotStuffMessage>(leader, ne.into());
+            self.ne_sent_views.insert(req.view);
+        }
+
+        Ok(())
+    }
+
+    /// On receiving an NE message during RECOVER: collect signatures.
+    /// If 2f+1 collected, form NEC and issue fresh proposal.
+    fn on_receive_ne<K: KVStore>(
+        &mut self,
+        ne: NEMessage,
+        origin: &VerifyingKey,
+        block_tree: &mut BlockTreeSingleton<K>,
+        app: &mut impl App<K>,
+    ) -> Result<(), HotStuffError> {
+        if ne.view != self.view_info.view {
+            return Ok(());
+        }
+
+        // Only process if we are currently recovering.
+        let nec_opt = if let RecoveryState::Recovering { ref mut ne_collector, .. } = self.recovery_state {
+            ne_collector.collect(origin, ne.view, ne.high_tip_qc_view, ne.signature)
+        } else {
+            return Ok(());
+        };
+
+        if let Some(nec) = nec_opt {
+            // NEC formed! Cancel recovery and issue fresh proposal.
+            let tc = if let RecoveryState::Recovering { ref tc, .. } = self.recovery_state {
+                tc.clone()
+            } else {
+                return Ok(());
+            };
+            self.recovery_state = RecoveryState::None;
+
+            // Fresh proposal with NEC: use the high_tip's QC as the block's justify.
+            let high_tip_qc = if let Some(ref tip) = tc.high_tip {
+                tip.block_justify.clone()
+            } else {
+                return Ok(());
+            };
+
+            // Produce a new block extending from the high_tip's QC.
+            let parent_block = if high_tip_qc.is_genesis_pc() {
+                None
+            } else {
+                Some(high_tip_qc.block)
+            };
+            let child_height = if let Some(ref pb) = parent_block {
+                let h = block_tree.block_height(pb)?.ok_or(
+                    BlockTreeError::BlockExpectedButNotFound { block: *pb },
+                )?;
+                h + 1
+            } else {
+                BlockHeight::new(0)
+            };
+
+            let produce_block_request = ProduceBlockRequest::new(
+                self.view_info.view,
+                parent_block,
+                block_tree.app_view(parent_block.as_ref())?,
+            );
+            let ProduceBlockResponse {
+                data,
+                data_hash,
+                app_state_updates: _,
+                validator_set_updates: _,
+            } = app.produce_block(produce_block_request);
+
+            let block = Block::new(child_height, high_tip_qc, data_hash, data);
+
+            let proposal = Proposal {
+                chain_id: self.config.chain_id,
+                view: self.view_info.view,
+                block,
+                tc: Some(tc),
+                nec: Some(nec),
+            };
+            self.sender_handle.broadcast::<HotStuffMessage>(proposal.clone().into());
+            Event::Propose(ProposeEvent {
+                timestamp: SystemTime::now(),
+                proposal,
+            })
+            .publish(&self.event_publisher);
+        }
+
+        Ok(())
+    }
 }
 
 /// Configuration parameters for the [`HotStuff`] struct.
@@ -826,4 +1168,25 @@ impl ProposalStatus {
     fn have_all_leaders_proposed(&self) -> bool {
         matches!(self, ProposalStatus::AllLeadersProposed)
     }
+}
+
+/// MonadBFT B2: State machine for async NEC recovery (Algorithm 7).
+///
+/// ## Challenge 1 resolution:
+/// The RECOVER algorithm is inherently async — the leader sends ProposalRequest
+/// and NERequest, then waits for responses while the view timer ticks.
+/// We cannot block enter_view. Instead:
+/// - enter_view starts recovery (sends requests, transitions to Recovering)
+/// - The main event loop continues processing messages
+/// - When ProposalResponse or enough NE messages arrive, the leader completes
+///   the proposal via on_receive_proposal_response or on_receive_ne
+/// - If the view timer expires, entering a new view clears the recovery state
+pub(crate) enum RecoveryState {
+    /// No recovery in progress.
+    None,
+    /// Actively recovering: waiting for ProposalResponse or NEC formation.
+    Recovering {
+        tc: crate::pacemaker::types::TimeoutCertificate,
+        ne_collector: NECollector,
+    },
 }

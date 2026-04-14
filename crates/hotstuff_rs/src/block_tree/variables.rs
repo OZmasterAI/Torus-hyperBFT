@@ -153,6 +153,10 @@ pub const VALIDATOR_SET_UPDATE_BLOCK_HEIGHT: [u8; 1] = [14];
 pub const VALIDATOR_SET_UPDATE_DECIDED: [u8; 1] = [15];
 pub const HIGHEST_VIEW_PHASE_VOTED: [u8; 1] = [16];
 pub const LOCAL_TIP: [u8; 1] = [17];
+/// MonadBFT B2: the (view, block_hash) of the last proposal this validator voted for.
+pub const LAST_VOTED_PROPOSAL: [u8; 1] = [18];
+/// MonadBFT B2: set of blocks that are speculatively committed but not yet irrevocably committed.
+pub const SPECULATIVE_COMMITS: [u8; 1] = [19];
 
 // Fields of Block
 pub const BLOCK_HEIGHT: [u8; 1] = [0];

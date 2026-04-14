@@ -499,41 +499,45 @@ pub(crate) fn block_to_commit<K: KVStore>(
 
     // Determine the `Block` to commit according to `justify.phase`.
     match justify.phase {
-        // If `justify.phase` is `Generic`, commit the `justify`'s great-grandparent block, if it has one in
-        // the block tree.
+        // MonadBFT 2-chain irrevocable commit for pipelined mode.
+        //
+        // Given justify (QC we're processing):
+        //   parent = block that justify certifies (justify.block)
+        //   grandparent = block that parent.justify certifies (parent_justify.block)
+        //
+        // If justify.view == parent_justify.view + 1 (two consecutive QCs),
+        // irrevocably commit the grandparent.
+        //
+        // ## Challenge 2 resolution:
+        // The locking rule (pc_to_lock) does NOT change. Lock-on-grandparent
+        // provides sufficient safety for 2-chain commit: when validators vote
+        // for a block, they process its justify QC and lock on the grandparent.
+        // Two consecutive QCs then safely commit because >2/3 are locked on
+        // that branch. The consecutive views requirement ensures no conflicting
+        // lock could form between the two QCs.
         Phase::Generic => {
-            // Check whether the parent block or the grandparent block is a genesis block. If so, there is no
-            // great-grandparent block to commit.
             let parent_justify = block_tree.block_justify(&justify.block)?;
             if parent_justify.is_genesis_pc() {
                 return Ok(None);
             };
-            let grandparent_justify = block_tree.block_justify(&parent_justify.block)?;
-            if grandparent_justify.is_genesis_pc() {
-                return Ok(None);
-            };
 
-            // Check whether the "consecutive views" requirement of the commit rule is satisfied.
-            let commit_rule_satisfied = justify.view == parent_justify.view + 1
-                && parent_justify.view == grandparent_justify.view + 1;
+            // 2-chain consecutive views: justify.view == parent_justify.view + 1
+            let commit_rule_satisfied = justify.view == parent_justify.view + 1;
 
-            // Check whether the great-grandparent block has been committed already.
             let not_committed_yet = {
-                let greatgrandparent_height = block_tree
-                    .block_height(&grandparent_justify.block)?
+                let grandparent_height = block_tree
+                    .block_height(&parent_justify.block)?
                     .ok_or(BlockTreeError::BlockExpectedButNotFound {
-                        block: grandparent_justify.block.clone(),
+                        block: parent_justify.block.clone(),
                     })?;
                 let highest_committed_block_height = block_tree.highest_committed_block_height()?;
 
                 highest_committed_block_height.is_none()
-                    || greatgrandparent_height > highest_committed_block_height.unwrap()
+                    || grandparent_height > highest_committed_block_height.unwrap()
             };
 
-            // If the commit rule is satisfied and the great-grandparent block has not been committed yet, ask the
-            // caller to commit it. Otherwise, return `None` to prevent redundant commits.
             if commit_rule_satisfied && not_committed_yet {
-                Ok(Some(grandparent_justify.block))
+                Ok(Some(parent_justify.block))
             } else {
                 Ok(None)
             }
