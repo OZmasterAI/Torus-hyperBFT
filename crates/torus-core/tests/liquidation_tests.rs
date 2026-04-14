@@ -82,8 +82,12 @@ fn force_close_equity_covers_loss() {
     // Position deleted
     assert!(pm.get_position(&trader, market).unwrap().is_none());
 
-    // PnL = -1500, balance was 1000 → -500 → clamped to 0, deficit = 500
-    assert_eq!(result.remaining_deficit, fp(500));
+    // PnL = -1500, penalty = 48500 * 250/10000 = 1212.5
+    // balance: 1000 + (-1500) - 1212.5 = -1712.5 → clamped to 0, deficit = 1712.5
+    let penalty = fp(48_500) * FixedPoint::from_raw(250 * FixedPoint::SCALE)
+        / FixedPoint::from_raw(10_000 * FixedPoint::SCALE);
+    let expected_deficit = fp(1_500) + penalty - fp(1_000);
+    assert_eq!(result.remaining_deficit, expected_deficit);
     let bal = pm.get_native_balance(&trader).unwrap();
     assert_eq!(bal.available, FixedPoint::ZERO);
 }
