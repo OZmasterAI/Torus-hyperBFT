@@ -438,3 +438,77 @@ fn gas_mismatch_detected() {
         .validate_block(&proposed.block, &h.db, &h.executor);
     assert!(result.is_err(), "tampered gas should be detected");
 }
+
+// ============================================================================
+// FIX 3 TEST: Block hash uses canonical encoding, not serde_json
+// ============================================================================
+
+// 9. Block hash is deterministic via canonical_header_bytes
+#[test]
+fn block_hash_uses_canonical_encoding() {
+    use torus_types::TorusBlockHeader;
+
+    let header = TorusBlockHeader {
+        height: 42,
+        timestamp: 1_700_000_000,
+        proposer: Address::new([0xAA; 20]),
+        state_root: B256::new([1u8; 32]),
+        receipts_root: B256::new([2u8; 32]),
+        logs_bloom: alloy_primitives::Bloom::ZERO,
+        evm_gas_used: 21_000,
+        evm_gas_limit: 30_000_000,
+        native_action_count: 5,
+        evm_tx_count: 3,
+        base_fee_per_gas: 1_000_000_000,
+        epoch: 7,
+        validator_set_hash: B256::new([3u8; 32]),
+    };
+
+    // Canonical bytes must be deterministic across calls.
+    let bytes1 = header.canonical_header_bytes();
+    let bytes2 = header.canonical_header_bytes();
+    assert_eq!(bytes1, bytes2, "canonical_header_bytes must be deterministic");
+
+    // Hash from canonical bytes must be deterministic.
+    let hash1 = alloy_primitives::keccak256(&bytes1);
+    let hash2 = alloy_primitives::keccak256(&bytes2);
+    assert_eq!(hash1, hash2);
+    assert_ne!(hash1, B256::ZERO);
+
+    // Canonical hash must differ from serde_json hash (different encoding).
+    let json_bytes = serde_json::to_vec(&header).unwrap();
+    let json_hash = alloy_primitives::keccak256(&json_bytes);
+    assert_ne!(
+        hash1, json_hash,
+        "canonical hash should differ from JSON hash (different encoding)"
+    );
+}
+
+// 10. Commit uses canonical hash for block identity
+#[test]
+fn commit_block_hash_is_canonical() {
+    let h = TestHarness::new();
+    let sk = test_signing_key(1);
+    let alice = signing_key_address(&sk);
+    let bob = Address::new([0xBB; 20]);
+
+    let ten_eth = U256::from(10_000_000_000_000_000_000u128);
+    h.db.put_account(&alice, &test_account(ten_eth)).unwrap();
+
+    let base_fee = h.parent_header.base_fee_per_gas as u128;
+    let rlp = build_signed_transfer(&sk, bob, U256::from(1_000u64), 0, base_fee);
+    let proposed = h.propose(vec![rlp], Address::ZERO);
+    let block = &proposed.block;
+    let validated = h.validator.validate_block(block, &h.db, &h.executor).unwrap();
+
+    let block_hash =
+        BlockCommitter::commit_block(&h.db, block, &validated.bundle, &validated.receipts)
+            .unwrap();
+
+    // Independently compute the expected hash from canonical bytes.
+    let expected_hash = alloy_primitives::keccak256(&block.header.canonical_header_bytes());
+    assert_eq!(
+        block_hash, expected_hash,
+        "commit_block must use canonical_header_bytes for block hash"
+    );
+}

@@ -28,14 +28,15 @@ impl BlockCommitter {
         // 1. Apply EVM state changes.
         apply_bundle_to_db(state_db, bundle)?;
 
-        // 2. Compute block hash (keccak256 of serialised header).
-        let header_bytes = serde_json::to_vec(&block.header)
-            .map_err(|e| BridgeError::Serialization(e.to_string()))?;
-        let block_hash = alloy_primitives::keccak256(&header_bytes);
+        // 2. Compute block hash using canonical encoding (deterministic across serde versions).
+        let canonical_bytes = block.header.canonical_header_bytes();
+        let block_hash = alloy_primitives::keccak256(&canonical_bytes);
 
-        // 3. Store block header.
+        // 3. Store block header (JSON for human-readable storage/queries).
         let height_key = block.header.height.to_be_bytes();
-        state_db.put_cf_raw(CF_BLOCK_HEADERS, &height_key, &header_bytes)?;
+        let header_json = serde_json::to_vec(&block.header)
+            .map_err(|e| BridgeError::Serialization(e.to_string()))?;
+        state_db.put_cf_raw(CF_BLOCK_HEADERS, &height_key, &header_json)?;
 
         // 4. Store block body.
         let body = block.body();

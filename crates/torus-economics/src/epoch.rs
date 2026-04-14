@@ -150,15 +150,17 @@ impl EpochManager {
         mut new_set: ValidatorSet,
         max_changes: usize,
     ) -> ValidatorSet {
-        use std::collections::HashSet;
+        use std::collections::BTreeSet;
 
         if max_changes == 0 {
             return old_set.clone();
         }
 
-        let old_addrs: HashSet<Address> =
+        // BTreeSet iterates in deterministic (sorted) order, unlike HashSet.
+        // This ensures all nodes select the same validators when the rotation cap applies.
+        let old_addrs: BTreeSet<Address> =
             old_set.validators.iter().map(|v| v.address).collect();
-        let new_addrs: HashSet<Address> =
+        let new_addrs: BTreeSet<Address> =
             new_set.validators.iter().map(|v| v.address).collect();
 
         let departures: Vec<Address> = old_addrs.difference(&new_addrs).copied().collect();
@@ -178,9 +180,9 @@ impl EpochManager {
 
         // For excess departures beyond allowed_swaps: keep old validator
         // For excess arrivals beyond allowed_swaps: defer to next epoch
-        let kept_departures: HashSet<Address> =
+        let kept_departures: BTreeSet<Address> =
             departures.iter().skip(allowed_swaps).copied().collect();
-        let deferred_arrivals: HashSet<Address> =
+        let deferred_arrivals: BTreeSet<Address> =
             arrivals.iter().skip(allowed_swaps).copied().collect();
 
         // Remove deferred arrivals from new_set
@@ -298,7 +300,7 @@ impl EpochManager {
         staking: &StakingManager,
         new_set: &ValidatorSet,
     ) -> Result<()> {
-        let active_addrs: std::collections::HashSet<Address> =
+        let active_addrs: std::collections::BTreeSet<Address> =
             new_set.validators.iter().map(|v| v.address).collect();
 
         for mut val in staking.all_validators()? {
@@ -459,5 +461,94 @@ mod tests {
         assert_eq!(diff.inserts.len(), 2);
         assert_eq!(diff.deletes.len(), 1);
         assert_eq!(diff.deletes[0], Address::new([1; 20]));
+    }
+
+    // FIX 4 TEST: Rotation cap produces deterministic results
+    #[test]
+    fn rotation_cap_deterministic_order() {
+        // Run apply_rotation_cap many times and verify the result is always identical.
+        // With HashSet, iteration order would be random → different kept/deferred sets.
+        // With BTreeSet, it must always produce the same result.
+        let old_set = ValidatorSet {
+            validators: (1..=10u8)
+                .map(|n| ValidatorInfo {
+                    address: Address::new([n; 20]),
+                    pubkey: PublicKey([n; 32]),
+                    power: (100 - n as u64) * 10,
+                    commission_bps: 500,
+                })
+                .collect(),
+            epoch: 1,
+        };
+
+        // New set: remove validators 1-5, add 11-15 (5 departures, 5 arrivals = 10 changes).
+        let new_set = ValidatorSet {
+            validators: (6..=15u8)
+                .map(|n| ValidatorInfo {
+                    address: Address::new([n; 20]),
+                    pubkey: PublicKey([n; 32]),
+                    power: (100 - n as u64) * 10,
+                    commission_bps: 500,
+                })
+                .collect(),
+            epoch: 2,
+        };
+
+        // Cap at 4 changes (2 swaps).
+        let first_result = EpochManager::apply_rotation_cap(&old_set, new_set.clone(), 4);
+        let first_addrs: Vec<Address> = first_result.validators.iter().map(|v| v.address).collect();
+
+        // Run 50 times — must always produce the same result.
+        for i in 0..50 {
+            let result = EpochManager::apply_rotation_cap(&old_set, new_set.clone(), 4);
+            let addrs: Vec<Address> = result.validators.iter().map(|v| v.address).collect();
+            assert_eq!(
+                first_addrs, addrs,
+                "rotation cap must be deterministic (iteration {i} differed)"
+            );
+        }
+    }
+
+    #[test]
+    fn rotation_cap_within_limit_unchanged() {
+        let old_set = ValidatorSet {
+            validators: vec![
+                ValidatorInfo {
+                    address: Address::new([1; 20]),
+                    pubkey: PublicKey([1; 32]),
+                    power: 100,
+                    commission_bps: 500,
+                },
+                ValidatorInfo {
+                    address: Address::new([2; 20]),
+                    pubkey: PublicKey([2; 32]),
+                    power: 200,
+                    commission_bps: 500,
+                },
+            ],
+            epoch: 1,
+        };
+
+        let new_set = ValidatorSet {
+            validators: vec![
+                ValidatorInfo {
+                    address: Address::new([2; 20]),
+                    pubkey: PublicKey([2; 32]),
+                    power: 200,
+                    commission_bps: 500,
+                },
+                ValidatorInfo {
+                    address: Address::new([3; 20]),
+                    pubkey: PublicKey([3; 32]),
+                    power: 150,
+                    commission_bps: 500,
+                },
+            ],
+            epoch: 2,
+        };
+
+        // 2 changes (1 departure + 1 arrival), cap is 10 — should pass through unchanged.
+        let result = EpochManager::apply_rotation_cap(&old_set, new_set.clone(), 10);
+        assert_eq!(result.validators.len(), new_set.validators.len());
     }
 }

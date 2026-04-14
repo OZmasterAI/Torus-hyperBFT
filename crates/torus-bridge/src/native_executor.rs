@@ -867,9 +867,12 @@ pub fn sort_native_actions(
 }
 
 /// Deterministic sort key for a native action.
+///
+/// Uses `NativeAction::canonical_bytes()` instead of `Debug` formatting to ensure
+/// the sort key is identical across compiler versions and crate updates.
 fn action_sort_key(sender: &Address, action: &NativeAction) -> (ActionCategory, Address, B256) {
     let category = classify_action(action);
-    let hash = alloy_primitives::keccak256(format!("{:?}", action).as_bytes());
+    let hash = alloy_primitives::keccak256(&action.canonical_bytes());
     (category, *sender, hash)
 }
 

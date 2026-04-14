@@ -174,6 +174,30 @@ pub struct TorusBlockHeader {
     pub validator_set_hash: B256,
 }
 
+impl TorusBlockHeader {
+    /// Canonical byte encoding for deterministic block hashing.
+    ///
+    /// Uses explicit big-endian encoding of each field in a fixed order.
+    /// Unlike `serde_json`, this is stable across serde versions and struct reordering.
+    pub fn canonical_header_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(256);
+        buf.extend_from_slice(&self.height.to_be_bytes());
+        buf.extend_from_slice(&self.timestamp.to_be_bytes());
+        buf.extend_from_slice(self.proposer.as_slice());
+        buf.extend_from_slice(self.state_root.as_slice());
+        buf.extend_from_slice(self.receipts_root.as_slice());
+        buf.extend_from_slice(self.logs_bloom.as_slice());
+        buf.extend_from_slice(&self.evm_gas_used.to_be_bytes());
+        buf.extend_from_slice(&self.evm_gas_limit.to_be_bytes());
+        buf.extend_from_slice(&self.native_action_count.to_be_bytes());
+        buf.extend_from_slice(&self.evm_tx_count.to_be_bytes());
+        buf.extend_from_slice(&self.base_fee_per_gas.to_be_bytes());
+        buf.extend_from_slice(&self.epoch.to_be_bytes());
+        buf.extend_from_slice(self.validator_set_hash.as_slice());
+        buf
+    }
+}
+
 /// Block body — the non-header payload, stored separately in cf_block_bodies.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TorusBlockBody {
@@ -279,6 +303,210 @@ pub enum NativeAction {
     DelistMarket {
         market_id: MarketId,
     },
+}
+
+impl NativeAction {
+    /// Deterministic canonical byte encoding for consensus-critical hashing.
+    ///
+    /// Unlike `Debug` formatting or `serde_json`, this encoding is guaranteed stable
+    /// across compiler versions, serde versions, and struct field reordering.
+    /// Each variant has a unique 1-byte tag followed by fixed-width big-endian fields.
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(64);
+        match self {
+            NativeAction::PlaceOrder(p) => {
+                buf.push(0);
+                buf.extend_from_slice(&p.market_id.to_be_bytes());
+                buf.push(p.is_buy as u8);
+                buf.extend_from_slice(&p.price.raw().to_be_bytes());
+                buf.extend_from_slice(&p.quantity.raw().to_be_bytes());
+                match &p.order_type {
+                    OrderType::Limit => buf.push(0),
+                    OrderType::Market => buf.push(1),
+                    OrderType::StopMarket { trigger } => {
+                        buf.push(2);
+                        buf.extend_from_slice(&trigger.raw().to_be_bytes());
+                    }
+                    OrderType::StopLimit { trigger, limit } => {
+                        buf.push(3);
+                        buf.extend_from_slice(&trigger.raw().to_be_bytes());
+                        buf.extend_from_slice(&limit.raw().to_be_bytes());
+                    }
+                }
+                buf.push(match p.time_in_force {
+                    TimeInForce::GTC => 0,
+                    TimeInForce::IOC => 1,
+                    TimeInForce::FOK => 2,
+                    TimeInForce::PostOnly => 3,
+                });
+                buf.push(p.reduce_only as u8);
+                match p.client_order_id {
+                    Some(id) => { buf.push(1); buf.extend_from_slice(&id.to_be_bytes()); }
+                    None => buf.push(0),
+                }
+            }
+            NativeAction::CancelOrder { order_id } => {
+                buf.push(1);
+                buf.extend_from_slice(&order_id.to_be_bytes());
+            }
+            NativeAction::CancelAllOrders { market_id } => {
+                buf.push(2);
+                match market_id {
+                    Some(id) => { buf.push(1); buf.extend_from_slice(&id.to_be_bytes()); }
+                    None => buf.push(0),
+                }
+            }
+            NativeAction::ModifyOrder { order_id, new_price, new_qty } => {
+                buf.push(3);
+                buf.extend_from_slice(&order_id.to_be_bytes());
+                match new_price {
+                    Some(p) => { buf.push(1); buf.extend_from_slice(&p.raw().to_be_bytes()); }
+                    None => buf.push(0),
+                }
+                match new_qty {
+                    Some(q) => { buf.push(1); buf.extend_from_slice(&q.raw().to_be_bytes()); }
+                    None => buf.push(0),
+                }
+            }
+            NativeAction::TransferToPerp { amount } => {
+                buf.push(4);
+                buf.extend_from_slice(&amount.to_be_bytes::<32>());
+            }
+            NativeAction::TransferToSpot { amount } => {
+                buf.push(5);
+                buf.extend_from_slice(&amount.to_be_bytes::<32>());
+            }
+            NativeAction::Withdraw { amount, to } => {
+                buf.push(6);
+                buf.extend_from_slice(&amount.to_be_bytes::<32>());
+                buf.extend_from_slice(to.as_slice());
+            }
+            NativeAction::Delegate { validator, amount } => {
+                buf.push(7);
+                buf.extend_from_slice(validator.as_slice());
+                buf.extend_from_slice(&amount.to_be_bytes::<32>());
+            }
+            NativeAction::Undelegate { validator, amount } => {
+                buf.push(8);
+                buf.extend_from_slice(validator.as_slice());
+                buf.extend_from_slice(&amount.to_be_bytes::<32>());
+            }
+            NativeAction::PermanentStake { amount } => {
+                buf.push(9);
+                buf.extend_from_slice(&amount.to_be_bytes::<32>());
+            }
+            NativeAction::ClaimRewards => {
+                buf.push(10);
+            }
+            NativeAction::SubmitProposal(p) => {
+                buf.push(11);
+                buf.extend_from_slice(&(p.title.len() as u32).to_be_bytes());
+                buf.extend_from_slice(p.title.as_bytes());
+                buf.extend_from_slice(&(p.description.len() as u32).to_be_bytes());
+                buf.extend_from_slice(p.description.as_bytes());
+                match &p.action {
+                    ProposalAction::UpdateMarketParams { market_id, params } => {
+                        buf.push(0);
+                        buf.extend_from_slice(&market_id.to_be_bytes());
+                        buf.extend_from_slice(&params.tick_size.raw().to_be_bytes());
+                        buf.extend_from_slice(&params.lot_size.raw().to_be_bytes());
+                        buf.extend_from_slice(&params.max_leverage.to_be_bytes());
+                        buf.extend_from_slice(&params.maintenance_margin_bps.to_be_bytes());
+                        buf.extend_from_slice(&params.max_funding_rate_bps.to_be_bytes());
+                    }
+                    ProposalAction::ListMarket(l) => {
+                        buf.push(1);
+                        buf.extend_from_slice(&(l.base_asset.len() as u32).to_be_bytes());
+                        buf.extend_from_slice(l.base_asset.as_bytes());
+                        buf.extend_from_slice(&(l.quote_asset.len() as u32).to_be_bytes());
+                        buf.extend_from_slice(l.quote_asset.as_bytes());
+                        buf.extend_from_slice(&l.tick_size.raw().to_be_bytes());
+                        buf.extend_from_slice(&l.lot_size.raw().to_be_bytes());
+                        buf.extend_from_slice(&l.max_leverage.to_be_bytes());
+                        buf.extend_from_slice(&l.maintenance_margin_bps.to_be_bytes());
+                    }
+                    ProposalAction::DelistMarket { market_id } => {
+                        buf.push(2);
+                        buf.extend_from_slice(&market_id.to_be_bytes());
+                    }
+                    ProposalAction::ParameterChange { key, value } => {
+                        buf.push(3);
+                        buf.extend_from_slice(&(key.len() as u32).to_be_bytes());
+                        buf.extend_from_slice(key.as_bytes());
+                        buf.extend_from_slice(&(value.len() as u32).to_be_bytes());
+                        buf.extend_from_slice(value.as_bytes());
+                    }
+                    ProposalAction::ValidatorRegistration { candidate } => {
+                        buf.push(4);
+                        buf.extend_from_slice(candidate.as_slice());
+                    }
+                }
+            }
+            NativeAction::Vote { proposal_id, option } => {
+                buf.push(12);
+                buf.extend_from_slice(&proposal_id.to_be_bytes());
+                buf.push(match option {
+                    VoteOption::Yes => 0,
+                    VoteOption::No => 1,
+                    VoteOption::Abstain => 2,
+                });
+            }
+            NativeAction::SubmitOraclePrices(s) => {
+                buf.push(13);
+                buf.extend_from_slice(&(s.prices.len() as u32).to_be_bytes());
+                for (mid, price) in &s.prices {
+                    buf.extend_from_slice(&mid.to_be_bytes());
+                    buf.extend_from_slice(&price.raw().to_be_bytes());
+                }
+                buf.extend_from_slice(&s.timestamp.to_be_bytes());
+            }
+            NativeAction::RegisterValidator { pubkey, commission } => {
+                buf.push(14);
+                buf.extend_from_slice(&pubkey.0);
+                buf.extend_from_slice(&commission.to_be_bytes());
+            }
+            NativeAction::UpdateCommission { new_rate } => {
+                buf.push(15);
+                buf.extend_from_slice(&new_rate.to_be_bytes());
+            }
+            NativeAction::JailVote { target } => {
+                buf.push(16);
+                buf.extend_from_slice(target.as_slice());
+            }
+            NativeAction::UnjailSelf => {
+                buf.push(17);
+            }
+            NativeAction::RotateValidatorKey { new_pubkey } => {
+                buf.push(18);
+                buf.extend_from_slice(&new_pubkey.0);
+            }
+            NativeAction::UpdateMarketParams { market_id, params } => {
+                buf.push(19);
+                buf.extend_from_slice(&market_id.to_be_bytes());
+                buf.extend_from_slice(&params.tick_size.raw().to_be_bytes());
+                buf.extend_from_slice(&params.lot_size.raw().to_be_bytes());
+                buf.extend_from_slice(&params.max_leverage.to_be_bytes());
+                buf.extend_from_slice(&params.maintenance_margin_bps.to_be_bytes());
+                buf.extend_from_slice(&params.max_funding_rate_bps.to_be_bytes());
+            }
+            NativeAction::ListMarket(l) => {
+                buf.push(20);
+                buf.extend_from_slice(&(l.base_asset.len() as u32).to_be_bytes());
+                buf.extend_from_slice(l.base_asset.as_bytes());
+                buf.extend_from_slice(&(l.quote_asset.len() as u32).to_be_bytes());
+                buf.extend_from_slice(l.quote_asset.as_bytes());
+                buf.extend_from_slice(&l.tick_size.raw().to_be_bytes());
+                buf.extend_from_slice(&l.lot_size.raw().to_be_bytes());
+                buf.extend_from_slice(&l.max_leverage.to_be_bytes());
+                buf.extend_from_slice(&l.maintenance_margin_bps.to_be_bytes());
+            }
+            NativeAction::DelistMarket { market_id } => {
+                buf.push(21);
+                buf.extend_from_slice(&market_id.to_be_bytes());
+            }
+        }
+        buf
+    }
 }
 
 /// Signed native action envelope. Submitted via torus_submitNativeAction RPC.

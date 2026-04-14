@@ -162,10 +162,13 @@ fn is_cancel(action: &NativeAction) -> bool {
 }
 
 /// Compute a deterministic hash for dedup purposes.
-/// Uses keccak256 of the action's Debug representation and nonce.
+///
+/// Uses `NativeAction::canonical_bytes()` instead of `Debug` formatting to ensure
+/// the hash is identical across compiler versions and crate updates.
 fn compute_action_hash(action: &SignedNativeAction) -> B256 {
-    let data = format!("{:?}|{}", action.action, action.nonce);
-    keccak256(data.as_bytes())
+    let mut data = action.action.canonical_bytes();
+    data.extend_from_slice(&action.nonce.to_be_bytes());
+    keccak256(&data)
 }
 
 #[cfg(test)]

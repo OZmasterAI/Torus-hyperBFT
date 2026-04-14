@@ -117,8 +117,7 @@ impl BlockProposer {
     ///   2. Non-GTC orders (pre-EVM)
     ///   3. EVM transactions
     ///   4. GTC limit orders (post-EVM)
-    ///   5-10: CoreWriter drain, lockbox, oracle, governance, liquidation, fees
-    ///         (executed during validation, not proposal)
+    ///   5-8: CoreWriter drain, governance, fee distribution, epoch boundary
     ///
     /// Senders are recovered from EIP-712 signatures on SignedNativeActions.
     pub fn build_block_with_native(
@@ -191,6 +190,18 @@ impl BlockProposer {
 
         // Phase 3: Execute post-EVM native actions (GTC orders, lockbox, oracle, etc.).
         NativeExecutor::execute_batch(&mut ctx, &post_evm);
+
+        // Phase 4: Drain and execute CoreWriter queue from previous block.
+        NativeExecutor::drain_core_writer(&mut ctx);
+
+        // Phase 5: Process pending governance proposals.
+        NativeExecutor::process_governance(&mut ctx);
+
+        // Phase 6: Fee distribution.
+        NativeExecutor::distribute_fees(&mut ctx, exec_result.gas_used);
+
+        // Phase 7: Epoch boundary check.
+        NativeExecutor::process_epoch_boundary(&mut ctx);
 
         // Compute composite state root.
         let native_root = compute_native_state_root(state_db);

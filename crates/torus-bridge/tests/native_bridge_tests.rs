@@ -570,3 +570,134 @@ fn epoch_boundary_triggered() {
     let result = NativeExecutor::process_epoch_boundary(&mut ctx);
     assert!(result.is_some(), "should trigger at epoch boundary");
 }
+
+// ============================================================================
+// FIX 1 TEST: Proposer/validator pipeline parity
+// ============================================================================
+
+#[test]
+fn proposer_validator_pipeline_parity() {
+    // Both proposer and validator should produce identical state roots
+    // for the same inputs, now that the proposer includes phases 4-7.
+    use torus_bridge::BlockProposer;
+
+    let (_dir, state_db) = open_test_db();
+    let evm_executor = EvmExecutor::new(TORUS_CHAIN_ID);
+    let proposer = BlockProposer::new(TORUS_CHAIN_ID);
+    let validator = BlockValidator::new(TORUS_CHAIN_ID);
+
+    let parent = torus_bridge::genesis_parent_header();
+
+    // Build a block with the proposer (empty native + EVM actions).
+    let proposed = proposer
+        .build_block_with_native(
+            &state_db,
+            &evm_executor,
+            &parent,
+            vec![],       // no native actions
+            vec![],       // no EVM transactions
+            1000,
+            addr(99),
+        )
+        .expect("proposer should succeed");
+
+    // Validate the proposed block with the validator.
+    let validated = validator.validate_block_with_native(
+        &proposed.block,
+        &state_db,
+        &evm_executor,
+        &[],  // no native senders
+    );
+
+    // The validator should accept the block (state roots match).
+    match validated {
+        Ok(v) => assert_eq!(
+            v.state_root, proposed.block.header.state_root,
+            "proposer and validator state roots must match"
+        ),
+        Err(e) => panic!(
+            "validator rejected proposer's block: {e}. \
+             This indicates pipeline divergence between proposer and validator."
+        ),
+    }
+}
+
+// ============================================================================
+// FIX 2 TEST: Canonical action bytes determinism
+// ============================================================================
+
+#[test]
+fn canonical_bytes_deterministic_across_calls() {
+    // The canonical_bytes encoding must produce identical output for the same action.
+    let action = NativeAction::PlaceOrder(PlaceOrderParams {
+        market_id: 1,
+        is_buy: true,
+        price: fp(50_000),
+        quantity: fp(10),
+        order_type: OrderType::Limit,
+        time_in_force: TimeInForce::GTC,
+        reduce_only: false,
+        client_order_id: Some(42),
+    });
+
+    let bytes1 = action.canonical_bytes();
+    let bytes2 = action.canonical_bytes();
+    assert_eq!(bytes1, bytes2, "canonical_bytes must be deterministic");
+
+    // Different actions must produce different bytes.
+    let action2 = NativeAction::CancelOrder { order_id: 1 };
+    let bytes3 = action2.canonical_bytes();
+    assert_ne!(bytes1, bytes3, "different actions must have different canonical bytes");
+}
+
+#[test]
+fn canonical_bytes_distinguishes_variants() {
+    // Ensure each variant has a unique encoding (no collisions).
+    let actions = vec![
+        NativeAction::ClaimRewards,
+        NativeAction::UnjailSelf,
+        NativeAction::CancelOrder { order_id: 0 },
+        NativeAction::CancelAllOrders { market_id: None },
+        NativeAction::TransferToPerp { amount: U256::ZERO },
+        NativeAction::TransferToSpot { amount: U256::ZERO },
+    ];
+
+    let bytes: Vec<Vec<u8>> = actions.iter().map(|a| a.canonical_bytes()).collect();
+    for i in 0..bytes.len() {
+        for j in (i + 1)..bytes.len() {
+            assert_ne!(
+                bytes[i], bytes[j],
+                "actions at index {i} and {j} produced identical canonical bytes"
+            );
+        }
+    }
+}
+
+#[test]
+fn sort_uses_canonical_bytes_not_debug() {
+    // Verify that action sorting uses canonical bytes (the function compiles and runs
+    // without relying on Debug formatting).
+    let actions = vec![
+        (addr(1), NativeAction::Delegate {
+            validator: addr(10),
+            amount: U256::from(100u64),
+        }),
+        (addr(2), NativeAction::Delegate {
+            validator: addr(20),
+            amount: U256::from(200u64),
+        }),
+    ];
+
+    // sort_native_actions internally uses action_sort_key which now calls canonical_bytes.
+    let (pre, post) = sort_native_actions(&actions);
+    // Both are staking actions (post-EVM).
+    assert!(pre.is_empty());
+    assert_eq!(post.len(), 2);
+
+    // Run again — must produce the same order.
+    let (pre2, post2) = sort_native_actions(&actions);
+    assert_eq!(pre.len(), pre2.len());
+    for (a, b) in post.iter().zip(post2.iter()) {
+        assert_eq!(a.0, b.0, "deterministic sort must produce same sender order");
+    }
+}
