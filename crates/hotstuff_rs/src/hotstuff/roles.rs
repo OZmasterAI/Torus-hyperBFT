@@ -81,6 +81,74 @@ pub(crate) fn is_proposer(
             && validator == &select_leader(view, validator_set_state.previous_validator_set()))
 }
 
+/// MonadBFT B3: Determine whether `validator` should act as proposer, using
+/// reputation-weighted leader selection.
+///
+/// Same logic as `is_proposer` but uses `select_leader_with_reputation`
+/// for the leader check. If reputation is None, falls back to standard selection.
+pub(crate) fn is_proposer_with_reputation(
+    validator: &VerifyingKey,
+    view: ViewNumber,
+    validator_set_state: &ValidatorSetState,
+    reputation: Option<&crate::hotstuff::types::LeaderReputation>,
+) -> bool {
+    use crate::pacemaker::implementation::select_leader_with_reputation;
+    match reputation {
+        Some(rep) => {
+            validator
+                == &select_leader_with_reputation(
+                    view,
+                    validator_set_state.committed_validator_set(),
+                    rep,
+                )
+                || (!validator_set_state.update_decided()
+                    && validator
+                        == &select_leader_with_reputation(
+                            view,
+                            validator_set_state.previous_validator_set(),
+                            rep,
+                        ))
+        }
+        None => is_proposer(validator, view, validator_set_state),
+    }
+}
+
+/// MonadBFT B3: Reputation-aware phase vote recipient selection.
+pub(crate) fn phase_vote_recipient_with_reputation(
+    phase_vote: &PhaseVote,
+    validator_set_state: &ValidatorSetState,
+    reputation: Option<&crate::hotstuff::types::LeaderReputation>,
+) -> VerifyingKey {
+    use crate::pacemaker::implementation::select_leader_with_reputation;
+    match reputation {
+        Some(rep) => {
+            if validator_set_state.update_decided() {
+                select_leader_with_reputation(
+                    phase_vote.view + 1,
+                    validator_set_state.committed_validator_set(),
+                    rep,
+                )
+            } else {
+                match phase_vote.phase {
+                    Phase::Generic | Phase::Prepare | Phase::Precommit | Phase::Commit => {
+                        select_leader_with_reputation(
+                            phase_vote.view + 1,
+                            validator_set_state.previous_validator_set(),
+                            rep,
+                        )
+                    }
+                    Phase::Decide => select_leader_with_reputation(
+                        phase_vote.view + 1,
+                        validator_set_state.committed_validator_set(),
+                        rep,
+                    ),
+                }
+            }
+        }
+        None => phase_vote_recipient(phase_vote, validator_set_state),
+    }
+}
+
 /// Determine whether or not `replica` should phase-vote for the `Proposal` or `Nudge` that `justify`
 /// was taken from. This depends on whether `replica`'s `PhaseVote`s can become part of quorum
 /// certificates that directly extend `justify`.

@@ -157,6 +157,10 @@ pub const LOCAL_TIP: [u8; 1] = [17];
 pub const LAST_VOTED_PROPOSAL: [u8; 1] = [18];
 /// MonadBFT B2: set of blocks that are speculatively committed but not yet irrevocably committed.
 pub const SPECULATIVE_COMMITS: [u8; 1] = [19];
+/// MonadBFT B3: per-validator leader reputation scores for reputation-weighted leader election.
+pub const LEADER_REPUTATION: [u8; 1] = [20];
+/// MonadBFT B3: persisted equivocation evidence (survives rollback, needed for slashing audit).
+pub const EQUIVOCATION_EVIDENCE: [u8; 1] = [21];
 
 // Fields of Block
 pub const BLOCK_HEIGHT: [u8; 1] = [0];

@@ -10,6 +10,7 @@ use ed25519_dalek::VerifyingKey;
 use hotstuff_rs::app::{
     App, ProduceBlockRequest, ProduceBlockResponse, ValidateBlockRequest, ValidateBlockResponse,
 };
+use hotstuff_rs::hotstuff::types::EquivocationEvidence;
 use hotstuff_rs::types::data_types::{CryptoHash, Data, Datum, Power};
 use hotstuff_rs::types::update_sets::ValidatorSetUpdates;
 
@@ -309,6 +310,66 @@ impl App<RocksKVStore> for TorusApp {
         request: ValidateBlockRequest<RocksKVStore>,
     ) -> ValidateBlockResponse {
         self.do_validate(request)
+    }
+
+    /// MonadBFT B3: Handle speculative rollback due to leader equivocation.
+    ///
+    /// Reverts any state changes from the rolled-back block and triggers
+    /// slashing of the equivocating leader (5% + tombstone).
+    fn on_speculative_rollback(
+        &mut self,
+        block: hotstuff_rs::types::data_types::CryptoHash,
+        evidence: &EquivocationEvidence,
+    ) {
+        tracing::warn!(
+            view = %evidence.view.int(),
+            leader = ?evidence.leader.to_bytes(),
+            block_a = ?evidence.block_a,
+            block_b = ?evidence.block_b,
+            "SPECULATIVE ROLLBACK: leader equivocation detected, reverting block"
+        );
+
+        // Phase 1: No EVM state changes to revert (empty blocks).
+        // When EVM execution is added, the StateOverlay approach will handle this:
+        // the overlay is simply discarded instead of committed to RocksDB.
+
+        // Slash the equivocating leader: 5% (500 bps) + tombstone.
+        // Derive Torus address from ed25519 pubkey via SHA-256 (last 20 bytes).
+        let leader_pubkey = evidence.leader.to_bytes();
+        let pubkey_hash: [u8; 32] = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(&leader_pubkey);
+            hasher.finalize().into()
+        };
+        let leader_addr = torus_types::Address::from_slice(&pubkey_hash[12..]);
+
+        match self.staking.slash(
+            leader_addr,
+            500,
+            torus_economics::SlashReason::DoubleSign,
+            0,
+        ) {
+            Ok(slashed_amount) => {
+                tracing::info!(
+                    %leader_addr,
+                    %slashed_amount,
+                    "equivocating leader slashed (5%) after speculative rollback"
+                );
+            }
+            Err(e) => {
+                tracing::error!(%leader_addr, %e, "failed to slash equivocating leader");
+            }
+        }
+
+        if let Err(e) = self.staking.tombstone_validator(&leader_addr) {
+            tracing::error!(%leader_addr, %e, "failed to tombstone equivocating leader");
+        }
+
+        tracing::info!(
+            rolled_back_block = ?block,
+            "speculative rollback complete — chain continues from pre-rollback state"
+        );
     }
 }
 

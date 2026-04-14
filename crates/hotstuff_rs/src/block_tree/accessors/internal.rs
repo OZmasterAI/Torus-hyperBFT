@@ -32,6 +32,7 @@
 use std::{cmp::max, iter::successors, sync::mpsc::Sender, time::SystemTime};
 
 use borsh::BorshSerialize;
+use ed25519_dalek::VerifyingKey;
 
 use crate::{
     events::{
@@ -319,8 +320,31 @@ impl<K: KVStore> BlockTreeSingleton<K> {
         self.write(wb);
 
         // MonadBFT B2: Promote irrevocably committed blocks from speculative list.
+        // MonadBFT B3: Record leader success for reputation tracking.
         for (block_hash, _) in &committed_blocks {
             let _ = self.promote_speculative_to_irrevocable(block_hash);
+            // The block's justify tells us the view in which it was proposed.
+            // The leader of that view gets a reputation success.
+            if let Ok(block_justify) = self.block_justify(block_hash) {
+                if !block_justify.is_genesis_pc() {
+                    // The block was proposed in justify.view + 1 (the view after its QC).
+                    // But actually, block_justify.view is the QC view. The block itself
+                    // was proposed by the leader of the view that follows. We need to find
+                    // who proposed the committed block. The committed block's view is in its
+                    // height context. For reputation, we use the committed validator set
+                    // leader selection.
+                    let committed_vs = self.committed_validator_set();
+                    if let Ok(vs) = committed_vs {
+                        // The block's proposer is the leader of the view where the block was inserted.
+                        // For pipelined mode, blocks are committed by 2-chain: the grandparent.
+                        // The committed block was proposed in a view we can approximate from
+                        // block_justify.view + 1 (the view this block was proposed in).
+                        let proposed_view = block_justify.view + 1;
+                        let leader = crate::pacemaker::implementation::select_leader(proposed_view, &vs);
+                        let _ = self.record_leader_success(&leader);
+                    }
+                }
+            }
         }
 
         Self::publish_update_block_tree_events(
@@ -1346,5 +1370,155 @@ impl<K: KVStore> BlockTreeSingleton<K> {
         let commits = self.speculative_commits()?;
         // Return the last one added (most recent).
         Ok(commits.last().cloned())
+    }
+
+    // ========================================================================
+    // MonadBFT B3: Speculative Rollback
+    // ========================================================================
+
+    /// Remove a block from the speculative commits list (rollback).
+    ///
+    /// Called when equivocation is detected for a speculatively committed block.
+    /// The block itself is NOT deleted from the block tree (it's needed as evidence).
+    /// Only the speculative commit status is reverted.
+    pub fn rollback_speculative_block(
+        &mut self,
+        block: &CryptoHash,
+    ) -> Result<bool, BlockTreeError> {
+        use borsh::BorshSerialize;
+        let mut commits = self.speculative_commits()?;
+        let was_speculative = commits.contains(block);
+        if was_speculative {
+            commits.retain(|b| b != block);
+            let mut wb: BlockTreeWriteBatch<K::WriteBatch> = BlockTreeWriteBatch::new();
+            wb.0.set(
+                &variables::SPECULATIVE_COMMITS,
+                &commits.try_to_vec().map_err(|err| KVSetError::SerializeValueError {
+                    key: Key::HighestTC,
+                    source: err,
+                })?,
+            );
+            self.write(wb);
+        }
+        Ok(was_speculative)
+    }
+
+    /// Persist equivocation evidence in the block tree.
+    ///
+    /// Evidence survives rollback — it's stored separately from the rolled-back
+    /// block's state and is needed for slashing and audit.
+    pub fn store_equivocation_evidence(
+        &mut self,
+        evidence: &crate::hotstuff::types::EquivocationEvidence,
+    ) -> Result<(), BlockTreeError> {
+        use borsh::BorshSerialize;
+        let mut existing = self.get_equivocation_evidence()?;
+        let entry = (
+            evidence.view,
+            evidence.leader.to_bytes(),
+            evidence.block_a,
+            evidence.block_b,
+        );
+        if !existing.contains(&entry) {
+            existing.push(entry);
+            let mut wb: BlockTreeWriteBatch<K::WriteBatch> = BlockTreeWriteBatch::new();
+            wb.0.set(
+                &variables::EQUIVOCATION_EVIDENCE,
+                &existing.try_to_vec().map_err(|err| KVSetError::SerializeValueError {
+                    key: Key::HighestTC,
+                    source: err,
+                })?,
+            );
+            self.write(wb);
+        }
+        Ok(())
+    }
+
+    /// Get all stored equivocation evidence.
+    pub fn get_equivocation_evidence(
+        &self,
+    ) -> Result<Vec<(ViewNumber, [u8; 32], CryptoHash, CryptoHash)>, BlockTreeError> {
+        use borsh::BorshDeserialize;
+        if let Some(bytes) = self.0.get(&variables::EQUIVOCATION_EVIDENCE) {
+            let evidence =
+                Vec::<(ViewNumber, [u8; 32], CryptoHash, CryptoHash)>::deserialize(
+                    &mut bytes.as_slice(),
+                )
+                .map_err(|err| KVGetError::DeserializeValueError {
+                    key: Key::HighestTC,
+                    source: err,
+                })?;
+            Ok(evidence)
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    // ========================================================================
+    // MonadBFT B3: Leader Reputation
+    // ========================================================================
+
+    /// Get the current leader reputation scores.
+    pub fn leader_reputation(
+        &self,
+    ) -> Result<crate::hotstuff::types::LeaderReputation, BlockTreeError> {
+        use borsh::BorshDeserialize;
+        if let Some(bytes) = self.0.get(&variables::LEADER_REPUTATION) {
+            let rep = crate::hotstuff::types::LeaderReputation::deserialize(
+                &mut bytes.as_slice(),
+            )
+            .map_err(|err| KVGetError::DeserializeValueError {
+                key: Key::HighestTC,
+                source: err,
+            })?;
+            Ok(rep)
+        } else {
+            Ok(crate::hotstuff::types::LeaderReputation::new(100))
+        }
+    }
+
+    /// Set the leader reputation scores.
+    pub fn set_leader_reputation(
+        &mut self,
+        reputation: &crate::hotstuff::types::LeaderReputation,
+    ) -> Result<(), BlockTreeError> {
+        use borsh::BorshSerialize;
+        let mut wb: BlockTreeWriteBatch<K::WriteBatch> = BlockTreeWriteBatch::new();
+        wb.0.set(
+            &variables::LEADER_REPUTATION,
+            &reputation.try_to_vec().map_err(|err| KVSetError::SerializeValueError {
+                key: Key::HighestTC,
+                source: err,
+            })?,
+        );
+        self.write(wb);
+        Ok(())
+    }
+
+    /// Record a successful block production for reputation tracking.
+    /// Called when a block is irrevocably committed.
+    pub fn record_leader_success(
+        &mut self,
+        leader: &VerifyingKey,
+    ) -> Result<(), BlockTreeError> {
+        let mut rep = self.leader_reputation()?;
+        rep.record_success(leader);
+        self.set_leader_reputation(&rep)
+    }
+
+    /// Record a timeout for reputation tracking.
+    /// Called when a TC is formed (view timed out).
+    pub fn record_leader_timeout(
+        &mut self,
+        leader: &VerifyingKey,
+    ) -> Result<(), BlockTreeError> {
+        let mut rep = self.leader_reputation()?;
+        rep.record_timeout(leader);
+        // Decay periodically: every `window_size` total events.
+        let total_events: u32 = rep.entries.iter().map(|(_, e)| e.total).sum();
+        if total_events > 0 && total_events % rep.window_size == 0 {
+            rep.decay();
+        }
+        self.set_leader_reputation(&rep)
     }
 }

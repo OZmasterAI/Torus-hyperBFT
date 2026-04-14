@@ -91,6 +91,12 @@ pub enum Event {
     EndSync(EndSyncEvent),
     ReceiveSyncRequest(ReceiveSyncRequestEvent),
     SendSyncResponse(SendSyncResponseEvent),
+
+    // MonadBFT B3: speculative rollback events.
+    /// A speculatively committed block was rolled back due to leader equivocation.
+    RollbackBlock(RollbackBlockEvent),
+    /// Leader equivocation detected: two different proposals from the same leader in the same view.
+    EquivocationDetected(EquivocationDetectedEvent),
 }
 
 impl Event {
@@ -306,4 +312,30 @@ pub struct SendSyncResponseEvent {
     pub peer: VerifyingKey,
     pub blocks: Vec<Block>,
     pub highest_pc: PhaseCertificate,
+}
+
+/// MonadBFT B3: A speculatively committed block was rolled back because the
+/// proposing leader equivocated (signed two different blocks at the same view).
+pub struct RollbackBlockEvent {
+    pub timestamp: SystemTime,
+    /// The block that was rolled back.
+    pub block: CryptoHash,
+    /// The view in which the equivocating leader proposed.
+    pub view: ViewNumber,
+    /// The equivocating leader's public key.
+    pub equivocator: VerifyingKey,
+}
+
+/// MonadBFT B3: Leader equivocation detected — two different proposals from the
+/// same leader in the same view.
+pub struct EquivocationDetectedEvent {
+    pub timestamp: SystemTime,
+    /// The equivocating leader's public key.
+    pub equivocator: VerifyingKey,
+    /// The view in which equivocation occurred.
+    pub view: ViewNumber,
+    /// Hash of the first proposal's block.
+    pub block_a: CryptoHash,
+    /// Hash of the second (conflicting) proposal's block.
+    pub block_b: CryptoHash,
 }

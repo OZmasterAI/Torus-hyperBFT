@@ -574,3 +574,136 @@ impl NECollector {
         None
     }
 }
+
+// ============================================================================
+// MonadBFT B3: Equivocation Evidence
+// ============================================================================
+
+/// Proof that a leader proposed two different blocks at the same view.
+///
+/// Contains the two conflicting block hashes and the view/leader identity.
+/// This is sufficient evidence for slashing — the two blocks are in the block
+/// tree and can be independently verified.
+#[derive(Clone, Debug)]
+pub struct EquivocationEvidence {
+    /// The view in which equivocation occurred.
+    pub view: ViewNumber,
+    /// The equivocating leader's public key.
+    pub leader: VerifyingKey,
+    /// Hash of the first block proposed.
+    pub block_a: CryptoHash,
+    /// Hash of the second (conflicting) block proposed.
+    pub block_b: CryptoHash,
+}
+
+// ============================================================================
+// MonadBFT B3: Leader Reputation
+// ============================================================================
+
+/// Per-validator leadership performance record for reputation tracking.
+///
+/// Stored as part of consensus state and updated deterministically on every node
+/// at the same points (block commit, view timeout). All nodes computing the same
+/// sequence of events produce identical reputation scores.
+#[derive(Clone, Debug, BorshSerialize, BorshDeserialize, PartialEq, Eq)]
+pub struct LeaderReputationEntry {
+    /// Number of views where this validator was leader and successfully produced a committed block.
+    pub successes: u32,
+    /// Total number of views where this validator was leader (successes + timeouts).
+    pub total: u32,
+}
+
+impl LeaderReputationEntry {
+    pub fn new() -> Self {
+        Self {
+            successes: 0,
+            total: 0,
+        }
+    }
+
+    /// Reputation score in basis points (0..=10000).
+    /// Returns 10000 (100%) when no data exists (benefit of the doubt).
+    pub fn score_bps(&self) -> u32 {
+        if self.total == 0 {
+            10_000
+        } else {
+            ((self.successes as u64) * 10_000 / (self.total as u64)) as u32
+        }
+    }
+
+    /// Record a successful block production.
+    pub fn record_success(&mut self) {
+        self.successes += 1;
+        self.total += 1;
+    }
+
+    /// Record a timeout (failed to produce a block in time).
+    pub fn record_timeout(&mut self) {
+        self.total += 1;
+    }
+}
+
+/// Aggregated leader reputation scores for the entire validator set.
+///
+/// Stored in the block tree for deterministic leader selection across all nodes.
+/// Updated at well-defined points: irrevocable commit (success) and TC formation (timeout).
+#[derive(Clone, Debug, BorshSerialize, BorshDeserialize, PartialEq, Eq)]
+pub struct LeaderReputation {
+    /// Map from validator public key bytes (32 bytes) to their reputation entry.
+    /// Using Vec of tuples for deterministic serialization order.
+    pub entries: Vec<([u8; 32], LeaderReputationEntry)>,
+    /// Sliding window size: entries older than this many views are decayed.
+    pub window_size: u32,
+}
+
+impl LeaderReputation {
+    pub fn new(window_size: u32) -> Self {
+        Self {
+            entries: Vec::new(),
+            window_size,
+        }
+    }
+
+    /// Get or create the entry for a validator.
+    fn entry_mut(&mut self, validator: &VerifyingKey) -> &mut LeaderReputationEntry {
+        let key = validator.to_bytes();
+        if let Some(pos) = self.entries.iter().position(|(k, _)| *k == key) {
+            &mut self.entries[pos].1
+        } else {
+            self.entries.push((key, LeaderReputationEntry::new()));
+            &mut self.entries.last_mut().unwrap().1
+        }
+    }
+
+    /// Record a successful block production for a leader.
+    pub fn record_success(&mut self, leader: &VerifyingKey) {
+        self.entry_mut(leader).record_success();
+    }
+
+    /// Record a timeout for a leader.
+    pub fn record_timeout(&mut self, leader: &VerifyingKey) {
+        self.entry_mut(leader).record_timeout();
+    }
+
+    /// Get the reputation score in basis points (0..=10000) for a validator.
+    /// Returns 10000 (100%) for unknown validators.
+    pub fn score_bps(&self, validator: &VerifyingKey) -> u32 {
+        let key = validator.to_bytes();
+        self.entries
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, e)| e.score_bps())
+            .unwrap_or(10_000)
+    }
+
+    /// Decay old data by halving all counters. Called periodically (e.g., every
+    /// `window_size` views) to implement a sliding window effect.
+    /// Removes entries that have decayed to zero.
+    pub fn decay(&mut self) {
+        for (_, entry) in &mut self.entries {
+            entry.successes /= 2;
+            entry.total /= 2;
+        }
+        self.entries.retain(|(_, e)| e.total > 0);
+    }
+}

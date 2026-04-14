@@ -466,6 +466,8 @@ impl EventHandlers {
                     .iter()
                     .for_each(|handler| handler(&send_sync_response_event));
             }
+            // MonadBFT B3: rollback and equivocation events — no handler registration yet.
+            Event::RollbackBlock(_) | Event::EquivocationDetected(_) => {}
         }
     }
 }

@@ -298,6 +298,14 @@ impl<N: Network> Pacemaker<N> {
                 })
                 .publish(&self.event_publisher);
 
+                // MonadBFT B3: Record leader timeout for reputation tracking.
+                // The leader of the timed-out view failed to produce a committed block.
+                let timed_out_leader = select_leader(
+                    new_tc.view,
+                    validator_set_state.committed_validator_set(),
+                );
+                let _ = block_tree.record_leader_timeout(&timed_out_leader);
+
                 // 3.1. If a newly collected Timeout Certificate has a higher view than `highest_tc`, update `highest_tc`.
                 //
                 // Note: we do not call `update_view` in this conditional block. We will call it when we receive an
@@ -759,6 +767,37 @@ pub fn select_leader(view: ViewNumber, validator_set: &ValidatorSet) -> Verifyin
 
     // Safety: If index not found, panic. This should never happen.
     unreachable!("Cannot select a leader: index not found!")
+}
+
+/// MonadBFT B3: Deterministically select a leader using reputation-weighted stake.
+///
+/// Adjusts each validator's effective power by their reputation score (in basis
+/// points), then delegates to the standard IWRR `select_leader`. Validators with
+/// low reputation get proportionally fewer leadership opportunities but are never
+/// fully excluded (minimum 1 power unit if they have any stake).
+///
+/// This function is deterministic: same (view, validator_set, reputation) → same leader.
+pub fn select_leader_with_reputation(
+    view: ViewNumber,
+    validator_set: &ValidatorSet,
+    reputation: &crate::hotstuff::types::LeaderReputation,
+) -> VerifyingKey {
+    use crate::types::{data_types::Power, update_sets::ValidatorSetUpdates};
+
+    // Build adjusted validator set with reputation-weighted powers.
+    let mut adjusted_vs = ValidatorSet::new();
+    let mut updates = ValidatorSetUpdates::new();
+
+    for (vk, power) in validator_set.validators_and_powers() {
+        let score_bps = reputation.score_bps(&vk) as u64;
+        let base_power = power.int();
+        // Effective power = base_power * score / 10000, minimum 1.
+        let effective = std::cmp::max(1, base_power * score_bps / 10_000);
+        updates.insert(vk, Power::new(effective));
+    }
+    adjusted_vs.apply_updates(&updates);
+
+    select_leader(view, &adjusted_vs)
 }
 
 /// Check whether `view` is an epoch-change view given the configured `epoch_length`.

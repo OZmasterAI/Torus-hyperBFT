@@ -51,6 +51,7 @@
 
 use crate::{
     block_tree::{accessors::app::AppBlockTreeView, pluggables::KVStore},
+    hotstuff::types::EquivocationEvidence,
     types::{
         block::Block,
         data_types::{CryptoHash, Data, ViewNumber},
@@ -176,6 +177,25 @@ pub trait App<K: KVStore>: Send {
         &mut self,
         request: ValidateBlockRequest<K>,
     ) -> ValidateBlockResponse;
+
+    /// MonadBFT B3: Called when a speculatively committed block is rolled back
+    /// due to leader equivocation.
+    ///
+    /// The application must revert ALL state changes from the rolled-back block.
+    /// After this call, the application state must be identical to the state
+    /// before the speculative block was executed.
+    ///
+    /// The `evidence` contains the two conflicting block hashes and the
+    /// equivocating leader's identity, which should be used for slashing.
+    ///
+    /// Default implementation is a no-op (for backward compatibility).
+    fn on_speculative_rollback(
+        &mut self,
+        _block: CryptoHash,
+        _evidence: &EquivocationEvidence,
+    ) {
+        // Default no-op for backward compatibility.
+    }
 }
 
 /// Request for an `App` to produce a new block extending a specific `parent_block`.

@@ -43,13 +43,13 @@ use crate::{
     types::{
         block::Block,
         crypto_primitives::Keypair,
-        data_types::{BlockHeight, ChainID, ViewNumber},
+        data_types::{BlockHeight, ChainID, CryptoHash, ViewNumber},
         signed_messages::{ActiveCollectorPair, Certificate, SignedMessage},
         validator_set::ValidatorSetState,
     },
 };
 
-use super::roles::phase_vote_recipient;
+use super::roles::{phase_vote_recipient, phase_vote_recipient_with_reputation, is_proposer_with_reputation};
 
 /// A single participant in the HotStuff subprotocol.
 ///
@@ -83,6 +83,9 @@ pub(crate) struct HotStuff<N: Network> {
     recovery_state: RecoveryState,
     /// MonadBFT B2: views for which this validator has already sent an NE message.
     ne_sent_views: HashSet<ViewNumber>,
+    /// MonadBFT B3: Track proposals per (view, leader) for equivocation detection.
+    /// Maps (view, leader) → first block hash seen from that leader in that view.
+    seen_proposals: std::collections::HashMap<(ViewNumber, VerifyingKey), CryptoHash>,
 }
 
 impl<N: Network> HotStuff<N> {
@@ -111,6 +114,7 @@ impl<N: Network> HotStuff<N> {
             event_publisher,
             recovery_state: RecoveryState::None,
             ne_sent_views: HashSet::new(),
+            seen_proposals: std::collections::HashMap::new(),
         }
     }
 
@@ -415,7 +419,14 @@ impl<N: Network> HotStuff<N> {
         if matches!(msg, HotStuffMessage::Proposal(_)) || matches!(msg, HotStuffMessage::Nudge(_)) {
             let validator_set_state = block_tree.validator_set_state()?;
 
-            if !is_proposer(origin, self.view_info.view, &validator_set_state) {
+            // MonadBFT B3: Use reputation-weighted leader selection.
+            let reputation = block_tree.leader_reputation().ok();
+            if !is_proposer_with_reputation(
+                origin,
+                self.view_info.view,
+                &validator_set_state,
+                reputation.as_ref(),
+            ) {
                 return Ok(());
             }
 
@@ -476,6 +487,72 @@ impl<N: Network> HotStuff<N> {
             proposal: proposal.clone(),
         })
         .publish(&self.event_publisher);
+
+        // MonadBFT B3: Equivocation detection — check if we've seen a different
+        // block from this leader in this view. If so, this is leader equivocation.
+        let proposal_key = (proposal.view, *origin);
+        if let Some(first_block_hash) = self.seen_proposals.get(&proposal_key) {
+            if *first_block_hash != proposal.block.hash {
+                // EQUIVOCATION DETECTED: same leader, same view, different block.
+                let evidence = super::types::EquivocationEvidence {
+                    view: proposal.view,
+                    leader: *origin,
+                    block_a: *first_block_hash,
+                    block_b: proposal.block.hash,
+                };
+
+                Event::EquivocationDetected(crate::events::EquivocationDetectedEvent {
+                    timestamp: SystemTime::now(),
+                    equivocator: *origin,
+                    view: proposal.view,
+                    block_a: *first_block_hash,
+                    block_b: proposal.block.hash,
+                })
+                .publish(&self.event_publisher);
+
+                // Store evidence persistently (survives rollback).
+                let _ = block_tree.store_equivocation_evidence(&evidence);
+
+                // Check if the FIRST block was speculatively committed — if so, roll it back.
+                if block_tree.is_speculatively_committed(first_block_hash)? {
+                    let rolled_back = block_tree.rollback_speculative_block(first_block_hash)?;
+                    if rolled_back {
+                        Event::RollbackBlock(crate::events::RollbackBlockEvent {
+                            timestamp: SystemTime::now(),
+                            block: *first_block_hash,
+                            view: proposal.view,
+                            equivocator: *origin,
+                        })
+                        .publish(&self.event_publisher);
+
+                        // Notify the application to revert state changes.
+                        app.on_speculative_rollback(*first_block_hash, &evidence);
+                    }
+                }
+
+                // Also check if the SECOND (new) block is somehow speculative.
+                if block_tree.is_speculatively_committed(&proposal.block.hash)? {
+                    let rolled_back =
+                        block_tree.rollback_speculative_block(&proposal.block.hash)?;
+                    if rolled_back {
+                        Event::RollbackBlock(crate::events::RollbackBlockEvent {
+                            timestamp: SystemTime::now(),
+                            block: proposal.block.hash,
+                            view: proposal.view,
+                            equivocator: *origin,
+                        })
+                        .publish(&self.event_publisher);
+                        app.on_speculative_rollback(proposal.block.hash, &evidence);
+                    }
+                }
+
+                // Don't process the equivocating proposal further.
+                return Ok(());
+            }
+            // Same block hash = duplicate, handled by ProposalStatus below.
+        } else {
+            self.seen_proposals.insert(proposal_key, proposal.block.hash);
+        }
 
         // MonadBFT: validate reproposal TC if present.
         if proposal.is_reproposal() {

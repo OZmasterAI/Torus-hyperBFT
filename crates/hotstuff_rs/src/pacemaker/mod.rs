@@ -241,3 +241,6 @@ pub mod messages;
 pub(crate) mod implementation;
 
 pub mod types;
+
+// Re-export leader selection functions for external use and testing.
+pub use implementation::{select_leader, select_leader_with_reputation};
