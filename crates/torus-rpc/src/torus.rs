@@ -1,6 +1,6 @@
 //! `torus_*` JSON-RPC namespace — native exchange, staking, governance endpoints.
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::Ordering::{self, Relaxed};
 
 use alloy_primitives::keccak256;
 use borsh::BorshDeserialize;
@@ -332,6 +332,8 @@ impl TorusApiServer for RpcState {
             None => return Ok(vec![]),
         };
 
+        let pruned_up_to = self.pruned_up_to.load(Relaxed);
+
         let iter = db.prefix_iterator_cf(cf, &prefix);
         let mut trades = Vec::new();
 
@@ -341,6 +343,16 @@ impl TorusApiServer for RpcState {
                 .map_err(ErrorObjectOwned::from)?;
             if !key.starts_with(&prefix) {
                 break;
+            }
+
+            // Key: market_id(8) + block_number(8) + trade_index(4)
+            // Skip trades from pruned blocks (forward-compatible for when
+            // trade pruning is implemented in a future batch).
+            if key.len() >= 16 && pruned_up_to > 0 {
+                let block = u64::from_be_bytes(key[8..16].try_into().unwrap());
+                if block < pruned_up_to {
+                    continue;
+                }
             }
 
             let trade = StoredTrade::try_from_slice(&value)
