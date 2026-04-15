@@ -116,7 +116,7 @@ fn decode_hex_key(hex_str: &str) -> Result<[u8; 32], Box<dyn std::error::Error>>
 }
 
 fn default_chain_config() -> ChainConfig {
-    use alloy_primitives::U256;
+    use alloy_primitives::{Address, U256};
     ChainConfig {
         chain_id: torus_evm::TORUS_CHAIN_ID,
         chain_name: "torus".to_string(),
@@ -129,6 +129,8 @@ fn default_chain_config() -> ChainConfig {
         fee_validator_bps: 0,
         fee_treasury_bps: 4500,
         fee_dev_pool_bps: 4500,
+        treasury_address: Address::ZERO,
+        dev_pool_address: Address::ZERO,
     }
 }
 

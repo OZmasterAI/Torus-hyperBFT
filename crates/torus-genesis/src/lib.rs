@@ -334,6 +334,8 @@ impl Genesis {
             fee_validator_bps: self.economics.fee_split.start.validator,
             fee_treasury_bps: self.economics.fee_split.start.treasury,
             fee_dev_pool_bps: self.economics.fee_split.start.dev_pool,
+            treasury_address: Address::ZERO,
+            dev_pool_address: Address::ZERO,
         }
     }
 

@@ -32,11 +32,21 @@ pub struct ValidatedBlock {
 pub struct BlockValidator {
     #[allow(dead_code)] // used in Phase 2 for native execution
     chain_id: u64,
+    epoch_length: u64,
+    max_validators: u32,
+    treasury_address: Address,
+    dev_pool_address: Address,
 }
 
 impl BlockValidator {
-    pub fn new(chain_id: u64) -> Self {
-        Self { chain_id }
+    pub fn new(
+        chain_id: u64,
+        epoch_length: u64,
+        max_validators: u32,
+        treasury_address: Address,
+        dev_pool_address: Address,
+    ) -> Self {
+        Self { chain_id, epoch_length, max_validators, treasury_address, dev_pool_address }
     }
 
     /// Validate a proposed block against the current state.
@@ -217,11 +227,11 @@ impl BlockValidator {
             block.header.height,
             block.header.timestamp,
             block.header.epoch,
-            0, // epoch_length — set by node in production
-            0, // max_validators
+            self.epoch_length,
+            self.max_validators,
             block.header.proposer,
-            Address::ZERO, // treasury
-            Address::ZERO, // dev_pool
+            self.treasury_address,
+            self.dev_pool_address,
         );
 
         // Phase 1: Execute pre-EVM native actions (cancellations, non-GTC orders).

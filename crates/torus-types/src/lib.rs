@@ -773,6 +773,12 @@ pub struct ChainConfig {
     pub fee_validator_bps: u32,
     pub fee_treasury_bps: u32,
     pub fee_dev_pool_bps: u32,
+    /// Treasury address for fee distribution and governance withdrawals.
+    #[serde(default)]
+    pub treasury_address: Address,
+    /// Dev pool address for fee distribution.
+    #[serde(default)]
+    pub dev_pool_address: Address,
 }
 
 impl ChainConfig {

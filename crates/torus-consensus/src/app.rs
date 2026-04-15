@@ -64,8 +64,20 @@ impl TorusApp {
         let staking = StakingManager::new(state_db.clone());
         Self {
             state_db,
-            proposer: BlockProposer::new(TORUS_CHAIN_ID),
-            validator: BlockValidator::new(TORUS_CHAIN_ID),
+            proposer: BlockProposer::new(
+                TORUS_CHAIN_ID,
+                config.epoch_length,
+                config.max_validators,
+                config.treasury_address,
+                config.dev_pool_address,
+            ),
+            validator: BlockValidator::new(
+                TORUS_CHAIN_ID,
+                config.epoch_length,
+                config.max_validators,
+                config.treasury_address,
+                config.dev_pool_address,
+            ),
             evm_executor: EvmExecutor::new(TORUS_CHAIN_ID),
             proposer_address: Address::ZERO,
             last_header: torus_bridge::genesis_parent_header(),
@@ -101,6 +113,8 @@ impl TorusApp {
             fee_validator_bps: 0,
             fee_treasury_bps: 4500,
             fee_dev_pool_bps: 4500,
+            treasury_address: Address::ZERO,
+            dev_pool_address: Address::ZERO,
         };
         Self::new(state_db, &config)
     }

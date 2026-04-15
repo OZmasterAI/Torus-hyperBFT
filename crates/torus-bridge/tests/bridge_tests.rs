@@ -115,8 +115,8 @@ impl TestHarness {
         Self {
             _dir: dir,
             db,
-            proposer: BlockProposer::new(TORUS_CHAIN_ID),
-            validator: BlockValidator::new(TORUS_CHAIN_ID),
+            proposer: BlockProposer::new(TORUS_CHAIN_ID, 100, 4, Address::ZERO, Address::ZERO),
+            validator: BlockValidator::new(TORUS_CHAIN_ID, 100, 4, Address::ZERO, Address::ZERO),
             executor: EvmExecutor::new(TORUS_CHAIN_ID),
             parent_header: genesis_parent_header(),
         }
@@ -246,9 +246,9 @@ fn state_root_determinism_two_validators() {
     db2.put_account(&alice, &test_account(ten_eth)).unwrap();
 
     let parent = genesis_parent_header();
-    let proposer = BlockProposer::new(TORUS_CHAIN_ID);
+    let proposer = BlockProposer::new(TORUS_CHAIN_ID, 100, 4, Address::ZERO, Address::ZERO);
     let executor = EvmExecutor::new(TORUS_CHAIN_ID);
-    let validator = BlockValidator::new(TORUS_CHAIN_ID);
+    let validator = BlockValidator::new(TORUS_CHAIN_ID, 100, 4, Address::ZERO, Address::ZERO);
 
     let base_fee = parent.base_fee_per_gas as u128;
     let rlp = build_signed_transfer(&sk, bob, U256::from(1_000_000u64), 0, base_fee);

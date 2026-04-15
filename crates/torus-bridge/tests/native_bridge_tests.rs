@@ -349,7 +349,7 @@ fn deterministic_native_execution() {
 fn empty_native_actions_evm_only() {
     let (_dir, state_db) = open_test_db();
     let evm_executor = EvmExecutor::new(TORUS_CHAIN_ID);
-    let validator = BlockValidator::new(TORUS_CHAIN_ID);
+    let validator = BlockValidator::new(TORUS_CHAIN_ID, 100, 4, Address::ZERO, Address::ZERO);
 
     let block = TorusBlock {
         header: TorusBlockHeader {
@@ -603,8 +603,8 @@ fn proposer_validator_pipeline_parity() {
 
     let (_dir, state_db) = open_test_db();
     let evm_executor = EvmExecutor::new(TORUS_CHAIN_ID);
-    let proposer = BlockProposer::new(TORUS_CHAIN_ID);
-    let validator = BlockValidator::new(TORUS_CHAIN_ID);
+    let proposer = BlockProposer::new(TORUS_CHAIN_ID, 100, 4, Address::ZERO, Address::ZERO);
+    let validator = BlockValidator::new(TORUS_CHAIN_ID, 100, 4, Address::ZERO, Address::ZERO);
 
     let parent = torus_bridge::genesis_parent_header();
 
