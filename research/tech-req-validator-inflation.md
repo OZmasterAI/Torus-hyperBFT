@@ -55,15 +55,32 @@ Total Staked   APY      Annual Emission   Daily Emission
 ### 1.2 Epoch Emission Calculation
 
 ```
-epoch_seconds  = epoch_length_blocks * TARGET_BLOCK_TIME_SECS
-epoch_fraction = epoch_seconds / SECONDS_PER_YEAR
+epoch_emission = TotalActiveStaked_atrs * INFLATION_CONSTANT * epoch_seconds
+               / (isqrt(TotalActiveStaked_atrs) * SECONDS_PER_YEAR)
 
-apy_ratio = INFLATION_CONSTANT / sqrt(TotalActiveStaked_TRS)
-epoch_emission = TotalActiveStaked_atrs * apy_ratio * epoch_fraction
+where:
+  epoch_seconds = epoch_length_blocks * TARGET_BLOCK_TIME_SECS
 ```
 
-All arithmetic uses `U256` integer math. The sqrt and ratio computations
-must produce deterministic results across all validators -- no floating point.
+**Why this form:** The naive formula `APY = C / sqrt(S_TRS)` requires
+converting atrs to TRS (`/ 10^18`), which loses precision in integer math.
+Instead, take sqrt of the raw atrs value. Since `sqrt(S_atrs) = sqrt(S_TRS * 10^18)`,
+the TRS conversion cancels out naturally in the division
+`S_atrs / sqrt(S_atrs) = sqrt(S_atrs)`.
+
+Implementation:
+
+```rust
+let sqrt_staked = isqrt(total_staked_atrs);
+if sqrt_staked.is_zero() { return Ok(U256::ZERO); }
+let emission = total_staked_atrs
+    * U256::from(VALIDATOR_INFLATION_CONSTANT)
+    * U256::from(epoch_seconds)
+    / (sqrt_staked * U256::from(SECONDS_PER_YEAR));
+```
+
+All arithmetic uses `U256` integer math. No floating point, no division
+by `10^18`, no precision loss. Deterministic across all validators.
 
 ### 1.3 Integer Square Root
 
@@ -104,25 +121,55 @@ Only **active validators** and their delegators receive inflation rewards.
 Candidates, jailed, and tombstoned validators are excluded.
 
 ```
-Active validator set (from EpochManager::compute_new_validator_set)
+Active validators = all_validators() filtered by status == Active
   For each active validator:
     Validator receives: commission portion
     Delegators receive: remainder, pro-rata by delegation amount
 ```
 
+**Note:** Use the current epoch's active set (`staking.all_validators()`
+filtered by `status == Active`), NOT `EpochManager::compute_new_validator_set()`
+which computes the *next* epoch's set. A validator about to be rotated out
+should still receive rewards for the epoch in which it was active.
+
 ### 2.2 Per-Validator Split
 
-Same commission logic as fee distribution (Section 11.2):
+Same commission logic as fee distribution (Section 11.2).
+
+Function signature:
+
+```rust
+pub fn distribute_validator_inflation(
+    staking: &StakingManager,
+    epoch_length_blocks: u64,
+) -> Result<U256>
+```
+
+`epoch_length_blocks` comes from `NativeExecContext.epoch_length` at the
+call site. Returns total emission minted.
+
+Distribution logic:
 
 ```
-validator_emission = total_epoch_emission * validator.total_stake() / total_active_staked
+total_active_staked = sum of val.total_stake() for all Active validators
+epoch_seconds = epoch_length_blocks * TARGET_BLOCK_TIME_SECS
+sqrt_staked = isqrt(total_active_staked)
 
-commission = validator_emission * validator.commission_bps / 10_000
-delegator_pool = validator_emission - commission
+total_emission = total_active_staked * INFLATION_CONSTANT * epoch_seconds
+               / (sqrt_staked * SECONDS_PER_YEAR)
 
-Validator:   credit_rewards(validator, commission)
-Delegators:  credit_rewards(delegator, delegator.amount / total_delegated * delegator_pool)
-Last delegator gets remainder (no rounding dust).
+For each active validator:
+  validator_emission = total_emission * val.total_stake() / total_active_staked
+  (last validator gets remainder)
+
+  commission = validator_emission * val.commission_bps / 10_000
+  delegator_pool = validator_emission - commission
+
+  credit_rewards(validator, commission)
+  For each delegator:
+    share = delegator_pool * del.amount / val.total_delegated
+    (last delegator gets remainder)
+    credit_rewards(delegator, share)
 ```
 
 ### 2.3 No Autocompound
@@ -152,21 +199,23 @@ existing fee distribution model (Section 11.2).
 
 ### 3.1 Call Site
 
-Validator inflation rewards are distributed at each epoch boundary,
-alongside permanent staking rewards. The call must appear in both
-proposer and validator execution paths identically (deterministic state).
+**Current state of `process_epoch_boundary()`:** Only calls
+`compute_new_validator_set()` and discards the result (`_new_set`).
+No reward distribution, no status updates, no rotation cap.
+`distribute_permanent_staking_rewards()` and `update_validator_statuses()`
+exist in torus-economics but are NOT wired into the bridge layer.
+Full epoch boundary wiring is a **separate plan**.
+
+This task adds `distribute_validator_inflation()` to `process_epoch_boundary()`:
 
 ```
 process_epoch_boundary(ctx):
-    1. compute_new_validator_set()            // existing
-    2. distribute_permanent_staking_rewards() // existing (Section 11.1)
-    3. distribute_validator_inflation()       // NEW
-    4. update_validator_statuses()            // existing
+    1. compute_new_validator_set()        // existing (result currently discarded)
+    2. distribute_validator_inflation()   // NEW — this task
 ```
 
-Step 3 must execute **before** validator status updates (step 4), so that
-the reward calculation uses the current epoch's active set, not the
-newly computed set.
+The new function must appear in both `proposer.rs` and `validator.rs`
+at the same position to maintain deterministic state roots.
 
 ### 3.2 Proposer-Validator Determinism
 
@@ -180,7 +229,7 @@ divergence causes `StateRootMismatch` (ref: audit finding 3.4.3).
 |---|---|
 | No active validators | Skip -- no emission, no mint |
 | Total active stake = 0 | Skip -- division by zero guard |
-| Single validator, no delegators | Entire emission to validator as commission |
+| Single validator, no delegators | Entire emission to validator (via zero-delegators guard, regardless of commission rate) |
 | Validator has 0% commission | Entire emission to delegator pool |
 | Validator has 100% commission | Entire emission to validator |
 | Epoch length = 0 | Skip -- epoch_fraction = 0 |
@@ -334,3 +383,8 @@ This must be updated to:
 - Emission cap / max epoch emission (not needed -- sqrt curve is self-limiting)
 - Interaction with slashing (slashed validators are jailed, excluded from active set, no rewards)
 - EVM precompile for querying inflation APY (future RPC addition)
+- **Full epoch boundary wiring** (separate plan): applying computed validator
+  sets, rotation cap, status updates, permanent staking reward distribution.
+  These are built and tested in torus-economics but not wired into the
+  bridge layer. This task only adds the new `distribute_validator_inflation()`
+  call to the existing `process_epoch_boundary()` function.
