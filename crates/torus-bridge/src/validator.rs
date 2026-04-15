@@ -255,6 +255,24 @@ impl BlockValidator {
             )));
         }
 
+        // Verify receipts_root by recomputing from execution results.
+        let computed_receipts_root = crate::proposer::compute_receipts_root(&exec_result.receipts)
+            .map_err(|e| BridgeError::Serialization(format!("receipts: {e}")))?;
+        if computed_receipts_root != block.header.receipts_root {
+            return Err(BridgeError::InvalidBlock(format!(
+                "receipts_root mismatch: header={}, computed={}",
+                block.header.receipts_root, computed_receipts_root
+            )));
+        }
+
+        // Verify logs_bloom matches execution results.
+        if exec_result.logs_bloom != block.header.logs_bloom {
+            return Err(BridgeError::InvalidBlock(format!(
+                "logs_bloom mismatch: header={}, computed={}",
+                block.header.logs_bloom, exec_result.logs_bloom
+            )));
+        }
+
         // Phase 3: Execute post-EVM native actions (GTC orders, lockbox, oracle, governance).
         NativeExecutor::execute_batch(&mut ctx, &post_evm);
 
