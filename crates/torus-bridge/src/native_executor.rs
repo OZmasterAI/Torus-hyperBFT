@@ -17,12 +17,13 @@ use torus_core::order_book::{OrderBook, OrderStatus};
 use torus_core::position::{MarginType, PositionManager};
 use torus_core::precompiles::{CoreWriterQueue, QueuedAction, QueuedActionKind};
 use torus_economics::{
-    EpochManager, GovernanceManager, RewardDistributor, StakingManager,
+    EpochManager, GovernanceManager, RewardDistributor, StakingManager, ValidatorStatus,
 };
+use torus_economics::epoch::ValidatorSetDiff;
 use torus_state::StateDb;
 use torus_types::{
-    FixedPoint, MarketId, NativeAction, OrderType, PlaceOrderParams, Side, TimeInForce, U256,
-    VoteOption,
+    FixedPoint, MarketId, NativeAction, OrderType, PlaceOrderParams, PublicKey, Side, TimeInForce,
+    U256, ValidatorInfo, ValidatorSet, VoteOption,
 };
 
 // ============================================================================
@@ -63,6 +64,14 @@ impl NativeActionResult {
 pub struct NativeBatchResult {
     pub results: Vec<NativeActionResult>,
     pub total_gas: u64,
+}
+
+/// Result of epoch boundary processing. Carries the validator set diff
+/// for future hotstuff_rs ValidatorSetUpdates integration.
+pub struct EpochBoundaryResult {
+    pub action: NativeActionResult,
+    pub new_set: Option<ValidatorSet>,
+    pub diff: Option<ValidatorSetDiff>,
 }
 
 // ============================================================================
@@ -1090,20 +1099,82 @@ impl NativeExecutor {
         }
     }
 
-    /// Check and process epoch boundary (validator rotation + reward distribution).
-    pub fn process_epoch_boundary(ctx: &mut NativeExecContext) -> Option<NativeActionResult> {
+    /// Check and process epoch boundary (reward distribution + validator rotation).
+    ///
+    /// Phase A — Rewards: distributes permanent staking rewards and validator
+    /// inflation to the CURRENT active set. Errors log-and-continue (reward
+    /// bugs should not block rotation).
+    ///
+    /// Phase B — Rotation: computes new validator set, applies rotation cap,
+    /// updates statuses, logs changes. Errors on compute_new_validator_set
+    /// early-return (broken validator set is a consensus-safety issue).
+    pub fn process_epoch_boundary(ctx: &mut NativeExecContext) -> Option<EpochBoundaryResult> {
         if !EpochManager::is_epoch_boundary(ctx.block_height, ctx.epoch_length) {
             return None;
         }
 
-        match EpochManager::compute_new_validator_set(
+        // --- Phase A: Reward distribution (uses CURRENT active set) ---
+
+        if let Err(e) = RewardDistributor::distribute_permanent_staking_rewards(
+            &ctx.staking,
+            ctx.epoch_length,
+        ) {
+            tracing::error!(%e, "permanent staking rewards failed");
+        }
+
+        if let Err(e) = RewardDistributor::distribute_validator_inflation(
+            &ctx.staking,
+            ctx.epoch_length,
+        ) {
+            tracing::error!(%e, "validator inflation distribution failed");
+        }
+
+        // --- Phase B: Validator set rotation ---
+
+        // B1: Build old set from current Active validators
+        let old_set = build_current_validator_set(&ctx.staking, ctx.epoch);
+
+        // B2: Compute new set
+        let new_set = match EpochManager::compute_new_validator_set(
             &ctx.staking,
             ctx.max_validators,
             ctx.epoch + 1,
         ) {
-            Ok(_new_set) => Some(NativeActionResult::ok("epoch_rotation", 5000)),
-            Err(e) => Some(NativeActionResult::err("epoch_rotation", e.to_string())),
+            Ok(set) => set,
+            Err(e) => {
+                return Some(EpochBoundaryResult {
+                    action: NativeActionResult::err("epoch_rotation", e.to_string()),
+                    new_set: None,
+                    diff: None,
+                });
+            }
+        };
+
+        // B3: Apply rotation cap
+        let cap = EpochManager::safe_rotation_cap(old_set.validators.len());
+        let new_set = EpochManager::apply_rotation_cap(&old_set, new_set, cap);
+
+        // B4: Check minimum set
+        if let Err(e) = EpochManager::check_minimum_set(&new_set) {
+            tracing::error!(%e, "validator set below minimum");
         }
+
+        // B5: Compute diff
+        let diff = EpochManager::compute_validator_set_diff(&old_set, &new_set);
+
+        // B6: Update statuses
+        if let Err(e) = EpochManager::update_validator_statuses(&ctx.staking, &new_set) {
+            tracing::error!(%e, "validator status update failed");
+        }
+
+        // B7: Log rotation
+        EpochManager::log_rotation(&old_set, &new_set, &diff, ctx.epoch + 1);
+
+        Some(EpochBoundaryResult {
+            action: NativeActionResult::ok("epoch_boundary", 5000),
+            new_set: Some(new_set),
+            diff: Some(diff),
+        })
     }
 
     /// Process pending governance proposals.
@@ -1119,6 +1190,29 @@ impl NativeExecutor {
             )],
         }
     }
+}
+
+/// Build a ValidatorSet from current Active validators in staking state.
+/// Uses the same power conversion as `EpochManager::compute_new_validator_set`.
+fn build_current_validator_set(staking: &StakingManager, epoch: u64) -> ValidatorSet {
+    let wei = U256::from(10u64).pow(U256::from(18u64));
+    let validators: Vec<ValidatorInfo> = match staking.all_validators() {
+        Ok(all) => all
+            .into_iter()
+            .filter(|v| v.status == ValidatorStatus::Active)
+            .map(|v| ValidatorInfo {
+                address: v.address,
+                pubkey: PublicKey(v.pubkey),
+                power: (v.total_stake() / wei).try_into().unwrap_or(u64::MAX),
+                commission_bps: v.commission_bps,
+            })
+            .collect(),
+        Err(e) => {
+            tracing::error!(%e, "failed to read validators for old set");
+            Vec::new()
+        }
+    };
+    ValidatorSet { validators, epoch }
 }
 
 // ============================================================================

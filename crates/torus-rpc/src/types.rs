@@ -395,6 +395,30 @@ pub struct RpcGovernanceParams {
     pub quorum_bps: String,
     pub min_proposal_stake: String,
     pub permanent_weight_multiplier: String,
+    pub treasury_address: String,
+}
+
+// ============================================================================
+// Treasury Info RPC Response Types
+// ============================================================================
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcTreasuryInfo {
+    pub treasury_address: String,
+    pub treasury_balance: String,
+    pub cumulative_burned: String,
+    pub cumulative_treasury: String,
+    pub current_fee_split: RpcFeeSplit,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcFeeSplit {
+    pub burn_bps: u16,
+    pub validator_bps: u16,
+    pub treasury_bps: u16,
+    pub dev_pool_bps: u16,
 }
 
 // ============================================================================

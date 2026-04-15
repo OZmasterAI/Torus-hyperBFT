@@ -324,6 +324,13 @@ pub const BLOCKS_PER_YEAR: u64 = 365 * 24 * 3600 / TARGET_BLOCK_TIME_SECS;
 /// Permanent staking APY: 500 bps (5%).
 pub const PERMANENT_STAKE_APY_BPS: u64 = 500;
 
+/// Validator inflation constant: APY = C / sqrt(TotalStaked_TRS).
+/// With C=200: 20% APY at 1M staked, 6.3% at 10M, 2% at 100M.
+pub const VALIDATOR_INFLATION_CONSTANT: u64 = 200;
+
+/// Seconds per year (365 days). Used for epoch fraction calculation.
+pub const SECONDS_PER_YEAR: u64 = 365 * 24 * 3600;
+
 /// Default supermajority threshold for PermanentUnlock proposals: 8000 bps (80%).
 pub const DEFAULT_PERMANENT_UNLOCK_THRESHOLD_BPS: u64 = 8000;
 

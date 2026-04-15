@@ -7,3 +7,8 @@ jobs = 6
 
 [profile.dev]
 split-debuginfo = "unpacked"
+
+[env]
+# Cache only librocksdb-sys C++ compilation via sccache
+CC_librocksdb_sys = "sccache cc"
+CXX_librocksdb_sys = "sccache c++"

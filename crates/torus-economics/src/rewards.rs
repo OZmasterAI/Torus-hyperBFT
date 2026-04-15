@@ -157,6 +157,112 @@ impl RewardDistributor {
         tracing::info!(%total_minted, stakers = all_stakes.len(), "permanent staking rewards distributed");
         Ok(total_minted)
     }
+
+    /// Distribute validator staking inflation at epoch boundary.
+    /// APY = 200 / sqrt(TotalActiveStaked_TRS). Rewards are inflationary (minted).
+    /// Only active validators and their delegators receive rewards.
+    pub fn distribute_validator_inflation(
+        staking: &StakingManager,
+        epoch_length_blocks: u64,
+    ) -> Result<U256> {
+        let all = staking.all_validators()?;
+        let mut active: Vec<_> = all
+            .into_iter()
+            .filter(|v| v.status == crate::types::ValidatorStatus::Active)
+            .collect();
+
+        if active.is_empty() {
+            return Ok(U256::ZERO);
+        }
+
+        // Sort by address ascending for deterministic remainder distribution.
+        active.sort_by_key(|v| v.address);
+
+        let total_active_staked: U256 = active.iter().map(|v| v.total_stake()).sum();
+        if total_active_staked.is_zero() {
+            return Ok(U256::ZERO);
+        }
+
+        let sqrt_staked = isqrt(total_active_staked);
+        if sqrt_staked.is_zero() {
+            return Ok(U256::ZERO);
+        }
+
+        let epoch_seconds = epoch_length_blocks * TARGET_BLOCK_TIME_SECS;
+        let total_emission = total_active_staked
+            * U256::from(VALIDATOR_INFLATION_CONSTANT)
+            * U256::from(epoch_seconds)
+            / (sqrt_staked * U256::from(SECONDS_PER_YEAR));
+
+        if total_emission.is_zero() {
+            return Ok(U256::ZERO);
+        }
+
+        let bps_10000 = U256::from(10_000u32);
+        let mut distributed = U256::ZERO;
+        let last_val_idx = active.len().saturating_sub(1);
+
+        for (i, val) in active.iter().enumerate() {
+            let val_emission = if i == last_val_idx {
+                total_emission - distributed
+            } else {
+                total_emission * val.total_stake() / total_active_staked
+            };
+
+            if val_emission.is_zero() {
+                continue;
+            }
+            distributed += val_emission;
+
+            // Commission split
+            let commission = val_emission * U256::from(val.commission_bps) / bps_10000;
+            let delegator_pool = val_emission - commission;
+
+            if !commission.is_zero() {
+                staking.credit_rewards(val.address, commission)?;
+            }
+
+            // If no delegators, validator gets everything
+            if delegator_pool.is_zero() || val.total_delegated.is_zero() {
+                if !delegator_pool.is_zero() {
+                    staking.credit_rewards(val.address, delegator_pool)?;
+                }
+                continue;
+            }
+
+            // Distribute to delegators pro-rata
+            let delegations = staking.delegations_for_validator(&val.address)?;
+            let total_delegated = val.total_delegated;
+            let mut del_distributed = U256::ZERO;
+            let last_del_idx = delegations.len().saturating_sub(1);
+
+            for (j, del) in delegations.iter().enumerate() {
+                let share = if j == last_del_idx {
+                    delegator_pool - del_distributed
+                } else {
+                    delegator_pool * del.amount / total_delegated
+                };
+
+                if !share.is_zero() {
+                    staking.credit_rewards(del.delegator, share)?;
+                    del_distributed += share;
+                }
+            }
+        }
+
+        // Update cumulative tracker
+        let prev = get_cumulative_validator_inflation(staking)?;
+        put_cumulative_validator_inflation(staking, prev + total_emission)?;
+
+        tracing::info!(
+            %total_emission,
+            active_validators = active.len(),
+            %total_active_staked,
+            "validator inflation rewards distributed"
+        );
+
+        Ok(total_emission)
+    }
 }
 
 /// Integer-only linear interpolation in basis points.
@@ -173,9 +279,57 @@ pub fn lerp_bps(start: u16, end: u16, numerator: u64, denominator: u64) -> u16 {
     }
 }
 
+/// Integer square root via Newton's method. Returns floor(sqrt(n)).
+pub(crate) fn isqrt(n: U256) -> U256 {
+    if n.is_zero() {
+        return U256::ZERO;
+    }
+    if n < U256::from(4u64) {
+        return U256::from(1u64);
+    }
+
+    // Initial guess: 2^((bits+1)/2)
+    let bits = 256 - n.leading_zeros();
+    let mut x = U256::from(1u64) << ((bits + 1) / 2);
+
+    loop {
+        let x_next = (x + n / x) >> 1;
+        if x_next >= x {
+            break;
+        }
+        x = x_next;
+    }
+    x
+}
+
 // ============================================================================
 // FeeSplitter (task 2.7)
 // ============================================================================
+
+/// Static key for cumulative validator inflation minted in CF_TREASURY.
+const VALIDATOR_INFLATION_KEY: &[u8] = b"validator_inflation_tracker";
+
+fn get_cumulative_validator_inflation(staking: &StakingManager) -> Result<U256> {
+    match staking
+        .state_db()
+        .get_cf_raw(CF_TREASURY, VALIDATOR_INFLATION_KEY)?
+    {
+        Some(data) => {
+            if data.len() != 32 {
+                return Err(EconomicsError::Borsh("invalid validator inflation tracker length".into()));
+            }
+            Ok(U256::from_be_slice(&data))
+        }
+        None => Ok(U256::ZERO),
+    }
+}
+
+fn put_cumulative_validator_inflation(staking: &StakingManager, total: U256) -> Result<()> {
+    staking
+        .state_db()
+        .put_cf_raw(CF_TREASURY, VALIDATOR_INFLATION_KEY, &total.to_be_bytes::<32>())?;
+    Ok(())
+}
 
 /// Static key for the supply tracker in CF_TREASURY.
 const SUPPLY_TRACKER_KEY: &[u8] = b"supply_tracker";
@@ -531,5 +685,191 @@ mod tests {
             .unwrap()
             .balance;
         assert_eq!(bal, wei(50_000) + minted);
+    }
+
+    // ====================================================================
+    // isqrt tests
+    // ====================================================================
+
+    #[test]
+    fn isqrt_basic() {
+        assert_eq!(isqrt(U256::ZERO), U256::ZERO);
+        assert_eq!(isqrt(U256::from(1u64)), U256::from(1u64));
+        assert_eq!(isqrt(U256::from(4u64)), U256::from(2u64));
+        assert_eq!(isqrt(U256::from(9u64)), U256::from(3u64));
+        assert_eq!(isqrt(U256::from(100u64)), U256::from(10u64));
+    }
+
+    #[test]
+    fn isqrt_large_u256() {
+        // sqrt(10^36) = 10^18 (1M TRS in atrs)
+        let val = U256::from(10u64).pow(U256::from(36u64));
+        assert_eq!(isqrt(val), U256::from(10u64).pow(U256::from(18u64)));
+    }
+
+    #[test]
+    fn isqrt_non_perfect() {
+        assert_eq!(isqrt(U256::from(2u64)), U256::from(1u64));
+        assert_eq!(isqrt(U256::from(3u64)), U256::from(1u64));
+        assert_eq!(isqrt(U256::from(5u64)), U256::from(2u64));
+        assert_eq!(isqrt(U256::from(99u64)), U256::from(9u64));
+    }
+
+    // ====================================================================
+    // Validator inflation tests
+    // ====================================================================
+
+    fn register_active_validator(
+        mgr: &StakingManager,
+        n: u8,
+        stake_tokens: u64,
+        commission_bps: u16,
+    ) -> Address {
+        let a = addr(n);
+        fund(mgr, &a, wei(stake_tokens));
+        mgr.register_validator(a, [n; 32], commission_bps, wei(stake_tokens))
+            .unwrap();
+        // Mark as active
+        let mut v = mgr.get_validator(&a).unwrap().unwrap();
+        v.status = crate::types::ValidatorStatus::Active;
+        mgr.put_validator(&a, &v).unwrap();
+        a
+    }
+
+    #[test]
+    fn validator_inflation_single_validator() {
+        let (_dir, mgr) = setup();
+        let val = register_active_validator(&mgr, 1, 100_000, 1000); // 10% commission
+
+        let epoch_blocks = 43200u64; // ~1 day at 2s blocks
+        let emission =
+            RewardDistributor::distribute_validator_inflation(&mgr, epoch_blocks).unwrap();
+
+        assert!(!emission.is_zero(), "should mint some inflation");
+
+        // Verify validator received rewards (commission + delegator pool since no delegators)
+        let pending = mgr.get_pending_rewards(&val).unwrap().unwrap();
+        assert_eq!(pending.amount, emission, "sole validator gets full emission");
+    }
+
+    #[test]
+    fn validator_inflation_with_delegators() {
+        let (_dir, mgr) = setup();
+        let val = register_active_validator(&mgr, 1, 50_000, 1000); // 10% commission
+        let d1 = addr(2);
+        let d2 = addr(3);
+        fund(&mgr, &d1, wei(100_000));
+        fund(&mgr, &d2, wei(100_000));
+        mgr.delegate(d1, val, wei(30_000)).unwrap();
+        mgr.delegate(d2, val, wei(70_000)).unwrap();
+
+        let epoch_blocks = 43200u64;
+        let emission =
+            RewardDistributor::distribute_validator_inflation(&mgr, epoch_blocks).unwrap();
+
+        let val_rewards = mgr.get_pending_rewards(&val).unwrap().unwrap().amount;
+        let d1_rewards = mgr.get_pending_rewards(&d1).unwrap().unwrap().amount;
+        let d2_rewards = mgr.get_pending_rewards(&d2).unwrap().unwrap().amount;
+
+        // Commission = emission * 10%
+        let bps = U256::from(10_000u32);
+        let expected_commission = emission * U256::from(1000u32) / bps;
+        assert_eq!(val_rewards, expected_commission);
+
+        // Sum of all rewards = total emission
+        assert_eq!(val_rewards + d1_rewards + d2_rewards, emission);
+
+        // d2 gets more than d1 (70k vs 30k delegated)
+        assert!(d2_rewards > d1_rewards);
+    }
+
+    #[test]
+    fn validator_inflation_multiple_validators() {
+        let (_dir, mgr) = setup();
+        register_active_validator(&mgr, 1, 100_000, 500);
+        register_active_validator(&mgr, 2, 200_000, 500);
+
+        let epoch_blocks = 43200u64;
+        let emission =
+            RewardDistributor::distribute_validator_inflation(&mgr, epoch_blocks).unwrap();
+
+        let r1 = mgr.get_pending_rewards(&addr(1)).unwrap().unwrap().amount;
+        let r2 = mgr.get_pending_rewards(&addr(2)).unwrap().unwrap().amount;
+
+        // Sum = total emission
+        assert_eq!(r1 + r2, emission);
+
+        // Validator 2 has 2x stake, should get ~2x rewards
+        assert!(r2 > r1);
+    }
+
+    #[test]
+    fn validator_inflation_no_active_validators() {
+        let (_dir, mgr) = setup();
+        // Register but leave as Candidate (default)
+        let a = addr(1);
+        fund(&mgr, &a, wei(100_000));
+        mgr.register_validator(a, [1u8; 32], 500, wei(50_000))
+            .unwrap();
+
+        let emission =
+            RewardDistributor::distribute_validator_inflation(&mgr, 43200).unwrap();
+        assert_eq!(emission, U256::ZERO);
+    }
+
+    #[test]
+    fn validator_inflation_zero_stake() {
+        let (_dir, mgr) = setup();
+        // No validators at all
+        let emission =
+            RewardDistributor::distribute_validator_inflation(&mgr, 43200).unwrap();
+        assert_eq!(emission, U256::ZERO);
+    }
+
+    #[test]
+    fn validator_inflation_apy_decreases_with_stake() {
+        // Higher total stake => lower per-unit reward
+        let (_dir1, mgr1) = setup();
+        register_active_validator(&mgr1, 1, 100_000, 0);
+        let e1 = RewardDistributor::distribute_validator_inflation(&mgr1, 43200).unwrap();
+
+        let (_dir2, mgr2) = setup();
+        register_active_validator(&mgr2, 1, 1_000_000, 0);
+        let e2 = RewardDistributor::distribute_validator_inflation(&mgr2, 43200).unwrap();
+
+        // Per-unit reward: e1/100k vs e2/1M
+        let per_unit_1 = e1 * U256::from(1_000_000u64);
+        let per_unit_2 = e2 * U256::from(100_000u64);
+        assert!(per_unit_1 > per_unit_2, "APY should decrease with more stake");
+    }
+
+    #[test]
+    fn validator_inflation_epoch_fraction() {
+        let (_dir, mgr) = setup();
+        register_active_validator(&mgr, 1, 100_000, 0);
+
+        let e_half = RewardDistributor::distribute_validator_inflation(&mgr, 21600).unwrap();
+
+        let (_dir2, mgr2) = setup();
+        register_active_validator(&mgr2, 1, 100_000, 0);
+        let e_full = RewardDistributor::distribute_validator_inflation(&mgr2, 43200).unwrap();
+
+        // Double epoch length should produce double emission
+        assert_eq!(e_full, e_half * U256::from(2u64));
+    }
+
+    #[test]
+    fn validator_inflation_cumulative_tracker() {
+        let (_dir, mgr) = setup();
+        register_active_validator(&mgr, 1, 100_000, 0);
+
+        let e1 = RewardDistributor::distribute_validator_inflation(&mgr, 43200).unwrap();
+        let cum1 = get_cumulative_validator_inflation(&mgr).unwrap();
+        assert_eq!(cum1, e1);
+
+        // Second epoch
+        let e2 = RewardDistributor::distribute_validator_inflation(&mgr, 43200).unwrap();
+        let cum2 = get_cumulative_validator_inflation(&mgr).unwrap();
+        assert_eq!(cum2, e1 + e2);
     }
 }

@@ -13,9 +13,14 @@ use torus_core::oracle::{OracleConfig, OracleManager};
 use torus_core::position::PositionManager;
 use torus_core::precompiles::OrderBookSnapshot;
 use torus_economics::governance::{GovernanceManager, ProposalStatus, ProposalType};
+use torus_economics::rewards::FeeSplitter;
 use torus_economics::staking::StakingManager;
-use torus_economics::types::ValidatorStatus;
-use torus_economics::PermanentStakeInfo;
+use torus_economics::types::{
+    ValidatorStatus, FEE_END_BURN_BPS, FEE_END_DEV_POOL_BPS, FEE_END_TREASURY_BPS,
+    FEE_END_VALIDATOR_BPS, FEE_START_BURN_BPS, FEE_START_DEV_POOL_BPS, FEE_START_TREASURY_BPS,
+    FEE_START_VALIDATOR_BPS, TRANSITION_EPOCHS,
+};
+use torus_economics::{lerp_bps, PermanentStakeInfo};
 use torus_state::cf::{
     CF_BLOCK_BODIES, CF_GOVERNANCE_PROPOSALS, CF_NATIVE_MARKETS, CF_NATIVE_ORDER_BOOKS,
     CF_NATIVE_TRADES, CF_STAKING_PERMANENT,
@@ -111,6 +116,10 @@ pub trait TorusApi {
 
     #[method(name = "getGovernanceParams")]
     async fn get_governance_params(&self) -> RpcResult<RpcGovernanceParams>;
+
+    // --- Treasury info (for explorer) ---
+    #[method(name = "getTreasuryInfo")]
+    async fn get_treasury_info(&self) -> RpcResult<RpcTreasuryInfo>;
 
     // --- Block body (native actions for explorer indexing) ---
     #[method(name = "getBlockBody")]
@@ -588,6 +597,73 @@ impl TorusApiServer for RpcState {
                 params.permanent_weight_multiplier_num,
                 params.permanent_weight_multiplier_den
             ),
+            treasury_address: hex_address(params.treasury_address),
+        })
+    }
+
+    async fn get_treasury_info(&self) -> RpcResult<RpcTreasuryInfo> {
+        let gov = GovernanceManager::new(self.state.clone());
+        let params = gov
+            .get_governance_params()
+            .map_err(|e| RpcError::Internal(e.to_string()))
+            .map_err(ErrorObjectOwned::from)?;
+
+        let treasury_address = params.treasury_address;
+
+        // Treasury balance from account state.
+        let treasury_balance = self
+            .state
+            .get_account(&treasury_address)
+            .map_err(RpcError::State)
+            .map_err(ErrorObjectOwned::from)?
+            .map(|a| a.balance)
+            .unwrap_or_default();
+
+        // Cumulative burn/treasury from SupplyTracker.
+        let staking = StakingManager::new(self.state.clone());
+        let tracker = FeeSplitter::get_supply_tracker(&staking)
+            .map_err(|e| RpcError::Internal(e.to_string()))
+            .map_err(ErrorObjectOwned::from)?;
+
+        // Current fee split BPS using lerp.
+        let current_height = self.latest_height.load(Ordering::Relaxed);
+        let epoch_length = 100u64;
+        let epoch_info =
+            torus_economics::queries::get_epoch_info(current_height, epoch_length);
+        let epoch = epoch_info.current_epoch;
+
+        let burn_bps =
+            lerp_bps(FEE_START_BURN_BPS, FEE_END_BURN_BPS, epoch, TRANSITION_EPOCHS);
+        let validator_bps = lerp_bps(
+            FEE_START_VALIDATOR_BPS,
+            FEE_END_VALIDATOR_BPS,
+            epoch,
+            TRANSITION_EPOCHS,
+        );
+        let treasury_bps = lerp_bps(
+            FEE_START_TREASURY_BPS,
+            FEE_END_TREASURY_BPS,
+            epoch,
+            TRANSITION_EPOCHS,
+        );
+        let dev_pool_bps = lerp_bps(
+            FEE_START_DEV_POOL_BPS,
+            FEE_END_DEV_POOL_BPS,
+            epoch,
+            TRANSITION_EPOCHS,
+        );
+
+        Ok(RpcTreasuryInfo {
+            treasury_address: hex_address(treasury_address),
+            treasury_balance: hex_u256(treasury_balance),
+            cumulative_burned: hex_u256(tracker.cumulative_burned),
+            cumulative_treasury: hex_u256(tracker.cumulative_treasury),
+            current_fee_split: RpcFeeSplit {
+                burn_bps,
+                validator_bps,
+                treasury_bps,
+                dev_pool_bps,
+            },
         })
     }
 
@@ -625,6 +701,7 @@ fn map_proposal(p: torus_economics::governance::Proposal) -> RpcProposal {
         ProposalType::MarketListing => "MarketListing",
         ProposalType::TextProposal => "TextProposal",
         ProposalType::ValidatorRegistration => "ValidatorRegistration",
+        ProposalType::PermanentUnlock => "PermanentUnlock",
     };
 
     let status = match p.status {

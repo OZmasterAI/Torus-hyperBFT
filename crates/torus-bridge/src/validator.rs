@@ -271,7 +271,17 @@ impl BlockValidator {
         NativeExecutor::distribute_fees(&mut ctx, exec_result.gas_used);
 
         // Phase 9: Epoch boundary check.
-        NativeExecutor::process_epoch_boundary(&mut ctx);
+        if let Some(epoch_result) = NativeExecutor::process_epoch_boundary(&mut ctx) {
+            if let Some(ref diff) = epoch_result.diff {
+                if !diff.is_empty() {
+                    tracing::info!(
+                        inserts = diff.inserts.len(),
+                        deletes = diff.deletes.len(),
+                        "epoch boundary: validator set changed"
+                    );
+                }
+            }
+        }
 
         // FIX ECON-FIND-02: Persist order book state after block execution.
         ctx.save_order_books();
