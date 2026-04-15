@@ -15,6 +15,11 @@ const BASE_FEE_MAX_CHANGE_DENOMINATOR: u64 = 8;
 pub fn calc_next_block_base_fee(gas_used: u64, gas_limit: u64, base_fee: u64) -> u64 {
     let gas_target = gas_limit / ELASTICITY_MULTIPLIER;
 
+    // If gas_limit is 0 or 1 (uninitialised parent), no adjustment is possible.
+    if gas_target == 0 {
+        return base_fee;
+    }
+
     if gas_used == gas_target {
         return base_fee;
     }
@@ -72,6 +77,16 @@ mod tests {
         // Empty block + base_fee = 1 → 1/8 rounds to 0, stays at 1.
         let base = calc_next_block_base_fee(0, 30_000_000, 1);
         assert_eq!(base, 1);
+    }
+
+    #[test]
+    fn base_fee_unchanged_for_zero_gas_limit() {
+        // gas_limit = 0 (e.g. genesis parent) → must not panic, no adjustment
+        assert_eq!(calc_next_block_base_fee(0, 0, 1_000_000_000), 1_000_000_000);
+        // nonzero gas_used with zero gas_limit → also must not panic
+        assert_eq!(calc_next_block_base_fee(1_000_000, 0, 1_000_000_000), 1_000_000_000);
+        // gas_limit = 1 → gas_target = 0 via integer division, same guard
+        assert_eq!(calc_next_block_base_fee(0, 1, 1_000_000_000), 1_000_000_000);
     }
 
     #[test]
