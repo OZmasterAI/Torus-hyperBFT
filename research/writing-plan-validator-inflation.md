@@ -1,8 +1,8 @@
-# Writing Plan: Validator Staking Inflation
+# Writing Plan: Validator Staking Inflation + Epoch Boundary Wiring
 
 **Spec:** [tech-req-validator-inflation.md](./tech-req-validator-inflation.md)
 **Date:** 2026-04-15
-**Estimated scope:** ~250 lines new code + ~150 lines tests
+**Estimated scope:** ~350 lines new code + ~200 lines tests
 
 ---
 
@@ -52,7 +52,7 @@ Uses `U256` bit shift (`>> 1`, `<< n`) and division. Need to verify
 
 **File:** `crates/torus-economics/src/rewards.rs`
 
-Add to `FeeSplitter` impl (or as standalone functions near it):
+Add as standalone functions near the existing `SupplyTracker` helpers:
 
 ```rust
 const VALIDATOR_INFLATION_KEY: &[u8] = b"validator_inflation_tracker";
@@ -103,7 +103,7 @@ Logic:
 **Reuse:** The per-validator commission + delegator distribution follows
 the exact same pattern as `FeeSplitter::distribute_validator_rewards()`
 (line 245). Consider extracting a shared helper, or just duplicate the
-pattern (it's ~30 lines and the two callers have different outer loops).
+pattern (~30 lines, two callers have different outer loops).
 
 **Tests to add:**
 - `validator_inflation_single_validator`
@@ -118,46 +118,155 @@ pattern (it's ~30 lines and the two callers have different outer loops).
 
 ---
 
-## Step 5: Export from lib.rs
-
-**File:** `crates/torus-economics/src/lib.rs`
-
-No change needed -- `RewardDistributor` is already re-exported (line 27).
-The new function is a method on `RewardDistributor`, so it's automatically
-accessible. Just verify.
-
-**Verify:** `cargo check -p torus-bridge`
-
----
-
-## Step 6: Wire into epoch boundary (native_executor.rs)
+## Step 5: EpochBoundaryResult type (native_executor.rs)
 
 **File:** `crates/torus-bridge/src/native_executor.rs`
 
-In `process_epoch_boundary()` (line 1094), after the existing
-`compute_new_validator_set` call, add:
+Add a new return type near `NativeActionResult`:
 
 ```rust
-// Distribute validator inflation rewards.
-if let Err(e) = RewardDistributor::distribute_validator_inflation(
-    &ctx.staking,
-    ctx.epoch_length,
-) {
-    tracing::error!(%e, "validator inflation distribution failed");
+pub struct EpochBoundaryResult {
+    pub action: NativeActionResult,
+    pub new_set: Option<ValidatorSet>,
+    pub diff: Option<ValidatorSetDiff>,
 }
 ```
 
-This is inside the `is_epoch_boundary` guard, so it only runs at
-epoch boundaries. Both `proposer.rs` (line 221) and `validator.rs`
-(line 274) call `process_epoch_boundary()`, so both paths get the
-new logic automatically -- no changes needed in proposer.rs or
-validator.rs.
+Will need to import `ValidatorSet` from `torus_types` and
+`ValidatorSetDiff` from `torus_economics::epoch`.
 
 **Verify:** `cargo check -p torus-bridge`
 
 ---
 
-## Step 7: Full test pass
+## Step 6: Rewrite process_epoch_boundary (native_executor.rs)
+
+**File:** `crates/torus-bridge/src/native_executor.rs`
+
+Replace the current `process_epoch_boundary()` (lines 1094-1107) with
+the full 10-step flow from the tech requirements Section 3.1.
+
+Current (hollow):
+```rust
+pub fn process_epoch_boundary(ctx: &mut NativeExecContext) -> Option<NativeActionResult> {
+    if !EpochManager::is_epoch_boundary(...) { return None; }
+    match EpochManager::compute_new_validator_set(...) {
+        Ok(_new_set) => Some(NativeActionResult::ok(...)),
+        Err(e) => Some(NativeActionResult::err(...)),
+    }
+}
+```
+
+New:
+```rust
+pub fn process_epoch_boundary(ctx: &mut NativeExecContext) -> Option<EpochBoundaryResult> {
+    if !EpochManager::is_epoch_boundary(ctx.block_height, ctx.epoch_length) {
+        return None;
+    }
+
+    // --- Phase A: Reward distribution (current active set) ---
+
+    // A1: Permanent staking rewards (existing function, newly wired)
+    if let Err(e) = RewardDistributor::distribute_permanent_staking_rewards(
+        &ctx.staking, ctx.epoch_length,
+    ) {
+        tracing::error!(%e, "permanent staking rewards failed");
+    }
+
+    // A2: Validator inflation rewards (NEW)
+    if let Err(e) = RewardDistributor::distribute_validator_inflation(
+        &ctx.staking, ctx.epoch_length,
+    ) {
+        tracing::error!(%e, "validator inflation distribution failed");
+    }
+
+    // --- Phase B: Validator set rotation ---
+
+    // B1: Build old set from current Active validators
+    let old_set = build_current_validator_set(&ctx.staking, ctx.epoch);
+
+    // B2: Compute new set (existing call -- now use the result)
+    let new_set = match EpochManager::compute_new_validator_set(
+        &ctx.staking, ctx.max_validators, ctx.epoch + 1,
+    ) {
+        Ok(set) => set,
+        Err(e) => return Some(EpochBoundaryResult {
+            action: NativeActionResult::err("epoch_rotation", e.to_string()),
+            new_set: None, diff: None,
+        }),
+    };
+
+    // B3: Apply rotation cap
+    let cap = EpochManager::safe_rotation_cap(old_set.validators.len());
+    let new_set = EpochManager::apply_rotation_cap(&old_set, new_set, cap);
+
+    // B4: Check minimum set
+    if let Err(e) = EpochManager::check_minimum_set(&new_set) {
+        tracing::error!(%e, "validator set below minimum");
+    }
+
+    // B5: Compute diff
+    let diff = EpochManager::compute_validator_set_diff(&old_set, &new_set);
+
+    // B6: Update statuses
+    if let Err(e) = EpochManager::update_validator_statuses(&ctx.staking, &new_set) {
+        tracing::error!(%e, "validator status update failed");
+    }
+
+    // B7: Log
+    EpochManager::log_rotation(&old_set, &new_set, &diff, ctx.epoch + 1);
+
+    Some(EpochBoundaryResult {
+        action: NativeActionResult::ok("epoch_boundary", 5000),
+        new_set: Some(new_set),
+        diff: Some(diff),
+    })
+}
+```
+
+**Helper needed:** `build_current_validator_set(staking, epoch) -> ValidatorSet`
+-- reads `all_validators()`, filters `status == Active`, converts to
+`ValidatorSet` format. ~15 lines.
+
+**Verify:** `cargo check -p torus-bridge`
+
+---
+
+## Step 7: Update callers (proposer.rs + validator.rs)
+
+**Files:**
+- `crates/torus-bridge/src/proposer.rs` (line 221)
+- `crates/torus-bridge/src/validator.rs` (line 274)
+
+Both currently do:
+```rust
+NativeExecutor::process_epoch_boundary(&mut ctx);
+```
+
+Update to handle new return type. For now, log the diff but don't
+apply to hotstuff_rs (that integration is out of scope):
+
+```rust
+if let Some(epoch_result) = NativeExecutor::process_epoch_boundary(&mut ctx) {
+    if let Some(ref diff) = epoch_result.diff {
+        if !diff.is_empty() {
+            tracing::info!(
+                inserts = diff.inserts.len(),
+                deletes = diff.deletes.len(),
+                "epoch boundary: validator set changed"
+            );
+        }
+    }
+}
+```
+
+Both files get identical code -- deterministic.
+
+**Verify:** `cargo check -p torus-bridge`
+
+---
+
+## Step 8: Full test pass
 
 Run all tests to check for regressions:
 
@@ -167,9 +276,14 @@ cargo test -p torus-bridge
 cargo test -p torus-integration-tests
 ```
 
+Pay special attention to:
+- Existing `epoch_boundary_*` tests in `torus-bridge/tests/native_bridge_tests.rs`
+- Existing `process_epoch_boundary` tests in `torus-integration-tests/tests/chaos.rs`
+- Any tests that match on the old `Option<NativeActionResult>` return type
+
 ---
 
-## Step 8: Update tech requirements doc
+## Step 9: Update tech requirements doc
 
 **File:** `research/technical-requirements.md`
 
@@ -182,15 +296,19 @@ to the new Section 11.5 spec.
 ## Dependency chain
 
 ```
-Step 1 (constants) ─┐
-                     ├── Step 4 (core function) ── Step 6 (wire) ── Step 7 (tests)
-Step 2 (isqrt) ─────┤
-Step 3 (tracker) ────┘
-                                                                     Step 8 (doc update)
+Step 1 (constants) ─────┐
+Step 2 (isqrt) ──────────┼── Step 4 (inflation fn) ──┐
+Step 3 (tracker) ────────┘                            │
+                                                      │
+Step 5 (result type) ─── Step 6 (rewrite epoch) ─────┼── Step 8 (tests)
+                              │                       │
+                         Step 7 (callers) ────────────┘
+                                                           Step 9 (doc)
 ```
 
-Steps 1, 2, 3 are independent and can be done in any order.
-Step 4 depends on all three.
-Step 6 depends on step 4.
-Step 7 is the final verification.
-Step 8 is a doc-only change, independent.
+Steps 1, 2, 3, 5 are independent -- can be done in any order.
+Step 4 depends on 1+2+3.
+Step 6 depends on 4+5.
+Step 7 depends on 6.
+Step 8 is the final verification after everything compiles.
+Step 9 is a doc-only change, independent.

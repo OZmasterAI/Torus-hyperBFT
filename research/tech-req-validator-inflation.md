@@ -199,23 +199,90 @@ existing fee distribution model (Section 11.2).
 
 ### 3.1 Call Site
 
-**Current state of `process_epoch_boundary()`:** Only calls
-`compute_new_validator_set()` and discards the result (`_new_set`).
-No reward distribution, no status updates, no rotation cap.
-`distribute_permanent_staking_rewards()` and `update_validator_statuses()`
-exist in torus-economics but are NOT wired into the bridge layer.
-Full epoch boundary wiring is a **separate plan**.
+**Current state of `process_epoch_boundary()` (`native_executor.rs:1094`):**
+Only calls `compute_new_validator_set()` and discards the result (`_new_set`).
+No reward distribution, no status updates, no rotation cap. The following
+functions exist in torus-economics, are built and tested, but NOT wired
+into the bridge layer:
 
-This task adds `distribute_validator_inflation()` to `process_epoch_boundary()`:
+- `EpochManager::apply_rotation_cap(old, new, max)` -- epoch.rs:148
+- `EpochManager::check_minimum_set(set)` -- epoch.rs:275
+- `EpochManager::update_validator_statuses(staking, set)` -- epoch.rs:299
+- `EpochManager::compute_validator_set_diff(old, new)` -- epoch.rs:86
+- `EpochManager::log_rotation(old, new, diff, epoch)` -- epoch.rs:220
+- `RewardDistributor::distribute_permanent_staking_rewards(staking, blocks)` -- rewards.rs:129
+
+**This task wires all of these** plus adds the new validator inflation
+distribution. The full epoch boundary flow becomes:
 
 ```
 process_epoch_boundary(ctx):
-    1. compute_new_validator_set()        // existing (result currently discarded)
-    2. distribute_validator_inflation()   // NEW — this task
+    // --- Reward distribution (uses CURRENT active set) ---
+    1. distribute_permanent_staking_rewards(staking, epoch_length)  // WIRE existing
+    2. distribute_validator_inflation(staking, epoch_length)         // NEW
+
+    // --- Validator set rotation ---
+    3. old_set = read current active validators as ValidatorSet
+    4. new_set = compute_new_validator_set(staking, max_validators, epoch+1)  // existing call
+    5. new_set = apply_rotation_cap(old_set, new_set, safe_rotation_cap(old_set.len()))  // WIRE
+    6. check_minimum_set(new_set)?                                  // WIRE
+    7. diff = compute_validator_set_diff(old_set, new_set)          // WIRE
+    8. update_validator_statuses(staking, new_set)                  // WIRE
+    9. log_rotation(old_set, new_set, diff, epoch)                  // WIRE
+    10. return (new_set, diff) for hotstuff_rs validator set updates
 ```
 
-The new function must appear in both `proposer.rs` and `validator.rs`
-at the same position to maintain deterministic state roots.
+**Ordering rationale:**
+- Steps 1-2 BEFORE rotation: rewards are for the epoch that just ended,
+  so they use the current active set. A validator being rotated out still
+  gets this epoch's rewards.
+- Steps 3-10 are the rotation: compute new set, cap changes, update statuses.
+
+**Step 3 — reading the old set:** `NativeExecContext` does not currently
+store the previous `ValidatorSet`. Two approaches:
+- **(A)** Build it from `staking.all_validators()` filtered by `status == Active`,
+  converting to `ValidatorSet` format. This works because `update_validator_statuses`
+  marks Active/Candidate each epoch.
+- **(B)** Persist the current `ValidatorSet` in a CF key and read it back.
+
+Recommend **(A)** — no new storage, and `all_validators()` is already called
+by `compute_new_validator_set()` internally.
+
+**Step 10 — return value:** Currently `process_epoch_boundary()` returns
+`Option<NativeActionResult>`. It needs to return the diff/new set so the
+consensus layer can apply `ValidatorSetUpdates` to hotstuff_rs. This
+requires changing the return type — see Section 3.4.
+
+### 3.2 Proposer-Validator Determinism
+
+Both `proposer.rs` (line 221) and `validator.rs` (line 274) call
+`process_epoch_boundary()`. All new logic goes inside that function,
+so both paths execute identically. No changes to proposer.rs or
+validator.rs needed for the epoch logic itself.
+
+### 3.3 Return Type Change
+
+Current signature:
+```rust
+pub fn process_epoch_boundary(ctx: &mut NativeExecContext) -> Option<NativeActionResult>
+```
+
+New signature must return the validator set diff for hotstuff_rs:
+```rust
+pub fn process_epoch_boundary(ctx: &mut NativeExecContext) -> Option<EpochBoundaryResult>
+
+pub struct EpochBoundaryResult {
+    pub action: NativeActionResult,
+    pub new_set: Option<ValidatorSet>,
+    pub diff: Option<ValidatorSetDiff>,
+}
+```
+
+Callers in `proposer.rs` and `validator.rs` must be updated to handle
+the new return type and apply the validator set updates. If hotstuff_rs
+integration is not ready, the diff can be logged and discarded initially.
+
+### 3.4 Edge Cases
 
 ### 3.2 Proposer-Validator Determinism
 
@@ -223,16 +290,19 @@ Both `proposer.rs` and `validator.rs` must call the same function in
 the same position within block processing. This is critical -- any
 divergence causes `StateRootMismatch` (ref: audit finding 3.4.3).
 
-### 3.3 Edge Cases
+### 3.5 Edge Cases
 
 | Condition | Behavior |
 |---|---|
-| No active validators | Skip -- no emission, no mint |
-| Total active stake = 0 | Skip -- division by zero guard |
+| No active validators | Skip rewards, skip rotation |
+| Total active stake = 0 | Skip rewards -- division by zero guard |
 | Single validator, no delegators | Entire emission to validator (via zero-delegators guard, regardless of commission rate) |
 | Validator has 0% commission | Entire emission to delegator pool |
 | Validator has 100% commission | Entire emission to validator |
 | Epoch length = 0 | Skip -- epoch_fraction = 0 |
+| Rotation cap exceeded | `apply_rotation_cap` defers excess changes to next epoch |
+| New set below minimum (4) | `check_minimum_set` warns but does not block (dev/test mode) |
+| No permanent stakers | `distribute_permanent_staking_rewards` returns zero, no-op |
 
 ---
 
@@ -338,12 +408,12 @@ This must be updated to:
 | `torus-economics/src/types.rs` | Add `VALIDATOR_INFLATION_CONSTANT`, `SECONDS_PER_YEAR` | Small |
 | `torus-economics/src/rewards.rs` | Add `distribute_validator_inflation()` + `isqrt()` | Medium |
 | `torus-economics/src/rewards.rs` | Add validator inflation tracker (separate CF_TREASURY key) | Small |
-| `torus-bridge/src/native_executor.rs` | Wire into `process_epoch_boundary()` | Small |
-| `torus-bridge/src/proposer.rs` | Ensure epoch boundary calls match validator path | Small |
-| `torus-bridge/src/validator.rs` | Ensure epoch boundary calls match proposer path | Small |
+| `torus-bridge/src/native_executor.rs` | Rewrite `process_epoch_boundary()` with full flow (10 steps), add `EpochBoundaryResult` struct | Medium |
+| `torus-bridge/src/proposer.rs` | Handle new `EpochBoundaryResult` return type | Small |
+| `torus-bridge/src/validator.rs` | Handle new `EpochBoundaryResult` return type | Small |
 
-**Not modified:** `staking.rs` (existing `credit_rewards`, `get_validator`,
-`delegations_for_validator` are sufficient), `governance.rs`, `epoch.rs`,
+**Not modified:** `staking.rs` (existing functions are sufficient),
+`governance.rs`, `epoch.rs` (all functions already built — only wiring needed),
 `ValidatorState` struct.
 
 ---
@@ -370,9 +440,13 @@ This must be updated to:
 | Test | Verifies |
 |---|---|
 | `epoch_boundary_distributes_inflation` | Full epoch boundary flow mints and distributes correctly |
-| `proposer_validator_state_root_match` | Both paths produce identical state after inflation distribution |
+| `epoch_boundary_distributes_permanent_rewards` | Permanent staking rewards are distributed at epoch boundary |
+| `epoch_boundary_rotates_validators` | Validator set rotation applies, statuses updated |
+| `epoch_boundary_rotation_cap` | Excess validator changes deferred to next epoch |
+| `proposer_validator_state_root_match` | Both paths produce identical state after full epoch boundary |
 | `inflation_rewards_claimable` | Distributed rewards appear in `get_pending_rewards` and can be claimed |
 | `inflation_does_not_change_delegation_amounts` | Delegation amounts and validator power unchanged after distribution |
+| `epoch_boundary_returns_diff` | `EpochBoundaryResult` contains correct inserts/deletes for hotstuff_rs |
 
 ---
 
@@ -383,8 +457,9 @@ This must be updated to:
 - Emission cap / max epoch emission (not needed -- sqrt curve is self-limiting)
 - Interaction with slashing (slashed validators are jailed, excluded from active set, no rewards)
 - EVM precompile for querying inflation APY (future RPC addition)
-- **Full epoch boundary wiring** (separate plan): applying computed validator
-  sets, rotation cap, status updates, permanent staking reward distribution.
-  These are built and tested in torus-economics but not wired into the
-  bridge layer. This task only adds the new `distribute_validator_inflation()`
-  call to the existing `process_epoch_boundary()` function.
+- **Oracle aggregation and liquidation wiring** (separate plan): `aggregate_oracle_prices()`
+  and `run_liquidation_checks()` are defined in native_executor.rs but not called from
+  proposer/validator paths. Trading engine concerns -- unrelated to epoch economics.
+- **hotstuff_rs ValidatorSetUpdates integration**: The epoch boundary will return
+  the diff, but actually applying it to the hotstuff_rs consensus layer may require
+  additional work depending on the consensus integration state.
