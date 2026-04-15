@@ -4,3 +4,6 @@ Cargo.lock
 *.swo
 *~
 .DS_Store
+.claude-state.json
+LIVE_STATE.json
+.git-backup/
