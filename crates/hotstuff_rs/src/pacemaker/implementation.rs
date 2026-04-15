@@ -774,15 +774,24 @@ pub fn select_leader(view: ViewNumber, validator_set: &ValidatorSet) -> Verifyin
     let p_total = validator_set.total_power();
     // Total number of validators.
     let n = validator_set.len();
+
+    assert!(
+        n > 0 && p_total.int() > 0,
+        "select_leader: validator set must be non-empty with nonzero total power \
+         (n={n}, total_power={})",
+        p_total.int()
+    );
+
     // Index in the abstract array.
     let index = view.int() % (p_total.int() as u64);
     // Max. power among the validators.
+    // Safety: n > 0 asserted above, so max() always returns Some.
     let p_max = validator_set
         .validators_and_powers()
         .iter()
         .map(|(_, power)| power.int())
         .max()
-        .expect("The validator set cannot be empty!")
+        .unwrap()
         .clone();
 
     let mut counter = 0;

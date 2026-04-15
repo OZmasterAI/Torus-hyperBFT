@@ -569,7 +569,7 @@ impl BlockSyncClientState {
         while self
             .blacklist
             .front()
-            .is_some_and(|(_, expiry)| expiry >= &now)
+            .is_some_and(|(_, expiry)| expiry <= &now)
         {
             let _ = self.blacklist.pop_front();
         }
