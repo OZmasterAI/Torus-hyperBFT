@@ -52,8 +52,8 @@ pub fn compute_native_state_root(
     state_db: &StateDb,
 ) -> Result<B256, torus_state::error::StateError> {
     use torus_state::cf::{
-        CF_NATIVE_BALANCES, CF_NATIVE_ORACLE, CF_NATIVE_POSITIONS, CF_STAKING_DELEGATIONS,
-        CF_STAKING_VALIDATORS,
+        CF_NATIVE_BALANCES, CF_NATIVE_ORDER_BOOKS, CF_NATIVE_ORACLE, CF_NATIVE_POSITIONS,
+        CF_STAKING_DELEGATIONS, CF_STAKING_VALIDATORS,
     };
 
     let db = state_db.inner();
@@ -62,6 +62,7 @@ pub fn compute_native_state_root(
     // Hash each native CF's contents in deterministic order.
     for cf_name in &[
         CF_NATIVE_BALANCES,
+        CF_NATIVE_ORDER_BOOKS,
         CF_NATIVE_POSITIONS,
         CF_NATIVE_ORACLE,
         CF_STAKING_DELEGATIONS,

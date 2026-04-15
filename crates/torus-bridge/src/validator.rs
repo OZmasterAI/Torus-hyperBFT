@@ -273,6 +273,9 @@ impl BlockValidator {
         // Phase 9: Epoch boundary check.
         NativeExecutor::process_epoch_boundary(&mut ctx);
 
+        // FIX ECON-FIND-02: Persist order book state after block execution.
+        ctx.save_order_books();
+
         // FIX ECON-FIND-03: Persist consumed nonces for replay protection.
         for (sender, nonce) in &consumed_nonces {
             let mut nonce_key = [0u8; 28];
