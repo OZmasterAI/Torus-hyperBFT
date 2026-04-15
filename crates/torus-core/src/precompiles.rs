@@ -476,8 +476,8 @@ fn read_markets(state_db: &StateDb) -> Result<Vec<u8>, CoreError> {
 // OracleReader (0x0802) — tasks 2.4.2
 // ============================================================================
 
-/// Max oracle age in blocks before price is considered stale.
-const DEFAULT_MAX_ORACLE_AGE: u64 = 100;
+// FIX MED-NEW-13: Use shared constant from oracle module.
+use crate::oracle::DEFAULT_MAX_ORACLE_AGE;
 
 fn oracle_reader(
     input: &[u8],
@@ -673,17 +673,13 @@ fn read_validators(state_db: &StateDb) -> Result<Vec<u8>, CoreError> {
         if key.len() != 20 {
             continue;
         }
-        // ValidatorState borsh: address(20) + pubkey(32) + commission_bps(u16 LE) + self_stake(U256 32 BE) + total_delegated(U256 32 BE) + ...
-        if value.len() >= 118 {
-            let addr = Address::from_slice(&value[..20]);
-            let commission_bps = u16::from_le_bytes([value[52], value[53]]);
-            let self_stake = U256::from_be_slice(&value[54..86]);
-            let total_delegated = U256::from_be_slice(&value[86..118]);
-            let total = self_stake + total_delegated;
-
-            validators.push(abi::encode_address(&addr));
+        // FIX MED-NEW-14: Use Borsh deserialization instead of fragile byte-offset parsing.
+        // Manual offsets silently break if ValidatorState fields are added/reordered.
+        if let Ok(vs) = torus_economics::types::ValidatorState::try_from_slice(&value) {
+            let total = vs.self_stake + vs.total_delegated;
+            validators.push(abi::encode_address(&vs.address));
             stakes.push(abi::encode_u128(u256_to_u128_saturating(total)));
-            commissions.push(abi::encode_u128(commission_bps as u128));
+            commissions.push(abi::encode_u128(vs.commission_bps as u128));
         }
     }
 

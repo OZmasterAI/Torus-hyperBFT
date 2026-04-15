@@ -4,9 +4,10 @@ use std::sync::atomic::Ordering::{self, Relaxed};
 
 use alloy_primitives::keccak256;
 use borsh::BorshDeserialize;
-use jsonrpsee::core::{async_trait, RpcResult};
+use jsonrpsee::core::{async_trait, RpcResult, SubscriptionResult};
 use jsonrpsee::proc_macros::rpc;
 use jsonrpsee::types::ErrorObjectOwned;
+use jsonrpsee::PendingSubscriptionSink;
 use rocksdb::IteratorMode;
 
 use torus_core::oracle::{OracleConfig, OracleManager};
@@ -128,6 +129,28 @@ pub trait TorusApi {
     // --- Block body (native actions for explorer indexing) ---
     #[method(name = "getBlockBody")]
     async fn get_block_body(&self, block_number: u64) -> RpcResult<Option<RpcBlockBody>>;
+
+    // --- Phase 7B: All trades in a single block (for explorer indexer) ---
+    #[method(name = "getBlockTrades")]
+    async fn get_block_trades(&self, block_number: u64) -> RpcResult<Vec<RpcTrade>>;
+
+    // --- Phase 7B: Time-range trade query (forward, inclusive) ---
+    #[method(name = "getTradeHistoryRange")]
+    async fn get_trade_history_range(
+        &self,
+        market_id: String,
+        from_block: String,
+        to_block: String,
+        limit: Option<u64>,
+    ) -> RpcResult<Vec<RpcTrade>>;
+
+    // --- Phase 7B: Trade streaming subscription ---
+    #[subscription(name = "subscribe" => "subscription", unsubscribe = "unsubscribe", item = serde_json::Value)]
+    async fn subscribe(
+        &self,
+        sub_type: String,
+        params: Option<serde_json::Value>,
+    ) -> SubscriptionResult;
 }
 
 // ============================================================================
@@ -720,6 +743,209 @@ impl TorusApiServer for RpcState {
             native_actions,
             native_action_count: body.native_actions.len() as u32,
         }))
+    }
+
+    // === Phase 7B: All trades in a single block ===
+
+    async fn get_block_trades(&self, block_number: u64) -> RpcResult<Vec<RpcTrade>> {
+        let trades_json = crate::scan_trades_for_block(&self.state, block_number);
+        let mut trades = Vec::with_capacity(trades_json.len());
+        for t in trades_json {
+            trades.push(RpcTrade {
+                trade_id: t
+                    .get("tradeId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("0x0")
+                    .to_string(),
+                market_id: t
+                    .get("marketId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("0x0")
+                    .to_string(),
+                price: t
+                    .get("price")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("0x0")
+                    .to_string(),
+                quantity: t
+                    .get("quantity")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("0x0")
+                    .to_string(),
+                side: t
+                    .get("side")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("buy")
+                    .to_string(),
+                block_number: t
+                    .get("blockNumber")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("0x0")
+                    .to_string(),
+                timestamp: t
+                    .get("timestamp")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("0x0")
+                    .to_string(),
+            });
+        }
+        Ok(trades)
+    }
+
+    // === Phase 7B: Time-range trade query ===
+
+    async fn get_trade_history_range(
+        &self,
+        market_id: String,
+        from_block: String,
+        to_block: String,
+        limit: Option<u64>,
+    ) -> RpcResult<Vec<RpcTrade>> {
+        let mid = parse_u64(&market_id).map_err(ErrorObjectOwned::from)?;
+        let from = parse_u64(&from_block).map_err(ErrorObjectOwned::from)?;
+        let to = parse_u64(&to_block).map_err(ErrorObjectOwned::from)?;
+        let limit = limit.unwrap_or(1000).min(5000) as usize;
+
+        let db = self.state.inner();
+        let cf = match db.cf_handle(CF_NATIVE_TRADES) {
+            Some(cf) => cf,
+            None => return Ok(vec![]),
+        };
+
+        // Build start key: market_id(8) + from_block(8) + 0x00000000
+        let mut start_key = [0u8; 20];
+        start_key[..8].copy_from_slice(&mid.to_be_bytes());
+        start_key[8..16].copy_from_slice(&from.to_be_bytes());
+
+        // Build end key: market_id(8) + (to_block+1)(8)
+        let end_block = to.saturating_add(1);
+        let mut end_prefix = [0u8; 16];
+        end_prefix[..8].copy_from_slice(&mid.to_be_bytes());
+        end_prefix[8..16].copy_from_slice(&end_block.to_be_bytes());
+
+        let iter = db.iterator_cf(
+            cf,
+            rocksdb::IteratorMode::From(&start_key, rocksdb::Direction::Forward),
+        );
+        let mut trades = Vec::with_capacity(limit.min(256));
+
+        for item in iter {
+            let (key, value) = item
+                .map_err(|e| RpcError::Internal(format!("rocksdb: {e}")))
+                .map_err(ErrorObjectOwned::from)?;
+
+            // Stop if we've left this market or past the end block
+            if key.len() < 16 || key[..8] != mid.to_be_bytes() {
+                break;
+            }
+            if key[..16] >= end_prefix[..] {
+                break;
+            }
+
+            let trade = StoredTrade::try_from_slice(&value)
+                .map_err(|e| RpcError::Internal(format!("borsh decode trade: {e}")))
+                .map_err(ErrorObjectOwned::from)?;
+
+            trades.push(RpcTrade {
+                trade_id: hex_u128(trade.trade_id),
+                market_id: market_id.clone(),
+                price: hex_fp(FixedPoint::from_raw(trade.price_raw)),
+                quantity: hex_fp(FixedPoint::from_raw(trade.quantity_raw)),
+                side: if trade.side == 0 {
+                    "buy".to_string()
+                } else {
+                    "sell".to_string()
+                },
+                block_number: hex_u64(trade.block_number),
+                timestamp: hex_u64(trade.timestamp),
+            });
+
+            if trades.len() >= limit {
+                break;
+            }
+        }
+
+        Ok(trades)
+    }
+
+    // === Phase 7B: Trade streaming subscription ===
+
+    async fn subscribe(
+        &self,
+        pending: PendingSubscriptionSink,
+        sub_type: String,
+        params: Option<serde_json::Value>,
+    ) -> SubscriptionResult {
+        const MAX_SUBSCRIPTIONS: usize = 1000;
+
+        let count = self.active_subscriptions.load(Relaxed);
+        if count >= MAX_SUBSCRIPTIONS {
+            pending
+                .reject(ErrorObjectOwned::owned(
+                    -32000,
+                    "subscription limit reached",
+                    None::<()>,
+                ))
+                .await;
+            return Ok(());
+        }
+        self.active_subscriptions.fetch_add(1, Relaxed);
+
+        let sink = pending.accept().await?;
+        let subs = self.active_subscriptions.clone();
+
+        match sub_type.as_str() {
+            "newTrades" => {
+                // Optional marketId filter from params
+                let market_filter: Option<String> = params
+                    .as_ref()
+                    .and_then(|p| p.get("marketId"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_lowercase());
+
+                let mut rx = self.notifier.new_trades.subscribe();
+                tokio::spawn(async move {
+                    while let Ok(trades) = rx.recv().await {
+                        for trade in &trades {
+                            // Apply marketId filter if specified
+                            let should_send = match &market_filter {
+                                Some(filter) => trade
+                                    .get("marketId")
+                                    .and_then(|v| v.as_str())
+                                    .map(|m| m.to_lowercase() == *filter)
+                                    .unwrap_or(true),
+                                None => true,
+                            };
+                            if should_send {
+                                match jsonrpsee::SubscriptionMessage::new(
+                                    "torus_subscription",
+                                    sink.subscription_id(),
+                                    trade,
+                                ) {
+                                    Ok(msg) => {
+                                        if sink.send(msg).await.is_err() {
+                                            subs.fetch_sub(1, Relaxed);
+                                            return;
+                                        }
+                                    }
+                                    Err(_) => {
+                                        subs.fetch_sub(1, Relaxed);
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    subs.fetch_sub(1, Relaxed);
+                });
+            }
+            _ => {
+                subs.fetch_sub(1, Relaxed);
+                tracing::warn!("unknown torus subscription kind: {sub_type}");
+            }
+        }
+
+        Ok(())
     }
 }
 

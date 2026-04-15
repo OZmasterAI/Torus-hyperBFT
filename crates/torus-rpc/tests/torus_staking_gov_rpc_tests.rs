@@ -474,6 +474,14 @@ async fn torus_get_proposals_by_status_and_all() {
 #[tokio::test]
 async fn torus_get_governance_params() {
     let (_dir, state, mempool, executor) = setup();
+
+    // FIX MED-NEW-15: Governance params must be initialized before querying.
+    let gov = GovernanceManager::new(state.clone());
+    gov.set_governance_params(
+        &torus_economics::governance::GovernanceParams::defaults(Address::ZERO),
+    )
+    .unwrap();
+
     let (handle, saddr) = start_server(state, mempool, executor).await;
     let client = HttpClientBuilder::default()
         .build(format!("http://{saddr}"))
@@ -484,7 +492,6 @@ async fn torus_get_governance_params() {
         .await
         .unwrap();
 
-    // Defaults should be returned.
     assert!(!result.voting_period_blocks.is_empty());
     assert!(!result.quorum_bps.is_empty());
     assert!(!result.min_proposal_stake.is_empty());

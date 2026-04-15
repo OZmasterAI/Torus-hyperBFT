@@ -111,6 +111,19 @@ impl Indexer {
             }
         }
 
+        // Index trades into OHLCV candles (Phase 7B)
+        if let Ok(trades) = self.rpc.get_block_trades(height).await {
+            for t in &trades {
+                let market_id = val_hex_i64(t, "marketId");
+                let timestamp = val_hex_i64(t, "timestamp");
+                let price_raw = parse_hex_i128(val_str(t, "price").as_str()) as i64;
+                let qty_raw = parse_hex_i128(val_str(t, "quantity").as_str()) as i64;
+                if let Err(e) = self.db.upsert_candle(market_id, timestamp, price_raw, qty_raw) {
+                    warn!("Failed to upsert candle at height {height}: {e}");
+                }
+            }
+        }
+
         // Snapshot validators every 100 blocks
         if height % 100 == 0 {
             if let Err(e) = self.snapshot_validators(h).await {
@@ -298,6 +311,11 @@ pub fn parse_native_action_row(
         proposal_id: extract_i64(&action_type, inner_ref, "proposal_id", &["Vote"]),
         payload: serde_json::to_string(action).unwrap_or_default(),
     }
+}
+
+fn parse_hex_i128(s: &str) -> i128 {
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    i128::from_str_radix(s, 16).unwrap_or(0)
 }
 
 fn extract_i64(at: &str, inner: Option<&Value>, field: &str, types: &[&str]) -> Option<i64> {

@@ -99,6 +99,20 @@ CREATE INDEX IF NOT EXISTS idx_na_target    ON native_actions(target);
 
 CREATE INDEX IF NOT EXISTS idx_vs_address ON validator_snapshots(address);
 CREATE INDEX IF NOT EXISTS idx_vs_block   ON validator_snapshots(block_height);
+
+CREATE TABLE IF NOT EXISTS candles (
+    market_id   INTEGER NOT NULL,
+    interval    TEXT NOT NULL,
+    open_time   INTEGER NOT NULL,
+    open        INTEGER NOT NULL,
+    high        INTEGER NOT NULL,
+    low         INTEGER NOT NULL,
+    close       INTEGER NOT NULL,
+    volume      INTEGER NOT NULL,
+    trade_count INTEGER NOT NULL,
+    PRIMARY KEY (market_id, interval, open_time)
+);
+CREATE INDEX IF NOT EXISTS idx_candles_market_interval ON candles(market_id, interval, open_time);
 ";
 
 // ============================================================================
@@ -175,6 +189,19 @@ pub struct ValidatorSnapshotRow {
     pub power: i64,
     pub commission_bps: i32,
     pub status: String,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct CandleRow {
+    pub market_id: i64,
+    pub interval: String,
+    pub open_time: i64,
+    pub open: i64,
+    pub high: i64,
+    pub low: i64,
+    pub close: i64,
+    pub volume: i64,
+    pub trade_count: i64,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -319,6 +346,98 @@ impl ExplorerDb {
             params![v.block_height, v.address, v.pubkey, v.power, v.commission_bps, v.status],
         )?;
         Ok(())
+    }
+
+    /// Upsert a single trade into candle(s) across all intervals.
+    /// `price_raw` and `qty_raw` are FixedPoint raw i128 values (8 decimal places).
+    pub fn upsert_candle(
+        &self,
+        market_id: i64,
+        timestamp: i64,
+        price_raw: i64,
+        qty_raw: i64,
+    ) -> Result<(), rusqlite::Error> {
+        const INTERVALS: &[(&str, i64)] = &[
+            ("1m", 60),
+            ("5m", 300),
+            ("15m", 900),
+            ("1h", 3600),
+        ];
+        let conn = self.conn.lock().unwrap();
+        for &(interval, secs) in INTERVALS {
+            let open_time = (timestamp / secs) * secs;
+            conn.execute(
+                "INSERT INTO candles (market_id, interval, open_time, open, high, low, close, volume, trade_count)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1)
+                 ON CONFLICT(market_id, interval, open_time) DO UPDATE SET
+                     high = MAX(candles.high, excluded.high),
+                     low = MIN(candles.low, excluded.low),
+                     close = excluded.close,
+                     volume = candles.volume + excluded.volume,
+                     trade_count = candles.trade_count + 1",
+                params![market_id, interval, open_time, price_raw, price_raw, price_raw, price_raw, qty_raw.abs()],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Query candles for a market and interval within a time range.
+    pub fn get_candles(
+        &self,
+        market_id: i64,
+        interval: &str,
+        from: Option<i64>,
+        to: Option<i64>,
+        limit: u32,
+    ) -> Result<Vec<CandleRow>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut sql = String::from(
+            "SELECT market_id, interval, open_time, open, high, low, close, volume, trade_count
+             FROM candles WHERE market_id = ?1 AND interval = ?2",
+        );
+        let mut bind_idx = 3;
+        if from.is_some() {
+            sql.push_str(&format!(" AND open_time >= ?{bind_idx}"));
+            bind_idx += 1;
+        }
+        if to.is_some() {
+            sql.push_str(&format!(" AND open_time <= ?{bind_idx}"));
+        }
+        sql.push_str(" ORDER BY open_time ASC LIMIT ?99");
+
+        let mut stmt = conn.prepare(&sql)?;
+
+        // Bind parameters dynamically
+        let mut idx = 1;
+        stmt.raw_bind_parameter(idx, market_id)?;
+        idx += 1;
+        stmt.raw_bind_parameter(idx, interval)?;
+        idx += 1;
+        if let Some(f) = from {
+            stmt.raw_bind_parameter(idx, f)?;
+            idx += 1;
+        }
+        if let Some(t) = to {
+            stmt.raw_bind_parameter(idx, t)?;
+        }
+        stmt.raw_bind_parameter(99, limit as i64)?;
+
+        let mut rows_iter = stmt.raw_query();
+        let mut result = Vec::new();
+        while let Some(row) = rows_iter.next()? {
+            result.push(CandleRow {
+                market_id: row.get(0)?,
+                interval: row.get(1)?,
+                open_time: row.get(2)?,
+                open: row.get(3)?,
+                high: row.get(4)?,
+                low: row.get(5)?,
+                close: row.get(6)?,
+                volume: row.get(7)?,
+                trade_count: row.get(8)?,
+            });
+        }
+        Ok(result)
     }
 
     pub fn delete_block_data(&self, height: i64) -> Result<(), rusqlite::Error> {

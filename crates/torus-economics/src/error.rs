@@ -157,4 +157,9 @@ pub enum EconomicsError {
 
     #[error("permanent unlock amount {amount} exceeds stake {stake}")]
     PermanentUnlockExceedsStake { amount: U256, stake: U256 },
+
+    // Governance initialization (FIX MED-NEW-15)
+
+    #[error("governance params not initialized — call set_governance_params at genesis")]
+    GovernanceNotInitialized,
 }

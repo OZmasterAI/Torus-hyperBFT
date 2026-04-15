@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use clap::Parser;
 use ed25519_dalek::SigningKey;
+use hotstuff_rs::events::CommitBlockEvent;
 use hotstuff_rs::replica::{Configuration, Replica, ReplicaSpec};
 use hotstuff_rs::types::data_types::{BufferSize, ChainID, EpochLength};
 use tracing::{error, info, warn};
@@ -18,7 +19,8 @@ use torus_evm::EvmExecutor;
 use torus_genesis::Genesis;
 use torus_mempool::{Mempool, MempoolConfig};
 use torus_network::{LibP2PNetwork, NetworkConfig};
-use torus_rpc::{BlockNotifier, RpcServer};
+use torus_rpc::{find_latest_height, scan_trades_for_block, BlockNotifier, RpcServer};
+use torus_state::cf::CF_BLOCK_HEADERS;
 use torus_state::{PrunerConfig, StateDb, StatePruner};
 use torus_types::ChainConfig;
 
@@ -321,19 +323,44 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         .log_events(false)
         .build();
 
-    // 7. Start replica
+    // 7. Block notifier (shared between consensus replica and RPC server)
+    let notifier = BlockNotifier::new();
+    let notifier_for_replica = notifier.clone();
+    let state_db_for_handler = state_db.clone();
+
+    // 8. Start replica with on_commit_block handler for WebSocket subscriptions
     let _replica = ReplicaSpec::builder()
         .app(app)
         .network(network)
         .kv_store(kv_store)
         .configuration(hs_config)
+        .on_commit_block(move |_event: &CommitBlockEvent| {
+            // Read the latest committed block height from RocksDB (O(1) reverse iterator).
+            let height = find_latest_height(&state_db_for_handler);
+            if height == 0 {
+                return;
+            }
+            // Read the block header: CF_BLOCK_HEADERS stores block_hash(32) || header_json.
+            match state_db_for_handler.get_cf_raw(CF_BLOCK_HEADERS, &height.to_be_bytes()) {
+                Ok(Some(data)) if data.len() > 32 => {
+                    if let Ok(header) =
+                        serde_json::from_slice::<serde_json::Value>(&data[32..])
+                    {
+                        notifier_for_replica.notify_new_block(header);
+                    }
+                }
+                _ => {}
+            }
+            // Scan trades for this block and notify subscribers.
+            let trades = scan_trades_for_block(&state_db_for_handler, height);
+            notifier_for_replica.notify_new_trades(trades);
+        })
         .build()
         .start();
     info!("consensus replica started");
 
-    // 8. Start RPC server
+    // 9. Start RPC server
     let rpc_addr: SocketAddr = cli.rpc_addr.parse()?;
-    let notifier = BlockNotifier::new();
     let rpc_server = RpcServer::new(
         state_db.clone(),
         mempool,

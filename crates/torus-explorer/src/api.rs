@@ -34,6 +34,7 @@ pub fn router(db: ExplorerDb, rpc: NodeRpcClient) -> Router {
         .route("/api/validators/{addr}", get(get_validator))
         .route("/api/search", get(search))
         .route("/api/stats", get(get_stats))
+        .route("/api/candles/{market_id}", get(get_candles))
         .layer(CorsLayer::permissive())
         .with_state(state)
 }
@@ -201,6 +202,52 @@ async fn search(State(s): State<AppState>, Query(q): Query<SearchQuery>) -> ApiR
 async fn get_stats(State(s): State<AppState>) -> ApiResult {
     let stats = s.db.get_stats()?;
     Ok(Json(json!(stats)))
+}
+
+#[derive(Deserialize)]
+pub struct CandleQuery {
+    pub interval: Option<String>,
+    pub from: Option<i64>,
+    pub to: Option<i64>,
+    pub limit: Option<u32>,
+}
+
+/// GET /api/candles/{market_id}?interval=5m&from=1700000000&to=1700003600&limit=500
+/// Returns OHLCV candles with floats (raw / 10^8).
+async fn get_candles(
+    State(s): State<AppState>,
+    Path(market_id): Path<i64>,
+    Query(q): Query<CandleQuery>,
+) -> ApiResult {
+    let interval = q.interval.as_deref().unwrap_or("5m");
+    let valid_intervals = ["1m", "5m", "15m", "1h"];
+    if !valid_intervals.contains(&interval) {
+        return Err(ApiError(format!(
+            "invalid interval '{}', must be one of: {}",
+            interval,
+            valid_intervals.join(", ")
+        )));
+    }
+    let limit = q.limit.unwrap_or(500).min(2000);
+    let candles = s.db.get_candles(market_id, interval, q.from, q.to, limit)?;
+
+    const SCALE: f64 = 100_000_000.0; // 10^8
+    let data: Vec<Value> = candles
+        .iter()
+        .map(|c| {
+            json!({
+                "time": c.open_time,
+                "open": c.open as f64 / SCALE,
+                "high": c.high as f64 / SCALE,
+                "low": c.low as f64 / SCALE,
+                "close": c.close as f64 / SCALE,
+                "volume": (c.volume as f64 / SCALE).abs(),
+                "tradeCount": c.trade_count,
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({"data": data, "marketId": market_id, "interval": interval})))
 }
 
 #[cfg(test)]

@@ -35,6 +35,7 @@ pub struct BlockNotifier {
     pub new_heads: broadcast::Sender<serde_json::Value>,
     pub new_logs: broadcast::Sender<Vec<serde_json::Value>>,
     pub pending_txs: broadcast::Sender<B256>,
+    pub new_trades: broadcast::Sender<Vec<serde_json::Value>>,
 }
 
 impl BlockNotifier {
@@ -42,10 +43,12 @@ impl BlockNotifier {
         let (new_heads, _) = broadcast::channel(256);
         let (new_logs, _) = broadcast::channel(256);
         let (pending_txs, _) = broadcast::channel(1024);
+        let (new_trades, _) = broadcast::channel(256);
         Self {
             new_heads,
             new_logs,
             pending_txs,
+            new_trades,
         }
     }
 
@@ -57,6 +60,13 @@ impl BlockNotifier {
     /// Notify subscribers of a pending transaction.
     pub fn notify_pending_tx(&self, hash: B256) {
         let _ = self.pending_txs.send(hash);
+    }
+
+    /// Notify subscribers of new trades from a committed block.
+    pub fn notify_new_trades(&self, trades: Vec<serde_json::Value>) {
+        if !trades.is_empty() {
+            let _ = self.new_trades.send(trades);
+        }
     }
 }
 
@@ -209,6 +219,91 @@ pub fn find_latest_height(state: &StateDb) -> u64 {
 /// Public helper to update latest height after committing a new block.
 pub fn set_latest_height(state: &RpcState, height: u64) {
     state.latest_height.store(height, Ordering::Relaxed);
+}
+
+/// Scan CF_NATIVE_TRADES for all trades at a given block height across all markets.
+/// Used by the on_commit_block handler to feed the `new_trades` broadcast channel.
+pub fn scan_trades_for_block(state: &StateDb, block_height: u64) -> Vec<serde_json::Value> {
+    use borsh::BorshDeserialize;
+    use torus_state::cf::{CF_NATIVE_MARKETS, CF_NATIVE_TRADES};
+
+    let db = state.inner();
+    let market_cf = match db.cf_handle(CF_NATIVE_MARKETS) {
+        Some(cf) => cf,
+        None => return vec![],
+    };
+    let trade_cf = match db.cf_handle(CF_NATIVE_TRADES) {
+        Some(cf) => cf,
+        None => return vec![],
+    };
+
+    let height_bytes = block_height.to_be_bytes();
+    let mut trades = Vec::new();
+
+    // Iterate all known market IDs and seek into CF_NATIVE_TRADES for each.
+    for item in db.iterator_cf(market_cf, rocksdb::IteratorMode::Start) {
+        let (market_key, _) = match item {
+            Ok(kv) => kv,
+            Err(_) => continue,
+        };
+        if market_key.len() != 8 {
+            continue;
+        }
+
+        // Build seek key: market_id(8) + block_height(8) + trade_index(0)
+        let mut start_key = [0u8; 20];
+        start_key[..8].copy_from_slice(&market_key);
+        start_key[8..16].copy_from_slice(&height_bytes);
+
+        let iter = db.iterator_cf(
+            trade_cf,
+            rocksdb::IteratorMode::From(&start_key, rocksdb::Direction::Forward),
+        );
+        for item in iter {
+            let (key, value) = match item {
+                Ok(kv) => kv,
+                Err(_) => break,
+            };
+            if key.len() < 16 {
+                break;
+            }
+            // Verify market_id prefix matches
+            if key[..8] != market_key[..] {
+                break;
+            }
+            // Verify block_number matches
+            if key[8..16] != height_bytes[..] {
+                break;
+            }
+
+            // Deserialize StoredTrade (borsh: trade_id u128 + price_raw i128 +
+            // quantity_raw i128 + side u8 + block_number u64 + timestamp u64)
+            #[derive(BorshDeserialize)]
+            struct StoredTrade {
+                trade_id: u128,
+                price_raw: i128,
+                quantity_raw: i128,
+                side: u8,
+                block_number: u64,
+                timestamp: u64,
+            }
+
+            if let Ok(t) = StoredTrade::try_from_slice(&value) {
+                let market_id = u64::from_be_bytes(market_key[..8].try_into().unwrap());
+                trades.push(serde_json::json!({
+                    "marketId": format!("0x{:x}", market_id),
+                    "tradeId": format!("0x{:x}", t.trade_id),
+                    "price": format!("0x{:x}", t.price_raw),
+                    "quantity": format!("0x{:x}", t.quantity_raw),
+                    "side": if t.side == 0 { "buy" } else { "sell" },
+                    "blockNumber": format!("0x{:x}", t.block_number),
+                    "timestamp": format!("0x{:x}", t.timestamp),
+                }));
+            }
+        }
+    }
+
+    trades
 }
 
 #[cfg(test)]

@@ -16,7 +16,9 @@ use crate::position::{borsh_read_address, borsh_read_fp, borsh_write_address, bo
 // Constants
 // ============================================================================
 
-const DEFAULT_MAX_ORACLE_AGE: u64 = 100;
+/// Max oracle age in blocks before price is considered stale.
+/// FIX MED-NEW-13: Single source of truth — also used by precompiles.rs.
+pub(crate) const DEFAULT_MAX_ORACLE_AGE: u64 = 100;
 const DEFAULT_MIN_ORACLE_REPORTERS: usize = 3;
 
 // ============================================================================

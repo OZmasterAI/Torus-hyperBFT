@@ -595,10 +595,12 @@ impl GovernanceManager {
                 let v: u64 = value.parse().map_err(|_| EconomicsError::InvalidParameterValue {
                     key: key.to_string(), reason: "must be a valid u64".to_string(),
                 })?;
-                if v > 100_000 {
+                // FIX MED-NEW-16: Enforce minimum timelock to prevent governance from
+                // disabling the delay entirely. 10 blocks ≈ 20s at 2s block time.
+                if v < 10 || v > 100_000 {
                     return Err(EconomicsError::InvalidParameterValue {
                         key: key.to_string(),
-                        reason: "must be <= 100000 blocks".to_string(),
+                        reason: "must be between 10 and 100000 blocks".to_string(),
                     });
                 }
             }
@@ -917,6 +919,15 @@ impl GovernanceManager {
         &self,
         current_block: u64,
     ) -> Result<Vec<ProposalOutcome>> {
+        // FIX MED-NEW-07: Skip full CF scan when no proposals have ever been created.
+        let proposal_count = match self.state_db.get_cf_raw(CF_FEE_CONFIG, PROPOSAL_COUNTER_KEY)? {
+            Some(data) if data.len() == 8 => u64::from_be_bytes(data.try_into().unwrap()),
+            _ => 0,
+        };
+        if proposal_count == 0 {
+            return Ok(Vec::new());
+        }
+
         let mut outcomes = Vec::new();
 
         // Finalize active proposals whose voting period has ended.
@@ -1096,11 +1107,14 @@ impl GovernanceManager {
         Ok(votes)
     }
 
+    /// FIX MED-NEW-15: Returns error if governance params were never initialized,
+    /// instead of silently defaulting to treasury_address = Address::ZERO (which
+    /// would permanently burn any treasury spend proposals).
     pub fn get_governance_params(&self) -> Result<GovernanceParams> {
         match self.state_db.get_cf_raw(CF_FEE_CONFIG, GOVERNANCE_PARAMS_KEY)? {
             Some(data) => Ok(GovernanceParams::try_from_slice(&data)
                 .map_err(|e| EconomicsError::Borsh(e.to_string()))?),
-            None => Ok(GovernanceParams::defaults(Address::ZERO)),
+            None => Err(EconomicsError::GovernanceNotInitialized),
         }
     }
 
@@ -1211,6 +1225,11 @@ impl GovernanceManager {
     ///
     /// Iterates all delegations and permanent stakes, computes each unique voter's
     /// weight, and stores it under a `snap_` prefixed key in CF_GOVERNANCE_VOTES.
+    ///
+    /// AUDIT MED-NEW-08: O(all_delegations + all_permanent_stakes) per proposal.
+    /// Rate-limited by min_proposal_stake requirement. A lazy evaluation approach
+    /// (compute weight on-demand at vote time) would eliminate this scan but requires
+    /// a larger refactor of the voting flow.
     fn snapshot_voter_weights(&self, proposal_id: u64, params: &GovernanceParams) -> Result<()> {
         use std::collections::HashMap;
 

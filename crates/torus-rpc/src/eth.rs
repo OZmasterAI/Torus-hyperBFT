@@ -159,7 +159,7 @@ fn block_env_from_header(header: &TorusBlockHeader) -> BlockEnvCfg {
     }
 }
 
-fn build_call_tx_env(call: &CallRequest) -> Result<TxEnv, RpcError> {
+fn build_call_tx_env(call: &CallRequest, chain_id: u64) -> Result<TxEnv, RpcError> {
     let caller = match &call.from {
         Some(f) => parse_address(f)?,
         None => Address::ZERO,
@@ -205,7 +205,7 @@ fn build_call_tx_env(call: &CallRequest) -> Result<TxEnv, RpcError> {
         value,
         data,
         nonce: nonce.unwrap_or(0),
-        chain_id: Some(7777),
+        chain_id: Some(chain_id),
         ..Default::default()
     })
 }
@@ -820,7 +820,7 @@ impl EthApiServer for RpcState {
         } else {
             BlockEnvCfg::default()
         };
-        let mut tx_env = build_call_tx_env(&tx).map_err(err)?;
+        let mut tx_env = build_call_tx_env(&tx, self.chain_id).map_err(err)?;
         // FIX 13 (EVM-PF-18): Default nonce to account's current nonce, not 0.
         if tx.nonce.is_none() {
             let caller = tx_env.caller;
@@ -869,7 +869,7 @@ impl EthApiServer for RpcState {
         };
         let mut lo: u64 = 21_000;
         let mut hi: u64 = DEFAULT_BLOCK_GAS_LIMIT;
-        let mut tx_env = build_call_tx_env(&tx).map_err(err)?;
+        let mut tx_env = build_call_tx_env(&tx, self.chain_id).map_err(err)?;
         // FIX 13 (EVM-PF-18): Default nonce to account's current nonce.
         if tx.nonce.is_none() {
             let caller = tx_env.caller;
@@ -899,7 +899,7 @@ impl EthApiServer for RpcState {
         }
         while lo + 1 < hi {
             let mid = lo + (hi - lo) / 2;
-            let mut tx_env = build_call_tx_env(&tx).map_err(err)?;
+            let mut tx_env = build_call_tx_env(&tx, self.chain_id).map_err(err)?;
             tx_env.gas_limit = mid;
             match self.executor.execute_tx(&self.state, &block_env, tx_env) {
                 Ok((r, _)) if r.success => hi = mid,

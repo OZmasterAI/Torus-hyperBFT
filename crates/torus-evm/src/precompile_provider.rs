@@ -91,8 +91,11 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for TorusPrecompiles<'_> {
         };
 
         // Build InterpreterResult.
+        // FIX MED-NEW-05: Check gas.record_cost return value instead of discarding it.
         let mut gas = Gas::new(inputs.gas_limit);
-        let _ = gas.record_cost(gas_required);
+        if !gas.record_cost(gas_required) {
+            return Ok(Some(InterpreterResult::new_oog(inputs.gas_limit)));
+        }
 
         match result {
             Ok(output) => Ok(Some(InterpreterResult {

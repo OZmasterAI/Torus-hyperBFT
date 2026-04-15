@@ -234,6 +234,9 @@ impl StakingManager {
 
         self.debit_balance(&staker, amount)?;
 
+        // FIX MED-NEW-12: locked_at_block tracks the initial lock, not the latest deposit.
+        // This is intentional for irreversible permanent stakes — subsequent deposits
+        // accumulate but the original lock timestamp is preserved.
         let mut info = self
             .get_permanent_stake(&staker)?
             .unwrap_or(PermanentStakeInfo {

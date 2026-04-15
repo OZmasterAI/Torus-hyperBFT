@@ -408,8 +408,12 @@ impl LiquidationEngine {
         }
 
         if eligible_total_size <= FixedPoint::ZERO || eligible_traders.is_empty() {
-            // No eligible traders — loss becomes protocol deficit
-            // (absorbed by insurance fund recovery over time)
+            // FIX MED-NEW-18: Log unrecoverable deficit instead of silently absorbing.
+            tracing::warn!(
+                %market_id,
+                %remaining_loss,
+                "unrecoverable socialized loss — no eligible traders, protocol deficit"
+            );
             return Ok(());
         }
 

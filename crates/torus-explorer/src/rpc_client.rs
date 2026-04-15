@@ -69,6 +69,15 @@ impl NodeRpcClient {
             .await?;
         Ok(result)
     }
+
+    /// Fetch all trades that occurred in a single block (Phase 7B).
+    pub async fn get_block_trades(&self, block_number: u64) -> Result<Vec<Value>, RpcError> {
+        let result: Vec<Value> = self
+            .http
+            .request("torus_getBlockTrades", rpc_params![block_number])
+            .await?;
+        Ok(result)
+    }
 }
 
 // ============================================================================
