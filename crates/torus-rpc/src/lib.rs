@@ -12,7 +12,7 @@ pub mod web3;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -115,6 +115,8 @@ pub struct RpcState {
     pub(crate) pruned_up_to: Arc<AtomicU64>,
     /// Per-sender tx submission rate limiter (Batch EK: EVM-FIND-19).
     pub(crate) tx_submit_limiter: TxSubmitLimiter,
+    /// Global cap on active WebSocket subscriptions (HIGH-NEW-05).
+    pub(crate) active_subscriptions: Arc<AtomicUsize>,
 }
 
 /// JSON-RPC server combining eth, net, and web3 namespaces.
@@ -144,6 +146,7 @@ impl RpcServer {
                 notifier,
                 pruned_up_to: Arc::new(AtomicU64::new(0)),
                 tx_submit_limiter: TxSubmitLimiter::new(50), // 50 tx per 10s per sender
+                active_subscriptions: Arc::new(AtomicUsize::new(0)),
             },
         }
     }

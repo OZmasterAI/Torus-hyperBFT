@@ -307,8 +307,8 @@ impl OracleManager {
         let prefix = submission_market_prefix(market_id);
         let iter = db.prefix_iterator_cf(cf, &prefix);
 
-        let mut latest_per_validator: std::collections::HashMap<Address, OracleSubmission> =
-            std::collections::HashMap::new();
+        let mut latest_per_validator: std::collections::BTreeMap<Address, OracleSubmission> =
+            std::collections::BTreeMap::new();
         let mut keys_to_prune: Vec<Vec<u8>> = Vec::new();
 
         for item in iter {

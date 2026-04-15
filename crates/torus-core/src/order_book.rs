@@ -844,7 +844,16 @@ impl OrderBook {
                     reduce_only: stop.reduce_only,
                     client_order_id: stop.client_order_id,
                 };
-                let _ = self.place_order(params, stop.trader, stop.timestamp);
+                let result = self.place_order(params, stop.trader, stop.timestamp);
+                if result.status == OrderStatus::Rejected {
+                    tracing::warn!(
+                        stop_id = stop.id,
+                        trader = %stop.trader,
+                        market_id = stop.market_id,
+                        trigger_price = ?stop.trigger_price,
+                        "stop order triggered but resulting order rejected"
+                    );
+                }
             }
 
             // No price change → no new triggers

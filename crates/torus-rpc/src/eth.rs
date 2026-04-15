@@ -1043,7 +1043,24 @@ impl EthApiServer for RpcState {
         kind: String,
         params: Option<serde_json::Value>,
     ) -> SubscriptionResult {
+        const MAX_SUBSCRIPTIONS: usize = 1000;
+
+        let count = self.active_subscriptions.load(Relaxed);
+        if count >= MAX_SUBSCRIPTIONS {
+            pending
+                .reject(ErrorObjectOwned::owned(
+                    -32000,
+                    "subscription limit reached",
+                    None::<()>,
+                ))
+                .await;
+            return Ok(());
+        }
+        self.active_subscriptions.fetch_add(1, Relaxed);
+
         let sink = pending.accept().await?;
+        let subs = self.active_subscriptions.clone();
+
         match kind.as_str() {
             "newHeads" => {
                 let mut rx = self.notifier.new_heads.subscribe();
@@ -1062,12 +1079,14 @@ impl EthApiServer for RpcState {
                             Err(_) => break,
                         }
                     }
+                    subs.fetch_sub(1, Relaxed);
                 });
             }
             "logs" => {
                 let filter: Option<LogFilter> = params.and_then(|p| serde_json::from_value(p).ok());
                 let filter_addr = filter.as_ref().and_then(|f| f.address.clone());
                 let mut rx = self.notifier.new_logs.subscribe();
+                let subs = subs.clone();
                 tokio::spawn(async move {
                     while let Ok(logs) = rx.recv().await {
                         for log_val in &logs {
@@ -1088,18 +1107,24 @@ impl EthApiServer for RpcState {
                                 ) {
                                     Ok(msg) => {
                                         if sink.send(msg).await.is_err() {
+                                            subs.fetch_sub(1, Relaxed);
                                             return;
                                         }
                                     }
-                                    Err(_) => return,
+                                    Err(_) => {
+                                        subs.fetch_sub(1, Relaxed);
+                                        return;
+                                    }
                                 }
                             }
                         }
                     }
+                    subs.fetch_sub(1, Relaxed);
                 });
             }
             "newPendingTransactions" => {
                 let mut rx = self.notifier.pending_txs.subscribe();
+                let subs = subs.clone();
                 tokio::spawn(async move {
                     while let Ok(hash) = rx.recv().await {
                         let val = serde_json::Value::String(hex_b256(hash));
@@ -1116,9 +1141,11 @@ impl EthApiServer for RpcState {
                             Err(_) => break,
                         }
                     }
+                    subs.fetch_sub(1, Relaxed);
                 });
             }
             _ => {
+                subs.fetch_sub(1, Relaxed);
                 tracing::warn!("unknown subscription kind: {kind}");
             }
         }

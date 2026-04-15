@@ -81,7 +81,11 @@ pub trait TorusApi {
 
     // --- 2.9.2: Market info ---
     #[method(name = "getMarkets")]
-    async fn get_markets(&self) -> RpcResult<Vec<RpcMarketInfo>>;
+    async fn get_markets(
+        &self,
+        offset: Option<u32>,
+        limit: Option<u32>,
+    ) -> RpcResult<Vec<RpcMarketInfo>>;
 
     #[method(name = "getTradeHistory")]
     async fn get_trade_history(
@@ -289,7 +293,15 @@ impl TorusApiServer for RpcState {
 
     // === 2.9.2: Market info ===
 
-    async fn get_markets(&self) -> RpcResult<Vec<RpcMarketInfo>> {
+    async fn get_markets(
+        &self,
+        offset: Option<u32>,
+        limit: Option<u32>,
+    ) -> RpcResult<Vec<RpcMarketInfo>> {
+        const MAX_MARKETS_PER_PAGE: usize = 500;
+        let offset = offset.unwrap_or(0) as usize;
+        let limit = limit.unwrap_or(100).min(MAX_MARKETS_PER_PAGE as u32) as usize;
+
         let db = self.state.inner();
         let cf = db
             .cf_handle(CF_NATIVE_MARKETS)
@@ -298,6 +310,7 @@ impl TorusApiServer for RpcState {
 
         let iter = db.iterator_cf(cf, IteratorMode::Start);
         let mut markets = Vec::new();
+        let mut scanned = 0usize;
 
         for item in iter {
             let (key, value) = item
@@ -306,6 +319,14 @@ impl TorusApiServer for RpcState {
             if key.len() != 8 {
                 continue;
             }
+
+            scanned += 1;
+
+            // Skip entries before offset without deserializing
+            if scanned <= offset {
+                continue;
+            }
+
             let mid = u64::from_be_bytes(key[..8].try_into().unwrap());
 
             let market = StoredMarket::try_from_slice(&value)
@@ -320,9 +341,13 @@ impl TorusApiServer for RpcState {
                 tick_size: hex_fp(FixedPoint::from_raw(market.tick_size_raw)),
                 status: "active".to_string(),
             });
+
+            if markets.len() >= limit {
+                break;
+            }
         }
 
-        markets.sort_by(|a, b| a.market_id.cmp(&b.market_id));
+        // Keys are u64 big-endian — RocksDB lexicographic order == numeric order. No sort needed.
         Ok(markets)
     }
 

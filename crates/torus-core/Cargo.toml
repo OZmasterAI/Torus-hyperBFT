@@ -12,6 +12,7 @@ alloy-primitives = { workspace = true }
 rocksdb = { workspace = true }
 thiserror = { workspace = true }
 borsh = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
