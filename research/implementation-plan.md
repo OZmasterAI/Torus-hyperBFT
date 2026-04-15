@@ -260,6 +260,17 @@ Track G (Integration):
 | 2.10.7 | Stress test: sustained 10k orders/sec with 4 validators | 2.1 | 3 days | M12 wk1 |
 | 2.10.8 | Chaos testing: validator crashes, network partitions | — | 3 days | M12 wk1-2 |
 | 2.10.9 | Bug fix buffer (findings from stress/chaos testing) | 2.10.8 | 5 days | M12 wk3-4 |
+| **2.11** | **Validator staking inflation + epoch boundary wiring** | 2.6, 2.7, 1.11 | 2 weeks | M12 |
+| 2.11.1 | Constants: `VALIDATOR_INFLATION_CONSTANT` (200), `SECONDS_PER_YEAR` in types.rs | — | 0.5 day | M12 |
+| 2.11.2 | Integer square root (`isqrt`) for U256 via Newton's method + unit tests | — | 1 day | M12 |
+| 2.11.3 | Validator inflation tracker (separate CF_TREASURY key, avoids Borsh migration) | — | 0.5 day | M12 |
+| 2.11.4 | `distribute_validator_inflation()`: APY = 200/sqrt(S), commission split, pro-rata to delegators, no autocompound | 2.11.1-3 | 3 days | M12 |
+| 2.11.5 | `EpochBoundaryResult` return type (carries new_set + diff for hotstuff_rs) | — | 0.5 day | M12 |
+| 2.11.6 | Rewrite `process_epoch_boundary()`: wire permanent staking rewards, validator inflation, rotation cap, minimum set check, validator set diff, status updates, log rotation | 2.11.4-5 | 2 days | M12 |
+| 2.11.7 | Update proposer.rs + validator.rs callers for new `EpochBoundaryResult` return type | 2.11.6 | 0.5 day | M12 |
+| 2.11.8 | Unit tests: isqrt, inflation curve, commission split, edge cases (zero stake, no active validators, epoch_length=0) | 2.11.4 | 2 days | M12 |
+| 2.11.9 | Integration tests: full epoch boundary flow, proposer-validator state root determinism, rewards claimable, rotation cap applied | 2.11.7 | 2 days | M12 |
+| | **Spec:** [tech-req-validator-inflation.md](./tech-req-validator-inflation.md), **Plan:** [writing-plan-validator-inflation.md](./writing-plan-validator-inflation.md) | | | |
 
 ---
 
@@ -298,7 +309,7 @@ Track G (Integration):
 | 3.4.1 | Audit firm selection and scoping | — | 2 weeks | M15 |
 | 3.4.2 | Consensus safety audit (includes MonadBFT changes) | 3.3 | 4 weeks | M15-M16 |
 | 3.4.3 | EVM correctness audit | Phase 1 | 3 weeks | M15-M16 |
-| 3.4.4 | Economic model audit (game theory review) | 2.6, 2.7 | 2 weeks | M16 |
+| 3.4.4 | Economic model audit (game theory review) | 2.6, 2.7, 2.11 | 2 weeks | M16 |
 | 3.4.5 | Fix audit findings | 3.4.2-3.4.4 | 4 weeks | M16-M17 |
 | 3.4.6 | Re-audit critical findings | 3.4.5 | 2 weeks | M17-M18 |
 | **3.5** | **Infrastructure and tooling** | Phase 2 | 4 weeks | M14-M16 |
@@ -531,8 +542,10 @@ Critical path: MonadBFT must complete before audit starts (M15). Audit findings 
 - [ ] EVM contracts read native order book via precompiles
 - [ ] EVM contracts place orders via CoreWriter (delayed by 1 block)
 - [ ] Lockbox transfers assets bidirectionally
-- [ ] Permanent staking earns 5% APY
+- [ ] Permanent staking earns 5% APY (distributed at epoch boundary)
+- [ ] Validator staking earns inflationary rewards (APY = 200/sqrt(S), no autocompound)
 - [ ] Fee split distributes to burn/validator/treasury/dev-pool
+- [ ] Epoch boundary fully wired: rewards + validator rotation + status updates
 - [ ] Governance proposals with 1.5x permanent-staker weight
 - [ ] All features work deterministically across 4 validators
 - **"Done" means:** Full feature parity with Torus economics design
