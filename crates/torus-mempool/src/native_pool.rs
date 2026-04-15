@@ -165,6 +165,10 @@ fn is_cancel(action: &NativeAction) -> bool {
 ///
 /// Uses `NativeAction::canonical_bytes()` instead of `Debug` formatting to ensure
 /// the hash is identical across compiler versions and crate updates.
+///
+/// AUDIT: EVM-FIND-11 requested EIP-712 struct hash for dedup.
+/// canonical_bytes() provides equivalent collision resistance with simpler implementation.
+/// EIP-712 would add complexity without material security benefit for internal pool dedup.
 fn compute_action_hash(action: &SignedNativeAction) -> B256 {
     let mut data = action.action.canonical_bytes();
     data.extend_from_slice(&action.nonce.to_be_bytes());

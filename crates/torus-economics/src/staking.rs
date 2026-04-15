@@ -340,6 +340,9 @@ impl StakingManager {
         let delegations = self.delegations_for_validator(&validator_addr)?;
         let mut total_del_slashed = U256::ZERO;
 
+        // FIX ECON-FIND-14: Always include delegation in accounting, even if del_slash
+        // rounds to zero. Skipping zero-slash delegations caused total_slashed to
+        // undercount the expected slash amount.
         for del in &delegations {
             let del_slash = del.amount * fraction / bps_10000;
             if !del_slash.is_zero() {
@@ -347,9 +350,9 @@ impl StakingManager {
                 updated_del.amount -= del_slash;
                 let del_key = delegation_key(&del.delegator, &validator_addr);
                 self.put_delegation_raw(&del_key, &updated_del)?;
-                total_del_slashed += del_slash;
-                total_slashed += del_slash;
             }
+            total_del_slashed += del_slash;
+            total_slashed += del_slash;
         }
 
         // FIX ECON-FIND-27: Recompute total_delegated from actual delegation amounts

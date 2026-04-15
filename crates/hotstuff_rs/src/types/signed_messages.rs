@@ -255,6 +255,12 @@ impl<CL: Collector> ActiveCollectorPair<CL> {
     }
 
     /// Collect `message` with both collectors in this `ActiveCollectorPair`.
+    ///
+    /// AUDIT: CONS-FIND-14 suggested cross-collector vote deduplication. NOT applied:
+    /// CVS and PVS must independently track quorum during validator set transitions.
+    /// A validator in both sets legitimately contributes to both quorums. Cross-collector
+    /// dedup would prevent PVS from reaching quorum when most PVS validators are also
+    /// in CVS, causing liveness failures during transitions.
     pub(crate) fn collect(
         &mut self,
         signer: &VerifyingKey,

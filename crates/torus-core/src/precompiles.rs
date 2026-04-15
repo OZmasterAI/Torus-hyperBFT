@@ -942,7 +942,9 @@ impl CoreWriterQueue {
         Ok(count)
     }
 
-    /// Find the next sequence number for a target block by scanning existing keys.
+    /// Find the next sequence number for a target block.
+    ///
+    /// FIX EVM-PF-16: Uses reverse seek (O(1)) instead of full prefix scan (O(n)).
     fn next_sequence(state_db: &StateDb, target_block: u64) -> Result<u64, CoreError> {
         let db = state_db.inner();
         let cf = db
@@ -950,26 +952,24 @@ impl CoreWriterQueue {
             .ok_or(CoreError::MissingCf(CF_CORE_WRITER_QUEUE))?;
 
         let prefix = target_block.to_be_bytes();
-        let iter = db.prefix_iterator_cf(cf, &prefix);
 
-        let mut max_seq: u64 = 0;
-        let mut found = false;
-        for item in iter {
-            let (key, _) =
-                item.map_err(|e| CoreError::State(torus_state::StateError::RocksDb(e)))?;
-            if !key.starts_with(&prefix) {
-                break;
-            }
-            if key.len() == 16 {
-                let seq = u64::from_be_bytes(key[8..16].try_into().unwrap());
-                if seq >= max_seq {
-                    max_seq = seq;
-                    found = true;
+        // Seek to the last possible key with this block prefix (prefix + 0xFF..FF).
+        let mut seek_key = Vec::with_capacity(16);
+        seek_key.extend_from_slice(&prefix);
+        seek_key.extend_from_slice(&[0xFF; 8]);
+
+        let mut iter = db.raw_iterator_cf(cf);
+        iter.seek_for_prev(&seek_key);
+
+        if iter.valid() {
+            if let Some(key) = iter.key() {
+                if key.starts_with(&prefix) && key.len() == 16 {
+                    let seq = u64::from_be_bytes(key[8..16].try_into().unwrap());
+                    return Ok(seq + 1);
                 }
             }
         }
-
-        Ok(if found { max_seq + 1 } else { 0 })
+        Ok(0)
     }
 }
 

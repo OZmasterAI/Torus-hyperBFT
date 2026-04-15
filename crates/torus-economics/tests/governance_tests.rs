@@ -6,7 +6,9 @@ use torus_economics::governance::{
     ExecutionPayload, GovernanceManager, GovernanceParams, ProposalOutcome, ProposalStatus,
     ProposalType,
 };
-use torus_economics::{EconomicsError, StakingManager, MIN_SELF_DELEGATION};
+use torus_economics::{
+    EconomicsError, StakingManager, MIN_SELF_DELEGATION, TARGET_BLOCK_TIME_SECS,
+};
 use torus_state::cf::{CF_FEE_CONFIG, CF_NATIVE_MARKETS};
 use torus_state::StateDb;
 use torus_types::FixedPoint;
@@ -689,7 +691,7 @@ fn query_governance_params_defaults() {
 
     // No params stored -> returns defaults.
     let params = gov.get_governance_params().unwrap();
-    assert_eq!(params.voting_period_blocks, 100_800);
+    assert_eq!(params.voting_period_blocks, 7 * 24 * 3600 / TARGET_BLOCK_TIME_SECS);
     assert_eq!(params.quorum_bps, 3300);
     assert_eq!(params.permanent_weight_multiplier_num, 3);
     assert_eq!(params.permanent_weight_multiplier_den, 2);

@@ -333,6 +333,11 @@ pub enum NativeAction {
     },
     ClaimRewards,
 
+    /// FIX ECON-FIND-15: Top up validator's self-stake from their balance.
+    TopUpSelfStake {
+        amount: U256,
+    },
+
     // === Governance ===
     SubmitProposal(Proposal),
     Vote {
@@ -568,6 +573,10 @@ impl NativeAction {
             NativeAction::DelistMarket { market_id } => {
                 buf.push(21);
                 buf.extend_from_slice(&market_id.to_be_bytes());
+            }
+            NativeAction::TopUpSelfStake { amount } => {
+                buf.push(22);
+                buf.extend_from_slice(&amount.to_be_bytes::<32>());
             }
         }
         buf

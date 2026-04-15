@@ -517,6 +517,11 @@ impl<N: Network> Pacemaker<N> {
             validator_set_state,
         );
 
+        // FIX CONS-PF-16: Prune bracha state for views we'll never revisit.
+        let cutoff_view = ViewNumber::new(next_view.int().saturating_sub(100));
+        self.state.bracha_timeout_power = self.state.bracha_timeout_power.split_off(&cutoff_view);
+        self.state.bracha_timeout_voters = self.state.bracha_timeout_voters.split_off(&cutoff_view);
+
         Ok(())
     }
 

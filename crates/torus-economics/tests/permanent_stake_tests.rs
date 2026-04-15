@@ -2,7 +2,7 @@
 
 use alloy_primitives::{Address, U256};
 use revm::state::AccountInfo;
-use torus_economics::{EconomicsError, RewardDistributor, StakingManager};
+use torus_economics::{EconomicsError, RewardDistributor, StakingManager, BLOCKS_PER_YEAR};
 use torus_state::StateDb;
 
 fn setup() -> (tempfile::TempDir, StakingManager) {
@@ -160,9 +160,9 @@ fn permanent_staking_rewards_proportional_distribution() {
 
     // Check exact proportions: reward = stake * 500 * blocks / (31536000 * 10000).
     let expected_s1 = wei(30_000) * U256::from(500u64) * U256::from(200_000u64)
-        / (U256::from(31_536_000u64) * U256::from(10_000u64));
+        / (U256::from(BLOCKS_PER_YEAR) * U256::from(10_000u64));
     let expected_s2 = wei(70_000) * U256::from(500u64) * U256::from(200_000u64)
-        / (U256::from(31_536_000u64) * U256::from(10_000u64));
+        / (U256::from(BLOCKS_PER_YEAR) * U256::from(10_000u64));
     assert_eq!(reward_s1, expected_s1);
     assert_eq!(reward_s2, expected_s2);
 }

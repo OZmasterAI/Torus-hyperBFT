@@ -291,14 +291,17 @@ fn convert_log(log: &alloy_primitives::Log) -> TorusLog {
 ///
 /// Legacy (no priority fee): `max_fee` is the gas price.
 /// EIP-1559: `base_fee + min(priority_fee, max_fee - base_fee)`.
+///
+/// FIX EVM-PF-02: Caps at `u64::MAX` instead of silent truncation via `as u64`.
 fn calc_effective_gas_price(base_fee: u64, max_fee: u128, priority_fee: Option<u128>) -> u64 {
-    match priority_fee {
+    let result = match priority_fee {
         Some(pf) => {
             let max_priority = pf.min(max_fee.saturating_sub(base_fee as u128));
-            (base_fee as u128 + max_priority) as u64
+            base_fee as u128 + max_priority
         }
-        None => max_fee as u64,
-    }
+        None => max_fee,
+    };
+    u64::try_from(result).unwrap_or(u64::MAX)
 }
 
 /// Map a revm [`EVMError`] into our [`EvmError`].

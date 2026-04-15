@@ -519,7 +519,7 @@ mod tests {
             RewardDistributor::distribute_permanent_staking_rewards(&mgr, blocks_in_epoch).unwrap();
 
         let expected = wei(50_000) * U256::from(500u64) * U256::from(100_000u64)
-            / (U256::from(31_536_000u64) * U256::from(10_000u64));
+            / (U256::from(BLOCKS_PER_YEAR) * U256::from(10_000u64));
         assert_eq!(minted, expected);
         assert!(!minted.is_zero());
 

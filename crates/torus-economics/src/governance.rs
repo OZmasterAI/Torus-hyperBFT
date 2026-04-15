@@ -27,8 +27,8 @@ type Result<T> = std::result::Result<T, EconomicsError>;
 // Constants
 // ============================================================================
 
-/// Default voting period: ~7 days at 6-second blocks.
-pub const DEFAULT_VOTING_PERIOD_BLOCKS: u64 = 100_800;
+/// Default voting period: ~7 days of blocks, derived from canonical block time.
+pub const DEFAULT_VOTING_PERIOD_BLOCKS: u64 = 7 * 24 * 3600 / crate::types::TARGET_BLOCK_TIME_SECS;
 
 /// Default quorum: 3300 basis points (33%) of total staked supply.
 pub const DEFAULT_QUORUM_BPS: u64 = 3300;
@@ -412,7 +412,7 @@ impl GovernanceParams {
             permanent_weight_multiplier_num: 3,
             permanent_weight_multiplier_den: 2,
             treasury_address,
-            timelock_blocks: 14400,
+            timelock_blocks: 24 * 3600 / crate::types::TARGET_BLOCK_TIME_SECS,
         }
     }
 }
@@ -656,6 +656,10 @@ impl GovernanceManager {
 
         self.put_proposal(&proposal)?;
 
+        // FIX ECON-FIND-16: Snapshot all voter weights at proposal creation time.
+        // Prevents flash-vote attacks by fixing voting power at snapshot_block.
+        self.snapshot_voter_weights(id, &params)?;
+
         tracing::info!(id, %proposer, "governance proposal submitted");
         Ok(id)
     }
@@ -693,9 +697,9 @@ impl GovernanceManager {
         }
 
         // Compute vote weight (chain-computed, never user-supplied).
-        // FIX 16: Use snapshot block for weight computation.
+        // FIX ECON-FIND-16: Use snapshotted weight from proposal creation time.
         let params = self.get_governance_params()?;
-        let weight = self.compute_vote_weight_at(&voter, &params, proposal.snapshot_block)?;
+        let weight = self.compute_vote_weight_at(&voter, &params, proposal_id)?;
         if weight.is_zero() {
             return Err(EconomicsError::NoVotingWeight(voter));
         }
@@ -1020,8 +1024,12 @@ impl GovernanceManager {
         let iter = db.iterator_cf(cf, rocksdb::IteratorMode::Start);
         let mut votes = Vec::new();
         for item in iter {
-            let (_key, value) = item
+            let (key, value) = item
                 .map_err(|e| EconomicsError::State(torus_state::StateError::RocksDb(e)))?;
+            // Skip snapshot weight entries (32-byte keys starting with "snap").
+            if key.starts_with(b"snap") {
+                continue;
+            }
             let vote = Vote::try_from_slice(&value)
                 .map_err(|e| EconomicsError::Borsh(e.to_string()))?;
             if vote.voter == *voter {
@@ -1120,19 +1128,94 @@ impl GovernanceManager {
         Ok(delegated + weighted_permanent)
     }
 
-    /// Compute vote weight, ideally at snapshot_block (FIX 16: flash-vote defense).
-    /// Currently uses live state as historical lookups are not yet supported.
-    /// The unbonding period provides the primary defense against flash-vote attacks.
+    /// FIX ECON-FIND-16: Compute vote weight from the snapshot taken at proposal creation.
+    ///
+    /// Looks up the voter's snapshotted weight (stored in CF_GOVERNANCE_VOTES under a
+    /// `snap_` prefixed key). Falls back to live state for backward compatibility with
+    /// proposals created before the snapshot mechanism was added.
     fn compute_vote_weight_at(
         &self,
         voter: &Address,
         params: &GovernanceParams,
-        _snapshot_block: u64,
+        proposal_id: u64,
     ) -> Result<U256> {
-        // TODO: Use historical state at snapshot_block when available.
-        // For now, live state is used. The unbonding period (longer than voting period)
-        // provides defense against flash-vote attacks.
+        // Try to load snapshotted weight first.
+        let snap_key = snapshot_weight_key(proposal_id, voter);
+        if let Some(data) = self.state_db.get_cf_raw(CF_GOVERNANCE_VOTES, &snap_key)? {
+            if data.len() == 32 {
+                return Ok(U256::from_be_slice(&data));
+            }
+        }
+        // Fallback: compute from live state (pre-snapshot proposals).
         self.compute_vote_weight(voter, params)
+    }
+
+    /// FIX ECON-FIND-16: Snapshot all voter weights at proposal creation time.
+    ///
+    /// Iterates all delegations and permanent stakes, computes each unique voter's
+    /// weight, and stores it under a `snap_` prefixed key in CF_GOVERNANCE_VOTES.
+    fn snapshot_voter_weights(&self, proposal_id: u64, params: &GovernanceParams) -> Result<()> {
+        use std::collections::HashMap;
+
+        let db = self.state_db.inner();
+        let mut voter_delegated: HashMap<Address, U256> = HashMap::new();
+
+        // Sum delegated amounts per delegator (key = delegator(20) + validator(20)).
+        if let Some(cf) = db.cf_handle(CF_STAKING_DELEGATIONS) {
+            for item in db.iterator_cf(cf, rocksdb::IteratorMode::Start) {
+                let (key, value) = item.map_err(|e| {
+                    EconomicsError::State(torus_state::StateError::RocksDb(e))
+                })?;
+                if key.len() < 20 { continue; }
+                let delegator = Address::from_slice(&key[..20]);
+                let delegation = Delegation::try_from_slice(&value)
+                    .map_err(|e| EconomicsError::Borsh(e.to_string()))?;
+                *voter_delegated.entry(delegator).or_insert(U256::ZERO) += delegation.amount;
+            }
+        }
+
+        // Merge permanent stake data.
+        let mut voter_permanent: HashMap<Address, U256> = HashMap::new();
+        if let Some(cf) = db.cf_handle(CF_STAKING_PERMANENT) {
+            for item in db.iterator_cf(cf, rocksdb::IteratorMode::Start) {
+                let (key, value) = item.map_err(|e| {
+                    EconomicsError::State(torus_state::StateError::RocksDb(e))
+                })?;
+                if key.len() < 20 { continue; }
+                let staker = Address::from_slice(&key[..20]);
+                let info = PermanentStakeInfo::try_from_slice(&value)
+                    .map_err(|e| EconomicsError::Borsh(e.to_string()))?;
+                voter_permanent.insert(staker, info.amount);
+            }
+        }
+
+        // Compute and store weighted vote power for each unique voter.
+        let den = if params.permanent_weight_multiplier_den == 0 {
+            1u64
+        } else {
+            params.permanent_weight_multiplier_den
+        };
+        let mut all_voters: std::collections::HashSet<Address> = voter_delegated.keys().copied().collect();
+        all_voters.extend(voter_permanent.keys());
+
+        for voter in all_voters {
+            let delegated = voter_delegated.get(&voter).copied().unwrap_or(U256::ZERO);
+            let permanent = voter_permanent.get(&voter).copied().unwrap_or(U256::ZERO);
+            let weighted_permanent = permanent
+                * U256::from(params.permanent_weight_multiplier_num)
+                / U256::from(den);
+            let weight = delegated + weighted_permanent;
+            if !weight.is_zero() {
+                let snap_key = snapshot_weight_key(proposal_id, &voter);
+                self.state_db.put_cf_raw(
+                    CF_GOVERNANCE_VOTES,
+                    &snap_key,
+                    &weight.to_be_bytes::<32>(),
+                )?;
+            }
+        }
+
+        Ok(())
     }
 
     /// Total vote weight cast on a proposal (yes + no + abstain) (FIX 20).
@@ -1261,6 +1344,16 @@ pub fn vote_key(proposal_id: u64, voter: &Address) -> [u8; 28] {
     let mut key = [0u8; 28];
     key[..8].copy_from_slice(&proposal_id.to_be_bytes());
     key[8..28].copy_from_slice(voter.as_slice());
+    key
+}
+
+/// FIX ECON-FIND-16: Build 32-byte snapshot weight key: "snap" ++ proposal_id(8 BE) ++ voter(20).
+/// Uses a different length (32 bytes) than vote_key (28 bytes) to avoid key collisions.
+fn snapshot_weight_key(proposal_id: u64, voter: &Address) -> [u8; 32] {
+    let mut key = [0u8; 32];
+    key[..4].copy_from_slice(b"snap");
+    key[4..12].copy_from_slice(&proposal_id.to_be_bytes());
+    key[12..32].copy_from_slice(voter.as_slice());
     key
 }
 

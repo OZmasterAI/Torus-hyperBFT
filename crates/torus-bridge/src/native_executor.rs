@@ -233,6 +233,13 @@ impl NativeExecutor {
                 Self::exec_permanent_stake(ctx, sender, *amount)
             }
             NativeAction::ClaimRewards => Self::exec_claim_rewards(ctx, sender),
+            // FIX ECON-FIND-15: TopUpSelfStake via NativeAction.
+            NativeAction::TopUpSelfStake { amount } => {
+                match ctx.staking.top_up_self_stake(*sender, *amount) {
+                    Ok(()) => NativeActionResult::ok("top_up_self_stake", 2000),
+                    Err(e) => NativeActionResult::err("top_up_self_stake", e.to_string()),
+                }
+            }
 
             // ---- Oracle ----
             NativeAction::SubmitOraclePrices(submission) => {
@@ -255,8 +262,9 @@ impl NativeExecutor {
             NativeAction::TransferToSpot { amount } => {
                 Self::exec_withdraw_from_native(ctx, sender, *amount)
             }
-            NativeAction::Withdraw { amount, .. } => {
-                Self::exec_withdraw_from_native(ctx, sender, *amount)
+            // FIX ECON-PF-17: Wire `to` address — debit sender, credit recipient.
+            NativeAction::Withdraw { amount, to } => {
+                Self::exec_withdraw_to(ctx, sender, to, *amount)
             }
 
             // ---- Validator management ----
@@ -888,6 +896,23 @@ impl NativeExecutor {
         }
     }
 
+    /// FIX ECON-PF-17: Withdraw from sender's native balance to a specified EVM address.
+    fn exec_withdraw_to(
+        ctx: &mut NativeExecContext,
+        sender: &Address,
+        to: &Address,
+        amount: U256,
+    ) -> NativeActionResult {
+        let fp_amount = match u256_to_fp(amount) {
+            Some(fp) => fp,
+            None => return NativeActionResult::err("withdraw_to", "amount overflow".into()),
+        };
+        match Lockbox::withdraw_from_native_to(&ctx.state_db, sender, to, fp_amount) {
+            Ok(()) => NativeActionResult::ok("withdraw_to", 1500),
+            Err(e) => NativeActionResult::err("withdraw_to", e.to_string()),
+        }
+    }
+
     // ========================================================================
     // Block-level processing helpers (called by validator pipeline)
     // ========================================================================
@@ -896,11 +921,12 @@ impl NativeExecutor {
     ///
     /// Task 3.1.5 (anti-MEV): Asserts the one-block delay is enforced — all
     /// drained actions must have been queued in a strictly earlier block.
-    pub fn drain_core_writer(ctx: &mut NativeExecContext) -> Vec<NativeActionResult> {
-        let queued = match CoreWriterQueue::drain(&ctx.state_db, ctx.block_height) {
-            Ok(actions) => actions,
-            Err(_) => return vec![],
-        };
+    ///
+    /// FIX EVM-FIND-12: Propagates drain errors instead of silently returning empty vec.
+    pub fn drain_core_writer(
+        ctx: &mut NativeExecContext,
+    ) -> Result<Vec<NativeActionResult>, torus_core::error::CoreError> {
+        let queued = CoreWriterQueue::drain(&ctx.state_db, ctx.block_height)?;
 
         let mut results = Vec::with_capacity(queued.len());
         for qa in &queued {
@@ -927,7 +953,7 @@ impl NativeExecutor {
             let result = Self::execute(ctx, &qa.trader, &action);
             results.push(result);
         }
-        results
+        Ok(results)
     }
 
     /// Aggregate oracle prices for listed markets after oracle submissions.

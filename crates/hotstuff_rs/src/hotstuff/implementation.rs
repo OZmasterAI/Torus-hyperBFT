@@ -188,6 +188,11 @@ impl<N: Network> HotStuff<N> {
             &validator_set_state,
         );
 
+        // FIX CONS-PF-15: Evict stale entries from seen_proposals to bound memory.
+        // Equivocation detection only needs current/recent views; 100-view window is generous.
+        let cutoff = ViewNumber::new(self.view_info.view.int().saturating_sub(100));
+        self.seen_proposals.retain(|&(view, _), _| view >= cutoff);
+
         // 3. Set `highest_view_entered` in the block tree to the new view, then emit a `StartView` event.
         block_tree.set_highest_view_entered(self.view_info.view)?;
 

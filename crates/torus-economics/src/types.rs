@@ -301,8 +301,12 @@ pub const MIN_SELF_DELEGATION: U256 = {
     U256::from_limbs([0x19E0_C9BA_B240_0000, 0x0000_0000_0000_021E, 0, 0])
 };
 
-/// Unbonding period: 604,800 blocks (~7 days at 1 block/sec).
-pub const UNBONDING_PERIOD: u64 = 604_800;
+/// FIX ECON-PF-16: Canonical target block time in seconds. All block-count
+/// constants derive from this. Matches max_view_time (2s) in node config.
+pub const TARGET_BLOCK_TIME_SECS: u64 = 2;
+
+/// Unbonding period: ~7 days of blocks.
+pub const UNBONDING_PERIOD: u64 = 7 * 24 * 3600 / TARGET_BLOCK_TIME_SECS;
 
 /// Maximum commission rate: 5000 bps (50%).
 pub const MAX_COMMISSION_BPS: u16 = 5000;
@@ -310,8 +314,8 @@ pub const MAX_COMMISSION_BPS: u16 = 5000;
 /// Maximum commission change per update: 100 bps (1%).
 pub const MAX_COMMISSION_CHANGE_BPS: u16 = 100;
 
-/// Blocks per year (~1 block/sec): 31,536,000.
-pub const BLOCKS_PER_YEAR: u64 = 31_536_000;
+/// Blocks per year, derived from TARGET_BLOCK_TIME_SECS.
+pub const BLOCKS_PER_YEAR: u64 = 365 * 24 * 3600 / TARGET_BLOCK_TIME_SECS;
 
 /// Permanent staking APY: 500 bps (5%).
 pub const PERMANENT_STAKE_APY_BPS: u64 = 500;
@@ -350,11 +354,11 @@ pub const DOWNTIME_WINDOW_BLOCKS: u64 = 1000;
 /// Downtime signing threshold: 50%.
 pub const DOWNTIME_THRESHOLD_PCT: u64 = 50;
 
-/// Jail duration for downtime: 28,800 blocks (~2 days at 6s blocks).
-pub const JAIL_DURATION_BLOCKS: u64 = 28_800;
+/// Jail duration for downtime: ~2 days of blocks.
+pub const JAIL_DURATION_BLOCKS: u64 = 2 * 24 * 3600 / TARGET_BLOCK_TIME_SECS;
 
-/// Jail vote expiry: 14,400 blocks (~1 day).
-pub const JAIL_VOTE_EXPIRY_BLOCKS: u64 = 14_400;
+/// Jail vote expiry: ~1 day of blocks.
+pub const JAIL_VOTE_EXPIRY_BLOCKS: u64 = 24 * 3600 / TARGET_BLOCK_TIME_SECS;
 
 // ============================================================================
 // Fee Split Result (2.7)
@@ -565,11 +569,11 @@ impl BorshDeserialize for PendingKeyRotation {
 // If cooldown enforcement is desired, add a `last_rotation_epoch` field to
 // ValidatorState and check it in submit_key_rotation.
 
-/// Commission change cooldown: 28,800 blocks (~2 days at 6s blocks).
-pub const COMMISSION_COOLDOWN_BLOCKS: u64 = 28_800;
+/// Commission change cooldown: ~2 days of blocks.
+pub const COMMISSION_COOLDOWN_BLOCKS: u64 = 2 * 24 * 3600 / TARGET_BLOCK_TIME_SECS;
 
-/// Validator whitelist expiry: 604,800 blocks (~7 days at 1 block/sec).
-pub const WHITELIST_EXPIRY_BLOCKS: u64 = 604_800;
+/// Validator whitelist expiry: ~7 days of blocks.
+pub const WHITELIST_EXPIRY_BLOCKS: u64 = 7 * 24 * 3600 / TARGET_BLOCK_TIME_SECS;
 
 /// Minimum number of active validators for BFT liveness (3f+1 where f=1).
 pub const MIN_ACTIVE_VALIDATORS: usize = 4;

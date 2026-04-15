@@ -266,7 +266,10 @@ async fn torus_submit_native_action_valid() {
     // Create a signed native action using the EIP-712 signing facility.
     let key = k256::ecdsa::SigningKey::from_slice(&[1u8; 32]).unwrap();
     let action = torus_types::NativeAction::ClaimRewards;
-    let nonce = 1_000_000u64;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
     let signed = torus_types::eip712::sign_native_action(action, nonce, &key);
 
     // Serialize to JSON bytes, then hex-encode.

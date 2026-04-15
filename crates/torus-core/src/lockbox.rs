@@ -113,6 +113,53 @@ impl Lockbox {
         state_db.write(batch)?;
         Ok(())
     }
+
+    /// FIX ECON-PF-17: Withdraw from sender's native balance to a specified EVM address.
+    ///
+    /// Debits `sender`'s native balance, credits `to`'s EVM balance.
+    /// When `to == sender`, this is equivalent to `withdraw_from_native`.
+    pub fn withdraw_from_native_to(
+        state_db: &StateDb,
+        sender: &Address,
+        to: &Address,
+        amount: FixedPoint,
+    ) -> Result<(), CoreError> {
+        if amount <= FixedPoint::ZERO {
+            return Ok(());
+        }
+
+        // Read and verify sender's native balance
+        let native_bal = get_native_balance(state_db, sender)?;
+        if native_bal.available < amount {
+            return Err(CoreError::InsufficientNativeBalance {
+                have: native_bal.available,
+                need: amount,
+            });
+        }
+
+        // Debit sender's native balance
+        let mut updated_bal = native_bal;
+        updated_bal.available = updated_bal.available - amount;
+
+        // Credit recipient's EVM balance
+        let evm_amount = fp_to_u256(amount);
+        let evm_balance = get_evm_balance(state_db, to)?;
+
+        // Atomic write: debit sender native + credit recipient EVM in one WriteBatch.
+        let mut batch = WriteBatch::default();
+        let cf_accounts = state_db.cf_handle(CF_ACCOUNTS)?;
+        let cf_native = state_db.cf_handle(CF_NATIVE_BALANCES)?;
+
+        let native_data =
+            borsh::to_vec(&updated_bal).map_err(|e| CoreError::Borsh(e.to_string()))?;
+        batch.put_cf(cf_native, sender.as_slice(), &native_data);
+
+        let evm_data = build_evm_balance_update(state_db, to, evm_balance + evm_amount)?;
+        batch.put_cf(cf_accounts, to.as_slice(), &evm_data);
+
+        state_db.write(batch)?;
+        Ok(())
+    }
 }
 
 // ============================================================================

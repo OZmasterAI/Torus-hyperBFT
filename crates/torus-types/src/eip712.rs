@@ -207,6 +207,7 @@ pub fn eip712_struct_hash(action: &NativeAction, nonce: u64) -> B256 {
         }
         NativeAction::ListMarket(listing) => hash_list_market(listing, nonce),
         NativeAction::DelistMarket { market_id } => hash_delist_market(*market_id, nonce),
+        NativeAction::TopUpSelfStake { amount } => hash_top_up_self_stake(amount, nonce),
     }
 }
 
@@ -472,6 +473,16 @@ fn hash_delist_market(market_id: MarketId, nonce: u64) -> B256 {
     let mut buf = Vec::with_capacity(3 * 32);
     buf.extend_from_slice(&th.0);
     buf.extend_from_slice(&encode_u64(market_id));
+    buf.extend_from_slice(&encode_u64(nonce));
+    keccak256(&buf)
+}
+
+// FIX ECON-FIND-15: EIP-712 type hash for TopUpSelfStake.
+fn hash_top_up_self_stake(amount: &U256, nonce: u64) -> B256 {
+    let th = keccak256("TopUpSelfStake(uint256 amount,uint64 nonce)");
+    let mut buf = Vec::with_capacity(3 * 32);
+    buf.extend_from_slice(&th.0);
+    buf.extend_from_slice(&encode_u256(amount));
     buf.extend_from_slice(&encode_u64(nonce));
     keccak256(&buf)
 }
