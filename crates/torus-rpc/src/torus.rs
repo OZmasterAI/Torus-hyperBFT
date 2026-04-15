@@ -465,8 +465,7 @@ impl TorusApiServer for RpcState {
 
     async fn get_epoch(&self) -> RpcResult<RpcEpochInfo> {
         let current_height = self.latest_height.load(Ordering::Relaxed);
-        // Default epoch length; in production this comes from ChainConfig.
-        let epoch_length = 100u64;
+        let epoch_length = self.epoch_length;
         let info = torus_economics::queries::get_epoch_info(current_height, epoch_length);
 
         Ok(RpcEpochInfo {
@@ -627,7 +626,7 @@ impl TorusApiServer for RpcState {
 
         // Current fee split BPS using lerp.
         let current_height = self.latest_height.load(Ordering::Relaxed);
-        let epoch_length = 100u64;
+        let epoch_length = self.epoch_length;
         let epoch_info =
             torus_economics::queries::get_epoch_info(current_height, epoch_length);
         let epoch = epoch_info.current_epoch;

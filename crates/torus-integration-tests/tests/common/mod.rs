@@ -133,6 +133,7 @@ impl TestHarness {
             self.mempool.clone(),
             self.executor.clone(),
             TORUS_CHAIN_ID,
+            100,
             notifier,
         );
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();

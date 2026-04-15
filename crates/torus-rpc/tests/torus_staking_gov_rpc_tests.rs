@@ -60,6 +60,7 @@ async fn start_server(
         mempool,
         executor,
         TORUS_CHAIN_ID,
+        100,
         BlockNotifier::new(),
     )
     .start("127.0.0.1:0".parse().unwrap())

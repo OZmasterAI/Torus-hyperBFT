@@ -337,6 +337,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         mempool,
         executor,
         chain_config.chain_id,
+        chain_config.epoch_length,
         notifier,
     );
     // Extract shared handles before start() consumes the server

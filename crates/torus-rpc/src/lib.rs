@@ -108,6 +108,7 @@ pub struct RpcState {
     pub(crate) mempool: Arc<Mempool>,
     pub(crate) executor: Arc<EvmExecutor>,
     pub(crate) chain_id: u64,
+    pub(crate) epoch_length: u64,
     pub(crate) latest_height: Arc<AtomicU64>,
     pub(crate) notifier: BlockNotifier,
     /// Block height up to which historical data has been pruned (0 = archive mode).
@@ -128,6 +129,7 @@ impl RpcServer {
         mempool: Arc<Mempool>,
         executor: Arc<EvmExecutor>,
         chain_id: u64,
+        epoch_length: u64,
         notifier: BlockNotifier,
     ) -> Self {
         let latest = find_latest_height(&state_db);
@@ -137,6 +139,7 @@ impl RpcServer {
                 mempool,
                 executor,
                 chain_id,
+                epoch_length,
                 latest_height: Arc::new(AtomicU64::new(latest)),
                 notifier,
                 pruned_up_to: Arc::new(AtomicU64::new(0)),
@@ -295,6 +298,7 @@ mod tests {
             mempool,
             executor,
             TORUS_CHAIN_ID,
+            100,
             BlockNotifier::new(),
         )
         .start("127.0.0.1:0".parse().unwrap())
