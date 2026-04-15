@@ -33,7 +33,9 @@ already exist.
 **File:** `crates/torus-economics/src/rewards.rs`
 
 Add a standalone `pub fn isqrt(n: U256) -> U256` using Newton's method.
-Place it near `lerp_bps` (line 162) as a math utility.
+Place it near `lerp_bps` (line 162) as a math utility. Visibility:
+`pub(crate)` -- only called from `distribute_validator_inflation()` in
+the same crate. No `pub use` in `lib.rs` needed.
 
 Uses `U256` bit shift (`>> 1`, `<< n`) and division. Need to verify
 `alloy_primitives::U256` supports `leading_zeros()` -- if not, use
@@ -85,20 +87,28 @@ pub fn distribute_validator_inflation(
 Logic:
 1. Get all validators via `staking.all_validators()`
 2. Filter to `status == Active` only
-3. Sum `total_stake()` across active validators -> `total_active_staked`
-4. Guard: if zero active or zero stake, return `Ok(U256::ZERO)`
-5. Compute: `sqrt_staked = isqrt(total_active_staked)`
-6. Compute: `epoch_seconds = epoch_length_blocks * TARGET_BLOCK_TIME_SECS`
-7. Compute: `total_emission = total_active_staked * INFLATION_CONSTANT * epoch_seconds / (sqrt_staked * SECONDS_PER_YEAR)`
-8. For each active validator (sorted deterministically for remainder):
+3. **Sort by address ascending** for deterministic iteration order.
+   The "last validator gets remainder" trick requires all nodes to
+   iterate in the same order. Sort by `address` (not stake) because
+   it's unique and stable across recomputations.
+4. Sum `total_stake()` across active validators -> `total_active_staked`
+5. Guard: if zero active or zero stake, return `Ok(U256::ZERO)`
+6. Compute: `sqrt_staked = isqrt(total_active_staked)`
+7. Compute: `epoch_seconds = epoch_length_blocks * TARGET_BLOCK_TIME_SECS`
+8. Compute: `total_emission = total_active_staked * INFLATION_CONSTANT * epoch_seconds / (sqrt_staked * SECONDS_PER_YEAR)`
+9. For each active validator (in address-sorted order):
    - `val_emission = total_emission * val.total_stake() / total_active_staked`
    - Last validator gets `total_emission - distributed_so_far`
    - Split val_emission into commission + delegator_pool
    - `credit_rewards(validator, commission)`
    - For each delegator: pro-rata share, last gets remainder
    - `credit_rewards(delegator, share)`
-9. Update cumulative tracker: `put_cumulative_validator_inflation(old + total_emission)`
-10. Log and return `total_emission`
+10. Update cumulative tracker: `put_cumulative_validator_inflation(old + total_emission)`
+11. Log and return `total_emission`
+
+**Overflow safety:** Worst case: 1B TRS staked (10^27 atrs) *
+200 * 86400 = ~1.7 * 10^34. U256 max is ~1.16 * 10^77. No overflow
+risk even at extreme staking levels.
 
 **Reuse:** The per-validator commission + delegator distribution follows
 the exact same pattern as `FeeSplitter::distribute_validator_rewards()`
@@ -113,6 +123,8 @@ pattern (~30 lines, two callers have different outer loops).
 - `validator_inflation_zero_stake`
 - `validator_inflation_apy_decreases_with_stake`
 - `validator_inflation_epoch_fraction`
+- `validator_inflation_cumulative_tracker` -- run two epochs, verify
+  `get_cumulative_validator_inflation` returns sum of both emissions
 
 **Verify:** `cargo test -p torus-economics validator_inflation`
 
@@ -165,6 +177,12 @@ pub fn process_epoch_boundary(ctx: &mut NativeExecContext) -> Option<EpochBounda
     }
 
     // --- Phase A: Reward distribution (current active set) ---
+    //
+    // Error strategy: reward failures are logged but do NOT block
+    // rotation (Phase B). Rationale: a reward calculation bug should
+    // not prevent the validator set from rotating, which is critical
+    // for liveness. Rotation failures DO early-return because a
+    // broken validator set is a consensus-safety issue.
 
     // A1: Permanent staking rewards (existing function, newly wired)
     if let Err(e) = RewardDistributor::distribute_permanent_staking_rewards(
@@ -225,8 +243,19 @@ pub fn process_epoch_boundary(ctx: &mut NativeExecContext) -> Option<EpochBounda
 ```
 
 **Helper needed:** `build_current_validator_set(staking, epoch) -> ValidatorSet`
--- reads `all_validators()`, filters `status == Active`, converts to
-`ValidatorSet` format. ~15 lines.
+-- reads `all_validators()`, filters `status == Active`, converts each
+`ValidatorState` to `ValidatorInfo`. Use the same power conversion as
+`compute_new_validator_set` (epoch.rs:57-63):
+```rust
+let wei = U256::from(10u64).pow(U256::from(18u64));
+ValidatorInfo {
+    address: v.address,
+    pubkey: PublicKey(v.pubkey),
+    power: (v.total_stake() / wei).try_into().unwrap_or(u64::MAX),
+    commission_bps: v.commission_bps,
+}
+```
+~15 lines total.
 
 **Verify:** `cargo check -p torus-bridge`
 
@@ -244,7 +273,12 @@ NativeExecutor::process_epoch_boundary(&mut ctx);
 ```
 
 Update to handle new return type. For now, log the diff but don't
-apply to hotstuff_rs (that integration is out of scope):
+apply to hotstuff_rs (that integration is out of scope).
+
+**Note:** The `EpochBoundaryResult` carries `new_set` and `diff`
+specifically so a future PR can feed them into hotstuff_rs
+`ValidatorSetUpdates`. This is not dead code -- it's the designed
+integration point. For now, log and drop:
 
 ```rust
 if let Some(epoch_result) = NativeExecutor::process_epoch_boundary(&mut ctx) {
@@ -266,20 +300,27 @@ Both files get identical code -- deterministic.
 
 ---
 
-## Step 8: Full test pass
+## Step 8: Fix broken tests + full test pass
 
-Run all tests to check for regressions:
+The return type change (`Option<NativeActionResult>` -> `Option<EpochBoundaryResult>`)
+**will** break existing tests that pattern-match on the old type. These are
+guaranteed breakages, not maybes.
+
+**8a. Fix known breakages:**
+- `torus-bridge/tests/native_bridge_tests.rs`: `epoch_boundary_not_triggered`
+  (line 573) and `epoch_boundary_triggered` (line 584) -- update to match
+  new `Option<EpochBoundaryResult>` return type
+- `torus-integration-tests/tests/chaos.rs`: `process_epoch_boundary` call
+  (line 508) -- update to handle new return type
+- Search for any other callers: `grep -r "process_epoch_boundary" crates/`
+
+**8b. Full test pass:**
 
 ```
 cargo test -p torus-economics
 cargo test -p torus-bridge
 cargo test -p torus-integration-tests
 ```
-
-Pay special attention to:
-- Existing `epoch_boundary_*` tests in `torus-bridge/tests/native_bridge_tests.rs`
-- Existing `process_epoch_boundary` tests in `torus-integration-tests/tests/chaos.rs`
-- Any tests that match on the old `Option<NativeActionResult>` return type
 
 ---
 
