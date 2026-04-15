@@ -164,6 +164,7 @@ fn test_governance_permanent_weight_decides_outcome() {
         permanent_weight_multiplier_den: 2,
         treasury_address: treasury,
         timelock_blocks: 5,
+        permanent_unlock_threshold_bps: 8000,
     };
     gov.set_governance_params(&params).unwrap();
 
@@ -241,6 +242,7 @@ fn test_governance_treasury_spend_execution() {
         permanent_weight_multiplier_den: 2,
         treasury_address: treasury,
         timelock_blocks: 5,
+        permanent_unlock_threshold_bps: 8000,
     };
     gov.set_governance_params(&params).unwrap();
 
