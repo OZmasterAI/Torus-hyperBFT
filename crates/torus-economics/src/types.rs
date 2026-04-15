@@ -152,7 +152,11 @@ impl BorshSerialize for Delegation {
         borsh_write_address(&self.delegator, writer)?;
         borsh_write_address(&self.validator, writer)?;
         borsh_write_u256(&self.amount, writer)?;
-        BorshSerialize::serialize(&(self.unbonding.len() as u32), writer)?;
+        // FIX ECON-PF-09: Safe length conversion instead of silent truncation via `as u32`
+        let unbonding_len: u32 = self.unbonding.len().try_into().map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "unbonding vec exceeds u32::MAX")
+        })?;
+        BorshSerialize::serialize(&unbonding_len, writer)?;
         for entry in &self.unbonding {
             BorshSerialize::serialize(entry, writer)?;
         }

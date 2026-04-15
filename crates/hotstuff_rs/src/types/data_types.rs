@@ -409,7 +409,8 @@ impl Add<u64> for ViewNumber {
     type Output = ViewNumber;
 
     fn add(self, rhs: u64) -> Self::Output {
-        ViewNumber(self.0.add(rhs))
+        // FIX CONS-FIND-32: Saturating to prevent overflow panic/wrap.
+        ViewNumber(self.0.saturating_add(rhs))
     }
 }
 
@@ -417,7 +418,8 @@ impl Sub<u64> for ViewNumber {
     type Output = ViewNumber;
 
     fn sub(self, rhs: u64) -> Self::Output {
-        ViewNumber(self.0.sub(rhs))
+        // FIX CONS-FIND-32: Saturating to prevent underflow panic/wrap.
+        ViewNumber(self.0.saturating_sub(rhs))
     }
 }
 
@@ -425,7 +427,9 @@ impl Sub<ViewNumber> for ViewNumber {
     type Output = i64;
 
     fn sub(self, rhs: ViewNumber) -> Self::Output {
-        (self.0 as i64).sub(rhs.0 as i64)
+        // FIX CONS-FIND-32: Safe cast via i128 intermediate to avoid truncation.
+        let diff = self.0 as i128 - rhs.0 as i128;
+        diff.clamp(i64::MIN as i128, i64::MAX as i128) as i64
     }
 }
 

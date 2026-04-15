@@ -97,4 +97,16 @@ pub enum CoreError {
 
     #[error("missing column family: {0}")]
     MissingCf(&'static str),
+
+    // FIX ECON-FIND-20: Stale oracle fallback price
+    #[error("stale oracle price for market {0}")]
+    StaleOraclePrice(MarketId),
+
+    // FIX ECON-FIND-26: Overflow on u128 → i128 cast
+    #[error("overflow: {0}")]
+    Overflow(String),
+
+    // FIX ECON-FIND-27: Invalid enum discriminant from ABI input
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
 }

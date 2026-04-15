@@ -303,6 +303,13 @@ impl<N: Network> Pacemaker<N> {
                 _ => None,
             };
 
+            // FIX CONS-FIND-26: Validate TipInfo fields before collecting.
+            if let Some(ref tip) = timeout_vote.local_tip {
+                if tip.view > self.view_info.view {
+                    return Ok(());
+                }
+            }
+
             // 3. Try to collect the TimeoutVote into a new `TimeoutCertificate`.
             if let Some(new_tc) = self
                 .state
@@ -341,12 +348,13 @@ impl<N: Network> Pacemaker<N> {
 
                     // 3.2. If we are a validator and we haven't broadcasted an AdvanceView message in the current view,
                     //      broadcast an AdvanceView message containing the newly collected TimeoutCertificate.
+                    // FIX CONS-FIND-25: Parenthesize to prevent non-validators broadcasting AdvanceView.
                     if is_validator(&self.config.keypair.public(), &validator_set_state)
-                        && self.state.last_advance_view.is_none()
-                        || self
-                            .state
-                            .last_advance_view
-                            .is_some_and(|v| v < self.view_info.view)
+                        && (self.state.last_advance_view.is_none()
+                            || self
+                                .state
+                                .last_advance_view
+                                .is_some_and(|v| v < self.view_info.view))
                     {
                         let pacemaker_message = PacemakerMessage::advance_view(
                             ProgressCertificate::TimeoutCertificate(new_tc),

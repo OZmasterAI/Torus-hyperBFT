@@ -17,7 +17,7 @@ use torus_core::order_book::{OrderBook, OrderStatus};
 use torus_core::position::{MarginType, PositionManager};
 use torus_core::precompiles::{CoreWriterQueue, QueuedAction, QueuedActionKind};
 use torus_economics::{
-    EpochManager, FeeSplitter, GovernanceManager, RewardDistributor, StakingManager,
+    EpochManager, GovernanceManager, RewardDistributor, StakingManager,
 };
 use torus_state::StateDb;
 use torus_types::{
@@ -212,7 +212,7 @@ impl NativeExecutor {
         match action {
             // ---- Order book ----
             NativeAction::PlaceOrder(params) => Self::exec_place_order(ctx, sender, params),
-            NativeAction::CancelOrder { order_id } => Self::exec_cancel_order(ctx, *order_id),
+            NativeAction::CancelOrder { order_id } => Self::exec_cancel_order(ctx, sender, *order_id),
             NativeAction::CancelAllOrders { market_id } => {
                 Self::exec_cancel_all(ctx, sender, *market_id)
             }
@@ -281,6 +281,10 @@ impl NativeExecutor {
             }
 
             // ---- Admin (governance-gated, stubs) ----
+            // AUDIT: ECON-PF-07 -- Intentional stubs. Market management (listing,
+            // delisting, param updates) will be implemented in the market registry
+            // feature. Variants are defined now so governance pipeline and EIP-712
+            // encoding are stable before the registry is built.
             NativeAction::UpdateMarketParams { .. } => {
                 NativeActionResult::ok("update_market_params", 0)
             }
@@ -433,7 +437,23 @@ impl NativeExecutor {
         NativeActionResult::ok("place_order", 1000)
     }
 
-    fn exec_cancel_order(ctx: &mut NativeExecContext, order_id: u128) -> NativeActionResult {
+    /// FIX CONS-FIND-30: Ownership check added -- only the order's trader can cancel.
+    fn exec_cancel_order(ctx: &mut NativeExecContext, sender: &Address, order_id: u128) -> NativeActionResult {
+        // Check ownership before cancelling (cheaper than cancel + re-insert).
+        for book in ctx.order_books.values() {
+            if let Some(order) = book.get_order(order_id) {
+                if order.trader != *sender {
+                    return NativeActionResult::err(
+                        "cancel_order",
+                        format!(
+                            "order {order_id} belongs to {}, not sender {sender}",
+                            order.trader
+                        ),
+                    );
+                }
+                break;
+            }
+        }
         for book in ctx.order_books.values_mut() {
             if let Ok(cancelled) = book.cancel_order(order_id) {
                 // FIX 2 (ECON-FIND-05): Release order margin on cancel.
@@ -693,9 +713,14 @@ impl NativeExecutor {
             .register_validator(*sender, pubkey.0, commission, self_stake)
         {
             Ok(()) => {
-                // Consume the whitelist entry after successful registration
+                // FIX ECON-FIND-21: Whitelist consume failure must fail the registration
+                // to prevent a validator from registering without consuming their whitelist slot.
                 if let Err(e) = ctx.governance.consume_whitelist(sender) {
-                    tracing::warn!(%sender, %e, "failed to consume whitelist entry");
+                    tracing::error!(%sender, %e, "whitelist consumption failed after registration");
+                    return NativeActionResult::err(
+                        "register_validator",
+                        format!("registered but whitelist error: {e}"),
+                    );
                 }
                 NativeActionResult::ok("register_validator", 5000)
             }
@@ -1049,7 +1074,8 @@ impl NativeExecutor {
             return NativeActionResult::ok("fee_distribution", 0);
         }
 
-        let _split = FeeSplitter::split_fees(total_fees, ctx.epoch);
+        // FIX ECON-FIND-22: Removed dead FeeSplitter::split_fees call.
+        // RewardDistributor::distribute_block_fees computes fee splits internally.
 
         match RewardDistributor::distribute_block_fees(
             &ctx.staking,

@@ -5,6 +5,8 @@ use rocksdb::WriteBatch;
 
 use revm::database::BundleState;
 
+// AUDIT: EVM-FIND-21 -- CF_LOGS / CF_LOGS_BLOOM not populated in commit path.
+// Log indexing deferred; logs served from receipts in RPC layer.
 use torus_state::cf::{
     CF_ACCOUNTS, CF_BLOCK_BODIES, CF_BLOCK_HASH_TO_NUMBER, CF_BLOCK_HEADERS, CF_CODE, CF_RECEIPTS,
     CF_STORAGE, CF_TX_HASH_TO_LOCATION,

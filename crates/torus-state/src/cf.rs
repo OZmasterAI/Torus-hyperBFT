@@ -12,7 +12,11 @@ pub const CF_BLOCK_HASH_TO_NUMBER: &str = "cf_block_hash_to_number";
 
 // Receipts and logs
 pub const CF_RECEIPTS: &str = "cf_receipts";
+/// Reserved for future eth_getLogs indexing. Currently unpopulated.
+/// AUDIT: EVM-FIND-21 -- full log/bloom indexing deferred to post-launch optimisation.
 pub const CF_LOGS: &str = "cf_logs";
+/// Reserved for future eth_getLogs bloom indexing. Currently unpopulated.
+/// AUDIT: EVM-FIND-21 -- full log/bloom indexing deferred to post-launch optimisation.
 pub const CF_LOGS_BLOOM: &str = "cf_logs_bloom";
 pub const CF_TX_HASH_TO_LOCATION: &str = "cf_tx_hash_to_location";
 

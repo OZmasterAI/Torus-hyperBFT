@@ -77,8 +77,14 @@ impl Position {
     }
 }
 
+/// AUDIT FIX ECON-FIND-31: Schema version byte prepended to Position serialization.
+/// BREAKING CHANGE (acceptable pre-launch): existing serialized Positions are
+/// incompatible and must be re-created.
+const POSITION_SCHEMA_VERSION: u8 = 1;
+
 impl BorshSerialize for Position {
     fn serialize<W: Write>(&self, w: &mut W) -> io::Result<()> {
+        w.write_all(&[POSITION_SCHEMA_VERSION])?;
         borsh_write_address(&self.trader, w)?;
         w.write_all(&self.market_id.to_be_bytes())?;
         w.write_all(&[u8::from(self.is_long)])?;
@@ -93,6 +99,14 @@ impl BorshSerialize for Position {
 
 impl BorshDeserialize for Position {
     fn deserialize_reader<R: Read>(r: &mut R) -> io::Result<Self> {
+        let mut ver = [0u8; 1];
+        r.read_exact(&mut ver)?;
+        if ver[0] != POSITION_SCHEMA_VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported Position schema version: {} (expected {})", ver[0], POSITION_SCHEMA_VERSION),
+            ));
+        }
         let trader = borsh_read_address(r)?;
         let mut mb = [0u8; 8];
         r.read_exact(&mut mb)?;
@@ -140,8 +154,14 @@ impl Default for NativeBalance {
     }
 }
 
+/// AUDIT FIX ECON-FIND-31: Schema version byte prepended to NativeBalance serialization.
+/// BREAKING CHANGE (acceptable pre-launch): existing serialized NativeBalances are
+/// incompatible and must be re-created.
+const NATIVE_BALANCE_SCHEMA_VERSION: u8 = 1;
+
 impl BorshSerialize for NativeBalance {
     fn serialize<W: Write>(&self, w: &mut W) -> io::Result<()> {
+        w.write_all(&[NATIVE_BALANCE_SCHEMA_VERSION])?;
         borsh_write_fp(&self.available, w)?;
         borsh_write_fp(&self.order_margin, w)?;
         Ok(())
@@ -150,6 +170,14 @@ impl BorshSerialize for NativeBalance {
 
 impl BorshDeserialize for NativeBalance {
     fn deserialize_reader<R: Read>(r: &mut R) -> io::Result<Self> {
+        let mut ver = [0u8; 1];
+        r.read_exact(&mut ver)?;
+        if ver[0] != NATIVE_BALANCE_SCHEMA_VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported NativeBalance schema version: {} (expected {})", ver[0], NATIVE_BALANCE_SCHEMA_VERSION),
+            ));
+        }
         let available = borsh_read_fp(r)?;
         let order_margin = borsh_read_fp(r)?;
         Ok(Self {

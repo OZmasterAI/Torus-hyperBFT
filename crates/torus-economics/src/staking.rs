@@ -842,7 +842,12 @@ impl StakingManager {
         Ok(delegations)
     }
 
-    /// Read all delegations for a specific validator (full scan, filter by validator).
+    /// Read all delegations for a specific validator.
+    ///
+    /// AUDIT: ECON-FIND-30 -- O(n) scan over all delegations. The key layout
+    /// `delegator(20) ++ validator(20)` prevents prefix-based lookup by validator.
+    /// A secondary index would fix this but requires schema migration. Acceptable
+    /// for now: only called during slashing, not on the per-block hot path.
     pub fn delegations_for_validator(&self, validator: &Address) -> Result<Vec<Delegation>> {
         let db = self.state_db.inner();
         let cf = db.cf_handle(CF_STAKING_DELEGATIONS).ok_or_else(|| {

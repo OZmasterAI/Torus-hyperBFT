@@ -227,14 +227,14 @@ impl OracleManager {
         let filtered = reject_outliers(&price_stake_pairs);
 
         if filtered.len() < self.config.min_oracle_reporters {
-            return self.get_last_valid_price(market_id);
+            return self.get_last_valid_price(market_id, current_block);
         }
 
         // FIX 19: Single-reporter safety — bound price change vs last valid price (ECON-PF-18)
         // When only one reporter passes filters, cap deviation at 10% from last known price
         // to prevent a single validator from manipulating the oracle.
         if filtered.len() == 1 {
-            if let Ok(last_price) = self.get_last_valid_price(market_id) {
+            if let Ok(last_price) = self.get_last_valid_price(market_id, current_block) {
                 if last_price > FixedPoint::ZERO {
                     let single_price = filtered[0].0;
                     let diff = if single_price > last_price {
@@ -247,7 +247,7 @@ impl OracleManager {
                     let bps_denom = FixedPoint::from_raw(10_000 * FixedPoint::SCALE);
                     let max_change = last_price * max_deviation_bps / bps_denom;
                     if diff > max_change {
-                        return self.get_last_valid_price(market_id);
+                        return self.get_last_valid_price(market_id, current_block);
                     }
                 }
             }
@@ -341,12 +341,18 @@ impl OracleManager {
         Ok(latest_per_validator.into_values().collect())
     }
 
-    fn get_last_valid_price(&self, market_id: MarketId) -> Result<FixedPoint, CoreError> {
+    /// AUDIT FIX ECON-FIND-20: `get_last_valid_price` now enforces the same
+    /// staleness check as `get_price`. Without this, a price from block 0 could
+    /// be returned as if current when used as a fallback in `aggregate_price`.
+    fn get_last_valid_price(&self, market_id: MarketId, current_block: u64) -> Result<FixedPoint, CoreError> {
         let key = aggregated_price_key(market_id);
         match self.state_db.get_cf_raw(CF_NATIVE_ORACLE, &key)? {
             Some(data) => {
                 let stored = StoredAggregatedPrice::try_from_slice(&data)
                     .map_err(|e| CoreError::Borsh(e.to_string()))?;
+                if current_block.saturating_sub(stored.block_number) > self.config.max_oracle_age {
+                    return Err(CoreError::StaleOraclePrice(market_id));
+                }
                 Ok(stored.price)
             }
             None => Err(CoreError::NoOraclePrice(market_id)),

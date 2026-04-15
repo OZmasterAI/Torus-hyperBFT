@@ -721,6 +721,27 @@ fn core_writer(
         let quantity = abi::decode_u128(&abi::word(input, 4)?);
         let time_in_force = abi::decode_u8(&abi::word(input, 5)?);
 
+        // FIX ECON-FIND-27: Validate enum discriminant ranges before use
+        // Side: 0=Buy, 1=Sell
+        if side > 1 {
+            return Err(CoreError::InvalidInput(format!("invalid side: {side}")));
+        }
+        // OrderType: 0=Limit, 1=Market, 2=StopMarket, 3=StopLimit
+        if order_type > 3 {
+            return Err(CoreError::InvalidInput(format!("invalid order_type: {order_type}")));
+        }
+        // TimeInForce: 0=GTC, 1=IOC, 2=FOK, 3=PostOnly
+        if time_in_force > 3 {
+            return Err(CoreError::InvalidInput(format!("invalid time_in_force: {time_in_force}")));
+        }
+        // FIX ECON-FIND-26: Validate u128 fits in i128 before cast (price & quantity)
+        if price > i128::MAX as u128 {
+            return Err(CoreError::Overflow("order price exceeds i128::MAX".into()));
+        }
+        if quantity > i128::MAX as u128 {
+            return Err(CoreError::Overflow("order quantity exceeds i128::MAX".into()));
+        }
+
         let action = QueuedAction {
             trader: *caller,
             kind: QueuedActionKind::PlaceOrder {
@@ -779,6 +800,10 @@ fn core_writer_staking(
     if sel == selector_for("delegate(address,uint128)") {
         let validator = abi::decode_address(&abi::word(input, 0)?);
         let amount = abi::decode_u128(&abi::word(input, 1)?);
+        // FIX ECON-FIND-26: Validate u128 fits in i128 before cast
+        if amount > i128::MAX as u128 {
+            return Err(CoreError::Overflow("delegate amount exceeds i128::MAX".into()));
+        }
 
         let action = QueuedAction {
             trader: *caller,
@@ -793,6 +818,10 @@ fn core_writer_staking(
     } else if sel == selector_for("undelegate(address,uint128)") {
         let validator = abi::decode_address(&abi::word(input, 0)?);
         let amount = abi::decode_u128(&abi::word(input, 1)?);
+        // FIX ECON-FIND-26: Validate u128 fits in i128 before cast
+        if amount > i128::MAX as u128 {
+            return Err(CoreError::Overflow("undelegate amount exceeds i128::MAX".into()));
+        }
 
         let action = QueuedAction {
             trader: *caller,
@@ -815,6 +844,10 @@ fn core_writer_staking(
         Ok(abi::encode_u128(0).to_vec())
     } else if sel == selector_for("lockPermanent(uint128)") {
         let amount = abi::decode_u128(&abi::word(input, 0)?);
+        // FIX ECON-FIND-26: Validate u128 fits in i128 before cast
+        if amount > i128::MAX as u128 {
+            return Err(CoreError::Overflow("lockPermanent amount exceeds i128::MAX".into()));
+        }
 
         let action = QueuedAction {
             trader: *caller,
@@ -843,11 +876,19 @@ fn lockbox_precompile(
 
     if sel == selector_for("depositToNative(uint128)") {
         let amount_raw = abi::decode_u128(&abi::word(input, 0)?);
+        // FIX ECON-FIND-26: Validate u128 fits in i128 before cast
+        if amount_raw > i128::MAX as u128 {
+            return Err(CoreError::Overflow("lockbox deposit amount exceeds i128::MAX".into()));
+        }
         let amount = FixedPoint::from_raw(amount_raw as i128);
         Lockbox::deposit_to_native(state_db, caller, amount)?;
         Ok(abi::encode_bool(true).to_vec())
     } else if sel == selector_for("withdrawFromNative(uint128)") {
         let amount_raw = abi::decode_u128(&abi::word(input, 0)?);
+        // FIX ECON-FIND-26: Validate u128 fits in i128 before cast
+        if amount_raw > i128::MAX as u128 {
+            return Err(CoreError::Overflow("lockbox withdraw amount exceeds i128::MAX".into()));
+        }
         let amount = FixedPoint::from_raw(amount_raw as i128);
         Lockbox::withdraw_from_native(state_db, caller, amount)?;
         Ok(abi::encode_bool(true).to_vec())

@@ -313,3 +313,44 @@ fn map_evm_err<DB: core::fmt::Debug, TX: core::fmt::Debug>(err: EVMError<DB, TX>
         EVMError::Custom(msg) => EvmError::Internal(msg),
     }
 }
+
+// AUDIT: EVM-FIND-22 -- Unit tests for calc_effective_gas_price.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn calc_effective_gas_price_legacy() {
+        // Legacy tx (no priority fee): gas price is max_fee directly.
+        assert_eq!(calc_effective_gas_price(100, 500, None), 500);
+    }
+
+    #[test]
+    fn calc_effective_gas_price_eip1559_normal() {
+        // EIP-1559: base_fee + min(priority_fee, max_fee - base_fee)
+        // = 100 + min(50, 400) = 150
+        assert_eq!(calc_effective_gas_price(100, 500, Some(50)), 150);
+    }
+
+    #[test]
+    fn calc_effective_gas_price_eip1559_capped() {
+        // Priority fee exceeds headroom: capped to max_fee - base_fee.
+        // = 100 + min(1000, 400) = 500
+        assert_eq!(calc_effective_gas_price(100, 500, Some(1000)), 500);
+    }
+
+    #[test]
+    fn calc_effective_gas_price_overflow_saturates() {
+        // Values exceeding u64::MAX saturate instead of truncating.
+        let huge: u128 = u64::MAX as u128 + 1000;
+        assert_eq!(calc_effective_gas_price(0, huge, None), u64::MAX);
+        assert_eq!(calc_effective_gas_price(100, huge, Some(huge)), u64::MAX);
+    }
+
+    #[test]
+    fn calc_effective_gas_price_zero_base() {
+        // Zero base fee: effective price equals min(priority_fee, max_fee).
+        assert_eq!(calc_effective_gas_price(0, 100, Some(50)), 50);
+        assert_eq!(calc_effective_gas_price(0, 0, Some(0)), 0);
+    }
+}

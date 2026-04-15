@@ -71,6 +71,7 @@ fn envelope_to_tx_env(envelope: &TxEnvelope, sender: Address) -> Result<TxEnv, B
                 data: tx.input.clone(),
                 nonce: tx.nonce,
                 chain_id: Some(tx.chain_id),
+                access_list: tx.access_list.clone(), // FIX CONS-FIND-31
                 ..Default::default()
             }
         }
@@ -86,6 +87,7 @@ fn envelope_to_tx_env(envelope: &TxEnvelope, sender: Address) -> Result<TxEnv, B
                 data: tx.input.clone(),
                 nonce: tx.nonce,
                 chain_id: Some(tx.chain_id),
+                access_list: tx.access_list.clone(), // FIX CONS-FIND-31
                 ..Default::default()
             }
         }

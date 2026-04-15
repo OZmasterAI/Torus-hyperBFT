@@ -367,16 +367,29 @@ impl<N: Network> HotStuff<N> {
                     view: self.view_info.view,
                     tc: tc.clone(),
                 };
-                let mut sent_count = 0;
-                for (vk, _power) in validator_set.validators_and_powers() {
-                    if sent_count >= kappa { break; }
-                    if vk != self.config.keypair.public() {
-                        self.sender_handle.send::<HotStuffMessage>(
-                            vk,
-                            req.clone().into(),
-                        );
-                        sent_count += 1;
+                // FIX CONS-FIND-28: Shuffle recipients to prevent deterministic withholding.
+                let mut recipients: Vec<_> = validator_set.validators_and_powers()
+                    .into_iter()
+                    .map(|(vk, _)| vk)
+                    .filter(|vk| *vk != self.config.keypair.public())
+                    .collect();
+
+                // Deterministic shuffle seeded by view number.
+                let seed = self.view_info.view.int();
+                let len = recipients.len();
+                if len > 1 {
+                    for i in (1..len).rev() {
+                        let j = (seed.wrapping_mul(6364136223846793005).wrapping_add(i as u64)
+                            % (i as u64 + 1)) as usize;
+                        recipients.swap(i, j);
                     }
+                }
+
+                for vk in recipients.into_iter().take(kappa) {
+                    self.sender_handle.send::<HotStuffMessage>(
+                        vk,
+                        req.clone().into(),
+                    );
                 }
 
                 // Step 2: Broadcast NERequest to ALL validators.
@@ -801,6 +814,21 @@ impl<N: Network> HotStuff<N> {
         let _ = self
             .phase_vote_collectors
             .update_validator_sets(&validator_set_state);
+
+        // FIX CONS-FIND-27: Update local_tip for nudge-certified blocks.
+        {
+            use crate::pacemaker::types::TipInfo;
+            if let Ok(Some(block)) = block_tree.block(&nudge.justify.block) {
+                let tip = TipInfo {
+                    block_hash: block.hash,
+                    block_height: block.height,
+                    block_justify: nudge.justify.clone(),
+                    block_data_hash: block.data_hash,
+                    view: self.view_info.view,
+                };
+                block_tree.set_local_tip(&tip)?;
+            }
+        }
 
         // 4. Vote, if I am allowed to vote and if I haven't voted in this view yet.
         if is_phase_voter(

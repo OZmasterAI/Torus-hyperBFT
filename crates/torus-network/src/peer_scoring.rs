@@ -177,11 +177,12 @@ impl PeerScoring {
     }
 
     /// Apply a temporary ban (1 hour).
+    /// Note: does NOT call save_bans — temp bans are in-memory only (Instant
+    /// is not serializable). Only permanent bans are persisted.
     fn temporary_ban(&mut self, peer: &PeerId, reason: &str) {
         let until = Instant::now() + TEMP_BAN_DURATION;
         self.temp_bans.insert(*peer, until);
         tracing::warn!(%peer, %reason, "peer temporarily banned (1 hour)");
-        self.save_bans();
     }
 
     /// Apply a permanent ban.
@@ -245,6 +246,9 @@ impl PeerScoring {
     }
 
     /// Save ban list to JSON file.
+    ///
+    /// FIX CONS-FIND-29: File I/O is offloaded to a background OS thread via
+    /// `std::thread::spawn` so it does not block the async event loop.
     fn save_bans(&self) {
         let path = match &self.ban_file {
             Some(p) => p.clone(),
@@ -267,14 +271,16 @@ impl PeerScoring {
             })
             .collect();
 
-        if let Ok(json) = serde_json::to_string_pretty(&entries) {
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
+        std::thread::spawn(move || {
+            if let Ok(json) = serde_json::to_string_pretty(&entries) {
+                if let Some(parent) = path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                if let Err(e) = std::fs::write(&path, json) {
+                    tracing::warn!(%e, "failed to save ban list");
+                }
             }
-            if let Err(e) = std::fs::write(&path, json) {
-                tracing::warn!(%e, "failed to save ban list");
-            }
-        }
+        });
     }
 }
 
@@ -435,6 +441,14 @@ mod tests {
                 scoring.penalize(&peer, PENALTY_INVALID_CONSENSUS_MSG, "attack");
             }
             assert!(scoring.permanently_banned_peers().contains(&peer));
+        }
+
+        // Wait for background thread to flush ban file to disk.
+        for _ in 0..100 {
+            if ban_file.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
 
         // Reload and check persistence
