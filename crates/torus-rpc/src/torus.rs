@@ -343,8 +343,15 @@ impl TorusApiServer for RpcState {
 
         let pruned_up_to = self.pruned_up_to.load(Relaxed);
 
-        let iter = db.prefix_iterator_cf(cf, &prefix);
-        let mut trades = Vec::new();
+        // Reverse-iterate from the upper bound of this market's key range.
+        // Key format: market_id(8) + block_number(8) + trade_index(4) = 20 bytes.
+        let mut upper = [0xFFu8; 20];
+        upper[..8].copy_from_slice(&prefix);
+        let iter = db.iterator_cf(
+            cf,
+            rocksdb::IteratorMode::From(&upper, rocksdb::Direction::Reverse),
+        );
+        let mut trades = Vec::with_capacity(limit);
 
         for item in iter {
             let (key, value) = item
@@ -355,12 +362,12 @@ impl TorusApiServer for RpcState {
             }
 
             // Key: market_id(8) + block_number(8) + trade_index(4)
-            // Skip trades from pruned blocks (forward-compatible for when
-            // trade pruning is implemented in a future batch).
+            // Since we iterate newest-first, once we hit a pruned block all
+            // remaining entries are older — stop immediately.
             if key.len() >= 16 && pruned_up_to > 0 {
                 let block = u64::from_be_bytes(key[8..16].try_into().unwrap());
                 if block < pruned_up_to {
-                    continue;
+                    break;
                 }
             }
 
@@ -381,11 +388,13 @@ impl TorusApiServer for RpcState {
                 block_number: hex_u64(trade.block_number),
                 timestamp: hex_u64(trade.timestamp),
             });
+
+            if trades.len() >= limit {
+                break;
+            }
         }
 
-        // Most recent first (keys are chronological ascending)
-        trades.reverse();
-        trades.truncate(limit);
+        // Already in descending order (most recent first) from reverse iteration.
         Ok(trades)
     }
 

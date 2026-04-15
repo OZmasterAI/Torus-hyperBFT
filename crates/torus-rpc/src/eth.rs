@@ -979,8 +979,10 @@ impl EthApiServer for RpcState {
         newest_block: String,
         reward_percentiles: Option<Vec<f64>>,
     ) -> RpcResult<FeeHistory> {
+        const MAX_FEE_HISTORY_BLOCKS: u64 = 1024;
+
         let latest = self.latest_height.load(Relaxed);
-        let count = parse_u64(&block_count).map_err(err)?;
+        let count = parse_u64(&block_count).map_err(err)?.min(MAX_FEE_HISTORY_BLOCKS);
         let newest = resolve_block_tag(&newest_block, latest).map_err(err)?;
         let oldest = newest.saturating_sub(count.saturating_sub(1));
         let mut base_fees = Vec::new();

@@ -399,8 +399,8 @@ fn enqueue_inbound(
 ) {
     let mut queue = inbound.lock().unwrap();
     if queue.len() >= MAX_INBOUND_QUEUE {
-        warn!("inbound queue full ({MAX_INBOUND_QUEUE}), dropping oldest message");
-        queue.pop_front();
+        warn!("inbound queue full ({MAX_INBOUND_QUEUE}), dropping incoming message");
+        return;
     }
     queue.push_back((sender, msg));
 }
