@@ -225,7 +225,8 @@ impl StakingManager {
     // Permanent staking
     // ========================================================================
 
-    /// Lock tokens permanently. Irreversible.
+    /// Lock tokens permanently. Irreversible unless governance votes to unlock
+    /// (80% supermajority via `PermanentUnlock` proposal).
     pub fn permanent_stake(&self, staker: Address, amount: U256, current_block: u64) -> Result<()> {
         if amount.is_zero() {
             return Ok(());
@@ -244,6 +245,71 @@ impl StakingManager {
         self.put_permanent_stake(&staker, &info)?;
 
         tracing::info!(%staker, %amount, "permanently staked");
+        Ok(())
+    }
+
+    /// Unlock permanently staked tokens via governance vote. Only callable from
+    /// within the crate (governance execution), never from user transactions.
+    ///
+    /// Mid-epoch timing: the staker receives full rewards for the last completed
+    /// epoch (already distributed). They will not appear in the next epoch's
+    /// `distribute_permanent_staking_rewards` since their record is removed/reduced.
+    ///
+    /// Vote weight: the staker's 1.5x governance weight automatically decreases
+    /// for future proposals since `compute_vote_weight()` reads live permanent stake.
+    /// Past proposal votes are unaffected (ECON-FIND-16 snapshots).
+    pub(crate) fn governance_unlock_permanent_stake(
+        &self,
+        staker: Address,
+        amount: U256,
+    ) -> Result<()> {
+        if amount.is_zero() {
+            return Err(EconomicsError::InvalidParameterValue {
+                key: "amount".to_string(),
+                reason: "permanent unlock amount must be > 0".to_string(),
+            });
+        }
+
+        let info = self
+            .get_permanent_stake(&staker)?
+            .ok_or(EconomicsError::PermanentStakeNotFound(staker))?;
+
+        if amount > info.amount {
+            return Err(EconomicsError::PermanentUnlockExceedsStake {
+                amount,
+                stake: info.amount,
+            });
+        }
+
+        // Update or remove the permanent stake entry.
+        if amount == info.amount {
+            self.delete_permanent_stake(&staker)?;
+        } else {
+            let updated = PermanentStakeInfo {
+                staker,
+                amount: info.amount - amount,
+                locked_at_block: info.locked_at_block,
+            };
+            self.put_permanent_stake(&staker, &updated)?;
+        }
+
+        // Claim any accrued pending rewards (from delegation etc.) if present.
+        let claimed_rewards = match self.get_pending_rewards(&staker)? {
+            Some(rewards) if !rewards.amount.is_zero() => {
+                let r = rewards.amount;
+                self.delete_pending_rewards(&staker)?;
+                r
+            }
+            _ => U256::ZERO,
+        };
+
+        // Credit unlocked principal + any claimed rewards to liquid balance.
+        self.credit_balance(&staker, amount + claimed_rewards)?;
+
+        tracing::info!(
+            %staker, %amount, %claimed_rewards,
+            "permanent stake unlocked via governance"
+        );
         Ok(())
     }
 
@@ -726,6 +792,12 @@ impl StakingManager {
         let data = borsh::to_vec(info).map_err(|e| EconomicsError::Borsh(e.to_string()))?;
         self.state_db
             .put_cf_raw(CF_STAKING_PERMANENT, address.as_slice(), &data)?;
+        Ok(())
+    }
+
+    fn delete_permanent_stake(&self, address: &Address) -> Result<()> {
+        self.state_db
+            .delete_cf_raw(CF_STAKING_PERMANENT, address.as_slice())?;
         Ok(())
     }
 

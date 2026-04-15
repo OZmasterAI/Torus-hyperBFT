@@ -48,6 +48,7 @@ fn setup() -> (tempfile::TempDir, GovernanceManager, StakingManager) {
         permanent_weight_multiplier_den: 2,
         treasury_address: addr(99),
         timelock_blocks: 10, // short for tests
+        permanent_unlock_threshold_bps: 8000,
     };
     gov.set_governance_params(&params).unwrap();
 

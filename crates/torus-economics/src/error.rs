@@ -149,4 +149,12 @@ pub enum EconomicsError {
         delegator: Address,
         validator: Address,
     },
+
+    // Permanent unlock errors (governance escape hatch)
+
+    #[error("permanent stake not found for {0}")]
+    PermanentStakeNotFound(Address),
+
+    #[error("permanent unlock amount {amount} exceeds stake {stake}")]
+    PermanentUnlockExceedsStake { amount: U256, stake: U256 },
 }

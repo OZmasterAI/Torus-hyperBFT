@@ -324,6 +324,9 @@ pub const BLOCKS_PER_YEAR: u64 = 365 * 24 * 3600 / TARGET_BLOCK_TIME_SECS;
 /// Permanent staking APY: 500 bps (5%).
 pub const PERMANENT_STAKE_APY_BPS: u64 = 500;
 
+/// Default supermajority threshold for PermanentUnlock proposals: 8000 bps (80%).
+pub const DEFAULT_PERMANENT_UNLOCK_THRESHOLD_BPS: u64 = 8000;
+
 /// Fee split transition epochs (5 years).
 pub const TRANSITION_EPOCHS: u64 = 1825;
 

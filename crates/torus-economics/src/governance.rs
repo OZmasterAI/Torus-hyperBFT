@@ -82,6 +82,8 @@ pub enum ProposalType {
     TextProposal,
     /// Whitelist a candidate for validator registration (Phase 3: 3.2.1).
     ValidatorRegistration,
+    /// Unlock permanently staked tokens via governance supermajority (80%).
+    PermanentUnlock,
 }
 
 impl BorshSerialize for ProposalType {
@@ -92,6 +94,7 @@ impl BorshSerialize for ProposalType {
             Self::MarketListing => 2,
             Self::TextProposal => 3,
             Self::ValidatorRegistration => 4,
+            Self::PermanentUnlock => 5,
         };
         writer.write_all(&[disc])
     }
@@ -107,6 +110,7 @@ impl BorshDeserialize for ProposalType {
             2 => Ok(Self::MarketListing),
             3 => Ok(Self::TextProposal),
             4 => Ok(Self::ValidatorRegistration),
+            5 => Ok(Self::PermanentUnlock),
             x => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("invalid ProposalType discriminant: {x}"),
@@ -191,6 +195,11 @@ pub enum ExecutionPayload {
     ValidatorRegistration {
         candidate: Address,
     },
+    /// Unlock permanently staked tokens via governance supermajority vote.
+    PermanentUnlock {
+        staker: Address,
+        amount: U256,
+    },
 }
 
 impl BorshSerialize for ExecutionPayload {
@@ -221,6 +230,11 @@ impl BorshSerialize for ExecutionPayload {
             Self::ValidatorRegistration { candidate } => {
                 writer.write_all(&[3u8])?;
                 borsh_write_address(candidate, writer)?;
+            }
+            Self::PermanentUnlock { staker, amount } => {
+                writer.write_all(&[4u8])?;
+                borsh_write_address(staker, writer)?;
+                borsh_write_u256(amount, writer)?;
             }
         }
         Ok(())
@@ -257,6 +271,11 @@ impl BorshDeserialize for ExecutionPayload {
             3 => {
                 let candidate = borsh_read_address(reader)?;
                 Ok(Self::ValidatorRegistration { candidate })
+            }
+            4 => {
+                let staker = borsh_read_address(reader)?;
+                let amount = borsh_read_u256(reader)?;
+                Ok(Self::PermanentUnlock { staker, amount })
             }
             x => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -400,6 +419,8 @@ pub struct GovernanceParams {
     pub treasury_address: Address,
     /// Timelock blocks: proposals must wait this many blocks after passing before execution.
     pub timelock_blocks: u64,
+    /// Supermajority threshold for PermanentUnlock proposals (bps, default 8000 = 80%).
+    pub permanent_unlock_threshold_bps: u64,
 }
 
 impl GovernanceParams {
@@ -413,6 +434,7 @@ impl GovernanceParams {
             permanent_weight_multiplier_den: 2,
             treasury_address,
             timelock_blocks: 24 * 3600 / crate::types::TARGET_BLOCK_TIME_SECS,
+            permanent_unlock_threshold_bps: crate::types::DEFAULT_PERMANENT_UNLOCK_THRESHOLD_BPS,
         }
     }
 }
@@ -426,6 +448,7 @@ impl BorshSerialize for GovernanceParams {
         BorshSerialize::serialize(&self.permanent_weight_multiplier_den, writer)?;
         borsh_write_address(&self.treasury_address, writer)?;
         BorshSerialize::serialize(&self.timelock_blocks, writer)?;
+        BorshSerialize::serialize(&self.permanent_unlock_threshold_bps, writer)?;
         Ok(())
     }
 }
@@ -439,10 +462,13 @@ impl BorshDeserialize for GovernanceParams {
         let permanent_weight_multiplier_den = u64::deserialize_reader(reader)?;
         let treasury_address = borsh_read_address(reader)?;
         let timelock_blocks = u64::deserialize_reader(reader)?;
+        // Backward-compatible: default if field absent (pre-upgrade data).
+        let permanent_unlock_threshold_bps = u64::deserialize_reader(reader)
+            .unwrap_or(crate::types::DEFAULT_PERMANENT_UNLOCK_THRESHOLD_BPS);
         Ok(Self {
             voting_period_blocks, quorum_bps, min_proposal_stake,
             permanent_weight_multiplier_num, permanent_weight_multiplier_den,
-            treasury_address, timelock_blocks,
+            treasury_address, timelock_blocks, permanent_unlock_threshold_bps,
         })
     }
 }
@@ -576,6 +602,17 @@ impl GovernanceManager {
                     });
                 }
             }
+            "permanent_unlock_threshold_bps" => {
+                let v: u64 = value.parse().map_err(|_| EconomicsError::InvalidParameterValue {
+                    key: key.to_string(), reason: "must be a valid u64".to_string(),
+                })?;
+                if v < 5000 || v > 10000 {
+                    return Err(EconomicsError::InvalidParameterValue {
+                        key: key.to_string(),
+                        reason: "must be between 5000 and 10000 (50% - 100%)".to_string(),
+                    });
+                }
+            }
             _ => return Err(EconomicsError::ParameterNotModifiable(key.to_string())),
         }
         Ok(())
@@ -633,6 +670,7 @@ impl GovernanceManager {
             Some(ExecutionPayload::ValidatorRegistration { .. }) => {
                 ProposalType::ValidatorRegistration
             }
+            Some(ExecutionPayload::PermanentUnlock { .. }) => ProposalType::PermanentUnlock,
             None => ProposalType::TextProposal,
         };
 
@@ -804,7 +842,18 @@ impl GovernanceManager {
 
         // FIX 20: Use total vote weight (yes + no + abstain) for quorum check.
         let total_votes = self.total_vote_weight(proposal_id)?;
-        let passed = proposal.votes_for > proposal.votes_against && total_votes >= quorum;
+
+        // PermanentUnlock requires supermajority: votes_for / total_vote_weight >= threshold_bps.
+        // Abstains count toward total_vote_weight (conservative: makes passage harder).
+        // All other proposal types keep simple majority.
+        let passed = if proposal.proposal_type == ProposalType::PermanentUnlock {
+            let threshold = U256::from(params.permanent_unlock_threshold_bps);
+            total_votes >= quorum
+                && !total_votes.is_zero()
+                && proposal.votes_for * U256::from(10_000u64) >= threshold * total_votes
+        } else {
+            proposal.votes_for > proposal.votes_against && total_votes >= quorum
+        };
 
         if !passed {
             proposal.status = ProposalStatus::Rejected;
@@ -967,6 +1016,14 @@ impl GovernanceManager {
                     %candidate,
                     expires = current_block + WHITELIST_EXPIRY_BLOCKS,
                     "validator registration whitelisted via governance"
+                );
+            }
+            ExecutionPayload::PermanentUnlock { staker, amount } => {
+                let staking = crate::staking::StakingManager::new(self.state_db.clone());
+                staking.governance_unlock_permanent_stake(*staker, *amount)?;
+                tracing::info!(
+                    %staker, %amount,
+                    "permanent stake unlocked via governance"
                 );
             }
         }
@@ -1445,5 +1502,260 @@ mod tests {
         let restored = Proposal::try_from_slice(&data).unwrap();
         assert_eq!(restored.executable_after, 0);
         assert_eq!(restored.snapshot_block, 100);
+    }
+
+    // ====================================================================
+    // PermanentUnlock governance tests
+    // ====================================================================
+
+    fn wei_gov(tokens: u64) -> U256 {
+        U256::from(tokens) * U256::from(10u64).pow(U256::from(18u64))
+    }
+
+    /// Setup with short voting period and low quorum for testing.
+    fn setup_unlock() -> (tempfile::TempDir, GovernanceManager) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = StateDb::open(dir.path()).unwrap();
+        let gm = GovernanceManager::new(db);
+        let mut params = GovernanceParams::defaults(Address::ZERO);
+        params.voting_period_blocks = 100;
+        params.timelock_blocks = 10;
+        params.min_proposal_stake = wei_gov(100);
+        params.quorum_bps = 100; // 1% for test simplicity
+        gm.set_governance_params(&params).unwrap();
+        (dir, gm)
+    }
+
+    /// Give voter a delegation entry for voting weight.
+    fn give_delegation(gm: &GovernanceManager, voter: Address, amount: U256) {
+        let validator = Address::new([0xFF; 20]);
+        let key = crate::staking::delegation_key(&voter, &validator);
+        let d = Delegation {
+            delegator: voter,
+            validator,
+            amount,
+            unbonding: vec![],
+        };
+        let data = borsh::to_vec(&d).unwrap();
+        gm.state_db()
+            .put_cf_raw(CF_STAKING_DELEGATIONS, &key, &data)
+            .unwrap();
+    }
+
+    /// Create a permanent stake entry directly in the CF.
+    fn give_permanent_stake(gm: &GovernanceManager, staker: Address, amount: U256) {
+        let info = PermanentStakeInfo {
+            staker,
+            amount,
+            locked_at_block: 1,
+        };
+        let data = borsh::to_vec(&info).unwrap();
+        gm.state_db()
+            .put_cf_raw(CF_STAKING_PERMANENT, staker.as_slice(), &data)
+            .unwrap();
+    }
+
+    #[test]
+    fn permanent_unlock_passes_at_supermajority() {
+        let (_dir, gm) = setup_unlock();
+        let staker = addr(10);
+        let voters: Vec<Address> = (1..=5).map(addr).collect();
+
+        for v in &voters {
+            give_delegation(&gm, *v, wei_gov(1000));
+        }
+        give_permanent_stake(&gm, staker, wei_gov(5000));
+
+        let id = gm
+            .submit_proposal(
+                voters[0],
+                "Unlock staker".into(),
+                "desc".into(),
+                Some(ExecutionPayload::PermanentUnlock {
+                    staker,
+                    amount: wei_gov(5000),
+                }),
+                0,
+            )
+            .unwrap();
+
+        // 4/5 vote for = 80% (exact supermajority threshold)
+        for v in &voters[..4] {
+            gm.cast_vote(*v, id, true, 50).unwrap();
+        }
+        gm.cast_vote(voters[4], id, false, 50).unwrap();
+
+        let outcome = gm.finalize_proposal(id, 101).unwrap();
+        assert_eq!(outcome, ProposalOutcome::Passed(id));
+
+        let outcome = gm.execute_proposal(id, 112).unwrap();
+        assert_eq!(outcome, ProposalOutcome::Executed(id));
+
+        // Permanent stake removed, balance credited.
+        let mgr = crate::staking::StakingManager::new(gm.state_db().clone());
+        assert!(mgr.get_permanent_stake(&staker).unwrap().is_none());
+        let acct = gm.state_db().get_account(&staker).unwrap().unwrap();
+        assert_eq!(acct.balance, wei_gov(5000));
+    }
+
+    #[test]
+    fn permanent_unlock_fails_below_supermajority() {
+        let (_dir, gm) = setup_unlock();
+        let staker = addr(10);
+        let voters: Vec<Address> = (1..=5).map(addr).collect();
+
+        for v in &voters {
+            give_delegation(&gm, *v, wei_gov(1000));
+        }
+        give_permanent_stake(&gm, staker, wei_gov(5000));
+
+        let id = gm
+            .submit_proposal(
+                voters[0],
+                "Unlock staker".into(),
+                "desc".into(),
+                Some(ExecutionPayload::PermanentUnlock {
+                    staker,
+                    amount: wei_gov(5000),
+                }),
+                0,
+            )
+            .unwrap();
+
+        // 3/5 vote for = 60% (majority but below 80% supermajority)
+        for v in &voters[..3] {
+            gm.cast_vote(*v, id, true, 50).unwrap();
+        }
+        for v in &voters[3..] {
+            gm.cast_vote(*v, id, false, 50).unwrap();
+        }
+
+        let outcome = gm.finalize_proposal(id, 101).unwrap();
+        assert_eq!(outcome, ProposalOutcome::Rejected(id));
+
+        // Permanent stake unchanged.
+        let mgr = crate::staking::StakingManager::new(gm.state_db().clone());
+        let info = mgr.get_permanent_stake(&staker).unwrap().unwrap();
+        assert_eq!(info.amount, wei_gov(5000));
+    }
+
+    #[test]
+    fn normal_proposal_still_passes_with_simple_majority() {
+        let (_dir, gm) = setup_unlock();
+        let voters: Vec<Address> = (1..=5).map(addr).collect();
+
+        for v in &voters {
+            give_delegation(&gm, *v, wei_gov(1000));
+        }
+
+        let id = gm
+            .submit_proposal(
+                voters[0],
+                "Change param".into(),
+                "desc".into(),
+                Some(ExecutionPayload::ParameterChange {
+                    param_key: "maintenance_margin_bps".into(),
+                    new_value: "500".into(),
+                }),
+                0,
+            )
+            .unwrap();
+
+        // 3/5 = 60% simple majority → should pass for non-PermanentUnlock
+        for v in &voters[..3] {
+            gm.cast_vote(*v, id, true, 50).unwrap();
+        }
+        for v in &voters[3..] {
+            gm.cast_vote(*v, id, false, 50).unwrap();
+        }
+
+        let outcome = gm.finalize_proposal(id, 101).unwrap();
+        assert_eq!(outcome, ProposalOutcome::Passed(id));
+    }
+
+    #[test]
+    fn permanent_unlock_partial() {
+        let (_dir, gm) = setup_unlock();
+        let staker = addr(10);
+        give_permanent_stake(&gm, staker, wei_gov(10000));
+
+        let mgr = crate::staking::StakingManager::new(gm.state_db().clone());
+        mgr.governance_unlock_permanent_stake(staker, wei_gov(3000))
+            .unwrap();
+
+        // Remainder stays locked.
+        let info = mgr.get_permanent_stake(&staker).unwrap().unwrap();
+        assert_eq!(info.amount, wei_gov(7000));
+
+        // Unlocked amount credited to balance.
+        let acct = gm.state_db().get_account(&staker).unwrap().unwrap();
+        assert_eq!(acct.balance, wei_gov(3000));
+    }
+
+    #[test]
+    fn permanent_unlock_full() {
+        let (_dir, gm) = setup_unlock();
+        let staker = addr(10);
+        give_permanent_stake(&gm, staker, wei_gov(5000));
+
+        let mgr = crate::staking::StakingManager::new(gm.state_db().clone());
+        mgr.governance_unlock_permanent_stake(staker, wei_gov(5000))
+            .unwrap();
+
+        // Entry completely removed.
+        assert!(mgr.get_permanent_stake(&staker).unwrap().is_none());
+        let acct = gm.state_db().get_account(&staker).unwrap().unwrap();
+        assert_eq!(acct.balance, wei_gov(5000));
+    }
+
+    #[test]
+    fn permanent_unlock_with_accrued_rewards() {
+        let (_dir, gm) = setup_unlock();
+        let staker = addr(10);
+        give_permanent_stake(&gm, staker, wei_gov(5000));
+
+        let mgr = crate::staking::StakingManager::new(gm.state_db().clone());
+        mgr.credit_rewards(staker, wei_gov(200)).unwrap();
+
+        mgr.governance_unlock_permanent_stake(staker, wei_gov(5000))
+            .unwrap();
+
+        // Balance = principal (5000) + accrued rewards (200).
+        let acct = gm.state_db().get_account(&staker).unwrap().unwrap();
+        assert_eq!(acct.balance, wei_gov(5200));
+
+        // Rewards entry cleared.
+        assert!(mgr.get_pending_rewards(&staker).unwrap().is_none());
+    }
+
+    #[test]
+    fn permanent_unlock_staker_not_found() {
+        let (_dir, gm) = setup_unlock();
+        let staker = addr(10);
+
+        let mgr = crate::staking::StakingManager::new(gm.state_db().clone());
+        let result = mgr.governance_unlock_permanent_stake(staker, wei_gov(1000));
+        assert!(matches!(
+            result,
+            Err(EconomicsError::PermanentStakeNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn permanent_unlock_amount_exceeds_stake() {
+        let (_dir, gm) = setup_unlock();
+        let staker = addr(10);
+        give_permanent_stake(&gm, staker, wei_gov(5000));
+
+        let mgr = crate::staking::StakingManager::new(gm.state_db().clone());
+        let result = mgr.governance_unlock_permanent_stake(staker, wei_gov(6000));
+        assert!(matches!(
+            result,
+            Err(EconomicsError::PermanentUnlockExceedsStake { .. })
+        ));
+
+        // Stake unchanged.
+        let info = mgr.get_permanent_stake(&staker).unwrap().unwrap();
+        assert_eq!(info.amount, wei_gov(5000));
     }
 }
