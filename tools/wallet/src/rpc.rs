@@ -51,6 +51,7 @@ impl RpcClient {
         parse_hex_u64(r.as_str().ok_or("chainId not string")?)
     }
 
+    #[allow(dead_code)]
     pub async fn block_number(&self) -> Result<u64, String> {
         let r = self.call("eth_blockNumber", serde_json::json!([])).await?;
         parse_hex_u64(r.as_str().ok_or("blockNumber not string")?)
@@ -103,7 +104,10 @@ impl RpcClient {
     }
 
     pub async fn submit_native_action(&self, signed_action_json: &str) -> Result<String, String> {
-        let r = self.call("torus_submitNativeAction", serde_json::json!([signed_action_json])).await?;
+        // Server does parse_bytes → hex::decode → serde_json::from_slice.
+        // Must send hex-encoded JSON bytes with 0x prefix.
+        let hex_payload = format!("0x{}", hex::encode(signed_action_json.as_bytes()));
+        let r = self.call("torus_submitNativeAction", serde_json::json!([hex_payload])).await?;
         r.as_str().map(|s| s.to_string()).ok_or("result not string".to_string())
     }
 
@@ -117,6 +121,34 @@ impl RpcClient {
 
     pub async fn get_proposals(&self) -> Result<serde_json::Value, String> {
         self.call("torus_getProposals", serde_json::json!([null])).await
+    }
+
+    pub async fn get_proposal(&self, id: u64) -> Result<serde_json::Value, String> {
+        self.call("torus_getProposal", serde_json::json!([id])).await
+    }
+
+    pub async fn get_open_orders(
+        &self,
+        trader: &str,
+        market_id: Option<u64>,
+    ) -> Result<serde_json::Value, String> {
+        self.call(
+            "torus_getOpenOrders",
+            serde_json::json!([trader, market_id]),
+        )
+        .await
+    }
+
+    pub async fn get_epoch(&self) -> Result<serde_json::Value, String> {
+        self.call("torus_getEpoch", serde_json::json!([])).await
+    }
+
+    pub async fn get_markets(
+        &self,
+        offset: Option<u32>,
+        limit: Option<u32>,
+    ) -> Result<serde_json::Value, String> {
+        self.call("torus_getMarkets", serde_json::json!([offset, limit])).await
     }
 }
 
@@ -167,5 +199,17 @@ mod tests {
         assert_eq!(parse_hex_u64("0x0").unwrap(), 0);
         assert_eq!(parse_hex_u64("0xff").unwrap(), 255);
         assert_eq!(parse_hex_u128("0x1").unwrap(), 1);
+    }
+
+    #[test]
+    fn test_submit_hex_roundtrip() {
+        let json = r#"{"action":"ClaimRewards","nonce":123}"#;
+        let hex_payload = format!("0x{}", hex::encode(json.as_bytes()));
+        assert!(hex_payload.starts_with("0x"));
+        let decoded = hex::decode(&hex_payload[2..]).unwrap();
+        assert_eq!(std::str::from_utf8(&decoded).unwrap(), json);
+        let roundtrip: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
+        assert_eq!(roundtrip["action"], "ClaimRewards");
+        assert_eq!(roundtrip["nonce"], 123);
     }
 }
