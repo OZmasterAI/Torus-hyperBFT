@@ -1,9 +1,9 @@
 # Technical Requirements: CLI Wallet Tool (Section 3.5.4)
 
-**Date:** 2026-04-16
-**Status:** Draft v1.0
+**Date:** 2026-04-16 (revised)
+**Status:** Draft v2.0 (matches actual codebase)
 **Parent:** [implementation-plan.md](./implementation-plan.md) Task 3.5.4
-**Depends on:** torus-rpc (1.8), native action format (1.3b), keystore (torus-node keygen)
+**Depends on:** `torus-rpc` (§1.8), native action format (§1.3b), secp256k1 keystore (already in `tools/wallet`)
 
 ---
 
@@ -13,12 +13,21 @@ A standalone CLI binary (`torus-wallet`) for interacting with a Torus node.
 Targets node operators and developers — not end users. Covers: key management,
 native action signing/submission, balance/position queries, and staking operations.
 
-**Key decisions:**
-- Separate binary crate (`crates/torus-wallet`), not a subcommand of `torus-node`
-- Reuses existing EIP-712 signing from `torus-types` and keystore from `torus-node`
-- Talks to node via JSON-RPC (`torus_*` and `eth_*` endpoints)
-- No EVM transaction construction — users have `cast`/Foundry for that
-- Output: JSON by default, human-readable with `--pretty`
+**Ground truth from the codebase:**
+
+- Binary lives at `tools/wallet/` (workspace member), NOT `crates/torus-wallet/`.
+- Has its own secp256k1 keystore (AES-256-GCM + Argon2id) at `tools/wallet/src/keystore.rs`.
+  Independent of `torus-node`'s ed25519 keystore — **do not extract or share**.
+- Signing uses the free function `torus_types::eip712::sign_native_action(action, nonce, &key) -> SignedNativeAction`.
+  There is NO `SignedNativeAction::sign(...)` method. The function takes **three** args; chain_id is
+  baked into the EIP-712 domain separator via `TORUS_CHAIN_ID`.
+- Nonce is **milliseconds since epoch** (`NONCE_WINDOW_MS = 60_000`), not nanoseconds.
+- `FixedPoint` is `i128` with `SCALE = 10^8` (`DECIMALS = 8`), NOT 10^18. All trading prices/quantities
+  use this. All TRS transfers/staking amounts use `U256` with 18 decimals (wei).
+- `torus_submitNativeAction` expects a **hex-encoded JSON byte string** (`parse_bytes` → `serde_json::from_slice`).
+  The existing `tools/wallet/src/rpc.rs:105` sends raw JSON — this is a bug to fix in Phase 0.
+- Output: human-readable by default, JSON with `--json`. This is the inverse of earlier drafts
+  that proposed `--pretty`; `--json` is already wired into every handler.
 
 ---
 
@@ -28,17 +37,17 @@ native action signing/submission, balance/position queries, and staking operatio
 
 | Category | Commands |
 |---|---|
-| **Key management** | `keygen`, `import-key`, `show-address` |
-| **Query** | `balance`, `positions`, `orders`, `staking-info`, `delegations`, `epoch`, `validators`, `proposals` |
+| **Key management** | `keygen`, `import`, `address` |
+| **Query** | `balance`, `positions`, `orders`, `staking`, `delegations`, `epoch`, `validators`, `proposals`, `block`, `tx`, `orderbook`, `position` |
 | **Trading** | `place-order`, `cancel-order`, `cancel-all`, `modify-order` |
-| **Transfers** | `transfer-to-perp`, `transfer-to-spot`, `withdraw` |
+| **Transfers** | `send` (EVM), `transfer-to-perp`, `transfer-to-spot`, `withdraw` |
 | **Staking** | `delegate`, `undelegate`, `permanent-stake`, `claim-rewards`, `top-up-self-stake` |
 | **Governance** | `submit-proposal`, `vote` |
 | **Validator ops** | `register-validator`, `update-commission`, `jail-vote`, `unjail`, `rotate-key` |
 
 ### 1.2 Out of Scope
 
-- EVM transaction construction (use `cast send` / Foundry)
+- EVM contract calls beyond `send` (use `cast send` / Foundry)
 - Batch/scripted operations (users pipe JSON)
 - Hardware wallet integration (future)
 - Interactive TUI mode
@@ -47,235 +56,335 @@ native action signing/submission, balance/position queries, and staking operatio
 
 ## 2. Architecture
 
-### 2.1 Binary Structure
+### 2.1 File Layout (modular)
 
 ```
-torus-wallet <subcommand> [args] --rpc <url> --keystore <path>
+tools/wallet/
+  Cargo.toml
+  src/
+    main.rs              # Cli struct, Command enum, dispatch — ~200 lines
+    keystore.rs          # existing secp256k1 + AES-256-GCM + Argon2id
+    rpc.rs               # JSON-RPC client (eth_* + torus_*)
+    parse.rs             # parse_trs_to_wei, parse_decimal_to_fixed_point,
+                         # parse_address, parse_pubkey
+    sign.rs              # load_signing_key, prompt_passphrase, now_ms,
+                         # submit_native_action, build_and_sign_eip1559_tx
+    commands/
+      mod.rs             # re-exports
+      keys.rs            # keygen, import, address
+      query.rs           # balance, validators, staking, block, tx, orderbook,
+                         # position, proposals, orders, positions, epoch, delegations
+      trading.rs         # place_order, cancel_order, cancel_all, modify_order
+      transfer.rs        # send, transfer_to_perp, transfer_to_spot, withdraw
+      staking.rs         # delegate, undelegate, permanent_stake,
+                         # claim_rewards, top_up_self_stake
+      governance.rs      # submit_proposal, vote
+      validator.rs       # register_validator, update_commission, jail_vote,
+                         # unjail, rotate_key
 ```
 
-Uses `clap` with derive API (same pattern as `torus-node`). Global flags:
+The `Command` enum in `main.rs` stays flat — users type `torus-wallet place-order`, not
+`torus-wallet trading place-order`. Each variant dispatches to a handler in the
+appropriate module.
+
+### 2.2 Global Flags
 
 | Flag | Default | Description |
 |---|---|---|
-| `--rpc` | `http://localhost:8545` | Node RPC endpoint |
-| `--keystore` | None | Path to encrypted keystore file |
-| `--passphrase-file` | None | File containing keystore passphrase (avoids prompt) |
-| `--pretty` | false | Human-readable output instead of raw JSON |
-| `--dry-run` | false | Build and sign the action, print it, but don't submit |
+| `--rpc-url <url>` | `http://localhost:8545` | Node RPC endpoint |
+| `--keystore <path>` | None | Encrypted keystore file (required for write commands, optional for queries with fallback) |
+| `--key <hex>` | None | Raw private key (UNSAFE; warns on use) |
+| `--chain-id <u64>` | from `eth_chainId` | Override chain ID |
+| `--json` | false | Emit JSON instead of human-readable (already exists; kept as-is) |
+| `--dry-run` | false | Build + sign, print SignedNativeAction JSON, do NOT submit |
+| `--passphrase-file <path>` | None | Read passphrase from file (trims trailing whitespace). Exits 1 if file missing |
 
-### 2.2 Signing Flow
+**Deviation from earlier drafts:** `--pretty` was dropped. `--json` stays as the opt-in
+JSON flag (inverse logic). Every existing handler already branches on `cli.json` — flipping
+this would touch every handler for no user benefit.
 
-All write commands follow the same flow:
+### 2.3 Signing Flow (write commands)
 
 ```
 1. Parse CLI args → NativeAction variant
-2. Load keystore → decrypt private key
-3. Build SignedNativeAction:
-   - nonce = current timestamp (nanoseconds)
-   - EIP-712 typed data hash (domain: chain_id from node)
-   - secp256k1 signature
-4. Submit via torus_submitNativeAction RPC
-5. Print result (tx hash or error)
+2. Resolve signing key:
+   - If --key <hex>: decode hex, warn to stderr
+   - Else if --keystore: read --passphrase-file (trim) OR prompt, decrypt
+   - Else: error
+3. nonce = ms since epoch (u64)
+4. signed = sign_native_action(action, nonce, &key)   // free function, 3 args
+5. If --dry-run: println!("{}", serde_json::to_string_pretty(&signed)); exit 0
+6. json_str = serde_json::to_string(&signed)
+7. hex_payload = format!("0x{}", hex::encode(json_str.as_bytes()))
+8. rpc.call("torus_submitNativeAction", [hex_payload])
+9. Print returned tx hash
 ```
 
-The EIP-712 signing logic already exists in `torus-types/src/eip712.rs`.
-The keystore encrypt/decrypt already exists in `torus-node/src/main.rs` (keygen).
+The hex-encoding at step 7 is **required** — the server does `parse_bytes(&arg)` →
+`hex::decode()` → `serde_json::from_slice()`. Sending raw JSON produces `bad hex` at
+step 7 server-side.
 
-### 2.3 Query Flow
-
-All read commands:
+### 2.4 Query Flow
 
 ```
 1. Parse CLI args
-2. Call appropriate RPC method (torus_getBalances, eth_getBalance, etc.)
-3. Deserialize response
-4. Print JSON (or formatted with --pretty)
+2. Resolve address (if query takes optional address): explicit --address, else keystore
+3. rpc.call("<method>", [...])
+4. If --json: pretty-print JSON
+   Else: format per command's human-readable template
 ```
 
-No keystore needed for queries.
+No keystore needed unless address fallback triggers.
 
 ---
 
 ## 3. Command Specifications
 
+Decimal convention:
+
+- **TRS / wei** (18 decimals): `parse_trs_to_wei(&str) -> U256`. Used for: `send`,
+  `transfer-to-perp`, `transfer-to-spot`, `withdraw`, all staking amounts.
+- **FixedPoint** (8 decimals, `i128`): `parse_decimal_to_fixed_point(&str) -> FixedPoint`.
+  Used for: `place-order` price/quantity/trigger, `modify-order`, all `MarketParams` /
+  `MarketListing` fields in `submit-proposal`.
+
+These MUST NOT be confused. Trading uses FixedPoint; money movement uses wei.
+
 ### 3.1 Key Management
 
-**`keygen`** — Generate a new encrypted keystore file.
-Reuse the existing keygen logic from `torus-node`. Prompts for passphrase
-(or reads from `--passphrase-file`). Writes to `--output <path>`.
+**`keygen --output <path>`** — Generate secp256k1 keypair, prompt passphrase, write encrypted keystore.
 
-**`import-key --hex <private_key_hex>`** — Import a raw hex private key
-into an encrypted keystore. For migration from `--validator-key` (deprecated).
+**`import --key <hex> --output <path>`** — Import raw hex private key into encrypted keystore.
 
-**`show-address`** — Decrypt keystore, derive and print the Ethereum address.
-Does not contact the node.
+**`address --keystore <path>`** — Decrypt keystore, print Ethereum address. No RPC.
 
 ### 3.2 Trading Commands
 
-**`place-order`**:
+**`place-order`** → `NativeAction::PlaceOrder(PlaceOrderParams { ... })`
+
 ```
-torus-wallet place-order \
-  --market <id> \
-  --side <buy|sell> \
-  --price <decimal> \
-  --quantity <decimal> \
-  --order-type <limit|market|stop-market|stop-limit> \
-  --tif <gtc|ioc|fok|post-only> \
-  --trigger-price <decimal>       # for stop orders
-  --reduce-only                   # optional flag
-  --client-id <string>            # optional
+--market <u64>                                       MarketId
+--side <buy|sell>                                    → is_buy: bool
+--price <decimal>                                    FixedPoint
+--quantity <decimal>                                 FixedPoint
+--order-type <limit|market|stop-market|stop-limit>   OrderType variant
+--tif <gtc|ioc|fok|post-only>                        TimeInForce variant
+--trigger-price <decimal>                            required for stop-market|stop-limit
+--reduce-only                                        flag, default false
+--client-id <u64>                                    optional (maps to client_order_id)
 ```
 
-All decimal values are parsed to `FixedPoint` (18 decimal places).
+Mappings:
 
-**`cancel-order --market <id> --order-id <id>`**
+- `limit` → `OrderType::Limit`
+- `market` → `OrderType::Market`
+- `stop-market` → `OrderType::StopMarket { trigger }` (error if `--trigger-price` absent)
+- `stop-limit` → `OrderType::StopLimit { trigger, limit: <price value> }` (error if `--trigger-price` absent)
+- `gtc`/`ioc`/`fok`/`post-only` → `TimeInForce::{GTC,IOC,FOK,PostOnly}`
 
-**`cancel-all --market <id>`**
+**`cancel-order --order-id <u128>`** → `NativeAction::CancelOrder { order_id }`.
+**No `--market` flag** — `CancelOrder` variant has no market_id field.
 
-**`modify-order --market <id> --order-id <id> --price <decimal> --quantity <decimal>`**
+**`cancel-all --market <u64>`** → `NativeAction::CancelAllOrders { market_id: Some(mid) }`.
+CLI always requires `--market`; to cancel across multiple markets, run per-market. The
+underlying `Option<MarketId>` accepts `None`, but we don't expose that (prevents accidents).
+
+**`modify-order --order-id <u128> [--price <decimal>] [--quantity <decimal>]`**
+→ `NativeAction::ModifyOrder { order_id, new_price, new_qty }`.
+**No `--market` flag.** At least one of `--price` or `--quantity` MUST be provided
+(error otherwise). Unset fields become `None`.
 
 ### 3.3 Transfer Commands
 
-**`transfer-to-perp --amount <decimal>`** — Move from spot to perp margin.
+**`send --to <addr> --value <trs>`** — EIP-1559 EVM transfer (already implemented).
 
-**`transfer-to-spot --amount <decimal>`** — Move from perp to spot balance.
+**`transfer-to-perp --amount <trs>`** → `NativeAction::TransferToPerp { amount: U256 }`.
 
-**`withdraw --to <address> --amount <decimal>`** — Withdraw to an address.
+**`transfer-to-spot --amount <trs>`** → `NativeAction::TransferToSpot { amount: U256 }`.
+
+**`withdraw --to <addr> --amount <trs>`** → `NativeAction::Withdraw { amount, to }`.
 
 ### 3.4 Staking Commands
 
-**`delegate --validator <address> --amount <decimal>`**
+**`delegate --validator <addr> --amount <trs>`** (already implemented).
 
-**`undelegate --validator <address> --amount <decimal>`**
+**`undelegate --validator <addr> --amount <trs>`** (already implemented).
 
-**`permanent-stake --amount <decimal>`**
+**`permanent-stake --amount <trs>`** → `NativeAction::PermanentStake { amount }`. Irreversible.
 
-**`claim-rewards`** — Claims all pending rewards.
+**`claim-rewards`** (already implemented).
 
-**`top-up-self-stake --amount <decimal>`** — Validator adds to own stake.
+**`top-up-self-stake --amount <trs>`** → `NativeAction::TopUpSelfStake { amount }`. Validator-only.
 
 ### 3.5 Governance Commands
 
-**`submit-proposal --type <param-change|treasury-spend|market-listing> --title <str> --description <str> --params <json>`**
+**`vote --proposal <u64> --option <yes|no|abstain>`** (already implemented).
 
-**`vote --proposal-id <id> --vote <yes|no|abstain>`**
+**`submit-proposal --title <str> --description <str> --proposal-type <kind> --params <json>`**
+→ `NativeAction::SubmitProposal(Proposal { title, description, action })`
+
+`--params` is a JSON string. The 5 `ProposalAction` variants map as follows:
+
+| `--proposal-type` | `--params` JSON | `ProposalAction` |
+|---|---|---|
+| `param-change` | `{"key":"epoch_length","value":"1000"}` | `ParameterChange { key, value }` |
+| `list-market` | `{"base_asset":"BTC","quote_asset":"USD","tick_size":"0.01","lot_size":"0.001","max_leverage":50,"maintenance_margin_bps":300}` | `ListMarket(MarketListing { ... })` |
+| `delist-market` | `{"market_id":5}` | `DelistMarket { market_id }` |
+| `update-market-params` | `{"market_id":1,"tick_size":"0.01","lot_size":"0.001","max_leverage":20,"maintenance_margin_bps":500,"max_funding_rate_bps":100}` | `UpdateMarketParams { market_id, params: MarketParams { ... } }` |
+| `validator-registration` | `{"candidate":"0xabc..."}` | `ValidatorRegistration { candidate }` |
+
+Notes:
+
+- `MarketListing` fields: `base_asset`, `quote_asset`, `tick_size`, `lot_size`, `max_leverage`, `maintenance_margin_bps` (no `max_funding_rate_bps`).
+- `MarketParams` fields: `tick_size`, `lot_size`, `max_leverage`, `maintenance_margin_bps`, `max_funding_rate_bps`.
+- `tick_size` and `lot_size` are decimal strings → `parse_decimal_to_fixed_point`.
+- Unknown `--proposal-type` or missing JSON fields → exit 1 with a clear error.
 
 ### 3.6 Validator Operations
 
-**`register-validator --pubkey <hex> --commission-bps <u16>`**
+**`register-validator --pubkey <hex64> --commission-bps <u16>`**
+→ `NativeAction::RegisterValidator { pubkey: PublicKey([u8;32]), commission }`.
+`--pubkey` is 64 hex chars (optional `0x` prefix) = 32 bytes.
 
-**`update-commission --commission-bps <u16>`**
+**`update-commission --commission-bps <u16>`** → `NativeAction::UpdateCommission { new_rate }`.
 
-**`jail-vote --validator <address>`**
+**`jail-vote --validator <addr>`** → `NativeAction::JailVote { target }`.
 
-**`unjail`**
+**`unjail`** → `NativeAction::UnjailSelf`.
 
-**`rotate-key --new-pubkey <hex>`**
+**`rotate-key --new-pubkey <hex64>`** → `NativeAction::RotateValidatorKey { new_pubkey }`.
 
 ### 3.7 Query Commands
 
-**`balance [--address <addr>]`** — Native + EVM balances. Defaults to keystore address.
+All queries that accept `--address` default to the keystore address if `--keystore` is set
+(`resolve_address()` helper). If neither `--address` nor `--keystore` is given, exit 1
+with `address required: provide --address or --keystore`.
 
-**`positions [--address <addr>]`** — Open positions across all markets.
+**`balance [--address <addr>]`** — EVM balance + `torus_getBalances` (spot/perp).
 
-**`orders [--market <id>]`** — Open orders. Optional market filter.
+**`positions [--address <addr>]`** — iterate `torus_getMarkets`, call `torus_getPosition` per market, collect non-null.
 
-**`staking-info [--address <addr>]`** — Delegation amounts, pending rewards, permanent stake.
+**`orders [--address <addr>] [--market <u64>]`** — `torus_getOpenOrders(trader, market_id_opt)`.
 
-**`delegations [--address <addr>]`** — All delegations for an address.
+**`staking [--address <addr>]`** (already `Staking`, rename arg to optional) — `torus_getStakingInfo` + `torus_getDelegations`.
 
-**`validators`** — List all validators with status, stake, commission.
+**`delegations [--address <addr>]`** — `torus_getDelegations` only.
 
-**`epoch`** — Current epoch number, height, time remaining.
+**`validators`** (already implemented) — `torus_getValidators`.
 
-**`proposals [--id <id>]`** — List proposals or get one by ID.
+**`epoch`** — `torus_getEpoch`. Display: epoch, start block, end block, blocks remaining.
+
+**`proposals [--id <u64>]`** — `torus_getProposal(id)` if `--id`, else `torus_getProposals(None)`.
+
+**`block [<height>]`**, **`tx <hash>`**, **`orderbook <market_id>`**, **`position <addr> <market_id>`** — already implemented.
 
 ---
 
 ## 4. RPC Mapping
 
-| Command | RPC Method |
-|---|---|
-| `balance` | `torus_getBalances` + `eth_getBalance` |
-| `positions` | `torus_getPosition` |
-| `orders` | `torus_getOrderBook` (filtered) |
-| `staking-info` | `torus_getStakingInfo` |
-| `delegations` | `torus_getDelegations` |
-| `validators` | `torus_getValidators` |
-| `epoch` | `torus_getEpoch` |
-| `proposals` | `torus_getProposals` / `torus_getProposal` |
-| All write commands | `torus_submitNativeAction` |
+| Command | RPC Method | Note |
+|---|---|---|
+| `balance` | `eth_getBalance` + `torus_getBalances` | |
+| `positions` | `torus_getMarkets` → `torus_getPosition` loop | No single-call endpoint |
+| `orders` | `torus_getOpenOrders` | New method to add in rpc.rs |
+| `staking` | `torus_getStakingInfo` + `torus_getDelegations` | Existing |
+| `delegations` | `torus_getDelegations` | Existing |
+| `validators` | `torus_getValidators` | Existing |
+| `epoch` | `torus_getEpoch` | New method to add in rpc.rs |
+| `proposals` | `torus_getProposals` / `torus_getProposal` | Existing: getProposals; add getProposal |
+| All write commands | `torus_submitNativeAction` (hex-encoded JSON) | Fix encoding in Phase 0 |
 
 ---
 
-## 5. Shared Code Extraction
+## 5. Code Reuse
 
-### 5.1 Keystore Module
+### 5.1 Keystore
 
-The keystore logic currently lives in `torus-node/src/main.rs` (lines ~193-250).
-Extract to a shared module:
+`tools/wallet/src/keystore.rs` (secp256k1 + AES-256-GCM + Argon2id) is the single source.
+**Do not** extract to a shared crate or share with `torus-node` — those use different
+key types (ed25519 validator keys, different threat model).
 
-```
-crates/torus-types/src/keystore.rs  (or a new torus-crypto crate)
-  pub fn generate_keystore(path, passphrase) -> Result<Address>
-  pub fn load_keystore(path, passphrase) -> Result<SigningKey>
-  pub fn address_from_keystore(path, passphrase) -> Result<Address>
-```
+### 5.2 Signing
 
-Both `torus-node` and `torus-wallet` import from the shared location.
+`torus_types::eip712::sign_native_action(action, nonce, &key)` — free function, 3 args,
+returns `SignedNativeAction` directly (not `Result`). Use as-is; no wallet-side signing
+code needed.
 
-### 5.2 NativeAction Construction
-
-`torus-types/src/eip712.rs` already has `SignedNativeAction::sign()`.
-`torus-wallet` calls this directly — no new signing code needed.
+`torus_types::eip712::ecrecover` and `SignedNativeAction::recover_sender` are available
+for test-side signature verification.
 
 ---
 
 ## 6. Error Handling
 
-| Error | Behavior |
+| Condition | Behavior |
 |---|---|
-| Node unreachable | Print RPC URL + connection error, exit 1 |
-| Invalid keystore passphrase | "Failed to decrypt keystore", exit 1 |
-| Action rejected by node | Print error message from RPC response, exit 1 |
-| Invalid CLI args | clap handles this automatically |
+| Node unreachable | Print RPC URL + reqwest error, exit 1 |
+| Invalid keystore passphrase | `Failed to decrypt keystore`, exit 1 |
+| `--passphrase-file` missing | `passphrase file not found: <path>`, exit 1 |
+| Action rejected by node | Print RPC error message, exit 1 |
+| Invalid CLI args | clap's default error, exit 2 |
 | `--dry-run` | Print signed action JSON to stdout, exit 0 (no submission) |
+| Missing `--trigger-price` on stop-market/stop-limit | exit 1 with explicit message |
+| Neither `--price` nor `--quantity` on `modify-order` | exit 1 with explicit message |
+| Too many decimals in FixedPoint parse (>8) | exit 1: `too many decimal places (max 8)` |
+| Invalid hex pubkey | exit 1: `invalid pubkey: expected 64 hex characters` |
+
+No `unwrap()` in non-test code. All errors are `Result<(), String>` propagated through `main()`.
 
 ---
 
 ## 7. Testing
 
-### 7.1 Unit Tests
+### 7.1 Unit tests (in `#[cfg(test)] mod tests`, per-module where natural)
 
-| Test | Verifies |
-|---|---|
-| `parse_place_order_args` | All order types, tif variants, optional flags |
-| `parse_decimal_to_fixed_point` | "1.5" -> FixedPoint, "0.001" precision, "999999" large |
-| `sign_and_verify_roundtrip` | Sign a NativeAction, verify signature recovers correct address |
-| `dry_run_output_format` | `--dry-run` produces valid JSON with all fields |
+| Test | Module | Verifies |
+|---|---|---|
+| `test_parse_decimal_to_fixed_point` | parse.rs | `"1.5"`→150_000_000, `"0.00000001"`→1, `"100"`→10_000_000_000, `"-1.5"`→-150_000_000, `"1.123456789"`→error, `""`→error |
+| `test_parse_trs_to_wei` | parse.rs | existing (keep) |
+| `test_parse_pubkey` | parse.rs | valid 64-char with/without 0x, wrong length, non-hex |
+| `test_parse_address` | parse.rs | existing (keep) |
+| `test_passphrase_file_trim` | sign.rs | trailing newline/spaces trimmed correctly |
+| `test_place_order_roundtrip` | trading.rs | build PlaceOrderParams (stop-limit with trigger + client_id) → sign → recover sender → address matches |
+| `test_all_new_variants_sign_correctly` | main.rs or individual | each new variant (TransferToPerp, Withdraw, PermanentStake, TopUpSelfStake, SubmitProposal×5 variants, RegisterValidator, UpdateCommission, JailVote, UnjailSelf, RotateValidatorKey) signs and recovers |
+| `test_dry_run_output_is_valid_json` | sign.rs | build NativeAction::ClaimRewards → serialize pretty → round-trip deserialize to SignedNativeAction; fields match |
+| `test_submit_hex_encoding` | rpc.rs | given raw JSON, produced payload starts with `0x` and decodes back to the same JSON |
 
-### 7.2 Integration Tests
+### 7.2 Integration (manual / `#[ignore]`)
 
-| Test | Verifies |
-|---|---|
-| `wallet_balance_query` | Connects to test node, returns balance |
-| `wallet_delegate_and_query` | delegate → query staking-info → verify |
-| `wallet_place_and_cancel_order` | place-order → cancel-order → verify |
+Against a running local node:
+
+- `torus-wallet balance --keystore <k>` — returns balance
+- `torus-wallet place-order --dry-run ...` — prints valid JSON, no submission
+- `torus-wallet delegate ...` followed by `torus-wallet staking` — delegation visible
+
+### 7.3 Success criterion
+
+```
+cargo test -p torus-wallet
+```
+
+Must pass green. Paste output in the implementation PR.
 
 ---
 
-## 8. Files
+## 8. Files Changed
 
-| File | Change | Scope |
-|---|---|---|
-| `crates/torus-wallet/Cargo.toml` | New crate | Small |
-| `crates/torus-wallet/src/main.rs` | CLI entry + clap derive | Medium |
-| `crates/torus-wallet/src/commands/mod.rs` | Command dispatch | Small |
-| `crates/torus-wallet/src/commands/trading.rs` | Order commands | Medium |
-| `crates/torus-wallet/src/commands/staking.rs` | Staking commands | Small |
-| `crates/torus-wallet/src/commands/governance.rs` | Governance commands | Small |
-| `crates/torus-wallet/src/commands/query.rs` | Read-only queries | Medium |
-| `crates/torus-wallet/src/commands/keys.rs` | Keygen, import, show | Small |
-| `crates/torus-wallet/src/rpc_client.rs` | JSON-RPC client wrapper | Small |
-| `crates/torus-types/src/keystore.rs` | Extract from torus-node | Small |
-| `crates/torus-node/src/main.rs` | Import keystore from shared | Small (refactor) |
+| File | Change |
+|---|---|
+| `tools/wallet/src/main.rs` | Shrink to ~200 lines (Cli struct, Command enum, dispatch) |
+| `tools/wallet/src/rpc.rs` | **Fix hex-encoding in `submit_native_action`** + add `get_open_orders`, `get_epoch`, `get_markets`, `get_proposal` |
+| `tools/wallet/src/keystore.rs` | Unchanged |
+| `tools/wallet/src/parse.rs` | NEW — `parse_trs_to_wei`, `parse_decimal_to_fixed_point`, `parse_address`, `parse_pubkey` |
+| `tools/wallet/src/sign.rs` | NEW — `load_signing_key`, `prompt_passphrase`, `read_passphrase_from_file`, `now_ms`, `submit_native_action`, `build_and_sign_eip1559_tx`, `resolve_address` |
+| `tools/wallet/src/commands/mod.rs` | NEW |
+| `tools/wallet/src/commands/keys.rs` | NEW — move existing `cmd_keygen`, `cmd_import`, `cmd_address` |
+| `tools/wallet/src/commands/query.rs` | NEW — move existing reads + add `cmd_orders`, `cmd_positions`, `cmd_epoch`, `cmd_delegations` |
+| `tools/wallet/src/commands/trading.rs` | NEW — `cmd_place_order`, `cmd_cancel_order`, `cmd_cancel_all`, `cmd_modify_order` |
+| `tools/wallet/src/commands/transfer.rs` | NEW — move `cmd_send` + add `cmd_transfer_to_perp`, `cmd_transfer_to_spot`, `cmd_withdraw` |
+| `tools/wallet/src/commands/staking.rs` | NEW — move `cmd_delegate`, `cmd_undelegate`, `cmd_claim_rewards` + add `cmd_permanent_stake`, `cmd_top_up_self_stake` |
+| `tools/wallet/src/commands/governance.rs` | NEW — move `cmd_vote` + add `cmd_submit_proposal` |
+| `tools/wallet/src/commands/validator.rs` | NEW — `cmd_register_validator`, `cmd_update_commission`, `cmd_jail_vote`, `cmd_unjail`, `cmd_rotate_key` |
+| `tools/wallet/Cargo.toml` | No changes — all deps already present |
+
+No changes to any other crate.
