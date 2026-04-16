@@ -345,26 +345,109 @@ export interface Proposal { /* ... */ }
 export interface GovernanceParams { /* ... */ }
 export interface TreasuryInfo { /* ... */ }
 
-// NativeAction types for signing
-export type NativeAction =
-  | { type: 'PlaceOrder'; params: PlaceOrderParams }
-  | { type: 'CancelOrder'; orderId: string }
-  | { type: 'CancelAllOrders'; marketId?: string }
-  | { type: 'TransferToPerp'; amount: string }
-  | { type: 'TransferToSpot'; amount: string }
-  | { type: 'Delegate'; validator: string; amount: string }
-  | { type: 'Undelegate'; validator: string; amount: string }
-  | { type: 'ClaimRewards' }
-  // ... etc
+// NativeAction: matches serde's default EXTERNALLY-TAGGED enum encoding
+// of torus_types::NativeAction (crates/torus-types/src/lib.rs:290-376).
+// Verified by running `serde_json::to_string` against the real type:
+//   Unit variant     → bare string:   "ClaimRewards"
+//   Struct variant   → { VariantName: { snake_case_fields... } }
+//   Tuple variant    → { VariantName: { ...inner_struct_fields } }
+// Field names are snake_case (Rust default), NOT camelCase.
+// Numeric fields (FixedPoint, U256, u64, u128) serialize as JSON numbers,
+// NOT hex strings — see "bigint safety" note below for the JSON.stringify caveat.
 
+export type NativeAction =
+  // --- Order book ---
+  | { PlaceOrder: SerdePlaceOrderParams }
+  | { CancelOrder: { order_id: number | bigint } }                           // u128
+  | { CancelAllOrders: { market_id: number | null } }                        // u64 | null
+  | { ModifyOrder: { order_id: number | bigint;
+                     new_price: bigint | null; new_qty: bigint | null } }
+  // --- Transfers ---
+  | { TransferToPerp: { amount: bigint } }                                   // U256
+  | { TransferToSpot: { amount: bigint } }
+  | { Withdraw:       { amount: bigint; to: `0x${string}` } }
+  // --- Staking ---
+  | { Delegate:        { validator: `0x${string}`; amount: bigint } }
+  | { Undelegate:      { validator: `0x${string}`; amount: bigint } }
+  | { PermanentStake:  { amount: bigint } }
+  | 'ClaimRewards'
+  | { TopUpSelfStake:  { amount: bigint } }
+  // --- Governance ---
+  | { SubmitProposal: SerdeProposal }
+  | { Vote:           { proposal_id: number; option: 'Yes' | 'No' | 'Abstain' } }
+  // --- Oracle ---
+  | { SubmitOraclePrices: SerdeOracleSubmission }
+  // --- Validator ---
+  | { RegisterValidator: { pubkey: number[]; commission: number } }          // [u8;32], u16
+  | { UpdateCommission:  { new_rate: number } }
+  | { JailVote:          { target: `0x${string}` } }
+  | 'UnjailSelf'
+  | { RotateValidatorKey: { new_pubkey: number[] } }
+  // --- Admin ---
+  | { UpdateMarketParams: { market_id: number; params: SerdeMarketParams } }
+  | { ListMarket:         SerdeMarketListing }
+  | { DelistMarket:       { market_id: number } }
+
+// Matches torus_types::PlaceOrderParams (crates/torus-types/src/lib.rs:600-610).
+// FixedPoint serializes as raw i128 (JSON number). Use `bigint` to preserve
+// precision through JSON.stringify with a bigint-aware replacer (see Step 6).
+export interface SerdePlaceOrderParams {
+  market_id: number;
+  is_buy: boolean;
+  price: bigint;              // FixedPoint raw i128 (value * 10^8)
+  quantity: bigint;           // FixedPoint raw i128
+  order_type: SerdeOrderType;
+  time_in_force: 'GTC' | 'IOC' | 'FOK' | 'PostOnly';
+  reduce_only: boolean;
+  client_order_id: number | null;
+}
+
+// torus_types::OrderType is externally tagged too:
+//   "Limit" | "Market"
+//   { StopMarket: { trigger: i128 } }
+//   { StopLimit:  { trigger: i128, limit: i128 } }
+export type SerdeOrderType =
+  | 'Limit'
+  | 'Market'
+  | { StopMarket: { trigger: bigint } }
+  | { StopLimit:  { trigger: bigint; limit: bigint } }
+
+// UI-layer form state (human-readable decimal strings, camelCase). This is
+// the input to `signAndSubmit()`, which converts to SerdePlaceOrderParams.
 export interface PlaceOrderParams {
-  marketId: number; isBuy: boolean; price: string; quantity: string;
-  orderType: 'limit' | 'market' | 'stop_market' | 'stop_limit';
-  timeInForce: 'gtc' | 'ioc' | 'fok' | 'post_only';
-  reduceOnly: boolean; clientOrderId?: number;
-  triggerPrice?: string; limitPrice?: string;
+  marketId: string;                                                      // "0x1"
+  isBuy: boolean;
+  price: string;                                                         // "65000.5"
+  quantity: string;                                                      // "0.1"
+  orderType: 'Limit' | 'Market' | 'StopMarket' | 'StopLimit';
+  trigger?: string;                                                      // decimal, required for Stop*
+  limit?: string;                                                        // decimal, required for StopLimit
+  timeInForce: 'GTC' | 'IOC' | 'FOK' | 'PostOnly';
+  reduceOnly: boolean;
+  clientOrderId?: number;
 }
 ```
+
+**Bigint safety for JSON.** `JSON.stringify` throws on raw `bigint` values.
+Use a bigint-aware replacer when serializing a `SignedNativeAction`:
+
+```typescript
+export function stringifyWithBigint(v: unknown): string {
+  return JSON.stringify(v, (_k, x) => typeof x === 'bigint' ? Number(x) : x)
+}
+```
+
+This is safe as long as every bigint value fits in `Number.MAX_SAFE_INTEGER`
+(2^53 - 1). FixedPoint prices up to ~$90M, U256 wei amounts up to ~0.009 ETH
+wei-equivalents, and u64 nonces (ms-since-epoch) all fit. **For U256 `amount`
+fields that could exceed 2^53** (e.g. ≥ 0.01 TRS at 18 decimals = 10^16 wei),
+the replacer must emit a JSON number via a string-to-number-or-decimal library,
+or the Rust side must accept a string — verify by roundtripping one large
+amount through the probe crate before shipping Withdraw / Delegate flows.
+
+// Placeholder types referenced above — fill in as needed:
+// SerdeProposal, SerdeOracleSubmission, SerdeMarketParams, SerdeMarketListing.
+// See crates/torus-types/src/lib.rs for the Rust source of truth.
 
 **4b. lib/fixed-point.ts:**
 
@@ -534,52 +617,7 @@ const DOMAIN = {
 } as const
 ```
 
-**6b. Per-variant EIP-712 types.** One entry per `NativeAction` variant.
-Field order and names must match the `keccak256(...)` type strings in
-`eip712.rs` verbatim. Selected examples (full set lives in the file):
-
-```typescript
-// eip712.rs:217-221
-const PlaceOrderType = {
-  PlaceOrder: [
-    { name: 'marketId',        type: 'uint64' },
-    { name: 'isBuy',           type: 'bool'   },
-    { name: 'price',           type: 'int128' },
-    { name: 'quantity',        type: 'int128' },
-    { name: 'orderType',       type: 'uint8'  },  // Limit=0 Market=1 StopMarket=2 StopLimit=3
-    { name: 'timeInForce',     type: 'uint8'  },  // GTC=0 IOC=1 FOK=2 PostOnly=3 (verify order)
-    { name: 'reduceOnly',      type: 'bool'   },
-    { name: 'clientOrderId',   type: 'uint64' },  // 0 if absent
-    { name: 'hasClientOrderId',type: 'bool'   },
-    { name: 'nonce',           type: 'uint64' },
-  ],
-} as const
-
-// eip712.rs:244
-const CancelOrderType = {
-  CancelOrder: [
-    { name: 'orderId', type: 'uint128' },
-    { name: 'nonce',   type: 'uint64'  },
-  ],
-} as const
-
-// eip712.rs:253
-const CancelAllOrdersType = {
-  CancelAllOrders: [
-    { name: 'marketId',    type: 'uint64' },  // 0 if absent
-    { name: 'hasMarketId', type: 'bool'   },
-    { name: 'nonce',       type: 'uint64' },
-  ],
-} as const
-
-// …one const per variant: ModifyOrder, TransferToPerp, TransferToSpot,
-// Withdraw, Delegate, Undelegate, PermanentStake, ClaimRewards,
-// SubmitProposal, Vote, SubmitOraclePrices, RegisterValidator,
-// UpdateCommission, JailVote, UnjailSelf, RotateValidatorKey,
-// UpdateMarketParams, ListMarket, DelistMarket, TopUpSelfStake.
-```
-
-**6c. Nonce rule.** The node enforces `|now_ms - nonce| ≤ 60_000`
+**6b. Nonce rule.** The node enforces `|now_ms - nonce| ≤ 60_000`
 (`eip712.rs:26` `NONCE_WINDOW_MS = 60_000`). Use **milliseconds since
 epoch directly** — do NOT multiply.
 
@@ -587,114 +625,311 @@ epoch directly** — do NOT multiply.
 const nonce = BigInt(Date.now())  // u64 milliseconds, within 60s window
 ```
 
-**6d. Sign + submit dispatcher.** Build the typed message per variant,
-sign with `signTypedData`, then hex-encode a `SignedNativeAction` JSON
-blob (matches `torus-types::SignedNativeAction` and the wire format
-expected by `submit_native_action` in `crates/torus-rpc/src/torus.rs:592`,
-which does `serde_json::from_slice(&parse_bytes(hex_string))`).
+**6c. EIP-712 type table — all 22 variants.** One entry per variant.
+Each type string and field list below is taken directly from its `hash_*`
+function in `eip712.rs`. **Do not edit without updating the Rust side in
+lockstep — Rust is the source of truth.**
 
 ```typescript
-import { fromDecimal } from './fixed-point'
+// File locations are crates/torus-types/src/eip712.rs:line
+
+const TYPES = {
+  PlaceOrder: [                                                     // :217
+    { name: 'marketId',         type: 'uint64' },
+    { name: 'isBuy',            type: 'bool'   },
+    { name: 'price',            type: 'int128' },
+    { name: 'quantity',         type: 'int128' },
+    { name: 'orderType',        type: 'uint8'  },   // Limit=0 Market=1 StopMarket=2 StopLimit=3
+    { name: 'timeInForce',      type: 'uint8'  },   // GTC=0 IOC=1 FOK=2 PostOnly=3
+    { name: 'reduceOnly',       type: 'bool'   },
+    { name: 'clientOrderId',    type: 'uint64' },   // 0 if absent
+    { name: 'hasClientOrderId', type: 'bool'   },
+    { name: 'nonce',            type: 'uint64' },
+  ],
+  CancelOrder: [                                                    // :244
+    { name: 'orderId', type: 'uint128' },
+    { name: 'nonce',   type: 'uint64'  },
+  ],
+  CancelAllOrders: [                                                // :253
+    { name: 'marketId',    type: 'uint64' },
+    { name: 'hasMarketId', type: 'bool'   },
+    { name: 'nonce',       type: 'uint64' },
+  ],
+  ModifyOrder: [                                                    // inspect eip712.rs ~:269
+    { name: 'orderId',     type: 'uint128' },
+    { name: 'newPrice',    type: 'int128'  },
+    { name: 'hasNewPrice', type: 'bool'    },
+    { name: 'newQty',      type: 'int128'  },
+    { name: 'hasNewQty',   type: 'bool'    },
+    { name: 'nonce',       type: 'uint64'  },
+  ],
+  TransferToPerp:  [{ name: 'amount', type: 'uint256' }, { name: 'nonce', type: 'uint64' }],
+  TransferToSpot:  [{ name: 'amount', type: 'uint256' }, { name: 'nonce', type: 'uint64' }],
+  Withdraw:        [{ name: 'amount', type: 'uint256' },
+                    { name: 'to',     type: 'address' },
+                    { name: 'nonce',  type: 'uint64'  }],
+  Delegate:        [{ name: 'validator', type: 'address' },
+                    { name: 'amount',    type: 'uint256' },
+                    { name: 'nonce',     type: 'uint64'  }],
+  Undelegate:      [{ name: 'validator', type: 'address' },
+                    { name: 'amount',    type: 'uint256' },
+                    { name: 'nonce',     type: 'uint64'  }],
+  PermanentStake:  [{ name: 'amount', type: 'uint256' }, { name: 'nonce', type: 'uint64' }],
+  ClaimRewards:    [{ name: 'nonce',  type: 'uint64'  }],
+  TopUpSelfStake:  [{ name: 'amount', type: 'uint256' }, { name: 'nonce', type: 'uint64' }],
+  Vote:            [{ name: 'proposalId', type: 'uint64' },
+                    { name: 'option',     type: 'uint8'  },   // Yes=0 No=1 Abstain=2
+                    { name: 'nonce',      type: 'uint64' }],
+  RegisterValidator: [{ name: 'pubkey',     type: 'bytes32' },
+                      { name: 'commission', type: 'uint16'  },
+                      { name: 'nonce',      type: 'uint64'  }],
+  UpdateCommission:   [{ name: 'newRate', type: 'uint16' }, { name: 'nonce', type: 'uint64' }],
+  JailVote:           [{ name: 'target',  type: 'address' }, { name: 'nonce', type: 'uint64' }],
+  UnjailSelf:         [{ name: 'nonce',   type: 'uint64'  }],
+  RotateValidatorKey: [{ name: 'newPubkey', type: 'bytes32' }, { name: 'nonce', type: 'uint64' }],
+  DelistMarket:       [{ name: 'marketId',  type: 'uint64' },  { name: 'nonce', type: 'uint64' }],
+  // UpdateMarketParams, ListMarket, SubmitProposal, SubmitOraclePrices have
+  // nested struct types. Mirror them from eip712.rs one-for-one — add the
+  // nested type entries to TYPES and reference via `type: 'StructName'` in
+  // the parent.
+} as const satisfies Record<string, readonly { name: string; type: string }[]>
+```
+
+**6d. Sign + submit.** The wire format for `submitNativeAction` is
+`hex(utf8(json(SignedNativeAction)))`. Wire shape was verified with a
+probe run (`serde_json::to_string` on real Rust types, 2026-04-16):
+
+```json
+{"action":"ClaimRewards","nonce":1713312000123,
+ "signature":{"v":27,"r":[17,17,…],"s":[34,34,…]}}
+```
+
+So `r`/`s` are arrays of 32 byte-numbers (not hex strings), `v` is a
+number, and `nonce` is a number.
+
+```typescript
+import { type WalletClient } from 'viem'
+import { fromDecimal, stringifyWithBigint } from './fixed-point'
+
+// Matches torus_types::Signature (crates/torus-types/src/lib.rs:183).
+interface WireSignature { v: number; r: number[]; s: number[] }
+
+function splitSig(hex: `0x${string}`): WireSignature {
+  const stripped = hex.slice(2)
+  const r = Array.from(Buffer.from(stripped.slice(0, 64),   'hex'))
+  const s = Array.from(Buffer.from(stripped.slice(64, 128), 'hex'))
+  const v = parseInt(stripped.slice(128, 130), 16)      // viem returns 27|28
+  return { v, r, s }
+}
 
 export async function signAndSubmit(
   rpc: TorusRpc,
   walletClient: WalletClient,
   account: `0x${string}`,
-  action: NativeAction,
+  action: NativeAction,                                 // serde-tagged shape from Step 4
 ): Promise<string> {
   const nonce = BigInt(Date.now())
-  const { types, primaryType, message } = buildTypedMessage(action, nonce)
+  const { primaryType, message } = buildTypedMessage(action, nonce)
 
-  const signature = await walletClient.signTypedData({
-    account,
-    domain: DOMAIN,
-    types,
-    primaryType,
-    message,
+  const sigHex = await walletClient.signTypedData({
+    account, domain: DOMAIN, types: TYPES, primaryType, message,
   })
 
-  // Wire: hex(utf8(json(SignedNativeAction { action, nonce, signature })))
-  const signed = {
-    action,                                // serde-tagged enum — see below
-    nonce: Number(nonce),                  // u64 — safe if < 2^53 (ms until 2255)
-    signature: splitSig(signature),        // { r, s, v } matching torus_types::Signature
+  const envelope = {
+    action,                                             // already serde shape (Step 4)
+    nonce: Number(nonce),
+    signature: splitSig(sigHex),
   }
-  const hex = '0x' + Buffer.from(JSON.stringify(signed), 'utf8').toString('hex')
-  return rpc.submitNativeAction(hex)
-}
-
-function buildTypedMessage(action: NativeAction, nonce: bigint) {
-  switch (action.type) {
-    case 'PlaceOrder':
-      return {
-        types: PlaceOrderType,
-        primaryType: 'PlaceOrder' as const,
-        message: {
-          marketId: BigInt(action.params.marketId),       // hex string → bigint u64
-          isBuy: action.params.isBuy,
-          price: fromDecimal(action.params.price),        // decimal → i128 raw
-          quantity: fromDecimal(action.params.quantity),
-          orderType: ORDER_TYPE_CODE[action.params.orderType],
-          timeInForce: TIF_CODE[action.params.timeInForce],
-          reduceOnly: action.params.reduceOnly,
-          clientOrderId: BigInt(action.params.clientOrderId ?? 0),
-          hasClientOrderId: action.params.clientOrderId != null,
-          nonce,
-        },
-      }
-    case 'CancelOrder':
-      return {
-        types: CancelOrderType,
-        primaryType: 'CancelOrder' as const,
-        message: { orderId: BigInt(action.orderId), nonce },
-      }
-    case 'CancelAllOrders':
-      return {
-        types: CancelAllOrdersType,
-        primaryType: 'CancelAllOrders' as const,
-        message: {
-          marketId: BigInt(action.marketId ?? '0x0'),
-          hasMarketId: action.marketId != null,
-          nonce,
-        },
-      }
-    // …dispatch for every NativeAction variant.
-    default:
-      throw new Error(`unsupported action: ${(action as { type: string }).type}`)
-  }
-}
-
-const ORDER_TYPE_CODE = { limit: 0, market: 1, stop_market: 2, stop_limit: 3 } as const
-const TIF_CODE = { gtc: 0, ioc: 1, fok: 2, post_only: 3 } as const  // verify against Rust enum order
-
-function splitSig(sig: `0x${string}`): { r: string; s: string; v: number } {
-  const r = '0x' + sig.slice(2, 66)
-  const s = '0x' + sig.slice(66, 130)
-  const v = parseInt(sig.slice(130, 132), 16)
-  return { r, s, v }
+  const jsonBytes = Buffer.from(stringifyWithBigint(envelope), 'utf8')
+  const hexBody = '0x' + jsonBytes.toString('hex')
+  return rpc.submitNativeAction(hexBody)
 }
 ```
 
-**6e. Serde tag for `NativeAction`.** The `action` field in the submitted
-JSON must serialize in the exact shape that `serde_json::from_slice::
-<SignedNativeAction>` expects. Read the `#[serde(...)]` attributes on
-`NativeAction` in `crates/torus-types/src/lib.rs` and mirror them in
-the TypeScript `NativeAction` discriminated union (tag key, tag name,
-field casing). Do not assume — inspect first.
+**v-byte normalization.** viem returns `v ∈ {27, 28}` (Ethereum style).
+The probe output shows the Rust side serializes `v: 27` directly, and
+`eip712.rs` uses `k256::ecdsa::RecoveryId::from_byte(v - 27)`-style
+recovery (inspect the `recover_signer` helper before shipping — if it
+expects 0/1, subtract 27 in `splitSig`). Add a `v-byte` test vector
+to the fixtures in 6h to lock this down.
 
-**6f. Implementation order.** Build + signature-test one variant at a
-time against the node, starting with the simplest:
+**6e. `buildTypedMessage` — full dispatcher.**
 
-1. `ClaimRewards` (no fields, 1-param struct hash) → proves domain +
-   submission wire format work end-to-end.
-2. `CancelAllOrders` (no side effects if no orders exist) → proves the
-   `hasMarketId` flag encoding.
-3. `PlaceOrder` → full happy path.
-4. Remaining variants as needed.
+```typescript
+function buildTypedMessage(a: NativeAction, nonce: bigint): {
+  primaryType: keyof typeof TYPES; message: Record<string, unknown>;
+} {
+  if (a === 'ClaimRewards') return { primaryType: 'ClaimRewards', message: { nonce } }
+  if (a === 'UnjailSelf')   return { primaryType: 'UnjailSelf',   message: { nonce } }
 
-**Verify per variant:** submit, check node logs for `invalid signature`
-vs. `InvalidNonce` vs. accepted. Match the type string with
-`keccak256(...)` output from Rust and compare bytes if recovery fails.
+  if ('PlaceOrder' in a) {
+    const p = a.PlaceOrder
+    return {
+      primaryType: 'PlaceOrder',
+      message: {
+        marketId: BigInt(p.market_id),
+        isBuy: p.is_buy,
+        price: p.price,
+        quantity: p.quantity,
+        orderType: orderTypeCode(p.order_type),
+        timeInForce: TIF_CODE[p.time_in_force],
+        reduceOnly: p.reduce_only,
+        clientOrderId: BigInt(p.client_order_id ?? 0),
+        hasClientOrderId: p.client_order_id != null,
+        nonce,
+      },
+    }
+  }
+  if ('CancelOrder' in a)
+    return { primaryType: 'CancelOrder',
+             message: { orderId: BigInt(a.CancelOrder.order_id), nonce } }
+  if ('CancelAllOrders' in a) {
+    const mid = a.CancelAllOrders.market_id
+    return { primaryType: 'CancelAllOrders',
+             message: { marketId: BigInt(mid ?? 0), hasMarketId: mid != null, nonce } }
+  }
+  if ('ModifyOrder' in a) {
+    const m = a.ModifyOrder
+    return { primaryType: 'ModifyOrder',
+             message: {
+               orderId: BigInt(m.order_id),
+               newPrice: m.new_price ?? 0n, hasNewPrice: m.new_price != null,
+               newQty:   m.new_qty   ?? 0n, hasNewQty:   m.new_qty   != null,
+               nonce } }
+  }
+  if ('TransferToPerp' in a) return { primaryType: 'TransferToPerp',
+    message: { amount: a.TransferToPerp.amount, nonce } }
+  if ('TransferToSpot' in a) return { primaryType: 'TransferToSpot',
+    message: { amount: a.TransferToSpot.amount, nonce } }
+  if ('Withdraw' in a) return { primaryType: 'Withdraw',
+    message: { amount: a.Withdraw.amount, to: a.Withdraw.to, nonce } }
+  if ('Delegate' in a) return { primaryType: 'Delegate',
+    message: { validator: a.Delegate.validator, amount: a.Delegate.amount, nonce } }
+  if ('Undelegate' in a) return { primaryType: 'Undelegate',
+    message: { validator: a.Undelegate.validator, amount: a.Undelegate.amount, nonce } }
+  if ('PermanentStake' in a) return { primaryType: 'PermanentStake',
+    message: { amount: a.PermanentStake.amount, nonce } }
+  if ('TopUpSelfStake' in a) return { primaryType: 'TopUpSelfStake',
+    message: { amount: a.TopUpSelfStake.amount, nonce } }
+  if ('Vote' in a) return { primaryType: 'Vote',
+    message: { proposalId: BigInt(a.Vote.proposal_id),
+               option: VOTE_CODE[a.Vote.option], nonce } }
+  if ('RegisterValidator' in a) return { primaryType: 'RegisterValidator',
+    message: { pubkey: bytes32Hex(a.RegisterValidator.pubkey),
+               commission: a.RegisterValidator.commission, nonce } }
+  if ('UpdateCommission' in a) return { primaryType: 'UpdateCommission',
+    message: { newRate: a.UpdateCommission.new_rate, nonce } }
+  if ('JailVote' in a) return { primaryType: 'JailVote',
+    message: { target: a.JailVote.target, nonce } }
+  if ('RotateValidatorKey' in a) return { primaryType: 'RotateValidatorKey',
+    message: { newPubkey: bytes32Hex(a.RotateValidatorKey.new_pubkey), nonce } }
+  if ('DelistMarket' in a) return { primaryType: 'DelistMarket',
+    message: { marketId: BigInt(a.DelistMarket.market_id), nonce } }
+
+  // SubmitProposal, SubmitOraclePrices, UpdateMarketParams, ListMarket carry
+  // nested structs. Once TYPES has the nested entries, mirror
+  // hash_submit_proposal / hash_submit_oracle_prices / hash_update_market_params
+  // / hash_list_market from eip712.rs field-for-field here.
+  throw new Error(`buildTypedMessage: unsupported variant ${JSON.stringify(a).slice(0, 64)}`)
+}
+
+function orderTypeCode(t: SerdeOrderType): 0 | 1 | 2 | 3 {
+  if (t === 'Limit')     return 0
+  if (t === 'Market')    return 1
+  if ('StopMarket' in t) return 2     // trigger NOT in EIP-712 struct (eip712.rs:230-234 matches `{..}`)
+  return 3                            // StopLimit; trigger/limit also NOT in struct
+}
+const TIF_CODE  = { GTC: 0, IOC: 1, FOK: 2, PostOnly: 3 } as const
+const VOTE_CODE = { Yes: 0, No: 1, Abstain: 2 } as const
+function bytes32Hex(b: number[]): `0x${string}` { return `0x${Buffer.from(b).toString('hex')}` }
+```
+
+**Stop-order caveat.** `hash_place_order` at `eip712.rs:230-234` matches
+`StopMarket { .. }` and `StopLimit { .. }` via `{ .. }` — **the trigger
+and limit fields are NOT committed to in the EIP-712 struct hash.** The
+dispatcher above preserves that behavior. If Rust ever starts including
+them in the hash (closing a potential malleability window), `TYPES` and
+the dispatcher must both be updated in the same PR.
+
+**6f. UI → serde conversion helper.** UI components construct
+`PlaceOrderParams` (camelCase decimals, Step 4); `signAndSubmit` takes
+the serde shape. Provide one converter so components never hand-build the
+wire shape:
+
+```typescript
+export function toSerdeAction(ui: UiAction): NativeAction {
+  switch (ui.kind) {
+    case 'place': {
+      const p = ui.params
+      const order_type: SerdeOrderType =
+        p.orderType === 'Limit'      ? 'Limit' :
+        p.orderType === 'Market'     ? 'Market' :
+        p.orderType === 'StopMarket' ? { StopMarket: { trigger: fromDecimal(p.trigger!) } } :
+                                       { StopLimit:  { trigger: fromDecimal(p.trigger!),
+                                                       limit:   fromDecimal(p.limit!)   } }
+      return { PlaceOrder: {
+        market_id: Number(BigInt(p.marketId)),
+        is_buy: p.isBuy,
+        price: fromDecimal(p.price),
+        quantity: fromDecimal(p.quantity),
+        order_type,
+        time_in_force: p.timeInForce,
+        reduce_only: p.reduceOnly,
+        client_order_id: p.clientOrderId ?? null,
+      } }
+    }
+    case 'cancel':    return { CancelOrder: { order_id: BigInt(ui.orderId) } }
+    case 'cancelAll': return { CancelAllOrders: {
+      market_id: ui.marketId ? Number(BigInt(ui.marketId)) : null } }
+    // …remaining UI-shape → serde-shape mappings
+  }
+}
+```
+
+**6g. Test-vector CI gate (mandatory).** The only way to catch type-string,
+field-order, or scalar-width drift before a user clicks Place Order is to
+share a fixture file across Rust and TS.
+
+- **Producer** (Rust): add a `#[test]` in `torus-types` that, for a pinned
+  list of `(NativeAction, nonce)` tuples covering every variant, writes
+  `crates/torus-types/tests/fixtures/eip712_vectors.json` with records of
+  shape `{ label, action: <serde>, nonce: <u64>, struct_hash: "0x…",
+  signing_hash: "0x…" }`. `struct_hash` comes from `eip712_struct_hash`
+  and `signing_hash` from `eip712_signing_hash(domain_separator, struct_hash)`.
+- **Consumer** (TS): a vitest fixture loader reads the same JSON, reconstructs
+  the typed message via `buildTypedMessage`, and asserts:
+  1. `hashStruct({ types: TYPES, primaryType, message })` (viem) equals
+     `struct_hash` byte-for-byte.
+  2. `hashTypedData({ domain: DOMAIN, types: TYPES, primaryType, message })`
+     equals `signing_hash`.
+  22 variants × 3 cases (Limit / Market / Stop\*) for PlaceOrder = ~25 tests.
+- **CI**: Rust regenerates fixtures on every `eip712.rs` change (git diff is
+  the review surface); TS CI fails on any divergence.
+- **v-byte probe**: one fixture case signs with a pinned k256 secret key,
+  stores the resulting signature, and asserts the TS dispatcher produces
+  an identical wire envelope (confirms r/s endianness and v-byte convention).
+
+This catches every realistic drift between the two sides — type string edit,
+field reorder, width change, new variant, signature shape — without needing
+a running node. Reference implementation in sibling project:
+`torus-HBFT-explorer/lib/eip712.ts` already demonstrates this pattern for
+an earlier subset of variants (memory id `2415a29f4b9c8a7b`).
+
+**6h. Implementation + rollout order.** Build and test one variant at a
+time against the fixtures first, then against a local node:
+
+1. **Fixture infrastructure** (Rust test producer + TS vitest consumer).
+2. `ClaimRewards` — empty action, proves domain + nonce + submission wire.
+3. `CancelAllOrders` — single optional field + marker bool, proves the
+   `hasMarketId` idiom and the externally-tagged `{ CancelAllOrders: {...} }`
+   envelope.
+4. `PlaceOrder` (Limit → Market → StopMarket → StopLimit) — full happy path.
+5. Remaining 18 variants, each gated behind a passing test vector.
+
+**Node-side debug aids if a submission fails despite vectors passing:**
+`RUST_LOG=torus_rpc=debug,torus_types=debug` prints the recovered signer
+and the struct hash the node computed. Compare byte-for-byte against the
+TS-side hash.
 
 ---
 
