@@ -20,6 +20,7 @@ use torus_economics::{
     EpochManager, GovernanceManager, RewardDistributor, StakingManager, ValidatorStatus,
 };
 use torus_economics::epoch::ValidatorSetDiff;
+use torus_state::cf::{CF_NATIVE_TRADES, CF_NATIVE_USER_TRADES};
 use torus_state::StateDb;
 use torus_types::{
     FixedPoint, MarketId, NativeAction, OrderType, PlaceOrderParams, PublicKey, Side, TimeInForce,
@@ -105,6 +106,8 @@ pub struct NativeExecContext {
 
     /// Accumulated native fees during this block.
     pub total_native_fees: u64,
+    /// Per-block trade counter for unique trade keys.
+    pub trade_index: u32,
 }
 
 impl NativeExecContext {
@@ -146,6 +149,7 @@ impl NativeExecContext {
             treasury_address,
             dev_pool_address,
             total_native_fees: 0,
+            trade_index: 0,
         }
     }
 
@@ -441,6 +445,62 @@ impl NativeExecutor {
                     format!("maker fill failed: {e}"),
                 );
             }
+        }
+
+        // Persist trades to CF_NATIVE_TRADES and CF_NATIVE_USER_TRADES.
+        // These CFs are NOT in the state root, so writes cannot affect consensus.
+        for fill in &result.fills {
+            let taker_side: u8 = if fill.maker_side == Side::Buy { 1 } else { 0 };
+
+            // Primary key: market_id(8) + block_number(8) + trade_index(4)
+            let mut trade_key = [0u8; 20];
+            trade_key[..8].copy_from_slice(&market_id.to_be_bytes());
+            trade_key[8..16].copy_from_slice(&ctx.block_height.to_be_bytes());
+            trade_key[16..20].copy_from_slice(&ctx.trade_index.to_be_bytes());
+
+            let trade_id = ctx.trade_index as u128;
+            let price_raw = fill.price.raw();
+            let quantity_raw = fill.quantity.raw();
+
+            // Borsh-serialize trade data (matches StoredTrade layout)
+            let mut trade_data = Vec::with_capacity(64);
+            trade_data.extend_from_slice(&trade_id.to_le_bytes());
+            trade_data.extend_from_slice(&price_raw.to_le_bytes());
+            trade_data.extend_from_slice(&quantity_raw.to_le_bytes());
+            trade_data.push(taker_side);
+            trade_data.extend_from_slice(&ctx.block_height.to_le_bytes());
+            trade_data.extend_from_slice(&ctx.timestamp.to_le_bytes());
+
+            let _ = ctx.state_db.put_cf_raw(CF_NATIVE_TRADES, &trade_key, &trade_data);
+
+            // Secondary index: per-user trades (descending block order)
+            let desc_block = u64::MAX - ctx.block_height;
+            let mut user_trade_data = Vec::with_capacity(80);
+            user_trade_data.extend_from_slice(&trade_id.to_le_bytes());
+            user_trade_data.extend_from_slice(&market_id.to_le_bytes());
+            user_trade_data.extend_from_slice(&price_raw.to_le_bytes());
+            user_trade_data.extend_from_slice(&quantity_raw.to_le_bytes());
+            user_trade_data.push(taker_side);
+            user_trade_data.push(0u8); // role: maker
+            user_trade_data.extend_from_slice(&ctx.block_height.to_le_bytes());
+            user_trade_data.extend_from_slice(&ctx.timestamp.to_le_bytes());
+
+            // Maker entry
+            let mut maker_key = [0u8; 32];
+            maker_key[..20].copy_from_slice(fill.maker.as_slice());
+            maker_key[20..28].copy_from_slice(&desc_block.to_be_bytes());
+            maker_key[28..32].copy_from_slice(&ctx.trade_index.to_be_bytes());
+            let _ = ctx.state_db.put_cf_raw(CF_NATIVE_USER_TRADES, &maker_key, &user_trade_data);
+
+            // Taker entry (flip role byte at offset 57: 16+8+16+16+1)
+            user_trade_data[57] = 1u8; // role: taker
+            let mut taker_key = [0u8; 32];
+            taker_key[..20].copy_from_slice(fill.taker.as_slice());
+            taker_key[20..28].copy_from_slice(&desc_block.to_be_bytes());
+            taker_key[28..32].copy_from_slice(&ctx.trade_index.to_be_bytes());
+            let _ = ctx.state_db.put_cf_raw(CF_NATIVE_USER_TRADES, &taker_key, &user_trade_data);
+
+            ctx.trade_index += 1;
         }
 
         NativeActionResult::ok("place_order", 1000)

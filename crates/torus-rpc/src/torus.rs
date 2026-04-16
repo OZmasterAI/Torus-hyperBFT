@@ -11,6 +11,7 @@ use jsonrpsee::PendingSubscriptionSink;
 use rocksdb::IteratorMode;
 
 use torus_core::oracle::{OracleConfig, OracleManager};
+use torus_core::order_book::OrderBook;
 use torus_core::position::PositionManager;
 use torus_core::precompiles::OrderBookSnapshot;
 use torus_economics::governance::{GovernanceManager, ProposalStatus, ProposalType};
@@ -24,7 +25,7 @@ use torus_economics::types::{
 use torus_economics::{lerp_bps, PermanentStakeInfo};
 use torus_state::cf::{
     CF_BLOCK_BODIES, CF_GOVERNANCE_PROPOSALS, CF_NATIVE_MARKETS, CF_NATIVE_ORDER_BOOKS,
-    CF_NATIVE_TRADES, CF_STAKING_PERMANENT,
+    CF_NATIVE_POSITIONS, CF_NATIVE_TRADES, CF_NATIVE_USER_TRADES, CF_STAKING_PERMANENT,
 };
 use torus_types::FixedPoint;
 
@@ -56,6 +57,20 @@ pub(crate) struct StoredTrade {
     pub price_raw: i128,
     pub quantity_raw: i128,
     pub side: u8,
+    pub block_number: u64,
+    pub timestamp: u64,
+}
+
+/// Per-user trade data stored in CF_NATIVE_USER_TRADES.
+/// Key: trader(20) + (u64::MAX - block)(8 BE) + trade_index(4 BE).
+#[derive(BorshDeserialize)]
+pub(crate) struct StoredUserTrade {
+    pub trade_id: u128,
+    pub market_id: u64,
+    pub price_raw: i128,
+    pub quantity_raw: i128,
+    pub side: u8,
+    pub role: u8,
     pub block_number: u64,
     pub timestamp: u64,
 }
@@ -143,6 +158,28 @@ pub trait TorusApi {
         to_block: String,
         limit: Option<u64>,
     ) -> RpcResult<Vec<RpcTrade>>;
+
+    // --- Trading app endpoints ---
+    #[method(name = "getOpenOrders")]
+    async fn get_open_orders(
+        &self,
+        trader: String,
+        market_id: Option<String>,
+    ) -> RpcResult<Vec<RpcOpenOrder>>;
+
+    #[method(name = "getOpenInterest")]
+    async fn get_open_interest(&self, market_id: String) -> RpcResult<RpcOpenInterest>;
+
+    #[method(name = "getMarkPrice")]
+    async fn get_mark_price(&self, market_id: String) -> RpcResult<RpcMarkPrice>;
+
+    #[method(name = "getUserTrades")]
+    async fn get_user_trades(
+        &self,
+        trader: String,
+        market_id: Option<String>,
+        limit: Option<u32>,
+    ) -> RpcResult<Vec<RpcUserTrade>>;
 
     // --- Phase 7B: Trade streaming subscription ---
     #[subscription(name = "subscribe" => "subscription", unsubscribe = "unsubscribe", item = serde_json::Value)]
@@ -868,6 +905,213 @@ impl TorusApiServer for RpcState {
         Ok(trades)
     }
 
+    // === Trading app endpoints ===
+
+    async fn get_open_orders(
+        &self,
+        trader: String,
+        market_id: Option<String>,
+    ) -> RpcResult<Vec<RpcOpenOrder>> {
+        let trader_addr = parse_address(&trader).map_err(ErrorObjectOwned::from)?;
+
+        let db = self.state.inner();
+        let cf = match db.cf_handle(CF_NATIVE_ORDER_BOOKS) {
+            Some(cf) => cf,
+            None => return Ok(vec![]),
+        };
+
+        let mut orders = Vec::new();
+
+        if let Some(ref mid_str) = market_id {
+            // Single market: read one OrderBook
+            let mid = parse_u64(mid_str).map_err(ErrorObjectOwned::from)?;
+            let key = mid.to_be_bytes();
+            if let Some(data) = db.get_cf(cf, &key)
+                .map_err(|e| RpcError::Internal(format!("rocksdb: {e}")))
+                .map_err(ErrorObjectOwned::from)?
+            {
+                let book = OrderBook::try_from_slice(&data)
+                    .map_err(|e| RpcError::Internal(format!("borsh decode order book: {e}")))
+                    .map_err(ErrorObjectOwned::from)?;
+                for order in book.orders_for_trader(&trader_addr) {
+                    if orders.len() >= 500 {
+                        break;
+                    }
+                    orders.push(order_to_rpc(order, mid));
+                }
+            }
+        } else {
+            // All markets: iterate CF_NATIVE_ORDER_BOOKS
+            let iter = db.iterator_cf(cf, IteratorMode::Start);
+            for item in iter {
+                if orders.len() >= 500 {
+                    break;
+                }
+                let (key, value) = item
+                    .map_err(|e| RpcError::Internal(format!("rocksdb: {e}")))
+                    .map_err(ErrorObjectOwned::from)?;
+                if key.len() != 8 {
+                    continue;
+                }
+                let mid = u64::from_be_bytes(key[..8].try_into().unwrap());
+                let book = match OrderBook::try_from_slice(&value) {
+                    Ok(b) => b,
+                    Err(_) => continue,
+                };
+                for order in book.orders_for_trader(&trader_addr) {
+                    if orders.len() >= 500 {
+                        break;
+                    }
+                    orders.push(order_to_rpc(order, mid));
+                }
+            }
+        }
+
+        Ok(orders)
+    }
+
+    async fn get_open_interest(&self, market_id: String) -> RpcResult<RpcOpenInterest> {
+        let mid = parse_u64(&market_id).map_err(ErrorObjectOwned::from)?;
+
+        let db = self.state.inner();
+        let cf = match db.cf_handle(CF_NATIVE_POSITIONS) {
+            Some(cf) => cf,
+            None => {
+                return Ok(RpcOpenInterest {
+                    market_id,
+                    long_oi: hex_fp(FixedPoint::ZERO),
+                    short_oi: hex_fp(FixedPoint::ZERO),
+                });
+            }
+        };
+
+        // Position key: trader(20) + market_id(8). Full scan, filter by market.
+        let mut long_oi = FixedPoint::ZERO;
+        let mut short_oi = FixedPoint::ZERO;
+        let iter = db.iterator_cf(cf, IteratorMode::Start);
+        for item in iter {
+            let (key, value) = item
+                .map_err(|e| RpcError::Internal(format!("rocksdb: {e}")))
+                .map_err(ErrorObjectOwned::from)?;
+            if key.len() != 28 {
+                continue;
+            }
+            let pos_market = u64::from_be_bytes(key[20..28].try_into().unwrap());
+            if pos_market != mid {
+                continue;
+            }
+            let pos = torus_core::position::Position::try_from_slice(&value)
+                .map_err(|e| RpcError::Internal(format!("borsh decode position: {e}")))
+                .map_err(ErrorObjectOwned::from)?;
+            if pos.is_long {
+                long_oi = long_oi + pos.size;
+            } else {
+                short_oi = short_oi + pos.size;
+            }
+        }
+
+        Ok(RpcOpenInterest {
+            market_id,
+            long_oi: hex_fp(long_oi),
+            short_oi: hex_fp(short_oi),
+        })
+    }
+
+    async fn get_mark_price(&self, market_id: String) -> RpcResult<RpcMarkPrice> {
+        let mid = parse_u64(&market_id).map_err(ErrorObjectOwned::from)?;
+        let current_block = self.latest_height.load(Ordering::Relaxed);
+
+        let oracle = OracleManager::new(self.state.clone(), OracleConfig::default());
+        let (mark_price, index_price, timestamp) = match oracle.get_price(mid, current_block) {
+            Ok(op) => (op.price, op.price, op.block_number),
+            Err(_) => (FixedPoint::ZERO, FixedPoint::ZERO, 0),
+        };
+
+        // Last trade price from the order book
+        let last_trade_price = match self.state.get_cf_raw(CF_NATIVE_ORDER_BOOKS, &mid.to_be_bytes()) {
+            Ok(Some(data)) => {
+                OrderBook::try_from_slice(&data)
+                    .ok()
+                    .and_then(|book| book.last_trade_price())
+                    .unwrap_or(FixedPoint::ZERO)
+            }
+            _ => FixedPoint::ZERO,
+        };
+
+        Ok(RpcMarkPrice {
+            market_id,
+            mark_price: hex_fp(mark_price),
+            index_price: hex_fp(index_price),
+            last_trade_price: hex_fp(last_trade_price),
+            timestamp,
+        })
+    }
+
+    async fn get_user_trades(
+        &self,
+        trader: String,
+        market_id: Option<String>,
+        limit: Option<u32>,
+    ) -> RpcResult<Vec<RpcUserTrade>> {
+        let trader_addr = parse_address(&trader).map_err(ErrorObjectOwned::from)?;
+        let limit = limit.unwrap_or(100).min(1000) as usize;
+        let market_filter = match market_id {
+            Some(ref s) => Some(parse_u64(s).map_err(ErrorObjectOwned::from)?),
+            None => None,
+        };
+
+        let db = self.state.inner();
+        let cf = match db.cf_handle(CF_NATIVE_USER_TRADES) {
+            Some(cf) => cf,
+            None => return Ok(vec![]),
+        };
+
+        // Forward prefix scan: keys encode descending block order via
+        // (u64::MAX - block), so forward iteration returns newest first.
+        let prefix = trader_addr.as_slice();
+        let iter = db.iterator_cf(
+            cf,
+            rocksdb::IteratorMode::From(prefix, rocksdb::Direction::Forward),
+        );
+
+        let mut trades = Vec::with_capacity(limit.min(256));
+        for item in iter {
+            let (key, value) = item
+                .map_err(|e| RpcError::Internal(format!("rocksdb: {e}")))
+                .map_err(ErrorObjectOwned::from)?;
+            if !key.starts_with(prefix) {
+                break;
+            }
+
+            let trade = StoredUserTrade::try_from_slice(&value)
+                .map_err(|e| RpcError::Internal(format!("borsh decode user trade: {e}")))
+                .map_err(ErrorObjectOwned::from)?;
+
+            if let Some(mf) = market_filter {
+                if trade.market_id != mf {
+                    continue;
+                }
+            }
+
+            trades.push(RpcUserTrade {
+                trade_id: hex_u128(trade.trade_id),
+                market_id: hex_u64(trade.market_id),
+                side: if trade.side == 0 { "buy".to_string() } else { "sell".to_string() },
+                price: hex_fp(FixedPoint::from_raw(trade.price_raw)),
+                quantity: hex_fp(FixedPoint::from_raw(trade.quantity_raw)),
+                role: if trade.role == 0 { "maker".to_string() } else { "taker".to_string() },
+                block_number: hex_u64(trade.block_number),
+                timestamp: hex_u64(trade.timestamp),
+            });
+
+            if trades.len() >= limit {
+                break;
+            }
+        }
+
+        Ok(trades)
+    }
+
     // === Phase 7B: Trade streaming subscription ===
 
     async fn subscribe(
@@ -983,6 +1227,41 @@ fn map_proposal(p: torus_economics::governance::Proposal) -> RpcProposal {
         votes_against: hex_u256(p.votes_against),
         start_block: hex_u64(p.start_block),
         end_block: hex_u64(p.end_block),
+    }
+}
+
+fn order_to_rpc(order: &torus_core::order_book::Order, market_id: u64) -> RpcOpenOrder {
+    use torus_types::{OrderType, Side, TimeInForce};
+
+    let side = match order.side {
+        Side::Buy => "buy",
+        Side::Sell => "sell",
+    };
+    let order_type = match order.order_type {
+        OrderType::Limit => "limit",
+        OrderType::Market => "market",
+        OrderType::StopMarket { .. } => "stop_market",
+        OrderType::StopLimit { .. } => "stop_limit",
+    };
+    let time_in_force = match order.time_in_force {
+        TimeInForce::GTC => "gtc",
+        TimeInForce::IOC => "ioc",
+        TimeInForce::FOK => "fok",
+        TimeInForce::PostOnly => "post_only",
+    };
+
+    RpcOpenOrder {
+        order_id: hex_u128(order.id),
+        market_id: hex_u64(market_id),
+        side: side.to_string(),
+        price: hex_fp(order.price),
+        remaining_qty: hex_fp(order.remaining_qty),
+        original_qty: hex_fp(order.original_qty),
+        order_type: order_type.to_string(),
+        time_in_force: time_in_force.to_string(),
+        reduce_only: order.reduce_only,
+        client_order_id: order.client_order_id.map(|id| hex_u64(id)),
+        timestamp: order.timestamp,
     }
 }
 

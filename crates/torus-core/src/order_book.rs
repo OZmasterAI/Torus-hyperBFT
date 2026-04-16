@@ -567,6 +567,14 @@ impl OrderBook {
         self.last_trade_price
     }
 
+    /// All resting orders belonging to a specific trader.
+    pub fn orders_for_trader(&self, trader: &Address) -> Vec<&Order> {
+        match self.trader_orders.get(trader) {
+            Some(ids) => ids.iter().filter_map(|id| self.get_order(*id)).collect(),
+            None => vec![],
+        }
+    }
+
     /// Number of pending stop orders.
     pub fn pending_stop_count(&self) -> usize {
         self.pending_stops.len()

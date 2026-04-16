@@ -323,6 +323,57 @@ pub struct RpcTrade {
 }
 
 // ============================================================================
+// Trading RPC Response Types (getOpenOrders, getOpenInterest, getMarkPrice, getUserTrades)
+// ============================================================================
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcOpenOrder {
+    pub order_id: String,
+    pub market_id: String,
+    pub side: String,
+    pub price: String,
+    pub remaining_qty: String,
+    pub original_qty: String,
+    pub order_type: String,
+    pub time_in_force: String,
+    pub reduce_only: bool,
+    pub client_order_id: Option<String>,
+    pub timestamp: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcOpenInterest {
+    pub market_id: String,
+    pub long_oi: String,
+    pub short_oi: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcMarkPrice {
+    pub market_id: String,
+    pub mark_price: String,
+    pub index_price: String,
+    pub last_trade_price: String,
+    pub timestamp: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcUserTrade {
+    pub trade_id: String,
+    pub market_id: String,
+    pub side: String,
+    pub price: String,
+    pub quantity: String,
+    pub role: String,
+    pub block_number: String,
+    pub timestamp: String,
+}
+
+// ============================================================================
 // Torus Staking RPC Response Types (2.9.3)
 // ============================================================================
 
