@@ -4,7 +4,11 @@
 **Date:** 2026-04-16
 **Estimated scope:** ~4,500 lines TypeScript/TSX + ~800 lines CSS/config
 **Repo:** New standalone repo `torus-trading-app` (separate from torus-web-design)
-**Prerequisite:** `torus_getOpenOrders` RPC endpoint ([writing-plan-trading-rpc-gaps.md](./writing-plan-trading-rpc-gaps.md) Step 1)
+**RPC dependencies:** all required endpoints (`torus_getOpenOrders`, `torus_getOrderBook`,
+`torus_getPosition`, `torus_getBalances`, `torus_getMarkets`, `torus_getTradeHistory`,
+`torus_submitNativeAction`) are implemented in torus-node. See
+`crates/torus-rpc/src/torus.rs` for the server trait and
+`crates/torus-rpc/src/lib.rs` tests for wire formats.
 
 ---
 
@@ -284,13 +288,24 @@ export default function RootLayout({ children }) {
 Define interfaces matching every RPC response from the PRD Section 5.1:
 
 ```typescript
+// Wire convention: numeric fields from the node are hex strings.
+//   - FixedPoint values (price, quantity, pnl, margin): hex-encoded i128
+//     (two's-complement; parse via `fromHex` → divide by 10^8 for decimal).
+//   - MarketId: hex-encoded u64 (e.g. "0x1"). The on-wire u64 is what gets
+//     signed inside EIP-712 PlaceOrder structs (convert `BigInt("0x1")` → u64).
+//   - Address: 0x-prefixed 20-byte hex.
+//   - block/timestamp: hex-encoded u64.
+
 export interface OrderBookLevel { price: string; quantity: string; orderCount: number }
 export interface OrderBook { marketId: string; bids: OrderBookLevel[]; asks: OrderBookLevel[] }
 
 export interface Position {
-  marketId: string; side: string; size: string; entryPrice: string;
+  marketId: string;
+  side: 'long' | 'short';            // RpcPosition uses "long"/"short", NOT "buy"/"sell"
+  size: string; entryPrice: string;
   unrealizedPnl: string; realizedPnl: string; margin: string;
-  marginMode: string; liquidationPrice: string;
+  marginMode: 'cross' | 'isolated';
+  liquidationPrice: string;
 }
 
 export interface Balances {
@@ -496,56 +511,190 @@ export class TorusWs {
 
 **File:** `lib/sign.ts`
 
-Builds and signs NativeAction payloads using the connected wallet.
+Builds and signs NativeAction payloads. **The node verifies signatures using
+a distinct EIP-712 type per NativeAction variant** — not a generic wrapper.
+See `crates/torus-types/src/eip712.rs:216-740` for the authoritative set
+of type strings and field layouts. A mismatch in type string, field order,
+or scalar width (`uint64` vs `uint128` vs `int128`) causes signature
+recovery to fail.
+
+**6a. Domain separator.**
 
 ```typescript
 import { type WalletClient } from 'viem'
 import { CHAIN_ID } from './constants'
 
+// Matches eip712.rs: { name: "Torus", version: "1", chainId: 7777,
+// verifyingContract: 0x0000...0000 } (zero address, NOT 0x...0001)
 const DOMAIN = {
   name: 'Torus',
   version: '1',
-  chainId: CHAIN_ID,
-  verifyingContract: '0x0000000000000000000000000000000000000001' as `0x${string}`,
-}
+  chainId: CHAIN_ID,                                           // 7777
+  verifyingContract: '0x0000000000000000000000000000000000000000' as `0x${string}`,
+} as const
+```
 
-// EIP-712 type definitions matching torus-types/src/eip712.rs
-const TYPES = {
-  NativeAction: [
-    { name: 'action', type: 'string' },
-    { name: 'nonce', type: 'uint64' },
+**6b. Per-variant EIP-712 types.** One entry per `NativeAction` variant.
+Field order and names must match the `keccak256(...)` type strings in
+`eip712.rs` verbatim. Selected examples (full set lives in the file):
+
+```typescript
+// eip712.rs:217-221
+const PlaceOrderType = {
+  PlaceOrder: [
+    { name: 'marketId',        type: 'uint64' },
+    { name: 'isBuy',           type: 'bool'   },
+    { name: 'price',           type: 'int128' },
+    { name: 'quantity',        type: 'int128' },
+    { name: 'orderType',       type: 'uint8'  },  // Limit=0 Market=1 StopMarket=2 StopLimit=3
+    { name: 'timeInForce',     type: 'uint8'  },  // GTC=0 IOC=1 FOK=2 PostOnly=3 (verify order)
+    { name: 'reduceOnly',      type: 'bool'   },
+    { name: 'clientOrderId',   type: 'uint64' },  // 0 if absent
+    { name: 'hasClientOrderId',type: 'bool'   },
+    { name: 'nonce',           type: 'uint64' },
   ],
-}
+} as const
+
+// eip712.rs:244
+const CancelOrderType = {
+  CancelOrder: [
+    { name: 'orderId', type: 'uint128' },
+    { name: 'nonce',   type: 'uint64'  },
+  ],
+} as const
+
+// eip712.rs:253
+const CancelAllOrdersType = {
+  CancelAllOrders: [
+    { name: 'marketId',    type: 'uint64' },  // 0 if absent
+    { name: 'hasMarketId', type: 'bool'   },
+    { name: 'nonce',       type: 'uint64' },
+  ],
+} as const
+
+// …one const per variant: ModifyOrder, TransferToPerp, TransferToSpot,
+// Withdraw, Delegate, Undelegate, PermanentStake, ClaimRewards,
+// SubmitProposal, Vote, SubmitOraclePrices, RegisterValidator,
+// UpdateCommission, JailVote, UnjailSelf, RotateValidatorKey,
+// UpdateMarketParams, ListMarket, DelistMarket, TopUpSelfStake.
+```
+
+**6c. Nonce rule.** The node enforces `|now_ms - nonce| ≤ 60_000`
+(`eip712.rs:26` `NONCE_WINDOW_MS = 60_000`). Use **milliseconds since
+epoch directly** — do NOT multiply.
+
+```typescript
+const nonce = BigInt(Date.now())  // u64 milliseconds, within 60s window
+```
+
+**6d. Sign + submit dispatcher.** Build the typed message per variant,
+sign with `signTypedData`, then hex-encode a `SignedNativeAction` JSON
+blob (matches `torus-types::SignedNativeAction` and the wire format
+expected by `submit_native_action` in `crates/torus-rpc/src/torus.rs:592`,
+which does `serde_json::from_slice(&parse_bytes(hex_string))`).
+
+```typescript
+import { fromDecimal } from './fixed-point'
 
 export async function signAndSubmit(
   rpc: TorusRpc,
   walletClient: WalletClient,
+  account: `0x${string}`,
   action: NativeAction,
 ): Promise<string> {
-  const nonce = BigInt(Date.now()) * 1_000_000n;
-  const actionJson = JSON.stringify(action);
+  const nonce = BigInt(Date.now())
+  const { types, primaryType, message } = buildTypedMessage(action, nonce)
 
   const signature = await walletClient.signTypedData({
+    account,
     domain: DOMAIN,
-    types: TYPES,
-    primaryType: 'NativeAction',
-    message: { action: actionJson, nonce },
-  });
+    types,
+    primaryType,
+    message,
+  })
 
-  return rpc.submitNativeAction({
-    action,
-    nonce: `0x${nonce.toString(16)}`,
-    signature,
-  });
+  // Wire: hex(utf8(json(SignedNativeAction { action, nonce, signature })))
+  const signed = {
+    action,                                // serde-tagged enum — see below
+    nonce: Number(nonce),                  // u64 — safe if < 2^53 (ms until 2255)
+    signature: splitSig(signature),        // { r, s, v } matching torus_types::Signature
+  }
+  const hex = '0x' + Buffer.from(JSON.stringify(signed), 'utf8').toString('hex')
+  return rpc.submitNativeAction(hex)
+}
+
+function buildTypedMessage(action: NativeAction, nonce: bigint) {
+  switch (action.type) {
+    case 'PlaceOrder':
+      return {
+        types: PlaceOrderType,
+        primaryType: 'PlaceOrder' as const,
+        message: {
+          marketId: BigInt(action.params.marketId),       // hex string → bigint u64
+          isBuy: action.params.isBuy,
+          price: fromDecimal(action.params.price),        // decimal → i128 raw
+          quantity: fromDecimal(action.params.quantity),
+          orderType: ORDER_TYPE_CODE[action.params.orderType],
+          timeInForce: TIF_CODE[action.params.timeInForce],
+          reduceOnly: action.params.reduceOnly,
+          clientOrderId: BigInt(action.params.clientOrderId ?? 0),
+          hasClientOrderId: action.params.clientOrderId != null,
+          nonce,
+        },
+      }
+    case 'CancelOrder':
+      return {
+        types: CancelOrderType,
+        primaryType: 'CancelOrder' as const,
+        message: { orderId: BigInt(action.orderId), nonce },
+      }
+    case 'CancelAllOrders':
+      return {
+        types: CancelAllOrdersType,
+        primaryType: 'CancelAllOrders' as const,
+        message: {
+          marketId: BigInt(action.marketId ?? '0x0'),
+          hasMarketId: action.marketId != null,
+          nonce,
+        },
+      }
+    // …dispatch for every NativeAction variant.
+    default:
+      throw new Error(`unsupported action: ${(action as { type: string }).type}`)
+  }
+}
+
+const ORDER_TYPE_CODE = { limit: 0, market: 1, stop_market: 2, stop_limit: 3 } as const
+const TIF_CODE = { gtc: 0, ioc: 1, fok: 2, post_only: 3 } as const  // verify against Rust enum order
+
+function splitSig(sig: `0x${string}`): { r: string; s: string; v: number } {
+  const r = '0x' + sig.slice(2, 66)
+  const s = '0x' + sig.slice(66, 130)
+  const v = parseInt(sig.slice(130, 132), 16)
+  return { r, s, v }
 }
 ```
 
-**Important:** The exact EIP-712 type structure must match
-`torus-types/src/eip712.rs`. Read that file before implementing to get
-the domain separator, type hashes, and field ordering exactly right.
-A mismatch means signature recovery fails on the node.
+**6e. Serde tag for `NativeAction`.** The `action` field in the submitted
+JSON must serialize in the exact shape that `serde_json::from_slice::
+<SignedNativeAction>` expects. Read the `#[serde(...)]` attributes on
+`NativeAction` in `crates/torus-types/src/lib.rs` and mirror them in
+the TypeScript `NativeAction` discriminated union (tag key, tag name,
+field casing). Do not assume — inspect first.
 
-**Verify:** Sign a `CancelAllOrders` action, submit to node, verify accepted.
+**6f. Implementation order.** Build + signature-test one variant at a
+time against the node, starting with the simplest:
+
+1. `ClaimRewards` (no fields, 1-param struct hash) → proves domain +
+   submission wire format work end-to-end.
+2. `CancelAllOrders` (no side effects if no orders exist) → proves the
+   `hasMarketId` flag encoding.
+3. `PlaceOrder` → full happy path.
+4. Remaining variants as needed.
+
+**Verify per variant:** submit, check node logs for `invalid signature`
+vs. `InvalidNonce` vs. accepted. Match the type string with
+`keccak256(...)` output from Rust and compare bytes if recovery fails.
 
 ---
 
@@ -1101,5 +1250,10 @@ Step 14 (positions + orders + layout) ──────────────
 
 **Critical path:** 1 → 2 → 3 → 4 → 7 → 13 → 14 = core trading flow.
 
-**External blocker:** `torus_getOpenOrders` must be implemented in torus-node
-before Step 14b (open-orders-table) works with real data.
+**No external blockers.** All required RPC endpoints and the EIP-712
+verification path are implemented and tested in torus-node
+(`crates/torus-rpc/src/lib.rs`, `crates/torus-types/src/eip712.rs`).
+Step 6 is the highest-risk client-side work: signature recovery is
+verified on the node for every submission, so a type-string or field-order
+mismatch will block *every* write action regardless of UI completeness.
+Budget a signing-variant integration pass before declaring Step 13 done.
