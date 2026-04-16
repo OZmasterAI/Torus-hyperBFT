@@ -1,13 +1,40 @@
 # Writing Plan: Trading App RPC Gaps
 
 **Spec:** [tech-req-trading-rpc-gaps.md](./tech-req-trading-rpc-gaps.md)
-**Date:** 2026-04-16
-**Estimated scope:** ~250 lines new code + ~200 lines tests
-**Priority:** Step 1 is a Phase 1 blocker for the trading app frontend
+**Date:** 2026-04-16 — **updated to reflect shipped state**
+**Estimated scope (original):** ~250 lines new code + ~200 lines tests
+**Priority:** Step 1 was a Phase 1 blocker for the trading app frontend
 
 ---
 
-## Step 1: torus_getOpenOrders (BLOCKER)
+## Current State (2026-04-16)
+
+Most of this plan SHIPPED in commit `0b2f87b` ("feat(rpc): implement trading app RPC gaps — 4 new endpoints + trade persistence").
+
+| Step | Status | Notes |
+|---|---|---|
+| **Step 1** — `torus_getOpenOrders` | ✅ **SHIPPED** | Shipped with **full enriched fields** from day 1 via different architecture than planned (see below) |
+| **Step 2** — `getOpenInterest` + `getMarkPrice` | ✅ **SHIPPED** | Both endpoints live |
+| **Step 3** — `StoredOrderV2` enrichment | ⚠️ **SUPERSEDED — SKIP** | Not needed. Implementation reads `OrderBookSnapshot` which already has all fields |
+| **Step 4** — `getUserTrades` + `CF_NATIVE_USER_TRADES` index | ✅ **SHIPPED** | Option A (secondary index) chosen |
+| **Step 5** — Tests | ⚠️ **PARTIAL** (7/~12) | Core happy-path covered; edge cases pending |
+
+**Architectural note on Step 1 vs Step 3:**
+The plan proposed a two-PR approach — ship slim `getOpenOrders` first (Step 1), then enrich `StoredOrder` to V2 (Step 3). The actual implementation shipped enriched in one go by using the in-memory `OrderBook` snapshot (`CF_NATIVE_ORDER_BOOKS`) instead of per-order `CF_NATIVE_ORDERS` entries. A new helper `OrderBook::orders_for_trader()` filters by trader. This bypassed the need for schema migration entirely. `RpcOpenOrder` now has `order_type`, `time_in_force`, `original_qty`, `reduce_only`, `client_order_id`, `timestamp` — all from day one.
+
+**What's actually left:**
+- 7 pending tests in Step 5 (listed below)
+- Nothing else. Step 3 is retired, not deferred.
+
+**Deferral recommendation:** Do not implement the remaining tests ahead of the trading-app webapp. Webapp usage will surface which edge cases actually matter; pre-speculating tests risks covering wrong scenarios. A 30-min smoke-test sweep pre-webapp would be reasonable; comprehensive tests after.
+
+---
+
+## Step 1: torus_getOpenOrders — ✅ SHIPPED (commit `0b2f87b`)
+
+> Shipped in `crates/torus-rpc/src/torus.rs:910` (trait decl at line 164). Reads full `OrderBookSnapshot` from `CF_NATIVE_ORDER_BOOKS`, calls new `book.orders_for_trader(&trader)` helper in `crates/torus-core/src/order_book.rs`. Returns `Vec<RpcOpenOrder>` with all enriched fields. `RpcOpenOrder` struct at `crates/torus-rpc/src/types.rs:331-343`.
+
+**Original plan (preserved for history):**
 
 **File:** `crates/torus-rpc/src/torus.rs`
 
@@ -38,7 +65,7 @@ pub struct RpcOpenOrder {
 }
 ```
 
-Slim V1 — matches current `StoredOrder` fields. Enriched fields added in Step 3.
+Slim V1 — matches current `StoredOrder` fields. Enriched fields added in Step 3. **[DEPRECATED: implementation shipped enriched directly — see note at top.]**
 
 **1c. Implement** (in `impl TorusApiServer for RpcState`):
 
@@ -84,6 +111,8 @@ async fn get_open_orders(&self, trader: String, market_id: Option<String>) -> Rp
 }
 ```
 
+**[DEPRECATED: actual implementation reads `OrderBookSnapshot` via `book.orders_for_trader()`, not a prefix scan on `CF_NATIVE_ORDERS`.]**
+
 **1d. Add import** at top of torus.rs:
 
 ```rust
@@ -97,7 +126,11 @@ if visibility is an issue).
 
 ---
 
-## Step 2: torus_getOpenInterest + torus_getMarkPrice
+## Step 2: torus_getOpenInterest + torus_getMarkPrice — ✅ SHIPPED (commit `0b2f87b`)
+
+> `getOpenInterest` at `crates/torus-rpc/src/torus.rs:973`. `getMarkPrice` at line 1020. Both scan/read existing CFs; running-counter optimization was not adopted (deferred as YAGNI).
+
+**Original plan (preserved for history):**
 
 **File:** `crates/torus-rpc/src/torus.rs`
 
@@ -158,7 +191,13 @@ from `torus_getTradeHistory(market_id, limit=1)`.
 
 ---
 
-## Step 3: Enrich StoredOrder to V2 (fast follow)
+## Step 3: Enrich StoredOrder to V2 (fast follow) — ⚠️ SUPERSEDED — SKIP
+
+> **Do not implement.** The shipped architecture in Step 1 bypasses the need for this entirely. Reading from `OrderBookSnapshot` (which already contains `Order` structs with all fields) avoids the schema migration. No V2 CF format was needed.
+>
+> The section below is preserved only as a historical record of the discarded approach. If a future refactor moves away from reading `OrderBookSnapshot` (e.g., if the snapshot CF is dropped for size reasons), this plan could be revisited.
+
+**Original plan (preserved for history):**
 
 **File:** `crates/torus-core/src/precompiles.rs`
 
@@ -180,80 +219,15 @@ pub struct StoredOrderV2 {
 }
 ```
 
-**3b. Update save path** in `crates/torus-bridge/src/native_executor.rs`:
-
-In `save_order_books()` (~line 185), the code iterates `self.order_books`
-and writes each order to `CF_NATIVE_ORDERS`. Find where individual orders
-are written (may be in the same function or a sub-call). Change the
-serialization from `StoredOrder` to `StoredOrderV2`, mapping fields from
-the in-memory `Order` struct:
-
-```rust
-let stored = StoredOrderV2 {
-    order_id: order.id,
-    price: order.price.raw(),
-    remaining_qty: order.remaining_qty.raw(),
-    original_qty: order.original_qty.raw(),
-    side: if order.side == Side::Buy { 0 } else { 1 },
-    order_type: match order.order_type {
-        OrderType::Limit => 0,
-        OrderType::Market => 1,
-        OrderType::StopMarket { .. } => 2,
-        OrderType::StopLimit { .. } => 3,
-    },
-    time_in_force: match order.time_in_force {
-        TimeInForce::GTC => 0,
-        TimeInForce::IOC => 1,
-        TimeInForce::FOK => 2,
-        TimeInForce::PostOnly => 3,
-    },
-    reduce_only: order.reduce_only,
-    client_order_id: order.client_order_id,
-    timestamp: order.timestamp,
-};
-```
-
-**3c. Update RPC reader** in `torus-rpc/src/torus.rs`:
-
-Update `get_open_orders` to try V2 deserialize first, fall back to V1:
-
-```rust
-let stored_v2 = StoredOrderV2::try_from_slice(&value);
-let stored_v1 = StoredOrder::try_from_slice(&value);
-
-match (stored_v2, stored_v1) {
-    (Ok(v2), _) => /* full fields */,
-    (_, Ok(v1)) => /* slim fields, defaults for missing */,
-    _ => /* skip malformed entry, log warning */,
-}
-```
-
-**3d. Update RpcOpenOrder** to include enriched fields:
-
-```rust
-pub struct RpcOpenOrder {
-    // ... existing fields ...
-    #[serde(rename = "originalQty")]
-    pub original_qty: Option<String>,
-    #[serde(rename = "orderType")]
-    pub order_type: Option<String>,
-    #[serde(rename = "timeInForce")]
-    pub time_in_force: Option<String>,
-    #[serde(rename = "reduceOnly")]
-    pub reduce_only: Option<bool>,
-    #[serde(rename = "clientOrderId")]
-    pub client_order_id: Option<String>,
-    pub timestamp: Option<u64>,
-}
-```
-
-All new fields are `Option` — `None` for V1 data, `Some` for V2.
-
-**Verify:** `cargo test -p torus-core && cargo test -p torus-rpc`
+**3b-3d:** (write path + RPC reader + RpcOpenOrder enrichment — all obsolete)
 
 ---
 
-## Step 4: torus_getUserTrades
+## Step 4: torus_getUserTrades — ✅ SHIPPED (commit `0b2f87b`)
+
+> `CF_NATIVE_USER_TRADES` added to `crates/torus-state/src/cf.rs`. Written at match time in `crates/torus-bridge/src/native_executor.rs`. RPC endpoint at `crates/torus-rpc/src/torus.rs:1050`. Prefix scan with descending-block keys for newest-first ordering.
+
+**Original plan (preserved for history):**
 
 **Files:**
 - `crates/torus-state/src/cf.rs` — add CF constant
@@ -311,53 +285,66 @@ without benefit.
 
 ---
 
-## Step 5: Tests
+## Step 5: Tests — ⚠️ PARTIAL (7 of ~12 shipped)
 
-**File:** `crates/torus-rpc/tests/trading_rpc_tests.rs` (new) or add to
-existing RPC test file.
+**Location:** inline in `crates/torus-rpc/src/lib.rs` (not a separate `tests/` file).
 
-**Tests for getOpenOrders:**
-- `get_open_orders_empty` — no orders, returns `[]`
-- `get_open_orders_single_market` — place 3 limit orders, query, verify 3 returned with correct fields
-- `get_open_orders_multi_market` — orders on market 1 and 2, query all, verify both markets present
-- `get_open_orders_filter_by_market` — query with market_id, only that market's orders
-- `get_open_orders_after_cancel` — place + cancel, verify gone
-- `get_open_orders_after_fill` — place + match, verify fully filled order removed
-- `get_open_orders_limit_500` — place 501 orders, verify only 500 returned
+### Shipped (7)
 
-**Tests for getOpenInterest:**
-- `get_open_interest_no_positions` — returns zero
-- `get_open_interest_basic` — open positions, verify OI
+| Test | Covers |
+|---|---|
+| `torus_get_open_orders_empty` | Empty result for address with no orders |
+| `torus_get_open_orders_single_market` | Place 3 orders, verify all returned |
+| `torus_get_open_orders_filter_by_market` | `market_id` filter works |
+| `torus_get_open_interest_basic` | Long + short positions → OI sums |
+| `torus_get_mark_price_from_order_book` | Mark/last-trade price when book populated |
+| `torus_get_user_trades_basic` | Execute trade → maker + taker both see it |
+| `torus_get_user_trades_filter_market` | `market_id` filter on user trades |
 
-**Tests for getMarkPrice:**
-- `get_mark_price_from_oracle` — submit oracle prices, query
+### Pending (7)
 
-**Tests for getUserTrades:**
-- `get_user_trades_basic` — execute trade, both maker and taker see it
-- `get_user_trades_newest_first` — verify ordering
-- `get_user_trades_filter_market` — filter works
+| Test | Covers | Priority |
+|---|---|---|
+| `get_open_orders_multi_market` | Orders across 2 markets, unfiltered query returns both | Medium |
+| `get_open_orders_after_cancel` | Cancelled order removed from results | High (common UX flow) |
+| `get_open_orders_after_fill` | Filled order removed from results | High (common UX flow) |
+| `get_open_orders_limit_500` | 501 orders → 500 returned cap | Low (unlikely scale) |
+| `get_open_interest_no_positions` | Empty market → zero OI | Medium |
+| `get_mark_price_from_oracle` | Oracle-sourced price (vs. order-book-sourced) | Medium |
+| `get_user_trades_newest_first` | Descending-block ordering verified | High (explicit guarantee) |
 
-**Tests for StoredOrderV2:**
-- `stored_order_v2_roundtrip` — serialize + deserialize
-- `stored_order_v1_fallback` — V1 data → graceful fallback
+### Retired (N/A)
 
-**Verify:** `cargo test -p torus-rpc`
+- `stored_order_v2_roundtrip` — StoredOrderV2 not implemented
+- `stored_order_v1_fallback` — same
+
+### Recommendation
+
+**Do not write the 7 pending tests pre-webapp.** Rationale:
+1. Webapp usage will surface which edge cases are actually hit; spec-driven tests often cover wrong scenarios.
+2. The 3 "High priority" tests above are still speculative — real cancel/fill flows may have timing quirks tests-in-isolation miss.
+3. A 30-min smoke-test sweep (1 test per endpoint, "doesn't panic on valid input") is the only pre-webapp testing worth doing. Comprehensive coverage after webapp exposes real bugs.
+
+If you disagree and want comprehensive coverage now, the 7 tests above can be written in ~3-4 hours by mirroring the patterns in the 7 shipped tests.
 
 ---
 
-## Dependency Chain
+## Dependency Chain (updated)
 
 ```
-Step 1 (getOpenOrders slim) ──── SHIPS IMMEDIATELY (unblocks frontend)
+Step 1 (getOpenOrders) ─────── ✅ SHIPPED
          │
-Step 2 (getOpenInterest + getMarkPrice) ── independent, can parallel
+Step 2 (OI + mark price) ───── ✅ SHIPPED
          │
-Step 3 (StoredOrderV2 enrichment) ── depends on Step 1 shipping first
+Step 3 (StoredOrderV2) ─────── ⚠️ SUPERSEDED (skip)
          │
-Step 4 (getUserTrades + secondary index) ── independent of 1-3
+Step 4 (getUserTrades) ─────── ✅ SHIPPED
          │
-Step 5 (tests) ── after all above
+Step 5 (tests) ─────────────── ⚠️ 7 of 12 shipped, 7 pending
+
+Only remaining work:
+  (a) 30-min smoke tests pre-webapp  — cheap safety net
+  (b) 7 comprehensive tests post-webapp — driven by real bugs
 ```
 
-Step 1 is the critical path. It can ship in isolation within 1-2 days.
-Steps 2, 3, 4 are independent and can be done in parallel after Step 1.
+**Shipped in 1 commit (`0b2f87b`) rather than the planned sequential PRs.** The original plan assumed Step 1 would ship slim first, with Step 3 following; the actual implementation shipped enriched in one commit by routing through `OrderBookSnapshot` instead of `CF_NATIVE_ORDERS`.

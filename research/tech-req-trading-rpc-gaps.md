@@ -1,9 +1,26 @@
 # Technical Requirements: Trading App RPC Gaps
 
 **Date:** 2026-04-16
-**Status:** Draft v1.0
+**Status:** v1.1 — **most work SHIPPED in commit `0b2f87b`** (2026-04-16)
 **Parent:** [PRD-trading-app.md](./PRD-trading-app.md) Section 5.2, 5.3, 8
 **Depends on:** torus-rpc (1.8), torus-core order book, torus-state CFs
+
+---
+
+## Current State (2026-04-16)
+
+| Item | Status | Notes |
+|---|---|---|
+| §1 `torus_getOpenOrders` | ✅ **SHIPPED** (commit `0b2f87b`) | Shipped with **full enriched fields** (§5 superseded — see below) |
+| §2 `torus_getOpenInterest` | ✅ **SHIPPED** (commit `0b2f87b`) | Scans `CF_NATIVE_POSITIONS`, sums long/short |
+| §3 `torus_getMarkPrice` | ✅ **SHIPPED** (commit `0b2f87b`) | Oracle price + last trade price + timestamp |
+| §4 `torus_getUserTrades` | ✅ **SHIPPED** (commit `0b2f87b`) | `CF_NATIVE_USER_TRADES` secondary index, descending-block keys |
+| §5 `StoredOrder` enrichment | ⚠️ **SUPERSEDED — NOT NEEDED** | Architectural shortcut: RPC reads `OrderBookSnapshot` from `CF_NATIVE_ORDER_BOOKS` via new `book.orders_for_trader()` helper, bypassing the need to migrate `StoredOrder`. All enriched fields (order_type, time_in_force, original_qty, reduce_only, client_order_id, timestamp) already in `RpcOpenOrder`. See `crates/torus-rpc/src/types.rs:329-343`. |
+| §7 Tests | ⚠️ **PARTIAL** (7 of ~12 from plan) | Shipped: `torus_get_mark_price_from_order_book`, `torus_get_open_interest_basic`, `torus_get_open_orders_empty`, `torus_get_open_orders_single_market`, `torus_get_open_orders_filter_by_market`, `torus_get_user_trades_basic`, `torus_get_user_trades_filter_market` — all inline in `crates/torus-rpc/src/lib.rs`. Missing: multi-market, after-cancel, after-fill, limit-500, no-positions edge, from-oracle (vs order-book), newest-first. |
+
+**What's actually left:** comprehensive test coverage (7 missing tests per §7) and doc hygiene. StoredOrderV2 migration (§5) is obsolete — do not implement.
+
+The sections below are preserved as the historical spec. Status markers appear in each section header.
 
 ---
 
@@ -13,19 +30,21 @@ The trading app PRD identified 1 blocker and 4 small RPC gaps that must be
 filled before the frontend can ship. This document specifies the protocol/RPC
 changes needed.
 
-**Priority order:**
-1. `torus_getOpenOrders` — **Phase 1 blocker** (trader can't see their orders)
-2. `torus_getOpenInterest` — Phase 1b (market stats)
-3. `torus_getMarkPrice` — Phase 1b (position valuation)
-4. `torus_getUserTrades` — Phase 1b (trade history per user)
-5. `StoredOrder` enrichment — improves #1 quality
+**Priority order (original — all 1-4 now SHIPPED, 5 superseded):**
+1. `torus_getOpenOrders` — ~~Phase 1 blocker~~ ✅ SHIPPED
+2. `torus_getOpenInterest` — ~~Phase 1b~~ ✅ SHIPPED
+3. `torus_getMarkPrice` — ~~Phase 1b~~ ✅ SHIPPED
+4. `torus_getUserTrades` — ~~Phase 1b~~ ✅ SHIPPED
+5. `StoredOrder` enrichment — ~~improves #1 quality~~ ⚠️ SUPERSEDED (see "Current State")
 
 **Not in scope:** Funding rate (requires new protocol mechanism), vaults,
 sub-accounts, TWAP (all Phase 3 protocol work).
 
 ---
 
-## 1. torus_getOpenOrders (Phase 1 Blocker)
+## 1. torus_getOpenOrders (Phase 1 Blocker) — ✅ SHIPPED
+
+> Commit `0b2f87b`. Shipped path diverges from §1.5 recommendation: chose **Option B (enriched) from day 1**, but via a different mechanism than `StoredOrderV2`. The RPC reads `OrderBookSnapshot` from existing `CF_NATIVE_ORDER_BOOKS` (which has all fields in memory) via new `OrderBook::orders_for_trader()` — see `crates/torus-rpc/src/torus.rs:910` impl, `crates/torus-core/src/order_book.rs` for the helper. No schema migration required.
 
 ### 1.1 Problem
 
@@ -123,7 +142,9 @@ fields when available.
 
 ---
 
-## 2. torus_getOpenInterest
+## 2. torus_getOpenInterest — ✅ SHIPPED
+
+> Commit `0b2f87b`. Implementation at `crates/torus-rpc/src/torus.rs:973`. Full scan of `CF_NATIVE_POSITIONS` (running counter optimization deferred — current scale doesn't warrant it).
 
 ### 2.1 Problem
 
@@ -161,7 +182,9 @@ for performance. Full scan as fallback for correctness verification.
 
 ---
 
-## 3. torus_getMarkPrice
+## 3. torus_getMarkPrice — ✅ SHIPPED
+
+> Commit `0b2f87b`. Implementation at `crates/torus-rpc/src/torus.rs:1020`. Returns `markPrice`, `indexPrice`, `lastTradePrice`, `timestamp`.
 
 ### 3.1 Problem
 
@@ -196,7 +219,9 @@ This endpoint just reads the stored result.
 
 ---
 
-## 4. torus_getUserTrades
+## 4. torus_getUserTrades — ✅ SHIPPED
+
+> Commit `0b2f87b`. Chose Option A (secondary index). `CF_NATIVE_USER_TRADES` added in `torus-state/src/cf.rs`, written in `torus-bridge/src/native_executor.rs` at match time, read via prefix scan in `crates/torus-rpc/src/torus.rs:1050`.
 
 ### 4.1 Problem
 
@@ -260,7 +285,11 @@ one for taker). The node already writes to multiple CFs per fill.
 
 ---
 
-## 5. StoredOrder Enrichment (Fast Follow)
+## 5. StoredOrder Enrichment (Fast Follow) — ⚠️ SUPERSEDED — DO NOT IMPLEMENT
+
+> **This section is obsolete.** The implementation in commit `0b2f87b` avoided needing `StoredOrderV2` by reading enriched data from `OrderBookSnapshot` (in `CF_NATIVE_ORDER_BOOKS`) instead of per-order `CF_NATIVE_ORDERS` entries. The new `OrderBook::orders_for_trader()` helper filters the in-memory-backed snapshot by trader and returns `Order` structs that already have all fields (`order_type`, `time_in_force`, `original_qty`, `reduce_only`, `client_order_id`, `timestamp`).
+>
+> Net result: `RpcOpenOrder` (see `crates/torus-rpc/src/types.rs:331-343`) has every enriched field, no schema migration was required, and this whole section's work is moot. Preserved for historical record only.
 
 ### 5.1 Problem
 
@@ -338,17 +367,25 @@ or match arms.
 
 ## 7. Testing
 
-| Test | Verifies |
-|---|---|
-| `get_open_orders_empty` | Returns `[]` for address with no orders |
-| `get_open_orders_single_market` | Place 3 orders, query, verify all 3 returned |
-| `get_open_orders_multi_market` | Orders across 2 markets, query without filter, verify all |
-| `get_open_orders_filter_by_market` | Query with market_id filter, only that market's orders returned |
-| `get_open_orders_after_cancel` | Place + cancel, verify cancelled order not in results |
-| `get_open_orders_after_fill` | Place + fill (via matching trade), verify filled order removed |
-| `get_open_interest_basic` | Open long + short positions, verify OI |
-| `get_mark_price_from_oracle` | Submit oracle prices, query mark price |
-| `get_user_trades_basic` | Execute trades, query per-user, verify |
-| `get_user_trades_filter_market` | Trades on 2 markets, filter by 1 |
-| `stored_order_v2_roundtrip` | Serialize V2, deserialize, verify all fields |
-| `stored_order_v1_fallback` | Old V1 data deserializes gracefully (missing fields get defaults) |
+All shipped tests are inline in `crates/torus-rpc/src/lib.rs` (not a separate `tests/` file).
+
+| Test | Status | Verifies |
+|---|---|---|
+| `torus_get_open_orders_empty` | ✅ SHIPPED | Returns `[]` for address with no orders |
+| `torus_get_open_orders_single_market` | ✅ SHIPPED | Place 3 orders, query, verify all 3 returned |
+| `torus_get_open_orders_filter_by_market` | ✅ SHIPPED | Query with market_id filter, only that market's orders returned |
+| `torus_get_open_interest_basic` | ✅ SHIPPED | Open long + short positions, verify OI |
+| `torus_get_mark_price_from_order_book` | ✅ SHIPPED | Query mark/last-trade price when populated |
+| `torus_get_user_trades_basic` | ✅ SHIPPED | Execute trades, query per-user, verify |
+| `torus_get_user_trades_filter_market` | ✅ SHIPPED | Trades on 2 markets, filter by 1 |
+| `get_open_orders_multi_market` | ❌ PENDING | Orders across 2 markets, query without filter, verify all |
+| `get_open_orders_after_cancel` | ❌ PENDING | Place + cancel, verify cancelled order not in results |
+| `get_open_orders_after_fill` | ❌ PENDING | Place + fill (via matching trade), verify filled order removed |
+| `get_open_orders_limit_500` | ❌ PENDING | 501 orders → verify 500 returned (cap) |
+| `get_open_interest_no_positions` | ❌ PENDING | Market with zero positions → returns zero OI |
+| `get_mark_price_from_oracle` | ❌ PENDING | Submit oracle prices (vs. only order-book), query mark price |
+| `get_user_trades_newest_first` | ❌ PENDING | Verify descending-block ordering |
+| ~~`stored_order_v2_roundtrip`~~ | N/A | StoredOrderV2 not implemented (§5 superseded) |
+| ~~`stored_order_v1_fallback`~~ | N/A | Same |
+
+**Remaining work for comprehensive coverage:** 7 tests above marked PENDING. Recommended order: defer until the trading-app webapp surfaces real edge cases (see `writing-plan-trading-rpc-gaps.md` for deferral rationale).
