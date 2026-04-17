@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use hotstuff_rs::networking::messages::Message;
 use hotstuff_rs::networking::network::Network;
+use zeroize::Zeroize;
 use hotstuff_rs::types::update_sets::ValidatorSetUpdates;
 use hotstuff_rs::types::validator_set::ValidatorSet;
 use libp2p::{identity, Multiaddr, PeerId, SwarmBuilder};
@@ -50,11 +51,13 @@ impl LibP2PNetwork {
     ) -> Result<(Self, TxGossipHandle), Box<dyn std::error::Error>> {
         let local_key = signing_key.verifying_key();
 
-        // Reuse the 32-byte ed25519 secret as the libp2p identity secret.
-        // try_from_bytes zeroes the input after consuming it.
         let mut secret_bytes = signing_key.to_bytes();
         let libp2p_secret = identity::ed25519::SecretKey::try_from_bytes(&mut secret_bytes)
-            .map_err(|e| format!("libp2p ed25519 secret: {e}"))?;
+            .map_err(|e| {
+                secret_bytes.zeroize();
+                format!("libp2p ed25519 secret: {e}")
+            })?;
+        secret_bytes.zeroize();
         let libp2p_keypair =
             identity::Keypair::from(identity::ed25519::Keypair::from(libp2p_secret));
 

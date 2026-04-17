@@ -34,11 +34,7 @@ pub(crate) fn load_signing_key(cli: &Cli) -> Result<SigningKey, String> {
 
 pub(crate) fn prompt_passphrase(prompt: &str) -> String {
     eprint!("{prompt}");
-    let mut pass = String::new();
-    std::io::stdin()
-        .read_line(&mut pass)
-        .expect("failed to read passphrase");
-    pass.trim().to_string()
+    rpassword::read_password().expect("failed to read passphrase")
 }
 
 /// Resolve passphrase from `--passphrase-file` (if set) or interactive prompt.

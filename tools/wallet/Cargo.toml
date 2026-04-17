@@ -26,6 +26,7 @@ reqwest = { workspace = true }
 rand = { workspace = true }
 aes-gcm = { workspace = true }
 argon2 = { workspace = true }
+rpassword = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

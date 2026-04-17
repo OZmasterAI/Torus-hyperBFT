@@ -96,7 +96,9 @@ ed25519-dalek = "2"
 ethnum = "1.5"
 aes-gcm = "0.10"
 argon2 = "0.5"
+rpassword = "5"
 rand = "0.8"
+zeroize = "1"
 hex = "0.4"
 
 # CLI
