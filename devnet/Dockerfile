@@ -3,12 +3,15 @@
 FROM rust:1.82-slim-bookworm AS builder
 
 RUN apt-get update && apt-get install -y \
-    pkg-config libssl-dev libclang-dev clang cmake \
+    pkg-config libssl-dev libclang-dev clang cmake mold \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
 COPY . .
 
+# Cap cargo parallelism so the workspace release build fits comfortably in
+# ~4 GB of RAM per rustc process (host has limited free RAM).
+ENV CARGO_BUILD_JOBS=3
 RUN cargo build --release --bin torus-node
 
 # Stage 2: Runtime
