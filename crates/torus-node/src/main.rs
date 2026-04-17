@@ -291,7 +291,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         ..NetworkConfig::default()
     };
 
-    let (network, _tx_gossip) = LibP2PNetwork::new(network_config, verifying_key).await?;
+    let (network, _tx_gossip) = LibP2PNetwork::new(network_config, signing_key.clone()).await?;
     info!(listen = %cli.p2p_listen, "p2p network started");
 
     // Dial bootstrap peers

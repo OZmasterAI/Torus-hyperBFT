@@ -191,7 +191,28 @@ fn handle_event(
                     return;
                 }
 
-                handle_consensus_gossip(&message.data, shared, peer_scoring, &propagation_source);
+                // Use the cryptographic author (gossipsub-verified in Strict mode)
+                // rather than the last-hop forwarder — gossip meshes relay messages,
+                // so propagation_source can be a different validator than the signer.
+                let author = match message.source {
+                    Some(pid) => pid,
+                    None => {
+                        warn!(
+                            peer = %propagation_source,
+                            "consensus gossip without source (strict mode violation)"
+                        );
+                        peer_scoring.penalize(
+                            &propagation_source,
+                            PENALTY_INVALID_CONSENSUS_MSG,
+                            "consensus message missing source",
+                        );
+                        return;
+                    }
+                };
+                if peer_scoring.is_banned(&author) {
+                    return;
+                }
+                handle_consensus_gossip(&message.data, shared, peer_scoring, &author);
             } else {
                 // TX message size validation (Phase 3: 3.1.7)
                 if message.data.len() > max_tx_msg_size {
