@@ -12,8 +12,21 @@ pub struct PeerMap {
 
 impl PeerMap {
     pub fn insert(&mut self, vk: VerifyingKey, peer_id: PeerId) {
-        self.vk_to_peer.insert(vk.to_bytes(), peer_id);
-        self.peer_to_vk.insert(peer_id, vk);
+        if let Some(old_pid) = self.vk_to_peer.insert(vk.to_bytes(), peer_id) {
+            if old_pid != peer_id {
+                self.peer_to_vk.remove(&old_pid);
+            }
+        }
+        if let Some(old_vk) = self.peer_to_vk.insert(peer_id, vk) {
+            if old_vk != vk {
+                self.vk_to_peer.remove(&old_vk.to_bytes());
+            }
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.vk_to_peer.clear();
+        self.peer_to_vk.clear();
     }
 
     pub fn remove_by_vk(&mut self, vk: &VerifyingKey) -> Option<PeerId> {

@@ -206,11 +206,14 @@ pub(crate) enum Command {
         #[arg(long)]
         order_id: u128,
     },
-    /// Cancel all orders in a market
+    /// Cancel all orders (in one market or across all markets)
     CancelAll {
-        /// Market ID
+        /// Market ID (omit with --all-markets to cancel across all markets)
+        #[arg(long, required_unless_present = "all_markets")]
+        market: Option<u64>,
+        /// Cancel across all markets
         #[arg(long)]
-        market: u64,
+        all_markets: bool,
     },
     /// Modify an existing order (price and/or quantity)
     ModifyOrder {
@@ -423,7 +426,7 @@ async fn main() {
         Command::CancelOrder { order_id } => {
             commands::trading::cmd_cancel_order(&cli, &rpc, *order_id).await
         }
-        Command::CancelAll { market } => commands::trading::cmd_cancel_all(&cli, &rpc, *market).await,
+        Command::CancelAll { market, .. } => commands::trading::cmd_cancel_all(&cli, &rpc, *market).await,
         Command::ModifyOrder {
             order_id,
             price,

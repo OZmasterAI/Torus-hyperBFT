@@ -80,12 +80,12 @@ pub(crate) async fn cmd_cancel_order(cli: &Cli, rpc: &RpcClient, order_id: u128)
     submit_native_action(cli, rpc, NativeAction::CancelOrder { order_id }).await
 }
 
-pub(crate) async fn cmd_cancel_all(cli: &Cli, rpc: &RpcClient, market: u64) -> Result<(), String> {
+pub(crate) async fn cmd_cancel_all(cli: &Cli, rpc: &RpcClient, market: Option<u64>) -> Result<(), String> {
     submit_native_action(
         cli,
         rpc,
         NativeAction::CancelAllOrders {
-            market_id: Some(market),
+            market_id: market,
         },
     )
     .await

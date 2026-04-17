@@ -133,6 +133,7 @@ impl Network for LibP2PNetwork {
         let mut validators = self.shared.validators.write().unwrap();
         let mut peer_map = self.shared.peer_map.write().unwrap();
         validators.clear();
+        peer_map.clear();
         for vk in validator_set.validators() {
             validators.insert(vk.to_bytes());
             let peer_id = peer_id_from_verifying_key(vk);

@@ -181,16 +181,6 @@ fn handle_event(
                     return;
                 }
 
-                // Consensus rate limiting (Phase 3: 3.1.7)
-                if !consensus_rate_limiter.check_and_increment(&propagation_source) {
-                    peer_scoring.penalize(
-                        &propagation_source,
-                        PENALTY_EXCESSIVE_RATE,
-                        "consensus message rate exceeded",
-                    );
-                    return;
-                }
-
                 // Use the cryptographic author (gossipsub-verified in Strict mode)
                 // rather than the last-hop forwarder — gossip meshes relay messages,
                 // so propagation_source can be a different validator than the signer.
@@ -210,6 +200,17 @@ fn handle_event(
                     }
                 };
                 if peer_scoring.is_banned(&author) {
+                    return;
+                }
+
+                // Rate-limit by cryptographic author, not forwarder — prevents
+                // a banned node from consuming honest relayers' rate-limit tokens.
+                if !consensus_rate_limiter.check_and_increment(&author) {
+                    peer_scoring.penalize(
+                        &author,
+                        PENALTY_EXCESSIVE_RATE,
+                        "consensus message rate exceeded",
+                    );
                     return;
                 }
                 handle_consensus_gossip(&message.data, shared, peer_scoring, &author);
