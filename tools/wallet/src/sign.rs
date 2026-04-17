@@ -52,10 +52,13 @@ pub(crate) fn read_passphrase(cli: &Cli) -> Result<String, String> {
 }
 
 pub(crate) fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64
+    u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .expect("system clock before 2554")
 }
 
 /// Resolve the query address: explicit `--address`, else derive from keystore/key.
@@ -80,6 +83,12 @@ pub(crate) fn build_and_sign_eip1559_tx(
     value: U256,
     gas_price: u128,
 ) -> Vec<u8> {
+    let data = Bytes::new();
+    assert!(
+        data.is_empty(),
+        "gas_limit 21000 is only valid for plain transfers; \
+         contract calls require a higher gas_limit"
+    );
     let tx = TxEip1559 {
         chain_id,
         nonce,
@@ -88,7 +97,7 @@ pub(crate) fn build_and_sign_eip1559_tx(
         max_priority_fee_per_gas: gas_price / 10,
         to: TxKind::Call(to),
         value,
-        input: Bytes::new(),
+        input: data,
         access_list: Default::default(),
     };
 
@@ -152,6 +161,7 @@ pub(crate) async fn submit_native_action(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::test_signing_key;
     use std::io::Write;
 
     fn cli_with_passphrase_file(path: std::path::PathBuf) -> Cli {
@@ -255,12 +265,7 @@ mod tests {
 
     #[test]
     fn test_build_eip1559_tx() {
-        let key = SigningKey::from_slice(&{
-            let mut b = [0u8; 32];
-            b[31] = 1;
-            b
-        })
-        .unwrap();
+        let key = test_signing_key();
         let to = Address::from_slice(&[0xBB; 20]);
         let raw = build_and_sign_eip1559_tx(&key, 7777, 0, to, U256::from(1000), 1_000_000_000);
         assert_eq!(raw[0], 0x02);
@@ -269,12 +274,7 @@ mod tests {
 
     #[test]
     fn test_native_action_signing() {
-        let key = SigningKey::from_slice(&{
-            let mut b = [0u8; 32];
-            b[31] = 1;
-            b
-        })
-        .unwrap();
+        let key = test_signing_key();
         let action = NativeAction::ClaimRewards;
         let signed = sign_native_action(action, 1_700_000_000_000u64, &key);
         let recovered = signed.recover_sender().expect("recovery should succeed");

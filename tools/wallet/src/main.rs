@@ -5,6 +5,8 @@ mod keystore;
 mod parse;
 mod rpc;
 mod sign;
+#[cfg(test)]
+mod test_utils;
 
 use std::path::PathBuf;
 

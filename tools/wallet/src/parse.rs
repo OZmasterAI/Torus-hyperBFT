@@ -41,7 +41,8 @@ pub(crate) fn parse_address(s: &str) -> Result<Address, String> {
 
 /// Parse decimal string to `FixedPoint` (8 decimal places, i128 scaled by 10^8).
 ///
-/// Accepts `"1.5"`, `"100"`, `"-1.5"`, `"0.00000001"`. Up to 8 fractional digits.
+/// Accepts `"1.5"`, `".5"` (no leading zero), `"100"`, `"-1.5"`, `"0.00000001"`.
+/// Up to 8 fractional digits.
 /// Rejects empty strings, non-numeric input, and more than 8 decimal places.
 pub(crate) fn parse_decimal_to_fixed_point(s: &str) -> Result<FixedPoint, String> {
     if s.is_empty() {
