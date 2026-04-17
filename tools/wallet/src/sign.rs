@@ -283,12 +283,7 @@ mod tests {
 
     #[test]
     fn test_delegate_action_signing() {
-        let key = SigningKey::from_slice(&{
-            let mut b = [0u8; 32];
-            b[31] = 1;
-            b
-        })
-        .unwrap();
+        let key = test_signing_key();
         let validator = Address::from_slice(&[0xCC; 20]);
         let action = NativeAction::Delegate {
             validator,
@@ -302,12 +297,7 @@ mod tests {
     #[test]
     fn test_dry_run_output_is_valid_json() {
         // Pure serialization roundtrip without RPC.
-        let key = SigningKey::from_slice(&{
-            let mut b = [0u8; 32];
-            b[31] = 1;
-            b
-        })
-        .unwrap();
+        let key = test_signing_key();
         let signed = sign_native_action(NativeAction::ClaimRewards, 1_700_000_000_000, &key);
         let pretty = serde_json::to_string_pretty(&signed).unwrap();
         let parsed: torus_types::SignedNativeAction = serde_json::from_str(&pretty).unwrap();

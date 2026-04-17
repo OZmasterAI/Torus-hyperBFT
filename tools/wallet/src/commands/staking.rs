@@ -54,24 +54,15 @@ pub(crate) async fn cmd_top_up_self_stake(cli: &Cli, rpc: &RpcClient, amount: &s
 #[cfg(test)]
 mod tests {
     use alloy_primitives::U256;
-    use k256::ecdsa::SigningKey;
     use torus_types::eip712::sign_native_action;
     use torus_types::NativeAction;
 
     use crate::keystore::address_from_key;
-
-    fn test_key() -> SigningKey {
-        SigningKey::from_slice(&{
-            let mut b = [0u8; 32];
-            b[31] = 1;
-            b
-        })
-        .unwrap()
-    }
+    use crate::test_utils::test_signing_key;
 
     #[test]
     fn test_permanent_stake_roundtrip() {
-        let key = test_key();
+        let key = test_signing_key();
         let signed = sign_native_action(
             NativeAction::PermanentStake {
                 amount: U256::from(5u64) * U256::from(1_000_000_000_000_000_000u64),
@@ -84,7 +75,7 @@ mod tests {
 
     #[test]
     fn test_top_up_self_stake_roundtrip() {
-        let key = test_key();
+        let key = test_signing_key();
         let signed = sign_native_action(
             NativeAction::TopUpSelfStake {
                 amount: U256::from(3u64) * U256::from(1_000_000_000_000_000_000u64),

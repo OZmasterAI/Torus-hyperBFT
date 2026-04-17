@@ -136,6 +136,8 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    use crate::test_utils::test_signing_key;
+
     #[test]
     fn keygen_and_load() {
         let dir = TempDir::new().unwrap();
@@ -156,11 +158,7 @@ mod tests {
 
     #[test]
     fn address_derivation() {
-        let key = SigningKey::from_slice(&{
-            let mut b = [0u8; 32];
-            b[31] = 1;
-            b
-        }).unwrap();
+        let key = test_signing_key();
         let addr = address_from_key(&key);
         assert_ne!(addr, Address::ZERO);
         assert_eq!(addr.len(), 20);

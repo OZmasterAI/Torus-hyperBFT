@@ -123,24 +123,15 @@ pub(crate) async fn cmd_modify_order(
 
 #[cfg(test)]
 mod tests {
-    use k256::ecdsa::SigningKey;
     use torus_types::eip712::sign_native_action;
     use torus_types::{NativeAction, OrderType, PlaceOrderParams, TimeInForce};
 
     use crate::keystore::address_from_key;
-
-    fn test_key() -> SigningKey {
-        SigningKey::from_slice(&{
-            let mut b = [0u8; 32];
-            b[31] = 1;
-            b
-        })
-        .unwrap()
-    }
+    use crate::test_utils::test_signing_key;
 
     #[test]
     fn test_place_order_stop_limit_roundtrip() {
-        let key = test_key();
+        let key = test_signing_key();
         let params = PlaceOrderParams {
             market_id: 1,
             is_buy: true,
@@ -165,7 +156,7 @@ mod tests {
 
     #[test]
     fn test_cancel_order_roundtrip() {
-        let key = test_key();
+        let key = test_signing_key();
         let signed = sign_native_action(
             NativeAction::CancelOrder { order_id: 0xdead_beef_u128 },
             1_700_000_000_000u64,
@@ -176,7 +167,7 @@ mod tests {
 
     #[test]
     fn test_cancel_all_roundtrip() {
-        let key = test_key();
+        let key = test_signing_key();
         let signed = sign_native_action(
             NativeAction::CancelAllOrders { market_id: Some(7) },
             1_700_000_000_000u64,
@@ -187,7 +178,7 @@ mod tests {
 
     #[test]
     fn test_modify_order_roundtrip() {
-        let key = test_key();
+        let key = test_signing_key();
         let signed = sign_native_action(
             NativeAction::ModifyOrder {
                 order_id: 123,

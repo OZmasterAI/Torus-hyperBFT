@@ -380,12 +380,18 @@ fn fixtures_path() -> PathBuf {
         .join("eip712_vectors.json")
 }
 
+fn address_from_signing_key(key: &SigningKey) -> String {
+    use k256::ecdsa::VerifyingKey;
+    let vk = VerifyingKey::from(key);
+    let uncompressed = vk.to_encoded_point(false);
+    let hash = alloy_primitives::keccak256(&uncompressed.as_bytes()[1..]);
+    hex0x(&hash[12..])
+}
+
 fn build_fixture_file() -> FixtureFile {
     let vectors = all_vectors();
     let key = pinned_key();
-    let signer = vectors[0]
-        .signer
-        .clone();
+    let signer = address_from_signing_key(&key);
 
     FixtureFile {
         schema_version: 1,
@@ -400,6 +406,7 @@ fn build_fixture_file() -> FixtureFile {
 }
 
 #[test]
+#[ignore] // Writes files to disk; run explicitly with: cargo test -- --ignored
 fn write_eip712_fixture_file() {
     let file = build_fixture_file();
     assert!(
@@ -443,6 +450,10 @@ fn fixture_file_matches_current_implementation() {
     let path = fixtures_path();
     if !path.exists() {
         // Allow first run on a fresh checkout to generate the file.
+        eprintln!(
+            "WARN: fixture file not found at {}, skipping consistency check",
+            path.display()
+        );
         return;
     }
     let on_disk = fs::read_to_string(&path).expect("read fixture");

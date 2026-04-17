@@ -108,22 +108,13 @@ fn parse_proposal_action(proposal_type: &str, params_json: &str) -> Result<Propo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use k256::ecdsa::SigningKey;
     use torus_types::eip712::sign_native_action;
 
     use crate::keystore::address_from_key;
-
-    fn test_key() -> SigningKey {
-        SigningKey::from_slice(&{
-            let mut b = [0u8; 32];
-            b[31] = 1;
-            b
-        })
-        .unwrap()
-    }
+    use crate::test_utils::test_signing_key;
 
     fn roundtrip(action: ProposalAction) {
-        let key = test_key();
+        let key = test_signing_key();
         let proposal = Proposal {
             title: "T".into(),
             description: "D".into(),

@@ -57,23 +57,14 @@ pub(crate) async fn cmd_rotate_key(cli: &Cli, rpc: &RpcClient, new_pubkey: &str)
 #[cfg(test)]
 mod tests {
     use alloy_primitives::Address;
-    use k256::ecdsa::SigningKey;
     use torus_types::eip712::sign_native_action;
     use torus_types::{NativeAction, PublicKey};
 
     use crate::keystore::address_from_key;
-
-    fn test_key() -> SigningKey {
-        SigningKey::from_slice(&{
-            let mut b = [0u8; 32];
-            b[31] = 1;
-            b
-        })
-        .unwrap()
-    }
+    use crate::test_utils::test_signing_key;
 
     fn roundtrip(action: NativeAction) {
-        let key = test_key();
+        let key = test_signing_key();
         let signed = sign_native_action(action, 1_700_000_000_000u64, &key);
         assert_eq!(signed.recover_sender().unwrap(), address_from_key(&key));
     }

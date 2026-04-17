@@ -82,24 +82,15 @@ pub(crate) async fn cmd_withdraw(
 #[cfg(test)]
 mod tests {
     use alloy_primitives::{Address, U256};
-    use k256::ecdsa::SigningKey;
     use torus_types::eip712::sign_native_action;
     use torus_types::NativeAction;
 
     use crate::keystore::address_from_key;
-
-    fn test_key() -> SigningKey {
-        SigningKey::from_slice(&{
-            let mut b = [0u8; 32];
-            b[31] = 1;
-            b
-        })
-        .unwrap()
-    }
+    use crate::test_utils::test_signing_key;
 
     #[test]
     fn test_transfer_to_perp_roundtrip() {
-        let key = test_key();
+        let key = test_signing_key();
         let signed = sign_native_action(
             NativeAction::TransferToPerp {
                 amount: U256::from(1_000_000_000_000_000_000u64),
@@ -112,7 +103,7 @@ mod tests {
 
     #[test]
     fn test_transfer_to_spot_roundtrip() {
-        let key = test_key();
+        let key = test_signing_key();
         let signed = sign_native_action(
             NativeAction::TransferToSpot {
                 amount: U256::from(2u64) * U256::from(1_000_000_000_000_000_000u64),
@@ -125,7 +116,7 @@ mod tests {
 
     #[test]
     fn test_withdraw_roundtrip() {
-        let key = test_key();
+        let key = test_signing_key();
         let signed = sign_native_action(
             NativeAction::Withdraw {
                 amount: U256::from(500_000_000_000_000_000u64),
