@@ -44,6 +44,7 @@ fn block_sync_test() {
         vs_updates.insert(keypairs[0].verifying_key(), Power::new(1));
         vs_updates.insert(keypairs[1].verifying_key(), Power::new(1));
         vs_updates.insert(keypairs[2].verifying_key(), Power::new(1));
+        vs_updates.insert(lagging_replica_keypair[0].verifying_key(), Power::new(1));
         vs_updates
     };
 
