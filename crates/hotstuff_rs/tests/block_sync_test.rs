@@ -38,13 +38,13 @@ fn block_sync_test() {
     // 1.4. Initialize the app state of the number app to the number 0.
     let init_as = NumberApp::initial_app_state();
 
-    // 1.4. Initialize the validator set of the cluster to contain 4 replicas.
+    // 1.4. Initialize the validator set with the 3 live replicas (quorum = 2).
+    // The lagging replica is a non-validator that syncs via block sync.
     let init_vs_updates = {
         let mut vs_updates = ValidatorSetUpdates::new();
         vs_updates.insert(keypairs[0].verifying_key(), Power::new(1));
         vs_updates.insert(keypairs[1].verifying_key(), Power::new(1));
         vs_updates.insert(keypairs[2].verifying_key(), Power::new(1));
-        vs_updates.insert(lagging_replica_keypair[0].verifying_key(), Power::new(1));
         vs_updates
     };
 
@@ -70,7 +70,7 @@ fn block_sync_test() {
         "Submitting one Increment transactions to each of replica 0 and replica 1.",
     );
     live_nodes[0].submit_transaction(NumberAppTransaction::Increment);
-    live_nodes[0].submit_transaction(NumberAppTransaction::Increment);
+    live_nodes[1].submit_transaction(NumberAppTransaction::Increment);
 
     // 2.2. Poll the app state of the live replicas until each sees the number as 2.
     log_with_context(
