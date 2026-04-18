@@ -18,6 +18,7 @@ use revm::state::AccountInfo;
 use serde::Deserialize;
 use tracing::info;
 
+use torus_economics::types::{ValidatorState, ValidatorStatus};
 use torus_state::cf::CF_STAKING_VALIDATORS;
 use torus_state::db::KECCAK_EMPTY;
 use torus_state::trie::compute_state_root_from_db;
@@ -279,20 +280,28 @@ impl Genesis {
             info!(%address, has_code = entry.code.is_some(), "seeded evm_alloc entry");
         }
 
-        // 3. Seed validator stakes into CF_STAKING_VALIDATORS
+        // 3. Seed validator stakes into CF_STAKING_VALIDATORS (borsh-encoded)
         for validator in &self.validators {
             let address = parse_address(&validator.address)?;
-            let info = serde_json::json!({
-                "address": validator.address,
-                "pubkey": validator.pubkey,
-                "stake": validator.stake,
-                "commission_bps": validator.commission_bps,
-            });
-            state_db.put_cf_raw(
-                CF_STAKING_VALIDATORS,
-                address.as_slice(),
-                info.to_string().as_bytes(),
-            )?;
+            let pubkey_bytes = decode_hex(&validator.pubkey)?;
+            let pubkey: [u8; 32] = pubkey_bytes
+                .try_into()
+                .map_err(|_| GenesisError::InvalidPubkey(validator.pubkey.clone()))?;
+            let stake = parse_u256(&validator.stake)?;
+            let state = ValidatorState {
+                address,
+                pubkey,
+                commission_bps: validator.commission_bps,
+                self_stake: stake,
+                total_delegated: U256::ZERO,
+                status: ValidatorStatus::Active,
+                jailed_until: None,
+                last_commission_change_block: None,
+            };
+            let data = borsh::to_vec(&state).map_err(|e| {
+                GenesisError::InvalidHex(format!("borsh encode validator: {e}"))
+            })?;
+            state_db.put_cf_raw(CF_STAKING_VALIDATORS, address.as_slice(), &data)?;
             info!(%address, stake = %validator.stake, "seeded genesis validator");
         }
 

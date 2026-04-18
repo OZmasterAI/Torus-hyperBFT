@@ -61,12 +61,12 @@ fn test_core_writer_delayed_execution() {
 
     // Drain in current block (10) — should return nothing (action targets block 11)
     let mut ctx_current = h.exec_context(current_block);
-    let results_current = NativeExecutor::drain_core_writer(&mut ctx_current);
+    let results_current = NativeExecutor::drain_core_writer(&mut ctx_current).unwrap();
     assert!(results_current.is_empty(), "actions should NOT execute in current block");
 
     // Drain in next block (11) — should execute
     let mut ctx_next = h.exec_context(current_block + 1);
-    let results_next = NativeExecutor::drain_core_writer(&mut ctx_next);
+    let results_next = NativeExecutor::drain_core_writer(&mut ctx_next).unwrap();
     assert_eq!(results_next.len(), 1, "should drain 1 action in next block");
     assert!(results_next[0].success, "queued order should execute successfully");
 }

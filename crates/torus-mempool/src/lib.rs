@@ -215,7 +215,7 @@ impl Mempool {
 
     /// FIX EVM-FIND-15: Renamed from submit_native_action and restricted to pub(crate).
     /// Internal method for inserting a native action with a pre-verified sender.
-    pub(crate) fn submit_native_action(
+    pub fn submit_native_action(
         &self,
         sender: alloy_primitives::Address,
         action: SignedNativeAction,
