@@ -203,14 +203,15 @@ impl<N: Network> HotStuff<N> {
         .publish(&self.event_publisher);
 
         // 4. If I am a proposer for the new view, then broadcast a `Proposal` or a `Nudge`.
-        // FIX CONS-FIND-12: Use reputation-weighted proposer check.
         let reputation = block_tree.leader_reputation().ok();
-        if is_proposer_with_reputation(
+        let am_proposer = is_proposer_with_reputation(
             &self.config.keypair.public(),
             self.view_info.view,
             &validator_set_state,
             reputation.as_ref(),
-        ) {
+        );
+        log::info!("enter_view: view={}, am_proposer={}", self.view_info.view.int(), am_proposer);
+        if am_proposer {
             // If a chain of consecutive views of voting for a validator-set-updating block has been interrupted, then
             // re-propose an existing block.
             if let Some(block_hash) = repropose_block(self.view_info.view, block_tree)? {
@@ -436,9 +437,14 @@ impl<N: Network> HotStuff<N> {
         block_tree: &mut BlockTreeSingleton<K>,
         app: &mut impl App<K>,
     ) -> Result<(), HotStuffError> {
-        // 1. If Proposal or Nudge received, check if the sender is a proposer for this view,
-        // and check if the replica is still accepting nudges and proposals. If the checks
-        // fail, ignore the message.
+        let msg_type = match &msg {
+            HotStuffMessage::Proposal(_) => "Proposal",
+            HotStuffMessage::Nudge(_) => "Nudge",
+            HotStuffMessage::PhaseVote(_) => "PhaseVote",
+            HotStuffMessage::NewView(_) => "NewView",
+            _ => "Other",
+        };
+        log::info!("on_receive_msg: type={}, view={}", msg_type, self.view_info.view.int());
         if matches!(msg, HotStuffMessage::Proposal(_)) || matches!(msg, HotStuffMessage::Nudge(_)) {
             let validator_set_state = block_tree.validator_set_state()?;
 

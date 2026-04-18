@@ -324,7 +324,7 @@ impl TorusApp {
         &mut self,
         request: ValidateBlockRequest<RocksKVStore>,
     ) -> ValidateBlockResponse {
-        // FIX CONS-PF-08: Flush any buffered slashes before validating.
+        tracing::info!("do_validate called");
         self.flush_pending_slashes();
 
         let block = request.proposed_block();
@@ -348,27 +348,21 @@ impl TorusApp {
             Err(_) => return ValidateBlockResponse::Invalid,
         };
 
-        // FIX CONS-PF-02: Validate native actions AND EVM transactions.
-        // Previously only EVM transactions were validated; native actions were
-        // accepted without signature verification, allowing a malicious proposer
-        // to forge arbitrary staking/governance operations.
         let has_native = !torus_block.native_actions.is_empty();
         let has_evm = !torus_block.evm_transactions.is_empty();
 
         let validation_result = if has_native {
-            // Block has native actions: use the full native+EVM pipeline which
-            // recovers senders from EIP-712 signatures and validates state root.
             self.validator
                 .validate_block_with_native(&torus_block, &self.state_db, &self.evm_executor)
         } else if has_evm {
-            // EVM-only block (no native actions).
             self.validator
                 .validate_block(&torus_block, &self.state_db, &self.evm_executor)
         } else {
             // Empty block — no execution to validate.
-            // FIX CONS-PF-05: Update last_header during validation, not production.
             self.persist_block_header(&torus_block);
-            self.last_header = torus_block.header.clone();
+            if torus_block.header.height > self.last_header.height {
+                self.last_header = torus_block.header.clone();
+            }
             let validator_set_updates = self.epoch_validator_set_updates(torus_block.header.height);
             return ValidateBlockResponse::Valid {
                 app_state_updates: None,
@@ -379,7 +373,9 @@ impl TorusApp {
         match validation_result {
             Ok(_validated) => {
                 self.persist_block_header(&torus_block);
-                self.last_header = torus_block.header.clone();
+                if torus_block.header.height > self.last_header.height {
+                    self.last_header = torus_block.header.clone();
+                }
                 if let Some(ref m) = self.metrics {
                     m.block_height.set(torus_block.header.height as i64);
                     m.blocks_committed.inc();
@@ -405,12 +401,25 @@ impl TorusApp {
 impl App<RocksKVStore> for TorusApp {
     fn produce_block(
         &mut self,
-        _request: ProduceBlockRequest<RocksKVStore>,
+        request: ProduceBlockRequest<RocksKVStore>,
     ) -> ProduceBlockResponse {
-        // FIX CONS-PF-08: Flush any buffered slashes before producing a new block.
+        // Derive the correct parent header from the block tree to avoid desync.
+        let parent_header = if let Some(parent_hash) = request.parent_block() {
+            if let Ok(Some(parent_block)) = request.block_tree().block(&parent_hash) {
+                let datums = parent_block.data.vec();
+                datums.first()
+                    .and_then(|d| serde_json::from_slice::<TorusBlock>(d.bytes()).ok())
+                    .map(|b| b.header)
+                    .unwrap_or_else(|| self.last_header.clone())
+            } else {
+                self.last_header.clone()
+            }
+        } else {
+            self.last_header.clone()
+        };
+        tracing::info!(parent_height = parent_header.height, local_height = self.last_header.height, "produce_block called");
         self.flush_pending_slashes();
 
-        // Phase 1: produce empty blocks (no mempool integration yet).
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -419,8 +428,8 @@ impl App<RocksKVStore> for TorusApp {
         let result = self.proposer.build_block(
             &self.state_db,
             &self.evm_executor,
-            &self.last_header,
-            vec![], // no pending txs in Phase 1
+            &parent_header,
+            vec![],
             timestamp,
             self.proposer_address,
         );
@@ -429,7 +438,7 @@ impl App<RocksKVStore> for TorusApp {
             Ok(proposed) => proposed.block,
             Err(_) => {
                 // Fallback: empty block with minimal header.
-                return produce_empty_block(&self.last_header, timestamp, self.proposer_address, &self.state_db);
+                return produce_empty_block(&parent_header, timestamp, self.proposer_address, &self.state_db);
             }
         };
 

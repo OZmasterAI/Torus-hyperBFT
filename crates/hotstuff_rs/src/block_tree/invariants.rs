@@ -521,8 +521,8 @@ pub(crate) fn block_to_commit<K: KVStore>(
                 return Ok(None);
             };
 
-            // 2-chain consecutive views: justify.view == parent_justify.view + 1
             let commit_rule_satisfied = justify.view == parent_justify.view + 1;
+            log::info!("block_to_commit: justify.view={}, parent_justify.view={}, consecutive={}", justify.view.int(), parent_justify.view.int(), commit_rule_satisfied);
 
             let not_committed_yet = {
                 let grandparent_height = block_tree

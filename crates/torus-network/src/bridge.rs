@@ -7,9 +7,9 @@ use hotstuff_rs::networking::network::Network;
 use zeroize::Zeroize;
 use hotstuff_rs::types::update_sets::ValidatorSetUpdates;
 use hotstuff_rs::types::validator_set::ValidatorSet;
-use libp2p::{identity, Multiaddr, PeerId, SwarmBuilder};
+use libp2p::{identity, multiaddr::Protocol, Multiaddr, PeerId, SwarmBuilder};
 use tokio::sync::mpsc;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::behaviour::TorusBehaviour;
 use crate::config::NetworkConfig;
@@ -105,8 +105,10 @@ impl LibP2PNetwork {
                 .behaviour_mut()
                 .kademlia
                 .add_address(peer_id, addr.clone());
-            if let Err(e) = swarm.dial(addr.clone()) {
-                warn!("Failed to dial bootstrap {addr}: {e}");
+            let dial_addr = addr.clone().with(Protocol::P2p(*peer_id));
+            info!(%peer_id, %dial_addr, "dialing bootstrap peer");
+            if let Err(e) = swarm.dial(dial_addr.clone()) {
+                warn!("Failed to dial bootstrap {dial_addr}: {e}");
             }
         }
 

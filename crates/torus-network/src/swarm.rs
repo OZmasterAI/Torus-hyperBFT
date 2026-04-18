@@ -312,25 +312,30 @@ fn handle_event(
             debug!("sync protocol event (not yet handled)");
         }
         SwarmEvent::NewListenAddr { address, .. } => info!("Listening on {address}"),
-        SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+        SwarmEvent::ConnectionEstablished { peer_id, num_established, .. } => {
             if peer_scoring.is_banned(&peer_id) {
-                // BUG FIX (3.1): Disconnect banned peers that slip through
                 let _ = swarm.disconnect_peer_id(peer_id);
                 debug!("Disconnected banned peer {peer_id}");
             } else {
-                debug!("Connected to {peer_id}");
+                info!(%peer_id, %num_established, "peer connected");
                 if let Some(ref m) = shared.metrics {
                     let count = swarm.connected_peers().count() as i64;
                     m.peers_connected.set(count);
                 }
             }
         }
-        SwarmEvent::ConnectionClosed { peer_id, .. } => {
-            debug!("Disconnected from {peer_id}");
+        SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
+            info!(%peer_id, ?cause, "peer disconnected");
             if let Some(ref m) = shared.metrics {
                 let count = swarm.connected_peers().count() as i64;
                 m.peers_connected.set(count);
             }
+        }
+        SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+            warn!(?peer_id, %error, "outgoing connection failed");
+        }
+        SwarmEvent::IncomingConnectionError { error, .. } => {
+            warn!(%error, "incoming connection failed");
         }
         _ => {}
     }

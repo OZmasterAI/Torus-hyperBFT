@@ -342,6 +342,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         .configuration(hs_config)
         .on_commit_block(move |_event: &CommitBlockEvent| {
             let height = find_latest_height(&state_db_for_handler);
+            info!(height, "on_commit_block fired");
             if height == 0 {
                 return;
             }
