@@ -1,0 +1,36 @@
+# Rust build artifacts — the main offender (57GB of host-side debug builds)
+target/
+**/target/
+
+# Version control
+.git/
+.gitignore
+.gitattributes
+
+# Node dependencies
+node_modules/
+
+# Local runtime state
+data/
+*.log
+LIVE_STATE.json
+
+# Dev tooling (Claude Code harness, shell hooks)
+.claude/
+hooks/
+
+# Documentation and research (not needed by the Rust build)
+docs/
+research/
+prompts/
+specs/
+monitoring/
+*.md
+!**/Cargo.toml
+!**/Cargo.lock
+
+# Editor / OS artifacts
+.DS_Store
+.vscode/
+.idea/
+*.swp
