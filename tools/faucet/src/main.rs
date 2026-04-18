@@ -47,7 +47,7 @@ struct Cli {
     cooldown_seconds: u64,
 
     /// Chain ID (must match node)
-    #[arg(long, default_value = "7777")]
+    #[arg(long, default_value = "7778")]
     chain_id: u64,
 
     /// Low-balance warning threshold in wei (default: 100 TRS)
@@ -619,7 +619,7 @@ mod tests {
         let to = Address::from_slice(&[0xAA; 20]);
         let value = U256::from(1_000_000_000_000_000_000u64); // 1 TRS
 
-        let raw = build_and_sign_eip1559_tx(&key, 7777, 0, to, value, 1_000_000_000);
+        let raw = build_and_sign_eip1559_tx(&key, 7778, 0, to, value, 1_000_000_000);
         // EIP-1559 tx starts with 0x02 type prefix
         assert_eq!(raw[0], 0x02);
         assert!(raw.len() > 100); // signed tx should be substantial

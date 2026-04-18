@@ -429,21 +429,10 @@ export interface PlaceOrderParams {
 ```
 
 **Bigint safety for JSON.** `JSON.stringify` throws on raw `bigint` values.
-Use a bigint-aware replacer when serializing a `SignedNativeAction`:
-
-```typescript
-export function stringifyWithBigint(v: unknown): string {
-  return JSON.stringify(v, (_k, x) => typeof x === 'bigint' ? Number(x) : x)
-}
-```
-
-This is safe as long as every bigint value fits in `Number.MAX_SAFE_INTEGER`
-(2^53 - 1). FixedPoint prices up to ~$90M, U256 wei amounts up to ~0.009 ETH
-wei-equivalents, and u64 nonces (ms-since-epoch) all fit. **For U256 `amount`
-fields that could exceed 2^53** (e.g. ≥ 0.01 TRS at 18 decimals = 10^16 wei),
-the replacer must emit a JSON number via a string-to-number-or-decimal library,
-or the Rust side must accept a string — verify by roundtripping one large
-amount through the probe crate before shipping Withdraw / Delegate flows.
+The shipped implementation uses a custom `canonicalJson()` serializer
+(in `lib/sign.ts`) that emits bigint values as bare numeric tokens via
+`.toString()` — never converting through `Number()`. This avoids all
+2^53 precision loss for U256 amounts, u128 order IDs, and FixedPoint values.
 
 // Placeholder types referenced above — fill in as needed:
 // SerdeProposal, SerdeOracleSubmission, SerdeMarketParams, SerdeMarketListing.
@@ -709,7 +698,7 @@ number, and `nonce` is a number.
 
 ```typescript
 import { type WalletClient } from 'viem'
-import { fromDecimal, stringifyWithBigint } from './fixed-point'
+import { fromDecimal } from './fixed-point'
 
 // Matches torus_types::Signature (crates/torus-types/src/lib.rs:183).
 interface WireSignature { v: number; r: number[]; s: number[] }
@@ -740,7 +729,7 @@ export async function signAndSubmit(
     nonce: Number(nonce),
     signature: splitSig(sigHex),
   }
-  const jsonBytes = Buffer.from(stringifyWithBigint(envelope), 'utf8')
+  const jsonBytes = Buffer.from(canonicalJson(envelope), 'utf8')
   const hexBody = '0x' + jsonBytes.toString('hex')
   return rpc.submitNativeAction(hexBody)
 }
