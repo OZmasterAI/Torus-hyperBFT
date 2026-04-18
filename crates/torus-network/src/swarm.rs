@@ -371,18 +371,28 @@ fn handle_command(
                 }
             }
         }
-        NetworkCommand::Send { target, message } => {
-            let peer_map = shared.peer_map.read().unwrap();
-            if let Some(peer_id) = peer_map.get_peer_id(&target) {
-                if let Ok(payload) = message.try_to_vec() {
-                    let request = DirectRequest {
-                        sender_key: local_key.to_bytes(),
-                        payload,
-                    };
-                    swarm.behaviour_mut().direct.send_request(peer_id, request);
+        NetworkCommand::Send { target: _, message } => {
+            // Use gossipsub instead of direct request-response for reliable
+            // delivery. Direct requests fail when peers aren't directly
+            // connected (only bootstrap peer has full mesh connectivity).
+            enqueue_inbound(&shared.inbound, *local_key, message.clone());
+            let mut envelope = local_key.to_bytes().to_vec();
+            if let Ok(msg_bytes) = message.try_to_vec() {
+                envelope.extend_from_slice(&msg_bytes);
+                match swarm
+                    .behaviour_mut()
+                    .gossipsub
+                    .publish(consensus_topic.clone(), envelope)
+                {
+                    Ok(_) => {
+                        if let Some(ref m) = shared.metrics {
+                            m.gossip_messages_sent.inc();
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to publish consensus message: {e:?}");
+                    }
                 }
-            } else {
-                warn!("Cannot send: no PeerId for target validator");
             }
         }
         NetworkCommand::RegisterPeer { vk, peer_id } => {

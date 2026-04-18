@@ -319,8 +319,25 @@ impl<K: KVStore> BlockTreeSingleton<K> {
 
         self.write(wb);
 
+        // MonadBFT B3: Record leader success on QC advancement.
+        // Every new highest QC is a positive reputation signal — the leader of that
+        // view successfully got a supermajority vote. This fires much more frequently
+        // than commit-only success, preventing the reputation death spiral where
+        // commits require consecutive QC views but reputation degradation prevents them.
+        if update_highest_pc.is_some() && !justify.is_genesis_pc() {
+            if let Ok(vs) = self.committed_validator_set() {
+                let qc_leader = match self.leader_reputation() {
+                    Ok(ref rep) => crate::pacemaker::implementation::select_leader_with_reputation(
+                        justify.view, &vs, rep,
+                    ),
+                    Err(_) => crate::pacemaker::implementation::select_leader(justify.view, &vs),
+                };
+                let _ = self.record_leader_success(&qc_leader);
+            }
+        }
+
         // MonadBFT B2: Promote irrevocably committed blocks from speculative list.
-        // MonadBFT B3: Record leader success for reputation tracking.
+        // MonadBFT B3: Record leader success for reputation tracking (on commit).
         for (block_hash, _) in &committed_blocks {
             let _ = self.promote_speculative_to_irrevocable(block_hash);
             // The block's justify tells us the view in which it was proposed.
@@ -340,7 +357,12 @@ impl<K: KVStore> BlockTreeSingleton<K> {
                         // The committed block was proposed in a view we can approximate from
                         // block_justify.view + 1 (the view this block was proposed in).
                         let proposed_view = block_justify.view + 1;
-                        let leader = crate::pacemaker::implementation::select_leader(proposed_view, &vs);
+                        let leader = match self.leader_reputation() {
+                            Ok(ref rep) => crate::pacemaker::implementation::select_leader_with_reputation(
+                                proposed_view, &vs, rep,
+                            ),
+                            Err(_) => crate::pacemaker::implementation::select_leader(proposed_view, &vs),
+                        };
                         let _ = self.record_leader_success(&leader);
                     }
                 }

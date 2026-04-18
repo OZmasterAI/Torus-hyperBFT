@@ -647,13 +647,15 @@ impl LeaderReputationEntry {
         }
     }
 
-    /// Reputation score in basis points (0..=10000).
+    /// Reputation score in basis points (2500..=10000).
     /// Returns 10000 (100%) when no data exists (benefit of the doubt).
+    /// Floor of 2500 (25%) prevents any validator from being excluded from rotation.
     pub fn score_bps(&self) -> u32 {
         if self.total == 0 {
             10_000
         } else {
-            ((self.successes as u64) * 10_000 / (self.total as u64)) as u32
+            let raw = ((self.successes as u64) * 10_000 / (self.total as u64)) as u32;
+            std::cmp::max(raw, 2_500)
         }
     }
 

@@ -323,11 +323,18 @@ impl<N: Network> Pacemaker<N> {
                 .publish(&self.event_publisher);
 
                 // MonadBFT B3: Record leader timeout for reputation tracking.
-                // The leader of the timed-out view failed to produce a committed block.
-                let timed_out_leader = select_leader(
-                    new_tc.view,
-                    validator_set_state.committed_validator_set(),
-                );
+                // Must use reputation-aware selection to blame the actual leader.
+                let timed_out_leader = match block_tree.leader_reputation().ok() {
+                    Some(ref rep) => select_leader_with_reputation(
+                        new_tc.view,
+                        validator_set_state.committed_validator_set(),
+                        rep,
+                    ),
+                    None => select_leader(
+                        new_tc.view,
+                        validator_set_state.committed_validator_set(),
+                    ),
+                };
                 let _ = block_tree.record_leader_timeout(&timed_out_leader);
 
                 // 3.1. If a newly collected Timeout Certificate has a higher view than `highest_tc`, update `highest_tc`.
@@ -828,6 +835,12 @@ pub fn select_leader_with_reputation(
     validator_set: &ValidatorSet,
     reputation: &crate::hotstuff::types::LeaderReputation,
 ) -> VerifyingKey {
+    // Warm-up: use plain round-robin for the first 20 views to let the
+    // system bootstrap before reputation data influences leader selection.
+    if view.int() < 20 {
+        return select_leader(view, validator_set);
+    }
+
     use crate::types::{data_types::Power, update_sets::ValidatorSetUpdates};
 
     // Build adjusted validator set with reputation-weighted powers.
