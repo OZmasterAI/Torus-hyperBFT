@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use libp2p::{Multiaddr, PeerId};
+use libp2p::{multiaddr::Protocol, Multiaddr, PeerId};
 
 /// Configuration for the Torus p2p network layer.
 #[derive(Clone, Debug)]
@@ -25,6 +25,37 @@ pub struct NetworkConfig {
     pub consensus_rate_limit_per_peer: u32,
     /// Path to the peer ban list JSON file (Phase 3: 3.1.7).
     pub ban_list_path: Option<PathBuf>,
+}
+
+impl NetworkConfig {
+    /// Parse a comma-separated list of multiaddrs (each with `/p2p/<peer_id>`)
+    /// into bootstrap peer entries. Returns entries that parsed successfully;
+    /// logs warnings for invalid ones.
+    pub fn parse_bootstrap_peers(peers_csv: &str) -> Vec<(PeerId, Multiaddr)> {
+        let mut result = Vec::new();
+        for addr_str in peers_csv.split(',').filter(|s| !s.is_empty()) {
+            let addr_str = addr_str.trim();
+            let addr: Multiaddr = match addr_str.parse() {
+                Ok(a) => a,
+                Err(_) => continue,
+            };
+            let peer_id = addr.iter().find_map(|p| {
+                if let Protocol::P2p(id) = p {
+                    Some(id)
+                } else {
+                    None
+                }
+            });
+            if let Some(pid) = peer_id {
+                let transport_addr = addr
+                    .iter()
+                    .filter(|p| !matches!(p, Protocol::P2p(_)))
+                    .collect();
+                result.push((pid, transport_addr));
+            }
+        }
+        result
+    }
 }
 
 impl Default for NetworkConfig {

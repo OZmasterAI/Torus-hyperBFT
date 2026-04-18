@@ -14,9 +14,10 @@ use hotstuff_rs::hotstuff::types::EquivocationEvidence;
 use hotstuff_rs::types::data_types::{CryptoHash, Data, Datum, Power};
 use hotstuff_rs::types::update_sets::ValidatorSetUpdates;
 
-use torus_bridge::{BlockProposer, BlockValidator};
+use torus_bridge::{BlockCommitter, BlockProposer, BlockValidator};
 use torus_economics::{EpochManager, SlashReason, StakingManager};
 use torus_evm::{EvmExecutor, TORUS_CHAIN_ID};
+use torus_state::cf::CF_BLOCK_HEADERS;
 use torus_state::StateDb;
 use torus_types::{Address, ChainConfig, TorusBlock, TorusBlockHeader, ValidatorSet};
 
@@ -287,6 +288,27 @@ impl TorusApp {
         hasher.finalize().into()
     }
 
+    fn persist_block_header(&self, block: &TorusBlock) {
+        let block_hash = alloy_primitives::keccak256(&block.header.canonical_header_bytes());
+        let header_json = match serde_json::to_vec(&block.header) {
+            Ok(j) => j,
+            Err(e) => {
+                tracing::error!(%e, "failed to serialize block header");
+                return;
+            }
+        };
+        let mut data = Vec::with_capacity(32 + header_json.len());
+        data.extend_from_slice(block_hash.as_slice());
+        data.extend_from_slice(&header_json);
+        if let Err(e) = self.state_db.put_cf_raw(
+            CF_BLOCK_HEADERS,
+            &block.header.height.to_be_bytes(),
+            &data,
+        ) {
+            tracing::error!(%e, height = block.header.height, "failed to persist block header");
+        }
+    }
+
     fn do_validate(
         &mut self,
         request: ValidateBlockRequest<RocksKVStore>,
@@ -334,6 +356,7 @@ impl TorusApp {
         } else {
             // Empty block — no execution to validate.
             // FIX CONS-PF-05: Update last_header during validation, not production.
+            self.persist_block_header(&torus_block);
             self.last_header = torus_block.header.clone();
             let validator_set_updates = self.epoch_validator_set_updates(torus_block.header.height);
             return ValidateBlockResponse::Valid {
@@ -344,6 +367,7 @@ impl TorusApp {
 
         match validation_result {
             Ok(_validated) => {
+                self.persist_block_header(&torus_block);
                 // FIX CONS-PF-05: Update last_header during validation, not production.
                 self.last_header = torus_block.header.clone();
                 let validator_set_updates =

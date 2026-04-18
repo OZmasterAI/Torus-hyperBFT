@@ -161,6 +161,11 @@ impl RpcServer {
         }
     }
 
+    /// Use an externally-created height counter (shared with the commit handler).
+    pub fn set_latest_height_handle(&mut self, handle: Arc<AtomicU64>) {
+        self.state.latest_height = handle;
+    }
+
     /// Get a shared handle to the latest block height atomic.
     pub fn latest_height(&self) -> Arc<AtomicU64> {
         self.state.latest_height.clone()

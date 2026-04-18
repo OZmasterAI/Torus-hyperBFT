@@ -10,7 +10,9 @@ torus-state = { workspace = true }
 torus-evm = { workspace = true }
 torus-bridge = { workspace = true }
 torus-economics = { workspace = true }
+torus-telemetry = { workspace = true }
 hotstuff_rs = { workspace = true }
+alloy-primitives = { workspace = true }
 rocksdb = { workspace = true }
 serde_json = { workspace = true }
 ed25519-dalek = { workspace = true }

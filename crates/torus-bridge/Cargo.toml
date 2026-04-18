@@ -10,6 +10,7 @@ torus-evm = { workspace = true }
 torus-core = { workspace = true }
 torus-state = { workspace = true }
 torus-economics = { workspace = true }
+torus-telemetry = { workspace = true }
 
 borsh = { workspace = true }
 alloy-primitives = { workspace = true }

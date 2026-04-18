@@ -2,6 +2,7 @@
 
 use prometheus_client::encoding::text::encode;
 use prometheus_client::metrics::counter::Counter;
+use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::metrics::histogram::{exponential_buckets, Histogram};
 use prometheus_client::registry::Registry;
@@ -41,6 +42,31 @@ pub struct Metrics {
 
     // Database metrics
     pub db_size_bytes: Gauge,
+
+    // Epoch metrics
+    pub epoch_number: Gauge,
+    pub validator_set_size: Gauge,
+
+    // Trading metrics
+    pub orders_matched: Counter,
+    pub liquidations_triggered: Counter,
+
+    // Pruner metrics
+    pub pruner_blocks_removed: Counter,
+
+    // RPC metrics
+    pub rpc_requests_total: Family<Vec<(String, String)>, Counter>,
+    pub rpc_request_duration_seconds: Histogram,
+
+    // Gossip metrics
+    pub gossip_messages_received: Counter,
+    pub gossip_messages_sent: Counter,
+
+    // Block detail metrics
+    pub block_transactions_count: Histogram,
+
+    // Consensus timeout metrics
+    pub consensus_timeout_total: Counter,
 }
 
 impl Metrics {
@@ -131,6 +157,85 @@ impl Metrics {
             db_size_bytes.clone(),
         );
 
+        let epoch_number = Gauge::default();
+        registry.register(
+            "torus_epoch_number",
+            "Current epoch number",
+            epoch_number.clone(),
+        );
+
+        let validator_set_size = Gauge::default();
+        registry.register(
+            "torus_validator_set_size",
+            "Number of validators in the active set",
+            validator_set_size.clone(),
+        );
+
+        let orders_matched = Counter::default();
+        registry.register(
+            "torus_orders_matched",
+            "Total number of order fills",
+            orders_matched.clone(),
+        );
+
+        let liquidations_triggered = Counter::default();
+        registry.register(
+            "torus_liquidations_triggered",
+            "Total liquidations triggered",
+            liquidations_triggered.clone(),
+        );
+
+        let pruner_blocks_removed = Counter::default();
+        registry.register(
+            "torus_pruner_blocks_removed",
+            "Total blocks removed by pruner",
+            pruner_blocks_removed.clone(),
+        );
+
+        let rpc_requests_total = Family::<Vec<(String, String)>, Counter>::default();
+        registry.register(
+            "torus_rpc_requests_total",
+            "Total RPC requests by method and status",
+            rpc_requests_total.clone(),
+        );
+
+        let rpc_request_duration_seconds =
+            Histogram::new(exponential_buckets(0.0001, 2.0, 15));
+        registry.register(
+            "torus_rpc_request_duration_seconds",
+            "RPC request duration in seconds",
+            rpc_request_duration_seconds.clone(),
+        );
+
+        let gossip_messages_received = Counter::default();
+        registry.register(
+            "torus_gossip_messages_received",
+            "Total gossip messages received",
+            gossip_messages_received.clone(),
+        );
+
+        let gossip_messages_sent = Counter::default();
+        registry.register(
+            "torus_gossip_messages_sent",
+            "Total gossip messages sent",
+            gossip_messages_sent.clone(),
+        );
+
+        let block_transactions_count =
+            Histogram::new(exponential_buckets(1.0, 2.0, 12));
+        registry.register(
+            "torus_block_transactions_count",
+            "Number of transactions per committed block",
+            block_transactions_count.clone(),
+        );
+
+        let consensus_timeout_total = Counter::default();
+        registry.register(
+            "torus_consensus_timeout_total",
+            "Total consensus timeouts",
+            consensus_timeout_total.clone(),
+        );
+
         Self {
             registry,
             blocks_committed,
@@ -145,6 +250,17 @@ impl Metrics {
             mempool_native_size,
             peers_connected,
             db_size_bytes,
+            epoch_number,
+            validator_set_size,
+            orders_matched,
+            liquidations_triggered,
+            pruner_blocks_removed,
+            rpc_requests_total,
+            rpc_request_duration_seconds,
+            gossip_messages_received,
+            gossip_messages_sent,
+            block_transactions_count,
+            consensus_timeout_total,
         }
     }
 

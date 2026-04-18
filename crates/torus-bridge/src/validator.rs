@@ -36,6 +36,7 @@ pub struct BlockValidator {
     max_validators: u32,
     treasury_address: Address,
     dev_pool_address: Address,
+    pub metrics: Option<std::sync::Arc<torus_telemetry::Metrics>>,
 }
 
 impl BlockValidator {
@@ -46,7 +47,7 @@ impl BlockValidator {
         treasury_address: Address,
         dev_pool_address: Address,
     ) -> Self {
-        Self { chain_id, epoch_length, max_validators, treasury_address, dev_pool_address }
+        Self { chain_id, epoch_length, max_validators, treasury_address, dev_pool_address, metrics: None }
     }
 
     /// Validate a proposed block against the current state.
@@ -233,6 +234,7 @@ impl BlockValidator {
             self.treasury_address,
             self.dev_pool_address,
         );
+        ctx.metrics = self.metrics.clone();
 
         // Phase 1: Execute pre-EVM native actions (cancellations, non-GTC orders).
         NativeExecutor::execute_batch(&mut ctx, &pre_evm);

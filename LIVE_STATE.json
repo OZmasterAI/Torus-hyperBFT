@@ -1,0 +1,36 @@
+{
+  "session": 155,
+  "branch": "master",
+  "status": "devnet-fixes-pending-verification",
+  "last_activity": "2026-04-18",
+  "feature": "devnet-testnet-readiness",
+  "framework_version": "v2.8.0",
+  "what_was_done": "Session 155: Fixed 4 bugs blocking devnet. (1) Genesis borsh fix (commit 843cdf4) — JSON→borsh for validators in CF_STAKING_VALIDATORS. (2) Gossipsub bootstrap — parse_bootstrap_peers() + kademlia registration + peer ID in docker-compose. (3) Block header persistence — persist_block_header() in app.rs do_validate. (4) RPC latest_height — shared Arc<AtomicU64> between commit handler and RPC server. Consensus produces blocks, epoch boundary fires. eth_blockNumber fix awaiting final Docker rebuild verification.",
+  "completed_this_session": [
+    "843cdf4 fix(genesis): borsh-encode validators instead of JSON strings",
+    "Gossipsub bootstrap: NetworkConfig::parse_bootstrap_peers(), docker-compose peer ID suffix, reverted add_explicit_peer (breaks mesh GRAFT)",
+    "Block header persistence: persist_block_header() in app.rs for empty+non-empty blocks — BlockCommitter was never wired into consensus flow",
+    "RPC height tracking: shared latest_height AtomicU64 between on_commit_block handler and RPC server via set_latest_height_handle()"
+  ],
+  "whats_next": [
+    "Verify Docker rebuild: eth_blockNumber should return real block heights after ~6min consensus warmup. If still 0x0, debug the on_commit_block handler.",
+    "RUNTIME VERIFY trading-app Phase 1: boot devnet + dev server on :3001, walk /trade /portfolio /markets.",
+    "Commit all uncommitted devnet fixes once verified.",
+    "Phase 2 trading-app: SubmitProposal UI, validator self-service panels.",
+    "Grafana monitoring: separate instance setting up Prometheus+Grafana dashboards (validator-0 metrics on :9090)."
+  ],
+  "known_issues": [
+    "Block header persistence + RPC height fixes compiled locally but not yet verified in Docker — final rebuild in progress at session end.",
+    "TORUS_CHAIN_ID hard-coded 7777 at eip712.rs:23 + :629.",
+    "Port 3000 held by torus-web; trading-app dev runs on :3001.",
+    "hotstuff_rs four_node_consensus test flaky (pre-existing).",
+    "torus-consensus Cargo.toml now has torus-telemetry dep (added by linter/user, not session work)."
+  ],
+  "memory_pointers": [
+    "47011c86264d71f5: Session 155 wrap-up (4 devnet fixes)",
+    "43523f6b5f3ae091: Genesis borsh fix",
+    "562e4cf645f8099a: eth_blockNumber fix (header persistence + shared height)",
+    "1ea4ca6fc5c517cb: Gossipsub bootstrap fix",
+    "8b8cf4d099804286: Session 150 context (prior pacemaker fix)"
+  ]
+}

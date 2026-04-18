@@ -108,6 +108,9 @@ pub struct NativeExecContext {
     pub total_native_fees: u64,
     /// Per-block trade counter for unique trade keys.
     pub trade_index: u32,
+
+    /// Optional metrics handle for Prometheus instrumentation.
+    pub metrics: Option<std::sync::Arc<torus_telemetry::Metrics>>,
 }
 
 impl NativeExecContext {
@@ -150,6 +153,7 @@ impl NativeExecContext {
             dev_pool_address,
             total_native_fees: 0,
             trade_index: 0,
+            metrics: None,
         }
     }
 
@@ -501,6 +505,10 @@ impl NativeExecutor {
             let _ = ctx.state_db.put_cf_raw(CF_NATIVE_USER_TRADES, &taker_key, &user_trade_data);
 
             ctx.trade_index += 1;
+        }
+
+        if let Some(ref m) = ctx.metrics {
+            m.orders_matched.inc_by(result.fills.len() as u64);
         }
 
         NativeActionResult::ok("place_order", 1000)
@@ -1116,6 +1124,9 @@ impl NativeExecutor {
             for liq in &liquidations {
                 match LiquidationEngine::execute_liquidation(&ctx.positions, liq, oracle_price) {
                     Ok(lr) => {
+                        if let Some(ref m) = ctx.metrics {
+                            m.liquidations_triggered.inc();
+                        }
                         results.push(NativeActionResult::ok("liquidation", 3000));
                         if lr.remaining_deficit > FixedPoint::ZERO {
                             let _ = LiquidationEngine::auto_deleverage(
@@ -1229,6 +1240,11 @@ impl NativeExecutor {
 
         // B7: Log rotation
         EpochManager::log_rotation(&old_set, &new_set, &diff, ctx.epoch + 1);
+
+        if let Some(ref m) = ctx.metrics {
+            m.epoch_number.set((ctx.epoch + 1) as i64);
+            m.validator_set_size.set(new_set.validators.len() as i64);
+        }
 
         Some(EpochBoundaryResult {
             action: NativeActionResult::ok("epoch_boundary", 5000),

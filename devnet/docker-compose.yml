@@ -36,7 +36,7 @@ services:
       - --data-dir=/data
       - --validator-key=0200000000000000000000000000000000000000000000000000000000000000
       - --p2p-listen=/ip4/0.0.0.0/udp/30334/quic-v1
-      - --p2p-peers=/ip4/172.28.0.10/udp/30333/quic-v1
+      - --p2p-peers=/ip4/172.28.0.10/udp/30333/quic-v1/p2p/12D3KooWPjceQrSwdWXPyLLeABRXmuqt69Rg3sBYbU1Nft9HyQ6X
       - --rpc-addr=0.0.0.0:8545
       - --log-level=info
     volumes:
@@ -58,7 +58,7 @@ services:
       - --data-dir=/data
       - --validator-key=0300000000000000000000000000000000000000000000000000000000000000
       - --p2p-listen=/ip4/0.0.0.0/udp/30335/quic-v1
-      - --p2p-peers=/ip4/172.28.0.10/udp/30333/quic-v1
+      - --p2p-peers=/ip4/172.28.0.10/udp/30333/quic-v1/p2p/12D3KooWPjceQrSwdWXPyLLeABRXmuqt69Rg3sBYbU1Nft9HyQ6X
       - --rpc-addr=0.0.0.0:8545
       - --log-level=info
     volumes:
@@ -80,7 +80,7 @@ services:
       - --data-dir=/data
       - --validator-key=0400000000000000000000000000000000000000000000000000000000000000
       - --p2p-listen=/ip4/0.0.0.0/udp/30336/quic-v1
-      - --p2p-peers=/ip4/172.28.0.10/udp/30333/quic-v1
+      - --p2p-peers=/ip4/172.28.0.10/udp/30333/quic-v1/p2p/12D3KooWPjceQrSwdWXPyLLeABRXmuqt69Rg3sBYbU1Nft9HyQ6X
       - --rpc-addr=0.0.0.0:8545
       - --log-level=info
     volumes:

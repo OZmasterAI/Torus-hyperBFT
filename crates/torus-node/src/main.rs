@@ -286,26 +286,21 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let listen_addr = cli.p2p_listen.parse()
         .map_err(|e| format!("invalid p2p-listen multiaddr: {e}"))?;
 
+    let bootstrap_peers = cli.p2p_peers.as_deref()
+        .map(NetworkConfig::parse_bootstrap_peers)
+        .unwrap_or_default();
+    for (pid, addr) in &bootstrap_peers {
+        info!(peer_id = %pid, addr = %addr, "bootstrap peer configured");
+    }
+
     let network_config = NetworkConfig {
         listen_addr,
+        bootstrap_peers,
         ..NetworkConfig::default()
     };
 
     let (network, _tx_gossip) = LibP2PNetwork::new(network_config, signing_key.clone()).await?;
     info!(listen = %cli.p2p_listen, "p2p network started");
-
-    // Dial bootstrap peers
-    if let Some(peers_str) = &cli.p2p_peers {
-        for addr_str in peers_str.split(',').filter(|s| !s.is_empty()) {
-            match addr_str.trim().parse() {
-                Ok(addr) => {
-                    network.dial(addr);
-                    info!(peer = addr_str.trim(), "dialing bootstrap peer");
-                }
-                Err(e) => warn!(peer = addr_str.trim(), %e, "invalid peer multiaddr, skipping"),
-            }
-        }
-    }
 
     // 6. Consensus configuration
     let hs_config = Configuration::builder()
@@ -323,10 +318,14 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         .log_events(false)
         .build();
 
-    // 7. Block notifier (shared between consensus replica and RPC server)
+    // 7. Block notifier + shared height counter (consensus replica ↔ RPC server)
     let notifier = BlockNotifier::new();
     let notifier_for_replica = notifier.clone();
     let state_db_for_handler = state_db.clone();
+    let latest_height_shared = Arc::new(std::sync::atomic::AtomicU64::new(
+        find_latest_height(&state_db),
+    ));
+    let latest_height_for_handler = latest_height_shared.clone();
 
     // 8. Start replica with on_commit_block handler for WebSocket subscriptions
     let _replica = ReplicaSpec::builder()
@@ -335,12 +334,11 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         .kv_store(kv_store)
         .configuration(hs_config)
         .on_commit_block(move |_event: &CommitBlockEvent| {
-            // Read the latest committed block height from RocksDB (O(1) reverse iterator).
             let height = find_latest_height(&state_db_for_handler);
             if height == 0 {
                 return;
             }
-            // Read the block header: CF_BLOCK_HEADERS stores block_hash(32) || header_json.
+            latest_height_for_handler.store(height, std::sync::atomic::Ordering::Relaxed);
             match state_db_for_handler.get_cf_raw(CF_BLOCK_HEADERS, &height.to_be_bytes()) {
                 Ok(Some(data)) if data.len() > 32 => {
                     if let Ok(header) =
@@ -351,7 +349,6 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 _ => {}
             }
-            // Scan trades for this block and notify subscribers.
             let trades = scan_trades_for_block(&state_db_for_handler, height);
             notifier_for_replica.notify_new_trades(trades);
         })
@@ -359,9 +356,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         .start();
     info!("consensus replica started");
 
-    // 9. Start RPC server
+    // 9. Start RPC server (shares height counter with commit handler)
     let rpc_addr: SocketAddr = cli.rpc_addr.parse()?;
-    let rpc_server = RpcServer::new(
+    let mut rpc_server = RpcServer::new(
         state_db.clone(),
         mempool,
         executor,
@@ -369,6 +366,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         chain_config.epoch_length,
         notifier,
     );
+    rpc_server.set_latest_height_handle(latest_height_shared);
     // Extract shared handles before start() consumes the server
     let latest_height_handle = rpc_server.latest_height();
     let pruned_up_to_handle = rpc_server.pruned_up_to();
