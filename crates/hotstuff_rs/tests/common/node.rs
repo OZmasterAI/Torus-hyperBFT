@@ -79,7 +79,7 @@ impl Node {
             // `max_view_time` must be **at least** 500 milliseconds, since `NumberApp`'s `produce_block` and
             // `validate_block` each take a minimum of 250 milliseconds to complete.
             .max_view_time(Duration::from_millis(10000))
-            .log_events(true)
+            .log_events(false)
             .build();
 
         let replica = ReplicaSpec::builder()
