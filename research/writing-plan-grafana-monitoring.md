@@ -1,8 +1,35 @@
 # Writing Plan: Grafana Monitoring Dashboards + Alerting
 
 **Spec:** [tech-req-grafana-monitoring.md](./tech-req-grafana-monitoring.md)
-**Date:** 2026-04-16
-**Estimated scope:** ~200 lines Rust (new metrics) + ~1500 lines JSON/YAML (dashboards + config)
+**Date:** 2026-04-16 (revised 2026-04-18)
+**Estimated scope:** ~200 lines Rust (new metrics) + ~800 lines JSON/YAML (new dashboards + config)
+
+---
+
+## Step 0: Audit existing monitoring infrastructure
+
+**Directory:** `monitoring/` (already exists — do NOT create `infra/`)
+
+The repo already has a monitoring stack. Catalog before adding:
+
+**Existing files:**
+- `monitoring/prometheus.yml` — scrapes 4 validators on `:9090`, references `alerts/*.yml`
+- `monitoring/dashboards/consensus.json` — consensus panels
+- `monitoring/dashboards/execution.json` — EVM/block execution panels
+- `monitoring/dashboards/network.json` — peer/gossip panels
+- `monitoring/alerts/consensus.yml` — MissedBlocks, ConsensusStall, SlowBlockBuild, HighConsensusRounds, MempoolBacklog
+- `monitoring/alerts/node.yml` — LowPeerCount, LowPeerCountCritical, DatabaseLargeWarning, DatabaseLargeCritical
+- `monitoring/alerts/infrastructure.yml` — DiskSpaceHigh, DiskSpaceCritical, MemoryHigh, HighCPU (requires node_exporter)
+
+**Already covered by existing alerts (do NOT duplicate):**
+- NodeNotProducingBlocks → `MissedBlocks` in consensus.yml
+- ConsensusStalledViews → `ConsensusStall` in consensus.yml
+- NoPeers → `LowPeerCountCritical` in node.yml
+- HighBlockBuildTime → `SlowBlockBuild` in consensus.yml
+- DiskSpaceCritical → exists in infrastructure.yml
+- MempoolBacklog → exists in consensus.yml
+
+**Verify:** Review each existing file for coverage gaps before proceeding.
 
 ---
 
@@ -110,58 +137,60 @@ Thread `Metrics` handle into the network behaviour constructor.
 
 **File:** `crates/torus-node/src/main.rs`
 
-Check if a `--metrics-addr` flag already exists. If not, add:
+Metrics are currently hardcoded at `"0.0.0.0:9090"` (line ~378). Replace
+with a CLI flag, keeping the same default to avoid breaking existing configs:
 
 ```rust
 /// Metrics (Prometheus) listen address
-#[arg(long, default_value = "0.0.0.0:9100")]
+#[arg(long, default_value = "0.0.0.0:9090")]
 metrics_addr: SocketAddr,
 ```
 
-Wire it to the telemetry HTTP listener that serves `/metrics` and `/health`.
+Wire it to the existing `torus_telemetry::serve_metrics()` call. The existing
+`monitoring/prometheus.yml` scrapes `:9090` — do NOT change the default port.
 
 **Verify:** `cargo test -p torus-node`
 
 ---
 
-## Step 6: Create infra directory + Docker Compose
+## Step 6: Add Docker Compose for monitoring stack
 
-**Files:**
-- `infra/docker-compose.monitoring.yml`
-- `infra/prometheus/prometheus.yml`
+**File:** `monitoring/docker-compose.yml`
 
-Create the monitoring stack. Prometheus scrapes `host.docker.internal:9100`
-(or configurable targets). Grafana auto-provisions dashboards and datasource.
+Add a compose file to the existing `monitoring/` directory. Prometheus
+mounts the existing `prometheus.yml` and `alerts/` directory. Grafana
+auto-provisions dashboards and datasource from new provisioning configs.
 
 ```yaml
-# docker-compose.monitoring.yml
+# monitoring/docker-compose.yml
 services:
   prometheus:
     image: prom/prometheus:v2.51.0
     volumes:
-      - ./prometheus:/etc/prometheus
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./alerts:/etc/prometheus/alerts:ro
     ports: ["9090:9090"]
 
   grafana:
     image: grafana/grafana:10.4.0
     volumes:
-      - ./grafana/provisioning:/etc/grafana/provisioning
-      - ./grafana/dashboards:/var/lib/grafana/dashboards
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./dashboards:/var/lib/grafana/dashboards:ro
     ports: ["3000:3000"]
     environment:
       GF_AUTH_ANONYMOUS_ENABLED: "true"
       GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
 ```
 
-**Verify:** `docker compose -f infra/docker-compose.monitoring.yml config`
+**Verify:** `docker compose -f monitoring/docker-compose.yml config`
 
 ---
 
 ## Step 7: Grafana provisioning configs
 
 **Files:**
-- `infra/grafana/provisioning/datasources/prometheus.yaml`
-- `infra/grafana/provisioning/dashboards/default.yaml`
+- `monitoring/grafana/provisioning/datasources/prometheus.yaml`
+- `monitoring/grafana/provisioning/dashboards/default.yaml`
 
 **datasources/prometheus.yaml:**
 ```yaml
@@ -192,12 +221,17 @@ Small config files, ~10 lines each.
 
 ## Step 8: Dashboard JSON files
 
-**Files:**
-- `infra/grafana/dashboards/node-overview.json`
-- `infra/grafana/dashboards/consensus.json`
-- `infra/grafana/dashboards/trading.json`
-- `infra/grafana/dashboards/rpc.json`
-- `infra/grafana/dashboards/network.json`
+Three dashboards already exist in `monitoring/dashboards/`. Extend those
+and add the missing ones:
+
+**Extend (add new panels for Step 1 metrics):**
+- `monitoring/dashboards/consensus.json` — add `consensus_timeout_total` panel
+- `monitoring/dashboards/network.json` — add `gossip_messages_received/sent` panels
+
+**Create new:**
+- `monitoring/dashboards/node-overview.json` — top-level summary: block height, peers, epoch, validator set size, mempool, DB size
+- `monitoring/dashboards/trading.json` — orders_matched, liquidations_triggered, pruner_blocks_removed
+- `monitoring/dashboards/rpc.json` — rpc_requests_total (by method/status), rpc_request_duration_seconds (p50/p95/p99)
 
 Each dashboard follows Grafana JSON model. Panel layout per tech-req
 Sections 2.1–2.5. Use `uid` based on dashboard name for stable links.
@@ -206,53 +240,56 @@ Sections 2.1–2.5. Use `uid` based on dashboard name for stable links.
 add panels programmatically. Each panel references the `Prometheus`
 datasource and uses the metric names from Step 1.
 
-This is the largest step (~1200 lines of JSON across 5 files). Use the
-Grafana JSON model directly — no grafonnet or other generators.
+~800 lines of JSON across 3 new files + panel additions to 2 existing files.
+Use the Grafana JSON model directly — no grafonnet or other generators.
 
-**Verify:** `docker compose up`, open `localhost:3000`, verify all 5
-dashboards load and show panels (data only appears when a node is running).
+**Verify:** `docker compose -f monitoring/docker-compose.yml up`, open
+`localhost:3000`, verify all 5 dashboards load and show panels (data only
+appears when a node is running).
 
 ---
 
-## Step 9: Prometheus alerting rules
+## Step 9: Add missing alerting rules
 
-**File:** `infra/prometheus/rules/torus-alerts.yml`
+Existing alerts already cover 10 of the 13 rules from the tech-req (see
+Step 0 audit). Only add rules for the NEW metrics from Step 1.
 
+**File:** `monitoring/alerts/consensus.yml` — append to existing group:
 ```yaml
-groups:
-  - name: torus-critical
-    rules:
-      - alert: NodeNotProducingBlocks
-        expr: rate(blocks_committed[5m]) == 0
-        for: 5m
-        labels: { severity: critical }
-        annotations:
-          summary: "Node {{ $labels.instance }} not producing blocks"
-
-      - alert: ConsensusStalledViews
-        expr: increase(consensus_view[10m]) == 0
-        for: 10m
-        labels: { severity: critical }
-
-      - alert: NoPeers
-        expr: peers_connected == 0
-        for: 2m
-        labels: { severity: critical }
-
-  - name: torus-warnings
-    rules:
-      - alert: HighBlockBuildTime
-        expr: histogram_quantile(0.95, rate(block_build_seconds_bucket[5m])) > 1.0
+      - alert: ConsensusTimeoutSpike
+        expr: rate(torus_consensus_timeout_total[5m]) > 0.1
         for: 5m
         labels: { severity: warning }
-
-      # ... (7 warning rules from tech-req Section 3.2)
+        annotations:
+          summary: "Consensus timeouts increasing"
 ```
 
-~80 lines YAML.
+**File:** `monitoring/alerts/node.yml` — append to existing group:
+```yaml
+      - alert: BlockHeightLag
+        expr: torus_block_height < on() group_left max(torus_block_height) - 10
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Node lagging >10 blocks behind cluster"
+```
 
-**Verify:** `promtool check rules infra/prometheus/rules/torus-alerts.yml`
-(install promtool or run via Docker: `docker run prom/prometheus promtool check rules ...`)
+**New file:** `monitoring/alerts/trading.yml`
+```yaml
+groups:
+  - name: torus_trading
+    rules:
+      - alert: LiquidationSpike
+        expr: rate(torus_liquidations_triggered[5m]) > 10
+        for: 2m
+        labels: { severity: warning }
+        annotations:
+          summary: "High liquidation rate ({{ $value }}/s)"
+```
+
+~30 lines YAML total (not 80 — most rules already exist).
+
+**Verify:** `docker run --rm -v ./monitoring/alerts:/rules prom/prometheus promtool check rules /rules/*.yml`
 
 ---
 
@@ -261,23 +298,25 @@ groups:
 Start the full stack:
 ```
 cargo run -p torus-node -- --genesis devnet-genesis.json --data-dir /tmp/torus-test &
-docker compose -f infra/docker-compose.monitoring.yml up -d
+docker compose -f monitoring/docker-compose.yml up -d
 ```
 
-1. Verify Prometheus targets page shows torus-node as UP
-2. Verify all 5 Grafana dashboards load without errors
-3. Verify at least `block_height` and `peers_connected` show data
-4. Trigger a test alert (stop the node, wait 5m, verify `NodeNotProducingBlocks` fires)
+1. Verify Prometheus targets page (`localhost:9090/targets`) shows torus-node as UP
+2. Verify all 5 dashboards load in Grafana (`localhost:3000`) without errors
+3. Verify at least `torus_block_height` and `torus_peers_connected` show data
+4. Trigger a test alert (stop the node, wait 30s, verify `MissedBlocks` fires)
 
 ---
 
 ## Dependency Chain
 
 ```
+Step 0 (audit existing) ── all other steps
+
 Step 1 (new metrics) ───┬── Step 2 (instrument epoch/trading/pruner)
                         ├── Step 3 (instrument RPC)
                         ├── Step 4 (instrument network)
-                        └── Step 5 (--metrics-addr)
+                        └── Step 5 (--metrics-addr flag)
 
 Step 6 (docker-compose) ── Step 7 (provisioning) ── Step 8 (dashboards)
                                                          │
@@ -287,4 +326,4 @@ Step 9 (alert rules) ─ independent of dashboards ────────┤
 ```
 
 Steps 1-5 (Rust) and Steps 6-9 (infra) are independent tracks.
-Step 10 needs everything.
+Step 0 is a prerequisite for everything. Step 10 needs everything.
