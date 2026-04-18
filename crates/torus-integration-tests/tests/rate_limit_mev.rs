@@ -351,7 +351,7 @@ fn core_writer_delay_guard_skips_same_block() {
     );
 
     // drain_core_writer should skip the action (block_queued=10, current=10).
-    let results = NativeExecutor::drain_core_writer(&mut ctx);
+    let results = NativeExecutor::drain_core_writer(&mut ctx).unwrap();
     assert_eq!(results.len(), 1);
     assert!(!results[0].success, "same-block action should be rejected");
     assert!(

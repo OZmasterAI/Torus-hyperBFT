@@ -101,7 +101,7 @@ fn test_core_writer_precompile_call() {
 
     // Verify the action is queued for block 21 (current + 1)
     let mut ctx_next = h.exec_context(current_block + 1);
-    let drained = NativeExecutor::drain_core_writer(&mut ctx_next);
+    let drained = NativeExecutor::drain_core_writer(&mut ctx_next).unwrap();
     assert_eq!(drained.len(), 1, "should have 1 queued action");
     assert!(drained[0].success);
 }
@@ -131,12 +131,12 @@ fn test_core_writer_staking_delayed_delegation() {
 
     // Current block: nothing should drain
     let mut ctx_current = h.exec_context(current_block);
-    let results = NativeExecutor::drain_core_writer(&mut ctx_current);
+    let results = NativeExecutor::drain_core_writer(&mut ctx_current).unwrap();
     assert!(results.is_empty());
 
     // Next block: delegation should execute
     let mut ctx_next = h.exec_context(current_block + 1);
-    let results = NativeExecutor::drain_core_writer(&mut ctx_next);
+    let results = NativeExecutor::drain_core_writer(&mut ctx_next).unwrap();
     assert_eq!(results.len(), 1);
     // Note: delegation may fail because the validator isn't registered,
     // but the action was successfully dequeued and dispatched.
@@ -194,14 +194,14 @@ fn test_execution_ordering_native_vs_core_writer() {
 
     // 3. In block 50, native buy is resting, CoreWriter order hasn't executed yet
     assert!(ctx.order_books.get(&market_id).unwrap().best_bid().is_some(), "native buy should be resting");
-    let drained_50 = NativeExecutor::drain_core_writer(&mut ctx);
+    let drained_50 = NativeExecutor::drain_core_writer(&mut ctx).unwrap();
     assert!(drained_50.is_empty(), "no CoreWriter actions in block 50");
 
     // 4. In block 51, the CoreWriter order executes and matches the resting buy.
     //    Need a fresh context for block 51 — but the resting buy is in-memory only.
     //    This test verifies the timing separation at the queue level.
     let mut ctx_51 = h.exec_context(block + 1);
-    let drained_51 = NativeExecutor::drain_core_writer(&mut ctx_51);
+    let drained_51 = NativeExecutor::drain_core_writer(&mut ctx_51).unwrap();
     assert_eq!(drained_51.len(), 1, "CoreWriter order should drain in block 51");
     assert!(drained_51[0].success);
 }
@@ -242,7 +242,7 @@ fn test_invalid_core_writer_action_isolation() {
 
     // Drain in next block: both should execute (invalid one fails gracefully)
     let mut ctx = h.exec_context(current_block + 1);
-    let results = NativeExecutor::drain_core_writer(&mut ctx);
+    let results = NativeExecutor::drain_core_writer(&mut ctx).unwrap();
     assert_eq!(results.len(), 2);
     assert!(!results[0].success, "invalid cancel should fail");
     assert!(results[1].success, "valid order should succeed despite earlier failure");
