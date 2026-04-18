@@ -49,6 +49,17 @@ impl LibP2PNetwork {
         config: NetworkConfig,
         signing_key: SigningKey,
     ) -> Result<(Self, TxGossipHandle), Box<dyn std::error::Error>> {
+        Self::with_metrics(config, signing_key, None).await
+    }
+
+    /// Create a new LibP2PNetwork with optional Prometheus metrics instrumentation.
+    /// Must be called from within a tokio runtime.
+    /// Spawns a background task to drive the libp2p swarm.
+    pub async fn with_metrics(
+        config: NetworkConfig,
+        signing_key: SigningKey,
+        metrics: Option<Arc<torus_telemetry::Metrics>>,
+    ) -> Result<(Self, TxGossipHandle), Box<dyn std::error::Error>> {
         let local_key = signing_key.verifying_key();
 
         let mut secret_bytes = signing_key.to_bytes();
@@ -65,6 +76,7 @@ impl LibP2PNetwork {
             inbound: Mutex::new(VecDeque::new()),
             peer_map: RwLock::new(PeerMap::default()),
             validators: RwLock::new(HashSet::new()),
+            metrics,
         });
 
         let (command_tx, command_rx) = mpsc::unbounded_channel();

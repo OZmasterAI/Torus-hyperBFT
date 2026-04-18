@@ -88,6 +88,10 @@ struct Cli {
     /// Older data is removed to save disk space. Cannot be used with --archive.
     #[arg(long)]
     retention_blocks: Option<u64>,
+
+    /// Metrics (Prometheus) listen address
+    #[arg(long, default_value = "0.0.0.0:9090")]
+    metrics_addr: SocketAddr,
 }
 
 #[derive(clap::Subcommand)]
@@ -268,7 +272,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // 5. Build components
-    let app = TorusApp::new(state_db.clone(), &chain_config);
+    let metrics = Arc::new(torus_telemetry::Metrics::new());
+    let app = TorusApp::new(state_db.clone(), &chain_config, Some(metrics.clone()));
     let kv_store = RocksKVStore::new(state_db.db_arc());
 
     // Mempool
@@ -299,7 +304,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         ..NetworkConfig::default()
     };
 
-    let (network, _tx_gossip) = LibP2PNetwork::new(network_config, signing_key.clone()).await?;
+    let (network, _tx_gossip) = LibP2PNetwork::with_metrics(
+        network_config, signing_key.clone(), Some(metrics.clone()),
+    ).await?;
     info!(listen = %cli.p2p_listen, "p2p network started");
 
     // 6. Consensus configuration
@@ -318,7 +325,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         .log_events(false)
         .build();
 
-    // 7. Block notifier + shared height counter (consensus replica ↔ RPC server)
+    // 7. Block notifier + shared height counter (consensus replica <-> RPC server)
     let notifier = BlockNotifier::new();
     let notifier_for_replica = notifier.clone();
     let state_db_for_handler = state_db.clone();
@@ -367,6 +374,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         notifier,
     );
     rpc_server.set_latest_height_handle(latest_height_shared);
+    rpc_server.set_metrics(metrics.clone());
     // Extract shared handles before start() consumes the server
     let latest_height_handle = rpc_server.latest_height();
     let pruned_up_to_handle = rpc_server.pruned_up_to();
@@ -376,13 +384,12 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| -> Box<dyn std::error::Error> { e })?;
     info!(%actual_addr, "JSON-RPC server started");
 
-    // 9. Metrics (optional telemetry endpoint)
-    let metrics = Arc::new(torus_telemetry::Metrics::new());
-    let metrics_addr: SocketAddr = "0.0.0.0:9090".parse().unwrap();
+    // 10. Metrics (telemetry endpoint)
+    let metrics_addr = cli.metrics_addr;
     tokio::spawn(torus_telemetry::serve_metrics(metrics_addr, metrics.clone()));
     info!(%metrics_addr, "telemetry server started");
 
-    // 10. Background pruner (if pruning enabled)
+    // 11. Background pruner (if pruning enabled)
     if let Some(retention) = cli.retention_blocks {
         let pruner_config = PrunerConfig {
             retention_blocks: retention,
@@ -394,6 +401,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             pruned_up_to_handle,
         );
         let latest_for_pruner = latest_height_handle.clone();
+        let metrics_for_pruner = metrics.clone();
         info!(retention_blocks = retention, "background pruner enabled");
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(30));
@@ -405,7 +413,10 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 match pruner.maybe_prune(current) {
                     Ok(0) => {}
-                    Ok(n) => info!(pruned_blocks = n, "background pruner cycle complete"),
+                    Ok(n) => {
+                        metrics_for_pruner.pruner_blocks_removed.inc_by(n);
+                        info!(pruned_blocks = n, "background pruner cycle complete");
+                    }
                     Err(e) => warn!(%e, "background pruner error"),
                 }
                 // Yield to avoid starving other tasks
@@ -416,7 +427,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         info!("archive mode: pruning disabled (all historical data retained)");
     }
 
-    // 11. Background DB size metric updater
+    // 12. Background DB size metric updater
     {
         let data_dir = cli.data_dir.clone();
         let db_gauge = metrics.db_size_bytes.clone();
@@ -430,7 +441,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // 12. Wait for shutdown signal
+    // 13. Wait for shutdown signal
     info!("node is running — press Ctrl+C to shut down");
     tokio::signal::ctrl_c().await?;
     info!("shutdown signal received, stopping...");
@@ -477,7 +488,7 @@ mod tests {
         ]).unwrap();
         assert!(!cli.archive);
         assert!(cli.retention_blocks.is_none());
-        // Neither flag → archive mode (no pruning)
+        // Neither flag -> archive mode (no pruning)
     }
 
     #[test]
@@ -489,5 +500,24 @@ mod tests {
         ]).unwrap();
         assert!(!cli.archive);
         assert_eq!(cli.retention_blocks, Some(50000));
+    }
+
+    #[test]
+    fn metrics_addr_default() {
+        let cli = Cli::try_parse_from([
+            "torus-node",
+            "--keystore", "k.keystore",
+        ]).unwrap();
+        assert_eq!(cli.metrics_addr, "0.0.0.0:9090".parse::<SocketAddr>().unwrap());
+    }
+
+    #[test]
+    fn metrics_addr_custom() {
+        let cli = Cli::try_parse_from([
+            "torus-node",
+            "--keystore", "k.keystore",
+            "--metrics-addr", "127.0.0.1:9091",
+        ]).unwrap();
+        assert_eq!(cli.metrics_addr, "127.0.0.1:9091".parse::<SocketAddr>().unwrap());
     }
 }

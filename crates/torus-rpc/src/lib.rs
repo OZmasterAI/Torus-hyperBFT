@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use alloy_primitives::B256;
+use jsonrpsee::server::middleware::rpc::{self as rpc_mw, RpcServiceT};
 use jsonrpsee::server::{ServerBuilder, ServerHandle};
 use tokio::sync::broadcast;
 use torus_evm::EvmExecutor;
@@ -127,6 +128,8 @@ pub struct RpcState {
     pub(crate) tx_submit_limiter: TxSubmitLimiter,
     /// Global cap on active WebSocket subscriptions (HIGH-NEW-05).
     pub(crate) active_subscriptions: Arc<AtomicUsize>,
+    /// Prometheus metrics handle.
+    pub(crate) metrics: Option<Arc<torus_telemetry::Metrics>>,
 }
 
 /// JSON-RPC server combining eth, net, and web3 namespaces.
@@ -157,6 +160,7 @@ impl RpcServer {
                 pruned_up_to: Arc::new(AtomicU64::new(0)),
                 tx_submit_limiter: TxSubmitLimiter::new(50), // 50 tx per 10s per sender
                 active_subscriptions: Arc::new(AtomicUsize::new(0)),
+                metrics: None,
             },
         }
     }
@@ -182,12 +186,24 @@ impl RpcServer {
         self.state.pruned_up_to.clone()
     }
 
+    /// Set the Prometheus metrics handle for RPC instrumentation.
+    pub fn set_metrics(&mut self, metrics: Arc<torus_telemetry::Metrics>) {
+        self.state.metrics = Some(metrics);
+    }
+
     /// Start the RPC server on the given address.
     pub async fn start(
         self,
         addr: SocketAddr,
     ) -> Result<(ServerHandle, SocketAddr), Box<dyn std::error::Error + Send + Sync>> {
-        let server = ServerBuilder::default().build(addr).await?;
+        let layer = MetricsLayer {
+            metrics: self.state.metrics.clone(),
+        };
+        let rpc_middleware = rpc_mw::RpcServiceBuilder::new().layer(layer);
+        let server = ServerBuilder::default()
+            .set_rpc_middleware(rpc_middleware)
+            .build(addr)
+            .await?;
         let local_addr = server.local_addr()?;
         let mut module = jsonrpsee::RpcModule::new(());
         module.merge(EthApiServer::into_rpc(self.state.clone()))?;
@@ -201,6 +217,88 @@ impl RpcServer {
     /// Get a reference to the RPC state.
     pub fn state(&self) -> &RpcState {
         &self.state
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RPC metrics middleware
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+struct MetricsLayer {
+    metrics: Option<Arc<torus_telemetry::Metrics>>,
+}
+
+impl<S: Clone> tower::Layer<S> for MetricsLayer {
+    type Service = MetricsMiddleware<S>;
+    fn layer(&self, inner: S) -> Self::Service {
+        MetricsMiddleware {
+            inner,
+            metrics: self.metrics.clone(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct MetricsMiddleware<S> {
+    inner: S,
+    metrics: Option<Arc<torus_telemetry::Metrics>>,
+}
+
+impl<S> RpcServiceT for MetricsMiddleware<S>
+where
+    S: RpcServiceT<
+            MethodResponse = rpc_mw::MethodResponse,
+            BatchResponse = rpc_mw::MethodResponse,
+            NotificationResponse = rpc_mw::MethodResponse,
+        > + Send
+        + Sync
+        + Clone
+        + 'static,
+{
+    type MethodResponse = rpc_mw::MethodResponse;
+    type BatchResponse = rpc_mw::MethodResponse;
+    type NotificationResponse = rpc_mw::MethodResponse;
+
+    fn call<'a>(
+        &self,
+        request: rpc_mw::Request<'a>,
+    ) -> impl std::future::Future<Output = Self::MethodResponse> + Send + 'a {
+        let metrics = self.metrics.clone();
+        let method = request.method_name().to_string();
+        let inner = self.inner.clone();
+        let start = Instant::now();
+
+        async move {
+            let response = inner.call(request).await;
+            if let Some(ref m) = metrics {
+                let duration = start.elapsed();
+                let status = if response.is_success() { "ok" } else { "error" };
+                m.rpc_requests_total
+                    .get_or_create(&vec![
+                        ("method".into(), method),
+                        ("status".into(), status.into()),
+                    ])
+                    .inc();
+                m.rpc_request_duration_seconds
+                    .observe(duration.as_secs_f64());
+            }
+            response
+        }
+    }
+
+    fn batch<'a>(
+        &self,
+        batch: rpc_mw::Batch<'a>,
+    ) -> impl std::future::Future<Output = Self::BatchResponse> + Send + 'a {
+        self.inner.batch(batch)
+    }
+
+    fn notification<'a>(
+        &self,
+        n: rpc_mw::Notification<'a>,
+    ) -> impl std::future::Future<Output = Self::NotificationResponse> + Send + 'a {
+        self.inner.notification(n)
     }
 }
 

@@ -41,6 +41,7 @@ pub struct SharedState {
     pub inbound: Mutex<VecDeque<(VerifyingKey, hotstuff_rs::networking::messages::Message)>>,
     pub peer_map: RwLock<PeerMap>,
     pub validators: RwLock<HashSet<[u8; 32]>>,
+    pub metrics: Option<Arc<torus_telemetry::Metrics>>,
 }
 
 enum SwarmAction {
@@ -130,12 +131,19 @@ pub async fn run_swarm_with_config(
                 return;
             }
             SwarmAction::Tx(Some(tx_bytes)) => {
-                if let Err(e) = swarm
+                match swarm
                     .behaviour_mut()
                     .gossipsub
                     .publish(tx_topic.clone(), tx_bytes)
                 {
-                    warn!("Failed to publish tx: {e:?}");
+                    Ok(_) => {
+                        if let Some(ref m) = shared.metrics {
+                            m.gossip_messages_sent.inc();
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to publish tx: {e:?}");
+                    }
                 }
             }
             SwarmAction::Tx(None) => {}
@@ -162,6 +170,11 @@ fn handle_event(
             // Check if peer is banned (Phase 3: 3.1.7)
             if peer_scoring.is_banned(&propagation_source) {
                 return;
+            }
+
+            // Increment gossip received counter
+            if let Some(ref m) = shared.metrics {
+                m.gossip_messages_received.inc();
             }
 
             let consensus_hash = gossipsub::IdentTopic::new(CONSENSUS_TOPIC).hash();
@@ -306,9 +319,19 @@ fn handle_event(
                 debug!("Disconnected banned peer {peer_id}");
             } else {
                 debug!("Connected to {peer_id}");
+                if let Some(ref m) = shared.metrics {
+                    let count = swarm.connected_peers().count() as i64;
+                    m.peers_connected.set(count);
+                }
             }
         }
-        SwarmEvent::ConnectionClosed { peer_id, .. } => debug!("Disconnected from {peer_id}"),
+        SwarmEvent::ConnectionClosed { peer_id, .. } => {
+            debug!("Disconnected from {peer_id}");
+            if let Some(ref m) = shared.metrics {
+                let count = swarm.connected_peers().count() as i64;
+                m.peers_connected.set(count);
+            }
+        }
         _ => {}
     }
 }
@@ -327,12 +350,19 @@ fn handle_command(
             let mut envelope = local_key.to_bytes().to_vec();
             if let Ok(msg_bytes) = message.try_to_vec() {
                 envelope.extend_from_slice(&msg_bytes);
-                if let Err(e) = swarm
+                match swarm
                     .behaviour_mut()
                     .gossipsub
                     .publish(consensus_topic.clone(), envelope)
                 {
-                    warn!("Failed to publish consensus message: {e:?}");
+                    Ok(_) => {
+                        if let Some(ref m) = shared.metrics {
+                            m.gossip_messages_sent.inc();
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to publish consensus message: {e:?}");
+                    }
                 }
             }
         }
@@ -486,6 +516,7 @@ mod tests {
             inbound: Mutex::new(VecDeque::new()),
             peer_map: RwLock::new(PeerMap::default()),
             validators: RwLock::new(HashSet::new()),
+            metrics: None,
         }
     }
 

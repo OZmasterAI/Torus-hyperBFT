@@ -14,6 +14,7 @@ use hotstuff_rs::hotstuff::types::EquivocationEvidence;
 use hotstuff_rs::types::data_types::{CryptoHash, Data, Datum, Power};
 use hotstuff_rs::types::update_sets::ValidatorSetUpdates;
 
+use std::sync::Arc;
 use torus_bridge::{BlockCommitter, BlockProposer, BlockValidator};
 use torus_economics::{EpochManager, SlashReason, StakingManager};
 use torus_evm::{EvmExecutor, TORUS_CHAIN_ID};
@@ -57,28 +58,37 @@ pub struct TorusApp {
     /// FIX CONS-PF-08: Buffered slash intents from speculative rollbacks.
     /// Applied to DB when the next block is produced or validated.
     pending_slashes: Vec<PendingSlash>,
+    metrics: Option<Arc<torus_telemetry::Metrics>>,
 }
 
 impl TorusApp {
     /// Create a new `TorusApp` with the given state database and chain config.
-    pub fn new(state_db: StateDb, config: &ChainConfig) -> Self {
+    pub fn new(
+        state_db: StateDb,
+        config: &ChainConfig,
+        metrics: Option<Arc<torus_telemetry::Metrics>>,
+    ) -> Self {
         let staking = StakingManager::new(state_db.clone());
+        let mut proposer = BlockProposer::new(
+            TORUS_CHAIN_ID,
+            config.epoch_length,
+            config.max_validators,
+            config.treasury_address,
+            config.dev_pool_address,
+        );
+        proposer.metrics = metrics.clone();
+        let mut validator = BlockValidator::new(
+            TORUS_CHAIN_ID,
+            config.epoch_length,
+            config.max_validators,
+            config.treasury_address,
+            config.dev_pool_address,
+        );
+        validator.metrics = metrics.clone();
         Self {
             state_db,
-            proposer: BlockProposer::new(
-                TORUS_CHAIN_ID,
-                config.epoch_length,
-                config.max_validators,
-                config.treasury_address,
-                config.dev_pool_address,
-            ),
-            validator: BlockValidator::new(
-                TORUS_CHAIN_ID,
-                config.epoch_length,
-                config.max_validators,
-                config.treasury_address,
-                config.dev_pool_address,
-            ),
+            proposer,
+            validator,
             evm_executor: EvmExecutor::new(TORUS_CHAIN_ID),
             proposer_address: Address::ZERO,
             last_header: torus_bridge::genesis_parent_header(),
@@ -91,6 +101,7 @@ impl TorusApp {
             },
             cached_vs_updates: None,
             pending_slashes: Vec::new(),
+            metrics,
         }
     }
 
@@ -117,7 +128,7 @@ impl TorusApp {
             treasury_address: Address::ZERO,
             dev_pool_address: Address::ZERO,
         };
-        Self::new(state_db, &config)
+        Self::new(state_db, &config, None)
     }
 
     /// FIX CONS-PF-08: Flush any buffered slash intents to DB.
@@ -368,8 +379,14 @@ impl TorusApp {
         match validation_result {
             Ok(_validated) => {
                 self.persist_block_header(&torus_block);
-                // FIX CONS-PF-05: Update last_header during validation, not production.
                 self.last_header = torus_block.header.clone();
+                if let Some(ref m) = self.metrics {
+                    m.block_height.set(torus_block.header.height as i64);
+                    m.blocks_committed.inc();
+                    let tx_count = torus_block.header.evm_tx_count as u64
+                        + torus_block.header.native_action_count as u64;
+                    m.block_transactions_count.observe(tx_count as f64);
+                }
                 let validator_set_updates =
                     self.epoch_validator_set_updates(torus_block.header.height);
                 ValidateBlockResponse::Valid {
