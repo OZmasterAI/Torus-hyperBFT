@@ -386,9 +386,10 @@ impl<N: Network> Pacemaker<N> {
                     })
                     .publish(&self.event_publisher);
 
-                    // Check if about to enter a new epoch, and if so then set the timeouts for the new epoch.
                     let next_view = tc.view + 1;
-                    self.update_view(next_view, &validator_set_state)?
+                    if next_view > self.view_info.view {
+                        self.update_view(next_view, &validator_set_state)?
+                    }
                 }
             }
         }
@@ -472,9 +473,10 @@ impl<N: Network> Pacemaker<N> {
                 self.state.last_advance_view = Some(self.view_info.view);
             }
 
-            // 5. Check if about to enter a new epoch, and if so then set the timeouts for the new epoch.
             let next_view = progress_certificate.view() + 1;
-            self.update_view(next_view, &validator_set_state)?
+            if next_view > self.view_info.view {
+                self.update_view(next_view, &validator_set_state)?
+            }
         }
 
         Ok(())
