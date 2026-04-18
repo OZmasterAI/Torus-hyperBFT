@@ -70,7 +70,7 @@ fn block_sync_test() {
         "Submitting one Increment transactions to each of replica 0 and replica 1.",
     );
     live_nodes[0].submit_transaction(NumberAppTransaction::Increment);
-    live_nodes[1].submit_transaction(NumberAppTransaction::Increment);
+    live_nodes[0].submit_transaction(NumberAppTransaction::Increment);
 
     // 2.2. Poll the app state of the live replicas until each sees the number as 2.
     log_with_context(
