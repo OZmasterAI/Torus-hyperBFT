@@ -1,0 +1,13 @@
+groups:
+  - name: torus_trading
+    rules:
+      - alert: LiquidationSpike
+        expr: rate(torus_liquidations_triggered_total[5m]) > 10
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High liquidation rate ({{ $value }}/s)"
+          description: >
+            The liquidation rate has exceeded 10/s for 2 minutes.
+            This may indicate extreme market volatility or oracle issues.

@@ -16,10 +16,10 @@
     { "type": "panel", "id": "stat", "name": "Stat", "version": "" }
   ],
   "id": null,
-  "uid": "torus-consensus",
-  "title": "Torus - Consensus Overview",
-  "description": "Block production, consensus rounds, and state root computation metrics for Torus hyperBFT.",
-  "tags": ["torus", "consensus", "hyperbft"],
+  "uid": "torus-node-overview",
+  "title": "Torus - Node Overview",
+  "description": "High-level overview of Torus node health, block production, and key metrics.",
+  "tags": ["torus", "overview"],
   "timezone": "browser",
   "editable": true,
   "graphTooltip": 1,
@@ -53,7 +53,7 @@
     {
       "title": "Block Height",
       "type": "stat",
-      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 0 },
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "fieldConfig": {
         "defaults": {
@@ -69,9 +69,33 @@
       ]
     },
     {
-      "title": "Consensus View",
+      "title": "Connected Peers",
       "type": "stat",
-      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 1 },
+              { "color": "green", "value": 3 }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "expr": "torus_peers_connected{instance=~\"$instance\"}",
+          "legendFormat": "{{instance}}"
+        }
+      ]
+    },
+    {
+      "title": "Epoch",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 0 },
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "fieldConfig": {
         "defaults": {
@@ -81,43 +105,68 @@
       },
       "targets": [
         {
-          "expr": "torus_consensus_view{instance=~\"$instance\"}",
+          "expr": "torus_epoch_number{instance=~\"$instance\"}",
           "legendFormat": "{{instance}}"
         }
       ]
     },
     {
-      "title": "Blocks Committed (total)",
+      "title": "Validator Set",
       "type": "stat",
-      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 0 },
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "thresholds" },
-          "thresholds": { "steps": [{ "color": "green", "value": null }] }
+          "thresholds": { "steps": [{ "color": "purple", "value": null }] }
         }
       },
       "targets": [
         {
-          "expr": "torus_blocks_committed_total{instance=~\"$instance\"}",
+          "expr": "torus_validator_set_size{instance=~\"$instance\"}",
           "legendFormat": "{{instance}}"
         }
       ]
     },
     {
-      "title": "Consensus Rounds (total)",
+      "title": "EVM Mempool",
       "type": "stat",
-      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 0 },
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "thresholds" },
-          "thresholds": { "steps": [{ "color": "orange", "value": null }] }
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 100 },
+              { "color": "red", "value": 500 }
+            ]
+          }
         }
       },
       "targets": [
         {
-          "expr": "torus_consensus_rounds_total{instance=~\"$instance\"}",
+          "expr": "torus_mempool_evm_size{instance=~\"$instance\"}",
+          "legendFormat": "{{instance}}"
+        }
+      ]
+    },
+    {
+      "title": "DB Size",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": { "steps": [{ "color": "green", "value": null }] },
+          "unit": "bytes"
+        }
+      },
+      "targets": [
+        {
+          "expr": "torus_db_size_bytes{instance=~\"$instance\"}",
           "legendFormat": "{{instance}}"
         }
       ]
@@ -160,94 +209,24 @@
       ]
     },
     {
-      "title": "Block Build Time (p50 / p95 / p99)",
+      "title": "Transactions Per Block",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
-      "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "fieldConfig": {
-        "defaults": {
-          "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "fillOpacity": 5 },
-          "color": { "mode": "palette-classic" },
-          "unit": "s"
-        }
-      },
-      "targets": [
-        {
-          "expr": "histogram_quantile(0.50, rate(torus_block_build_seconds_bucket{instance=~\"$instance\"}[5m]))",
-          "legendFormat": "p50 {{instance}}"
-        },
-        {
-          "expr": "histogram_quantile(0.95, rate(torus_block_build_seconds_bucket{instance=~\"$instance\"}[5m]))",
-          "legendFormat": "p95 {{instance}}"
-        },
-        {
-          "expr": "histogram_quantile(0.99, rate(torus_block_build_seconds_bucket{instance=~\"$instance\"}[5m]))",
-          "legendFormat": "p99 {{instance}}"
-        }
-      ]
-    },
-    {
-      "title": "State Root Compute Time (p50 / p95 / p99)",
-      "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
-      "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "fieldConfig": {
-        "defaults": {
-          "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "fillOpacity": 5 },
-          "color": { "mode": "palette-classic" },
-          "unit": "s"
-        }
-      },
-      "targets": [
-        {
-          "expr": "histogram_quantile(0.50, rate(torus_state_root_compute_seconds_bucket{instance=~\"$instance\"}[5m]))",
-          "legendFormat": "p50 {{instance}}"
-        },
-        {
-          "expr": "histogram_quantile(0.95, rate(torus_state_root_compute_seconds_bucket{instance=~\"$instance\"}[5m]))",
-          "legendFormat": "p95 {{instance}}"
-        },
-        {
-          "expr": "histogram_quantile(0.99, rate(torus_state_root_compute_seconds_bucket{instance=~\"$instance\"}[5m]))",
-          "legendFormat": "p99 {{instance}}"
-        }
-      ]
-    },
-    {
-      "title": "Consensus Rounds Rate",
-      "type": "timeseries",
-      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 20 },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 12 },
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "fieldConfig": {
         "defaults": {
           "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "fillOpacity": 10 },
-          "color": { "mode": "palette-classic" },
-          "unit": "ops"
+          "color": { "mode": "palette-classic" }
         }
       },
       "targets": [
         {
-          "expr": "rate(torus_consensus_rounds_total{instance=~\"$instance\"}[1m])",
-          "legendFormat": "{{instance}}"
-        }
-      ]
-    },
-    {
-      "title": "Consensus Timeouts Rate",
-      "type": "timeseries",
-      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 28 },
-      "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "fieldConfig": {
-        "defaults": {
-          "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "fillOpacity": 10 },
-          "color": { "mode": "palette-classic" },
-          "unit": "ops"
-        }
-      },
-      "targets": [
+          "expr": "histogram_quantile(0.50, rate(torus_block_transactions_count_bucket{instance=~\"$instance\"}[5m]))",
+          "legendFormat": "p50 {{instance}}"
+        },
         {
-          "expr": "rate(torus_consensus_timeout_total{instance=~\"$instance\"}[1m])",
-          "legendFormat": "{{instance}}"
+          "expr": "histogram_quantile(0.99, rate(torus_block_transactions_count_bucket{instance=~\"$instance\"}[5m]))",
+          "legendFormat": "p99 {{instance}}"
         }
       ]
     }

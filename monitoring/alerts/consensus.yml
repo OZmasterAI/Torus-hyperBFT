@@ -65,3 +65,14 @@ groups:
             The mempool has been continuously growing for over 10 minutes.
             This means transactions are arriving faster than they are being
             included in blocks. Check block production rate and gas limits.
+
+      - alert: ConsensusTimeoutSpike
+        expr: rate(torus_consensus_timeout_total[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Consensus timeouts increasing"
+          description: >
+            The consensus timeout rate has exceeded 0.1/s for 5 minutes.
+            This may indicate network partitions or Byzantine validators.

@@ -52,3 +52,14 @@ groups:
             The RocksDB data directory has grown past 200 GB. Disk exhaustion
             is imminent if not addressed. Enable pruning with --retention-blocks
             or expand storage immediately. Current size: {{ $value | humanize1024 }}B.
+
+      - alert: BlockHeightLag
+        expr: torus_block_height < on() group_left max(torus_block_height) - 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Node lagging >10 blocks behind cluster"
+          description: >
+            This node's block height is more than 10 blocks behind the
+            highest in the cluster. Check network connectivity and sync status.

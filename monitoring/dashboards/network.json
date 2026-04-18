@@ -202,9 +202,47 @@
       ]
     },
     {
+      "title": "Gossip Messages Received Rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 20 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "fillOpacity": 10 },
+          "color": { "mode": "palette-classic" },
+          "unit": "ops"
+        }
+      },
+      "targets": [
+        {
+          "expr": "rate(torus_gossip_messages_received{instance=~\"$instance\"}[1m])",
+          "legendFormat": "{{instance}}"
+        }
+      ]
+    },
+    {
+      "title": "Gossip Messages Sent Rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 20 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "fillOpacity": 10 },
+          "color": { "mode": "palette-classic" },
+          "unit": "ops"
+        }
+      },
+      "targets": [
+        {
+          "expr": "rate(torus_gossip_messages_sent{instance=~\"$instance\"}[1m])",
+          "legendFormat": "{{instance}}"
+        }
+      ]
+    },
+    {
       "title": "Setup Notes",
       "type": "text",
-      "gridPos": { "h": 4, "w": 24, "x": 0, "y": 20 },
+      "gridPos": { "h": 4, "w": 24, "x": 0, "y": 28 },
       "options": {
         "mode": "markdown",
         "content": "### Infrastructure Panels\n\nThe CPU, Memory, and Disk panels require **node_exporter** to be running on each Torus node.\nInstall: `apt install prometheus-node-exporter` or download from the [official releases](https://github.com/prometheus/node_exporter/releases).\nEnsure Prometheus scrapes node_exporter targets (default port 9100)."
