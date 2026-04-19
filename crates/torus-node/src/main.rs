@@ -273,16 +273,17 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     // 5. Build components
     let metrics = Arc::new(torus_telemetry::Metrics::new());
-    let app = TorusApp::new(state_db.clone(), &chain_config, Some(metrics.clone()));
-    let kv_store = RocksKVStore::new(state_db.db_arc());
 
-    // Mempool
+    // Mempool (created before app so consensus can drain it during block production)
     let mempool_config = MempoolConfig {
         chain_id: chain_config.chain_id,
         block_gas_limit: chain_config.evm_gas_limit,
         ..MempoolConfig::default()
     };
     let mempool = Arc::new(Mempool::new(state_db.clone(), mempool_config));
+
+    let app = TorusApp::new(state_db.clone(), &chain_config, Some(metrics.clone()), Some(mempool.clone()));
+    let kv_store = RocksKVStore::new(state_db.db_arc());
 
     // EVM executor
     let executor = Arc::new(EvmExecutor::new(chain_config.chain_id));

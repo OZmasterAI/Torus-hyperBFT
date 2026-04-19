@@ -16,6 +16,7 @@ use hotstuff_rs::types::update_sets::ValidatorSetUpdates;
 
 use std::sync::Arc;
 use torus_bridge::{BlockCommitter, BlockProposer, BlockValidator};
+use torus_mempool::Mempool;
 use torus_economics::{EpochManager, SlashReason, StakingManager};
 use torus_evm::{EvmExecutor, TORUS_CHAIN_ID};
 use torus_state::cf::CF_BLOCK_HEADERS;
@@ -37,9 +38,6 @@ struct PendingSlash {
 use crate::kv_store::RocksKVStore;
 
 /// Consensus application wired to the execution bridge.
-///
-/// In Phase 1: produces empty EVM blocks (no mempool), validates proposed
-/// blocks by re-executing EVM transactions and verifying state roots.
 pub struct TorusApp {
     state_db: StateDb,
     proposer: BlockProposer,
@@ -51,22 +49,18 @@ pub struct TorusApp {
     epoch_length: u64,
     max_validators: u32,
     last_validator_set: ValidatorSet,
-    /// FIX CONS-FIND-02: Cache epoch validator set updates by height for idempotency.
-    /// Prevents the double-call bug where produce_block mutates state and validate_block
-    /// sees stale state, causing the proposer to halt at epoch boundaries.
     cached_vs_updates: Option<(u64, Option<ValidatorSetUpdates>)>,
-    /// FIX CONS-PF-08: Buffered slash intents from speculative rollbacks.
-    /// Applied to DB when the next block is produced or validated.
     pending_slashes: Vec<PendingSlash>,
     metrics: Option<Arc<torus_telemetry::Metrics>>,
+    mempool: Option<Arc<Mempool>>,
 }
 
 impl TorusApp {
-    /// Create a new `TorusApp` with the given state database and chain config.
     pub fn new(
         state_db: StateDb,
         config: &ChainConfig,
         metrics: Option<Arc<torus_telemetry::Metrics>>,
+        mempool: Option<Arc<Mempool>>,
     ) -> Self {
         let staking = StakingManager::new(state_db.clone());
         let mut proposer = BlockProposer::new(
@@ -85,6 +79,9 @@ impl TorusApp {
             config.dev_pool_address,
         );
         validator.metrics = metrics.clone();
+        let genesis_validator_set = EpochManager::compute_new_validator_set(
+            &staking, config.max_validators, 0,
+        ).unwrap_or_else(|_| ValidatorSet { validators: vec![], epoch: 0 });
         Self {
             state_db,
             proposer,
@@ -95,13 +92,11 @@ impl TorusApp {
             staking,
             epoch_length: config.epoch_length,
             max_validators: config.max_validators,
-            last_validator_set: ValidatorSet {
-                validators: vec![],
-                epoch: 0,
-            },
+            last_validator_set: genesis_validator_set,
             cached_vs_updates: None,
             pending_slashes: Vec::new(),
             metrics,
+            mempool,
         }
     }
 
@@ -128,7 +123,7 @@ impl TorusApp {
             treasury_address: Address::ZERO,
             dev_pool_address: Address::ZERO,
         };
-        Self::new(state_db, &config, None)
+        Self::new(state_db, &config, None, None)
     }
 
     /// FIX CONS-PF-08: Flush any buffered slash intents to DB.
@@ -350,6 +345,14 @@ impl TorusApp {
 
         let has_native = !torus_block.native_actions.is_empty();
         let has_evm = !torus_block.evm_transactions.is_empty();
+        tracing::info!(
+            height = torus_block.header.height,
+            has_native,
+            has_evm,
+            evm_tx_count = torus_block.evm_transactions.len(),
+            native_count = torus_block.native_actions.len(),
+            "do_validate: block contents"
+        );
 
         let validation_result = if has_native {
             self.validator
@@ -371,8 +374,27 @@ impl TorusApp {
         };
 
         match validation_result {
-            Ok(_validated) => {
-                self.persist_block_header(&torus_block);
+            Ok(validated) => {
+                match BlockCommitter::commit_block(
+                    &self.state_db,
+                    &torus_block,
+                    &validated.bundle,
+                    &validated.receipts,
+                ) {
+                    Ok(block_hash) => {
+                        tracing::info!(
+                            height = torus_block.header.height,
+                            %block_hash,
+                            evm_txs = torus_block.evm_transactions.len(),
+                            "committed block state to DB"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(%e, "failed to commit block state");
+                        return ValidateBlockResponse::Invalid;
+                    }
+                }
+
                 if torus_block.header.height > self.last_header.height {
                     self.last_header = torus_block.header.clone();
                 }
@@ -425,11 +447,27 @@ impl App<RocksKVStore> for TorusApp {
             .unwrap_or_default()
             .as_secs();
 
-        let result = self.proposer.build_block(
+        let (native_actions, evm_txs) = if let Some(ref mempool) = self.mempool {
+            let gas_limit = if parent_header.evm_gas_limit == 0 {
+                torus_evm::DEFAULT_BLOCK_GAS_LIMIT
+            } else {
+                parent_header.evm_gas_limit
+            };
+            let (native, evm) = mempool.drain_for_block(256, gas_limit, parent_header.state_root);
+            if !evm.is_empty() || !native.is_empty() {
+                tracing::info!(evm_txs = evm.len(), native_actions = native.len(), "drained mempool for block");
+            }
+            (native, evm)
+        } else {
+            (vec![], vec![])
+        };
+
+        let result = self.proposer.build_block_with_native(
             &self.state_db,
             &self.evm_executor,
             &parent_header,
-            vec![],
+            native_actions,
+            evm_txs,
             timestamp,
             self.proposer_address,
         );

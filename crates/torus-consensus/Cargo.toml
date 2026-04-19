@@ -9,6 +9,7 @@ torus-types = { workspace = true }
 torus-state = { workspace = true }
 torus-evm = { workspace = true }
 torus-bridge = { workspace = true }
+torus-mempool = { workspace = true }
 torus-economics = { workspace = true }
 torus-telemetry = { workspace = true }
 hotstuff_rs = { workspace = true }
