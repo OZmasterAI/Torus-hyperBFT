@@ -474,8 +474,8 @@ impl App<RocksKVStore> for TorusApp {
 
         let block = match result {
             Ok(proposed) => proposed.block,
-            Err(_) => {
-                // Fallback: empty block with minimal header.
+            Err(e) => {
+                tracing::error!(%e, "build_block_with_native FAILED — falling back to empty block (EVM txs lost!)");
                 return produce_empty_block(&parent_header, timestamp, self.proposer_address, &self.state_db);
             }
         };
