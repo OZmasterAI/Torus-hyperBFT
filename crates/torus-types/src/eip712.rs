@@ -4,7 +4,7 @@
 //! struct representation.  The nonce (timestamp-based, milliseconds) is included
 //! in every struct for replay protection.
 //!
-//! Domain: `{ name: "Torus", version: "1", chainId: 7777, verifyingContract: 0x0 }`
+//! Domain: `{ name: "Torus", version: "1", chainId: 7778, verifyingContract: 0x0 }`
 
 use alloy_primitives::{keccak256, Address, B256, U256};
 use k256::ecdsa::{RecoveryId, SigningKey, VerifyingKey};
@@ -20,7 +20,7 @@ use crate::{
 // ============================================================================
 
 /// Torus chain ID embedded in the EIP-712 domain separator.
-pub const TORUS_CHAIN_ID: u64 = 7777;
+pub const TORUS_CHAIN_ID: u64 = 7778;
 
 /// Maximum allowed nonce drift from current time (60 seconds).
 pub const NONCE_WINDOW_MS: u64 = 60_000;

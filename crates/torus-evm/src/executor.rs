@@ -15,7 +15,7 @@ use crate::bloom::logs_bloom;
 use crate::error::EvmError;
 
 /// Torus mainnet chain ID.
-pub const TORUS_CHAIN_ID: u64 = 7777;
+pub const TORUS_CHAIN_ID: u64 = 7778;
 
 /// Default block gas limit (30M).
 pub const DEFAULT_BLOCK_GAS_LIMIT: u64 = 30_000_000;

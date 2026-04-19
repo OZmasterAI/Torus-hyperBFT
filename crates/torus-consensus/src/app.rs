@@ -64,7 +64,7 @@ impl TorusApp {
     ) -> Self {
         let staking = StakingManager::new(state_db.clone());
         let mut proposer = BlockProposer::new(
-            TORUS_CHAIN_ID,
+            config.chain_id,
             config.epoch_length,
             config.max_validators,
             config.treasury_address,
@@ -72,7 +72,7 @@ impl TorusApp {
         );
         proposer.metrics = metrics.clone();
         let mut validator = BlockValidator::new(
-            TORUS_CHAIN_ID,
+            config.chain_id,
             config.epoch_length,
             config.max_validators,
             config.treasury_address,
@@ -86,7 +86,7 @@ impl TorusApp {
             state_db,
             proposer,
             validator,
-            evm_executor: EvmExecutor::new(TORUS_CHAIN_ID),
+            evm_executor: EvmExecutor::new(config.chain_id),
             proposer_address: Address::ZERO,
             last_header: torus_bridge::genesis_parent_header(),
             staking,
@@ -354,12 +354,9 @@ impl TorusApp {
             "do_validate: block contents"
         );
 
-        let validation_result = if has_native {
+        let validation_result = if has_native || has_evm {
             self.validator
                 .validate_block_with_native(&torus_block, &self.state_db, &self.evm_executor)
-        } else if has_evm {
-            self.validator
-                .validate_block(&torus_block, &self.state_db, &self.evm_executor)
         } else {
             // Empty block — no execution to validate.
             self.persist_block_header(&torus_block);
