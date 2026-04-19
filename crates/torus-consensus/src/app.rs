@@ -354,9 +354,12 @@ impl TorusApp {
             "do_validate: block contents"
         );
 
-        let validation_result = if has_native || has_evm {
+        let validation_result = if has_native {
             self.validator
                 .validate_block_with_native(&torus_block, &self.state_db, &self.evm_executor)
+        } else if has_evm {
+            self.validator
+                .validate_block(&torus_block, &self.state_db, &self.evm_executor)
         } else {
             // Empty block — no execution to validate.
             self.persist_block_header(&torus_block);
@@ -459,20 +462,31 @@ impl App<RocksKVStore> for TorusApp {
             (vec![], vec![])
         };
 
-        let result = self.proposer.build_block_with_native(
-            &self.state_db,
-            &self.evm_executor,
-            &parent_header,
-            native_actions,
-            evm_txs,
-            timestamp,
-            self.proposer_address,
-        );
+        let result = if native_actions.is_empty() {
+            self.proposer.build_block(
+                &self.state_db,
+                &self.evm_executor,
+                &parent_header,
+                evm_txs,
+                timestamp,
+                self.proposer_address,
+            )
+        } else {
+            self.proposer.build_block_with_native(
+                &self.state_db,
+                &self.evm_executor,
+                &parent_header,
+                native_actions,
+                evm_txs,
+                timestamp,
+                self.proposer_address,
+            )
+        };
 
         let block = match result {
             Ok(proposed) => proposed.block,
             Err(e) => {
-                tracing::error!(%e, "build_block_with_native FAILED — falling back to empty block (EVM txs lost!)");
+                tracing::error!(%e, "block proposal FAILED — falling back to empty block");
                 return produce_empty_block(&parent_header, timestamp, self.proposer_address, &self.state_db);
             }
         };
