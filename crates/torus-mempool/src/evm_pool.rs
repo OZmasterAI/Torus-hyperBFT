@@ -220,6 +220,57 @@ impl EvmPool {
         Some(entry)
     }
 
+    /// Return the next nonce this sender should use, accounting for pool contents.
+    ///
+    /// Walks consecutive nonces starting from `state_nonce`. If the pool holds
+    /// nonces 5, 6, 7 and state_nonce is 5, returns 8. If there's a gap (5, 7),
+    /// returns 6.
+    pub fn pending_nonce(&self, sender: &Address, state_nonce: u64) -> u64 {
+        let txs = match self.by_sender.get(sender) {
+            Some(m) => m,
+            None => return state_nonce,
+        };
+        let mut nonce = state_nonce;
+        while txs.contains_key(&nonce) {
+            nonce += 1;
+        }
+        nonce
+    }
+
+    /// Remove transactions with nonce below `confirmed_nonce` for the given sender.
+    /// Returns (count_removed, freed_bytes).
+    pub fn prune_confirmed(&mut self, sender: &Address, confirmed_nonce: u64) -> (usize, usize) {
+        let stale: Vec<u64> = match self.by_sender.get(sender) {
+            Some(txs) => txs.range(..confirmed_nonce).map(|(&n, _)| n).collect(),
+            None => return (0, 0),
+        };
+        let mut freed_bytes = 0usize;
+        for nonce in &stale {
+            if let Some(entry) = self
+                .by_sender
+                .get_mut(sender)
+                .and_then(|m| m.remove(nonce))
+            {
+                freed_bytes += entry.raw_rlp.len();
+                self.by_hash.remove(&entry.hash);
+                self.by_price.remove(&TxPriority {
+                    max_fee_per_gas: entry.max_fee_per_gas,
+                    max_priority_fee: entry.max_priority_fee,
+                    hash: entry.hash,
+                });
+                self.size -= 1;
+            }
+        }
+        if self
+            .by_sender
+            .get(sender)
+            .map_or(true, |m| m.is_empty())
+        {
+            self.by_sender.remove(sender);
+        }
+        (stale.len(), freed_bytes)
+    }
+
     /// Drain transactions for a block proposal using k-way merge by gas price.
     ///
     /// For each sender, starts with their lowest-nonce tx. Picks highest gas price

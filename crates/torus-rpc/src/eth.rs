@@ -588,8 +588,11 @@ impl EthApiServer for RpcState {
     }
 
     async fn get_transaction_count(&self, addr: String, block: String) -> RpcResult<String> {
-        let _block = resolve_block_tag(&block, self.latest_height.load(Relaxed)).map_err(err)?;
         let address = parse_address(&addr).map_err(err)?;
+        if block == "pending" {
+            return Ok(hex_u64(self.mempool.pending_nonce(&address)));
+        }
+        let _block = resolve_block_tag(&block, self.latest_height.load(Relaxed)).map_err(err)?;
         Ok(hex_u64(
             self.state
                 .get_account(&address)

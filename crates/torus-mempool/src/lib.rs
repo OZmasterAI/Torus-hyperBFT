@@ -276,8 +276,21 @@ impl Mempool {
         (native, evm)
     }
 
+    /// Return the next nonce a sender should use, accounting for pending pool TXs.
+    ///
+    /// This is the "pending" nonce: state_nonce + count of consecutive in-pool
+    /// nonces starting from state_nonce. Clients use this to avoid nonce collisions
+    /// when submitting transactions faster than blocks commit.
+    pub fn pending_nonce(&self, sender: &alloy_primitives::Address) -> u64 {
+        let account = self.state.get_account(sender).ok().flatten();
+        let state_nonce = account.map(|a| a.nonce).unwrap_or(0);
+        let pool = self.evm.read().unwrap();
+        pool.pending_nonce(sender, state_nonce)
+    }
+
     /// Record which senders had txs/actions included in a committed block.
-    /// Updates the sliding-window rate tracker. Call after each block commit.
+    /// Updates the sliding-window rate tracker and prunes stale transactions
+    /// whose nonce is now below the sender's confirmed state nonce.
     pub fn notify_block_committed(
         &self,
         block_height: u64,
@@ -286,6 +299,32 @@ impl Mempool {
     ) {
         let mut tracker = self.rate_tracker.write().unwrap();
         tracker.record_block(block_height, evm_senders, native_senders);
+        drop(tracker);
+
+        if !evm_senders.is_empty() {
+            let mut pool = self.evm.write().unwrap();
+            let mut total_pruned = 0usize;
+            let mut total_freed = 0usize;
+            for sender in evm_senders {
+                let state_nonce = self
+                    .state
+                    .get_account(sender)
+                    .ok()
+                    .flatten()
+                    .map(|a| a.nonce)
+                    .unwrap_or(0);
+                let (pruned, freed) = pool.prune_confirmed(sender, state_nonce);
+                total_pruned += pruned;
+                total_freed += freed;
+            }
+            if total_freed > 0 {
+                self.memory_used
+                    .fetch_sub(total_freed, std::sync::atomic::Ordering::Relaxed);
+            }
+            if total_pruned > 0 {
+                tracing::debug!(pruned = total_pruned, "pruned stale txs after block commit");
+            }
+        }
     }
 }
 
@@ -952,5 +991,62 @@ mod tests {
         // Nonce 64 should still be accepted
         let raw = create_eip1559_tx(&k, 64, 1_000_000_000, 100_000_000, 21_000, U256::ZERO);
         pool.add_evm_tx(raw).unwrap();
+    }
+
+    #[test]
+    fn pending_nonce_consecutive() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state.clone(), MempoolConfig::default());
+        let k = key(92);
+        let addr = address_from_key(&k);
+        fund(&state, &addr, U256::from(10u64.pow(18)), 0);
+
+        assert_eq!(pool.pending_nonce(&addr), 0);
+
+        pool.add_evm_tx(create_eip1559_tx(&k, 0, 1_000_000_000, 100_000_000, 21_000, U256::ZERO)).unwrap();
+        assert_eq!(pool.pending_nonce(&addr), 1);
+
+        pool.add_evm_tx(create_eip1559_tx(&k, 1, 1_000_000_000, 100_000_000, 21_000, U256::ZERO)).unwrap();
+        assert_eq!(pool.pending_nonce(&addr), 2);
+    }
+
+    #[test]
+    fn pending_nonce_with_gap() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state.clone(), MempoolConfig::default());
+        let k = key(93);
+        let addr = address_from_key(&k);
+        fund(&state, &addr, U256::from(10u64.pow(18)), 0);
+
+        // Insert nonces 0 and 2 (skip 1) — pending nonce should be 1
+        pool.add_evm_tx(create_eip1559_tx(&k, 0, 1_000_000_000, 100_000_000, 21_000, U256::ZERO)).unwrap();
+        pool.add_evm_tx(create_eip1559_tx(&k, 2, 1_000_000_000, 100_000_000, 21_000, U256::ZERO)).unwrap();
+        assert_eq!(pool.pending_nonce(&addr), 1);
+
+        // Fill the gap — now pending nonce should jump to 3
+        pool.add_evm_tx(create_eip1559_tx(&k, 1, 1_000_000_000, 100_000_000, 21_000, U256::ZERO)).unwrap();
+        assert_eq!(pool.pending_nonce(&addr), 3);
+    }
+
+    #[test]
+    fn prune_after_block_commit() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state.clone(), MempoolConfig::default());
+        let k = key(94);
+        let addr = address_from_key(&k);
+        fund(&state, &addr, U256::from(10u64.pow(18)), 0);
+
+        for i in 0..4u64 {
+            pool.add_evm_tx(create_eip1559_tx(&k, i, 1_000_000_000, 100_000_000, 21_000, U256::ZERO)).unwrap();
+        }
+        assert_eq!(pool.evm_pool_size(), 4);
+
+        // Simulate block commit: advance state nonce to 2
+        fund(&state, &addr, U256::from(10u64.pow(18)), 2);
+        pool.notify_block_committed(1, &[addr], &[]);
+
+        // Nonces 0 and 1 should be pruned, 2 and 3 remain
+        assert_eq!(pool.evm_pool_size(), 2);
+        assert_eq!(pool.pending_nonce(&addr), 4);
     }
 }
