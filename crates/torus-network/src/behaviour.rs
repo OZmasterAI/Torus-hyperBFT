@@ -67,8 +67,10 @@ impl TorusBehaviour {
             request_response::Config::default().with_request_timeout(Duration::from_secs(10)),
         );
 
-        // Kademlia DHT
-        let kademlia = kad::Behaviour::new(peer_id, kad::store::MemoryStore::new(peer_id));
+        // Kademlia DHT — server mode so nodes respond to bootstrap queries
+        // and share peer addresses with each other.
+        let mut kademlia = kad::Behaviour::new(peer_id, kad::store::MemoryStore::new(peer_id));
+        kademlia.set_mode(Some(kad::Mode::Server));
 
         // Identify protocol
         let identify =
