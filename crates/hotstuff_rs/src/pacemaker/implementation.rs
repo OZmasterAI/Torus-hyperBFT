@@ -627,9 +627,8 @@ impl PacemakerState {
 
             // Add timeouts for all remaining views in the epoch of start_view.
             for view in start_view.int()..=epoch_view {
-                let time_to_view_deadline = Duration::from_secs(
-                    config.max_view_time.as_secs() * (view - start_view.int() + 1),
-                );
+                let time_to_view_deadline =
+                    config.max_view_time * (view - start_view.int() + 1) as u32;
                 timeouts.insert(ViewNumber::new(view), start_time + time_to_view_deadline);
             }
 
@@ -666,9 +665,8 @@ impl PacemakerState {
 
         // Populate `self.timeouts` with the timeouts of the views in the newly-entered epoch.
         for view in epoch_start_view.int()..=epoch_change_view {
-            let time_to_view_deadline = Duration::from_secs(
-                config.max_view_time.as_secs() * (view - epoch_start_view.int() + 1),
-            );
+            let time_to_view_deadline =
+                config.max_view_time * (view - epoch_start_view.int() + 1) as u32;
             self.timeouts.insert(
                 ViewNumber::new(view),
                 epoch_start_time + time_to_view_deadline,

@@ -16,7 +16,7 @@ use crate::config::NetworkConfig;
 use crate::peer::PeerMap;
 use crate::peer_scoring::{
     ConsensusRateLimiter, PeerScoring, PENALTY_INVALID_CONSENSUS_MSG, PENALTY_INVALID_TX,
-    PENALTY_EXCESSIVE_RATE, REWARD_BLOCK_RELAY,
+    REWARD_BLOCK_RELAY,
 };
 use crate::tx_gossip::TxGossipState;
 
@@ -244,11 +244,7 @@ fn handle_event(
                 // Rate-limit by cryptographic author, not forwarder — prevents
                 // a banned node from consuming honest relayers' rate-limit tokens.
                 if !consensus_rate_limiter.check_and_increment(&author) {
-                    peer_scoring.penalize(
-                        &author,
-                        PENALTY_EXCESSIVE_RATE,
-                        "consensus message rate exceeded",
-                    );
+                    debug!(%author, "consensus rate limit exceeded, dropping message");
                     return;
                 }
                 handle_consensus_gossip(&message.data, shared, peer_scoring, &author);
