@@ -371,27 +371,34 @@ fn handle_command(
                 }
             }
         }
-        NetworkCommand::Send { target: _, message } => {
-            // Use gossipsub instead of direct request-response for reliable
-            // delivery. Direct requests fail when peers aren't directly
-            // connected (only bootstrap peer has full mesh connectivity).
-            enqueue_inbound(&shared.inbound, *local_key, message.clone());
-            let mut envelope = local_key.to_bytes().to_vec();
-            if let Ok(msg_bytes) = message.try_to_vec() {
-                envelope.extend_from_slice(&msg_bytes);
-                match swarm
-                    .behaviour_mut()
-                    .gossipsub
-                    .publish(consensus_topic.clone(), envelope)
-                {
-                    Ok(_) => {
-                        if let Some(ref m) = shared.metrics {
-                            m.gossip_messages_sent.inc();
-                        }
+        NetworkCommand::Send { target, message } => {
+            if target == *local_key {
+                enqueue_inbound(&shared.inbound, *local_key, message);
+                return;
+            }
+            let peer_id = shared.peer_map.read().unwrap().get_peer_id(&target).copied();
+            if let Some(pid) = peer_id {
+                if let Ok(payload) = message.try_to_vec() {
+                    let req = DirectRequest {
+                        sender_key: local_key.to_bytes(),
+                        payload,
+                    };
+                    swarm.behaviour_mut().direct.send_request(&pid, req);
+                    if let Some(ref m) = shared.metrics {
+                        m.gossip_messages_sent.inc();
                     }
-                    Err(e) => {
-                        warn!("Failed to publish consensus message: {e:?}");
-                    }
+                }
+            } else {
+                // Peer not in map yet — fall back to gossipsub broadcast
+                warn!("Send target not in peer map, falling back to gossipsub");
+                enqueue_inbound(&shared.inbound, *local_key, message.clone());
+                let mut envelope = local_key.to_bytes().to_vec();
+                if let Ok(msg_bytes) = message.try_to_vec() {
+                    envelope.extend_from_slice(&msg_bytes);
+                    let _ = swarm
+                        .behaviour_mut()
+                        .gossipsub
+                        .publish(consensus_topic.clone(), envelope);
                 }
             }
         }
