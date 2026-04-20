@@ -1,0 +1,46 @@
+{
+  "prp": "commit-then-execute",
+  "created": "2026-04-20T02:20:00Z",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Extend ValidatedBlock with native context fields",
+      "status": "pending",
+      "files": ["crates/torus-bridge/src/validator.rs"],
+      "validate": "cargo check -p torus-bridge",
+      "depends_on": []
+    },
+    {
+      "id": 2,
+      "name": "Strip native execution from proposer build_block_with_native",
+      "status": "pending",
+      "files": ["crates/torus-bridge/src/proposer.rs"],
+      "validate": "cargo check -p torus-bridge",
+      "depends_on": []
+    },
+    {
+      "id": 3,
+      "name": "Strip native execution from validator validate_block_with_native",
+      "status": "pending",
+      "files": ["crates/torus-bridge/src/validator.rs"],
+      "validate": "cargo check -p torus-bridge",
+      "depends_on": [1]
+    },
+    {
+      "id": 4,
+      "name": "Add post-commit native execution in app.rs do_validate",
+      "status": "pending",
+      "files": ["crates/torus-consensus/src/app.rs"],
+      "validate": "cargo check -p torus-consensus",
+      "depends_on": [1, 2, 3]
+    },
+    {
+      "id": 5,
+      "name": "Full workspace compile and test",
+      "status": "pending",
+      "files": [],
+      "validate": "cargo test --workspace",
+      "depends_on": [4]
+    }
+  ]
+}
