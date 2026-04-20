@@ -5,7 +5,7 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use ed25519_dalek::VerifyingKey;
 use libp2p::futures::StreamExt;
 use libp2p::swarm::SwarmEvent;
-use libp2p::{gossipsub, identify, request_response, Multiaddr, PeerId, Swarm};
+use libp2p::{gossipsub, identify, kad, request_response, Multiaddr, PeerId, Swarm};
 use sha3::{Digest, Keccak256};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -34,6 +34,9 @@ pub enum NetworkCommand {
     },
     Dial {
         addr: Multiaddr,
+    },
+    DialPeer {
+        peer_id: PeerId,
     },
 }
 
@@ -98,6 +101,9 @@ pub async fn run_swarm_with_config(
     cleanup_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let stale_age = std::time::Duration::from_secs(3600); // 1 hour
 
+    let mut mesh_interval = tokio::time::interval(std::time::Duration::from_secs(10));
+    mesh_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     loop {
         let action = tokio::select! {
             event = swarm.select_next_some() => SwarmAction::Event(Box::new(event)),
@@ -106,6 +112,25 @@ pub async fn run_swarm_with_config(
             _ = cleanup_interval.tick() => {
                 peer_scoring.cleanup_stale(stale_age);
                 consensus_rate_limiter.cleanup_stale();
+                continue;
+            }
+            _ = mesh_interval.tick() => {
+                let local_pid = *swarm.local_peer_id();
+                let peer_map = shared.peer_map.read().unwrap();
+                let to_dial: Vec<PeerId> = peer_map.peer_ids()
+                    .filter(|pid| **pid != local_pid && !swarm.is_connected(pid))
+                    .copied()
+                    .collect();
+                drop(peer_map);
+                if !to_dial.is_empty() {
+                    let _ = swarm.behaviour_mut().kademlia.bootstrap();
+                    for pid in &to_dial {
+                        if let Err(e) = swarm.dial(*pid) {
+                            debug!(%pid, %e, "mesh maintenance dial failed");
+                        }
+                    }
+                    info!(missing = to_dial.len(), "mesh: dialing unconnected validators");
+                }
                 continue;
             }
         };
@@ -322,6 +347,7 @@ fn handle_event(
                     let count = swarm.connected_peers().count() as i64;
                     m.peers_connected.set(count);
                 }
+                let _ = swarm.behaviour_mut().kademlia.bootstrap();
             }
         }
         SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
@@ -337,6 +363,22 @@ fn handle_event(
         SwarmEvent::IncomingConnectionError { error, .. } => {
             warn!(%error, "incoming connection failed");
         }
+        SwarmEvent::Behaviour(TorusBehaviourEvent::Kademlia(
+            kad::Event::OutboundQueryProgressed { result: kad::QueryResult::Bootstrap(Ok(_)), .. }
+        )) => {
+            let local_pid = *swarm.local_peer_id();
+            let peer_map = shared.peer_map.read().unwrap();
+            let to_dial: Vec<PeerId> = peer_map.peer_ids()
+                .filter(|pid| **pid != local_pid && !swarm.is_connected(pid))
+                .copied()
+                .collect();
+            drop(peer_map);
+            for pid in to_dial {
+                info!(%pid, "kademlia bootstrap: dialing validator");
+                let _ = swarm.dial(pid);
+            }
+        }
+        SwarmEvent::Behaviour(TorusBehaviourEvent::Kademlia(_)) => {}
         _ => {}
     }
 }
@@ -409,6 +451,13 @@ fn handle_command(
         NetworkCommand::Dial { addr } => {
             if let Err(e) = swarm.dial(addr.clone()) {
                 warn!("Failed to dial {addr}: {e}");
+            }
+        }
+        NetworkCommand::DialPeer { peer_id } => {
+            if *swarm.local_peer_id() != peer_id && !swarm.is_connected(&peer_id) {
+                if let Err(e) = swarm.dial(peer_id) {
+                    debug!(%peer_id, "DialPeer failed: {e}");
+                }
             }
         }
     }

@@ -49,4 +49,8 @@ impl PeerMap {
     pub fn contains_vk(&self, vk: &VerifyingKey) -> bool {
         self.vk_to_peer.contains_key(&vk.to_bytes())
     }
+
+    pub fn peer_ids(&self) -> impl Iterator<Item = &PeerId> {
+        self.peer_to_vk.keys()
+    }
 }

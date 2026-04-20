@@ -153,6 +153,12 @@ impl Network for LibP2PNetwork {
             let peer_id = peer_id_from_verifying_key(vk);
             peer_map.insert(*vk, peer_id);
         }
+        drop(peer_map);
+        drop(validators);
+        for vk in validator_set.validators() {
+            let peer_id = peer_id_from_verifying_key(vk);
+            let _ = self.command_tx.send(NetworkCommand::DialPeer { peer_id });
+        }
     }
 
     fn update_validator_set(&mut self, updates: ValidatorSetUpdates) {
