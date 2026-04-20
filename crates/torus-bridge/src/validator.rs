@@ -6,13 +6,10 @@ use revm::database::BundleState;
 
 use torus_evm::{BlockEnvCfg, EvmExecutor};
 use torus_state::StateDb;
-use torus_types::{Receipt, TorusBlock};
+use torus_types::{NativeAction, Receipt, TorusBlock};
 
 use crate::decode::decode_all_txs;
 use crate::error::BridgeError;
-use crate::native_executor::{
-    sort_native_actions, NativeExecContext, NativeExecutor,
-};
 use crate::state_root::{
     compute_full_composite_root, compute_native_state_root, compute_post_bundle_state_root,
 };
@@ -26,15 +23,23 @@ pub struct ValidatedBlock {
     pub bundle: BundleState,
     /// Computed state root (matches the block header).
     pub state_root: B256,
+    /// Recovered (sender, action) pairs for post-commit native execution.
+    pub native_sender_actions: Vec<(Address, NativeAction)>,
+    /// Consumed nonces for post-commit persistence.
+    pub native_consumed_nonces: Vec<(Address, u64)>,
 }
 
 /// Validates proposed blocks by re-executing EVM transactions and verifying the state root.
 pub struct BlockValidator {
-    #[allow(dead_code)] // used in Phase 2 for native execution
+    #[allow(dead_code)]
     chain_id: u64,
+    #[allow(dead_code)]
     epoch_length: u64,
+    #[allow(dead_code)]
     max_validators: u32,
+    #[allow(dead_code)]
     treasury_address: Address,
+    #[allow(dead_code)]
     dev_pool_address: Address,
     pub metrics: Option<std::sync::Arc<torus_telemetry::Metrics>>,
 }
@@ -154,6 +159,8 @@ impl BlockValidator {
             receipts: exec_result.receipts,
             bundle: exec_result.bundle,
             state_root: computed_root,
+            native_sender_actions: vec![],
+            native_consumed_nonces: vec![],
         })
     }
 
@@ -219,27 +226,7 @@ impl BlockValidator {
             sender_actions.push((sender, signed.action.clone()));
         }
 
-        // Sort into pre-EVM and post-EVM groups.
-        let (pre_evm, post_evm) = sort_native_actions(&sender_actions);
-
-        // Create native execution context.
-        let mut ctx = NativeExecContext::new(
-            state_db.clone(),
-            block.header.height,
-            block.header.timestamp,
-            block.header.epoch,
-            self.epoch_length,
-            self.max_validators,
-            block.header.proposer,
-            self.treasury_address,
-            self.dev_pool_address,
-        );
-        ctx.metrics = self.metrics.clone();
-
-        // Phase 1: Execute pre-EVM native actions (cancellations, non-GTC orders).
-        NativeExecutor::execute_batch(&mut ctx, &pre_evm);
-
-        // Phase 2: Execute EVM transactions.
+        // Execute EVM transactions.
         let decoded_txs = decode_all_txs(&block.evm_transactions)?;
         let tx_envs: Vec<_> = decoded_txs.iter().map(|d| d.tx_env.clone()).collect();
 
@@ -285,50 +272,7 @@ impl BlockValidator {
             )));
         }
 
-        // Phase 3: Execute post-EVM native actions (GTC orders, lockbox, oracle, governance).
-        NativeExecutor::execute_batch(&mut ctx, &post_evm);
-
-        // Phase 4: Drain and execute CoreWriter queue from previous block.
-        // FIX EVM-FIND-12: Propagate drain errors — a failed drain means missing actions.
-        NativeExecutor::drain_core_writer(&mut ctx)?;
-
-        // Phase 5-7: Oracle aggregation, governance processing, liquidation checks
-        // are driven by the block-level helpers. In production, market lists and
-        // validator stakes come from the chain config / staking state.
-        NativeExecutor::process_governance(&mut ctx);
-
-        // Phase 8: Fee distribution.
-        NativeExecutor::distribute_fees(&mut ctx, exec_result.gas_used);
-
-        // Phase 9: Epoch boundary check.
-        if let Some(epoch_result) = NativeExecutor::process_epoch_boundary(&mut ctx) {
-            if let Some(ref diff) = epoch_result.diff {
-                if !diff.is_empty() {
-                    tracing::info!(
-                        inserts = diff.inserts.len(),
-                        deletes = diff.deletes.len(),
-                        "epoch boundary: validator set changed"
-                    );
-                }
-            }
-        }
-
-        // FIX ECON-FIND-02: Persist order book state after block execution.
-        ctx.save_order_books();
-
-        // FIX ECON-FIND-03: Persist consumed nonces for replay protection.
-        for (sender, nonce) in &consumed_nonces {
-            let mut nonce_key = [0u8; 28];
-            nonce_key[..20].copy_from_slice(sender.as_slice());
-            nonce_key[20..28].copy_from_slice(&nonce.to_be_bytes());
-            let _ = state_db.put_cf_raw(
-                torus_state::cf::CF_NATIVE_NONCES,
-                &nonce_key,
-                &block.header.height.to_be_bytes(),
-            );
-        }
-
-        // Compute composite state root (EVM bundle + native state).
+        // Compute composite state root (lagged native root — reads unmodified DB).
         let native_root = compute_native_state_root(state_db)?;
         let computed_root =
             compute_full_composite_root(state_db, &exec_result.bundle, native_root)?;
@@ -344,6 +288,8 @@ impl BlockValidator {
             receipts: exec_result.receipts,
             bundle: exec_result.bundle,
             state_root: computed_root,
+            native_sender_actions: sender_actions,
+            native_consumed_nonces: consumed_nonces,
         })
     }
 }

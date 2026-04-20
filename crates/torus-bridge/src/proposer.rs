@@ -10,7 +10,6 @@ use torus_types::{SignedNativeAction, TorusBlock, TorusBlockHeader};
 
 use crate::decode::{decode_all_txs, DecodedTx};
 use crate::error::BridgeError;
-use crate::native_executor::{sort_native_actions, NativeExecContext, NativeExecutor};
 use crate::state_root::{compute_full_composite_root, compute_native_state_root, compute_post_bundle_state_root};
 
 /// Result of a block proposal.
@@ -23,11 +22,14 @@ pub struct ProposedBlock {
 
 /// Constructs valid `TorusBlock`s ready for consensus.
 pub struct BlockProposer {
-    #[allow(dead_code)] // used in Phase 2 for native execution
+    #[allow(dead_code)]
     chain_id: u64,
     epoch_length: u64,
+    #[allow(dead_code)]
     max_validators: u32,
+    #[allow(dead_code)]
     treasury_address: Address,
+    #[allow(dead_code)]
     dev_pool_address: Address,
     pub metrics: Option<std::sync::Arc<torus_telemetry::Metrics>>,
 }
@@ -159,13 +161,10 @@ impl BlockProposer {
         // SignedNativeActions are kept intact in the block so validators can
         // independently verify signatures during consensus validation.
         // FIX ECON-FIND-03: Check persistent nonces to prevent replay.
-        let mut sender_actions = Vec::with_capacity(signed_native_actions.len());
-        let mut consumed_nonces: Vec<(Address, u64)> = Vec::new();
         for signed in &signed_native_actions {
             let sender = signed
                 .recover_sender()
                 .map_err(|e| BridgeError::SignatureRecovery(format!("{e}")))?;
-            // Replay check: skip actions with already-consumed nonces.
             let mut nonce_key = [0u8; 28];
             nonce_key[..20].copy_from_slice(sender.as_slice());
             nonce_key[20..28].copy_from_slice(&signed.nonce.to_be_bytes());
@@ -175,33 +174,10 @@ impl BlockProposer {
                 .is_some()
             {
                 tracing::warn!(%sender, nonce = signed.nonce, "skipping replayed native action");
-                continue;
             }
-            consumed_nonces.push((sender, signed.nonce));
-            sender_actions.push((sender, signed.action.clone()));
         }
 
-        // Sort into pre-EVM and post-EVM groups.
-        let (pre_evm, post_evm) = sort_native_actions(&sender_actions);
-
-        // Create native execution context.
-        let mut ctx = NativeExecContext::new(
-            state_db.clone(),
-            block_height,
-            timestamp,
-            parent.epoch,
-            self.epoch_length,
-            self.max_validators,
-            proposer,
-            self.treasury_address,
-            self.dev_pool_address,
-        );
-        ctx.metrics = self.metrics.clone();
-
-        // Phase 1: Execute pre-EVM native actions (cancellations, non-GTC orders).
-        NativeExecutor::execute_batch(&mut ctx, &pre_evm);
-
-        // Phase 2: Execute EVM transactions.
+        // Execute EVM transactions.
         let decoded_txs = decode_all_txs(&evm_transactions)?;
         let tx_envs: Vec<_> = decoded_txs.iter().map(|d| d.tx_env.clone()).collect();
 
@@ -216,48 +192,7 @@ impl BlockProposer {
         let mut exec_result = evm_executor.execute_block(state_db, &block_cfg, tx_envs)?;
         set_receipt_metadata(&mut exec_result, &decoded_txs, block_height);
 
-        // Phase 3: Execute post-EVM native actions (GTC orders, lockbox, oracle, etc.).
-        NativeExecutor::execute_batch(&mut ctx, &post_evm);
-
-        // Phase 4: Drain and execute CoreWriter queue from previous block.
-        // FIX EVM-FIND-12: Propagate drain errors — a failed drain means missing actions.
-        NativeExecutor::drain_core_writer(&mut ctx)?;
-
-        // Phase 5: Process pending governance proposals.
-        NativeExecutor::process_governance(&mut ctx);
-
-        // Phase 6: Fee distribution.
-        NativeExecutor::distribute_fees(&mut ctx, exec_result.gas_used);
-
-        // Phase 7: Epoch boundary check.
-        if let Some(epoch_result) = NativeExecutor::process_epoch_boundary(&mut ctx) {
-            if let Some(ref diff) = epoch_result.diff {
-                if !diff.is_empty() {
-                    tracing::info!(
-                        inserts = diff.inserts.len(),
-                        deletes = diff.deletes.len(),
-                        "epoch boundary: validator set changed"
-                    );
-                }
-            }
-        }
-
-        // FIX ECON-FIND-02: Persist order book state after block execution.
-        ctx.save_order_books();
-
-        // FIX ECON-FIND-03: Persist consumed nonces for replay protection.
-        for (sender, nonce) in &consumed_nonces {
-            let mut nonce_key = [0u8; 28];
-            nonce_key[..20].copy_from_slice(sender.as_slice());
-            nonce_key[20..28].copy_from_slice(&nonce.to_be_bytes());
-            let _ = state_db.put_cf_raw(
-                torus_state::cf::CF_NATIVE_NONCES,
-                &nonce_key,
-                &block_height.to_be_bytes(),
-            );
-        }
-
-        // Compute composite state root.
+        // Compute composite state root (lagged native root — reads unmodified DB).
         let native_root = compute_native_state_root(state_db)?;
         let state_root = compute_full_composite_root(state_db, &exec_result.bundle, native_root)?;
         let receipts_root = compute_receipts_root(&exec_result.receipts)

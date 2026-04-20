@@ -1,5 +1,5 @@
 #!/bin/bash
-# tx-loop.sh — 8 hardhat accounts send random TRS to each other (~2 tx/sec).
+# tx-loop.sh — 8 hardhat accounts send random TRS to each other (~10 tx/sec).
 # Usage: bash tx-loop.sh [rpc_url]
 # Requires: cast (foundry)
 set -o pipefail
@@ -8,9 +8,7 @@ EVM_URL="${1:-http://localhost:8545}"
 CHAIN_ID=7778
 GAS_PRICE="100000000000000"
 
-# 8 hardhat well-known dev keys — each account sends once every 4s,
-# so its previous TX has time to land in a block before the next nonce.
-# (NEVER use in production)
+# 8 hardhat well-known dev keys (NEVER use in production)
 KEYS=(
     "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
     "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
@@ -64,7 +62,7 @@ for i in "${!ADDRS[@]}"; do
 done
 
 echo ""
-echo "Sending ~2 tx/sec (round-robin across $NUM_KEYS accounts)"
+echo "Sending ~10 tx/sec (round-robin across $NUM_KEYS accounts)"
 echo "Press Ctrl+C to stop"
 echo ""
 
@@ -110,5 +108,5 @@ while true; do
         echo "[$TIMESTAMP] #$COUNT | ${TRS_AMOUNT} TRS | ${S_SHORT}→${R_SHORT} | ${TX_HASH:0:18}..."
     fi
 
-    sleep 0.5
+    sleep 0.1
 done
