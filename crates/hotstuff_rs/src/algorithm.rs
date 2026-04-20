@@ -138,9 +138,9 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
             }
 
             // 2. Let the pacemaker update its internal state if needed.
-            self.pacemaker
-                .tick(&self.block_tree)
-                .expect("Pacemaker failure!");
+            if let Err(e) = self.pacemaker.tick(&self.block_tree) {
+                log::error!("Pacemaker tick error: {:?} — continuing", e);
+            }
 
             // 3. Query the pacemaker for potential updates to the current view.
             let view_info = self.pacemaker.query();
@@ -148,9 +148,13 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
             // 4. In case the view has been updated, update HotStuff's internal view and perform
             // the necessary protocol steps.
             if self.hotstuff.is_view_outdated(view_info) {
-                self.hotstuff
+                if let Err(e) = self
+                    .hotstuff
                     .enter_view(view_info.clone(), &mut self.block_tree, &mut self.app)
-                    .expect("HotStuff failure!")
+                {
+                    log::error!("HotStuff enter_view error (view={}): {:?} — skipping view", view_info.view.int(), e);
+                    continue;
+                }
             }
 
             // 5. Poll the network for incoming messages.
@@ -159,18 +163,30 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
                 .recv(self.chain_id, view_info.view, view_info.deadline)
             {
                 Ok((origin, msg)) => match msg {
-                    ProgressMessage::HotStuffMessage(msg) => self
-                        .hotstuff
-                        .on_receive_msg(msg, &origin, &mut self.block_tree, &mut self.app)
-                        .expect("HotStuff failure!"),
-                    ProgressMessage::PacemakerMessage(msg) => self
-                        .pacemaker
-                        .on_receive_msg(msg, &origin, &mut self.block_tree)
-                        .expect("Pacemaker failure!"),
-                    ProgressMessage::BlockSyncAdvertiseMessage(msg) => self
-                        .block_sync_client
-                        .on_receive_msg(msg, &origin, &mut self.block_tree, &mut self.app)
-                        .expect("Block Sync Client failure!"),
+                    ProgressMessage::HotStuffMessage(msg) => {
+                        if let Err(e) = self
+                            .hotstuff
+                            .on_receive_msg(msg, &origin, &mut self.block_tree, &mut self.app)
+                        {
+                            log::error!("HotStuff on_receive_msg error: {:?} — dropping message", e);
+                        }
+                    }
+                    ProgressMessage::PacemakerMessage(msg) => {
+                        if let Err(e) = self
+                            .pacemaker
+                            .on_receive_msg(msg, &origin, &mut self.block_tree)
+                        {
+                            log::error!("Pacemaker on_receive_msg error: {:?} — dropping message", e);
+                        }
+                    }
+                    ProgressMessage::BlockSyncAdvertiseMessage(msg) => {
+                        if let Err(e) = self
+                            .block_sync_client
+                            .on_receive_msg(msg, &origin, &mut self.block_tree, &mut self.app)
+                        {
+                            log::error!("BlockSync on_receive_msg error: {:?} — dropping message", e);
+                        }
+                    }
                 },
                 Err(ProgressMessageReceiveError::Disconnected) => {
                     panic!("The poller has disconnected!")
@@ -179,9 +195,12 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
             }
 
             // 6. Let the block sync client update its internal state, and trigger sync if needed.
-            self.block_sync_client
+            if let Err(e) = self
+                .block_sync_client
                 .tick(&mut self.block_tree, &mut self.app)
-                .expect("Block Sync Client failure!")
+            {
+                log::error!("BlockSync tick error: {:?} — continuing", e);
+            }
         }
     }
 }

@@ -15,6 +15,8 @@
         "chain_id": 7778
     },
     "economics": {
+        "treasury_address": "0xf000000000000000000000000000000000000001",
+        "dev_pool_address": "0xf000000000000000000000000000000000000002",
         "fee_split": {
             "start": { "burn": 1000, "validator": 0, "treasury": 4500, "dev_pool": 4500 },
             "end": { "burn": 2500, "validator": 2500, "treasury": 2500, "dev_pool": 2500 },

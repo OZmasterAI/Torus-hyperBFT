@@ -93,6 +93,10 @@ pub struct EvmConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct EconomicsConfig {
+    #[serde(default)]
+    pub treasury_address: Option<String>,
+    #[serde(default)]
+    pub dev_pool_address: Option<String>,
     pub fee_split: FeeSplitConfig,
     pub permanent_staking: PermanentStakingConfig,
     pub validator: ValidatorConstraints,
@@ -343,8 +347,18 @@ impl Genesis {
             fee_validator_bps: self.economics.fee_split.start.validator,
             fee_treasury_bps: self.economics.fee_split.start.treasury,
             fee_dev_pool_bps: self.economics.fee_split.start.dev_pool,
-            treasury_address: Address::ZERO,
-            dev_pool_address: Address::ZERO,
+            treasury_address: self
+                .economics
+                .treasury_address
+                .as_deref()
+                .and_then(|s| parse_address(s).ok())
+                .unwrap_or(Address::ZERO),
+            dev_pool_address: self
+                .economics
+                .dev_pool_address
+                .as_deref()
+                .and_then(|s| parse_address(s).ok())
+                .unwrap_or(Address::ZERO),
         }
     }
 
@@ -424,6 +438,8 @@ mod tests {
                 "chain_id": 7778
             },
             "economics": {
+                "treasury_address": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "dev_pool_address": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
                 "fee_split": {
                     "start": { "burn": 1000, "validator": 0, "treasury": 4500, "dev_pool": 4500 },
                     "end": { "burn": 2500, "validator": 2500, "treasury": 2500, "dev_pool": 2500 },
@@ -496,6 +512,14 @@ mod tests {
         assert_eq!(config.epoch_length, 100);
         assert_eq!(config.fee_burn_bps, 1000);
         assert_eq!(config.fee_treasury_bps, 4500);
+        assert_eq!(
+            config.treasury_address,
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".parse::<Address>().unwrap()
+        );
+        assert_eq!(
+            config.dev_pool_address,
+            "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".parse::<Address>().unwrap()
+        );
     }
 
     #[test]
