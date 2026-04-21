@@ -4,7 +4,6 @@ rustflags = ["-C", "link-arg=-fuse-ld=mold"]
 
 [build]
 jobs = 8
-rustc-wrapper = "sccache"
 
 [profile.dev]
 split-debuginfo = "unpacked"
