@@ -9,9 +9,6 @@ jobs = 6
 split-debuginfo = "unpacked"
 codegen-backend = "cranelift"
 
-[profile.dev.package.ethnum]
-codegen-backend = "llvm"
-
 [env]
 # Cache only librocksdb-sys C++ compilation via sccache
 CC_librocksdb_sys = "sccache cc"
