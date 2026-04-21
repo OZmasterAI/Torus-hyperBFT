@@ -3,7 +3,7 @@ linker = "clang"
 rustflags = ["-C", "link-arg=-fuse-ld=mold"]
 
 [build]
-jobs = 8
+jobs = 6
 
 [profile.dev]
 split-debuginfo = "unpacked"
