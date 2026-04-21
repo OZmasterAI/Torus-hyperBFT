@@ -19,6 +19,7 @@ use serde::Deserialize;
 use tracing::info;
 
 use torus_economics::types::{ValidatorState, ValidatorStatus};
+use torus_economics::{GovernanceManager, GovernanceParams};
 use torus_state::cf::CF_STAKING_VALIDATORS;
 use torus_state::db::KECCAK_EMPTY;
 use torus_state::trie::compute_state_root_from_db;
@@ -326,7 +327,19 @@ impl Genesis {
             info!(%address, %amount, "seeded genesis permanent stake");
         }
 
-        // 5. Compute state root
+        // 5. Seed governance params
+        let treasury_address = self
+            .economics
+            .treasury_address
+            .as_deref()
+            .and_then(|s| parse_address(s).ok())
+            .unwrap_or(Address::ZERO);
+        let gov = GovernanceManager::new(state_db.clone());
+        gov.set_governance_params(&GovernanceParams::defaults(treasury_address))
+            .map_err(|e| GenesisError::InvalidHex(format!("governance params: {e}")))?;
+        info!(%treasury_address, "seeded governance params");
+
+        // 6. Compute state root
         let state_root = compute_state_root_from_db(state_db)?;
         info!(%state_root, "genesis state root computed");
         Ok(state_root)

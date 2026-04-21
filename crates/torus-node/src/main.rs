@@ -34,7 +34,7 @@ mod keystore;
 #[command(
     name = "torus-node",
     version,
-    about = "Torus-hyperBFT validator node"
+    about = "Torus-hyperBFT node (validator or RPC-only)"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -92,6 +92,11 @@ struct Cli {
     /// Metrics (Prometheus) listen address
     #[arg(long, default_value = "0.0.0.0:9090")]
     metrics_addr: SocketAddr,
+
+    /// Run as a non-validator RPC node. Syncs blocks from peers but does not
+    /// participate in consensus. No validator key required.
+    #[arg(long)]
+    rpc_only: bool,
 }
 
 #[derive(clap::Subcommand)]
@@ -212,13 +217,20 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         warn!("--validator-key is deprecated and insecure (visible in ps/history). Use --keystore instead.");
         let key_bytes = decode_hex_key(hex_key)?;
         SigningKey::from_bytes(&key_bytes)
+    } else if cli.rpc_only {
+        let mut seed = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut seed);
+        let key = SigningKey::from_bytes(&seed);
+        info!("rpc-only mode: generated ephemeral key for network identity");
+        key
     } else {
-        return Err("either --keystore or --validator-key must be provided".into());
+        return Err("either --keystore or --validator-key must be provided (or use --rpc-only)".into());
     };
     let verifying_key = signing_key.verifying_key();
     info!(
         pubkey = hex::encode(verifying_key.as_bytes()),
-        "loaded validator key"
+        mode = if cli.rpc_only { "rpc-only" } else { "validator" },
+        "loaded node key"
     );
 
     // 2b. Restore from snapshot if requested (Phase 3: 3.1.6)

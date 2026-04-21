@@ -159,10 +159,16 @@ impl<N: Network> BlockSyncClient<N> {
         self.block_sync_client_state
             .remove_expired_blacklisted_servers();
 
-        // 2. Update highest_pc_view if needed.
+        // 2. Update progress timer based on committed height, not PC view.
+        //    PC view advances even for non-validator nodes that can't commit,
+        //    so using it would prevent sync from ever triggering.
         let highest_pc_view = block_tree.highest_pc()?.view;
         if highest_pc_view > self.block_sync_client_state.highest_pc_view {
             self.block_sync_client_state.highest_pc_view = highest_pc_view;
+        }
+        let committed_height = block_tree.highest_committed_block_height()?;
+        if committed_height != self.block_sync_client_state.last_committed_height {
+            self.block_sync_client_state.last_committed_height = committed_height;
             self.block_sync_client_state.last_progress_or_sync_time = Instant::now();
         }
 
@@ -509,12 +515,15 @@ struct BlockSyncClientState {
     blacklist: VecDeque<(VerifyingKey, Instant)>,
 
     /// The most recent instant in time when either:
-    /// 1. Progress was made (the highest PC was updated).
+    /// 1. Progress was made (committed block height advanced).
     /// 2. The block sync procedure was completed (not necessarily successfully).
     last_progress_or_sync_time: Instant,
 
     /// Cached value of `block_tree.highest_pc().view`.
     highest_pc_view: ViewNumber,
+
+    /// Cached highest committed block height for stall detection.
+    last_committed_height: Option<BlockHeight>,
 }
 
 impl BlockSyncClientState {
@@ -525,6 +534,7 @@ impl BlockSyncClientState {
             blacklist: VecDeque::new(),
             last_progress_or_sync_time: Instant::now(),
             highest_pc_view: ViewNumber::new(0),
+            last_committed_height: None,
         }
     }
 
