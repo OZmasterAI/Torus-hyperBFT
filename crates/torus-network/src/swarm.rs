@@ -318,12 +318,23 @@ fn handle_event(
             info,
             ..
         })) => {
-            // Don't add banned peers to Kademlia
             if peer_scoring.is_banned(&peer_id) {
                 return;
             }
+            // Extract ed25519 key before consuming other fields.
+            let maybe_vk = info.public_key.try_into_ed25519().ok()
+                .and_then(|ed_pk| VerifyingKey::from_bytes(&ed_pk.to_bytes()).ok());
             for addr in info.listen_addrs {
                 swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
+            }
+            // Register non-validator peers (e.g. RPC nodes) so verify_sender_key
+            // accepts their direct messages (block sync requests).
+            if let Some(vk) = maybe_vk {
+                let mut pm = shared.peer_map.write().unwrap();
+                if !pm.contains_vk(&vk) {
+                    pm.insert(vk, peer_id);
+                    info!(%peer_id, "registered peer from identify exchange");
+                }
             }
         }
         // FIX 6 (CONS-FIND-25-32): Sync protocol events.
@@ -351,6 +362,15 @@ fn handle_event(
             if let Some(ref m) = shared.metrics {
                 let count = swarm.connected_peers().count() as i64;
                 m.peers_connected.set(count);
+            }
+            // Clean up non-validator peers from peer_map to prevent unbounded growth.
+            let validators = shared.validators.read().unwrap();
+            let mut pm = shared.peer_map.write().unwrap();
+            if let Some(vk) = pm.get_vk(&peer_id).copied() {
+                if !validators.contains(&vk.to_bytes()) {
+                    pm.remove_by_vk(&vk);
+                    debug!(%peer_id, "removed non-validator peer from peer map");
+                }
             }
         }
         SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {

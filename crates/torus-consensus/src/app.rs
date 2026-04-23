@@ -371,7 +371,10 @@ impl TorusApp {
         let block = request.proposed_block();
         let datums = block.data.vec();
 
+        tracing::info!(datums_len = datums.len(), block_height = block.height.int(), "do_validate: datum count");
+
         if datums.len() != 1 {
+            tracing::warn!(datums_len = datums.len(), "do_validate: REJECTED — datums.len() != 1");
             return ValidateBlockResponse::Invalid;
         }
 
@@ -380,13 +383,17 @@ impl TorusApp {
         // Verify data hash.
         let computed = Self::hash_datum(datum_bytes);
         if block.data_hash != CryptoHash::new(computed) {
+            tracing::warn!(datum_len = datum_bytes.len(), "do_validate: REJECTED — data_hash mismatch");
             return ValidateBlockResponse::Invalid;
         }
 
         // Deserialize.
         let torus_block: TorusBlock = match serde_json::from_slice(datum_bytes) {
             Ok(b) => b,
-            Err(_) => return ValidateBlockResponse::Invalid,
+            Err(e) => {
+                tracing::warn!(%e, "do_validate: REJECTED — deserialization failed");
+                return ValidateBlockResponse::Invalid;
+            }
         };
 
         let has_native = !torus_block.native_actions.is_empty();

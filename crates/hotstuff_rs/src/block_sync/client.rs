@@ -176,6 +176,11 @@ impl<N: Network> BlockSyncClient<N> {
         if Instant::now() - self.block_sync_client_state.last_progress_or_sync_time
             >= self.config.block_sync_trigger_timeout
         {
+            log::info!(
+                "block_sync: timeout trigger fired, available_servers={}, committed_height={:?}",
+                self.block_sync_client_state.available_sync_servers.len(),
+                committed_height,
+            );
             self.sync(block_tree, app)?;
             self.block_sync_client_state.last_progress_or_sync_time = Instant::now();
         };
@@ -268,8 +273,10 @@ impl<N: Network> BlockSyncClient<N> {
             .block_sync_client_state
             .random_sync_server(&highest_committed_block_height)
         {
+            log::info!("block_sync: starting sync with peer, our committed_height={:?}", highest_committed_block_height);
             self.sync_with(&peer, block_tree, app)
         } else {
+            log::warn!("block_sync: no available sync servers, cannot sync");
             Ok(())
         }
     }
@@ -334,11 +341,13 @@ impl<N: Network> BlockSyncClient<N> {
                 .recv_response(*peer, Instant::now() + self.config.response_timeout)
             {
                 Ok(response) => {
+                    log::info!("block_sync: got response with {} blocks", response.blocks.len());
                     let new_blocks: Vec<Block> = response
                         .blocks
                         .into_iter()
                         .skip_while(|block| block_tree.contains(&block.hash))
                         .collect();
+                    log::info!("block_sync: {} new blocks after filtering", new_blocks.len());
                     if new_blocks.is_empty() {
                         // Check if the server's commitment to providing blocks at least up to a given height was observed.
                         // If not, blacklist the server.
@@ -365,11 +374,16 @@ impl<N: Network> BlockSyncClient<N> {
                         return Ok(());
                     }
 
-                    for block in new_blocks {
+                    for (block_idx, block) in new_blocks.iter().enumerate() {
+                        log::info!(
+                            "block_sync: processing block {}/{}, hash={:?}, justify.view={}, justify.is_genesis={}",
+                            block_idx + 1, new_blocks.len(), &block.hash.bytes()[..4],
+                            block.justify.view.int(), block.justify.is_genesis_pc(),
+                        );
                         if !block.is_correct(block_tree)?
-                            || !safe_block(&block, block_tree, self.config.chain_id)?
+                            || !safe_block(block, block_tree, self.config.chain_id)?
                         {
-                            // Blacklist the sync server.
+                            log::warn!("block_sync: block {} failed is_correct/safe_block, blacklisting", block_idx + 1);
                             self.block_sync_client_state.blacklist_sync_server(
                                 peer.clone(),
                                 self.config.blacklist_expiry_time,
@@ -390,16 +404,15 @@ impl<N: Network> BlockSyncClient<N> {
                         };
 
                         let validate_block_request =
-                            ValidateBlockRequest::new(&block, block_tree.app_view(parent_block)?);
+                            ValidateBlockRequest::new(block, block_tree.app_view(parent_block)?);
 
                         if let ValidateBlockResponse::Valid {
                             app_state_updates,
                             validator_set_updates,
                         } = app.validate_block_for_sync(validate_block_request)
                         {
-                            // 1. Insert the block into the block tree.
                             block_tree.insert(
-                                &block,
+                                block,
                                 app_state_updates.as_ref(),
                                 validator_set_updates.as_ref(),
                             )?;
@@ -409,7 +422,6 @@ impl<N: Network> BlockSyncClient<N> {
                             })
                             .publish(&self.event_publisher);
 
-                            // 2. Trigger block tree updates: update highest PC, lock, commit.
                             let committed_validator_set_updates =
                                 block_tree.update(&block.justify, &self.event_publisher)?;
 
@@ -419,8 +431,9 @@ impl<N: Network> BlockSyncClient<N> {
                             }
 
                             blocks_synced += 1;
+                            log::info!("block_sync: block {} inserted+updated, blocks_synced={}", block_idx + 1, blocks_synced);
                         } else {
-                            // Blacklist the sync server.
+                            log::warn!("block_sync: block {} failed app validation, blacklisting", block_idx + 1);
                             self.block_sync_client_state.blacklist_sync_server(
                                 peer.clone(),
                                 self.config.blacklist_expiry_time,
@@ -441,8 +454,9 @@ impl<N: Network> BlockSyncClient<N> {
                         }
                     }
                 }
-                Err(BlockSyncResponseReceiveError::Disconnected)
-                | Err(BlockSyncResponseReceiveError::Timeout) => {
+                Err(ref e @ BlockSyncResponseReceiveError::Disconnected)
+                | Err(ref e @ BlockSyncResponseReceiveError::Timeout) => {
+                    log::warn!("block_sync: sync response error: {:?}", e);
                     // Check if the server's commitment to providing blocks at least up to a given height was observed.
                     // If not, blacklist the server.
                     let min_blocks_expected = *self

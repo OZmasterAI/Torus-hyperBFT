@@ -630,9 +630,16 @@ impl<N: Network> HotStuff<N> {
         }
 
         // 1. Check if block is correct and safe.
-        if !proposal.block.is_correct(block_tree)?
-            || !safe_block(&proposal.block, block_tree, self.config.chain_id)?
-        {
+        let is_correct = proposal.block.is_correct(block_tree)?;
+        let is_safe = if is_correct { safe_block(&proposal.block, block_tree, self.config.chain_id)? } else { false };
+        if !is_correct || !is_safe {
+            log::warn!(
+                "dropping proposal: view={}, is_correct={}, is_safe={}, justify_block_known={}",
+                self.view_info.view.int(),
+                is_correct,
+                is_safe,
+                block_tree.contains(&proposal.block.justify.block),
+            );
             // Ensure that proposals or nudges from this leader should no longer be accepted in this view.
             match self.proposal_status {
                 ProposalStatus::WaitingForProposal => {

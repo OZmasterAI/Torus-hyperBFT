@@ -149,15 +149,19 @@ pub trait KVGet {
         match data_len {
             None => Ok(None),
             Some(len) => {
-                let mut data = (0..len.int()).map(|i| self.block_datum(block, i));
-                if let None = data.find(|datum| datum.is_none()) {
-                    Ok(Some(Data::new(data.map(|datum| datum.unwrap()).collect())))
-                } else {
+                let datums: Vec<Option<Datum>> = (0..len.int())
+                    .map(|i| self.block_datum(block, i))
+                    .collect();
+                if datums.iter().any(|d| d.is_none()) {
                     Err(KVGetError::ValueExpectedButNotFound {
                         key: Key::BlockData {
                             block: block.clone(),
                         },
                     })
+                } else {
+                    Ok(Some(Data::new(
+                        datums.into_iter().map(|d| d.unwrap()).collect(),
+                    )))
                 }
             }
         }
