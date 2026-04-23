@@ -15,17 +15,14 @@ use ed25519_dalek::VerifyingKey;
 
 use crate::{
     app::App,
-    block_sync::{
-        client::{BlockSyncClient, BlockSyncClientConfiguration},
-        messages::BlockSyncResponse,
-    },
+    block_sync::client::{BlockSyncClient, BlockSyncClientConfiguration},
     block_tree::{accessors::internal::BlockTreeSingleton, pluggables::KVStore},
     events::*,
     hotstuff::implementation::{HotStuff, HotStuffConfiguration},
     networking::{
         messages::ProgressMessage,
         network::{Network, ValidatorSetUpdateHandle},
-        receiving::{BlockSyncClientStub, ProgressMessageReceiveError, ProgressMessageStub},
+        receiving::{ProgressMessageReceiveError, ProgressMessageStub},
         sending::SenderHandle,
     },
     pacemaker::implementation::{Pacemaker, PacemakerConfiguration},
@@ -58,12 +55,12 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
         network: N,
         progress_msg_receiver: Receiver<(VerifyingKey, ProgressMessage)>,
         progress_msg_buffer_capacity: BufferSize,
-        block_sync_response_receiver: Receiver<(VerifyingKey, BlockSyncResponse)>,
+        worker_commands: Sender<super::block_sync::worker::SyncCommand>,
+        worker_results: Receiver<super::block_sync::worker::SyncResult>,
         shutdown_signal: Receiver<()>,
         event_publisher: Option<Sender<Event>>,
     ) -> Self {
         let pm_stub = ProgressMessageStub::new(progress_msg_receiver, progress_msg_buffer_capacity);
-        let block_sync_client_stub = BlockSyncClientStub::new(block_sync_response_receiver);
         let msg_sender: SenderHandle<N> = SenderHandle::new(network.clone());
         let validator_set_update_handle = ValidatorSetUpdateHandle::new(network);
 
@@ -103,8 +100,8 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
 
         let block_sync_client = BlockSyncClient::new(
             block_sync_client_config,
-            block_sync_client_stub,
-            msg_sender,
+            worker_commands,
+            worker_results,
             validator_set_update_handle,
             event_publisher.clone(),
         );
@@ -157,7 +154,18 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
                 }
             }
 
-            // 5. Poll the network for incoming messages.
+            // 5. Poll the sync worker for fetched blocks (non-blocking).
+            self.block_sync_client.poll_worker_results();
+
+            // 6. Process one pending sync block if available (non-blocking).
+            if let Err(e) = self
+                .block_sync_client
+                .process_pending_block(&mut self.block_tree, &mut self.app)
+            {
+                log::error!("BlockSync process_pending_block error: {:?} — continuing", e);
+            }
+
+            // 7. Poll the network for incoming messages.
             match self
                 .pm_stub
                 .recv(self.chain_id, view_info.view, view_info.deadline)
@@ -182,7 +190,7 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
                     ProgressMessage::BlockSyncAdvertiseMessage(msg) => {
                         if let Err(e) = self
                             .block_sync_client
-                            .on_receive_msg(msg, &origin, &mut self.block_tree, &mut self.app)
+                            .on_receive_msg(msg, &origin, &mut self.block_tree)
                         {
                             log::error!("BlockSync on_receive_msg error: {:?} — dropping message", e);
                         }
@@ -194,10 +202,10 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
                 Err(ProgressMessageReceiveError::Timeout) => {}
             }
 
-            // 6. Let the block sync client update its internal state, and trigger sync if needed.
+            // 8. Let the block sync client update its internal state, and trigger sync if needed.
             if let Err(e) = self
                 .block_sync_client
-                .tick(&mut self.block_tree, &mut self.app)
+                .tick(&mut self.block_tree)
             {
                 log::error!("BlockSync tick error: {:?} — continuing", e);
             }

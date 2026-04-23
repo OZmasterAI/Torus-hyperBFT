@@ -125,6 +125,7 @@ use crate::{
     block_sync::{
         client::BlockSyncClientConfiguration,
         server::{BlockSyncServer, BlockSyncServerConfiguration},
+        worker::BlockSyncWorker,
     },
     block_tree::{
         accessors::{internal::BlockTreeSingleton, public::BlockTreeCamera},
@@ -506,6 +507,20 @@ impl<K: KVStore, A: App<K> + 'static, N: Network + 'static> ReplicaSpec<K, A, N>
         );
         let block_sync_server = block_sync_server.start();
 
+        // Spawn the block sync worker thread — handles fetch I/O off the algorithm thread.
+        let (worker_cmd_sender, worker_cmd_receiver) = mpsc::channel();
+        let (worker_result_sender, worker_result_receiver) = mpsc::channel();
+        let (worker_shutdown, worker_shutdown_receiver) = mpsc::channel();
+        let block_sync_worker = BlockSyncWorker::new(
+            crate::networking::receiving::BlockSyncClientStub::new(block_sync_responses),
+            self.network.clone(),
+            block_sync_client_config.response_timeout,
+            worker_cmd_receiver,
+            worker_result_sender,
+            worker_shutdown_receiver,
+        );
+        let block_sync_worker = block_sync_worker.start();
+
         let (algorithm_shutdown, algorithm_shutdown_receiver) = mpsc::channel();
         let algorithm = Algorithm::new(
             chain_id,
@@ -517,7 +532,8 @@ impl<K: KVStore, A: App<K> + 'static, N: Network + 'static> ReplicaSpec<K, A, N>
             self.network.clone(),
             progress_msgs,
             progress_msg_buffer_capacity,
-            block_sync_responses,
+            worker_cmd_sender,
+            worker_result_receiver,
             algorithm_shutdown_receiver,
             event_publisher,
         );
@@ -547,6 +563,8 @@ impl<K: KVStore, A: App<K> + 'static, N: Network + 'static> ReplicaSpec<K, A, N>
             algorithm_shutdown,
             block_sync_server: Some(block_sync_server),
             block_sync_server_shutdown,
+            block_sync_worker: Some(block_sync_worker),
+            block_sync_worker_shutdown: worker_shutdown,
             event_bus,
             event_bus_shutdown,
         }
@@ -563,6 +581,8 @@ pub struct Replica<K: KVStore> {
     algorithm_shutdown: Sender<()>,
     block_sync_server: Option<JoinHandle<()>>,
     block_sync_server_shutdown: Sender<()>,
+    block_sync_worker: Option<JoinHandle<()>>,
+    block_sync_worker_shutdown: Sender<()>,
     event_bus: Option<JoinHandle<()>>,
     event_bus_shutdown: Option<Sender<()>>,
 }
@@ -604,6 +624,10 @@ impl<K: KVStore> Drop for Replica<K> {
 
         self.algorithm_shutdown.send(()).unwrap();
         self.algorithm.take().unwrap().join().unwrap();
+
+        // Worker may have already exited when its command channel disconnected after algorithm shutdown.
+        let _ = self.block_sync_worker_shutdown.send(());
+        let _ = self.block_sync_worker.take().unwrap().join();
 
         self.block_sync_server_shutdown.send(()).unwrap();
         self.block_sync_server.take().unwrap().join().unwrap();
