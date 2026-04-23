@@ -69,10 +69,8 @@ fn four_node_consensus_produces_and_commits_blocks() {
     // Start all replicas
     let _replicas: Vec<Replica<RocksKVStore>> = (0..NUM_VALIDATORS)
         .map(|i| {
-            // Configuration matches hotstuff_rs reference tests (tests/common/node.rs).
-            // Key: block_sync_server_advertise_time must be long to prevent
-            // BlockSyncAdvertise messages from triggering sync and blocking
-            // the algorithm loop during active consensus.
+            // Block sync disabled: triggers set to MAX to prevent sync from
+            // blocking the algorithm loop during this pure-consensus test.
             let config = Configuration::builder()
                 .me(signing_keys[i].clone())
                 .chain_id(ChainID::new(CHAIN_ID))
@@ -80,11 +78,11 @@ fn four_node_consensus_produces_and_commits_blocks() {
                 .max_view_time(Duration::from_millis(2000))
                 .progress_msg_buffer_capacity(BufferSize::new(1024))
                 .block_sync_request_limit(10)
-                .block_sync_server_advertise_time(Duration::new(10, 0))
+                .block_sync_server_advertise_time(Duration::from_secs(u32::MAX as u64))
                 .block_sync_response_timeout(Duration::new(3, 0))
                 .block_sync_blacklist_expiry_time(Duration::new(10, 0))
-                .block_sync_trigger_min_view_difference(2)
-                .block_sync_trigger_timeout(Duration::new(60, 0))
+                .block_sync_trigger_min_view_difference(u64::MAX)
+                .block_sync_trigger_timeout(Duration::from_secs(u32::MAX as u64))
                 .log_events(false)
                 .build();
 
