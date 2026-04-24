@@ -22,9 +22,13 @@ use torus_bridge::{
 use torus_mempool::Mempool;
 use torus_economics::{EpochManager, SlashReason, StakingManager};
 use torus_evm::{EvmExecutor, TORUS_CHAIN_ID};
-use torus_state::cf::CF_BLOCK_HEADERS;
+use torus_state::cf::{
+    CF_BLOCK_BODIES, CF_BLOCK_HEADERS, CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT,
+};
 use torus_state::StateDb;
-use torus_types::{Address, ChainConfig, NativeAction, TorusBlock, TorusBlockHeader, ValidatorSet};
+use torus_types::{
+    Address, ChainConfig, NativeAction, TorusBlock, TorusBlockBody, TorusBlockHeader, ValidatorSet,
+};
 
 /// FIX CONS-PF-08: Buffered slash intent recorded during speculative rollback.
 /// Applied to DB only when the next block is produced/validated (i.e., the chain
@@ -87,7 +91,7 @@ impl TorusApp {
         let genesis_validator_set = EpochManager::compute_new_validator_set(
             &staking, config.max_validators, 0,
         ).unwrap_or_else(|_| ValidatorSet { validators: vec![], epoch: 0 });
-        Self {
+        let mut app = Self {
             state_db,
             proposer,
             validator,
@@ -104,7 +108,9 @@ impl TorusApp {
             dev_pool_address: config.dev_pool_address,
             metrics,
             mempool,
-        }
+        };
+        app.replay_native_post_commit_if_needed();
+        app
     }
 
     /// Create a stub `TorusApp` without a database (for consensus-only tests).
@@ -131,6 +137,139 @@ impl TorusApp {
             dev_pool_address: Address::ZERO,
         };
         Self::new(state_db, &config, None, None)
+    }
+
+    /// Detect and replay native post-commit execution missed due to a crash.
+    fn replay_native_post_commit_if_needed(&mut self) {
+        let committed = match self.find_last_committed_height() {
+            Some(h) if h > 0 => h,
+            _ => return,
+        };
+
+        let applied = self.read_native_applied_height().unwrap_or(0);
+        if applied >= committed {
+            return;
+        }
+
+        tracing::warn!(
+            committed_height = committed,
+            applied_height = applied,
+            "crash recovery: native post-commit gap detected, replaying"
+        );
+
+        let header: TorusBlockHeader = match self
+            .state_db
+            .get_cf_raw(CF_BLOCK_HEADERS, &committed.to_be_bytes())
+        {
+            Ok(Some(data)) if data.len() > 32 => match serde_json::from_slice(&data[32..]) {
+                Ok(h) => h,
+                Err(e) => {
+                    tracing::error!(%e, height = committed, "crash recovery: failed to deserialize header");
+                    self.write_native_applied_height(committed);
+                    return;
+                }
+            },
+            _ => {
+                tracing::error!(height = committed, "crash recovery: block header not found");
+                self.write_native_applied_height(committed);
+                return;
+            }
+        };
+
+        self.last_header = header.clone();
+
+        let body: TorusBlockBody = match self
+            .state_db
+            .get_cf_raw(CF_BLOCK_BODIES, &committed.to_be_bytes())
+        {
+            Ok(Some(data)) => match serde_json::from_slice(&data) {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::error!(%e, "crash recovery: failed to deserialize block body");
+                    self.write_native_applied_height(committed);
+                    return;
+                }
+            },
+            _ => {
+                tracing::info!(height = committed, "crash recovery: no block body (empty block), marking applied");
+                self.write_native_applied_height(committed);
+                return;
+            }
+        };
+
+        if body.native_actions.is_empty() {
+            tracing::info!(height = committed, "crash recovery: no native actions, marking applied");
+            self.write_native_applied_height(committed);
+            return;
+        }
+
+        let mut sender_actions = Vec::with_capacity(body.native_actions.len());
+        let mut consumed_nonces = Vec::new();
+        for signed in &body.native_actions {
+            match signed.recover_sender() {
+                Ok(sender) => {
+                    consumed_nonces.push((sender, signed.nonce));
+                    sender_actions.push((sender, signed.action.clone()));
+                }
+                Err(e) => {
+                    tracing::error!(%e, "crash recovery: failed to recover sender, skipping action");
+                }
+            }
+        }
+
+        let block = TorusBlock {
+            header,
+            native_actions: body.native_actions,
+            evm_transactions: body.evm_transactions,
+            core_writer_actions: body.core_writer_actions,
+        };
+
+        match self.execute_native_post_commit(&block, sender_actions, consumed_nonces) {
+            Ok(()) => {
+                self.write_native_applied_height(committed);
+                tracing::info!(height = committed, "crash recovery: native post-commit replayed successfully");
+            }
+            Err(e) => {
+                tracing::error!(%e, height = committed, "crash recovery: replay failed");
+            }
+        }
+    }
+
+    fn find_last_committed_height(&self) -> Option<u64> {
+        let db = self.state_db.inner();
+        let cf = db.cf_handle(CF_BLOCK_HEADERS)?;
+        let mut iter = db.iterator_cf(cf, rocksdb::IteratorMode::End);
+        iter.next()
+            .and_then(|r| r.ok())
+            .and_then(|(key, _)| {
+                if key.len() == 8 {
+                    Some(u64::from_be_bytes(key[..8].try_into().ok()?))
+                } else {
+                    None
+                }
+            })
+    }
+
+    fn read_native_applied_height(&self) -> Option<u64> {
+        self.state_db
+            .get_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT)
+            .ok()
+            .flatten()
+            .and_then(|data| {
+                if data.len() == 8 {
+                    Some(u64::from_be_bytes(data[..8].try_into().ok()?))
+                } else {
+                    None
+                }
+            })
+    }
+
+    fn write_native_applied_height(&self, height: u64) {
+        let _ = self.state_db.put_cf_raw(
+            CF_CONSENSUS_META,
+            META_NATIVE_APPLIED_HEIGHT,
+            &height.to_be_bytes(),
+        );
     }
 
     /// FIX CONS-PF-08: Flush any buffered slash intents to DB.
@@ -328,6 +467,11 @@ impl TorusApp {
         sender_actions: Vec<(Address, NativeAction)>,
         consumed_nonces: Vec<(Address, u64)>,
     ) -> Result<(), BridgeError> {
+        if let Some(applied) = self.read_native_applied_height() {
+            if applied >= block.header.height {
+                return Ok(());
+            }
+        }
         let (pre_evm, post_evm) = sort_native_actions(&sender_actions);
         let mut ctx = NativeExecContext::new(
             self.state_db.clone(),
@@ -416,6 +560,7 @@ impl TorusApp {
         } else {
             // Empty block — no execution to validate.
             self.persist_block_header(&torus_block);
+            self.write_native_applied_height(torus_block.header.height);
             if torus_block.header.height > self.last_header.height {
                 self.last_header = torus_block.header.clone();
             }
@@ -443,13 +588,16 @@ impl TorusApp {
                             "committed block state to DB"
                         );
                         if has_native {
-                            if let Err(e) = self.execute_native_post_commit(
+                            match self.execute_native_post_commit(
                                 &torus_block,
                                 validated.native_sender_actions,
                                 validated.native_consumed_nonces,
                             ) {
-                                tracing::error!(%e, "native post-commit execution failed");
+                                Ok(()) => self.write_native_applied_height(torus_block.header.height),
+                                Err(e) => tracing::error!(%e, "native post-commit execution failed"),
                             }
+                        } else {
+                            self.write_native_applied_height(torus_block.header.height);
                         }
                     }
                     Err(e) => {
@@ -706,5 +854,171 @@ fn produce_empty_block(
         data: Data::new(vec![Datum::new(encoded)]),
         app_state_updates: None,
         validator_set_updates: None,
+    }
+}
+
+#[cfg(test)]
+mod crash_recovery_tests {
+    use super::*;
+    use torus_types::{Bloom, SignedNativeAction, B256};
+
+    fn make_test_config_and_db() -> (ChainConfig, StateDb) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(1000);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("torus-crash-test-{}-{}", std::process::id(), id));
+        let _ = std::fs::create_dir_all(&dir);
+        let state_db = StateDb::open(&dir).expect("open test db");
+        let config = ChainConfig {
+            chain_id: torus_evm::TORUS_CHAIN_ID,
+            chain_name: "crash-test".to_string(),
+            evm_gas_limit: 30_000_000,
+            base_fee_per_gas: 1_000_000_000,
+            epoch_length: 100,
+            max_validators: 4,
+            min_stake: torus_economics::MIN_SELF_DELEGATION,
+            fee_burn_bps: 1000,
+            fee_validator_bps: 0,
+            fee_treasury_bps: 4500,
+            fee_dev_pool_bps: 4500,
+            treasury_address: Address::ZERO,
+            dev_pool_address: Address::ZERO,
+        };
+        (config, state_db)
+    }
+
+    fn make_block(height: u64, native_actions: Vec<SignedNativeAction>) -> TorusBlock {
+        TorusBlock {
+            header: TorusBlockHeader {
+                height,
+                timestamp: 1000 + height,
+                proposer: Address::ZERO,
+                state_root: B256::ZERO,
+                receipts_root: B256::ZERO,
+                logs_bloom: Bloom::ZERO,
+                evm_gas_used: 0,
+                evm_gas_limit: 30_000_000,
+                native_action_count: native_actions.len() as u32,
+                evm_tx_count: 0,
+                base_fee_per_gas: 1_000_000_000,
+                epoch: 0,
+                validator_set_hash: B256::ZERO,
+            },
+            native_actions,
+            evm_transactions: vec![],
+            core_writer_actions: vec![],
+        }
+    }
+
+    fn sign_claim_rewards(nonce: u64) -> SignedNativeAction {
+        let mut seed = [1u8; 32];
+        seed[0] = ((nonce % 254) + 1) as u8;
+        let key = k256::ecdsa::SigningKey::from_slice(&seed).unwrap();
+        torus_types::eip712::sign_native_action(NativeAction::ClaimRewards, nonce, &key)
+    }
+
+    fn persist_block_for_test(state_db: &StateDb, block: &TorusBlock) {
+        let block_hash = alloy_primitives::keccak256(&block.header.canonical_header_bytes());
+        let header_json = serde_json::to_vec(&block.header).unwrap();
+        let mut data = Vec::with_capacity(32 + header_json.len());
+        data.extend_from_slice(block_hash.as_slice());
+        data.extend_from_slice(&header_json);
+        state_db
+            .put_cf_raw(CF_BLOCK_HEADERS, &block.header.height.to_be_bytes(), &data)
+            .unwrap();
+
+        let body = block.body();
+        let body_bytes = serde_json::to_vec(&body).unwrap();
+        state_db
+            .put_cf_raw(CF_BLOCK_BODIES, &block.header.height.to_be_bytes(), &body_bytes)
+            .unwrap();
+    }
+
+    #[test]
+    fn crash_recovery_replays_native_post_commit() {
+        let (config, state_db) = make_test_config_and_db();
+        let block = make_block(1, vec![sign_claim_rewards(100)]);
+
+        // Simulate commit_block writing header+body but native exec never runs
+        persist_block_for_test(&state_db, &block);
+
+        // META_NATIVE_APPLIED_HEIGHT not set → simulates crash before native exec
+        assert!(state_db
+            .get_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT)
+            .unwrap()
+            .is_none());
+
+        // Reconstruct TorusApp — should detect gap and replay
+        let app = TorusApp::new(state_db.clone(), &config, None, None);
+
+        // Verify applied height was written
+        let applied = app.read_native_applied_height();
+        assert_eq!(applied, Some(1), "replay should set applied height to 1");
+        assert_eq!(app.last_header.height, 1, "last_header should be updated");
+    }
+
+    #[test]
+    fn no_replay_when_already_applied() {
+        let (config, state_db) = make_test_config_and_db();
+        let block = make_block(5, vec![sign_claim_rewards(200)]);
+
+        persist_block_for_test(&state_db, &block);
+
+        // Pre-set applied height = committed height → no gap
+        state_db
+            .put_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT, &5u64.to_be_bytes())
+            .unwrap();
+
+        let app = TorusApp::new(state_db.clone(), &config, None, None);
+        assert_eq!(app.read_native_applied_height(), Some(5));
+        // last_header stays at genesis since no replay occurred
+        assert_eq!(app.last_header.height, 0);
+    }
+
+    #[test]
+    fn replay_empty_block_marks_applied() {
+        let (config, state_db) = make_test_config_and_db();
+        let block = make_block(3, vec![]); // no native actions
+
+        // Only persist header (empty block has no body in CF_BLOCK_BODIES)
+        let block_hash = alloy_primitives::keccak256(&block.header.canonical_header_bytes());
+        let header_json = serde_json::to_vec(&block.header).unwrap();
+        let mut data = Vec::with_capacity(32 + header_json.len());
+        data.extend_from_slice(block_hash.as_slice());
+        data.extend_from_slice(&header_json);
+        state_db
+            .put_cf_raw(CF_BLOCK_HEADERS, &block.header.height.to_be_bytes(), &data)
+            .unwrap();
+
+        let app = TorusApp::new(state_db.clone(), &config, None, None);
+        assert_eq!(
+            app.read_native_applied_height(),
+            Some(3),
+            "empty block should be marked as applied"
+        );
+    }
+
+    #[test]
+    fn idempotent_native_post_commit() {
+        let (config, state_db) = make_test_config_and_db();
+        let signed = sign_claim_rewards(300);
+        let sender = signed.recover_sender().unwrap();
+        let block = make_block(2, vec![signed.clone()]);
+
+        let app = TorusApp::new(state_db.clone(), &config, None, None);
+
+        let sender_actions = vec![(sender, signed.action.clone())];
+        let consumed_nonces = vec![(sender, signed.nonce)];
+
+        // First call
+        app.execute_native_post_commit(&block, sender_actions.clone(), consumed_nonces.clone())
+            .unwrap();
+        app.write_native_applied_height(2);
+
+        // Second call — should be a no-op due to idempotency guard
+        app.execute_native_post_commit(&block, sender_actions, consumed_nonces)
+            .unwrap();
+
+        assert_eq!(app.read_native_applied_height(), Some(2));
     }
 }

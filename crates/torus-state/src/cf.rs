@@ -57,6 +57,9 @@ pub const CF_NATIVE_NONCES: &str = "cf_native_nonces";
 pub const CF_CORE_WRITER_QUEUE: &str = "cf_core_writer_queue";
 pub const CF_CONSENSUS_META: &str = "cf_consensus_meta";
 
+/// Key in CF_CONSENSUS_META: last block height where native post-commit completed.
+pub const META_NATIVE_APPLIED_HEIGHT: &[u8] = b"native_applied_height";
+
 // Trie (MPT state root)
 pub const CF_TRIE_NODES: &str = "cf_trie_nodes";
 pub const CF_TRIE_ACCOUNTS: &str = "cf_trie_accounts";
