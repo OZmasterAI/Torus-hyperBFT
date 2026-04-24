@@ -447,9 +447,7 @@ fn handle_command(
                     }
                 }
             } else {
-                // Peer not in map yet — fall back to gossipsub broadcast
-                warn!("Send target not in peer map, falling back to gossipsub");
-                enqueue_inbound(&shared.inbound, *local_key, message.clone());
+                warn!(target_key = ?target, "Send target not in peer map, falling back to gossipsub");
                 let mut envelope = local_key.to_bytes().to_vec();
                 if let Ok(msg_bytes) = message.try_to_vec() {
                     envelope.extend_from_slice(&msg_bytes);

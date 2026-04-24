@@ -60,7 +60,7 @@ impl Default for MempoolConfig {
             max_pool_size: 4096,
             max_per_sender: 16,
             replacement_bump_pct: 10,
-            chain_id: 7777,
+            chain_id: torus_types::eip712::TORUS_CHAIN_ID,
             block_gas_limit: 30_000_000,
             rate_window_blocks: rate_limit::RATE_WINDOW_BLOCKS,
             evm_rate_limit_per_window: rate_limit::EVM_RATE_LIMIT_PER_WINDOW,
@@ -355,7 +355,7 @@ mod tests {
         value: U256,
     ) -> Vec<u8> {
         let tx = TxEip1559 {
-            chain_id: 7777,
+            chain_id: torus_types::eip712::TORUS_CHAIN_ID,
             nonce,
             max_fee_per_gas: max_fee,
             max_priority_fee_per_gas: priority_fee,

@@ -134,7 +134,7 @@ fn encode_string(s: &str) -> [u8; 32] {
 ///   typeHash("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)")
 ///   || keccak256("Torus")
 ///   || keccak256("1")
-///   || uint256(7777)
+///   || uint256(7778)
 ///   || address(0x0)
 /// )
 /// ```
