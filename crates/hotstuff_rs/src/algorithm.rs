@@ -44,6 +44,8 @@ pub(crate) struct Algorithm<N: Network + 'static, K: KVStore, A: App<K> + 'stati
 }
 
 impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
+    const MAX_SYNC_BLOCKS_PER_TICK: usize = 128;
+
     /// Create an instance of the algorithm thread.
     pub(crate) fn new(
         chain_id: ChainID,
@@ -157,12 +159,19 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
             // 5. Poll the sync worker for fetched blocks (non-blocking).
             self.block_sync_client.poll_worker_results();
 
-            // 6. Process one pending sync block if available (non-blocking).
-            if let Err(e) = self
-                .block_sync_client
-                .process_pending_block(&mut self.block_tree, &mut self.app)
-            {
-                log::error!("BlockSync process_pending_block error: {:?} — continuing", e);
+            // 6. Process pending sync blocks — drain the batch for faster catch-up.
+            for _ in 0..Self::MAX_SYNC_BLOCKS_PER_TICK {
+                match self
+                    .block_sync_client
+                    .process_pending_block(&mut self.block_tree, &mut self.app)
+                {
+                    Ok(true) => {}
+                    Ok(false) => break,
+                    Err(e) => {
+                        log::error!("BlockSync process_pending_block error: {:?} — continuing", e);
+                        break;
+                    }
+                }
             }
 
             // 7. Poll the network for incoming messages.
