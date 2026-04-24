@@ -1,0 +1,46 @@
+{
+  "prp": "crash-safety-post-commit",
+  "created": "2026-04-24T09:00:00Z",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Add NATIVE_APPLIED_HEIGHT key and write flag after post-commit",
+      "status": "pending",
+      "files": ["crates/torus-state/src/cf.rs", "crates/torus-consensus/src/app.rs"],
+      "validate": "cargo check -p torus-consensus",
+      "depends_on": []
+    },
+    {
+      "id": 2,
+      "name": "Add startup replay check to TorusApp::new()",
+      "status": "pending",
+      "files": ["crates/torus-consensus/src/app.rs"],
+      "validate": "cargo check -p torus-consensus",
+      "depends_on": [1]
+    },
+    {
+      "id": 3,
+      "name": "Verify execute_native_post_commit idempotency",
+      "status": "pending",
+      "files": ["crates/torus-consensus/src/app.rs"],
+      "validate": "cargo test -p torus-consensus -- idempotent",
+      "depends_on": [1]
+    },
+    {
+      "id": 4,
+      "name": "Add crash-recovery integration test",
+      "status": "pending",
+      "files": ["crates/torus-consensus/tests/consensus_test.rs"],
+      "validate": "cargo test -p torus-consensus -- crash_recovery",
+      "depends_on": [1, 2, 3]
+    },
+    {
+      "id": 5,
+      "name": "Full workspace compile and test",
+      "status": "pending",
+      "files": [],
+      "validate": "cargo test --workspace",
+      "depends_on": [4]
+    }
+  ]
+}

@@ -1,0 +1,62 @@
+{
+  "prp": "validation-worker-thread",
+  "created": "2026-04-24T09:00:00Z",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Define ValidationCommand and ValidationResult types",
+      "status": "pending",
+      "files": ["crates/torus-consensus/src/validation_worker.rs"],
+      "validate": "cargo check -p torus-consensus",
+      "depends_on": []
+    },
+    {
+      "id": 2,
+      "name": "Implement ValidationWorker thread",
+      "status": "pending",
+      "files": ["crates/torus-consensus/src/validation_worker.rs"],
+      "validate": "cargo check -p torus-consensus",
+      "depends_on": [1]
+    },
+    {
+      "id": 3,
+      "name": "Integrate worker into TorusApp",
+      "status": "pending",
+      "files": ["crates/torus-consensus/src/app.rs"],
+      "validate": "cargo check -p torus-consensus",
+      "depends_on": [2]
+    },
+    {
+      "id": 4,
+      "name": "Handle state synchronization between main and worker",
+      "status": "pending",
+      "files": ["crates/torus-consensus/src/app.rs", "crates/torus-consensus/src/validation_worker.rs"],
+      "validate": "cargo check -p torus-consensus",
+      "depends_on": [3]
+    },
+    {
+      "id": 5,
+      "name": "Spawn and shutdown in main.rs",
+      "status": "pending",
+      "files": ["crates/torus-node/src/main.rs"],
+      "validate": "cargo check -p torus-node",
+      "depends_on": [3]
+    },
+    {
+      "id": 6,
+      "name": "Consensus test with validation worker",
+      "status": "pending",
+      "files": ["crates/torus-consensus/tests/consensus_test.rs"],
+      "validate": "cargo test -p torus-consensus -- consensus_test",
+      "depends_on": [3, 4, 5]
+    },
+    {
+      "id": 7,
+      "name": "Full workspace compile and test",
+      "status": "pending",
+      "files": [],
+      "validate": "cargo test --workspace",
+      "depends_on": [6]
+    }
+  ]
+}
