@@ -304,6 +304,7 @@ impl DowntimeTracker {
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
+    use torus_types::eip712::TORUS_CHAIN_ID;
 
     fn make_keypair(seed: u8) -> (SigningKey, VerifyingKey) {
         let sk = SigningKey::from_bytes(&[seed; 32]);
@@ -336,10 +337,10 @@ mod tests {
     #[test]
     fn detect_double_sign() {
         let (sk, _vk) = make_keypair(1);
-        let mut detector = DoubleSignDetector::new(7777, 100);
+        let mut detector = DoubleSignDetector::new(TORUS_CHAIN_ID, 100);
 
-        let vote_a = sign_vote(&sk, 7777, 10, [0xAA; 32], 0);
-        let vote_b = sign_vote(&sk, 7777, 10, [0xBB; 32], 0);
+        let vote_a = sign_vote(&sk, TORUS_CHAIN_ID, 10, [0xAA; 32], 0);
+        let vote_b = sign_vote(&sk, TORUS_CHAIN_ID, 10, [0xBB; 32], 0);
 
         assert!(detector.record_vote(&vote_a).is_none());
 
@@ -355,9 +356,9 @@ mod tests {
     #[test]
     fn same_vote_no_false_positive() {
         let (sk, _vk) = make_keypair(2);
-        let mut detector = DoubleSignDetector::new(7777, 100);
+        let mut detector = DoubleSignDetector::new(TORUS_CHAIN_ID, 100);
 
-        let vote = sign_vote(&sk, 7777, 10, [0xAA; 32], 0);
+        let vote = sign_vote(&sk, TORUS_CHAIN_ID, 10, [0xAA; 32], 0);
 
         assert!(detector.record_vote(&vote).is_none());
         assert!(detector.record_vote(&vote).is_none());
@@ -366,10 +367,10 @@ mod tests {
     #[test]
     fn different_view_no_false_positive() {
         let (sk, _vk) = make_keypair(3);
-        let mut detector = DoubleSignDetector::new(7777, 100);
+        let mut detector = DoubleSignDetector::new(TORUS_CHAIN_ID, 100);
 
-        let vote_a = sign_vote(&sk, 7777, 10, [0xAA; 32], 0);
-        let vote_b = sign_vote(&sk, 7777, 11, [0xBB; 32], 0);
+        let vote_a = sign_vote(&sk, TORUS_CHAIN_ID, 10, [0xAA; 32], 0);
+        let vote_b = sign_vote(&sk, TORUS_CHAIN_ID, 11, [0xBB; 32], 0);
 
         assert!(detector.record_vote(&vote_a).is_none());
         assert!(detector.record_vote(&vote_b).is_none());
@@ -378,16 +379,16 @@ mod tests {
     #[test]
     fn old_votes_pruned() {
         let (sk, _vk) = make_keypair(4);
-        let mut detector = DoubleSignDetector::new(7777, 100);
+        let mut detector = DoubleSignDetector::new(TORUS_CHAIN_ID, 100);
 
-        let vote_old = sign_vote(&sk, 7777, 10, [0xAA; 32], 0);
+        let vote_old = sign_vote(&sk, TORUS_CHAIN_ID, 10, [0xAA; 32], 0);
         assert!(detector.record_vote(&vote_old).is_none());
 
-        let vote_new = sign_vote(&sk, 7777, 200, [0xCC; 32], 0);
+        let vote_new = sign_vote(&sk, TORUS_CHAIN_ID, 200, [0xCC; 32], 0);
         assert!(detector.record_vote(&vote_new).is_none());
 
         // Old view pruned — conflicting vote won't be detected
-        let vote_conflict = sign_vote(&sk, 7777, 10, [0xBB; 32], 0);
+        let vote_conflict = sign_vote(&sk, TORUS_CHAIN_ID, 10, [0xBB; 32], 0);
         assert!(detector.record_vote(&vote_conflict).is_none());
 
         assert!(detector.tracked_vote_count() <= 2);
@@ -396,7 +397,7 @@ mod tests {
     #[test]
     fn evidence_with_invalid_signer_fails_verification() {
         let evidence = DoubleSignEvidence {
-            chain_id: 7777,
+            chain_id: TORUS_CHAIN_ID,
             view: 10,
             phase: 0,
             signer: [0xFF; 32],
@@ -416,11 +417,11 @@ mod tests {
     fn evidence_same_block_hash_fails_verification() {
         let (sk, _) = make_keypair(5);
         use ed25519_dalek::Signer;
-        let msg = build_vote_message(7777, 10, &[0xAA; 32], 0);
+        let msg = build_vote_message(TORUS_CHAIN_ID, 10, &[0xAA; 32], 0);
         let sig = sk.sign(&msg);
 
         let evidence = DoubleSignEvidence {
-            chain_id: 7777,
+            chain_id: TORUS_CHAIN_ID,
             view: 10,
             phase: 0,
             signer: sk.verifying_key().to_bytes(),

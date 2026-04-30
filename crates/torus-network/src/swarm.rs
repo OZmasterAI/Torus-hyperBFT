@@ -447,15 +447,7 @@ fn handle_command(
                     }
                 }
             } else {
-                warn!(target_key = ?target, "Send target not in peer map, falling back to gossipsub");
-                let mut envelope = local_key.to_bytes().to_vec();
-                if let Ok(msg_bytes) = message.try_to_vec() {
-                    envelope.extend_from_slice(&msg_bytes);
-                    let _ = swarm
-                        .behaviour_mut()
-                        .gossipsub
-                        .publish(consensus_topic.clone(), envelope);
-                }
+                warn!(target_key = ?target, "Send target not in peer map — dropping unicast message");
             }
         }
         NetworkCommand::RegisterPeer { vk, peer_id } => {

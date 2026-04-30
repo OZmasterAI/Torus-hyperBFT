@@ -1407,4 +1407,258 @@ mod tests {
         assert_eq!(trades[0].market_id, hex_u64(1));
         handle.stop().unwrap();
     }
+    // ========================================================================
+    // 7 pending trading RPC tests (from writing-plan-trading-rpc-gaps.md)
+    // ========================================================================
+
+    // --- get_open_orders_multi_market ---
+    // Unfiltered query returns orders spanning multiple markets.
+    #[tokio::test]
+    async fn get_open_orders_multi_market() {
+        let (_dir, state, mempool, executor) = setup();
+        let trader = Address::from([0x11; 20]);
+        // Place orders in three distinct markets.
+        store_order_book_with_orders(&state, 1, &[(trader, Side::Buy, 49000, 2)]);
+        store_order_book_with_orders(&state, 2, &[(trader, Side::Sell, 3100, 1)]);
+        store_order_book_with_orders(&state, 3, &[
+            (trader, Side::Buy, 1900, 5),
+            (trader, Side::Sell, 2100, 3),
+        ]);
+        let (handle, addr) = start_server(state, mempool, executor).await;
+        use jsonrpsee::core::client::ClientT;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}")).unwrap();
+        // No market_id param → all markets.
+        let orders: Vec<RpcOpenOrder> = client
+            .request("torus_getOpenOrders", jsonrpsee::rpc_params![hex_address(trader)])
+            .await.unwrap();
+        assert_eq!(orders.len(), 4);
+        // All must belong to the requesting trader; market IDs should span 1, 2, and 3.
+        let mut market_ids: Vec<u64> = orders.iter()
+            .map(|o| u64::from_str_radix(o.market_id.strip_prefix("0x").unwrap(), 16).unwrap())
+            .collect();
+        market_ids.sort_unstable();
+        market_ids.dedup();
+        assert_eq!(market_ids, vec![1, 2, 3]);
+        handle.stop().unwrap();
+    }
+
+    // --- get_open_orders_after_cancel ---
+    // A cancelled order must not appear in subsequent getOpenOrders responses.
+    #[tokio::test]
+    async fn get_open_orders_after_cancel() {
+        let (_dir, state, mempool, executor) = setup();
+        let trader = Address::from([0x22; 20]);
+        // Build a book with two buy orders.
+        let mut book = OrderBook::new(1, fp(1), fp(1));
+        let r1 = book.place_order(PlaceOrderParams {
+            market_id: 1, is_buy: true, price: fp(48000), quantity: fp(2),
+            order_type: OrderType::Limit, time_in_force: TimeInForce::GTC,
+            reduce_only: false, client_order_id: None,
+        }, trader, 1700000000);
+        book.place_order(PlaceOrderParams {
+            market_id: 1, is_buy: true, price: fp(47000), quantity: fp(3),
+            order_type: OrderType::Limit, time_in_force: TimeInForce::GTC,
+            reduce_only: false, client_order_id: None,
+        }, trader, 1700000001);
+        // Cancel the first order before persisting.
+        book.cancel_order(r1.order_id).unwrap();
+        let data = borsh::to_vec(&book).unwrap();
+        state.put_cf_raw(CF_NATIVE_ORDER_BOOKS, &1u64.to_be_bytes(), &data).unwrap();
+
+        let (handle, addr) = start_server(state, mempool, executor).await;
+        use jsonrpsee::core::client::ClientT;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}")).unwrap();
+        let orders: Vec<RpcOpenOrder> = client
+            .request("torus_getOpenOrders", jsonrpsee::rpc_params![hex_address(trader), "0x1"])
+            .await.unwrap();
+        // Only the second order should remain.
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].price, hex_fp(fp(47000)));
+        handle.stop().unwrap();
+    }
+
+    // --- get_open_orders_after_fill ---
+    // A fully-filled order must not appear in getOpenOrders results.
+    #[tokio::test]
+    async fn get_open_orders_after_fill() {
+        let (_dir, state, mempool, executor) = setup();
+        let maker = Address::from([0x33; 20]);
+        let taker = Address::from([0x44; 20]);
+        // Build book: maker places a sell resting on the book first.
+        let mut book = OrderBook::new(1, fp(1), fp(1));
+        book.place_order(PlaceOrderParams {
+            market_id: 1, is_buy: false, price: fp(50000), quantity: fp(1),
+            order_type: OrderType::Limit, time_in_force: TimeInForce::GTC,
+            reduce_only: false, client_order_id: None,
+        }, maker, 1700000000);
+        // Taker buy at the same price fully fills the maker's sell.
+        book.place_order(PlaceOrderParams {
+            market_id: 1, is_buy: true, price: fp(50000), quantity: fp(1),
+            order_type: OrderType::Limit, time_in_force: TimeInForce::GTC,
+            reduce_only: false, client_order_id: None,
+        }, taker, 1700000001);
+        // Persist the post-fill book state.
+        let data = borsh::to_vec(&book).unwrap();
+        state.put_cf_raw(CF_NATIVE_ORDER_BOOKS, &1u64.to_be_bytes(), &data).unwrap();
+
+        let (handle, addr) = start_server(state, mempool, executor).await;
+        use jsonrpsee::core::client::ClientT;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}")).unwrap();
+        // Neither party should have open orders after the complete fill.
+        let maker_orders: Vec<RpcOpenOrder> = client
+            .request("torus_getOpenOrders", jsonrpsee::rpc_params![hex_address(maker), "0x1"])
+            .await.unwrap();
+        assert!(maker_orders.is_empty(), "maker's filled sell should be gone");
+        let taker_orders: Vec<RpcOpenOrder> = client
+            .request("torus_getOpenOrders", jsonrpsee::rpc_params![hex_address(taker), "0x1"])
+            .await.unwrap();
+        assert!(taker_orders.is_empty(), "taker's filled buy should be gone");
+        handle.stop().unwrap();
+    }
+
+    // --- get_open_orders_limit_500 ---
+    // The endpoint must not return more than 500 orders regardless of how many
+    // are in the book.
+    //
+    // The order book enforces MAX_ORDERS_PER_TRADER_PER_MARKET = 200, so we
+    // spread orders across three markets (200 + 200 + 101 = 501) to produce
+    // more than 500 total and verify the RPC cap fires.
+    #[tokio::test]
+    async fn get_open_orders_limit_500() {
+        let (_dir, state, mempool, executor) = setup();
+        let trader = Address::from([0x55; 20]);
+
+        // Markets 1 and 2: 200 buy orders each (hits per-market trader cap).
+        for market_id in [1u64, 2u64] {
+            let mut book = OrderBook::new(market_id, fp(1), fp(1));
+            for i in 1u32..=200 {
+                book.place_order(PlaceOrderParams {
+                    market_id, is_buy: true,
+                    price: fp(i as i64 * 100),
+                    quantity: fp(1),
+                    order_type: OrderType::Limit, time_in_force: TimeInForce::GTC,
+                    reduce_only: false, client_order_id: None,
+                }, trader, 1_700_000_000 + i as u64);
+            }
+            let data = borsh::to_vec(&book).unwrap();
+            state.put_cf_raw(CF_NATIVE_ORDER_BOOKS, &market_id.to_be_bytes(), &data).unwrap();
+        }
+
+        // Market 3: 101 sell orders — brings the total to 501.
+        let mut book3 = OrderBook::new(3, fp(1), fp(1));
+        for i in 1u32..=101 {
+            book3.place_order(PlaceOrderParams {
+                market_id: 3, is_buy: false,
+                price: fp(i as i64 * 100 + 500_000),
+                quantity: fp(1),
+                order_type: OrderType::Limit, time_in_force: TimeInForce::GTC,
+                reduce_only: false, client_order_id: None,
+            }, trader, 1_700_000_000 + i as u64);
+        }
+        let data3 = borsh::to_vec(&book3).unwrap();
+        state.put_cf_raw(CF_NATIVE_ORDER_BOOKS, &3u64.to_be_bytes(), &data3).unwrap();
+
+        let (handle, addr) = start_server(state, mempool, executor).await;
+        use jsonrpsee::core::client::ClientT;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}")).unwrap();
+        let orders: Vec<RpcOpenOrder> = client
+            .request("torus_getOpenOrders", jsonrpsee::rpc_params![hex_address(trader)])
+            .await.unwrap();
+        // Must be capped at 500 — never 501.
+        assert_eq!(orders.len(), 500);
+        handle.stop().unwrap();
+    }
+
+    // --- get_open_interest_no_positions ---
+    // An empty market returns zero long OI and zero short OI.
+    #[tokio::test]
+    async fn get_open_interest_no_positions() {
+        let (_dir, state, mempool, executor) = setup();
+        // No positions written to state — market 99 is entirely empty.
+        let (handle, addr) = start_server(state, mempool, executor).await;
+        use jsonrpsee::core::client::ClientT;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}")).unwrap();
+        let oi: RpcOpenInterest = client
+            .request("torus_getOpenInterest", jsonrpsee::rpc_params!["0x63"])
+            .await.unwrap();
+        assert_eq!(oi.long_oi, hex_fp(FixedPoint::ZERO));
+        assert_eq!(oi.short_oi, hex_fp(FixedPoint::ZERO));
+        handle.stop().unwrap();
+    }
+
+    // --- get_mark_price_from_oracle ---
+    // When an aggregated oracle price exists in CF_NATIVE_ORACLE the endpoint
+    // must return it as both mark_price and index_price.  This is distinct
+    // from the order-book-last-trade path tested by torus_get_mark_price_from_order_book.
+    #[tokio::test]
+    async fn get_mark_price_from_oracle() {
+        use torus_state::cf::CF_NATIVE_ORACLE;
+        let (_dir, state, mempool, executor) = setup();
+        let market_id: u64 = 7;
+        let oracle_price = fp(42000);
+
+        // Write a StoredAggregatedPrice entry for market 7.
+        // Binary layout: price(i128 16 BE) + block_number(u64 8 BE) + num_reporters(u32 4 BE).
+        let mut key = Vec::with_capacity(11);
+        key.extend_from_slice(b"agg");
+        key.extend_from_slice(&market_id.to_be_bytes());
+        let mut value = Vec::with_capacity(28);
+        value.extend_from_slice(&oracle_price.raw().to_be_bytes());
+        value.extend_from_slice(&1u64.to_be_bytes()); // block_number
+        value.extend_from_slice(&3u32.to_be_bytes()); // num_reporters
+        state.put_cf_raw(CF_NATIVE_ORACLE, &key, &value).unwrap();
+
+        let (handle, addr) = start_server(state, mempool, executor).await;
+        use jsonrpsee::core::client::ClientT;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}")).unwrap();
+        let mp: RpcMarkPrice = client
+            .request("torus_getMarkPrice", jsonrpsee::rpc_params!["0x7"])
+            .await.unwrap();
+        // Oracle price must surface as mark_price and index_price.
+        assert_eq!(mp.mark_price, hex_fp(oracle_price));
+        assert_eq!(mp.index_price, hex_fp(oracle_price));
+        // No trades occurred in this book so last_trade_price must be zero.
+        assert_eq!(mp.last_trade_price, hex_fp(FixedPoint::ZERO));
+        handle.stop().unwrap();
+    }
+
+    // --- get_user_trades_newest_first ---
+    // Trades must be returned in descending block order (newest block first).
+    #[tokio::test]
+    async fn get_user_trades_newest_first() {
+        let (_dir, state, mempool, executor) = setup();
+        let trader = Address::from([0xFF; 20]);
+        let price = 50000i64 as i128 * FixedPoint::SCALE;
+        let qty   =     1i128 * FixedPoint::SCALE;
+        // Insert three trades at blocks 5, 20, and 10 (out of order).
+        store_user_trade(&state, &trader, 100, 1, price, qty, 0, 1,  5, 1_700_000_005, 0);
+        store_user_trade(&state, &trader, 200, 1, price, qty, 1, 0, 20, 1_700_000_020, 0);
+        store_user_trade(&state, &trader, 300, 1, price, qty, 0, 1, 10, 1_700_000_010, 0);
+
+        let (handle, addr) = start_server(state, mempool, executor).await;
+        use jsonrpsee::core::client::ClientT;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}")).unwrap();
+        let trades: Vec<RpcUserTrade> = client
+            .request("torus_getUserTrades", jsonrpsee::rpc_params![hex_address(trader)])
+            .await.unwrap();
+        assert_eq!(trades.len(), 3);
+        // Verify descending block order: block 20, then 10, then 5.
+        let blocks: Vec<u64> = trades.iter()
+            .map(|t| u64::from_str_radix(t.block_number.strip_prefix("0x").unwrap(), 16).unwrap())
+            .collect();
+        assert_eq!(blocks, vec![20, 10, 5]);
+        // Verify trade IDs match the expected block ordering.
+        assert_eq!(trades[0].trade_id, hex_u128(200));
+        assert_eq!(trades[1].trade_id, hex_u128(300));
+        assert_eq!(trades[2].trade_id, hex_u128(100));
+        handle.stop().unwrap();
+    }
+
 }

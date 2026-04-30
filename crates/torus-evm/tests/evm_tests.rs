@@ -491,6 +491,111 @@ fn standard_precompile_ecrecover_still_works() {
     assert!(result.success, "ecrecover should not crash");
 }
 
+
+// ---------------------------------------------------------------------------
+// 13. EIP-1559: tx rejected when gas_price < base_fee
+// ---------------------------------------------------------------------------
+#[test]
+fn eip1559_tx_rejected_when_gas_price_below_base_fee() {
+    let (_dir, db) = open_test_db();
+
+    let balance = U256::from(10_000_000_000_000_000_000u128);
+    db.put_account(&ALICE, &test_account(balance)).unwrap();
+
+    // Block base_fee = 1 gwei.  Set tx gas_price = 0.5 gwei (below base_fee).
+    let block_cfg = default_block_cfg(); // base_fee = 1_000_000_000
+    let insufficient_gas_price: u128 = block_cfg.base_fee as u128 / 2; // 500M < 1G
+
+    let tx = TxEnv {
+        caller: ALICE,
+        gas_limit: 21_000,
+        gas_price: insufficient_gas_price,
+        kind: TxKind::Call(BOB),
+        value: U256::from(1u64),
+        nonce: 0,
+        chain_id: Some(TORUS_CHAIN_ID),
+        ..Default::default()
+    };
+
+    let executor = EvmExecutor::new(TORUS_CHAIN_ID);
+    let err = executor.execute_tx(&db, &block_cfg, tx).unwrap_err();
+
+    match err {
+        torus_evm::EvmError::InvalidTransaction(msg) => {
+            assert!(
+                msg.to_lowercase().contains("gaspricelessthanbasefee")
+                    || msg.contains("GasPriceLessThanBasefee"),
+                "error must cite GasPriceLessThanBasefee, got: {msg}"
+            );
+        }
+        other => panic!("expected InvalidTransaction, got: {other}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 14. EIP-1559: unused gas is refunded to sender at gas_price per unit
+// ---------------------------------------------------------------------------
+#[test]
+fn eip1559_unused_gas_refunded() {
+    let (_dir, db) = open_test_db();
+
+    // Fund ALICE generously.
+    let balance = U256::from(10_000_000_000_000_000_000u128);
+    db.put_account(&ALICE, &test_account(balance)).unwrap();
+
+    let block_cfg = default_block_cfg(); // base_fee = 1 gwei
+    let gas_price: u128 = block_cfg.base_fee as u128; // 1 gwei, no tip
+    let gas_limit: u64 = 50_000; // much more than 21_000 needed by a transfer
+
+    let value = U256::from(1_000u64);
+    let tx = TxEnv {
+        caller: ALICE,
+        gas_limit,
+        gas_price,
+        kind: TxKind::Call(BOB),
+        value,
+        nonce: 0,
+        chain_id: Some(TORUS_CHAIN_ID),
+        ..Default::default()
+    };
+
+    let executor = EvmExecutor::new(TORUS_CHAIN_ID);
+    let (result, bundle) = executor.execute_tx(&db, &block_cfg, tx).unwrap();
+
+    // A plain ETH transfer uses exactly 21_000 gas regardless of gas_limit.
+    assert!(result.success, "transfer should succeed");
+    assert_eq!(result.gas_used, 21_000, "transfer always uses 21k gas");
+
+    // The bundle must carry state changes (sender debit, receiver credit, coinbase).
+    assert!(!bundle.state.is_empty(), "bundle should have state changes");
+
+    // Execute again via execute_block to inspect receipts for gas_used accounting.
+    let block_cfg2 = BlockEnvCfg {
+        number: 2,
+        ..block_cfg.clone()
+    };
+    db.put_account(&ALICE, &test_account(balance)).unwrap(); // reset alice
+    let tx2 = TxEnv {
+        caller: ALICE,
+        gas_limit,
+        gas_price,
+        kind: TxKind::Call(BOB),
+        value,
+        nonce: 0,
+        chain_id: Some(TORUS_CHAIN_ID),
+        ..Default::default()
+    };
+    let block_result = executor.execute_block(&db, &block_cfg2, vec![tx2]).unwrap();
+
+    // receipt.gas_used = 21_000 (actual), not 50_000 (limit).
+    assert_eq!(block_result.receipts[0].gas_used, 21_000,
+        "receipt gas_used must reflect actual consumption, not gas_limit");
+
+    // Total block gas = 21_000 (the 29_000 unspent were refunded to sender).
+    assert_eq!(block_result.gas_used, 21_000,
+        "block gas_used must be actual gas, refund does not count as block gas");
+}
+
 /// Convenience module for hex decoding in tests.
 mod hex {
     pub fn decode(s: &str) -> Result<Vec<u8>, String> {

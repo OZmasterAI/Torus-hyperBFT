@@ -16,6 +16,7 @@ use torus_consensus::slashing::{DoubleSignDetector, DowntimeTracker};
 use torus_economics::types::*;
 use torus_economics::{EpochManager, StakingManager};
 use torus_state::StateDb;
+use torus_types::eip712::TORUS_CHAIN_ID;
 use torus_types::NativeAction;
 
 fn setup() -> (tempfile::TempDir, StakingManager) {
@@ -288,7 +289,7 @@ fn double_sign_detection_produces_verifiable_evidence() {
     use torus_consensus::slashing::ObservedPhaseVote;
 
     let sk = SigningKey::from_bytes(&[42u8; 32]);
-    let chain_id = 7777u64;
+    let chain_id = TORUS_CHAIN_ID;
 
     let mut detector = DoubleSignDetector::new(chain_id, EVIDENCE_WINDOW_VIEWS);
 
