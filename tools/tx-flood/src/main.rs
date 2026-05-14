@@ -218,21 +218,22 @@ async fn send_raw_tx(client: &reqwest::Client, url: &str, raw_hex: &str, id: u64
         .ok_or_else(|| "null result".to_string())
 }
 
-/// Send to ALL endpoints (fan-out). Returns Ok if any succeed.
+/// Send to ALL endpoints (true fan-out — no mempool gossip between validators).
 async fn send_to_all(
     client: &reqwest::Client,
     urls: &[String],
     raw_hex: &str,
     id: u64,
 ) -> Result<String, String> {
+    let mut any_hash = None;
     let mut last_err = String::new();
     for url in urls {
         match send_raw_tx(client, url, raw_hex, id).await {
-            Ok(hash) => return Ok(hash),
-            Err(e) => last_err = e,
+            Ok(hash) => { any_hash = Some(hash); }
+            Err(e) => { last_err = e; }
         }
     }
-    Err(last_err)
+    any_hash.ok_or(last_err)
 }
 
 #[tokio::main]

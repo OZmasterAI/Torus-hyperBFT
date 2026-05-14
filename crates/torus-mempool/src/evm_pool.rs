@@ -113,6 +113,10 @@ impl EvmPool {
         self.by_hash.contains_key(hash)
     }
 
+    pub fn all_senders(&self) -> Vec<Address> {
+        self.by_sender.keys().cloned().collect()
+    }
+
     /// Insert a validated transaction.
     /// Returns (replaced_hash, freed_bytes) — freed_bytes is the total raw RLP size
     /// of any evicted or replaced transactions (FIX EVM-FIND-02).

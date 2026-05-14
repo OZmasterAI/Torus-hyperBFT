@@ -342,6 +342,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let notifier = BlockNotifier::new();
     let notifier_for_replica = notifier.clone();
     let state_db_for_handler = state_db.clone();
+    let mempool_for_handler = mempool.clone();
     let latest_height_shared = Arc::new(std::sync::atomic::AtomicU64::new(
         find_latest_height(&state_db),
     ));
@@ -359,6 +360,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             if height == 0 {
                 return;
             }
+            mempool_for_handler.prune_committed_txs();
             latest_height_for_handler.store(height, std::sync::atomic::Ordering::Relaxed);
             match state_db_for_handler.get_cf_raw(CF_BLOCK_HEADERS, &height.to_be_bytes()) {
                 Ok(Some(data)) if data.len() > 32 => {

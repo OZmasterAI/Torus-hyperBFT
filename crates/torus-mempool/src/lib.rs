@@ -326,6 +326,41 @@ impl Mempool {
             }
         }
     }
+
+    /// Prune all senders in the EVM pool against current state nonces.
+    /// Call this on every block commit so non-proposing validators clean up
+    /// txs that were included by other validators' blocks.
+    pub fn prune_committed_txs(&self) {
+        let senders: Vec<alloy_primitives::Address> = {
+            let pool = self.evm.read().unwrap();
+            pool.all_senders()
+        };
+        if senders.is_empty() {
+            return;
+        }
+        let mut pool = self.evm.write().unwrap();
+        let mut total_pruned = 0usize;
+        let mut total_freed = 0usize;
+        for sender in &senders {
+            let state_nonce = self
+                .state
+                .get_account(sender)
+                .ok()
+                .flatten()
+                .map(|a| a.nonce)
+                .unwrap_or(0);
+            let (pruned, freed) = pool.prune_confirmed(sender, state_nonce);
+            total_pruned += pruned;
+            total_freed += freed;
+        }
+        if total_freed > 0 {
+            self.memory_used
+                .fetch_sub(total_freed, std::sync::atomic::Ordering::Relaxed);
+        }
+        if total_pruned > 0 {
+            tracing::info!(pruned = total_pruned, senders = senders.len(), "pruned stale txs on block commit");
+        }
+    }
 }
 
 #[cfg(test)]
