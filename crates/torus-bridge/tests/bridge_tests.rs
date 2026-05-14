@@ -858,7 +858,7 @@ fn gas_accounting_tx_rejected_when_max_fee_below_base_fee() {
     let insufficient_max_fee: u128 = block1_base_fee as u128 - 1;
     let rlp = build_signed_transfer(&sk, bob, U256::from(1u64), 0, insufficient_max_fee);
 
-    // Attempt to propose a block with this transaction — execution should fail.
+    // Proposer skips invalid txs instead of aborting — block succeeds with 0 EVM txs.
     let result = h.proposer.build_block(
         &h.db,
         &h.executor,
@@ -868,21 +868,12 @@ fn gas_accounting_tx_rejected_when_max_fee_below_base_fee() {
         Address::ZERO,
     );
 
-    assert!(
-        result.is_err(),
-        "block proposal must fail when tx max_fee ({insufficient_max_fee}) < base_fee ({block1_base_fee})"
+    let proposed = result.expect("proposer should succeed by skipping the invalid tx");
+    assert_eq!(
+        proposed.block.header.evm_tx_count, 0,
+        "block should contain 0 txs after skipping max_fee < base_fee tx"
     );
-    let err = result.err().expect("result must be Err");
-    match err {
-        torus_bridge::BridgeError::Evm(torus_evm::EvmError::InvalidTransaction(msg)) => {
-            assert!(
-                msg.to_lowercase().contains("gaspricelessthanbasefee")
-                    || msg.contains("GasPriceLessThanBasefee"),
-                "error message should mention GasPriceLessThanBasefee, got: {msg}"
-            );
-        }
-        other => panic!("expected BridgeError::Evm(InvalidTransaction), got: {other}"),
-    }
+    assert_eq!(proposed.block.evm_transactions.len(), 0);
 }
 
 // 18. Unused gas is refunded to sender at max_fee_per_gas per gas unit

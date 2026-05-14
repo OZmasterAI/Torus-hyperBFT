@@ -86,20 +86,38 @@ impl BlockProposer {
             base_fee: next_base_fee,
         };
 
-        // 4. Execute EVM transactions.
-        let mut exec_result = evm_executor.execute_block(state_db, &block_cfg, tx_envs)?;
+        // 4. Execute EVM transactions (skip invalid — don't abort block for one bad tx).
+        let mut exec_result = evm_executor.execute_block(state_db, &block_cfg, tx_envs, true)?;
 
-        // 5. Set tx hashes and block info on receipts.
-        set_receipt_metadata(&mut exec_result, &decoded_txs, block_height);
+        // 5. Filter to only include successfully executed txs.
+        let included = &exec_result.included_indices;
+        let evm_transactions: Vec<Vec<u8>> = included.iter().map(|&i| evm_transactions[i].clone()).collect();
+        let included_decoded: Vec<_> = included.iter().map(|&i| &decoded_txs[i]).collect();
+        if included.len() < decoded_txs.len() {
+            tracing::warn!(
+                total = decoded_txs.len(),
+                included = included.len(),
+                skipped = decoded_txs.len() - included.len(),
+                "skipped invalid txs during block proposal"
+            );
+        }
 
-        // 6. Compute state root without modifying DB.
+        // 6. Set tx hashes and block info on receipts.
+        for (i, receipt) in exec_result.receipts.iter_mut().enumerate() {
+            if let Some(dtx) = included_decoded.get(i) {
+                receipt.tx_hash = dtx.tx_hash;
+            }
+            receipt.block_number = block_height;
+        }
+
+        // 7. Compute state root without modifying DB.
         let state_root = compute_post_bundle_state_root(state_db, &exec_result.bundle)?;
 
-        // 7. Compute receipts root (deterministic hash of serialised receipts).
+        // 8. Compute receipts root (deterministic hash of serialised receipts).
         let receipts_root = compute_receipts_root(&exec_result.receipts)
             .map_err(|e| BridgeError::Serialization(format!("receipts: {e}")))?;
 
-        // 8. Assemble block.
+        // 9. Assemble block with only the included txs.
         let block = TorusBlock {
             header: TorusBlockHeader {
                 height: block_height,
@@ -190,8 +208,25 @@ impl BlockProposer {
             base_fee: next_base_fee,
         };
 
-        let mut exec_result = evm_executor.execute_block(state_db, &block_cfg, tx_envs)?;
-        set_receipt_metadata(&mut exec_result, &decoded_txs, block_height);
+        let mut exec_result = evm_executor.execute_block(state_db, &block_cfg, tx_envs, true)?;
+
+        let included = &exec_result.included_indices;
+        let evm_transactions: Vec<Vec<u8>> = included.iter().map(|&i| evm_transactions[i].clone()).collect();
+        let included_decoded: Vec<_> = included.iter().map(|&i| &decoded_txs[i]).collect();
+        if included.len() < decoded_txs.len() {
+            tracing::warn!(
+                total = decoded_txs.len(),
+                included = included.len(),
+                skipped = decoded_txs.len() - included.len(),
+                "skipped invalid txs during block proposal"
+            );
+        }
+        for (i, receipt) in exec_result.receipts.iter_mut().enumerate() {
+            if let Some(dtx) = included_decoded.get(i) {
+                receipt.tx_hash = dtx.tx_hash;
+            }
+            receipt.block_number = block_height;
+        }
 
         // Compute composite state root (lagged native root — reads unmodified DB).
         let native_root = compute_native_state_root(state_db)?;

@@ -112,7 +112,7 @@ impl BlockValidator {
             base_fee: block.header.base_fee_per_gas,
         };
 
-        let mut exec_result = evm_executor.execute_block(state_db, &block_cfg, tx_envs)?;
+        let mut exec_result = evm_executor.execute_block(state_db, &block_cfg, tx_envs, false)?;
 
         for (i, receipt) in exec_result.receipts.iter_mut().enumerate() {
             if let Some(dtx) = decoded_txs.get(i) {
@@ -246,7 +246,7 @@ impl BlockValidator {
             base_fee: block.header.base_fee_per_gas,
         };
 
-        let mut exec_result = evm_executor.execute_block(state_db, &block_cfg, tx_envs)?;
+        let mut exec_result = evm_executor.execute_block(state_db, &block_cfg, tx_envs, false)?;
 
         for (i, receipt) in exec_result.receipts.iter_mut().enumerate() {
             if let Some(dtx) = decoded_txs.get(i) {

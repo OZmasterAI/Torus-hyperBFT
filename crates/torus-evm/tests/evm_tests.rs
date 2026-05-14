@@ -217,7 +217,7 @@ fn block_execution_multiple_txs() {
     ];
 
     let executor = EvmExecutor::new(TORUS_CHAIN_ID);
-    let result = executor.execute_block(&db, &block_cfg, txs).unwrap();
+    let result = executor.execute_block(&db, &block_cfg, txs, false).unwrap();
 
     assert_eq!(result.receipts.len(), 2);
     assert_eq!(result.gas_used, 42_000); // 21000 * 2
@@ -282,7 +282,7 @@ fn block_gas_limit_exceeded() {
     ];
 
     let executor = EvmExecutor::new(TORUS_CHAIN_ID);
-    let err = executor.execute_block(&db, &block_cfg, txs).unwrap_err();
+    let err = executor.execute_block(&db, &block_cfg, txs, false).unwrap_err();
 
     match err {
         torus_evm::EvmError::BlockGasLimitExceeded { .. } => {}
@@ -305,7 +305,7 @@ fn transfer_block_has_zero_bloom() {
     let txs = vec![transfer_tx(ALICE, BOB, U256::from(1u64), 0, gas_price)];
 
     let executor = EvmExecutor::new(TORUS_CHAIN_ID);
-    let result = executor.execute_block(&db, &block_cfg, txs).unwrap();
+    let result = executor.execute_block(&db, &block_cfg, txs, false).unwrap();
 
     // Plain ETH transfers emit no logs → bloom is all zeros.
     assert_eq!(result.logs_bloom, Bloom::ZERO);
@@ -585,7 +585,7 @@ fn eip1559_unused_gas_refunded() {
         chain_id: Some(TORUS_CHAIN_ID),
         ..Default::default()
     };
-    let block_result = executor.execute_block(&db, &block_cfg2, vec![tx2]).unwrap();
+    let block_result = executor.execute_block(&db, &block_cfg2, vec![tx2], false).unwrap();
 
     // receipt.gas_used = 21_000 (actual), not 50_000 (limit).
     assert_eq!(block_result.receipts[0].gas_used, 21_000,

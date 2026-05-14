@@ -68,6 +68,9 @@ pub struct BlockExecResult {
     pub gas_used: u64,
     /// Aggregate logs bloom for the block.
     pub logs_bloom: Bloom,
+    /// Indices of input txs that were included (only differs from 0..N when
+    /// `skip_invalid` is true and some txs were dropped).
+    pub included_indices: Vec<usize>,
 }
 
 /// EVM executor configured for the Torus chain.
@@ -135,6 +138,7 @@ impl EvmExecutor {
         state_db: &StateDb,
         block_cfg: &BlockEnvCfg,
         transactions: Vec<TxEnv>,
+        skip_invalid: bool,
     ) -> Result<BlockExecResult, EvmError> {
         let state = State::builder()
             .with_database_ref(state_db)
@@ -157,12 +161,22 @@ impl EvmExecutor {
         let mut receipts = Vec::with_capacity(transactions.len());
         let mut cumulative_gas: u64 = 0;
         let mut block_bloom = Bloom::ZERO;
+        let mut included_indices = Vec::with_capacity(transactions.len());
+        let mut receipt_idx: usize = 0;
 
         for (idx, tx) in transactions.into_iter().enumerate() {
             let max_fee = tx.gas_price;
             let priority_fee = tx.gas_priority_fee;
 
-            let result = evm.transact_commit(tx).map_err(map_evm_err)?;
+            let result = match evm.transact_commit(tx) {
+                Ok(r) => r,
+                Err(EVMError::Transaction(tx_err)) if skip_invalid => {
+                    tracing::warn!(idx, ?tx_err, "skipping invalid tx during block proposal");
+                    continue;
+                }
+                Err(e) => return Err(map_evm_err(e)),
+            };
+            included_indices.push(idx);
             let gas_used = result.gas().used();
 
             cumulative_gas =
@@ -209,7 +223,7 @@ impl EvmExecutor {
                 tx_hash: B256::ZERO,
                 block_number: block_cfg.number,
                 block_hash: B256::ZERO,
-                tx_index: idx as u32,
+                tx_index: receipt_idx as u32,
                 cumulative_gas_used: cumulative_gas,
                 gas_used,
                 contract_address,
@@ -218,6 +232,7 @@ impl EvmExecutor {
                 status: success,
                 effective_gas_price,
             });
+            receipt_idx += 1;
         }
 
         // Merge all transaction transitions into the bundle.
@@ -232,6 +247,7 @@ impl EvmExecutor {
             bundle,
             gas_used: cumulative_gas,
             logs_bloom: block_bloom,
+            included_indices,
         })
     }
 }
