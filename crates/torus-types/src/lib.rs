@@ -225,6 +225,8 @@ pub struct TorusBlockHeader {
     pub logs_bloom: Bloom,
     /// Gas used by EVM transactions.
     pub evm_gas_used: u64,
+    /// Total EVM fee revenue in wei: sum(gas_used * effective_gas_price).
+    pub evm_fee_revenue: u128,
     /// Gas limit for EVM transactions in this block.
     pub evm_gas_limit: u64,
     /// Native action count.
@@ -253,6 +255,7 @@ impl TorusBlockHeader {
         buf.extend_from_slice(self.receipts_root.as_slice());
         buf.extend_from_slice(self.logs_bloom.as_slice());
         buf.extend_from_slice(&self.evm_gas_used.to_be_bytes());
+        buf.extend_from_slice(&self.evm_fee_revenue.to_be_bytes());
         buf.extend_from_slice(&self.evm_gas_limit.to_be_bytes());
         buf.extend_from_slice(&self.native_action_count.to_be_bytes());
         buf.extend_from_slice(&self.evm_tx_count.to_be_bytes());

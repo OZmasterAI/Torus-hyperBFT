@@ -489,7 +489,7 @@ impl TorusApp {
         NativeExecutor::execute_batch(&mut ctx, &post_evm);
         NativeExecutor::drain_core_writer(&mut ctx)?;
         NativeExecutor::process_governance(&mut ctx);
-        NativeExecutor::distribute_fees(&mut ctx, block.header.evm_gas_used);
+        NativeExecutor::distribute_fees(&mut ctx, block.header.evm_fee_revenue);
         NativeExecutor::process_epoch_boundary(&mut ctx);
         ctx.save_order_books();
         for (sender, nonce) in &consumed_nonces {
@@ -828,6 +828,7 @@ fn produce_empty_block(
             receipts_root: B256::ZERO,
             logs_bloom: Bloom::ZERO,
             evm_gas_used: 0,
+            evm_fee_revenue: 0,
             evm_gas_limit: parent.evm_gas_limit,
             native_action_count: 0,
             evm_tx_count: 0,
@@ -893,6 +894,7 @@ mod crash_recovery_tests {
                 receipts_root: B256::ZERO,
                 logs_bloom: Bloom::ZERO,
                 evm_gas_used: 0,
+                evm_fee_revenue: 0,
                 evm_gas_limit: 30_000_000,
                 native_action_count: native_actions.len() as u32,
                 evm_tx_count: 0,

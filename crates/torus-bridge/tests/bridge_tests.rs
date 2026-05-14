@@ -481,6 +481,7 @@ fn block_hash_uses_canonical_encoding() {
         receipts_root: B256::new([2u8; 32]),
         logs_bloom: alloy_primitives::Bloom::ZERO,
         evm_gas_used: 21_000,
+        evm_fee_revenue: 0,
         evm_gas_limit: 30_000_000,
         native_action_count: 5,
         evm_tx_count: 3,

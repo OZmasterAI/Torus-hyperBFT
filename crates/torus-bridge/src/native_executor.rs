@@ -1148,8 +1148,8 @@ impl NativeExecutor {
     }
 
     /// Distribute fees at end of block.
-    pub fn distribute_fees(ctx: &mut NativeExecContext, total_evm_fees: u64) -> NativeActionResult {
-        let total_fees = U256::from(ctx.total_native_fees + total_evm_fees);
+    pub fn distribute_fees(ctx: &mut NativeExecContext, total_evm_fees: u128) -> NativeActionResult {
+        let total_fees = U256::from(ctx.total_native_fees as u128 + total_evm_fees);
         if total_fees.is_zero() {
             return NativeActionResult::ok("fee_distribution", 0);
         }

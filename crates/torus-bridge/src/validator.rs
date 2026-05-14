@@ -128,6 +128,14 @@ impl BlockValidator {
             )));
         }
 
+        let computed_fee_revenue = crate::proposer::compute_fee_revenue(&exec_result.receipts);
+        if computed_fee_revenue != block.header.evm_fee_revenue {
+            return Err(BridgeError::InvalidBlock(format!(
+                "fee revenue mismatch: header={}, computed={}",
+                block.header.evm_fee_revenue, computed_fee_revenue
+            )));
+        }
+
         // FIX CONS-PF-13: Verify receipts_root by recomputing from execution results.
         let computed_receipts_root = crate::proposer::compute_receipts_root(&exec_result.receipts)
             .map_err(|e| BridgeError::Serialization(format!("receipts: {e}")))?;
@@ -251,6 +259,14 @@ impl BlockValidator {
             return Err(BridgeError::InvalidBlock(format!(
                 "gas used mismatch: header={}, executed={}",
                 block.header.evm_gas_used, exec_result.gas_used
+            )));
+        }
+
+        let computed_fee_revenue = crate::proposer::compute_fee_revenue(&exec_result.receipts);
+        if computed_fee_revenue != block.header.evm_fee_revenue {
+            return Err(BridgeError::InvalidBlock(format!(
+                "fee revenue mismatch: header={}, computed={}",
+                block.header.evm_fee_revenue, computed_fee_revenue
             )));
         }
 

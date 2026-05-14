@@ -430,6 +430,7 @@ mod tests {
             receipts_root: B256::ZERO,
             logs_bloom: Bloom::ZERO,
             evm_gas_used: gas_used,
+            evm_fee_revenue: 0,
             evm_gas_limit: 30_000_000,
             native_action_count: 0,
             evm_tx_count: 0,
@@ -561,7 +562,7 @@ mod tests {
                 .request::<String, _>("eth_chainId", jsonrpsee::rpc_params![])
                 .await
                 .unwrap(),
-            "0x1e61"
+            "0x1e62"
         );
         handle.stop().unwrap();
     }

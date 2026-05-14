@@ -6,7 +6,7 @@ use torus_evm::{
     calc_next_block_base_fee, BlockEnvCfg, BlockExecResult, EvmExecutor, DEFAULT_BLOCK_GAS_LIMIT,
 };
 use torus_state::StateDb;
-use torus_types::{SignedNativeAction, TorusBlock, TorusBlockHeader};
+use torus_types::{Receipt, SignedNativeAction, TorusBlock, TorusBlockHeader};
 
 use crate::decode::{decode_all_txs, DecodedTx};
 use crate::error::BridgeError;
@@ -109,6 +109,7 @@ impl BlockProposer {
                 receipts_root,
                 logs_bloom: exec_result.logs_bloom,
                 evm_gas_used: exec_result.gas_used,
+                evm_fee_revenue: compute_fee_revenue(&exec_result.receipts),
                 evm_gas_limit: gas_limit,
                 native_action_count: 0,
                 evm_tx_count: evm_transactions.len() as u32,
@@ -207,6 +208,7 @@ impl BlockProposer {
                 receipts_root,
                 logs_bloom: exec_result.logs_bloom,
                 evm_gas_used: exec_result.gas_used,
+                evm_fee_revenue: compute_fee_revenue(&exec_result.receipts),
                 evm_gas_limit: gas_limit,
                 native_action_count: signed_native_actions.len() as u32,
                 evm_tx_count: evm_transactions.len() as u32,
@@ -260,6 +262,7 @@ pub fn genesis_parent_header() -> TorusBlockHeader {
         receipts_root: B256::ZERO,
         logs_bloom: Bloom::ZERO,
         evm_gas_used: 0,
+        evm_fee_revenue: 0,
         evm_gas_limit: DEFAULT_BLOCK_GAS_LIMIT,
         native_action_count: 0,
         evm_tx_count: 0,
@@ -267,4 +270,11 @@ pub fn genesis_parent_header() -> TorusBlockHeader {
         epoch: 0,
         validator_set_hash: B256::ZERO,
     }
+}
+
+pub fn compute_fee_revenue(receipts: &[Receipt]) -> u128 {
+    receipts
+        .iter()
+        .map(|r| r.gas_used as u128 * r.effective_gas_price as u128)
+        .sum()
 }

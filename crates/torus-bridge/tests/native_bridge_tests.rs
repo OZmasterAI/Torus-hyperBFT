@@ -360,6 +360,7 @@ fn empty_native_actions_evm_only() {
             receipts_root: B256::ZERO,
             logs_bloom: alloy_primitives::Bloom::ZERO,
             evm_gas_used: 0,
+            evm_fee_revenue: 0,
             evm_gas_limit: 30_000_000,
             native_action_count: 0,
             evm_tx_count: 0,
