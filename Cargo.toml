@@ -19,6 +19,7 @@ members = [
     "crates/torus-explorer",
     "tools/faucet",
     "tools/wallet",
+    "tools/tx-flood",
 ]
 
 [workspace.package]
