@@ -61,52 +61,65 @@ for i in "${!ADDRS[@]}"; do
     NONCES+=("$N")
 done
 
+BATCH=${2:-8}
 echo ""
-echo "Sending ~10 tx/sec (round-robin across $NUM_KEYS accounts)"
+echo "Sending ~${BATCH} tx/batch across $NUM_KEYS accounts (parallel)"
 echo "Press Ctrl+C to stop"
 echo ""
 
 COUNT=0
 ERRORS=0
-trap 'echo ""; echo "Stopped after $COUNT tx ($ERRORS errors)."; exit 0' INT
+trap 'wait 2>/dev/null; echo ""; echo "Stopped after $COUNT tx ($ERRORS errors)."; exit 0' INT
 
 while true; do
-    SENDER_IDX=$(( COUNT % NUM_KEYS ))
-    RECV_IDX=$(( (SENDER_IDX + 1 + RANDOM % (NUM_KEYS - 1)) % NUM_KEYS ))
+    PIDS=()
+    for (( b=0; b<BATCH; b++ )); do
+        SENDER_IDX=$(( (COUNT + b) % NUM_KEYS ))
+        RECV_IDX=$(( (SENDER_IDX + 1 + RANDOM % (NUM_KEYS - 1)) % NUM_KEYS ))
 
-    COUNT=$((COUNT + 1))
-    TIMESTAMP=$(date +"%H:%M:%S")
+        TRS_AMOUNT=$(( RANDOM % 91 + 10 ))
+        WEI_AMOUNT="${TRS_AMOUNT}000000000000000000"
 
-    TRS_AMOUNT=$(( RANDOM % 9901 + 100 ))
-    WEI_AMOUNT="${TRS_AMOUNT}000000000000000000"
-
-    NONCE="${NONCES[$SENDER_IDX]}"
-
-    S_SHORT="${ADDRS[$SENDER_IDX]:0:8}"
-    R_SHORT="${ADDRS[$RECV_IDX]:0:8}"
-
-    TX_HASH=$(cast send \
-        --private-key "${KEYS[$SENDER_IDX]}" \
-        --rpc-url "$EVM_URL" \
-        --chain "$CHAIN_ID" \
-        --gas-price "$GAS_PRICE" \
-        --nonce "$NONCE" \
-        --async \
-        "${ADDRS[$RECV_IDX]}" \
-        --value "$WEI_AMOUNT" \
-        2>&1) || TX_HASH="FAILED"
-
-    if [[ "$TX_HASH" == "FAILED" ]] || [[ "$TX_HASH" == *"rror"* ]]; then
-        ERRORS=$((ERRORS + 1))
-        FRESH=$(cast nonce --rpc-url "$EVM_URL" "${ADDRS[$SENDER_IDX]}" 2>/dev/null)
-        if [ -n "$FRESH" ]; then
-            NONCES[$SENDER_IDX]="$FRESH"
-        fi
-        echo "[$TIMESTAMP] #$COUNT | ${TRS_AMOUNT} TRS | ${S_SHORT}→${R_SHORT} | FAILED (resync nonce→${FRESH})"
-    else
+        NONCE="${NONCES[$SENDER_IDX]}"
         NONCES[$SENDER_IDX]=$(( NONCE + 1 ))
-        echo "[$TIMESTAMP] #$COUNT | ${TRS_AMOUNT} TRS | ${S_SHORT}→${R_SHORT} | ${TX_HASH:0:18}..."
+
+        S_SHORT="${ADDRS[$SENDER_IDX]:0:8}"
+        R_SHORT="${ADDRS[$RECV_IDX]:0:8}"
+        IDX=$((COUNT + b + 1))
+
+        (
+            TX_HASH=$(cast send \
+                --private-key "${KEYS[$SENDER_IDX]}" \
+                --rpc-url "$EVM_URL" \
+                --chain "$CHAIN_ID" \
+                --gas-price "$GAS_PRICE" \
+                --priority-gas-price "$GAS_PRICE" \
+                --nonce "$NONCE" \
+                --async \
+                "${ADDRS[$RECV_IDX]}" \
+                --value "$WEI_AMOUNT" \
+                2>&1) || TX_HASH="FAILED"
+
+            TS=$(date +"%H:%M:%S")
+            if [[ "$TX_HASH" == "FAILED" ]] || [[ "$TX_HASH" == *"rror"* ]]; then
+                echo "[$TS] #$IDX | ${TRS_AMOUNT} TRS | ${S_SHORT}→${R_SHORT} | FAILED"
+            else
+                echo "[$TS] #$IDX | ${TRS_AMOUNT} TRS | ${S_SHORT}→${R_SHORT} | ${TX_HASH:0:18}..."
+            fi
+        ) &
+        PIDS+=($!)
+    done
+
+    wait "${PIDS[@]}" 2>/dev/null
+    COUNT=$((COUNT + BATCH))
+
+    # Resync nonces every 80 txs to recover from any failures
+    if (( COUNT % 24 == 0 )); then
+        for i in "${!ADDRS[@]}"; do
+            N=$(cast nonce --rpc-url "$EVM_URL" "${ADDRS[$i]}" 2>/dev/null || echo "${NONCES[$i]}")
+            NONCES[$i]="$N"
+        done
     fi
 
-    sleep 0.1
+    sleep 0.05
 done
