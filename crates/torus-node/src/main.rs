@@ -329,7 +329,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         .epoch_length(EpochLength::new(chain_config.epoch_length as u32))
         .max_view_time(Duration::from_millis(500))
         .progress_msg_buffer_capacity(BufferSize::new(1024))
-        .block_sync_request_limit(10)
+        .block_sync_request_limit(128)
         .block_sync_server_advertise_time(Duration::new(10, 0))
         .block_sync_response_timeout(Duration::new(3, 0))
         .block_sync_blacklist_expiry_time(Duration::new(10, 0))

@@ -92,6 +92,10 @@ impl<N: Network> BlockSyncClient<N> {
         }
     }
 
+    pub(crate) fn has_pending_sync(&self) -> bool {
+        self.pending_sync.is_some()
+    }
+
     /// Process a received [`BlockSyncAdvertiseMessage`].
     pub(crate) fn on_receive_msg<K: KVStore>(
         &mut self,

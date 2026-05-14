@@ -9,6 +9,7 @@
 use std::{
     sync::mpsc::{Receiver, Sender, TryRecvError},
     thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
 
 use ed25519_dalek::VerifyingKey;
@@ -175,9 +176,15 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
             }
 
             // 7. Poll the network for incoming messages.
+            // Use a short deadline during active sync so we don't park for 500ms between batches.
+            let recv_deadline = if self.block_sync_client.has_pending_sync() {
+                std::cmp::min(view_info.deadline, Instant::now() + Duration::from_millis(10))
+            } else {
+                view_info.deadline
+            };
             match self
                 .pm_stub
-                .recv(self.chain_id, view_info.view, view_info.deadline)
+                .recv(self.chain_id, view_info.view, recv_deadline)
             {
                 Ok((origin, msg)) => match msg {
                     ProgressMessage::HotStuffMessage(msg) => {
