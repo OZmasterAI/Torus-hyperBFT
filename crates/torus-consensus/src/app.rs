@@ -587,17 +587,13 @@ impl TorusApp {
                             evm_txs = torus_block.evm_transactions.len(),
                             "committed block state to DB"
                         );
-                        if has_native {
-                            match self.execute_native_post_commit(
-                                &torus_block,
-                                validated.native_sender_actions,
-                                validated.native_consumed_nonces,
-                            ) {
-                                Ok(()) => self.write_native_applied_height(torus_block.header.height),
-                                Err(e) => tracing::error!(%e, "native post-commit execution failed"),
-                            }
-                        } else {
-                            self.write_native_applied_height(torus_block.header.height);
+                        match self.execute_native_post_commit(
+                            &torus_block,
+                            validated.native_sender_actions,
+                            validated.native_consumed_nonces,
+                        ) {
+                            Ok(()) => self.write_native_applied_height(torus_block.header.height),
+                            Err(e) => tracing::error!(%e, "native post-commit execution failed"),
                         }
                     }
                     Err(e) => {
