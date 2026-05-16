@@ -216,6 +216,32 @@ impl Mempool {
         self.submit_native_action(sender, action)
     }
 
+    /// Submit a session-signed native action with pre-resolved sender.
+    /// Called by RPC after verifying the session key signature against state.
+    pub fn add_native_action_presigned(
+        &self,
+        sender: alloy_primitives::Address,
+        action: SignedNativeAction,
+    ) -> Result<(), MempoolError> {
+        let current_time_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before epoch")
+            .as_millis() as u64;
+
+        // Nonce window check still applies.
+        use torus_types::eip712::NONCE_WINDOW_MS;
+        if action.nonce.saturating_add(NONCE_WINDOW_MS) < current_time_ms {
+            return Err(MempoolError::NativeValidationFailed("nonce too old".into()));
+        }
+        if action.nonce > current_time_ms.saturating_add(NONCE_WINDOW_MS) {
+            return Err(MempoolError::NativeValidationFailed(
+                "nonce too far in future".into(),
+            ));
+        }
+
+        self.submit_native_action(sender, action)
+    }
+
     /// FIX EVM-FIND-15: Renamed from submit_native_action and restricted to pub(crate).
     /// Internal method for inserting a native action with a pre-verified sender.
     pub fn submit_native_action(
@@ -792,12 +818,12 @@ mod tests {
         let (_dir, state) = setup();
         let pool = Mempool::new(state, MempoolConfig::default());
 
-        use torus_types::{NativeAction, Signature};
-        let sig = Signature {
+        use torus_types::{ActionSignature, NativeAction, Signature};
+        let sig = ActionSignature::Eip712(Signature {
             v: 27,
             r: [0u8; 32],
             s: [0u8; 32],
-        };
+        });
         let sender = Address::repeat_byte(0xAA);
 
         pool.submit_native_action(
@@ -884,11 +910,11 @@ mod tests {
             SignedNativeAction {
                 action: torus_types::NativeAction::ClaimRewards,
                 nonce: 1,
-                signature: torus_types::Signature {
+                signature: torus_types::ActionSignature::Eip712(torus_types::Signature {
                     v: 27,
                     r: [0; 32],
                     s: [0; 32],
-                },
+                }),
             },
         )
         .unwrap();

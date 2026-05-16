@@ -25,4 +25,5 @@ tracing = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 k256 = { workspace = true }
+ed25519-dalek = { workspace = true }
 alloy-eips = { workspace = true }

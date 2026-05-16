@@ -598,11 +598,18 @@ impl TorusApiServer for RpcState {
             .map_err(|e| RpcError::InvalidParams(format!("invalid action encoding: {e}")))
             .map_err(ErrorObjectOwned::from)?;
 
-        // Validate signature — recover sender address.
-        // TODO: Add nonce/chain-id validation once wall-clock time is available in RPC context.
-        let _sender = action
-            .recover_sender()
-            .map_err(|e| RpcError::InvalidParams(format!("signature verification failed: {e:?}")))
+        // Resolve sender — supports both EIP-712 ECDSA and ed25519 session keys.
+        let current_time_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before epoch")
+            .as_millis() as u64;
+
+        let state_ref = &self.state;
+        let sender = action
+            .validate_with_sessions(current_time_ms, self.chain_id, |pubkey| {
+                state_ref.get_session(pubkey).ok().flatten()
+            })
+            .map_err(|e| RpcError::InvalidParams(format!("signature verification failed: {e}")))
             .map_err(ErrorObjectOwned::from)?;
 
         // Compute action hash for the receipt.
@@ -611,9 +618,10 @@ impl TorusApiServer for RpcState {
             .map_err(ErrorObjectOwned::from)?;
         let hash = keccak256(&action_bytes);
 
-        // Submit to mempool native action pool.
+        // Submit to mempool with pre-resolved sender (bypasses validate() which
+        // only handles EIP-712; we already validated above with session support).
         self.mempool
-            .add_native_action(action)
+            .add_native_action_presigned(sender, action)
             .map_err(|e| ErrorObjectOwned::from(RpcError::Internal(format!("mempool: {e}"))))?;
 
         Ok(hex_b256(hash))

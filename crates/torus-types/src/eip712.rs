@@ -7,12 +7,13 @@
 //! Domain: `{ name: "Torus", version: "1", chainId: 7778, verifyingContract: 0x0 }`
 
 use alloy_primitives::{keccak256, Address, B256, U256};
+use ed25519_dalek::{Verifier, VerifyingKey as Ed25519VerifyingKey};
 use k256::ecdsa::{RecoveryId, SigningKey, VerifyingKey};
 
 use crate::{
-    FixedPoint, MarketId, MarketListing, MarketParams, NativeAction, OracleSubmission, OrderId,
-    OrderType, PlaceOrderParams, Proposal, ProposalAction, PublicKey, Signature,
-    SignedNativeAction, VoteOption,
+    ActionSignature, FixedPoint, MarketId, MarketListing, MarketParams, NativeAction,
+    OracleSubmission, OrderId, OrderType, PlaceOrderParams, Proposal, ProposalAction, PublicKey,
+    SessionScope, Signature, SignedNativeAction, VoteOption,
 };
 
 // ============================================================================
@@ -42,6 +43,20 @@ pub enum Eip712Error {
     NonceTooFuture,
     /// Node's chain ID does not match the domain separator chain ID.
     ChainIdMismatch { expected: u64, got: u64 },
+    /// Session key signature verification failed.
+    SessionSignatureInvalid,
+    /// Session key not found in state.
+    SessionNotFound,
+    /// Session key has expired.
+    SessionExpired,
+    /// Action not allowed by session scope.
+    SessionScopeViolation,
+    /// Action requires EIP-712 signature (cannot use session key).
+    RequiresEip712,
+    /// Max active sessions exceeded.
+    MaxSessionsExceeded,
+    /// Session expiry exceeds maximum allowed (24h).
+    ExpiryTooFar,
 }
 
 impl std::fmt::Display for Eip712Error {
@@ -54,6 +69,13 @@ impl std::fmt::Display for Eip712Error {
             Self::ChainIdMismatch { expected, got } => {
                 write!(f, "chain ID mismatch: expected {expected}, got {got}")
             }
+            Self::SessionSignatureInvalid => write!(f, "ed25519 session signature invalid"),
+            Self::SessionNotFound => write!(f, "session key not found"),
+            Self::SessionExpired => write!(f, "session key expired"),
+            Self::SessionScopeViolation => write!(f, "action not allowed by session scope"),
+            Self::RequiresEip712 => write!(f, "action requires EIP-712 ECDSA signature"),
+            Self::MaxSessionsExceeded => write!(f, "max 5 active sessions per address"),
+            Self::ExpiryTooFar => write!(f, "session expiry exceeds 24h maximum"),
         }
     }
 }
@@ -208,6 +230,12 @@ pub fn eip712_struct_hash(action: &NativeAction, nonce: u64) -> B256 {
         NativeAction::ListMarket(listing) => hash_list_market(listing, nonce),
         NativeAction::DelistMarket { market_id } => hash_delist_market(*market_id, nonce),
         NativeAction::TopUpSelfStake { amount } => hash_top_up_self_stake(amount, nonce),
+        NativeAction::CreateSession { session_pubkey, expiry, scope } => {
+            hash_create_session(session_pubkey, *expiry, *scope, nonce)
+        }
+        NativeAction::RevokeSession { session_pubkey } => {
+            hash_revoke_session(session_pubkey, nonce)
+        }
     }
 }
 
@@ -487,6 +515,26 @@ fn hash_top_up_self_stake(amount: &U256, nonce: u64) -> B256 {
     keccak256(&buf)
 }
 
+fn hash_create_session(pubkey: &[u8; 32], expiry: u64, scope: SessionScope, nonce: u64) -> B256 {
+    let th = keccak256("CreateSession(bytes32 sessionPubkey,uint64 expiry,uint8 scope,uint64 nonce)");
+    let mut buf = Vec::with_capacity(5 * 32);
+    buf.extend_from_slice(&th.0);
+    buf.extend_from_slice(pubkey);
+    buf.extend_from_slice(&encode_u64(expiry));
+    buf.extend_from_slice(&encode_u8(scope as u8));
+    buf.extend_from_slice(&encode_u64(nonce));
+    keccak256(&buf)
+}
+
+fn hash_revoke_session(pubkey: &[u8; 32], nonce: u64) -> B256 {
+    let th = keccak256("RevokeSession(bytes32 sessionPubkey,uint64 nonce)");
+    let mut buf = Vec::with_capacity(3 * 32);
+    buf.extend_from_slice(&th.0);
+    buf.extend_from_slice(pubkey);
+    buf.extend_from_slice(&encode_u64(nonce));
+    keccak256(&buf)
+}
+
 // ---------- nested-type helpers ----------
 
 fn hash_proposal_action(action: &ProposalAction) -> B256 {
@@ -600,21 +648,109 @@ pub fn sign_native_action(
     SignedNativeAction {
         action,
         nonce,
-        signature: Signature {
+        signature: ActionSignature::Eip712(Signature {
             v: recid.to_byte() + 27,
             r,
             s,
-        },
+        }),
     }
+}
+
+/// Maximum session key expiry: 24 hours in milliseconds.
+pub const MAX_SESSION_EXPIRY_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// Maximum active sessions per address.
+pub const MAX_SESSIONS_PER_ADDRESS: usize = 5;
+
+/// Actions that MUST use EIP-712 signature (cannot use session keys).
+pub fn requires_eip712(action: &NativeAction) -> bool {
+    matches!(
+        action,
+        NativeAction::CreateSession { .. }
+            | NativeAction::RevokeSession { .. }
+            | NativeAction::Withdraw { .. }
+            | NativeAction::Delegate { .. }
+            | NativeAction::Undelegate { .. }
+            | NativeAction::PermanentStake { .. }
+            | NativeAction::ClaimRewards
+    )
 }
 
 impl SignedNativeAction {
     /// Recover the sender's Ethereum address from the EIP-712 signature.
+    /// Returns error if the signature is a session key (use `resolve_sender` with state instead).
     pub fn recover_sender(&self) -> Result<Address, Eip712Error> {
-        let domain = eip712_domain_separator();
-        let struct_hash = eip712_struct_hash(&self.action, self.nonce);
-        let signing_hash = eip712_signing_hash(domain, struct_hash);
-        ecrecover(&signing_hash, &self.signature)
+        match &self.signature {
+            ActionSignature::Eip712(sig) => {
+                let domain = eip712_domain_separator();
+                let struct_hash = eip712_struct_hash(&self.action, self.nonce);
+                let signing_hash = eip712_signing_hash(domain, struct_hash);
+                ecrecover(&signing_hash, sig)
+            }
+            ActionSignature::Session { .. } => Err(Eip712Error::RequiresEip712),
+        }
+    }
+
+    /// Verify ed25519 session signature and return the session pubkey.
+    /// Does NOT check session state (expiry, scope) — caller must do that.
+    pub fn verify_session_signature(&self) -> Result<[u8; 32], Eip712Error> {
+        match &self.signature {
+            ActionSignature::Session { session_pubkey, sig } => {
+                let vk = Ed25519VerifyingKey::from_bytes(session_pubkey)
+                    .map_err(|_| Eip712Error::SessionSignatureInvalid)?;
+                let ed_sig = ed25519_dalek::Signature::from_bytes(&sig.0);
+                let domain = eip712_domain_separator();
+                let struct_hash = eip712_struct_hash(&self.action, self.nonce);
+                let signing_hash = eip712_signing_hash(domain, struct_hash);
+                vk.verify(signing_hash.as_slice(), &ed_sig)
+                    .map_err(|_| Eip712Error::SessionSignatureInvalid)?;
+                Ok(*session_pubkey)
+            }
+            ActionSignature::Eip712(_) => Err(Eip712Error::InvalidSignature),
+        }
+    }
+
+    /// Resolve the sender address using state-based session lookup.
+    /// For Eip712: recovers ECDSA sender directly.
+    /// For Session: verifies ed25519, then looks up session owner via the provided closure.
+    pub fn resolve_sender<F>(
+        &self,
+        current_timestamp: u64,
+        session_lookup: F,
+    ) -> Result<Address, Eip712Error>
+    where
+        F: FnOnce(&[u8; 32]) -> Option<crate::SessionData>,
+    {
+        match &self.signature {
+            ActionSignature::Eip712(sig) => {
+                let domain = eip712_domain_separator();
+                let struct_hash = eip712_struct_hash(&self.action, self.nonce);
+                let signing_hash = eip712_signing_hash(domain, struct_hash);
+                ecrecover(&signing_hash, sig)
+            }
+            ActionSignature::Session { session_pubkey, sig } => {
+                if requires_eip712(&self.action) {
+                    return Err(Eip712Error::RequiresEip712);
+                }
+                let vk = Ed25519VerifyingKey::from_bytes(session_pubkey)
+                    .map_err(|_| Eip712Error::SessionSignatureInvalid)?;
+                let ed_sig = ed25519_dalek::Signature::from_bytes(&sig.0);
+                let domain = eip712_domain_separator();
+                let struct_hash = eip712_struct_hash(&self.action, self.nonce);
+                let signing_hash = eip712_signing_hash(domain, struct_hash);
+                vk.verify(signing_hash.as_slice(), &ed_sig)
+                    .map_err(|_| Eip712Error::SessionSignatureInvalid)?;
+                let session = session_lookup(session_pubkey)
+                    .ok_or(Eip712Error::SessionNotFound)?;
+                if current_timestamp > session.expiry {
+                    return Err(Eip712Error::SessionExpired);
+                }
+                if !session.scope.allows(&self.action) {
+                    return Err(Eip712Error::SessionScopeViolation);
+                }
+                Ok(session.owner)
+            }
+        }
     }
 
     /// Full validation: chain ID guard, nonce freshness, and sender recovery.
@@ -642,6 +778,33 @@ impl SignedNativeAction {
         }
 
         self.recover_sender()
+    }
+
+    /// Full validation with session key support.
+    pub fn validate_with_sessions<F>(
+        &self,
+        current_time_ms: u64,
+        expected_chain_id: u64,
+        session_lookup: F,
+    ) -> Result<Address, Eip712Error>
+    where
+        F: FnOnce(&[u8; 32]) -> Option<crate::SessionData>,
+    {
+        if expected_chain_id != TORUS_CHAIN_ID {
+            return Err(Eip712Error::ChainIdMismatch {
+                expected: TORUS_CHAIN_ID,
+                got: expected_chain_id,
+            });
+        }
+
+        if self.nonce.saturating_add(NONCE_WINDOW_MS) < current_time_ms {
+            return Err(Eip712Error::NonceTooOld);
+        }
+        if self.nonce > current_time_ms.saturating_add(NONCE_WINDOW_MS) {
+            return Err(Eip712Error::NonceTooFuture);
+        }
+
+        self.resolve_sender(current_time_ms, session_lookup)
     }
 }
 
@@ -950,6 +1113,9 @@ mod tests {
     fn signature_v_is_27_or_28() {
         let key = test_key();
         let signed = sign_native_action(NativeAction::ClaimRewards, TEST_NONCE, &key);
-        assert!(signed.signature.v == 27 || signed.signature.v == 28);
+        match &signed.signature {
+            ActionSignature::Eip712(sig) => assert!(sig.v == 27 || sig.v == 28),
+            _ => panic!("expected Eip712 signature"),
+        }
     }
 }

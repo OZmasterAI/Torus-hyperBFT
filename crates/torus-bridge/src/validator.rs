@@ -211,9 +211,11 @@ impl BlockValidator {
         let mut sender_actions = Vec::with_capacity(block.native_actions.len());
         let mut consumed_nonces: Vec<(Address, u64)> = Vec::new();
         for (i, signed) in block.native_actions.iter().enumerate() {
-            let sender = signed.recover_sender().map_err(|e| {
+            let sender = signed.resolve_sender(block.header.timestamp, |pubkey| {
+                state_db.get_session(pubkey).ok().flatten()
+            }).map_err(|e| {
                 BridgeError::InvalidBlock(format!(
-                    "native action {i}: invalid EIP-712 signature: {e}"
+                    "native action {i}: signature verification failed: {e}"
                 ))
             })?;
             // Replay check: reject blocks containing replayed nonces.

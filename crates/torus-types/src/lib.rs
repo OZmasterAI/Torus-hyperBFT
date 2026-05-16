@@ -190,6 +190,104 @@ pub struct Signature {
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PublicKey(pub [u8; 32]);
 
+/// Scope of actions a session key is authorized to perform.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SessionScope {
+    /// PlaceOrder, CancelOrder, ModifyOrder, CancelAllOrders only.
+    Trading,
+    /// TransferToPerp, TransferToSpot only.
+    TransfersOnly,
+    /// Everything except CreateSession, RevokeSession, Withdraw, Delegate,
+    /// Undelegate, PermanentStake, ClaimRewards.
+    Full,
+}
+
+impl SessionScope {
+    pub fn allows(&self, action: &NativeAction) -> bool {
+        match self {
+            SessionScope::Trading => matches!(
+                action,
+                NativeAction::PlaceOrder(_)
+                    | NativeAction::CancelOrder { .. }
+                    | NativeAction::ModifyOrder { .. }
+                    | NativeAction::CancelAllOrders { .. }
+            ),
+            SessionScope::TransfersOnly => matches!(
+                action,
+                NativeAction::TransferToPerp { .. } | NativeAction::TransferToSpot { .. }
+            ),
+            SessionScope::Full => !matches!(
+                action,
+                NativeAction::CreateSession { .. }
+                    | NativeAction::RevokeSession { .. }
+                    | NativeAction::Withdraw { .. }
+                    | NativeAction::Delegate { .. }
+                    | NativeAction::Undelegate { .. }
+                    | NativeAction::PermanentStake { .. }
+                    | NativeAction::ClaimRewards
+            ),
+        }
+    }
+}
+
+/// Ed25519 signature (64 bytes) with custom serde as two 32-byte halves.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Ed25519Sig(pub [u8; 64]);
+
+impl Serialize for Ed25519Sig {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeTuple;
+        let mut seq = serializer.serialize_tuple(64)?;
+        for byte in &self.0 {
+            seq.serialize_element(byte)?;
+        }
+        seq.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for Ed25519Sig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = Ed25519Sig;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                write!(f, "64 bytes")
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Ed25519Sig, A::Error> {
+                let mut buf = [0u8; 64];
+                for (i, byte) in buf.iter_mut().enumerate() {
+                    *byte = seq.next_element()?.ok_or_else(|| {
+                        serde::de::Error::invalid_length(i, &"64 bytes")
+                    })?;
+                }
+                Ok(Ed25519Sig(buf))
+            }
+        }
+        deserializer.deserialize_tuple(64, Visitor)
+    }
+}
+
+/// Signature type for native actions — either traditional EIP-712 ECDSA or ed25519 session key.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ActionSignature {
+    /// Traditional EIP-712 ECDSA signature (secp256k1).
+    Eip712(Signature),
+    /// Ed25519 session key signature.
+    Session {
+        session_pubkey: [u8; 32],
+        sig: Ed25519Sig,
+    },
+}
+
+/// Stored session key data (persisted in state DB).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionData {
+    pub owner: Address,
+    pub expiry: u64,
+    pub scope: SessionScope,
+    pub created_at: u64,
+}
+
 // ============================================================================
 // Block Types (§3.2)
 // ============================================================================
@@ -365,6 +463,16 @@ pub enum NativeAction {
     UnjailSelf,
     RotateValidatorKey {
         new_pubkey: PublicKey,
+    },
+
+    // === Session Keys ===
+    CreateSession {
+        session_pubkey: [u8; 32],
+        expiry: u64,
+        scope: SessionScope,
+    },
+    RevokeSession {
+        session_pubkey: [u8; 32],
     },
 
     // === Admin (governance-gated) ===
@@ -581,6 +689,20 @@ impl NativeAction {
                 buf.push(22);
                 buf.extend_from_slice(&amount.to_be_bytes::<32>());
             }
+            NativeAction::CreateSession { session_pubkey, expiry, scope } => {
+                buf.push(23);
+                buf.extend_from_slice(session_pubkey);
+                buf.extend_from_slice(&expiry.to_be_bytes());
+                buf.push(match scope {
+                    SessionScope::Trading => 0,
+                    SessionScope::TransfersOnly => 1,
+                    SessionScope::Full => 2,
+                });
+            }
+            NativeAction::RevokeSession { session_pubkey } => {
+                buf.push(24);
+                buf.extend_from_slice(session_pubkey);
+            }
         }
         buf
     }
@@ -592,8 +714,8 @@ pub struct SignedNativeAction {
     pub action: NativeAction,
     /// Millisecond timestamp nonce (not sequential — allows out-of-order processing).
     pub nonce: u64,
-    /// EIP-712 signature (r, s, v) over the typed data hash.
-    pub signature: Signature,
+    /// EIP-712 ECDSA or ed25519 session key signature.
+    pub signature: ActionSignature,
 }
 
 // ============================================================================

@@ -97,10 +97,13 @@ fn build_vector(label: &str, action: NativeAction) -> Vector {
         struct_hash: hex0x(struct_hash.as_slice()),
         signing_hash: hex0x(signing_hash.as_slice()),
         signer: hex0x(signer.as_slice()),
-        signature: SerializedSig {
-            v: signed.signature.v,
-            r: signed.signature.r.to_vec(),
-            s: signed.signature.s.to_vec(),
+        signature: match &signed.signature {
+            torus_types::ActionSignature::Eip712(sig) => SerializedSig {
+                v: sig.v,
+                r: sig.r.to_vec(),
+                s: sig.s.to_vec(),
+            },
+            _ => panic!("expected Eip712 signature"),
         },
         signed_envelope_hex: envelope_hex,
         signed_envelope_json: envelope_json,

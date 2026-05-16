@@ -182,7 +182,9 @@ impl BlockProposer {
         // FIX ECON-FIND-03: Check persistent nonces to prevent replay.
         for signed in &signed_native_actions {
             let sender = signed
-                .recover_sender()
+                .resolve_sender(timestamp, |pubkey| {
+                    state_db.get_session(pubkey).ok().flatten()
+                })
                 .map_err(|e| BridgeError::SignatureRecovery(format!("{e}")))?;
             let mut nonce_key = [0u8; 28];
             nonce_key[..20].copy_from_slice(sender.as_slice());

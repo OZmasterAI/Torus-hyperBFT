@@ -16,18 +16,18 @@ use torus_bridge::native_executor::{NativeExecContext, NativeExecutor};
 use torus_core::precompiles::{CoreWriterQueue, QueuedAction, QueuedActionKind};
 use torus_mempool::{Mempool, MempoolConfig};
 use torus_state::StateDb;
-use torus_types::{FixedPoint, NativeAction, Signature, SignedNativeAction};
+use torus_types::{ActionSignature, FixedPoint, NativeAction, Signature, SignedNativeAction};
 
 fn addr(n: u8) -> Address {
     Address::new([n; 20])
 }
 
-fn sig() -> Signature {
-    Signature {
+fn sig() -> ActionSignature {
+    ActionSignature::Eip712(Signature {
         v: 27,
         r: [0u8; 32],
         s: [0u8; 32],
-    }
+    })
 }
 
 fn make_native(nonce: u64, action: NativeAction) -> SignedNativeAction {

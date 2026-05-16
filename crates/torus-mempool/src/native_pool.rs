@@ -178,14 +178,14 @@ fn compute_action_hash(action: &SignedNativeAction) -> B256 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use torus_types::{NativeAction, Signature, SignedNativeAction};
+    use torus_types::{ActionSignature, NativeAction, Signature, SignedNativeAction};
 
-    fn sig() -> Signature {
-        Signature {
+    fn sig() -> ActionSignature {
+        ActionSignature::Eip712(Signature {
             v: 27,
             r: [0u8; 32],
             s: [0u8; 32],
-        }
+        })
     }
 
     fn make_action(nonce: u64, action: NativeAction) -> SignedNativeAction {

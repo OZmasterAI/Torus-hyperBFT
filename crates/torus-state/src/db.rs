@@ -205,6 +205,50 @@ impl StateDb {
         Ok(())
     }
 
+    // ---- Session key operations (cf_sessions) ----
+
+    /// Get a session by its ed25519 public key.
+    pub fn get_session(&self, pubkey: &[u8; 32]) -> Result<Option<torus_types::SessionData>, StateError> {
+        match self.get_cf_raw(crate::cf::CF_SESSIONS, pubkey)? {
+            Some(bytes) => {
+                let data: torus_types::SessionData = serde_json::from_slice(&bytes)
+                    .map_err(|e| StateError::InvalidData(e.to_string()))?;
+                Ok(Some(data))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Store a session.
+    pub fn put_session(&self, pubkey: &[u8; 32], data: &torus_types::SessionData) -> Result<(), StateError> {
+        let bytes = serde_json::to_vec(data)
+            .map_err(|e| StateError::InvalidData(e.to_string()))?;
+        self.put_cf_raw(crate::cf::CF_SESSIONS, pubkey, &bytes)
+    }
+
+    /// Delete a session.
+    pub fn delete_session(&self, pubkey: &[u8; 32]) -> Result<(), StateError> {
+        self.delete_cf_raw(crate::cf::CF_SESSIONS, pubkey)
+    }
+
+    /// Count active sessions for an owner address.
+    /// Scans all sessions (acceptable since max 5 per owner, total count is bounded).
+    pub fn count_sessions_for_owner(&self, owner: &alloy_primitives::Address) -> Result<usize, StateError> {
+        let cf = self.cf(crate::cf::CF_SESSIONS)?;
+        let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+        let mut count = 0;
+        for item in iter {
+            if let Ok((_key, value)) = item {
+                if let Ok(data) = serde_json::from_slice::<torus_types::SessionData>(&value) {
+                    if data.owner == *owner {
+                        count += 1;
+                    }
+                }
+            }
+        }
+        Ok(count)
+    }
+
     /// List all column family names that were opened.
     pub fn column_families(&self) -> &'static [&'static str] {
         ALL_CF_NAMES

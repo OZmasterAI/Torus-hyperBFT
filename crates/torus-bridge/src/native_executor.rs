@@ -23,8 +23,8 @@ use torus_economics::epoch::ValidatorSetDiff;
 use torus_state::cf::{CF_NATIVE_TRADES, CF_NATIVE_USER_TRADES};
 use torus_state::StateDb;
 use torus_types::{
-    FixedPoint, MarketId, NativeAction, OrderType, PlaceOrderParams, PublicKey, Side, TimeInForce,
-    U256, ValidatorInfo, ValidatorSet, VoteOption,
+    FixedPoint, MarketId, NativeAction, OrderType, PlaceOrderParams, PublicKey, SessionScope, Side,
+    TimeInForce, U256, ValidatorInfo, ValidatorSet, VoteOption,
 };
 
 // ============================================================================
@@ -295,6 +295,14 @@ impl NativeExecutor {
             NativeAction::UnjailSelf => Self::exec_unjail_self(ctx, sender),
             NativeAction::RotateValidatorKey { new_pubkey } => {
                 Self::exec_rotate_key(ctx, sender, new_pubkey)
+            }
+
+            // ---- Session Keys ----
+            NativeAction::CreateSession { session_pubkey, expiry, scope } => {
+                Self::exec_create_session(ctx, sender, session_pubkey, *expiry, *scope)
+            }
+            NativeAction::RevokeSession { session_pubkey } => {
+                Self::exec_revoke_session(ctx, sender, session_pubkey)
             }
 
             // ---- Admin (governance-gated, stubs) ----
@@ -833,6 +841,97 @@ impl NativeExecutor {
         ) {
             Ok(()) => NativeActionResult::ok("rotate_validator_key", 5000),
             Err(e) => NativeActionResult::err("rotate_validator_key", e.to_string()),
+        }
+    }
+
+    // ========================================================================
+    // Session key handlers
+    // ========================================================================
+
+    fn exec_create_session(
+        ctx: &mut NativeExecContext,
+        sender: &Address,
+        session_pubkey: &[u8; 32],
+        expiry: u64,
+        scope: SessionScope,
+    ) -> NativeActionResult {
+        use torus_types::eip712::{MAX_SESSION_EXPIRY_MS, MAX_SESSIONS_PER_ADDRESS};
+
+        // Validate expiry is within 24h from current block timestamp
+        if expiry > ctx.timestamp + MAX_SESSION_EXPIRY_MS {
+            return NativeActionResult::err("create_session", "expiry exceeds 24h maximum".into());
+        }
+        if expiry <= ctx.timestamp {
+            return NativeActionResult::err("create_session", "session already expired".into());
+        }
+
+        // Check max sessions per owner
+        match ctx.state_db.count_sessions_for_owner(sender) {
+            Ok(count) if count >= MAX_SESSIONS_PER_ADDRESS => {
+                return NativeActionResult::err(
+                    "create_session",
+                    "max 5 active sessions exceeded".into(),
+                );
+            }
+            Err(e) => {
+                return NativeActionResult::err("create_session", format!("state error: {e}"));
+            }
+            _ => {}
+        }
+
+        // Check if session key already exists
+        match ctx.state_db.get_session(session_pubkey) {
+            Ok(Some(_)) => {
+                return NativeActionResult::err(
+                    "create_session",
+                    "session key already exists".into(),
+                );
+            }
+            Err(e) => {
+                return NativeActionResult::err("create_session", format!("state error: {e}"));
+            }
+            _ => {}
+        }
+
+        // Store the session
+        let data = torus_types::SessionData {
+            owner: *sender,
+            expiry,
+            scope,
+            created_at: ctx.timestamp,
+        };
+        match ctx.state_db.put_session(session_pubkey, &data) {
+            Ok(()) => NativeActionResult::ok("create_session", 5000),
+            Err(e) => NativeActionResult::err("create_session", format!("store failed: {e}")),
+        }
+    }
+
+    fn exec_revoke_session(
+        ctx: &mut NativeExecContext,
+        sender: &Address,
+        session_pubkey: &[u8; 32],
+    ) -> NativeActionResult {
+        // Verify session exists and sender is the owner
+        match ctx.state_db.get_session(session_pubkey) {
+            Ok(Some(data)) => {
+                if data.owner != *sender {
+                    return NativeActionResult::err(
+                        "revoke_session",
+                        "not session owner".into(),
+                    );
+                }
+            }
+            Ok(None) => {
+                return NativeActionResult::err("revoke_session", "session not found".into());
+            }
+            Err(e) => {
+                return NativeActionResult::err("revoke_session", format!("state error: {e}"));
+            }
+        }
+
+        match ctx.state_db.delete_session(session_pubkey) {
+            Ok(()) => NativeActionResult::ok("revoke_session", 2000),
+            Err(e) => NativeActionResult::err("revoke_session", format!("delete failed: {e}")),
         }
     }
 

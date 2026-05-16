@@ -207,7 +207,9 @@ impl TorusApp {
         let mut sender_actions = Vec::with_capacity(body.native_actions.len());
         let mut consumed_nonces = Vec::new();
         for signed in &body.native_actions {
-            match signed.recover_sender() {
+            match signed.resolve_sender(header.timestamp, |pubkey| {
+                self.state_db.get_session(pubkey).ok().flatten()
+            }) {
                 Ok(sender) => {
                     consumed_nonces.push((sender, signed.nonce));
                     sender_actions.push((sender, signed.action.clone()));
