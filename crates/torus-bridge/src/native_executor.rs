@@ -27,6 +27,8 @@ use torus_types::{
     TimeInForce, U256, ValidatorInfo, ValidatorSet, VoteOption,
 };
 
+use crate::market_workers::{MarketWorkerPool, MatchRequest};
+
 // ============================================================================
 // Result types
 // ============================================================================
@@ -318,19 +320,247 @@ impl NativeExecutor {
         }
     }
 
-    /// Execute a batch of (sender, action) pairs in order.
-    /// Does NOT stop on individual failure — every action runs.
+    /// Execute a batch of (sender, action) pairs with per-market parallel matching.
+    ///
+    /// Pipeline:
+    ///   Phase 1 — Execute all non-PlaceOrder actions sequentially
+    ///   Phase 2 — Pre-reserve margin, assign global order IDs, partition by market
+    ///   Phase 3 — Parallel matching: one thread per market's OrderBook
+    ///   Phase 4 — Sequential settlement: release margin, apply fills, persist trades
+    ///
+    /// Individual action failures do NOT stop the batch (deterministic semantics).
     pub fn execute_batch(
         ctx: &mut NativeExecContext,
         actions: &[(Address, NativeAction)],
     ) -> NativeBatchResult {
-        let mut results = Vec::with_capacity(actions.len());
+        let n = actions.len();
+        let mut results: Vec<NativeActionResult> = (0..n)
+            .map(|_| NativeActionResult::ok("pending", 0))
+            .collect();
         let mut total_gas = 0u64;
 
-        for (sender, action) in actions {
-            let result = Self::execute(ctx, sender, action);
-            total_gas += result.gas_used;
-            results.push(result);
+        // ---- Phase 1: Partition and execute non-PlaceOrder actions ----
+        let mut place_order_indices: Vec<usize> = Vec::new();
+
+        for (i, (sender, action)) in actions.iter().enumerate() {
+            match action {
+                NativeAction::PlaceOrder(_) => place_order_indices.push(i),
+                _ => {
+                    let result = Self::execute(ctx, sender, action);
+                    total_gas += result.gas_used;
+                    results[i] = result;
+                }
+            }
+        }
+
+        if place_order_indices.is_empty() {
+            return NativeBatchResult { results, total_gas };
+        }
+
+        // ---- Phase 2: Pre-reserve margin, assign IDs, partition by market ----
+        struct PreparedOrder {
+            index: usize,
+            sender: Address,
+            params: PlaceOrderParams,
+            order_id: u128,
+            margin_reserved: FixedPoint,
+        }
+
+        let mut market_batches: HashMap<MarketId, Vec<PreparedOrder>> = HashMap::new();
+
+        for &i in &place_order_indices {
+            let (sender, action) = &actions[i];
+            let params = match action {
+                NativeAction::PlaceOrder(p) => p,
+                _ => unreachable!(),
+            };
+
+            let market_id = params.market_id;
+            let is_market = matches!(params.order_type, OrderType::Market);
+
+            // Reserve margin (same logic as exec_place_order Phase 2)
+            let order_margin_required = if !is_market && params.price > FixedPoint::ZERO {
+                let notional = params.price * params.quantity;
+                let max_lev = ctx
+                    .margin_configs
+                    .get(&market_id)
+                    .map(|c| effective_max_leverage(&c.tiers, notional))
+                    .unwrap_or(20);
+                let lev_fp = FixedPoint::from_raw(max_lev as i128 * FixedPoint::SCALE);
+                notional / lev_fp
+            } else {
+                FixedPoint::ZERO
+            };
+
+            if order_margin_required > FixedPoint::ZERO {
+                match ctx.positions.get_native_balance(sender) {
+                    Ok(mut bal) => {
+                        if bal.available < order_margin_required {
+                            results[i] = NativeActionResult::err(
+                                "place_order",
+                                format!(
+                                    "insufficient margin: need {order_margin_required}, have {}",
+                                    bal.available
+                                ),
+                            );
+                            continue;
+                        }
+                        bal.available = bal.available - order_margin_required;
+                        bal.order_margin = bal.order_margin + order_margin_required;
+                        if let Err(e) = ctx.positions.put_native_balance(sender, &bal) {
+                            results[i] = NativeActionResult::err("place_order", e.to_string());
+                            continue;
+                        }
+                    }
+                    Err(e) => {
+                        results[i] = NativeActionResult::err("place_order", e.to_string());
+                        continue;
+                    }
+                }
+            }
+
+            // Assign global order ID (monotonic, pre-matching)
+            let order_id = ctx.next_global_order_id;
+            ctx.next_global_order_id += 1;
+
+            market_batches
+                .entry(market_id)
+                .or_default()
+                .push(PreparedOrder {
+                    index: i,
+                    sender: *sender,
+                    params: params.clone(),
+                    order_id,
+                    margin_reserved: order_margin_required,
+                });
+        }
+
+        // ---- Phase 3: Parallel matching ----
+        let mut worker_batches: HashMap<MarketId, (OrderBook, Vec<MatchRequest>)> = HashMap::new();
+
+        for (&market_id, prepared) in &market_batches {
+            let book = ctx
+                .order_books
+                .remove(&market_id)
+                .unwrap_or_else(|| OrderBook::new(market_id, FixedPoint::ONE, FixedPoint::ONE));
+
+            let requests: Vec<MatchRequest> = prepared
+                .iter()
+                .map(|p| MatchRequest {
+                    sender: p.sender,
+                    params: p.params.clone(),
+                    order_id: p.order_id,
+                })
+                .collect();
+
+            worker_batches.insert(market_id, (book, requests));
+        }
+
+        let market_results = MarketWorkerPool::match_parallel(worker_batches, ctx.timestamp);
+
+        // ---- Phase 4: Sequential settlement ----
+        for mbr in market_results {
+            let market_id = mbr.market_id;
+
+            // Reinsert updated book
+            ctx.order_books.insert(market_id, mbr.book);
+
+            // Update global ID high-water mark
+            if mbr.next_order_id > ctx.next_global_order_id {
+                ctx.next_global_order_id = mbr.next_order_id;
+            }
+
+            let prepared = match market_batches.get(&market_id) {
+                Some(p) => p,
+                None => continue,
+            };
+
+            for (match_result, prep) in mbr.results.iter().zip(prepared.iter()) {
+                let result = &match_result.result;
+
+                // Release margin for filled/cancelled portion
+                if prep.margin_reserved > FixedPoint::ZERO {
+                    let order_rests = matches!(
+                        result.status,
+                        OrderStatus::Resting
+                            | OrderStatus::PartiallyFilled
+                            | OrderStatus::PendingTrigger
+                    );
+                    let filled_qty: FixedPoint = result
+                        .fills
+                        .iter()
+                        .map(|f| f.quantity)
+                        .fold(FixedPoint::ZERO, |a, b| a + b);
+
+                    let margin_to_release = if !order_rests {
+                        prep.margin_reserved
+                    } else if filled_qty > FixedPoint::ZERO {
+                        prep.margin_reserved * filled_qty / prep.params.quantity
+                    } else {
+                        FixedPoint::ZERO
+                    };
+
+                    if margin_to_release > FixedPoint::ZERO {
+                        if let Ok(mut bal) = ctx.positions.get_native_balance(&prep.sender) {
+                            bal.order_margin = bal.order_margin - margin_to_release;
+                            bal.available = bal.available + margin_to_release;
+                            let _ = ctx.positions.put_native_balance(&prep.sender, &bal);
+                        }
+                    }
+                }
+
+                // Apply fills to position manager
+                let mut fill_failed = false;
+                for fill in &result.fills {
+                    let taker_is_buy = fill.maker_side != Side::Buy;
+                    if let Err(e) = ctx.positions.apply_fill(
+                        &fill.taker,
+                        market_id,
+                        taker_is_buy,
+                        fill.quantity,
+                        fill.price,
+                        MarginType::Cross,
+                    ) {
+                        results[prep.index] = NativeActionResult::err(
+                            "place_order",
+                            format!("taker fill failed: {e}"),
+                        );
+                        fill_failed = true;
+                        break;
+                    }
+                    if let Err(e) = ctx.positions.apply_fill(
+                        &fill.maker,
+                        market_id,
+                        fill.maker_side == Side::Buy,
+                        fill.quantity,
+                        fill.price,
+                        MarginType::Cross,
+                    ) {
+                        results[prep.index] = NativeActionResult::err(
+                            "place_order",
+                            format!("maker fill failed: {e}"),
+                        );
+                        fill_failed = true;
+                        break;
+                    }
+                }
+
+                if fill_failed {
+                    continue;
+                }
+
+                // Persist trades
+                for fill in &result.fills {
+                    Self::persist_trade(ctx, market_id, fill);
+                }
+
+                if let Some(ref m) = ctx.metrics {
+                    m.orders_matched.inc_by(result.fills.len() as u64);
+                }
+
+                total_gas += 1000;
+                results[prep.index] = NativeActionResult::ok("place_order", 1000);
+            }
         }
 
         NativeBatchResult { results, total_gas }
@@ -520,6 +750,60 @@ impl NativeExecutor {
         }
 
         NativeActionResult::ok("place_order", 1000)
+    }
+
+    /// Persist a single fill to CF_NATIVE_TRADES and CF_NATIVE_USER_TRADES.
+    fn persist_trade(
+        ctx: &mut NativeExecContext,
+        market_id: MarketId,
+        fill: &torus_core::order_book::Fill,
+    ) {
+        let taker_side: u8 = if fill.maker_side == Side::Buy { 1 } else { 0 };
+
+        let mut trade_key = [0u8; 20];
+        trade_key[..8].copy_from_slice(&market_id.to_be_bytes());
+        trade_key[8..16].copy_from_slice(&ctx.block_height.to_be_bytes());
+        trade_key[16..20].copy_from_slice(&ctx.trade_index.to_be_bytes());
+
+        let trade_id = ctx.trade_index as u128;
+        let price_raw = fill.price.raw();
+        let quantity_raw = fill.quantity.raw();
+
+        let mut trade_data = Vec::with_capacity(64);
+        trade_data.extend_from_slice(&trade_id.to_le_bytes());
+        trade_data.extend_from_slice(&price_raw.to_le_bytes());
+        trade_data.extend_from_slice(&quantity_raw.to_le_bytes());
+        trade_data.push(taker_side);
+        trade_data.extend_from_slice(&ctx.block_height.to_le_bytes());
+        trade_data.extend_from_slice(&ctx.timestamp.to_le_bytes());
+
+        let _ = ctx.state_db.put_cf_raw(CF_NATIVE_TRADES, &trade_key, &trade_data);
+
+        let desc_block = u64::MAX - ctx.block_height;
+        let mut user_trade_data = Vec::with_capacity(80);
+        user_trade_data.extend_from_slice(&trade_id.to_le_bytes());
+        user_trade_data.extend_from_slice(&market_id.to_le_bytes());
+        user_trade_data.extend_from_slice(&price_raw.to_le_bytes());
+        user_trade_data.extend_from_slice(&quantity_raw.to_le_bytes());
+        user_trade_data.push(taker_side);
+        user_trade_data.push(0u8); // role: maker
+        user_trade_data.extend_from_slice(&ctx.block_height.to_le_bytes());
+        user_trade_data.extend_from_slice(&ctx.timestamp.to_le_bytes());
+
+        let mut maker_key = [0u8; 32];
+        maker_key[..20].copy_from_slice(fill.maker.as_slice());
+        maker_key[20..28].copy_from_slice(&desc_block.to_be_bytes());
+        maker_key[28..32].copy_from_slice(&ctx.trade_index.to_be_bytes());
+        let _ = ctx.state_db.put_cf_raw(CF_NATIVE_USER_TRADES, &maker_key, &user_trade_data);
+
+        user_trade_data[57] = 1u8; // role: taker
+        let mut taker_key = [0u8; 32];
+        taker_key[..20].copy_from_slice(fill.taker.as_slice());
+        taker_key[20..28].copy_from_slice(&desc_block.to_be_bytes());
+        taker_key[28..32].copy_from_slice(&ctx.trade_index.to_be_bytes());
+        let _ = ctx.state_db.put_cf_raw(CF_NATIVE_USER_TRADES, &taker_key, &user_trade_data);
+
+        ctx.trade_index += 1;
     }
 
     /// FIX CONS-FIND-30: Ownership check added -- only the order's trader can cancel.

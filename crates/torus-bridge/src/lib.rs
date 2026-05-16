@@ -6,6 +6,7 @@
 pub mod committer;
 pub mod decode;
 pub mod error;
+pub mod market_workers;
 pub mod native_executor;
 pub mod proposer;
 pub mod state_root;
