@@ -135,6 +135,7 @@ impl TorusApp {
             fee_dev_pool_bps: 4500,
             treasury_address: Address::ZERO,
             dev_pool_address: Address::ZERO,
+            timeout_base_ms: 500,
         };
         Self::new(state_db, &config, None, None)
     }
@@ -884,6 +885,7 @@ mod crash_recovery_tests {
             fee_dev_pool_bps: 4500,
             treasury_address: Address::ZERO,
             dev_pool_address: Address::ZERO,
+            timeout_base_ms: 500,
         };
         (config, state_db)
     }

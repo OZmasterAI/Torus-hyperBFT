@@ -43,6 +43,8 @@ pub struct MempoolConfig {
     pub native_rate_limit_per_window: u32,
     /// Max EVM txs per sender per block.
     pub evm_per_block_cap: usize,
+    /// Max total EVM txs per block (all senders combined).
+    pub evm_total_block_cap: usize,
     /// Max native actions per sender per block.
     pub native_per_block_cap: usize,
     /// Max total native pool size.
@@ -66,6 +68,7 @@ impl Default for MempoolConfig {
             evm_rate_limit_per_window: rate_limit::EVM_RATE_LIMIT_PER_WINDOW,
             native_rate_limit_per_window: rate_limit::NATIVE_RATE_LIMIT_PER_WINDOW,
             evm_per_block_cap: rate_limit::EVM_PER_BLOCK_CAP,
+            evm_total_block_cap: rate_limit::EVM_TOTAL_BLOCK_CAP,
             native_per_block_cap: rate_limit::NATIVE_PER_BLOCK_CAP,
             native_pool_max_size: rate_limit::NATIVE_POOL_MAX_SIZE,
             native_per_sender_cap: rate_limit::NATIVE_PER_SENDER_CAP,
@@ -185,7 +188,7 @@ impl Mempool {
     /// `parent_hash` seeds deterministic same-price shuffling (anti-MEV, Task 3.1.5).
     pub fn drain_evm(&self, gas_limit: u64, parent_hash: B256) -> Vec<Vec<u8>> {
         let mut pool = self.evm.write().unwrap();
-        let drained = pool.drain(gas_limit, self.config.evm_per_block_cap, &parent_hash);
+        let drained = pool.drain(gas_limit, self.config.evm_per_block_cap, self.config.evm_total_block_cap, &parent_hash);
         // FIX EVM-FIND-02: Decrement memory for drained transactions.
         let drained_bytes: usize = drained.iter().map(|tx| tx.len()).sum();
         if drained_bytes > 0 {

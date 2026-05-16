@@ -372,6 +372,7 @@ impl Genesis {
                 .as_deref()
                 .and_then(|s| parse_address(s).ok())
                 .unwrap_or(Address::ZERO),
+            timeout_base_ms: self.consensus.timeout_base_ms,
         }
     }
 

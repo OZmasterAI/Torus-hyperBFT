@@ -142,6 +142,7 @@ fn default_chain_config() -> ChainConfig {
         fee_dev_pool_bps: 4500,
         treasury_address: Address::ZERO,
         dev_pool_address: Address::ZERO,
+        timeout_base_ms: 500,
     }
 }
 
@@ -327,7 +328,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         .me(signing_key)
         .chain_id(ChainID::new(chain_config.chain_id))
         .epoch_length(EpochLength::new(chain_config.epoch_length as u32))
-        .max_view_time(Duration::from_millis(500))
+        .max_view_time(Duration::from_millis(chain_config.timeout_base_ms))
         .progress_msg_buffer_capacity(BufferSize::new(1024))
         .block_sync_request_limit(128)
         .block_sync_server_advertise_time(Duration::new(10, 0))

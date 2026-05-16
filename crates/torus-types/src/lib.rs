@@ -782,6 +782,13 @@ pub struct ChainConfig {
     /// Dev pool address for fee distribution.
     #[serde(default)]
     pub dev_pool_address: Address,
+    /// Consensus view timeout in milliseconds (from genesis).
+    #[serde(default = "default_timeout_base_ms")]
+    pub timeout_base_ms: u64,
+}
+
+fn default_timeout_base_ms() -> u64 {
+    500
 }
 
 impl ChainConfig {

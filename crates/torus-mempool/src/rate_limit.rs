@@ -25,6 +25,10 @@ pub const NATIVE_RATE_LIMIT_PER_WINDOW: u32 = 200;
 /// Max EVM transactions per sender per block.
 pub const EVM_PER_BLOCK_CAP: usize = 4;
 
+/// Max total EVM transactions per block (all senders combined).
+/// Bounds worst-case EVM execution time to stay within the view timeout.
+pub const EVM_TOTAL_BLOCK_CAP: usize = 20;
+
 /// Max native actions per sender per block.
 pub const NATIVE_PER_BLOCK_CAP: usize = 16;
 

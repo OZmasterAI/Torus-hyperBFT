@@ -287,6 +287,7 @@ impl EvmPool {
         &mut self,
         gas_budget: u64,
         per_sender_limit: usize,
+        total_limit: usize,
         parent_hash: &B256,
     ) -> Vec<Vec<u8>> {
         let mut heap = BinaryHeap::new();
@@ -313,6 +314,10 @@ impl EvmPool {
             let count = sender_counts.get(&top.sender).copied().unwrap_or(0);
             if count >= per_sender_limit {
                 continue;
+            }
+
+            if result.len() >= total_limit {
+                break;
             }
 
             if gas_used.saturating_add(top.gas_limit) > gas_budget {
