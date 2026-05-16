@@ -76,9 +76,13 @@ struct Cli {
     #[arg(long, default_value_t = 2)]
     monitor_interval: u64,
 
-    /// Batch size per sender per round (capped to mempool limit of 16)
-    #[arg(long, default_value_t = 16)]
+    /// Batch size per sender per round (default matches drain-per-block to avoid pool overflow)
+    #[arg(long, default_value_t = 4)]
     batch_per_sender: u64,
+
+    /// Max seconds to wait for nonce confirmation before moving on
+    #[arg(long, default_value_t = 30)]
+    drain_timeout_secs: u64,
 }
 
 struct Account {
@@ -250,6 +254,7 @@ async fn main() {
     let num_accounts = cli.accounts.min(20).max(1);
     let gas_price = (cli.gas_price_gwei as u128) * 1_000_000_000;
     let batch_per_sender = cli.batch_per_sender.min(MEMPOOL_MAX_PER_SENDER);
+    let drain_timeout_secs = cli.drain_timeout_secs;
 
     let max_txs_per_block = DRAIN_PER_SENDER_PER_BLOCK * num_accounts as u64;
 
@@ -259,6 +264,7 @@ async fn main() {
     println!("Txs per account:    {}", cli.txs_per_account);
     println!("Total txs:          {}", num_accounts as u64 * cli.txs_per_account);
     println!("Batch per sender:   {batch_per_sender} (mempool cap: {MEMPOOL_MAX_PER_SENDER})");
+    println!("Drain strategy:     nonce-poll (timeout: {drain_timeout_secs}s)");
     println!("Concurrency:        {}", cli.concurrency);
     println!("Gas price:          {} gwei", cli.gas_price_gwei);
     println!("Fan-out:            ALL {} endpoints (no mempool gossip)", rpc_urls.len());
@@ -457,12 +463,30 @@ async fn main() {
             break;
         }
 
-        // Wait for the mempool to drain before submitting next batch.
-        // With 4 tx/sender/block and ~90ms blocks, 16 txs drain in ~4 blocks = ~360ms.
-        // Be conservative: wait a bit longer to avoid PoolFull rejections.
-        let drain_blocks = (batch_per_sender + DRAIN_PER_SENDER_PER_BLOCK - 1) / DRAIN_PER_SENDER_PER_BLOCK;
-        let drain_ms = drain_blocks * 100; // ~100ms per block under load
-        tokio::time::sleep(Duration::from_millis(drain_ms)).await;
+        // Poll nonces until all submitted txs are confirmed on-chain.
+        // This ensures the mempool has drained before we send the next batch.
+        let drain_deadline = Instant::now() + Duration::from_secs(drain_timeout_secs);
+        loop {
+            if Instant::now() > drain_deadline {
+                tracing::warn!("drain timeout — proceeding with next batch");
+                break;
+            }
+            let mut all_confirmed = true;
+            for sender_idx in 0..num_accounts {
+                let expected_nonce = nonces[sender_idx] + cursor[sender_idx];
+                let addr_hex = format!("0x{}", hex::encode(accounts[sender_idx].address.as_slice()));
+                if let Ok(current) = fetch_nonce(&client, &rpc_urls[0], &addr_hex).await {
+                    if current < expected_nonce {
+                        all_confirmed = false;
+                        break;
+                    }
+                }
+            }
+            if all_confirmed {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     let total_elapsed = blast_start.elapsed();
