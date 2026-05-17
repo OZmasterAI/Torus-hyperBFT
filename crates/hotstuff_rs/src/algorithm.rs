@@ -194,6 +194,11 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
                         {
                             log::error!("HotStuff on_receive_msg error: {:?} — dropping message", e);
                         }
+                        if self.hotstuff.take_sync_needed() {
+                            if let Err(e) = self.block_sync_client.trigger_sync(&mut self.block_tree) {
+                                log::error!("BlockSync trigger_sync error: {:?}", e);
+                            }
+                        }
                     }
                     ProgressMessage::PacemakerMessage(msg) => {
                         if let Err(e) = self

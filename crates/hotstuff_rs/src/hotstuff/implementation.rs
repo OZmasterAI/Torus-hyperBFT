@@ -86,6 +86,7 @@ pub(crate) struct HotStuff<N: Network> {
     /// MonadBFT B3: Track proposals per (view, leader) for equivocation detection.
     /// Maps (view, leader) → first block hash seen from that leader in that view.
     seen_proposals: std::collections::HashMap<(ViewNumber, VerifyingKey), CryptoHash>,
+    sync_needed: bool,
 }
 
 impl<N: Network> HotStuff<N> {
@@ -115,7 +116,14 @@ impl<N: Network> HotStuff<N> {
             recovery_state: RecoveryState::None,
             ne_sent_views: HashSet::new(),
             seen_proposals: std::collections::HashMap::new(),
+            sync_needed: false,
         }
+    }
+
+    pub(crate) fn take_sync_needed(&mut self) -> bool {
+        let needed = self.sync_needed;
+        self.sync_needed = false;
+        needed
     }
 
     /// Checks whether the HotStuff internal view is outdated with respect to the view from [`ViewInfo`] provided
@@ -633,13 +641,17 @@ impl<N: Network> HotStuff<N> {
         let is_correct = proposal.block.is_correct(block_tree)?;
         let is_safe = if is_correct { safe_block(&proposal.block, block_tree, self.config.chain_id)? } else { false };
         if !is_correct || !is_safe {
+            let justify_block_known = block_tree.contains(&proposal.block.justify.block);
             log::warn!(
                 "dropping proposal: view={}, is_correct={}, is_safe={}, justify_block_known={}",
                 self.view_info.view.int(),
                 is_correct,
                 is_safe,
-                block_tree.contains(&proposal.block.justify.block),
+                justify_block_known,
             );
+            if !justify_block_known {
+                self.sync_needed = true;
+            }
             // Ensure that proposals or nudges from this leader should no longer be accepted in this view.
             match self.proposal_status {
                 ProposalStatus::WaitingForProposal => {

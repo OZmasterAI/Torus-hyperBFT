@@ -32,7 +32,7 @@ use crate::{
     },
     block_tree::{
         accessors::internal::{BlockTreeError, BlockTreeSingleton},
-        invariants::{safe_block, safe_pc},
+        invariants::safe_pc,
         pluggables::KVStore,
     },
     events::{EndSyncEvent, Event, InsertBlockEvent, StartSyncEvent},
@@ -94,6 +94,19 @@ impl<N: Network> BlockSyncClient<N> {
 
     pub(crate) fn has_pending_sync(&self) -> bool {
         self.pending_sync.is_some()
+    }
+
+    pub(crate) fn trigger_sync<K: KVStore>(
+        &mut self,
+        block_tree: &mut BlockTreeSingleton<K>,
+    ) -> Result<(), BlockSyncClientError> {
+        if self.pending_sync.is_some() {
+            return Ok(());
+        }
+        log::info!("block_sync: proposal-drop trigger fired (justify_block_known=false)");
+        self.request_sync(block_tree)?;
+        self.block_sync_client_state.last_progress_or_sync_time = Instant::now();
+        Ok(())
     }
 
     /// Process a received [`BlockSyncAdvertiseMessage`].
@@ -235,9 +248,13 @@ impl<N: Network> BlockSyncClient<N> {
         let peer = session.peer;
         let chain_id = self.config.chain_id;
 
-        // Validate block correctness and safety
-        if !block.is_correct(block_tree)? || !safe_block(&block, block_tree, chain_id)? {
-            log::warn!("block_sync: block failed is_correct/safe_block, blacklisting peer");
+        // Validate cryptographic correctness only (hashes, signatures).
+        // safe_block() is intentionally skipped: synced blocks come from the peer's
+        // committed chain which may diverge from our locked_pc branch. The lock
+        // rule prevents conflicting votes in live consensus but must not reject
+        // valid committed blocks during catch-up.
+        if !block.is_correct(block_tree)? {
+            log::warn!("block_sync: block failed is_correct, blacklisting peer");
             self.block_sync_client_state.blacklist_sync_server(
                 peer,
                 self.config.blacklist_expiry_time,
@@ -339,21 +356,27 @@ impl<N: Network> BlockSyncClient<N> {
         origin: &VerifyingKey,
         block_tree: &mut BlockTreeSingleton<K>,
     ) -> Result<(), BlockSyncClientError> {
-        let highest_view_entered = block_tree.highest_view_entered()?;
+        let local_highest_pc_view = block_tree.highest_pc()?.view;
         if self
             .block_sync_client_state
             .blacklist_contains_server_address(origin)
         {
             return Ok(());
         }
-        if advertise_pc.highest_pc.view < highest_view_entered {
+        if advertise_pc.highest_pc.view < local_highest_pc_view {
             return Ok(());
         }
-        let view_difference = (advertise_pc.highest_pc.view - highest_view_entered) as u64;
+        let view_difference = (advertise_pc.highest_pc.view - local_highest_pc_view) as u64;
         if self.pending_sync.is_none()
             && view_difference >= self.config.block_sync_trigger_min_view_difference
             && advertise_pc.highest_pc.is_correct(block_tree)?
         {
+            log::info!(
+                "block_sync: advertise_pc trigger fired, remote_pc_view={}, local_pc_view={}, diff={}",
+                advertise_pc.highest_pc.view.int(),
+                local_highest_pc_view.int(),
+                view_difference,
+            );
             self.request_sync(block_tree)?;
             self.block_sync_client_state.last_progress_or_sync_time = Instant::now();
         };
