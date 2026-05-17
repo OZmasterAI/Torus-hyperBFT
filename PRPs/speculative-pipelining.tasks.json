@@ -1,0 +1,55 @@
+{
+  "prp": "speculative-pipelining",
+  "created": "2026-05-17T19:15:00Z",
+  "prerequisite": "hybrid-pipelining (Option A) must be complete first",
+  "tasks": [
+    {
+      "id": "C1",
+      "name": "Speculative block production worker",
+      "status": "pending",
+      "files": ["crates/hotstuff_rs/src/algorithm.rs"],
+      "validate": "cargo test -p hotstuff_rs speculative_worker",
+      "depends_on": []
+    },
+    {
+      "id": "C2",
+      "name": "Use speculative result on QC arrival (enter_view fast path)",
+      "status": "pending",
+      "files": ["crates/hotstuff_rs/src/hotstuff/implementation.rs"],
+      "validate": "cargo test -p hotstuff_rs speculative_enter_view",
+      "depends_on": ["C1"]
+    },
+    {
+      "id": "C3",
+      "name": "App-level state snapshot for speculation (CoW clone)",
+      "status": "pending",
+      "files": ["crates/torus-consensus/src/app.rs"],
+      "validate": "cargo test -p torus-consensus speculative_state",
+      "depends_on": ["C1"]
+    },
+    {
+      "id": "C4",
+      "name": "Predict next proposer (round-robin lookahead)",
+      "status": "pending",
+      "files": ["crates/hotstuff_rs/src/hotstuff/roles.rs"],
+      "validate": "cargo test -p hotstuff_rs roles::next_proposer",
+      "depends_on": []
+    },
+    {
+      "id": "C5",
+      "name": "Cancellation and cleanup (single slot, no accumulation)",
+      "status": "pending",
+      "files": ["crates/hotstuff_rs/src/algorithm.rs"],
+      "validate": "cargo test -p hotstuff_rs speculative_cleanup",
+      "depends_on": ["C1", "C2"]
+    },
+    {
+      "id": "C6",
+      "name": "Integration test + feature flag",
+      "status": "pending",
+      "files": ["crates/torus-node/src/main.rs", "devnet/docker-compose.yml"],
+      "validate": "cargo test -p hotstuff_rs && devnet integration test",
+      "depends_on": ["C1", "C2", "C3", "C4", "C5"]
+    }
+  ]
+}
