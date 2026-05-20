@@ -20,6 +20,7 @@ use std::sync::Arc;
 use torus_bridge::{
     sort_native_actions, merge_bundle_into, BlockCommitter, BlockProposer, BlockValidator,
     BridgeError, BundleState, NativeExecContext, NativeExecutor,
+    state_root::compute_post_bundle_state_root,
 };
 use torus_mempool::Mempool;
 use torus_economics::{EpochManager, SlashReason, StakingManager};
@@ -748,6 +749,7 @@ impl TorusApp {
         // EVM catch-up: if our EVM state is behind, walk the committed chain
         // backwards from this block's parent to our last EVM-committed height,
         // then replay each ancestor's EVM txs in forward order to advance state_db.
+        let mut did_catchup = false;
         if let Some(ref ph) = parent_hash {
             let parent_height = torus_block.header.height.saturating_sub(1);
             let evm_height = self.evm_committed_height;
@@ -796,9 +798,9 @@ impl TorusApp {
                     let has_native = !tb.native_actions.is_empty();
                     if has_evm || has_native {
                         let result = if has_native {
-                            self.validator.validate_block_with_native(tb, &self.state_db, &self.evm_executor)
+                            self.validator.validate_block_with_native_for_catchup(tb, &self.state_db, &self.evm_executor)
                         } else {
-                            self.validator.validate_block(tb, &self.state_db, &self.evm_executor)
+                            self.validator.validate_block_for_catchup(tb, &self.state_db, &self.evm_executor)
                         };
                         match result {
                             Ok(validated) => {
@@ -811,7 +813,9 @@ impl TorusApp {
                                     return ValidateBlockResponse::Invalid;
                                 }
                                 if has_native || tb.header.evm_fee_revenue > 0 {
-                                    let _ = self.execute_native_post_commit(tb, validated.native_sender_actions, validated.native_consumed_nonces);
+                                    if let Err(e) = self.execute_native_post_commit(tb, validated.native_sender_actions, validated.native_consumed_nonces) {
+                                        tracing::error!(%e, height = tb.header.height, "catch-up: native post-commit FAILED");
+                                    }
                                 }
                                 self.write_native_applied_height(tb.header.height);
                             }
@@ -824,12 +828,26 @@ impl TorusApp {
                         self.persist_block_header(tb);
                         self.write_native_applied_height(tb.header.height);
                     }
+                    // Diagnostic: compare state root after each catch-up block.
+                    let empty_bundle = BundleState::default();
+                    if let Ok(current_root) = compute_post_bundle_state_root(&self.state_db, &empty_bundle) {
+                        if current_root != tb.header.state_root {
+                            tracing::warn!(
+                                height = tb.header.height,
+                                expected = %tb.header.state_root,
+                                actual = %current_root,
+                                fee_revenue = tb.header.evm_fee_revenue,
+                                "catch-up: STATE ROOT DRIFT after block replay"
+                            );
+                        }
+                    }
                     self.evm_committed_height = tb.header.height;
                     if tb.header.height > self.last_header.height {
                         self.last_header = tb.header.clone();
                     }
                     self.state_db_tip = Some(*hash);
                 }
+                did_catchup = true;
                 tracing::info!(count, new_evm_height = self.evm_committed_height, "do_validate: EVM catch-up complete");
             }
         }
@@ -857,6 +875,17 @@ impl TorusApp {
                     &merged_parent,
                     &self.evm_executor,
                 )
+            }
+        } else if did_catchup {
+            // Block immediately after catch-up: skip state root check since
+            // catch-up replay may leave state_db with accumulated drift from
+            // fee distribution effects. The block is already consensus-committed.
+            if has_native {
+                self.validator
+                    .validate_block_with_native_for_catchup(&torus_block, &self.state_db, &self.evm_executor)
+            } else {
+                self.validator
+                    .validate_block_for_catchup(&torus_block, &self.state_db, &self.evm_executor)
             }
         } else if has_native {
             self.validator

@@ -65,7 +65,7 @@ impl BlockValidator {
         state_db: &StateDb,
         evm_executor: &EvmExecutor,
     ) -> Result<ValidatedBlock, BridgeError> {
-        self.validate_block_inner(block, state_db, evm_executor, None)
+        self.validate_block_inner(block, state_db, evm_executor, None, false)
     }
 
     /// Validate with parent header for base_fee verification.
@@ -76,7 +76,18 @@ impl BlockValidator {
         evm_executor: &EvmExecutor,
         parent_header: &torus_types::TorusBlockHeader,
     ) -> Result<ValidatedBlock, BridgeError> {
-        self.validate_block_inner(block, state_db, evm_executor, Some(parent_header))
+        self.validate_block_inner(block, state_db, evm_executor, Some(parent_header), false)
+    }
+
+    /// Validate during catch-up replay — skips state root check since blocks
+    /// are already consensus-committed.
+    pub fn validate_block_for_catchup(
+        &self,
+        block: &TorusBlock,
+        state_db: &StateDb,
+        evm_executor: &EvmExecutor,
+    ) -> Result<ValidatedBlock, BridgeError> {
+        self.validate_block_inner(block, state_db, evm_executor, None, true)
     }
 
     fn validate_block_inner(
@@ -85,6 +96,7 @@ impl BlockValidator {
         state_db: &StateDb,
         evm_executor: &EvmExecutor,
         parent_header: Option<&torus_types::TorusBlockHeader>,
+        skip_state_root_check: bool,
     ) -> Result<ValidatedBlock, BridgeError> {
         // FIX CONS-PF-14: Verify base_fee using EIP-1559 if parent is available.
         if let Some(parent) = parent_header {
@@ -156,7 +168,7 @@ impl BlockValidator {
 
         let computed_root = compute_post_bundle_state_root(state_db, &exec_result.bundle)?;
 
-        if computed_root != block.header.state_root {
+        if !skip_state_root_check && computed_root != block.header.state_root {
             return Err(BridgeError::StateRootMismatch {
                 expected: block.header.state_root,
                 computed: computed_root,
@@ -294,6 +306,27 @@ impl BlockValidator {
         state_db: &StateDb,
         evm_executor: &EvmExecutor,
     ) -> Result<ValidatedBlock, BridgeError> {
+        self.validate_block_with_native_inner(block, state_db, evm_executor, false)
+    }
+
+    /// Validate with native during catch-up replay — skips state root check
+    /// since blocks are already consensus-committed.
+    pub fn validate_block_with_native_for_catchup(
+        &self,
+        block: &TorusBlock,
+        state_db: &StateDb,
+        evm_executor: &EvmExecutor,
+    ) -> Result<ValidatedBlock, BridgeError> {
+        self.validate_block_with_native_inner(block, state_db, evm_executor, true)
+    }
+
+    fn validate_block_with_native_inner(
+        &self,
+        block: &TorusBlock,
+        state_db: &StateDb,
+        evm_executor: &EvmExecutor,
+        skip_state_root_check: bool,
+    ) -> Result<ValidatedBlock, BridgeError> {
         // FIX CONS-PF-02: Recover senders from EIP-712 signatures in each
         // SignedNativeAction. If any signature is invalid, reject the block.
         // FIX ECON-FIND-03: Check persistent nonces to prevent replay.
@@ -384,7 +417,7 @@ impl BlockValidator {
         let computed_root =
             compute_full_composite_root(state_db, &exec_result.bundle, native_root)?;
 
-        if computed_root != block.header.state_root {
+        if !skip_state_root_check && computed_root != block.header.state_root {
             return Err(BridgeError::StateRootMismatch {
                 expected: block.header.state_root,
                 computed: computed_root,
