@@ -18,8 +18,18 @@
         "treasury_address": "0xf000000000000000000000000000000000000001",
         "dev_pool_address": "0xf000000000000000000000000000000000000002",
         "fee_split": {
-            "start": { "burn": 1000, "validator": 0, "treasury": 4500, "dev_pool": 4500 },
-            "end": { "burn": 2500, "validator": 2500, "treasury": 2500, "dev_pool": 2500 },
+            "start": {
+                "burn": 1000,
+                "validator": 0,
+                "treasury": 4500,
+                "dev_pool": 4500
+            },
+            "end": {
+                "burn": 2500,
+                "validator": 2500,
+                "treasury": 2500,
+                "dev_pool": 2500
+            },
             "transition_epochs": 1825
         },
         "permanent_staking": {
@@ -107,69 +117,469 @@
             "note": "test-account-6 (hardhat #6)"
         },
         {
-            "address": "0x14dc79964da2c08dda4c5d09d47b49dc8de5f3e2",
+            "address": "0x14dc79964da2c08b23698b3d3cc7ca32193d9955",
             "balance": "1000000000000000000000000",
             "note": "test-account-7 (hardhat #7)"
         },
         {
-            "address": "0x23618e81E3f5cdF7f54C3d65f7FBc0aBf5B21E8f",
+            "address": "0x23618e81e3f5cdf7f54c3d65f7fbc0abf5b21e8f",
             "balance": "1000000000000000000000000",
             "note": "test-account-8 (hardhat #8)"
         },
         {
-            "address": "0xa0Ee7A142d267C1f36714E4a8F75612F20a79720",
+            "address": "0xa0ee7a142d267c1f36714e4a8f75612f20a79720",
             "balance": "1000000000000000000000000",
             "note": "test-account-9 (hardhat #9)"
         },
         {
-            "address": "0xBcd4042DE499D14e55001CcbB24a551F3b954096",
+            "address": "0xbcd4042de499d14e55001ccbb24a551f3b954096",
             "balance": "1000000000000000000000000",
             "note": "test-account-10 (hardhat #10)"
         },
         {
-            "address": "0x71bE63f3384f5fb98995898A86B02Fb2426c5788",
+            "address": "0x71be63f3384f5fb98995898a86b02fb2426c5788",
             "balance": "1000000000000000000000000",
             "note": "test-account-11 (hardhat #11)"
         },
         {
-            "address": "0xFABB0ac9d68B0B445fB7357272Ff202C5651694a",
+            "address": "0xfabb0ac9d68b0b445fb7357272ff202c5651694a",
             "balance": "1000000000000000000000000",
             "note": "test-account-12 (hardhat #12)"
         },
         {
-            "address": "0x1CBd3b2770909D4e10f157cABC84C7264073C9Ec",
+            "address": "0x1cbd3b2770909d4e10f157cabc84c7264073c9ec",
             "balance": "1000000000000000000000000",
             "note": "test-account-13 (hardhat #13)"
         },
         {
-            "address": "0xdF3e18d64BC6A983f673Ab319CCaE4f1a57C7097",
+            "address": "0xdf3e18d64bc6a983f673ab319ccae4f1a57c7097",
             "balance": "1000000000000000000000000",
             "note": "test-account-14 (hardhat #14)"
         },
         {
-            "address": "0xcd3B766CCDd6AE721141F452C550Ca635964ce71",
+            "address": "0xcd3b766ccdd6ae721141f452c550ca635964ce71",
             "balance": "1000000000000000000000000",
             "note": "test-account-15 (hardhat #15)"
         },
         {
-            "address": "0x2546BcD3c84621e976D8185a91A922aE77ECEc30",
+            "address": "0x2546bcd3c84621e976d8185a91a922ae77ecec30",
             "balance": "1000000000000000000000000",
             "note": "test-account-16 (hardhat #16)"
         },
         {
-            "address": "0xbDA5747bFD65F08deb54cb465eB87D40e51B197E",
+            "address": "0xbda5747bfd65f08deb54cb465eb87d40e51b197e",
             "balance": "1000000000000000000000000",
             "note": "test-account-17 (hardhat #17)"
         },
         {
-            "address": "0xdD2FD4581271e230360230F9337D5c0430Bf44C0",
+            "address": "0xdd2fd4581271e230360230f9337d5c0430bf44c0",
             "balance": "1000000000000000000000000",
             "note": "test-account-18 (hardhat #18)"
         },
         {
-            "address": "0x8626f6940E2eb28930eFb4CeF49B2d1F2C9C1199",
+            "address": "0x8626f6940e2eb28930efb4cef49b2d1f2c9c1199",
             "balance": "1000000000000000000000000",
             "note": "test-account-19 (hardhat #19)"
+        },
+        {
+            "address": "0x09db0a93b389bef724429898f539aeb7ac2dd55f",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-20 (hardhat #20)"
+        },
+        {
+            "address": "0x02484cb50aac86eae85610d6f4bf026f30f6627d",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-21 (hardhat #21)"
+        },
+        {
+            "address": "0x08135da0a343e492fa2d4282f2ae34c6c5cc1bbe",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-22 (hardhat #22)"
+        },
+        {
+            "address": "0x5e661b79fe2d3f6ce70f5aac07d8cd9abb2743f1",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-23 (hardhat #23)"
+        },
+        {
+            "address": "0x61097ba76cd906d2ba4fd106e757f7eb455fc295",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-24 (hardhat #24)"
+        },
+        {
+            "address": "0xdf37f81daad2b0327a0a50003740e1c935c70913",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-25 (hardhat #25)"
+        },
+        {
+            "address": "0x553bc17a05702530097c3677091c5bb47a3a7931",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-26 (hardhat #26)"
+        },
+        {
+            "address": "0x87bdce72c06c21cd96219bd8521bdf1f42c78b5e",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-27 (hardhat #27)"
+        },
+        {
+            "address": "0x40fc963a729c542424cd800349a7e4ecc4896624",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-28 (hardhat #28)"
+        },
+        {
+            "address": "0x9dcce783b6464611f38631e6c851bf441907c710",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-29 (hardhat #29)"
+        },
+        {
+            "address": "0x1bcb8e569eedab4668e55145cfeaf190902d3cf2",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-30 (hardhat #30)"
+        },
+        {
+            "address": "0x8263fce86b1b78f95ab4dae11907d8af88f841e7",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-31 (hardhat #31)"
+        },
+        {
+            "address": "0xcf2d5b3cbb4d7bf04e3f7bfa8e27081b52191f91",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-32 (hardhat #32)"
+        },
+        {
+            "address": "0x86c53eb85d0b7548fea5c4b4f82b4205c8f6ac18",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-33 (hardhat #33)"
+        },
+        {
+            "address": "0x1aac82773cb722166d7da0d5b0fa35b0307dd99d",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-34 (hardhat #34)"
+        },
+        {
+            "address": "0x2f4f06d218e426344cfe1a83d53dad806994d325",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-35 (hardhat #35)"
+        },
+        {
+            "address": "0x1003ff39d25f2ab16dbcc18ece05a9b6154f65f4",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-36 (hardhat #36)"
+        },
+        {
+            "address": "0x9eaf5590f2c84912a08de97fa28d0529361deb9e",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-37 (hardhat #37)"
+        },
+        {
+            "address": "0x11e8f3ea3c6fcf12ecff2722d75cefc539c51a1c",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-38 (hardhat #38)"
+        },
+        {
+            "address": "0x7d86687f980a56b832e9378952b738b614a99dc6",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-39 (hardhat #39)"
+        },
+        {
+            "address": "0x9ef6c02fb2ecc446146e05f1ff687a788a8bf76d",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-40 (hardhat #40)"
+        },
+        {
+            "address": "0x08a2de6f3528319123b25935c92888b16db8913e",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-41 (hardhat #41)"
+        },
+        {
+            "address": "0xe141c82d99d85098e03e1a1cc1cde676556fdde0",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-42 (hardhat #42)"
+        },
+        {
+            "address": "0x4b23d303d9e3719d6cdf8d172ea030f80509ea15",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-43 (hardhat #43)"
+        },
+        {
+            "address": "0xc004e69c5c04a223463ff32042dd36dabf63a25a",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-44 (hardhat #44)"
+        },
+        {
+            "address": "0x5eb15c0992734b5e77c888d713b4fc67b3d679a2",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-45 (hardhat #45)"
+        },
+        {
+            "address": "0x7ebb637fd68c523613be51aad27c35c4db199b9c",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-46 (hardhat #46)"
+        },
+        {
+            "address": "0x3c3e2e178c69d4bad964568415a0f0c84fd6320a",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-47 (hardhat #47)"
+        },
+        {
+            "address": "0x35304262b9e87c00c430149f28dd154995d01207",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-48 (hardhat #48)"
+        },
+        {
+            "address": "0xd4a1e660c916855229e1712090ccfd8a424a2e33",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-49 (hardhat #49)"
+        },
+        {
+            "address": "0xee7f6a930b29d7350498af97f0f9672eaecbeeff",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-50 (hardhat #50)"
+        },
+        {
+            "address": "0x145e2dc5c8238d1be628f87076a37d4a26a78544",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-51 (hardhat #51)"
+        },
+        {
+            "address": "0xd6a098ebcc5f8bd4e174d915c54486b077a34a51",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-52 (hardhat #52)"
+        },
+        {
+            "address": "0x042a63149117602129b6922ecfe3111168c2c323",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-53 (hardhat #53)"
+        },
+        {
+            "address": "0xa0ec9ee47802ceb56eb58ce80f3e41630b771b04",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-54 (hardhat #54)"
+        },
+        {
+            "address": "0xe8b1ff302a740fd2c6e76b620d45508daec2ddff",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-55 (hardhat #55)"
+        },
+        {
+            "address": "0xab707cb80e7de7c75d815b1a653433f3eec44c74",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-56 (hardhat #56)"
+        },
+        {
+            "address": "0x0d803cdeee5990f22c2a8df10a695d2312da26cc",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-57 (hardhat #57)"
+        },
+        {
+            "address": "0x1c87bb9234aec6adc580eae6c8b59558a4502220",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-58 (hardhat #58)"
+        },
+        {
+            "address": "0x4779d18931b35540f84b0cd0e9633855b84df7b8",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-59 (hardhat #59)"
+        },
+        {
+            "address": "0xc0543b0b980d8c834cbdf023b2d2a75b5f9d1909",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-60 (hardhat #60)"
+        },
+        {
+            "address": "0x73b3074ac649a8dc31c2c90a124469456301a30f",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-61 (hardhat #61)"
+        },
+        {
+            "address": "0x265188114eb5d5536bc8654d8e9710fe72c28c4d",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-62 (hardhat #62)"
+        },
+        {
+            "address": "0x924ba5ce9f91dded37b4ebf8c0dc82a40202fc0a",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-63 (hardhat #63)"
+        },
+        {
+            "address": "0x64492e25c30031edad55e57cea599cdb1f06dad1",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-64 (hardhat #64)"
+        },
+        {
+            "address": "0x262595fa2a3a86adacde208589614d483e3ef1c0",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-65 (hardhat #65)"
+        },
+        {
+            "address": "0xdfd99099fa13541a64aee9aad61c0dbf3d32d492",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-66 (hardhat #66)"
+        },
+        {
+            "address": "0x63c3686ef31c03a641e2ea8993a91ea351e5891a",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-67 (hardhat #67)"
+        },
+        {
+            "address": "0x9394cb5f737bd3acea7dce90ca48dbd42801ee5d",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-68 (hardhat #68)"
+        },
+        {
+            "address": "0x344dca30f5c5f74f2f13dc1d48ad3a9069d13ad9",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-69 (hardhat #69)"
+        },
+        {
+            "address": "0xf23e054d8b4d0becfa22deef5632f27f781f8bf5",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-70 (hardhat #70)"
+        },
+        {
+            "address": "0x6d69f301d1da5c7818b5e61eecc745b30179c68b",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-71 (hardhat #71)"
+        },
+        {
+            "address": "0xf0ce7bab13c99ba0565f426508a7cd8f4c247e5a",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-72 (hardhat #72)"
+        },
+        {
+            "address": "0x011bd5423c5f77b5a0789e27f922535fd76b688f",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-73 (hardhat #73)"
+        },
+        {
+            "address": "0xd9065f27e9b706e5f7628e067cc00b288dddbf19",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-74 (hardhat #74)"
+        },
+        {
+            "address": "0x54ccceb38251c29b628ef8b00b3cab97e7cac7d5",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-75 (hardhat #75)"
+        },
+        {
+            "address": "0xa1196426b41627ae75ea7f7409e074be97367da2",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-76 (hardhat #76)"
+        },
+        {
+            "address": "0xe74cef90b6cf1a77fefad731713e6f53e575c183",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-77 (hardhat #77)"
+        },
+        {
+            "address": "0x7df8efa6d6f1cb5c4f36315e0acb82b02ae8ba40",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-78 (hardhat #78)"
+        },
+        {
+            "address": "0x9e126c57330fa71556628e0aabd6b6b6783d99fa",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-79 (hardhat #79)"
+        },
+        {
+            "address": "0x586ba39027a74e8d40e6626f89ae97ba7f616644",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-80 (hardhat #80)"
+        },
+        {
+            "address": "0x9a50ed082cf2fc003152580dcdb320b834fa379e",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-81 (hardhat #81)"
+        },
+        {
+            "address": "0xbc8183bac3e969042736f7af07f76223d11d2148",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-82 (hardhat #82)"
+        },
+        {
+            "address": "0x586af62eae7f447d14d25f53918814e04d3a5ba4",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-83 (hardhat #83)"
+        },
+        {
+            "address": "0xccdd262f272ee6c226266eea13ee48d4d932ce66",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-84 (hardhat #84)"
+        },
+        {
+            "address": "0xf0eeddc5e015d4c459590e01dcc2f2fd1d2baac7",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-85 (hardhat #85)"
+        },
+        {
+            "address": "0x4edfedff17ab9642f8464d6143900903dd21421a",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-86 (hardhat #86)"
+        },
+        {
+            "address": "0x492c973c16e8aec46f4d71716e91b05b245377c9",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-87 (hardhat #87)"
+        },
+        {
+            "address": "0xe5d3ab6883b7e8c35c04675f28bb992ca1129ee4",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-88 (hardhat #88)"
+        },
+        {
+            "address": "0x71f280dea6fc5a03790941ad72956f545feb7a52",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-89 (hardhat #89)"
+        },
+        {
+            "address": "0xe77478d9e136d3643cfc6fef578abf63f9ab91b1",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-90 (hardhat #90)"
+        },
+        {
+            "address": "0x6c8ea11559dfe79ae3dbdd6a67b47f61b929398f",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-91 (hardhat #91)"
+        },
+        {
+            "address": "0x48fa7b63049a6f4e7316eb2d9c5bdda8933bca2f",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-92 (hardhat #92)"
+        },
+        {
+            "address": "0x16adfbefdefd488c992086d472a4ca577a0e5e54",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-93 (hardhat #93)"
+        },
+        {
+            "address": "0x225356ff5d64889d7364be2c990f93a66298ee8d",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-94 (hardhat #94)"
+        },
+        {
+            "address": "0xcbdc0f9a4c38f1e010bd3b6e43598a55d1868c23",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-95 (hardhat #95)"
+        },
+        {
+            "address": "0xbc5bdcee96b1bc47822c74e6f64186fba7d686be",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-96 (hardhat #96)"
+        },
+        {
+            "address": "0x0536896a5e38bbd59f3f369ff3682677965abd19",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-97 (hardhat #97)"
+        },
+        {
+            "address": "0xfe0f143fcad5b561b1ed2ac960278a2f23559ef9",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-98 (hardhat #98)"
+        },
+        {
+            "address": "0x98d08079928fccb30598c6c6382abfd7dbfaa1cd",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-99 (hardhat #99)"
         }
     ],
     "evm_alloc": {},
