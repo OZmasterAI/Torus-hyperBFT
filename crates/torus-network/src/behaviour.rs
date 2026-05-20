@@ -6,7 +6,7 @@ use libp2p::{
     StreamProtocol,
 };
 
-use crate::codec::BorshCodec;
+use crate::codec::{BlockDataCodec, BorshCodec};
 use crate::sync::{SyncRequest, SyncResponse};
 
 pub const CONSENSUS_TOPIC: &str = "/torus/consensus/1.0";
@@ -21,6 +21,8 @@ pub struct TorusBehaviour {
     pub identify: identify::Behaviour,
     /// Connection limits enforcement (Phase 3: 3.1.7).
     pub connection_limits: connection_limits::Behaviour,
+    /// Dedicated block-data fetch protocol (hybrid pipelining Task 2).
+    pub block_data: request_response::Behaviour<BlockDataCodec>,
     /// Peer block list for banning (Phase 3: 3.1.7).
     pub block_list: allow_block_list::Behaviour<allow_block_list::BlockedPeers>,
 }
@@ -53,6 +55,15 @@ impl TorusBehaviour {
         let direct = request_response::Behaviour::<BorshCodec>::new(
             [(
                 StreamProtocol::new("/torus/direct/1.0"),
+                request_response::ProtocolSupport::Full,
+            )],
+            request_response::Config::default().with_request_timeout(Duration::from_secs(10)),
+        );
+
+        // Block data fetch request-response (borsh codec, hybrid pipelining)
+        let block_data = request_response::Behaviour::<BlockDataCodec>::new(
+            [(
+                StreamProtocol::new("/torus/block-data/1.0"),
                 request_response::ProtocolSupport::Full,
             )],
             request_response::Config::default().with_request_timeout(Duration::from_secs(10)),
@@ -93,6 +104,7 @@ impl TorusBehaviour {
         Ok(Self {
             gossipsub,
             direct,
+            block_data,
             sync_proto,
             kademlia,
             identify,

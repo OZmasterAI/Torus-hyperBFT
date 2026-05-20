@@ -6,6 +6,8 @@
 
 use sha2::{Digest, Sha256};
 
+use std::collections::HashMap;
+
 use ed25519_dalek::VerifyingKey;
 use hotstuff_rs::app::{
     App, ProduceBlockRequest, ProduceBlockResponse, ValidateBlockRequest, ValidateBlockResponse,
@@ -16,8 +18,8 @@ use hotstuff_rs::types::update_sets::ValidatorSetUpdates;
 
 use std::sync::Arc;
 use torus_bridge::{
-    sort_native_actions, BlockCommitter, BlockProposer, BlockValidator, BridgeError,
-    NativeExecContext, NativeExecutor,
+    sort_native_actions, merge_bundle_into, BlockCommitter, BlockProposer, BlockValidator,
+    BridgeError, BundleState, NativeExecContext, NativeExecutor,
 };
 use torus_mempool::Mempool;
 use torus_economics::{EpochManager, SlashReason, StakingManager};
@@ -25,10 +27,17 @@ use torus_evm::{EvmExecutor, TORUS_CHAIN_ID};
 use torus_state::cf::{
     CF_BLOCK_BODIES, CF_BLOCK_HEADERS, CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT,
 };
-use torus_state::StateDb;
+use torus_state::{StateDb, StateOverlay};
 use torus_types::{
     Address, ChainConfig, NativeAction, TorusBlock, TorusBlockBody, TorusBlockHeader, ValidatorSet,
 };
+
+/// Pending EVM execution result stored until consensus commits the block.
+struct PendingExec {
+    bundle: BundleState,
+    parent_hash: Option<CryptoHash>,
+    height: u64,
+}
 
 /// FIX CONS-PF-08: Buffered slash intent recorded during speculative rollback.
 /// Applied to DB only when the next block is produced/validated (i.e., the chain
@@ -62,6 +71,13 @@ pub struct TorusApp {
     dev_pool_address: Address,
     metrics: Option<Arc<torus_telemetry::Metrics>>,
     mempool: Option<Arc<Mempool>>,
+    /// Pending EVM bundles not yet flushed to state_db, keyed by block hash.
+    pending_bundles: HashMap<CryptoHash, PendingExec>,
+    /// Block hash whose EVM state was last flushed to state_db.
+    state_db_tip: Option<CryptoHash>,
+    /// Highest block height whose EVM state has been committed to state_db.
+    /// May lag behind last_header.height when blocks are synced without EVM re-execution.
+    evm_committed_height: u64,
 }
 
 impl TorusApp {
@@ -108,6 +124,9 @@ impl TorusApp {
             dev_pool_address: config.dev_pool_address,
             metrics,
             mempool,
+            pending_bundles: HashMap::new(),
+            state_db_tip: None,
+            evm_committed_height: 0,
         };
         app.replay_native_post_commit_if_needed();
         app
@@ -464,6 +483,87 @@ impl TorusApp {
         }
     }
 
+    // ------------------------------------------------------------------
+    // Deferred EVM commit: overlay helpers
+    // ------------------------------------------------------------------
+
+    /// Build a merged `BundleState` containing all pending ancestor changes
+    /// between `state_db_tip` and `parent_hash` (inclusive).
+    fn merged_parent_bundle(&self, parent_hash: &CryptoHash) -> BundleState {
+        let mut chain = Vec::new();
+        let mut cursor = *parent_hash;
+        while let Some(pending) = self.pending_bundles.get(&cursor) {
+            chain.push(&pending.bundle);
+            match pending.parent_hash {
+                Some(p) => cursor = p,
+                None => break,
+            }
+        }
+        // Apply oldest-first so later bundles override earlier ones.
+        let mut merged = BundleState::default();
+        for bundle in chain.into_iter().rev() {
+            merge_bundle_into(&mut merged, bundle);
+        }
+        merged
+    }
+
+    /// Returns true if `parent_hash` has pending (unflushed) EVM state.
+    fn parent_is_pending(&self, parent_hash: &CryptoHash) -> bool {
+        self.pending_bundles.contains_key(parent_hash)
+    }
+
+    /// Flush committed blocks' pending bundles to `state_db`.
+    ///
+    /// `committed_hash` is the highest block known to be committed by consensus.
+    /// We flush all pending bundles on the committed chain, then prune
+    /// orphaned fork bundles.
+    fn flush_committed_bundles(&mut self, committed_hash: Option<CryptoHash>) {
+        let committed_hash = match committed_hash {
+            Some(h) => h,
+            None => return,
+        };
+
+        // Walk from committed block back to state_db_tip, collecting bundles to flush.
+        let mut to_flush = Vec::new();
+        let mut cursor = committed_hash;
+        while let Some(pending) = self.pending_bundles.get(&cursor) {
+            to_flush.push(cursor);
+            match pending.parent_hash {
+                Some(p) => cursor = p,
+                None => break,
+            }
+        }
+
+        if to_flush.is_empty() {
+            return;
+        }
+
+        // Flush oldest-first.
+        to_flush.reverse();
+        let flush_height = self.pending_bundles.get(to_flush.last().unwrap())
+            .map(|p| p.height)
+            .unwrap_or(0);
+
+        for hash in &to_flush {
+            if let Some(pending) = self.pending_bundles.remove(hash) {
+                if let Err(e) = BlockCommitter::commit_pending_bundle(
+                    &self.state_db,
+                    &pending.bundle,
+                ) {
+                    tracing::error!(%e, "failed to flush pending EVM bundle");
+                }
+            }
+        }
+
+        self.state_db_tip = Some(committed_hash);
+        if flush_height > self.evm_committed_height {
+            self.evm_committed_height = flush_height;
+        }
+
+        // Prune orphaned fork bundles (height <= committed height).
+        self.pending_bundles.retain(|_, p| p.height > flush_height);
+    }
+
     fn execute_native_post_commit(
         &self,
         block: &TorusBlock,
@@ -554,16 +654,16 @@ impl TorusApp {
             "do_validate: block contents"
         );
 
-        let validation_result = if has_native {
-            self.validator
-                .validate_block_with_native(&torus_block, &self.state_db, &self.evm_executor)
-        } else if has_evm {
-            self.validator
-                .validate_block(&torus_block, &self.state_db, &self.evm_executor)
-        } else {
+        if !has_native && !has_evm {
             // Empty block — no execution to validate.
             self.persist_block_header(&torus_block);
             self.write_native_applied_height(torus_block.header.height);
+            let parent_height = torus_block.header.height.saturating_sub(1);
+            if parent_height <= self.evm_committed_height
+                && torus_block.header.height > self.evm_committed_height
+            {
+                self.evm_committed_height = torus_block.header.height;
+            }
             if torus_block.header.height > self.last_header.height {
                 self.last_header = torus_block.header.clone();
             }
@@ -572,24 +672,186 @@ impl TorusApp {
                 app_state_updates: None,
                 validator_set_updates,
             };
+        }
+
+        // Flush any pending bundles that consensus has committed.
+        let committed_hash = request.block_tree()
+            .highest_committed_block()
+            .ok()
+            .flatten();
+        self.flush_committed_bundles(committed_hash);
+
+        // Determine the parent block hash for overlay construction.
+        let parent_hash = if block.justify.is_genesis_pc() {
+            None
+        } else {
+            Some(block.justify.block)
+        };
+
+        // EVM catch-up: if our EVM state is behind, walk the committed chain
+        // backwards from this block's parent to our last EVM-committed height,
+        // then replay each ancestor's EVM txs in forward order to advance state_db.
+        if let Some(ref ph) = parent_hash {
+            let parent_height = torus_block.header.height.saturating_sub(1);
+            let evm_height = self.evm_committed_height;
+            if parent_height > evm_height && !self.pending_bundles.contains_key(ph) {
+                let gap = parent_height - evm_height;
+                tracing::info!(height = torus_block.header.height, parent_height, evm_height, gap, "do_validate: EVM behind — attempting catch-up walk");
+
+                // Collect ancestors from parent back to our EVM height.
+                let mut ancestors = Vec::new();
+                let mut cursor = *ph;
+                while let Ok(Some(ancestor_block)) = request.block_tree().block(&cursor) {
+                    let datums = ancestor_block.data.vec();
+                    if let Some(datum) = datums.first() {
+                        if let Ok(tb) = serde_json::from_slice::<TorusBlock>(datum.bytes()) {
+                            if tb.header.height <= evm_height {
+                                break;
+                            }
+                            ancestors.push((cursor, ancestor_block.clone(), tb));
+                        }
+                    }
+                    if ancestor_block.justify.is_genesis_pc() {
+                        break;
+                    }
+                    cursor = ancestor_block.justify.block;
+                }
+                ancestors.reverse();
+
+                if ancestors.is_empty() || ancestors.first().map(|(_, _, tb)| tb.header.height).unwrap_or(0) > evm_height + 1 {
+                    // Ancestor chain incomplete — insert this block without EVM
+                    // so it becomes available for future catch-up walks.
+                    tracing::info!(height = torus_block.header.height, evm_height, "do_validate: ancestor chain incomplete — inserting without EVM");
+                    self.persist_block_header(&torus_block);
+                    if torus_block.header.height > self.last_header.height {
+                        self.last_header = torus_block.header.clone();
+                    }
+                    let validator_set_updates = self.epoch_validator_set_updates(torus_block.header.height);
+                    return ValidateBlockResponse::Valid {
+                        app_state_updates: None,
+                        validator_set_updates,
+                    };
+                }
+
+                let count = ancestors.len();
+                for (hash, _raw_block, tb) in &ancestors {
+                    let has_evm = !tb.evm_transactions.is_empty();
+                    let has_native = !tb.native_actions.is_empty();
+                    if has_evm || has_native {
+                        let result = if has_native {
+                            self.validator.validate_block_with_native(tb, &self.state_db, &self.evm_executor)
+                        } else {
+                            self.validator.validate_block(tb, &self.state_db, &self.evm_executor)
+                        };
+                        match result {
+                            Ok(validated) => {
+                                if let Err(e) = BlockCommitter::commit_block_metadata(&self.state_db, tb, &validated.receipts) {
+                                    tracing::error!(%e, height = tb.header.height, "catch-up: metadata commit failed");
+                                    return ValidateBlockResponse::Invalid;
+                                }
+                                if let Err(e) = BlockCommitter::commit_pending_bundle(&self.state_db, &validated.bundle) {
+                                    tracing::error!(%e, height = tb.header.height, "catch-up: bundle commit failed");
+                                    return ValidateBlockResponse::Invalid;
+                                }
+                                if has_native || tb.header.evm_fee_revenue > 0 {
+                                    let _ = self.execute_native_post_commit(tb, validated.native_sender_actions, validated.native_consumed_nonces);
+                                }
+                                self.write_native_applied_height(tb.header.height);
+                            }
+                            Err(e) => {
+                                tracing::error!(%e, height = tb.header.height, "catch-up: EVM re-execution failed");
+                                return ValidateBlockResponse::Invalid;
+                            }
+                        }
+                    } else {
+                        self.persist_block_header(tb);
+                        self.write_native_applied_height(tb.header.height);
+                    }
+                    self.evm_committed_height = tb.header.height;
+                    if tb.header.height > self.last_header.height {
+                        self.last_header = tb.header.clone();
+                    }
+                    self.state_db_tip = Some(*hash);
+                }
+                tracing::info!(count, new_evm_height = self.evm_committed_height, "do_validate: EVM catch-up complete");
+            }
+        }
+
+        // Build overlay from pending parent bundles so EVM reads uncommitted
+        // ancestor state without corrupting state_db.
+        let use_overlay = parent_hash
+            .as_ref()
+            .map_or(false, |ph| self.parent_is_pending(ph));
+
+        let validation_result = if use_overlay {
+            let parent = parent_hash.unwrap();
+            let merged_parent = self.merged_parent_bundle(&parent);
+            let overlay = StateOverlay::from_bundle(self.state_db.clone(), &merged_parent);
+            if has_native {
+                // Native+EVM with overlay not yet supported — fall back to direct.
+                // Native blocks are rare; fork during native block is extremely unlikely.
+                self.validator
+                    .validate_block_with_native(&torus_block, &self.state_db, &self.evm_executor)
+            } else {
+                self.validator.validate_block_with_overlay(
+                    &torus_block,
+                    &overlay,
+                    &self.state_db,
+                    &merged_parent,
+                    &self.evm_executor,
+                )
+            }
+        } else if has_native {
+            self.validator
+                .validate_block_with_native(&torus_block, &self.state_db, &self.evm_executor)
+        } else {
+            self.validator
+                .validate_block(&torus_block, &self.state_db, &self.evm_executor)
         };
 
         match validation_result {
             Ok(validated) => {
-                let commit_result = BlockCommitter::commit_block(
+                // Write block metadata (header, body, receipts, indices) immediately.
+                // Defer EVM state (accounts, storage, code) until consensus commits.
+                let meta_result = BlockCommitter::commit_block_metadata(
                     &self.state_db,
                     &torus_block,
-                    &validated.bundle,
                     &validated.receipts,
                 );
-                match commit_result {
+                match meta_result {
                     Ok(block_hash) => {
                         tracing::info!(
                             height = torus_block.header.height,
                             %block_hash,
                             evm_txs = torus_block.evm_transactions.len(),
-                            "committed block state to DB"
+                            pending = use_overlay,
+                            "validated block (EVM state deferred)"
                         );
+
+                        // Store the EVM bundle for deferred flush.
+                        let block_crypto_hash = block.hash;
+                        self.pending_bundles.insert(block_crypto_hash, PendingExec {
+                            bundle: validated.bundle,
+                            parent_hash,
+                            height: torus_block.header.height,
+                        });
+
+                        // If parent is NOT pending (i.e. its state is in state_db),
+                        // we can flush this block immediately since it extends
+                        // the committed chain — fast path for the linear case.
+                        if !use_overlay {
+                            if let Some(pending) = self.pending_bundles.remove(&block_crypto_hash) {
+                                if let Err(e) = BlockCommitter::commit_pending_bundle(
+                                    &self.state_db,
+                                    &pending.bundle,
+                                ) {
+                                    tracing::error!(%e, "failed to flush EVM bundle (fast path)");
+                                }
+                                self.state_db_tip = Some(block_crypto_hash);
+                                self.evm_committed_height = torus_block.header.height;
+                            }
+                        }
+
                         if has_native || torus_block.header.evm_fee_revenue > 0 {
                             match self.execute_native_post_commit(
                                 &torus_block,
@@ -604,7 +866,7 @@ impl TorusApp {
                         }
                     }
                     Err(e) => {
-                        tracing::error!(%e, "failed to commit block state");
+                        tracing::error!(%e, "failed to commit block metadata");
                         return ValidateBlockResponse::Invalid;
                     }
                 }
@@ -700,8 +962,8 @@ impl App<RocksKVStore> for TorusApp {
             )
         };
 
-        let block = match result {
-            Ok(proposed) => proposed.block,
+        let (block, exec_result) = match result {
+            Ok(proposed) => (proposed.block, proposed.exec_result),
             Err(e) => {
                 tracing::error!(%e, "block proposal FAILED — falling back to empty block");
                 if let Some(ref mempool) = self.mempool {
@@ -718,11 +980,55 @@ impl App<RocksKVStore> for TorusApp {
             }
         };
 
+        // Proposer state commitment: write metadata + EVM state immediately
+        // (proposer always extends the linear chain — no fork risk).
+        let has_evm = !block.evm_transactions.is_empty();
+        let has_native = !block.native_actions.is_empty();
+        if has_evm || has_native {
+            match BlockCommitter::commit_block_metadata(
+                &self.state_db,
+                &block,
+                &exec_result.receipts,
+            ) {
+                Ok(block_hash) => {
+                    if let Err(e) = BlockCommitter::commit_pending_bundle(
+                        &self.state_db,
+                        &exec_result.bundle,
+                    ) {
+                        tracing::error!(%e, "proposer: failed to commit EVM bundle");
+                    }
+                    self.evm_committed_height = block.header.height;
+                    tracing::info!(
+                        height = block.header.height,
+                        %block_hash,
+                        evm_txs = block.evm_transactions.len(),
+                        "proposer: committed block state to DB"
+                    );
+                    if has_native || block.header.evm_fee_revenue > 0 {
+                        match self.execute_native_post_commit(
+                            &block,
+                            vec![],
+                            vec![],
+                        ) {
+                            Ok(()) => self.write_native_applied_height(block.header.height),
+                            Err(e) => tracing::error!(%e, "proposer: native post-commit failed"),
+                        }
+                    } else {
+                        self.write_native_applied_height(block.header.height);
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(%e, "proposer: failed to commit block metadata");
+                }
+            }
+        }
+
+        if block.header.height > self.last_header.height {
+            self.last_header = block.header.clone();
+        }
+
         let encoded = serde_json::to_vec(&block).expect("serialize TorusBlock");
         let hash = Self::hash_datum(&encoded);
-
-        // FIX CONS-PF-05: Don't update last_header during produce_block (before consensus).
-        // It will be updated in do_validate when the block passes consensus validation.
 
         // Check for epoch boundary and compute validator set updates.
         let validator_set_updates = self.epoch_validator_set_updates(block.header.height);
@@ -746,6 +1052,34 @@ impl App<RocksKVStore> for TorusApp {
         &mut self,
         request: ValidateBlockRequest<RocksKVStore>,
     ) -> ValidateBlockResponse {
+        // During sync, blocks are already consensus-committed by quorum.
+        // If our EVM state is behind, skip EVM re-execution so the block
+        // gets inserted into the tree. The catch-up walk in do_validate
+        // will replay EVM when the ancestor chain is complete.
+        let block = request.proposed_block();
+        let datums = block.data.vec();
+        if datums.len() == 1 {
+            if let Ok(tb) = serde_json::from_slice::<TorusBlock>(datums[0].bytes()) {
+                let parent_height = tb.header.height.saturating_sub(1);
+                if parent_height > self.evm_committed_height {
+                    tracing::info!(
+                        height = tb.header.height,
+                        evm_height = self.evm_committed_height,
+                        "validate_block_for_sync: EVM behind — inserting without re-execution"
+                    );
+                    self.persist_block_header(&tb);
+                    if tb.header.height > self.last_header.height {
+                        self.last_header = tb.header.clone();
+                    }
+                    let validator_set_updates = self.epoch_validator_set_updates(tb.header.height);
+                    return ValidateBlockResponse::Valid {
+                        app_state_updates: None,
+                        validator_set_updates,
+                    };
+                }
+            }
+        }
+        // EVM state is current — do full validation.
         self.do_validate(request)
     }
 

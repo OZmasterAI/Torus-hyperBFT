@@ -8,12 +8,16 @@ use std::sync::{Arc, Mutex};
 
 use ed25519_dalek::VerifyingKey;
 
+use hotstuff_rs::hotstuff::messages::{BlockDataRequest, BlockDataResponse};
 use hotstuff_rs::networking::messages::Message;
 use hotstuff_rs::networking::network::Network;
+use hotstuff_rs::types::block::Block;
+use hotstuff_rs::types::data_types::CryptoHash;
 use hotstuff_rs::types::update_sets::ValidatorSetUpdates;
 use hotstuff_rs::types::validator_set::ValidatorSet;
 
 type Inbox = Arc<Mutex<VecDeque<(VerifyingKey, Message)>>>;
+type BlockDataInbox = Arc<Mutex<VecDeque<(VerifyingKey, BlockDataResponse)>>>;
 
 /// In-process channel network for testing consensus with multiple validators
 /// in a single process.
@@ -25,6 +29,8 @@ pub struct ChannelNetwork {
     me: VerifyingKey,
     my_inbox: Inbox,
     all_inboxes: Arc<HashMap<[u8; 32], Inbox>>,
+    block_store: Arc<Mutex<HashMap<CryptoHash, Block>>>,
+    block_data_inbox: BlockDataInbox,
 }
 
 impl ChannelNetwork {
@@ -37,6 +43,7 @@ impl ChannelNetwork {
             inboxes.insert(key.to_bytes(), Arc::new(Mutex::new(VecDeque::new())));
         }
         let all_inboxes = Arc::new(inboxes);
+        let block_store = Arc::new(Mutex::new(HashMap::new()));
 
         keys.iter()
             .map(|key| {
@@ -45,6 +52,8 @@ impl ChannelNetwork {
                     me: *key,
                     my_inbox,
                     all_inboxes: all_inboxes.clone(),
+                    block_store: block_store.clone(),
+                    block_data_inbox: Arc::new(Mutex::new(VecDeque::new())),
                 }
             })
             .collect()
@@ -76,5 +85,21 @@ impl Network for ChannelNetwork {
 
     fn recv(&mut self) -> Option<(VerifyingKey, Message)> {
         self.my_inbox.lock().unwrap().pop_front()
+    }
+
+    fn store_block_for_serving(&mut self, hash: CryptoHash, block: Block) {
+        self.block_store.lock().unwrap().insert(hash, block);
+    }
+
+    fn request_block_data(&mut self, peer: VerifyingKey, request: BlockDataRequest) {
+        let block = self.block_store.lock().unwrap().get(&request.block_hash).cloned();
+        if let Some(block) = block {
+            let resp = BlockDataResponse { view: request.view, block };
+            self.block_data_inbox.lock().unwrap().push_back((peer, resp));
+        }
+    }
+
+    fn recv_block_data(&mut self) -> Option<(VerifyingKey, BlockDataResponse)> {
+        self.block_data_inbox.lock().unwrap().pop_front()
     }
 }

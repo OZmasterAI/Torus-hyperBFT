@@ -178,11 +178,12 @@ impl ProgressMessageStub {
 
                     // Return the message if either:
                     // 1. It is a HotStuff message for the current view, or
+                    // 1b. It is a block data fetch message (viewless — body may arrive after view advances), or
                     // 2. If it is a Pacemaker message for the current view or a future view, or
                     // 3. If it is a BlockSyncAdvertise message.
                     let return_msg = match &msg {
                         ProgressMessage::HotStuffMessage(hotstuff_msg) => {
-                            hotstuff_msg.view() == cur_view
+                            hotstuff_msg.view() == cur_view || hotstuff_msg.is_block_data_msg()
                         }
                         ProgressMessage::PacemakerMessage(pacemaker_msg) => {
                             pacemaker_msg.view() >= cur_view

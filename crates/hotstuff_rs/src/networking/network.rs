@@ -4,7 +4,8 @@
 
 use ed25519_dalek::VerifyingKey;
 
-use crate::types::{update_sets::ValidatorSetUpdates, validator_set::ValidatorSet};
+use crate::hotstuff::messages::{BlockDataRequest, BlockDataResponse};
+use crate::types::{block::Block, data_types::CryptoHash, update_sets::ValidatorSetUpdates, validator_set::ValidatorSet};
 
 use super::messages::Message;
 
@@ -24,6 +25,18 @@ pub trait Network: Clone + Send {
 
     /// Receive a message from any peer. Returns immediately with a None if no message is available now.
     fn recv(&mut self) -> Option<(VerifyingKey, Message)>;
+
+    /// Request block data from a peer via the dedicated block-data protocol.
+    /// Default no-op for backward compatibility.
+    fn request_block_data(&mut self, _peer: VerifyingKey, _request: BlockDataRequest) {}
+
+    /// Receive a block-data response. Non-blocking, returns None if nothing available.
+    /// Responses arrive via a channel separate from the consensus message queue.
+    fn recv_block_data(&mut self) -> Option<(VerifyingKey, BlockDataResponse)> { None }
+
+    /// Publish a block to the network-thread store so it can serve body requests
+    /// without touching the algorithm thread.
+    fn store_block_for_serving(&mut self, _hash: CryptoHash, _block: Block) {}
 }
 
 /// Handle for informing the [`Network`] implementation about validator set updates.

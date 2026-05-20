@@ -147,13 +147,12 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
 
             // 4. In case the view has been updated, update HotStuff's internal view and perform
             // the necessary protocol steps.
-            if self.hotstuff.is_view_outdated(view_info) {
+            if self.hotstuff.is_view_outdated(view_info) || self.hotstuff.has_deferred_proposal() {
                 if let Err(e) = self
                     .hotstuff
                     .enter_view(view_info.clone(), &mut self.block_tree, &mut self.app)
                 {
-                    log::error!("HotStuff enter_view error (view={}): {:?} — skipping view", view_info.view.int(), e);
-                    continue;
+                    log::error!("HotStuff enter_view error (view={}): {:?} — will retry after polling messages", view_info.view.int(), e);
                 }
             }
 
@@ -175,9 +174,28 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
                 }
             }
 
+            // 6b. Poll the dedicated block-data channel for body responses.
+            if let Err(e) = self
+                .hotstuff
+                .poll_block_data_responses(&mut self.block_tree, &mut self.app)
+            {
+                log::error!("HotStuff poll_block_data_responses error: {:?}", e);
+            }
+
+            // 6c. Retry stale body fetches; trigger sync after max retries.
+            self.hotstuff.tick_pending_body_retries();
+            if self.hotstuff.take_sync_needed() {
+                if let Err(e) = self.block_sync_client.trigger_sync(&mut self.block_tree) {
+                    log::error!("BlockSync trigger_sync (body retry exhausted) error: {:?}", e);
+                }
+            }
+
             // 7. Poll the network for incoming messages.
             // Use a short deadline during active sync so we don't park for 500ms between batches.
-            let recv_deadline = if self.block_sync_client.has_pending_sync() {
+            let recv_deadline = if self.block_sync_client.has_pending_sync()
+                || self.hotstuff.has_deferred_proposal()
+                || self.hotstuff.has_pending_body_fetches()
+            {
                 std::cmp::min(view_info.deadline, Instant::now() + Duration::from_millis(10))
             } else {
                 view_info.deadline

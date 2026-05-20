@@ -8,7 +8,7 @@ use revm::{Context, ExecuteCommitEvm, MainBuilder, MainContext};
 
 use crate::precompile_provider::TorusPrecompiles;
 
-use torus_state::StateDb;
+use torus_state::{StateDb, StateOverlay};
 use torus_types::{Log as TorusLog, Receipt};
 
 use crate::bloom::logs_bloom;
@@ -236,6 +236,125 @@ impl EvmExecutor {
         }
 
         // Merge all transaction transitions into the bundle.
+        let mut bundle = BundleState::default();
+        evm.ctx.modify_db(|s| {
+            s.merge_transitions(BundleRetention::Reverts);
+            bundle = s.take_bundle();
+        });
+
+        Ok(BlockExecResult {
+            receipts,
+            bundle,
+            gas_used: cumulative_gas,
+            logs_bloom: block_bloom,
+            included_indices,
+        })
+    }
+
+    /// Same as [`execute_block`](Self::execute_block) but reads EVM state from
+    /// a [`StateOverlay`] (pending parent bundles layered on state_db).
+    /// Precompiles still read native state from the underlying `state_db`.
+    pub fn execute_block_with_overlay(
+        &self,
+        overlay: &StateOverlay,
+        block_cfg: &BlockEnvCfg,
+        transactions: Vec<TxEnv>,
+        skip_invalid: bool,
+    ) -> Result<BlockExecResult, EvmError> {
+        let state = State::builder()
+            .with_database_ref(overlay)
+            .with_bundle_update()
+            .build();
+
+        let chain_id = self.chain_id;
+        let ctx = Context::mainnet()
+            .modify_cfg_chained(|cfg| {
+                cfg.set_spec_and_mainnet_gas_params(SpecId::CANCUN);
+                cfg.chain_id = chain_id;
+            })
+            .modify_block_chained(|b| apply_block_env(b, block_cfg))
+            .with_db(state);
+
+        let mut evm = ctx
+            .build_mainnet()
+            .with_precompiles(TorusPrecompiles::new(SpecId::CANCUN, overlay.base(), block_cfg.number));
+
+        let mut receipts = Vec::with_capacity(transactions.len());
+        let mut cumulative_gas: u64 = 0;
+        let mut block_bloom = Bloom::ZERO;
+        let mut included_indices = Vec::with_capacity(transactions.len());
+        let mut receipt_idx: usize = 0;
+
+        for (idx, tx) in transactions.into_iter().enumerate() {
+            let max_fee = tx.gas_price;
+            let priority_fee = tx.gas_priority_fee;
+
+            let result = match evm.transact_commit(tx) {
+                Ok(r) => r,
+                Err(EVMError::Transaction(tx_err)) if skip_invalid => {
+                    tracing::warn!(idx, ?tx_err, "skipping invalid tx during block proposal");
+                    continue;
+                }
+                Err(e) => return Err(map_evm_err(e)),
+            };
+            included_indices.push(idx);
+            let gas_used = result.gas().used();
+
+            cumulative_gas =
+                cumulative_gas
+                    .checked_add(gas_used)
+                    .ok_or(EvmError::BlockGasLimitExceeded {
+                        cumulative: u64::MAX,
+                        limit: block_cfg.gas_limit,
+                    })?;
+
+            if cumulative_gas > block_cfg.gas_limit {
+                return Err(EvmError::BlockGasLimitExceeded {
+                    cumulative: cumulative_gas,
+                    limit: block_cfg.gas_limit,
+                });
+            }
+
+            let success = result.is_success();
+
+            let (torus_logs, tx_bloom) = if success {
+                let evm_logs = result.logs();
+                let bloom = logs_bloom(evm_logs.iter());
+                let logs = evm_logs.iter().map(convert_log).collect();
+                (logs, bloom)
+            } else {
+                (Vec::new(), Bloom::ZERO)
+            };
+
+            block_bloom |= tx_bloom;
+
+            let contract_address = match &result {
+                ExecutionResult::Success {
+                    output: Output::Create(_, addr),
+                    ..
+                } => *addr,
+                _ => None,
+            };
+
+            let effective_gas_price =
+                calc_effective_gas_price(block_cfg.base_fee, max_fee, priority_fee);
+
+            receipts.push(Receipt {
+                tx_hash: B256::ZERO,
+                block_number: block_cfg.number,
+                block_hash: B256::ZERO,
+                tx_index: receipt_idx as u32,
+                cumulative_gas_used: cumulative_gas,
+                gas_used,
+                contract_address,
+                logs: torus_logs,
+                logs_bloom: tx_bloom,
+                status: success,
+                effective_gas_price,
+            });
+            receipt_idx += 1;
+        }
+
         let mut bundle = BundleState::default();
         evm.ctx.modify_db(|s| {
             s.merge_transitions(BundleRetention::Reverts);

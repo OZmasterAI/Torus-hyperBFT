@@ -119,4 +119,9 @@ impl<'a, K: KVStore> AppBlockTreeView<'a, K> {
     pub fn validator_set(&self) -> Result<ValidatorSet, BlockTreeError> {
         self.block_tree.committed_validator_set()
     }
+
+    /// Get the hash of the highest committed block (if any).
+    pub fn highest_committed_block(&self) -> Result<Option<CryptoHash>, BlockTreeError> {
+        self.block_tree.highest_committed_block()
+    }
 }

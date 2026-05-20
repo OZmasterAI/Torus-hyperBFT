@@ -108,3 +108,74 @@ where
     io.close().await?;
     Ok(())
 }
+
+/// Request on the dedicated `/torus/block-data/1.0` protocol.
+#[derive(borsh::BorshSerialize, borsh::BorshDeserialize, Debug, Clone)]
+pub struct BlockDataNetRequest {
+    pub block_hash: [u8; 32],
+    pub view: u64,
+}
+
+/// Response on the dedicated `/torus/block-data/1.0` protocol.
+/// `payload` is a borsh-encoded `Block`; empty when not found.
+#[derive(borsh::BorshSerialize, borsh::BorshDeserialize, Debug, Clone)]
+pub struct BlockDataNetResponse {
+    pub view: u64,
+    pub payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct BlockDataCodec;
+
+#[async_trait]
+impl libp2p::request_response::Codec for BlockDataCodec {
+    type Protocol = StreamProtocol;
+    type Request = BlockDataNetRequest;
+    type Response = BlockDataNetResponse;
+
+    async fn read_request<T>(
+        &mut self,
+        _protocol: &Self::Protocol,
+        io: &mut T,
+    ) -> io::Result<Self::Request>
+    where
+        T: AsyncRead + Unpin + Send,
+    {
+        read_length_prefixed_borsh(io).await
+    }
+
+    async fn read_response<T>(
+        &mut self,
+        _protocol: &Self::Protocol,
+        io: &mut T,
+    ) -> io::Result<Self::Response>
+    where
+        T: AsyncRead + Unpin + Send,
+    {
+        read_length_prefixed_borsh(io).await
+    }
+
+    async fn write_request<T>(
+        &mut self,
+        _protocol: &Self::Protocol,
+        io: &mut T,
+        req: Self::Request,
+    ) -> io::Result<()>
+    where
+        T: AsyncWrite + Unpin + Send,
+    {
+        write_length_prefixed_borsh(io, &req).await
+    }
+
+    async fn write_response<T>(
+        &mut self,
+        _protocol: &Self::Protocol,
+        io: &mut T,
+        res: Self::Response,
+    ) -> io::Result<()>
+    where
+        T: AsyncWrite + Unpin + Send,
+    {
+        write_length_prefixed_borsh(io, &res).await
+    }
+}

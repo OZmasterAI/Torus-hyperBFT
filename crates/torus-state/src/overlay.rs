@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 use alloy_primitives::{Address, Bytes, B256, U256};
 use revm::bytecode::Bytecode;
+use revm::database::BundleState;
 use revm::state::AccountInfo;
 
 use crate::db::{StateDb, KECCAK_EMPTY};
@@ -79,6 +80,32 @@ impl StateOverlay {
     /// Reference to the underlying base database.
     pub fn base(&self) -> &StateDb {
         &self.base
+    }
+
+    /// Create an overlay pre-populated with changes from a `BundleState`.
+    pub fn from_bundle(base: StateDb, bundle: &BundleState) -> Self {
+        let mut overlay = Self::new(base);
+        overlay.apply_bundle(bundle);
+        overlay
+    }
+
+    /// Apply all account, storage, and code changes from a `BundleState`.
+    ///
+    /// Later calls override earlier ones for the same key, so call in
+    /// ancestor-first order when layering multiple bundles.
+    pub fn apply_bundle(&mut self, bundle: &BundleState) {
+        for (address, acct) in &bundle.state {
+            self.accounts.insert(*address, acct.info.clone());
+            for (slot, slot_val) in &acct.storage {
+                self.storage
+                    .entry(*address)
+                    .or_default()
+                    .insert(*slot, slot_val.present_value);
+            }
+        }
+        for (hash, bytecode) in &bundle.contracts {
+            self.code.insert(*hash, bytecode.bytes().to_vec());
+        }
     }
 }
 

@@ -289,7 +289,10 @@ impl<N: Network> BlockSyncClient<N> {
             .publish(&self.event_publisher);
 
             let committed_validator_set_updates =
-                block_tree.update(&block.justify, &self.event_publisher)?;
+                block_tree.update(&block.justify, &self.event_publisher).unwrap_or_else(|e| {
+                    log::warn!("block_sync: block_tree.update failed: {:?}", e);
+                    None
+                });
 
             if let Some(vs_updates) = committed_validator_set_updates {
                 self.validator_set_update_handle
@@ -304,7 +307,7 @@ impl<N: Network> BlockSyncClient<N> {
                 if highest_pc.is_correct(block_tree)?
                     && safe_pc(highest_pc, block_tree, chain_id)?
                 {
-                    block_tree.update(highest_pc, &self.event_publisher)?;
+                    let _ = block_tree.update(highest_pc, &self.event_publisher);
                 }
             }
 

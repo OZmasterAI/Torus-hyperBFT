@@ -105,6 +105,7 @@ while true; do
             --chain "$CHAIN_ID" \
             --gas-price "$GAS_PRICE" \
             --priority-gas-price "$GAS_PRICE" \
+            --gas-limit 21000 \
             --nonce "$NONCE" \
             --async \
             "${ADDRS[$RECV_IDX]}" \
@@ -125,13 +126,16 @@ while true; do
         BG_COUNT=0
     fi
 
-    # Resync nonces every full rotation through all accounts
+    # Resync nonces every full rotation through all accounts.
+    # Only advance — never rewind, since the mempool may be ahead of confirmed state.
     if (( COUNT % (NUM_KEYS * 2) == 0 )); then
         wait
         BG_COUNT=0
         for i in "${!ADDRS[@]}"; do
             N=$(cast nonce --rpc-url "$EVM_URL" "${ADDRS[$i]}" 2>/dev/null || echo "${NONCES[$i]}")
-            NONCES[$i]="$N"
+            if (( N > NONCES[$i] )); then
+                NONCES[$i]="$N"
+            fi
         done
     fi
 

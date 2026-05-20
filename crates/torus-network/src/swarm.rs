@@ -1,4 +1,4 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, RwLock};
 
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::behaviour::{TorusBehaviour, TorusBehaviourEvent, CONSENSUS_TOPIC, TX_TOPIC};
-use crate::codec::{DirectRequest, DirectResponse};
+use crate::codec::{BlockDataNetRequest, BlockDataNetResponse, DirectRequest, DirectResponse};
 use crate::config::NetworkConfig;
 use crate::peer::PeerMap;
 use crate::peer_scoring::{
@@ -38,6 +38,17 @@ pub enum NetworkCommand {
     DialPeer {
         peer_id: PeerId,
     },
+    /// Request block data via the dedicated `/torus/block-data/1.0` protocol.
+    BlockDataRequest {
+        target: VerifyingKey,
+        block_hash: [u8; 32],
+        view: u64,
+    },
+    /// Store a block so the network thread can serve it to requesters.
+    StoreBlock {
+        hash: [u8; 32],
+        block_bytes: Vec<u8>,
+    },
 }
 
 pub struct SharedState {
@@ -45,6 +56,12 @@ pub struct SharedState {
     pub peer_map: RwLock<PeerMap>,
     pub validators: RwLock<HashSet<[u8; 32]>>,
     pub metrics: Option<Arc<torus_telemetry::Metrics>>,
+    /// Block store for serving block-data requests on the network thread.
+    /// Maps block_hash → borsh-encoded Block bytes.
+    pub block_store: RwLock<HashMap<[u8; 32], Vec<u8>>>,
+    /// Inbound block-data responses (separate from consensus inbound queue).
+    /// Entries: (sender_vk, view, borsh-encoded Block bytes).
+    pub block_data_inbound: Mutex<VecDeque<(VerifyingKey, u64, Vec<u8>)>>,
 }
 
 enum SwarmAction {
@@ -337,6 +354,83 @@ fn handle_event(
                 }
             }
         }
+        // Block-data fetch protocol: inbound request — serve from network-thread block store.
+        SwarmEvent::Behaviour(TorusBehaviourEvent::BlockData(request_response::Event::Message {
+            message: request_response::Message::Request { request, channel, .. },
+            peer,
+            ..
+        })) => {
+            if peer_scoring.is_banned(&peer) {
+                let _ = swarm.behaviour_mut().block_data.send_response(
+                    channel,
+                    BlockDataNetResponse { view: request.view, payload: Vec::new() },
+                );
+                return;
+            }
+            let store = shared.block_store.read().unwrap();
+            let store_len = store.len();
+            let payload = store.get(&request.block_hash).cloned().unwrap_or_default();
+            drop(store);
+            if payload.is_empty() {
+                warn!(
+                    %peer,
+                    view = request.view,
+                    hash = ?request.block_hash,
+                    store_size = store_len,
+                    "block-data request: block NOT FOUND in store"
+                );
+            } else {
+                info!(
+                    %peer,
+                    view = request.view,
+                    payload_bytes = payload.len(),
+                    "block-data request: serving block"
+                );
+            }
+            if let Err(resp) = swarm.behaviour_mut().block_data.send_response(
+                channel,
+                BlockDataNetResponse { view: request.view, payload },
+            ) {
+                warn!(view = resp.view, "block-data send_response FAILED (channel dead)");
+            }
+        }
+        // Block-data fetch protocol: inbound response — forward to algorithm thread.
+        SwarmEvent::Behaviour(TorusBehaviourEvent::BlockData(request_response::Event::Message {
+            message: request_response::Message::Response { response, .. },
+            peer,
+            ..
+        })) => {
+            if response.payload.is_empty() {
+                warn!(%peer, "block-data response: empty payload (block not found on server)");
+                return;
+            }
+            let sender_vk = shared.peer_map.read().unwrap().get_vk(&peer).copied();
+            if let Some(vk) = sender_vk {
+                info!(
+                    %peer,
+                    view = response.view,
+                    payload_bytes = response.payload.len(),
+                    "block-data response: queuing body for algorithm thread"
+                );
+                let mut queue = shared.block_data_inbound.lock().unwrap();
+                if queue.len() < MAX_INBOUND_QUEUE {
+                    queue.push_back((vk, response.view, response.payload));
+                }
+            } else {
+                warn!(%peer, "block-data response from peer not in peer_map — dropping");
+            }
+        }
+        SwarmEvent::Behaviour(TorusBehaviourEvent::BlockData(
+            request_response::Event::OutboundFailure { peer, error, .. }
+        )) => {
+            warn!(%peer, ?error, "block-data OUTBOUND FAILURE");
+        }
+        SwarmEvent::Behaviour(TorusBehaviourEvent::BlockData(
+            request_response::Event::InboundFailure { peer, error, .. }
+        )) => {
+            warn!(%peer, ?error, "block-data INBOUND FAILURE");
+        }
+        SwarmEvent::Behaviour(TorusBehaviourEvent::BlockData(_)) => {}
         // FIX 6 (CONS-FIND-25-32): Sync protocol events.
         // TODO: When sync serving is implemented, handle sync requests in a
         // spawned task (tokio::spawn) to avoid blocking the consensus event loop.
@@ -466,6 +560,18 @@ fn handle_command(
                 }
             }
         }
+        NetworkCommand::BlockDataRequest { target, block_hash, view } => {
+            let peer_id = shared.peer_map.read().unwrap().get_peer_id(&target).copied();
+            if let Some(pid) = peer_id {
+                let req = BlockDataNetRequest { block_hash, view };
+                swarm.behaviour_mut().block_data.send_request(&pid, req);
+            } else {
+                warn!("BlockDataRequest target not in peer map — dropping");
+            }
+        }
+        NetworkCommand::StoreBlock { hash, block_bytes } => {
+            shared.block_store.write().unwrap().insert(hash, block_bytes);
+        }
     }
 }
 
@@ -594,6 +700,8 @@ mod tests {
             peer_map: RwLock::new(PeerMap::default()),
             validators: RwLock::new(HashSet::new()),
             metrics: None,
+            block_store: RwLock::new(HashMap::new()),
+            block_data_inbound: Mutex::new(VecDeque::new()),
         }
     }
 

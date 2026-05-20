@@ -439,11 +439,17 @@ impl<N: Network> Pacemaker<N> {
         };
 
         if is_valid {
-            // 3. If the received certificate is a TimeoutCertificate and has a higher view number than `highest_tc`,
-            //    update the `highest_tc`.
-            //
-            // Note: we do not update `highest_pc` here, since checking the safety of PCs and updating `highest_pc`
-            //       is a responsibility of the HotStuff sub-protocol.
+            // 3a. If the certificate is a PC, advance highest_pc and update_decided
+            //     without commit processing. In the header pipeline, HotStuff
+            //     hasn't called block_tree.update() yet (body in flight), so
+            //     the pacemaker keeps highest_pc in sync to prevent proposer
+            //     disagreement on validator set state.
+            if let ProgressCertificate::PhaseCertificate(pc) = &progress_certificate {
+                let _ = block_tree.advance_highest_pc_from_remote(pc);
+            }
+
+            // 3b. If the received certificate is a TimeoutCertificate and has a higher view number than `highest_tc`,
+            //     update the `highest_tc`.
             if let ProgressCertificate::TimeoutCertificate(tc) = &progress_certificate {
                 if block_tree.highest_tc()?.is_none()
                     || tc.view > block_tree.highest_tc()?.unwrap().view

@@ -1,9 +1,13 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, RwLock};
 
+use borsh::BorshSerialize;
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use hotstuff_rs::hotstuff::messages::{BlockDataRequest, BlockDataResponse, HotStuffMessage};
 use hotstuff_rs::networking::messages::Message;
 use hotstuff_rs::networking::network::Network;
+use hotstuff_rs::types::block::Block;
+use hotstuff_rs::types::data_types::{CryptoHash, ViewNumber};
 use zeroize::Zeroize;
 use hotstuff_rs::types::update_sets::ValidatorSetUpdates;
 use hotstuff_rs::types::validator_set::ValidatorSet;
@@ -77,6 +81,8 @@ impl LibP2PNetwork {
             peer_map: RwLock::new(PeerMap::default()),
             validators: RwLock::new(HashSet::new()),
             metrics,
+            block_store: RwLock::new(HashMap::new()),
+            block_data_inbound: Mutex::new(VecDeque::new()),
         });
 
         let (command_tx, command_rx) = mpsc::unbounded_channel();
@@ -188,5 +194,37 @@ impl Network for LibP2PNetwork {
 
     fn recv(&mut self) -> Option<(VerifyingKey, Message)> {
         self.shared.inbound.lock().unwrap().pop_front()
+    }
+
+    fn request_block_data(&mut self, peer: VerifyingKey, request: BlockDataRequest) {
+        // Route through the proven HotStuffMessage direct-message path instead of
+        // the dedicated /torus/block-data/1.0 protocol which silently fails in devnet.
+        let msg: Message = HotStuffMessage::BlockDataRequest(request).into();
+        self.send(peer, msg);
+    }
+
+    fn recv_block_data(&mut self) -> Option<(VerifyingKey, BlockDataResponse)> {
+        let (vk, view, block_bytes) = self.shared.block_data_inbound.lock().unwrap().pop_front()?;
+        match borsh::BorshDeserialize::try_from_slice(&block_bytes) {
+            Ok(block) => Some((vk, BlockDataResponse { view: ViewNumber::new(view), block })),
+            Err(e) => {
+                tracing::warn!(
+                    view,
+                    bytes_len = block_bytes.len(),
+                    %e,
+                    "block-data recv: borsh deserialization FAILED — dropping response"
+                );
+                None
+            }
+        }
+    }
+
+    fn store_block_for_serving(&mut self, hash: CryptoHash, block: Block) {
+        if let Ok(block_bytes) = block.try_to_vec() {
+            let _ = self.command_tx.send(NetworkCommand::StoreBlock {
+                hash: hash.bytes(),
+                block_bytes,
+            });
+        }
     }
 }

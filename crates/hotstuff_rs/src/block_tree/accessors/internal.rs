@@ -399,6 +399,25 @@ impl<K: KVStore> BlockTreeSingleton<K> {
         Ok(())
     }
 
+    /// Update highest_pc and validator-set-decided flag from a received PC
+    /// without triggering commit processing. Used by the pacemaker when it
+    /// receives an AdvanceView containing a PC whose block may not yet be
+    /// in the tree (header pipeline: body still in flight).
+    pub fn advance_highest_pc_from_remote(
+        &mut self,
+        pc: &PhaseCertificate,
+    ) -> Result<(), BlockTreeError> {
+        let mut wb = BlockTreeWriteBatch::new();
+        if pc.view > self.highest_pc()?.view {
+            wb.set_highest_pc(pc)?;
+        }
+        if pc.phase.is_decide() {
+            wb.set_validator_set_update_decided(true)?;
+        }
+        self.write(wb);
+        Ok(())
+    }
+
     /// Set the highest view entered to be `view`.
     ///
     /// ## Preconditions
@@ -487,7 +506,12 @@ impl<K: KVStore> BlockTreeSingleton<K> {
         // newest.
         let uncommitted_blocks_iter = blocks_iter.take_while(|b| {
             min_height.is_none()
-                || min_height.is_some_and(|h| self.block_height(b).unwrap().unwrap() > h)
+                || min_height.is_some_and(|h| {
+                    self.block_height(b)
+                        .ok()
+                        .flatten()
+                        .map_or(false, |bh| bh > h)
+                })
         });
         let uncommitted_blocks = uncommitted_blocks_iter.collect::<Vec<CryptoHash>>();
         let uncommitted_blocks_ordered_iter = uncommitted_blocks.iter().rev();

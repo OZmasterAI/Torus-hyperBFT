@@ -9,6 +9,8 @@ use std::mem;
 
 use borsh::{BorshDeserialize, BorshSerialize};
 
+use std::collections::HashMap;
+
 use crate::{
     networking::{messages::ProgressMessage, receiving::Cacheable},
     types::{
@@ -51,6 +53,16 @@ pub enum HotStuffMessage {
     /// A single No-Endorsement attestation from a validator who did not vote
     /// for the high_tip block.
     NE(NEMessage),
+
+    // Hybrid pipelining: header-first propagation
+    /// Lightweight proposal header (gossip). Validators vote on this before body fetch.
+    ProposalHeader(ProposalHeader),
+
+    /// Request for the full block body (point-to-point to proposer).
+    BlockDataRequest(BlockDataRequest),
+
+    /// Response with full block body (point-to-point back to requester).
+    BlockDataResponse(BlockDataResponse),
 }
 
 impl HotStuffMessage {
@@ -65,6 +77,9 @@ impl HotStuffMessage {
             HotStuffMessage::ProposalResponse(ProposalResponse { chain_id, .. }) => *chain_id,
             HotStuffMessage::NERequest(NERequest { chain_id, .. }) => *chain_id,
             HotStuffMessage::NE(NEMessage { chain_id, .. }) => *chain_id,
+            HotStuffMessage::ProposalHeader(h) => h.chain_id,
+            HotStuffMessage::BlockDataRequest(r) => r.chain_id,
+            HotStuffMessage::BlockDataResponse(r) => r.block.justify.chain_id,
         }
     }
 
@@ -79,7 +94,17 @@ impl HotStuffMessage {
             HotStuffMessage::ProposalResponse(ProposalResponse { view, .. }) => *view,
             HotStuffMessage::NERequest(NERequest { view, .. }) => *view,
             HotStuffMessage::NE(NEMessage { view, .. }) => *view,
+            HotStuffMessage::ProposalHeader(h) => h.view,
+            HotStuffMessage::BlockDataRequest(r) => r.view,
+            HotStuffMessage::BlockDataResponse(r) => r.view,
         }
+    }
+
+    /// Returns true for hybrid pipelining messages that bypass view filtering.
+    /// ProposalHeaders must bypass because bodies may still be in-flight when
+    /// the view advances (e.g. rapid timeouts at startup).
+    pub fn is_block_data_msg(&self) -> bool {
+        matches!(self, HotStuffMessage::BlockDataRequest(_) | HotStuffMessage::BlockDataResponse(_) | HotStuffMessage::ProposalHeader(_))
     }
 
     /// Returns the number of bytes required to store a given instance of the [`HotStuffMessage`] enum.
@@ -93,6 +118,9 @@ impl HotStuffMessage {
             HotStuffMessage::ProposalResponse(_) => mem::size_of::<ProposalResponse>() as u64,
             HotStuffMessage::NERequest(_) => mem::size_of::<NERequest>() as u64,
             HotStuffMessage::NE(_) => mem::size_of::<NEMessage>() as u64,
+            HotStuffMessage::ProposalHeader(_) => mem::size_of::<ProposalHeader>() as u64,
+            HotStuffMessage::BlockDataRequest(_) => mem::size_of::<BlockDataRequest>() as u64,
+            HotStuffMessage::BlockDataResponse(_) => mem::size_of::<BlockDataResponse>() as u64,
         }
     }
 }
@@ -366,5 +394,217 @@ impl From<NERequest> for HotStuffMessage {
 impl From<NEMessage> for HotStuffMessage {
     fn from(ne: NEMessage) -> Self {
         HotStuffMessage::NE(ne)
+    }
+}
+
+// ============================================================================
+// Hybrid pipelining: header-first propagation types
+// ============================================================================
+
+/// Lightweight proposal header broadcast via gossip (<1KB without body data).
+/// Validators vote on this before fetching the full block body.
+#[derive(Clone, BorshSerialize, BorshDeserialize, PartialEq, Eq)]
+pub struct ProposalHeader {
+    pub chain_id: ChainID,
+    pub view: ViewNumber,
+    pub block_hash: CryptoHash,
+    pub height: BlockHeight,
+    pub data_hash: CryptoHash,
+    pub justify: PhaseCertificate,
+    pub tc: Option<TimeoutCertificate>,
+    pub nec: Option<NoEndorsementCertificate>,
+    pub has_validator_set_updates: bool,
+}
+
+impl ProposalHeader {
+    pub fn from_proposal(p: &Proposal, has_validator_set_updates: bool) -> Self {
+        ProposalHeader {
+            chain_id: p.chain_id,
+            view: p.view,
+            block_hash: p.block.hash,
+            height: p.block.height,
+            data_hash: p.block.data_hash,
+            justify: p.block.justify.clone(),
+            tc: p.tc.clone(),
+            nec: p.nec.clone(),
+            has_validator_set_updates,
+        }
+    }
+}
+
+impl From<ProposalHeader> for HotStuffMessage {
+    fn from(header: ProposalHeader) -> Self {
+        HotStuffMessage::ProposalHeader(header)
+    }
+}
+
+/// Request for the full block body (sent point-to-point to the proposer).
+#[derive(Clone, BorshSerialize, BorshDeserialize, PartialEq, Eq)]
+pub struct BlockDataRequest {
+    pub chain_id: ChainID,
+    pub view: ViewNumber,
+    pub block_hash: CryptoHash,
+}
+
+impl From<BlockDataRequest> for HotStuffMessage {
+    fn from(req: BlockDataRequest) -> Self {
+        HotStuffMessage::BlockDataRequest(req)
+    }
+}
+
+/// Response containing the full block (sent point-to-point back to requester).
+#[derive(Clone, BorshSerialize, BorshDeserialize)]
+pub struct BlockDataResponse {
+    pub view: ViewNumber,
+    pub block: Block,
+}
+
+impl From<BlockDataResponse> for HotStuffMessage {
+    fn from(resp: BlockDataResponse) -> Self {
+        HotStuffMessage::BlockDataResponse(resp)
+    }
+}
+
+/// Tracks pending block body fetches for the hybrid propagation protocol.
+/// Maps block_hash → (header, set of peers we've requested from).
+pub type PendingHeaders = HashMap<CryptoHash, ProposalHeader>;
+pub type PendingBodies = HashMap<CryptoHash, Block>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use borsh::BorshDeserialize;
+    use crate::hotstuff::types::PhaseCertificate;
+    use crate::types::data_types::*;
+
+    fn genesis_pc() -> PhaseCertificate {
+        PhaseCertificate::genesis_pc()
+    }
+
+    #[test]
+    fn proposal_header_roundtrip_borsh() {
+        let header = ProposalHeader {
+            chain_id: ChainID::new(1),
+            view: ViewNumber::new(5),
+            block_hash: CryptoHash::new([0xAA; 32]),
+            height: BlockHeight::new(3),
+            data_hash: CryptoHash::new([0xBB; 32]),
+            justify: genesis_pc(),
+            tc: None,
+            nec: None,
+            has_validator_set_updates: false,
+        };
+        let bytes = header.try_to_vec().unwrap();
+        assert!(bytes.len() < 1024, "header serialized to {} bytes, must be <1KB", bytes.len());
+        let decoded = ProposalHeader::try_from_slice(&bytes).unwrap();
+        assert!(header == decoded, "roundtrip mismatch");
+    }
+
+    #[test]
+    fn proposal_header_from_proposal() {
+        let pc = genesis_pc();
+        let block = Block::new(
+            BlockHeight::new(1),
+            pc.clone(),
+            CryptoHash::new([0xCC; 32]),
+            Data::new(vec![Datum::new(vec![1, 2, 3])]),
+        );
+        let proposal = Proposal {
+            chain_id: ChainID::new(1),
+            view: ViewNumber::new(5),
+            block: block.clone(),
+            tc: None,
+            nec: None,
+        };
+        let header = ProposalHeader::from_proposal(&proposal, false);
+        assert!(header.chain_id == proposal.chain_id);
+        assert_eq!(header.view, proposal.view);
+        assert_eq!(header.block_hash, block.hash);
+        assert_eq!(header.height, block.height);
+        assert_eq!(header.data_hash, block.data_hash);
+        assert!(header.justify == block.justify);
+        assert!(!header.has_validator_set_updates);
+    }
+
+    #[test]
+    fn block_data_request_roundtrip_borsh() {
+        let req = BlockDataRequest {
+            chain_id: ChainID::new(1),
+            view: ViewNumber::new(1),
+            block_hash: CryptoHash::new([0xDD; 32]),
+        };
+        let bytes = req.try_to_vec().unwrap();
+        assert!(bytes.len() < 100, "request serialized to {} bytes", bytes.len());
+        let decoded = BlockDataRequest::try_from_slice(&bytes).unwrap();
+        assert!(req == decoded, "roundtrip mismatch");
+    }
+
+    #[test]
+    fn block_data_response_roundtrip_borsh() {
+        let block = Block::new(
+            BlockHeight::new(1),
+            genesis_pc(),
+            CryptoHash::new([0xCC; 32]),
+            Data::new(vec![Datum::new(vec![0u8; 4000])]),
+        );
+        let resp = BlockDataResponse { view: ViewNumber::new(1), block: block.clone() };
+        let bytes = resp.try_to_vec().unwrap();
+        assert!(bytes.len() < 4 * 1024 * 1024, "response must fit in 4MB direct msg");
+        let decoded = BlockDataResponse::try_from_slice(&bytes).unwrap();
+        assert_eq!(decoded.block.hash, block.hash);
+    }
+
+    #[test]
+    fn proposal_header_much_smaller_than_full_proposal() {
+        let big_data = Data::new(vec![Datum::new(vec![0u8; 100_000])]);
+        let block = Block::new(
+            BlockHeight::new(1),
+            genesis_pc(),
+            CryptoHash::new([0xCC; 32]),
+            big_data,
+        );
+        let proposal = Proposal {
+            chain_id: ChainID::new(1),
+            view: ViewNumber::new(5),
+            block,
+            tc: None,
+            nec: None,
+        };
+        let proposal_bytes = proposal.try_to_vec().unwrap();
+        let header = ProposalHeader::from_proposal(&proposal, false);
+        let header_bytes = header.try_to_vec().unwrap();
+        assert!(
+            header_bytes.len() * 10 < proposal_bytes.len(),
+            "header ({} bytes) should be at least 10x smaller than proposal ({} bytes)",
+            header_bytes.len(),
+            proposal_bytes.len()
+        );
+    }
+
+    #[test]
+    fn hotstuff_message_variants_for_hybrid_pipelining() {
+        let header = ProposalHeader {
+            chain_id: ChainID::new(1),
+            view: ViewNumber::new(5),
+            block_hash: CryptoHash::new([0xAA; 32]),
+            height: BlockHeight::new(3),
+            data_hash: CryptoHash::new([0xBB; 32]),
+            justify: genesis_pc(),
+            tc: None,
+            nec: None,
+            has_validator_set_updates: false,
+        };
+        let msg: HotStuffMessage = header.into();
+        assert!(msg.chain_id() == ChainID::new(1));
+        assert_eq!(msg.view(), ViewNumber::new(5));
+
+        let req = BlockDataRequest {
+            chain_id: ChainID::new(2),
+            view: ViewNumber::new(3),
+            block_hash: CryptoHash::new([0xDD; 32]),
+        };
+        let msg: HotStuffMessage = req.into();
+        assert!(msg.chain_id() == ChainID::new(2));
+        assert_eq!(msg.view(), ViewNumber::new(3));
     }
 }

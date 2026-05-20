@@ -432,8 +432,10 @@ pub(crate) fn pc_to_lock<K: KVStore>(
     let pc_to_lock = match justify.phase {
         // If `justify.phase` is `Generic`, lock on `justify.block.justify`.
         Phase::Generic => {
-            let parent_justify = block_tree.block_justify(&justify.block)?;
-            Some(parent_justify.clone())
+            match block_tree.block_justify(&justify.block) {
+                Ok(parent_justify) => Some(parent_justify.clone()),
+                Err(_) => return Ok(None),
+            }
         }
 
         // If `justify.phase` is `Prepare`, don't lock.
@@ -516,22 +518,31 @@ pub(crate) fn block_to_commit<K: KVStore>(
         // that branch. The consecutive views requirement ensures no conflicting
         // lock could form between the two QCs.
         Phase::Generic => {
-            let parent_justify = block_tree.block_justify(&justify.block)?;
+            let parent_justify = match block_tree.block_justify(&justify.block) {
+                Ok(pj) => pj,
+                Err(_) => {
+                    log::debug!("block_to_commit: justify.block not in tree yet (pending body), deferring");
+                    return Ok(None);
+                }
+            };
             if parent_justify.is_genesis_pc() {
                 return Ok(None);
             };
 
             let commit_rule_satisfied = justify.view == parent_justify.view + 1;
-            log::info!("block_to_commit: justify.view={}, parent_justify.view={}, consecutive={}", justify.view.int(), parent_justify.view.int(), commit_rule_satisfied);
+
+            let grandparent_height = match block_tree.block_height(&parent_justify.block)? {
+                Some(h) => h,
+                None => {
+                    if commit_rule_satisfied {
+                        log::debug!("block_to_commit: grandparent not in tree yet (pending body), deferring commit");
+                    }
+                    return Ok(None);
+                }
+            };
 
             let not_committed_yet = {
-                let grandparent_height = block_tree
-                    .block_height(&parent_justify.block)?
-                    .ok_or(BlockTreeError::BlockExpectedButNotFound {
-                        block: parent_justify.block.clone(),
-                    })?;
                 let highest_committed_block_height = block_tree.highest_committed_block_height()?;
-
                 highest_committed_block_height.is_none()
                     || grandparent_height > highest_committed_block_height.unwrap()
             };

@@ -5,7 +5,7 @@ use alloy_primitives::{Address, B256};
 use revm::database::BundleState;
 
 use torus_evm::{BlockEnvCfg, EvmExecutor};
-use torus_state::StateDb;
+use torus_state::{StateDb, StateOverlay};
 use torus_types::{NativeAction, Receipt, TorusBlock};
 
 use crate::decode::decode_all_txs;
@@ -182,6 +182,95 @@ impl BlockValidator {
         self.validate_block(block, state_db, evm_executor)
     }
 
+    /// Validate a block against a [`StateOverlay`] (deferred-commit mode).
+    ///
+    /// EVM execution reads from the overlay (pending parent bundles layered
+    /// on state_db). State root is verified using `state_db + merged_bundle`
+    /// where `merged_bundle` combines all pending ancestor changes with this
+    /// block's execution result.
+    pub fn validate_block_with_overlay(
+        &self,
+        block: &TorusBlock,
+        overlay: &StateOverlay,
+        state_db: &StateDb,
+        merged_parent_bundle: &BundleState,
+        evm_executor: &EvmExecutor,
+    ) -> Result<ValidatedBlock, BridgeError> {
+        let decoded_txs = decode_all_txs(&block.evm_transactions)?;
+        let tx_envs: Vec<_> = decoded_txs.iter().map(|d| d.tx_env.clone()).collect();
+
+        let block_cfg = BlockEnvCfg {
+            number: block.header.height,
+            timestamp: block.header.timestamp,
+            beneficiary: block.header.proposer,
+            gas_limit: block.header.evm_gas_limit,
+            base_fee: block.header.base_fee_per_gas,
+        };
+
+        let mut exec_result =
+            evm_executor.execute_block_with_overlay(overlay, &block_cfg, tx_envs, false)?;
+
+        for (i, receipt) in exec_result.receipts.iter_mut().enumerate() {
+            if let Some(dtx) = decoded_txs.get(i) {
+                receipt.tx_hash = dtx.tx_hash;
+            }
+            receipt.block_number = block.header.height;
+        }
+
+        if exec_result.gas_used != block.header.evm_gas_used {
+            return Err(BridgeError::InvalidBlock(format!(
+                "gas used mismatch: header={}, executed={}",
+                block.header.evm_gas_used, exec_result.gas_used
+            )));
+        }
+
+        let computed_fee_revenue = crate::proposer::compute_fee_revenue(&exec_result.receipts);
+        if computed_fee_revenue != block.header.evm_fee_revenue {
+            return Err(BridgeError::InvalidBlock(format!(
+                "fee revenue mismatch: header={}, computed={}",
+                block.header.evm_fee_revenue, computed_fee_revenue
+            )));
+        }
+
+        let computed_receipts_root = crate::proposer::compute_receipts_root(&exec_result.receipts)
+            .map_err(|e| BridgeError::Serialization(format!("receipts: {e}")))?;
+        if computed_receipts_root != block.header.receipts_root {
+            return Err(BridgeError::InvalidBlock(format!(
+                "receipts_root mismatch: header={}, computed={}",
+                block.header.receipts_root, computed_receipts_root
+            )));
+        }
+
+        if exec_result.logs_bloom != block.header.logs_bloom {
+            return Err(BridgeError::InvalidBlock(format!(
+                "logs_bloom mismatch: header={}, computed={}",
+                block.header.logs_bloom, exec_result.logs_bloom
+            )));
+        }
+
+        // State root: merge pending parent changes with this block's bundle
+        // and verify against state_db (the last committed base).
+        let mut verification_bundle = merged_parent_bundle.clone();
+        merge_bundle_into(&mut verification_bundle, &exec_result.bundle);
+        let computed_root =
+            compute_post_bundle_state_root(state_db, &verification_bundle)?;
+
+        if computed_root != block.header.state_root {
+            return Err(BridgeError::StateRootMismatch {
+                expected: block.header.state_root,
+                computed: computed_root,
+            });
+        }
+
+        Ok(ValidatedBlock {
+            receipts: exec_result.receipts,
+            bundle: exec_result.bundle,
+            state_root: computed_root,
+            native_sender_actions: vec![],
+            native_consumed_nonces: vec![],
+        })
+    }
+
     /// Validate a block with the full native + EVM execution pipeline.
     ///
     /// FIX CONS-PF-02: Recovers senders from the EIP-712 signatures embedded
@@ -309,5 +398,23 @@ impl BlockValidator {
             native_sender_actions: sender_actions,
             native_consumed_nonces: consumed_nonces,
         })
+    }
+}
+
+/// Merge `src` bundle changes into `dst`. For overlapping accounts/slots,
+/// `src` (the later block) wins.
+pub fn merge_bundle_into(dst: &mut BundleState, src: &BundleState) {
+    for (addr, src_acct) in &src.state {
+        let entry = dst.state.entry(*addr).or_insert_with(|| src_acct.clone());
+        if std::ptr::eq(entry, src_acct) {
+            continue;
+        }
+        entry.info = src_acct.info.clone();
+        for (slot, slot_val) in &src_acct.storage {
+            entry.storage.insert(*slot, slot_val.clone());
+        }
+    }
+    for (hash, bytecode) in &src.contracts {
+        dst.contracts.insert(*hash, bytecode.clone());
     }
 }

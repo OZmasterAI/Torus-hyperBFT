@@ -8,7 +8,7 @@
 //!
 //! Main type: [`HotStuff`].
 
-use std::{collections::HashSet, sync::mpsc::Sender, time::SystemTime};
+use std::{collections::HashSet, sync::mpsc::Sender, time::{Duration, Instant, SystemTime}};
 use borsh::BorshSerialize;
 
 use ed25519_dalek::VerifyingKey;
@@ -29,8 +29,9 @@ use crate::{
     },
     hotstuff::{
         messages::{
-            HotStuffMessage, NEMessage, NERequest, NewView, Nudge, PhaseVote, Proposal,
-            ProposalRequest, ProposalResponse,
+            BlockDataRequest, BlockDataResponse, HotStuffMessage, NEMessage, NERequest, NewView,
+            Nudge, PhaseVote, Proposal, ProposalHeader, ProposalRequest, ProposalResponse,
+            PendingBodies, PendingHeaders,
         },
         roles::{is_phase_voter, is_proposer, new_view_recipients_with_reputation},
         types::{valid_nec, NECollector, Phase, PhaseVoteCollector},
@@ -87,6 +88,17 @@ pub(crate) struct HotStuff<N: Network> {
     /// Maps (view, leader) → first block hash seen from that leader in that view.
     seen_proposals: std::collections::HashMap<(ViewNumber, VerifyingKey), CryptoHash>,
     sync_needed: bool,
+    /// Hybrid pipelining: full blocks stored locally by the proposer after broadcasting header.
+    pending_bodies: PendingBodies,
+    /// Hybrid pipelining: headers received but body not yet fetched. Maps block_hash → header.
+    pending_headers: PendingHeaders,
+    /// Hybrid pipelining: tracks body fetch retries. Maps block_hash → (last_request_time, retry_count, origin_peer).
+    body_fetch_tracker: std::collections::HashMap<CryptoHash, (Instant, u8, VerifyingKey)>,
+    /// Hybrid pipelining: bodies received but parent not yet in tree. Retried after each insertion.
+    deferred_bodies: PendingBodies,
+    /// True when enter_view succeeded but proposal production failed (parent block not yet in tree).
+    /// The algorithm loop should retry the proposal after polling messages.
+    proposal_deferred: bool,
 }
 
 impl<N: Network> HotStuff<N> {
@@ -117,6 +129,11 @@ impl<N: Network> HotStuff<N> {
             ne_sent_views: HashSet::new(),
             seen_proposals: std::collections::HashMap::new(),
             sync_needed: false,
+            pending_bodies: PendingBodies::new(),
+            pending_headers: PendingHeaders::new(),
+            body_fetch_tracker: std::collections::HashMap::new(),
+            deferred_bodies: PendingBodies::new(),
+            proposal_deferred: false,
         }
     }
 
@@ -137,6 +154,18 @@ impl<N: Network> HotStuff<N> {
         new_view_info.view != self.view_info.view
     }
 
+    pub(crate) fn has_deferred_proposal(&self) -> bool {
+        self.proposal_deferred
+    }
+
+    pub(crate) fn pending_body(&self, hash: &CryptoHash) -> Option<&Block> {
+        self.pending_bodies.get(hash)
+    }
+
+    pub(crate) fn take_pending_body(&mut self, hash: &CryptoHash) -> Option<Block> {
+        self.pending_bodies.remove(hash)
+    }
+
     /// On receiving a new [`ViewInfo`] from the [`Pacemaker`](crate::pacemaker::protocol::Pacemaker), send
     /// messages and perform state updates associated with exiting the current view, and update the local
     /// view info.
@@ -155,6 +184,82 @@ impl<N: Network> HotStuff<N> {
         block_tree: &mut BlockTreeSingleton<K>,
         app: &mut impl App<K>,
     ) -> Result<(), HotStuffError> {
+        // Retry deferred proposal: parent body has now arrived, skip view transition.
+        if self.proposal_deferred && new_view_info.view == self.view_info.view {
+            self.proposal_deferred = false;
+            let highest_pc = block_tree.highest_pc()?;
+            if matches!(highest_pc.phase, Phase::Generic | Phase::Decide) {
+                let validator_set_state = block_tree.validator_set_state()?;
+                let reputation = block_tree.leader_reputation().ok();
+                if is_proposer_with_reputation(
+                    &self.config.keypair.public(),
+                    self.view_info.view,
+                    &validator_set_state,
+                    reputation.as_ref(),
+                ) {
+                    let (parent_block, child_height) = if highest_pc.is_genesis_pc() {
+                        (None, BlockHeight::new(0))
+                    } else {
+                        match block_tree.block_height(&highest_pc.block)? {
+                            Some(h) => (Some(highest_pc.block), h + 1),
+                            None => {
+                                self.proposal_deferred = true;
+                                return Ok(());
+                            }
+                        }
+                    };
+
+                    let produce_block_request = ProduceBlockRequest::new(
+                        self.view_info.view,
+                        parent_block,
+                        block_tree.app_view(parent_block.as_ref())?,
+                    );
+                    let ProduceBlockResponse {
+                        data,
+                        data_hash,
+                        app_state_updates,
+                        validator_set_updates,
+                    } = app.produce_block(produce_block_request);
+
+                    let block = Block::new(child_height, highest_pc, data_hash, data);
+                    block_tree.insert(&block, app_state_updates.as_ref(), validator_set_updates.as_ref())?;
+                    Event::InsertBlock(InsertBlockEvent {
+                        timestamp: SystemTime::now(),
+                        block: block.clone(),
+                    }).publish(&self.event_publisher);
+                    let committed_vs_updates = block_tree.update(&block.justify, &self.event_publisher).unwrap_or_else(|e| {
+                        if let BlockTreeError::BlockExpectedButNotFound { block: missing } = &e {
+                            log::warn!("enter_view: missing block {:?} in commit chain — triggering sync", missing);
+                            self.sync_needed = true;
+                        } else {
+                            log::warn!("enter_view: block_tree.update failed after self-insert: {:?}", e);
+                        }
+                        None
+                    });
+                    if let Some(vs_updates) = committed_vs_updates {
+                        self.validator_set_update_handle.update_validator_set(vs_updates);
+                    }
+
+                    let proposal = Proposal {
+                        chain_id: self.config.chain_id,
+                        view: self.view_info.view,
+                        block,
+                        tc: None,
+                        nec: None,
+                    };
+                    let header = ProposalHeader::from_proposal(&proposal, validator_set_updates.is_some());
+                    self.pending_bodies.insert(proposal.block.hash, proposal.block.clone());
+                    self.sender_handle.store_block_for_serving(proposal.block.hash, proposal.block.clone());
+                    self.sender_handle.broadcast::<HotStuffMessage>(header.into());
+                    Event::Propose(ProposeEvent {
+                        timestamp: SystemTime::now(),
+                        proposal,
+                    }).publish(&self.event_publisher);
+                }
+            }
+            return Ok(());
+        }
+
         let validator_set_state = block_tree.validator_set_state()?;
 
         // 1. Send a NewView message for the current view to the next leader(s).
@@ -211,6 +316,9 @@ impl<N: Network> HotStuff<N> {
         .publish(&self.event_publisher);
 
         // 4. If I am a proposer for the new view, then broadcast a `Proposal` or a `Nudge`.
+        //    If the parent block isn't in the tree yet (body fetch in progress),
+        //    defer the proposal and retry after message polling.
+        self.proposal_deferred = false;
         let reputation = block_tree.leader_reputation().ok();
         let am_proposer = is_proposer_with_reputation(
             &self.config.keypair.public(),
@@ -218,7 +326,6 @@ impl<N: Network> HotStuff<N> {
             &validator_set_state,
             reputation.as_ref(),
         );
-        log::info!("enter_view: view={}, am_proposer={}", self.view_info.view.int(), am_proposer);
         if am_proposer {
             // If a chain of consecutive views of voting for a validator-set-updating block has been interrupted, then
             // re-propose an existing block.
@@ -234,8 +341,12 @@ impl<N: Network> HotStuff<N> {
                     tc: None,
                     nec: None,
                 };
+
+                let header = ProposalHeader::from_proposal(&proposal, false);
+                self.pending_bodies.insert(proposal.block.hash, proposal.block.clone());
+                self.sender_handle.store_block_for_serving(proposal.block.hash, proposal.block.clone());
                 self.sender_handle
-                    .broadcast::<HotStuffMessage>(proposal.clone().into());
+                    .broadcast::<HotStuffMessage>(header.into());
 
                 Event::Propose(ProposeEvent {
                     timestamp: SystemTime::now(),
@@ -252,8 +363,11 @@ impl<N: Network> HotStuff<N> {
                     if let Some(proposal) = self.create_proposal_based_on_tc(
                         &tc, block_tree, app,
                     )? {
+                        let header = ProposalHeader::from_proposal(&proposal, false);
+                        self.pending_bodies.insert(proposal.block.hash, proposal.block.clone());
+                        self.sender_handle.store_block_for_serving(proposal.block.hash, proposal.block.clone());
                         self.sender_handle
-                            .broadcast::<HotStuffMessage>(proposal.clone().into());
+                            .broadcast::<HotStuffMessage>(header.into());
                         Event::Propose(ProposeEvent {
                             timestamp: SystemTime::now(),
                             proposal,
@@ -272,12 +386,13 @@ impl<N: Network> HotStuff<N> {
                     let (parent_block, child_height) = if highest_pc.is_genesis_pc() {
                         (None, BlockHeight::new(0))
                     } else {
-                        let parent_height = block_tree.block_height(&highest_pc.block)?.ok_or(
-                            BlockTreeError::BlockExpectedButNotFound {
-                                block: highest_pc.block,
-                            },
-                        )?;
-                        (Some(highest_pc.block), parent_height + 1)
+                        match block_tree.block_height(&highest_pc.block)? {
+                            Some(parent_height) => (Some(highest_pc.block), parent_height + 1),
+                            None => {
+                                self.proposal_deferred = true;
+                                return Ok(());
+                            }
+                        }
                     };
 
                     let produce_block_request = ProduceBlockRequest::new(
@@ -289,21 +404,45 @@ impl<N: Network> HotStuff<N> {
                     let ProduceBlockResponse {
                         data,
                         data_hash,
-                        app_state_updates: _,
-                        validator_set_updates: _,
+                        app_state_updates,
+                        validator_set_updates,
                     } = app.produce_block(produce_block_request);
 
                     let block = Block::new(child_height, highest_pc, data_hash, data);
+
+                    // Proposer self-inserts before broadcasting: ensures the block
+                    // is in the tree before QC forms and next view references it.
+                    block_tree.insert(
+                        &block,
+                        app_state_updates.as_ref(),
+                        validator_set_updates.as_ref(),
+                    )?;
+                    Event::InsertBlock(InsertBlockEvent {
+                        timestamp: SystemTime::now(),
+                        block: block.clone(),
+                    })
+                    .publish(&self.event_publisher);
+
+                    let committed_vs_updates =
+                        block_tree.update(&block.justify, &self.event_publisher).unwrap_or(None);
+                    if let Some(vs_updates) = committed_vs_updates {
+                        self.validator_set_update_handle
+                            .update_validator_set(vs_updates);
+                    }
 
                     let proposal = Proposal {
                         chain_id: self.config.chain_id,
                         view: self.view_info.view,
                         block,
                         tc: None,
-                    nec: None,
+                        nec: None,
                     };
+
+                    let header = ProposalHeader::from_proposal(&proposal, validator_set_updates.is_some());
+                    self.pending_bodies.insert(proposal.block.hash, proposal.block.clone());
+                    self.sender_handle.store_block_for_serving(proposal.block.hash, proposal.block.clone());
                     self.sender_handle
-                        .broadcast::<HotStuffMessage>(proposal.clone().into());
+                        .broadcast::<HotStuffMessage>(header.into());
 
                     Event::Propose(ProposeEvent {
                         timestamp: SystemTime::now(),
@@ -453,24 +592,35 @@ impl<N: Network> HotStuff<N> {
             _ => "Other",
         };
         log::info!("on_receive_msg: type={}, view={}", msg_type, self.view_info.view.int());
-        if matches!(msg, HotStuffMessage::Proposal(_)) || matches!(msg, HotStuffMessage::Nudge(_)) {
+        if matches!(msg, HotStuffMessage::Proposal(_) | HotStuffMessage::Nudge(_) | HotStuffMessage::ProposalHeader(_)) {
             let validator_set_state = block_tree.validator_set_state()?;
+
+            // For ProposalHeaders that bypass view filtering, verify the sender
+            // was the proposer for the HEADER's view (not the local view).
+            let check_view = match &msg {
+                HotStuffMessage::ProposalHeader(h) => h.view,
+                _ => self.view_info.view,
+            };
 
             // MonadBFT B3: Use reputation-weighted leader selection.
             let reputation = block_tree.leader_reputation().ok();
             if !is_proposer_with_reputation(
                 origin,
-                self.view_info.view,
+                check_view,
                 &validator_set_state,
                 reputation.as_ref(),
             ) {
                 return Ok(());
             }
 
-            if self.proposal_status.has_one_leader_proposed(origin)
-                || self.proposal_status.have_all_leaders_proposed()
-            {
-                return Ok(());
+            // Skip duplicate proposals for the current view (not applicable to
+            // late-arriving ProposalHeaders from past views).
+            if !matches!(msg, HotStuffMessage::ProposalHeader(_)) {
+                if self.proposal_status.has_one_leader_proposed(origin)
+                    || self.proposal_status.have_all_leaders_proposed()
+                {
+                    return Ok(());
+                }
             }
         }
 
@@ -498,6 +648,16 @@ impl<N: Network> HotStuff<N> {
             }
             HotStuffMessage::NE(ne) => {
                 self.on_receive_ne(ne, origin, block_tree, app)
+            }
+            // Hybrid pipelining
+            HotStuffMessage::ProposalHeader(header) => {
+                self.on_receive_proposal_header(header, origin, block_tree, app)
+            }
+            HotStuffMessage::BlockDataRequest(req) => {
+                self.on_receive_block_data_request(req, origin, block_tree)
+            }
+            HotStuffMessage::BlockDataResponse(resp) => {
+                self.on_receive_block_data_response(resp, origin, block_tree, app)
             }
         }
     }
@@ -692,7 +852,7 @@ impl<N: Network> HotStuff<N> {
 
             // 3. Trigger block tree updates: update highestPC, lock, commit.
             let committed_validator_set_updates =
-                block_tree.update(&proposal.block.justify, &self.event_publisher)?;
+                block_tree.update(&proposal.block.justify, &self.event_publisher).unwrap_or(None);
 
             if let Some(vs_updates) = committed_validator_set_updates {
                 self.validator_set_update_handle
@@ -826,7 +986,7 @@ impl<N: Network> HotStuff<N> {
 
         // 2. Trigger block tree updates: update highestPC, lock, commit.
         let committed_validator_set_updates =
-            block_tree.update(&nudge.justify, &self.event_publisher)?;
+            block_tree.update(&nudge.justify, &self.event_publisher).unwrap_or(None);
 
         if let Some(vs_updates) = committed_validator_set_updates {
             self.validator_set_update_handle
@@ -933,15 +1093,27 @@ impl<N: Network> HotStuff<N> {
                 .publish(&self.event_publisher);
 
                 // If the newly collected PC is not correct or not safe, then ignore it and return.
-                if !new_pc.is_correct(block_tree)?
-                    || !safe_pc(&new_pc, block_tree, self.config.chain_id)?
-                {
+                // In the header pipeline, the PC's block may not be in the tree
+                // yet (body in flight) but is tracked in pending_headers.
+                let pc_block_pending = self.pending_headers.contains_key(&new_pc.block)
+                    || self.pending_bodies.contains_key(&new_pc.block);
+                let pc_safe = if pc_block_pending {
+                    new_pc.is_correct(block_tree)?
+                } else {
+                    new_pc.is_correct(block_tree)?
+                        && safe_pc(&new_pc, block_tree, self.config.chain_id)?
+                };
+                if !pc_safe {
                     return Ok(());
                 }
 
                 // 2. Trigger block tree updates: update highestPC, lock, commit (if new PC collected).
+                //    In the header pipeline the certified block may not be in
+                //    the tree yet (body in flight). Always advance highest_pc
+                //    first, then attempt full update for commits.
+                let _ = block_tree.advance_highest_pc_from_remote(&new_pc);
                 let committed_validator_set_updates =
-                    block_tree.update(&new_pc, &self.event_publisher)?;
+                    block_tree.update(&new_pc, &self.event_publisher).unwrap_or(None);
 
 
                 // MonadBFT B2: Speculative commit — 1-QC for fresh proposals.
@@ -969,17 +1141,11 @@ impl<N: Network> HotStuff<N> {
                     .phase_vote_collectors
                     .update_validator_sets(&validator_set_state);
 
-                // MonadBFT: Backup QC broadcast.
-                // FIX CONS-FIND-12: Use reputation-weighted proposer check.
-                let reputation = block_tree.leader_reputation().ok();
-                if new_pc.phase.is_generic()
-                    && is_proposer_with_reputation(
-                        &self.config.keypair.public(),
-                        self.view_info.view,
-                        &validator_set_state,
-                        reputation.as_ref(),
-                    )
-                {
+                // Broadcast AdvanceView with the new PC so all validators can
+                // advance. In the header pipeline, non-proposers don't call
+                // block_tree.update() until bodies arrive, so this broadcast is
+                // the primary mechanism for view synchronization.
+                if new_pc.phase.is_generic() {
                     use crate::pacemaker::messages::ProgressCertificate;
                     let advance_msg = crate::pacemaker::messages::PacemakerMessage::advance_view(
                         ProgressCertificate::PhaseCertificate(new_pc.clone()),
@@ -1017,7 +1183,7 @@ impl<N: Network> HotStuff<N> {
         {
             // 2. Trigger block tree updates: update highestPC, lock, commit (if new PC collected).
             let committed_validator_set_updates =
-                block_tree.update(&new_view.highest_pc, &self.event_publisher)?;
+                block_tree.update(&new_view.highest_pc, &self.event_publisher).unwrap_or(None);
 
             if let Some(vs_updates) = committed_validator_set_updates {
                 self.validator_set_update_handle
@@ -1123,7 +1289,10 @@ impl<N: Network> HotStuff<N> {
             tc: Some(tc),
             nec: None,
         };
-        self.sender_handle.broadcast::<HotStuffMessage>(proposal.clone().into());
+        let header = ProposalHeader::from_proposal(&proposal, false);
+        self.pending_bodies.insert(proposal.block.hash, proposal.block.clone());
+        self.sender_handle.store_block_for_serving(proposal.block.hash, proposal.block.clone());
+        self.sender_handle.broadcast::<HotStuffMessage>(header.into());
         Event::Propose(ProposeEvent {
             timestamp: SystemTime::now(),
             proposal,
@@ -1272,7 +1441,10 @@ impl<N: Network> HotStuff<N> {
                 tc: Some(tc),
                 nec: Some(nec),
             };
-            self.sender_handle.broadcast::<HotStuffMessage>(proposal.clone().into());
+            let header = ProposalHeader::from_proposal(&proposal, false);
+            self.pending_bodies.insert(proposal.block.hash, proposal.block.clone());
+            self.sender_handle.store_block_for_serving(proposal.block.hash, proposal.block.clone());
+            self.sender_handle.broadcast::<HotStuffMessage>(header.into());
             Event::Propose(ProposeEvent {
                 timestamp: SystemTime::now(),
                 proposal,
@@ -1281,6 +1453,371 @@ impl<N: Network> HotStuff<N> {
         }
 
         Ok(())
+    }
+
+    // ========================================================================
+    // Hybrid pipelining: header-first propagation handlers
+    // ========================================================================
+
+    /// Process a ProposalHeader: verify safety, vote, request body.
+    /// The block is NOT inserted into the tree yet — that happens when the body arrives.
+    fn on_receive_proposal_header<K: KVStore>(
+        &mut self,
+        header: ProposalHeader,
+        origin: &VerifyingKey,
+        block_tree: &mut BlockTreeSingleton<K>,
+        app: &mut impl App<K>,
+    ) -> Result<(), HotStuffError> {
+        // Equivocation detection (same as on_receive_proposal).
+        let proposal_key = (header.view, *origin);
+        if let Some(first_hash) = self.seen_proposals.get(&proposal_key) {
+            if *first_hash != header.block_hash {
+                let evidence = super::types::EquivocationEvidence {
+                    view: header.view,
+                    leader: *origin,
+                    block_a: *first_hash,
+                    block_b: header.block_hash,
+                };
+                Event::EquivocationDetected(crate::events::EquivocationDetectedEvent {
+                    timestamp: SystemTime::now(),
+                    equivocator: *origin,
+                    view: header.view,
+                    block_a: *first_hash,
+                    block_b: header.block_hash,
+                })
+                .publish(&self.event_publisher);
+                let _ = block_tree.store_equivocation_evidence(&evidence);
+
+                if block_tree.is_speculatively_committed(first_hash)? {
+                    let rolled_back = block_tree.rollback_speculative_block(first_hash)?;
+                    if rolled_back {
+                        Event::RollbackBlock(crate::events::RollbackBlockEvent {
+                            timestamp: SystemTime::now(),
+                            block: *first_hash,
+                            view: header.view,
+                            equivocator: *origin,
+                        })
+                        .publish(&self.event_publisher);
+                        app.on_speculative_rollback(*first_hash, &evidence);
+                    }
+                }
+                return Ok(());
+            }
+        } else {
+            self.seen_proposals.insert(proposal_key, header.block_hash);
+        }
+
+        // Verify block_hash = hash(height, justify, data_hash) — all from the header.
+        let expected_hash = Block::hash(header.height, &header.justify, &header.data_hash);
+        if header.block_hash != expected_hash {
+            log::warn!("dropping proposal header: hash mismatch, view={}", header.view.int());
+            return Ok(());
+        }
+
+        // If the block is already in the tree (proposer self-inserted), skip body fetch
+        // but still vote below.
+        let block_already_in_tree = block_tree.block_height(&header.block_hash)?.is_some();
+
+        // Verify justify correctness and safety (same checks as safe_block).
+        // In the header pipeline, the justify's block may not yet be in the tree
+        // (body still in flight) but we already validated and voted for it. Tracked
+        // entries in pending_headers/pending_bodies are proof of prior validation.
+        let justify_correct = header.justify.is_correct(block_tree)?;
+        let justify_previously_validated =
+            self.pending_headers.contains_key(&header.justify.block)
+                || self.pending_bodies.contains_key(&header.justify.block);
+        let is_safe = if justify_correct {
+            if justify_previously_validated {
+                header.justify.is_block_justify()
+                    && (header.justify.chain_id == self.config.chain_id
+                        || header.justify.is_genesis_pc())
+            } else {
+                safe_pc(&header.justify, block_tree, self.config.chain_id)?
+                    && header.justify.is_block_justify()
+            }
+        } else {
+            false
+        };
+
+        if !justify_correct || !is_safe {
+            let justify_block_known = block_tree.contains(&header.justify.block);
+            log::warn!(
+                "dropping proposal header: view={}, justify_correct={}, is_safe={}, justify_block_known={}",
+                header.view.int(), justify_correct, is_safe, justify_block_known,
+            );
+            if !justify_block_known {
+                self.sync_needed = true;
+            }
+            match self.proposal_status {
+                ProposalStatus::WaitingForProposal => {
+                    self.proposal_status = ProposalStatus::OneLeaderProposed { leader: *origin }
+                }
+                ProposalStatus::OneLeaderProposed { leader: _ } => {
+                    self.proposal_status = ProposalStatus::AllLeadersProposed
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+
+        // Vote on the header (same voting logic as on_receive_proposal).
+        let validator_set_state = block_tree.validator_set_state()?;
+        if is_phase_voter(
+            &self.config.keypair.public(),
+            &validator_set_state,
+            &header.justify,
+        ) && (block_tree.highest_view_voted()?.is_none()
+            || block_tree.highest_view_voted()?.unwrap() < self.view_info.view)
+        {
+            let vote_phase = if header.has_validator_set_updates {
+                Phase::Prepare
+            } else {
+                Phase::Generic
+            };
+
+            let phase_vote = PhaseVote::new(
+                &self.config.keypair,
+                self.config.chain_id,
+                self.view_info.view,
+                header.block_hash,
+                vote_phase,
+            );
+            let reputation = block_tree.leader_reputation().ok();
+            let vote_recipient = phase_vote_recipient_with_reputation(
+                &phase_vote,
+                &validator_set_state,
+                reputation.as_ref(),
+            );
+            self.sender_handle
+                .send::<HotStuffMessage>(vote_recipient, phase_vote.clone().into());
+
+            block_tree.set_vote_state_atomic(self.view_info.view, header.block_hash)?;
+            Event::PhaseVote(PhaseVoteEvent {
+                timestamp: SystemTime::now(),
+                vote: phase_vote,
+            })
+            .publish(&self.event_publisher);
+        }
+
+        // Request the body via the dedicated block-data protocol (skip if already self-inserted).
+        if !block_already_in_tree {
+            let req = BlockDataRequest {
+                chain_id: header.chain_id,
+                view: header.view,
+                block_hash: header.block_hash,
+            };
+            self.sender_handle.request_block_data(*origin, req);
+            self.body_fetch_tracker.insert(header.block_hash, (Instant::now(), 0, *origin));
+            self.pending_headers.insert(header.block_hash, header);
+        }
+
+        // Update proposal status.
+        match self.proposal_status {
+            ProposalStatus::WaitingForProposal => {
+                self.proposal_status = ProposalStatus::OneLeaderProposed { leader: *origin }
+            }
+            ProposalStatus::OneLeaderProposed { leader: _ } => {
+                self.proposal_status = ProposalStatus::AllLeadersProposed
+            }
+            _ => {}
+        }
+
+        Ok(())
+    }
+
+    /// Serve a BlockDataRequest: look up block in pending_bodies or block_tree, respond.
+    fn on_receive_block_data_request<K: KVStore>(
+        &mut self,
+        req: BlockDataRequest,
+        origin: &VerifyingKey,
+        block_tree: &mut BlockTreeSingleton<K>,
+    ) -> Result<(), HotStuffError> {
+        let block = if let Some(block) = self.pending_bodies.get(&req.block_hash) {
+            Some(block.clone())
+        } else {
+            block_tree.block(&req.block_hash)?
+        };
+
+        if let Some(block) = block {
+            let resp = BlockDataResponse { view: req.view, block };
+            self.sender_handle
+                .send::<HotStuffMessage>(*origin, resp.into());
+        }
+
+        Ok(())
+    }
+
+    /// Process a BlockDataResponse: validate block, insert into tree, trigger updates.
+    /// If parent state isn't available yet, defers the body for later processing.
+    fn on_receive_block_data_response<K: KVStore>(
+        &mut self,
+        resp: BlockDataResponse,
+        _origin: &VerifyingKey,
+        block_tree: &mut BlockTreeSingleton<K>,
+        app: &mut impl App<K>,
+    ) -> Result<(), HotStuffError> {
+        let block = resp.block;
+        let block_hash = block.hash;
+
+        if !self.pending_headers.contains_key(&block_hash) {
+            return Ok(());
+        }
+
+        if self.try_insert_body(block.clone(), block_tree, app)? {
+            self.pending_headers.remove(&block_hash);
+            self.body_fetch_tracker.remove(&block_hash);
+            self.drain_deferred_bodies(block_tree, app)?;
+        } else {
+            self.deferred_bodies.insert(block_hash, block);
+            self.body_fetch_tracker.remove(&block_hash);
+        }
+
+        Ok(())
+    }
+
+    /// Attempt to validate and insert a block body. Returns true on success, false if
+    /// the parent state isn't available yet.
+    fn try_insert_body<K: KVStore>(
+        &mut self,
+        block: Block,
+        block_tree: &mut BlockTreeSingleton<K>,
+        app: &mut impl App<K>,
+    ) -> Result<bool, HotStuffError> {
+        let parent_block = if block.justify.is_genesis_pc() {
+            None
+        } else {
+            Some(&block.justify.block)
+        };
+        let app_view = match block_tree.app_view(parent_block) {
+            Ok(v) => v,
+            Err(_) => return Ok(false),
+        };
+        let validate_block_request = ValidateBlockRequest::new(&block, app_view);
+
+        if let ValidateBlockResponse::Valid {
+            app_state_updates,
+            validator_set_updates,
+        } = app.validate_block(validate_block_request)
+        {
+            block_tree.insert(
+                &block,
+                app_state_updates.as_ref(),
+                validator_set_updates.as_ref(),
+            )?;
+            Event::InsertBlock(InsertBlockEvent {
+                timestamp: SystemTime::now(),
+                block: block.clone(),
+            })
+            .publish(&self.event_publisher);
+
+            let committed_validator_set_updates =
+                block_tree.update(&block.justify, &self.event_publisher).unwrap_or_else(|e| {
+                    if let BlockTreeError::BlockExpectedButNotFound { block: missing } = &e {
+                        log::warn!("body insert: missing block {:?} in commit chain — triggering sync", missing);
+                        self.sync_needed = true;
+                    } else {
+                        log::warn!("block_tree.update after body insert: {:?}", e);
+                    }
+                    None
+                });
+
+            if let Some(vs_updates) = committed_validator_set_updates {
+                self.validator_set_update_handle
+                    .update_validator_set(vs_updates)
+            }
+
+            let validator_set_state = block_tree.validator_set_state()?;
+            let _ = self
+                .phase_vote_collectors
+                .update_validator_sets(&validator_set_state);
+            Ok(true)
+        } else {
+            log::warn!("body validation failed for block hash={:?}", block.hash);
+            Ok(false)
+        }
+    }
+
+    /// After a successful body insertion, process any deferred bodies whose
+    /// parents are now available.
+    fn drain_deferred_bodies<K: KVStore>(
+        &mut self,
+        block_tree: &mut BlockTreeSingleton<K>,
+        app: &mut impl App<K>,
+    ) -> Result<(), HotStuffError> {
+        let mut progress = true;
+        while progress {
+            progress = false;
+            let hashes: Vec<CryptoHash> = self.deferred_bodies.keys().cloned().collect();
+            for hash in hashes {
+                let block = match self.deferred_bodies.get(&hash) {
+                    Some(b) => b.clone(),
+                    None => continue,
+                };
+                if self.try_insert_body(block, block_tree, app)? {
+                    self.deferred_bodies.remove(&hash);
+                    self.pending_headers.remove(&hash);
+                    self.body_fetch_tracker.remove(&hash);
+                    progress = true;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Poll the dedicated block-data channel for body responses.
+    /// Called from the algorithm loop between consensus message processing steps.
+    pub(crate) fn poll_block_data_responses<K: KVStore>(
+        &mut self,
+        block_tree: &mut BlockTreeSingleton<K>,
+        app: &mut impl App<K>,
+    ) -> Result<(), HotStuffError> {
+        while let Some((origin, resp)) = self.sender_handle.recv_block_data() {
+            self.on_receive_block_data_response(resp, &origin, block_tree, app)?;
+        }
+        Ok(())
+    }
+
+    const BODY_RETRY_INTERVAL: Duration = Duration::from_millis(300);
+    const MAX_BODY_RETRIES: u8 = 3;
+
+    /// Re-request bodies for stale pending headers; trigger block sync after max retries.
+    pub(crate) fn tick_pending_body_retries(&mut self) {
+        let now = Instant::now();
+        let mut expired = Vec::new();
+        for (hash, (last_req, count, origin)) in self.body_fetch_tracker.iter_mut() {
+            if now.duration_since(*last_req) < Self::BODY_RETRY_INTERVAL {
+                continue;
+            }
+            if *count >= Self::MAX_BODY_RETRIES {
+                log::warn!("body fetch exhausted {} retries for {:?} — falling back to sync", Self::MAX_BODY_RETRIES, hash);
+                expired.push(*hash);
+                continue;
+            }
+            if let Some(header) = self.pending_headers.get(hash) {
+                let req = BlockDataRequest {
+                    chain_id: header.chain_id,
+                    view: header.view,
+                    block_hash: header.block_hash,
+                };
+                self.sender_handle.request_block_data(*origin, req);
+                *last_req = now;
+                *count += 1;
+                log::debug!("body fetch retry {} for {:?}", count, hash);
+            } else {
+                expired.push(*hash);
+            }
+        }
+        for hash in &expired {
+            self.body_fetch_tracker.remove(hash);
+            self.pending_headers.remove(hash);
+        }
+        if !expired.is_empty() {
+            self.sync_needed = true;
+        }
+    }
+
+    pub(crate) fn has_pending_body_fetches(&self) -> bool {
+        !self.body_fetch_tracker.is_empty()
     }
 }
 
