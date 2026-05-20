@@ -58,7 +58,7 @@ fn setup() -> (tempfile::TempDir, GovernanceManager, StakingManager) {
 /// Register a validator and return its address.
 fn setup_validator(staking: &StakingManager, n: u8) -> Address {
     let validator = addr(n);
-    fund(staking.state_db(), &validator, wei(100_000));
+    fund(staking.state(), &validator, wei(100_000));
     staking
         .register_validator(validator, [n; 32], 500, MIN_SELF_DELEGATION)
         .unwrap();
@@ -74,7 +74,7 @@ fn setup_voter(
     perm_amount: U256,
 ) {
     let voter = addr(voter_n);
-    fund(staking.state_db(), &voter, del_amount + perm_amount);
+    fund(staking.state(), &voter, del_amount + perm_amount);
     if !del_amount.is_zero() {
         staking.delegate(voter, validator, del_amount).unwrap();
     }
@@ -377,7 +377,7 @@ fn execute_parameter_change() {
 
     // Verify parameter updated in CF_FEE_CONFIG.
     let data = gov
-        .state_db()
+        .state()
         .get_cf_raw(CF_FEE_CONFIG, b"max_leverage")
         .unwrap()
         .unwrap();
@@ -396,7 +396,7 @@ fn execute_treasury_spend() {
 
     // Fund treasury.
     let treasury = addr(99);
-    fund(gov.state_db(), &treasury, wei(10_000));
+    fund(gov.state(), &treasury, wei(10_000));
 
     let recipient = addr(50);
     let payload = ExecutionPayload::TreasurySpend {
@@ -417,7 +417,7 @@ fn execute_treasury_spend() {
 
     // Verify treasury debited.
     let treasury_bal = gov
-        .state_db()
+        .state()
         .get_account(&treasury)
         .unwrap()
         .unwrap()
@@ -426,7 +426,7 @@ fn execute_treasury_spend() {
 
     // Verify recipient credited.
     let recipient_bal = gov
-        .state_db()
+        .state()
         .get_account(&recipient)
         .unwrap()
         .unwrap()
@@ -441,7 +441,7 @@ fn execute_treasury_spend_insufficient() {
     setup_voter(&staking, 2, validator, wei(500), U256::ZERO);
 
     // Treasury has only 100.
-    fund(gov.state_db(), &addr(99), wei(100));
+    fund(gov.state(), &addr(99), wei(100));
 
     let payload = ExecutionPayload::TreasurySpend {
         recipient: addr(50),
@@ -491,7 +491,7 @@ fn execute_market_listing() {
     // Verify market created in CF_NATIVE_MARKETS.
     let market_key = 42u64.to_be_bytes();
     let data = gov
-        .state_db()
+        .state()
         .get_cf_raw(CF_NATIVE_MARKETS, &market_key)
         .unwrap();
     assert!(data.is_some(), "market should exist in CF_NATIVE_MARKETS");

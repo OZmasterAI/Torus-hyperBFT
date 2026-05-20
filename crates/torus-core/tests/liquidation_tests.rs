@@ -357,7 +357,7 @@ fn insurance_fund_absorbs_loss() {
     make_cross_long(&pm, &trader2, market, fp(1), fp(50_000));
     set_balance(&pm, &trader2, fp(10_000));
 
-    let state_db = pm.state_db();
+    let state_db = pm.state();
     let amount = fp(1_000);
     state_db
         .put_cf_raw(

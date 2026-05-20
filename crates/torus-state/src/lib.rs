@@ -1,5 +1,6 @@
 //! RocksDB storage, revm Database trait, and MPT state root computation.
 
+pub mod backend;
 pub mod cf;
 pub mod db;
 pub mod error;
@@ -8,6 +9,7 @@ pub mod pruner;
 pub mod snapshot;
 pub mod trie;
 
+pub use backend::{AtomicWriteOp, NativeStateOverlay, StateBackend};
 pub use db::StateDb;
 pub use error::StateError;
 pub use overlay::StateOverlay;

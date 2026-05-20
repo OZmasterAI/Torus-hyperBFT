@@ -15,7 +15,7 @@ use torus_state::cf::{
     CF_FEE_CONFIG, CF_GOVERNANCE_PROPOSALS, CF_GOVERNANCE_VOTES, CF_NATIVE_MARKETS,
     CF_STAKING_DELEGATIONS, CF_STAKING_PERMANENT,
 };
-use torus_state::StateDb;
+use torus_state::{StateBackend, StateDb};
 use torus_types::FixedPoint;
 
 use crate::error::EconomicsError;
@@ -494,17 +494,17 @@ pub enum ProposalOutcome {
 /// Reads stake data directly from staking column families to compute
 /// chain-verified vote weights without coupling to `StakingManager`.
 #[derive(Clone)]
-pub struct GovernanceManager {
-    state_db: StateDb,
+pub struct GovernanceManager<T: StateBackend = StateDb> {
+    state: T,
 }
 
-impl GovernanceManager {
-    pub fn new(state_db: StateDb) -> Self {
-        Self { state_db }
+impl<T: StateBackend> GovernanceManager<T> {
+    pub fn new(state: T) -> Self {
+        Self { state }
     }
 
-    pub fn state_db(&self) -> &StateDb {
-        &self.state_db
+    pub fn state(&self) -> &T {
+        &self.state
     }
 
     // ========================================================================
@@ -732,7 +732,7 @@ impl GovernanceManager {
 
         // Verify not already voted.
         let vkey = vote_key(proposal_id, &voter);
-        if self.state_db.get_cf_raw(CF_GOVERNANCE_VOTES, &vkey)?.is_some() {
+        if self.state.get_cf_raw(CF_GOVERNANCE_VOTES, &vkey)?.is_some() {
             return Err(EconomicsError::AlreadyVoted { voter, proposal_id });
         }
 
@@ -755,7 +755,7 @@ impl GovernanceManager {
         // Store vote record.
         let vote = Vote { voter, proposal_id, support, weight, block_number: current_block };
         let data = borsh::to_vec(&vote).map_err(|e| EconomicsError::Borsh(e.to_string()))?;
-        self.state_db.put_cf_raw(CF_GOVERNANCE_VOTES, &vkey, &data)?;
+        self.state.put_cf_raw(CF_GOVERNANCE_VOTES, &vkey, &data)?;
 
         tracing::debug!(%voter, proposal_id, support, %weight, "vote cast");
         Ok(())
@@ -787,7 +787,7 @@ impl GovernanceManager {
 
         // Verify not already voted.
         let vkey = vote_key(proposal_id, &voter);
-        if self.state_db.get_cf_raw(CF_GOVERNANCE_VOTES, &vkey)?.is_some() {
+        if self.state.get_cf_raw(CF_GOVERNANCE_VOTES, &vkey)?.is_some() {
             return Err(EconomicsError::AlreadyVoted { voter, proposal_id });
         }
 
@@ -804,7 +804,7 @@ impl GovernanceManager {
             weight, block_number: current_block,
         };
         let data = borsh::to_vec(&vote).map_err(|e| EconomicsError::Borsh(e.to_string()))?;
-        self.state_db.put_cf_raw(CF_GOVERNANCE_VOTES, &vkey, &data)?;
+        self.state.put_cf_raw(CF_GOVERNANCE_VOTES, &vkey, &data)?;
 
         // NOTE: We intentionally do NOT update proposal.votes_for or votes_against
         tracing::debug!(%voter, proposal_id, "abstain vote cast");
@@ -920,7 +920,7 @@ impl GovernanceManager {
         current_block: u64,
     ) -> Result<Vec<ProposalOutcome>> {
         // FIX MED-NEW-07: Skip full CF scan when no proposals have ever been created.
-        let proposal_count = match self.state_db.get_cf_raw(CF_FEE_CONFIG, PROPOSAL_COUNTER_KEY)? {
+        let proposal_count = match self.state.get_cf_raw(CF_FEE_CONFIG, PROPOSAL_COUNTER_KEY)? {
             Some(data) if data.len() == 8 => u64::from_be_bytes(data.try_into().unwrap()),
             _ => 0,
         };
@@ -967,14 +967,14 @@ impl GovernanceManager {
             ExecutionPayload::ParameterChange { param_key, new_value } => {
                 // FIX 13: Validate parameter change at execution time (defense-in-depth).
                 Self::validate_param_change(param_key, new_value)?;
-                self.state_db
+                self.state
                     .put_cf_raw(CF_FEE_CONFIG, param_key.as_bytes(), new_value.as_bytes())?;
                 tracing::info!(param_key, new_value, "governance parameter updated");
             }
             ExecutionPayload::TreasurySpend { recipient, amount, reason } => {
                 // Debit treasury account.
                 let mut treasury_acct = self
-                    .state_db
+                    .state
                     .get_account(&params.treasury_address)?
                     .unwrap_or_default();
                 if treasury_acct.balance < *amount {
@@ -983,13 +983,13 @@ impl GovernanceManager {
                     });
                 }
                 treasury_acct.balance -= *amount;
-                self.state_db.put_account(&params.treasury_address, &treasury_acct)?;
+                self.state.put_account(&params.treasury_address, &treasury_acct)?;
 
                 // Credit recipient.
                 let mut recipient_acct =
-                    self.state_db.get_account(recipient)?.unwrap_or_default();
+                    self.state.get_account(recipient)?.unwrap_or_default();
                 recipient_acct.balance += *amount;
-                self.state_db.put_account(recipient, &recipient_acct)?;
+                self.state.put_account(recipient, &recipient_acct)?;
 
                 tracing::info!(%recipient, %amount, reason, "treasury spend executed");
             }
@@ -1008,7 +1008,7 @@ impl GovernanceManager {
                     .map_err(|e| EconomicsError::Borsh(e.to_string()))?;
                 BorshSerialize::serialize(&initial_margin.raw(), &mut data)
                     .map_err(|e| EconomicsError::Borsh(e.to_string()))?;
-                self.state_db.put_cf_raw(CF_NATIVE_MARKETS, &key, &data)?;
+                self.state.put_cf_raw(CF_NATIVE_MARKETS, &key, &data)?;
 
                 tracing::info!(
                     market_id, base_asset, quote_asset, "market listed via governance"
@@ -1030,7 +1030,7 @@ impl GovernanceManager {
                 );
             }
             ExecutionPayload::PermanentUnlock { staker, amount } => {
-                let staking = crate::staking::StakingManager::new(self.state_db.clone());
+                let staking = crate::staking::StakingManager::new(self.state.clone());
                 staking.governance_unlock_permanent_stake(*staker, *amount)?;
                 tracing::info!(
                     %staker, %amount,
@@ -1050,19 +1050,11 @@ impl GovernanceManager {
     }
 
     pub fn get_proposals_by_status(&self, status: ProposalStatus) -> Result<Vec<Proposal>> {
-        let db = self.state_db.inner();
-        let cf = db.cf_handle(CF_GOVERNANCE_PROPOSALS).ok_or_else(|| {
-            EconomicsError::State(torus_state::StateError::MissingColumnFamily(
-                CF_GOVERNANCE_PROPOSALS.to_string(),
-            ))
-        })?;
-        let iter = db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+        let entries = self.state.iterate_cf(CF_GOVERNANCE_PROPOSALS, None)?;
         let mut proposals = Vec::new();
-        for item in iter {
-            let (key, value) = item
-                .map_err(|e| EconomicsError::State(torus_state::StateError::RocksDb(e)))?;
+        for (key, value) in &entries {
             if key.len() != 8 { continue; }
-            let proposal = Proposal::try_from_slice(&value)
+            let proposal = Proposal::try_from_slice(value)
                 .map_err(|e| EconomicsError::Borsh(e.to_string()))?;
             if proposal.status == status {
                 proposals.push(proposal);
@@ -1073,7 +1065,7 @@ impl GovernanceManager {
 
     pub fn get_vote(&self, proposal_id: u64, voter: &Address) -> Result<Option<Vote>> {
         let vkey = vote_key(proposal_id, voter);
-        match self.state_db.get_cf_raw(CF_GOVERNANCE_VOTES, &vkey)? {
+        match self.state.get_cf_raw(CF_GOVERNANCE_VOTES, &vkey)? {
             Some(data) => Ok(Some(
                 Vote::try_from_slice(&data)
                     .map_err(|e| EconomicsError::Borsh(e.to_string()))?,
@@ -1083,22 +1075,14 @@ impl GovernanceManager {
     }
 
     pub fn get_voter_history(&self, voter: &Address) -> Result<Vec<Vote>> {
-        let db = self.state_db.inner();
-        let cf = db.cf_handle(CF_GOVERNANCE_VOTES).ok_or_else(|| {
-            EconomicsError::State(torus_state::StateError::MissingColumnFamily(
-                CF_GOVERNANCE_VOTES.to_string(),
-            ))
-        })?;
-        let iter = db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+        let entries = self.state.iterate_cf(CF_GOVERNANCE_VOTES, None)?;
         let mut votes = Vec::new();
-        for item in iter {
-            let (key, value) = item
-                .map_err(|e| EconomicsError::State(torus_state::StateError::RocksDb(e)))?;
+        for (key, value) in &entries {
             // Skip snapshot weight entries (32-byte keys starting with "snap").
             if key.starts_with(b"snap") {
                 continue;
             }
-            let vote = Vote::try_from_slice(&value)
+            let vote = Vote::try_from_slice(value)
                 .map_err(|e| EconomicsError::Borsh(e.to_string()))?;
             if vote.voter == *voter {
                 votes.push(vote);
@@ -1111,7 +1095,7 @@ impl GovernanceManager {
     /// instead of silently defaulting to treasury_address = Address::ZERO (which
     /// would permanently burn any treasury spend proposals).
     pub fn get_governance_params(&self) -> Result<GovernanceParams> {
-        match self.state_db.get_cf_raw(CF_FEE_CONFIG, GOVERNANCE_PARAMS_KEY)? {
+        match self.state.get_cf_raw(CF_FEE_CONFIG, GOVERNANCE_PARAMS_KEY)? {
             Some(data) => Ok(GovernanceParams::try_from_slice(&data)
                 .map_err(|e| EconomicsError::Borsh(e.to_string()))?),
             None => Err(EconomicsError::GovernanceNotInitialized),
@@ -1120,7 +1104,7 @@ impl GovernanceManager {
 
     pub fn set_governance_params(&self, params: &GovernanceParams) -> Result<()> {
         let data = borsh::to_vec(params).map_err(|e| EconomicsError::Borsh(e.to_string()))?;
-        self.state_db.put_cf_raw(CF_FEE_CONFIG, GOVERNANCE_PARAMS_KEY, &data)?;
+        self.state.put_cf_raw(CF_FEE_CONFIG, GOVERNANCE_PARAMS_KEY, &data)?;
         Ok(())
     }
 
@@ -1145,7 +1129,7 @@ impl GovernanceManager {
         use torus_state::cf::CF_CONSENSUS_META;
 
         let key = whitelist_key(candidate);
-        match self.state_db.get_cf_raw(CF_CONSENSUS_META, &key)? {
+        match self.state.get_cf_raw(CF_CONSENSUS_META, &key)? {
             Some(data) => Ok(Some(
                 ValidatorWhitelistEntry::try_from_slice(&data)
                     .map_err(|e| EconomicsError::Borsh(e.to_string()))?,
@@ -1164,7 +1148,7 @@ impl GovernanceManager {
 
         let key = whitelist_key(candidate);
         let data = borsh::to_vec(entry).map_err(|e| EconomicsError::Borsh(e.to_string()))?;
-        self.state_db.put_cf_raw(CF_CONSENSUS_META, &key, &data)?;
+        self.state.put_cf_raw(CF_CONSENSUS_META, &key, &data)?;
         Ok(())
     }
 
@@ -1173,7 +1157,7 @@ impl GovernanceManager {
         use torus_state::cf::CF_CONSENSUS_META;
 
         let key = whitelist_key(candidate);
-        self.state_db.delete_cf_raw(CF_CONSENSUS_META, &key)?;
+        self.state.delete_cf_raw(CF_CONSENSUS_META, &key)?;
         Ok(())
     }
 
@@ -1212,7 +1196,7 @@ impl GovernanceManager {
     ) -> Result<U256> {
         // Try to load snapshotted weight first.
         let snap_key = snapshot_weight_key(proposal_id, voter);
-        if let Some(data) = self.state_db.get_cf_raw(CF_GOVERNANCE_VOTES, &snap_key)? {
+        if let Some(data) = self.state.get_cf_raw(CF_GOVERNANCE_VOTES, &snap_key)? {
             if data.len() == 32 {
                 return Ok(U256::from_be_slice(&data));
             }
@@ -1233,36 +1217,27 @@ impl GovernanceManager {
     fn snapshot_voter_weights(&self, proposal_id: u64, params: &GovernanceParams) -> Result<()> {
         use std::collections::HashMap;
 
-        let db = self.state_db.inner();
         let mut voter_delegated: HashMap<Address, U256> = HashMap::new();
 
         // Sum delegated amounts per delegator (key = delegator(20) + validator(20)).
-        if let Some(cf) = db.cf_handle(CF_STAKING_DELEGATIONS) {
-            for item in db.iterator_cf(cf, rocksdb::IteratorMode::Start) {
-                let (key, value) = item.map_err(|e| {
-                    EconomicsError::State(torus_state::StateError::RocksDb(e))
-                })?;
-                if key.len() < 20 { continue; }
-                let delegator = Address::from_slice(&key[..20]);
-                let delegation = Delegation::try_from_slice(&value)
-                    .map_err(|e| EconomicsError::Borsh(e.to_string()))?;
-                *voter_delegated.entry(delegator).or_insert(U256::ZERO) += delegation.amount;
-            }
+        let delegation_entries = self.state.iterate_cf(CF_STAKING_DELEGATIONS, None)?;
+        for (key, value) in &delegation_entries {
+            if key.len() < 20 { continue; }
+            let delegator = Address::from_slice(&key[..20]);
+            let delegation = Delegation::try_from_slice(value)
+                .map_err(|e| EconomicsError::Borsh(e.to_string()))?;
+            *voter_delegated.entry(delegator).or_insert(U256::ZERO) += delegation.amount;
         }
 
         // Merge permanent stake data.
         let mut voter_permanent: HashMap<Address, U256> = HashMap::new();
-        if let Some(cf) = db.cf_handle(CF_STAKING_PERMANENT) {
-            for item in db.iterator_cf(cf, rocksdb::IteratorMode::Start) {
-                let (key, value) = item.map_err(|e| {
-                    EconomicsError::State(torus_state::StateError::RocksDb(e))
-                })?;
-                if key.len() < 20 { continue; }
-                let staker = Address::from_slice(&key[..20]);
-                let info = PermanentStakeInfo::try_from_slice(&value)
-                    .map_err(|e| EconomicsError::Borsh(e.to_string()))?;
-                voter_permanent.insert(staker, info.amount);
-            }
+        let permanent_entries = self.state.iterate_cf(CF_STAKING_PERMANENT, None)?;
+        for (key, value) in &permanent_entries {
+            if key.len() < 20 { continue; }
+            let staker = Address::from_slice(&key[..20]);
+            let info = PermanentStakeInfo::try_from_slice(value)
+                .map_err(|e| EconomicsError::Borsh(e.to_string()))?;
+            voter_permanent.insert(staker, info.amount);
         }
 
         // Compute and store weighted vote power for each unique voter.
@@ -1283,7 +1258,7 @@ impl GovernanceManager {
             let weight = delegated + weighted_permanent;
             if !weight.is_zero() {
                 let snap_key = snapshot_weight_key(proposal_id, &voter);
-                self.state_db.put_cf_raw(
+                self.state.put_cf_raw(
                     CF_GOVERNANCE_VOTES,
                     &snap_key,
                     &weight.to_be_bytes::<32>(),
@@ -1296,20 +1271,11 @@ impl GovernanceManager {
 
     /// Total vote weight cast on a proposal (yes + no + abstain) (FIX 20).
     fn total_vote_weight(&self, proposal_id: u64) -> Result<U256> {
-        let db = self.state_db.inner();
-        let cf = db.cf_handle(CF_GOVERNANCE_VOTES).ok_or_else(|| {
-            EconomicsError::State(torus_state::StateError::MissingColumnFamily(
-                CF_GOVERNANCE_VOTES.to_string(),
-            ))
-        })?;
         let prefix = proposal_id.to_be_bytes();
-        let iter = db.prefix_iterator_cf(cf, &prefix);
+        let entries = self.state.iterate_cf(CF_GOVERNANCE_VOTES, Some(&prefix))?;
         let mut total = U256::ZERO;
-        for item in iter {
-            let (key, value) = item
-                .map_err(|e| EconomicsError::State(torus_state::StateError::RocksDb(e)))?;
-            if !key.starts_with(&prefix) { break; }
-            let vote = Vote::try_from_slice(&value)
+        for (_key, value) in &entries {
+            let vote = Vote::try_from_slice(value)
                 .map_err(|e| EconomicsError::Borsh(e.to_string()))?;
             total += vote.weight;
         }
@@ -1318,29 +1284,20 @@ impl GovernanceManager {
 
     /// Sum total staked supply across all delegations and permanent stakes.
     fn total_staked_supply(&self) -> Result<U256> {
-        let db = self.state_db.inner();
         let mut total = U256::ZERO;
 
-        if let Some(cf) = db.cf_handle(CF_STAKING_DELEGATIONS) {
-            for item in db.iterator_cf(cf, rocksdb::IteratorMode::Start) {
-                let (_key, value) = item.map_err(|e| {
-                    EconomicsError::State(torus_state::StateError::RocksDb(e))
-                })?;
-                let delegation = Delegation::try_from_slice(&value)
-                    .map_err(|e| EconomicsError::Borsh(e.to_string()))?;
-                total += delegation.amount;
-            }
+        let delegation_entries = self.state.iterate_cf(CF_STAKING_DELEGATIONS, None)?;
+        for (_key, value) in &delegation_entries {
+            let delegation = Delegation::try_from_slice(value)
+                .map_err(|e| EconomicsError::Borsh(e.to_string()))?;
+            total += delegation.amount;
         }
 
-        if let Some(cf) = db.cf_handle(CF_STAKING_PERMANENT) {
-            for item in db.iterator_cf(cf, rocksdb::IteratorMode::Start) {
-                let (_key, value) = item.map_err(|e| {
-                    EconomicsError::State(torus_state::StateError::RocksDb(e))
-                })?;
-                let info = PermanentStakeInfo::try_from_slice(&value)
-                    .map_err(|e| EconomicsError::Borsh(e.to_string()))?;
-                total += info.amount;
-            }
+        let permanent_entries = self.state.iterate_cf(CF_STAKING_PERMANENT, None)?;
+        for (_key, value) in &permanent_entries {
+            let info = PermanentStakeInfo::try_from_slice(value)
+                .map_err(|e| EconomicsError::Borsh(e.to_string()))?;
+            total += info.amount;
         }
 
         Ok(total)
@@ -1348,20 +1305,11 @@ impl GovernanceManager {
 
     /// Total delegated stake for a voter (prefix scan on delegator address).
     fn total_delegated_for(&self, voter: &Address) -> Result<U256> {
-        let db = self.state_db.inner();
-        let cf = db.cf_handle(CF_STAKING_DELEGATIONS).ok_or_else(|| {
-            EconomicsError::State(torus_state::StateError::MissingColumnFamily(
-                CF_STAKING_DELEGATIONS.to_string(),
-            ))
-        })?;
         let prefix = voter.as_slice();
-        let iter = db.prefix_iterator_cf(cf, prefix);
+        let entries = self.state.iterate_cf(CF_STAKING_DELEGATIONS, Some(prefix))?;
         let mut total = U256::ZERO;
-        for item in iter {
-            let (key, value) = item
-                .map_err(|e| EconomicsError::State(torus_state::StateError::RocksDb(e)))?;
-            if !key.starts_with(prefix) { break; }
-            let delegation = Delegation::try_from_slice(&value)
+        for (_key, value) in &entries {
+            let delegation = Delegation::try_from_slice(value)
                 .map_err(|e| EconomicsError::Borsh(e.to_string()))?;
             total += delegation.amount;
         }
@@ -1370,7 +1318,7 @@ impl GovernanceManager {
 
     /// Permanent stake for a voter.
     fn permanent_stake_for(&self, voter: &Address) -> Result<U256> {
-        match self.state_db.get_cf_raw(CF_STAKING_PERMANENT, voter.as_slice())? {
+        match self.state.get_cf_raw(CF_STAKING_PERMANENT, voter.as_slice())? {
             Some(data) => {
                 let info = PermanentStakeInfo::try_from_slice(&data)
                     .map_err(|e| EconomicsError::Borsh(e.to_string()))?;
@@ -1382,12 +1330,12 @@ impl GovernanceManager {
 
     /// Get and increment the proposal counter. Returns the new ID (starts at 1).
     fn next_proposal_id(&self) -> Result<u64> {
-        let current = match self.state_db.get_cf_raw(CF_FEE_CONFIG, PROPOSAL_COUNTER_KEY)? {
+        let current = match self.state.get_cf_raw(CF_FEE_CONFIG, PROPOSAL_COUNTER_KEY)? {
             Some(data) if data.len() == 8 => u64::from_be_bytes(data.try_into().unwrap()),
             _ => 0,
         };
         let next = current + 1;
-        self.state_db
+        self.state
             .put_cf_raw(CF_FEE_CONFIG, PROPOSAL_COUNTER_KEY, &next.to_be_bytes())?;
         Ok(next)
     }
@@ -1398,7 +1346,7 @@ impl GovernanceManager {
 
     fn get_proposal_raw(&self, id: u64) -> Result<Option<Proposal>> {
         let key = id.to_be_bytes();
-        match self.state_db.get_cf_raw(CF_GOVERNANCE_PROPOSALS, &key)? {
+        match self.state.get_cf_raw(CF_GOVERNANCE_PROPOSALS, &key)? {
             Some(data) => Ok(Some(
                 Proposal::try_from_slice(&data)
                     .map_err(|e| EconomicsError::Borsh(e.to_string()))?,
@@ -1410,7 +1358,7 @@ impl GovernanceManager {
     fn put_proposal(&self, proposal: &Proposal) -> Result<()> {
         let key = proposal.id.to_be_bytes();
         let data = borsh::to_vec(proposal).map_err(|e| EconomicsError::Borsh(e.to_string()))?;
-        self.state_db.put_cf_raw(CF_GOVERNANCE_PROPOSALS, &key, &data)?;
+        self.state.put_cf_raw(CF_GOVERNANCE_PROPOSALS, &key, &data)?;
         Ok(())
     }
 }
@@ -1464,27 +1412,27 @@ mod tests {
     #[test]
     fn reject_disallowed_parameter_key() {
         let (_dir, _gm) = setup();
-        let result = GovernanceManager::validate_param_change("evil_key", "666");
+        let result = GovernanceManager::<StateDb>::validate_param_change("evil_key", "666");
         assert!(matches!(result, Err(EconomicsError::ParameterNotModifiable(_))));
     }
 
     #[test]
     fn reject_out_of_range_parameter() {
         let (_dir, _gm) = setup();
-        let result = GovernanceManager::validate_param_change("maintenance_margin_bps", "0");
+        let result = GovernanceManager::<StateDb>::validate_param_change("maintenance_margin_bps", "0");
         assert!(matches!(result, Err(EconomicsError::InvalidParameterValue { .. })));
 
-        let result = GovernanceManager::validate_param_change("maintenance_margin_bps", "10000");
+        let result = GovernanceManager::<StateDb>::validate_param_change("maintenance_margin_bps", "10000");
         assert!(matches!(result, Err(EconomicsError::InvalidParameterValue { .. })));
 
-        let result = GovernanceManager::validate_param_change("maintenance_margin_bps", "500");
+        let result = GovernanceManager::<StateDb>::validate_param_change("maintenance_margin_bps", "500");
         assert!(result.is_ok());
     }
 
     #[test]
     fn reject_zero_multiplier_den() {
         let (_dir, _gm) = setup();
-        let result = GovernanceManager::validate_param_change(
+        let result = GovernanceManager::<StateDb>::validate_param_change(
             "permanent_weight_multiplier_den", "0",
         );
         assert!(matches!(result, Err(EconomicsError::InvalidParameterValue { .. })));
@@ -1556,7 +1504,7 @@ mod tests {
             unbonding: vec![],
         };
         let data = borsh::to_vec(&d).unwrap();
-        gm.state_db()
+        gm.state()
             .put_cf_raw(CF_STAKING_DELEGATIONS, &key, &data)
             .unwrap();
     }
@@ -1569,7 +1517,7 @@ mod tests {
             locked_at_block: 1,
         };
         let data = borsh::to_vec(&info).unwrap();
-        gm.state_db()
+        gm.state()
             .put_cf_raw(CF_STAKING_PERMANENT, staker.as_slice(), &data)
             .unwrap();
     }
@@ -1611,9 +1559,9 @@ mod tests {
         assert_eq!(outcome, ProposalOutcome::Executed(id));
 
         // Permanent stake removed, balance credited.
-        let mgr = crate::staking::StakingManager::new(gm.state_db().clone());
+        let mgr = crate::staking::StakingManager::new(gm.state().clone());
         assert!(mgr.get_permanent_stake(&staker).unwrap().is_none());
-        let acct = gm.state_db().get_account(&staker).unwrap().unwrap();
+        let acct = gm.state().get_account(&staker).unwrap().unwrap();
         assert_eq!(acct.balance, wei_gov(5000));
     }
 
@@ -1653,7 +1601,7 @@ mod tests {
         assert_eq!(outcome, ProposalOutcome::Rejected(id));
 
         // Permanent stake unchanged.
-        let mgr = crate::staking::StakingManager::new(gm.state_db().clone());
+        let mgr = crate::staking::StakingManager::new(gm.state().clone());
         let info = mgr.get_permanent_stake(&staker).unwrap().unwrap();
         assert_eq!(info.amount, wei_gov(5000));
     }
@@ -1698,7 +1646,7 @@ mod tests {
         let staker = addr(10);
         give_permanent_stake(&gm, staker, wei_gov(10000));
 
-        let mgr = crate::staking::StakingManager::new(gm.state_db().clone());
+        let mgr = crate::staking::StakingManager::new(gm.state().clone());
         mgr.governance_unlock_permanent_stake(staker, wei_gov(3000))
             .unwrap();
 
@@ -1707,7 +1655,7 @@ mod tests {
         assert_eq!(info.amount, wei_gov(7000));
 
         // Unlocked amount credited to balance.
-        let acct = gm.state_db().get_account(&staker).unwrap().unwrap();
+        let acct = gm.state().get_account(&staker).unwrap().unwrap();
         assert_eq!(acct.balance, wei_gov(3000));
     }
 
@@ -1717,13 +1665,13 @@ mod tests {
         let staker = addr(10);
         give_permanent_stake(&gm, staker, wei_gov(5000));
 
-        let mgr = crate::staking::StakingManager::new(gm.state_db().clone());
+        let mgr = crate::staking::StakingManager::new(gm.state().clone());
         mgr.governance_unlock_permanent_stake(staker, wei_gov(5000))
             .unwrap();
 
         // Entry completely removed.
         assert!(mgr.get_permanent_stake(&staker).unwrap().is_none());
-        let acct = gm.state_db().get_account(&staker).unwrap().unwrap();
+        let acct = gm.state().get_account(&staker).unwrap().unwrap();
         assert_eq!(acct.balance, wei_gov(5000));
     }
 
@@ -1733,14 +1681,14 @@ mod tests {
         let staker = addr(10);
         give_permanent_stake(&gm, staker, wei_gov(5000));
 
-        let mgr = crate::staking::StakingManager::new(gm.state_db().clone());
+        let mgr = crate::staking::StakingManager::new(gm.state().clone());
         mgr.credit_rewards(staker, wei_gov(200)).unwrap();
 
         mgr.governance_unlock_permanent_stake(staker, wei_gov(5000))
             .unwrap();
 
         // Balance = principal (5000) + accrued rewards (200).
-        let acct = gm.state_db().get_account(&staker).unwrap().unwrap();
+        let acct = gm.state().get_account(&staker).unwrap().unwrap();
         assert_eq!(acct.balance, wei_gov(5200));
 
         // Rewards entry cleared.
@@ -1752,7 +1700,7 @@ mod tests {
         let (_dir, gm) = setup_unlock();
         let staker = addr(10);
 
-        let mgr = crate::staking::StakingManager::new(gm.state_db().clone());
+        let mgr = crate::staking::StakingManager::new(gm.state().clone());
         let result = mgr.governance_unlock_permanent_stake(staker, wei_gov(1000));
         assert!(matches!(
             result,
@@ -1766,7 +1714,7 @@ mod tests {
         let staker = addr(10);
         give_permanent_stake(&gm, staker, wei_gov(5000));
 
-        let mgr = crate::staking::StakingManager::new(gm.state_db().clone());
+        let mgr = crate::staking::StakingManager::new(gm.state().clone());
         let result = mgr.governance_unlock_permanent_stake(staker, wei_gov(6000));
         assert!(matches!(
             result,

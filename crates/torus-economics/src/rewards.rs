@@ -3,6 +3,7 @@
 use alloy_primitives::{Address, U256};
 use borsh::BorshDeserialize;
 use torus_state::cf::CF_TREASURY;
+use torus_state::StateBackend;
 
 use crate::staking::StakingManager;
 use crate::types::*;
@@ -20,8 +21,8 @@ impl RewardDistributor {
     /// 2. Burn portion is destroyed (no-op).
     /// 3. Validator share goes to proposer's delegators pro-rata (minus commission).
     /// 4. Treasury and dev_pool credited to configured addresses.
-    pub fn distribute_block_fees(
-        staking: &StakingManager,
+    pub fn distribute_block_fees<T: StateBackend>(
+        staking: &StakingManager<T>,
         proposer: Address,
         total_fees: U256,
         epoch: u64,
@@ -74,8 +75,8 @@ impl RewardDistributor {
     }
 
     /// Distribute the validator's fee share to their delegators pro-rata.
-    fn distribute_validator_share(
-        staking: &StakingManager,
+    fn distribute_validator_share<T: StateBackend>(
+        staking: &StakingManager<T>,
         proposer: &Address,
         validator_share: U256,
     ) -> Result<()> {
@@ -126,8 +127,8 @@ impl RewardDistributor {
 
     /// Distribute permanent staking rewards at epoch boundary.
     /// Rate = 500 bps (5% APY). Rewards are inflationary (minted).
-    pub fn distribute_permanent_staking_rewards(
-        staking: &StakingManager,
+    pub fn distribute_permanent_staking_rewards<T: StateBackend>(
+        staking: &StakingManager<T>,
         blocks_in_epoch: u64,
     ) -> Result<U256> {
         let all_stakes = staking.all_permanent_stakes()?;
@@ -161,8 +162,8 @@ impl RewardDistributor {
     /// Distribute validator staking inflation at epoch boundary.
     /// APY = 200 / sqrt(TotalActiveStaked_TRS). Rewards are inflationary (minted).
     /// Only active validators and their delegators receive rewards.
-    pub fn distribute_validator_inflation(
-        staking: &StakingManager,
+    pub fn distribute_validator_inflation<T: StateBackend>(
+        staking: &StakingManager<T>,
         epoch_length_blocks: u64,
     ) -> Result<U256> {
         let all = staking.all_validators()?;
@@ -309,9 +310,9 @@ pub(crate) fn isqrt(n: U256) -> U256 {
 /// Static key for cumulative validator inflation minted in CF_TREASURY.
 const VALIDATOR_INFLATION_KEY: &[u8] = b"validator_inflation_tracker";
 
-fn get_cumulative_validator_inflation(staking: &StakingManager) -> Result<U256> {
+fn get_cumulative_validator_inflation<T: StateBackend>(staking: &StakingManager<T>) -> Result<U256> {
     match staking
-        .state_db()
+        .state()
         .get_cf_raw(CF_TREASURY, VALIDATOR_INFLATION_KEY)?
     {
         Some(data) => {
@@ -324,9 +325,9 @@ fn get_cumulative_validator_inflation(staking: &StakingManager) -> Result<U256> 
     }
 }
 
-fn put_cumulative_validator_inflation(staking: &StakingManager, total: U256) -> Result<()> {
+fn put_cumulative_validator_inflation<T: StateBackend>(staking: &StakingManager<T>, total: U256) -> Result<()> {
     staking
-        .state_db()
+        .state()
         .put_cf_raw(CF_TREASURY, VALIDATOR_INFLATION_KEY, &total.to_be_bytes::<32>())?;
     Ok(())
 }
@@ -383,7 +384,7 @@ impl FeeSplitter {
 
     /// Burn tokens by deducting from the cumulative supply tracker.
     /// No balance is credited anywhere — tokens are destroyed.
-    pub fn execute_burn(staking: &StakingManager, amount: U256) -> Result<()> {
+    pub fn execute_burn<T: StateBackend>(staking: &StakingManager<T>, amount: U256) -> Result<()> {
         if amount.is_zero() {
             return Ok(());
         }
@@ -396,8 +397,8 @@ impl FeeSplitter {
 
     /// Distribute the validator portion of fees to the block proposer.
     /// Proposer keeps commission_rate; remaining goes to delegators pro-rata.
-    pub fn distribute_validator_rewards(
-        staking: &StakingManager,
+    pub fn distribute_validator_rewards<T: StateBackend>(
+        staking: &StakingManager<T>,
         proposer: &Address,
         amount: U256,
     ) -> Result<()> {
@@ -454,8 +455,8 @@ impl FeeSplitter {
     }
 
     /// Credit treasury address and update cumulative tracker.
-    pub fn credit_treasury(
-        staking: &StakingManager,
+    pub fn credit_treasury<T: StateBackend>(
+        staking: &StakingManager<T>,
         treasury_address: &Address,
         amount: U256,
     ) -> Result<()> {
@@ -470,9 +471,9 @@ impl FeeSplitter {
     }
 
     /// Get the supply tracker from CF_TREASURY.
-    pub fn get_supply_tracker(staking: &StakingManager) -> Result<SupplyTracker> {
+    pub fn get_supply_tracker<T: StateBackend>(staking: &StakingManager<T>) -> Result<SupplyTracker> {
         match staking
-            .state_db()
+            .state()
             .get_cf_raw(CF_TREASURY, SUPPLY_TRACKER_KEY)?
         {
             Some(data) => Ok(SupplyTracker::try_from_slice(&data)
@@ -484,10 +485,10 @@ impl FeeSplitter {
         }
     }
 
-    fn put_supply_tracker(staking: &StakingManager, tracker: &SupplyTracker) -> Result<()> {
+    fn put_supply_tracker<T: StateBackend>(staking: &StakingManager<T>, tracker: &SupplyTracker) -> Result<()> {
         let data = borsh::to_vec(tracker).map_err(|e| EconomicsError::Borsh(e.to_string()))?;
         staking
-            .state_db()
+            .state()
             .put_cf_raw(CF_TREASURY, SUPPLY_TRACKER_KEY, &data)?;
         Ok(())
     }
@@ -515,7 +516,7 @@ mod tests {
             balance: amount,
             ..Default::default()
         };
-        mgr.state_db().put_account(a, &info).unwrap();
+        mgr.state().put_account(a, &info).unwrap();
     }
 
     fn wei(tokens: u64) -> U256 {
@@ -604,13 +605,13 @@ mod tests {
             .unwrap();
 
         let treasury_bal = mgr
-            .state_db()
+            .state()
             .get_account(&treasury)
             .unwrap()
             .unwrap()
             .balance;
         let dev_pool_bal = mgr
-            .state_db()
+            .state()
             .get_account(&dev_pool)
             .unwrap()
             .unwrap()
@@ -679,7 +680,7 @@ mod tests {
 
         // Staker balance = 50k remaining + minted rewards.
         let bal = mgr
-            .state_db()
+            .state()
             .get_account(&staker)
             .unwrap()
             .unwrap()

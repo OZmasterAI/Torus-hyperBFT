@@ -9,7 +9,7 @@ use torus_state::cf::{
     CF_CONSENSUS_META, CF_JAIL_VOTES, CF_SLASH_RECORDS, CF_STAKING_DELEGATIONS,
     CF_STAKING_PERMANENT, CF_STAKING_REWARDS, CF_STAKING_VALIDATORS,
 };
-use torus_state::StateDb;
+use torus_state::{StateBackend, StateDb};
 
 use crate::rewards::FeeSplitter;
 
@@ -21,17 +21,17 @@ type Result<T> = std::result::Result<T, EconomicsError>;
 /// Manages validator registration, delegation, undelegation, permanent staking,
 /// and reward claiming against the RocksDB staking column families.
 #[derive(Clone)]
-pub struct StakingManager {
-    state_db: StateDb,
+pub struct StakingManager<T: StateBackend = StateDb> {
+    state: T,
 }
 
-impl StakingManager {
-    pub fn new(state_db: StateDb) -> Self {
-        Self { state_db }
+impl<T: StateBackend> StakingManager<T> {
+    pub fn new(state: T) -> Self {
+        Self { state }
     }
 
-    pub fn state_db(&self) -> &StateDb {
-        &self.state_db
+    pub fn state(&self) -> &T {
+        &self.state
     }
 
     // ========================================================================
@@ -543,7 +543,7 @@ impl StakingManager {
             block_height: current_block,
         };
         let data = borsh::to_vec(&vote).map_err(|e| EconomicsError::Borsh(e.to_string()))?;
-        self.state_db.put_cf_raw(CF_JAIL_VOTES, &vkey, &data)?;
+        self.state.put_cf_raw(CF_JAIL_VOTES, &vkey, &data)?;
 
         // Tally all non-expired votes for this target
         let total_vote_weight = self.tally_jail_votes(&target, current_block)?;
@@ -564,29 +564,17 @@ impl StakingManager {
 
     /// Tally non-expired jail votes for a target. Cleans up expired votes.
     fn tally_jail_votes(&self, target: &Address, current_block: u64) -> Result<U256> {
-        let db = self.state_db.inner();
-        let cf = db.cf_handle(CF_JAIL_VOTES).ok_or_else(|| {
-            EconomicsError::State(torus_state::StateError::MissingColumnFamily(
-                CF_JAIL_VOTES.to_string(),
-            ))
-        })?;
-
         let prefix = target.as_slice();
-        let iter = db.prefix_iterator_cf(cf, prefix);
+        let entries = self.state.iterate_cf(CF_JAIL_VOTES, Some(prefix))?;
         let mut total_weight = U256::ZERO;
         let mut expired_keys = Vec::new();
 
-        for item in iter {
-            let (key, value) =
-                item.map_err(|e| EconomicsError::State(torus_state::StateError::RocksDb(e)))?;
-            if !key.starts_with(prefix) {
-                break;
-            }
-            let vote = JailVoteRecord::try_from_slice(&value)
+        for (key, value) in &entries {
+            let vote = JailVoteRecord::try_from_slice(value)
                 .map_err(|e| EconomicsError::Borsh(e.to_string()))?;
 
             if current_block > vote.block_height + JAIL_VOTE_EXPIRY_BLOCKS {
-                expired_keys.push(key.to_vec());
+                expired_keys.push(key.clone());
                 continue;
             }
 
@@ -600,7 +588,7 @@ impl StakingManager {
 
         // Clean up expired votes
         for key in &expired_keys {
-            self.state_db.delete_cf_raw(CF_JAIL_VOTES, key)?;
+            self.state.delete_cf_raw(CF_JAIL_VOTES, key)?;
         }
 
         Ok(total_weight)
@@ -618,28 +606,11 @@ impl StakingManager {
 
     /// Clear all jail votes targeting a validator (called on unjail).
     pub fn clear_jail_votes(&self, target: &Address) -> Result<()> {
-        let db = self.state_db.inner();
-        let cf = db.cf_handle(CF_JAIL_VOTES).ok_or_else(|| {
-            EconomicsError::State(torus_state::StateError::MissingColumnFamily(
-                CF_JAIL_VOTES.to_string(),
-            ))
-        })?;
-
         let prefix = target.as_slice();
-        let iter = db.prefix_iterator_cf(cf, prefix);
-        let mut keys = Vec::new();
+        let entries = self.state.iterate_cf(CF_JAIL_VOTES, Some(prefix))?;
 
-        for item in iter {
-            let (key, _) =
-                item.map_err(|e| EconomicsError::State(torus_state::StateError::RocksDb(e)))?;
-            if !key.starts_with(prefix) {
-                break;
-            }
-            keys.push(key.to_vec());
-        }
-
-        for key in &keys {
-            self.state_db.delete_cf_raw(CF_JAIL_VOTES, key)?;
+        for (key, _) in &entries {
+            self.state.delete_cf_raw(CF_JAIL_VOTES, key)?;
         }
 
         Ok(())
@@ -727,7 +698,7 @@ impl StakingManager {
     ) -> Result<()> {
         let key = slash_record_key(validator, block_height);
         let data = borsh::to_vec(record).map_err(|e| EconomicsError::Borsh(e.to_string()))?;
-        self.state_db
+        self.state
             .put_cf_raw(CF_SLASH_RECORDS, &key, &data)?;
         Ok(())
     }
@@ -738,7 +709,7 @@ impl StakingManager {
 
     pub fn get_validator(&self, address: &Address) -> Result<Option<ValidatorState>> {
         match self
-            .state_db
+            .state
             .get_cf_raw(CF_STAKING_VALIDATORS, address.as_slice())?
         {
             Some(data) => Ok(Some(
@@ -751,13 +722,13 @@ impl StakingManager {
 
     pub fn put_validator(&self, address: &Address, state: &ValidatorState) -> Result<()> {
         let data = borsh::to_vec(state).map_err(|e| EconomicsError::Borsh(e.to_string()))?;
-        self.state_db
+        self.state
             .put_cf_raw(CF_STAKING_VALIDATORS, address.as_slice(), &data)?;
         Ok(())
     }
 
     fn get_delegation_raw(&self, key: &[u8; 40]) -> Result<Option<Delegation>> {
-        match self.state_db.get_cf_raw(CF_STAKING_DELEGATIONS, key)? {
+        match self.state.get_cf_raw(CF_STAKING_DELEGATIONS, key)? {
             Some(data) => Ok(Some(
                 Delegation::try_from_slice(&data)
                     .map_err(|e| EconomicsError::Borsh(e.to_string()))?,
@@ -768,19 +739,19 @@ impl StakingManager {
 
     fn put_delegation_raw(&self, key: &[u8; 40], delegation: &Delegation) -> Result<()> {
         let data = borsh::to_vec(delegation).map_err(|e| EconomicsError::Borsh(e.to_string()))?;
-        self.state_db
+        self.state
             .put_cf_raw(CF_STAKING_DELEGATIONS, key, &data)?;
         Ok(())
     }
 
     fn delete_delegation_raw(&self, key: &[u8; 40]) -> Result<()> {
-        self.state_db.delete_cf_raw(CF_STAKING_DELEGATIONS, key)?;
+        self.state.delete_cf_raw(CF_STAKING_DELEGATIONS, key)?;
         Ok(())
     }
 
     pub fn get_permanent_stake(&self, address: &Address) -> Result<Option<PermanentStakeInfo>> {
         match self
-            .state_db
+            .state
             .get_cf_raw(CF_STAKING_PERMANENT, address.as_slice())?
         {
             Some(data) => Ok(Some(
@@ -793,20 +764,20 @@ impl StakingManager {
 
     fn put_permanent_stake(&self, address: &Address, info: &PermanentStakeInfo) -> Result<()> {
         let data = borsh::to_vec(info).map_err(|e| EconomicsError::Borsh(e.to_string()))?;
-        self.state_db
+        self.state
             .put_cf_raw(CF_STAKING_PERMANENT, address.as_slice(), &data)?;
         Ok(())
     }
 
     fn delete_permanent_stake(&self, address: &Address) -> Result<()> {
-        self.state_db
+        self.state
             .delete_cf_raw(CF_STAKING_PERMANENT, address.as_slice())?;
         Ok(())
     }
 
     pub fn get_pending_rewards(&self, address: &Address) -> Result<Option<PendingRewards>> {
         match self
-            .state_db
+            .state
             .get_cf_raw(CF_STAKING_REWARDS, address.as_slice())?
         {
             Some(data) => Ok(Some(
@@ -826,13 +797,13 @@ impl StakingManager {
             });
         rewards.amount += amount;
         let data = borsh::to_vec(&rewards).map_err(|e| EconomicsError::Borsh(e.to_string()))?;
-        self.state_db
+        self.state
             .put_cf_raw(CF_STAKING_REWARDS, address.as_slice(), &data)?;
         Ok(())
     }
 
     fn delete_pending_rewards(&self, address: &Address) -> Result<()> {
-        self.state_db
+        self.state
             .delete_cf_raw(CF_STAKING_REWARDS, address.as_slice())?;
         Ok(())
     }
@@ -842,7 +813,7 @@ impl StakingManager {
     // ========================================================================
 
     fn debit_balance(&self, address: &Address, amount: U256) -> Result<()> {
-        let mut account = self.state_db.get_account(address)?.unwrap_or_default();
+        let mut account = self.state.get_account(address)?.unwrap_or_default();
 
         if account.balance < amount {
             return Err(EconomicsError::InsufficientBalance {
@@ -851,14 +822,14 @@ impl StakingManager {
             });
         }
         account.balance -= amount;
-        self.state_db.put_account(address, &account)?;
+        self.state.put_account(address, &account)?;
         Ok(())
     }
 
     pub fn credit_balance(&self, address: &Address, amount: U256) -> Result<()> {
-        let mut account = self.state_db.get_account(address)?.unwrap_or_default();
+        let mut account = self.state.get_account(address)?.unwrap_or_default();
         account.balance += amount;
-        self.state_db.put_account(address, &account)?;
+        self.state.put_account(address, &account)?;
         Ok(())
     }
 
@@ -868,18 +839,10 @@ impl StakingManager {
 
     /// Read all validators from CF_STAKING_VALIDATORS.
     pub fn all_validators(&self) -> Result<Vec<ValidatorState>> {
-        let db = self.state_db.inner();
-        let cf = db.cf_handle(CF_STAKING_VALIDATORS).ok_or_else(|| {
-            EconomicsError::State(torus_state::StateError::MissingColumnFamily(
-                CF_STAKING_VALIDATORS.to_string(),
-            ))
-        })?;
-        let iter = db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+        let entries = self.state.iterate_cf(CF_STAKING_VALIDATORS, None)?;
         let mut validators = Vec::new();
-        for item in iter {
-            let (_key, value) =
-                item.map_err(|e| EconomicsError::State(torus_state::StateError::RocksDb(e)))?;
-            let state = ValidatorState::try_from_slice(&value)
+        for (_key, value) in &entries {
+            let state = ValidatorState::try_from_slice(value)
                 .map_err(|e| EconomicsError::Borsh(e.to_string()))?;
             validators.push(state);
         }
@@ -895,22 +858,10 @@ impl StakingManager {
 
     /// Read all delegations for a specific delegator (prefix scan on delegator address).
     pub fn delegations_for_delegator(&self, delegator: &Address) -> Result<Vec<Delegation>> {
-        let db = self.state_db.inner();
-        let cf = db.cf_handle(CF_STAKING_DELEGATIONS).ok_or_else(|| {
-            EconomicsError::State(torus_state::StateError::MissingColumnFamily(
-                CF_STAKING_DELEGATIONS.to_string(),
-            ))
-        })?;
-        let prefix = delegator.as_slice();
-        let iter = db.prefix_iterator_cf(cf, prefix);
+        let entries = self.state.iterate_cf(CF_STAKING_DELEGATIONS, Some(delegator.as_slice()))?;
         let mut delegations = Vec::new();
-        for item in iter {
-            let (key, value) =
-                item.map_err(|e| EconomicsError::State(torus_state::StateError::RocksDb(e)))?;
-            if !key.starts_with(prefix) {
-                break;
-            }
-            let delegation = Delegation::try_from_slice(&value)
+        for (_key, value) in &entries {
+            let delegation = Delegation::try_from_slice(value)
                 .map_err(|e| EconomicsError::Borsh(e.to_string()))?;
             delegations.push(delegation);
         }
@@ -924,20 +875,12 @@ impl StakingManager {
     /// A secondary index would fix this but requires schema migration. Acceptable
     /// for now: only called during slashing, not on the per-block hot path.
     pub fn delegations_for_validator(&self, validator: &Address) -> Result<Vec<Delegation>> {
-        let db = self.state_db.inner();
-        let cf = db.cf_handle(CF_STAKING_DELEGATIONS).ok_or_else(|| {
-            EconomicsError::State(torus_state::StateError::MissingColumnFamily(
-                CF_STAKING_DELEGATIONS.to_string(),
-            ))
-        })?;
-        let iter = db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+        let entries = self.state.iterate_cf(CF_STAKING_DELEGATIONS, None)?;
         let mut delegations = Vec::new();
-        for item in iter {
-            let (key, value) =
-                item.map_err(|e| EconomicsError::State(torus_state::StateError::RocksDb(e)))?;
+        for (key, value) in &entries {
             // Key is delegator(20) ++ validator(20). Check the validator suffix.
             if key.len() == 40 && &key[20..] == validator.as_slice() {
-                let delegation = Delegation::try_from_slice(&value)
+                let delegation = Delegation::try_from_slice(value)
                     .map_err(|e| EconomicsError::Borsh(e.to_string()))?;
                 delegations.push(delegation);
             }
@@ -1043,7 +986,7 @@ impl StakingManager {
     /// Get a pending key rotation for a validator.
     pub fn get_pending_rotation(&self, addr: &Address) -> Result<Option<PendingKeyRotation>> {
         let key = pending_rotation_key(addr);
-        match self.state_db.get_cf_raw(CF_CONSENSUS_META, &key)? {
+        match self.state.get_cf_raw(CF_CONSENSUS_META, &key)? {
             Some(data) => Ok(Some(
                 PendingKeyRotation::try_from_slice(&data)
                     .map_err(|e| EconomicsError::Borsh(e.to_string()))?,
@@ -1055,33 +998,22 @@ impl StakingManager {
     fn put_pending_rotation(&self, addr: &Address, rotation: &PendingKeyRotation) -> Result<()> {
         let key = pending_rotation_key(addr);
         let data = borsh::to_vec(rotation).map_err(|e| EconomicsError::Borsh(e.to_string()))?;
-        self.state_db.put_cf_raw(CF_CONSENSUS_META, &key, &data)?;
+        self.state.put_cf_raw(CF_CONSENSUS_META, &key, &data)?;
         Ok(())
     }
 
     fn delete_pending_rotation(&self, addr: &Address) -> Result<()> {
         let key = pending_rotation_key(addr);
-        self.state_db.delete_cf_raw(CF_CONSENSUS_META, &key)?;
+        self.state.delete_cf_raw(CF_CONSENSUS_META, &key)?;
         Ok(())
     }
 
     fn all_pending_rotations(&self) -> Result<Vec<PendingKeyRotation>> {
-        let db = self.state_db.inner();
-        let cf = db.cf_handle(CF_CONSENSUS_META).ok_or_else(|| {
-            EconomicsError::State(torus_state::StateError::MissingColumnFamily(
-                CF_CONSENSUS_META.to_string(),
-            ))
-        })?;
         let prefix = b"pending_rotation:";
-        let iter = db.prefix_iterator_cf(cf, prefix);
+        let entries = self.state.iterate_cf(CF_CONSENSUS_META, Some(prefix))?;
         let mut rotations = Vec::new();
-        for item in iter {
-            let (key, value) =
-                item.map_err(|e| EconomicsError::State(torus_state::StateError::RocksDb(e)))?;
-            if !key.starts_with(prefix) {
-                break;
-            }
-            let rotation = PendingKeyRotation::try_from_slice(&value)
+        for (_key, value) in &entries {
+            let rotation = PendingKeyRotation::try_from_slice(value)
                 .map_err(|e| EconomicsError::Borsh(e.to_string()))?;
             rotations.push(rotation);
         }
@@ -1090,18 +1022,10 @@ impl StakingManager {
 
     /// Read all permanent stakes (full scan).
     pub fn all_permanent_stakes(&self) -> Result<Vec<PermanentStakeInfo>> {
-        let db = self.state_db.inner();
-        let cf = db.cf_handle(CF_STAKING_PERMANENT).ok_or_else(|| {
-            EconomicsError::State(torus_state::StateError::MissingColumnFamily(
-                CF_STAKING_PERMANENT.to_string(),
-            ))
-        })?;
-        let iter = db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+        let entries = self.state.iterate_cf(CF_STAKING_PERMANENT, None)?;
         let mut stakes = Vec::new();
-        for item in iter {
-            let (_key, value) =
-                item.map_err(|e| EconomicsError::State(torus_state::StateError::RocksDb(e)))?;
-            let info = PermanentStakeInfo::try_from_slice(&value)
+        for (_key, value) in &entries {
+            let info = PermanentStakeInfo::try_from_slice(value)
                 .map_err(|e| EconomicsError::Borsh(e.to_string()))?;
             stakes.push(info);
         }
@@ -1166,7 +1090,7 @@ mod tests {
             balance: amount,
             ..Default::default()
         };
-        mgr.state_db().put_account(addr, &info).unwrap();
+        mgr.state().put_account(addr, &info).unwrap();
     }
 
     fn addr(n: u8) -> Address {
@@ -1207,7 +1131,7 @@ mod tests {
         assert_eq!(val.total_delegated, del_amount);
 
         // Check delegator balance was debited.
-        let acct = mgr.state_db().get_account(&delegator).unwrap().unwrap();
+        let acct = mgr.state().get_account(&delegator).unwrap().unwrap();
         assert_eq!(
             acct.balance,
             U256::from(4_000u64) * U256::from(10u64).pow(U256::from(18u64))
@@ -1294,7 +1218,7 @@ mod tests {
         assert_eq!(info.locked_at_block, 100);
 
         // Balance reduced.
-        let acct = mgr.state_db().get_account(&staker).unwrap().unwrap();
+        let acct = mgr.state().get_account(&staker).unwrap().unwrap();
         assert_eq!(acct.balance, balance - stake_amount);
     }
 
@@ -1313,7 +1237,7 @@ mod tests {
         assert_eq!(claimed, reward);
 
         // Balance should be credited.
-        let acct = mgr.state_db().get_account(&user).unwrap().unwrap();
+        let acct = mgr.state().get_account(&user).unwrap().unwrap();
         assert_eq!(acct.balance, reward);
 
         // Claiming again should fail.

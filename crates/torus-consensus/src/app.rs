@@ -27,7 +27,7 @@ use torus_evm::{EvmExecutor, TORUS_CHAIN_ID};
 use torus_state::cf::{
     CF_BLOCK_BODIES, CF_BLOCK_HEADERS, CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT,
 };
-use torus_state::{StateDb, StateOverlay};
+use torus_state::{NativeStateOverlay, StateBackend, StateDb, StateOverlay};
 use torus_types::{
     Address, ChainConfig, NativeAction, TorusBlock, TorusBlockBody, TorusBlockHeader, ValidatorSet,
 };
@@ -35,6 +35,7 @@ use torus_types::{
 /// Pending EVM execution result stored until consensus commits the block.
 struct PendingExec {
     bundle: BundleState,
+    native_overlay: Option<NativeStateOverlay>,
     parent_hash: Option<CryptoHash>,
     height: u64,
 }
@@ -552,6 +553,12 @@ impl TorusApp {
                 ) {
                     tracing::error!(%e, "failed to flush pending EVM bundle");
                 }
+                // Flush native overlay (native execution changes)
+                if let Some(ref overlay) = pending.native_overlay {
+                    if let Err(e) = overlay.flush(&self.state_db) {
+                        tracing::error!(%e, "failed to flush native overlay");
+                    }
+                }
             }
         }
 
@@ -559,6 +566,7 @@ impl TorusApp {
         if flush_height > self.evm_committed_height {
             self.evm_committed_height = flush_height;
         }
+        self.write_native_applied_height(flush_height);
 
         // Prune orphaned fork bundles (height <= committed height).
         self.pending_bundles.retain(|_, p| p.height > flush_height);
@@ -606,6 +614,55 @@ impl TorusApp {
             );
         }
         Ok(())
+    }
+
+    /// Run native execution on a NativeStateOverlay seeded with EVM bundle
+    /// account changes. All writes go to the overlay, NOT to state_db.
+    fn execute_native_on_overlay(
+        &self,
+        block: &TorusBlock,
+        sender_actions: Vec<(Address, NativeAction)>,
+        consumed_nonces: Vec<(Address, u64)>,
+        bundle: &BundleState,
+    ) -> Result<NativeStateOverlay, BridgeError> {
+        let overlay = NativeStateOverlay::new(self.state_db.clone());
+        overlay.seed_from_bundle(bundle);
+
+        let (pre_evm, post_evm) = sort_native_actions(&sender_actions);
+        let mut ctx = NativeExecContext::new(
+            overlay.clone(),
+            block.header.height,
+            block.header.timestamp,
+            block.header.epoch,
+            self.epoch_length,
+            self.max_validators,
+            block.header.proposer,
+            self.treasury_address,
+            self.dev_pool_address,
+        );
+        ctx.metrics = self.metrics.clone();
+
+        NativeExecutor::execute_batch(&mut ctx, &pre_evm);
+        NativeExecutor::execute_batch(&mut ctx, &post_evm);
+        NativeExecutor::drain_core_writer(&mut ctx)?;
+        NativeExecutor::process_governance(&mut ctx);
+        NativeExecutor::distribute_fees(&mut ctx, block.header.evm_fee_revenue);
+        NativeExecutor::process_epoch_boundary(&mut ctx);
+        ctx.save_order_books();
+
+        // Write consumed nonces to overlay
+        for (sender, nonce) in &consumed_nonces {
+            let mut nonce_key = [0u8; 28];
+            nonce_key[..20].copy_from_slice(sender.as_slice());
+            nonce_key[20..28].copy_from_slice(&nonce.to_be_bytes());
+            let _ = overlay.put_cf_raw(
+                torus_state::cf::CF_NATIVE_NONCES,
+                &nonce_key,
+                &block.header.height.to_be_bytes(),
+            );
+        }
+
+        Ok(overlay)
     }
 
     fn do_validate(
@@ -828,41 +885,57 @@ impl TorusApp {
                             "validated block (EVM state deferred)"
                         );
 
-                        // Store the EVM bundle for deferred flush.
                         let block_crypto_hash = block.hash;
-                        self.pending_bundles.insert(block_crypto_hash, PendingExec {
-                            bundle: validated.bundle,
-                            parent_hash,
-                            height: torus_block.header.height,
-                        });
 
-                        // If parent is NOT pending (i.e. its state is in state_db),
-                        // we can flush this block immediately since it extends
-                        // the committed chain — fast path for the linear case.
-                        if !use_overlay {
-                            if let Some(pending) = self.pending_bundles.remove(&block_crypto_hash) {
-                                if let Err(e) = BlockCommitter::commit_pending_bundle(
-                                    &self.state_db,
-                                    &pending.bundle,
+                        if use_overlay {
+                            // Fork case: defer BOTH EVM + native via overlay to
+                            // prevent fork siblings from corrupting shared state_db.
+                            let native_overlay = if has_native || torus_block.header.evm_fee_revenue > 0 {
+                                match self.execute_native_on_overlay(
+                                    &torus_block,
+                                    validated.native_sender_actions,
+                                    validated.native_consumed_nonces,
+                                    &validated.bundle,
                                 ) {
-                                    tracing::error!(%e, "failed to flush EVM bundle (fast path)");
+                                    Ok(ov) => Some(ov),
+                                    Err(e) => {
+                                        tracing::error!(%e, "native overlay execution failed");
+                                        None
+                                    }
                                 }
-                                self.state_db_tip = Some(block_crypto_hash);
-                                self.evm_committed_height = torus_block.header.height;
-                            }
-                        }
+                            } else {
+                                None
+                            };
 
-                        if has_native || torus_block.header.evm_fee_revenue > 0 {
-                            match self.execute_native_post_commit(
-                                &torus_block,
-                                validated.native_sender_actions,
-                                validated.native_consumed_nonces,
-                            ) {
-                                Ok(()) => self.write_native_applied_height(torus_block.header.height),
-                                Err(e) => tracing::error!(%e, "native post-commit execution failed"),
-                            }
+                            self.pending_bundles.insert(block_crypto_hash, PendingExec {
+                                bundle: validated.bundle,
+                                native_overlay,
+                                parent_hash,
+                                height: torus_block.header.height,
+                            });
                         } else {
-                            self.write_native_applied_height(torus_block.header.height);
+                            // Linear case: no fork siblings, safe to commit immediately.
+                            if let Err(e) = BlockCommitter::commit_pending_bundle(
+                                &self.state_db,
+                                &validated.bundle,
+                            ) {
+                                tracing::error!(%e, "failed to flush EVM bundle");
+                            }
+                            self.state_db_tip = Some(block_crypto_hash);
+                            self.evm_committed_height = torus_block.header.height;
+
+                            if has_native || torus_block.header.evm_fee_revenue > 0 {
+                                match self.execute_native_post_commit(
+                                    &torus_block,
+                                    validated.native_sender_actions,
+                                    validated.native_consumed_nonces,
+                                ) {
+                                    Ok(()) => self.write_native_applied_height(torus_block.header.height),
+                                    Err(e) => tracing::error!(%e, "native post-commit execution failed"),
+                                }
+                            } else {
+                                self.write_native_applied_height(torus_block.header.height);
+                            }
                         }
                     }
                     Err(e) => {

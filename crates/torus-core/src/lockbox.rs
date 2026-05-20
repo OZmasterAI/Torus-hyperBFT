@@ -8,9 +8,8 @@
 //! individual writes could previously cause permanent fund loss or duplication.
 
 use borsh::BorshDeserialize;
-use rocksdb::WriteBatch;
 use torus_state::cf::{CF_ACCOUNTS, CF_NATIVE_BALANCES};
-use torus_state::StateDb;
+use torus_state::{AtomicWriteOp, StateBackend};
 use torus_types::{Address, FixedPoint, U256};
 
 use crate::error::CoreError;
@@ -31,7 +30,7 @@ impl Lockbox {
     /// Debits msg.sender's EVM balance, credits their native balance.
     /// Both sides use the same 8-decimal FixedPoint denomination.
     pub fn deposit_to_native(
-        state_db: &StateDb,
+        state: &impl StateBackend,
         trader: &Address,
         amount: FixedPoint,
     ) -> Result<(), CoreError> {
@@ -42,7 +41,7 @@ impl Lockbox {
         let evm_amount = fp_to_u256(amount);
 
         // Read and verify EVM balance
-        let evm_balance = get_evm_balance(state_db, trader)?;
+        let evm_balance = get_evm_balance(state, trader)?;
         if evm_balance < evm_amount {
             return Err(CoreError::InsufficientEvmBalance {
                 have: evm_balance,
@@ -51,21 +50,17 @@ impl Lockbox {
         }
 
         // Credit native balance
-        let mut native_bal = get_native_balance(state_db, trader)?;
+        let mut native_bal = get_native_balance(state, trader)?;
         native_bal.available = native_bal.available + amount;
 
-        // Atomic write: debit EVM + credit native in one WriteBatch.
-        let mut batch = WriteBatch::default();
-        let cf_accounts = state_db.cf_handle(CF_ACCOUNTS)?;
-        let cf_native = state_db.cf_handle(CF_NATIVE_BALANCES)?;
-
-        let evm_data = build_evm_balance_update(state_db, trader, evm_balance - evm_amount)?;
-        batch.put_cf(cf_accounts, trader.as_slice(), &evm_data);
-
+        // Atomic write: debit EVM + credit native.
+        let evm_data = build_evm_balance_update(state, trader, evm_balance - evm_amount)?;
         let native_data = borsh::to_vec(&native_bal).map_err(|e| CoreError::Borsh(e.to_string()))?;
-        batch.put_cf(cf_native, trader.as_slice(), &native_data);
 
-        state_db.write(batch)?;
+        state.atomic_write(&[
+            AtomicWriteOp::Put { cf: CF_ACCOUNTS, key: trader.as_slice(), value: &evm_data },
+            AtomicWriteOp::Put { cf: CF_NATIVE_BALANCES, key: trader.as_slice(), value: &native_data },
+        ])?;
         Ok(())
     }
 
@@ -73,7 +68,7 @@ impl Lockbox {
     ///
     /// Debits native balance, credits EVM balance.
     pub fn withdraw_from_native(
-        state_db: &StateDb,
+        state: &impl StateBackend,
         trader: &Address,
         amount: FixedPoint,
     ) -> Result<(), CoreError> {
@@ -82,7 +77,7 @@ impl Lockbox {
         }
 
         // Read and verify native balance
-        let native_bal = get_native_balance(state_db, trader)?;
+        let native_bal = get_native_balance(state, trader)?;
         if native_bal.available < amount {
             return Err(CoreError::InsufficientNativeBalance {
                 have: native_bal.available,
@@ -96,21 +91,17 @@ impl Lockbox {
 
         // Credit EVM balance
         let evm_amount = fp_to_u256(amount);
-        let evm_balance = get_evm_balance(state_db, trader)?;
+        let evm_balance = get_evm_balance(state, trader)?;
 
-        // Atomic write: debit native + credit EVM in one WriteBatch.
-        let mut batch = WriteBatch::default();
-        let cf_accounts = state_db.cf_handle(CF_ACCOUNTS)?;
-        let cf_native = state_db.cf_handle(CF_NATIVE_BALANCES)?;
-
+        // Atomic write: debit native + credit EVM.
         let native_data =
             borsh::to_vec(&updated_bal).map_err(|e| CoreError::Borsh(e.to_string()))?;
-        batch.put_cf(cf_native, trader.as_slice(), &native_data);
+        let evm_data = build_evm_balance_update(state, trader, evm_balance + evm_amount)?;
 
-        let evm_data = build_evm_balance_update(state_db, trader, evm_balance + evm_amount)?;
-        batch.put_cf(cf_accounts, trader.as_slice(), &evm_data);
-
-        state_db.write(batch)?;
+        state.atomic_write(&[
+            AtomicWriteOp::Put { cf: CF_NATIVE_BALANCES, key: trader.as_slice(), value: &native_data },
+            AtomicWriteOp::Put { cf: CF_ACCOUNTS, key: trader.as_slice(), value: &evm_data },
+        ])?;
         Ok(())
     }
 
@@ -119,7 +110,7 @@ impl Lockbox {
     /// Debits `sender`'s native balance, credits `to`'s EVM balance.
     /// When `to == sender`, this is equivalent to `withdraw_from_native`.
     pub fn withdraw_from_native_to(
-        state_db: &StateDb,
+        state: &impl StateBackend,
         sender: &Address,
         to: &Address,
         amount: FixedPoint,
@@ -129,7 +120,7 @@ impl Lockbox {
         }
 
         // Read and verify sender's native balance
-        let native_bal = get_native_balance(state_db, sender)?;
+        let native_bal = get_native_balance(state, sender)?;
         if native_bal.available < amount {
             return Err(CoreError::InsufficientNativeBalance {
                 have: native_bal.available,
@@ -143,21 +134,17 @@ impl Lockbox {
 
         // Credit recipient's EVM balance
         let evm_amount = fp_to_u256(amount);
-        let evm_balance = get_evm_balance(state_db, to)?;
+        let evm_balance = get_evm_balance(state, to)?;
 
-        // Atomic write: debit sender native + credit recipient EVM in one WriteBatch.
-        let mut batch = WriteBatch::default();
-        let cf_accounts = state_db.cf_handle(CF_ACCOUNTS)?;
-        let cf_native = state_db.cf_handle(CF_NATIVE_BALANCES)?;
-
+        // Atomic write: debit sender native + credit recipient EVM.
         let native_data =
             borsh::to_vec(&updated_bal).map_err(|e| CoreError::Borsh(e.to_string()))?;
-        batch.put_cf(cf_native, sender.as_slice(), &native_data);
+        let evm_data = build_evm_balance_update(state, to, evm_balance + evm_amount)?;
 
-        let evm_data = build_evm_balance_update(state_db, to, evm_balance + evm_amount)?;
-        batch.put_cf(cf_accounts, to.as_slice(), &evm_data);
-
-        state_db.write(batch)?;
+        state.atomic_write(&[
+            AtomicWriteOp::Put { cf: CF_NATIVE_BALANCES, key: sender.as_slice(), value: &native_data },
+            AtomicWriteOp::Put { cf: CF_ACCOUNTS, key: to.as_slice(), value: &evm_data },
+        ])?;
         Ok(())
     }
 }
@@ -167,8 +154,8 @@ impl Lockbox {
 // ============================================================================
 
 /// Read EVM balance from CF_ACCOUNTS (first 32 bytes of the 72-byte account record).
-fn get_evm_balance(state_db: &StateDb, address: &Address) -> Result<U256, CoreError> {
-    match state_db.get_cf_raw(CF_ACCOUNTS, address.as_slice())? {
+fn get_evm_balance(state: &impl StateBackend, address: &Address) -> Result<U256, CoreError> {
+    match state.get_cf_raw(CF_ACCOUNTS, address.as_slice())? {
         Some(data) if data.len() >= 32 => Ok(U256::from_be_slice(&data[..32])),
         _ => Ok(U256::ZERO),
     }
@@ -177,11 +164,11 @@ fn get_evm_balance(state_db: &StateDb, address: &Address) -> Result<U256, CoreEr
 /// Build a 72-byte EVM account record with the given balance, preserving nonce and code_hash.
 /// Creates the account record if it doesn't exist.
 fn build_evm_balance_update(
-    state_db: &StateDb,
+    state: &impl StateBackend,
     address: &Address,
     new_balance: U256,
 ) -> Result<Vec<u8>, CoreError> {
-    let mut data = match state_db.get_cf_raw(CF_ACCOUNTS, address.as_slice())? {
+    let mut data = match state.get_cf_raw(CF_ACCOUNTS, address.as_slice())? {
         Some(d) if d.len() == 72 => d,
         _ => {
             // New account: balance(32) + nonce(8, zero) + code_hash(32, KECCAK_EMPTY)
@@ -198,8 +185,8 @@ fn build_evm_balance_update(
 // Native balance helpers
 // ============================================================================
 
-fn get_native_balance(state_db: &StateDb, trader: &Address) -> Result<NativeBalance, CoreError> {
-    match state_db.get_cf_raw(CF_NATIVE_BALANCES, trader.as_slice())? {
+fn get_native_balance(state: &impl StateBackend, trader: &Address) -> Result<NativeBalance, CoreError> {
+    match state.get_cf_raw(CF_NATIVE_BALANCES, trader.as_slice())? {
         Some(data) => Ok(
             NativeBalance::try_from_slice(&data).map_err(|e| CoreError::Borsh(e.to_string()))?,
         ),

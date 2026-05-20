@@ -3,6 +3,7 @@
 //! Provides initial and maintenance margin checks at both order submission
 //! and match time (double-check). Uses margin tiers for leverage limits.
 
+use torus_state::StateBackend;
 use torus_types::{Address, FixedPoint, MarketId};
 
 use crate::error::CoreError;
@@ -87,7 +88,7 @@ impl MarginEngine {
     /// Check margin at order submission time.
     /// Returns Ok(()) if the trader has sufficient margin for the new order.
     pub fn check_initial_margin(
-        positions: &PositionManager,
+        positions: &PositionManager<impl StateBackend>,
         trader: &Address,
         _market_id: MarketId,
         _is_buy: bool,
@@ -150,7 +151,7 @@ impl MarginEngine {
     /// Double-check margin at match time. Same logic as initial but called during fill.
     /// If margin fails, the order should be cancelled (not executed).
     pub fn check_margin_at_match(
-        positions: &PositionManager,
+        positions: &PositionManager<impl StateBackend>,
         trader: &Address,
         market_id: MarketId,
         is_buy: bool,
@@ -178,7 +179,7 @@ impl MarginEngine {
 
     /// Compute cross-margin equity: balance + sum(unrealized PnL across all positions).
     pub fn cross_margin_equity(
-        positions: &PositionManager,
+        positions: &PositionManager<impl StateBackend>,
         trader: &Address,
         oracle_prices: &[(MarketId, FixedPoint)],
     ) -> Result<FixedPoint, CoreError> {
@@ -201,7 +202,7 @@ impl MarginEngine {
 
     /// Total maintenance margin required across all cross-margin positions.
     pub fn total_maintenance_margin(
-        positions: &PositionManager,
+        positions: &PositionManager<impl StateBackend>,
         trader: &Address,
         config: &MarketMarginConfig,
         oracle_prices: &[(MarketId, FixedPoint)],

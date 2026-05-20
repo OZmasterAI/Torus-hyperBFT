@@ -3,7 +3,7 @@
 //! Tasks 2.3.1–2.3.4: check_liquidations, execute_liquidation, auto_deleverage, socialize_loss.
 
 use torus_state::cf::CF_NATIVE_BALANCES;
-use torus_state::StateDb;
+use torus_state::StateBackend;
 use torus_types::{Address, FixedPoint, MarketId};
 
 use crate::error::CoreError;
@@ -70,7 +70,7 @@ pub struct LiquidationEngine;
 impl LiquidationEngine {
     // 2.3.1: Scan all positions for liquidation candidates.
     pub fn check_liquidations(
-        positions: &PositionManager,
+        positions: &PositionManager<impl StateBackend>,
         traders: &[Address],
         config: &MarketMarginConfig,
         oracle_prices: &[(MarketId, FixedPoint)],
@@ -113,7 +113,7 @@ impl LiquidationEngine {
 
     /// Check cross-margin account for liquidation.
     fn check_cross_liquidation(
-        positions: &PositionManager,
+        positions: &PositionManager<impl StateBackend>,
         trader: &Address,
         all_pos: &[Position],
         config: &MarketMarginConfig,
@@ -191,7 +191,7 @@ impl LiquidationEngine {
 
     // 2.3.2: Force close a position at oracle price.
     pub fn execute_liquidation(
-        positions: &PositionManager,
+        positions: &PositionManager<impl StateBackend>,
         liquidation: &Liquidation,
         oracle_price: FixedPoint,
     ) -> Result<LiquidationResult, CoreError> {
@@ -212,10 +212,10 @@ impl LiquidationEngine {
         let liquidation_penalty = notional * penalty_bps / bps_denom;
 
         // Credit insurance fund
-        let state_db = positions.state_db();
-        let mut fund_balance = Self::get_insurance_fund(state_db)?;
+        let state = positions.state();
+        let mut fund_balance = Self::get_insurance_fund(state)?;
         fund_balance = fund_balance + liquidation_penalty;
-        Self::set_insurance_fund(state_db, fund_balance)?;
+        Self::set_insurance_fund(state, fund_balance)?;
 
         // Credit/debit PnL to trader balance, minus the penalty
         let mut bal = positions.get_native_balance(&pos.trader)?;
@@ -253,7 +253,7 @@ impl LiquidationEngine {
 
     // 2.3.3: Auto-deleverage — rank profitable traders, reduce their positions.
     pub fn auto_deleverage(
-        positions: &PositionManager,
+        positions: &PositionManager<impl StateBackend>,
         market_id: MarketId,
         mut loss_amount: FixedPoint,
         oracle_price: FixedPoint,
@@ -343,7 +343,7 @@ impl LiquidationEngine {
 
     // 2.3.4: Socialized loss — insurance fund first, then spread across all traders.
     pub fn socialize_loss(
-        positions: &PositionManager,
+        positions: &PositionManager<impl StateBackend>,
         market_id: MarketId,
         mut remaining_loss: FixedPoint,
         traders: &[Address],
@@ -352,17 +352,17 @@ impl LiquidationEngine {
             return Ok(());
         }
 
-        let state_db = positions.state_db();
+        let state = positions.state();
 
         // First: deduct from insurance fund
-        let fund_balance = Self::get_insurance_fund(state_db)?;
+        let fund_balance = Self::get_insurance_fund(state)?;
         if fund_balance > FixedPoint::ZERO {
             if fund_balance >= remaining_loss {
-                Self::set_insurance_fund(state_db, fund_balance - remaining_loss)?;
+                Self::set_insurance_fund(state, fund_balance - remaining_loss)?;
                 return Ok(());
             }
             remaining_loss = remaining_loss - fund_balance;
-            Self::set_insurance_fund(state_db, FixedPoint::ZERO)?;
+            Self::set_insurance_fund(state, FixedPoint::ZERO)?;
         }
 
         if remaining_loss <= FixedPoint::ZERO {
@@ -429,8 +429,8 @@ impl LiquidationEngine {
     }
 
     /// Get insurance fund balance from state.
-    fn get_insurance_fund(state_db: &StateDb) -> Result<FixedPoint, CoreError> {
-        match state_db.get_cf_raw(CF_NATIVE_BALANCES, INSURANCE_FUND_KEY)? {
+    fn get_insurance_fund(state: &impl StateBackend) -> Result<FixedPoint, CoreError> {
+        match state.get_cf_raw(CF_NATIVE_BALANCES, INSURANCE_FUND_KEY)? {
             Some(data) if data.len() == 16 => Ok(FixedPoint::from_raw(i128::from_be_bytes(
                 data.try_into().unwrap(),
             ))),
@@ -439,8 +439,8 @@ impl LiquidationEngine {
     }
 
     /// Set insurance fund balance in state.
-    fn set_insurance_fund(state_db: &StateDb, amount: FixedPoint) -> Result<(), CoreError> {
-        state_db.put_cf_raw(
+    fn set_insurance_fund(state: &impl StateBackend, amount: FixedPoint) -> Result<(), CoreError> {
+        state.put_cf_raw(
             CF_NATIVE_BALANCES,
             INSURANCE_FUND_KEY,
             &amount.raw().to_be_bytes(),
@@ -562,7 +562,7 @@ mod tests {
         let _result = LiquidationEngine::execute_liquidation(&pm, &liq, fp(49000)).unwrap();
 
         // Insurance fund should have been credited with penalty
-        let fund = LiquidationEngine::get_insurance_fund(pm.state_db()).unwrap();
+        let fund = LiquidationEngine::get_insurance_fund(pm.state()).unwrap();
         assert!(fund > FixedPoint::ZERO, "insurance fund should be credited");
 
         // Penalty = notional * 250 / 10000 = 49000 * 0.025 = 1225

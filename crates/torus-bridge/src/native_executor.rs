@@ -21,7 +21,7 @@ use torus_economics::{
 };
 use torus_economics::epoch::ValidatorSetDiff;
 use torus_state::cf::{CF_NATIVE_TRADES, CF_NATIVE_USER_TRADES};
-use torus_state::StateDb;
+use torus_state::{StateBackend, StateDb};
 use torus_types::{
     FixedPoint, MarketId, NativeAction, OrderType, PlaceOrderParams, PublicKey, SessionScope, Side,
     TimeInForce, U256, ValidatorInfo, ValidatorSet, VoteOption,
@@ -82,12 +82,12 @@ pub struct EpochBoundaryResult {
 // ============================================================================
 
 /// All state managers and block metadata needed for native execution.
-pub struct NativeExecContext {
-    pub positions: PositionManager,
-    pub oracle: OracleManager,
-    pub staking: StakingManager,
-    pub governance: GovernanceManager,
-    pub state_db: StateDb,
+pub struct NativeExecContext<T: StateBackend = StateDb> {
+    pub positions: PositionManager<T>,
+    pub oracle: OracleManager<T>,
+    pub staking: StakingManager<T>,
+    pub governance: GovernanceManager<T>,
+    pub state: T,
 
     /// Order books (per market, in-memory).
     pub order_books: HashMap<MarketId, OrderBook>,
@@ -115,10 +115,10 @@ pub struct NativeExecContext {
     pub metrics: Option<std::sync::Arc<torus_telemetry::Metrics>>,
 }
 
-impl NativeExecContext {
-    /// Create a new execution context from a StateDb and block metadata.
+impl<T: StateBackend> NativeExecContext<T> {
+    /// Create a new execution context from a state backend and block metadata.
     pub fn new(
-        state_db: StateDb,
+        state: T,
         block_height: u64,
         timestamp: u64,
         epoch: u64,
@@ -128,20 +128,20 @@ impl NativeExecContext {
         treasury_address: Address,
         dev_pool_address: Address,
     ) -> Self {
-        let positions = PositionManager::new(state_db.clone());
-        let oracle = OracleManager::new(state_db.clone(), OracleConfig::default());
-        let staking = StakingManager::new(state_db.clone());
-        let governance = GovernanceManager::new(state_db.clone());
+        let positions = PositionManager::new(state.clone());
+        let oracle = OracleManager::new(state.clone(), OracleConfig::default());
+        let staking = StakingManager::new(state.clone());
+        let governance = GovernanceManager::new(state.clone());
 
         // FIX 1 (ECON-FIND-02): Load persisted order books from DB on startup.
-        let (order_books, next_global_order_id) = Self::load_order_books(&state_db);
+        let (order_books, next_global_order_id) = Self::load_order_books(&state);
 
         Self {
             positions,
             oracle,
             staking,
             governance,
-            state_db,
+            state,
             order_books,
             margin_configs: HashMap::new(),
             next_global_order_id,
@@ -160,27 +160,23 @@ impl NativeExecContext {
     }
 
     /// FIX 1 (ECON-FIND-02): Load order books from DB. Returns (books, next_global_order_id).
-    fn load_order_books(state_db: &StateDb) -> (HashMap<MarketId, OrderBook>, u128) {
+    fn load_order_books(state: &T) -> (HashMap<MarketId, OrderBook>, u128) {
         use borsh::BorshDeserialize;
         use torus_state::cf::CF_NATIVE_ORDER_BOOKS;
 
         let mut books = HashMap::new();
         let mut max_order_id: u128 = 0;
 
-        let db = state_db.inner();
-        if let Some(cf) = db.cf_handle(CF_NATIVE_ORDER_BOOKS) {
-            let iter = db.iterator_cf(cf, rocksdb::IteratorMode::Start);
-            for item in iter {
-                if let Ok((key, value)) = item {
-                    if key.len() == 8 {
-                        let market_id = u64::from_be_bytes(key[..8].try_into().unwrap());
-                        if let Ok(book) = OrderBook::try_from_slice(&value) {
-                            let book_next_id = book.next_order_id();
-                            if book_next_id > max_order_id {
-                                max_order_id = book_next_id;
-                            }
-                            books.insert(market_id, book);
+        if let Ok(entries) = state.iterate_cf(CF_NATIVE_ORDER_BOOKS, None) {
+            for (key, value) in entries {
+                if key.len() == 8 {
+                    let market_id = u64::from_be_bytes(key[..8].try_into().unwrap());
+                    if let Ok(book) = OrderBook::try_from_slice(&value) {
+                        let book_next_id = book.next_order_id();
+                        if book_next_id > max_order_id {
+                            max_order_id = book_next_id;
                         }
+                        books.insert(market_id, book);
                     }
                 }
             }
@@ -199,7 +195,7 @@ impl NativeExecContext {
             let key = market_id.to_be_bytes();
             match borsh::to_vec(book) {
                 Ok(data) => {
-                    if let Err(e) = self.state_db.put_cf_raw(CF_NATIVE_ORDER_BOOKS, &key, &data) {
+                    if let Err(e) = self.state.put_cf_raw(CF_NATIVE_ORDER_BOOKS, &key, &data) {
                         tracing::error!(market_id, %e, "failed to persist order book");
                     }
                 }
@@ -223,8 +219,8 @@ pub struct NativeExecutor;
 
 impl NativeExecutor {
     /// Execute a single native action for the given sender.
-    pub fn execute(
-        ctx: &mut NativeExecContext,
+    pub fn execute<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
         sender: &Address,
         action: &NativeAction,
     ) -> NativeActionResult {
@@ -329,8 +325,8 @@ impl NativeExecutor {
     ///   Phase 4 — Sequential settlement: release margin, apply fills, persist trades
     ///
     /// Individual action failures do NOT stop the batch (deterministic semantics).
-    pub fn execute_batch(
-        ctx: &mut NativeExecContext,
+    pub fn execute_batch<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
         actions: &[(Address, NativeAction)],
     ) -> NativeBatchResult {
         let n = actions.len();
@@ -570,8 +566,8 @@ impl NativeExecutor {
     // Order book handlers
     // ========================================================================
 
-    fn exec_place_order(
-        ctx: &mut NativeExecContext,
+    fn exec_place_order<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
         sender: &Address,
         params: &PlaceOrderParams,
     ) -> NativeActionResult {
@@ -713,7 +709,7 @@ impl NativeExecutor {
             trade_data.extend_from_slice(&ctx.block_height.to_le_bytes());
             trade_data.extend_from_slice(&ctx.timestamp.to_le_bytes());
 
-            let _ = ctx.state_db.put_cf_raw(CF_NATIVE_TRADES, &trade_key, &trade_data);
+            let _ = ctx.state.put_cf_raw(CF_NATIVE_TRADES, &trade_key, &trade_data);
 
             // Secondary index: per-user trades (descending block order)
             let desc_block = u64::MAX - ctx.block_height;
@@ -732,7 +728,7 @@ impl NativeExecutor {
             maker_key[..20].copy_from_slice(fill.maker.as_slice());
             maker_key[20..28].copy_from_slice(&desc_block.to_be_bytes());
             maker_key[28..32].copy_from_slice(&ctx.trade_index.to_be_bytes());
-            let _ = ctx.state_db.put_cf_raw(CF_NATIVE_USER_TRADES, &maker_key, &user_trade_data);
+            let _ = ctx.state.put_cf_raw(CF_NATIVE_USER_TRADES, &maker_key, &user_trade_data);
 
             // Taker entry (flip role byte at offset 57: 16+8+16+16+1)
             user_trade_data[57] = 1u8; // role: taker
@@ -740,7 +736,7 @@ impl NativeExecutor {
             taker_key[..20].copy_from_slice(fill.taker.as_slice());
             taker_key[20..28].copy_from_slice(&desc_block.to_be_bytes());
             taker_key[28..32].copy_from_slice(&ctx.trade_index.to_be_bytes());
-            let _ = ctx.state_db.put_cf_raw(CF_NATIVE_USER_TRADES, &taker_key, &user_trade_data);
+            let _ = ctx.state.put_cf_raw(CF_NATIVE_USER_TRADES, &taker_key, &user_trade_data);
 
             ctx.trade_index += 1;
         }
@@ -753,8 +749,8 @@ impl NativeExecutor {
     }
 
     /// Persist a single fill to CF_NATIVE_TRADES and CF_NATIVE_USER_TRADES.
-    fn persist_trade(
-        ctx: &mut NativeExecContext,
+    fn persist_trade<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
         market_id: MarketId,
         fill: &torus_core::order_book::Fill,
     ) {
@@ -777,7 +773,7 @@ impl NativeExecutor {
         trade_data.extend_from_slice(&ctx.block_height.to_le_bytes());
         trade_data.extend_from_slice(&ctx.timestamp.to_le_bytes());
 
-        let _ = ctx.state_db.put_cf_raw(CF_NATIVE_TRADES, &trade_key, &trade_data);
+        let _ = ctx.state.put_cf_raw(CF_NATIVE_TRADES, &trade_key, &trade_data);
 
         let desc_block = u64::MAX - ctx.block_height;
         let mut user_trade_data = Vec::with_capacity(80);
@@ -794,20 +790,20 @@ impl NativeExecutor {
         maker_key[..20].copy_from_slice(fill.maker.as_slice());
         maker_key[20..28].copy_from_slice(&desc_block.to_be_bytes());
         maker_key[28..32].copy_from_slice(&ctx.trade_index.to_be_bytes());
-        let _ = ctx.state_db.put_cf_raw(CF_NATIVE_USER_TRADES, &maker_key, &user_trade_data);
+        let _ = ctx.state.put_cf_raw(CF_NATIVE_USER_TRADES, &maker_key, &user_trade_data);
 
         user_trade_data[57] = 1u8; // role: taker
         let mut taker_key = [0u8; 32];
         taker_key[..20].copy_from_slice(fill.taker.as_slice());
         taker_key[20..28].copy_from_slice(&desc_block.to_be_bytes());
         taker_key[28..32].copy_from_slice(&ctx.trade_index.to_be_bytes());
-        let _ = ctx.state_db.put_cf_raw(CF_NATIVE_USER_TRADES, &taker_key, &user_trade_data);
+        let _ = ctx.state.put_cf_raw(CF_NATIVE_USER_TRADES, &taker_key, &user_trade_data);
 
         ctx.trade_index += 1;
     }
 
     /// FIX CONS-FIND-30: Ownership check added -- only the order's trader can cancel.
-    fn exec_cancel_order(ctx: &mut NativeExecContext, sender: &Address, order_id: u128) -> NativeActionResult {
+    fn exec_cancel_order<T: StateBackend>(ctx: &mut NativeExecContext<T>, sender: &Address, order_id: u128) -> NativeActionResult {
         // Check ownership before cancelling (cheaper than cancel + re-insert).
         for book in ctx.order_books.values() {
             if let Some(order) = book.get_order(order_id) {
@@ -850,8 +846,8 @@ impl NativeExecutor {
         NativeActionResult::err("cancel_order", format!("order {order_id} not found"))
     }
 
-    fn exec_cancel_all(
-        ctx: &mut NativeExecContext,
+    fn exec_cancel_all<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
         sender: &Address,
         market_id: Option<MarketId>,
     ) -> NativeActionResult {
@@ -907,8 +903,8 @@ impl NativeExecutor {
         NativeActionResult::ok("cancel_all", 500)
     }
 
-    fn exec_modify_order(
-        ctx: &mut NativeExecContext,
+    fn exec_modify_order<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
         order_id: u128,
         new_price: Option<FixedPoint>,
         new_qty: Option<FixedPoint>,
@@ -975,8 +971,8 @@ impl NativeExecutor {
     // Staking handlers
     // ========================================================================
 
-    fn exec_delegate(
-        ctx: &mut NativeExecContext,
+    fn exec_delegate<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
         sender: &Address,
         validator: &Address,
         amount: U256,
@@ -987,8 +983,8 @@ impl NativeExecutor {
         }
     }
 
-    fn exec_undelegate(
-        ctx: &mut NativeExecContext,
+    fn exec_undelegate<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
         sender: &Address,
         validator: &Address,
         amount: U256,
@@ -1002,8 +998,8 @@ impl NativeExecutor {
         }
     }
 
-    fn exec_permanent_stake(
-        ctx: &mut NativeExecContext,
+    fn exec_permanent_stake<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
         sender: &Address,
         amount: U256,
     ) -> NativeActionResult {
@@ -1016,15 +1012,15 @@ impl NativeExecutor {
         }
     }
 
-    fn exec_claim_rewards(ctx: &mut NativeExecContext, sender: &Address) -> NativeActionResult {
+    fn exec_claim_rewards<T: StateBackend>(ctx: &mut NativeExecContext<T>, sender: &Address) -> NativeActionResult {
         match ctx.staking.claim_rewards(*sender) {
             Ok(_) => NativeActionResult::ok("claim_rewards", 1500),
             Err(e) => NativeActionResult::err("claim_rewards", e.to_string()),
         }
     }
 
-    fn exec_jail_vote(
-        ctx: &mut NativeExecContext,
+    fn exec_jail_vote<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
         sender: &Address,
         target: &Address,
     ) -> NativeActionResult {
@@ -1040,15 +1036,15 @@ impl NativeExecutor {
         }
     }
 
-    fn exec_unjail_self(ctx: &mut NativeExecContext, sender: &Address) -> NativeActionResult {
+    fn exec_unjail_self<T: StateBackend>(ctx: &mut NativeExecContext<T>, sender: &Address) -> NativeActionResult {
         match ctx.staking.unjail(sender, ctx.block_height) {
             Ok(()) => NativeActionResult::ok("unjail_self", 2000),
             Err(e) => NativeActionResult::err("unjail_self", e.to_string()),
         }
     }
 
-    fn exec_register_validator(
-        ctx: &mut NativeExecContext,
+    fn exec_register_validator<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
         sender: &Address,
         pubkey: &torus_types::PublicKey,
         commission: u16,
@@ -1066,7 +1062,7 @@ impl NativeExecutor {
         }
 
         // Determine self-stake: sender's full balance is used as self-stake
-        let self_stake = match ctx.state_db.get_account(sender) {
+        let self_stake = match ctx.state.get_account(sender) {
             Ok(Some(acct)) => acct.balance,
             Ok(None) => {
                 return NativeActionResult::err(
@@ -1097,8 +1093,8 @@ impl NativeExecutor {
         }
     }
 
-    fn exec_update_commission(
-        ctx: &mut NativeExecContext,
+    fn exec_update_commission<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
         sender: &Address,
         new_rate: u16,
     ) -> NativeActionResult {
@@ -1111,8 +1107,8 @@ impl NativeExecutor {
         }
     }
 
-    fn exec_rotate_key(
-        ctx: &mut NativeExecContext,
+    fn exec_rotate_key<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
         sender: &Address,
         new_pubkey: &torus_types::PublicKey,
     ) -> NativeActionResult {
@@ -1132,8 +1128,8 @@ impl NativeExecutor {
     // Session key handlers
     // ========================================================================
 
-    fn exec_create_session(
-        ctx: &mut NativeExecContext,
+    fn exec_create_session<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
         sender: &Address,
         session_pubkey: &[u8; 32],
         expiry: u64,
@@ -1150,7 +1146,7 @@ impl NativeExecutor {
         }
 
         // Check max sessions per owner
-        match ctx.state_db.count_sessions_for_owner(sender) {
+        match ctx.state.count_sessions_for_owner(sender) {
             Ok(count) if count >= MAX_SESSIONS_PER_ADDRESS => {
                 return NativeActionResult::err(
                     "create_session",
@@ -1164,7 +1160,7 @@ impl NativeExecutor {
         }
 
         // Check if session key already exists
-        match ctx.state_db.get_session(session_pubkey) {
+        match ctx.state.get_session(session_pubkey) {
             Ok(Some(_)) => {
                 return NativeActionResult::err(
                     "create_session",
@@ -1184,19 +1180,19 @@ impl NativeExecutor {
             scope,
             created_at: ctx.timestamp,
         };
-        match ctx.state_db.put_session(session_pubkey, &data) {
+        match ctx.state.put_session(session_pubkey, &data) {
             Ok(()) => NativeActionResult::ok("create_session", 5000),
             Err(e) => NativeActionResult::err("create_session", format!("store failed: {e}")),
         }
     }
 
-    fn exec_revoke_session(
-        ctx: &mut NativeExecContext,
+    fn exec_revoke_session<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
         sender: &Address,
         session_pubkey: &[u8; 32],
     ) -> NativeActionResult {
         // Verify session exists and sender is the owner
-        match ctx.state_db.get_session(session_pubkey) {
+        match ctx.state.get_session(session_pubkey) {
             Ok(Some(data)) => {
                 if data.owner != *sender {
                     return NativeActionResult::err(
@@ -1213,7 +1209,7 @@ impl NativeExecutor {
             }
         }
 
-        match ctx.state_db.delete_session(session_pubkey) {
+        match ctx.state.delete_session(session_pubkey) {
             Ok(()) => NativeActionResult::ok("revoke_session", 2000),
             Err(e) => NativeActionResult::err("revoke_session", format!("delete failed: {e}")),
         }
@@ -1223,8 +1219,8 @@ impl NativeExecutor {
     // Oracle handlers
     // ========================================================================
 
-    fn exec_submit_oracle_prices(
-        ctx: &mut NativeExecContext,
+    fn exec_submit_oracle_prices<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
         sender: &Address,
         prices: &[(MarketId, FixedPoint)],
         _submission_timestamp: u64,
@@ -1266,8 +1262,8 @@ impl NativeExecutor {
     // Governance handlers
     // ========================================================================
 
-    fn exec_submit_proposal(
-        ctx: &mut NativeExecContext,
+    fn exec_submit_proposal<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
         sender: &Address,
         proposal: &torus_types::Proposal,
     ) -> NativeActionResult {
@@ -1314,8 +1310,8 @@ impl NativeExecutor {
         }
     }
 
-    fn exec_vote(
-        ctx: &mut NativeExecContext,
+    fn exec_vote<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
         sender: &Address,
         proposal_id: u64,
         option: VoteOption,
@@ -1349,8 +1345,8 @@ impl NativeExecutor {
     // Lockbox handlers
     // ========================================================================
 
-    fn exec_deposit_to_native(
-        ctx: &mut NativeExecContext,
+    fn exec_deposit_to_native<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
         sender: &Address,
         amount: U256,
     ) -> NativeActionResult {
@@ -1358,14 +1354,14 @@ impl NativeExecutor {
             Some(fp) => fp,
             None => return NativeActionResult::err("deposit_to_native", "amount overflow".into()),
         };
-        match Lockbox::deposit_to_native(&ctx.state_db, sender, fp_amount) {
+        match Lockbox::deposit_to_native(&ctx.state, sender, fp_amount) {
             Ok(()) => NativeActionResult::ok("deposit_to_native", 1500),
             Err(e) => NativeActionResult::err("deposit_to_native", e.to_string()),
         }
     }
 
-    fn exec_withdraw_from_native(
-        ctx: &mut NativeExecContext,
+    fn exec_withdraw_from_native<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
         sender: &Address,
         amount: U256,
     ) -> NativeActionResult {
@@ -1375,15 +1371,15 @@ impl NativeExecutor {
                 return NativeActionResult::err("withdraw_from_native", "amount overflow".into())
             }
         };
-        match Lockbox::withdraw_from_native(&ctx.state_db, sender, fp_amount) {
+        match Lockbox::withdraw_from_native(&ctx.state, sender, fp_amount) {
             Ok(()) => NativeActionResult::ok("withdraw_from_native", 1500),
             Err(e) => NativeActionResult::err("withdraw_from_native", e.to_string()),
         }
     }
 
     /// FIX ECON-PF-17: Withdraw from sender's native balance to a specified EVM address.
-    fn exec_withdraw_to(
-        ctx: &mut NativeExecContext,
+    fn exec_withdraw_to<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
         sender: &Address,
         to: &Address,
         amount: U256,
@@ -1392,7 +1388,7 @@ impl NativeExecutor {
             Some(fp) => fp,
             None => return NativeActionResult::err("withdraw_to", "amount overflow".into()),
         };
-        match Lockbox::withdraw_from_native_to(&ctx.state_db, sender, to, fp_amount) {
+        match Lockbox::withdraw_from_native_to(&ctx.state, sender, to, fp_amount) {
             Ok(()) => NativeActionResult::ok("withdraw_to", 1500),
             Err(e) => NativeActionResult::err("withdraw_to", e.to_string()),
         }
@@ -1408,10 +1404,10 @@ impl NativeExecutor {
     /// drained actions must have been queued in a strictly earlier block.
     ///
     /// FIX EVM-FIND-12: Propagates drain errors instead of silently returning empty vec.
-    pub fn drain_core_writer(
-        ctx: &mut NativeExecContext,
+    pub fn drain_core_writer<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
     ) -> Result<Vec<NativeActionResult>, torus_core::error::CoreError> {
-        let queued = CoreWriterQueue::drain(&ctx.state_db, ctx.block_height)?;
+        let queued = CoreWriterQueue::drain(&ctx.state, ctx.block_height)?;
 
         let mut results = Vec::with_capacity(queued.len());
         for qa in &queued {
@@ -1442,8 +1438,8 @@ impl NativeExecutor {
     }
 
     /// Aggregate oracle prices for listed markets after oracle submissions.
-    pub fn aggregate_oracle_prices(
-        ctx: &mut NativeExecContext,
+    pub fn aggregate_oracle_prices<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
         markets: &[MarketId],
         validator_stakes: &[(Address, FixedPoint)],
     ) -> Vec<NativeActionResult> {
@@ -1463,8 +1459,8 @@ impl NativeExecutor {
     }
 
     /// Run liquidation checks across all configured markets.
-    pub fn run_liquidation_checks(
-        ctx: &mut NativeExecContext,
+    pub fn run_liquidation_checks<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
         traders: &[Address],
         oracle_prices: &[(MarketId, FixedPoint)],
     ) -> Vec<NativeActionResult> {
@@ -1531,7 +1527,7 @@ impl NativeExecutor {
     }
 
     /// Distribute fees at end of block.
-    pub fn distribute_fees(ctx: &mut NativeExecContext, total_evm_fees: u128) -> NativeActionResult {
+    pub fn distribute_fees<T: StateBackend>(ctx: &mut NativeExecContext<T>, total_evm_fees: u128) -> NativeActionResult {
         let total_fees = U256::from(ctx.total_native_fees as u128 + total_evm_fees);
         if total_fees.is_zero() {
             return NativeActionResult::ok("fee_distribution", 0);
@@ -1562,7 +1558,7 @@ impl NativeExecutor {
     /// Phase B — Rotation: computes new validator set, applies rotation cap,
     /// updates statuses, logs changes. Errors on compute_new_validator_set
     /// early-return (broken validator set is a consensus-safety issue).
-    pub fn process_epoch_boundary(ctx: &mut NativeExecContext) -> Option<EpochBoundaryResult> {
+    pub fn process_epoch_boundary<T: StateBackend>(ctx: &mut NativeExecContext<T>) -> Option<EpochBoundaryResult> {
         if !EpochManager::is_epoch_boundary(ctx.block_height, ctx.epoch_length) {
             return None;
         }
@@ -1637,7 +1633,7 @@ impl NativeExecutor {
     }
 
     /// Process pending governance proposals.
-    pub fn process_governance(ctx: &mut NativeExecContext) -> Vec<NativeActionResult> {
+    pub fn process_governance<T: StateBackend>(ctx: &mut NativeExecContext<T>) -> Vec<NativeActionResult> {
         match ctx.governance.process_pending_proposals(ctx.block_height) {
             Ok(outcomes) => outcomes
                 .iter()
@@ -1653,7 +1649,7 @@ impl NativeExecutor {
 
 /// Build a ValidatorSet from current Active validators in staking state.
 /// Uses the same power conversion as `EpochManager::compute_new_validator_set`.
-fn build_current_validator_set(staking: &StakingManager, epoch: u64) -> ValidatorSet {
+fn build_current_validator_set(staking: &StakingManager<impl StateBackend>, epoch: u64) -> ValidatorSet {
     let wei = U256::from(10u64).pow(U256::from(18u64));
     let validators: Vec<ValidatorInfo> = match staking.all_validators() {
         Ok(all) => all

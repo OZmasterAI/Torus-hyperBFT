@@ -3,6 +3,7 @@
 use alloy_primitives::{Address, U256};
 use borsh::BorshDeserialize;
 use torus_state::cf::CF_DEV_POOL;
+use torus_state::StateBackend;
 
 use crate::staking::StakingManager;
 use crate::types::*;
@@ -98,7 +99,7 @@ impl DevPool {
         let entries = Self::all_entries(staking)?;
         for entry in &entries {
             staking
-                .state_db()
+                .state()
                 .delete_cf_raw(CF_DEV_POOL, entry.deployer.as_slice())?;
         }
         tracing::debug!(cleared = entries.len(), "dev pool epoch reset");
@@ -111,7 +112,7 @@ impl DevPool {
         deployer: &Address,
     ) -> Result<Option<DevPoolEntry>> {
         match staking
-            .state_db()
+            .state()
             .get_cf_raw(CF_DEV_POOL, deployer.as_slice())?
         {
             Some(data) => Ok(Some(
@@ -129,28 +130,20 @@ impl DevPool {
     ) -> Result<()> {
         let data = borsh::to_vec(entry).map_err(|e| EconomicsError::Borsh(e.to_string()))?;
         staking
-            .state_db()
+            .state()
             .put_cf_raw(CF_DEV_POOL, deployer.as_slice(), &data)?;
         Ok(())
     }
 
     /// Read all dev pool entries (full scan of CF_DEV_POOL).
     pub fn all_entries(staking: &StakingManager) -> Result<Vec<DevPoolEntry>> {
-        let db = staking.state_db().inner();
-        let cf = db.cf_handle(CF_DEV_POOL).ok_or_else(|| {
-            EconomicsError::State(torus_state::StateError::MissingColumnFamily(
-                CF_DEV_POOL.to_string(),
-            ))
-        })?;
-        let iter = db.iterator_cf(cf, rocksdb::IteratorMode::Start);
-        let mut entries = Vec::new();
-        for item in iter {
-            let (_key, value) =
-                item.map_err(|e| EconomicsError::State(torus_state::StateError::RocksDb(e)))?;
-            let entry = DevPoolEntry::try_from_slice(&value)
+        let entries = staking.state().iterate_cf(CF_DEV_POOL, None)?;
+        let mut result = Vec::new();
+        for (_key, value) in &entries {
+            let entry = DevPoolEntry::try_from_slice(value)
                 .map_err(|e| EconomicsError::Borsh(e.to_string()))?;
-            entries.push(entry);
+            result.push(entry);
         }
-        Ok(entries)
+        Ok(result)
     }
 }

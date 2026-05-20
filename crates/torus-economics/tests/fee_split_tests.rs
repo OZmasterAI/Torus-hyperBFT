@@ -28,7 +28,7 @@ fn fund(mgr: &StakingManager, a: &Address, amount: U256) {
         balance: amount,
         ..Default::default()
     };
-    mgr.state_db().put_account(a, &info).unwrap();
+    mgr.state().put_account(a, &info).unwrap();
 }
 
 // ============================================================================
@@ -251,7 +251,7 @@ fn no_validator_record_credits_proposer_directly() {
     FeeSplitter::distribute_validator_rewards(&mgr, &proposer, wei(1_000)).unwrap();
 
     // No validator record -> full amount goes to balance.
-    let acct = mgr.state_db().get_account(&proposer).unwrap().unwrap();
+    let acct = mgr.state().get_account(&proposer).unwrap().unwrap();
     assert_eq!(acct.balance, wei(1_000));
 }
 
@@ -267,7 +267,7 @@ fn treasury_credit_and_tracking() {
 
     FeeSplitter::credit_treasury(&mgr, &treasury, wei(2_000)).unwrap();
     let bal = mgr
-        .state_db()
+        .state()
         .get_account(&treasury)
         .unwrap()
         .unwrap()
@@ -280,7 +280,7 @@ fn treasury_credit_and_tracking() {
     // Second credit accumulates.
     FeeSplitter::credit_treasury(&mgr, &treasury, wei(3_000)).unwrap();
     let bal = mgr
-        .state_db()
+        .state()
         .get_account(&treasury)
         .unwrap()
         .unwrap()
@@ -315,13 +315,13 @@ fn dev_pool_two_deployers_pro_rata() {
     assert_eq!(count, 2);
 
     let bal1 = mgr
-        .state_db()
+        .state()
         .get_account(&deployer1)
         .unwrap()
         .unwrap()
         .balance;
     let bal2 = mgr
-        .state_db()
+        .state()
         .get_account(&deployer2)
         .unwrap()
         .unwrap()

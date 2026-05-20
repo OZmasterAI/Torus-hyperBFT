@@ -24,7 +24,7 @@ fn fund(mgr: &StakingManager, a: &Address, amount: U256) {
         balance: amount,
         ..Default::default()
     };
-    mgr.state_db().put_account(a, &info).unwrap();
+    mgr.state().put_account(a, &info).unwrap();
 }
 
 // ============================================================================
@@ -40,7 +40,7 @@ fn lock_permanent_stake_debits_balance() {
     mgr.permanent_stake(staker, wei(25_000), 50).unwrap();
 
     // Balance should be debited.
-    let acct = mgr.state_db().get_account(&staker).unwrap().unwrap();
+    let acct = mgr.state().get_account(&staker).unwrap().unwrap();
     assert_eq!(acct.balance, wei(75_000));
 
     // Permanent stake should be credited.
@@ -61,7 +61,7 @@ fn lock_permanent_stake_accumulates() {
     let info = mgr.get_permanent_stake(&staker).unwrap().unwrap();
     assert_eq!(info.amount, wei(30_000));
 
-    let acct = mgr.state_db().get_account(&staker).unwrap().unwrap();
+    let acct = mgr.state().get_account(&staker).unwrap().unwrap();
     assert_eq!(acct.balance, wei(70_000));
 }
 
@@ -102,7 +102,7 @@ fn permanent_staking_rewards_go_to_liquid_balance() {
     mgr.permanent_stake(staker, wei(50_000), 0).unwrap();
 
     let balance_before = mgr
-        .state_db()
+        .state()
         .get_account(&staker)
         .unwrap()
         .unwrap()
@@ -118,7 +118,7 @@ fn permanent_staking_rewards_go_to_liquid_balance() {
 
     // Verify rewards went to liquid balance (non-auto-compounding).
     let balance_after = mgr
-        .state_db()
+        .state()
         .get_account(&staker)
         .unwrap()
         .unwrap()
@@ -143,15 +143,15 @@ fn permanent_staking_rewards_proportional_distribution() {
     mgr.permanent_stake(s1, wei(30_000), 0).unwrap();
     mgr.permanent_stake(s2, wei(70_000), 0).unwrap();
 
-    let bal_s1_before = mgr.state_db().get_account(&s1).unwrap().unwrap().balance;
-    let bal_s2_before = mgr.state_db().get_account(&s2).unwrap().unwrap().balance;
+    let bal_s1_before = mgr.state().get_account(&s1).unwrap().unwrap().balance;
+    let bal_s2_before = mgr.state().get_account(&s2).unwrap().unwrap().balance;
 
     let blocks_in_epoch = 200_000u64;
     let total_minted =
         RewardDistributor::distribute_permanent_staking_rewards(&mgr, blocks_in_epoch).unwrap();
 
-    let reward_s1 = mgr.state_db().get_account(&s1).unwrap().unwrap().balance - bal_s1_before;
-    let reward_s2 = mgr.state_db().get_account(&s2).unwrap().unwrap().balance - bal_s2_before;
+    let reward_s1 = mgr.state().get_account(&s1).unwrap().unwrap().balance - bal_s1_before;
+    let reward_s2 = mgr.state().get_account(&s2).unwrap().unwrap().balance - bal_s2_before;
 
     // s2 should get ~2.33x more than s1 (70/30 ratio).
     assert!(reward_s2 > reward_s1);
@@ -181,7 +181,7 @@ fn lock_zero_amount_is_noop() {
     mgr.permanent_stake(staker, U256::ZERO, 0).unwrap();
 
     assert!(mgr.get_permanent_stake(&staker).unwrap().is_none());
-    let acct = mgr.state_db().get_account(&staker).unwrap().unwrap();
+    let acct = mgr.state().get_account(&staker).unwrap().unwrap();
     assert_eq!(acct.balance, wei(10_000));
 }
 

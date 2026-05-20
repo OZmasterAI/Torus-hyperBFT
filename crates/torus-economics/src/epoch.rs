@@ -2,6 +2,7 @@
 
 use alloy_primitives::{Address, B256, U256};
 use sha3::{Digest, Keccak256};
+use torus_state::StateBackend;
 use torus_types::{PublicKey, ValidatorInfo, ValidatorSet};
 
 use crate::staking::StakingManager;
@@ -31,8 +32,8 @@ impl EpochManager {
     }
 
     /// Read all validators, rank by total stake, return top `max_validators` as the new set.
-    pub fn compute_new_validator_set(
-        staking: &StakingManager,
+    pub fn compute_new_validator_set<T: StateBackend>(
+        staking: &StakingManager<T>,
         max_validators: u32,
         epoch: u64,
     ) -> Result<ValidatorSet> {
@@ -296,8 +297,8 @@ impl EpochManager {
     }
 
     /// Update validator statuses after epoch rotation.
-    pub fn update_validator_statuses(
-        staking: &StakingManager,
+    pub fn update_validator_statuses<T: StateBackend>(
+        staking: &StakingManager<T>,
         new_set: &ValidatorSet,
     ) -> Result<()> {
         let active_addrs: std::collections::BTreeSet<Address> =
@@ -361,7 +362,7 @@ mod tests {
             balance: stake,
             ..Default::default()
         };
-        mgr.state_db().put_account(&addr, &info).unwrap();
+        mgr.state().put_account(&addr, &info).unwrap();
         mgr.register_validator(addr, [n; 32], 500, stake).unwrap();
         addr
     }

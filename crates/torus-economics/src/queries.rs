@@ -124,7 +124,7 @@ mod tests {
             balance: amount,
             ..Default::default()
         };
-        mgr.state_db().put_account(a, &info).unwrap();
+        mgr.state().put_account(a, &info).unwrap();
     }
 
     #[test]

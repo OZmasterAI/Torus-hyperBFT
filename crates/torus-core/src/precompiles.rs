@@ -14,7 +14,7 @@ use std::io::{self, Read as IoRead, Write as IoWrite};
 use alloy_primitives::keccak256;
 use borsh::{BorshDeserialize, BorshSerialize};
 use torus_state::cf::*;
-use torus_state::StateDb;
+use torus_state::{StateBackend, StateDb};
 use torus_types::{Address, FixedPoint, MarketId, OrderId, U256};
 
 use crate::error::CoreError;
@@ -922,35 +922,25 @@ impl CoreWriterQueue {
     /// Drain all actions queued for the given block_number.
     /// Returns the actions and deletes them from state.
     pub fn drain(
-        state_db: &StateDb,
+        state: &impl StateBackend,
         block_number: u64,
     ) -> Result<Vec<QueuedAction>, CoreError> {
-        let db = state_db.inner();
-        let cf = db
-            .cf_handle(CF_CORE_WRITER_QUEUE)
-            .ok_or(CoreError::MissingCf(CF_CORE_WRITER_QUEUE))?;
-
         let prefix = block_number.to_be_bytes();
-        let iter = db.prefix_iterator_cf(cf, &prefix);
+        let entries = state.iterate_cf(CF_CORE_WRITER_QUEUE, Some(&prefix))?;
 
         let mut actions = Vec::new();
         let mut keys_to_delete = Vec::new();
 
-        for item in iter {
-            let (key, value) =
-                item.map_err(|e| CoreError::State(torus_state::StateError::RocksDb(e)))?;
-            if !key.starts_with(&prefix) {
-                break;
-            }
-            if let Ok(action) = QueuedAction::try_from_slice(&value) {
+        for (key, value) in &entries {
+            if let Ok(action) = QueuedAction::try_from_slice(value) {
                 actions.push(action);
             }
-            keys_to_delete.push(key.to_vec());
+            keys_to_delete.push(key.clone());
         }
 
         // Delete drained entries
         for key in &keys_to_delete {
-            state_db.delete_cf_raw(CF_CORE_WRITER_QUEUE, key)?;
+            state.delete_cf_raw(CF_CORE_WRITER_QUEUE, key)?;
         }
 
         Ok(actions)

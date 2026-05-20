@@ -38,7 +38,7 @@ fn fund(mgr: &StakingManager, a: &Address, amount: U256) {
         balance: amount,
         ..Default::default()
     };
-    mgr.state_db().put_account(a, &info).unwrap();
+    mgr.state().put_account(a, &info).unwrap();
 }
 
 fn register_and_activate(mgr: &StakingManager, v: Address, stake_tokens: u64) {
@@ -177,7 +177,7 @@ fn jail_vote_lifecycle() {
     }
 
     // --- Jail vote via NativeAction ---
-    let state_db = mgr.state_db().clone();
+    let state_db = mgr.state().clone();
     let mut ctx = NativeExecContext::new(
         state_db, 100, 1_700_000_100, 0, 100, 100,
         addr(99), addr(98), addr(97),

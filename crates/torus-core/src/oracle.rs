@@ -6,7 +6,7 @@ use std::io::{self, Read, Write};
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use torus_state::cf::CF_NATIVE_ORACLE;
-use torus_state::StateDb;
+use torus_state::{StateBackend, StateDb};
 use torus_types::{Address, FixedPoint, MarketId};
 
 use crate::error::CoreError;
@@ -164,14 +164,14 @@ fn aggregated_price_key(market_id: MarketId) -> Vec<u8> {
 // OracleManager
 // ============================================================================
 
-pub struct OracleManager {
-    state_db: StateDb,
+pub struct OracleManager<T: StateBackend = StateDb> {
+    state: T,
     config: OracleConfig,
 }
 
-impl OracleManager {
-    pub fn new(state_db: StateDb, config: OracleConfig) -> Self {
-        Self { state_db, config }
+impl<T: StateBackend> OracleManager<T> {
+    pub fn new(state: T, config: OracleConfig) -> Self {
+        Self { state, config }
     }
 
     // 2.8b.1: Submit a price from a validator.
@@ -192,7 +192,7 @@ impl OracleManager {
         };
         let key = submission_key(market_id, validator, block_number);
         let data = borsh::to_vec(&submission).map_err(|e| CoreError::Borsh(e.to_string()))?;
-        self.state_db.put_cf_raw(CF_NATIVE_ORACLE, &key, &data)?;
+        self.state.put_cf_raw(CF_NATIVE_ORACLE, &key, &data)?;
         Ok(())
     }
 
@@ -265,7 +265,7 @@ impl OracleManager {
         };
         let key = aggregated_price_key(market_id);
         let data = borsh::to_vec(&stored).map_err(|e| CoreError::Borsh(e.to_string()))?;
-        self.state_db.put_cf_raw(CF_NATIVE_ORACLE, &key, &data)?;
+        self.state.put_cf_raw(CF_NATIVE_ORACLE, &key, &data)?;
 
         Ok(price)
     }
@@ -277,7 +277,7 @@ impl OracleManager {
         current_block: u64,
     ) -> Result<OraclePrice, CoreError> {
         let key = aggregated_price_key(market_id);
-        match self.state_db.get_cf_raw(CF_NATIVE_ORACLE, &key)? {
+        match self.state.get_cf_raw(CF_NATIVE_ORACLE, &key)? {
             Some(data) => {
                 let stored = StoredAggregatedPrice::try_from_slice(&data)
                     .map_err(|e| CoreError::Borsh(e.to_string()))?;
@@ -302,27 +302,17 @@ impl OracleManager {
         start_block: u64,
         end_block: u64,
     ) -> Result<Vec<OracleSubmission>, CoreError> {
-        let db = self.state_db.inner();
-        let cf = db
-            .cf_handle(CF_NATIVE_ORACLE)
-            .ok_or(CoreError::MissingCf(CF_NATIVE_ORACLE))?;
         let prefix = submission_market_prefix(market_id);
-        let iter = db.prefix_iterator_cf(cf, &prefix);
+        let entries = self.state.iterate_cf(CF_NATIVE_ORACLE, Some(&prefix))?;
 
         let mut latest_per_validator: std::collections::BTreeMap<Address, OracleSubmission> =
             std::collections::BTreeMap::new();
         let mut keys_to_prune: Vec<Vec<u8>> = Vec::new();
 
-        for item in iter {
-            let (key, value) =
-                item.map_err(|e| CoreError::State(torus_state::StateError::RocksDb(e)))?;
-            if !key.starts_with(&prefix) {
-                break;
-            }
-            if let Ok(sub) = OracleSubmission::try_from_slice(&value) {
+        for (key, value) in &entries {
+            if let Ok(sub) = OracleSubmission::try_from_slice(value) {
                 if sub.block_number < start_block {
-                    // FIX 17: Mark old submissions for pruning
-                    keys_to_prune.push(key.to_vec());
+                    keys_to_prune.push(key.clone());
                 } else if sub.block_number <= end_block {
                     match latest_per_validator.get(&sub.validator) {
                         Some(existing) if existing.block_number >= sub.block_number => {}
@@ -334,10 +324,9 @@ impl OracleManager {
             }
         }
 
-        // FIX 17: Prune old submissions (limit to avoid excessive deletes per block)
         let prune_limit = 100;
         for key in keys_to_prune.iter().take(prune_limit) {
-            let _ = self.state_db.delete_cf_raw(CF_NATIVE_ORACLE, key);
+            let _ = self.state.delete_cf_raw(CF_NATIVE_ORACLE, key);
         }
 
         Ok(latest_per_validator.into_values().collect())
@@ -348,7 +337,7 @@ impl OracleManager {
     /// be returned as if current when used as a fallback in `aggregate_price`.
     fn get_last_valid_price(&self, market_id: MarketId, current_block: u64) -> Result<FixedPoint, CoreError> {
         let key = aggregated_price_key(market_id);
-        match self.state_db.get_cf_raw(CF_NATIVE_ORACLE, &key)? {
+        match self.state.get_cf_raw(CF_NATIVE_ORACLE, &key)? {
             Some(data) => {
                 let stored = StoredAggregatedPrice::try_from_slice(&data)
                     .map_err(|e| CoreError::Borsh(e.to_string()))?;

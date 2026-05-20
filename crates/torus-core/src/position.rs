@@ -6,7 +6,7 @@ use std::io::{self, Read, Write};
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use torus_state::cf::{CF_NATIVE_BALANCES, CF_NATIVE_POSITIONS};
-use torus_state::StateDb;
+use torus_state::{StateBackend, StateDb};
 use torus_types::{Address, FixedPoint, MarketId};
 
 use crate::error::CoreError;
@@ -204,17 +204,17 @@ pub fn position_key(trader: &Address, market_id: MarketId) -> [u8; 28] {
 // ============================================================================
 
 #[derive(Clone)]
-pub struct PositionManager {
-    state_db: StateDb,
+pub struct PositionManager<T: StateBackend = StateDb> {
+    state: T,
 }
 
-impl PositionManager {
-    pub fn new(state_db: StateDb) -> Self {
-        Self { state_db }
+impl<T: StateBackend> PositionManager<T> {
+    pub fn new(state: T) -> Self {
+        Self { state }
     }
 
-    pub fn state_db(&self) -> &StateDb {
-        &self.state_db
+    pub fn state(&self) -> &T {
+        &self.state
     }
 
     // ---- Position CRUD ----
@@ -225,7 +225,7 @@ impl PositionManager {
         market_id: MarketId,
     ) -> Result<Option<Position>, CoreError> {
         let key = position_key(trader, market_id);
-        match self.state_db.get_cf_raw(CF_NATIVE_POSITIONS, &key)? {
+        match self.state.get_cf_raw(CF_NATIVE_POSITIONS, &key)? {
             Some(data) => Ok(Some(
                 Position::try_from_slice(&data)
                     .map_err(|e| CoreError::Borsh(e.to_string()))?,
@@ -237,7 +237,7 @@ impl PositionManager {
     pub fn put_position(&self, pos: &Position) -> Result<(), CoreError> {
         let key = position_key(&pos.trader, pos.market_id);
         let data = borsh::to_vec(pos).map_err(|e| CoreError::Borsh(e.to_string()))?;
-        self.state_db
+        self.state
             .put_cf_raw(CF_NATIVE_POSITIONS, &key, &data)?;
         Ok(())
     }
@@ -248,25 +248,15 @@ impl PositionManager {
         market_id: MarketId,
     ) -> Result<(), CoreError> {
         let key = position_key(trader, market_id);
-        self.state_db.delete_cf_raw(CF_NATIVE_POSITIONS, &key)?;
+        self.state.delete_cf_raw(CF_NATIVE_POSITIONS, &key)?;
         Ok(())
     }
 
     /// All positions for a trader (prefix scan).
     pub fn positions_for_trader(&self, trader: &Address) -> Result<Vec<Position>, CoreError> {
-        let db = self.state_db.inner();
-        let cf = db
-            .cf_handle(CF_NATIVE_POSITIONS)
-            .ok_or(CoreError::MissingCf(CF_NATIVE_POSITIONS))?;
-        let prefix = trader.as_slice();
-        let iter = db.prefix_iterator_cf(cf, prefix);
-        let mut out = Vec::new();
-        for item in iter {
-            let (key, value) =
-                item.map_err(|e| CoreError::State(torus_state::StateError::RocksDb(e)))?;
-            if !key.starts_with(prefix) {
-                break;
-            }
+        let entries = self.state.iterate_cf(CF_NATIVE_POSITIONS, Some(trader.as_slice()))?;
+        let mut out = Vec::with_capacity(entries.len());
+        for (_key, value) in entries {
             out.push(
                 Position::try_from_slice(&value)
                     .map_err(|e| CoreError::Borsh(e.to_string()))?,
@@ -279,7 +269,7 @@ impl PositionManager {
 
     pub fn get_native_balance(&self, trader: &Address) -> Result<NativeBalance, CoreError> {
         match self
-            .state_db
+            .state
             .get_cf_raw(CF_NATIVE_BALANCES, trader.as_slice())?
         {
             Some(data) => Ok(NativeBalance::try_from_slice(&data)
@@ -294,7 +284,7 @@ impl PositionManager {
         bal: &NativeBalance,
     ) -> Result<(), CoreError> {
         let data = borsh::to_vec(bal).map_err(|e| CoreError::Borsh(e.to_string()))?;
-        self.state_db
+        self.state
             .put_cf_raw(CF_NATIVE_BALANCES, trader.as_slice(), &data)?;
         Ok(())
     }
