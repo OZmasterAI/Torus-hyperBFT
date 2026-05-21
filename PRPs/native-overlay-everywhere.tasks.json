@@ -1,0 +1,70 @@
+{
+  "prp": "native-overlay-everywhere",
+  "created": "2026-05-21T12:20:00Z",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Make NativeStateOverlay generic over fallback",
+      "status": "pending",
+      "files": ["crates/torus-state/src/backend.rs", "crates/torus-state/src/lib.rs"],
+      "validate": "cargo test -p torus-state chained_overlay",
+      "depends_on": []
+    },
+    {
+      "id": 2,
+      "name": "Make compute_native_state_root generic over StateBackend",
+      "status": "pending",
+      "files": ["crates/torus-bridge/src/state_root.rs"],
+      "validate": "cargo test -p torus-bridge native_state_root",
+      "depends_on": [1]
+    },
+    {
+      "id": 3,
+      "name": "do_validate always uses overlay + PendingExec",
+      "status": "pending",
+      "files": ["crates/torus-consensus/src/app.rs"],
+      "validate": "cargo test -p torus-consensus validate",
+      "depends_on": [1]
+    },
+    {
+      "id": 4,
+      "name": "produce_block reads native_root via overlay chain and defers commit",
+      "status": "pending",
+      "files": ["crates/torus-consensus/src/app.rs", "crates/torus-bridge/src/proposer.rs"],
+      "validate": "cargo test -p torus-consensus produce && cargo test -p torus-bridge proposer",
+      "depends_on": [2, 3]
+    },
+    {
+      "id": 5,
+      "name": "Catch-up path uses overlay + immediate flush + skip nonce check",
+      "status": "pending",
+      "files": ["crates/torus-consensus/src/app.rs", "crates/torus-bridge/src/validator.rs"],
+      "validate": "cargo test -p torus-bridge validator && cargo test -p torus-consensus",
+      "depends_on": [1]
+    },
+    {
+      "id": 6,
+      "name": "Remove ensure_native_committed_through and execute_native_post_commit",
+      "status": "pending",
+      "files": ["crates/torus-consensus/src/app.rs"],
+      "validate": "cargo build -p torus-consensus && cargo test -p torus-consensus",
+      "depends_on": [3, 4, 5]
+    },
+    {
+      "id": 7,
+      "name": "Crash recovery uses overlay + immediate flush",
+      "status": "pending",
+      "files": ["crates/torus-consensus/src/app.rs"],
+      "validate": "cargo test -p torus-consensus replay_native",
+      "depends_on": [1, 6]
+    },
+    {
+      "id": 8,
+      "name": "Devnet integration: 10k+ blocks with tx-loop + native-order-flood",
+      "status": "pending",
+      "files": [],
+      "validate": "docker logs devnet-validator-0-1 2>&1 | grep -c 'state root mismatch' | grep '^0$'",
+      "depends_on": [1, 2, 3, 4, 5, 6, 7]
+    }
+  ]
+}
