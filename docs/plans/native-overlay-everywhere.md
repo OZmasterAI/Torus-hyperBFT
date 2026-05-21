@@ -1,4 +1,4 @@
-# Design: Native Overlay Everywhere (Deferred Native Commit)
+# Design: Native Overlay Everywhere (Chained Overlays, Zero Disk Writes Until Commit)
 
 ## Problem
 12 sessions (S222-S233) of state root divergence bugs, all from the same root cause:
@@ -14,102 +14,116 @@ but it's only used for the fork-sibling path (`use_overlay=true`). The other 3 p
 
 | Path | Where | Writes to | Bug-free? |
 |------|-------|-----------|-----------|
-| Fork sibling (use_overlay) | do_validate L983-1008 | NativeStateOverlay → PendingExec | YES |
+| Fork sibling (use_overlay) | do_validate L983-1008 | NativeStateOverlay -> PendingExec | YES |
 | Linear (no fork) | do_validate L1009-1030 | Disk via execute_native_post_commit | NO |
 | Parent catch-up | ensure_native_committed_through L262 | Disk directly | NO |
 | EVM catch-up | do_validate L860-913 | Disk via execute_native_post_commit | NO |
 
-## Options
+## Design: Chained Overlays
 
-### Option A: Unify all paths to overlay (Recommended)
+Remove ALL direct disk writes from native execution. Every path uses NativeStateOverlay.
+Disk is ONLY written in flush_committed_bundles when consensus commits a block. Overlays
+chain through parent overlays so produce_block can read uncommitted parent state without
+flushing to disk.
 
-Remove the linear/fork distinction. ALL do_validate calls store results in PendingExec.
-Flush to disk ONLY via flush_committed_bundles when consensus commits.
+### Key insight
+NativeStateOverlay already implements iterate_cf with merge semantics (L304-341 in
+backend.rs): pending writes merge with fallback, tombstones handled, sorted output.
+compute_native_state_root can run on an overlay instead of disk.
 
-**Changes:**
+### Chaining mechanism
+Make NativeStateOverlay generic over its fallback:
 
-1. **do_validate** (app.rs ~L962-1040): Remove the `if use_overlay { } else { }` branch.
-   Always create native overlay, always store in PendingExec. ~30 lines removed, ~5 added.
+```rust
+// Before:
+pub struct NativeStateOverlay { db: StateDb, pending: Arc<RwLock<PendingState>> }
 
-2. **produce_block** (app.rs ~L1040-1209): Before computing native_root:
-   - Call flush_committed_bundles (need committed hash from block tree)
-   - Remove ensure_native_committed_through call
-   - After building the block: store EVM bundle + native overlay in PendingExec
-     (currently commits EVM to disk immediately at L1165)
-   ~20 lines changed.
+// After:
+pub struct NativeStateOverlay<T: StateBackend = StateDb> { db: T, pending: Arc<RwLock<PendingState>> }
+```
 
-3. **catch-up path** (app.rs ~L860-913): Run native on overlay per ancestor,
-   flush immediately since these are already-committed blocks. Skip nonce check
-   (already consensus-committed). ~15 lines changed.
+This gives: `NativeStateOverlay<NativeStateOverlay<StateDb>>` = child -> parent -> disk.
+Reads check child pending -> parent pending -> disk. Zero cost if parent is already flushed.
 
-4. **Remove ensure_native_committed_through** (app.rs L262-316): No longer needed.
-   All parent state arrives via flush_committed_bundles. ~55 lines removed.
+## Changes
 
-5. **Remove execute_native_post_commit** (app.rs L632-673): Replace all callers
-   with execute_native_on_overlay. Only flush path is flush_committed_bundles.
-   ~40 lines removed.
+### 1. Make NativeStateOverlay generic (backend.rs)
+- `struct NativeStateOverlay<T: StateBackend = StateDb>` — generic over fallback
+- All `impl` blocks become `impl<T: StateBackend> NativeStateOverlay<T>`
+- `new()` takes `T` instead of `StateDb`
+- `flush()` writes pending to a `&StateDb` target (unchanged)
+- ~30 lines changed, no logic changes
 
-6. **flush_committed_bundles** (app.rs L578-629): Already handles native overlay
-   flush (L614-618). No change needed — it already works for the fork path.
+### 2. compute_native_state_root generic (state_root.rs or wherever it lives)
+- Change signature: `fn compute_native_state_root(db: &impl StateBackend)` instead of `&StateDb`
+- Same for compute_full_composite_root if it reads native CFs
+- ~5 lines changed
 
-7. **Crash recovery / replay_native_post_commit_if_needed** (app.rs L143-260):
-   On startup, if native_applied_height < committed height, replay using overlay
-   + immediate flush. Similar to catch-up. ~20 lines changed.
+### 3. do_validate — always use overlay + PendingExec (app.rs ~L962-1040)
+- Remove the `if use_overlay { } else { }` branch entirely
+- ALL paths: create NativeStateOverlay, run execute_native_on_overlay, store in PendingExec
+- For the overlay case (fork sibling): overlay chains through parent's pending overlay
+  if parent is in pending_bundles, otherwise falls back to disk
+- ~30 lines removed, ~10 added
 
-8. **proposer.rs build_block_with_native** (L156-235): Currently commits EVM with
-   `execute_block(state_db, ..., true)`. Change to `false` (don't commit), return
-   BundleState for deferred commit. ~3 lines changed.
+### 4. produce_block — read native_root from overlay chain (app.rs ~L1040-1209)
+- Remove ensure_native_committed_through call
+- Build overlay chain: if parent has a pending native_overlay in pending_bundles,
+  create new overlay wrapping it. Otherwise wrap disk.
+- compute_native_state_root(&overlay) instead of compute_native_state_root(&state_db)
+- After building block: store EVM bundle + native overlay in PendingExec
+  (currently commits EVM to disk immediately at L1165 — defer instead)
+- ~25 lines changed
 
-**Files:** app.rs (~150 lines changed), proposer.rs (~3 lines), validator.rs (0 — already returns overlay data)
+### 5. catch-up path — overlay + immediate flush (app.rs ~L860-913)
+- Run native on overlay per ancestor block
+- Flush overlay immediately after each block (already consensus-committed)
+- Skip nonce check (blocks are already committed, nonce replay is not a concern)
+- ~15 lines changed
 
-**Effort:** Medium (1-2 sessions). Machinery exists, it's wiring.
-**Risk:** Low — we're REMOVING code paths and unifying to one that already works.
+### 6. Remove dead code (app.rs)
+- Remove `ensure_native_committed_through` (L262-316) — ~55 lines
+- Remove `execute_native_post_commit` (L632-673) — ~40 lines
+- Remove `read_native_applied_height` / `write_native_applied_height` if no longer needed
+  (flush_committed_bundles can track via evm_committed_height or a unified committed_height)
 
-### Option B: Fix nonce check + keep two paths
+### 7. Crash recovery (app.rs L143-260)
+- replay_native_post_commit_if_needed: use overlay + immediate flush
+- Same pattern as catch-up: create overlay, execute, flush to disk
+- ~20 lines changed
 
-Skip nonce check in validate_block_with_native_for_catchup. Keep the linear/fork
-distinction.
+### 8. proposer.rs build_block_with_native (L156-235)
+- Change `evm_executor.execute_block(state_db, ..., true)` to `false`
+- Don't commit EVM to disk — return BundleState for deferred commit
+- ~3 lines changed
 
-**Changes:** validator.rs ~5 lines (add skip_nonce_check parameter).
+## Summary
 
-**Effort:** Small (30 min)
-**Risk:** High — the linear path still writes to disk, future bugs guaranteed.
+| What | Lines |
+|------|-------|
+| NativeStateOverlay generic | ~30 changed |
+| compute_native_state_root generic | ~5 changed |
+| do_validate: always overlay | -30, +10 |
+| produce_block: overlay chain, defer | ~25 changed |
+| catch-up: overlay + flush + skip nonce | ~15 changed |
+| Remove ensure_native_committed_through | -55 |
+| Remove execute_native_post_commit | -40 |
+| Crash recovery | ~20 changed |
+| proposer.rs | ~3 changed |
+| **Net** | **~110 changed, ~95 removed** |
 
-### Option C: Overlay everywhere + chain overlays (no flush before produce)
+**Files:** backend.rs, app.rs, proposer.rs, state_root computation (3-4 files)
 
-Like Option A, but instead of flushing parent overlay to disk before produce_block,
-read THROUGH chained overlays (parent overlay on top of disk). Avoids any disk writes
-until final commit.
+## Speculative Pipelining Readiness
+With chained overlays, speculative block production (Task C3) becomes trivial:
+- Speculative produce_block creates overlay wrapping uncommitted parent overlay
+- If speculation confirmed: overlay stays in PendingExec chain
+- If speculation discarded: drop the overlay (zero disk cleanup)
+- No on_speculative_rollback state repair needed
 
-**Effort:** Large — NativeStateOverlay doesn't support chaining, compute_native_state_root
-would need to read from overlay instead of disk.
-**Risk:** Medium — more complex overlay management, harder to debug.
-
-## Recommendation
-
-**Option A.** It's the minimal change that eliminates the entire class of bugs. We're
-removing the special "linear" and "ensure_native_committed_through" code paths and
-unifying to the overlay path that already works for fork siblings. The machinery
-(NativeStateOverlay, StateBackend, PendingExec with native_overlay) is all built.
-
-Option B is a band-aid. Option C is over-engineering for now (but becomes useful
-for speculative pipelining later).
-
-## Task Order
-
-1. Remove linear path in do_validate — always use overlay + PendingExec
-2. Update produce_block — flush parent before native_root, defer own block to PendingExec
-3. Update catch-up path — overlay + immediate flush, skip nonce check
-4. Remove ensure_native_committed_through and execute_native_post_commit
-5. Update crash recovery (replay_native_post_commit_if_needed)
-6. Update proposer.rs — don't commit EVM in build_block_with_native
-7. Test: rebuild devnet, run tx-loop + native-order-flood, verify zero mismatches
-
-## Open Questions
-
-1. Does flush_committed_bundles have access to the right committed_hash in produce_block?
-   → Yes, ProduceBlockRequest has block_tree() which gives highest_committed_block().
-2. Does build_block_with_native need the EVM BundleState committed to compute state_root?
-   → No, compute_full_composite_root takes BundleState as input without needing it on disk.
-3. Memory overhead of holding overlays for pending blocks?
-   → Minimal. Each overlay is a BTreeMap of CF writes. At most 2-3 pending blocks.
+## Verification
+1. `cargo test -p torus-consensus` — existing tests pass
+2. `cargo test -p torus-bridge` — native executor tests pass
+3. Rebuild devnet, run tx-loop + native-order-flood simultaneously
+4. Verify zero state root mismatches after 10k+ blocks with sustained native load
+5. Kill and restart a validator mid-run — verify crash recovery works
