@@ -329,10 +329,12 @@ impl<N: Network> Pacemaker<N> {
                         new_tc.view,
                         validator_set_state.committed_validator_set(),
                         rep,
+                        self.config.leader_tenure,
                     ),
                     None => select_leader(
                         new_tc.view,
                         validator_set_state.committed_validator_set(),
+                        self.config.leader_tenure,
                     ),
                 };
                 let _ = block_tree.record_leader_timeout(&timed_out_leader);
@@ -593,6 +595,10 @@ pub(crate) struct PacemakerConfiguration {
 
     /// How much time can elapse in a view before it times out.
     pub(crate) max_view_time: Duration,
+
+    /// How many consecutive views a single leader keeps before rotation.
+    /// 1 = rotate every view (original behavior).
+    pub(crate) leader_tenure: u64,
 }
 
 /// In-memory state of a [`Pacemaker`].
@@ -781,8 +787,11 @@ impl ViewInfo {
 /// Deterministically select a replica in `validator_set` to become the leader of `view` using the
 /// [Interleaved WRR](https://en.wikipedia.org/wiki/Weighted_round_robin#Interleaved_WRR) algorithm.
 ///
+/// `tenure` controls how many consecutive views the same leader keeps before rotation.
+/// A tenure of 1 (or 0) gives the original per-view rotation behavior.
+///
 /// [Read more](super#leader-selection).
-pub fn select_leader(view: ViewNumber, validator_set: &ValidatorSet) -> VerifyingKey {
+pub fn select_leader(view: ViewNumber, validator_set: &ValidatorSet, tenure: u64) -> VerifyingKey {
     // Length of the abstract array.
     let p_total = validator_set.total_power();
     // Total number of validators.
@@ -795,8 +804,11 @@ pub fn select_leader(view: ViewNumber, validator_set: &ValidatorSet) -> Verifyin
         p_total.int()
     );
 
+    // Stable leader: divide view by tenure so the same leader is selected for
+    // `tenure` consecutive views before rotating. tenure.max(1) prevents div-by-zero.
+    let effective_view = view.int() / tenure.max(1);
     // Index in the abstract array.
-    let index = view.int() % (p_total.int() as u64);
+    let index = effective_view % (p_total.int() as u64);
     // Max. power among the validators.
     // Safety: n > 0 asserted above, so max() always returns Some.
     let p_max = validator_set
@@ -838,11 +850,12 @@ pub fn select_leader_with_reputation(
     view: ViewNumber,
     validator_set: &ValidatorSet,
     reputation: &crate::hotstuff::types::LeaderReputation,
+    tenure: u64,
 ) -> VerifyingKey {
     // Warm-up: use plain round-robin for the first 20 views to let the
     // system bootstrap before reputation data influences leader selection.
     if view.int() < 20 {
-        return select_leader(view, validator_set);
+        return select_leader(view, validator_set, tenure);
     }
 
     use crate::types::{data_types::Power, update_sets::ValidatorSetUpdates};
@@ -860,7 +873,7 @@ pub fn select_leader_with_reputation(
     }
     adjusted_vs.apply_updates(&updates);
 
-    select_leader(view, &adjusted_vs)
+    select_leader(view, &adjusted_vs, tenure)
 }
 
 /// Check whether `view` is an epoch-change view given the configured `epoch_length`.
@@ -909,7 +922,7 @@ fn select_leader_fairness_test() {
     let total_power = validator_set.total_power().int() as u64;
     let leader_sequence: Vec<VerifyingKey> = (0..total_power)
         .into_iter()
-        .map(|v| select_leader(ViewNumber::new(v), &validator_set))
+        .map(|v| select_leader(ViewNumber::new(v), &validator_set, 1))
         .collect();
 
     validator_set.validators().for_each(|validator| {

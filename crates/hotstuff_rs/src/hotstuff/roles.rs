@@ -75,10 +75,11 @@ pub(crate) fn is_proposer(
     validator: &VerifyingKey,
     view: ViewNumber,
     validator_set_state: &ValidatorSetState,
+    tenure: u64,
 ) -> bool {
-    validator == &select_leader(view, validator_set_state.committed_validator_set())
+    validator == &select_leader(view, validator_set_state.committed_validator_set(), tenure)
         || (!validator_set_state.update_decided()
-            && validator == &select_leader(view, validator_set_state.previous_validator_set()))
+            && validator == &select_leader(view, validator_set_state.previous_validator_set(), tenure))
 }
 
 /// MonadBFT B3: Determine whether `validator` should act as proposer, using
@@ -91,6 +92,7 @@ pub(crate) fn is_proposer_with_reputation(
     view: ViewNumber,
     validator_set_state: &ValidatorSetState,
     reputation: Option<&crate::hotstuff::types::LeaderReputation>,
+    tenure: u64,
 ) -> bool {
     use crate::pacemaker::implementation::select_leader_with_reputation;
     match reputation {
@@ -100,6 +102,7 @@ pub(crate) fn is_proposer_with_reputation(
                     view,
                     validator_set_state.committed_validator_set(),
                     rep,
+                    tenure,
                 )
                 || (!validator_set_state.update_decided()
                     && validator
@@ -107,9 +110,10 @@ pub(crate) fn is_proposer_with_reputation(
                             view,
                             validator_set_state.previous_validator_set(),
                             rep,
+                            tenure,
                         ))
         }
-        None => is_proposer(validator, view, validator_set_state),
+        None => is_proposer(validator, view, validator_set_state, tenure),
     }
 }
 
@@ -118,6 +122,7 @@ pub(crate) fn phase_vote_recipient_with_reputation(
     phase_vote: &PhaseVote,
     validator_set_state: &ValidatorSetState,
     reputation: Option<&crate::hotstuff::types::LeaderReputation>,
+    tenure: u64,
 ) -> VerifyingKey {
     use crate::pacemaker::implementation::select_leader_with_reputation;
     match reputation {
@@ -127,6 +132,7 @@ pub(crate) fn phase_vote_recipient_with_reputation(
                     phase_vote.view + 1,
                     validator_set_state.committed_validator_set(),
                     rep,
+                    tenure,
                 )
             } else {
                 match phase_vote.phase {
@@ -135,17 +141,19 @@ pub(crate) fn phase_vote_recipient_with_reputation(
                             phase_vote.view + 1,
                             validator_set_state.previous_validator_set(),
                             rep,
+                            tenure,
                         )
                     }
                     Phase::Decide => select_leader_with_reputation(
                         phase_vote.view + 1,
                         validator_set_state.committed_validator_set(),
                         rep,
+                        tenure,
                     ),
                 }
             }
         }
-        None => phase_vote_recipient(phase_vote, validator_set_state),
+        None => phase_vote_recipient(phase_vote, validator_set_state, tenure),
     }
 }
 
@@ -219,21 +227,25 @@ pub(crate) fn is_phase_voter(
 pub(crate) fn phase_vote_recipient(
     phase_vote: &PhaseVote,
     validator_set_state: &ValidatorSetState,
+    tenure: u64,
 ) -> VerifyingKey {
     if validator_set_state.update_decided() {
         select_leader(
             phase_vote.view + 1,
             validator_set_state.committed_validator_set(),
+            tenure,
         )
     } else {
         match phase_vote.phase {
             Phase::Generic | Phase::Prepare | Phase::Precommit | Phase::Commit => select_leader(
                 phase_vote.view + 1,
                 validator_set_state.previous_validator_set(),
+                tenure,
             ),
             Phase::Decide => select_leader(
                 phase_vote.view + 1,
                 validator_set_state.committed_validator_set(),
+                tenure,
             ),
         }
     }
@@ -256,11 +268,13 @@ pub(crate) fn phase_vote_recipient(
 pub(crate) fn new_view_recipients(
     new_view: &NewView,
     validator_set_state: &ValidatorSetState,
+    tenure: u64,
 ) -> (VerifyingKey, Option<VerifyingKey>) {
     (
         select_leader(
             new_view.view + 1,
             validator_set_state.committed_validator_set(),
+            tenure,
         ),
         if validator_set_state.update_decided() {
             None
@@ -268,6 +282,7 @@ pub(crate) fn new_view_recipients(
             Some(select_leader(
                 new_view.view + 1,
                 validator_set_state.previous_validator_set(),
+                tenure,
             ))
         },
     )
@@ -278,11 +293,12 @@ pub(crate) fn new_view_recipients_with_reputation(
     new_view: &NewView,
     validator_set_state: &ValidatorSetState,
     reputation: Option<&crate::hotstuff::types::LeaderReputation>,
+    tenure: u64,
 ) -> (VerifyingKey, Option<VerifyingKey>) {
     use crate::pacemaker::implementation::select_leader_with_reputation;
     let select = |view, vs: &crate::types::validator_set::ValidatorSet| match reputation {
-        Some(rep) => select_leader_with_reputation(view, vs, rep),
-        None => select_leader(view, vs),
+        Some(rep) => select_leader_with_reputation(view, vs, rep, tenure),
+        None => select_leader(view, vs, tenure),
     };
     (
         select(

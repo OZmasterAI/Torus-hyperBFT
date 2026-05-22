@@ -244,6 +244,8 @@ pub struct Configuration {
     pub max_view_time: Duration,
     #[builder(setter(doc = "Enable logging? Required."))]
     pub log_events: bool,
+    #[builder(default = 1, setter(doc = "Set the number of consecutive views a leader keeps before rotation. Default: 1 (rotate every view)."))]
+    pub leader_tenure: u64,
 }
 
 impl
@@ -263,15 +265,18 @@ impl
         BlockSyncServerConfiguration,
     ) {
         let keypair = Keypair::new(self.me);
+        let leader_tenure = self.leader_tenure.max(1);
         let hotstuff_config = HotStuffConfiguration {
             chain_id: self.chain_id,
             keypair: keypair.clone(),
+            leader_tenure,
         };
         let pacemaker_config = PacemakerConfiguration {
             chain_id: self.chain_id,
             keypair: keypair.clone(),
             epoch_length: self.epoch_length,
             max_view_time: self.max_view_time,
+            leader_tenure,
         };
         let block_sync_client_config = BlockSyncClientConfiguration {
             chain_id: self.chain_id,
@@ -280,6 +285,7 @@ impl
             blacklist_expiry_time: self.block_sync_blacklist_expiry_time,
             block_sync_trigger_min_view_difference: self.block_sync_trigger_min_view_difference,
             block_sync_trigger_timeout: self.block_sync_trigger_timeout,
+            leader_tenure,
         };
         let block_sync_server_config = BlockSyncServerConfiguration {
             chain_id: self.chain_id,

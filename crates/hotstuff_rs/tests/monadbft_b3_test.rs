@@ -253,8 +253,8 @@ fn reputation_weighted_selection_matches_standard_at_full_rep() {
     // For all views, reputation-weighted and standard should select the same leader.
     for v in 0..20 {
         let view = ViewNumber::new(v);
-        let standard = select_leader(view, &vs);
-        let weighted = select_leader_with_reputation(view, &vs, &rep);
+        let standard = select_leader(view, &vs, 1);
+        let weighted = select_leader_with_reputation(view, &vs, &rep, 1);
         assert_eq!(
             standard, weighted,
             "View {}: standard and weighted should match at full reputation",
@@ -283,7 +283,7 @@ fn low_reputation_reduces_selection_frequency() {
     let total_views = 1000u64;
     let mut counts = [0u64; 4];
     for v in 0..total_views {
-        let leader = select_leader_with_reputation(ViewNumber::new(v), &vs, &rep);
+        let leader = select_leader_with_reputation(ViewNumber::new(v), &vs, &rep, 1);
         for (i, kp) in keypairs.iter().enumerate() {
             if leader == kp.verifying_key() {
                 counts[i] += 1;
@@ -322,7 +322,7 @@ fn low_reputation_does_not_exclude() {
     let total_views = 1000u64;
     let mut count_v0 = 0u64;
     for v in 0..total_views {
-        let leader = select_leader_with_reputation(ViewNumber::new(v), &vs, &rep);
+        let leader = select_leader_with_reputation(ViewNumber::new(v), &vs, &rep, 1);
         if leader == keypairs[0].verifying_key() {
             count_v0 += 1;
         }
@@ -404,8 +404,8 @@ fn reputation_determinism() {
 
     for v in 0..50 {
         let view = ViewNumber::new(v);
-        let leader_a = select_leader_with_reputation(view, &vs, &rep_a);
-        let leader_b = select_leader_with_reputation(view, &vs, &rep_b);
+        let leader_a = select_leader_with_reputation(view, &vs, &rep_a, 1);
+        let leader_b = select_leader_with_reputation(view, &vs, &rep_b, 1);
         assert_eq!(
             leader_a, leader_b,
             "View {}: determinism violated — different leaders selected",
@@ -435,7 +435,7 @@ fn reputation_with_varied_stake() {
     let total_views = 1000u64;
     let mut counts = [0u64; 4];
     for v in 0..total_views {
-        let leader = select_leader_with_reputation(ViewNumber::new(v), &vs, &rep);
+        let leader = select_leader_with_reputation(ViewNumber::new(v), &vs, &rep, 1);
         for (i, kp) in keypairs.iter().enumerate() {
             if leader == kp.verifying_key() {
                 counts[i] += 1;
@@ -534,7 +534,7 @@ fn reputation_weighted_selection_performance() {
     // Measure overhead by running many selections.
     let start = std::time::Instant::now();
     for v in 0..10_000 {
-        let _ = select_leader_with_reputation(ViewNumber::new(v), &vs, &rep);
+        let _ = select_leader_with_reputation(ViewNumber::new(v), &vs, &rep, 1);
     }
     let duration = start.elapsed();
 

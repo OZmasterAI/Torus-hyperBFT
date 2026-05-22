@@ -196,6 +196,7 @@ impl<N: Network> HotStuff<N> {
                     self.view_info.view,
                     &validator_set_state,
                     reputation.as_ref(),
+                    self.config.leader_tenure,
                 ) {
                     let (parent_block, child_height) = if highest_pc.is_genesis_pc() {
                         (None, BlockHeight::new(0))
@@ -227,7 +228,7 @@ impl<N: Network> HotStuff<N> {
                         timestamp: SystemTime::now(),
                         block: block.clone(),
                     }).publish(&self.event_publisher);
-                    let committed_vs_updates = block_tree.update(&block.justify, &self.event_publisher).unwrap_or_else(|e| {
+                    let committed_vs_updates = block_tree.update(&block.justify, &self.event_publisher, self.config.leader_tenure).unwrap_or_else(|e| {
                         if let BlockTreeError::BlockExpectedButNotFound { block: missing } = &e {
                             log::warn!("enter_view: missing block {:?} in commit chain — triggering sync", missing);
                             self.sync_needed = true;
@@ -271,7 +272,7 @@ impl<N: Network> HotStuff<N> {
 
         // FIX CONS-PF-10: Use reputation-weighted leader for NewView routing.
         let reputation = block_tree.leader_reputation().ok();
-        match new_view_recipients_with_reputation(&new_view, &validator_set_state, reputation.as_ref()) {
+        match new_view_recipients_with_reputation(&new_view, &validator_set_state, reputation.as_ref(), self.config.leader_tenure) {
             (committed_vs_leader, None) => self
                 .sender_handle
                 .send::<HotStuffMessage>(committed_vs_leader, new_view.clone().into()),
@@ -325,6 +326,7 @@ impl<N: Network> HotStuff<N> {
             self.view_info.view,
             &validator_set_state,
             reputation.as_ref(),
+            self.config.leader_tenure,
         );
         if am_proposer {
             // If a chain of consecutive views of voting for a validator-set-updating block has been interrupted, then
@@ -424,7 +426,7 @@ impl<N: Network> HotStuff<N> {
                     .publish(&self.event_publisher);
 
                     let committed_vs_updates =
-                        block_tree.update(&block.justify, &self.event_publisher).unwrap_or(None);
+                        block_tree.update(&block.justify, &self.event_publisher, self.config.leader_tenure).unwrap_or(None);
                     if let Some(vs_updates) = committed_vs_updates {
                         self.validator_set_update_handle
                             .update_validator_set(vs_updates);
@@ -609,6 +611,7 @@ impl<N: Network> HotStuff<N> {
                 check_view,
                 &validator_set_state,
                 reputation.as_ref(),
+                self.config.leader_tenure,
             ) {
                 return Ok(());
             }
@@ -852,7 +855,7 @@ impl<N: Network> HotStuff<N> {
 
             // 3. Trigger block tree updates: update highestPC, lock, commit.
             let committed_validator_set_updates =
-                block_tree.update(&proposal.block.justify, &self.event_publisher).unwrap_or(None);
+                block_tree.update(&proposal.block.justify, &self.event_publisher, self.config.leader_tenure).unwrap_or(None);
 
             if let Some(vs_updates) = committed_validator_set_updates {
                 self.validator_set_update_handle
@@ -889,7 +892,7 @@ impl<N: Network> HotStuff<N> {
                 );
                 // FIX CONS-FIND-13: Use reputation-weighted vote recipient.
                 let reputation = block_tree.leader_reputation().ok();
-                let vote_recipient = phase_vote_recipient_with_reputation(&phase_vote, &validator_set_state, reputation.as_ref());
+                let vote_recipient = phase_vote_recipient_with_reputation(&phase_vote, &validator_set_state, reputation.as_ref(), self.config.leader_tenure);
                 self.sender_handle
                     .send::<HotStuffMessage>(vote_recipient, phase_vote.clone().into());
 
@@ -986,7 +989,7 @@ impl<N: Network> HotStuff<N> {
 
         // 2. Trigger block tree updates: update highestPC, lock, commit.
         let committed_validator_set_updates =
-            block_tree.update(&nudge.justify, &self.event_publisher).unwrap_or(None);
+            block_tree.update(&nudge.justify, &self.event_publisher, self.config.leader_tenure).unwrap_or(None);
 
         if let Some(vs_updates) = committed_validator_set_updates {
             self.validator_set_update_handle
@@ -1039,7 +1042,7 @@ impl<N: Network> HotStuff<N> {
             );
             // FIX CONS-FIND-13: Use reputation-weighted vote recipient.
             let reputation = block_tree.leader_reputation().ok();
-            let vote_recipient = phase_vote_recipient_with_reputation(&vote, &validator_set_state, reputation.as_ref());
+            let vote_recipient = phase_vote_recipient_with_reputation(&vote, &validator_set_state, reputation.as_ref(), self.config.leader_tenure);
             self.sender_handle
                 .send::<HotStuffMessage>(vote_recipient, vote.clone().into());
 
@@ -1113,7 +1116,7 @@ impl<N: Network> HotStuff<N> {
                 //    first, then attempt full update for commits.
                 let _ = block_tree.advance_highest_pc_from_remote(&new_pc);
                 let committed_validator_set_updates =
-                    block_tree.update(&new_pc, &self.event_publisher).unwrap_or(None);
+                    block_tree.update(&new_pc, &self.event_publisher, self.config.leader_tenure).unwrap_or(None);
 
 
                 // MonadBFT B2: Speculative commit — 1-QC for fresh proposals.
@@ -1183,7 +1186,7 @@ impl<N: Network> HotStuff<N> {
         {
             // 2. Trigger block tree updates: update highestPC, lock, commit (if new PC collected).
             let committed_validator_set_updates =
-                block_tree.update(&new_view.highest_pc, &self.event_publisher).unwrap_or(None);
+                block_tree.update(&new_view.highest_pc, &self.event_publisher, self.config.leader_tenure).unwrap_or(None);
 
             if let Some(vs_updates) = committed_validator_set_updates {
                 self.validator_set_update_handle
@@ -1356,10 +1359,12 @@ impl<N: Network> HotStuff<N> {
                     req.view,
                     validator_set_state.committed_validator_set(),
                     rep,
+                    self.config.leader_tenure,
                 ),
                 None => crate::pacemaker::implementation::select_leader(
                     req.view,
                     validator_set_state.committed_validator_set(),
+                    self.config.leader_tenure,
                 ),
             };
             self.sender_handle.send::<HotStuffMessage>(leader, ne.into());
@@ -1587,6 +1592,7 @@ impl<N: Network> HotStuff<N> {
                 &phase_vote,
                 &validator_set_state,
                 reputation.as_ref(),
+                self.config.leader_tenure,
             );
             self.sender_handle
                 .send::<HotStuffMessage>(vote_recipient, phase_vote.clone().into());
@@ -1711,7 +1717,7 @@ impl<N: Network> HotStuff<N> {
             .publish(&self.event_publisher);
 
             let committed_validator_set_updates =
-                block_tree.update(&block.justify, &self.event_publisher).unwrap_or_else(|e| {
+                block_tree.update(&block.justify, &self.event_publisher, self.config.leader_tenure).unwrap_or_else(|e| {
                     if let BlockTreeError::BlockExpectedButNotFound { block: missing } = &e {
                         log::warn!("body insert: missing block {:?} in commit chain — triggering sync", missing);
                         self.sync_needed = true;
@@ -1829,6 +1835,10 @@ pub(crate) struct HotStuffConfiguration {
 
     /// The keypair with which the HotStuff implementation should sign `PhaseVote`s.
     pub(crate) keypair: Keypair,
+
+    /// How many consecutive views a single leader keeps before rotation.
+    /// 1 = rotate every view (original behavior).
+    pub(crate) leader_tenure: u64,
 }
 
 /// The different ways a call to a method of the `HotStuff` struct can fail.

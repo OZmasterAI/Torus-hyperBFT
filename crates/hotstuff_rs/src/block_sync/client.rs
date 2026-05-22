@@ -289,7 +289,7 @@ impl<N: Network> BlockSyncClient<N> {
             .publish(&self.event_publisher);
 
             let committed_validator_set_updates =
-                block_tree.update(&block.justify, &self.event_publisher).unwrap_or_else(|e| {
+                block_tree.update(&block.justify, &self.event_publisher, self.config.leader_tenure).unwrap_or_else(|e| {
                     log::warn!("block_sync: block_tree.update failed: {:?}", e);
                     None
                 });
@@ -307,7 +307,7 @@ impl<N: Network> BlockSyncClient<N> {
                 if highest_pc.is_correct(block_tree)?
                     && safe_pc(highest_pc, block_tree, chain_id)?
                 {
-                    let _ = block_tree.update(highest_pc, &self.event_publisher);
+                    let _ = block_tree.update(highest_pc, &self.event_publisher, self.config.leader_tenure);
                 }
             }
 
@@ -524,6 +524,8 @@ pub(crate) struct BlockSyncClientConfiguration {
     pub(crate) blacklist_expiry_time: Duration,
     pub(crate) block_sync_trigger_min_view_difference: u64,
     pub(crate) block_sync_trigger_timeout: Duration,
+    /// How many consecutive views a single leader keeps before rotation.
+    pub(crate) leader_tenure: u64,
 }
 
 struct BlockSyncClientState {

@@ -288,6 +288,7 @@ impl<K: KVStore> BlockTreeSingleton<K> {
         &mut self,
         justify: &PhaseCertificate,
         event_publisher: &Option<Sender<Event>>,
+        leader_tenure: u64,
     ) -> Result<Option<ValidatorSetUpdates>, BlockTreeError> {
         let mut wb = BlockTreeWriteBatch::new();
 
@@ -328,9 +329,9 @@ impl<K: KVStore> BlockTreeSingleton<K> {
             if let Ok(vs) = self.committed_validator_set() {
                 let qc_leader = match self.leader_reputation() {
                     Ok(ref rep) => crate::pacemaker::implementation::select_leader_with_reputation(
-                        justify.view, &vs, rep,
+                        justify.view, &vs, rep, leader_tenure,
                     ),
-                    Err(_) => crate::pacemaker::implementation::select_leader(justify.view, &vs),
+                    Err(_) => crate::pacemaker::implementation::select_leader(justify.view, &vs, leader_tenure),
                 };
                 let _ = self.record_leader_success(&qc_leader);
             }
@@ -359,9 +360,9 @@ impl<K: KVStore> BlockTreeSingleton<K> {
                         let proposed_view = block_justify.view + 1;
                         let leader = match self.leader_reputation() {
                             Ok(ref rep) => crate::pacemaker::implementation::select_leader_with_reputation(
-                                proposed_view, &vs, rep,
+                                proposed_view, &vs, rep, leader_tenure,
                             ),
-                            Err(_) => crate::pacemaker::implementation::select_leader(proposed_view, &vs),
+                            Err(_) => crate::pacemaker::implementation::select_leader(proposed_view, &vs, leader_tenure),
                         };
                         let _ = self.record_leader_success(&leader);
                     }
