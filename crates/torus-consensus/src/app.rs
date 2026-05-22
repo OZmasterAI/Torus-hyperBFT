@@ -5,10 +5,15 @@
 //! `produce_block` and `validate_block` do NOT execute EVM transactions.
 //! They only build/validate the raw transaction list for consensus ordering.
 //!
-//! All execution happens in `on_committed_block`, called by hotstuff_rs after
-//! a block is irrevocably committed (2-chain in MonadBFT). This eliminates
-//! the entire class of state divergence bugs by construction: every node
-//! executes the same finalized blocks in the same order.
+//! All execution happens post-commit. This eliminates the entire class of
+//! state divergence bugs by construction.
+//!
+//! ## Execution Pipelining (CTE8)
+//!
+//! Execution is offloaded to a dedicated background thread via a bounded
+//! `SyncSender` channel. `on_committed_block` sends the finalized block to
+//! the execution thread and returns immediately, allowing consensus to
+//! proceed at full speed (~43ms/block) regardless of execution load.
 
 use sha2::{Digest, Sha256};
 
@@ -22,6 +27,8 @@ use hotstuff_rs::types::data_types::{CryptoHash, Data, Datum, Power};
 use hotstuff_rs::types::update_sets::ValidatorSetUpdates;
 
 use std::sync::Arc;
+use std::sync::mpsc::SyncSender;
+use std::thread::JoinHandle;
 use torus_bridge::{
     sort_native_actions, decode_all_txs, BlockCommitter, BlockProposer, BlockValidator,
     BundleState, NativeExecContext, NativeExecutor,
@@ -37,10 +44,6 @@ use torus_types::{
     Address, ChainConfig, TorusBlock, TorusBlockBody, TorusBlockHeader, ValidatorSet,
 };
 
-/// FIX CONS-PF-08: Buffered slash intent recorded during speculative rollback.
-/// Applied to DB only when the next block is produced/validated (i.e., the chain
-/// has moved forward past the equivocation). Discarded if the app is reconstructed
-/// from DB state (meaning the entire speculative chain was abandoned).
 #[derive(Clone, Debug)]
 struct PendingSlash {
     validator: Address,
@@ -49,226 +52,97 @@ struct PendingSlash {
     tombstone: bool,
 }
 
-use crate::kv_store::RocksKVStore;
+struct CommittedBlockMsg {
+    torus_block: TorusBlock,
+    pending_slashes: Vec<PendingSlash>,
+}
 
-/// Consensus application wired to the execution bridge.
-///
-/// ## Consensus-then-Execute
-///
-/// `produce_block`: drains mempool, builds raw tx list, NO execution.
-/// `validate_block`: structural + signature checks only, NO execution.
-/// `on_committed_block`: executes EVM + native for finalized blocks.
-pub struct TorusApp {
+struct ExecutionContext {
     state_db: StateDb,
-    #[allow(dead_code)]
-    proposer: BlockProposer,
     validator: BlockValidator,
     evm_executor: EvmExecutor,
-    proposer_address: Address,
-    last_header: TorusBlockHeader,
     staking: StakingManager,
     epoch_length: u64,
     max_validators: u32,
-    last_validator_set: ValidatorSet,
-    cached_vs_updates: Option<(u64, Option<ValidatorSetUpdates>)>,
-    pending_slashes: Vec<PendingSlash>,
     treasury_address: Address,
     dev_pool_address: Address,
     metrics: Option<Arc<torus_telemetry::Metrics>>,
-    mempool: Option<Arc<Mempool>>,
 }
 
-impl TorusApp {
-    pub fn new(
-        state_db: StateDb,
-        config: &ChainConfig,
-        metrics: Option<Arc<torus_telemetry::Metrics>>,
-        mempool: Option<Arc<Mempool>>,
-    ) -> Self {
-        let staking = StakingManager::new(state_db.clone());
-        let mut proposer = BlockProposer::new(
-            config.chain_id,
-            config.epoch_length,
-            config.max_validators,
-            config.treasury_address,
-            config.dev_pool_address,
-        );
-        proposer.metrics = metrics.clone();
-        let mut validator = BlockValidator::new(
-            config.chain_id,
-            config.epoch_length,
-            config.max_validators,
-            config.treasury_address,
-            config.dev_pool_address,
-        );
-        validator.metrics = metrics.clone();
-        let genesis_validator_set = EpochManager::compute_new_validator_set(
-            &staking, config.max_validators, 0,
-        ).unwrap_or_else(|_| ValidatorSet { validators: vec![], epoch: 0 });
-        let mut app = Self {
-            state_db,
-            proposer,
-            validator,
-            evm_executor: EvmExecutor::new(config.chain_id),
-            proposer_address: Address::ZERO,
-            last_header: torus_bridge::genesis_parent_header(),
-            staking,
-            epoch_length: config.epoch_length,
-            max_validators: config.max_validators,
-            last_validator_set: genesis_validator_set,
-            cached_vs_updates: None,
-            pending_slashes: Vec::new(),
-            treasury_address: config.treasury_address,
-            dev_pool_address: config.dev_pool_address,
-            metrics,
-            mempool,
-        };
-        app.replay_committed_if_needed();
-        app
-    }
+// ---- Standalone helpers (used by both execution thread and crash recovery) ----
 
-    /// Create a stub `TorusApp` without a database (for consensus-only tests).
-    pub fn stub() -> Self {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("torus-stub-{}-{}", std::process::id(), id));
-        let _ = std::fs::create_dir_all(&dir);
-        let state_db = StateDb::open(&dir).expect("open stub state db");
-        let config = ChainConfig {
-            chain_id: TORUS_CHAIN_ID,
-            chain_name: "torus-test".to_string(),
-            evm_gas_limit: 30_000_000,
-            base_fee_per_gas: 1_000_000_000,
-            epoch_length: 100,
-            max_validators: 4,
-            min_stake: torus_economics::MIN_SELF_DELEGATION,
-            fee_burn_bps: 1000,
-            fee_validator_bps: 0,
-            fee_treasury_bps: 4500,
-            fee_dev_pool_bps: 4500,
-            treasury_address: Address::ZERO,
-            dev_pool_address: Address::ZERO,
-            timeout_base_ms: 500,
-        };
-        Self::new(state_db, &config, None, None)
-    }
+fn read_native_applied_height(state_db: &StateDb) -> Option<u64> {
+    state_db
+        .get_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT)
+        .ok()
+        .flatten()
+        .and_then(|data| {
+            if data.len() == 8 {
+                Some(u64::from_be_bytes(data[..8].try_into().ok()?))
+            } else {
+                None
+            }
+        })
+}
 
-    /// Crash recovery: detect and replay committed blocks whose execution was
-    /// interrupted. Replays from native_applied_height to last committed height.
-    fn replay_committed_if_needed(&mut self) {
-        let committed = match self.find_last_committed_height() {
-            Some(h) if h > 0 => h,
-            _ => return,
-        };
+fn write_native_applied_height(state_db: &StateDb, height: u64) {
+    let _ = state_db.put_cf_raw(
+        CF_CONSENSUS_META,
+        META_NATIVE_APPLIED_HEIGHT,
+        &height.to_be_bytes(),
+    );
+}
 
-        let applied = self.read_native_applied_height().unwrap_or(0);
-        if applied >= committed {
+fn find_last_committed_height(state_db: &StateDb) -> Option<u64> {
+    let db = state_db.inner();
+    let cf = db.cf_handle(CF_BLOCK_HEADERS)?;
+    let mut iter = db.iterator_cf(cf, rocksdb::IteratorMode::End);
+    iter.next()
+        .and_then(|r| r.ok())
+        .and_then(|(key, _)| {
+            if key.len() == 8 {
+                Some(u64::from_be_bytes(key[..8].try_into().ok()?))
+            } else {
+                None
+            }
+        })
+}
+
+fn persist_block_header(state_db: &StateDb, block: &TorusBlock) {
+    let block_hash = alloy_primitives::keccak256(&block.header.canonical_header_bytes());
+    let header_json = match serde_json::to_vec(&block.header) {
+        Ok(j) => j,
+        Err(e) => {
+            tracing::error!(%e, "failed to serialize block header");
             return;
         }
+    };
+    let mut data = Vec::with_capacity(32 + header_json.len());
+    data.extend_from_slice(block_hash.as_slice());
+    data.extend_from_slice(&header_json);
+    if let Err(e) = state_db.put_cf_raw(
+        CF_BLOCK_HEADERS,
+        &block.header.height.to_be_bytes(),
+        &data,
+    ) {
+        tracing::error!(%e, height = block.header.height, "failed to persist block header");
+    }
+}
 
-        tracing::warn!(
-            committed_height = committed,
-            applied_height = applied,
-            "crash recovery: execution gap detected, replaying"
-        );
+// ---- Execution pipeline ----
 
-        let header: TorusBlockHeader = match self
-            .state_db
-            .get_cf_raw(CF_BLOCK_HEADERS, &committed.to_be_bytes())
-        {
-            Ok(Some(data)) if data.len() > 32 => match serde_json::from_slice(&data[32..]) {
-                Ok(h) => h,
-                Err(e) => {
-                    tracing::error!(%e, height = committed, "crash recovery: failed to deserialize header");
-                    self.write_native_applied_height(committed);
-                    return;
-                }
-            },
-            _ => {
-                tracing::error!(height = committed, "crash recovery: block header not found");
-                self.write_native_applied_height(committed);
+impl ExecutionContext {
+    fn execute_committed_block(&self, torus_block: &TorusBlock, pending_slashes: Vec<PendingSlash>) {
+        let height = torus_block.header.height;
+
+        if let Some(applied) = read_native_applied_height(&self.state_db) {
+            if applied >= height {
+                tracing::debug!(height, applied, "execution pipeline: already applied, skipping");
                 return;
             }
-        };
-
-        self.last_header = header.clone();
-
-        let body: TorusBlockBody = match self
-            .state_db
-            .get_cf_raw(CF_BLOCK_BODIES, &committed.to_be_bytes())
-        {
-            Ok(Some(data)) => match serde_json::from_slice(&data) {
-                Ok(b) => b,
-                Err(e) => {
-                    tracing::error!(%e, "crash recovery: failed to deserialize block body");
-                    self.write_native_applied_height(committed);
-                    return;
-                }
-            },
-            _ => {
-                tracing::info!(height = committed, "crash recovery: no block body (empty block), marking applied");
-                self.write_native_applied_height(committed);
-                return;
-            }
-        };
-
-        if body.native_actions.is_empty() && body.evm_transactions.is_empty() {
-            tracing::info!(height = committed, "crash recovery: empty block, marking applied");
-            self.write_native_applied_height(committed);
-            return;
         }
 
-        // Reconstruct torus_block from header + body and execute.
-        let block = TorusBlock {
-            header,
-            native_actions: body.native_actions,
-            evm_transactions: body.evm_transactions,
-            core_writer_actions: body.core_writer_actions,
-        };
-        self.execute_committed_block(&block);
-    }
-
-    fn find_last_committed_height(&self) -> Option<u64> {
-        let db = self.state_db.inner();
-        let cf = db.cf_handle(CF_BLOCK_HEADERS)?;
-        let mut iter = db.iterator_cf(cf, rocksdb::IteratorMode::End);
-        iter.next()
-            .and_then(|r| r.ok())
-            .and_then(|(key, _)| {
-                if key.len() == 8 {
-                    Some(u64::from_be_bytes(key[..8].try_into().ok()?))
-                } else {
-                    None
-                }
-            })
-    }
-
-    fn read_native_applied_height(&self) -> Option<u64> {
-        self.state_db
-            .get_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT)
-            .ok()
-            .flatten()
-            .and_then(|data| {
-                if data.len() == 8 {
-                    Some(u64::from_be_bytes(data[..8].try_into().ok()?))
-                } else {
-                    None
-                }
-            })
-    }
-
-    fn write_native_applied_height(&self, height: u64) {
-        let _ = self.state_db.put_cf_raw(
-            CF_CONSENSUS_META,
-            META_NATIVE_APPLIED_HEIGHT,
-            &height.to_be_bytes(),
-        );
-    }
-
-    /// FIX CONS-PF-08: Flush any buffered slash intents to DB.
-    fn flush_pending_slashes(&mut self) {
-        for slash in self.pending_slashes.drain(..) {
+        for slash in pending_slashes {
             match self.staking.slash(
                 slash.validator,
                 slash.fraction_bps,
@@ -301,6 +175,359 @@ impl TorusApp {
                 }
             }
         }
+
+        let has_evm = !torus_block.evm_transactions.is_empty();
+        let has_native = !torus_block.native_actions.is_empty();
+
+        tracing::info!(
+            height,
+            has_evm,
+            has_native,
+            evm_tx_count = torus_block.evm_transactions.len(),
+            native_count = torus_block.native_actions.len(),
+            "execution pipeline: executing finalized block"
+        );
+
+        // ---- EVM execution ----
+        let mut bundle = BundleState::default();
+        let mut computed_fee_revenue: u128 = 0;
+        if has_evm {
+            match self.validator.validate_block_for_catchup(
+                torus_block,
+                &self.state_db,
+                &self.evm_executor,
+            ) {
+                Ok(validated) => {
+                    computed_fee_revenue = torus_bridge::proposer::compute_fee_revenue(&validated.receipts);
+                    if let Err(e) = BlockCommitter::commit_pending_bundle(
+                        &self.state_db,
+                        &validated.bundle,
+                    ) {
+                        tracing::error!(%e, height, "failed to commit EVM bundle");
+                    }
+                    if let Err(e) = BlockCommitter::commit_block_metadata(
+                        &self.state_db,
+                        torus_block,
+                        &validated.receipts,
+                    ) {
+                        tracing::error!(%e, height, "failed to commit block metadata");
+                    }
+                    bundle = validated.bundle;
+                }
+                Err(e) => {
+                    tracing::error!(%e, height, "EVM execution failed for committed block");
+                }
+            }
+        } else {
+            persist_block_header(&self.state_db, torus_block);
+        }
+
+        // ---- Native execution ----
+        if has_native || computed_fee_revenue > 0 {
+            let mut sender_actions = Vec::with_capacity(torus_block.native_actions.len());
+            let mut consumed_nonces = Vec::new();
+            for signed in &torus_block.native_actions {
+                match signed.resolve_sender(torus_block.header.timestamp, |pubkey| {
+                    self.state_db.get_session(pubkey).ok().flatten()
+                }) {
+                    Ok(sender) => {
+                        consumed_nonces.push((sender, signed.nonce));
+                        sender_actions.push((sender, signed.action.clone()));
+                    }
+                    Err(e) => {
+                        tracing::warn!(%e, "failed to recover native action sender, skipping");
+                    }
+                }
+            }
+
+            let overlay = NativeStateOverlay::new(self.state_db.clone());
+            overlay.seed_from_bundle(&bundle);
+
+            let (pre_evm, post_evm) = sort_native_actions(&sender_actions);
+            let mut ctx = NativeExecContext::new(
+                overlay.clone(),
+                torus_block.header.height,
+                torus_block.header.timestamp,
+                torus_block.header.epoch,
+                self.epoch_length,
+                self.max_validators,
+                torus_block.header.proposer,
+                self.treasury_address,
+                self.dev_pool_address,
+            );
+            ctx.metrics = self.metrics.clone();
+
+            NativeExecutor::execute_batch(&mut ctx, &pre_evm);
+            NativeExecutor::execute_batch(&mut ctx, &post_evm);
+            let _ = NativeExecutor::drain_core_writer(&mut ctx);
+            NativeExecutor::process_governance(&mut ctx);
+            NativeExecutor::distribute_fees(&mut ctx, computed_fee_revenue);
+            NativeExecutor::process_epoch_boundary(&mut ctx);
+            ctx.save_order_books();
+
+            for (sender, nonce) in &consumed_nonces {
+                let mut nonce_key = [0u8; 28];
+                nonce_key[..20].copy_from_slice(sender.as_slice());
+                nonce_key[20..28].copy_from_slice(&nonce.to_be_bytes());
+                let _ = overlay.put_cf_raw(
+                    torus_state::cf::CF_NATIVE_NONCES,
+                    &nonce_key,
+                    &torus_block.header.height.to_be_bytes(),
+                );
+            }
+
+            if let Err(e) = overlay.flush(&self.state_db) {
+                tracing::error!(%e, height, "failed to flush native overlay");
+            }
+        }
+
+        // ---- Update tracking ----
+        write_native_applied_height(&self.state_db, height);
+
+        if let Some(ref m) = self.metrics {
+            m.block_height.set(height as i64);
+            m.blocks_committed.inc();
+            let tx_count = torus_block.header.evm_tx_count as u64
+                + torus_block.header.native_action_count as u64;
+            m.block_transactions_count.observe(tx_count as f64);
+        }
+
+        tracing::info!(height, "execution pipeline: block done");
+    }
+}
+
+fn execution_loop(rx: std::sync::mpsc::Receiver<CommittedBlockMsg>, ctx: ExecutionContext) {
+    tracing::info!("execution pipeline thread started");
+    while let Ok(msg) = rx.recv() {
+        ctx.execute_committed_block(&msg.torus_block, msg.pending_slashes);
+    }
+    tracing::info!("execution pipeline thread shutting down");
+}
+
+use crate::kv_store::RocksKVStore;
+
+/// Consensus application wired to the execution bridge.
+///
+/// ## Consensus-then-Execute with Pipelining
+///
+/// `produce_block`: drains mempool, builds raw tx list, NO execution.
+/// `validate_block`: structural + signature checks only, NO execution.
+/// `on_committed_block`: sends finalized blocks to the execution pipeline thread.
+pub struct TorusApp {
+    #[allow(dead_code)]
+    state_db: StateDb,
+    #[allow(dead_code)]
+    proposer: BlockProposer,
+    #[allow(dead_code)]
+    validator: BlockValidator,
+    #[allow(dead_code)]
+    evm_executor: EvmExecutor,
+    proposer_address: Address,
+    last_header: TorusBlockHeader,
+    staking: StakingManager,
+    epoch_length: u64,
+    max_validators: u32,
+    last_validator_set: ValidatorSet,
+    cached_vs_updates: Option<(u64, Option<ValidatorSetUpdates>)>,
+    pending_slashes: Vec<PendingSlash>,
+    #[allow(dead_code)]
+    treasury_address: Address,
+    #[allow(dead_code)]
+    dev_pool_address: Address,
+    #[allow(dead_code)]
+    metrics: Option<Arc<torus_telemetry::Metrics>>,
+    mempool: Option<Arc<Mempool>>,
+    exec_tx: Option<SyncSender<CommittedBlockMsg>>,
+    exec_handle: Option<JoinHandle<()>>,
+}
+
+impl TorusApp {
+    pub fn new(
+        state_db: StateDb,
+        config: &ChainConfig,
+        metrics: Option<Arc<torus_telemetry::Metrics>>,
+        mempool: Option<Arc<Mempool>>,
+    ) -> Self {
+        let staking = StakingManager::new(state_db.clone());
+        let mut proposer = BlockProposer::new(
+            config.chain_id,
+            config.epoch_length,
+            config.max_validators,
+            config.treasury_address,
+            config.dev_pool_address,
+        );
+        proposer.metrics = metrics.clone();
+        let mut validator = BlockValidator::new(
+            config.chain_id,
+            config.epoch_length,
+            config.max_validators,
+            config.treasury_address,
+            config.dev_pool_address,
+        );
+        validator.metrics = metrics.clone();
+        let genesis_validator_set = EpochManager::compute_new_validator_set(
+            &staking, config.max_validators, 0,
+        ).unwrap_or_else(|_| ValidatorSet { validators: vec![], epoch: 0 });
+
+        // Execution pipeline context — owns its own copies for thread safety.
+        let mut exec_validator = BlockValidator::new(
+            config.chain_id,
+            config.epoch_length,
+            config.max_validators,
+            config.treasury_address,
+            config.dev_pool_address,
+        );
+        exec_validator.metrics = metrics.clone();
+        let exec_ctx = ExecutionContext {
+            state_db: state_db.clone(),
+            validator: exec_validator,
+            evm_executor: EvmExecutor::new(config.chain_id),
+            staking: StakingManager::new(state_db.clone()),
+            epoch_length: config.epoch_length,
+            max_validators: config.max_validators,
+            treasury_address: config.treasury_address,
+            dev_pool_address: config.dev_pool_address,
+            metrics: metrics.clone(),
+        };
+
+        // Crash recovery runs synchronously before spawning the pipeline.
+        let last_header = Self::replay_committed(&state_db, &exec_ctx);
+
+        // Spawn execution pipeline: bounded channel (64 blocks) for backpressure.
+        let (exec_tx, exec_rx) = std::sync::mpsc::sync_channel(64);
+        let exec_handle = std::thread::Builder::new()
+            .name("torus-execution".into())
+            .spawn(move || execution_loop(exec_rx, exec_ctx))
+            .expect("spawn execution pipeline thread");
+
+        Self {
+            state_db,
+            proposer,
+            validator,
+            evm_executor: EvmExecutor::new(config.chain_id),
+            proposer_address: Address::ZERO,
+            last_header,
+            staking,
+            epoch_length: config.epoch_length,
+            max_validators: config.max_validators,
+            last_validator_set: genesis_validator_set,
+            cached_vs_updates: None,
+            pending_slashes: Vec::new(),
+            treasury_address: config.treasury_address,
+            dev_pool_address: config.dev_pool_address,
+            metrics,
+            mempool,
+            exec_tx: Some(exec_tx),
+            exec_handle: Some(exec_handle),
+        }
+    }
+
+    /// Create a stub `TorusApp` without a database (for consensus-only tests).
+    pub fn stub() -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("torus-stub-{}-{}", std::process::id(), id));
+        let _ = std::fs::create_dir_all(&dir);
+        let state_db = StateDb::open(&dir).expect("open stub state db");
+        let config = ChainConfig {
+            chain_id: TORUS_CHAIN_ID,
+            chain_name: "torus-test".to_string(),
+            evm_gas_limit: 30_000_000,
+            base_fee_per_gas: 1_000_000_000,
+            epoch_length: 100,
+            max_validators: 4,
+            min_stake: torus_economics::MIN_SELF_DELEGATION,
+            fee_burn_bps: 1000,
+            fee_validator_bps: 0,
+            fee_treasury_bps: 4500,
+            fee_dev_pool_bps: 4500,
+            treasury_address: Address::ZERO,
+            dev_pool_address: Address::ZERO,
+            timeout_base_ms: 500,
+        };
+        Self::new(state_db, &config, None, None)
+    }
+
+    /// Crash recovery: replay committed blocks whose execution was interrupted.
+    fn replay_committed(state_db: &StateDb, exec_ctx: &ExecutionContext) -> TorusBlockHeader {
+        let mut last_header = torus_bridge::genesis_parent_header();
+
+        let committed = match find_last_committed_height(state_db) {
+            Some(h) if h > 0 => h,
+            _ => return last_header,
+        };
+
+        let applied = read_native_applied_height(state_db).unwrap_or(0);
+        if applied >= committed {
+            return last_header;
+        }
+
+        tracing::warn!(
+            committed_height = committed,
+            applied_height = applied,
+            "crash recovery: execution gap detected, replaying"
+        );
+
+        let header: TorusBlockHeader = match state_db
+            .get_cf_raw(CF_BLOCK_HEADERS, &committed.to_be_bytes())
+        {
+            Ok(Some(data)) if data.len() > 32 => match serde_json::from_slice(&data[32..]) {
+                Ok(h) => h,
+                Err(e) => {
+                    tracing::error!(%e, height = committed, "crash recovery: failed to deserialize header");
+                    write_native_applied_height(state_db, committed);
+                    return last_header;
+                }
+            },
+            _ => {
+                tracing::error!(height = committed, "crash recovery: block header not found");
+                write_native_applied_height(state_db, committed);
+                return last_header;
+            }
+        };
+
+        last_header = header.clone();
+
+        let body: TorusBlockBody = match state_db
+            .get_cf_raw(CF_BLOCK_BODIES, &committed.to_be_bytes())
+        {
+            Ok(Some(data)) => match serde_json::from_slice(&data) {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::error!(%e, "crash recovery: failed to deserialize block body");
+                    write_native_applied_height(state_db, committed);
+                    return last_header;
+                }
+            },
+            _ => {
+                tracing::info!(height = committed, "crash recovery: no block body (empty block), marking applied");
+                write_native_applied_height(state_db, committed);
+                return last_header;
+            }
+        };
+
+        if body.native_actions.is_empty() && body.evm_transactions.is_empty() {
+            tracing::info!(height = committed, "crash recovery: empty block, marking applied");
+            write_native_applied_height(state_db, committed);
+            return last_header;
+        }
+
+        let block = TorusBlock {
+            header,
+            native_actions: body.native_actions,
+            evm_transactions: body.evm_transactions,
+            core_writer_actions: body.core_writer_actions,
+        };
+        exec_ctx.execute_committed_block(&block, vec![]);
+
+        last_header
+    }
+
+    fn hash_datum(bytes: &[u8]) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        hasher.finalize().into()
     }
 
     /// Compute validator set updates at epoch boundary.
@@ -409,182 +636,14 @@ impl TorusApp {
         self.cached_vs_updates = Some((height, Some(updates.clone())));
         Some(updates)
     }
+}
 
-    fn hash_datum(bytes: &[u8]) -> [u8; 32] {
-        let mut hasher = Sha256::new();
-        hasher.update(bytes);
-        hasher.finalize().into()
-    }
-
-    fn persist_block_header(&self, block: &TorusBlock) {
-        let block_hash = alloy_primitives::keccak256(&block.header.canonical_header_bytes());
-        let header_json = match serde_json::to_vec(&block.header) {
-            Ok(j) => j,
-            Err(e) => {
-                tracing::error!(%e, "failed to serialize block header");
-                return;
-            }
-        };
-        let mut data = Vec::with_capacity(32 + header_json.len());
-        data.extend_from_slice(block_hash.as_slice());
-        data.extend_from_slice(&header_json);
-        if let Err(e) = self.state_db.put_cf_raw(
-            CF_BLOCK_HEADERS,
-            &block.header.height.to_be_bytes(),
-            &data,
-        ) {
-            tracing::error!(%e, height = block.header.height, "failed to persist block header");
+impl Drop for TorusApp {
+    fn drop(&mut self) {
+        self.exec_tx.take();
+        if let Some(handle) = self.exec_handle.take() {
+            let _ = handle.join();
         }
-    }
-
-    // ------------------------------------------------------------------
-    // Consensus-then-Execute: the ONE execution path
-    // ------------------------------------------------------------------
-
-    /// Execute a committed block: EVM transactions + native actions.
-    /// This is the ONLY place where state changes happen.
-    /// Called from `on_committed_block` (normal path) and crash recovery.
-    fn execute_committed_block(&mut self, torus_block: &TorusBlock) {
-        let height = torus_block.header.height;
-
-        // Idempotency guard: skip if already executed.
-        if let Some(applied) = self.read_native_applied_height() {
-            if applied >= height {
-                tracing::debug!(height, applied, "execute_committed_block: already applied, skipping");
-                return;
-            }
-        }
-
-        self.flush_pending_slashes();
-
-        let has_evm = !torus_block.evm_transactions.is_empty();
-        let has_native = !torus_block.native_actions.is_empty();
-
-        tracing::info!(
-            height,
-            has_evm,
-            has_native,
-            evm_tx_count = torus_block.evm_transactions.len(),
-            native_count = torus_block.native_actions.len(),
-            "execute_committed_block: executing finalized block"
-        );
-
-        // ---- EVM execution ----
-        let mut bundle = BundleState::default();
-        let mut computed_fee_revenue: u128 = 0;
-        if has_evm {
-            match self.validator.validate_block_for_catchup(
-                torus_block,
-                &self.state_db,
-                &self.evm_executor,
-            ) {
-                Ok(validated) => {
-                    computed_fee_revenue = torus_bridge::proposer::compute_fee_revenue(&validated.receipts);
-                    // Commit EVM state to DB.
-                    if let Err(e) = BlockCommitter::commit_pending_bundle(
-                        &self.state_db,
-                        &validated.bundle,
-                    ) {
-                        tracing::error!(%e, height, "failed to commit EVM bundle");
-                    }
-                    // Commit block metadata (receipts, indices, etc.).
-                    if let Err(e) = BlockCommitter::commit_block_metadata(
-                        &self.state_db,
-                        torus_block,
-                        &validated.receipts,
-                    ) {
-                        tracing::error!(%e, height, "failed to commit block metadata");
-                    }
-                    bundle = validated.bundle;
-                }
-                Err(e) => {
-                    tracing::error!(%e, height, "EVM execution failed for committed block");
-                }
-            }
-        } else {
-            // No EVM txs -- still persist block header for RPC.
-            self.persist_block_header(torus_block);
-        }
-
-        // ---- Native execution ----
-        if has_native || computed_fee_revenue > 0 {
-            // Resolve senders for native actions.
-            let mut sender_actions = Vec::with_capacity(torus_block.native_actions.len());
-            let mut consumed_nonces = Vec::new();
-            for signed in &torus_block.native_actions {
-                match signed.resolve_sender(torus_block.header.timestamp, |pubkey| {
-                    self.state_db.get_session(pubkey).ok().flatten()
-                }) {
-                    Ok(sender) => {
-                        consumed_nonces.push((sender, signed.nonce));
-                        sender_actions.push((sender, signed.action.clone()));
-                    }
-                    Err(e) => {
-                        tracing::warn!(%e, "failed to recover native action sender, skipping");
-                    }
-                }
-            }
-
-            // Execute native on overlay seeded with EVM bundle, then flush.
-            let overlay = NativeStateOverlay::new(self.state_db.clone());
-            overlay.seed_from_bundle(&bundle);
-
-            let (pre_evm, post_evm) = sort_native_actions(&sender_actions);
-            let mut ctx = NativeExecContext::new(
-                overlay.clone(),
-                torus_block.header.height,
-                torus_block.header.timestamp,
-                torus_block.header.epoch,
-                self.epoch_length,
-                self.max_validators,
-                torus_block.header.proposer,
-                self.treasury_address,
-                self.dev_pool_address,
-            );
-            ctx.metrics = self.metrics.clone();
-
-            NativeExecutor::execute_batch(&mut ctx, &pre_evm);
-            NativeExecutor::execute_batch(&mut ctx, &post_evm);
-            let _ = NativeExecutor::drain_core_writer(&mut ctx);
-            NativeExecutor::process_governance(&mut ctx);
-            NativeExecutor::distribute_fees(&mut ctx, computed_fee_revenue);
-            NativeExecutor::process_epoch_boundary(&mut ctx);
-            ctx.save_order_books();
-
-            // Write consumed nonces.
-            for (sender, nonce) in &consumed_nonces {
-                let mut nonce_key = [0u8; 28];
-                nonce_key[..20].copy_from_slice(sender.as_slice());
-                nonce_key[20..28].copy_from_slice(&nonce.to_be_bytes());
-                let _ = overlay.put_cf_raw(
-                    torus_state::cf::CF_NATIVE_NONCES,
-                    &nonce_key,
-                    &torus_block.header.height.to_be_bytes(),
-                );
-            }
-
-            // Flush overlay to state_db.
-            if let Err(e) = overlay.flush(&self.state_db) {
-                tracing::error!(%e, height, "failed to flush native overlay");
-            }
-        }
-
-        // ---- Update tracking ----
-        self.write_native_applied_height(height);
-
-        if height > self.last_header.height {
-            self.last_header = torus_block.header.clone();
-        }
-
-        if let Some(ref m) = self.metrics {
-            m.block_height.set(height as i64);
-            m.blocks_committed.inc();
-            let tx_count = torus_block.header.evm_tx_count as u64
-                + torus_block.header.native_action_count as u64;
-            m.block_transactions_count.observe(tx_count as f64);
-        }
-
-        tracing::info!(height, "execute_committed_block: done");
     }
 }
 
@@ -592,12 +651,11 @@ impl App<RocksKVStore> for TorusApp {
     /// Produce a block: drain mempool, build raw tx list, NO execution.
     ///
     /// The state_root is set to the parent's state_root (unchanged until
-    /// execution happens in on_committed_block).
+    /// execution happens on the pipeline thread).
     fn produce_block(
         &mut self,
         request: ProduceBlockRequest<RocksKVStore>,
     ) -> ProduceBlockResponse {
-        // Derive the correct parent header from the block tree.
         let parent_header = if let Some(parent_hash) = request.parent_block() {
             if let Ok(Some(parent_block)) = request.block_tree().block(&parent_hash) {
                 let datums = parent_block.data.vec();
@@ -612,14 +670,12 @@ impl App<RocksKVStore> for TorusApp {
             self.last_header.clone()
         };
         tracing::info!(parent_height = parent_header.height, local_height = self.last_header.height, "produce_block called (CTE)");
-        self.flush_pending_slashes();
 
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
 
-        // Drain mempool for raw transaction list.
         let (native_actions, evm_txs) = if let Some(ref mempool) = self.mempool {
             let gas_limit = if parent_header.evm_gas_limit == 0 {
                 torus_evm::DEFAULT_BLOCK_GAS_LIMIT
@@ -635,16 +691,13 @@ impl App<RocksKVStore> for TorusApp {
             (vec![], vec![])
         };
 
-        // Build block with raw txs -- NO EVM execution, NO state root computation.
-        // State root carries forward from parent (will be updated post-execution
-        // in on_committed_block).
         use torus_types::{Bloom, B256};
         let block = TorusBlock {
             header: TorusBlockHeader {
                 height: parent_header.height + 1,
                 timestamp,
                 proposer: self.proposer_address,
-                state_root: parent_header.state_root,  // unchanged until execution
+                state_root: parent_header.state_root,
                 receipts_root: B256::ZERO,
                 logs_bloom: Bloom::ZERO,
                 evm_gas_used: 0,
@@ -664,7 +717,6 @@ impl App<RocksKVStore> for TorusApp {
         let encoded = serde_json::to_vec(&block).expect("serialize TorusBlock");
         let hash = Self::hash_datum(&encoded);
 
-        // Check for epoch boundary and compute validator set updates.
         let validator_set_updates = self.epoch_validator_set_updates(block.header.height);
 
         ProduceBlockResponse {
@@ -676,20 +728,11 @@ impl App<RocksKVStore> for TorusApp {
     }
 
     /// Validate a proposed block: structural + signature checks only, NO execution.
-    ///
-    /// We verify:
-    /// 1. Single datum with correct data_hash
-    /// 2. Deserializable as TorusBlock
-    /// 3. EVM transactions decode correctly (valid RLP)
-    /// 4. Native action signatures are valid
-    ///
-    /// NO EVM execution, NO state root check -- execution happens in on_committed_block.
     fn validate_block(
         &mut self,
         request: ValidateBlockRequest<RocksKVStore>,
     ) -> ValidateBlockResponse {
         tracing::info!("validate_block called (CTE)");
-        self.flush_pending_slashes();
 
         let block = request.proposed_block();
         let datums = block.data.vec();
@@ -701,14 +744,12 @@ impl App<RocksKVStore> for TorusApp {
 
         let datum_bytes = datums[0].bytes();
 
-        // Verify data hash.
         let computed = Self::hash_datum(datum_bytes);
         if block.data_hash != CryptoHash::new(computed) {
             tracing::warn!(datum_len = datum_bytes.len(), "validate_block: REJECTED -- data_hash mismatch");
             return ValidateBlockResponse::Invalid;
         }
 
-        // Deserialize.
         let torus_block: TorusBlock = match serde_json::from_slice(datum_bytes) {
             Ok(b) => b,
             Err(e) => {
@@ -724,7 +765,6 @@ impl App<RocksKVStore> for TorusApp {
             "validate_block: structural check passed"
         );
 
-        // Verify EVM transactions decode (valid RLP + recoverable sender).
         if !torus_block.evm_transactions.is_empty() {
             if decode_all_txs(&torus_block.evm_transactions).is_err() {
                 tracing::warn!("validate_block: REJECTED -- invalid EVM transactions");
@@ -732,7 +772,6 @@ impl App<RocksKVStore> for TorusApp {
             }
         }
 
-        // Verify native action signatures.
         for (i, signed_action) in torus_block.native_actions.iter().enumerate() {
             if signed_action.recover_sender().is_err() {
                 tracing::warn!(index = i, "validate_block: REJECTED -- invalid native action signature");
@@ -748,23 +787,14 @@ impl App<RocksKVStore> for TorusApp {
     }
 
     /// Validate a block during sync: same as validate_block (structural only).
-    /// Execution happens in on_committed_block for synced blocks too.
     fn validate_block_for_sync(
         &mut self,
         request: ValidateBlockRequest<RocksKVStore>,
     ) -> ValidateBlockResponse {
-        // During sync, blocks are already consensus-committed by quorum.
-        // Use the same lightweight validation as validate_block.
         self.validate_block(request)
     }
 
-    /// Consensus-then-Execute: called after a block is irrevocably committed.
-    ///
-    /// This is the ONE place where ALL execution happens:
-    /// - EVM transaction execution
-    /// - Native action execution
-    /// - State commitment to DB
-    /// - Metrics updates
+    /// Send committed block to the execution pipeline thread.
     fn on_committed_block(
         &mut self,
         block: &Block,
@@ -781,14 +811,27 @@ impl App<RocksKVStore> for TorusApp {
             return;
         };
 
+        let height = torus_block.header.height;
         tracing::info!(
-            height = torus_block.header.height,
+            height,
             evm_txs = torus_block.evm_transactions.len(),
             native = torus_block.native_actions.len(),
-            "on_committed_block: executing finalized block"
+            "on_committed_block: sending to execution pipeline"
         );
 
-        self.execute_committed_block(&torus_block);
+        if height > self.last_header.height {
+            self.last_header = torus_block.header.clone();
+        }
+
+        if let Some(ref tx) = self.exec_tx {
+            let msg = CommittedBlockMsg {
+                torus_block,
+                pending_slashes: self.pending_slashes.drain(..).collect(),
+            };
+            if tx.send(msg).is_err() {
+                tracing::error!(height, "execution pipeline channel closed — block will not be executed!");
+            }
+        }
     }
 
     /// MonadBFT B3: Handle speculative rollback due to leader equivocation.
@@ -804,10 +847,6 @@ impl App<RocksKVStore> for TorusApp {
             block_b = ?evidence.block_b,
             "SPECULATIVE ROLLBACK: leader equivocation detected"
         );
-
-        // In consensus-then-execute, no EVM state changes need reverting
-        // because execution only happens in on_committed_block (post-finalization).
-        // We only need to slash the equivocating leader.
 
         let leader_pubkey = evidence.leader.to_bytes();
         let leader_addr = match self.staking.find_validator_by_pubkey(&leader_pubkey) {
@@ -927,20 +966,16 @@ mod crash_recovery_tests {
         let (config, state_db) = make_test_config_and_db();
         let block = make_block(1, vec![sign_claim_rewards(100)]);
 
-        // Simulate commit writing header+body but execution never runs
         persist_block_for_test(&state_db, &block);
 
-        // META_NATIVE_APPLIED_HEIGHT not set -> simulates crash before execution
         assert!(state_db
             .get_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT)
             .unwrap()
             .is_none());
 
-        // Reconstruct TorusApp -- should detect gap and replay
         let app = TorusApp::new(state_db.clone(), &config, None, None);
 
-        // Verify applied height was written
-        let applied = app.read_native_applied_height();
+        let applied = read_native_applied_height(&state_db);
         assert_eq!(applied, Some(1), "replay should set applied height to 1");
         assert_eq!(app.last_header.height, 1, "last_header should be updated");
     }
@@ -952,23 +987,20 @@ mod crash_recovery_tests {
 
         persist_block_for_test(&state_db, &block);
 
-        // Pre-set applied height = committed height -> no gap
         state_db
             .put_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT, &5u64.to_be_bytes())
             .unwrap();
 
         let app = TorusApp::new(state_db.clone(), &config, None, None);
-        assert_eq!(app.read_native_applied_height(), Some(5));
-        // last_header stays at genesis since no replay occurred
+        assert_eq!(read_native_applied_height(&state_db), Some(5));
         assert_eq!(app.last_header.height, 0);
     }
 
     #[test]
     fn replay_empty_block_marks_applied() {
         let (config, state_db) = make_test_config_and_db();
-        let block = make_block(3, vec![]); // no native actions
+        let block = make_block(3, vec![]);
 
-        // Only persist header (empty block has no body in CF_BLOCK_BODIES)
         let block_hash = alloy_primitives::keccak256(&block.header.canonical_header_bytes());
         let header_json = serde_json::to_vec(&block.header).unwrap();
         let mut data = Vec::with_capacity(32 + header_json.len());
@@ -978,9 +1010,9 @@ mod crash_recovery_tests {
             .put_cf_raw(CF_BLOCK_HEADERS, &block.header.height.to_be_bytes(), &data)
             .unwrap();
 
-        let app = TorusApp::new(state_db.clone(), &config, None, None);
+        let _app = TorusApp::new(state_db.clone(), &config, None, None);
         assert_eq!(
-            app.read_native_applied_height(),
+            read_native_applied_height(&state_db),
             Some(3),
             "empty block should be marked as applied"
         );
