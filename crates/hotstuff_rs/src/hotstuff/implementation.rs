@@ -18,7 +18,7 @@ use crate::{
         App, ProduceBlockRequest, ProduceBlockResponse, ValidateBlockRequest, ValidateBlockResponse,
     },
     block_tree::{
-        accessors::internal::{BlockTreeError, BlockTreeSingleton},
+        accessors::internal::{BlockTreeError, BlockTreeSingleton, UpdateResult},
         invariants::{repropose_block, safe_block, safe_nudge, safe_pc},
         pluggables::KVStore,
     },
@@ -143,6 +143,25 @@ impl<N: Network> HotStuff<N> {
         needed
     }
 
+    /// Process an `UpdateResult` from `block_tree.update()`:
+    /// 1. Call `app.on_committed_block()` for each newly committed block (oldest first).
+    /// 2. Forward validator set updates to the network layer.
+    fn process_update_result<K: KVStore>(
+        &mut self,
+        result: UpdateResult,
+        block_tree: &BlockTreeSingleton<K>,
+        app: &mut impl App<K>,
+    ) {
+        for committed_hash in &result.committed_block_hashes {
+            if let Ok(Some(committed_block)) = block_tree.block(committed_hash) {
+                app.on_committed_block(&committed_block, *committed_hash);
+            }
+        }
+        if let Some(vs_updates) = result.validator_set_updates {
+            self.validator_set_update_handle.update_validator_set(vs_updates);
+        }
+    }
+
     /// Checks whether the HotStuff internal view is outdated with respect to the view from [`ViewInfo`] provided
     /// by the [`Pacemaker`](crate::pacemaker::protocol::Pacemaker).
     ///
@@ -227,18 +246,16 @@ impl<N: Network> HotStuff<N> {
                         timestamp: SystemTime::now(),
                         block: block.clone(),
                     }).publish(&self.event_publisher);
-                    let committed_vs_updates = block_tree.update(&block.justify, &self.event_publisher).unwrap_or_else(|e| {
+                    let update_result = block_tree.update(&block.justify, &self.event_publisher).unwrap_or_else(|e| {
                         if let BlockTreeError::BlockExpectedButNotFound { block: missing } = &e {
                             log::warn!("enter_view: missing block {:?} in commit chain — triggering sync", missing);
                             self.sync_needed = true;
                         } else {
                             log::warn!("enter_view: block_tree.update failed after self-insert: {:?}", e);
                         }
-                        None
+                        UpdateResult { validator_set_updates: None, committed_block_hashes: vec![] }
                     });
-                    if let Some(vs_updates) = committed_vs_updates {
-                        self.validator_set_update_handle.update_validator_set(vs_updates);
-                    }
+                    self.process_update_result(update_result, block_tree, app);
 
                     let proposal = Proposal {
                         chain_id: self.config.chain_id,
@@ -423,12 +440,10 @@ impl<N: Network> HotStuff<N> {
                     })
                     .publish(&self.event_publisher);
 
-                    let committed_vs_updates =
-                        block_tree.update(&block.justify, &self.event_publisher).unwrap_or(None);
-                    if let Some(vs_updates) = committed_vs_updates {
-                        self.validator_set_update_handle
-                            .update_validator_set(vs_updates);
-                    }
+                    let update_result =
+                        block_tree.update(&block.justify, &self.event_publisher)
+                            .unwrap_or(UpdateResult { validator_set_updates: None, committed_block_hashes: vec![] });
+                    self.process_update_result(update_result, block_tree, app);
 
                     let proposal = Proposal {
                         chain_id: self.config.chain_id,
@@ -629,12 +644,12 @@ impl<N: Network> HotStuff<N> {
             HotStuffMessage::Proposal(proposal) => {
                 self.on_receive_proposal(proposal, origin, block_tree, app)
             }
-            HotStuffMessage::Nudge(nudge) => self.on_receive_nudge(nudge, origin, block_tree),
+            HotStuffMessage::Nudge(nudge) => self.on_receive_nudge(nudge, origin, block_tree, app),
             HotStuffMessage::PhaseVote(vote) => {
-                self.on_receive_phase_vote(vote, origin, block_tree)
+                self.on_receive_phase_vote(vote, origin, block_tree, app)
             }
             HotStuffMessage::NewView(new_view) => {
-                self.on_receive_new_view(new_view, origin, block_tree)
+                self.on_receive_new_view(new_view, origin, block_tree, app)
             }
             // MonadBFT B2: NEC recovery messages
             HotStuffMessage::ProposalRequest(req) => {
@@ -851,13 +866,10 @@ impl<N: Network> HotStuff<N> {
             .publish(&self.event_publisher);
 
             // 3. Trigger block tree updates: update highestPC, lock, commit.
-            let committed_validator_set_updates =
-                block_tree.update(&proposal.block.justify, &self.event_publisher).unwrap_or(None);
-
-            if let Some(vs_updates) = committed_validator_set_updates {
-                self.validator_set_update_handle
-                    .update_validator_set(vs_updates)
-            }
+            let update_result =
+                block_tree.update(&proposal.block.justify, &self.event_publisher)
+                    .unwrap_or(UpdateResult { validator_set_updates: None, committed_block_hashes: vec![] });
+            self.process_update_result(update_result, block_tree, app);
 
             // 4. Access the possibly updated validator set state, and update the vote collectors if needed.
             let validator_set_state = block_tree.validator_set_state()?;
@@ -954,6 +966,7 @@ impl<N: Network> HotStuff<N> {
         nudge: Nudge,
         origin: &VerifyingKey,
         block_tree: &mut BlockTreeSingleton<K>,
+        app: &mut impl App<K>,
     ) -> Result<(), HotStuffError> {
         Event::ReceiveNudge(ReceiveNudgeEvent {
             timestamp: SystemTime::now(),
@@ -985,13 +998,10 @@ impl<N: Network> HotStuff<N> {
         }
 
         // 2. Trigger block tree updates: update highestPC, lock, commit.
-        let committed_validator_set_updates =
-            block_tree.update(&nudge.justify, &self.event_publisher).unwrap_or(None);
-
-        if let Some(vs_updates) = committed_validator_set_updates {
-            self.validator_set_update_handle
-                .update_validator_set(vs_updates)
-        }
+        let update_result =
+            block_tree.update(&nudge.justify, &self.event_publisher)
+                .unwrap_or(UpdateResult { validator_set_updates: None, committed_block_hashes: vec![] });
+        self.process_update_result(update_result, block_tree, app);
 
         // 3. Access the possibly updated validator set state, and update the vote collectors if needed.
         let validator_set_state = block_tree.validator_set_state()?;
@@ -1075,6 +1085,7 @@ impl<N: Network> HotStuff<N> {
         phase_vote: PhaseVote,
         signer: &VerifyingKey,
         block_tree: &mut BlockTreeSingleton<K>,
+        app: &mut impl App<K>,
     ) -> Result<(), HotStuffError> {
         Event::ReceivePhaseVote(ReceivePhaseVoteEvent {
             timestamp: SystemTime::now(),
@@ -1112,8 +1123,10 @@ impl<N: Network> HotStuff<N> {
                 //    the tree yet (body in flight). Always advance highest_pc
                 //    first, then attempt full update for commits.
                 let _ = block_tree.advance_highest_pc_from_remote(&new_pc);
-                let committed_validator_set_updates =
-                    block_tree.update(&new_pc, &self.event_publisher).unwrap_or(None);
+                let update_result =
+                    block_tree.update(&new_pc, &self.event_publisher)
+                        .unwrap_or(UpdateResult { validator_set_updates: None, committed_block_hashes: vec![] });
+                self.process_update_result(update_result, block_tree, app);
 
 
                 // MonadBFT B2: Speculative commit — 1-QC for fresh proposals.
@@ -1127,10 +1140,6 @@ impl<N: Network> HotStuff<N> {
                             let _ = block_tree.add_speculative_commit(new_pc.block);
                         }
                     }
-                }
-                if let Some(vs_updates) = committed_validator_set_updates {
-                    self.validator_set_update_handle
-                        .update_validator_set(vs_updates)
                 }
 
                 // 3. Access the possibly updated validator set state, and update the vote collectors if needed
@@ -1169,6 +1178,7 @@ impl<N: Network> HotStuff<N> {
         new_view: NewView,
         origin: &VerifyingKey,
         block_tree: &mut BlockTreeSingleton<K>,
+        app: &mut impl App<K>,
     ) -> Result<(), HotStuffError> {
         Event::ReceiveNewView(ReceiveNewViewEvent {
             timestamp: SystemTime::now(),
@@ -1182,13 +1192,10 @@ impl<N: Network> HotStuff<N> {
             && safe_pc(&new_view.highest_pc, block_tree, self.config.chain_id)?
         {
             // 2. Trigger block tree updates: update highestPC, lock, commit (if new PC collected).
-            let committed_validator_set_updates =
-                block_tree.update(&new_view.highest_pc, &self.event_publisher).unwrap_or(None);
-
-            if let Some(vs_updates) = committed_validator_set_updates {
-                self.validator_set_update_handle
-                    .update_validator_set(vs_updates)
-            }
+            let update_result =
+                block_tree.update(&new_view.highest_pc, &self.event_publisher)
+                    .unwrap_or(UpdateResult { validator_set_updates: None, committed_block_hashes: vec![] });
+            self.process_update_result(update_result, block_tree, app);
 
             // 3. Access the possibly updated validator set state, and update the phase vote collectors if needed
             // (if new PC collected).
@@ -1710,7 +1717,7 @@ impl<N: Network> HotStuff<N> {
             })
             .publish(&self.event_publisher);
 
-            let committed_validator_set_updates =
+            let update_result =
                 block_tree.update(&block.justify, &self.event_publisher).unwrap_or_else(|e| {
                     if let BlockTreeError::BlockExpectedButNotFound { block: missing } = &e {
                         log::warn!("body insert: missing block {:?} in commit chain — triggering sync", missing);
@@ -1718,13 +1725,9 @@ impl<N: Network> HotStuff<N> {
                     } else {
                         log::warn!("block_tree.update after body insert: {:?}", e);
                     }
-                    None
+                    UpdateResult { validator_set_updates: None, committed_block_hashes: vec![] }
                 });
-
-            if let Some(vs_updates) = committed_validator_set_updates {
-                self.validator_set_update_handle
-                    .update_validator_set(vs_updates)
-            }
+            self.process_update_result(update_result, block_tree, app);
 
             let validator_set_state = block_tree.validator_set_state()?;
             let _ = self

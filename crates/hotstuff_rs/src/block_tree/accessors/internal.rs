@@ -60,6 +60,15 @@ use super::super::{
 
 use super::{app::AppBlockTreeView, public::BlockTreeSnapshot};
 
+/// Result of a [`BlockTreeSingleton::update`] call, containing both the
+/// validator set updates (if any) and the list of newly committed block hashes
+/// (oldest to newest). The caller uses `committed_block_hashes` to invoke
+/// `App::on_committed_block` for each finalized block.
+pub struct UpdateResult {
+    pub validator_set_updates: Option<ValidatorSetUpdates>,
+    pub committed_block_hashes: Vec<CryptoHash>,
+}
+
 /// Read and write handle into the block tree that should be owned exclusively by the algorithm thread.
 ///
 /// ## Categories of methods
@@ -288,7 +297,7 @@ impl<K: KVStore> BlockTreeSingleton<K> {
         &mut self,
         justify: &PhaseCertificate,
         event_publisher: &Option<Sender<Event>>,
-    ) -> Result<Option<ValidatorSetUpdates>, BlockTreeError> {
+    ) -> Result<UpdateResult, BlockTreeError> {
         let mut wb = BlockTreeWriteBatch::new();
 
         let mut update_locked_pc: Option<PhaseCertificate> = None;
@@ -376,6 +385,12 @@ impl<K: KVStore> BlockTreeSingleton<K> {
             &committed_blocks,
         );
 
+        // Collect committed block hashes (oldest to newest) for on_committed_block callbacks.
+        let committed_block_hashes: Vec<CryptoHash> = committed_blocks
+            .iter()
+            .map(|(hash, _)| *hash)
+            .collect();
+
         // Safety: a block that updates the validator set must be followed by a block that contains a decide
         // pc. A block becomes committed immediately if its commitPC or decidePC is seen. Therefore, under normal
         // operation, at most 1 validator-set-updating block can be committed at a time.
@@ -384,7 +399,10 @@ impl<K: KVStore> BlockTreeSingleton<K> {
             .rev()
             .find_map(|(_, validator_set_updates_opt)| validator_set_updates_opt);
 
-        Ok(resulting_vs_update)
+        Ok(UpdateResult {
+            validator_set_updates: resulting_vs_update,
+            committed_block_hashes,
+        })
     }
 
     /// Set the highest `TimeoutCertificate` to be `tc`.

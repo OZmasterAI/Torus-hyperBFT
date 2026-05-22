@@ -178,6 +178,24 @@ pub trait App<K: KVStore>: Send {
         request: ValidateBlockRequest<K>,
     ) -> ValidateBlockResponse;
 
+    /// Called after a block is irrevocably committed by consensus (finalized via
+    /// the commit rule -- 2-chain in MonadBFT pipelined mode).
+    ///
+    /// In a consensus-then-execute architecture, this is the **only** place where
+    /// the application should execute transactions and mutate state. The block's
+    /// transaction list is available via `block.data`.
+    ///
+    /// `committed_hash` is the CryptoHash of the committed block.
+    ///
+    /// Default implementation is a no-op (for backward compatibility during migration).
+    fn on_committed_block(
+        &mut self,
+        _block: &Block,
+        _committed_hash: CryptoHash,
+    ) {
+        // Default no-op for backward compatibility.
+    }
+
     /// MonadBFT B3: Called when a speculatively committed block is rolled back
     /// due to leader equivocation.
     ///

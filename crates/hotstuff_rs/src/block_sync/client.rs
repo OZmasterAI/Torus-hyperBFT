@@ -31,7 +31,7 @@ use crate::{
         AdvertiseBlock, AdvertisePC, BlockSyncAdvertiseMessage,
     },
     block_tree::{
-        accessors::internal::{BlockTreeError, BlockTreeSingleton},
+        accessors::internal::{BlockTreeError, BlockTreeSingleton, UpdateResult},
         invariants::safe_pc,
         pluggables::KVStore,
     },
@@ -288,13 +288,19 @@ impl<N: Network> BlockSyncClient<N> {
             })
             .publish(&self.event_publisher);
 
-            let committed_validator_set_updates =
+            let update_result =
                 block_tree.update(&block.justify, &self.event_publisher).unwrap_or_else(|e| {
                     log::warn!("block_sync: block_tree.update failed: {:?}", e);
-                    None
+                    UpdateResult { validator_set_updates: None, committed_block_hashes: vec![] }
                 });
 
-            if let Some(vs_updates) = committed_validator_set_updates {
+            // Call on_committed_block for each newly committed block during sync.
+            for committed_hash in &update_result.committed_block_hashes {
+                if let Ok(Some(committed_block)) = block_tree.block(committed_hash) {
+                    app.on_committed_block(&committed_block, *committed_hash);
+                }
+            }
+            if let Some(vs_updates) = update_result.validator_set_updates {
                 self.validator_set_update_handle
                     .update_validator_set(vs_updates)
             }
@@ -307,7 +313,16 @@ impl<N: Network> BlockSyncClient<N> {
                 if highest_pc.is_correct(block_tree)?
                     && safe_pc(highest_pc, block_tree, chain_id)?
                 {
-                    let _ = block_tree.update(highest_pc, &self.event_publisher);
+                    let update_result2 = block_tree.update(highest_pc, &self.event_publisher)
+                        .unwrap_or(UpdateResult { validator_set_updates: None, committed_block_hashes: vec![] });
+                    for committed_hash in &update_result2.committed_block_hashes {
+                        if let Ok(Some(committed_block)) = block_tree.block(committed_hash) {
+                            app.on_committed_block(&committed_block, *committed_hash);
+                        }
+                    }
+                    if let Some(vs_updates) = update_result2.validator_set_updates {
+                        self.validator_set_update_handle.update_validator_set(vs_updates);
+                    }
                 }
             }
 
