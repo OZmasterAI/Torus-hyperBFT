@@ -82,6 +82,13 @@ pub struct ConsensusConfig {
     pub epoch_length: u64,
     pub timeout_base_ms: u64,
     pub timeout_max_ms: u64,
+    /// How many consecutive views a leader keeps before rotation. Default: 1.
+    #[serde(default = "default_leader_tenure")]
+    pub leader_tenure: u64,
+}
+
+fn default_leader_tenure() -> u64 {
+    1
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -373,6 +380,7 @@ impl Genesis {
                 .and_then(|s| parse_address(s).ok())
                 .unwrap_or(Address::ZERO),
             timeout_base_ms: self.consensus.timeout_base_ms,
+            leader_tenure: self.consensus.leader_tenure,
         }
     }
 

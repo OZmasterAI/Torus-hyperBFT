@@ -907,10 +907,18 @@ pub struct ChainConfig {
     /// Consensus view timeout in milliseconds (from genesis).
     #[serde(default = "default_timeout_base_ms")]
     pub timeout_base_ms: u64,
+    /// How many consecutive views a single leader keeps before rotation.
+    /// 1 = rotate every view (original behavior). Devnet: 100.
+    #[serde(default = "default_leader_tenure")]
+    pub leader_tenure: u64,
 }
 
 fn default_timeout_base_ms() -> u64 {
     500
+}
+
+fn default_leader_tenure() -> u64 {
+    1
 }
 
 impl ChainConfig {

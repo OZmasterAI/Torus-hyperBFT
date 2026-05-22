@@ -143,6 +143,7 @@ fn default_chain_config() -> ChainConfig {
         treasury_address: Address::ZERO,
         dev_pool_address: Address::ZERO,
         timeout_base_ms: 500,
+        leader_tenure: 100,
     }
 }
 
@@ -281,6 +282,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         chain_id = chain_config.chain_id,
         epoch_length = chain_config.epoch_length,
         gas_limit = chain_config.evm_gas_limit,
+        leader_tenure = chain_config.leader_tenure,
         "chain configuration loaded"
     );
 
@@ -337,6 +339,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         .block_sync_trigger_min_view_difference(2)
         .block_sync_trigger_timeout(Duration::new(60, 0))
         .log_events(false)
+        .leader_tenure(chain_config.leader_tenure)
         .build();
 
     // 7. Block notifier + shared height counter (consensus replica <-> RPC server)

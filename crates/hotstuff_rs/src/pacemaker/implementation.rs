@@ -935,3 +935,70 @@ fn select_leader_fairness_test() {
         )
     })
 }
+
+/// Tests that stable leader (tenure > 1) keeps the same leader for `tenure` consecutive views,
+/// then rotates.
+#[test]
+fn stable_leader_tenure_test() {
+    use crate::types::{data_types::Power, update_sets::ValidatorSetUpdates};
+    use ed25519_dalek::SigningKey;
+    use rand_core::OsRng;
+
+    let mut csprg = OsRng {};
+    let n = 4;
+    let keypairs: Vec<SigningKey> = (0..n).map(|_| SigningKey::generate(&mut csprg)).collect();
+
+    let mut validator_set = ValidatorSet::new();
+    let mut validator_set_updates = ValidatorSetUpdates::new();
+    for kp in &keypairs {
+        validator_set_updates.insert(kp.verifying_key(), Power::new(1));
+    }
+    validator_set.apply_updates(&validator_set_updates);
+
+    let tenure: u64 = 10;
+
+    // With equal power (1 each), total_power=4, leaders cycle 0,1,2,3.
+    // With tenure=10, views 0..9 should all select the same leader,
+    // views 10..19 should select the next, etc.
+    for epoch in 0..4u64 {
+        let expected_leader = select_leader(ViewNumber::new(epoch * tenure), &validator_set, tenure);
+        for offset in 0..tenure {
+            let view = epoch * tenure + offset;
+            let leader = select_leader(ViewNumber::new(view), &validator_set, tenure);
+            assert_eq!(
+                leader, expected_leader,
+                "Views in same tenure epoch should select the same leader \
+                 (epoch={}, view={}, offset={})",
+                epoch, view, offset
+            );
+        }
+    }
+
+    // Verify that tenure=1 gives different leaders for different views (original behavior).
+    let leader_v0 = select_leader(ViewNumber::new(0), &validator_set, 1);
+    let leader_v1 = select_leader(ViewNumber::new(1), &validator_set, 1);
+    assert_ne!(
+        leader_v0, leader_v1,
+        "With tenure=1, consecutive views should have different leaders (4 equal-power validators)"
+    );
+}
+
+/// Tests that tenure=0 is safely handled (treated as tenure=1).
+#[test]
+fn stable_leader_tenure_zero_safe() {
+    use crate::types::{data_types::Power, update_sets::ValidatorSetUpdates};
+    use ed25519_dalek::SigningKey;
+    use rand_core::OsRng;
+
+    let mut csprg = OsRng {};
+    let kp = SigningKey::generate(&mut csprg);
+
+    let mut validator_set = ValidatorSet::new();
+    let mut updates = ValidatorSetUpdates::new();
+    updates.insert(kp.verifying_key(), Power::new(1));
+    validator_set.apply_updates(&updates);
+
+    // tenure=0 should not panic (division by zero).
+    let leader = select_leader(ViewNumber::new(5), &validator_set, 0);
+    assert_eq!(leader, kp.verifying_key());
+}

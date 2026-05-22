@@ -157,6 +157,7 @@ impl TorusApp {
             treasury_address: Address::ZERO,
             dev_pool_address: Address::ZERO,
             timeout_base_ms: 500,
+            leader_tenure: 1,
         };
         Self::new(state_db, &config, None, None)
     }
@@ -1324,6 +1325,7 @@ mod crash_recovery_tests {
             treasury_address: Address::ZERO,
             dev_pool_address: Address::ZERO,
             timeout_base_ms: 500,
+            leader_tenure: 1,
         };
         (config, state_db)
     }

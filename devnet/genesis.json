@@ -6,7 +6,8 @@
         "protocol": "hotstuff",
         "epoch_length": 100,
         "timeout_base_ms": 500,
-        "timeout_max_ms": 30000
+        "timeout_max_ms": 30000,
+        "leader_tenure": 100
     },
     "evm": {
         "spec_id": "cancun",
