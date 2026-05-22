@@ -23,9 +23,8 @@ use hotstuff_rs::types::update_sets::ValidatorSetUpdates;
 
 use std::sync::Arc;
 use torus_bridge::{
-    sort_native_actions, BlockCommitter, BlockProposer, BlockValidator,
-    BridgeError, BundleState, NativeExecContext, NativeExecutor,
-    state_root::compute_post_bundle_state_root,
+    sort_native_actions, decode_all_txs, BlockCommitter, BlockProposer, BlockValidator,
+    BundleState, NativeExecContext, NativeExecutor,
 };
 use torus_mempool::Mempool;
 use torus_economics::{EpochManager, SlashReason, StakingManager};
@@ -35,7 +34,7 @@ use torus_state::cf::{
 };
 use torus_state::{NativeStateOverlay, StateBackend, StateDb};
 use torus_types::{
-    Address, ChainConfig, NativeAction, TorusBlock, TorusBlockBody, TorusBlockHeader, ValidatorSet,
+    Address, ChainConfig, TorusBlock, TorusBlockBody, TorusBlockHeader, ValidatorSet,
 };
 
 /// FIX CONS-PF-08: Buffered slash intent recorded during speculative rollback.
@@ -61,6 +60,7 @@ use crate::kv_store::RocksKVStore;
 /// `on_committed_block`: executes EVM + native for finalized blocks.
 pub struct TorusApp {
     state_db: StateDb,
+    #[allow(dead_code)]
     proposer: BlockProposer,
     validator: BlockValidator,
     evm_executor: EvmExecutor,
@@ -722,11 +722,10 @@ impl App<RocksKVStore> for TorusApp {
             "validate_block: structural check passed"
         );
 
-        // Verify EVM transactions decode (valid RLP).
-        for (i, tx_bytes) in torus_block.evm_transactions.iter().enumerate() {
-            use alloy_rlp::Decodable;
-            if alloy_consensus::TxEnvelope::decode(&mut tx_bytes.as_slice()).is_err() {
-                tracing::warn!(index = i, "validate_block: REJECTED -- invalid EVM tx RLP");
+        // Verify EVM transactions decode (valid RLP + recoverable sender).
+        if !torus_block.evm_transactions.is_empty() {
+            if decode_all_txs(&torus_block.evm_transactions).is_err() {
+                tracing::warn!("validate_block: REJECTED -- invalid EVM transactions");
                 return ValidateBlockResponse::Invalid;
             }
         }
@@ -845,7 +844,7 @@ impl App<RocksKVStore> for TorusApp {
 #[cfg(test)]
 mod crash_recovery_tests {
     use super::*;
-    use torus_types::{Bloom, SignedNativeAction, B256};
+    use torus_types::{Bloom, NativeAction, SignedNativeAction, B256};
 
     fn make_test_config_and_db() -> (ChainConfig, StateDb) {
         use std::sync::atomic::{AtomicU64, Ordering};
