@@ -124,7 +124,7 @@ impl BlockValidator {
             base_fee: block.header.base_fee_per_gas,
         };
 
-        let mut exec_result = evm_executor.execute_block(state_db, &block_cfg, tx_envs, false)?;
+        let mut exec_result = evm_executor.execute_block(state_db, &block_cfg, tx_envs, skip_state_root_check)?;
 
         for (i, receipt) in exec_result.receipts.iter_mut().enumerate() {
             if let Some(dtx) = decoded_txs.get(i) {
@@ -133,37 +133,37 @@ impl BlockValidator {
             receipt.block_number = block.header.height;
         }
 
-        if exec_result.gas_used != block.header.evm_gas_used {
-            return Err(BridgeError::InvalidBlock(format!(
-                "gas used mismatch: header={}, executed={}",
-                block.header.evm_gas_used, exec_result.gas_used
-            )));
-        }
+        if !skip_state_root_check {
+            if exec_result.gas_used != block.header.evm_gas_used {
+                return Err(BridgeError::InvalidBlock(format!(
+                    "gas used mismatch: header={}, executed={}",
+                    block.header.evm_gas_used, exec_result.gas_used
+                )));
+            }
 
-        let computed_fee_revenue = crate::proposer::compute_fee_revenue(&exec_result.receipts);
-        if computed_fee_revenue != block.header.evm_fee_revenue {
-            return Err(BridgeError::InvalidBlock(format!(
-                "fee revenue mismatch: header={}, computed={}",
-                block.header.evm_fee_revenue, computed_fee_revenue
-            )));
-        }
+            let computed_fee_revenue = crate::proposer::compute_fee_revenue(&exec_result.receipts);
+            if computed_fee_revenue != block.header.evm_fee_revenue {
+                return Err(BridgeError::InvalidBlock(format!(
+                    "fee revenue mismatch: header={}, computed={}",
+                    block.header.evm_fee_revenue, computed_fee_revenue
+                )));
+            }
 
-        // FIX CONS-PF-13: Verify receipts_root by recomputing from execution results.
-        let computed_receipts_root = crate::proposer::compute_receipts_root(&exec_result.receipts)
-            .map_err(|e| BridgeError::Serialization(format!("receipts: {e}")))?;
-        if computed_receipts_root != block.header.receipts_root {
-            return Err(BridgeError::InvalidBlock(format!(
-                "receipts_root mismatch: header={}, computed={}",
-                block.header.receipts_root, computed_receipts_root
-            )));
-        }
+            let computed_receipts_root = crate::proposer::compute_receipts_root(&exec_result.receipts)
+                .map_err(|e| BridgeError::Serialization(format!("receipts: {e}")))?;
+            if computed_receipts_root != block.header.receipts_root {
+                return Err(BridgeError::InvalidBlock(format!(
+                    "receipts_root mismatch: header={}, computed={}",
+                    block.header.receipts_root, computed_receipts_root
+                )));
+            }
 
-        // FIX CONS-PF-13: Verify logs_bloom matches execution results.
-        if exec_result.logs_bloom != block.header.logs_bloom {
-            return Err(BridgeError::InvalidBlock(format!(
-                "logs_bloom mismatch: header={}, computed={}",
-                block.header.logs_bloom, exec_result.logs_bloom
-            )));
+            if exec_result.logs_bloom != block.header.logs_bloom {
+                return Err(BridgeError::InvalidBlock(format!(
+                    "logs_bloom mismatch: header={}, computed={}",
+                    block.header.logs_bloom, exec_result.logs_bloom
+                )));
+            }
         }
 
         let computed_root = compute_post_bundle_state_root(state_db, &exec_result.bundle)?;
@@ -370,7 +370,7 @@ impl BlockValidator {
             base_fee: block.header.base_fee_per_gas,
         };
 
-        let mut exec_result = evm_executor.execute_block(state_db, &block_cfg, tx_envs, false)?;
+        let mut exec_result = evm_executor.execute_block(state_db, &block_cfg, tx_envs, skip_state_root_check)?;
 
         for (i, receipt) in exec_result.receipts.iter_mut().enumerate() {
             if let Some(dtx) = decoded_txs.get(i) {

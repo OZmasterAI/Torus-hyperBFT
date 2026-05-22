@@ -471,6 +471,7 @@ impl TorusApp {
 
         // ---- EVM execution ----
         let mut bundle = BundleState::default();
+        let mut computed_fee_revenue: u128 = 0;
         if has_evm {
             match self.validator.validate_block_for_catchup(
                 torus_block,
@@ -478,6 +479,7 @@ impl TorusApp {
                 &self.evm_executor,
             ) {
                 Ok(validated) => {
+                    computed_fee_revenue = torus_bridge::proposer::compute_fee_revenue(&validated.receipts);
                     // Commit EVM state to DB.
                     if let Err(e) = BlockCommitter::commit_pending_bundle(
                         &self.state_db,
@@ -505,7 +507,7 @@ impl TorusApp {
         }
 
         // ---- Native execution ----
-        if has_native || torus_block.header.evm_fee_revenue > 0 {
+        if has_native || computed_fee_revenue > 0 {
             // Resolve senders for native actions.
             let mut sender_actions = Vec::with_capacity(torus_block.native_actions.len());
             let mut consumed_nonces = Vec::new();
@@ -545,7 +547,7 @@ impl TorusApp {
             NativeExecutor::execute_batch(&mut ctx, &post_evm);
             let _ = NativeExecutor::drain_core_writer(&mut ctx);
             NativeExecutor::process_governance(&mut ctx);
-            NativeExecutor::distribute_fees(&mut ctx, torus_block.header.evm_fee_revenue);
+            NativeExecutor::distribute_fees(&mut ctx, computed_fee_revenue);
             NativeExecutor::process_epoch_boundary(&mut ctx);
             ctx.save_order_books();
 
