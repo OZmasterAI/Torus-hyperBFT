@@ -134,6 +134,7 @@ impl BlockProposer {
                 base_fee_per_gas: next_base_fee,
                 epoch: torus_economics::EpochManager::epoch_for_block(block_height, self.epoch_length),
                 validator_set_hash: parent.validator_set_hash,
+                sig_attestation: [0u8; 64],
             },
             native_actions: vec![],
             evm_transactions,
@@ -252,6 +253,7 @@ impl BlockProposer {
                 base_fee_per_gas: next_base_fee,
                 epoch: torus_economics::EpochManager::epoch_for_block(block_height, self.epoch_length),
                 validator_set_hash: parent.validator_set_hash,
+                sig_attestation: [0u8; 64],
             },
             native_actions: signed_native_actions,
             evm_transactions,
@@ -306,7 +308,47 @@ pub fn genesis_parent_header() -> TorusBlockHeader {
         base_fee_per_gas: 1_000_000_000, // 1 gwei initial base fee
         epoch: 0,
         validator_set_hash: B256::ZERO,
+        sig_attestation: [0u8; 64],
     }
+}
+
+// ============================================================================
+// Signature Attestation
+// ============================================================================
+
+fn attestation_digest(actions: &[SignedNativeAction]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for action in actions {
+        hasher.update(&serde_json::to_vec(action).unwrap_or_default());
+    }
+    hasher.finalize().into()
+}
+
+pub fn generate_sig_attestation(
+    native_actions: &[SignedNativeAction],
+    proposer_key: &ed25519_dalek::SigningKey,
+) -> [u8; 64] {
+    if native_actions.is_empty() {
+        return [0u8; 64];
+    }
+    use ed25519_dalek::Signer;
+    let digest = attestation_digest(native_actions);
+    proposer_key.sign(&digest).to_bytes()
+}
+
+pub fn verify_sig_attestation(
+    native_actions: &[SignedNativeAction],
+    attestation: &[u8; 64],
+    proposer_pubkey: &ed25519_dalek::VerifyingKey,
+) -> bool {
+    if native_actions.is_empty() {
+        return *attestation == [0u8; 64];
+    }
+    let digest = attestation_digest(native_actions);
+    let sig = ed25519_dalek::Signature::from_bytes(attestation);
+    use ed25519_dalek::Verifier;
+    proposer_pubkey.verify(&digest, &sig).is_ok()
 }
 
 pub fn compute_fee_revenue(receipts: &[Receipt]) -> u128 {
@@ -314,4 +356,65 @@ pub fn compute_fee_revenue(receipts: &[Receipt]) -> u128 {
         .iter()
         .map(|r| r.gas_used as u128 * r.effective_gas_price as u128)
         .sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use torus_types::{ActionSignature, NativeAction, Signature};
+
+    fn make_test_signed_action(nonce: u64) -> SignedNativeAction {
+        SignedNativeAction {
+            action: NativeAction::ClaimRewards,
+            nonce,
+            signature: ActionSignature::Eip712(Signature {
+                v: 27,
+                r: [0u8; 32],
+                s: [0u8; 32],
+            }),
+        }
+    }
+
+    #[test]
+    fn attestation_roundtrip() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let actions = vec![make_test_signed_action(1), make_test_signed_action(2)];
+        let att = generate_sig_attestation(&actions, &key);
+        assert_ne!(att, [0u8; 64]);
+        assert!(verify_sig_attestation(&actions, &att, &key.verifying_key()));
+    }
+
+    #[test]
+    fn attestation_tampered_actions_fails() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let actions = vec![make_test_signed_action(1), make_test_signed_action(2)];
+        let att = generate_sig_attestation(&actions, &key);
+
+        let mut bad = actions.clone();
+        bad.push(make_test_signed_action(3));
+        assert!(!verify_sig_attestation(&bad, &att, &key.verifying_key()));
+    }
+
+    #[test]
+    fn attestation_wrong_key_fails() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let other = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
+        let actions = vec![make_test_signed_action(1)];
+        let att = generate_sig_attestation(&actions, &key);
+        assert!(!verify_sig_attestation(&actions, &att, &other.verifying_key()));
+    }
+
+    #[test]
+    fn empty_actions_zero_attestation() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let att = generate_sig_attestation(&[], &key);
+        assert_eq!(att, [0u8; 64]);
+        assert!(verify_sig_attestation(&[], &[0u8; 64], &key.verifying_key()));
+    }
+
+    #[test]
+    fn empty_actions_nonzero_attestation_fails() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        assert!(!verify_sig_attestation(&[], &[1u8; 64], &key.verifying_key()));
+    }
 }

@@ -367,6 +367,7 @@ fn empty_native_actions_evm_only() {
             base_fee_per_gas: 1_000_000_000,
             epoch: 0,
             validator_set_hash: B256::ZERO,
+            sig_attestation: [0u8; 64],
         },
         native_actions: vec![],
         evm_transactions: vec![],

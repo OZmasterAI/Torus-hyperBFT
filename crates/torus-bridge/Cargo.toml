@@ -12,6 +12,7 @@ torus-state = { workspace = true }
 torus-economics = { workspace = true }
 torus-telemetry = { workspace = true }
 
+ed25519-dalek = { workspace = true }
 borsh = { workspace = true }
 alloy-primitives = { workspace = true }
 alloy-consensus = { workspace = true, features = ["k256"] }

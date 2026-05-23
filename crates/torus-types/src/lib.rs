@@ -288,6 +288,45 @@ pub struct SessionData {
     pub created_at: u64,
 }
 
+mod attestation_bytes {
+    use serde::{Deserializer, Serializer};
+
+    pub fn default() -> [u8; 64] {
+        [0u8; 64]
+    }
+
+    pub fn serialize<S: Serializer>(data: &[u8; 64], s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeTuple;
+        let mut tup = s.serialize_tuple(64)?;
+        for byte in data {
+            tup.serialize_element(byte)?;
+        }
+        tup.end()
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 64], D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = [u8; 64];
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                write!(f, "64 bytes")
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<[u8; 64], A::Error> {
+                let mut buf = [0u8; 64];
+                for (i, byte) in buf.iter_mut().enumerate() {
+                    *byte = seq.next_element()?
+                        .ok_or_else(|| serde::de::Error::invalid_length(i, &"64 bytes"))?;
+                }
+                Ok(buf)
+            }
+        }
+        d.deserialize_tuple(64, V)
+    }
+}
+
 // ============================================================================
 // Block Types (§3.2)
 // ============================================================================
@@ -337,6 +376,8 @@ pub struct TorusBlockHeader {
     pub epoch: u64,
     /// Validator set hash for this epoch.
     pub validator_set_hash: B256,
+    #[serde(with = "attestation_bytes", default = "attestation_bytes::default")]
+    pub sig_attestation: [u8; 64],
 }
 
 impl TorusBlockHeader {
@@ -1057,5 +1098,61 @@ mod tests {
     #[should_panic(expected = "FixedPoint division error")]
     fn div_operator_panics_on_zero() {
         let _ = FixedPoint::ONE / FixedPoint::ZERO;
+    }
+
+    #[test]
+    fn header_with_attestation_serializes() {
+        let mut header = TorusBlockHeader {
+            height: 1,
+            timestamp: 1000,
+            proposer: Address::ZERO,
+            state_root: B256::ZERO,
+            receipts_root: B256::ZERO,
+            logs_bloom: alloy_primitives::Bloom::ZERO,
+            evm_gas_used: 0,
+            evm_fee_revenue: 0,
+            evm_gas_limit: 30_000_000,
+            native_action_count: 0,
+            evm_tx_count: 0,
+            base_fee_per_gas: 1_000_000_000,
+            epoch: 0,
+            validator_set_hash: B256::ZERO,
+            sig_attestation: [0u8; 64],
+        };
+        header.sig_attestation = [42u8; 64];
+        let json = serde_json::to_vec(&header).unwrap();
+        let decoded: TorusBlockHeader = serde_json::from_slice(&json).unwrap();
+        assert_eq!(decoded.sig_attestation, [42u8; 64]);
+    }
+
+    #[test]
+    fn header_without_attestation_defaults_to_zero() {
+        let json = br#"{"height":1,"timestamp":1000,"proposer":"0x0000000000000000000000000000000000000000","state_root":"0x0000000000000000000000000000000000000000000000000000000000000000","receipts_root":"0x0000000000000000000000000000000000000000000000000000000000000000","logs_bloom":"0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000","evm_gas_used":0,"evm_fee_revenue":0,"evm_gas_limit":30000000,"native_action_count":0,"evm_tx_count":0,"base_fee_per_gas":1000000000,"epoch":0,"validator_set_hash":"0x0000000000000000000000000000000000000000000000000000000000000000"}"#;
+        let decoded: TorusBlockHeader = serde_json::from_slice(json).unwrap();
+        assert_eq!(decoded.sig_attestation, [0u8; 64]);
+    }
+
+    #[test]
+    fn attestation_excluded_from_canonical_bytes() {
+        let h1 = TorusBlockHeader {
+            height: 1,
+            timestamp: 1000,
+            proposer: Address::ZERO,
+            state_root: B256::ZERO,
+            receipts_root: B256::ZERO,
+            logs_bloom: alloy_primitives::Bloom::ZERO,
+            evm_gas_used: 0,
+            evm_fee_revenue: 0,
+            evm_gas_limit: 30_000_000,
+            native_action_count: 0,
+            evm_tx_count: 0,
+            base_fee_per_gas: 1_000_000_000,
+            epoch: 0,
+            validator_set_hash: B256::ZERO,
+            sig_attestation: [0u8; 64],
+        };
+        let mut h2 = h1.clone();
+        h2.sig_attestation = [0xff; 64];
+        assert_eq!(h1.canonical_header_bytes(), h2.canonical_header_bytes());
     }
 }

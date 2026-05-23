@@ -488,6 +488,7 @@ fn block_hash_uses_canonical_encoding() {
         base_fee_per_gas: 1_000_000_000,
         epoch: 7,
         validator_set_hash: B256::new([3u8; 32]),
+        sig_attestation: [0u8; 64],
     };
 
     // Canonical bytes must be deterministic across calls.

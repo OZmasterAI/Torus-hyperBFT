@@ -809,13 +809,88 @@ impl SignedNativeAction {
 }
 
 // ============================================================================
+// Batch Verification
+// ============================================================================
+
+pub fn batch_verify_native_actions(
+    actions: &[SignedNativeAction],
+    timestamp: u64,
+    session_lookup: impl Fn(&[u8; 32]) -> Option<crate::SessionData>,
+) -> Vec<usize> {
+    let mut invalid = Vec::new();
+    let domain = eip712_domain_separator();
+
+    let mut ed_indices = Vec::new();
+    let mut ed_messages = Vec::new();
+    let mut ed_signatures = Vec::new();
+    let mut ed_keys = Vec::new();
+
+    for (i, action) in actions.iter().enumerate() {
+        match &action.signature {
+            ActionSignature::Eip712(_) => {
+                if action.recover_sender().is_err() {
+                    invalid.push(i);
+                }
+            }
+            ActionSignature::Session {
+                session_pubkey,
+                sig,
+            } => {
+                if requires_eip712(&action.action) {
+                    invalid.push(i);
+                    continue;
+                }
+                match session_lookup(session_pubkey) {
+                    Some(session)
+                        if timestamp <= session.expiry
+                            && session.scope.allows(&action.action) =>
+                    {
+                        let Ok(vk) = Ed25519VerifyingKey::from_bytes(session_pubkey) else {
+                            invalid.push(i);
+                            continue;
+                        };
+                        let struct_hash = eip712_struct_hash(&action.action, action.nonce);
+                        let signing_hash = eip712_signing_hash(domain, struct_hash);
+
+                        ed_indices.push(i);
+                        ed_messages.push(signing_hash.0.to_vec());
+                        ed_signatures.push(ed25519_dalek::Signature::from_bytes(&sig.0));
+                        ed_keys.push(vk);
+                    }
+                    _ => {
+                        invalid.push(i);
+                    }
+                }
+            }
+        }
+    }
+
+    if !ed_indices.is_empty() {
+        let msg_refs: Vec<&[u8]> = ed_messages.iter().map(|m| m.as_slice()).collect();
+        if ed25519_dalek::verify_batch(&msg_refs, &ed_signatures, &ed_keys).is_err() {
+            for j in 0..ed_indices.len() {
+                if ed_keys[j]
+                    .verify(&ed_messages[j], &ed_signatures[j])
+                    .is_err()
+                {
+                    invalid.push(ed_indices[j]);
+                }
+            }
+        }
+    }
+
+    invalid.sort_unstable();
+    invalid
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{OrderType, TimeInForce};
+    use crate::{Ed25519Sig, OrderType, SessionData, SessionScope, TimeInForce};
 
     fn test_key() -> SigningKey {
         let mut bytes = [0u8; 32];
@@ -1117,5 +1192,147 @@ mod tests {
             ActionSignature::Eip712(sig) => assert!(sig.v == 27 || sig.v == 28),
             _ => panic!("expected Eip712 signature"),
         }
+    }
+
+    // --- batch verification ---
+
+    fn sign_action_with_session(
+        action: NativeAction,
+        nonce: u64,
+        session_key: &ed25519_dalek::SigningKey,
+    ) -> SignedNativeAction {
+        use ed25519_dalek::Signer;
+        let domain = eip712_domain_separator();
+        let struct_hash = eip712_struct_hash(&action, nonce);
+        let signing_hash = eip712_signing_hash(domain, struct_hash);
+        let sig = session_key.sign(signing_hash.as_slice());
+        SignedNativeAction {
+            action,
+            nonce,
+            signature: ActionSignature::Session {
+                session_pubkey: session_key.verifying_key().to_bytes(),
+                sig: Ed25519Sig(sig.to_bytes()),
+            },
+        }
+    }
+
+    fn make_session(owner: Address) -> SessionData {
+        SessionData {
+            owner,
+            expiry: u64::MAX,
+            scope: SessionScope::Trading,
+            created_at: 0,
+        }
+    }
+
+    #[test]
+    fn batch_verify_all_valid_eip712() {
+        let key = test_key();
+        let actions = vec![
+            sign_native_action(NativeAction::ClaimRewards, TEST_NONCE, &key),
+            sign_native_action(NativeAction::UnjailSelf, TEST_NONCE + 1, &key),
+        ];
+        let invalid = batch_verify_native_actions(&actions, TEST_NONCE, |_| None);
+        assert!(invalid.is_empty());
+    }
+
+    #[test]
+    fn batch_verify_all_valid_session() {
+        let ed_key = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
+        let pubkey = ed_key.verifying_key().to_bytes();
+        let session = make_session(Address::from([0x11; 20]));
+        let actions = vec![
+            sign_action_with_session(
+                NativeAction::CancelOrder { order_id: 1 },
+                TEST_NONCE,
+                &ed_key,
+            ),
+            sign_action_with_session(
+                NativeAction::CancelOrder { order_id: 2 },
+                TEST_NONCE + 1,
+                &ed_key,
+            ),
+        ];
+        let invalid = batch_verify_native_actions(&actions, TEST_NONCE, |pk| {
+            if pk == &pubkey { Some(session.clone()) } else { None }
+        });
+        assert!(invalid.is_empty());
+    }
+
+    #[test]
+    fn batch_verify_mixed_valid_and_invalid() {
+        let key = test_key();
+        let ed_key = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
+        let pubkey = ed_key.verifying_key().to_bytes();
+        let session = make_session(Address::from([0x11; 20]));
+
+        let actions = vec![
+            sign_native_action(NativeAction::ClaimRewards, TEST_NONCE, &key),
+            sign_action_with_session(
+                NativeAction::CancelOrder { order_id: 1 },
+                TEST_NONCE,
+                &ed_key,
+            ),
+            sign_action_with_session(
+                NativeAction::CancelOrder { order_id: 2 },
+                TEST_NONCE,
+                &ed_key,
+            ),
+        ];
+
+        let invalid = batch_verify_native_actions(&actions, TEST_NONCE, |_| None);
+        assert_eq!(invalid, vec![1, 2]);
+
+        let invalid = batch_verify_native_actions(&actions, TEST_NONCE, |pk| {
+            if pk == &pubkey { Some(session.clone()) } else { None }
+        });
+        assert!(invalid.is_empty());
+    }
+
+    #[test]
+    fn batch_verify_detects_tampered_session_sig() {
+        let ed_key = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
+        let pubkey = ed_key.verifying_key().to_bytes();
+        let session = make_session(Address::from([0x11; 20]));
+
+        let mut action = sign_action_with_session(
+            NativeAction::CancelOrder { order_id: 1 },
+            TEST_NONCE,
+            &ed_key,
+        );
+        if let ActionSignature::Session { ref mut sig, .. } = action.signature {
+            sig.0[0] ^= 0xff;
+        }
+
+        let invalid = batch_verify_native_actions(&[action], TEST_NONCE, |pk| {
+            if pk == &pubkey { Some(session.clone()) } else { None }
+        });
+        assert_eq!(invalid, vec![0]);
+    }
+
+    #[test]
+    fn batch_verify_rejects_session_for_eip712_required_action() {
+        let ed_key = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
+        let pubkey = ed_key.verifying_key().to_bytes();
+        let session = SessionData {
+            owner: Address::from([0x11; 20]),
+            expiry: u64::MAX,
+            scope: SessionScope::Full,
+            created_at: 0,
+        };
+
+        let action = sign_action_with_session(
+            NativeAction::Withdraw {
+                amount: alloy_primitives::U256::from(100),
+                to: Address::ZERO,
+            },
+            TEST_NONCE,
+            &ed_key,
+        );
+
+        let invalid = batch_verify_native_actions(&[action], TEST_NONCE, |pk| {
+            if pk == &pubkey { Some(session.clone()) } else { None }
+        });
+        assert_eq!(invalid, vec![0]);
     }
 }

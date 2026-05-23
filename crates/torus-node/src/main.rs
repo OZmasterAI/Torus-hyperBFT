@@ -295,7 +295,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     };
     let mempool = Arc::new(Mempool::new(state_db.clone(), mempool_config));
 
-    let app = TorusApp::new(state_db.clone(), &chain_config, Some(metrics.clone()), Some(mempool.clone()));
+    let signing_key_for_app = if !cli.rpc_only { Some(signing_key.clone()) } else { None };
+    let app = TorusApp::new(state_db.clone(), &chain_config, Some(metrics.clone()), Some(mempool.clone()), signing_key_for_app);
     let kv_store = RocksKVStore::new(state_db.db_arc());
 
     // EVM executor

@@ -337,6 +337,8 @@ pub struct TorusApp {
     #[allow(dead_code)]
     metrics: Option<Arc<torus_telemetry::Metrics>>,
     mempool: Option<Arc<Mempool>>,
+    #[allow(dead_code)]
+    signing_key: Option<ed25519_dalek::SigningKey>,
     exec_tx: Option<SyncSender<CommittedBlockMsg>>,
     exec_handle: Option<JoinHandle<()>>,
 }
@@ -347,6 +349,7 @@ impl TorusApp {
         config: &ChainConfig,
         metrics: Option<Arc<torus_telemetry::Metrics>>,
         mempool: Option<Arc<Mempool>>,
+        signing_key: Option<ed25519_dalek::SigningKey>,
     ) -> Self {
         let staking = StakingManager::new(state_db.clone());
         let mut proposer = BlockProposer::new(
@@ -415,6 +418,7 @@ impl TorusApp {
             pending_slashes: Vec::new(),
             treasury_address: config.treasury_address,
             dev_pool_address: config.dev_pool_address,
+            signing_key,
             metrics,
             mempool,
             exec_tx: Some(exec_tx),
@@ -446,7 +450,10 @@ impl TorusApp {
             dev_pool_address: Address::ZERO,
             timeout_base_ms: 500,
         };
-        Self::new(state_db, &config, None, None)
+        let mut seed = [0u8; 32];
+        seed[..8].copy_from_slice(&id.to_le_bytes());
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed);
+        Self::new(state_db, &config, None, None, Some(signing_key))
     }
 
     /// Crash recovery: replay committed blocks whose execution was interrupted.
@@ -708,6 +715,7 @@ impl App<RocksKVStore> for TorusApp {
                 base_fee_per_gas: parent_header.base_fee_per_gas,
                 epoch: parent_header.epoch,
                 validator_set_hash: parent_header.validator_set_hash,
+                sig_attestation: [0u8; 64],
             },
             native_actions,
             evm_transactions: evm_txs,
@@ -935,6 +943,7 @@ mod crash_recovery_tests {
                 base_fee_per_gas: 1_000_000_000,
                 epoch: 0,
                 validator_set_hash: B256::ZERO,
+                sig_attestation: [0u8; 64],
             },
             native_actions,
             evm_transactions: vec![],
@@ -978,7 +987,7 @@ mod crash_recovery_tests {
             .unwrap()
             .is_none());
 
-        let app = TorusApp::new(state_db.clone(), &config, None, None);
+        let app = TorusApp::new(state_db.clone(), &config, None, None, None);
 
         let applied = read_native_applied_height(&state_db);
         assert_eq!(applied, Some(1), "replay should set applied height to 1");
@@ -996,7 +1005,7 @@ mod crash_recovery_tests {
             .put_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT, &5u64.to_be_bytes())
             .unwrap();
 
-        let app = TorusApp::new(state_db.clone(), &config, None, None);
+        let app = TorusApp::new(state_db.clone(), &config, None, None, None);
         assert_eq!(read_native_applied_height(&state_db), Some(5));
         assert_eq!(app.last_header.height, 0);
     }
@@ -1015,7 +1024,7 @@ mod crash_recovery_tests {
             .put_cf_raw(CF_BLOCK_HEADERS, &block.header.height.to_be_bytes(), &data)
             .unwrap();
 
-        let _app = TorusApp::new(state_db.clone(), &config, None, None);
+        let _app = TorusApp::new(state_db.clone(), &config, None, None, None);
         assert_eq!(
             read_native_applied_height(&state_db),
             Some(3),
