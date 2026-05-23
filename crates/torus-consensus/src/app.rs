@@ -224,9 +224,42 @@ impl ExecutionContext {
 
         // ---- Native execution ----
         if has_native || computed_fee_revenue > 0 {
+            let invalid_indices = if has_native {
+                torus_types::eip712::batch_verify_native_actions(
+                    &torus_block.native_actions,
+                    torus_block.header.timestamp,
+                    |pubkey| self.state_db.get_session(pubkey).ok().flatten(),
+                )
+            } else {
+                vec![]
+            };
+
+            if !invalid_indices.is_empty() {
+                tracing::error!(
+                    count = invalid_indices.len(),
+                    proposer = %torus_block.header.proposer,
+                    "SLASHING PROPOSER: attested block contained invalid signatures"
+                );
+                if let Err(e) = self.staking.slash(
+                    torus_block.header.proposer,
+                    10000,
+                    SlashReason::InvalidAttestation,
+                    0,
+                ) {
+                    tracing::error!(%e, "CRITICAL: failed to slash proposer for invalid attestation");
+                }
+                if let Err(e) = self.staking.tombstone_validator(&torus_block.header.proposer) {
+                    tracing::error!(%e, "CRITICAL: failed to tombstone proposer for invalid attestation");
+                }
+            }
+
             let mut sender_actions = Vec::with_capacity(torus_block.native_actions.len());
             let mut consumed_nonces = Vec::new();
-            for signed in &torus_block.native_actions {
+            for (i, signed) in torus_block.native_actions.iter().enumerate() {
+                if invalid_indices.contains(&i) {
+                    tracing::error!(index = i, "INVALID SIG in attested block — skipping action");
+                    continue;
+                }
                 match signed.resolve_sender(torus_block.header.timestamp, |pubkey| {
                     self.state_db.get_session(pubkey).ok().flatten()
                 }) {
@@ -683,19 +716,38 @@ impl App<RocksKVStore> for TorusApp {
             .unwrap_or_default()
             .as_secs();
 
-        let (native_actions, evm_txs) = if let Some(ref mempool) = self.mempool {
+        let (mut native_actions, evm_txs) = if let Some(ref mempool) = self.mempool {
             let gas_limit = if parent_header.evm_gas_limit == 0 {
                 torus_evm::DEFAULT_BLOCK_GAS_LIMIT
             } else {
                 parent_header.evm_gas_limit
             };
-            let (native, evm) = mempool.drain_for_block(256, gas_limit, parent_header.state_root);
+            let (native, evm) = mempool.drain_for_block(4096, gas_limit, parent_header.state_root);
             if !evm.is_empty() || !native.is_empty() {
                 tracing::info!(evm_txs = evm.len(), native_actions = native.len(), "drained mempool for block");
             }
             (native, evm)
         } else {
             (vec![], vec![])
+        };
+
+        if !native_actions.is_empty() {
+            let invalid = torus_types::eip712::batch_verify_native_actions(
+                &native_actions,
+                timestamp,
+                |pubkey| self.state_db.get_session(pubkey).ok().flatten(),
+            );
+            if !invalid.is_empty() {
+                tracing::warn!(count = invalid.len(), "produce_block: dropping actions with invalid signatures");
+                for &idx in invalid.iter().rev() {
+                    native_actions.remove(idx);
+                }
+            }
+        }
+
+        let sig_attestation = match self.signing_key {
+            Some(ref key) => torus_bridge::proposer::generate_sig_attestation(&native_actions, key),
+            None => [0u8; 64],
         };
 
         use torus_types::{Bloom, B256};
@@ -715,7 +767,7 @@ impl App<RocksKVStore> for TorusApp {
                 base_fee_per_gas: parent_header.base_fee_per_gas,
                 epoch: parent_header.epoch,
                 validator_set_hash: parent_header.validator_set_hash,
-                sig_attestation: [0u8; 64],
+                sig_attestation,
             },
             native_actions,
             evm_transactions: evm_txs,
@@ -780,16 +832,43 @@ impl App<RocksKVStore> for TorusApp {
             }
         }
 
-        use rayon::prelude::*;
-        let all_sigs_valid = torus_block.native_actions.par_iter().enumerate().all(|(i, signed_action)| {
-            if signed_action.recover_sender().is_err() {
-                tracing::warn!(index = i, "validate_block: REJECTED -- invalid native action signature");
-                return false;
+        if !torus_block.native_actions.is_empty() {
+            if torus_block.header.sig_attestation == [0u8; 64] {
+                use rayon::prelude::*;
+                let all_valid = torus_block.native_actions.par_iter().enumerate().all(|(i, sa)| {
+                    if sa.recover_sender().is_err() {
+                        tracing::warn!(index = i, "validate_block: REJECTED -- invalid native action signature");
+                        return false;
+                    }
+                    true
+                });
+                if !all_valid {
+                    return ValidateBlockResponse::Invalid;
+                }
+            } else {
+                let proposer_addr = torus_block.header.proposer;
+                let proposer_pubkey = match self.staking.get_validator(&proposer_addr) {
+                    Ok(Some(val)) => match ed25519_dalek::VerifyingKey::from_bytes(&val.pubkey) {
+                        Ok(vk) => vk,
+                        Err(_) => {
+                            tracing::warn!(%proposer_addr, "validate_block: REJECTED -- invalid proposer pubkey");
+                            return ValidateBlockResponse::Invalid;
+                        }
+                    },
+                    _ => {
+                        tracing::warn!(%proposer_addr, "validate_block: REJECTED -- proposer not in validator set");
+                        return ValidateBlockResponse::Invalid;
+                    }
+                };
+                if !torus_bridge::proposer::verify_sig_attestation(
+                    &torus_block.native_actions,
+                    &torus_block.header.sig_attestation,
+                    &proposer_pubkey,
+                ) {
+                    tracing::warn!(%proposer_addr, "validate_block: REJECTED -- invalid sig attestation");
+                    return ValidateBlockResponse::Invalid;
+                }
             }
-            true
-        });
-        if !all_sigs_valid {
-            return ValidateBlockResponse::Invalid;
         }
 
         let validator_set_updates = self.epoch_validator_set_updates(torus_block.header.height);

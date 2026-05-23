@@ -470,6 +470,7 @@ pub enum SlashReason {
     DoubleSign,
     Downtime,
     JailVote,
+    InvalidAttestation,
 }
 
 impl BorshSerialize for SlashReason {
@@ -478,6 +479,7 @@ impl BorshSerialize for SlashReason {
             Self::DoubleSign => 0,
             Self::Downtime => 1,
             Self::JailVote => 2,
+            Self::InvalidAttestation => 3,
         };
         writer.write_all(&[disc])
     }
@@ -491,6 +493,7 @@ impl BorshDeserialize for SlashReason {
             0 => Ok(Self::DoubleSign),
             1 => Ok(Self::Downtime),
             2 => Ok(Self::JailVote),
+            3 => Ok(Self::InvalidAttestation),
             x => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("invalid SlashReason discriminant: {x}"),
