@@ -16,6 +16,7 @@ hotstuff_rs = { workspace = true }
 alloy-primitives = { workspace = true }
 rocksdb = { workspace = true }
 serde_json = { workspace = true }
+bincode = { workspace = true }
 ed25519-dalek = { workspace = true }
 sha2 = "0.10"
 rayon = "1"

@@ -314,6 +314,15 @@ impl ExecutionContext {
             }
         }
 
+        // ---- Persist block body for RPC queries ----
+        if let Ok(body_bytes) = serde_json::to_vec(&torus_block.body()) {
+            let _ = self.state_db.put_cf_raw(
+                CF_BLOCK_BODIES,
+                &height.to_be_bytes(),
+                &body_bytes,
+            );
+        }
+
         // ---- Update tracking ----
         write_native_applied_height(&self.state_db, height);
 
@@ -441,7 +450,16 @@ impl TorusApp {
             proposer,
             validator,
             evm_executor: EvmExecutor::new(config.chain_id),
-            proposer_address: Address::ZERO,
+            proposer_address: signing_key.as_ref().and_then(|sk| {
+                let pubkey = sk.verifying_key();
+                staking.find_validator_by_pubkey(pubkey.as_bytes())
+                    .ok()
+                    .flatten()
+                    .map(|v| {
+                        tracing::info!(address = %v.address, "resolved proposer address from signing key");
+                        v.address
+                    })
+            }).unwrap_or(Address::ZERO),
             last_header,
             staking,
             epoch_length: config.epoch_length,
@@ -700,7 +718,7 @@ impl App<RocksKVStore> for TorusApp {
             if let Ok(Some(parent_block)) = request.block_tree().block(&parent_hash) {
                 let datums = parent_block.data.vec();
                 datums.first()
-                    .and_then(|d| serde_json::from_slice::<TorusBlock>(d.bytes()).ok())
+                    .and_then(|d| bincode::deserialize::<TorusBlock>(d.bytes()).ok())
                     .map(|b| b.header)
                     .unwrap_or_else(|| self.last_header.clone())
             } else {
@@ -774,7 +792,7 @@ impl App<RocksKVStore> for TorusApp {
             core_writer_actions: vec![],
         };
 
-        let encoded = serde_json::to_vec(&block).expect("serialize TorusBlock");
+        let encoded = bincode::serialize(&block).expect("serialize TorusBlock");
         let hash = Self::hash_datum(&encoded);
 
         let validator_set_updates = self.epoch_validator_set_updates(block.header.height);
@@ -810,7 +828,7 @@ impl App<RocksKVStore> for TorusApp {
             return ValidateBlockResponse::Invalid;
         }
 
-        let torus_block: TorusBlock = match serde_json::from_slice(datum_bytes) {
+        let torus_block: TorusBlock = match bincode::deserialize(datum_bytes) {
             Ok(b) => b,
             Err(e) => {
                 tracing::warn!(%e, "validate_block: REJECTED -- deserialization failed");
@@ -898,7 +916,7 @@ impl App<RocksKVStore> for TorusApp {
             return;
         };
 
-        let Ok(torus_block) = serde_json::from_slice::<TorusBlock>(datum.bytes()) else {
+        let Ok(torus_block) = bincode::deserialize::<TorusBlock>(datum.bytes()) else {
             tracing::warn!("on_committed_block: failed to deserialize TorusBlock");
             return;
         };

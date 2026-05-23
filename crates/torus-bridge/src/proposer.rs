@@ -320,7 +320,7 @@ fn attestation_digest(actions: &[SignedNativeAction]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     for action in actions {
-        hasher.update(&serde_json::to_vec(action).unwrap_or_default());
+        hasher.update(&bincode::serialize(action).unwrap_or_default());
     }
     hasher.finalize().into()
 }

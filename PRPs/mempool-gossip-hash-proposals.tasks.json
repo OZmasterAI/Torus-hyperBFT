@@ -1,0 +1,102 @@
+{
+  "prp": "mempool-gossip-hash-proposals",
+  "created": "2026-05-23T10:30:00Z",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Move compute_action_hash to torus-types",
+      "status": "pending",
+      "files": [
+        "crates/torus-types/src/lib.rs",
+        "crates/torus-mempool/src/native_pool.rs"
+      ],
+      "validate": "cargo test -p torus-types -p torus-mempool",
+      "depends_on": []
+    },
+    {
+      "id": 2,
+      "name": "Add CompactBlock type to torus-types",
+      "status": "pending",
+      "files": [
+        "crates/torus-types/src/lib.rs"
+      ],
+      "validate": "cargo test -p torus-types -- compact_block",
+      "depends_on": [1]
+    },
+    {
+      "id": 3,
+      "name": "Wire native action gossip — outbound",
+      "status": "pending",
+      "files": [
+        "crates/torus-network/src/behaviour.rs",
+        "crates/torus-mempool/src/lib.rs",
+        "crates/torus-network/src/swarm.rs",
+        "crates/torus-node/src/main.rs"
+      ],
+      "validate": "cargo check -p torus-network -p torus-mempool -p torus-node",
+      "depends_on": [1]
+    },
+    {
+      "id": 4,
+      "name": "Wire native action gossip — inbound",
+      "status": "pending",
+      "files": [
+        "crates/torus-network/src/swarm.rs",
+        "crates/torus-node/src/main.rs"
+      ],
+      "validate": "cargo test -p torus-mempool -p torus-network",
+      "depends_on": [3]
+    },
+    {
+      "id": 5,
+      "name": "Produce CompactBlock in consensus",
+      "status": "pending",
+      "files": [
+        "crates/torus-consensus/src/app.rs"
+      ],
+      "validate": "cargo test -p torus-consensus",
+      "depends_on": [2]
+    },
+    {
+      "id": 6,
+      "name": "Add get_by_hash to NativePool + Mempool",
+      "status": "pending",
+      "files": [
+        "crates/torus-mempool/src/native_pool.rs",
+        "crates/torus-mempool/src/lib.rs"
+      ],
+      "validate": "cargo test -p torus-mempool",
+      "depends_on": [1]
+    },
+    {
+      "id": 7,
+      "name": "Reconstruct TorusBlock from CompactBlock in validate/commit",
+      "status": "pending",
+      "files": [
+        "crates/torus-consensus/src/app.rs"
+      ],
+      "validate": "cargo test -p torus-consensus",
+      "depends_on": [4, 5, 6]
+    },
+    {
+      "id": 8,
+      "name": "Fallback: log missing hashes, reject gracefully",
+      "status": "pending",
+      "files": [
+        "crates/torus-consensus/src/app.rs"
+      ],
+      "validate": "cargo test -p torus-consensus",
+      "depends_on": [7]
+    },
+    {
+      "id": 9,
+      "name": "Integration test + benchmark",
+      "status": "pending",
+      "files": [
+        "tools/bench-throughput/src/main.rs"
+      ],
+      "validate": "./target/release/bench-throughput consensus --senders 100 --duration 30",
+      "depends_on": [8]
+    }
+  ]
+}
