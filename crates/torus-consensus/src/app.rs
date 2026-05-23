@@ -772,11 +772,16 @@ impl App<RocksKVStore> for TorusApp {
             }
         }
 
-        for (i, signed_action) in torus_block.native_actions.iter().enumerate() {
+        use rayon::prelude::*;
+        let all_sigs_valid = torus_block.native_actions.par_iter().enumerate().all(|(i, signed_action)| {
             if signed_action.recover_sender().is_err() {
                 tracing::warn!(index = i, "validate_block: REJECTED -- invalid native action signature");
-                return ValidateBlockResponse::Invalid;
+                return false;
             }
+            true
+        });
+        if !all_sigs_valid {
+            return ValidateBlockResponse::Invalid;
         }
 
         let validator_set_updates = self.epoch_validator_set_updates(torus_block.header.height);

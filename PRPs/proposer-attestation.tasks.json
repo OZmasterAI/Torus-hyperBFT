@@ -1,0 +1,70 @@
+{
+  "prp": "proposer-attestation",
+  "created": "2026-05-23T01:50:00Z",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Add sig_attestation field to TorusBlockHeader",
+      "status": "pending",
+      "files": ["crates/torus-types/src/lib.rs"],
+      "validate": "cargo test -p torus-types",
+      "depends_on": []
+    },
+    {
+      "id": 2,
+      "name": "Batch signature verification utility (ed25519 batch + secp256k1 individual)",
+      "status": "pending",
+      "files": ["crates/torus-types/src/eip712.rs"],
+      "validate": "cargo test -p torus-types -- batch_verify",
+      "depends_on": []
+    },
+    {
+      "id": 3,
+      "name": "Attestation generation and verification helpers",
+      "status": "pending",
+      "files": ["crates/torus-bridge/src/proposer.rs"],
+      "validate": "cargo test -p torus-bridge -- attestation",
+      "depends_on": [1]
+    },
+    {
+      "id": 4,
+      "name": "Pass validator signing key into TorusApp",
+      "status": "pending",
+      "files": ["crates/torus-consensus/src/app.rs", "crates/torus-node/src/main.rs"],
+      "validate": "cargo check -p torus-consensus -p torus-node",
+      "depends_on": []
+    },
+    {
+      "id": 5,
+      "name": "produce_block: batch verify sigs + generate attestation + raise cap to 4096",
+      "status": "pending",
+      "files": ["crates/torus-consensus/src/app.rs"],
+      "validate": "cargo test -p torus-consensus",
+      "depends_on": [1, 2, 3, 4]
+    },
+    {
+      "id": 6,
+      "name": "validate_block: check attestation only (fallback to per-action for zero attestation)",
+      "status": "pending",
+      "files": ["crates/torus-consensus/src/app.rs"],
+      "validate": "cargo test -p torus-consensus",
+      "depends_on": [3, 5]
+    },
+    {
+      "id": 7,
+      "name": "Execution thread: re-verify all sigs post-commit, slash proposer if invalid",
+      "status": "pending",
+      "files": ["crates/torus-consensus/src/app.rs"],
+      "validate": "cargo test -p torus-consensus",
+      "depends_on": [2, 5]
+    },
+    {
+      "id": 8,
+      "name": "Devnet integration test: rebuild, native-order-flood, verify block times <80ms",
+      "status": "pending",
+      "files": [],
+      "validate": "docker compose build && docker compose up -d",
+      "depends_on": [5, 6, 7]
+    }
+  ]
+}
