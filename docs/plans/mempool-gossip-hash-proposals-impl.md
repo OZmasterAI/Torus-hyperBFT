@@ -15,15 +15,15 @@ EVM transactions stay as full content (small, few per block).
 4. Fallback fetch when validator is missing an action referenced by hash
 5. `bench-throughput consensus --senders 100 --duration 30` shows >2,000 included/sec (vs ~800 baseline)
 6. All existing tests pass: `cargo test -p torus-consensus -p torus-bridge -p torus-mempool -p torus-network`
-7. Attestation unchanged — proposer still signs over full actions locally
+7. Attestation: proposer computes sig_attestation over full TorusBlock before
+   compacting; validators re-derive the same hash after reconstruction
 
 ## Tasks
 
-### Task 1: Export compute_action_hash from torus-mempool
+### Task 1: Move compute_action_hash to torus-types
 
-**Test first**: `cargo test -p torus-mempool -- compute_action_hash_is_pub`
+**Test first**: `cargo test -p torus-types -- compute_action_hash`
 ```rust
-// native_pool.rs — add test
 #[test]
 fn compute_action_hash_deterministic() {
     let action = make_test_action();
@@ -35,10 +35,19 @@ fn compute_action_hash_deterministic() {
 ```
 
 **Implementation**:
-- `crates/torus-mempool/src/native_pool.rs:172` — change `fn compute_action_hash` to `pub fn compute_action_hash`
-- `crates/torus-mempool/src/lib.rs` — add `pub use native_pool::compute_action_hash;`
+- `crates/torus-types/src/lib.rs` — add pub fn:
+```rust
+pub fn compute_action_hash(action: &SignedNativeAction) -> B256 {
+    let mut data = action.action.canonical_bytes();
+    data.extend_from_slice(&action.nonce.to_be_bytes());
+    alloy_primitives::keccak256(&data)
+}
+```
+- `crates/torus-mempool/src/native_pool.rs:172` — replace body with
+  `torus_types::compute_action_hash(action)`, keep the private fn as a wrapper
+  or just call torus_types directly.
 
-**Verify**: `cargo test -p torus-mempool && cargo check -p torus-consensus`
+**Verify**: `cargo test -p torus-types -p torus-mempool`
 **Depends on**: none
 
 ---
@@ -74,7 +83,7 @@ pub struct CompactBlock {
 impl CompactBlock {
     pub fn from_block(block: &TorusBlock) -> Self {
         let hashes = block.native_actions.iter()
-            .map(|a| torus_mempool::compute_action_hash(a))
+            .map(|a| compute_action_hash(a))
             .collect();
         Self {
             header: block.header.clone(),
@@ -86,37 +95,12 @@ impl CompactBlock {
 }
 ```
 
-Note: CompactBlock cannot depend on torus-mempool (circular dep). Move
-`compute_action_hash` to torus-types instead (canonical_bytes + nonce + keccak256).
-
 **Verify**: `cargo test -p torus-types -- compact_block`
-**Depends on**: T1 (but T1 scope changes — move hash fn to torus-types)
+**Depends on**: T1
 
 ---
 
-### Task 3: Move compute_action_hash to torus-types
-
-**Test first**: `cargo check -p torus-types` after adding the function.
-
-**Implementation**:
-- `crates/torus-types/src/lib.rs` — add pub fn:
-```rust
-pub fn compute_action_hash(action: &SignedNativeAction) -> B256 {
-    let mut data = action.action.canonical_bytes();
-    data.extend_from_slice(&action.nonce.to_be_bytes());
-    alloy_primitives::keccak256(&data)
-}
-```
-- `crates/torus-mempool/src/native_pool.rs:172` — replace body with
-  `torus_types::compute_action_hash(action)`, keep the private fn as a wrapper
-  or just call torus_types directly.
-
-**Verify**: `cargo test -p torus-types -p torus-mempool`
-**Depends on**: none (T1 and T2 merge into this)
-
----
-
-### Task 4: Wire native action gossip — outbound
+### Task 3: Wire native action gossip — outbound
 
 **Test first**: Submit a native action via RPC on validator-0. Check logs on
 validator-1 for receipt of the gossiped message.
@@ -146,35 +130,46 @@ validator-1 for receipt of the gossiped message.
 
 **Verify**: Start devnet, submit native action, check logs on non-proposer for
 `"received native action gossip"`.
-**Depends on**: T3
+**Depends on**: T1
 
 ---
 
-### Task 5: Wire native action gossip — inbound
+### Task 4: Wire native action gossip — inbound
 
 **Test first**: Submit native action on validator-0, check that validator-1's
 mempool contains it (via torus_getOpenOrders or native pool size log).
 
 **Implementation**:
+
+Note: The existing TX_TOPIC handler (swarm.rs:284) only does dedup tracking
+via `TxGossipState::should_accept` — it never delivers received transactions
+to the Mempool. The native action inbound path must be built from scratch
+with a complete delivery pipeline: gossipsub → deserialize → channel → mempool
+insertion.
+
 - `crates/torus-network/src/swarm.rs` — add handler for `NATIVE_ACTION_TOPIC`
-  messages (similar to TX_TOPIC handler at L283). Deserialize with bincode,
-  send to a new `native_action_rx` channel.
+  messages. Deserialize `SignedNativeAction` with bincode, send to a new
+  `native_action_rx: mpsc::UnboundedReceiver<SignedNativeAction>` channel.
+  Do NOT copy the TX_TOPIC pattern (which is receive-deaf).
 
 - `crates/torus-node/src/main.rs` — spawn a task that reads from
-  `native_action_rx` and calls `mempool.add_native_action(action)` (or
-  `submit_native_action` to skip re-validation since the sender already
-  validated). Use `add_native_action` for safety — re-validates sig + nonce.
+  `native_action_rx` and calls `mempool.add_native_action(action)`.
+  Use `add_native_action` (not `submit_native_action`) for safety —
+  re-validates sig + nonce on the receiving side.
 
 - Dedup: NativePool already deduplicates by `(sender, action_hash)` in the
   `seen` HashSet (native_pool.rs:60), so duplicate gossip messages are
   no-ops.
 
+- Expected per-message size: ~200-500 bytes (bincode-encoded SignedNativeAction).
+  Well within gossipsub `max_transmit_size: 256 KB`.
+
 **Verify**: `cargo test -p torus-mempool -p torus-network` + devnet manual test.
-**Depends on**: T4
+**Depends on**: T3
 
 ---
 
-### Task 6: Produce CompactBlock in consensus
+### Task 5: Produce CompactBlock in consensus
 
 **Test first**: `cargo test -p torus-consensus -- produce_compact_block`
 ```rust
@@ -191,6 +186,9 @@ fn produce_compact_block_has_hashes() {
 **Implementation** — `crates/torus-consensus/src/app.rs` in `produce_block`:
 - After building `block: TorusBlock` (L788), store it in a local cache keyed
   by height (for later reconstruction requests).
+- Compute `sig_attestation` over the full `TorusBlock` BEFORE compacting.
+  The attestation hash must cover full action content, not just hashes.
+  Validators will re-derive the same hash after reconstructing the full block.
 - Serialize `CompactBlock::from_block(&block)` instead of the full block:
   ```rust
   let compact = CompactBlock::from_block(&block);
@@ -201,11 +199,11 @@ fn produce_compact_block_has_hashes() {
   TorusApp for fallback fetch.
 
 **Verify**: `cargo test -p torus-consensus`
-**Depends on**: T3
+**Depends on**: T1
 
 ---
 
-### Task 7: Reconstruct TorusBlock from CompactBlock in validate_block
+### Task 6: Reconstruct TorusBlock from CompactBlock in validate_block
 
 **Test first**: `cargo test -p torus-consensus -- validate_reconstructs_block`
 
@@ -225,49 +223,74 @@ fn produce_compact_block_has_hashes() {
       }
   }
   ```
-- If `missing` is not empty, reject with a specific error that triggers
-  fallback fetch (Task 8). For now, log warning and reject.
+- If `missing` is not empty, trigger fallback (T7) before rejecting.
 - Reconstruct full `TorusBlock` from compact + resolved actions.
+- Re-derive the attestation hash from the reconstructed full block and verify
+  it matches `sig_attestation` in the header.
 - Run existing validation logic on the reconstructed block.
 
-- `crates/torus-mempool/src/native_pool.rs` — add `get_by_hash(&B256)`:
+- `crates/torus-mempool/src/native_pool.rs` — add `hash_index: HashMap<B256, usize>`
+  for O(1) lookup instead of linear scan. Update on insert/remove:
   ```rust
   pub fn get_by_hash(&self, hash: &B256) -> Option<SignedNativeAction> {
-      self.entries.iter()
-          .find(|e| &e.action_hash == hash)
+      self.hash_index.get(hash)
+          .and_then(|&idx| self.entries.get(idx))
           .map(|e| e.action.clone())
   }
   ```
-  Expose via `Mempool::get_native_by_hash` in lib.rs.
+  Expose via `Mempool::get_native_by_hash` in lib.rs. The O(1) index is
+  required to hit the 2,000 tx/sec target — linear scan over thousands of
+  entries per hash would be O(n*m) for full block reconstruction.
 
-- Same change in `on_committed_block` and `validate_block_for_sync`.
+- `on_committed_block`: same CompactBlock deserialization.
+
+- `validate_block_for_sync`: This path CANNOT rely on mempool gossip state
+  (the mempool may have evicted actions long ago). Sync blocks must carry
+  full action content. Options:
+  (a) Sync messages embed full `TorusBlock` bytes alongside the compact datum.
+  (b) The sync protocol fetches full blocks from peers separately.
+  For v1, use option (a): store full block bytes in `CF_BLOCK_BODIES` on
+  commit, and use those for sync instead of the compact datum.
 
 **Verify**: `cargo test -p torus-consensus -p torus-mempool`
-**Depends on**: T5, T6
+**Depends on**: T4, T5
 
 ---
 
-### Task 8: Fallback fetch for missing actions
+### Task 7: Fallback fetch for missing actions
 
 **Test first**: Validator that hasn't received gossip for an action can still
-validate the block after fetching from proposer.
+validate the block after a short retry window.
 
 **Implementation**:
-- When `validate_block` finds missing hashes, return `Invalid` for now (the
-  block will fail, HotStuff retries or syncs). This is acceptable for v1 —
-  gossip propagation is fast enough that validators almost always have actions.
+- When `validate_block` finds missing hashes, do NOT immediately reject.
+  Instead, wait up to 200ms with 50ms polling intervals for the missing
+  actions to arrive via gossip:
+  ```rust
+  if !missing.is_empty() {
+      for _ in 0..4 {
+          tokio::time::sleep(Duration::from_millis(50)).await;
+          missing.retain(|hash| mempool.get_by_hash(hash).is_none());
+          if missing.is_empty() { break; }
+      }
+  }
+  ```
+  If still missing after retry, reject with `Invalid` and log the missing
+  hashes at WARN level. Pure rejection without retry risks chain stall under
+  network jitter, even with a 4-validator set.
 
 - Future enhancement: add a `NativeActionFetchRequest` message to the
   block-data protocol to request specific actions by hash from the proposer.
+  The proposer already caches full blocks in `pending_proposals` (T5).
   Defer to a follow-up task.
 
 **Verify**: Devnet test — flood with bench-throughput, check that missing-hash
 rejections are rare (<1%).
-**Depends on**: T7
+**Depends on**: T6
 
 ---
 
-### Task 9: Integration test + benchmark
+### Task 8: Integration test + benchmark
 
 **Test first**: `bench-throughput consensus --senders 100 --duration 30`
 
@@ -281,7 +304,7 @@ rejections are rare (<1%).
 
 **Verify**: Included/sec > 2,000. Zero missing-hash rejections under moderate
 load.
-**Depends on**: T8
+**Depends on**: T7
 
 ---
 
