@@ -38,8 +38,9 @@
     },
     {
       "id": 4,
-      "name": "Wire native action gossip — inbound",
+      "name": "Wire native action gossip — inbound (full delivery pipeline)",
       "status": "pending",
+      "notes": "TX_TOPIC handler is receive-deaf (dedup only). Build complete path: gossipsub → deserialize → channel → mempool.add_native_action()",
       "files": [
         "crates/torus-network/src/swarm.rs",
         "crates/torus-node/src/main.rs"
@@ -49,8 +50,9 @@
     },
     {
       "id": 5,
-      "name": "Produce CompactBlock in consensus",
+      "name": "Produce CompactBlock in consensus (attestation before compact)",
       "status": "pending",
+      "notes": "sig_attestation must be computed over full TorusBlock BEFORE compacting to CompactBlock",
       "files": [
         "crates/torus-consensus/src/app.rs"
       ],
@@ -59,44 +61,37 @@
     },
     {
       "id": 6,
-      "name": "Add get_by_hash to NativePool + Mempool",
+      "name": "Reconstruct TorusBlock from CompactBlock + hash_index + sync path",
       "status": "pending",
+      "notes": "Add hash_index: HashMap<B256,usize> to NativePool for O(1) lookup. validate_block_for_sync cannot use mempool — use full block bytes from CF_BLOCK_BODIES",
       "files": [
+        "crates/torus-consensus/src/app.rs",
         "crates/torus-mempool/src/native_pool.rs",
         "crates/torus-mempool/src/lib.rs"
       ],
-      "validate": "cargo test -p torus-mempool",
-      "depends_on": [1]
+      "validate": "cargo test -p torus-consensus -p torus-mempool",
+      "depends_on": [4, 5]
     },
     {
       "id": 7,
-      "name": "Reconstruct TorusBlock from CompactBlock in validate/commit",
+      "name": "Fallback: 200ms retry window then reject on missing hashes",
       "status": "pending",
+      "notes": "4x50ms polls before rejecting. Pure rejection risks chain stall under network jitter",
       "files": [
         "crates/torus-consensus/src/app.rs"
       ],
       "validate": "cargo test -p torus-consensus",
-      "depends_on": [4, 5, 6]
+      "depends_on": [6]
     },
     {
       "id": 8,
-      "name": "Fallback: log missing hashes, reject gracefully",
-      "status": "pending",
-      "files": [
-        "crates/torus-consensus/src/app.rs"
-      ],
-      "validate": "cargo test -p torus-consensus",
-      "depends_on": [7]
-    },
-    {
-      "id": 9,
       "name": "Integration test + benchmark",
       "status": "pending",
       "files": [
         "tools/bench-throughput/src/main.rs"
       ],
       "validate": "./target/release/bench-throughput consensus --senders 100 --duration 30",
-      "depends_on": [8]
+      "depends_on": [7]
     }
   ]
 }
