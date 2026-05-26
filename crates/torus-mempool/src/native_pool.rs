@@ -5,8 +5,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use alloy_primitives::{keccak256, Address, B256};
-use torus_types::{NativeAction, SignedNativeAction};
+use alloy_primitives::{Address, B256};
+use torus_types::{compute_action_hash, NativeAction, SignedNativeAction};
 
 use crate::error::MempoolError;
 
@@ -23,6 +23,7 @@ pub(crate) struct NativePool {
     entries: Vec<NativePoolEntry>,
     sender_counts: HashMap<Address, usize>,
     seen: HashSet<(Address, B256)>,
+    hash_index: HashMap<B256, usize>,
     max_size: usize,
     max_per_sender: usize,
     max_per_block: usize,
@@ -34,6 +35,7 @@ impl NativePool {
             entries: Vec::new(),
             sender_counts: HashMap::new(),
             seen: HashSet::new(),
+            hash_index: HashMap::new(),
             max_size,
             max_per_sender,
             max_per_block,
@@ -42,6 +44,13 @@ impl NativePool {
 
     pub fn size(&self) -> usize {
         self.entries.len()
+    }
+
+    pub fn get_by_hash(&self, hash: &B256) -> Option<SignedNativeAction> {
+        self.hash_index
+            .get(hash)
+            .and_then(|&idx| self.entries.get(idx))
+            .map(|e| e.action.clone())
     }
 
     /// Insert a native action with a known sender.
@@ -75,6 +84,10 @@ impl NativePool {
                     let evicted = self.entries.swap_remove(idx);
                     self.dec_sender_count(&evicted.sender);
                     self.seen.remove(&(evicted.sender, evicted.action_hash));
+                    self.hash_index.remove(&evicted.action_hash);
+                    if idx < self.entries.len() {
+                        self.hash_index.insert(self.entries[idx].action_hash, idx);
+                    }
                 } else {
                     return Err(MempoolError::NativePoolFull);
                 }
@@ -85,12 +98,14 @@ impl NativePool {
 
         *self.sender_counts.entry(sender).or_insert(0) += 1;
         self.seen.insert((sender, action_hash));
+        let idx = self.entries.len();
         self.entries.push(NativePoolEntry {
             sender,
             action,
             action_hash,
             is_cancel,
         });
+        self.hash_index.insert(action_hash, idx);
 
         Ok(())
     }
@@ -113,6 +128,7 @@ impl NativePool {
 
         // Take ownership of all entries, then partition into taken/remaining.
         let all_entries = std::mem::take(&mut self.entries);
+        self.hash_index.clear();
         let mut block_counts: HashMap<Address, usize> = HashMap::new();
         let mut taken = Vec::new();
 
@@ -128,10 +144,72 @@ impl NativePool {
                 }
             }
             // Not taken — put back in pool.
+            let idx = self.entries.len();
+            self.hash_index.insert(entry.action_hash, idx);
             self.entries.push(entry);
         }
 
         taken
+    }
+
+    /// Select up to `limit` actions for a block WITHOUT removing them from the pool.
+    /// Actions stay in the pool until `remove_committed` is called after commit.
+    /// Uses the same priority order as `drain`.
+    pub fn select_for_block(&mut self, limit: usize) -> Vec<SignedNativeAction> {
+        self.entries.sort_by(|a, b| {
+            let a_pri = if a.is_cancel { 0u8 } else { 1 };
+            let b_pri = if b.is_cancel { 0u8 } else { 1 };
+            a_pri
+                .cmp(&b_pri)
+                .then_with(|| a.sender.cmp(&b.sender))
+                .then_with(|| a.action.nonce.cmp(&b.action.nonce))
+        });
+        // Rebuild hash_index after sort
+        self.hash_index.clear();
+        for (i, entry) in self.entries.iter().enumerate() {
+            self.hash_index.insert(entry.action_hash, i);
+        }
+
+        let mut block_counts: HashMap<Address, usize> = HashMap::new();
+        let mut selected = Vec::new();
+
+        for entry in &self.entries {
+            if selected.len() >= limit {
+                break;
+            }
+            let count = block_counts.get(&entry.sender).copied().unwrap_or(0);
+            if count < self.max_per_block {
+                *block_counts.entry(entry.sender).or_insert(0) += 1;
+                selected.push(entry.action.clone());
+            }
+        }
+
+        selected
+    }
+
+    /// Remove actions that were included in a committed block.
+    pub fn remove_committed(&mut self, hashes: &[B256]) {
+        let to_remove: HashSet<B256> = hashes.iter().copied().collect();
+        let mut removed_entries = Vec::new();
+
+        self.entries.retain(|entry| {
+            if to_remove.contains(&entry.action_hash) {
+                removed_entries.push((entry.sender, entry.action_hash));
+                false
+            } else {
+                true
+            }
+        });
+
+        for (sender, hash) in &removed_entries {
+            self.seen.remove(&(*sender, *hash));
+            self.dec_sender_count(sender);
+        }
+
+        self.hash_index.clear();
+        for (i, entry) in self.entries.iter().enumerate() {
+            self.hash_index.insert(entry.action_hash, i);
+        }
     }
 
     /// Re-insert previously drained actions (e.g., after block reorg).
@@ -159,20 +237,6 @@ fn is_cancel(action: &NativeAction) -> bool {
         action,
         NativeAction::CancelOrder { .. } | NativeAction::CancelAllOrders { .. }
     )
-}
-
-/// Compute a deterministic hash for dedup purposes.
-///
-/// Uses `NativeAction::canonical_bytes()` instead of `Debug` formatting to ensure
-/// the hash is identical across compiler versions and crate updates.
-///
-/// AUDIT: EVM-FIND-11 requested EIP-712 struct hash for dedup.
-/// canonical_bytes() provides equivalent collision resistance with simpler implementation.
-/// EIP-712 would add complexity without material security benefit for internal pool dedup.
-fn compute_action_hash(action: &SignedNativeAction) -> B256 {
-    let mut data = action.action.canonical_bytes();
-    data.extend_from_slice(&action.nonce.to_be_bytes());
-    keccak256(&data)
 }
 
 #[cfg(test)]
@@ -302,6 +366,94 @@ mod tests {
         let drained = pool.drain(10);
         assert_eq!(drained.len(), 2);
         assert_eq!(pool.size(), 3);
+    }
+
+    #[test]
+    fn get_by_hash_returns_action() {
+        let mut pool = NativePool::new(100, 64, 16);
+        let sender = Address::repeat_byte(1);
+        let action = make_action(1, NativeAction::ClaimRewards);
+        let hash = compute_action_hash(&action);
+
+        pool.insert(sender, action.clone()).unwrap();
+        let found = pool.get_by_hash(&hash);
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().nonce, 1);
+
+        assert!(pool.get_by_hash(&B256::ZERO).is_none());
+    }
+
+    #[test]
+    fn select_for_block_does_not_drain() {
+        let mut pool = NativePool::new(100, 64, 16);
+        let sender = Address::repeat_byte(1);
+        for i in 1..=5u64 {
+            pool.insert(sender, make_action(i, NativeAction::ClaimRewards)).unwrap();
+        }
+        assert_eq!(pool.size(), 5);
+
+        let selected = pool.select_for_block(3);
+        assert_eq!(selected.len(), 3);
+        assert_eq!(pool.size(), 5, "select_for_block must not remove entries");
+
+        let hash1 = compute_action_hash(&selected[0]);
+        assert!(pool.get_by_hash(&hash1).is_some(), "selected action still in pool");
+    }
+
+    #[test]
+    fn remove_committed_cleans_pool() {
+        let mut pool = NativePool::new(100, 64, 16);
+        let sender = Address::repeat_byte(1);
+        for i in 1..=5u64 {
+            pool.insert(sender, make_action(i, NativeAction::ClaimRewards)).unwrap();
+        }
+        let selected = pool.select_for_block(3);
+        let hashes: Vec<B256> = selected.iter().map(|a| compute_action_hash(a)).collect();
+
+        pool.remove_committed(&hashes);
+        assert_eq!(pool.size(), 2, "3 committed actions removed, 2 remain");
+
+        for h in &hashes {
+            assert!(pool.get_by_hash(h).is_none(), "committed action removed from hash_index");
+        }
+    }
+
+    #[test]
+    fn hash_index_survives_drain() {
+        let mut pool = NativePool::new(100, 64, 2);
+        let sender = Address::repeat_byte(1);
+        for i in 1..=4u64 {
+            pool.insert(sender, make_action(i, NativeAction::ClaimRewards)).unwrap();
+        }
+        let action4_hash = compute_action_hash(&make_action(4, NativeAction::ClaimRewards));
+
+        let drained = pool.drain(10);
+        assert_eq!(drained.len(), 2);
+        assert_eq!(pool.size(), 2);
+
+        let remaining = pool.get_by_hash(&action4_hash);
+        assert!(remaining.is_some());
+    }
+
+    #[test]
+    fn hash_index_updated_on_eviction() {
+        let mut pool = NativePool::new(2, 64, 16);
+        let a = Address::repeat_byte(1);
+        let b = Address::repeat_byte(2);
+        let c = Address::repeat_byte(3);
+
+        let action_a = make_action(1, NativeAction::ClaimRewards);
+        let action_b = make_action(2, NativeAction::ClaimRewards);
+        let action_c = make_action(3, NativeAction::CancelOrder { order_id: 1 });
+        let hash_c = compute_action_hash(&action_c);
+
+        pool.insert(a, action_a).unwrap();
+        pool.insert(b, action_b).unwrap();
+        pool.insert(c, action_c).unwrap();
+        assert_eq!(pool.size(), 2);
+
+        let found = pool.get_by_hash(&hash_c);
+        assert!(found.is_some());
     }
 
     #[test]

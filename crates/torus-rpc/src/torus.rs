@@ -141,6 +141,10 @@ pub trait TorusApi {
     #[method(name = "getTreasuryInfo")]
     async fn get_treasury_info(&self) -> RpcResult<RpcTreasuryInfo>;
 
+    // --- Leader info (direct-to-leader) ---
+    #[method(name = "getLeader")]
+    async fn get_leader(&self) -> RpcResult<RpcLeaderInfo>;
+
     // --- Block body (native actions for explorer indexing) ---
     #[method(name = "getBlockBody")]
     async fn get_block_body(&self, block_number: u64) -> RpcResult<Option<RpcBlockBody>>;
@@ -590,39 +594,54 @@ impl TorusApiServer for RpcState {
     // === 2.9.4: Submission ===
 
     async fn submit_native_action(&self, signed_action: String) -> RpcResult<String> {
-        // Decode hex → bytes.
         let bytes = parse_bytes(&signed_action).map_err(ErrorObjectOwned::from)?;
 
-        // Deserialize JSON bytes → SignedNativeAction (serde, not borsh).
-        let action: torus_types::SignedNativeAction = serde_json::from_slice(&bytes)
-            .map_err(|e| RpcError::InvalidParams(format!("invalid action encoding: {e}")))
-            .map_err(ErrorObjectOwned::from)?;
+        // Offload deserialization + ECDSA verification to the blocking thread pool
+        // so heavy crypto doesn't starve the async runtime under load.
+        let state_db = self.state.clone();
+        let chain_id = self.chain_id;
+        let (sender, action, action_bytes, hash) = tokio::task::spawn_blocking(move || {
+            let action: torus_types::SignedNativeAction = serde_json::from_slice(&bytes)
+                .map_err(|e| RpcError::InvalidParams(format!("invalid action encoding: {e}")))?;
 
-        // Resolve sender — supports both EIP-712 ECDSA and ed25519 session keys.
-        let current_time_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock before epoch")
-            .as_millis() as u64;
+            let current_time_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock before epoch")
+                .as_millis() as u64;
 
-        let state_ref = &self.state;
-        let sender = action
-            .validate_with_sessions(current_time_ms, self.chain_id, |pubkey| {
-                state_ref.get_session(pubkey).ok().flatten()
-            })
-            .map_err(|e| RpcError::InvalidParams(format!("signature verification failed: {e}")))
-            .map_err(ErrorObjectOwned::from)?;
+            let sender = action
+                .validate_with_sessions(current_time_ms, chain_id, |pubkey| {
+                    state_db.get_session(pubkey).ok().flatten()
+                })
+                .map_err(|e| RpcError::InvalidParams(format!("signature verification failed: {e}")))?;
 
-        // Compute action hash for the receipt.
-        let action_bytes = serde_json::to_vec(&action)
-            .map_err(|e| RpcError::Internal(format!("serialize action: {e}")))
-            .map_err(ErrorObjectOwned::from)?;
-        let hash = keccak256(&action_bytes);
+            let action_bytes = serde_json::to_vec(&action)
+                .map_err(|e| RpcError::Internal(format!("serialize action: {e}")))?;
+            let hash = keccak256(&action_bytes);
 
-        // Submit to mempool with pre-resolved sender (bypasses validate() which
-        // only handles EIP-712; we already validated above with session support).
+            Ok::<_, RpcError>((sender, action, action_bytes, hash))
+        })
+        .await
+        .map_err(|e| ErrorObjectOwned::from(RpcError::Internal(format!("spawn_blocking: {e}"))))?
+        .map_err(ErrorObjectOwned::from)?;
+
         self.mempool
-            .add_native_action_presigned(sender, action)
+            .add_native_action_presigned(sender, action.clone())
             .map_err(|e| ErrorObjectOwned::from(RpcError::Internal(format!("mempool: {e}"))))?;
+
+        // Forward to leader if this node is not the current leader.
+        if let (Some(ref leader_fn), Some(ref own_vk), Some(ref fwd_tx)) =
+            (&self.leader_vk_fn, &self.own_vk, &self.forward_action_tx)
+        {
+            if let Some(leader_vk) = leader_fn() {
+                if leader_vk != *own_vk {
+                    let mut payload = Vec::with_capacity(20 + action_bytes.len());
+                    payload.extend_from_slice(sender.as_slice());
+                    payload.extend_from_slice(&action_bytes);
+                    let _ = fwd_tx.send((leader_vk, payload));
+                }
+            }
+        }
 
         Ok(hex_b256(hash))
     }
@@ -765,6 +784,35 @@ impl TorusApiServer for RpcState {
                 treasury_bps,
                 dev_pool_bps,
             },
+        })
+    }
+
+    async fn get_leader(&self) -> RpcResult<RpcLeaderInfo> {
+        let (leader_vk_bytes, view) = match &self.leader_vk_fn {
+            Some(f) => {
+                let vk = f();
+                let view = self.latest_height.load(Ordering::Relaxed).saturating_add(1);
+                (vk, view)
+            }
+            None => (None, 0),
+        };
+
+        let (address, peer_id) = if let Some(vk_bytes) = leader_vk_bytes {
+            let staking = StakingManager::new(self.state.clone());
+            let addr = staking.find_validator_by_pubkey(&vk_bytes)
+                .ok()
+                .flatten()
+                .map(|v| hex_address(v.address))
+                .unwrap_or_else(|| format!("0x{}", ::hex::encode(vk_bytes)));
+            (addr, format!("0x{}", ::hex::encode(vk_bytes)))
+        } else {
+            ("0x0".to_string(), String::new())
+        };
+
+        Ok(RpcLeaderInfo {
+            address,
+            peer_id,
+            view: hex_u64(view),
         })
     }
 

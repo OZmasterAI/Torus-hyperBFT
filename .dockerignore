@@ -1,6 +1,7 @@
-# Rust build artifacts — the main offender (57GB of host-side debug builds)
+# Rust build artifacts — exclude everything except the release binary
 target/
 **/target/
+!target/release/torus-node
 
 # Version control
 .git/

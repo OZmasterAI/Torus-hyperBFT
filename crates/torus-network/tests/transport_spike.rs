@@ -42,7 +42,7 @@ async fn two_node_message_exchange() {
         ..Default::default()
     };
 
-    let (mut net_a, _tx_a) = LibP2PNetwork::new(config_a, sk_a).await.unwrap();
+    let (mut net_a, _tx_a, _na_a) = LibP2PNetwork::new(config_a, sk_a).await.unwrap();
 
     // Give Node A time to start listening
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -53,7 +53,7 @@ async fn two_node_message_exchange() {
         ..Default::default()
     };
 
-    let (mut net_b, _tx_b) = LibP2PNetwork::new(config_b, sk_b).await.unwrap();
+    let (mut net_b, _tx_b, _na_b) = LibP2PNetwork::new(config_b, sk_b).await.unwrap();
 
     // Give both nodes time to start
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -95,7 +95,7 @@ async fn network_is_clone_send() {
         listen_addr: "/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap(),
         ..Default::default()
     };
-    let (net, _tx) = LibP2PNetwork::new(config, sk).await.unwrap();
+    let (net, _tx, _na) = LibP2PNetwork::new(config, sk).await.unwrap();
 
     // Clone works
     let net2 = net.clone();
@@ -118,7 +118,7 @@ async fn broadcast_self_delivery() {
         listen_addr: "/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap(),
         ..Default::default()
     };
-    let (mut net, _tx) = LibP2PNetwork::new(config, sk).await.unwrap();
+    let (mut net, _tx, _na) = LibP2PNetwork::new(config, sk).await.unwrap();
 
     // Wait for swarm to initialize
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -151,7 +151,7 @@ async fn validator_set_tracking() {
         listen_addr: "/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap(),
         ..Default::default()
     };
-    let (mut net, _tx) = LibP2PNetwork::new(config, sk_a).await.unwrap();
+    let (mut net, _tx, _na) = LibP2PNetwork::new(config, sk_a).await.unwrap();
 
     // Build a validator set
     let mut vs = hotstuff_rs::types::validator_set::ValidatorSet::new();
@@ -179,7 +179,7 @@ async fn tx_gossip_submit() {
         listen_addr: "/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap(),
         ..Default::default()
     };
-    let (_net, tx_handle) = LibP2PNetwork::new(config, sk).await.unwrap();
+    let (_net, tx_handle, _na) = LibP2PNetwork::new(config, sk).await.unwrap();
 
     // Should succeed (swarm task is running)
     assert!(tx_handle.submit_tx(vec![1, 2, 3]).is_ok());

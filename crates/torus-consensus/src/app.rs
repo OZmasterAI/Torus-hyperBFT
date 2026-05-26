@@ -26,7 +26,8 @@ use hotstuff_rs::types::block::Block;
 use hotstuff_rs::types::data_types::{CryptoHash, Data, Datum, Power};
 use hotstuff_rs::types::update_sets::ValidatorSetUpdates;
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 use std::sync::mpsc::SyncSender;
 use std::thread::JoinHandle;
 use torus_bridge::{
@@ -41,7 +42,7 @@ use torus_state::cf::{
 };
 use torus_state::{NativeStateOverlay, StateBackend, StateDb};
 use torus_types::{
-    Address, ChainConfig, TorusBlock, TorusBlockBody, TorusBlockHeader, ValidatorSet,
+    Address, ChainConfig, CompactBlock, TorusBlock, TorusBlockBody, TorusBlockHeader, ValidatorSet,
 };
 
 #[derive(Clone, Debug)]
@@ -55,6 +56,46 @@ struct PendingSlash {
 struct CommittedBlockMsg {
     torus_block: TorusBlock,
     pending_slashes: Vec<PendingSlash>,
+}
+
+/// Shared consensus state for leader discovery by non-consensus components (RPC).
+pub struct LeaderState {
+    view: AtomicU64,
+    validators: RwLock<hotstuff_rs::types::validator_set::ValidatorSet>,
+}
+
+impl LeaderState {
+    fn new() -> Self {
+        Self {
+            view: AtomicU64::new(1),
+            validators: RwLock::new(hotstuff_rs::types::validator_set::ValidatorSet::new()),
+        }
+    }
+
+    fn set_view(&self, view: u64) {
+        self.view.store(view, Ordering::Relaxed);
+    }
+
+    fn sync_validators(&self, vs: &torus_types::ValidatorSet) {
+        let mut hs_vs = hotstuff_rs::types::validator_set::ValidatorSet::new();
+        for v in &vs.validators {
+            if let Ok(vk) = VerifyingKey::from_bytes(&v.pubkey.0) {
+                hs_vs.put(&vk, Power::new(v.power));
+            }
+        }
+        *self.validators.write().unwrap() = hs_vs;
+    }
+
+    pub fn current_view(&self) -> u64 {
+        self.view.load(Ordering::Relaxed)
+    }
+
+    pub fn current_leader(&self) -> Option<VerifyingKey> {
+        let vs = self.validators.read().unwrap();
+        if vs.len() == 0 { return None; }
+        let view = hotstuff_rs::types::data_types::ViewNumber::new(self.view.load(Ordering::Relaxed));
+        Some(hotstuff_rs::pacemaker::select_leader(view, &vs))
+    }
 }
 
 struct ExecutionContext {
@@ -372,6 +413,7 @@ pub struct TorusApp {
     last_validator_set: ValidatorSet,
     cached_vs_updates: Option<(u64, Option<ValidatorSetUpdates>)>,
     pending_slashes: Vec<PendingSlash>,
+    pending_proposals: std::collections::HashMap<u64, TorusBlock>,
     #[allow(dead_code)]
     treasury_address: Address,
     #[allow(dead_code)]
@@ -383,6 +425,7 @@ pub struct TorusApp {
     signing_key: Option<ed25519_dalek::SigningKey>,
     exec_tx: Option<SyncSender<CommittedBlockMsg>>,
     exec_handle: Option<JoinHandle<()>>,
+    leader_state: Arc<LeaderState>,
 }
 
 impl TorusApp {
@@ -445,6 +488,10 @@ impl TorusApp {
             .spawn(move || execution_loop(exec_rx, exec_ctx))
             .expect("spawn execution pipeline thread");
 
+        let leader_state = Arc::new(LeaderState::new());
+        leader_state.sync_validators(&genesis_validator_set);
+        leader_state.set_view(last_header.height.saturating_add(1));
+
         Self {
             state_db,
             proposer,
@@ -467,6 +514,7 @@ impl TorusApp {
             last_validator_set: genesis_validator_set,
             cached_vs_updates: None,
             pending_slashes: Vec::new(),
+            pending_proposals: std::collections::HashMap::new(),
             treasury_address: config.treasury_address,
             dev_pool_address: config.dev_pool_address,
             signing_key,
@@ -474,7 +522,12 @@ impl TorusApp {
             mempool,
             exec_tx: Some(exec_tx),
             exec_handle: Some(exec_handle),
+            leader_state,
         }
+    }
+
+    pub fn leader_state(&self) -> Arc<LeaderState> {
+        self.leader_state.clone()
     }
 
     /// Create a stub `TorusApp` without a database (for consensus-only tests).
@@ -691,6 +744,7 @@ impl TorusApp {
             "epoch boundary: validator set updated"
         );
         self.last_validator_set = capped_set;
+        self.leader_state.sync_validators(&self.last_validator_set);
         self.cached_vs_updates = Some((height, Some(updates.clone())));
         Some(updates)
     }
@@ -718,8 +772,12 @@ impl App<RocksKVStore> for TorusApp {
             if let Ok(Some(parent_block)) = request.block_tree().block(&parent_hash) {
                 let datums = parent_block.data.vec();
                 datums.first()
-                    .and_then(|d| bincode::deserialize::<TorusBlock>(d.bytes()).ok())
-                    .map(|b| b.header)
+                    .and_then(|d| {
+                        bincode::deserialize::<TorusBlock>(d.bytes())
+                            .map(|b| b.header)
+                            .or_else(|_| bincode::deserialize::<CompactBlock>(d.bytes()).map(|cb| cb.header))
+                            .ok()
+                    })
                     .unwrap_or_else(|| self.last_header.clone())
             } else {
                 self.last_header.clone()
@@ -740,9 +798,10 @@ impl App<RocksKVStore> for TorusApp {
             } else {
                 parent_header.evm_gas_limit
             };
-            let (native, evm) = mempool.drain_for_block(4096, gas_limit, parent_header.state_root);
+            let native = mempool.select_native_for_block(4096);
+            let evm = mempool.drain_evm(gas_limit, parent_header.state_root);
             if !evm.is_empty() || !native.is_empty() {
-                tracing::info!(evm_txs = evm.len(), native_actions = native.len(), "drained mempool for block");
+                tracing::info!(evm_txs = evm.len(), native_actions = native.len(), "selected actions for block");
             }
             (native, evm)
         } else {
@@ -792,10 +851,13 @@ impl App<RocksKVStore> for TorusApp {
             core_writer_actions: vec![],
         };
 
+        let height = block.header.height;
         let encoded = bincode::serialize(&block).expect("serialize TorusBlock");
+        self.pending_proposals.insert(height, block);
+        self.pending_proposals.retain(|&h, _| h + 10 > height);
         let hash = Self::hash_datum(&encoded);
 
-        let validator_set_updates = self.epoch_validator_set_updates(block.header.height);
+        let validator_set_updates = self.epoch_validator_set_updates(height);
 
         ProduceBlockResponse {
             data_hash: CryptoHash::new(hash),
@@ -828,20 +890,74 @@ impl App<RocksKVStore> for TorusApp {
             return ValidateBlockResponse::Invalid;
         }
 
-        let torus_block: TorusBlock = match bincode::deserialize(datum_bytes) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!(%e, "validate_block: REJECTED -- deserialization failed");
-                return ValidateBlockResponse::Invalid;
-            }
-        };
+        // Try TorusBlock first (new format), CompactBlock fallback (backward compat)
+        let torus_block = if let Ok(block) = bincode::deserialize::<TorusBlock>(datum_bytes) {
+            tracing::info!(
+                height = block.header.height,
+                evm_tx_count = block.evm_transactions.len(),
+                native_count = block.native_actions.len(),
+                "validate_block: TorusBlock deserialized"
+            );
+            block
+        } else if let Ok(compact) = bincode::deserialize::<CompactBlock>(datum_bytes) {
+            tracing::info!(
+                height = compact.header.height,
+                native_hashes = compact.native_action_hashes.len(),
+                "validate_block: CompactBlock fallback"
+            );
 
-        tracing::info!(
-            height = torus_block.header.height,
-            evm_tx_count = torus_block.evm_transactions.len(),
-            native_count = torus_block.native_actions.len(),
-            "validate_block: structural check passed"
-        );
+            let native_actions = if compact.native_action_hashes.is_empty() {
+                vec![]
+            } else if let Some(ref mempool) = self.mempool {
+                let mut actions: Vec<Option<torus_types::SignedNativeAction>> =
+                    vec![None; compact.native_action_hashes.len()];
+                let mut missing: Vec<usize> = Vec::new();
+
+                for (i, hash) in compact.native_action_hashes.iter().enumerate() {
+                    match mempool.get_native_by_hash(hash) {
+                        Some(action) => actions[i] = Some(action),
+                        None => missing.push(i),
+                    }
+                }
+
+                if !missing.is_empty() {
+                    for _ in 0..5 {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                        missing.retain(|&i| {
+                            match mempool.get_native_by_hash(&compact.native_action_hashes[i]) {
+                                Some(action) => { actions[i] = Some(action); false }
+                                None => true,
+                            }
+                        });
+                        if missing.is_empty() { break; }
+                    }
+                }
+
+                if !missing.is_empty() {
+                    tracing::warn!(
+                        missing_count = missing.len(),
+                        height = compact.header.height,
+                        "validate_block: REJECTED -- missing native actions after retry"
+                    );
+                    return ValidateBlockResponse::Invalid;
+                }
+
+                actions.into_iter().map(|a| a.unwrap()).collect()
+            } else {
+                tracing::warn!("validate_block: REJECTED -- no mempool for action reconstruction");
+                return ValidateBlockResponse::Invalid;
+            };
+
+            TorusBlock {
+                header: compact.header,
+                native_actions,
+                evm_transactions: compact.evm_transactions,
+                core_writer_actions: compact.core_writer_actions,
+            }
+        } else {
+            tracing::warn!("validate_block: REJECTED -- deserialization failed");
+            return ValidateBlockResponse::Invalid;
+        };
 
         if !torus_block.evm_transactions.is_empty() {
             if decode_all_txs(&torus_block.evm_transactions).is_err() {
@@ -889,7 +1005,11 @@ impl App<RocksKVStore> for TorusApp {
             }
         }
 
-        let validator_set_updates = self.epoch_validator_set_updates(torus_block.header.height);
+        let height = torus_block.header.height;
+        self.pending_proposals.insert(height, torus_block);
+        self.pending_proposals.retain(|&h, _| h + 10 > height);
+
+        let validator_set_updates = self.epoch_validator_set_updates(height);
         ValidateBlockResponse::Valid {
             app_state_updates: None,
             validator_set_updates,
@@ -916,12 +1036,42 @@ impl App<RocksKVStore> for TorusApp {
             return;
         };
 
-        let Ok(torus_block) = bincode::deserialize::<TorusBlock>(datum.bytes()) else {
-            tracing::warn!("on_committed_block: failed to deserialize TorusBlock");
+        let datum_bytes = datum.bytes();
+        let torus_block = if let Ok(full) = bincode::deserialize::<TorusBlock>(datum_bytes) {
+            let height = full.header.height;
+            self.pending_proposals.remove(&height).unwrap_or(full)
+        } else if let Ok(compact) = bincode::deserialize::<CompactBlock>(datum_bytes) {
+            let height = compact.header.height;
+            if let Some(cached) = self.pending_proposals.remove(&height) {
+                cached
+            } else if let Some(ref mempool) = self.mempool {
+                let mut native_actions = Vec::with_capacity(compact.native_action_hashes.len());
+                for hash in &compact.native_action_hashes {
+                    match mempool.get_native_by_hash(hash) {
+                        Some(action) => native_actions.push(action),
+                        None => {
+                            tracing::error!(height, "on_committed_block: missing action hash — block will not execute");
+                            return;
+                        }
+                    }
+                }
+                TorusBlock {
+                    header: compact.header,
+                    native_actions,
+                    evm_transactions: compact.evm_transactions,
+                    core_writer_actions: compact.core_writer_actions,
+                }
+            } else {
+                tracing::error!(height, "on_committed_block: no mempool — cannot reconstruct");
+                return;
+            }
+        } else {
+            tracing::warn!("on_committed_block: failed to deserialize block datum");
             return;
         };
 
         let height = torus_block.header.height;
+
         tracing::info!(
             height,
             evm_txs = torus_block.evm_transactions.len(),
@@ -931,6 +1081,16 @@ impl App<RocksKVStore> for TorusApp {
 
         if height > self.last_header.height {
             self.last_header = torus_block.header.clone();
+            self.leader_state.set_view(height.saturating_add(1));
+        }
+
+        if !torus_block.native_actions.is_empty() {
+            if let Some(ref mempool) = self.mempool {
+                let hashes: Vec<torus_types::B256> = torus_block.native_actions.iter()
+                    .map(torus_types::compute_action_hash)
+                    .collect();
+                mempool.remove_committed_native(&hashes);
+            }
         }
 
         if let Some(ref tx) = self.exec_tx {

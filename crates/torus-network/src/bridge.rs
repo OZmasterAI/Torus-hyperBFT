@@ -19,7 +19,7 @@ use crate::behaviour::TorusBehaviour;
 use crate::config::NetworkConfig;
 use crate::peer::PeerMap;
 use crate::swarm::{run_swarm_with_config, NetworkCommand, SharedState};
-use crate::tx_gossip::TxGossipHandle;
+use crate::tx_gossip::{NativeGossipHandle, TxGossipHandle};
 
 /// Derive a libp2p PeerId from a validator's ed25519 VerifyingKey.
 ///
@@ -36,10 +36,20 @@ pub fn peer_id_from_verifying_key(vk: &VerifyingKey) -> PeerId {
 ///
 /// Bridges async libp2p with the synchronous Network trait using channels
 /// and shared state protected by `Arc<Mutex/RwLock>`.
-#[derive(Clone)]
 pub struct LibP2PNetwork {
     command_tx: mpsc::UnboundedSender<NetworkCommand>,
     shared: Arc<SharedState>,
+    native_inbound_rx: Option<mpsc::UnboundedReceiver<(torus_types::Address, torus_types::SignedNativeAction)>>,
+}
+
+impl Clone for LibP2PNetwork {
+    fn clone(&self) -> Self {
+        Self {
+            command_tx: self.command_tx.clone(),
+            shared: self.shared.clone(),
+            native_inbound_rx: None,
+        }
+    }
 }
 
 impl LibP2PNetwork {
@@ -52,7 +62,7 @@ impl LibP2PNetwork {
     pub async fn new(
         config: NetworkConfig,
         signing_key: SigningKey,
-    ) -> Result<(Self, TxGossipHandle), Box<dyn std::error::Error>> {
+    ) -> Result<(Self, TxGossipHandle, NativeGossipHandle), Box<dyn std::error::Error>> {
         Self::with_metrics(config, signing_key, None).await
     }
 
@@ -63,7 +73,7 @@ impl LibP2PNetwork {
         config: NetworkConfig,
         signing_key: SigningKey,
         metrics: Option<Arc<torus_telemetry::Metrics>>,
-    ) -> Result<(Self, TxGossipHandle), Box<dyn std::error::Error>> {
+    ) -> Result<(Self, TxGossipHandle, NativeGossipHandle), Box<dyn std::error::Error>> {
         let local_key = signing_key.verifying_key();
 
         let mut secret_bytes = signing_key.to_bytes();
@@ -76,6 +86,7 @@ impl LibP2PNetwork {
         let libp2p_keypair =
             identity::Keypair::from(identity::ed25519::Keypair::from(libp2p_secret));
 
+        let (native_inbound_tx, native_inbound_rx) = mpsc::unbounded_channel();
         let shared = Arc::new(SharedState {
             inbound: Mutex::new(VecDeque::new()),
             peer_map: RwLock::new(PeerMap::default()),
@@ -83,10 +94,12 @@ impl LibP2PNetwork {
             metrics,
             block_store: RwLock::new(HashMap::new()),
             block_data_inbound: Mutex::new(VecDeque::new()),
+            native_action_inbound: Some(native_inbound_tx),
         });
 
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (tx_tx, tx_rx) = mpsc::unbounded_channel();
+        let (native_tx, native_rx) = mpsc::channel(8192);
 
         let max_peers = config.max_peers;
         let mut swarm = SwarmBuilder::with_existing_identity(libp2p_keypair)
@@ -122,13 +135,20 @@ impl LibP2PNetwork {
         let config_clone = config.clone();
         tokio::spawn(async move {
             run_swarm_with_config(
-                swarm, command_rx, tx_rx, shared_clone, local_key, &config_clone,
+                swarm, command_rx, tx_rx, native_rx, shared_clone, local_key, &config_clone,
             ).await
         });
 
-        let network = Self { command_tx, shared };
+        let network = Self { command_tx, shared, native_inbound_rx: Some(native_inbound_rx) };
         let tx_handle = TxGossipHandle { tx_sender: tx_tx };
-        Ok((network, tx_handle))
+        let native_handle = NativeGossipHandle { sender: native_tx };
+        Ok((network, tx_handle, native_handle))
+    }
+
+    /// Take the inbound native action receiver. Called once at startup to
+    /// spawn a task that drains gossip-received actions into the mempool.
+    pub fn take_native_action_rx(&mut self) -> Option<mpsc::UnboundedReceiver<(torus_types::Address, torus_types::SignedNativeAction)>> {
+        self.native_inbound_rx.take()
     }
 
     /// Register a peer's VerifyingKey to PeerId mapping.
@@ -145,6 +165,12 @@ impl LibP2PNetwork {
     /// Dial a multiaddr to connect to a peer.
     pub fn dial(&self, addr: Multiaddr) {
         let _ = self.command_tx.send(NetworkCommand::Dial { addr });
+    }
+
+    /// Forward a native action directly to a specific peer (leader).
+    /// Payload format: sender_address(20) + serde_json(SignedNativeAction).
+    pub fn forward_native_action(&self, target: VerifyingKey, payload: Vec<u8>) {
+        let _ = self.command_tx.send(NetworkCommand::ForwardNativeAction { target, payload });
     }
 }
 

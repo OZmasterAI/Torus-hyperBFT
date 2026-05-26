@@ -17,3 +17,4 @@ ed25519-dalek = { workspace = true }
 [dev-dependencies]
 serde_json = { workspace = true }
 hex = { workspace = true }
+bincode = { workspace = true }

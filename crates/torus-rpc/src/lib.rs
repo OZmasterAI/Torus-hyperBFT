@@ -130,6 +130,12 @@ pub struct RpcState {
     pub(crate) active_subscriptions: Arc<AtomicUsize>,
     /// Prometheus metrics handle.
     pub(crate) metrics: Option<Arc<torus_telemetry::Metrics>>,
+    /// This node's ed25519 verifying key (for leader comparison).
+    pub(crate) own_vk: Option<[u8; 32]>,
+    /// Returns the current leader's verifying key bytes.
+    pub(crate) leader_vk_fn: Option<Arc<dyn Fn() -> Option<[u8; 32]> + Send + Sync>>,
+    /// Channel to forward native actions to the leader: (leader_vk, sender_addr ++ action_json).
+    pub(crate) forward_action_tx: Option<tokio::sync::mpsc::UnboundedSender<([u8; 32], Vec<u8>)>>,
 }
 
 /// JSON-RPC server combining eth, net, and web3 namespaces.
@@ -161,8 +167,23 @@ impl RpcServer {
                 tx_submit_limiter: TxSubmitLimiter::new(50), // 50 tx per 10s per sender
                 active_subscriptions: Arc::new(AtomicUsize::new(0)),
                 metrics: None,
+                own_vk: None,
+                leader_vk_fn: None,
+                forward_action_tx: None,
             },
         }
+    }
+
+    /// Configure leader forwarding for direct-to-leader native action submission.
+    pub fn set_leader_forwarding(
+        &mut self,
+        own_vk: [u8; 32],
+        leader_vk_fn: Arc<dyn Fn() -> Option<[u8; 32]> + Send + Sync>,
+        forward_tx: tokio::sync::mpsc::UnboundedSender<([u8; 32], Vec<u8>)>,
+    ) {
+        self.state.own_vk = Some(own_vk);
+        self.state.leader_vk_fn = Some(leader_vk_fn);
+        self.state.forward_action_tx = Some(forward_tx);
     }
 
     /// Use an externally-created height counter (shared with the commit handler).
@@ -200,7 +221,10 @@ impl RpcServer {
             metrics: self.state.metrics.clone(),
         };
         let rpc_middleware = rpc_mw::RpcServiceBuilder::new().layer(layer);
-        let server = ServerBuilder::default()
+        let server_cfg = jsonrpsee::server::ServerConfig::builder()
+            .max_connections(64)
+            .build();
+        let server = ServerBuilder::with_config(server_cfg)
             .set_rpc_middleware(rpc_middleware)
             .build(addr)
             .await?;

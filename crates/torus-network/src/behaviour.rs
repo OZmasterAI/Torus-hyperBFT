@@ -11,6 +11,7 @@ use crate::sync::{SyncRequest, SyncResponse};
 
 pub const CONSENSUS_TOPIC: &str = "/torus/consensus/1.0";
 pub const TX_TOPIC: &str = "/torus/transactions/1.0";
+pub const NATIVE_ACTION_TOPIC: &str = "/torus/native-actions/1.0";
 
 #[derive(NetworkBehaviour)]
 pub struct TorusBehaviour {
@@ -41,7 +42,7 @@ impl TorusBehaviour {
         // GossipSub
         let gossipsub_config = gossipsub::ConfigBuilder::default()
             .heartbeat_interval(Duration::from_millis(500))
-            .max_transmit_size(256 * 1024)
+            .max_transmit_size(2 * 1024 * 1024)
             .validation_mode(gossipsub::ValidationMode::Strict)
             .build()
             .map_err(|e| format!("gossipsub config: {e}"))?;

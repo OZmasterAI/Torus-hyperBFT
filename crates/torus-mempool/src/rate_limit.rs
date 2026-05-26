@@ -32,11 +32,13 @@ pub const EVM_TOTAL_BLOCK_CAP: usize = 20;
 /// Max native actions per sender per block.
 pub const NATIVE_PER_BLOCK_CAP: usize = 16;
 
-/// Max total native pool size (2x EVM pool default of 4096).
-pub const NATIVE_POOL_MAX_SIZE: usize = 8192;
+/// Max total native pool size. With gossip replication, each validator holds
+/// actions from all peers, so this must be large enough for the full mesh.
+pub const NATIVE_POOL_MAX_SIZE: usize = 65536;
 
-/// Max pending native actions per sender in the pool.
-pub const NATIVE_PER_SENDER_CAP: usize = 64;
+/// Max pending native actions per sender in the pool. With non-destructive
+/// selection (actions stay until commit), this must cover burst submissions.
+pub const NATIVE_PER_SENDER_CAP: usize = 512;
 
 // ============================================================================
 // Rate tracker

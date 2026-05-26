@@ -77,3 +77,24 @@ impl TxGossipHandle {
             .map_err(|_| "network task shut down")
     }
 }
+
+/// Handle for gossiping native actions to the validator mesh.
+///
+/// Uses a bounded channel (capacity 8192) with backpressure: if the swarm
+/// can't keep up, actions are silently dropped rather than unbounded growth.
+#[derive(Clone)]
+pub struct NativeGossipHandle {
+    pub(crate) sender: tokio::sync::mpsc::Sender<Vec<u8>>,
+}
+
+impl NativeGossipHandle {
+    pub fn submit(&self, action_bytes: Vec<u8>) -> Result<(), &'static str> {
+        self.sender
+            .try_send(action_bytes)
+            .map_err(|_| "native gossip channel full or closed")
+    }
+
+    pub fn into_sender(self) -> tokio::sync::mpsc::Sender<Vec<u8>> {
+        self.sender
+    }
+}

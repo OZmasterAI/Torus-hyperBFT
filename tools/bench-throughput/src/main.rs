@@ -310,7 +310,7 @@ async fn fetch_block_body(
     });
     let resp: serde_json::Value = client.post(url).json(&body).send().await.ok()?.json().await.ok()?;
     let result = resp.get("result")?;
-    result.get("native_action_count")?.as_u64()
+    result.get("nativeActionCount")?.as_u64()
 }
 
 async fn run_consensus(

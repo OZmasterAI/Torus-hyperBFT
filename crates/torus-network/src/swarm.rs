@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use ed25519_dalek::VerifyingKey;
@@ -10,7 +11,7 @@ use sha3::{Digest, Keccak256};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use crate::behaviour::{TorusBehaviour, TorusBehaviourEvent, CONSENSUS_TOPIC, TX_TOPIC};
+use crate::behaviour::{TorusBehaviour, TorusBehaviourEvent, CONSENSUS_TOPIC, NATIVE_ACTION_TOPIC, TX_TOPIC};
 use crate::codec::{BlockDataNetRequest, BlockDataNetResponse, DirectRequest, DirectResponse};
 use crate::config::NetworkConfig;
 use crate::peer::PeerMap;
@@ -49,7 +50,15 @@ pub enum NetworkCommand {
         hash: [u8; 32],
         block_bytes: Vec<u8>,
     },
+    /// Forward a native action directly to the leader node.
+    ForwardNativeAction {
+        target: VerifyingKey,
+        payload: Vec<u8>,
+    },
 }
+
+/// Marker byte prefixed to forwarded native action payloads in DirectRequest.
+const FORWARD_ACTION_MARKER: u8 = 0xFE;
 
 pub struct SharedState {
     pub inbound: Mutex<VecDeque<(VerifyingKey, hotstuff_rs::networking::messages::Message)>>,
@@ -62,40 +71,89 @@ pub struct SharedState {
     /// Inbound block-data responses (separate from consensus inbound queue).
     /// Entries: (sender_vk, view, borsh-encoded Block bytes).
     pub block_data_inbound: Mutex<VecDeque<(VerifyingKey, u64, Vec<u8>)>>,
+    /// Inbound native actions received from gossip (deserialized by swarm, consumed by mempool task).
+    /// Tuple: (pre-verified sender address, signed action) — receivers skip ECDSA recovery.
+    pub native_action_inbound: Option<tokio::sync::mpsc::UnboundedSender<(torus_types::Address, torus_types::SignedNativeAction)>>,
 }
 
 enum SwarmAction {
     Event(Box<SwarmEvent<TorusBehaviourEvent>>),
     Command(Option<Box<NetworkCommand>>),
     Tx(Option<Vec<u8>>),
+    NativeAction(Option<Vec<u8>>),
+    FlushNativeBatch,
+}
+
+const NATIVE_BATCH_INTERVAL_MS: u64 = 50;
+const NATIVE_BATCH_MAX_SIZE: usize = 1024;
+const NATIVE_BATCH_MARKER: u8 = 0xFF;
+
+fn serialize_native_batch(actions: &[Vec<u8>]) -> Vec<u8> {
+    let total: usize = 1 + 4 + actions.iter().map(|a| 4 + a.len()).sum::<usize>();
+    let mut buf = Vec::with_capacity(total);
+    buf.push(NATIVE_BATCH_MARKER);
+    buf.extend_from_slice(&(actions.len() as u32).to_le_bytes());
+    for action in actions {
+        buf.extend_from_slice(&(action.len() as u32).to_le_bytes());
+        buf.extend_from_slice(action);
+    }
+    buf
+}
+
+fn deserialize_native_batch(data: &[u8]) -> Option<Vec<&[u8]>> {
+    if data.first() != Some(&NATIVE_BATCH_MARKER) || data.len() < 5 {
+        return None;
+    }
+    let count = u32::from_le_bytes(data[1..5].try_into().ok()?) as usize;
+    let mut actions = Vec::with_capacity(count);
+    let mut offset = 5;
+    for _ in 0..count {
+        if offset + 4 > data.len() {
+            return None;
+        }
+        let len = u32::from_le_bytes(data[offset..offset + 4].try_into().ok()?) as usize;
+        offset += 4;
+        if offset + len > data.len() {
+            return None;
+        }
+        actions.push(&data[offset..offset + len]);
+        offset += len;
+    }
+    Some(actions)
 }
 
 pub async fn run_swarm(
     swarm: Swarm<TorusBehaviour>,
     command_rx: mpsc::UnboundedReceiver<NetworkCommand>,
     tx_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    native_action_rx: mpsc::Receiver<Vec<u8>>,
     shared: Arc<SharedState>,
     local_key: VerifyingKey,
 ) {
-    run_swarm_with_config(swarm, command_rx, tx_rx, shared, local_key, &NetworkConfig::default()).await
+    run_swarm_with_config(swarm, command_rx, tx_rx, native_action_rx, shared, local_key, &NetworkConfig::default()).await
 }
 
 pub async fn run_swarm_with_config(
     mut swarm: Swarm<TorusBehaviour>,
     mut command_rx: mpsc::UnboundedReceiver<NetworkCommand>,
     mut tx_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    mut native_action_rx: mpsc::Receiver<Vec<u8>>,
     shared: Arc<SharedState>,
     local_key: VerifyingKey,
     config: &NetworkConfig,
 ) {
     let consensus_topic = gossipsub::IdentTopic::new(CONSENSUS_TOPIC);
     let tx_topic = gossipsub::IdentTopic::new(TX_TOPIC);
+    let native_action_topic = gossipsub::IdentTopic::new(NATIVE_ACTION_TOPIC);
 
     if let Err(e) = swarm.behaviour_mut().gossipsub.subscribe(&consensus_topic) {
         warn!("Failed to subscribe to consensus topic: {e:?}");
     }
     if let Err(e) = swarm.behaviour_mut().gossipsub.subscribe(&tx_topic) {
         warn!("Failed to subscribe to tx topic: {e:?}");
+    }
+    if let Err(e) = swarm.behaviour_mut().gossipsub.subscribe(&native_action_topic) {
+        warn!("Failed to subscribe to native action topic: {e:?}");
     }
 
     let mut tx_gossip_state = TxGossipState::new(
@@ -121,11 +179,29 @@ pub async fn run_swarm_with_config(
     let mut mesh_interval = tokio::time::interval(std::time::Duration::from_secs(10));
     mesh_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    let mut native_batch: Vec<Vec<u8>> = Vec::with_capacity(256);
+    let mut batch_timer = tokio::time::interval(Duration::from_millis(NATIVE_BATCH_INTERVAL_MS));
+    batch_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     loop {
         let action = tokio::select! {
-            event = swarm.select_next_some() => SwarmAction::Event(Box::new(event)),
+            biased;
+
+            // P1: consensus commands (outbound) — highest priority to prevent starvation
             cmd = command_rx.recv() => SwarmAction::Command(cmd.map(Box::new)),
+
+            // P2: swarm events (consensus inbound, connections, gossip)
+            event = swarm.select_next_some() => SwarmAction::Event(Box::new(event)),
+
+            // P3: EVM tx publish
             tx = tx_rx.recv() => SwarmAction::Tx(tx),
+
+            // P4: flush native batch on timer
+            _ = batch_timer.tick(), if !native_batch.is_empty() => SwarmAction::FlushNativeBatch,
+
+            // P5: buffer native actions (lowest priority)
+            na = native_action_rx.recv() => SwarmAction::NativeAction(na),
+
             _ = cleanup_interval.tick() => {
                 peer_scoring.cleanup_stale(stale_age);
                 consensus_rate_limiter.cleanup_stale();
@@ -189,6 +265,52 @@ pub async fn run_swarm_with_config(
                 }
             }
             SwarmAction::Tx(None) => {}
+            SwarmAction::FlushNativeBatch => {
+                if !native_batch.is_empty() {
+                    let batch_bytes = serialize_native_batch(&native_batch);
+                    let count = native_batch.len();
+                    native_batch.clear();
+                    match swarm
+                        .behaviour_mut()
+                        .gossipsub
+                        .publish(native_action_topic.clone(), batch_bytes)
+                    {
+                        Ok(_) => {
+                            debug!(count, "published native action batch to gossipsub");
+                            if let Some(ref m) = shared.metrics {
+                                m.gossip_messages_sent.inc();
+                            }
+                        }
+                        Err(e) => {
+                            warn!(count, "failed to publish native batch: {e:?}");
+                        }
+                    }
+                }
+            }
+            SwarmAction::NativeAction(Some(action_bytes)) => {
+                native_batch.push(action_bytes);
+                if native_batch.len() >= NATIVE_BATCH_MAX_SIZE {
+                    let batch_bytes = serialize_native_batch(&native_batch);
+                    let count = native_batch.len();
+                    native_batch.clear();
+                    match swarm
+                        .behaviour_mut()
+                        .gossipsub
+                        .publish(native_action_topic.clone(), batch_bytes)
+                    {
+                        Ok(_) => {
+                            debug!(count, "published native action batch (size cap) to gossipsub");
+                            if let Some(ref m) = shared.metrics {
+                                m.gossip_messages_sent.inc();
+                            }
+                        }
+                        Err(e) => {
+                            warn!(count, "failed to publish native batch: {e:?}");
+                        }
+                    }
+                }
+            }
+            SwarmAction::NativeAction(None) => {}
         }
     }
 }
@@ -265,6 +387,55 @@ fn handle_event(
                     return;
                 }
                 handle_consensus_gossip(&message.data, shared, peer_scoring, &author);
+            } else if message.topic == gossipsub::IdentTopic::new(NATIVE_ACTION_TOPIC).hash() {
+                if message.data.len() > max_tx_msg_size {
+                    warn!(
+                        peer = %propagation_source,
+                        size = message.data.len(),
+                        "oversized native action message rejected"
+                    );
+                    peer_scoring.penalize(
+                        &propagation_source,
+                        PENALTY_INVALID_TX,
+                        "oversized native action message",
+                    );
+                    return;
+                }
+                if let Some(actions) = deserialize_native_batch(&message.data) {
+                    let count = actions.len();
+                    let mut ok = 0usize;
+                    for action_bytes in actions {
+                        match bincode::deserialize::<(torus_types::Address, torus_types::SignedNativeAction)>(action_bytes) {
+                            Ok(pair) => {
+                                if let Some(ref tx) = shared.native_action_inbound {
+                                    let _ = tx.send(pair);
+                                }
+                                ok += 1;
+                            }
+                            Err(e) => {
+                                debug!(peer = %propagation_source, %e, "malformed action in batch");
+                            }
+                        }
+                    }
+                    debug!(count, ok, "received native action batch from {propagation_source}");
+                } else {
+                    match bincode::deserialize::<(torus_types::Address, torus_types::SignedNativeAction)>(&message.data) {
+                        Ok(pair) => {
+                            if let Some(ref tx) = shared.native_action_inbound {
+                                let _ = tx.send(pair);
+                            }
+                            debug!("received single native action from {propagation_source}");
+                        }
+                        Err(e) => {
+                            warn!(peer = %propagation_source, %e, "malformed native action gossip");
+                            peer_scoring.penalize(
+                                &propagation_source,
+                                PENALTY_INVALID_TX,
+                                "malformed native action",
+                            );
+                        }
+                    }
+                }
             } else {
                 // TX message size validation (Phase 3: 3.1.7)
                 if message.data.len() > max_tx_msg_size {
@@ -317,7 +488,19 @@ fn handle_event(
                     return;
                 }
             };
-            if let Ok(msg) =
+            if request.payload.first() == Some(&FORWARD_ACTION_MARKER) {
+                let action_bytes = &request.payload[1..];
+                if action_bytes.len() > 20 {
+                    let sender_addr = torus_types::Address::from_slice(&action_bytes[..20]);
+                    if let Ok(action) = serde_json::from_slice::<torus_types::SignedNativeAction>(&action_bytes[20..]) {
+                        if let Some(ref tx) = shared.native_action_inbound {
+                            let _ = tx.send((sender_addr, action));
+                        }
+                    } else {
+                        warn!(%peer, "forwarded native action: deserialization failed");
+                    }
+                }
+            } else if let Ok(msg) =
                 hotstuff_rs::networking::messages::Message::try_from_slice(&request.payload)
             {
                 enqueue_inbound(&shared.inbound, sender_vk, msg);
@@ -572,6 +755,20 @@ fn handle_command(
         NetworkCommand::StoreBlock { hash, block_bytes } => {
             shared.block_store.write().unwrap().insert(hash, block_bytes);
         }
+        NetworkCommand::ForwardNativeAction { target, payload } => {
+            let peer_id = shared.peer_map.read().unwrap().get_peer_id(&target).copied();
+            if let Some(pid) = peer_id {
+                let mut envelope = vec![FORWARD_ACTION_MARKER];
+                envelope.extend_from_slice(&payload);
+                let req = DirectRequest {
+                    sender_key: local_key.to_bytes(),
+                    payload: envelope,
+                };
+                swarm.behaviour_mut().direct.send_request(&pid, req);
+            } else {
+                warn!("ForwardNativeAction: leader not in peer map");
+            }
+        }
     }
 }
 
@@ -702,6 +899,7 @@ mod tests {
             metrics: None,
             block_store: RwLock::new(HashMap::new()),
             block_data_inbound: Mutex::new(VecDeque::new()),
+            native_action_inbound: None,
         }
     }
 

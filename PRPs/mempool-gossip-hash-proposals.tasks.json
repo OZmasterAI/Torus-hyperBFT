@@ -5,7 +5,7 @@
     {
       "id": 1,
       "name": "Move compute_action_hash to torus-types",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/torus-types/src/lib.rs",
         "crates/torus-mempool/src/native_pool.rs"
@@ -16,7 +16,7 @@
     {
       "id": 2,
       "name": "Add CompactBlock type to torus-types",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/torus-types/src/lib.rs"
       ],
@@ -26,7 +26,7 @@
     {
       "id": 3,
       "name": "Wire native action gossip — outbound",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/torus-network/src/behaviour.rs",
         "crates/torus-mempool/src/lib.rs",
@@ -39,7 +39,7 @@
     {
       "id": 4,
       "name": "Wire native action gossip — inbound (full delivery pipeline)",
-      "status": "pending",
+      "status": "done",
       "notes": "TX_TOPIC handler is receive-deaf (dedup only). Build complete path: gossipsub → deserialize → channel → mempool.add_native_action()",
       "files": [
         "crates/torus-network/src/swarm.rs",
@@ -51,7 +51,7 @@
     {
       "id": 5,
       "name": "Produce CompactBlock in consensus (attestation before compact)",
-      "status": "pending",
+      "status": "done",
       "notes": "sig_attestation must be computed over full TorusBlock BEFORE compacting to CompactBlock",
       "files": [
         "crates/torus-consensus/src/app.rs"
@@ -62,7 +62,7 @@
     {
       "id": 6,
       "name": "Reconstruct TorusBlock from CompactBlock + hash_index + sync path",
-      "status": "pending",
+      "status": "done",
       "notes": "Add hash_index: HashMap<B256,usize> to NativePool for O(1) lookup. validate_block_for_sync cannot use mempool — use full block bytes from CF_BLOCK_BODIES",
       "files": [
         "crates/torus-consensus/src/app.rs",
@@ -75,7 +75,7 @@
     {
       "id": 7,
       "name": "Fallback: 200ms retry window then reject on missing hashes",
-      "status": "pending",
+      "status": "done",
       "notes": "4x50ms polls before rejecting. Pure rejection risks chain stall under network jitter",
       "files": [
         "crates/torus-consensus/src/app.rs"

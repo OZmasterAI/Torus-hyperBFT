@@ -319,10 +319,29 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         ..NetworkConfig::default()
     };
 
-    let (network, _tx_gossip) = LibP2PNetwork::with_metrics(
+    let (mut network, _tx_gossip, native_gossip) = LibP2PNetwork::with_metrics(
         network_config, signing_key.clone(), Some(metrics.clone()),
     ).await?;
+    mempool.set_native_gossip_tx(native_gossip.into_sender());
+
+    // Spawn inbound native action gossip → mempool task
+    if let Some(mut native_rx) = network.take_native_action_rx() {
+        let mempool_for_gossip = mempool.clone();
+        tokio::spawn(async move {
+            while let Some((sender, action)) = native_rx.recv().await {
+                match mempool_for_gossip.add_native_action_from_gossip_trusted(sender, action) {
+                    Ok(()) => {}
+                    Err(torus_mempool::MempoolError::DuplicateNativeAction) => {}
+                    Err(e) => tracing::warn!("gossip native action rejected: {e}"),
+                }
+            }
+        });
+    }
     info!(listen = %cli.p2p_listen, "p2p network started");
+
+    // 5b. Extract leader state + clone network for RPC forwarding (before replica consumes them)
+    let leader_state = app.leader_state();
+    let network_for_fwd = network.clone();
 
     // 6. Consensus configuration
     let hs_config = Configuration::builder()
@@ -393,6 +412,16 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     );
     rpc_server.set_latest_height_handle(latest_height_shared);
     rpc_server.set_metrics(metrics.clone());
+
+    // Leader forwarding: RPC → network bridge
+    let own_vk = verifying_key.to_bytes();
+    let leader_state_for_rpc = leader_state.clone();
+    let leader_vk_fn: Arc<dyn Fn() -> Option<[u8; 32]> + Send + Sync> = Arc::new(move || {
+        leader_state_for_rpc.current_leader().map(|vk| *vk.as_bytes())
+    });
+    let (fwd_tx, mut fwd_rx) = tokio::sync::mpsc::unbounded_channel();
+    rpc_server.set_leader_forwarding(own_vk, leader_vk_fn, fwd_tx);
+
     // Extract shared handles before start() consumes the server
     let latest_height_handle = rpc_server.latest_height();
     let pruned_up_to_handle = rpc_server.pruned_up_to();
@@ -401,6 +430,15 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         .await
         .map_err(|e| -> Box<dyn std::error::Error> { e })?;
     info!(%actual_addr, "JSON-RPC server started");
+
+    // Forwarding bridge: receives (target_vk_bytes, payload) from RPC, sends via network
+    tokio::spawn(async move {
+        while let Some((target_vk_bytes, payload)) = fwd_rx.recv().await {
+            if let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(&target_vk_bytes) {
+                network_for_fwd.forward_native_action(vk, payload);
+            }
+        }
+    });
 
     // 10. Metrics (telemetry endpoint)
     let metrics_addr = cli.metrics_addr;

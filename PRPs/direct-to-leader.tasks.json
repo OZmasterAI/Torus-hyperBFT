@@ -1,0 +1,62 @@
+{
+  "prp": "direct-to-leader",
+  "created": "2026-05-23T23:30:00Z",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "produce_block serializes TorusBlock instead of CompactBlock",
+      "status": "pending",
+      "files": ["crates/torus-consensus/src/app.rs"],
+      "validate": "cargo test -p torus-consensus",
+      "depends_on": []
+    },
+    {
+      "id": 2,
+      "name": "validate_block deserializes TorusBlock directly",
+      "status": "pending",
+      "files": ["crates/torus-consensus/src/app.rs"],
+      "validate": "cargo test -p torus-consensus",
+      "depends_on": [1]
+    },
+    {
+      "id": 3,
+      "name": "on_committed_block deserializes TorusBlock directly",
+      "status": "pending",
+      "files": ["crates/torus-consensus/src/app.rs"],
+      "validate": "cargo test -p torus-consensus",
+      "depends_on": [1]
+    },
+    {
+      "id": 4,
+      "name": "Devnet benchmark verification (>1000 included/sec)",
+      "status": "pending",
+      "files": [],
+      "validate": "bench-throughput consensus --duration 60 --senders 100",
+      "depends_on": [1, 2, 3]
+    },
+    {
+      "id": 5,
+      "name": "Expose current leader from consensus to node",
+      "status": "pending",
+      "files": ["crates/torus-consensus/src/app.rs", "crates/torus-node/src/main.rs"],
+      "validate": "cargo test -p torus-consensus -p torus-node",
+      "depends_on": [4]
+    },
+    {
+      "id": 6,
+      "name": "Non-leader RPC forwards native actions to leader",
+      "status": "pending",
+      "files": ["crates/torus-rpc/src/torus.rs", "crates/torus-node/src/main.rs", "crates/torus-network/src/bridge.rs"],
+      "validate": "cargo test -p torus-rpc -p torus-network",
+      "depends_on": [5]
+    },
+    {
+      "id": 7,
+      "name": "torus_getLeader RPC endpoint",
+      "status": "pending",
+      "files": ["crates/torus-rpc/src/torus.rs"],
+      "validate": "cargo test -p torus-rpc",
+      "depends_on": [5]
+    }
+  ]
+}

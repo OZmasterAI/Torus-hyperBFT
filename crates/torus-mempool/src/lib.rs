@@ -86,6 +86,8 @@ pub struct Mempool {
     config: MempoolConfig,
     /// Approximate total memory used by pooled transactions (Phase 3: 3.1.7).
     memory_used: std::sync::atomic::AtomicUsize,
+    /// Outbound native action gossip channel (set once at startup).
+    native_gossip_tx: std::sync::OnceLock<tokio::sync::mpsc::Sender<Vec<u8>>>,
 }
 
 impl Mempool {
@@ -108,6 +110,16 @@ impl Mempool {
             state,
             config,
             memory_used: std::sync::atomic::AtomicUsize::new(0),
+            native_gossip_tx: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Set the outbound gossip channel for native actions.
+    /// Called once at startup after network initialization.
+    pub fn set_native_gossip_tx(&self, tx: tokio::sync::mpsc::Sender<Vec<u8>>) {
+        match self.native_gossip_tx.set(tx) {
+            Ok(()) => tracing::info!("native action gossip enabled"),
+            Err(_) => tracing::warn!("native_gossip_tx already set"),
         }
     }
 
@@ -204,6 +216,7 @@ impl Mempool {
     }
 
     /// Submit a signed native action. Full EIP-712 validation: signature, chain ID, nonce freshness.
+    /// Gossips to the validator mesh on success (RPC submission path).
     /// FIX EVM-FIND-05: Calls validate() instead of just recover_sender().
     pub fn add_native_action(&self, action: SignedNativeAction) -> Result<(), MempoolError> {
         let current_time_ms = std::time::SystemTime::now()
@@ -213,11 +226,14 @@ impl Mempool {
         let sender = action
             .validate(current_time_ms, self.config.chain_id)
             .map_err(|e| MempoolError::NativeValidationFailed(e.to_string()))?;
-        self.submit_native_action(sender, action)
+        self.submit_native_action(sender, action.clone())?;
+        self.gossip_native_action(sender, &action);
+        Ok(())
     }
 
     /// Submit a session-signed native action with pre-resolved sender.
     /// Called by RPC after verifying the session key signature against state.
+    /// Gossips to the validator mesh on success.
     pub fn add_native_action_presigned(
         &self,
         sender: alloy_primitives::Address,
@@ -228,7 +244,6 @@ impl Mempool {
             .expect("system clock before epoch")
             .as_millis() as u64;
 
-        // Nonce window check still applies.
         use torus_types::eip712::NONCE_WINDOW_MS;
         if action.nonce.saturating_add(NONCE_WINDOW_MS) < current_time_ms {
             return Err(MempoolError::NativeValidationFailed("nonce too old".into()));
@@ -239,7 +254,48 @@ impl Mempool {
             ));
         }
 
+        self.submit_native_action(sender, action.clone())?;
+        self.gossip_native_action(sender, &action);
+        Ok(())
+    }
+
+    /// Insert a native action received from gossip with a pre-verified sender.
+    /// Skips ECDSA recovery (the expensive part) — trusts that the originating
+    /// node already verified the signature. Only checks nonce freshness.
+    pub fn add_native_action_from_gossip_trusted(
+        &self,
+        sender: alloy_primitives::Address,
+        action: SignedNativeAction,
+    ) -> Result<(), MempoolError> {
+        let current_time_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before epoch")
+            .as_millis() as u64;
+        use torus_types::eip712::NONCE_WINDOW_MS;
+        if action.nonce.saturating_add(NONCE_WINDOW_MS) < current_time_ms {
+            return Err(MempoolError::NativeValidationFailed("nonce too old (>60s)".into()));
+        }
+        if action.nonce > current_time_ms.saturating_add(NONCE_WINDOW_MS) {
+            return Err(MempoolError::NativeValidationFailed("nonce too far in future".into()));
+        }
         self.submit_native_action(sender, action)
+    }
+
+    /// Gossip includes sender address so receivers can skip ECDSA recovery.
+    fn gossip_native_action(&self, sender: alloy_primitives::Address, action: &SignedNativeAction) {
+        if let Some(tx) = self.native_gossip_tx.get() {
+            if let Ok(bytes) = bincode::serialize(&(sender, action)) {
+                match tx.try_send(bytes) {
+                    Ok(()) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        tracing::debug!("native gossip channel full, dropping outbound action");
+                    }
+                    Err(_) => {
+                        tracing::warn!("native gossip channel closed");
+                    }
+                }
+            }
+        }
     }
 
     /// FIX EVM-FIND-15: Renamed from submit_native_action and restricted to pub(crate).
@@ -283,6 +339,23 @@ impl Mempool {
     /// Current native pool size.
     pub fn native_pool_size(&self) -> usize {
         self.native.read().unwrap().size()
+    }
+
+    /// Look up a native action by its hash (for compact block reconstruction).
+    pub fn get_native_by_hash(&self, hash: &B256) -> Option<SignedNativeAction> {
+        self.native.read().unwrap().get_by_hash(hash)
+    }
+
+    /// Select native actions for a block proposal WITHOUT removing them.
+    /// Actions stay in the pool for other validators' `get_by_hash` lookups.
+    /// Call `remove_committed_native` after the block is committed.
+    pub fn select_native_for_block(&self, limit: usize) -> Vec<SignedNativeAction> {
+        self.native.write().unwrap().select_for_block(limit)
+    }
+
+    /// Remove native actions that were included in a committed block.
+    pub fn remove_committed_native(&self, hashes: &[B256]) {
+        self.native.write().unwrap().remove_committed(hashes);
     }
 
     /// Approximate total memory used by pooled transactions (Phase 3: 3.1.7).

@@ -264,10 +264,9 @@ impl<N: Network> HotStuff<N> {
                         tc: None,
                         nec: None,
                     };
-                    let header = ProposalHeader::from_proposal(&proposal, validator_set_updates.is_some());
                     self.pending_bodies.insert(proposal.block.hash, proposal.block.clone());
                     self.sender_handle.store_block_for_serving(proposal.block.hash, proposal.block.clone());
-                    self.sender_handle.broadcast::<HotStuffMessage>(header.into());
+                    self.sender_handle.broadcast::<HotStuffMessage>(proposal.clone().into());
                     Event::Propose(ProposeEvent {
                         timestamp: SystemTime::now(),
                         proposal,
@@ -359,11 +358,10 @@ impl<N: Network> HotStuff<N> {
                     nec: None,
                 };
 
-                let header = ProposalHeader::from_proposal(&proposal, false);
                 self.pending_bodies.insert(proposal.block.hash, proposal.block.clone());
                 self.sender_handle.store_block_for_serving(proposal.block.hash, proposal.block.clone());
                 self.sender_handle
-                    .broadcast::<HotStuffMessage>(header.into());
+                    .broadcast::<HotStuffMessage>(proposal.clone().into());
 
                 Event::Propose(ProposeEvent {
                     timestamp: SystemTime::now(),
@@ -380,11 +378,10 @@ impl<N: Network> HotStuff<N> {
                     if let Some(proposal) = self.create_proposal_based_on_tc(
                         &tc, block_tree, app,
                     )? {
-                        let header = ProposalHeader::from_proposal(&proposal, false);
                         self.pending_bodies.insert(proposal.block.hash, proposal.block.clone());
                         self.sender_handle.store_block_for_serving(proposal.block.hash, proposal.block.clone());
                         self.sender_handle
-                            .broadcast::<HotStuffMessage>(header.into());
+                            .broadcast::<HotStuffMessage>(proposal.clone().into());
                         Event::Propose(ProposeEvent {
                             timestamp: SystemTime::now(),
                             proposal,
@@ -453,11 +450,10 @@ impl<N: Network> HotStuff<N> {
                         nec: None,
                     };
 
-                    let header = ProposalHeader::from_proposal(&proposal, validator_set_updates.is_some());
                     self.pending_bodies.insert(proposal.block.hash, proposal.block.clone());
                     self.sender_handle.store_block_for_serving(proposal.block.hash, proposal.block.clone());
                     self.sender_handle
-                        .broadcast::<HotStuffMessage>(header.into());
+                        .broadcast::<HotStuffMessage>(proposal.clone().into());
 
                     Event::Propose(ProposeEvent {
                         timestamp: SystemTime::now(),
@@ -1296,10 +1292,9 @@ impl<N: Network> HotStuff<N> {
             tc: Some(tc),
             nec: None,
         };
-        let header = ProposalHeader::from_proposal(&proposal, false);
         self.pending_bodies.insert(proposal.block.hash, proposal.block.clone());
         self.sender_handle.store_block_for_serving(proposal.block.hash, proposal.block.clone());
-        self.sender_handle.broadcast::<HotStuffMessage>(header.into());
+        self.sender_handle.broadcast::<HotStuffMessage>(proposal.clone().into());
         Event::Propose(ProposeEvent {
             timestamp: SystemTime::now(),
             proposal,
@@ -1448,10 +1443,9 @@ impl<N: Network> HotStuff<N> {
                 tc: Some(tc),
                 nec: Some(nec),
             };
-            let header = ProposalHeader::from_proposal(&proposal, false);
             self.pending_bodies.insert(proposal.block.hash, proposal.block.clone());
             self.sender_handle.store_block_for_serving(proposal.block.hash, proposal.block.clone());
-            self.sender_handle.broadcast::<HotStuffMessage>(header.into());
+            self.sender_handle.broadcast::<HotStuffMessage>(proposal.clone().into());
             Event::Propose(ProposeEvent {
                 timestamp: SystemTime::now(),
                 proposal,

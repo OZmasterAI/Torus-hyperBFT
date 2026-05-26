@@ -473,6 +473,18 @@ pub struct RpcFeeSplit {
 }
 
 // ============================================================================
+// Leader Info Response (direct-to-leader)
+// ============================================================================
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcLeaderInfo {
+    pub address: String,
+    pub peer_id: String,
+    pub view: String,
+}
+
+// ============================================================================
 // Block Body Response (for explorer indexing)
 // ============================================================================
 

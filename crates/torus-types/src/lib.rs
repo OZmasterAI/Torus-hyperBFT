@@ -423,6 +423,32 @@ impl TorusBlock {
     }
 }
 
+/// Compact block for consensus proposals — carries action hashes instead of full payloads.
+/// Validators reconstruct the full `TorusBlock` from their local mempool.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CompactBlock {
+    pub header: TorusBlockHeader,
+    pub native_action_hashes: Vec<B256>,
+    pub evm_transactions: Vec<Vec<u8>>,
+    pub core_writer_actions: Vec<CoreWriterAction>,
+}
+
+impl CompactBlock {
+    pub fn from_block(block: &TorusBlock) -> Self {
+        let hashes = block
+            .native_actions
+            .iter()
+            .map(|a| compute_action_hash(a))
+            .collect();
+        Self {
+            header: block.header.clone(),
+            native_action_hashes: hashes,
+            evm_transactions: block.evm_transactions.clone(),
+            core_writer_actions: block.core_writer_actions.clone(),
+        }
+    }
+}
+
 // ============================================================================
 // Native Action Types (§5.6)
 // ============================================================================
@@ -757,6 +783,15 @@ pub struct SignedNativeAction {
     pub nonce: u64,
     /// EIP-712 ECDSA or ed25519 session key signature.
     pub signature: ActionSignature,
+}
+
+/// Deterministic hash of a signed native action for dedup and compact block references.
+///
+/// Uses `NativeAction::canonical_bytes()` + nonce for collision resistance.
+pub fn compute_action_hash(action: &SignedNativeAction) -> B256 {
+    let mut data = action.action.canonical_bytes();
+    data.extend_from_slice(&action.nonce.to_be_bytes());
+    alloy_primitives::keccak256(&data)
 }
 
 // ============================================================================
@@ -1130,6 +1165,141 @@ mod tests {
         let json = br#"{"height":1,"timestamp":1000,"proposer":"0x0000000000000000000000000000000000000000","state_root":"0x0000000000000000000000000000000000000000000000000000000000000000","receipts_root":"0x0000000000000000000000000000000000000000000000000000000000000000","logs_bloom":"0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000","evm_gas_used":0,"evm_fee_revenue":0,"evm_gas_limit":30000000,"native_action_count":0,"evm_tx_count":0,"base_fee_per_gas":1000000000,"epoch":0,"validator_set_hash":"0x0000000000000000000000000000000000000000000000000000000000000000"}"#;
         let decoded: TorusBlockHeader = serde_json::from_slice(json).unwrap();
         assert_eq!(decoded.sig_attestation, [0u8; 64]);
+    }
+
+    fn test_header() -> TorusBlockHeader {
+        TorusBlockHeader {
+            height: 1,
+            timestamp: 1000,
+            proposer: Address::ZERO,
+            state_root: B256::ZERO,
+            receipts_root: B256::ZERO,
+            logs_bloom: Bloom::ZERO,
+            evm_gas_used: 0,
+            evm_fee_revenue: 0,
+            evm_gas_limit: 30_000_000,
+            native_action_count: 0,
+            evm_tx_count: 0,
+            base_fee_per_gas: 1_000_000_000,
+            epoch: 0,
+            validator_set_hash: B256::ZERO,
+            sig_attestation: [0u8; 64],
+        }
+    }
+
+    #[test]
+    fn compact_block_roundtrip_bincode() {
+        let action = SignedNativeAction {
+            action: NativeAction::ClaimRewards,
+            nonce: 100,
+            signature: ActionSignature::Eip712(Signature {
+                v: 27, r: [0u8; 32], s: [0u8; 32],
+            }),
+        };
+        let block = TorusBlock {
+            header: test_header(),
+            native_actions: vec![action.clone(); 10],
+            evm_transactions: vec![vec![1, 2, 3]],
+            core_writer_actions: vec![],
+        };
+        let compact = CompactBlock::from_block(&block);
+        assert_eq!(compact.native_action_hashes.len(), 10);
+        assert_eq!(compact.native_action_hashes[0], compute_action_hash(&action));
+
+        let encoded = bincode::serialize(&compact).unwrap();
+        let decoded: CompactBlock = bincode::deserialize(&encoded).unwrap();
+        assert_eq!(decoded.native_action_hashes.len(), 10);
+        assert_eq!(decoded.native_action_hashes[0], compact.native_action_hashes[0]);
+        assert_eq!(decoded.evm_transactions, compact.evm_transactions);
+    }
+
+    #[test]
+    fn compact_block_smaller_than_full_block() {
+        let actions: Vec<SignedNativeAction> = (0..100).map(|i| SignedNativeAction {
+            action: NativeAction::CancelOrder { order_id: i },
+            nonce: i as u64,
+            signature: ActionSignature::Eip712(Signature {
+                v: 27, r: [0u8; 32], s: [0u8; 32],
+            }),
+        }).collect();
+        let block = TorusBlock {
+            header: test_header(),
+            native_actions: actions,
+            evm_transactions: vec![],
+            core_writer_actions: vec![],
+        };
+        let compact = CompactBlock::from_block(&block);
+
+        let full_size = bincode::serialize(&block).unwrap().len();
+        let compact_size = bincode::serialize(&compact).unwrap().len();
+        assert!(compact_size < full_size, "compact {compact_size} should be smaller than full {full_size}");
+    }
+
+    #[test]
+    fn compact_block_empty_actions() {
+        let block = TorusBlock {
+            header: test_header(),
+            native_actions: vec![],
+            evm_transactions: vec![],
+            core_writer_actions: vec![],
+        };
+        let compact = CompactBlock::from_block(&block);
+        assert!(compact.native_action_hashes.is_empty());
+    }
+
+    #[test]
+    fn compute_action_hash_deterministic() {
+        let action = SignedNativeAction {
+            action: NativeAction::ClaimRewards,
+            nonce: 12345,
+            signature: ActionSignature::Eip712(Signature {
+                v: 27,
+                r: [0u8; 32],
+                s: [0u8; 32],
+            }),
+        };
+        let h1 = compute_action_hash(&action);
+        let h2 = compute_action_hash(&action);
+        assert_eq!(h1, h2);
+        assert_ne!(h1, B256::ZERO);
+    }
+
+    #[test]
+    fn compute_action_hash_differs_by_nonce() {
+        let a1 = SignedNativeAction {
+            action: NativeAction::ClaimRewards,
+            nonce: 1,
+            signature: ActionSignature::Eip712(Signature {
+                v: 27, r: [0u8; 32], s: [0u8; 32],
+            }),
+        };
+        let a2 = SignedNativeAction {
+            action: NativeAction::ClaimRewards,
+            nonce: 2,
+            signature: ActionSignature::Eip712(Signature {
+                v: 27, r: [0u8; 32], s: [0u8; 32],
+            }),
+        };
+        assert_ne!(compute_action_hash(&a1), compute_action_hash(&a2));
+    }
+
+    #[test]
+    fn compute_action_hash_differs_by_action() {
+        let a1 = SignedNativeAction {
+            action: NativeAction::ClaimRewards,
+            nonce: 1,
+            signature: ActionSignature::Eip712(Signature {
+                v: 27, r: [0u8; 32], s: [0u8; 32],
+            }),
+        };
+        let a2 = SignedNativeAction {
+            action: NativeAction::CancelOrder { order_id: 42 },
+            nonce: 1,
+            signature: ActionSignature::Eip712(Signature {
+                v: 27, r: [0u8; 32], s: [0u8; 32],
+            }),
+        };
+        assert_ne!(compute_action_hash(&a1), compute_action_hash(&a2));
     }
 
     #[test]

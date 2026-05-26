@@ -24,4 +24,4 @@ pub mod tx_gossip;
 pub use bridge::LibP2PNetwork;
 pub use config::NetworkConfig;
 pub use sync::{SyncRequest, SyncResponse};
-pub use tx_gossip::TxGossipHandle;
+pub use tx_gossip::{NativeGossipHandle, TxGossipHandle};
