@@ -1,0 +1,95 @@
+{
+    "chain_id": 7778,
+    "chain_name": "torus-testnet",
+    "timestamp": 1748649600,
+    "consensus": {
+        "protocol": "hotstuff",
+        "epoch_length": 100,
+        "timeout_base_ms": 500,
+        "timeout_max_ms": 30000
+    },
+    "evm": {
+        "spec_id": "cancun",
+        "gas_limit": 30000000,
+        "base_fee_initial": 1000000000,
+        "chain_id": 7778
+    },
+    "economics": {
+        "treasury_address": "0xf000000000000000000000000000000000000001",
+        "dev_pool_address": "0xf000000000000000000000000000000000000002",
+        "fee_split": {
+            "start": {
+                "burn": 1000,
+                "validator": 0,
+                "treasury": 4500,
+                "dev_pool": 4500
+            },
+            "end": {
+                "burn": 2500,
+                "validator": 2500,
+                "treasury": 2500,
+                "dev_pool": 2500
+            },
+            "transition_epochs": 1825
+        },
+        "permanent_staking": {
+            "annual_rate_bps": 500,
+            "governance_multiplier_bps": 15000
+        },
+        "validator": {
+            "min_self_delegation": "10000000000000000000000",
+            "max_validators": 21,
+            "unbonding_period_blocks": 604800,
+            "max_commission_bps": 5000,
+            "max_commission_change_bps": 100
+        }
+    },
+    "validators": [
+        {
+            "address": "0x1000000000000000000000000000000000000001",
+            "pubkey": "0x1f655caebb0e810402482d23b7beb998a1188735b2d9535f972b4e02dc31d629",
+            "stake": "1000000000000000000000000",
+            "commission_bps": 500
+        }
+    ],
+    "accounts": [
+        {
+            "address": "0xf000000000000000000000000000000000000001",
+            "balance": "1000000000000000000000000000",
+            "note": "treasury"
+        },
+        {
+            "address": "0xf000000000000000000000000000000000000002",
+            "balance": "500000000000000000000000000",
+            "note": "dev_pool"
+        },
+        {
+            "address": "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-0 (hardhat #0)"
+        },
+        {
+            "address": "0x70997970c51812dc3a010c7d01b50e0d17dc79c8",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-1 (hardhat #1)"
+        },
+        {
+            "address": "0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-2 (hardhat #2)"
+        },
+        {
+            "address": "0x90f79bf6eb2c4f870365e785982e1f101e93b906",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-3 (hardhat #3)"
+        },
+        {
+            "address": "0x15d34aaf54267db7d7c367839aaf71a00a2c6a65",
+            "balance": "1000000000000000000000000",
+            "note": "test-account-4 (hardhat #4)"
+        }
+    ],
+    "evm_alloc": {},
+    "markets": [],
+    "precompiles": {}
+}

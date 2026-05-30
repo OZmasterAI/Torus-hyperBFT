@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
+use serde::Deserialize;
 use ed25519_dalek::SigningKey;
 use hotstuff_rs::events::CommitBlockEvent;
 use hotstuff_rs::replica::{Configuration, Replica, ReplicaSpec};
@@ -39,6 +40,10 @@ mod keystore;
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
+
+    /// Path to TOML config file (CLI flags override config file values)
+    #[arg(long)]
+    config: Option<PathBuf>,
 
     /// Path to genesis.json (required for first run)
     #[arg(long)]
@@ -126,6 +131,62 @@ fn decode_hex_key(hex_str: &str) -> Result<[u8; 32], Box<dyn std::error::Error>>
     Ok(arr)
 }
 
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+struct ConfigFile {
+    genesis: Option<PathBuf>,
+    data_dir: Option<PathBuf>,
+    keystore: Option<PathBuf>,
+    passphrase_file: Option<PathBuf>,
+    validator_key: Option<String>,
+    p2p_listen: Option<String>,
+    p2p_peers: Option<String>,
+    rpc_addr: Option<String>,
+    log_level: Option<String>,
+    metrics_addr: Option<String>,
+    rpc_only: Option<bool>,
+    archive: Option<bool>,
+    retention_blocks: Option<u64>,
+}
+
+fn load_config_file(path: &PathBuf) -> Result<ConfigFile, Box<dyn std::error::Error>> {
+    let contents = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read config file {}: {e}", path.display()))?;
+    let config: ConfigFile = toml::from_str(&contents)
+        .map_err(|e| format!("invalid config TOML: {e}"))?;
+    Ok(config)
+}
+
+fn apply_config_defaults(cli: &mut Cli, cfg: ConfigFile) {
+    if cli.genesis.is_none() { cli.genesis = cfg.genesis; }
+    if cli.keystore.is_none() { cli.keystore = cfg.keystore; }
+    if cli.passphrase_file.is_none() { cli.passphrase_file = cfg.passphrase_file; }
+    if cli.validator_key.is_none() { cli.validator_key = cfg.validator_key; }
+    if cli.p2p_peers.is_none() { cli.p2p_peers = cfg.p2p_peers; }
+    if let Some(dir) = cfg.data_dir {
+        if cli.data_dir == PathBuf::from("./data") { cli.data_dir = dir; }
+    }
+    if let Some(listen) = cfg.p2p_listen {
+        if cli.p2p_listen == "/ip4/0.0.0.0/udp/30333/quic-v1" { cli.p2p_listen = listen; }
+    }
+    if let Some(addr) = cfg.rpc_addr {
+        if cli.rpc_addr == "0.0.0.0:8545" { cli.rpc_addr = addr; }
+    }
+    if let Some(level) = cfg.log_level {
+        if cli.log_level == "info" { cli.log_level = level; }
+    }
+    if let Some(addr) = cfg.metrics_addr {
+        if cli.metrics_addr == "0.0.0.0:9090".parse::<SocketAddr>().unwrap() {
+            if let Ok(parsed) = addr.parse::<SocketAddr>() {
+                cli.metrics_addr = parsed;
+            }
+        }
+    }
+    if cfg.rpc_only.unwrap_or(false) && !cli.rpc_only { cli.rpc_only = true; }
+    if cfg.archive.unwrap_or(false) && !cli.archive { cli.archive = true; }
+    if cli.retention_blocks.is_none() { cli.retention_blocks = cfg.retention_blocks; }
+}
+
 fn default_chain_config() -> ChainConfig {
     use alloy_primitives::{Address, U256};
     ChainConfig {
@@ -152,7 +213,18 @@ fn default_chain_config() -> ChainConfig {
 
 #[tokio::main]
 async fn main() {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+
+    // Load config file if specified (CLI flags take precedence)
+    if let Some(config_path) = cli.config.clone() {
+        match load_config_file(&config_path) {
+            Ok(cfg) => apply_config_defaults(&mut cli, cfg),
+            Err(e) => {
+                eprintln!("Error loading config: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
 
     // Handle keygen subcommand before tracing init
     if let Some(Command::Keygen { output }) = &cli.command {
@@ -306,9 +378,12 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let listen_addr = cli.p2p_listen.parse()
         .map_err(|e| format!("invalid p2p-listen multiaddr: {e}"))?;
 
-    let bootstrap_peers = cli.p2p_peers.as_deref()
-        .map(NetworkConfig::parse_bootstrap_peers)
-        .unwrap_or_default();
+    let bootstrap_peers = if let Some(peers_csv) = cli.p2p_peers.as_deref() {
+        NetworkConfig::parse_bootstrap_peers(peers_csv)
+    } else {
+        info!("no --p2p-peers specified, using default testnet bootstrap nodes");
+        NetworkConfig::default_bootstrap_peers()
+    };
     for (pid, addr) in &bootstrap_peers {
         info!(peer_id = %pid, addr = %addr, "bootstrap peer configured");
     }

@@ -58,6 +58,17 @@ impl NetworkConfig {
     }
 }
 
+pub const TESTNET_BOOTSTRAP_PEERS: &[&str] = &[
+    "/ip4/95.111.231.121/udp/30333/quic-v1/p2p/12D3KooWBvvTCcRY9kfzW8ftqokqeS7SnfcKSvQKYxftViHdy3jW",
+];
+
+impl NetworkConfig {
+    pub fn default_bootstrap_peers() -> Vec<(PeerId, Multiaddr)> {
+        let csv = TESTNET_BOOTSTRAP_PEERS.join(",");
+        Self::parse_bootstrap_peers(&csv)
+    }
+}
+
 impl Default for NetworkConfig {
     fn default() -> Self {
         Self {
