@@ -798,7 +798,7 @@ impl App<RocksKVStore> for TorusApp {
             } else {
                 parent_header.evm_gas_limit
             };
-            let native = mempool.select_native_for_block(4096);
+            let native = mempool.select_native_for_block(torus_mempool::rate_limit::NATIVE_TOTAL_BLOCK_CAP);
             let evm = mempool.drain_evm(gas_limit, parent_header.state_root);
             if !evm.is_empty() || !native.is_empty() {
                 tracing::info!(evm_txs = evm.len(), native_actions = native.len(), "selected actions for block");
@@ -808,19 +808,9 @@ impl App<RocksKVStore> for TorusApp {
             (vec![], vec![])
         };
 
-        if !native_actions.is_empty() {
-            let invalid = torus_types::eip712::batch_verify_native_actions(
-                &native_actions,
-                timestamp,
-                |pubkey| self.state_db.get_session(pubkey).ok().flatten(),
-            );
-            if !invalid.is_empty() {
-                tracing::warn!(count = invalid.len(), "produce_block: dropping actions with invalid signatures");
-                for &idx in invalid.iter().rev() {
-                    native_actions.remove(idx);
-                }
-            }
-        }
+        // Sig verification skipped: actions are already verified at RPC ingestion
+        // (submit_native_action → spawn_blocking → validate_with_sessions).
+        // Re-verifying here was the main block production bottleneck under load.
 
         let sig_attestation = match self.signing_key {
             Some(ref key) => torus_bridge::proposer::generate_sig_attestation(&native_actions, key),

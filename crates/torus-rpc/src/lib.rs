@@ -172,7 +172,7 @@ impl RpcServer {
                 own_vk: None,
                 leader_vk_fn: None,
                 forward_action_tx: None,
-                submit_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
+                submit_semaphore: Arc::new(tokio::sync::Semaphore::new(16)),
             },
         }
     }

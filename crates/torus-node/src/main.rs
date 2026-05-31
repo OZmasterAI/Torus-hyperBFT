@@ -500,11 +500,30 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // Extract shared handles before start() consumes the server
     let latest_height_handle = rpc_server.latest_height();
     let pruned_up_to_handle = rpc_server.pruned_up_to();
-    let (_rpc_handle, actual_addr) = rpc_server
-        .start(rpc_addr)
-        .await
-        .map_err(|e| -> Box<dyn std::error::Error> { e })?;
-    info!(%actual_addr, "JSON-RPC server started");
+
+    // Spawn RPC on a dedicated tokio runtime so user traffic can never
+    // starve the consensus/libp2p runtime (same idea as Hyperliquid sentries).
+    let (rpc_addr_tx, rpc_addr_rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new().name("rpc-runtime".into()).spawn(move || {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .thread_name("rpc-worker")
+            .enable_all()
+            .build()
+            .expect("failed to build RPC runtime");
+        rt.block_on(async {
+            match rpc_server.start(rpc_addr).await {
+                Ok((handle, addr)) => {
+                    let _ = rpc_addr_tx.send(Ok(addr));
+                    handle.stopped().await;
+                }
+                Err(e) => { let _ = rpc_addr_tx.send(Err(format!("{e}"))); }
+            }
+        });
+    })?;
+    let actual_addr = rpc_addr_rx.recv()?
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    info!(%actual_addr, "JSON-RPC server started (dedicated runtime)");
 
     // Forwarding bridge: receives (target_vk_bytes, payload) from RPC, sends via network
     tokio::spawn(async move {

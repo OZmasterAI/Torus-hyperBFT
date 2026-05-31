@@ -88,6 +88,8 @@ pub struct Mempool {
     memory_used: std::sync::atomic::AtomicUsize,
     /// Outbound native action gossip channel (set once at startup).
     native_gossip_tx: std::sync::OnceLock<tokio::sync::mpsc::Sender<Vec<u8>>>,
+    /// When false, native action gossip is suppressed (direct-to-leader mode).
+    native_gossip_enabled: std::sync::atomic::AtomicBool,
 }
 
 impl Mempool {
@@ -111,7 +113,13 @@ impl Mempool {
             config,
             memory_used: std::sync::atomic::AtomicUsize::new(0),
             native_gossip_tx: std::sync::OnceLock::new(),
+            native_gossip_enabled: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Enable or disable native action gossip at runtime.
+    pub fn set_native_gossip_enabled(&self, enabled: bool) {
+        self.native_gossip_enabled.store(enabled, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Set the outbound gossip channel for native actions.
@@ -282,7 +290,12 @@ impl Mempool {
     }
 
     /// Gossip includes sender address so receivers can skip ECDSA recovery.
+    /// Disabled when direct-to-leader forwarding is active (avoids flooding
+    /// the GossipSub mesh and starving consensus messages under load).
     fn gossip_native_action(&self, sender: alloy_primitives::Address, action: &SignedNativeAction) {
+        if !self.native_gossip_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
         if let Some(tx) = self.native_gossip_tx.get() {
             if let Ok(bytes) = bincode::serialize(&(sender, action)) {
                 match tx.try_send(bytes) {
