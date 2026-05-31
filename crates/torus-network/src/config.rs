@@ -59,7 +59,7 @@ impl NetworkConfig {
 }
 
 pub const TESTNET_BOOTSTRAP_PEERS: &[&str] = &[
-    "/ip4/95.111.231.121/udp/30333/quic-v1/p2p/12D3KooWBvvTCcRY9kfzW8ftqokqeS7SnfcKSvQKYxftViHdy3jW",
+    "/ip4/95.111.231.121/udp/30333/quic-v1/p2p/12D3KooWQeKf21QBchGQUr25U6w6yNB4P78PPQZivhHRAqFnMK24",
 ];
 
 impl NetworkConfig {

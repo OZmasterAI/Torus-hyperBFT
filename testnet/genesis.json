@@ -47,7 +47,7 @@
     "validators": [
         {
             "address": "0x1000000000000000000000000000000000000001",
-            "pubkey": "0x1f655caebb0e810402482d23b7beb998a1188735b2d9535f972b4e02dc31d629",
+            "pubkey": "0xdc4ca7a6ab405ad1da72806658b4f87282b25e448eb438b09a3034c7328cecf5",
             "stake": "1000000000000000000000000",
             "commission_bps": 500
         }
