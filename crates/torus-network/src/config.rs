@@ -75,7 +75,7 @@ impl Default for NetworkConfig {
             listen_addr: "/ip4/0.0.0.0/udp/0/quic-v1".parse().unwrap(),
             bootstrap_peers: Vec::new(),
             max_peers: 100,
-            gossipsub_heartbeat_ms: 500,
+            gossipsub_heartbeat_ms: 100,
             max_consensus_message_size: 256 * 1024,
             max_tx_message_size: 128 * 1024,
             tx_rate_limit_per_peer: 100,

@@ -264,9 +264,7 @@ impl<N: Network> HotStuff<N> {
                         tc: None,
                         nec: None,
                     };
-                    self.pending_bodies.insert(proposal.block.hash, proposal.block.clone());
-                    self.sender_handle.store_block_for_serving(proposal.block.hash, proposal.block.clone());
-                    self.sender_handle.broadcast::<HotStuffMessage>(proposal.clone().into());
+                    self.broadcast_proposal_as_header(&proposal, validator_set_updates.is_some());
                     Event::Propose(ProposeEvent {
                         timestamp: SystemTime::now(),
                         proposal,
@@ -358,10 +356,7 @@ impl<N: Network> HotStuff<N> {
                     nec: None,
                 };
 
-                self.pending_bodies.insert(proposal.block.hash, proposal.block.clone());
-                self.sender_handle.store_block_for_serving(proposal.block.hash, proposal.block.clone());
-                self.sender_handle
-                    .broadcast::<HotStuffMessage>(proposal.clone().into());
+                self.broadcast_proposal_as_header(&proposal, true);
 
                 Event::Propose(ProposeEvent {
                     timestamp: SystemTime::now(),
@@ -378,10 +373,7 @@ impl<N: Network> HotStuff<N> {
                     if let Some(proposal) = self.create_proposal_based_on_tc(
                         &tc, block_tree, app,
                     )? {
-                        self.pending_bodies.insert(proposal.block.hash, proposal.block.clone());
-                        self.sender_handle.store_block_for_serving(proposal.block.hash, proposal.block.clone());
-                        self.sender_handle
-                            .broadcast::<HotStuffMessage>(proposal.clone().into());
+                        self.broadcast_proposal_as_header(&proposal, false);
                         Event::Propose(ProposeEvent {
                             timestamp: SystemTime::now(),
                             proposal,
@@ -450,10 +442,7 @@ impl<N: Network> HotStuff<N> {
                         nec: None,
                     };
 
-                    self.pending_bodies.insert(proposal.block.hash, proposal.block.clone());
-                    self.sender_handle.store_block_for_serving(proposal.block.hash, proposal.block.clone());
-                    self.sender_handle
-                        .broadcast::<HotStuffMessage>(proposal.clone().into());
+                    self.broadcast_proposal_as_header(&proposal, validator_set_updates.is_some());
 
                     Event::Propose(ProposeEvent {
                         timestamp: SystemTime::now(),
@@ -492,6 +481,13 @@ impl<N: Network> HotStuff<N> {
     ///   RECOVER is async: sends ProposalRequest/NERequest, stores RecoveryState,
     ///   returns None. The event loop handles responses via on_receive_proposal_response
     ///   and on_receive_ne. If the view timer expires, recovery is abandoned.
+    fn broadcast_proposal_as_header(&mut self, proposal: &Proposal, has_validator_set_updates: bool) {
+        self.pending_bodies.insert(proposal.block.hash, proposal.block.clone());
+        self.sender_handle.store_block_for_serving(proposal.block.hash, proposal.block.clone());
+        let header = ProposalHeader::from_proposal(proposal, has_validator_set_updates);
+        self.sender_handle.broadcast::<HotStuffMessage>(header.into());
+    }
+
     fn create_proposal_based_on_tc<K: KVStore>(
         &mut self,
         tc: &crate::pacemaker::types::TimeoutCertificate,
@@ -1292,9 +1288,7 @@ impl<N: Network> HotStuff<N> {
             tc: Some(tc),
             nec: None,
         };
-        self.pending_bodies.insert(proposal.block.hash, proposal.block.clone());
-        self.sender_handle.store_block_for_serving(proposal.block.hash, proposal.block.clone());
-        self.sender_handle.broadcast::<HotStuffMessage>(proposal.clone().into());
+        self.broadcast_proposal_as_header(&proposal, false);
         Event::Propose(ProposeEvent {
             timestamp: SystemTime::now(),
             proposal,
