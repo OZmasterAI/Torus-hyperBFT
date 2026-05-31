@@ -136,6 +136,8 @@ pub struct RpcState {
     pub(crate) leader_vk_fn: Option<Arc<dyn Fn() -> Option<[u8; 32]> + Send + Sync>>,
     /// Channel to forward native actions to the leader: (leader_vk, sender_addr ++ action_json).
     pub(crate) forward_action_tx: Option<tokio::sync::mpsc::UnboundedSender<([u8; 32], Vec<u8>)>>,
+    /// Admission control: cap concurrent submit_native_action calls.
+    pub(crate) submit_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 /// JSON-RPC server combining eth, net, and web3 namespaces.
@@ -170,6 +172,7 @@ impl RpcServer {
                 own_vk: None,
                 leader_vk_fn: None,
                 forward_action_tx: None,
+                submit_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
             },
         }
     }

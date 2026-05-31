@@ -1,0 +1,46 @@
+{
+  "prp": "consensus-fast-path",
+  "created": "2026-05-31T10:45:00Z",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Extract broadcast_proposal_as_header helper",
+      "status": "pending",
+      "files": ["crates/hotstuff_rs/src/hotstuff/implementation.rs"],
+      "validate": "cargo test -p hotstuff_rs",
+      "depends_on": []
+    },
+    {
+      "id": 2,
+      "name": "Switch all 5 proposal broadcast sites to header",
+      "status": "pending",
+      "files": ["crates/hotstuff_rs/src/hotstuff/implementation.rs"],
+      "validate": "cargo test -p hotstuff_rs",
+      "depends_on": [1]
+    },
+    {
+      "id": 3,
+      "name": "Reduce gossipsub heartbeat from 500ms to 100ms",
+      "status": "pending",
+      "files": ["crates/torus-network/src/config.rs"],
+      "validate": "cargo test -p torus-network",
+      "depends_on": []
+    },
+    {
+      "id": 4,
+      "name": "Raise NATIVE_PER_BLOCK_CAP from 16 to 2000",
+      "status": "pending",
+      "files": ["crates/torus-mempool/src/rate_limit.rs"],
+      "validate": "cargo test -p torus-mempool",
+      "depends_on": []
+    },
+    {
+      "id": 5,
+      "name": "Integration test — devnet benchmark",
+      "status": "pending",
+      "files": [],
+      "validate": "cargo build --release -p torus-node && cd devnet && ./start.sh --build",
+      "depends_on": [1, 2, 3, 4]
+    }
+  ]
+}
