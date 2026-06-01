@@ -366,6 +366,10 @@ impl Mempool {
         self.native.write().unwrap().select_for_block(limit)
     }
 
+    pub fn select_native_for_block_with_senders(&self, limit: usize) -> Vec<(alloy_primitives::Address, SignedNativeAction)> {
+        self.native.write().unwrap().select_for_block_with_senders(limit)
+    }
+
     /// Remove native actions that were included in a committed block.
     pub fn remove_committed_native(&self, hashes: &[B256]) {
         self.native.write().unwrap().remove_committed(hashes);

@@ -172,6 +172,10 @@ impl LibP2PNetwork {
     pub fn forward_native_action(&self, target: VerifyingKey, payload: Vec<u8>) {
         let _ = self.command_tx.send(NetworkCommand::ForwardNativeAction { target, payload });
     }
+
+    pub fn broadcast_native_actions(&self, payload: Vec<u8>) {
+        let _ = self.command_tx.send(NetworkCommand::BroadcastNativeActions { payload });
+    }
 }
 
 impl Network for LibP2PNetwork {

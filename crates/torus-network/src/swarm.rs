@@ -55,10 +55,16 @@ pub enum NetworkCommand {
         target: VerifyingKey,
         payload: Vec<u8>,
     },
+    /// Proposer pushes batched actions to all validators via req/res before CompactBlock proposal.
+    BroadcastNativeActions {
+        payload: Vec<u8>,
+    },
 }
 
 /// Marker byte prefixed to forwarded native action payloads in DirectRequest.
 const FORWARD_ACTION_MARKER: u8 = 0xFE;
+/// Marker byte for batched pre-proposal action payloads (CompactBlock dissemination).
+const PRE_PROPOSAL_BATCH_MARKER: u8 = 0xFD;
 
 pub struct SharedState {
     pub inbound: Mutex<VecDeque<(VerifyingKey, hotstuff_rs::networking::messages::Message)>>,
@@ -488,7 +494,23 @@ fn handle_event(
                     return;
                 }
             };
-            if request.payload.first() == Some(&FORWARD_ACTION_MARKER) {
+            if request.payload.first() == Some(&PRE_PROPOSAL_BATCH_MARKER) {
+                let batch_bytes = &request.payload[1..];
+                match bincode::deserialize::<Vec<(torus_types::Address, torus_types::SignedNativeAction)>>(batch_bytes) {
+                    Ok(pairs) => {
+                        let count = pairs.len();
+                        if let Some(ref tx) = shared.native_action_inbound {
+                            for pair in pairs {
+                                let _ = tx.send(pair);
+                            }
+                        }
+                        tracing::info!(count, %peer, "received pre-proposal action batch");
+                    }
+                    Err(e) => {
+                        warn!(%peer, %e, "pre-proposal batch deserialization failed");
+                    }
+                }
+            } else if request.payload.first() == Some(&FORWARD_ACTION_MARKER) {
                 let action_bytes = &request.payload[1..];
                 if action_bytes.len() > 20 {
                     let sender_addr = torus_types::Address::from_slice(&action_bytes[..20]);
@@ -768,6 +790,23 @@ fn handle_command(
             } else {
                 warn!("ForwardNativeAction: leader not in peer map");
             }
+        }
+        NetworkCommand::BroadcastNativeActions { payload } => {
+            let peers: Vec<PeerId> = shared.peer_map.read().unwrap()
+                .peer_ids()
+                .copied()
+                .collect();
+            let count = peers.len();
+            let mut envelope = vec![PRE_PROPOSAL_BATCH_MARKER];
+            envelope.extend_from_slice(&payload);
+            for pid in peers {
+                let req = DirectRequest {
+                    sender_key: local_key.to_bytes(),
+                    payload: envelope.clone(),
+                };
+                swarm.behaviour_mut().direct.send_request(&pid, req);
+            }
+            tracing::info!(count, bytes = payload.len(), "broadcast pre-proposal actions to validators");
         }
     }
 }

@@ -13,7 +13,7 @@ pub mod kv_store;
 pub mod network;
 pub mod slashing;
 
-pub use app::{LeaderState, TorusApp};
+pub use app::{LeaderState, PreProposalBundle, TorusApp};
 pub use genesis::GenesisConfig;
 pub use kv_store::RocksKVStore;
 pub use network::ChannelNetwork;

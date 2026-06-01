@@ -187,6 +187,37 @@ impl NativePool {
         selected
     }
 
+    pub fn select_for_block_with_senders(&mut self, limit: usize) -> Vec<(Address, SignedNativeAction)> {
+        self.entries.sort_by(|a, b| {
+            let a_pri = if a.is_cancel { 0u8 } else { 1 };
+            let b_pri = if b.is_cancel { 0u8 } else { 1 };
+            a_pri
+                .cmp(&b_pri)
+                .then_with(|| a.sender.cmp(&b.sender))
+                .then_with(|| a.action.nonce.cmp(&b.action.nonce))
+        });
+        self.hash_index.clear();
+        for (i, entry) in self.entries.iter().enumerate() {
+            self.hash_index.insert(entry.action_hash, i);
+        }
+
+        let mut block_counts: HashMap<Address, usize> = HashMap::new();
+        let mut selected = Vec::new();
+
+        for entry in &self.entries {
+            if selected.len() >= limit {
+                break;
+            }
+            let count = block_counts.get(&entry.sender).copied().unwrap_or(0);
+            if count < self.max_per_block {
+                *block_counts.entry(entry.sender).or_insert(0) += 1;
+                selected.push((entry.sender, entry.action.clone()));
+            }
+        }
+
+        selected
+    }
+
     /// Remove actions that were included in a committed block.
     pub fn remove_committed(&mut self, hashes: &[B256]) {
         let to_remove: HashSet<B256> = hashes.iter().copied().collect();

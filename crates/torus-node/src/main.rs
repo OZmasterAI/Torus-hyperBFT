@@ -368,7 +368,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let mempool = Arc::new(Mempool::new(state_db.clone(), mempool_config));
 
     let signing_key_for_app = if !cli.rpc_only { Some(signing_key.clone()) } else { None };
-    let app = TorusApp::new(state_db.clone(), &chain_config, Some(metrics.clone()), Some(mempool.clone()), signing_key_for_app);
+    let mut app = TorusApp::new(state_db.clone(), &chain_config, Some(metrics.clone()), Some(mempool.clone()), signing_key_for_app);
     let kv_store = RocksKVStore::new(state_db.db_arc());
 
     // EVM executor
@@ -414,7 +414,19 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     }
     info!(listen = %cli.p2p_listen, "p2p network started");
 
-    // 5b. Extract leader state + clone network for RPC forwarding (before replica consumes them)
+    // 5b. Pre-proposal action push: proposer → all validators via req/res (CompactBlock support)
+    let (pre_proposal_tx, pre_proposal_rx) = std::sync::mpsc::sync_channel::<torus_consensus::PreProposalBundle>(4);
+    app.set_pre_proposal_tx(pre_proposal_tx);
+    let network_for_pre_proposal = network.clone();
+    std::thread::spawn(move || {
+        while let Ok(bundle) = pre_proposal_rx.recv() {
+            if let Ok(payload) = bincode::serialize(&bundle.actions) {
+                network_for_pre_proposal.broadcast_native_actions(payload);
+            }
+        }
+    });
+
+    // 5c. Extract leader state + clone network for RPC forwarding (before replica consumes them)
     let leader_state = app.leader_state();
     let network_for_fwd = network.clone();
 

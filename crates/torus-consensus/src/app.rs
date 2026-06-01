@@ -426,6 +426,12 @@ pub struct TorusApp {
     exec_tx: Option<SyncSender<CommittedBlockMsg>>,
     exec_handle: Option<JoinHandle<()>>,
     leader_state: Arc<LeaderState>,
+    pre_proposal_tx: Option<std::sync::mpsc::SyncSender<PreProposalBundle>>,
+}
+
+/// Actions the proposer pushes to validators via unicast before broadcasting CompactBlock.
+pub struct PreProposalBundle {
+    pub actions: Vec<(Address, torus_types::SignedNativeAction)>,
 }
 
 impl TorusApp {
@@ -523,11 +529,16 @@ impl TorusApp {
             exec_tx: Some(exec_tx),
             exec_handle: Some(exec_handle),
             leader_state,
+            pre_proposal_tx: None,
         }
     }
 
     pub fn leader_state(&self) -> Arc<LeaderState> {
         self.leader_state.clone()
+    }
+
+    pub fn set_pre_proposal_tx(&mut self, tx: std::sync::mpsc::SyncSender<PreProposalBundle>) {
+        self.pre_proposal_tx = Some(tx);
     }
 
     /// Create a stub `TorusApp` without a database (for consensus-only tests).
@@ -792,13 +803,13 @@ impl App<RocksKVStore> for TorusApp {
             .unwrap_or_default()
             .as_secs();
 
-        let (mut native_actions, evm_txs) = if let Some(ref mempool) = self.mempool {
+        let (native_with_senders, evm_txs) = if let Some(ref mempool) = self.mempool {
             let gas_limit = if parent_header.evm_gas_limit == 0 {
                 torus_evm::DEFAULT_BLOCK_GAS_LIMIT
             } else {
                 parent_header.evm_gas_limit
             };
-            let native = mempool.select_native_for_block(torus_mempool::rate_limit::NATIVE_TOTAL_BLOCK_CAP);
+            let native = mempool.select_native_for_block_with_senders(torus_mempool::rate_limit::NATIVE_TOTAL_BLOCK_CAP);
             let evm = mempool.drain_evm(gas_limit, parent_header.state_root);
             if !evm.is_empty() || !native.is_empty() {
                 tracing::info!(evm_txs = evm.len(), native_actions = native.len(), "selected actions for block");
@@ -808,9 +819,8 @@ impl App<RocksKVStore> for TorusApp {
             (vec![], vec![])
         };
 
-        // Sig verification skipped: actions are already verified at RPC ingestion
-        // (submit_native_action → spawn_blocking → validate_with_sessions).
-        // Re-verifying here was the main block production bottleneck under load.
+        let native_actions: Vec<torus_types::SignedNativeAction> =
+            native_with_senders.iter().map(|(_, a)| a.clone()).collect();
 
         let sig_attestation = match self.signing_key {
             Some(ref key) => torus_bridge::proposer::generate_sig_attestation(&native_actions, key),
@@ -842,7 +852,19 @@ impl App<RocksKVStore> for TorusApp {
         };
 
         let height = block.header.height;
-        let encoded = bincode::serialize(&block).expect("serialize TorusBlock");
+
+        if !native_with_senders.is_empty() {
+            if let Some(ref tx) = self.pre_proposal_tx {
+                let count = native_with_senders.len();
+                match tx.try_send(PreProposalBundle { actions: native_with_senders }) {
+                    Ok(()) => tracing::info!(count, height, "pre-proposal push sent"),
+                    Err(e) => tracing::warn!(count, height, %e, "pre-proposal push failed"),
+                }
+            }
+        }
+
+        let compact = CompactBlock::from_block(&block);
+        let encoded = bincode::serialize(&compact).expect("serialize CompactBlock");
         self.pending_proposals.insert(height, block);
         self.pending_proposals.retain(|&h, _| h + 10 > height);
         let hash = Self::hash_datum(&encoded);
@@ -907,19 +929,6 @@ impl App<RocksKVStore> for TorusApp {
                     match mempool.get_native_by_hash(hash) {
                         Some(action) => actions[i] = Some(action),
                         None => missing.push(i),
-                    }
-                }
-
-                if !missing.is_empty() {
-                    for _ in 0..5 {
-                        std::thread::sleep(std::time::Duration::from_millis(100));
-                        missing.retain(|&i| {
-                            match mempool.get_native_by_hash(&compact.native_action_hashes[i]) {
-                                Some(action) => { actions[i] = Some(action); false }
-                                None => true,
-                            }
-                        });
-                        if missing.is_empty() { break; }
                     }
                 }
 
