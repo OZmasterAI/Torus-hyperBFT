@@ -34,7 +34,7 @@ pub const NATIVE_PER_BLOCK_CAP: usize = 64;
 
 /// Max total native actions per block (all senders combined).
 /// Bounded by sig verification cost in produce_block + validate_block.
-pub const NATIVE_TOTAL_BLOCK_CAP: usize = 100;
+pub const NATIVE_TOTAL_BLOCK_CAP: usize = 1000;
 
 /// Max total native pool size. With gossip replication, each validator holds
 /// actions from all peers, so this must be large enough for the full mesh.
