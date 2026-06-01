@@ -473,29 +473,48 @@ async fn run_consensus(
             let mut rng = StdRng::from_entropy();
             let mut req_id: u64 = sender_idx as u64 * 1_000_000;
             let mut url_idx: usize = sender_idx % url_count;
+            const BATCH_SIZE: usize = 50;
 
             while Instant::now() < deadline {
-                let action = random_place_order(&mut rng, 1);
-                let nonce = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis() as u64;
-                let signed = sign_native_action(action, nonce, &key);
-                let json_bytes = serde_json::to_vec(&signed).unwrap();
-                let hex_encoded = format!("0x{}", hex::encode(&json_bytes));
+                let mut batch_body = Vec::with_capacity(BATCH_SIZE);
+                for _ in 0..BATCH_SIZE {
+                    let action = random_place_order(&mut rng, 1);
+                    let nonce = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis() as u64;
+                    let signed = sign_native_action(action, nonce, &key);
+                    let json_bytes = serde_json::to_vec(&signed).unwrap();
+                    let hex_encoded = format!("0x{}", hex::encode(&json_bytes));
+                    req_id += 1;
+                    batch_body.push(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "method": "torus_submitNativeAction",
+                        "params": [hex_encoded],
+                        "id": req_id
+                    }));
+                }
 
                 let permit = semaphore.clone().acquire_owned().await.unwrap();
                 let url = urls[url_idx % url_count].clone();
                 url_idx += 1;
-                req_id += 1;
 
                 let client = client.clone();
                 let submitted = submitted.clone();
 
                 tokio::spawn(async move {
                     let _permit = permit;
-                    if submit_native_action(&client, &url, &hex_encoded, req_id).await.is_ok() {
-                        submitted.fetch_add(1, Ordering::Relaxed);
+                    let resp = client.post(&url)
+                        .json(&batch_body)
+                        .send()
+                        .await;
+                    if let Ok(r) = resp {
+                        if let Ok(results) = r.json::<Vec<serde_json::Value>>().await {
+                            let ok_count = results.iter()
+                                .filter(|r| r.get("error").is_none())
+                                .count() as u64;
+                            submitted.fetch_add(ok_count, Ordering::Relaxed);
+                        }
                     }
                 });
             }
