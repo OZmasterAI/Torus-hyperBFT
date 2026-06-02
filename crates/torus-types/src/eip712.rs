@@ -822,12 +822,32 @@ impl SignedNativeAction {
 /// The resolved sender is exactly what `SignedNativeAction::resolve_sender`
 /// would return, so callers reuse it directly instead of recovering a second
 /// time — secp256k1 ecrecover happens once per action, not twice.
+///
+/// The EIP-712 ecrecovers (the dominant per-action cost) run in parallel via
+/// rayon; the result is order-preserving and identical to a serial run. Session
+/// verification stays sequential — its ed25519 work is already batched, and
+/// keeping `session_lookup` off the worker threads avoids forcing a `Sync` bound
+/// on callers.
 pub fn batch_verify_native_actions(
     actions: &[SignedNativeAction],
     timestamp: u64,
     session_lookup: impl Fn(&[u8; 32]) -> Option<crate::SessionData>,
 ) -> Vec<Option<Address>> {
-    let mut senders: Vec<Option<Address>> = vec![None; actions.len()];
+    use rayon::prelude::*;
+
+    // Phase 1 (parallel): recover EIP-712 senders. Each ecrecover is pure,
+    // independent crypto with no shared/borrowed state; `collect` over an indexed
+    // parallel iterator preserves order, so the output is deterministic.
+    let mut senders: Vec<Option<Address>> = actions
+        .par_iter()
+        .map(|action| match &action.signature {
+            ActionSignature::Eip712(_) => action.recover_sender().ok(),
+            ActionSignature::Session { .. } => None,
+        })
+        .collect();
+
+    // Phase 2 (sequential): resolve session actions (needs `session_lookup`) and
+    // assemble the ed25519 batch.
     let domain = eip712_domain_separator();
 
     let mut ed_indices = Vec::new();
@@ -836,41 +856,34 @@ pub fn batch_verify_native_actions(
     let mut ed_keys = Vec::new();
 
     for (i, action) in actions.iter().enumerate() {
-        match &action.signature {
-            ActionSignature::Eip712(_) => {
-                // For EIP-712, recovery IS the verification: keep the address.
-                if let Ok(sender) = action.recover_sender() {
-                    senders[i] = Some(sender);
-                }
-            }
-            ActionSignature::Session {
-                session_pubkey,
-                sig,
-            } => {
-                if requires_eip712(&action.action) {
+        let ActionSignature::Session {
+            session_pubkey,
+            sig,
+        } = &action.signature
+        else {
+            continue; // EIP-712 already resolved in phase 1
+        };
+        if requires_eip712(&action.action) {
+            continue;
+        }
+        match session_lookup(session_pubkey) {
+            Some(session)
+                if timestamp <= session.expiry && session.scope.allows(&action.action) =>
+            {
+                let Ok(vk) = Ed25519VerifyingKey::from_bytes(session_pubkey) else {
                     continue;
-                }
-                match session_lookup(session_pubkey) {
-                    Some(session)
-                        if timestamp <= session.expiry
-                            && session.scope.allows(&action.action) =>
-                    {
-                        let Ok(vk) = Ed25519VerifyingKey::from_bytes(session_pubkey) else {
-                            continue;
-                        };
-                        let struct_hash = eip712_struct_hash(&action.action, action.nonce);
-                        let signing_hash = eip712_signing_hash(domain, struct_hash);
+                };
+                let struct_hash = eip712_struct_hash(&action.action, action.nonce);
+                let signing_hash = eip712_signing_hash(domain, struct_hash);
 
-                        ed_indices.push(i);
-                        ed_messages.push(signing_hash.0.to_vec());
-                        ed_signatures.push(ed25519_dalek::Signature::from_bytes(&sig.0));
-                        ed_keys.push(vk);
-                        // Tentatively valid; cleared below if the batch ed25519 verify fails.
-                        senders[i] = Some(session.owner);
-                    }
-                    _ => {}
-                }
+                ed_indices.push(i);
+                ed_messages.push(signing_hash.0.to_vec());
+                ed_signatures.push(ed25519_dalek::Signature::from_bytes(&sig.0));
+                ed_keys.push(vk);
+                // Tentatively valid; cleared below if the batch ed25519 verify fails.
+                senders[i] = Some(session.owner);
             }
+            _ => {}
         }
     }
 
@@ -1286,6 +1299,57 @@ mod tests {
         assert_eq!(senders[1], actions[1].resolve_sender(TEST_NONCE, lookup).ok());
         // Invalid action -> None.
         assert_eq!(senders[2], None);
+    }
+
+    /// #2 parallelization guard: the parallel batch verify must reproduce the
+    /// exact per-action ground truth, identically across runs, regardless of
+    /// rayon thread scheduling (index order is preserved by `collect`).
+    #[test]
+    fn batch_verify_parallel_matches_serial_for_large_mixed_batch() {
+        let key = test_key();
+        let key2 = test_key_2();
+        let ed_key = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
+        let pubkey = ed_key.verifying_key().to_bytes();
+        let owner = Address::from([0x11; 20]);
+        let session = make_session(owner);
+        let ed_key_unknown = ed25519_dalek::SigningKey::from_bytes(&[99u8; 32]);
+
+        // 64 actions cycling: EIP-712(key), EIP-712(key2), valid session, invalid session.
+        let mut actions = Vec::new();
+        for i in 0..64u64 {
+            let nonce = TEST_NONCE + i;
+            actions.push(match i % 4 {
+                0 => sign_native_action(NativeAction::ClaimRewards, nonce, &key),
+                1 => sign_native_action(NativeAction::UnjailSelf, nonce, &key2),
+                2 => sign_action_with_session(NativeAction::CancelOrder { order_id: 1 }, nonce, &ed_key),
+                _ => sign_action_with_session(
+                    NativeAction::CancelOrder { order_id: 1 },
+                    nonce,
+                    &ed_key_unknown,
+                ),
+            });
+        }
+
+        // Ground truth, computed independently of the batch function.
+        let expected: Vec<Option<Address>> = (0..64u64)
+            .map(|i| match i % 4 {
+                0 => Some(signer_address(&key)),
+                1 => Some(signer_address(&key2)),
+                2 => Some(owner),
+                _ => None,
+            })
+            .collect();
+
+        let got = batch_verify_native_actions(&actions, TEST_NONCE, |pk| {
+            if pk == &pubkey { Some(session.clone()) } else { None }
+        });
+        assert_eq!(got, expected);
+
+        // Determinism: a second run is identical (no thread-order dependence).
+        let again = batch_verify_native_actions(&actions, TEST_NONCE, |pk| {
+            if pk == &pubkey { Some(session.clone()) } else { None }
+        });
+        assert_eq!(got, again);
     }
 
     #[test]
