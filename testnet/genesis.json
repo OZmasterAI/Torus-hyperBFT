@@ -58,8 +58,8 @@
             "commission_bps": 500
         },
         {
-            "address": "0xc92ba1af6379d5cf5bd1080c83d88b11a85bf7ce",
-            "pubkey": "0x6832a01a0dfd3416bea313dd986d3a68d2541286413b446126cda1876a08a67b",
+            "address": "0x0936adb653ffd8ef521029ffbf27bc1c815a7cbb",
+            "pubkey": "0x537f761858a3b44a23a0d63e16d9e642a86c44aac98a94d39501d2115528a63c",
             "stake": "1000000000000000000000000",
             "commission_bps": 500
         }
