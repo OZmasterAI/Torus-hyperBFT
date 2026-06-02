@@ -265,7 +265,10 @@ impl ExecutionContext {
 
         // ---- Native execution ----
         if has_native || computed_fee_revenue > 0 {
-            let invalid_indices = if has_native {
+            // One verification pass resolves every sender too (EIP-712 ecrecover or
+            // session owner); `None` marks an invalid signature. Reused below so we
+            // never recover the same action twice.
+            let resolved_senders = if has_native {
                 torus_types::eip712::batch_verify_native_actions(
                     &torus_block.native_actions,
                     torus_block.header.timestamp,
@@ -275,9 +278,10 @@ impl ExecutionContext {
                 vec![]
             };
 
-            if !invalid_indices.is_empty() {
+            let invalid_count = resolved_senders.iter().filter(|s| s.is_none()).count();
+            if invalid_count > 0 {
                 tracing::error!(
-                    count = invalid_indices.len(),
+                    count = invalid_count,
                     proposer = %torus_block.header.proposer,
                     "SLASHING PROPOSER: attested block contained invalid signatures"
                 );
@@ -297,21 +301,12 @@ impl ExecutionContext {
             let mut sender_actions = Vec::with_capacity(torus_block.native_actions.len());
             let mut consumed_nonces = Vec::new();
             for (i, signed) in torus_block.native_actions.iter().enumerate() {
-                if invalid_indices.contains(&i) {
+                let Some(sender) = resolved_senders.get(i).copied().flatten() else {
                     tracing::error!(index = i, "INVALID SIG in attested block — skipping action");
                     continue;
-                }
-                match signed.resolve_sender(torus_block.header.timestamp, |pubkey| {
-                    self.state_db.get_session(pubkey).ok().flatten()
-                }) {
-                    Ok(sender) => {
-                        consumed_nonces.push((sender, signed.nonce));
-                        sender_actions.push((sender, signed.action.clone()));
-                    }
-                    Err(e) => {
-                        tracing::warn!(%e, "failed to recover native action sender, skipping");
-                    }
-                }
+                };
+                consumed_nonces.push((sender, signed.nonce));
+                sender_actions.push((sender, signed.action.clone()));
             }
 
             let overlay = NativeStateOverlay::new(self.state_db.clone());
