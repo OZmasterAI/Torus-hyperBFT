@@ -812,12 +812,22 @@ impl SignedNativeAction {
 // Batch Verification
 // ============================================================================
 
+/// Batch-verify native action signatures AND resolve each sender in one pass.
+///
+/// Returns a vector parallel to `actions`: `Some(sender)` for a valid action
+/// (the EIP-712-recovered address, or the session owner), `None` for an invalid
+/// one (bad signature, missing/expired/out-of-scope session, or a session key
+/// used for an action that requires a full EIP-712 signature).
+///
+/// The resolved sender is exactly what `SignedNativeAction::resolve_sender`
+/// would return, so callers reuse it directly instead of recovering a second
+/// time — secp256k1 ecrecover happens once per action, not twice.
 pub fn batch_verify_native_actions(
     actions: &[SignedNativeAction],
     timestamp: u64,
     session_lookup: impl Fn(&[u8; 32]) -> Option<crate::SessionData>,
-) -> Vec<usize> {
-    let mut invalid = Vec::new();
+) -> Vec<Option<Address>> {
+    let mut senders: Vec<Option<Address>> = vec![None; actions.len()];
     let domain = eip712_domain_separator();
 
     let mut ed_indices = Vec::new();
@@ -828,8 +838,9 @@ pub fn batch_verify_native_actions(
     for (i, action) in actions.iter().enumerate() {
         match &action.signature {
             ActionSignature::Eip712(_) => {
-                if action.recover_sender().is_err() {
-                    invalid.push(i);
+                // For EIP-712, recovery IS the verification: keep the address.
+                if let Ok(sender) = action.recover_sender() {
+                    senders[i] = Some(sender);
                 }
             }
             ActionSignature::Session {
@@ -837,7 +848,6 @@ pub fn batch_verify_native_actions(
                 sig,
             } => {
                 if requires_eip712(&action.action) {
-                    invalid.push(i);
                     continue;
                 }
                 match session_lookup(session_pubkey) {
@@ -846,7 +856,6 @@ pub fn batch_verify_native_actions(
                             && session.scope.allows(&action.action) =>
                     {
                         let Ok(vk) = Ed25519VerifyingKey::from_bytes(session_pubkey) else {
-                            invalid.push(i);
                             continue;
                         };
                         let struct_hash = eip712_struct_hash(&action.action, action.nonce);
@@ -856,10 +865,10 @@ pub fn batch_verify_native_actions(
                         ed_messages.push(signing_hash.0.to_vec());
                         ed_signatures.push(ed25519_dalek::Signature::from_bytes(&sig.0));
                         ed_keys.push(vk);
+                        // Tentatively valid; cleared below if the batch ed25519 verify fails.
+                        senders[i] = Some(session.owner);
                     }
-                    _ => {
-                        invalid.push(i);
-                    }
+                    _ => {}
                 }
             }
         }
@@ -873,14 +882,13 @@ pub fn batch_verify_native_actions(
                     .verify(&ed_messages[j], &ed_signatures[j])
                     .is_err()
                 {
-                    invalid.push(ed_indices[j]);
+                    senders[ed_indices[j]] = None;
                 }
             }
         }
     }
 
-    invalid.sort_unstable();
-    invalid
+    senders
 }
 
 // ============================================================================
@@ -1225,6 +1233,61 @@ mod tests {
         }
     }
 
+    /// Collapse the positional sender vector back to the indices of invalid
+    /// actions, so the existing index-based assertions stay meaningful.
+    fn invalid_indices(senders: &[Option<Address>]) -> Vec<usize> {
+        senders
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.is_none())
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// The contract that makes the double-recovery removal safe: the sender
+    /// `batch_verify_native_actions` returns for a valid action is EXACTLY what
+    /// `recover_sender` (EIP-712) / `resolve_sender` (session) would return, and
+    /// invalid actions come back as `None`.
+    #[test]
+    fn batch_verify_returns_resolved_senders() {
+        let key = test_key();
+        let ed_key = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
+        let pubkey = ed_key.verifying_key().to_bytes();
+        let owner = Address::from([0x11; 20]);
+        let session = make_session(owner);
+
+        // A different session key whose owner is NOT registered -> invalid.
+        let ed_key_unknown = ed25519_dalek::SigningKey::from_bytes(&[43u8; 32]);
+
+        let actions = vec![
+            sign_native_action(NativeAction::ClaimRewards, TEST_NONCE, &key), // 0: EIP-712 valid
+            sign_action_with_session(NativeAction::CancelOrder { order_id: 1 }, TEST_NONCE, &ed_key), // 1: session valid
+            sign_action_with_session(
+                NativeAction::CancelOrder { order_id: 2 },
+                TEST_NONCE,
+                &ed_key_unknown,
+            ), // 2: session not found -> invalid
+        ];
+
+        let lookup = |pk: &[u8; 32]| {
+            if pk == &pubkey {
+                Some(session.clone())
+            } else {
+                None
+            }
+        };
+        let senders = batch_verify_native_actions(&actions, TEST_NONCE, lookup);
+
+        // EIP-712: recovered address == signer, and == recover_sender().
+        assert_eq!(senders[0], Some(signer_address(&key)));
+        assert_eq!(senders[0], actions[0].recover_sender().ok());
+        // Session: resolved sender == session owner, and == resolve_sender().
+        assert_eq!(senders[1], Some(owner));
+        assert_eq!(senders[1], actions[1].resolve_sender(TEST_NONCE, lookup).ok());
+        // Invalid action -> None.
+        assert_eq!(senders[2], None);
+    }
+
     #[test]
     fn batch_verify_all_valid_eip712() {
         let key = test_key();
@@ -1232,7 +1295,7 @@ mod tests {
             sign_native_action(NativeAction::ClaimRewards, TEST_NONCE, &key),
             sign_native_action(NativeAction::UnjailSelf, TEST_NONCE + 1, &key),
         ];
-        let invalid = batch_verify_native_actions(&actions, TEST_NONCE, |_| None);
+        let invalid = invalid_indices(&batch_verify_native_actions(&actions, TEST_NONCE, |_| None));
         assert!(invalid.is_empty());
     }
 
@@ -1253,9 +1316,9 @@ mod tests {
                 &ed_key,
             ),
         ];
-        let invalid = batch_verify_native_actions(&actions, TEST_NONCE, |pk| {
+        let invalid = invalid_indices(&batch_verify_native_actions(&actions, TEST_NONCE, |pk| {
             if pk == &pubkey { Some(session.clone()) } else { None }
-        });
+        }));
         assert!(invalid.is_empty());
     }
 
@@ -1280,12 +1343,12 @@ mod tests {
             ),
         ];
 
-        let invalid = batch_verify_native_actions(&actions, TEST_NONCE, |_| None);
+        let invalid = invalid_indices(&batch_verify_native_actions(&actions, TEST_NONCE, |_| None));
         assert_eq!(invalid, vec![1, 2]);
 
-        let invalid = batch_verify_native_actions(&actions, TEST_NONCE, |pk| {
+        let invalid = invalid_indices(&batch_verify_native_actions(&actions, TEST_NONCE, |pk| {
             if pk == &pubkey { Some(session.clone()) } else { None }
-        });
+        }));
         assert!(invalid.is_empty());
     }
 
@@ -1304,9 +1367,9 @@ mod tests {
             sig.0[0] ^= 0xff;
         }
 
-        let invalid = batch_verify_native_actions(&[action], TEST_NONCE, |pk| {
+        let invalid = invalid_indices(&batch_verify_native_actions(&[action], TEST_NONCE, |pk| {
             if pk == &pubkey { Some(session.clone()) } else { None }
-        });
+        }));
         assert_eq!(invalid, vec![0]);
     }
 
@@ -1330,9 +1393,9 @@ mod tests {
             &ed_key,
         );
 
-        let invalid = batch_verify_native_actions(&[action], TEST_NONCE, |pk| {
+        let invalid = invalid_indices(&batch_verify_native_actions(&[action], TEST_NONCE, |pk| {
             if pk == &pubkey { Some(session.clone()) } else { None }
-        });
+        }));
         assert_eq!(invalid, vec![0]);
     }
 }
