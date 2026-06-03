@@ -314,3 +314,29 @@ branch HEAD 5cf4fad. **This gate revises the seams of Tasks 3-4 — read before 
 **Recommendation:** proceed with Tasks 2-5 using the corrected seams above, and add the
 block-sync companion (T6) — but get explicit approval on the scope (D-only vs D+T6) before
 building, since T6 widens scope beyond "dissemination hardening".
+
+## Implementation status (branch cap100-3val-perf)
+Scope decision: **Option 1** — Option D now (corrected seams); the T5 bench decides T6.
+
+| Task | Status | Commit | Verify |
+|------|--------|--------|--------|
+| T1 triage gate | done | `50513b3` | findings above; verdict approved |
+| T2 PendingSendQueue | done | `f254e66` | `cargo test -p torus-network -- pending_send` (3/3) |
+| T3 enqueue/flush + OutboundFailure | done | `ad7c136` | `torus-network` 20 lib + 9 integ green |
+| T4 native-bundle re-push ring | done | `7570e7b` | ring unit test + suite green |
+| T5 metrics | done | `cc3aec9` | `torus-network`+`torus-consensus` green; `torus-node` compiles |
+| T5 quiet-host bench | **DEFERRED** | — | host not quiet (live testnet node 336% CPU + torus-web; load 12/8) — user deferred |
+| T6 block-sync companion | gated on T5 bench | — | only if the bench shows block-sync stalls |
+
+**Corrected seams applied (from the T1 triage; differ from the original task text):**
+- Flush trigger = `SwarmEvent::ConnectionEstablished` (→ vk via `get_vk`), not `RegisterPeer`
+  (validators are pre-mapped by `init_validator_set`, so they never miss registration).
+- T3 enqueue gate = `!swarm.is_connected(pid)` for a mapped validator, not "absent from peer_map".
+- `Direct` `OutboundFailure` (previously swallowed by `_ => {}`) now logs + re-enqueues via the
+  `outbound_direct` request-id map; `Direct` `Response` untracks on ack; `InboundFailure` logs.
+
+**Next session:** run the deferred bench on a quiet host (pause torus-web + the live testnet
+node, or use a separate box): `cargo build --release -p torus-node` then
+`bench-throughput consensus --senders 100 --duration 30`. Capture `torus_missing_action_rejections`
++ the other 3 counters and the block-sync/view-stall rate against the PASS BAR, then decide T6.
+**Do NOT declare Step 3 done until the bench runs.**
