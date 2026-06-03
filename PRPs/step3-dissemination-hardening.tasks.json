@@ -7,10 +7,10 @@
   "tasks": [
     {
       "id": 1,
-      "name": "Scope the delivery seams (reconnect trigger, OutboundFailure handling)",
+      "name": "Scope delivery + block-sync seams (reconnect trigger, OutboundFailure, block_sync timeout + justify_block_known=false triage)",
       "status": "pending",
-      "files": ["crates/torus-network/src/swarm.rs"],
-      "validate": "grep -n \"ConnectionEstablished\\|OutboundFailure\\|identify::Event\" crates/torus-network/src/swarm.rs",
+      "files": ["crates/torus-network/src/swarm.rs", "crates/hotstuff_rs/src/block_sync/client.rs"],
+      "validate": "grep -n \"ConnectionEstablished\\|OutboundFailure\\|identify::Event\\|justify_block_known\\|worker fetch error\" crates/torus-network/src/swarm.rs crates/hotstuff_rs/src/block_sync/client.rs",
       "depends_on": []
     },
     {

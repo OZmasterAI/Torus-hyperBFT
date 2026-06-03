@@ -17,6 +17,12 @@ This supersedes the gossip-era `mempool-gossip-hash-proposals-impl.md`.
    swarm **event-loop congestion** (1.5–2s under load), not peer-map misses. Tasks 2–4
    fix the drop/reconnect holes; **Task 5 measures** whether congestion still
    dominates now that gossip is off, and flags a follow-up if so.
+4. **[NEW — live evidence, `testnet/node.log`, Jun 3]** Under load the chain also shows
+   a **block-sync / connectivity** failure *alongside* dissemination: `block_sync:
+   worker fetch error (timeout/disconnect)` + `dropping proposal header ...
+   justify_block_known=false` (missing parent block), views turning over ~500–600 ms
+   **without committing**. This is **partly outside D's delivery scope** — Task 1(d)
+   triages it to decide whether D is sufficient or needs a companion block-sync fix.
 
 **Keep unchanged:** the 100 ms retry in `validate_block` (`app.rs:941-959`) as the
 last-resort safety net (correct for all-3 quorum; do NOT remove — that was the
@@ -33,7 +39,7 @@ last-resort safety net (correct for all-3 quorum; do NOT remove — that was the
 
 ## Tasks
 
-### Task 1: Scope the delivery seams (read-only, no code)
+### Task 1: Scope the delivery + block-sync seams (read-only, no code)
 **Test first**: n/a — investigation. **Verify** = a findings block appended below as
 `## Task 1 findings`.
 Confirm in `crates/torus-network/src/swarm.rs`:
@@ -42,8 +48,17 @@ Confirm in `crates/torus-network/src/swarm.rs`:
   `peer_map`. **This is the flush trigger for Tasks 3–4.**
 - (b) How the `direct` request_response `OutboundFailure` is handled today (find the
   event arm). Decides whether an explicit send-retry is needed.
-- (c) Sanity-check failure mode #3 against current (gossip-off) code paths.
-**Verify**: `grep -n "ConnectionEstablished\|OutboundFailure\|identify::Event" crates/torus-network/src/swarm.rs` returns the arms; findings written.
+- (c) Sanity-check the congestion hypothesis (failure mode #3) against current
+  (gossip-off) code paths.
+- (d) **Block-sync triage (failure mode #4 — live in `node.log`).** In
+  `hotstuff_rs::block_sync::client` and the `BlockDataRequest` path (`swarm.rs:768`,
+  `request_block_data`): why does `worker fetch error (timeout/disconnect)` fire — is
+  the block fetch fire-and-forget / unretried (cf. mem `a06daf38` `body_fetch_tracker`)?
+  And why are proposals dropped with `justify_block_known=false` (missing parent) — a
+  sync gap, or a peer-map/connectivity gap? **Deliverable: decide whether this is
+  resolved by D's delivery hardening, or needs a companion block-sync fix (separate
+  task/step) — so the Task 5 bench isn't surprised by a second root cause.**
+**Verify**: `grep -n "ConnectionEstablished\|OutboundFailure\|identify::Event\|justify_block_known\|worker fetch error" crates/torus-network/src/swarm.rs crates/hotstuff_rs/src/block_sync/client.rs` returns the arms; findings + the "D sufficient or not" call written.
 **Depends on**: none.
 
 ### Task 2: Bounded generic `PendingSendQueue` (pure, fully unit-tested)
