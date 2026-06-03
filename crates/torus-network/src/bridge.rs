@@ -18,6 +18,7 @@ use tracing::{info, warn};
 use crate::behaviour::TorusBehaviour;
 use crate::config::NetworkConfig;
 use crate::peer::PeerMap;
+use crate::pending_send::PendingSendQueue;
 use crate::swarm::{run_swarm_with_config, NetworkCommand, SharedState};
 use crate::tx_gossip::{NativeGossipHandle, TxGossipHandle};
 
@@ -95,6 +96,8 @@ impl LibP2PNetwork {
             block_store: RwLock::new(HashMap::new()),
             block_data_inbound: Mutex::new(VecDeque::new()),
             native_action_inbound: Some(native_inbound_tx),
+            pending_sends: Mutex::new(PendingSendQueue::new(256)),
+            outbound_direct: Mutex::new(HashMap::new()),
         });
 
         let (command_tx, command_rx) = mpsc::unbounded_channel();

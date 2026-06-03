@@ -15,6 +15,7 @@ use crate::behaviour::{TorusBehaviour, TorusBehaviourEvent, CONSENSUS_TOPIC, NAT
 use crate::codec::{BlockDataNetRequest, BlockDataNetResponse, DirectRequest, DirectResponse};
 use crate::config::NetworkConfig;
 use crate::peer::PeerMap;
+use crate::pending_send::PendingSendQueue;
 use crate::peer_scoring::{
     ConsensusRateLimiter, PeerScoring, PENALTY_INVALID_CONSENSUS_MSG, PENALTY_INVALID_TX,
     REWARD_BLOCK_RELAY,
@@ -80,6 +81,15 @@ pub struct SharedState {
     /// Inbound native actions received from gossip (deserialized by swarm, consumed by mempool task).
     /// Tuple: (pre-verified sender address, signed action) — receivers skip ECDSA recovery.
     pub native_action_inbound: Option<tokio::sync::mpsc::UnboundedSender<(torus_types::Address, torus_types::SignedNativeAction)>>,
+    /// Consensus messages buffered for a validator that is in the peer map but
+    /// not currently connected (Task 3 — corrected seam). A validator is mapped
+    /// from genesis via `init_validator_set`, so the real gap is connectivity,
+    /// not registration. Flushed on `SwarmEvent::ConnectionEstablished`.
+    pub pending_sends: Mutex<PendingSendQueue<hotstuff_rs::networking::messages::Message>>,
+    /// In-flight direct consensus sends, keyed by request id, so a `Direct`
+    /// `OutboundFailure` (previously swallowed by `_ => {}`) can re-enqueue the
+    /// message for the next reconnect flush instead of dropping it (Task 3).
+    pub outbound_direct: Mutex<HashMap<request_response::OutboundRequestId, (VerifyingKey, hotstuff_rs::networking::messages::Message)>>,
 }
 
 enum SwarmAction {
@@ -240,6 +250,7 @@ pub async fn run_swarm_with_config(
                     *event,
                     &mut swarm,
                     &shared,
+                    &local_key,
                     &mut tx_gossip_state,
                     &mut consensus_rate_limiter,
                     &mut peer_scoring,
@@ -325,6 +336,7 @@ fn handle_event(
     event: SwarmEvent<TorusBehaviourEvent>,
     swarm: &mut Swarm<TorusBehaviour>,
     shared: &SharedState,
+    local_key: &VerifyingKey,
     tx_gossip_state: &mut TxGossipState,
     consensus_rate_limiter: &mut ConsensusRateLimiter,
     peer_scoring: &mut PeerScoring,
@@ -535,6 +547,34 @@ fn handle_event(
                 .direct
                 .send_response(channel, DirectResponse);
         }
+        // Direct protocol response = delivery ack for a tracked consensus send.
+        SwarmEvent::Behaviour(TorusBehaviourEvent::Direct(request_response::Event::Message {
+            message: request_response::Message::Response { request_id, .. },
+            ..
+        })) => {
+            shared.outbound_direct.lock().unwrap().remove(&request_id);
+        }
+        // Direct protocol outbound failure — previously swallowed by `_ => {}`
+        // (Task 1 finding b). Re-enqueue the consensus message so the next
+        // ConnectionEstablished flush re-delivers it; nudge a dial. Untracked
+        // payloads (native push / forward) are logged only — T4 re-pushes those.
+        SwarmEvent::Behaviour(TorusBehaviourEvent::Direct(
+            request_response::Event::OutboundFailure { peer, request_id, error, .. }
+        )) => {
+            let tracked = shared.outbound_direct.lock().unwrap().remove(&request_id);
+            if let Some((target, message)) = tracked {
+                warn!(%peer, ?error, "direct send failed — re-enqueueing consensus message for reconnect flush");
+                shared.pending_sends.lock().unwrap().enqueue(&target, message);
+                let _ = swarm.dial(peer);
+            } else {
+                warn!(%peer, ?error, "direct send failed (untracked payload)");
+            }
+        }
+        SwarmEvent::Behaviour(TorusBehaviourEvent::Direct(
+            request_response::Event::InboundFailure { peer, error, .. }
+        )) => {
+            warn!(%peer, ?error, "direct inbound failure");
+        }
         SwarmEvent::Behaviour(TorusBehaviourEvent::Identify(identify::Event::Received {
             peer_id,
             info,
@@ -654,6 +694,20 @@ fn handle_event(
                     m.peers_connected.set(count);
                 }
                 let _ = swarm.behaviour_mut().kademlia.bootstrap();
+                // Corrected reconnect seam (Task 1a): a validator stays mapped in
+                // peer_map across disconnects, so ConnectionEstablished — not
+                // RegisterPeer/Identify — is what fires when the link returns.
+                // Flush any consensus messages buffered while it was unreachable.
+                let reconnected_vk = shared.peer_map.read().unwrap().get_vk(&peer_id).copied();
+                if let Some(vk) = reconnected_vk {
+                    let pending = shared.pending_sends.lock().unwrap().flush(&vk);
+                    if !pending.is_empty() {
+                        info!(%peer_id, count = pending.len(), "flushing pending consensus sends on (re)connect");
+                        for message in pending {
+                            send_direct(swarm, shared, local_key, &vk, message);
+                        }
+                    }
+                }
             }
         }
         SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
@@ -729,25 +783,7 @@ fn handle_command(
             }
         }
         NetworkCommand::Send { target, message } => {
-            if target == *local_key {
-                enqueue_inbound(&shared.inbound, *local_key, message);
-                return;
-            }
-            let peer_id = shared.peer_map.read().unwrap().get_peer_id(&target).copied();
-            if let Some(pid) = peer_id {
-                if let Ok(payload) = message.try_to_vec() {
-                    let req = DirectRequest {
-                        sender_key: local_key.to_bytes(),
-                        payload,
-                    };
-                    swarm.behaviour_mut().direct.send_request(&pid, req);
-                    if let Some(ref m) = shared.metrics {
-                        m.gossip_messages_sent.inc();
-                    }
-                }
-            } else {
-                warn!(target_key = ?target, "Send target not in peer map — dropping unicast message");
-            }
+            send_direct(swarm, shared, local_key, &target, message);
         }
         NetworkCommand::RegisterPeer { vk, peer_id } => {
             shared.peer_map.write().unwrap().insert(vk, peer_id);
@@ -807,6 +843,57 @@ fn handle_command(
                 swarm.behaviour_mut().direct.send_request(&pid, req);
             }
             tracing::info!(count, bytes = payload.len(), "broadcast pre-proposal actions to validators");
+        }
+    }
+}
+
+/// Send a consensus message directly to `target`, buffering instead of dropping
+/// when the peer is unreachable (Task 3 — corrected delivery seam).
+///
+/// A validator is in `peer_map` from genesis (`init_validator_set`), so the real
+/// gap is connectivity, not registration: a send to a mapped-but-disconnected
+/// peer races into a (previously silent) `OutboundFailure`. We instead enqueue +
+/// nudge a dial, and the `ConnectionEstablished` arm flushes the queue. The send
+/// is tracked in `outbound_direct` so a post-dial failure can also re-enqueue.
+fn send_direct(
+    swarm: &mut Swarm<TorusBehaviour>,
+    shared: &SharedState,
+    local_key: &VerifyingKey,
+    target: &VerifyingKey,
+    message: hotstuff_rs::networking::messages::Message,
+) {
+    if target == local_key {
+        enqueue_inbound(&shared.inbound, *local_key, message);
+        return;
+    }
+    let peer_id = shared.peer_map.read().unwrap().get_peer_id(target).copied();
+    let pid = match peer_id {
+        Some(pid) => pid,
+        None => {
+            // Not mapped yet (rare for validators) — buffer until registration.
+            shared.pending_sends.lock().unwrap().enqueue(target, message);
+            return;
+        }
+    };
+    if !swarm.is_connected(&pid) {
+        // Mapped but disconnected — buffer + nudge a dial; flush on reconnect.
+        shared.pending_sends.lock().unwrap().enqueue(target, message);
+        let _ = swarm.dial(pid);
+        return;
+    }
+    if let Ok(payload) = message.try_to_vec() {
+        let req = DirectRequest {
+            sender_key: local_key.to_bytes(),
+            payload,
+        };
+        let req_id = swarm.behaviour_mut().direct.send_request(&pid, req);
+        shared
+            .outbound_direct
+            .lock()
+            .unwrap()
+            .insert(req_id, (*target, message));
+        if let Some(ref m) = shared.metrics {
+            m.gossip_messages_sent.inc();
         }
     }
 }
@@ -939,6 +1026,8 @@ mod tests {
             block_store: RwLock::new(HashMap::new()),
             block_data_inbound: Mutex::new(VecDeque::new()),
             native_action_inbound: None,
+            pending_sends: Mutex::new(PendingSendQueue::new(256)),
+            outbound_direct: Mutex::new(HashMap::new()),
         }
     }
 
