@@ -3,6 +3,24 @@
 _Brainstorm doc. Branch `cap100-3val-perf`. Feeds `/writing-plans` → updates
 `mempool-gossip-hash-proposals-impl.md`. Created session 297._
 
+## ⚠️ CORRECTION (session 297) — gossip stays OFF
+Verified via `git show 66ddef4` (2026-05-31): native-action gossip was disabled
+**on purpose** — "with direct-to-leader forwarding active, mempool gossip is
+redundant and floods GossipSub, drowning consensus messages." Re-enabling it
+(original Options A & C below) would **reintroduce that consensus-stall
+regression** → REJECTED. Follower delivery is the pre-proposal **unicast push**
+(commit `865d4e1`, `swarm.rs:794`), fire-and-forget and racing. The real Step-3
+fork is now:
+- **Option D** — harden the unicast push + silent-drop sites (`749/718`), keep
+  the 100ms retry, leave gossip off. Bounded traffic (proposer → 3 validators,
+  once/block) won't flood. Preserves CompactBlock for the eventual cap raise.
+- **Option E** — at cap-100, send **full-block proposals** (drop CompactBlock +
+  reconstruction + the push entirely). Simplest/most robust now; compaction only
+  pays off at high cap, which is deferred (Step 5).
+- **Option B** — add a 4th validator: still blocked, no host available.
+
+Options A/B/C below retained for history. Recommendation pending D-vs-E pick.
+
 ## Problem
 At flood, validators reject the proposer's `CompactBlock` with "missing native
 actions" → on a 3-validator all-3 quorum, one rejection stalls the view. The
