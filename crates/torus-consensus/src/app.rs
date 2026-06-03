@@ -932,6 +932,38 @@ impl App<RocksKVStore> for TorusApp {
                     }
                 }
 
+                // Safety net for the CompactBlock reconstruction path. Actions are normally
+                // delivered by the proposer's pre-proposal unicast push (PreProposalBundle ->
+                // BroadcastNativeActions) before this proposal arrives, but that push can race
+                // the CompactBlock under load -- especially at a high NATIVE_TOTAL_BLOCK_CAP.
+                // Poll the mempool briefly so late-arriving pushes can land before we reject.
+                // (Restores the retry loop removed in 865d4e1 when the unicast push was added.)
+                //
+                // Total budget is capped at 100ms (5 x 20ms), kept well under the consensus
+                // view timeout (timeout_base_ms = 500ms): validate_block blocking time counts
+                // against the view (hotstuff_rs: 4*EWNL + produce + validate < max_view_time),
+                // so a 500ms blocking retry here could burn the whole view and cause timeouts.
+                if !missing.is_empty() {
+                    const RECONSTRUCT_RETRIES: usize = 5;
+                    const RECONSTRUCT_RETRY_DELAY: std::time::Duration =
+                        std::time::Duration::from_millis(20);
+                    for _ in 0..RECONSTRUCT_RETRIES {
+                        std::thread::sleep(RECONSTRUCT_RETRY_DELAY);
+                        missing.retain(|&i| {
+                            match mempool.get_native_by_hash(&compact.native_action_hashes[i]) {
+                                Some(action) => {
+                                    actions[i] = Some(action);
+                                    false
+                                }
+                                None => true,
+                            }
+                        });
+                        if missing.is_empty() {
+                            break;
+                        }
+                    }
+                }
+
                 if !missing.is_empty() {
                     tracing::warn!(
                         missing_count = missing.len(),
