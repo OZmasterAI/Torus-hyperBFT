@@ -960,6 +960,9 @@ impl App<RocksKVStore> for TorusApp {
                 }
 
                 if !missing.is_empty() {
+                    if let Some(ref m) = self.metrics {
+                        m.missing_action_rejections.inc();
+                    }
                     tracing::warn!(
                         missing_count = missing.len(),
                         height = compact.header.height,

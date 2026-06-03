@@ -579,6 +579,9 @@ fn handle_event(
             if let Some((target, message)) = tracked {
                 warn!(%peer, ?error, "direct send failed — re-enqueueing consensus message for reconnect flush");
                 shared.pending_sends.lock().unwrap().enqueue(&target, message);
+                if let Some(ref m) = shared.metrics {
+                    m.pending_sends_enqueued.inc();
+                }
                 let _ = swarm.dial(peer);
             } else {
                 warn!(%peer, ?error, "direct send failed (untracked payload)");
@@ -718,6 +721,9 @@ fn handle_event(
                     if !pending.is_empty() {
                         info!(%peer_id, count = pending.len(), "flushing pending consensus sends on (re)connect");
                         for message in pending {
+                            if let Some(ref m) = shared.metrics {
+                                m.pending_sends_flushed.inc();
+                            }
                             send_direct(swarm, shared, local_key, &vk, message);
                         }
                     }
@@ -735,6 +741,9 @@ fn handle_event(
                                     payload: envelope,
                                 };
                                 swarm.behaviour_mut().direct.send_request(&peer_id, req);
+                                if let Some(ref m) = shared.metrics {
+                                    m.native_bundle_repushed.inc();
+                                }
                             }
                         }
                     }
@@ -910,12 +919,18 @@ fn send_direct(
         None => {
             // Not mapped yet (rare for validators) — buffer until registration.
             shared.pending_sends.lock().unwrap().enqueue(target, message);
+            if let Some(ref m) = shared.metrics {
+                m.pending_sends_enqueued.inc();
+            }
             return;
         }
     };
     if !swarm.is_connected(&pid) {
         // Mapped but disconnected — buffer + nudge a dial; flush on reconnect.
         shared.pending_sends.lock().unwrap().enqueue(target, message);
+        if let Some(ref m) = shared.metrics {
+            m.pending_sends_enqueued.inc();
+        }
         let _ = swarm.dial(pid);
         return;
     }

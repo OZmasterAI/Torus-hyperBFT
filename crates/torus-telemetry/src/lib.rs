@@ -67,6 +67,12 @@ pub struct Metrics {
 
     // Consensus timeout metrics
     pub consensus_timeout_total: Counter,
+
+    // Step 3 dissemination-hardening metrics
+    pub pending_sends_enqueued: Counter,
+    pub pending_sends_flushed: Counter,
+    pub native_bundle_repushed: Counter,
+    pub missing_action_rejections: Counter,
 }
 
 impl Metrics {
@@ -236,6 +242,34 @@ impl Metrics {
             consensus_timeout_total.clone(),
         );
 
+        let pending_sends_enqueued = Counter::default();
+        registry.register(
+            "torus_pending_sends_enqueued",
+            "Consensus unicast messages buffered because the target was unreachable",
+            pending_sends_enqueued.clone(),
+        );
+
+        let pending_sends_flushed = Counter::default();
+        registry.register(
+            "torus_pending_sends_flushed",
+            "Buffered consensus unicast messages flushed on (re)connect",
+            pending_sends_flushed.clone(),
+        );
+
+        let native_bundle_repushed = Counter::default();
+        registry.register(
+            "torus_native_bundle_repushed",
+            "Recent native-action bundles re-pushed to a (re)connecting validator",
+            native_bundle_repushed.clone(),
+        );
+
+        let missing_action_rejections = Counter::default();
+        registry.register(
+            "torus_missing_action_rejections",
+            "CompactBlock validations rejected after retry due to missing native actions",
+            missing_action_rejections.clone(),
+        );
+
         Self {
             registry,
             blocks_committed,
@@ -261,6 +295,10 @@ impl Metrics {
             gossip_messages_sent,
             block_transactions_count,
             consensus_timeout_total,
+            pending_sends_enqueued,
+            pending_sends_flushed,
+            native_bundle_repushed,
+            missing_action_rejections,
         }
     }
 
