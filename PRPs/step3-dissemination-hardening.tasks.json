@@ -1,0 +1,49 @@
+{
+  "prp": "step3-dissemination-hardening",
+  "created": "2026-06-03T20:55:00+02:00",
+  "design_doc": "docs/plans/step3-dissemination-hardening.md",
+  "impl_doc": "docs/plans/step3-dissemination-hardening-impl.md",
+  "option": "D — harden unicast delivery, keep CompactBlock, gossip stays off",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Scope the delivery seams (reconnect trigger, OutboundFailure handling)",
+      "status": "pending",
+      "files": ["crates/torus-network/src/swarm.rs"],
+      "validate": "grep -n \"ConnectionEstablished\\|OutboundFailure\\|identify::Event\" crates/torus-network/src/swarm.rs",
+      "depends_on": []
+    },
+    {
+      "id": 2,
+      "name": "Bounded generic PendingSendQueue + unit tests",
+      "status": "pending",
+      "files": ["crates/torus-network/src/pending_send.rs", "crates/torus-network/src/lib.rs"],
+      "validate": "cargo test -p torus-network -- pending_send",
+      "depends_on": []
+    },
+    {
+      "id": 3,
+      "name": "Enqueue-on-miss / flush-on-register for consensus unicast (fix drop @swarm.rs:749)",
+      "status": "pending",
+      "files": ["crates/torus-network/src/swarm.rs"],
+      "validate": "cargo test -p torus-network",
+      "depends_on": [1, 2]
+    },
+    {
+      "id": 4,
+      "name": "Re-push recent native-action bundles on (re)registration (fix missing-action @swarm.rs:794)",
+      "status": "pending",
+      "files": ["crates/torus-network/src/swarm.rs"],
+      "validate": "cargo test -p torus-network",
+      "depends_on": [1, 3]
+    },
+    {
+      "id": 5,
+      "name": "Metrics + quiet-host flood verification + congestion measurement",
+      "status": "pending",
+      "files": ["crates/torus-network/src/swarm.rs", "crates/torus-consensus/src/app.rs"],
+      "validate": "cargo test -p torus-network -p torus-consensus",
+      "depends_on": [3, 4]
+    }
+  ]
+}

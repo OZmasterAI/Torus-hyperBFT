@@ -19,7 +19,15 @@ fork is now:
   pays off at high cap, which is deferred (Step 5).
 - **Option B** — add a 4th validator: still blocked, no host available.
 
-Options A/B/C below retained for history. Recommendation pending D-vs-E pick.
+Options A/B/C below retained for history. **DECISION (s297): Option D LOCKED.**
+The missing-action stall is a *delivery* bug, not a CompactBlock flaw, and the
+full→compact switch (`865d4e1`) was deliberate prep for the cap raise (Step 5,
+deferred not cancelled) — so reverting (E) would be a 4th delivery-churn undoing
+a forward decision. Fix delivery, keep CompactBlock. Key design rule: harden the
+PRIMARY unicast push so a fallback fetch is a rare exception, NOT a per-block
+round-trip (that round-trip is exactly what sank the header-fetch approach,
+46→211ms). Next: `/writing-plans` → TDD impl plan (supersedes the gossip-era
+`mempool-gossip-hash-proposals-impl.md`).
 
 ## Problem
 At flood, validators reject the proposer's `CompactBlock` with "missing native
