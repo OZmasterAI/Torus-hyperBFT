@@ -6,7 +6,10 @@ use std::sync::Arc;
 use alloy_primitives::{Address, Bytes, B256, U256};
 use revm::bytecode::Bytecode;
 use revm::state::AccountInfo;
-use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, Options, WriteBatch, DB};
+use rocksdb::{
+    BlockBasedOptions, Cache, ColumnFamily, ColumnFamilyDescriptor, DBCompressionType, Options,
+    WriteBatch, DB,
+};
 
 use crate::cf::*;
 use crate::error::StateError;
@@ -32,10 +35,34 @@ impl StateDb {
         let mut opts = Options::default();
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
+        // DB-wide: parallelize flush/compaction and smooth fsync spikes during
+        // heavy block writes. (Stock defaults run only 2 background jobs.)
+        opts.set_max_background_jobs(4);
+        opts.set_bytes_per_sync(1 << 20); // 1 MiB
+
+        // Per-CF tuning, shared across every column family. RocksDB ships an
+        // ~8 MiB block cache and NO bloom filters by default, which is poor for
+        // this node's point-lookup-heavy access (account / code / native-action
+        // -by-hash). A shared cache + bloom filters is the main read win here.
+        let cache = Cache::new_lru_cache(256 * 1024 * 1024); // 256 MiB shared block cache
+        let mut bbt = BlockBasedOptions::default();
+        bbt.set_block_cache(&cache);
+        bbt.set_bloom_filter(10.0, false); // ~1% false positives on point lookups
+        bbt.set_block_size(16 * 1024); // 16 KiB blocks
+        bbt.set_cache_index_and_filter_blocks(true);
+        bbt.set_pin_l0_filter_and_index_blocks_in_cache(true);
+
+        let mut cf_opts = Options::default();
+        cf_opts.set_block_based_table_factory(&bbt);
+        cf_opts.set_write_buffer_size(128 * 1024 * 1024); // 128 MiB memtable
+        cf_opts.set_max_write_buffer_number(4);
+        cf_opts.set_compression_type(DBCompressionType::Lz4);
+        cf_opts.set_bottommost_compression_type(DBCompressionType::Zstd);
+        cf_opts.set_level_compaction_dynamic_level_bytes(true);
 
         let cf_descriptors: Vec<ColumnFamilyDescriptor> = ALL_CF_NAMES
             .iter()
-            .map(|name| ColumnFamilyDescriptor::new(*name, Options::default()))
+            .map(|name| ColumnFamilyDescriptor::new(*name, cf_opts.clone()))
             .collect();
 
         let db = DB::open_cf_descriptors(&opts, path, cf_descriptors)?;
