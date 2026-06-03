@@ -66,6 +66,16 @@ pub enum NetworkCommand {
 const FORWARD_ACTION_MARKER: u8 = 0xFE;
 /// Marker byte for batched pre-proposal action payloads (CompactBlock dissemination).
 const PRE_PROPOSAL_BATCH_MARKER: u8 = 0xFD;
+/// How many recent pre-proposal bundles to retain for re-push on (re)connect (Task 4).
+const RECENT_NATIVE_BUNDLES_CAP: usize = 3;
+
+/// Push `item` into a bounded ring, evicting the oldest when at `cap`.
+fn push_bounded(ring: &mut VecDeque<Vec<u8>>, item: Vec<u8>, cap: usize) {
+    if ring.len() >= cap {
+        ring.pop_front();
+    }
+    ring.push_back(item);
+}
 
 pub struct SharedState {
     pub inbound: Mutex<VecDeque<(VerifyingKey, hotstuff_rs::networking::messages::Message)>>,
@@ -90,6 +100,10 @@ pub struct SharedState {
     /// `OutboundFailure` (previously swallowed by `_ => {}`) can re-enqueue the
     /// message for the next reconnect flush instead of dropping it (Task 3).
     pub outbound_direct: Mutex<HashMap<request_response::OutboundRequestId, (VerifyingKey, hotstuff_rs::networking::messages::Message)>>,
+    /// Bounded ring of recent pre-proposal action bundle envelopes (Task 4).
+    /// Re-pushed to a validator that (re)connects after the original push, so its
+    /// mempool catches up before the next CompactBlock it must reconstruct.
+    pub recent_native_bundles: Mutex<VecDeque<Vec<u8>>>,
 }
 
 enum SwarmAction {
@@ -707,6 +721,23 @@ fn handle_event(
                             send_direct(swarm, shared, local_key, &vk, message);
                         }
                     }
+                    // T4: re-push recent native-action bundles so a (re)connecting
+                    // validator's mempool catches up before the next CompactBlock it
+                    // must reconstruct. Validator-gated; dedup is free on the receiver.
+                    if shared.validators.read().unwrap().contains(&vk.to_bytes()) {
+                        let bundles: Vec<Vec<u8>> =
+                            shared.recent_native_bundles.lock().unwrap().iter().cloned().collect();
+                        if !bundles.is_empty() {
+                            info!(%peer_id, count = bundles.len(), "re-pushing recent native bundles on (re)connect");
+                            for envelope in bundles {
+                                let req = DirectRequest {
+                                    sender_key: local_key.to_bytes(),
+                                    payload: envelope,
+                                };
+                                swarm.behaviour_mut().direct.send_request(&peer_id, req);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -842,6 +873,13 @@ fn handle_command(
                 };
                 swarm.behaviour_mut().direct.send_request(&pid, req);
             }
+            // T4: retain this bundle (bounded ring) for re-push to validators that
+            // (re)connect after this push. Dedup is free on the receiver.
+            push_bounded(
+                &mut shared.recent_native_bundles.lock().unwrap(),
+                envelope,
+                RECENT_NATIVE_BUNDLES_CAP,
+            );
             tracing::info!(count, bytes = payload.len(), "broadcast pre-proposal actions to validators");
         }
     }
@@ -1028,6 +1066,7 @@ mod tests {
             native_action_inbound: None,
             pending_sends: Mutex::new(PendingSendQueue::new(256)),
             outbound_direct: Mutex::new(HashMap::new()),
+            recent_native_bundles: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -1083,5 +1122,17 @@ mod tests {
     #[test]
     fn inbound_queue_capacity_constant() {
         assert_eq!(MAX_INBOUND_QUEUE, 10_000);
+    }
+
+    #[test]
+    fn recent_native_bundles_ring_keeps_last_n() {
+        let mut ring: VecDeque<Vec<u8>> = VecDeque::new();
+        // Push CAP+2 items; ring must retain only the last CAP, oldest evicted.
+        for i in 0..(RECENT_NATIVE_BUNDLES_CAP as u8 + 2) {
+            push_bounded(&mut ring, vec![i], RECENT_NATIVE_BUNDLES_CAP);
+        }
+        assert_eq!(ring.len(), RECENT_NATIVE_BUNDLES_CAP);
+        assert_eq!(ring.front().unwrap(), &vec![2u8]);
+        assert_eq!(ring.back().unwrap(), &vec![RECENT_NATIVE_BUNDLES_CAP as u8 + 1]);
     }
 }
