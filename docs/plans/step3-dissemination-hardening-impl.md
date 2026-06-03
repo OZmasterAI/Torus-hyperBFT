@@ -219,4 +219,98 @@ cd devnet && ./start.sh --build                      # quiet host only
   rollback returns to current behaviour exactly.
 
 ## Task 1 findings
-_(to be filled during implementation)_
+_Read-only triage, session (cap100-3val-perf). All line refs verified against current
+branch HEAD 5cf4fad. **This gate revises the seams of Tasks 3-4 — read before building.**_
+
+### (a) Reconnect trigger — and a premise correction for Tasks 3-4
+- **`peer_map` is populated by the validator set, NOT by `RegisterPeer`.**
+  `LibP2PNetwork::init_validator_set` (`bridge.rs:182-198`) writes **all** validators
+  into `shared.peer_map` directly at startup, deriving each `peer_id` deterministically
+  via `peer_id_from_verifying_key`. `update_validator_set` (`bridge.rs:200-212`) keeps it
+  in sync on set changes. The `RegisterPeer` command is documented **"Normally
+  unnecessary … kept for ad-hoc registration (observers, tests)"** (`bridge.rs:154-163`).
+- **A validator is therefore in `peer_map` from genesis and is never removed on
+  disconnect.** `ConnectionClosed` removes **non-validators only** (`swarm.rs:665-673`);
+  `Identify::Received` inserts **only when `!contains_vk`** (`swarm.rs:554-560`), i.e. only
+  for brand-new (RPC) peers.
+- **Consequence — the `Send`-drop @749 premise (failure mode #1) is largely moot for the
+  validator↔validator path.** `get_peer_id(target)` returns `Some` for every validator,
+  so the `None`/warn-drop branch (`swarm.rs:748-750`) essentially never fires for consensus.
+- **The real reconnect signal is `SwarmEvent::ConnectionEstablished` (`swarm.rs:646-658`)**
+  — it fires when a disconnected validator's QUIC connection returns, but today it only
+  logs + bootstraps Kademlia; it flushes nothing and touches no app state. `Identify` and
+  `RegisterPeer` do **not** re-fire on a pure validator reconnect (vk already mapped).
+  ⇒ **Flush trigger for Tasks 3-4 must be `ConnectionEstablished`, mapped to a vk via
+  `peer_map.get_vk(&peer_id)` — NOT `RegisterPeer`.**
+
+### (b) Direct-protocol `OutboundFailure` is silently dropped
+- `handle_event` matches only `Direct(Event::Message{Request})` (`swarm.rs:467-537`).
+  There is **no arm** for `Direct` `Response`, `OutboundFailure`, or `InboundFailure`
+  — they fall through to `_ => {}` (`swarm.rs:697`). (Contrast: the `BlockData` protocol
+  *does* log both failures, `swarm.rs:628-637`.)
+- ⇒ When a consensus `Vote`/`NewView` or a pre-proposal native push is `send_request`-ed
+  to a **mapped-but-currently-disconnected** validator, libp2p dials; if delivery fails the
+  `OutboundFailure` is **lost with no log and no retry**. **This — not the peer-map miss —
+  is the actual consensus-unicast loss**, and the queue-on-peer-map-miss design (T3) does
+  not catch it.
+
+### (c) Congestion hypothesis (failure mode #3) vs current gossip-off code
+- Native-action gossip is confirmed OFF: `native_gossip_enabled=false`
+  (`mempool/lib.rs:116`), gated at `lib.rs:296`; the outbound `native_action_rx` flush
+  path (`swarm.rs:274-318`) is dormant. **Keep it off** (guardrail).
+- But consensus itself still uses **gossipsub** (`Broadcast`→publish, `swarm.rs:709-729`),
+  and the per-block pre-proposal push (`BroadcastNativeActions`, `swarm.rs:794-810`)
+  serializes the whole action batch and `send_request`s it to each validator on the
+  command path (P1). The **receiver deserializes that batch inline on the event loop**
+  (`swarm.rs:497-512`). Under cap-100 flood this inline (de)serialization + dial churn is a
+  plausible source of the 1.5-2s push latency in mem `8ee99db3`, **independent of peer-map
+  state**. ⇒ T3/T4 cannot be assumed to cure it; **T5 must measure** (do not declare done
+  on green unit tests alone).
+
+### (d) Block-sync triage (failure mode #4 — live in node.log) — SEPARATE root cause
+- **`worker fetch error (timeout/disconnect)` is fatal to the session, no retry**
+  (`client.rs:194-199`): `SyncResult::Error` → `check_commitment_and_end_session()` →
+  which **blacklists** the peer for `blacklist_expiry=10s` whenever
+  `blocks_synced < min_blocks_expected` (`client.rs:503-521`) — true for any 0-block
+  timeout. Worker fetch timeout is `block_sync_response_timeout=3s` (`main.rs:442`).
+  (NB: distinct from the *body-fetch* path, which already retries via `body_fetch_tracker`
+  / `tick_pending_body_retries`, mem `a06daf38` + `algorithm.rs:186` — that one is fine.)
+- **On a 3-validator set this is a liveness cliff:** blacklisting the 1-2 reachable sync
+  servers empties `available_sync_servers` → `random_sync_server` returns `None` →
+  "no available sync servers, cannot sync" (`client.rs:419-422`) until a blacklist expires.
+- **`justify_block_known=false` is a *trigger*, not terminal.** A header whose parent is
+  unknown is dropped at `implementation.rs:1537-1556`, which sets `sync_needed=true`
+  (1543-1544); `algorithm.rs:186-191/215-219` then calls `trigger_sync`
+  (`client.rs:99-110`). Recovery hinges on that sync succeeding — which the timeout→
+  blacklist→starvation cascade above can defeat.
+- **The acute historical cause is already fixed on THIS branch.** Mem `4c5d41161`
+  (ProposalHeaders dropped by the view filter) is mitigated: `is_block_data_msg()` includes
+  `ProposalHeader` (`messages.rs:106-108`) and the view filter bypasses it
+  (`receiving.rs:186`).
+- **The live node.log is the OLD `59e595e` cap-1000 binary, not this branch** (mem
+  `07d92e4f`) — so its block-sync failures are partly pre-fix. The residual, branch-relevant
+  block-sync risk is the **fetch-timeout → blacklist → server-starvation cascade** under load.
+
+### VERDICT — is Option D's delivery hardening SUFFICIENT?
+**NECESSARY but NOT SUFFICIENT, and the plan's seams need correction.**
+1. **Option D is still the right delivery fix** — gossip stays off, CompactBlock stays,
+   retry stays. But two of its target seams are wrong as written:
+   - **Flush trigger** = `ConnectionEstablished` (→ vk via `get_vk`), **not** `RegisterPeer`.
+   - **Enqueue gate (T3)** = `!swarm.is_connected(&pid)` for a mapped validator, **not**
+     "absent from `peer_map`" (which doesn't happen for validators). Plus **handle
+     `Direct` `OutboundFailure`** (log + re-enqueue) to catch post-dial loss (finding b).
+   - T2 (`PendingSendQueue`) is unaffected — build it as specified.
+   - T4 re-push bundles likewise keys off `ConnectionEstablished`.
+2. **Block-sync is a co-equal root cause that Option D does not touch.** Recommend a
+   **companion task (T6 / separate step):** on transient `worker fetch error`, **retry the
+   same fetch ≥1× before ending the session**, and/or **do not blacklist on
+   timeout/disconnect** (reserve blacklist for `is_correct`/app-validation failures —
+   distinguish "bad data" from "slow/unreachable"), and/or **never blacklist the last
+   reachable server** on small (≤4) validator sets.
+3. **Do not declare Step 3 done on unit-test green.** Gate the call on the **T5 quiet-host
+   bench measuring BOTH** missing-action rejections **and** block-sync errors / view-stall
+   rate, on this branch's binary (the live log was the old binary).
+
+**Recommendation:** proceed with Tasks 2-5 using the corrected seams above, and add the
+block-sync companion (T6) — but get explicit approval on the scope (D-only vs D+T6) before
+building, since T6 widens scope beyond "dissemination hardening".
