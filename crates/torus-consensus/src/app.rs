@@ -429,6 +429,24 @@ pub struct PreProposalBundle {
     pub actions: Vec<(Address, torus_types::SignedNativeAction)>,
 }
 
+/// Encode the datum carried in a consensus proposal.
+///
+/// Emits the FULL, self-contained `TorusBlock` (native actions inline) rather
+/// than a hash-only `CompactBlock`. CompactBlock reconstruction depends on every
+/// validator already holding the actions -- which originally arrived via gossip.
+/// Gossip is disabled (it drowned consensus), so the only delivery was a racing
+/// pre-proposal unicast push that loses under load: validators reject blocks for
+/// missing actions and the chain stalls (step3 dissemination gap). A full block
+/// needs no out-of-band delivery and is self-contained for block-sync too.
+///
+/// This reverts to the proven full-block proposals (06620a1) that ran healthy at
+/// cap-100 for ~5 days; they were dropped only to shrink proposals for a cap
+/// raise that is deferred. At cap-100 a full block stays well under
+/// `max_consensus_message_size` (256KB); revisit before raising the block cap.
+fn encode_proposal_datum(block: &TorusBlock) -> Vec<u8> {
+    bincode::serialize(block).expect("serialize TorusBlock")
+}
+
 impl TorusApp {
     pub fn new(
         state_db: StateDb,
@@ -858,8 +876,7 @@ impl App<RocksKVStore> for TorusApp {
             }
         }
 
-        let compact = CompactBlock::from_block(&block);
-        let encoded = bincode::serialize(&compact).expect("serialize CompactBlock");
+        let encoded = encode_proposal_datum(&block);
         self.pending_proposals.insert(height, block);
         self.pending_proposals.retain(|&h, _| h + 10 > height);
         let hash = Self::hash_datum(&encoded);
@@ -1278,6 +1295,29 @@ mod crash_recovery_tests {
         let applied = read_native_applied_height(&state_db);
         assert_eq!(applied, Some(1), "replay should set applied height to 1");
         assert_eq!(app.last_header.height, 1, "last_header should be updated");
+    }
+
+    #[test]
+    fn produce_block_datum_is_full_self_contained_block() {
+        // The datum the proposer emits must be a FULL TorusBlock carrying its
+        // native actions inline -- not a hash-only CompactBlock. A CompactBlock
+        // can only be reconstructed if the actions were already delivered
+        // out-of-band (gossip is off; the pre-proposal push races and loses
+        // under load), which stalls the chain (step3 dissemination gap).
+        let actions: Vec<SignedNativeAction> = (0..100).map(sign_claim_rewards).collect();
+        let block = make_block(7, actions);
+
+        let datum = encode_proposal_datum(&block);
+
+        // Must deserialize as a full TorusBlock with every action present, with
+        // no dependency on a mempool or out-of-band action delivery.
+        let decoded: TorusBlock = bincode::deserialize(&datum)
+            .expect("proposal datum must be a full self-contained TorusBlock");
+        assert_eq!(
+            decoded.native_actions.len(),
+            100,
+            "full block must carry all native actions inline"
+        );
     }
 
     #[test]
