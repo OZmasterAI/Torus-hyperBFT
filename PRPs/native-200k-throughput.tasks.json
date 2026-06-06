@@ -1,0 +1,79 @@
+{
+  "prp": "native-200k-throughput",
+  "created": "2026-06-06T16:55:00",
+  "goal": "200k native orders/sec end-to-end committed, sub-100ms blocks. Phase B (batch action) is the executable scope below; A/C/D are milestones needing their own -impl.md.",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "B1: Add PlaceOrderBatch(Vec<PlaceOrderParams>) variant + canonical_bytes",
+      "status": "pending",
+      "files": ["crates/torus-types/src/lib.rs"],
+      "validate": "cargo test -p torus-types canonical",
+      "depends_on": []
+    },
+    {
+      "id": 2,
+      "name": "B2: EIP-712 hash_place_order_batch + dispatch arm + single-sig recover round-trip",
+      "status": "pending",
+      "files": ["crates/torus-types/src/eip712.rs"],
+      "validate": "cargo test -p torus-types -- eip712 batch",
+      "depends_on": [1]
+    },
+    {
+      "id": 3,
+      "name": "B3: Configurable NATIVE_ORDERS_PER_BATCH_CAP + NATIVE_ORDERS_PER_BLOCK_CAP + oversize rejection",
+      "status": "pending",
+      "files": ["crates/torus-mempool/src/rate_limit.rs"],
+      "validate": "cargo test -p torus-mempool rate_limit",
+      "depends_on": [1]
+    },
+    {
+      "id": 4,
+      "name": "B4: Executor flatten batch into per-market parallel matching + aggregate result",
+      "status": "pending",
+      "files": ["crates/torus-bridge/src/native_executor.rs"],
+      "validate": "cargo test -p torus-bridge execute_batch",
+      "depends_on": [1]
+    },
+    {
+      "id": 5,
+      "name": "B5: Replay/nonce (one batch = one (sender,nonce)) + rate-tracker order accounting",
+      "status": "pending",
+      "files": ["crates/torus-consensus/src/app.rs", "crates/torus-mempool/src/rate_limit.rs"],
+      "validate": "cargo test -p torus-consensus duplicate_committed_native",
+      "depends_on": [4]
+    },
+    {
+      "id": 6,
+      "name": "B6: Devnet proof - bench --batch-size, orders/s >> 330, dup ~1.0, blocks <100ms",
+      "status": "pending",
+      "files": ["tools/bench-throughput/src/main.rs", "crates/torus-network/src/config.rs"],
+      "validate": "cargo test --workspace",
+      "depends_on": [2, 3, 5]
+    },
+    {
+      "id": 100,
+      "name": "Phase A: Incremental state root (MILESTONE - needs own -impl.md + brainstorm; determinism CI gate)",
+      "status": "blocked",
+      "files": ["crates/torus-bridge/src/state_root.rs", "crates/torus-state/src/trie.rs"],
+      "validate": "TBD: incremental-root == full-scan on corpus + cargo test --workspace",
+      "depends_on": [6]
+    },
+    {
+      "id": 110,
+      "name": "Phase C: Raise caps + max_consensus_message_size + validate 1-2MB dissemination (MILESTONE)",
+      "status": "blocked",
+      "files": ["crates/torus-mempool/src/rate_limit.rs", "crates/torus-network/src/config.rs", "crates/torus-network/src/swarm.rs"],
+      "validate": "TBD: devnet 1-2MB blocks, no stall, sub-100ms",
+      "depends_on": [100]
+    },
+    {
+      "id": 120,
+      "name": "Phase D: Off-box benchmark harness on quiet larger box (MILESTONE)",
+      "status": "blocked",
+      "files": ["tools/bench-throughput/src/main.rs", "devnet/docker-compose.yml"],
+      "validate": "TBD: end-to-end orders/s on clean host, <1% rejects, p99 target, no stall",
+      "depends_on": [110]
+    }
+  ]
+}
