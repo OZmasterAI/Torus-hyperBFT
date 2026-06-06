@@ -195,6 +195,7 @@ pub fn eip712_signing_hash(domain_separator: B256, struct_hash: B256) -> B256 {
 pub fn eip712_struct_hash(action: &NativeAction, nonce: u64) -> B256 {
     match action {
         NativeAction::PlaceOrder(p) => hash_place_order(p, nonce),
+        NativeAction::PlaceOrderBatch(orders) => hash_place_order_batch(orders, nonce),
         NativeAction::CancelOrder { order_id } => hash_cancel_order(*order_id, nonce),
         NativeAction::CancelAllOrders { market_id } => hash_cancel_all_orders(*market_id, nonce),
         NativeAction::ModifyOrder {
@@ -241,15 +242,12 @@ pub fn eip712_struct_hash(action: &NativeAction, nonce: u64) -> B256 {
 
 // ---------- order book ----------
 
-fn hash_place_order(p: &PlaceOrderParams, nonce: u64) -> B256 {
-    let th = keccak256(
-        "PlaceOrder(uint64 marketId,bool isBuy,int128 price,int128 quantity,\
-         uint8 orderType,uint8 timeInForce,bool reduceOnly,\
-         uint64 clientOrderId,bool hasClientOrderId,uint64 nonce)",
-    );
+/// Append the 9 EIP-712 order fields (no typehash, no nonce) to `buf`.
+///
+/// Shared by `hash_place_order` (single, nonce-bearing) and `hash_place_order_item`
+/// (batch element, nonce at the batch level) so the two paths cannot diverge.
+fn append_place_order_fields(buf: &mut Vec<u8>, p: &PlaceOrderParams) {
     let (coid, has_coid) = p.client_order_id.map_or((0, false), |id| (id, true));
-    let mut buf = Vec::with_capacity(11 * 32);
-    buf.extend_from_slice(&th.0);
     buf.extend_from_slice(&encode_u64(p.market_id));
     buf.extend_from_slice(&encode_bool(p.is_buy));
     buf.extend_from_slice(&encode_i128(p.price.raw()));
@@ -264,6 +262,53 @@ fn hash_place_order(p: &PlaceOrderParams, nonce: u64) -> B256 {
     buf.extend_from_slice(&encode_bool(p.reduce_only));
     buf.extend_from_slice(&encode_u64(coid));
     buf.extend_from_slice(&encode_bool(has_coid));
+}
+
+fn hash_place_order(p: &PlaceOrderParams, nonce: u64) -> B256 {
+    let th = keccak256(
+        "PlaceOrder(uint64 marketId,bool isBuy,int128 price,int128 quantity,\
+         uint8 orderType,uint8 timeInForce,bool reduceOnly,\
+         uint64 clientOrderId,bool hasClientOrderId,uint64 nonce)",
+    );
+    let mut buf = Vec::with_capacity(11 * 32);
+    buf.extend_from_slice(&th.0);
+    append_place_order_fields(&mut buf, p);
+    buf.extend_from_slice(&encode_u64(nonce));
+    keccak256(&buf)
+}
+
+/// EIP-712 struct hash for one order *inside* a batch (no nonce — the nonce is
+/// bound once at the batch level). Distinct typehash from `PlaceOrder` so a single
+/// order and a batch element can never collide.
+fn hash_place_order_item(p: &PlaceOrderParams) -> B256 {
+    let th = keccak256(
+        "PlaceOrderItem(uint64 marketId,bool isBuy,int128 price,int128 quantity,\
+         uint8 orderType,uint8 timeInForce,bool reduceOnly,\
+         uint64 clientOrderId,bool hasClientOrderId)",
+    );
+    let mut buf = Vec::with_capacity(10 * 32);
+    buf.extend_from_slice(&th.0);
+    append_place_order_fields(&mut buf, p);
+    keccak256(&buf)
+}
+
+/// EIP-712 struct hash for a batch of orders under one signature + one nonce.
+///
+/// Follows the codebase's array convention (cf. `hash_submit_oracle_prices`):
+/// the dynamic array is folded into a single `bytes32 ordersHash =
+/// keccak256(item_hash_1 || item_hash_2 || ...)`. `count` is bound explicitly so
+/// truncation/extension changes the hash even if it weren't already implied.
+fn hash_place_order_batch(orders: &[PlaceOrderParams], nonce: u64) -> B256 {
+    let th = keccak256("PlaceOrderBatch(bytes32 ordersHash,uint64 count,uint64 nonce)");
+    let mut acc = Vec::with_capacity(orders.len() * 32);
+    for p in orders {
+        acc.extend_from_slice(&hash_place_order_item(p).0);
+    }
+    let orders_hash = keccak256(&acc);
+    let mut buf = Vec::with_capacity(4 * 32);
+    buf.extend_from_slice(&th.0);
+    buf.extend_from_slice(&encode_bytes32(&orders_hash));
+    buf.extend_from_slice(&encode_u64(orders.len() as u64));
     buf.extend_from_slice(&encode_u64(nonce));
     keccak256(&buf)
 }
@@ -994,6 +1039,53 @@ mod tests {
 
         let signed = sign_native_action(action, TEST_NONCE, &key);
         assert_eq!(signed.recover_sender().unwrap(), expected);
+    }
+
+    #[test]
+    fn sign_and_recover_place_order_batch_single_signature() {
+        let key = test_key();
+        let expected = signer_address(&key);
+
+        let mk = |market_id: u64, is_buy: bool, coid: Option<u64>| PlaceOrderParams {
+            market_id,
+            is_buy,
+            price: FixedPoint::from_raw(1_000_000_000),
+            quantity: FixedPoint::from_raw(100_000_000),
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::GTC,
+            reduce_only: false,
+            client_order_id: coid,
+        };
+        let orders = vec![mk(1, true, Some(1)), mk(2, false, Some(2)), mk(3, true, None)];
+
+        // ONE signature covers all N orders (the throughput keystone).
+        let signed =
+            sign_native_action(NativeAction::PlaceOrderBatch(orders.clone()), TEST_NONCE, &key);
+        assert_eq!(signed.recover_sender().unwrap(), expected);
+
+        // Tampering with ANY order in the batch breaks the signature
+        // (ecrecover yields a different address, so it won't match `expected`).
+        let mut tampered = signed.clone();
+        if let NativeAction::PlaceOrderBatch(ref mut v) = tampered.action {
+            v[1].price = FixedPoint::from_raw(999_999_999);
+        }
+        assert_ne!(tampered.recover_sender().unwrap(), expected);
+
+        // Reordering the batch also invalidates it (order is signed).
+        let mut reordered = signed.clone();
+        if let NativeAction::PlaceOrderBatch(ref mut v) = reordered.action {
+            v.swap(0, 1);
+        }
+        assert_ne!(reordered.recover_sender().unwrap(), expected);
+
+        // A batch-of-one is a distinct EIP-712 struct from the single PlaceOrder
+        // of the same order (different typehash) — no cross-variant collision.
+        let single = NativeAction::PlaceOrder(orders[0].clone());
+        let batch_of_one = NativeAction::PlaceOrderBatch(vec![orders[0].clone()]);
+        assert_ne!(
+            eip712_struct_hash(&single, TEST_NONCE),
+            eip712_struct_hash(&batch_of_one, TEST_NONCE),
+        );
     }
 
     #[test]

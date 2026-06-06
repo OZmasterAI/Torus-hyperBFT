@@ -64,6 +64,10 @@ enum Command {
         duration: u64,
         #[arg(long, default_value_t = 512)]
         concurrency: usize,
+        /// Orders per signed PlaceOrderBatch (1 = single PlaceOrder). The throughput
+        /// knob: orders/s = actions/s x batch_size. Sweep e.g. 1/100/500/1000.
+        #[arg(long, default_value_t = 1)]
+        batch_size: usize,
     },
     Combined {
         #[arg(long, default_value = "http://localhost:8545,http://localhost:8546,http://localhost:8547,http://localhost:8548")]
@@ -95,6 +99,21 @@ fn random_place_order(rng: &mut impl Rng, market_id: u64) -> NativeAction {
         reduce_only: false,
         client_order_id: None,
     })
+}
+
+/// Build one action carrying `batch_size` orders. `batch_size <= 1` returns a plain
+/// `PlaceOrder` (the legacy single path) for apples-to-apples A/B runs.
+fn random_place_order_action(rng: &mut impl Rng, market_id: u64, batch_size: usize) -> NativeAction {
+    if batch_size <= 1 {
+        return random_place_order(rng, market_id);
+    }
+    let orders: Vec<PlaceOrderParams> = (0..batch_size)
+        .map(|_| match random_place_order(rng, market_id) {
+            NativeAction::PlaceOrder(p) => p,
+            _ => unreachable!(),
+        })
+        .collect();
+    NativeAction::PlaceOrderBatch(orders)
 }
 
 fn random_address(rng: &mut impl Rng) -> Address {
@@ -318,15 +337,18 @@ async fn run_consensus(
     senders: usize,
     duration_secs: u64,
     concurrency: usize,
+    batch_size: usize,
 ) {
     let rpc_urls: Vec<String> = rpc_urls_str.split(',').map(|s| s.trim().to_string()).collect();
     let num_senders = senders.max(1);
     let keys = load_sender_keys(num_senders);
+    let orders_per_action = batch_size.max(1) as u64;
 
     println!("=== Torus Throughput Benchmark ===");
     println!("Mode: consensus");
     println!("Duration: {duration_secs}s");
     println!("Senders: {num_senders}");
+    println!("Batch size: {orders_per_action} order(s)/action");
     println!("RPC endpoints: {}", rpc_urls.len());
     println!();
 
@@ -445,12 +467,14 @@ async fn run_consensus(
                 };
 
                 eprintln!(
-                    "[{:.0}s] submitted: {} ({:.0}/s) | included: {} ({:.0}/s) | blk: #{} | {:.0}ms/blk",
+                    "[{:.0}s] submitted: {} actions ({:.0}/s) | included: {} actions ({:.0}/s) | \
+                     orders ~{:.0}/s | blk: #{} | {:.0}ms/blk",
                     elapsed,
                     format_num(sub),
                     sub_rate,
                     format_num(inc),
                     inc_rate,
+                    inc_rate * orders_per_action as f64,
                     current_block,
                     avg_blk_ms,
                 );
@@ -475,7 +499,7 @@ async fn run_consensus(
             let mut url_idx: usize = sender_idx % url_count;
 
             while Instant::now() < deadline {
-                let action = random_place_order(&mut rng, 1);
+                let action = random_place_order_action(&mut rng, 1, batch_size);
                 let nonce = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap()
@@ -551,6 +575,14 @@ async fn run_consensus(
         format_num(final_included),
         include_rate,
     );
+    if orders_per_action > 1 {
+        println!(
+            "Orders:     {} orders ({:.0}/s)  [actions x{} batch]",
+            format_num(final_included * orders_per_action),
+            include_rate * orders_per_action as f64,
+            orders_per_action,
+        );
+    }
     println!("Drop rate:  {drop_rate:.1}%");
     println!("Block time: {avg_block_time_ms:.0}ms avg");
     println!(
@@ -564,7 +596,11 @@ async fn run_consensus(
             include_rate, peak_block, peak_actions,
         );
     }
-    println!("Sustained:  {:.0}/s included (over {duration_secs}s)", include_rate);
+    println!(
+        "Sustained:  {:.0} orders/s ({:.0} actions/s) over {duration_secs}s",
+        include_rate * orders_per_action as f64,
+        include_rate,
+    );
 }
 
 // ============================================================================
@@ -595,7 +631,8 @@ async fn main() {
             senders,
             duration,
             concurrency,
-        } => run_consensus(&rpc_urls, senders, duration, concurrency).await,
+            batch_size,
+        } => run_consensus(&rpc_urls, senders, duration, concurrency, batch_size).await,
         Command::Combined { .. } => run_combined(),
     }
 }

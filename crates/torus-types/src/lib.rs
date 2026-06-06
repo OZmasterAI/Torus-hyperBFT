@@ -459,6 +459,11 @@ impl CompactBlock {
 pub enum NativeAction {
     // === Order Book ===
     PlaceOrder(PlaceOrderParams),
+    /// Many orders under one signature + one nonce (market-maker batch submission).
+    /// Throughput keystone (Phase B): a single secp256k1 ecrecover and a single
+    /// `(sender, nonce)` cover every order, and the per-block action cap counts the
+    /// whole batch as one action — so `orders/block = action_cap * batch_size`.
+    PlaceOrderBatch(Vec<PlaceOrderParams>),
     CancelOrder {
         order_id: OrderId,
     },
@@ -554,6 +559,41 @@ pub enum NativeAction {
 }
 
 impl NativeAction {
+    /// Append a single order's canonical body (no variant tag) to `buf`.
+    ///
+    /// Shared by the `PlaceOrder` and `PlaceOrderBatch` encodings so a batched
+    /// order is byte-identical to the same order submitted singly.
+    fn encode_place_order_params(buf: &mut Vec<u8>, p: &PlaceOrderParams) {
+        buf.extend_from_slice(&p.market_id.to_be_bytes());
+        buf.push(p.is_buy as u8);
+        buf.extend_from_slice(&p.price.raw().to_be_bytes());
+        buf.extend_from_slice(&p.quantity.raw().to_be_bytes());
+        match &p.order_type {
+            OrderType::Limit => buf.push(0),
+            OrderType::Market => buf.push(1),
+            OrderType::StopMarket { trigger } => {
+                buf.push(2);
+                buf.extend_from_slice(&trigger.raw().to_be_bytes());
+            }
+            OrderType::StopLimit { trigger, limit } => {
+                buf.push(3);
+                buf.extend_from_slice(&trigger.raw().to_be_bytes());
+                buf.extend_from_slice(&limit.raw().to_be_bytes());
+            }
+        }
+        buf.push(match p.time_in_force {
+            TimeInForce::GTC => 0,
+            TimeInForce::IOC => 1,
+            TimeInForce::FOK => 2,
+            TimeInForce::PostOnly => 3,
+        });
+        buf.push(p.reduce_only as u8);
+        match p.client_order_id {
+            Some(id) => { buf.push(1); buf.extend_from_slice(&id.to_be_bytes()); }
+            None => buf.push(0),
+        }
+    }
+
     /// Deterministic canonical byte encoding for consensus-critical hashing.
     ///
     /// Unlike `Debug` formatting or `serde_json`, this encoding is guaranteed stable
@@ -564,33 +604,13 @@ impl NativeAction {
         match self {
             NativeAction::PlaceOrder(p) => {
                 buf.push(0);
-                buf.extend_from_slice(&p.market_id.to_be_bytes());
-                buf.push(p.is_buy as u8);
-                buf.extend_from_slice(&p.price.raw().to_be_bytes());
-                buf.extend_from_slice(&p.quantity.raw().to_be_bytes());
-                match &p.order_type {
-                    OrderType::Limit => buf.push(0),
-                    OrderType::Market => buf.push(1),
-                    OrderType::StopMarket { trigger } => {
-                        buf.push(2);
-                        buf.extend_from_slice(&trigger.raw().to_be_bytes());
-                    }
-                    OrderType::StopLimit { trigger, limit } => {
-                        buf.push(3);
-                        buf.extend_from_slice(&trigger.raw().to_be_bytes());
-                        buf.extend_from_slice(&limit.raw().to_be_bytes());
-                    }
-                }
-                buf.push(match p.time_in_force {
-                    TimeInForce::GTC => 0,
-                    TimeInForce::IOC => 1,
-                    TimeInForce::FOK => 2,
-                    TimeInForce::PostOnly => 3,
-                });
-                buf.push(p.reduce_only as u8);
-                match p.client_order_id {
-                    Some(id) => { buf.push(1); buf.extend_from_slice(&id.to_be_bytes()); }
-                    None => buf.push(0),
+                Self::encode_place_order_params(&mut buf, p);
+            }
+            NativeAction::PlaceOrderBatch(orders) => {
+                buf.push(25);
+                buf.extend_from_slice(&(orders.len() as u32).to_be_bytes());
+                for p in orders {
+                    Self::encode_place_order_params(&mut buf, p);
                 }
             }
             NativeAction::CancelOrder { order_id } => {
@@ -1133,6 +1153,60 @@ mod tests {
     #[should_panic(expected = "FixedPoint division error")]
     fn div_operator_panics_on_zero() {
         let _ = FixedPoint::ONE / FixedPoint::ZERO;
+    }
+
+    // ---- PlaceOrderBatch (Phase B, Task B1) ----
+
+    fn sample_order(market_id: MarketId, qty_raw: i128) -> PlaceOrderParams {
+        PlaceOrderParams {
+            market_id,
+            is_buy: true,
+            price: FixedPoint::from_raw(100 * FixedPoint::SCALE),
+            quantity: FixedPoint::from_raw(qty_raw),
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::GTC,
+            reduce_only: false,
+            client_order_id: None,
+        }
+    }
+
+    #[test]
+    fn place_order_batch_canonical_bytes_deterministic_and_distinct() {
+        let p1 = sample_order(1, 10 * FixedPoint::SCALE);
+        let p2 = sample_order(2, 20 * FixedPoint::SCALE);
+        let batch = NativeAction::PlaceOrderBatch(vec![p1.clone(), p2.clone()]);
+
+        // Deterministic: same batch encodes identically every call.
+        assert_eq!(batch.canonical_bytes(), batch.canonical_bytes());
+
+        // Unique tag byte (next free after 0..=24).
+        assert_eq!(batch.canonical_bytes()[0], 25);
+
+        // Order is significant — reordering changes the bytes.
+        let reversed = NativeAction::PlaceOrderBatch(vec![p2.clone(), p1.clone()]);
+        assert_ne!(batch.canonical_bytes(), reversed.canonical_bytes());
+
+        // A batch is never byte-equal to a single PlaceOrder (tag + count framing).
+        let single = NativeAction::PlaceOrder(p1.clone());
+        assert_ne!(batch.canonical_bytes(), single.canonical_bytes());
+
+        // A batch's per-order encoding matches the single-order encoding (sans tag),
+        // proving the shared encoder is used (no divergence between paths).
+        let single_body = &single.canonical_bytes()[1..];
+        let batch_bytes = batch.canonical_bytes();
+        // batch layout: [tag=25][u32 count][order1 body][order2 body]
+        assert_eq!(&batch_bytes[1..5], &2u32.to_be_bytes());
+        assert_eq!(&batch_bytes[5..5 + single_body.len()], single_body);
+
+        // Empty batch is encodable and distinct from a populated one.
+        let empty = NativeAction::PlaceOrderBatch(vec![]);
+        assert_eq!(&empty.canonical_bytes(), &[25u8, 0, 0, 0, 0]);
+        assert_ne!(empty.canonical_bytes(), batch.canonical_bytes());
+
+        // Serde round-trip (bincode is the block wire format) preserves identity.
+        let encoded = bincode::serialize(&batch).unwrap();
+        let back: NativeAction = bincode::deserialize(&encoded).unwrap();
+        assert_eq!(back.canonical_bytes(), batch.canonical_bytes());
     }
 
     #[test]

@@ -1492,4 +1492,48 @@ mod crash_recovery_tests {
             "consumed nonce should be recorded",
         );
     }
+
+    #[test]
+    fn duplicate_committed_native_batch_consumes_nonce_once() {
+        // Phase B / Task B5: a PlaceOrderBatch carries many orders but ONE (sender, nonce),
+        // so committing the same batch twice must execute it once (replay guard at the
+        // per-action (sender, nonce) granularity — the 2e52851 fix, unchanged by batching).
+        let (config, state_db) = make_test_config_and_db();
+        let exec_ctx = make_exec_ctx(&config, &state_db);
+
+        let mk = |market_id: u64| torus_types::PlaceOrderParams {
+            market_id,
+            is_buy: true,
+            price: FixedPoint::from_raw(100 * FixedPoint::SCALE),
+            quantity: FixedPoint::from_raw(FixedPoint::SCALE),
+            order_type: torus_types::OrderType::Limit,
+            time_in_force: torus_types::TimeInForce::GTC,
+            reduce_only: false,
+            client_order_id: None,
+        };
+        let key = k256::ecdsa::SigningKey::from_slice(&[9u8; 32]).unwrap();
+        let signed = torus_types::eip712::sign_native_action(
+            NativeAction::PlaceOrderBatch(vec![mk(1), mk(2), mk(3)]),
+            555_555,
+            &key,
+        );
+        let sender = signed.recover_sender().expect("recover sender");
+
+        // Same batch committed in two consecutive blocks (the proven dup scenario).
+        exec_ctx.execute_committed_block(&make_block(1, vec![signed.clone()]), vec![]);
+        exec_ctx.execute_committed_block(&make_block(2, vec![signed.clone()]), vec![]);
+
+        // Recorded exactly once; the stored value is the FIRST commit height (1),
+        // proving the second commit was skipped (not re-executed / re-written).
+        let nonce_key = torus_state::cf::native_nonce_key(&sender, signed.nonce);
+        let recorded = state_db
+            .get_cf_raw(torus_state::cf::CF_NATIVE_NONCES, &nonce_key)
+            .unwrap()
+            .expect("batch must consume its (sender, nonce) once");
+        assert_eq!(
+            recorded.as_slice(),
+            &1u64.to_be_bytes(),
+            "replay guard must skip the second commit (nonce height stays 1)",
+        );
+    }
 }

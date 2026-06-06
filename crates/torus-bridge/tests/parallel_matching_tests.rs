@@ -428,3 +428,100 @@ fn global_order_ids_unique_across_markets() {
     // Should have consumed exactly 3 IDs
     assert_eq!(ctx.next_global_order_id, initial_id + 3);
 }
+
+// ============================================================================
+// Test 8: PlaceOrderBatch flattens to identical state vs individual orders (B4)
+// ============================================================================
+
+#[test]
+fn place_order_batch_matches_individual_orders() {
+    // --- Run A: one signed batch of 4 orders across 3 markets (one crossing pair) ---
+    let (_dir, db) = open_test_db();
+    let mut ctx_batch = make_ctx(db.clone());
+    let mm = addr(1);
+    fund_native(&ctx_batch, &mm, fp(1_000_000));
+
+    let batch = NativeAction::PlaceOrderBatch(vec![
+        limit_buy(1, 100, 5),
+        limit_buy(2, 200, 3),
+        limit_sell(1, 100, 5), // crosses the market-1 buy above
+        limit_buy(3, 50, 2),
+    ]);
+    let initial_id = ctx_batch.next_global_order_id;
+    let _ = NativeExecutor::execute_batch(&mut ctx_batch, &[(mm, batch)]);
+
+    // --- Run B: the same 4 orders as individual PlaceOrder actions, same order ---
+    let (_dir2, db2) = open_test_db();
+    let mut ctx_indiv = make_ctx(db2.clone());
+    fund_native(&ctx_indiv, &mm, fp(1_000_000));
+
+    let indiv: Vec<(Address, NativeAction)> = vec![
+        (mm, NativeAction::PlaceOrder(limit_buy(1, 100, 5))),
+        (mm, NativeAction::PlaceOrder(limit_buy(2, 200, 3))),
+        (mm, NativeAction::PlaceOrder(limit_sell(1, 100, 5))),
+        (mm, NativeAction::PlaceOrder(limit_buy(3, 50, 2))),
+    ];
+    let result_indiv = NativeExecutor::execute_batch(&mut ctx_indiv, &indiv);
+    for r in &result_indiv.results {
+        assert!(r.success, "individual order failed: {:?}", r.error);
+    }
+
+    // Identical effect: 4 order IDs consumed, same trade count, same reserved margin.
+    assert_eq!(
+        ctx_batch.next_global_order_id,
+        initial_id + 4,
+        "batch must consume exactly 4 global order IDs"
+    );
+    assert_eq!(ctx_batch.next_global_order_id, ctx_indiv.next_global_order_id);
+    assert_eq!(ctx_batch.trade_index, ctx_indiv.trade_index);
+    assert_eq!(
+        ctx_batch
+            .positions
+            .get_native_balance(&mm)
+            .unwrap()
+            .order_margin,
+        ctx_indiv
+            .positions
+            .get_native_balance(&mm)
+            .unwrap()
+            .order_margin,
+        "batched vs individual reserved margin must match"
+    );
+}
+
+// ============================================================================
+// Test 9: A failing order inside a batch is isolated (batch is not all-or-nothing)
+// ============================================================================
+
+#[test]
+fn place_order_batch_failure_isolated() {
+    let (_dir, db) = open_test_db();
+    let mut ctx = make_ctx(db.clone());
+    let mm = addr(1);
+    // Enough margin for 2 of 3 orders (each needs 50); third must fail.
+    fund_native(&ctx, &mm, fp(120));
+
+    let batch = NativeAction::PlaceOrderBatch(vec![
+        limit_buy(1, 100, 10), // margin 50
+        limit_buy(2, 200, 5),  // margin 50
+        limit_buy(3, 100, 10), // margin 50 — only 20 left → fails
+    ]);
+    let result = NativeExecutor::execute_batch(&mut ctx, &[(mm, batch)]);
+
+    // Flattened → one result per order.
+    assert_eq!(result.results.len(), 3);
+    assert!(result.results[0].success, "order 0: {:?}", result.results[0].error);
+    assert!(result.results[1].success, "order 1: {:?}", result.results[1].error);
+    assert!(!result.results[2].success, "order 2 should fail on margin");
+    assert!(result.results[2]
+        .error
+        .as_ref()
+        .unwrap()
+        .contains("insufficient margin"));
+
+    // First two reservations survived the third's failure.
+    assert_eq!(
+        ctx.positions.get_native_balance(&mm).unwrap().order_margin,
+        fp(100)
+    );
+}

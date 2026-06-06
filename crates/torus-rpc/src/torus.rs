@@ -606,6 +606,11 @@ impl TorusApiServer for RpcState {
             let action: torus_types::SignedNativeAction = serde_json::from_slice(&bytes)
                 .map_err(|e| RpcError::InvalidParams(format!("invalid action encoding: {e}")))?;
 
+            // Reject malformed batches (empty / over NATIVE_ORDERS_PER_BATCH_CAP) before
+            // spending an ecrecover on them.
+            torus_mempool::rate_limit::validate_batch_size(&action.action)
+                .map_err(RpcError::InvalidParams)?;
+
             let current_time_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("system clock before epoch")

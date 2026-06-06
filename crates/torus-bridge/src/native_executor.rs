@@ -227,6 +227,22 @@ impl NativeExecutor {
         match action {
             // ---- Order book ----
             NativeAction::PlaceOrder(params) => Self::exec_place_order(ctx, sender, params),
+            // A batch reaching the single-action path (e.g. crash-replay) is routed through
+            // the same flatten + per-market parallel pipeline as the live path, then collapsed
+            // to one summary result. `execute_batch` flattens batches into `PlaceOrder`s, so it
+            // never re-enters this arm — no recursion.
+            NativeAction::PlaceOrderBatch(_) => {
+                let pair = (*sender, action.clone());
+                let batch = Self::execute_batch(ctx, std::slice::from_ref(&pair));
+                let total = batch.results.len();
+                let ok = batch.results.iter().filter(|r| r.success).count();
+                NativeActionResult {
+                    action_type: "place_order_batch",
+                    success: ok == total,
+                    error: (ok != total).then(|| format!("{ok}/{total} orders placed")),
+                    gas_used: batch.total_gas,
+                }
+            }
             NativeAction::CancelOrder { order_id } => Self::exec_cancel_order(ctx, sender, *order_id),
             NativeAction::CancelAllOrders { market_id } => {
                 Self::exec_cancel_all(ctx, sender, *market_id)
@@ -329,6 +345,31 @@ impl NativeExecutor {
         ctx: &mut NativeExecContext<T>,
         actions: &[(Address, NativeAction)],
     ) -> NativeBatchResult {
+        // Flatten any PlaceOrderBatch into individual (sender, PlaceOrder) entries so the
+        // per-market parallel matching pipeline treats batched and singly-submitted orders
+        // identically. Deterministic: actions in slice order, orders in batch order. Zero-copy
+        // on the common no-batch path via Cow::Borrowed.
+        let flattened: std::borrow::Cow<[(Address, NativeAction)]> = if actions
+            .iter()
+            .any(|(_, a)| matches!(a, NativeAction::PlaceOrderBatch(_)))
+        {
+            let mut out = Vec::with_capacity(actions.len());
+            for (sender, action) in actions {
+                match action {
+                    NativeAction::PlaceOrderBatch(orders) => {
+                        for p in orders {
+                            out.push((*sender, NativeAction::PlaceOrder(p.clone())));
+                        }
+                    }
+                    other => out.push((*sender, other.clone())),
+                }
+            }
+            std::borrow::Cow::Owned(out)
+        } else {
+            std::borrow::Cow::Borrowed(actions)
+        };
+        let actions: &[(Address, NativeAction)] = &flattened;
+
         let n = actions.len();
         let mut results: Vec<NativeActionResult> = (0..n)
             .map(|_| NativeActionResult::ok("pending", 0))
@@ -1712,6 +1753,10 @@ pub fn classify_action(action: &NativeAction) -> ActionCategory {
                 TimeInForce::IOC | TimeInForce::FOK => ActionCategory::NonGtcOrder,
             },
         },
+        // A batch is a unit of GTC-class limit orders (the market-maker use case); it
+        // sorts alongside other GTC orders into the post-EVM phase. Internal order is
+        // preserved when `execute_batch` flattens it.
+        NativeAction::PlaceOrderBatch(_) => ActionCategory::GtcOrder,
         NativeAction::ModifyOrder { .. } => ActionCategory::NonGtcOrder,
         NativeAction::TransferToPerp { .. }
         | NativeAction::TransferToSpot { .. }

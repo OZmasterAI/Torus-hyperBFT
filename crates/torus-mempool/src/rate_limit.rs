@@ -44,6 +44,24 @@ pub const NATIVE_POOL_MAX_SIZE: usize = 65536;
 /// selection (actions stay until commit), this must cover burst submissions.
 pub const NATIVE_PER_SENDER_CAP: usize = 512;
 
+/// Max orders a single `PlaceOrderBatch` may carry (Phase B throughput keystone).
+///
+/// Chain-side safety ceiling rejected at RPC ingress + block validation. Clients
+/// (market makers) tune their *actual* batch size up to this bound — that's the
+/// "configurable" knob for finding the throughput sweet spot. Bytes per batch
+/// ≈ size × ~70B, so a full block of batches must stay under
+/// `max_consensus_message_size` — Phase C raises that limit and this cap together.
+pub const NATIVE_ORDERS_PER_BATCH_CAP: usize = 1024;
+
+/// Max total orders (individual `PlaceOrder` + expanded `PlaceOrderBatch`) admitted
+/// per block. Bounds worst-case matching/execution time so block production stays
+/// within the consensus view budget.
+///
+/// NOTE: enforcement is wired into `produce_block` order-aware selection in Phase C
+/// (alongside raising `NATIVE_TOTAL_BLOCK_CAP`). Today selection counts *actions*;
+/// this constant documents the target order ceiling. See `order_count`.
+pub const NATIVE_ORDERS_PER_BLOCK_CAP: usize = 50_000;
+
 // ============================================================================
 // Rate tracker
 // ============================================================================
@@ -164,6 +182,36 @@ impl RateTracker {
             !deque.is_empty()
         });
     }
+}
+
+/// Number of individual orders/operations an action represents.
+///
+/// A `PlaceOrderBatch` counts as its length; every other action counts as 1.
+/// Used for per-block order accounting and for charging rate limits per *order*
+/// rather than per *batch* (so one giant batch can't dodge the rate limiter).
+pub fn order_count(action: &NativeAction) -> usize {
+    match action {
+        NativeAction::PlaceOrderBatch(orders) => orders.len(),
+        _ => 1,
+    }
+}
+
+/// Reject malformed batches at ingress: empty (no-op spam) or larger than
+/// [`NATIVE_ORDERS_PER_BATCH_CAP`]. Non-batch actions always pass.
+pub fn validate_batch_size(action: &NativeAction) -> Result<(), String> {
+    if let NativeAction::PlaceOrderBatch(orders) = action {
+        if orders.is_empty() {
+            return Err("empty PlaceOrderBatch".to_string());
+        }
+        if orders.len() > NATIVE_ORDERS_PER_BATCH_CAP {
+            return Err(format!(
+                "PlaceOrderBatch size {} exceeds NATIVE_ORDERS_PER_BATCH_CAP {}",
+                orders.len(),
+                NATIVE_ORDERS_PER_BATCH_CAP
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Check if a native action type is exempt from rate limiting.
@@ -295,5 +343,49 @@ mod tests {
         }));
         assert!(!is_exempt_action(&NativeAction::ClaimRewards));
         assert!(!is_exempt_action(&NativeAction::CancelOrder { order_id: 1 }));
+    }
+
+    // ---- PlaceOrderBatch caps (Phase B, Task B3) ----
+
+    fn sample_params() -> torus_types::PlaceOrderParams {
+        torus_types::PlaceOrderParams {
+            market_id: 1,
+            is_buy: true,
+            price: torus_types::FixedPoint::from_raw(100),
+            quantity: torus_types::FixedPoint::from_raw(100),
+            order_type: torus_types::OrderType::Limit,
+            time_in_force: torus_types::TimeInForce::GTC,
+            reduce_only: false,
+            client_order_id: None,
+        }
+    }
+
+    #[test]
+    fn order_count_counts_orders_not_actions() {
+        let p = sample_params();
+        assert_eq!(order_count(&NativeAction::CancelOrder { order_id: 1 }), 1);
+        assert_eq!(order_count(&NativeAction::PlaceOrder(p.clone())), 1);
+        assert_eq!(order_count(&NativeAction::PlaceOrderBatch(vec![p.clone(); 5])), 5);
+        assert_eq!(order_count(&NativeAction::PlaceOrderBatch(vec![])), 0);
+    }
+
+    #[test]
+    fn validate_batch_size_rejects_oversize_and_empty() {
+        let p = sample_params();
+
+        // At the cap: accepted.
+        let at_cap = NativeAction::PlaceOrderBatch(vec![p.clone(); NATIVE_ORDERS_PER_BATCH_CAP]);
+        assert!(validate_batch_size(&at_cap).is_ok());
+
+        // One over the cap: rejected.
+        let over = NativeAction::PlaceOrderBatch(vec![p.clone(); NATIVE_ORDERS_PER_BATCH_CAP + 1]);
+        assert!(validate_batch_size(&over).is_err());
+
+        // Empty batch (no-op spam): rejected.
+        assert!(validate_batch_size(&NativeAction::PlaceOrderBatch(vec![])).is_err());
+
+        // Non-batch actions always pass.
+        assert!(validate_batch_size(&NativeAction::CancelOrder { order_id: 1 }).is_ok());
+        assert!(validate_batch_size(&NativeAction::PlaceOrder(p)).is_ok());
     }
 }
