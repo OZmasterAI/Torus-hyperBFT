@@ -188,6 +188,24 @@ impl NativePool {
     }
 
     pub fn select_for_block_with_senders(&mut self, limit: usize) -> Vec<(Address, SignedNativeAction)> {
+        self.select_for_block_with_senders_excluding(limit, &HashSet::new())
+    }
+
+    /// Like `select_for_block_with_senders`, but skips any action whose hash is in
+    /// `exclude`.
+    ///
+    /// Pipeline-aware selection: the proposer passes the action hashes of its
+    /// proposed-but-uncommitted blocks (the in-flight 3-chain window) so the same
+    /// action is not re-selected for blocks N+1/N+2 before N commits and calls
+    /// `remove_committed`. Root-cause fix for duplicate native inclusion (memory
+    /// 282f9818); recovers the ~2/3 of cap-100 block space that dups wasted. Excluded
+    /// actions stay in the pool and become selectable again once their in-flight block
+    /// commits (removing them) or is evicted from the proposer window.
+    pub fn select_for_block_with_senders_excluding(
+        &mut self,
+        limit: usize,
+        exclude: &HashSet<B256>,
+    ) -> Vec<(Address, SignedNativeAction)> {
         self.entries.sort_by(|a, b| {
             let a_pri = if a.is_cancel { 0u8 } else { 1 };
             let b_pri = if b.is_cancel { 0u8 } else { 1 };
@@ -207,6 +225,9 @@ impl NativePool {
         for entry in &self.entries {
             if selected.len() >= limit {
                 break;
+            }
+            if exclude.contains(&entry.action_hash) {
+                continue;
             }
             let count = block_counts.get(&entry.sender).copied().unwrap_or(0);
             if count < self.max_per_block {
@@ -508,5 +529,32 @@ mod tests {
         let drained = pool.drain(10);
         assert_eq!(drained.len(), 4);
         assert_eq!(pool.size(), 2);
+    }
+
+    #[test]
+    fn select_excluding_skips_in_flight_actions() {
+        let mut pool = NativePool::new(100, 64, 16);
+        let sender = Address::repeat_byte(1);
+        for i in 1..=5u64 {
+            pool.insert(sender, make_action(i, NativeAction::ClaimRewards))
+                .unwrap();
+        }
+
+        // Treat a first proposal's actions as in-flight; they must not be re-selected
+        // while still in the proposer window (duplicate-inclusion root cause).
+        let first = pool.select_for_block_with_senders(5);
+        assert_eq!(first.len(), 5);
+        let exclude: HashSet<B256> = first.iter().map(|(_, a)| compute_action_hash(a)).collect();
+
+        let second = pool.select_for_block_with_senders_excluding(5, &exclude);
+        assert!(second.is_empty(), "in-flight actions must not be re-selected");
+        assert_eq!(pool.size(), 5, "selection stays non-destructive");
+
+        // A fresh (non-excluded) action is still selectable past the exclusion set.
+        pool.insert(sender, make_action(99, NativeAction::ClaimRewards))
+            .unwrap();
+        let third = pool.select_for_block_with_senders_excluding(5, &exclude);
+        assert_eq!(third.len(), 1, "only the fresh action is selected");
+        assert_eq!(third[0].1.nonce, 99);
     }
 }

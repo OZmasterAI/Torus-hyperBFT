@@ -370,6 +370,21 @@ impl Mempool {
         self.native.write().unwrap().select_for_block_with_senders(limit)
     }
 
+    /// Pipeline-aware variant: skips actions whose hash is in `exclude` (the
+    /// proposer's in-flight, proposed-but-uncommitted action hashes). Prevents the
+    /// same action being re-selected for blocks N+1/N+2 before N commits — the root
+    /// cause of duplicate native inclusion.
+    pub fn select_native_for_block_with_senders_excluding(
+        &self,
+        limit: usize,
+        exclude: &std::collections::HashSet<B256>,
+    ) -> Vec<(alloy_primitives::Address, SignedNativeAction)> {
+        self.native
+            .write()
+            .unwrap()
+            .select_for_block_with_senders_excluding(limit, exclude)
+    }
+
     /// Remove native actions that were included in a committed block.
     pub fn remove_committed_native(&self, hashes: &[B256]) {
         self.native.write().unwrap().remove_committed(hashes);

@@ -300,11 +300,36 @@ impl ExecutionContext {
 
             let mut sender_actions = Vec::with_capacity(torus_block.native_actions.len());
             let mut consumed_nonces = Vec::new();
+            // Defense-in-depth replay guard. The non-destructive mempool selection ×
+            // HotStuff 3-chain pipeline re-includes the same action in consecutive
+            // blocks before the first commits and calls `remove_committed_native`
+            // (memory b206f59c / 282f9818). Without this guard each inclusion
+            // re-executed — proven on devnet, one TransferToPerp credited 3x. Skip any
+            // (sender, nonce) already consumed by a prior committed block — mirrors the
+            // sync/catchup check in torus-bridge validator.rs — so each action executes
+            // at most once even when included 2-3x. `seen_in_block` also dedups a
+            // (sender, nonce) repeated within a single block.
+            let mut seen_in_block = std::collections::HashSet::new();
             for (i, signed) in torus_block.native_actions.iter().enumerate() {
                 let Some(sender) = resolved_senders.get(i).copied().flatten() else {
                     tracing::error!(index = i, "INVALID SIG in attested block — skipping action");
                     continue;
                 };
+                let nonce_key = torus_state::cf::native_nonce_key(&sender, signed.nonce);
+                let already_committed = self
+                    .state_db
+                    .get_cf_raw(torus_state::cf::CF_NATIVE_NONCES, &nonce_key)
+                    .unwrap_or(None)
+                    .is_some();
+                if already_committed || !seen_in_block.insert((sender, signed.nonce)) {
+                    tracing::warn!(
+                        %sender,
+                        nonce = signed.nonce,
+                        height,
+                        "skipping duplicate/replayed native action on live commit path"
+                    );
+                    continue;
+                }
                 consumed_nonces.push((sender, signed.nonce));
                 sender_actions.push((sender, signed.action.clone()));
             }
@@ -335,9 +360,7 @@ impl ExecutionContext {
             ctx.save_order_books();
 
             for (sender, nonce) in &consumed_nonces {
-                let mut nonce_key = [0u8; 28];
-                nonce_key[..20].copy_from_slice(sender.as_slice());
-                nonce_key[20..28].copy_from_slice(&nonce.to_be_bytes());
+                let nonce_key = torus_state::cf::native_nonce_key(sender, *nonce);
                 let _ = overlay.put_cf_raw(
                     torus_state::cf::CF_NATIVE_NONCES,
                     &nonce_key,
@@ -822,7 +845,20 @@ impl App<RocksKVStore> for TorusApp {
             } else {
                 parent_header.evm_gas_limit
             };
-            let native = mempool.select_native_for_block_with_senders(torus_mempool::rate_limit::NATIVE_TOTAL_BLOCK_CAP);
+            // Pipeline-aware selection: exclude actions already carried by our
+            // in-flight (proposed-but-uncommitted) blocks so the non-destructive pool
+            // does not re-select them for N+1/N+2 before N commits and calls
+            // `remove_committed_native` — the root cause of duplicate native inclusion
+            // (memory 282f9818). `pending_proposals` is exactly that in-flight window.
+            let in_flight: std::collections::HashSet<torus_types::B256> = self
+                .pending_proposals
+                .values()
+                .flat_map(|b| b.native_actions.iter().map(torus_types::compute_action_hash))
+                .collect();
+            let native = mempool.select_native_for_block_with_senders_excluding(
+                torus_mempool::rate_limit::NATIVE_TOTAL_BLOCK_CAP,
+                &in_flight,
+            );
             let evm = mempool.drain_evm(gas_limit, parent_header.state_root);
             if !evm.is_empty() || !native.is_empty() {
                 tracing::info!(evm_txs = evm.len(), native_actions = native.len(), "selected actions for block");
@@ -1201,7 +1237,7 @@ impl App<RocksKVStore> for TorusApp {
 #[cfg(test)]
 mod crash_recovery_tests {
     use super::*;
-    use torus_types::{Bloom, NativeAction, SignedNativeAction, B256};
+    use torus_types::{Bloom, FixedPoint, NativeAction, SignedNativeAction, B256, U256};
 
     fn make_test_config_and_db() -> (ChainConfig, StateDb) {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -1355,6 +1391,105 @@ mod crash_recovery_tests {
             read_native_applied_height(&state_db),
             Some(3),
             "empty block should be marked as applied"
+        );
+    }
+
+    // ---- live-path replay dedup (duplicate native inclusion) ----
+
+    /// Build an `ExecutionContext` directly (mirrors `TorusApp::new`) so a test can
+    /// drive `execute_committed_block` for several heights synchronously.
+    fn make_exec_ctx(config: &ChainConfig, state_db: &StateDb) -> ExecutionContext {
+        ExecutionContext {
+            state_db: state_db.clone(),
+            validator: BlockValidator::new(
+                config.chain_id,
+                config.epoch_length,
+                config.max_validators,
+                config.treasury_address,
+                config.dev_pool_address,
+            ),
+            evm_executor: EvmExecutor::new(config.chain_id),
+            staking: StakingManager::new(state_db.clone()),
+            epoch_length: config.epoch_length,
+            max_validators: config.max_validators,
+            treasury_address: config.treasury_address,
+            dev_pool_address: config.dev_pool_address,
+            metrics: None,
+        }
+    }
+
+    /// Seed an EVM balance into CF_ACCOUNTS (72-byte record: balance ++ nonce ++ code_hash).
+    /// `Lockbox::get_evm_balance` reads the first 32 bytes big-endian.
+    fn fund_evm_balance(state_db: &StateDb, addr: Address, balance: U256) {
+        let mut rec = vec![0u8; 72];
+        rec[..32].copy_from_slice(&balance.to_be_bytes::<32>());
+        state_db
+            .put_cf_raw(torus_state::cf::CF_ACCOUNTS, addr.as_slice(), &rec)
+            .unwrap();
+    }
+
+    fn read_evm_balance(state_db: &StateDb, addr: Address) -> U256 {
+        match state_db
+            .get_cf_raw(torus_state::cf::CF_ACCOUNTS, addr.as_slice())
+            .unwrap()
+        {
+            Some(d) if d.len() >= 32 => U256::from_be_slice(&d[..32]),
+            _ => U256::ZERO,
+        }
+    }
+
+    /// REGRESSION (correctness/fund-safety): an identical native action committed in
+    /// several consecutive blocks must be EXECUTED exactly once.
+    ///
+    /// The non-destructive mempool selection × HotStuff 3-chain pipeline re-includes
+    /// the same action in blocks N, N+1, N+2 before N commits (memory b206f59c). The
+    /// live commit path had NO per-(sender,nonce) replay guard, so each inclusion
+    /// re-executed — proven on devnet: one TransferToPerp credited 3x
+    /// (devnet/scripts/native-transfer-probe.py). Here we commit the SAME signed
+    /// TransferToPerp in three blocks and assert the sender's EVM balance is debited
+    /// for exactly ONE deposit (not three).
+    #[test]
+    fn duplicate_committed_native_action_executes_once() {
+        let (config, state_db) = make_test_config_and_db();
+        let exec_ctx = make_exec_ctx(&config, &state_db);
+
+        // amount is a raw 8-decimal FixedPoint (u256_to_fp), NOT 18-decimal wei.
+        let amount_raw: u128 = FixedPoint::ONE.raw() as u128; // 1.0 == 100_000_000
+        let amount = U256::from(amount_raw);
+        let key = k256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap();
+        let signed = torus_types::eip712::sign_native_action(
+            NativeAction::TransferToPerp { amount },
+            424_242,
+            &key,
+        );
+        let sender = signed.recover_sender().expect("recover sender");
+
+        // Fund enough EVM balance for THREE deposits, so the only thing that can stop
+        // a 2nd/3rd execution is correct dedup — never insufficient funds.
+        let start_balance = amount * U256::from(10u8);
+        fund_evm_balance(&state_db, sender, start_balance);
+
+        // Same action committed in three consecutive blocks (the proven bug scenario).
+        for height in 1..=3u64 {
+            exec_ctx.execute_committed_block(&make_block(height, vec![signed.clone()]), vec![]);
+        }
+
+        let evm_after = read_evm_balance(&state_db, sender);
+        let debited = start_balance - evm_after;
+        assert_eq!(
+            debited, amount,
+            "TransferToPerp committed in 3 blocks must debit EVM balance ONCE (got {debited}, \
+             expected {amount}); duplicate execution = fund-safety bug",
+        );
+
+        // The consumed nonce must be recorded in CF_NATIVE_NONCES.
+        let nonce_key = torus_state::cf::native_nonce_key(&sender, signed.nonce);
+        assert!(
+            state_db
+                .get_cf_raw(torus_state::cf::CF_NATIVE_NONCES, &nonce_key)
+                .unwrap()
+                .is_some(),
+            "consumed nonce should be recorded",
         );
     }
 }

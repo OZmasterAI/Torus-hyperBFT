@@ -53,6 +53,19 @@ pub const CF_JAIL_VOTES: &str = "cf_jail_votes";
 /// Consumed EIP-712 nonces. Key: sender(20) ++ nonce(8 BE). Value: block_height(8 BE).
 pub const CF_NATIVE_NONCES: &str = "cf_native_nonces";
 
+/// Build the [`CF_NATIVE_NONCES`] key for a `(sender, nonce)` pair: sender(20) ++ nonce(8 BE).
+///
+/// Single source of truth for the replay-protection key layout. Used by the
+/// live-execution replay guard and nonce-write loop (torus-consensus app.rs) and the
+/// sync/catchup validator (torus-bridge validator.rs); keep them in lock-step via this
+/// helper so the key format can never silently drift between read and write paths.
+pub fn native_nonce_key(sender: &alloy_primitives::Address, nonce: u64) -> [u8; 28] {
+    let mut key = [0u8; 28];
+    key[..20].copy_from_slice(sender.as_slice());
+    key[20..28].copy_from_slice(&nonce.to_be_bytes());
+    key
+}
+
 // Session keys
 /// Session key storage. Key: ed25519 pubkey (32 bytes). Value: JSON-encoded SessionData.
 pub const CF_SESSIONS: &str = "cf_sessions";

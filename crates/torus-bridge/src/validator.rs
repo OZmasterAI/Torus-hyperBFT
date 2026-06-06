@@ -341,9 +341,7 @@ impl BlockValidator {
                 ))
             })?;
             // Replay check: reject blocks containing replayed nonces.
-            let mut nonce_key = [0u8; 28];
-            nonce_key[..20].copy_from_slice(sender.as_slice());
-            nonce_key[20..28].copy_from_slice(&signed.nonce.to_be_bytes());
+            let nonce_key = torus_state::cf::native_nonce_key(&sender, signed.nonce);
             if state_db
                 .get_cf_raw(torus_state::cf::CF_NATIVE_NONCES, &nonce_key)
                 .unwrap_or(None)
