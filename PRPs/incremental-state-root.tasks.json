@@ -1,0 +1,72 @@
+{
+  "prp": "incremental-state-root",
+  "created": "2026-06-06T18:02:00",
+  "goal": "Phase A Option A: persistent incremental state root (reth-trie-sparse EVM + keyed SMT native). Kill O(total-state) root recompute (2x/block on consensus thread). EVM-first; behind determinism gate (incremental == full-scan).",
+  "branch_suggestion": "phase-a-incremental-root",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "A1.1: Trie-node CF layout + DB-backed TrieNodeProvider over CF_TRIE_ACCOUNTS/STORAGE",
+      "status": "pending",
+      "files": ["crates/torus-state/src/trie.rs", "crates/torus-state/src/cf.rs"],
+      "validate": "cargo test -p torus-state trie_node_provider",
+      "depends_on": []
+    },
+    {
+      "id": 2,
+      "name": "A1.2: One-time migration build_trie_to_cf; persisted root == compute_state_root_from_db",
+      "status": "pending",
+      "files": ["crates/torus-state/src/trie.rs"],
+      "validate": "cargo test -p torus-state trie_migration_root_matches_full_scan",
+      "depends_on": [1]
+    },
+    {
+      "id": 3,
+      "name": "A1.3: incremental_evm_root(db,bundle)->(root,TrieUpdates) via SparseStateTrie; EVM determinism gate",
+      "status": "pending",
+      "files": ["crates/torus-state/src/trie.rs", "crates/torus-bridge/src/state_root.rs"],
+      "validate": "cargo test -p torus-state incremental_evm_root_equals_full_scan",
+      "depends_on": [2]
+    },
+    {
+      "id": 4,
+      "name": "A1.4: Persist TrieUpdates in the commit WriteBatch (crash-consistent); survives reopen",
+      "status": "pending",
+      "files": ["crates/torus-state/src/committer.rs", "crates/torus-consensus/src/app.rs"],
+      "validate": "cargo test -p torus-state trie_survives_crash_reopen",
+      "depends_on": [3]
+    },
+    {
+      "id": 5,
+      "name": "A1.5: Swap EVM callsites to incremental; full-scan debug oracle + StateRootMismatch net",
+      "status": "pending",
+      "files": ["crates/torus-bridge/src/proposer.rs", "crates/torus-bridge/src/validator.rs", "crates/torus-bridge/src/state_root.rs"],
+      "validate": "cargo test -p torus-bridge -p torus-consensus",
+      "depends_on": [4]
+    },
+    {
+      "id": 6,
+      "name": "A1.6: Scaling proof - root time flat vs state size (1k/100k/1M); devnet sub-100ms at scale",
+      "status": "pending",
+      "files": ["tools/bench-throughput/src/main.rs"],
+      "validate": "bench: incremental root time flat as state grows (vs full-scan growth)",
+      "depends_on": [5]
+    },
+    {
+      "id": 200,
+      "name": "A2: Native incremental root (keyed SMT/Merkle over CF_NATIVE_TRIE, update from overlay dirty keys) - MILESTONE, own -impl.md",
+      "status": "blocked",
+      "files": ["crates/torus-state/src/trie.rs", "crates/torus-state/src/backend.rs", "crates/torus-bridge/src/state_root.rs"],
+      "validate": "TBD: incremental native root == compute_native_state_root over corpus + crash/reopen",
+      "depends_on": [6]
+    },
+    {
+      "id": 210,
+      "name": "Cross-cutting: determinism CI gate target + lag/sync (validate_block_for_sync) verification - MILESTONE",
+      "status": "blocked",
+      "files": ["crates/torus-integration-tests/tests/chaos.rs", "crates/torus-bridge/src/validator.rs"],
+      "validate": "TBD: incremental==full corpus in CI; sync path validates roots; four_node_consensus green",
+      "depends_on": [6]
+    }
+  ]
+}
