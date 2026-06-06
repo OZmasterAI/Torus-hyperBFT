@@ -12,7 +12,7 @@ Requires: pip install eth-keys pycryptodome requests
 import json
 import os
 import random
-import struct
+import signal
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -27,6 +27,7 @@ from eth_keys import KeyAPI
 RPC_URL = sys.argv[1] if len(sys.argv) > 1 else "http://localhost:8545"
 NUM_SENDERS = int(sys.argv[2]) if len(sys.argv) > 2 else 100
 TARGET_OPS = int(sys.argv[3]) if len(sys.argv) > 3 else 200  # target orders/sec
+DURATION = int(sys.argv[4]) if len(sys.argv) > 4 else 0  # seconds; 0 = until signal
 CHAIN_ID = 7778
 MARKET_ID = 1
 MAX_WORKERS = 32
@@ -261,12 +262,20 @@ def get_block_number() -> int:
 
 
 def get_block_native_count(height: int) -> int:
-    """Get native action count from a block."""
-    r = rpc_call("torus_getBlockBody", [hex(height)])
+    """Get native action count from a block. torus_getBlockBody takes a u64
+    (NOT hex) and returns camelCase fields -> nativeActionCount."""
+    r = rpc_call("torus_getBlockBody", [height])
     if "result" in r and r["result"]:
-        body = r["result"]
-        return len(body.get("native_actions", []))
+        return int(r["result"].get("nativeActionCount", 0))
     return 0
+
+
+def get_block_native_actions(height: int) -> list:
+    """Return the raw native action JSON values committed in `height`."""
+    r = rpc_call("torus_getBlockBody", [height])
+    if "result" in r and r["result"]:
+        return r["result"].get("nativeActions", []) or []
+    return []
 
 
 def submit_action(payload: str, url: str = RPC_URL) -> dict:
@@ -286,7 +295,7 @@ QTY_MAX = 100_000_000  # 1.0
 
 
 def main():
-    print(f"=== Torus Native Order Flood ===")
+    print("=== Torus Native Order Flood ===")
     print(f"RPC:     {RPC_URL}")
     print(f"Senders: {NUM_SENDERS}")
     print(f"Target:  {TARGET_OPS} orders/sec")
@@ -307,9 +316,12 @@ def main():
     print(f"  last:  {keys[-1][1]}")
     print()
 
-    # RPC endpoints — distribute across all 4 validators + rpc for throughput
+    # RPC endpoints — distribute across all 4 validators + rpc for throughput.
+    # NOTE: validator-0 host RPC is remapped to 8645 (8545 belongs to the live
+    # testnet on this host — see devnet/docker-compose.yml). 8545 deliberately
+    # excluded so the flood never hits the testnet.
     endpoints = []
-    for port in [8545, 8546, 8547, 8548, 8549]:
+    for port in [8645, 8546, 8547, 8548, 8549]:
         try:
             r = rpc_call("eth_blockNumber", [], f"http://localhost:{port}")
             if "result" in r:
@@ -333,74 +345,82 @@ def main():
     batch_size = min(NUM_SENDERS, MAX_WORKERS)
     last_report = time.time()
 
-    print(f"Flooding... (Ctrl+C to stop)")
+    stop = [False]
+
+    def _handle_stop(_signum, _frame):
+        stop[0] = True
+
+    signal.signal(signal.SIGINT, _handle_stop)
+    signal.signal(signal.SIGTERM, _handle_stop)
+
+    note = f"auto-stop after {DURATION}s" if DURATION else "until SIGINT/SIGTERM"
+    print(f"Flooding... ({note})")
     print(
         f"{'time':>8} | {'sub':>6} | {'ok':>6} | {'err':>5} | {'ops/s':>7} | {'blk':>8} | native/blk"
     )
     print("-" * 80)
 
-    try:
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-            while True:
-                futures = []
-                batch_start = time.time()
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        while not stop[0]:
+            futures = []
+            batch_start = time.time()
 
-                for _ in range(batch_size):
-                    idx = random.randrange(len(keys))
-                    pk, addr = keys[idx]
-                    is_buy = random.random() > 0.5
-                    price = random.randint(PRICE_MIN, PRICE_MAX)
-                    qty = random.randint(QTY_MIN, QTY_MAX)
-                    nonce_ms = int(time.time() * 1000)
-                    # Add per-sender offset to avoid nonce collisions
-                    offset = nonce_counters.get(idx, 0)
-                    nonce_counters[idx] = offset + 1
-                    nonce = nonce_ms + offset
+            for _ in range(batch_size):
+                idx = random.randrange(len(keys))
+                pk, addr = keys[idx]
+                is_buy = random.random() > 0.5
+                price = random.randint(PRICE_MIN, PRICE_MAX)
+                qty = random.randint(QTY_MIN, QTY_MAX)
+                nonce_ms = int(time.time() * 1000)
+                # Add per-sender offset to avoid nonce collisions
+                offset = nonce_counters.get(idx, 0)
+                nonce_counters[idx] = offset + 1
+                nonce = nonce_ms + offset
 
-                    payload = sign_place_order(pk, MARKET_ID, is_buy, price, qty, nonce)
-                    ep = endpoints[submitted % len(endpoints)]
-                    futures.append(pool.submit(submit_action, payload, ep))
-                    submitted += 1
+                payload = sign_place_order(pk, MARKET_ID, is_buy, price, qty, nonce)
+                ep = endpoints[submitted % len(endpoints)]
+                futures.append(pool.submit(submit_action, payload, ep))
+                submitted += 1
 
-                for f in as_completed(futures):
-                    result = f.result()
-                    if "result" in result and result["result"]:
-                        accepted += 1
-                    else:
-                        errors += 1
+            for f in as_completed(futures):
+                result = f.result()
+                if "result" in result and result["result"]:
+                    accepted += 1
+                else:
+                    errors += 1
 
-                elapsed = time.time() - start_time
-                if time.time() - last_report >= POLL_INTERVAL:
-                    cur_block = get_block_number()
-                    blocks_delta = cur_block - start_block
-                    native_rate = "?"
-                    if blocks_delta > 0:
-                        # Sample last block's native count
-                        nc = get_block_native_count(cur_block - 1)
-                        native_rate = str(nc)
+            elapsed = time.time() - start_time
+            if time.time() - last_report >= POLL_INTERVAL:
+                cur_block = get_block_number()
+                blocks_delta = cur_block - start_block
+                native_rate = "?"
+                if blocks_delta > 0:
+                    # Sample last block's native count
+                    nc = get_block_native_count(cur_block - 1)
+                    native_rate = str(nc)
 
-                    ops_s = accepted / max(elapsed, 0.01)
-                    print(
-                        f"{elapsed:7.1f}s | {submitted:6d} | {accepted:6d} | {errors:5d} "
-                        f"| {ops_s:6.0f}/s | #{cur_block:>6d} | {native_rate}"
-                    )
-                    last_report = time.time()
+                ops_s = accepted / max(elapsed, 0.01)
+                print(
+                    f"{elapsed:7.1f}s | {submitted:6d} | {accepted:6d} | {errors:5d} "
+                    f"| {ops_s:6.0f}/s | #{cur_block:>6d} | {native_rate}"
+                )
+                last_report = time.time()
 
-                # Pace to target rate
-                batch_elapsed = time.time() - batch_start
-                target_elapsed = batch_size * delay
-                if batch_elapsed < target_elapsed:
-                    time.sleep(target_elapsed - batch_elapsed)
+            if DURATION and elapsed >= DURATION:
+                break
 
-    except KeyboardInterrupt:
-        elapsed = time.time() - start_time
-        cur_block = get_block_number()
-        print()
-        print(f"Stopped after {submitted} orders ({errors} errors) in {elapsed:.1f}s")
-        print(f"  accepted: {accepted} ({accepted / max(elapsed, 0.01):.0f}/s)")
-        print(
-            f"  blocks:   {start_block} → {cur_block} ({cur_block - start_block} blocks)"
-        )
+            # Pace to target rate
+            batch_elapsed = time.time() - batch_start
+            target_elapsed = batch_size * delay
+            if batch_elapsed < target_elapsed:
+                time.sleep(target_elapsed - batch_elapsed)
+
+    elapsed = time.time() - start_time
+    cur_block = get_block_number()
+    print()
+    print(f"Stopped after {submitted} orders ({errors} errors) in {elapsed:.1f}s")
+    print(f"  accepted: {accepted} ({accepted / max(elapsed, 0.01):.0f}/s)")
+    print(f"  blocks:   {start_block} -> {cur_block} ({cur_block - start_block} blocks)")
 
 
 if __name__ == "__main__":
