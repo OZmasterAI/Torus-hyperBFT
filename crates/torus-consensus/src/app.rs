@@ -1625,6 +1625,66 @@ mod crash_recovery_tests {
         }
     }
 
+    /// One PlaceOrderBatch action carrying `n_orders` orders (dummy signature — the
+    /// proposal-size test below only measures encoded bytes; `compute_action_hash`
+    /// omits the signature). Mirrors the bench's bs=N order shape.
+    fn big_order_batch_action(nonce: u64, n_orders: usize) -> SignedNativeAction {
+        use torus_types::{ActionSignature, OrderType, PlaceOrderParams, Signature, TimeInForce};
+        let order = PlaceOrderParams {
+            market_id: 1,
+            is_buy: true,
+            price: FixedPoint::from_raw(6_000_000_000_000),
+            quantity: FixedPoint::from_raw(FixedPoint::SCALE),
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::GTC,
+            reduce_only: false,
+            client_order_id: None,
+        };
+        SignedNativeAction {
+            action: NativeAction::PlaceOrderBatch(vec![order; n_orders]),
+            nonce,
+            signature: ActionSignature::Eip712(Signature { v: 27, r: [0u8; 32], s: [0u8; 32] }),
+        }
+    }
+
+    /// Task 9 (scale milestone, deterministic proof): the bs=500 flood collapsed
+    /// because a block of ~50k orders serializes to ~2.5 MB as a FULL TorusBlock —
+    /// far over the 256 KB `max_consensus_message_size` — so the proposal could not
+    /// disseminate and the chain stalled (mem 41ca452). The COMPACT encoding carries
+    /// only action hashes, so the SAME block fits comfortably: this is the encoding
+    /// change that lets the bs=500 flood hold and unblocks the path to 400k orders/sec.
+    #[test]
+    fn compact_proposal_holds_where_full_block_collapsed_at_bs500() {
+        // torus-network NetworkConfig default (config.rs:79).
+        const MAX_CONSENSUS_MESSAGE_SIZE: usize = 256 * 1024;
+
+        // The bs=500 block shape: 100 actions x 500-order batches = 50k orders.
+        let actions: Vec<SignedNativeAction> =
+            (0..100).map(|i| big_order_batch_action(i as u64, 500)).collect();
+        let block = make_block(9, actions);
+
+        let full = encode_proposal_datum(&block, false);
+        let compact = encode_proposal_datum(&block, true);
+
+        assert!(
+            full.len() > MAX_CONSENSUS_MESSAGE_SIZE,
+            "full block ({} bytes) exceeds the 256KB consensus limit — reproduces the bs=500 collapse",
+            full.len()
+        );
+        assert!(
+            compact.len() < MAX_CONSENSUS_MESSAGE_SIZE,
+            "compact block ({} bytes) fits the 256KB consensus limit — the fix",
+            compact.len()
+        );
+        // Bodies are entirely out-of-band: compact is orders-of-magnitude smaller.
+        assert!(
+            compact.len() * 50 < full.len(),
+            "compact ({} bytes) must be >50x smaller than full ({} bytes)",
+            compact.len(),
+            full.len()
+        );
+    }
+
     #[test]
     fn compactblock_reconstructs_from_da_store() {
         // Reproduction of the livelock fix: a CompactBlock referencing a native body
