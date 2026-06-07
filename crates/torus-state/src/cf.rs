@@ -66,6 +66,16 @@ pub fn native_nonce_key(sender: &alloy_primitives::Address, nonce: u64) -> [u8; 
     key
 }
 
+// Native-action data-availability (DA) body store (Phase C: native-action DA)
+/// Durable native-action bodies keyed by 32-byte action-hash. Value: bincode(SignedNativeAction).
+///
+/// DECOUPLED from the 60s nonce-staleness gate (NONCE_WINDOW_MS) that gates mempool
+/// admission, so a body referenced by a proposed/committed CompactBlock is always
+/// reconstructable even after the nonce window expires or the process restarts
+/// (livelock root cause, mem 28e1a821). Push-primary, fetch-rare: mirrored on every
+/// ingest/produce/receive path; served by-hash on a miss via /torus/native-da/1.0.
+pub const CF_NATIVE_PENDING: &str = "cf_native_pending";
+
 // Session keys
 /// Session key storage. Key: ed25519 pubkey (32 bytes). Value: JSON-encoded SessionData.
 pub const CF_SESSIONS: &str = "cf_sessions";
@@ -114,6 +124,7 @@ pub const ALL_CF_NAMES: &[&str] = &[
     CF_SLASH_RECORDS,
     CF_JAIL_VOTES,
     CF_NATIVE_NONCES,
+    CF_NATIVE_PENDING,
     CF_SESSIONS,
     CF_CORE_WRITER_QUEUE,
     CF_CONSENSUS_META,
