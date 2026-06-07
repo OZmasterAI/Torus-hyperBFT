@@ -871,6 +871,13 @@ impl App<RocksKVStore> for TorusApp {
         let native_actions: Vec<torus_types::SignedNativeAction> =
             native_with_senders.iter().map(|(_, a)| a.clone()).collect();
 
+        // Proposer guarantee: mirror every referenced body to the durable DA store
+        // so any validator can reconstruct the block out-of-band, even when it is
+        // compact (push-primary, pull-rare). Livelock fix (mem 28e1a821).
+        if let Some(ref mempool) = self.mempool {
+            mempool.mirror_native_to_da(&native_actions);
+        }
+
         let sig_attestation = match self.signing_key {
             Some(ref key) => torus_bridge::proposer::generate_sig_attestation(&native_actions, key),
             None => [0u8; 64],

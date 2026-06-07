@@ -15,7 +15,7 @@ pub mod validate;
 use std::sync::RwLock;
 
 use alloy_primitives::B256;
-use torus_state::StateDb;
+use torus_state::{NativeDaStore, StateDb};
 use torus_types::SignedNativeAction;
 
 pub use crate::error::MempoolError;
@@ -83,6 +83,8 @@ pub struct Mempool {
     native: RwLock<native_pool::NativePool>,
     rate_tracker: RwLock<rate_limit::RateTracker>,
     state: StateDb,
+    /// Durable, nonce-gate-decoupled native-action body store (out-of-band DA).
+    da_store: NativeDaStore,
     config: MempoolConfig,
     /// Approximate total memory used by pooled transactions (Phase 3: 3.1.7).
     memory_used: std::sync::atomic::AtomicUsize,
@@ -105,11 +107,15 @@ impl Mempool {
             config.evm_rate_limit_per_window,
             config.native_rate_limit_per_window,
         );
+        // DA store shares the same RocksDB handle; every native-action body the
+        // mempool sees is mirrored here durably (decoupled from the nonce gate).
+        let da_store = NativeDaStore::new(state.clone());
         Self {
             evm: RwLock::new(evm_pool::EvmPool::new()),
             native: RwLock::new(native_pool),
             rate_tracker: RwLock::new(tracker),
             state,
+            da_store,
             config,
             memory_used: std::sync::atomic::AtomicUsize::new(0),
             native_gossip_tx: std::sync::OnceLock::new(),
@@ -235,6 +241,8 @@ impl Mempool {
             .validate(current_time_ms, self.config.chain_id)
             .map_err(|e| MempoolError::NativeValidationFailed(e.to_string()))?;
         self.submit_native_action(sender, action.clone())?;
+        // Mirror the admitted body to the durable DA store (out-of-band delivery).
+        self.mirror_to_da(&action);
         self.gossip_native_action(sender, &action);
         Ok(())
     }
@@ -263,6 +271,8 @@ impl Mempool {
         }
 
         self.submit_native_action(sender, action.clone())?;
+        // Mirror the admitted body to the durable DA store (out-of-band delivery).
+        self.mirror_to_da(&action);
         self.gossip_native_action(sender, &action);
         Ok(())
     }
@@ -275,6 +285,12 @@ impl Mempool {
         sender: alloy_primitives::Address,
         action: SignedNativeAction,
     ) -> Result<(), MempoolError> {
+        // DA store is DECOUPLED from the 60s nonce gate: a pushed/gossiped body is
+        // (or will be) block-referenced, so mirror it durably even when it is too
+        // stale for mempool admission -- otherwise the referencing block can never
+        // be reconstructed and consensus wedges (livelock root cause, mem 28e1a821).
+        self.mirror_to_da(&action);
+
         let current_time_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system clock before epoch")
@@ -345,6 +361,8 @@ impl Mempool {
 
     /// Re-insert previously drained native actions (e.g., after reorg).
     pub fn reinsert_native(&self, actions: Vec<SignedNativeAction>) {
+        // Keep the DA-store invariant: every pooled body stays reconstructable.
+        self.mirror_native_to_da(&actions);
         let mut pool = self.native.write().unwrap();
         pool.reinsert(actions);
     }
@@ -357,6 +375,40 @@ impl Mempool {
     /// Look up a native action by its hash (for compact block reconstruction).
     pub fn get_native_by_hash(&self, hash: &B256) -> Option<SignedNativeAction> {
         self.native.read().unwrap().get_by_hash(hash)
+    }
+
+    /// Look up a native-action body in the durable DA store by hash.
+    ///
+    /// The DA store is the durable, nonce-gate-decoupled superset of the in-memory
+    /// pool, so a block-referenced body survives the 60s nonce window, pool
+    /// eviction, and a process restart. Compact-block reconstruction MUST use this
+    /// (not the ephemeral pool) to avoid the missing-body livelock (mem 28e1a821).
+    pub fn get_native_da(&self, hash: &B256) -> Option<SignedNativeAction> {
+        match self.da_store.get(hash) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!("native DA store read failed: {e}");
+                None
+            }
+        }
+    }
+
+    /// Mirror native-action bodies into the durable DA store (proposer guarantee:
+    /// every body referenced by a block we propose stays reconstructable).
+    pub fn mirror_native_to_da(&self, actions: &[SignedNativeAction]) {
+        for action in actions {
+            self.mirror_to_da(action);
+        }
+    }
+
+    /// Best-effort durable mirror of one native-action body. A DA write failure is
+    /// logged, never propagated: it must not fail an ingest path (the rare
+    /// pull-fallback is the safety net), but it is loud because a lost body can
+    /// later force a fetch or, worst case, a stall.
+    fn mirror_to_da(&self, action: &SignedNativeAction) {
+        if let Err(e) = self.da_store.put(action) {
+            tracing::error!("native DA store write failed: {e}");
+        }
     }
 
     /// Select native actions for a block proposal WITHOUT removing them.
