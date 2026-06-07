@@ -94,6 +94,25 @@ pub fn build_trie_to_cf(db: &StateDb) -> Result<B256, StateError> {
     Ok(root)
 }
 
+/// Ensure the persistent trie + hashed mirror exist, building them once from the current plain
+/// state if absent (idempotent boot helper). Returns `true` if a build was performed.
+///
+/// [`commit_evm_bundle_incremental`] persists plain state, the hashed mirror, and the trie nodes
+/// in one atomic batch, so `CF_HASHED_*`/`CF_TRIE_*` advance in lockstep with `CF_ACCOUNTS`; this
+/// therefore only does work on the first boot after Phase A is enabled (or after a fresh genesis).
+pub fn ensure_trie_built(db: &StateDb) -> Result<bool, StateError> {
+    let cf = db.cf_handle(CF_HASHED_ACCOUNTS)?;
+    let mut iter = db.inner().raw_iterator_cf(cf);
+    iter.seek_to_first();
+    let already_built = iter.valid();
+    iter.status()?;
+    if already_built {
+        return Ok(false);
+    }
+    build_trie_to_cf(db)?;
+    Ok(true)
+}
+
 /// `true` if `info` is an EIP-161 "empty" account (zero nonce, zero balance, no code) — such
 /// accounts are excluded from the state trie.
 fn is_empty_account(info: &AccountInfo) -> bool {

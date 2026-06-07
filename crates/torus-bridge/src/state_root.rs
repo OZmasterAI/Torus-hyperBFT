@@ -15,6 +15,44 @@ use torus_state::trie::{
     compute_composite_root, compute_state_root, compute_storage_root, TrieAccount, EMPTY_ROOT_HASH,
 };
 
+/// Runtime switch (default OFF): compute the EVM state root incrementally instead of by full scan.
+/// Off by default so the proven full-scan path stays primary until the incremental path is
+/// validated on a live devnet (Phase A, flag-gated rollout).
+fn incremental_state_root_enabled() -> bool {
+    std::env::var("TORUS_INCREMENTAL_STATE_ROOT")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// EVM post-bundle root honoring the incremental flag. Split out with an explicit `incremental`
+/// param so both paths are unit-testable without touching process env.
+fn evm_root_routed(
+    state_db: &StateDb,
+    bundle: &BundleState,
+    incremental: bool,
+) -> Result<B256, StateError> {
+    if !incremental {
+        return compute_post_bundle_evm_root(state_db, bundle);
+    }
+    let (root, _updates) = torus_state::incremental::incremental_evm_root(state_db, bundle)?;
+    // Runtime determinism oracle: under debug or TORUS_INCREMENTAL_ORACLE, cross-check against the
+    // full scan and fail loudly on any divergence (a consensus-splitting bug) rather than voting it.
+    if cfg!(debug_assertions) || std::env::var("TORUS_INCREMENTAL_ORACLE").is_ok() {
+        let full = compute_post_bundle_evm_root(state_db, bundle)?;
+        if root != full {
+            return Err(StateError::InvalidData(format!(
+                "incremental state-root divergence: incremental={root} full-scan={full}"
+            )));
+        }
+    }
+    Ok(root)
+}
+
+/// EVM post-bundle root, routed by the runtime flag ([`incremental_state_root_enabled`]).
+fn flagged_evm_root(state_db: &StateDb, bundle: &BundleState) -> Result<B256, StateError> {
+    evm_root_routed(state_db, bundle, incremental_state_root_enabled())
+}
+
 /// Compute the composite state root (EVM + native) after applying the given `BundleState`.
 ///
 /// Native state is a no-op in Phase 1 — native root is `EMPTY_ROOT_HASH`.
@@ -23,7 +61,7 @@ pub fn compute_post_bundle_state_root(
     state_db: &StateDb,
     bundle: &BundleState,
 ) -> Result<B256, StateError> {
-    let evm_root = compute_post_bundle_evm_root(state_db, bundle)?;
+    let evm_root = flagged_evm_root(state_db, bundle)?;
     Ok(compute_composite_root(evm_root, EMPTY_ROOT_HASH))
 }
 
@@ -36,7 +74,7 @@ pub fn compute_full_composite_root(
     bundle: &BundleState,
     native_root: B256,
 ) -> Result<B256, StateError> {
-    let evm_root = compute_post_bundle_evm_root(state_db, bundle)?;
+    let evm_root = flagged_evm_root(state_db, bundle)?;
     Ok(compute_composite_root(evm_root, native_root))
 }
 
@@ -181,4 +219,56 @@ fn compute_post_bundle_evm_root(
     }
 
     Ok(compute_state_root(trie_accounts))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::evm_root_routed;
+    use alloy_primitives::{address, Address, U256};
+    use revm::database::BundleState;
+    use revm::state::AccountInfo;
+    use torus_state::db::{StateDb, KECCAK_EMPTY};
+    use torus_state::incremental::build_trie_to_cf;
+
+    /// The bridge-level routing must produce the same EVM root via the incremental engine as via
+    /// the full scan (the determinism gate, exercised through state_root.rs's own dispatch).
+    #[test]
+    fn bridge_incremental_evm_root_matches_full_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = StateDb::open(dir.path()).unwrap();
+        for i in 1u8..24 {
+            let mut b = [0u8; 20];
+            b[0] = i;
+            b[19] = i;
+            db.put_account(
+                &Address::from(b),
+                &AccountInfo {
+                    balance: U256::from(i as u64 * 1000),
+                    nonce: i as u64,
+                    code_hash: KECCAK_EMPTY,
+                    account_id: None,
+                    code: None,
+                },
+            )
+            .unwrap();
+        }
+        build_trie_to_cf(&db).unwrap();
+
+        let bundle = BundleState::builder(0..=0)
+            .state_present_account_info(
+                address!("0c000000000000000000000000000000000000cc"),
+                AccountInfo {
+                    balance: U256::from(42u64),
+                    nonce: 9,
+                    code_hash: KECCAK_EMPTY,
+                    account_id: None,
+                    code: None,
+                },
+            )
+            .build();
+
+        let full = evm_root_routed(&db, &bundle, false).unwrap();
+        let incremental = evm_root_routed(&db, &bundle, true).unwrap();
+        assert_eq!(full, incremental, "bridge routing: incremental EVM root must equal full scan");
+    }
 }

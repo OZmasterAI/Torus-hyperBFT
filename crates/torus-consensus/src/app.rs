@@ -240,11 +240,25 @@ impl ExecutionContext {
             ) {
                 Ok(validated) => {
                     computed_fee_revenue = torus_bridge::proposer::compute_fee_revenue(&validated.receipts);
-                    if let Err(e) = BlockCommitter::commit_pending_bundle(
+                    // Phase A: commit EVM plain state + the hashed mirror + the incremental trie
+                    // nodes in ONE atomic batch, so CF_HASHED_*/CF_TRIE_* stay in lockstep with
+                    // CF_ACCOUNTS (keeps the incremental root's base correct across restarts/replay).
+                    // Falls back to the plain commit if the incremental path errors, so a trie bug
+                    // can never halt the chain (the full-scan root stays primary unless the flag is on).
+                    match torus_state::incremental::commit_evm_bundle_incremental(
                         &self.state_db,
                         &validated.bundle,
                     ) {
-                        tracing::error!(%e, height, "failed to commit EVM bundle");
+                        Ok(_root) => {}
+                        Err(e) => {
+                            tracing::error!(%e, height, "incremental commit failed; falling back to plain EVM commit");
+                            if let Err(e2) = BlockCommitter::commit_pending_bundle(
+                                &self.state_db,
+                                &validated.bundle,
+                            ) {
+                                tracing::error!(%e2, height, "failed to commit EVM bundle (fallback)");
+                            }
+                        }
                     }
                     if let Err(e) = BlockCommitter::commit_block_metadata(
                         &self.state_db,
@@ -561,6 +575,13 @@ impl TorusApp {
             dev_pool_address: config.dev_pool_address,
             metrics: metrics.clone(),
         };
+
+        // Phase A: ensure the persistent incremental trie exists before any commit (including
+        // replay below). No-op after the first boot; keeps the incremental root's base ready while
+        // the full-scan root stays primary until TORUS_INCREMENTAL_STATE_ROOT is enabled.
+        if let Err(e) = torus_state::incremental::ensure_trie_built(&state_db) {
+            tracing::warn!(%e, "failed to build initial state trie (incremental root unavailable until rebuilt)");
+        }
 
         // Crash recovery runs synchronously before spawning the pipeline.
         let last_header = Self::replay_committed(&state_db, &exec_ctx);
