@@ -313,4 +313,11 @@ pub enum ValidateBlockResponse {
     /// `App`'s semantics, or that the execution of `validate_block` for the proposed block will exceed the
     /// [timing requirements](App#timing-requirements).
     Invalid,
+
+    /// Indicates that the block is structurally sound but the `App` is missing
+    /// out-of-band data required to fully validate/execute it (e.g. native-action
+    /// bodies referenced by a CompactBlock). The block must NOT be treated as
+    /// invalid: the missing data should be fetched and validation retried. During
+    /// block-sync this means the serving peer must NOT be blacklisted.
+    MissingData,
 }

@@ -1066,15 +1066,19 @@ impl App<RocksKVStore> for TorusApp {
                     tracing::warn!(
                         missing_count = missing.len(),
                         height = compact.header.height,
-                        "validate_block: REJECTED -- missing native actions after retry"
+                        "validate_block: MISSING native action bodies after retry -- fetch via DA (not invalid)"
                     );
-                    return ValidateBlockResponse::Invalid;
+                    // MissingData (NOT Invalid): the block is structurally fine, we just
+                    // lack the out-of-band bodies. The sync path must not blacklist the
+                    // serving peer for this (livelock root cause, mem 28e1a821) -- fetch
+                    // via the rare pull-fallback (Task 6) instead.
+                    return ValidateBlockResponse::MissingData;
                 }
 
                 actions.into_iter().map(|a| a.unwrap()).collect()
             } else {
-                tracing::warn!("validate_block: REJECTED -- no mempool for action reconstruction");
-                return ValidateBlockResponse::Invalid;
+                tracing::warn!("validate_block: cannot reconstruct -- no mempool/DA store available");
+                return ValidateBlockResponse::MissingData;
             };
 
             TorusBlock {

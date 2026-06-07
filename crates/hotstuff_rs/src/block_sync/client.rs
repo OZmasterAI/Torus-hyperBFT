@@ -272,10 +272,17 @@ impl<N: Network> BlockSyncClient<N> {
         let validate_block_request =
             ValidateBlockRequest::new(&block, block_tree.app_view(parent_block)?);
 
+        // A `MissingData` response means we lack this block's out-of-band data
+        // (native-action bodies), NOT that the block or the serving peer is bad -- so
+        // fetch the data instead of blacklisting. Blacklisting on a missing body
+        // exhausted the peer set and wedged sync (livelock root cause, mem 28e1a821).
+        let validation = app.validate_block_for_sync(validate_block_request);
+        let should_blacklist = warrants_blacklist(&validation);
+
         if let ValidateBlockResponse::Valid {
             app_state_updates,
             validator_set_updates,
-        } = app.validate_block_for_sync(validate_block_request)
+        } = validation
         {
             block_tree.insert(
                 &block,
@@ -330,11 +337,17 @@ impl<N: Network> BlockSyncClient<N> {
                 "block_sync: block inserted, blocks_synced={}",
                 self.pending_sync.as_ref().unwrap().blocks_synced
             );
-        } else {
-            log::warn!("block_sync: block failed app validation, blacklisting peer");
+        } else if should_blacklist {
+            log::warn!("block_sync: block failed app validation (invalid), blacklisting peer");
             self.block_sync_client_state.blacklist_sync_server(
                 peer,
                 self.config.blacklist_expiry_time,
+            );
+            self.end_session();
+            return Ok(true);
+        } else {
+            log::warn!(
+                "block_sync: block data missing during sync -- NOT blacklisting peer (will fetch)"
             );
             self.end_session();
             return Ok(true);
@@ -619,6 +632,37 @@ impl BlockSyncClientState {
                 .choose(&mut rand::thread_rng())
                 .copied(),
         }
+    }
+}
+
+/// Whether a non-`Valid` sync validation response warrants blacklisting the serving
+/// peer. Only a cryptographically/semantically `Invalid` block does. A `MissingData`
+/// response means we simply lack the block's out-of-band data (e.g. native-action
+/// bodies referenced by a CompactBlock): the peer served a correct block, so we must
+/// FETCH the data and retry -- not punish the peer. Blacklisting on a missing body
+/// exhausted the peer set and wedged sync (livelock root cause, mem 28e1a821).
+fn warrants_blacklist(response: &ValidateBlockResponse) -> bool {
+    matches!(response, ValidateBlockResponse::Invalid)
+}
+
+#[cfg(test)]
+mod blacklist_decision_tests {
+    use super::warrants_blacklist;
+    use crate::app::ValidateBlockResponse;
+
+    #[test]
+    fn missing_body_does_not_blacklist() {
+        // A block we cannot fully validate only because its out-of-band data
+        // (native-action bodies) is missing must NOT blacklist the serving peer --
+        // fetch the data instead (livelock root cause, mem 28e1a821).
+        assert!(!warrants_blacklist(&ValidateBlockResponse::MissingData));
+        // A valid block is not blacklisted.
+        assert!(!warrants_blacklist(&ValidateBlockResponse::Valid {
+            app_state_updates: None,
+            validator_set_updates: None,
+        }));
+        // Only a genuinely invalid (crypto/structurally bad) block is blacklisted.
+        assert!(warrants_blacklist(&ValidateBlockResponse::Invalid));
     }
 }
 
