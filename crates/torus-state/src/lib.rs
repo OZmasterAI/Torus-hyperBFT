@@ -8,6 +8,7 @@ pub mod native_da;
 pub mod overlay;
 pub mod pruner;
 pub mod incremental;
+pub mod native_trie;
 pub mod snapshot;
 pub mod trie;
 pub mod trie_cursor;
