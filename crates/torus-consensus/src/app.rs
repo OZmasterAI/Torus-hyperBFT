@@ -474,22 +474,38 @@ pub trait NativeDaFetcher: Send + Sync {
     fn drain(&self) -> Vec<Vec<u8>>;
 }
 
+/// CONSENSUS-CRITICAL version flag: emit hash-only `CompactBlock` proposals
+/// (`true`) instead of full self-contained `TorusBlock`s (`false`).
+///
+/// The consensus block identity is `data_hash` over the datum bytes, so compact
+/// and full encodings hash DIFFERENTLY — every validator MUST agree on this value
+/// or they split. It is therefore tied to the BINARY version (not env/per-node):
+/// flip it only in a coordinated relaunch where every validator runs the fixed
+/// binary (Phase C Task 9). Re-enabling compact is what unlocks 400k orders/sec — a
+/// block referencing ~20–40k orders ≈ 1–2 MB of bodies far exceeds the 256 KB
+/// `max_consensus_message_size`, so bodies must travel out-of-band (durable DA store
+/// + push T7 + rare pull T6). Default `false` keeps the proven full-block path until
+/// that coordinated flip. Does NOT affect the EVM/RPC header hash
+/// (`keccak256(canonical_header_bytes)`), which is identical in both encodings.
+const COMPACT_PROPOSALS: bool = false;
+
 /// Encode the datum carried in a consensus proposal.
 ///
-/// Emits the FULL, self-contained `TorusBlock` (native actions inline) rather
-/// than a hash-only `CompactBlock`. CompactBlock reconstruction depends on every
-/// validator already holding the actions -- which originally arrived via gossip.
-/// Gossip is disabled (it drowned consensus), so the only delivery was a racing
-/// pre-proposal unicast push that loses under load: validators reject blocks for
-/// missing actions and the chain stalls (step3 dissemination gap). A full block
-/// needs no out-of-band delivery and is self-contained for block-sync too.
+/// With `compact = false` (default): the FULL, self-contained `TorusBlock` (native
+/// actions inline) — needs no out-of-band delivery and is self-contained for
+/// block-sync. The proven full-block path (06620a1) that ran healthy at cap-100.
 ///
-/// This reverts to the proven full-block proposals (06620a1) that ran healthy at
-/// cap-100 for ~5 days; they were dropped only to shrink proposals for a cap
-/// raise that is deferred. At cap-100 a full block stays well under
-/// `max_consensus_message_size` (256KB); revisit before raising the block cap.
-fn encode_proposal_datum(block: &TorusBlock) -> Vec<u8> {
-    bincode::serialize(block).expect("serialize TorusBlock")
+/// With `compact = true` (version-gated, Task 8): a hash-only `CompactBlock`. The
+/// bodies are NOT inline — they are mirrored to the durable DA store (T2), pushed
+/// to validators (T7), and fetched on a miss via the rare pull-fallback (T6). This
+/// shrinks the proposal so it fits `max_consensus_message_size` at 400k orders/sec.
+/// All validators must emit the SAME encoding (see [`COMPACT_PROPOSALS`]).
+fn encode_proposal_datum(block: &TorusBlock, compact: bool) -> Vec<u8> {
+    if compact {
+        bincode::serialize(&CompactBlock::from_block(block)).expect("serialize CompactBlock")
+    } else {
+        bincode::serialize(block).expect("serialize TorusBlock")
+    }
 }
 
 impl TorusApp {
@@ -1052,7 +1068,11 @@ impl App<RocksKVStore> for TorusApp {
 
         let height = block.header.height;
 
-        if !native_with_senders.is_empty() {
+        // Pre-proposal push: only needed for COMPACT proposals, whose bodies travel
+        // out-of-band. A FULL block already carries its bodies inline, so pushing them
+        // too would be a redundant double-send (Task 8). The proposer always mirrors to
+        // its own DA store above, regardless of mode.
+        if COMPACT_PROPOSALS && !native_with_senders.is_empty() {
             if let Some(ref tx) = self.pre_proposal_tx {
                 let count = native_with_senders.len();
                 match tx.try_send(PreProposalBundle { actions: native_with_senders }) {
@@ -1062,7 +1082,7 @@ impl App<RocksKVStore> for TorusApp {
             }
         }
 
-        let encoded = encode_proposal_datum(&block);
+        let encoded = encode_proposal_datum(&block, COMPACT_PROPOSALS);
         self.pending_proposals.insert(height, block);
         self.pending_proposals.retain(|&h, _| h + 10 > height);
         let hash = Self::hash_datum(&encoded);
@@ -1539,26 +1559,70 @@ mod crash_recovery_tests {
     }
 
     #[test]
-    fn produce_block_datum_is_full_self_contained_block() {
-        // The datum the proposer emits must be a FULL TorusBlock carrying its
-        // native actions inline -- not a hash-only CompactBlock. A CompactBlock
-        // can only be reconstructed if the actions were already delivered
-        // out-of-band (gossip is off; the pre-proposal push races and loses
-        // under load), which stalls the chain (step3 dissemination gap).
+    fn produce_block_datum_is_compact() {
+        // Task 8: with compact proposals enabled (version-gated), the proposal datum
+        // carries only action HASHES (CompactBlock), not inline bodies — bodies travel
+        // out-of-band via the durable DA store (push T7 / pull T6). Required for 400k
+        // orders/sec, where a full block of ~MB exceeds max_consensus_message_size.
         let actions: Vec<SignedNativeAction> = (0..100).map(sign_claim_rewards).collect();
         let block = make_block(7, actions);
 
-        let datum = encode_proposal_datum(&block);
-
-        // Must deserialize as a full TorusBlock with every action present, with
-        // no dependency on a mempool or out-of-band action delivery.
-        let decoded: TorusBlock = bincode::deserialize(&datum)
-            .expect("proposal datum must be a full self-contained TorusBlock");
+        // Compact-mode datum: a CompactBlock referencing all 100 actions by hash.
+        let compact_datum = encode_proposal_datum(&block, true);
+        let decoded: CompactBlock = bincode::deserialize(&compact_datum)
+            .expect("compact-mode datum must be a CompactBlock");
         assert_eq!(
-            decoded.native_actions.len(),
+            decoded.native_action_hashes.len(),
             100,
-            "full block must carry all native actions inline"
+            "compact datum references every action by hash"
         );
+
+        // The FULL encoding remains valid behind the flag (staged rollout / rollback),
+        // and is strictly larger — proving the compact datum carries no inline bodies.
+        let full_datum = encode_proposal_datum(&block, false);
+        let full: TorusBlock = bincode::deserialize(&full_datum)
+            .expect("full-mode datum must be a self-contained TorusBlock");
+        assert_eq!(full.native_actions.len(), 100);
+        assert!(
+            compact_datum.len() < full_datum.len(),
+            "compact datum must be smaller (bodies are out-of-band, not inline)"
+        );
+    }
+
+    #[test]
+    fn compact_proposal_disseminates() {
+        // Task 8: a compact proposal carries only hashes, and a peer reconstructs the
+        // full block from bodies delivered out-of-band into its durable DA store
+        // (push T7 / pull T6) — so re-enabling compact does not strand any validator.
+        let (config, state_db) = make_test_config_and_db();
+        let actions: Vec<SignedNativeAction> = (0..10).map(sign_claim_rewards).collect();
+        let block = make_block(5, actions.clone());
+
+        // The proposer emits a CompactBlock datum (hashes only).
+        let datum = encode_proposal_datum(&block, true);
+        let compact: CompactBlock =
+            bincode::deserialize(&datum).expect("compact-mode datum is a CompactBlock");
+        assert_eq!(compact.native_action_hashes.len(), actions.len());
+
+        // A peer holding the bodies in its DA store (delivered out-of-band) reconstructs
+        // the full block — the bodies were NOT in the proposal itself.
+        let mempool = Arc::new(torus_mempool::Mempool::new(
+            state_db.clone(),
+            torus_mempool::MempoolConfig::default(),
+        ));
+        mempool.mirror_native_to_da(&actions); // models push/pull delivery into the DA store
+        let app = TorusApp::new(state_db.clone(), &config, None, Some(mempool), None);
+        let reconstructed = app
+            .reconstruct_compact_from_da(&compact)
+            .expect("peer reconstructs the compact block from its durable DA store");
+        assert_eq!(reconstructed.native_actions.len(), actions.len());
+        for (got, want) in reconstructed.native_actions.iter().zip(actions.iter()) {
+            assert_eq!(
+                torus_types::compute_action_hash(got),
+                torus_types::compute_action_hash(want),
+                "reconstructed bodies match the referenced hashes"
+            );
+        }
     }
 
     #[test]
