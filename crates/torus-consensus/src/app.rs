@@ -487,7 +487,11 @@ pub trait NativeDaFetcher: Send + Sync {
 /// + push T7 + rare pull T6). Default `false` keeps the proven full-block path until
 /// that coordinated flip. Does NOT affect the EVM/RPC header hash
 /// (`keccak256(canonical_header_bytes)`), which is identical in both encodings.
-const COMPACT_PROPOSALS: bool = false;
+///
+/// ENABLED (Task 9): all validators MUST run this binary in a coordinated relaunch.
+/// Deploying it to a SUBSET while others run a full-block binary splits consensus
+/// (different `data_hash` for the same block). Do NOT deploy piecemeal.
+const COMPACT_PROPOSALS: bool = true;
 
 /// Encode the datum carried in a consensus proposal.
 ///
