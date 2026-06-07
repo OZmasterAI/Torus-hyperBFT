@@ -17,8 +17,8 @@ use revm::database::BundleState;
 use revm::state::AccountInfo;
 use rocksdb::WriteBatch;
 
-use crate::cf::{CF_ACCOUNTS, CF_HASHED_ACCOUNTS, CF_HASHED_STORAGE};
-use crate::db::{decode_account_info, encode_account_info, StateDb, KECCAK_EMPTY};
+use crate::cf::{CF_ACCOUNTS, CF_HASHED_ACCOUNTS, CF_HASHED_STORAGE, CF_STORAGE};
+use crate::db::{decode_account_info, encode_account_info, storage_key, StateDb, KECCAK_EMPTY};
 use crate::error::StateError;
 use crate::trie::{compute_state_root, compute_storage_root, TrieAccount, EMPTY_ROOT_HASH};
 use crate::trie_cursor::{write_trie_updates, RocksHashedCursorFactory, RocksTrieCursorFactory};
@@ -204,9 +204,122 @@ pub fn incremental_evm_root(
         .map_err(|e| StateError::InvalidData(format!("incremental evm root: {e}")))
 }
 
+/// Apply `bundle` to the plain EVM state (`CF_ACCOUNTS` / `CF_STORAGE`) into `batch`.
+///
+/// Mirrors `torus-bridge::committer::commit_block` exactly (no EIP-161 here — revm nulls empty
+/// accounts in the bundle), so `CF_ACCOUNTS` stays byte-identical to the production commit path.
+pub fn apply_bundle_plain(
+    db: &StateDb,
+    batch: &mut WriteBatch,
+    bundle: &BundleState,
+) -> Result<(), StateError> {
+    let cf_accounts = db.cf_handle(CF_ACCOUNTS)?;
+    let cf_storage = db.cf_handle(CF_STORAGE)?;
+    for (address, bundle_acct) in &bundle.state {
+        match &bundle_acct.info {
+            Some(info) => {
+                batch.put_cf(cf_accounts, address.as_slice(), encode_account_info(info));
+                for (slot, slot_val) in &bundle_acct.storage {
+                    let key = storage_key(address, slot);
+                    if slot_val.present_value.is_zero() {
+                        batch.delete_cf(cf_storage, key);
+                    } else {
+                        batch.put_cf(cf_storage, key, slot_val.present_value.to_be_bytes::<32>());
+                    }
+                }
+            }
+            None => {
+                if bundle_acct.original_info.is_some() {
+                    batch.delete_cf(cf_accounts, address.as_slice());
+                }
+                for (slot, _) in &bundle_acct.storage {
+                    batch.delete_cf(cf_storage, storage_key(address, slot));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Apply `bundle` to the keccak-ordered hashed-state mirror (`CF_HASHED_*`) into `batch`.
+///
+/// Applies EIP-161 (accounts that end empty are dropped + their hashed storage wiped) so
+/// `CF_HASHED_*` is the EIP-161-clean post-state that backs [`incremental_evm_root`]'s base
+/// cursors. Keeping this base clean — independent of whether `CF_ACCOUNTS` retains empties — is
+/// what makes the incremental root byte-identical to the full-scan oracle for every block.
+pub fn apply_bundle_hashed(
+    db: &StateDb,
+    batch: &mut WriteBatch,
+    bundle: &BundleState,
+) -> Result<(), StateError> {
+    let cf_acc = db.cf_handle(CF_HASHED_ACCOUNTS)?;
+    let cf_stor = db.cf_handle(CF_HASHED_STORAGE)?;
+    for (address, bundle_acct) in &bundle.state {
+        let hashed_address = keccak256(address.as_slice());
+        let keep = match &bundle_acct.info {
+            Some(info) if !is_empty_account(info) => {
+                batch.put_cf(cf_acc, hashed_address.as_slice(), encode_account_info(info));
+                true
+            }
+            _ => {
+                // None or EIP-161 empty: account removed from the trie.
+                batch.delete_cf(cf_acc, hashed_address.as_slice());
+                false
+            }
+        };
+        if keep {
+            for (slot, slot_val) in &bundle_acct.storage {
+                let hashed_slot = keccak256(slot.to_be_bytes::<32>());
+                let key = hashed_storage_key(&hashed_address, &hashed_slot);
+                if slot_val.present_value.is_zero() {
+                    batch.delete_cf(cf_stor, key);
+                } else {
+                    batch.put_cf(cf_stor, key, slot_val.present_value.to_be_bytes::<32>());
+                }
+            }
+        } else {
+            // Wipe every hashed storage entry under this account's 32-byte prefix.
+            let mut iter = db.inner().raw_iterator_cf(cf_stor);
+            iter.seek(hashed_address.as_slice());
+            while iter.valid() {
+                let k = match iter.key() {
+                    Some(k) if k.starts_with(hashed_address.as_slice()) => k.to_vec(),
+                    _ => break,
+                };
+                batch.delete_cf(cf_stor, &k);
+                iter.next();
+            }
+            iter.status()?;
+        }
+    }
+    Ok(())
+}
+
+/// Commit `bundle` and its incremental trie/hashed updates to the DB in ONE atomic `WriteBatch`,
+/// returning the new EVM state root.
+///
+/// Crash-consistent: plain state (`CF_ACCOUNTS`/`CF_STORAGE`), the hashed mirror (`CF_HASHED_*`),
+/// and the trie nodes (`CF_TRIE_*`) all land together or not at all. The root + `TrieUpdates` are
+/// computed over the committed base BEFORE the batch is written (no mid-commit mutation).
+pub fn commit_evm_bundle_incremental(
+    db: &StateDb,
+    bundle: &BundleState,
+) -> Result<B256, StateError> {
+    let (root, trie_updates) = incremental_evm_root(db, bundle)?;
+    let mut batch = WriteBatch::default();
+    apply_bundle_plain(db, &mut batch, bundle)?;
+    apply_bundle_hashed(db, &mut batch, bundle)?;
+    write_trie_updates(db, &mut batch, &trie_updates)?;
+    db.write(batch)?;
+    Ok(root)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{build_trie_to_cf, full_post_bundle_evm_root, incremental_evm_root};
+    use super::{
+        build_trie_to_cf, commit_evm_bundle_incremental, full_post_bundle_evm_root,
+        incremental_evm_root,
+    };
     use crate::cf::CF_TRIE_ACCOUNTS;
     use crate::db::{StateDb, KECCAK_EMPTY};
     use crate::trie::compute_state_root_from_db;
@@ -449,6 +562,72 @@ mod tests {
                 "randomized round {round}: incremental EVM root != full-scan oracle"
             );
         }
+    }
+
+    /// Crash-consistency: commit a bundle (plain + hashed + trie in one atomic batch), then drop &
+    /// reopen the DB and confirm the root recomputes identically from the persisted CFs.
+    #[test]
+    fn trie_survives_crash_reopen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().to_path_buf();
+
+        let contract = address!("00000000000000000000000000000000000000aa");
+        let eoa1 = address!("0000000000000000000000000000000000000001");
+        let new_addr = address!("00000000000000000000000000000000000000cc");
+        let mut storage = StorageKeyMap::default();
+        storage.insert(U256::from(0u64), (U256::from(42u64), U256::ZERO)); // delete slot 0
+        storage.insert(U256::from(9u64), (U256::ZERO, U256::from(77u64))); // insert slot 9
+        let bundle = BundleState::builder(0..=0)
+            .state_present_account_info(eoa1, eoa(424_242, 9))
+            .state_present_account_info(new_addr, eoa(7_777, 1))
+            .state_present_account_info(
+                contract,
+                AccountInfo {
+                    balance: U256::from(5u64),
+                    nonce: 7,
+                    code_hash: keccak256([1u8, 2, 3]),
+                    account_id: None,
+                    code: None,
+                },
+            )
+            .state_storage(contract, storage)
+            .build();
+        let empty = || BundleState::builder(0..=0).build();
+
+        // Commit, then verify the committed trie reproduces the root before any crash.
+        let root = {
+            let db = StateDb::open(&path).expect("open db");
+            seed(&db);
+            build_trie_to_cf(&db).expect("migration");
+            let root = commit_evm_bundle_incremental(&db, &bundle).expect("commit");
+            assert_eq!(
+                incremental_evm_root(&db, &empty()).unwrap().0,
+                root,
+                "post-commit incremental(empty) must equal the committed root"
+            );
+            assert_eq!(
+                full_post_bundle_evm_root(&db, &empty()).unwrap(),
+                root,
+                "post-commit full-scan(empty) must equal the committed root"
+            );
+            root
+            // `db` dropped here — simulates process shutdown / crash.
+        };
+
+        // Reopen the same directory and confirm nothing changed.
+        let db = StateDb::open(&path).expect("reopen db");
+        assert_eq!(
+            incremental_evm_root(&db, &empty()).unwrap().0,
+            root,
+            "trie root changed after drop+reopen"
+        );
+        assert_eq!(
+            full_post_bundle_evm_root(&db, &empty()).unwrap(),
+            root,
+            "plain-state root changed after drop+reopen"
+        );
+
+        drop(dir);
     }
 
     #[test]
