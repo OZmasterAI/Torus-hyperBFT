@@ -15,7 +15,7 @@ use hotstuff_rs::replica::{Configuration, Replica, ReplicaSpec};
 use hotstuff_rs::types::data_types::{BufferSize, ChainID, EpochLength};
 use tracing::{error, info, warn};
 
-use torus_consensus::{RocksKVStore, TorusApp};
+use torus_consensus::{NativeDaFetcher, RocksKVStore, TorusApp};
 use torus_evm::EvmExecutor;
 use torus_genesis::Genesis;
 use torus_mempool::{Mempool, MempoolConfig};
@@ -26,6 +26,24 @@ use torus_state::{NativeDaStore, PrunerConfig, StateDb, StatePruner};
 use torus_types::ChainConfig;
 
 mod keystore;
+
+/// Production native-DA pull-fallback transport (Phase C Task 6): bridges the
+/// consensus app's [`NativeDaFetcher`] to the libp2p `/torus/native-da/1.0`
+/// protocol. `fetch` fans the request out to the validator set; `drain` returns
+/// bodies that have arrived on the network thread's inbound queue.
+struct NetworkDaFetcher {
+    network: LibP2PNetwork,
+}
+
+impl NativeDaFetcher for NetworkDaFetcher {
+    fn fetch(&self, hashes: Vec<[u8; 32]>) {
+        self.network.fetch_native_actions_from_validators(hashes);
+    }
+
+    fn drain(&self) -> Vec<Vec<u8>> {
+        self.network.drain_native_da_inbound()
+    }
+}
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -401,6 +419,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // Attach the durable DA store so the swarm can SERVE native-action bodies
     // by-hash on /torus/native-da/1.0 (Phase C Task 5 — RARE pull-fallback).
     network.set_native_da_store(NativeDaStore::new(state_db.clone()));
+    // Wire the consensus app's RARE pull-fallback to the network (Phase C Task 6):
+    // on a CompactBlock reconstruction miss it fetches the missing bodies by-hash.
+    app.set_native_da_fetcher(Arc::new(NetworkDaFetcher { network: network.clone() }));
 
     // Spawn inbound native action gossip → mempool task
     if let Some(mut native_rx) = network.take_native_action_rx() {

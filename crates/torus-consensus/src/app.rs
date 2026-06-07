@@ -445,11 +445,33 @@ pub struct TorusApp {
     exec_handle: Option<JoinHandle<()>>,
     leader_state: Arc<LeaderState>,
     pre_proposal_tx: Option<std::sync::mpsc::SyncSender<PreProposalBundle>>,
+    /// RARE pull-fallback transport (Task 6): fetch missing native-action bodies
+    /// by-hash on a reconstruction miss. Injected at startup over `/torus/native-da/1.0`;
+    /// `None` in consensus-only tests (no fetch fires).
+    da_fetcher: Option<Arc<dyn NativeDaFetcher>>,
 }
 
 /// Actions the proposer pushes to validators via unicast before broadcasting CompactBlock.
 pub struct PreProposalBundle {
     pub actions: Vec<(Address, torus_types::SignedNativeAction)>,
+}
+
+/// RARE pull-fallback transport for native-action DA bodies (Phase C Task 6).
+///
+/// Injected from torus-node over the libp2p `/torus/native-da/1.0` protocol so
+/// torus-consensus needn't depend on torus-network. Used only on a reconstruction
+/// MISS — push covers the common case, so this fires rarely (mem a6cf33a9: pull is
+/// fallback-only, never per-block).
+///
+/// `fetch` is **non-blocking** (it only enqueues a request to the network thread).
+/// `drain` returns the bodies that have arrived since the last call (each =
+/// `bincode(SignedNativeAction)`). Target selection (which peers to ask) is the
+/// implementation's concern, keeping the consensus layer free of peer identity.
+pub trait NativeDaFetcher: Send + Sync {
+    /// Request the given action-hashes from peers. Non-blocking.
+    fn fetch(&self, hashes: Vec<[u8; 32]>);
+    /// Drain native-action bodies received so far. Non-blocking.
+    fn drain(&self) -> Vec<Vec<u8>>;
 }
 
 /// Encode the datum carried in a consensus proposal.
@@ -566,6 +588,7 @@ impl TorusApp {
             exec_handle: Some(exec_handle),
             leader_state,
             pre_proposal_tx: None,
+            da_fetcher: None,
         }
     }
 
@@ -575,6 +598,12 @@ impl TorusApp {
 
     pub fn set_pre_proposal_tx(&mut self, tx: std::sync::mpsc::SyncSender<PreProposalBundle>) {
         self.pre_proposal_tx = Some(tx);
+    }
+
+    /// Attach the RARE pull-fallback transport (Task 6). Called once at startup with
+    /// a handle over the `/torus/native-da/1.0` protocol.
+    pub fn set_native_da_fetcher(&mut self, fetcher: Arc<dyn NativeDaFetcher>) {
+        self.da_fetcher = Some(fetcher);
     }
 
     /// Create a stub `TorusApp` without a database (for consensus-only tests).
@@ -717,6 +746,83 @@ impl TorusApp {
             evm_transactions: compact.evm_transactions.clone(),
             core_writer_actions: compact.core_writer_actions.clone(),
         })
+    }
+
+    /// RARE pull-fallback entry point (Task 6): if any of `compact`'s native-action
+    /// bodies are absent from the durable DA store, fetch them by-hash and absorb the
+    /// response into the store. Returns `true` iff a fetch was issued.
+    ///
+    /// Does NOTHING when every body is already local — the common case, so pull fires
+    /// rarely (mem a6cf33a9: pull is fallback-only, never per-block). Intended for the
+    /// SYNC path (`validate_block_for_sync`); the hot `validate_block` path keeps only
+    /// its bounded local retry and never triggers a network fetch (mem 8ee99db3).
+    pub fn pull_compact_bodies_if_missing(&self, compact: &CompactBlock) -> bool {
+        let missing = match self.reconstruct_compact_from_da(compact) {
+            Ok(_) => return false, // all bodies local — no fetch (rarity)
+            Err(missing) => missing,
+        };
+        // A miss: attempt the bounded pull (recovery is re-checked by the caller's
+        // subsequent reconstruct/validate). Report that a fetch was issued.
+        self.pull_missing_bodies(&missing);
+        true
+    }
+
+    /// Fetch the `missing` native-action bodies by-hash and absorb any that arrive
+    /// into the durable DA store. Returns `true` once all are present (or were
+    /// already), `false` on timeout.
+    ///
+    /// Bounded poll (≤ ~80ms, well under the 500ms view timeout) on the block-sync
+    /// path — NOT the hot consensus voting path. The existing `validate_block` retry
+    /// already waits ≤100ms during sync, so this stays within the established budget;
+    /// it never adds blocking to live consensus (mem 8ee99db3).
+    fn pull_missing_bodies(&self, missing: &[torus_types::B256]) -> bool {
+        if missing.is_empty() {
+            return true;
+        }
+        let (Some(fetcher), Some(mempool)) = (self.da_fetcher.as_ref(), self.mempool.as_ref())
+        else {
+            return false; // no transport/store wired (consensus-only tests)
+        };
+
+        let hashes: Vec<[u8; 32]> = missing.iter().map(|h| h.0).collect();
+        fetcher.fetch(hashes);
+
+        if let Some(ref m) = self.metrics {
+            m.native_da_pull_requests.inc();
+        }
+
+        const PULL_RETRIES: usize = 4;
+        const PULL_DELAY: std::time::Duration = std::time::Duration::from_millis(20);
+        for _ in 0..PULL_RETRIES {
+            std::thread::sleep(PULL_DELAY);
+            Self::absorb_fetched_bodies(mempool, fetcher.as_ref());
+            if missing.iter().all(|h| mempool.get_native_da(h).is_some()) {
+                if let Some(ref m) = self.metrics {
+                    m.native_da_pull_recovered.inc();
+                }
+                tracing::info!(count = missing.len(), "native-da pull: bodies recovered");
+                return true;
+            }
+        }
+        tracing::warn!(count = missing.len(), "native-da pull: bodies NOT recovered within budget");
+        false
+    }
+
+    /// Drain fetched bodies and mirror them into the durable DA store. Each body is
+    /// stored under its own RECOMPUTED action-hash (`mirror_native_to_da`), so a peer
+    /// cannot place a body under a hash it does not own.
+    fn absorb_fetched_bodies(mempool: &Mempool, fetcher: &dyn NativeDaFetcher) {
+        let bodies = fetcher.drain();
+        if bodies.is_empty() {
+            return;
+        }
+        let actions: Vec<torus_types::SignedNativeAction> = bodies
+            .iter()
+            .filter_map(|b| bincode::deserialize::<torus_types::SignedNativeAction>(b).ok())
+            .collect();
+        if !actions.is_empty() {
+            mempool.mirror_native_to_da(&actions);
+        }
     }
 
     fn hash_datum(bytes: &[u8]) -> [u8; 32] {
@@ -1159,6 +1265,28 @@ impl App<RocksKVStore> for TorusApp {
         &mut self,
         request: ValidateBlockRequest<RocksKVStore>,
     ) -> ValidateBlockResponse {
+        // RARE pull-fallback (Task 6): a synced CompactBlock whose bodies are absent
+        // from the durable DA store fetches them by-hash from peers BEFORE validating,
+        // so the block recovers in-call instead of bouncing (no blacklist, mem 28e1a821).
+        // This runs on the block-sync path; the hot validate_block path is untouched and
+        // never triggers a network fetch (mem 8ee99db3). Peek + decode the datum, then
+        // drop the borrow before validating (which consumes `request`).
+        let compact: Option<CompactBlock> = {
+            let datums = request.proposed_block().data.vec();
+            datums.first().and_then(|d| {
+                let bytes = d.bytes();
+                // A full TorusBlock is self-contained (no out-of-band bodies); only a
+                // CompactBlock can miss. Try full first to avoid a misparse.
+                if bincode::deserialize::<TorusBlock>(bytes).is_ok() {
+                    None
+                } else {
+                    bincode::deserialize::<CompactBlock>(bytes).ok()
+                }
+            })
+        };
+        if let Some(compact) = compact {
+            self.pull_compact_bodies_if_missing(&compact);
+        }
         self.validate_block(request)
     }
 
@@ -1222,6 +1350,16 @@ impl App<RocksKVStore> for TorusApp {
                     missing = missing.len(),
                     "on_committed_block: missing native bodies for committed block -- execution deferred (fetch: Task 6)"
                 );
+                // NON-BLOCKING pull (Task 6): nudge the bodies toward the durable DA
+                // store so a re-sync / restart-replay of this committed block can
+                // reconstruct it. Do NOT wait here -- this is the consensus thread
+                // (mem 8ee99db3); height has already advanced above, so no wedge.
+                if let Some(fetcher) = self.da_fetcher.as_ref() {
+                    fetcher.fetch(missing.iter().map(|h| h.0).collect());
+                    if let Some(ref m) = self.metrics {
+                        m.native_da_pull_requests.inc();
+                    }
+                }
                 return;
             }
         };

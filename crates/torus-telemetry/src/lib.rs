@@ -73,6 +73,11 @@ pub struct Metrics {
     pub pending_sends_flushed: Counter,
     pub native_bundle_repushed: Counter,
     pub missing_action_rejections: Counter,
+    /// Native-DA pull-fallback fetches issued (Phase C Task 6). Must stay LOW under
+    /// load — push covers the common case; a high rate signals push is failing.
+    pub native_da_pull_requests: Counter,
+    /// Native-DA pull-fallbacks that recovered all missing bodies in-call (Task 6).
+    pub native_da_pull_recovered: Counter,
 }
 
 impl Metrics {
@@ -270,6 +275,20 @@ impl Metrics {
             missing_action_rejections.clone(),
         );
 
+        let native_da_pull_requests = Counter::default();
+        registry.register(
+            "torus_native_da_pull_requests",
+            "Native-DA pull-fallback fetches issued on a reconstruction miss (should stay LOW)",
+            native_da_pull_requests.clone(),
+        );
+
+        let native_da_pull_recovered = Counter::default();
+        registry.register(
+            "torus_native_da_pull_recovered",
+            "Native-DA pull-fallbacks that recovered all missing bodies in-call",
+            native_da_pull_recovered.clone(),
+        );
+
         Self {
             registry,
             blocks_committed,
@@ -299,6 +318,8 @@ impl Metrics {
             pending_sends_flushed,
             native_bundle_repushed,
             missing_action_rejections,
+            native_da_pull_requests,
+            native_da_pull_recovered,
         }
     }
 

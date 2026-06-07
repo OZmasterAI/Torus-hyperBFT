@@ -25,3 +25,4 @@ borsh = { workspace = true }
 tracing = { workspace = true }
 revm = { workspace = true }
 libp2p = { workspace = true }
+bincode = { workspace = true }

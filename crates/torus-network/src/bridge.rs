@@ -41,6 +41,9 @@ pub struct LibP2PNetwork {
     command_tx: mpsc::UnboundedSender<NetworkCommand>,
     shared: Arc<SharedState>,
     native_inbound_rx: Option<mpsc::UnboundedReceiver<(torus_types::Address, torus_types::SignedNativeAction)>>,
+    /// This node's own validator key, used to skip self when fanning a native-DA
+    /// pull-fallback out to the validator set (Task 6).
+    local_key: VerifyingKey,
 }
 
 impl Clone for LibP2PNetwork {
@@ -49,6 +52,7 @@ impl Clone for LibP2PNetwork {
             command_tx: self.command_tx.clone(),
             shared: self.shared.clone(),
             native_inbound_rx: None,
+            local_key: self.local_key,
         }
     }
 }
@@ -145,7 +149,7 @@ impl LibP2PNetwork {
             ).await
         });
 
-        let network = Self { command_tx, shared, native_inbound_rx: Some(native_inbound_rx) };
+        let network = Self { command_tx, shared, native_inbound_rx: Some(native_inbound_rx), local_key };
         let tx_handle = TxGossipHandle { tx_sender: tx_tx };
         let native_handle = NativeGossipHandle { sender: native_tx };
         Ok((network, tx_handle, native_handle))
@@ -197,6 +201,32 @@ impl LibP2PNetwork {
         let _ = self
             .command_tx
             .send(NetworkCommand::FetchNativeActions { target, hashes });
+    }
+
+    /// Fan a RARE pull-fallback fetch out to every other validator (Task 6). Used on
+    /// a reconstruction miss: at least one peer holds the bodies durably (the proposer
+    /// mirrored them in produce_block), so asking the whole set recovers reliably
+    /// without the consensus layer needing to resolve peer identity. Non-blocking;
+    /// fires rarely (push covers the common case).
+    pub fn fetch_native_actions_from_validators(&self, hashes: Vec<[u8; 32]>) {
+        if hashes.is_empty() {
+            return;
+        }
+        let local = self.local_key.to_bytes();
+        let targets: Vec<VerifyingKey> = {
+            let validators = self.shared.validators.read().unwrap();
+            validators
+                .iter()
+                .filter(|vk_bytes| **vk_bytes != local)
+                .filter_map(|vk_bytes| VerifyingKey::from_bytes(vk_bytes).ok())
+                .collect()
+        };
+        for target in targets {
+            let _ = self.command_tx.send(NetworkCommand::FetchNativeActions {
+                target,
+                hashes: hashes.clone(),
+            });
+        }
     }
 
     /// Drain native-action bodies received via the pull-fallback response (each =
