@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 torus-types = { workspace = true }
+torus-state = { workspace = true }
 torus-telemetry = { workspace = true }
 hotstuff_rs = { workspace = true }
 ed25519-dalek = { workspace = true }

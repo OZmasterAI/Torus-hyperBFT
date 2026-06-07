@@ -99,6 +99,8 @@ impl LibP2PNetwork {
             pending_sends: Mutex::new(PendingSendQueue::new(256)),
             outbound_direct: Mutex::new(HashMap::new()),
             recent_native_bundles: Mutex::new(VecDeque::new()),
+            native_da: RwLock::new(None),
+            native_da_inbound: Mutex::new(VecDeque::new()),
         });
 
         let (command_tx, command_rx) = mpsc::unbounded_channel();
@@ -179,6 +181,29 @@ impl LibP2PNetwork {
 
     pub fn broadcast_native_actions(&self, payload: Vec<u8>) {
         let _ = self.command_tx.send(NetworkCommand::BroadcastNativeActions { payload });
+    }
+
+    /// Attach the durable native-action DA store so the swarm can SERVE bodies
+    /// by-hash on `/torus/native-da/1.0` (Task 5). Called once at startup with a
+    /// cheap clone over the shared StateDb.
+    pub fn set_native_da_store(&self, store: torus_state::NativeDaStore) {
+        *self.shared.native_da.write().unwrap() = Some(store);
+    }
+
+    /// Issue a RARE pull-fallback fetch for missing native-action bodies by-hash
+    /// from `target` (Task 6). Non-blocking: the response is delivered to the
+    /// inbound queue, drained via [`Self::drain_native_da_inbound`].
+    pub fn fetch_native_actions(&self, target: VerifyingKey, hashes: Vec<[u8; 32]>) {
+        let _ = self
+            .command_tx
+            .send(NetworkCommand::FetchNativeActions { target, hashes });
+    }
+
+    /// Drain native-action bodies received via the pull-fallback response (each =
+    /// `bincode(SignedNativeAction)`). Non-blocking — returns whatever has arrived.
+    pub fn drain_native_da_inbound(&self) -> Vec<Vec<u8>> {
+        let mut q = self.shared.native_da_inbound.lock().unwrap();
+        q.drain(..).collect()
     }
 }
 

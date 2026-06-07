@@ -57,6 +57,14 @@ impl NativeDaStore {
         }
     }
 
+    /// Fetch the raw stored bytes (`bincode(SignedNativeAction)`) by action-hash,
+    /// without deserializing. The `/torus/native-da/1.0` serve path ships these
+    /// bytes verbatim to a requesting peer. Takes the 32-byte hash directly so the
+    /// network layer needn't depend on `alloy-primitives`. Returns `None` if absent.
+    pub fn get_raw(&self, hash: &[u8; 32]) -> Result<Option<Vec<u8>>, StateError> {
+        self.db.get_cf_raw(CF_NATIVE_PENDING, hash.as_slice())
+    }
+
     /// Remove bodies by hash (e.g. after commit + an eviction window). Best-effort:
     /// absent keys are silently skipped.
     pub fn remove(&self, hashes: &[B256]) -> Result<(), StateError> {

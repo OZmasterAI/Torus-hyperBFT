@@ -11,8 +11,13 @@ use sha3::{Digest, Keccak256};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+use torus_state::NativeDaStore;
+
 use crate::behaviour::{TorusBehaviour, TorusBehaviourEvent, CONSENSUS_TOPIC, NATIVE_ACTION_TOPIC, TX_TOPIC};
-use crate::codec::{BlockDataNetRequest, BlockDataNetResponse, DirectRequest, DirectResponse};
+use crate::codec::{
+    BlockDataNetRequest, BlockDataNetResponse, DirectRequest, DirectResponse, NativeDaNetRequest,
+    NativeDaNetResponse,
+};
 use crate::config::NetworkConfig;
 use crate::peer::PeerMap;
 use crate::pending_send::PendingSendQueue;
@@ -60,6 +65,13 @@ pub enum NetworkCommand {
     BroadcastNativeActions {
         payload: Vec<u8>,
     },
+    /// RARE pull-fallback: fetch native-action bodies by-hash from `target` via the
+    /// dedicated `/torus/native-da/1.0` protocol when a CompactBlock body is absent
+    /// locally (Phase C Task 5/6). Push covers the common case; this fires on a miss.
+    FetchNativeActions {
+        target: VerifyingKey,
+        hashes: Vec<[u8; 32]>,
+    },
 }
 
 /// Marker byte prefixed to forwarded native action payloads in DirectRequest.
@@ -75,6 +87,28 @@ fn push_bounded(ring: &mut VecDeque<Vec<u8>>, item: Vec<u8>, cap: usize) {
         ring.pop_front();
     }
     ring.push_back(item);
+}
+
+/// Serve native-action bodies for the requested hashes from the durable DA store
+/// (Task 5). Returns one entry per requested hash, **in request order**; an empty
+/// `Vec` means the body was not found (or no store is attached). The stored
+/// `bincode(SignedNativeAction)` bytes are shipped verbatim. Pure over the store
+/// handle so the serve semantics are unit-testable without a live swarm.
+fn serve_native_da_bodies(store: Option<&NativeDaStore>, hashes: &[[u8; 32]]) -> Vec<Vec<u8>> {
+    let Some(store) = store else {
+        return vec![Vec::new(); hashes.len()];
+    };
+    hashes
+        .iter()
+        .map(|h| match store.get_raw(h) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => Vec::new(),
+            Err(e) => {
+                warn!(?e, "native-da serve: DA store read failed");
+                Vec::new()
+            }
+        })
+        .collect()
 }
 
 pub struct SharedState {
@@ -104,6 +138,15 @@ pub struct SharedState {
     /// Re-pushed to a validator that (re)connects after the original push, so its
     /// mempool catches up before the next CompactBlock it must reconstruct.
     pub recent_native_bundles: Mutex<VecDeque<Vec<u8>>>,
+    /// Durable native-action DA store handle, used to SERVE bodies by-hash on the
+    /// `/torus/native-da/1.0` protocol (Task 5). `None` until attached at startup
+    /// via `LibP2PNetwork::set_native_da_store` (a cheap clone over the same
+    /// StateDb). Tests/observers may leave it unset → serve returns not-found.
+    pub native_da: RwLock<Option<NativeDaStore>>,
+    /// Inbound native-action bodies received via the pull-fallback response
+    /// (each = `bincode(SignedNativeAction)`), drained by the consensus app on a
+    /// reconstruction miss (Task 6). Bounded by `MAX_INBOUND_QUEUE`.
+    pub native_da_inbound: Mutex<VecDeque<Vec<u8>>>,
 }
 
 enum SwarmAction {
@@ -693,6 +736,67 @@ fn handle_event(
             warn!(%peer, ?error, "block-data INBOUND FAILURE");
         }
         SwarmEvent::Behaviour(TorusBehaviourEvent::BlockData(_)) => {}
+        // Native-DA fetch protocol: inbound request — serve bodies by-hash from the
+        // durable DA store (Task 5). The RARE pull-fallback; push covers the common case.
+        SwarmEvent::Behaviour(TorusBehaviourEvent::NativeDa(request_response::Event::Message {
+            message: request_response::Message::Request { request, channel, .. },
+            peer,
+            ..
+        })) => {
+            let bodies = if peer_scoring.is_banned(&peer) {
+                vec![Vec::new(); request.hashes.len()]
+            } else {
+                let store = shared.native_da.read().unwrap();
+                serve_native_da_bodies(store.as_ref(), &request.hashes)
+            };
+            let found = bodies.iter().filter(|b| !b.is_empty()).count();
+            debug!(%peer, requested = request.hashes.len(), found, "native-da request: serving bodies");
+            if swarm
+                .behaviour_mut()
+                .native_da
+                .send_response(channel, NativeDaNetResponse { bodies })
+                .is_err()
+            {
+                warn!(%peer, "native-da send_response FAILED (channel dead)");
+            }
+        }
+        // Native-DA fetch protocol: inbound response — queue bodies for the
+        // consensus app to insert into its DA store and retry reconstruct (Task 6).
+        // Responses are solicited (request_response only delivers for our own
+        // outbound request), so no sender verification is needed.
+        SwarmEvent::Behaviour(TorusBehaviourEvent::NativeDa(request_response::Event::Message {
+            message: request_response::Message::Response { response, .. },
+            peer,
+            ..
+        })) => {
+            let mut queue = shared.native_da_inbound.lock().unwrap();
+            let mut queued = 0usize;
+            for body in response.bodies {
+                if body.is_empty() {
+                    continue; // not-found entry
+                }
+                if queue.len() >= MAX_INBOUND_QUEUE {
+                    warn!(%peer, "native-da inbound queue full — dropping body");
+                    break;
+                }
+                queue.push_back(body);
+                queued += 1;
+            }
+            if queued > 0 {
+                debug!(%peer, queued, "native-da response: queued bodies for app");
+            }
+        }
+        SwarmEvent::Behaviour(TorusBehaviourEvent::NativeDa(
+            request_response::Event::OutboundFailure { peer, error, .. },
+        )) => {
+            warn!(%peer, ?error, "native-da OUTBOUND FAILURE");
+        }
+        SwarmEvent::Behaviour(TorusBehaviourEvent::NativeDa(
+            request_response::Event::InboundFailure { peer, error, .. },
+        )) => {
+            warn!(%peer, ?error, "native-da INBOUND FAILURE");
+        }
+        SwarmEvent::Behaviour(TorusBehaviourEvent::NativeDa(_)) => {}
         // FIX 6 (CONS-FIND-25-32): Sync protocol events.
         // TODO: When sync serving is implemented, handle sync requests in a
         // spawned task (tokio::spawn) to avoid blocking the consensus event loop.
@@ -891,6 +995,15 @@ fn handle_command(
             );
             tracing::info!(count, bytes = payload.len(), "broadcast pre-proposal actions to validators");
         }
+        NetworkCommand::FetchNativeActions { target, hashes } => {
+            let peer_id = shared.peer_map.read().unwrap().get_peer_id(&target).copied();
+            if let Some(pid) = peer_id {
+                let req = NativeDaNetRequest { hashes };
+                swarm.behaviour_mut().native_da.send_request(&pid, req);
+            } else {
+                warn!("FetchNativeActions target not in peer map — dropping");
+            }
+        }
     }
 }
 
@@ -1082,6 +1195,8 @@ mod tests {
             pending_sends: Mutex::new(PendingSendQueue::new(256)),
             outbound_direct: Mutex::new(HashMap::new()),
             recent_native_bundles: Mutex::new(VecDeque::new()),
+            native_da: RwLock::new(None),
+            native_da_inbound: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -1149,5 +1264,43 @@ mod tests {
         assert_eq!(ring.len(), RECENT_NATIVE_BUNDLES_CAP);
         assert_eq!(ring.front().unwrap(), &vec![2u8]);
         assert_eq!(ring.back().unwrap(), &vec![RECENT_NATIVE_BUNDLES_CAP as u8 + 1]);
+    }
+
+    /// Task 5: the `/torus/native-da/1.0` serve path returns the stored body bytes
+    /// for a known hash (in request order), an empty entry for an unknown hash, and
+    /// all-empty when no DA store is attached (tests/observers).
+    #[test]
+    fn serve_native_da_returns_known_and_skips_unknown() {
+        use torus_state::db::StateDb;
+        use torus_state::NativeDaStore;
+        use torus_types::{
+            compute_action_hash, ActionSignature, NativeAction, Signature, SignedNativeAction,
+        };
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = StateDb::open(dir.path()).expect("open db");
+        let store = NativeDaStore::new(db);
+
+        let action = SignedNativeAction {
+            action: NativeAction::ClaimRewards,
+            nonce: 7,
+            signature: ActionSignature::Eip712(Signature { v: 27, r: [0u8; 32], s: [0u8; 32] }),
+        };
+        let known: [u8; 32] = compute_action_hash(&action).0;
+        let unknown = [9u8; 32];
+        store.put(&action).expect("put");
+
+        // Known + unknown, order preserved: bodies[0] is the stored body, bodies[1] empty.
+        let bodies = serve_native_da_bodies(Some(&store), &[known, unknown]);
+        assert_eq!(bodies.len(), 2);
+        assert!(!bodies[0].is_empty(), "known hash served");
+        assert!(bodies[1].is_empty(), "unknown hash -> empty (not found)");
+        let got: SignedNativeAction =
+            bincode::deserialize(&bodies[0]).expect("served bytes deserialize");
+        assert_eq!(compute_action_hash(&got).0, known, "served body round-trips to its hash");
+
+        // No store attached -> one empty entry per requested hash.
+        let none = serve_native_da_bodies(None, &[known, unknown]);
+        assert_eq!(none, vec![Vec::<u8>::new(), Vec::<u8>::new()]);
     }
 }

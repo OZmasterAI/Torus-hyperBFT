@@ -6,7 +6,7 @@ use libp2p::{
     StreamProtocol,
 };
 
-use crate::codec::{BlockDataCodec, BorshCodec};
+use crate::codec::{BlockDataCodec, BorshCodec, NativeDaCodec};
 use crate::sync::{SyncRequest, SyncResponse};
 
 pub const CONSENSUS_TOPIC: &str = "/torus/consensus/1.0";
@@ -24,6 +24,10 @@ pub struct TorusBehaviour {
     pub connection_limits: connection_limits::Behaviour,
     /// Dedicated block-data fetch protocol (hybrid pipelining Task 2).
     pub block_data: request_response::Behaviour<BlockDataCodec>,
+    /// Dedicated native-action DA fetch protocol (Phase C Task 5): serves
+    /// native-action bodies by-hash as the RARE pull-fallback for CompactBlock
+    /// reconstruction. Push stays primary; this fires only on a miss.
+    pub native_da: request_response::Behaviour<NativeDaCodec>,
     /// Peer block list for banning (Phase 3: 3.1.7).
     pub block_list: allow_block_list::Behaviour<allow_block_list::BlockedPeers>,
 }
@@ -70,6 +74,16 @@ impl TorusBehaviour {
             request_response::Config::default().with_request_timeout(Duration::from_secs(10)),
         );
 
+        // Native-action DA fetch request-response (borsh codec, Phase C Task 5):
+        // serves CompactBlock bodies by-hash for the RARE pull-fallback.
+        let native_da = request_response::Behaviour::<NativeDaCodec>::new(
+            [(
+                StreamProtocol::new("/torus/native-da/1.0"),
+                request_response::ProtocolSupport::Full,
+            )],
+            request_response::Config::default().with_request_timeout(Duration::from_secs(10)),
+        );
+
         // Block sync request-response (cbor codec)
         let sync_proto = request_response::cbor::Behaviour::<SyncRequest, SyncResponse>::new(
             [(
@@ -106,6 +120,7 @@ impl TorusBehaviour {
             gossipsub,
             direct,
             block_data,
+            native_da,
             sync_proto,
             kademlia,
             identify,

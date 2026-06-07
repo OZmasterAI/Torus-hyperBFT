@@ -22,7 +22,7 @@ use torus_mempool::{Mempool, MempoolConfig};
 use torus_network::{LibP2PNetwork, NetworkConfig};
 use torus_rpc::{find_latest_height, scan_trades_for_block, BlockNotifier, RpcServer};
 use torus_state::cf::CF_BLOCK_HEADERS;
-use torus_state::{PrunerConfig, StateDb, StatePruner};
+use torus_state::{NativeDaStore, PrunerConfig, StateDb, StatePruner};
 use torus_types::ChainConfig;
 
 mod keystore;
@@ -398,6 +398,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         network_config, signing_key.clone(), Some(metrics.clone()),
     ).await?;
     mempool.set_native_gossip_tx(native_gossip.into_sender());
+    // Attach the durable DA store so the swarm can SERVE native-action bodies
+    // by-hash on /torus/native-da/1.0 (Phase C Task 5 — RARE pull-fallback).
+    network.set_native_da_store(NativeDaStore::new(state_db.clone()));
 
     // Spawn inbound native action gossip → mempool task
     if let Some(mut native_rx) = network.take_native_action_rx() {
