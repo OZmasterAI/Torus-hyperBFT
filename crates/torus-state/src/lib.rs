@@ -9,6 +9,7 @@ pub mod overlay;
 pub mod pruner;
 pub mod snapshot;
 pub mod trie;
+pub mod trie_cursor;
 
 pub use backend::{AtomicWriteOp, NativeStateOverlay, StateBackend};
 pub use db::StateDb;

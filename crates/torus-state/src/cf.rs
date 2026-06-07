@@ -89,8 +89,19 @@ pub const META_NATIVE_APPLIED_HEIGHT: &[u8] = b"native_applied_height";
 
 // Trie (MPT state root)
 pub const CF_TRIE_NODES: &str = "cf_trie_nodes";
+/// Account-trie branch nodes for reth's `StateRoot`. Key: path nibbles (1 byte/nibble),
+/// value: encoded `BranchNodeCompact`. Phase A (incremental state root).
 pub const CF_TRIE_ACCOUNTS: &str = "cf_trie_accounts";
+/// Storage-trie branch nodes. Key: keccak(address)(32) ++ path nibbles, value: branch node.
+/// The hashed-address prefix isolates each account's storage trie. Phase A.
 pub const CF_TRIE_STORAGE: &str = "cf_trie_storage";
+
+// Hashed-state mirrors (keccak-ordered) — back reth's `StateRoot` hashed cursors (Phase A).
+/// keccak(address)(32) -> reth `Account` (nonce, balance, bytecode_hash). Keccak-ordered so a
+/// RocksDB iterator yields accounts in Ethereum state-trie order.
+pub const CF_HASHED_ACCOUNTS: &str = "cf_hashed_accounts";
+/// keccak(address)(32) ++ keccak(slot)(32) -> 32-byte big-endian storage value. Keccak-ordered.
+pub const CF_HASHED_STORAGE: &str = "cf_hashed_storage";
 
 /// All column family names. RocksDB requires these at open time.
 pub const ALL_CF_NAMES: &[&str] = &[
@@ -131,4 +142,6 @@ pub const ALL_CF_NAMES: &[&str] = &[
     CF_TRIE_NODES,
     CF_TRIE_ACCOUNTS,
     CF_TRIE_STORAGE,
+    CF_HASHED_ACCOUNTS,
+    CF_HASHED_STORAGE,
 ];
