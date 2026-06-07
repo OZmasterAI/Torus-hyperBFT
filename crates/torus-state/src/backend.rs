@@ -292,6 +292,75 @@ impl NativeStateOverlay {
         }
         addrs
     }
+
+    /// The native-root dirty `(cf_tag, key) -> Option<value>` set this overlay would flush — writes
+    /// (`Some`) and deletes (`None`) hitting the 6 native-root CFs only (mirrors `dirty_evm_accounts`).
+    /// Fed to the bucketed native trie (A2.2) so it tracks the committed native state. Non-root CFs
+    /// (nonces, governance, markets, …) are excluded — they are not part of the native root.
+    pub fn dirty_native_keys(&self) -> BTreeMap<(u8, Vec<u8>), Option<Vec<u8>>> {
+        let state = self.pending.read().unwrap();
+        let mut dirty = BTreeMap::new();
+        for ((cf_name, key), value) in &state.writes {
+            if let Some(tag) = crate::native_trie::cf_tag(cf_name) {
+                dirty.insert((tag, key.clone()), Some(value.clone()));
+            }
+        }
+        for (cf_name, key) in &state.deletes {
+            if let Some(tag) = crate::native_trie::cf_tag(cf_name) {
+                dirty.insert((tag, key.clone()), None);
+            }
+        }
+        dirty
+    }
+
+    /// Flush pending native writes AND maintain the bucketed native trie — the native-CF writes and
+    /// the trie/mirror updates land in ONE atomic `WriteBatch` (crash-consistent: native state and
+    /// its root advance together or not at all).
+    ///
+    /// Safety: the trie ops are computed read-only FIRST and only appended on success, and the batch
+    /// is written either way — so a trie-maintenance failure can NEVER drop committed native state.
+    /// On failure the error is returned AFTER the native writes are durable; the caller logs it and
+    /// the (off-by-default) incremental root is merely stale for that block (repaired by replay /
+    /// caught by the runtime oracle).
+    pub fn flush_with_native_trie(&self, target: &StateDb) -> Result<(), StateError> {
+        let state = self.pending.read().unwrap();
+        let raw = target.inner();
+        let mut batch = WriteBatch::default();
+        for ((cf_name, key), value) in &state.writes {
+            let cf = raw
+                .cf_handle(cf_name)
+                .ok_or_else(|| StateError::MissingColumnFamily(cf_name.clone()))?;
+            batch.put_cf(cf, key, value);
+        }
+        for (cf_name, key) in &state.deletes {
+            if let Some(cf) = raw.cf_handle(cf_name) {
+                batch.delete_cf(cf, key);
+            }
+        }
+
+        // Native-root dirty map, folded into the SAME batch.
+        let mut dirty: BTreeMap<(u8, Vec<u8>), Option<Vec<u8>>> = BTreeMap::new();
+        for ((cf_name, key), value) in &state.writes {
+            if let Some(tag) = crate::native_trie::cf_tag(cf_name) {
+                dirty.insert((tag, key.clone()), Some(value.clone()));
+            }
+        }
+        for (cf_name, key) in &state.deletes {
+            if let Some(tag) = crate::native_trie::cf_tag(cf_name) {
+                dirty.insert((tag, key.clone()), None);
+            }
+        }
+
+        // apply_native_dirty_to_batch computes all ops before appending, so on Err nothing was
+        // appended and the native-CF writes still flush.
+        let trie_result = if dirty.is_empty() {
+            Ok(())
+        } else {
+            crate::native_trie::apply_native_dirty_to_batch(target, &mut batch, &dirty).map(|_| ())
+        };
+        target.write(batch)?;
+        trie_result
+    }
 }
 
 impl StateBackend for NativeStateOverlay {
@@ -575,5 +644,29 @@ mod tests {
         let loaded = StateBackend::get_account(&overlay, &addr).unwrap().unwrap();
         assert_eq!(loaded.balance, info.balance);
         assert_eq!(loaded.nonce, info.nonce);
+    }
+
+    /// A2.2: flushing through `flush_with_native_trie` commits native CFs AND keeps the bucketed
+    /// native root equal to the full scan, in one atomic batch. Non-root CFs (nonces) are excluded.
+    #[test]
+    fn flush_with_native_trie_maintains_root() {
+        use crate::cf::{CF_NATIVE_NONCES, CF_STAKING_VALIDATORS};
+        let (db, _dir) = temp_db();
+        crate::native_trie::build_native_trie_to_cf(&db).unwrap(); // empty base
+
+        let overlay = NativeStateOverlay::new(db.clone());
+        StateBackend::put_cf_raw(&overlay, CF_NATIVE_BALANCES, b"\x00\x01acct", b"bal1").unwrap();
+        StateBackend::put_cf_raw(&overlay, CF_STAKING_VALIDATORS, b"val1", b"stake").unwrap();
+        StateBackend::put_cf_raw(&overlay, CF_NATIVE_NONCES, b"nonce", b"x").unwrap(); // non-root
+
+        overlay.flush_with_native_trie(&db).unwrap();
+
+        assert_eq!(
+            StateDb::get_cf_raw(&db, CF_NATIVE_BALANCES, b"\x00\x01acct").unwrap().unwrap(),
+            b"bal1"
+        );
+        let persisted = crate::native_trie::persisted_native_root(&db).unwrap();
+        assert_eq!(persisted, crate::native_trie::native_root_full(&db).unwrap());
+        assert_ne!(persisted, crate::trie::EMPTY_ROOT_HASH);
     }
 }

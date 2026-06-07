@@ -382,8 +382,14 @@ impl ExecutionContext {
                 );
             }
 
-            if let Err(e) = overlay.flush(&self.state_db) {
-                tracing::error!(%e, height, "failed to flush native overlay");
+            // Flush native state AND maintain the incremental native bucketed-Merkle trie in ONE
+            // atomic batch (Phase A A2.2). Unconditional like the EVM resync below — the trie is
+            // kept current regardless of TORUS_INCREMENTAL_STATE_ROOT so it is ready when the flag
+            // flips. A trie-maintenance failure never drops committed native state (the native-CF
+            // writes are in the same batch and are written even if the trie ops are skipped); it
+            // only leaves the off-by-default incremental native root stale for this block.
+            if let Err(e) = overlay.flush_with_native_trie(&self.state_db) {
+                tracing::error!(%e, height, "native overlay flush / incremental native trie maintenance failed");
             }
 
             // Phase A: native post-commit credited EVM account balances (fees / validator rewards)
@@ -593,6 +599,12 @@ impl TorusApp {
         // the full-scan root stays primary until TORUS_INCREMENTAL_STATE_ROOT is enabled.
         if let Err(e) = torus_state::incremental::ensure_trie_built(&state_db) {
             tracing::warn!(%e, "failed to build initial state trie (incremental root unavailable until rebuilt)");
+        }
+        // Phase A A2.2: same for the native bucketed-Merkle trie. No-op after first boot; keeps the
+        // incremental native root's base ready while the full-scan native root stays primary until
+        // TORUS_INCREMENTAL_STATE_ROOT is enabled.
+        if let Err(e) = torus_state::native_trie::ensure_native_trie_built(&state_db) {
+            tracing::warn!(%e, "failed to build initial native trie (incremental native root unavailable until rebuilt)");
         }
 
         // Crash recovery runs synchronously before spawning the pipeline.
