@@ -682,6 +682,43 @@ impl TorusApp {
         last_header
     }
 
+    /// Reconstruct a `CompactBlock`'s full body set from the durable DA store.
+    ///
+    /// Returns `Ok(TorusBlock)` when every referenced native-action body is present
+    /// in the DA store, or `Err(missing_hashes)` listing the bodies that must be
+    /// fetched (the rare pull-fallback, Task 6). Reads the DURABLE store -- NOT the
+    /// ephemeral mempool -- so a block-referenced body survives the 60s nonce
+    /// window, pool eviction, and a restart (livelock root cause, mem 28e1a821).
+    fn reconstruct_compact_from_da(
+        &self,
+        compact: &CompactBlock,
+    ) -> Result<TorusBlock, Vec<torus_types::B256>> {
+        let mut native_actions = Vec::with_capacity(compact.native_action_hashes.len());
+        let mut missing = Vec::new();
+        if !compact.native_action_hashes.is_empty() {
+            match self.mempool {
+                Some(ref mempool) => {
+                    for hash in &compact.native_action_hashes {
+                        match mempool.get_native_da(hash) {
+                            Some(action) => native_actions.push(action),
+                            None => missing.push(*hash),
+                        }
+                    }
+                }
+                None => missing = compact.native_action_hashes.clone(),
+            }
+        }
+        if !missing.is_empty() {
+            return Err(missing);
+        }
+        Ok(TorusBlock {
+            header: compact.header.clone(),
+            native_actions,
+            evm_transactions: compact.evm_transactions.clone(),
+            core_writer_actions: compact.core_writer_actions.clone(),
+        })
+    }
+
     fn hash_datum(bytes: &[u8]) -> [u8; 32] {
         let mut hasher = Sha256::new();
         hasher.update(bytes);
@@ -981,7 +1018,10 @@ impl App<RocksKVStore> for TorusApp {
                 let mut missing: Vec<usize> = Vec::new();
 
                 for (i, hash) in compact.native_action_hashes.iter().enumerate() {
-                    match mempool.get_native_by_hash(hash) {
+                    // Read the DURABLE DA store, not the ephemeral nonce-gated mempool:
+                    // a block-referenced body survives the 60s nonce window, pool
+                    // eviction, and restart (livelock root cause, mem 28e1a821).
+                    match mempool.get_native_da(hash) {
                         Some(action) => actions[i] = Some(action),
                         None => missing.push(i),
                     }
@@ -1005,7 +1045,7 @@ impl App<RocksKVStore> for TorusApp {
                     for _ in 0..RECONSTRUCT_RETRIES {
                         std::thread::sleep(RECONSTRUCT_RETRY_DELAY);
                         missing.retain(|&i| {
-                            match mempool.get_native_by_hash(&compact.native_action_hashes[i]) {
+                            match mempool.get_native_da(&compact.native_action_hashes[i]) {
                                 Some(action) => {
                                     actions[i] = Some(action);
                                     false
@@ -1105,7 +1145,12 @@ impl App<RocksKVStore> for TorusApp {
         }
     }
 
-    /// Validate a block during sync: same as validate_block (structural only).
+    /// Validate a block during sync. Delegates to `validate_block`, which now
+    /// reconstructs CompactBlock bodies from the durable DA store (not the ephemeral
+    /// mempool) -- so a synced block whose bodies are durably present validates
+    /// instead of being rejected and blacklisting the serving peer (livelock root
+    /// cause, mem 28e1a821). A still-missing body is fetched via the rare
+    /// pull-fallback (Task 6).
     fn validate_block_for_sync(
         &mut self,
         request: ValidateBlockRequest<RocksKVStore>,
@@ -1126,40 +1171,56 @@ impl App<RocksKVStore> for TorusApp {
         };
 
         let datum_bytes = datum.bytes();
-        let torus_block = if let Ok(full) = bincode::deserialize::<TorusBlock>(datum_bytes) {
-            let height = full.header.height;
-            self.pending_proposals.remove(&height).unwrap_or(full)
-        } else if let Ok(compact) = bincode::deserialize::<CompactBlock>(datum_bytes) {
-            let height = compact.header.height;
-            if let Some(cached) = self.pending_proposals.remove(&height) {
-                cached
-            } else if let Some(ref mempool) = self.mempool {
-                let mut native_actions = Vec::with_capacity(compact.native_action_hashes.len());
-                for hash in &compact.native_action_hashes {
-                    match mempool.get_native_by_hash(hash) {
-                        Some(action) => native_actions.push(action),
-                        None => {
-                            tracing::error!(height, "on_committed_block: missing action hash — block will not execute");
-                            return;
-                        }
-                    }
-                }
-                TorusBlock {
-                    header: compact.header,
-                    native_actions,
-                    evm_transactions: compact.evm_transactions,
-                    core_writer_actions: compact.core_writer_actions,
+        // The HEADER is always in the datum; only CompactBlock BODIES need the DA
+        // store. Extract the header up front and advance last_header from it
+        // UNCONDITIONALLY (below) so a missing body can never freeze consensus
+        // height/view -- the livelock root cause (mem 28e1a821) was an early return
+        // here, before last_header advanced, which froze RPC height and churned views.
+        let (header, reconstructed): (TorusBlockHeader, Result<TorusBlock, Vec<torus_types::B256>>) =
+            if let Ok(full) = bincode::deserialize::<TorusBlock>(datum_bytes) {
+                let height = full.header.height;
+                let block = self.pending_proposals.remove(&height).unwrap_or(full);
+                (block.header.clone(), Ok(block))
+            } else if let Ok(compact) = bincode::deserialize::<CompactBlock>(datum_bytes) {
+                let height = compact.header.height;
+                if let Some(cached) = self.pending_proposals.remove(&height) {
+                    (cached.header.clone(), Ok(cached))
+                } else {
+                    (
+                        compact.header.clone(),
+                        self.reconstruct_compact_from_da(&compact),
+                    )
                 }
             } else {
-                tracing::error!(height, "on_committed_block: no mempool — cannot reconstruct");
+                tracing::warn!("on_committed_block: failed to deserialize block datum");
+                return;
+            };
+
+        let height = header.height;
+
+        // Track committed consensus height/view from the header regardless of body
+        // availability (BFT finality is independent of local execution readiness).
+        if height > self.last_header.height {
+            self.last_header = header.clone();
+            self.leader_state.set_view(height.saturating_add(1));
+        }
+
+        let torus_block = match reconstructed {
+            Ok(b) => b,
+            Err(missing) => {
+                // An already-committed block whose bodies we cannot reconstruct. With
+                // the durable DA store + proposer mirror + push this is rare (a node that
+                // committed via QC without validating); the pull-fallback (Task 6) fetches
+                // and executes it. Loud, never silent -- and crucially the chain height
+                // has already advanced above, so consensus does NOT wedge.
+                tracing::error!(
+                    height,
+                    missing = missing.len(),
+                    "on_committed_block: missing native bodies for committed block -- execution deferred (fetch: Task 6)"
+                );
                 return;
             }
-        } else {
-            tracing::warn!("on_committed_block: failed to deserialize block datum");
-            return;
         };
-
-        let height = torus_block.header.height;
 
         tracing::info!(
             height,
@@ -1167,11 +1228,6 @@ impl App<RocksKVStore> for TorusApp {
             native = torus_block.native_actions.len(),
             "on_committed_block: sending to execution pipeline"
         );
-
-        if height > self.last_header.height {
-            self.last_header = torus_block.header.clone();
-            self.leader_state.set_view(height.saturating_add(1));
-        }
 
         if !torus_block.native_actions.is_empty() {
             if let Some(ref mempool) = self.mempool {
@@ -1361,6 +1417,60 @@ mod crash_recovery_tests {
             100,
             "full block must carry all native actions inline"
         );
+    }
+
+    #[test]
+    fn compactblock_reconstructs_from_da_store() {
+        // Reproduction of the livelock fix: a CompactBlock referencing a native body
+        // that lives ONLY in the durable DA store -- never admitted to the ephemeral
+        // nonce-gated mempool -- must reconstruct. Previously reconstruction read the
+        // mempool, missed, and the block was rejected (+ peer blacklisted on the sync
+        // path), wedging the chain (root cause, mem 28e1a821).
+        let (config, state_db) = make_test_config_and_db();
+
+        let body = sign_claim_rewards(123);
+        let body_hash = torus_types::compute_action_hash(&body);
+
+        let mempool = Arc::new(torus_mempool::Mempool::new(
+            state_db.clone(),
+            torus_mempool::MempoolConfig::default(),
+        ));
+        // Mirror to the DA store WITHOUT mempool admission (mirror_native_to_da does
+        // not touch the in-memory pool) -- exactly the "in DA, not in mempool" state.
+        mempool.mirror_native_to_da(std::slice::from_ref(&body));
+        assert!(
+            mempool.get_native_by_hash(&body_hash).is_none(),
+            "precondition: body is NOT in the ephemeral mempool pool"
+        );
+        assert!(
+            mempool.get_native_da(&body_hash).is_some(),
+            "precondition: body IS in the durable DA store"
+        );
+
+        let app = TorusApp::new(state_db.clone(), &config, None, Some(mempool), None);
+
+        // A CompactBlock referencing the body by hash reconstructs from the DA store.
+        let full = make_block(1, vec![body.clone()]);
+        let compact = CompactBlock::from_block(&full);
+        let reconstructed = app
+            .reconstruct_compact_from_da(&compact)
+            .expect("CompactBlock must reconstruct from the DA store");
+        assert_eq!(reconstructed.native_actions.len(), 1);
+        assert_eq!(
+            torus_types::compute_action_hash(&reconstructed.native_actions[0]),
+            body_hash,
+            "reconstructed body must match the referenced hash"
+        );
+
+        // A body present in NEITHER store -> typed miss (Err of the missing hashes),
+        // the signal the rare pull-fallback consumes (Task 6) -- not a hard reject
+        // that blacklists a peer.
+        let unknown = make_block(2, vec![sign_claim_rewards(999)]);
+        let unknown_compact = CompactBlock::from_block(&unknown);
+        let missing = app
+            .reconstruct_compact_from_da(&unknown_compact)
+            .expect_err("an absent body must report a typed miss");
+        assert_eq!(missing.len(), 1);
     }
 
     #[test]
