@@ -168,9 +168,27 @@ Mirrors `incremental.rs` exactly:
 - **Rollback:** `native_root_full` stays in-tree as the oracle; revert = flip callsites back. New CFs
   become dead but harmless.
 
-## Open questions (resolve during implementation)
-1. **Atomic batch shape (A2.2):** fold the native-trie/mirror updates into the overlay-flush batch vs a
-   second batch immediately after. Target: one batch (crash-consistent). Confirm against the existing
-   `flush` + `resync_evm_accounts` ordering in `execute_committed_block`.
-2. **Writer coverage (A2.2/A2.3):** confirm all 6-CF writers go through the overlay (rule 5).
-3. **5-CF helper fate (A2.3):** fix to 6 CFs vs delete — depends on its callers (sync/catchup?).
+## Open questions — RESOLVED during implementation
+1. **Atomic batch shape (A2.2):** RESOLVED — `NativeStateOverlay::flush_with_native_trie` folds the
+   native-CF writes AND the trie/mirror updates into ONE `WriteBatch`. Safe-by-construction: the trie
+   ops are computed read-only first and appended only on success, and the batch is written either way,
+   so a trie-maintenance failure can never drop committed native state.
+2. **Writer coverage (A2.2/A2.3):** RESOLVED — `execute_committed_block` is the SOLE native-commit path
+   (live execution thread + crash-recovery replay + tests); all native execution runs on the overlay,
+   so the generalized `dirty_native_keys` captures every 6-CF write. Validated by the real-execution
+   determinism gate (`chaos.rs::native_incremental_root_matches_full_scan_under_real_execution`) and
+   `four_node_consensus` with `TORUS_INCREMENTAL_ORACLE=1`.
+3. **5-CF helper fate (A2.3):** RESOLVED — `trie.rs::compute_native_state_root_from_db` (divergent
+   5-CF) DELETED; `snapshot.rs` now uses `native_root_full` (bucketed, 6-CF) so snapshot verification
+   matches the consensus composite root.
+
+## Cross-cutting verification (done)
+- **Determinism CI gate:** the incremental==full corpus runs as ordinary `#[test]`s (hard CI failure
+  on divergence): EVM (`torus-state::incremental` — explicit + 40-round fuzz + sequential), native
+  (`torus-state::native_trie` — single-step + 30-round sequential + crash), and the integration-level
+  **real-execution** gate in `chaos.rs`. Plus `four_node_consensus` runnable with flag+oracle.
+- **Sync / N−1 lag:** `validate_block_for_sync` → `validate_block` (the same path as live consensus) →
+  the bridge native validation → `flagged_native_root`, so live and sync compute the native root
+  identically. `validate_block_for_catchup` is EVM-only (no native root). The lag is preserved: at
+  validate time the persisted native root reflects state N−1 (last executed block), matching the
+  full-scan of the N−1 DB — confirmed by `four_node_consensus` + oracle (8 blocks, 0 divergence).

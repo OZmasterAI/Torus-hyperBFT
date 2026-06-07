@@ -321,6 +321,63 @@ fn test_replay_determinism() {
 // Fast tests — no #[ignore]
 // ============================================================================
 
+/// Phase A cross-cutting determinism gate: under REAL native execution (NativeExecutor on a
+/// NativeStateOverlay, committed via `flush_with_native_trie` — the consensus commit path), the
+/// incrementally-maintained native bucketed-Merkle root must stay byte-identical to the full-scan
+/// oracle after EVERY block. This is the compile-time twin of the runtime oracle: a HARD CI failure
+/// on any divergence. Unlike the torus-state unit corpus (synthetic (cf,key) writes), this exercises
+/// the actual native-CF write patterns of orders / cancels / oracle / lockbox / governance / fees.
+#[test]
+fn native_incremental_root_matches_full_scan_under_real_execution() {
+    use torus_state::native_trie::{build_native_trie_to_cf, native_root_full, persisted_native_root};
+    use torus_state::NativeStateOverlay;
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let state_db = StateDb::open(tmp.path()).unwrap();
+
+    // Fund traders, then build the native trie base over the funded state.
+    let positions = PositionManager::new(state_db.clone());
+    for i in 1..=12u8 {
+        let mut bal = positions.get_native_balance(&addr(i)).unwrap();
+        bal.available = bal.available + fp(10_000_000);
+        positions.put_native_balance(&addr(i), &bal).unwrap();
+    }
+    build_native_trie_to_cf(&state_db).unwrap();
+    assert_eq!(
+        persisted_native_root(&state_db).unwrap(),
+        native_root_full(&state_db).unwrap(),
+        "post-migration: persisted native root must equal full scan"
+    );
+
+    for block in 0..15usize {
+        // Mirror the consensus native block: execute on an overlay, then flush + maintain the trie
+        // in one atomic batch.
+        let overlay = NativeStateOverlay::new(state_db.clone());
+        let mut ctx = NativeExecContext::new(
+            overlay.clone(),
+            (block + 1) as u64,
+            1_700_000_001 + block as u64,
+            0,
+            100,
+            100,
+            Address::ZERO,
+            Address::ZERO,
+            Address::ZERO,
+        );
+        let actions = generate_diverse_block(block);
+        NativeExecutor::execute_batch(&mut ctx, &actions);
+        NativeExecutor::process_governance(&mut ctx);
+        NativeExecutor::distribute_fees(&mut ctx, 0);
+        overlay.flush_with_native_trie(&state_db).unwrap();
+
+        assert_eq!(
+            persisted_native_root(&state_db).unwrap(),
+            native_root_full(&state_db).unwrap(),
+            "block {block}: incremental native root != full-scan oracle (real execution)"
+        );
+    }
+}
+
 /// Execution ordering: verify tech-req section 2.2 ordering is enforced.
 /// Cancels before new orders, non-GTC before GTC.
 #[test]
