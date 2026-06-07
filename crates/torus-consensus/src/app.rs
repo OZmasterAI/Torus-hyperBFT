@@ -385,6 +385,18 @@ impl ExecutionContext {
             if let Err(e) = overlay.flush(&self.state_db) {
                 tracing::error!(%e, height, "failed to flush native overlay");
             }
+
+            // Phase A: native post-commit credited EVM account balances (fees / validator rewards)
+            // straight to CF_ACCOUNTS via the overlay flush, bypassing incremental trie maintenance.
+            // Re-sync those accounts into CF_HASHED_*/CF_TRIE_* so the incremental root keeps tracking
+            // the full scan (devnet-smoke finding). Best-effort: a failure only degrades the
+            // flag-gated (off-by-default) incremental path, never the committed plain state.
+            let native_evm_addrs = overlay.dirty_evm_accounts();
+            if let Err(e) =
+                torus_state::incremental::resync_evm_accounts(&self.state_db, &native_evm_addrs)
+            {
+                tracing::error!(%e, height, "failed to resync incremental trie after native post-commit");
+            }
         }
 
         // ---- Persist block body for RPC queries ----

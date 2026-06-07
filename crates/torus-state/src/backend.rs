@@ -269,6 +269,29 @@ impl NativeStateOverlay {
         let state = self.pending.read().unwrap();
         state.writes.len() + state.deletes.len()
     }
+
+    /// Addresses whose `CF_ACCOUNTS` entry this overlay wrote or deleted.
+    ///
+    /// Native post-commit (fee distribution to treasury/dev_pool, validator rewards) credits EVM
+    /// account *balances* through this overlay; on flush those land in `CF_ACCOUNTS` but bypass the
+    /// incremental EVM trie. The consensus commit path feeds these addresses to
+    /// `torus_state::incremental::resync_evm_accounts` so `CF_HASHED_*`/`CF_TRIE_*` keep tracking
+    /// `CF_ACCOUNTS` (otherwise the incremental root drifts from the full scan — devnet-smoke find).
+    pub fn dirty_evm_accounts(&self) -> Vec<Address> {
+        let state = self.pending.read().unwrap();
+        let mut addrs = Vec::new();
+        for (cf_name, key) in state.writes.keys() {
+            if cf_name == CF_ACCOUNTS && key.len() == 20 {
+                addrs.push(Address::from_slice(key));
+            }
+        }
+        for (cf_name, key) in &state.deletes {
+            if cf_name == CF_ACCOUNTS && key.len() == 20 {
+                addrs.push(Address::from_slice(key));
+            }
+        }
+        addrs
+    }
 }
 
 impl StateBackend for NativeStateOverlay {

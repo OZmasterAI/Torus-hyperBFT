@@ -8,6 +8,7 @@
 use std::collections::BTreeMap;
 
 use alloy_primitives::{keccak256, Address, B256, U256};
+use reth_primitives_traits::Account;
 use reth_trie::hashed_cursor::HashedPostStateCursorFactory;
 use reth_trie::prefix_set::{PrefixSetMut, TriePrefixSetsMut};
 use reth_trie::StateRoot;
@@ -333,6 +334,59 @@ pub fn commit_evm_bundle_incremental(
     Ok(root)
 }
 
+/// Re-sync the incremental EVM trie (`CF_HASHED_ACCOUNTS` + `CF_TRIE_*`) for accounts whose
+/// `CF_ACCOUNTS` entry changed OUTSIDE the EVM-bundle commit — i.e. native post-commit (fee
+/// distribution to treasury/dev_pool, validator rewards) crediting EVM account balances.
+///
+/// **Account-only by design:** native execution changes EVM account *balances*, never EVM contract
+/// *storage*, so each account's existing storage trie (and thus `storage_root`) is reused (no
+/// `HashedStorage` entries). Reads the FINAL `CF_ACCOUNTS` value (EIP-161: empty -> deleted) for
+/// each address. Without this, `CF_HASHED_*`/`CF_TRIE_*` drift from `CF_ACCOUNTS` after every
+/// fee-bearing block and the incremental root diverges from the full scan (devnet-smoke finding).
+pub fn resync_evm_accounts(db: &StateDb, addresses: &[Address]) -> Result<(), StateError> {
+    let unique: std::collections::BTreeSet<Address> = addresses.iter().copied().collect();
+    if unique.is_empty() {
+        return Ok(());
+    }
+
+    let mut hashed = HashedPostState::default();
+    for addr in &unique {
+        let hashed_address = keccak256(addr.as_slice());
+        let account = match db.get_account(addr)? {
+            Some(info) if !is_empty_account(&info) => Some(Account::from(&info)),
+            _ => None,
+        };
+        hashed.accounts.insert(hashed_address, account);
+    }
+
+    let prefix_sets = hashed.construct_prefix_sets().freeze();
+    let sorted = hashed.into_sorted();
+    let (_root, trie_updates) = StateRoot::new(
+        RocksTrieCursorFactory::new(db),
+        HashedPostStateCursorFactory::new(RocksHashedCursorFactory::new(db), &sorted),
+    )
+    .with_prefix_sets(prefix_sets)
+    .root_with_updates()
+    .map_err(|e| StateError::InvalidData(format!("resync evm accounts: {e}")))?;
+
+    let mut batch = WriteBatch::default();
+    let cf_acc = db.cf_handle(CF_HASHED_ACCOUNTS)?;
+    for addr in &unique {
+        let hashed_address = keccak256(addr.as_slice());
+        match db.get_account(addr)? {
+            Some(info) if !is_empty_account(&info) => {
+                batch.put_cf(cf_acc, hashed_address.as_slice(), encode_account_info(&info));
+            }
+            _ => {
+                batch.delete_cf(cf_acc, hashed_address.as_slice());
+            }
+        }
+    }
+    write_trie_updates(db, &mut batch, &trie_updates)?;
+    db.write(batch)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -655,5 +709,102 @@ mod tests {
         let oracle = compute_state_root_from_db(&db).expect("oracle root");
         let migrated = build_trie_to_cf(&db).expect("migration");
         assert_eq!(migrated, oracle, "empty-state migration must match oracle (EMPTY_ROOT_HASH)");
+    }
+
+    /// Regression for the devnet-smoke finding: SEQUENTIAL incremental commits must keep the
+    /// persisted trie/hashed mirror byte-identical to the full scan after EVERY block. The A1.3
+    /// single-step gate missed this multi-block accumulation, and a live 4-node devnet under EVM
+    /// load diverged on every EVM block.
+    #[test]
+    fn sequential_incremental_commits_match_full_scan() {
+        fn xorshift(s: &mut u64) -> u64 {
+            *s ^= *s << 13;
+            *s ^= *s >> 7;
+            *s ^= *s << 17;
+            *s
+        }
+        let (db, _dir) = temp_db();
+        seed(&db);
+        build_trie_to_cf(&db).expect("migration");
+
+        let addr_of = |i: u32| -> Address {
+            let mut b = [0u8; 20];
+            b[0..4].copy_from_slice(&i.to_be_bytes());
+            b[19] = 0x5a;
+            Address::from(b)
+        };
+        let empty = || BundleState::builder(0..=0).build();
+
+        let mut rng = 0x1234_5678_9abc_def0u64;
+        for round in 0..25u32 {
+            // Transfer-style bundle: existing accounts get new balance/nonce (no storage),
+            // mirroring the tx-loop EOA transfers that triggered the live divergence.
+            let mut builder = BundleState::builder(0..=0);
+            for _ in 0..3 {
+                let a = addr_of((xorshift(&mut rng) % 300) as u32);
+                builder = builder.state_present_account_info(
+                    a,
+                    eoa(1_000 + xorshift(&mut rng) % 1_000_000, round as u64 + 1),
+                );
+            }
+            let bundle = builder.build();
+
+            // The EXACT check the runtime oracle does each block: incremental vs full-scan for this
+            // bundle over the current (sequentially-evolved) committed base. This is where the live
+            // devnet diverged — the maintained trie node set can be root-correct yet non-canonical,
+            // so the next bundle reveals the wrong nodes.
+            let pre_incr = incremental_evm_root(&db, &bundle).unwrap().0;
+            let pre_full = full_post_bundle_evm_root(&db, &bundle).unwrap();
+            assert_eq!(
+                pre_incr, pre_full,
+                "round {round}: incremental != full over evolved base (PRE-commit oracle check)"
+            );
+
+            commit_evm_bundle_incremental(&db, &bundle).expect("commit");
+
+            // And the committed trie itself stays consistent.
+            let incremental = incremental_evm_root(&db, &empty()).unwrap().0;
+            let full = full_post_bundle_evm_root(&db, &empty()).unwrap();
+            assert_eq!(incremental, full, "round {round}: committed trie drifted (POST-commit)");
+        }
+    }
+
+    /// Regression for the devnet-smoke root cause: native post-commit credits EVM account balances
+    /// straight to CF_ACCOUNTS (bypassing the trie); `resync_evm_accounts` must restore consistency.
+    #[test]
+    fn resync_evm_accounts_repairs_native_post_commit_drift() {
+        use super::resync_evm_accounts;
+        let (db, _dir) = temp_db();
+        seed(&db);
+        build_trie_to_cf(&db).expect("migration");
+
+        // A normal EVM-bundle commit (maintains its own trie).
+        let user = address!("0000000000000000000000000000000000000001");
+        let bundle = BundleState::builder(0..=0)
+            .state_present_account_info(user, eoa(500_000, 3))
+            .build();
+        commit_evm_bundle_incremental(&db, &bundle).expect("commit");
+
+        // Simulate native post-commit: credit EVM balances DIRECTLY to CF_ACCOUNTS, bypassing the
+        // trie (exactly what NativeStateOverlay::flush does for treasury/dev_pool fee distribution).
+        let treasury = address!("f000000000000000000000000000000000000001");
+        db.put_account(&treasury, &eoa(123_456, 0)).unwrap();
+        db.put_account(&user, &eoa(777_777, 4)).unwrap(); // also bump an existing account
+
+        let empty = || BundleState::builder(0..=0).build();
+        // The incremental base now drifts from the full scan (the live divergence).
+        assert_ne!(
+            incremental_evm_root(&db, &empty()).unwrap().0,
+            full_post_bundle_evm_root(&db, &empty()).unwrap(),
+            "expected drift after native-style bypass write (pre-resync)"
+        );
+
+        // Re-sync the touched accounts; consistency must be restored.
+        resync_evm_accounts(&db, &[treasury, user]).expect("resync");
+        assert_eq!(
+            incremental_evm_root(&db, &empty()).unwrap().0,
+            full_post_bundle_evm_root(&db, &empty()).unwrap(),
+            "after resync: incremental must equal full scan"
+        );
     }
 }
