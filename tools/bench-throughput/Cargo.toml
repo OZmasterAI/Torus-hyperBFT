@@ -15,6 +15,7 @@ torus-state = { workspace = true }
 torus-genesis = { workspace = true }
 torus-economics = { workspace = true }
 alloy-primitives = { workspace = true }
+revm = { workspace = true }
 k256 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

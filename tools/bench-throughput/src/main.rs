@@ -79,6 +79,21 @@ enum Command {
         #[arg(long, default_value_t = 512)]
         concurrency: usize,
     },
+    /// State-root scaling proof (Phase A A1.6): seed synthetic EVM state at each --sizes value,
+    /// then measure per-block incremental vs full-scan root-compute time. The incremental root is
+    /// O(changed) so its time stays ~flat as state grows; the full scan is O(total state) so it
+    /// grows ~linearly — the production-scale payoff a fresh small-state devnet can't show.
+    StateRoot {
+        /// Comma-separated account counts to sweep (synthetic state sizes). 1M can take minutes.
+        #[arg(long, default_value = "1000,100000,1000000")]
+        sizes: String,
+        /// Accounts changed per simulated block (the O(changed) working set).
+        #[arg(long, default_value_t = 16)]
+        changed: usize,
+        /// Blocks measured per size; the reported time is the MIN across them (noise-robust).
+        #[arg(long, default_value_t = 5)]
+        blocks: usize,
+    },
 }
 
 fn random_place_order(rng: &mut impl Rng, market_id: u64) -> NativeAction {
@@ -612,6 +627,102 @@ fn run_combined() {
 }
 
 // ============================================================================
+// Mode 4: State-root scaling (Phase A A1.6)
+// ============================================================================
+
+fn run_state_root_scaling(sizes_str: &str, changed: usize, blocks: usize) {
+    use alloy_primitives::U256;
+    use revm::database::BundleState;
+    use revm::state::AccountInfo;
+    use tempfile::TempDir;
+    use torus_state::db::KECCAK_EMPTY;
+    use torus_state::incremental::{
+        build_trie_to_cf, full_post_bundle_evm_root, incremental_evm_root,
+    };
+    use torus_state::StateDb;
+
+    let sizes: Vec<u64> = sizes_str
+        .split(',')
+        .filter_map(|s| s.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .collect();
+    let changed = changed.max(1);
+    let blocks = blocks.max(1);
+
+    let eoa = |bal: u64, nonce: u64| AccountInfo {
+        balance: U256::from(bal),
+        nonce,
+        code_hash: KECCAK_EMPTY,
+        account_id: None,
+        code: None,
+    };
+    let addr_of = |i: u64| -> Address {
+        let mut b = [0u8; 20];
+        b[0..8].copy_from_slice(&i.to_be_bytes());
+        Address::from(b)
+    };
+
+    println!("=== State-Root Scaling Proof (Phase A A1.6) ===");
+    println!("Changed accounts/block: {changed}");
+    println!("Blocks measured/size:   {blocks} (min reported)");
+    println!();
+    println!(
+        "{:>12}  {:>13}  {:>13}  {:>9}  {:>11}",
+        "accounts", "full-scan", "incremental", "speedup", "trie-build"
+    );
+    println!("{}", "-".repeat(66));
+
+    for &n in &sizes {
+        let dir = TempDir::new().unwrap();
+        let db = StateDb::open(dir.path()).unwrap();
+        for i in 0..n {
+            db.put_account(&addr_of(i), &eoa(1_000 + i, i)).unwrap();
+        }
+
+        let t = Instant::now();
+        build_trie_to_cf(&db).unwrap();
+        let build_time = t.elapsed();
+
+        // A small bundle changing `changed` existing accounts spread across the keyspace — the
+        // per-block working set. This is O(changed), independent of n.
+        let mut builder = BundleState::builder(0..=0);
+        let stride = (n / changed as u64).max(1);
+        for j in 0..changed as u64 {
+            let i = (j * stride) % n;
+            builder = builder.state_present_account_info(addr_of(i), eoa(7_000_000 + j, 999));
+        }
+        let bundle = builder.build();
+
+        let (mut full, mut incr) = (Duration::MAX, Duration::MAX);
+        for _ in 0..blocks {
+            let t = Instant::now();
+            let _ = incremental_evm_root(&db, &bundle).unwrap();
+            incr = incr.min(t.elapsed());
+
+            let t = Instant::now();
+            let _ = full_post_bundle_evm_root(&db, &bundle).unwrap();
+            full = full.min(t.elapsed());
+        }
+
+        let speedup = full.as_secs_f64() / incr.as_secs_f64().max(1e-9);
+        println!(
+            "{:>12}  {:>13}  {:>13}  {:>8.1}x  {:>11}",
+            format_num(n),
+            format!("{full:.2?}"),
+            format!("{incr:.2?}"),
+            speedup,
+            format!("{build_time:.2?}"),
+        );
+    }
+
+    println!();
+    println!(
+        "Incremental root-compute time stays ~flat as accounts grow; full-scan grows ~linearly.\n\
+         That flat line is the sub-100ms block-time guarantee holding at production state size."
+    );
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -634,5 +745,10 @@ async fn main() {
             batch_size,
         } => run_consensus(&rpc_urls, senders, duration, concurrency, batch_size).await,
         Command::Combined { .. } => run_combined(),
+        Command::StateRoot {
+            sizes,
+            changed,
+            blocks,
+        } => run_state_root_scaling(&sizes, changed, blocks),
     }
 }

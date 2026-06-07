@@ -807,4 +807,93 @@ mod tests {
             "after resync: incremental must equal full scan"
         );
     }
+
+    /// A1.6 scaling proof: the incremental EVM root is O(changed) — its per-block compute time is
+    /// (near-)independent of total state size, while the full-scan oracle is O(total state). This
+    /// is the production-scale payoff Phase B's small-state devnet couldn't show: block time stays
+    /// flat as chain state grows.
+    ///
+    /// Robust to scheduler noise: each measurement is the MIN over several runs, and the assertions
+    /// compare GROWTH FACTORS (large-state / small-state) — the full scan must grow far faster than
+    /// incremental — plus a clear absolute speedup at large state. Sizes are kept modest so the test
+    /// stays a few seconds; `bench-throughput state-root` sweeps 1k/100k/1M for the human-facing proof.
+    ///
+    /// `#[ignore]`d: it's a perf proof (the full-scan leg is O(state) and slow in a debug build), so
+    /// it runs on demand / in a perf lane rather than the fast default suite. Run with
+    /// `cargo test -p torus-state -- --ignored incremental_evm_root_scales_flat_vs_full_scan`.
+    #[test]
+    #[ignore = "perf proof (slow full-scan leg); run explicitly or via bench-throughput state-root"]
+    fn incremental_evm_root_scales_flat_vs_full_scan() {
+        use std::time::{Duration, Instant};
+
+        const N_SMALL: u32 = 1_000;
+        const N_LARGE: u32 = 25_000; // 25x state
+        const CHANGED: u32 = 8; // O(changed) per "block"
+        const RUNS: u32 = 5;
+
+        // Build a DB of `n` plain EOAs, migrate the trie, then return (min incremental, min
+        // full-scan) root-compute time for a fixed bundle that changes CHANGED existing accounts.
+        fn measure(n: u32) -> (Duration, Duration) {
+            let (db, _dir) = temp_db();
+            for i in 0..n {
+                let mut b = [0u8; 20];
+                b[0..4].copy_from_slice(&i.to_be_bytes());
+                db.put_account(&Address::from(b), &eoa(1_000 + i as u64, i as u64)).unwrap();
+            }
+            build_trie_to_cf(&db).unwrap();
+
+            // Spread the changed accounts across the keyspace; this is O(changed), not O(state).
+            let mut builder = BundleState::builder(0..=0);
+            for j in 0..CHANGED {
+                let i = j * (n / CHANGED);
+                let mut b = [0u8; 20];
+                b[0..4].copy_from_slice(&i.to_be_bytes());
+                builder = builder
+                    .state_present_account_info(Address::from(b), eoa(7_000_000 + j as u64, 999));
+            }
+            let bundle = builder.build();
+
+            let (mut incr, mut full) = (Duration::MAX, Duration::MAX);
+            for _ in 0..RUNS {
+                let t = Instant::now();
+                let _ = incremental_evm_root(&db, &bundle).unwrap();
+                incr = incr.min(t.elapsed());
+
+                let t = Instant::now();
+                let _ = full_post_bundle_evm_root(&db, &bundle).unwrap();
+                full = full.min(t.elapsed());
+            }
+            (incr, full)
+        }
+
+        let (incr_s, full_s) = measure(N_SMALL);
+        let (incr_l, full_l) = measure(N_LARGE);
+
+        let full_growth = full_l.as_secs_f64() / full_s.as_secs_f64().max(1e-9);
+        let incr_growth = incr_l.as_secs_f64() / incr_s.as_secs_f64().max(1e-9);
+        let speedup_large = full_l.as_secs_f64() / incr_l.as_secs_f64().max(1e-9);
+
+        eprintln!(
+            "A1.6 scaling ({state_x}x state): full-scan {full_s:?}->{full_l:?} ({full_growth:.1}x), \
+             incremental {incr_s:?}->{incr_l:?} ({incr_growth:.1}x); large-state speedup {speedup_large:.1}x",
+            state_x = N_LARGE / N_SMALL,
+        );
+
+        // 1. The full scan grows with state size (≈linear): more state must cost much more time.
+        assert!(
+            full_growth > 8.0,
+            "full-scan should grow ~linearly with state ({}x state) but grew only {full_growth:.1}x",
+            N_LARGE / N_SMALL,
+        );
+        // 2. Incremental grows far slower than the full scan — the "flat vs linear" signal.
+        assert!(
+            full_growth > incr_growth * 3.0,
+            "incremental must grow far slower than full-scan (full {full_growth:.1}x vs incr {incr_growth:.1}x)",
+        );
+        // 3. At large state, incremental is dramatically cheaper than the full scan.
+        assert!(
+            speedup_large > 5.0,
+            "incremental must be much cheaper than full-scan at scale (got {speedup_large:.1}x)",
+        );
+    }
 }
