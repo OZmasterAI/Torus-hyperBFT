@@ -259,16 +259,23 @@ pub fn build_native_trie_to_cf(db: &StateDb) -> Result<B256, StateError> {
 /// Returns `true` iff a build was performed. The trie CF always holds at least the root marker once
 /// built (even for empty native state), so its emptiness is the reliable "not yet built" signal.
 pub fn ensure_native_trie_built(db: &StateDb) -> Result<bool, StateError> {
+    if is_native_trie_built(db)? {
+        return Ok(false);
+    }
+    build_native_trie_to_cf(db)?;
+    Ok(true)
+}
+
+/// `true` if the native bucketed trie has been built (cheap probe: `CF_NATIVE_TRIE` is non-empty —
+/// the root marker is always written by [`build_native_trie_to_cf`], even for empty native state).
+/// The flag-routed native root falls back to the full scan when this is `false` (an unmigrated DB).
+pub fn is_native_trie_built(db: &StateDb) -> Result<bool, StateError> {
     let cf = db.cf_handle(CF_NATIVE_TRIE)?;
     let mut iter = db.inner().raw_iterator_cf(cf);
     iter.seek_to_first();
     let built = iter.valid();
     iter.status()?;
-    if built {
-        return Ok(false);
-    }
-    build_native_trie_to_cf(db)?;
-    Ok(true)
+    Ok(built)
 }
 
 /// Read the persisted native root marker (the incrementally-maintained root). Returns

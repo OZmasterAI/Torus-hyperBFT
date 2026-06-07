@@ -102,16 +102,24 @@ pub fn build_trie_to_cf(db: &StateDb) -> Result<B256, StateError> {
 /// in one atomic batch, so `CF_HASHED_*`/`CF_TRIE_*` advance in lockstep with `CF_ACCOUNTS`; this
 /// therefore only does work on the first boot after Phase A is enabled (or after a fresh genesis).
 pub fn ensure_trie_built(db: &StateDb) -> Result<bool, StateError> {
-    let cf = db.cf_handle(CF_HASHED_ACCOUNTS)?;
-    let mut iter = db.inner().raw_iterator_cf(cf);
-    iter.seek_to_first();
-    let already_built = iter.valid();
-    iter.status()?;
-    if already_built {
+    if is_trie_built(db)? {
         return Ok(false);
     }
     build_trie_to_cf(db)?;
     Ok(true)
+}
+
+/// `true` if the persistent EVM trie + hashed mirror exist (cheap probe: `CF_HASHED_ACCOUNTS` is
+/// non-empty). The incremental root is only valid once they are built, so the flag-routed root falls
+/// back to the full scan when this is `false` (an unmigrated DB — e.g. a unit test that bypasses the
+/// boot-time `ensure_trie_built`).
+pub fn is_trie_built(db: &StateDb) -> Result<bool, StateError> {
+    let cf = db.cf_handle(CF_HASHED_ACCOUNTS)?;
+    let mut iter = db.inner().raw_iterator_cf(cf);
+    iter.seek_to_first();
+    let built = iter.valid();
+    iter.status()?;
+    Ok(built)
 }
 
 /// `true` if `info` is an EIP-161 "empty" account (zero nonce, zero balance, no code) — such

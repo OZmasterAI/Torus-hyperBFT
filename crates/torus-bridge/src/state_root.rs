@@ -15,13 +15,16 @@ use torus_state::trie::{
     compute_composite_root, compute_state_root, compute_storage_root, TrieAccount, EMPTY_ROOT_HASH,
 };
 
-/// Runtime switch (default OFF): compute the EVM state root incrementally instead of by full scan.
-/// Off by default so the proven full-scan path stays primary until the incremental path is
-/// validated on a live devnet (Phase A, flag-gated rollout).
+/// Runtime switch (Phase A **default ON**, devnet-baked): compute the EVM + native state root
+/// incrementally (O(changed)/block) instead of by full scan. `TORUS_INCREMENTAL_STATE_ROOT=0` (or
+/// `false`) is the kill-switch back to the proven full-scan root. The node always builds/maintains
+/// the tries at boot (`ensure_trie_built` / `ensure_native_trie_built`), so the incremental base is
+/// ready before any block; the validator `StateRootMismatch` check remains the live safety net.
 fn incremental_state_root_enabled() -> bool {
-    std::env::var("TORUS_INCREMENTAL_STATE_ROOT")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+    match std::env::var("TORUS_INCREMENTAL_STATE_ROOT") {
+        Ok(v) => !(v == "0" || v.eq_ignore_ascii_case("false")),
+        Err(_) => true,
+    }
 }
 
 /// EVM post-bundle root honoring the incremental flag. Split out with an explicit `incremental`
@@ -31,7 +34,10 @@ fn evm_root_routed(
     bundle: &BundleState,
     incremental: bool,
 ) -> Result<B256, StateError> {
-    if !incremental {
+    // Fall back to the full scan when incremental is off OR the persistent trie hasn't been built
+    // yet (an unmigrated DB — production builds it at boot, but unit tests may bypass that). This
+    // keeps default-on safe: a missing trie yields the correct full-scan root, never a wrong one.
+    if !incremental || !torus_state::incremental::is_trie_built(state_db)? {
         return compute_post_bundle_evm_root(state_db, bundle);
     }
     let (root, _updates) = torus_state::incremental::incremental_evm_root(state_db, bundle)?;
@@ -59,7 +65,8 @@ fn flagged_evm_root(state_db: &StateDb, bundle: &BundleState) -> Result<B256, St
 /// `TORUS_INCREMENTAL_ORACLE`, cross-checks it against the full scan, failing loud on any divergence
 /// (a consensus-splitting bug) rather than voting it.
 fn native_root_routed(state_db: &StateDb, incremental: bool) -> Result<B256, StateError> {
-    if !incremental {
+    // Same full-scan fallback as the EVM half when incremental is off or the native trie is unbuilt.
+    if !incremental || !torus_state::native_trie::is_native_trie_built(state_db)? {
         return torus_state::native_trie::native_root_full(state_db);
     }
     let persisted = torus_state::native_trie::persisted_native_root(state_db)?;
