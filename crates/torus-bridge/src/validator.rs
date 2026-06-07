@@ -11,7 +11,7 @@ use torus_types::{NativeAction, Receipt, TorusBlock};
 use crate::decode::decode_all_txs;
 use crate::error::BridgeError;
 use crate::state_root::{
-    compute_full_composite_root, compute_native_state_root, compute_post_bundle_state_root,
+    compute_full_composite_root, compute_post_bundle_state_root, flagged_native_root,
 };
 
 /// Successfully validated block — ready for commitment.
@@ -411,7 +411,7 @@ impl BlockValidator {
         }
 
         // Compute composite state root (lagged native root — reads unmodified DB).
-        let native_root = compute_native_state_root(state_db)?;
+        let native_root = flagged_native_root(state_db)?;
         let computed_root =
             compute_full_composite_root(state_db, &exec_result.bundle, native_root)?;
 

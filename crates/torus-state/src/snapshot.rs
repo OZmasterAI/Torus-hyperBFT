@@ -12,7 +12,8 @@ use serde::{Deserialize, Serialize};
 use crate::cf::ALL_CF_NAMES;
 use crate::db::StateDb;
 use crate::error::StateError;
-use crate::trie::{compute_composite_root, compute_native_state_root_from_db, compute_state_root_from_db};
+use crate::native_trie::native_root_full;
+use crate::trie::{compute_composite_root, compute_state_root_from_db};
 
 /// Metadata recorded alongside a snapshot.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -133,7 +134,10 @@ impl StateDb {
         // FIX 6 (EVM-PF-11): Recompute the *composite* root (EVM + native) to
         // compare like-for-like against metadata.state_root which is the composite root.
         let evm_root = compute_state_root_from_db(&snapshot_db)?;
-        let native_root = compute_native_state_root_from_db(&snapshot_db)?;
+        // Native half = the bucketed-Merkle root (Phase A A2.3), matching the consensus native root
+        // (`torus_bridge::state_root::flagged_native_root`) so a snapshot verifies like-for-like
+        // against the block's composite `state_root`. (Replaces the divergent 5-CF flat keccak.)
+        let native_root = native_root_full(&snapshot_db)?;
         let computed_root = compute_composite_root(evm_root, native_root);
 
         let verified = computed_root == metadata.state_root;
@@ -354,7 +358,7 @@ mod tests {
     /// Compute the composite state root (EVM + native) matching what verify_snapshot expects.
     fn composite_root_from_db(db: &StateDb) -> B256 {
         let evm_root = compute_state_root_from_db(db).unwrap();
-        let native_root = compute_native_state_root_from_db(db).unwrap();
+        let native_root = native_root_full(db).unwrap();
         compute_composite_root(evm_root, native_root)
     }
 

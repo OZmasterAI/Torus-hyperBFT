@@ -53,6 +53,35 @@ fn flagged_evm_root(state_db: &StateDb, bundle: &BundleState) -> Result<B256, St
     evm_root_routed(state_db, bundle, incremental_state_root_enabled())
 }
 
+/// Native root honoring the incremental flag — the symmetric twin of [`evm_root_routed`]. Flag-off
+/// computes the bucketed-Merkle root by full scan (`native_root_full`, the determinism ORACLE);
+/// flag-on reads the incrementally-maintained persisted root and, under debug or
+/// `TORUS_INCREMENTAL_ORACLE`, cross-checks it against the full scan, failing loud on any divergence
+/// (a consensus-splitting bug) rather than voting it.
+fn native_root_routed(state_db: &StateDb, incremental: bool) -> Result<B256, StateError> {
+    if !incremental {
+        return torus_state::native_trie::native_root_full(state_db);
+    }
+    let persisted = torus_state::native_trie::persisted_native_root(state_db)?;
+    if cfg!(debug_assertions) || std::env::var("TORUS_INCREMENTAL_ORACLE").is_ok() {
+        let full = torus_state::native_trie::native_root_full(state_db)?;
+        if persisted != full {
+            return Err(StateError::InvalidData(format!(
+                "incremental native-root divergence: incremental={persisted} full-scan={full}"
+            )));
+        }
+    }
+    Ok(persisted)
+}
+
+/// Native state root, routed by the runtime flag ([`incremental_state_root_enabled`]). Replaces the
+/// flat keccak ([`compute_native_state_root`]) at the consensus callsites: BOTH flag states compute
+/// the same bucketed-Merkle root (value-neutral flag), so flipping the flag needs no coordination —
+/// the new binary (which maintains the native trie) is the unit of upgrade.
+pub fn flagged_native_root(state_db: &StateDb) -> Result<B256, StateError> {
+    native_root_routed(state_db, incremental_state_root_enabled())
+}
+
 /// Compute the composite state root (EVM + native) after applying the given `BundleState`.
 ///
 /// Native state is a no-op in Phase 1 — native root is `EMPTY_ROOT_HASH`.

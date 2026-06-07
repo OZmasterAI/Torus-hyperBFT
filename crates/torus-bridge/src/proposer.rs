@@ -10,7 +10,7 @@ use torus_types::{Receipt, SignedNativeAction, TorusBlock, TorusBlockHeader};
 
 use crate::decode::{decode_all_txs, DecodedTx};
 use crate::error::BridgeError;
-use crate::state_root::{compute_full_composite_root, compute_native_state_root, compute_post_bundle_state_root};
+use crate::state_root::{compute_full_composite_root, compute_post_bundle_state_root, flagged_native_root};
 
 /// Result of a block proposal.
 pub struct ProposedBlock {
@@ -232,7 +232,7 @@ impl BlockProposer {
         }
 
         // Compute composite state root (lagged native root — reads unmodified DB).
-        let native_root = compute_native_state_root(state_db)?;
+        let native_root = flagged_native_root(state_db)?;
         let state_root = compute_full_composite_root(state_db, &exec_result.bundle, native_root)?;
         let receipts_root = compute_receipts_root(&exec_result.receipts)
             .map_err(|e| BridgeError::Serialization(format!("receipts: {e}")))?;
