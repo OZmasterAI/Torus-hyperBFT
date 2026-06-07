@@ -1,0 +1,80 @@
+{
+  "prp": "native-action-da",
+  "created": "2026-06-07T11:10:00",
+  "goal": "Option B DA layer: durable native-action body store (CF keyed by action-hash, decoupled from 60s nonce gate) + hardened push-primary + RARE pull-fallback by-hash (/torus/native-da/1.0) + remove blacklist/freeze footguns. Reliable out-of-band delivery for 400k orders/sec; first increment un-wedges the testnet livelock. Push-primary/fetch-rare (s297 Option D); pull is fallback-only (per-block pull regressed 46->211ms).",
+  "branch_suggestion": "phase-c-native-da",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Durable DA body store (CF_NATIVE_PENDING) keyed by action-hash, decoupled from 60s nonce gate",
+      "status": "pending",
+      "files": ["crates/torus-state/src/cf.rs", "crates/torus-mempool/src/native_pool.rs"],
+      "validate": "cargo test -p torus-state native_da_store_roundtrip",
+      "depends_on": []
+    },
+    {
+      "id": 2,
+      "name": "Populate DA store on every ingest + produce path (incl nonce-stale, decoupled)",
+      "status": "pending",
+      "files": ["crates/torus-mempool/src/lib.rs", "crates/torus-consensus/src/app.rs"],
+      "validate": "cargo test -p torus-mempool da_store_populated_on_ingest",
+      "depends_on": [1]
+    },
+    {
+      "id": 3,
+      "name": "Reconstruct from DA store in validate/validate_for_sync/on_committed_block; NeedFetch not Invalid; drop last_header freeze",
+      "status": "pending",
+      "files": ["crates/torus-consensus/src/app.rs"],
+      "validate": "cargo test -p torus-consensus compactblock_reconstructs_from_da_store",
+      "depends_on": [2]
+    },
+    {
+      "id": 4,
+      "name": "Remove footguns: no peer-blacklist on missing body; no silent last_header freeze",
+      "status": "pending",
+      "files": ["crates/hotstuff_rs/src/block_sync/client.rs", "crates/torus-consensus/src/app.rs"],
+      "validate": "cargo test -p hotstuff_rs -p torus-consensus missing_body_does_not_blacklist",
+      "depends_on": [3]
+    },
+    {
+      "id": 5,
+      "name": "/torus/native-da/1.0 request_response protocol (serve bodies by-hash from DA store)",
+      "status": "pending",
+      "files": ["crates/torus-network/src/behaviour.rs", "crates/torus-network/src/codec.rs", "crates/torus-network/src/swarm.rs"],
+      "validate": "cargo test -p torus-network native_da_protocol_roundtrip",
+      "depends_on": [1]
+    },
+    {
+      "id": 6,
+      "name": "Wire RARE pull-fallback into the miss path (bounded fetch-on-miss, reconstruct, retry once)",
+      "status": "pending",
+      "files": ["crates/torus-consensus/src/app.rs", "crates/torus-network/src/swarm.rs"],
+      "validate": "cargo test -p torus-integration-tests native_da_pull_fallback_recovers",
+      "depends_on": [3, 5]
+    },
+    {
+      "id": 7,
+      "name": "Harden push-primary (queue/retry, no silent drops) feeding the DA store",
+      "status": "pending",
+      "files": ["crates/torus-network/src/swarm.rs"],
+      "validate": "cargo test -p torus-network push_queues_until_peer_connected",
+      "depends_on": [2]
+    },
+    {
+      "id": 8,
+      "name": "Re-enable CompactBlock proposals behind reliable DA; drop redundant double-send (version-gated)",
+      "status": "pending",
+      "files": ["crates/torus-consensus/src/app.rs"],
+      "validate": "cargo test -p torus-consensus compact_proposal_disseminates",
+      "depends_on": [6, 7]
+    },
+    {
+      "id": 9,
+      "name": "MILESTONE: scale proof toward 400k (bench bs->500 holds, pull-rate low, no stalls) + coordinated relaunch",
+      "status": "blocked",
+      "files": ["tools/bench-throughput/src/main.rs"],
+      "validate": "bench: stalls=0, DA pull-rate low, orders/sec climbs; devnet no justify_block_known=false",
+      "depends_on": [8]
+    }
+  ]
+}
