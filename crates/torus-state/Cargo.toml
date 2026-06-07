@@ -13,6 +13,7 @@ rocksdb = { workspace = true }
 reth-trie = { workspace = true }
 reth-trie-common = { workspace = true }
 reth-storage-errors = { workspace = true }
+reth-primitives-traits = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

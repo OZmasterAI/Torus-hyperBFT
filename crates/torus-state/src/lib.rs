@@ -7,6 +7,7 @@ pub mod error;
 pub mod native_da;
 pub mod overlay;
 pub mod pruner;
+pub mod incremental;
 pub mod snapshot;
 pub mod trie;
 pub mod trie_cursor;

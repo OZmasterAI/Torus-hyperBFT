@@ -22,15 +22,17 @@
 
 use std::sync::Arc;
 
-use alloy_primitives::B256;
+use alloy_primitives::{B256, U256};
+use reth_primitives_traits::Account;
 use reth_storage_errors::db::DatabaseError;
+use reth_trie::hashed_cursor::{HashedCursor, HashedCursorFactory, HashedStorageCursor};
 use reth_trie::trie_cursor::{TrieCursor, TrieCursorFactory, TrieStorageCursor};
 use reth_trie_common::updates::TrieUpdates;
 use reth_trie_common::{BranchNodeCompact, Nibbles, TrieMask};
 use rocksdb::{DBRawIterator, WriteBatch};
 
-use crate::cf::{CF_TRIE_ACCOUNTS, CF_TRIE_STORAGE};
-use crate::db::StateDb;
+use crate::cf::{CF_HASHED_ACCOUNTS, CF_HASHED_STORAGE, CF_TRIE_ACCOUNTS, CF_TRIE_STORAGE};
+use crate::db::{decode_account_info, StateDb};
 use crate::error::StateError;
 
 /// Length of the hashed-address prefix on storage-trie keys.
@@ -128,12 +130,15 @@ pub fn write_trie_updates(
     batch: &mut WriteBatch,
     updates: &TrieUpdates,
 ) -> Result<(), StateError> {
+    // Removes BEFORE upserts: RocksDB applies batch ops in insertion order, and a full recompute
+    // can list a path in BOTH `removed_nodes` and `account_nodes` (e.g. prefix-set "all"). Deleting
+    // first lets the upsert win, so a re-emitted node ends up present rather than wiped.
     let acc_cf = db.cf_handle(CF_TRIE_ACCOUNTS)?;
-    for (path, node) in &updates.account_nodes {
-        batch.put_cf(acc_cf, account_trie_key(path), encode_branch_node(node));
-    }
     for path in &updates.removed_nodes {
         batch.delete_cf(acc_cf, account_trie_key(path));
+    }
+    for (path, node) in &updates.account_nodes {
+        batch.put_cf(acc_cf, account_trie_key(path), encode_branch_node(node));
     }
 
     let stor_cf = db.cf_handle(CF_TRIE_STORAGE)?;
@@ -152,11 +157,11 @@ pub fn write_trie_updates(
             }
             iter.status()?;
         }
-        for (path, node) in &storage.storage_nodes {
-            batch.put_cf(stor_cf, storage_trie_key(hashed_address, path), encode_branch_node(node));
-        }
         for path in &storage.removed_nodes {
             batch.delete_cf(stor_cf, storage_trie_key(hashed_address, path));
+        }
+        for (path, node) in &storage.storage_nodes {
+            batch.put_cf(stor_cf, storage_trie_key(hashed_address, path), encode_branch_node(node));
         }
     }
     Ok(())
@@ -324,6 +329,170 @@ impl<'a> TrieStorageCursor for RocksTrieCursor<'a> {
 
 fn to_db_err<E: std::fmt::Display>(err: E) -> DatabaseError {
     DatabaseError::Other(err.to_string())
+}
+
+// ---- reth HashedCursorFactory over RocksDB (the keccak-ordered hashed-state mirror) ----
+
+/// A [`HashedCursorFactory`] backed by `CF_HASHED_ACCOUNTS` / `CF_HASHED_STORAGE`.
+///
+/// Provides reth's `StateRoot` with post-state account/storage values iterated in keccak(key)
+/// order (Ethereum state-trie order). Account values are the existing 72-byte `AccountInfo`
+/// encoding, converted to reth's `Account` on read.
+#[derive(Clone, Copy)]
+pub struct RocksHashedCursorFactory<'a> {
+    db: &'a StateDb,
+}
+
+impl<'a> RocksHashedCursorFactory<'a> {
+    pub fn new(db: &'a StateDb) -> Self {
+        Self { db }
+    }
+}
+
+impl<'f> HashedCursorFactory for RocksHashedCursorFactory<'f> {
+    type AccountCursor<'a>
+        = RocksHashedAccountCursor<'a>
+    where
+        Self: 'a;
+    type StorageCursor<'a>
+        = RocksHashedStorageCursor<'a>
+    where
+        Self: 'a;
+
+    fn hashed_account_cursor(&self) -> Result<Self::AccountCursor<'_>, DatabaseError> {
+        RocksHashedAccountCursor::new(self.db)
+    }
+
+    fn hashed_storage_cursor(
+        &self,
+        hashed_address: B256,
+    ) -> Result<Self::StorageCursor<'_>, DatabaseError> {
+        RocksHashedStorageCursor::new(self.db, hashed_address)
+    }
+}
+
+/// Cursor over hashed accounts (`CF_HASHED_ACCOUNTS`), keyed by keccak(address).
+pub struct RocksHashedAccountCursor<'a> {
+    db: &'a StateDb,
+    iter: DBRawIterator<'a>,
+}
+
+impl<'a> RocksHashedAccountCursor<'a> {
+    fn new(db: &'a StateDb) -> Result<Self, DatabaseError> {
+        let cf = db.cf_handle(CF_HASHED_ACCOUNTS).map_err(to_db_err)?;
+        Ok(Self { db, iter: db.inner().raw_iterator_cf(cf) })
+    }
+
+    fn read_current(&mut self) -> Result<Option<(B256, Account)>, DatabaseError> {
+        self.iter.status().map_err(to_db_err)?;
+        if !self.iter.valid() {
+            return Ok(None);
+        }
+        let key = self.iter.key().expect("valid iterator has a key");
+        if key.len() != 32 {
+            return Err(to_db_err(format!("hashed account key len {} != 32", key.len())));
+        }
+        let hashed_address = B256::from_slice(key);
+        let info = decode_account_info(self.iter.value().expect("valid value")).map_err(to_db_err)?;
+        Ok(Some((hashed_address, Account::from(&info))))
+    }
+}
+
+impl<'a> HashedCursor for RocksHashedAccountCursor<'a> {
+    type Value = Account;
+
+    fn seek(&mut self, key: B256) -> Result<Option<(B256, Account)>, DatabaseError> {
+        self.iter.seek(key.as_slice());
+        self.read_current()
+    }
+
+    fn next(&mut self) -> Result<Option<(B256, Account)>, DatabaseError> {
+        if !self.iter.valid() {
+            return Ok(None);
+        }
+        self.iter.next();
+        self.read_current()
+    }
+
+    fn reset(&mut self) {
+        if let Ok(cf) = self.db.cf_handle(CF_HASHED_ACCOUNTS) {
+            self.iter = self.db.inner().raw_iterator_cf(cf);
+        }
+    }
+}
+
+/// Cursor over one account's hashed storage (`CF_HASHED_STORAGE`), keyed by
+/// keccak(address) ++ keccak(slot), scanning only the 32-byte address prefix.
+pub struct RocksHashedStorageCursor<'a> {
+    db: &'a StateDb,
+    prefix: [u8; HASHED_ADDR_LEN],
+    iter: DBRawIterator<'a>,
+}
+
+impl<'a> RocksHashedStorageCursor<'a> {
+    fn new(db: &'a StateDb, hashed_address: B256) -> Result<Self, DatabaseError> {
+        let cf = db.cf_handle(CF_HASHED_STORAGE).map_err(to_db_err)?;
+        Ok(Self { db, prefix: hashed_address.0, iter: db.inner().raw_iterator_cf(cf) })
+    }
+
+    fn refresh_iter(&mut self) {
+        if let Ok(cf) = self.db.cf_handle(CF_HASHED_STORAGE) {
+            self.iter = self.db.inner().raw_iterator_cf(cf);
+        }
+    }
+
+    fn read_current(&mut self) -> Result<Option<(B256, U256)>, DatabaseError> {
+        self.iter.status().map_err(to_db_err)?;
+        if !self.iter.valid() {
+            return Ok(None);
+        }
+        let key = self.iter.key().expect("valid iterator has a key");
+        if key.len() != HASHED_ADDR_LEN + 32 || !key.starts_with(&self.prefix) {
+            return Ok(None);
+        }
+        let hashed_slot = B256::from_slice(&key[HASHED_ADDR_LEN..]);
+        let value = U256::from_be_slice(self.iter.value().expect("valid value"));
+        Ok(Some((hashed_slot, value)))
+    }
+}
+
+impl<'a> HashedCursor for RocksHashedStorageCursor<'a> {
+    type Value = U256;
+
+    fn seek(&mut self, subkey: B256) -> Result<Option<(B256, U256)>, DatabaseError> {
+        let mut key = Vec::with_capacity(HASHED_ADDR_LEN + 32);
+        key.extend_from_slice(&self.prefix);
+        key.extend_from_slice(subkey.as_slice());
+        self.iter.seek(&key);
+        self.read_current()
+    }
+
+    fn next(&mut self) -> Result<Option<(B256, U256)>, DatabaseError> {
+        if !self.iter.valid() {
+            return Ok(None);
+        }
+        self.iter.next();
+        self.read_current()
+    }
+
+    fn reset(&mut self) {
+        self.refresh_iter();
+    }
+}
+
+impl<'a> HashedStorageCursor for RocksHashedStorageCursor<'a> {
+    fn is_storage_empty(&mut self) -> Result<bool, DatabaseError> {
+        self.iter.seek(&self.prefix);
+        self.iter.status().map_err(to_db_err)?;
+        let has_entry =
+            self.iter.valid() && self.iter.key().map_or(false, |k| k.starts_with(&self.prefix));
+        Ok(!has_entry)
+    }
+
+    fn set_hashed_address(&mut self, hashed_address: B256) {
+        self.prefix = hashed_address.0;
+        self.refresh_iter();
+    }
 }
 
 #[cfg(test)]
