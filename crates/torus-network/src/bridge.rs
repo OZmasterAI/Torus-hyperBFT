@@ -105,6 +105,7 @@ impl LibP2PNetwork {
             recent_native_bundles: Mutex::new(VecDeque::new()),
             native_da: RwLock::new(None),
             native_da_inbound: Mutex::new(VecDeque::new()),
+            pending_native_pushes: Mutex::new(PendingSendQueue::new(8)),
         });
 
         let (command_tx, command_rx) = mpsc::unbounded_channel();

@@ -147,6 +147,12 @@ pub struct SharedState {
     /// (each = `bincode(SignedNativeAction)`), drained by the consensus app on a
     /// reconstruction miss (Task 6). Bounded by `MAX_INBOUND_QUEUE`.
     pub native_da_inbound: Mutex<VecDeque<Vec<u8>>>,
+    /// Per-validator queue of pre-proposal native-action push envelopes whose target
+    /// was not connected at push time (Task 7). Flushed on the validator's
+    /// `ConnectionEstablished` so a push is DELIVERED on (re)connect instead of
+    /// dropped under load — hardening the push-primary that feeds every validator's
+    /// DA store (push covers the common case so the pull-fallback stays rare).
+    pub pending_native_pushes: Mutex<PendingSendQueue<Vec<u8>>>,
 }
 
 enum SwarmAction {
@@ -831,6 +837,20 @@ fn handle_event(
                             send_direct(swarm, shared, local_key, &vk, message);
                         }
                     }
+                    // T7: deliver native-action pushes that were QUEUED while this
+                    // validator was disconnected (targeted, in enqueue order) — so a
+                    // push is never dropped just because its target was offline.
+                    let queued_pushes = shared.pending_native_pushes.lock().unwrap().flush(&vk);
+                    if !queued_pushes.is_empty() {
+                        info!(%peer_id, count = queued_pushes.len(), "flushing queued native pushes on (re)connect");
+                        for envelope in queued_pushes {
+                            let req = DirectRequest {
+                                sender_key: local_key.to_bytes(),
+                                payload: envelope,
+                            };
+                            swarm.behaviour_mut().direct.send_request(&peer_id, req);
+                        }
+                    }
                     // T4: re-push recent native-action bundles so a (re)connecting
                     // validator's mempool catches up before the next CompactBlock it
                     // must reconstruct. Validator-gated; dedup is free on the receiver.
@@ -972,28 +992,57 @@ fn handle_command(
             }
         }
         NetworkCommand::BroadcastNativeActions { payload } => {
-            let peers: Vec<PeerId> = shared.peer_map.read().unwrap()
-                .peer_ids()
-                .copied()
-                .collect();
-            let count = peers.len();
             let mut envelope = vec![PRE_PROPOSAL_BATCH_MARKER];
             envelope.extend_from_slice(&payload);
-            for pid in peers {
-                let req = DirectRequest {
-                    sender_key: local_key.to_bytes(),
-                    payload: envelope.clone(),
-                };
-                swarm.behaviour_mut().direct.send_request(&pid, req);
+            // Resolve every mapped peer (validators + RPC nodes that also reconstruct
+            // bodies), tagging validator membership and skipping self.
+            let targets: Vec<(VerifyingKey, PeerId, bool)> = {
+                let validators = shared.validators.read().unwrap();
+                let peer_map = shared.peer_map.read().unwrap();
+                peer_map
+                    .peer_ids()
+                    .filter_map(|pid| {
+                        let vk = *peer_map.get_vk(pid)?;
+                        if vk == *local_key {
+                            return None; // never push to self
+                        }
+                        let is_validator = validators.contains(&vk.to_bytes());
+                        Some((vk, *pid, is_validator))
+                    })
+                    .collect()
+            };
+            // T7: send to every connected peer now; for a DISCONNECTED validator, QUEUE
+            // the push so it is delivered on (re)connect instead of dropped under load
+            // (and nudge a dial). The receiver mirrors bodies to its durable DA store
+            // unconditionally (T2), so a delivered push keeps the pull-fallback rare.
+            let mut sent = 0usize;
+            let mut queued = 0usize;
+            for (vk, pid, is_validator) in targets {
+                if swarm.is_connected(&pid) {
+                    let req = DirectRequest {
+                        sender_key: local_key.to_bytes(),
+                        payload: envelope.clone(),
+                    };
+                    swarm.behaviour_mut().direct.send_request(&pid, req);
+                    sent += 1;
+                } else if is_validator {
+                    shared
+                        .pending_native_pushes
+                        .lock()
+                        .unwrap()
+                        .enqueue(&vk, envelope.clone());
+                    let _ = swarm.dial(pid);
+                    queued += 1;
+                }
             }
-            // T4: retain this bundle (bounded ring) for re-push to validators that
-            // (re)connect after this push. Dedup is free on the receiver.
+            // T4: also retain this bundle (bounded ring) for a broad re-push to any
+            // validator that (re)connects after this push. Dedup is free on the receiver.
             push_bounded(
                 &mut shared.recent_native_bundles.lock().unwrap(),
                 envelope,
                 RECENT_NATIVE_BUNDLES_CAP,
             );
-            tracing::info!(count, bytes = payload.len(), "broadcast pre-proposal actions to validators");
+            tracing::info!(sent, queued, bytes = payload.len(), "broadcast pre-proposal actions to validators");
         }
         NetworkCommand::FetchNativeActions { target, hashes } => {
             let peer_id = shared.peer_map.read().unwrap().get_peer_id(&target).copied();
@@ -1197,6 +1246,7 @@ mod tests {
             recent_native_bundles: Mutex::new(VecDeque::new()),
             native_da: RwLock::new(None),
             native_da_inbound: Mutex::new(VecDeque::new()),
+            pending_native_pushes: Mutex::new(PendingSendQueue::new(8)),
         }
     }
 
@@ -1302,5 +1352,32 @@ mod tests {
         // No store attached -> one empty entry per requested hash.
         let none = serve_native_da_bodies(None, &[known, unknown]);
         assert_eq!(none, vec![Vec::<u8>::new(), Vec::<u8>::new()]);
+    }
+
+    /// Task 7: a native-action push to a validator that is not yet connected is
+    /// QUEUED (not dropped) and delivered when the peer (re)connects. Exercises the
+    /// `pending_native_pushes` lifecycle that `BroadcastNativeActions` (enqueue on
+    /// disconnect) and `ConnectionEstablished` (flush on connect) rely on.
+    #[test]
+    fn push_queues_until_peer_connected() {
+        let shared = test_shared();
+        let vk = test_vk(7);
+        let env1 = vec![PRE_PROPOSAL_BATCH_MARKER, 1, 2, 3];
+        let env2 = vec![PRE_PROPOSAL_BATCH_MARKER, 4, 5, 6];
+
+        // Two pushes while the target is disconnected -> both queued, none dropped.
+        shared.pending_native_pushes.lock().unwrap().enqueue(&vk, env1.clone());
+        shared.pending_native_pushes.lock().unwrap().enqueue(&vk, env2.clone());
+
+        // On (re)connect -> flushed in enqueue order, then the queue is cleared.
+        let flushed = shared.pending_native_pushes.lock().unwrap().flush(&vk);
+        assert_eq!(flushed, vec![env1, env2], "queued pushes delivered in order on connect");
+        assert!(
+            shared.pending_native_pushes.lock().unwrap().flush(&vk).is_empty(),
+            "queue cleared after flush"
+        );
+
+        // A different validator's queue is independent (no cross-delivery).
+        assert!(shared.pending_native_pushes.lock().unwrap().flush(&test_vk(8)).is_empty());
     }
 }
