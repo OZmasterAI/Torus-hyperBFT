@@ -1,0 +1,46 @@
+{
+  "prp": "native-da-push-hardening",
+  "created": "2026-06-08",
+  "design": "docs/plans/native-da-push-hardening-impl.md",
+  "note": "Follow-up #4 to native-da-bigbody. Phase 1 (task 1) alone un-wedges bs~1000 (liveness). Gossipsub (Option D) is deferred to a separate follow-up #5.",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Hot-path pull-fallback seam (bounded, view-timeout-safe) — the un-wedge",
+      "phase": "1 (Option A)",
+      "status": "pending",
+      "files": ["crates/torus-consensus/src/app.rs"],
+      "validate": "cargo test -p torus-consensus validate_block",
+      "depends_on": [],
+      "notes": "Reuse landed bigbody pull (Tasks 2-3) with HOT-path consts << 500ms view timeout. If bounded-block too tight under real RTT, switch to async-vote-next-view variant (impl doc Task 1.2)."
+    },
+    {
+      "id": 2,
+      "name": "Raise quinn max_concurrent_bidi_streams (with_quic_config)",
+      "phase": "2 (Option C)",
+      "status": "pending",
+      "files": ["crates/torus-network/src/bridge.rs"],
+      "validate": "cargo test -p torus-network",
+      "depends_on": []
+    },
+    {
+      "id": 3,
+      "name": "Bounded in-flight backpressure on BroadcastNativeActions push loop",
+      "phase": "2 (Option B)",
+      "status": "pending",
+      "files": ["crates/torus-network/src/swarm.rs"],
+      "validate": "cargo test -p torus-network",
+      "depends_on": [],
+      "notes": "Cap concurrent direct.send_request to PUSH_MAX_INFLIGHT; preserve T7 pending_native_pushes disconnect-queue. Optional 3b: hash-only push for batches >4MB (rely on task 1 pull)."
+    },
+    {
+      "id": 4,
+      "name": "Regression gate + bs=1000 un-wedge proof (no permanent wedge, recovers post-load)",
+      "phase": "cross-cutting",
+      "status": "pending",
+      "files": [],
+      "validate": "cargo test -p torus-network -p torus-consensus -p torus-mempool && cargo test -p torus-consensus four_node_consensus",
+      "depends_on": [1, 2, 3]
+    }
+  ]
+}
