@@ -89,6 +89,89 @@ fn push_bounded(ring: &mut VecDeque<Vec<u8>>, item: Vec<u8>, cap: usize) {
     ring.push_back(item);
 }
 
+/// Max concurrent in-flight native-action push `send_request`s (#4 Task 3). Bounds the
+/// push loop so N validators × bursty pre-proposal batches can't exhaust quinn's raised
+/// per-connection bidi-stream window (`NATIVE_DA_STREAM_LIMIT`=512, Task 2) — the
+/// `max sub-streams reached` storm that helped wedge bs=1000. Kept well below the window
+/// so consensus sends (sharing `/torus/direct`) keep stream headroom.
+const PUSH_MAX_INFLIGHT: usize = 32;
+
+/// Max native-action push envelopes queued behind the in-flight cap (#4 Task 3). Bounds
+/// memory if a link saturates; overflow drops the OLDEST (also retained in
+/// `recent_native_bundles` for re-push on reconnect, so a drop is recoverable).
+const PUSH_QUEUE_CAP: usize = 512;
+
+/// Bounded-in-flight scheduler for native-action pushes (#4 Task 3). Caps concurrent
+/// direct `send_request`s to `max_inflight` and queues the overflow (bounded by
+/// `queue_cap`, drop-oldest), dispatching the next queued push only as an in-flight one
+/// completes (Direct `Response`/`OutboundFailure`). Generic over the request-id type so
+/// the policy is unit-testable without a live swarm.
+pub struct PushScheduler<Id: std::hash::Hash + Eq + Copy> {
+    inflight: HashSet<Id>,
+    queue: VecDeque<(PeerId, Vec<u8>)>,
+    max_inflight: usize,
+    queue_cap: usize,
+}
+
+impl PushScheduler<request_response::OutboundRequestId> {
+    /// Construct the production push scheduler with the configured caps (#4 Task 3).
+    pub(crate) fn for_pushes() -> Self {
+        Self::new(PUSH_MAX_INFLIGHT, PUSH_QUEUE_CAP)
+    }
+}
+
+impl<Id: std::hash::Hash + Eq + Copy> PushScheduler<Id> {
+    fn new(max_inflight: usize, queue_cap: usize) -> Self {
+        Self {
+            inflight: HashSet::new(),
+            queue: VecDeque::new(),
+            max_inflight,
+            queue_cap,
+        }
+    }
+
+    /// May another push go out now without exceeding the in-flight cap?
+    fn has_capacity(&self) -> bool {
+        self.inflight.len() < self.max_inflight
+    }
+
+    /// Record a freshly dispatched push as in-flight (keyed by its request id).
+    fn record(&mut self, id: Id) {
+        self.inflight.insert(id);
+    }
+
+    /// Queue a push for later dispatch (the cap was reached). Bounded: when full, drops
+    /// the OLDEST queued push and returns `true` so the caller can log the drop.
+    fn enqueue(&mut self, pid: PeerId, envelope: Vec<u8>) -> bool {
+        let dropped = self.queue.len() >= self.queue_cap && self.queue.pop_front().is_some();
+        self.queue.push_back((pid, envelope));
+        dropped
+    }
+
+    /// A tracked Direct send completed (`Response`/`OutboundFailure`). If `id` was one of
+    /// our in-flight pushes, free its slot and return the next queued push to dispatch (if
+    /// any); the caller sends it and calls [`Self::record`] with the new id. Returns `None`
+    /// for an untracked id (a consensus/forward send on the shared protocol) or an empty
+    /// queue.
+    fn complete(&mut self, id: Id) -> Option<(PeerId, Vec<u8>)> {
+        if self.inflight.remove(&id) {
+            self.queue.pop_front()
+        } else {
+            None
+        }
+    }
+
+    #[cfg(test)]
+    fn inflight_len(&self) -> usize {
+        self.inflight.len()
+    }
+
+    #[cfg(test)]
+    fn queued_len(&self) -> usize {
+        self.queue.len()
+    }
+}
+
 /// Serve native-action bodies for the requested hashes from the durable DA store
 /// (Task 5). Returns one entry per requested hash, **in request order**; an empty
 /// `Vec` means the body was not found (or no store is attached). The stored
@@ -153,6 +236,12 @@ pub struct SharedState {
     /// dropped under load — hardening the push-primary that feeds every validator's
     /// DA store (push covers the common case so the pull-fallback stays rare).
     pub pending_native_pushes: Mutex<PendingSendQueue<Vec<u8>>>,
+    /// Bounded-in-flight scheduler for native-action pushes (#4 Task 3): caps concurrent
+    /// `direct.send_request` pushes to `PUSH_MAX_INFLIGHT` so the push loop can't exhaust
+    /// quinn's bidi-stream window (the `max sub-streams reached` storm). Overflow is queued
+    /// (bounded) and dispatched as in-flight pushes complete (Direct `Response` /
+    /// `OutboundFailure`).
+    pub push_scheduler: Mutex<PushScheduler<request_response::OutboundRequestId>>,
 }
 
 enum SwarmAction {
@@ -616,6 +705,9 @@ fn handle_event(
             ..
         })) => {
             shared.outbound_direct.lock().unwrap().remove(&request_id);
+            // #4 Task 3: if this acked a native push, free its in-flight slot and
+            // dispatch the next queued push (no-op for consensus/forward sends).
+            dispatch_next_push(swarm, shared, local_key, request_id);
         }
         // Direct protocol outbound failure — previously swallowed by `_ => {}`
         // (Task 1 finding b). Re-enqueue the consensus message so the next
@@ -635,6 +727,11 @@ fn handle_event(
             } else {
                 warn!(%peer, ?error, "direct send failed (untracked payload)");
             }
+            // #4 Task 3: a FAILED native push still frees its in-flight slot — dispatch
+            // the next queued push so a saturated link drains instead of stalling (no-op
+            // for consensus sends, already handled above). The failed body is recoverable
+            // via T4 re-push + the hot-path pull (#4 Task 1).
+            dispatch_next_push(swarm, shared, local_key, request_id);
         }
         SwarmEvent::Behaviour(TorusBehaviourEvent::Direct(
             request_response::Event::InboundFailure { peer, error, .. }
@@ -1015,16 +1112,33 @@ fn handle_command(
             // the push so it is delivered on (re)connect instead of dropped under load
             // (and nudge a dial). The receiver mirrors bodies to its durable DA store
             // unconditionally (T2), so a delivered push keeps the pull-fallback rare.
+            //
+            // #4 Task 3: bound concurrent IN-FLIGHT pushes via the PushScheduler so this
+            // loop can't exhaust quinn's per-connection bidi-stream window (the
+            // `max sub-streams reached` storm). Beyond the cap, queue the push (bounded);
+            // it is dispatched as in-flight pushes complete (Direct Response/OutboundFailure,
+            // see `dispatch_next_push`). Disconnected-validator T7 queuing is unchanged.
             let mut sent = 0usize;
             let mut queued = 0usize;
+            let mut backpressured = 0usize;
+            let mut dropped = 0usize;
             for (vk, pid, is_validator) in targets {
                 if swarm.is_connected(&pid) {
-                    let req = DirectRequest {
-                        sender_key: local_key.to_bytes(),
-                        payload: envelope.clone(),
-                    };
-                    swarm.behaviour_mut().direct.send_request(&pid, req);
-                    sent += 1;
+                    let mut sched = shared.push_scheduler.lock().unwrap();
+                    if sched.has_capacity() {
+                        let req = DirectRequest {
+                            sender_key: local_key.to_bytes(),
+                            payload: envelope.clone(),
+                        };
+                        let id = swarm.behaviour_mut().direct.send_request(&pid, req);
+                        sched.record(id);
+                        sent += 1;
+                    } else {
+                        if sched.enqueue(pid, envelope.clone()) {
+                            dropped += 1;
+                        }
+                        backpressured += 1;
+                    }
                 } else if is_validator {
                     shared
                         .pending_native_pushes
@@ -1042,7 +1156,21 @@ fn handle_command(
                 envelope,
                 RECENT_NATIVE_BUNDLES_CAP,
             );
-            tracing::info!(sent, queued, bytes = payload.len(), "broadcast pre-proposal actions to validators");
+            tracing::info!(
+                sent,
+                queued,
+                backpressured,
+                dropped,
+                bytes = payload.len(),
+                "broadcast pre-proposal actions to validators"
+            );
+            if dropped > 0 {
+                // Never silent: a saturated push link dropped the oldest queued pushes.
+                // Recoverable — the bundle is retained in `recent_native_bundles` and
+                // re-pushed when the validator (re)connects, and the hot-path pull (#4
+                // Task 1) recovers any body that still misses.
+                tracing::warn!(dropped, "native push queue saturated -- oldest pushes dropped (recoverable via re-push + hot pull)");
+            }
         }
         NetworkCommand::FetchNativeActions { target, hashes } => {
             let peer_id = shared.peer_map.read().unwrap().get_peer_id(&target).copied();
@@ -1053,6 +1181,31 @@ fn handle_command(
                 warn!("FetchNativeActions target not in peer map — dropping");
             }
         }
+    }
+}
+
+/// On a completed Direct send (`Response`/`OutboundFailure`), if it was a tracked native
+/// push, free its in-flight slot and dispatch the next queued push (#4 Task 3 — bounded
+/// backpressure). No-op for consensus/forward sends, which the scheduler does not track.
+///
+/// The queue drains monotonically: every completion (ack OR failure) pops at most one
+/// queued push, so even a saturated/failing link empties the queue rather than growing it.
+/// A redispatch to a now-disconnected peer simply fails and drains the next; its body is
+/// recoverable via the T4 re-push and the hot-path pull (#4 Task 1).
+fn dispatch_next_push(
+    swarm: &mut Swarm<TorusBehaviour>,
+    shared: &SharedState,
+    local_key: &VerifyingKey,
+    completed: request_response::OutboundRequestId,
+) {
+    let next = shared.push_scheduler.lock().unwrap().complete(completed);
+    if let Some((pid, payload)) = next {
+        let req = DirectRequest {
+            sender_key: local_key.to_bytes(),
+            payload,
+        };
+        let id = swarm.behaviour_mut().direct.send_request(&pid, req);
+        shared.push_scheduler.lock().unwrap().record(id);
     }
 }
 
@@ -1247,6 +1400,7 @@ mod tests {
             native_da: RwLock::new(None),
             native_da_inbound: Mutex::new(VecDeque::new()),
             pending_native_pushes: Mutex::new(PendingSendQueue::new(8)),
+            push_scheduler: Mutex::new(PushScheduler::for_pushes()),
         }
     }
 
@@ -1379,6 +1533,81 @@ mod tests {
 
         // A different validator's queue is independent (no cross-delivery).
         assert!(shared.pending_native_pushes.lock().unwrap().flush(&test_vk(8)).is_empty());
+    }
+
+    /// #4 Task 3 (RED first): the native-action push loop must cap concurrent in-flight
+    /// `direct.send_request`s to `PUSH_MAX_INFLIGHT` and QUEUE the overflow, dispatching
+    /// the next queued push only as an in-flight one completes (Direct Response /
+    /// OutboundFailure) — so N validators × bursty pre-proposal batches can't exhaust
+    /// quinn's bidi-stream window (the `max sub-streams reached` storm). `PushScheduler` is
+    /// generic over the request-id type so it is testable without a live swarm. MUST fail
+    /// before Task 3 (the loop is unbounded; no PushScheduler / PUSH_MAX_INFLIGHT yet).
+    #[test]
+    fn push_scheduler_caps_inflight_and_drains_on_completion() {
+        let mut sched: PushScheduler<u64> = PushScheduler::new(2, 16);
+
+        // Fire 5 pushes; only the cap (2) goes in-flight, the other 3 queue.
+        let mut id = 0u64;
+        let mut dispatched = 0;
+        for _ in 0..5 {
+            if sched.has_capacity() {
+                id += 1;
+                sched.record(id);
+                dispatched += 1;
+            } else {
+                sched.enqueue(test_peer(1), vec![id as u8]);
+            }
+        }
+        assert_eq!(dispatched, 2, "only PUSH_MAX_INFLIGHT sends go in-flight at once");
+        assert_eq!(sched.inflight_len(), 2);
+        assert_eq!(sched.queued_len(), 3, "overflow is queued, not dropped");
+
+        // An untracked completion (a consensus send shares the Direct protocol) is ignored.
+        assert!(sched.complete(999).is_none(), "a non-push id dispatches nothing");
+        assert_eq!(sched.inflight_len(), 2);
+
+        // Completing each in-flight push frees a slot and yields one queued push; the
+        // caller records the redispatch, so in-flight never exceeds the cap.
+        for completed in [1u64, 2, 3] {
+            let _ = sched.complete(completed).expect("completion dispatches the next queued push");
+            id += 1;
+            sched.record(id);
+            assert!(sched.inflight_len() <= 2, "in-flight never exceeds the cap");
+        }
+        assert_eq!(sched.queued_len(), 0, "all queued pushes dispatched");
+
+        // With an empty queue, a completion frees the slot but dispatches nothing.
+        assert!(sched.complete(5).is_none());
+        assert_eq!(sched.inflight_len(), 1, "freed a slot, nothing left to re-dispatch");
+    }
+
+    /// #4 Task 3: the push queue is BOUNDED at `PUSH_QUEUE_CAP` — overflow drops the
+    /// OLDEST (the bundle is also retained in `recent_native_bundles` for re-push on
+    /// reconnect) and reports the drop, so a saturated link can't grow the queue without
+    /// bound and the cap is never silent.
+    #[test]
+    fn push_scheduler_queue_bounded_drops_oldest() {
+        let mut sched: PushScheduler<u64> = PushScheduler::new(1, 2);
+        sched.record(1); // fill the single in-flight slot
+        assert!(!sched.has_capacity());
+
+        assert!(!sched.enqueue(test_peer(1), vec![1]), "1st fits under the cap");
+        assert!(!sched.enqueue(test_peer(2), vec![2]), "2nd fits under the cap");
+        assert!(sched.enqueue(test_peer(3), vec![3]), "3rd overflows -> drops oldest");
+        assert_eq!(sched.queued_len(), 2, "queue stays bounded at PUSH_QUEUE_CAP");
+
+        // Oldest ([1]) was dropped; FIFO order preserved for the rest ([2] then [3]).
+        assert_eq!(sched.complete(1).unwrap().1, vec![2u8]);
+    }
+
+    /// #4 Task 3: the in-flight cap must stay well under the raised QUIC stream window
+    /// (NATIVE_DA_STREAM_LIMIT=512, Task 2) so the push loop never approaches the ceiling.
+    #[test]
+    fn push_max_inflight_is_bounded() {
+        assert!(
+            PUSH_MAX_INFLIGHT > 0 && PUSH_MAX_INFLIGHT <= 64,
+            "PUSH_MAX_INFLIGHT={PUSH_MAX_INFLIGHT} must bound the loop well below the 512 window",
+        );
     }
 
     /// Task 4 (headline E2E): a >4 MB native-action body-set reconstructs with ZERO

@@ -19,7 +19,7 @@ use crate::behaviour::TorusBehaviour;
 use crate::config::NetworkConfig;
 use crate::peer::PeerMap;
 use crate::pending_send::PendingSendQueue;
-use crate::swarm::{run_swarm_with_config, NetworkCommand, SharedState};
+use crate::swarm::{run_swarm_with_config, NetworkCommand, PushScheduler, SharedState};
 use crate::tx_gossip::{NativeGossipHandle, TxGossipHandle};
 
 /// Derive a libp2p PeerId from a validator's ed25519 VerifyingKey.
@@ -131,6 +131,7 @@ impl LibP2PNetwork {
             native_da: RwLock::new(None),
             native_da_inbound: Mutex::new(VecDeque::new()),
             pending_native_pushes: Mutex::new(PendingSendQueue::new(8)),
+            push_scheduler: Mutex::new(PushScheduler::for_pushes()),
         });
 
         let (command_tx, command_rx) = mpsc::unbounded_channel();
@@ -374,6 +375,7 @@ mod tests {
             native_da: RwLock::new(None),
             native_da_inbound: Mutex::new(VecDeque::new()),
             pending_native_pushes: Mutex::new(PendingSendQueue::new(8)),
+            push_scheduler: Mutex::new(PushScheduler::for_pushes()),
         })
     }
 
