@@ -1380,4 +1380,140 @@ mod tests {
         // A different validator's queue is independent (no cross-delivery).
         assert!(shared.pending_native_pushes.lock().unwrap().flush(&test_vk(8)).is_empty());
     }
+
+    /// Task 4 (headline E2E): a >4 MB native-action body-set reconstructs with ZERO
+    /// missing via the REAL pull path — chunked client fetch (`NATIVE_DA_FETCH_CHUNK`)
+    /// → `NativeDaCodec` request round-trip → server `serve_native_da_bodies` →
+    /// `NativeDaCodec` response round-trip → client absorb by RECOMPUTED hash.
+    ///
+    /// This is the exact case that wedged the chain at bs=1000 (~4.17 MB blocks): the
+    /// old single 4 MB codec cap, shared across protocols, silently dropped the one
+    /// oversized native-DA response, so a compact block's bodies never landed and the
+    /// block could not be reconstructed (liveness wedge). With per-protocol caps
+    /// (Task 1) + client chunking (Task 2) the SAME set travels as several bounded
+    /// responses and fully reconstructs. This is the test that would have caught it.
+    #[test]
+    fn native_da_bigbody_reconstructs_over_4mb() {
+        use crate::bridge::NATIVE_DA_FETCH_CHUNK;
+        use crate::codec::NativeDaCodec;
+        use futures::io::Cursor;
+        use libp2p::request_response::Codec as _;
+        use libp2p::StreamProtocol;
+        use torus_state::db::StateDb;
+        use torus_types::{
+            compute_action_hash, ActionSignature, FixedPoint, NativeAction, OrderType,
+            PlaceOrderParams, Signature, SignedNativeAction, TimeInForce,
+        };
+
+        // One `PlaceOrderBatch` body of `n_orders` orders; distinct per `nonce`
+        // (`compute_action_hash` mixes in the nonce), so 100 bodies get 100 hashes.
+        fn big_body(nonce: u64, n_orders: usize) -> SignedNativeAction {
+            let order = PlaceOrderParams {
+                market_id: 1,
+                is_buy: true,
+                price: FixedPoint::from_raw(6_000_000_000_000),
+                quantity: FixedPoint::from_raw(FixedPoint::SCALE),
+                order_type: OrderType::Limit,
+                time_in_force: TimeInForce::GTC,
+                reduce_only: false,
+                client_order_id: None,
+            };
+            SignedNativeAction {
+                action: NativeAction::PlaceOrderBatch(vec![order; n_orders]),
+                nonce,
+                signature: ActionSignature::Eip712(Signature { v: 27, r: [0u8; 32], s: [0u8; 32] }),
+            }
+        }
+
+        // Seed a DA store with 100 distinct bodies summing > 4 MB (the old shared cap).
+        const N_BODIES: usize = 100;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = NativeDaStore::new(StateDb::open(dir.path()).expect("open db"));
+        let mut all_hashes: Vec<[u8; 32]> = Vec::with_capacity(N_BODIES);
+        let mut total_stored = 0usize;
+        for nonce in 0..N_BODIES as u64 {
+            let action = big_body(nonce, 1000);
+            store.put(&action).expect("seed body");
+            let h = compute_action_hash(&action).0;
+            total_stored += store.get_raw(&h).unwrap().expect("body stored").len();
+            all_hashes.push(h);
+        }
+        assert!(
+            total_stored > 4 * 1024 * 1024,
+            "fixture must exceed the old 4 MB cap to be meaningful (got {total_stored} bytes)"
+        );
+
+        // Drive the full client→codec→server→codec→client path, chunk by chunk, exactly
+        // as the chunked pull-fallback does on the wire.
+        let proto = StreamProtocol::new("/torus/native-da/1.0");
+        let mut reconstructed: HashMap<[u8; 32], Vec<u8>> = HashMap::new();
+        let mut max_response_bytes = 0usize;
+        let mut chunk_count = 0usize;
+        futures::executor::block_on(async {
+            let mut codec = NativeDaCodec;
+            for chunk in all_hashes.chunks(NATIVE_DA_FETCH_CHUNK) {
+                chunk_count += 1;
+
+                // Client → server: the request round-trips through the codec.
+                let mut wbuf = Cursor::new(Vec::new());
+                codec
+                    .write_request(&proto, &mut wbuf, NativeDaNetRequest { hashes: chunk.to_vec() })
+                    .await
+                    .expect("write request");
+                let mut rbuf = Cursor::new(wbuf.into_inner());
+                let served_req =
+                    codec.read_request(&proto, &mut rbuf).await.expect("read request");
+
+                // Server serves the bodies for those hashes from its DA store.
+                let bodies = serve_native_da_bodies(Some(&store), &served_req.hashes);
+
+                // Server → client: the response round-trips through the codec. Each
+                // chunked response is bounded; together they carry the full >4 MB set.
+                let mut wbuf = Cursor::new(Vec::new());
+                codec
+                    .write_response(&proto, &mut wbuf, NativeDaNetResponse { bodies })
+                    .await
+                    .expect("write response");
+                let response_bytes = wbuf.into_inner();
+                max_response_bytes = max_response_bytes.max(response_bytes.len());
+                let mut rbuf = Cursor::new(response_bytes);
+                let served =
+                    codec.read_response(&proto, &mut rbuf).await.expect("read response");
+
+                // Client absorbs by RECOMPUTED hash (a peer cannot place a body under a
+                // hash it does not own) — mirrors `app.rs::absorb_fetched_bodies`.
+                for body in served.bodies {
+                    if body.is_empty() {
+                        continue;
+                    }
+                    let action: SignedNativeAction =
+                        bincode::deserialize(&body).expect("deserialize served body");
+                    reconstructed.insert(compute_action_hash(&action).0, body);
+                }
+            }
+        });
+
+        // Chunking really happened (7 bounded responses, not 1 oversized one)...
+        assert_eq!(
+            chunk_count,
+            N_BODIES.div_ceil(NATIVE_DA_FETCH_CHUNK),
+            "100 bodies fetched as ceil(100/16)=7 chunked requests"
+        );
+        assert!(
+            max_response_bytes < total_stored,
+            "no single response carries the whole >4 MB set ({max_response_bytes} < {total_stored})"
+        );
+        // ...and every body reconstructs by its own hash: ZERO missing (the un-wedge).
+        let missing: Vec<[u8; 32]> = all_hashes
+            .iter()
+            .copied()
+            .filter(|h| !reconstructed.contains_key(h))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "{} of {N_BODIES} bodies missing after reconstruct",
+            missing.len()
+        );
+        assert_eq!(reconstructed.len(), N_BODIES, "all 100 distinct bodies recovered");
+    }
 }
