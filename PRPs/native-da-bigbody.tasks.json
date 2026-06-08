@@ -1,0 +1,47 @@
+{
+  "prp": "native-da-bigbody",
+  "created": "2026-06-08",
+  "design": "docs/plans/native-da-bigbody-dissemination-fix-impl.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Per-protocol codec caps",
+      "status": "pending",
+      "files": ["crates/torus-network/src/codec.rs"],
+      "validate": "cargo test -p torus-network codec",
+      "depends_on": []
+    },
+    {
+      "id": 2,
+      "name": "Chunk native-DA client fetch",
+      "status": "pending",
+      "files": ["crates/torus-network/src/bridge.rs"],
+      "validate": "cargo test -p torus-network bridge",
+      "depends_on": []
+    },
+    {
+      "id": 3,
+      "name": "Widen pull budget",
+      "status": "pending",
+      "files": ["crates/torus-consensus/src/app.rs"],
+      "validate": "cargo test -p torus-consensus pull",
+      "depends_on": []
+    },
+    {
+      "id": 4,
+      "name": "E2E >4MB reconstruction proof",
+      "status": "pending",
+      "files": ["crates/torus-network/tests/native_da_bigbody.rs"],
+      "validate": "cargo test -p torus-network native_da_bigbody",
+      "depends_on": [1, 2]
+    },
+    {
+      "id": 5,
+      "name": "Regression gate (four_node_consensus + suites green)",
+      "status": "pending",
+      "files": [],
+      "validate": "cargo test -p torus-network -p torus-consensus -p torus-mempool",
+      "depends_on": [1, 2, 3, 4]
+    }
+  ]
+}

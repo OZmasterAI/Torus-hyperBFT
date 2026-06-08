@@ -20,7 +20,19 @@ pub struct DirectResponse;
 #[derive(Debug, Clone, Default)]
 pub struct BorshCodec;
 
+impl BorshCodec {
+    const MAX_MSG_SIZE: usize = MAX_DIRECT_MSG_SIZE;
+}
+
+/// `/torus/direct` push-path cap (unchanged — the per-validator push backpressure
+/// fix is tracked separately). Oversized pre-proposal bodies are recovered via the
+/// chunked `/torus/native-da` pull path instead.
 const MAX_DIRECT_MSG_SIZE: usize = 4 * 1024 * 1024; // 4 MB
+/// `/torus/native-da` response cap — generous headroom; bodies are pulled in
+/// size-bounded chunks (`NATIVE_DA_FETCH_CHUNK`), so a response stays well under this.
+const MAX_NATIVE_DA_MSG_SIZE: usize = 8 * 1024 * 1024; // 8 MB
+/// `/torus/block-data` response cap — must fit a full big block during sync.
+const MAX_BLOCK_DATA_MSG_SIZE: usize = 16 * 1024 * 1024; // 16 MB
 
 #[async_trait]
 impl libp2p::request_response::Codec for BorshCodec {
@@ -36,7 +48,7 @@ impl libp2p::request_response::Codec for BorshCodec {
     where
         T: AsyncRead + Unpin + Send,
     {
-        read_length_prefixed_borsh(io).await
+        read_length_prefixed_borsh(io, Self::MAX_MSG_SIZE).await
     }
 
     async fn read_response<T>(
@@ -47,7 +59,7 @@ impl libp2p::request_response::Codec for BorshCodec {
     where
         T: AsyncRead + Unpin + Send,
     {
-        read_length_prefixed_borsh(io).await
+        read_length_prefixed_borsh(io, Self::MAX_MSG_SIZE).await
     }
 
     async fn write_request<T>(
@@ -75,7 +87,7 @@ impl libp2p::request_response::Codec for BorshCodec {
     }
 }
 
-async fn read_length_prefixed_borsh<T, D>(io: &mut T) -> io::Result<D>
+async fn read_length_prefixed_borsh<T, D>(io: &mut T, max_size: usize) -> io::Result<D>
 where
     T: AsyncRead + Unpin + Send,
     D: borsh::BorshDeserialize,
@@ -83,7 +95,7 @@ where
     let mut len_buf = [0u8; 4];
     io.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
-    if len > MAX_DIRECT_MSG_SIZE {
+    if len > max_size {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "message too large",
@@ -127,6 +139,10 @@ pub struct BlockDataNetResponse {
 #[derive(Debug, Clone, Default)]
 pub struct BlockDataCodec;
 
+impl BlockDataCodec {
+    const MAX_MSG_SIZE: usize = MAX_BLOCK_DATA_MSG_SIZE;
+}
+
 #[async_trait]
 impl libp2p::request_response::Codec for BlockDataCodec {
     type Protocol = StreamProtocol;
@@ -141,7 +157,7 @@ impl libp2p::request_response::Codec for BlockDataCodec {
     where
         T: AsyncRead + Unpin + Send,
     {
-        read_length_prefixed_borsh(io).await
+        read_length_prefixed_borsh(io, Self::MAX_MSG_SIZE).await
     }
 
     async fn read_response<T>(
@@ -152,7 +168,7 @@ impl libp2p::request_response::Codec for BlockDataCodec {
     where
         T: AsyncRead + Unpin + Send,
     {
-        read_length_prefixed_borsh(io).await
+        read_length_prefixed_borsh(io, Self::MAX_MSG_SIZE).await
     }
 
     async fn write_request<T>(
@@ -200,6 +216,10 @@ pub struct NativeDaNetResponse {
 #[derive(Debug, Clone, Default)]
 pub struct NativeDaCodec;
 
+impl NativeDaCodec {
+    const MAX_MSG_SIZE: usize = MAX_NATIVE_DA_MSG_SIZE;
+}
+
 #[async_trait]
 impl libp2p::request_response::Codec for NativeDaCodec {
     type Protocol = StreamProtocol;
@@ -214,7 +234,7 @@ impl libp2p::request_response::Codec for NativeDaCodec {
     where
         T: AsyncRead + Unpin + Send,
     {
-        read_length_prefixed_borsh(io).await
+        read_length_prefixed_borsh(io, Self::MAX_MSG_SIZE).await
     }
 
     async fn read_response<T>(
@@ -225,7 +245,7 @@ impl libp2p::request_response::Codec for NativeDaCodec {
     where
         T: AsyncRead + Unpin + Send,
     {
-        read_length_prefixed_borsh(io).await
+        read_length_prefixed_borsh(io, Self::MAX_MSG_SIZE).await
     }
 
     async fn write_request<T>(
@@ -284,5 +304,39 @@ mod tests {
         let back = NativeDaNetResponse::try_from_slice(&bytes).expect("deserialize response");
         assert_eq!(back.bodies, resp.bodies);
         assert!(back.bodies[1].is_empty(), "not-found entry stays empty");
+    }
+
+    /// Task 1 (RED first): a native-DA response larger than the legacy shared 4 MB
+    /// cap MUST round-trip through `NativeDaCodec` once it has its own larger cap
+    /// (Option C). This is exactly the case that wedged the chain at bs=1000
+    /// (~4.17 MB blocks) — today it fails with "message too large".
+    #[test]
+    fn native_da_response_over_4mb_roundtrips() {
+        use futures::io::Cursor;
+        use libp2p::request_response::Codec as _;
+        futures::executor::block_on(async {
+            let proto = StreamProtocol::new("/torus/native-da/1.0");
+            // ~5.5 MB total: 8 bodies x 700 KB — well over the old 4 MB cap.
+            let resp = NativeDaNetResponse {
+                bodies: (0..8u8).map(|i| vec![i; 700 * 1024]).collect(),
+            };
+            let mut codec = NativeDaCodec;
+            let mut wbuf = Cursor::new(Vec::new());
+            codec
+                .write_response(&proto, &mut wbuf, resp.clone())
+                .await
+                .expect("write >4MB native-da response");
+            let bytes = wbuf.into_inner();
+            assert!(
+                bytes.len() > 4 * 1024 * 1024,
+                "test fixture must exceed the old 4MB cap to be meaningful"
+            );
+            let mut rbuf = Cursor::new(bytes);
+            let back = codec
+                .read_response(&proto, &mut rbuf)
+                .await
+                .expect("read >4MB native-da response");
+            assert_eq!(back.bodies, resp.bodies);
+        });
     }
 }
