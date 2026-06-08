@@ -8,6 +8,7 @@ publish = false
 torus-core = { workspace = true }
 torus-economics = { workspace = true }
 torus-bridge = { workspace = true }
+torus-genesis = { workspace = true }
 torus-consensus = { workspace = true }
 torus-rpc = { workspace = true }
 torus-evm = { workspace = true }

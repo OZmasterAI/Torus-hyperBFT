@@ -58,7 +58,11 @@ enum Command {
     Consensus {
         #[arg(long, default_value = "http://localhost:8545,http://localhost:8546,http://localhost:8547,http://localhost:8548")]
         rpc_urls: String,
-        #[arg(long, default_value_t = 100)]
+        /// Number of distinct signing senders. Defaults to 20 — the hardhat market-maker
+        /// accounts pre-funded with a native balance in genesis (`native_balances`). Orders
+        /// from UNFUNDED senders (index >= 20) are rejected for insufficient margin and never
+        /// match, so raising this above 20 needs matching genesis funding to be meaningful.
+        #[arg(long, default_value_t = 20)]
         senders: usize,
         #[arg(long, default_value_t = 30)]
         duration: u64,
@@ -97,9 +101,14 @@ enum Command {
 }
 
 fn random_place_order(rng: &mut impl Rng, market_id: u64) -> NativeAction {
-    let mid_price: i128 = 6_000_000_000_000; // 60,000 * SCALE
-    let offset = rng.gen_range(-500_000_000_000i128..500_000_000_000i128);
-    let price = FixedPoint::from_raw(mid_price + offset);
+    // Prices MUST be tick-aligned or the matching engine rejects the order outright
+    // (`order_book.rs`: `price.raw() % tick_size.raw() != 0` -> Rejected). The runtime
+    // order book is auto-created with tick = lot = FixedPoint::ONE (whole units), so
+    // generate whole-unit prices around a 60,000 mid (±5,000) — these always satisfy a
+    // 1.0 tick and cross often enough to actually exercise the matching engine.
+    let mid: i128 = 60_000;
+    let offset = rng.gen_range(-5_000i128..=5_000);
+    let price = FixedPoint::from_raw((mid + offset) * FixedPoint::SCALE);
     let qty_units = rng.gen_range(1i128..=100);
     let quantity = FixedPoint::from_raw(qty_units * FixedPoint::SCALE);
     let is_buy = rng.gen_bool(0.5);
@@ -347,6 +356,77 @@ async fn fetch_block_body(
     result.get("nativeActionCount")?.as_u64()
 }
 
+/// Sum native actions actually committed across a block range — the authoritative
+/// throughput measure. The live monitor undercounts badly at fast block times (it
+/// can't poll every body within its 500ms tick and silently drops undrained blocks
+/// when it aborts), so after the load phase we re-fetch EVERY block body in the run
+/// window `(start_exclusive, end_inclusive]` with bounded concurrency and a short
+/// retry for tail blocks whose body isn't queryable yet. Returns the committed
+/// `(block, native_count)` pairs that were successfully read.
+async fn sweep_block_bodies(
+    client: Arc<reqwest::Client>,
+    urls: Arc<Vec<String>>,
+    start_exclusive: u64,
+    end_inclusive: u64,
+    concurrency: usize,
+) -> Vec<(u64, u64)> {
+    if end_inclusive <= start_exclusive {
+        return Vec::new();
+    }
+    let sem = Arc::new(Semaphore::new(concurrency.max(1)));
+    let mut set = tokio::task::JoinSet::new();
+
+    for blk in (start_exclusive + 1)..=end_inclusive {
+        let sem = sem.clone();
+        let client = client.clone();
+        let urls = urls.clone();
+        set.spawn(async move {
+            let _permit = sem.acquire_owned().await.unwrap();
+            let url = &urls[(blk as usize) % urls.len()];
+            // Tail blocks may not have a queryable body yet — retry with light backoff.
+            for attempt in 0..5u64 {
+                if let Some(count) = fetch_block_body(&client, url, blk).await {
+                    return (blk, Some(count));
+                }
+                tokio::time::sleep(Duration::from_millis(150 * (attempt + 1))).await;
+            }
+            (blk, None)
+        });
+    }
+
+    let mut out = Vec::new();
+    let mut missing = 0u64;
+    while let Some(res) = set.join_next().await {
+        match res {
+            Ok((blk, Some(count))) => out.push((blk, count)),
+            Ok((_, None)) | Err(_) => missing += 1,
+        }
+    }
+    if missing > 0 {
+        eprintln!(
+            "[sweep] warning: {missing} block bodies unavailable after retries (excluded from total)"
+        );
+    }
+    out.sort_unstable_by_key(|(blk, _)| *blk);
+    out
+}
+
+/// Aggregate swept `(block, native_count)` pairs into
+/// `(total_included, block_count, peak_actions, peak_block)`.
+fn summarize_included(blocks: &[(u64, u64)]) -> (u64, u64, u64, u64) {
+    let mut total = 0u64;
+    let mut peak_actions = 0u64;
+    let mut peak_block = 0u64;
+    for &(blk, count) in blocks {
+        total += count;
+        if count > peak_actions {
+            peak_actions = count;
+            peak_block = blk;
+        }
+    }
+    (total, blocks.len() as u64, peak_actions, peak_block)
+}
+
 async fn run_consensus(
     rpc_urls_str: &str,
     senders: usize,
@@ -552,22 +632,35 @@ async fn run_consensus(
     let total_elapsed = start_time.elapsed();
     let final_submitted = submitted.load(Ordering::Relaxed);
 
-    let stats = final_stats.lock().await;
-    let final_included = stats.total_included;
-    let block_count = stats.block_count;
-    let peak_actions = stats.peak_actions;
-    let peak_block = stats.peak_block;
-    let avg_block_time_ms = if stats.block_times.is_empty() {
-        0.0
-    } else {
-        stats.block_times.iter().sum::<f64>() / stats.block_times.len() as f64 * 1000.0
+    // Authoritative inclusion count: re-sweep EVERY block body in the run window.
+    // The live monitor's running total undercounts ~3x at fast block times, so the
+    // reported throughput / drop-rate are computed from this full re-sweep instead.
+    let end_block = fetch_block_number(&client, &rpc_urls[0])
+        .await
+        .unwrap_or(start_block);
+    let swept = sweep_block_bodies(
+        client.clone(),
+        rpc_urls.clone(),
+        start_block,
+        end_block,
+        concurrency,
+    )
+    .await;
+    let (final_included, block_count, peak_actions, peak_block) = summarize_included(&swept);
+
+    let avg_block_time_ms = {
+        let stats = final_stats.lock().await;
+        if stats.block_times.is_empty() {
+            0.0
+        } else {
+            stats.block_times.iter().sum::<f64>() / stats.block_times.len() as f64 * 1000.0
+        }
     };
     let avg_native_per_block = if block_count > 0 {
         final_included / block_count
     } else {
         0
     };
-    drop(stats);
 
     let elapsed_secs = total_elapsed.as_secs_f64();
     let submit_rate = if elapsed_secs > 0.0 { final_submitted as f64 / elapsed_secs } else { 0.0 };
@@ -601,8 +694,11 @@ async fn run_consensus(
     println!("Drop rate:  {drop_rate:.1}%");
     println!("Block time: {avg_block_time_ms:.0}ms avg");
     println!(
-        "Blocks:     {} total, {} avg native/block",
-        block_count, avg_native_per_block,
+        "Blocks:     {} with bodies in #{}..#{}, {} avg native/block",
+        block_count,
+        start_block + 1,
+        end_block,
+        avg_native_per_block,
     );
     println!();
     if peak_actions > 0 {
@@ -750,5 +846,29 @@ async fn main() {
             changed,
             blocks,
         } => run_state_root_scaling(&sizes, changed, blocks),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::summarize_included;
+
+    #[test]
+    fn summarize_totals_count_and_peak() {
+        // total = 5+20+0+8 = 33; peak block is #11 with 20 actions.
+        let blocks = [(10u64, 5u64), (11, 20), (12, 0), (13, 8)];
+        assert_eq!(summarize_included(&blocks), (33, 4, 20, 11));
+    }
+
+    #[test]
+    fn summarize_empty_is_zero() {
+        assert_eq!(summarize_included(&[]), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn summarize_first_max_wins_on_ties() {
+        // First block reaching the peak count keeps the peak_block slot.
+        let blocks = [(7u64, 9u64), (8, 9)];
+        assert_eq!(summarize_included(&blocks), (18, 2, 9, 7));
     }
 }

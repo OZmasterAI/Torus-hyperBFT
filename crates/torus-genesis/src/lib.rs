@@ -14,18 +14,20 @@ use hotstuff_rs::types::update_sets::AppStateUpdates;
 use hotstuff_rs::types::validator_set::{
     ValidatorSet as HsValidatorSet, ValidatorSetState,
 };
+use borsh::BorshSerialize;
 use revm::state::AccountInfo;
 use serde::Deserialize;
 use tracing::info;
 
+use torus_core::position::NativeBalance;
 use torus_economics::types::{ValidatorState, ValidatorStatus};
 use torus_economics::{GovernanceManager, GovernanceParams};
-use torus_state::cf::CF_STAKING_VALIDATORS;
+use torus_state::cf::{CF_NATIVE_BALANCES, CF_NATIVE_MARKETS, CF_STAKING_VALIDATORS};
 use torus_state::db::KECCAK_EMPTY;
 use torus_state::trie::compute_state_root_from_db;
 use torus_state::{StateDb, StateError};
 use torus_types::{
-    ChainConfig, PublicKey, ValidatorInfo,
+    ChainConfig, FixedPoint, PublicKey, ValidatorInfo,
     ValidatorSet as TorusValidatorSet,
 };
 
@@ -69,11 +71,16 @@ pub struct Genesis {
     #[serde(default)]
     pub evm_alloc: HashMap<String, EvmAllocEntry>,
     #[serde(default)]
-    pub markets: Vec<serde_json::Value>,
+    pub markets: Vec<GenesisMarket>,
     #[serde(default)]
     pub precompiles: HashMap<String, String>,
     #[serde(default)]
     pub permanent_stakes: Vec<GenesisPermanentStake>,
+    /// Native (perp-side) balances to pre-fund. Seeds `CF_NATIVE_BALANCES` so that
+    /// accounts can place margined orders at genesis without a prior deposit — used
+    /// by the throughput bench's market-maker senders.
+    #[serde(default)]
+    pub native_balances: Vec<GenesisNativeBalance>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -155,6 +162,33 @@ pub struct GenesisPermanentStake {
     pub amount: String,
 }
 
+/// A perpetual market to seed into `CF_NATIVE_MARKETS` at genesis.
+///
+/// Stored in the exact borsh layout the matching engine + RPC reader expect:
+/// `base_asset(String) + quote_asset(String) + lot_size(i128) + tick_size(i128) + initial_margin(i128)`,
+/// keyed by `market_id` (8-byte big-endian). `CF_NATIVE_MARKETS` is OFF the consensus
+/// native state root, so seeding it cannot diverge validators.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GenesisMarket {
+    pub market_id: u64,
+    pub base_asset: String,
+    pub quote_asset: String,
+    /// Minimum order size, as a decimal string (e.g. "1.0"). Scaled by 10^8 (`FixedPoint`).
+    pub lot_size: String,
+    /// Minimum price increment, as a decimal string (e.g. "0.01"). Scaled by 10^8.
+    pub tick_size: String,
+    /// Initial margin requirement, as a decimal string (e.g. "5.0"). Scaled by 10^8.
+    pub initial_margin: String,
+}
+
+/// A native (perp-side) balance to pre-fund into `CF_NATIVE_BALANCES`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GenesisNativeBalance {
+    pub address: String,
+    /// Available collateral, as a decimal string (e.g. "1000000000.0"). Scaled by 10^8.
+    pub available: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct EvmAllocEntry {
     pub balance: String,
@@ -183,6 +217,45 @@ fn parse_u256(s: &str) -> Result<U256, GenesisError> {
         U256::from_str_radix(s, 10)
             .map_err(|_| GenesisError::InvalidAmount(s.to_string()))
     }
+}
+
+/// Parse a decimal string (e.g. `"1.0"`, `"0.01"`, `"1000000000"`) into a `FixedPoint`
+/// raw value scaled by `FixedPoint::SCALE` (10^8). Uses exact integer math — no floating
+/// point — so every validator parsing the same genesis string derives a byte-identical
+/// raw value. Rejects more than 8 fractional digits and on overflow.
+fn parse_fixedpoint_raw(s: &str) -> Result<i128, GenesisError> {
+    let trimmed = s.trim();
+    let (neg, body) = match trimmed.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, trimmed),
+    };
+    let (int_str, frac_str) = match body.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (body, ""),
+    };
+    if frac_str.len() > 8 {
+        return Err(GenesisError::InvalidAmount(format!(
+            "{s}: more than 8 fractional digits"
+        )));
+    }
+    let parse_digits = |d: &str| -> Result<i128, GenesisError> {
+        if d.is_empty() {
+            Ok(0)
+        } else if d.bytes().all(|b| b.is_ascii_digit()) {
+            d.parse::<i128>()
+                .map_err(|_| GenesisError::InvalidAmount(s.to_string()))
+        } else {
+            Err(GenesisError::InvalidAmount(s.to_string()))
+        }
+    };
+    let int_val = parse_digits(int_str)?;
+    // Right-pad the fraction to 8 digits: "5" -> "50000000" = 0.5 * 10^8.
+    let frac_val = parse_digits(&format!("{frac_str:0<8}"))?;
+    let raw = int_val
+        .checked_mul(FixedPoint::SCALE)
+        .and_then(|v| v.checked_add(frac_val))
+        .ok_or_else(|| GenesisError::InvalidAmount(format!("{s}: overflow")))?;
+    Ok(if neg { -raw } else { raw })
 }
 
 fn decode_hex(s: &str) -> Result<Vec<u8>, GenesisError> {
@@ -327,7 +400,56 @@ impl Genesis {
             info!(%address, %amount, "seeded genesis permanent stake");
         }
 
-        // 5. Seed governance params
+        // 5. Seed native perpetual markets into CF_NATIVE_MARKETS. This CF is OFF the
+        //    consensus native state root, so seeding it cannot diverge validators; it
+        //    drives RPC market listings and order/margin validation.
+        for market in &self.markets {
+            let lot_size = parse_fixedpoint_raw(&market.lot_size)?;
+            let tick_size = parse_fixedpoint_raw(&market.tick_size)?;
+            let initial_margin = parse_fixedpoint_raw(&market.initial_margin)?;
+
+            // Borsh layout MUST match torus-rpc `StoredMarket` + governance `MarketListing`:
+            // base(String) + quote(String) + lot_size(i128) + tick_size(i128) + initial_margin(i128).
+            let mut data = Vec::new();
+            BorshSerialize::serialize(&market.base_asset, &mut data)
+                .map_err(|e| GenesisError::InvalidHex(format!("borsh market base: {e}")))?;
+            BorshSerialize::serialize(&market.quote_asset, &mut data)
+                .map_err(|e| GenesisError::InvalidHex(format!("borsh market quote: {e}")))?;
+            BorshSerialize::serialize(&lot_size, &mut data)
+                .map_err(|e| GenesisError::InvalidHex(format!("borsh market lot: {e}")))?;
+            BorshSerialize::serialize(&tick_size, &mut data)
+                .map_err(|e| GenesisError::InvalidHex(format!("borsh market tick: {e}")))?;
+            BorshSerialize::serialize(&initial_margin, &mut data)
+                .map_err(|e| GenesisError::InvalidHex(format!("borsh market margin: {e}")))?;
+
+            state_db.put_cf_raw(CF_NATIVE_MARKETS, &market.market_id.to_be_bytes(), &data)?;
+            info!(
+                market_id = market.market_id,
+                base = %market.base_asset,
+                quote = %market.quote_asset,
+                "seeded genesis market"
+            );
+        }
+
+        // 6. Seed native (perp-side) balances into CF_NATIVE_BALANCES so pre-funded
+        //    accounts can place margined orders at genesis without a prior deposit.
+        //    CF_NATIVE_BALANCES IS part of the native root, but the genesis root is only
+        //    logged (not checkpointed) and block 1 recomputes the composite root from the
+        //    full DB — identical genesis.json => identical roots across validators.
+        for nb in &self.native_balances {
+            let address = parse_address(&nb.address)?;
+            let available = FixedPoint::from_raw(parse_fixedpoint_raw(&nb.available)?);
+            let balance = NativeBalance {
+                available,
+                order_margin: FixedPoint::ZERO,
+            };
+            let data = borsh::to_vec(&balance)
+                .map_err(|e| GenesisError::InvalidHex(format!("borsh native balance: {e}")))?;
+            state_db.put_cf_raw(CF_NATIVE_BALANCES, address.as_slice(), &data)?;
+            info!(%address, %available, "seeded genesis native balance");
+        }
+
+        // 7. Seed governance params
         let treasury_address = self
             .economics
             .treasury_address
@@ -339,7 +461,7 @@ impl Genesis {
             .map_err(|e| GenesisError::InvalidHex(format!("governance params: {e}")))?;
         info!(%treasury_address, "seeded governance params");
 
-        // 6. Compute state root
+        // 8. Compute state root (EVM-only; informational — see step 6 note).
         let state_root = compute_state_root_from_db(state_db)?;
         info!(%state_root, "genesis state root computed");
         Ok(state_root)
@@ -620,5 +742,81 @@ mod tests {
         assert_eq!(parse_u256("1000").unwrap(), U256::from(1000u64));
         assert_eq!(parse_u256("0xff").unwrap(), U256::from(255u64));
         assert_eq!(parse_u256("0x0").unwrap(), U256::ZERO);
+    }
+
+    #[test]
+    fn parse_fixedpoint_raw_exact_decimals() {
+        assert_eq!(parse_fixedpoint_raw("1").unwrap(), FixedPoint::SCALE);
+        assert_eq!(parse_fixedpoint_raw("1.0").unwrap(), FixedPoint::SCALE);
+        assert_eq!(parse_fixedpoint_raw("0.01").unwrap(), 1_000_000);
+        assert_eq!(parse_fixedpoint_raw("5.0").unwrap(), 5 * FixedPoint::SCALE);
+        assert_eq!(parse_fixedpoint_raw("0.5").unwrap(), FixedPoint::SCALE / 2);
+        assert_eq!(parse_fixedpoint_raw(".25").unwrap(), 25_000_000);
+        assert_eq!(parse_fixedpoint_raw("0.00000001").unwrap(), 1); // 1 raw unit (10^-8)
+        assert_eq!(
+            parse_fixedpoint_raw("1000000000").unwrap(),
+            1_000_000_000i128 * FixedPoint::SCALE
+        );
+        assert_eq!(
+            parse_fixedpoint_raw("-2.5").unwrap(),
+            -(5 * FixedPoint::SCALE / 2)
+        );
+        // Rejections: >8 fractional digits, non-numeric, multiple dots.
+        assert!(parse_fixedpoint_raw("0.000000001").is_err());
+        assert!(parse_fixedpoint_raw("abc").is_err());
+        assert!(parse_fixedpoint_raw("1.2.3").is_err());
+    }
+
+    #[test]
+    fn initialize_seeds_market_and_native_balance() {
+        use borsh::BorshDeserialize;
+
+        // Start from the valid sample genesis and inject a market + a funded balance.
+        let mut v: serde_json::Value = serde_json::from_str(&sample_genesis_json()).unwrap();
+        v["markets"] = serde_json::json!([{
+            "market_id": 1,
+            "base_asset": "BTC",
+            "quote_asset": "USD",
+            "lot_size": "1.0",
+            "tick_size": "0.01",
+            "initial_margin": "5.0"
+        }]);
+        v["native_balances"] = serde_json::json!([{
+            "address": "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+            "available": "1000000000.0"
+        }]);
+
+        let genesis = Genesis::from_json(&v.to_string()).unwrap();
+        assert_eq!(genesis.markets.len(), 1);
+        assert_eq!(genesis.native_balances.len(), 1);
+
+        let dir = TempDir::new().unwrap();
+        let db = StateDb::open(dir.path()).unwrap();
+        genesis.initialize(&db).unwrap();
+
+        // Market round-trips in the EXACT borsh layout the RPC `StoredMarket` reader expects:
+        // base(String) + quote(String) + lot(i128) + tick(i128) + initial_margin(i128).
+        let raw = db
+            .get_cf_raw(CF_NATIVE_MARKETS, &1u64.to_be_bytes())
+            .unwrap()
+            .expect("market 1 should be seeded");
+        let (base, quote, lot, tick, margin): (String, String, i128, i128, i128) =
+            BorshDeserialize::try_from_slice(&raw).unwrap();
+        assert_eq!(base, "BTC");
+        assert_eq!(quote, "USD");
+        assert_eq!(lot, FixedPoint::SCALE);
+        assert_eq!(tick, 1_000_000);
+        assert_eq!(margin, 5 * FixedPoint::SCALE);
+
+        // Native balance is readable through the production PositionManager path —
+        // this is exactly what exec_place_order's margin check reads.
+        let trader: Address = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266".parse().unwrap();
+        let positions = torus_core::position::PositionManager::new(db.clone());
+        let bal = positions.get_native_balance(&trader).unwrap();
+        assert_eq!(
+            bal.available,
+            FixedPoint::from_raw(1_000_000_000i128 * FixedPoint::SCALE)
+        );
+        assert_eq!(bal.order_margin, FixedPoint::ZERO);
     }
 }

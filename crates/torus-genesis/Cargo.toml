@@ -8,6 +8,7 @@ license.workspace = true
 torus-types = { workspace = true }
 torus-state = { workspace = true }
 torus-economics = { workspace = true }
+torus-core = { workspace = true }
 borsh = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
