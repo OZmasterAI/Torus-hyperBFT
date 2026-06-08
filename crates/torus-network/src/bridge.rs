@@ -33,6 +33,24 @@ pub fn peer_id_from_verifying_key(vk: &VerifyingKey) -> PeerId {
     identity::PublicKey::from(pk).to_peer_id()
 }
 
+/// Per-connection QUIC bidi-stream window for the swarm transport (#4 Task 2).
+///
+/// The native-action PUSH loop opens one bidi stream per validator per pre-proposal
+/// batch, and consensus sends share the same `/torus/direct` protocol — so under high
+/// `batch_size` the libp2p default (256) was exhausted, firing `max sub-streams reached`
+/// (2,537x at bs=500) and starving consensus, which helped wedge bs=1000. 512 gives
+/// headroom over the push burst + concurrent consensus streams; Task 3 additionally
+/// BOUNDS the push loop so it cannot burst toward even this raised ceiling.
+const NATIVE_DA_STREAM_LIMIT: u32 = 512;
+
+/// Raise the QUIC transport's per-connection bidi-stream window to
+/// [`NATIVE_DA_STREAM_LIMIT`] (used via `SwarmBuilder::with_quic_config`). Factored out
+/// so the limit is unit-testable without a live swarm (#4 Task 2).
+fn tune_quic_config(mut cfg: libp2p::quic::Config) -> libp2p::quic::Config {
+    cfg.max_concurrent_stream_limit = NATIVE_DA_STREAM_LIMIT;
+    cfg
+}
+
 /// libp2p-based Network implementation for hotstuff_rs.
 ///
 /// Bridges async libp2p with the synchronous Network trait using channels
@@ -122,7 +140,7 @@ impl LibP2PNetwork {
         let max_peers = config.max_peers;
         let mut swarm = SwarmBuilder::with_existing_identity(libp2p_keypair)
             .with_tokio()
-            .with_quic()
+            .with_quic_config(tune_quic_config)
             .with_dns()
             .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?
             .with_behaviour(|key| {
@@ -363,6 +381,33 @@ mod tests {
         let mut bytes = [0u8; 32];
         bytes[0] = seed;
         SigningKey::from_bytes(&bytes)
+    }
+
+    /// #4 Task 2 (RED first): the QUIC transport must raise its per-connection bidi-stream
+    /// window above the libp2p default so the native-action PUSH loop (one stream per
+    /// validator per pre-proposal, plus consensus sends sharing the Direct protocol) cannot
+    /// exhaust it under bs=500+ load — the `max sub-streams reached` storm (2,537x at
+    /// bs=500) that helped wedge bs=1000. `tune_quic_config` must RAISE the limit and land
+    /// it at the chosen headroom. MUST fail before Task 2 (no tune_quic_config /
+    /// NATIVE_DA_STREAM_LIMIT yet).
+    #[test]
+    fn quic_stream_window_raised_for_push_headroom() {
+        let kp = identity::Keypair::generate_ed25519();
+        let default_limit = libp2p::quic::Config::new(&kp).max_concurrent_stream_limit;
+        let tuned = tune_quic_config(libp2p::quic::Config::new(&kp));
+        assert!(
+            tuned.max_concurrent_stream_limit > default_limit,
+            "tuning must RAISE the bidi-stream window above the libp2p default ({default_limit})",
+        );
+        assert!(
+            tuned.max_concurrent_stream_limit >= 512,
+            "stream window must be >=512 for push-burst + consensus headroom, got {}",
+            tuned.max_concurrent_stream_limit,
+        );
+        assert_eq!(
+            tuned.max_concurrent_stream_limit, NATIVE_DA_STREAM_LIMIT,
+            "the builder must use NATIVE_DA_STREAM_LIMIT",
+        );
     }
 
     /// Task 2 (RED first): the by-hash native-DA pull-fallback must split its hash
