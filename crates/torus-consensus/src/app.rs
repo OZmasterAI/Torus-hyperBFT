@@ -553,6 +553,23 @@ fn encode_proposal_datum(block: &TorusBlock, compact: bool) -> Vec<u8> {
 const PULL_RETRIES: usize = 20;
 const PULL_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
 
+/// Bounded LOCAL retry on the hot validate path: a racing pre-proposal PUSH that lands
+/// just after the CompactBlock usually arrives within this window, so the common case
+/// never touches the network (keeps the pull rare). 5 × 20 ms = 100 ms.
+const RECONSTRUCT_RETRIES: usize = 5;
+const RECONSTRUCT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// SHORT hot-path PULL budget (#4 Task 1 — the un-wedge): when the LOCAL retry still
+/// misses (a true push miss), the hot validate path fires a bounded native-DA pull and
+/// re-checks instead of giving up. 8 × 20 ms = 160 ms. Combined with the local retry
+/// (100 ms) the hot path blocks ≤ 260 ms — well under the 500 ms view timeout
+/// (`hot_pull_budget_under_view_timeout`), so a body that cannot be pulled in-budget
+/// fails the view (re-proposed next view) rather than hanging past it. Distinct from the
+/// ~1 s SYNC budget (`PULL_RETRIES`/`PULL_DELAY`), which may safely block because it is
+/// off the consensus voting path (mem 8ee99db3).
+const HOT_PULL_RETRIES: usize = 8;
+const HOT_PULL_DELAY: std::time::Duration = std::time::Duration::from_millis(20);
+
 impl TorusApp {
     pub fn new(
         state_db: StateDb,
@@ -841,15 +858,29 @@ impl TorusApp {
         true
     }
 
-    /// Fetch the `missing` native-action bodies by-hash and absorb any that arrive
-    /// into the durable DA store. Returns `true` once all are present (or were
-    /// already), `false` on timeout.
-    ///
-    /// Bounded poll (~1 s = `PULL_RETRIES` × `PULL_DELAY`) on the block-sync path —
-    /// NOT the hot consensus voting path, so a blocking wait of ≤1 s is safe and never
-    /// touches live consensus (mem 8ee99db3). The earlier 80 ms budget gave up before a
-    /// >4 MB body-set (now pulled in chunks) could arrive; ~1 s recovers a late body.
+    /// Sync-path wrapper over [`Self::pull_missing_bodies_bounded`] with the ~1 s budget
+    /// (`PULL_RETRIES` × `PULL_DELAY`). Safe to block here — the block-sync path is off
+    /// the consensus voting hot path (mem 8ee99db3). The earlier 80 ms budget gave up
+    /// before a >4 MB body-set (now pulled in chunks) could arrive; ~1 s recovers a late
+    /// body.
     fn pull_missing_bodies(&self, missing: &[torus_types::B256]) -> bool {
+        self.pull_missing_bodies_bounded(missing, PULL_RETRIES, PULL_DELAY)
+    }
+
+    /// Fetch the `missing` native-action bodies by-hash and absorb any that arrive into
+    /// the durable DA store, polling `retries` times with `delay` between drains. Returns
+    /// `true` once all are present (or were already), `false` on timeout.
+    ///
+    /// The budget is the caller's: the SYNC path passes the ~1 s `PULL_RETRIES`/`PULL_DELAY`
+    /// (safe to block off the voting path); the HOT validate path passes the short
+    /// `HOT_PULL_RETRIES`/`HOT_PULL_DELAY` (≪ the 500 ms view timeout) so a body that
+    /// can't be pulled in-budget fails the view instead of hanging past it (#4 Task 1).
+    fn pull_missing_bodies_bounded(
+        &self,
+        missing: &[torus_types::B256],
+        retries: usize,
+        delay: std::time::Duration,
+    ) -> bool {
         if missing.is_empty() {
             return true;
         }
@@ -865,8 +896,8 @@ impl TorusApp {
             m.native_da_pull_requests.inc();
         }
 
-        for _ in 0..PULL_RETRIES {
-            std::thread::sleep(PULL_DELAY);
+        for _ in 0..retries {
+            std::thread::sleep(delay);
             Self::absorb_fetched_bodies(mempool, fetcher.as_ref());
             if missing.iter().all(|h| mempool.get_native_da(h).is_some()) {
                 if let Some(ref m) = self.metrics {
@@ -878,6 +909,86 @@ impl TorusApp {
         }
         tracing::warn!(count = missing.len(), "native-da pull: bodies NOT recovered within budget");
         false
+    }
+
+    /// Reconstruct a CompactBlock's native-action bodies for the HOT validate path
+    /// (#4 Task 1). Bodies travel out-of-band (proposer PUSH → durable DA store), so a
+    /// CompactBlock can reference a body the local store does not have yet:
+    ///
+    /// 1. Fast local lookup, then a bounded LOCAL retry — a racing pre-proposal PUSH
+    ///    usually lands here (the common case; keeps the pull rare).
+    /// 2. On a remaining miss, fire a SHORT bounded native-DA PULL
+    ///    (`HOT_PULL_RETRIES` × `HOT_PULL_DELAY`, budgeted ≪ the 500 ms view timeout) and
+    ///    re-check. This is the un-wedge: a push miss is now recoverable on the HOT path,
+    ///    not only on sync (mem 8ee99db3 left the hot path pull-free, so a live push miss
+    ///    wedged consensus at high batch_size — mem 28e1a821 / bs=1000).
+    ///
+    /// Returns the reconstructed actions (in `hashes` order) when every body is present
+    /// in-budget, or `Err(missing_count)` so the caller votes MissingData — failing THIS
+    /// view (re-proposed next view, by which point the body has likely arrived) rather
+    /// than blocking past the view timeout. Only call with a non-empty `hashes`.
+    fn reconstruct_native_actions_hot(
+        &self,
+        hashes: &[torus_types::B256],
+    ) -> Result<Vec<torus_types::SignedNativeAction>, usize> {
+        let Some(ref mempool) = self.mempool else {
+            return Err(hashes.len()); // no DA store wired (consensus-only observer)
+        };
+
+        let mut actions: Vec<Option<torus_types::SignedNativeAction>> = vec![None; hashes.len()];
+        let mut missing: Vec<usize> = Vec::new();
+        for (i, hash) in hashes.iter().enumerate() {
+            // Read the DURABLE DA store, not the ephemeral nonce-gated mempool: a
+            // block-referenced body survives the 60s nonce window, pool eviction, and a
+            // restart (livelock root cause, mem 28e1a821).
+            match mempool.get_native_da(hash) {
+                Some(action) => actions[i] = Some(action),
+                None => missing.push(i),
+            }
+        }
+
+        // (1) Bounded LOCAL retry: actions are normally delivered by the proposer's
+        // pre-proposal unicast push (PreProposalBundle -> BroadcastNativeActions) before
+        // this proposal arrives, but that push can race the CompactBlock under load.
+        // Poll briefly so a late push lands before we resort to the network.
+        if !missing.is_empty() {
+            for _ in 0..RECONSTRUCT_RETRIES {
+                std::thread::sleep(RECONSTRUCT_RETRY_DELAY);
+                missing.retain(|&i| match mempool.get_native_da(&hashes[i]) {
+                    Some(action) => {
+                        actions[i] = Some(action);
+                        false
+                    }
+                    None => true,
+                });
+                if missing.is_empty() {
+                    break;
+                }
+            }
+        }
+
+        // (2) HOT pull-fallback (#4 Task 1): the push truly missed — pull the bodies
+        // by-hash on the HOT path too, with a SHORT budget so we never block past the
+        // view timeout. Reuses the proven sync pull infra (mem 4d99a78e) with hot consts.
+        if !missing.is_empty() {
+            let missing_hashes: Vec<torus_types::B256> =
+                missing.iter().map(|&i| hashes[i]).collect();
+            if self.pull_missing_bodies_bounded(&missing_hashes, HOT_PULL_RETRIES, HOT_PULL_DELAY)
+            {
+                missing.retain(|&i| match mempool.get_native_da(&hashes[i]) {
+                    Some(action) => {
+                        actions[i] = Some(action);
+                        false
+                    }
+                    None => true,
+                });
+            }
+        }
+
+        if !missing.is_empty() {
+            return Err(missing.len());
+        }
+        Ok(actions.into_iter().map(|a| a.expect("all bodies present")).collect())
     }
 
     /// Drain fetched bodies and mirror them into the durable DA store. Each body is
@@ -1194,73 +1305,29 @@ impl App<RocksKVStore> for TorusApp {
 
             let native_actions = if compact.native_action_hashes.is_empty() {
                 vec![]
-            } else if let Some(ref mempool) = self.mempool {
-                let mut actions: Vec<Option<torus_types::SignedNativeAction>> =
-                    vec![None; compact.native_action_hashes.len()];
-                let mut missing: Vec<usize> = Vec::new();
-
-                for (i, hash) in compact.native_action_hashes.iter().enumerate() {
-                    // Read the DURABLE DA store, not the ephemeral nonce-gated mempool:
-                    // a block-referenced body survives the 60s nonce window, pool
-                    // eviction, and restart (livelock root cause, mem 28e1a821).
-                    match mempool.get_native_da(hash) {
-                        Some(action) => actions[i] = Some(action),
-                        None => missing.push(i),
-                    }
-                }
-
-                // Safety net for the CompactBlock reconstruction path. Actions are normally
-                // delivered by the proposer's pre-proposal unicast push (PreProposalBundle ->
-                // BroadcastNativeActions) before this proposal arrives, but that push can race
-                // the CompactBlock under load -- especially at a high NATIVE_TOTAL_BLOCK_CAP.
-                // Poll the mempool briefly so late-arriving pushes can land before we reject.
-                // (Restores the retry loop removed in 865d4e1 when the unicast push was added.)
-                //
-                // Total budget is capped at 100ms (5 x 20ms), kept well under the consensus
-                // view timeout (timeout_base_ms = 500ms): validate_block blocking time counts
-                // against the view (hotstuff_rs: 4*EWNL + produce + validate < max_view_time),
-                // so a 500ms blocking retry here could burn the whole view and cause timeouts.
-                if !missing.is_empty() {
-                    const RECONSTRUCT_RETRIES: usize = 5;
-                    const RECONSTRUCT_RETRY_DELAY: std::time::Duration =
-                        std::time::Duration::from_millis(20);
-                    for _ in 0..RECONSTRUCT_RETRIES {
-                        std::thread::sleep(RECONSTRUCT_RETRY_DELAY);
-                        missing.retain(|&i| {
-                            match mempool.get_native_da(&compact.native_action_hashes[i]) {
-                                Some(action) => {
-                                    actions[i] = Some(action);
-                                    false
-                                }
-                                None => true,
-                            }
-                        });
-                        if missing.is_empty() {
-                            break;
-                        }
-                    }
-                }
-
-                if !missing.is_empty() {
-                    if let Some(ref m) = self.metrics {
-                        m.missing_action_rejections.inc();
-                    }
-                    tracing::warn!(
-                        missing_count = missing.len(),
-                        height = compact.header.height,
-                        "validate_block: MISSING native action bodies after retry -- fetch via DA (not invalid)"
-                    );
-                    // MissingData (NOT Invalid): the block is structurally fine, we just
-                    // lack the out-of-band bodies. The sync path must not blacklist the
-                    // serving peer for this (livelock root cause, mem 28e1a821) -- fetch
-                    // via the rare pull-fallback (Task 6) instead.
-                    return ValidateBlockResponse::MissingData;
-                }
-
-                actions.into_iter().map(|a| a.unwrap()).collect()
             } else {
-                tracing::warn!("validate_block: cannot reconstruct -- no mempool/DA store available");
-                return ValidateBlockResponse::MissingData;
+                // Reconstruct out-of-band bodies for the HOT path: a fast local retry for
+                // a racing pre-proposal PUSH, then a SHORT bounded native-DA PULL so a
+                // genuine push miss is recovered live instead of wedging (#4 Task 1 — the
+                // un-wedge). Budget stays ≪ the 500 ms view timeout.
+                match self.reconstruct_native_actions_hot(&compact.native_action_hashes) {
+                    Ok(actions) => actions,
+                    Err(missing_count) => {
+                        if let Some(ref m) = self.metrics {
+                            m.missing_action_rejections.inc();
+                        }
+                        tracing::warn!(
+                            missing_count,
+                            height = compact.header.height,
+                            "validate_block: MISSING native action bodies after hot retry + pull -- fetch via DA (not invalid)"
+                        );
+                        // MissingData (NOT Invalid): the block is structurally fine, we
+                        // just lack the out-of-band bodies. The sync path must not
+                        // blacklist the serving peer for this (livelock root cause, mem
+                        // 28e1a821) — it re-pulls via the rare fallback instead.
+                        return ValidateBlockResponse::MissingData;
+                    }
+                }
             };
 
             TorusBlock {
@@ -1593,6 +1660,37 @@ mod crash_recovery_tests {
         state_db
             .put_cf_raw(CF_BLOCK_BODIES, &block.header.height.to_be_bytes(), &body_bytes)
             .unwrap();
+    }
+
+    /// Test double: a `NativeDaFetcher` whose body only appears on the
+    /// `deliver_on_drain`-th `drain()` — models a body that lands some retries into the
+    /// pull. Shared by the sync-budget test and the hot-path pull tests (#4 Task 1).
+    struct LateFetcher {
+        body: Vec<u8>,
+        deliver_on_drain: usize,
+        drains: std::sync::atomic::AtomicUsize,
+    }
+    impl NativeDaFetcher for LateFetcher {
+        fn fetch(&self, _hashes: Vec<[u8; 32]>) {}
+        fn drain(&self) -> Vec<Vec<u8>> {
+            use std::sync::atomic::Ordering;
+            let n = self.drains.fetch_add(1, Ordering::Relaxed) + 1;
+            if n >= self.deliver_on_drain {
+                vec![self.body.clone()]
+            } else {
+                Vec::new()
+            }
+        }
+    }
+
+    /// Test double: a fetcher that NEVER delivers — models a true push miss whose body
+    /// cannot be pulled in-budget, so the hot path must fail the view, not hang (#4 Task 1).
+    struct NeverFetcher;
+    impl NativeDaFetcher for NeverFetcher {
+        fn fetch(&self, _hashes: Vec<[u8; 32]>) {}
+        fn drain(&self) -> Vec<Vec<u8>> {
+            Vec::new()
+        }
     }
 
     #[test]
@@ -1997,27 +2095,7 @@ mod crash_recovery_tests {
     /// half of the >4 MB un-wedge (the codec/chunk half lives in torus-network).
     #[test]
     fn pull_recovers_body_delivered_after_old_budget() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        /// A `NativeDaFetcher` whose body only appears on the `deliver_on_drain`-th
-        /// `drain()` — models a body that lands later than the old budget allowed.
-        struct LateFetcher {
-            body: Vec<u8>,
-            deliver_on_drain: usize,
-            drains: AtomicUsize,
-        }
-        impl NativeDaFetcher for LateFetcher {
-            fn fetch(&self, _hashes: Vec<[u8; 32]>) {}
-            fn drain(&self) -> Vec<Vec<u8>> {
-                let n = self.drains.fetch_add(1, Ordering::Relaxed) + 1;
-                if n >= self.deliver_on_drain {
-                    vec![self.body.clone()]
-                } else {
-                    Vec::new()
-                }
-            }
-        }
-
+        // `LateFetcher` is the shared test double hoisted to module scope.
         let (config, state_db) = make_test_config_and_db();
         let mempool = Arc::new(torus_mempool::Mempool::new(
             state_db.clone(),
@@ -2033,7 +2111,7 @@ mod crash_recovery_tests {
         let fetcher = Arc::new(LateFetcher {
             body,
             deliver_on_drain: 8,
-            drains: AtomicUsize::new(0),
+            drains: std::sync::atomic::AtomicUsize::new(0),
         });
         app.set_native_da_fetcher(fetcher);
 
@@ -2043,6 +2121,93 @@ mod crash_recovery_tests {
         assert!(
             mempool.get_native_da(&hash).is_some(),
             "the recovered body landed in the durable DA store",
+        );
+    }
+
+    /// #4 Task 1 (RED first): a CompactBlock body absent from the local DA store is
+    /// recovered on the HOT validate path via a SHORT bounded native-DA pull — not only
+    /// on the sync path. Until now the hot path was pull-free by design (mem 8ee99db3) to
+    /// protect the view timeout, so a live PUSH miss was unrecoverable and wedged consensus
+    /// at high batch_size (mem 28e1a821 / bs=1000). The body is delivered by the fetcher a
+    /// few drains in; only a hot-path PULL drains the fetcher, so this passes ONLY once the
+    /// hot path pulls. MUST fail before Task 1 lands.
+    #[test]
+    fn hot_path_pulls_missing_body_within_budget() {
+        let (config, state_db) = make_test_config_and_db();
+        let mempool = Arc::new(torus_mempool::Mempool::new(
+            state_db.clone(),
+            torus_mempool::MempoolConfig::default(),
+        ));
+        let mut app = TorusApp::new(state_db.clone(), &config, None, Some(mempool.clone()), None);
+
+        let action = sign_claim_rewards(7);
+        let hash = torus_types::compute_action_hash(&action);
+        let body = bincode::serialize(&action).expect("serialize body");
+        // Delivered on the 3rd drain — within the hot budget (HOT_PULL_RETRIES drains).
+        let fetcher = Arc::new(LateFetcher {
+            body,
+            deliver_on_drain: 3,
+            drains: std::sync::atomic::AtomicUsize::new(0),
+        });
+        app.set_native_da_fetcher(fetcher);
+
+        assert!(mempool.get_native_da(&hash).is_none(), "body absent before the hot pull");
+        let actions = app
+            .reconstruct_native_actions_hot(&[hash])
+            .expect("hot path must pull + recover the missing body");
+        assert_eq!(actions.len(), 1, "the recovered action is returned (in hash order)");
+        assert!(
+            mempool.get_native_da(&hash).is_some(),
+            "the recovered body landed in the durable DA store",
+        );
+    }
+
+    /// #4 Task 1 (RED first): when the body NEVER arrives, the hot path must FAIL THE VIEW
+    /// (Err with the missing count) and return WITHIN the hot budget — it must not block
+    /// past the 500 ms view timeout (which would burn the view and worsen the wedge). The
+    /// block is simply re-proposed next view, by which point the body has likely arrived.
+    /// MUST fail before Task 1 (today the hot path is neither pull-backed nor pull-bounded).
+    #[test]
+    fn hot_path_fails_view_fast_when_body_never_arrives() {
+        let (config, state_db) = make_test_config_and_db();
+        let mempool = Arc::new(torus_mempool::Mempool::new(
+            state_db.clone(),
+            torus_mempool::MempoolConfig::default(),
+        ));
+        let mut app = TorusApp::new(state_db.clone(), &config, None, Some(mempool.clone()), None);
+
+        let action = sign_claim_rewards(9);
+        let hash = torus_types::compute_action_hash(&action);
+        app.set_native_da_fetcher(Arc::new(NeverFetcher));
+
+        let start = std::time::Instant::now();
+        let result = app.reconstruct_native_actions_hot(&[hash]);
+        let elapsed = start.elapsed();
+
+        assert_eq!(
+            result.err(),
+            Some(1),
+            "a never-arriving body fails the view, reporting the missing count",
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(config.timeout_base_ms),
+            "hot path must return within the {}ms view timeout, not hang: took {elapsed:?}",
+            config.timeout_base_ms,
+        );
+    }
+
+    /// #4 Task 1: the HOT-path reconstruction budget (local retry + short pull) must stay
+    /// strictly under the 500 ms view timeout, so validate_block fails a missed view
+    /// instead of burning it (hotstuff: 4*EWNL + produce + validate < max_view_time). The
+    /// UPPER-bound mirror of `pull_budget_is_at_least_one_second` (the sync LOWER bound).
+    #[test]
+    fn hot_pull_budget_under_view_timeout() {
+        let local = RECONSTRUCT_RETRY_DELAY * RECONSTRUCT_RETRIES as u32;
+        let pull = HOT_PULL_DELAY * HOT_PULL_RETRIES as u32;
+        let total = local + pull;
+        assert!(
+            total < std::time::Duration::from_millis(500),
+            "hot-path budget {total:?} (local {local:?} + pull {pull:?}) must be < 500 ms view timeout",
         );
     }
 }
