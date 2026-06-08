@@ -544,6 +544,15 @@ fn encode_proposal_datum(block: &TorusBlock, compact: bool) -> Vec<u8> {
     }
 }
 
+/// Pull-fallback poll budget for [`TorusApp::pull_missing_bodies`]: drain-and-absorb
+/// is retried `PULL_RETRIES` times, sleeping `PULL_DELAY` between attempts, so the
+/// effective wait = `PULL_RETRIES * PULL_DELAY` = ~1 s. This runs ONLY on the
+/// block-sync path (never the consensus voting hot path), so blocking up to ~1 s is
+/// safe — and necessary: the original 80 ms (4 × 20 ms) gave up before a >4 MB
+/// chunked body-set could land, contributing to the wedge (native-DA fix Task 3).
+const PULL_RETRIES: usize = 20;
+const PULL_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+
 impl TorusApp {
     pub fn new(
         state_db: StateDb,
@@ -836,10 +845,10 @@ impl TorusApp {
     /// into the durable DA store. Returns `true` once all are present (or were
     /// already), `false` on timeout.
     ///
-    /// Bounded poll (≤ ~80ms, well under the 500ms view timeout) on the block-sync
-    /// path — NOT the hot consensus voting path. The existing `validate_block` retry
-    /// already waits ≤100ms during sync, so this stays within the established budget;
-    /// it never adds blocking to live consensus (mem 8ee99db3).
+    /// Bounded poll (~1 s = `PULL_RETRIES` × `PULL_DELAY`) on the block-sync path —
+    /// NOT the hot consensus voting path, so a blocking wait of ≤1 s is safe and never
+    /// touches live consensus (mem 8ee99db3). The earlier 80 ms budget gave up before a
+    /// >4 MB body-set (now pulled in chunks) could arrive; ~1 s recovers a late body.
     fn pull_missing_bodies(&self, missing: &[torus_types::B256]) -> bool {
         if missing.is_empty() {
             return true;
@@ -856,8 +865,6 @@ impl TorusApp {
             m.native_da_pull_requests.inc();
         }
 
-        const PULL_RETRIES: usize = 4;
-        const PULL_DELAY: std::time::Duration = std::time::Duration::from_millis(20);
         for _ in 0..PULL_RETRIES {
             std::thread::sleep(PULL_DELAY);
             Self::absorb_fetched_bodies(mempool, fetcher.as_ref());
@@ -1966,6 +1973,76 @@ mod crash_recovery_tests {
             recorded.as_slice(),
             &1u64.to_be_bytes(),
             "replay guard must skip the second commit (nonce height stays 1)",
+        );
+    }
+
+    /// Task 3 (RED first): the pull-fallback poll budget must be ≥ 1 s so a body that
+    /// arrives a few hundred ms after the request (slow peer / under load) is still
+    /// recovered on the sync path. The original 4 × 20 ms = 80 ms gave up far too
+    /// early — a body landing later was lost, contributing to the >4 MB wedge. The
+    /// widened 20 × 50 ms = 1 s is safe here (sync path only, never consensus voting).
+    #[test]
+    fn pull_budget_is_at_least_one_second() {
+        let budget = PULL_DELAY * PULL_RETRIES as u32;
+        assert!(
+            budget >= std::time::Duration::from_secs(1),
+            "PULL_RETRIES({PULL_RETRIES}) * PULL_DELAY({PULL_DELAY:?}) = {budget:?} must be ≥ 1 s",
+        );
+    }
+
+    /// Task 3 (behavioral): a body that only arrives AFTER the old 80 ms budget would
+    /// have expired (modelled here as delivered on the 8th drain ≈ 400 ms in) is still
+    /// recovered within the widened budget. The old 4-retry loop gave up at drain 4 and
+    /// lost it; 20 retries reach drain 8 and recover it. This is the consensus-layer
+    /// half of the >4 MB un-wedge (the codec/chunk half lives in torus-network).
+    #[test]
+    fn pull_recovers_body_delivered_after_old_budget() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// A `NativeDaFetcher` whose body only appears on the `deliver_on_drain`-th
+        /// `drain()` — models a body that lands later than the old budget allowed.
+        struct LateFetcher {
+            body: Vec<u8>,
+            deliver_on_drain: usize,
+            drains: AtomicUsize,
+        }
+        impl NativeDaFetcher for LateFetcher {
+            fn fetch(&self, _hashes: Vec<[u8; 32]>) {}
+            fn drain(&self) -> Vec<Vec<u8>> {
+                let n = self.drains.fetch_add(1, Ordering::Relaxed) + 1;
+                if n >= self.deliver_on_drain {
+                    vec![self.body.clone()]
+                } else {
+                    Vec::new()
+                }
+            }
+        }
+
+        let (config, state_db) = make_test_config_and_db();
+        let mempool = Arc::new(torus_mempool::Mempool::new(
+            state_db.clone(),
+            torus_mempool::MempoolConfig::default(),
+        ));
+        let mut app = TorusApp::new(state_db.clone(), &config, None, Some(mempool.clone()), None);
+
+        let action = sign_claim_rewards(42);
+        let hash = torus_types::compute_action_hash(&action);
+        let body = bincode::serialize(&action).expect("serialize body");
+
+        // Delivered on the 8th drain — past the old 4-retry budget, within the new 20.
+        let fetcher = Arc::new(LateFetcher {
+            body,
+            deliver_on_drain: 8,
+            drains: AtomicUsize::new(0),
+        });
+        app.set_native_da_fetcher(fetcher);
+
+        assert!(mempool.get_native_da(&hash).is_none(), "body absent before the pull");
+        let recovered = app.pull_missing_bodies(&[hash]);
+        assert!(recovered, "a body arriving after the old 80 ms budget is recovered within ~1 s");
+        assert!(
+            mempool.get_native_da(&hash).is_some(),
+            "the recovered body landed in the durable DA store",
         );
     }
 }
