@@ -57,6 +57,13 @@ impl Clone for LibP2PNetwork {
     }
 }
 
+/// Max action-hashes per `/torus/native-da/1.0` fetch request. The pull-fallback
+/// splits a missing-body set into chunks of this size per validator so each response
+/// stays well under `MAX_NATIVE_DA_MSG_SIZE` (a `PlaceOrderBatch` body is ≤ ~75 KB, so
+/// 16 bodies ≤ ~1.2 MB). Keeps a >4 MB total fetch from collapsing into one oversized
+/// response the codec drops (native-DA fix Task 2).
+pub const NATIVE_DA_FETCH_CHUNK: usize = 16;
+
 impl LibP2PNetwork {
     /// Create a new LibP2PNetwork. Must be called from within a tokio runtime.
     /// Spawns a background task to drive the libp2p swarm.
@@ -209,6 +216,11 @@ impl LibP2PNetwork {
     /// mirrored them in produce_block), so asking the whole set recovers reliably
     /// without the consensus layer needing to resolve peer identity. Non-blocking;
     /// fires rarely (push covers the common case).
+    ///
+    /// The hash list is split into [`NATIVE_DA_FETCH_CHUNK`]-sized requests per target
+    /// so no single `/torus/native-da/1.0` response approaches the codec cap — a >4 MB
+    /// body-set is pulled as several bounded responses instead of one oversized one that
+    /// the codec drops (the bs=1000 wedge; native-DA fix Task 2).
     pub fn fetch_native_actions_from_validators(&self, hashes: Vec<[u8; 32]>) {
         if hashes.is_empty() {
             return;
@@ -223,10 +235,12 @@ impl LibP2PNetwork {
                 .collect()
         };
         for target in targets {
-            let _ = self.command_tx.send(NetworkCommand::FetchNativeActions {
-                target,
-                hashes: hashes.clone(),
-            });
+            for chunk in hashes.chunks(NATIVE_DA_FETCH_CHUNK) {
+                let _ = self.command_tx.send(NetworkCommand::FetchNativeActions {
+                    target,
+                    hashes: chunk.to_vec(),
+                });
+            }
         }
     }
 
@@ -315,6 +329,104 @@ impl Network for LibP2PNetwork {
                 hash: hash.bytes(),
                 block_bytes,
             });
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Minimal [`SharedState`] carrying a fixed validator set — enough to drive
+    /// `fetch_native_actions_from_validators` without a live swarm. Only `validators`
+    /// is exercised here; the rest mirror the swarm-module test helper.
+    fn shared_with_validators(vks: &[VerifyingKey]) -> Arc<SharedState> {
+        let validators: HashSet<[u8; 32]> = vks.iter().map(|vk| vk.to_bytes()).collect();
+        Arc::new(SharedState {
+            inbound: Mutex::new(VecDeque::new()),
+            peer_map: RwLock::new(PeerMap::default()),
+            validators: RwLock::new(validators),
+            metrics: None,
+            block_store: RwLock::new(HashMap::new()),
+            block_data_inbound: Mutex::new(VecDeque::new()),
+            native_action_inbound: None,
+            pending_sends: Mutex::new(PendingSendQueue::new(256)),
+            outbound_direct: Mutex::new(HashMap::new()),
+            recent_native_bundles: Mutex::new(VecDeque::new()),
+            native_da: RwLock::new(None),
+            native_da_inbound: Mutex::new(VecDeque::new()),
+            pending_native_pushes: Mutex::new(PendingSendQueue::new(8)),
+        })
+    }
+
+    fn test_signing_key(seed: u8) -> SigningKey {
+        let mut bytes = [0u8; 32];
+        bytes[0] = seed;
+        SigningKey::from_bytes(&bytes)
+    }
+
+    /// Task 2 (RED first): the by-hash native-DA pull-fallback must split its hash
+    /// list into `NATIVE_DA_FETCH_CHUNK`-sized requests PER validator, so a >4 MB
+    /// body-set is pulled as several codec-sized responses instead of one oversized
+    /// response the codec drops (the bs=1000 wedge). Driving the fetch with 100 hashes
+    /// against a 3-validator set (self + 2 peers) must enqueue `ceil(100/16)=7`
+    /// `FetchNativeActions` commands per NON-self validator (=14), each carrying
+    /// ≤16 hashes and together covering every hash once per validator. Today (one
+    /// oversized request/validator) this fails the per-request size bound.
+    #[test]
+    fn fetch_native_actions_chunks_per_validator() {
+        let local = test_signing_key(1);
+        let peer_a = test_signing_key(2).verifying_key();
+        let peer_b = test_signing_key(3).verifying_key();
+
+        let (command_tx, mut command_rx) = mpsc::unbounded_channel();
+        let shared = shared_with_validators(&[local.verifying_key(), peer_a, peer_b]);
+        let net = LibP2PNetwork {
+            command_tx,
+            shared,
+            native_inbound_rx: None,
+            local_key: local.verifying_key(),
+        };
+
+        // 100 distinct hashes.
+        let hashes: Vec<[u8; 32]> = (0..100u32)
+            .map(|i| {
+                let mut h = [0u8; 32];
+                h[..4].copy_from_slice(&i.to_le_bytes());
+                h
+            })
+            .collect();
+        net.fetch_native_actions_from_validators(hashes.clone());
+
+        // Drain every enqueued command; bucket the chunks by target.
+        let mut per_target: HashMap<[u8; 32], Vec<[u8; 32]>> = HashMap::new();
+        let mut command_count = 0usize;
+        while let Ok(cmd) = command_rx.try_recv() {
+            let NetworkCommand::FetchNativeActions { target, hashes } = cmd else {
+                panic!("fetch must enqueue only FetchNativeActions commands");
+            };
+            command_count += 1;
+            assert!(
+                (1..=NATIVE_DA_FETCH_CHUNK).contains(&hashes.len()),
+                "each request carries 1..=NATIVE_DA_FETCH_CHUNK hashes, got {}",
+                hashes.len()
+            );
+            per_target.entry(target.to_bytes()).or_default().extend(hashes);
+        }
+
+        let chunks_per_validator = hashes.len().div_ceil(NATIVE_DA_FETCH_CHUNK); // 7
+        assert_eq!(
+            command_count,
+            chunks_per_validator * 2,
+            "ceil(100/16)=7 chunks × 2 non-self validators = 14 commands"
+        );
+        assert_eq!(per_target.len(), 2, "exactly the 2 non-self validators are targeted");
+        assert!(
+            !per_target.contains_key(&local.verifying_key().to_bytes()),
+            "self is never a fetch target"
+        );
+        for got in per_target.values() {
+            assert_eq!(got, &hashes, "every hash delivered exactly once per validator, in order");
         }
     }
 }
