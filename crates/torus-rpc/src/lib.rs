@@ -360,13 +360,25 @@ pub fn find_latest_height(state: &StateDb) -> u64 {
     let Ok(cf) = state.cf_handle(CF_BLOCK_HEADERS) else {
         return 0;
     };
-    let mut iter = state.inner().iterator_cf(cf, rocksdb::IteratorMode::End);
-    match iter.next() {
-        Some(Ok((key, _))) if key.len() == 8 => {
-            u64::from_be_bytes(key[..8].try_into().unwrap())
+    // Non-height entries (e.g. the pruner's `__prune_meta__` key) sort AFTER
+    // the 8-byte big-endian height keys, so skip past them instead of bailing
+    // to 0 — on a pruned DB the meta key is the last entry and bailing froze
+    // eth_blockNumber at 0 and short-circuited on_commit_block (s334). The
+    // take(8) bounds the scan; today there is exactly one meta key.
+    for entry in state
+        .inner()
+        .iterator_cf(cf, rocksdb::IteratorMode::End)
+        .take(8)
+    {
+        match entry {
+            Ok((key, _)) if key.len() == 8 => {
+                return u64::from_be_bytes(key[..8].try_into().unwrap());
+            }
+            Ok(_) => continue,
+            Err(_) => return 0,
         }
-        _ => 0,
     }
+    0
 }
 
 /// Public helper to update latest height after committing a new block.
@@ -539,6 +551,28 @@ mod tests {
             Arc::new(Mempool::new(state.clone(), MempoolConfig::default())),
             Arc::new(EvmExecutor::new(TORUS_CHAIN_ID)),
         )
+    }
+
+    #[test]
+    fn find_latest_height_skips_prune_meta_key() {
+        let dir = TempDir::new().unwrap();
+        let state = StateDb::open(dir.path()).unwrap();
+        for h in 1u64..=5 {
+            state
+                .put_cf_raw(CF_BLOCK_HEADERS, &h.to_be_bytes(), b"hdr")
+                .unwrap();
+        }
+        // The pruner's meta key sorts AFTER all 8-byte big-endian height keys; a
+        // pruned (or transplanted-from-pruned) DB must still report the real tip
+        // (s334: eth_blockNumber froze at 0 and on_commit_block early-returned).
+        state
+            .put_cf_raw(
+                CF_BLOCK_HEADERS,
+                b"__prune_meta__\x00\x00",
+                &9999u64.to_be_bytes(),
+            )
+            .unwrap();
+        assert_eq!(find_latest_height(&state), 5);
     }
 
     async fn start_server(
