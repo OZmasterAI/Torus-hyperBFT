@@ -226,6 +226,16 @@ Rebuild release; run the bs-sweep on the live testnet (or a local 3-val devnet o
 THROWAWAY genesis — never wedge the live chain mid-test). Confirm bs500 advances, bs100
 holds 23.4k o/s, bs200 recovers. Capture orders/s + block-time per batch_size to a memory.
 
+## Rollout (mixed-version — review F7)
+The hash-only push adds a new `/torus/direct` marker byte (`0xFC`). An OLD binary has no
+branch for it: the inbound dispatch falls through to the HotStuff-message parse, fails, and
+`peer_scoring.penalize(.., PENALTY_INVALID_CONSENSUS_MSG)`s the new-binary proposer — repeated
+manifests could score it toward a ban, silently severing consensus on old-binary validators.
+Mitigations: (a) the gate only fires under heavy native-action load (the idle live testnet
+never triggers it), and (b) the bs-sweep E2E runs on a LOCAL all-new-binary devnet. For the
+live chain this is a **coordinated all-new-binary relaunch** (every validator on the new
+binary) — the project's standing norm for any wire/format change, NOT a rolling upgrade.
+
 ## Rollback
 All changes are additive (a new marker, a new command/method, a size gate, an absorb-drain
 in the hot retry). Bodies stay content-addressed by hash — no consensus-format/state-root

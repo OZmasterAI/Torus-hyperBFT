@@ -65,6 +65,12 @@ pub enum NetworkCommand {
     BroadcastNativeActions {
         payload: Vec<u8>,
     },
+    /// Proposer pushes only the action HASHES (a tiny manifest) when the body set is too
+    /// big to disseminate within the view; validators PULL the bodies by-hash (pre-warm).
+    /// Phase 2.3 (#5) — un-wedges bs≈500 (VIEW TIMEOUT on big-body dissemination).
+    BroadcastNativeActionHashes {
+        hashes: Vec<[u8; 32]>,
+    },
     /// RARE pull-fallback: fetch native-action bodies by-hash from `target` via the
     /// dedicated `/torus/native-da/1.0` protocol when a CompactBlock body is absent
     /// locally (Phase C Task 5/6). Push covers the common case; this fires on a miss.
@@ -78,6 +84,10 @@ pub enum NetworkCommand {
 const FORWARD_ACTION_MARKER: u8 = 0xFE;
 /// Marker byte for batched pre-proposal action payloads (CompactBlock dissemination).
 const PRE_PROPOSAL_BATCH_MARKER: u8 = 0xFD;
+/// Marker byte for a HASH-ONLY pre-proposal manifest (`bincode(Vec<[u8;32]>)`): the body
+/// set was too big to disseminate within the view, so the proposer pushes only the hashes
+/// and validators PULL the bodies (pre-warm). Phase 2.3 (#5) — un-wedges bs≈500.
+const PRE_PROPOSAL_HASHES_MARKER: u8 = 0xFC;
 /// How many recent pre-proposal bundles to retain for re-push on (re)connect (Task 4).
 const RECENT_NATIVE_BUNDLES_CAP: usize = 3;
 
@@ -674,6 +684,25 @@ fn handle_event(
                         warn!(%peer, %e, "pre-proposal batch deserialization failed");
                     }
                 }
+            } else if request.payload.first() == Some(&PRE_PROPOSAL_HASHES_MARKER) {
+                // Phase 2.3 (#5): the proposer pushed only the HASHES (the body set was too
+                // big to disseminate within the view). PRE-WARM the bodies by pulling them
+                // by-hash from the proposer (this verified `peer` mirrored them in
+                // produce_block) BEFORE its CompactBlock arrives, so the hot validate path
+                // finds them already absorbed instead of wedging on dissemination.
+                match plan_prewarm_requests(&request.payload[1..]) {
+                    Some(chunks) => {
+                        let count: usize = chunks.iter().map(|c| c.len()).sum();
+                        for hashes in chunks {
+                            swarm
+                                .behaviour_mut()
+                                .native_da
+                                .send_request(&peer, NativeDaNetRequest { hashes });
+                        }
+                        tracing::info!(count, %peer, "pre-proposal HASH manifest -> pre-warm pull from proposer");
+                    }
+                    None => warn!(%peer, "pre-proposal hash manifest decode failed -- no pre-warm"),
+                }
             } else if request.payload.first() == Some(&FORWARD_ACTION_MARKER) {
                 let action_bytes = &request.payload[1..];
                 if action_bytes.len() > 20 {
@@ -1089,87 +1118,30 @@ fn handle_command(
             }
         }
         NetworkCommand::BroadcastNativeActions { payload } => {
+            // Full-body push (the fast common case for small batches): wrap the bodies in
+            // the batch marker and fan them out. The receiver mirrors bodies to its durable
+            // DA store, keeping the hot-path pull rare.
             let mut envelope = vec![PRE_PROPOSAL_BATCH_MARKER];
             envelope.extend_from_slice(&payload);
-            // Resolve every mapped peer (validators + RPC nodes that also reconstruct
-            // bodies), tagging validator membership and skipping self.
-            let targets: Vec<(VerifyingKey, PeerId, bool)> = {
-                let validators = shared.validators.read().unwrap();
-                let peer_map = shared.peer_map.read().unwrap();
-                peer_map
-                    .peer_ids()
-                    .filter_map(|pid| {
-                        let vk = *peer_map.get_vk(pid)?;
-                        if vk == *local_key {
-                            return None; // never push to self
-                        }
-                        let is_validator = validators.contains(&vk.to_bytes());
-                        Some((vk, *pid, is_validator))
-                    })
-                    .collect()
-            };
-            // T7: send to every connected peer now; for a DISCONNECTED validator, QUEUE
-            // the push so it is delivered on (re)connect instead of dropped under load
-            // (and nudge a dial). The receiver mirrors bodies to its durable DA store
-            // unconditionally (T2), so a delivered push keeps the pull-fallback rare.
-            //
-            // #4 Task 3: bound concurrent IN-FLIGHT pushes via the PushScheduler so this
-            // loop can't exhaust quinn's per-connection bidi-stream window (the
-            // `max sub-streams reached` storm). Beyond the cap, queue the push (bounded);
-            // it is dispatched as in-flight pushes complete (Direct Response/OutboundFailure,
-            // see `dispatch_next_push`). Disconnected-validator T7 queuing is unchanged.
-            let mut sent = 0usize;
-            let mut queued = 0usize;
-            let mut backpressured = 0usize;
-            let mut dropped = 0usize;
-            for (vk, pid, is_validator) in targets {
-                if swarm.is_connected(&pid) {
-                    let mut sched = shared.push_scheduler.lock().unwrap();
-                    if sched.has_capacity() {
-                        let req = DirectRequest {
-                            sender_key: local_key.to_bytes(),
-                            payload: envelope.clone(),
-                        };
-                        let id = swarm.behaviour_mut().direct.send_request(&pid, req);
-                        sched.record(id);
-                        sent += 1;
-                    } else {
-                        if sched.enqueue(pid, envelope.clone()) {
-                            dropped += 1;
-                        }
-                        backpressured += 1;
-                    }
-                } else if is_validator {
-                    shared
-                        .pending_native_pushes
-                        .lock()
-                        .unwrap()
-                        .enqueue(&vk, envelope.clone());
-                    let _ = swarm.dial(pid);
-                    queued += 1;
+            fan_native_push(swarm, shared, local_key, envelope, true);
+        }
+        NetworkCommand::BroadcastNativeActionHashes { hashes } => {
+            // Phase 2.3 (#5): the body set was too big to disseminate within the view, so
+            // push only a tiny HASH manifest — validators PULL the bodies (pre-warm) the
+            // moment they see it, off the view's critical path. Same PushScheduler-bounded
+            // fan + re-push ring as the body push (the envelope is just far smaller, so it
+            // never approaches the /torus/direct cap and always lands within the view).
+            match bincode::serialize(&hashes) {
+                Ok(body) => {
+                    let mut envelope = vec![PRE_PROPOSAL_HASHES_MARKER];
+                    envelope.extend_from_slice(&body);
+                    tracing::info!(
+                        count = hashes.len(),
+                        "pre-proposal HASH-ONLY manifest push (bodies pulled by peers)"
+                    );
+                    fan_native_push(swarm, shared, local_key, envelope, false);
                 }
-            }
-            // T4: also retain this bundle (bounded ring) for a broad re-push to any
-            // validator that (re)connects after this push. Dedup is free on the receiver.
-            push_bounded(
-                &mut shared.recent_native_bundles.lock().unwrap(),
-                envelope,
-                RECENT_NATIVE_BUNDLES_CAP,
-            );
-            tracing::info!(
-                sent,
-                queued,
-                backpressured,
-                dropped,
-                bytes = payload.len(),
-                "broadcast pre-proposal actions to validators"
-            );
-            if dropped > 0 {
-                // Never silent: a saturated push link dropped the oldest queued pushes.
-                // Recoverable — the bundle is retained in `recent_native_bundles` and
-                // re-pushed when the validator (re)connects, and the hot-path pull (#4
-                // Task 1) recovers any body that still misses.
-                tracing::warn!(dropped, "native push queue saturated -- oldest pushes dropped (recoverable via re-push + hot pull)");
+                Err(e) => tracing::warn!(%e, "hash manifest serialize failed -- skipping push"),
             }
         }
         NetworkCommand::FetchNativeActions { target, hashes } => {
@@ -1181,6 +1153,127 @@ fn handle_command(
                 warn!("FetchNativeActions target not in peer map — dropping");
             }
         }
+    }
+}
+
+/// Defensive cap on a pre-warm manifest's hash count (review F6): a legitimate block holds
+/// far fewer native actions than this, so a larger manifest from a (mapped) peer is rejected
+/// rather than fanned into thousands of NativeDa sub-stream opens. The manifest body is
+/// already bounded by the 4 MB `/torus/direct` codec; this bounds the pre-warm FAN itself.
+const MAX_PREWARM_HASHES: usize = 100_000;
+
+/// Decode a `PRE_PROPOSAL_HASHES_MARKER` manifest body (`bincode(Vec<[u8;32]>)`) into
+/// per-request hash chunks (≤ `NATIVE_DA_FETCH_CHUNK`) for the pre-warm pull (Phase 2.3 #5).
+/// `None` on a malformed, empty, or over-cap manifest — nothing is pulled, so the node falls
+/// back to the hot-path pull when the CompactBlock arrives.
+fn plan_prewarm_requests(body: &[u8]) -> Option<Vec<Vec<[u8; 32]>>> {
+    let hashes: Vec<[u8; 32]> = bincode::deserialize(body).ok()?;
+    if hashes.is_empty() || hashes.len() > MAX_PREWARM_HASHES {
+        return None;
+    }
+    Some(
+        hashes
+            .chunks(crate::bridge::NATIVE_DA_FETCH_CHUNK)
+            .map(|c| c.to_vec())
+            .collect(),
+    )
+}
+
+/// Fan a pre-proposal native-DA push `envelope` (already marker-prefixed) out to every
+/// connected mapped peer, bounded by the PushScheduler (#4 Task 3) and queued for a
+/// disconnected validator (T7), then retain it in `recent_native_bundles` for re-push on
+/// (re)connect (T4). Shared by the full-body push (`BroadcastNativeActions`) and the
+/// hash-only manifest push (`BroadcastNativeActionHashes`, Phase 2.3 #5) — only the
+/// envelope contents differ, so the bounded-fan + re-push machinery is identical.
+fn fan_native_push(
+    swarm: &mut Swarm<TorusBehaviour>,
+    shared: &SharedState,
+    local_key: &VerifyingKey,
+    envelope: Vec<u8>,
+    retain_for_repush: bool,
+) {
+    let bytes = envelope.len();
+    // Resolve every mapped peer (validators + RPC nodes that also reconstruct bodies),
+    // tagging validator membership and skipping self.
+    let targets: Vec<(VerifyingKey, PeerId, bool)> = {
+        let validators = shared.validators.read().unwrap();
+        let peer_map = shared.peer_map.read().unwrap();
+        peer_map
+            .peer_ids()
+            .filter_map(|pid| {
+                let vk = *peer_map.get_vk(pid)?;
+                if vk == *local_key {
+                    return None; // never push to self
+                }
+                let is_validator = validators.contains(&vk.to_bytes());
+                Some((vk, *pid, is_validator))
+            })
+            .collect()
+    };
+    // T7: send to every connected peer now; for a DISCONNECTED validator, QUEUE the push so
+    // it is delivered on (re)connect instead of dropped under load (and nudge a dial).
+    //
+    // #4 Task 3: bound concurrent IN-FLIGHT pushes via the PushScheduler so this loop can't
+    // exhaust quinn's per-connection bidi-stream window (the `max sub-streams reached`
+    // storm). Beyond the cap, queue the push (bounded); it is dispatched as in-flight pushes
+    // complete (see `dispatch_next_push`). Disconnected-validator T7 queuing is unchanged.
+    let mut sent = 0usize;
+    let mut queued = 0usize;
+    let mut backpressured = 0usize;
+    let mut dropped = 0usize;
+    for (vk, pid, is_validator) in targets {
+        if swarm.is_connected(&pid) {
+            let mut sched = shared.push_scheduler.lock().unwrap();
+            if sched.has_capacity() {
+                let req = DirectRequest {
+                    sender_key: local_key.to_bytes(),
+                    payload: envelope.clone(),
+                };
+                let id = swarm.behaviour_mut().direct.send_request(&pid, req);
+                sched.record(id);
+                sent += 1;
+            } else {
+                if sched.enqueue(pid, envelope.clone()) {
+                    dropped += 1;
+                }
+                backpressured += 1;
+            }
+        } else if is_validator {
+            shared
+                .pending_native_pushes
+                .lock()
+                .unwrap()
+                .enqueue(&vk, envelope.clone());
+            let _ = swarm.dial(pid);
+            queued += 1;
+        }
+    }
+    // T4: retain FULL-BODY bundles (bounded ring) for a broad re-push to any validator that
+    // (re)connects after this push — a re-pushed body seeds the reconnecting node's DA store
+    // directly. A HASH manifest is a pre-warm tied to a SPECIFIC upcoming proposal: re-pushing
+    // it after reconnect only fires spurious pulls for bodies the node will get via normal
+    // block processing / sync, so manifests are NOT retained (review F1).
+    if retain_for_repush {
+        push_bounded(
+            &mut shared.recent_native_bundles.lock().unwrap(),
+            envelope,
+            RECENT_NATIVE_BUNDLES_CAP,
+        );
+    }
+    tracing::info!(
+        sent,
+        queued,
+        backpressured,
+        dropped,
+        bytes,
+        "broadcast pre-proposal actions to validators"
+    );
+    if dropped > 0 {
+        // Never silent: a saturated push link dropped the oldest queued pushes. Recoverable
+        // — the bundle is retained in `recent_native_bundles` and re-pushed when the
+        // validator (re)connects, and the hot-path pull (#4 Task 1) recovers a still-missing
+        // body.
+        tracing::warn!(dropped, "native push queue saturated -- oldest pushes dropped (recoverable via re-push + hot pull)");
     }
 }
 
@@ -1368,6 +1461,33 @@ fn handle_consensus_gossip(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Phase 2.3 (#5, RED first): a hash-only manifest body (`bincode(Vec<[u8;32]>)`)
+    /// decodes into per-request hash chunks (≤ `NATIVE_DA_FETCH_CHUNK`) for the pre-warm
+    /// pull, covering every hash once in order; a malformed or empty manifest yields `None`
+    /// (no pull fired). MUST fail before Task 3 (no `plan_prewarm_requests`).
+    #[test]
+    fn prewarm_requests_chunk_the_manifest() {
+        let chunk = crate::bridge::NATIVE_DA_FETCH_CHUNK;
+        let hashes: Vec<[u8; 32]> = (0..40u8).map(|i| [i; 32]).collect();
+        let body = bincode::serialize(&hashes).unwrap();
+
+        let chunks = plan_prewarm_requests(&body).expect("a valid manifest yields chunks");
+        assert_eq!(chunks.len(), hashes.len().div_ceil(chunk), "ceil(40/16) = 3 chunks");
+        assert!(
+            chunks.iter().all(|c| (1..=chunk).contains(&c.len())),
+            "each chunk carries 1..=NATIVE_DA_FETCH_CHUNK hashes"
+        );
+        assert_eq!(chunks.concat(), hashes, "every hash covered exactly once, in order");
+
+        assert!(plan_prewarm_requests(b"\x00\x01not-bincode").is_none(), "garbage -> no pull");
+        let empty = bincode::serialize::<Vec<[u8; 32]>>(&vec![]).unwrap();
+        assert!(plan_prewarm_requests(&empty).is_none(), "empty manifest -> no pull");
+
+        // Review F6: a manifest exceeding the defensive cap is rejected (no pre-warm fan).
+        let over_cap = bincode::serialize(&vec![[0u8; 32]; MAX_PREWARM_HASHES + 1]).unwrap();
+        assert!(plan_prewarm_requests(&over_cap).is_none(), "over-cap manifest -> no pull");
+    }
 
     fn test_vk(seed: u8) -> VerifyingKey {
         let mut bytes = [0u8; 32];

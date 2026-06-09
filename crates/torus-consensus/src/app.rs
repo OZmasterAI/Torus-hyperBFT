@@ -889,6 +889,15 @@ impl TorusApp {
             return false; // no transport/store wired (consensus-only tests)
         };
 
+        // Pre-warm fast path (review F2): a body pushed-as-hash may already be sitting in the
+        // fetcher inbound (the receiver pre-warm-pulled it) but not yet absorbed — e.g. it
+        // landed just after the hot local-retry's last drain. Absorb + re-check BEFORE issuing
+        // a network fetch, so a pre-warmed (or late) body never triggers a redundant fetch.
+        Self::absorb_fetched_bodies(mempool, fetcher.as_ref());
+        if missing.iter().all(|h| mempool.get_native_da(h).is_some()) {
+            return true;
+        }
+
         let hashes: Vec<[u8; 32]> = missing.iter().map(|h| h.0).collect();
         fetcher.fetch(hashes);
 
@@ -954,6 +963,14 @@ impl TorusApp {
         if !missing.is_empty() {
             for _ in 0..RECONSTRUCT_RETRIES {
                 std::thread::sleep(RECONSTRUCT_RETRY_DELAY);
+                // Phase 2.3 pre-warm (#5): a hash-only push made THIS node PULL the bodies
+                // out-of-band (the receiver fired the by-hash fetch on the manifest), so they
+                // arrive in the fetcher inbound. Absorb them into the DA store here, in the
+                // fast local retry, so a pre-warmed body is picked up WITHOUT the redundant
+                // hot network fetch below — the common case once the proposer pushes hashes.
+                if let Some(ref fetcher) = self.da_fetcher {
+                    Self::absorb_fetched_bodies(mempool, fetcher.as_ref());
+                }
                 missing.retain(|&i| match mempool.get_native_da(&hashes[i]) {
                     Some(action) => {
                         actions[i] = Some(action);
@@ -1693,6 +1710,28 @@ mod crash_recovery_tests {
         }
     }
 
+    /// Test double (Phase 2.3 #5): models a hash-only PRE-WARM — the body already sits in
+    /// the inbound queue (delivered once on the first `drain()`, then gone, as a real pull
+    /// delivers each body once). `fetch()` is COUNTED so a test can prove the hot local
+    /// retry absorbed the pre-warmed body without issuing a redundant network fetch.
+    struct PrewarmFetcher {
+        body: Vec<u8>,
+        fetches: std::sync::atomic::AtomicUsize,
+        drained: std::sync::atomic::AtomicBool,
+    }
+    impl NativeDaFetcher for PrewarmFetcher {
+        fn fetch(&self, _hashes: Vec<[u8; 32]>) {
+            self.fetches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        fn drain(&self) -> Vec<Vec<u8>> {
+            if self.drained.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                Vec::new()
+            } else {
+                vec![self.body.clone()]
+            }
+        }
+    }
+
     #[test]
     fn crash_recovery_replays_committed_block() {
         let (config, state_db) = make_test_config_and_db();
@@ -2159,6 +2198,46 @@ mod crash_recovery_tests {
         assert!(
             mempool.get_native_da(&hash).is_some(),
             "the recovered body landed in the durable DA store",
+        );
+    }
+
+    /// Phase 2.3 (#5, RED first): when a hash-only push PRE-WARMED the bodies (they already
+    /// sit in the fetcher inbound), the HOT local retry must ABSORB them into the DA store
+    /// and reconstruct WITHOUT issuing a redundant network fetch. Asserts the body is
+    /// recovered AND `fetch()` was never called. MUST fail before Task 4 (today only the
+    /// hot-PULL phase absorbs, and it calls `fetch` first → fetch_count ≥ 1).
+    #[test]
+    fn prewarmed_bodies_absorbed_without_redundant_hot_fetch() {
+        let (config, state_db) = make_test_config_and_db();
+        let mempool = Arc::new(torus_mempool::Mempool::new(
+            state_db.clone(),
+            torus_mempool::MempoolConfig::default(),
+        ));
+        let mut app = TorusApp::new(state_db.clone(), &config, None, Some(mempool.clone()), None);
+
+        let action = sign_claim_rewards(11);
+        let hash = torus_types::compute_action_hash(&action);
+        let body = bincode::serialize(&action).expect("serialize body");
+        let fetcher = Arc::new(PrewarmFetcher {
+            body,
+            fetches: std::sync::atomic::AtomicUsize::new(0),
+            drained: std::sync::atomic::AtomicBool::new(false),
+        });
+        app.set_native_da_fetcher(fetcher.clone());
+
+        assert!(mempool.get_native_da(&hash).is_none(), "body absent before reconstruct");
+        let actions = app
+            .reconstruct_native_actions_hot(&[hash])
+            .expect("the pre-warmed body must be absorbed and reconstructed");
+        assert_eq!(actions.len(), 1, "the absorbed action is returned (in hash order)");
+        assert!(
+            mempool.get_native_da(&hash).is_some(),
+            "the pre-warmed body landed in the durable DA store",
+        );
+        assert_eq!(
+            fetcher.fetches.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a pre-warmed body must be absorbed by the local retry -- no redundant hot fetch",
         );
     }
 

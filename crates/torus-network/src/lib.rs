@@ -22,7 +22,7 @@ pub mod swarm;
 pub mod sync;
 pub mod tx_gossip;
 
-pub use bridge::LibP2PNetwork;
+pub use bridge::{should_push_hashes_only, LibP2PNetwork, HASH_ONLY_PUSH_THRESHOLD};
 pub use config::NetworkConfig;
 pub use pending_send::PendingSendQueue;
 pub use sync::{SyncRequest, SyncResponse};

@@ -444,7 +444,20 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let network_for_pre_proposal = network.clone();
     std::thread::spawn(move || {
         while let Ok(bundle) = pre_proposal_rx.recv() {
-            if let Ok(payload) = bincode::serialize(&bundle.actions) {
+            let Ok(payload) = bincode::serialize(&bundle.actions) else { continue };
+            if torus_network::should_push_hashes_only(payload.len()) {
+                // Phase 2.3 (#5): the body set is too big to disseminate within the view —
+                // push only the HASHES; validators pull the bodies (pre-warm) off the view's
+                // critical path. Un-wedges bs≈500 (VIEW TIMEOUT on big-body dissemination).
+                // The hashes match the CompactBlock's native_action_hashes (same actions,
+                // same compute_action_hash), so peers pull exactly the referenced bodies.
+                let hashes: Vec<[u8; 32]> = bundle
+                    .actions
+                    .iter()
+                    .map(|(_, a)| torus_types::compute_action_hash(a).0)
+                    .collect();
+                network_for_pre_proposal.broadcast_native_action_hashes(hashes);
+            } else {
                 network_for_pre_proposal.broadcast_native_actions(payload);
             }
         }

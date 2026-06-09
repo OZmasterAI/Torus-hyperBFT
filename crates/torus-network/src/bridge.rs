@@ -82,6 +82,22 @@ impl Clone for LibP2PNetwork {
 /// response the codec drops (native-DA fix Task 2).
 pub const NATIVE_DA_FETCH_CHUNK: usize = 16;
 
+/// Pre-proposal pushes whose encoded body set exceeds this go out as a tiny HASH MANIFEST
+/// (peers PULL the bodies) instead of the full multi-MB body push that wedges the view at
+/// bs≈500 — the live failure mode is a VIEW TIMEOUT on big-body dissemination (mem
+/// f58957c6), not the substream cap. Below the threshold the full-body push stays the fast
+/// path (no pull RTT), protecting the healthy bs100 baseline (23,430 o/s @ 289 ms). It sits
+/// well UNDER `MAX_DIRECT_MSG_SIZE` (4 MB) so the manifest path engages before the codec
+/// rejects an oversized batch. Tunable — validated/adjusted by the bs-sweep (Phase 2.3 #5).
+pub const HASH_ONLY_PUSH_THRESHOLD: usize = 512 * 1024; // 512 KB
+
+/// Whether a pre-proposal push of `encoded_len` bytes (the bincoded action bodies) should
+/// ship HASHES only and let validators pull the bodies (Phase 2.3 #5). Boundary is
+/// exclusive: exactly at the threshold still uses the full-body push.
+pub fn should_push_hashes_only(encoded_len: usize) -> bool {
+    encoded_len > HASH_ONLY_PUSH_THRESHOLD
+}
+
 impl LibP2PNetwork {
     /// Create a new LibP2PNetwork. Must be called from within a tokio runtime.
     /// Spawns a background task to drive the libp2p swarm.
@@ -212,6 +228,14 @@ impl LibP2PNetwork {
 
     pub fn broadcast_native_actions(&self, payload: Vec<u8>) {
         let _ = self.command_tx.send(NetworkCommand::BroadcastNativeActions { payload });
+    }
+
+    /// Push only the action HASHES (a tiny manifest) for an oversized pre-proposal batch;
+    /// validators PULL the bodies by-hash (Phase 2.3 #5). The body set is too big to
+    /// disseminate within the view, so the full-body push would wedge it (bs≈500 VIEW
+    /// TIMEOUT on big-body dissemination, mem f58957c6).
+    pub fn broadcast_native_action_hashes(&self, hashes: Vec<[u8; 32]>) {
+        let _ = self.command_tx.send(NetworkCommand::BroadcastNativeActionHashes { hashes });
     }
 
     /// Attach the durable native-action DA store so the swarm can SERVE bodies
@@ -475,5 +499,51 @@ mod tests {
         for got in per_target.values() {
             assert_eq!(got, &hashes, "every hash delivered exactly once per validator, in order");
         }
+    }
+
+    /// Phase 2.3 (#5, RED first): the hash-only push helper must enqueue a
+    /// `BroadcastNativeActionHashes` command carrying exactly the manifest hashes (the
+    /// swarm then wraps them in a `PRE_PROPOSAL_HASHES_MARKER` envelope and fans them out
+    /// over the same PushScheduler-bounded path). MUST fail before Task 2 (no method/variant).
+    #[test]
+    fn broadcast_hashes_enqueues_hashes_command() {
+        let local = test_signing_key(1);
+        let (command_tx, mut command_rx) = mpsc::unbounded_channel();
+        let net = LibP2PNetwork {
+            command_tx,
+            shared: shared_with_validators(&[local.verifying_key()]),
+            native_inbound_rx: None,
+            local_key: local.verifying_key(),
+        };
+        net.broadcast_native_action_hashes(vec![[7u8; 32], [9u8; 32]]);
+        let NetworkCommand::BroadcastNativeActionHashes { hashes } =
+            command_rx.try_recv().expect("a command must be enqueued")
+        else {
+            panic!("expected a BroadcastNativeActionHashes command");
+        };
+        assert_eq!(hashes, vec![[7u8; 32], [9u8; 32]], "the exact manifest hashes are forwarded");
+    }
+
+    /// Phase 2.3 (#5, RED first): pre-proposal pushes above `HASH_ONLY_PUSH_THRESHOLD`
+    /// must ship HASHES only (peers pull the bodies) instead of the full-body push that
+    /// wedges the view at bs≈500 (VIEW TIMEOUT on big-body dissemination, mem f58957c6).
+    /// The gate is by encoded byte size and must engage BELOW the 4 MB `/torus/direct`
+    /// cap so the manifest path kicks in before the codec rejects an oversized batch.
+    /// MUST fail before Task 1 (no `should_push_hashes_only` / `HASH_ONLY_PUSH_THRESHOLD`).
+    #[test]
+    fn hash_only_gate_triggers_above_threshold() {
+        assert!(!should_push_hashes_only(0), "empty/small batch keeps the full-body push");
+        assert!(
+            !should_push_hashes_only(HASH_ONLY_PUSH_THRESHOLD),
+            "at the threshold stays full-body (boundary is exclusive)"
+        );
+        assert!(
+            should_push_hashes_only(HASH_ONLY_PUSH_THRESHOLD + 1),
+            "above the threshold ships hashes only"
+        );
+        assert!(
+            HASH_ONLY_PUSH_THRESHOLD < 4 * 1024 * 1024,
+            "gate must engage BELOW the 4 MB /torus/direct cap"
+        );
     }
 }
