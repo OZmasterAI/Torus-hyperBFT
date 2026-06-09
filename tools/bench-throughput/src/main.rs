@@ -411,6 +411,37 @@ async fn sweep_block_bodies(
     out
 }
 
+/// Drop trailing zero-count blocks from a swept window. A live chain keeps
+/// producing empty blocks after the load stops; counting them would dilute
+/// block stats and pin the window end past the actual run.
+fn trim_trailing_empty(blocks: &mut Vec<(u64, u64)>) {
+    while matches!(blocks.last(), Some((_, 0))) {
+        blocks.pop();
+    }
+}
+
+#[cfg(test)]
+mod sweep_window_tests {
+    use super::*;
+
+    #[test]
+    fn trim_trailing_empty_drops_only_tail_zeros() {
+        let mut blocks = vec![(10, 0), (11, 5), (12, 0), (13, 7), (14, 0), (15, 0)];
+        trim_trailing_empty(&mut blocks);
+        assert_eq!(blocks, vec![(10, 0), (11, 5), (12, 0), (13, 7)]);
+    }
+
+    #[test]
+    fn trim_trailing_empty_handles_all_zero_and_empty() {
+        let mut all_zero = vec![(1, 0), (2, 0)];
+        trim_trailing_empty(&mut all_zero);
+        assert!(all_zero.is_empty());
+        let mut empty: Vec<(u64, u64)> = Vec::new();
+        trim_trailing_empty(&mut empty);
+        assert!(empty.is_empty());
+    }
+}
+
 /// Aggregate swept `(block, native_count)` pairs into
 /// `(total_included, block_count, peak_actions, peak_block)`.
 fn summarize_included(blocks: &[(u64, u64)]) -> (u64, u64, u64, u64) {
@@ -635,10 +666,17 @@ async fn run_consensus(
     // Authoritative inclusion count: re-sweep EVERY block body in the run window.
     // The live monitor's running total undercounts ~3x at fast block times, so the
     // reported throughput / drop-rate are computed from this full re-sweep instead.
-    let end_block = fetch_block_number(&client, &rpc_urls[0])
+    //
+    // eth_blockNumber reports EXECUTION height, which lags consensus by blocks under
+    // load (CTE) — a window snapshotted right after the load phase cuts off the tail
+    // of the run while the executor drains its backlog. Keep extending the window
+    // until two consecutive extensions surface zero further orders (120s cap), then
+    // drop trailing empty blocks so a live chain's post-load block production does
+    // not dilute the stats.
+    let mut end_block = fetch_block_number(&client, &rpc_urls[0])
         .await
         .unwrap_or(start_block);
-    let swept = sweep_block_bodies(
+    let mut swept = sweep_block_bodies(
         client.clone(),
         rpc_urls.clone(),
         start_block,
@@ -646,6 +684,37 @@ async fn run_consensus(
         concurrency,
     )
     .await;
+    let drain_deadline = Instant::now() + Duration::from_secs(120);
+    let mut quiet_extensions = 0u32;
+    while quiet_extensions < 2 && Instant::now() < drain_deadline {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let cur = match fetch_block_number(&client, &rpc_urls[0]).await {
+            Some(n) if n > end_block => n,
+            // Height not advancing: executor still frozen or RPC hiccup — keep
+            // waiting (the 120s cap bounds a genuinely stuck chain).
+            _ => continue,
+        };
+        let delta =
+            sweep_block_bodies(client.clone(), rpc_urls.clone(), end_block, cur, concurrency)
+                .await;
+        let drained: u64 = delta.iter().map(|(_, c)| c).sum();
+        if drained == 0 {
+            quiet_extensions += 1;
+        } else {
+            quiet_extensions = 0;
+            eprintln!(
+                "[drain] +{} actions in blocks #{}..#{} (executor catching up)",
+                drained,
+                end_block + 1,
+                cur
+            );
+        }
+        swept.extend(delta);
+        end_block = cur;
+    }
+    swept.sort_unstable_by_key(|(blk, _)| *blk);
+    trim_trailing_empty(&mut swept);
+    let end_block = swept.last().map(|(blk, _)| *blk).unwrap_or(start_block);
     let (final_included, block_count, peak_actions, peak_block) = summarize_included(&swept);
 
     let avg_block_time_ms = {
