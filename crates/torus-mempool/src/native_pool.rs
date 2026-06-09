@@ -16,6 +16,10 @@ pub(crate) struct NativePoolEntry {
     pub action: SignedNativeAction,
     pub action_hash: B256,
     pub is_cancel: bool,
+    /// bincode-encoded size of `action` — the bytes this entry contributes to a
+    /// block body (bodies are bincode, app.rs `block_bytes`). Computed once at
+    /// insert so byte-capped selection is O(1) per entry.
+    pub encoded_len: usize,
 }
 
 /// Native action pool with per-sender tracking, dedup, and size limits.
@@ -64,6 +68,12 @@ impl NativePool {
     ) -> Result<(), MempoolError> {
         let action_hash = compute_action_hash(&action);
         let is_cancel = is_cancel(&action.action);
+        // Serialization of a serde struct cannot realistically fail; if it ever
+        // does, a half-cap sentinel keeps the entry out of byte-capped blocks
+        // without overflowing the selection sum.
+        let encoded_len = bincode::serialized_size(&action)
+            .map(|n| n as usize)
+            .unwrap_or(usize::MAX / 2);
 
         // Dedup: reject identical (sender, action_hash).
         if self.seen.contains(&(sender, action_hash)) {
@@ -104,6 +114,7 @@ impl NativePool {
             action,
             action_hash,
             is_cancel,
+            encoded_len,
         });
         self.hash_index.insert(action_hash, idx);
 
@@ -188,7 +199,7 @@ impl NativePool {
     }
 
     pub fn select_for_block_with_senders(&mut self, limit: usize) -> Vec<(Address, SignedNativeAction)> {
-        self.select_for_block_with_senders_excluding(limit, &HashSet::new())
+        self.select_for_block_with_senders_excluding(limit, &HashSet::new(), usize::MAX)
     }
 
     /// Like `select_for_block_with_senders`, but skips any action whose hash is in
@@ -201,10 +212,16 @@ impl NativePool {
     /// 282f9818); recovers the ~2/3 of cap-100 block space that dups wasted. Excluded
     /// actions stay in the pool and become selectable again once their in-flight block
     /// commits (removing them) or is evicted from the proposer window.
+    /// `bytes_cap` bounds the summed bincode-encoded size of selected actions —
+    /// the WAN dissemination budget per block body. Selection stops at the first
+    /// entry that would exceed it (deterministic prefix), so a flood of huge
+    /// batch actions degrades to more, smaller blocks instead of an
+    /// undisseminatable mega-block (s334 bs1000 wedge).
     pub fn select_for_block_with_senders_excluding(
         &mut self,
         limit: usize,
         exclude: &HashSet<B256>,
+        bytes_cap: usize,
     ) -> Vec<(Address, SignedNativeAction)> {
         self.entries.sort_by(|a, b| {
             let a_pri = if a.is_cancel { 0u8 } else { 1 };
@@ -221,9 +238,15 @@ impl NativePool {
 
         let mut block_counts: HashMap<Address, usize> = HashMap::new();
         let mut selected = Vec::new();
+        let mut bytes_used: usize = 0;
 
         for entry in &self.entries {
             if selected.len() >= limit {
+                break;
+            }
+            if bytes_used.saturating_add(entry.encoded_len) > bytes_cap {
+                // Deterministic prefix: stop at the first entry that would blow
+                // the body-byte budget rather than skipping past it.
                 break;
             }
             if exclude.contains(&entry.action_hash) {
@@ -232,11 +255,41 @@ impl NativePool {
             let count = block_counts.get(&entry.sender).copied().unwrap_or(0);
             if count < self.max_per_block {
                 *block_counts.entry(entry.sender).or_insert(0) += 1;
+                bytes_used = bytes_used.saturating_add(entry.encoded_len);
                 selected.push((entry.sender, entry.action.clone()));
             }
         }
 
         selected
+    }
+
+    /// Evict entries whose nonce has aged out of the protocol validity window.
+    ///
+    /// An action with `nonce + NONCE_WINDOW_MS < now_ms` can never pass
+    /// admission/validation again, so keeping it selectable only lets leaders
+    /// propose blocks that cannot validate — the s334 bs1000 wedge had no
+    /// self-heal precisely because nothing ever removed these. Called lazily
+    /// from the selection/drain wrappers. Returns the number evicted.
+    pub fn evict_expired(&mut self, now_ms: u64) -> usize {
+        use torus_types::eip712::NONCE_WINDOW_MS;
+        let mut removed = Vec::new();
+        self.entries.retain(|entry| {
+            if entry.action.nonce.saturating_add(NONCE_WINDOW_MS) < now_ms {
+                removed.push((entry.sender, entry.action_hash));
+                false
+            } else {
+                true
+            }
+        });
+        for (sender, hash) in &removed {
+            self.seen.remove(&(*sender, *hash));
+            self.dec_sender_count(sender);
+        }
+        self.hash_index.clear();
+        for (i, entry) in self.entries.iter().enumerate() {
+            self.hash_index.insert(entry.action_hash, i);
+        }
+        removed.len()
     }
 
     /// Remove actions that were included in a committed block.
@@ -334,6 +387,51 @@ mod tests {
             NativeAction::CancelOrder { .. }
         ));
         assert_eq!(pool.size(), 0);
+    }
+
+    #[test]
+    fn byte_cap_bounds_selection() {
+        let mut pool = NativePool::new(100, 64, 16);
+        // Distinct senders so per-sender caps don't interfere; identical action
+        // shape so every entry has the same encoded size.
+        let mut per_action: usize = 0;
+        for i in 0..10u8 {
+            let sender = Address::repeat_byte(i + 1);
+            let action = make_action(1_000_000 + i as u64, NativeAction::ClaimRewards);
+            per_action = bincode::serialized_size(&action).unwrap() as usize;
+            pool.insert(sender, action).unwrap();
+        }
+        // Budget for exactly 3.5 actions -> 3 selected.
+        let cap = per_action * 7 / 2;
+        let selected =
+            pool.select_for_block_with_senders_excluding(100, &HashSet::new(), cap);
+        assert_eq!(selected.len(), 3);
+        // usize::MAX preserves uncapped behavior.
+        let all =
+            pool.select_for_block_with_senders_excluding(100, &HashSet::new(), usize::MAX);
+        assert_eq!(all.len(), 10);
+    }
+
+    #[test]
+    fn evict_expired_purges_stale_entries() {
+        use torus_types::eip712::NONCE_WINDOW_MS;
+        let mut pool = NativePool::new(100, 64, 16);
+        let sender = Address::repeat_byte(1);
+        let now: u64 = 10 * NONCE_WINDOW_MS;
+        let stale = make_action(now - 2 * NONCE_WINDOW_MS, NativeAction::ClaimRewards);
+        let fresh = make_action(now, NativeAction::CancelOrder { order_id: 7 });
+        let stale_hash = compute_action_hash(&stale);
+        pool.insert(sender, stale.clone()).unwrap();
+        pool.insert(sender, fresh).unwrap();
+        assert_eq!(pool.size(), 2);
+
+        let evicted = pool.evict_expired(now);
+        assert_eq!(evicted, 1);
+        assert_eq!(pool.size(), 1);
+        assert!(pool.get_by_hash(&stale_hash).is_none());
+        // seen/sender_counts cleaned: the same (sender, action) is insertable again.
+        pool.insert(sender, stale).unwrap();
+        assert_eq!(pool.size(), 2);
     }
 
     #[test]
@@ -546,14 +644,14 @@ mod tests {
         assert_eq!(first.len(), 5);
         let exclude: HashSet<B256> = first.iter().map(|(_, a)| compute_action_hash(a)).collect();
 
-        let second = pool.select_for_block_with_senders_excluding(5, &exclude);
+        let second = pool.select_for_block_with_senders_excluding(5, &exclude, usize::MAX);
         assert!(second.is_empty(), "in-flight actions must not be re-selected");
         assert_eq!(pool.size(), 5, "selection stays non-destructive");
 
         // A fresh (non-excluded) action is still selectable past the exclusion set.
         pool.insert(sender, make_action(99, NativeAction::ClaimRewards))
             .unwrap();
-        let third = pool.select_for_block_with_senders_excluding(5, &exclude);
+        let third = pool.select_for_block_with_senders_excluding(5, &exclude, usize::MAX);
         assert_eq!(third.len(), 1, "only the fresh action is selected");
         assert_eq!(third[0].1.nonce, 99);
     }

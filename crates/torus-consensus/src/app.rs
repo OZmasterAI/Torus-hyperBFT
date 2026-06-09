@@ -553,6 +553,18 @@ fn encode_proposal_datum(block: &TorusBlock, compact: bool) -> Vec<u8> {
 const PULL_RETRIES: usize = 20;
 const PULL_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
 
+/// Ceiling for the size-aware sync pull budget: 160 × 50 ms = 8 s. Large
+/// batched blocks carry multi-MB body-sets that cannot land within the flat
+/// ~1 s budget on WAN links (s334 bs1000); the sync path may safely block
+/// longer because it is off the consensus voting path.
+const MAX_SYNC_PULL_RETRIES: usize = 160;
+
+/// Sync-path pull budget scaled by how many bodies are missing (~2 bodies per
+/// 50 ms tick), clamped to [`PULL_RETRIES`, `MAX_SYNC_PULL_RETRIES`] (~1–8 s).
+fn sync_pull_retries(missing: usize) -> usize {
+    (missing / 2).clamp(PULL_RETRIES, MAX_SYNC_PULL_RETRIES)
+}
+
 /// Bounded LOCAL retry on the hot validate path: a racing pre-proposal PUSH that lands
 /// just after the CompactBlock usually arrives within this window, so the common case
 /// never touches the network (keeps the pull rare). 5 × 20 ms = 100 ms.
@@ -864,7 +876,7 @@ impl TorusApp {
     /// before a >4 MB body-set (now pulled in chunks) could arrive; ~1 s recovers a late
     /// body.
     fn pull_missing_bodies(&self, missing: &[torus_types::B256]) -> bool {
-        self.pull_missing_bodies_bounded(missing, PULL_RETRIES, PULL_DELAY)
+        self.pull_missing_bodies_bounded(missing, sync_pull_retries(missing.len()), PULL_DELAY)
     }
 
     /// Fetch the `missing` native-action bodies by-hash and absorb any that arrive into
@@ -1201,6 +1213,7 @@ impl App<RocksKVStore> for TorusApp {
             let native = mempool.select_native_for_block_with_senders_excluding(
                 torus_mempool::rate_limit::NATIVE_TOTAL_BLOCK_CAP,
                 &in_flight,
+                torus_mempool::rate_limit::NATIVE_BLOCK_BYTES_CAP,
             );
             let evm = mempool.drain_evm(gas_limit, parent_header.state_root);
             if !evm.is_empty() || !native.is_empty() {
@@ -2124,6 +2137,22 @@ mod crash_recovery_tests {
         assert!(
             budget >= std::time::Duration::from_secs(1),
             "PULL_RETRIES({PULL_RETRIES}) * PULL_DELAY({PULL_DELAY:?}) = {budget:?} must be ≥ 1 s",
+        );
+    }
+
+    /// Sprint 1 T4: the sync-path pull budget scales with how many bodies are
+    /// missing — a flat ~1 s budget recovers a late single body but gives up on
+    /// the multi-MB body-sets of batched blocks (s334 bs1000: fetch exhausted,
+    /// fell back to sync, which also timed out). Floor stays ~1 s, cap ~8 s.
+    #[test]
+    fn sync_pull_retries_scales_with_missing_count() {
+        assert_eq!(sync_pull_retries(0), PULL_RETRIES, "floor at no/low missing");
+        assert_eq!(sync_pull_retries(40), PULL_RETRIES, "40/2 == floor");
+        assert_eq!(sync_pull_retries(100), 50, "linear midband: ~2 bodies/tick");
+        assert_eq!(
+            sync_pull_retries(10_000),
+            MAX_SYNC_PULL_RETRIES,
+            "cap at ~8 s for huge sets"
         );
     }
 

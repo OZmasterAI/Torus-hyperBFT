@@ -18,6 +18,14 @@ use alloy_primitives::B256;
 use torus_state::{NativeDaStore, StateDb};
 use torus_types::SignedNativeAction;
 
+/// Wall-clock milliseconds — the clock native-action nonces are minted from.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 pub use crate::error::MempoolError;
 pub use crate::evm_pool::EvmPoolEntry;
 
@@ -356,6 +364,10 @@ impl Mempool {
     /// Per-sender-per-block caps are enforced internally.
     pub fn drain_native(&self, limit: usize) -> Vec<SignedNativeAction> {
         let mut pool = self.native.write().unwrap();
+        let evicted = pool.evict_expired(now_ms());
+        if evicted > 0 {
+            tracing::info!(evicted, "evicted nonce-expired native actions from pool");
+        }
         pool.drain(limit)
     }
 
@@ -426,15 +438,20 @@ impl Mempool {
     /// proposer's in-flight, proposed-but-uncommitted action hashes). Prevents the
     /// same action being re-selected for blocks N+1/N+2 before N commits — the root
     /// cause of duplicate native inclusion.
+    /// `bytes_cap` bounds the summed encoded size of the selected bodies (WAN
+    /// dissemination budget — see `rate_limit::NATIVE_BLOCK_BYTES_CAP`).
     pub fn select_native_for_block_with_senders_excluding(
         &self,
         limit: usize,
         exclude: &std::collections::HashSet<B256>,
+        bytes_cap: usize,
     ) -> Vec<(alloy_primitives::Address, SignedNativeAction)> {
-        self.native
-            .write()
-            .unwrap()
-            .select_for_block_with_senders_excluding(limit, exclude)
+        let mut pool = self.native.write().unwrap();
+        let evicted = pool.evict_expired(now_ms());
+        if evicted > 0 {
+            tracing::info!(evicted, "evicted nonce-expired native actions from pool");
+        }
+        pool.select_for_block_with_senders_excluding(limit, exclude, bytes_cap)
     }
 
     /// Remove native actions that were included in a committed block.
@@ -983,11 +1000,14 @@ mod tests {
         });
         let sender = Address::repeat_byte(0xAA);
 
+        // Nonces are ms timestamps by protocol convention (admission enforces the
+        // window); pool TTL eviction would discard 1970-era synthetic nonces.
+        let base = now_ms();
         pool.submit_native_action(
             sender,
             SignedNativeAction {
                 action: NativeAction::ClaimRewards,
-                nonce: 1,
+                nonce: base + 1,
                 signature: sig.clone(),
             },
         )
@@ -996,7 +1016,7 @@ mod tests {
             sender,
             SignedNativeAction {
                 action: NativeAction::CancelOrder { order_id: 42 },
-                nonce: 2,
+                nonce: base + 2,
                 signature: sig.clone(),
             },
         )
@@ -1005,7 +1025,7 @@ mod tests {
             sender,
             SignedNativeAction {
                 action: NativeAction::ClaimRewards,
-                nonce: 3,
+                nonce: base + 3,
                 signature: sig,
             },
         )
@@ -1066,7 +1086,8 @@ mod tests {
             sender,
             SignedNativeAction {
                 action: torus_types::NativeAction::ClaimRewards,
-                nonce: 1,
+                // ms-timestamp nonce: survives the pool's TTL eviction.
+                nonce: now_ms(),
                 signature: torus_types::ActionSignature::Eip712(torus_types::Signature {
                     v: 27,
                     r: [0; 32],

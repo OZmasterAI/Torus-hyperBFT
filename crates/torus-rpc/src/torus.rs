@@ -594,8 +594,11 @@ impl TorusApiServer for RpcState {
     // === 2.9.4: Submission ===
 
     async fn submit_native_action(&self, signed_action: String) -> RpcResult<String> {
-        let _permit = self.submit_semaphore.try_acquire()
-            .map_err(|_| ErrorObjectOwned::from(RpcError::Internal("server overloaded, try again".into())))?;
+        // Bounded queue: bursts wait up to SUBMIT_QUEUE_TIMEOUT for a permit
+        // instead of instantly bouncing; sustained saturation still sheds.
+        let _permit = crate::acquire_submit_permit(&self.submit_semaphore)
+            .await
+            .ok_or_else(|| ErrorObjectOwned::from(RpcError::Internal("server overloaded, try again".into())))?;
         let bytes = parse_bytes(&signed_action).map_err(ErrorObjectOwned::from)?;
 
         // Offload deserialization + ECDSA verification to the blocking thread pool

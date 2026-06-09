@@ -62,6 +62,17 @@ pub const NATIVE_ORDERS_PER_BATCH_CAP: usize = 1024;
 /// this constant documents the target order ceiling. See `order_count`.
 pub const NATIVE_ORDERS_PER_BLOCK_CAP: usize = 50_000;
 
+/// Hard ceiling on the summed bincode-encoded size of native-action bodies in
+/// one block (bytes) — the WAN dissemination budget. Pre-proposal push +
+/// hash-manifest pull demonstrably move ~2MB inside a view on testnet links,
+/// while the ~7.5MB bodies of a 50k-order block wedge dissemination outright
+/// (s334 bs1000: body fetches exhausted, every leader re-proposed the same
+/// mega-block). Selection stops before exceeding this, so a flooded mempool
+/// degrades to more, smaller blocks instead of undisseminatable ones. Unlike
+/// `NATIVE_ORDERS_PER_BLOCK_CAP` (documented target, not yet enforced), this
+/// IS enforced in `select_for_block_with_senders_excluding`.
+pub const NATIVE_BLOCK_BYTES_CAP: usize = 2_000_000;
+
 // ============================================================================
 // Rate tracker
 // ============================================================================

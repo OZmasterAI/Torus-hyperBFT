@@ -1,0 +1,60 @@
+{
+  "prp": "sprint1-throughput-rails",
+  "created": "2026-06-09T23:25:00Z",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Byte-capped native selection (NATIVE_BLOCK_BYTES_CAP, encoded_len)",
+      "status": "pending",
+      "files": [
+        "crates/torus-mempool/src/rate_limit.rs",
+        "crates/torus-mempool/src/native_pool.rs",
+        "crates/torus-mempool/src/lib.rs",
+        "crates/torus-consensus/src/app.rs",
+        "crates/torus-mempool/Cargo.toml"
+      ],
+      "validate": "cargo test -p torus-mempool",
+      "depends_on": []
+    },
+    {
+      "id": 2,
+      "name": "Lazy TTL eviction from nonce window (evict_expired)",
+      "status": "pending",
+      "files": [
+        "crates/torus-mempool/src/native_pool.rs",
+        "crates/torus-mempool/src/lib.rs"
+      ],
+      "validate": "cargo test -p torus-mempool",
+      "depends_on": [1]
+    },
+    {
+      "id": 3,
+      "name": "Submit semaphore 64 + bounded acquire timeout",
+      "status": "pending",
+      "files": [
+        "crates/torus-rpc/src/lib.rs",
+        "crates/torus-rpc/src/torus.rs"
+      ],
+      "validate": "cargo test -p torus-rpc",
+      "depends_on": []
+    },
+    {
+      "id": 4,
+      "name": "Size-aware sync pull budget (sync_pull_retries)",
+      "status": "pending",
+      "files": [
+        "crates/torus-consensus/src/app.rs"
+      ],
+      "validate": "cargo test -p torus-consensus",
+      "depends_on": []
+    },
+    {
+      "id": 5,
+      "name": "Prove: workspace tests, deploy both nodes, re-sweep bs500/bs1000",
+      "status": "pending",
+      "files": [],
+      "validate": "cargo test --workspace && cargo build --release",
+      "depends_on": [1, 2, 3, 4]
+    }
+  ]
+}

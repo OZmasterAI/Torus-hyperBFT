@@ -16,6 +16,29 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+/// Concurrent in-flight native-action submissions. 16 measurably capped ingress
+/// at ~100-240 actions/s (s334 off-box bench was submit-bound, not
+/// consensus-bound); 64 keeps deserialize+ecrecover work bounded on the
+/// blocking pool while letting bursts through.
+pub(crate) const SUBMIT_PERMITS: usize = 64;
+
+/// How long a submission may wait for a permit before the server sheds it.
+/// Bursts queue briefly instead of instantly erroring "overloaded"; sustained
+/// saturation still rejects after this bound.
+pub(crate) const SUBMIT_QUEUE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_millis(250);
+
+/// Acquire a submission permit, waiting at most [`SUBMIT_QUEUE_TIMEOUT`].
+/// `None` ⇒ saturated past the queue bound (caller returns "overloaded").
+pub(crate) async fn acquire_submit_permit(
+    sem: &tokio::sync::Semaphore,
+) -> Option<tokio::sync::SemaphorePermit<'_>> {
+    tokio::time::timeout(SUBMIT_QUEUE_TIMEOUT, sem.acquire())
+        .await
+        .ok()?
+        .ok()
+}
+
 use alloy_primitives::B256;
 use jsonrpsee::server::middleware::rpc::{self as rpc_mw, RpcServiceT};
 use jsonrpsee::server::{ServerBuilder, ServerHandle};
@@ -172,7 +195,7 @@ impl RpcServer {
                 own_vk: None,
                 leader_vk_fn: None,
                 forward_action_tx: None,
-                submit_semaphore: Arc::new(tokio::sync::Semaphore::new(16)),
+                submit_semaphore: Arc::new(tokio::sync::Semaphore::new(SUBMIT_PERMITS)),
             },
         }
     }
@@ -1690,4 +1713,25 @@ mod tests {
         handle.stop().unwrap();
     }
 
+}
+#[cfg(test)]
+mod submit_queue_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn permit_granted_when_free() {
+        let sem = Arc::new(tokio::sync::Semaphore::new(SUBMIT_PERMITS));
+        assert!(acquire_submit_permit(&sem).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn permit_times_out_when_saturated() {
+        let sem = Arc::new(tokio::sync::Semaphore::new(1));
+        let _held = sem.clone().acquire_owned().await.unwrap();
+        let start = Instant::now();
+        assert!(acquire_submit_permit(&sem).await.is_none());
+        // Bounded queue: gives up around SUBMIT_QUEUE_TIMEOUT, not instantly, not forever.
+        assert!(start.elapsed() >= SUBMIT_QUEUE_TIMEOUT);
+        assert!(start.elapsed() < SUBMIT_QUEUE_TIMEOUT * 4);
+    }
 }
