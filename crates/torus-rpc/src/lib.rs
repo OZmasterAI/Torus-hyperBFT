@@ -28,6 +28,10 @@ pub(crate) const SUBMIT_PERMITS: usize = 64;
 pub(crate) const SUBMIT_QUEUE_TIMEOUT: std::time::Duration =
     std::time::Duration::from_millis(250);
 
+/// Max items per `torus_submitNativeActions` call. Bounds the work one permit
+/// admits: ~100 ecrecovers ≈ 5–10ms on the blocking pool.
+pub(crate) const SUBMIT_BATCH_MAX: usize = 100;
+
 /// Acquire a submission permit, waiting at most [`SUBMIT_QUEUE_TIMEOUT`].
 /// `None` ⇒ saturated past the queue bound (caller returns "overloaded").
 pub(crate) async fn acquire_submit_permit(
@@ -614,6 +618,54 @@ mod tests {
         assert_eq!(resolve_block_tag("earliest", 100).unwrap(), 0);
         assert_eq!(resolve_block_tag("pending", 100).unwrap(), 100);
         assert_eq!(resolve_block_tag("0xa", 100).unwrap(), 10);
+    }
+
+    #[tokio::test]
+    async fn submit_native_actions_batch_per_item_results() {
+        let (_dir, state, mempool, executor) = setup();
+        let (handle, addr) = start_server(state, mempool.clone(), executor).await;
+        use jsonrpsee::core::client::ClientT;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let mk = |key_hex: &str, nonce: u64| {
+            let key =
+                k256::ecdsa::SigningKey::from_slice(&hex::decode(key_hex).unwrap()).unwrap();
+            let signed = torus_types::eip712::sign_native_action(
+                torus_types::NativeAction::ClaimRewards,
+                nonce,
+                &key,
+            );
+            format!("0x{}", hex::encode(serde_json::to_vec(&signed).unwrap()))
+        };
+        // Hardhat accounts 0 and 1 (the funded bench senders).
+        let a = mk(
+            "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+            now_ms,
+        );
+        let b = mk(
+            "59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d",
+            now_ms + 1,
+        );
+
+        let results: Vec<RpcSubmitResult> = client
+            .request(
+                "torus_submitNativeActions",
+                jsonrpsee::rpc_params![vec![a, b, "0xzz-not-hex".to_string()]],
+            )
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 3, "one result per submitted item, in order");
+        assert!(results[0].hash.is_some() && results[0].error.is_none());
+        assert!(results[1].hash.is_some() && results[1].error.is_none());
+        assert!(results[2].hash.is_none() && results[2].error.is_some());
+        assert_eq!(mempool.native_pool_size(), 2, "only the valid actions admitted");
+        handle.stop().unwrap();
     }
 
     #[tokio::test]

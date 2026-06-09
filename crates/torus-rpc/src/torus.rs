@@ -127,6 +127,15 @@ pub trait TorusApi {
     #[method(name = "submitNativeAction")]
     async fn submit_native_action(&self, signed_action: String) -> RpcResult<String>;
 
+    /// Batch submission: up to `SUBMIT_BATCH_MAX` hex payloads in one call.
+    /// One permit + one blocking task amortizes HTTP/JSON/scheduling overhead;
+    /// per-item results so one bad action never poisons the batch (Sprint 2).
+    #[method(name = "submitNativeActions")]
+    async fn submit_native_actions(
+        &self,
+        signed_actions: Vec<String>,
+    ) -> RpcResult<Vec<RpcSubmitResult>>;
+
     // --- 2.9.5: Governance ---
     #[method(name = "getProposal")]
     async fn get_proposal(&self, proposal_id: u64) -> RpcResult<Option<RpcProposal>>;
@@ -197,6 +206,50 @@ pub trait TorusApi {
 // ============================================================================
 // Implementation
 // ============================================================================
+
+/// Parse + structurally validate + signature-verify one hex-encoded signed
+/// native action. Blocking-pool work (ecrecover); the batch endpoint runs a
+/// whole batch of these inside one `spawn_blocking`. Error is a per-item
+/// message, never a call-level failure.
+fn verify_one_action(
+    signed_action: &str,
+    chain_id: u64,
+    state_db: &torus_state::StateDb,
+    current_time_ms: u64,
+) -> Result<(alloy_primitives::Address, torus_types::SignedNativeAction, Vec<u8>, alloy_primitives::B256), String> {
+    let bytes = parse_bytes(signed_action).map_err(|e| format!("invalid hex: {e}"))?;
+    let action: torus_types::SignedNativeAction =
+        serde_json::from_slice(&bytes).map_err(|e| format!("invalid action encoding: {e}"))?;
+    torus_mempool::rate_limit::validate_batch_size(&action.action)?;
+    let sender = action
+        .validate_with_sessions(current_time_ms, chain_id, |pubkey| {
+            state_db.get_session(pubkey).ok().flatten()
+        })
+        .map_err(|e| format!("signature verification failed: {e}"))?;
+    let action_bytes =
+        serde_json::to_vec(&action).map_err(|e| format!("serialize action: {e}"))?;
+    let hash = keccak256(&action_bytes);
+    Ok((sender, action, action_bytes, hash))
+}
+
+impl RpcState {
+    /// Direct-to-leader forwarding tail shared by the single and batch submit
+    /// endpoints: no-op when this node IS the leader or forwarding is unwired.
+    fn forward_to_leader(&self, sender: &alloy_primitives::Address, action_bytes: &[u8]) {
+        if let (Some(ref leader_fn), Some(ref own_vk), Some(ref fwd_tx)) =
+            (&self.leader_vk_fn, &self.own_vk, &self.forward_action_tx)
+        {
+            if let Some(leader_vk) = leader_fn() {
+                if leader_vk != *own_vk {
+                    let mut payload = Vec::with_capacity(20 + action_bytes.len());
+                    payload.extend_from_slice(sender.as_slice());
+                    payload.extend_from_slice(action_bytes);
+                    let _ = fwd_tx.send((leader_vk, payload));
+                }
+            }
+        }
+    }
+}
 
 #[async_trait]
 impl TorusApiServer for RpcState {
@@ -639,21 +692,74 @@ impl TorusApiServer for RpcState {
             .add_native_action_presigned(sender, action.clone())
             .map_err(|e| ErrorObjectOwned::from(RpcError::Internal(format!("mempool: {e}"))))?;
 
-        // Forward to leader if this node is not the current leader.
-        if let (Some(ref leader_fn), Some(ref own_vk), Some(ref fwd_tx)) =
-            (&self.leader_vk_fn, &self.own_vk, &self.forward_action_tx)
-        {
-            if let Some(leader_vk) = leader_fn() {
-                if leader_vk != *own_vk {
-                    let mut payload = Vec::with_capacity(20 + action_bytes.len());
-                    payload.extend_from_slice(sender.as_slice());
-                    payload.extend_from_slice(&action_bytes);
-                    let _ = fwd_tx.send((leader_vk, payload));
-                }
-            }
-        }
+        self.forward_to_leader(&sender, &action_bytes);
 
         Ok(hex_b256(hash))
+    }
+
+    async fn submit_native_actions(
+        &self,
+        signed_actions: Vec<String>,
+    ) -> RpcResult<Vec<RpcSubmitResult>> {
+        if signed_actions.len() > crate::SUBMIT_BATCH_MAX {
+            return Err(ErrorObjectOwned::from(RpcError::InvalidParams(format!(
+                "batch too large: {} > {}",
+                signed_actions.len(),
+                crate::SUBMIT_BATCH_MAX
+            ))));
+        }
+        // One permit covers the whole batch — that's the amortization: the
+        // permit bounds concurrent blocking-pool verify tasks, and the batch
+        // runs as exactly one such task.
+        let _permit = crate::acquire_submit_permit(&self.submit_semaphore)
+            .await
+            .ok_or_else(|| {
+                ErrorObjectOwned::from(RpcError::Internal("server overloaded, try again".into()))
+            })?;
+
+        let state_db = self.state.clone();
+        let chain_id = self.chain_id;
+        let verified = tokio::task::spawn_blocking(move || {
+            let current_time_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock before epoch")
+                .as_millis() as u64;
+            signed_actions
+                .into_iter()
+                .map(|signed_action| {
+                    verify_one_action(&signed_action, chain_id, &state_db, current_time_ms)
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        .map_err(|e| ErrorObjectOwned::from(RpcError::Internal(format!("spawn_blocking: {e}"))))?;
+
+        let results = verified
+            .into_iter()
+            .map(|item| match item {
+                Ok((sender, action, action_bytes, hash)) => {
+                    match self.mempool.add_native_action_presigned(sender, action) {
+                        Ok(()) => {
+                            self.forward_to_leader(&sender, &action_bytes);
+                            RpcSubmitResult {
+                                hash: Some(hex_b256(hash)),
+                                error: None,
+                            }
+                        }
+                        Err(e) => RpcSubmitResult {
+                            hash: None,
+                            error: Some(format!("mempool: {e}")),
+                        },
+                    }
+                }
+                Err(msg) => RpcSubmitResult {
+                    hash: None,
+                    error: Some(msg),
+                },
+            })
+            .collect();
+
+        Ok(results)
     }
 
     // === 2.9.5: Governance ===

@@ -400,6 +400,17 @@ pub struct RpcUnbonding {
     pub release_block: String,
 }
 
+/// Per-item outcome of a `torus_submitNativeActions` batch call: exactly one of
+/// `hash` (accepted) or `error` is set, in submission order.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcSubmitResult {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RpcValidatorInfo {

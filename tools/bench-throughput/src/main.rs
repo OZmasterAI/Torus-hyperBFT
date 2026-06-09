@@ -72,6 +72,14 @@ enum Command {
         /// knob: orders/s = actions/s x batch_size. Sweep e.g. 1/100/500/1000.
         #[arg(long, default_value_t = 1)]
         batch_size: usize,
+        /// Actions per `torus_submitNativeActions` RPC call (1 = legacy single
+        /// endpoint). Amortizes HTTP/JSON/permit overhead (Sprint 2). Server cap: 100.
+        #[arg(long, default_value_t = 1)]
+        submit_batch: usize,
+        /// First sender key index (use disjoint ranges, e.g. 0 and 10, when running
+        /// multiple bench instances so nonce/rate-limit accounting never collides).
+        #[arg(long, default_value_t = 0)]
+        sender_offset: usize,
     },
     Combined {
         #[arg(long, default_value = "http://localhost:8545,http://localhost:8546,http://localhost:8547,http://localhost:8548")]
@@ -278,8 +286,9 @@ struct SenderKey {
     signing_key: SigningKey,
 }
 
-fn load_sender_keys(count: usize) -> Vec<SenderKey> {
-    let mut keys: Vec<SenderKey> = HARDHAT_KEYS[..count.min(20)]
+fn load_sender_keys(count: usize, offset: usize) -> Vec<SenderKey> {
+    let funded_end = (offset + count).min(20);
+    let mut keys: Vec<SenderKey> = HARDHAT_KEYS[offset.min(20)..funded_end]
         .iter()
         .map(|hex_key| {
             let bytes = hex::decode(hex_key).expect("valid hex");
@@ -288,12 +297,49 @@ fn load_sender_keys(count: usize) -> Vec<SenderKey> {
         })
         .collect();
 
-    for i in 20..count {
+    for i in funded_end..(offset + count) {
         let mut rng = StdRng::seed_from_u64(0xBEEF_0000 + i as u64);
         let signing_key = SigningKey::random(&mut rng);
         keys.push(SenderKey { signing_key });
     }
     keys
+}
+
+/// Submit a batch of pre-encoded signed actions via `torus_submitNativeActions`.
+/// Returns how many items the server accepted (entries carrying a `hash`).
+async fn submit_native_actions_batch(
+    client: &reqwest::Client,
+    url: &str,
+    payloads: &[String],
+    id: u64,
+) -> Result<usize, String> {
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "torus_submitNativeActions",
+        "params": [payloads],
+        "id": id
+    });
+    let resp: serde_json::Value = client
+        .post(url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("http: {e}"))?
+        .json()
+        .await
+        .map_err(|e| format!("parse: {e}"))?;
+
+    if let Some(err) = resp.get("error") {
+        return Err(format!(
+            "rpc: {}",
+            err.get("message").and_then(|m| m.as_str()).unwrap_or("unknown")
+        ));
+    }
+    let accepted = resp["result"]
+        .as_array()
+        .map(|items| items.iter().filter(|i| i.get("hash").is_some()).count())
+        .unwrap_or(0);
+    Ok(accepted)
 }
 
 async fn submit_native_action(
@@ -464,17 +510,21 @@ async fn run_consensus(
     duration_secs: u64,
     concurrency: usize,
     batch_size: usize,
+    submit_batch: usize,
+    sender_offset: usize,
 ) {
     let rpc_urls: Vec<String> = rpc_urls_str.split(',').map(|s| s.trim().to_string()).collect();
     let num_senders = senders.max(1);
-    let keys = load_sender_keys(num_senders);
+    let keys = load_sender_keys(num_senders, sender_offset);
     let orders_per_action = batch_size.max(1) as u64;
+    let submit_batch = submit_batch.clamp(1, 100);
 
     println!("=== Torus Throughput Benchmark ===");
     println!("Mode: consensus");
     println!("Duration: {duration_secs}s");
-    println!("Senders: {num_senders}");
+    println!("Senders: {num_senders} (offset {sender_offset})");
     println!("Batch size: {orders_per_action} order(s)/action");
+    println!("Submit batch: {submit_batch} action(s)/RPC call");
     println!("RPC endpoints: {}", rpc_urls.len());
     println!();
 
@@ -623,16 +673,25 @@ async fn run_consensus(
             let mut rng = StdRng::from_entropy();
             let mut req_id: u64 = sender_idx as u64 * 1_000_000;
             let mut url_idx: usize = sender_idx % url_count;
+            // Strictly increasing per-sender nonces: same-ms duplicates are
+            // dropped by the committed (sender, nonce) replay guard, silently
+            // shrinking measured throughput (acute inside one submit batch).
+            let mut last_nonce: u64 = 0;
 
             while Instant::now() < deadline {
-                let action = random_place_order_action(&mut rng, 1, batch_size);
-                let nonce = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis() as u64;
-                let signed = sign_native_action(action, nonce, &key);
-                let json_bytes = serde_json::to_vec(&signed).unwrap();
-                let hex_encoded = format!("0x{}", hex::encode(&json_bytes));
+                let mut payloads = Vec::with_capacity(submit_batch);
+                for _ in 0..submit_batch {
+                    let action = random_place_order_action(&mut rng, 1, batch_size);
+                    let base = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis() as u64;
+                    let nonce = base.max(last_nonce + 1);
+                    last_nonce = nonce;
+                    let signed = sign_native_action(action, nonce, &key);
+                    let json_bytes = serde_json::to_vec(&signed).unwrap();
+                    payloads.push(format!("0x{}", hex::encode(&json_bytes)));
+                }
 
                 let permit = semaphore.clone().acquire_owned().await.unwrap();
                 let url = urls[url_idx % url_count].clone();
@@ -644,8 +703,14 @@ async fn run_consensus(
 
                 tokio::spawn(async move {
                     let _permit = permit;
-                    if submit_native_action(&client, &url, &hex_encoded, req_id).await.is_ok() {
-                        submitted.fetch_add(1, Ordering::Relaxed);
+                    if payloads.len() == 1 {
+                        if submit_native_action(&client, &url, &payloads[0], req_id).await.is_ok() {
+                            submitted.fetch_add(1, Ordering::Relaxed);
+                        }
+                    } else if let Ok(accepted) =
+                        submit_native_actions_batch(&client, &url, &payloads, req_id).await
+                    {
+                        submitted.fetch_add(accepted as u64, Ordering::Relaxed);
                     }
                 });
             }
@@ -908,7 +973,20 @@ async fn main() {
             duration,
             concurrency,
             batch_size,
-        } => run_consensus(&rpc_urls, senders, duration, concurrency, batch_size).await,
+            submit_batch,
+            sender_offset,
+        } => {
+            run_consensus(
+                &rpc_urls,
+                senders,
+                duration,
+                concurrency,
+                batch_size,
+                submit_batch,
+                sender_offset,
+            )
+            .await
+        }
         Command::Combined { .. } => run_combined(),
         Command::StateRoot {
             sizes,
