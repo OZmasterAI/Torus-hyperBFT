@@ -1,0 +1,56 @@
+{
+  "prp": "native-da-hash-only-push",
+  "created": "2026-06-09",
+  "design": "docs/plans/native-da-hash-only-push-impl.md",
+  "note": "Phase 2.3 / follow-up #5 to native-da-push-hardening. Option A: size-gated hash-manifest pre-push + receiver pre-warm pull. Un-wedges live bs500 (VIEW TIMEOUT on big-body dissemination, mem f58957c6) by shipping a tiny hash manifest and pulling bodies concurrently with consensus. Transport/timing only — NO consensus-format/state-root change. Guardrail: keep bs100=23,430 o/s.",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Size-gate (should_push_hashes_only + HASH_ONLY_PUSH_THRESHOLD) + PRE_PROPOSAL_HASHES_MARKER",
+      "status": "pending",
+      "files": ["crates/torus-network/src/bridge.rs", "crates/torus-network/src/swarm.rs"],
+      "validate": "cargo test -p torus-network hash_only_gate",
+      "depends_on": []
+    },
+    {
+      "id": 2,
+      "name": "Outbound hash-manifest push (BroadcastNativeActionHashes + broadcast_native_action_hashes), reuse PushScheduler fan",
+      "status": "pending",
+      "files": ["crates/torus-network/src/swarm.rs", "crates/torus-network/src/bridge.rs"],
+      "validate": "cargo test -p torus-network broadcast_hashes",
+      "depends_on": [1]
+    },
+    {
+      "id": 3,
+      "name": "Inbound hashes-marker -> pre-warm pull from proposer (plan_prewarm_requests + handler branch)",
+      "status": "pending",
+      "files": ["crates/torus-network/src/swarm.rs"],
+      "validate": "cargo test -p torus-network prewarm_requests",
+      "depends_on": [1]
+    },
+    {
+      "id": 4,
+      "name": "Absorb pre-warmed bodies during the hot local-retry (reconstruct_native_actions_hot) — no redundant fetch",
+      "status": "pending",
+      "files": ["crates/torus-consensus/src/app.rs"],
+      "validate": "cargo test -p torus-consensus reconstruct",
+      "depends_on": []
+    },
+    {
+      "id": 5,
+      "name": "Wire size-gate into the pre-proposal glue (push hashes vs full bodies)",
+      "status": "pending",
+      "files": ["crates/torus-node/src/main.rs", "crates/torus-network/src/lib.rs"],
+      "validate": "cargo build -p torus-node",
+      "depends_on": [1, 2]
+    },
+    {
+      "id": 6,
+      "name": "Regression gate + bs-sweep un-wedge proof (bs500 advances, bs100 no-regress, bs200 recovers)",
+      "status": "pending",
+      "files": [],
+      "validate": "cargo test -p torus-network -p torus-consensus -p torus-mempool && cargo test -p torus-consensus four_node_consensus",
+      "depends_on": [1, 2, 3, 4, 5]
+    }
+  ]
+}
