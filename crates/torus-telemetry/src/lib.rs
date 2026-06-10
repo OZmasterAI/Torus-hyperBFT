@@ -70,6 +70,11 @@ pub struct Metrics {
     /// Outbound native actions dropped because the gossip channel was full.
     /// Must stay 0 under load — drops mean pre-spread is silently failing.
     pub native_gossip_dropped_full: Counter,
+    /// Outbound native actions dropped from pre-spread because a single action
+    /// exceeds the receivers' gossip cap (`max_tx_message_size`) — it could never
+    /// be delivered and would get the forwarder penalized (s339 validator ban).
+    /// The pre-proposal push / DA pull path still carries these to inclusion.
+    pub native_gossip_dropped_oversized: Counter,
 
     // Submit-ack phase timing (Sprint 3.5) — decomposes where multi-second
     // batch-submit acks accrue: semaphore queue vs blocking-pool verify vs
@@ -276,6 +281,13 @@ impl Metrics {
             native_gossip_dropped_full.clone(),
         );
 
+        let native_gossip_dropped_oversized = Counter::default();
+        registry.register(
+            "torus_native_gossip_dropped_oversized",
+            "Outbound native actions dropped from pre-spread for exceeding the gossip message cap",
+            native_gossip_dropped_oversized.clone(),
+        );
+
         let rpc_submit_permit_wait_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
         registry.register(
             "torus_rpc_submit_permit_wait_seconds",
@@ -394,6 +406,7 @@ impl Metrics {
             native_gossip_published_actions,
             native_gossip_received_actions,
             native_gossip_dropped_full,
+            native_gossip_dropped_oversized,
             rpc_submit_permit_wait_seconds,
             rpc_submit_verify_seconds,
             rpc_submit_admit_seconds,

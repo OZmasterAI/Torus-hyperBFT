@@ -265,6 +265,93 @@ enum SwarmAction {
 const NATIVE_BATCH_INTERVAL_MS: u64 = 50;
 const NATIVE_BATCH_MAX_SIZE: usize = 1024;
 const NATIVE_BATCH_MARKER: u8 = 0xFF;
+/// Serialized overhead of an empty native batch: marker (1) + action count (4).
+const NATIVE_BATCH_HEADER_BYTES: usize = 5;
+/// Per-action serialized overhead inside a batch: the u32 length prefix.
+const NATIVE_BATCH_ENTRY_OVERHEAD: usize = 4;
+
+/// Whether appending an action of `action_len` bytes to a batch currently measuring
+/// `batch_bytes` on the wire would exceed `max_msg_size` — the receivers' hard-reject
+/// cap (`config.max_tx_message_size`). Receivers reject strictly-greater sizes AND
+/// penalize the forwarding peer, so the publisher must flush before crossing it
+/// (s339: count-only batching shipped 160–595KB messages that banned friend2).
+fn batch_would_exceed(batch_bytes: usize, action_len: usize, max_msg_size: usize) -> bool {
+    batch_bytes + NATIVE_BATCH_ENTRY_OVERHEAD + action_len > max_msg_size
+}
+
+/// Whether `peer` is a member of the CURRENT consensus validator set.
+///
+/// Validator-set peers are exempt from ban-driven refusal on consensus-critical
+/// paths: severing a validator's votes/proposals/pacemaker messages (or refusing
+/// it DA/block-data service) turns a tx-layer penalty into a cluster liveness
+/// fault — s339: a 1h ban of one validator for relaying oversized batches stalled
+/// commits cluster-wide until expiry. Abuse from a validator stays bounded by the
+/// per-author rate limiters, which apply regardless of ban state.
+fn is_validator_peer(shared: &SharedState, peer: &PeerId) -> bool {
+    let peer_map = shared.peer_map.read().unwrap();
+    match peer_map.get_vk(peer) {
+        Some(vk) => shared.validators.read().unwrap().contains(&vk.to_bytes()),
+        None => false,
+    }
+}
+
+/// Ban gate for gossip processing: drop only if the peer is banned AND not a
+/// current validator (see [`is_validator_peer`]).
+fn should_drop_banned_gossip(
+    scoring: &mut PeerScoring,
+    shared: &SharedState,
+    peer: &PeerId,
+) -> bool {
+    scoring.is_banned(peer) && !is_validator_peer(shared, peer)
+}
+
+/// Penalize the cryptographic AUTHOR of an invalid gossip message — never the
+/// last-hop forwarder. Gossip meshes relay other nodes' messages, so the
+/// `propagation_source` is routinely an honest peer (s339: forwarder penalties
+/// banned a validator for relaying another node's oversized batches). With no
+/// author in the envelope, nobody is penalized. Returns the penalized peer.
+fn penalize_gossip_author(
+    scoring: &mut PeerScoring,
+    author: Option<PeerId>,
+    amount: i64,
+    reason: &str,
+) -> Option<PeerId> {
+    if let Some(ref a) = author {
+        scoring.penalize(a, amount, reason);
+    }
+    author
+}
+
+/// Publish the pending native-action batch to gossipsub and reset the accumulator.
+/// `trigger` names which bound flushed it (timer / byte budget / count cap) for logs.
+fn publish_native_batch(
+    swarm: &mut libp2p::Swarm<TorusBehaviour>,
+    shared: &Arc<SharedState>,
+    topic: &gossipsub::IdentTopic,
+    batch: &mut Vec<Vec<u8>>,
+    batch_bytes: &mut usize,
+    trigger: &str,
+) {
+    if batch.is_empty() {
+        return;
+    }
+    let payload = serialize_native_batch(batch);
+    let count = batch.len();
+    batch.clear();
+    *batch_bytes = NATIVE_BATCH_HEADER_BYTES;
+    match swarm.behaviour_mut().gossipsub.publish(topic.clone(), payload) {
+        Ok(_) => {
+            debug!(count, trigger, "published native action batch to gossipsub");
+            if let Some(ref m) = shared.metrics {
+                m.gossip_messages_sent.inc();
+                m.native_gossip_published_actions.inc_by(count as u64);
+            }
+        }
+        Err(e) => {
+            warn!(count, trigger, "failed to publish native batch: {e:?}");
+        }
+    }
+}
 
 fn serialize_native_batch(actions: &[Vec<u8>]) -> Vec<u8> {
     let total: usize = 1 + 4 + actions.iter().map(|a| 4 + a.len()).sum::<usize>();
@@ -358,6 +445,9 @@ pub async fn run_swarm_with_config(
     mesh_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     let mut native_batch: Vec<Vec<u8>> = Vec::with_capacity(256);
+    // Running on-wire size of `native_batch` (header + length-prefixed entries),
+    // kept in lockstep so the byte-budget flush never crosses `max_tx_msg_size`.
+    let mut native_batch_bytes: usize = NATIVE_BATCH_HEADER_BYTES;
     let mut batch_timer = tokio::time::interval(Duration::from_millis(NATIVE_BATCH_INTERVAL_MS));
     batch_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -445,49 +535,52 @@ pub async fn run_swarm_with_config(
             }
             SwarmAction::Tx(None) => {}
             SwarmAction::FlushNativeBatch => {
-                if !native_batch.is_empty() {
-                    let batch_bytes = serialize_native_batch(&native_batch);
-                    let count = native_batch.len();
-                    native_batch.clear();
-                    match swarm
-                        .behaviour_mut()
-                        .gossipsub
-                        .publish(native_action_topic.clone(), batch_bytes)
-                    {
-                        Ok(_) => {
-                            debug!(count, "published native action batch to gossipsub");
-                            if let Some(ref m) = shared.metrics {
-                                m.gossip_messages_sent.inc();
-                                m.native_gossip_published_actions.inc_by(count as u64);
-                            }
-                        }
-                        Err(e) => {
-                            warn!(count, "failed to publish native batch: {e:?}");
-                        }
-                    }
-                }
+                publish_native_batch(
+                    &mut swarm,
+                    &shared,
+                    &native_action_topic,
+                    &mut native_batch,
+                    &mut native_batch_bytes,
+                    "timer",
+                );
             }
             SwarmAction::NativeAction(Some(action_bytes)) => {
-                native_batch.push(action_bytes);
-                if native_batch.len() >= NATIVE_BATCH_MAX_SIZE {
-                    let batch_bytes = serialize_native_batch(&native_batch);
-                    let count = native_batch.len();
-                    native_batch.clear();
-                    match swarm
-                        .behaviour_mut()
-                        .gossipsub
-                        .publish(native_action_topic.clone(), batch_bytes)
-                    {
-                        Ok(_) => {
-                            debug!(count, "published native action batch (size cap) to gossipsub");
-                            if let Some(ref m) = shared.metrics {
-                                m.gossip_messages_sent.inc();
-                                m.native_gossip_published_actions.inc_by(count as u64);
-                            }
-                        }
-                        Err(e) => {
-                            warn!(count, "failed to publish native batch: {e:?}");
-                        }
+                let entry_bytes = NATIVE_BATCH_ENTRY_OVERHEAD + action_bytes.len();
+                if NATIVE_BATCH_HEADER_BYTES + entry_bytes > max_tx_msg_size {
+                    // Can never be delivered: receivers hard-reject > max_tx_msg_size
+                    // and penalize the forwarder (s339: relayed oversized batches got a
+                    // validator banned). The pre-proposal push / DA pull path still
+                    // carries the action to inclusion when its holder leads.
+                    warn!(
+                        size = NATIVE_BATCH_HEADER_BYTES + entry_bytes,
+                        cap = max_tx_msg_size,
+                        "native action exceeds gossip cap — dropped from pre-spread"
+                    );
+                    if let Some(ref m) = shared.metrics {
+                        m.native_gossip_dropped_oversized.inc();
+                    }
+                } else {
+                    if batch_would_exceed(native_batch_bytes, action_bytes.len(), max_tx_msg_size) {
+                        publish_native_batch(
+                            &mut swarm,
+                            &shared,
+                            &native_action_topic,
+                            &mut native_batch,
+                            &mut native_batch_bytes,
+                            "byte budget",
+                        );
+                    }
+                    native_batch_bytes += entry_bytes;
+                    native_batch.push(action_bytes);
+                    if native_batch.len() >= NATIVE_BATCH_MAX_SIZE {
+                        publish_native_batch(
+                            &mut swarm,
+                            &shared,
+                            &native_action_topic,
+                            &mut native_batch,
+                            &mut native_batch_bytes,
+                            "count cap",
+                        );
                     }
                 }
             }
@@ -513,8 +606,10 @@ fn handle_event(
             message,
             ..
         })) => {
-            // Check if peer is banned (Phase 3: 3.1.7)
-            if peer_scoring.is_banned(&propagation_source) {
+            // Ban gate by last-hop forwarder — validator-set peers exempt (s350
+            // FIX B): a banned validator's relayed traffic still carries the
+            // cluster's votes/proposals, and dropping it stalls commits.
+            if should_drop_banned_gossip(&mut *peer_scoring, shared, &propagation_source) {
                 return;
             }
 
@@ -525,15 +620,18 @@ fn handle_event(
 
             let consensus_hash = gossipsub::IdentTopic::new(CONSENSUS_TOPIC).hash();
             if message.topic == consensus_hash {
-                // Message size validation (Phase 3: 3.1.7)
+                // Message size validation (Phase 3: 3.1.7). Penalty goes to the
+                // AUTHOR — the forwarder merely relayed it (s350 FIX B).
                 if message.data.len() > max_consensus_msg_size {
                     warn!(
                         peer = %propagation_source,
+                        author = ?message.source,
                         size = message.data.len(),
                         "oversized consensus message rejected"
                     );
-                    peer_scoring.penalize(
-                        &propagation_source,
+                    penalize_gossip_author(
+                        peer_scoring,
+                        message.source,
                         PENALTY_INVALID_CONSENSUS_MSG,
                         "oversized consensus message",
                     );
@@ -558,7 +656,9 @@ fn handle_event(
                         return;
                     }
                 };
-                if peer_scoring.is_banned(&author) {
+                // Validator-set authors keep consensus service even while banned
+                // (s350 FIX B) — quorum needs their votes; rate limits still apply.
+                if should_drop_banned_gossip(&mut *peer_scoring, shared, &author) {
                     return;
                 }
 
@@ -571,13 +671,18 @@ fn handle_event(
                 handle_consensus_gossip(&message.data, shared, peer_scoring, &author);
             } else if message.topic == gossipsub::IdentTopic::new(NATIVE_ACTION_TOPIC).hash() {
                 if message.data.len() > max_tx_msg_size {
+                    // Penalty goes to the AUTHOR, never the relayer — forwarder
+                    // penalties on this exact path banned friend2 (validator) for
+                    // an hour and stalled commits cluster-wide (s339 root cause).
                     warn!(
                         peer = %propagation_source,
+                        author = ?message.source,
                         size = message.data.len(),
                         "oversized native action message rejected"
                     );
-                    peer_scoring.penalize(
-                        &propagation_source,
+                    penalize_gossip_author(
+                        peer_scoring,
+                        message.source,
                         PENALTY_INVALID_TX,
                         "oversized native action message",
                     );
@@ -651,8 +756,9 @@ fn handle_event(
             peer,
             ..
         })) => {
-            // Check if peer is banned (Phase 3: 3.1.7)
-            if peer_scoring.is_banned(&peer) {
+            // Ban gate — validator-set peers exempt (s350 FIX B): /torus/direct
+            // carries consensus unicasts; refusing a validator stalls quorum.
+            if should_drop_banned_gossip(&mut *peer_scoring, shared, &peer) {
                 let _ = swarm
                     .behaviour_mut()
                     .direct
@@ -780,7 +886,9 @@ fn handle_event(
             info,
             ..
         })) => {
-            if peer_scoring.is_banned(&peer_id) {
+            // Validator-set peers exempt (s350 FIX B): identify keeps the peer
+            // map fresh, which the validator exemption itself depends on.
+            if should_drop_banned_gossip(&mut *peer_scoring, shared, &peer_id) {
                 return;
             }
             // Extract ed25519 key before consuming other fields.
@@ -805,7 +913,9 @@ fn handle_event(
             peer,
             ..
         })) => {
-            if peer_scoring.is_banned(&peer) {
+            // Validator-set peers exempt (s350 FIX B): refusing block-data serve
+            // to a validator starves its sync and breaks cluster liveness.
+            if should_drop_banned_gossip(&mut *peer_scoring, shared, &peer) {
                 let _ = swarm.behaviour_mut().block_data.send_response(
                     channel,
                     BlockDataNetResponse { view: request.view, payload: Vec::new() },
@@ -883,7 +993,10 @@ fn handle_event(
             peer,
             ..
         })) => {
-            let bodies = if peer_scoring.is_banned(&peer) {
+            // Validator-set peers exempt (s350 FIX B): empty DA responses to a
+            // validator make its pull-fallback fail and veto valid proposals
+            // (s339: val1's 16 unrecovered pulls each broke a view's quorum).
+            let bodies = if should_drop_banned_gossip(&mut *peer_scoring, shared, &peer) {
                 vec![Vec::new(); request.hashes.len()]
             } else {
                 let store = shared.native_da.read().unwrap();
@@ -948,7 +1061,10 @@ fn handle_event(
         }
         SwarmEvent::NewListenAddr { address, .. } => info!("Listening on {address}"),
         SwarmEvent::ConnectionEstablished { peer_id, num_established, .. } => {
-            if peer_scoring.is_banned(&peer_id) {
+            // Validator-set peers exempt (s350 FIX B): never refuse a quorum
+            // member's connection — a banned validator that reconnects mid-ban
+            // would otherwise be severed entirely until expiry.
+            if should_drop_banned_gossip(&mut *peer_scoring, shared, &peer_id) {
                 let _ = swarm.disconnect_peer_id(peer_id);
                 debug!("Disconnected banned peer {peer_id}");
             } else {
@@ -1472,6 +1588,7 @@ fn handle_consensus_gossip(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::peer_scoring::INITIAL_SCORE;
 
     /// Phase 2.3 (#5, RED first): a hash-only manifest body (`bincode(Vec<[u8;32]>)`)
     /// decodes into per-request hash chunks (≤ `NATIVE_DA_FETCH_CHUNK`) for the pre-warm
@@ -1498,6 +1615,114 @@ mod tests {
         // Review F6: a manifest exceeding the defensive cap is rejected (no pre-warm fan).
         let over_cap = bincode::serialize(&vec![[0u8; 32]; MAX_PREWARM_HASHES + 1]).unwrap();
         assert!(plan_prewarm_requests(&over_cap).is_none(), "over-cap manifest -> no pull");
+    }
+
+    /// s350 FIX B (RED first): a banned peer that is a CURRENT VALIDATOR-SET member must
+    /// keep consensus-critical service — severing a validator's gossip turns a tx-layer
+    /// penalty into a cluster liveness fault (s339: our 1h ban of friend2 for *relaying*
+    /// oversized batches stalled commits until expiry). Banned non-validators stay
+    /// dropped. MUST fail before FIX B lands (no `should_drop_banned_gossip`).
+    #[test]
+    fn banned_validator_keeps_consensus_service() {
+        let vk = test_vk(7);
+        let peer = test_peer(7);
+        let shared = test_shared();
+        shared.peer_map.write().unwrap().insert(vk, peer);
+        shared.validators.write().unwrap().insert(vk.to_bytes());
+        let mut scoring = PeerScoring::new(None);
+        for _ in 0..30 {
+            scoring.penalize(&peer, PENALTY_INVALID_CONSENSUS_MSG, "test");
+        }
+        assert!(scoring.is_banned(&peer), "precondition: the validator IS banned");
+        assert!(
+            !should_drop_banned_gossip(&mut scoring, &shared, &peer),
+            "validator-set member must keep consensus service while banned"
+        );
+
+        let outsider = test_peer(8);
+        for _ in 0..30 {
+            scoring.penalize(&outsider, PENALTY_INVALID_CONSENSUS_MSG, "test");
+        }
+        assert!(
+            should_drop_banned_gossip(&mut scoring, &shared, &outsider),
+            "banned non-validator stays dropped"
+        );
+    }
+
+    /// s350 FIX B: invalid-gossip penalties must hit the cryptographic AUTHOR
+    /// (`message.source`), never the last-hop forwarder — meshes relay other nodes'
+    /// messages, and penalizing relayers is how an honest validator got banned (s339).
+    /// No author in the envelope → nobody is penalized.
+    #[test]
+    fn oversized_penalty_targets_author_not_forwarder() {
+        let author = test_peer(9);
+        let forwarder = test_peer(10);
+        let mut scoring = PeerScoring::new(None);
+
+        let hit = penalize_gossip_author(
+            &mut scoring,
+            Some(author),
+            PENALTY_INVALID_TX,
+            "oversized native action message",
+        );
+        assert_eq!(hit, Some(author));
+        assert_eq!(scoring.score(&author), INITIAL_SCORE - PENALTY_INVALID_TX);
+        assert_eq!(scoring.score(&forwarder), INITIAL_SCORE, "forwarder untouched");
+
+        let none = penalize_gossip_author(&mut scoring, None, PENALTY_INVALID_TX, "no author");
+        assert_eq!(none, None, "no author -> no penalty");
+    }
+
+    /// s350 FIX A (RED first): the publish batcher must flush on a BYTE budget, not just
+    /// count — bs50 actions (~10KB+) batched by count produced 160–595KB gossip messages
+    /// that every receiver rejects at `max_tx_message_size` (128KB) and penalizes the
+    /// forwarder for (root cause of the friend2 validator ban, s339 wedge). MUST fail
+    /// before FIX A lands (no `batch_would_exceed` / byte constants).
+    #[test]
+    fn native_batch_flushes_before_byte_budget() {
+        let cap = 128 * 1024;
+        // Empty batch: an action that fits exactly at the cap is allowed through...
+        let exact_fit = cap - NATIVE_BATCH_HEADER_BYTES - NATIVE_BATCH_ENTRY_OVERHEAD;
+        assert!(
+            !batch_would_exceed(NATIVE_BATCH_HEADER_BYTES, exact_fit, cap),
+            "receivers reject only len > cap (strict), so == cap must pass"
+        );
+        // ...one byte more can never be delivered: the drop decision boundary.
+        assert!(
+            batch_would_exceed(NATIVE_BATCH_HEADER_BYTES, exact_fit + 1, cap),
+            "an action that cannot fit even alone must be dropped from pre-spread"
+        );
+        // A 10KB action lands in a batch already holding ~120KB → flush first.
+        assert!(
+            batch_would_exceed(120 * 1024, 10 * 1024, cap),
+            "pushing past the cap must flush the pending batch first"
+        );
+        assert!(
+            !batch_would_exceed(60 * 1024, 10 * 1024, cap),
+            "well under budget keeps accumulating"
+        );
+    }
+
+    /// s350 FIX A: the incremental byte accounting used by the publish loop must match
+    /// the real serialized size, or the budget drifts from what receivers measure.
+    #[test]
+    fn native_batch_size_accounting_matches_serializer() {
+        let actions: Vec<Vec<u8>> = vec![vec![0xAB; 10_240], vec![0xCD; 3], vec![0xEF; 75_000]];
+        let accounted = NATIVE_BATCH_HEADER_BYTES
+            + actions
+                .iter()
+                .map(|a| NATIVE_BATCH_ENTRY_OVERHEAD + a.len())
+                .sum::<usize>();
+        assert_eq!(
+            serialize_native_batch(&actions).len(),
+            accounted,
+            "running budget must equal the on-wire message size"
+        );
+        assert_eq!(
+            serialize_native_batch(&[]).len(),
+            NATIVE_BATCH_HEADER_BYTES,
+            "empty batch is exactly the header"
+        );
     }
 
     fn test_vk(seed: u8) -> VerifyingKey {

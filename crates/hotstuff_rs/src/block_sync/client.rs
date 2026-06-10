@@ -71,6 +71,10 @@ struct PendingSyncSession {
     fetch_iterations: u32,
     session_start: Instant,
     awaiting_fetch: bool,
+    /// Start height of the most recent fetch — a next fetch at the SAME height
+    /// would return the identical range again (no commit progress was made from
+    /// a full batch), so the session ends instead of looping (s350 FIX C).
+    last_fetch_start_height: Option<BlockHeight>,
 }
 
 impl<N: Network> BlockSyncClient<N> {
@@ -142,11 +146,18 @@ impl<N: Network> BlockSyncClient<N> {
         if committed_height != self.block_sync_client_state.last_committed_height {
             self.block_sync_client_state.last_committed_height = committed_height;
             self.block_sync_client_state.last_progress_or_sync_time = Instant::now();
+            // Real commit progress: restore the fast trigger (s350 FIX C).
+            self.block_sync_client_state.consecutive_futile_sessions = 0;
         }
 
+        // s350 FIX C: futile sessions stretch the re-trigger exponentially (60s →
+        // up to 480s) — without this, a commit famine put every replica on a
+        // permanent 30s-fetch/60s-cycle storm against its peers.
+        let scaled_trigger_timeout = self.config.block_sync_trigger_timeout
+            * futile_backoff_multiplier(self.block_sync_client_state.consecutive_futile_sessions);
         if self.pending_sync.is_none()
             && Instant::now() - self.block_sync_client_state.last_progress_or_sync_time
-                >= self.config.block_sync_trigger_timeout
+                >= scaled_trigger_timeout
         {
             log::info!(
                 "block_sync: timeout trigger fired, available_servers={}, committed_height={:?}",
@@ -467,6 +478,7 @@ impl<N: Network> BlockSyncClient<N> {
             fetch_iterations: 1,
             session_start: Instant::now(),
             awaiting_fetch: true,
+            last_fetch_start_height: Some(start_height),
         });
 
         Ok(())
@@ -498,6 +510,25 @@ impl<N: Network> BlockSyncClient<N> {
             .highest_committed_block_height()?
             .map(|h| h + 1)
             .unwrap_or(BlockHeight::new(0));
+
+        // s350 FIX C: the previous fetch started at the same height — a full batch
+        // yielded zero commit progress (every block already known/uncommittable),
+        // and refetching the identical range can only loop until the deadline
+        // (observed s339: the same 128-block range refetched >1000× per session,
+        // re-triggered every 60s, indefinitely). End the session; the server was
+        // honest, so no blacklist.
+        if refetch_would_repeat(
+            session.last_fetch_start_height.map(|h| h.int()),
+            start_height.int(),
+        ) {
+            log::info!(
+                "block_sync: batch at height {} made no commit progress — ending session",
+                start_height.int()
+            );
+            self.end_session();
+            return Ok(());
+        }
+        session.last_fetch_start_height = Some(start_height);
 
         let peer = session.peer;
         session.awaiting_fetch = true;
@@ -535,6 +566,16 @@ impl<N: Network> BlockSyncClient<N> {
 
     fn end_session(&mut self) {
         if let Some(session) = self.pending_sync.take() {
+            // s350 FIX C: zero-block sessions feed the trigger backoff; any
+            // productive session resets it so a lagging replica stays fast.
+            if session.blocks_synced == 0 {
+                self.block_sync_client_state.consecutive_futile_sessions =
+                    self.block_sync_client_state
+                        .consecutive_futile_sessions
+                        .saturating_add(1);
+            } else {
+                self.block_sync_client_state.consecutive_futile_sessions = 0;
+            }
             Event::EndSync(EndSyncEvent {
                 timestamp: SystemTime::now(),
                 peer: session.peer,
@@ -560,6 +601,10 @@ struct BlockSyncClientState {
     last_progress_or_sync_time: Instant,
     highest_pc_view: ViewNumber,
     last_committed_height: Option<BlockHeight>,
+    /// Sessions in a row that synced zero blocks — scales the timeout trigger
+    /// via [`futile_backoff_multiplier`]; reset on any commit progress or any
+    /// session that inserts a block (s350 FIX C).
+    consecutive_futile_sessions: u32,
 }
 
 impl BlockSyncClientState {
@@ -570,6 +615,7 @@ impl BlockSyncClientState {
             last_progress_or_sync_time: Instant::now(),
             highest_pc_view: ViewNumber::new(0),
             last_committed_height: None,
+            consecutive_futile_sessions: 0,
         }
     }
 
@@ -643,6 +689,60 @@ impl BlockSyncClientState {
 /// exhausted the peer set and wedged sync (livelock root cause, mem 28e1a821).
 fn warrants_blacklist(response: &ValidateBlockResponse) -> bool {
     matches!(response, ValidateBlockResponse::Invalid)
+}
+
+/// Whether issuing the next batch fetch at `next_start` would repeat the previous
+/// fetch of this session — i.e. the last batch yielded NOTHING that advanced our
+/// committed height (every block already known / uncommittable), so the same range
+/// would be served again, forever.
+///
+/// s339/s350 livelock: post-load, every replica held the full speculative chain but
+/// commits were famined; sessions refetched the identical 128-block range hundreds
+/// of times per second until the 30s session deadline, re-triggering every 60s —
+/// indefinitely. A repeat fetch can never make progress the previous one didn't:
+/// end the session instead (the server was honest — do NOT blacklist).
+fn refetch_would_repeat(prev_start: Option<u64>, next_start: u64) -> bool {
+    prev_start == Some(next_start)
+}
+
+/// Trigger-timeout multiplier after `consecutive_futile` sync sessions that synced
+/// zero blocks: 1, 2, 4, then capped at 8 (60s base → 480s max). Any session that
+/// inserts a block — or any commit progress — resets the counter, so a genuinely
+/// lagging replica keeps its fast trigger. Prevents the cluster-wide every-60s
+/// fetch storm while commits are famined (s350).
+fn futile_backoff_multiplier(consecutive_futile: u32) -> u32 {
+    1u32 << consecutive_futile.min(3)
+}
+
+#[cfg(test)]
+mod sync_livelock_guard_tests {
+    use super::{futile_backoff_multiplier, refetch_would_repeat};
+
+    /// s350 FIX C (RED first): a batch request at the same start height as the
+    /// previous fetch means zero commit progress was made from a full batch — the
+    /// session must end, not refetch the identical range until the deadline.
+    /// MUST fail before FIX C lands (no `refetch_would_repeat`).
+    #[test]
+    fn repeat_fetch_ends_session() {
+        // First fetch of a session: nothing to repeat.
+        assert!(!refetch_would_repeat(None, 25813));
+        // Commit progress advanced the start height: keep syncing.
+        assert!(!refetch_would_repeat(Some(25813), 25941));
+        // Same start as the last fetch: the famine loop — stop here.
+        assert!(refetch_would_repeat(Some(25813), 25813));
+    }
+
+    /// s350 FIX C: futile sessions back the timeout trigger off exponentially,
+    /// capped at 8× (60s → 480s); productive sessions reset to 1×.
+    #[test]
+    fn futile_sessions_back_off_capped() {
+        assert_eq!(futile_backoff_multiplier(0), 1, "healthy: base trigger");
+        assert_eq!(futile_backoff_multiplier(1), 2);
+        assert_eq!(futile_backoff_multiplier(2), 4);
+        assert_eq!(futile_backoff_multiplier(3), 8);
+        assert_eq!(futile_backoff_multiplier(10), 8, "capped — never unbounded");
+        assert_eq!(futile_backoff_multiplier(u32::MAX), 8, "no shift overflow");
+    }
 }
 
 #[cfg(test)]
