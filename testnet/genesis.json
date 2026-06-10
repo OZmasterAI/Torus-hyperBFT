@@ -1,12 +1,13 @@
 {
     "chain_id": 7778,
     "chain_name": "torus-testnet",
-    "timestamp": 1781222400,
+    "timestamp": 1781308800,
     "consensus": {
         "protocol": "hotstuff",
         "epoch_length": 100,
         "timeout_base_ms": 500,
-        "timeout_max_ms": 30000
+        "timeout_max_ms": 30000,
+        "reputation_leader_selection": false
     },
     "evm": {
         "spec_id": "cancun",
