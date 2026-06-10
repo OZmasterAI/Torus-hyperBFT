@@ -1,7 +1,7 @@
 {
     "chain_id": 7778,
     "chain_name": "torus-testnet",
-    "timestamp": 1781136000,
+    "timestamp": 1781222400,
     "consensus": {
         "protocol": "hotstuff",
         "epoch_length": 100,
@@ -48,13 +48,13 @@
         {
             "address": "0x1000000000000000000000000000000000000001",
             "pubkey": "0xdc4ca7a6ab405ad1da72806658b4f87282b25e448eb438b09a3034c7328cecf5",
-            "stake": "1000000000000000000000000",
+            "stake": "2000000000000000000000000",
             "commission_bps": 500
         },
         {
             "address": "0x1b8b5853cd3a0ddeeee259f12fbb8bbe2d2d337d",
             "pubkey": "0x899396cf13f070699196bed73c8bdc27187a8fa925cb1a0abd7a35614235fdbb",
-            "stake": "1000000000000000000000000",
+            "stake": "2000000000000000000000000",
             "commission_bps": 500
         },
         {
