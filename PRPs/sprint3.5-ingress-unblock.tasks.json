@@ -1,0 +1,75 @@
+{
+  "prp": "sprint3.5-ingress-unblock",
+  "created": "2026-06-10T10:30:00Z",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Gossip-path counters (publish / receive / drop)",
+      "status": "pending",
+      "files": [
+        "crates/torus-telemetry/src/lib.rs",
+        "crates/torus-mempool/src/lib.rs",
+        "crates/torus-network/src/swarm.rs",
+        "crates/torus-node/src/main.rs"
+      ],
+      "validate": "cargo test -p torus-mempool --lib && cargo test -p torus-network --lib",
+      "depends_on": []
+    },
+    {
+      "id": 2,
+      "name": "Submit-ack phase histograms",
+      "status": "pending",
+      "files": [
+        "crates/torus-telemetry/src/lib.rs",
+        "crates/torus-rpc/src/torus.rs",
+        "crates/torus-rpc/src/lib.rs"
+      ],
+      "validate": "cargo test -p torus-rpc --lib",
+      "depends_on": [1]
+    },
+    {
+      "id": 3,
+      "name": "Gate leader-forward behind gossip-off",
+      "status": "pending",
+      "files": [
+        "crates/torus-rpc/src/lib.rs",
+        "crates/torus-rpc/src/torus.rs",
+        "crates/torus-node/src/main.rs"
+      ],
+      "validate": "cargo test -p torus-rpc --lib",
+      "depends_on": []
+    },
+    {
+      "id": 4,
+      "name": "Failure counters at the storm sites",
+      "status": "pending",
+      "files": [
+        "crates/torus-telemetry/src/lib.rs",
+        "crates/torus-network/src/swarm.rs"
+      ],
+      "validate": "cargo test -p torus-network --lib",
+      "depends_on": [2]
+    },
+    {
+      "id": 5,
+      "name": "Deploy + instrumented re-sweep (PROOF)",
+      "status": "pending",
+      "files": [
+        "testnet/",
+        "docs/plans/sprint3.5-ingress-unblock-impl.md"
+      ],
+      "validate": "cargo fmt --check && cargo test -p torus-rpc --lib && cargo test -p torus-mempool --lib && cargo test -p torus-network --lib",
+      "depends_on": [1, 2, 3, 4]
+    },
+    {
+      "id": 6,
+      "name": "Bench: pre-generate signed actions before window",
+      "status": "pending",
+      "files": [
+        "tools/bench-throughput/src/main.rs"
+      ],
+      "validate": "cargo test -p bench-throughput",
+      "depends_on": []
+    }
+  ]
+}
