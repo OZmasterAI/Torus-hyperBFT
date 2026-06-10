@@ -182,8 +182,9 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
                 log::error!("HotStuff poll_block_data_responses error: {:?}", e);
             }
 
-            // 6c. Retry stale body fetches; trigger sync after max retries.
-            self.hotstuff.tick_pending_body_retries();
+            // 6c. Retry stale body fetches (proposer first, then rotate across the
+            // other validators); trigger sync after max retries.
+            self.hotstuff.tick_pending_body_retries(&self.block_tree);
             if self.hotstuff.take_sync_needed() {
                 if let Err(e) = self.block_sync_client.trigger_sync(&mut self.block_tree) {
                     log::error!("BlockSync trigger_sync (body retry exhausted) error: {:?}", e);

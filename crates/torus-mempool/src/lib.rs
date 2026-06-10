@@ -288,6 +288,45 @@ impl Mempool {
     /// Insert a native action received from gossip with a pre-verified sender.
     /// Skips ECDSA recovery (the expensive part) — trusts that the originating
     /// node already verified the signature. Only checks nonce freshness.
+    /// Verified gossip ingest (Sprint 3 T2): DA-mirror first (availability ≠
+    /// validity — a block-referenced body must be reconstructable regardless),
+    /// then authenticate the CLAIMED sender before pool admission, since a
+    /// malicious peer could otherwise gossip forged `(sender, action)` pairs
+    /// into every validator's pool. Eip712: recovered signer must equal the
+    /// claim. Session: signature must verify and the registered session owner
+    /// must equal the claim.
+    pub fn add_native_action_from_gossip(
+        &self,
+        claimed_sender: alloy_primitives::Address,
+        action: SignedNativeAction,
+    ) -> Result<(), MempoolError> {
+        self.mirror_to_da(&action);
+        let verified_sender = match &action.signature {
+            torus_types::ActionSignature::Eip712(_) => action.recover_sender().map_err(|e| {
+                MempoolError::NativeValidationFailed(format!("gossip sig recovery: {e}"))
+            })?,
+            torus_types::ActionSignature::Session { .. } => {
+                let pubkey = action.verify_session_signature().map_err(|e| {
+                    MempoolError::NativeValidationFailed(format!("gossip session sig: {e}"))
+                })?;
+                match self.state.get_session(&pubkey) {
+                    Ok(Some(session)) => session.owner,
+                    _ => {
+                        return Err(MempoolError::NativeValidationFailed(
+                            "gossip session unknown".into(),
+                        ))
+                    }
+                }
+            }
+        };
+        if verified_sender != claimed_sender {
+            return Err(MempoolError::NativeValidationFailed(
+                "gossip sender mismatch".into(),
+            ));
+        }
+        self.add_native_action_from_gossip_trusted(claimed_sender, action)
+    }
+
     pub fn add_native_action_from_gossip_trusted(
         &self,
         sender: alloy_primitives::Address,
@@ -624,6 +663,39 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let state = StateDb::open(dir.path()).unwrap();
         (dir, state)
+    }
+
+    #[test]
+    fn gossip_ingest_verifies_claimed_sender() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state, MempoolConfig::default());
+        // Hardhat account 0 — a real key so signature recovery yields a real sender.
+        let key = k256::ecdsa::SigningKey::from_slice(
+            &alloy_primitives::hex::decode(
+                "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let now = now_ms();
+        let signed = torus_types::eip712::sign_native_action(
+            torus_types::NativeAction::ClaimRewards,
+            now,
+            &key,
+        );
+        let real_sender = signed.recover_sender().unwrap();
+        let hash = torus_types::compute_action_hash(&signed);
+
+        // A peer gossiping a forged (sender, action) pair must not pollute the
+        // pool — but the body stays DA-mirrored (availability ≠ validity).
+        let forged = alloy_primitives::Address::repeat_byte(0xEE);
+        assert!(pool.add_native_action_from_gossip(forged, signed.clone()).is_err());
+        assert_eq!(pool.native_pool_size(), 0, "forged sender must not enter pool");
+        assert!(pool.get_native_da(&hash).is_some(), "body still DA-mirrored");
+
+        // The genuine sender is admitted.
+        pool.add_native_action_from_gossip(real_sender, signed).unwrap();
+        assert_eq!(pool.native_pool_size(), 1);
     }
 
     fn fund(state: &StateDb, addr: &Address, balance: U256, nonce: u64) {

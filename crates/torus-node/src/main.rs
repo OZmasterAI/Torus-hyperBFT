@@ -120,6 +120,13 @@ struct Cli {
     /// participate in consensus. No validator key required.
     #[arg(long)]
     rpc_only: bool,
+
+    /// Gossip admitted native-action bodies to the validator mesh as they
+    /// arrive at ingress (Sprint 3 pre-spread): by proposal time peers already
+    /// hold the bodies, so compact proposals need only gap-pulls. Disable with
+    /// --native-gossip=false to fall back to push/pull-only dissemination.
+    #[arg(long, default_value_t = true)]
+    native_gossip: bool,
 }
 
 #[derive(clap::Subcommand)]
@@ -416,6 +423,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         network_config, signing_key.clone(), Some(metrics.clone()),
     ).await?;
     mempool.set_native_gossip_tx(native_gossip.into_sender());
+    mempool.set_native_gossip_enabled(cli.native_gossip);
+    info!(enabled = cli.native_gossip, "native-action gossip pre-spread");
     // Attach the durable DA store so the swarm can SERVE native-action bodies
     // by-hash on /torus/native-da/1.0 (Phase C Task 5 — RARE pull-fallback).
     network.set_native_da_store(NativeDaStore::new(state_db.clone()));
@@ -428,10 +437,12 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         let mempool_for_gossip = mempool.clone();
         tokio::spawn(async move {
             while let Some((sender, action)) = native_rx.recv().await {
-                match mempool_for_gossip.add_native_action_from_gossip_trusted(sender, action) {
+                // Verified ingest: authenticates the claimed sender (forged
+                // gossip pairs must not pollute the pool); DA-mirrors first.
+                match mempool_for_gossip.add_native_action_from_gossip(sender, action) {
                     Ok(()) => {}
                     Err(torus_mempool::MempoolError::DuplicateNativeAction) => {}
-                    Err(e) => tracing::warn!("gossip native action rejected: {e}"),
+                    Err(e) => tracing::debug!("gossip native action rejected: {e}"),
                 }
             }
         });

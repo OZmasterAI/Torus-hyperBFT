@@ -63,15 +63,19 @@ pub const NATIVE_ORDERS_PER_BATCH_CAP: usize = 1024;
 pub const NATIVE_ORDERS_PER_BLOCK_CAP: usize = 50_000;
 
 /// Hard ceiling on the summed bincode-encoded size of native-action bodies in
-/// one block (bytes) — the WAN dissemination budget. Pre-proposal push +
-/// hash-manifest pull demonstrably move ~2MB inside a view on testnet links,
-/// while the ~7.5MB bodies of a 50k-order block wedge dissemination outright
-/// (s334 bs1000: body fetches exhausted, every leader re-proposed the same
-/// mega-block). Selection stops before exceeding this, so a flooded mempool
-/// degrades to more, smaller blocks instead of undisseminatable ones. Unlike
+/// one block (bytes) — the WAN dissemination budget. Selection stops before
+/// exceeding this, so a flooded mempool degrades to more, smaller blocks
+/// instead of undisseminatable ones (s334 bs1000 wedge: ~7.5MB bodies, body
+/// fetches exhausted, every leader re-proposed the same mega-block). Unlike
 /// `NATIVE_ORDERS_PER_BLOCK_CAP` (documented target, not yet enforced), this
 /// IS enforced in `select_for_block_with_senders_excluding`.
-pub const NATIVE_BLOCK_BYTES_CAP: usize = 2_000_000;
+///
+/// 2MB was the push/manifest-pull-only budget (s334 measured 34.5k orders/s
+/// pinned at exactly this cap × block rate). With Sprint 3 native-action
+/// gossip pre-spread, bodies are already on every validator by proposal time
+/// and the proposal moves ~hashes only, so the per-block budget rises to 6MB
+/// (~40k orders at ~150B/order). Gap-pulls + rotated body fetch cover misses.
+pub const NATIVE_BLOCK_BYTES_CAP: usize = 6_000_000;
 
 // ============================================================================
 // Rate tracker

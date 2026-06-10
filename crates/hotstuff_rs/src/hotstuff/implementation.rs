@@ -1770,30 +1770,61 @@ impl<N: Network> HotStuff<N> {
 
     const BODY_RETRY_INTERVAL: Duration = Duration::from_millis(300);
     const MAX_BODY_RETRIES: u8 = 3;
+    /// Total fetch attempts before giving up to sync: 3 at the proposer, then
+    /// up to 6 rotated across the other validators (Sprint 3 T3 — a
+    /// non-serving proposer must not defeat the fetch when another validator
+    /// holds the body).
+    const MAX_BODY_RETRIES_TOTAL: u8 = 9;
 
     /// Re-request bodies for stale pending headers; trigger block sync after max retries.
-    pub(crate) fn tick_pending_body_retries(&mut self) {
+    /// The proposer is asked first (`MAX_BODY_RETRIES` attempts), then the request
+    /// rotates across the other committed validators.
+    pub(crate) fn tick_pending_body_retries<K: KVStore>(
+        &mut self,
+        block_tree: &BlockTreeSingleton<K>,
+    ) {
         let now = Instant::now();
+        let me = self.config.keypair.public();
         let mut expired = Vec::new();
         for (hash, (last_req, count, origin)) in self.body_fetch_tracker.iter_mut() {
             if now.duration_since(*last_req) < Self::BODY_RETRY_INTERVAL {
                 continue;
             }
-            if *count >= Self::MAX_BODY_RETRIES {
-                log::warn!("body fetch exhausted {} retries for {:?} — falling back to sync", Self::MAX_BODY_RETRIES, hash);
+            if *count >= Self::MAX_BODY_RETRIES_TOTAL {
+                log::warn!(
+                    "body fetch exhausted {} retries (proposer + rotation) for {:?} — falling back to sync",
+                    Self::MAX_BODY_RETRIES_TOTAL,
+                    hash
+                );
                 expired.push(*hash);
                 continue;
             }
             if let Some(header) = self.pending_headers.get(hash) {
+                let others: Vec<VerifyingKey> = block_tree
+                    .committed_validator_set()
+                    .map(|vs| {
+                        vs.validators()
+                            .filter(|vk| **vk != me && *vk != origin)
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let Some(target) =
+                    rotated_body_fetch_target(*count, Self::MAX_BODY_RETRIES, origin, &others)
+                else {
+                    log::warn!("body fetch has no remaining targets for {:?} — falling back to sync", hash);
+                    expired.push(*hash);
+                    continue;
+                };
                 let req = BlockDataRequest {
                     chain_id: header.chain_id,
                     view: header.view,
                     block_hash: header.block_hash,
                 };
-                self.sender_handle.request_block_data(*origin, req);
+                self.sender_handle.request_block_data(target, req);
                 *last_req = now;
                 *count += 1;
-                log::debug!("body fetch retry {} for {:?}", count, hash);
+                log::debug!("body fetch retry {} (target rotation) for {:?}", count, hash);
             } else {
                 expired.push(*hash);
             }
@@ -1809,6 +1840,63 @@ impl<N: Network> HotStuff<N> {
 
     pub(crate) fn has_pending_body_fetches(&self) -> bool {
         !self.body_fetch_tracker.is_empty()
+    }
+}
+
+/// Pick the target for body-fetch attempt number `attempt` (0-based): the first
+/// `max_origin_retries` attempts go to `origin` (the proposer — overwhelmingly
+/// the holder), then rotate across the OTHER validators. A non-serving proposer
+/// (s334 executor livelock: a zombie peer held the only asked-for copy) no
+/// longer defeats the fetch when any other validator holds the body.
+pub(crate) fn rotated_body_fetch_target(
+    attempt: u8,
+    max_origin_retries: u8,
+    origin: &VerifyingKey,
+    others: &[VerifyingKey],
+) -> Option<VerifyingKey> {
+    if attempt < max_origin_retries {
+        return Some(*origin);
+    }
+    if others.is_empty() {
+        return None;
+    }
+    let idx = (attempt - max_origin_retries) as usize % others.len();
+    Some(others[idx])
+}
+
+#[cfg(test)]
+mod body_fetch_rotation_tests {
+    use super::*;
+
+    fn vk(seed: u8) -> VerifyingKey {
+        ed25519_dalek::SigningKey::from_bytes(&[seed; 32]).verifying_key()
+    }
+
+    #[test]
+    fn origin_first_then_rotate_through_others() {
+        let origin = vk(1);
+        let others = [vk(2), vk(3)];
+        for attempt in 0..3 {
+            assert_eq!(
+                rotated_body_fetch_target(attempt, 3, &origin, &others),
+                Some(origin),
+                "attempts 0-2 target the proposer"
+            );
+        }
+        assert_eq!(rotated_body_fetch_target(3, 3, &origin, &others), Some(others[0]));
+        assert_eq!(rotated_body_fetch_target(4, 3, &origin, &others), Some(others[1]));
+        assert_eq!(
+            rotated_body_fetch_target(5, 3, &origin, &others),
+            Some(others[0]),
+            "wraps around the other validators"
+        );
+    }
+
+    #[test]
+    fn no_others_means_origin_only() {
+        let origin = vk(1);
+        assert_eq!(rotated_body_fetch_target(0, 3, &origin, &[]), Some(origin));
+        assert_eq!(rotated_body_fetch_target(3, 3, &origin, &[]), None);
     }
 }
 
