@@ -163,6 +163,11 @@ pub struct RpcState {
     pub(crate) leader_vk_fn: Option<Arc<dyn Fn() -> Option<[u8; 32]> + Send + Sync>>,
     /// Channel to forward native actions to the leader: (leader_vk, sender_addr ++ action_json).
     pub(crate) forward_action_tx: Option<tokio::sync::mpsc::UnboundedSender<([u8; 32], Vec<u8>)>>,
+    /// Forward full action bodies to the leader. Only wanted when native gossip
+    /// is OFF (fallback mode) — with gossip pre-spread on, bodies already reach
+    /// every validator and the duplicate forward just burns the leader's link
+    /// (Sprint 3.5; the s338 sweep storm was partly this).
+    pub(crate) forward_bodies: bool,
     /// Admission control: cap concurrent submit_native_action calls.
     pub(crate) submit_semaphore: Arc<tokio::sync::Semaphore>,
 }
@@ -199,21 +204,27 @@ impl RpcServer {
                 own_vk: None,
                 leader_vk_fn: None,
                 forward_action_tx: None,
+                forward_bodies: false,
                 submit_semaphore: Arc::new(tokio::sync::Semaphore::new(SUBMIT_PERMITS)),
             },
         }
     }
 
     /// Configure leader forwarding for direct-to-leader native action submission.
+    /// `forward_bodies`: send full action bodies to the leader — pass `true`
+    /// only when native gossip is OFF; with gossip on, bodies already pre-spread
+    /// and the forward would duplicate every body on the leader's link.
     pub fn set_leader_forwarding(
         &mut self,
         own_vk: [u8; 32],
         leader_vk_fn: Arc<dyn Fn() -> Option<[u8; 32]> + Send + Sync>,
         forward_tx: tokio::sync::mpsc::UnboundedSender<([u8; 32], Vec<u8>)>,
+        forward_bodies: bool,
     ) {
         self.state.own_vk = Some(own_vk);
         self.state.leader_vk_fn = Some(leader_vk_fn);
         self.state.forward_action_tx = Some(forward_tx);
+        self.state.forward_bodies = forward_bodies;
     }
 
     /// Use an externally-created height counter (shared with the commit handler).
@@ -666,6 +677,155 @@ mod tests {
         assert!(results[2].hash.is_none() && results[2].error.is_some());
         assert_eq!(mempool.native_pool_size(), 2, "only the valid actions admitted");
         handle.stop().unwrap();
+    }
+
+    #[tokio::test]
+    async fn submit_records_phase_histograms() {
+        let (_dir, state, mempool, executor) = setup();
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
+        let mut server = RpcServer::new(
+            state,
+            mempool,
+            executor,
+            TORUS_CHAIN_ID,
+            100,
+            BlockNotifier::new(),
+        );
+        server.set_metrics(metrics.clone());
+        let (handle, addr) = server.start("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        use jsonrpsee::core::client::ClientT;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let key = k256::ecdsa::SigningKey::from_slice(
+            &hex::decode("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80")
+                .unwrap(),
+        )
+        .unwrap();
+        let signed = torus_types::eip712::sign_native_action(
+            torus_types::NativeAction::ClaimRewards,
+            now_ms,
+            &key,
+        );
+        let payload = format!("0x{}", hex::encode(serde_json::to_vec(&signed).unwrap()));
+
+        let results: Vec<RpcSubmitResult> = client
+            .request(
+                "torus_submitNativeActions",
+                jsonrpsee::rpc_params![vec![payload]],
+            )
+            .await
+            .unwrap();
+        assert!(results[0].hash.is_some());
+
+        // One batch call = exactly one observation in each phase histogram.
+        let text = metrics.encode();
+        for name in [
+            "torus_rpc_submit_permit_wait_seconds",
+            "torus_rpc_submit_verify_seconds",
+            "torus_rpc_submit_admit_seconds",
+        ] {
+            assert!(
+                text.contains(&format!("{name}_count 1")),
+                "{name} not observed exactly once; metrics dump:\n{text}"
+            );
+        }
+        handle.stop().unwrap();
+    }
+
+    #[tokio::test]
+    async fn leader_forward_gated_by_forward_bodies() {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let mk_payload = |nonce: u64| {
+            let key = k256::ecdsa::SigningKey::from_slice(
+                &hex::decode(
+                    "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let signed = torus_types::eip712::sign_native_action(
+                torus_types::NativeAction::ClaimRewards,
+                nonce,
+                &key,
+            );
+            format!("0x{}", hex::encode(serde_json::to_vec(&signed).unwrap()))
+        };
+        let own = [1u8; 32];
+        let leader = [2u8; 32];
+
+        // forward_bodies=false (gossip carries bodies): fwd channel stays empty.
+        let (_dir, state, mempool, executor) = setup();
+        let mut server = RpcServer::new(
+            state,
+            mempool,
+            executor,
+            TORUS_CHAIN_ID,
+            100,
+            BlockNotifier::new(),
+        );
+        let (fwd_tx, mut fwd_rx) = tokio::sync::mpsc::unbounded_channel();
+        server.set_leader_forwarding(own, Arc::new(move || Some(leader)), fwd_tx, false);
+        let (handle, addr) = server.start("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        use jsonrpsee::core::client::ClientT;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+        let results: Vec<RpcSubmitResult> = client
+            .request(
+                "torus_submitNativeActions",
+                jsonrpsee::rpc_params![vec![mk_payload(now_ms)]],
+            )
+            .await
+            .unwrap();
+        assert!(results[0].hash.is_some());
+        assert!(
+            fwd_rx.try_recv().is_err(),
+            "no full-body leader forward when gossip pre-spread owns body delivery"
+        );
+        handle.stop().unwrap();
+
+        // forward_bodies=true (gossip off): today's full-body forward, unchanged.
+        let (_dir2, state2, mempool2, executor2) = setup();
+        let mut server2 = RpcServer::new(
+            state2,
+            mempool2,
+            executor2,
+            TORUS_CHAIN_ID,
+            100,
+            BlockNotifier::new(),
+        );
+        let (fwd_tx2, mut fwd_rx2) = tokio::sync::mpsc::unbounded_channel();
+        server2.set_leader_forwarding(own, Arc::new(move || Some(leader)), fwd_tx2, true);
+        let (handle2, addr2) = server2.start("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let client2 = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr2}"))
+            .unwrap();
+        let results2: Vec<RpcSubmitResult> = client2
+            .request(
+                "torus_submitNativeActions",
+                jsonrpsee::rpc_params![vec![mk_payload(now_ms + 1)]],
+            )
+            .await
+            .unwrap();
+        assert!(results2[0].hash.is_some());
+        let (vk, payload) = fwd_rx2
+            .try_recv()
+            .expect("full-body forward must still flow in fallback mode");
+        assert_eq!(vk, leader);
+        assert!(
+            payload.len() > 20,
+            "payload is 20-byte sender prefix + action bytes"
+        );
+        handle2.stop().unwrap();
     }
 
     #[tokio::test]

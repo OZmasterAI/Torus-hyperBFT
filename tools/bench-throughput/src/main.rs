@@ -133,6 +133,33 @@ fn random_place_order(rng: &mut impl Rng, market_id: u64) -> NativeAction {
     })
 }
 
+/// Sign one submit-batch worth of payloads (T6 signer pipeline). Returns the
+/// hex payload strings and the advanced nonce watermark — nonces must be
+/// strictly increasing per sender because the committed (sender, nonce) replay
+/// guard silently drops same-ms duplicates.
+fn sign_payload_batch(
+    rng: &mut impl Rng,
+    key: &k256::ecdsa::SigningKey,
+    batch_size: usize,
+    submit_batch: usize,
+    mut last_nonce: u64,
+) -> (Vec<String>, u64) {
+    let mut payloads = Vec::with_capacity(submit_batch);
+    for _ in 0..submit_batch {
+        let action = random_place_order_action(rng, 1, batch_size);
+        let base = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let nonce = base.max(last_nonce + 1);
+        last_nonce = nonce;
+        let signed = sign_native_action(action, nonce, key);
+        let json_bytes = serde_json::to_vec(&signed).unwrap();
+        payloads.push(format!("0x{}", hex::encode(&json_bytes)));
+    }
+    (payloads, last_nonce)
+}
+
 /// Build one action carrying `batch_size` orders. `batch_size <= 1` returns a plain
 /// `PlaceOrder` (the legacy single path) for apples-to-apples A/B runs.
 fn random_place_order_action(rng: &mut impl Rng, market_id: u64, batch_size: usize) -> NativeAction {
@@ -670,28 +697,33 @@ async fn run_consensus(
         let url_count = urls.len();
 
         sender_handles.push(tokio::spawn(async move {
-            let mut rng = StdRng::from_entropy();
             let mut req_id: u64 = sender_idx as u64 * 1_000_000;
             let mut url_idx: usize = sender_idx % url_count;
-            // Strictly increasing per-sender nonces: same-ms duplicates are
-            // dropped by the committed (sender, nonce) replay guard, silently
-            // shrinking measured throughput (acute inside one submit batch).
-            let mut last_nonce: u64 = 0;
+
+            // T6 signer pipeline: a dedicated blocking-pool task signs AHEAD
+            // into a small buffer so signing CPU overlaps network I/O instead
+            // of serializing with it (bs1000 signing starved the submit loop
+            // on the 4-core box). Depth 4 keeps nonces well inside the 60s
+            // freshness window while decoupling the two stages.
+            let (pregen_tx, mut pregen_rx) = tokio::sync::mpsc::channel::<Vec<String>>(4);
+            let signer = tokio::task::spawn_blocking(move || {
+                let mut rng = StdRng::from_entropy();
+                let mut last_nonce: u64 = 0;
+                loop {
+                    let (payloads, n) =
+                        sign_payload_batch(&mut rng, &key, batch_size, submit_batch, last_nonce);
+                    last_nonce = n;
+                    if pregen_tx.blocking_send(payloads).is_err() {
+                        break; // submit loop finished — receiver dropped
+                    }
+                }
+            });
+            let mut starved_ns: u128 = 0;
 
             while Instant::now() < deadline {
-                let mut payloads = Vec::with_capacity(submit_batch);
-                for _ in 0..submit_batch {
-                    let action = random_place_order_action(&mut rng, 1, batch_size);
-                    let base = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap()
-                        .as_millis() as u64;
-                    let nonce = base.max(last_nonce + 1);
-                    last_nonce = nonce;
-                    let signed = sign_native_action(action, nonce, &key);
-                    let json_bytes = serde_json::to_vec(&signed).unwrap();
-                    payloads.push(format!("0x{}", hex::encode(&json_bytes)));
-                }
+                let wait_t0 = Instant::now();
+                let Some(payloads) = pregen_rx.recv().await else { break };
+                starved_ns += wait_t0.elapsed().as_nanos();
 
                 let permit = semaphore.clone().acquire_owned().await.unwrap();
                 let url = urls[url_idx % url_count].clone();
@@ -713,6 +745,17 @@ async fn run_consensus(
                         submitted.fetch_add(accepted as u64, Ordering::Relaxed);
                     }
                 });
+            }
+
+            // Dropping the receiver fails the signer's next blocking_send,
+            // which is its exit signal.
+            drop(pregen_rx);
+            let _ = signer.await;
+            if starved_ns > 1_000_000 {
+                eprintln!(
+                    "[sender {sender_idx}] signer-starved {:.1}ms total (signing slower than submits)",
+                    starved_ns as f64 / 1e6
+                );
             }
         }));
     }
@@ -999,6 +1042,31 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::summarize_included;
+    use super::sign_payload_batch;
+    use rand::{rngs::StdRng, SeedableRng};
+
+    #[test]
+    fn sign_payload_batch_nonces_strictly_increase() {
+        let mut rng = StdRng::seed_from_u64(7);
+        let key = k256::ecdsa::SigningKey::from_slice(&[0x11; 32]).unwrap();
+        let (p1, n1) = sign_payload_batch(&mut rng, &key, 3, 4, 0);
+        let (p2, n2) = sign_payload_batch(&mut rng, &key, 3, 4, n1);
+        assert_eq!(p1.len(), 4);
+        assert_eq!(p2.len(), 4);
+        assert!(n2 > n1, "nonce watermark must advance across batches");
+        let dec = |p: &String| -> u64 {
+            let bytes = hex::decode(p.trim_start_matches("0x")).unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            v["nonce"].as_u64().expect("signed action has a numeric nonce")
+        };
+        let nonces: Vec<u64> = p1.iter().chain(p2.iter()).map(dec).collect();
+        for w in nonces.windows(2) {
+            assert!(
+                w[1] > w[0],
+                "nonces must be strictly increasing across the pregen stream: {nonces:?}"
+            );
+        }
+    }
 
     #[test]
     fn summarize_totals_count_and_peak() {

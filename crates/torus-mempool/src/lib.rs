@@ -100,6 +100,8 @@ pub struct Mempool {
     native_gossip_tx: std::sync::OnceLock<tokio::sync::mpsc::Sender<Vec<u8>>>,
     /// When false, native action gossip is suppressed (direct-to-leader mode).
     native_gossip_enabled: std::sync::atomic::AtomicBool,
+    /// Node metrics handle (set once at startup; absent in most unit tests).
+    metrics: std::sync::OnceLock<std::sync::Arc<torus_telemetry::Metrics>>,
 }
 
 impl Mempool {
@@ -128,6 +130,7 @@ impl Mempool {
             memory_used: std::sync::atomic::AtomicUsize::new(0),
             native_gossip_tx: std::sync::OnceLock::new(),
             native_gossip_enabled: std::sync::atomic::AtomicBool::new(false),
+            metrics: std::sync::OnceLock::new(),
         }
     }
 
@@ -142,6 +145,13 @@ impl Mempool {
         match self.native_gossip_tx.set(tx) {
             Ok(()) => tracing::info!("native action gossip enabled"),
             Err(_) => tracing::warn!("native_gossip_tx already set"),
+        }
+    }
+
+    /// Set the node metrics handle. Called once at startup.
+    pub fn set_metrics(&self, metrics: std::sync::Arc<torus_telemetry::Metrics>) {
+        if self.metrics.set(metrics).is_err() {
+            tracing::warn!("mempool metrics already set");
         }
     }
 
@@ -364,6 +374,9 @@ impl Mempool {
                 match tx.try_send(bytes) {
                     Ok(()) => {}
                     Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        if let Some(m) = self.metrics.get() {
+                            m.native_gossip_dropped_full.inc();
+                        }
                         tracing::debug!("native gossip channel full, dropping outbound action");
                     }
                     Err(_) => {
@@ -696,6 +709,56 @@ mod tests {
         // The genuine sender is admitted.
         pool.add_native_action_from_gossip(real_sender, signed).unwrap();
         assert_eq!(pool.native_pool_size(), 1);
+    }
+
+    #[test]
+    fn gossip_drop_increments_counter() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state, MempoolConfig::default());
+        let metrics = std::sync::Arc::new(torus_telemetry::Metrics::new());
+        pool.set_metrics(metrics.clone());
+        // Capacity-1 channel with a live but never-drained receiver: the second
+        // post-admission publish hits TrySendError::Full and must be counted.
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        pool.set_native_gossip_tx(tx);
+        pool.set_native_gossip_enabled(true);
+
+        let key1 = k256::ecdsa::SigningKey::from_slice(
+            &alloy_primitives::hex::decode(
+                "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let key2 = k256::ecdsa::SigningKey::from_slice(
+            &alloy_primitives::hex::decode(
+                "59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let now = now_ms();
+        let a1 = torus_types::eip712::sign_native_action(
+            torus_types::NativeAction::ClaimRewards,
+            now,
+            &key1,
+        );
+        let a2 = torus_types::eip712::sign_native_action(
+            torus_types::NativeAction::ClaimRewards,
+            now,
+            &key2,
+        );
+        let s1 = a1.recover_sender().unwrap();
+        let s2 = a2.recover_sender().unwrap();
+
+        pool.add_native_action_presigned(s1, a1).unwrap();
+        assert_eq!(metrics.native_gossip_dropped_full.get(), 0);
+        pool.add_native_action_presigned(s2, a2).unwrap();
+        assert_eq!(
+            metrics.native_gossip_dropped_full.get(),
+            1,
+            "second publish must be counted as a channel-full drop"
+        );
     }
 
     fn fund(state: &StateDb, addr: &Address, balance: U256, nonce: u64) {

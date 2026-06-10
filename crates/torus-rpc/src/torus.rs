@@ -236,6 +236,9 @@ impl RpcState {
     /// Direct-to-leader forwarding tail shared by the single and batch submit
     /// endpoints: no-op when this node IS the leader or forwarding is unwired.
     fn forward_to_leader(&self, sender: &alloy_primitives::Address, action_bytes: &[u8]) {
+        if !self.forward_bodies {
+            return;
+        }
         if let (Some(ref leader_fn), Some(ref own_vk), Some(ref fwd_tx)) =
             (&self.leader_vk_fn, &self.own_vk, &self.forward_action_tx)
         {
@@ -711,14 +714,20 @@ impl TorusApiServer for RpcState {
         // One permit covers the whole batch — that's the amortization: the
         // permit bounds concurrent blocking-pool verify tasks, and the batch
         // runs as exactly one such task.
+        let permit_wait_t0 = std::time::Instant::now();
         let _permit = crate::acquire_submit_permit(&self.submit_semaphore)
             .await
             .ok_or_else(|| {
                 ErrorObjectOwned::from(RpcError::Internal("server overloaded, try again".into()))
             })?;
+        if let Some(ref m) = self.metrics {
+            m.rpc_submit_permit_wait_seconds
+                .observe(permit_wait_t0.elapsed().as_secs_f64());
+        }
 
         let state_db = self.state.clone();
         let chain_id = self.chain_id;
+        let verify_t0 = std::time::Instant::now();
         let verified = tokio::task::spawn_blocking(move || {
             let current_time_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -733,7 +742,12 @@ impl TorusApiServer for RpcState {
         })
         .await
         .map_err(|e| ErrorObjectOwned::from(RpcError::Internal(format!("spawn_blocking: {e}"))))?;
+        if let Some(ref m) = self.metrics {
+            m.rpc_submit_verify_seconds
+                .observe(verify_t0.elapsed().as_secs_f64());
+        }
 
+        let admit_t0 = std::time::Instant::now();
         let results = verified
             .into_iter()
             .map(|item| match item {
@@ -758,6 +772,10 @@ impl TorusApiServer for RpcState {
                 },
             })
             .collect();
+        if let Some(ref m) = self.metrics {
+            m.rpc_submit_admit_seconds
+                .observe(admit_t0.elapsed().as_secs_f64());
+        }
 
         Ok(results)
     }

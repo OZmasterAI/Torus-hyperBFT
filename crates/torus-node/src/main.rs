@@ -424,6 +424,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     ).await?;
     mempool.set_native_gossip_tx(native_gossip.into_sender());
     mempool.set_native_gossip_enabled(cli.native_gossip);
+    mempool.set_metrics(metrics.clone());
     info!(enabled = cli.native_gossip, "native-action gossip pre-spread");
     // Attach the durable DA store so the swarm can SERVE native-action bodies
     // by-hash on /torus/native-da/1.0 (Phase C Task 5 — RARE pull-fallback).
@@ -555,7 +556,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         leader_state_for_rpc.current_leader().map(|vk| *vk.as_bytes())
     });
     let (fwd_tx, mut fwd_rx) = tokio::sync::mpsc::unbounded_channel();
-    rpc_server.set_leader_forwarding(own_vk, leader_vk_fn, fwd_tx);
+    // Full-body forwards only in the no-gossip fallback: with pre-spread on,
+    // gossip already delivers every body to the leader (Sprint 3.5).
+    rpc_server.set_leader_forwarding(own_vk, leader_vk_fn, fwd_tx, !cli.native_gossip);
 
     // Extract shared handles before start() consumes the server
     let latest_height_handle = rpc_server.latest_height();

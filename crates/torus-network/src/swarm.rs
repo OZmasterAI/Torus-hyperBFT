@@ -458,6 +458,7 @@ pub async fn run_swarm_with_config(
                             debug!(count, "published native action batch to gossipsub");
                             if let Some(ref m) = shared.metrics {
                                 m.gossip_messages_sent.inc();
+                                m.native_gossip_published_actions.inc_by(count as u64);
                             }
                         }
                         Err(e) => {
@@ -481,6 +482,7 @@ pub async fn run_swarm_with_config(
                             debug!(count, "published native action batch (size cap) to gossipsub");
                             if let Some(ref m) = shared.metrics {
                                 m.gossip_messages_sent.inc();
+                                m.native_gossip_published_actions.inc_by(count as u64);
                             }
                         }
                         Err(e) => {
@@ -598,6 +600,9 @@ fn handle_event(
                         }
                     }
                     debug!(count, ok, "received native action batch from {propagation_source}");
+                    if let Some(ref m) = shared.metrics {
+                        m.native_gossip_received_actions.inc_by(ok as u64);
+                    }
                 } else {
                     match bincode::deserialize::<(torus_types::Address, torus_types::SignedNativeAction)>(&message.data) {
                         Ok(pair) => {
@@ -755,6 +760,9 @@ fn handle_event(
                 let _ = swarm.dial(peer);
             } else {
                 warn!(%peer, ?error, "direct send failed (untracked payload)");
+                if let Some(ref m) = shared.metrics {
+                    m.direct_send_failures_untracked.inc();
+                }
             }
             // #4 Task 3: a FAILED native push still frees its in-flight slot — dispatch
             // the next queued push so a saturated link drains instead of stalling (no-op
@@ -922,6 +930,9 @@ fn handle_event(
             request_response::Event::OutboundFailure { peer, error, .. },
         )) => {
             warn!(%peer, ?error, "native-da OUTBOUND FAILURE");
+            if let Some(ref m) = shared.metrics {
+                m.native_da_pull_failures.inc();
+            }
         }
         SwarmEvent::Behaviour(TorusBehaviourEvent::NativeDa(
             request_response::Event::InboundFailure { peer, error, .. },

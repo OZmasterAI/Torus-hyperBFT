@@ -62,6 +62,29 @@ pub struct Metrics {
     pub gossip_messages_received: Counter,
     pub gossip_messages_sent: Counter,
 
+    // Native-action gossip pre-spread metrics (Sprint 3.5)
+    /// Native actions published to gossipsub (summed per batch).
+    pub native_gossip_published_actions: Counter,
+    /// Native actions received from gossipsub (decoded OK, forwarded to ingest).
+    pub native_gossip_received_actions: Counter,
+    /// Outbound native actions dropped because the gossip channel was full.
+    /// Must stay 0 under load — drops mean pre-spread is silently failing.
+    pub native_gossip_dropped_full: Counter,
+
+    // Submit-ack phase timing (Sprint 3.5) — decomposes where multi-second
+    // batch-submit acks accrue: semaphore queue vs blocking-pool verify vs
+    // pool admission.
+    pub rpc_submit_permit_wait_seconds: Histogram,
+    pub rpc_submit_verify_seconds: Histogram,
+    pub rpc_submit_admit_seconds: Histogram,
+
+    // Link-storm visibility (Sprint 3.5) — the s338 sweep produced 155+ pull
+    // timeouts and 238 substream exhaustions visible only as log warns.
+    /// Native-DA pull requests that failed (timeout / substream exhaustion).
+    pub native_da_pull_failures: Counter,
+    /// Untracked direct sends (native push / leader-forward) that failed.
+    pub direct_send_failures_untracked: Counter,
+
     // Block detail metrics
     pub block_transactions_count: Histogram,
 
@@ -232,6 +255,62 @@ impl Metrics {
             gossip_messages_sent.clone(),
         );
 
+        let native_gossip_published_actions = Counter::default();
+        registry.register(
+            "torus_native_gossip_published_actions",
+            "Native actions published to gossipsub (summed per batch)",
+            native_gossip_published_actions.clone(),
+        );
+
+        let native_gossip_received_actions = Counter::default();
+        registry.register(
+            "torus_native_gossip_received_actions",
+            "Native actions received from gossipsub and forwarded to ingest",
+            native_gossip_received_actions.clone(),
+        );
+
+        let native_gossip_dropped_full = Counter::default();
+        registry.register(
+            "torus_native_gossip_dropped_full",
+            "Outbound native actions dropped on full gossip channel",
+            native_gossip_dropped_full.clone(),
+        );
+
+        let rpc_submit_permit_wait_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
+        registry.register(
+            "torus_rpc_submit_permit_wait_seconds",
+            "Time a batch submit waited for a verify permit",
+            rpc_submit_permit_wait_seconds.clone(),
+        );
+
+        let rpc_submit_verify_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
+        registry.register(
+            "torus_rpc_submit_verify_seconds",
+            "Time a batch submit spent in blocking-pool verification",
+            rpc_submit_verify_seconds.clone(),
+        );
+
+        let rpc_submit_admit_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
+        registry.register(
+            "torus_rpc_submit_admit_seconds",
+            "Time a batch submit spent admitting verified actions to the pool",
+            rpc_submit_admit_seconds.clone(),
+        );
+
+        let native_da_pull_failures = Counter::default();
+        registry.register(
+            "torus_native_da_pull_failures",
+            "Native-DA pull requests that failed (timeout or substream exhaustion)",
+            native_da_pull_failures.clone(),
+        );
+
+        let direct_send_failures_untracked = Counter::default();
+        registry.register(
+            "torus_direct_send_failures_untracked",
+            "Untracked direct sends (native push / leader-forward) that failed",
+            direct_send_failures_untracked.clone(),
+        );
+
         let block_transactions_count =
             Histogram::new(exponential_buckets(1.0, 2.0, 12));
         registry.register(
@@ -312,6 +391,14 @@ impl Metrics {
             rpc_request_duration_seconds,
             gossip_messages_received,
             gossip_messages_sent,
+            native_gossip_published_actions,
+            native_gossip_received_actions,
+            native_gossip_dropped_full,
+            rpc_submit_permit_wait_seconds,
+            rpc_submit_verify_seconds,
+            rpc_submit_admit_seconds,
+            native_da_pull_failures,
+            direct_send_failures_untracked,
             block_transactions_count,
             consensus_timeout_total,
             pending_sends_enqueued,
