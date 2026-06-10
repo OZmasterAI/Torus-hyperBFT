@@ -826,7 +826,55 @@ pub fn select_leader(view: ViewNumber, validator_set: &ValidatorSet) -> Verifyin
     unreachable!("Cannot select a leader: index not found!")
 }
 
+/// MonadBFT B3 kill switch: whether `select_leader_with_reputation` actually
+/// weights by reputation (`true`) or delegates to plain IWRR [`select_leader`]
+/// (`false`, the default).
+///
+/// Default-off because reputation is accumulated from locally-observed events
+/// (TC formation, QC advancement) that are not totally ordered across replicas:
+/// a replica that misses events (offline, or syncing past them) builds a
+/// different reputation map, and divergent maps make replicas disagree on the
+/// leader of every view — which prevents consecutive-view QCs and therefore
+/// halts 2-chain commits. Selection must stay a pure function of consensus
+/// state (view, validator set) until reputation is derived from committed
+/// chain data.
+static REPUTATION_LEADER_SELECTION_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Enable or disable reputation-weighted leader selection (default: disabled).
+///
+/// Leader selection must agree on every replica of a chain: set this to the
+/// same value on ALL replicas, before the replica starts, and never while it
+/// is running.
+pub fn set_reputation_leader_selection(enabled: bool) {
+    REPUTATION_LEADER_SELECTION_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether reputation-weighted leader selection is currently enabled.
+pub fn reputation_leader_selection_enabled() -> bool {
+    REPUTATION_LEADER_SELECTION_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// MonadBFT B3: Deterministically select a leader using reputation-weighted stake.
+///
+/// When reputation-weighted selection is disabled (the default, see
+/// [`set_reputation_leader_selection`]), this ignores `reputation` and behaves
+/// exactly like [`select_leader`]. When enabled, it delegates to
+/// [`select_leader_reputation_weighted`].
+pub fn select_leader_with_reputation(
+    view: ViewNumber,
+    validator_set: &ValidatorSet,
+    reputation: &crate::hotstuff::types::LeaderReputation,
+) -> VerifyingKey {
+    if !reputation_leader_selection_enabled() {
+        return select_leader(view, validator_set);
+    }
+    select_leader_reputation_weighted(view, validator_set, reputation)
+}
+
+/// The reputation-weighted selection algorithm itself (B3), applied
+/// unconditionally — callers outside tests should go through
+/// [`select_leader_with_reputation`] so the kill switch is respected.
 ///
 /// Adjusts each validator's effective power by their reputation score (in basis
 /// points), then delegates to the standard IWRR `select_leader`. Validators with
@@ -834,7 +882,7 @@ pub fn select_leader(view: ViewNumber, validator_set: &ValidatorSet) -> Verifyin
 /// fully excluded (minimum 1 power unit if they have any stake).
 ///
 /// This function is deterministic: same (view, validator_set, reputation) → same leader.
-pub fn select_leader_with_reputation(
+pub fn select_leader_reputation_weighted(
     view: ViewNumber,
     validator_set: &ValidatorSet,
     reputation: &crate::hotstuff::types::LeaderReputation,
@@ -881,6 +929,15 @@ fn epoch(view: ViewNumber, epoch_length: EpochLength) -> u64 {
         return 0;
     }
     view.int().div_ceil(el)
+}
+
+/// Reputation-weighted selection must be opt-in: a replica that never calls
+/// `set_reputation_leader_selection(true)` selects leaders with plain IWRR.
+/// (Nothing else in the lib test binary toggles the switch, so this genuinely
+/// observes the default.)
+#[test]
+fn reputation_leader_selection_disabled_by_default() {
+    assert!(!reputation_leader_selection_enabled());
 }
 
 /// Tests if the number of times each validator is selected as a leader is proportional to its power.

@@ -732,6 +732,7 @@ impl TorusApp {
             treasury_address: Address::ZERO,
             dev_pool_address: Address::ZERO,
             timeout_base_ms: 500,
+            reputation_leader_selection: false,
         };
         let mut seed = [0u8; 32];
         seed[..8].copy_from_slice(&id.to_le_bytes());
@@ -1639,6 +1640,7 @@ mod crash_recovery_tests {
             treasury_address: Address::ZERO,
             dev_pool_address: Address::ZERO,
             timeout_base_ms: 500,
+            reputation_leader_selection: false,
         };
         (config, state_db)
     }

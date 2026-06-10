@@ -243,4 +243,7 @@ pub(crate) mod implementation;
 pub mod types;
 
 // Re-export leader selection functions for external use and testing.
-pub use implementation::{select_leader, select_leader_with_reputation};
+pub use implementation::{
+    reputation_leader_selection_enabled, select_leader, select_leader_reputation_weighted,
+    select_leader_with_reputation, set_reputation_leader_selection,
+};

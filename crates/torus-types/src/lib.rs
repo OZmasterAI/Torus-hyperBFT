@@ -1003,6 +1003,12 @@ pub struct ChainConfig {
     /// Consensus view timeout in milliseconds (from genesis).
     #[serde(default = "default_timeout_base_ms")]
     pub timeout_base_ms: u64,
+    /// MonadBFT B3: weight leader selection by observed leader reputation.
+    /// Consensus-critical — every validator of a chain must use the same value.
+    /// Off by default: locally-observed reputation diverges across replicas
+    /// and divergent leader schedules halt finalization.
+    #[serde(default)]
+    pub reputation_leader_selection: bool,
 }
 
 fn default_timeout_base_ms() -> u64 {

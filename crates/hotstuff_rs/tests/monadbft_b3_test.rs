@@ -9,7 +9,10 @@ use rand_core::OsRng;
 use hotstuff_rs::hotstuff::types::{
     EquivocationEvidence, LeaderReputation, LeaderReputationEntry,
 };
-use hotstuff_rs::pacemaker::{select_leader, select_leader_with_reputation};
+use hotstuff_rs::pacemaker::{
+    reputation_leader_selection_enabled, select_leader, select_leader_reputation_weighted,
+    select_leader_with_reputation, set_reputation_leader_selection,
+};
 use hotstuff_rs::types::crypto_primitives::SigningKey;
 use hotstuff_rs::types::data_types::*;
 use hotstuff_rs::types::update_sets::ValidatorSetUpdates;
@@ -110,14 +113,14 @@ fn reputation_entry_all_successes() {
     assert_eq!(entry.total, 10);
 }
 
-/// Score after all timeouts is 0%.
+/// Score after all timeouts clamps to the 2500 bps floor (never excluded).
 #[test]
 fn reputation_entry_all_timeouts() {
     let mut entry = LeaderReputationEntry::new();
     for _ in 0..10 {
         entry.record_timeout();
     }
-    assert_eq!(entry.score_bps(), 0);
+    assert_eq!(entry.score_bps(), 2500);
     assert_eq!(entry.successes, 0);
     assert_eq!(entry.total, 10);
 }
@@ -254,7 +257,7 @@ fn reputation_weighted_selection_matches_standard_at_full_rep() {
     for v in 0..20 {
         let view = ViewNumber::new(v);
         let standard = select_leader(view, &vs);
-        let weighted = select_leader_with_reputation(view, &vs, &rep);
+        let weighted = select_leader_reputation_weighted(view, &vs, &rep);
         assert_eq!(
             standard, weighted,
             "View {}: standard and weighted should match at full reputation",
@@ -276,14 +279,14 @@ fn low_reputation_reduces_selection_frequency() {
     for _ in 0..9 {
         rep.record_timeout(&keypairs[0].verifying_key());
     }
-    // Validator 0 score: 1000 bps (10%)
-    assert_eq!(rep.score_bps(&keypairs[0].verifying_key()), 1000);
+    // Validator 0 raw score 1000 bps (10%) clamps to the 2500 bps floor.
+    assert_eq!(rep.score_bps(&keypairs[0].verifying_key()), 2500);
 
     // Count selections over many views.
     let total_views = 1000u64;
     let mut counts = [0u64; 4];
     for v in 0..total_views {
-        let leader = select_leader_with_reputation(ViewNumber::new(v), &vs, &rep);
+        let leader = select_leader_reputation_weighted(ViewNumber::new(v), &vs, &rep);
         for (i, kp) in keypairs.iter().enumerate() {
             if leader == kp.verifying_key() {
                 counts[i] += 1;
@@ -291,11 +294,11 @@ fn low_reputation_reduces_selection_frequency() {
         }
     }
 
-    // Validator 0 (10% rep) should be selected significantly less than others.
+    // Validator 0 (25% floored rep) should be selected significantly less than others.
     // Others have 100% rep with power 10 → effective power 10.
-    // Validator 0 has 10% rep with power 10 → effective power 1.
-    // Total power = 1 + 10 + 10 + 10 = 31.
-    // Expected: V0 ≈ 1/31 ≈ 3.2%, others ≈ 10/31 ≈ 32.3%.
+    // Validator 0 has 25% rep with power 10 → effective power 2.
+    // Total power = 2 + 10 + 10 + 10 = 32.
+    // Expected: V0 ≈ 2/32 ≈ 6.3%, others ≈ 10/32 ≈ 31.3%.
     assert!(
         counts[0] < counts[1],
         "Low-rep validator 0 ({}) should be selected less than full-rep validator 1 ({})",
@@ -314,15 +317,16 @@ fn low_reputation_does_not_exclude() {
     for _ in 0..10 {
         rep.record_timeout(&keypairs[0].verifying_key());
     }
-    assert_eq!(rep.score_bps(&keypairs[0].verifying_key()), 0);
+    // Raw score 0 clamps to the 2500 bps floor.
+    assert_eq!(rep.score_bps(&keypairs[0].verifying_key()), 2500);
 
-    // With 0% rep, effective power = max(1, 10 * 0 / 10000) = 1.
-    // Total power = 1 + 10 + 10 + 10 = 31.
-    // Validator 0 should still appear in ~1/31 views.
+    // With floored 25% rep, effective power = max(1, 10 * 2500 / 10000) = 2.
+    // Total power = 2 + 10 + 10 + 10 = 32.
+    // Validator 0 should still appear in ~2/32 views.
     let total_views = 1000u64;
     let mut count_v0 = 0u64;
     for v in 0..total_views {
-        let leader = select_leader_with_reputation(ViewNumber::new(v), &vs, &rep);
+        let leader = select_leader_reputation_weighted(ViewNumber::new(v), &vs, &rep);
         if leader == keypairs[0].verifying_key() {
             count_v0 += 1;
         }
@@ -348,7 +352,8 @@ fn reputation_recovery_after_poor_performance() {
     for _ in 0..2 {
         rep.record_success(&keypairs[0].verifying_key());
     }
-    assert_eq!(rep.score_bps(&keypairs[0].verifying_key()), 2000); // 20%
+    // Raw score 2000 bps (20%) clamps to the 2500 bps floor.
+    assert_eq!(rep.score_bps(&keypairs[0].verifying_key()), 2500);
 
     // Gradually recover.
     for _ in 0..20 {
@@ -404,8 +409,8 @@ fn reputation_determinism() {
 
     for v in 0..50 {
         let view = ViewNumber::new(v);
-        let leader_a = select_leader_with_reputation(view, &vs, &rep_a);
-        let leader_b = select_leader_with_reputation(view, &vs, &rep_b);
+        let leader_a = select_leader_reputation_weighted(view, &vs, &rep_a);
+        let leader_b = select_leader_reputation_weighted(view, &vs, &rep_b);
         assert_eq!(
             leader_a, leader_b,
             "View {}: determinism violated — different leaders selected",
@@ -435,7 +440,7 @@ fn reputation_with_varied_stake() {
     let total_views = 1000u64;
     let mut counts = [0u64; 4];
     for v in 0..total_views {
-        let leader = select_leader_with_reputation(ViewNumber::new(v), &vs, &rep);
+        let leader = select_leader_reputation_weighted(ViewNumber::new(v), &vs, &rep);
         for (i, kp) in keypairs.iter().enumerate() {
             if leader == kp.verifying_key() {
                 counts[i] += 1;
@@ -534,7 +539,7 @@ fn reputation_weighted_selection_performance() {
     // Measure overhead by running many selections.
     let start = std::time::Instant::now();
     for v in 0..10_000 {
-        let _ = select_leader_with_reputation(ViewNumber::new(v), &vs, &rep);
+        let _ = select_leader_reputation_weighted(ViewNumber::new(v), &vs, &rep);
     }
     let duration = start.elapsed();
 
@@ -544,5 +549,89 @@ fn reputation_weighted_selection_performance() {
         duration.as_secs() < 60,
         "10k reputation-weighted selections took too long: {:?}",
         duration
+    );
+}
+
+// ============================================================================
+// B3 kill switch: reputation-weighted selection is opt-in (default OFF)
+// ============================================================================
+
+/// Serializes the kill-switch tests: they read/write process-wide selection
+/// mode, so they must not interleave with each other.
+static SELECTION_MODE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Reputation entries that crater a power-2 validator: under weighted
+/// selection its effective power drops 2 → max(1, 2*2500/10000) = 1, which
+/// changes p_total and therefore the whole IWRR schedule.
+fn cratered_rep(victim: &SigningKey) -> LeaderReputation {
+    let mut rep = LeaderReputation::new(100);
+    for _ in 0..20 {
+        rep.record_timeout(&victim.verifying_key());
+    }
+    rep
+}
+
+/// With the switch off (the default), `select_leader_with_reputation` ignores
+/// reputation entirely and matches plain IWRR — even with degraded entries.
+/// This is the testnet-stall regression test: divergent per-node reputation
+/// must not be able to change the leader schedule unless explicitly enabled.
+#[test]
+fn reputation_selection_disabled_by_default_matches_plain_iwrr() {
+    let _guard = SELECTION_MODE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    set_reputation_leader_selection(false);
+
+    // Testnet-shaped validator set: weighted stakes 2/2/1.
+    let (keypairs, vs) = make_weighted_validator_set(&[2, 2, 1]);
+    let rep = cratered_rep(&keypairs[0]);
+
+    assert!(!reputation_leader_selection_enabled());
+    for v in 0..200 {
+        let view = ViewNumber::new(v);
+        assert_eq!(
+            select_leader_with_reputation(view, &vs, &rep),
+            select_leader(view, &vs),
+            "view {}: with the kill switch off, selection must be plain IWRR",
+            v
+        );
+    }
+}
+
+/// Explicitly enabling the switch restores reputation-weighted behavior.
+#[test]
+fn reputation_selection_enabled_uses_weighted_schedule() {
+    let _guard = SELECTION_MODE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let (keypairs, vs) = make_weighted_validator_set(&[2, 2, 1]);
+    let rep = cratered_rep(&keypairs[0]);
+
+    set_reputation_leader_selection(true);
+    assert!(reputation_leader_selection_enabled());
+    // Views past the warm-up window (< 20 uses plain selection regardless).
+    let selected: Vec<_> = (20..220)
+        .map(|v| select_leader_with_reputation(ViewNumber::new(v), &vs, &rep))
+        .collect();
+    // Restore the default before any assertion can panic out of the test.
+    set_reputation_leader_selection(false);
+
+    let weighted: Vec<_> = (20..220)
+        .map(|v| select_leader_reputation_weighted(ViewNumber::new(v), &vs, &rep))
+        .collect();
+    assert_eq!(
+        selected, weighted,
+        "with the kill switch on, the wrapper must use the weighted schedule"
+    );
+
+    // Sanity: the cratered entries actually change the schedule vs plain IWRR,
+    // otherwise the disabled-by-default test above proves nothing.
+    let plain: Vec<_> = (20..220)
+        .map(|v| select_leader(ViewNumber::new(v), &vs))
+        .collect();
+    assert_ne!(
+        weighted, plain,
+        "cratered reputation should produce a different schedule than plain IWRR"
     );
 }

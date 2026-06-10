@@ -89,6 +89,10 @@ pub struct ConsensusConfig {
     pub epoch_length: u64,
     pub timeout_base_ms: u64,
     pub timeout_max_ms: u64,
+    /// MonadBFT B3 reputation-weighted leader selection (consensus-critical:
+    /// identical on all validators). Absent in genesis TOML → disabled.
+    #[serde(default)]
+    pub reputation_leader_selection: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -495,6 +499,7 @@ impl Genesis {
                 .and_then(|s| parse_address(s).ok())
                 .unwrap_or(Address::ZERO),
             timeout_base_ms: self.consensus.timeout_base_ms,
+            reputation_leader_selection: self.consensus.reputation_leader_selection,
         }
     }
 

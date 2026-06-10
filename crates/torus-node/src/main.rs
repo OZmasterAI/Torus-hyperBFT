@@ -229,6 +229,7 @@ fn default_chain_config() -> ChainConfig {
         treasury_address: Address::ZERO,
         dev_pool_address: Address::ZERO,
         timeout_base_ms: 500,
+        reputation_leader_selection: false,
     }
 }
 
@@ -480,6 +481,20 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let network_for_fwd = network.clone();
 
     // 6. Consensus configuration
+    // Leader-selection mode is consensus-critical: every validator must run the
+    // same setting or replicas disagree on leaders and finalization halts.
+    hotstuff_rs::pacemaker::set_reputation_leader_selection(
+        chain_config.reputation_leader_selection,
+    );
+    info!(
+        reputation_leader_selection = chain_config.reputation_leader_selection,
+        "leader selection mode: {}",
+        if chain_config.reputation_leader_selection {
+            "reputation-weighted (B3)"
+        } else {
+            "plain IWRR round-robin"
+        }
+    );
     let hs_config = Configuration::builder()
         .me(signing_key)
         .chain_id(ChainID::new(chain_config.chain_id))
