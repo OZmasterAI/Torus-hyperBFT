@@ -50,6 +50,12 @@ impl NativePool {
         self.entries.len()
     }
 
+    /// True when the pool is at capacity — non-cancel inserts are guaranteed
+    /// to fail (cancels may still evict their way in).
+    pub fn is_full(&self) -> bool {
+        self.entries.len() >= self.max_size
+    }
+
     pub fn get_by_hash(&self, hash: &B256) -> Option<SignedNativeAction> {
         self.hash_index
             .get(hash)
@@ -337,7 +343,9 @@ impl NativePool {
     }
 }
 
-fn is_cancel(action: &NativeAction) -> bool {
+/// Cancels get pool-eviction priority; exported so ingress can route them to
+/// full verification even when the pool is full (pre-verify shedding).
+pub fn is_cancel(action: &NativeAction) -> bool {
     matches!(
         action,
         NativeAction::CancelOrder { .. } | NativeAction::CancelAllOrders { .. }
@@ -464,6 +472,24 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(err, MempoolError::NativeSenderQueueFull { .. }));
+    }
+
+    #[test]
+    fn is_full_tracks_cap() {
+        let mut pool = NativePool::new(2, 64, 16);
+        assert!(!pool.is_full());
+        pool.insert(
+            Address::repeat_byte(1),
+            make_action(1, NativeAction::ClaimRewards),
+        )
+        .unwrap();
+        assert!(!pool.is_full());
+        pool.insert(
+            Address::repeat_byte(2),
+            make_action(2, NativeAction::ClaimRewards),
+        )
+        .unwrap();
+        assert!(pool.is_full());
     }
 
     #[test]

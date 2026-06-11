@@ -879,6 +879,94 @@ mod tests {
         handle.stop().unwrap();
     }
 
+    /// Sprint 5 Task 4: with the native pool at capacity, non-cancel actions
+    /// are shed after a decode-only pass (no signature verification spent),
+    /// while cancels still travel the full verify path so pool eviction
+    /// semantics are preserved.
+    #[tokio::test]
+    async fn pool_full_sheds_non_cancels_before_verify() {
+        let dir = TempDir::new().unwrap();
+        let state = StateDb::open(dir.path()).unwrap();
+        // Capacity 0: the pool is permanently "full" from the first submit.
+        let cfg = MempoolConfig {
+            native_pool_max_size: 0,
+            ..Default::default()
+        };
+        let mempool = Arc::new(Mempool::new(state.clone(), cfg));
+        let executor = Arc::new(EvmExecutor::new(TORUS_CHAIN_ID));
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
+        let mut server = RpcServer::new(
+            state,
+            mempool,
+            executor,
+            TORUS_CHAIN_ID,
+            100,
+            BlockNotifier::new(),
+        );
+        server.set_metrics(metrics.clone());
+        let (handle, addr) = server.start("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        use jsonrpsee::core::client::ClientT;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let key = k256::ecdsa::SigningKey::from_slice(
+            &hex::decode("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80")
+                .unwrap(),
+        )
+        .unwrap();
+        let mk = |action: torus_types::NativeAction, nonce: u64| {
+            let signed = torus_types::eip712::sign_native_action(action, nonce, &key);
+            format!("0x{}", hex::encode(serde_json::to_vec(&signed).unwrap()))
+        };
+        let batch = vec![
+            mk(torus_types::NativeAction::ClaimRewards, now_ms),
+            mk(
+                torus_types::NativeAction::CancelOrder { order_id: 7 },
+                now_ms + 1,
+            ),
+        ];
+
+        let results: Vec<RpcSubmitResult> = client
+            .request("torus_submitNativeActions", jsonrpsee::rpc_params![batch])
+            .await
+            .unwrap();
+        // Non-cancel: shed before signature verification.
+        assert_eq!(
+            results[0].error.as_deref(),
+            Some("mempool: pool full (pre-verify)"),
+            "non-cancel should be pre-verify shed: {:?}",
+            results[0]
+        );
+        // Cancel: full verify path, rejected at admission (nothing to evict).
+        assert!(
+            results[1]
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("native action pool full"),
+            "cancel should reach real admission: {:?}",
+            results[1]
+        );
+
+        let text = metrics.encode();
+        assert!(
+            text.contains(
+                r#"torus_rpc_submit_admit_rejects_total{reason="pool_full_preverify"} 1"#
+            ),
+            "pre-verify shed not counted; dump:\n{text}"
+        );
+        assert!(
+            text.contains(r#"torus_rpc_submit_admit_rejects_total{reason="pool_full"} 1"#),
+            "cancel admission reject not counted; dump:\n{text}"
+        );
+        handle.stop().unwrap();
+    }
+
     #[tokio::test]
     async fn leader_forward_gated_by_forward_bodies() {
         let now_ms = std::time::SystemTime::now()

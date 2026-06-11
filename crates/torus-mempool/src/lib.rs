@@ -27,6 +27,7 @@ fn now_ms() -> u64 {
 }
 
 pub use crate::error::MempoolError;
+pub use crate::native_pool::is_cancel;
 pub use crate::evm_pool::EvmPoolEntry;
 
 /// Mempool configuration.
@@ -434,6 +435,11 @@ impl Mempool {
     /// Current native pool size.
     pub fn native_pool_size(&self) -> usize {
         self.native.read().unwrap().size()
+    }
+
+    /// True when the native pool is at capacity (non-cancel admits will fail).
+    pub fn native_pool_is_full(&self) -> bool {
+        self.native.read().unwrap().is_full()
     }
 
     /// Look up a native action by its hash (for compact block reconstruction).

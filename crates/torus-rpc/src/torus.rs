@@ -232,6 +232,16 @@ pub(crate) fn verify_one_action(
     Ok((sender, action, action_bytes, hash))
 }
 
+/// Routing decision for one batch item, made before signature verification.
+/// `Proceed` payloads are consumed (`mem::take`) when handed to the verify
+/// closure; only the variant tag matters afterwards.
+enum SubmitSlot {
+    /// Pay full verification (normal path; cancels even when the pool is full).
+    Proceed(String),
+    /// Shed before crypto with this per-item error (reason already counted).
+    Rejected(String),
+}
+
 impl RpcState {
     /// Count one admission-path rejection under its concrete reason label.
     fn count_admit_reject(&self, reason: &str) {
@@ -734,6 +744,58 @@ impl TorusApiServer for RpcState {
                 .observe(permit_wait_t0.elapsed().as_secs_f64());
         }
 
+        // Sprint 5 (C): when the native pool is already full, non-cancel
+        // actions are doomed at admission — shed them after a decode-only
+        // pass instead of paying signature verification. Cancels proceed to
+        // full verification (admission evicts a non-cancel to make room).
+        let mut slots: Vec<SubmitSlot> = if self.mempool.native_pool_is_full() {
+            let screened = tokio::task::spawn_blocking(move || {
+                signed_actions
+                    .into_iter()
+                    .map(|signed_action| {
+                        let decoded = parse_bytes(&signed_action)
+                            .map_err(|e| format!("invalid hex: {e}"))
+                            .and_then(|bytes| {
+                                serde_json::from_slice::<torus_types::SignedNativeAction>(&bytes)
+                                    .map_err(|e| format!("invalid action encoding: {e}"))
+                            });
+                        match decoded {
+                            Ok(action) if torus_mempool::is_cancel(&action.action) => {
+                                SubmitSlot::Proceed(signed_action)
+                            }
+                            Ok(_) => SubmitSlot::Rejected(
+                                "mempool: pool full (pre-verify)".to_string(),
+                            ),
+                            Err(e) => SubmitSlot::Rejected(e),
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .await
+            .map_err(|e| {
+                ErrorObjectOwned::from(RpcError::Internal(format!("spawn_blocking: {e}")))
+            })?;
+            for slot in &screened {
+                if let SubmitSlot::Rejected(msg) = slot {
+                    self.count_admit_reject(if msg.ends_with("(pre-verify)") {
+                        "pool_full_preverify"
+                    } else {
+                        "verify_failed"
+                    });
+                }
+            }
+            screened
+        } else {
+            signed_actions.into_iter().map(SubmitSlot::Proceed).collect()
+        };
+        let to_verify: Vec<String> = slots
+            .iter_mut()
+            .filter_map(|slot| match slot {
+                SubmitSlot::Proceed(payload) => Some(std::mem::take(payload)),
+                SubmitSlot::Rejected(_) => None,
+            })
+            .collect();
+
         let state_db = self.state.clone();
         let chain_id = self.chain_id;
         let verify_t0 = std::time::Instant::now();
@@ -743,7 +805,7 @@ impl TorusApiServer for RpcState {
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("system clock before epoch")
                 .as_millis() as u64;
-            let out = signed_actions
+            let out = to_verify
                 .into_iter()
                 .map(|signed_action| {
                     verify_one_action(&signed_action, chain_id, &state_db, current_time_ms)
@@ -761,9 +823,23 @@ impl TorusApiServer for RpcState {
         }
 
         let admit_t0 = std::time::Instant::now();
-        let results = verified
+        let mut verified_iter = verified.into_iter();
+        let results = slots
             .into_iter()
-            .map(|item| match item {
+            .map(|slot| {
+                let item = match slot {
+                    // Pre-verify shed: reason already counted at prescreen.
+                    SubmitSlot::Rejected(msg) => {
+                        return RpcSubmitResult {
+                            hash: None,
+                            error: Some(msg),
+                        };
+                    }
+                    SubmitSlot::Proceed(_) => verified_iter
+                        .next()
+                        .expect("one verified result per proceed slot"),
+                };
+                match item {
                 Ok((sender, action, action_bytes, hash)) => {
                     match self.mempool.add_native_action_presigned(sender, action) {
                         Ok(()) => {
@@ -796,6 +872,7 @@ impl TorusApiServer for RpcState {
                         hash: None,
                         error: Some(msg),
                     }
+                }
                 }
             })
             .collect();
