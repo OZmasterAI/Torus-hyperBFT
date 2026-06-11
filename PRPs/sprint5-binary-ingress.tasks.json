@@ -1,0 +1,85 @@
+{
+  "prp": "sprint5-binary-ingress",
+  "created": "2026-06-11T10:49:15Z",
+  "plan": "docs/plans/sprint5-binary-ingress-impl.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "verify CPU histogram (split cpu from wall)",
+      "status": "pending",
+      "files": [
+        "crates/torus-telemetry/src/lib.rs",
+        "crates/torus-rpc/src/torus.rs",
+        "crates/torus-rpc/src/lib.rs"
+      ],
+      "validate": "cargo test -p torus-rpc submit_records_phase_histograms",
+      "depends_on": []
+    },
+    {
+      "id": 2,
+      "name": "verify_one_action micro-bench breakdown (bs 1/100/500)",
+      "status": "pending",
+      "files": [
+        "crates/torus-rpc/src/lib.rs"
+      ],
+      "validate": "cargo test -p torus-rpc verify_breakdown_by_batch_size -- --nocapture",
+      "depends_on": []
+    },
+    {
+      "id": 3,
+      "name": "admit drop-reason counters (IntCounterVec by reason)",
+      "status": "pending",
+      "files": [
+        "crates/torus-telemetry/src/lib.rs",
+        "crates/torus-rpc/src/torus.rs",
+        "crates/torus-rpc/src/lib.rs"
+      ],
+      "validate": "cargo test -p torus-rpc",
+      "depends_on": [1]
+    },
+    {
+      "id": 4,
+      "name": "pool-saturation pre-verify gate (decode-only fast reject, cancels exempt)",
+      "status": "pending",
+      "files": [
+        "crates/torus-mempool/src/lib.rs",
+        "crates/torus-mempool/src/native_pool.rs",
+        "crates/torus-rpc/src/torus.rs"
+      ],
+      "validate": "cargo test -p torus-rpc && cargo test -p torus-mempool",
+      "depends_on": [3]
+    },
+    {
+      "id": 5,
+      "name": "bincode hash-identity determinism test (gate for endpoint)",
+      "status": "pending",
+      "files": [
+        "crates/torus-rpc/src/lib.rs"
+      ],
+      "validate": "cargo test -p torus-rpc bincode_roundtrip_preserves_action_hash",
+      "depends_on": []
+    },
+    {
+      "id": 6,
+      "name": "torus_submitNativeActionsBin endpoint + shared submit pipeline",
+      "status": "pending",
+      "files": [
+        "crates/torus-rpc/src/torus.rs",
+        "crates/torus-rpc/src/lib.rs"
+      ],
+      "validate": "cargo test -p torus-rpc",
+      "depends_on": [1, 3, 4, 5]
+    },
+    {
+      "id": 7,
+      "name": "bench-throughput --format bin",
+      "status": "pending",
+      "files": [
+        "tools/bench-throughput/src/main.rs",
+        "tools/bench-throughput/Cargo.toml"
+      ],
+      "validate": "cargo build --release -p bench-throughput",
+      "depends_on": [6]
+    }
+  ]
+}
