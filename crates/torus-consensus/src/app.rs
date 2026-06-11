@@ -183,6 +183,10 @@ impl ExecutionContext {
             }
         }
 
+        // Exec-ceiling Option A: total timer starts AFTER the skip-check so
+        // restart-replayed (already-applied) blocks never pollute the distribution.
+        let block_timer = std::time::Instant::now();
+
         for slash in pending_slashes {
             match self.staking.slash(
                 slash.validator,
@@ -282,6 +286,7 @@ impl ExecutionContext {
             // One verification pass resolves every sender too (EIP-712 ecrecover or
             // session owner); `None` marks an invalid signature. Reused below so we
             // never recover the same action twice.
+            let verify_timer = std::time::Instant::now();
             let resolved_senders = if has_native {
                 torus_types::eip712::batch_verify_native_actions(
                     &torus_block.native_actions,
@@ -291,6 +296,9 @@ impl ExecutionContext {
             } else {
                 vec![]
             };
+            if let Some(ref m) = self.metrics {
+                m.exec_verify_seconds.observe(verify_timer.elapsed().as_secs_f64());
+            }
 
             let invalid_count = resolved_senders.iter().filter(|s| s.is_none()).count();
             if invalid_count > 0 {
@@ -312,6 +320,7 @@ impl ExecutionContext {
                 }
             }
 
+            let replay_guard_timer = std::time::Instant::now();
             let mut sender_actions = Vec::with_capacity(torus_block.native_actions.len());
             let mut consumed_nonces = Vec::new();
             // Defense-in-depth replay guard. The non-destructive mempool selection ×
@@ -347,6 +356,10 @@ impl ExecutionContext {
                 consumed_nonces.push((sender, signed.nonce));
                 sender_actions.push((sender, signed.action.clone()));
             }
+            if let Some(ref m) = self.metrics {
+                m.exec_replay_guard_seconds.observe(replay_guard_timer.elapsed().as_secs_f64());
+                m.native_actions_processed.inc_by(sender_actions.len() as u64);
+            }
 
             let overlay = NativeStateOverlay::new(self.state_db.clone());
             overlay.seed_from_bundle(&bundle);
@@ -365,14 +378,24 @@ impl ExecutionContext {
             );
             ctx.metrics = self.metrics.clone();
 
+            let engine_timer = std::time::Instant::now();
             NativeExecutor::execute_batch(&mut ctx, &pre_evm);
             NativeExecutor::execute_batch(&mut ctx, &post_evm);
             let _ = NativeExecutor::drain_core_writer(&mut ctx);
             NativeExecutor::process_governance(&mut ctx);
             NativeExecutor::distribute_fees(&mut ctx, computed_fee_revenue);
             NativeExecutor::process_epoch_boundary(&mut ctx);
-            ctx.save_order_books();
+            if let Some(ref m) = self.metrics {
+                m.exec_engine_seconds.observe(engine_timer.elapsed().as_secs_f64());
+            }
 
+            let save_books_timer = std::time::Instant::now();
+            ctx.save_order_books();
+            if let Some(ref m) = self.metrics {
+                m.exec_save_books_seconds.observe(save_books_timer.elapsed().as_secs_f64());
+            }
+
+            let flush_timer = std::time::Instant::now();
             for (sender, nonce) in &consumed_nonces {
                 let nonce_key = torus_state::cf::native_nonce_key(sender, *nonce);
                 let _ = overlay.put_cf_raw(
@@ -403,6 +426,9 @@ impl ExecutionContext {
             {
                 tracing::error!(%e, height, "failed to resync incremental trie after native post-commit");
             }
+            if let Some(ref m) = self.metrics {
+                m.exec_flush_seconds.observe(flush_timer.elapsed().as_secs_f64());
+            }
         }
 
         // ---- Persist block body for RPC queries ----
@@ -423,6 +449,7 @@ impl ExecutionContext {
             let tx_count = torus_block.header.evm_tx_count as u64
                 + torus_block.header.native_action_count as u64;
             m.block_transactions_count.observe(tx_count as f64);
+            m.exec_block_seconds.observe(block_timer.elapsed().as_secs_f64());
         }
 
         tracing::info!(height, "execution pipeline: block done");
@@ -433,6 +460,12 @@ fn execution_loop(rx: std::sync::mpsc::Receiver<CommittedBlockMsg>, ctx: Executi
     tracing::info!("execution pipeline thread started");
     while let Ok(msg) = rx.recv() {
         ctx.execute_committed_block(&msg.torus_block, msg.pending_slashes);
+        // Paired with the inc() at the `exec_tx.send` site: dec AFTER execution
+        // so the gauge counts queued + in-flight blocks (pinned near the channel
+        // bound 64 = execution is the bottleneck).
+        if let Some(ref m) = ctx.metrics {
+            m.exec_queue_depth.dec();
+        }
     }
     tracing::info!("execution pipeline thread shutting down");
 }
@@ -1190,6 +1223,10 @@ impl App<RocksKVStore> for TorusApp {
         };
         tracing::info!(parent_height = parent_header.height, local_height = self.last_header.height, "produce_block called (CTE)");
 
+        // Exec-ceiling Option A: wire the (previously dead) block_build_seconds —
+        // covers mempool selection, DA mirror, attestation, construction, encode.
+        let build_timer = std::time::Instant::now();
+
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -1286,6 +1323,10 @@ impl App<RocksKVStore> for TorusApp {
         let hash = Self::hash_datum(&encoded);
 
         let validator_set_updates = self.epoch_validator_set_updates(height);
+
+        if let Some(ref m) = self.metrics {
+            m.block_build_seconds.observe(build_timer.elapsed().as_secs_f64());
+        }
 
         ProduceBlockResponse {
             data_hash: CryptoHash::new(hash),
@@ -1559,8 +1600,16 @@ impl App<RocksKVStore> for TorusApp {
                 torus_block,
                 pending_slashes: self.pending_slashes.drain(..).collect(),
             };
+            // inc BEFORE the (possibly blocking) send so a consensus thread stalled
+            // on a full channel is visible as depth ≥ the bound, not hidden.
+            if let Some(ref m) = self.metrics {
+                m.exec_queue_depth.inc();
+            }
             if tx.send(msg).is_err() {
                 tracing::error!(height, "execution pipeline channel closed — block will not be executed!");
+                if let Some(ref m) = self.metrics {
+                    m.exec_queue_depth.dec();
+                }
             }
         }
     }
@@ -2125,6 +2174,45 @@ mod crash_recovery_tests {
             recorded.as_slice(),
             &1u64.to_be_bytes(),
             "replay guard must skip the second commit (nonce height stays 1)",
+        );
+    }
+
+    /// Exec-ceiling Option A: executing ONE native block must observe each
+    /// phase histogram exactly once and count the executed action, so the
+    /// live probe's per-phase sums decompose `exec_block_seconds` cleanly
+    /// (per-phase count == native-block count by design).
+    #[test]
+    fn exec_phase_histograms_observe_per_block() {
+        let (config, state_db) = make_test_config_and_db();
+        let mut exec_ctx = make_exec_ctx(&config, &state_db);
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
+        exec_ctx.metrics = Some(metrics.clone());
+
+        exec_ctx.execute_committed_block(&make_block(1, vec![sign_claim_rewards(7)]), vec![]);
+
+        let text = metrics.encode();
+        for name in [
+            "torus_exec_verify_seconds",
+            "torus_exec_replay_guard_seconds",
+            "torus_exec_engine_seconds",
+            "torus_exec_save_books_seconds",
+            "torus_exec_flush_seconds",
+            "torus_exec_block_seconds",
+        ] {
+            assert!(
+                text.contains(&format!("{name}_count 1")),
+                "{name} must observe exactly once per native block:\n{text}",
+            );
+        }
+        assert!(
+            text.contains("torus_native_actions_processed_total 1"),
+            "executed action must be counted:\n{text}",
+        );
+        // Direct synchronous call never touches the exec channel; the gauge's
+        // inc/dec sites live there and are verified by the live probe (Task 3).
+        assert!(
+            text.contains("torus_exec_queue_depth 0"),
+            "queue gauge must stay 0 on the direct-call path:\n{text}",
         );
     }
 
