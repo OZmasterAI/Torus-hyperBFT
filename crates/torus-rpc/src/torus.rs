@@ -136,6 +136,15 @@ pub trait TorusApi {
         signed_actions: Vec<String>,
     ) -> RpcResult<Vec<RpcSubmitResult>>;
 
+    /// Batch submission with bincode-encoded payloads (hex of bincode bytes).
+    /// Same pipeline and per-item semantics as `submitNativeActions`; action
+    /// identity stays the canonical-JSON keccak in both formats (Sprint 5).
+    #[method(name = "submitNativeActionsBin")]
+    async fn submit_native_actions_bin(
+        &self,
+        payloads: Vec<String>,
+    ) -> RpcResult<Vec<RpcSubmitResult>>;
+
     // --- 2.9.5: Governance ---
     #[method(name = "getProposal")]
     async fn get_proposal(&self, proposal_id: u64) -> RpcResult<Option<RpcProposal>>;
@@ -207,29 +216,56 @@ pub trait TorusApi {
 // Implementation
 // ============================================================================
 
+/// Ingress payload decoder: bytes (already hex-stripped) → signed action.
+/// One per wire format; everything downstream of decode is format-agnostic.
+type DecodeFn = fn(&[u8]) -> Result<torus_types::SignedNativeAction, String>;
+
+/// Canonical-JSON ingress (legacy `submitNativeActions`).
+fn decode_action_json(bytes: &[u8]) -> Result<torus_types::SignedNativeAction, String> {
+    serde_json::from_slice(bytes).map_err(|e| format!("invalid action encoding: {e}"))
+}
+
+/// bincode ingress (`submitNativeActionsBin`). Hash identity is unaffected:
+/// canonical bytes are re-derived via serde_json after decode.
+fn decode_action_bin(bytes: &[u8]) -> Result<torus_types::SignedNativeAction, String> {
+    bincode::deserialize(bytes).map_err(|e| format!("invalid action encoding: {e}"))
+}
+
 /// Parse + structurally validate + signature-verify one hex-encoded signed
 /// native action. Blocking-pool work (ecrecover); the batch endpoint runs a
 /// whole batch of these inside one `spawn_blocking`. Error is a per-item
 /// message, never a call-level failure.
-pub(crate) fn verify_one_action(
+fn verify_one_action_with(
+    decode: DecodeFn,
     signed_action: &str,
     chain_id: u64,
     state_db: &torus_state::StateDb,
     current_time_ms: u64,
 ) -> Result<(alloy_primitives::Address, torus_types::SignedNativeAction, Vec<u8>, alloy_primitives::B256), String> {
     let bytes = parse_bytes(signed_action).map_err(|e| format!("invalid hex: {e}"))?;
-    let action: torus_types::SignedNativeAction =
-        serde_json::from_slice(&bytes).map_err(|e| format!("invalid action encoding: {e}"))?;
+    let action = decode(&bytes)?;
     torus_mempool::rate_limit::validate_batch_size(&action.action)?;
     let sender = action
         .validate_with_sessions(current_time_ms, chain_id, |pubkey| {
             state_db.get_session(pubkey).ok().flatten()
         })
         .map_err(|e| format!("signature verification failed: {e}"))?;
+    // Canonical bytes stay serde_json regardless of ingress format: the
+    // action hash, gossip body, and leader-forward payload all derive here.
     let action_bytes =
         serde_json::to_vec(&action).map_err(|e| format!("serialize action: {e}"))?;
     let hash = keccak256(&action_bytes);
     Ok((sender, action, action_bytes, hash))
+}
+
+/// JSON-ingress wrapper kept for the single-action endpoint and tests.
+pub(crate) fn verify_one_action(
+    signed_action: &str,
+    chain_id: u64,
+    state_db: &torus_state::StateDb,
+    current_time_ms: u64,
+) -> Result<(alloy_primitives::Address, torus_types::SignedNativeAction, Vec<u8>, alloy_primitives::B256), String> {
+    verify_one_action_with(decode_action_json, signed_action, chain_id, state_db, current_time_ms)
 }
 
 /// Routing decision for one batch item, made before signature verification.
@@ -250,6 +286,182 @@ impl RpcState {
                 .get_or_create(&vec![("reason".into(), reason.into())])
                 .inc();
         }
+    }
+
+    /// Shared batch-submit pipeline: cap check → permit → pool-full prescreen
+    /// (decode-only shed) → blocking-pool verify → admit + leader-forward.
+    /// `decode` fixes the wire format; everything downstream is format-agnostic.
+    async fn run_submit_pipeline(
+        &self,
+        signed_actions: Vec<String>,
+        decode: DecodeFn,
+    ) -> RpcResult<Vec<RpcSubmitResult>> {
+        if signed_actions.len() > crate::SUBMIT_BATCH_MAX {
+            return Err(ErrorObjectOwned::from(RpcError::InvalidParams(format!(
+                "batch too large: {} > {}",
+                signed_actions.len(),
+                crate::SUBMIT_BATCH_MAX
+            ))));
+        }
+        // One permit covers the whole batch — that's the amortization: the
+        // permit bounds concurrent blocking-pool verify tasks, and the batch
+        // runs as exactly one such task.
+        let permit_wait_t0 = std::time::Instant::now();
+        let _permit = crate::acquire_submit_permit(&self.submit_semaphore)
+            .await
+            .ok_or_else(|| {
+                ErrorObjectOwned::from(RpcError::Internal("server overloaded, try again".into()))
+            })?;
+        if let Some(ref m) = self.metrics {
+            m.rpc_submit_permit_wait_seconds
+                .observe(permit_wait_t0.elapsed().as_secs_f64());
+        }
+
+        // Sprint 5 (C): when the native pool is already full, non-cancel
+        // actions are doomed at admission — shed them after a decode-only
+        // pass instead of paying signature verification. Cancels proceed to
+        // full verification (admission evicts a non-cancel to make room).
+        let mut slots: Vec<SubmitSlot> = if self.mempool.native_pool_is_full() {
+            let screened = tokio::task::spawn_blocking(move || {
+                signed_actions
+                    .into_iter()
+                    .map(|signed_action| {
+                        let decoded = parse_bytes(&signed_action)
+                            .map_err(|e| format!("invalid hex: {e}"))
+                            .and_then(|bytes| decode(&bytes));
+                        match decoded {
+                            Ok(action) if torus_mempool::is_cancel(&action.action) => {
+                                SubmitSlot::Proceed(signed_action)
+                            }
+                            Ok(_) => SubmitSlot::Rejected(
+                                "mempool: pool full (pre-verify)".to_string(),
+                            ),
+                            Err(e) => SubmitSlot::Rejected(e),
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .await
+            .map_err(|e| {
+                ErrorObjectOwned::from(RpcError::Internal(format!("spawn_blocking: {e}")))
+            })?;
+            for slot in &screened {
+                if let SubmitSlot::Rejected(msg) = slot {
+                    self.count_admit_reject(if msg.ends_with("(pre-verify)") {
+                        "pool_full_preverify"
+                    } else {
+                        "verify_failed"
+                    });
+                }
+            }
+            screened
+        } else {
+            signed_actions.into_iter().map(SubmitSlot::Proceed).collect()
+        };
+        let to_verify: Vec<String> = slots
+            .iter_mut()
+            .filter_map(|slot| match slot {
+                SubmitSlot::Proceed(payload) => Some(std::mem::take(payload)),
+                SubmitSlot::Rejected(_) => None,
+            })
+            .collect();
+
+        let state_db = self.state.clone();
+        let chain_id = self.chain_id;
+        let verify_t0 = std::time::Instant::now();
+        let (verified, verify_cpu) = tokio::task::spawn_blocking(move || {
+            let cpu_t0 = std::time::Instant::now();
+            let current_time_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock before epoch")
+                .as_millis() as u64;
+            let out = to_verify
+                .into_iter()
+                .map(|signed_action| {
+                    verify_one_action_with(
+                        decode,
+                        &signed_action,
+                        chain_id,
+                        &state_db,
+                        current_time_ms,
+                    )
+                })
+                .collect::<Vec<_>>();
+            (out, cpu_t0.elapsed())
+        })
+        .await
+        .map_err(|e| ErrorObjectOwned::from(RpcError::Internal(format!("spawn_blocking: {e}"))))?;
+        if let Some(ref m) = self.metrics {
+            m.rpc_submit_verify_seconds
+                .observe(verify_t0.elapsed().as_secs_f64());
+            m.rpc_submit_verify_cpu_seconds
+                .observe(verify_cpu.as_secs_f64());
+        }
+
+        let admit_t0 = std::time::Instant::now();
+        let mut verified_iter = verified.into_iter();
+        let results = slots
+            .into_iter()
+            .map(|slot| {
+                let item = match slot {
+                    // Pre-verify shed: reason already counted at prescreen.
+                    SubmitSlot::Rejected(msg) => {
+                        return RpcSubmitResult {
+                            hash: None,
+                            error: Some(msg),
+                        };
+                    }
+                    SubmitSlot::Proceed(_) => verified_iter
+                        .next()
+                        .expect("one verified result per proceed slot"),
+                };
+                match item {
+                    Ok((sender, action, action_bytes, hash)) => {
+                        match self.mempool.add_native_action_presigned(sender, action) {
+                            Ok(()) => {
+                                self.forward_to_leader(&sender, &action_bytes);
+                                RpcSubmitResult {
+                                    hash: Some(hex_b256(hash)),
+                                    error: None,
+                                }
+                            }
+                            Err(e) => {
+                                self.count_admit_reject(match &e {
+                                    torus_mempool::MempoolError::DuplicateNativeAction => {
+                                        "duplicate"
+                                    }
+                                    torus_mempool::MempoolError::NativeSenderQueueFull { .. } => {
+                                        "sender_queue_full"
+                                    }
+                                    torus_mempool::MempoolError::NativePoolFull => "pool_full",
+                                    torus_mempool::MempoolError::RateLimited { .. } => {
+                                        "rate_limited"
+                                    }
+                                    _ => "other",
+                                });
+                                RpcSubmitResult {
+                                    hash: None,
+                                    error: Some(format!("mempool: {e}")),
+                                }
+                            }
+                        }
+                    }
+                    Err(msg) => {
+                        self.count_admit_reject("verify_failed");
+                        RpcSubmitResult {
+                            hash: None,
+                            error: Some(msg),
+                        }
+                    }
+                }
+            })
+            .collect();
+        if let Some(ref m) = self.metrics {
+            m.rpc_submit_admit_seconds
+                .observe(admit_t0.elapsed().as_secs_f64());
+        }
+
+        Ok(results)
     }
 
     /// Direct-to-leader forwarding tail shared by the single and batch submit
@@ -723,165 +935,15 @@ impl TorusApiServer for RpcState {
         &self,
         signed_actions: Vec<String>,
     ) -> RpcResult<Vec<RpcSubmitResult>> {
-        if signed_actions.len() > crate::SUBMIT_BATCH_MAX {
-            return Err(ErrorObjectOwned::from(RpcError::InvalidParams(format!(
-                "batch too large: {} > {}",
-                signed_actions.len(),
-                crate::SUBMIT_BATCH_MAX
-            ))));
-        }
-        // One permit covers the whole batch — that's the amortization: the
-        // permit bounds concurrent blocking-pool verify tasks, and the batch
-        // runs as exactly one such task.
-        let permit_wait_t0 = std::time::Instant::now();
-        let _permit = crate::acquire_submit_permit(&self.submit_semaphore)
+        self.run_submit_pipeline(signed_actions, decode_action_json)
             .await
-            .ok_or_else(|| {
-                ErrorObjectOwned::from(RpcError::Internal("server overloaded, try again".into()))
-            })?;
-        if let Some(ref m) = self.metrics {
-            m.rpc_submit_permit_wait_seconds
-                .observe(permit_wait_t0.elapsed().as_secs_f64());
-        }
+    }
 
-        // Sprint 5 (C): when the native pool is already full, non-cancel
-        // actions are doomed at admission — shed them after a decode-only
-        // pass instead of paying signature verification. Cancels proceed to
-        // full verification (admission evicts a non-cancel to make room).
-        let mut slots: Vec<SubmitSlot> = if self.mempool.native_pool_is_full() {
-            let screened = tokio::task::spawn_blocking(move || {
-                signed_actions
-                    .into_iter()
-                    .map(|signed_action| {
-                        let decoded = parse_bytes(&signed_action)
-                            .map_err(|e| format!("invalid hex: {e}"))
-                            .and_then(|bytes| {
-                                serde_json::from_slice::<torus_types::SignedNativeAction>(&bytes)
-                                    .map_err(|e| format!("invalid action encoding: {e}"))
-                            });
-                        match decoded {
-                            Ok(action) if torus_mempool::is_cancel(&action.action) => {
-                                SubmitSlot::Proceed(signed_action)
-                            }
-                            Ok(_) => SubmitSlot::Rejected(
-                                "mempool: pool full (pre-verify)".to_string(),
-                            ),
-                            Err(e) => SubmitSlot::Rejected(e),
-                        }
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .await
-            .map_err(|e| {
-                ErrorObjectOwned::from(RpcError::Internal(format!("spawn_blocking: {e}")))
-            })?;
-            for slot in &screened {
-                if let SubmitSlot::Rejected(msg) = slot {
-                    self.count_admit_reject(if msg.ends_with("(pre-verify)") {
-                        "pool_full_preverify"
-                    } else {
-                        "verify_failed"
-                    });
-                }
-            }
-            screened
-        } else {
-            signed_actions.into_iter().map(SubmitSlot::Proceed).collect()
-        };
-        let to_verify: Vec<String> = slots
-            .iter_mut()
-            .filter_map(|slot| match slot {
-                SubmitSlot::Proceed(payload) => Some(std::mem::take(payload)),
-                SubmitSlot::Rejected(_) => None,
-            })
-            .collect();
-
-        let state_db = self.state.clone();
-        let chain_id = self.chain_id;
-        let verify_t0 = std::time::Instant::now();
-        let (verified, verify_cpu) = tokio::task::spawn_blocking(move || {
-            let cpu_t0 = std::time::Instant::now();
-            let current_time_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system clock before epoch")
-                .as_millis() as u64;
-            let out = to_verify
-                .into_iter()
-                .map(|signed_action| {
-                    verify_one_action(&signed_action, chain_id, &state_db, current_time_ms)
-                })
-                .collect::<Vec<_>>();
-            (out, cpu_t0.elapsed())
-        })
-        .await
-        .map_err(|e| ErrorObjectOwned::from(RpcError::Internal(format!("spawn_blocking: {e}"))))?;
-        if let Some(ref m) = self.metrics {
-            m.rpc_submit_verify_seconds
-                .observe(verify_t0.elapsed().as_secs_f64());
-            m.rpc_submit_verify_cpu_seconds
-                .observe(verify_cpu.as_secs_f64());
-        }
-
-        let admit_t0 = std::time::Instant::now();
-        let mut verified_iter = verified.into_iter();
-        let results = slots
-            .into_iter()
-            .map(|slot| {
-                let item = match slot {
-                    // Pre-verify shed: reason already counted at prescreen.
-                    SubmitSlot::Rejected(msg) => {
-                        return RpcSubmitResult {
-                            hash: None,
-                            error: Some(msg),
-                        };
-                    }
-                    SubmitSlot::Proceed(_) => verified_iter
-                        .next()
-                        .expect("one verified result per proceed slot"),
-                };
-                match item {
-                Ok((sender, action, action_bytes, hash)) => {
-                    match self.mempool.add_native_action_presigned(sender, action) {
-                        Ok(()) => {
-                            self.forward_to_leader(&sender, &action_bytes);
-                            RpcSubmitResult {
-                                hash: Some(hex_b256(hash)),
-                                error: None,
-                            }
-                        }
-                        Err(e) => {
-                            self.count_admit_reject(match &e {
-                                torus_mempool::MempoolError::DuplicateNativeAction => "duplicate",
-                                torus_mempool::MempoolError::NativeSenderQueueFull { .. } => {
-                                    "sender_queue_full"
-                                }
-                                torus_mempool::MempoolError::NativePoolFull => "pool_full",
-                                torus_mempool::MempoolError::RateLimited { .. } => "rate_limited",
-                                _ => "other",
-                            });
-                            RpcSubmitResult {
-                                hash: None,
-                                error: Some(format!("mempool: {e}")),
-                            }
-                        }
-                    }
-                }
-                Err(msg) => {
-                    self.count_admit_reject("verify_failed");
-                    RpcSubmitResult {
-                        hash: None,
-                        error: Some(msg),
-                    }
-                }
-                }
-            })
-            .collect();
-        if let Some(ref m) = self.metrics {
-            m.rpc_submit_admit_seconds
-                .observe(admit_t0.elapsed().as_secs_f64());
-        }
-
-        Ok(results)
+    async fn submit_native_actions_bin(
+        &self,
+        payloads: Vec<String>,
+    ) -> RpcResult<Vec<RpcSubmitResult>> {
+        self.run_submit_pipeline(payloads, decode_action_bin).await
     }
 
     // === 2.9.5: Governance ===

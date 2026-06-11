@@ -943,6 +943,74 @@ mod tests {
         }
     }
 
+    /// Sprint 5 Task 6: the bincode endpoint returns the same canonical-JSON
+    /// keccak hash as the legacy path, fails per-item on undecodable payloads,
+    /// and enforces the shared batch cap.
+    #[tokio::test]
+    async fn submit_native_actions_bin_endpoint() {
+        let (_dir, state, mempool, executor) = setup();
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
+        let mut server = RpcServer::new(
+            state,
+            mempool.clone(),
+            executor,
+            TORUS_CHAIN_ID,
+            100,
+            BlockNotifier::new(),
+        );
+        server.set_metrics(metrics.clone());
+        let (handle, addr) = server.start("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        use jsonrpsee::core::client::ClientT;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let key = k256::ecdsa::SigningKey::from_slice(
+            &hex::decode("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80")
+                .unwrap(),
+        )
+        .unwrap();
+        let signed = torus_types::eip712::sign_native_action(
+            torus_types::NativeAction::ClaimRewards,
+            now_ms,
+            &key,
+        );
+        let expected =
+            alloy_primitives::keccak256(&serde_json::to_vec(&signed).unwrap());
+        let bin_payload = format!("0x{}", hex::encode(bincode::serialize(&signed).unwrap()));
+
+        let results: Vec<RpcSubmitResult> = client
+            .request(
+                "torus_submitNativeActionsBin",
+                jsonrpsee::rpc_params![vec![bin_payload, "0xdeadbeef".to_string()]],
+            )
+            .await
+            .unwrap();
+        // Hash identity: bin ingress yields the canonical-JSON keccak.
+        use std::str::FromStr;
+        let got =
+            alloy_primitives::B256::from_str(results[0].hash.as_ref().expect("admitted"))
+                .unwrap();
+        assert_eq!(got, expected, "bin-path hash != canonical JSON hash");
+        assert_eq!(mempool.native_pool_size(), 1, "valid bin action admitted");
+        // Garbage bincode: per-item error, call still succeeds.
+        assert!(results[1].hash.is_none() && results[1].error.is_some());
+        // Batch cap applies to the bin endpoint too.
+        let oversize: Vec<String> = (0..101).map(|_| "0x00".to_string()).collect();
+        let over = client
+            .request::<Vec<RpcSubmitResult>, _>(
+                "torus_submitNativeActionsBin",
+                jsonrpsee::rpc_params![oversize],
+            )
+            .await;
+        assert!(over.is_err(), "oversize batch must be a call-level error");
+        handle.stop().unwrap();
+    }
+
     /// Sprint 5 Task 4: with the native pool at capacity, non-cancel actions
     /// are shed after a decode-only pass (no signature verification spent),
     /// while cancels still travel the full verify path so pool eviction
