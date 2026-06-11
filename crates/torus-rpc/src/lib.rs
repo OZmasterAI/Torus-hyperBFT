@@ -879,6 +879,70 @@ mod tests {
         handle.stop().unwrap();
     }
 
+    /// Sprint 5 Task 5: ingress format determinism — the action hash is
+    /// keccak256 of the canonical serde_json bytes; a bincode round-trip must
+    /// reproduce the exact same hash for every action shape (gates the
+    /// torus_submitNativeActionsBin endpoint). Also asserts the wire size win.
+    #[test]
+    fn bincode_roundtrip_preserves_action_hash() {
+        let key = k256::ecdsa::SigningKey::from_slice(
+            &hex::decode("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80")
+                .unwrap(),
+        )
+        .unwrap();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let order = |i: usize, coid: Option<u64>| torus_types::PlaceOrderParams {
+            market_id: 1,
+            is_buy: i % 2 == 0,
+            price: torus_types::FixedPoint::from_raw(1_000_000_000 + i as i128),
+            quantity: torus_types::FixedPoint::from_raw(100_000_000),
+            order_type: torus_types::OrderType::Limit,
+            time_in_force: torus_types::TimeInForce::GTC,
+            reduce_only: false,
+            client_order_id: coid,
+        };
+        let cases: Vec<torus_types::NativeAction> = vec![
+            torus_types::NativeAction::ClaimRewards,
+            // Option::None exercises the human-readable/binary serde split.
+            torus_types::NativeAction::PlaceOrder(order(0, None)),
+            torus_types::NativeAction::PlaceOrderBatch(
+                (0..500).map(|i| order(i, Some(i as u64))).collect(),
+            ),
+            torus_types::NativeAction::CancelOrder { order_id: 7 },
+            torus_types::NativeAction::ModifyOrder {
+                order_id: 9,
+                new_price: Some(torus_types::FixedPoint::from_raw(2_000_000_000)),
+                new_qty: None,
+            },
+        ];
+        for action in cases {
+            let label = format!("{action:?}");
+            let signed = torus_types::eip712::sign_native_action(action, now_ms, &key);
+            let json = serde_json::to_vec(&signed).unwrap();
+            let json_hash = alloy_primitives::keccak256(&json);
+
+            let wire = bincode::serialize(&signed).unwrap();
+            let back: torus_types::SignedNativeAction = bincode::deserialize(&wire).unwrap();
+            let bin_hash = alloy_primitives::keccak256(&serde_json::to_vec(&back).unwrap());
+
+            assert_eq!(
+                json_hash, bin_hash,
+                "hash identity diverged after bincode round-trip: {}",
+                &label[..label.len().min(60)]
+            );
+            assert!(
+                wire.len() < json.len(),
+                "bincode not smaller ({} >= {}): {}",
+                wire.len(),
+                json.len(),
+                &label[..label.len().min(60)]
+            );
+        }
+    }
+
     /// Sprint 5 Task 4: with the native pool at capacity, non-cancel actions
     /// are shed after a decode-only pass (no signature verification spent),
     /// while cancels still travel the full verify path so pool eviction

@@ -23,6 +23,7 @@ alloy-consensus = { workspace = true }
 alloy-eips = { workspace = true }
 tracing = { workspace = true }
 borsh = { workspace = true }
+bincode = { workspace = true }
 rocksdb = { workspace = true }
 hex = "0.4"
 thiserror = "2"
