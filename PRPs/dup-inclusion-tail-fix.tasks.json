@@ -1,0 +1,38 @@
+{
+  "prp": "dup-inclusion-tail-fix",
+  "created": "2026-06-12T01:02:00",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "InFlightHashLedger struct + unit tests (RED->GREEN)",
+      "status": "pending",
+      "files": ["crates/torus-consensus/src/app.rs"],
+      "validate": "nice -n19 cargo test -p torus-consensus --lib in_flight_ledger -j2",
+      "depends_on": []
+    },
+    {
+      "id": 2,
+      "name": "Wire ledger into produce_block/validate_block/on_committed_block + selection seam test",
+      "status": "pending",
+      "files": ["crates/torus-consensus/src/app.rs"],
+      "validate": "nice -n19 cargo test -p torus-consensus --lib -j2",
+      "depends_on": [1]
+    },
+    {
+      "id": 3,
+      "name": "Full suite + clippy",
+      "status": "pending",
+      "files": [],
+      "validate": "nice -n19 cargo test -p torus-consensus --lib -j2 && nice -n19 cargo test -p torus-mempool --lib -j2 && cargo clippy -p torus-consensus -- -D warnings",
+      "depends_on": [2]
+    },
+    {
+      "id": 4,
+      "name": "Commit",
+      "status": "pending",
+      "files": ["crates/torus-consensus/src/app.rs", "docs/plans/dup-inclusion-tail-fix.md", "docs/plans/dup-inclusion-tail-fix-impl.md", "PRPs/dup-inclusion-tail-fix.tasks.json"],
+      "validate": "git log --oneline -1",
+      "depends_on": [3]
+    }
+  ]
+}

@@ -479,6 +479,36 @@ use crate::kv_store::RocksKVStore;
 /// `produce_block`: drains mempool, builds raw tx list, NO execution.
 /// `validate_block`: structural + signature checks only, NO execution.
 /// `on_committed_block`: sends finalized blocks to the execution pipeline thread.
+/// In-flight native-action hashes by height — every proposal seen (ours and
+/// other leaders'), INCLUDING compact proposals whose bodies could not be
+/// reconstructed (`MissingData`), which `pending_proposals` cannot track
+/// because it stores full bodies. Same-height re-proposals union instead of
+/// overwrite. Heights are evicted by the same h+10 sliding window as
+/// `pending_proposals` and cleared on commit. Closes the duplicate-inclusion
+/// tail (factor 1.08–1.27 measured s355, mem c0f4f938) left by
+/// body-dependent tracking.
+#[derive(Default)]
+struct InFlightHashLedger {
+    by_height: std::collections::HashMap<u64, std::collections::HashSet<torus_types::B256>>,
+}
+
+impl InFlightHashLedger {
+    fn note<I: IntoIterator<Item = torus_types::B256>>(&mut self, height: u64, hashes: I) {
+        self.by_height.entry(height).or_default().extend(hashes);
+        self.by_height.retain(|&h, _| h + 10 > height);
+    }
+
+    fn clear(&mut self, height: u64) {
+        self.by_height.remove(&height);
+    }
+
+    fn extend_into(&self, out: &mut std::collections::HashSet<torus_types::B256>) {
+        for hashes in self.by_height.values() {
+            out.extend(hashes.iter().copied());
+        }
+    }
+}
+
 pub struct TorusApp {
     #[allow(dead_code)]
     state_db: StateDb,
@@ -497,6 +527,7 @@ pub struct TorusApp {
     cached_vs_updates: Option<(u64, Option<ValidatorSetUpdates>)>,
     pending_slashes: Vec<PendingSlash>,
     pending_proposals: std::collections::HashMap<u64, TorusBlock>,
+    in_flight_hashes: InFlightHashLedger,
     #[allow(dead_code)]
     treasury_address: Address,
     #[allow(dead_code)]
@@ -715,6 +746,7 @@ impl TorusApp {
             cached_vs_updates: None,
             pending_slashes: Vec::new(),
             pending_proposals: std::collections::HashMap::new(),
+            in_flight_hashes: InFlightHashLedger::default(),
             treasury_address: config.treasury_address,
             dev_pool_address: config.dev_pool_address,
             signing_key,
@@ -1243,11 +1275,15 @@ impl App<RocksKVStore> for TorusApp {
             // does not re-select them for N+1/N+2 before N commits and calls
             // `remove_committed_native` — the root cause of duplicate native inclusion
             // (memory 282f9818). `pending_proposals` is exactly that in-flight window.
-            let in_flight: std::collections::HashSet<torus_types::B256> = self
+            let mut in_flight: std::collections::HashSet<torus_types::B256> = self
                 .pending_proposals
                 .values()
                 .flat_map(|b| b.native_actions.iter().map(torus_types::compute_action_hash))
                 .collect();
+            // Union the hash ledger: covers compact proposals whose bodies never
+            // reconstructed (MissingData) — absent from `pending_proposals` but
+            // still in flight on the wire (s355 duplicate-inclusion tail).
+            self.in_flight_hashes.extend_into(&mut in_flight);
             let native = mempool.select_native_for_block_with_senders_excluding(
                 torus_mempool::rate_limit::NATIVE_TOTAL_BLOCK_CAP,
                 &in_flight,
@@ -1317,9 +1353,17 @@ impl App<RocksKVStore> for TorusApp {
             }
         }
 
+        // Note our own block's hashes too: a same-height re-proposal would
+        // overwrite the `pending_proposals` entry and silently untrack these.
+        let own_hashes: Vec<torus_types::B256> = block
+            .native_actions
+            .iter()
+            .map(torus_types::compute_action_hash)
+            .collect();
         let encoded = encode_proposal_datum(&block, COMPACT_PROPOSALS);
         self.pending_proposals.insert(height, block);
         self.pending_proposals.retain(|&h, _| h + 10 > height);
+        self.in_flight_hashes.note(height, own_hashes);
         let hash = Self::hash_datum(&encoded);
 
         let validator_set_updates = self.epoch_validator_set_updates(height);
@@ -1374,6 +1418,14 @@ impl App<RocksKVStore> for TorusApp {
                 native_hashes = compact.native_action_hashes.len(),
                 "validate_block: CompactBlock fallback"
             );
+
+            // Track these hashes BEFORE attempting reconstruction: if bodies are
+            // missing (MissingData below) this proposal never reaches
+            // `pending_proposals`, yet its actions are in flight on the wire — the
+            // next leader must still exclude them from selection or they are
+            // re-included 2–4x (the s355 duplicate-inclusion tail, mem c0f4f938).
+            self.in_flight_hashes
+                .note(compact.header.height, compact.native_action_hashes.iter().copied());
 
             let native_actions = if compact.native_action_hashes.is_empty() {
                 vec![]
@@ -1544,6 +1596,9 @@ impl App<RocksKVStore> for TorusApp {
             };
 
         let height = header.height;
+        // Committed: these hashes leave the in-flight window. The mempool prunes
+        // them via `remove_committed_native` further down this path.
+        self.in_flight_hashes.clear(height);
 
         // Track committed consensus height/view from the header regardless of body
         // availability (BFT finality is independent of local execution readiness).
@@ -1659,6 +1714,60 @@ impl App<RocksKVStore> for TorusApp {
             rolled_back_block = ?block,
             "speculative rollback complete (no state to revert in CTE model)"
         );
+    }
+}
+
+#[cfg(test)]
+mod in_flight_ledger_tests {
+    use super::*;
+    use torus_types::B256;
+
+    fn h(n: u8) -> B256 {
+        B256::from([n; 32])
+    }
+
+    #[test]
+    fn in_flight_ledger_notes_and_unions_per_height() {
+        let mut ledger = InFlightHashLedger::default();
+        ledger.note(5, [h(1), h(2)]);
+        ledger.note(5, [h(2), h(3)]); // same-height re-proposal unions, not overwrites
+        let mut out = std::collections::HashSet::new();
+        ledger.extend_into(&mut out);
+        assert_eq!(out, [h(1), h(2), h(3)].into_iter().collect());
+    }
+
+    #[test]
+    fn in_flight_ledger_window_evicts_old_heights() {
+        let mut ledger = InFlightHashLedger::default();
+        ledger.note(1, [h(1)]);
+        ledger.note(11, [h(2)]); // 1 + 10 > 11 is false -> height 1 evicted
+        let mut out = std::collections::HashSet::new();
+        ledger.extend_into(&mut out);
+        assert_eq!(out, [h(2)].into_iter().collect());
+    }
+
+    #[test]
+    fn in_flight_ledger_commit_clear() {
+        let mut ledger = InFlightHashLedger::default();
+        ledger.note(5, [h(1)]);
+        ledger.note(6, [h(2)]);
+        ledger.clear(5);
+        let mut out = std::collections::HashSet::new();
+        ledger.extend_into(&mut out);
+        assert_eq!(out, [h(2)].into_iter().collect());
+    }
+
+    #[test]
+    fn in_flight_ledger_extends_selection_exclusion_set() {
+        // produce_block builds the exclusion set from pending_proposals bodies,
+        // then unions the ledger (compact proposals whose bodies never
+        // reconstructed). Both sources must land in the final set handed to
+        // select_native_for_block_with_senders_excluding.
+        let mut in_flight: std::collections::HashSet<B256> = [h(1)].into_iter().collect();
+        let mut ledger = InFlightHashLedger::default();
+        ledger.note(7, [h(2)]);
+        ledger.extend_into(&mut in_flight);
+        assert!(in_flight.contains(&h(1)) && in_flight.contains(&h(2)));
     }
 }
 
