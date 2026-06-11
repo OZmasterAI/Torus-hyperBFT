@@ -1,0 +1,46 @@
+{
+  "prp": "ingress-verify-fix",
+  "created": "2026-06-11T16:55:00Z",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Order-pinning test for parallel verify (GREEN-first guard)",
+      "status": "pending",
+      "files": ["crates/torus-rpc/src/lib.rs"],
+      "validate": "cargo test -p torus-rpc submit_batch_order_preserved",
+      "depends_on": []
+    },
+    {
+      "id": 2,
+      "name": "par_iter the verify closure + verify_cpu doc fix",
+      "status": "pending",
+      "files": [
+        "crates/torus-rpc/Cargo.toml",
+        "crates/torus-rpc/src/torus.rs",
+        "crates/torus-telemetry/src/lib.rs"
+      ],
+      "validate": "cargo test -p torus-rpc",
+      "depends_on": [1]
+    },
+    {
+      "id": 3,
+      "name": "Admit sub-timers (insert/forward histograms)",
+      "status": "pending",
+      "files": [
+        "crates/torus-telemetry/src/lib.rs",
+        "crates/torus-rpc/src/torus.rs",
+        "crates/torus-rpc/src/lib.rs"
+      ],
+      "validate": "cargo test -p torus-telemetry -p torus-rpc",
+      "depends_on": []
+    },
+    {
+      "id": 4,
+      "name": "Live bs500 probe rerun + delta verdict",
+      "status": "pending",
+      "files": ["docs/plans/ingress-verify-fix.md"],
+      "validate": "python3 devnet/scripts/exec_phase_table.py testnet/sweep-s352/metrics-baseline.txt testnet/sweep-s352/metrics-post.txt",
+      "depends_on": [1, 2, 3]
+    }
+  ]
+}
