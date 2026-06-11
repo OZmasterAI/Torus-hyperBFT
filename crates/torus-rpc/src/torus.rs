@@ -370,13 +370,19 @@ impl RpcState {
         let chain_id = self.chain_id;
         let verify_t0 = std::time::Instant::now();
         let (verified, verify_cpu) = tokio::task::spawn_blocking(move || {
+            // Option A (ingress-verify-fix): verify the batch in PARALLEL —
+            // per-action cost is ~70ms CPU at bs500, so a serial loop made the
+            // ack RTT scale with batch size. collect() preserves index order,
+            // which the per-item result alignment below depends on (pinned by
+            // submit_batch_order_preserved_with_interleaved_failures).
+            use rayon::prelude::*;
             let cpu_t0 = std::time::Instant::now();
             let current_time_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("system clock before epoch")
                 .as_millis() as u64;
             let out = to_verify
-                .into_iter()
+                .into_par_iter()
                 .map(|signed_action| {
                     verify_one_action_with(
                         decode,
@@ -399,6 +405,10 @@ impl RpcState {
         }
 
         let admit_t0 = std::time::Instant::now();
+        // Sub-phase accumulators (Option A): split admit into mempool insert
+        // vs leader-forward so the probe can name the next bottleneck.
+        let mut insert_dur = std::time::Duration::ZERO;
+        let mut forward_dur = std::time::Duration::ZERO;
         let mut verified_iter = verified.into_iter();
         let results = slots
             .into_iter()
@@ -417,9 +427,14 @@ impl RpcState {
                 };
                 match item {
                     Ok((sender, action, action_bytes, hash)) => {
-                        match self.mempool.add_native_action_presigned(sender, action) {
+                        let insert_t0 = std::time::Instant::now();
+                        let admitted = self.mempool.add_native_action_presigned(sender, action);
+                        insert_dur += insert_t0.elapsed();
+                        match admitted {
                             Ok(()) => {
+                                let forward_t0 = std::time::Instant::now();
                                 self.forward_to_leader(&sender, &action_bytes);
+                                forward_dur += forward_t0.elapsed();
                                 RpcSubmitResult {
                                     hash: Some(hex_b256(hash)),
                                     error: None,
@@ -459,6 +474,10 @@ impl RpcState {
         if let Some(ref m) = self.metrics {
             m.rpc_submit_admit_seconds
                 .observe(admit_t0.elapsed().as_secs_f64());
+            m.rpc_submit_admit_insert_seconds
+                .observe(insert_dur.as_secs_f64());
+            m.rpc_submit_admit_forward_seconds
+                .observe(forward_dur.as_secs_f64());
         }
 
         Ok(results)

@@ -679,6 +679,70 @@ mod tests {
         handle.stop().unwrap();
     }
 
+    /// Option A (ingress-verify-fix): per-item result ORDER is pinned with
+    /// failures interleaved at fixed indexes, so the parallel verify swap
+    /// (rayon par_iter) can never silently reorder or misalign results.
+    #[tokio::test]
+    async fn submit_batch_order_preserved_with_interleaved_failures() {
+        let (_dir, state, mempool, executor) = setup();
+        let (handle, addr) = start_server(state, mempool.clone(), executor).await;
+        use jsonrpsee::core::client::ClientT;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let mk = |key_hex: &str, nonce: u64| {
+            let key =
+                k256::ecdsa::SigningKey::from_slice(&hex::decode(key_hex).unwrap()).unwrap();
+            let signed = torus_types::eip712::sign_native_action(
+                torus_types::NativeAction::ClaimRewards,
+                nonce,
+                &key,
+            );
+            format!("0x{}", hex::encode(serde_json::to_vec(&signed).unwrap()))
+        };
+        const KEY_A: &str = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+        const KEY_B: &str = "59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
+
+        // 12 items; indexes 2, 5, 8, 11 invalid; valid ones alternate A/B
+        // senders with distinct nonces.
+        let bad_indexes = [2usize, 5, 8, 11];
+        let mut batch: Vec<String> = Vec::new();
+        let mut n = 0u64;
+        for i in 0..12usize {
+            if bad_indexes.contains(&i) {
+                batch.push(format!("0xzz-bad-{i}"));
+            } else {
+                let key = if n % 2 == 0 { KEY_A } else { KEY_B };
+                batch.push(mk(key, now_ms + n));
+                n += 1;
+            }
+        }
+
+        let results: Vec<RpcSubmitResult> = client
+            .request("torus_submitNativeActions", jsonrpsee::rpc_params![batch])
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 12, "one result per item, in order");
+        for (i, r) in results.iter().enumerate() {
+            if bad_indexes.contains(&i) {
+                assert!(r.hash.is_none() && r.error.is_some(), "index {i} must fail");
+            } else {
+                assert!(r.hash.is_some() && r.error.is_none(), "index {i} must succeed");
+            }
+        }
+        assert_eq!(
+            mempool.native_pool_size(),
+            8,
+            "exactly the 8 valid actions admitted"
+        );
+        handle.stop().unwrap();
+    }
+
     #[tokio::test]
     async fn submit_records_phase_histograms() {
         let (_dir, state, mempool, executor) = setup();
@@ -730,6 +794,8 @@ mod tests {
             "torus_rpc_submit_verify_seconds",
             "torus_rpc_submit_verify_cpu_seconds",
             "torus_rpc_submit_admit_seconds",
+            "torus_rpc_submit_admit_insert_seconds",
+            "torus_rpc_submit_admit_forward_seconds",
         ] {
             assert!(
                 text.contains(&format!("{name}_count 1")),

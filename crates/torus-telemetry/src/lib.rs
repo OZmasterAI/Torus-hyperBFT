@@ -81,10 +81,17 @@ pub struct Metrics {
     // pool admission.
     pub rpc_submit_permit_wait_seconds: Histogram,
     pub rpc_submit_verify_seconds: Histogram,
-    /// Compute-only time inside the verify closure; `verify_seconds` wraps the
-    /// `spawn_blocking` await, so wall − cpu ≈ blocking-pool queue + scheduling.
+    /// In-closure span of the verify work; `verify_seconds` wraps the
+    /// `spawn_blocking` await, so wall − this ≈ blocking-pool queue + scheduling.
+    /// Since Option A (ingress-verify-fix) the closure verifies via rayon, so
+    /// this is parallel wall time, NOT cumulative CPU (name kept for dashboard
+    /// continuity).
     pub rpc_submit_verify_cpu_seconds: Histogram,
     pub rpc_submit_admit_seconds: Histogram,
+    /// Admit sub-phase (Option A): cumulative mempool-insert time per batch.
+    pub rpc_submit_admit_insert_seconds: Histogram,
+    /// Admit sub-phase (Option A): cumulative leader-forward time per batch.
+    pub rpc_submit_admit_forward_seconds: Histogram,
     /// Batch-submit items rejected at admission, labeled by concrete reason
     /// (duplicate / sender_queue_full / pool_full / rate_limited /
     /// verify_failed / other) — shows WHICH limit fires under saturation.
@@ -326,7 +333,7 @@ impl Metrics {
         let rpc_submit_verify_cpu_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
         registry.register(
             "torus_rpc_submit_verify_cpu_seconds",
-            "Compute-only time inside the batch verify closure (wall minus cpu = pool queue)",
+            "In-closure span of batch verify (parallel wall since Option A; verify_seconds minus this = pool queue)",
             rpc_submit_verify_cpu_seconds.clone(),
         );
 
@@ -335,6 +342,20 @@ impl Metrics {
             "torus_rpc_submit_admit_seconds",
             "Time a batch submit spent admitting verified actions to the pool",
             rpc_submit_admit_seconds.clone(),
+        );
+
+        let rpc_submit_admit_insert_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
+        registry.register(
+            "torus_rpc_submit_admit_insert_seconds",
+            "Cumulative mempool-insert time within one batch admit",
+            rpc_submit_admit_insert_seconds.clone(),
+        );
+
+        let rpc_submit_admit_forward_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
+        registry.register(
+            "torus_rpc_submit_admit_forward_seconds",
+            "Cumulative leader-forward time within one batch admit",
+            rpc_submit_admit_forward_seconds.clone(),
         );
 
         let rpc_submit_admit_rejects = Family::<Vec<(String, String)>, Counter>::default();
@@ -495,6 +516,8 @@ impl Metrics {
             rpc_submit_verify_seconds,
             rpc_submit_verify_cpu_seconds,
             rpc_submit_admit_seconds,
+            rpc_submit_admit_insert_seconds,
+            rpc_submit_admit_forward_seconds,
             rpc_submit_admit_rejects,
             native_da_pull_failures,
             direct_send_failures_untracked,
@@ -603,6 +626,21 @@ mod tests {
         m.blocks_committed.inc();
         let encoded = m.encode();
         assert!(encoded.contains("torus_blocks_committed"));
+    }
+
+    /// Ingress-verify-fix Option A: the admit sub-phase histograms must be
+    /// registered so the probe can split admit cost into mempool insert vs
+    /// leader-forward.
+    #[test]
+    fn admit_subphase_metrics_register() {
+        let m = Metrics::new();
+        let text = m.encode();
+        for name in [
+            "torus_rpc_submit_admit_insert_seconds",
+            "torus_rpc_submit_admit_forward_seconds",
+        ] {
+            assert!(text.contains(name), "{name} not registered:\n{text}");
+        }
     }
 
     /// Exec-ceiling Option A: the six execution-phase histograms and the
