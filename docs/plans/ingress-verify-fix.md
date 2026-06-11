@@ -77,6 +77,38 @@ behind the new sub-timers** once A measurably pins all 8 cores
 revisit after B. The exec-side double-verify trust-cache stays DEFERRED:
 exec queue depth was 0 — optimizing the idle thread buys nothing today.
 
+## Results (s352 + s353 probes)
+
+Three identical bs500 solo runs (10 senders, sb10, 30s):
+
+| metric                      | s351 serial | s352 shared-pool | s353 dedicated pool |
+|-----------------------------|------------:|-----------------:|--------------------:|
+| submitted (acked)           | 39/s        | 15/s             | 14/s                |
+| unique actions executed     | 448 (~15/s) | 169              | 469 (~15.6/s)       |
+| inclusion efficiency        | 34%         | 34%              | **~100%**           |
+| block time under load       | 529ms       | 4034ms           | 1229ms              |
+| exec verify phase /nat-blk  | 429ms       | 1224ms (90.7%)   | 291ms               |
+| exec queue depth            | 0           | climbed to 26    | one blip of 1       |
+| verify in-closure /batch    | 0.70s (cpu) | 5.9s             | 5.4s                |
+| admit /batch (insert)       | 0.42s       | 0.14s            | 0.24s               |
+
+- **s352 (naive par_iter)**: REGRESSION — global-rayon-pool sharing
+  queue-starved consensus/exec batch verify. Reverted by 1659352.
+- **s353 (dedicated 4-thread pool)**: starvation fixed (cadence and exec
+  phases recovered, queue empty). Effective unique throughput equals the
+  serial baseline (~15 actions/s ≈ 7.5k orders/s) but with ~100%
+  inclusion of acked submissions (s351 dropped 65% client-side).
+- Bench "included 1013 > submitted 460" is duplicate block-body counting
+  across the 3-chain pipeline; exec-side dedup executed exactly 469.
+- The wall is now nakedly the **70ms CPU per bs500 action**: 10
+  concurrent batches demand ~7s CPU/wave against a 4-thread budget on a
+  shared 8-core box. Arrangement is solved; cost is not.
+
+**Verdict: proceed to Option B (cut the per-action CPU)** — sub-profile
+decode vs eip712 vs canonical-encode+keccak, optimize the dominant term
+byte-identically. Pool size (4) is a secondary tunable; raising it taxes
+consensus (s352 showed the failure mode at the extreme).
+
 ## Open Questions
 - Where exactly does the 70ms split (decode vs eip712 vs canonical
   encode+keccak)? B's sub-timers answer this; could land WITH A.
