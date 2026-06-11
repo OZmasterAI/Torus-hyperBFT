@@ -1,0 +1,55 @@
+{
+  "prp": "exec-ceiling",
+  "created": "2026-06-11T12:44:49Z",
+  "plan": "docs/plans/exec-ceiling-impl.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "register exec phase histograms + queue gauge in telemetry",
+      "status": "pending",
+      "files": [
+        "crates/torus-telemetry/src/lib.rs"
+      ],
+      "validate": "cargo test -p torus-telemetry",
+      "depends_on": []
+    },
+    {
+      "id": 2,
+      "name": "phase timers + native_actions_processed in execute_committed_block",
+      "status": "pending",
+      "files": [
+        "crates/torus-consensus/src/app.rs"
+      ],
+      "validate": "cargo test -p torus-consensus --lib",
+      "depends_on": [1]
+    },
+    {
+      "id": 3,
+      "name": "exec queue depth gauge at channel send/recv sites",
+      "status": "pending",
+      "files": [
+        "crates/torus-consensus/src/app.rs"
+      ],
+      "validate": "cargo build -p torus-consensus",
+      "depends_on": [1]
+    },
+    {
+      "id": 4,
+      "name": "wire block_build_seconds in produce_block",
+      "status": "pending",
+      "files": [
+        "crates/torus-consensus/src/app.rs"
+      ],
+      "validate": "cargo test -p torus-consensus --lib",
+      "depends_on": []
+    },
+    {
+      "id": 5,
+      "name": "live bs500 probe + phase verdict table",
+      "status": "pending",
+      "files": [],
+      "validate": "curl -s 127.0.0.1:9090/metrics | grep torus_exec_block_seconds_count",
+      "depends_on": [1, 2, 3, 4]
+    }
+  ]
+}
