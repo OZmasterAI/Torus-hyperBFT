@@ -268,6 +268,31 @@ pub(crate) fn verify_one_action(
     verify_one_action_with(decode_action_json, signed_action, chain_id, state_db, current_time_ms)
 }
 
+/// Dedicated bounded pool for ingress verification (s352 regression fix).
+///
+/// The GLOBAL rayon pool runs consensus-critical work — exec-thread
+/// `batch_verify_native_actions`, the validate-path batch verify, and
+/// per-market matching. Running ingress `par_iter` on that same pool let
+/// ~100 queued ingress tasks starve consensus verify at the task-queue
+/// level (s352 probe: block time 529ms→4034ms, exec verify phase 3x).
+/// Half the cores (min 2) keeps ingress off the consensus threads' backs
+/// while still parallelizing within a batch.
+fn ingress_verify_pool() -> &'static rayon::ThreadPool {
+    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let threads = (std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(8)
+            / 2)
+        .max(2);
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|i| format!("torus-ingress-verify-{i}"))
+            .build()
+            .expect("build ingress verify pool")
+    })
+}
+
 /// Routing decision for one batch item, made before signature verification.
 /// `Proceed` payloads are consumed (`mem::take`) when handed to the verify
 /// closure; only the variant tag matters afterwards.
@@ -372,8 +397,10 @@ impl RpcState {
         let (verified, verify_cpu) = tokio::task::spawn_blocking(move || {
             // Option A (ingress-verify-fix): verify the batch in PARALLEL —
             // per-action cost is ~70ms CPU at bs500, so a serial loop made the
-            // ack RTT scale with batch size. collect() preserves index order,
-            // which the per-item result alignment below depends on (pinned by
+            // ack RTT scale with batch size. Runs on the DEDICATED ingress
+            // pool, never the global one (s352: sharing starved consensus).
+            // collect() preserves index order, which the per-item result
+            // alignment below depends on (pinned by
             // submit_batch_order_preserved_with_interleaved_failures).
             use rayon::prelude::*;
             let cpu_t0 = std::time::Instant::now();
@@ -381,18 +408,20 @@ impl RpcState {
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("system clock before epoch")
                 .as_millis() as u64;
-            let out = to_verify
-                .into_par_iter()
-                .map(|signed_action| {
-                    verify_one_action_with(
-                        decode,
-                        &signed_action,
-                        chain_id,
-                        &state_db,
-                        current_time_ms,
-                    )
-                })
-                .collect::<Vec<_>>();
+            let out = ingress_verify_pool().install(|| {
+                to_verify
+                    .into_par_iter()
+                    .map(|signed_action| {
+                        verify_one_action_with(
+                            decode,
+                            &signed_action,
+                            chain_id,
+                            &state_db,
+                            current_time_ms,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            });
             (out, cpu_t0.elapsed())
         })
         .await
