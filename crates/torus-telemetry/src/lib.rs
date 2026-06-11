@@ -113,6 +113,20 @@ pub struct Metrics {
     pub native_da_pull_requests: Counter,
     /// Native-DA pull-fallbacks that recovered all missing bodies in-call (Task 6).
     pub native_da_pull_recovered: Counter,
+
+    // Exec-ceiling Option A (s351) — phase decomposition of the execution
+    // thread. Phase histograms observe only when a block enters the native
+    // section, so per-phase counts equal native-block counts; `exec_block_seconds`
+    // observes every executed (non-replay) block.
+    pub exec_verify_seconds: Histogram,
+    pub exec_replay_guard_seconds: Histogram,
+    pub exec_engine_seconds: Histogram,
+    pub exec_save_books_seconds: Histogram,
+    pub exec_flush_seconds: Histogram,
+    pub exec_block_seconds: Histogram,
+    /// Committed blocks handed to the exec channel but not yet fully executed.
+    /// Pinned near the channel bound (64) = execution is the bottleneck.
+    pub exec_queue_depth: Gauge,
 }
 
 impl Metrics {
@@ -401,6 +415,55 @@ impl Metrics {
             native_da_pull_recovered.clone(),
         );
 
+        let exec_verify_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
+        registry.register(
+            "torus_exec_verify_seconds",
+            "Exec phase: batch signature verification of native actions",
+            exec_verify_seconds.clone(),
+        );
+
+        let exec_replay_guard_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
+        registry.register(
+            "torus_exec_replay_guard_seconds",
+            "Exec phase: per-action (sender, nonce) replay-guard point reads",
+            exec_replay_guard_seconds.clone(),
+        );
+
+        let exec_engine_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
+        registry.register(
+            "torus_exec_engine_seconds",
+            "Exec phase: native engine batches, governance, fees and epoch boundary",
+            exec_engine_seconds.clone(),
+        );
+
+        let exec_save_books_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
+        registry.register(
+            "torus_exec_save_books_seconds",
+            "Exec phase: serializing dirty order books into the overlay",
+            exec_save_books_seconds.clone(),
+        );
+
+        let exec_flush_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
+        registry.register(
+            "torus_exec_flush_seconds",
+            "Exec phase: nonce writes, atomic overlay flush and incremental tries",
+            exec_flush_seconds.clone(),
+        );
+
+        let exec_block_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
+        registry.register(
+            "torus_exec_block_seconds",
+            "Total time to execute a committed block on the execution thread",
+            exec_block_seconds.clone(),
+        );
+
+        let exec_queue_depth = Gauge::default();
+        registry.register(
+            "torus_exec_queue_depth",
+            "Committed blocks sent to the execution channel but not yet executed",
+            exec_queue_depth.clone(),
+        );
+
         Self {
             registry,
             blocks_committed,
@@ -443,6 +506,13 @@ impl Metrics {
             missing_action_rejections,
             native_da_pull_requests,
             native_da_pull_recovered,
+            exec_verify_seconds,
+            exec_replay_guard_seconds,
+            exec_engine_seconds,
+            exec_save_books_seconds,
+            exec_flush_seconds,
+            exec_block_seconds,
+            exec_queue_depth,
         }
     }
 
@@ -533,5 +603,26 @@ mod tests {
         m.blocks_committed.inc();
         let encoded = m.encode();
         assert!(encoded.contains("torus_blocks_committed"));
+    }
+
+    /// Exec-ceiling Option A: the six execution-phase histograms and the
+    /// exec-queue-depth gauge must be registered (present in encode() with
+    /// zero observations), so the live probe can decompose where the
+    /// execution thread's time goes.
+    #[test]
+    fn exec_phase_metrics_register() {
+        let m = Metrics::new();
+        let text = m.encode();
+        for name in [
+            "torus_exec_verify_seconds",
+            "torus_exec_replay_guard_seconds",
+            "torus_exec_engine_seconds",
+            "torus_exec_save_books_seconds",
+            "torus_exec_flush_seconds",
+            "torus_exec_block_seconds",
+            "torus_exec_queue_depth",
+        ] {
+            assert!(text.contains(name), "{name} not registered:\n{text}");
+        }
     }
 }
