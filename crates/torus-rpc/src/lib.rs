@@ -819,6 +819,66 @@ mod tests {
         }
     }
 
+    /// Sprint 5 Task 3: admission rejects are counted by concrete reason so
+    /// saturation regimes show WHICH limit fires (duplicate / pool_full / ...).
+    #[tokio::test]
+    async fn admit_rejects_counted_by_reason() {
+        let (_dir, state, mempool, executor) = setup();
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
+        let mut server = RpcServer::new(
+            state,
+            mempool,
+            executor,
+            TORUS_CHAIN_ID,
+            100,
+            BlockNotifier::new(),
+        );
+        server.set_metrics(metrics.clone());
+        let (handle, addr) = server.start("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        use jsonrpsee::core::client::ClientT;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let key = k256::ecdsa::SigningKey::from_slice(
+            &hex::decode("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80")
+                .unwrap(),
+        )
+        .unwrap();
+        let signed = torus_types::eip712::sign_native_action(
+            torus_types::NativeAction::ClaimRewards,
+            now_ms,
+            &key,
+        );
+        let payload = format!("0x{}", hex::encode(serde_json::to_vec(&signed).unwrap()));
+
+        // Same action twice in one batch: first admits, second is a duplicate.
+        let results: Vec<RpcSubmitResult> = client
+            .request(
+                "torus_submitNativeActions",
+                jsonrpsee::rpc_params![vec![payload.clone(), payload]],
+            )
+            .await
+            .unwrap();
+        assert!(results[0].hash.is_some() && results[0].error.is_none());
+        assert!(
+            results[1].error.as_deref().unwrap_or("").contains("duplicate"),
+            "second submit should be rejected as duplicate: {:?}",
+            results[1]
+        );
+
+        let text = metrics.encode();
+        assert!(
+            text.contains(r#"torus_rpc_submit_admit_rejects_total{reason="duplicate"} 1"#),
+            "duplicate reject not counted; metrics dump:\n{text}"
+        );
+        handle.stop().unwrap();
+    }
+
     #[tokio::test]
     async fn leader_forward_gated_by_forward_bodies() {
         let now_ms = std::time::SystemTime::now()

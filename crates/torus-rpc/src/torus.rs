@@ -233,6 +233,15 @@ pub(crate) fn verify_one_action(
 }
 
 impl RpcState {
+    /// Count one admission-path rejection under its concrete reason label.
+    fn count_admit_reject(&self, reason: &str) {
+        if let Some(ref m) = self.metrics {
+            m.rpc_submit_admit_rejects
+                .get_or_create(&vec![("reason".into(), reason.into())])
+                .inc();
+        }
+    }
+
     /// Direct-to-leader forwarding tail shared by the single and batch submit
     /// endpoints: no-op when this node IS the leader or forwarding is unwired.
     fn forward_to_leader(&self, sender: &alloy_primitives::Address, action_bytes: &[u8]) {
@@ -764,16 +773,30 @@ impl TorusApiServer for RpcState {
                                 error: None,
                             }
                         }
-                        Err(e) => RpcSubmitResult {
-                            hash: None,
-                            error: Some(format!("mempool: {e}")),
-                        },
+                        Err(e) => {
+                            self.count_admit_reject(match &e {
+                                torus_mempool::MempoolError::DuplicateNativeAction => "duplicate",
+                                torus_mempool::MempoolError::NativeSenderQueueFull { .. } => {
+                                    "sender_queue_full"
+                                }
+                                torus_mempool::MempoolError::NativePoolFull => "pool_full",
+                                torus_mempool::MempoolError::RateLimited { .. } => "rate_limited",
+                                _ => "other",
+                            });
+                            RpcSubmitResult {
+                                hash: None,
+                                error: Some(format!("mempool: {e}")),
+                            }
+                        }
                     }
                 }
-                Err(msg) => RpcSubmitResult {
-                    hash: None,
-                    error: Some(msg),
-                },
+                Err(msg) => {
+                    self.count_admit_reject("verify_failed");
+                    RpcSubmitResult {
+                        hash: None,
+                        error: Some(msg),
+                    }
+                }
             })
             .collect();
         if let Some(ref m) = self.metrics {
