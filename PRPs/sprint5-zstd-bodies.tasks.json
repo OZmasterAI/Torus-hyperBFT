@@ -1,0 +1,62 @@
+{
+  "prp": "sprint5-zstd-bodies",
+  "created": "2026-06-12T01:25:00",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "zstd codec frame fns + roundtrip/bomb/corrupt/ratio tests (RED->GREEN)",
+      "status": "pending",
+      "files": ["crates/torus-network/src/codec.rs", "crates/torus-network/Cargo.toml"],
+      "validate": "nice -n19 cargo test -p torus-network --lib zstd -j2",
+      "depends_on": []
+    },
+    {
+      "id": 2,
+      "name": "Register /torus/*/2.0 protocols, codec dispatch on negotiated protocol",
+      "status": "pending",
+      "files": ["crates/torus-network/src/behaviour.rs", "crates/torus-network/src/codec.rs", "crates/torus-network/src/swarm.rs"],
+      "validate": "nice -n19 cargo test -p torus-network --lib -j2",
+      "depends_on": [1]
+    },
+    {
+      "id": 3,
+      "name": "Push/pull/sync senders prefer 2.0 (audit hardcoded /1.0 strings)",
+      "status": "pending",
+      "files": ["crates/torus-network/src/bridge.rs"],
+      "validate": "nice -n19 cargo test -p torus-network --lib -j2",
+      "depends_on": [2]
+    },
+    {
+      "id": 4,
+      "name": "Gossip v2 topic dual-subscribe + --gossip-zstd publish flag (default off)",
+      "status": "pending",
+      "files": ["crates/torus-network/src/behaviour.rs", "crates/torus-node/src/main.rs"],
+      "validate": "nice -n19 cargo test -p torus-network --lib -j2 && nice -n19 cargo test -p torus-mempool --lib -j2",
+      "depends_on": [1]
+    },
+    {
+      "id": 5,
+      "name": "Telemetry: wire_bytes_pre_compress / wire_bytes_on_wire per path",
+      "status": "pending",
+      "files": ["crates/torus-telemetry/src/lib.rs", "crates/torus-network/src/codec.rs"],
+      "validate": "nice -n19 cargo test -p torus-telemetry --lib -j2",
+      "depends_on": [1]
+    },
+    {
+      "id": 6,
+      "name": "Mixed-version devnet proof (HEAD vs HEAD~1): fallback works, ratio measured, zero bans",
+      "status": "pending",
+      "files": ["devnet/"],
+      "validate": "devnet 4-node flood: lockstep commits, dup-factor <=1.05, ratio >=3x in counters",
+      "depends_on": [2, 3, 4, 5]
+    },
+    {
+      "id": 7,
+      "name": "Commit + append measured ratios to design doc",
+      "status": "pending",
+      "files": ["docs/plans/sprint5-zstd-bodies.md"],
+      "validate": "git log --oneline -1",
+      "depends_on": [6]
+    }
+  ]
+}
