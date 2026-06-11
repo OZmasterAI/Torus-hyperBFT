@@ -211,7 +211,7 @@ pub trait TorusApi {
 /// native action. Blocking-pool work (ecrecover); the batch endpoint runs a
 /// whole batch of these inside one `spawn_blocking`. Error is a per-item
 /// message, never a call-level failure.
-fn verify_one_action(
+pub(crate) fn verify_one_action(
     signed_action: &str,
     chain_id: u64,
     state_db: &torus_state::StateDb,
@@ -728,23 +728,27 @@ impl TorusApiServer for RpcState {
         let state_db = self.state.clone();
         let chain_id = self.chain_id;
         let verify_t0 = std::time::Instant::now();
-        let verified = tokio::task::spawn_blocking(move || {
+        let (verified, verify_cpu) = tokio::task::spawn_blocking(move || {
+            let cpu_t0 = std::time::Instant::now();
             let current_time_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("system clock before epoch")
                 .as_millis() as u64;
-            signed_actions
+            let out = signed_actions
                 .into_iter()
                 .map(|signed_action| {
                     verify_one_action(&signed_action, chain_id, &state_db, current_time_ms)
                 })
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            (out, cpu_t0.elapsed())
         })
         .await
         .map_err(|e| ErrorObjectOwned::from(RpcError::Internal(format!("spawn_blocking: {e}"))))?;
         if let Some(ref m) = self.metrics {
             m.rpc_submit_verify_seconds
                 .observe(verify_t0.elapsed().as_secs_f64());
+            m.rpc_submit_verify_cpu_seconds
+                .observe(verify_cpu.as_secs_f64());
         }
 
         let admit_t0 = std::time::Instant::now();

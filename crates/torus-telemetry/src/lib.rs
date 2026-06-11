@@ -81,6 +81,9 @@ pub struct Metrics {
     // pool admission.
     pub rpc_submit_permit_wait_seconds: Histogram,
     pub rpc_submit_verify_seconds: Histogram,
+    /// Compute-only time inside the verify closure; `verify_seconds` wraps the
+    /// `spawn_blocking` await, so wall − cpu ≈ blocking-pool queue + scheduling.
+    pub rpc_submit_verify_cpu_seconds: Histogram,
     pub rpc_submit_admit_seconds: Histogram,
 
     // Link-storm visibility (Sprint 3.5) — the s338 sweep produced 155+ pull
@@ -302,6 +305,13 @@ impl Metrics {
             rpc_submit_verify_seconds.clone(),
         );
 
+        let rpc_submit_verify_cpu_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
+        registry.register(
+            "torus_rpc_submit_verify_cpu_seconds",
+            "Compute-only time inside the batch verify closure (wall minus cpu = pool queue)",
+            rpc_submit_verify_cpu_seconds.clone(),
+        );
+
         let rpc_submit_admit_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
         registry.register(
             "torus_rpc_submit_admit_seconds",
@@ -409,6 +419,7 @@ impl Metrics {
             native_gossip_dropped_oversized,
             rpc_submit_permit_wait_seconds,
             rpc_submit_verify_seconds,
+            rpc_submit_verify_cpu_seconds,
             rpc_submit_admit_seconds,
             native_da_pull_failures,
             direct_send_failures_untracked,

@@ -728,6 +728,7 @@ mod tests {
         for name in [
             "torus_rpc_submit_permit_wait_seconds",
             "torus_rpc_submit_verify_seconds",
+            "torus_rpc_submit_verify_cpu_seconds",
             "torus_rpc_submit_admit_seconds",
         ] {
             assert!(
@@ -736,6 +737,86 @@ mod tests {
             );
         }
         handle.stop().unwrap();
+    }
+
+    /// Sprint 5 Task 2 (instrumentation): per-phase cost of `verify_one_action`
+    /// at bs 1/100/500. Prints µs per phase under --nocapture; asserts only
+    /// correctness so timing noise can't flake CI.
+    #[test]
+    fn verify_breakdown_by_batch_size() {
+        let (_dir, state, _mempool, _executor) = setup();
+        let key = k256::ecdsa::SigningKey::from_slice(
+            &hex::decode("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80")
+                .unwrap(),
+        )
+        .unwrap();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        for n in [1usize, 100, 500] {
+            let orders: Vec<torus_types::PlaceOrderParams> = (0..n)
+                .map(|i| torus_types::PlaceOrderParams {
+                    market_id: 1,
+                    is_buy: i % 2 == 0,
+                    price: torus_types::FixedPoint::from_raw(1_000_000_000 + i as i128),
+                    quantity: torus_types::FixedPoint::from_raw(100_000_000),
+                    order_type: torus_types::OrderType::Limit,
+                    time_in_force: torus_types::TimeInForce::GTC,
+                    reduce_only: false,
+                    client_order_id: Some(i as u64),
+                })
+                .collect();
+            let signed = torus_types::eip712::sign_native_action(
+                torus_types::NativeAction::PlaceOrderBatch(orders),
+                now_ms,
+                &key,
+            );
+            let payload = format!("0x{}", hex::encode(serde_json::to_vec(&signed).unwrap()));
+
+            let t = std::time::Instant::now();
+            let bytes = crate::types::parse_bytes(&payload).unwrap();
+            let d_hex = t.elapsed();
+
+            let t = std::time::Instant::now();
+            let action: torus_types::SignedNativeAction =
+                serde_json::from_slice(&bytes).unwrap();
+            let d_parse = t.elapsed();
+
+            let t = std::time::Instant::now();
+            action
+                .validate_with_sessions(now_ms, TORUS_CHAIN_ID, |pk| {
+                    state.get_session(pk).ok().flatten()
+                })
+                .unwrap();
+            let d_sig = t.elapsed();
+
+            let t = std::time::Instant::now();
+            let canonical = serde_json::to_vec(&action).unwrap();
+            let d_ser = t.elapsed();
+
+            let t = std::time::Instant::now();
+            let _ = alloy_primitives::keccak256(&canonical);
+            let d_keccak = t.elapsed();
+
+            let t = std::time::Instant::now();
+            let (_, _, _, _hash) =
+                crate::torus::verify_one_action(&payload, TORUS_CHAIN_ID, &state, now_ms)
+                    .unwrap();
+            let d_total = t.elapsed();
+
+            println!(
+                "bs={n:>4} bytes={:>7} | hex={:>6}µs parse={:>6}µs sig={:>6}µs ser={:>6}µs keccak={:>5}µs | verify_one_action total={:>6}µs",
+                payload.len(),
+                d_hex.as_micros(),
+                d_parse.as_micros(),
+                d_sig.as_micros(),
+                d_ser.as_micros(),
+                d_keccak.as_micros(),
+                d_total.as_micros(),
+            );
+        }
     }
 
     #[tokio::test]
