@@ -80,6 +80,10 @@ enum Command {
         /// multiple bench instances so nonce/rate-limit accounting never collides).
         #[arg(long, default_value_t = 0)]
         sender_offset: usize,
+        /// Ingress wire format: "json" (hex of canonical JSON) or "bin"
+        /// (hex of bincode via torus_submitNativeActionsBin, Sprint 5).
+        #[arg(long, default_value = "json")]
+        format: String,
     },
     Combined {
         #[arg(long, default_value = "http://localhost:8545,http://localhost:8546,http://localhost:8547,http://localhost:8548")]
@@ -143,6 +147,7 @@ fn sign_payload_batch(
     batch_size: usize,
     submit_batch: usize,
     mut last_nonce: u64,
+    bin: bool,
 ) -> (Vec<String>, u64) {
     let mut payloads = Vec::with_capacity(submit_batch);
     for _ in 0..submit_batch {
@@ -154,8 +159,12 @@ fn sign_payload_batch(
         let nonce = base.max(last_nonce + 1);
         last_nonce = nonce;
         let signed = sign_native_action(action, nonce, key);
-        let json_bytes = serde_json::to_vec(&signed).unwrap();
-        payloads.push(format!("0x{}", hex::encode(&json_bytes)));
+        let bytes = if bin {
+            bincode::serialize(&signed).unwrap()
+        } else {
+            serde_json::to_vec(&signed).unwrap()
+        };
+        payloads.push(format!("0x{}", hex::encode(&bytes)));
     }
     (payloads, last_nonce)
 }
@@ -332,17 +341,23 @@ fn load_sender_keys(count: usize, offset: usize) -> Vec<SenderKey> {
     keys
 }
 
-/// Submit a batch of pre-encoded signed actions via `torus_submitNativeActions`.
+/// Submit a batch of pre-encoded signed actions via `torus_submitNativeActions`
+/// (or `torus_submitNativeActionsBin` for bincode payloads, Sprint 5).
 /// Returns how many items the server accepted (entries carrying a `hash`).
 async fn submit_native_actions_batch(
     client: &reqwest::Client,
     url: &str,
     payloads: &[String],
     id: u64,
+    bin: bool,
 ) -> Result<usize, String> {
     let body = serde_json::json!({
         "jsonrpc": "2.0",
-        "method": "torus_submitNativeActions",
+        "method": if bin {
+            "torus_submitNativeActionsBin"
+        } else {
+            "torus_submitNativeActions"
+        },
         "params": [payloads],
         "id": id
     });
@@ -539,6 +554,7 @@ async fn run_consensus(
     batch_size: usize,
     submit_batch: usize,
     sender_offset: usize,
+    bin: bool,
 ) {
     let rpc_urls: Vec<String> = rpc_urls_str.split(',').map(|s| s.trim().to_string()).collect();
     let num_senders = senders.max(1);
@@ -710,8 +726,14 @@ async fn run_consensus(
                 let mut rng = StdRng::from_entropy();
                 let mut last_nonce: u64 = 0;
                 loop {
-                    let (payloads, n) =
-                        sign_payload_batch(&mut rng, &key, batch_size, submit_batch, last_nonce);
+                    let (payloads, n) = sign_payload_batch(
+                        &mut rng,
+                        &key,
+                        batch_size,
+                        submit_batch,
+                        last_nonce,
+                        bin,
+                    );
                     last_nonce = n;
                     if pregen_tx.blocking_send(payloads).is_err() {
                         break; // submit loop finished — receiver dropped
@@ -735,12 +757,14 @@ async fn run_consensus(
 
                 tokio::spawn(async move {
                     let _permit = permit;
-                    if payloads.len() == 1 {
+                    // bin payloads always go through the batch endpoint — the
+                    // legacy single endpoint only speaks canonical JSON.
+                    if payloads.len() == 1 && !bin {
                         if submit_native_action(&client, &url, &payloads[0], req_id).await.is_ok() {
                             submitted.fetch_add(1, Ordering::Relaxed);
                         }
                     } else if let Ok(accepted) =
-                        submit_native_actions_batch(&client, &url, &payloads, req_id).await
+                        submit_native_actions_batch(&client, &url, &payloads, req_id, bin).await
                     {
                         submitted.fetch_add(accepted as u64, Ordering::Relaxed);
                     }
@@ -1018,7 +1042,16 @@ async fn main() {
             batch_size,
             submit_batch,
             sender_offset,
+            format,
         } => {
+            let bin = match format.as_str() {
+                "bin" => true,
+                "json" => false,
+                other => {
+                    eprintln!("unknown --format {other:?} (expected \"json\" or \"bin\")");
+                    std::process::exit(2);
+                }
+            };
             run_consensus(
                 &rpc_urls,
                 senders,
@@ -1027,6 +1060,7 @@ async fn main() {
                 batch_size,
                 submit_batch,
                 sender_offset,
+                bin,
             )
             .await
         }
@@ -1049,8 +1083,8 @@ mod tests {
     fn sign_payload_batch_nonces_strictly_increase() {
         let mut rng = StdRng::seed_from_u64(7);
         let key = k256::ecdsa::SigningKey::from_slice(&[0x11; 32]).unwrap();
-        let (p1, n1) = sign_payload_batch(&mut rng, &key, 3, 4, 0);
-        let (p2, n2) = sign_payload_batch(&mut rng, &key, 3, 4, n1);
+        let (p1, n1) = sign_payload_batch(&mut rng, &key, 3, 4, 0, false);
+        let (p2, n2) = sign_payload_batch(&mut rng, &key, 3, 4, n1, false);
         assert_eq!(p1.len(), 4);
         assert_eq!(p2.len(), 4);
         assert!(n2 > n1, "nonce watermark must advance across batches");
