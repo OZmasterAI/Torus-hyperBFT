@@ -1,0 +1,54 @@
+# Leg A — Sprint 5 shake-out: all nodes on HEAD binary, --gossip-zstd ON
+# (safe: every peer is 2.0-capable). validator-0 logs codec frames so the
+# zstd /2.0 path is observable at info-level elsewhere.
+# Usage: docker compose -f docker-compose.yml -f docker-compose.legA.yml up -d
+services:
+  validator-0:
+    command:
+      - --genesis=/genesis/genesis.json
+      - --data-dir=/data
+      - --validator-key=0100000000000000000000000000000000000000000000000000000000000000
+      - --p2p-listen=/ip4/0.0.0.0/udp/30333/quic-v1
+      - --rpc-addr=0.0.0.0:8545
+      - --log-level=info,torus_network::codec=debug
+      - --gossip-zstd
+  validator-1:
+    command:
+      - --genesis=/genesis/genesis.json
+      - --data-dir=/data
+      - --validator-key=0200000000000000000000000000000000000000000000000000000000000000
+      - --p2p-listen=/ip4/0.0.0.0/udp/30334/quic-v1
+      - --p2p-peers=/ip4/172.28.0.10/udp/30333/quic-v1/p2p/12D3KooWPjceQrSwdWXPyLLeABRXmuqt69Rg3sBYbU1Nft9HyQ6X
+      - --rpc-addr=0.0.0.0:8545
+      - --log-level=info
+      - --gossip-zstd
+  validator-2:
+    command:
+      - --genesis=/genesis/genesis.json
+      - --data-dir=/data
+      - --validator-key=0300000000000000000000000000000000000000000000000000000000000000
+      - --p2p-listen=/ip4/0.0.0.0/udp/30335/quic-v1
+      - --p2p-peers=/ip4/172.28.0.10/udp/30333/quic-v1/p2p/12D3KooWPjceQrSwdWXPyLLeABRXmuqt69Rg3sBYbU1Nft9HyQ6X
+      - --rpc-addr=0.0.0.0:8545
+      - --log-level=info
+      - --gossip-zstd
+  validator-3:
+    command:
+      - --genesis=/genesis/genesis.json
+      - --data-dir=/data
+      - --validator-key=0400000000000000000000000000000000000000000000000000000000000000
+      - --p2p-listen=/ip4/0.0.0.0/udp/30336/quic-v1
+      - --p2p-peers=/ip4/172.28.0.10/udp/30333/quic-v1/p2p/12D3KooWPjceQrSwdWXPyLLeABRXmuqt69Rg3sBYbU1Nft9HyQ6X
+      - --rpc-addr=0.0.0.0:8545
+      - --log-level=info
+      - --gossip-zstd
+  rpc-node:
+    command:
+      - --rpc-only
+      - --genesis=/genesis/genesis.json
+      - --data-dir=/data
+      - --p2p-listen=/ip4/0.0.0.0/udp/30337/quic-v1
+      - --p2p-peers=/ip4/172.28.0.10/udp/30333/quic-v1/p2p/12D3KooWPjceQrSwdWXPyLLeABRXmuqt69Rg3sBYbU1Nft9HyQ6X
+      - --rpc-addr=0.0.0.0:8545
+      - --log-level=info
+      - --gossip-zstd

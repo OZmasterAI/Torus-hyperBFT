@@ -428,11 +428,25 @@ async fn fetch_block_number(client: &reqwest::Client, url: &str) -> Option<u64> 
     u64::from_str_radix(s, 16).ok()
 }
 
+/// One swept block: `(block_number, native slots, action identity hashes)`.
+/// Identity hashes are empty when the node returned only a count (old RPC).
+type SweptBlock = (u64, u64, Vec<u64>);
+
+/// Stable identity of one included action: hash of its canonical JSON
+/// (serde_json maps are BTreeMap-backed, so key order is deterministic).
+/// 64-bit FxHash-style collisions are negligible at bench scales.
+fn action_identity(action: &serde_json::Value) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    action.to_string().hash(&mut h);
+    h.finish()
+}
+
 async fn fetch_block_body(
     client: &reqwest::Client,
     url: &str,
     block_number: u64,
-) -> Option<u64> {
+) -> Option<(u64, Vec<u64>)> {
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "method": "torus_getBlockBody",
@@ -441,7 +455,15 @@ async fn fetch_block_body(
     });
     let resp: serde_json::Value = client.post(url).json(&body).send().await.ok()?.json().await.ok()?;
     let result = resp.get("result")?;
-    result.get("nativeActionCount")?.as_u64()
+    // Prefer the action list: identities enable cross-block dedup (the
+    // "included" metric otherwise overcounts ~3x under 3-chain commit lag).
+    if let Some(actions) = result.get("nativeActions").and_then(|a| a.as_array()) {
+        let ids: Vec<u64> = actions.iter().map(action_identity).collect();
+        return Some((ids.len() as u64, ids));
+    }
+    // Old node: count only, no identities.
+    let count = result.get("nativeActionCount")?.as_u64()?;
+    Some((count, Vec::new()))
 }
 
 /// Sum native actions actually committed across a block range — the authoritative
@@ -457,7 +479,7 @@ async fn sweep_block_bodies(
     start_exclusive: u64,
     end_inclusive: u64,
     concurrency: usize,
-) -> Vec<(u64, u64)> {
+) -> Vec<SweptBlock> {
     if end_inclusive <= start_exclusive {
         return Vec::new();
     }
@@ -473,8 +495,8 @@ async fn sweep_block_bodies(
             let url = &urls[(blk as usize) % urls.len()];
             // Tail blocks may not have a queryable body yet — retry with light backoff.
             for attempt in 0..5u64 {
-                if let Some(count) = fetch_block_body(&client, url, blk).await {
-                    return (blk, Some(count));
+                if let Some((count, ids)) = fetch_block_body(&client, url, blk).await {
+                    return (blk, Some((count, ids)));
                 }
                 tokio::time::sleep(Duration::from_millis(150 * (attempt + 1))).await;
             }
@@ -486,7 +508,7 @@ async fn sweep_block_bodies(
     let mut missing = 0u64;
     while let Some(res) = set.join_next().await {
         match res {
-            Ok((blk, Some(count))) => out.push((blk, count)),
+            Ok((blk, Some((count, ids)))) => out.push((blk, count, ids)),
             Ok((_, None)) | Err(_) => missing += 1,
         }
     }
@@ -495,15 +517,15 @@ async fn sweep_block_bodies(
             "[sweep] warning: {missing} block bodies unavailable after retries (excluded from total)"
         );
     }
-    out.sort_unstable_by_key(|(blk, _)| *blk);
+    out.sort_unstable_by_key(|b| b.0);
     out
 }
 
 /// Drop trailing zero-count blocks from a swept window. A live chain keeps
 /// producing empty blocks after the load stops; counting them would dilute
 /// block stats and pin the window end past the actual run.
-fn trim_trailing_empty(blocks: &mut Vec<(u64, u64)>) {
-    while matches!(blocks.last(), Some((_, 0))) {
+fn trim_trailing_empty(blocks: &mut Vec<SweptBlock>) {
+    while matches!(blocks.last(), Some((_, 0, _))) {
         blocks.pop();
     }
 }
@@ -512,38 +534,119 @@ fn trim_trailing_empty(blocks: &mut Vec<(u64, u64)>) {
 mod sweep_window_tests {
     use super::*;
 
+    fn blk(n: u64, ids: &[u64]) -> SweptBlock {
+        (n, ids.len() as u64, ids.to_vec())
+    }
+
     #[test]
     fn trim_trailing_empty_drops_only_tail_zeros() {
-        let mut blocks = vec![(10, 0), (11, 5), (12, 0), (13, 7), (14, 0), (15, 0)];
+        let mut blocks = vec![
+            blk(10, &[]),
+            blk(11, &[1, 2, 3, 4, 5]),
+            blk(12, &[]),
+            blk(13, &[6, 7, 8, 9, 10, 11, 12]),
+            blk(14, &[]),
+            blk(15, &[]),
+        ];
         trim_trailing_empty(&mut blocks);
-        assert_eq!(blocks, vec![(10, 0), (11, 5), (12, 0), (13, 7)]);
+        assert_eq!(
+            blocks.iter().map(|b| b.0).collect::<Vec<_>>(),
+            vec![10, 11, 12, 13]
+        );
     }
 
     #[test]
     fn trim_trailing_empty_handles_all_zero_and_empty() {
-        let mut all_zero = vec![(1, 0), (2, 0)];
+        let mut all_zero = vec![blk(1, &[]), blk(2, &[])];
         trim_trailing_empty(&mut all_zero);
         assert!(all_zero.is_empty());
-        let mut empty: Vec<(u64, u64)> = Vec::new();
+        let mut empty: Vec<SweptBlock> = Vec::new();
         trim_trailing_empty(&mut empty);
         assert!(empty.is_empty());
     }
+
+    // Duplicate-inclusion accounting (ingress-cpu-supply open Q3): the same
+    // action included in several blocks must count once in `unique`. Slots
+    // stay the raw per-block sum so the dup factor (slots/unique) is visible.
+    #[test]
+    fn summarize_dedups_identities_across_blocks() {
+        let blocks = vec![blk(1, &[10, 11]), blk(2, &[11, 12]), blk(3, &[10, 11])];
+        let s = summarize_included(&blocks);
+        assert_eq!(s.slots, 6);
+        assert_eq!(s.unique, Some(3));
+        assert_eq!(s.block_count, 3);
+        assert_eq!(s.peak_actions, 2);
+        assert_eq!(s.peak_block, 1);
+    }
+
+    // Old nodes return only nativeActionCount (no identity list): unique is
+    // unknowable, not zero — report None so callers fall back to slots.
+    #[test]
+    fn summarize_unique_none_when_identities_missing() {
+        let blocks = vec![(1u64, 3u64, Vec::new())];
+        let s = summarize_included(&blocks);
+        assert_eq!(s.slots, 3);
+        assert_eq!(s.unique, None);
+    }
+
+    // Mixed availability (some bodies fell back to count-only) would
+    // undercount duplicates — treat the whole window as unknown.
+    #[test]
+    fn summarize_unique_none_when_partially_missing() {
+        let blocks = vec![blk(1, &[10, 11]), (2u64, 2u64, Vec::new())];
+        let s = summarize_included(&blocks);
+        assert_eq!(s.slots, 4);
+        assert_eq!(s.unique, None);
+    }
+
+    #[test]
+    fn summarize_empty_window() {
+        let s = summarize_included(&[]);
+        assert_eq!(s.slots, 0);
+        assert_eq!(s.unique, Some(0));
+        assert_eq!(s.block_count, 0);
+    }
 }
 
-/// Aggregate swept `(block, native_count)` pairs into
-/// `(total_included, block_count, peak_actions, peak_block)`.
-fn summarize_included(blocks: &[(u64, u64)]) -> (u64, u64, u64, u64) {
-    let mut total = 0u64;
+/// Aggregate of a swept block window.
+struct IncludedSummary {
+    /// Raw per-block native slots summed — overcounts when the same action
+    /// rides several blocks (3-chain commit lag re-inclusion).
+    slots: u64,
+    /// Distinct action identities across the window — the honest "included"
+    /// number. `None` when any non-empty block lacked identities (old RPC),
+    /// since a partial dedup would understate the dup factor.
+    unique: Option<u64>,
+    block_count: u64,
+    peak_actions: u64,
+    peak_block: u64,
+}
+
+fn summarize_included(blocks: &[SweptBlock]) -> IncludedSummary {
+    let mut slots = 0u64;
     let mut peak_actions = 0u64;
     let mut peak_block = 0u64;
-    for &(blk, count) in blocks {
-        total += count;
-        if count > peak_actions {
-            peak_actions = count;
-            peak_block = blk;
+    let mut seen = std::collections::HashSet::new();
+    let mut identities_complete = true;
+    for (blk, count, ids) in blocks {
+        slots += count;
+        if *count > peak_actions {
+            peak_actions = *count;
+            peak_block = *blk;
+        }
+        if ids.len() as u64 == *count {
+            seen.extend(ids.iter().copied());
+        } else {
+            identities_complete = false;
         }
     }
-    (total, blocks.len() as u64, peak_actions, peak_block)
+    IncludedSummary {
+        slots,
+        unique: identities_complete.then(|| seen.len() as u64),
+        block_count: blocks.len() as u64,
+        peak_actions,
+        peak_block,
+    }
 }
 
 async fn run_consensus(
@@ -656,7 +759,7 @@ async fn run_consensus(
                 let mut stats = block_stats.lock().await;
                 for blk in pending_blocks.drain(..) {
                     match fetch_block_body(&mon_client, &mon_url, blk).await {
-                        Some(native_count) => {
+                        Some((native_count, _ids)) => {
                             stats.total_included += native_count;
                             mon_included.store(stats.total_included, Ordering::Relaxed);
                             stats.block_count += 1;
@@ -829,7 +932,7 @@ async fn run_consensus(
         let delta =
             sweep_block_bodies(client.clone(), rpc_urls.clone(), end_block, cur, concurrency)
                 .await;
-        let drained: u64 = delta.iter().map(|(_, c)| c).sum();
+        let drained: u64 = delta.iter().map(|(_, c, _)| c).sum();
         if drained == 0 {
             quiet_extensions += 1;
         } else {
@@ -844,10 +947,15 @@ async fn run_consensus(
         swept.extend(delta);
         end_block = cur;
     }
-    swept.sort_unstable_by_key(|(blk, _)| *blk);
+    swept.sort_unstable_by_key(|b| b.0);
     trim_trailing_empty(&mut swept);
-    let end_block = swept.last().map(|(blk, _)| *blk).unwrap_or(start_block);
-    let (final_included, block_count, peak_actions, peak_block) = summarize_included(&swept);
+    let end_block = swept.last().map(|b| b.0).unwrap_or(start_block);
+    let summary = summarize_included(&swept);
+    let block_count = summary.block_count;
+    // The honest throughput number: unique actions when identities were
+    // available, raw slots otherwise (old nodes). Slots inflate ~3x under
+    // 3-chain commit lag re-inclusion (s355 finding).
+    let final_included = summary.unique.unwrap_or(summary.slots);
 
     let avg_block_time_ms = {
         let stats = final_stats.lock().await;
@@ -879,11 +987,28 @@ async fn run_consensus(
         format_num(final_submitted),
         submit_rate,
     );
-    println!(
-        "Included:   {} native actions ({:.0}/s)",
-        format_num(final_included),
-        include_rate,
-    );
+    match summary.unique {
+        Some(unique) => {
+            let dup_factor = if unique > 0 {
+                summary.slots as f64 / unique as f64
+            } else {
+                1.0
+            };
+            println!(
+                "Included:   {} unique native actions ({:.0}/s) [{} slots, dup x{:.2}]",
+                format_num(unique),
+                include_rate,
+                format_num(summary.slots),
+                dup_factor,
+            );
+        }
+        None => println!(
+            "Included:   {} native action slots ({:.0}/s) [no identities from node; \
+             may overcount re-inclusions]",
+            format_num(final_included),
+            include_rate,
+        ),
+    }
     if orders_per_action > 1 {
         println!(
             "Orders:     {} orders ({:.0}/s)  [actions x{} batch]",
@@ -902,10 +1027,10 @@ async fn run_consensus(
         avg_native_per_block,
     );
     println!();
-    if peak_actions > 0 {
+    if summary.peak_actions > 0 {
         println!(
             "Peak:       {:.0}/s included (block #{}, {} actions)",
-            include_rate, peak_block, peak_actions,
+            include_rate, summary.peak_block, summary.peak_actions,
         );
     }
     println!(
@@ -1075,8 +1200,8 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::summarize_included;
     use super::sign_payload_batch;
+    use super::{summarize_included, SweptBlock};
     use rand::{rngs::StdRng, SeedableRng};
 
     #[test]
@@ -1104,20 +1229,30 @@ mod tests {
 
     #[test]
     fn summarize_totals_count_and_peak() {
-        // total = 5+20+0+8 = 33; peak block is #11 with 20 actions.
-        let blocks = [(10u64, 5u64), (11, 20), (12, 0), (13, 8)];
-        assert_eq!(summarize_included(&blocks), (33, 4, 20, 11));
-    }
-
-    #[test]
-    fn summarize_empty_is_zero() {
-        assert_eq!(summarize_included(&[]), (0, 0, 0, 0));
+        // slots = 5+20+0+8 = 33; peak block is #11 with 20 actions.
+        let blocks: Vec<SweptBlock> = vec![
+            (10, 5, Vec::new()),
+            (11, 20, Vec::new()),
+            (12, 0, Vec::new()),
+            (13, 8, Vec::new()),
+        ];
+        let s = summarize_included(&blocks);
+        assert_eq!(
+            (s.slots, s.block_count, s.peak_actions, s.peak_block),
+            (33, 4, 20, 11)
+        );
+        // Count-only bodies (no identities) → unique unknown.
+        assert_eq!(s.unique, None);
     }
 
     #[test]
     fn summarize_first_max_wins_on_ties() {
         // First block reaching the peak count keeps the peak_block slot.
-        let blocks = [(7u64, 9u64), (8, 9)];
-        assert_eq!(summarize_included(&blocks), (18, 2, 9, 7));
+        let blocks: Vec<SweptBlock> = vec![(7, 9, Vec::new()), (8, 9, Vec::new())];
+        let s = summarize_included(&blocks);
+        assert_eq!(
+            (s.slots, s.block_count, s.peak_actions, s.peak_block),
+            (18, 2, 9, 7)
+        );
     }
 }

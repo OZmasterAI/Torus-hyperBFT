@@ -1,0 +1,16 @@
+# Leg B — mixed-version fallback proof: validator-3 runs the pre-Sprint5
+# image (no /2.0 protocols, no v2 gossip topic). gossip-zstd stays OFF
+# everywhere (base commands), since an old peer cannot read the v2 topic.
+# validator-0 keeps codec debug so per-peer 2.0-vs-1.0 negotiation is visible.
+# Usage: docker compose -f docker-compose.yml -f docker-compose.legB.yml up -d
+services:
+  validator-0:
+    command:
+      - --genesis=/genesis/genesis.json
+      - --data-dir=/data
+      - --validator-key=0100000000000000000000000000000000000000000000000000000000000000
+      - --p2p-listen=/ip4/0.0.0.0/udp/30333/quic-v1
+      - --rpc-addr=0.0.0.0:8545
+      - --log-level=info,torus_network::codec=debug
+  validator-3:
+    image: torus-devnet-node:pre-sprint5

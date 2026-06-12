@@ -67,9 +67,42 @@ until a contention-free probe says otherwise. The s352/s353 pool
 isolation stays — it's correct architecture regardless.
 
 ## Open Questions
-- What exactly produces idle load ~11? (framework gates? surrealdb?
-  indexer?) — audit before pinning.
+- ~~What exactly produces idle load ~11?~~ ANSWERED (s356 audit below).
 - Do the OTHER validators (val1/val2) have the same contention profile?
   Their inclusion latency affects end-to-end numbers too.
 - bench-throughput counts duplicate block-body inclusions — fix its
   accounting (exec-side dedup is truth) before trusting its included/s.
+
+## s356 audit (2026-06-12, devnet down, 10s /proc delta sample)
+Box steady-state CPU attribution (8 cores):
+- toolshed.py (MCP gateway): **100% — one full core, sustained 6 days**.
+  Single biggest standing tax; likely a poll loop missing a sleep.
+- active claude session: ~37% while working (×3 sessions resident, bursty)
+- everything else ≤2% each: surrealdb, mongod, TORUSd, vscode-server,
+  ngrok, tmux, memory_server
+Per-tool-call hook spikes (statusline.py etc.) hit 100% momentarily but
+are short-lived. The historical "load ~11" = this baseline + devnet
+containers + bench + hook storms stacking.
+
+Cross-confirmation: the s356 devnet shake-out saturated the box (load 40)
+with 5 node containers; averaged CPU was identical for pre-Sprint5 and
+HEAD binaries (~270-310% each) — starvation is environmental, not a code
+regression. Reconfirms the 5.8ms-real / starvation-tax thesis.
+
+## B1 pinning runbook (prepared s356 — NOT yet applied, needs user go)
+Goal: node on cores 2-7 (6 dedicated), framework noise confined to 0-1.
+No root needed:
+1. `systemctl --user set-property --runtime <toolshed unit> AllowedCPUs=0-1`
+   (same for surrealdb.service, memory server unit if systemd-managed;
+   ad-hoc processes instead get `taskset -cp 0-1 <pid>`)
+2. `taskset -cp 0-1 <tmux-server-pid>` — claude sessions + shells inherit.
+3. Node start command gains `taskset -c 2-7` prefix:
+   `taskset -c 2-7 nohup ./target/release/torus-node --genesis ... &`
+4. Drop `--runtime`/persist only after a validated probe.
+Rollback: `taskset -cp 0-7 <pid>` / drop the property.
+
+## B2+B3 re-probe procedure (post-relaunch, quiet + pinned box)
+bs500, 10+ senders, `--format bin` (sprint5-B endpoint: drops ~30% of the
+5.8ms real cost), exec-side dedup as the truth metric. Expected if thesis
+holds: per-action verify CPU ≈ 4-6ms, ingress ceiling ≈ 600+ actions/s
+on 6 dedicated cores.
