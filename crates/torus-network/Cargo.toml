@@ -21,6 +21,7 @@ bincode = { workspace = true }
 zeroize = { workspace = true }
 futures = "0.3"
 async-trait = "0.1"
+zstd = "0.13"  # /torus/*/2.0 wire frames (sprint5); zstd-sys already in tree via reth
 
 [dev-dependencies]
 tokio = { workspace = true }

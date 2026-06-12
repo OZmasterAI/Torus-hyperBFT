@@ -12,6 +12,11 @@ use crate::sync::{SyncRequest, SyncResponse};
 pub const CONSENSUS_TOPIC: &str = "/torus/consensus/1.0";
 pub const TX_TOPIC: &str = "/torus/transactions/1.0";
 pub const NATIVE_ACTION_TOPIC: &str = "/torus/native-actions/1.0";
+/// Sprint 5: zstd-compressed native-action batches. Gossipsub cannot
+/// negotiate per-peer like request_response, so nodes SUBSCRIBE to both
+/// topics but publish v2 only behind `--gossip-zstd` (flipped once every
+/// validator runs a 2.0-capable binary).
+pub const NATIVE_ACTION_TOPIC_V2: &str = "/torus/native-actions/2.0";
 
 #[derive(NetworkBehaviour)]
 pub struct TorusBehaviour {
@@ -56,31 +61,53 @@ impl TorusBehaviour {
         )
         .map_err(|e| format!("gossipsub: {e}"))?;
 
-        // Direct message request-response (borsh codec)
+        // Direct message request-response (borsh codec). Sprint 5: the /2.0
+        // variant is zstd-framed; listed FIRST so multistream-select prefers it,
+        // falling back per-peer to raw /1.0 with old binaries (mixed-binary safe).
         let direct = request_response::Behaviour::<BorshCodec>::new(
-            [(
-                StreamProtocol::new("/torus/direct/1.0"),
-                request_response::ProtocolSupport::Full,
-            )],
+            [
+                (
+                    StreamProtocol::new("/torus/direct/2.0"),
+                    request_response::ProtocolSupport::Full,
+                ),
+                (
+                    StreamProtocol::new("/torus/direct/1.0"),
+                    request_response::ProtocolSupport::Full,
+                ),
+            ],
             request_response::Config::default().with_request_timeout(Duration::from_secs(10)),
         );
 
-        // Block data fetch request-response (borsh codec, hybrid pipelining)
+        // Block data fetch request-response (borsh codec, hybrid pipelining).
+        // /2.0 = zstd-framed, negotiated per peer (Sprint 5).
         let block_data = request_response::Behaviour::<BlockDataCodec>::new(
-            [(
-                StreamProtocol::new("/torus/block-data/1.0"),
-                request_response::ProtocolSupport::Full,
-            )],
+            [
+                (
+                    StreamProtocol::new("/torus/block-data/2.0"),
+                    request_response::ProtocolSupport::Full,
+                ),
+                (
+                    StreamProtocol::new("/torus/block-data/1.0"),
+                    request_response::ProtocolSupport::Full,
+                ),
+            ],
             request_response::Config::default().with_request_timeout(Duration::from_secs(10)),
         );
 
         // Native-action DA fetch request-response (borsh codec, Phase C Task 5):
         // serves CompactBlock bodies by-hash for the RARE pull-fallback.
+        // /2.0 = zstd-framed, negotiated per peer (Sprint 5).
         let native_da = request_response::Behaviour::<NativeDaCodec>::new(
-            [(
-                StreamProtocol::new("/torus/native-da/1.0"),
-                request_response::ProtocolSupport::Full,
-            )],
+            [
+                (
+                    StreamProtocol::new("/torus/native-da/2.0"),
+                    request_response::ProtocolSupport::Full,
+                ),
+                (
+                    StreamProtocol::new("/torus/native-da/1.0"),
+                    request_response::ProtocolSupport::Full,
+                ),
+            ],
             request_response::Config::default().with_request_timeout(Duration::from_secs(10)),
         );
 

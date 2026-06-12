@@ -127,6 +127,15 @@ struct Cli {
     /// --native-gossip=false to fall back to push/pull-only dissemination.
     #[arg(long, default_value_t = true)]
     native_gossip: bool,
+
+    /// Publish native-action gossip batches zstd-compressed on the
+    /// /torus/native-actions/2.0 topic (Sprint 5). Receiving is always
+    /// dual-topic; flip this ONLY once every validator runs a 2.0-capable
+    /// binary — old peers cannot read the compressed topic. The
+    /// request/response paths (direct push, DA pull, block-data) negotiate
+    /// zstd per peer automatically and need no flag.
+    #[arg(long)]
+    gossip_zstd: bool,
 }
 
 #[derive(clap::Subcommand)]
@@ -417,6 +426,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let network_config = NetworkConfig {
         listen_addr,
         bootstrap_peers,
+        gossip_zstd: cli.gossip_zstd,
         ..NetworkConfig::default()
     };
 

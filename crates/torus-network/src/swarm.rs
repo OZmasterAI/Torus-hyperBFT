@@ -13,7 +13,7 @@ use tracing::{debug, info, warn};
 
 use torus_state::NativeDaStore;
 
-use crate::behaviour::{TorusBehaviour, TorusBehaviourEvent, CONSENSUS_TOPIC, NATIVE_ACTION_TOPIC, TX_TOPIC};
+use crate::behaviour::{TorusBehaviour, TorusBehaviourEvent, CONSENSUS_TOPIC, NATIVE_ACTION_TOPIC, NATIVE_ACTION_TOPIC_V2, TX_TOPIC};
 use crate::codec::{
     BlockDataNetRequest, BlockDataNetResponse, DirectRequest, DirectResponse, NativeDaNetRequest,
     NativeDaNetResponse,
@@ -331,11 +331,33 @@ fn publish_native_batch(
     batch: &mut Vec<Vec<u8>>,
     batch_bytes: &mut usize,
     trigger: &str,
+    zstd: bool,
 ) {
     if batch.is_empty() {
         return;
     }
     let payload = serialize_native_batch(batch);
+    // Sprint 5: behind --gossip-zstd the batch ships zstd-framed on the v2
+    // topic. On a compress failure keep the batch for the next flush — never
+    // ship raw bytes on the v2 topic, v2 receivers inflate unconditionally.
+    let payload = if zstd {
+        match zstd::bulk::compress(&payload, crate::codec::ZSTD_WIRE_LEVEL) {
+            Ok(c) => {
+                crate::codec::record_wire_compression(
+                    crate::codec::WirePath::GossipNative,
+                    payload.len(),
+                    c.len(),
+                );
+                c
+            }
+            Err(e) => {
+                warn!(%e, "zstd gossip compress failed; batch kept for retry");
+                return;
+            }
+        }
+    } else {
+        payload
+    };
     let count = batch.len();
     batch.clear();
     *batch_bytes = NATIVE_BATCH_HEADER_BYTES;
@@ -409,7 +431,17 @@ pub async fn run_swarm_with_config(
 ) {
     let consensus_topic = gossipsub::IdentTopic::new(CONSENSUS_TOPIC);
     let tx_topic = gossipsub::IdentTopic::new(TX_TOPIC);
-    let native_action_topic = gossipsub::IdentTopic::new(NATIVE_ACTION_TOPIC);
+    let native_action_topic_v1 = gossipsub::IdentTopic::new(NATIVE_ACTION_TOPIC);
+    let native_action_topic_v2 = gossipsub::IdentTopic::new(NATIVE_ACTION_TOPIC_V2);
+    // Sprint 5: receive BOTH topic versions unconditionally; PUBLISH v2 (zstd)
+    // only behind --gossip-zstd — gossipsub cannot negotiate per-peer the way
+    // request_response does, so the flip waits for all validators on 2.0.
+    let gossip_zstd = config.gossip_zstd;
+    let native_action_topic = if gossip_zstd {
+        native_action_topic_v2.clone()
+    } else {
+        native_action_topic_v1.clone()
+    };
 
     if let Err(e) = swarm.behaviour_mut().gossipsub.subscribe(&consensus_topic) {
         warn!("Failed to subscribe to consensus topic: {e:?}");
@@ -417,8 +449,11 @@ pub async fn run_swarm_with_config(
     if let Err(e) = swarm.behaviour_mut().gossipsub.subscribe(&tx_topic) {
         warn!("Failed to subscribe to tx topic: {e:?}");
     }
-    if let Err(e) = swarm.behaviour_mut().gossipsub.subscribe(&native_action_topic) {
+    if let Err(e) = swarm.behaviour_mut().gossipsub.subscribe(&native_action_topic_v1) {
         warn!("Failed to subscribe to native action topic: {e:?}");
+    }
+    if let Err(e) = swarm.behaviour_mut().gossipsub.subscribe(&native_action_topic_v2) {
+        warn!("Failed to subscribe to native action v2 topic: {e:?}");
     }
 
     let mut tx_gossip_state = TxGossipState::new(
@@ -542,6 +577,7 @@ pub async fn run_swarm_with_config(
                     &mut native_batch,
                     &mut native_batch_bytes,
                     "timer",
+                    gossip_zstd,
                 );
             }
             SwarmAction::NativeAction(Some(action_bytes)) => {
@@ -568,6 +604,7 @@ pub async fn run_swarm_with_config(
                             &mut native_batch,
                             &mut native_batch_bytes,
                             "byte budget",
+                            gossip_zstd,
                         );
                     }
                     native_batch_bytes += entry_bytes;
@@ -580,6 +617,7 @@ pub async fn run_swarm_with_config(
                             &mut native_batch,
                             &mut native_batch_bytes,
                             "count cap",
+                            gossip_zstd,
                         );
                     }
                 }
@@ -669,7 +707,9 @@ fn handle_event(
                     return;
                 }
                 handle_consensus_gossip(&message.data, shared, peer_scoring, &author);
-            } else if message.topic == gossipsub::IdentTopic::new(NATIVE_ACTION_TOPIC).hash() {
+            } else if message.topic == gossipsub::IdentTopic::new(NATIVE_ACTION_TOPIC).hash()
+                || message.topic == gossipsub::IdentTopic::new(NATIVE_ACTION_TOPIC_V2).hash()
+            {
                 if message.data.len() > max_tx_msg_size {
                     // Penalty goes to the AUTHOR, never the relayer — forwarder
                     // penalties on this exact path banned friend2 (validator) for
@@ -688,7 +728,39 @@ fn handle_event(
                     );
                     return;
                 }
-                if let Some(actions) = deserialize_native_batch(&message.data) {
+                // Sprint 5: the v2 topic carries a zstd frame of the identical
+                // batch bytes; inflate bounded by the same receiver cap before
+                // parsing. Undecodable frames penalize the AUTHOR (never the
+                // forwarder — the s339/s350 ban-the-relayer lesson).
+                let v2_buf;
+                let payload: &[u8] = if message.topic
+                    == gossipsub::IdentTopic::new(NATIVE_ACTION_TOPIC_V2).hash()
+                {
+                    match zstd::bulk::decompress(&message.data, max_tx_msg_size) {
+                        Ok(d) => {
+                            v2_buf = d;
+                            &v2_buf
+                        }
+                        Err(e) => {
+                            warn!(
+                                peer = %propagation_source,
+                                author = ?message.source,
+                                %e,
+                                "undecodable zstd native batch rejected"
+                            );
+                            penalize_gossip_author(
+                                peer_scoring,
+                                message.source,
+                                PENALTY_INVALID_TX,
+                                "undecodable zstd native batch",
+                            );
+                            return;
+                        }
+                    }
+                } else {
+                    &message.data
+                };
+                if let Some(actions) = deserialize_native_batch(payload) {
                     let count = actions.len();
                     let mut ok = 0usize;
                     for action_bytes in actions {
@@ -709,7 +781,7 @@ fn handle_event(
                         m.native_gossip_received_actions.inc_by(ok as u64);
                     }
                 } else {
-                    match bincode::deserialize::<(torus_types::Address, torus_types::SignedNativeAction)>(&message.data) {
+                    match bincode::deserialize::<(torus_types::Address, torus_types::SignedNativeAction)>(payload) {
                         Ok(pair) => {
                             if let Some(ref tx) = shared.native_action_inbound {
                                 let _ = tx.send(pair);

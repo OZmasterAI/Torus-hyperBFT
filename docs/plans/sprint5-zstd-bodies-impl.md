@@ -74,6 +74,20 @@ upgrade.
 - Commit code; append measured ratios to sprint5-zstd-bodies.md.
 - **Depends on**: Task 6
 
+## Implementation deltas (s355, during build)
+- `/torus/sync/2.0` DESCOPED: `sync_proto` uses libp2p's built-in cbor codec
+  (serde types, not borsh) — making it zstd-aware means replacing the codec.
+  Sync's heavy payloads actually travel `/torus/block-data` (16 MB cap),
+  which IS versioned; the cbor channel is small control traffic. Revisit only
+  if sync-control bytes ever show up in the wire counters.
+- T5 telemetry: implemented as in-process atomics
+  (`codec::wire_compression_stats()`, per-path pre/wire byte counters) plus a
+  debug log per /2.0 frame — prometheus registry export deferred to the
+  friend-deploy rollout commit.
+- T6 mixed-version devnet proof DEFERRED on user instruction (no node runs
+  until friends deploy). The negotiation fallback is exercised in code review
+  + unit tests; live proof rides the friend-deploy session.
+
 ## Verification (end-to-end)
 Devnet mixed-version proof (T6) is the gate. Live testnet rollout per the
 design doc Rollout section — seed deploy any time after T6; gossip flip only

@@ -69,8 +69,17 @@ roadmap names — building it here also unblocks erasure coding (item 2) later.
 4. Flip `--gossip-zstd` on all three → gossip savings; retire v1 topic in a
    later release.
 
+## Measured (s355, T1 ratio probe — varied 500-order batch, realistic shape)
+- level 1: 64,664 → 5,869 bytes (11.0x)
+- level 3: 64,664 → 6,882 bytes (9.4x)  ← shipped (`ZSTD_WIRE_LEVEL`)
+- level 6: 64,664 → 6,688 bytes (9.7x)
+~9–11x on order-JSON, well above the 3–5x roadmap estimate. Level 3 kept:
+levels 1/6 differ by <15% on size; live traffic ratio to be confirmed via
+`codec::wire_compression_stats()` after the friend deploy.
+
 ## Open Questions
 - zstd level: start 3 (fast, ~3-4x on JSON); benchmark 1 vs 3 vs 6 in T1.
+  RESOLVED s355: see Measured — level 3 shipped.
 - Dictionary training (shared zstd dict for small frames): defer — batches
   are large enough that plain frames should hit target; revisit if gossip
   singles dominate.

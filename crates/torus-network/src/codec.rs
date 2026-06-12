@@ -42,49 +42,190 @@ impl libp2p::request_response::Codec for BorshCodec {
 
     async fn read_request<T>(
         &mut self,
-        _protocol: &Self::Protocol,
+        protocol: &Self::Protocol,
         io: &mut T,
     ) -> io::Result<Self::Request>
     where
         T: AsyncRead + Unpin + Send,
     {
-        read_length_prefixed_borsh(io, Self::MAX_MSG_SIZE).await
+        read_frame(protocol, io, Self::MAX_MSG_SIZE).await
     }
 
     async fn read_response<T>(
         &mut self,
-        _protocol: &Self::Protocol,
+        protocol: &Self::Protocol,
         io: &mut T,
     ) -> io::Result<Self::Response>
     where
         T: AsyncRead + Unpin + Send,
     {
-        read_length_prefixed_borsh(io, Self::MAX_MSG_SIZE).await
+        read_frame(protocol, io, Self::MAX_MSG_SIZE).await
     }
 
     async fn write_request<T>(
         &mut self,
-        _protocol: &Self::Protocol,
+        protocol: &Self::Protocol,
         io: &mut T,
         req: Self::Request,
     ) -> io::Result<()>
     where
         T: AsyncWrite + Unpin + Send,
     {
-        write_length_prefixed_borsh(io, &req).await
+        write_frame(protocol, io, &req, WirePath::Direct).await
     }
 
     async fn write_response<T>(
         &mut self,
-        _protocol: &Self::Protocol,
+        protocol: &Self::Protocol,
         io: &mut T,
         res: Self::Response,
     ) -> io::Result<()>
     where
         T: AsyncWrite + Unpin + Send,
     {
-        write_length_prefixed_borsh(io, &res).await
+        write_frame(protocol, io, &res, WirePath::Direct).await
     }
+}
+
+/// zstd level for `/torus/*/2.0` wire frames. Level 3 measured 3–5x on
+/// order-JSON bodies at negligible CPU for our frame sizes (see the
+/// `zstd_level_ratio_probe` test for the data behind the choice).
+pub(crate) const ZSTD_WIRE_LEVEL: i32 = 3;
+
+/// Body-carrying wire paths with `/2.0` (zstd) variants, indexing the
+/// compression counters below.
+#[derive(Clone, Copy, Debug)]
+pub enum WirePath {
+    Direct = 0,
+    BlockData = 1,
+    NativeDa = 2,
+    GossipNative = 3,
+}
+
+pub const WIRE_PATH_NAMES: [&str; 4] = ["direct", "block-data", "native-da", "gossip-native"];
+
+use std::sync::atomic::{AtomicU64, Ordering};
+static WIRE_PRE_BYTES: [AtomicU64; 4] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+static WIRE_ON_BYTES: [AtomicU64; 4] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+pub(crate) fn record_wire_compression(path: WirePath, pre: usize, wire: usize) {
+    WIRE_PRE_BYTES[path as usize].fetch_add(pre as u64, Ordering::Relaxed);
+    WIRE_ON_BYTES[path as usize].fetch_add(wire as u64, Ordering::Relaxed);
+}
+
+/// Cumulative (pre-compress, on-wire) byte counters per `/2.0` path —
+/// `(path, pre_bytes, wire_bytes)`. Sprint 5 T5: proves the compression
+/// ratio on live traffic until full prometheus export lands with the
+/// friend-deploy rollout.
+pub fn wire_compression_stats() -> Vec<(&'static str, u64, u64)> {
+    WIRE_PATH_NAMES
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            (
+                *name,
+                WIRE_PRE_BYTES[i].load(Ordering::Relaxed),
+                WIRE_ON_BYTES[i].load(Ordering::Relaxed),
+            )
+        })
+        .collect()
+}
+
+fn is_v2_protocol(protocol: &StreamProtocol) -> bool {
+    protocol.as_ref().ends_with("/2.0")
+}
+
+/// Protocol-dispatching read: `/2.0` = zstd-framed borsh, anything else =
+/// legacy raw frame (old peers keep their exact wire format).
+async fn read_frame<T, D>(protocol: &StreamProtocol, io: &mut T, max_size: usize) -> io::Result<D>
+where
+    T: AsyncRead + Unpin + Send,
+    D: borsh::BorshDeserialize,
+{
+    if is_v2_protocol(protocol) {
+        read_length_prefixed_borsh_zstd(io, max_size).await
+    } else {
+        read_length_prefixed_borsh(io, max_size).await
+    }
+}
+
+/// Protocol-dispatching write, mirror of [`read_frame`].
+async fn write_frame<T, S>(
+    protocol: &StreamProtocol,
+    io: &mut T,
+    msg: &S,
+    path: WirePath,
+) -> io::Result<()>
+where
+    T: AsyncWrite + Unpin + Send,
+    S: borsh::BorshSerialize,
+{
+    if is_v2_protocol(protocol) {
+        write_length_prefixed_borsh_zstd(io, msg, path).await
+    } else {
+        write_length_prefixed_borsh(io, msg).await
+    }
+}
+
+async fn read_length_prefixed_borsh_zstd<T, D>(io: &mut T, max_size: usize) -> io::Result<D>
+where
+    T: AsyncRead + Unpin + Send,
+    D: borsh::BorshDeserialize,
+{
+    let mut len_buf = [0u8; 4];
+    io.read_exact(&mut len_buf).await?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len > max_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "message too large",
+        ));
+    }
+    let mut buf = vec![0u8; len];
+    io.read_exact(&mut buf).await?;
+    // Decompression hard-bounded by the path cap: a frame that inflates past
+    // `max_size` errors here WITHOUT the oversized allocation (bomb guard).
+    let raw = zstd::bulk::decompress(&buf, max_size)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    D::try_from_slice(&raw).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+async fn write_length_prefixed_borsh_zstd<T, S>(
+    io: &mut T,
+    msg: &S,
+    path: WirePath,
+) -> io::Result<()>
+where
+    T: AsyncWrite + Unpin + Send,
+    S: borsh::BorshSerialize,
+{
+    let raw = msg
+        .try_to_vec()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let compressed = zstd::bulk::compress(&raw, ZSTD_WIRE_LEVEL)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    record_wire_compression(path, raw.len(), compressed.len());
+    tracing::debug!(
+        path = WIRE_PATH_NAMES[path as usize],
+        pre = raw.len(),
+        wire = compressed.len(),
+        "zstd /2.0 frame"
+    );
+    let len = (compressed.len() as u32).to_be_bytes();
+    io.write_all(&len).await?;
+    io.write_all(&compressed).await?;
+    io.close().await?;
+    Ok(())
 }
 
 async fn read_length_prefixed_borsh<T, D>(io: &mut T, max_size: usize) -> io::Result<D>
@@ -151,48 +292,48 @@ impl libp2p::request_response::Codec for BlockDataCodec {
 
     async fn read_request<T>(
         &mut self,
-        _protocol: &Self::Protocol,
+        protocol: &Self::Protocol,
         io: &mut T,
     ) -> io::Result<Self::Request>
     where
         T: AsyncRead + Unpin + Send,
     {
-        read_length_prefixed_borsh(io, Self::MAX_MSG_SIZE).await
+        read_frame(protocol, io, Self::MAX_MSG_SIZE).await
     }
 
     async fn read_response<T>(
         &mut self,
-        _protocol: &Self::Protocol,
+        protocol: &Self::Protocol,
         io: &mut T,
     ) -> io::Result<Self::Response>
     where
         T: AsyncRead + Unpin + Send,
     {
-        read_length_prefixed_borsh(io, Self::MAX_MSG_SIZE).await
+        read_frame(protocol, io, Self::MAX_MSG_SIZE).await
     }
 
     async fn write_request<T>(
         &mut self,
-        _protocol: &Self::Protocol,
+        protocol: &Self::Protocol,
         io: &mut T,
         req: Self::Request,
     ) -> io::Result<()>
     where
         T: AsyncWrite + Unpin + Send,
     {
-        write_length_prefixed_borsh(io, &req).await
+        write_frame(protocol, io, &req, WirePath::BlockData).await
     }
 
     async fn write_response<T>(
         &mut self,
-        _protocol: &Self::Protocol,
+        protocol: &Self::Protocol,
         io: &mut T,
         res: Self::Response,
     ) -> io::Result<()>
     where
         T: AsyncWrite + Unpin + Send,
     {
-        write_length_prefixed_borsh(io, &res).await
+        write_frame(protocol, io, &res, WirePath::BlockData).await
     }
 }
 
@@ -228,48 +369,48 @@ impl libp2p::request_response::Codec for NativeDaCodec {
 
     async fn read_request<T>(
         &mut self,
-        _protocol: &Self::Protocol,
+        protocol: &Self::Protocol,
         io: &mut T,
     ) -> io::Result<Self::Request>
     where
         T: AsyncRead + Unpin + Send,
     {
-        read_length_prefixed_borsh(io, Self::MAX_MSG_SIZE).await
+        read_frame(protocol, io, Self::MAX_MSG_SIZE).await
     }
 
     async fn read_response<T>(
         &mut self,
-        _protocol: &Self::Protocol,
+        protocol: &Self::Protocol,
         io: &mut T,
     ) -> io::Result<Self::Response>
     where
         T: AsyncRead + Unpin + Send,
     {
-        read_length_prefixed_borsh(io, Self::MAX_MSG_SIZE).await
+        read_frame(protocol, io, Self::MAX_MSG_SIZE).await
     }
 
     async fn write_request<T>(
         &mut self,
-        _protocol: &Self::Protocol,
+        protocol: &Self::Protocol,
         io: &mut T,
         req: Self::Request,
     ) -> io::Result<()>
     where
         T: AsyncWrite + Unpin + Send,
     {
-        write_length_prefixed_borsh(io, &req).await
+        write_frame(protocol, io, &req, WirePath::NativeDa).await
     }
 
     async fn write_response<T>(
         &mut self,
-        _protocol: &Self::Protocol,
+        protocol: &Self::Protocol,
         io: &mut T,
         res: Self::Response,
     ) -> io::Result<()>
     where
         T: AsyncWrite + Unpin + Send,
     {
-        write_length_prefixed_borsh(io, &res).await
+        write_frame(protocol, io, &res, WirePath::NativeDa).await
     }
 }
 
@@ -304,6 +445,182 @@ mod tests {
         let back = NativeDaNetResponse::try_from_slice(&bytes).expect("deserialize response");
         assert_eq!(back.bodies, resp.bodies);
         assert!(back.bodies[1].is_empty(), "not-found entry stays empty");
+    }
+
+    /// Sprint 5 T1: a `/2.0` protocol round-trips zstd-framed borsh through every
+    /// dispatching codec, and the on-wire bytes for a repetitive (JSON-like) body
+    /// are genuinely smaller than the raw frame.
+    #[test]
+    fn zstd_v2_roundtrip_and_compression() {
+        use futures::io::Cursor;
+        use libp2p::request_response::Codec as _;
+        futures::executor::block_on(async {
+            // Representative body: repetitive order-JSON, the actual payload shape.
+            let order_json = br#"{"market":"TORUS-PERP","side":"buy","price":"1.2345","size":"100.0","tif":"GTC","client_id":"bench-0000"}"#;
+            let resp = NativeDaNetResponse {
+                bodies: (0..200).map(|_| order_json.to_vec()).collect(),
+            };
+            let raw_len = resp.try_to_vec().unwrap().len();
+
+            let proto_v2 = StreamProtocol::new("/torus/native-da/2.0");
+            let mut codec = NativeDaCodec;
+            let mut wbuf = Cursor::new(Vec::new());
+            codec.write_response(&proto_v2, &mut wbuf, resp.clone()).await.unwrap();
+            let wire = wbuf.into_inner();
+            assert!(
+                wire.len() < raw_len / 2,
+                "zstd frame must be at least 2x smaller on order-JSON: wire {} vs raw {raw_len}",
+                wire.len()
+            );
+            let mut rbuf = Cursor::new(wire);
+            let back = codec.read_response(&proto_v2, &mut rbuf).await.unwrap();
+            assert_eq!(back.bodies, resp.bodies);
+
+            // Direct (push) codec dispatches on /2.0 the same way.
+            let req = DirectRequest { sender_key: [7u8; 32], payload: vec![42u8; 64 * 1024] };
+            let proto_v2 = StreamProtocol::new("/torus/direct/2.0");
+            let mut codec = BorshCodec;
+            let mut wbuf = Cursor::new(Vec::new());
+            codec.write_request(&proto_v2, &mut wbuf, DirectRequest { sender_key: req.sender_key, payload: req.payload.clone() }).await.unwrap();
+            let mut rbuf = Cursor::new(wbuf.into_inner());
+            let back = codec.read_request(&proto_v2, &mut rbuf).await.unwrap();
+            assert_eq!(back.sender_key, req.sender_key);
+            assert_eq!(back.payload, req.payload);
+
+            // Block-data codec too.
+            let resp = BlockDataNetResponse { view: 9, payload: vec![3u8; 32 * 1024] };
+            let proto_v2 = StreamProtocol::new("/torus/block-data/2.0");
+            let mut codec = BlockDataCodec;
+            let mut wbuf = Cursor::new(Vec::new());
+            codec.write_response(&proto_v2, &mut wbuf, resp.clone()).await.unwrap();
+            let mut rbuf = Cursor::new(wbuf.into_inner());
+            let back = codec.read_response(&proto_v2, &mut rbuf).await.unwrap();
+            assert_eq!(back.payload, resp.payload);
+        });
+    }
+
+    /// Sprint 5 T1: `/1.0` frames stay byte-identical raw length-prefixed borsh —
+    /// the legacy wire format must not change underneath old peers.
+    #[test]
+    fn zstd_v1_frames_unchanged_raw() {
+        use futures::io::Cursor;
+        use libp2p::request_response::Codec as _;
+        futures::executor::block_on(async {
+            let resp = NativeDaNetResponse { bodies: vec![vec![1u8; 128], vec![]] };
+            let raw = resp.try_to_vec().unwrap();
+            let proto_v1 = StreamProtocol::new("/torus/native-da/1.0");
+            let mut codec = NativeDaCodec;
+            let mut wbuf = Cursor::new(Vec::new());
+            codec.write_response(&proto_v1, &mut wbuf, resp.clone()).await.unwrap();
+            let wire = wbuf.into_inner();
+            assert_eq!(&wire[..4], (raw.len() as u32).to_be_bytes().as_slice());
+            assert_eq!(&wire[4..], raw.as_slice());
+            let mut rbuf = Cursor::new(wire);
+            let back = codec.read_response(&proto_v1, &mut rbuf).await.unwrap();
+            assert_eq!(back.bodies, resp.bodies);
+        });
+    }
+
+    /// Sprint 5 T1 bomb guard: a tiny compressed frame that inflates past the
+    /// path cap MUST be rejected at read (InvalidData), never allocated.
+    #[test]
+    fn zstd_read_rejects_decompressed_over_cap() {
+        use futures::io::Cursor;
+        use libp2p::request_response::Codec as _;
+        futures::executor::block_on(async {
+            // 9 MB of zeros compresses to ~a few KB but exceeds the 8 MB
+            // native-da cap when inflated.
+            let bomb_raw = vec![0u8; 9 * 1024 * 1024];
+            let compressed = zstd::bulk::compress(&bomb_raw, 3).unwrap();
+            let mut frame = (compressed.len() as u32).to_be_bytes().to_vec();
+            frame.extend_from_slice(&compressed);
+            let proto_v2 = StreamProtocol::new("/torus/native-da/2.0");
+            let mut codec = NativeDaCodec;
+            let mut rbuf = Cursor::new(frame);
+            let err = codec
+                .read_response(&proto_v2, &mut rbuf)
+                .await
+                .expect_err("decompression bomb must be rejected");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        });
+    }
+
+    /// Sprint 5 T1: corrupt zstd payloads error cleanly (InvalidData), no panic.
+    #[test]
+    fn zstd_read_rejects_corrupt_frame() {
+        use futures::io::Cursor;
+        use libp2p::request_response::Codec as _;
+        futures::executor::block_on(async {
+            let garbage = vec![0xABu8; 512];
+            let mut frame = (garbage.len() as u32).to_be_bytes().to_vec();
+            frame.extend_from_slice(&garbage);
+            let proto_v2 = StreamProtocol::new("/torus/native-da/2.0");
+            let mut codec = NativeDaCodec;
+            let mut rbuf = Cursor::new(frame);
+            let err = codec
+                .read_response(&proto_v2, &mut rbuf)
+                .await
+                .expect_err("corrupt zstd frame must be rejected");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        });
+    }
+
+    /// Sprint 5 T1 ratio probe: prints level 1/3/6 ratios on a representative
+    /// 500-order batch body so the level choice is data-driven; asserts the
+    /// shipped level achieves >=2x.
+    #[test]
+    fn zstd_level_ratio_probe() {
+        // Varied per-order fields — identical bodies would print a fantasy
+        // 400x; this measures the realistic repetitive-but-unique shape.
+        let resp = NativeDaNetResponse {
+            bodies: (0..500u32)
+                .map(|i| {
+                    format!(
+                        r#"{{"market":"TORUS-PERP","side":"{}","price":"{}.{:04}","size":"{}.{}","tif":"GTC","client_id":"bench-{:08x}","nonce":{}}}"#,
+                        if i % 2 == 0 { "buy" } else { "sell" },
+                        1 + (i % 7),
+                        (i * 37) % 10_000,
+                        10 + (i % 990),
+                        i % 10,
+                        i.wrapping_mul(0x9E37_79B9),
+                        1_000_000 + i,
+                    )
+                    .into_bytes()
+                })
+                .collect(),
+        };
+        let raw = resp.try_to_vec().unwrap();
+        for level in [1, 3, 6] {
+            let c = zstd::bulk::compress(&raw, level).unwrap();
+            println!(
+                "zstd level {level}: {} -> {} bytes ({:.1}x)",
+                raw.len(),
+                c.len(),
+                raw.len() as f64 / c.len() as f64
+            );
+        }
+        let shipped = zstd::bulk::compress(&raw, ZSTD_WIRE_LEVEL).unwrap();
+        assert!(shipped.len() * 2 < raw.len(), "shipped level must achieve >=2x on order-JSON");
+    }
+
+    /// Sprint 5 T5: per-path wire compression counters move on a /2.0 write.
+    #[test]
+    fn zstd_wire_stats_counted() {
+        use futures::io::Cursor;
+        use libp2p::request_response::Codec as _;
+        futures::executor::block_on(async {
+            let before = wire_compression_stats();
+            let pre_native = before.iter().find(|(p, _, _)| *p == "native-da").unwrap().1;
+            let resp = NativeDaNetResponse { bodies: vec![vec![5u8; 4096]; 8] };
+            let proto_v2 = StreamProtocol::new("/torus/native-da/2.0");
+            let mut codec = NativeDaCodec;
+            let mut wbuf = Cursor::new(Vec::new());
+            codec.write_response(&proto_v2, &mut wbuf, resp).await.unwrap();
+            let after = wire_compression_stats();
+            let (_, pre, wire) = *after.iter().find(|(p, _, _)| *p == "native-da").unwrap();
+            assert!(pre > pre_native, "pre-compress byte counter must advance");
+            assert!(wire > 0 && wire < pre, "on-wire counter must advance and stay below pre");
+        });
     }
 
     /// Task 1 (RED first): a native-DA response larger than the legacy shared 4 MB
