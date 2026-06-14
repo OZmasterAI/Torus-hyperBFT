@@ -1,0 +1,55 @@
+{
+  "prp": "double-verify-trust-cache",
+  "created": "2026-06-14T18:17:13",
+  "gate": "PARKED behind B1 clean-box probe (Q4) — do not run until verify is proven to still dominate post-pinning. Ship behind --exec-trust-cache (default off).",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Cache structure (FifoCache verified_senders in Mempool) + verified_locally flag on NativePoolEntry + cap const",
+      "status": "pending",
+      "files": ["crates/torus-mempool/src/native_pool.rs", "crates/torus-mempool/src/lib.rs", "crates/torus-mempool/src/rate_limit.rs"],
+      "validate": "cargo test -p torus-mempool --lib verified_sender",
+      "depends_on": []
+    },
+    {
+      "id": 2,
+      "name": "Populate cache at add_native_action_presigned + add_native_action_from_gossip; _trusted sets verified_locally=false",
+      "status": "pending",
+      "files": ["crates/torus-mempool/src/lib.rs"],
+      "validate": "cargo test -p torus-mempool --lib",
+      "depends_on": [1]
+    },
+    {
+      "id": 3,
+      "name": "Refresh-stash verified sender in remove_committed_native before removal (bridges 64-block exec lag)",
+      "status": "pending",
+      "files": ["crates/torus-mempool/src/lib.rs"],
+      "validate": "cargo test -p torus-mempool --lib remove_committed_stash",
+      "depends_on": [1, 2]
+    },
+    {
+      "id": 4,
+      "name": "Add verified_lookup closure param to batch_verify_native_actions; wire from app.rs:291 (hit=skip recover, miss=verify+slash)",
+      "status": "pending",
+      "files": ["crates/torus-types/src/eip712.rs", "crates/torus-consensus/src/app.rs"],
+      "validate": "cargo test -p torus-types --lib batch_verify && cargo test -p torus-consensus --lib",
+      "depends_on": [1]
+    },
+    {
+      "id": 5,
+      "name": "Integration tests: cache-vs-no-cache determinism, invalid-sig slashing still fires, provenance (trusted-claim re-verified)",
+      "status": "pending",
+      "files": ["crates/torus-consensus/src/app.rs"],
+      "validate": "cargo test -p torus-consensus --lib trust_cache",
+      "depends_on": [4]
+    },
+    {
+      "id": 6,
+      "name": "Metrics (cache hits/misses/evictions) + --exec-trust-cache gate flag (default off)",
+      "status": "pending",
+      "files": ["crates/torus-telemetry/src/lib.rs", "crates/torus-network/src/config.rs", "crates/torus-node/src/main.rs", "crates/torus-mempool/src/lib.rs"],
+      "validate": "cargo test -p torus-telemetry --lib && cargo build",
+      "depends_on": [1, 4]
+    }
+  ]
+}
