@@ -59,6 +59,9 @@ pub struct LibP2PNetwork {
     command_tx: mpsc::UnboundedSender<NetworkCommand>,
     shared: Arc<SharedState>,
     native_inbound_rx: Option<mpsc::UnboundedReceiver<(torus_types::Address, torus_types::SignedNativeAction)>>,
+    /// Inbound forwarded EVM txs (raw RLP) received on the leader (Option B). Taken once at
+    /// startup to drive an ingest task → `add_evm_tx`.
+    evm_inbound_rx: Option<mpsc::UnboundedReceiver<Vec<u8>>>,
     /// This node's own validator key, used to skip self when fanning a native-DA
     /// pull-fallback out to the validator set (Task 6).
     local_key: VerifyingKey,
@@ -70,6 +73,7 @@ impl Clone for LibP2PNetwork {
             command_tx: self.command_tx.clone(),
             shared: self.shared.clone(),
             native_inbound_rx: None,
+            evm_inbound_rx: None,
             local_key: self.local_key,
         }
     }
@@ -133,6 +137,7 @@ impl LibP2PNetwork {
             identity::Keypair::from(identity::ed25519::Keypair::from(libp2p_secret));
 
         let (native_inbound_tx, native_inbound_rx) = mpsc::unbounded_channel();
+        let (evm_inbound_tx, evm_inbound_rx) = mpsc::unbounded_channel();
         let shared = Arc::new(SharedState {
             inbound: Mutex::new(VecDeque::new()),
             peer_map: RwLock::new(PeerMap::default()),
@@ -141,6 +146,7 @@ impl LibP2PNetwork {
             block_store: RwLock::new(HashMap::new()),
             block_data_inbound: Mutex::new(VecDeque::new()),
             native_action_inbound: Some(native_inbound_tx),
+            evm_tx_inbound: Some(evm_inbound_tx),
             pending_sends: Mutex::new(PendingSendQueue::new(256)),
             outbound_direct: Mutex::new(HashMap::new()),
             recent_native_bundles: Mutex::new(VecDeque::new()),
@@ -192,7 +198,7 @@ impl LibP2PNetwork {
             ).await
         });
 
-        let network = Self { command_tx, shared, native_inbound_rx: Some(native_inbound_rx), local_key };
+        let network = Self { command_tx, shared, native_inbound_rx: Some(native_inbound_rx), evm_inbound_rx: Some(evm_inbound_rx), local_key };
         let tx_handle = TxGossipHandle { tx_sender: tx_tx };
         let native_handle = NativeGossipHandle { sender: native_tx };
         Ok((network, tx_handle, native_handle))
@@ -202,6 +208,12 @@ impl LibP2PNetwork {
     /// spawn a task that drains gossip-received actions into the mempool.
     pub fn take_native_action_rx(&mut self) -> Option<mpsc::UnboundedReceiver<(torus_types::Address, torus_types::SignedNativeAction)>> {
         self.native_inbound_rx.take()
+    }
+
+    /// Take the inbound forwarded-EVM-tx receiver (raw RLP). Called once at startup to spawn
+    /// the ingest task that drains direct-to-leader-forwarded EVM txs into the mempool (Option B).
+    pub fn take_evm_tx_rx(&mut self) -> Option<mpsc::UnboundedReceiver<Vec<u8>>> {
+        self.evm_inbound_rx.take()
     }
 
     /// Register a peer's VerifyingKey to PeerId mapping.
@@ -224,6 +236,12 @@ impl LibP2PNetwork {
     /// Payload format: sender_address(20) + serde_json(SignedNativeAction).
     pub fn forward_native_action(&self, target: VerifyingKey, payload: Vec<u8>) {
         let _ = self.command_tx.send(NetworkCommand::ForwardNativeAction { target, payload });
+    }
+
+    /// Forward a raw RLP EVM transaction directly to the leader (Option B — EVM tx
+    /// dissemination). Payload is the raw RLP; the leader full-validates via `add_evm_tx`.
+    pub fn forward_evm_tx(&self, target: VerifyingKey, payload: Vec<u8>) {
+        let _ = self.command_tx.send(NetworkCommand::ForwardEvmTx { target, payload });
     }
 
     pub fn broadcast_native_actions(&self, payload: Vec<u8>) {
@@ -393,6 +411,7 @@ mod tests {
             block_store: RwLock::new(HashMap::new()),
             block_data_inbound: Mutex::new(VecDeque::new()),
             native_action_inbound: None,
+            evm_tx_inbound: None,
             pending_sends: Mutex::new(PendingSendQueue::new(256)),
             outbound_direct: Mutex::new(HashMap::new()),
             recent_native_bundles: Mutex::new(VecDeque::new()),
@@ -456,6 +475,7 @@ mod tests {
             command_tx,
             shared,
             native_inbound_rx: None,
+            evm_inbound_rx: None,
             local_key: local.verifying_key(),
         };
 
@@ -513,6 +533,7 @@ mod tests {
             command_tx,
             shared: shared_with_validators(&[local.verifying_key()]),
             native_inbound_rx: None,
+            evm_inbound_rx: None,
             local_key: local.verifying_key(),
         };
         net.broadcast_native_action_hashes(vec![[7u8; 32], [9u8; 32]]);

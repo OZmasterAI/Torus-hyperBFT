@@ -163,6 +163,10 @@ pub struct RpcState {
     pub(crate) leader_vk_fn: Option<Arc<dyn Fn() -> Option<[u8; 32]> + Send + Sync>>,
     /// Channel to forward native actions to the leader: (leader_vk, sender_addr ++ action_json).
     pub(crate) forward_action_tx: Option<tokio::sync::mpsc::UnboundedSender<([u8; 32], Vec<u8>)>>,
+    /// Channel to forward raw EVM txs to the leader: (leader_vk, raw_rlp). Option B — EVM tx
+    /// dissemination. Unconditional (no `forward_bodies` gate): EVM has no gossip pre-spread,
+    /// so the unicast is the ONLY way a tx submitted to a non-proposer reaches the producer.
+    pub(crate) forward_evm_tx: Option<tokio::sync::mpsc::UnboundedSender<([u8; 32], Vec<u8>)>>,
     /// Forward full action bodies to the leader. Only wanted when native gossip
     /// is OFF (fallback mode) — with gossip pre-spread on, bodies already reach
     /// every validator and the duplicate forward just burns the leader's link
@@ -204,6 +208,7 @@ impl RpcServer {
                 own_vk: None,
                 leader_vk_fn: None,
                 forward_action_tx: None,
+                forward_evm_tx: None,
                 forward_bodies: false,
                 submit_semaphore: Arc::new(tokio::sync::Semaphore::new(SUBMIT_PERMITS)),
             },
@@ -219,11 +224,13 @@ impl RpcServer {
         own_vk: [u8; 32],
         leader_vk_fn: Arc<dyn Fn() -> Option<[u8; 32]> + Send + Sync>,
         forward_tx: tokio::sync::mpsc::UnboundedSender<([u8; 32], Vec<u8>)>,
+        evm_forward_tx: tokio::sync::mpsc::UnboundedSender<([u8; 32], Vec<u8>)>,
         forward_bodies: bool,
     ) {
         self.state.own_vk = Some(own_vk);
         self.state.leader_vk_fn = Some(leader_vk_fn);
         self.state.forward_action_tx = Some(forward_tx);
+        self.state.forward_evm_tx = Some(evm_forward_tx);
         self.state.forward_bodies = forward_bodies;
     }
 
@@ -1200,7 +1207,8 @@ mod tests {
             BlockNotifier::new(),
         );
         let (fwd_tx, mut fwd_rx) = tokio::sync::mpsc::unbounded_channel();
-        server.set_leader_forwarding(own, Arc::new(move || Some(leader)), fwd_tx, false);
+        let (evm_fwd_tx, _evm_fwd_rx) = tokio::sync::mpsc::unbounded_channel();
+        server.set_leader_forwarding(own, Arc::new(move || Some(leader)), fwd_tx, evm_fwd_tx, false);
         let (handle, addr) = server.start("127.0.0.1:0".parse().unwrap()).await.unwrap();
         use jsonrpsee::core::client::ClientT;
         let client = jsonrpsee::http_client::HttpClientBuilder::default()
@@ -1231,7 +1239,8 @@ mod tests {
             BlockNotifier::new(),
         );
         let (fwd_tx2, mut fwd_rx2) = tokio::sync::mpsc::unbounded_channel();
-        server2.set_leader_forwarding(own, Arc::new(move || Some(leader)), fwd_tx2, true);
+        let (evm_fwd_tx2, _evm_fwd_rx2) = tokio::sync::mpsc::unbounded_channel();
+        server2.set_leader_forwarding(own, Arc::new(move || Some(leader)), fwd_tx2, evm_fwd_tx2, true);
         let (handle2, addr2) = server2.start("127.0.0.1:0".parse().unwrap()).await.unwrap();
         let client2 = jsonrpsee::http_client::HttpClientBuilder::default()
             .build(format!("http://{addr2}"))
@@ -1251,6 +1260,122 @@ mod tests {
         assert!(
             payload.len() > 20,
             "payload is 20-byte sender prefix + action bytes"
+        );
+        handle2.stop().unwrap();
+    }
+
+    /// Option B (EVM tx dissemination): an EVM tx submitted to a NON-leader node must be
+    /// forwarded to the current leader UNCONDITIONALLY — unlike native actions, EVM has no
+    /// gossip pre-spread, so the `forward_bodies` gate does NOT apply. When this node IS the
+    /// leader, nothing is forwarded (it proposes the tx itself). RED before
+    /// `forward_evm_to_leader` + the `send_raw_transaction` call site exist.
+    #[tokio::test]
+    async fn evm_tx_forwarded_to_leader_unconditionally() {
+        use alloy_consensus::{SignableTransaction, TxEip1559, TxEnvelope};
+        use alloy_primitives::{Bytes, Signature as AlloySig, TxKind};
+        use alloy_rlp::Encodable;
+        use jsonrpsee::core::client::ClientT;
+
+        fn evm_addr(key: &k256::ecdsa::SigningKey) -> Address {
+            let pt = key.verifying_key().to_encoded_point(false);
+            Address::from_slice(&alloy_primitives::keccak256(&pt.as_bytes()[1..]).as_slice()[12..])
+        }
+        fn signed_eip1559(key: &k256::ecdsa::SigningKey, nonce: u64) -> Vec<u8> {
+            let tx = TxEip1559 {
+                chain_id: TORUS_CHAIN_ID,
+                nonce,
+                max_fee_per_gas: 1_000_000_000,
+                max_priority_fee_per_gas: 1_000_000_000,
+                gas_limit: 21_000,
+                to: TxKind::Call(Address::ZERO),
+                value: U256::from(1u64),
+                input: Bytes::new(),
+                access_list: Default::default(),
+            };
+            let sig_hash = tx.signature_hash();
+            let (sig, recid) = key.sign_prehash_recoverable(sig_hash.as_slice()).unwrap();
+            let r = U256::from_be_slice(sig.r().to_bytes().as_slice());
+            let s = U256::from_be_slice(sig.s().to_bytes().as_slice());
+            let signature = AlloySig::new(r, s, recid.is_y_odd());
+            let mut buf = Vec::new();
+            TxEnvelope::Eip1559(tx.into_signed(signature)).encode(&mut buf);
+            buf
+        }
+        let fund = |state: &StateDb, addr: &Address| {
+            state
+                .put_account(
+                    addr,
+                    &AccountInfo {
+                        balance: U256::from(10u128.pow(18)),
+                        nonce: 0,
+                        code_hash: B256::ZERO,
+                        code: None,
+                        account_id: None,
+                    },
+                )
+                .unwrap();
+        };
+
+        let key = k256::ecdsa::SigningKey::from_slice(
+            &hex::decode("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80")
+                .unwrap(),
+        )
+        .unwrap();
+        let sender = evm_addr(&key);
+        let own = [1u8; 32];
+        let leader = [2u8; 32];
+
+        // --- Node is NOT the leader: EVM tx must be forwarded even with forward_bodies=false. ---
+        let (_dir, state, mempool, executor) = setup();
+        fund(&state, &sender);
+        let raw = signed_eip1559(&key, 0);
+        let mut server =
+            RpcServer::new(state, mempool, executor, TORUS_CHAIN_ID, 100, BlockNotifier::new());
+        let (fwd_tx, _fwd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (evm_fwd_tx, mut evm_fwd_rx) = tokio::sync::mpsc::unbounded_channel();
+        server.set_leader_forwarding(own, Arc::new(move || Some(leader)), fwd_tx, evm_fwd_tx, false);
+        let (handle, addr) = server.start("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+        let hash: String = client
+            .request(
+                "eth_sendRawTransaction",
+                jsonrpsee::rpc_params![format!("0x{}", hex::encode(&raw))],
+            )
+            .await
+            .unwrap();
+        assert!(hash.starts_with("0x"));
+        let (vk, payload) = evm_fwd_rx
+            .try_recv()
+            .expect("EVM tx must be forwarded to the leader even with forward_bodies=false");
+        assert_eq!(vk, leader, "forwarded to the current leader");
+        assert_eq!(payload, raw, "payload is the raw RLP, unmodified (no sender prefix)");
+        handle.stop().unwrap();
+
+        // --- Node IS the leader: nothing forwarded (it proposes the tx itself). ---
+        let (_dir2, state2, mempool2, executor2) = setup();
+        fund(&state2, &sender);
+        let raw2 = signed_eip1559(&key, 0);
+        let mut server2 =
+            RpcServer::new(state2, mempool2, executor2, TORUS_CHAIN_ID, 100, BlockNotifier::new());
+        let (fwd_tx2, _fwd_rx2) = tokio::sync::mpsc::unbounded_channel();
+        let (evm_fwd_tx2, mut evm_fwd_rx2) = tokio::sync::mpsc::unbounded_channel();
+        server2.set_leader_forwarding(own, Arc::new(move || Some(own)), fwd_tx2, evm_fwd_tx2, false);
+        let (handle2, addr2) = server2.start("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let client2 = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr2}"))
+            .unwrap();
+        let _: String = client2
+            .request(
+                "eth_sendRawTransaction",
+                jsonrpsee::rpc_params![format!("0x{}", hex::encode(&raw2))],
+            )
+            .await
+            .unwrap();
+        assert!(
+            evm_fwd_rx2.try_recv().is_err(),
+            "no forward when this node is itself the leader"
         );
         handle2.stop().unwrap();
     }

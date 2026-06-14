@@ -61,6 +61,12 @@ pub enum NetworkCommand {
         target: VerifyingKey,
         payload: Vec<u8>,
     },
+    /// Forward a raw EVM transaction directly to the leader node (Option B — EVM tx
+    /// dissemination). Payload is raw RLP; the leader full-validates via `add_evm_tx`.
+    ForwardEvmTx {
+        target: VerifyingKey,
+        payload: Vec<u8>,
+    },
     /// Proposer pushes batched actions to all validators via req/res before CompactBlock proposal.
     BroadcastNativeActions {
         payload: Vec<u8>,
@@ -88,8 +94,30 @@ const PRE_PROPOSAL_BATCH_MARKER: u8 = 0xFD;
 /// set was too big to disseminate within the view, so the proposer pushes only the hashes
 /// and validators PULL the bodies (pre-warm). Phase 2.3 (#5) — un-wedges bs≈500.
 const PRE_PROPOSAL_HASHES_MARKER: u8 = 0xFC;
+/// Marker byte prefixed to forwarded EVM transactions in DirectRequest (Option B — EVM tx
+/// direct-to-leader dissemination). Distinct from the native/pre-proposal markers so the
+/// receive path routes the payload to `add_evm_tx`, never the native pool.
+const FORWARD_EVM_MARKER: u8 = 0xFB;
 /// How many recent pre-proposal bundles to retain for re-push on (re)connect (Task 4).
 const RECENT_NATIVE_BUNDLES_CAP: usize = 3;
+
+/// Wrap a raw RLP EVM transaction in a DirectRequest forward envelope (marker + body).
+fn encode_forwarded_evm(raw_rlp: &[u8]) -> Vec<u8> {
+    let mut envelope = Vec::with_capacity(1 + raw_rlp.len());
+    envelope.push(FORWARD_EVM_MARKER);
+    envelope.extend_from_slice(raw_rlp);
+    envelope
+}
+
+/// Strip the EVM forward marker, returning the raw RLP body. Returns `None` unless the payload
+/// starts with `FORWARD_EVM_MARKER` and carries a non-empty body — so a native / pre-proposal
+/// envelope (different marker) or a marker-only frame never routes to `add_evm_tx`.
+fn parse_forwarded_evm_tx(payload: &[u8]) -> Option<&[u8]> {
+    match payload.split_first() {
+        Some((&FORWARD_EVM_MARKER, rest)) if !rest.is_empty() => Some(rest),
+        _ => None,
+    }
+}
 
 /// Push `item` into a bounded ring, evicting the oldest when at `cap`.
 fn push_bounded(ring: &mut VecDeque<Vec<u8>>, item: Vec<u8>, cap: usize) {
@@ -218,6 +246,9 @@ pub struct SharedState {
     /// Inbound native actions received from gossip (deserialized by swarm, consumed by mempool task).
     /// Tuple: (pre-verified sender address, signed action) — receivers skip ECDSA recovery.
     pub native_action_inbound: Option<tokio::sync::mpsc::UnboundedSender<(torus_types::Address, torus_types::SignedNativeAction)>>,
+    /// Inbound forwarded EVM transactions (raw RLP) received on the leader from a peer's
+    /// direct-to-leader forward (Option B). Consumed by the node's ingest task → `add_evm_tx`.
+    pub evm_tx_inbound: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
     /// Consensus messages buffered for a validator that is in the peer map but
     /// not currently connected (Task 3 — corrected seam). A validator is mapped
     /// from genesis via `init_validator_set`, so the real gap is connectivity,
@@ -898,6 +929,12 @@ fn handle_event(
                         warn!(%peer, "forwarded native action: deserialization failed");
                     }
                 }
+            } else if let Some(raw_rlp) = parse_forwarded_evm_tx(&request.payload) {
+                // Option B: a peer forwarded a raw EVM tx to us as (current) leader. Hand it to
+                // the ingest task → add_evm_tx, which full-validates (sig/nonce/balance/gas).
+                if let Some(ref tx) = shared.evm_tx_inbound {
+                    let _ = tx.send(raw_rlp.to_vec());
+                }
             } else if let Ok(msg) =
                 hotstuff_rs::networking::messages::Message::try_from_slice(&request.payload)
             {
@@ -1316,6 +1353,18 @@ fn handle_command(
                 warn!("ForwardNativeAction: leader not in peer map");
             }
         }
+        NetworkCommand::ForwardEvmTx { target, payload } => {
+            let peer_id = shared.peer_map.read().unwrap().get_peer_id(&target).copied();
+            if let Some(pid) = peer_id {
+                let req = DirectRequest {
+                    sender_key: local_key.to_bytes(),
+                    payload: encode_forwarded_evm(&payload),
+                };
+                swarm.behaviour_mut().direct.send_request(&pid, req);
+            } else {
+                warn!("ForwardEvmTx: leader not in peer map");
+            }
+        }
         NetworkCommand::BroadcastNativeActions { payload } => {
             // Full-body push (the fast common case for small batches): wrap the bodies in
             // the batch marker and fan them out. The receiver mirrors bodies to its durable
@@ -1689,6 +1738,47 @@ mod tests {
         assert!(plan_prewarm_requests(&over_cap).is_none(), "over-cap manifest -> no pull");
     }
 
+    /// EVM direct-to-leader forward (Option B), RED first: the EVM forward marker must not
+    /// collide with any other DirectRequest marker, or a forwarded EVM tx would be misrouted
+    /// into the native-action / pre-proposal receive branches (and vice-versa). MUST fail
+    /// before the const exists.
+    #[test]
+    fn forward_evm_marker_is_distinct() {
+        let others = [
+            FORWARD_ACTION_MARKER,
+            PRE_PROPOSAL_BATCH_MARKER,
+            PRE_PROPOSAL_HASHES_MARKER,
+        ];
+        assert!(
+            !others.contains(&FORWARD_EVM_MARKER),
+            "FORWARD_EVM_MARKER {:#x} collides with an existing DirectRequest marker",
+            FORWARD_EVM_MARKER
+        );
+    }
+
+    /// The EVM forward wire format round-trips: `encode` prepends the marker, `parse` strips
+    /// it and returns the raw RLP. A marker-only or empty envelope yields `None` (no tx to
+    /// admit — guards an off-by-one on the slice).
+    #[test]
+    fn forwarded_evm_tx_roundtrips() {
+        let rlp = vec![0x02u8, 0xf8, 0x6c, 0x01, 0x02, 0x03]; // arbitrary RLP-shaped bytes
+        let env = encode_forwarded_evm(&rlp);
+        assert_eq!(env.first(), Some(&FORWARD_EVM_MARKER), "marker prefixed");
+        assert_eq!(parse_forwarded_evm_tx(&env), Some(rlp.as_slice()), "round-trips to raw RLP");
+
+        assert_eq!(parse_forwarded_evm_tx(&[FORWARD_EVM_MARKER]), None, "marker-only -> None");
+        assert_eq!(parse_forwarded_evm_tx(&[]), None, "empty -> None");
+    }
+
+    /// Cross-routing guard: a NATIVE forward envelope (marker 0xFE) must NOT parse as an EVM
+    /// tx — otherwise native-action bodies would be fed to `add_evm_tx`.
+    #[test]
+    fn parse_forwarded_evm_rejects_native_marker() {
+        let mut native_env = vec![FORWARD_ACTION_MARKER];
+        native_env.extend_from_slice(b"\x00\x01\x02 native body");
+        assert_eq!(parse_forwarded_evm_tx(&native_env), None);
+    }
+
     /// s350 FIX B (RED first): a banned peer that is a CURRENT VALIDATOR-SET member must
     /// keep consensus-critical service — severing a validator's gossip turns a tx-layer
     /// penalty into a cluster liveness fault (s339: our 1h ban of friend2 for *relaying*
@@ -1822,6 +1912,7 @@ mod tests {
             block_store: RwLock::new(HashMap::new()),
             block_data_inbound: Mutex::new(VecDeque::new()),
             native_action_inbound: None,
+            evm_tx_inbound: None,
             pending_sends: Mutex::new(PendingSendQueue::new(256)),
             outbound_direct: Mutex::new(HashMap::new()),
             recent_native_bundles: Mutex::new(VecDeque::new()),

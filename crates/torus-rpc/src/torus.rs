@@ -531,6 +531,27 @@ impl RpcState {
             }
         }
     }
+
+    /// Direct-to-leader forwarding for EVM txs (Option B): unicast the raw RLP to the current
+    /// leader so a tx submitted to a non-proposer / RPC-only node still reaches the block
+    /// producer. UNCONDITIONAL — unlike the native forward there is no `forward_bodies` gate
+    /// (EVM has no gossip pre-spread, so this unicast is the only dissemination path). No-op
+    /// when this node IS the leader or forwarding is unwired. The leader independently
+    /// full-validates via `add_evm_tx`, so forwarding pre-validated bytes is safe.
+    ///
+    /// Takes the RLP by value (the caller already owns a clone, since `add_evm_tx` consumes the
+    /// original): moving it into the channel avoids a second copy of the body on the hot path.
+    pub(crate) fn forward_evm_to_leader(&self, raw_rlp: Vec<u8>) {
+        if let (Some(ref leader_fn), Some(ref own_vk), Some(ref fwd_tx)) =
+            (&self.leader_vk_fn, &self.own_vk, &self.forward_evm_tx)
+        {
+            if let Some(leader_vk) = leader_fn() {
+                if leader_vk != *own_vk {
+                    let _ = fwd_tx.send((leader_vk, raw_rlp));
+                }
+            }
+        }
+    }
 }
 
 #[async_trait]

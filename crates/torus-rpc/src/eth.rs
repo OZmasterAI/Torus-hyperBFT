@@ -626,10 +626,17 @@ impl EthApiServer for RpcState {
         if !self.tx_submit_limiter.check_sender(&sender) {
             return Err(err(RpcError::TxSubmitRateLimit));
         }
+        // Keep the raw RLP for the direct-to-leader forward (Option B); add_evm_tx consumes it.
+        let raw_for_forward = bytes.clone();
         let hash = self
             .mempool
             .add_evm_tx(bytes)
             .map_err(|e| err(RpcError::Mempool(e.to_string())))?;
+        // Option B (EVM tx dissemination): unicast the validated tx to the current leader so it
+        // reaches the block producer even when this node is not the proposer (fixes the EVM
+        // dead-end where a tx was mined only by the node it was submitted to). No-op if we are
+        // the leader. The leader independently re-validates via add_evm_tx.
+        self.forward_evm_to_leader(raw_for_forward);
         let _ = self.notifier.pending_txs.send(hash);
         Ok(hex_b256(hash))
     }

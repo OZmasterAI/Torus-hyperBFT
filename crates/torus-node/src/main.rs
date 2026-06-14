@@ -459,6 +459,22 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         });
     }
+
+    // Spawn inbound forwarded-EVM-tx → mempool task (Option B). A peer that received an EVM tx
+    // on its RPC unicast it to us as the current leader; add_evm_tx full-validates here, so
+    // forwarded bytes are trusted no more than locally-submitted ones.
+    if let Some(mut evm_rx) = network.take_evm_tx_rx() {
+        let mempool_for_evm = mempool.clone();
+        tokio::spawn(async move {
+            while let Some(raw_rlp) = evm_rx.recv().await {
+                match mempool_for_evm.add_evm_tx(raw_rlp) {
+                    Ok(_) => {}
+                    Err(torus_mempool::MempoolError::DuplicateTx(_)) => {}
+                    Err(e) => tracing::debug!("forwarded evm tx rejected: {e}"),
+                }
+            }
+        });
+    }
     info!(listen = %cli.p2p_listen, "p2p network started");
 
     // 5b. Pre-proposal action push: proposer → all validators via req/res (CompactBlock support)
@@ -489,6 +505,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // 5c. Extract leader state + clone network for RPC forwarding (before replica consumes them)
     let leader_state = app.leader_state();
     let network_for_fwd = network.clone();
+    let network_for_evm_fwd = network.clone();
 
     // 6. Consensus configuration
     // Leader-selection mode is consensus-critical: every validator must run the
@@ -581,9 +598,11 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         leader_state_for_rpc.current_leader().map(|vk| *vk.as_bytes())
     });
     let (fwd_tx, mut fwd_rx) = tokio::sync::mpsc::unbounded_channel();
-    // Full-body forwards only in the no-gossip fallback: with pre-spread on,
-    // gossip already delivers every body to the leader (Sprint 3.5).
-    rpc_server.set_leader_forwarding(own_vk, leader_vk_fn, fwd_tx, !cli.native_gossip);
+    let (evm_fwd_tx, mut evm_fwd_rx) = tokio::sync::mpsc::unbounded_channel();
+    // Full-body native forwards only in the no-gossip fallback: with pre-spread on,
+    // gossip already delivers every body to the leader (Sprint 3.5). EVM forwarding has no
+    // gossip path, so it is unconditional — wired via its own channel.
+    rpc_server.set_leader_forwarding(own_vk, leader_vk_fn, fwd_tx, evm_fwd_tx, !cli.native_gossip);
 
     // Extract shared handles before start() consumes the server
     let latest_height_handle = rpc_server.latest_height();
@@ -618,6 +637,15 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         while let Some((target_vk_bytes, payload)) = fwd_rx.recv().await {
             if let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(&target_vk_bytes) {
                 network_for_fwd.forward_native_action(vk, payload);
+            }
+        }
+    });
+
+    // EVM forwarding bridge (Option B): (leader_vk_bytes, raw_rlp) from RPC → network unicast.
+    tokio::spawn(async move {
+        while let Some((target_vk_bytes, payload)) = evm_fwd_rx.recv().await {
+            if let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(&target_vk_bytes) {
+                network_for_evm_fwd.forward_evm_tx(vk, payload);
             }
         }
     });
