@@ -128,14 +128,18 @@ struct Cli {
     #[arg(long, default_value_t = true)]
     native_gossip: bool,
 
-    /// Publish native-action gossip batches zstd-compressed on the
-    /// /torus/native-actions/2.0 topic (Sprint 5). Receiving is always
-    /// dual-topic; flip this ONLY once every validator runs a 2.0-capable
-    /// binary — old peers cannot read the compressed topic. The
+    /// Disable zstd-compressed native-action gossip publish. Sprint 5 makes
+    /// this DEFAULT-ON: batches publish on the /torus/native-actions/2.0
+    /// (zstd) topic. gossipsub cannot negotiate per-peer, so a v2 publish is
+    /// invisible to any peer still on a pre-zstd binary (< commit 6cbda39)
+    /// that does not subscribe to v2 — such a peer misses the gossip and
+    /// heals via block-sync/DA-pull (proven mixed-version safe, s356). Pass
+    /// --no-gossip-zstd to fall back to the v1 (uncompressed) topic while a
+    /// validator is still upgrading. Receiving is always dual-topic. The
     /// request/response paths (direct push, DA pull, block-data) negotiate
-    /// zstd per peer automatically and need no flag.
+    /// zstd per peer automatically and are unaffected by this flag.
     #[arg(long)]
-    gossip_zstd: bool,
+    no_gossip_zstd: bool,
 }
 
 #[derive(clap::Subcommand)]
@@ -426,7 +430,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let network_config = NetworkConfig {
         listen_addr,
         bootstrap_peers,
-        gossip_zstd: cli.gossip_zstd,
+        gossip_zstd: !cli.no_gossip_zstd,
         ..NetworkConfig::default()
     };
 
