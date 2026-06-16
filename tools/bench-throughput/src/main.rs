@@ -84,6 +84,14 @@ enum Command {
         /// (hex of bincode via torus_submitNativeActionsBin, Sprint 5).
         #[arg(long, default_value = "json")]
         format: String,
+        /// Pre-sign N submit-batches PER SENDER before the timed window, then
+        /// fire the pre-built ammo (no signing in the hot loop) — isolates the
+        /// chain's ingress/exec ceiling from this box's signing speed. 0 = off
+        /// (stream-sign during the run). Nonces run contiguously from now_ms, so
+        /// keep N x submit_batch under the 60s nonce window and size N for
+        /// duration x target-rate (a sender that runs out logs "ammo exhausted").
+        #[arg(long, default_value_t = 0)]
+        pre_sign: usize,
     },
     Combined {
         #[arg(long, default_value = "http://localhost:8545,http://localhost:8546,http://localhost:8547,http://localhost:8548")]
@@ -167,6 +175,43 @@ fn sign_payload_batch(
         payloads.push(format!("0x{}", hex::encode(&bytes)));
     }
     (payloads, last_nonce)
+}
+
+/// Pre-sign `count` submit-batch payloads for one sender BEFORE the timed
+/// window (pre-sign mode). Firing pre-built ammo makes the hot loop pure
+/// network I/O, isolating the chain's ingress/exec ceiling from client signing
+/// speed. Nonces run *contiguously* from `base_nonce` (deterministic, unlike the
+/// streaming path's wall-clock nonces), so they are strictly increasing
+/// regardless of signing speed. `base_nonce` should be ~`now_ms` and the span
+/// (`count * submit_batch`) must stay inside the chain's `NONCE_WINDOW_MS` (60s)
+/// or late ammo is rejected as "too far in future".
+fn pregen_ammo(
+    rng: &mut impl Rng,
+    key: &k256::ecdsa::SigningKey,
+    batch_size: usize,
+    submit_batch: usize,
+    count: usize,
+    bin: bool,
+    base_nonce: u64,
+) -> Vec<Vec<String>> {
+    let mut nonce = base_nonce;
+    let mut ammo = Vec::with_capacity(count);
+    for _ in 0..count {
+        let mut payloads = Vec::with_capacity(submit_batch);
+        for _ in 0..submit_batch {
+            let action = random_place_order_action(rng, 1, batch_size);
+            let signed = sign_native_action(action, nonce, key);
+            nonce += 1;
+            let bytes = if bin {
+                bincode::serialize(&signed).unwrap()
+            } else {
+                serde_json::to_vec(&signed).unwrap()
+            };
+            payloads.push(format!("0x{}", hex::encode(&bytes)));
+        }
+        ammo.push(payloads);
+    }
+    ammo
 }
 
 /// Build one action carrying `batch_size` orders. `batch_size <= 1` returns a plain
@@ -382,6 +427,28 @@ async fn submit_native_actions_batch(
         .map(|items| items.iter().filter(|i| i.get("hash").is_some()).count())
         .unwrap_or(0);
     Ok(accepted)
+}
+
+/// Fire one already-signed payload set and credit `submitted` by however many the
+/// server accepted. A lone JSON action uses the legacy single endpoint; anything
+/// else (or any bincode payload) goes through the batch endpoint.
+async fn submit_payloads(
+    client: &reqwest::Client,
+    url: &str,
+    payloads: &[String],
+    req_id: u64,
+    bin: bool,
+    submitted: &AtomicU64,
+) {
+    if payloads.len() == 1 && !bin {
+        if submit_native_action(client, url, &payloads[0], req_id).await.is_ok() {
+            submitted.fetch_add(1, Ordering::Relaxed);
+        }
+    } else if let Ok(accepted) =
+        submit_native_actions_batch(client, url, payloads, req_id, bin).await
+    {
+        submitted.fetch_add(accepted as u64, Ordering::Relaxed);
+    }
 }
 
 async fn submit_native_action(
@@ -658,12 +725,25 @@ async fn run_consensus(
     submit_batch: usize,
     sender_offset: usize,
     bin: bool,
+    pre_sign: usize,
 ) {
     let rpc_urls: Vec<String> = rpc_urls_str.split(',').map(|s| s.trim().to_string()).collect();
     let num_senders = senders.max(1);
     let keys = load_sender_keys(num_senders, sender_offset);
     let orders_per_action = batch_size.max(1) as u64;
     let submit_batch = submit_batch.clamp(1, 100);
+
+    // Pre-sign nonces run contiguously from now_ms; if the ammo span exceeds the
+    // chain's 60s nonce window the tail is rejected as "too far in future".
+    let nonce_span_ms = (pre_sign * submit_batch) as u64;
+    if pre_sign > 0 && nonce_span_ms > torus_types::eip712::NONCE_WINDOW_MS / 2 {
+        eprintln!(
+            "[pre-sign] WARNING: ammo nonce span {nonce_span_ms}ms exceeds half the chain's {}ms \
+             nonce window — with the 30s lead, late ammo risks 'too far in future' rejection. \
+             Lower --pre-sign or --submit-batch.",
+            torus_types::eip712::NONCE_WINDOW_MS
+        );
+    }
 
     println!("=== Torus Throughput Benchmark ===");
     println!("Mode: consensus");
@@ -672,6 +752,12 @@ async fn run_consensus(
     println!("Batch size: {orders_per_action} order(s)/action");
     println!("Submit batch: {submit_batch} action(s)/RPC call");
     println!("RPC endpoints: {}", rpc_urls.len());
+    if pre_sign > 0 {
+        println!(
+            "Pre-sign: {pre_sign} batches/sender ({} actions/sender, signed before the clock)",
+            pre_sign * submit_batch
+        );
+    }
     println!();
 
     let client = Arc::new(
@@ -686,6 +772,41 @@ async fn run_consensus(
 
     let submitted = Arc::new(AtomicU64::new(0));
     let included = Arc::new(AtomicU64::new(0));
+
+    // Pre-sign mode: build ALL ammo BEFORE the clock so the timed window is pure
+    // submission (no signing CPU competing). Each sender signs in parallel on the
+    // blocking pool; nonces start at now_ms and run contiguously per sender.
+    let mut ammo: Vec<Vec<Vec<String>>> = Vec::new();
+    if pre_sign > 0 {
+        // Lead the nonces by half the window so they're still valid AFTER the
+        // (potentially long) pre-sign phase: the chain rejects nonce < now-60s,
+        // and signing a big ammo can take tens of seconds. now_ms + 30s keeps the
+        // whole stream inside ±60s of fire time for pre-sign phases up to ~30s.
+        let base_nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            + torus_types::eip712::NONCE_WINDOW_MS / 2;
+        println!("Pre-signing {pre_sign} payloads x {num_senders} senders...");
+        let t0 = Instant::now();
+        let mut handles = Vec::with_capacity(num_senders);
+        for sk in &keys {
+            let key = sk.signing_key.clone();
+            handles.push(tokio::task::spawn_blocking(move || {
+                let mut rng = StdRng::from_entropy();
+                pregen_ammo(&mut rng, &key, batch_size, submit_batch, pre_sign, bin, base_nonce)
+            }));
+        }
+        for h in handles {
+            ammo.push(h.await.expect("pregen task panicked"));
+        }
+        println!(
+            "Pre-signed {} actions in {:.1}s",
+            num_senders * pre_sign * submit_batch,
+            t0.elapsed().as_secs_f64()
+        );
+    }
+
     let start_block = fetch_block_number(&client, &rpc_urls[0]).await.unwrap_or(0);
     let deadline = Instant::now() + Duration::from_secs(duration_secs);
     let start_time = Instant::now();
@@ -814,75 +935,102 @@ async fn run_consensus(
         let submitted = submitted.clone();
         let semaphore = semaphore.clone();
         let url_count = urls.len();
+        let sender_ammo = if pre_sign > 0 {
+            std::mem::take(&mut ammo[sender_idx])
+        } else {
+            Vec::new()
+        };
 
         sender_handles.push(tokio::spawn(async move {
             let mut req_id: u64 = sender_idx as u64 * 1_000_000;
             let mut url_idx: usize = sender_idx % url_count;
 
-            // T6 signer pipeline: a dedicated blocking-pool task signs AHEAD
-            // into a small buffer so signing CPU overlaps network I/O instead
-            // of serializing with it (bs1000 signing starved the submit loop
-            // on the 4-core box). Depth 4 keeps nonces well inside the 60s
-            // freshness window while decoupling the two stages.
-            let (pregen_tx, mut pregen_rx) = tokio::sync::mpsc::channel::<Vec<String>>(4);
-            let signer = tokio::task::spawn_blocking(move || {
-                let mut rng = StdRng::from_entropy();
-                let mut last_nonce: u64 = 0;
-                loop {
-                    let (payloads, n) = sign_payload_batch(
-                        &mut rng,
-                        &key,
-                        batch_size,
-                        submit_batch,
-                        last_nonce,
-                        bin,
-                    );
-                    last_nonce = n;
-                    if pregen_tx.blocking_send(payloads).is_err() {
-                        break; // submit loop finished — receiver dropped
+            if pre_sign > 0 {
+                // Pre-sign mode: fire pre-built ammo, ZERO signing in the timed
+                // window — submit rate is now bounded by the chain/network, not
+                // this box's signer. Stops early if a sender runs out of ammo.
+                let total = sender_ammo.len();
+                let mut fired = 0usize;
+                for payloads in sender_ammo {
+                    if Instant::now() >= deadline {
+                        break;
+                    }
+                    let permit = semaphore.clone().acquire_owned().await.unwrap();
+                    let url = urls[url_idx % url_count].clone();
+                    url_idx += 1;
+                    req_id += 1;
+                    let client = client.clone();
+                    let submitted = submitted.clone();
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        submit_payloads(&client, &url, &payloads, req_id, bin, &submitted).await;
+                    });
+                    fired += 1;
+                }
+                if fired == total {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left > Duration::from_millis(500) {
+                        eprintln!(
+                            "[sender {sender_idx}] ammo exhausted ({total} batches, {:.0}s left) — raise --pre-sign",
+                            left.as_secs_f64()
+                        );
                     }
                 }
-            });
-            let mut starved_ns: u128 = 0;
-
-            while Instant::now() < deadline {
-                let wait_t0 = Instant::now();
-                let Some(payloads) = pregen_rx.recv().await else { break };
-                starved_ns += wait_t0.elapsed().as_nanos();
-
-                let permit = semaphore.clone().acquire_owned().await.unwrap();
-                let url = urls[url_idx % url_count].clone();
-                url_idx += 1;
-                req_id += 1;
-
-                let client = client.clone();
-                let submitted = submitted.clone();
-
-                tokio::spawn(async move {
-                    let _permit = permit;
-                    // bin payloads always go through the batch endpoint — the
-                    // legacy single endpoint only speaks canonical JSON.
-                    if payloads.len() == 1 && !bin {
-                        if submit_native_action(&client, &url, &payloads[0], req_id).await.is_ok() {
-                            submitted.fetch_add(1, Ordering::Relaxed);
+            } else {
+                // T6 signer pipeline (streaming): a dedicated blocking-pool task
+                // signs AHEAD into a depth-4 buffer so signing CPU overlaps
+                // network I/O instead of serializing with it. Nonces stay inside
+                // the 60s freshness window while decoupling the two stages.
+                let (pregen_tx, mut pregen_rx) = tokio::sync::mpsc::channel::<Vec<String>>(4);
+                let signer = tokio::task::spawn_blocking(move || {
+                    let mut rng = StdRng::from_entropy();
+                    let mut last_nonce: u64 = 0;
+                    loop {
+                        let (payloads, n) = sign_payload_batch(
+                            &mut rng,
+                            &key,
+                            batch_size,
+                            submit_batch,
+                            last_nonce,
+                            bin,
+                        );
+                        last_nonce = n;
+                        if pregen_tx.blocking_send(payloads).is_err() {
+                            break; // submit loop finished — receiver dropped
                         }
-                    } else if let Ok(accepted) =
-                        submit_native_actions_batch(&client, &url, &payloads, req_id, bin).await
-                    {
-                        submitted.fetch_add(accepted as u64, Ordering::Relaxed);
                     }
                 });
-            }
+                let mut starved_ns: u128 = 0;
 
-            // Dropping the receiver fails the signer's next blocking_send,
-            // which is its exit signal.
-            drop(pregen_rx);
-            let _ = signer.await;
-            if starved_ns > 1_000_000 {
-                eprintln!(
-                    "[sender {sender_idx}] signer-starved {:.1}ms total (signing slower than submits)",
-                    starved_ns as f64 / 1e6
-                );
+                while Instant::now() < deadline {
+                    let wait_t0 = Instant::now();
+                    let Some(payloads) = pregen_rx.recv().await else { break };
+                    starved_ns += wait_t0.elapsed().as_nanos();
+
+                    let permit = semaphore.clone().acquire_owned().await.unwrap();
+                    let url = urls[url_idx % url_count].clone();
+                    url_idx += 1;
+                    req_id += 1;
+
+                    let client = client.clone();
+                    let submitted = submitted.clone();
+
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        submit_payloads(&client, &url, &payloads, req_id, bin, &submitted).await;
+                    });
+                }
+
+                // Dropping the receiver fails the signer's next blocking_send,
+                // which is its exit signal.
+                drop(pregen_rx);
+                let _ = signer.await;
+                if starved_ns > 1_000_000 {
+                    eprintln!(
+                        "[sender {sender_idx}] signer-starved {:.1}ms total (signing slower than submits)",
+                        starved_ns as f64 / 1e6
+                    );
+                }
             }
         }));
     }
@@ -1168,6 +1316,7 @@ async fn main() {
             submit_batch,
             sender_offset,
             format,
+            pre_sign,
         } => {
             let bin = match format.as_str() {
                 "bin" => true,
@@ -1186,6 +1335,7 @@ async fn main() {
                 submit_batch,
                 sender_offset,
                 bin,
+                pre_sign,
             )
             .await
         }
@@ -1200,7 +1350,7 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::sign_payload_batch;
+    use super::{pregen_ammo, sign_payload_batch};
     use super::{summarize_included, SweptBlock};
     use rand::{rngs::StdRng, SeedableRng};
 
@@ -1223,6 +1373,35 @@ mod tests {
             assert!(
                 w[1] > w[0],
                 "nonces must be strictly increasing across the pregen stream: {nonces:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pregen_ammo_nonces_are_contiguous_from_base() {
+        let mut rng = StdRng::seed_from_u64(7);
+        let key = k256::ecdsa::SigningKey::from_slice(&[0x11; 32]).unwrap();
+        // Deterministic: nonces depend only on base_nonce, not the wall clock, so
+        // this catches a non-advancing nonce regardless of signing speed (in debug
+        // a wall-clock nonce would mask it). 3 payloads x 10 actions = 30-action
+        // stream, expected nonces BASE..BASE+30.
+        const BASE: u64 = 1_700_000_000_000;
+        let ammo = pregen_ammo(&mut rng, &key, 1, 10, 3, false, BASE);
+        assert_eq!(ammo.len(), 3, "one payload-vec per requested count");
+        assert!(ammo.iter().all(|p| p.len() == 10), "each payload carries submit_batch actions");
+
+        let dec = |p: &String| -> u64 {
+            let bytes = hex::decode(p.trim_start_matches("0x")).unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            v["nonce"].as_u64().expect("signed action has a numeric nonce")
+        };
+        let nonces: Vec<u64> = ammo.iter().flatten().map(dec).collect();
+        assert_eq!(nonces.len(), 30, "3 payloads x 10 actions");
+        for (i, &n) in nonces.iter().enumerate() {
+            assert_eq!(
+                n,
+                BASE + i as u64,
+                "ammo nonces must be contiguous & strictly increasing from base_nonce: {nonces:?}"
             );
         }
     }
