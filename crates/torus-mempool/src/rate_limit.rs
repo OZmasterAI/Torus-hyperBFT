@@ -32,9 +32,16 @@ pub const EVM_TOTAL_BLOCK_CAP: usize = 20;
 /// Max native actions per sender per block.
 pub const NATIVE_PER_BLOCK_CAP: usize = 64;
 
-/// Max total native actions per block (all senders combined).
-/// Bounded by sig verification cost in produce_block + validate_block.
-pub const NATIVE_TOTAL_BLOCK_CAP: usize = 100;
+/// Max total native actions per block (all senders combined). Raised 100->1000
+/// (s365) now that CompactBlock disseminates proposals as hashes — the 256 KB
+/// `max_consensus_message_size` no longer binds (a 50k-order block is ~32 KB
+/// compact vs ~2.5 MB full; see `compact_proposal_holds_where_full_block_collapsed_at_bs500`),
+/// so blocks fill to the 6 MB `NATIVE_BLOCK_BYTES_CAP` instead of this count.
+/// Selection is enforced only in produce_block; validate_block does not reject
+/// on count, so a node on the old value still accepts a higher-cap proposer's
+/// blocks (no fork). The serial sig-verify cost still rises with block size, so
+/// the bytes cap is the real ceiling.
+pub const NATIVE_TOTAL_BLOCK_CAP: usize = 1000;
 
 /// Max total native pool size. With gossip replication, each validator holds
 /// actions from all peers, so this must be large enough for the full mesh.
