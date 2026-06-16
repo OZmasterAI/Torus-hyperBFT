@@ -92,6 +92,11 @@ enum Command {
         /// duration x target-rate (a sender that runs out logs "ammo exhausted").
         #[arg(long, default_value_t = 0)]
         pre_sign: usize,
+        /// Pace pre-sign firing to this many actions/s PER SENDER (0 = unbounded
+        /// burst). Offer a controlled load to find where the chain saturates —
+        /// an unpaced burst overruns RPC ingress and under-measures the chain.
+        #[arg(long, default_value_t = 0)]
+        rate: usize,
     },
     Combined {
         #[arg(long, default_value = "http://localhost:8545,http://localhost:8546,http://localhost:8547,http://localhost:8548")]
@@ -212,6 +217,18 @@ fn pregen_ammo(
         ammo.push(payloads);
     }
     ammo
+}
+
+/// Per-submit-batch fire interval that holds `rate` actions/s for one sender,
+/// given `submit_batch` actions ship per fire. `rate == 0` => unbounded (`None`).
+/// Used to PACE the pre-sign fire loop so a burst doesn't overrun RPC ingress —
+/// an unpaced burst times out at the server's submit semaphore and makes a solo
+/// pre-sign run under-measure the chain.
+fn fire_interval(submit_batch: usize, rate: usize) -> Option<Duration> {
+    if rate == 0 {
+        return None;
+    }
+    Some(Duration::from_secs_f64(submit_batch as f64 / rate as f64))
 }
 
 /// Build one action carrying `batch_size` orders. `batch_size <= 1` returns a plain
@@ -726,6 +743,7 @@ async fn run_consensus(
     sender_offset: usize,
     bin: bool,
     pre_sign: usize,
+    rate: usize,
 ) {
     let rpc_urls: Vec<String> = rpc_urls_str.split(',').map(|s| s.trim().to_string()).collect();
     let num_senders = senders.max(1);
@@ -757,6 +775,10 @@ async fn run_consensus(
             "Pre-sign: {pre_sign} batches/sender ({} actions/sender, signed before the clock)",
             pre_sign * submit_batch
         );
+        match fire_interval(submit_batch, rate) {
+            Some(_) => println!("Rate: {rate} actions/s/sender (paced fire)"),
+            None => println!("Rate: unbounded (burst)"),
+        }
     }
     println!();
 
@@ -951,9 +973,21 @@ async fn run_consensus(
                 // this box's signer. Stops early if a sender runs out of ammo.
                 let total = sender_ammo.len();
                 let mut fired = 0usize;
+                let pace = fire_interval(submit_batch, rate);
+                let mut next_fire = Instant::now();
                 for payloads in sender_ammo {
                     if Instant::now() >= deadline {
                         break;
+                    }
+                    // Paced fire: hold the offered rate so a burst doesn't overrun
+                    // RPC ingress. next_fire.max(now) means a slow patch never builds
+                    // a catch-up burst — it just resumes the cadence.
+                    if let Some(iv) = pace {
+                        let now = Instant::now();
+                        if now < next_fire {
+                            tokio::time::sleep(next_fire - now).await;
+                        }
+                        next_fire = next_fire.max(now) + iv;
                     }
                     let permit = semaphore.clone().acquire_owned().await.unwrap();
                     let url = urls[url_idx % url_count].clone();
@@ -1317,6 +1351,7 @@ async fn main() {
             sender_offset,
             format,
             pre_sign,
+            rate,
         } => {
             let bin = match format.as_str() {
                 "bin" => true,
@@ -1336,6 +1371,7 @@ async fn main() {
                 sender_offset,
                 bin,
                 pre_sign,
+                rate,
             )
             .await
         }
@@ -1350,7 +1386,7 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{pregen_ammo, sign_payload_batch};
+    use super::{fire_interval, pregen_ammo, sign_payload_batch};
     use super::{summarize_included, SweptBlock};
     use rand::{rngs::StdRng, SeedableRng};
 
@@ -1404,6 +1440,18 @@ mod tests {
                 "ammo nonces must be contiguous & strictly increasing from base_nonce: {nonces:?}"
             );
         }
+    }
+
+    #[test]
+    fn fire_interval_paces_to_rate() {
+        assert_eq!(fire_interval(10, 0), None, "rate 0 = unbounded (no pacing)");
+        let approx = |iv: Option<std::time::Duration>, secs: f64| {
+            (iv.expect("rate>0 must pace").as_secs_f64() - secs).abs() < 1e-9
+        };
+        // actions/s with actions/fire -> seconds/fire (submit_batch / rate).
+        assert!(approx(fire_interval(10, 100), 0.100), "100 a/s, 10/fire => 100ms/fire");
+        assert!(approx(fire_interval(10, 200), 0.050), "200 a/s, 10/fire => 50ms/fire");
+        assert!(approx(fire_interval(1, 1000), 0.001), "1000 a/s, 1/fire => 1ms/fire");
     }
 
     #[test]
