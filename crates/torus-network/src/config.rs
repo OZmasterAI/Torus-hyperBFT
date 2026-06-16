@@ -25,10 +25,6 @@ pub struct NetworkConfig {
     pub consensus_rate_limit_per_peer: u32,
     /// Path to the peer ban list JSON file (Phase 3: 3.1.7).
     pub ban_list_path: Option<PathBuf>,
-    /// Publish native-action gossip batches zstd-compressed on the v2 topic
-    /// (Sprint 5). Receiving is always dual-topic; flip this ONLY once every
-    /// validator runs a 2.0-capable binary — old peers cannot read v2.
-    pub gossip_zstd: bool,
 }
 
 impl NetworkConfig {
@@ -86,7 +82,6 @@ impl Default for NetworkConfig {
             tx_dedup_window_secs: 60,
             consensus_rate_limit_per_peer: 50,
             ban_list_path: None,
-            gossip_zstd: false,
         }
     }
 }

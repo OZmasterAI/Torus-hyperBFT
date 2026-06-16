@@ -13,7 +13,7 @@ use tracing::{debug, info, warn};
 
 use torus_state::NativeDaStore;
 
-use crate::behaviour::{TorusBehaviour, TorusBehaviourEvent, CONSENSUS_TOPIC, NATIVE_ACTION_TOPIC, NATIVE_ACTION_TOPIC_V2, TX_TOPIC};
+use crate::behaviour::{TorusBehaviour, TorusBehaviourEvent, CONSENSUS_TOPIC, NATIVE_ACTION_TOPIC, TX_TOPIC};
 use crate::codec::{
     BlockDataNetRequest, BlockDataNetResponse, DirectRequest, DirectResponse, NativeDaNetRequest,
     NativeDaNetResponse,
@@ -362,33 +362,15 @@ fn publish_native_batch(
     batch: &mut Vec<Vec<u8>>,
     batch_bytes: &mut usize,
     trigger: &str,
-    zstd: bool,
 ) {
     if batch.is_empty() {
         return;
     }
+    // Native-action batches ship RAW on the v1 gossip topic. zstd gossip (the
+    // v2 topic) was removed (s364): gossipsub cannot negotiate per-peer, so
+    // compressing here forced every subscriber to inflate — a DoS vector. The
+    // per-peer-negotiated zstd lives on the request_response body paths.
     let payload = serialize_native_batch(batch);
-    // Sprint 5: behind --gossip-zstd the batch ships zstd-framed on the v2
-    // topic. On a compress failure keep the batch for the next flush — never
-    // ship raw bytes on the v2 topic, v2 receivers inflate unconditionally.
-    let payload = if zstd {
-        match zstd::bulk::compress(&payload, crate::codec::ZSTD_WIRE_LEVEL) {
-            Ok(c) => {
-                crate::codec::record_wire_compression(
-                    crate::codec::WirePath::GossipNative,
-                    payload.len(),
-                    c.len(),
-                );
-                c
-            }
-            Err(e) => {
-                warn!(%e, "zstd gossip compress failed; batch kept for retry");
-                return;
-            }
-        }
-    } else {
-        payload
-    };
     let count = batch.len();
     batch.clear();
     *batch_bytes = NATIVE_BATCH_HEADER_BYTES;
@@ -440,6 +422,24 @@ fn deserialize_native_batch(data: &[u8]) -> Option<Vec<&[u8]>> {
     Some(actions)
 }
 
+/// Subscribe to the gossip topics every node participates in.
+///
+/// Deliberately does NOT subscribe to the removed `/torus/native-actions/2.0`
+/// zstd topic. Gossipsub cannot negotiate compression per-peer, so a v2
+/// subscriber must inflate every frame an attacker publishes — one
+/// `--gossip-zstd` peer could DoS the whole cluster (s364). Native-action
+/// gossip therefore rides only the raw v1 topic; per-peer zstd lives on the
+/// request_response body paths (`/torus/{native-da,block-data,direct}/2.0`),
+/// which DO negotiate per peer and stay.
+fn subscribe_gossip_topics(gossipsub: &mut gossipsub::Behaviour) {
+    for topic in [CONSENSUS_TOPIC, TX_TOPIC, NATIVE_ACTION_TOPIC] {
+        let ident = gossipsub::IdentTopic::new(topic);
+        if let Err(e) = gossipsub.subscribe(&ident) {
+            warn!(topic, "failed to subscribe to gossip topic: {e:?}");
+        }
+    }
+}
+
 pub async fn run_swarm(
     swarm: Swarm<TorusBehaviour>,
     command_rx: mpsc::UnboundedReceiver<NetworkCommand>,
@@ -462,30 +462,14 @@ pub async fn run_swarm_with_config(
 ) {
     let consensus_topic = gossipsub::IdentTopic::new(CONSENSUS_TOPIC);
     let tx_topic = gossipsub::IdentTopic::new(TX_TOPIC);
-    let native_action_topic_v1 = gossipsub::IdentTopic::new(NATIVE_ACTION_TOPIC);
-    let native_action_topic_v2 = gossipsub::IdentTopic::new(NATIVE_ACTION_TOPIC_V2);
-    // Sprint 5: receive BOTH topic versions unconditionally; PUBLISH v2 (zstd)
-    // only behind --gossip-zstd — gossipsub cannot negotiate per-peer the way
-    // request_response does, so the flip waits for all validators on 2.0.
-    let gossip_zstd = config.gossip_zstd;
-    let native_action_topic = if gossip_zstd {
-        native_action_topic_v2.clone()
-    } else {
-        native_action_topic_v1.clone()
-    };
+    // Native-action batches gossip ONLY on the raw v1 topic. The zstd v2 topic
+    // was removed (s364): gossipsub cannot negotiate compression per-peer, so a
+    // v2 subscriber had to inflate any peer's frames — a cluster-wide DoS that
+    // `--no-gossip-zstd` could not close (it only stopped local publishing).
+    // Per-peer zstd survives on the request_response body paths, not gossip.
+    let native_action_topic = gossipsub::IdentTopic::new(NATIVE_ACTION_TOPIC);
 
-    if let Err(e) = swarm.behaviour_mut().gossipsub.subscribe(&consensus_topic) {
-        warn!("Failed to subscribe to consensus topic: {e:?}");
-    }
-    if let Err(e) = swarm.behaviour_mut().gossipsub.subscribe(&tx_topic) {
-        warn!("Failed to subscribe to tx topic: {e:?}");
-    }
-    if let Err(e) = swarm.behaviour_mut().gossipsub.subscribe(&native_action_topic_v1) {
-        warn!("Failed to subscribe to native action topic: {e:?}");
-    }
-    if let Err(e) = swarm.behaviour_mut().gossipsub.subscribe(&native_action_topic_v2) {
-        warn!("Failed to subscribe to native action v2 topic: {e:?}");
-    }
+    subscribe_gossip_topics(&mut swarm.behaviour_mut().gossipsub);
 
     let mut tx_gossip_state = TxGossipState::new(
         config.tx_dedup_window_secs,
@@ -608,7 +592,6 @@ pub async fn run_swarm_with_config(
                     &mut native_batch,
                     &mut native_batch_bytes,
                     "timer",
-                    gossip_zstd,
                 );
             }
             SwarmAction::NativeAction(Some(action_bytes)) => {
@@ -635,7 +618,6 @@ pub async fn run_swarm_with_config(
                             &mut native_batch,
                             &mut native_batch_bytes,
                             "byte budget",
-                            gossip_zstd,
                         );
                     }
                     native_batch_bytes += entry_bytes;
@@ -648,7 +630,6 @@ pub async fn run_swarm_with_config(
                             &mut native_batch,
                             &mut native_batch_bytes,
                             "count cap",
-                            gossip_zstd,
                         );
                     }
                 }
@@ -738,9 +719,7 @@ fn handle_event(
                     return;
                 }
                 handle_consensus_gossip(&message.data, shared, peer_scoring, &author);
-            } else if message.topic == gossipsub::IdentTopic::new(NATIVE_ACTION_TOPIC).hash()
-                || message.topic == gossipsub::IdentTopic::new(NATIVE_ACTION_TOPIC_V2).hash()
-            {
+            } else if message.topic == gossipsub::IdentTopic::new(NATIVE_ACTION_TOPIC).hash() {
                 if message.data.len() > max_tx_msg_size {
                     // Penalty goes to the AUTHOR, never the relayer — forwarder
                     // penalties on this exact path banned friend2 (validator) for
@@ -759,39 +738,10 @@ fn handle_event(
                     );
                     return;
                 }
-                // Sprint 5: the v2 topic carries a zstd frame of the identical
-                // batch bytes; inflate bounded by the same receiver cap before
-                // parsing. Undecodable frames penalize the AUTHOR (never the
-                // forwarder — the s339/s350 ban-the-relayer lesson).
-                let v2_buf;
-                let payload: &[u8] = if message.topic
-                    == gossipsub::IdentTopic::new(NATIVE_ACTION_TOPIC_V2).hash()
-                {
-                    match zstd::bulk::decompress(&message.data, max_tx_msg_size) {
-                        Ok(d) => {
-                            v2_buf = d;
-                            &v2_buf
-                        }
-                        Err(e) => {
-                            warn!(
-                                peer = %propagation_source,
-                                author = ?message.source,
-                                %e,
-                                "undecodable zstd native batch rejected"
-                            );
-                            penalize_gossip_author(
-                                peer_scoring,
-                                message.source,
-                                PENALTY_INVALID_TX,
-                                "undecodable zstd native batch",
-                            );
-                            return;
-                        }
-                    }
-                } else {
-                    &message.data
-                };
-                if let Some(actions) = deserialize_native_batch(payload) {
+                // Native-action batches arrive RAW on the v1 topic (zstd gossip
+                // removed, s364) — parse directly, no decompress-on-receive step,
+                // which was the per-node DoS surface.
+                if let Some(actions) = deserialize_native_batch(&message.data) {
                     let count = actions.len();
                     let mut ok = 0usize;
                     for action_bytes in actions {
@@ -812,7 +762,7 @@ fn handle_event(
                         m.native_gossip_received_actions.inc_by(ok as u64);
                     }
                 } else {
-                    match bincode::deserialize::<(torus_types::Address, torus_types::SignedNativeAction)>(payload) {
+                    match bincode::deserialize::<(torus_types::Address, torus_types::SignedNativeAction)>(&message.data) {
                         Ok(pair) => {
                             if let Some(ref tx) = shared.native_action_inbound {
                                 let _ = tx.send(pair);
@@ -1710,6 +1660,32 @@ fn handle_consensus_gossip(
 mod tests {
     use super::*;
     use crate::peer_scoring::INITIAL_SCORE;
+
+    /// s364 DoS closure (RED first): no node may subscribe to the removed
+    /// `/torus/native-actions/2.0` zstd gossip topic. Subscribing forces every
+    /// node to decompress attacker-published frames, so one `--gossip-zstd`
+    /// peer could stall the whole cluster. Per-peer zstd survives only on the
+    /// request_response body paths (`/torus/{native-da,block-data,direct}/2.0`),
+    /// which negotiate compression per peer; gossip carries raw v1 only.
+    #[test]
+    fn no_node_subscribes_to_v2_gossip_topic() {
+        let key = libp2p::identity::Keypair::generate_ed25519();
+        let mut behaviour = TorusBehaviour::new(&key).expect("build behaviour");
+        subscribe_gossip_topics(&mut behaviour.gossipsub);
+
+        let subscribed: Vec<_> = behaviour.gossipsub.topics().cloned().collect();
+        let v2 = gossipsub::IdentTopic::new("/torus/native-actions/2.0").hash();
+        assert!(
+            !subscribed.contains(&v2),
+            "node subscribed to the removed v2 gossip topic (DoS vector); topics={subscribed:?}"
+        );
+        // Sanity: native-action gossip still rides the raw v1 topic.
+        let v1 = gossipsub::IdentTopic::new(NATIVE_ACTION_TOPIC).hash();
+        assert!(
+            subscribed.contains(&v1),
+            "node must still subscribe to the v1 native-actions topic"
+        );
+    }
 
     /// Phase 2.3 (#5, RED first): a hash-only manifest body (`bincode(Vec<[u8;32]>)`)
     /// decodes into per-request hash chunks (≤ `NATIVE_DA_FETCH_CHUNK`) for the pre-warm

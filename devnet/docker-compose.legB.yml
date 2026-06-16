@@ -1,7 +1,8 @@
 # Leg B — mixed-version fallback proof: validator-3 runs the pre-Sprint5
-# image (no /2.0 protocols, no v2 gossip topic). gossip-zstd stays OFF
-# everywhere (base commands), since an old peer cannot read the v2 topic.
-# validator-0 keeps codec debug so per-peer 2.0-vs-1.0 negotiation is visible.
+# image (no /2.0 request_response protocols). No gossip-zstd flag is passed
+# (it was removed in s364 with the v2 gossip topic); native-action gossip is
+# raw v1 for every peer. validator-0 keeps codec debug so per-peer 2.0-vs-1.0
+# request_response negotiation is visible.
 # Usage: docker compose -f docker-compose.yml -f docker-compose.legB.yml up -d
 services:
   validator-0:

@@ -12,11 +12,12 @@ use crate::sync::{SyncRequest, SyncResponse};
 pub const CONSENSUS_TOPIC: &str = "/torus/consensus/1.0";
 pub const TX_TOPIC: &str = "/torus/transactions/1.0";
 pub const NATIVE_ACTION_TOPIC: &str = "/torus/native-actions/1.0";
-/// Sprint 5: zstd-compressed native-action batches. Gossipsub cannot
-/// negotiate per-peer like request_response, so nodes SUBSCRIBE to both
-/// topics but publish v2 only behind `--gossip-zstd` (flipped once every
-/// validator runs a 2.0-capable binary).
-pub const NATIVE_ACTION_TOPIC_V2: &str = "/torus/native-actions/2.0";
+// The `/torus/native-actions/2.0` zstd gossip topic was REMOVED (s364): a v2
+// subscriber had to decompress every frame an attacker published (gossipsub
+// cannot negotiate compression per-peer), a cluster-wide DoS that
+// `--no-gossip-zstd` could not close — it only stopped local publishing. The
+// per-peer-negotiated zstd survives on the request_response body protocols
+// (`/torus/{direct,block-data,native-da}/2.0`), never on gossip.
 
 #[derive(NetworkBehaviour)]
 pub struct TorusBehaviour {
