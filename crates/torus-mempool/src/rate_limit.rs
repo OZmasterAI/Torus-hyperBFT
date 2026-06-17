@@ -32,16 +32,17 @@ pub const EVM_TOTAL_BLOCK_CAP: usize = 20;
 /// Max native actions per sender per block.
 pub const NATIVE_PER_BLOCK_CAP: usize = 64;
 
-/// Max total native actions per block (all senders combined). Raised 100->1000
-/// (s365) now that CompactBlock disseminates proposals as hashes — the 256 KB
-/// `max_consensus_message_size` no longer binds (a 50k-order block is ~32 KB
-/// compact vs ~2.5 MB full; see `compact_proposal_holds_where_full_block_collapsed_at_bs500`),
-/// so blocks fill to the 6 MB `NATIVE_BLOCK_BYTES_CAP` instead of this count.
-/// Selection is enforced only in produce_block; validate_block does not reject
-/// on count, so a node on the old value still accepts a higher-cap proposer's
-/// blocks (no fork). The serial sig-verify cost still rises with block size, so
-/// the bytes cap is the real ceiling.
-pub const NATIVE_TOTAL_BLOCK_CAP: usize = 1000;
+/// Max total native actions per block (all senders combined). Held at 100 — this
+/// also bounds the block BODY to a size that disseminates over the WAN. s365
+/// raised it to 1000 and it WEDGED under 3-box load: blocks grew to ~292 actions
+/// (the 6 MB `NATIVE_BLOCK_BYTES_CAP`), and 6 MB bodies overran native-DA
+/// (`native-da OUTBOUND FAILURE` + `body fetch exhausted ... falling back to
+/// sync`), stalling the chain until the load stopped. So 100 is a deliberate
+/// dissemination guard, not just a sig-verify bound — at bs400 it keeps blocks
+/// ~2 MB (stable). Raise it ONLY after body dissemination is fixed (erasure-coded
+/// bodies, docs/plans). Enforced only in produce_block selection; validate_block
+/// does not reject on count, so mixed cap values don't fork.
+pub const NATIVE_TOTAL_BLOCK_CAP: usize = 100;
 
 /// Max total native pool size. With gossip replication, each validator holds
 /// actions from all peers, so this must be large enough for the full mesh.
