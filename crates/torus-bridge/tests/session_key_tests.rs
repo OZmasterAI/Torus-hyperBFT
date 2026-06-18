@@ -97,10 +97,12 @@ fn create_session_with_ecdsa_succeeds() {
     let owner = addr(1);
     let session_key = make_ed25519_key();
     let pubkey = session_key.verifying_key().to_bytes();
-    let timestamp = 1_700_000_000_000u64;
-    let expiry = timestamp + 3_600_000; // 1 hour
+    // Block timestamp is SECONDS in production (header.timestamp = .as_secs());
+    // expiry is MILLISECONDS (matches order-time current_time_ms / the nonce window).
+    let block_ts_secs = 1_700_000_000u64;
+    let expiry = block_ts_secs * 1000 + 3_600_000; // 1 hour, ms
 
-    let mut ctx = make_ctx(state_db.clone(), timestamp);
+    let mut ctx = make_ctx(state_db.clone(), block_ts_secs);
     let action = NativeAction::CreateSession {
         session_pubkey: pubkey,
         expiry,
@@ -115,7 +117,49 @@ fn create_session_with_ecdsa_succeeds() {
     assert_eq!(session.owner, owner);
     assert_eq!(session.expiry, expiry);
     assert_eq!(session.scope, SessionScope::Trading);
-    assert_eq!(session.created_at, timestamp);
+    assert_eq!(session.created_at, block_ts_secs * 1000);
+}
+
+#[test]
+fn create_session_seconds_block_ts_then_resolve_ms_order() {
+    // Regression for the seconds/ms expiry bug: production builds the block
+    // timestamp in SECONDS (header.timestamp = .as_secs()), but expiry and order
+    // validation (resolve_sender / current_time_ms) are MILLISECONDS. A session
+    // created via the executor under a realistic seconds block ts MUST be usable by
+    // an order validated against wall-clock ms. Before the fix, create_session
+    // rejected the ms expiry as "exceeds 24h maximum", the session was never written,
+    // and every order failed "session key not found".
+    let (_dir, state_db) = open_test_db();
+    let owner = addr(1);
+    let session_key = make_ed25519_key();
+    let pubkey = session_key.verifying_key().to_bytes();
+
+    let block_ts_secs = 1_700_000_000u64; // SECONDS, as a block header carries
+    let now_ms = block_ts_secs * 1000; // wall-clock ms at order time
+    let expiry_ms = now_ms + 3_600_000; // 1h, ms (what a client sends)
+
+    let mut ctx = make_ctx(state_db.clone(), block_ts_secs);
+    let create = NativeAction::CreateSession {
+        session_pubkey: pubkey,
+        expiry: expiry_ms,
+        scope: SessionScope::Full,
+    };
+    let result = NativeExecutor::execute(&mut ctx, &owner, &create);
+    assert!(
+        result.success,
+        "create_session rejected a valid ms expiry under a seconds block ts: {:?}",
+        result.error
+    );
+
+    // The session must be usable: resolve an order against wall-clock ms.
+    let order = place_order_action();
+    let signed = sign_with_session(order, now_ms, &session_key);
+    let resolved = signed.resolve_sender(now_ms, |pk| state_db.get_session(pk).ok().flatten());
+    assert_eq!(
+        resolved.unwrap(),
+        owner,
+        "session created under a seconds block ts must resolve at ms order time"
+    );
 }
 
 #[test]
@@ -206,8 +250,8 @@ fn expired_session_key_rejected() {
 fn create_6th_session_rejected() {
     let (_dir, state_db) = open_test_db();
     let owner = addr(1);
-    let timestamp = 1_700_000_000_000u64;
-    let expiry = timestamp + 3_600_000;
+    let block_ts_secs = 1_700_000_000u64; // SECONDS (block header)
+    let expiry = block_ts_secs * 1000 + 3_600_000; // ms
 
     // Create 5 sessions
     for i in 0..5u8 {
@@ -217,7 +261,7 @@ fn create_6th_session_rejected() {
             owner,
             expiry,
             scope: SessionScope::Trading,
-            created_at: timestamp,
+            created_at: block_ts_secs * 1000,
         };
         state_db.put_session(&key_bytes, &data).unwrap();
     }
@@ -231,7 +275,7 @@ fn create_6th_session_rejected() {
         scope: SessionScope::Trading,
     };
 
-    let mut ctx = make_ctx(state_db, timestamp);
+    let mut ctx = make_ctx(state_db, block_ts_secs);
     let result = NativeExecutor::execute(&mut ctx, &owner, &action);
     assert!(!result.success);
     assert!(result.error.unwrap().contains("max 5"));

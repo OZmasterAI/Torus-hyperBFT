@@ -1178,11 +1178,17 @@ impl NativeExecutor {
     ) -> NativeActionResult {
         use torus_types::eip712::{MAX_SESSION_EXPIRY_MS, MAX_SESSIONS_PER_ADDRESS};
 
-        // Validate expiry is within 24h from current block timestamp
-        if expiry > ctx.timestamp + MAX_SESSION_EXPIRY_MS {
+        // The block timestamp is SECONDS (header.timestamp = .as_secs()), but
+        // `expiry`, MAX_SESSION_EXPIRY_MS, and order-time validation (resolve_sender
+        // against current_time_ms) are all MILLISECONDS. Convert to ms here so
+        // creation and usage agree — otherwise no expiry satisfies both gates and
+        // every session is unusable (rejected "expiry exceeds 24h maximum" on create,
+        // so orders later fail "session key not found").
+        let now_ms = ctx.timestamp.saturating_mul(1000);
+        if expiry > now_ms + MAX_SESSION_EXPIRY_MS {
             return NativeActionResult::err("create_session", "expiry exceeds 24h maximum".into());
         }
-        if expiry <= ctx.timestamp {
+        if expiry <= now_ms {
             return NativeActionResult::err("create_session", "session already expired".into());
         }
 
@@ -1219,7 +1225,7 @@ impl NativeExecutor {
             owner: *sender,
             expiry,
             scope,
-            created_at: ctx.timestamp,
+            created_at: now_ms,
         };
         match ctx.state.put_session(session_pubkey, &data) {
             Ok(()) => NativeActionResult::ok("create_session", 5000),
