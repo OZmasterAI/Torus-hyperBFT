@@ -701,6 +701,36 @@ pub fn sign_native_action(
     }
 }
 
+/// Sign a native action with an ed25519 **session key** instead of the owner's
+/// EIP-712 ECDSA key. Produces the SAME signing hash as [`sign_native_action`]
+/// (EIP-712 domain + struct hash) but signs it with ed25519, so the node authorizes
+/// it via its batched `verify_batch` + session-state lookup instead of a per-action
+/// secp256k1 `ecrecover` — the fast path that makes session keys cheap at ingress.
+///
+/// The session pubkey must already be registered on-chain (via a `CreateSession`
+/// action) and its scope must permit `action`, or the node rejects it at
+/// `resolve_sender`. This is a client-side signing helper only — it changes no
+/// validation or consensus behavior.
+pub fn sign_native_action_with_session(
+    action: NativeAction,
+    nonce: u64,
+    session_key: &ed25519_dalek::SigningKey,
+) -> SignedNativeAction {
+    use ed25519_dalek::Signer;
+    let domain = eip712_domain_separator();
+    let struct_hash = eip712_struct_hash(&action, nonce);
+    let signing_hash = eip712_signing_hash(domain, struct_hash);
+    let sig = session_key.sign(signing_hash.as_slice());
+    SignedNativeAction {
+        action,
+        nonce,
+        signature: ActionSignature::Session {
+            session_pubkey: session_key.verifying_key().to_bytes(),
+            sig: crate::Ed25519Sig(sig.to_bytes()),
+        },
+    }
+}
+
 /// Maximum session key expiry: 24 hours in milliseconds.
 pub const MAX_SESSION_EXPIRY_MS: u64 = 24 * 60 * 60 * 1000;
 
@@ -956,7 +986,7 @@ pub fn batch_verify_native_actions(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Ed25519Sig, OrderType, SessionData, SessionScope, TimeInForce};
+    use crate::{OrderType, SessionData, SessionScope, TimeInForce};
 
     fn test_key() -> SigningKey {
         let mut bytes = [0u8; 32];
@@ -1314,19 +1344,8 @@ mod tests {
         nonce: u64,
         session_key: &ed25519_dalek::SigningKey,
     ) -> SignedNativeAction {
-        use ed25519_dalek::Signer;
-        let domain = eip712_domain_separator();
-        let struct_hash = eip712_struct_hash(&action, nonce);
-        let signing_hash = eip712_signing_hash(domain, struct_hash);
-        let sig = session_key.sign(signing_hash.as_slice());
-        SignedNativeAction {
-            action,
-            nonce,
-            signature: ActionSignature::Session {
-                session_pubkey: session_key.verifying_key().to_bytes(),
-                sig: Ed25519Sig(sig.to_bytes()),
-            },
-        }
+        // Delegates to the production signer so the tests exercise the public API.
+        sign_native_action_with_session(action, nonce, session_key)
     }
 
     fn make_session(owner: Address) -> SessionData {
@@ -1336,6 +1355,34 @@ mod tests {
             scope: SessionScope::Trading,
             created_at: 0,
         }
+    }
+
+    #[test]
+    fn sign_native_action_with_session_resolves_to_owner() {
+        // The bench's lever-1 primitive: an ed25519 session key signs the SAME
+        // EIP-712 hash, and the chain resolves it to the registered owner WITHOUT
+        // a per-action secp256k1 ecrecover (the ingress-verify cost we're killing).
+        let ed_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let pubkey = ed_key.verifying_key().to_bytes();
+        let owner = Address::from([0x22; 20]);
+        let session = SessionData {
+            owner,
+            expiry: u64::MAX,
+            scope: SessionScope::Full,
+            created_at: 0,
+        };
+        let signed = sign_native_action_with_session(
+            NativeAction::CancelOrder { order_id: 7 },
+            TEST_NONCE,
+            &ed_key,
+        );
+        // Carries a valid ed25519 signature over the EIP-712 signing hash.
+        assert_eq!(signed.verify_session_signature().unwrap(), pubkey);
+        // Resolves to the registered owner via the session lookup — no ecrecover.
+        let got = signed
+            .resolve_sender(0, |pk| (pk == &pubkey).then(|| session.clone()))
+            .expect("session-signed action resolves to owner");
+        assert_eq!(got, owner);
     }
 
     /// Collapse the positional sender vector back to the indices of invalid

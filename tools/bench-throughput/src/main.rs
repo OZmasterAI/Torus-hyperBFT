@@ -10,7 +10,9 @@ use rand::{Rng, SeedableRng};
 use tokio::sync::Semaphore;
 
 use torus_types::{
-    eip712::sign_native_action, FixedPoint, NativeAction, OrderType, PlaceOrderParams, TimeInForce,
+    eip712::{sign_native_action, sign_native_action_with_session},
+    FixedPoint, NativeAction, OrderType, PlaceOrderParams, SessionScope, SignedNativeAction,
+    TimeInForce,
 };
 
 const HARDHAT_KEYS: [&str; 20] = [
@@ -97,6 +99,13 @@ enum Command {
         /// an unpaced burst overruns RPC ingress and under-measures the chain.
         #[arg(long, default_value_t = 0)]
         rate: usize,
+        /// Signature mode: "eip712" (secp256k1 ECDSA, default — the node recovers
+        /// the sender per action) or "session" (ed25519 session keys — registers a
+        /// CreateSession per sender, then signs orders with the session key to hit
+        /// the chain's batched-ed25519 fast path; isolates the chain ceiling from
+        /// per-action ecrecover cost).
+        #[arg(long, default_value = "eip712")]
+        sign_mode: String,
     },
     Combined {
         #[arg(long, default_value = "http://localhost:8545,http://localhost:8546,http://localhost:8547,http://localhost:8548")]
@@ -122,6 +131,17 @@ enum Command {
         /// Blocks measured per size; the reported time is the MIN across them (noise-robust).
         #[arg(long, default_value_t = 5)]
         blocks: usize,
+    },
+    /// Print derived EVM addresses for a sender range, for genesis funding. Uses
+    /// the SAME key derivation as the consensus bench, so funded addresses provably
+    /// match the senders the bench will use (no address/funding mismatch).
+    GenAccounts {
+        /// First sender index (e.g. 20 to derive senders 20..20+count).
+        #[arg(long, default_value_t = 20)]
+        offset: usize,
+        /// How many sender addresses to derive.
+        #[arg(long, default_value_t = 40)]
+        count: usize,
     },
 }
 
@@ -150,6 +170,34 @@ fn random_place_order(rng: &mut impl Rng, market_id: u64) -> NativeAction {
     })
 }
 
+/// How the bench signs each action.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SignMode {
+    /// EIP-712 ECDSA (secp256k1): the owner key signs and the node recovers the
+    /// sender with a per-action `ecrecover` — the expensive ingress path.
+    Eip712,
+    /// Ed25519 session key: sessions are registered first (a `CreateSession` per
+    /// sender), then orders are signed with the session key so the node takes its
+    /// batched-ed25519 fast path — isolates the chain ceiling from per-action
+    /// ecrecover cost (lever 1).
+    Session,
+}
+
+/// Sign one action in the configured mode. `k256` is the owner's EIP-712 key;
+/// `session` is its registered ed25519 session key (used only in `Session` mode).
+fn sign_one(
+    action: NativeAction,
+    nonce: u64,
+    k256: &k256::ecdsa::SigningKey,
+    session: &ed25519_dalek::SigningKey,
+    mode: SignMode,
+) -> SignedNativeAction {
+    match mode {
+        SignMode::Eip712 => sign_native_action(action, nonce, k256),
+        SignMode::Session => sign_native_action_with_session(action, nonce, session),
+    }
+}
+
 /// Sign one submit-batch worth of payloads (T6 signer pipeline). Returns the
 /// hex payload strings and the advanced nonce watermark — nonces must be
 /// strictly increasing per sender because the committed (sender, nonce) replay
@@ -157,6 +205,8 @@ fn random_place_order(rng: &mut impl Rng, market_id: u64) -> NativeAction {
 fn sign_payload_batch(
     rng: &mut impl Rng,
     key: &k256::ecdsa::SigningKey,
+    session: &ed25519_dalek::SigningKey,
+    mode: SignMode,
     batch_size: usize,
     submit_batch: usize,
     mut last_nonce: u64,
@@ -171,7 +221,7 @@ fn sign_payload_batch(
             .as_millis() as u64;
         let nonce = base.max(last_nonce + 1);
         last_nonce = nonce;
-        let signed = sign_native_action(action, nonce, key);
+        let signed = sign_one(action, nonce, key, session, mode);
         let bytes = if bin {
             bincode::serialize(&signed).unwrap()
         } else {
@@ -193,6 +243,8 @@ fn sign_payload_batch(
 fn pregen_ammo(
     rng: &mut impl Rng,
     key: &k256::ecdsa::SigningKey,
+    session: &ed25519_dalek::SigningKey,
+    mode: SignMode,
     batch_size: usize,
     submit_batch: usize,
     count: usize,
@@ -205,7 +257,7 @@ fn pregen_ammo(
         let mut payloads = Vec::with_capacity(submit_batch);
         for _ in 0..submit_batch {
             let action = random_place_order_action(rng, 1, batch_size);
-            let signed = sign_native_action(action, nonce, key);
+            let signed = sign_one(action, nonce, key, session, mode);
             nonce += 1;
             let bytes = if bin {
                 bincode::serialize(&signed).unwrap()
@@ -382,25 +434,83 @@ fn run_matching_engine(orders: usize, markets: u64, warmup: usize, genesis_path:
 
 struct SenderKey {
     signing_key: SigningKey,
+    /// Deterministic ed25519 session key for this sender (used in --sign-mode
+    /// session). Registered on-chain via `CreateSession` before the timed window.
+    session_key: ed25519_dalek::SigningKey,
+}
+
+/// Deterministic ed25519 session key for sender `idx` — stable across runs so a
+/// re-bench can reuse an already-registered session.
+fn session_key_for(idx: usize) -> ed25519_dalek::SigningKey {
+    let mut seed = [0u8; 32];
+    seed[..8].copy_from_slice(&(0xED25_0000_0000_0000u64 + idx as u64).to_le_bytes());
+    ed25519_dalek::SigningKey::from_bytes(&seed)
 }
 
 fn load_sender_keys(count: usize, offset: usize) -> Vec<SenderKey> {
-    let funded_end = (offset + count).min(20);
-    let mut keys: Vec<SenderKey> = HARDHAT_KEYS[offset.min(20)..funded_end]
-        .iter()
-        .map(|hex_key| {
-            let bytes = hex::decode(hex_key).expect("valid hex");
-            let signing_key = SigningKey::from_slice(&bytes).expect("valid key");
-            SenderKey { signing_key }
+    (offset..offset + count)
+        .map(|idx| {
+            // Indices < 20 use the genesis-funded hardhat accounts; beyond that,
+            // deterministic random keys (unfunded — their orders won't match, but
+            // the keys stay stable per index for reproducible runs).
+            let signing_key = if idx < 20 {
+                let bytes = hex::decode(HARDHAT_KEYS[idx]).expect("valid hex");
+                SigningKey::from_slice(&bytes).expect("valid key")
+            } else {
+                let mut rng = StdRng::seed_from_u64(0xBEEF_0000 + idx as u64);
+                SigningKey::random(&mut rng)
+            };
+            SenderKey {
+                signing_key,
+                session_key: session_key_for(idx),
+            }
         })
-        .collect();
+        .collect()
+}
 
-    for i in funded_end..(offset + count) {
-        let mut rng = StdRng::seed_from_u64(0xBEEF_0000 + i as u64);
-        let signing_key = SigningKey::random(&mut rng);
-        keys.push(SenderKey { signing_key });
+/// Register one ed25519 session key per sender on-chain via a `CreateSession`
+/// action, EIP-712-signed by the owner key (sessions can only be created with the
+/// master key — `requires_eip712`). Orders can then be session-signed for the
+/// chain's batched-ed25519 fast path. Uses `SessionScope::Full` because the
+/// `Trading` scope does NOT permit `PlaceOrderBatch` (the bench's throughput
+/// action). Returns how many `CreateSession` actions the nodes admitted at ingress.
+async fn register_sessions(
+    client: &reqwest::Client,
+    urls: &[String],
+    keys: &[SenderKey],
+    bin: bool,
+) -> usize {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    // 1 hour — comfortably under MAX_SESSION_EXPIRY_MS (24h) and far in the future.
+    let expiry = now_ms + 60 * 60 * 1000;
+    let mut accepted = 0usize;
+    for (i, sk) in keys.iter().enumerate() {
+        let action = NativeAction::CreateSession {
+            session_pubkey: sk.session_key.verifying_key().to_bytes(),
+            expiry,
+            scope: SessionScope::Full,
+        };
+        // Distinct, in-window nonce per sender, below the order nonces (which lead
+        // by half the 60s window), so the (owner, nonce) replay guard never clashes.
+        let nonce = now_ms + i as u64;
+        let signed = sign_native_action(action, nonce, &sk.signing_key);
+        let bytes = if bin {
+            bincode::serialize(&signed).unwrap()
+        } else {
+            serde_json::to_vec(&signed).unwrap()
+        };
+        let payload = format!("0x{}", hex::encode(&bytes));
+        match submit_native_actions_batch(client, &urls[i % urls.len()], &[payload], i as u64, bin)
+            .await
+        {
+            Ok(n) => accepted += n,
+            Err(e) => eprintln!("[session] sender {i} CreateSession failed: {e}"),
+        }
     }
-    keys
+    accepted
 }
 
 /// Submit a batch of pre-encoded signed actions via `torus_submitNativeActions`
@@ -439,12 +549,24 @@ async fn submit_native_actions_batch(
             err.get("message").and_then(|m| m.as_str()).unwrap_or("unknown")
         ));
     }
-    let accepted = resp["result"]
-        .as_array()
-        .map(|items| items.iter().filter(|i| i.get("hash").is_some()).count())
+    let items = resp["result"].as_array();
+    let accepted = items
+        .map(|its| its.iter().filter(|i| i.get("hash").is_some()).count())
         .unwrap_or(0);
+    if accepted == 0 {
+        // Surface WHY nothing landed — a per-item error or an unexpected shape.
+        // A silent 0-accepted is exactly the misread session signing exists to avoid.
+        let reason = items
+            .and_then(|its| its.iter().find_map(|i| i.get("error").map(|e| e.to_string())))
+            .unwrap_or_else(|| resp["result"].to_string());
+        return Err(format!("0 accepted ({} sent): {reason}", payloads.len()));
+    }
     Ok(accepted)
 }
+
+/// Count of submit errors surfaced so far — we print only the first few so a
+/// rejected run doesn't flood the timed window with one line per batch.
+static SUBMIT_ERRS: AtomicU64 = AtomicU64::new(0);
 
 /// Fire one already-signed payload set and credit `submitted` by however many the
 /// server accepted. A lone JSON action uses the legacy single endpoint; anything
@@ -457,14 +579,25 @@ async fn submit_payloads(
     bin: bool,
     submitted: &AtomicU64,
 ) {
-    if payloads.len() == 1 && !bin {
-        if submit_native_action(client, url, &payloads[0], req_id).await.is_ok() {
-            submitted.fetch_add(1, Ordering::Relaxed);
-        }
-    } else if let Ok(accepted) =
+    let result = if payloads.len() == 1 && !bin {
+        submit_native_action(client, url, &payloads[0], req_id)
+            .await
+            .map(|()| 1usize)
+    } else {
         submit_native_actions_batch(client, url, payloads, req_id, bin).await
-    {
-        submitted.fetch_add(accepted as u64, Ordering::Relaxed);
+    };
+    match result {
+        Ok(accepted) => {
+            submitted.fetch_add(accepted as u64, Ordering::Relaxed);
+        }
+        // Surface the first few rejection reasons instead of silently dropping —
+        // a bench that reports 0 with no reason is how saturated/rejected runs get
+        // misread as the chain's ceiling.
+        Err(e) => {
+            if SUBMIT_ERRS.fetch_add(1, Ordering::Relaxed) < 5 {
+                eprintln!("[submit] {e}");
+            }
+        }
     }
 }
 
@@ -744,6 +877,7 @@ async fn run_consensus(
     bin: bool,
     pre_sign: usize,
     rate: usize,
+    sign_mode: SignMode,
 ) {
     let rpc_urls: Vec<String> = rpc_urls_str.split(',').map(|s| s.trim().to_string()).collect();
     let num_senders = senders.max(1);
@@ -765,6 +899,13 @@ async fn run_consensus(
 
     println!("=== Torus Throughput Benchmark ===");
     println!("Mode: consensus");
+    println!(
+        "Sign mode: {}",
+        match sign_mode {
+            SignMode::Eip712 => "eip712 (secp256k1 ecrecover per action)",
+            SignMode::Session => "session (ed25519 fast path)",
+        }
+    );
     println!("Duration: {duration_secs}s");
     println!("Senders: {num_senders} (offset {sender_offset})");
     println!("Batch size: {orders_per_action} order(s)/action");
@@ -792,6 +933,70 @@ async fn run_consensus(
             .expect("HTTP client"),
     );
 
+    // In session mode, register one ed25519 session per sender and wait for it to
+    // commit BEFORE the timed window, so session-signed orders hit the fast path
+    // instead of being rejected as "session not found".
+    if sign_mode == SignMode::Session {
+        println!("Registering {num_senders} ed25519 session(s) (scope: Full)...");
+        let accepted = register_sessions(&client, &rpc_urls, &keys, bin).await;
+        if accepted < num_senders {
+            eprintln!(
+                "[session] WARNING: only {accepted}/{num_senders} CreateSession actions admitted — \
+                 session-signed orders from unregistered senders will be rejected."
+            );
+        } else {
+            println!("  {accepted}/{num_senders} session(s) admitted.");
+        }
+        // CreateSession must COMMIT to state before a session-signed order
+        // validates: ingress `session_lookup` reads committed state (db.get_session),
+        // which lags inclusion by the ~3-block HotStuff commit window. Rather than
+        // guess a block count, poll with a canary session-signed order from sender 0
+        // until the node accepts it — then every session (all registered in the same
+        // block) is live. Without this, orders fire pre-commit and the node rejects
+        // them "signature verification failed: session key not found".
+        print!("  waiting for sessions to commit (canary probe)... ");
+        use std::io::Write as _;
+        let _ = std::io::stdout().flush();
+        let canary_key = &keys[0].session_key;
+        let mut probe_nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let probe_deadline = Instant::now() + Duration::from_secs(45);
+        let mut live = false;
+        while Instant::now() < probe_deadline {
+            tokio::time::sleep(Duration::from_millis(750)).await;
+            probe_nonce += 1;
+            let canary = sign_native_action_with_session(
+                random_place_order_action(&mut StdRng::from_entropy(), 1, 1),
+                probe_nonce,
+                canary_key,
+            );
+            let bytes = if bin {
+                bincode::serialize(&canary).unwrap()
+            } else {
+                serde_json::to_vec(&canary).unwrap()
+            };
+            let payload = format!("0x{}", hex::encode(&bytes));
+            if let Ok(n) =
+                submit_native_actions_batch(&client, &rpc_urls[0], &[payload], 0, bin).await
+            {
+                if n > 0 {
+                    live = true;
+                    break;
+                }
+            }
+        }
+        if live {
+            println!("live (canary accepted).");
+        } else {
+            eprintln!(
+                "\n[session] WARNING: sessions still not live after 45s — orders will be \
+                 rejected 'session key not found'. Check chain liveness."
+            );
+        }
+    }
+
     let submitted = Arc::new(AtomicU64::new(0));
     let included = Arc::new(AtomicU64::new(0));
 
@@ -814,9 +1019,13 @@ async fn run_consensus(
         let mut handles = Vec::with_capacity(num_senders);
         for sk in &keys {
             let key = sk.signing_key.clone();
+            let session = sk.session_key.clone();
             handles.push(tokio::task::spawn_blocking(move || {
                 let mut rng = StdRng::from_entropy();
-                pregen_ammo(&mut rng, &key, batch_size, submit_batch, pre_sign, bin, base_nonce)
+                pregen_ammo(
+                    &mut rng, &key, &session, sign_mode, batch_size, submit_batch, pre_sign, bin,
+                    base_nonce,
+                )
             }));
         }
         for h in handles {
@@ -952,6 +1161,7 @@ async fn run_consensus(
 
     for sender_idx in 0..num_senders {
         let key = keys[sender_idx].signing_key.clone();
+        let session_key = keys[sender_idx].session_key.clone();
         let client = client.clone();
         let urls = rpc_urls.clone();
         let submitted = submitted.clone();
@@ -1023,6 +1233,8 @@ async fn run_consensus(
                         let (payloads, n) = sign_payload_batch(
                             &mut rng,
                             &key,
+                            &session_key,
+                            sign_mode,
                             batch_size,
                             submit_batch,
                             last_nonce,
@@ -1330,6 +1542,22 @@ fn run_state_root_scaling(sizes_str: &str, changed: usize, blocks: usize) {
 // Main
 // ============================================================================
 
+/// Derive EVM addresses for a sender range using the SAME key path the consensus
+/// bench uses, so genesis funding provably matches the senders. Mirrors the chain's
+/// `pubkey_to_address`: keccak256 of the 64-byte uncompressed pubkey, last 20 bytes.
+/// Emits `<idx> 0x<address>` per line for downstream genesis tooling.
+fn run_gen_accounts(offset: usize, count: usize) {
+    let keys = load_sender_keys(count, offset);
+    for (i, sk) in keys.iter().enumerate() {
+        let idx = offset + i;
+        let vk = sk.signing_key.verifying_key();
+        let uncompressed = vk.to_encoded_point(false);
+        let hash = alloy_primitives::keccak256(&uncompressed.as_bytes()[1..]);
+        let addr = Address::from_slice(&hash[12..]);
+        println!("{idx} {addr:#x}");
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -1352,12 +1580,21 @@ async fn main() {
             format,
             pre_sign,
             rate,
+            sign_mode,
         } => {
             let bin = match format.as_str() {
                 "bin" => true,
                 "json" => false,
                 other => {
                     eprintln!("unknown --format {other:?} (expected \"json\" or \"bin\")");
+                    std::process::exit(2);
+                }
+            };
+            let mode = match sign_mode.as_str() {
+                "eip712" => SignMode::Eip712,
+                "session" => SignMode::Session,
+                other => {
+                    eprintln!("unknown --sign-mode {other:?} (expected \"eip712\" or \"session\")");
                     std::process::exit(2);
                 }
             };
@@ -1372,6 +1609,7 @@ async fn main() {
                 bin,
                 pre_sign,
                 rate,
+                mode,
             )
             .await
         }
@@ -1381,12 +1619,13 @@ async fn main() {
             changed,
             blocks,
         } => run_state_root_scaling(&sizes, changed, blocks),
+        Command::GenAccounts { offset, count } => run_gen_accounts(offset, count),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{fire_interval, pregen_ammo, sign_payload_batch};
+    use super::{fire_interval, pregen_ammo, sign_one, sign_payload_batch, SignMode};
     use super::{summarize_included, SweptBlock};
     use rand::{rngs::StdRng, SeedableRng};
 
@@ -1394,8 +1633,9 @@ mod tests {
     fn sign_payload_batch_nonces_strictly_increase() {
         let mut rng = StdRng::seed_from_u64(7);
         let key = k256::ecdsa::SigningKey::from_slice(&[0x11; 32]).unwrap();
-        let (p1, n1) = sign_payload_batch(&mut rng, &key, 3, 4, 0, false);
-        let (p2, n2) = sign_payload_batch(&mut rng, &key, 3, 4, n1, false);
+        let ed = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]);
+        let (p1, n1) = sign_payload_batch(&mut rng, &key, &ed, SignMode::Eip712, 3, 4, 0, false);
+        let (p2, n2) = sign_payload_batch(&mut rng, &key, &ed, SignMode::Eip712, 3, 4, n1, false);
         assert_eq!(p1.len(), 4);
         assert_eq!(p2.len(), 4);
         assert!(n2 > n1, "nonce watermark must advance across batches");
@@ -1414,15 +1654,36 @@ mod tests {
     }
 
     #[test]
+    fn session_mode_produces_verifiable_ed25519_signature() {
+        // sign_one(Session) must emit an ActionSignature::Session that round-trips
+        // through the wire encoding and verifies against the session pubkey — i.e.
+        // the node takes the batched-ed25519 fast path, not a per-action ecrecover.
+        let k = k256::ecdsa::SigningKey::from_slice(&[0x11; 32]).unwrap();
+        let ed = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]);
+        let pubkey = ed.verifying_key().to_bytes();
+        let action = torus_types::NativeAction::CancelOrder { order_id: 9 };
+        let signed = sign_one(action, 1_700_000_000_000, &k, &ed, SignMode::Session);
+        // Round-trips through the same JSON the bench fires on the wire.
+        let bytes = serde_json::to_vec(&signed).unwrap();
+        let decoded: torus_types::SignedNativeAction = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            decoded.verify_session_signature().unwrap(),
+            pubkey,
+            "session-signed action must carry a valid ed25519 sig over the EIP-712 hash"
+        );
+    }
+
+    #[test]
     fn pregen_ammo_nonces_are_contiguous_from_base() {
         let mut rng = StdRng::seed_from_u64(7);
         let key = k256::ecdsa::SigningKey::from_slice(&[0x11; 32]).unwrap();
+        let ed = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]);
         // Deterministic: nonces depend only on base_nonce, not the wall clock, so
         // this catches a non-advancing nonce regardless of signing speed (in debug
         // a wall-clock nonce would mask it). 3 payloads x 10 actions = 30-action
         // stream, expected nonces BASE..BASE+30.
         const BASE: u64 = 1_700_000_000_000;
-        let ammo = pregen_ammo(&mut rng, &key, 1, 10, 3, false, BASE);
+        let ammo = pregen_ammo(&mut rng, &key, &ed, SignMode::Eip712, 1, 10, 3, false, BASE);
         assert_eq!(ammo.len(), 3, "one payload-vec per requested count");
         assert!(ammo.iter().all(|p| p.len() == 10), "each payload carries submit_batch actions");
 
