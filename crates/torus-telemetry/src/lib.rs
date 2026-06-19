@@ -128,6 +128,13 @@ pub struct Metrics {
     pub exec_verify_seconds: Histogram,
     pub exec_replay_guard_seconds: Histogram,
     pub exec_engine_seconds: Histogram,
+    /// Sub-phase decomposition of one `execute_batch` call (s372). `exec_engine`
+    /// above times the whole native section (two execute_batch calls + governance
+    /// + fees + epoch); these three split a single call into margin reservation /
+    /// parallel matching / settlement so we can see which phase dominates.
+    pub exec_phase_margin_seconds: Histogram,
+    pub exec_phase_match_seconds: Histogram,
+    pub exec_phase_settle_seconds: Histogram,
     pub exec_save_books_seconds: Histogram,
     pub exec_flush_seconds: Histogram,
     pub exec_block_seconds: Histogram,
@@ -457,6 +464,27 @@ impl Metrics {
             exec_engine_seconds.clone(),
         );
 
+        let exec_phase_margin_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
+        registry.register(
+            "torus_exec_phase_margin_seconds",
+            "Exec sub-phase: per-order margin reservation + market partition (execute_batch Phase 2)",
+            exec_phase_margin_seconds.clone(),
+        );
+
+        let exec_phase_match_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
+        registry.register(
+            "torus_exec_phase_match_seconds",
+            "Exec sub-phase: per-market parallel order matching (execute_batch Phase 3)",
+            exec_phase_match_seconds.clone(),
+        );
+
+        let exec_phase_settle_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
+        registry.register(
+            "torus_exec_phase_settle_seconds",
+            "Exec sub-phase: settlement - margin release, fills, trade persist (execute_batch Phase 4)",
+            exec_phase_settle_seconds.clone(),
+        );
+
         let exec_save_books_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
         registry.register(
             "torus_exec_save_books_seconds",
@@ -532,6 +560,9 @@ impl Metrics {
             exec_verify_seconds,
             exec_replay_guard_seconds,
             exec_engine_seconds,
+            exec_phase_margin_seconds,
+            exec_phase_match_seconds,
+            exec_phase_settle_seconds,
             exec_save_books_seconds,
             exec_flush_seconds,
             exec_block_seconds,
@@ -655,6 +686,9 @@ mod tests {
             "torus_exec_verify_seconds",
             "torus_exec_replay_guard_seconds",
             "torus_exec_engine_seconds",
+            "torus_exec_phase_margin_seconds",
+            "torus_exec_phase_match_seconds",
+            "torus_exec_phase_settle_seconds",
             "torus_exec_save_books_seconds",
             "torus_exec_flush_seconds",
             "torus_exec_block_seconds",

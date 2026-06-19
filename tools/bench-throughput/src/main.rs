@@ -320,9 +320,26 @@ fn format_num(n: u64) -> String {
 // Mode 1: Matching Engine
 // ============================================================================
 
+/// Extract a histogram's `_sum` value (in seconds) from OpenMetrics text. A
+/// histogram sum carries no labels, so the line is `<metric>_sum <value>`.
+fn metric_sum(encoded: &str, metric: &str) -> f64 {
+    let key = format!("{metric}_sum");
+    for line in encoded.lines() {
+        if let Some(rest) = line.strip_prefix(key.as_str()) {
+            if let Some(tok) = rest.split_whitespace().next() {
+                if let Ok(v) = tok.parse::<f64>() {
+                    return v;
+                }
+            }
+        }
+    }
+    0.0
+}
+
 fn run_matching_engine(orders: usize, markets: u64, warmup: usize, genesis_path: &str) {
     use tempfile::TempDir;
     use torus_bridge::native_executor::{NativeExecContext, NativeExecutor};
+    use torus_core::position::NativeBalance;
     use torus_genesis::Genesis;
     use torus_state::StateDb;
 
@@ -353,6 +370,15 @@ fn run_matching_engine(orders: usize, markets: u64, warmup: usize, genesis_path:
         chain_config.dev_pool_address,
     );
 
+    // Fund every generated sender so Phase-2 margin reservation never rejects.
+    // Random bench senders are otherwise unfunded (`get_native_balance` returns a
+    // zero-`available` default) -> "insufficient margin" -> orders are dropped
+    // BEFORE Phase-3 matching, so the bench would time rejection, not matching.
+    let fund = NativeBalance {
+        available: FixedPoint::from_raw(i128::MAX / 4),
+        order_margin: FixedPoint::ZERO,
+    };
+
     // Warmup
     if warmup > 0 {
         let warmup_actions: Vec<(Address, NativeAction)> = (0..warmup)
@@ -361,6 +387,11 @@ fn run_matching_engine(orders: usize, markets: u64, warmup: usize, genesis_path:
                 (random_address(&mut rng), random_place_order(&mut rng, mid))
             })
             .collect();
+        for (addr, _) in &warmup_actions {
+            ctx.positions
+                .put_native_balance(addr, &fund)
+                .expect("fund warmup sender");
+        }
         let t = Instant::now();
         NativeExecutor::execute_batch(&mut ctx, &warmup_actions);
         let elapsed = t.elapsed();
@@ -392,9 +423,18 @@ fn run_matching_engine(orders: usize, markets: u64, warmup: usize, genesis_path:
             })
             .collect();
 
+        for (addr, _) in &actions {
+            ctx.positions
+                .put_native_balance(addr, &fund)
+                .expect("fund batch sender");
+        }
+        // Fresh metrics handle so the per-phase histograms reflect THIS batch only.
+        let phase_metrics = std::sync::Arc::new(torus_telemetry::Metrics::new());
+        ctx.metrics = Some(phase_metrics.clone());
         let t = Instant::now();
         NativeExecutor::execute_batch(&mut ctx, &actions);
         let elapsed = t.elapsed();
+        ctx.metrics = None;
         let rate = batch_size as f64 / elapsed.as_secs_f64();
 
         println!(
@@ -402,6 +442,13 @@ fn run_matching_engine(orders: usize, markets: u64, warmup: usize, genesis_path:
             format_num(batch_size as u64),
             rate,
             elapsed.as_secs_f64() * 1000.0,
+        );
+        let enc = phase_metrics.encode();
+        println!(
+            "  phases: margin {:.1}ms | match {:.1}ms | settle {:.1}ms",
+            metric_sum(&enc, "torus_exec_phase_margin_seconds") * 1000.0,
+            metric_sum(&enc, "torus_exec_phase_match_seconds") * 1000.0,
+            metric_sum(&enc, "torus_exec_phase_settle_seconds") * 1000.0,
         );
     }
 
@@ -414,6 +461,11 @@ fn run_matching_engine(orders: usize, markets: u64, warmup: usize, genesis_path:
                 .map(|_| (random_address(&mut rng), random_place_order(&mut rng, m)))
                 .collect();
 
+            for (addr, _) in &actions {
+                ctx.positions
+                    .put_native_balance(addr, &fund)
+                    .expect("fund per-market sender");
+            }
             let t = Instant::now();
             NativeExecutor::execute_batch(&mut ctx, &actions);
             let elapsed = t.elapsed();

@@ -395,6 +395,7 @@ impl NativeExecutor {
         }
 
         // ---- Phase 2: Pre-reserve margin, assign IDs, partition by market ----
+        let margin_timer = std::time::Instant::now();
         struct PreparedOrder {
             index: usize,
             sender: Address,
@@ -472,7 +473,13 @@ impl NativeExecutor {
                 });
         }
 
+        if let Some(ref m) = ctx.metrics {
+            m.exec_phase_margin_seconds
+                .observe(margin_timer.elapsed().as_secs_f64());
+        }
+
         // ---- Phase 3: Parallel matching ----
+        let match_timer = std::time::Instant::now();
         let mut worker_batches: HashMap<MarketId, (OrderBook, Vec<MatchRequest>)> = HashMap::new();
 
         for (&market_id, prepared) in &market_batches {
@@ -494,8 +501,13 @@ impl NativeExecutor {
         }
 
         let market_results = MarketWorkerPool::match_parallel(worker_batches, ctx.timestamp);
+        if let Some(ref m) = ctx.metrics {
+            m.exec_phase_match_seconds
+                .observe(match_timer.elapsed().as_secs_f64());
+        }
 
         // ---- Phase 4: Sequential settlement ----
+        let settle_timer = std::time::Instant::now();
         for mbr in market_results {
             let market_id = mbr.market_id;
 
@@ -598,6 +610,11 @@ impl NativeExecutor {
                 total_gas += 1000;
                 results[prep.index] = NativeActionResult::ok("place_order", 1000);
             }
+        }
+
+        if let Some(ref m) = ctx.metrics {
+            m.exec_phase_settle_seconds
+                .observe(settle_timer.elapsed().as_secs_f64());
         }
 
         NativeBatchResult { results, total_gas }

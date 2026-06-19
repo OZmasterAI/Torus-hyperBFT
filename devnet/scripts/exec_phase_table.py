@@ -9,7 +9,16 @@ ms/native-block, share of exec_block_seconds, and the unattributed residual.
 
 import sys
 
-PHASES = ["verify", "replay_guard", "engine", "save_books", "flush"]
+PHASES = [
+    "verify",
+    "replay_guard",
+    "engine",
+    "phase_margin",
+    "phase_match",
+    "phase_settle",
+    "save_books",
+    "flush",
+]
 
 
 def parse(path):

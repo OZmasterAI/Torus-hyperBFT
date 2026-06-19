@@ -10,7 +10,9 @@ path = "src/main.rs"
 
 [dependencies]
 torus-types = { workspace = true }
+torus-core = { workspace = true }
 torus-bridge = { workspace = true }
+torus-telemetry = { workspace = true }
 torus-state = { workspace = true }
 torus-genesis = { workspace = true }
 torus-economics = { workspace = true }
