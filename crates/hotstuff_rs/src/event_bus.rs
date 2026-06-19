@@ -489,10 +489,14 @@ pub(crate) fn start_event_bus(
             }
         }
 
-        if let Ok(event) = event_subscriber.try_recv() {
-            (&event_handlers).fire_handlers(event)
-        } else if let Err(TryRecvError::Disconnected) = event_subscriber.try_recv() {
-            panic!("The algorithm thread (event publisher) disconnected from the channel")
+        // S370: block (with a short timeout so shutdown stays responsive) instead of
+        // busy-polling try_recv — an idle node must not spin a whole core here.
+        match event_subscriber.recv_timeout(std::time::Duration::from_millis(100)) {
+            Ok(event) => (&event_handlers).fire_handlers(event),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => (),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("The algorithm thread (event publisher) disconnected from the channel")
+            }
         }
     })
 }

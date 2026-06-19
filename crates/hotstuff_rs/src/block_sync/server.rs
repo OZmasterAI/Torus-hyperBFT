@@ -146,6 +146,10 @@ impl<N: Network + 'static, K: KVStore> BlockSyncServer<N, K> {
                         // Otherwise, do not send a response.
                     }
                 }
+            } else {
+                // S370: no pending sync request -> park briefly instead of spinning
+                // the core on try_recv. Sync is not latency-critical (ms is fine).
+                thread::sleep(std::time::Duration::from_millis(5));
             }
 
             // 2. If the last advertisement was sent more than `advertise_time` duration ago, broadcast an:

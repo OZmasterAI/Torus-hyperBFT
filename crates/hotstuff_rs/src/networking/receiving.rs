@@ -65,7 +65,10 @@ pub(crate) fn start_polling<N: Network + 'static>(
                 },
             }
         } else {
-            thread::yield_now()
+            // S370: yield_now() does NOT sleep, so an idle node spins this core (the
+            // box self-saturates and stretches block time). Park briefly instead —
+            // when messages are queued recv() returns Some and we never sleep.
+            thread::sleep(std::time::Duration::from_micros(250))
         }
     });
     (
