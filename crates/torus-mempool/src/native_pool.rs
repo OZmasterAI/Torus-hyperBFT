@@ -20,6 +20,12 @@ pub(crate) struct NativePoolEntry {
     /// block body (bodies are bincode, app.rs `block_bytes`). Computed once at
     /// insert so byte-capped selection is O(1) per entry.
     pub encoded_len: usize,
+    /// True iff THIS node verified the signature and resolved `sender` from it
+    /// (RPC ingress or gossip-RECOVER) — the only entries eligible to seed the
+    /// exec trust-cache. False for gossip-TRUSTED admits (sender claimed by a
+    /// peer, not re-derived here), which must never be short-circuited at exec.
+    /// See `docs/plans/double-verify-trust-cache-impl.md`.
+    pub verified_locally: bool,
 }
 
 /// Native action pool with per-sender tracking, dedup, and size limits.
@@ -63,15 +69,52 @@ impl NativePool {
             .map(|e| e.action.clone())
     }
 
+    /// For each committed `hash` still present in the pool that THIS node locally
+    /// verified, return its `(verified_cache_key, sender)` so the caller can
+    /// refresh-stash the verified sender into the exec trust-cache BEFORE the entry
+    /// is pruned — bridging the lag before the (slower) exec thread reads it.
+    /// Skips entries not locally verified or whose signature kind isn't cacheable
+    /// (`verified_cache_key` returns `None`).
+    pub fn verified_restash_keys(&self, hashes: &[B256]) -> Vec<(B256, Address)> {
+        let mut out = Vec::new();
+        for h in hashes {
+            if let Some(&idx) = self.hash_index.get(h) {
+                if let Some(entry) = self.entries.get(idx) {
+                    if entry.verified_locally {
+                        if let Some(key) = torus_types::verified_cache_key(&entry.action) {
+                            out.push((key, entry.sender));
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// Insert a native action with a known sender.
     ///
     /// Checks: dedup by (sender, action_hash), per-sender pool cap, total pool cap.
     /// When pool is full and a cancel arrives, evicts a lowest-priority non-cancel.
+    /// Entries inserted via this 2-arg form are NOT marked locally-verified (the
+    /// conservative default); the verified ingress/recover paths call
+    /// [`NativePool::insert_verified`] so they can seed the exec trust-cache.
     pub fn insert(
         &mut self,
         sender: Address,
         action: SignedNativeAction,
-    ) -> Result<(), MempoolError> {
+    ) -> Result<B256, MempoolError> {
+        self.insert_verified(sender, action, false)
+    }
+
+    /// Insert with explicit provenance. `verified_locally` records whether THIS
+    /// node verified the signature and resolved `sender` from it (so the entry is
+    /// eligible for the exec trust-cache). Returns the action hash on success.
+    pub fn insert_verified(
+        &mut self,
+        sender: Address,
+        action: SignedNativeAction,
+        verified_locally: bool,
+    ) -> Result<B256, MempoolError> {
         let action_hash = compute_action_hash(&action);
         let is_cancel = is_cancel(&action.action);
         // Serialization of a serde struct cannot realistically fail; if it ever
@@ -121,10 +164,11 @@ impl NativePool {
             action_hash,
             is_cancel,
             encoded_len,
+            verified_locally,
         });
         self.hash_index.insert(action_hash, idx);
 
-        Ok(())
+        Ok(action_hash)
     }
 
     /// Drain up to `limit` actions in priority order with per-sender-per-block caps.

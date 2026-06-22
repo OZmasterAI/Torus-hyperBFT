@@ -65,6 +65,7 @@ fn test_config() -> ChainConfig {
         dev_pool_address: Address::ZERO,
         timeout_base_ms: 500,
         reputation_leader_selection: false,
+        exec_trust_cache: false,
     }
 }
 

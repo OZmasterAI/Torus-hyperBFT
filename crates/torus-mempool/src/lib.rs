@@ -11,12 +11,15 @@ pub mod evm_pool;
 pub mod native_pool;
 pub mod rate_limit;
 pub mod validate;
+mod verified_cache;
 
 use std::sync::RwLock;
 
-use alloy_primitives::B256;
+use alloy_primitives::{Address, B256};
 use torus_state::{NativeDaStore, StateDb};
 use torus_types::SignedNativeAction;
+
+use crate::verified_cache::FifoCache;
 
 /// Wall-clock milliseconds — the clock native-action nonces are minted from.
 fn now_ms() -> u64 {
@@ -60,6 +63,8 @@ pub struct MempoolConfig {
     pub native_pool_max_size: usize,
     /// Max pending native actions per sender in the pool.
     pub native_per_sender_cap: usize,
+    /// Capacity of the exec trust-cache (locally-verified action hash -> sender).
+    pub verified_sender_cache_cap: usize,
     // ---- Memory budget (Phase 3: 3.1.7) ----
     /// Maximum combined memory for EVM + native pools in bytes (0 = unlimited).
     pub max_memory_bytes: usize,
@@ -81,6 +86,7 @@ impl Default for MempoolConfig {
             native_per_block_cap: rate_limit::NATIVE_PER_BLOCK_CAP,
             native_pool_max_size: rate_limit::NATIVE_POOL_MAX_SIZE,
             native_per_sender_cap: rate_limit::NATIVE_PER_SENDER_CAP,
+            verified_sender_cache_cap: rate_limit::VERIFIED_SENDER_CACHE_CAP,
             max_memory_bytes: 64 * 1024 * 1024, // 64 MB default
         }
     }
@@ -103,6 +109,12 @@ pub struct Mempool {
     native_gossip_enabled: std::sync::atomic::AtomicBool,
     /// Node metrics handle (set once at startup; absent in most unit tests).
     metrics: std::sync::OnceLock<std::sync::Arc<torus_telemetry::Metrics>>,
+    /// Exec trust-cache: locally-verified action hash -> recovered sender, letting
+    /// the execution thread skip a redundant secp256k1 recovery on a HIT. Keyed by
+    /// the signature-committing `torus_types::verified_cache_key` (NOT
+    /// `compute_action_hash`, which omits the signature). MISS => full recover +
+    /// slash. See `docs/plans/double-verify-trust-cache-impl.md`.
+    verified_senders: RwLock<FifoCache<B256, Address>>,
 }
 
 impl Mempool {
@@ -121,6 +133,7 @@ impl Mempool {
         // DA store shares the same RocksDB handle; every native-action body the
         // mempool sees is mirrored here durably (decoupled from the nonce gate).
         let da_store = NativeDaStore::new(state.clone());
+        let verified_cap = config.verified_sender_cache_cap;
         Self {
             evm: RwLock::new(evm_pool::EvmPool::new()),
             native: RwLock::new(native_pool),
@@ -132,7 +145,44 @@ impl Mempool {
             native_gossip_tx: std::sync::OnceLock::new(),
             native_gossip_enabled: std::sync::atomic::AtomicBool::new(false),
             metrics: std::sync::OnceLock::new(),
+            verified_senders: RwLock::new(FifoCache::new(verified_cap)),
         }
+    }
+
+    /// Record a locally-verified `key -> sender` mapping in the exec trust-cache.
+    ///
+    /// `key` MUST be the signature-committing `torus_types::verified_cache_key`
+    /// (NOT `compute_action_hash`, which omits the signature) so that a later HIT
+    /// can only ever return the sender a fresh recover would. Only the verified
+    /// ingress / gossip-recover paths call this; gossip-TRUSTED admits must not.
+    pub fn cache_verified_sender(&self, key: B256, sender: Address) {
+        let evicted = match self.verified_senders.write() {
+            Ok(mut cache) => cache.insert(key, sender),
+            Err(_) => return,
+        };
+        if evicted > 0 {
+            if let Some(m) = self.metrics.get() {
+                m.verified_sender_cache_evictions.inc_by(evicted);
+            }
+        }
+    }
+
+    /// Look up a locally-verified sender by its signature-committing key. Read-only
+    /// (no recency bump). `None` => cache MISS => caller must full recover + slash.
+    pub fn verified_sender(&self, key: &B256) -> Option<Address> {
+        let result = self
+            .verified_senders
+            .read()
+            .ok()
+            .and_then(|cache| cache.get(key).copied());
+        if let Some(m) = self.metrics.get() {
+            if result.is_some() {
+                m.verified_sender_cache_hits.inc();
+            } else {
+                m.verified_sender_cache_misses.inc();
+            }
+        }
+        result
     }
 
     /// Enable or disable native action gossip at runtime.
@@ -335,13 +385,29 @@ impl Mempool {
                 "gossip sender mismatch".into(),
             ));
         }
-        self.add_native_action_from_gossip_trusted(claimed_sender, action)
+        // This node re-derived the sender from the signature above -> locally
+        // verified, so the entry may seed the exec trust-cache.
+        self.admit_gossip(claimed_sender, action, true)
     }
 
     pub fn add_native_action_from_gossip_trusted(
         &self,
         sender: alloy_primitives::Address,
         action: SignedNativeAction,
+    ) -> Result<(), MempoolError> {
+        // Sender is CLAIMED by the peer and NOT re-derived here -> not locally
+        // verified; must never be short-circuited at exec.
+        self.admit_gossip(sender, action, false)
+    }
+
+    /// Shared gossip admission: durable DA mirror + nonce-window gate + pool insert
+    /// with the given provenance. `verified_locally` distinguishes the recover path
+    /// (true, seeds the trust-cache) from the raw trusted path (false).
+    fn admit_gossip(
+        &self,
+        sender: alloy_primitives::Address,
+        action: SignedNativeAction,
+        verified_locally: bool,
     ) -> Result<(), MempoolError> {
         // DA store is DECOUPLED from the 60s nonce gate: a pushed/gossiped body is
         // (or will be) block-referenced, so mirror it durably even when it is too
@@ -360,7 +426,7 @@ impl Mempool {
         if action.nonce > current_time_ms.saturating_add(NONCE_WINDOW_MS) {
             return Err(MempoolError::NativeValidationFailed("nonce too far in future".into()));
         }
-        self.submit_native_action(sender, action)
+        self.submit_native_action_inner(sender, action, verified_locally)
     }
 
     /// Gossip includes sender address so receivers can skip ECDSA recovery.
@@ -390,10 +456,27 @@ impl Mempool {
 
     /// FIX EVM-FIND-15: Renamed from submit_native_action and restricted to pub(crate).
     /// Internal method for inserting a native action with a pre-verified sender.
+    ///
+    /// The public form treats the sender as locally verified (its documented
+    /// contract), so the entry is eligible to seed the exec trust-cache.
     pub fn submit_native_action(
         &self,
         sender: alloy_primitives::Address,
         action: SignedNativeAction,
+    ) -> Result<(), MempoolError> {
+        self.submit_native_action_inner(sender, action, true)
+    }
+
+    /// Native insert with explicit provenance. `verified_locally` records whether
+    /// THIS node verified the signature and resolved `sender` from it (RPC ingress
+    /// or gossip-RECOVER). Only locally-verified EIP-712 actions seed the exec
+    /// trust-cache (keyed by the signature-committing `verified_cache_key`);
+    /// gossip-TRUSTED admits pass `false` and are never short-circuited at exec.
+    fn submit_native_action_inner(
+        &self,
+        sender: alloy_primitives::Address,
+        action: SignedNativeAction,
+        verified_locally: bool,
     ) -> Result<(), MempoolError> {
         // Rate limit check — exempt oracle/governance actions (Task 3.1.4).
         if !rate_limit::is_exempt_action(&action.action) {
@@ -406,8 +489,24 @@ impl Mempool {
             }
         }
 
-        let mut pool = self.native.write().unwrap();
-        pool.insert(sender, action)?;
+        // Derive the trust-cache key BEFORE `action` is moved into the pool. `None`
+        // for non-EIP-712 (session) actions, which are never short-circuited.
+        let cache_key = if verified_locally {
+            torus_types::verified_cache_key(&action)
+        } else {
+            None
+        };
+
+        {
+            let mut pool = self.native.write().unwrap();
+            pool.insert_verified(sender, action, verified_locally)?;
+        }
+
+        // Seed only after a successful insert, so a rejected (dup/full) action
+        // never pollutes the cache.
+        if let Some(key) = cache_key {
+            self.cache_verified_sender(key, sender);
+        }
         tracing::debug!(%sender, "native action added to mempool");
         Ok(())
     }
@@ -513,7 +612,23 @@ impl Mempool {
     }
 
     /// Remove native actions that were included in a committed block.
+    ///
+    /// Before pruning, refresh-stash each locally-verified sender into the exec
+    /// trust-cache so it survives long enough for the exec thread (which lags up to
+    /// the exec-queue depth behind commit) to read it on a HIT. These committed
+    /// actions are pruned here on the consensus thread BEFORE the block crosses the
+    /// exec channel, so without this restash a live pool lookup at exec would miss
+    /// (the prune-before-exec trap, mem a644ca0a). Read-then-write on the single
+    /// consensus thread; concurrent peers only insert, never remove, so the
+    /// captured entries are still present at prune time.
     pub fn remove_committed_native(&self, hashes: &[B256]) {
+        let restash = {
+            let pool = self.native.read().unwrap();
+            pool.verified_restash_keys(hashes)
+        };
+        for (key, sender) in restash {
+            self.cache_verified_sender(key, sender);
+        }
         self.native.write().unwrap().remove_committed(hashes);
     }
 
@@ -715,6 +830,135 @@ mod tests {
         // The genuine sender is admitted.
         pool.add_native_action_from_gossip(real_sender, signed).unwrap();
         assert_eq!(pool.native_pool_size(), 1);
+    }
+
+    #[test]
+    fn trust_cache_populated_on_verified_paths_not_on_trusted() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state, MempoolConfig::default());
+        // Real key so EIP-712 recovery yields a real sender (EIP-712 is the only
+        // cacheable signature kind — its sender is a stateless function of the sig).
+        let k = k256::ecdsa::SigningKey::from_slice(
+            &alloy_primitives::hex::decode(
+                "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let base = now_ms();
+
+        // (a) RPC presigned ingress -> locally verified -> cached.
+        let a1 = torus_types::eip712::sign_native_action(
+            torus_types::NativeAction::ClaimRewards,
+            base + 1,
+            &k,
+        );
+        let s1 = a1.recover_sender().unwrap();
+        let key1 = torus_types::verified_cache_key(&a1).expect("eip712 is cacheable");
+        pool.add_native_action_presigned(s1, a1).unwrap();
+        assert_eq!(
+            pool.verified_sender(&key1),
+            Some(s1),
+            "presigned ingress must seed the trust-cache"
+        );
+
+        // (b) gossip RECOVER (sig re-derived here) -> locally verified -> cached.
+        let a2 = torus_types::eip712::sign_native_action(
+            torus_types::NativeAction::ClaimRewards,
+            base + 2,
+            &k,
+        );
+        let s2 = a2.recover_sender().unwrap();
+        let key2 = torus_types::verified_cache_key(&a2).expect("eip712 is cacheable");
+        pool.add_native_action_from_gossip(s2, a2).unwrap();
+        assert_eq!(
+            pool.verified_sender(&key2),
+            Some(s2),
+            "gossip-recover must seed the trust-cache"
+        );
+
+        // (c) gossip TRUSTED (sender claimed by peer, NOT re-derived) -> NOT cached.
+        let a3 = torus_types::eip712::sign_native_action(
+            torus_types::NativeAction::ClaimRewards,
+            base + 3,
+            &k,
+        );
+        let s3 = a3.recover_sender().unwrap();
+        let key3 = torus_types::verified_cache_key(&a3).expect("eip712 is cacheable");
+        pool.add_native_action_from_gossip_trusted(s3, a3).unwrap();
+        assert_eq!(
+            pool.verified_sender(&key3),
+            None,
+            "gossip-trusted must NOT seed the trust-cache (verified_locally=false)"
+        );
+    }
+
+    #[test]
+    fn remove_committed_stash_refreshes_verified_sender() {
+        let (_dir, state) = setup();
+        // Tiny cache cap so a few inserts cheaply churn the original out.
+        let config = MempoolConfig {
+            verified_sender_cache_cap: 2,
+            ..MempoolConfig::default()
+        };
+        let pool = Mempool::new(state, config);
+
+        let k = k256::ecdsa::SigningKey::from_slice(
+            &alloy_primitives::hex::decode(
+                "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let base = now_ms();
+
+        let a = torus_types::eip712::sign_native_action(
+            torus_types::NativeAction::ClaimRewards,
+            base + 1,
+            &k,
+        );
+        let sender = a.recover_sender().unwrap();
+        let hash = torus_types::compute_action_hash(&a); // pool key
+        let key = torus_types::verified_cache_key(&a).expect("eip712"); // trust-cache key
+
+        // Admit (verified) -> cached + pooled (presigned does not remove).
+        pool.add_native_action_presigned(sender, a).unwrap();
+        assert_eq!(pool.verified_sender(&key), Some(sender), "seeded on admit");
+
+        // Churn the cache past its cap (same signer, distinct nonces => distinct
+        // keys) to evict the original entry from the cache.
+        for i in 0..5u64 {
+            let other = torus_types::eip712::sign_native_action(
+                torus_types::NativeAction::ClaimRewards,
+                base + 100 + i,
+                &k,
+            );
+            let os = other.recover_sender().unwrap();
+            pool.add_native_action_presigned(os, other).unwrap();
+        }
+        assert_eq!(
+            pool.verified_sender(&key),
+            None,
+            "original evicted from the cache by churn"
+        );
+        assert!(
+            pool.get_native_by_hash(&hash).is_some(),
+            "but still resident in the pool"
+        );
+
+        // Commit it: remove_committed_native MUST refresh-stash the verified sender
+        // to the fresh cache end BEFORE pruning the pool entry, so the exec thread
+        // (which lags behind commit) still gets a HIT.
+        pool.remove_committed_native(&[hash]);
+        assert_eq!(
+            pool.verified_sender(&key),
+            Some(sender),
+            "re-stashed to the cache before prune"
+        );
+        assert!(
+            pool.get_native_by_hash(&hash).is_none(),
+            "pool entry removed after commit"
+        );
     }
 
     #[test]

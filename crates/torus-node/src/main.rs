@@ -127,6 +127,13 @@ struct Cli {
     /// --native-gossip=false to fall back to push/pull-only dissemination.
     #[arg(long, default_value_t = true)]
     native_gossip: bool,
+
+    /// Enable the exec trust-cache: at execution, reuse a sender this node already
+    /// verified at ingress/gossip instead of re-running secp256k1 recovery.
+    /// Deterministic (a HIT equals a fresh recover), so it never affects consensus
+    /// or state. Off by default; enable for A/B measurement, disable to roll back.
+    #[arg(long)]
+    exec_trust_cache: bool,
 }
 
 #[derive(clap::Subcommand)]
@@ -230,6 +237,7 @@ fn default_chain_config() -> ChainConfig {
         dev_pool_address: Address::ZERO,
         timeout_base_ms: 500,
         reputation_leader_selection: false,
+        exec_trust_cache: false,
     }
 }
 
@@ -349,7 +357,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     info!("state database opened");
 
     // 4. Genesis initialization
-    let chain_config = if let Some(genesis_path) = &cli.genesis {
+    let mut chain_config = if let Some(genesis_path) = &cli.genesis {
         let genesis = Genesis::from_file(genesis_path)?;
         let config = genesis.chain_config();
 
@@ -381,6 +389,15 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         gas_limit = chain_config.evm_gas_limit,
         "chain configuration loaded"
     );
+
+    // Node-local override: `--exec-trust-cache` enables the exec trust-cache read
+    // path (default off). It is deterministic (a HIT equals a fresh recover), so
+    // toggling it per-node never affects consensus or state — purely an A/B and
+    // rollback switch.
+    chain_config.exec_trust_cache = cli.exec_trust_cache;
+    if chain_config.exec_trust_cache {
+        info!("exec trust-cache ENABLED: execution reuses locally-verified senders (skips re-recover)");
+    }
 
     // 5. Build components
     let metrics = Arc::new(torus_telemetry::Metrics::new());

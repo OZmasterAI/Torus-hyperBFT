@@ -85,6 +85,16 @@ pub const NATIVE_ORDERS_PER_BLOCK_CAP: usize = 50_000;
 /// (~40k orders at ~150B/order). Gap-pulls + rotated body fetch cover misses.
 pub const NATIVE_BLOCK_BYTES_CAP: usize = 6_000_000;
 
+/// Capacity of the per-node exec trust-cache (`verified_senders`: locally-verified
+/// action hash -> recovered sender). Sized to comfortably bridge the in-flight
+/// window between ingress/gossip-recover and execution: the exec pipeline lags up
+/// to the exec queue depth (64 committed blocks, app.rs `sync_channel(64)`) behind
+/// consensus, each block up to `NATIVE_TOTAL_BLOCK_CAP` (100) actions => a 6400
+/// hard floor. Shipped at ~2.5x margin so churn / gossip dups don't evict
+/// still-needed entries before exec reads them. Over-cap or cold => cache MISS =>
+/// full recover + slash (safe). ~32B/entry => ~0.5MB at this cap.
+pub const VERIFIED_SENDER_CACHE_CAP: usize = 16_384;
+
 // ============================================================================
 // Rate tracker
 // ============================================================================

@@ -108,6 +108,15 @@ struct ExecutionContext {
     treasury_address: Address,
     dev_pool_address: Address,
     metrics: Option<Arc<torus_telemetry::Metrics>>,
+    /// Shared mempool handle for the exec trust-cache read path: a HIT lets the
+    /// execution thread reuse a locally-verified sender and skip the secp256k1
+    /// recover. `None` when the node runs without a mempool (rpc-only / tests).
+    mempool: Option<Arc<Mempool>>,
+    /// Node-local gate for the trust-cache read (`--exec-trust-cache`, default
+    /// off). When false the cache is never consulted at exec -> full recover every
+    /// time (today's behavior). A HIT is deterministic (== fresh recover), so this
+    /// only changes performance, never the resolved sender or state.
+    exec_trust_cache: bool,
 }
 
 // ---- Standalone helpers (used by both execution thread and crash recovery) ----
@@ -288,10 +297,22 @@ impl ExecutionContext {
             // never recover the same action twice.
             let verify_timer = std::time::Instant::now();
             let resolved_senders = if has_native {
-                torus_types::eip712::batch_verify_native_actions(
+                torus_types::eip712::batch_verify_native_actions_cached(
                     &torus_block.native_actions,
                     torus_block.header.timestamp,
                     |pubkey| self.state_db.get_session(pubkey).ok().flatten(),
+                    // Exec trust-cache read (gated by --exec-trust-cache, default
+                    // off): when enabled, a HIT reuses a locally-verified sender
+                    // (keyed by the signature-committing key) and skips the secp256k1
+                    // recover; a MISS — or the flag being off — falls through to the
+                    // full recover + slash below.
+                    |key| {
+                        if self.exec_trust_cache {
+                            self.mempool.as_ref().and_then(|m| m.verified_sender(key))
+                        } else {
+                            None
+                        }
+                    },
                 )
             } else {
                 vec![]
@@ -694,6 +715,8 @@ impl TorusApp {
             treasury_address: config.treasury_address,
             dev_pool_address: config.dev_pool_address,
             metrics: metrics.clone(),
+            mempool: mempool.clone(),
+            exec_trust_cache: config.exec_trust_cache,
         };
 
         // Phase A: ensure the persistent incremental trie exists before any commit (including
@@ -798,6 +821,7 @@ impl TorusApp {
             dev_pool_address: Address::ZERO,
             timeout_base_ms: 500,
             reputation_leader_selection: false,
+            exec_trust_cache: false,
         };
         let mut seed = [0u8; 32];
         seed[..8].copy_from_slice(&id.to_le_bytes());
@@ -1799,6 +1823,7 @@ mod crash_recovery_tests {
             dev_pool_address: Address::ZERO,
             timeout_base_ms: 500,
             reputation_leader_selection: false,
+            exec_trust_cache: false,
         };
         (config, state_db)
     }
@@ -2148,6 +2173,17 @@ mod crash_recovery_tests {
     /// Build an `ExecutionContext` directly (mirrors `TorusApp::new`) so a test can
     /// drive `execute_committed_block` for several heights synchronously.
     fn make_exec_ctx(config: &ChainConfig, state_db: &StateDb) -> ExecutionContext {
+        // Default: no mempool, cache off -> all misses = today's full-recover
+        // behavior, exactly what the existing exec tests assert.
+        make_exec_ctx_with_mempool(config, state_db, None, false)
+    }
+
+    fn make_exec_ctx_with_mempool(
+        config: &ChainConfig,
+        state_db: &StateDb,
+        mempool: Option<Arc<Mempool>>,
+        exec_trust_cache: bool,
+    ) -> ExecutionContext {
         ExecutionContext {
             state_db: state_db.clone(),
             validator: BlockValidator::new(
@@ -2164,7 +2200,181 @@ mod crash_recovery_tests {
             treasury_address: config.treasury_address,
             dev_pool_address: config.dev_pool_address,
             metrics: None,
+            mempool,
+            exec_trust_cache,
         }
+    }
+
+    /// GATE (double-verify-trust-cache T5): the exec trust-cache must be a pure
+    /// performance optimization. With a real mempool-populated cache, the resolved
+    /// senders from the cached verify MUST equal the uncached (full-recover) verify
+    /// action-for-action — including an invalid signature (-> None, the slashing
+    /// input that fires app.rs:303-320) and a gossip-TRUSTED action
+    /// (verified_locally=false -> not cached -> re-verified, never short-circuited).
+    #[test]
+    fn trust_cache_resolved_senders_identical_cached_vs_uncached() {
+        use torus_types::ActionSignature;
+        let (_config, state_db) = make_test_config_and_db();
+        let mempool = Mempool::new(state_db.clone(), torus_mempool::MempoolConfig::default());
+        let base = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        let k1 = k256::ecdsa::SigningKey::from_slice(&[11u8; 32]).unwrap();
+        let k2 = k256::ecdsa::SigningKey::from_slice(&[12u8; 32]).unwrap();
+
+        // (0) EIP-712 admitted via the verified ingress path -> seeds the cache.
+        let a_cached =
+            torus_types::eip712::sign_native_action(NativeAction::ClaimRewards, base + 1, &k1);
+        let s_cached = a_cached.recover_sender().unwrap();
+        mempool
+            .add_native_action_presigned(s_cached, a_cached.clone())
+            .unwrap();
+
+        // (1) EIP-712 valid but never admitted -> cache MISS -> full recover.
+        let a_uncached =
+            torus_types::eip712::sign_native_action(NativeAction::ClaimRewards, base + 2, &k2);
+        let s_uncached = a_uncached.recover_sender().unwrap();
+
+        // (2) EIP-712 with a corrupted signature -> invalid -> None (slash input).
+        let mut a_invalid =
+            torus_types::eip712::sign_native_action(NativeAction::ClaimRewards, base + 3, &k1);
+        if let ActionSignature::Eip712(ref mut sig) = a_invalid.signature {
+            sig.r = [0xff; 32];
+            sig.s = [0xff; 32];
+        }
+
+        // (3) gossip-TRUSTED (sender claimed by a peer, verified_locally=false) ->
+        //     NOT cached -> exec must re-verify it (no short-circuit).
+        let a_trusted =
+            torus_types::eip712::sign_native_action(NativeAction::ClaimRewards, base + 4, &k2);
+        let s_trusted = a_trusted.recover_sender().unwrap();
+        mempool
+            .add_native_action_from_gossip_trusted(s_trusted, a_trusted.clone())
+            .unwrap();
+
+        let actions = vec![a_cached, a_uncached, a_invalid, a_trusted.clone()];
+
+        let uncached = torus_types::eip712::batch_verify_native_actions(&actions, base, |_| None);
+        let cached = torus_types::eip712::batch_verify_native_actions_cached(
+            &actions,
+            base,
+            |_| None,
+            |key| mempool.verified_sender(key),
+        );
+
+        assert_eq!(
+            cached, uncached,
+            "DETERMINISM GATE: cache-on resolved senders must equal cache-off"
+        );
+        // Structural sanity across the four provenance classes.
+        assert_eq!(cached[0], Some(s_cached), "cached HIT == fresh recover");
+        assert_eq!(cached[1], Some(s_uncached), "MISS -> full recover");
+        assert_eq!(cached[2], None, "invalid sig -> None (slash path input)");
+        assert_eq!(cached[3], Some(s_trusted), "trusted re-verified, not short-circuited");
+
+        // Provenance: the trusted action was never seeded into the cache.
+        let trusted_key = torus_types::verified_cache_key(&a_trusted).unwrap();
+        assert_eq!(
+            mempool.verified_sender(&trusted_key),
+            None,
+            "gossip-trusted (verified_locally=false) must not be cached"
+        );
+    }
+
+    /// GATE (T5, state level): executing the SAME block with the trust-cache warm
+    /// (HIT) vs cold (no mempool) must reach identical state. A correct cache reuses
+    /// exactly the sender a fresh recover yields, so execution is unchanged.
+    #[test]
+    fn trust_cache_execution_state_identical_cached_vs_uncached() {
+        let amount = U256::from(FixedPoint::ONE.raw() as u128);
+        let key = k256::ecdsa::SigningKey::from_slice(&[21u8; 32]).unwrap();
+        let signed = torus_types::eip712::sign_native_action(
+            NativeAction::TransferToPerp { amount },
+            424_242,
+            &key,
+        );
+        let sender = signed.recover_sender().unwrap();
+        let start = amount * U256::from(10u8);
+
+        // --- Cold cache (no mempool): full recover, today's path. ---
+        let (config_off, db_off) = make_test_config_and_db();
+        let ctx_off = make_exec_ctx_with_mempool(&config_off, &db_off, None, false);
+        fund_evm_balance(&db_off, sender, start);
+        ctx_off.execute_committed_block(&make_block(1, vec![signed.clone()]), vec![]);
+        let off_balance = read_evm_balance(&db_off, sender);
+
+        // --- Warm cache (HIT): seed the signature-committing key -> sender. ---
+        let (config_on, db_on) = make_test_config_and_db();
+        let mempool = Arc::new(Mempool::new(
+            db_on.clone(),
+            torus_mempool::MempoolConfig::default(),
+        ));
+        let cache_key = torus_types::verified_cache_key(&signed).unwrap();
+        mempool.cache_verified_sender(cache_key, sender);
+        assert_eq!(
+            mempool.verified_sender(&cache_key),
+            Some(sender),
+            "precondition: cache is warm so exec takes the HIT path"
+        );
+        // Flag ON so the warm cache is actually consulted (the HIT path).
+        let ctx_on = make_exec_ctx_with_mempool(&config_on, &db_on, Some(mempool), true);
+        fund_evm_balance(&db_on, sender, start);
+        ctx_on.execute_committed_block(&make_block(1, vec![signed.clone()]), vec![]);
+        let on_balance = read_evm_balance(&db_on, sender);
+
+        assert_eq!(
+            on_balance, off_balance,
+            "execution with a warm trust-cache must reach identical state as cold"
+        );
+        assert_eq!(start - on_balance, amount, "executed exactly once, correct debit");
+    }
+
+    /// T6: with `--exec-trust-cache` OFF (the default), the cache is never consulted
+    /// at exec — even a POISONED entry is ignored and the action is fully recovered
+    /// (today's behavior). This is what makes the flag a safe default-off rollback
+    /// switch.
+    #[test]
+    fn trust_cache_flag_off_bypasses_cache() {
+        let amount = U256::from(FixedPoint::ONE.raw() as u128);
+        let key = k256::ecdsa::SigningKey::from_slice(&[31u8; 32]).unwrap();
+        let signed = torus_types::eip712::sign_native_action(
+            NativeAction::TransferToPerp { amount },
+            424_242,
+            &key,
+        );
+        let real_sender = signed.recover_sender().unwrap();
+        let start = amount * U256::from(10u8);
+
+        let (config, db) = make_test_config_and_db();
+        let mempool = Arc::new(Mempool::new(
+            db.clone(),
+            torus_mempool::MempoolConfig::default(),
+        ));
+        // POISON the cache: map this action's key to a bogus sender. If exec ever
+        // consulted the cache, the deposit would be attributed to `bogus` and the
+        // real sender would NOT be debited.
+        let bogus = Address::from([0xCD; 20]);
+        assert_ne!(bogus, real_sender);
+        let cache_key = torus_types::verified_cache_key(&signed).unwrap();
+        mempool.cache_verified_sender(cache_key, bogus);
+
+        // Flag OFF -> cache ignored -> real sender recovered + debited.
+        let ctx = make_exec_ctx_with_mempool(&config, &db, Some(mempool), false);
+        fund_evm_balance(&db, real_sender, start);
+        ctx.execute_committed_block(&make_block(1, vec![signed.clone()]), vec![]);
+
+        assert_eq!(
+            start - read_evm_balance(&db, real_sender),
+            amount,
+            "flag OFF must full-recover the REAL sender, ignoring the poisoned cache"
+        );
+        assert_eq!(
+            read_evm_balance(&db, bogus),
+            U256::ZERO,
+            "poisoned cache entry must never be used when the flag is off"
+        );
     }
 
     /// Seed an EVM balance into CF_ACCOUNTS (72-byte record: balance ++ nonce ++ code_hash).

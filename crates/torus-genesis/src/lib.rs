@@ -500,6 +500,9 @@ impl Genesis {
                 .unwrap_or(Address::ZERO),
             timeout_base_ms: self.consensus.timeout_base_ms,
             reputation_leader_selection: self.consensus.reputation_leader_selection,
+            // Node-local perf toggle; never sourced from genesis. Enabled per-node
+            // via the `--exec-trust-cache` CLI flag.
+            exec_trust_cache: false,
         }
     }
 

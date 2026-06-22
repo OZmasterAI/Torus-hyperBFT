@@ -908,16 +908,55 @@ pub fn batch_verify_native_actions(
     timestamp: u64,
     session_lookup: impl Fn(&[u8; 32]) -> Option<crate::SessionData>,
 ) -> Vec<Option<Address>> {
+    // No exec trust-cache: every action is fully verified — exactly today's
+    // behavior. The execution path uses `batch_verify_native_actions_cached`;
+    // passing a never-hitting lookup here makes "cache off" provably identical.
+    batch_verify_native_actions_cached(actions, timestamp, session_lookup, |_| None)
+}
+
+/// Trust-cache-aware variant of [`batch_verify_native_actions`].
+///
+/// `verified_lookup(key)` returns a previously locally-verified sender for an
+/// action's signature-committing [`verified_cache_key`]. On a HIT the secp256k1
+/// recover is skipped and the cached sender reused — and because the cache holds
+/// only locally-verified senders keyed by the FULL signature, that sender is
+/// exactly what a fresh recover would return, so this can never change the
+/// resolved sender or fork the chain. A MISS (or a non-cacheable session action,
+/// for which `verified_cache_key` returns `None`) falls through to full recover +
+/// session resolution. Cache consultation is a sequential pre-pass, kept off the
+/// rayon workers exactly like `session_lookup`.
+pub fn batch_verify_native_actions_cached(
+    actions: &[SignedNativeAction],
+    timestamp: u64,
+    session_lookup: impl Fn(&[u8; 32]) -> Option<crate::SessionData>,
+    verified_lookup: impl Fn(&alloy_primitives::B256) -> Option<Address>,
+) -> Vec<Option<Address>> {
     use rayon::prelude::*;
 
-    // Phase 1 (parallel): recover EIP-712 senders. Each ecrecover is pure,
-    // independent crypto with no shared/borrowed state; `collect` over an indexed
-    // parallel iterator preserves order, so the output is deterministic.
+    // Pre-pass (sequential): consult the trust-cache. For a locally-verified
+    // EIP-712 action a HIT yields the sender a fresh recover would produce, so the
+    // dominant ecrecover below is skipped. `verified_cache_key` returns None for
+    // session / non-EIP-712 actions, which are never short-circuited.
+    let cache_hits: Vec<Option<Address>> = actions
+        .iter()
+        .map(|action| crate::verified_cache_key(action).and_then(|k| verified_lookup(&k)))
+        .collect();
+
+    // Phase 1 (parallel): recover EIP-712 senders for cache MISSES only. Each
+    // ecrecover is pure, independent crypto with no shared/borrowed state; `collect`
+    // over an indexed parallel iterator preserves order, so the output is
+    // deterministic and identical to a serial run.
     let mut senders: Vec<Option<Address>> = actions
         .par_iter()
-        .map(|action| match &action.signature {
-            ActionSignature::Eip712(_) => action.recover_sender().ok(),
-            ActionSignature::Session { .. } => None,
+        .zip(cache_hits.par_iter())
+        .map(|(action, hit)| {
+            if hit.is_some() {
+                return *hit; // trust-cache HIT: reuse sender, skip recover
+            }
+            match &action.signature {
+                ActionSignature::Eip712(_) => action.recover_sender().ok(),
+                ActionSignature::Session { .. } => None,
+            }
         })
         .collect();
 
@@ -1600,5 +1639,55 @@ mod tests {
             if pk == &pubkey { Some(session.clone()) } else { None }
         }));
         assert_eq!(invalid, vec![0]);
+    }
+
+    // ---- trust-cache short-circuit (double-verify-trust-cache T4) ----
+
+    #[test]
+    fn batch_verify_cache_hit_skips_recover() {
+        // Valid EIP-712 action; the cache returns a SENTINEL distinct from the real
+        // signer. If recovery had run it would yield `real`; getting `sentinel`
+        // proves the HIT short-circuited the secp256k1 recover.
+        let key = test_key();
+        let action = sign_native_action(NativeAction::ClaimRewards, TEST_NONCE, &key);
+        let real = signer_address(&key);
+        let ck = crate::verified_cache_key(&action).expect("eip712 is cacheable");
+        let sentinel = Address::from([0xAB; 20]);
+        assert_ne!(sentinel, real);
+
+        let got = batch_verify_native_actions_cached(
+            &[action.clone()],
+            TEST_NONCE,
+            |_| None,
+            |k| if *k == ck { Some(sentinel) } else { None },
+        );
+        assert_eq!(
+            got[0],
+            Some(sentinel),
+            "cache HIT must be reused verbatim (recover skipped)"
+        );
+
+        // MISS (empty cache) -> full recover yields the real signer (today's path).
+        let miss = batch_verify_native_actions_cached(&[action], TEST_NONCE, |_| None, |_| None);
+        assert_eq!(miss[0], Some(real), "cache MISS must full-recover");
+    }
+
+    #[test]
+    fn batch_verify_cache_invalid_action_is_none() {
+        // A session with no entry in lookup is unresolvable. Session actions are
+        // never cacheable (`verified_cache_key` -> None), so the cache cannot mask
+        // this: the result stays None — the slashing signal.
+        let ed_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let action = sign_action_with_session(
+            NativeAction::CancelOrder { order_id: 1 },
+            TEST_NONCE,
+            &ed_key,
+        );
+        assert!(
+            crate::verified_cache_key(&action).is_none(),
+            "session actions are not cacheable"
+        );
+        let got = batch_verify_native_actions_cached(&[action], TEST_NONCE, |_| None, |_| None);
+        assert_eq!(got[0], None, "unresolvable action -> None (slash input)");
     }
 }

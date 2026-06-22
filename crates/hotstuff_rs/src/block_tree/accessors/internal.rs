@@ -81,7 +81,17 @@ pub struct UpdateResult {
 /// 3. [Helper functions called by `BlockTree::update`](#impl-BlockTreeSingleton<K>-2).
 /// 4. [Basic state getters](#impl-BlockTreeSingleton<K>-3).
 /// 5. [Extra state getters](#impl-BlockTreeSingleton<K>-4).
-pub struct BlockTreeSingleton<K: KVStore>(K);
+/// `self.0` is the backing key-value store; `self.1` is a write-through in-memory
+/// cache of the deserialized `LeaderReputation` (MonadBFT B3). It is lazily loaded
+/// on first read and refreshed on every reputation write, eliminating the ~9 KV
+/// get + borsh deserialize per consensus round on the hot path. `RefCell` gives
+/// interior mutability for the lazy load behind `&self`; a `BlockTreeSingleton` is
+/// owned/borrowed by the single consensus thread (`KVStore` requires `Send`, not
+/// `Sync`), so being `!Sync` from the `RefCell` is fine.
+pub struct BlockTreeSingleton<K: KVStore>(
+    K,
+    core::cell::RefCell<Option<crate::hotstuff::types::LeaderReputation>>,
+);
 
 /// Lifecycle methods.
 ///
@@ -94,7 +104,7 @@ impl<K: KVStore> BlockTreeSingleton<K> {
     /// This constructor is private (`pub(crate)`). To create an instance of `BlockTreeSingleton` as a
     /// library user, use [`new_unsafe`](Self::new_unsafe).
     pub(crate) fn new(kv_store: K) -> Self {
-        BlockTreeSingleton(kv_store)
+        BlockTreeSingleton(kv_store, core::cell::RefCell::new(None))
     }
 
     /// Create a new instance of `BlockTreeSingleton` on top of `kv_store`.
@@ -1549,18 +1559,28 @@ impl<K: KVStore> BlockTreeSingleton<K> {
         &self,
     ) -> Result<crate::hotstuff::types::LeaderReputation, BlockTreeError> {
         use borsh::BorshDeserialize;
-        if let Some(bytes) = self.0.get(&variables::LEADER_REPUTATION) {
-            let rep = crate::hotstuff::types::LeaderReputation::deserialize(
-                &mut bytes.as_slice(),
-            )
-            .map_err(|err| KVGetError::DeserializeValueError {
-                key: Key::HighestTC,
-                source: err,
-            })?;
-            Ok(rep)
-        } else {
-            Ok(crate::hotstuff::types::LeaderReputation::new(100))
+        // Write-through cache: serve warm reads from memory (the hot path reads this
+        // ~9x/round). Cold cache -> load from the KV (or the default) once and
+        // memoize. Every write goes through `set_leader_reputation`, which refreshes
+        // the cache in lock-step with the KV, so a HIT equals a fresh KV deserialize.
+        {
+            let cached = self.1.borrow();
+            if let Some(rep) = cached.as_ref() {
+                return Ok(rep.clone());
+            }
         }
+        let rep = if let Some(bytes) = self.0.get(&variables::LEADER_REPUTATION) {
+            crate::hotstuff::types::LeaderReputation::deserialize(&mut bytes.as_slice()).map_err(
+                |err| KVGetError::DeserializeValueError {
+                    key: Key::HighestTC,
+                    source: err,
+                },
+            )?
+        } else {
+            crate::hotstuff::types::LeaderReputation::new(100)
+        };
+        *self.1.borrow_mut() = Some(rep.clone());
+        Ok(rep)
     }
 
     /// Set the leader reputation scores.
@@ -1578,6 +1598,9 @@ impl<K: KVStore> BlockTreeSingleton<K> {
             })?,
         );
         self.write(wb);
+        // Write-through: keep the in-mem cache identical to what we just persisted,
+        // so subsequent reads are served from memory without diverging from the KV.
+        *self.1.borrow_mut() = Some(reputation.clone());
         Ok(())
     }
 
@@ -1606,5 +1629,198 @@ impl<K: KVStore> BlockTreeSingleton<K> {
             rep.decay();
         }
         self.set_leader_reputation(&rep)
+    }
+}
+
+#[cfg(test)]
+mod leader_rep_cache_tests {
+    use super::*;
+    use crate::block_tree::pluggables::{KVGet, KVStore, WriteBatch};
+    use borsh::BorshDeserialize;
+    use ed25519_dalek::SigningKey;
+    use std::collections::HashMap;
+
+    /// Minimal in-memory `KVStore` for block-tree unit tests. Counts reads of the
+    /// `LEADER_REPUTATION` key so a test can prove the in-mem cache (not the KV)
+    /// serves repeated reads.
+    #[derive(Clone, Default)]
+    struct MemKV {
+        map: HashMap<Vec<u8>, Vec<u8>>,
+        lr_gets: std::cell::Cell<usize>,
+    }
+
+    struct MemWb {
+        sets: Vec<(Vec<u8>, Vec<u8>)>,
+        deletes: Vec<Vec<u8>>,
+    }
+
+    #[derive(Clone)]
+    struct MemSnap(HashMap<Vec<u8>, Vec<u8>>);
+
+    impl WriteBatch for MemWb {
+        fn new() -> Self {
+            Self { sets: Vec::new(), deletes: Vec::new() }
+        }
+        fn set(&mut self, key: &[u8], value: &[u8]) {
+            self.sets.push((key.to_vec(), value.to_vec()));
+        }
+        fn delete(&mut self, key: &[u8]) {
+            self.deletes.push(key.to_vec());
+        }
+    }
+
+    impl KVGet for MemKV {
+        fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+            if key == &variables::LEADER_REPUTATION[..] {
+                self.lr_gets.set(self.lr_gets.get() + 1);
+            }
+            self.map.get(key).cloned()
+        }
+    }
+
+    impl KVGet for MemSnap {
+        fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+            self.0.get(key).cloned()
+        }
+    }
+
+    impl KVStore for MemKV {
+        type WriteBatch = MemWb;
+        type Snapshot<'a> = MemSnap;
+        fn write(&mut self, wb: MemWb) {
+            for (k, v) in wb.sets {
+                self.map.insert(k, v);
+            }
+            for k in wb.deletes {
+                self.map.remove(&k);
+            }
+        }
+        fn clear(&mut self) {
+            self.map.clear();
+        }
+        fn snapshot<'b>(&'b self) -> MemSnap {
+            MemSnap(self.map.clone())
+        }
+    }
+
+    fn vk(seed: u8) -> VerifyingKey {
+        SigningKey::from_bytes(&[seed; 32]).verifying_key()
+    }
+
+    /// Write-through cache invariant: a recorded reputation bump is visible via the
+    /// (cached) `leader_reputation()`, the cached value byte-equals a fresh borsh
+    /// deserialize straight from the KV, AND repeated reads are served from memory
+    /// (no KV get for the reputation key after warm-up).
+    #[test]
+    fn leader_rep_cache_write_through() {
+        let mut bt = BlockTreeSingleton::new(MemKV::default());
+        let leader = vk(1);
+
+        bt.record_leader_success(&leader).unwrap();
+
+        // (1) The read reflects the bump.
+        let cached = bt.leader_reputation().unwrap();
+        let entry = cached
+            .entries
+            .iter()
+            .find(|(k, _)| *k == leader.to_bytes())
+            .expect("leader recorded");
+        assert_eq!((entry.1.successes, entry.1.total), (1, 1));
+
+        // (2) cache == KV: a fresh borsh deserialize straight from the KV equals the
+        // cached value (write-through kept them identical).
+        let raw = bt
+            .0
+            .map
+            .get(&variables::LEADER_REPUTATION[..])
+            .expect("reputation persisted to KV")
+            .clone();
+        let from_kv =
+            crate::hotstuff::types::LeaderReputation::deserialize(&mut raw.as_slice()).unwrap();
+        assert_eq!(from_kv, cached, "cache must byte-equal a fresh KV deserialize");
+
+        // (3) Reads are served from the in-mem cache: after warm-up, repeated
+        // `leader_reputation()` calls issue NO KV get for the reputation key.
+        let _ = bt.leader_reputation().unwrap(); // ensure warm
+        bt.0.lr_gets.set(0);
+        for _ in 0..5 {
+            let _ = bt.leader_reputation().unwrap();
+        }
+        assert_eq!(
+            bt.0.lr_gets.get(),
+            0,
+            "warm reads must be served from the in-mem cache, not the KV"
+        );
+    }
+
+    /// GATE (leader-rep-kv-cache T2): the write-through cache must be fork-safe.
+    /// (a) a cold cache (fresh `BlockTreeSingleton` over the same KV = a restart)
+    /// yields scores byte-identical to the warm cache; (b) reputation-weighted
+    /// leader selection picks the same leader warm vs cold for a fixed
+    /// (view, validator_set); (c) periodic `decay()` fires identically through the
+    /// cache.
+    #[test]
+    fn leader_rep_cache_deterministic() {
+        use crate::pacemaker::implementation::select_leader_reputation_weighted;
+        use crate::types::data_types::{Power, ViewNumber};
+        use crate::types::update_sets::ValidatorSetUpdates;
+        use crate::types::validator_set::ValidatorSet;
+
+        let v0 = vk(10);
+        let v1 = vk(11);
+        let v2 = vk(12);
+        let validator_set = {
+            let mut vs = ValidatorSet::new();
+            let mut up = ValidatorSetUpdates::new();
+            up.insert(v0, Power::new(100));
+            up.insert(v1, Power::new(100));
+            up.insert(v2, Power::new(100));
+            vs.apply_updates(&up);
+            vs
+        };
+
+        let mut bt = BlockTreeSingleton::new(MemKV::default());
+        // Fixed event sequence crossing the decay boundary (window_size default 100):
+        // v0 mostly succeeds, v1 mostly times out -> divergent, then decayed scores.
+        for i in 0..120u32 {
+            if i % 3 == 0 {
+                bt.record_leader_timeout(&v1).unwrap();
+            } else {
+                bt.record_leader_success(&v0).unwrap();
+            }
+        }
+        let warm = bt.leader_reputation().unwrap();
+
+        // (a) Cold cache over the SAME KV (simulates a restart) == warm scores.
+        let cold_bt = BlockTreeSingleton::new(bt.0.clone());
+        let cold = cold_bt.leader_reputation().unwrap();
+        assert_eq!(
+            warm, cold,
+            "cold-start reputation (loaded fresh from KV) must equal the warm cache"
+        );
+
+        // (b) Reputation-weighted leader selection is identical warm vs cold for a
+        // fixed (view, validator_set), including reputation-influenced views (>=20).
+        for view in [25u64, 99, 333, 1000] {
+            let vn = ViewNumber::new(view);
+            assert_eq!(
+                select_leader_reputation_weighted(vn, &validator_set, &warm),
+                select_leader_reputation_weighted(vn, &validator_set, &cold),
+                "leader selection must be identical warm vs cold at view {view}"
+            );
+        }
+
+        // (c) decay() fired at the window boundary (without decay v0 would have
+        // exactly 80 successes/total): proves periodic decay ran through the cache.
+        let e0 = warm
+            .entries
+            .iter()
+            .find(|(k, _)| *k == v0.to_bytes())
+            .expect("v0 present");
+        assert!(
+            e0.1.total < 80,
+            "decay must have halved counters at the window boundary (v0.total={})",
+            e0.1.total
+        );
     }
 }

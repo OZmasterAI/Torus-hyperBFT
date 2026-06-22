@@ -75,6 +75,13 @@ pub struct Metrics {
     /// be delivered and would get the forwarder penalized (s339 validator ban).
     /// The pre-proposal push / DA pull path still carries these to inclusion.
     pub native_gossip_dropped_oversized: Counter,
+    /// Exec trust-cache HITs: a locally-verified sender was reused, skipping the
+    /// secp256k1 recover at execution (double-verify-trust-cache).
+    pub verified_sender_cache_hits: Counter,
+    /// Exec trust-cache MISSes: no cached sender, fell through to full recover+slash.
+    pub verified_sender_cache_misses: Counter,
+    /// Exec trust-cache evictions (FIFO cap reached). High vs hits => cap too small.
+    pub verified_sender_cache_evictions: Counter,
 
     // Submit-ack phase timing (Sprint 3.5) — decomposes where multi-second
     // batch-submit acks accrue: semaphore queue vs blocking-pool verify vs
@@ -323,6 +330,27 @@ impl Metrics {
             native_gossip_dropped_oversized.clone(),
         );
 
+        let verified_sender_cache_hits = Counter::default();
+        registry.register(
+            "torus_verified_sender_cache_hits",
+            "Exec trust-cache hits (locally-verified sender reused, secp256k1 recover skipped)",
+            verified_sender_cache_hits.clone(),
+        );
+
+        let verified_sender_cache_misses = Counter::default();
+        registry.register(
+            "torus_verified_sender_cache_misses",
+            "Exec trust-cache misses (fell through to full recover + slash)",
+            verified_sender_cache_misses.clone(),
+        );
+
+        let verified_sender_cache_evictions = Counter::default();
+        registry.register(
+            "torus_verified_sender_cache_evictions",
+            "Exec trust-cache FIFO evictions",
+            verified_sender_cache_evictions.clone(),
+        );
+
         let rpc_submit_permit_wait_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
         registry.register(
             "torus_rpc_submit_permit_wait_seconds",
@@ -540,6 +568,9 @@ impl Metrics {
             native_gossip_received_actions,
             native_gossip_dropped_full,
             native_gossip_dropped_oversized,
+            verified_sender_cache_hits,
+            verified_sender_cache_misses,
+            verified_sender_cache_evictions,
             rpc_submit_permit_wait_seconds,
             rpc_submit_verify_seconds,
             rpc_submit_verify_cpu_seconds,
@@ -693,6 +724,21 @@ mod tests {
             "torus_exec_flush_seconds",
             "torus_exec_block_seconds",
             "torus_exec_queue_depth",
+        ] {
+            assert!(text.contains(name), "{name} not registered:\n{text}");
+        }
+    }
+
+    /// Exec trust-cache (double-verify-trust-cache T6): hit/miss/eviction counters
+    /// must be registered so the cache hit-rate is observable for A/B measurement.
+    #[test]
+    fn verified_sender_cache_metrics_register() {
+        let m = Metrics::new();
+        let text = m.encode();
+        for name in [
+            "torus_verified_sender_cache_hits",
+            "torus_verified_sender_cache_misses",
+            "torus_verified_sender_cache_evictions",
         ] {
             assert!(text.contains(name), "{name} not registered:\n{text}");
         }

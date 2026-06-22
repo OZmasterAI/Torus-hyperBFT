@@ -814,6 +814,33 @@ pub fn compute_action_hash(action: &SignedNativeAction) -> B256 {
     alloy_primitives::keccak256(&data)
 }
 
+/// Signature-committing key for the exec trust-cache, or `None` when the action
+/// is not eligible for caching.
+///
+/// `compute_action_hash` deliberately OMITS the signature, so it must NOT key the
+/// trust-cache: two actions with the same payload+nonce but different signatures
+/// (recovering to different/invalid senders) would collide, letting a warm-cache
+/// node reuse a sender a cold-cache node would never recover — a consensus FORK
+/// (or a missed slash). This key commits to the full signature, so any signature
+/// difference yields a different key => cache MISS => full recover + slash (safe).
+///
+/// Only EIP-712 actions are cacheable: their sender is a pure, stateless function
+/// of the signature (`ecrecover`). A session action resolves through exec-time
+/// state (session existence, expiry, scope), so a cached hit could diverge from a
+/// fresh resolve — `None` is returned for those and they are always fully
+/// re-verified. Used IDENTICALLY at populate (mempool) and read (`batch_verify_native_actions`).
+pub fn verified_cache_key(action: &SignedNativeAction) -> Option<B256> {
+    let ActionSignature::Eip712(sig) = &action.signature else {
+        return None;
+    };
+    let mut data = action.action.canonical_bytes();
+    data.extend_from_slice(&action.nonce.to_be_bytes());
+    data.push(sig.v);
+    data.extend_from_slice(&sig.r);
+    data.extend_from_slice(&sig.s);
+    Some(alloy_primitives::keccak256(&data))
+}
+
 // ============================================================================
 // Order Types
 // ============================================================================
@@ -1009,6 +1036,13 @@ pub struct ChainConfig {
     /// and divergent leader schedules halt finalization.
     #[serde(default)]
     pub reputation_leader_selection: bool,
+    /// Node-local: consult the exec trust-cache to skip redundant secp256k1
+    /// recovery on cache HITs at execution. Deterministic (a HIT returns the same
+    /// sender a fresh recover would), so it never affects consensus or state; off
+    /// by default, enabled per-node via `--exec-trust-cache` for A/B measurement
+    /// and safe rollback.
+    #[serde(default)]
+    pub exec_trust_cache: bool,
 }
 
 fn default_timeout_base_ms() -> u64 {
