@@ -128,11 +128,11 @@ struct Cli {
     #[arg(long, default_value_t = true)]
     native_gossip: bool,
 
-    /// Enable the exec trust-cache: at execution, reuse a sender this node already
-    /// verified at ingress/gossip instead of re-running secp256k1 recovery.
-    /// Deterministic (a HIT equals a fresh recover), so it never affects consensus
-    /// or state. Off by default; enable for A/B measurement, disable to roll back.
-    #[arg(long)]
+    /// Exec trust-cache: at execution, reuse a sender this node already verified at
+    /// ingress/gossip instead of re-running secp256k1 recovery. Deterministic (a HIT
+    /// equals a fresh recover), so it never affects consensus or state. ON by default
+    /// (s376 bench: -77% exec-verify, +61% orders/s). Disable with --exec-trust-cache=false.
+    #[arg(long, default_value_t = true)]
     exec_trust_cache: bool,
 }
 
