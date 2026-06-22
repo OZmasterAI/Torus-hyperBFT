@@ -1,0 +1,41 @@
+{
+  "prp": "leader-rep-kv-cache",
+  "created": "2026-06-22T12:20:00Z",
+  "description": "Write-through in-memory cache for HotStuff leader_reputation (and optional speculative_commits) to eliminate ~11 uncached KV round-trips/block on the consensus hot path. Secondary lever; build after double-verify-trust-cache.",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Write-through in-memory cache field on BlockTreeSingleton",
+      "status": "pending",
+      "files": [
+        "crates/hotstuff_rs/src/block_tree/accessors/internal.rs",
+        "crates/hotstuff_rs/src/hotstuff/types.rs"
+      ],
+      "validate": "cargo test -p hotstuff_rs --lib leader_rep_cache_write_through",
+      "depends_on": []
+    },
+    {
+      "id": 2,
+      "name": "Determinism + crash-recovery tests (cache == KV, cold-load == today, identical leader selection)",
+      "status": "pending",
+      "files": [
+        "crates/hotstuff_rs/src/block_tree/accessors/internal.rs",
+        "crates/hotstuff_rs/src/pacemaker/implementation.rs"
+      ],
+      "validate": "cargo test -p hotstuff_rs --lib leader_rep_cache_deterministic",
+      "depends_on": [1]
+    },
+    {
+      "id": 3,
+      "name": "Optional: coalesce record writes + speculative_commits read-cache + hit/miss metrics",
+      "status": "pending",
+      "files": [
+        "crates/hotstuff_rs/src/block_tree/accessors/internal.rs",
+        "crates/hotstuff_rs/src/hotstuff/implementation.rs",
+        "crates/torus-telemetry/src/lib.rs"
+      ],
+      "validate": "cargo test -p hotstuff_rs --lib && cargo build",
+      "depends_on": [1]
+    }
+  ]
+}
