@@ -160,7 +160,8 @@ impl RewardDistributor {
     }
 
     /// Distribute validator staking inflation at epoch boundary.
-    /// APY = 200 / sqrt(TotalActiveStaked_TRS). Rewards are inflationary (minted).
+    /// Flat 5% APY (VALIDATOR_INFLATION_APY_BPS), matching permanent stake.
+    /// Rewards are inflationary (minted).
     /// Only active validators and their delegators receive rewards.
     pub fn distribute_validator_inflation<T: StateBackend>(
         staking: &StakingManager<T>,
@@ -184,16 +185,12 @@ impl RewardDistributor {
             return Ok(U256::ZERO);
         }
 
-        let sqrt_staked = isqrt(total_active_staked);
-        if sqrt_staked.is_zero() {
-            return Ok(U256::ZERO);
-        }
-
-        let epoch_seconds = epoch_length_blocks * TARGET_BLOCK_TIME_SECS;
+        // Flat 5% APY on total active stake, mirroring permanent-stake rewards.
+        // emission = stake * APY_BPS * blocks_in_epoch / (BLOCKS_PER_YEAR * 10000)
         let total_emission = total_active_staked
-            * U256::from(VALIDATOR_INFLATION_CONSTANT)
-            * U256::from(epoch_seconds)
-            / (sqrt_staked * U256::from(SECONDS_PER_YEAR));
+            * U256::from(VALIDATOR_INFLATION_APY_BPS)
+            * U256::from(epoch_length_blocks)
+            / (U256::from(BLOCKS_PER_YEAR) * U256::from(10_000u64));
 
         if total_emission.is_zero() {
             return Ok(U256::ZERO);
@@ -278,29 +275,6 @@ pub fn lerp_bps(start: u16, end: u16, numerator: u64, denominator: u64) -> u16 {
         let delta = (start - end) as u64;
         start - ((delta * numerator) / denominator) as u16
     }
-}
-
-/// Integer square root via Newton's method. Returns floor(sqrt(n)).
-pub(crate) fn isqrt(n: U256) -> U256 {
-    if n.is_zero() {
-        return U256::ZERO;
-    }
-    if n < U256::from(4u64) {
-        return U256::from(1u64);
-    }
-
-    // Initial guess: 2^((bits+1)/2)
-    let bits = 256 - n.leading_zeros();
-    let mut x = U256::from(1u64) << ((bits + 1) / 2);
-
-    loop {
-        let x_next = (x + n / x) >> 1;
-        if x_next >= x {
-            break;
-        }
-        x = x_next;
-    }
-    x
 }
 
 // ============================================================================
@@ -689,34 +663,6 @@ mod tests {
     }
 
     // ====================================================================
-    // isqrt tests
-    // ====================================================================
-
-    #[test]
-    fn isqrt_basic() {
-        assert_eq!(isqrt(U256::ZERO), U256::ZERO);
-        assert_eq!(isqrt(U256::from(1u64)), U256::from(1u64));
-        assert_eq!(isqrt(U256::from(4u64)), U256::from(2u64));
-        assert_eq!(isqrt(U256::from(9u64)), U256::from(3u64));
-        assert_eq!(isqrt(U256::from(100u64)), U256::from(10u64));
-    }
-
-    #[test]
-    fn isqrt_large_u256() {
-        // sqrt(10^36) = 10^18 (1M TRS in atrs)
-        let val = U256::from(10u64).pow(U256::from(36u64));
-        assert_eq!(isqrt(val), U256::from(10u64).pow(U256::from(18u64)));
-    }
-
-    #[test]
-    fn isqrt_non_perfect() {
-        assert_eq!(isqrt(U256::from(2u64)), U256::from(1u64));
-        assert_eq!(isqrt(U256::from(3u64)), U256::from(1u64));
-        assert_eq!(isqrt(U256::from(5u64)), U256::from(2u64));
-        assert_eq!(isqrt(U256::from(99u64)), U256::from(9u64));
-    }
-
-    // ====================================================================
     // Validator inflation tests
     // ====================================================================
 
@@ -828,20 +774,30 @@ mod tests {
     }
 
     #[test]
-    fn validator_inflation_apy_decreases_with_stake() {
-        // Higher total stake => lower per-unit reward
+    fn validator_inflation_is_flat_5pct_apy() {
+        // Full year of blocks on 1M stake => exactly 5% = 50k TRS.
+        let (_dir, mgr) = setup();
+        register_active_validator(&mgr, 1, 1_000_000, 0);
+        let emission =
+            RewardDistributor::distribute_validator_inflation(&mgr, BLOCKS_PER_YEAR).unwrap();
+        assert_eq!(emission, wei(50_000));
+    }
+
+    #[test]
+    fn validator_inflation_apy_constant_with_stake() {
+        // Flat APY: per-unit reward identical regardless of total stake.
         let (_dir1, mgr1) = setup();
         register_active_validator(&mgr1, 1, 100_000, 0);
-        let e1 = RewardDistributor::distribute_validator_inflation(&mgr1, 43200).unwrap();
+        let e1 = RewardDistributor::distribute_validator_inflation(&mgr1, BLOCKS_PER_YEAR).unwrap();
 
         let (_dir2, mgr2) = setup();
         register_active_validator(&mgr2, 1, 1_000_000, 0);
-        let e2 = RewardDistributor::distribute_validator_inflation(&mgr2, 43200).unwrap();
+        let e2 = RewardDistributor::distribute_validator_inflation(&mgr2, BLOCKS_PER_YEAR).unwrap();
 
-        // Per-unit reward: e1/100k vs e2/1M
-        let per_unit_1 = e1 * U256::from(1_000_000u64);
-        let per_unit_2 = e2 * U256::from(100_000u64);
-        assert!(per_unit_1 > per_unit_2, "APY should decrease with more stake");
+        // Exactly 5% of stake, and e2 is exactly 10x e1 (same flat rate).
+        assert_eq!(e1, wei(5_000));
+        assert_eq!(e2, wei(50_000));
+        assert_eq!(e2, e1 * U256::from(10u64));
     }
 
     #[test]
@@ -849,13 +805,15 @@ mod tests {
         let (_dir, mgr) = setup();
         register_active_validator(&mgr, 1, 100_000, 0);
 
-        let e_half = RewardDistributor::distribute_validator_inflation(&mgr, 21600).unwrap();
+        let e_half =
+            RewardDistributor::distribute_validator_inflation(&mgr, BLOCKS_PER_YEAR / 2).unwrap();
 
         let (_dir2, mgr2) = setup();
         register_active_validator(&mgr2, 1, 100_000, 0);
-        let e_full = RewardDistributor::distribute_validator_inflation(&mgr2, 43200).unwrap();
+        let e_full =
+            RewardDistributor::distribute_validator_inflation(&mgr2, BLOCKS_PER_YEAR).unwrap();
 
-        // Double epoch length should produce double emission
+        // Double epoch length should produce double emission.
         assert_eq!(e_full, e_half * U256::from(2u64));
     }
 
