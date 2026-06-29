@@ -5,6 +5,12 @@ rustflags = ["-C", "link-arg=-fuse-ld=mold"]
 [build]
 jobs = 6
 
+[net]
+# Use the system `git` binary for fetches. cargo's built-in fetcher pulls the
+# large reth monorepo (git dep, tag v2.0.0) incompletely on fresh machines,
+# surfacing as "no matching package named reth-storage-errors".
+git-fetch-with-cli = true
+
 [profile.dev]
 split-debuginfo = "unpacked"
 
