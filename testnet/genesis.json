@@ -63,6 +63,12 @@
             "pubkey": "0x537f761858a3b44a23a0d63e16d9e642a86c44aac98a94d39501d2115528a63c",
             "stake": "1000000000000000000000000",
             "commission_bps": 500
+        },
+        {
+            "address": "0x7e7cfdb06a5c0e3cc85510ccaeed896f39c179f5",
+            "pubkey": "0x99f813745e8347609dda017afbbe4a963921ed32df40e1d215c56bb9ddb3a59f",
+            "stake": "2000000000000000000000000",
+            "commission_bps": 500
         }
     ],
     "accounts": [
