@@ -491,8 +491,9 @@ struct SenderKey {
     session_key: ed25519_dalek::SigningKey,
 }
 
-/// Deterministic ed25519 session key for sender `idx` — stable across runs so a
-/// re-bench can reuse an already-registered session.
+/// Deterministic ed25519 session key for sender `idx` — stable across runs for
+/// reproducibility. `register_sessions` revokes-then-recreates it each run, so a
+/// stale/expired copy from a prior run never blocks re-registration.
 fn session_key_for(idx: usize) -> ed25519_dalek::SigningKey {
     let mut seed = [0u8; 32];
     seed[..8].copy_from_slice(&(0xED25_0000_0000_0000u64 + idx as u64).to_le_bytes());
@@ -532,6 +533,44 @@ async fn register_sessions(
     keys: &[SenderKey],
     bin: bool,
 ) -> usize {
+    // Refresh each run: REVOKE the prior (possibly-expired) session for this
+    // deterministic key first, then CREATE it fresh. On a long-lived chain a
+    // previous run's session lingers registered-but-expired; without the revoke,
+    // re-create fails "session key already exists" and orders fail "session key
+    // expired" — and expired sessions still count toward the max-5-per-owner cap
+    // (count_sessions_for_owner does not filter by expiry). Revoke is best-effort:
+    // on the first run there is nothing to revoke, which exec reports as a harmless
+    // per-action "session not found" no-op (it does not fail the block).
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+
+    // --- Phase 1: revoke any stale session bound to each deterministic key ---
+    for (i, sk) in keys.iter().enumerate() {
+        let action = NativeAction::RevokeSession {
+            session_pubkey: sk.session_key.verifying_key().to_bytes(),
+        };
+        let nonce = now_ms + i as u64;
+        let signed = sign_native_action(action, nonce, &sk.signing_key);
+        let bytes = if bin {
+            bincode::serialize(&signed).unwrap()
+        } else {
+            serde_json::to_vec(&signed).unwrap()
+        };
+        let payload = format!("0x{}", hex::encode(&bytes));
+        // Ignore result — a missing session (first run) is expected and harmless.
+        let _ =
+            submit_native_actions_batch(client, &urls[i % urls.len()], &[payload], i as u64, bin)
+                .await;
+    }
+    // Let the revokes COMMIT before creating: exec_create_session's "already exists"
+    // check reads committed state, which lags inclusion by the ~3-block HotStuff
+    // window. Registration runs before the timed window (chain idle), so a few
+    // seconds comfortably clears it.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+
+    // --- Phase 2: create the fresh sessions ---
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -545,8 +584,8 @@ async fn register_sessions(
             expiry,
             scope: SessionScope::Full,
         };
-        // Distinct, in-window nonce per sender, below the order nonces (which lead
-        // by half the 60s window), so the (owner, nonce) replay guard never clashes.
+        // Distinct, in-window nonce per sender; offset from the revoke nonce above
+        // (>=4s newer) so the (owner, nonce) replay guard never clashes.
         let nonce = now_ms + i as u64;
         let signed = sign_native_action(action, nonce, &sk.signing_key);
         let bytes = if bin {
