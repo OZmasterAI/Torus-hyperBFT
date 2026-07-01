@@ -1479,6 +1479,39 @@ mod tests {
         assert_eq!(senders[2], None);
     }
 
+    /// Incident regression (mem 41e06912): the non-attested `validate_block` branch
+    /// used `recover_sender`, which returns `Err` for EVERY session action — so it
+    /// blanket-rejected session-signed orders and wedged the chain in a reject loop.
+    /// The fix routes that branch through `batch_verify_native_actions` + a session
+    /// lookup. This pins the exact accept/reject flip: `recover_sender` still errors
+    /// on a session action, but `batch_verify` RESOLVES it when the session is
+    /// registered and still returns `None` when it is not.
+    #[test]
+    fn session_action_errors_on_recover_but_resolves_via_batch_verify() {
+        let ed_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let pubkey = ed_key.verifying_key().to_bytes();
+        let owner = Address::from([0x33; 20]);
+        let session = make_session(owner);
+        let action =
+            sign_action_with_session(NativeAction::CancelOrder { order_id: 9 }, TEST_NONCE, &ed_key);
+
+        // The bug's mechanism: the old non-attested path can't verify sessions.
+        assert!(action.recover_sender().is_err());
+
+        // Fix: a registered session resolves to its owner (ACCEPT).
+        let with_session = batch_verify_native_actions(
+            std::slice::from_ref(&action),
+            TEST_NONCE,
+            |pk| (pk == &pubkey).then(|| session.clone()),
+        );
+        assert_eq!(with_session[0], Some(owner));
+
+        // ...but an unregistered session still fails (REJECT — no security hole).
+        let no_session =
+            batch_verify_native_actions(std::slice::from_ref(&action), TEST_NONCE, |_| None);
+        assert_eq!(no_session[0], None);
+    }
+
     /// #2 parallelization guard: the parallel batch verify must reproduce the
     /// exact per-action ground truth, identically across runs, regardless of
     /// rayon thread scheduling (index order is preserved by `collect`).

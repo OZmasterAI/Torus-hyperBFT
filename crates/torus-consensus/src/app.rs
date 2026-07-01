@@ -1498,15 +1498,31 @@ impl App<RocksKVStore> for TorusApp {
 
         if !torus_block.native_actions.is_empty() {
             if torus_block.header.sig_attestation == [0u8; 64] {
-                use rayon::prelude::*;
-                let all_valid = torus_block.native_actions.par_iter().enumerate().all(|(i, sa)| {
-                    if sa.recover_sender().is_err() {
-                        tracing::warn!(index = i, "validate_block: REJECTED -- invalid native action signature");
-                        return false;
-                    }
-                    true
-                });
-                if !all_valid {
+                // Non-attested proposer: we must verify every action ourselves. Use the
+                // SAME session-aware resolver as the execution path (see ~L300) so BOTH
+                // EIP-712 and ed25519 *session* signatures are checked against committed
+                // session state. The old code called `recover_sender`, which returns Err
+                // for every `ActionSignature::Session` (eip712.rs:765) and thus blanket-
+                // rejected all session actions on non-attested blocks — the deterministic
+                // root cause of the reject-loop (mem 41e06912). `None` == bad sig /
+                // missing / expired / out-of-scope session.
+                //
+                // Reads `self.state_db` (committed state, identical across validators at
+                // this height) so the verdict is deterministic and cannot fork WITHIN a
+                // block. NOTE: this is a CONSENSUS VALIDITY CHANGE — deploy to ALL
+                // validators together; a mixed old/new set disagrees on these blocks and
+                // forks. Same-block CreateSession+order still rejects here (defect A,
+                // tracked separately) — strictly better than rejecting all session blocks.
+                let resolved = torus_types::eip712::batch_verify_native_actions(
+                    &torus_block.native_actions,
+                    torus_block.header.timestamp,
+                    |pubkey| self.state_db.get_session(pubkey).ok().flatten(),
+                );
+                if let Some(i) = resolved.iter().position(|s| s.is_none()) {
+                    tracing::warn!(
+                        index = i,
+                        "validate_block: REJECTED -- invalid native action signature"
+                    );
                     return ValidateBlockResponse::Invalid;
                 }
             } else {
