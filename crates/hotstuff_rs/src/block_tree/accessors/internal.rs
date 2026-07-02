@@ -401,6 +401,19 @@ impl<K: KVStore> BlockTreeSingleton<K> {
             .map(|(hash, _)| *hash)
             .collect();
 
+        // Block-tree pruner: bound cf_consensus_meta growth by deleting blocks that
+        // fell out of the retention window (no-op unless enabled via
+        // set_block_tree_retention). Best-effort local housekeeping in its own write
+        // batch — a pruning error must never fail consensus.
+        if !committed_block_hashes.is_empty() {
+            if let Err(err) = self.prune_old_committed_blocks() {
+                log::warn!(
+                    "block-tree pruning failed (will retry on next commit): {:?}",
+                    err
+                );
+            }
+        }
+
         // Safety: a block that updates the validator set must be followed by a block that contains a decide
         // pc. A block becomes committed immediately if its commitPC or decidePC is seen. Therefore, under normal
         // operation, at most 1 validator-set-updating block can be committed at a time.
@@ -1017,6 +1030,31 @@ impl<W: WriteBatch> BlockTreeWriteBatch<W> {
         ))
     }
 
+    /// Block-tree pruner: delete the height -> hash mapping for a pruned height.
+    pub fn delete_block_at_height(&mut self, height: BlockHeight) {
+        self.0.delete(&concat(
+            &variables::BLOCK_AT_HEIGHT,
+            &height.try_to_vec().unwrap(),
+        ));
+    }
+
+    /// Block-tree pruner: persist the prune pointer (the lowest committed height
+    /// NOT yet pruned).
+    pub fn set_block_tree_pruned_height(
+        &mut self,
+        height: BlockHeight,
+    ) -> Result<(), BlockTreeError> {
+        Ok(self.0.set(
+            &variables::BLOCK_TREE_PRUNED_HEIGHT,
+            &height
+                .try_to_vec()
+                .map_err(|err| KVSetError::SerializeValueError {
+                    key: Key::BlockAtHeight { height },
+                    source: err,
+                })?,
+        ))
+    }
+
     /* ↓↓↓ Block to Children ↓↓↓ */
 
     pub fn set_children(
@@ -1442,6 +1480,89 @@ impl<K: KVStore> BlockTreeSingleton<K> {
         Ok(())
     }
 
+    /// Block-tree pruner: the persisted prune pointer — the lowest committed
+    /// height NOT yet pruned. `None` if pruning has never run.
+    pub fn block_tree_pruned_height(&self) -> Result<Option<BlockHeight>, BlockTreeError> {
+        use borsh::BorshDeserialize;
+        if let Some(bytes) = self.0.get(&variables::BLOCK_TREE_PRUNED_HEIGHT) {
+            let height = BlockHeight::deserialize(&mut bytes.as_slice()).map_err(|err| {
+                KVGetError::DeserializeValueError {
+                    key: Key::HighestCommittedBlock,
+                    source: err,
+                }
+            })?;
+            Ok(Some(height))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Block-tree pruner: prune committed blocks that fell out of the retention
+    /// window configured via
+    /// [`set_block_tree_retention`](crate::block_tree::set_block_tree_retention).
+    /// No-op (returns `Ok(0)`) when pruning is disabled.
+    pub fn prune_old_committed_blocks(&mut self) -> Result<u64, BlockTreeError> {
+        match crate::block_tree::block_tree_retention() {
+            Some(retention) => self.prune_old_committed_blocks_with(retention),
+            None => Ok(0),
+        }
+    }
+
+    /// Block-tree pruner core: delete the per-block keys (BLOCKS fields + data,
+    /// BLOCK_AT_HEIGHT, BLOCK_TO_CHILDREN, and any lingering pending-update /
+    /// validator-set-update entries) of committed blocks at heights strictly
+    /// below `highest_committed - retention`, advancing a persisted prune
+    /// pointer by at most [`Self::PRUNE_BATCH_MAX`] heights per call so the
+    /// consensus thread never stalls on a large backlog.
+    ///
+    /// Node-local storage housekeeping, NOT consensus-critical: only deeply
+    /// committed, canonical blocks are touched — never the uncommitted tail,
+    /// safety singletons, leader reputation, speculative commits, or
+    /// equivocation evidence. Runs in its own write batch, after (and separate
+    /// from) the commit's atomic batch, so it is crash-safe and idempotent.
+    pub fn prune_old_committed_blocks_with(
+        &mut self,
+        retention: u64,
+    ) -> Result<u64, BlockTreeError> {
+        const PRUNE_BATCH_MAX: u64 = 64;
+
+        let Some(highest) = self.highest_committed_block_height()? else {
+            return Ok(0);
+        };
+        let highest = highest.int();
+        if highest <= retention {
+            return Ok(0);
+        }
+        // Retain heights `horizon..=highest`; heights below `horizon` are prunable.
+        let horizon = highest - retention;
+        let start = self
+            .block_tree_pruned_height()?
+            .map(|h| h.int())
+            .unwrap_or(0);
+        if start >= horizon {
+            return Ok(0);
+        }
+        let end = horizon.min(start.saturating_add(PRUNE_BATCH_MAX));
+
+        let mut wb: BlockTreeWriteBatch<K::WriteBatch> = BlockTreeWriteBatch::new();
+        let mut pruned = 0u64;
+        for h in start..end {
+            let height = BlockHeight::new(h);
+            if let Some(hash) = self.block_at_height(height)? {
+                let data_len = self.block_data_len(&hash)?.unwrap_or(DataLen::new(0));
+                wb.delete_block(&hash, data_len);
+                wb.delete_children(&hash);
+                wb.delete_pending_app_state_updates(&hash);
+                wb.delete_block_validator_set_updates(&hash);
+                wb.delete_block_at_height(height);
+                pruned += 1;
+            }
+        }
+        wb.set_block_tree_pruned_height(BlockHeight::new(end))?;
+        self.write(wb);
+        Ok(pruned)
+    }
+
     /// MonadBFT B2: Query whether a block is speculatively committed (but not yet irrevocable).
     pub fn is_speculatively_committed(&self, block: &CryptoHash) -> Result<bool, BlockTreeError> {
         Ok(self.speculative_commits()?.contains(block))
@@ -1822,5 +1943,277 @@ mod leader_rep_cache_tests {
             "decay must have halved counters at the window boundary (v0.total={})",
             e0.1.total
         );
+    }
+}
+
+#[cfg(test)]
+mod block_tree_pruner_tests {
+    use super::*;
+    use crate::block_tree::pluggables::{KVGet, KVStore, WriteBatch};
+    use crate::hotstuff::types::{Phase, PhaseCertificate};
+    use crate::types::block::Block;
+    use crate::types::data_types::{
+        BlockHeight, ChainID, CryptoHash, Data, SignatureSet, ViewNumber,
+    };
+    use std::collections::HashMap;
+
+    #[derive(Clone, Default)]
+    struct MemKV {
+        map: HashMap<Vec<u8>, Vec<u8>>,
+    }
+
+    struct MemWb {
+        sets: Vec<(Vec<u8>, Vec<u8>)>,
+        deletes: Vec<Vec<u8>>,
+    }
+
+    #[derive(Clone)]
+    struct MemSnap(HashMap<Vec<u8>, Vec<u8>>);
+
+    impl WriteBatch for MemWb {
+        fn new() -> Self {
+            Self { sets: Vec::new(), deletes: Vec::new() }
+        }
+        fn set(&mut self, key: &[u8], value: &[u8]) {
+            self.sets.push((key.to_vec(), value.to_vec()));
+        }
+        fn delete(&mut self, key: &[u8]) {
+            self.deletes.push(key.to_vec());
+        }
+    }
+
+    impl KVGet for MemKV {
+        fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+            self.map.get(key).cloned()
+        }
+    }
+
+    impl KVGet for MemSnap {
+        fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+            self.0.get(key).cloned()
+        }
+    }
+
+    impl KVStore for MemKV {
+        type WriteBatch = MemWb;
+        type Snapshot<'a> = MemSnap;
+        fn write(&mut self, wb: MemWb) {
+            for (k, v) in wb.sets {
+                self.map.insert(k, v);
+            }
+            for k in wb.deletes {
+                self.map.remove(&k);
+            }
+        }
+        fn clear(&mut self) {
+            self.map.clear();
+        }
+        fn snapshot<'b>(&'b self) -> MemSnap {
+            MemSnap(self.map.clone())
+        }
+    }
+
+    /// Insert a linear committed chain of `len` blocks at heights `0..len`
+    /// (each block's justify referencing its parent), then commit the tip.
+    /// Returns the block hashes in height order.
+    fn seed_committed_chain(
+        bt: &mut BlockTreeSingleton<MemKV>,
+        len: u64,
+    ) -> Vec<CryptoHash> {
+        let mut hashes = Vec::with_capacity(len as usize);
+        let mut justify = PhaseCertificate::genesis_pc();
+        for h in 0..len {
+            let block = Block::new(
+                BlockHeight::new(h),
+                justify.clone(),
+                CryptoHash::new([h as u8; 32]),
+                Data::new(vec![]),
+            );
+            bt.insert(&block, None, None).unwrap();
+            hashes.push(block.hash);
+            justify = PhaseCertificate {
+                chain_id: ChainID::new(0),
+                view: ViewNumber::new(h + 1),
+                block: block.hash,
+                phase: Phase::Generic,
+                signatures: SignatureSet::new(0),
+            };
+        }
+        let tip = *hashes.last().unwrap();
+        let mut wb = BlockTreeWriteBatch::new();
+        bt.commit(&mut wb, &tip).unwrap();
+        bt.write(wb);
+        hashes
+    }
+
+    /// Extend an existing seeded chain by one block at `height`, justified by
+    /// `parent`, and commit it. Returns the new block's hash.
+    fn extend_and_commit(
+        bt: &mut BlockTreeSingleton<MemKV>,
+        height: u64,
+        parent: CryptoHash,
+    ) -> CryptoHash {
+        let justify = PhaseCertificate {
+            chain_id: ChainID::new(0),
+            view: ViewNumber::new(height),
+            block: parent,
+            phase: Phase::Generic,
+            signatures: SignatureSet::new(0),
+        };
+        let block = Block::new(
+            BlockHeight::new(height),
+            justify,
+            CryptoHash::new([height as u8; 32]),
+            Data::new(vec![]),
+        );
+        bt.insert(&block, None, None).unwrap();
+        let mut wb = BlockTreeWriteBatch::new();
+        bt.commit(&mut wb, &block.hash).unwrap();
+        bt.write(wb);
+        block.hash
+    }
+
+    /// Pruning removes every per-block key (BLOCKS fields, BLOCK_AT_HEIGHT,
+    /// BLOCK_TO_CHILDREN) below `highest_committed - retention`, retains the
+    /// window, leaves safety singletons intact, and persists the prune pointer.
+    #[test]
+    fn pruner_removes_old_committed_blocks() {
+        let mut bt = BlockTreeSingleton::new(MemKV::default());
+        let hashes = seed_committed_chain(&mut bt, 51); // heights 0..=50
+
+        let pruned = bt.prune_old_committed_blocks_with(8).unwrap();
+        assert_eq!(pruned, 42, "heights 0..=41 fall below horizon 50-8=42");
+
+        for h in 0..42u64 {
+            assert!(
+                bt.block_at_height(BlockHeight::new(h)).unwrap().is_none(),
+                "BLOCK_AT_HEIGHT[{h}] must be deleted"
+            );
+            assert!(
+                bt.block_height(&hashes[h as usize]).unwrap().is_none(),
+                "BLOCKS fields for height {h} must be deleted"
+            );
+            assert!(
+                bt.children(&hashes[h as usize]).is_err(),
+                "BLOCK_TO_CHILDREN for height {h} must be deleted"
+            );
+        }
+        for h in 42..=50u64 {
+            assert!(
+                bt.block_at_height(BlockHeight::new(h)).unwrap().is_some(),
+                "height {h} is inside the retention window and must be kept"
+            );
+        }
+
+        // Safety singletons intact.
+        assert_eq!(
+            bt.highest_committed_block().unwrap(),
+            Some(hashes[50]),
+            "highest committed block must survive pruning"
+        );
+        assert_eq!(
+            bt.block_tree_pruned_height().unwrap(),
+            Some(BlockHeight::new(42)),
+            "prune pointer must persist"
+        );
+    }
+
+    /// The per-call workload is bounded: a large backlog drains in
+    /// PRUNE_BATCH_MAX-sized chunks across successive calls.
+    #[test]
+    fn pruner_bounds_batch_size() {
+        let mut bt = BlockTreeSingleton::new(MemKV::default());
+        seed_committed_chain(&mut bt, 200); // heights 0..=199, horizon 191
+
+        assert_eq!(bt.prune_old_committed_blocks_with(8).unwrap(), 64);
+        assert_eq!(bt.prune_old_committed_blocks_with(8).unwrap(), 64);
+        assert_eq!(bt.prune_old_committed_blocks_with(8).unwrap(), 63);
+        assert_eq!(
+            bt.prune_old_committed_blocks_with(8).unwrap(),
+            0,
+            "backlog drained — nothing further to prune"
+        );
+
+        assert!(bt.block_at_height(BlockHeight::new(190)).unwrap().is_none());
+        assert!(bt.block_at_height(BlockHeight::new(191)).unwrap().is_some());
+    }
+
+    /// No committed blocks, or a chain shorter than the retention window,
+    /// prunes nothing.
+    #[test]
+    fn pruner_noop_when_underwater() {
+        let mut bt = BlockTreeSingleton::new(MemKV::default());
+        assert_eq!(
+            bt.prune_old_committed_blocks_with(8).unwrap(),
+            0,
+            "empty tree: nothing to prune"
+        );
+
+        seed_committed_chain(&mut bt, 10); // heights 0..=9
+        assert_eq!(
+            bt.prune_old_committed_blocks_with(20).unwrap(),
+            0,
+            "retention exceeds chain height: nothing to prune"
+        );
+        assert!(bt.block_at_height(BlockHeight::new(0)).unwrap().is_some());
+    }
+
+    /// Committing on top of a pruned tree keeps working (the commit walk never
+    /// crosses the pruned horizon), and subsequent prunes advance incrementally.
+    #[test]
+    fn pruner_commit_safe_across_horizon() {
+        let mut bt = BlockTreeSingleton::new(MemKV::default());
+        let hashes = seed_committed_chain(&mut bt, 51); // heights 0..=50
+        assert_eq!(bt.prune_old_committed_blocks_with(8).unwrap(), 42);
+
+        let new_tip = extend_and_commit(&mut bt, 51, hashes[50]);
+        assert_eq!(bt.highest_committed_block().unwrap(), Some(new_tip));
+
+        // Horizon moved 42 -> 43: exactly one more height is pruned.
+        assert_eq!(bt.prune_old_committed_blocks_with(8).unwrap(), 1);
+        assert!(bt.block_at_height(BlockHeight::new(42)).unwrap().is_none());
+        assert!(bt.block_at_height(BlockHeight::new(43)).unwrap().is_some());
+    }
+
+    /// The crate-level retention switch: disabled by default (wrapper prunes
+    /// nothing), small values clamp to the floor, `None`/`Some(0)` disable.
+    /// Also exercises the `prune_old_committed_blocks()` wrapper used by
+    /// `update()`. Global state is reset at the end.
+    #[test]
+    fn pruner_retention_switch_and_wrapper() {
+        use crate::block_tree::{
+            block_tree_retention, set_block_tree_retention, MIN_BLOCK_TREE_RETENTION,
+        };
+
+        let mut bt = BlockTreeSingleton::new(MemKV::default());
+        seed_committed_chain(&mut bt, 51);
+
+        // Force-disable regardless of test ordering in this process.
+        set_block_tree_retention(None);
+        assert_eq!(block_tree_retention(), None);
+        assert_eq!(
+            bt.prune_old_committed_blocks().unwrap(),
+            0,
+            "disabled retention must prune nothing"
+        );
+
+        set_block_tree_retention(Some(2));
+        assert_eq!(
+            block_tree_retention(),
+            Some(MIN_BLOCK_TREE_RETENTION),
+            "tiny retention clamps to the floor"
+        );
+
+        set_block_tree_retention(Some(0));
+        assert_eq!(block_tree_retention(), None, "zero disables");
+
+        set_block_tree_retention(Some(8));
+        assert!(
+            bt.prune_old_committed_blocks().unwrap() > 0,
+            "wrapper must prune with retention enabled"
+        );
+
+        // Reset for other tests in this process.
+        set_block_tree_retention(None);
     }
 }

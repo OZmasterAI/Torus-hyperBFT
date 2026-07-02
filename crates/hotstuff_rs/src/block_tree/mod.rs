@@ -63,3 +63,40 @@ pub mod invariants;
 pub mod variables;
 
 pub mod pluggables;
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Floor for [`set_block_tree_retention`]: retention windows smaller than this
+/// are clamped up so pruning can never reach the uncommitted tail / speculative
+/// window (pipeline depth ~1-3 views). Production deployments should use much
+/// larger windows (torus-node clamps to >= 1000).
+pub const MIN_BLOCK_TREE_RETENTION: u64 = 8;
+
+/// Block-tree retention window in blocks. `0` = pruning disabled (archive).
+///
+/// Node-local storage policy, NOT consensus-critical: validators may run
+/// different retention windows (or none) without affecting agreement. Mirrors
+/// the `set_reputation_leader_selection` crate-static pattern.
+static BLOCK_TREE_RETENTION: AtomicU64 = AtomicU64::new(0);
+
+/// Enable pruning of old committed blocks from the block tree, retaining the
+/// most recent `retention` committed heights. `None` or `Some(0)` disables
+/// pruning (archive mode, the default). Values below
+/// [`MIN_BLOCK_TREE_RETENTION`] are clamped up.
+///
+/// Call once at node startup, before the replica starts.
+pub fn set_block_tree_retention(retention: Option<u64>) {
+    let value = match retention {
+        Some(0) | None => 0,
+        Some(r) => r.max(MIN_BLOCK_TREE_RETENTION),
+    };
+    BLOCK_TREE_RETENTION.store(value, Ordering::Relaxed);
+}
+
+/// The active block-tree retention window, if pruning is enabled.
+pub fn block_tree_retention() -> Option<u64> {
+    match BLOCK_TREE_RETENTION.load(Ordering::Relaxed) {
+        0 => None,
+        r => Some(r),
+    }
+}

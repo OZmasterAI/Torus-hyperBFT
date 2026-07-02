@@ -532,6 +532,19 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             "plain IWRR round-robin"
         }
     );
+    // Block-tree pruner (S391): bound hotstuff's cf_consensus_meta growth with the
+    // same retention knob as the state pruner. Node-local storage policy (not
+    // consensus-critical); clamped to >= 1000 so consensus lookbacks and the
+    // speculative window are never at risk. Archive nodes (no --retention-blocks)
+    // keep everything and remain the genesis-sync source.
+    hotstuff_rs::block_tree::set_block_tree_retention(cli.retention_blocks.map(|r| r.max(1000)));
+    if let Some(r) = cli.retention_blocks {
+        info!(
+            retention_blocks = r.max(1000),
+            "block-tree pruner enabled (cf_consensus_meta)"
+        );
+    }
+
     let hs_config = Configuration::builder()
         .me(signing_key)
         .chain_id(ChainID::new(chain_config.chain_id))

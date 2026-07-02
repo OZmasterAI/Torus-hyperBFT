@@ -161,6 +161,10 @@ pub const SPECULATIVE_COMMITS: [u8; 1] = [19];
 pub const LEADER_REPUTATION: [u8; 1] = [20];
 /// MonadBFT B3: persisted equivocation evidence (survives rollback, needed for slashing audit).
 pub const EQUIVOCATION_EVIDENCE: [u8; 1] = [21];
+/// Block-tree pruner: the lowest committed height NOT yet pruned (the prune
+/// pointer). Heights below this have had their [`BLOCKS`], [`BLOCK_AT_HEIGHT`]
+/// and [`BLOCK_TO_CHILDREN`] entries deleted.
+pub const BLOCK_TREE_PRUNED_HEIGHT: [u8; 1] = [22];
 
 // Fields of Block
 pub const BLOCK_HEIGHT: [u8; 1] = [0];
