@@ -185,13 +185,14 @@ impl LibP2PNetwork {
         let (native_tx, native_rx) = mpsc::channel(8192);
 
         let max_peers = config.max_peers;
+        let gossipsub_heartbeat_ms = config.gossipsub_heartbeat_ms;
         let mut swarm = SwarmBuilder::with_existing_identity(libp2p_keypair)
             .with_tokio()
             .with_quic_config(tune_quic_config)
             .with_dns()
             .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?
             .with_behaviour(|key| {
-                TorusBehaviour::with_limits(key, max_peers)
+                TorusBehaviour::with_limits_and_heartbeat(key, max_peers, gossipsub_heartbeat_ms)
                     .expect("failed to create TorusBehaviour")
             })
             .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?

@@ -38,6 +38,25 @@ pub struct TorusBehaviour {
     pub block_list: allow_block_list::Behaviour<allow_block_list::BlockedPeers>,
 }
 
+/// Default gossipsub heartbeat interval (ms). Single source of truth shared
+/// with `NetworkConfig::default()`. S391: the intended value was always 100ms
+/// (config.rs), but the behaviour hardcoded 500ms and never read the config —
+/// mesh re-grafting / IWANT retransmission after a WAN blip healed 5x slower
+/// than designed.
+pub const DEFAULT_GOSSIPSUB_HEARTBEAT_MS: u64 = 100;
+
+/// Build the consensus gossipsub config with the given heartbeat interval.
+/// Extracted (and unit-tested) so the heartbeat can never silently drift from
+/// `NetworkConfig.gossipsub_heartbeat_ms` again.
+pub fn gossipsub_config(heartbeat_ms: u64) -> Result<gossipsub::Config, String> {
+    gossipsub::ConfigBuilder::default()
+        .heartbeat_interval(Duration::from_millis(heartbeat_ms))
+        .max_transmit_size(2 * 1024 * 1024)
+        .validation_mode(gossipsub::ValidationMode::Strict)
+        .build()
+        .map_err(|e| format!("gossipsub config: {e}"))
+}
+
 impl TorusBehaviour {
     pub fn new(key: &libp2p::identity::Keypair) -> Result<Self, Box<dyn std::error::Error>> {
         Self::with_limits(key, 100)
@@ -47,15 +66,18 @@ impl TorusBehaviour {
         key: &libp2p::identity::Keypair,
         max_peers: usize,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::with_limits_and_heartbeat(key, max_peers, DEFAULT_GOSSIPSUB_HEARTBEAT_MS)
+    }
+
+    pub fn with_limits_and_heartbeat(
+        key: &libp2p::identity::Keypair,
+        max_peers: usize,
+        gossipsub_heartbeat_ms: u64,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let peer_id = key.public().to_peer_id();
 
         // GossipSub
-        let gossipsub_config = gossipsub::ConfigBuilder::default()
-            .heartbeat_interval(Duration::from_millis(500))
-            .max_transmit_size(2 * 1024 * 1024)
-            .validation_mode(gossipsub::ValidationMode::Strict)
-            .build()
-            .map_err(|e| format!("gossipsub config: {e}"))?;
+        let gossipsub_config = gossipsub_config(gossipsub_heartbeat_ms)?;
         let gossipsub = gossipsub::Behaviour::new(
             gossipsub::MessageAuthenticity::Signed(key.clone()),
             gossipsub_config,
@@ -155,5 +177,42 @@ impl TorusBehaviour {
             connection_limits,
             block_list,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// S391: `NetworkConfig.gossipsub_heartbeat_ms` was dead config — the
+    /// behaviour hardcoded a 500ms heartbeat while config.rs said 100ms. The
+    /// heartbeat must come from the caller.
+    #[test]
+    fn gossipsub_heartbeat_comes_from_caller() {
+        let cfg = gossipsub_config(100).expect("build gossipsub config");
+        assert_eq!(cfg.heartbeat_interval(), Duration::from_millis(100));
+        let cfg = gossipsub_config(500).expect("build gossipsub config");
+        assert_eq!(cfg.heartbeat_interval(), Duration::from_millis(500));
+    }
+
+    /// The crate default and NetworkConfig's default must be the same value
+    /// (single source of truth), so `TorusBehaviour::new`/`with_limits`
+    /// fallbacks match a default-configured node.
+    #[test]
+    fn network_config_default_heartbeat_matches_crate_default() {
+        assert_eq!(
+            crate::config::NetworkConfig::default().gossipsub_heartbeat_ms,
+            DEFAULT_GOSSIPSUB_HEARTBEAT_MS
+        );
+    }
+
+    /// The wired constructor honors the requested heartbeat (construction
+    /// succeeds; the interval itself is asserted via `gossipsub_config` above
+    /// since libp2p's Behaviour does not expose its config).
+    #[test]
+    fn with_limits_and_heartbeat_constructs() {
+        let key = libp2p::identity::Keypair::generate_ed25519();
+        TorusBehaviour::with_limits_and_heartbeat(&key, 50, 250)
+            .expect("behaviour with custom heartbeat");
     }
 }
