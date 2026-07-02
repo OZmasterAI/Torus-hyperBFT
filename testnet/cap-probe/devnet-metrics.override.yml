@@ -1,0 +1,17 @@
+# Probe-only compose override: expose EVERY devnet node's Prometheus metrics
+# (container :9090) on a distinct host port, so cap-probe/analyze.py can scrape
+# the FOLLOWERS' native-DA counters (recovery pulls fire on the node missing a
+# body — i.e. a follower, not the proposer). The base compose only maps
+# validator-0 (9091:9090); this adds the rest. Ports lists merge additively.
+#
+#   docker compose -f devnet/docker-compose.yml \
+#                  -f testnet/cap-probe/devnet-metrics.override.yml up -d
+services:
+  validator-1:
+    ports: ["9092:9090"]
+  validator-2:
+    ports: ["9093:9090"]
+  validator-3:
+    ports: ["9094:9090"]
+  rpc-node:
+    ports: ["9095:9090"]

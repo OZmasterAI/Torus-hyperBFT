@@ -1,0 +1,14 @@
+# Cap devnet CPU so a bs-ladder flood can't starve the LIVE testnet validator
+# sharing this 8-core box (all-3 quorum: a starved seed stalls the real chain).
+# 5 services x 1.2 cpus = 6 cores max, leaving ~2 for the seed + system.
+services:
+  validator-0:
+    cpus: 1.2
+  validator-1:
+    cpus: 1.2
+  validator-2:
+    cpus: 1.2
+  validator-3:
+    cpus: 1.2
+  rpc-node:
+    cpus: 1.2
