@@ -1768,14 +1768,6 @@ impl<N: Network> HotStuff<N> {
         Ok(())
     }
 
-    const BODY_RETRY_INTERVAL: Duration = Duration::from_millis(300);
-    const MAX_BODY_RETRIES: u8 = 3;
-    /// Total fetch attempts before giving up to sync: 3 at the proposer, then
-    /// up to 6 rotated across the other validators (Sprint 3 T3 — a
-    /// non-serving proposer must not defeat the fetch when another validator
-    /// holds the body).
-    const MAX_BODY_RETRIES_TOTAL: u8 = 9;
-
     /// Re-request bodies for stale pending headers; trigger block sync after max retries.
     /// The proposer is asked first (`MAX_BODY_RETRIES` attempts), then the request
     /// rotates across the other committed validators.
@@ -1787,13 +1779,13 @@ impl<N: Network> HotStuff<N> {
         let me = self.config.keypair.public();
         let mut expired = Vec::new();
         for (hash, (last_req, count, origin)) in self.body_fetch_tracker.iter_mut() {
-            if now.duration_since(*last_req) < Self::BODY_RETRY_INTERVAL {
+            if now.duration_since(*last_req) < BODY_RETRY_INTERVAL {
                 continue;
             }
-            if *count >= Self::MAX_BODY_RETRIES_TOTAL {
+            if *count >= MAX_BODY_RETRIES_TOTAL {
                 log::warn!(
                     "body fetch exhausted {} retries (proposer + rotation) for {:?} — falling back to sync",
-                    Self::MAX_BODY_RETRIES_TOTAL,
+                    MAX_BODY_RETRIES_TOTAL,
                     hash
                 );
                 expired.push(*hash);
@@ -1810,7 +1802,7 @@ impl<N: Network> HotStuff<N> {
                     })
                     .unwrap_or_default();
                 let Some(target) =
-                    rotated_body_fetch_target(*count, Self::MAX_BODY_RETRIES, origin, &others)
+                    rotated_body_fetch_target(*count, MAX_BODY_RETRIES, origin, &others)
                 else {
                     log::warn!("body fetch has no remaining targets for {:?} — falling back to sync", hash);
                     expired.push(*hash);
@@ -1842,6 +1834,19 @@ impl<N: Network> HotStuff<N> {
         !self.body_fetch_tracker.is_empty()
     }
 }
+
+/// Cadence of body-fetch re-requests for a stale pending header. S391: was
+/// 300ms — with 3 proposer attempts a single lost first request cost 900ms
+/// (nearly two 500ms view timeouts) before any other validator was asked.
+pub(crate) const BODY_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+/// Attempts at the proposer before rotating to the other validators (S391:
+/// 3 -> 2; rotation now starts within 200ms, see
+/// `rotation_budget_within_half_view_timeout`).
+pub(crate) const MAX_BODY_RETRIES: u8 = 2;
+/// Total fetch attempts before giving up to sync: first at the proposer, then
+/// rotated across the other validators (Sprint 3 T3 — a non-serving proposer
+/// must not defeat the fetch when another validator holds the body).
+pub(crate) const MAX_BODY_RETRIES_TOTAL: u8 = 9;
 
 /// Pick the target for body-fetch attempt number `attempt` (0-based): the first
 /// `max_origin_retries` attempts go to `origin` (the proposer — overwhelmingly
@@ -1897,6 +1902,24 @@ mod body_fetch_rotation_tests {
         let origin = vk(1);
         assert_eq!(rotated_body_fetch_target(0, 3, &origin, &[]), Some(origin));
         assert_eq!(rotated_body_fetch_target(3, 3, &origin, &[]), None);
+    }
+
+    /// S391: a slow or lossy proposer must not hold a body fetch hostage — the
+    /// first alternate-validator request must fire within half the 500ms view
+    /// timeout (was 300ms x 3 = 900ms, nearly two full view timeouts). Guards
+    /// the constants against drifting back up.
+    #[test]
+    fn rotation_budget_within_half_view_timeout() {
+        let pre_rotation = BODY_RETRY_INTERVAL * MAX_BODY_RETRIES as u32;
+        assert!(
+            pre_rotation <= Duration::from_millis(250),
+            "worst-case wait before rotating off the proposer is {pre_rotation:?}; \
+             must be <= 250ms (half the 500ms view timeout)"
+        );
+        assert!(
+            MAX_BODY_RETRIES_TOTAL > MAX_BODY_RETRIES,
+            "rotation across other validators must exist"
+        );
     }
 }
 
