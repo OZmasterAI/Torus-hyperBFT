@@ -1,5 +1,8 @@
 //! Torus-hyperBFT telemetry: Prometheus metrics registry, tracing subscriber, /health endpoint.
 
+pub mod view_metrics;
+pub use view_metrics::ViewMetricsRecorder;
+
 use prometheus_client::encoding::text::encode;
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
@@ -156,6 +159,17 @@ pub struct Metrics {
     /// Committed blocks handed to the exec channel but not yet fully executed.
     /// Pinned near the channel bound (64) = execution is the bottleneck.
     pub exec_queue_depth: Gauge,
+
+    // View-phase timing (hotstuff replica lifecycle, fed by ViewMetricsRecorder).
+    // Decomposes per-leg block cadence per node: leader build + QC collection,
+    // follower proposal arrival + persist + vote.
+    pub view_duration_seconds: Histogram,
+    pub view_propose_delay_seconds: Histogram,
+    pub view_qc_collect_seconds: Histogram,
+    pub view_proposal_arrival_seconds: Histogram,
+    pub view_insert_persist_seconds: Histogram,
+    pub view_vote_delay_seconds: Histogram,
+    pub commit_interval_seconds: Histogram,
 }
 
 impl Metrics {
@@ -563,6 +577,55 @@ impl Metrics {
             exec_queue_depth.clone(),
         );
 
+        let view_duration_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 15));
+        registry.register(
+            "torus_view_duration_seconds",
+            "Full view duration: StartView to the next StartView",
+            view_duration_seconds.clone(),
+        );
+
+        let view_propose_delay_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 15));
+        registry.register(
+            "torus_view_propose_delay_seconds",
+            "Leader: StartView to Propose broadcast (block build + readiness)",
+            view_propose_delay_seconds.clone(),
+        );
+
+        let view_qc_collect_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 15));
+        registry.register(
+            "torus_view_qc_collect_seconds",
+            "Leader: Propose broadcast to PhaseCertificate collected (vote round-trip incl. voter persist)",
+            view_qc_collect_seconds.clone(),
+        );
+
+        let view_proposal_arrival_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 15));
+        registry.register(
+            "torus_view_proposal_arrival_seconds",
+            "Follower: StartView to the leader's proposal arriving",
+            view_proposal_arrival_seconds.clone(),
+        );
+
+        let view_insert_persist_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 15));
+        registry.register(
+            "torus_view_insert_persist_seconds",
+            "Follower: proposal arrival to block persisted (validate + block-tree write)",
+            view_insert_persist_seconds.clone(),
+        );
+
+        let view_vote_delay_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 15));
+        registry.register(
+            "torus_view_vote_delay_seconds",
+            "Follower: proposal arrival to phase vote sent",
+            view_vote_delay_seconds.clone(),
+        );
+
+        let commit_interval_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 15));
+        registry.register(
+            "torus_commit_interval_seconds",
+            "Gap between consecutive local block commits (chain cadence per node)",
+            commit_interval_seconds.clone(),
+        );
+
         Self {
             registry,
             blocks_committed,
@@ -622,6 +685,13 @@ impl Metrics {
             exec_flush_seconds,
             exec_block_seconds,
             exec_queue_depth,
+            view_duration_seconds,
+            view_propose_delay_seconds,
+            view_qc_collect_seconds,
+            view_proposal_arrival_seconds,
+            view_insert_persist_seconds,
+            view_vote_delay_seconds,
+            commit_interval_seconds,
         }
     }
 

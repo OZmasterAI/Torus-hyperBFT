@@ -10,7 +10,10 @@ use std::time::Duration;
 use clap::Parser;
 use serde::Deserialize;
 use ed25519_dalek::SigningKey;
-use hotstuff_rs::events::CommitBlockEvent;
+use hotstuff_rs::events::{
+    CollectPCEvent, CommitBlockEvent, InsertBlockEvent, PhaseVoteEvent, ProposeEvent,
+    ReceiveProposalEvent, StartViewEvent, ViewTimeoutEvent,
+};
 use hotstuff_rs::replica::{Configuration, Replica, ReplicaSpec};
 use hotstuff_rs::types::data_types::{BufferSize, ChainID, EpochLength};
 use tracing::{error, info, warn};
@@ -554,13 +557,38 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     ));
     let latest_height_for_handler = latest_height_shared.clone();
 
-    // 8. Start replica with on_commit_block handler for WebSocket subscriptions
+    // 8. Start replica with on_commit_block handler for WebSocket subscriptions.
+    // View-phase timing: one recorder clone per lifecycle event, timestamps taken
+    // from the events so bus queuing doesn't skew the histograms.
+    let view_rec = Arc::new(torus_telemetry::ViewMetricsRecorder::new(metrics.clone()));
+    let rec_start = view_rec.clone();
+    let rec_propose = view_rec.clone();
+    let rec_collect = view_rec.clone();
+    let rec_receive = view_rec.clone();
+    let rec_insert = view_rec.clone();
+    let rec_vote = view_rec.clone();
+    let rec_commit = view_rec.clone();
+    let timeout_counter = metrics.consensus_timeout_total.clone();
     let _replica = ReplicaSpec::builder()
         .app(app)
         .network(network)
         .kv_store(kv_store)
         .configuration(hs_config)
-        .on_commit_block(move |_event: &CommitBlockEvent| {
+        .on_start_view(move |ev: &StartViewEvent| {
+            rec_start.start_view(ev.timestamp, ev.view.int());
+        })
+        .on_propose(move |ev: &ProposeEvent| rec_propose.propose(ev.timestamp))
+        .on_collect_pc(move |ev: &CollectPCEvent| rec_collect.collect_pc(ev.timestamp))
+        .on_receive_proposal(move |ev: &ReceiveProposalEvent| {
+            rec_receive.receive_proposal(ev.timestamp);
+        })
+        .on_insert_block(move |ev: &InsertBlockEvent| rec_insert.insert_block(ev.timestamp))
+        .on_phase_vote(move |ev: &PhaseVoteEvent| rec_vote.phase_vote(ev.timestamp))
+        .on_view_timeout(move |_ev: &ViewTimeoutEvent| {
+            timeout_counter.inc();
+        })
+        .on_commit_block(move |event: &CommitBlockEvent| {
+            rec_commit.commit_block(event.timestamp);
             let height = find_latest_height(&state_db_for_handler);
             info!(height, "on_commit_block fired");
             if height == 0 {
