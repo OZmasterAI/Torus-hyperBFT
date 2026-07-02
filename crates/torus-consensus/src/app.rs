@@ -1001,6 +1001,11 @@ impl TorusApp {
         }
 
         let hashes: Vec<[u8; 32]> = missing.iter().map(|h| h.0).collect();
+        // S391 wake-on-arrival: snapshot before firing the fetch so a push that
+        // races the pull wakes the first wait. Pull responses themselves land in
+        // the fetcher inbound and still need this thread's absorb, so the slices
+        // keep the old `delay` cadence as the worst case.
+        let mut seen = torus_state::NativeDaStore::arrival_generation();
         fetcher.fetch(hashes);
 
         if let Some(ref m) = self.metrics {
@@ -1008,7 +1013,7 @@ impl TorusApp {
         }
 
         for _ in 0..retries {
-            std::thread::sleep(delay);
+            torus_state::NativeDaStore::wait_for_arrival(seen, delay);
             Self::absorb_fetched_bodies(mempool, fetcher.as_ref());
             if missing.iter().all(|h| mempool.get_native_da(h).is_some()) {
                 if let Some(ref m) = self.metrics {
@@ -1017,6 +1022,8 @@ impl TorusApp {
                 tracing::info!(count = missing.len(), "native-da pull: bodies recovered");
                 return true;
             }
+            // Fold in our own absorb puts so they don't self-wake the next wait.
+            seen = torus_state::NativeDaStore::arrival_generation();
         }
         tracing::warn!(count = missing.len(), "native-da pull: bodies NOT recovered within budget");
         false
@@ -1063,8 +1070,13 @@ impl TorusApp {
         // this proposal arrives, but that push can race the CompactBlock under load.
         // Poll briefly so a late push lands before we resort to the network.
         if !missing.is_empty() {
+            // S391 wake-on-arrival: block on the DA-store arrival notifier with the
+            // same 20ms slice instead of a fixed sleep — a racing push wakes this
+            // thread at delivery time, while the worst case stays the old tick
+            // cadence (the ≤260ms hot-path budget is unchanged).
+            let mut seen = torus_state::NativeDaStore::arrival_generation();
             for _ in 0..RECONSTRUCT_RETRIES {
-                std::thread::sleep(RECONSTRUCT_RETRY_DELAY);
+                torus_state::NativeDaStore::wait_for_arrival(seen, RECONSTRUCT_RETRY_DELAY);
                 // Phase 2.3 pre-warm (#5): a hash-only push made THIS node PULL the bodies
                 // out-of-band (the receiver fired the by-hash fetch on the manifest), so they
                 // arrive in the fetcher inbound. Absorb them into the DA store here, in the
@@ -1083,6 +1095,8 @@ impl TorusApp {
                 if missing.is_empty() {
                     break;
                 }
+                // Fold in our own absorb puts so they don't self-wake the next wait.
+                seen = torus_state::NativeDaStore::arrival_generation();
             }
         }
 
