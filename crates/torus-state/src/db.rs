@@ -218,6 +218,14 @@ impl StateDb {
         Ok(self.db.get_cf(cf, key)?)
     }
 
+    /// Presence check for a key in any column family without copying the value
+    /// (pinned read). For hot paths that only need to know a (multi-KB) value is
+    /// already local — e.g. the native-DA pre-warm filter.
+    pub fn exists_cf_raw(&self, cf_name: &str, key: &[u8]) -> Result<bool, StateError> {
+        let cf = self.cf(cf_name)?;
+        Ok(self.db.get_pinned_cf(cf, key)?.is_some())
+    }
+
     /// Put a raw value into any column family.
     pub fn put_cf_raw(&self, cf_name: &str, key: &[u8], value: &[u8]) -> Result<(), StateError> {
         let cf = self.cf(cf_name)?;

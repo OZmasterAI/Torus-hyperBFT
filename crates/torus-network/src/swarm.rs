@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -291,6 +292,51 @@ enum SwarmAction {
     Tx(Option<Vec<u8>>),
     NativeAction(Option<Vec<u8>>),
     FlushNativeBatch,
+    DaServeDone(Option<DaServeDone>),
+}
+
+/// A completed off-loop native-DA serve: the response and its channel, ready for
+/// `send_response` back on the swarm loop (only the loop owns the behaviour).
+type DaServeDone = (
+    request_response::ResponseChannel<NativeDaNetResponse>,
+    NativeDaNetResponse,
+    PeerId,
+);
+
+/// Cap on concurrently running off-loop DA serves. Small on purpose: each job is
+/// ≤ `NATIVE_DA_FETCH_CHUNK` point-gets of multi-KB bodies; at the cap the
+/// request arm answers all-empty and the requester retries/rotates, so serves
+/// never queue unboundedly against a pull storm.
+const MAX_DA_SERVE_INFLIGHT: usize = 8;
+
+/// Bounded off-loop native-DA serve pool (#6 fix A) — see the NativeDa request
+/// arm in `handle_event`. S387: serving bodies inline on the swarm loop let
+/// manifest-mode pull storms starve consensus traffic, and every pull timed out
+/// unserved (445 requester timeouts, zero serves).
+struct DaServePool {
+    tx: mpsc::UnboundedSender<DaServeDone>,
+    inflight: Arc<AtomicUsize>,
+}
+
+impl DaServePool {
+    fn new(tx: mpsc::UnboundedSender<DaServeDone>) -> Self {
+        Self { tx, inflight: Arc::new(AtomicUsize::new(0)) }
+    }
+
+    /// Reserve a serve slot; `false` = at capacity (the caller answers
+    /// all-empty). The running job releases the slot after posting completion.
+    fn try_admit(&self) -> bool {
+        let mut cur = self.inflight.load(Ordering::Relaxed);
+        loop {
+            if cur >= MAX_DA_SERVE_INFLIGHT {
+                return false;
+            }
+            match self.inflight.compare_exchange_weak(cur, cur + 1, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => return true,
+                Err(actual) => cur = actual,
+            }
+        }
+    }
 }
 
 const NATIVE_BATCH_INTERVAL_MS: u64 = 50;
@@ -501,6 +547,11 @@ pub async fn run_swarm_with_config(
     let mut batch_timer = tokio::time::interval(Duration::from_millis(NATIVE_BATCH_INTERVAL_MS));
     batch_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    // Off-loop native-DA serve pool (#6 fix A): completions come back through
+    // this channel and are answered in the select below.
+    let (da_serve_tx, mut da_serve_rx) = mpsc::unbounded_channel::<DaServeDone>();
+    let da_serve = DaServePool::new(da_serve_tx);
+
     loop {
         let action = tokio::select! {
             biased;
@@ -510,6 +561,10 @@ pub async fn run_swarm_with_config(
 
             // P2: swarm events (consensus inbound, connections, gossip)
             event = swarm.select_next_some() => SwarmAction::Event(Box::new(event)),
+
+            // P2.5: completed off-loop DA serves — tiny send_response calls, kept
+            // prompt so pull latency stays low without store reads on the loop.
+            done = da_serve_rx.recv() => SwarmAction::DaServeDone(done),
 
             // P3: EVM tx publish
             tx = tx_rx.recv() => SwarmAction::Tx(tx),
@@ -556,10 +611,23 @@ pub async fn run_swarm_with_config(
                     &mut tx_gossip_state,
                     &mut consensus_rate_limiter,
                     &mut peer_scoring,
+                    &da_serve,
                     max_consensus_msg_size,
                     max_tx_msg_size,
                 );
             }
+            SwarmAction::DaServeDone(Some((channel, response, peer))) => {
+                if swarm
+                    .behaviour_mut()
+                    .native_da
+                    .send_response(channel, response)
+                    .is_err()
+                {
+                    warn!(%peer, "native-da send_response FAILED (channel dead)");
+                }
+            }
+            // Unreachable while `da_serve` (held by this loop) owns a sender.
+            SwarmAction::DaServeDone(None) => {}
             SwarmAction::Command(Some(cmd)) => {
                 handle_command(*cmd, &mut swarm, &shared, &local_key, &consensus_topic);
             }
@@ -647,6 +715,7 @@ fn handle_event(
     tx_gossip_state: &mut TxGossipState,
     consensus_rate_limiter: &mut ConsensusRateLimiter,
     peer_scoring: &mut PeerScoring,
+    da_serve: &DaServePool,
     max_consensus_msg_size: usize,
     max_tx_msg_size: usize,
 ) {
@@ -854,7 +923,11 @@ fn handle_event(
                 // by-hash from the proposer (this verified `peer` mirrored them in
                 // produce_block) BEFORE its CompactBlock arrives, so the hot validate path
                 // finds them already absorbed instead of wedging on dissemination.
-                match plan_prewarm_requests(&request.payload[1..]) {
+                let plan = {
+                    let store = shared.native_da.read().unwrap();
+                    plan_prewarm_requests(&request.payload[1..], store.as_ref())
+                };
+                match plan {
                     Some(chunks) => {
                         let count: usize = chunks.iter().map(|c| c.len()).sum();
                         for hashes in chunks {
@@ -863,9 +936,11 @@ fn handle_event(
                                 .native_da
                                 .send_request(&peer, NativeDaNetRequest { hashes });
                         }
-                        tracing::info!(count, %peer, "pre-proposal HASH manifest -> pre-warm pull from proposer");
+                        tracing::info!(count, %peer, "pre-proposal HASH manifest -> pre-warm pull of MISSING bodies from proposer");
                     }
-                    None => warn!(%peer, "pre-proposal hash manifest decode failed -- no pre-warm"),
+                    // All bodies already local (ingest push / gossip mirror beat the
+                    // manifest), or empty/malformed (logged inside the planner).
+                    None => debug!(%peer, "pre-proposal hash manifest: nothing to pre-warm"),
                 }
             } else if request.payload.first() == Some(&FORWARD_ACTION_MARKER) {
                 let action_bytes = &request.payload[1..];
@@ -1052,24 +1127,49 @@ fn handle_event(
             peer,
             ..
         })) => {
-            // Validator-set peers exempt (s350 FIX B): empty DA responses to a
-            // validator make its pull-fallback fail and veto valid proposals
-            // (s339: val1's 16 unrecovered pulls each broke a view's quorum).
-            let bodies = if should_drop_banned_gossip(&mut *peer_scoring, shared, &peer) {
-                vec![Vec::new(); request.hashes.len()]
+            // Banned peers (validator-set peers exempt, s350 FIX B: empty DA
+            // responses to a validator make its pull-fallback fail and veto valid
+            // proposals — s339: val1's 16 unrecovered pulls each broke a view's
+            // quorum) and pool overload both answer all-empty inline; the
+            // requester retries/rotates.
+            let banned = should_drop_banned_gossip(&mut *peer_scoring, shared, &peer);
+            let overloaded = !banned && !da_serve.try_admit();
+            if banned || overloaded {
+                if overloaded {
+                    debug!(%peer, "native-da serve pool at capacity — answering empty");
+                    if let Some(ref m) = shared.metrics {
+                        m.native_da_serve_dropped.inc();
+                    }
+                }
+                let bodies = vec![Vec::new(); request.hashes.len()];
+                if swarm
+                    .behaviour_mut()
+                    .native_da
+                    .send_response(channel, NativeDaNetResponse { bodies })
+                    .is_err()
+                {
+                    warn!(%peer, "native-da send_response FAILED (channel dead)");
+                }
             } else {
-                let store = shared.native_da.read().unwrap();
-                serve_native_da_bodies(store.as_ref(), &request.hashes)
-            };
-            let found = bodies.iter().filter(|b| !b.is_empty()).count();
-            debug!(%peer, requested = request.hashes.len(), found, "native-da request: serving bodies");
-            if swarm
-                .behaviour_mut()
-                .native_da
-                .send_response(channel, NativeDaNetResponse { bodies })
-                .is_err()
-            {
-                warn!(%peer, "native-da send_response FAILED (channel dead)");
+                // Off-loop serve (#6 fix A): the body reads are RocksDB point-gets
+                // of multi-KB values — served inline they queue the consensus
+                // event loop behind DA traffic (S387: manifest-mode pull storms
+                // starved the loop and every pull timed out unserved). The bounded
+                // blocking task posts its response back through the loop's select.
+                let store = shared.native_da.read().unwrap().clone();
+                let metrics = shared.metrics.clone();
+                let tx = da_serve.tx.clone();
+                let inflight = Arc::clone(&da_serve.inflight);
+                tokio::task::spawn_blocking(move || {
+                    let bodies = serve_native_da_bodies(store.as_ref(), &request.hashes);
+                    let found = bodies.iter().filter(|b| !b.is_empty()).count();
+                    debug!(%peer, requested = request.hashes.len(), found, "native-da request: serving bodies");
+                    if let Some(ref m) = metrics {
+                        m.native_da_served.inc();
+                    }
+                    let _ = tx.send((channel, NativeDaNetResponse { bodies }, peer));
+                    inflight.fetch_sub(1, Ordering::Relaxed);
+                });
             }
         }
         // Native-DA fetch protocol: inbound response — queue bodies for the
@@ -1364,13 +1464,38 @@ const MAX_PREWARM_HASHES: usize = 100_000;
 /// per-request hash chunks (≤ `NATIVE_DA_FETCH_CHUNK`) for the pre-warm pull (Phase 2.3 #5).
 /// `None` on a malformed, empty, or over-cap manifest — nothing is pulled, so the node falls
 /// back to the hot-path pull when the CompactBlock arrives.
-fn plan_prewarm_requests(body: &[u8]) -> Option<Vec<Vec<[u8; 32]>>> {
-    let hashes: Vec<[u8; 32]> = bincode::deserialize(body).ok()?;
-    if hashes.is_empty() || hashes.len() > MAX_PREWARM_HASHES {
+fn plan_prewarm_requests(
+    body: &[u8],
+    store: Option<&NativeDaStore>,
+) -> Option<Vec<Vec<[u8; 32]>>> {
+    let Ok(hashes) = bincode::deserialize::<Vec<[u8; 32]>>(body) else {
+        warn!("pre-proposal hash manifest decode failed -- no pre-warm");
+        return None;
+    };
+    if hashes.is_empty() {
+        return None;
+    }
+    if hashes.len() > MAX_PREWARM_HASHES {
+        warn!(count = hashes.len(), "pre-proposal hash manifest over cap -- no pre-warm");
+        return None;
+    }
+    // Pull ONLY what we don't already hold (#6 fix C): ingest pushes + the gossip
+    // mirror land most bodies before the manifest arrives, and re-pulling them
+    // turned the pre-warm into an N×(whole block) pull storm at the proposer
+    // (S387 soft wedge). A store read error counts as missing — one redundant
+    // pull beats a body-less block.
+    let missing: Vec<[u8; 32]> = match store {
+        Some(s) => hashes
+            .into_iter()
+            .filter(|h| !s.contains(h).unwrap_or(false))
+            .collect(),
+        None => hashes,
+    };
+    if missing.is_empty() {
         return None;
     }
     Some(
-        hashes
+        missing
             .chunks(crate::bridge::NATIVE_DA_FETCH_CHUNK)
             .map(|c| c.to_vec())
             .collect(),
@@ -1697,7 +1822,8 @@ mod tests {
         let hashes: Vec<[u8; 32]> = (0..40u8).map(|i| [i; 32]).collect();
         let body = bincode::serialize(&hashes).unwrap();
 
-        let chunks = plan_prewarm_requests(&body).expect("a valid manifest yields chunks");
+        // No store attached (`None`) => pull every manifest hash, as before.
+        let chunks = plan_prewarm_requests(&body, None).expect("a valid manifest yields chunks");
         assert_eq!(chunks.len(), hashes.len().div_ceil(chunk), "ceil(40/16) = 3 chunks");
         assert!(
             chunks.iter().all(|c| (1..=chunk).contains(&c.len())),
@@ -1705,13 +1831,13 @@ mod tests {
         );
         assert_eq!(chunks.concat(), hashes, "every hash covered exactly once, in order");
 
-        assert!(plan_prewarm_requests(b"\x00\x01not-bincode").is_none(), "garbage -> no pull");
+        assert!(plan_prewarm_requests(b"\x00\x01not-bincode", None).is_none(), "garbage -> no pull");
         let empty = bincode::serialize::<Vec<[u8; 32]>>(&vec![]).unwrap();
-        assert!(plan_prewarm_requests(&empty).is_none(), "empty manifest -> no pull");
+        assert!(plan_prewarm_requests(&empty, None).is_none(), "empty manifest -> no pull");
 
         // Review F6: a manifest exceeding the defensive cap is rejected (no pre-warm fan).
         let over_cap = bincode::serialize(&vec![[0u8; 32]; MAX_PREWARM_HASHES + 1]).unwrap();
-        assert!(plan_prewarm_requests(&over_cap).is_none(), "over-cap manifest -> no pull");
+        assert!(plan_prewarm_requests(&over_cap, None).is_none(), "over-cap manifest -> no pull");
     }
 
     /// EVM direct-to-leader forward (Option B), RED first: the EVM forward marker must not
@@ -2239,5 +2365,101 @@ mod tests {
             missing.len()
         );
         assert_eq!(reconstructed.len(), N_BODIES, "all 100 distinct bodies recovered");
+    }
+
+    /// #6 fix A: the off-loop DA serve pool admits at most `MAX_DA_SERVE_INFLIGHT`
+    /// jobs at once — the (MAX+1)th `try_admit` fails (its request arm answers
+    /// all-empty), and releasing a slot re-opens exactly one admission. This is the
+    /// backpressure that stops a pull storm from queueing serves unboundedly (S387).
+    #[test]
+    fn da_serve_pool_bounds_inflight() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let pool = DaServePool::new(tx);
+
+        // Admit exactly the cap, then refuse the next.
+        for i in 0..MAX_DA_SERVE_INFLIGHT {
+            assert!(pool.try_admit(), "admission {i} within the cap must succeed");
+        }
+        assert!(!pool.try_admit(), "admission past the cap must fail (answer empty inline)");
+
+        // A running job releasing its slot re-opens exactly one admission.
+        pool.inflight.fetch_sub(1, Ordering::Relaxed);
+        assert!(pool.try_admit(), "a freed slot re-opens one admission");
+        assert!(!pool.try_admit(), "and only one — back at the cap");
+    }
+
+    /// #6 fix C: the pre-warm plan pulls ONLY the bodies not already in the DA store.
+    /// Ingest pushes + the gossip mirror land most bodies before the manifest arrives,
+    /// so re-pulling them turned the pre-warm into an N×(whole block) pull storm at the
+    /// proposer (S387 soft wedge). Present hashes are filtered out; the missing set is
+    /// returned in order, chunked ≤ `NATIVE_DA_FETCH_CHUNK`.
+    #[test]
+    fn prewarm_pulls_only_missing_bodies() {
+        use torus_state::cf::CF_NATIVE_PENDING;
+        use torus_state::db::StateDb;
+        use torus_state::NativeDaStore;
+        let chunk = crate::bridge::NATIVE_DA_FETCH_CHUNK;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = StateDb::open(dir.path()).expect("open db");
+        let hashes: Vec<[u8; 32]> = (0..40u8).map(|i| [i; 32]).collect();
+        // Seed the FIRST 25 as present; the last 15 stay missing.
+        for h in &hashes[..25] {
+            db.put_cf_raw(CF_NATIVE_PENDING, h, b"body-bytes").expect("seed present body");
+        }
+        let store = NativeDaStore::new(db);
+
+        let body = bincode::serialize(&hashes).unwrap();
+        let chunks =
+            plan_prewarm_requests(&body, Some(&store)).expect("15 missing -> a plan");
+        assert!(
+            chunks.iter().all(|c| (1..=chunk).contains(&c.len())),
+            "each chunk carries 1..=NATIVE_DA_FETCH_CHUNK hashes"
+        );
+        let flat: Vec<[u8; 32]> = chunks.concat();
+        assert_eq!(
+            flat,
+            hashes[25..].to_vec(),
+            "pulls exactly the 15 missing hashes, order preserved"
+        );
+    }
+
+    /// #6 fix C: when every manifest hash is already local, there is nothing to
+    /// pre-warm — the plan is `None` (no pull fired, no storm at the proposer).
+    #[test]
+    fn prewarm_all_local_returns_none() {
+        use torus_state::cf::CF_NATIVE_PENDING;
+        use torus_state::db::StateDb;
+        use torus_state::NativeDaStore;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = StateDb::open(dir.path()).expect("open db");
+        let hashes: Vec<[u8; 32]> = (0..40u8).map(|i| [i; 32]).collect();
+        for h in &hashes {
+            db.put_cf_raw(CF_NATIVE_PENDING, h, b"body-bytes").expect("seed present body");
+        }
+        let store = NativeDaStore::new(db);
+
+        let body = bincode::serialize(&hashes).unwrap();
+        assert!(
+            plan_prewarm_requests(&body, Some(&store)).is_none(),
+            "all bodies local -> nothing to pre-warm"
+        );
+    }
+
+    /// #6 fix C: with no store attached (`None`) the planner cannot check presence, so
+    /// it conservatively pulls every hash — the pre-fix behaviour, still chunked.
+    #[test]
+    fn prewarm_without_store_pulls_all() {
+        let chunk = crate::bridge::NATIVE_DA_FETCH_CHUNK;
+        let hashes: Vec<[u8; 32]> = (0..40u8).map(|i| [i; 32]).collect();
+        let body = bincode::serialize(&hashes).unwrap();
+
+        let chunks = plan_prewarm_requests(&body, None).expect("no store -> pull all");
+        assert!(
+            chunks.iter().all(|c| (1..=chunk).contains(&c.len())),
+            "each chunk carries 1..=NATIVE_DA_FETCH_CHUNK hashes"
+        );
+        assert_eq!(chunks.concat(), hashes, "all 40 hashes pulled, order preserved");
     }
 }

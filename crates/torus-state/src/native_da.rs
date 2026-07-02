@@ -73,4 +73,37 @@ impl NativeDaStore {
         }
         Ok(())
     }
+
+    /// Presence check by action-hash WITHOUT copying the body. The pre-warm pull
+    /// filter calls this once per manifest hash, so it must not pay `get_raw`'s
+    /// multi-KB value copy just to test existence.
+    pub fn contains(&self, hash: &[u8; 32]) -> Result<bool, StateError> {
+        self.db.exists_cf_raw(CF_NATIVE_PENDING, hash.as_slice())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_store() -> (tempfile::TempDir, NativeDaStore) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = StateDb::open(dir.path()).expect("open temp StateDb");
+        (dir, NativeDaStore::new(db))
+    }
+
+    /// `contains` must reflect raw presence in CF_NATIVE_PENDING without needing
+    /// a decodable body (the serve path also ships raw bytes verbatim).
+    #[test]
+    fn contains_reflects_put_and_absent() {
+        let (_dir, store) = temp_store();
+        let present = [7u8; 32];
+        let absent = [9u8; 32];
+        store
+            .db
+            .put_cf_raw(CF_NATIVE_PENDING, &present, b"body-bytes")
+            .expect("raw put");
+        assert!(store.contains(&present).expect("contains present"));
+        assert!(!store.contains(&absent).expect("contains absent"));
+    }
 }

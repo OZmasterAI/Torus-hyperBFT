@@ -127,6 +127,14 @@ pub struct Metrics {
     pub native_da_pull_requests: Counter,
     /// Native-DA pull-fallbacks that recovered all missing bodies in-call (Task 6).
     pub native_da_pull_recovered: Counter,
+    /// Native-DA pull requests this node SERVED (off-loop, #6 fix A). The serve
+    /// side was previously invisible at info level — S387's `serving=0` false
+    /// signal. served + serve_dropped ≈ inbound pull requests seen.
+    pub native_da_served: Counter,
+    /// Native-DA serves answered all-empty because the bounded serve pool was at
+    /// capacity (requester retries/rotates). A sustained rate = raise the pool
+    /// cap or the pull storm is back.
+    pub native_da_serve_dropped: Counter,
 
     // Exec-ceiling Option A (s351) — phase decomposition of the execution
     // thread. Phase histograms observe only when a block enters the native
@@ -471,6 +479,20 @@ impl Metrics {
             native_da_pull_recovered.clone(),
         );
 
+        let native_da_served = Counter::default();
+        registry.register(
+            "torus_native_da_served",
+            "Native-DA pull requests this node served (off-loop serve pool)",
+            native_da_served.clone(),
+        );
+
+        let native_da_serve_dropped = Counter::default();
+        registry.register(
+            "torus_native_da_serve_dropped",
+            "Native-DA serves answered all-empty because the serve pool was at capacity",
+            native_da_serve_dropped.clone(),
+        );
+
         let exec_verify_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
         registry.register(
             "torus_exec_verify_seconds",
@@ -588,6 +610,8 @@ impl Metrics {
             missing_action_rejections,
             native_da_pull_requests,
             native_da_pull_recovered,
+            native_da_served,
+            native_da_serve_dropped,
             exec_verify_seconds,
             exec_replay_guard_seconds,
             exec_engine_seconds,
