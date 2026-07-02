@@ -95,11 +95,35 @@ pub const NATIVE_DA_FETCH_CHUNK: usize = 16;
 /// rejects an oversized batch. Tunable — validated/adjusted by the bs-sweep (Phase 2.3 #5).
 pub const HASH_ONLY_PUSH_THRESHOLD: usize = 512 * 1024; // 512 KB
 
+/// Effective manifest threshold: `TORUS_HASH_ONLY_PUSH_THRESHOLD` (bytes) overrides the
+/// compiled default PER NODE, read once at first use. TRANSPORT-ONLY and safe to A/B on a
+/// single validator without coordination: receivers handle both push forms (body batch
+/// 0xFD / hash manifest 0xFC) regardless of what any proposer chose, so the flag can never
+/// split consensus. Exists for the S387 follow-up — with serves off-loop and pre-warm
+/// pulling only missing bodies, the 512 KB default is likely too eager, but a raise must be
+/// measured on WAN (the view-timeout wedge it guards against is bandwidth-bound, mem
+/// f58957c6) — this makes that sweep a restart, not a rebuild/redeploy.
+fn hash_only_push_threshold() -> usize {
+    static THRESHOLD: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *THRESHOLD.get_or_init(|| {
+        std::env::var("TORUS_HASH_ONLY_PUSH_THRESHOLD")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(HASH_ONLY_PUSH_THRESHOLD)
+    })
+}
+
 /// Whether a pre-proposal push of `encoded_len` bytes (the bincoded action bodies) should
 /// ship HASHES only and let validators pull the bodies (Phase 2.3 #5). Boundary is
 /// exclusive: exactly at the threshold still uses the full-body push.
 pub fn should_push_hashes_only(encoded_len: usize) -> bool {
-    encoded_len > HASH_ONLY_PUSH_THRESHOLD
+    should_push_hashes_only_at(encoded_len, hash_only_push_threshold())
+}
+
+/// Pure decision seam for [`should_push_hashes_only`], split out so the boundary is
+/// unit-testable at any threshold without touching process env.
+fn should_push_hashes_only_at(encoded_len: usize, threshold: usize) -> bool {
+    encoded_len > threshold
 }
 
 impl LibP2PNetwork {
@@ -566,5 +590,22 @@ mod tests {
             HASH_ONLY_PUSH_THRESHOLD < 4 * 1024 * 1024,
             "gate must engage BELOW the 4 MB /torus/direct cap"
         );
+    }
+
+    /// S387 follow-up: the manifest gate honors a per-node override threshold via the
+    /// pure seam (`TORUS_HASH_ONLY_PUSH_THRESHOLD` routes here; OnceLock env state
+    /// itself is process-wide, so the boundary is tested threshold-parameterized).
+    #[test]
+    fn hash_only_gate_boundary_holds_at_any_threshold() {
+        for threshold in [0usize, 1, HASH_ONLY_PUSH_THRESHOLD, 2 * 1024 * 1024] {
+            assert!(
+                !should_push_hashes_only_at(threshold, threshold),
+                "at threshold {threshold} stays full-body (exclusive boundary)"
+            );
+            assert!(
+                should_push_hashes_only_at(threshold + 1, threshold),
+                "above threshold {threshold} ships hashes only"
+            );
+        }
     }
 }
