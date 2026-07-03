@@ -1,0 +1,11 @@
+services:
+  validator-0:
+    image: torus-devnet-node:ab-s395
+  validator-1:
+    image: torus-devnet-node:ab-s395
+  validator-2:
+    image: torus-devnet-node:ab-s395
+  validator-3:
+    image: torus-devnet-node:ab-s395
+  rpc-node:
+    image: torus-devnet-node:ab-s395

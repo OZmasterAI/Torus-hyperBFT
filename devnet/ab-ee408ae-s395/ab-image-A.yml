@@ -1,0 +1,11 @@
+services:
+  validator-0:
+    image: torus-devnet-node:ab-ee408ae
+  validator-1:
+    image: torus-devnet-node:ab-ee408ae
+  validator-2:
+    image: torus-devnet-node:ab-ee408ae
+  validator-3:
+    image: torus-devnet-node:ab-ee408ae
+  rpc-node:
+    image: torus-devnet-node:ab-ee408ae

@@ -1,0 +1,15 @@
+phase             Δsum s  Δcount    ms/blk  share%
+verify             1.314       3    437.98    35.2
+replay_guard       0.008       3      2.66     0.2
+engine             0.777       3    259.13    20.8
+phase_margin       0.216       3     72.04     5.8
+phase_match        0.438       3    146.13    11.7
+phase_settle       0.020       3      6.59     0.5
+save_books         0.000       3      0.01     0.0
+flush              0.301       3    100.34     8.1
+residual           0.660                      17.7
+TOTAL block        3.735     398      9.38   100.0
+
+actions processed: 166 | blocks committed: 398 | actions/native-blk: 0
+block_build: 130 obs, 49.76 ms/blk (leader-only)
+exec_queue_depth now: 0

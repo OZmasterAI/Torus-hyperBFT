@@ -1,0 +1,117 @@
+=== Torus Throughput Benchmark ===
+Mode: consensus
+Sign mode: eip712 (secp256k1 ecrecover per action)
+Duration: 60s
+Senders: 20 (offset 0)
+Batch size: 100 order(s)/action
+Submit batch: 100 action(s)/RPC call
+RPC endpoints: 4
+Pre-sign: 16 batches/sender (1600 actions/sender, signed before the clock)
+Rate: 20 actions/s/sender (paced fire)
+
+Pre-signing 16 payloads x 20 senders...
+Pre-signed 32000 actions in 40.6s
+[2s] submitted: 100 actions (53/s) | included: 0 actions (0/s) | orders ~0/s | blk: #472 | 176ms/blk
+[2s] submitted: 200 actions (83/s) | included: 0 actions (0/s) | orders ~0/s | blk: #473 | 266ms/blk
+[3s] submitted: 200 actions (67/s) | included: 0 actions (0/s) | orders ~0/s | blk: #473 | 266ms/blk
+[4s] submitted: 200 actions (57/s) | included: 0 actions (0/s) | orders ~0/s | blk: #473 | 266ms/blk
+[4s] submitted: 200 actions (50/s) | included: 0 actions (0/s) | orders ~0/s | blk: #473 | 266ms/blk
+[5s] submitted: 400 actions (87/s) | included: 0 actions (0/s) | orders ~0/s | blk: #473 | 266ms/blk
+[5s] submitted: 500 actions (98/s) | included: 0 actions (0/s) | orders ~0/s | blk: #474 | 511ms/blk
+[7s] submitted: 1,300 actions (189/s) | included: 0 actions (0/s) | orders ~0/s | blk: #474 | 511ms/blk
+[7s] submitted: 1,700 actions (227/s) | included: 0 actions (0/s) | orders ~0/s | blk: #474 | 511ms/blk
+[8s] submitted: 1,800 actions (225/s) | included: 0 actions (0/s) | orders ~0/s | blk: #474 | 511ms/blk
+[9s] submitted: 1,800 actions (209/s) | included: 0 actions (0/s) | orders ~0/s | blk: #474 | 511ms/blk
+[9s] submitted: 2,300 actions (252/s) | included: 0 actions (0/s) | orders ~0/s | blk: #475 | 828ms/blk
+[10s] submitted: 3,100 actions (317/s) | included: 0 actions (0/s) | orders ~0/s | blk: #475 | 828ms/blk
+[11s] submitted: 3,500 actions (310/s) | included: 0 actions (0/s) | orders ~0/s | blk: #475 | 828ms/blk
+[12s] submitted: 3,900 actions (325/s) | included: 1 actions (0/s) | orders ~8/s | blk: #476 | 992ms/blk
+[13s] submitted: 4,000 actions (317/s) | included: 1 actions (0/s) | orders ~8/s | blk: #476 | 992ms/blk
+[13s] submitted: 4,000 actions (305/s) | included: 1 actions (0/s) | orders ~8/s | blk: #476 | 992ms/blk
+[14s] submitted: 4,100 actions (301/s) | included: 1 actions (0/s) | orders ~7/s | blk: #476 | 992ms/blk
+[14s] submitted: 4,200 actions (296/s) | included: 1 actions (0/s) | orders ~7/s | blk: #476 | 992ms/blk
+[15s] submitted: 4,300 actions (290/s) | included: 1 actions (0/s) | orders ~7/s | blk: #476 | 992ms/blk
+[16s] submitted: 4,900 actions (308/s) | included: 1 actions (0/s) | orders ~6/s | blk: #476 | 992ms/blk
+[17s] submitted: 5,100 actions (307/s) | included: 1 actions (0/s) | orders ~6/s | blk: #476 | 992ms/blk
+[17s] submitted: 5,400 actions (316/s) | included: 1 actions (0/s) | orders ~6/s | blk: #476 | 992ms/blk
+[18s] submitted: 5,400 actions (301/s) | included: 1 actions (0/s) | orders ~6/s | blk: #476 | 992ms/blk
+[18s] submitted: 5,400 actions (293/s) | included: 1 actions (0/s) | orders ~5/s | blk: #476 | 992ms/blk
+[20s] submitted: 6,300 actions (322/s) | included: 1 actions (0/s) | orders ~5/s | blk: #476 | 992ms/blk
+[21s] submitted: 7,500 actions (359/s) | included: 1 actions (0/s) | orders ~5/s | blk: #476 | 992ms/blk
+[submit] http: error sending request for url (http://localhost:8547/)
+[22s] submitted: 7,900 actions (367/s) | included: 1 actions (0/s) | orders ~5/s | blk: #476 | 992ms/blk
+[22s] submitted: 7,900 actions (358/s) | included: 1 actions (0/s) | orders ~5/s | blk: #476 | 992ms/blk
+[23s] submitted: 7,900 actions (348/s) | included: 1 actions (0/s) | orders ~4/s | blk: #476 | 992ms/blk
+[23s] submitted: 7,900 actions (340/s) | included: 1 actions (0/s) | orders ~4/s | blk: #476 | 992ms/blk
+[24s] submitted: 8,200 actions (336/s) | included: 1 actions (0/s) | orders ~4/s | blk: #476 | 992ms/blk
+[25s] submitted: 8,800 actions (346/s) | included: 1 actions (0/s) | orders ~4/s | blk: #476 | 992ms/blk
+[27s] submitted: 9,700 actions (362/s) | included: 1 actions (0/s) | orders ~4/s | blk: #476 | 992ms/blk
+[27s] submitted: 9,900 actions (361/s) | included: 1 actions (0/s) | orders ~4/s | blk: #476 | 992ms/blk
+[28s] submitted: 10,000 actions (357/s) | included: 1 actions (0/s) | orders ~4/s | blk: #476 | 992ms/blk
+[29s] submitted: 10,100 actions (351/s) | included: 1 actions (0/s) | orders ~3/s | blk: #476 | 992ms/blk
+[29s] submitted: 10,100 actions (343/s) | included: 1 actions (0/s) | orders ~3/s | blk: #476 | 992ms/blk
+[30s] submitted: 10,100 actions (338/s) | included: 1 actions (0/s) | orders ~3/s | blk: #476 | 992ms/blk
+[31s] submitted: 10,200 actions (329/s) | included: 1 actions (0/s) | orders ~3/s | blk: #476 | 992ms/blk
+[32s] submitted: 10,500 actions (328/s) | included: 1 actions (0/s) | orders ~3/s | blk: #476 | 992ms/blk
+[33s] submitted: 10,700 actions (329/s) | included: 1 actions (0/s) | orders ~3/s | blk: #476 | 992ms/blk
+[33s] submitted: 10,900 actions (329/s) | included: 1 actions (0/s) | orders ~3/s | blk: #476 | 992ms/blk
+[34s] submitted: 11,100 actions (328/s) | included: 1 actions (0/s) | orders ~3/s | blk: #476 | 992ms/blk
+[34s] submitted: 11,100 actions (322/s) | included: 1 actions (0/s) | orders ~3/s | blk: #476 | 992ms/blk
+[35s] submitted: 11,100 actions (315/s) | included: 1 actions (0/s) | orders ~3/s | blk: #476 | 992ms/blk
+[submit] http: error sending request for url (http://localhost:8547/)
+[submit] http: error sending request for url (http://localhost:8547/)
+[submit] http: error sending request for url (http://localhost:8547/)
+[submit] http: error sending request for url (http://localhost:8547/)
+[37s] submitted: 11,500 actions (314/s) | included: 1 actions (0/s) | orders ~3/s | blk: #476 | 992ms/blk
+[37s] submitted: 12,100 actions (323/s) | included: 1 actions (0/s) | orders ~3/s | blk: #476 | 992ms/blk
+[38s] submitted: 12,500 actions (328/s) | included: 1 actions (0/s) | orders ~3/s | blk: #476 | 992ms/blk
+[39s] submitted: 12,700 actions (328/s) | included: 1 actions (0/s) | orders ~3/s | blk: #476 | 992ms/blk
+[39s] submitted: 12,700 actions (324/s) | included: 1 actions (0/s) | orders ~3/s | blk: #476 | 992ms/blk
+[40s] submitted: 12,700 actions (320/s) | included: 1 actions (0/s) | orders ~3/s | blk: #476 | 992ms/blk
+[41s] submitted: 12,700 actions (313/s) | included: 1 actions (0/s) | orders ~2/s | blk: #476 | 992ms/blk
+[41s] submitted: 12,800 actions (310/s) | included: 1 actions (0/s) | orders ~2/s | blk: #476 | 992ms/blk
+[42s] submitted: 12,800 actions (306/s) | included: 1 actions (0/s) | orders ~2/s | blk: #476 | 992ms/blk
+[42s] submitted: 12,900 actions (304/s) | included: 1 actions (0/s) | orders ~2/s | blk: #476 | 992ms/blk
+[43s] submitted: 12,900 actions (300/s) | included: 1 actions (0/s) | orders ~2/s | blk: #476 | 992ms/blk
+[44s] submitted: 12,900 actions (296/s) | included: 1 actions (0/s) | orders ~2/s | blk: #476 | 992ms/blk
+[44s] submitted: 12,900 actions (293/s) | included: 1 actions (0/s) | orders ~2/s | blk: #476 | 992ms/blk
+[45s] submitted: 12,900 actions (289/s) | included: 1 actions (0/s) | orders ~2/s | blk: #476 | 992ms/blk
+[46s] submitted: 14,800 actions (321/s) | included: 1 actions (0/s) | orders ~2/s | blk: #476 | 992ms/blk
+[47s] submitted: 15,500 actions (330/s) | included: 1 actions (0/s) | orders ~2/s | blk: #476 | 992ms/blk
+[48s] submitted: 15,500 actions (326/s) | included: 1 actions (0/s) | orders ~2/s | blk: #476 | 992ms/blk
+[48s] submitted: 15,500 actions (321/s) | included: 1 actions (0/s) | orders ~2/s | blk: #476 | 992ms/blk
+[49s] submitted: 15,500 actions (317/s) | included: 1 actions (0/s) | orders ~2/s | blk: #476 | 992ms/blk
+[50s] submitted: 15,500 actions (312/s) | included: 1 actions (0/s) | orders ~2/s | blk: #476 | 992ms/blk
+[51s] submitted: 16,118 actions (319/s) | included: 1 actions (0/s) | orders ~2/s | blk: #476 | 992ms/blk
+[51s] submitted: 16,283 actions (317/s) | included: 1 actions (0/s) | orders ~2/s | blk: #476 | 992ms/blk
+[52s] submitted: 16,283 actions (314/s) | included: 1 actions (0/s) | orders ~2/s | blk: #476 | 992ms/blk
+[52s] submitted: 16,283 actions (311/s) | included: 1 actions (0/s) | orders ~2/s | blk: #476 | 992ms/blk
+[53s] submitted: 16,283 actions (307/s) | included: 1 actions (0/s) | orders ~2/s | blk: #476 | 992ms/blk
+[54s] submitted: 16,283 actions (304/s) | included: 1 actions (0/s) | orders ~2/s | blk: #476 | 992ms/blk
+[54s] submitted: 16,283 actions (301/s) | included: 1 actions (0/s) | orders ~2/s | blk: #476 | 992ms/blk
+[55s] submitted: 16,283 actions (298/s) | included: 1 actions (0/s) | orders ~2/s | blk: #476 | 992ms/blk
+[56s] submitted: 16,283 actions (292/s) | included: 1 actions (0/s) | orders ~2/s | blk: #476 | 992ms/blk
+[56s] submitted: 16,283 actions (288/s) | included: 1 actions (0/s) | orders ~2/s | blk: #476 | 992ms/blk
+[57s] submitted: 16,283 actions (286/s) | included: 1 actions (0/s) | orders ~2/s | blk: #476 | 992ms/blk
+[58s] submitted: 16,283 actions (283/s) | included: 1 actions (0/s) | orders ~2/s | blk: #476 | 992ms/blk
+[58s] submitted: 16,283 actions (281/s) | included: 1 actions (0/s) | orders ~2/s | blk: #476 | 992ms/blk
+[59s] submitted: 16,283 actions (278/s) | included: 1 actions (0/s) | orders ~2/s | blk: #476 | 992ms/blk
+[59s] submitted: 16,283 actions (275/s) | included: 1 actions (0/s) | orders ~2/s | blk: #476 | 992ms/blk
+[60s] submitted: 16,283 actions (273/s) | included: 1 actions (0/s) | orders ~2/s | blk: #476 | 992ms/blk
+[61s] submitted: 16,283 actions (265/s) | included: 1 actions (0/s) | orders ~2/s | blk: #476 | 992ms/blk
+[62s] submitted: 16,283 actions (263/s) | included: 1 actions (0/s) | orders ~2/s | blk: #476 | 992ms/blk
+[63s] submitted: 16,283 actions (260/s) | included: 1 actions (0/s) | orders ~2/s | blk: #476 | 992ms/blk
+[63s] submitted: 16,283 actions (258/s) | included: 1 actions (0/s) | orders ~2/s | blk: #476 | 992ms/blk
+[64s] submitted: 16,283 actions (256/s) | included: 1 actions (0/s) | orders ~2/s | blk: #476 | 992ms/blk
+[drain] +165 actions in blocks #477..#478 (executor catching up)
+
+--- Results ---
+Submitted:  16,283 native actions (256/s)
+Included:   166 unique native actions (3/s) [166 slots, dup x1.00]
+Orders:     16,600 orders (261/s)  [actions x100 batch]
+Drop rate:  99.0%
+Block time: 992ms avg
+Blocks:     14 with bodies in #465..#478, 11 avg native/block
+
+Peak:       3/s included (block #478, 100 actions)
+Sustained:  261 orders/s (3 actions/s) over 60s
