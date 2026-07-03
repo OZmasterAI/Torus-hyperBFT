@@ -11,15 +11,23 @@ files and build.
 - Core mechanism: per-block EVM **gas budget** passed to the drain
   (`EvmPool::drain` is already gas-budgeted — `evm_pool.rs:319-370`,
   `lib.rs:284-294`, consumed at `torus-consensus/src/app.rs:1316`).
-- Initial budget **15_000_000** (half the 30M block gas limit),
+- Initial budget **5_000_000** (conservative debut; S392 amendment — was 15M),
   **env-overridable** (same pattern as `TORUS_HASH_ONLY_PUSH_THRESHOLD`).
+  The bench earns the raise: run the acceptance bench with the override at
+  **15_000_000** (half the 30M block gas limit) and promote that to the
+  default only if it holds. Context: the deleted `EVM_TOTAL_BLOCK_CAP=20`
+  was the view-timeout guard (`rate_limit.rs:29-30`); 15M is ~5x cap-20
+  worst-case swap exec, and EVM exec runs on the commit path sequentially
+  before native exec (`app.rs:255-324`).
 - Per-sender share cap ~**25% of the block's EVM gas budget**, behind a
   **config flag: ON for testnet, OFF for mainnet** (mainnet = pure gas budget,
   Ethereum-style; the share cap is only a faucet-era spam guard).
 - Also DELETE the dormant `RateTracker` 50/100-blocks window
   (`rate_limit.rs:19`; its `notify_block_committed` feed is test-only).
 - Keep the anti-MEV shuffle (`evm_pool.rs:75-84`) and fee-ordered k-way merge.
-- Acceptance: devnet swap-load bench fits exec budget; >100 swaps/block land.
+- Acceptance: mixed-load bench (native bs400 + swap load) at the 15M override
+  keeps commit_interval / view_duration / exec_verify_seconds flat vs the
+  native-only baseline, and >100 swaps/block land; then raise default 5M->15M.
 
 ## D2 — eth_call / estimateGas: standard geth semantics
 - Simulation path (call-only executor config): `disable_base_fee` +
