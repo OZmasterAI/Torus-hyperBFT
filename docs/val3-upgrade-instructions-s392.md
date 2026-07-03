@@ -1,4 +1,4 @@
-# val3 upgrade instructions — S395 (3989416)
+# val3 upgrade instructions — S395 (code tip 69f0a99)
 
 Copy-paste for the val3 operator (3rd validator, self-hosted). Supersedes the
 S392/b96f058 instructions (never run) and the earlier fa7791d ones — this
@@ -59,7 +59,7 @@ matters for block dissemination):
   gossip):
 
   ```
-  --p2p-peers /ip4/95.111.231.121/udp/30333/quic-v1/p2p/12D3KooWFSJjbJhn6H92v7FbPGWXoCWLQFhH4koG56mS7Ps7KGPu,/ip4/84.32.108.220/udp/30333/quic-v1/p2p/12D3KooWK5QYy1chfBmWpk6kfu9KTpq4rqfnRkXFuXmAc4DCPUze
+  --p2p-peers /ip4/95.111.231.121/udp/30333/quic-v1/p2p/12D3KooWQeKf21QBchGQUr25U6w6yNB4P78PPQZivhHRAqFnMK24,/ip4/84.32.108.220/udp/30333/quic-v1/p2p/12D3KooWK5QYy1chfBmWpk6kfu9KTpq4rqfnRkXFuXmAc4DCPUze
   ```
 
 - make sure you're NOT passing `--native-gossip=false`
