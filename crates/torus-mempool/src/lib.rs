@@ -50,17 +50,14 @@ pub struct MempoolConfig {
     /// below the current base fee are rejected. Updated from committed headers
     /// via [`Mempool::set_base_fee`]; 1 gwei matches the frozen chain base fee.
     pub initial_base_fee: u64,
-    // ---- Rate limiting (Task 3.1.4) ----
-    /// Sliding window size in blocks for rate tracking.
-    pub rate_window_blocks: u64,
-    /// Max EVM txs per sender within the rate window.
-    pub evm_rate_limit_per_window: u32,
-    /// Max native actions per sender within the rate window.
-    pub native_rate_limit_per_window: u32,
-    /// Max EVM txs per sender per block.
-    pub evm_per_block_cap: usize,
-    /// Max total EVM txs per block (all senders combined).
-    pub evm_total_block_cap: usize,
+    // ---- Block-space budgets (D1, S392) ----
+    /// Per-block EVM gas budget for drain selection. 5M debut default;
+    /// `TORUS_EVM_BLOCK_GAS_BUDGET` env override. The acceptance bench at 15M
+    /// earns the raise (docs/plans/evm-blocker-set-decisions.md D1).
+    pub evm_block_gas_budget: u64,
+    /// Per-sender share of the EVM gas budget, in percent. 0 disables
+    /// (mainnet = pure gas budget); `TORUS_EVM_SENDER_SHARE_PCT` env override.
+    pub evm_sender_share_pct: u32,
     /// Max native actions per sender per block.
     pub native_per_block_cap: usize,
     /// Max total native pool size.
@@ -83,11 +80,8 @@ impl Default for MempoolConfig {
             chain_id: torus_types::eip712::TORUS_CHAIN_ID,
             block_gas_limit: 30_000_000,
             initial_base_fee: 1_000_000_000,
-            rate_window_blocks: rate_limit::RATE_WINDOW_BLOCKS,
-            evm_rate_limit_per_window: rate_limit::EVM_RATE_LIMIT_PER_WINDOW,
-            native_rate_limit_per_window: rate_limit::NATIVE_RATE_LIMIT_PER_WINDOW,
-            evm_per_block_cap: rate_limit::EVM_PER_BLOCK_CAP,
-            evm_total_block_cap: rate_limit::EVM_TOTAL_BLOCK_CAP,
+            evm_block_gas_budget: rate_limit::evm_block_gas_budget(),
+            evm_sender_share_pct: rate_limit::evm_sender_share_pct(),
             native_per_block_cap: rate_limit::NATIVE_PER_BLOCK_CAP,
             native_pool_max_size: rate_limit::NATIVE_POOL_MAX_SIZE,
             native_per_sender_cap: rate_limit::NATIVE_PER_SENDER_CAP,
@@ -101,7 +95,6 @@ impl Default for MempoolConfig {
 pub struct Mempool {
     evm: RwLock<evm_pool::EvmPool>,
     native: RwLock<native_pool::NativePool>,
-    rate_tracker: RwLock<rate_limit::RateTracker>,
     state: StateDb,
     /// Durable, nonce-gate-decoupled native-action body store (out-of-band DA).
     da_store: NativeDaStore,
@@ -133,11 +126,6 @@ impl Mempool {
             config.native_per_sender_cap,
             config.native_per_block_cap,
         );
-        let tracker = rate_limit::RateTracker::new(
-            config.rate_window_blocks,
-            config.evm_rate_limit_per_window,
-            config.native_rate_limit_per_window,
-        );
         // DA store shares the same RocksDB handle; every native-action body the
         // mempool sees is mirrored here durably (decoupled from the nonce gate).
         let da_store = NativeDaStore::new(state.clone());
@@ -146,7 +134,6 @@ impl Mempool {
         Self {
             evm: RwLock::new(evm_pool::EvmPool::new()),
             native: RwLock::new(native_pool),
-            rate_tracker: RwLock::new(tracker),
             state,
             da_store,
             config,
@@ -219,11 +206,18 @@ impl Mempool {
     /// Submit a raw RLP-encoded EVM transaction.
     /// Decodes, validates, checks rate limit, and inserts. Returns the tx hash.
     pub fn add_evm_tx(&self, raw_rlp: Vec<u8>) -> Result<B256, MempoolError> {
+        // D1 (S392): bound tx gas by the EVM budget, not just the block gas
+        // limit — a tx above the budget would pass a bare block-limit check
+        // yet sit unselectable in the pool forever (stuck nonce).
+        let max_tx_gas = self
+            .config
+            .block_gas_limit
+            .min(self.config.evm_block_gas_budget);
         let entry = validate::validate_evm_tx(
             &raw_rlp,
             &self.state,
             self.config.chain_id,
-            self.config.block_gas_limit,
+            max_tx_gas,
             self.current_base_fee
                 .load(std::sync::atomic::Ordering::Relaxed),
         )?;
@@ -239,17 +233,6 @@ impl Mempool {
                 .load(std::sync::atomic::Ordering::Relaxed);
             if current + tx_size > self.config.max_memory_bytes {
                 return Err(MempoolError::PoolFull);
-            }
-        }
-
-        // Rate limit check (Task 3.1.4).
-        {
-            let tracker = self.rate_tracker.read().unwrap();
-            if tracker.is_evm_rate_limited(&sender) {
-                return Err(MempoolError::RateLimited {
-                    sender,
-                    window: self.config.rate_window_blocks,
-                });
             }
         }
 
@@ -289,17 +272,27 @@ impl Mempool {
     }
 
     /// Drain EVM transactions for a block proposal.
-    /// Selects highest-gas-price transactions that fit within `gas_limit`,
-    /// respecting per-sender nonce ordering. Removes selected txs from the pool.
+    ///
+    /// D1 (S392): selection is bounded by the block's EVM gas budget —
+    /// min(block gas limit, configured budget; 5M debut default,
+    /// `TORUS_EVM_BLOCK_GAS_BUDGET` override) — with an optional per-sender
+    /// share cap. Count caps deleted. Respects per-sender nonce ordering and
+    /// removes selected txs from the pool.
     ///
     /// `parent_hash` seeds deterministic same-price shuffling (anti-MEV, Task 3.1.5).
     pub fn drain_evm(&self, gas_limit: u64, parent_hash: B256) -> Vec<Vec<u8>> {
+        let budget = gas_limit.min(self.config.evm_block_gas_budget);
+        // Per-sender share cap (testnet spam guard; 0 = off for mainnet).
+        let sender_gas_cap = match self.config.evm_sender_share_pct {
+            0 => None,
+            pct => Some(budget.saturating_mul(pct as u64) / 100),
+        };
         // D4 re-check: the floor may have moved since admission.
         let min_base_fee = self
             .current_base_fee
             .load(std::sync::atomic::Ordering::Relaxed) as u128;
         let mut pool = self.evm.write().unwrap();
-        let drained = pool.drain(gas_limit, self.config.evm_per_block_cap, self.config.evm_total_block_cap, &parent_hash, min_base_fee);
+        let drained = pool.drain(budget, sender_gas_cap, &parent_hash, min_base_fee);
         // FIX EVM-FIND-02: Decrement memory for drained transactions.
         let drained_bytes: usize = drained.iter().map(|tx| tx.len()).sum();
         if drained_bytes > 0 {
@@ -506,17 +499,6 @@ impl Mempool {
         action: SignedNativeAction,
         verified_locally: bool,
     ) -> Result<(), MempoolError> {
-        // Rate limit check — exempt oracle/governance actions (Task 3.1.4).
-        if !rate_limit::is_exempt_action(&action.action) {
-            let tracker = self.rate_tracker.read().unwrap();
-            if tracker.is_native_rate_limited(&sender) {
-                return Err(MempoolError::RateLimited {
-                    sender,
-                    window: self.config.rate_window_blocks,
-                });
-            }
-        }
-
         // Derive the trust-cache key BEFORE `action` is moved into the pool. `None`
         // for non-EIP-712 (session) actions, which are never short-circuited.
         let cache_key = if verified_locally {
@@ -692,19 +674,11 @@ impl Mempool {
         pool.pending_nonce(sender, state_nonce)
     }
 
-    /// Record which senders had txs/actions included in a committed block.
-    /// Updates the sliding-window rate tracker and prunes stale transactions
-    /// whose nonce is now below the sender's confirmed state nonce.
-    pub fn notify_block_committed(
-        &self,
-        block_height: u64,
-        evm_senders: &[alloy_primitives::Address],
-        native_senders: &[alloy_primitives::Address],
-    ) {
-        let mut tracker = self.rate_tracker.write().unwrap();
-        tracker.record_block(block_height, evm_senders, native_senders);
-        drop(tracker);
-
+    /// Prune stale transactions from senders included in a committed block —
+    /// txs whose nonce is now below the sender's confirmed state nonce.
+    /// (D1, S392: the dormant sliding-window rate tracker this also fed was
+    /// deleted; its feed was test-only.)
+    pub fn notify_block_committed(&self, evm_senders: &[alloy_primitives::Address]) {
         if !evm_senders.is_empty() {
             let mut pool = self.evm.write().unwrap();
             let mut total_pruned = 0usize;
@@ -1342,7 +1316,12 @@ mod tests {
     #[test]
     fn drain_respects_gas_budget() {
         let (_dir, state) = setup();
-        let pool = Mempool::new(state.clone(), MempoolConfig::default());
+        // Share cap off: this test exercises the budget dimension alone.
+        let config = MempoolConfig {
+            evm_sender_share_pct: 0,
+            ..MempoolConfig::default()
+        };
+        let pool = Mempool::new(state.clone(), config);
 
         let k = key(30);
         let addr = address_from_key(&k);
@@ -1520,10 +1499,13 @@ mod tests {
     }
 
     #[test]
-    fn evm_per_block_cap_enforced() {
+    fn evm_sender_gas_share_enforced() {
+        // D1 (S392): one sender may only fill their share of the EVM budget.
+        // Budget 210k at 25% => 52.5k/sender => two 21k transfers fit, not three.
         let (_dir, state) = setup();
         let config = MempoolConfig {
-            evm_per_block_cap: 2,
+            evm_block_gas_budget: 210_000,
+            evm_sender_share_pct: 25,
             ..MempoolConfig::default()
         };
         let pool = Mempool::new(state.clone(), config);
@@ -1545,19 +1527,75 @@ mod tests {
         }
         assert_eq!(pool.evm_pool_size(), 5);
 
-        // Per-block cap = 2: only 2 drained, 3 remain.
         let drained = pool.drain_evm(30_000_000, B256::ZERO);
-        assert_eq!(drained.len(), 2);
-        assert_eq!(pool.evm_pool_size(), 3);
+        assert_eq!(drained.len(), 2, "sender capped at 25% of the EVM budget");
+        assert_eq!(pool.evm_pool_size(), 3, "excess stays pooled");
+    }
+
+    #[test]
+    fn evm_sender_share_zero_disables_cap() {
+        // D1: share pct 0 = mainnet mode — a single sender may fill the budget.
+        let (_dir, state) = setup();
+        let config = MempoolConfig {
+            evm_block_gas_budget: 105_000,
+            evm_sender_share_pct: 0,
+            ..MempoolConfig::default()
+        };
+        let pool = Mempool::new(state.clone(), config);
+
+        let k = key(71);
+        fund(&state, &address_from_key(&k), U256::from(10u64.pow(18)), 0);
+        for i in 0..5u64 {
+            pool.add_evm_tx(create_eip1559_tx(
+                &k,
+                i,
+                1_000_000_000,
+                100_000_000,
+                21_000,
+                U256::ZERO,
+            ))
+            .unwrap();
+        }
+
+        let drained = pool.drain_evm(30_000_000, B256::ZERO);
+        assert_eq!(drained.len(), 5, "5 x 21k = 105k fills the whole budget");
+    }
+
+    #[test]
+    fn drain_uses_configured_evm_budget() {
+        // D1: the configured budget bounds selection even when the caller
+        // passes the full 30M block gas limit.
+        let (_dir, state) = setup();
+        let config = MempoolConfig {
+            evm_block_gas_budget: 63_000,
+            evm_sender_share_pct: 0,
+            ..MempoolConfig::default()
+        };
+        let pool = Mempool::new(state.clone(), config);
+
+        let k = key(72);
+        fund(&state, &address_from_key(&k), U256::from(10u64.pow(18)), 0);
+        for i in 0..5u64 {
+            pool.add_evm_tx(create_eip1559_tx(
+                &k,
+                i,
+                1_000_000_000,
+                100_000_000,
+                21_000,
+                U256::ZERO,
+            ))
+            .unwrap();
+        }
+
+        let drained = pool.drain_evm(30_000_000, B256::ZERO);
+        assert_eq!(drained.len(), 3, "63k budget admits exactly three 21k txs");
+        assert_eq!(pool.evm_pool_size(), 2);
     }
 
     #[test]
     fn anti_mev_same_gas_different_parent_hash() {
         let (_dir, state) = setup();
-        let config = MempoolConfig {
-            evm_per_block_cap: 10,
-            ..MempoolConfig::default()
-        };
+        let config = MempoolConfig::default();
 
         // Create two senders with the same gas price.
         let ka = key(80);
@@ -1700,7 +1738,7 @@ mod tests {
 
         // Simulate block commit: advance state nonce to 2
         fund(&state, &addr, U256::from(10u64.pow(18)), 2);
-        pool.notify_block_committed(1, &[addr], &[]);
+        pool.notify_block_committed(&[addr]);
 
         // Nonces 0 and 1 should be pruned, 2 and 3 remain
         assert_eq!(pool.evm_pool_size(), 2);

@@ -32,8 +32,6 @@ pub enum MempoolError {
     GasLimitExceeded { tx_gas: u64, block_gas: u64 },
     /// State read error during validation.
     State(String),
-    /// Sender has exceeded the transaction rate limit (Task 3.1.4).
-    RateLimited { sender: Address, window: u64 },
     /// Native action pool is full.
     NativePoolFull,
     /// Duplicate native action (same sender + action content + nonce).
@@ -81,9 +79,6 @@ impl fmt::Display for MempoolError {
                 write!(f, "tx gas {tx_gas} exceeds block gas {block_gas}")
             }
             Self::State(e) => write!(f, "state error: {e}"),
-            Self::RateLimited { sender, window } => {
-                write!(f, "rate limited: {sender} exceeded limit in {window}-block window")
-            }
             Self::NativePoolFull => write!(f, "native action pool full"),
             Self::DuplicateNativeAction => write!(f, "duplicate native action"),
             Self::NativeSenderQueueFull { sender } => {

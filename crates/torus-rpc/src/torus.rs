@@ -478,9 +478,6 @@ impl RpcState {
                                         "sender_queue_full"
                                     }
                                     torus_mempool::MempoolError::NativePoolFull => "pool_full",
-                                    torus_mempool::MempoolError::RateLimited { .. } => {
-                                        "rate_limited"
-                                    }
                                     _ => "other",
                                 });
                                 RpcSubmitResult {

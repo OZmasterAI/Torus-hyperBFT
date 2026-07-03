@@ -281,14 +281,14 @@ impl EvmPool {
     /// across all senders, advances that sender's pointer, repeats until gas budget
     /// is exhausted. Returns raw RLP bytes for inclusion in `TorusBlock`.
     ///
-    /// Task 3.1.4: `per_sender_limit` caps txs per address in a single block.
+    /// D1 (S392): selection is bounded by `gas_budget` alone (count caps
+    /// deleted); `sender_gas_cap` optionally caps one sender's share of it.
     /// Task 3.1.5: `parent_hash` seeds deterministic same-price shuffling (anti-MEV).
     /// D4 (S392): `min_base_fee` re-checks the fee floor at selection time.
     pub fn drain(
         &mut self,
         gas_budget: u64,
-        per_sender_limit: usize,
-        total_limit: usize,
+        sender_gas_cap: Option<u64>,
         parent_hash: &B256,
         min_base_fee: u128,
     ) -> Vec<Vec<u8>> {
@@ -309,7 +309,7 @@ impl EvmPool {
         let mut result = Vec::new();
         let mut gas_used: u64 = 0;
         let mut to_remove = Vec::new();
-        let mut sender_counts: HashMap<Address, usize> = HashMap::new();
+        let mut sender_gas: HashMap<Address, u64> = HashMap::new();
 
         while let Some(top) = heap.pop() {
             // D4 (S392) drain re-check: the heap pops highest fee first, so once
@@ -319,14 +319,17 @@ impl EvmPool {
                 break;
             }
 
-            // Per-sender-per-block limit (Task 3.1.4): leave excess in pool.
-            let count = sender_counts.get(&top.sender).copied().unwrap_or(0);
-            if count >= per_sender_limit {
-                continue;
-            }
-
-            if result.len() >= total_limit {
-                break;
+            // D1 per-sender gas share (testnet spam guard): after a sender's
+            // FIRST selected tx, further txs must fit inside their share of
+            // the budget. The first tx is always eligible (bounded only by
+            // the remaining block budget) so a single large tx — e.g. a
+            // contract deploy bigger than the share — can still land; the
+            // cap throttles sustained multi-tx flooding. Excess stays pooled.
+            if let Some(cap) = sender_gas_cap {
+                let used = sender_gas.get(&top.sender).copied().unwrap_or(0);
+                if used != 0 && used.saturating_add(top.gas_limit) > cap {
+                    continue;
+                }
             }
 
             if gas_used.saturating_add(top.gas_limit) > gas_budget {
@@ -351,7 +354,7 @@ impl EvmPool {
                     .unwrap(),
             );
             result.push(raw);
-            *sender_counts.entry(top.sender).or_insert(0) += 1;
+            *sender_gas.entry(top.sender).or_insert(0) += top.gas_limit;
 
             // Advance: push next nonce for this sender.
             let next_nonce = top.nonce + 1;

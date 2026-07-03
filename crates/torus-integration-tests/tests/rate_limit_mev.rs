@@ -1,11 +1,14 @@
 //! Integration tests for rate limiting and anti-MEV protections (Phase 3: 3.1.4, 3.1.5).
 //!
 //! Covers:
-//! - Flood test: one sender submits many EVM txs → rate-limited, others unaffected
 //! - Sandwich resistance: same gas price → ordering varies by parent hash
 //! - CoreWriter full flow: one-block delay enforcement
-//! - Mixed load: spammer throttled, legitimate traffic unaffected
 //! - Native pool hardening: per-sender caps, dedup, pool size limit
+//!
+//! D1 (S392): the sliding-window RateTracker tests were deleted along with
+//! the tracker itself (dormant in production — its feed was test-only).
+//! Per-block EVM spam control is now the gas budget + sender share cap,
+//! covered in torus-mempool unit tests.
 
 mod common;
 
@@ -36,134 +39,6 @@ fn make_native(nonce: u64, action: NativeAction) -> SignedNativeAction {
         nonce,
         signature: sig(),
     }
-}
-
-// ============================================================================
-// 3.1.4: Rate limiting tests
-// ============================================================================
-
-#[test]
-fn flood_test_spammer_blocked_legit_ok() {
-    let dir = tempfile::tempdir().unwrap();
-    let state = StateDb::open(dir.path()).unwrap();
-    let config = MempoolConfig {
-        native_rate_limit_per_window: 10,
-        rate_window_blocks: 10,
-        ..MempoolConfig::default()
-    };
-    let pool = Mempool::new(state.clone(), config);
-
-    let spammer = addr(1);
-    let legit = addr(2);
-
-    // Record spammer as having 10 native actions in recent blocks → at limit.
-    for i in 1..=10 {
-        pool.notify_block_committed(i, &[], &[spammer]);
-    }
-
-    // Spammer tries to submit — rejected.
-    let err = pool
-        .submit_native_action(spammer, make_native(100, NativeAction::ClaimRewards))
-        .unwrap_err();
-    assert!(format!("{err}").contains("rate limited"));
-
-    // Legit user is unaffected.
-    pool.submit_native_action(legit, make_native(1, NativeAction::ClaimRewards))
-        .unwrap();
-    assert_eq!(pool.native_pool_size(), 1);
-}
-
-#[test]
-fn native_rate_limit_rejects_at_limit() {
-    let dir = tempfile::tempdir().unwrap();
-    let state = StateDb::open(dir.path()).unwrap();
-    let config = MempoolConfig {
-        native_rate_limit_per_window: 5,
-        rate_window_blocks: 10,
-        ..MempoolConfig::default()
-    };
-    let pool = Mempool::new(state.clone(), config);
-
-    let spammer = addr(1);
-    let legit = addr(2);
-
-    // Record 5 native actions from spammer → at limit.
-    pool.notify_block_committed(1, &[], &vec![spammer; 5]);
-
-    // Spammer rejected.
-    let err = pool
-        .submit_native_action(spammer, make_native(100, NativeAction::ClaimRewards))
-        .unwrap_err();
-    assert!(
-        format!("{err}").contains("rate limited"),
-        "expected rate limit error, got: {err}"
-    );
-
-    // Legit user unaffected.
-    pool.submit_native_action(legit, make_native(1, NativeAction::ClaimRewards))
-        .unwrap();
-}
-
-#[test]
-fn exempt_oracle_bypasses_rate_limit() {
-    let dir = tempfile::tempdir().unwrap();
-    let state = StateDb::open(dir.path()).unwrap();
-    let config = MempoolConfig {
-        native_rate_limit_per_window: 5,
-        rate_window_blocks: 10,
-        ..MempoolConfig::default()
-    };
-    let pool = Mempool::new(state.clone(), config);
-
-    let validator = addr(1);
-
-    // Fill validator to native rate limit.
-    pool.notify_block_committed(1, &[], &vec![validator; 5]);
-
-    // Regular action rejected.
-    let err = pool
-        .submit_native_action(validator, make_native(100, NativeAction::ClaimRewards))
-        .unwrap_err();
-    assert!(format!("{err}").contains("rate limited"));
-
-    // Oracle submission exempt — accepted despite rate limit.
-    let oracle_action = NativeAction::SubmitOraclePrices(torus_types::OracleSubmission {
-        prices: vec![(1, FixedPoint::from_raw(5000_00000000))],
-        timestamp: 1000,
-    });
-    pool.submit_native_action(validator, make_native(101, oracle_action))
-        .unwrap();
-    assert_eq!(pool.native_pool_size(), 1);
-}
-
-#[test]
-fn window_slides_sender_can_submit_again() {
-    let dir = tempfile::tempdir().unwrap();
-    let state = StateDb::open(dir.path()).unwrap();
-    let config = MempoolConfig {
-        native_rate_limit_per_window: 5,
-        rate_window_blocks: 10,
-        ..MempoolConfig::default()
-    };
-    let pool = Mempool::new(state.clone(), config);
-
-    let sender = addr(1);
-
-    // Fill to limit in block 1.
-    pool.notify_block_committed(1, &[], &vec![sender; 5]);
-    assert!(pool
-        .submit_native_action(sender, make_native(100, NativeAction::ClaimRewards))
-        .is_err());
-
-    // Advance past the window.
-    for i in 2..=12 {
-        pool.notify_block_committed(i, &[], &[]);
-    }
-
-    // Block 1 is outside window (current=12, window=10, cutoff=2).
-    // Sender can submit again.
-    pool.submit_native_action(sender, make_native(200, NativeAction::ClaimRewards))
-        .unwrap();
 }
 
 // ============================================================================
@@ -386,10 +261,7 @@ fn same_gas_price_ordering_deterministic_by_parent_hash() {
     // the same-hash-same-order property. Here we verify the integration.
     let dir = tempfile::tempdir().unwrap();
     let state = StateDb::open(dir.path()).unwrap();
-    let config = MempoolConfig {
-        evm_per_block_cap: 10,
-        ..MempoolConfig::default()
-    };
+    let config = MempoolConfig::default();
 
     // Create pool — deterministic ordering is tested in the mempool unit tests.
     // This integration test just verifies the plumbing works end-to-end.
@@ -460,79 +332,3 @@ fn native_ordering_not_manipulable_by_submission_order() {
     assert_eq!(pre_v1[1].0, pre_v2[1].0);
 }
 
-// ============================================================================
-// Mixed load: spammer + legitimate traffic
-// ============================================================================
-
-#[test]
-fn mixed_load_spammer_throttled_legit_unaffected() {
-    let dir = tempfile::tempdir().unwrap();
-    let state = StateDb::open(dir.path()).unwrap();
-    let config = MempoolConfig {
-        native_rate_limit_per_window: 10,
-        rate_window_blocks: 10,
-        native_per_block_cap: 16,
-        ..MempoolConfig::default()
-    };
-    let pool = Mempool::new(state.clone(), config);
-
-    let spammer = addr(1);
-    let trader_a = addr(2);
-    let trader_b = addr(3);
-
-    // Spammer exhausts their rate limit.
-    pool.notify_block_committed(1, &[], &vec![spammer; 10]);
-
-    // Spammer can't submit more.
-    assert!(pool
-        .submit_native_action(spammer, make_native(100, NativeAction::ClaimRewards))
-        .is_err());
-
-    // Legitimate traders unaffected.
-    for i in 1..=5 {
-        pool.submit_native_action(
-            trader_a,
-            make_native(i, NativeAction::CancelOrder { order_id: i as u128 }),
-        )
-        .unwrap();
-        pool.submit_native_action(trader_b, make_native(i + 100, NativeAction::ClaimRewards))
-            .unwrap();
-    }
-
-    assert_eq!(pool.native_pool_size(), 10);
-
-    // Drain gets actions from both legit traders (not the spammer).
-    let drained = pool.drain_native(100);
-    assert_eq!(drained.len(), 10);
-}
-
-#[test]
-fn node_restart_resets_rate_windows() {
-    let dir = tempfile::tempdir().unwrap();
-    let state = StateDb::open(dir.path()).unwrap();
-    let config = MempoolConfig {
-        native_rate_limit_per_window: 5,
-        rate_window_blocks: 10,
-        ..MempoolConfig::default()
-    };
-
-    // First pool instance — fill rate limit.
-    {
-        let pool = Mempool::new(state.clone(), config.clone());
-        let sender = addr(1);
-        pool.notify_block_committed(1, &[], &vec![sender; 5]);
-        assert!(pool
-            .submit_native_action(sender, make_native(100, NativeAction::ClaimRewards))
-            .is_err());
-    }
-
-    // "Restart": create a new Mempool (rate tracker resets).
-    {
-        let pool = Mempool::new(state.clone(), config);
-        let sender = addr(1);
-        // After restart, sender can submit immediately.
-        pool.submit_native_action(sender, make_native(200, NativeAction::ClaimRewards))
-            .unwrap();
-        assert_eq!(pool.native_pool_size(), 1);
-    }
-}
