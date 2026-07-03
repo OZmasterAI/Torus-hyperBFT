@@ -451,19 +451,33 @@ impl<K: KVStore> BlockTreeSingleton<K> {
     /// Update highest_pc and validator-set-decided flag from a received PC
     /// without triggering commit processing. Used by the pacemaker when it
     /// receives an AdvanceView containing a PC whose block may not yet be
-    /// in the tree (header pipeline: body still in flight).
+    /// in the tree (header pipeline: body still in flight), and by the next
+    /// leader when it assembles a PC from votes.
+    ///
+    /// Emits [`UpdateHighestPCEvent`] when the highest PC actually advances —
+    /// in the header pipeline this path usually wins the race against
+    /// [`update`](Self::update), which would otherwise be the only emitter.
     pub fn advance_highest_pc_from_remote(
         &mut self,
         pc: &PhaseCertificate,
+        event_publisher: &Option<Sender<Event>>,
     ) -> Result<(), BlockTreeError> {
         let mut wb = BlockTreeWriteBatch::new();
-        if pc.view > self.highest_pc()?.view {
+        let advanced = pc.view > self.highest_pc()?.view;
+        if advanced {
             wb.set_highest_pc(pc)?;
         }
         if pc.phase.is_decide() {
             wb.set_validator_set_update_decided(true)?;
         }
         self.write(wb);
+        if advanced {
+            Event::UpdateHighestPC(UpdateHighestPCEvent {
+                timestamp: SystemTime::now(),
+                highest_pc: pc.clone(),
+            })
+            .publish(event_publisher);
+        }
         Ok(())
     }
 

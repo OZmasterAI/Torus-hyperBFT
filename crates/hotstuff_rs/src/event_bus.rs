@@ -78,6 +78,7 @@ pub(crate) struct EventHandlers {
     pub(crate) advance_view_handlers: HandlerPair<AdvanceViewEvent>,
 
     pub(crate) receive_proposal_handlers: HandlerPair<ReceiveProposalEvent>,
+    pub(crate) receive_proposal_header_handlers: HandlerPair<ReceiveProposalHeaderEvent>,
     pub(crate) receive_nudge_handlers: HandlerPair<ReceiveNudgeEvent>,
     pub(crate) receive_phase_vote_handlers: HandlerPair<ReceivePhaseVoteEvent>,
     pub(crate) receive_new_view_handlers: HandlerPair<ReceiveNewViewEvent>,
@@ -115,6 +116,7 @@ impl EventHandlers {
         timeout_vote_handler: Option<HandlerPtr<TimeoutVoteEvent>>,
         advance_view_handler: Option<HandlerPtr<AdvanceViewEvent>>,
         receive_proposal_handler: Option<HandlerPtr<ReceiveProposalEvent>>,
+        receive_proposal_header_handler: Option<HandlerPtr<ReceiveProposalHeaderEvent>>,
         receive_nudge_handler: Option<HandlerPtr<ReceiveNudgeEvent>>,
         receive_phase_vote_handler: Option<HandlerPtr<ReceivePhaseVoteEvent>>,
         receive_new_view_handler: Option<HandlerPtr<ReceiveNewViewEvent>>,
@@ -144,6 +146,7 @@ impl EventHandlers {
             timeout_vote_handlers: HandlerPair::new(log, timeout_vote_handler),
             advance_view_handlers: HandlerPair::new(log, advance_view_handler),
             receive_proposal_handlers: HandlerPair::new(log, receive_proposal_handler),
+            receive_proposal_header_handlers: HandlerPair::new(log, receive_proposal_header_handler),
             receive_nudge_handlers: HandlerPair::new(log, receive_nudge_handler),
             receive_phase_vote_handlers: HandlerPair::new(log, receive_phase_vote_handler),
             receive_new_view_handlers: HandlerPair::new(log, receive_new_view_handler),
@@ -177,6 +180,7 @@ impl EventHandlers {
             && self.timeout_vote_handlers.is_empty()
             && self.advance_view_handlers.is_empty()
             && self.receive_proposal_handlers.is_empty()
+            && self.receive_proposal_header_handlers.is_empty()
             && self.receive_nudge_handlers.is_empty()
             && self.receive_phase_vote_handlers.is_empty()
             && self.receive_new_view_handlers.is_empty()
@@ -335,6 +339,16 @@ impl EventHandlers {
                     .logging_handler
                     .iter()
                     .for_each(|handler| handler(&receive_proposal_event));
+            }
+            Event::ReceiveProposalHeader(receive_proposal_header_event) => {
+                self.receive_proposal_header_handlers
+                    .user_defined_handler
+                    .iter()
+                    .for_each(|handler| handler(&receive_proposal_header_event));
+                self.receive_proposal_header_handlers
+                    .logging_handler
+                    .iter()
+                    .for_each(|handler| handler(&receive_proposal_header_event));
             }
             Event::ReceiveNudge(receive_nudge_event) => {
                 self.receive_nudge_handlers

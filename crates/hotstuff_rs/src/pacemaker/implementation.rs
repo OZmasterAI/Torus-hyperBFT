@@ -445,7 +445,7 @@ impl<N: Network> Pacemaker<N> {
             //     the pacemaker keeps highest_pc in sync to prevent proposer
             //     disagreement on validator set state.
             if let ProgressCertificate::PhaseCertificate(pc) = &progress_certificate {
-                let _ = block_tree.advance_highest_pc_from_remote(pc);
+                let _ = block_tree.advance_highest_pc_from_remote(pc, &self.event_publisher);
             }
 
             // 3b. If the received certificate is a TimeoutCertificate and has a higher view number than `highest_tc`,

@@ -55,6 +55,7 @@ pub const TIMEOUT_VOTE: &str = "TimeoutVote";
 pub const ADVANCE_VIEW: &str = "AdvanceView";
 
 pub const RECEIVE_PROPOSAL: &str = "ReceiveProposal";
+pub const RECEIVE_PROPOSAL_HEADER: &str = "ReceiveProposalHeader";
 pub const RECEIVE_NUDGE: &str = "ReceiveNudge";
 pub const RECEIVE_PHASE_VOTE: &str = "ReceivePhaseVote";
 pub const RECEIVE_NEW_VIEW: &str = "ReceiveNewView";
@@ -282,6 +283,22 @@ impl Logger for ReceiveProposalEvent {
                 first_seven_base64_chars(&receive_proposal_event.origin.to_bytes()),
                 first_seven_base64_chars(&receive_proposal_event.proposal.block.hash.bytes()),
                 receive_proposal_event.proposal.block.height
+            )
+        };
+        Box::new(logger)
+    }
+}
+
+impl Logger for ReceiveProposalHeaderEvent {
+    fn get_logger() -> Box<dyn Fn(&Self) + Send> {
+        let logger = |ev: &ReceiveProposalHeaderEvent| {
+            log::info!(
+                "{}, {}, {}, {}, {}",
+                RECEIVE_PROPOSAL_HEADER,
+                secs_since_unix_epoch(ev.timestamp),
+                first_seven_base64_chars(&ev.origin.to_bytes()),
+                first_seven_base64_chars(&ev.block_hash.bytes()),
+                ev.view
             )
         };
         Box::new(logger)

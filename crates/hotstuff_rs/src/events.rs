@@ -74,6 +74,7 @@ pub enum Event {
 
     // Events that involve receiving a Progress Message.
     ReceiveProposal(ReceiveProposalEvent),
+    ReceiveProposalHeader(ReceiveProposalHeaderEvent),
     ReceiveNudge(ReceiveNudgeEvent),
     ReceivePhaseVote(ReceivePhaseVoteEvent),
     ReceiveNewView(ReceiveNewViewEvent),
@@ -206,6 +207,16 @@ pub struct ReceiveProposalEvent {
     pub timestamp: SystemTime,
     pub origin: VerifyingKey,
     pub proposal: Proposal,
+}
+
+/// The replica received a [`ProposalHeader`](crate::hotstuff::messages::ProposalHeader) (hash-only
+/// pipeline) for `view` from the leader identified by `origin`. Emitted after the header's hash
+/// check passes; the block body may still be in flight.
+pub struct ReceiveProposalHeaderEvent {
+    pub timestamp: SystemTime,
+    pub origin: VerifyingKey,
+    pub view: ViewNumber,
+    pub block_hash: CryptoHash,
 }
 
 /// The replica received a `nudge` for the replica's current view from the leader of the view,

@@ -594,7 +594,7 @@ impl Metrics {
         let view_qc_collect_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 15));
         registry.register(
             "torus_view_qc_collect_seconds",
-            "Leader: Propose broadcast to PhaseCertificate collected (vote round-trip incl. voter persist)",
+            "Leader: Propose broadcast to our block certified locally (PC observed via a later justify; full vote round-trip)",
             view_qc_collect_seconds.clone(),
         );
 

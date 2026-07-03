@@ -89,6 +89,7 @@
 //! - `.on_phase_vote(...)`
 //! - `.on_new_view(...)`
 //! - `.on_receive_proposal(...)`
+//! - `.on_receive_proposal_header(...)`
 //! - `.on_receive_nudge(...)`
 //! - `.on_receive_phase_vote(...)`
 //! - `.on_receive_new_view(...)`
@@ -322,6 +323,7 @@ impl
     - `.on_timeout_vote(...)`
     - `.on_advance_view(...)`
     - `.on_receive_proposal(...)`
+    - `.on_receive_proposal_header(...)`
     - `.on_receive_nudge(...)`
     - `.on_receive_phase_vote(...)`
     - `.on_receive_new_view(...)`
@@ -397,6 +399,9 @@ pub struct ReplicaSpec<K: KVStore, A: App<K> + 'static, N: Network + 'static> {
     #[builder(default, setter(transform = |handler: impl Fn(&ReceiveProposalEvent) + Send + 'static| Some(Box::new(handler) as HandlerPtr<ReceiveProposalEvent>),
     doc = "Register a handler closure to be invoked after the replica receives a proposal for a block. Optional."))]
     on_receive_proposal: Option<HandlerPtr<ReceiveProposalEvent>>,
+    #[builder(default, setter(transform = |handler: impl Fn(&ReceiveProposalHeaderEvent) + Send + 'static| Some(Box::new(handler) as HandlerPtr<ReceiveProposalHeaderEvent>),
+    doc = "Register a handler closure to be invoked after the replica receives a proposal header (hash-only pipeline). Optional."))]
+    on_receive_proposal_header: Option<HandlerPtr<ReceiveProposalHeaderEvent>>,
     #[builder(default, setter(transform = |handler: impl Fn(&ReceiveNudgeEvent) + Send + 'static| Some(Box::new(handler) as HandlerPtr<ReceiveNudgeEvent>),
     doc = "Register a handler closure to be invoked after the replica receives a nudge for a block. Optional."))]
     on_receive_nudge: Option<HandlerPtr<ReceiveNudgeEvent>>,
@@ -475,6 +480,7 @@ impl<K: KVStore, A: App<K> + 'static, N: Network + 'static> ReplicaSpec<K, A, N>
             self.on_timeout_vote,
             self.on_advance_view,
             self.on_receive_proposal,
+            self.on_receive_proposal_header,
             self.on_receive_nudge,
             self.on_receive_phase_vote,
             self.on_receive_new_view,

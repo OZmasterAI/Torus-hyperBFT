@@ -1124,7 +1124,7 @@ impl<N: Network> HotStuff<N> {
                 //    In the header pipeline the certified block may not be in
                 //    the tree yet (body in flight). Always advance highest_pc
                 //    first, then attempt full update for commits.
-                let _ = block_tree.advance_highest_pc_from_remote(&new_pc);
+                let _ = block_tree.advance_highest_pc_from_remote(&new_pc, &self.event_publisher);
                 let update_result =
                     block_tree.update(&new_pc, &self.event_publisher)
                         .unwrap_or(UpdateResult { validator_set_updates: None, committed_block_hashes: vec![] });
@@ -1518,6 +1518,16 @@ impl<N: Network> HotStuff<N> {
             log::warn!("dropping proposal header: hash mismatch, view={}", header.view.int());
             return Ok(());
         }
+
+        // Header passed integrity checks: this is the proposal-arrival moment of
+        // the hash-only pipeline (the body may still be in flight).
+        Event::ReceiveProposalHeader(crate::events::ReceiveProposalHeaderEvent {
+            timestamp: SystemTime::now(),
+            origin: *origin,
+            view: header.view,
+            block_hash: header.block_hash,
+        })
+        .publish(&self.event_publisher);
 
         // If the block is already in the tree (proposer self-inserted), skip body fetch
         // but still vote below.
