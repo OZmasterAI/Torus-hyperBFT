@@ -16,15 +16,31 @@ services:
       - --data-dir=/data
       - --validator-key=0100000000000000000000000000000000000000000000000000000000000000
       - --p2p-listen=/ip4/0.0.0.0/udp/30333/quic-v1
+      - --p2p-private-addrs
+      # Explicit devnet-internal peer suppresses the COMPILED-IN testnet bootstrap
+      # fallback (config.rs TESTNET_BOOTSTRAP_PEERS): without this, validator-0
+      # dials the LIVE testnet seed, cross-pollutes both kademlia meshes, and the
+      # resulting dial storms destabilize the devnet mesh during benches (S395).
+      # Even if the peer id below goes stale, the mesh still forms via
+      # validator-id dialing + inbound — and no testnet contact happens.
+      - --p2p-peers=/ip4/172.28.0.11/udp/30334/quic-v1/p2p/12D3KooWH3uVF6wv47WnArKHk5p6cvgCJEb74UTmxztmQDc298L3
       - --rpc-addr=0.0.0.0:8545
       - --log-level=info
+    environment:
+      # Mirror the live testnet's body-push threshold: at bs400 a 100-action
+      # block body is ~2.8MB; the 512KB default forces hash-only manifests and
+      # the mesh can't reconstruct in time (S395 failed-view collapse).
+      - TORUS_HASH_ONLY_PUSH_THRESHOLD=6000000
     volumes:
       - ./genesis.json:/genesis/genesis.json:ro
       - validator-0-data:/data
     ports:
-      - "30333:30333/udp"
-      - "8545:8545"
-      - "9090:9090"
+      # Host side remapped to coexist with the live testnet node (which holds
+      # 8545/30333/9090). Container ports unchanged, so inter-container P2P
+      # (172.28.0.10:30333) and the bench (localhost:8645) are unaffected.
+      - "30433:30333/udp"
+      - "8645:8545"
+      - "9091:9090"
     networks:
       torus-devnet:
         ipv4_address: 172.28.0.10
@@ -36,9 +52,15 @@ services:
       - --data-dir=/data
       - --validator-key=0200000000000000000000000000000000000000000000000000000000000000
       - --p2p-listen=/ip4/0.0.0.0/udp/30334/quic-v1
+      - --p2p-private-addrs
       - --p2p-peers=/ip4/172.28.0.10/udp/30333/quic-v1/p2p/12D3KooWPjceQrSwdWXPyLLeABRXmuqt69Rg3sBYbU1Nft9HyQ6X
       - --rpc-addr=0.0.0.0:8545
       - --log-level=info
+    environment:
+      # Mirror the live testnet's body-push threshold: at bs400 a 100-action
+      # block body is ~2.8MB; the 512KB default forces hash-only manifests and
+      # the mesh can't reconstruct in time (S395 failed-view collapse).
+      - TORUS_HASH_ONLY_PUSH_THRESHOLD=6000000
     volumes:
       - ./genesis.json:/genesis/genesis.json:ro
       - validator-1-data:/data
@@ -58,9 +80,15 @@ services:
       - --data-dir=/data
       - --validator-key=0300000000000000000000000000000000000000000000000000000000000000
       - --p2p-listen=/ip4/0.0.0.0/udp/30335/quic-v1
+      - --p2p-private-addrs
       - --p2p-peers=/ip4/172.28.0.10/udp/30333/quic-v1/p2p/12D3KooWPjceQrSwdWXPyLLeABRXmuqt69Rg3sBYbU1Nft9HyQ6X
       - --rpc-addr=0.0.0.0:8545
       - --log-level=info
+    environment:
+      # Mirror the live testnet's body-push threshold: at bs400 a 100-action
+      # block body is ~2.8MB; the 512KB default forces hash-only manifests and
+      # the mesh can't reconstruct in time (S395 failed-view collapse).
+      - TORUS_HASH_ONLY_PUSH_THRESHOLD=6000000
     volumes:
       - ./genesis.json:/genesis/genesis.json:ro
       - validator-2-data:/data
@@ -80,9 +108,15 @@ services:
       - --data-dir=/data
       - --validator-key=0400000000000000000000000000000000000000000000000000000000000000
       - --p2p-listen=/ip4/0.0.0.0/udp/30336/quic-v1
+      - --p2p-private-addrs
       - --p2p-peers=/ip4/172.28.0.10/udp/30333/quic-v1/p2p/12D3KooWPjceQrSwdWXPyLLeABRXmuqt69Rg3sBYbU1Nft9HyQ6X
       - --rpc-addr=0.0.0.0:8545
       - --log-level=info
+    environment:
+      # Mirror the live testnet's body-push threshold: at bs400 a 100-action
+      # block body is ~2.8MB; the 512KB default forces hash-only manifests and
+      # the mesh can't reconstruct in time (S395 failed-view collapse).
+      - TORUS_HASH_ONLY_PUSH_THRESHOLD=6000000
     volumes:
       - ./genesis.json:/genesis/genesis.json:ro
       - validator-3-data:/data
@@ -102,9 +136,15 @@ services:
       - --genesis=/genesis/genesis.json
       - --data-dir=/data
       - --p2p-listen=/ip4/0.0.0.0/udp/30337/quic-v1
+      - --p2p-private-addrs
       - --p2p-peers=/ip4/172.28.0.10/udp/30333/quic-v1/p2p/12D3KooWPjceQrSwdWXPyLLeABRXmuqt69Rg3sBYbU1Nft9HyQ6X
       - --rpc-addr=0.0.0.0:8545
       - --log-level=info
+    environment:
+      # Mirror the live testnet's body-push threshold: at bs400 a 100-action
+      # block body is ~2.8MB; the 512KB default forces hash-only manifests and
+      # the mesh can't reconstruct in time (S395 failed-view collapse).
+      - TORUS_HASH_ONLY_PUSH_THRESHOLD=6000000
     volumes:
       - ./genesis.json:/genesis/genesis.json:ro
       - rpc-node-data:/data
