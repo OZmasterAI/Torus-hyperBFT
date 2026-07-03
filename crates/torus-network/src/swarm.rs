@@ -1315,7 +1315,19 @@ fn handle_event(
             }
         }
         SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
-            warn!(?peer_id, %error, "outgoing connection failed");
+            // Dials whose every candidate address was non-global were refused
+            // by the dial-layer filter (transport.rs) without touching the
+            // wire; a stale private record re-learned from a peer's book is
+            // routine hygiene, not an operational failure worth WARN spam.
+            let only_filtered = !shared.allow_private_addrs
+                && matches!(&error, libp2p::swarm::DialError::Transport(errs)
+                    if !errs.is_empty()
+                        && errs.iter().all(|(a, _)| !crate::config::is_global_addr(a)));
+            if only_filtered {
+                debug!(?peer_id, %error, "outgoing connection failed (non-global addresses filtered)");
+            } else {
+                warn!(?peer_id, %error, "outgoing connection failed");
+            }
         }
         SwarmEvent::IncomingConnectionError { error, .. } => {
             warn!(%error, "incoming connection failed");

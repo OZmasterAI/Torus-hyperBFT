@@ -187,9 +187,31 @@ impl LibP2PNetwork {
 
         let max_peers = config.max_peers;
         let gossipsub_heartbeat_ms = config.gossipsub_heartbeat_ms;
+        // DNS wraps the dial filter which wraps QUIC, so /dns4 bootstrap
+        // entries resolve BEFORE the filter judges the literal IP. Kademlia
+        // query dials to stale private records (re-learned from peers that
+        // still carry them) die at the filter instead of hitting the wire.
+        let enforce_global_dials = !config.allow_private_addrs;
+        let exempt_bootstrap: Arc<HashSet<Multiaddr>> = Arc::new(
+            config
+                .bootstrap_peers
+                .iter()
+                .map(|(_, a)| crate::transport::strip_p2p(a))
+                .collect(),
+        );
         let mut swarm = SwarmBuilder::with_existing_identity(libp2p_keypair)
             .with_tokio()
-            .with_quic_config(tune_quic_config)
+            .with_other_transport(|key| {
+                let quic = libp2p::quic::tokio::Transport::new(tune_quic_config(
+                    libp2p::quic::Config::new(key),
+                ));
+                crate::transport::GlobalOnlyTransport::new(
+                    quic,
+                    enforce_global_dials,
+                    exempt_bootstrap,
+                )
+            })
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?
             .with_dns()
             .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?
             .with_behaviour(|key| {
