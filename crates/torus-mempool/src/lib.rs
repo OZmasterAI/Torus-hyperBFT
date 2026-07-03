@@ -574,9 +574,11 @@ impl Mempool {
 
     /// Mirror native-action bodies into the durable DA store (proposer guarantee:
     /// every body referenced by a block we propose stays reconstructable).
+    /// One atomic WriteBatch + one arrival-notifier wake for the whole block —
+    /// this runs on the leader's produce_block critical path (S395).
     pub fn mirror_native_to_da(&self, actions: &[SignedNativeAction]) {
-        for action in actions {
-            self.mirror_to_da(action);
+        if let Err(e) = self.da_store.put_batch(actions) {
+            tracing::error!("native DA store batch write failed: {e}");
         }
     }
 

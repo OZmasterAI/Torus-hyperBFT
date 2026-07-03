@@ -1012,8 +1012,17 @@ impl TorusApp {
             m.native_da_pull_requests.inc();
         }
 
-        for _ in 0..retries {
-            torus_state::NativeDaStore::wait_for_arrival(seen, delay);
+        // Deadline-bounded loop (S395): a loaded scheduler overshoots each individual
+        // wait slice, and with per-ITERATION bounds those overshoots stack (13 x 20ms
+        // nominal was observed at 500ms+ wall under load). Bounding by wall-clock
+        // deadline keeps the total budget honest regardless of load.
+        let deadline = std::time::Instant::now() + delay * retries as u32;
+        loop {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            torus_state::NativeDaStore::wait_for_arrival(seen, std::cmp::min(delay, deadline - now));
             Self::absorb_fetched_bodies(mempool, fetcher.as_ref());
             if missing.iter().all(|h| mempool.get_native_da(h).is_some()) {
                 if let Some(ref m) = self.metrics {
@@ -1075,8 +1084,19 @@ impl TorusApp {
             // thread at delivery time, while the worst case stays the old tick
             // cadence (the ≤260ms hot-path budget is unchanged).
             let mut seen = torus_state::NativeDaStore::arrival_generation();
-            for _ in 0..RECONSTRUCT_RETRIES {
-                torus_state::NativeDaStore::wait_for_arrival(seen, RECONSTRUCT_RETRY_DELAY);
+            // Deadline-bounded like the pull loop below (S395): iteration-count
+            // bounds stack scheduler overshoot past the hot budget under load.
+            let deadline = std::time::Instant::now()
+                + RECONSTRUCT_RETRY_DELAY * RECONSTRUCT_RETRIES as u32;
+            loop {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                torus_state::NativeDaStore::wait_for_arrival(
+                    seen,
+                    std::cmp::min(RECONSTRUCT_RETRY_DELAY, deadline - now),
+                );
                 // Phase 2.3 pre-warm (#5): a hash-only push made THIS node PULL the bodies
                 // out-of-band (the receiver fired the by-hash fetch on the manifest), so they
                 // arrive in the fetcher inbound. Absorb them into the DA store here, in the

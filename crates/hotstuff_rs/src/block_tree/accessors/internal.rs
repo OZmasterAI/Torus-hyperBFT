@@ -88,9 +88,13 @@ pub struct UpdateResult {
 /// interior mutability for the lazy load behind `&self`; a `BlockTreeSingleton` is
 /// owned/borrowed by the single consensus thread (`KVStore` requires `Send`, not
 /// `Sync`), so being `!Sync` from the `RefCell` is fine.
+/// `self.2` is the same write-through pattern for the `SPECULATIVE_COMMITS` list
+/// (MonadBFT B2), which was previously a raw KV read-modify-write of the whole
+/// `Vec<CryptoHash>` blob twice per view (S395 floor shave).
 pub struct BlockTreeSingleton<K: KVStore>(
     K,
     core::cell::RefCell<Option<crate::hotstuff::types::LeaderReputation>>,
+    core::cell::RefCell<Option<Vec<CryptoHash>>>,
 );
 
 /// Lifecycle methods.
@@ -104,7 +108,11 @@ impl<K: KVStore> BlockTreeSingleton<K> {
     /// This constructor is private (`pub(crate)`). To create an instance of `BlockTreeSingleton` as a
     /// library user, use [`new_unsafe`](Self::new_unsafe).
     pub(crate) fn new(kv_store: K) -> Self {
-        BlockTreeSingleton(kv_store, core::cell::RefCell::new(None))
+        BlockTreeSingleton(
+            kv_store,
+            core::cell::RefCell::new(None),
+            core::cell::RefCell::new(None),
+        )
     }
 
     /// Create a new instance of `BlockTreeSingleton` on top of `kv_store`.
@@ -1428,55 +1436,70 @@ impl<K: KVStore> BlockTreeSingleton<K> {
     }
 
     /// MonadBFT B2: Get the list of speculatively committed blocks.
+    ///
+    /// Write-through cached (`self.2`), same pattern as `leader_reputation`: the
+    /// happy path read this and rewrote the whole blob twice per view (add on QC,
+    /// promote on commit) — S395 floor shave.
     pub fn speculative_commits(&self) -> Result<Vec<CryptoHash>, BlockTreeError> {
         use borsh::BorshDeserialize;
-        if let Some(bytes) = self.0.get(&variables::SPECULATIVE_COMMITS) {
-            let hashes = Vec::<CryptoHash>::deserialize(&mut bytes.as_slice())
-                .map_err(|err| KVGetError::DeserializeValueError {
+        {
+            let cached = self.2.borrow();
+            if let Some(commits) = cached.as_ref() {
+                return Ok(commits.clone());
+            }
+        }
+        let hashes = if let Some(bytes) = self.0.get(&variables::SPECULATIVE_COMMITS) {
+            Vec::<CryptoHash>::deserialize(&mut bytes.as_slice()).map_err(|err| {
+                KVGetError::DeserializeValueError {
                     key: Key::HighestTC,
                     source: err,
-                })?;
-            Ok(hashes)
+                }
+            })?
         } else {
-            Ok(Vec::new())
-        }
+            Vec::new()
+        };
+        *self.2.borrow_mut() = Some(hashes.clone());
+        Ok(hashes)
     }
 
-    /// MonadBFT B2: Add a block to the speculative commits list.
-    pub fn add_speculative_commit(&mut self, block: CryptoHash) -> Result<(), BlockTreeError> {
+    /// Persist the speculative-commits list and refresh the write-through cache
+    /// (`self.2`) in lock-step, so a cache HIT equals a fresh KV deserialize.
+    fn set_speculative_commits(&mut self, commits: Vec<CryptoHash>) -> Result<(), BlockTreeError> {
         use borsh::BorshSerialize;
-        let mut commits = self.speculative_commits()?;
-        if !commits.contains(&block) {
-            commits.push(block);
-            let mut wb: BlockTreeWriteBatch<K::WriteBatch> = BlockTreeWriteBatch::new();
-            wb.0.set(
-                &variables::SPECULATIVE_COMMITS,
-                &commits.try_to_vec()
-                    .map_err(|err| KVSetError::SerializeValueError {
-                        key: Key::HighestTC,
-                        source: err,
-                    })?,
-            );
-            self.write(wb);
-        }
-        Ok(())
-    }
-
-    /// MonadBFT B2: Remove irrevocably committed blocks from speculative list.
-    pub fn promote_speculative_to_irrevocable(&mut self, block: &CryptoHash) -> Result<(), BlockTreeError> {
-        use borsh::BorshSerialize;
-        let mut commits = self.speculative_commits()?;
-        commits.retain(|b| b != block);
         let mut wb: BlockTreeWriteBatch<K::WriteBatch> = BlockTreeWriteBatch::new();
         wb.0.set(
             &variables::SPECULATIVE_COMMITS,
-            &commits.try_to_vec()
+            &commits
+                .try_to_vec()
                 .map_err(|err| KVSetError::SerializeValueError {
                     key: Key::HighestTC,
                     source: err,
                 })?,
         );
         self.write(wb);
+        *self.2.borrow_mut() = Some(commits);
+        Ok(())
+    }
+
+    /// MonadBFT B2: Add a block to the speculative commits list.
+    pub fn add_speculative_commit(&mut self, block: CryptoHash) -> Result<(), BlockTreeError> {
+        let mut commits = self.speculative_commits()?;
+        if !commits.contains(&block) {
+            commits.push(block);
+            self.set_speculative_commits(commits)?;
+        }
+        Ok(())
+    }
+
+    /// MonadBFT B2: Remove irrevocably committed blocks from speculative list.
+    /// No-op (no KV write) when the block was not in the list.
+    pub fn promote_speculative_to_irrevocable(&mut self, block: &CryptoHash) -> Result<(), BlockTreeError> {
+        let mut commits = self.speculative_commits()?;
+        let before = commits.len();
+        commits.retain(|b| b != block);
+        if commits.len() != before {
+            self.set_speculative_commits(commits)?;
+        }
         Ok(())
     }
 
@@ -1602,20 +1625,11 @@ impl<K: KVStore> BlockTreeSingleton<K> {
         &mut self,
         block: &CryptoHash,
     ) -> Result<bool, BlockTreeError> {
-        use borsh::BorshSerialize;
         let mut commits = self.speculative_commits()?;
         let was_speculative = commits.contains(block);
         if was_speculative {
             commits.retain(|b| b != block);
-            let mut wb: BlockTreeWriteBatch<K::WriteBatch> = BlockTreeWriteBatch::new();
-            wb.0.set(
-                &variables::SPECULATIVE_COMMITS,
-                &commits.try_to_vec().map_err(|err| KVSetError::SerializeValueError {
-                    key: Key::HighestTC,
-                    source: err,
-                })?,
-            );
-            self.write(wb);
+            self.set_speculative_commits(commits)?;
         }
         Ok(was_speculative)
     }

@@ -75,6 +75,36 @@ impl NativeDaStore {
         Ok(())
     }
 
+    /// Store many bodies in ONE atomic `WriteBatch`, waking arrival waiters once.
+    ///
+    /// The leader's `produce_block` mirrors a full block's actions (up to the
+    /// per-block cap) before the proposal is encoded; doing that with per-body
+    /// [`put`](Self::put) calls issued N separate RocksDB writes + N notifier
+    /// wakes on the consensus hot path (S395 floor shave #1). Empty input is a
+    /// no-op. Same idempotent overwrite semantics as `put`.
+    pub fn put_batch(&self, actions: &[SignedNativeAction]) -> Result<(), StateError> {
+        if actions.is_empty() {
+            return Ok(());
+        }
+        let mut batch = rocksdb::WriteBatch::default();
+        let cf = self.db.cf_handle(CF_NATIVE_PENDING)?;
+        for action in actions {
+            let hash = compute_action_hash(action);
+            let bytes =
+                bincode::serialize(action).map_err(|e| StateError::InvalidData(e.to_string()))?;
+            batch.put_cf(cf, hash.as_slice(), &bytes);
+        }
+        self.db.write(batch)?;
+        let notifier = arrivals();
+        let mut generation = notifier
+            .generation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *generation = generation.wrapping_add(1);
+        notifier.arrived.notify_all();
+        Ok(())
+    }
+
     /// Snapshot the arrival generation. Take it BEFORE checking the store for
     /// missing bodies and pass it to [`wait_for_arrival`](Self::wait_for_arrival)
     /// so an insert racing the check can never be missed.

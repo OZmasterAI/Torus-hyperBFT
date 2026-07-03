@@ -1095,17 +1095,27 @@ impl<N: Network> HotStuff<N> {
                 })
                 .publish(&self.event_publisher);
 
-                // If the newly collected PC is not correct or not safe, then ignore it and return.
+                // If the newly collected PC is not safe, then ignore it and return.
                 // In the header pipeline, the PC's block may not be in the tree
                 // yet (body in flight) but is tracked in pending_headers.
+                //
+                // S395 floor shave: a PC assembled HERE was built by the collector
+                // exclusively from votes whose signatures were each verified on
+                // entry (`phase_vote.is_correct(signer)` above), against the
+                // current validator-set state (collectors are rebuilt on VS
+                // updates), over the exact same message bytes — so re-running the
+                // full signature loop (`is_correct`) on it was redundant work
+                // (n wasted ed25519 verifies per QC). Remote PCs (a proposal's
+                // `justify`, AdvanceView, sync) still get fully verified at their
+                // own entry points.
+                debug_assert!(
+                    new_pc.is_correct(block_tree)?,
+                    "locally-collected PC must be correct by construction"
+                );
                 let pc_block_pending = self.pending_headers.contains_key(&new_pc.block)
                     || self.pending_bodies.contains_key(&new_pc.block);
-                let pc_safe = if pc_block_pending {
-                    new_pc.is_correct(block_tree)?
-                } else {
-                    new_pc.is_correct(block_tree)?
-                        && safe_pc(&new_pc, block_tree, self.config.chain_id)?
-                };
+                let pc_safe =
+                    pc_block_pending || safe_pc(&new_pc, block_tree, self.config.chain_id)?;
                 if !pc_safe {
                     return Ok(());
                 }
