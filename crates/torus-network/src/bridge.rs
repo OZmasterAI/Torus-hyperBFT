@@ -178,6 +178,7 @@ impl LibP2PNetwork {
             native_da_inbound: Mutex::new(VecDeque::new()),
             pending_native_pushes: Mutex::new(PendingSendQueue::new(8)),
             push_scheduler: Mutex::new(PushScheduler::for_pushes()),
+            allow_private_addrs: config.allow_private_addrs,
         });
 
         let (command_tx, command_rx) = mpsc::unbounded_channel();
@@ -444,6 +445,7 @@ mod tests {
             native_da_inbound: Mutex::new(VecDeque::new()),
             pending_native_pushes: Mutex::new(PendingSendQueue::new(8)),
             push_scheduler: Mutex::new(PushScheduler::for_pushes()),
+            allow_private_addrs: false,
         })
     }
 

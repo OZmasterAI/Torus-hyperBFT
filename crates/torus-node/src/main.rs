@@ -98,6 +98,14 @@ struct Cli {
     #[arg(long)]
     p2p_peers: Option<String>,
 
+    /// Accept loopback/private/link-local peer addresses into the kademlia
+    /// address book. Off by default: on a public network such entries (a NAT'd
+    /// peer's advertised 127.0.0.1, a container's docker subnet) are undialable
+    /// and cause dial storms. Enable on devnets/single-host meshes where the
+    /// fabric is a private subnet. Explicit --p2p-peers are always exempt.
+    #[arg(long, default_value_t = false)]
+    p2p_private_addrs: bool,
+
     /// JSON-RPC listen address
     #[arg(long, default_value = "0.0.0.0:8545")]
     rpc_addr: String,
@@ -437,6 +445,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let network_config = NetworkConfig {
         listen_addr,
         bootstrap_peers,
+        allow_private_addrs: cli.p2p_private_addrs,
         ..NetworkConfig::default()
     };
 

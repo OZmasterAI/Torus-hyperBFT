@@ -284,6 +284,10 @@ pub struct SharedState {
     /// (bounded) and dispatched as in-flight pushes complete (Direct `Response` /
     /// `OutboundFailure`).
     pub push_scheduler: Mutex<PushScheduler<request_response::OutboundRequestId>>,
+    /// Mirror of [`NetworkConfig::allow_private_addrs`]: when false (public
+    /// networks), loopback/private/link-local addresses are kept out of the
+    /// kademlia address book — both identify-advertised and DHT-learned.
+    pub allow_private_addrs: bool,
 }
 
 enum SwarmAction {
@@ -1029,7 +1033,15 @@ fn handle_event(
             let maybe_vk = info.public_key.try_into_ed25519().ok()
                 .and_then(|ed_pk| VerifyingKey::from_bytes(&ed_pk.to_bytes()).ok());
             for addr in info.listen_addrs {
-                swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
+                // A NAT'd peer advertises its loopback/LAN listen addrs; storing
+                // them means we dial ourselves (127.0.0.1:<our port>) or dead
+                // endpoints forever. Keep only globally-dialable addresses
+                // unless this network runs on a private fabric (devnet).
+                if shared.allow_private_addrs || crate::config::is_global_addr(&addr) {
+                    swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
+                } else {
+                    debug!(%peer_id, %addr, "dropping non-global advertised address");
+                }
             }
             // Register non-validator peers (e.g. RPC nodes) so verify_sender_key
             // accepts their direct messages (block sync requests).
@@ -1321,6 +1333,22 @@ fn handle_event(
             for pid in to_dial {
                 info!(%pid, "kademlia bootstrap: dialing validator");
                 let _ = swarm.dial(pid);
+            }
+        }
+        // DHT-learned records (FIND_NODE responses relay other peers' address
+        // books) bypass the identify filter above — evict non-global entries as
+        // they land so stale loopback/container addresses can't re-enter via a
+        // peer that still carries them.
+        SwarmEvent::Behaviour(TorusBehaviourEvent::Kademlia(kad::Event::RoutingUpdated {
+            peer, addresses, ..
+        })) => {
+            if !shared.allow_private_addrs {
+                for addr in addresses.iter() {
+                    if !crate::config::is_global_addr(addr) {
+                        swarm.behaviour_mut().kademlia.remove_address(&peer, addr);
+                        debug!(%peer, %addr, "evicted non-global address from kademlia");
+                    }
+                }
             }
         }
         SwarmEvent::Behaviour(TorusBehaviourEvent::Kademlia(_)) => {}
@@ -2022,6 +2050,7 @@ mod tests {
             native_da_inbound: Mutex::new(VecDeque::new()),
             pending_native_pushes: Mutex::new(PendingSendQueue::new(8)),
             push_scheduler: Mutex::new(PushScheduler::for_pushes()),
+            allow_private_addrs: false,
         }
     }
 

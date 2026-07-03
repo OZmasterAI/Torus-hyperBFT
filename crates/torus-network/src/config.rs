@@ -25,6 +25,45 @@ pub struct NetworkConfig {
     pub consensus_rate_limit_per_peer: u32,
     /// Path to the peer ban list JSON file (Phase 3: 3.1.7).
     pub ban_list_path: Option<PathBuf>,
+    /// Accept loopback/private/link-local addresses into the kademlia address
+    /// book (identify-advertised and DHT-learned). Off by default: on a public
+    /// network these entries are never dialable from here (a NAT'd peer
+    /// advertising `127.0.0.1`, a container advertising its docker subnet) and
+    /// only produce dial storms against ourselves or dead endpoints. Enable on
+    /// devnets / single-host meshes where the fabric IS a private subnet.
+    /// Explicit `--p2p-peers` entries are always exempt — operator intent wins.
+    pub allow_private_addrs: bool,
+}
+
+/// Whether `addr`'s IP component is globally dialable — i.e. not loopback,
+/// RFC1918-private, link-local, CGNAT, unspecified, or broadcast. Multiaddrs
+/// without an IP component (e.g. `/dns4/...`) are considered dialable.
+pub fn is_global_addr(addr: &Multiaddr) -> bool {
+    for p in addr.iter() {
+        match p {
+            Protocol::Ip4(ip) => {
+                let o = ip.octets();
+                return !(ip.is_loopback()
+                    || ip.is_private()
+                    || ip.is_link_local()
+                    || ip.is_unspecified()
+                    || ip.is_broadcast()
+                    // CGNAT 100.64.0.0/10
+                    || (o[0] == 100 && (o[1] & 0xC0) == 64));
+            }
+            Protocol::Ip6(ip) => {
+                let s = ip.segments();
+                return !(ip.is_loopback()
+                    || ip.is_unspecified()
+                    // unique-local fc00::/7
+                    || (s[0] & 0xfe00) == 0xfc00
+                    // link-local fe80::/10
+                    || (s[0] & 0xffc0) == 0xfe80);
+            }
+            _ => continue,
+        }
+    }
+    true
 }
 
 impl NetworkConfig {
@@ -82,6 +121,47 @@ impl Default for NetworkConfig {
             tx_dedup_window_secs: 60,
             consensus_rate_limit_per_peer: 50,
             ban_list_path: None,
+            allow_private_addrs: false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn addr(s: &str) -> Multiaddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn non_global_addresses_rejected() {
+        for s in [
+            "/ip4/127.0.0.1/udp/30333/quic-v1",   // loopback (dial-self)
+            "/ip4/10.1.2.3/udp/30333/quic-v1",    // RFC1918
+            "/ip4/172.28.0.20/udp/30333/quic-v1", // RFC1918 (docker devnet subnet)
+            "/ip4/192.168.1.5/tcp/30333",         // RFC1918
+            "/ip4/169.254.7.7/udp/30333/quic-v1", // link-local
+            "/ip4/100.64.0.9/udp/30333/quic-v1",  // CGNAT
+            "/ip4/0.0.0.0/udp/30333/quic-v1",     // unspecified
+            "/ip6/::1/udp/30333/quic-v1",         // v6 loopback
+            "/ip6/fe80::1/udp/30333/quic-v1",     // v6 link-local
+            "/ip6/fd00::1/udp/30333/quic-v1",     // v6 unique-local
+        ] {
+            assert!(!is_global_addr(&addr(s)), "{s} must be rejected");
+        }
+    }
+
+    #[test]
+    fn global_addresses_accepted() {
+        for s in [
+            "/ip4/95.111.231.121/udp/30333/quic-v1", // live seed
+            "/ip4/84.32.108.220/udp/30333/quic-v1",  // val1
+            "/ip4/100.128.0.1/udp/30333/quic-v1",    // just past CGNAT range
+            "/ip6/2a01:4f8::1/udp/30333/quic-v1",    // public v6
+            "/dns4/seed.example.org/udp/30333/quic-v1", // no IP component
+        ] {
+            assert!(is_global_addr(&addr(s)), "{s} must be accepted");
         }
     }
 }
