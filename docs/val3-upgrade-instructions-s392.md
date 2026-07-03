@@ -1,13 +1,18 @@
-# val3 upgrade instructions — S392 (b96f058)
+# val3 upgrade instructions — S395 (3989416)
 
 Copy-paste for the val3 operator (3rd validator, self-hosted). Supersedes the
-earlier fa7791d instructions. Sent 2026-07-03.
+S392/b96f058 instructions (never run) and the earlier fa7791d ones — this
+replaces them entirely. Sent 2026-07-03.
 
 ---
 
-Big upgrade ready on branch `fix/hotstuff-idle-cpu-spin`. Your node can stay
-up while you build — but **don't restart until I say go** (chain is halted;
-we bring our two up first, then you rejoin).
+New build ready on the same branch `fix/hotstuff-idle-cpu-spin`. Why this one
+matters: with three equal-stake validators the chain can only cross an epoch
+boundary (every 100th view) when **all three** of us vote — so right now it's
+parked, waiting for you. Our two nodes are already running this exact code.
+The moment you're up on it, the chain resumes on its own.
+
+Your node can stay up while you build.
 
 **1. Update + rebuild:**
 
@@ -16,11 +21,22 @@ cd <your-torus-hyperbft-repo>
 git fetch origin fix/hotstuff-idle-cpu-spin
 git checkout fix/hotstuff-idle-cpu-spin
 git pull --ff-only origin fix/hotstuff-idle-cpu-spin
-git log --oneline -1        # must print: b96f058
+git log --oneline -1        # must print: 3989416
 cargo build --release
 ```
 
-**2. Set the DA threshold env var** (you never confirmed this one — it
+Since b96f058 this adds: a pacemaker fix so the chain un-parks after view
+jumps (this is the one that matters for the current halt), per-block hot-path
+cuts, and order-book persistence fixes. All wire-compatible, no config
+migration, defaults unchanged.
+
+**2. Do NOT touch your keys or data directory.** Same keystore, same data
+dir. Your libp2p peer id is derived from your validator key, and our dials to
+you currently fail with "Unexpected peer ID" — a clean restart on this build
+with your existing keystore is exactly what should fix that. If you
+regenerate anything we're worse off.
+
+**3. Set the DA threshold env var** (you never confirmed this one — it
 matters for block dissemination):
 
 - systemd: `sudo systemctl edit <your-service>` and add:
@@ -36,7 +52,7 @@ matters for block dissemination):
   TORUS_HASH_ONLY_PUSH_THRESHOLD=6000000 ./target/release/torus-node ...
   ```
 
-**3. Check your start flags** (still missing last time):
+**4. Check your start flags** (still missing last time):
 
 - `--retention-blocks 100000` — without it your disk grows forever
 - add **both** of our nodes as peers (right now you only reach the seed —
@@ -49,13 +65,16 @@ matters for block dissemination):
 
 - make sure you're NOT passing `--native-gossip=false`
 
-**4. Send me these** so we can fix the gossip gap from our side too:
+**5. Restart into the new binary as soon as the build is done** — no waiting
+for a "go" this time; we're already up and the chain is waiting on you. Just
+ping me right before you restart so I can watch it come back.
 
+**6. Send me these after restart** (so we can confirm the peer-id fix and the
+gossip gap from our side):
+
+- the first ~30 lines of your node's startup log (they include your peer id
+  and listen addresses)
 - your public IP (and confirm UDP 30333 is open inbound on your firewall)
 - `curl -s localhost:9090/metrics | grep torus_native_gossip`
 - `mtr -rz -c 20 95.111.231.121` and `mtr -rz -c 20 84.32.108.220`
   (or `ping -c 20` each if no mtr)
-
-**5. Wait for my "go"**, then restart into the new binary. After restart,
-send me the `torus_native_gossip` metrics again once the chain is moving so
-we can confirm gossip is actually flowing this time.
