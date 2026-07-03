@@ -6,11 +6,11 @@ replaces them entirely. Sent 2026-07-03.
 
 ---
 
-New build ready on the same branch `fix/hotstuff-idle-cpu-spin`. Why this one
-matters: with three equal-stake validators the chain can only cross an epoch
-boundary (every 100th view) when **all three** of us vote — so right now it's
-parked, waiting for you. Our two nodes are already running this exact code.
-The moment you're up on it, the chain resumes on its own.
+New build ready on a new branch: `sprint/blockspeed-orders-s395`. Why this
+one matters: with three equal-stake validators the chain can only cross an
+epoch boundary (every 100th view) when **all three** of us vote — so right
+now it's parked, waiting for you. Our two nodes are already running this
+exact code. The moment you're up on it, the chain resumes on its own.
 
 Your node can stay up while you build.
 
@@ -18,10 +18,9 @@ Your node can stay up while you build.
 
 ```bash
 cd <your-torus-hyperbft-repo>
-git fetch origin fix/hotstuff-idle-cpu-spin
-git checkout fix/hotstuff-idle-cpu-spin
-git pull --ff-only origin fix/hotstuff-idle-cpu-spin
-git log --oneline -1        # must print: 3989416
+git fetch origin sprint/blockspeed-orders-s395
+git checkout sprint/blockspeed-orders-s395
+git log --oneline -8 | grep 69f0a99   # must match — last CODE commit (anything above it is docs-only)
 cargo build --release
 ```
 
