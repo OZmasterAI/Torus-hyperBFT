@@ -43,6 +43,24 @@ pub fn decode_all_txs(rlp_txs: &[Vec<u8>]) -> Result<Vec<DecodedTx>, BridgeError
     rlp_txs.iter().map(|b| decode_rlp_tx(b)).collect()
 }
 
+/// Decode a batch leniently (D3, S392): an undecodable or unsupported tx is
+/// logged and skipped, returning each successfully decoded tx with its
+/// original index in `rlp_txs`. Used on the committed-block execution path,
+/// where one bad tx must never void the whole block's EVM effects.
+pub fn decode_txs_lossy(rlp_txs: &[Vec<u8>]) -> Vec<(usize, DecodedTx)> {
+    rlp_txs
+        .iter()
+        .enumerate()
+        .filter_map(|(i, raw)| match decode_rlp_tx(raw) {
+            Ok(d) => Some((i, d)),
+            Err(e) => {
+                tracing::warn!(tx_index = i, %e, "skipping undecodable EVM tx in committed block");
+                None
+            }
+        })
+        .collect()
+}
+
 /// Convert an alloy `TxEnvelope` into a revm `TxEnv`.
 fn envelope_to_tx_env(envelope: &TxEnvelope, sender: Address) -> Result<TxEnv, BridgeError> {
     let tx_env = match envelope {

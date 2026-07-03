@@ -13,7 +13,7 @@ pub mod state_root;
 pub mod validator;
 
 pub use committer::BlockCommitter;
-pub use decode::{decode_all_txs, decode_rlp_tx, DecodedTx};
+pub use decode::{decode_all_txs, decode_rlp_tx, decode_txs_lossy, DecodedTx};
 pub use error::BridgeError;
 pub use native_executor::{
     sort_native_actions, ActionCategory, NativeActionResult, NativeBatchResult, NativeExecContext,

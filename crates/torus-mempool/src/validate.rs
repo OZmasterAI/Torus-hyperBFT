@@ -28,14 +28,31 @@ fn extract_gas_price(tx: &TxEnvelope) -> (u128, u128) {
 
 /// Decode, validate, and extract metadata from a raw EVM transaction.
 ///
-/// Checks: RLP decode, chain ID, gas limit, signature recovery, nonce, balance.
+/// Checks: RLP decode, tx type, chain ID, gas limit, fee floor, signature
+/// recovery, nonce, balance.
 pub fn validate_evm_tx(
     raw_rlp: &[u8],
     state: &StateDb,
     chain_id: u64,
     block_gas_limit: u64,
+    base_fee: u64,
 ) -> Result<EvmPoolEntry, MempoolError> {
     let tx = decode_tx(raw_rlp)?;
+
+    // D3 (S392): only Legacy/EIP-2930/EIP-1559 execute on Torus. Blob (type 3)
+    // and set-code (type 4) envelopes are rejected before signature recovery so
+    // they can never reach the pool or a proposed block.
+    match &tx {
+        TxEnvelope::Legacy(_) | TxEnvelope::Eip2930(_) | TxEnvelope::Eip1559(_) => {}
+        other => {
+            let tx_type = match other {
+                TxEnvelope::Eip4844(_) => 3,
+                TxEnvelope::Eip7702(_) => 4,
+                _ => 0xFF,
+            };
+            return Err(MempoolError::UnsupportedTxType { tx_type });
+        }
+    }
 
     // Chain ID
     if tx.chain_id() != Some(chain_id) {
@@ -52,6 +69,15 @@ pub fn validate_evm_tx(
             tx_gas: gas_limit,
             block_gas: block_gas_limit,
         });
+    }
+
+    // D4 (S392): dynamic fee floor. A tx whose max fee can't cover the current
+    // base fee would be silently skipped at execution (GasPriceLessThanBasefee)
+    // and strand the sender's nonce — reject it up front instead. `base_fee`
+    // tracks committed headers (frozen at 1 gwei until the fee market unfreezes).
+    let (max_fee, priority_fee) = extract_gas_price(&tx);
+    if max_fee < base_fee as u128 {
+        return Err(MempoolError::FeeTooLow { max_fee, base_fee });
     }
 
     // Sender recovery
@@ -89,7 +115,6 @@ pub fn validate_evm_tx(
     }
 
     // Balance check: gas_limit * max_fee_per_gas + value
-    let (max_fee, priority_fee) = extract_gas_price(&tx);
     let value = tx.value();
     let total_cost = U256::from(gas_limit) * U256::from(max_fee) + value;
 

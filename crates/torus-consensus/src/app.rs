@@ -1704,6 +1704,13 @@ impl App<RocksKVStore> for TorusApp {
             }
         }
 
+        // D4 (S392): pin the mempool's admission fee floor to the base fee
+        // committed blocks actually charge (frozen at 1 gwei today; follows
+        // the header once the fee market unfreezes).
+        if let Some(ref mempool) = self.mempool {
+            mempool.set_base_fee(torus_block.header.base_fee_per_gas);
+        }
+
         if let Some(ref tx) = self.exec_tx {
             let msg = CommittedBlockMsg {
                 torus_block,

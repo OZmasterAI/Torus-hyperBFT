@@ -46,6 +46,10 @@ pub struct MempoolConfig {
     pub chain_id: u64,
     /// Block gas limit for validation.
     pub block_gas_limit: u64,
+    /// Initial admission fee floor in wei (D4, S392): txs with `max_fee_per_gas`
+    /// below the current base fee are rejected. Updated from committed headers
+    /// via [`Mempool::set_base_fee`]; 1 gwei matches the frozen chain base fee.
+    pub initial_base_fee: u64,
     // ---- Rate limiting (Task 3.1.4) ----
     /// Sliding window size in blocks for rate tracking.
     pub rate_window_blocks: u64,
@@ -78,6 +82,7 @@ impl Default for MempoolConfig {
             replacement_bump_pct: 10,
             chain_id: torus_types::eip712::TORUS_CHAIN_ID,
             block_gas_limit: 30_000_000,
+            initial_base_fee: 1_000_000_000,
             rate_window_blocks: rate_limit::RATE_WINDOW_BLOCKS,
             evm_rate_limit_per_window: rate_limit::EVM_RATE_LIMIT_PER_WINDOW,
             native_rate_limit_per_window: rate_limit::NATIVE_RATE_LIMIT_PER_WINDOW,
@@ -101,6 +106,9 @@ pub struct Mempool {
     /// Durable, nonce-gate-decoupled native-action body store (out-of-band DA).
     da_store: NativeDaStore,
     config: MempoolConfig,
+    /// Current base fee in wei — the D4 admission/drain fee floor. Written from
+    /// committed block headers; read on every add_evm_tx and drain.
+    current_base_fee: std::sync::atomic::AtomicU64,
     /// Approximate total memory used by pooled transactions (Phase 3: 3.1.7).
     memory_used: std::sync::atomic::AtomicUsize,
     /// Outbound native action gossip channel (set once at startup).
@@ -134,6 +142,7 @@ impl Mempool {
         // mempool sees is mirrored here durably (decoupled from the nonce gate).
         let da_store = NativeDaStore::new(state.clone());
         let verified_cap = config.verified_sender_cache_cap;
+        let initial_base_fee = config.initial_base_fee;
         Self {
             evm: RwLock::new(evm_pool::EvmPool::new()),
             native: RwLock::new(native_pool),
@@ -141,6 +150,7 @@ impl Mempool {
             state,
             da_store,
             config,
+            current_base_fee: std::sync::atomic::AtomicU64::new(initial_base_fee),
             memory_used: std::sync::atomic::AtomicUsize::new(0),
             native_gossip_tx: std::sync::OnceLock::new(),
             native_gossip_enabled: std::sync::atomic::AtomicBool::new(false),
@@ -214,6 +224,8 @@ impl Mempool {
             &self.state,
             self.config.chain_id,
             self.config.block_gas_limit,
+            self.current_base_fee
+                .load(std::sync::atomic::Ordering::Relaxed),
         )?;
 
         let hash = entry.hash;
@@ -282,8 +294,12 @@ impl Mempool {
     ///
     /// `parent_hash` seeds deterministic same-price shuffling (anti-MEV, Task 3.1.5).
     pub fn drain_evm(&self, gas_limit: u64, parent_hash: B256) -> Vec<Vec<u8>> {
+        // D4 re-check: the floor may have moved since admission.
+        let min_base_fee = self
+            .current_base_fee
+            .load(std::sync::atomic::Ordering::Relaxed) as u128;
         let mut pool = self.evm.write().unwrap();
-        let drained = pool.drain(gas_limit, self.config.evm_per_block_cap, self.config.evm_total_block_cap, &parent_hash);
+        let drained = pool.drain(gas_limit, self.config.evm_per_block_cap, self.config.evm_total_block_cap, &parent_hash, min_base_fee);
         // FIX EVM-FIND-02: Decrement memory for drained transactions.
         let drained_bytes: usize = drained.iter().map(|tx| tx.len()).sum();
         if drained_bytes > 0 {
@@ -291,6 +307,18 @@ impl Mempool {
                 .fetch_sub(drained_bytes, std::sync::atomic::Ordering::Relaxed);
         }
         drained
+    }
+
+    /// Update the D4 fee floor from a committed block header's base fee.
+    pub fn set_base_fee(&self, base_fee: u64) {
+        self.current_base_fee
+            .store(base_fee, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Current D4 fee floor in wei.
+    pub fn base_fee(&self) -> u64 {
+        self.current_base_fee
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Current EVM pool size.
@@ -1252,11 +1280,13 @@ mod tests {
 
         let k5 = key(15);
         fund(&state, &address_from_key(&k5), U256::from(10u64.pow(18)), 0);
+        // At the D4 floor (1 gwei) but not outbidding the cheapest pooled tx
+        // (same max fee, lower priority fee) — still PoolFull, not FeeTooLow.
         let err = pool
             .add_evm_tx(create_eip1559_tx(
                 &k5,
                 0,
-                500_000_000,
+                1_000_000_000,
                 50_000_000,
                 21_000,
                 U256::ZERO,
@@ -1675,5 +1705,138 @@ mod tests {
         // Nonces 0 and 1 should be pruned, 2 and 3 remain
         assert_eq!(pool.evm_pool_size(), 2);
         assert_eq!(pool.pending_nonce(&addr), 4);
+    }
+
+    // ---- D3/D4 (S392): tx-type gate and fee floor ----
+
+    fn sign_envelope<T>(key: &SigningKey, tx: T) -> Vec<u8>
+    where
+        T: SignableTransaction<AlloySig>,
+        TxEnvelope: From<alloy_consensus::Signed<T>>,
+    {
+        let sig_hash = tx.signature_hash();
+        let (sig, recid) = key.sign_prehash_recoverable(sig_hash.as_slice()).unwrap();
+        let signature = AlloySig::new(
+            U256::from_be_slice(sig.r().to_bytes().as_slice()),
+            U256::from_be_slice(sig.s().to_bytes().as_slice()),
+            recid.is_y_odd(),
+        );
+        let envelope = TxEnvelope::from(tx.into_signed(signature));
+        let mut buf = Vec::new();
+        envelope.encode(&mut buf);
+        buf
+    }
+
+    fn create_eip4844_tx(key: &SigningKey, nonce: u64) -> Vec<u8> {
+        sign_envelope(
+            key,
+            alloy_consensus::TxEip4844 {
+                chain_id: torus_types::eip712::TORUS_CHAIN_ID,
+                nonce,
+                gas_limit: 21_000,
+                max_fee_per_gas: 2_000_000_000,
+                max_priority_fee_per_gas: 1,
+                to: Address::ZERO,
+                value: U256::ZERO,
+                input: Bytes::new(),
+                access_list: Default::default(),
+                blob_versioned_hashes: vec![B256::repeat_byte(1)],
+                max_fee_per_blob_gas: 1,
+            },
+        )
+    }
+
+    fn create_eip7702_tx(key: &SigningKey, nonce: u64) -> Vec<u8> {
+        sign_envelope(
+            key,
+            alloy_consensus::TxEip7702 {
+                chain_id: torus_types::eip712::TORUS_CHAIN_ID,
+                nonce,
+                gas_limit: 21_000,
+                max_fee_per_gas: 2_000_000_000,
+                max_priority_fee_per_gas: 1,
+                to: Address::ZERO,
+                value: U256::ZERO,
+                input: Bytes::new(),
+                access_list: Default::default(),
+                authorization_list: vec![],
+            },
+        )
+    }
+
+    #[test]
+    fn rejects_blob_tx_type_at_admission() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state.clone(), MempoolConfig::default());
+        let k = key(95);
+        fund(&state, &address_from_key(&k), U256::from(10u64.pow(18)), 0);
+
+        let err = pool.add_evm_tx(create_eip4844_tx(&k, 0)).unwrap_err();
+        assert!(
+            matches!(err, MempoolError::UnsupportedTxType { tx_type: 3 }),
+            "expected UnsupportedTxType(3), got: {err}"
+        );
+        assert_eq!(pool.evm_pool_size(), 0);
+    }
+
+    #[test]
+    fn rejects_setcode_tx_type_at_admission() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state.clone(), MempoolConfig::default());
+        let k = key(96);
+        fund(&state, &address_from_key(&k), U256::from(10u64.pow(18)), 0);
+
+        let err = pool.add_evm_tx(create_eip7702_tx(&k, 0)).unwrap_err();
+        assert!(
+            matches!(err, MempoolError::UnsupportedTxType { tx_type: 4 }),
+            "expected UnsupportedTxType(4), got: {err}"
+        );
+        assert_eq!(pool.evm_pool_size(), 0);
+    }
+
+    #[test]
+    fn admission_rejects_max_fee_below_base_fee() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state.clone(), MempoolConfig::default());
+        let k = key(97);
+        let addr = address_from_key(&k);
+        fund(&state, &addr, U256::from(10u64.pow(18)), 0);
+
+        // 0.999999999 gwei < the 1-gwei floor.
+        let err = pool
+            .add_evm_tx(create_eip1559_tx(&k, 0, 999_999_999, 0, 21_000, U256::ZERO))
+            .unwrap_err();
+        assert!(
+            matches!(err, MempoolError::FeeTooLow { .. }),
+            "expected FeeTooLow, got: {err}"
+        );
+
+        // Nonce chain unaffected: the SAME nonce at the floor is admitted cleanly.
+        pool.add_evm_tx(create_eip1559_tx(&k, 0, 1_000_000_000, 100, 21_000, U256::ZERO))
+            .unwrap();
+        assert_eq!(pool.pending_nonce(&addr), 1);
+    }
+
+    #[test]
+    fn drain_recheck_drops_below_floor_txs() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state.clone(), MempoolConfig::default());
+        let k = key(98);
+        fund(&state, &address_from_key(&k), U256::from(10u64.pow(18)), 0);
+
+        pool.add_evm_tx(create_eip1559_tx(&k, 0, 1_000_000_000, 100, 21_000, U256::ZERO))
+            .unwrap();
+
+        // Floor rises after admission: the tx must NOT be selected, but stays pooled.
+        pool.set_base_fee(2_000_000_000);
+        assert!(
+            pool.drain_evm(30_000_000, B256::ZERO).is_empty(),
+            "below-floor tx must not be drained into a block"
+        );
+        assert_eq!(pool.evm_pool_size(), 1, "tx stays pooled for when the fee drops");
+
+        // Floor falls back: the tx becomes selectable again.
+        pool.set_base_fee(1_000_000_000);
+        assert_eq!(pool.drain_evm(30_000_000, B256::ZERO).len(), 1);
     }
 }

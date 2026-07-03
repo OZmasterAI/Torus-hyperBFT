@@ -8,7 +8,7 @@ use torus_evm::{BlockEnvCfg, EvmExecutor};
 use torus_state::{StateDb, StateOverlay};
 use torus_types::{NativeAction, Receipt, TorusBlock};
 
-use crate::decode::decode_all_txs;
+use crate::decode::{decode_all_txs, decode_txs_lossy, DecodedTx};
 use crate::error::BridgeError;
 use crate::state_root::{
     compute_full_composite_root, compute_post_bundle_state_root, flagged_native_root,
@@ -113,8 +113,18 @@ impl BlockValidator {
             }
         }
 
-        let decoded_txs = decode_all_txs(&block.evm_transactions)?;
-        let tx_envs: Vec<_> = decoded_txs.iter().map(|d| d.tx_env.clone()).collect();
+        // D3 (S392): on the committed/catchup path an undecodable tx skips only
+        // itself — never the whole block's EVM execution. Strict (vote-side)
+        // validation still rejects such blocks outright.
+        let decoded_txs: Vec<(usize, DecodedTx)> = if skip_state_root_check {
+            decode_txs_lossy(&block.evm_transactions)
+        } else {
+            decode_all_txs(&block.evm_transactions)?
+                .into_iter()
+                .enumerate()
+                .collect()
+        };
+        let tx_envs: Vec<_> = decoded_txs.iter().map(|(_, d)| d.tx_env.clone()).collect();
 
         let block_cfg = BlockEnvCfg {
             number: block.header.height,
@@ -126,12 +136,7 @@ impl BlockValidator {
 
         let mut exec_result = evm_executor.execute_block(state_db, &block_cfg, tx_envs, skip_state_root_check)?;
 
-        for (i, receipt) in exec_result.receipts.iter_mut().enumerate() {
-            if let Some(dtx) = decoded_txs.get(i) {
-                receipt.tx_hash = dtx.tx_hash;
-            }
-            receipt.block_number = block.header.height;
-        }
+        align_receipts(&mut exec_result, &decoded_txs, block.header.height);
 
         if !skip_state_root_check {
             if exec_result.gas_used != block.header.evm_gas_used {
@@ -208,8 +213,11 @@ impl BlockValidator {
         merged_parent_bundle: &BundleState,
         evm_executor: &EvmExecutor,
     ) -> Result<ValidatedBlock, BridgeError> {
-        let decoded_txs = decode_all_txs(&block.evm_transactions)?;
-        let tx_envs: Vec<_> = decoded_txs.iter().map(|d| d.tx_env.clone()).collect();
+        let decoded_txs: Vec<(usize, DecodedTx)> = decode_all_txs(&block.evm_transactions)?
+            .into_iter()
+            .enumerate()
+            .collect();
+        let tx_envs: Vec<_> = decoded_txs.iter().map(|(_, d)| d.tx_env.clone()).collect();
 
         let block_cfg = BlockEnvCfg {
             number: block.header.height,
@@ -222,12 +230,7 @@ impl BlockValidator {
         let mut exec_result =
             evm_executor.execute_block_with_overlay(overlay, &block_cfg, tx_envs, false)?;
 
-        for (i, receipt) in exec_result.receipts.iter_mut().enumerate() {
-            if let Some(dtx) = decoded_txs.get(i) {
-                receipt.tx_hash = dtx.tx_hash;
-            }
-            receipt.block_number = block.header.height;
-        }
+        align_receipts(&mut exec_result, &decoded_txs, block.header.height);
 
         if exec_result.gas_used != block.header.evm_gas_used {
             return Err(BridgeError::InvalidBlock(format!(
@@ -356,9 +359,17 @@ impl BlockValidator {
             sender_actions.push((sender, signed.action.clone()));
         }
 
-        // Execute EVM transactions.
-        let decoded_txs = decode_all_txs(&block.evm_transactions)?;
-        let tx_envs: Vec<_> = decoded_txs.iter().map(|d| d.tx_env.clone()).collect();
+        // Execute EVM transactions. D3 (S392): lossy decode on the catchup
+        // path so one bad tx can't void the whole block's EVM effects.
+        let decoded_txs: Vec<(usize, DecodedTx)> = if skip_state_root_check {
+            decode_txs_lossy(&block.evm_transactions)
+        } else {
+            decode_all_txs(&block.evm_transactions)?
+                .into_iter()
+                .enumerate()
+                .collect()
+        };
+        let tx_envs: Vec<_> = decoded_txs.iter().map(|(_, d)| d.tx_env.clone()).collect();
 
         let block_cfg = BlockEnvCfg {
             number: block.header.height,
@@ -370,12 +381,7 @@ impl BlockValidator {
 
         let mut exec_result = evm_executor.execute_block(state_db, &block_cfg, tx_envs, skip_state_root_check)?;
 
-        for (i, receipt) in exec_result.receipts.iter_mut().enumerate() {
-            if let Some(dtx) = decoded_txs.get(i) {
-                receipt.tx_hash = dtx.tx_hash;
-            }
-            receipt.block_number = block.header.height;
-        }
+        align_receipts(&mut exec_result, &decoded_txs, block.header.height);
 
         if exec_result.gas_used != block.header.evm_gas_used {
             return Err(BridgeError::InvalidBlock(format!(
@@ -429,6 +435,32 @@ impl BlockValidator {
             native_sender_actions: sender_actions,
             native_consumed_nonces: consumed_nonces,
         })
+    }
+}
+
+/// D5 (S392): map executor receipts back to the txs that produced them.
+///
+/// `receipts[j]` came from input env `included_indices[j]`, and
+/// `decoded[included_indices[j]].0` is that tx's ORIGINAL index in
+/// `block.evm_transactions`. Receipts carry the original body index in
+/// `tx_index` so CF_RECEIPTS, CF_TX_HASH_TO_LOCATION and body lookups stay
+/// aligned when a tx is skipped mid-block; skipped txs get no receipt.
+fn align_receipts(
+    exec: &mut torus_evm::executor::BlockExecResult,
+    decoded: &[(usize, DecodedTx)],
+    height: u64,
+) {
+    let torus_evm::executor::BlockExecResult {
+        receipts,
+        included_indices,
+        ..
+    } = exec;
+    for (j, receipt) in receipts.iter_mut().enumerate() {
+        if let Some((orig_idx, dtx)) = included_indices.get(j).and_then(|&e| decoded.get(e)) {
+            receipt.tx_hash = dtx.tx_hash;
+            receipt.tx_index = *orig_idx as u32;
+        }
+        receipt.block_number = height;
     }
 }
 

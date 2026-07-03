@@ -121,13 +121,14 @@ impl BlockCommitter {
         batch.put_cf(cf_hash_to_num, block_hash.as_slice(), &height_key);
 
         // 7. Tx hash → location index (height(8) || tx_index(4)).
-        for (i, _tx_bytes) in block.evm_transactions.iter().enumerate() {
-            if let Some(receipt) = receipts.get(i) {
-                let mut location = [0u8; 12];
-                location[..8].copy_from_slice(&height_key);
-                location[8..12].copy_from_slice(&(i as u32).to_be_bytes());
-                batch.put_cf(cf_tx_loc, receipt.tx_hash.as_slice(), &location);
-            }
+        // D5 (S392): drive off the receipts, not a positional zip — when a tx is
+        // skipped mid-block, receipts[i] is NOT the receipt of evm_transactions[i].
+        // Each receipt carries its original body index in tx_index.
+        for receipt in receipts {
+            let mut location = [0u8; 12];
+            location[..8].copy_from_slice(&height_key);
+            location[8..12].copy_from_slice(&receipt.tx_index.to_be_bytes());
+            batch.put_cf(cf_tx_loc, receipt.tx_hash.as_slice(), &location);
         }
 
         // Atomic write — all or nothing.
@@ -180,13 +181,13 @@ impl BlockCommitter {
 
         batch.put_cf(cf_hash_to_num, block_hash.as_slice(), &height_key);
 
-        for (i, _tx_bytes) in block.evm_transactions.iter().enumerate() {
-            if let Some(receipt) = receipts.get(i) {
-                let mut location = [0u8; 12];
-                location[..8].copy_from_slice(&height_key);
-                location[8..12].copy_from_slice(&(i as u32).to_be_bytes());
-                batch.put_cf(cf_tx_loc, receipt.tx_hash.as_slice(), &location);
-            }
+        // D5 (S392): drive off the receipts (see commit_block step 7) — skipped
+        // txs get no receipt and therefore no location entry.
+        for receipt in receipts {
+            let mut location = [0u8; 12];
+            location[..8].copy_from_slice(&height_key);
+            location[8..12].copy_from_slice(&receipt.tx_index.to_be_bytes());
+            batch.put_cf(cf_tx_loc, receipt.tx_hash.as_slice(), &location);
         }
 
         state_db.write(batch)?;

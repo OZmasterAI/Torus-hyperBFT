@@ -283,12 +283,14 @@ impl EvmPool {
     ///
     /// Task 3.1.4: `per_sender_limit` caps txs per address in a single block.
     /// Task 3.1.5: `parent_hash` seeds deterministic same-price shuffling (anti-MEV).
+    /// D4 (S392): `min_base_fee` re-checks the fee floor at selection time.
     pub fn drain(
         &mut self,
         gas_budget: u64,
         per_sender_limit: usize,
         total_limit: usize,
         parent_hash: &B256,
+        min_base_fee: u128,
     ) -> Vec<Vec<u8>> {
         let mut heap = BinaryHeap::new();
         for (sender, txs) in &self.by_sender {
@@ -310,6 +312,13 @@ impl EvmPool {
         let mut sender_counts: HashMap<Address, usize> = HashMap::new();
 
         while let Some(top) = heap.pop() {
+            // D4 (S392) drain re-check: the heap pops highest fee first, so once
+            // the top is below the floor everything remaining is too — stop
+            // selecting. Below-floor txs stay pooled (the floor is dynamic).
+            if top.max_fee_per_gas < min_base_fee {
+                break;
+            }
+
             // Per-sender-per-block limit (Task 3.1.4): leave excess in pool.
             let count = sender_counts.get(&top.sender).copied().unwrap_or(0);
             if count >= per_sender_limit {

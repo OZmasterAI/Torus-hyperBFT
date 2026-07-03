@@ -44,6 +44,10 @@ pub enum MempoolError {
     NativeValidationFailed(String),
     /// FIX EVM-FIND-08: Transaction nonce is too far in the future.
     NonceTooFar { sender: Address, have: u64, max: u64 },
+    /// D3 (S392): blob (type 3) / set-code (type 4) transactions are not supported.
+    UnsupportedTxType { tx_type: u8 },
+    /// D4 (S392): max fee per gas is below the current base fee.
+    FeeTooLow { max_fee: u128, base_fee: u64 },
 }
 
 impl fmt::Display for MempoolError {
@@ -90,6 +94,15 @@ impl fmt::Display for MempoolError {
             }
             Self::NonceTooFar { sender, have, max } => {
                 write!(f, "nonce too far in future for {sender}: have {have}, max {max}")
+            }
+            Self::UnsupportedTxType { tx_type } => {
+                write!(f, "transaction type not supported: type {tx_type}")
+            }
+            Self::FeeTooLow { max_fee, base_fee } => {
+                write!(
+                    f,
+                    "max fee per gas ({max_fee}) below current base fee ({base_fee})"
+                )
             }
         }
     }
