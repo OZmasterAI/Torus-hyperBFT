@@ -74,6 +74,74 @@ async fn eth_call_rejects_historical_block_tag() {
     handle.stop().unwrap();
 }
 
+/// D2 (S392) acceptance: bare eth_call (no fee fields) from an EMPTY account
+/// at height > 0 with base_fee = 1 gwei succeeds — geth/reth call semantics.
+/// Pre-fix this failed with GasPriceLessThanBasefee; the bug hid because other
+/// tests run at height 0, where BlockEnvCfg::default() carries base_fee 0.
+#[tokio::test]
+async fn bare_eth_call_succeeds_at_height_with_base_fee() {
+    let (_dir, state, mempool, executor) = setup();
+
+    // Commit a height-1 header carrying the chain's 1-gwei base fee BEFORE the
+    // server starts, so find_latest_height reports latest = 1.
+    let header = torus_types::TorusBlockHeader {
+        height: 1,
+        timestamp: 1000,
+        proposer: alloy_primitives::Address::repeat_byte(0x99),
+        state_root: alloy_primitives::B256::ZERO,
+        receipts_root: alloy_primitives::B256::ZERO,
+        logs_bloom: alloy_primitives::Bloom::ZERO,
+        evm_gas_used: 0,
+        evm_fee_revenue: 0,
+        evm_gas_limit: 30_000_000,
+        native_action_count: 0,
+        evm_tx_count: 0,
+        base_fee_per_gas: 1_000_000_000,
+        epoch: 0,
+        validator_set_hash: alloy_primitives::B256::ZERO,
+        sig_attestation: [0u8; 64],
+    };
+    let canonical = header.canonical_header_bytes();
+    let block_hash = alloy_primitives::keccak256(&canonical);
+    let mut data = block_hash.to_vec();
+    data.extend(serde_json::to_vec(&header).unwrap());
+    state
+        .put_cf_raw(torus_state::cf::CF_BLOCK_HEADERS, &1u64.to_be_bytes(), &data)
+        .unwrap();
+
+    let (handle, addr) = start_server(state, mempool, executor).await;
+    let client = HttpClientBuilder::default()
+        .build(format!("http://{addr}"))
+        .unwrap();
+
+    // Never-funded account, no gas/fee fields.
+    let call_obj = serde_json::json!({
+        "from": "0x00000000000000000000000000000000000000ee",
+        "to": "0x00000000000000000000000000000000000000bb",
+        "data": "0x"
+    });
+    let result: Result<String, _> = client
+        .request("eth_call", rpc_params![call_obj.clone(), "latest"])
+        .await;
+    assert!(
+        result.is_ok(),
+        "bare eth_call from empty account at height>0 must succeed, got: {:?}",
+        result.err()
+    );
+
+    // Same bare request through eth_estimateGas.
+    let est: Result<String, _> = client
+        .request("eth_estimateGas", rpc_params![call_obj])
+        .await;
+    assert!(
+        est.is_ok(),
+        "bare eth_estimateGas must succeed, got: {:?}",
+        est.err()
+    );
+
+    handle.stop().unwrap();
+}
+
 /// FIX 8 + 15: eth_estimateGas returns error (not gas_used) on revert.
 #[tokio::test]
 async fn estimate_gas_returns_error_on_revert() {

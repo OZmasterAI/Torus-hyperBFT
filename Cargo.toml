@@ -48,7 +48,9 @@ torus-node = { path = "crates/torus-node" }
 hotstuff_rs = { path = "crates/hotstuff_rs" }
 
 # EVM — pinned to 36 to match reth v2.0.0 (revm 37 not yet adopted by reth)
-revm = "36"
+# optional_no_base_fee: exposes CfgEnv::disable_base_fee for the eth_call
+# simulation path (D2, S392). Defaults to false — consensus exec unaffected.
+revm = { version = "36", features = ["optional_no_base_fee"] }
 
 # Ethereum types (alloy)
 alloy-primitives = { version = "1.5", features = ["serde"] }

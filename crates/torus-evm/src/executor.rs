@@ -98,6 +98,31 @@ impl EvmExecutor {
         block_cfg: &BlockEnvCfg,
         tx: TxEnv,
     ) -> Result<(TxExecResult, BundleState), EvmError> {
+        self.execute_tx_inner(state_db, block_cfg, tx, false)
+    }
+
+    /// Execute a transaction in CALL-SIMULATION mode (D2, S392): standard
+    /// geth/reth eth_call / eth_estimateGas semantics. Base-fee and nonce
+    /// checks are disabled, so a bare call (omitted fee fields => gas price 0)
+    /// from an empty account succeeds at height > 0. Provided fee fields still
+    /// charge normally, and value transfers still require balance — exactly
+    /// geth. Never use this on a consensus path.
+    pub fn execute_call(
+        &self,
+        state_db: &StateDb,
+        block_cfg: &BlockEnvCfg,
+        tx: TxEnv,
+    ) -> Result<(TxExecResult, BundleState), EvmError> {
+        self.execute_tx_inner(state_db, block_cfg, tx, true)
+    }
+
+    fn execute_tx_inner(
+        &self,
+        state_db: &StateDb,
+        block_cfg: &BlockEnvCfg,
+        tx: TxEnv,
+        call_mode: bool,
+    ) -> Result<(TxExecResult, BundleState), EvmError> {
         let state = State::builder()
             .with_database_ref(state_db)
             .with_bundle_update()
@@ -108,6 +133,10 @@ impl EvmExecutor {
             .modify_cfg_chained(|cfg| {
                 cfg.set_spec_and_mainnet_gas_params(SpecId::CANCUN);
                 cfg.chain_id = chain_id;
+                if call_mode {
+                    cfg.disable_base_fee = true;
+                    cfg.disable_nonce_check = true;
+                }
             })
             .modify_block_chained(|b| apply_block_env(b, block_cfg))
             .with_db(state);

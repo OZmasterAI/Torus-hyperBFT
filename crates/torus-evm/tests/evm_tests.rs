@@ -58,6 +58,46 @@ fn transfer_tx(from: Address, to: Address, value: U256, nonce: u64, gas_price: u
 }
 
 // ---------------------------------------------------------------------------
+// D2 (S392): call-simulation mode — geth/reth eth_call semantics
+// ---------------------------------------------------------------------------
+#[test]
+fn call_mode_allows_bare_call_from_empty_account() {
+    let (_dir, db) = open_test_db();
+    let executor = EvmExecutor::new(TORUS_CHAIN_ID);
+    let block_cfg = default_block_cfg(); // height 1, base_fee = 1 gwei
+
+    // Never-funded caller; omitted fee fields => gas_price 0 < base_fee.
+    let empty = Address::new([0xEE; 20]);
+    let tx = transfer_tx(empty, BOB, U256::ZERO, 0, 0);
+    let (result, _) = executor
+        .execute_call(&db, &block_cfg, tx)
+        .expect("call mode must disable the base-fee check");
+    assert!(result.success);
+
+    // The consensus path must still reject the same underpriced tx.
+    let tx = transfer_tx(empty, BOB, U256::ZERO, 0, 0);
+    assert!(
+        executor.execute_tx(&db, &block_cfg, tx).is_err(),
+        "execute_tx must keep enforcing the base fee"
+    );
+}
+
+#[test]
+fn call_mode_ignores_nonce_mismatch() {
+    let (_dir, db) = open_test_db();
+    let executor = EvmExecutor::new(TORUS_CHAIN_ID);
+    let block_cfg = default_block_cfg();
+
+    // State nonce is 0; a stale or arbitrary nonce must not fail a simulation.
+    let empty = Address::new([0xEE; 20]);
+    let tx = transfer_tx(empty, BOB, U256::ZERO, 7, 0);
+    let (result, _) = executor
+        .execute_call(&db, &block_cfg, tx)
+        .expect("nonce check disabled in call mode");
+    assert!(result.success);
+}
+
+// ---------------------------------------------------------------------------
 // 1. Simple ETH transfer
 // ---------------------------------------------------------------------------
 #[test]

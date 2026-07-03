@@ -842,9 +842,11 @@ impl EthApiServer for RpcState {
                 .map(|a| a.nonce)
                 .unwrap_or(0);
         }
+        // D2 (S392): call-simulation mode — geth semantics (no base-fee/nonce
+        // checks), so bare calls work at height > 0 with a nonzero base fee.
         let (result, _) = self
             .executor
-            .execute_tx(&self.state, &block_env, tx_env)
+            .execute_call(&self.state, &block_env, tx_env)
             .map_err(|e| err(RpcError::Evm(e.to_string())))?;
         // FIX 15: Return revert reason when execution fails.
         if !result.success {
@@ -892,9 +894,10 @@ impl EthApiServer for RpcState {
                 .unwrap_or(0);
         }
         tx_env.gas_limit = hi;
+        // D2 (S392): call-simulation mode — see `call` above.
         let (result, _) = self
             .executor
-            .execute_tx(&self.state, &block_env, tx_env)
+            .execute_call(&self.state, &block_env, tx_env)
             .map_err(|e| err(RpcError::Evm(e.to_string())))?;
         // FIX 8 (EVM-FIND-10): Return error on revert instead of gas used.
         // FIX 15: Include revert reason in error data.
@@ -911,7 +914,7 @@ impl EthApiServer for RpcState {
             let mid = lo + (hi - lo) / 2;
             let mut tx_env = build_call_tx_env(&tx, self.chain_id).map_err(err)?;
             tx_env.gas_limit = mid;
-            match self.executor.execute_tx(&self.state, &block_env, tx_env) {
+            match self.executor.execute_call(&self.state, &block_env, tx_env) {
                 Ok((r, _)) if r.success => hi = mid,
                 _ => lo = mid,
             }
