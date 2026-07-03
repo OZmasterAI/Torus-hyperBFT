@@ -91,10 +91,20 @@ pub struct NativeExecContext<T: StateBackend = StateDb> {
 
     /// Order books (per market, in-memory).
     pub order_books: HashMap<MarketId, OrderBook>,
+    /// Markets whose book was mutated during THIS block (placed / matched /
+    /// cancelled / modified). `save_order_books` writes only these — untouched
+    /// books already hold identical bytes in the CF, so skipping them is
+    /// byte-identical in final state (state-root-safe even in mixed
+    /// deployments) and turns the old O(all resting orders) rewrite into
+    /// O(touched) (S395).
+    pub dirty_books: std::collections::HashSet<MarketId>,
     /// Per-market margin configuration.
     pub margin_configs: HashMap<MarketId, MarketMarginConfig>,
     /// FIX 6 (ECON-FIND-09): Global order ID counter shared across all markets.
     pub next_global_order_id: u128,
+    /// Counter value at load time — the counter row is persisted only when it
+    /// advanced this block (or was never stored), so no-order blocks write nothing.
+    loaded_next_global_order_id: Option<u128>,
 
     // Block metadata
     pub block_height: u64,
@@ -134,7 +144,13 @@ impl<T: StateBackend> NativeExecContext<T> {
         let governance = GovernanceManager::new(state.clone());
 
         // FIX 1 (ECON-FIND-02): Load persisted order books from DB on startup.
-        let (order_books, next_global_order_id) = Self::load_order_books(&state);
+        let (order_books, scanned_next_id) = Self::load_order_books(&state);
+        // S395: the durable counter row is authoritative when present — the
+        // book-maxima scan resets to 1 once all books drain, silently reusing
+        // order ids across a restart. max() keeps back-compat with DBs written
+        // before the counter row existed.
+        let persisted_next_id = Self::load_next_global_order_id(&state);
+        let next_global_order_id = scanned_next_id.max(persisted_next_id.unwrap_or(1));
 
         Self {
             positions,
@@ -143,8 +159,10 @@ impl<T: StateBackend> NativeExecContext<T> {
             governance,
             state,
             order_books,
+            dirty_books: std::collections::HashSet::new(),
             margin_configs: HashMap::new(),
             next_global_order_id,
+            loaded_next_global_order_id: persisted_next_id,
             block_height,
             timestamp,
             epoch,
@@ -187,16 +205,44 @@ impl<T: StateBackend> NativeExecContext<T> {
         (books, next_id)
     }
 
-    /// FIX 1 (ECON-FIND-02): Persist all order books to DB. Called after block execution.
-    pub fn save_order_books(&self) {
-        use torus_state::cf::CF_NATIVE_ORDER_BOOKS;
+    /// Durable global-order-id counter row. Lives in `CF_NATIVE_MARKETS` — a
+    /// non-consensus-root CF (NOT one of `NATIVE_ROOT_CFS`, and every reader of
+    /// that CF skips keys whose length != 8) — so it is node-local metadata
+    /// that can never perturb the state root and is invisible to old binaries.
+    const NEXT_GLOBAL_ORDER_ID_KEY: &'static [u8] = b"__next_global_order_id__";
 
-        for (&market_id, book) in &self.order_books {
+    /// Read the persisted counter, if the row exists (DBs written before S395
+    /// have none — the caller falls back to the book-maxima scan).
+    fn load_next_global_order_id(state: &T) -> Option<u128> {
+        use torus_state::cf::CF_NATIVE_MARKETS;
+        let bytes = state
+            .get_cf_raw(CF_NATIVE_MARKETS, Self::NEXT_GLOBAL_ORDER_ID_KEY)
+            .ok()
+            .flatten()?;
+        Some(u128::from_be_bytes(bytes.try_into().ok()?))
+    }
+
+    /// FIX 1 (ECON-FIND-02) + S395 dirty-only rewrite: persist the order books
+    /// TOUCHED this block (placed / matched / cancelled / modified) and the
+    /// global order-id counter when it advanced. Untouched books already hold
+    /// identical bytes in the CF — the old rewrite-everything loop cost
+    /// O(all resting orders) in Borsh serialization per block. Returns the
+    /// number of book rows written (test hook). Called after block execution.
+    pub fn save_order_books(&self) -> usize {
+        use torus_state::cf::{CF_NATIVE_MARKETS, CF_NATIVE_ORDER_BOOKS};
+
+        let mut written = 0;
+        for &market_id in &self.dirty_books {
+            let Some(book) = self.order_books.get(&market_id) else {
+                continue;
+            };
             let key = market_id.to_be_bytes();
             match borsh::to_vec(book) {
                 Ok(data) => {
                     if let Err(e) = self.state.put_cf_raw(CF_NATIVE_ORDER_BOOKS, &key, &data) {
                         tracing::error!(market_id, %e, "failed to persist order book");
+                    } else {
+                        written += 1;
                     }
                 }
                 Err(e) => {
@@ -204,6 +250,20 @@ impl<T: StateBackend> NativeExecContext<T> {
                 }
             }
         }
+
+        // Persist the counter only when it moved (or was never stored), so
+        // blocks without order flow write nothing at all.
+        if self.loaded_next_global_order_id != Some(self.next_global_order_id) {
+            if let Err(e) = self.state.put_cf_raw(
+                CF_NATIVE_MARKETS,
+                Self::NEXT_GLOBAL_ORDER_ID_KEY,
+                &self.next_global_order_id.to_be_bytes(),
+            ) {
+                tracing::error!(%e, "failed to persist next_global_order_id");
+            }
+        }
+
+        written
     }
 }
 
@@ -513,6 +573,7 @@ impl NativeExecutor {
 
             // Reinsert updated book
             ctx.order_books.insert(market_id, mbr.book);
+            ctx.dirty_books.insert(market_id);
 
             // Update global ID high-water mark
             if mbr.next_order_id > ctx.next_global_order_id {
@@ -670,6 +731,7 @@ impl NativeExecutor {
         }
 
         // Get or create order book for this market.
+        ctx.dirty_books.insert(market_id);
         let book = ctx
             .order_books
             .entry(market_id)
@@ -882,6 +944,7 @@ impl NativeExecutor {
                 // FIX 2 (ECON-FIND-05): Release order margin on cancel.
                 let notional = cancelled.price * cancelled.remaining_qty;
                 let market_id = book.market_id;
+                ctx.dirty_books.insert(market_id);
                 let max_lev = ctx
                     .margin_configs
                     .get(&market_id)
@@ -916,6 +979,9 @@ impl NativeExecutor {
             Some(mid) => {
                 if let Some(book) = ctx.order_books.get_mut(&mid) {
                     let cancelled = book.cancel_all(*sender, Some(mid));
+                    if !cancelled.is_empty() {
+                        ctx.dirty_books.insert(mid);
+                    }
                     for order in &cancelled {
                         let notional = order.price * order.remaining_qty;
                         let max_lev = ctx
@@ -933,6 +999,9 @@ impl NativeExecutor {
                 for mid in market_ids {
                     if let Some(book) = ctx.order_books.get_mut(&mid) {
                         let cancelled = book.cancel_all(*sender, None);
+                        if !cancelled.is_empty() {
+                            ctx.dirty_books.insert(mid);
+                        }
                         for order in &cancelled {
                             let notional = order.price * order.remaining_qty;
                             let max_lev = ctx
@@ -971,6 +1040,7 @@ impl NativeExecutor {
             // Capture old order state for margin delta calculation.
             let old_order = book.get_order(order_id).cloned();
             if let Ok(modified) = book.modify_order(order_id, new_price, new_qty) {
+                ctx.dirty_books.insert(book.market_id);
                 // FIX 2 (ECON-FIND-05): Adjust order margin for the modified order.
                 if let Some(old) = old_order {
                     let market_id = book.market_id;

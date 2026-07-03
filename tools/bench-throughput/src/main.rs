@@ -106,6 +106,11 @@ enum Command {
         /// per-action ecrecover cost).
         #[arg(long, default_value = "eip712")]
         sign_mode: String,
+        /// Spread orders uniformly across market ids 1..=N (per ORDER inside a
+        /// batch). 1 = legacy single-market shape, which skips the chain's
+        /// per-market parallel matching entirely (S372/S395).
+        #[arg(long, default_value_t = 1)]
+        markets: u64,
     },
     Combined {
         #[arg(long, default_value = "http://localhost:8545,http://localhost:8546,http://localhost:8547,http://localhost:8548")]
@@ -211,10 +216,11 @@ fn sign_payload_batch(
     submit_batch: usize,
     mut last_nonce: u64,
     bin: bool,
+    markets: u64,
 ) -> (Vec<String>, u64) {
     let mut payloads = Vec::with_capacity(submit_batch);
     for _ in 0..submit_batch {
-        let action = random_place_order_action(rng, 1, batch_size);
+        let action = random_place_order_action(rng, markets, batch_size);
         let base = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -250,13 +256,14 @@ fn pregen_ammo(
     count: usize,
     bin: bool,
     base_nonce: u64,
+    markets: u64,
 ) -> Vec<Vec<String>> {
     let mut nonce = base_nonce;
     let mut ammo = Vec::with_capacity(count);
     for _ in 0..count {
         let mut payloads = Vec::with_capacity(submit_batch);
         for _ in 0..submit_batch {
-            let action = random_place_order_action(rng, 1, batch_size);
+            let action = random_place_order_action(rng, markets, batch_size);
             let signed = sign_one(action, nonce, key, session, mode);
             nonce += 1;
             let bytes = if bin {
@@ -285,14 +292,25 @@ fn fire_interval(submit_batch: usize, rate: usize) -> Option<Duration> {
 
 /// Build one action carrying `batch_size` orders. `batch_size <= 1` returns a plain
 /// `PlaceOrder` (the legacy single path) for apples-to-apples A/B runs.
-fn random_place_order_action(rng: &mut impl Rng, market_id: u64, batch_size: usize) -> NativeAction {
+///
+/// `markets` > 1 spreads orders uniformly across market ids `1..=markets`
+/// (per ORDER, so one PlaceOrderBatch fans out to many books) — a single-market
+/// load shape skips `MarketWorkerPool::match_parallel` entirely
+/// (market_workers.rs single-market fast path) and measures one book's
+/// sequential ceiling, not the chain's (S372 finding, S395 knob).
+fn random_place_order_action(rng: &mut impl Rng, markets: u64, batch_size: usize) -> NativeAction {
+    let markets = markets.max(1);
     if batch_size <= 1 {
+        let market_id = rng.gen_range(1..=markets);
         return random_place_order(rng, market_id);
     }
     let orders: Vec<PlaceOrderParams> = (0..batch_size)
-        .map(|_| match random_place_order(rng, market_id) {
-            NativeAction::PlaceOrder(p) => p,
-            _ => unreachable!(),
+        .map(|_| {
+            let market_id = rng.gen_range(1..=markets);
+            match random_place_order(rng, market_id) {
+                NativeAction::PlaceOrder(p) => p,
+                _ => unreachable!(),
+            }
         })
         .collect();
     NativeAction::PlaceOrderBatch(orders)
@@ -969,6 +987,7 @@ async fn run_consensus(
     pre_sign: usize,
     rate: usize,
     sign_mode: SignMode,
+    markets: u64,
 ) {
     let rpc_urls: Vec<String> = rpc_urls_str.split(',').map(|s| s.trim().to_string()).collect();
     let num_senders = senders.max(1);
@@ -1115,7 +1134,7 @@ async fn run_consensus(
                 let mut rng = StdRng::from_entropy();
                 pregen_ammo(
                     &mut rng, &key, &session, sign_mode, batch_size, submit_batch, pre_sign, bin,
-                    base_nonce,
+                    base_nonce, markets,
                 )
             }));
         }
@@ -1330,6 +1349,7 @@ async fn run_consensus(
                             submit_batch,
                             last_nonce,
                             bin,
+                            markets,
                         );
                         last_nonce = n;
                         if pregen_tx.blocking_send(payloads).is_err() {
@@ -1672,6 +1692,7 @@ async fn main() {
             pre_sign,
             rate,
             sign_mode,
+            markets,
         } => {
             let bin = match format.as_str() {
                 "bin" => true,
@@ -1701,6 +1722,7 @@ async fn main() {
                 pre_sign,
                 rate,
                 mode,
+                markets,
             )
             .await
         }
@@ -1725,8 +1747,8 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(7);
         let key = k256::ecdsa::SigningKey::from_slice(&[0x11; 32]).unwrap();
         let ed = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]);
-        let (p1, n1) = sign_payload_batch(&mut rng, &key, &ed, SignMode::Eip712, 3, 4, 0, false);
-        let (p2, n2) = sign_payload_batch(&mut rng, &key, &ed, SignMode::Eip712, 3, 4, n1, false);
+        let (p1, n1) = sign_payload_batch(&mut rng, &key, &ed, SignMode::Eip712, 3, 4, 0, false, 1);
+        let (p2, n2) = sign_payload_batch(&mut rng, &key, &ed, SignMode::Eip712, 3, 4, n1, false, 1);
         assert_eq!(p1.len(), 4);
         assert_eq!(p2.len(), 4);
         assert!(n2 > n1, "nonce watermark must advance across batches");
@@ -1774,7 +1796,7 @@ mod tests {
         // a wall-clock nonce would mask it). 3 payloads x 10 actions = 30-action
         // stream, expected nonces BASE..BASE+30.
         const BASE: u64 = 1_700_000_000_000;
-        let ammo = pregen_ammo(&mut rng, &key, &ed, SignMode::Eip712, 1, 10, 3, false, BASE);
+        let ammo = pregen_ammo(&mut rng, &key, &ed, SignMode::Eip712, 1, 10, 3, false, BASE, 1);
         assert_eq!(ammo.len(), 3, "one payload-vec per requested count");
         assert!(ammo.iter().all(|p| p.len() == 10), "each payload carries submit_batch actions");
 
