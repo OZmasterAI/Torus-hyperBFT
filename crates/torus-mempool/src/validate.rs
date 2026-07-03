@@ -54,12 +54,19 @@ pub fn validate_evm_tx(
         }
     }
 
-    // Chain ID
-    if tx.chain_id() != Some(chain_id) {
-        return Err(MempoolError::InvalidChainId {
-            have: tx.chain_id(),
-            want: chain_id,
-        });
+    // Chain ID: exact match, or None for pre-EIP-155 LEGACY txs — required for
+    // Nick's-method keyless deploys (canonical Multicall3 at 0xcA11...CA11,
+    // D6 S392). Such txs are cross-chain replayable by design; typed txs
+    // always carry a chain id and stay strictly checked.
+    match tx.chain_id() {
+        Some(id) if id == chain_id => {}
+        None if matches!(tx, TxEnvelope::Legacy(_)) => {}
+        have => {
+            return Err(MempoolError::InvalidChainId {
+                have,
+                want: chain_id,
+            });
+        }
     }
 
     // Gas limit

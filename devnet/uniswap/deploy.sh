@@ -31,9 +31,12 @@ deploy() {
     shift 2
     local ARGS=("$@")
 
-    echo -n "Deploying $NAME... "
+    # Progress goes to stderr: callers capture stdout for the address alone
+    # (D6 fix — the old version leaked the progress line into $(deploy ...)).
+    echo -n "Deploying $NAME... " >&2
     local RESULT
     RESULT=$(forge create \
+        --broadcast \
         --rpc-url "$RPC" \
         --private-key "$DEPLOYER_KEY" \
         --gas-price "$GAS_PRICE" \
@@ -41,11 +44,11 @@ deploy() {
         --json \
         --root "$SCRIPT_DIR" \
         "$BYTECODE" \
-        "${ARGS[@]}" 2>&1) || { echo "FAILED: $RESULT"; exit 1; }
+        "${ARGS[@]}" 2>&1) || { echo "FAILED: $RESULT" >&2; exit 1; }
 
     local ADDR
     ADDR=$(echo "$RESULT" | jq -r '.deployedTo')
-    echo "$ADDR"
+    echo "$ADDR" >&2
     echo "$ADDR"
 }
 
@@ -151,6 +154,29 @@ done
 echo "Distributed 100M of each token to 9 test accounts"
 
 echo ""
+echo "=== Multicall3 (canonical, Nick's method) ==="
+# D6 (S392): deploy canonical Multicall3 at 0xcA11...CA11 by funding the
+# keyless deployer and publishing the well-known presigned pre-EIP-155 legacy
+# tx (admission accepts chain-id-less legacy txs for exactly this). Vendored
+# from github.com/mds1/multicall3: nonce 0, 100 gwei, 1M gas => needs 0.1 TRS.
+MULTICALL3_ADDR="0xcA11bde05977b3631167028862bE2a173976CA11"
+MULTICALL3_DEPLOYER="0x05f32B3cC3888453ff71B01135B34FF8e41263F2"
+MULTICALL3_TX_FILE="$SCRIPT_DIR/multicall3-presigned.tx"
+if [ "$(cast code --rpc-url "$RPC" "$MULTICALL3_ADDR" 2>/dev/null)" != "0x" ]; then
+    echo "Multicall3 already deployed at $MULTICALL3_ADDR"
+elif [ -s "$MULTICALL3_TX_FILE" ]; then
+    cast send --private-key "$DEPLOYER_KEY" --rpc-url "$RPC" --gas-price "$GAS_PRICE" --priority-gas-price "$GAS_PRICE" \
+        --value "200000000000000000" "$MULTICALL3_DEPLOYER" >/dev/null 2>&1 || true
+    if cast publish --rpc-url "$RPC" "$(tr -d '[:space:]' < "$MULTICALL3_TX_FILE")" >/dev/null 2>&1; then
+        echo "Multicall3 deployed at $MULTICALL3_ADDR"
+    else
+        echo "WARN: Multicall3 publish failed (non-fatal)"
+    fi
+else
+    echo "WARN: $MULTICALL3_TX_FILE missing — skipping Multicall3"
+fi
+
+echo ""
 echo "=== Deployment Complete ==="
 
 # Save addresses
@@ -162,6 +188,7 @@ cat > "$SCRIPT_DIR/addresses.json" << EOF
     "weth": "$WETH",
     "factory": "$FACTORY",
     "router": "$ROUTER",
+    "multicall3": "$MULTICALL3_ADDR",
     "tokenA": "$TOKEN_A",
     "tokenB": "$TOKEN_B",
     "tokenC": "$TOKEN_C",

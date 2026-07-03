@@ -18,7 +18,7 @@ use revm::database::BundleState;
 use revm::state::AccountInfo;
 use rocksdb::WriteBatch;
 
-use crate::cf::{CF_ACCOUNTS, CF_HASHED_ACCOUNTS, CF_HASHED_STORAGE, CF_STORAGE};
+use crate::cf::{CF_ACCOUNTS, CF_CODE, CF_HASHED_ACCOUNTS, CF_HASHED_STORAGE, CF_STORAGE};
 use crate::db::{decode_account_info, encode_account_info, storage_key, StateDb, KECCAK_EMPTY};
 use crate::error::StateError;
 use crate::trie::{compute_state_root, compute_storage_root, TrieAccount, EMPTY_ROOT_HASH};
@@ -265,6 +265,16 @@ pub fn apply_bundle_plain(
                 }
             }
         }
+    }
+
+    // Contract bytecode (CF_CODE). The plain-commit path writes
+    // `bundle.contracts` too; omitting it here left every contract deployed
+    // through the Phase-A incremental commit with a code_hash but NO stored
+    // bytecode — all calls saw empty code. Caught by the D6 uniswap e2e (S392).
+    let cf_code = db.cf_handle(CF_CODE)?;
+    for (code_hash, bytecode) in &bundle.contracts {
+        let raw = bytecode.bytes();
+        batch.put_cf(cf_code, code_hash.as_slice(), raw.as_ref());
     }
     Ok(())
 }

@@ -58,6 +58,66 @@ fn transfer_tx(from: Address, to: Address, value: U256, nonce: u64, gas_price: u
 }
 
 // ---------------------------------------------------------------------------
+// D6 (S392): CREATE2 — first repo-wide coverage; Uniswap-style pair address
+// math depends on it.
+// ---------------------------------------------------------------------------
+#[test]
+fn create2_deploys_at_deterministic_address() {
+    // A creation tx whose init code runs CREATE2(salt=42) on a 5-byte child
+    // init code and RETURNs the created address as its "runtime code": the
+    // call output then carries the child address with no second tx or state
+    // persistence needed. It must equal
+    // keccak256(0xff ++ deployer ++ salt ++ keccak256(child_init))[12..].
+    let (_dir, db) = open_test_db();
+    let ten_eth = U256::from(10_000_000_000_000_000_000u128);
+    db.put_account(&ALICE, &test_account(ten_eth)).unwrap();
+
+    let executor = EvmExecutor::new(TORUS_CHAIN_ID);
+    let block_cfg = default_block_cfg();
+
+    // PUSH1 0, PUSH1 0, RETURN — child deploys with empty runtime.
+    let child_init: [u8; 5] = [0x60, 0x00, 0x60, 0x00, 0xf3];
+    #[rustfmt::skip]
+    let init_code: Vec<u8> = vec![
+        0x64, 0x60, 0x00, 0x60, 0x00, 0xf3, // PUSH5 <child init>
+        0x60, 0x00, 0x52,                   // MSTORE at 0 (right-aligned: mem[27..32])
+        0x60, 0x2a,                         // PUSH1 42  (salt)
+        0x60, 0x05,                         // PUSH1 5   (size)
+        0x60, 0x1b,                         // PUSH1 27  (offset)
+        0x60, 0x00,                         // PUSH1 0   (value)
+        0xf5,                               // CREATE2
+        0x60, 0x00, 0x52,                   // MSTORE created address at 0
+        0x60, 0x20, 0x60, 0x00, 0xf3,       // RETURN mem[0..32]
+    ];
+
+    let tx = TxEnv {
+        caller: ALICE,
+        gas_limit: 1_000_000,
+        gas_price: block_cfg.base_fee as u128,
+        kind: TxKind::Create,
+        value: U256::ZERO,
+        data: Bytes::from(init_code),
+        nonce: 0,
+        chain_id: Some(TORUS_CHAIN_ID),
+        ..Default::default()
+    };
+    let (result, _bundle) = executor.execute_tx(&db, &block_cfg, tx).unwrap();
+    assert!(result.success, "CREATE2 deployer tx must succeed");
+
+    let deployer = result.contract_address.expect("deployer address");
+    assert_eq!(result.output.len(), 32, "output is the returned address word");
+    let created = Address::from_slice(&result.output[12..32]);
+    assert_ne!(created, Address::ZERO, "CREATE2 must not fail (returns 0 on failure)");
+
+    let salt = B256::from(U256::from(42u64));
+    let expected = deployer.create2(salt, alloy_primitives::keccak256(child_init));
+    assert_eq!(
+        created, expected,
+        "CREATE2 address must follow keccak256(0xff ++ deployer ++ salt ++ init_hash)"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // D2 (S392): call-simulation mode — geth/reth eth_call semantics
 // ---------------------------------------------------------------------------
 #[test]

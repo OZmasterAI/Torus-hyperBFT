@@ -31,3 +31,44 @@ jobs:
 
       - name: Test
         run: cargo test --workspace
+
+  # D6 (S392): full Uniswap-V2 proof — 1-node devnet, deploy Factory/Router/
+  # tokens + canonical Multicall3 (Nick's method), add liquidity, swap, assert
+  # balances and receipts. The node runs with the 15M EVM gas budget override
+  # (the D1 bench setting) so contract deploys have headroom over the 5M debut.
+  uniswap-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: foundry-rs/foundry-toolchain@v1
+
+      - name: Build node
+        run: cargo build -p torus-node
+
+      - name: Start single-validator devnet
+        run: |
+          python3 devnet/uniswap/make-ci-genesis.py devnet/genesis.json /tmp/genesis-ci.json
+          TORUS_EVM_BLOCK_GAS_BUDGET=15000000 nohup ./target/debug/torus-node \
+            --genesis /tmp/genesis-ci.json \
+            --data-dir /tmp/torus-ci-data \
+            --validator-key 0100000000000000000000000000000000000000000000000000000000000000 \
+            --p2p-listen /ip4/127.0.0.1/udp/30333/quic-v1 \
+            --rpc-addr 127.0.0.1:8545 \
+            --log-level info > /tmp/node.log 2>&1 &
+          for i in $(seq 1 60); do
+            if cast block-number --rpc-url http://127.0.0.1:8545 >/dev/null 2>&1; then break; fi
+            sleep 2
+          done
+          cast chain-id --rpc-url http://127.0.0.1:8545
+
+      - name: Deploy Uniswap V2 + Multicall3
+        run: bash devnet/uniswap/deploy.sh http://127.0.0.1:8545
+
+      - name: Swap and assert
+        run: bash devnet/uniswap/ci-swap-check.sh http://127.0.0.1:8545
+
+      - name: Node log on failure
+        if: failure()
+        run: tail -150 /tmp/node.log

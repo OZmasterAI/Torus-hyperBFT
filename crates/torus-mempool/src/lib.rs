@@ -1877,4 +1877,27 @@ mod tests {
         pool.set_base_fee(1_000_000_000);
         assert_eq!(pool.drain_evm(30_000_000, B256::ZERO).len(), 1);
     }
+
+    #[test]
+    fn accepts_pre_eip155_legacy_tx() {
+        // D6 (S392): Nick's-method keyless deploys (canonical Multicall3) are
+        // pre-EIP-155 legacy txs with NO chain id — admission must accept them.
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state.clone(), MempoolConfig::default());
+        let k = key(99);
+        fund(&state, &address_from_key(&k), U256::from(10u64.pow(18)), 0);
+
+        let tx = alloy_consensus::TxLegacy {
+            chain_id: None,
+            nonce: 0,
+            gas_price: 2_000_000_000,
+            gas_limit: 21_000,
+            to: TxKind::Call(Address::ZERO),
+            value: U256::ZERO,
+            input: Bytes::new(),
+        };
+        let raw = sign_envelope(&k, tx);
+        pool.add_evm_tx(raw).expect("pre-155 legacy tx must be admitted");
+        assert_eq!(pool.evm_pool_size(), 1);
+    }
 }
