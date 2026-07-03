@@ -20,7 +20,6 @@ pub mod pending_send;
 pub mod peer_scoring;
 pub mod swarm;
 pub mod sync;
-pub mod transport;
 pub mod tx_gossip;
 
 pub use bridge::{should_push_hashes_only, LibP2PNetwork, HASH_ONLY_PUSH_THRESHOLD};
