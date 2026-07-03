@@ -82,6 +82,31 @@ files and build.
 D3 -> D4 -> D5 (small, independent, testable together) -> D2 (call executor
 cfg) -> D1 (caps, needs bench) -> D6 (proves everything end-to-end).
 
+## Implementation notes (S392 — all six shipped)
+
+Commits: `6830efb` (D3+D4+D5), `0113917` (D2), `c6834e2` (D1), `ac927a8`
+(D6 + CF_CODE fix). All decided behavior implemented; two field-driven
+deviations and one discovery:
+
+- **D1 share cap: first-tx grace.** A hard 25% share cap strands any tx
+  larger than the share forever (admission passes at block-gas-limit, drain
+  can never select => stuck nonce; a ~4.2M-gas Uniswap Router deploy could
+  never land at 5M x 25%). Implemented: a sender's FIRST selected tx is
+  bounded only by the remaining block budget; the share cap throttles 2nd+
+  txs. Admission also bounds tx gas by min(block gas limit, EVM budget) for
+  the same stuck-nonce reason.
+- **D6 Multicall3 needed a pre-EIP-155 allowance.** "Chain accepts legacy
+  txs" was false for chain-id-less ones — admission required chain_id ==
+  7778. Nick's-method deploys are pre-155 by construction, so admission now
+  accepts chain-id-less LEGACY txs only (typed txs stay strictly checked).
+- **CF_CODE chain bug found by the D6 e2e.** The Phase-A incremental commit
+  never wrote `bundle.contracts`: every contract deployed since Phase A had
+  a code_hash with no stored bytecode (all calls saw empty code). Fixed in
+  `ac927a8`; the deploy->swap e2e is green after.
+
+D1 acceptance bench (mixed load at the 15M override) remains open — it gates
+the 5M -> 15M default raise and runs after the testnet relaunch.
+
 ## Explicitly out of scope for this set
 Fee-market unfreeze (base fee dynamics), logs index CF, WS subscription fixes,
 historical state, receipts trie in headers — see roadmap items 8-16
