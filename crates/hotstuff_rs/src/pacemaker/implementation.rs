@@ -523,6 +523,26 @@ impl<N: Network> Pacemaker<N> {
             self.state.update_timeouts(next_view, &self.config);
         }
 
+        // 2b. S395 liveness fix: the per-epoch schedule assigns every view an ABSOLUTE
+        // deadline (`epoch_start_time + gap * max_view_time`). That is correct for a
+        // replica that is BEHIND schedule (missed views' deadlines are in the past, so
+        // it burns through them instantly), but a replica that gets AHEAD of schedule
+        // would inherit a deadline far in the future and park until it: (a) a restart
+        // that jumps forward via a persisted/received TC from a long no-quorum churn
+        // (observed live: ~39k-view intra-epoch jump = ~5.5h park at view 642500), and
+        // (b) a fast QC run whose accumulated surplus turns one dead leader into a
+        // minutes-long stall. When the deadline of the view we are ENTERING is more
+        // than 2x max_view_time away, the remaining schedule is stale for this
+        // replica: rebase it to start from now (same routine as an epoch entry).
+        let scheduled = *self
+            .state
+            .timeouts
+            .get(&next_view)
+            .ok_or(UpdateViewError::GetViewTimeoutError { view: next_view })?;
+        if scheduled > Instant::now() + self.config.max_view_time * 2 {
+            self.state.update_timeouts(next_view, &self.config);
+        }
+
         // 3. Update the Pacemaker's `view_info` state.
         self.view_info = ViewInfo::new(
             next_view,
@@ -978,4 +998,104 @@ fn select_leader_fairness_test() {
             validator_set.power(validator).unwrap().int() as usize
         )
     })
+}
+
+/// No-op network for pacemaker unit tests: `update_view` never sends, so the
+/// sender handle only needs to exist.
+#[cfg(test)]
+#[derive(Clone)]
+struct NullNetwork;
+
+#[cfg(test)]
+impl Network for NullNetwork {
+    fn init_validator_set(&mut self, _: ValidatorSet) {}
+    fn update_validator_set(&mut self, _: crate::types::update_sets::ValidatorSetUpdates) {}
+    fn broadcast(&mut self, _: Message) {}
+    fn send(&mut self, _: VerifyingKey, _: Message) {}
+    fn recv(&mut self) -> Option<(VerifyingKey, Message)> {
+        None
+    }
+}
+
+/// Single-validator pacemaker fixture starting at `init_view`, 500ms view time,
+/// 100k-view epochs (the live testnet shape).
+#[cfg(test)]
+fn test_pacemaker(init_view: u64) -> (Pacemaker<NullNetwork>, ValidatorSetState) {
+    use crate::types::{data_types::Power, update_sets::ValidatorSetUpdates};
+    use ed25519_dalek::SigningKey;
+    use rand_core::OsRng;
+
+    let mut csprg = OsRng {};
+    let keypair = SigningKey::generate(&mut csprg);
+    let config = PacemakerConfiguration {
+        chain_id: ChainID::new(0),
+        keypair: Keypair::new(keypair.clone()),
+        epoch_length: EpochLength::new(100_000),
+        max_view_time: Duration::from_millis(500),
+    };
+    let mut vs = ValidatorSet::new();
+    let mut updates = ValidatorSetUpdates::new();
+    updates.insert(keypair.verifying_key(), Power::new(1));
+    vs.apply_updates(&updates);
+    let vss = ValidatorSetState::new(vs.clone(), vs, None, true);
+    let pacemaker = Pacemaker::new(
+        config,
+        SenderHandle::new(NullNetwork),
+        ViewNumber::new(init_view),
+        &vss,
+        None,
+    )
+    .unwrap();
+    (pacemaker, vss)
+}
+
+/// S395 regression: entering a view whose scheduled deadline is far in the future
+/// (forward jump via a persisted/received TC after a long no-quorum churn) must
+/// rebase the schedule instead of parking the pacemaker until the stale absolute
+/// deadline (observed live: ~39k-view intra-epoch jump = ~5.5h park at view 642500).
+#[test]
+fn update_view_jump_rebases_stale_schedule() {
+    let (mut pacemaker, vss) = test_pacemaker(1);
+    let max_view_time = Duration::from_millis(500);
+
+    pacemaker.update_view(ViewNumber::new(39_000), &vss).unwrap();
+    assert!(
+        pacemaker.query().deadline <= Instant::now() + max_view_time * 2,
+        "jumped-to view must not inherit a stale far-future deadline"
+    );
+
+    // Views AFTER the jump target must be rebased too, or every subsequent
+    // sequential advance would park again.
+    pacemaker.update_view(ViewNumber::new(39_001), &vss).unwrap();
+    assert!(pacemaker.query().deadline <= Instant::now() + max_view_time * 2);
+}
+
+/// A fast QC run (advancing far ahead of the wall-clock schedule) must not
+/// accumulate unbounded surplus: one dead leader after a fast burst previously
+/// stalled until the schedule caught up (minutes), instead of one view time.
+#[test]
+fn update_view_fast_run_deadline_bounded() {
+    let (mut pacemaker, vss) = test_pacemaker(1);
+    for v in 2..=50u64 {
+        pacemaker.update_view(ViewNumber::new(v), &vss).unwrap();
+    }
+    assert!(
+        pacemaker.query().deadline <= Instant::now() + Duration::from_millis(500) * 2,
+        "fast-run surplus must be bounded to 2x max_view_time"
+    );
+}
+
+/// The cumulative schedule is preserved while on/near schedule: a single-step
+/// advance right after init keeps its scheduled deadline (~2 view times out)
+/// rather than being rebased to one view time.
+#[test]
+fn update_view_on_schedule_keeps_cumulative_deadline() {
+    let (mut pacemaker, vss) = test_pacemaker(1);
+    pacemaker.update_view(ViewNumber::new(2), &vss).unwrap();
+    let deadline = pacemaker.query().deadline;
+    assert!(
+        deadline > Instant::now() + Duration::from_millis(600),
+        "on-schedule advance must keep the cumulative deadline, not rebase"
+    );
+    assert!(deadline <= Instant::now() + Duration::from_millis(1100));
 }

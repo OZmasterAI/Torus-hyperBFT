@@ -1323,9 +1323,9 @@ impl App<RocksKVStore> for TorusApp {
             // still in flight on the wire (s355 duplicate-inclusion tail).
             self.in_flight_hashes.extend_into(&mut in_flight);
             let native = mempool.select_native_for_block_with_senders_excluding(
-                torus_mempool::rate_limit::NATIVE_TOTAL_BLOCK_CAP,
+                torus_mempool::rate_limit::native_total_block_cap(),
                 &in_flight,
-                torus_mempool::rate_limit::NATIVE_BLOCK_BYTES_CAP,
+                torus_mempool::rate_limit::native_block_bytes_cap(),
             );
             let evm = mempool.drain_evm(gas_limit, parent_header.state_root);
             if !evm.is_empty() || !native.is_empty() {

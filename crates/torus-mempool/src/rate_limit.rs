@@ -57,6 +57,20 @@ pub fn evm_sender_share_pct() -> u32 {
 /// Max native actions per sender per block.
 pub const NATIVE_PER_BLOCK_CAP: usize = 64;
 
+/// Effective per-sender native action cap: `TORUS_NATIVE_PER_BLOCK_CAP`
+/// overrides the compiled default PER NODE (same pattern as
+/// `TORUS_EVM_BLOCK_GAS_BUDGET`). Proposer-local selection policy —
+/// validate_block does not reject on count, so mixed values can't fork.
+pub fn native_per_block_cap() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("TORUS_NATIVE_PER_BLOCK_CAP")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(NATIVE_PER_BLOCK_CAP)
+    })
+}
+
 /// Max total native actions per block (all senders combined). Held at 100 — this
 /// also bounds the block BODY to a size that disseminates over the WAN. s365
 /// raised it to 1000 and it WEDGED under 3-box load: blocks grew to ~292 actions
@@ -68,6 +82,22 @@ pub const NATIVE_PER_BLOCK_CAP: usize = 64;
 /// bodies, docs/plans). Enforced only in produce_block selection; validate_block
 /// does not reject on count, so mixed cap values don't fork.
 pub const NATIVE_TOTAL_BLOCK_CAP: usize = 100;
+
+/// Effective total native action cap: `TORUS_NATIVE_TOTAL_BLOCK_CAP` overrides
+/// the compiled default PER NODE. Proposer-local selection policy (enforced
+/// only in produce_block; validate_block does not reject on count) — mixed
+/// values across validators cannot fork consensus. The S387 cap-probe proved
+/// cap=1000 no longer wedges (push-hardening + c408c0e off-loop pull serving);
+/// the compiled default stays 100 until a full-mesh bench earns the raise.
+pub fn native_total_block_cap() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("TORUS_NATIVE_TOTAL_BLOCK_CAP")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(NATIVE_TOTAL_BLOCK_CAP)
+    })
+}
 
 /// Max total native pool size. With gossip replication, each validator holds
 /// actions from all peers, so this must be large enough for the full mesh.
@@ -109,6 +139,20 @@ pub const NATIVE_ORDERS_PER_BLOCK_CAP: usize = 50_000;
 /// and the proposal moves ~hashes only, so the per-block budget rises to 6MB
 /// (~40k orders at ~150B/order). Gap-pulls + rotated body fetch cover misses.
 pub const NATIVE_BLOCK_BYTES_CAP: usize = 6_000_000;
+
+/// Effective native block bytes cap: `TORUS_NATIVE_BLOCK_BYTES_CAP` overrides
+/// the compiled default PER NODE. Proposer-local (selection stops before the
+/// cap; validators execute whatever the committed block carries) — safe to A/B
+/// on one proposer without coordination.
+pub fn native_block_bytes_cap() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("TORUS_NATIVE_BLOCK_BYTES_CAP")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(NATIVE_BLOCK_BYTES_CAP)
+    })
+}
 
 /// Capacity of the per-node exec trust-cache (`verified_senders`: locally-verified
 /// action hash -> recovered sender). Sized to comfortably bridge the in-flight

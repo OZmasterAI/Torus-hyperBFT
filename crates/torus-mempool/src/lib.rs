@@ -82,7 +82,7 @@ impl Default for MempoolConfig {
             initial_base_fee: 1_000_000_000,
             evm_block_gas_budget: rate_limit::evm_block_gas_budget(),
             evm_sender_share_pct: rate_limit::evm_sender_share_pct(),
-            native_per_block_cap: rate_limit::NATIVE_PER_BLOCK_CAP,
+            native_per_block_cap: rate_limit::native_per_block_cap(),
             native_pool_max_size: rate_limit::NATIVE_POOL_MAX_SIZE,
             native_per_sender_cap: rate_limit::NATIVE_PER_SENDER_CAP,
             verified_sender_cache_cap: rate_limit::VERIFIED_SENDER_CACHE_CAP,
