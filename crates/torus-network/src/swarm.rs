@@ -609,14 +609,31 @@ pub async fn run_swarm_with_config(
                     info!(missing = to_dial.len(), "mesh: dialing unconnected validators");
                 }
 
+                // peer_map also holds non-validator peers (RPC nodes), hence
+                // the is_validator_peer filter for everything below.
+                let validator_pids: Vec<PeerId> = mapped.iter()
+                    .filter(|pid| is_validator_peer(&shared, pid))
+                    .copied()
+                    .collect();
+
+                // Explicit peering (Task 4): validators always receive our
+                // publishes/forwards directly (subscription still required) and
+                // gossipsub redials them on heartbeat. Idempotent HashSet
+                // insert. NOTE: explicit peers are kept OUT of the mesh by
+                // design (a GRAFT from one is PRUNEd), so peering must be
+                // reciprocal — do not deploy to a mixed fleet where some
+                // validators run pre-explicit-peer builds.
+                for pid in &validator_pids {
+                    swarm.behaviour_mut().gossipsub.add_explicit_peer(pid);
+                }
+
                 // Watchdog (S395 wedge): a CURRENT-validator peer that stays
                 // connected but unsubscribed to the consensus topic past grace
                 // gets a forced disconnect; the dial above re-establishes the
                 // connection next tick, re-running the subscription exchange
-                // the fast-restart race lost. peer_map also holds non-validator
-                // peers (RPC nodes), hence the is_validator_peer filter.
-                let connected_validators: Vec<PeerId> = mapped.iter()
-                    .filter(|pid| swarm.is_connected(pid) && is_validator_peer(&shared, pid))
+                // the fast-restart race lost.
+                let connected_validators: Vec<PeerId> = validator_pids.iter()
+                    .filter(|pid| swarm.is_connected(pid))
                     .copied()
                     .collect();
                 let consensus_hash = consensus_topic.hash();
