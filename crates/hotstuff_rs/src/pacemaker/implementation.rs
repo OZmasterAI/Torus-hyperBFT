@@ -801,6 +801,20 @@ impl ViewInfo {
 /// Deterministically select a replica in `validator_set` to become the leader of `view` using the
 /// [Interleaved WRR](https://en.wikipedia.org/wiki/Weighted_round_robin#Interleaved_WRR) algorithm.
 ///
+/// The abstract IWRR array is: for each threshold `t` in `1..=p_max`, every validator (in
+/// `validators()` order) whose power is `>= t`. The leader of `view` is the element at
+/// `view % total_power`.
+///
+/// Computed in closed form, O(n log n) in the number of validators. The previous
+/// implementation walked the abstract array entry-by-entry — O(view % total_power) work per
+/// call with a HashMap lookup per step. With live powers of stake/wei (= 2,000,000 per
+/// validator, total 6,000,000) the walk grew linearly with view number for millions of views:
+/// ~1.2M iterations per call at view 1.18M, several calls per view on every replica. That was
+/// the chain-wide block-cadence "height drag" (S405: 268ms/blk at view 700k → 475ms at 1.16M —
+/// perf showed select_leader + its hashing at >20% of the algorithm thread). The reference
+/// walk survives as `select_leader_reference` in tests; `select_leader_closed_form_matches_reference`
+/// proves output equivalence exhaustively — the two are consensus-identical.
+///
 /// [Read more](super#leader-selection).
 pub fn select_leader(view: ViewNumber, validator_set: &ValidatorSet) -> VerifyingKey {
     // Length of the abstract array.
@@ -816,33 +830,44 @@ pub fn select_leader(view: ViewNumber, validator_set: &ValidatorSet) -> Verifyin
     );
 
     // Index in the abstract array.
-    let index = view.int() % (p_total.int() as u64);
-    // Max. power among the validators.
-    // Safety: n > 0 asserted above, so max() always returns Some.
-    let p_max = validator_set
-        .validators_and_powers()
-        .iter()
-        .map(|(_, power)| power.int())
-        .max()
-        .unwrap()
-        .clone();
+    let index = (view.int() % (p_total.int() as u64)) as u128;
 
-    let mut counter = 0;
+    // Validator powers in `validators()` order (the row order of the abstract array).
+    let powers: Vec<u64> = validator_set
+        .validators()
+        .map(|v| validator_set.power(v).unwrap().int())
+        .collect();
 
-    // Search for a validator at given index in the abstract array of leaders.
-    for threshold in 1..=p_max {
-        for k in 0..=(n - 1) {
-            let validator = validator_set.validators().nth(k).unwrap();
-            if validator_set.power(validator).unwrap().int() >= threshold {
-                if counter == index {
-                    return *validator;
-                }
-                counter += 1
-            }
+    // Distinct positive power levels, ascending. For thresholds `t` in the segment
+    // `(prev_level, level]` no validator power lies strictly between the bounds, so the
+    // row membership {v : power(v) >= t} = {v : power(v) >= level} is constant across
+    // the segment: (level - prev_level) rows of `members` entries each.
+    let mut levels = powers.iter().copied().filter(|p| *p > 0).collect::<Vec<_>>();
+    levels.sort_unstable();
+    levels.dedup();
+
+    let mut cum: u128 = 0;
+    let mut prev: u64 = 0;
+    for level in levels {
+        let members = powers.iter().filter(|p| **p >= level).count() as u128;
+        let seg = (level - prev) as u128 * members;
+        if cum + seg > index {
+            // `index` falls inside this segment; identical rows, so only the
+            // position within the row matters.
+            let pos_in_row = ((index - cum) % members) as usize;
+            let validator = validator_set
+                .validators()
+                .filter(|v| validator_set.power(v).unwrap().int() >= level)
+                .nth(pos_in_row)
+                .unwrap();
+            return *validator;
         }
+        cum += seg;
+        prev = level;
     }
 
-    // Safety: If index not found, panic. This should never happen.
+    // Safety: index = view % total_power < total_power = the abstract array length,
+    // so a segment always contains it. This should never happen.
     unreachable!("Cannot select a leader: index not found!")
 }
 
@@ -998,6 +1023,93 @@ fn select_leader_fairness_test() {
             validator_set.power(validator).unwrap().int() as usize
         )
     })
+}
+
+/// The original entry-by-entry IWRR walk, kept as the semantic reference for
+/// `select_leader_closed_form_matches_reference`. O(view % total_power) — this
+/// was the S405 height-drag root cause and must never be used in production.
+#[cfg(test)]
+fn select_leader_reference(view: ViewNumber, validator_set: &ValidatorSet) -> VerifyingKey {
+    let p_total = validator_set.total_power();
+    let n = validator_set.len();
+    let index = view.int() % (p_total.int() as u64);
+    let p_max = validator_set
+        .validators_and_powers()
+        .iter()
+        .map(|(_, power)| power.int())
+        .max()
+        .unwrap();
+
+    let mut counter = 0;
+    for threshold in 1..=p_max {
+        for k in 0..=(n - 1) {
+            let validator = validator_set.validators().nth(k).unwrap();
+            if validator_set.power(validator).unwrap().int() >= threshold {
+                if counter == index {
+                    return *validator;
+                }
+                counter += 1
+            }
+        }
+    }
+    unreachable!("Cannot select a leader: index not found!")
+}
+
+/// Consensus-safety proof for the closed-form `select_leader`: it must return
+/// the IDENTICAL leader to the reference walk for every view — a mixed fleet
+/// of old and new binaries must always agree on the leader. Exhaustive over
+/// three full array wraps for varied power profiles (duplicates, zeros, ones,
+/// gaps, single validator), plus live-testnet-shaped spot checks (3 × 2M power
+/// at real view magnitudes).
+#[test]
+fn select_leader_closed_form_matches_reference() {
+    use crate::types::{data_types::Power, update_sets::ValidatorSetUpdates};
+    use ed25519_dalek::SigningKey;
+    use rand_core::OsRng;
+
+    let mut csprg = OsRng {};
+    let mut build = |powers: &[u64]| {
+        let mut vs = ValidatorSet::new();
+        let mut updates = ValidatorSetUpdates::new();
+        for p in powers {
+            let vk = SigningKey::generate(&mut csprg).verifying_key();
+            updates.insert(vk, Power::new(*p));
+        }
+        vs.apply_updates(&updates);
+        vs
+    };
+
+    for powers in [
+        vec![2, 2, 2],
+        vec![1, 3, 2],
+        vec![5, 5, 1],
+        vec![7],
+        vec![1, 1, 1, 1, 10],
+        vec![4, 9, 2, 2, 6, 1, 1, 3],
+        vec![0, 3, 5], // power-0 validator never leads but sits in the set
+    ] {
+        let vs = build(&powers);
+        let total: u64 = powers.iter().sum();
+        for view in 0..(total * 3) {
+            let v = ViewNumber::new(view);
+            assert_eq!(
+                select_leader(v, &vs),
+                select_leader_reference(v, &vs),
+                "diverged: powers={powers:?} view={view}"
+            );
+        }
+    }
+
+    // Live-testnet shape: 3 validators, power = stake/wei = 2,000,000 each.
+    let vs = build(&[2_000_000, 2_000_000, 2_000_000]);
+    for view in [0, 1, 19, 20, 1_179_840, 2_500_000, 5_999_999, 6_000_000, 6_000_001] {
+        let v = ViewNumber::new(view);
+        assert_eq!(
+            select_leader(v, &vs),
+            select_leader_reference(v, &vs),
+            "diverged at live-shaped view {view}"
+        );
+    }
 }
 
 /// No-op network for pacemaker unit tests: `update_view` never sends, so the
