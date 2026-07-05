@@ -15,6 +15,7 @@ pub mod behaviour;
 pub mod bridge;
 pub mod codec;
 pub mod config;
+pub mod mesh_watchdog;
 pub mod peer;
 pub mod pending_send;
 pub mod peer_scoring;
