@@ -13,8 +13,9 @@ use torus_core::liquidation::LiquidationEngine;
 use torus_core::lockbox::{fp_to_u256, u256_to_fp, Lockbox};
 use torus_core::margin::{effective_max_leverage, MarketMarginConfig};
 use torus_core::oracle::{OracleConfig, OracleManager};
+use torus_core::error::CoreError;
 use torus_core::order_book::{OrderBook, OrderStatus};
-use torus_core::position::{MarginType, PositionManager};
+use torus_core::position::{MarginType, NativeBalance, PositionManager};
 use torus_core::precompiles::{CoreWriterQueue, QueuedAction, QueuedActionKind};
 use torus_economics::{
     EpochManager, GovernanceManager, RewardDistributor, StakingManager, ValidatorStatus,
@@ -82,6 +83,93 @@ pub struct EpochBoundaryResult {
 // ============================================================================
 
 /// All state managers and block metadata needed for native execution.
+/// Per-`execute_batch`-call write-back cache for native balances (O1).
+///
+/// Phase 2 (margin reserve) and Phase 4 (margin release) touch each sender's
+/// `NativeBalance` repeatedly. The dominant cost is the per-order `NativeStateOverlay`
+/// PUT: each `put_cf_raw` allocates a `String` CF-name + key/value `Vec`s, Borsh-encodes,
+/// takes an `RwLock`, and inserts into a `BTreeMap`. At bs400 with N flood senders, a
+/// naive path pays one such PUT per order (~4×N per block); this cache defers those,
+/// mutating an in-memory typed map and flushing each *unique* sender's final balance to
+/// the overlay once (≈N PUTs), while first-read misses fall through to the overlay.
+///
+/// Coherence (the overlay must be authoritative at every point some *other* reader could
+/// observe it): the only in-call reader that bypasses this cache is Phase 4 `apply_fill`,
+/// which credits realized PnL straight to the overlay. Before each `apply_fill`, the
+/// trader's pending balance is flushed and evicted (`flush_and_evict`) so `apply_fill`
+/// reads the post-release balance and the later `flush_all` cannot clobber the credit.
+/// `flush_all` runs at the end of the call, so the *next* `execute_batch` call and all
+/// post-batch consumers (`drain_core_writer`, `save_order_books`, block-end flush) see a
+/// fully materialized overlay. Flush order is over distinct per-sender keys, so it is
+/// state-independent of iteration order; the map is otherwise never iterated.
+struct BalanceCache {
+    map: HashMap<Address, NativeBalance>,
+    dirty: std::collections::HashSet<Address>,
+}
+
+impl BalanceCache {
+    fn new() -> Self {
+        Self {
+            map: HashMap::new(),
+            dirty: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Return the sender's balance, reading through to `positions` on a miss.
+    fn load<T: StateBackend>(
+        &mut self,
+        positions: &PositionManager<T>,
+        addr: &Address,
+    ) -> Result<NativeBalance, CoreError> {
+        if let Some(bal) = self.map.get(addr) {
+            return Ok(bal.clone());
+        }
+        let bal = positions.get_native_balance(addr)?;
+        self.map.insert(*addr, bal.clone());
+        Ok(bal)
+    }
+
+    /// Update the cached balance and mark it dirty (write-back — no overlay PUT yet).
+    fn set(&mut self, addr: &Address, bal: NativeBalance) {
+        self.map.insert(*addr, bal);
+        self.dirty.insert(*addr);
+    }
+
+    /// Flush a trader's pending balance to the overlay (if dirty) and evict it, handing
+    /// authority back to the overlay. Called before `apply_fill` credits that trader
+    /// directly, so the credit lands on the post-release balance and survives `flush_all`.
+    fn flush_and_evict<T: StateBackend>(
+        &mut self,
+        positions: &PositionManager<T>,
+        addr: &Address,
+    ) -> Result<(), CoreError> {
+        if let Some(bal) = self.map.remove(addr) {
+            if self.dirty.remove(addr) {
+                positions.put_native_balance(addr, &bal)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Flush every pending dirty balance to the overlay (end of the `execute_batch` call).
+    /// Keys are distinct per sender, so final overlay state is independent of flush order;
+    /// sorted anyway to keep the write sequence deterministic.
+    fn flush_all<T: StateBackend>(
+        &mut self,
+        positions: &PositionManager<T>,
+    ) -> Result<(), CoreError> {
+        let mut addrs: Vec<Address> = self.dirty.iter().copied().collect();
+        addrs.sort();
+        for addr in &addrs {
+            if let Some(bal) = self.map.get(addr) {
+                positions.put_native_balance(addr, bal)?;
+            }
+        }
+        self.dirty.clear();
+        Ok(())
+    }
+}
+
 pub struct NativeExecContext<T: StateBackend = StateDb> {
     pub positions: PositionManager<T>,
     pub oracle: OracleManager<T>,
@@ -466,6 +554,11 @@ impl NativeExecutor {
 
         let mut market_batches: HashMap<MarketId, Vec<PreparedOrder>> = HashMap::new();
 
+        // O1: write-through balance cache, scoped to this execute_batch call. Serves
+        // repeated Phase 2 reserve / Phase 4 release reads for the same sender without
+        // re-hitting the overlay's lock + alloc + Borsh path.
+        let mut bal_cache = BalanceCache::new();
+
         for &i in &place_order_indices {
             let (sender, action) = &actions[i];
             let params = match action {
@@ -491,7 +584,7 @@ impl NativeExecutor {
             };
 
             if order_margin_required > FixedPoint::ZERO {
-                match ctx.positions.get_native_balance(sender) {
+                match bal_cache.load(&ctx.positions, sender) {
                     Ok(mut bal) => {
                         if bal.available < order_margin_required {
                             results[i] = NativeActionResult::err(
@@ -505,10 +598,7 @@ impl NativeExecutor {
                         }
                         bal.available = bal.available - order_margin_required;
                         bal.order_margin = bal.order_margin + order_margin_required;
-                        if let Err(e) = ctx.positions.put_native_balance(sender, &bal) {
-                            results[i] = NativeActionResult::err("place_order", e.to_string());
-                            continue;
-                        }
+                        bal_cache.set(sender, bal);
                     }
                     Err(e) => {
                         results[i] = NativeActionResult::err("place_order", e.to_string());
@@ -611,10 +701,10 @@ impl NativeExecutor {
                     };
 
                     if margin_to_release > FixedPoint::ZERO {
-                        if let Ok(mut bal) = ctx.positions.get_native_balance(&prep.sender) {
+                        if let Ok(mut bal) = bal_cache.load(&ctx.positions, &prep.sender) {
                             bal.order_margin = bal.order_margin - margin_to_release;
                             bal.available = bal.available + margin_to_release;
-                            let _ = ctx.positions.put_native_balance(&prep.sender, &bal);
+                            bal_cache.set(&prep.sender, bal);
                         }
                     }
                 }
@@ -622,6 +712,12 @@ impl NativeExecutor {
                 // Apply fills to position manager
                 let mut fill_failed = false;
                 for fill in &result.fills {
+                    // apply_fill credits realized PnL straight to the overlay, bypassing
+                    // bal_cache. Flush+evict these traders' pending balances first so the
+                    // credit lands on the post-release balance and flush_all can't clobber
+                    // it; a later margin release for them re-reads the overlay (O1 coherence).
+                    let _ = bal_cache.flush_and_evict(&ctx.positions, &fill.taker);
+                    let _ = bal_cache.flush_and_evict(&ctx.positions, &fill.maker);
                     let taker_is_buy = fill.maker_side != Side::Buy;
                     if let Err(e) = ctx.positions.apply_fill(
                         &fill.taker,
@@ -672,6 +768,11 @@ impl NativeExecutor {
                 results[prep.index] = NativeActionResult::ok("place_order", 1000);
             }
         }
+
+        // O1: materialize all deferred balance mutations (reserves + releases) into the
+        // overlay before the call returns, so the next execute_batch call and every
+        // post-batch consumer sees authoritative state.
+        let _ = bal_cache.flush_all(&ctx.positions);
 
         if let Some(ref m) = ctx.metrics {
             m.exec_phase_settle_seconds

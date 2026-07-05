@@ -525,3 +525,184 @@ fn place_order_batch_failure_isolated() {
         fp(100)
     );
 }
+
+// ============================================================================
+// Test 10: Same-sender batch == same-sender sequential (pins per-batch semantics)
+// ============================================================================
+//
+// Six non-crossing resting limit orders from ONE sender across two markets. In
+// market 1 the sender holds BOTH buys (90/91) and sells (110/111): best bid 91 <
+// best ask 110, so nothing self-crosses. Market 2 mirrors with buy@90 / sell@110.
+// Running them as one execute_batch (Run A) must land the sender in exactly the
+// same NativeBalance and produce the same total resting-order count as running
+// them as six consecutive single-action execute_batch calls on one ctx (Run B) —
+// the sequential oracle for the prod one-ctx-per-block path. This pins the
+// existing semantics ahead of the per-batch balance-cache refactor.
+#[test]
+fn batch_same_sender_orders_equal_individual_batches() {
+    let sender = addr(1);
+
+    // All six rest (no crossing pair anywhere). Margin per order = notional/20:
+    // 4.5 + 4.55 + 5.5 + 5.55 (mkt1) + 4.5 + 5.5 (mkt2) = 30.1 — funded 100_000.
+    let orders = [
+        limit_buy(1, 90, 1),
+        limit_buy(1, 91, 1),
+        limit_sell(1, 110, 1),
+        limit_sell(1, 111, 1),
+        limit_buy(2, 90, 1),
+        limit_sell(2, 110, 1),
+    ];
+
+    // --- Run A: one execute_batch call with all six orders ---
+    let (_dir_a, db_a) = open_test_db();
+    let mut ctx_a = make_ctx(db_a.clone());
+    fund_native(&ctx_a, &sender, fp(100_000));
+
+    let actions_a: Vec<(Address, NativeAction)> = orders
+        .iter()
+        .map(|p| (sender, NativeAction::PlaceOrder(p.clone())))
+        .collect();
+    let res_a = NativeExecutor::execute_batch(&mut ctx_a, &actions_a);
+    for (i, r) in res_a.results.iter().enumerate() {
+        assert!(r.success, "batch order {i} failed: {:?}", r.error);
+    }
+
+    // --- Run B: six consecutive single-action execute_batch calls on ONE ctx ---
+    let (_dir_b, db_b) = open_test_db();
+    let mut ctx_b = make_ctx(db_b.clone());
+    fund_native(&ctx_b, &sender, fp(100_000));
+
+    for p in &orders {
+        let res_b = NativeExecutor::execute_batch(
+            &mut ctx_b,
+            &[(sender, NativeAction::PlaceOrder(p.clone()))],
+        );
+        assert!(
+            res_b.results[0].success,
+            "sequential order failed: {:?}",
+            res_b.results[0].error
+        );
+    }
+
+    // Balances must be bit-identical across batched vs sequential.
+    let bal_a = ctx_a.positions.get_native_balance(&sender).unwrap();
+    let bal_b = ctx_b.positions.get_native_balance(&sender).unwrap();
+    assert_eq!(
+        bal_a.available, bal_b.available,
+        "available diverges: A={:?} B={:?}",
+        bal_a.available, bal_b.available
+    );
+    assert_eq!(
+        bal_a.order_margin, bal_b.order_margin,
+        "order_margin diverges: A={:?} B={:?}",
+        bal_a.order_margin, bal_b.order_margin
+    );
+
+    // All six rest → total resting-order count identical (and equal to 6).
+    let count_a: usize = ctx_a.order_books.values().map(|b| b.order_count()).sum();
+    let count_b: usize = ctx_b.order_books.values().map(|b| b.order_count()).sum();
+    assert_eq!(count_a, 6, "expected all six orders resting in Run A");
+    assert_eq!(count_a, count_b, "resting-order count diverges A vs B");
+}
+
+// ============================================================================
+// Test 11: Stale-per-batch-cache detector — multi-market settle touches A ≥3x
+// ============================================================================
+//
+// In batch 3 (a single execute_batch) trader A's NativeBalance is mutated three
+// times across two markets during Phase-4 settlement:
+//   (1) release the mkt-1 sell order's margin,
+//   (2) credit the mkt-1 realized PnL (-5) from closing the long,
+//   (3) release the mkt-2 buy order's margin.
+// This is exactly the interleaving a stale per-batch balance cache would corrupt
+// by dropping one of the mutations. We derive A's exact end state from the code
+// and pin it.
+#[test]
+fn same_sender_multi_market_settle_balance_exact() {
+    let trader_a = addr(1);
+    let trader_b = addr(2);
+
+    let (_dir, db) = open_test_db();
+    let mut ctx = make_ctx(db.clone());
+    fund_native(&ctx, &trader_a, fp(100_000));
+    fund_native(&ctx, &trader_b, fp(100_000));
+
+    // --- Batch 1: counterparty B seeds resting liquidity (nothing self-crosses) ---
+    //   mkt1 sell@100, mkt1 buy@95 (95 < 100 → no cross), mkt2 sell@50.
+    let b1 = NativeExecutor::execute_batch(
+        &mut ctx,
+        &[
+            (trader_b, NativeAction::PlaceOrder(limit_sell(1, 100, 1))),
+            (trader_b, NativeAction::PlaceOrder(limit_buy(1, 95, 1))),
+            (trader_b, NativeAction::PlaceOrder(limit_sell(2, 50, 1))),
+        ],
+    );
+    for (i, r) in b1.results.iter().enumerate() {
+        assert!(r.success, "batch1 order {i} failed: {:?}", r.error);
+    }
+
+    // --- Batch 2: A buys mkt1 @100 → crosses B's sell@100, fills @100 (maker px),
+    //     opening A long 1@100. The order fully fills, so its 100/20 = 5 margin is
+    //     released in full; apply_fill opens the position without touching
+    //     `available`. Net effect on A: back to funding, zero order_margin. ---
+    let b2 = NativeExecutor::execute_batch(
+        &mut ctx,
+        &[(trader_a, NativeAction::PlaceOrder(limit_buy(1, 100, 1)))],
+    );
+    assert!(b2.results[0].success, "batch2 failed: {:?}", b2.results[0].error);
+    {
+        let bal = ctx.positions.get_native_balance(&trader_a).unwrap();
+        assert_eq!(bal.available, fp(100_000), "post-open available");
+        assert_eq!(bal.order_margin, FixedPoint::ZERO, "post-open margin");
+    }
+
+    // --- Batch 3 (UNDER TEST): both actions from A in ONE execute_batch ---
+    //   a. sell mkt1 @90 qty1 → crosses B's resting buy@95 → fills @95 (maker px)
+    //      → fully closes A's long → realized PnL (95-100)*1 = -5 credited.
+    //   b. buy  mkt2 @50 qty1 → crosses B's resting sell@50 → fills @50 → opens long.
+    //
+    // Derivation (fill price = MAKER price; a fully-filled order releases its FULL
+    // reserved margin per native_executor Phase 4):
+    //   Phase 2 reserves: sell 90/20 = 4.5, buy 50/20 = 2.5 → order_margin 7.0,
+    //     available 100_000 → 99_993.
+    //   Phase 4 (per-market; the running sum is order-independent):
+    //     mkt1: release +4.5, then PnL credit -5 (close long @95 vs entry 100).
+    //     mkt2: release +2.5 (buy fully fills; opening the long does not touch
+    //           `available`).
+    //   available: 99_993 + 4.5 - 5 + 2.5 = 99_995 (== funding - 5 realized loss).
+    //   order_margin: 7.0 - 4.5 - 2.5 = 0 (both orders fully fill → nothing rests).
+    let b3 = NativeExecutor::execute_batch(
+        &mut ctx,
+        &[
+            (trader_a, NativeAction::PlaceOrder(limit_sell(1, 90, 1))),
+            (trader_a, NativeAction::PlaceOrder(limit_buy(2, 50, 1))),
+        ],
+    );
+    for (i, r) in b3.results.iter().enumerate() {
+        assert!(r.success, "batch3 order {i} failed: {:?}", r.error);
+    }
+
+    // Assert A's exact end balance via a FRESH PositionManager read from the DB
+    // (StateDb is Arc<DB>-backed, so ctx writes are immediately visible).
+    let pm = torus_core::position::PositionManager::new(db.clone());
+    let bal_a = pm.get_native_balance(&trader_a).unwrap();
+    assert_eq!(bal_a.available, fp(99_995), "A available after multi-market settle");
+    assert_eq!(
+        bal_a.order_margin,
+        FixedPoint::ZERO,
+        "A order_margin must return to zero — both batch-3 orders fully filled"
+    );
+
+    // Positions: mkt1 closed (deleted), mkt2 long 1 @ 50 (maker fill price).
+    assert!(
+        pm.get_position(&trader_a, 1).unwrap().is_none(),
+        "A's mkt1 long must be fully closed"
+    );
+    let pos2 = pm
+        .get_position(&trader_a, 2)
+        .unwrap()
+        .expect("A must hold a mkt2 position");
+    assert!(pos2.is_long, "A's mkt2 position must be long");
+    assert_eq!(pos2.size, fp(1), "A's mkt2 position size must be 1");
+    assert_eq!(pos2.entry_price, fp(50), "A's mkt2 entry price must be maker 50");
+}
