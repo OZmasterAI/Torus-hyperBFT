@@ -165,6 +165,12 @@ pub struct Metrics {
     // follower proposal arrival + persist + vote.
     pub view_duration_seconds: Histogram,
     pub view_propose_delay_seconds: Histogram,
+    /// Leader propose_delay decomposition (S405 BS-3): StartView to own-block
+    /// insert (produce_block + block-tree write)...
+    pub view_propose_build_seconds: Histogram,
+    /// ...and own-block insert to Propose broadcast (update/commit chain +
+    /// event emit + broadcast handoff).
+    pub view_propose_finalize_seconds: Histogram,
     pub view_qc_collect_seconds: Histogram,
     pub view_proposal_arrival_seconds: Histogram,
     pub view_insert_persist_seconds: Histogram,
@@ -602,6 +608,20 @@ impl Metrics {
             view_propose_delay_seconds.clone(),
         );
 
+        let view_propose_build_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 15));
+        registry.register(
+            "torus_view_propose_build_seconds",
+            "Leader: StartView to own-block insert (produce_block + block-tree write)",
+            view_propose_build_seconds.clone(),
+        );
+
+        let view_propose_finalize_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 15));
+        registry.register(
+            "torus_view_propose_finalize_seconds",
+            "Leader: own-block insert to Propose broadcast (update/commit + broadcast handoff)",
+            view_propose_finalize_seconds.clone(),
+        );
+
         let view_qc_collect_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 15));
         registry.register(
             "torus_view_qc_collect_seconds",
@@ -719,6 +739,8 @@ impl Metrics {
             exec_queue_depth,
             view_duration_seconds,
             view_propose_delay_seconds,
+            view_propose_build_seconds,
+            view_propose_finalize_seconds,
             view_qc_collect_seconds,
             view_proposal_arrival_seconds,
             view_insert_persist_seconds,

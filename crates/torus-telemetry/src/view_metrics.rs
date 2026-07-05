@@ -28,6 +28,11 @@ struct ViewState {
     proposal_received_at: Option<SystemTime>,
     /// Guards `view_insert_persist_seconds` against multi-insert double counts.
     insert_observed: bool,
+    /// Latest insert this view with NO received proposal — the leader's own
+    /// block (insert happens right before Propose). Consumed by `propose()`
+    /// for the build/finalize split; leadership is only confirmed there, so a
+    /// block-sync insert that never leads to a Propose records nothing.
+    self_insert_at: Option<SystemTime>,
     /// Guards `view_vote_delay_seconds` against duplicate-vote double counts.
     vote_observed: bool,
     /// Previous CommitBlock event time, for the commit interval gap.
@@ -72,17 +77,29 @@ impl ViewMetricsRecorder {
         s.proposal_received_at = None;
         s.insert_observed = false;
         s.vote_observed = false;
+        s.self_insert_at = None;
         self.metrics.consensus_view.set(view as i64);
     }
 
     /// Propose (leader): time from view start to proposal broadcast. Also
-    /// arms the QC round-trip clock for `block_hash`.
+    /// arms the QC round-trip clock for `block_hash`, and — when our own
+    /// block's insert was seen this view — splits the delay into build
+    /// (StartView -> insert: produce_block + block-tree write) and finalize
+    /// (insert -> Propose: update/commit + event emit + broadcast handoff).
     pub fn propose(&self, ts: SystemTime, block_hash: [u8; 32]) {
         let mut s = self.state.lock().unwrap();
         if let Some(started) = s.view_started_at {
             self.metrics
                 .view_propose_delay_seconds
                 .observe(secs_between(started, ts));
+            if let Some(inserted) = s.self_insert_at.take() {
+                self.metrics
+                    .view_propose_build_seconds
+                    .observe(secs_between(started, inserted));
+                self.metrics
+                    .view_propose_finalize_seconds
+                    .observe(secs_between(inserted, ts));
+            }
         }
         s.last_propose = Some((ts, block_hash));
     }
@@ -136,6 +153,10 @@ impl ViewMetricsRecorder {
                 .view_insert_persist_seconds
                 .observe(secs_between(received, ts));
             s.insert_observed = true;
+        } else {
+            // No received proposal: our own block (leader) or a sync insert.
+            // Stash the latest; propose() consumes it only if we actually lead.
+            s.self_insert_at = Some(ts);
         }
     }
 
@@ -317,6 +338,58 @@ mod tests {
         r.insert_block(t(40));
         let text = m.encode();
         assert_eq!(sample(&text, "torus_view_insert_persist_seconds_count"), 0.0);
+    }
+
+    /// S405 propose decomposition: on the leader, InsertBlock (own block, no
+    /// received proposal) followed by Propose splits propose_delay into
+    /// build (StartView -> insert) and finalize (insert -> Propose).
+    #[test]
+    fn leader_build_finalize_split() {
+        let (m, r) = rec();
+        r.start_view(t(0), 1);
+        r.insert_block(t(80)); // own-block insert: no proposal received
+        r.propose(t(130), [7u8; 32]);
+        let text = m.encode();
+        assert_eq!(sample(&text, "torus_view_propose_build_seconds_count"), 1.0);
+        assert!((sample(&text, "torus_view_propose_build_seconds_sum") - 0.08).abs() < 1e-9);
+        assert_eq!(
+            sample(&text, "torus_view_propose_finalize_seconds_count"),
+            1.0
+        );
+        assert!((sample(&text, "torus_view_propose_finalize_seconds_sum") - 0.05).abs() < 1e-9);
+        // Total still observed as before.
+        assert!((sample(&text, "torus_view_propose_delay_seconds_sum") - 0.13).abs() < 1e-9);
+        // Follower insert metric untouched by the leader path.
+        assert_eq!(sample(&text, "torus_view_insert_persist_seconds_count"), 0.0);
+    }
+
+    /// A sync insert (no proposal, no subsequent Propose in the view) must not
+    /// record leader build/finalize — leadership is only confirmed at Propose.
+    #[test]
+    fn sync_insert_without_propose_records_no_build() {
+        let (m, r) = rec();
+        r.start_view(t(0), 1);
+        r.insert_block(t(40));
+        r.start_view(t(300), 2);
+        r.propose(t(360), [7u8; 32]); // next view: leader, but no insert seen yet
+        let text = m.encode();
+        assert_eq!(sample(&text, "torus_view_propose_build_seconds_count"), 0.0);
+        assert_eq!(
+            sample(&text, "torus_view_propose_finalize_seconds_count"),
+            0.0
+        );
+    }
+
+    /// The follower path (proposal received) must not feed the leader split.
+    #[test]
+    fn follower_insert_records_no_build() {
+        let (m, r) = rec();
+        r.start_view(t(0), 1);
+        r.receive_proposal(t(30));
+        r.insert_block(t(70));
+        r.phase_vote(t(80));
+        let text = m.encode();
+        assert_eq!(sample(&text, "torus_view_propose_build_seconds_count"), 0.0);
     }
 
     #[test]
