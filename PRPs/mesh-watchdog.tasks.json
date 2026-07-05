@@ -5,7 +5,7 @@
     {
       "id": 1,
       "name": "Telemetry: mesh gauges + watchdog counter",
-      "status": "pending",
+      "status": "completed",
       "files": ["crates/torus-telemetry/src/lib.rs"],
       "validate": "cargo test -p torus-telemetry",
       "depends_on": []
@@ -13,7 +13,7 @@
     {
       "id": 2,
       "name": "mesh_watchdog module: pure state machine + unit tests",
-      "status": "pending",
+      "status": "completed",
       "files": ["crates/torus-network/src/mesh_watchdog.rs", "crates/torus-network/src/lib.rs"],
       "validate": "cargo test -p torus-network mesh_watchdog",
       "depends_on": []
@@ -21,7 +21,7 @@
     {
       "id": 3,
       "name": "Wire watchdog into mesh_interval tick (detect + force-disconnect + metrics)",
-      "status": "pending",
+      "status": "completed",
       "files": ["crates/torus-network/src/swarm.rs"],
       "validate": "cargo test -p torus-network && cargo build --release -p torus-node",
       "depends_on": [1, 2]
@@ -29,7 +29,7 @@
     {
       "id": 4,
       "name": "Gossipsub explicit peers for validator set (verify 0.56 semantics first)",
-      "status": "pending",
+      "status": "completed",
       "files": ["crates/torus-network/src/swarm.rs"],
       "validate": "cargo test -p torus-network && cargo build --release -p torus-node",
       "depends_on": [3]
@@ -37,7 +37,7 @@
     {
       "id": 5,
       "name": "Devnet wedge repro + A/B verification (base vs fixed)",
-      "status": "pending",
+      "status": "completed",
       "files": ["devnet/scripts/wedge-repro-s405.sh"],
       "validate": "bash devnet/scripts/wedge-repro-s405.sh && test -f devnet/wedge-repro-s405/summary.md",
       "depends_on": [3, 4]
