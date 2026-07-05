@@ -543,6 +543,8 @@ pub async fn run_swarm_with_config(
 
     let mut mesh_interval = tokio::time::interval(std::time::Duration::from_secs(10));
     mesh_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // S395 subscription-wedge watchdog, evaluated on the mesh tick (Task 3).
+    let mut mesh_watchdog = crate::mesh_watchdog::MeshWatchdog::default();
 
     let mut native_batch: Vec<Vec<u8>> = Vec::with_capacity(256);
     // Running on-wire size of `native_batch` (header + length-prefixed entries),
@@ -587,11 +589,16 @@ pub async fn run_swarm_with_config(
             _ = mesh_interval.tick() => {
                 let local_pid = *swarm.local_peer_id();
                 let peer_map = shared.peer_map.read().unwrap();
-                let to_dial: Vec<PeerId> = peer_map.peer_ids()
-                    .filter(|pid| **pid != local_pid && !swarm.is_connected(pid))
+                let mapped: Vec<PeerId> = peer_map.peer_ids()
+                    .filter(|pid| **pid != local_pid)
                     .copied()
                     .collect();
                 drop(peer_map);
+
+                let to_dial: Vec<PeerId> = mapped.iter()
+                    .filter(|pid| !swarm.is_connected(pid))
+                    .copied()
+                    .collect();
                 if !to_dial.is_empty() {
                     let _ = swarm.behaviour_mut().kademlia.bootstrap();
                     for pid in &to_dial {
@@ -600,6 +607,35 @@ pub async fn run_swarm_with_config(
                         }
                     }
                     info!(missing = to_dial.len(), "mesh: dialing unconnected validators");
+                }
+
+                // Watchdog (S395 wedge): a CURRENT-validator peer that stays
+                // connected but unsubscribed to the consensus topic past grace
+                // gets a forced disconnect; the dial above re-establishes the
+                // connection next tick, re-running the subscription exchange
+                // the fast-restart race lost. peer_map also holds non-validator
+                // peers (RPC nodes), hence the is_validator_peer filter.
+                let connected_validators: Vec<PeerId> = mapped.iter()
+                    .filter(|pid| swarm.is_connected(pid) && is_validator_peer(&shared, pid))
+                    .copied()
+                    .collect();
+                let consensus_hash = consensus_topic.hash();
+                let subscribed: HashSet<PeerId> = swarm.behaviour().gossipsub.all_peers()
+                    .filter(|(_, topics)| topics.contains(&&consensus_hash))
+                    .map(|(pid, _)| *pid)
+                    .collect();
+                for pid in mesh_watchdog.tick(std::time::Instant::now(), &connected_validators, &subscribed) {
+                    warn!(%pid, "mesh watchdog: validator connected but unsubscribed past grace — forcing reconnect");
+                    if let Some(ref m) = shared.metrics {
+                        m.mesh_watchdog_disconnects.inc();
+                    }
+                    let _ = swarm.disconnect_peer_id(pid);
+                }
+                if let Some(ref m) = shared.metrics {
+                    m.consensus_mesh_peers
+                        .set(swarm.behaviour().gossipsub.mesh_peers(&consensus_hash).count() as i64);
+                    m.consensus_subscribed_validators
+                        .set(connected_validators.iter().filter(|pid| subscribed.contains(*pid)).count() as i64);
                 }
                 continue;
             }
