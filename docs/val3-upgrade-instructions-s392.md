@@ -1,16 +1,17 @@
-# val3 upgrade instructions — S395 (code tip 69f0a99)
+# val3 upgrade instructions — S403 (code tip c949c7b)
 
 Copy-paste for the val3 operator (3rd validator, self-hosted). Supersedes the
-S392/b96f058 instructions (never run) and the earlier fa7791d ones — this
-replaces them entirely. Sent 2026-07-03.
+S395/69f0a99 instructions — this replaces them entirely. Sent 2026-07-05.
 
 ---
 
-New build ready on a new branch: `sprint/blockspeed-orders-s395`. Why this
-one matters: with three equal-stake validators the chain can only cross an
-epoch boundary (every 100th view) when **all three** of us vote — so right
-now it's parked, waiting for you. Our two nodes are already running this
-exact code. The moment you're up on it, the chain resumes on its own.
+New build ready: branch `sprint/blockspeed-orders-s395`, commit `c949c7b`
+(also pushed to `fix/hotstuff-idle-cpu-spin` if that's what your clone
+tracks). Why it matters: block time has degraded from ~270ms to ~450ms and we
+traced it to your validator's leg — every quorum certificate waits on your
+vote, and proposals are slow whenever you lead. Our two nodes are already on
+this exact code. Your upgrade + a clean restart should give the whole chain
+its speed back.
 
 Your node can stay up while you build.
 
@@ -20,23 +21,20 @@ Your node can stay up while you build.
 cd <your-torus-hyperbft-repo>
 git fetch origin sprint/blockspeed-orders-s395
 git checkout sprint/blockspeed-orders-s395
-git log --oneline -8 | grep 69f0a99   # must match — last CODE commit (anything above it is docs-only)
+git pull --ff-only origin sprint/blockspeed-orders-s395
+git log --oneline -1   # must print: c949c7b Reapply "fix(network): refuse dials to non-global addresses..."
 cargo build --release
 ```
 
-Since b96f058 this adds: a pacemaker fix so the chain un-parks after view
-jumps (this is the one that matters for the current halt), per-block hot-path
-cuts, and order-book persistence fixes. All wire-compatible, no config
-migration, defaults unchanged.
+Since 69f0a99 this adds: a dial filter that stops wasted dials to dead/private
+addresses, kademlia address-book hygiene, and telemetry. All wire-compatible,
+no config migration, defaults unchanged.
 
 **2. Do NOT touch your keys or data directory.** Same keystore, same data
-dir. Your libp2p peer id is derived from your validator key, and our dials to
-you currently fail with "Unexpected peer ID" — a clean restart on this build
-with your existing keystore is exactly what should fix that. If you
+dir. Your libp2p peer id is derived from your validator key — if you
 regenerate anything we're worse off.
 
-**3. Set the DA threshold env var** (you never confirmed this one — it
-matters for block dissemination):
+**3. Set the DA threshold env var** (skip if already done last time):
 
 - systemd: `sudo systemctl edit <your-service>` and add:
 
@@ -53,10 +51,10 @@ matters for block dissemination):
 
 **4. Check your start flags** (still missing last time):
 
-- `--retention-blocks 100000` — without it your disk grows forever
-- add **both** of our nodes as peers (right now you only reach the seed —
-  that's why your node pulls every block body instead of getting action
-  gossip):
+- `--retention-blocks 100000` — without it your database grows forever and
+  your node gets slower with height (this is likely a big part of the current
+  slowdown)
+- add **both** of our nodes as peers:
 
   ```
   --p2p-peers /ip4/95.111.231.121/udp/30333/quic-v1/p2p/12D3KooWQeKf21QBchGQUr25U6w6yNB4P78PPQZivhHRAqFnMK24,/ip4/84.32.108.220/udp/30333/quic-v1/p2p/12D3KooWK5QYy1chfBmWpk6kfu9KTpq4rqfnRkXFuXmAc4DCPUze
@@ -64,16 +62,26 @@ matters for block dissemination):
 
 - make sure you're NOT passing `--native-gossip=false`
 
-**5. Restart into the new binary as soon as the build is done** — no waiting
-for a "go" this time; we're already up and the chain is waiting on you. Just
-ping me right before you restart so I can watch it come back.
+**5. Restart — IMPORTANT, do NOT use `systemctl restart` or a quick
+kill+start.** A fast in-place restart races the dying connection and can
+leave your node connected but gossip-mute, which stalls the whole chain
+(this has bitten us three times). Instead:
 
-**6. Send me these after restart** (so we can confirm the peer-id fix and the
-gossip gap from our side):
+```bash
+sudo systemctl stop <your-service>     # or however you normally stop it
+sleep 20
+sudo systemctl start <your-service>    # or your normal start command
+```
 
-- the first ~30 lines of your node's startup log (they include your peer id
-  and listen addresses)
-- your public IP (and confirm UDP 30333 is open inbound on your firewall)
-- `curl -s localhost:9090/metrics | grep torus_native_gossip`
-- `mtr -rz -c 20 95.111.231.121` and `mtr -rz -c 20 84.32.108.220`
-  (or `ping -c 20` each if no mtr)
+If the process ignores the stop and hangs (no new log lines), `kill -9` it —
+then still wait 20 seconds before starting.
+
+**6. Verify after restart:**
+
+```bash
+curl -s localhost:9090/metrics | grep -c torus_view_duration_seconds   # >0 = new binary
+# log should show heights climbing past ~1,065,000 within a minute
+# if you see NoPeersSubscribedToTopic spam: stop, wait 20s, start again
+```
+
+Ping me when it's up — I'll verify from our side and re-measure block speed.
