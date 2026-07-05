@@ -60,9 +60,27 @@ impl StateDb {
         cf_opts.set_bottommost_compression_type(DBCompressionType::Zstd);
         cf_opts.set_level_compaction_dynamic_level_bytes(true);
 
+        // cf_consensus_meta holds a small hot keyset rewritten EVERY block
+        // (leader reputation, speculative commits, highest PC/TC, block tree).
+        // Under the shared 128 MiB buffer its memtable accumulates dead
+        // versions for hours without flushing, and the consensus thread's
+        // propose-path reads slow down walking the growing skiplist —
+        // measured +0.9 ms per 1k blocks (S405 soak), the live height-drag
+        // mechanism. A small buffer flushes it early; compaction then drops
+        // the dead versions and reads stay flat.
+        let mut meta_opts = cf_opts.clone();
+        meta_opts.set_write_buffer_size(8 * 1024 * 1024); // 8 MiB
+
         let cf_descriptors: Vec<ColumnFamilyDescriptor> = ALL_CF_NAMES
             .iter()
-            .map(|name| ColumnFamilyDescriptor::new(*name, cf_opts.clone()))
+            .map(|name| {
+                let opts = if *name == CF_CONSENSUS_META {
+                    meta_opts.clone()
+                } else {
+                    cf_opts.clone()
+                };
+                ColumnFamilyDescriptor::new(*name, opts)
+            })
             .collect();
 
         let db = DB::open_cf_descriptors(&opts, path, cf_descriptors)?;

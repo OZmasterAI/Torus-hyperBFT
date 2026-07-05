@@ -672,3 +672,49 @@ fn account_storage_iterator() {
     let slots = db.account_storage(&addr).unwrap();
     assert_eq!(slots.len(), 2);
 }
+
+// ============================================================================
+// S405 height-drag fix — cf_consensus_meta write-buffer sizing
+// ============================================================================
+
+/// cf_consensus_meta holds a small hot keyset rewritten EVERY block (leader
+/// reputation, speculative commits, highest PC/TC, block tree). Under the
+/// shared 128 MiB write buffer its memtable accumulated dead versions for
+/// hours without flushing (48 MB in a 35-min soak) and consensus-thread
+/// propose-path reads slowed ~0.9 ms per 1k blocks walking the growing
+/// skiplist. The CF must use a small write buffer so it flushes early and
+/// compaction drops the dead versions.
+#[test]
+fn consensus_meta_memtable_flushes_early() {
+    let (db, _dir) = temp_db();
+    // ~12 MiB of rewrites over a small keyset — the consensus-meta pattern.
+    let value = vec![0xABu8; 4096];
+    for i in 0..3072u32 {
+        let key = format!("hot-key-{}", i % 64);
+        db.put_cf_raw(torus_state::cf::CF_CONSENSUS_META, key.as_bytes(), &value)
+            .expect("put");
+    }
+    // Flush is asynchronous; give it a moment, then require that the memtable
+    // did NOT retain everything we wrote (i.e. an automatic flush fired well
+    // below the written volume).
+    let inner = db.inner();
+    let cf = inner
+        .cf_handle(torus_state::cf::CF_CONSENSUS_META)
+        .expect("cf handle");
+    let written: u64 = 3072 * 4096;
+    let mut memtable = u64::MAX;
+    for _ in 0..50 {
+        memtable = inner
+            .property_int_value_cf(cf, "rocksdb.cur-size-all-mem-tables")
+            .expect("property")
+            .expect("memtable size");
+        if memtable < written / 2 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(
+        memtable < written / 2,
+        "cf_consensus_meta memtable never flushed: {memtable} bytes retained of {written} written — write buffer too large for a hot rewrite-heavy CF"
+    );
+}
