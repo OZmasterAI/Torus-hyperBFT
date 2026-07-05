@@ -763,16 +763,39 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         info!("archive mode: pruning disabled (all historical data retained)");
     }
 
-    // 12. Background DB size metric updater
+    // 12. Background DB size + RocksDB runtime-state metric updater. The
+    // runtime properties (L0 files, memtables, pending compaction, block
+    // cache) all reset on restart — the same signature as the accumulating
+    // propose cost (S405 BS-3) — so they're sampled per CF to correlate.
     {
         let data_dir = cli.data_dir.clone();
-        let db_gauge = metrics.db_size_bytes.clone();
+        let m = metrics.clone();
+        let db = state_db.db_arc();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(60));
             loop {
                 interval.tick().await;
                 let size = torus_state::dir_size_bytes(&data_dir);
-                db_gauge.set(size as i64);
+                m.db_size_bytes.set(size as i64);
+                for cf_name in torus_state::cf::ALL_CF_NAMES {
+                    let Some(cf) = db.cf_handle(cf_name) else { continue };
+                    let label = vec![("cf".to_string(), (*cf_name).to_string())];
+                    for (prop, fam) in [
+                        ("rocksdb.num-files-at-level0", &m.rocksdb_l0_files),
+                        ("rocksdb.cur-size-all-mem-tables", &m.rocksdb_memtable_bytes),
+                        (
+                            "rocksdb.estimate-pending-compaction-bytes",
+                            &m.rocksdb_pending_compaction_bytes,
+                        ),
+                    ] {
+                        if let Ok(Some(v)) = db.property_int_value_cf(cf, prop) {
+                            fam.get_or_create(&label).set(v as i64);
+                        }
+                    }
+                }
+                if let Ok(Some(v)) = db.property_int_value("rocksdb.block-cache-usage") {
+                    m.rocksdb_block_cache_bytes.set(v as i64);
+                }
             }
         });
     }

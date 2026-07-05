@@ -187,6 +187,19 @@ pub struct Metrics {
     /// Validators force-disconnected by the mesh watchdog (connected but
     /// unsubscribed past grace) to re-trigger the subscription exchange.
     pub mesh_watchdog_disconnects: Counter,
+
+    // RocksDB runtime state (S405 BS-3) — the propose cost accumulates with
+    // process lifetime, not persistent DB size; these expose the in-process
+    // storage state (all reset on restart) to correlate against.
+    /// Files at LSM level 0, per column family (reads probe every L0 file;
+    /// write stalls trigger on L0 count).
+    pub rocksdb_l0_files: Family<Vec<(String, String)>, Gauge>,
+    /// cur-size-all-mem-tables, per column family.
+    pub rocksdb_memtable_bytes: Family<Vec<(String, String)>, Gauge>,
+    /// estimate-pending-compaction-bytes, per column family.
+    pub rocksdb_pending_compaction_bytes: Family<Vec<(String, String)>, Gauge>,
+    /// Shared block-cache usage (DB-wide).
+    pub rocksdb_block_cache_bytes: Gauge,
 }
 
 impl Metrics {
@@ -678,6 +691,34 @@ impl Metrics {
             mesh_watchdog_disconnects.clone(),
         );
 
+        let rocksdb_l0_files = Family::<Vec<(String, String)>, Gauge>::default();
+        registry.register(
+            "torus_rocksdb_l0_files",
+            "RocksDB files at level 0, per column family",
+            rocksdb_l0_files.clone(),
+        );
+
+        let rocksdb_memtable_bytes = Family::<Vec<(String, String)>, Gauge>::default();
+        registry.register(
+            "torus_rocksdb_memtable_bytes",
+            "RocksDB cur-size-all-mem-tables, per column family",
+            rocksdb_memtable_bytes.clone(),
+        );
+
+        let rocksdb_pending_compaction_bytes = Family::<Vec<(String, String)>, Gauge>::default();
+        registry.register(
+            "torus_rocksdb_pending_compaction_bytes",
+            "RocksDB estimate-pending-compaction-bytes, per column family",
+            rocksdb_pending_compaction_bytes.clone(),
+        );
+
+        let rocksdb_block_cache_bytes = Gauge::default();
+        registry.register(
+            "torus_rocksdb_block_cache_bytes",
+            "RocksDB shared block-cache usage",
+            rocksdb_block_cache_bytes.clone(),
+        );
+
         Self {
             registry,
             blocks_committed,
@@ -749,6 +790,10 @@ impl Metrics {
             consensus_mesh_peers,
             consensus_subscribed_validators,
             mesh_watchdog_disconnects,
+            rocksdb_l0_files,
+            rocksdb_memtable_bytes,
+            rocksdb_pending_compaction_bytes,
+            rocksdb_block_cache_bytes,
         }
     }
 
@@ -875,6 +920,28 @@ mod tests {
             "torus_exec_flush_seconds",
             "torus_exec_block_seconds",
             "torus_exec_queue_depth",
+        ] {
+            assert!(text.contains(name), "{name} not registered:\n{text}");
+        }
+    }
+
+    /// RocksDB runtime state (S405 BS-3): per-CF L0/memtable/pending-compaction
+    /// gauges and the shared block-cache gauge must be registered so the
+    /// uptime-accumulating propose cost can be correlated with storage state.
+    #[test]
+    fn rocksdb_runtime_metrics_register() {
+        let m = Metrics::new();
+        let cf = vec![("cf".to_string(), "cf_consensus_meta".to_string())];
+        m.rocksdb_l0_files.get_or_create(&cf).set(3);
+        m.rocksdb_memtable_bytes.get_or_create(&cf).set(1024);
+        m.rocksdb_pending_compaction_bytes.get_or_create(&cf).set(0);
+        m.rocksdb_block_cache_bytes.set(4096);
+        let text = m.encode();
+        for name in [
+            "torus_rocksdb_l0_files",
+            "torus_rocksdb_memtable_bytes",
+            "torus_rocksdb_pending_compaction_bytes",
+            "torus_rocksdb_block_cache_bytes",
         ] {
             assert!(text.contains(name), "{name} not registered:\n{text}");
         }
