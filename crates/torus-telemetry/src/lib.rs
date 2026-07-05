@@ -170,6 +170,17 @@ pub struct Metrics {
     pub view_insert_persist_seconds: Histogram,
     pub view_vote_delay_seconds: Histogram,
     pub commit_interval_seconds: Histogram,
+
+    // Mesh watchdog (S405) — makes the S395 gossipsub degraded mode (validator
+    // connected but never subscribed after a fast restart) visible on /metrics.
+    /// Gossipsub mesh size for the consensus topic.
+    pub consensus_mesh_peers: Gauge,
+    /// Connected validator peers that gossipsub reports as subscribed to the
+    /// consensus topic. Below (validator_set_size - 1) for >60s = wedge.
+    pub consensus_subscribed_validators: Gauge,
+    /// Validators force-disconnected by the mesh watchdog (connected but
+    /// unsubscribed past grace) to re-trigger the subscription exchange.
+    pub mesh_watchdog_disconnects: Counter,
 }
 
 impl Metrics {
@@ -626,6 +637,27 @@ impl Metrics {
             commit_interval_seconds.clone(),
         );
 
+        let consensus_mesh_peers = Gauge::default();
+        registry.register(
+            "torus_consensus_mesh_peers",
+            "Gossipsub mesh size for the consensus topic",
+            consensus_mesh_peers.clone(),
+        );
+
+        let consensus_subscribed_validators = Gauge::default();
+        registry.register(
+            "torus_consensus_subscribed_validators",
+            "Connected validator peers subscribed to the consensus topic",
+            consensus_subscribed_validators.clone(),
+        );
+
+        let mesh_watchdog_disconnects = Counter::default();
+        registry.register(
+            "torus_mesh_watchdog_disconnects",
+            "Validators force-disconnected by the mesh watchdog (connected but unsubscribed past grace)",
+            mesh_watchdog_disconnects.clone(),
+        );
+
         Self {
             registry,
             blocks_committed,
@@ -692,6 +724,9 @@ impl Metrics {
             view_insert_persist_seconds,
             view_vote_delay_seconds,
             commit_interval_seconds,
+            consensus_mesh_peers,
+            consensus_subscribed_validators,
+            mesh_watchdog_disconnects,
         }
     }
 
@@ -818,6 +853,25 @@ mod tests {
             "torus_exec_flush_seconds",
             "torus_exec_block_seconds",
             "torus_exec_queue_depth",
+        ] {
+            assert!(text.contains(name), "{name} not registered:\n{text}");
+        }
+    }
+
+    /// Mesh watchdog (S405): the consensus-mesh gauges and watchdog-kick counter
+    /// must be registered so the S395 degraded mode (validator connected but
+    /// unsubscribed) is visible on /metrics instead of inferred from views/block.
+    #[test]
+    fn mesh_watchdog_metrics_register() {
+        let m = Metrics::new();
+        m.consensus_mesh_peers.set(2);
+        m.consensus_subscribed_validators.set(2);
+        m.mesh_watchdog_disconnects.inc();
+        let text = m.encode();
+        for name in [
+            "torus_consensus_mesh_peers",
+            "torus_consensus_subscribed_validators",
+            "torus_mesh_watchdog_disconnects",
         ] {
             assert!(text.contains(name), "{name} not registered:\n{text}");
         }
