@@ -237,6 +237,16 @@ tick is the right place, not one-shot init.)
 (not raw data dirs — respect DO-NOT-COMMIT list).
 **Depends on**: Tasks 3, 4
 
+## Mixed-version deployment constraint (Task 4 finding, S405)
+
+Verified in vendored libp2p-gossipsub 0.49.4: explicit peers are kept OUT of
+the mesh by design — a GRAFT from an explicit peer is answered with PRUNE
+(behaviour.rs:1401) and a warning. Explicit peering therefore must be
+reciprocal. Rolling the explicit-peers build onto seed+val1 while val3 runs an
+older build would leave val3 fanout-only toward us. **Do not deploy Task 4 to
+live until every validator carries it.** The watchdog (Tasks 1–3) is
+version-neutral and safe to deploy independently.
+
 ## Verification (end-to-end)
 
 - `cargo test -p torus-network -p torus-telemetry` green.

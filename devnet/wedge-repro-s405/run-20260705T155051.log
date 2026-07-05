@@ -1,0 +1,50 @@
+[15:50:52] === wedge repro: 10 in-place restarts of validator-1, observer=validator-0 ===
+[15:50:54] binary: devnet-validator-0-1   torus-devnet-node   local               linux/amd64         ccc93e0407ab        47.2MB              28 seconds ago
+[15:50:54] subscription metric absent -> BASE mode (views/block detection)
+[15:51:05] pre-flight (base): height=63
+[15:51:05] attempt 1/10: docker restart -t0 validator-1
+[15:53:03]   base windows: 1.39 / 1.55 / 1.52 views/block
+[15:53:04] attempt 2/10: docker restart -t0 validator-1
+[15:55:02]   base windows: 1.13 / 1.17 / 1.15 views/block
+[15:55:02] attempt 3/10: docker restart -t0 validator-1
+[15:57:00]   base windows: 2.00 / 1.92 / 2.11 views/block
+[15:57:01]   WEDGE INDUCED (base) — watching 90s for spontaneous heal (expected: none)
+[15:58:31]   base heal-watch: 2.00 / 1.95 / 2.00 views/block
+[15:58:31]   STILL DEGRADED after 3 more windows — S395 behavior confirmed on base
+[15:58:32] attempt 4/10: docker restart -t0 validator-1
+[16:00:30]   base windows: 2.02 / 2.00 / 2.02 views/block
+[16:00:31]   WEDGE INDUCED (base) — watching 90s for spontaneous heal (expected: none)
+[16:02:01]   base heal-watch: 2.13 / 1.93 / 2.27 views/block
+[16:02:02]   STILL DEGRADED after 3 more windows — S395 behavior confirmed on base
+[16:02:02] attempt 5/10: docker restart -t0 validator-1
+[16:04:01]   base windows: 1.93 / 1.90 / 1.87 views/block
+[16:04:01]   WEDGE INDUCED (base) — watching 90s for spontaneous heal (expected: none)
+[16:05:32]   base heal-watch: 1.93 / 1.95 / 1.98 views/block
+[16:05:32]   STILL DEGRADED after 3 more windows — S395 behavior confirmed on base
+[16:05:32] attempt 6/10: docker restart -t0 validator-1
+[16:07:30]   base windows: 1.98 / 1.67 / 2.20 views/block
+[16:07:30]   WEDGE INDUCED (base) — watching 90s for spontaneous heal (expected: none)
+[16:09:01]   base heal-watch: 2.00 / 1.96 / 1.83 views/block
+[16:09:01]   STILL DEGRADED after 3 more windows — S395 behavior confirmed on base
+[16:09:02] attempt 7/10: docker restart -t0 validator-1
+[16:11:00]   base windows: 2.02 / 2.02 / 2.69 views/block
+[16:11:00]   WEDGE INDUCED (base) — watching 90s for spontaneous heal (expected: none)
+[16:12:31]   base heal-watch: 2.02 / 1.98 / 2.04 views/block
+[16:12:31]   STILL DEGRADED after 3 more windows — S395 behavior confirmed on base
+[16:12:31] attempt 8/10: docker restart -t0 validator-1
+[16:14:29]   base windows: 1.98 / 1.93 / 1.94 views/block
+[16:14:29]   WEDGE INDUCED (base) — watching 90s for spontaneous heal (expected: none)
+[16:16:00]   base heal-watch: 1.96 / 1.89 / 2.09 views/block
+[16:16:00]   STILL DEGRADED after 3 more windows — S395 behavior confirmed on base
+[16:16:00] attempt 9/10: docker restart -t0 validator-1
+[16:17:59]   base windows: 1.95 / 1.91 / 1.95 views/block
+[16:18:00]   WEDGE INDUCED (base) — watching 90s for spontaneous heal (expected: none)
+[16:19:31]   base heal-watch: 1.77 / 2.06 / 2.06 views/block
+[16:19:31]   STILL DEGRADED after 3 more windows — S395 behavior confirmed on base
+[16:19:31] attempt 10/10: docker restart -t0 validator-1
+[16:21:30]   base windows: 2.00 / 1.96 / 2.02 views/block
+[16:21:30]   WEDGE INDUCED (base) — watching 90s for spontaneous heal (expected: none)
+[16:23:01]   base heal-watch: 2.23 / 1.96 / 2.02 views/block
+[16:23:01]   STILL DEGRADED after 3 more windows — S395 behavior confirmed on base
+[16:23:01] === summary: attempts=10 wedges_induced=8 healed=0 ===
+[16:23:01] log: devnet/wedge-repro-s405/run-20260705T155051.log

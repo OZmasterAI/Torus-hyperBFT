@@ -1,0 +1,25 @@
+[14:59:10] === wedge repro: 10 in-place restarts of validator-1, observer=validator-0 ===
+[14:59:13] binary: devnet-validator-0-1   torus-devnet-node   local               linux/amd64         f9b72437d5e9        47.2MB              34 seconds ago
+[14:59:13] pre-flight: subscribed_validators=3 (need 3)
+[14:59:13] attempt 1/10: docker restart -t0 validator-1
+[14:59:42]   t+25s subscribed=3 kicks=0 views/block=1.19
+[14:59:42] attempt 2/10: docker restart -t0 validator-1
+[15:00:10]   t+25s subscribed=3 kicks=0 views/block=1.77
+[15:00:10] attempt 3/10: docker restart -t0 validator-1
+[15:00:37]   t+25s subscribed=3 kicks=0 views/block=1.77
+[15:00:37] attempt 4/10: docker restart -t0 validator-1
+[15:01:05]   t+25s subscribed=3 kicks=0 views/block=2.27
+[15:01:05] attempt 5/10: docker restart -t0 validator-1
+[15:01:33]   t+25s subscribed=3 kicks=0 views/block=2.02
+[15:01:33] attempt 6/10: docker restart -t0 validator-1
+[15:02:02]   t+25s subscribed=3 kicks=0 views/block=1.95
+[15:02:03] attempt 7/10: docker restart -t0 validator-1
+[15:02:31]   t+25s subscribed=3 kicks=0 views/block=2.09
+[15:02:31] attempt 8/10: docker restart -t0 validator-1
+[15:02:59]   t+25s subscribed=3 kicks=0 views/block=1.92
+[15:02:59] attempt 9/10: docker restart -t0 validator-1
+[15:03:27]   t+25s subscribed=3 kicks=0 views/block=1.96
+[15:03:27] attempt 10/10: docker restart -t0 validator-1
+[15:03:54]   t+25s subscribed=3 kicks=0 views/block=2.04
+[15:03:54] === summary: attempts=10 wedges_induced=0 healed=0 ===
+[15:03:54] log: devnet/wedge-repro-s405/run-20260705T145908.log
