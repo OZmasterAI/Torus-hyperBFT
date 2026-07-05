@@ -79,6 +79,13 @@ pub fn is_precompile(address: &Address) -> bool {
     }
 }
 
+/// Whether a precompile id is a read-only reader (0x0800–0x0803), safe to run in an
+/// eth_call / eth_estimateGas simulation. The writer precompiles (CoreWriter 0x0810,
+/// CoreWriterStaking 0x0811, Lockbox 0x0820) mutate shared state and must be denied there.
+pub const fn is_reader_precompile(id: u16) -> bool {
+    matches!(id, ADDR_ORDER_BOOK_READER..=ADDR_STAKING_READER)
+}
+
 // ============================================================================
 // ABI Encoding / Decoding
 // ============================================================================
@@ -253,6 +260,35 @@ pub fn execute_precompile(
     state_db: &StateDb,
     current_block: u64,
 ) -> Result<Vec<u8>, CoreError> {
+    execute_precompile_inner(address, input, caller, state_db, current_block, false)
+}
+
+/// Read-only variant for eth_call / eth_estimateGas simulation.
+///
+/// SECURITY: the writer precompiles (CoreWriter 0x0810, CoreWriterStaking 0x0811, Lockbox
+/// 0x0820) mutate the shared `StateDb` directly, bypassing the EVM's revert sandbox. Run in
+/// an eth_call/estimateGas simulation they would durably mutate consensus state out of
+/// consensus — diverging this node's state root from the network (state root mismatch →
+/// fork/halt) and, for CoreWriter, enqueuing an action that the next block drains and
+/// executes on this node only. This variant denies them (revert) while readers still work.
+pub fn execute_precompile_read_only(
+    address: &Address,
+    input: &[u8],
+    caller: &Address,
+    state_db: &StateDb,
+    current_block: u64,
+) -> Result<Vec<u8>, CoreError> {
+    execute_precompile_inner(address, input, caller, state_db, current_block, true)
+}
+
+fn execute_precompile_inner(
+    address: &Address,
+    input: &[u8],
+    caller: &Address,
+    state_db: &StateDb,
+    current_block: u64,
+    read_only: bool,
+) -> Result<Vec<u8>, CoreError> {
     let bytes = address.as_slice();
     if !bytes[..18].iter().all(|&b| b == 0) {
         return Err(CoreError::InvalidPrecompileInput(
@@ -260,6 +296,14 @@ pub fn execute_precompile(
         ));
     }
     let id = u16::from_be_bytes([bytes[18], bytes[19]]);
+
+    // Default-deny: in a read-only (eth_call) context, only reader precompiles may run.
+    // Any state-mutating (or unknown) precompile reverts instead of touching the DB.
+    if read_only && !is_reader_precompile(id) {
+        return Err(CoreError::InvalidPrecompileInput(
+            "state-mutating precompile invoked in read-only (eth_call) context".into(),
+        ));
+    }
 
     match id {
         ADDR_ORDER_BOOK_READER => order_book_reader(input, state_db),

@@ -702,3 +702,90 @@ fn unknown_selector_returns_error() {
     let result = execute_precompile(&address, &input, &addr(0), &db, 100);
     assert!(matches!(result, Err(CoreError::UnknownSelector(_))));
 }
+
+// ============================================================================
+// SECURITY: read-only (eth_call / eth_estimateGas) denies writer precompiles
+//
+// In call-simulation the Torus writer precompiles must NOT mutate the shared
+// StateDb — doing so out of consensus diverges the node's state root (fork/halt)
+// and, for CoreWriter, enqueues an action the next block drains on this node only.
+// ============================================================================
+
+#[test]
+fn read_only_denies_lockbox_deposit_no_state_change() {
+    let (_dir, db) = setup();
+    let trader = addr(7);
+    set_evm_balance(&db, &trader, U256::from(10_000u64 * FixedPoint::SCALE as u64));
+
+    let address = precompile_address(ADDR_LOCKBOX);
+    let input = build_input(
+        "depositToNative(uint128)",
+        &[abi::encode_u128(fp(3_000).raw() as u128)],
+    );
+
+    // Read-only: must be denied AND leave both balances untouched.
+    let result = execute_precompile_read_only(&address, &input, &trader, &db, 100);
+    assert!(result.is_err(), "writer precompile must be denied in read-only mode");
+
+    assert_eq!(
+        get_evm_balance(&db, &trader),
+        U256::from(10_000u64 * FixedPoint::SCALE as u64),
+        "EVM balance must be unchanged by a denied read-only call",
+    );
+    let bal = PositionManager::new(db).get_native_balance(&trader).unwrap();
+    assert_eq!(
+        bal.available,
+        FixedPoint::ZERO,
+        "native balance must be unchanged by a denied read-only call",
+    );
+}
+
+#[test]
+fn read_only_denies_core_writer_no_enqueue() {
+    let (_dir, db) = setup();
+    let caller = addr(1);
+    let address = precompile_address(ADDR_CORE_WRITER);
+    let input = build_input(
+        "placeOrder(bytes32,uint8,uint8,uint128,uint128,uint8)",
+        &[
+            encode_market_id(1),
+            abi::encode_u8(0),
+            abi::encode_u8(0),
+            abi::encode_u128(fp(50_000).raw() as u128),
+            abi::encode_u128(fp(5).raw() as u128),
+            abi::encode_u8(0),
+        ],
+    );
+
+    let result = execute_precompile_read_only(&address, &input, &caller, &db, 100);
+    assert!(result.is_err(), "core_writer must be denied in read-only mode");
+    // Nothing enqueued for the next block (would otherwise be drained on-chain).
+    assert_eq!(CoreWriterQueue::pending_count(&db, 101).unwrap(), 0);
+}
+
+#[test]
+fn read_only_denies_core_writer_staking_no_enqueue() {
+    let (_dir, db) = setup();
+    let address = precompile_address(ADDR_CORE_WRITER_STAKING);
+    let input = build_input(
+        "delegate(address,uint128)",
+        &[encode_addr(&addr(10)), abi::encode_u128(fp(1_000).raw() as u128)],
+    );
+
+    let result = execute_precompile_read_only(&address, &input, &addr(1), &db, 50);
+    assert!(result.is_err());
+    assert_eq!(CoreWriterQueue::pending_count(&db, 51).unwrap(), 0);
+}
+
+#[test]
+fn read_only_is_transparent_for_reader_precompiles() {
+    let (_dir, db) = setup();
+    // The guard must not affect reader precompiles: same result on both paths.
+    let address = precompile_address(ADDR_ORDER_BOOK_READER);
+    let input = build_input("getOrderBook(bytes32)", &[encode_market_id(1)]);
+
+    let ro = execute_precompile_read_only(&address, &input, &addr(0), &db, 100);
+    let normal = execute_precompile(&address, &input, &addr(0), &db, 100);
+    assert!(ro.is_ok(), "reader precompile must still run in read-only mode");
+    assert_eq!(ro.unwrap(), normal.unwrap());
+}

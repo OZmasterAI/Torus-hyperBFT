@@ -11,7 +11,8 @@ use revm::primitives::hardfork::SpecId;
 use revm::primitives::{Address, Bytes};
 
 use torus_core::precompiles::{
-    execute_precompile, is_precompile, precompile_gas, ALL_PRECOMPILE_ADDRESSES,
+    execute_precompile, execute_precompile_read_only, is_precompile, precompile_gas,
+    ALL_PRECOMPILE_ADDRESSES,
 };
 use torus_state::StateDb;
 
@@ -22,15 +23,30 @@ pub struct TorusPrecompiles<'a> {
     eth: EthPrecompiles,
     state_db: &'a StateDb,
     current_block: u64,
+    /// eth_call / eth_estimateGas simulation: deny state-mutating (writer) precompiles so
+    /// a simulation can't durably mutate the shared `StateDb` outside consensus.
+    read_only: bool,
 }
 
 impl<'a> TorusPrecompiles<'a> {
-    /// Create a new provider for the given spec, state database, and block number.
+    /// Create a provider for real transaction/block execution (writer precompiles enabled).
     pub fn new(spec: SpecId, state_db: &'a StateDb, current_block: u64) -> Self {
+        Self::with_mode(spec, state_db, current_block, false)
+    }
+
+    /// Create a provider for eth_call / eth_estimateGas simulation, where `read_only`
+    /// denies writer precompiles (they would bypass the EVM sandbox and mutate the DB).
+    pub fn with_mode(
+        spec: SpecId,
+        state_db: &'a StateDb,
+        current_block: u64,
+        read_only: bool,
+    ) -> Self {
         Self {
             eth: EthPrecompiles::new(spec),
             state_db,
             current_block,
+            read_only,
         }
     }
 }
@@ -81,13 +97,23 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for TorusPrecompiles<'_> {
                 CallInput::Bytes(bytes) => &bytes.0,
             };
 
-            execute_precompile(
-                &address,
-                input_bytes,
-                &inputs.caller,
-                self.state_db,
-                self.current_block,
-            )
+            if self.read_only {
+                execute_precompile_read_only(
+                    &address,
+                    input_bytes,
+                    &inputs.caller,
+                    self.state_db,
+                    self.current_block,
+                )
+            } else {
+                execute_precompile(
+                    &address,
+                    input_bytes,
+                    &inputs.caller,
+                    self.state_db,
+                    self.current_block,
+                )
+            }
         };
 
         // Build InterpreterResult.

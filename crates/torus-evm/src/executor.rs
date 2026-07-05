@@ -141,9 +141,15 @@ impl EvmExecutor {
             .modify_block_chained(|b| apply_block_env(b, block_cfg))
             .with_db(state);
 
-        let mut evm = ctx
-            .build_mainnet()
-            .with_precompiles(TorusPrecompiles::new(SpecId::CANCUN, state_db, block_cfg.number));
+        // In call-simulation mode (eth_call / eth_estimateGas) run the precompiles
+        // read-only so the Torus writer precompiles cannot durably mutate the shared
+        // StateDb outside consensus (they bypass revm's revert sandbox).
+        let mut evm = ctx.build_mainnet().with_precompiles(TorusPrecompiles::with_mode(
+            SpecId::CANCUN,
+            state_db,
+            block_cfg.number,
+            call_mode,
+        ));
         let result = evm.transact_commit(tx).map_err(map_evm_err)?;
 
         let tx_result = build_tx_result(&result);
