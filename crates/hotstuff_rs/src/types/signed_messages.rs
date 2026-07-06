@@ -66,6 +66,7 @@ pub(crate) trait SignedMessage: Clone {
 
 /// Data types that indicate that a validator supports a particular **decision** about a particular
 /// `chain_id` and `view`.
+#[allow(dead_code)]
 pub(crate) trait Vote: SignedMessage {
     /// Get the `chain_id` of the chain that the `Vote` is about.
     fn chain_id(&self) -> ChainID;
@@ -139,6 +140,7 @@ pub(crate) trait Certificate {
     /// simply isn't enough remaining votes in "2/3rds + 1" to form two quorums. Critically, note that if
     /// the quorum threshold were any lower (e.g., just 2/3rds), this case would be possible, and the
     /// invariant would no longer hold.
+    #[allow(dead_code)]
     fn quorum(validator_set_power: TotalPower) -> TotalPower {
         const TOTAL_POWER_OVERFLOW: &str =
             "Validator set power exceeds u128::MAX/2. Read the itemdoc for Validator Set.";

@@ -25,7 +25,7 @@
 //! is currently allowed to take part in consensus decisions:
 //! - **Validators**: replicas that currently take part in consensus decisions.
 //! - **Listeners**: replicas that currently do not take part in consensus decisions, but rather
-//!  merely replicates the block tree.
+//!   merely replicates the block tree.
 //!
 //! As the definition above implies, the **Validator Set** is dynamic, and will change as
 //! [**validator set-updating**](crate::app#two-app-mutable-states-app-state-and-validator-set) blocks

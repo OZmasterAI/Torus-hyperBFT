@@ -22,7 +22,7 @@ use super::{
 /// An active validator can:
 /// - Propose/Nudge and phase vote in the HotStuff protocol,
 /// - Contribute [timeout votes](crate::pacemaker::messages::TimeoutVote) and
-///    [advance view messages](crate::pacemaker::messages::AdvanceView).
+///   [advance view messages](crate::pacemaker::messages::AdvanceView).
 ///
 /// ## `is_validator` logic
 ///
@@ -187,17 +187,17 @@ pub(crate) fn is_phase_voter(
     if validator_set_state.update_decided() {
         validator_set_state
             .committed_validator_set()
-            .contains(&replica)
+            .contains(replica)
     } else {
         match justify.phase {
             Phase::Generic | Phase::Prepare | Phase::Precommit | Phase::Decide => {
                 validator_set_state
                     .previous_validator_set()
-                    .contains(&replica)
+                    .contains(replica)
             }
             Phase::Commit => validator_set_state
                 .committed_validator_set()
-                .contains(&replica),
+                .contains(replica),
         }
     }
 }
@@ -252,7 +252,8 @@ pub(crate) fn phase_vote_recipient(
 /// Returns a pair containing the following items:
 /// 1. `VerifyingKey`: the leader in the committed validator set in `new_view.view + 1`.
 /// 2. `Option<VerifyingKey>`: the leader in the resigning validator set in `new_view.view + 1` (`None`
-///     if the most recently initiated validator set update has been decided).
+///    if the most recently initiated validator set update has been decided).
+#[allow(dead_code)]
 pub(crate) fn new_view_recipients(
     new_view: &NewView,
     validator_set_state: &ValidatorSetState,
