@@ -686,6 +686,83 @@ mod tests {
         handle.stop().unwrap();
     }
 
+    #[tokio::test]
+    async fn submit_rejects_unknown_market_single_and_batch() {
+        let (_dir, state, mempool, executor) = setup();
+        // Seed market 1 (existence is what the guard reads; genesis writes
+        // borsh StoredMarket bytes under the same 8-byte BE key).
+        state
+            .put_cf_raw(
+                torus_state::cf::CF_NATIVE_MARKETS,
+                &1u64.to_be_bytes(),
+                b"seeded-market",
+            )
+            .unwrap();
+        let (handle, addr) = start_server(state, mempool.clone(), executor).await;
+        use jsonrpsee::core::client::ClientT;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let key = k256::ecdsa::SigningKey::from_slice(
+            &hex::decode("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80")
+                .unwrap(),
+        )
+        .unwrap();
+        let params = |market_id: u64| torus_types::PlaceOrderParams {
+            market_id,
+            is_buy: true,
+            price: torus_types::FixedPoint::from_raw(6_500_000_000_000),
+            quantity: torus_types::FixedPoint::from_raw(10_000_000),
+            order_type: torus_types::OrderType::Limit,
+            time_in_force: torus_types::TimeInForce::GTC,
+            reduce_only: false,
+            client_order_id: None,
+        };
+        let mk = |action: torus_types::NativeAction, nonce: u64| {
+            let signed = torus_types::eip712::sign_native_action(action, nonce, &key);
+            format!("0x{}", hex::encode(serde_json::to_vec(&signed).unwrap()))
+        };
+
+        let good_single = mk(torus_types::NativeAction::PlaceOrder(params(1)), now_ms);
+        let bad_single = mk(torus_types::NativeAction::PlaceOrder(params(99)), now_ms + 1);
+        let bad_batch = mk(
+            torus_types::NativeAction::PlaceOrderBatch(vec![params(1), params(99)]),
+            now_ms + 2,
+        );
+
+        // Batch pipeline: per-item errors, listed-market order admitted.
+        let results: Vec<RpcSubmitResult> = client
+            .request(
+                "torus_submitNativeActions",
+                jsonrpsee::rpc_params![vec![good_single, bad_single, bad_batch]],
+            )
+            .await
+            .unwrap();
+        assert!(results[0].hash.is_some() && results[0].error.is_none());
+        assert!(results[1].error.as_deref().unwrap_or("").contains("unknown market_id 99"));
+        assert!(results[2].error.as_deref().unwrap_or("").contains("unknown market_id 99"));
+        assert_eq!(mempool.native_pool_size(), 1, "only the listed-market order admitted");
+
+        // Single endpoint: call-level error.
+        let err = client
+            .request::<String, _>(
+                "torus_submitNativeAction",
+                jsonrpsee::rpc_params![mk(
+                    torus_types::NativeAction::PlaceOrder(params(77)),
+                    now_ms + 3
+                )],
+            )
+            .await
+            .expect_err("unknown market must be rejected on the single endpoint");
+        assert!(err.to_string().contains("unknown market_id 77"));
+        handle.stop().unwrap();
+    }
+
     /// Option A (ingress-verify-fix): per-item result ORDER is pinned with
     /// failures interleaved at fixed indexes, so the parallel verify swap
     /// (rayon par_iter) can never silently reorder or misalign results.
@@ -818,6 +895,15 @@ mod tests {
     #[test]
     fn verify_breakdown_by_batch_size() {
         let (_dir, state, _mempool, _executor) = setup();
+        // Market 1 must exist: verify_one_action_with now runs the O2
+        // unknown-market ingress guard (validate_known_markets).
+        state
+            .put_cf_raw(
+                torus_state::cf::CF_NATIVE_MARKETS,
+                &1u64.to_be_bytes(),
+                b"seeded-market",
+            )
+            .unwrap();
         let key = k256::ecdsa::SigningKey::from_slice(
             &hex::decode("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80")
                 .unwrap(),

@@ -397,7 +397,17 @@ impl NativeExecutor {
             // the same flatten + per-market parallel pipeline as the live path, then collapsed
             // to one summary result. `execute_batch` flattens batches into `PlaceOrder`s, so it
             // never re-enters this arm — no recursion.
-            NativeAction::PlaceOrderBatch(_) => {
+            NativeAction::PlaceOrderBatch(orders) => {
+                if !torus_types::batch_len_within_cap(orders.len()) {
+                    return NativeActionResult::err(
+                        "place_order_batch",
+                        format!(
+                            "batch size {} outside [1, {}] — skipped (deterministic cap)",
+                            orders.len(),
+                            torus_types::NATIVE_ORDERS_PER_BATCH_CAP
+                        ),
+                    );
+                }
                 let pair = (*sender, action.clone());
                 let batch = Self::execute_batch(ctx, std::slice::from_ref(&pair));
                 let total = batch.results.len();
@@ -520,15 +530,46 @@ impl NativeExecutor {
             .any(|(_, a)| matches!(a, NativeAction::PlaceOrderBatch(_)))
         {
             let mut out = Vec::with_capacity(actions.len());
+            let mut skipped_batches = 0usize;
             for (sender, action) in actions {
                 match action {
                     NativeAction::PlaceOrderBatch(orders) => {
+                        // G1 (O2): DETERMINISTIC exec-side cap. The RPC/admit
+                        // checks are node-local policy; this is the consensus-
+                        // critical bound. An oversize (or empty) batch is
+                        // skipped WHOLESALE — same doctrine as the replay-guard
+                        // skip (app.rs warn + continue) — the block is never
+                        // aborted, and every correct node skips identically.
+                        //
+                        // LOCKSTEP-DEPLOY: this skip is a consensus-semantics
+                        // change (a pre-upgrade node flattens+executes an
+                        // oversize batch; an upgraded node skips it → divergent
+                        // state root on a block that carries one). The whole
+                        // fleet must run this before any block can legally carry
+                        // a batch above the cap — same deploy class as the
+                        // SessionScope::Trading widening (torus-types lib.rs).
+                        if !torus_types::batch_len_within_cap(orders.len()) {
+                            // Aggregate the count; do NOT log per batch. A
+                            // malicious proposer can pack a block with thousands
+                            // of tiny empty/oversize batches under the byte cap;
+                            // per-batch WARN with %sender formatting would stall
+                            // the single exec thread every block (log-DoS).
+                            skipped_batches += 1;
+                            continue;
+                        }
                         for p in orders {
                             out.push((*sender, NativeAction::PlaceOrder(p.clone())));
                         }
                     }
                     other => out.push((*sender, other.clone())),
                 }
+            }
+            if skipped_batches > 0 {
+                tracing::warn!(
+                    skipped_batches,
+                    cap = torus_types::NATIVE_ORDERS_PER_BATCH_CAP,
+                    "skipped oversize/empty PlaceOrderBatch action(s) at exec (deterministic cap)"
+                );
             }
             std::borrow::Cow::Owned(out)
         } else {

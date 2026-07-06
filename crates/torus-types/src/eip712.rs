@@ -1424,6 +1424,60 @@ mod tests {
         assert_eq!(got, owner);
     }
 
+    /// O2/G3: least-privilege market makers must be able to batch under
+    /// Trading scope; the narrow TransfersOnly scope must still reject.
+    /// Covers BOTH enforcement points: `resolve_sender` (ingress, :823) and
+    /// `batch_verify_native_actions` (exec/consensus, :985) — one `allows()`.
+    #[test]
+    fn trading_scope_allows_place_order_batch_transfers_only_rejects() {
+        let ed_key = ed25519_dalek::SigningKey::from_bytes(&[44u8; 32]);
+        let pubkey = ed_key.verifying_key().to_bytes();
+        let owner = Address::from([0x44; 20]);
+
+        let params = crate::PlaceOrderParams {
+            market_id: 1,
+            is_buy: true,
+            price: FixedPoint::from_raw(6_500_000_000_000),
+            quantity: FixedPoint::from_raw(10_000_000),
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::GTC,
+            reduce_only: false,
+            client_order_id: None,
+        };
+        let signed = sign_action_with_session(
+            NativeAction::PlaceOrderBatch(vec![params.clone(), params]),
+            TEST_NONCE,
+            &ed_key,
+        );
+
+        // Ingress path: Trading scope resolves to the owner.
+        let trading = make_session(owner); // scope: Trading
+        let got = signed
+            .resolve_sender(0, |pk| (pk == &pubkey).then(|| trading.clone()))
+            .expect("Trading scope must allow PlaceOrderBatch");
+        assert_eq!(got, owner);
+
+        // Exec/consensus path agrees.
+        let senders = batch_verify_native_actions(
+            std::slice::from_ref(&signed),
+            TEST_NONCE,
+            |pk| (pk == &pubkey).then(|| trading.clone()),
+        );
+        assert_eq!(senders[0], Some(owner));
+
+        // TransfersOnly still rejects with the precise scope error.
+        let transfers = SessionData {
+            owner,
+            expiry: u64::MAX,
+            scope: SessionScope::TransfersOnly,
+            created_at: 0,
+        };
+        let err = signed
+            .resolve_sender(0, |pk| (pk == &pubkey).then(|| transfers.clone()))
+            .unwrap_err();
+        assert!(matches!(err, Eip712Error::SessionScopeViolation));
+    }
+
     /// Collapse the positional sender vector back to the indices of invalid
     /// actions, so the existing index-based assertions stay meaningful.
     fn invalid_indices(senders: &[Option<Address>]) -> Vec<usize> {

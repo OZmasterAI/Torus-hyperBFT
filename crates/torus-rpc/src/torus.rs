@@ -231,6 +231,40 @@ fn decode_action_bin(bytes: &[u8]) -> Result<torus_types::SignedNativeAction, St
     bincode::deserialize(bytes).map_err(|e| format!("invalid action encoding: {e}"))
 }
 
+/// RPC-only ingress guard (non-consensus; O2 design Open Question 2): reject
+/// PlaceOrder / PlaceOrderBatch actions referencing a market_id with no row
+/// in CF_NATIVE_MARKETS — closing the phantom-book trap where a typo'd id
+/// "succeeds" into a tick=1/lot=1 book conjured at exec
+/// (native_executor.rs:656; exec-side fix is a separate consensus item).
+/// Point-gets on the 8-byte BE market key; the order-id counter row in the
+/// same CF has a 24-byte key (NEXT_GLOBAL_ORDER_ID_KEY) so it never collides.
+/// Cheap: runs BEFORE signature verify; batches dedup market ids first.
+pub(crate) fn validate_known_markets(
+    action: &torus_types::NativeAction,
+    state_db: &torus_state::StateDb,
+) -> Result<(), String> {
+    let check = |mid: u64| -> Result<(), String> {
+        match state_db.get_cf_raw(CF_NATIVE_MARKETS, &mid.to_be_bytes()) {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => Err(format!("unknown market_id {mid}")),
+            Err(e) => Err(format!("market lookup failed: {e}")),
+        }
+    };
+    match action {
+        torus_types::NativeAction::PlaceOrder(p) => check(p.market_id),
+        torus_types::NativeAction::PlaceOrderBatch(orders) => {
+            let mut seen = std::collections::BTreeSet::new();
+            for p in orders {
+                if seen.insert(p.market_id) {
+                    check(p.market_id)?;
+                }
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Parse + structurally validate + signature-verify one hex-encoded signed
 /// native action. Blocking-pool work (ecrecover); the batch endpoint runs a
 /// whole batch of these inside one `spawn_blocking`. Error is a per-item
@@ -245,6 +279,7 @@ fn verify_one_action_with(
     let bytes = parse_bytes(signed_action).map_err(|e| format!("invalid hex: {e}"))?;
     let action = decode(&bytes)?;
     torus_mempool::rate_limit::validate_batch_size(&action.action)?;
+    validate_known_markets(&action.action, state_db)?;
     let sender = action
         .validate_with_sessions(current_time_ms, chain_id, |pubkey| {
             state_db.get_session(pubkey).ok().flatten()
@@ -965,6 +1000,9 @@ impl TorusApiServer for RpcState {
             // Reject malformed batches (empty / over NATIVE_ORDERS_PER_BATCH_CAP) before
             // spending an ecrecover on them.
             torus_mempool::rate_limit::validate_batch_size(&action.action)
+                .map_err(RpcError::InvalidParams)?;
+
+            validate_known_markets(&action.action, &state_db)
                 .map_err(RpcError::InvalidParams)?;
 
             let current_time_ms = std::time::SystemTime::now()

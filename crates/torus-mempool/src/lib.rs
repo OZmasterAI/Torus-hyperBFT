@@ -436,6 +436,16 @@ impl Mempool {
         // be reconstructed and consensus wedges (livelock root cause, mem 28e1a821).
         self.mirror_to_da(&action);
 
+        // G1 defensive layer (O2): an oversize/empty batch must never enter
+        // the POOL (an honest node must never SELECT it into a proposal). It
+        // is still DA-mirrored above: a malicious proposer may reference it,
+        // and the block must stay reconstructable so the deterministic
+        // exec-side skip can run (availability != validity, mem 28e1a821).
+        // Covers every network ingest: gossip topic, pre-proposal full-body
+        // push, direct forward, and the gossip-trusted path.
+        crate::rate_limit::validate_batch_size(&action.action)
+            .map_err(MempoolError::NativeValidationFailed)?;
+
         let current_time_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system clock before epoch")
@@ -609,18 +619,20 @@ impl Mempool {
     /// cause of duplicate native inclusion.
     /// `bytes_cap` bounds the summed encoded size of the selected bodies (WAN
     /// dissemination budget — see `rate_limit::NATIVE_BLOCK_BYTES_CAP`).
+    /// `orders_cap` bounds total orders via `order_count` (`NATIVE_ORDERS_PER_BLOCK_CAP`).
     pub fn select_native_for_block_with_senders_excluding(
         &self,
         limit: usize,
         exclude: &std::collections::HashSet<B256>,
         bytes_cap: usize,
+        orders_cap: usize,
     ) -> Vec<(alloy_primitives::Address, SignedNativeAction)> {
         let mut pool = self.native.write().unwrap();
         let evicted = pool.evict_expired(now_ms());
         if evicted > 0 {
             tracing::info!(evicted, "evicted nonce-expired native actions from pool");
         }
-        pool.select_for_block_with_senders_excluding(limit, exclude, bytes_cap)
+        pool.select_for_block_with_senders_excluding(limit, exclude, bytes_cap, orders_cap)
     }
 
     /// Remove native actions that were included in a committed block.
@@ -833,6 +845,72 @@ mod tests {
 
         // The genuine sender is admitted.
         pool.add_native_action_from_gossip(real_sender, signed).unwrap();
+        assert_eq!(pool.native_pool_size(), 1);
+    }
+
+    #[test]
+    fn gossip_admit_rejects_oversize_and_empty_batch_but_keeps_da_mirror() {
+        use crate::rate_limit::NATIVE_ORDERS_PER_BATCH_CAP;
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state, MempoolConfig::default());
+        let key = k256::ecdsa::SigningKey::from_slice(
+            &alloy_primitives::hex::decode(
+                "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let now = now_ms();
+        let params = torus_types::PlaceOrderParams {
+            market_id: 1,
+            is_buy: true,
+            price: torus_types::FixedPoint::from_raw(6_500_000_000_000),
+            quantity: torus_types::FixedPoint::from_raw(10_000_000),
+            order_type: torus_types::OrderType::Limit,
+            time_in_force: torus_types::TimeInForce::GTC,
+            reduce_only: false,
+            client_order_id: None,
+        };
+
+        // Oversize batch: rejected by BOTH gossip paths, pool stays empty,
+        // but the body IS DA-mirrored (availability != validity — a block
+        // referencing it must stay reconstructable for the exec-side skip).
+        let over = torus_types::eip712::sign_native_action(
+            torus_types::NativeAction::PlaceOrderBatch(vec![
+                params.clone();
+                NATIVE_ORDERS_PER_BATCH_CAP + 1
+            ]),
+            now,
+            &key,
+        );
+        let sender = over.recover_sender().unwrap();
+        let over_hash = torus_types::compute_action_hash(&over);
+        assert!(pool.add_native_action_from_gossip(sender, over.clone()).is_err());
+        assert!(pool
+            .add_native_action_from_gossip_trusted(sender, over)
+            .is_err());
+        assert_eq!(pool.native_pool_size(), 0, "oversize batch must never enter the pool");
+        assert!(pool.get_native_da(&over_hash).is_some(), "body still DA-mirrored");
+
+        // Empty batch: same rejection.
+        let empty = torus_types::eip712::sign_native_action(
+            torus_types::NativeAction::PlaceOrderBatch(vec![]),
+            now + 1,
+            &key,
+        );
+        assert!(pool.add_native_action_from_gossip(sender, empty).is_err());
+        assert_eq!(pool.native_pool_size(), 0);
+
+        // At-cap batch: admitted (boundary).
+        let at_cap = torus_types::eip712::sign_native_action(
+            torus_types::NativeAction::PlaceOrderBatch(vec![
+                params;
+                NATIVE_ORDERS_PER_BATCH_CAP
+            ]),
+            now + 2,
+            &key,
+        );
+        pool.add_native_action_from_gossip(sender, at_cap).unwrap();
         assert_eq!(pool.native_pool_size(), 1);
     }
 

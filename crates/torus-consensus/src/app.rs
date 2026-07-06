@@ -1386,6 +1386,7 @@ impl App<RocksKVStore> for TorusApp {
                 torus_mempool::rate_limit::native_total_block_cap(),
                 &in_flight,
                 torus_mempool::rate_limit::native_block_bytes_cap(),
+                torus_mempool::rate_limit::native_orders_per_block_cap(),
             );
             let evm = mempool.drain_evm(gas_limit, parent_header.state_root);
             if !evm.is_empty() || !native.is_empty() {

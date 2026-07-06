@@ -38,3 +38,7 @@ harness = false
 [[bench]]
 name = "exec_batch_trades"
 harness = false
+
+[[bench]]
+name = "exec_place_batch"
+harness = false
