@@ -1,0 +1,83 @@
+{
+  "prp": "o5-feed-gates",
+  "created": "2026-07-06T00:00:00Z",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "caps.rs single source of truth + ladder invariant tests",
+      "status": "pending",
+      "files": [
+        "crates/torus-network/src/caps.rs",
+        "crates/torus-network/src/codec.rs",
+        "crates/torus-network/src/lib.rs"
+      ],
+      "validate": "cargo test -p torus-network caps",
+      "depends_on": []
+    },
+    {
+      "id": 2,
+      "name": "wire gossipsub max_transmit_size to config (kill hardcode)",
+      "status": "pending",
+      "files": [
+        "crates/torus-network/src/behaviour.rs",
+        "crates/torus-network/src/bridge.rs"
+      ],
+      "validate": "cargo test -p torus-network",
+      "depends_on": [1]
+    },
+    {
+      "id": 3,
+      "name": "EVM worst-case ladder test (must be RED at 256KB)",
+      "status": "pending",
+      "files": [
+        "crates/torus-integration-tests/tests/o5_feed_gates.rs"
+      ],
+      "validate": "cargo test -p torus-integration-tests --test o5_feed_gates 2>&1 | grep -q 'worst_case_compact_proposal_fits_consensus_accept_gate ... FAILED'",
+      "depends_on": [1]
+    },
+    {
+      "id": 4,
+      "name": "raise accept gates: consensus 256KB->1MB, direct read 4MB->8MB",
+      "status": "pending",
+      "files": [
+        "crates/torus-network/src/config.rs",
+        "crates/torus-network/src/caps.rs",
+        "crates/torus-consensus/src/app.rs",
+        "crates/hotstuff_rs/src/hotstuff/messages.rs"
+      ],
+      "validate": "cargo test -p torus-integration-tests --test o5_feed_gates && cargo test -p torus-network -p torus-consensus",
+      "depends_on": [3]
+    },
+    {
+      "id": 5,
+      "name": "clamp env push threshold to fleet floor with WARN (S388 6MB fix)",
+      "status": "pending",
+      "files": [
+        "crates/torus-network/src/bridge.rs"
+      ],
+      "validate": "cargo test -p torus-network bridge",
+      "depends_on": [1]
+    },
+    {
+      "id": 6,
+      "name": "devnet bs400 threshold sweep 512KB-vs-3MB (default unchanged)",
+      "status": "pending",
+      "files": [
+        "devnet/sweep-o5-threshold-s415.sh"
+      ],
+      "validate": "test -s devnet/sweep-o5-s415.csv && awk -F, 'NR>1 && $2==3145728 {ok=($5<5 && $6==0)} END {exit !ok}' devnet/sweep-o5-s415.csv",
+      "depends_on": [1, 2, 3, 4, 5]
+    },
+    {
+      "id": 7,
+      "name": "rollout doc + roadmap check-off + memory save",
+      "status": "pending",
+      "files": [
+        "docs/plans/o5-feed-gates-impl.md",
+        "docs/plans/blockspeed-orders-roadmap-s405.md"
+      ],
+      "validate": "grep -q '\\[x\\] \\*\\*O5' docs/plans/blockspeed-orders-roadmap-s405.md",
+      "depends_on": [6]
+    }
+  ]
+}
