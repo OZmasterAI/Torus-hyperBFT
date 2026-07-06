@@ -14,7 +14,8 @@
     {
       "id": 2,
       "name": "Extract free recover_bodies_bounded shared by sync path and worker (pure refactor)",
-      "status": "pending",
+      "status": "done",
+      "commit": "984b34a",
       "files": ["crates/torus-consensus/src/app.rs"],
       "validate": "cargo test -p torus-consensus pull_ && cargo clippy -p torus-consensus -- -D warnings",
       "depends_on": []
@@ -22,7 +23,7 @@
     {
       "id": 3,
       "name": "DaRecoveryWorker: channel + named thread + store-check dedup + drop-join",
-      "status": "pending",
+      "status": "done",
       "files": ["crates/torus-consensus/src/app.rs"],
       "validate": "cargo test -p torus-consensus recovery_worker_recovers_late_body_off_thread",
       "depends_on": [2]

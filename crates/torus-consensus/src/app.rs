@@ -764,6 +764,138 @@ fn recover_bodies_bounded(
     false
 }
 
+/// BS-4a recovery-worker pull budget: 50 × 20 ms = ~1 s, sync-parity (matches the
+/// flat `PULL_RETRIES * PULL_DELAY` sync budget). OPEN QUESTION: 1 s (sync parity)
+/// vs 2 s (cover a slow re-propose cycle so the re-proposed view is guaranteed to
+/// find the body locally) — start at sync parity, tune on devnet. The worker runs
+/// OFF the consensus thread, so widening this later costs no hot-path latency.
+const WORKER_PULL_RETRIES: usize = 50;
+const WORKER_PULL_DELAY: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// BS-4a: owns the off-thread recovery of push-missed native-action bodies.
+/// The consensus thread hands missing hashes here and votes MissingData
+/// immediately; this thread runs the (event-driven, deadline-bounded) pull
+/// loop with the roomier WORKER budget, so the re-proposed view finds the
+/// bodies locally. Sender-drop => recv Err => thread exits (O3 pattern).
+///
+/// `tx` is an `Option` (sanctioned deviation from the bare-`Sender` sketch):
+/// `Drop` must close the channel BEFORE joining, and the only way to drop a
+/// field early is `Option::take` — same shape as the O3 `BackgroundCfWriter`
+/// (torus-state/src/bg_writer.rs).
+#[allow(dead_code)] // wired in BS-4a Task 4
+struct DaRecoveryWorker {
+    tx: Option<std::sync::mpsc::SyncSender<Vec<torus_types::B256>>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Bounded in-flight batch queue. Under a sustained-miss / partition regime,
+/// submits arrive at view cadence (~2/s) while the worker drains at ~1/s (each
+/// unrecoverable batch burns the full ~1 s budget), so an UNBOUNDED channel would
+/// grow without limit AND make shutdown drain block queue_depth × ~1 s. Capping at
+/// 8 bounds both: memory (≤ 8 queued batches) and shutdown latency (see `Drop`). A
+/// full queue means recovery is already saturated — dropping the newest batch is
+/// harmless, the re-proposed view resubmits the same hashes next view.
+const WORKER_QUEUE_CAP: usize = 8;
+
+#[allow(dead_code)] // wired in BS-4a Task 4
+impl DaRecoveryWorker {
+    /// Spawn the recovery thread. It owns clones of the mempool/fetcher Arcs, so
+    /// it needs nothing from `TorusApp` and stays alive until the channel closes.
+    fn spawn(
+        mempool: Arc<Mempool>,
+        fetcher: Arc<dyn NativeDaFetcher>,
+        metrics: Option<Arc<torus_telemetry::Metrics>>,
+    ) -> Self {
+        let (tx, rx) =
+            std::sync::mpsc::sync_channel::<Vec<torus_types::B256>>(WORKER_QUEUE_CAP);
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_shutdown = shutdown.clone();
+        let handle = std::thread::Builder::new()
+            .name("torus-da-recovery".into())
+            .spawn(move || {
+                // recv() yields queued batches even after the sender is dropped,
+                // then errors — the shutdown flag below turns that drain into an
+                // early exit so a dying node never spends budget on stale work.
+                while let Ok(batch) = rx.recv() {
+                    // Shutdown wins immediately: queued recovery work is worthless
+                    // on a node that is going down. Unlike O3's DB writes there is
+                    // NO data-loss concern here (a dropped pull just re-fires on the
+                    // re-proposed view), so drain-on-shutdown is intentionally NOT
+                    // wanted — bail before spending a ~1 s budget on a dying node.
+                    if worker_shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                    // A hash may have landed (late push, pre-warm, another batch)
+                    // while this one sat queued — drop what's already in the store
+                    // so we never fire a redundant network fetch.
+                    let still_missing: Vec<torus_types::B256> = batch
+                        .into_iter()
+                        .filter(|h| mempool.get_native_da(h).is_none())
+                        .collect();
+                    if still_missing.is_empty() {
+                        continue;
+                    }
+                    recover_bodies_bounded(
+                        &mempool,
+                        fetcher.as_ref(),
+                        &still_missing,
+                        WORKER_PULL_RETRIES,
+                        WORKER_PULL_DELAY,
+                        metrics.as_deref(),
+                    );
+                }
+            })
+            .expect("spawn torus-da-recovery thread");
+        Self {
+            tx: Some(tx),
+            handle: Some(handle),
+            shutdown,
+        }
+    }
+
+    /// Hand a batch of missing hashes to the worker. Non-blocking (`try_send`):
+    /// the consensus thread calls this, so it must NEVER block or panic. On a full
+    /// queue (recovery already saturated) or a dead worker the batch is dropped with
+    /// a warning — harmless, the re-proposed view resubmits the same hashes.
+    fn submit(&self, hashes: Vec<torus_types::B256>) {
+        use std::sync::mpsc::TrySendError;
+        let Some(tx) = &self.tx else {
+            tracing::warn!("da-recovery worker: sender already closed; dropping batch");
+            return;
+        };
+        match tx.try_send(hashes) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                tracing::warn!("da-recovery worker queue full; dropping missing-hash batch");
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                tracing::warn!("da-recovery worker thread gone; dropping missing-hash batch");
+            }
+        }
+    }
+}
+
+impl Drop for DaRecoveryWorker {
+    fn drop(&mut self) {
+        // Signal shutdown BEFORE closing the channel: the worker checks the flag
+        // right after each recv() Ok and bails, so batches still queued (≤
+        // WORKER_QUEUE_CAP) are DISCARDED in O(1), not drained (no data-loss concern
+        // here — dropped pulls re-fire on the re-proposed view). Join is therefore
+        // bounded by at most ONE in-flight batch already inside
+        // recover_bodies_bounded (deadline-bounded ≤ ~1 s) plus O(1). Closing tx
+        // then unblocks a worker parked in recv().
+        self.shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+        drop(self.tx.take());
+        if let Some(h) = self.handle.take() {
+            // A worker panic must not propagate out of Drop — log, never unwrap.
+            if h.join().is_err() {
+                tracing::warn!("da-recovery worker thread panicked");
+            }
+        }
+    }
+}
+
 /// Bounded LOCAL retry on the hot validate path: a racing pre-proposal PUSH that lands
 /// just after the CompactBlock usually arrives within this window, so the common case
 /// never touches the network (keeps the pull rare). 5 × 20 ms = 100 ms.
@@ -2935,6 +3067,88 @@ mod crash_recovery_tests {
             assert!(std::time::Instant::now() < deadline, "worker never recovered the body");
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+    }
+
+    /// BS-4a: the recovery worker, fed a missing hash, pulls + absorbs the body into
+    /// the durable DA store off-thread within its budget.
+    #[test]
+    fn recovery_worker_recovers_late_body_off_thread() {
+        let (_config, state_db) = make_test_config_and_db();
+        let mempool = Arc::new(torus_mempool::Mempool::new(
+            state_db.clone(),
+            torus_mempool::MempoolConfig::default(),
+        ));
+
+        let action = sign_claim_rewards(23);
+        let hash = torus_types::compute_action_hash(&action);
+        let body = bincode::serialize(&action).expect("serialize body");
+        // Delivered on the 3rd drain — inside the worker budget, as in the driver test.
+        let fetcher = Arc::new(LateFetcher {
+            body,
+            deliver_on_drain: 3,
+            drains: std::sync::atomic::AtomicUsize::new(0),
+        });
+
+        // No TorusApp: the worker is constructed directly from the Arcs it owns.
+        let worker = DaRecoveryWorker::spawn(mempool.clone(), fetcher, None);
+        assert!(
+            mempool.get_native_da(&hash).is_none(),
+            "body absent before the worker pull"
+        );
+        worker.submit(vec![hash]);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while mempool.get_native_da(&hash).is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker never recovered the body"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        // Exercise Drop-join on a live worker thread — a hang here IS the defect.
+        drop(worker);
+    }
+
+    /// BS-4a: dropping the worker with an in-flight batch AND a queued backlog must
+    /// join within ~one batch budget — queued batches are DISCARDED via the shutdown
+    /// flag, not drained (old defect: drop drained queue_depth x ~1s). Uses a
+    /// never-delivering fetcher so every batch would burn the full ~1s budget if
+    /// processed; the 3s bound cleanly separates fixed (~1s) from regressed (~9s)
+    /// while staying load-tolerant (elapsed bounds flake under parallel-suite load,
+    /// mem 96dfce88).
+    #[test]
+    fn recovery_worker_drop_discards_backlog_and_joins_bounded() {
+        let (_config, state_db) = make_test_config_and_db();
+        let mempool = Arc::new(torus_mempool::Mempool::new(
+            state_db.clone(),
+            torus_mempool::MempoolConfig::default(),
+        ));
+
+        // NeverFetcher delivers nothing, so each batch runs the full ~1s budget if
+        // processed — 9 backlogged batches would take ~9s to drain, ~1s to discard.
+        let worker = DaRecoveryWorker::spawn(mempool.clone(), Arc::new(NeverFetcher), None);
+
+        // 9 distinct single-hash batches: never-arriving hashes, so the worker's
+        // store-check dedup can't drop them. First is taken in-flight; the next 8
+        // fill the cap-8 queue (a 9th queued would warn+drop — fine either way).
+        for nonce in 100u64..109 {
+            let hash = torus_types::compute_action_hash(&sign_claim_rewards(nonce));
+            worker.submit(vec![hash]);
+        }
+
+        // Let the worker pick up one batch in-flight (now inside recover_bodies_bounded).
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let t = std::time::Instant::now();
+        drop(worker);
+        let elapsed = t.elapsed();
+        // Visible under `--nocapture`: fixed ≈ one budget (~1s), regressed ≈ 9s.
+        println!("drop-join elapsed: {elapsed:?}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "drop must not drain the backlog: took {elapsed:?}",
+        );
     }
 
     /// #4 Task 1 (RED first): a CompactBlock body absent from the local DA store is
