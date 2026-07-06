@@ -188,11 +188,7 @@ pub trait App<K: KVStore>: Send {
     /// `committed_hash` is the CryptoHash of the committed block.
     ///
     /// Default implementation is a no-op (for backward compatibility during migration).
-    fn on_committed_block(
-        &mut self,
-        _block: &Block,
-        _committed_hash: CryptoHash,
-    ) {
+    fn on_committed_block(&mut self, _block: &Block, _committed_hash: CryptoHash) {
         // Default no-op for backward compatibility.
     }
 
@@ -207,11 +203,7 @@ pub trait App<K: KVStore>: Send {
     /// equivocating leader's identity, which should be used for slashing.
     ///
     /// Default implementation is a no-op (for backward compatibility).
-    fn on_speculative_rollback(
-        &mut self,
-        _block: CryptoHash,
-        _evidence: &EquivocationEvidence,
-    ) {
+    fn on_speculative_rollback(&mut self, _block: CryptoHash, _evidence: &EquivocationEvidence) {
         // Default no-op for backward compatibility.
     }
 }

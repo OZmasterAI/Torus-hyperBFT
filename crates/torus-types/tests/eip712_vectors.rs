@@ -114,12 +114,7 @@ fn all_vectors() -> Vec<Vector> {
     let addr1 = Address::from([0x11; 20]);
     let addr2 = Address::from([0x22; 20]);
 
-    let mk_place = |is_buy,
-                    order_type,
-                    tif,
-                    reduce_only,
-                    coid: Option<u64>|
-     -> NativeAction {
+    let mk_place = |is_buy, order_type, tif, reduce_only, coid: Option<u64>| -> NativeAction {
         NativeAction::PlaceOrder(PlaceOrderParams {
             market_id: 1,
             is_buy,
@@ -135,23 +130,11 @@ fn all_vectors() -> Vec<Vector> {
     vec![
         build_vector(
             "PlaceOrder_Limit_Buy_GTC",
-            mk_place(
-                true,
-                OrderType::Limit,
-                TimeInForce::GTC,
-                false,
-                Some(42),
-            ),
+            mk_place(true, OrderType::Limit, TimeInForce::GTC, false, Some(42)),
         ),
         build_vector(
             "PlaceOrder_Limit_Sell_PostOnly",
-            mk_place(
-                false,
-                OrderType::Limit,
-                TimeInForce::PostOnly,
-                false,
-                None,
-            ),
+            mk_place(false, OrderType::Limit, TimeInForce::PostOnly, false, None),
         ),
         build_vector(
             "PlaceOrder_Market_Buy_IOC",
@@ -159,13 +142,7 @@ fn all_vectors() -> Vec<Vector> {
         ),
         build_vector(
             "PlaceOrder_Market_Sell_FOK_ReduceOnly",
-            mk_place(
-                false,
-                OrderType::Market,
-                TimeInForce::FOK,
-                true,
-                None,
-            ),
+            mk_place(false, OrderType::Market, TimeInForce::FOK, true, None),
         ),
         build_vector(
             "PlaceOrder_StopMarket_Sell",
@@ -313,10 +290,7 @@ fn all_vectors() -> Vec<Vector> {
             "UpdateCommission",
             NativeAction::UpdateCommission { new_rate: 300 },
         ),
-        build_vector(
-            "JailVote",
-            NativeAction::JailVote { target: addr1 },
-        ),
+        build_vector("JailVote", NativeAction::JailVote { target: addr1 }),
         build_vector("UnjailSelf", NativeAction::UnjailSelf),
         build_vector(
             "RotateValidatorKey",
@@ -324,10 +298,7 @@ fn all_vectors() -> Vec<Vector> {
                 new_pubkey: PublicKey([0xcd; 32]),
             },
         ),
-        build_vector(
-            "DelistMarket",
-            NativeAction::DelistMarket { market_id: 99 },
-        ),
+        build_vector("DelistMarket", NativeAction::DelistMarket { market_id: 99 }),
         // Nested-struct variants: Phase B consumers need these too. TS MVP
         // can skip verifying these hashes until the parallel TS dispatcher
         // lands, but the fixture captures them so drift is caught.
@@ -504,12 +475,10 @@ fn fixture_file_matches_current_implementation() {
         return;
     }
     let on_disk = fs::read_to_string(&path).expect("read fixture");
-    let disk_value: serde_json::Value =
-        serde_json::from_str(&on_disk).expect("parse fixture JSON");
+    let disk_value: serde_json::Value = serde_json::from_str(&on_disk).expect("parse fixture JSON");
 
     let computed = build_fixture_file();
-    let computed_value =
-        serde_json::to_value(&computed).expect("serialize computed fixture");
+    let computed_value = serde_json::to_value(&computed).expect("serialize computed fixture");
 
     if disk_value != computed_value {
         panic!(

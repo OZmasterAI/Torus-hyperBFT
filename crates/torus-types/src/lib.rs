@@ -119,16 +119,14 @@ impl std::ops::Mul for FixedPoint {
 impl std::ops::Div for FixedPoint {
     type Output = Self;
     fn div(self, rhs: Self) -> Self {
-        self.checked_div(rhs)
-            .expect("FixedPoint division error")
+        self.checked_div(rhs).expect("FixedPoint division error")
     }
 }
 
 impl std::ops::Add for FixedPoint {
     type Output = Self;
     fn add(self, rhs: Self) -> Self {
-        self.checked_add(rhs)
-            .expect("FixedPoint addition overflow")
+        self.checked_add(rhs).expect("FixedPoint addition overflow")
     }
 }
 
@@ -149,14 +147,14 @@ impl std::ops::Neg for FixedPoint {
 
 impl std::ops::AddAssign for FixedPoint {
     fn add_assign(&mut self, rhs: Self) {
-        *self = self.checked_add(rhs)
-            .expect("FixedPoint addition overflow");
+        *self = self.checked_add(rhs).expect("FixedPoint addition overflow");
     }
 }
 
 impl std::ops::SubAssign for FixedPoint {
     fn sub_assign(&mut self, rhs: Self) {
-        *self = self.checked_sub(rhs)
+        *self = self
+            .checked_sub(rhs)
             .expect("FixedPoint subtraction underflow");
     }
 }
@@ -261,12 +259,15 @@ impl<'de> Deserialize<'de> for Ed25519Sig {
             fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
                 write!(f, "64 bytes")
             }
-            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Ed25519Sig, A::Error> {
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Ed25519Sig, A::Error> {
                 let mut buf = [0u8; 64];
                 for (i, byte) in buf.iter_mut().enumerate() {
-                    *byte = seq.next_element()?.ok_or_else(|| {
-                        serde::de::Error::invalid_length(i, &"64 bytes")
-                    })?;
+                    *byte = seq
+                        .next_element()?
+                        .ok_or_else(|| serde::de::Error::invalid_length(i, &"64 bytes"))?;
                 }
                 Ok(Ed25519Sig(buf))
             }
@@ -325,7 +326,8 @@ mod attestation_bytes {
             ) -> Result<[u8; 64], A::Error> {
                 let mut buf = [0u8; 64];
                 for (i, byte) in buf.iter_mut().enumerate() {
-                    *byte = seq.next_element()?
+                    *byte = seq
+                        .next_element()?
                         .ok_or_else(|| serde::de::Error::invalid_length(i, &"64 bytes"))?;
                 }
                 Ok(buf)
@@ -616,7 +618,10 @@ impl NativeAction {
         });
         buf.push(p.reduce_only as u8);
         match p.client_order_id {
-            Some(id) => { buf.push(1); buf.extend_from_slice(&id.to_be_bytes()); }
+            Some(id) => {
+                buf.push(1);
+                buf.extend_from_slice(&id.to_be_bytes());
+            }
             None => buf.push(0),
         }
     }
@@ -647,19 +652,32 @@ impl NativeAction {
             NativeAction::CancelAllOrders { market_id } => {
                 buf.push(2);
                 match market_id {
-                    Some(id) => { buf.push(1); buf.extend_from_slice(&id.to_be_bytes()); }
+                    Some(id) => {
+                        buf.push(1);
+                        buf.extend_from_slice(&id.to_be_bytes());
+                    }
                     None => buf.push(0),
                 }
             }
-            NativeAction::ModifyOrder { order_id, new_price, new_qty } => {
+            NativeAction::ModifyOrder {
+                order_id,
+                new_price,
+                new_qty,
+            } => {
                 buf.push(3);
                 buf.extend_from_slice(&order_id.to_be_bytes());
                 match new_price {
-                    Some(p) => { buf.push(1); buf.extend_from_slice(&p.raw().to_be_bytes()); }
+                    Some(p) => {
+                        buf.push(1);
+                        buf.extend_from_slice(&p.raw().to_be_bytes());
+                    }
                     None => buf.push(0),
                 }
                 match new_qty {
-                    Some(q) => { buf.push(1); buf.extend_from_slice(&q.raw().to_be_bytes()); }
+                    Some(q) => {
+                        buf.push(1);
+                        buf.extend_from_slice(&q.raw().to_be_bytes());
+                    }
                     None => buf.push(0),
                 }
             }
@@ -737,7 +755,10 @@ impl NativeAction {
                     }
                 }
             }
-            NativeAction::Vote { proposal_id, option } => {
+            NativeAction::Vote {
+                proposal_id,
+                option,
+            } => {
                 buf.push(12);
                 buf.extend_from_slice(&proposal_id.to_be_bytes());
                 buf.push(match option {
@@ -803,7 +824,11 @@ impl NativeAction {
                 buf.push(22);
                 buf.extend_from_slice(&amount.to_be_bytes::<32>());
             }
-            NativeAction::CreateSession { session_pubkey, expiry, scope } => {
+            NativeAction::CreateSession {
+                session_pubkey,
+                expiry,
+                scope,
+            } => {
                 buf.push(23);
                 buf.extend_from_slice(session_pubkey);
                 buf.extend_from_slice(&expiry.to_be_bytes());
@@ -1334,7 +1359,9 @@ mod tests {
             action: NativeAction::ClaimRewards,
             nonce: 100,
             signature: ActionSignature::Eip712(Signature {
-                v: 27, r: [0u8; 32], s: [0u8; 32],
+                v: 27,
+                r: [0u8; 32],
+                s: [0u8; 32],
             }),
         };
         let block = TorusBlock {
@@ -1345,24 +1372,34 @@ mod tests {
         };
         let compact = CompactBlock::from_block(&block);
         assert_eq!(compact.native_action_hashes.len(), 10);
-        assert_eq!(compact.native_action_hashes[0], compute_action_hash(&action));
+        assert_eq!(
+            compact.native_action_hashes[0],
+            compute_action_hash(&action)
+        );
 
         let encoded = bincode::serialize(&compact).unwrap();
         let decoded: CompactBlock = bincode::deserialize(&encoded).unwrap();
         assert_eq!(decoded.native_action_hashes.len(), 10);
-        assert_eq!(decoded.native_action_hashes[0], compact.native_action_hashes[0]);
+        assert_eq!(
+            decoded.native_action_hashes[0],
+            compact.native_action_hashes[0]
+        );
         assert_eq!(decoded.evm_transactions, compact.evm_transactions);
     }
 
     #[test]
     fn compact_block_smaller_than_full_block() {
-        let actions: Vec<SignedNativeAction> = (0..100).map(|i| SignedNativeAction {
-            action: NativeAction::CancelOrder { order_id: i },
-            nonce: i as u64,
-            signature: ActionSignature::Eip712(Signature {
-                v: 27, r: [0u8; 32], s: [0u8; 32],
-            }),
-        }).collect();
+        let actions: Vec<SignedNativeAction> = (0..100)
+            .map(|i| SignedNativeAction {
+                action: NativeAction::CancelOrder { order_id: i },
+                nonce: i as u64,
+                signature: ActionSignature::Eip712(Signature {
+                    v: 27,
+                    r: [0u8; 32],
+                    s: [0u8; 32],
+                }),
+            })
+            .collect();
         let block = TorusBlock {
             header: test_header(),
             native_actions: actions,
@@ -1373,7 +1410,10 @@ mod tests {
 
         let full_size = bincode::serialize(&block).unwrap().len();
         let compact_size = bincode::serialize(&compact).unwrap().len();
-        assert!(compact_size < full_size, "compact {compact_size} should be smaller than full {full_size}");
+        assert!(
+            compact_size < full_size,
+            "compact {compact_size} should be smaller than full {full_size}"
+        );
     }
 
     #[test]
@@ -1411,14 +1451,18 @@ mod tests {
             action: NativeAction::ClaimRewards,
             nonce: 1,
             signature: ActionSignature::Eip712(Signature {
-                v: 27, r: [0u8; 32], s: [0u8; 32],
+                v: 27,
+                r: [0u8; 32],
+                s: [0u8; 32],
             }),
         };
         let a2 = SignedNativeAction {
             action: NativeAction::ClaimRewards,
             nonce: 2,
             signature: ActionSignature::Eip712(Signature {
-                v: 27, r: [0u8; 32], s: [0u8; 32],
+                v: 27,
+                r: [0u8; 32],
+                s: [0u8; 32],
             }),
         };
         assert_ne!(compute_action_hash(&a1), compute_action_hash(&a2));
@@ -1430,14 +1474,18 @@ mod tests {
             action: NativeAction::ClaimRewards,
             nonce: 1,
             signature: ActionSignature::Eip712(Signature {
-                v: 27, r: [0u8; 32], s: [0u8; 32],
+                v: 27,
+                r: [0u8; 32],
+                s: [0u8; 32],
             }),
         };
         let a2 = SignedNativeAction {
             action: NativeAction::CancelOrder { order_id: 42 },
             nonce: 1,
             signature: ActionSignature::Eip712(Signature {
-                v: 27, r: [0u8; 32], s: [0u8; 32],
+                v: 27,
+                r: [0u8; 32],
+                s: [0u8; 32],
             }),
         };
         assert_ne!(compute_action_hash(&a1), compute_action_hash(&a2));

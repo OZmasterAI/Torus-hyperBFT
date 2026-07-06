@@ -76,17 +76,23 @@ pub(crate) async fn cmd_place_order(
     submit_native_action(cli, rpc, NativeAction::PlaceOrder(params)).await
 }
 
-pub(crate) async fn cmd_cancel_order(cli: &Cli, rpc: &RpcClient, order_id: u128) -> Result<(), String> {
+pub(crate) async fn cmd_cancel_order(
+    cli: &Cli,
+    rpc: &RpcClient,
+    order_id: u128,
+) -> Result<(), String> {
     submit_native_action(cli, rpc, NativeAction::CancelOrder { order_id }).await
 }
 
-pub(crate) async fn cmd_cancel_all(cli: &Cli, rpc: &RpcClient, market: Option<u64>) -> Result<(), String> {
+pub(crate) async fn cmd_cancel_all(
+    cli: &Cli,
+    rpc: &RpcClient,
+    market: Option<u64>,
+) -> Result<(), String> {
     submit_native_action(
         cli,
         rpc,
-        NativeAction::CancelAllOrders {
-            market_id: market,
-        },
+        NativeAction::CancelAllOrders { market_id: market },
     )
     .await
 }
@@ -145,11 +151,8 @@ mod tests {
             reduce_only: false,
             client_order_id: Some(42),
         };
-        let signed = sign_native_action(
-            NativeAction::PlaceOrder(params),
-            1_700_000_000_000u64,
-            &key,
-        );
+        let signed =
+            sign_native_action(NativeAction::PlaceOrder(params), 1_700_000_000_000u64, &key);
         let recovered = signed.recover_sender().expect("recover");
         assert_eq!(recovered, address_from_key(&key));
     }
@@ -158,7 +161,9 @@ mod tests {
     fn test_cancel_order_roundtrip() {
         let key = test_signing_key();
         let signed = sign_native_action(
-            NativeAction::CancelOrder { order_id: 0xdead_beef_u128 },
+            NativeAction::CancelOrder {
+                order_id: 0xdead_beef_u128,
+            },
             1_700_000_000_000u64,
             &key,
         );

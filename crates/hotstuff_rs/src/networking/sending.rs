@@ -2,9 +2,9 @@
 
 use ed25519_dalek::VerifyingKey;
 
+use super::{messages::Message, network::Network};
 use crate::hotstuff::messages::{BlockDataRequest, BlockDataResponse};
 use crate::types::{block::Block, data_types::CryptoHash};
-use super::{messages::Message, network::Network};
 
 /// Handle for sending and broadcasting messages to the [`Network`].
 ///

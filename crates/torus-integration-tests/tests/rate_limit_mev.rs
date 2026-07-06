@@ -286,14 +286,8 @@ fn native_actions_ordered_by_sender_within_category() {
     let sender_b = addr(0xBB);
 
     let actions = vec![
-        (
-            sender_b,
-            NativeAction::CancelOrder { order_id: 1 },
-        ),
-        (
-            sender_a,
-            NativeAction::CancelOrder { order_id: 2 },
-        ),
+        (sender_b, NativeAction::CancelOrder { order_id: 1 }),
+        (sender_a, NativeAction::CancelOrder { order_id: 2 }),
     ];
 
     let (pre_evm, _) = sort_native_actions(&actions);
@@ -331,4 +325,3 @@ fn native_ordering_not_manipulable_by_submission_order() {
     assert_eq!(pre_v1[0].0, pre_v2[0].0);
     assert_eq!(pre_v1[1].0, pre_v2[1].0);
 }
-

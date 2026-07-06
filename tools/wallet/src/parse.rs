@@ -13,17 +13,23 @@ pub(crate) fn parse_trs_to_wei(trs: &str) -> Result<U256, String> {
     let parts: Vec<&str> = trs.split('.').collect();
     match parts.len() {
         1 => {
-            let whole: u128 = parts[0].parse().map_err(|e| format!("invalid amount: {e}"))?;
+            let whole: u128 = parts[0]
+                .parse()
+                .map_err(|e| format!("invalid amount: {e}"))?;
             Ok(U256::from(whole) * U256::from(1_000_000_000_000_000_000u64))
         }
         2 => {
-            let whole: u128 = parts[0].parse().map_err(|e| format!("invalid amount: {e}"))?;
+            let whole: u128 = parts[0]
+                .parse()
+                .map_err(|e| format!("invalid amount: {e}"))?;
             let frac_str = parts[1];
             if frac_str.len() > 18 {
                 return Err("too many decimal places (max 18)".into());
             }
             let padded = format!("{frac_str:0<18}");
-            let frac: u128 = padded.parse().map_err(|e| format!("invalid fraction: {e}"))?;
+            let frac: u128 = padded
+                .parse()
+                .map_err(|e| format!("invalid fraction: {e}"))?;
             Ok(U256::from(whole) * U256::from(1_000_000_000_000_000_000u64) + U256::from(frac))
         }
         _ => Err("invalid amount format, expected '1.5' or '1'".into()),
@@ -155,7 +161,10 @@ mod tests {
             10_000_000_000
         );
         assert_eq!(parse_decimal_to_fixed_point("0.00000001").unwrap().raw(), 1);
-        assert_eq!(parse_decimal_to_fixed_point("0.001").unwrap().raw(), 100_000);
+        assert_eq!(
+            parse_decimal_to_fixed_point("0.001").unwrap().raw(),
+            100_000
+        );
         assert_eq!(
             parse_decimal_to_fixed_point("-1.5").unwrap().raw(),
             -150_000_000

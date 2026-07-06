@@ -10,9 +10,7 @@ use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
 use torus_bridge::native_executor::{NativeExecContext, NativeExecutor};
 use torus_core::position::{NativeBalance, PositionManager};
 use torus_state::{NativeStateOverlay, StateDb};
-use torus_types::{
-    Address, FixedPoint, NativeAction, OrderType, PlaceOrderParams, TimeInForce,
-};
+use torus_types::{Address, FixedPoint, NativeAction, OrderType, PlaceOrderParams, TimeInForce};
 
 const NUM_SENDERS: usize = 100;
 const FILLS_PER_BLOCK: usize = 200;

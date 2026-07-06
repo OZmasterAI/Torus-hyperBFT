@@ -45,18 +45,12 @@ fn test_order_book_reader_with_snapshot() {
     let ask_price = TestHarness::fp(51000);
     let ask_qty = TestHarness::fp(3);
 
-    let snapshot = TestHarness::snapshot(
-        &[(bid_price, bid_qty)],
-        &[(ask_price, ask_qty)],
-    );
+    let snapshot = TestHarness::snapshot(&[(bid_price, bid_qty)], &[(ask_price, ask_qty)]);
     h.persist_order_book(market_id, &snapshot);
 
     // Call OrderBookReader: getOrderBook(bytes32)
     let addr = precompile_address(ADDR_ORDER_BOOK_READER);
-    let input = call_data(
-        "getOrderBook(bytes32)",
-        &[abi::encode_market_id(market_id)],
-    );
+    let input = call_data("getOrderBook(bytes32)", &[abi::encode_market_id(market_id)]);
     let caller = Address::ZERO;
     let result = execute_precompile(&addr, &input, &caller, &h.state_db, 1).unwrap();
 
@@ -67,12 +61,14 @@ fn test_order_book_reader_with_snapshot() {
     // Decode the first array — bid_prices. Offsets are in the first 4 words (32 bytes each).
     // The bid_prices array starts at the offset in word 0.
     let offset0 = u32::from_be_bytes(result[28..32].try_into().unwrap()) as usize;
-    let bid_count = u32::from_be_bytes(result[offset0 + 28..offset0 + 32].try_into().unwrap()) as usize;
+    let bid_count =
+        u32::from_be_bytes(result[offset0 + 28..offset0 + 32].try_into().unwrap()) as usize;
     assert_eq!(bid_count, 1, "should have 1 bid level");
 
     // Read the bid price value (the element after the length word)
     let bp_start = offset0 + 32;
-    let bid_price_raw = u128::from_be_bytes(result[bp_start + 16..bp_start + 32].try_into().unwrap());
+    let bid_price_raw =
+        u128::from_be_bytes(result[bp_start + 16..bp_start + 32].try_into().unwrap());
     assert_eq!(bid_price_raw, bid_price.raw() as u128);
 }
 
@@ -166,7 +162,8 @@ fn test_oracle_reader_after_aggregation() {
 
     let addr = precompile_address(ADDR_ORACLE_READER);
     let input = call_data("getPrice(bytes32)", &[abi::encode_market_id(market_id)]);
-    let result = execute_precompile(&addr, &input, &Address::ZERO, &h.state_db, block_number).unwrap();
+    let result =
+        execute_precompile(&addr, &input, &Address::ZERO, &h.state_db, block_number).unwrap();
 
     // getPrice returns: (uint128 price, uint64 block_number, bool stale)
     assert_eq!(result.len(), 96);
@@ -284,6 +281,7 @@ fn test_cross_consistency_order_then_read() {
 
     // Verify bid count = 1
     let offset0 = u32::from_be_bytes(result[28..32].try_into().unwrap()) as usize;
-    let bid_count = u32::from_be_bytes(result[offset0 + 28..offset0 + 32].try_into().unwrap()) as usize;
+    let bid_count =
+        u32::from_be_bytes(result[offset0 + 28..offset0 + 32].try_into().unwrap()) as usize;
     assert_eq!(bid_count, 1);
 }

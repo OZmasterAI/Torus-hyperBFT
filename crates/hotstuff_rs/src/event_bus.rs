@@ -146,7 +146,10 @@ impl EventHandlers {
             timeout_vote_handlers: HandlerPair::new(log, timeout_vote_handler),
             advance_view_handlers: HandlerPair::new(log, advance_view_handler),
             receive_proposal_handlers: HandlerPair::new(log, receive_proposal_handler),
-            receive_proposal_header_handlers: HandlerPair::new(log, receive_proposal_header_handler),
+            receive_proposal_header_handlers: HandlerPair::new(
+                log,
+                receive_proposal_header_handler,
+            ),
             receive_nudge_handlers: HandlerPair::new(log, receive_nudge_handler),
             receive_phase_vote_handlers: HandlerPair::new(log, receive_phase_vote_handler),
             receive_new_view_handlers: HandlerPair::new(log, receive_new_view_handler),

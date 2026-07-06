@@ -347,8 +347,7 @@ fn build_rpc_tx(
 }
 
 /// Empty trie root: keccak256(rlp("")) = keccak256(0x80).
-const EMPTY_TRIE_ROOT: &str =
-    "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421";
+const EMPTY_TRIE_ROOT: &str = "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421";
 
 fn build_rpc_block(
     header: &TorusBlockHeader,
@@ -995,7 +994,9 @@ impl EthApiServer for RpcState {
         const MAX_FEE_HISTORY_BLOCKS: u64 = 1024;
 
         let latest = self.latest_height.load(Relaxed);
-        let count = parse_u64(&block_count).map_err(err)?.min(MAX_FEE_HISTORY_BLOCKS);
+        let count = parse_u64(&block_count)
+            .map_err(err)?
+            .min(MAX_FEE_HISTORY_BLOCKS);
         let newest = resolve_block_tag(&newest_block, latest).map_err(err)?;
         let oldest = newest.saturating_sub(count.saturating_sub(1));
         let mut base_fees = Vec::new();

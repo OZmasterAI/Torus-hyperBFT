@@ -119,13 +119,7 @@ fn submit_proposal_sufficient_stake() {
 fn submit_proposal_insufficient_stake() {
     let (_dir, gov, _staking) = setup();
     // addr(5) has no stake at all.
-    let result = gov.submit_proposal(
-        addr(5),
-        "Bad Proposal".into(),
-        "No stake".into(),
-        None,
-        0,
-    );
+    let result = gov.submit_proposal(addr(5), "Bad Proposal".into(), "No stake".into(), None, 0);
     assert!(matches!(
         result,
         Err(EconomicsError::InsufficientProposalStake { .. })
@@ -235,10 +229,7 @@ fn cast_vote_expired_proposal() {
         .unwrap();
     // Voting period is 100 blocks. Try to vote at block 101.
     let result = gov.cast_vote(addr(2), id, true, 101);
-    assert!(matches!(
-        result,
-        Err(EconomicsError::ProposalNotActive(_))
-    ));
+    assert!(matches!(result, Err(EconomicsError::ProposalNotActive(_))));
 }
 
 #[test]
@@ -416,12 +407,7 @@ fn execute_treasury_spend() {
     assert_eq!(outcome, ProposalOutcome::Executed(id));
 
     // Verify treasury debited.
-    let treasury_bal = gov
-        .state()
-        .get_account(&treasury)
-        .unwrap()
-        .unwrap()
-        .balance;
+    let treasury_bal = gov.state().get_account(&treasury).unwrap().unwrap().balance;
     assert_eq!(treasury_bal, wei(9_000));
 
     // Verify recipient credited.
@@ -474,7 +460,7 @@ fn execute_market_listing() {
         base_asset: "ETH".into(),
         quote_asset: "USDC".into(),
         lot_size: FixedPoint::from_raw(10_000_000), // 0.1
-        tick_size: FixedPoint::from_raw(1_000_000),  // 0.01
+        tick_size: FixedPoint::from_raw(1_000_000), // 0.01
         initial_margin: FixedPoint::from_raw(500_000_000), // 5.0
     };
     let id = gov
@@ -651,15 +637,11 @@ fn query_proposals_by_status() {
     gov.cast_vote(addr(2), id1, true, 10).unwrap();
     gov.finalize_proposal(id1, 101).unwrap();
 
-    let active = gov
-        .get_proposals_by_status(ProposalStatus::Active)
-        .unwrap();
+    let active = gov.get_proposals_by_status(ProposalStatus::Active).unwrap();
     assert_eq!(active.len(), 1);
     assert_eq!(active[0].title, "P2");
 
-    let passed = gov
-        .get_proposals_by_status(ProposalStatus::Passed)
-        .unwrap();
+    let passed = gov.get_proposals_by_status(ProposalStatus::Passed).unwrap();
     assert_eq!(passed.len(), 1);
     assert_eq!(passed[0].title, "P1");
 }

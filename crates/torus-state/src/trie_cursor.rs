@@ -79,8 +79,9 @@ fn encode_branch_node(node: &BranchNodeCompact) -> Vec<u8> {
 }
 
 fn decode_branch_node(bytes: &[u8]) -> Result<BranchNodeCompact, StateError> {
-    let invalid =
-        |what: &str| StateError::InvalidData(format!("trie branch node: {what} (len {})", bytes.len()));
+    let invalid = |what: &str| {
+        StateError::InvalidData(format!("trie branch node: {what} (len {})", bytes.len()))
+    };
 
     if bytes.len() < 8 {
         return Err(invalid("truncated header"));
@@ -115,7 +116,13 @@ fn decode_branch_node(bytes: &[u8]) -> Result<BranchNodeCompact, StateError> {
     // Construct by field (not `BranchNodeCompact::new`, which debug-asserts mask/hash invariants):
     // stored nodes are trusted, and any corruption surfaces as a root mismatch via the determinism
     // gate rather than a panic on the read path.
-    Ok(BranchNodeCompact { state_mask, tree_mask, hash_mask, hashes: Arc::new(hashes), root_hash })
+    Ok(BranchNodeCompact {
+        state_mask,
+        tree_mask,
+        hash_mask,
+        hashes: Arc::new(hashes),
+        root_hash,
+    })
 }
 
 // ---- Persistence: fold TrieUpdates into a WriteBatch ----
@@ -161,7 +168,11 @@ pub fn write_trie_updates(
             batch.delete_cf(stor_cf, storage_trie_key(hashed_address, path));
         }
         for (path, node) in &storage.storage_nodes {
-            batch.put_cf(stor_cf, storage_trie_key(hashed_address, path), encode_branch_node(node));
+            batch.put_cf(
+                stor_cf,
+                storage_trie_key(hashed_address, path),
+                encode_branch_node(node),
+            );
         }
     }
     Ok(())
@@ -224,10 +235,19 @@ impl<'a> RocksTrieCursor<'a> {
         hashed_address: Option<B256>,
     ) -> Result<Self, DatabaseError> {
         let iter = Self::make_iter(db, cf_name)?;
-        Ok(Self { db, cf_name, prefix: hashed_address.map(|a| a.0), iter, current: None })
+        Ok(Self {
+            db,
+            cf_name,
+            prefix: hashed_address.map(|a| a.0),
+            iter,
+            current: None,
+        })
     }
 
-    fn make_iter(db: &'a StateDb, cf_name: &'static str) -> Result<DBRawIterator<'a>, DatabaseError> {
+    fn make_iter(
+        db: &'a StateDb,
+        cf_name: &'static str,
+    ) -> Result<DBRawIterator<'a>, DatabaseError> {
         let cf = db.cf_handle(cf_name).map_err(to_db_err)?;
         Ok(db.inner().raw_iterator_cf(cf))
     }
@@ -380,7 +400,10 @@ pub struct RocksHashedAccountCursor<'a> {
 impl<'a> RocksHashedAccountCursor<'a> {
     fn new(db: &'a StateDb) -> Result<Self, DatabaseError> {
         let cf = db.cf_handle(CF_HASHED_ACCOUNTS).map_err(to_db_err)?;
-        Ok(Self { db, iter: db.inner().raw_iterator_cf(cf) })
+        Ok(Self {
+            db,
+            iter: db.inner().raw_iterator_cf(cf),
+        })
     }
 
     fn read_current(&mut self) -> Result<Option<(B256, Account)>, DatabaseError> {
@@ -390,10 +413,14 @@ impl<'a> RocksHashedAccountCursor<'a> {
         }
         let key = self.iter.key().expect("valid iterator has a key");
         if key.len() != 32 {
-            return Err(to_db_err(format!("hashed account key len {} != 32", key.len())));
+            return Err(to_db_err(format!(
+                "hashed account key len {} != 32",
+                key.len()
+            )));
         }
         let hashed_address = B256::from_slice(key);
-        let info = decode_account_info(self.iter.value().expect("valid value")).map_err(to_db_err)?;
+        let info =
+            decode_account_info(self.iter.value().expect("valid value")).map_err(to_db_err)?;
         Ok(Some((hashed_address, Account::from(&info))))
     }
 }
@@ -432,7 +459,11 @@ pub struct RocksHashedStorageCursor<'a> {
 impl<'a> RocksHashedStorageCursor<'a> {
     fn new(db: &'a StateDb, hashed_address: B256) -> Result<Self, DatabaseError> {
         let cf = db.cf_handle(CF_HASHED_STORAGE).map_err(to_db_err)?;
-        Ok(Self { db, prefix: hashed_address.0, iter: db.inner().raw_iterator_cf(cf) })
+        Ok(Self {
+            db,
+            prefix: hashed_address.0,
+            iter: db.inner().raw_iterator_cf(cf),
+        })
     }
 
     fn refresh_iter(&mut self) {
@@ -484,8 +515,11 @@ impl<'a> HashedStorageCursor for RocksHashedStorageCursor<'a> {
     fn is_storage_empty(&mut self) -> Result<bool, DatabaseError> {
         self.iter.seek(&self.prefix);
         self.iter.status().map_err(to_db_err)?;
-        let has_entry =
-            self.iter.valid() && self.iter.key().map_or(false, |k| k.starts_with(&self.prefix));
+        let has_entry = self.iter.valid()
+            && self
+                .iter
+                .key()
+                .map_or(false, |k| k.starts_with(&self.prefix));
         Ok(!has_entry)
     }
 
@@ -557,22 +591,44 @@ mod tests {
 
         // Account trie: exact round-trip.
         let mut ac = factory.account_trie_cursor().expect("account cursor");
-        assert_eq!(ac.seek_exact(p12.clone()).unwrap(), Some((p12.clone(), acc_a.clone())));
-        assert_eq!(ac.seek_exact(p13.clone()).unwrap(), Some((p13.clone(), acc_b.clone())));
+        assert_eq!(
+            ac.seek_exact(p12.clone()).unwrap(),
+            Some((p12.clone(), acc_a.clone()))
+        );
+        assert_eq!(
+            ac.seek_exact(p13.clone()).unwrap(),
+            Some((p13.clone(), acc_b.clone()))
+        );
         // Absent path -> None.
         assert_eq!(ac.seek_exact(absent.clone()).unwrap(), None);
         // seek(>=) lands on the matching key.
-        assert_eq!(ac.seek(p12.clone()).unwrap(), Some((p12.clone(), acc_a.clone())));
+        assert_eq!(
+            ac.seek(p12.clone()).unwrap(),
+            Some((p12.clone(), acc_a.clone()))
+        );
 
         // Storage trie: an identical path under two accounts must NOT collide.
-        let mut sc1 = factory.storage_trie_cursor(addr1).expect("storage cursor 1");
-        assert_eq!(sc1.seek_exact(p12.clone()).unwrap(), Some((p12.clone(), s1.clone())));
-        let mut sc2 = factory.storage_trie_cursor(addr2).expect("storage cursor 2");
-        assert_eq!(sc2.seek_exact(p12.clone()).unwrap(), Some((p12.clone(), s2.clone())));
+        let mut sc1 = factory
+            .storage_trie_cursor(addr1)
+            .expect("storage cursor 1");
+        assert_eq!(
+            sc1.seek_exact(p12.clone()).unwrap(),
+            Some((p12.clone(), s1.clone()))
+        );
+        let mut sc2 = factory
+            .storage_trie_cursor(addr2)
+            .expect("storage cursor 2");
+        assert_eq!(
+            sc2.seek_exact(p12.clone()).unwrap(),
+            Some((p12.clone(), s2.clone()))
+        );
         assert_ne!(s1, s2);
 
         // set_hashed_address reuse: switch cursor 1 to addr2 -> now sees s2, not s1.
         sc1.set_hashed_address(addr2);
-        assert_eq!(sc1.seek_exact(p12.clone()).unwrap(), Some((p12.clone(), s2)));
+        assert_eq!(
+            sc1.seek_exact(p12.clone()).unwrap(),
+            Some((p12.clone(), s2))
+        );
     }
 }

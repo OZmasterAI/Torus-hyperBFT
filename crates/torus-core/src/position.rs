@@ -104,7 +104,10 @@ impl BorshDeserialize for Position {
         if ver[0] != POSITION_SCHEMA_VERSION {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("unsupported Position schema version: {} (expected {})", ver[0], POSITION_SCHEMA_VERSION),
+                format!(
+                    "unsupported Position schema version: {} (expected {})",
+                    ver[0], POSITION_SCHEMA_VERSION
+                ),
             ));
         }
         let trader = borsh_read_address(r)?;
@@ -175,7 +178,10 @@ impl BorshDeserialize for NativeBalance {
         if ver[0] != NATIVE_BALANCE_SCHEMA_VERSION {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("unsupported NativeBalance schema version: {} (expected {})", ver[0], NATIVE_BALANCE_SCHEMA_VERSION),
+                format!(
+                    "unsupported NativeBalance schema version: {} (expected {})",
+                    ver[0], NATIVE_BALANCE_SCHEMA_VERSION
+                ),
             ));
         }
         let available = borsh_read_fp(r)?;
@@ -227,8 +233,7 @@ impl<T: StateBackend> PositionManager<T> {
         let key = position_key(trader, market_id);
         match self.state.get_cf_raw(CF_NATIVE_POSITIONS, &key)? {
             Some(data) => Ok(Some(
-                Position::try_from_slice(&data)
-                    .map_err(|e| CoreError::Borsh(e.to_string()))?,
+                Position::try_from_slice(&data).map_err(|e| CoreError::Borsh(e.to_string()))?,
             )),
             None => Ok(None),
         }
@@ -237,16 +242,11 @@ impl<T: StateBackend> PositionManager<T> {
     pub fn put_position(&self, pos: &Position) -> Result<(), CoreError> {
         let key = position_key(&pos.trader, pos.market_id);
         let data = borsh::to_vec(pos).map_err(|e| CoreError::Borsh(e.to_string()))?;
-        self.state
-            .put_cf_raw(CF_NATIVE_POSITIONS, &key, &data)?;
+        self.state.put_cf_raw(CF_NATIVE_POSITIONS, &key, &data)?;
         Ok(())
     }
 
-    pub fn delete_position(
-        &self,
-        trader: &Address,
-        market_id: MarketId,
-    ) -> Result<(), CoreError> {
+    pub fn delete_position(&self, trader: &Address, market_id: MarketId) -> Result<(), CoreError> {
         let key = position_key(trader, market_id);
         self.state.delete_cf_raw(CF_NATIVE_POSITIONS, &key)?;
         Ok(())
@@ -254,12 +254,13 @@ impl<T: StateBackend> PositionManager<T> {
 
     /// All positions for a trader (prefix scan).
     pub fn positions_for_trader(&self, trader: &Address) -> Result<Vec<Position>, CoreError> {
-        let entries = self.state.iterate_cf(CF_NATIVE_POSITIONS, Some(trader.as_slice()))?;
+        let entries = self
+            .state
+            .iterate_cf(CF_NATIVE_POSITIONS, Some(trader.as_slice()))?;
         let mut out = Vec::with_capacity(entries.len());
         for (_key, value) in entries {
             out.push(
-                Position::try_from_slice(&value)
-                    .map_err(|e| CoreError::Borsh(e.to_string()))?,
+                Position::try_from_slice(&value).map_err(|e| CoreError::Borsh(e.to_string()))?,
             );
         }
         Ok(out)
@@ -378,11 +379,7 @@ impl<T: StateBackend> PositionManager<T> {
     }
 
     /// Credit (or debit if negative) realized PnL to native balance.
-    fn credit_realized_pnl(
-        &self,
-        trader: &Address,
-        pnl: FixedPoint,
-    ) -> Result<(), CoreError> {
+    fn credit_realized_pnl(&self, trader: &Address, pnl: FixedPoint) -> Result<(), CoreError> {
         let mut bal = self.get_native_balance(trader)?;
         bal.available = bal.available + pnl;
         self.put_native_balance(trader, &bal)?;

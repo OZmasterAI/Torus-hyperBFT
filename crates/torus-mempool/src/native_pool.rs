@@ -248,7 +248,10 @@ impl NativePool {
         selected
     }
 
-    pub fn select_for_block_with_senders(&mut self, limit: usize) -> Vec<(Address, SignedNativeAction)> {
+    pub fn select_for_block_with_senders(
+        &mut self,
+        limit: usize,
+    ) -> Vec<(Address, SignedNativeAction)> {
         self.select_for_block_with_senders_excluding(limit, &HashSet::new(), usize::MAX, usize::MAX)
     }
 
@@ -477,8 +480,12 @@ mod tests {
             pool.select_for_block_with_senders_excluding(100, &HashSet::new(), cap, usize::MAX);
         assert_eq!(selected.len(), 3);
         // usize::MAX preserves uncapped behavior.
-        let all =
-            pool.select_for_block_with_senders_excluding(100, &HashSet::new(), usize::MAX, usize::MAX);
+        let all = pool.select_for_block_with_senders_excluding(
+            100,
+            &HashSet::new(),
+            usize::MAX,
+            usize::MAX,
+        );
         assert_eq!(all.len(), 10);
     }
 
@@ -582,11 +589,8 @@ mod tests {
             .unwrap();
         pool.insert(b, make_action(2, NativeAction::ClaimRewards))
             .unwrap();
-        pool.insert(
-            c,
-            make_action(3, NativeAction::CancelOrder { order_id: 1 }),
-        )
-        .unwrap();
+        pool.insert(c, make_action(3, NativeAction::CancelOrder { order_id: 1 }))
+            .unwrap();
         assert_eq!(pool.size(), 2);
     }
 
@@ -626,7 +630,8 @@ mod tests {
         let mut pool = NativePool::new(100, 64, 16);
         let sender = Address::repeat_byte(1);
         for i in 1..=5u64 {
-            pool.insert(sender, make_action(i, NativeAction::ClaimRewards)).unwrap();
+            pool.insert(sender, make_action(i, NativeAction::ClaimRewards))
+                .unwrap();
         }
         assert_eq!(pool.size(), 5);
 
@@ -635,7 +640,10 @@ mod tests {
         assert_eq!(pool.size(), 5, "select_for_block must not remove entries");
 
         let hash1 = compute_action_hash(&selected[0]);
-        assert!(pool.get_by_hash(&hash1).is_some(), "selected action still in pool");
+        assert!(
+            pool.get_by_hash(&hash1).is_some(),
+            "selected action still in pool"
+        );
     }
 
     #[test]
@@ -643,7 +651,8 @@ mod tests {
         let mut pool = NativePool::new(100, 64, 16);
         let sender = Address::repeat_byte(1);
         for i in 1..=5u64 {
-            pool.insert(sender, make_action(i, NativeAction::ClaimRewards)).unwrap();
+            pool.insert(sender, make_action(i, NativeAction::ClaimRewards))
+                .unwrap();
         }
         let selected = pool.select_for_block(3);
         let hashes: Vec<B256> = selected.iter().map(|a| compute_action_hash(a)).collect();
@@ -652,7 +661,10 @@ mod tests {
         assert_eq!(pool.size(), 2, "3 committed actions removed, 2 remain");
 
         for h in &hashes {
-            assert!(pool.get_by_hash(h).is_none(), "committed action removed from hash_index");
+            assert!(
+                pool.get_by_hash(h).is_none(),
+                "committed action removed from hash_index"
+            );
         }
     }
 
@@ -661,7 +673,8 @@ mod tests {
         let mut pool = NativePool::new(100, 64, 2);
         let sender = Address::repeat_byte(1);
         for i in 1..=4u64 {
-            pool.insert(sender, make_action(i, NativeAction::ClaimRewards)).unwrap();
+            pool.insert(sender, make_action(i, NativeAction::ClaimRewards))
+                .unwrap();
         }
         let action4_hash = compute_action_hash(&make_action(4, NativeAction::ClaimRewards));
 
@@ -705,7 +718,12 @@ mod tests {
                 .unwrap();
             pool.insert(
                 b,
-                make_action(i + 100, NativeAction::CancelOrder { order_id: i as u128 }),
+                make_action(
+                    i + 100,
+                    NativeAction::CancelOrder {
+                        order_id: i as u128,
+                    },
+                ),
             )
             .unwrap();
         }
@@ -732,14 +750,19 @@ mod tests {
         assert_eq!(first.len(), 5);
         let exclude: HashSet<B256> = first.iter().map(|(_, a)| compute_action_hash(a)).collect();
 
-        let second = pool.select_for_block_with_senders_excluding(5, &exclude, usize::MAX, usize::MAX);
-        assert!(second.is_empty(), "in-flight actions must not be re-selected");
+        let second =
+            pool.select_for_block_with_senders_excluding(5, &exclude, usize::MAX, usize::MAX);
+        assert!(
+            second.is_empty(),
+            "in-flight actions must not be re-selected"
+        );
         assert_eq!(pool.size(), 5, "selection stays non-destructive");
 
         // A fresh (non-excluded) action is still selectable past the exclusion set.
         pool.insert(sender, make_action(99, NativeAction::ClaimRewards))
             .unwrap();
-        let third = pool.select_for_block_with_senders_excluding(5, &exclude, usize::MAX, usize::MAX);
+        let third =
+            pool.select_for_block_with_senders_excluding(5, &exclude, usize::MAX, usize::MAX);
         assert_eq!(third.len(), 1, "only the fresh action is selected");
         assert_eq!(third[0].1.nonce, 99);
     }
@@ -781,13 +804,13 @@ mod tests {
 
         // Order budget 25: cancels first (1+1), then TWO batches (10+10 -> 22);
         // a third batch would reach 32 > 25 -> deterministic-prefix break.
-        let sel = pool.select_for_block_with_senders_excluding(
-            100,
-            &HashSet::new(),
-            usize::MAX,
-            25,
+        let sel =
+            pool.select_for_block_with_senders_excluding(100, &HashSet::new(), usize::MAX, 25);
+        assert_eq!(
+            sel.len(),
+            4,
+            "2 cancels + 2 batches fit the 25-order budget"
         );
-        assert_eq!(sel.len(), 4, "2 cancels + 2 batches fit the 25-order budget");
         assert!(matches!(sel[0].1.action, NativeAction::CancelOrder { .. }));
         assert!(matches!(sel[1].1.action, NativeAction::CancelOrder { .. }));
         assert!(matches!(sel[2].1.action, NativeAction::PlaceOrderBatch(_)));

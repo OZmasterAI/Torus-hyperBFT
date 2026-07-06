@@ -64,8 +64,7 @@ pub fn write_keystore(
         .hash_password_into(passphrase.as_bytes(), &salt, &mut derived_key)
         .map_err(|e| format!("argon2: {e}"))?;
 
-    let cipher = Aes256Gcm::new_from_slice(&derived_key)
-        .map_err(|e| format!("cipher: {e}"))?;
+    let cipher = Aes256Gcm::new_from_slice(&derived_key).map_err(|e| format!("cipher: {e}"))?;
     let nonce = Nonce::from_slice(&nonce_bytes);
     let ciphertext = cipher
         .encrypt(nonce, key.to_bytes().as_ref())
@@ -118,8 +117,7 @@ pub fn load_keystore(
         .decrypt(nonce, ciphertext.as_ref())
         .map_err(|_| "decryption failed: wrong passphrase")?;
 
-    let key = SigningKey::from_slice(&plaintext)
-        .map_err(|e| format!("invalid key bytes: {e}"))?;
+    let key = SigningKey::from_slice(&plaintext).map_err(|e| format!("invalid key bytes: {e}"))?;
 
     // Verify address matches
     let addr = address_from_key(&key);

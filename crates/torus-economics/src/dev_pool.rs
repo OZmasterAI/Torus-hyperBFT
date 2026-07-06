@@ -107,10 +107,7 @@ impl DevPool {
     }
 
     /// Get a single deployer's entry.
-    pub fn get_entry(
-        staking: &StakingManager,
-        deployer: &Address,
-    ) -> Result<Option<DevPoolEntry>> {
+    pub fn get_entry(staking: &StakingManager, deployer: &Address) -> Result<Option<DevPoolEntry>> {
         match staking
             .state()
             .get_cf_raw(CF_DEV_POOL, deployer.as_slice())?
@@ -123,11 +120,7 @@ impl DevPool {
         }
     }
 
-    fn put_entry(
-        staking: &StakingManager,
-        deployer: &Address,
-        entry: &DevPoolEntry,
-    ) -> Result<()> {
+    fn put_entry(staking: &StakingManager, deployer: &Address, entry: &DevPoolEntry) -> Result<()> {
         let data = borsh::to_vec(entry).map_err(|e| EconomicsError::Borsh(e.to_string()))?;
         staking
             .state()

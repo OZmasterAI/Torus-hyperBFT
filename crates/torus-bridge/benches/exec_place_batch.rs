@@ -14,8 +14,7 @@ use torus_core::position::{NativeBalance, PositionManager};
 use torus_state::{NativeStateOverlay, StateDb};
 use torus_types::eip712::{batch_verify_native_actions, sign_native_action};
 use torus_types::{
-    Address, FixedPoint, NativeAction, OrderType, PlaceOrderParams, SignedNativeAction,
-    TimeInForce,
+    Address, FixedPoint, NativeAction, OrderType, PlaceOrderParams, SignedNativeAction, TimeInForce,
 };
 
 const N: usize = 400;
@@ -73,7 +72,10 @@ fn bench_variant(c: &mut Criterion, name: &str, actions: Vec<SignedNativeAction>
     PositionManager::new(db.clone())
         .put_native_balance(
             &sender,
-            &NativeBalance { available: fp(100_000_000), order_margin: FixedPoint::ZERO },
+            &NativeBalance {
+                available: fp(100_000_000),
+                order_margin: FixedPoint::ZERO,
+            },
         )
         .expect("fund");
 

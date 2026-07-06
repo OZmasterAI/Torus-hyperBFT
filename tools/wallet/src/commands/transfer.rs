@@ -11,7 +11,12 @@ use crate::rpc::RpcClient;
 use crate::sign::{build_and_sign_eip1559_tx, load_signing_key, submit_native_action};
 use crate::Cli;
 
-pub(crate) async fn cmd_send(cli: &Cli, rpc: &RpcClient, to: &str, value: &str) -> Result<(), String> {
+pub(crate) async fn cmd_send(
+    cli: &Cli,
+    rpc: &RpcClient,
+    to: &str,
+    value: &str,
+) -> Result<(), String> {
     let key = load_signing_key(cli)?;
     let from_addr = address_from_key(&key);
     let from_hex = format!("0x{}", hex::encode(from_addr));
@@ -50,14 +55,32 @@ pub(crate) async fn cmd_send(cli: &Cli, rpc: &RpcClient, to: &str, value: &str) 
     Ok(())
 }
 
-pub(crate) async fn cmd_transfer_to_perp(cli: &Cli, rpc: &RpcClient, amount: &str) -> Result<(), String> {
+pub(crate) async fn cmd_transfer_to_perp(
+    cli: &Cli,
+    rpc: &RpcClient,
+    amount: &str,
+) -> Result<(), String> {
     let amount_wei = parse_trs_to_wei(amount)?;
-    submit_native_action(cli, rpc, NativeAction::TransferToPerp { amount: amount_wei }).await
+    submit_native_action(
+        cli,
+        rpc,
+        NativeAction::TransferToPerp { amount: amount_wei },
+    )
+    .await
 }
 
-pub(crate) async fn cmd_transfer_to_spot(cli: &Cli, rpc: &RpcClient, amount: &str) -> Result<(), String> {
+pub(crate) async fn cmd_transfer_to_spot(
+    cli: &Cli,
+    rpc: &RpcClient,
+    amount: &str,
+) -> Result<(), String> {
     let amount_wei = parse_trs_to_wei(amount)?;
-    submit_native_action(cli, rpc, NativeAction::TransferToSpot { amount: amount_wei }).await
+    submit_native_action(
+        cli,
+        rpc,
+        NativeAction::TransferToSpot { amount: amount_wei },
+    )
+    .await
 }
 
 pub(crate) async fn cmd_withdraw(

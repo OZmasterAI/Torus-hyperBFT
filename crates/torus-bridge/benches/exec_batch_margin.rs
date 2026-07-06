@@ -8,9 +8,7 @@ use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
 use torus_bridge::native_executor::{NativeExecContext, NativeExecutor};
 use torus_core::position::{NativeBalance, PositionManager};
 use torus_state::{NativeStateOverlay, StateDb};
-use torus_types::{
-    Address, FixedPoint, NativeAction, OrderType, PlaceOrderParams, TimeInForce,
-};
+use torus_types::{Address, FixedPoint, NativeAction, OrderType, PlaceOrderParams, TimeInForce};
 
 const NUM_SENDERS: usize = 100;
 const ORDERS_PER_BLOCK: usize = 400;
@@ -82,11 +80,11 @@ fn bench_execute_batch(c: &mut Criterion) {
                 let overlay = NativeStateOverlay::new(db.clone());
                 NativeExecContext::new(
                     overlay,
-                    1,          // block_height
-                    1_000_000,  // timestamp
-                    0,          // epoch
-                    1000,       // epoch_length
-                    100,        // max_validators
+                    1,         // block_height
+                    1_000_000, // timestamp
+                    0,         // epoch
+                    1000,      // epoch_length
+                    100,       // max_validators
                     Address::new([0xAA; 20]),
                     Address::new([0xBB; 20]),
                     Address::new([0xCC; 20]),

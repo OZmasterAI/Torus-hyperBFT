@@ -20,5 +20,5 @@ pub use native_executor::{
     NativeExecutor,
 };
 pub use proposer::{genesis_parent_header, BlockProposer, ProposedBlock};
-pub use validator::{BlockValidator, ValidatedBlock, merge_bundle_into};
 pub use revm::database::BundleState;
+pub use validator::{merge_bundle_into, BlockValidator, ValidatedBlock};

@@ -7,7 +7,7 @@ use revm::state::AccountInfo;
 use tempfile::TempDir;
 
 use torus_economics::{EpochManager, StakingManager};
-use torus_state::{StateDb, SnapshotConfig, SnapshotManager, SnapshotMetadata};
+use torus_state::{SnapshotConfig, SnapshotManager, SnapshotMetadata, StateDb};
 use torus_types::{NativeAction, PublicKey};
 
 // ============================================================================
@@ -76,7 +76,11 @@ fn snapshot_lifecycle_create_verify_restore() {
 
     // Verify snapshot
     let result = StateDb::verify_snapshot(&snap_path).unwrap();
-    assert!(result.verified, "snapshot verification failed: {:?}", result.error);
+    assert!(
+        result.verified,
+        "snapshot verification failed: {:?}",
+        result.error
+    );
     assert_eq!(result.block_height, 50);
 
     // Restore to a new directory
@@ -326,7 +330,9 @@ fn key_rotation_duplicate_rejected() {
     let err = staking
         .submit_key_rotation(validator, [3u8; 32], 0, 60)
         .unwrap_err();
-    assert!(err.to_string().contains("already has a pending key rotation"));
+    assert!(err
+        .to_string()
+        .contains("already has a pending key rotation"));
 }
 
 #[test]

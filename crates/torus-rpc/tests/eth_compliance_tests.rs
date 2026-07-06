@@ -64,7 +64,10 @@ async fn eth_call_rejects_historical_block_tag() {
     let result: Result<String, _> = client
         .request("eth_call", rpc_params![call_obj, "0x1"])
         .await;
-    assert!(result.is_err(), "eth_call should reject historical block tag");
+    assert!(
+        result.is_err(),
+        "eth_call should reject historical block tag"
+    );
     let err_msg = result.unwrap_err().to_string();
     assert!(
         err_msg.contains("historical state not available"),
@@ -106,7 +109,11 @@ async fn bare_eth_call_succeeds_at_height_with_base_fee() {
     let mut data = block_hash.to_vec();
     data.extend(serde_json::to_vec(&header).unwrap());
     state
-        .put_cf_raw(torus_state::cf::CF_BLOCK_HEADERS, &1u64.to_be_bytes(), &data)
+        .put_cf_raw(
+            torus_state::cf::CF_BLOCK_HEADERS,
+            &1u64.to_be_bytes(),
+            &data,
+        )
         .unwrap();
 
     let (handle, addr) = start_server(state, mempool, executor).await;
@@ -185,9 +192,7 @@ async fn get_logs_rejects_excessive_block_range() {
         "toBlock": "0x10000" // 65536 — exceeds 10,000
     });
 
-    let result: Result<Vec<RpcLog>, _> = client
-        .request("eth_getLogs", rpc_params![filter])
-        .await;
+    let result: Result<Vec<RpcLog>, _> = client.request("eth_getLogs", rpc_params![filter]).await;
     assert!(result.is_err(), "getLogs should reject excessive range");
     let err_msg = result.unwrap_err().to_string();
     assert!(
@@ -212,9 +217,7 @@ async fn get_logs_accepts_valid_range() {
         "toBlock": "latest"
     });
 
-    let result: Result<Vec<RpcLog>, _> = client
-        .request("eth_getLogs", rpc_params![filter])
-        .await;
+    let result: Result<Vec<RpcLog>, _> = client.request("eth_getLogs", rpc_params![filter]).await;
     assert!(result.is_ok(), "getLogs should accept zero-range query");
 
     handle.stop().unwrap();
@@ -250,7 +253,9 @@ fn rpc_transaction_access_list_field_exists() {
         }]),
     };
     let json = serde_json::to_value(&tx).unwrap();
-    let al = json.get("accessList").expect("accessList should be present");
+    let al = json
+        .get("accessList")
+        .expect("accessList should be present");
     assert!(al.is_array());
     assert_eq!(al.as_array().unwrap().len(), 1);
 }

@@ -236,11 +236,9 @@ impl PeerScoring {
     pub fn cleanup_stale(&mut self, stale_age: Duration) {
         let now = Instant::now();
         // Remove score entries for peers not seen in a long time and not banned
-        self.scores
-            .retain(|peer, entry| {
-                now.duration_since(entry.last_update) < stale_age
-                    || self.perm_bans.contains_key(peer)
-            });
+        self.scores.retain(|peer, entry| {
+            now.duration_since(entry.last_update) < stale_age || self.perm_bans.contains_key(peer)
+        });
         // Purge expired temp bans
         self.temp_bans.retain(|_, until| now < *until);
     }
@@ -293,9 +291,8 @@ mod tests {
         let mut bytes = [0u8; 32];
         bytes[0] = id;
         let key = libp2p::identity::ed25519::SecretKey::try_from_bytes(bytes).unwrap();
-        let keypair = libp2p::identity::Keypair::from(
-            libp2p::identity::ed25519::Keypair::from(key),
-        );
+        let keypair =
+            libp2p::identity::Keypair::from(libp2p::identity::ed25519::Keypair::from(key));
         keypair.public().to_peer_id()
     }
 
@@ -311,7 +308,10 @@ mod tests {
         let mut scoring = PeerScoring::new(None);
         let peer = test_peer(2);
         scoring.penalize(&peer, PENALTY_INVALID_CONSENSUS_MSG, "test");
-        assert_eq!(scoring.score(&peer), INITIAL_SCORE - PENALTY_INVALID_CONSENSUS_MSG as i64);
+        assert_eq!(
+            scoring.score(&peer),
+            INITIAL_SCORE - PENALTY_INVALID_CONSENSUS_MSG as i64
+        );
     }
 
     #[test]

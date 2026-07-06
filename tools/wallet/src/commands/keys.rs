@@ -14,7 +14,8 @@ pub(crate) async fn cmd_keygen(output: PathBuf) -> Result<(), String> {
         return Err("passphrases do not match".into());
     }
 
-    let (key, addr) = generate_keystore(&output, &pass).map_err(|e| format!("keygen failed: {e}"))?;
+    let (key, addr) =
+        generate_keystore(&output, &pass).map_err(|e| format!("keygen failed: {e}"))?;
 
     let private_key_hex = hex::encode(key.to_bytes());
     println!("Address:     0x{}", hex::encode(addr));

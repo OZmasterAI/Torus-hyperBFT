@@ -8,13 +8,11 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use alloy_primitives::{keccak256, Address, B256, U256};
+use borsh::BorshSerialize;
 use ed25519_dalek::VerifyingKey;
 use hotstuff_rs::types::data_types::Power;
 use hotstuff_rs::types::update_sets::AppStateUpdates;
-use hotstuff_rs::types::validator_set::{
-    ValidatorSet as HsValidatorSet, ValidatorSetState,
-};
-use borsh::BorshSerialize;
+use hotstuff_rs::types::validator_set::{ValidatorSet as HsValidatorSet, ValidatorSetState};
 use revm::state::AccountInfo;
 use serde::Deserialize;
 use tracing::info;
@@ -27,8 +25,7 @@ use torus_state::db::KECCAK_EMPTY;
 use torus_state::trie::compute_state_root_from_db;
 use torus_state::{StateDb, StateError};
 use torus_types::{
-    ChainConfig, FixedPoint, PublicKey, ValidatorInfo,
-    ValidatorSet as TorusValidatorSet,
+    ChainConfig, FixedPoint, PublicKey, ValidatorInfo, ValidatorSet as TorusValidatorSet,
 };
 
 // ---------------------------------------------------------------------------
@@ -215,11 +212,9 @@ fn parse_address(s: &str) -> Result<Address, GenesisError> {
 fn parse_u256(s: &str) -> Result<U256, GenesisError> {
     let s = s.trim();
     if s.starts_with("0x") || s.starts_with("0X") {
-        U256::from_str_radix(&s[2..], 16)
-            .map_err(|_| GenesisError::InvalidAmount(s.to_string()))
+        U256::from_str_radix(&s[2..], 16).map_err(|_| GenesisError::InvalidAmount(s.to_string()))
     } else {
-        U256::from_str_radix(s, 10)
-            .map_err(|_| GenesisError::InvalidAmount(s.to_string()))
+        U256::from_str_radix(s, 10).map_err(|_| GenesisError::InvalidAmount(s.to_string()))
     }
 }
 
@@ -380,9 +375,8 @@ impl Genesis {
                 jailed_until: None,
                 last_commission_change_block: None,
             };
-            let data = borsh::to_vec(&state).map_err(|e| {
-                GenesisError::InvalidHex(format!("borsh encode validator: {e}"))
-            })?;
+            let data = borsh::to_vec(&state)
+                .map_err(|e| GenesisError::InvalidHex(format!("borsh encode validator: {e}")))?;
             state_db.put_cf_raw(CF_STAKING_VALIDATORS, address.as_slice(), &data)?;
             info!(%address, stake = %validator.stake, "seeded genesis validator");
         }
@@ -658,11 +652,15 @@ mod tests {
         assert_eq!(config.fee_treasury_bps, 4500);
         assert_eq!(
             config.treasury_address,
-            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".parse::<Address>().unwrap()
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .parse::<Address>()
+                .unwrap()
         );
         assert_eq!(
             config.dev_pool_address,
-            "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".parse::<Address>().unwrap()
+            "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                .parse::<Address>()
+                .unwrap()
         );
     }
 
@@ -687,16 +685,26 @@ mod tests {
         assert_ne!(state_root, B256::ZERO);
 
         // Verify accounts exist
-        let treasury: Address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".parse().unwrap();
-        let acct = state_db.get_account(&treasury).unwrap().expect("treasury exists");
+        let treasury: Address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            .parse()
+            .unwrap();
+        let acct = state_db
+            .get_account(&treasury)
+            .unwrap()
+            .expect("treasury exists");
         assert_eq!(
             acct.balance,
             U256::from_str_radix("1000000000000000000000000000", 10).unwrap()
         );
 
         // Verify evm_alloc contract
-        let contract: Address = "0xcccccccccccccccccccccccccccccccccccccccc".parse().unwrap();
-        let acct = state_db.get_account(&contract).unwrap().expect("contract exists");
+        let contract: Address = "0xcccccccccccccccccccccccccccccccccccccccc"
+            .parse()
+            .unwrap();
+        let acct = state_db
+            .get_account(&contract)
+            .unwrap()
+            .expect("contract exists");
         assert_ne!(acct.code_hash, KECCAK_EMPTY);
         assert!(state_db.get_code(&acct.code_hash).unwrap().is_some());
 
@@ -705,8 +713,12 @@ mod tests {
         assert_eq!(val, U256::from(1));
 
         // Verify validator in CF_STAKING_VALIDATORS
-        let vaddr: Address = "0x1111111111111111111111111111111111111111".parse().unwrap();
-        let raw = state_db.get_cf_raw(CF_STAKING_VALIDATORS, vaddr.as_slice()).unwrap();
+        let vaddr: Address = "0x1111111111111111111111111111111111111111"
+            .parse()
+            .unwrap();
+        let raw = state_db
+            .get_cf_raw(CF_STAKING_VALIDATORS, vaddr.as_slice())
+            .unwrap();
         assert!(raw.is_some());
     }
 
@@ -818,7 +830,9 @@ mod tests {
 
         // Native balance is readable through the production PositionManager path —
         // this is exactly what exec_place_order's margin check reads.
-        let trader: Address = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266".parse().unwrap();
+        let trader: Address = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"
+            .parse()
+            .unwrap();
         let positions = torus_core::position::PositionManager::new(db.clone());
         let bal = positions.get_native_balance(&trader).unwrap();
         assert_eq!(

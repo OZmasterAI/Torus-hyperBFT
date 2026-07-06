@@ -52,9 +52,9 @@ fn encode_addr(a: &Address) -> [u8; 32] {
 /// Set EVM balance directly in CF_ACCOUNTS (72-byte record).
 fn set_evm_balance(db: &StateDb, address: &Address, balance: U256) {
     let keccak_empty: [u8; 32] = [
-        0xc5, 0xd2, 0x46, 0x01, 0x86, 0xf7, 0x23, 0x3c, 0x92, 0x7e, 0x7d, 0xb2, 0xdc, 0xc7,
-        0x03, 0xc0, 0xe5, 0x00, 0xb6, 0x53, 0xca, 0x82, 0x27, 0x3b, 0x7b, 0xfa, 0xd8, 0x04,
-        0x5d, 0x85, 0xa4, 0x70,
+        0xc5, 0xd2, 0x46, 0x01, 0x86, 0xf7, 0x23, 0x3c, 0x92, 0x7e, 0x7d, 0xb2, 0xdc, 0xc7, 0x03,
+        0xc0, 0xe5, 0x00, 0xb6, 0x53, 0xca, 0x82, 0x27, 0x3b, 0x7b, 0xfa, 0xd8, 0x04, 0x5d, 0x85,
+        0xa4, 0x70,
     ];
     let mut data = vec![0u8; 72];
     data[..32].copy_from_slice(&balance.to_be_bytes::<32>());
@@ -94,7 +94,11 @@ fn lockbox_deposit_to_native() {
     let trader = addr(1);
 
     // Give trader 10,000 EVM balance (raw FixedPoint units)
-    set_evm_balance(&db, &trader, U256::from(10_000u64 * FixedPoint::SCALE as u64));
+    set_evm_balance(
+        &db,
+        &trader,
+        U256::from(10_000u64 * FixedPoint::SCALE as u64),
+    );
 
     // Deposit 3,000 to native
     Lockbox::deposit_to_native(&db, &trader, fp(3_000)).unwrap();
@@ -145,7 +149,10 @@ fn lockbox_insufficient_evm_balance() {
     set_evm_balance(&db, &trader, U256::from(100u64));
 
     let result = Lockbox::deposit_to_native(&db, &trader, fp(1_000));
-    assert!(matches!(result, Err(CoreError::InsufficientEvmBalance { .. })));
+    assert!(matches!(
+        result,
+        Err(CoreError::InsufficientEvmBalance { .. })
+    ));
 }
 
 #[test]
@@ -292,7 +299,11 @@ fn balance_reader_get_balances() {
     .unwrap();
 
     // Set EVM balance
-    set_evm_balance(&db, &trader, U256::from(5_000u64 * FixedPoint::SCALE as u64));
+    set_evm_balance(
+        &db,
+        &trader,
+        U256::from(5_000u64 * FixedPoint::SCALE as u64),
+    );
 
     // Call precompile
     let address = precompile_address(ADDR_BALANCE_READER);
@@ -412,11 +423,11 @@ fn core_writer_place_order_queues_action() {
         "placeOrder(bytes32,uint8,uint8,uint128,uint128,uint8)",
         &[
             encode_market_id(1),
-            abi::encode_u8(0),           // Buy
-            abi::encode_u8(0),           // Limit
+            abi::encode_u8(0),                          // Buy
+            abi::encode_u8(0),                          // Limit
             abi::encode_u128(fp(50_000).raw() as u128), // price
             abi::encode_u128(fp(5).raw() as u128),      // quantity
-            abi::encode_u8(0),           // GTC
+            abi::encode_u8(0),                          // GTC
         ],
     );
 
@@ -440,10 +451,7 @@ fn core_writer_cancel_order_queues_action() {
     let caller = addr(1);
 
     let address = precompile_address(ADDR_CORE_WRITER);
-    let input = build_input(
-        "cancelOrder(bytes32)",
-        &[abi::encode_order_id(42)],
-    );
+    let input = build_input("cancelOrder(bytes32)", &[abi::encode_order_id(42)]);
 
     let output = execute_precompile(&address, &input, &caller, &db, 100).unwrap();
     assert_eq!(output.len(), 32);
@@ -518,7 +526,10 @@ fn queue_enqueue_and_drain() {
 
     // Verify first action
     assert_eq!(drained[0].trader, addr(1));
-    assert!(matches!(drained[0].kind, QueuedActionKind::PlaceOrder { market_id: 1, .. }));
+    assert!(matches!(
+        drained[0].kind,
+        QueuedActionKind::PlaceOrder { market_id: 1, .. }
+    ));
 
     // Verify second action
     assert_eq!(drained[1].trader, addr(2));
@@ -635,7 +646,11 @@ fn lockbox_precompile_deposit() {
     let (_dir, db) = setup();
     let trader = addr(5);
 
-    set_evm_balance(&db, &trader, U256::from(10_000u64 * FixedPoint::SCALE as u64));
+    set_evm_balance(
+        &db,
+        &trader,
+        U256::from(10_000u64 * FixedPoint::SCALE as u64),
+    );
 
     let address = precompile_address(ADDR_LOCKBOX);
     let input = build_input(
@@ -715,7 +730,11 @@ fn unknown_selector_returns_error() {
 fn read_only_denies_lockbox_deposit_no_state_change() {
     let (_dir, db) = setup();
     let trader = addr(7);
-    set_evm_balance(&db, &trader, U256::from(10_000u64 * FixedPoint::SCALE as u64));
+    set_evm_balance(
+        &db,
+        &trader,
+        U256::from(10_000u64 * FixedPoint::SCALE as u64),
+    );
 
     let address = precompile_address(ADDR_LOCKBOX);
     let input = build_input(
@@ -725,14 +744,19 @@ fn read_only_denies_lockbox_deposit_no_state_change() {
 
     // Read-only: must be denied AND leave both balances untouched.
     let result = execute_precompile_read_only(&address, &input, &trader, &db, 100);
-    assert!(result.is_err(), "writer precompile must be denied in read-only mode");
+    assert!(
+        result.is_err(),
+        "writer precompile must be denied in read-only mode"
+    );
 
     assert_eq!(
         get_evm_balance(&db, &trader),
         U256::from(10_000u64 * FixedPoint::SCALE as u64),
         "EVM balance must be unchanged by a denied read-only call",
     );
-    let bal = PositionManager::new(db).get_native_balance(&trader).unwrap();
+    let bal = PositionManager::new(db)
+        .get_native_balance(&trader)
+        .unwrap();
     assert_eq!(
         bal.available,
         FixedPoint::ZERO,
@@ -758,7 +782,10 @@ fn read_only_denies_core_writer_no_enqueue() {
     );
 
     let result = execute_precompile_read_only(&address, &input, &caller, &db, 100);
-    assert!(result.is_err(), "core_writer must be denied in read-only mode");
+    assert!(
+        result.is_err(),
+        "core_writer must be denied in read-only mode"
+    );
     // Nothing enqueued for the next block (would otherwise be drained on-chain).
     assert_eq!(CoreWriterQueue::pending_count(&db, 101).unwrap(), 0);
 }
@@ -769,7 +796,10 @@ fn read_only_denies_core_writer_staking_no_enqueue() {
     let address = precompile_address(ADDR_CORE_WRITER_STAKING);
     let input = build_input(
         "delegate(address,uint128)",
-        &[encode_addr(&addr(10)), abi::encode_u128(fp(1_000).raw() as u128)],
+        &[
+            encode_addr(&addr(10)),
+            abi::encode_u128(fp(1_000).raw() as u128),
+        ],
     );
 
     let result = execute_precompile_read_only(&address, &input, &addr(1), &db, 50);
@@ -786,6 +816,9 @@ fn read_only_is_transparent_for_reader_precompiles() {
 
     let ro = execute_precompile_read_only(&address, &input, &addr(0), &db, 100);
     let normal = execute_precompile(&address, &input, &addr(0), &db, 100);
-    assert!(ro.is_ok(), "reader precompile must still run in read-only mode");
+    assert!(
+        ro.is_ok(),
+        "reader precompile must still run in read-only mode"
+    );
     assert_eq!(ro.unwrap(), normal.unwrap());
 }

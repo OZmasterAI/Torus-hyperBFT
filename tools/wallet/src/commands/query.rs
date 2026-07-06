@@ -3,7 +3,11 @@
 
 use crate::rpc::{self, format_trs, RpcClient};
 
-pub(crate) async fn cmd_balance(rpc: &RpcClient, address: &str, json_output: bool) -> Result<(), String> {
+pub(crate) async fn cmd_balance(
+    rpc: &RpcClient,
+    address: &str,
+    json_output: bool,
+) -> Result<(), String> {
     let evm_balance = rpc.get_balance(address).await?;
     let native_balances = rpc.get_balances(address).await.ok();
 
@@ -49,12 +53,18 @@ pub(crate) async fn cmd_validators(rpc: &RpcClient, json_output: bool) -> Result
     }
 
     if let Some(arr) = vals.as_array() {
-        println!("{:<4} {:<44} {:>15} {:>10}", "#", "Address", "Stake", "Commission");
+        println!(
+            "{:<4} {:<44} {:>15} {:>10}",
+            "#", "Address", "Stake", "Commission"
+        );
         println!("{}", "-".repeat(80));
         for (i, v) in arr.iter().enumerate() {
             let addr = v.get("address").and_then(|a| a.as_str()).unwrap_or("?");
             let power = v.get("power").and_then(|p| p.as_u64()).unwrap_or(0);
-            let commission = v.get("commission_bps").and_then(|c| c.as_u64()).unwrap_or(0);
+            let commission = v
+                .get("commission_bps")
+                .and_then(|c| c.as_u64())
+                .unwrap_or(0);
             println!(
                 "{:<4} {:<44} {:>15} {:>8}.{:02}%",
                 i + 1,
@@ -68,7 +78,11 @@ pub(crate) async fn cmd_validators(rpc: &RpcClient, json_output: bool) -> Result
     Ok(())
 }
 
-pub(crate) async fn cmd_staking(rpc: &RpcClient, address: &str, json_output: bool) -> Result<(), String> {
+pub(crate) async fn cmd_staking(
+    rpc: &RpcClient,
+    address: &str,
+    json_output: bool,
+) -> Result<(), String> {
     let info = rpc.get_staking_info(address).await?;
     let delegations = rpc.get_delegations(address).await.ok();
 
@@ -96,7 +110,11 @@ pub(crate) async fn cmd_block(
     json_output: bool,
 ) -> Result<(), String> {
     let block_num = match height {
-        Some(h) => format!("0x{:x}", h.parse::<u64>().map_err(|e| format!("invalid height: {e}"))?),
+        Some(h) => format!(
+            "0x{:x}",
+            h.parse::<u64>()
+                .map_err(|e| format!("invalid height: {e}"))?
+        ),
         None => "latest".to_string(),
     };
     let block = rpc.get_block_by_number(&block_num, false).await?;
@@ -112,7 +130,10 @@ pub(crate) async fn cmd_block(
     }
     let height = block.get("number").and_then(|n| n.as_str()).unwrap_or("?");
     let hash = block.get("hash").and_then(|h| h.as_str()).unwrap_or("?");
-    let timestamp = block.get("timestamp").and_then(|t| t.as_str()).unwrap_or("?");
+    let timestamp = block
+        .get("timestamp")
+        .and_then(|t| t.as_str())
+        .unwrap_or("?");
     let tx_count = block
         .get("transactions")
         .and_then(|t| t.as_array())

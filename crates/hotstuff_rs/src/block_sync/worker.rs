@@ -21,11 +21,7 @@ use ed25519_dalek::VerifyingKey;
 use crate::{
     block_sync::messages::BlockSyncRequest,
     hotstuff::types::PhaseCertificate,
-    networking::{
-        network::Network,
-        receiving::BlockSyncClientStub,
-        sending::SenderHandle,
-    },
+    networking::{network::Network, receiving::BlockSyncClientStub, sending::SenderHandle},
     types::{
         block::Block,
         data_types::{BlockHeight, ChainID},
@@ -52,13 +48,9 @@ pub(crate) enum SyncResult {
         highest_pc: PhaseCertificate,
     },
     /// The peer returned an empty response (no more blocks).
-    Empty {
-        peer: VerifyingKey,
-    },
+    Empty { peer: VerifyingKey },
     /// An error occurred (timeout, disconnect).
-    Error {
-        peer: VerifyingKey,
-    },
+    Error { peer: VerifyingKey },
 }
 
 pub(crate) struct BlockSyncWorker<N: Network + 'static> {

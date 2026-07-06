@@ -119,10 +119,7 @@ impl Certificate for TimeoutCertificate {
                         base_msg.clone()
                     };
 
-                    if _signer
-                        .verify(&msg, &signature)
-                        .is_ok()
-                    {
+                    if _signer.verify(&msg, &signature).is_ok() {
                         total_power += power;
                     } else {
                         // tc contains incorrect signature.

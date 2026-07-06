@@ -253,7 +253,9 @@ impl<N: Network> Pacemaker<N> {
             if timeout_vote.view >= self.view_info.view {
                 // Deduplicate: skip if this voter already contributed to this view.
                 let voter_key = origin.to_bytes();
-                let voters = self.state.bracha_timeout_voters
+                let voters = self
+                    .state
+                    .bracha_timeout_voters
                     .entry(timeout_vote.view)
                     .or_insert_with(BTreeSet::new);
                 if !voters.contains(&voter_key) {
@@ -264,19 +266,33 @@ impl<N: Network> Pacemaker<N> {
                         .power(origin)
                         .map(|p| p.int())
                         .unwrap_or(0);
-                    let accumulated = self.state.bracha_timeout_power
+                    let accumulated = self
+                        .state
+                        .bracha_timeout_power
                         .entry(timeout_vote.view)
                         .or_insert(0);
                     *accumulated += voter_power;
                 }
-                let accumulated_power = *self.state.bracha_timeout_power
+                let accumulated_power = *self
+                    .state
+                    .bracha_timeout_power
                     .get(&timeout_vote.view)
                     .unwrap_or(&0);
-                let total_power = validator_set_state.committed_validator_set().total_power().int() as u64;
-                let f = if total_power > 0 { (total_power - 1) / 3 } else { 0 };
+                let total_power = validator_set_state
+                    .committed_validator_set()
+                    .total_power()
+                    .int() as u64;
+                let f = if total_power > 0 {
+                    (total_power - 1) / 3
+                } else {
+                    0
+                };
                 if accumulated_power >= f + 1
                     && is_validator(&self.config.keypair.public(), &validator_set_state)
-                    && self.state.last_timeout_vote_view.map_or(true, |v| v < timeout_vote.view)
+                    && self
+                        .state
+                        .last_timeout_vote_view
+                        .map_or(true, |v| v < timeout_vote.view)
                 {
                     let own_timeout = PacemakerMessage::timeout_vote(
                         &self.config.keypair,
@@ -330,10 +346,9 @@ impl<N: Network> Pacemaker<N> {
                         validator_set_state.committed_validator_set(),
                         rep,
                     ),
-                    None => select_leader(
-                        new_tc.view,
-                        validator_set_state.committed_validator_set(),
-                    ),
+                    None => {
+                        select_leader(new_tc.view, validator_set_state.committed_validator_set())
+                    }
                 };
                 let _ = block_tree.record_leader_timeout(&timed_out_leader);
 
@@ -433,9 +448,7 @@ impl<N: Network> Pacemaker<N> {
             ProgressCertificate::PhaseCertificate(pc) => pc.is_correct(block_tree)?,
             // FIX CONS-FIND-18: Accept TCs in AdvanceView for ANY view, not just
             // epoch-change views. TCs are valid for liveness at any view.
-            ProgressCertificate::TimeoutCertificate(tc) => {
-                tc.is_correct(&block_tree)?
-            }
+            ProgressCertificate::TimeoutCertificate(tc) => tc.is_correct(&block_tree)?,
         };
 
         if is_valid {
@@ -842,7 +855,11 @@ pub fn select_leader(view: ViewNumber, validator_set: &ValidatorSet) -> Verifyin
     // `(prev_level, level]` no validator power lies strictly between the bounds, so the
     // row membership {v : power(v) >= t} = {v : power(v) >= level} is constant across
     // the segment: (level - prev_level) rows of `members` entries each.
-    let mut levels = powers.iter().copied().filter(|p| *p > 0).collect::<Vec<_>>();
+    let mut levels = powers
+        .iter()
+        .copied()
+        .filter(|p| *p > 0)
+        .collect::<Vec<_>>();
     levels.sort_unstable();
     levels.dedup();
 
@@ -1102,7 +1119,9 @@ fn select_leader_closed_form_matches_reference() {
 
     // Live-testnet shape: 3 validators, power = stake/wei = 2,000,000 each.
     let vs = build(&[2_000_000, 2_000_000, 2_000_000]);
-    for view in [0, 1, 19, 20, 1_179_840, 2_500_000, 5_999_999, 6_000_000, 6_000_001] {
+    for view in [
+        0, 1, 19, 20, 1_179_840, 2_500_000, 5_999_999, 6_000_000, 6_000_001,
+    ] {
         let v = ViewNumber::new(view);
         assert_eq!(
             select_leader(v, &vs),
@@ -1170,7 +1189,9 @@ fn update_view_jump_rebases_stale_schedule() {
     let (mut pacemaker, vss) = test_pacemaker(1);
     let max_view_time = Duration::from_millis(500);
 
-    pacemaker.update_view(ViewNumber::new(39_000), &vss).unwrap();
+    pacemaker
+        .update_view(ViewNumber::new(39_000), &vss)
+        .unwrap();
     assert!(
         pacemaker.query().deadline <= Instant::now() + max_view_time * 2,
         "jumped-to view must not inherit a stale far-future deadline"
@@ -1178,7 +1199,9 @@ fn update_view_jump_rebases_stale_schedule() {
 
     // Views AFTER the jump target must be rebased too, or every subsequent
     // sequential advance would park again.
-    pacemaker.update_view(ViewNumber::new(39_001), &vss).unwrap();
+    pacemaker
+        .update_view(ViewNumber::new(39_001), &vss)
+        .unwrap();
     assert!(pacemaker.query().deadline <= Instant::now() + max_view_time * 2);
 }
 

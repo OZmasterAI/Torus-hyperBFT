@@ -144,9 +144,7 @@ async fn torus_get_staking_info() {
     staking
         .register_validator(validator, [1u8; 32], 500, wei(10_000))
         .unwrap();
-    staking
-        .delegate(delegator, validator, wei(5_000))
-        .unwrap();
+    staking.delegate(delegator, validator, wei(5_000)).unwrap();
     staking.permanent_stake(delegator, wei(3_000), 100).unwrap();
     staking.credit_rewards(delegator, wei(200)).unwrap();
 
@@ -229,12 +227,8 @@ async fn torus_get_delegations() {
     staking
         .register_validator(v2, [2u8; 32], 500, wei(10_000))
         .unwrap();
-    staking
-        .delegate(delegator, v1, wei(20_000))
-        .unwrap();
-    staking
-        .delegate(delegator, v2, wei(30_000))
-        .unwrap();
+    staking.delegate(delegator, v1, wei(20_000)).unwrap();
+    staking.delegate(delegator, v2, wei(30_000)).unwrap();
 
     let (handle, saddr) = start_server(state, mempool, executor).await;
     let client = HttpClientBuilder::default()
@@ -336,9 +330,9 @@ async fn torus_get_proposal_exists() {
     let gov = GovernanceManager::new(state.clone());
     let staking = StakingManager::new(state.clone());
     // FIX MED-NEW-15: params must be initialized before submit_proposal.
-    gov.set_governance_params(
-        &torus_economics::governance::GovernanceParams::defaults(Address::ZERO),
-    )
+    gov.set_governance_params(&torus_economics::governance::GovernanceParams::defaults(
+        Address::ZERO,
+    ))
     .unwrap();
 
     let proposer = addr(1);
@@ -350,9 +344,7 @@ async fn torus_get_proposal_exists() {
     staking
         .register_validator(validator, [1u8; 32], 500, wei(10_000))
         .unwrap();
-    staking
-        .delegate(proposer, validator, wei(5_000))
-        .unwrap();
+    staking.delegate(proposer, validator, wei(5_000)).unwrap();
 
     let id = gov
         .submit_proposal(
@@ -409,9 +401,9 @@ async fn torus_get_proposals_by_status_and_all() {
     let gov = GovernanceManager::new(state.clone());
     let staking = StakingManager::new(state.clone());
     // FIX MED-NEW-15: params must be initialized before submit_proposal.
-    gov.set_governance_params(
-        &torus_economics::governance::GovernanceParams::defaults(Address::ZERO),
-    )
+    gov.set_governance_params(&torus_economics::governance::GovernanceParams::defaults(
+        Address::ZERO,
+    ))
     .unwrap();
 
     let proposer = addr(1);
@@ -422,9 +414,7 @@ async fn torus_get_proposals_by_status_and_all() {
     staking
         .register_validator(validator, [1u8; 32], 500, wei(10_000))
         .unwrap();
-    staking
-        .delegate(proposer, validator, wei(5_000))
-        .unwrap();
+    staking.delegate(proposer, validator, wei(5_000)).unwrap();
 
     // Create 3 proposals (all start as Active).
     gov.submit_proposal(
@@ -487,9 +477,9 @@ async fn torus_get_governance_params() {
 
     // FIX MED-NEW-15: Governance params must be initialized before querying.
     let gov = GovernanceManager::new(state.clone());
-    gov.set_governance_params(
-        &torus_economics::governance::GovernanceParams::defaults(Address::ZERO),
-    )
+    gov.set_governance_params(&torus_economics::governance::GovernanceParams::defaults(
+        Address::ZERO,
+    ))
     .unwrap();
 
     let (handle, saddr) = start_server(state, mempool, executor).await;

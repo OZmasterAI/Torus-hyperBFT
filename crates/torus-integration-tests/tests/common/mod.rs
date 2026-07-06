@@ -90,9 +90,13 @@ impl TestHarness {
         // lot_size = 1.0
         (FixedPoint::ONE.raw()).serialize(&mut data).unwrap();
         // tick_size = 0.01
-        (FixedPoint::from_raw(1_000_000).raw()).serialize(&mut data).unwrap();
+        (FixedPoint::from_raw(1_000_000).raw())
+            .serialize(&mut data)
+            .unwrap();
         // initial_margin = 5.0
-        (FixedPoint::from_raw(5 * FixedPoint::SCALE).raw()).serialize(&mut data).unwrap();
+        (FixedPoint::from_raw(5 * FixedPoint::SCALE).raw())
+            .serialize(&mut data)
+            .unwrap();
 
         self.state_db
             .put_cf_raw(CF_NATIVE_MARKETS, &market_id.to_be_bytes(), &data)

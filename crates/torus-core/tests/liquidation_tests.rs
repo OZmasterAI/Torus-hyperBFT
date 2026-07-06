@@ -74,8 +74,7 @@ fn force_close_equity_covers_loss() {
         LiquidationEngine::check_liquidations(&pm, &traders, &config, &oracle_prices).unwrap();
     assert!(!liqs.is_empty());
 
-    let result =
-        LiquidationEngine::execute_liquidation(&pm, &liqs[0], fp(48_500)).unwrap();
+    let result = LiquidationEngine::execute_liquidation(&pm, &liqs[0], fp(48_500)).unwrap();
     assert_eq!(result.method, LiquidationMethod::ForceClose);
     assert_eq!(result.size, fp(1));
 

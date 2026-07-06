@@ -250,11 +250,7 @@ impl EvmPool {
         };
         let mut freed_bytes = 0usize;
         for nonce in &stale {
-            if let Some(entry) = self
-                .by_sender
-                .get_mut(sender)
-                .and_then(|m| m.remove(nonce))
-            {
+            if let Some(entry) = self.by_sender.get_mut(sender).and_then(|m| m.remove(nonce)) {
                 freed_bytes += entry.raw_rlp.len();
                 self.by_hash.remove(&entry.hash);
                 self.by_price.remove(&TxPriority {
@@ -265,11 +261,7 @@ impl EvmPool {
                 self.size -= 1;
             }
         }
-        if self
-            .by_sender
-            .get(sender)
-            .map_or(true, |m| m.is_empty())
-        {
+        if self.by_sender.get(sender).map_or(true, |m| m.is_empty()) {
             self.by_sender.remove(sender);
         }
         (stale.len(), freed_bytes)

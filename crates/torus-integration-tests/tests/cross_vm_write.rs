@@ -49,7 +49,7 @@ fn test_core_writer_delayed_execution() {
         trader,
         kind: QueuedActionKind::PlaceOrder {
             market_id,
-            side: 0, // buy
+            side: 0,       // buy
             order_type: 0, // limit
             price: TestHarness::fp(50000),
             quantity: TestHarness::fp(2),
@@ -62,13 +62,19 @@ fn test_core_writer_delayed_execution() {
     // Drain in current block (10) — should return nothing (action targets block 11)
     let mut ctx_current = h.exec_context(current_block);
     let results_current = NativeExecutor::drain_core_writer(&mut ctx_current).unwrap();
-    assert!(results_current.is_empty(), "actions should NOT execute in current block");
+    assert!(
+        results_current.is_empty(),
+        "actions should NOT execute in current block"
+    );
 
     // Drain in next block (11) — should execute
     let mut ctx_next = h.exec_context(current_block + 1);
     let results_next = NativeExecutor::drain_core_writer(&mut ctx_next).unwrap();
     assert_eq!(results_next.len(), 1, "should drain 1 action in next block");
-    assert!(results_next[0].success, "queued order should execute successfully");
+    assert!(
+        results_next[0].success,
+        "queued order should execute successfully"
+    );
 }
 
 /// CoreWriter placeOrder via precompile call.
@@ -87,11 +93,11 @@ fn test_core_writer_precompile_call() {
         "placeOrder(bytes32,uint8,uint8,uint128,uint128,uint8)",
         &[
             abi::encode_market_id(market_id),
-            abi::encode_u8(0),  // side: buy
-            abi::encode_u8(0),  // order_type: limit
+            abi::encode_u8(0),                                      // side: buy
+            abi::encode_u8(0),                                      // order_type: limit
             abi::encode_u128(TestHarness::fp(45000).raw() as u128), // price
             abi::encode_u128(TestHarness::fp(1).raw() as u128),     // quantity
-            abi::encode_u8(0),  // time_in_force: GTC
+            abi::encode_u8(0),                                      // time_in_force: GTC
         ],
     );
 
@@ -193,7 +199,14 @@ fn test_execution_ordering_native_vs_core_writer() {
     CoreWriterQueue::enqueue(&h.state_db, &qa).unwrap();
 
     // 3. In block 50, native buy is resting, CoreWriter order hasn't executed yet
-    assert!(ctx.order_books.get(&market_id).unwrap().best_bid().is_some(), "native buy should be resting");
+    assert!(
+        ctx.order_books
+            .get(&market_id)
+            .unwrap()
+            .best_bid()
+            .is_some(),
+        "native buy should be resting"
+    );
     let drained_50 = NativeExecutor::drain_core_writer(&mut ctx).unwrap();
     assert!(drained_50.is_empty(), "no CoreWriter actions in block 50");
 
@@ -202,7 +215,11 @@ fn test_execution_ordering_native_vs_core_writer() {
     //    This test verifies the timing separation at the queue level.
     let mut ctx_51 = h.exec_context(block + 1);
     let drained_51 = NativeExecutor::drain_core_writer(&mut ctx_51).unwrap();
-    assert_eq!(drained_51.len(), 1, "CoreWriter order should drain in block 51");
+    assert_eq!(
+        drained_51.len(),
+        1,
+        "CoreWriter order should drain in block 51"
+    );
     assert!(drained_51[0].success);
 }
 
@@ -245,5 +262,8 @@ fn test_invalid_core_writer_action_isolation() {
     let results = NativeExecutor::drain_core_writer(&mut ctx).unwrap();
     assert_eq!(results.len(), 2);
     assert!(!results[0].success, "invalid cancel should fail");
-    assert!(results[1].success, "valid order should succeed despite earlier failure");
+    assert!(
+        results[1].success,
+        "valid order should succeed despite earlier failure"
+    );
 }

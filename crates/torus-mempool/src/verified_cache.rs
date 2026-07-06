@@ -133,7 +133,11 @@ mod tests {
         c.insert(1, 11); // refresh key 1 -> now key 2 is the oldest
         c.insert(3, 30); // evicts oldest live = key 2
         assert_eq!(c.get(&2), None, "un-refreshed key evicted first");
-        assert_eq!(c.get(&1), Some(&11), "refreshed key survives with new value");
+        assert_eq!(
+            c.get(&1),
+            Some(&11),
+            "refreshed key survives with new value"
+        );
         assert_eq!(c.get(&3), Some(&30));
         assert_eq!(c.len(), 2);
     }

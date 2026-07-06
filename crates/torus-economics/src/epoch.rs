@@ -159,10 +159,8 @@ impl EpochManager {
 
         // BTreeSet iterates in deterministic (sorted) order, unlike HashSet.
         // This ensures all nodes select the same validators when the rotation cap applies.
-        let old_addrs: BTreeSet<Address> =
-            old_set.validators.iter().map(|v| v.address).collect();
-        let new_addrs: BTreeSet<Address> =
-            new_set.validators.iter().map(|v| v.address).collect();
+        let old_addrs: BTreeSet<Address> = old_set.validators.iter().map(|v| v.address).collect();
+        let new_addrs: BTreeSet<Address> = new_set.validators.iter().map(|v| v.address).collect();
 
         let departures: Vec<Address> = old_addrs.difference(&new_addrs).copied().collect();
         let arrivals: Vec<Address> = new_addrs.difference(&old_addrs).copied().collect();
@@ -202,7 +200,9 @@ impl EpochManager {
 
         // Re-sort by stake desc, address asc for determinism
         new_set.validators.sort_by(|a, b| {
-            b.power.cmp(&a.power).then_with(|| a.address.cmp(&b.address))
+            b.power
+                .cmp(&a.power)
+                .then_with(|| a.address.cmp(&b.address))
         });
 
         tracing::warn!(

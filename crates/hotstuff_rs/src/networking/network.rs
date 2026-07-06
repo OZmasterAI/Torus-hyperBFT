@@ -5,7 +5,10 @@
 use ed25519_dalek::VerifyingKey;
 
 use crate::hotstuff::messages::{BlockDataRequest, BlockDataResponse};
-use crate::types::{block::Block, data_types::CryptoHash, update_sets::ValidatorSetUpdates, validator_set::ValidatorSet};
+use crate::types::{
+    block::Block, data_types::CryptoHash, update_sets::ValidatorSetUpdates,
+    validator_set::ValidatorSet,
+};
 
 use super::messages::Message;
 
@@ -32,7 +35,9 @@ pub trait Network: Clone + Send {
 
     /// Receive a block-data response. Non-blocking, returns None if nothing available.
     /// Responses arrive via a channel separate from the consensus message queue.
-    fn recv_block_data(&mut self) -> Option<(VerifyingKey, BlockDataResponse)> { None }
+    fn recv_block_data(&mut self) -> Option<(VerifyingKey, BlockDataResponse)> {
+        None
+    }
 
     /// Publish a block to the network-thread store so it can serve body requests
     /// without touching the algorithm thread.

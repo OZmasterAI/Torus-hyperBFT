@@ -355,7 +355,9 @@ impl<K: KVStore> BlockTreeSingleton<K> {
             if let Ok(vs) = self.committed_validator_set() {
                 let qc_leader = match self.leader_reputation() {
                     Ok(ref rep) => crate::pacemaker::implementation::select_leader_with_reputation(
-                        justify.view, &vs, rep,
+                        justify.view,
+                        &vs,
+                        rep,
                     ),
                     Err(_) => crate::pacemaker::implementation::select_leader(justify.view, &vs),
                 };
@@ -385,10 +387,16 @@ impl<K: KVStore> BlockTreeSingleton<K> {
                         // block_justify.view + 1 (the view this block was proposed in).
                         let proposed_view = block_justify.view + 1;
                         let leader = match self.leader_reputation() {
-                            Ok(ref rep) => crate::pacemaker::implementation::select_leader_with_reputation(
-                                proposed_view, &vs, rep,
-                            ),
-                            Err(_) => crate::pacemaker::implementation::select_leader(proposed_view, &vs),
+                            Ok(ref rep) => {
+                                crate::pacemaker::implementation::select_leader_with_reputation(
+                                    proposed_view,
+                                    &vs,
+                                    rep,
+                                )
+                            }
+                            Err(_) => {
+                                crate::pacemaker::implementation::select_leader(proposed_view, &vs)
+                            }
                         };
                         let _ = self.record_leader_success(&leader);
                     }
@@ -404,10 +412,8 @@ impl<K: KVStore> BlockTreeSingleton<K> {
         );
 
         // Collect committed block hashes (oldest to newest) for on_committed_block callbacks.
-        let committed_block_hashes: Vec<CryptoHash> = committed_blocks
-            .iter()
-            .map(|(hash, _)| *hash)
-            .collect();
+        let committed_block_hashes: Vec<CryptoHash> =
+            committed_blocks.iter().map(|(hash, _)| *hash).collect();
 
         // Block-tree pruner: bound cf_consensus_meta growth by deleting blocks that
         // fell out of the retention window (no-op unless enabled via
@@ -517,7 +523,8 @@ impl<K: KVStore> BlockTreeSingleton<K> {
         wb.set_highest_view_phase_voted(view)?;
         wb.0.set(
             &variables::LAST_VOTED_PROPOSAL,
-            &(view, block).try_to_vec()
+            &(view, block)
+                .try_to_vec()
                 .map_err(|err| KVSetError::SerializeValueError {
                     key: Key::HighestTC,
                     source: err,
@@ -1390,7 +1397,10 @@ impl<K: KVStore> BlockTreeSingleton<K> {
     }
 
     /// Set the validator's local_tip after voting for a fresh proposal.
-    pub fn set_local_tip(&mut self, tip: &crate::pacemaker::types::TipInfo) -> Result<(), BlockTreeError> {
+    pub fn set_local_tip(
+        &mut self,
+        tip: &crate::pacemaker::types::TipInfo,
+    ) -> Result<(), BlockTreeError> {
         use borsh::BorshSerialize;
         let mut wb: BlockTreeWriteBatch<K::WriteBatch> = BlockTreeWriteBatch::new();
         wb.0.set(
@@ -1406,7 +1416,9 @@ impl<K: KVStore> BlockTreeSingleton<K> {
     }
 
     /// Get the highest QC for inclusion in a timeout vote.
-    pub fn highest_qc_for_timeout(&self) -> Result<Option<crate::hotstuff::types::PhaseCertificate>, BlockTreeError> {
+    pub fn highest_qc_for_timeout(
+        &self,
+    ) -> Result<Option<crate::hotstuff::types::PhaseCertificate>, BlockTreeError> {
         let highest_pc = self.highest_pc()?;
         if highest_pc.is_genesis_pc() {
             return Ok(None);
@@ -1422,10 +1434,12 @@ impl<K: KVStore> BlockTreeSingleton<K> {
     pub fn last_voted_proposal(&self) -> Result<Option<(ViewNumber, CryptoHash)>, BlockTreeError> {
         use borsh::BorshDeserialize;
         if let Some(bytes) = self.0.get(&variables::LAST_VOTED_PROPOSAL) {
-            let pair = <(ViewNumber, CryptoHash)>::deserialize(&mut bytes.as_slice())
-                .map_err(|err| KVGetError::DeserializeValueError {
-                    key: Key::HighestTC, // reuse key enum
-                    source: err,
+            let pair =
+                <(ViewNumber, CryptoHash)>::deserialize(&mut bytes.as_slice()).map_err(|err| {
+                    KVGetError::DeserializeValueError {
+                        key: Key::HighestTC, // reuse key enum
+                        source: err,
+                    }
                 })?;
             Ok(Some(pair))
         } else {
@@ -1434,12 +1448,17 @@ impl<K: KVStore> BlockTreeSingleton<K> {
     }
 
     /// MonadBFT B2: Record the (view, block_hash) of the proposal we just voted for.
-    pub fn set_last_voted_proposal(&mut self, view: ViewNumber, block: CryptoHash) -> Result<(), BlockTreeError> {
+    pub fn set_last_voted_proposal(
+        &mut self,
+        view: ViewNumber,
+        block: CryptoHash,
+    ) -> Result<(), BlockTreeError> {
         use borsh::BorshSerialize;
         let mut wb: BlockTreeWriteBatch<K::WriteBatch> = BlockTreeWriteBatch::new();
         wb.0.set(
             &variables::LAST_VOTED_PROPOSAL,
-            &(view, block).try_to_vec()
+            &(view, block)
+                .try_to_vec()
                 .map_err(|err| KVSetError::SerializeValueError {
                     key: Key::HighestTC,
                     source: err,
@@ -1507,7 +1526,10 @@ impl<K: KVStore> BlockTreeSingleton<K> {
 
     /// MonadBFT B2: Remove irrevocably committed blocks from speculative list.
     /// No-op (no KV write) when the block was not in the list.
-    pub fn promote_speculative_to_irrevocable(&mut self, block: &CryptoHash) -> Result<(), BlockTreeError> {
+    pub fn promote_speculative_to_irrevocable(
+        &mut self,
+        block: &CryptoHash,
+    ) -> Result<(), BlockTreeError> {
         let mut commits = self.speculative_commits()?;
         let before = commits.len();
         commits.retain(|b| b != block);
@@ -1608,10 +1630,9 @@ impl<K: KVStore> BlockTreeSingleton<K> {
     /// MonadBFT B2: Query whether a block is irrevocably committed.
     pub fn is_irrevocably_committed(&self, block: &CryptoHash) -> Result<bool, BlockTreeError> {
         if let Some(highest) = self.highest_committed_block()? {
-            if let (Some(block_height), Some(highest_height)) = (
-                self.block_height(block)?,
-                self.block_height(&highest)?,
-            ) {
+            if let (Some(block_height), Some(highest_height)) =
+                (self.block_height(block)?, self.block_height(&highest)?)
+            {
                 return Ok(block_height <= highest_height);
             }
         }
@@ -1669,10 +1690,12 @@ impl<K: KVStore> BlockTreeSingleton<K> {
             let mut wb: BlockTreeWriteBatch<K::WriteBatch> = BlockTreeWriteBatch::new();
             wb.0.set(
                 &variables::EQUIVOCATION_EVIDENCE,
-                &existing.try_to_vec().map_err(|err| KVSetError::SerializeValueError {
-                    key: Key::HighestTC,
-                    source: err,
-                })?,
+                &existing
+                    .try_to_vec()
+                    .map_err(|err| KVSetError::SerializeValueError {
+                        key: Key::HighestTC,
+                        source: err,
+                    })?,
             );
             self.write(wb);
         }
@@ -1685,14 +1708,13 @@ impl<K: KVStore> BlockTreeSingleton<K> {
     ) -> Result<Vec<(ViewNumber, [u8; 32], CryptoHash, CryptoHash)>, BlockTreeError> {
         use borsh::BorshDeserialize;
         if let Some(bytes) = self.0.get(&variables::EQUIVOCATION_EVIDENCE) {
-            let evidence =
-                Vec::<(ViewNumber, [u8; 32], CryptoHash, CryptoHash)>::deserialize(
-                    &mut bytes.as_slice(),
-                )
-                .map_err(|err| KVGetError::DeserializeValueError {
-                    key: Key::HighestTC,
-                    source: err,
-                })?;
+            let evidence = Vec::<(ViewNumber, [u8; 32], CryptoHash, CryptoHash)>::deserialize(
+                &mut bytes.as_slice(),
+            )
+            .map_err(|err| KVGetError::DeserializeValueError {
+                key: Key::HighestTC,
+                source: err,
+            })?;
             Ok(evidence)
         } else {
             Ok(Vec::new())
@@ -1741,10 +1763,12 @@ impl<K: KVStore> BlockTreeSingleton<K> {
         let mut wb: BlockTreeWriteBatch<K::WriteBatch> = BlockTreeWriteBatch::new();
         wb.0.set(
             &variables::LEADER_REPUTATION,
-            &reputation.try_to_vec().map_err(|err| KVSetError::SerializeValueError {
-                key: Key::HighestTC,
-                source: err,
-            })?,
+            &reputation
+                .try_to_vec()
+                .map_err(|err| KVSetError::SerializeValueError {
+                    key: Key::HighestTC,
+                    source: err,
+                })?,
         );
         self.write(wb);
         // Write-through: keep the in-mem cache identical to what we just persisted,
@@ -1755,10 +1779,7 @@ impl<K: KVStore> BlockTreeSingleton<K> {
 
     /// Record a successful block production for reputation tracking.
     /// Called when a block is irrevocably committed.
-    pub fn record_leader_success(
-        &mut self,
-        leader: &VerifyingKey,
-    ) -> Result<(), BlockTreeError> {
+    pub fn record_leader_success(&mut self, leader: &VerifyingKey) -> Result<(), BlockTreeError> {
         let mut rep = self.leader_reputation()?;
         rep.record_success(leader);
         self.set_leader_reputation(&rep)
@@ -1766,10 +1787,7 @@ impl<K: KVStore> BlockTreeSingleton<K> {
 
     /// Record a timeout for reputation tracking.
     /// Called when a TC is formed (view timed out).
-    pub fn record_leader_timeout(
-        &mut self,
-        leader: &VerifyingKey,
-    ) -> Result<(), BlockTreeError> {
+    pub fn record_leader_timeout(&mut self, leader: &VerifyingKey) -> Result<(), BlockTreeError> {
         let mut rep = self.leader_reputation()?;
         rep.record_timeout(leader);
         // Decay periodically: every `window_size` total events.
@@ -1808,7 +1826,10 @@ mod leader_rep_cache_tests {
 
     impl WriteBatch for MemWb {
         fn new() -> Self {
-            Self { sets: Vec::new(), deletes: Vec::new() }
+            Self {
+                sets: Vec::new(),
+                deletes: Vec::new(),
+            }
         }
         fn set(&mut self, key: &[u8], value: &[u8]) {
             self.sets.push((key.to_vec(), value.to_vec()));
@@ -1878,15 +1899,17 @@ mod leader_rep_cache_tests {
 
         // (2) cache == KV: a fresh borsh deserialize straight from the KV equals the
         // cached value (write-through kept them identical).
-        let raw = bt
-            .0
-            .map
-            .get(&variables::LEADER_REPUTATION[..])
-            .expect("reputation persisted to KV")
-            .clone();
+        let raw =
+            bt.0.map
+                .get(&variables::LEADER_REPUTATION[..])
+                .expect("reputation persisted to KV")
+                .clone();
         let from_kv =
             crate::hotstuff::types::LeaderReputation::deserialize(&mut raw.as_slice()).unwrap();
-        assert_eq!(from_kv, cached, "cache must byte-equal a fresh KV deserialize");
+        assert_eq!(
+            from_kv, cached,
+            "cache must byte-equal a fresh KV deserialize"
+        );
 
         // (3) Reads are served from the in-mem cache: after warm-up, repeated
         // `leader_reputation()` calls issue NO KV get for the reputation key.
@@ -2000,7 +2023,10 @@ mod block_tree_pruner_tests {
 
     impl WriteBatch for MemWb {
         fn new() -> Self {
-            Self { sets: Vec::new(), deletes: Vec::new() }
+            Self {
+                sets: Vec::new(),
+                deletes: Vec::new(),
+            }
         }
         fn set(&mut self, key: &[u8], value: &[u8]) {
             self.sets.push((key.to_vec(), value.to_vec()));
@@ -2044,10 +2070,7 @@ mod block_tree_pruner_tests {
     /// Insert a linear committed chain of `len` blocks at heights `0..len`
     /// (each block's justify referencing its parent), then commit the tip.
     /// Returns the block hashes in height order.
-    fn seed_committed_chain(
-        bt: &mut BlockTreeSingleton<MemKV>,
-        len: u64,
-    ) -> Vec<CryptoHash> {
+    fn seed_committed_chain(bt: &mut BlockTreeSingleton<MemKV>, len: u64) -> Vec<CryptoHash> {
         let mut hashes = Vec::with_capacity(len as usize);
         let mut justify = PhaseCertificate::genesis_pc();
         for h in 0..len {

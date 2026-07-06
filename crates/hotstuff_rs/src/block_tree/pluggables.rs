@@ -149,9 +149,8 @@ pub trait KVGet {
         match data_len {
             None => Ok(None),
             Some(len) => {
-                let datums: Vec<Option<Datum>> = (0..len.int())
-                    .map(|i| self.block_datum(block, i))
-                    .collect();
+                let datums: Vec<Option<Datum>> =
+                    (0..len.int()).map(|i| self.block_datum(block, i)).collect();
                 if datums.iter().any(|d| d.is_none()) {
                     Err(KVGetError::ValueExpectedButNotFound {
                         key: Key::BlockData {

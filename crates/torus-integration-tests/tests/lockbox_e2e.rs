@@ -115,7 +115,10 @@ fn test_insufficient_native_balance_atomic() {
     h.fund_native(&trader, have);
 
     let result = Lockbox::withdraw_from_native(&h.state_db, &trader, TestHarness::fp(200));
-    assert!(result.is_err(), "should fail with insufficient native balance");
+    assert!(
+        result.is_err(),
+        "should fail with insufficient native balance"
+    );
 
     // Both balances unchanged.
     assert_eq!(native_bal(&h, &trader), have);

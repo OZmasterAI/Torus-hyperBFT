@@ -130,11 +130,8 @@ mod tests {
 
     #[test]
     fn test_proposal_param_change() {
-        let a = parse_proposal_action(
-            "param-change",
-            r#"{"key":"epoch_length","value":"1000"}"#,
-        )
-        .unwrap();
+        let a = parse_proposal_action("param-change", r#"{"key":"epoch_length","value":"1000"}"#)
+            .unwrap();
         match &a {
             ProposalAction::ParameterChange { key, value } => {
                 assert_eq!(key, "epoch_length");

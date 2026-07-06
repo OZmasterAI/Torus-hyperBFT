@@ -284,14 +284,18 @@ pub fn lerp_bps(start: u16, end: u16, numerator: u64, denominator: u64) -> u16 {
 /// Static key for cumulative validator inflation minted in CF_TREASURY.
 const VALIDATOR_INFLATION_KEY: &[u8] = b"validator_inflation_tracker";
 
-fn get_cumulative_validator_inflation<T: StateBackend>(staking: &StakingManager<T>) -> Result<U256> {
+fn get_cumulative_validator_inflation<T: StateBackend>(
+    staking: &StakingManager<T>,
+) -> Result<U256> {
     match staking
         .state()
         .get_cf_raw(CF_TREASURY, VALIDATOR_INFLATION_KEY)?
     {
         Some(data) => {
             if data.len() != 32 {
-                return Err(EconomicsError::Borsh("invalid validator inflation tracker length".into()));
+                return Err(EconomicsError::Borsh(
+                    "invalid validator inflation tracker length".into(),
+                ));
             }
             Ok(U256::from_be_slice(&data))
         }
@@ -299,10 +303,15 @@ fn get_cumulative_validator_inflation<T: StateBackend>(staking: &StakingManager<
     }
 }
 
-fn put_cumulative_validator_inflation<T: StateBackend>(staking: &StakingManager<T>, total: U256) -> Result<()> {
-    staking
-        .state()
-        .put_cf_raw(CF_TREASURY, VALIDATOR_INFLATION_KEY, &total.to_be_bytes::<32>())?;
+fn put_cumulative_validator_inflation<T: StateBackend>(
+    staking: &StakingManager<T>,
+    total: U256,
+) -> Result<()> {
+    staking.state().put_cf_raw(
+        CF_TREASURY,
+        VALIDATOR_INFLATION_KEY,
+        &total.to_be_bytes::<32>(),
+    )?;
     Ok(())
 }
 
@@ -329,7 +338,12 @@ impl FeeSplitter {
 
         let bps_10000 = U256::from(10_000u32);
 
-        let burn_bps = lerp_bps(FEE_START_BURN_BPS, FEE_END_BURN_BPS, epoch, TRANSITION_EPOCHS);
+        let burn_bps = lerp_bps(
+            FEE_START_BURN_BPS,
+            FEE_END_BURN_BPS,
+            epoch,
+            TRANSITION_EPOCHS,
+        );
         let validator_bps = lerp_bps(
             FEE_START_VALIDATOR_BPS,
             FEE_END_VALIDATOR_BPS,
@@ -445,7 +459,9 @@ impl FeeSplitter {
     }
 
     /// Get the supply tracker from CF_TREASURY.
-    pub fn get_supply_tracker<T: StateBackend>(staking: &StakingManager<T>) -> Result<SupplyTracker> {
+    pub fn get_supply_tracker<T: StateBackend>(
+        staking: &StakingManager<T>,
+    ) -> Result<SupplyTracker> {
         match staking
             .state()
             .get_cf_raw(CF_TREASURY, SUPPLY_TRACKER_KEY)?
@@ -459,7 +475,10 @@ impl FeeSplitter {
         }
     }
 
-    fn put_supply_tracker<T: StateBackend>(staking: &StakingManager<T>, tracker: &SupplyTracker) -> Result<()> {
+    fn put_supply_tracker<T: StateBackend>(
+        staking: &StakingManager<T>,
+        tracker: &SupplyTracker,
+    ) -> Result<()> {
         let data = borsh::to_vec(tracker).map_err(|e| EconomicsError::Borsh(e.to_string()))?;
         staking
             .state()
@@ -578,18 +597,8 @@ mod tests {
         RewardDistributor::distribute_block_fees(&mgr, proposer, total_fees, 0, treasury, dev_pool)
             .unwrap();
 
-        let treasury_bal = mgr
-            .state()
-            .get_account(&treasury)
-            .unwrap()
-            .unwrap()
-            .balance;
-        let dev_pool_bal = mgr
-            .state()
-            .get_account(&dev_pool)
-            .unwrap()
-            .unwrap()
-            .balance;
+        let treasury_bal = mgr.state().get_account(&treasury).unwrap().unwrap().balance;
+        let dev_pool_bal = mgr.state().get_account(&dev_pool).unwrap().unwrap().balance;
 
         assert_eq!(treasury_bal, wei(45));
         assert_eq!(dev_pool_bal, wei(45));
@@ -653,12 +662,7 @@ mod tests {
         assert!(!minted.is_zero());
 
         // Staker balance = 50k remaining + minted rewards.
-        let bal = mgr
-            .state()
-            .get_account(&staker)
-            .unwrap()
-            .unwrap()
-            .balance;
+        let bal = mgr.state().get_account(&staker).unwrap().unwrap().balance;
         assert_eq!(bal, wei(50_000) + minted);
     }
 
@@ -696,7 +700,10 @@ mod tests {
 
         // Verify validator received rewards (commission + delegator pool since no delegators)
         let pending = mgr.get_pending_rewards(&val).unwrap().unwrap();
-        assert_eq!(pending.amount, emission, "sole validator gets full emission");
+        assert_eq!(
+            pending.amount, emission,
+            "sole validator gets full emission"
+        );
     }
 
     #[test]
@@ -759,8 +766,7 @@ mod tests {
         mgr.register_validator(a, [1u8; 32], 500, wei(50_000))
             .unwrap();
 
-        let emission =
-            RewardDistributor::distribute_validator_inflation(&mgr, 43200).unwrap();
+        let emission = RewardDistributor::distribute_validator_inflation(&mgr, 43200).unwrap();
         assert_eq!(emission, U256::ZERO);
     }
 
@@ -768,8 +774,7 @@ mod tests {
     fn validator_inflation_zero_stake() {
         let (_dir, mgr) = setup();
         // No validators at all
-        let emission =
-            RewardDistributor::distribute_validator_inflation(&mgr, 43200).unwrap();
+        let emission = RewardDistributor::distribute_validator_inflation(&mgr, 43200).unwrap();
         assert_eq!(emission, U256::ZERO);
     }
 

@@ -147,7 +147,9 @@ fn full_downtime_lifecycle() {
     assert_eq!(val.jailed_until, Some(100 + JAIL_DURATION_BLOCKS));
 
     // Cannot unjail before cooldown
-    assert!(mgr.unjail(&bad_val, 100 + JAIL_DURATION_BLOCKS - 1).is_err());
+    assert!(mgr
+        .unjail(&bad_val, 100 + JAIL_DURATION_BLOCKS - 1)
+        .is_err());
 
     // Unjail after cooldown
     let unjail_block = 100 + JAIL_DURATION_BLOCKS;
@@ -179,32 +181,27 @@ fn jail_vote_lifecycle() {
     // --- Jail vote via NativeAction ---
     let state_db = mgr.state().clone();
     let mut ctx = NativeExecContext::new(
-        state_db, 100, 1_700_000_100, 0, 100, 100,
-        addr(99), addr(98), addr(97),
+        state_db,
+        100,
+        1_700_000_100,
+        0,
+        100,
+        100,
+        addr(99),
+        addr(98),
+        addr(97),
     );
 
     // v1 votes
-    let r1 = NativeExecutor::execute(
-        &mut ctx,
-        &v1,
-        &NativeAction::JailVote { target },
-    );
+    let r1 = NativeExecutor::execute(&mut ctx, &v1, &NativeAction::JailVote { target });
     assert!(r1.success);
 
     // v2 votes
-    let r2 = NativeExecutor::execute(
-        &mut ctx,
-        &v2,
-        &NativeAction::JailVote { target },
-    );
+    let r2 = NativeExecutor::execute(&mut ctx, &v2, &NativeAction::JailVote { target });
     assert!(r2.success);
 
     // v3 votes — threshold reached (75% > 66.7%)
-    let r3 = NativeExecutor::execute(
-        &mut ctx,
-        &v3,
-        &NativeAction::JailVote { target },
-    );
+    let r3 = NativeExecutor::execute(&mut ctx, &v3, &NativeAction::JailVote { target });
     assert!(r3.success);
 
     // Verify target is jailed
@@ -214,11 +211,7 @@ fn jail_vote_lifecycle() {
     // --- Unjail via NativeAction ---
     // Advance past cooldown
     ctx.block_height = 100 + JAIL_DURATION_BLOCKS;
-    let r_unjail = NativeExecutor::execute(
-        &mut ctx,
-        &target,
-        &NativeAction::UnjailSelf,
-    );
+    let r_unjail = NativeExecutor::execute(&mut ctx, &target, &NativeAction::UnjailSelf);
     assert!(r_unjail.success);
 
     let val = ctx.staking.get_validator(&target).unwrap().unwrap();
@@ -316,8 +309,13 @@ fn double_sign_detection_produces_verifiable_evidence() {
 
     assert!(detector.record_vote(&vote_a).is_none());
 
-    let evidence = detector.record_vote(&vote_b).expect("should detect double sign");
-    assert!(evidence.verify(), "evidence must be independently verifiable");
+    let evidence = detector
+        .record_vote(&vote_b)
+        .expect("should detect double sign");
+    assert!(
+        evidence.verify(),
+        "evidence must be independently verifiable"
+    );
     assert_eq!(evidence.view, 50);
     assert_ne!(evidence.vote_a.block_hash, evidence.vote_b.block_hash);
 }

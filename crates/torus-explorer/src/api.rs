@@ -147,9 +147,7 @@ async fn get_address_actions(
 
 async fn list_validators(State(s): State<AppState>) -> ApiResult {
     let validators = s.db.get_latest_validators()?;
-    Ok(Json(
-        json!({"data": validators, "total": validators.len()}),
-    ))
+    Ok(Json(json!({"data": validators, "total": validators.len()})))
 }
 
 async fn get_validator(State(s): State<AppState>, Path(addr): Path<String>) -> ApiResult {
@@ -247,7 +245,9 @@ async fn get_candles(
         })
         .collect();
 
-    Ok(Json(json!({"data": data, "marketId": market_id, "interval": interval})))
+    Ok(Json(
+        json!({"data": data, "marketId": market_id, "interval": interval}),
+    ))
 }
 
 #[cfg(test)]
@@ -307,10 +307,7 @@ mod tests {
 
     async fn get_json(app: &Router, path: &str) -> Value {
         use tower::ServiceExt;
-        let req = Request::builder()
-            .uri(path)
-            .body(Body::empty())
-            .unwrap();
+        let req = Request::builder().uri(path).body(Body::empty()).unwrap();
         let resp: axum::response::Response = app.clone().oneshot(req).await.unwrap();
         let body = axum::body::to_bytes(resp.into_body(), 1_000_000)
             .await

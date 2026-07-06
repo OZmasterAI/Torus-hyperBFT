@@ -13,7 +13,11 @@ pub struct Indexer {
 
 impl Indexer {
     pub fn new(rpc: NodeRpcClient, db: ExplorerDb, batch_size: u32) -> Self {
-        Self { rpc, db, batch_size }
+        Self {
+            rpc,
+            db,
+            batch_size,
+        }
     }
 
     /// Backfill from last indexed height to current chain tip.
@@ -118,7 +122,10 @@ impl Indexer {
                 let timestamp = val_hex_i64(t, "timestamp");
                 let price_raw = parse_hex_i128(val_str(t, "price").as_str()) as i64;
                 let qty_raw = parse_hex_i128(val_str(t, "quantity").as_str()) as i64;
-                if let Err(e) = self.db.upsert_candle(market_id, timestamp, price_raw, qty_raw) {
+                if let Err(e) = self
+                    .db
+                    .upsert_candle(market_id, timestamp, price_raw, qty_raw)
+                {
                     warn!("Failed to upsert candle at height {height}: {e}");
                 }
             }
@@ -146,10 +153,7 @@ impl Indexer {
                 address: val_str(v, "address"),
                 pubkey: val_str(v, "pubkey"),
                 power: val_hex_i64(v, "power"),
-                commission_bps: v
-                    .get("commissionBps")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0) as i32,
+                commission_bps: v.get("commissionBps").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
                 status: val_str(v, "status"),
             };
             self.db
@@ -166,11 +170,7 @@ impl Indexer {
 
         let ws = WsClientBuilder::default().build(ws_url).await?;
         let mut sub: jsonrpsee::core::client::Subscription<Value> = ws
-            .subscribe(
-                "eth_subscribe",
-                rpc_params!["newHeads"],
-                "eth_unsubscribe",
-            )
+            .subscribe("eth_subscribe", rpc_params!["newHeads"], "eth_unsubscribe")
             .await?;
 
         info!("Subscribed to newHeads on {ws_url}");
@@ -303,11 +303,43 @@ pub fn parse_native_action_row(
         block_height,
         action_index,
         action_type: action_type.clone(),
-        market_id: extract_i64(&action_type, inner_ref, "market_id", &["PlaceOrder", "CancelAllOrders", "UpdateMarketParams", "DelistMarket"]),
-        order_id: extract_val_str(&action_type, inner_ref, "order_id", &["CancelOrder", "ModifyOrder"]),
-        validator: extract_str(&action_type, inner_ref, "validator", &["Delegate", "Undelegate"]),
+        market_id: extract_i64(
+            &action_type,
+            inner_ref,
+            "market_id",
+            &[
+                "PlaceOrder",
+                "CancelAllOrders",
+                "UpdateMarketParams",
+                "DelistMarket",
+            ],
+        ),
+        order_id: extract_val_str(
+            &action_type,
+            inner_ref,
+            "order_id",
+            &["CancelOrder", "ModifyOrder"],
+        ),
+        validator: extract_str(
+            &action_type,
+            inner_ref,
+            "validator",
+            &["Delegate", "Undelegate"],
+        ),
         target: extract_str(&action_type, inner_ref, "target", &["JailVote"]),
-        amount: extract_val_str(&action_type, inner_ref, "amount", &["Delegate", "Undelegate", "PermanentStake", "Withdraw", "TransferToPerp", "TransferToSpot"]),
+        amount: extract_val_str(
+            &action_type,
+            inner_ref,
+            "amount",
+            &[
+                "Delegate",
+                "Undelegate",
+                "PermanentStake",
+                "Withdraw",
+                "TransferToPerp",
+                "TransferToSpot",
+            ],
+        ),
         proposal_id: extract_i64(&action_type, inner_ref, "proposal_id", &["Vote"]),
         payload: serde_json::to_string(action).unwrap_or_default(),
     }
@@ -319,17 +351,23 @@ fn parse_hex_i128(s: &str) -> i128 {
 }
 
 fn extract_i64(at: &str, inner: Option<&Value>, field: &str, types: &[&str]) -> Option<i64> {
-    if !types.contains(&at) { return None; }
+    if !types.contains(&at) {
+        return None;
+    }
     inner?.get(field).and_then(|v| v.as_i64())
 }
 
 fn extract_str(at: &str, inner: Option<&Value>, field: &str, types: &[&str]) -> Option<String> {
-    if !types.contains(&at) { return None; }
+    if !types.contains(&at) {
+        return None;
+    }
     inner?.get(field).and_then(|v| v.as_str()).map(String::from)
 }
 
 fn extract_val_str(at: &str, inner: Option<&Value>, field: &str, types: &[&str]) -> Option<String> {
-    if !types.contains(&at) { return None; }
+    if !types.contains(&at) {
+        return None;
+    }
     inner?.get(field).map(|v| v.to_string())
 }
 
@@ -394,20 +432,38 @@ mod tests {
     fn indexer_reorg_flow() {
         let db = ExplorerDb::open_in_memory().unwrap();
         let block = BlockRow {
-            height: 10, hash: "0xAAAA".into(), parent_hash: "0x0009".into(),
-            timestamp: 1000, proposer: "0xprop".into(), gas_used: 0,
-            gas_limit: 30_000_000, base_fee: 0, tx_count: 1,
-            native_action_count: 0, epoch: 0,
-            validator_set_hash: String::new(), state_root: String::new(),
+            height: 10,
+            hash: "0xAAAA".into(),
+            parent_hash: "0x0009".into(),
+            timestamp: 1000,
+            proposer: "0xprop".into(),
+            gas_used: 0,
+            gas_limit: 30_000_000,
+            base_fee: 0,
+            tx_count: 1,
+            native_action_count: 0,
+            epoch: 0,
+            validator_set_hash: String::new(),
+            state_root: String::new(),
         };
         db.insert_block(&block).unwrap();
         db.insert_transaction(&TxRow {
-            hash: "0xtx_old".into(), block_height: 10, tx_index: 0,
-            from_addr: "0xfrom".into(), to_addr: None, value: "0x0".into(),
-            gas_limit: 21000, gas_used: 21000, gas_price: "0x0".into(),
-            input_data: "0x".into(), nonce: 0, status: true,
-            contract_address: None, tx_type: 0,
-        }).unwrap();
+            hash: "0xtx_old".into(),
+            block_height: 10,
+            tx_index: 0,
+            from_addr: "0xfrom".into(),
+            to_addr: None,
+            value: "0x0".into(),
+            gas_limit: 21000,
+            gas_used: 21000,
+            gas_price: "0x0".into(),
+            input_data: "0x".into(),
+            nonce: 0,
+            status: true,
+            contract_address: None,
+            tx_type: 0,
+        })
+        .unwrap();
         assert!(db.get_block(10).unwrap().is_some());
         db.delete_block_data(10).unwrap();
         assert!(db.get_block(10).unwrap().is_none());

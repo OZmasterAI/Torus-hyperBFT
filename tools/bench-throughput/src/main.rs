@@ -39,7 +39,10 @@ const HARDHAT_KEYS: [&str; 20] = [
 ];
 
 #[derive(Parser)]
-#[command(name = "bench-throughput", about = "Torus-hyperBFT throughput benchmarking tool")]
+#[command(
+    name = "bench-throughput",
+    about = "Torus-hyperBFT throughput benchmarking tool"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -58,7 +61,10 @@ enum Command {
         genesis: String,
     },
     Consensus {
-        #[arg(long, default_value = "http://localhost:8545,http://localhost:8546,http://localhost:8547,http://localhost:8548")]
+        #[arg(
+            long,
+            default_value = "http://localhost:8545,http://localhost:8546,http://localhost:8547,http://localhost:8548"
+        )]
         rpc_urls: String,
         /// Number of distinct signing senders. Defaults to 20 — the hardhat market-maker
         /// accounts pre-funded with a native balance in genesis (`native_balances`). Orders
@@ -113,7 +119,10 @@ enum Command {
         markets: u64,
     },
     Combined {
-        #[arg(long, default_value = "http://localhost:8545,http://localhost:8546,http://localhost:8547,http://localhost:8548")]
+        #[arg(
+            long,
+            default_value = "http://localhost:8545,http://localhost:8546,http://localhost:8547,http://localhost:8548"
+        )]
         rpc_urls: String,
         #[arg(long, default_value_t = 100)]
         senders: usize,
@@ -472,7 +481,10 @@ fn run_matching_engine(orders: usize, markets: u64, warmup: usize, genesis_path:
 
     if market_count > 1 {
         println!();
-        println!("--- Per-market breakdown (single batch of {}) ---", format_num(orders as u64));
+        println!(
+            "--- Per-market breakdown (single batch of {}) ---",
+            format_num(orders as u64)
+        );
 
         for m in 0..market_count.min(4) {
             let actions: Vec<(Address, NativeAction)> = (0..orders)
@@ -655,7 +667,9 @@ async fn submit_native_actions_batch(
     if let Some(err) = resp.get("error") {
         return Err(format!(
             "rpc: {}",
-            err.get("message").and_then(|m| m.as_str()).unwrap_or("unknown")
+            err.get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("unknown")
         ));
     }
     let items = resp["result"].as_array();
@@ -666,7 +680,10 @@ async fn submit_native_actions_batch(
         // Surface WHY nothing landed — a per-item error or an unexpected shape.
         // A silent 0-accepted is exactly the misread session signing exists to avoid.
         let reason = items
-            .and_then(|its| its.iter().find_map(|i| i.get("error").map(|e| e.to_string())))
+            .and_then(|its| {
+                its.iter()
+                    .find_map(|i| i.get("error").map(|e| e.to_string()))
+            })
             .unwrap_or_else(|| resp["result"].to_string());
         return Err(format!("0 accepted ({} sent): {reason}", payloads.len()));
     }
@@ -735,7 +752,9 @@ async fn submit_native_action(
     if let Some(err) = resp.get("error") {
         return Err(format!(
             "rpc: {}",
-            err.get("message").and_then(|m| m.as_str()).unwrap_or("unknown")
+            err.get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("unknown")
         ));
     }
     Ok(())
@@ -748,7 +767,15 @@ async fn fetch_block_number(client: &reqwest::Client, url: &str) -> Option<u64> 
         "params": [],
         "id": 1
     });
-    let resp: serde_json::Value = client.post(url).json(&body).send().await.ok()?.json().await.ok()?;
+    let resp: serde_json::Value = client
+        .post(url)
+        .json(&body)
+        .send()
+        .await
+        .ok()?
+        .json()
+        .await
+        .ok()?;
     let hex_str = resp["result"].as_str()?;
     let s = hex_str.strip_prefix("0x").unwrap_or(hex_str);
     u64::from_str_radix(s, 16).ok()
@@ -779,7 +806,15 @@ async fn fetch_block_body(
         "params": [block_number],
         "id": 1
     });
-    let resp: serde_json::Value = client.post(url).json(&body).send().await.ok()?.json().await.ok()?;
+    let resp: serde_json::Value = client
+        .post(url)
+        .json(&body)
+        .send()
+        .await
+        .ok()?
+        .json()
+        .await
+        .ok()?;
     let result = resp.get("result")?;
     // Prefer the action list: identities enable cross-block dedup (the
     // "included" metric otherwise overcounts ~3x under 3-chain commit lag).
@@ -989,7 +1024,10 @@ async fn run_consensus(
     sign_mode: SignMode,
     markets: u64,
 ) {
-    let rpc_urls: Vec<String> = rpc_urls_str.split(',').map(|s| s.trim().to_string()).collect();
+    let rpc_urls: Vec<String> = rpc_urls_str
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .collect();
     let num_senders = senders.max(1);
     let keys = load_sender_keys(num_senders, sender_offset);
     let orders_per_action = batch_size.max(1) as u64;
@@ -1133,8 +1171,16 @@ async fn run_consensus(
             handles.push(tokio::task::spawn_blocking(move || {
                 let mut rng = StdRng::from_entropy();
                 pregen_ammo(
-                    &mut rng, &key, &session, sign_mode, batch_size, submit_batch, pre_sign, bin,
-                    base_nonce, markets,
+                    &mut rng,
+                    &key,
+                    &session,
+                    sign_mode,
+                    batch_size,
+                    submit_batch,
+                    pre_sign,
+                    bin,
+                    base_nonce,
+                    markets,
                 )
             }));
         }
@@ -1239,14 +1285,23 @@ async fn run_consensus(
                 let elapsed = mon_start.elapsed().as_secs_f64();
                 let sub = mon_submitted.load(Ordering::Relaxed);
                 let inc = mon_included.load(Ordering::Relaxed);
-                let sub_rate = if elapsed > 0.0 { sub as f64 / elapsed } else { 0.0 };
-                let inc_rate = if elapsed > 0.0 { inc as f64 / elapsed } else { 0.0 };
+                let sub_rate = if elapsed > 0.0 {
+                    sub as f64 / elapsed
+                } else {
+                    0.0
+                };
+                let inc_rate = if elapsed > 0.0 {
+                    inc as f64 / elapsed
+                } else {
+                    0.0
+                };
                 let avg_blk_ms = {
                     let stats = block_stats.lock().await;
                     if stats.block_times.is_empty() {
                         0.0
                     } else {
-                        stats.block_times.iter().sum::<f64>() / stats.block_times.len() as f64 * 1000.0
+                        stats.block_times.iter().sum::<f64>() / stats.block_times.len() as f64
+                            * 1000.0
                     }
                 };
 
@@ -1434,9 +1489,14 @@ async fn run_consensus(
             // waiting (the 120s cap bounds a genuinely stuck chain).
             _ => continue,
         };
-        let delta =
-            sweep_block_bodies(client.clone(), rpc_urls.clone(), end_block, cur, concurrency)
-                .await;
+        let delta = sweep_block_bodies(
+            client.clone(),
+            rpc_urls.clone(),
+            end_block,
+            cur,
+            concurrency,
+        )
+        .await;
         let drained: u64 = delta.iter().map(|(_, c, _)| c).sum();
         if drained == 0 {
             quiet_extensions += 1;
@@ -1477,8 +1537,16 @@ async fn run_consensus(
     };
 
     let elapsed_secs = total_elapsed.as_secs_f64();
-    let submit_rate = if elapsed_secs > 0.0 { final_submitted as f64 / elapsed_secs } else { 0.0 };
-    let include_rate = if elapsed_secs > 0.0 { final_included as f64 / elapsed_secs } else { 0.0 };
+    let submit_rate = if elapsed_secs > 0.0 {
+        final_submitted as f64 / elapsed_secs
+    } else {
+        0.0
+    };
+    let include_rate = if elapsed_secs > 0.0 {
+        final_included as f64 / elapsed_secs
+    } else {
+        0.0
+    };
     let drop_rate = if final_submitted > 0 {
         (1.0 - final_included as f64 / final_submitted as f64) * 100.0
     } else {
@@ -1748,14 +1816,17 @@ mod tests {
         let key = k256::ecdsa::SigningKey::from_slice(&[0x11; 32]).unwrap();
         let ed = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]);
         let (p1, n1) = sign_payload_batch(&mut rng, &key, &ed, SignMode::Eip712, 3, 4, 0, false, 1);
-        let (p2, n2) = sign_payload_batch(&mut rng, &key, &ed, SignMode::Eip712, 3, 4, n1, false, 1);
+        let (p2, n2) =
+            sign_payload_batch(&mut rng, &key, &ed, SignMode::Eip712, 3, 4, n1, false, 1);
         assert_eq!(p1.len(), 4);
         assert_eq!(p2.len(), 4);
         assert!(n2 > n1, "nonce watermark must advance across batches");
         let dec = |p: &String| -> u64 {
             let bytes = hex::decode(p.trim_start_matches("0x")).unwrap();
             let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-            v["nonce"].as_u64().expect("signed action has a numeric nonce")
+            v["nonce"]
+                .as_u64()
+                .expect("signed action has a numeric nonce")
         };
         let nonces: Vec<u64> = p1.iter().chain(p2.iter()).map(dec).collect();
         for w in nonces.windows(2) {
@@ -1796,14 +1867,30 @@ mod tests {
         // a wall-clock nonce would mask it). 3 payloads x 10 actions = 30-action
         // stream, expected nonces BASE..BASE+30.
         const BASE: u64 = 1_700_000_000_000;
-        let ammo = pregen_ammo(&mut rng, &key, &ed, SignMode::Eip712, 1, 10, 3, false, BASE, 1);
+        let ammo = pregen_ammo(
+            &mut rng,
+            &key,
+            &ed,
+            SignMode::Eip712,
+            1,
+            10,
+            3,
+            false,
+            BASE,
+            1,
+        );
         assert_eq!(ammo.len(), 3, "one payload-vec per requested count");
-        assert!(ammo.iter().all(|p| p.len() == 10), "each payload carries submit_batch actions");
+        assert!(
+            ammo.iter().all(|p| p.len() == 10),
+            "each payload carries submit_batch actions"
+        );
 
         let dec = |p: &String| -> u64 {
             let bytes = hex::decode(p.trim_start_matches("0x")).unwrap();
             let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-            v["nonce"].as_u64().expect("signed action has a numeric nonce")
+            v["nonce"]
+                .as_u64()
+                .expect("signed action has a numeric nonce")
         };
         let nonces: Vec<u64> = ammo.iter().flatten().map(dec).collect();
         assert_eq!(nonces.len(), 30, "3 payloads x 10 actions");
@@ -1823,9 +1910,18 @@ mod tests {
             (iv.expect("rate>0 must pace").as_secs_f64() - secs).abs() < 1e-9
         };
         // actions/s with actions/fire -> seconds/fire (submit_batch / rate).
-        assert!(approx(fire_interval(10, 100), 0.100), "100 a/s, 10/fire => 100ms/fire");
-        assert!(approx(fire_interval(10, 200), 0.050), "200 a/s, 10/fire => 50ms/fire");
-        assert!(approx(fire_interval(1, 1000), 0.001), "1000 a/s, 1/fire => 1ms/fire");
+        assert!(
+            approx(fire_interval(10, 100), 0.100),
+            "100 a/s, 10/fire => 100ms/fire"
+        );
+        assert!(
+            approx(fire_interval(10, 200), 0.050),
+            "200 a/s, 10/fire => 50ms/fire"
+        );
+        assert!(
+            approx(fire_interval(1, 1000), 0.001),
+            "1000 a/s, 1/fire => 1ms/fire"
+        );
     }
 
     #[test]

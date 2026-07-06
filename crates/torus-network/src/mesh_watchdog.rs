@@ -155,16 +155,11 @@ mod tests {
         wd.tick(t0, &ps, &none);
         assert_eq!(wd.tracked(), 1);
         // Subscription arrives late but within grace: tracking cleared.
-        assert!(wd
-            .tick(t0 + Duration::from_secs(30), &ps, &all)
-            .is_empty());
+        assert!(wd.tick(t0 + Duration::from_secs(30), &ps, &all).is_empty());
         assert_eq!(wd.tracked(), 0);
         // Flaps back to unsubscribed: grace restarts from scratch.
         assert!(wd.tick(t0 + WATCHDOG_GRACE, &ps, &none).is_empty());
-        assert_eq!(
-            wd.tick(t0 + WATCHDOG_GRACE * 2, &ps, &none),
-            ps
-        );
+        assert_eq!(wd.tick(t0 + WATCHDOG_GRACE * 2, &ps, &none), ps);
     }
 
     #[test]
@@ -174,9 +169,6 @@ mod tests {
         let subscribed: HashSet<PeerId> = [ps[0], ps[1]].into_iter().collect();
         let t0 = Instant::now();
         wd.tick(t0, &ps, &subscribed);
-        assert_eq!(
-            wd.tick(t0 + WATCHDOG_GRACE, &ps, &subscribed),
-            vec![ps[2]]
-        );
+        assert_eq!(wd.tick(t0 + WATCHDOG_GRACE, &ps, &subscribed), vec![ps[2]]);
     }
 }

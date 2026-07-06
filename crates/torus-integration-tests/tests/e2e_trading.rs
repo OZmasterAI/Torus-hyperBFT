@@ -9,9 +9,7 @@ use alloy_primitives::Address;
 use jsonrpsee::core::client::ClientT;
 use jsonrpsee::core::params::ObjectParams;
 use torus_bridge::native_executor::NativeExecutor;
-use torus_types::{
-    FixedPoint, NativeAction, OrderType, PlaceOrderParams, TimeInForce, U256,
-};
+use torus_types::{FixedPoint, NativeAction, OrderType, PlaceOrderParams, TimeInForce, U256};
 
 use crate::common::TestHarness;
 
@@ -66,20 +64,36 @@ fn test_full_order_lifecycle() {
     h.fund_native(&trader_b, TestHarness::fp(100_000));
 
     // Place buy at 50000, qty 1
-    let r1 = NativeExecutor::execute(&mut ctx, &trader_a, &buy_order(market, TestHarness::fp(50000), TestHarness::fp(1)));
+    let r1 = NativeExecutor::execute(
+        &mut ctx,
+        &trader_a,
+        &buy_order(market, TestHarness::fp(50000), TestHarness::fp(1)),
+    );
     assert!(r1.success, "buy order should succeed");
 
     // Place matching sell at 50000, qty 1
-    let r2 = NativeExecutor::execute(&mut ctx, &trader_b, &sell_order(market, TestHarness::fp(50000), TestHarness::fp(1)));
+    let r2 = NativeExecutor::execute(
+        &mut ctx,
+        &trader_b,
+        &sell_order(market, TestHarness::fp(50000), TestHarness::fp(1)),
+    );
     assert!(r2.success, "sell order should succeed");
 
     // Both traders should have positions
-    let pos_a = h.positions.get_position(&trader_a, market).unwrap().expect("trader_a position");
+    let pos_a = h
+        .positions
+        .get_position(&trader_a, market)
+        .unwrap()
+        .expect("trader_a position");
     assert!(pos_a.is_long);
     assert_eq!(pos_a.size, TestHarness::fp(1));
     assert_eq!(pos_a.entry_price, TestHarness::fp(50000));
 
-    let pos_b = h.positions.get_position(&trader_b, market).unwrap().expect("trader_b position");
+    let pos_b = h
+        .positions
+        .get_position(&trader_b, market)
+        .unwrap()
+        .expect("trader_b position");
     assert!(!pos_b.is_long);
     assert_eq!(pos_b.size, TestHarness::fp(1));
     assert_eq!(pos_b.entry_price, TestHarness::fp(50000));
@@ -98,23 +112,42 @@ fn test_partial_fill() {
     h.fund_native(&seller, TestHarness::fp(1_000_000));
 
     // Place large buy: 10 units at 50000
-    NativeExecutor::execute(&mut ctx, &buyer, &buy_order(market, TestHarness::fp(50000), TestHarness::fp(10)));
+    NativeExecutor::execute(
+        &mut ctx,
+        &buyer,
+        &buy_order(market, TestHarness::fp(50000), TestHarness::fp(10)),
+    );
 
     // Match with smaller sell: 3 units at 50000
-    NativeExecutor::execute(&mut ctx, &seller, &sell_order(market, TestHarness::fp(50000), TestHarness::fp(3)));
+    NativeExecutor::execute(
+        &mut ctx,
+        &seller,
+        &sell_order(market, TestHarness::fp(50000), TestHarness::fp(3)),
+    );
 
     // Buyer should have a position for 3 filled units
-    let pos_buyer = h.positions.get_position(&buyer, market).unwrap().expect("buyer position");
+    let pos_buyer = h
+        .positions
+        .get_position(&buyer, market)
+        .unwrap()
+        .expect("buyer position");
     assert!(pos_buyer.is_long);
     assert_eq!(pos_buyer.size, TestHarness::fp(3));
 
     // Seller should also have 3
-    let pos_seller = h.positions.get_position(&seller, market).unwrap().expect("seller position");
+    let pos_seller = h
+        .positions
+        .get_position(&seller, market)
+        .unwrap()
+        .expect("seller position");
     assert_eq!(pos_seller.size, TestHarness::fp(3));
 
     // The remaining 7 units should still be resting on the book
     let book = ctx.order_books.get(&market).expect("order book exists");
-    assert!(book.best_bid().is_some(), "resting buy orders should remain");
+    assert!(
+        book.best_bid().is_some(),
+        "resting buy orders should remain"
+    );
 }
 
 /// Cancel order: place then cancel, verify gone from book.
@@ -128,7 +161,11 @@ fn test_cancel_order() {
     h.fund_native(&trader, TestHarness::fp(100_000));
 
     // Place a GTC buy order
-    let r = NativeExecutor::execute(&mut ctx, &trader, &buy_order(market, TestHarness::fp(45000), TestHarness::fp(2)));
+    let r = NativeExecutor::execute(
+        &mut ctx,
+        &trader,
+        &buy_order(market, TestHarness::fp(45000), TestHarness::fp(2)),
+    );
     assert!(r.success);
 
     // The order should be resting (no matching sell)
@@ -145,7 +182,10 @@ fn test_cancel_order() {
 
     // Book should be empty now
     let book = ctx.order_books.get(&market).unwrap();
-    assert!(book.best_bid().is_none(), "bids should be empty after cancel");
+    assert!(
+        book.best_bid().is_none(),
+        "bids should be empty after cancel"
+    );
 
     // No position should exist (order was never filled)
     assert!(h.positions.get_position(&trader, market).unwrap().is_none());
@@ -166,13 +206,29 @@ fn test_multiple_markets() {
     let market_2 = 2u64;
 
     // Place buy on market 1
-    NativeExecutor::execute(&mut ctx, &trader_a, &buy_order(market_1, TestHarness::fp(50000), TestHarness::fp(5)));
+    NativeExecutor::execute(
+        &mut ctx,
+        &trader_a,
+        &buy_order(market_1, TestHarness::fp(50000), TestHarness::fp(5)),
+    );
     // Place sell on market 2 (should NOT match the buy on market 1)
-    NativeExecutor::execute(&mut ctx, &trader_b, &sell_order(market_2, TestHarness::fp(50000), TestHarness::fp(5)));
+    NativeExecutor::execute(
+        &mut ctx,
+        &trader_b,
+        &sell_order(market_2, TestHarness::fp(50000), TestHarness::fp(5)),
+    );
 
     // Neither should have positions (orders are on different markets)
-    assert!(h.positions.get_position(&trader_a, market_1).unwrap().is_none());
-    assert!(h.positions.get_position(&trader_b, market_2).unwrap().is_none());
+    assert!(h
+        .positions
+        .get_position(&trader_a, market_1)
+        .unwrap()
+        .is_none());
+    assert!(h
+        .positions
+        .get_position(&trader_b, market_2)
+        .unwrap()
+        .is_none());
 
     // Both books should have resting orders
     assert!(!ctx.order_books.get(&market_1).unwrap().best_bid().is_none());
@@ -192,8 +248,14 @@ fn test_batch_execution() {
     h.fund_native(&trader_b, TestHarness::fp(1_000_000));
 
     let actions: Vec<(Address, NativeAction)> = vec![
-        (trader_a, buy_order(market, TestHarness::fp(50000), TestHarness::fp(5)).clone()),
-        (trader_b, sell_order(market, TestHarness::fp(50000), TestHarness::fp(5)).clone()),
+        (
+            trader_a,
+            buy_order(market, TestHarness::fp(50000), TestHarness::fp(5)).clone(),
+        ),
+        (
+            trader_b,
+            sell_order(market, TestHarness::fp(50000), TestHarness::fp(5)).clone(),
+        ),
     ];
 
     let batch_result = NativeExecutor::execute_batch(&mut ctx, &actions);
@@ -202,8 +264,16 @@ fn test_batch_execution() {
     assert!(batch_result.results[1].success);
 
     // Both positions should exist from the match
-    let pos_a = h.positions.get_position(&trader_a, market).unwrap().expect("position a");
-    let pos_b = h.positions.get_position(&trader_b, market).unwrap().expect("position b");
+    let pos_a = h
+        .positions
+        .get_position(&trader_a, market)
+        .unwrap()
+        .expect("position a");
+    let pos_b = h
+        .positions
+        .get_position(&trader_b, market)
+        .unwrap()
+        .expect("position b");
     assert_eq!(pos_a.size, TestHarness::fp(5));
     assert_eq!(pos_b.size, TestHarness::fp(5));
 }
@@ -221,11 +291,23 @@ async fn test_rpc_position_consistency() {
     h.fund_native(&trader_b, TestHarness::fp(100_000));
 
     // Execute matching orders
-    NativeExecutor::execute(&mut ctx, &trader_a, &buy_order(market, TestHarness::fp(50000), TestHarness::fp(2)));
-    NativeExecutor::execute(&mut ctx, &trader_b, &sell_order(market, TestHarness::fp(50000), TestHarness::fp(2)));
+    NativeExecutor::execute(
+        &mut ctx,
+        &trader_a,
+        &buy_order(market, TestHarness::fp(50000), TestHarness::fp(2)),
+    );
+    NativeExecutor::execute(
+        &mut ctx,
+        &trader_b,
+        &sell_order(market, TestHarness::fp(50000), TestHarness::fp(2)),
+    );
 
     // Verify position exists in DB
-    let pos = h.positions.get_position(&trader_a, market).unwrap().expect("position");
+    let pos = h
+        .positions
+        .get_position(&trader_a, market)
+        .unwrap()
+        .expect("position");
     assert_eq!(pos.size, TestHarness::fp(2));
 
     // Start RPC and query the same position

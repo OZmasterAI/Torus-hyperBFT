@@ -239,8 +239,7 @@ mod tests {
     fn wait_for_arrival_returns_on_timeout() {
         let seen = NativeDaStore::arrival_generation();
         let start = std::time::Instant::now();
-        let new_gen =
-            NativeDaStore::wait_for_arrival(seen, std::time::Duration::from_millis(30));
+        let new_gen = NativeDaStore::wait_for_arrival(seen, std::time::Duration::from_millis(30));
         assert!(new_gen >= seen, "generation never regresses");
         assert!(
             start.elapsed() < std::time::Duration::from_millis(1_500),

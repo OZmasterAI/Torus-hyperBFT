@@ -283,7 +283,10 @@ mod tests {
             1.0
         );
         assert!((sample(&text, "torus_view_proposal_arrival_seconds_sum") - 0.03).abs() < 1e-9);
-        assert_eq!(sample(&text, "torus_view_insert_persist_seconds_count"), 1.0);
+        assert_eq!(
+            sample(&text, "torus_view_insert_persist_seconds_count"),
+            1.0
+        );
         assert!((sample(&text, "torus_view_insert_persist_seconds_sum") - 0.04).abs() < 1e-9);
         assert_eq!(sample(&text, "torus_view_vote_delay_seconds_count"), 1.0);
         assert!((sample(&text, "torus_view_vote_delay_seconds_sum") - 0.05).abs() < 1e-9);
@@ -308,7 +311,10 @@ mod tests {
         );
         assert_eq!(sample(&text, "torus_view_vote_delay_seconds_count"), 1.0);
         assert!((sample(&text, "torus_view_vote_delay_seconds_sum") - 0.05).abs() < 1e-9);
-        assert_eq!(sample(&text, "torus_view_insert_persist_seconds_count"), 1.0);
+        assert_eq!(
+            sample(&text, "torus_view_insert_persist_seconds_count"),
+            1.0
+        );
         assert!((sample(&text, "torus_view_insert_persist_seconds_sum") - 0.09).abs() < 1e-9);
     }
 
@@ -327,7 +333,10 @@ mod tests {
             1.0
         );
         assert!((sample(&text, "torus_view_proposal_arrival_seconds_sum") - 0.03).abs() < 1e-9);
-        assert_eq!(sample(&text, "torus_view_insert_persist_seconds_count"), 1.0);
+        assert_eq!(
+            sample(&text, "torus_view_insert_persist_seconds_count"),
+            1.0
+        );
         assert!((sample(&text, "torus_view_insert_persist_seconds_sum") - 0.1).abs() < 1e-9);
     }
 
@@ -337,7 +346,10 @@ mod tests {
         r.start_view(t(0), 1);
         r.insert_block(t(40));
         let text = m.encode();
-        assert_eq!(sample(&text, "torus_view_insert_persist_seconds_count"), 0.0);
+        assert_eq!(
+            sample(&text, "torus_view_insert_persist_seconds_count"),
+            0.0
+        );
     }
 
     /// S405 propose decomposition: on the leader, InsertBlock (own block, no
@@ -360,7 +372,10 @@ mod tests {
         // Total still observed as before.
         assert!((sample(&text, "torus_view_propose_delay_seconds_sum") - 0.13).abs() < 1e-9);
         // Follower insert metric untouched by the leader path.
-        assert_eq!(sample(&text, "torus_view_insert_persist_seconds_count"), 0.0);
+        assert_eq!(
+            sample(&text, "torus_view_insert_persist_seconds_count"),
+            0.0
+        );
     }
 
     /// A sync insert (no proposal, no subsequent Propose in the view) must not

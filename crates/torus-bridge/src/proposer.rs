@@ -10,7 +10,9 @@ use torus_types::{Receipt, SignedNativeAction, TorusBlock, TorusBlockHeader};
 
 use crate::decode::{decode_all_txs, DecodedTx};
 use crate::error::BridgeError;
-use crate::state_root::{compute_full_composite_root, compute_post_bundle_state_root, flagged_native_root};
+use crate::state_root::{
+    compute_full_composite_root, compute_post_bundle_state_root, flagged_native_root,
+};
 
 /// Result of a block proposal.
 pub struct ProposedBlock {
@@ -42,7 +44,14 @@ impl BlockProposer {
         treasury_address: Address,
         dev_pool_address: Address,
     ) -> Self {
-        Self { chain_id, epoch_length, max_validators, treasury_address, dev_pool_address, metrics: None }
+        Self {
+            chain_id,
+            epoch_length,
+            max_validators,
+            treasury_address,
+            dev_pool_address,
+            metrics: None,
+        }
     }
 
     /// Build a block from the given EVM transactions.
@@ -91,7 +100,10 @@ impl BlockProposer {
 
         // 5. Filter to only include successfully executed txs.
         let included = &exec_result.included_indices;
-        let evm_transactions: Vec<Vec<u8>> = included.iter().map(|&i| evm_transactions[i].clone()).collect();
+        let evm_transactions: Vec<Vec<u8>> = included
+            .iter()
+            .map(|&i| evm_transactions[i].clone())
+            .collect();
         let included_decoded: Vec<_> = included.iter().map(|&i| &decoded_txs[i]).collect();
         if included.len() < decoded_txs.len() {
             tracing::warn!(
@@ -132,7 +144,10 @@ impl BlockProposer {
                 native_action_count: 0,
                 evm_tx_count: evm_transactions.len() as u32,
                 base_fee_per_gas: next_base_fee,
-                epoch: torus_economics::EpochManager::epoch_for_block(block_height, self.epoch_length),
+                epoch: torus_economics::EpochManager::epoch_for_block(
+                    block_height,
+                    self.epoch_length,
+                ),
                 validator_set_hash: parent.validator_set_hash,
                 sig_attestation: [0u8; 64],
             },
@@ -214,7 +229,10 @@ impl BlockProposer {
         let mut exec_result = evm_executor.execute_block(state_db, &block_cfg, tx_envs, true)?;
 
         let included = &exec_result.included_indices;
-        let evm_transactions: Vec<Vec<u8>> = included.iter().map(|&i| evm_transactions[i].clone()).collect();
+        let evm_transactions: Vec<Vec<u8>> = included
+            .iter()
+            .map(|&i| evm_transactions[i].clone())
+            .collect();
         let included_decoded: Vec<_> = included.iter().map(|&i| &decoded_txs[i]).collect();
         if included.len() < decoded_txs.len() {
             tracing::warn!(
@@ -251,7 +269,10 @@ impl BlockProposer {
                 native_action_count: signed_native_actions.len() as u32,
                 evm_tx_count: evm_transactions.len() as u32,
                 base_fee_per_gas: next_base_fee,
-                epoch: torus_economics::EpochManager::epoch_for_block(block_height, self.epoch_length),
+                epoch: torus_economics::EpochManager::epoch_for_block(
+                    block_height,
+                    self.epoch_length,
+                ),
                 validator_set_hash: parent.validator_set_hash,
                 sig_attestation: [0u8; 64],
             },
@@ -401,7 +422,11 @@ mod tests {
         let other = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
         let actions = vec![make_test_signed_action(1)];
         let att = generate_sig_attestation(&actions, &key);
-        assert!(!verify_sig_attestation(&actions, &att, &other.verifying_key()));
+        assert!(!verify_sig_attestation(
+            &actions,
+            &att,
+            &other.verifying_key()
+        ));
     }
 
     #[test]
@@ -409,12 +434,20 @@ mod tests {
         let key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
         let att = generate_sig_attestation(&[], &key);
         assert_eq!(att, [0u8; 64]);
-        assert!(verify_sig_attestation(&[], &[0u8; 64], &key.verifying_key()));
+        assert!(verify_sig_attestation(
+            &[],
+            &[0u8; 64],
+            &key.verifying_key()
+        ));
     }
 
     #[test]
     fn empty_actions_nonzero_attestation_fails() {
         let key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
-        assert!(!verify_sig_attestation(&[], &[1u8; 64], &key.verifying_key()));
+        assert!(!verify_sig_attestation(
+            &[],
+            &[1u8; 64],
+            &key.verifying_key()
+        ));
     }
 }

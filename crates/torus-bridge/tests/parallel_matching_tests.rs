@@ -7,9 +7,7 @@ use torus_bridge::native_executor::{NativeExecContext, NativeExecutor};
 use torus_core::order_book::OrderBook;
 use torus_core::position::NativeBalance;
 use torus_state::StateDb;
-use torus_types::{
-    FixedPoint, MarketId, NativeAction, OrderType, PlaceOrderParams, TimeInForce,
-};
+use torus_types::{FixedPoint, MarketId, NativeAction, OrderType, PlaceOrderParams, TimeInForce};
 
 use std::collections::HashMap;
 
@@ -32,12 +30,12 @@ fn fp(v: i64) -> FixedPoint {
 fn make_ctx(state_db: StateDb) -> NativeExecContext {
     NativeExecContext::new(
         state_db,
-        1,        // block_height
-        1000,     // timestamp
-        0,        // epoch
-        100,      // epoch_length
-        10,       // max_validators
-        addr(99), // proposer
+        1,         // block_height
+        1000,      // timestamp
+        0,         // epoch
+        100,       // epoch_length
+        10,        // max_validators
+        addr(99),  // proposer
         addr(100), // treasury
         addr(101), // dev_pool
     )
@@ -103,9 +101,21 @@ fn parallel_matching_deterministic_same_as_sequential() {
     let parallel_result = NativeExecutor::execute_batch(&mut ctx, &actions);
 
     // All should succeed
-    assert!(parallel_result.results[0].success, "order 0 failed: {:?}", parallel_result.results[0].error);
-    assert!(parallel_result.results[1].success, "order 1 failed: {:?}", parallel_result.results[1].error);
-    assert!(parallel_result.results[2].success, "order 2 failed: {:?}", parallel_result.results[2].error);
+    assert!(
+        parallel_result.results[0].success,
+        "order 0 failed: {:?}",
+        parallel_result.results[0].error
+    );
+    assert!(
+        parallel_result.results[1].success,
+        "order 1 failed: {:?}",
+        parallel_result.results[1].error
+    );
+    assert!(
+        parallel_result.results[2].success,
+        "order 2 failed: {:?}",
+        parallel_result.results[2].error
+    );
 
     // Now run the same scenario sequentially on a fresh context
     let (_dir2, db2) = open_test_db();
@@ -124,11 +134,9 @@ fn parallel_matching_deterministic_same_as_sequential() {
     // Both should produce same success/failure pattern
     for i in 0..actions.len() {
         assert_eq!(
-            parallel_result.results[i].success,
-            seq_result[i].success,
+            parallel_result.results[i].success, seq_result[i].success,
             "result {i} diverges: parallel={:?} sequential={:?}",
-            parallel_result.results[i],
-            seq_result[i],
+            parallel_result.results[i], seq_result[i],
         );
     }
 
@@ -168,7 +176,11 @@ fn multi_market_fills_settle_correctly() {
     }
 
     // Verify trade_index advanced for fills on both markets
-    assert!(ctx.trade_index >= 2, "expected at least 2 trades, got {}", ctx.trade_index);
+    assert!(
+        ctx.trade_index >= 2,
+        "expected at least 2 trades, got {}",
+        ctx.trade_index
+    );
 
     // Verify order books exist for both markets
     assert!(ctx.order_books.contains_key(&1));
@@ -190,9 +202,8 @@ fn mixed_batch_place_orders_and_other_actions() {
     fund_native(&ctx, &trader_b, fp(500_000));
 
     // First, place a resting order so we can cancel it
-    let setup_actions: Vec<(Address, NativeAction)> = vec![
-        (trader_a, NativeAction::PlaceOrder(limit_buy(1, 50, 1))),
-    ];
+    let setup_actions: Vec<(Address, NativeAction)> =
+        vec![(trader_a, NativeAction::PlaceOrder(limit_buy(1, 50, 1)))];
     let setup = NativeExecutor::execute_batch(&mut ctx, &setup_actions);
     assert!(setup.results[0].success);
 
@@ -210,10 +221,22 @@ fn mixed_batch_place_orders_and_other_actions() {
     let result = NativeExecutor::execute_batch(&mut ctx, &actions);
 
     // Cancel should succeed (order 1 existed)
-    assert!(result.results[0].success, "cancel failed: {:?}", result.results[0].error);
+    assert!(
+        result.results[0].success,
+        "cancel failed: {:?}",
+        result.results[0].error
+    );
     // PlaceOrders should succeed
-    assert!(result.results[1].success, "place buy failed: {:?}", result.results[1].error);
-    assert!(result.results[2].success, "place sell failed: {:?}", result.results[2].error);
+    assert!(
+        result.results[1].success,
+        "place buy failed: {:?}",
+        result.results[1].error
+    );
+    assert!(
+        result.results[2].success,
+        "place sell failed: {:?}",
+        result.results[2].error
+    );
     // ClaimRewards may fail (no staking setup) but shouldn't panic
     assert_eq!(result.results[3].action_type, "claim_rewards");
 }
@@ -242,8 +265,16 @@ fn same_trader_two_markets_margin_reserved() {
     let result = NativeExecutor::execute_batch(&mut ctx, &actions);
 
     // Both should succeed since total margin (100) equals available balance
-    assert!(result.results[0].success, "market 1 order failed: {:?}", result.results[0].error);
-    assert!(result.results[1].success, "market 2 order failed: {:?}", result.results[1].error);
+    assert!(
+        result.results[0].success,
+        "market 1 order failed: {:?}",
+        result.results[0].error
+    );
+    assert!(
+        result.results[1].success,
+        "market 2 order failed: {:?}",
+        result.results[1].error
+    );
 
     // Available balance should be zero (all reserved)
     let bal = ctx.positions.get_native_balance(&trader).unwrap();
@@ -268,8 +299,15 @@ fn same_trader_insufficient_margin_second_order_fails() {
     let result = NativeExecutor::execute_batch(&mut ctx, &actions);
 
     assert!(result.results[0].success, "first order should succeed");
-    assert!(!result.results[1].success, "second order should fail (insufficient margin)");
-    assert!(result.results[1].error.as_ref().unwrap().contains("insufficient margin"));
+    assert!(
+        !result.results[1].success,
+        "second order should fail (insufficient margin)"
+    );
+    assert!(result.results[1]
+        .error
+        .as_ref()
+        .unwrap()
+        .contains("insufficient margin"));
 }
 
 // ============================================================================
@@ -342,7 +380,10 @@ fn worker_pool_multiple_markets_parallel() {
     // Find market 1's result — it should have fills
     let m1 = results.iter().find(|r| r.market_id == 1).unwrap();
     assert_eq!(m1.results.len(), 1);
-    assert!(!m1.results[0].result.fills.is_empty(), "market 1 should have fills");
+    assert!(
+        !m1.results[0].result.fills.is_empty(),
+        "market 1 should have fills"
+    );
 
     // Market 2 and 3 should have no fills (resting)
     let m2 = results.iter().find(|r| r.market_id == 2).unwrap();
@@ -368,11 +409,11 @@ fn result_ordering_matches_input_ordering() {
 
     // Interleave PlaceOrders from different markets with non-PlaceOrder actions
     let actions: Vec<(Address, NativeAction)> = vec![
-        (trader_a, NativeAction::PlaceOrder(limit_buy(1, 100, 5))),   // [0] place
-        (trader_a, NativeAction::CancelOrder { order_id: 999 }),       // [1] cancel (will fail: not found)
-        (trader_b, NativeAction::PlaceOrder(limit_sell(2, 200, 3))),   // [2] place
-        (trader_a, NativeAction::PlaceOrder(limit_buy(2, 200, 3))),   // [3] place (fills with [2])
-        (trader_b, NativeAction::PlaceOrder(limit_sell(1, 100, 5))),  // [4] place (fills with [0])
+        (trader_a, NativeAction::PlaceOrder(limit_buy(1, 100, 5))), // [0] place
+        (trader_a, NativeAction::CancelOrder { order_id: 999 }), // [1] cancel (will fail: not found)
+        (trader_b, NativeAction::PlaceOrder(limit_sell(2, 200, 3))), // [2] place
+        (trader_a, NativeAction::PlaceOrder(limit_buy(2, 200, 3))), // [3] place (fills with [2])
+        (trader_b, NativeAction::PlaceOrder(limit_sell(1, 100, 5))), // [4] place (fills with [0])
     ];
 
     let result = NativeExecutor::execute_batch(&mut ctx, &actions);
@@ -472,7 +513,10 @@ fn place_order_batch_matches_individual_orders() {
         initial_id + 4,
         "batch must consume exactly 4 global order IDs"
     );
-    assert_eq!(ctx_batch.next_global_order_id, ctx_indiv.next_global_order_id);
+    assert_eq!(
+        ctx_batch.next_global_order_id,
+        ctx_indiv.next_global_order_id
+    );
     assert_eq!(ctx_batch.trade_index, ctx_indiv.trade_index);
     assert_eq!(
         ctx_batch
@@ -510,8 +554,16 @@ fn place_order_batch_failure_isolated() {
 
     // Flattened → one result per order.
     assert_eq!(result.results.len(), 3);
-    assert!(result.results[0].success, "order 0: {:?}", result.results[0].error);
-    assert!(result.results[1].success, "order 1: {:?}", result.results[1].error);
+    assert!(
+        result.results[0].success,
+        "order 0: {:?}",
+        result.results[0].error
+    );
+    assert!(
+        result.results[1].success,
+        "order 1: {:?}",
+        result.results[1].error
+    );
     assert!(!result.results[2].success, "order 2 should fail on margin");
     assert!(result.results[2]
         .error
@@ -649,7 +701,11 @@ fn same_sender_multi_market_settle_balance_exact() {
         &mut ctx,
         &[(trader_a, NativeAction::PlaceOrder(limit_buy(1, 100, 1)))],
     );
-    assert!(b2.results[0].success, "batch2 failed: {:?}", b2.results[0].error);
+    assert!(
+        b2.results[0].success,
+        "batch2 failed: {:?}",
+        b2.results[0].error
+    );
     {
         let bal = ctx.positions.get_native_balance(&trader_a).unwrap();
         assert_eq!(bal.available, fp(100_000), "post-open available");
@@ -686,7 +742,11 @@ fn same_sender_multi_market_settle_balance_exact() {
     // (StateDb is Arc<DB>-backed, so ctx writes are immediately visible).
     let pm = torus_core::position::PositionManager::new(db.clone());
     let bal_a = pm.get_native_balance(&trader_a).unwrap();
-    assert_eq!(bal_a.available, fp(99_995), "A available after multi-market settle");
+    assert_eq!(
+        bal_a.available,
+        fp(99_995),
+        "A available after multi-market settle"
+    );
     assert_eq!(
         bal_a.order_margin,
         FixedPoint::ZERO,
@@ -704,7 +764,11 @@ fn same_sender_multi_market_settle_balance_exact() {
         .expect("A must hold a mkt2 position");
     assert!(pos2.is_long, "A's mkt2 position must be long");
     assert_eq!(pos2.size, fp(1), "A's mkt2 position size must be 1");
-    assert_eq!(pos2.entry_price, fp(50), "A's mkt2 entry price must be maker 50");
+    assert_eq!(
+        pos2.entry_price,
+        fp(50),
+        "A's mkt2 entry price must be maker 50"
+    );
 }
 
 // ============================================================================
@@ -732,7 +796,11 @@ fn mixed_batch_pass_fail_pins_partial_per_order_contract() {
     let res = NativeExecutor::execute_batch(&mut ctx_batch, &[(mm, batch)]);
 
     assert_eq!(res.results.len(), 3, "flattened: one result per order");
-    assert!(res.results[0].success, "order 0: {:?}", res.results[0].error);
+    assert!(
+        res.results[0].success,
+        "order 0: {:?}",
+        res.results[0].error
+    );
     assert!(!res.results[1].success, "order 1 must fail on margin");
     assert!(res.results[1]
         .error
@@ -766,8 +834,14 @@ fn mixed_batch_pass_fail_pins_partial_per_order_contract() {
 
     let b = ctx_batch.positions.get_native_balance(&mm).unwrap();
     let s = ctx_singles.positions.get_native_balance(&mm).unwrap();
-    assert_eq!(b.available, s.available, "available: batch == singles minus failed");
-    assert_eq!(b.order_margin, s.order_margin, "reserved margin: batch == singles minus failed");
+    assert_eq!(
+        b.available, s.available,
+        "available: batch == singles minus failed"
+    );
+    assert_eq!(
+        b.order_margin, s.order_margin,
+        "reserved margin: batch == singles minus failed"
+    );
     assert_eq!(
         ctx_batch.next_global_order_id, ctx_singles.next_global_order_id,
         "order-id consumption: batch == singles minus failed"
@@ -801,11 +875,26 @@ fn oversize_batch_skipped_deterministically_sibling_executes() {
 
     // Whole batch skipped at flatten: only the sibling's result exists, only
     // one order id consumed, zero attacker margin reserved.
-    assert_eq!(res.results.len(), 1, "oversize batch must not flatten into results");
-    assert!(res.results[0].success, "sibling: {:?}", res.results[0].error);
-    assert_eq!(ctx.next_global_order_id, id0 + 1, "no ids for the skipped batch");
     assert_eq!(
-        ctx.positions.get_native_balance(&attacker).unwrap().order_margin,
+        res.results.len(),
+        1,
+        "oversize batch must not flatten into results"
+    );
+    assert!(
+        res.results[0].success,
+        "sibling: {:?}",
+        res.results[0].error
+    );
+    assert_eq!(
+        ctx.next_global_order_id,
+        id0 + 1,
+        "no ids for the skipped batch"
+    );
+    assert_eq!(
+        ctx.positions
+            .get_native_balance(&attacker)
+            .unwrap()
+            .order_margin,
         FixedPoint::ZERO,
         "skipped batch must reserve nothing"
     );
@@ -818,6 +907,9 @@ fn oversize_batch_skipped_deterministically_sibling_executes() {
     assert_eq!(res2.results.len(), NATIVE_ORDERS_PER_BATCH_CAP);
 
     // Empty batch: skipped by the same rule (mirrors validate_batch_size).
-    let res3 = NativeExecutor::execute_batch(&mut ctx, &[(attacker, NativeAction::PlaceOrderBatch(vec![]))]);
+    let res3 = NativeExecutor::execute_batch(
+        &mut ctx,
+        &[(attacker, NativeAction::PlaceOrderBatch(vec![]))],
+    );
     assert_eq!(res3.results.len(), 0);
 }

@@ -41,14 +41,32 @@ pub(crate) async fn cmd_claim_rewards(cli: &Cli, rpc: &RpcClient) -> Result<(), 
     submit_native_action(cli, rpc, NativeAction::ClaimRewards).await
 }
 
-pub(crate) async fn cmd_permanent_stake(cli: &Cli, rpc: &RpcClient, amount: &str) -> Result<(), String> {
+pub(crate) async fn cmd_permanent_stake(
+    cli: &Cli,
+    rpc: &RpcClient,
+    amount: &str,
+) -> Result<(), String> {
     let amount_wei = parse_trs_to_wei(amount)?;
-    submit_native_action(cli, rpc, NativeAction::PermanentStake { amount: amount_wei }).await
+    submit_native_action(
+        cli,
+        rpc,
+        NativeAction::PermanentStake { amount: amount_wei },
+    )
+    .await
 }
 
-pub(crate) async fn cmd_top_up_self_stake(cli: &Cli, rpc: &RpcClient, amount: &str) -> Result<(), String> {
+pub(crate) async fn cmd_top_up_self_stake(
+    cli: &Cli,
+    rpc: &RpcClient,
+    amount: &str,
+) -> Result<(), String> {
     let amount_wei = parse_trs_to_wei(amount)?;
-    submit_native_action(cli, rpc, NativeAction::TopUpSelfStake { amount: amount_wei }).await
+    submit_native_action(
+        cli,
+        rpc,
+        NativeAction::TopUpSelfStake { amount: amount_wei },
+    )
+    .await
 }
 
 #[cfg(test)]

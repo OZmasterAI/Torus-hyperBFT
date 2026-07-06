@@ -126,7 +126,7 @@ pub fn compute_native_state_root(
     state_db: &StateDb,
 ) -> Result<B256, torus_state::error::StateError> {
     use torus_state::cf::{
-        CF_NATIVE_BALANCES, CF_NATIVE_ORDER_BOOKS, CF_NATIVE_ORACLE, CF_NATIVE_POSITIONS,
+        CF_NATIVE_BALANCES, CF_NATIVE_ORACLE, CF_NATIVE_ORDER_BOOKS, CF_NATIVE_POSITIONS,
         CF_STAKING_DELEGATIONS, CF_STAKING_VALIDATORS,
     };
 
@@ -179,7 +179,9 @@ fn compute_post_bundle_evm_root(
 
     let mut accounts: BTreeMap<Address, AccountInfo> = BTreeMap::new();
     let cf = state_db.cf_handle(CF_ACCOUNTS)?;
-    let iter = state_db.inner().iterator_cf(cf, rocksdb::IteratorMode::Start);
+    let iter = state_db
+        .inner()
+        .iterator_cf(cf, rocksdb::IteratorMode::Start);
     for item in iter {
         let (key, value) = item?;
         if key.len() != 20 {
@@ -305,6 +307,9 @@ mod tests {
 
         let full = evm_root_routed(&db, &bundle, false).unwrap();
         let incremental = evm_root_routed(&db, &bundle, true).unwrap();
-        assert_eq!(full, incremental, "bridge routing: incremental EVM root must equal full scan");
+        assert_eq!(
+            full, incremental,
+            "bridge routing: incremental EVM root must equal full scan"
+        );
     }
 }

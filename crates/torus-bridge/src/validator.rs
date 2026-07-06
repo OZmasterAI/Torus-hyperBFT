@@ -52,7 +52,14 @@ impl BlockValidator {
         treasury_address: Address,
         dev_pool_address: Address,
     ) -> Self {
-        Self { chain_id, epoch_length, max_validators, treasury_address, dev_pool_address, metrics: None }
+        Self {
+            chain_id,
+            epoch_length,
+            max_validators,
+            treasury_address,
+            dev_pool_address,
+            metrics: None,
+        }
     }
 
     /// Validate a proposed block against the current state.
@@ -134,7 +141,8 @@ impl BlockValidator {
             base_fee: block.header.base_fee_per_gas,
         };
 
-        let mut exec_result = evm_executor.execute_block(state_db, &block_cfg, tx_envs, skip_state_root_check)?;
+        let mut exec_result =
+            evm_executor.execute_block(state_db, &block_cfg, tx_envs, skip_state_root_check)?;
 
         align_receipts(&mut exec_result, &decoded_txs, block.header.height);
 
@@ -154,8 +162,9 @@ impl BlockValidator {
                 )));
             }
 
-            let computed_receipts_root = crate::proposer::compute_receipts_root(&exec_result.receipts)
-                .map_err(|e| BridgeError::Serialization(format!("receipts: {e}")))?;
+            let computed_receipts_root =
+                crate::proposer::compute_receipts_root(&exec_result.receipts)
+                    .map_err(|e| BridgeError::Serialization(format!("receipts: {e}")))?;
             if computed_receipts_root != block.header.receipts_root {
                 return Err(BridgeError::InvalidBlock(format!(
                     "receipts_root mismatch: header={}, computed={}",
@@ -267,8 +276,7 @@ impl BlockValidator {
         // and verify against state_db (the last committed base).
         let mut verification_bundle = merged_parent_bundle.clone();
         merge_bundle_into(&mut verification_bundle, &exec_result.bundle);
-        let computed_root =
-            compute_post_bundle_state_root(state_db, &verification_bundle)?;
+        let computed_root = compute_post_bundle_state_root(state_db, &verification_bundle)?;
 
         if computed_root != block.header.state_root {
             return Err(BridgeError::StateRootMismatch {
@@ -336,13 +344,15 @@ impl BlockValidator {
         let mut sender_actions = Vec::with_capacity(block.native_actions.len());
         let mut consumed_nonces: Vec<(Address, u64)> = Vec::new();
         for (i, signed) in block.native_actions.iter().enumerate() {
-            let sender = signed.resolve_sender(block.header.timestamp, |pubkey| {
-                state_db.get_session(pubkey).ok().flatten()
-            }).map_err(|e| {
-                BridgeError::InvalidBlock(format!(
-                    "native action {i}: signature verification failed: {e}"
-                ))
-            })?;
+            let sender = signed
+                .resolve_sender(block.header.timestamp, |pubkey| {
+                    state_db.get_session(pubkey).ok().flatten()
+                })
+                .map_err(|e| {
+                    BridgeError::InvalidBlock(format!(
+                        "native action {i}: signature verification failed: {e}"
+                    ))
+                })?;
             // Replay check: reject blocks containing replayed nonces.
             let nonce_key = torus_state::cf::native_nonce_key(&sender, signed.nonce);
             if state_db
@@ -379,7 +389,8 @@ impl BlockValidator {
             base_fee: block.header.base_fee_per_gas,
         };
 
-        let mut exec_result = evm_executor.execute_block(state_db, &block_cfg, tx_envs, skip_state_root_check)?;
+        let mut exec_result =
+            evm_executor.execute_block(state_db, &block_cfg, tx_envs, skip_state_root_check)?;
 
         align_receipts(&mut exec_result, &decoded_txs, block.header.height);
 

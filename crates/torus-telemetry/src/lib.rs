@@ -335,8 +335,7 @@ impl Metrics {
             rpc_requests_total.clone(),
         );
 
-        let rpc_request_duration_seconds =
-            Histogram::new(exponential_buckets(0.0001, 2.0, 15));
+        let rpc_request_duration_seconds = Histogram::new(exponential_buckets(0.0001, 2.0, 15));
         registry.register(
             "torus_rpc_request_duration_seconds",
             "RPC request duration in seconds",
@@ -469,8 +468,7 @@ impl Metrics {
             direct_send_failures_untracked.clone(),
         );
 
-        let block_transactions_count =
-            Histogram::new(exponential_buckets(1.0, 2.0, 12));
+        let block_transactions_count = Histogram::new(exponential_buckets(1.0, 2.0, 12));
         registry.register(
             "torus_block_transactions_count",
             "Number of transactions per committed block",

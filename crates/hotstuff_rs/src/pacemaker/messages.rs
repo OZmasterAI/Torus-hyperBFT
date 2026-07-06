@@ -45,9 +45,7 @@ impl PacemakerMessage {
     ) -> PacemakerMessage {
         // Sign the full message including local_tip and highest_qc to prevent
         // MITM substitution of these fields.
-        let message = TimeoutVote::build_message_bytes(
-            chain_id, view, &local_tip, &highest_qc,
-        );
+        let message = TimeoutVote::build_message_bytes(chain_id, view, &local_tip, &highest_qc);
         let signature = keypair.sign(&message);
 
         PacemakerMessage::TimeoutVote(TimeoutVote {

@@ -56,7 +56,9 @@ pub const fn precompile_gas(id: u16) -> u64 {
 /// Convert a precompile ID to a 20-byte Ethereum address.
 pub const fn precompile_address(id: u16) -> Address {
     let b = id.to_be_bytes();
-    Address::new([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, b[0], b[1]])
+    Address::new([
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, b[0], b[1],
+    ])
 }
 
 /// All Torus precompile addresses (for EVM warm-address injection).
@@ -346,20 +348,42 @@ fn order_book_reader(input: &[u8], state_db: &StateDb) -> Result<Vec<u8>, CoreEr
 fn read_order_book(state_db: &StateDb, market_id: MarketId) -> Result<Vec<u8>, CoreError> {
     let key = market_id.to_be_bytes();
     let snapshot = match state_db.get_cf_raw(CF_NATIVE_ORDER_BOOKS, &key)? {
-        Some(data) => OrderBookSnapshot::try_from_slice(&data)
-            .map_err(|e| CoreError::Borsh(e.to_string()))?,
+        Some(data) => {
+            OrderBookSnapshot::try_from_slice(&data).map_err(|e| CoreError::Borsh(e.to_string()))?
+        }
         None => OrderBookSnapshot {
             bids: vec![],
             asks: vec![],
         },
     };
 
-    let bid_prices: Vec<[u8; 32]> = snapshot.bids.iter().map(|l| abi::encode_fp_as_u128(l.price)).collect();
-    let bid_qtys: Vec<[u8; 32]> = snapshot.bids.iter().map(|l| abi::encode_fp_as_u128(l.quantity)).collect();
-    let ask_prices: Vec<[u8; 32]> = snapshot.asks.iter().map(|l| abi::encode_fp_as_u128(l.price)).collect();
-    let ask_qtys: Vec<[u8; 32]> = snapshot.asks.iter().map(|l| abi::encode_fp_as_u128(l.quantity)).collect();
+    let bid_prices: Vec<[u8; 32]> = snapshot
+        .bids
+        .iter()
+        .map(|l| abi::encode_fp_as_u128(l.price))
+        .collect();
+    let bid_qtys: Vec<[u8; 32]> = snapshot
+        .bids
+        .iter()
+        .map(|l| abi::encode_fp_as_u128(l.quantity))
+        .collect();
+    let ask_prices: Vec<[u8; 32]> = snapshot
+        .asks
+        .iter()
+        .map(|l| abi::encode_fp_as_u128(l.price))
+        .collect();
+    let ask_qtys: Vec<[u8; 32]> = snapshot
+        .asks
+        .iter()
+        .map(|l| abi::encode_fp_as_u128(l.quantity))
+        .collect();
 
-    Ok(abi::encode_arrays_response(&[&bid_prices, &bid_qtys, &ask_prices, &ask_qtys]))
+    Ok(abi::encode_arrays_response(&[
+        &bid_prices,
+        &bid_qtys,
+        &ask_prices,
+        &ask_qtys,
+    ]))
 }
 
 /// getPosition → (int128 size, uint128 entry_price, int128 unrealized_pnl, int128 realized_pnl, uint128 margin)
@@ -441,7 +465,12 @@ fn read_open_orders(
         }
     }
 
-    Ok(abi::encode_arrays_response(&[&order_ids, &prices, &quantities, &sides]))
+    Ok(abi::encode_arrays_response(&[
+        &order_ids,
+        &prices,
+        &quantities,
+        &sides,
+    ]))
 }
 
 // ============================================================================
@@ -549,9 +578,7 @@ fn read_oracle_price(
     let key = oracle_agg_key(market_id);
     match state_db.get_cf_raw(CF_NATIVE_ORACLE, &key)? {
         Some(data) if data.len() >= 28 => {
-            let price = FixedPoint::from_raw(i128::from_be_bytes(
-                data[..16].try_into().unwrap(),
-            ));
+            let price = FixedPoint::from_raw(i128::from_be_bytes(data[..16].try_into().unwrap()));
             let block_number = u64::from_be_bytes(data[16..24].try_into().unwrap());
             let stale = current_block.saturating_sub(block_number) > DEFAULT_MAX_ORACLE_AGE;
 
@@ -566,10 +593,7 @@ fn read_oracle_price(
 }
 
 /// getAllPrices → (bytes32[] market_ids, uint128[] prices, bool[] stale_flags)
-fn read_all_oracle_prices(
-    state_db: &StateDb,
-    current_block: u64,
-) -> Result<Vec<u8>, CoreError> {
+fn read_all_oracle_prices(state_db: &StateDb, current_block: u64) -> Result<Vec<u8>, CoreError> {
     let db = state_db.inner();
     let cf = db
         .cf_handle(CF_NATIVE_ORACLE)
@@ -590,9 +614,7 @@ fn read_all_oracle_prices(
         }
         if key.len() == 11 && value.len() >= 28 {
             let mid = u64::from_be_bytes(key[3..11].try_into().unwrap());
-            let price = FixedPoint::from_raw(i128::from_be_bytes(
-                value[..16].try_into().unwrap(),
-            ));
+            let price = FixedPoint::from_raw(i128::from_be_bytes(value[..16].try_into().unwrap()));
             let block_number = u64::from_be_bytes(value[16..24].try_into().unwrap());
             let stale = current_block.saturating_sub(block_number) > DEFAULT_MAX_ORACLE_AGE;
 
@@ -602,7 +624,11 @@ fn read_all_oracle_prices(
         }
     }
 
-    Ok(abi::encode_arrays_response(&[&market_ids, &prices, &stale_flags]))
+    Ok(abi::encode_arrays_response(&[
+        &market_ids,
+        &prices,
+        &stale_flags,
+    ]))
 }
 
 /// Build the oracle aggregated price key: "agg" + market_id(8 BE).
@@ -727,7 +753,11 @@ fn read_validators(state_db: &StateDb) -> Result<Vec<u8>, CoreError> {
         }
     }
 
-    Ok(abi::encode_arrays_response(&[&validators, &stakes, &commissions]))
+    Ok(abi::encode_arrays_response(&[
+        &validators,
+        &stakes,
+        &commissions,
+    ]))
 }
 
 /// Saturating conversion from U256 to u128.
@@ -768,18 +798,24 @@ fn core_writer(
         }
         // OrderType: 0=Limit, 1=Market, 2=StopMarket, 3=StopLimit
         if order_type > 3 {
-            return Err(CoreError::InvalidInput(format!("invalid order_type: {order_type}")));
+            return Err(CoreError::InvalidInput(format!(
+                "invalid order_type: {order_type}"
+            )));
         }
         // TimeInForce: 0=GTC, 1=IOC, 2=FOK, 3=PostOnly
         if time_in_force > 3 {
-            return Err(CoreError::InvalidInput(format!("invalid time_in_force: {time_in_force}")));
+            return Err(CoreError::InvalidInput(format!(
+                "invalid time_in_force: {time_in_force}"
+            )));
         }
         // FIX ECON-FIND-26: Validate u128 fits in i128 before cast (price & quantity)
         if price > i128::MAX as u128 {
             return Err(CoreError::Overflow("order price exceeds i128::MAX".into()));
         }
         if quantity > i128::MAX as u128 {
-            return Err(CoreError::Overflow("order quantity exceeds i128::MAX".into()));
+            return Err(CoreError::Overflow(
+                "order quantity exceeds i128::MAX".into(),
+            ));
         }
 
         let action = QueuedAction {
@@ -842,7 +878,9 @@ fn core_writer_staking(
         let amount = abi::decode_u128(&abi::word(input, 1)?);
         // FIX ECON-FIND-26: Validate u128 fits in i128 before cast
         if amount > i128::MAX as u128 {
-            return Err(CoreError::Overflow("delegate amount exceeds i128::MAX".into()));
+            return Err(CoreError::Overflow(
+                "delegate amount exceeds i128::MAX".into(),
+            ));
         }
 
         let action = QueuedAction {
@@ -860,7 +898,9 @@ fn core_writer_staking(
         let amount = abi::decode_u128(&abi::word(input, 1)?);
         // FIX ECON-FIND-26: Validate u128 fits in i128 before cast
         if amount > i128::MAX as u128 {
-            return Err(CoreError::Overflow("undelegate amount exceeds i128::MAX".into()));
+            return Err(CoreError::Overflow(
+                "undelegate amount exceeds i128::MAX".into(),
+            ));
         }
 
         let action = QueuedAction {
@@ -886,7 +926,9 @@ fn core_writer_staking(
         let amount = abi::decode_u128(&abi::word(input, 0)?);
         // FIX ECON-FIND-26: Validate u128 fits in i128 before cast
         if amount > i128::MAX as u128 {
-            return Err(CoreError::Overflow("lockPermanent amount exceeds i128::MAX".into()));
+            return Err(CoreError::Overflow(
+                "lockPermanent amount exceeds i128::MAX".into(),
+            ));
         }
 
         let action = QueuedAction {
@@ -918,7 +960,9 @@ fn lockbox_precompile(
         let amount_raw = abi::decode_u128(&abi::word(input, 0)?);
         // FIX ECON-FIND-26: Validate u128 fits in i128 before cast
         if amount_raw > i128::MAX as u128 {
-            return Err(CoreError::Overflow("lockbox deposit amount exceeds i128::MAX".into()));
+            return Err(CoreError::Overflow(
+                "lockbox deposit amount exceeds i128::MAX".into(),
+            ));
         }
         let amount = FixedPoint::from_raw(amount_raw as i128);
         Lockbox::deposit_to_native(state_db, caller, amount)?;
@@ -927,7 +971,9 @@ fn lockbox_precompile(
         let amount_raw = abi::decode_u128(&abi::word(input, 0)?);
         // FIX ECON-FIND-26: Validate u128 fits in i128 before cast
         if amount_raw > i128::MAX as u128 {
-            return Err(CoreError::Overflow("lockbox withdraw amount exceeds i128::MAX".into()));
+            return Err(CoreError::Overflow(
+                "lockbox withdraw amount exceeds i128::MAX".into(),
+            ));
         }
         let amount = FixedPoint::from_raw(amount_raw as i128);
         Lockbox::withdraw_from_native(state_db, caller, amount)?;

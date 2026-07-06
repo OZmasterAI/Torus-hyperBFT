@@ -76,16 +76,24 @@ impl DoubleSignEvidence {
         };
 
         // Verify signature A
-        let msg_a =
-            build_vote_message(self.chain_id, self.view, &self.vote_a.block_hash, self.phase);
+        let msg_a = build_vote_message(
+            self.chain_id,
+            self.view,
+            &self.vote_a.block_hash,
+            self.phase,
+        );
         let sig_a = EdSignature::from_bytes(&self.vote_a.signature);
         if vk.verify(&msg_a, &sig_a).is_err() {
             return false;
         }
 
         // Verify signature B
-        let msg_b =
-            build_vote_message(self.chain_id, self.view, &self.vote_b.block_hash, self.phase);
+        let msg_b = build_vote_message(
+            self.chain_id,
+            self.view,
+            &self.vote_b.block_hash,
+            self.phase,
+        );
         let sig_b = EdSignature::from_bytes(&self.vote_b.signature);
         if vk.verify(&msg_b, &sig_b).is_err() {
             return false;
@@ -264,11 +272,7 @@ impl DowntimeTracker {
 
     /// Check which validators from the given set are below the signing threshold.
     /// Returns pubkeys of validators that signed fewer than `threshold_pct`% of blocks.
-    pub fn detect_downtime(
-        &self,
-        validators: &[[u8; 32]],
-        threshold_pct: u64,
-    ) -> Vec<[u8; 32]> {
+    pub fn detect_downtime(&self, validators: &[[u8; 32]], threshold_pct: u64) -> Vec<[u8; 32]> {
         let total_blocks = self.block_signers.len() as u64;
         if total_blocks == 0 {
             return vec![];

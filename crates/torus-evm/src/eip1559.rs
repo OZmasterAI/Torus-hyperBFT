@@ -84,7 +84,10 @@ mod tests {
         // gas_limit = 0 (e.g. genesis parent) → must not panic, no adjustment
         assert_eq!(calc_next_block_base_fee(0, 0, 1_000_000_000), 1_000_000_000);
         // nonzero gas_used with zero gas_limit → also must not panic
-        assert_eq!(calc_next_block_base_fee(1_000_000, 0, 1_000_000_000), 1_000_000_000);
+        assert_eq!(
+            calc_next_block_base_fee(1_000_000, 0, 1_000_000_000),
+            1_000_000_000
+        );
         // gas_limit = 1 → gas_target = 0 via integer division, same guard
         assert_eq!(calc_next_block_base_fee(0, 1, 1_000_000_000), 1_000_000_000);
     }

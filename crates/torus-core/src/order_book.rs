@@ -1150,9 +1150,9 @@ impl BorshSerialize for OrderBook {
         }
 
         // Collect all resting orders from bids and asks
-        let order_count: u32 =
-            (self.bids.values().map(|q| q.len()).sum::<usize>()
-                + self.asks.values().map(|q| q.len()).sum::<usize>()) as u32;
+        let order_count: u32 = (self.bids.values().map(|q| q.len()).sum::<usize>()
+            + self.asks.values().map(|q| q.len()).sum::<usize>())
+            as u32;
         w.write_all(&order_count.to_be_bytes())?;
 
         // Write bids (price ascending from BTreeMap iteration, but order within level is FIFO)

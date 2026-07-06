@@ -148,9 +148,9 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
             // 4. In case the view has been updated, update HotStuff's internal view and perform
             // the necessary protocol steps.
             if self.hotstuff.is_view_outdated(view_info) || self.hotstuff.has_deferred_proposal() {
-                if let Err(e) = self
-                    .hotstuff
-                    .enter_view(view_info.clone(), &mut self.block_tree, &mut self.app)
+                if let Err(e) =
+                    self.hotstuff
+                        .enter_view(view_info.clone(), &mut self.block_tree, &mut self.app)
                 {
                     log::error!("HotStuff enter_view error (view={}): {:?} — will retry after polling messages", view_info.view.int(), e);
                 }
@@ -168,7 +168,10 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
                     Ok(true) => {}
                     Ok(false) => break,
                     Err(e) => {
-                        log::error!("BlockSync process_pending_block error: {:?} — continuing", e);
+                        log::error!(
+                            "BlockSync process_pending_block error: {:?} — continuing",
+                            e
+                        );
                         break;
                     }
                 }
@@ -187,7 +190,10 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
             self.hotstuff.tick_pending_body_retries(&self.block_tree);
             if self.hotstuff.take_sync_needed() {
                 if let Err(e) = self.block_sync_client.trigger_sync(&mut self.block_tree) {
-                    log::error!("BlockSync trigger_sync (body retry exhausted) error: {:?}", e);
+                    log::error!(
+                        "BlockSync trigger_sync (body retry exhausted) error: {:?}",
+                        e
+                    );
                 }
             }
 
@@ -197,7 +203,10 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
                 || self.hotstuff.has_deferred_proposal()
                 || self.hotstuff.has_pending_body_fetches()
             {
-                std::cmp::min(view_info.deadline, Instant::now() + Duration::from_millis(10))
+                std::cmp::min(
+                    view_info.deadline,
+                    Instant::now() + Duration::from_millis(10),
+                )
             } else {
                 view_info.deadline
             };
@@ -207,32 +216,46 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
             {
                 Ok((origin, msg)) => match msg {
                     ProgressMessage::HotStuffMessage(msg) => {
-                        if let Err(e) = self
-                            .hotstuff
-                            .on_receive_msg(msg, &origin, &mut self.block_tree, &mut self.app)
-                        {
-                            log::error!("HotStuff on_receive_msg error: {:?} — dropping message", e);
+                        if let Err(e) = self.hotstuff.on_receive_msg(
+                            msg,
+                            &origin,
+                            &mut self.block_tree,
+                            &mut self.app,
+                        ) {
+                            log::error!(
+                                "HotStuff on_receive_msg error: {:?} — dropping message",
+                                e
+                            );
                         }
                         if self.hotstuff.take_sync_needed() {
-                            if let Err(e) = self.block_sync_client.trigger_sync(&mut self.block_tree) {
+                            if let Err(e) =
+                                self.block_sync_client.trigger_sync(&mut self.block_tree)
+                            {
                                 log::error!("BlockSync trigger_sync error: {:?}", e);
                             }
                         }
                     }
                     ProgressMessage::PacemakerMessage(msg) => {
-                        if let Err(e) = self
-                            .pacemaker
-                            .on_receive_msg(msg, &origin, &mut self.block_tree)
+                        if let Err(e) =
+                            self.pacemaker
+                                .on_receive_msg(msg, &origin, &mut self.block_tree)
                         {
-                            log::error!("Pacemaker on_receive_msg error: {:?} — dropping message", e);
+                            log::error!(
+                                "Pacemaker on_receive_msg error: {:?} — dropping message",
+                                e
+                            );
                         }
                     }
                     ProgressMessage::BlockSyncAdvertiseMessage(msg) => {
-                        if let Err(e) = self
-                            .block_sync_client
-                            .on_receive_msg(msg, &origin, &mut self.block_tree)
-                        {
-                            log::error!("BlockSync on_receive_msg error: {:?} — dropping message", e);
+                        if let Err(e) = self.block_sync_client.on_receive_msg(
+                            msg,
+                            &origin,
+                            &mut self.block_tree,
+                        ) {
+                            log::error!(
+                                "BlockSync on_receive_msg error: {:?} — dropping message",
+                                e
+                            );
                         }
                     }
                 },
@@ -243,10 +266,7 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
             }
 
             // 8. Let the block sync client update its internal state, and trigger sync if needed.
-            if let Err(e) = self
-                .block_sync_client
-                .tick(&mut self.block_tree)
-            {
+            if let Err(e) = self.block_sync_client.tick(&mut self.block_tree) {
                 log::error!("BlockSync tick error: {:?} — continuing", e);
             }
         }

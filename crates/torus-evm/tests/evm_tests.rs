@@ -105,9 +105,17 @@ fn create2_deploys_at_deterministic_address() {
     assert!(result.success, "CREATE2 deployer tx must succeed");
 
     let deployer = result.contract_address.expect("deployer address");
-    assert_eq!(result.output.len(), 32, "output is the returned address word");
+    assert_eq!(
+        result.output.len(),
+        32,
+        "output is the returned address word"
+    );
     let created = Address::from_slice(&result.output[12..32]);
-    assert_ne!(created, Address::ZERO, "CREATE2 must not fail (returns 0 on failure)");
+    assert_ne!(
+        created,
+        Address::ZERO,
+        "CREATE2 must not fail (returns 0 on failure)"
+    );
 
     let salt = B256::from(U256::from(42u64));
     let expected = deployer.create2(salt, alloy_primitives::keccak256(child_init));
@@ -382,7 +390,9 @@ fn block_gas_limit_exceeded() {
     ];
 
     let executor = EvmExecutor::new(TORUS_CHAIN_ID);
-    let err = executor.execute_block(&db, &block_cfg, txs, false).unwrap_err();
+    let err = executor
+        .execute_block(&db, &block_cfg, txs, false)
+        .unwrap_err();
 
     match err {
         torus_evm::EvmError::BlockGasLimitExceeded { .. } => {}
@@ -432,8 +442,9 @@ fn precompile_balance_reader_via_evm() {
         .unwrap();
 
     // BalanceReader precompile at 0x0801.
-    let precompile_addr =
-        Address::new([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x08, 0x01]);
+    let precompile_addr = Address::new([
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x08, 0x01,
+    ]);
 
     // Build calldata: getBalances(address) selector + BOB padded.
     let sig_hash = alloy_primitives::keccak256("getBalances(address)".as_bytes());
@@ -486,8 +497,9 @@ fn precompile_unknown_selector_reverts() {
     db.put_account(&ALICE, &test_account(ten_eth)).unwrap();
 
     // OrderBookReader precompile at 0x0800 — call with bogus selector.
-    let precompile_addr =
-        Address::new([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x08, 0x00]);
+    let precompile_addr = Address::new([
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x08, 0x00,
+    ]);
 
     let block_cfg = default_block_cfg();
     let tx = TxEnv {
@@ -520,8 +532,9 @@ fn precompile_charges_correct_gas() {
     db.put_account(&ALICE, &test_account(ten_eth)).unwrap();
 
     // BalanceReader (read-only) costs GAS_PRECOMPILE_READ = 2600.
-    let precompile_addr =
-        Address::new([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x08, 0x01]);
+    let precompile_addr = Address::new([
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x08, 0x01,
+    ]);
 
     let sig_hash = alloy_primitives::keccak256("getBalances(address)".as_bytes());
     let mut calldata = Vec::with_capacity(36);
@@ -590,7 +603,6 @@ fn standard_precompile_ecrecover_still_works() {
     // ecrecover with all-zero inputs returns empty (invalid sig) but succeeds.
     assert!(result.success, "ecrecover should not crash");
 }
-
 
 // ---------------------------------------------------------------------------
 // 13. EIP-1559: tx rejected when gas_price < base_fee
@@ -685,15 +697,21 @@ fn eip1559_unused_gas_refunded() {
         chain_id: Some(TORUS_CHAIN_ID),
         ..Default::default()
     };
-    let block_result = executor.execute_block(&db, &block_cfg2, vec![tx2], false).unwrap();
+    let block_result = executor
+        .execute_block(&db, &block_cfg2, vec![tx2], false)
+        .unwrap();
 
     // receipt.gas_used = 21_000 (actual), not 50_000 (limit).
-    assert_eq!(block_result.receipts[0].gas_used, 21_000,
-        "receipt gas_used must reflect actual consumption, not gas_limit");
+    assert_eq!(
+        block_result.receipts[0].gas_used, 21_000,
+        "receipt gas_used must reflect actual consumption, not gas_limit"
+    );
 
     // Total block gas = 21_000 (the 29_000 unspent were refunded to sender).
-    assert_eq!(block_result.gas_used, 21_000,
-        "block gas_used must be actual gas, refund does not count as block gas");
+    assert_eq!(
+        block_result.gas_used, 21_000,
+        "block gas_used must be actual gas, refund does not count as block gas"
+    );
 }
 
 /// Convenience module for hex decoding in tests.

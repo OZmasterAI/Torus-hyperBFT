@@ -75,7 +75,11 @@ fn make_action(nonce: u64) -> SignedNativeAction {
     SignedNativeAction {
         action: NativeAction::ClaimRewards,
         nonce,
-        signature: ActionSignature::Eip712(Signature { v: 27, r: [0u8; 32], s: [0u8; 32] }),
+        signature: ActionSignature::Eip712(Signature {
+            v: 27,
+            r: [0u8; 32],
+            s: [0u8; 32],
+        }),
     }
 }
 
@@ -121,7 +125,13 @@ fn native_da_pull_fallback_recovers() {
         "precondition: body absent from the local DA store"
     );
 
-    let mut app = TorusApp::new(state_db.clone(), &test_config(), None, Some(mempool.clone()), None);
+    let mut app = TorusApp::new(
+        state_db.clone(),
+        &test_config(),
+        None,
+        Some(mempool.clone()),
+        None,
+    );
 
     // The peer holds the body: stage its on-wire bytes (bincode) in the mock fetcher.
     let body_bytes = bincode::serialize(&body).expect("serialize body");
@@ -131,7 +141,11 @@ fn native_da_pull_fallback_recovers() {
     // MISS -> pull fires exactly once, the fetched body is absorbed into the DA store.
     let fired = app.pull_compact_bodies_if_missing(&compact);
     assert!(fired, "pull-fallback must fire on a reconstruction miss");
-    assert_eq!(fetcher.fetch_calls(), 1, "exactly one fetch issued for the miss");
+    assert_eq!(
+        fetcher.fetch_calls(),
+        1,
+        "exactly one fetch issued for the miss"
+    );
     assert!(
         mempool.get_native_da(&body_hash).is_some(),
         "the fetched body must be absorbed into the durable DA store"
@@ -140,8 +154,15 @@ fn native_da_pull_fallback_recovers() {
     // RARITY: with the body now local, a repeat does NOT fetch (push covers the
     // common case — pull must stay rare, mem a6cf33a9).
     let refired = app.pull_compact_bodies_if_missing(&compact);
-    assert!(!refired, "pull-fallback must NOT fire when bodies are already local");
-    assert_eq!(fetcher.fetch_calls(), 1, "no extra fetch when bodies are already local");
+    assert!(
+        !refired,
+        "pull-fallback must NOT fire when bodies are already local"
+    );
+    assert_eq!(
+        fetcher.fetch_calls(),
+        1,
+        "no extra fetch when bodies are already local"
+    );
 }
 
 #[test]
@@ -156,7 +177,13 @@ fn native_da_pull_noop_without_fetcher() {
     let body_hash = compute_action_hash(&body);
     let compact = compact_referencing(&body, 1);
 
-    let app = TorusApp::new(state_db.clone(), &test_config(), None, Some(mempool.clone()), None);
+    let app = TorusApp::new(
+        state_db.clone(),
+        &test_config(),
+        None,
+        Some(mempool.clone()),
+        None,
+    );
 
     let fired = app.pull_compact_bodies_if_missing(&compact);
     assert!(fired, "a miss still reports a pull attempt");

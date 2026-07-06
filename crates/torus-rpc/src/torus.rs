@@ -275,7 +275,15 @@ fn verify_one_action_with(
     chain_id: u64,
     state_db: &torus_state::StateDb,
     current_time_ms: u64,
-) -> Result<(alloy_primitives::Address, torus_types::SignedNativeAction, Vec<u8>, alloy_primitives::B256), String> {
+) -> Result<
+    (
+        alloy_primitives::Address,
+        torus_types::SignedNativeAction,
+        Vec<u8>,
+        alloy_primitives::B256,
+    ),
+    String,
+> {
     let bytes = parse_bytes(signed_action).map_err(|e| format!("invalid hex: {e}"))?;
     let action = decode(&bytes)?;
     torus_mempool::rate_limit::validate_batch_size(&action.action)?;
@@ -287,8 +295,7 @@ fn verify_one_action_with(
         .map_err(|e| format!("signature verification failed: {e}"))?;
     // Canonical bytes stay serde_json regardless of ingress format: the
     // action hash, gossip body, and leader-forward payload all derive here.
-    let action_bytes =
-        serde_json::to_vec(&action).map_err(|e| format!("serialize action: {e}"))?;
+    let action_bytes = serde_json::to_vec(&action).map_err(|e| format!("serialize action: {e}"))?;
     let hash = keccak256(&action_bytes);
     Ok((sender, action, action_bytes, hash))
 }
@@ -299,8 +306,22 @@ pub(crate) fn verify_one_action(
     chain_id: u64,
     state_db: &torus_state::StateDb,
     current_time_ms: u64,
-) -> Result<(alloy_primitives::Address, torus_types::SignedNativeAction, Vec<u8>, alloy_primitives::B256), String> {
-    verify_one_action_with(decode_action_json, signed_action, chain_id, state_db, current_time_ms)
+) -> Result<
+    (
+        alloy_primitives::Address,
+        torus_types::SignedNativeAction,
+        Vec<u8>,
+        alloy_primitives::B256,
+    ),
+    String,
+> {
+    verify_one_action_with(
+        decode_action_json,
+        signed_action,
+        chain_id,
+        state_db,
+        current_time_ms,
+    )
 }
 
 /// Dedicated bounded pool for ingress verification (s352 regression fix).
@@ -393,9 +414,9 @@ impl RpcState {
                             Ok(action) if torus_mempool::is_cancel(&action.action) => {
                                 SubmitSlot::Proceed(signed_action)
                             }
-                            Ok(_) => SubmitSlot::Rejected(
-                                "mempool: pool full (pre-verify)".to_string(),
-                            ),
+                            Ok(_) => {
+                                SubmitSlot::Rejected("mempool: pool full (pre-verify)".to_string())
+                            }
                             Err(e) => SubmitSlot::Rejected(e),
                         }
                     })
@@ -416,7 +437,10 @@ impl RpcState {
             }
             screened
         } else {
-            signed_actions.into_iter().map(SubmitSlot::Proceed).collect()
+            signed_actions
+                .into_iter()
+                .map(SubmitSlot::Proceed)
+                .collect()
         };
         let to_verify: Vec<String> = slots
             .iter_mut()
@@ -509,9 +533,9 @@ impl RpcState {
                                     torus_mempool::MempoolError::DuplicateNativeAction => {
                                         "duplicate"
                                     }
-                                    torus_mempool::MempoolError::NativeSenderQueueFull { .. } => {
-                                        "sender_queue_full"
-                                    }
+                                    torus_mempool::MempoolError::NativeSenderQueueFull {
+                                        ..
+                                    } => "sender_queue_full",
                                     torus_mempool::MempoolError::NativePoolFull => "pool_full",
                                     _ => "other",
                                 });
@@ -660,8 +684,7 @@ impl TorusApiServer for RpcState {
 
                 // Compute unrealized PnL using oracle price; fall back to entry price.
                 let current_block = self.latest_height.load(Ordering::Relaxed);
-                let oracle =
-                    OracleManager::new(self.state.clone(), OracleConfig::default());
+                let oracle = OracleManager::new(self.state.clone(), OracleConfig::default());
                 let mark_price = oracle
                     .get_price(mid, current_block)
                     .map(|op| op.price)
@@ -724,13 +747,12 @@ impl TorusApiServer for RpcState {
         }
 
         // Permanent stake from CF_STAKING_PERMANENT
-        let permanent_stake =
-            match self.state.get_cf_raw(CF_STAKING_PERMANENT, addr.as_slice()) {
-                Ok(Some(data)) => PermanentStakeInfo::try_from_slice(&data)
-                    .map(|info| hex_u256(info.amount))
-                    .unwrap_or_else(|_| "0x0".to_string()),
-                _ => "0x0".to_string(),
-            };
+        let permanent_stake = match self.state.get_cf_raw(CF_STAKING_PERMANENT, addr.as_slice()) {
+            Ok(Some(data)) => PermanentStakeInfo::try_from_slice(&data)
+                .map(|info| hex_u256(info.amount))
+                .unwrap_or_else(|_| "0x0".to_string()),
+            _ => "0x0".to_string(),
+        };
 
         let native_total = native_bal.available + native_bal.order_margin;
 
@@ -986,7 +1008,9 @@ impl TorusApiServer for RpcState {
         // instead of instantly bouncing; sustained saturation still sheds.
         let _permit = crate::acquire_submit_permit(&self.submit_semaphore)
             .await
-            .ok_or_else(|| ErrorObjectOwned::from(RpcError::Internal("server overloaded, try again".into())))?;
+            .ok_or_else(|| {
+                ErrorObjectOwned::from(RpcError::Internal("server overloaded, try again".into()))
+            })?;
         let bytes = parse_bytes(&signed_action).map_err(ErrorObjectOwned::from)?;
 
         // Offload deserialization + ECDSA verification to the blocking thread pool
@@ -1002,8 +1026,7 @@ impl TorusApiServer for RpcState {
             torus_mempool::rate_limit::validate_batch_size(&action.action)
                 .map_err(RpcError::InvalidParams)?;
 
-            validate_known_markets(&action.action, &state_db)
-                .map_err(RpcError::InvalidParams)?;
+            validate_known_markets(&action.action, &state_db).map_err(RpcError::InvalidParams)?;
 
             let current_time_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1014,7 +1037,9 @@ impl TorusApiServer for RpcState {
                 .validate_with_sessions(current_time_ms, chain_id, |pubkey| {
                     state_db.get_session(pubkey).ok().flatten()
                 })
-                .map_err(|e| RpcError::InvalidParams(format!("signature verification failed: {e}")))?;
+                .map_err(|e| {
+                    RpcError::InvalidParams(format!("signature verification failed: {e}"))
+                })?;
 
             let action_bytes = serde_json::to_vec(&action)
                 .map_err(|e| RpcError::Internal(format!("serialize action: {e}")))?;
@@ -1077,9 +1102,7 @@ impl TorusApiServer for RpcState {
                 let db = self.state.inner();
                 let cf = db
                     .cf_handle(CF_GOVERNANCE_PROPOSALS)
-                    .ok_or_else(|| {
-                        RpcError::Internal("missing CF_GOVERNANCE_PROPOSALS".into())
-                    })
+                    .ok_or_else(|| RpcError::Internal("missing CF_GOVERNANCE_PROPOSALS".into()))
                     .map_err(ErrorObjectOwned::from)?;
                 let iter = db.iterator_cf(cf, IteratorMode::Start);
                 let mut all = Vec::new();
@@ -1090,12 +1113,9 @@ impl TorusApiServer for RpcState {
                     if key.len() != 8 {
                         continue;
                     }
-                    let proposal =
-                        torus_economics::governance::Proposal::try_from_slice(&value)
-                            .map_err(|e| {
-                                RpcError::Internal(format!("borsh decode proposal: {e}"))
-                            })
-                            .map_err(ErrorObjectOwned::from)?;
+                    let proposal = torus_economics::governance::Proposal::try_from_slice(&value)
+                        .map_err(|e| RpcError::Internal(format!("borsh decode proposal: {e}")))
+                        .map_err(ErrorObjectOwned::from)?;
                     all.push(proposal);
                 }
                 all
@@ -1118,8 +1138,7 @@ impl TorusApiServer for RpcState {
             min_proposal_stake: hex_u256(params.min_proposal_stake),
             permanent_weight_multiplier: format!(
                 "{}/{}",
-                params.permanent_weight_multiplier_num,
-                params.permanent_weight_multiplier_den
+                params.permanent_weight_multiplier_num, params.permanent_weight_multiplier_den
             ),
             treasury_address: hex_address(params.treasury_address),
         })
@@ -1152,12 +1171,15 @@ impl TorusApiServer for RpcState {
         // Current fee split BPS using lerp.
         let current_height = self.latest_height.load(Ordering::Relaxed);
         let epoch_length = self.epoch_length;
-        let epoch_info =
-            torus_economics::queries::get_epoch_info(current_height, epoch_length);
+        let epoch_info = torus_economics::queries::get_epoch_info(current_height, epoch_length);
         let epoch = epoch_info.current_epoch;
 
-        let burn_bps =
-            lerp_bps(FEE_START_BURN_BPS, FEE_END_BURN_BPS, epoch, TRANSITION_EPOCHS);
+        let burn_bps = lerp_bps(
+            FEE_START_BURN_BPS,
+            FEE_END_BURN_BPS,
+            epoch,
+            TRANSITION_EPOCHS,
+        );
         let validator_bps = lerp_bps(
             FEE_START_VALIDATOR_BPS,
             FEE_END_VALIDATOR_BPS,
@@ -1203,7 +1225,8 @@ impl TorusApiServer for RpcState {
 
         let (address, peer_id) = if let Some(vk_bytes) = leader_vk_bytes {
             let staking = StakingManager::new(self.state.clone());
-            let addr = staking.find_validator_by_pubkey(&vk_bytes)
+            let addr = staking
+                .find_validator_by_pubkey(&vk_bytes)
                 .ok()
                 .flatten()
                 .map(|v| hex_address(v.address))
@@ -1386,7 +1409,8 @@ impl TorusApiServer for RpcState {
             // Single market: read one OrderBook
             let mid = parse_u64(mid_str).map_err(ErrorObjectOwned::from)?;
             let key = mid.to_be_bytes();
-            if let Some(data) = db.get_cf(cf, &key)
+            if let Some(data) = db
+                .get_cf(cf, &key)
                 .map_err(|e| RpcError::Internal(format!("rocksdb: {e}")))
                 .map_err(ErrorObjectOwned::from)?
             {
@@ -1488,13 +1512,14 @@ impl TorusApiServer for RpcState {
         };
 
         // Last trade price from the order book
-        let last_trade_price = match self.state.get_cf_raw(CF_NATIVE_ORDER_BOOKS, &mid.to_be_bytes()) {
-            Ok(Some(data)) => {
-                OrderBook::try_from_slice(&data)
-                    .ok()
-                    .and_then(|book| book.last_trade_price())
-                    .unwrap_or(FixedPoint::ZERO)
-            }
+        let last_trade_price = match self
+            .state
+            .get_cf_raw(CF_NATIVE_ORDER_BOOKS, &mid.to_be_bytes())
+        {
+            Ok(Some(data)) => OrderBook::try_from_slice(&data)
+                .ok()
+                .and_then(|book| book.last_trade_price())
+                .unwrap_or(FixedPoint::ZERO),
             _ => FixedPoint::ZERO,
         };
 
@@ -1556,10 +1581,18 @@ impl TorusApiServer for RpcState {
             trades.push(RpcUserTrade {
                 trade_id: hex_u128(trade.trade_id),
                 market_id: hex_u64(trade.market_id),
-                side: if trade.side == 0 { "buy".to_string() } else { "sell".to_string() },
+                side: if trade.side == 0 {
+                    "buy".to_string()
+                } else {
+                    "sell".to_string()
+                },
                 price: hex_fp(FixedPoint::from_raw(trade.price_raw)),
                 quantity: hex_fp(FixedPoint::from_raw(trade.quantity_raw)),
-                role: if trade.role == 0 { "maker".to_string() } else { "taker".to_string() },
+                role: if trade.role == 0 {
+                    "maker".to_string()
+                } else {
+                    "taker".to_string()
+                },
                 block_number: hex_u64(trade.block_number),
                 timestamp: hex_u64(trade.timestamp),
             });

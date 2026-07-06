@@ -129,12 +129,8 @@ impl MarginEngine {
             MarginType::Cross => {
                 // Cross: available + sum(unrealized PnL) - sum(maintenance) >= initial
                 let equity = Self::cross_margin_equity(positions, trader, oracle_prices)?;
-                let maint = Self::total_maintenance_margin(
-                    positions,
-                    trader,
-                    config,
-                    oracle_prices,
-                )?;
+                let maint =
+                    Self::total_maintenance_margin(positions, trader, config, oracle_prices)?;
                 let free_margin = equity - maint;
                 if free_margin < required_initial {
                     return Err(CoreError::InsufficientMargin {
@@ -221,7 +217,8 @@ impl MarginEngine {
                 let initial = notional / lev_fp;
                 // Maintenance = initial * maintenance_factor_bps / 10000
                 // FIX 4 (ECON-PF-10): Scale maint_num correctly as a FixedPoint value
-                let maint_num = FixedPoint::from_raw(config.maintenance_factor_bps as i128 * FixedPoint::SCALE);
+                let maint_num =
+                    FixedPoint::from_raw(config.maintenance_factor_bps as i128 * FixedPoint::SCALE);
                 let bps_denom = FixedPoint::from_raw(10_000 * FixedPoint::SCALE);
                 total = total + initial * maint_num / bps_denom;
             }
@@ -240,7 +237,8 @@ impl MarginEngine {
         let lev_fp = FixedPoint::from_raw(max_lev as i128 * FixedPoint::SCALE);
         let initial_margin = notional / lev_fp;
         // FIX 4 (ECON-PF-10): Scale maint_num correctly as a FixedPoint value
-        let maint_num = FixedPoint::from_raw(config.maintenance_factor_bps as i128 * FixedPoint::SCALE);
+        let maint_num =
+            FixedPoint::from_raw(config.maintenance_factor_bps as i128 * FixedPoint::SCALE);
         let bps_denom = FixedPoint::from_raw(10_000 * FixedPoint::SCALE);
         let maintenance = initial_margin * maint_num / bps_denom;
 
@@ -374,10 +372,7 @@ mod tests {
             &config,
             &oracle_prices,
         );
-        assert!(matches!(
-            result,
-            Err(CoreError::MaxLeverageExceeded { .. })
-        ));
+        assert!(matches!(result, Err(CoreError::MaxLeverageExceeded { .. })));
     }
 
     #[test]
@@ -438,8 +433,7 @@ mod tests {
         .unwrap();
 
         let oracle_prices: Vec<(u64, FixedPoint)> = vec![];
-        let equity =
-            MarginEngine::cross_margin_equity(&pm, &trader, &oracle_prices).unwrap();
+        let equity = MarginEngine::cross_margin_equity(&pm, &trader, &oracle_prices).unwrap();
         // equity = available - order_margin = 10000 - 3000 = 7000
         assert_eq!(equity, fp(7_000));
     }
@@ -476,13 +470,8 @@ mod tests {
         // maintenance_factor_bps = 5000 (50%)
         let oracle_prices = vec![(1u64, fp(50_000))];
 
-        let maint = MarginEngine::total_maintenance_margin(
-            &pm,
-            &trader,
-            &config,
-            &oracle_prices,
-        )
-        .unwrap();
+        let maint =
+            MarginEngine::total_maintenance_margin(&pm, &trader, &config, &oracle_prices).unwrap();
 
         // Notional = 1 * 50000 = 50000
         // Tier: 50000 <= 100000 → max_leverage = 50
@@ -507,13 +496,21 @@ mod tests {
         let config = MarketMarginConfig::new(1, 50);
 
         // At mark price 50000: maintenance = 500, isolated_margin + upnl = 600 + 0 = 600
-        assert!(MarginEngine::check_isolated_maintenance(&pos, fp(50_000), &config));
+        assert!(MarginEngine::check_isolated_maintenance(
+            &pos,
+            fp(50_000),
+            &config
+        ));
 
         // With less margin: 400 < 500 → should fail
         let pos2 = Position {
             isolated_margin: fp(400),
             ..pos.clone()
         };
-        assert!(!MarginEngine::check_isolated_maintenance(&pos2, fp(50_000), &config));
+        assert!(!MarginEngine::check_isolated_maintenance(
+            &pos2,
+            fp(50_000),
+            &config
+        ));
     }
 }

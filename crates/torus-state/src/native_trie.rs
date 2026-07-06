@@ -46,7 +46,10 @@ pub const NATIVE_ROOT_CFS: [(&str, u8); 6] = [
 
 /// `cf_tag` for a CF name, or `None` if it is not one of the 6 native-root CFs.
 pub fn cf_tag(cf_name: &str) -> Option<u8> {
-    NATIVE_ROOT_CFS.iter().find(|(n, _)| *n == cf_name).map(|(_, t)| *t)
+    NATIVE_ROOT_CFS
+        .iter()
+        .find(|(n, _)| *n == cf_name)
+        .map(|(_, t)| *t)
 }
 
 // CF_NATIVE_TRIE key prefixes.
@@ -160,7 +163,10 @@ fn build_tree(
         let mut next = BTreeMap::new();
         for p in parents {
             let left = level_nodes.get(&(2 * p)).copied().unwrap_or(child_default);
-            let right = level_nodes.get(&(2 * p + 1)).copied().unwrap_or(child_default);
+            let right = level_nodes
+                .get(&(2 * p + 1))
+                .copied()
+                .unwrap_or(child_default);
             let h = hash_pair(&left, &right);
             nodes.push((node_key_internal(level, p), h));
             next.insert(p, h);
@@ -186,7 +192,9 @@ fn put_node(batch: &mut WriteBatch, trie_cf: &rocksdb::ColumnFamily, key: &[u8; 
 fn leaves_from_db(db: &StateDb) -> Result<BTreeMap<u16, B256>, StateError> {
     let mut acc: BTreeMap<u16, Vec<u8>> = BTreeMap::new();
     for (cf_name, tag) in NATIVE_ROOT_CFS {
-        let Some(cf) = db.inner().cf_handle(cf_name) else { continue };
+        let Some(cf) = db.inner().cf_handle(cf_name) else {
+            continue;
+        };
         let iter = db.inner().iterator_cf(cf, rocksdb::IteratorMode::Start);
         for item in iter {
             let (key, value) = item?;
@@ -194,7 +202,10 @@ fn leaves_from_db(db: &StateDb) -> Result<BTreeMap<u16, B256>, StateError> {
             frame_entry(acc.entry(b).or_default(), tag, &key, &value);
         }
     }
-    Ok(acc.into_iter().map(|(b, data)| (b, keccak256(&data))).collect())
+    Ok(acc
+        .into_iter()
+        .map(|(b, data)| (b, keccak256(&data)))
+        .collect())
 }
 
 /// Full-scan native root — the determinism ORACLE and the flag-off path. O(total native state):
@@ -232,7 +243,9 @@ pub fn build_native_trie_to_cf(db: &StateDb) -> Result<B256, StateError> {
     // Mirror every entry and accumulate bucket inputs in one pass.
     let mut acc: BTreeMap<u16, Vec<u8>> = BTreeMap::new();
     for (cf_name, tag) in NATIVE_ROOT_CFS {
-        let Some(cf) = db.inner().cf_handle(cf_name) else { continue };
+        let Some(cf) = db.inner().cf_handle(cf_name) else {
+            continue;
+        };
         let iter = db.inner().iterator_cf(cf, rocksdb::IteratorMode::Start);
         for item in iter {
             let (key, value) = item?;
@@ -241,8 +254,10 @@ pub fn build_native_trie_to_cf(db: &StateDb) -> Result<B256, StateError> {
             frame_entry(acc.entry(b).or_default(), tag, &key, &value);
         }
     }
-    let leaves: BTreeMap<u16, B256> =
-        acc.into_iter().map(|(b, data)| (b, keccak256(&data))).collect();
+    let leaves: BTreeMap<u16, B256> = acc
+        .into_iter()
+        .map(|(b, data)| (b, keccak256(&data)))
+        .collect();
 
     let defaults = default_nodes();
     let (node00, nodes) = build_tree(&leaves, &defaults);
@@ -284,7 +299,9 @@ pub fn persisted_native_root(db: &StateDb) -> Result<B256, StateError> {
     let cf = db.cf_handle(CF_NATIVE_TRIE)?;
     match db.inner().get_cf(cf, ROOT_KEY)? {
         Some(v) if v.len() == 32 => Ok(B256::from_slice(&v)),
-        Some(_) => Err(StateError::InvalidData("native root marker has wrong length".into())),
+        Some(_) => Err(StateError::InvalidData(
+            "native root marker has wrong length".into(),
+        )),
         None => Ok(EMPTY_ROOT_HASH),
     }
 }
@@ -339,7 +356,9 @@ fn read_bucket_members(
     iter.seek(prefix);
     while iter.valid() {
         let (k, v) = match (iter.key(), iter.value()) {
-            (Some(k), Some(v)) if k.starts_with(&prefix) && k.len() >= 3 => (k.to_vec(), v.to_vec()),
+            (Some(k), Some(v)) if k.starts_with(&prefix) && k.len() >= 3 => {
+                (k.to_vec(), v.to_vec())
+            }
             _ => break,
         };
         out.insert((k[2], k[3..].to_vec()), v);
@@ -364,7 +383,10 @@ fn compute_native_dirty_ops(
     let mut by_bucket: BTreeMap<u16, Vec<((u8, Vec<u8>), Option<Vec<u8>>)>> = BTreeMap::new();
     for ((tag, key), val) in dirty {
         let b = bucket_id(*tag, key);
-        by_bucket.entry(b).or_default().push(((*tag, key.clone()), val.clone()));
+        by_bucket
+            .entry(b)
+            .or_default()
+            .push(((*tag, key.clone()), val.clone()));
     }
 
     // 2. For each changed bucket: emit mirror ops + recompute its leaf hash from the new member set.
@@ -376,11 +398,19 @@ fn compute_native_dirty_ops(
             match val {
                 Some(v) => {
                     members.insert((*tag, key.clone()), v.clone());
-                    ops.push(NodeOp { target: CfTarget::Mirror, key: mk, value: Some(v.clone()) });
+                    ops.push(NodeOp {
+                        target: CfTarget::Mirror,
+                        key: mk,
+                        value: Some(v.clone()),
+                    });
                 }
                 None => {
                     members.remove(&(*tag, key.clone()));
-                    ops.push(NodeOp { target: CfTarget::Mirror, key: mk, value: None });
+                    ops.push(NodeOp {
+                        target: CfTarget::Mirror,
+                        key: mk,
+                        value: None,
+                    });
                 }
             }
         }
@@ -399,8 +429,10 @@ fn compute_native_dirty_ops(
     // 3. Propagate up, level by level. A parent recomputes from its changed children (in `changed`)
     //    and its unchanged children (read from the persisted tree, or the level default).
     for level in (1..=TREE_DEPTH).rev() {
-        let level_indices: Vec<usize> =
-            changed.range((level, 0)..(level + 1, 0)).map(|(&(_, i), _)| i).collect();
+        let level_indices: Vec<usize> = changed
+            .range((level, 0)..(level + 1, 0))
+            .map(|(&(_, i), _)| i)
+            .collect();
         let parents: BTreeSet<usize> = level_indices.iter().map(|i| i / 2).collect();
         for p in parents {
             let left = match changed.get(&(level, 2 * p)) {
@@ -424,9 +456,17 @@ fn compute_native_dirty_ops(
             node_key_internal(*level, *index).to_vec()
         };
         if *value == defaults[*level] {
-            ops.push(NodeOp { target: CfTarget::Trie, key, value: None });
+            ops.push(NodeOp {
+                target: CfTarget::Trie,
+                key,
+                value: None,
+            });
         } else {
-            ops.push(NodeOp { target: CfTarget::Trie, key, value: Some(value.as_slice().to_vec()) });
+            ops.push(NodeOp {
+                target: CfTarget::Trie,
+                key,
+                value: Some(value.as_slice().to_vec()),
+            });
         }
     }
 
@@ -519,8 +559,15 @@ mod tests {
         assert_ne!(full, EMPTY_ROOT_HASH, "seeded corpus must be non-empty");
 
         let built = build_native_trie_to_cf(&db).unwrap();
-        assert_eq!(built, full, "built native trie root must equal the full scan");
-        assert_eq!(persisted_native_root(&db).unwrap(), full, "persisted marker must match");
+        assert_eq!(
+            built, full,
+            "built native trie root must equal the full scan"
+        );
+        assert_eq!(
+            persisted_native_root(&db).unwrap(),
+            full,
+            "persisted marker must match"
+        );
 
         // Idempotent: rebuilding reproduces the same root.
         let again = build_native_trie_to_cf(&db).unwrap();
@@ -538,7 +585,10 @@ mod tests {
         let (db, _dir) = temp_db();
         assert_eq!(native_root_full(&db).unwrap(), EMPTY_ROOT_HASH);
         let built = build_native_trie_to_cf(&db).unwrap();
-        assert_eq!(built, EMPTY_ROOT_HASH, "empty native state => EMPTY_ROOT_HASH");
+        assert_eq!(
+            built, EMPTY_ROOT_HASH,
+            "empty native state => EMPTY_ROOT_HASH"
+        );
         assert_eq!(persisted_native_root(&db).unwrap(), EMPTY_ROOT_HASH);
     }
 
@@ -547,7 +597,8 @@ mod tests {
         let (db, _dir) = temp_db();
         seed(&db);
         let r1 = native_root_full(&db).unwrap();
-        db.put_cf_raw(CF_NATIVE_BALANCES, b"\x00\x00\x00\x00new", b"v").unwrap();
+        db.put_cf_raw(CF_NATIVE_BALANCES, b"\x00\x00\x00\x00new", b"v")
+            .unwrap();
         let r2 = native_root_full(&db).unwrap();
         assert_ne!(r1, r2, "native root must change when state changes");
     }
@@ -557,8 +608,14 @@ mod tests {
         let (db, _dir) = temp_db();
         seed(&db);
         assert!(ensure_native_trie_built(&db).unwrap(), "first call builds");
-        assert!(!ensure_native_trie_built(&db).unwrap(), "second call is a no-op");
-        assert_eq!(persisted_native_root(&db).unwrap(), native_root_full(&db).unwrap());
+        assert!(
+            !ensure_native_trie_built(&db).unwrap(),
+            "second call is a no-op"
+        );
+        assert_eq!(
+            persisted_native_root(&db).unwrap(),
+            native_root_full(&db).unwrap()
+        );
     }
 
     fn key_for(tag: usize, i: u32) -> Vec<u8> {
@@ -604,7 +661,7 @@ mod tests {
         let cases: Vec<Vec<(usize, Vec<u8>, Option<Vec<u8>>)>> = vec![
             vec![(0, key_for(0, 5), Some(vec![1, 2, 3, 4]))], // update existing balance
             vec![(2, b"brand-new-position-key".to_vec(), Some(vec![9; 20]))], // insert (fresh bucket)
-            vec![(3, key_for(3, 10), None)],                  // delete existing oracle entry
+            vec![(3, key_for(3, 10), None)], // delete existing oracle entry
             vec![
                 (0, key_for(0, 1), Some(vec![7; 16])),
                 (1, key_for(1, 2), Some(vec![8; 30])),
@@ -661,7 +718,10 @@ mod tests {
             let dirty = apply_ops(&db, &ops);
             let incr = commit_native_trie_incremental(&db, &dirty).unwrap();
             let full = native_root_full(&db).unwrap();
-            assert_eq!(incr, full, "round {round}: incremental != full-scan over evolved base");
+            assert_eq!(
+                incr, full,
+                "round {round}: incremental != full-scan over evolved base"
+            );
         }
     }
 
@@ -689,8 +749,16 @@ mod tests {
             // `db` dropped here — simulates process shutdown / crash.
         };
         let db = StateDb::open(&path).unwrap();
-        assert_eq!(persisted_native_root(&db).unwrap(), root, "persisted native root changed after reopen");
-        assert_eq!(native_root_full(&db).unwrap(), root, "full-scan root changed after reopen");
+        assert_eq!(
+            persisted_native_root(&db).unwrap(),
+            root,
+            "persisted native root changed after reopen"
+        );
+        assert_eq!(
+            native_root_full(&db).unwrap(),
+            root,
+            "full-scan root changed after reopen"
+        );
         drop(dir);
     }
 }

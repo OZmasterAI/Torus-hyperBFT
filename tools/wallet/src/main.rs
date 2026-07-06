@@ -319,7 +319,9 @@ async fn main() {
 
     let result = match &cli.command {
         Command::Keygen { output } => commands::keys::cmd_keygen(output.clone()).await,
-        Command::Import { key, output } => commands::keys::cmd_import(key.clone(), output.clone()).await,
+        Command::Import { key, output } => {
+            commands::keys::cmd_import(key.clone(), output.clone()).await
+        }
         Command::Address { keystore } => commands::keys::cmd_address(keystore.clone()).await,
         Command::Balance { address } => {
             let addr = match address {
@@ -348,7 +350,9 @@ async fn main() {
             };
             commands::query::cmd_staking(&rpc, &addr, cli.json).await
         }
-        Command::Block { height } => commands::query::cmd_block(&rpc, height.clone(), cli.json).await,
+        Command::Block { height } => {
+            commands::query::cmd_block(&rpc, height.clone(), cli.json).await
+        }
         Command::Tx { hash } => commands::query::cmd_tx(&rpc, hash, cli.json).await,
         Command::Send { to, value } => commands::transfer::cmd_send(&cli, &rpc, to, value).await,
         Command::Delegate { validator, amount } => {
@@ -428,7 +432,9 @@ async fn main() {
         Command::CancelOrder { order_id } => {
             commands::trading::cmd_cancel_order(&cli, &rpc, *order_id).await
         }
-        Command::CancelAll { market, .. } => commands::trading::cmd_cancel_all(&cli, &rpc, *market).await,
+        Command::CancelAll { market, .. } => {
+            commands::trading::cmd_cancel_all(&cli, &rpc, *market).await
+        }
         Command::ModifyOrder {
             order_id,
             price,

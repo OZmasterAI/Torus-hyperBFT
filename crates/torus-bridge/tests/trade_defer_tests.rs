@@ -12,9 +12,7 @@ use torus_bridge::native_executor::{NativeExecContext, NativeExecutor};
 use torus_core::position::NativeBalance;
 use torus_state::cf::{CF_NATIVE_TRADES, CF_NATIVE_USER_TRADES};
 use torus_state::{StateBackend, StateDb};
-use torus_types::{
-    FixedPoint, MarketId, NativeAction, OrderType, PlaceOrderParams, TimeInForce,
-};
+use torus_types::{FixedPoint, MarketId, NativeAction, OrderType, PlaceOrderParams, TimeInForce};
 
 // ---- Helpers (mirrors parallel_matching_tests.rs) ----
 
@@ -200,7 +198,11 @@ fn pending_trades_accumulate_across_batches() {
     assert!(r2.results.iter().all(|r| r.success));
 
     let pending = ctx.take_pending_trades();
-    assert_eq!(pending.len(), 6, "2 fills x 3 KVs, accumulated across calls");
+    assert_eq!(
+        pending.len(),
+        6,
+        "2 fills x 3 KVs, accumulated across calls"
+    );
 
     // Distinct keys — trade_index kept advancing across batches.
     let mut keys: Vec<&(&str, Vec<u8>, Vec<u8>)> = pending.iter().collect();

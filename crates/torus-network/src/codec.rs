@@ -428,7 +428,10 @@ mod tests {
         // Empty request round-trips (degenerate fetch).
         let empty_req = NativeDaNetRequest { hashes: Vec::new() };
         let bytes = empty_req.try_to_vec().unwrap();
-        assert!(NativeDaNetRequest::try_from_slice(&bytes).unwrap().hashes.is_empty());
+        assert!(NativeDaNetRequest::try_from_slice(&bytes)
+            .unwrap()
+            .hashes
+            .is_empty());
 
         // Response: a found body, an empty (not-found) entry, another found body —
         // ordering and the empty marker must survive the round-trip.
@@ -459,7 +462,10 @@ mod tests {
             let proto_v2 = StreamProtocol::new("/torus/native-da/2.0");
             let mut codec = NativeDaCodec;
             let mut wbuf = Cursor::new(Vec::new());
-            codec.write_response(&proto_v2, &mut wbuf, resp.clone()).await.unwrap();
+            codec
+                .write_response(&proto_v2, &mut wbuf, resp.clone())
+                .await
+                .unwrap();
             let wire = wbuf.into_inner();
             assert!(
                 wire.len() < raw_len / 2,
@@ -471,22 +477,41 @@ mod tests {
             assert_eq!(back.bodies, resp.bodies);
 
             // Direct (push) codec dispatches on /2.0 the same way.
-            let req = DirectRequest { sender_key: [7u8; 32], payload: vec![42u8; 64 * 1024] };
+            let req = DirectRequest {
+                sender_key: [7u8; 32],
+                payload: vec![42u8; 64 * 1024],
+            };
             let proto_v2 = StreamProtocol::new("/torus/direct/2.0");
             let mut codec = BorshCodec;
             let mut wbuf = Cursor::new(Vec::new());
-            codec.write_request(&proto_v2, &mut wbuf, DirectRequest { sender_key: req.sender_key, payload: req.payload.clone() }).await.unwrap();
+            codec
+                .write_request(
+                    &proto_v2,
+                    &mut wbuf,
+                    DirectRequest {
+                        sender_key: req.sender_key,
+                        payload: req.payload.clone(),
+                    },
+                )
+                .await
+                .unwrap();
             let mut rbuf = Cursor::new(wbuf.into_inner());
             let back = codec.read_request(&proto_v2, &mut rbuf).await.unwrap();
             assert_eq!(back.sender_key, req.sender_key);
             assert_eq!(back.payload, req.payload);
 
             // Block-data codec too.
-            let resp = BlockDataNetResponse { view: 9, payload: vec![3u8; 32 * 1024] };
+            let resp = BlockDataNetResponse {
+                view: 9,
+                payload: vec![3u8; 32 * 1024],
+            };
             let proto_v2 = StreamProtocol::new("/torus/block-data/2.0");
             let mut codec = BlockDataCodec;
             let mut wbuf = Cursor::new(Vec::new());
-            codec.write_response(&proto_v2, &mut wbuf, resp.clone()).await.unwrap();
+            codec
+                .write_response(&proto_v2, &mut wbuf, resp.clone())
+                .await
+                .unwrap();
             let mut rbuf = Cursor::new(wbuf.into_inner());
             let back = codec.read_response(&proto_v2, &mut rbuf).await.unwrap();
             assert_eq!(back.payload, resp.payload);
@@ -500,12 +525,17 @@ mod tests {
         use futures::io::Cursor;
         use libp2p::request_response::Codec as _;
         futures::executor::block_on(async {
-            let resp = NativeDaNetResponse { bodies: vec![vec![1u8; 128], vec![]] };
+            let resp = NativeDaNetResponse {
+                bodies: vec![vec![1u8; 128], vec![]],
+            };
             let raw = resp.try_to_vec().unwrap();
             let proto_v1 = StreamProtocol::new("/torus/native-da/1.0");
             let mut codec = NativeDaCodec;
             let mut wbuf = Cursor::new(Vec::new());
-            codec.write_response(&proto_v1, &mut wbuf, resp.clone()).await.unwrap();
+            codec
+                .write_response(&proto_v1, &mut wbuf, resp.clone())
+                .await
+                .unwrap();
             let wire = wbuf.into_inner();
             assert_eq!(&wire[..4], (raw.len() as u32).to_be_bytes().as_slice());
             assert_eq!(&wire[4..], raw.as_slice());
@@ -594,7 +624,10 @@ mod tests {
             );
         }
         let shipped = zstd::bulk::compress(&raw, ZSTD_WIRE_LEVEL).unwrap();
-        assert!(shipped.len() * 2 < raw.len(), "shipped level must achieve >=2x on order-JSON");
+        assert!(
+            shipped.len() * 2 < raw.len(),
+            "shipped level must achieve >=2x on order-JSON"
+        );
     }
 
     /// Sprint 5 T5: per-path wire compression counters move on a /2.0 write.
@@ -605,15 +638,23 @@ mod tests {
         futures::executor::block_on(async {
             let before = wire_compression_stats();
             let pre_native = before.iter().find(|(p, _, _)| *p == "native-da").unwrap().1;
-            let resp = NativeDaNetResponse { bodies: vec![vec![5u8; 4096]; 8] };
+            let resp = NativeDaNetResponse {
+                bodies: vec![vec![5u8; 4096]; 8],
+            };
             let proto_v2 = StreamProtocol::new("/torus/native-da/2.0");
             let mut codec = NativeDaCodec;
             let mut wbuf = Cursor::new(Vec::new());
-            codec.write_response(&proto_v2, &mut wbuf, resp).await.unwrap();
+            codec
+                .write_response(&proto_v2, &mut wbuf, resp)
+                .await
+                .unwrap();
             let after = wire_compression_stats();
             let (_, pre, wire) = *after.iter().find(|(p, _, _)| *p == "native-da").unwrap();
             assert!(pre > pre_native, "pre-compress byte counter must advance");
-            assert!(wire > 0 && wire < pre, "on-wire counter must advance and stay below pre");
+            assert!(
+                wire > 0 && wire < pre,
+                "on-wire counter must advance and stay below pre"
+            );
         });
     }
 

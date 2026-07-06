@@ -51,7 +51,11 @@ pub fn build_trie_to_cf(db: &StateDb) -> Result<B256, StateError> {
     let mut storage_addrs: Vec<B256> = Vec::new();
     for (address, info) in &accounts {
         let hashed_address = keccak256(address.as_slice());
-        batch.put_cf(hashed_acc_cf, hashed_address.as_slice(), encode_account_info(info));
+        batch.put_cf(
+            hashed_acc_cf,
+            hashed_address.as_slice(),
+            encode_account_info(info),
+        );
 
         let mut has_storage = false;
         for (slot, value) in db.account_storage(address)? {
@@ -78,14 +82,18 @@ pub fn build_trie_to_cf(db: &StateDb) -> Result<B256, StateError> {
     let mut prefix_sets = TriePrefixSetsMut::default();
     prefix_sets.account_prefix_set = PrefixSetMut::all();
     for hashed_address in &storage_addrs {
-        prefix_sets.storage_prefix_sets.insert(*hashed_address, PrefixSetMut::all());
+        prefix_sets
+            .storage_prefix_sets
+            .insert(*hashed_address, PrefixSetMut::all());
     }
 
-    let (root, updates) =
-        StateRoot::new(RocksTrieCursorFactory::new(db), RocksHashedCursorFactory::new(db))
-            .with_prefix_sets(prefix_sets.freeze())
-            .root_with_updates()
-            .map_err(|e| StateError::InvalidData(format!("incremental state root: {e}")))?;
+    let (root, updates) = StateRoot::new(
+        RocksTrieCursorFactory::new(db),
+        RocksHashedCursorFactory::new(db),
+    )
+    .with_prefix_sets(prefix_sets.freeze())
+    .root_with_updates()
+    .map_err(|e| StateError::InvalidData(format!("incremental state root: {e}")))?;
 
     // 3. Persist the trie nodes.
     let mut batch = WriteBatch::default();
@@ -142,7 +150,10 @@ pub fn full_post_bundle_evm_root(db: &StateDb, bundle: &BundleState) -> Result<B
     for item in iter {
         let (key, value) = item?;
         if key.len() != 20 {
-            return Err(StateError::InvalidData(format!("account key len {} != 20", key.len())));
+            return Err(StateError::InvalidData(format!(
+                "account key len {} != 20",
+                key.len()
+            )));
         }
         accounts.insert(Address::from_slice(&key), decode_account_info(&value)?);
     }
@@ -393,7 +404,11 @@ pub fn resync_evm_accounts(db: &StateDb, addresses: &[Address]) -> Result<(), St
         let hashed_address = keccak256(addr.as_slice());
         match db.get_account(addr)? {
             Some(info) if !is_empty_account(&info) => {
-                batch.put_cf(cf_acc, hashed_address.as_slice(), encode_account_info(&info));
+                batch.put_cf(
+                    cf_acc,
+                    hashed_address.as_slice(),
+                    encode_account_info(&info),
+                );
             }
             _ => {
                 batch.delete_cf(cf_acc, hashed_address.as_slice());
@@ -425,13 +440,23 @@ mod tests {
     }
 
     fn eoa(balance: u64, nonce: u64) -> AccountInfo {
-        AccountInfo { balance: U256::from(balance), nonce, code_hash: KECCAK_EMPTY, account_id: None, code: None }
+        AccountInfo {
+            balance: U256::from(balance),
+            nonce,
+            code_hash: KECCAK_EMPTY,
+            account_id: None,
+            code: None,
+        }
     }
 
     /// Seed a mix of accounts (EOAs, a contract with multiple storage slots, an account with a
     /// single slot) and enough distinct addresses to force real branch nodes.
     fn seed(db: &StateDb) {
-        db.put_account(&address!("0000000000000000000000000000000000000001"), &eoa(100, 1)).unwrap();
+        db.put_account(
+            &address!("0000000000000000000000000000000000000001"),
+            &eoa(100, 1),
+        )
+        .unwrap();
 
         let contract = address!("00000000000000000000000000000000000000aa");
         db.put_account(
@@ -445,20 +470,25 @@ mod tests {
             },
         )
         .unwrap();
-        db.put_storage(&contract, &U256::from(0u64), &U256::from(42u64)).unwrap();
-        db.put_storage(&contract, &U256::from(1u64), &U256::from(99u64)).unwrap();
-        db.put_storage(&contract, &U256::from(1000u64), &U256::from(7u64)).unwrap();
+        db.put_storage(&contract, &U256::from(0u64), &U256::from(42u64))
+            .unwrap();
+        db.put_storage(&contract, &U256::from(1u64), &U256::from(99u64))
+            .unwrap();
+        db.put_storage(&contract, &U256::from(1000u64), &U256::from(7u64))
+            .unwrap();
 
         for i in 2..9u8 {
             let mut bytes = [0u8; 20];
             bytes[0] = i;
             bytes[19] = i;
-            db.put_account(&Address::from(bytes), &eoa(i as u64 * 1000, i as u64)).unwrap();
+            db.put_account(&Address::from(bytes), &eoa(i as u64 * 1000, i as u64))
+                .unwrap();
         }
 
         let single = address!("00000000000000000000000000000000000000bb");
         db.put_account(&single, &eoa(1, 0)).unwrap();
-        db.put_storage(&single, &U256::from(5u64), &U256::from(123u64)).unwrap();
+        db.put_storage(&single, &U256::from(5u64), &U256::from(123u64))
+            .unwrap();
 
         // Bulk accounts so the (keccak-hashed) trie has guaranteed non-root branch nodes
         // (reth never persists the root node itself), exercising real node persistence + the
@@ -468,10 +498,13 @@ mod tests {
             bytes[0..4].copy_from_slice(&i.to_be_bytes());
             bytes[19] = 0x5a;
             let addr = Address::from(bytes);
-            db.put_account(&addr, &eoa(1_000 + i as u64, i as u64)).unwrap();
+            db.put_account(&addr, &eoa(1_000 + i as u64, i as u64))
+                .unwrap();
             if i % 10 == 0 {
-                db.put_storage(&addr, &U256::from(i), &U256::from(i + 1)).unwrap();
-                db.put_storage(&addr, &U256::from(i + 7), &U256::from(i + 2)).unwrap();
+                db.put_storage(&addr, &U256::from(i), &U256::from(i + 1))
+                    .unwrap();
+                db.put_storage(&addr, &U256::from(i + 7), &U256::from(i + 2))
+                    .unwrap();
             }
         }
     }
@@ -483,7 +516,10 @@ mod tests {
 
         let oracle = compute_state_root_from_db(&db).expect("oracle root");
         let migrated = build_trie_to_cf(&db).expect("migration");
-        assert_eq!(migrated, oracle, "migrated trie root must equal full-scan oracle");
+        assert_eq!(
+            migrated, oracle,
+            "migrated trie root must equal full-scan oracle"
+        );
 
         // Idempotent: re-running reproduces the same root.
         let again = build_trie_to_cf(&db).expect("migration #2");
@@ -493,7 +529,10 @@ mod tests {
         let cf = db.cf_handle(CF_TRIE_ACCOUNTS).unwrap();
         let mut iter = db.inner().raw_iterator_cf(cf);
         iter.seek_to_first();
-        assert!(iter.valid(), "account trie CF should be non-empty after migration");
+        assert!(
+            iter.valid(),
+            "account trie CF should be non-empty after migration"
+        );
     }
 
     /// The EVM determinism gate: the incremental post-bundle root must be byte-identical to the
@@ -530,11 +569,15 @@ mod tests {
             ("empty", BundleState::builder(0..=0).build()),
             (
                 "balance_nonce_change",
-                BundleState::builder(0..=0).state_present_account_info(eoa1, eoa(424_242, 9)).build(),
+                BundleState::builder(0..=0)
+                    .state_present_account_info(eoa1, eoa(424_242, 9))
+                    .build(),
             ),
             (
                 "new_account",
-                BundleState::builder(0..=0).state_present_account_info(new_addr, eoa(7_777, 3)).build(),
+                BundleState::builder(0..=0)
+                    .state_present_account_info(new_addr, eoa(7_777, 3))
+                    .build(),
             ),
             (
                 "storage_insert",
@@ -552,15 +595,21 @@ mod tests {
             ),
             (
                 "account_delete",
-                BundleState::builder(0..=0).state_original_account_info(eoa1, eoa(100, 1)).build(),
+                BundleState::builder(0..=0)
+                    .state_original_account_info(eoa1, eoa(100, 1))
+                    .build(),
             ),
             (
                 "eip161_new_empty",
-                BundleState::builder(0..=0).state_present_account_info(new_addr, eoa(0, 0)).build(),
+                BundleState::builder(0..=0)
+                    .state_present_account_info(new_addr, eoa(0, 0))
+                    .build(),
             ),
             (
                 "eip161_drain_existing",
-                BundleState::builder(0..=0).state_present_account_info(eoa1, eoa(0, 0)).build(),
+                BundleState::builder(0..=0)
+                    .state_present_account_info(eoa1, eoa(0, 0))
+                    .build(),
             ),
             (
                 "combined",
@@ -726,7 +775,10 @@ mod tests {
         let (db, _dir) = temp_db();
         let oracle = compute_state_root_from_db(&db).expect("oracle root");
         let migrated = build_trie_to_cf(&db).expect("migration");
-        assert_eq!(migrated, oracle, "empty-state migration must match oracle (EMPTY_ROOT_HASH)");
+        assert_eq!(
+            migrated, oracle,
+            "empty-state migration must match oracle (EMPTY_ROOT_HASH)"
+        );
     }
 
     /// Regression for the devnet-smoke finding: SEQUENTIAL incremental commits must keep the
@@ -783,7 +835,10 @@ mod tests {
             // And the committed trie itself stays consistent.
             let incremental = incremental_evm_root(&db, &empty()).unwrap().0;
             let full = full_post_bundle_evm_root(&db, &empty()).unwrap();
-            assert_eq!(incremental, full, "round {round}: committed trie drifted (POST-commit)");
+            assert_eq!(
+                incremental, full,
+                "round {round}: committed trie drifted (POST-commit)"
+            );
         }
     }
 
@@ -856,7 +911,8 @@ mod tests {
             for i in 0..n {
                 let mut b = [0u8; 20];
                 b[0..4].copy_from_slice(&i.to_be_bytes());
-                db.put_account(&Address::from(b), &eoa(1_000 + i as u64, i as u64)).unwrap();
+                db.put_account(&Address::from(b), &eoa(1_000 + i as u64, i as u64))
+                    .unwrap();
             }
             build_trie_to_cf(&db).unwrap();
 

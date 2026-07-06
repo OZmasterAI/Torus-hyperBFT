@@ -40,7 +40,11 @@ pub(crate) async fn cmd_update_commission(
     .await
 }
 
-pub(crate) async fn cmd_jail_vote(cli: &Cli, rpc: &RpcClient, validator: &str) -> Result<(), String> {
+pub(crate) async fn cmd_jail_vote(
+    cli: &Cli,
+    rpc: &RpcClient,
+    validator: &str,
+) -> Result<(), String> {
     let target = parse_address(validator)?;
     submit_native_action(cli, rpc, NativeAction::JailVote { target }).await
 }
@@ -49,9 +53,18 @@ pub(crate) async fn cmd_unjail(cli: &Cli, rpc: &RpcClient) -> Result<(), String>
     submit_native_action(cli, rpc, NativeAction::UnjailSelf).await
 }
 
-pub(crate) async fn cmd_rotate_key(cli: &Cli, rpc: &RpcClient, new_pubkey: &str) -> Result<(), String> {
+pub(crate) async fn cmd_rotate_key(
+    cli: &Cli,
+    rpc: &RpcClient,
+    new_pubkey: &str,
+) -> Result<(), String> {
     let pk = parse_pubkey(new_pubkey)?;
-    submit_native_action(cli, rpc, NativeAction::RotateValidatorKey { new_pubkey: pk }).await
+    submit_native_action(
+        cli,
+        rpc,
+        NativeAction::RotateValidatorKey { new_pubkey: pk },
+    )
+    .await
 }
 
 #[cfg(test)]

@@ -55,7 +55,6 @@ pub enum EconomicsError {
     DeployerNotFound(Address),
 
     // Governance errors (task 2.8)
-
     #[error("proposal {0} not found")]
     ProposalNotFound(u64),
 
@@ -100,7 +99,6 @@ pub enum EconomicsError {
     ProposalNotPassed(u64),
 
     // Slashing & Jailing errors (Phase 3: 3.1)
-
     #[error("validator {0} is not jailed")]
     ValidatorNotJailed(Address),
 
@@ -115,7 +113,6 @@ pub enum EconomicsError {
     },
 
     // Key rotation errors (Phase 3: 3.1.8)
-
     #[error("validator {0} already has a pending key rotation")]
     KeyRotationAlreadyPending(Address),
 
@@ -129,7 +126,6 @@ pub enum EconomicsError {
     CannotRotateWhileJailed(Address),
 
     // Dynamic validator set errors (Phase 3: 3.2)
-
     #[error("validator registration not approved by governance for {0}")]
     ValidatorNotWhitelisted(Address),
 
@@ -143,7 +139,6 @@ pub enum EconomicsError {
     BelowMinimumActiveSet { have: usize, need: usize },
 
     // Unbonding queue cap (ECON-FIND-30)
-
     #[error("too many unbonding entries for {delegator} -> {validator} (max 100)")]
     TooManyUnbondingEntries {
         delegator: Address,
@@ -151,7 +146,6 @@ pub enum EconomicsError {
     },
 
     // Permanent unlock errors (governance escape hatch)
-
     #[error("permanent stake not found for {0}")]
     PermanentStakeNotFound(Address),
 
@@ -159,7 +153,6 @@ pub enum EconomicsError {
     PermanentUnlockExceedsStake { amount: U256, stake: U256 },
 
     // Governance initialization (FIX MED-NEW-15)
-
     #[error("governance params not initialized — call set_governance_params at genesis")]
     GovernanceNotInitialized,
 }

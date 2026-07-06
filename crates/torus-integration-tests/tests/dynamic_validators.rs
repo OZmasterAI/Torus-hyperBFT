@@ -59,9 +59,7 @@ fn register_validator(staking: &StakingManager, n: u8, stake_tokens: u64) -> Add
     let a = addr(n);
     let stake = wei(stake_tokens);
     staking.credit_balance(&a, stake + wei(10_000)).unwrap();
-    staking
-        .register_validator(a, [n; 32], 500, stake)
-        .unwrap();
+    staking.register_validator(a, [n; 32], 500, stake).unwrap();
     a
 }
 
@@ -93,8 +91,7 @@ fn whitelist_candidate(
         )
         .unwrap();
 
-    gov.cast_vote(*proposer, prop_id, true, block + 1)
-        .unwrap();
+    gov.cast_vote(*proposer, prop_id, true, block + 1).unwrap();
 
     // FIX 15 (745a98a): finalize starts the 5-block timelock; execution is a
     // separate step (same two-phase contract as governance_tests.rs).
@@ -591,7 +588,9 @@ fn test_unjail_and_reenter_active_set() {
     EpochManager::update_validator_statuses(&staking, &set1).unwrap();
 
     // Jail v1 at block 100
-    staking.jail_validator(&v1, JAIL_DURATION_BLOCKS, 100).unwrap();
+    staking
+        .jail_validator(&v1, JAIL_DURATION_BLOCKS, 100)
+        .unwrap();
 
     // Epoch 2: v1 excluded
     let set2 = EpochManager::compute_new_validator_set(&staking, 10, 2).unwrap();
@@ -766,7 +765,9 @@ fn test_rewards_preserved_on_validator_departure() {
     staking.credit_rewards(v1, wei(1_000)).unwrap();
 
     // Jail v1 → will be removed at next epoch
-    staking.jail_validator(&v1, JAIL_DURATION_BLOCKS, 100).unwrap();
+    staking
+        .jail_validator(&v1, JAIL_DURATION_BLOCKS, 100)
+        .unwrap();
 
     // Epoch rotation removes v1
     let set = EpochManager::compute_new_validator_set(&staking, 10, 2).unwrap();

@@ -266,12 +266,7 @@ fn treasury_credit_and_tracking() {
     fund(&mgr, &treasury, U256::ZERO);
 
     FeeSplitter::credit_treasury(&mgr, &treasury, wei(2_000)).unwrap();
-    let bal = mgr
-        .state()
-        .get_account(&treasury)
-        .unwrap()
-        .unwrap()
-        .balance;
+    let bal = mgr.state().get_account(&treasury).unwrap().unwrap().balance;
     assert_eq!(bal, wei(2_000));
 
     let tracker = FeeSplitter::get_supply_tracker(&mgr).unwrap();
@@ -279,12 +274,7 @@ fn treasury_credit_and_tracking() {
 
     // Second credit accumulates.
     FeeSplitter::credit_treasury(&mgr, &treasury, wei(3_000)).unwrap();
-    let bal = mgr
-        .state()
-        .get_account(&treasury)
-        .unwrap()
-        .unwrap()
-        .balance;
+    let bal = mgr.state().get_account(&treasury).unwrap().unwrap().balance;
     assert_eq!(bal, wei(5_000));
 
     let tracker = FeeSplitter::get_supply_tracker(&mgr).unwrap();

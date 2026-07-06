@@ -6,10 +6,10 @@
 use borsh::BorshSerialize;
 use rand_core::OsRng;
 
+use hotstuff_rs::hotstuff::messages::Proposal;
 use hotstuff_rs::hotstuff::types::{
     is_fresh_proposal, NECollector, NoEndorsementCertificate, Phase, PhaseCertificate,
 };
-use hotstuff_rs::hotstuff::messages::Proposal;
 use hotstuff_rs::pacemaker::types::TimeoutCertificate;
 use hotstuff_rs::types::block::Block;
 use hotstuff_rs::types::crypto_primitives::{Signer, SigningKey};
@@ -46,11 +46,7 @@ fn make_block(height: u64, justify: PhaseCertificate) -> Block {
     )
 }
 
-fn sign_ne(
-    keypair: &SigningKey,
-    view: ViewNumber,
-    high_tip_qc_view: ViewNumber,
-) -> SignatureBytes {
+fn sign_ne(keypair: &SigningKey, view: ViewNumber, high_tip_qc_view: ViewNumber) -> SignatureBytes {
     let msg = (view, high_tip_qc_view).try_to_vec().unwrap();
     let sig = keypair.sign(&msg);
     SignatureBytes::new(sig.to_bytes())
@@ -83,7 +79,11 @@ fn nec_and_qc_cannot_coexist_4_validators() {
             sig,
         );
         if i < 2 {
-            assert!(result.is_none(), "NEC should not form with only {} sigs", i + 1);
+            assert!(
+                result.is_none(),
+                "NEC should not form with only {} sigs",
+                i + 1
+            );
         } else {
             assert!(result.is_some(), "NEC should form with 3 sigs");
         }
@@ -280,7 +280,7 @@ fn is_not_fresh_for_reproposal() {
         view: ViewNumber::new(4),
         signatures: SignatureSet::new(0),
         high_tip: None,
-        high_qc: None,       // No high_qc
+        high_qc: None,            // No high_qc
         high_tip_is_winner: true, // high_tip wins
         voter_metadata: vec![],
     };
@@ -291,7 +291,10 @@ fn is_not_fresh_for_reproposal() {
         tc: Some(tc),
         nec: None,
     };
-    assert!(!is_fresh_proposal(&proposal), "Reproposal should NOT be fresh");
+    assert!(
+        !is_fresh_proposal(&proposal),
+        "Reproposal should NOT be fresh"
+    );
 }
 
 /// Non-consecutive view without TC or NEC is NOT fresh.
@@ -312,7 +315,10 @@ fn is_not_fresh_for_non_consecutive() {
         tc: None,
         nec: None,
     };
-    assert!(!is_fresh_proposal(&proposal), "Non-consecutive should NOT be fresh");
+    assert!(
+        !is_fresh_proposal(&proposal),
+        "Non-consecutive should NOT be fresh"
+    );
 }
 
 // ============================================================================

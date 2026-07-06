@@ -101,12 +101,7 @@ fn permanent_staking_rewards_go_to_liquid_balance() {
 
     mgr.permanent_stake(staker, wei(50_000), 0).unwrap();
 
-    let balance_before = mgr
-        .state()
-        .get_account(&staker)
-        .unwrap()
-        .unwrap()
-        .balance;
+    let balance_before = mgr.state().get_account(&staker).unwrap().unwrap().balance;
     assert_eq!(balance_before, wei(50_000));
 
     let blocks_in_epoch = 100_000u64;
@@ -117,12 +112,7 @@ fn permanent_staking_rewards_go_to_liquid_balance() {
     assert!(!minted.is_zero());
 
     // Verify rewards went to liquid balance (non-auto-compounding).
-    let balance_after = mgr
-        .state()
-        .get_account(&staker)
-        .unwrap()
-        .unwrap()
-        .balance;
+    let balance_after = mgr.state().get_account(&staker).unwrap().unwrap().balance;
     assert_eq!(balance_after, balance_before + minted);
 
     // Permanent stake should NOT have changed (not auto-compounded).
@@ -201,7 +191,6 @@ fn lock_more_than_balance_fails() {
 #[test]
 fn no_permanent_stakers_distributes_nothing() {
     let (_dir, mgr) = setup();
-    let minted =
-        RewardDistributor::distribute_permanent_staking_rewards(&mgr, 100_000).unwrap();
+    let minted = RewardDistributor::distribute_permanent_staking_rewards(&mgr, 100_000).unwrap();
     assert_eq!(minted, U256::ZERO);
 }

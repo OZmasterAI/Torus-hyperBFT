@@ -66,8 +66,7 @@ pub trait StateBackend: Clone + Send + Sync {
         pubkey: &[u8; 32],
         data: &torus_types::SessionData,
     ) -> Result<(), StateError> {
-        let bytes =
-            serde_json::to_vec(data).map_err(|e| StateError::InvalidData(e.to_string()))?;
+        let bytes = serde_json::to_vec(data).map_err(|e| StateError::InvalidData(e.to_string()))?;
         self.put_cf_raw(CF_SESSIONS, pubkey, &bytes)
     }
 
@@ -253,8 +252,7 @@ impl NativeStateOverlay {
                 }
                 None => {
                     if bundle_acct.original_info.is_some() {
-                        let _ =
-                            StateBackend::delete_cf_raw(self, CF_ACCOUNTS, address.as_slice());
+                        let _ = StateBackend::delete_cf_raw(self, CF_ACCOUNTS, address.as_slice());
                     }
                 }
             }
@@ -662,11 +660,16 @@ mod tests {
         overlay.flush_with_native_trie(&db).unwrap();
 
         assert_eq!(
-            StateDb::get_cf_raw(&db, CF_NATIVE_BALANCES, b"\x00\x01acct").unwrap().unwrap(),
+            StateDb::get_cf_raw(&db, CF_NATIVE_BALANCES, b"\x00\x01acct")
+                .unwrap()
+                .unwrap(),
             b"bal1"
         );
         let persisted = crate::native_trie::persisted_native_root(&db).unwrap();
-        assert_eq!(persisted, crate::native_trie::native_root_full(&db).unwrap());
+        assert_eq!(
+            persisted,
+            crate::native_trie::native_root_full(&db).unwrap()
+        );
         assert_ne!(persisted, crate::trie::EMPTY_ROOT_HASH);
     }
 }

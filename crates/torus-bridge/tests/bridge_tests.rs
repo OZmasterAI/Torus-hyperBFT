@@ -78,7 +78,15 @@ fn build_signed_transfer_with_tip(
     max_fee_per_gas: u128,
     max_priority_fee_per_gas: u128,
 ) -> Vec<u8> {
-    build_signed_tx(sk, to, value, nonce, max_fee_per_gas, max_priority_fee_per_gas, 21_000)
+    build_signed_tx(
+        sk,
+        to,
+        value,
+        nonce,
+        max_fee_per_gas,
+        max_priority_fee_per_gas,
+        21_000,
+    )
 }
 
 /// Build a signed EIP-1559 tx with an explicit gas_limit (for refund tests).
@@ -494,7 +502,10 @@ fn block_hash_uses_canonical_encoding() {
     // Canonical bytes must be deterministic across calls.
     let bytes1 = header.canonical_header_bytes();
     let bytes2 = header.canonical_header_bytes();
-    assert_eq!(bytes1, bytes2, "canonical_header_bytes must be deterministic");
+    assert_eq!(
+        bytes1, bytes2,
+        "canonical_header_bytes must be deterministic"
+    );
 
     // Hash from canonical bytes must be deterministic.
     let hash1 = alloy_primitives::keccak256(&bytes1);
@@ -526,11 +537,13 @@ fn commit_block_hash_is_canonical() {
     let rlp = build_signed_transfer(&sk, bob, U256::from(1_000u64), 0, base_fee);
     let proposed = h.propose(vec![rlp], Address::ZERO);
     let block = &proposed.block;
-    let validated = h.validator.validate_block(block, &h.db, &h.executor).unwrap();
+    let validated = h
+        .validator
+        .validate_block(block, &h.db, &h.executor)
+        .unwrap();
 
     let block_hash =
-        BlockCommitter::commit_block(&h.db, block, &validated.bundle, &validated.receipts)
-            .unwrap();
+        BlockCommitter::commit_block(&h.db, block, &validated.bundle, &validated.receipts).unwrap();
 
     // Independently compute the expected hash from canonical bytes.
     let expected_hash = alloy_primitives::keccak256(&block.header.canonical_header_bytes());
@@ -580,8 +593,13 @@ fn gas_accounting_sender_balance_deducted() {
         .validator
         .validate_block(&proposed.block, &h.db, &h.executor)
         .unwrap();
-    BlockCommitter::commit_block(&h.db, &proposed.block, &validated.bundle, &validated.receipts)
-        .unwrap();
+    BlockCommitter::commit_block(
+        &h.db,
+        &proposed.block,
+        &validated.bundle,
+        &validated.receipts,
+    )
+    .unwrap();
 
     let alice_after = h.db.get_account(&alice).unwrap().unwrap();
     // Sender pays: gas_used * max_fee_per_gas + value
@@ -621,8 +639,13 @@ fn gas_accounting_tip_to_proposer() {
         .validator
         .validate_block(&proposed.block, &h.db, &h.executor)
         .unwrap();
-    BlockCommitter::commit_block(&h.db, &proposed.block, &validated.bundle, &validated.receipts)
-        .unwrap();
+    BlockCommitter::commit_block(
+        &h.db,
+        &proposed.block,
+        &validated.bundle,
+        &validated.receipts,
+    )
+    .unwrap();
 
     let proposer_acct = h.db.get_account(&proposer).unwrap().unwrap();
     // Proposer receives: gas_used * (max_fee - block_base_fee)
@@ -661,8 +684,13 @@ fn gas_accounting_base_fee_burned() {
         .validator
         .validate_block(&proposed.block, &h.db, &h.executor)
         .unwrap();
-    BlockCommitter::commit_block(&h.db, &proposed.block, &validated.bundle, &validated.receipts)
-        .unwrap();
+    BlockCommitter::commit_block(
+        &h.db,
+        &proposed.block,
+        &validated.bundle,
+        &validated.receipts,
+    )
+    .unwrap();
 
     let alice_after = h.db.get_account(&alice).unwrap().unwrap();
     let bob_after = h.db.get_account(&bob).unwrap().unwrap();
@@ -812,8 +840,13 @@ fn gas_accounting_tip_capped_by_max_fee() {
         .validator
         .validate_block(&proposed.block, &h.db, &h.executor)
         .unwrap();
-    BlockCommitter::commit_block(&h.db, &proposed.block, &validated.bundle, &validated.receipts)
-        .unwrap();
+    BlockCommitter::commit_block(
+        &h.db,
+        &proposed.block,
+        &validated.bundle,
+        &validated.receipts,
+    )
+    .unwrap();
 
     // Proposer receives: gas_used * (max_fee - block_base_fee)
     let proposer_per_gas = max_fee - block_base_fee as u128;
@@ -828,8 +861,7 @@ fn gas_accounting_tip_capped_by_max_fee() {
     // effective_gas_price = block_base_fee + min(tip, max_fee - block_base_fee)
     //                     = block_base_fee + (max_fee - block_base_fee) = max_fee
     assert_eq!(
-        validated.receipts[0].effective_gas_price,
-        max_fee as u64,
+        validated.receipts[0].effective_gas_price, max_fee as u64,
         "effective_gas_price should equal max_fee when tip is capped to headroom"
     );
 }
@@ -904,14 +936,22 @@ fn gas_accounting_unused_gas_refunded_to_sender() {
     let block_base_fee = proposed.block.header.base_fee_per_gas;
 
     // Confirm the transfer used exactly 21_000 gas.
-    assert_eq!(proposed.block.header.evm_gas_used, 21_000, "transfer should use 21k gas");
+    assert_eq!(
+        proposed.block.header.evm_gas_used, 21_000,
+        "transfer should use 21k gas"
+    );
 
     let validated = h
         .validator
         .validate_block(&proposed.block, &h.db, &h.executor)
         .unwrap();
-    BlockCommitter::commit_block(&h.db, &proposed.block, &validated.bundle, &validated.receipts)
-        .unwrap();
+    BlockCommitter::commit_block(
+        &h.db,
+        &proposed.block,
+        &validated.bundle,
+        &validated.receipts,
+    )
+    .unwrap();
 
     let gas_used: u64 = 21_000;
     let gas_unused = gas_limit - gas_used;
@@ -935,5 +975,8 @@ fn gas_accounting_unused_gas_refunded_to_sender() {
 
     // Sanity: bob received the value.
     let bob_after = h.db.get_account(&bob).unwrap().unwrap();
-    assert_eq!(bob_after.balance, value, "bob should receive the transferred value");
+    assert_eq!(
+        bob_after.balance, value,
+        "bob should receive the transferred value"
+    );
 }

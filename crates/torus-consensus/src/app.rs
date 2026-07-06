@@ -27,16 +27,16 @@ use hotstuff_rs::types::data_types::{CryptoHash, Data, Datum, Power};
 use hotstuff_rs::types::update_sets::ValidatorSetUpdates;
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
 use std::sync::mpsc::SyncSender;
+use std::sync::{Arc, RwLock};
 use std::thread::JoinHandle;
 use torus_bridge::{
-    sort_native_actions, decode_all_txs, BlockCommitter, BlockProposer, BlockValidator,
+    decode_all_txs, sort_native_actions, BlockCommitter, BlockProposer, BlockValidator,
     BundleState, NativeExecContext, NativeExecutor,
 };
-use torus_mempool::Mempool;
 use torus_economics::{EpochManager, SlashReason, StakingManager};
 use torus_evm::{EvmExecutor, TORUS_CHAIN_ID};
+use torus_mempool::Mempool;
 use torus_state::cf::{
     CF_BLOCK_BODIES, CF_BLOCK_HEADERS, CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT,
 };
@@ -92,8 +92,11 @@ impl LeaderState {
 
     pub fn current_leader(&self) -> Option<VerifyingKey> {
         let vs = self.validators.read().unwrap();
-        if vs.len() == 0 { return None; }
-        let view = hotstuff_rs::types::data_types::ViewNumber::new(self.view.load(Ordering::Relaxed));
+        if vs.len() == 0 {
+            return None;
+        }
+        let view =
+            hotstuff_rs::types::data_types::ViewNumber::new(self.view.load(Ordering::Relaxed));
         Some(hotstuff_rs::pacemaker::select_leader(view, &vs))
     }
 }
@@ -154,15 +157,13 @@ fn find_last_committed_height(state_db: &StateDb) -> Option<u64> {
     let db = state_db.inner();
     let cf = db.cf_handle(CF_BLOCK_HEADERS)?;
     let mut iter = db.iterator_cf(cf, rocksdb::IteratorMode::End);
-    iter.next()
-        .and_then(|r| r.ok())
-        .and_then(|(key, _)| {
-            if key.len() == 8 {
-                Some(u64::from_be_bytes(key[..8].try_into().ok()?))
-            } else {
-                None
-            }
-        })
+    iter.next().and_then(|r| r.ok()).and_then(|(key, _)| {
+        if key.len() == 8 {
+            Some(u64::from_be_bytes(key[..8].try_into().ok()?))
+        } else {
+            None
+        }
+    })
 }
 
 fn persist_block_header(state_db: &StateDb, block: &TorusBlock) {
@@ -177,11 +178,8 @@ fn persist_block_header(state_db: &StateDb, block: &TorusBlock) {
     let mut data = Vec::with_capacity(32 + header_json.len());
     data.extend_from_slice(block_hash.as_slice());
     data.extend_from_slice(&header_json);
-    if let Err(e) = state_db.put_cf_raw(
-        CF_BLOCK_HEADERS,
-        &block.header.height.to_be_bytes(),
-        &data,
-    ) {
+    if let Err(e) = state_db.put_cf_raw(CF_BLOCK_HEADERS, &block.header.height.to_be_bytes(), &data)
+    {
         tracing::error!(%e, height = block.header.height, "failed to persist block header");
     }
 }
@@ -189,12 +187,20 @@ fn persist_block_header(state_db: &StateDb, block: &TorusBlock) {
 // ---- Execution pipeline ----
 
 impl ExecutionContext {
-    fn execute_committed_block(&self, torus_block: &TorusBlock, pending_slashes: Vec<PendingSlash>) {
+    fn execute_committed_block(
+        &self,
+        torus_block: &TorusBlock,
+        pending_slashes: Vec<PendingSlash>,
+    ) {
         let height = torus_block.header.height;
 
         if let Some(applied) = read_native_applied_height(&self.state_db) {
             if applied >= height {
-                tracing::debug!(height, applied, "execution pipeline: already applied, skipping");
+                tracing::debug!(
+                    height,
+                    applied,
+                    "execution pipeline: already applied, skipping"
+                );
                 return;
             }
         }
@@ -204,12 +210,10 @@ impl ExecutionContext {
         let block_timer = std::time::Instant::now();
 
         for slash in pending_slashes {
-            match self.staking.slash(
-                slash.validator,
-                slash.fraction_bps,
-                slash.reason.clone(),
-                0,
-            ) {
+            match self
+                .staking
+                .slash(slash.validator, slash.fraction_bps, slash.reason.clone(), 0)
+            {
                 Ok(amount) => {
                     tracing::info!(
                         %slash.validator,
@@ -259,7 +263,8 @@ impl ExecutionContext {
                 &self.evm_executor,
             ) {
                 Ok(validated) => {
-                    computed_fee_revenue = torus_bridge::proposer::compute_fee_revenue(&validated.receipts);
+                    computed_fee_revenue =
+                        torus_bridge::proposer::compute_fee_revenue(&validated.receipts);
                     // Phase A: commit EVM plain state + the hashed mirror + the incremental trie
                     // nodes in ONE atomic batch, so CF_HASHED_*/CF_TRIE_* stay in lockstep with
                     // CF_ACCOUNTS (keeps the incremental root's base correct across restarts/replay).
@@ -325,7 +330,8 @@ impl ExecutionContext {
                 vec![]
             };
             if let Some(ref m) = self.metrics {
-                m.exec_verify_seconds.observe(verify_timer.elapsed().as_secs_f64());
+                m.exec_verify_seconds
+                    .observe(verify_timer.elapsed().as_secs_f64());
             }
 
             let invalid_count = resolved_senders.iter().filter(|s| s.is_none()).count();
@@ -343,7 +349,10 @@ impl ExecutionContext {
                 ) {
                     tracing::error!(%e, "CRITICAL: failed to slash proposer for invalid attestation");
                 }
-                if let Err(e) = self.staking.tombstone_validator(&torus_block.header.proposer) {
+                if let Err(e) = self
+                    .staking
+                    .tombstone_validator(&torus_block.header.proposer)
+                {
                     tracing::error!(%e, "CRITICAL: failed to tombstone proposer for invalid attestation");
                 }
             }
@@ -385,8 +394,10 @@ impl ExecutionContext {
                 sender_actions.push((sender, signed.action.clone()));
             }
             if let Some(ref m) = self.metrics {
-                m.exec_replay_guard_seconds.observe(replay_guard_timer.elapsed().as_secs_f64());
-                m.native_actions_processed.inc_by(sender_actions.len() as u64);
+                m.exec_replay_guard_seconds
+                    .observe(replay_guard_timer.elapsed().as_secs_f64());
+                m.native_actions_processed
+                    .inc_by(sender_actions.len() as u64);
             }
 
             let overlay = NativeStateOverlay::new(self.state_db.clone());
@@ -418,13 +429,15 @@ impl ExecutionContext {
             NativeExecutor::distribute_fees(&mut ctx, computed_fee_revenue);
             NativeExecutor::process_epoch_boundary(&mut ctx);
             if let Some(ref m) = self.metrics {
-                m.exec_engine_seconds.observe(engine_timer.elapsed().as_secs_f64());
+                m.exec_engine_seconds
+                    .observe(engine_timer.elapsed().as_secs_f64());
             }
 
             let save_books_timer = std::time::Instant::now();
             ctx.save_order_books();
             if let Some(ref m) = self.metrics {
-                m.exec_save_books_seconds.observe(save_books_timer.elapsed().as_secs_f64());
+                m.exec_save_books_seconds
+                    .observe(save_books_timer.elapsed().as_secs_f64());
             }
 
             let flush_timer = std::time::Instant::now();
@@ -459,7 +472,8 @@ impl ExecutionContext {
                 tracing::error!(%e, height, "failed to resync incremental trie after native post-commit");
             }
             if let Some(ref m) = self.metrics {
-                m.exec_flush_seconds.observe(flush_timer.elapsed().as_secs_f64());
+                m.exec_flush_seconds
+                    .observe(flush_timer.elapsed().as_secs_f64());
             }
 
             // O3: hand this block's buffered trade-history KVs to the background
@@ -487,11 +501,9 @@ impl ExecutionContext {
 
         // ---- Persist block body for RPC queries ----
         if let Ok(body_bytes) = serde_json::to_vec(&torus_block.body()) {
-            let _ = self.state_db.put_cf_raw(
-                CF_BLOCK_BODIES,
-                &height.to_be_bytes(),
-                &body_bytes,
-            );
+            let _ = self
+                .state_db
+                .put_cf_raw(CF_BLOCK_BODIES, &height.to_be_bytes(), &body_bytes);
         }
 
         // ---- Update tracking ----
@@ -503,7 +515,8 @@ impl ExecutionContext {
             let tx_count = torus_block.header.evm_tx_count as u64
                 + torus_block.header.native_action_count as u64;
             m.block_transactions_count.observe(tx_count as f64);
-            m.exec_block_seconds.observe(block_timer.elapsed().as_secs_f64());
+            m.exec_block_seconds
+                .observe(block_timer.elapsed().as_secs_f64());
         }
 
         tracing::info!(height, "execution pipeline: block done");
@@ -725,9 +738,12 @@ impl TorusApp {
             config.dev_pool_address,
         );
         validator.metrics = metrics.clone();
-        let genesis_validator_set = EpochManager::compute_new_validator_set(
-            &staking, config.max_validators, 0,
-        ).unwrap_or_else(|_| ValidatorSet { validators: vec![], epoch: 0 });
+        let genesis_validator_set =
+            EpochManager::compute_new_validator_set(&staking, config.max_validators, 0)
+                .unwrap_or_else(|_| ValidatorSet {
+                    validators: vec![],
+                    epoch: 0,
+                });
 
         // Execution pipeline context — owns its own copies for thread safety.
         let mut exec_validator = BlockValidator::new(
@@ -909,26 +925,31 @@ impl TorusApp {
 
         last_header = header.clone();
 
-        let body: TorusBlockBody = match state_db
-            .get_cf_raw(CF_BLOCK_BODIES, &committed.to_be_bytes())
-        {
-            Ok(Some(data)) => match serde_json::from_slice(&data) {
-                Ok(b) => b,
-                Err(e) => {
-                    tracing::error!(%e, "crash recovery: failed to deserialize block body");
+        let body: TorusBlockBody =
+            match state_db.get_cf_raw(CF_BLOCK_BODIES, &committed.to_be_bytes()) {
+                Ok(Some(data)) => match serde_json::from_slice(&data) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::error!(%e, "crash recovery: failed to deserialize block body");
+                        write_native_applied_height(state_db, committed);
+                        return last_header;
+                    }
+                },
+                _ => {
+                    tracing::info!(
+                        height = committed,
+                        "crash recovery: no block body (empty block), marking applied"
+                    );
                     write_native_applied_height(state_db, committed);
                     return last_header;
                 }
-            },
-            _ => {
-                tracing::info!(height = committed, "crash recovery: no block body (empty block), marking applied");
-                write_native_applied_height(state_db, committed);
-                return last_header;
-            }
-        };
+            };
 
         if body.native_actions.is_empty() && body.evm_transactions.is_empty() {
-            tracing::info!(height = committed, "crash recovery: empty block, marking applied");
+            tracing::info!(
+                height = committed,
+                "crash recovery: empty block, marking applied"
+            );
             write_native_applied_height(state_db, committed);
             return last_header;
         }
@@ -1062,7 +1083,10 @@ impl TorusApp {
             if now >= deadline {
                 break;
             }
-            torus_state::NativeDaStore::wait_for_arrival(seen, std::cmp::min(delay, deadline - now));
+            torus_state::NativeDaStore::wait_for_arrival(
+                seen,
+                std::cmp::min(delay, deadline - now),
+            );
             Self::absorb_fetched_bodies(mempool, fetcher.as_ref());
             if missing.iter().all(|h| mempool.get_native_da(h).is_some()) {
                 if let Some(ref m) = self.metrics {
@@ -1074,7 +1098,10 @@ impl TorusApp {
             // Fold in our own absorb puts so they don't self-wake the next wait.
             seen = torus_state::NativeDaStore::arrival_generation();
         }
-        tracing::warn!(count = missing.len(), "native-da pull: bodies NOT recovered within budget");
+        tracing::warn!(
+            count = missing.len(),
+            "native-da pull: bodies NOT recovered within budget"
+        );
         false
     }
 
@@ -1126,8 +1153,8 @@ impl TorusApp {
             let mut seen = torus_state::NativeDaStore::arrival_generation();
             // Deadline-bounded like the pull loop below (S395): iteration-count
             // bounds stack scheduler overshoot past the hot budget under load.
-            let deadline = std::time::Instant::now()
-                + RECONSTRUCT_RETRY_DELAY * RECONSTRUCT_RETRIES as u32;
+            let deadline =
+                std::time::Instant::now() + RECONSTRUCT_RETRY_DELAY * RECONSTRUCT_RETRIES as u32;
             loop {
                 let now = std::time::Instant::now();
                 if now >= deadline {
@@ -1166,8 +1193,7 @@ impl TorusApp {
         if !missing.is_empty() {
             let missing_hashes: Vec<torus_types::B256> =
                 missing.iter().map(|&i| hashes[i]).collect();
-            if self.pull_missing_bodies_bounded(&missing_hashes, HOT_PULL_RETRIES, HOT_PULL_DELAY)
-            {
+            if self.pull_missing_bodies_bounded(&missing_hashes, HOT_PULL_RETRIES, HOT_PULL_DELAY) {
                 missing.retain(|&i| match mempool.get_native_da(&hashes[i]) {
                     Some(action) => {
                         actions[i] = Some(action);
@@ -1181,7 +1207,10 @@ impl TorusApp {
         if !missing.is_empty() {
             return Err(missing.len());
         }
-        Ok(actions.into_iter().map(|a| a.expect("all bodies present")).collect())
+        Ok(actions
+            .into_iter()
+            .map(|a| a.expect("all bodies present"))
+            .collect())
     }
 
     /// Drain fetched bodies and mirror them into the durable DA store. Each body is
@@ -1250,8 +1279,7 @@ impl TorusApp {
             new_set.clone()
         };
 
-        let diff =
-            EpochManager::compute_validator_set_diff(&self.last_validator_set, &capped_set);
+        let diff = EpochManager::compute_validator_set_diff(&self.last_validator_set, &capped_set);
         if diff.is_empty() {
             self.last_validator_set = capped_set;
             self.cached_vs_updates = Some((height, None));
@@ -1337,11 +1365,14 @@ impl App<RocksKVStore> for TorusApp {
         let parent_header = if let Some(parent_hash) = request.parent_block() {
             if let Ok(Some(parent_block)) = request.block_tree().block(&parent_hash) {
                 let datums = parent_block.data.vec();
-                datums.first()
+                datums
+                    .first()
                     .and_then(|d| {
                         bincode::deserialize::<TorusBlock>(d.bytes())
                             .map(|b| b.header)
-                            .or_else(|_| bincode::deserialize::<CompactBlock>(d.bytes()).map(|cb| cb.header))
+                            .or_else(|_| {
+                                bincode::deserialize::<CompactBlock>(d.bytes()).map(|cb| cb.header)
+                            })
                             .ok()
                     })
                     .unwrap_or_else(|| self.last_header.clone())
@@ -1351,7 +1382,11 @@ impl App<RocksKVStore> for TorusApp {
         } else {
             self.last_header.clone()
         };
-        tracing::info!(parent_height = parent_header.height, local_height = self.last_header.height, "produce_block called (CTE)");
+        tracing::info!(
+            parent_height = parent_header.height,
+            local_height = self.last_header.height,
+            "produce_block called (CTE)"
+        );
 
         // Exec-ceiling Option A: wire the (previously dead) block_build_seconds —
         // covers mempool selection, DA mirror, attestation, construction, encode.
@@ -1376,7 +1411,11 @@ impl App<RocksKVStore> for TorusApp {
             let mut in_flight: std::collections::HashSet<torus_types::B256> = self
                 .pending_proposals
                 .values()
-                .flat_map(|b| b.native_actions.iter().map(torus_types::compute_action_hash))
+                .flat_map(|b| {
+                    b.native_actions
+                        .iter()
+                        .map(torus_types::compute_action_hash)
+                })
                 .collect();
             // Union the hash ledger: covers compact proposals whose bodies never
             // reconstructed (MissingData) — absent from `pending_proposals` but
@@ -1390,7 +1429,11 @@ impl App<RocksKVStore> for TorusApp {
             );
             let evm = mempool.drain_evm(gas_limit, parent_header.state_root);
             if !evm.is_empty() || !native.is_empty() {
-                tracing::info!(evm_txs = evm.len(), native_actions = native.len(), "selected actions for block");
+                tracing::info!(
+                    evm_txs = evm.len(),
+                    native_actions = native.len(),
+                    "selected actions for block"
+                );
             }
             (native, evm)
         } else {
@@ -1445,7 +1488,9 @@ impl App<RocksKVStore> for TorusApp {
         if COMPACT_PROPOSALS && !native_with_senders.is_empty() {
             if let Some(ref tx) = self.pre_proposal_tx {
                 let count = native_with_senders.len();
-                match tx.try_send(PreProposalBundle { actions: native_with_senders }) {
+                match tx.try_send(PreProposalBundle {
+                    actions: native_with_senders,
+                }) {
                     Ok(()) => tracing::info!(count, height, "pre-proposal push sent"),
                     Err(e) => tracing::warn!(count, height, %e, "pre-proposal push failed"),
                 }
@@ -1468,7 +1513,8 @@ impl App<RocksKVStore> for TorusApp {
         let validator_set_updates = self.epoch_validator_set_updates(height);
 
         if let Some(ref m) = self.metrics {
-            m.block_build_seconds.observe(build_timer.elapsed().as_secs_f64());
+            m.block_build_seconds
+                .observe(build_timer.elapsed().as_secs_f64());
         }
 
         ProduceBlockResponse {
@@ -1490,7 +1536,10 @@ impl App<RocksKVStore> for TorusApp {
         let datums = block.data.vec();
 
         if datums.len() != 1 {
-            tracing::warn!(datums_len = datums.len(), "validate_block: REJECTED -- datums.len() != 1");
+            tracing::warn!(
+                datums_len = datums.len(),
+                "validate_block: REJECTED -- datums.len() != 1"
+            );
             return ValidateBlockResponse::Invalid;
         }
 
@@ -1498,7 +1547,10 @@ impl App<RocksKVStore> for TorusApp {
 
         let computed = Self::hash_datum(datum_bytes);
         if block.data_hash != CryptoHash::new(computed) {
-            tracing::warn!(datum_len = datum_bytes.len(), "validate_block: REJECTED -- data_hash mismatch");
+            tracing::warn!(
+                datum_len = datum_bytes.len(),
+                "validate_block: REJECTED -- data_hash mismatch"
+            );
             return ValidateBlockResponse::Invalid;
         }
 
@@ -1523,8 +1575,10 @@ impl App<RocksKVStore> for TorusApp {
             // `pending_proposals`, yet its actions are in flight on the wire — the
             // next leader must still exclude them from selection or they are
             // re-included 2–4x (the s355 duplicate-inclusion tail, mem c0f4f938).
-            self.in_flight_hashes
-                .note(compact.header.height, compact.native_action_hashes.iter().copied());
+            self.in_flight_hashes.note(
+                compact.header.height,
+                compact.native_action_hashes.iter().copied(),
+            );
 
             let native_actions = if compact.native_action_hashes.is_empty() {
                 vec![]
@@ -1673,11 +1727,7 @@ impl App<RocksKVStore> for TorusApp {
     }
 
     /// Send committed block to the execution pipeline thread.
-    fn on_committed_block(
-        &mut self,
-        block: &Block,
-        _committed_hash: CryptoHash,
-    ) {
+    fn on_committed_block(&mut self, block: &Block, _committed_hash: CryptoHash) {
         let datums = block.data.vec();
         let Some(datum) = datums.first() else {
             tracing::debug!("on_committed_block: no datums in block");
@@ -1690,25 +1740,27 @@ impl App<RocksKVStore> for TorusApp {
         // UNCONDITIONALLY (below) so a missing body can never freeze consensus
         // height/view -- the livelock root cause (mem 28e1a821) was an early return
         // here, before last_header advanced, which froze RPC height and churned views.
-        let (header, reconstructed): (TorusBlockHeader, Result<TorusBlock, Vec<torus_types::B256>>) =
-            if let Ok(full) = bincode::deserialize::<TorusBlock>(datum_bytes) {
-                let height = full.header.height;
-                let block = self.pending_proposals.remove(&height).unwrap_or(full);
-                (block.header.clone(), Ok(block))
-            } else if let Ok(compact) = bincode::deserialize::<CompactBlock>(datum_bytes) {
-                let height = compact.header.height;
-                if let Some(cached) = self.pending_proposals.remove(&height) {
-                    (cached.header.clone(), Ok(cached))
-                } else {
-                    (
-                        compact.header.clone(),
-                        self.reconstruct_compact_from_da(&compact),
-                    )
-                }
+        let (header, reconstructed): (
+            TorusBlockHeader,
+            Result<TorusBlock, Vec<torus_types::B256>>,
+        ) = if let Ok(full) = bincode::deserialize::<TorusBlock>(datum_bytes) {
+            let height = full.header.height;
+            let block = self.pending_proposals.remove(&height).unwrap_or(full);
+            (block.header.clone(), Ok(block))
+        } else if let Ok(compact) = bincode::deserialize::<CompactBlock>(datum_bytes) {
+            let height = compact.header.height;
+            if let Some(cached) = self.pending_proposals.remove(&height) {
+                (cached.header.clone(), Ok(cached))
             } else {
-                tracing::warn!("on_committed_block: failed to deserialize block datum");
-                return;
-            };
+                (
+                    compact.header.clone(),
+                    self.reconstruct_compact_from_da(&compact),
+                )
+            }
+        } else {
+            tracing::warn!("on_committed_block: failed to deserialize block datum");
+            return;
+        };
 
         let height = header.height;
         // Committed: these hashes leave the in-flight window. The mempool prunes
@@ -1758,7 +1810,9 @@ impl App<RocksKVStore> for TorusApp {
 
         if !torus_block.native_actions.is_empty() {
             if let Some(ref mempool) = self.mempool {
-                let hashes: Vec<torus_types::B256> = torus_block.native_actions.iter()
+                let hashes: Vec<torus_types::B256> = torus_block
+                    .native_actions
+                    .iter()
                     .map(torus_types::compute_action_hash)
                     .collect();
                 mempool.remove_committed_native(&hashes);
@@ -1783,7 +1837,10 @@ impl App<RocksKVStore> for TorusApp {
                 m.exec_queue_depth.inc();
             }
             if tx.send(msg).is_err() {
-                tracing::error!(height, "execution pipeline channel closed — block will not be executed!");
+                tracing::error!(
+                    height,
+                    "execution pipeline channel closed — block will not be executed!"
+                );
                 if let Some(ref m) = self.metrics {
                     m.exec_queue_depth.dec();
                 }
@@ -1902,7 +1959,8 @@ mod crash_recovery_tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(1000);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("torus-crash-test-{}-{}", std::process::id(), id));
+        let dir =
+            std::env::temp_dir().join(format!("torus-crash-test-{}-{}", std::process::id(), id));
         let _ = std::fs::create_dir_all(&dir);
         let state_db = StateDb::open(&dir).expect("open test db");
         let config = ChainConfig {
@@ -1971,7 +2029,11 @@ mod crash_recovery_tests {
         let body = block.body();
         let body_bytes = serde_json::to_vec(&body).unwrap();
         state_db
-            .put_cf_raw(CF_BLOCK_BODIES, &block.header.height.to_be_bytes(), &body_bytes)
+            .put_cf_raw(
+                CF_BLOCK_BODIES,
+                &block.header.height.to_be_bytes(),
+                &body_bytes,
+            )
             .unwrap();
     }
 
@@ -2017,10 +2079,14 @@ mod crash_recovery_tests {
     }
     impl NativeDaFetcher for PrewarmFetcher {
         fn fetch(&self, _hashes: Vec<[u8; 32]>) {
-            self.fetches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.fetches
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         fn drain(&self) -> Vec<Vec<u8>> {
-            if self.drained.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            if self
+                .drained
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
                 Vec::new()
             } else {
                 vec![self.body.clone()]
@@ -2132,7 +2198,11 @@ mod crash_recovery_tests {
         SignedNativeAction {
             action: NativeAction::PlaceOrderBatch(vec![order; n_orders]),
             nonce,
-            signature: ActionSignature::Eip712(Signature { v: 27, r: [0u8; 32], s: [0u8; 32] }),
+            signature: ActionSignature::Eip712(Signature {
+                v: 27,
+                r: [0u8; 32],
+                s: [0u8; 32],
+            }),
         }
     }
 
@@ -2152,8 +2222,9 @@ mod crash_recovery_tests {
         const MAX_CONSENSUS_MESSAGE_SIZE: usize = 1024 * 1024;
 
         // The bs=500 block shape: 100 actions x 500-order batches = 50k orders.
-        let actions: Vec<SignedNativeAction> =
-            (0..100).map(|i| big_order_batch_action(i as u64, 500)).collect();
+        let actions: Vec<SignedNativeAction> = (0..100)
+            .map(|i| big_order_batch_action(i as u64, 500))
+            .collect();
         let block = make_block(9, actions);
 
         let full = encode_proposal_datum(&block, false);
@@ -2240,7 +2311,11 @@ mod crash_recovery_tests {
         persist_block_for_test(&state_db, &block);
 
         state_db
-            .put_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT, &5u64.to_be_bytes())
+            .put_cf_raw(
+                CF_CONSENSUS_META,
+                META_NATIVE_APPLIED_HEIGHT,
+                &5u64.to_be_bytes(),
+            )
             .unwrap();
 
         let app = TorusApp::new(state_db.clone(), &config, None, None, None);
@@ -2377,7 +2452,11 @@ mod crash_recovery_tests {
         assert_eq!(cached[0], Some(s_cached), "cached HIT == fresh recover");
         assert_eq!(cached[1], Some(s_uncached), "MISS -> full recover");
         assert_eq!(cached[2], None, "invalid sig -> None (slash path input)");
-        assert_eq!(cached[3], Some(s_trusted), "trusted re-verified, not short-circuited");
+        assert_eq!(
+            cached[3],
+            Some(s_trusted),
+            "trusted re-verified, not short-circuited"
+        );
 
         // Provenance: the trusted action was never seeded into the cache.
         let trusted_key = torus_types::verified_cache_key(&a_trusted).unwrap();
@@ -2433,7 +2512,11 @@ mod crash_recovery_tests {
             on_balance, off_balance,
             "execution with a warm trust-cache must reach identical state as cold"
         );
-        assert_eq!(start - on_balance, amount, "executed exactly once, correct debit");
+        assert_eq!(
+            start - on_balance,
+            amount,
+            "executed exactly once, correct debit"
+        );
     }
 
     /// T6: with `--exec-trust-cache` OFF (the default), the cache is never consulted
@@ -2733,7 +2816,11 @@ mod crash_recovery_tests {
     /// fell back to sync, which also timed out). Floor stays ~1 s, cap ~8 s.
     #[test]
     fn sync_pull_retries_scales_with_missing_count() {
-        assert_eq!(sync_pull_retries(0), PULL_RETRIES, "floor at no/low missing");
+        assert_eq!(
+            sync_pull_retries(0),
+            PULL_RETRIES,
+            "floor at no/low missing"
+        );
         assert_eq!(sync_pull_retries(40), PULL_RETRIES, "40/2 == floor");
         assert_eq!(sync_pull_retries(100), 50, "linear midband: ~2 bodies/tick");
         assert_eq!(
@@ -2770,9 +2857,15 @@ mod crash_recovery_tests {
         });
         app.set_native_da_fetcher(fetcher);
 
-        assert!(mempool.get_native_da(&hash).is_none(), "body absent before the pull");
+        assert!(
+            mempool.get_native_da(&hash).is_none(),
+            "body absent before the pull"
+        );
         let recovered = app.pull_missing_bodies(&[hash]);
-        assert!(recovered, "a body arriving after the old 80 ms budget is recovered within ~1 s");
+        assert!(
+            recovered,
+            "a body arriving after the old 80 ms budget is recovered within ~1 s"
+        );
         assert!(
             mempool.get_native_da(&hash).is_some(),
             "the recovered body landed in the durable DA store",
@@ -2806,11 +2899,18 @@ mod crash_recovery_tests {
         });
         app.set_native_da_fetcher(fetcher);
 
-        assert!(mempool.get_native_da(&hash).is_none(), "body absent before the hot pull");
+        assert!(
+            mempool.get_native_da(&hash).is_none(),
+            "body absent before the hot pull"
+        );
         let actions = app
             .reconstruct_native_actions_hot(&[hash])
             .expect("hot path must pull + recover the missing body");
-        assert_eq!(actions.len(), 1, "the recovered action is returned (in hash order)");
+        assert_eq!(
+            actions.len(),
+            1,
+            "the recovered action is returned (in hash order)"
+        );
         assert!(
             mempool.get_native_da(&hash).is_some(),
             "the recovered body landed in the durable DA store",
@@ -2841,11 +2941,18 @@ mod crash_recovery_tests {
         });
         app.set_native_da_fetcher(fetcher.clone());
 
-        assert!(mempool.get_native_da(&hash).is_none(), "body absent before reconstruct");
+        assert!(
+            mempool.get_native_da(&hash).is_none(),
+            "body absent before reconstruct"
+        );
         let actions = app
             .reconstruct_native_actions_hot(&[hash])
             .expect("the pre-warmed body must be absorbed and reconstructed");
-        assert_eq!(actions.len(), 1, "the absorbed action is returned (in hash order)");
+        assert_eq!(
+            actions.len(),
+            1,
+            "the absorbed action is returned (in hash order)"
+        );
         assert!(
             mempool.get_native_da(&hash).is_some(),
             "the pre-warmed body landed in the durable DA store",

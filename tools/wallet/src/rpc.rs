@@ -21,14 +21,19 @@ impl RpcClient {
         }
     }
 
-    pub async fn call(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
+    pub async fn call(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
         let body = serde_json::json!({
             "jsonrpc": "2.0",
             "method": method,
             "params": params,
             "id": 1
         });
-        let resp = self.client
+        let resp = self
+            .client
             .post(&self.url)
             .json(&body)
             .send()
@@ -58,12 +63,19 @@ impl RpcClient {
     }
 
     pub async fn get_balance(&self, addr: &str) -> Result<alloy_primitives::U256, String> {
-        let r = self.call("eth_getBalance", serde_json::json!([addr, "latest"])).await?;
+        let r = self
+            .call("eth_getBalance", serde_json::json!([addr, "latest"]))
+            .await?;
         parse_hex_u256(r.as_str().ok_or("balance not string")?)
     }
 
     pub async fn get_transaction_count(&self, addr: &str) -> Result<u64, String> {
-        let r = self.call("eth_getTransactionCount", serde_json::json!([addr, "latest"])).await?;
+        let r = self
+            .call(
+                "eth_getTransactionCount",
+                serde_json::json!([addr, "latest"]),
+            )
+            .await?;
         parse_hex_u64(r.as_str().ok_or("nonce not string")?)
     }
 
@@ -73,58 +85,87 @@ impl RpcClient {
     }
 
     pub async fn send_raw_transaction(&self, raw_hex: &str) -> Result<String, String> {
-        let r = self.call("eth_sendRawTransaction", serde_json::json!([raw_hex])).await?;
-        r.as_str().map(|s| s.to_string()).ok_or("tx hash not string".to_string())
+        let r = self
+            .call("eth_sendRawTransaction", serde_json::json!([raw_hex]))
+            .await?;
+        r.as_str()
+            .map(|s| s.to_string())
+            .ok_or("tx hash not string".to_string())
     }
 
-    pub async fn get_block_by_number(&self, number: &str, full_txs: bool) -> Result<serde_json::Value, String> {
-        self.call("eth_getBlockByNumber", serde_json::json!([number, full_txs])).await
+    pub async fn get_block_by_number(
+        &self,
+        number: &str,
+        full_txs: bool,
+    ) -> Result<serde_json::Value, String> {
+        self.call(
+            "eth_getBlockByNumber",
+            serde_json::json!([number, full_txs]),
+        )
+        .await
     }
 
     pub async fn get_transaction_by_hash(&self, hash: &str) -> Result<serde_json::Value, String> {
-        self.call("eth_getTransactionByHash", serde_json::json!([hash])).await
+        self.call("eth_getTransactionByHash", serde_json::json!([hash]))
+            .await
     }
 
     // --- torus namespace ---
 
     pub async fn get_balances(&self, addr: &str) -> Result<serde_json::Value, String> {
-        self.call("torus_getBalances", serde_json::json!([addr])).await
+        self.call("torus_getBalances", serde_json::json!([addr]))
+            .await
     }
 
     pub async fn get_validators(&self) -> Result<serde_json::Value, String> {
-        self.call("torus_getValidators", serde_json::json!([])).await
+        self.call("torus_getValidators", serde_json::json!([]))
+            .await
     }
 
     pub async fn get_staking_info(&self, addr: &str) -> Result<serde_json::Value, String> {
-        self.call("torus_getStakingInfo", serde_json::json!([addr])).await
+        self.call("torus_getStakingInfo", serde_json::json!([addr]))
+            .await
     }
 
     pub async fn get_delegations(&self, addr: &str) -> Result<serde_json::Value, String> {
-        self.call("torus_getDelegations", serde_json::json!([addr])).await
+        self.call("torus_getDelegations", serde_json::json!([addr]))
+            .await
     }
 
     pub async fn submit_native_action(&self, signed_action_json: &str) -> Result<String, String> {
         // Server does parse_bytes → hex::decode → serde_json::from_slice.
         // Must send hex-encoded JSON bytes with 0x prefix.
         let hex_payload = format!("0x{}", hex::encode(signed_action_json.as_bytes()));
-        let r = self.call("torus_submitNativeAction", serde_json::json!([hex_payload])).await?;
-        r.as_str().map(|s| s.to_string()).ok_or("result not string".to_string())
+        let r = self
+            .call("torus_submitNativeAction", serde_json::json!([hex_payload]))
+            .await?;
+        r.as_str()
+            .map(|s| s.to_string())
+            .ok_or("result not string".to_string())
     }
 
     pub async fn get_order_book(&self, market_id: &str) -> Result<serde_json::Value, String> {
-        self.call("torus_getOrderBook", serde_json::json!([market_id])).await
+        self.call("torus_getOrderBook", serde_json::json!([market_id]))
+            .await
     }
 
-    pub async fn get_position(&self, addr: &str, market_id: &str) -> Result<serde_json::Value, String> {
-        self.call("torus_getPosition", serde_json::json!([addr, market_id])).await
+    pub async fn get_position(
+        &self,
+        addr: &str,
+        market_id: &str,
+    ) -> Result<serde_json::Value, String> {
+        self.call("torus_getPosition", serde_json::json!([addr, market_id]))
+            .await
     }
 
     pub async fn get_proposals(&self) -> Result<serde_json::Value, String> {
-        self.call("torus_getProposals", serde_json::json!([null])).await
+        self.call("torus_getProposals", serde_json::json!([null]))
+            .await
     }
 
     pub async fn get_proposal(&self, id: u64) -> Result<serde_json::Value, String> {
-        self.call("torus_getProposal", serde_json::json!([id])).await
+        self.call("torus_getProposal", serde_json::json!([id]))
+            .await
     }
 
     pub async fn get_open_orders(
@@ -148,7 +189,8 @@ impl RpcClient {
         offset: Option<u32>,
         limit: Option<u32>,
     ) -> Result<serde_json::Value, String> {
-        self.call("torus_getMarkets", serde_json::json!([offset, limit])).await
+        self.call("torus_getMarkets", serde_json::json!([offset, limit]))
+            .await
     }
 }
 
@@ -188,10 +230,19 @@ mod tests {
     #[test]
     fn test_format_trs() {
         use alloy_primitives::U256;
-        assert_eq!(format_trs(U256::from(1_000_000_000_000_000_000u64)), "1.000000 TRS");
-        assert_eq!(format_trs(U256::from(12_500_000_000_000_000_000u128)), "12.500000 TRS");
+        assert_eq!(
+            format_trs(U256::from(1_000_000_000_000_000_000u64)),
+            "1.000000 TRS"
+        );
+        assert_eq!(
+            format_trs(U256::from(12_500_000_000_000_000_000u128)),
+            "12.500000 TRS"
+        );
         assert_eq!(format_trs(U256::ZERO), "0.000000 TRS");
-        assert_eq!(format_trs(U256::from(500_000_000_000_000u64)), "0.000500 TRS");
+        assert_eq!(
+            format_trs(U256::from(500_000_000_000_000u64)),
+            "0.000500 TRS"
+        );
     }
 
     #[test]

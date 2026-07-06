@@ -81,14 +81,8 @@ fn test_full_staking_lifecycle() {
     // At TRANSITION_EPOCHS: 25% burn, 25% validator, 25% treasury, 25% dev_pool.
     // Validator share = 2,500. Commission (10%) = 250 -> proposer rewards.
     // Delegator pool = 2,250 -> single delegator gets all.
-    let del_rewards = staking
-        .get_pending_rewards(&delegator)
-        .unwrap()
-        .unwrap();
-    let val_rewards = staking
-        .get_pending_rewards(&validator)
-        .unwrap()
-        .unwrap();
+    let del_rewards = staking.get_pending_rewards(&delegator).unwrap().unwrap();
+    let val_rewards = staking.get_pending_rewards(&validator).unwrap().unwrap();
     assert_eq!(del_rewards.amount, wei(2_250));
     assert_eq!(val_rewards.amount, wei(250));
 
@@ -409,9 +403,7 @@ fn test_multi_validator_delegation() {
     assert_eq!(total_delegated, wei(6_000));
 
     // Undelegate from v2.
-    staking
-        .undelegate(delegator, v2, wei(2_000), 100)
-        .unwrap();
+    staking.undelegate(delegator, v2, wei(2_000), 100).unwrap();
 
     // v2 delegation reduced to zero.
     let val2 = staking.get_validator(&v2).unwrap().unwrap();

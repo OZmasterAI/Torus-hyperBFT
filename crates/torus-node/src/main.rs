@@ -8,7 +8,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
-use serde::Deserialize;
 use ed25519_dalek::SigningKey;
 use hotstuff_rs::events::{
     CommitBlockEvent, InsertBlockEvent, PhaseVoteEvent, ProposeEvent, ReceiveProposalEvent,
@@ -16,6 +15,7 @@ use hotstuff_rs::events::{
 };
 use hotstuff_rs::replica::{Configuration, Replica, ReplicaSpec};
 use hotstuff_rs::types::data_types::{BufferSize, ChainID, EpochLength};
+use serde::Deserialize;
 use tracing::{error, info, warn};
 
 use torus_consensus::{NativeDaFetcher, RocksKVStore, TorusApp};
@@ -195,28 +195,46 @@ struct ConfigFile {
 fn load_config_file(path: &PathBuf) -> Result<ConfigFile, Box<dyn std::error::Error>> {
     let contents = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read config file {}: {e}", path.display()))?;
-    let config: ConfigFile = toml::from_str(&contents)
-        .map_err(|e| format!("invalid config TOML: {e}"))?;
+    let config: ConfigFile =
+        toml::from_str(&contents).map_err(|e| format!("invalid config TOML: {e}"))?;
     Ok(config)
 }
 
 fn apply_config_defaults(cli: &mut Cli, cfg: ConfigFile) {
-    if cli.genesis.is_none() { cli.genesis = cfg.genesis; }
-    if cli.keystore.is_none() { cli.keystore = cfg.keystore; }
-    if cli.passphrase_file.is_none() { cli.passphrase_file = cfg.passphrase_file; }
-    if cli.validator_key.is_none() { cli.validator_key = cfg.validator_key; }
-    if cli.p2p_peers.is_none() { cli.p2p_peers = cfg.p2p_peers; }
+    if cli.genesis.is_none() {
+        cli.genesis = cfg.genesis;
+    }
+    if cli.keystore.is_none() {
+        cli.keystore = cfg.keystore;
+    }
+    if cli.passphrase_file.is_none() {
+        cli.passphrase_file = cfg.passphrase_file;
+    }
+    if cli.validator_key.is_none() {
+        cli.validator_key = cfg.validator_key;
+    }
+    if cli.p2p_peers.is_none() {
+        cli.p2p_peers = cfg.p2p_peers;
+    }
     if let Some(dir) = cfg.data_dir {
-        if cli.data_dir == PathBuf::from("./data") { cli.data_dir = dir; }
+        if cli.data_dir == PathBuf::from("./data") {
+            cli.data_dir = dir;
+        }
     }
     if let Some(listen) = cfg.p2p_listen {
-        if cli.p2p_listen == "/ip4/0.0.0.0/udp/30333/quic-v1" { cli.p2p_listen = listen; }
+        if cli.p2p_listen == "/ip4/0.0.0.0/udp/30333/quic-v1" {
+            cli.p2p_listen = listen;
+        }
     }
     if let Some(addr) = cfg.rpc_addr {
-        if cli.rpc_addr == "0.0.0.0:8545" { cli.rpc_addr = addr; }
+        if cli.rpc_addr == "0.0.0.0:8545" {
+            cli.rpc_addr = addr;
+        }
     }
     if let Some(level) = cfg.log_level {
-        if cli.log_level == "info" { cli.log_level = level; }
+        if cli.log_level == "info" {
+            cli.log_level = level;
+        }
     }
     if let Some(addr) = cfg.metrics_addr {
         if cli.metrics_addr == "0.0.0.0:9090".parse::<SocketAddr>().unwrap() {
@@ -225,9 +243,15 @@ fn apply_config_defaults(cli: &mut Cli, cfg: ConfigFile) {
             }
         }
     }
-    if cfg.rpc_only.unwrap_or(false) && !cli.rpc_only { cli.rpc_only = true; }
-    if cfg.archive.unwrap_or(false) && !cli.archive { cli.archive = true; }
-    if cli.retention_blocks.is_none() { cli.retention_blocks = cfg.retention_blocks; }
+    if cfg.rpc_only.unwrap_or(false) && !cli.rpc_only {
+        cli.rpc_only = true;
+    }
+    if cfg.archive.unwrap_or(false) && !cli.archive {
+        cli.archive = true;
+    }
+    if cli.retention_blocks.is_none() {
+        cli.retention_blocks = cfg.retention_blocks;
+    }
 }
 
 fn default_chain_config() -> ChainConfig {
@@ -342,12 +366,18 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         info!("rpc-only mode: generated ephemeral key for network identity");
         key
     } else {
-        return Err("either --keystore or --validator-key must be provided (or use --rpc-only)".into());
+        return Err(
+            "either --keystore or --validator-key must be provided (or use --rpc-only)".into(),
+        );
     };
     let verifying_key = signing_key.verifying_key();
     info!(
         pubkey = hex::encode(verifying_key.as_bytes()),
-        mode = if cli.rpc_only { "rpc-only" } else { "validator" },
+        mode = if cli.rpc_only {
+            "rpc-only"
+        } else {
+            "validator"
+        },
         "loaded node key"
     );
 
@@ -357,8 +387,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         let meta = StateDb::restore_from_snapshot(snapshot_path, &cli.data_dir)?;
         info!(
             block_height = meta.block_height,
-            "database restored from snapshot, resuming from block {}",
-            meta.block_height
+            "database restored from snapshot, resuming from block {}", meta.block_height
         );
     }
 
@@ -421,15 +450,27 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     };
     let mempool = Arc::new(Mempool::new(state_db.clone(), mempool_config));
 
-    let signing_key_for_app = if !cli.rpc_only { Some(signing_key.clone()) } else { None };
-    let mut app = TorusApp::new(state_db.clone(), &chain_config, Some(metrics.clone()), Some(mempool.clone()), signing_key_for_app);
+    let signing_key_for_app = if !cli.rpc_only {
+        Some(signing_key.clone())
+    } else {
+        None
+    };
+    let mut app = TorusApp::new(
+        state_db.clone(),
+        &chain_config,
+        Some(metrics.clone()),
+        Some(mempool.clone()),
+        signing_key_for_app,
+    );
     let kv_store = RocksKVStore::new(state_db.db_arc());
 
     // EVM executor
     let executor = Arc::new(EvmExecutor::new(chain_config.chain_id));
 
     // Network
-    let listen_addr = cli.p2p_listen.parse()
+    let listen_addr = cli
+        .p2p_listen
+        .parse()
         .map_err(|e| format!("invalid p2p-listen multiaddr: {e}"))?;
 
     let bootstrap_peers = if let Some(peers_csv) = cli.p2p_peers.as_deref() {
@@ -449,19 +490,24 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         ..NetworkConfig::default()
     };
 
-    let (mut network, _tx_gossip, native_gossip) = LibP2PNetwork::with_metrics(
-        network_config, signing_key.clone(), Some(metrics.clone()),
-    ).await?;
+    let (mut network, _tx_gossip, native_gossip) =
+        LibP2PNetwork::with_metrics(network_config, signing_key.clone(), Some(metrics.clone()))
+            .await?;
     mempool.set_native_gossip_tx(native_gossip.into_sender());
     mempool.set_native_gossip_enabled(cli.native_gossip);
     mempool.set_metrics(metrics.clone());
-    info!(enabled = cli.native_gossip, "native-action gossip pre-spread");
+    info!(
+        enabled = cli.native_gossip,
+        "native-action gossip pre-spread"
+    );
     // Attach the durable DA store so the swarm can SERVE native-action bodies
     // by-hash on /torus/native-da/1.0 (Phase C Task 5 — RARE pull-fallback).
     network.set_native_da_store(NativeDaStore::new(state_db.clone()));
     // Wire the consensus app's RARE pull-fallback to the network (Phase C Task 6):
     // on a CompactBlock reconstruction miss it fetches the missing bodies by-hash.
-    app.set_native_da_fetcher(Arc::new(NetworkDaFetcher { network: network.clone() }));
+    app.set_native_da_fetcher(Arc::new(NetworkDaFetcher {
+        network: network.clone(),
+    }));
 
     // Spawn inbound native action gossip → mempool task
     if let Some(mut native_rx) = network.take_native_action_rx() {
@@ -497,12 +543,15 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     info!(listen = %cli.p2p_listen, "p2p network started");
 
     // 5b. Pre-proposal action push: proposer → all validators via req/res (CompactBlock support)
-    let (pre_proposal_tx, pre_proposal_rx) = std::sync::mpsc::sync_channel::<torus_consensus::PreProposalBundle>(4);
+    let (pre_proposal_tx, pre_proposal_rx) =
+        std::sync::mpsc::sync_channel::<torus_consensus::PreProposalBundle>(4);
     app.set_pre_proposal_tx(pre_proposal_tx);
     let network_for_pre_proposal = network.clone();
     std::thread::spawn(move || {
         while let Ok(bundle) = pre_proposal_rx.recv() {
-            let Ok(payload) = bincode::serialize(&bundle.actions) else { continue };
+            let Ok(payload) = bincode::serialize(&bundle.actions) else {
+                continue;
+            };
             if torus_network::should_push_hashes_only(payload.len()) {
                 // Phase 2.3 (#5): the body set is too big to disseminate within the view —
                 // push only the HASHES; validators pull the bodies (pre-warm) off the view's
@@ -574,9 +623,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let notifier_for_replica = notifier.clone();
     let state_db_for_handler = state_db.clone();
     let mempool_for_handler = mempool.clone();
-    let latest_height_shared = Arc::new(std::sync::atomic::AtomicU64::new(
-        find_latest_height(&state_db),
-    ));
+    let latest_height_shared = Arc::new(std::sync::atomic::AtomicU64::new(find_latest_height(
+        &state_db,
+    )));
     let latest_height_for_handler = latest_height_shared.clone();
 
     // 8. Start replica with on_commit_block handler for WebSocket subscriptions.
@@ -633,9 +682,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             latest_height_for_handler.store(height, std::sync::atomic::Ordering::Relaxed);
             match state_db_for_handler.get_cf_raw(CF_BLOCK_HEADERS, &height.to_be_bytes()) {
                 Ok(Some(data)) if data.len() > 32 => {
-                    if let Ok(header) =
-                        serde_json::from_slice::<serde_json::Value>(&data[32..])
-                    {
+                    if let Ok(header) = serde_json::from_slice::<serde_json::Value>(&data[32..]) {
                         notifier_for_replica.notify_new_block(header);
                     }
                 }
@@ -665,7 +712,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let own_vk = verifying_key.to_bytes();
     let leader_state_for_rpc = leader_state.clone();
     let leader_vk_fn: Arc<dyn Fn() -> Option<[u8; 32]> + Send + Sync> = Arc::new(move || {
-        leader_state_for_rpc.current_leader().map(|vk| *vk.as_bytes())
+        leader_state_for_rpc
+            .current_leader()
+            .map(|vk| *vk.as_bytes())
     });
     let (fwd_tx, mut fwd_rx) = tokio::sync::mpsc::unbounded_channel();
     let (evm_fwd_tx, mut evm_fwd_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -681,24 +730,29 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // Spawn RPC on a dedicated tokio runtime so user traffic can never
     // starve the consensus/libp2p runtime (same idea as Hyperliquid sentries).
     let (rpc_addr_tx, rpc_addr_rx) = std::sync::mpsc::channel();
-    std::thread::Builder::new().name("rpc-runtime".into()).spawn(move || {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(4)
-            .thread_name("rpc-worker")
-            .enable_all()
-            .build()
-            .expect("failed to build RPC runtime");
-        rt.block_on(async {
-            match rpc_server.start(rpc_addr).await {
-                Ok((handle, addr)) => {
-                    let _ = rpc_addr_tx.send(Ok(addr));
-                    handle.stopped().await;
+    std::thread::Builder::new()
+        .name("rpc-runtime".into())
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(4)
+                .thread_name("rpc-worker")
+                .enable_all()
+                .build()
+                .expect("failed to build RPC runtime");
+            rt.block_on(async {
+                match rpc_server.start(rpc_addr).await {
+                    Ok((handle, addr)) => {
+                        let _ = rpc_addr_tx.send(Ok(addr));
+                        handle.stopped().await;
+                    }
+                    Err(e) => {
+                        let _ = rpc_addr_tx.send(Err(format!("{e}")));
+                    }
                 }
-                Err(e) => { let _ = rpc_addr_tx.send(Err(format!("{e}"))); }
-            }
-        });
-    })?;
-    let actual_addr = rpc_addr_rx.recv()?
+            });
+        })?;
+    let actual_addr = rpc_addr_rx
+        .recv()?
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
     info!(%actual_addr, "JSON-RPC server started (dedicated runtime)");
 
@@ -722,7 +776,10 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     // 10. Metrics (telemetry endpoint)
     let metrics_addr = cli.metrics_addr;
-    tokio::spawn(torus_telemetry::serve_metrics(metrics_addr, metrics.clone()));
+    tokio::spawn(torus_telemetry::serve_metrics(
+        metrics_addr,
+        metrics.clone(),
+    ));
     info!(%metrics_addr, "telemetry server started");
 
     // 11. Background pruner (if pruning enabled)
@@ -731,11 +788,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             retention_blocks: retention,
             ..PrunerConfig::default()
         };
-        let mut pruner = StatePruner::new(
-            state_db.clone(),
-            pruner_config,
-            pruned_up_to_handle,
-        );
+        let mut pruner = StatePruner::new(state_db.clone(), pruner_config, pruned_up_to_handle);
         let latest_for_pruner = latest_height_handle.clone();
         let metrics_for_pruner = metrics.clone();
         info!(retention_blocks = retention, "background pruner enabled");
@@ -778,7 +831,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 let size = torus_state::dir_size_bytes(&data_dir);
                 m.db_size_bytes.set(size as i64);
                 for cf_name in torus_state::cf::ALL_CF_NAMES {
-                    let Some(cf) = db.cf_handle(cf_name) else { continue };
+                    let Some(cf) = db.cf_handle(cf_name) else {
+                        continue;
+                    };
                     let label = vec![("cf".to_string(), (*cf_name).to_string())];
                     for (prop, fam) in [
                         ("rocksdb.num-files-at-level0", &m.rocksdb_l0_files),
@@ -824,9 +879,11 @@ mod tests {
     fn archive_and_retention_mutually_exclusive() {
         let result = Cli::try_parse_from([
             "torus-node",
-            "--keystore", "k.keystore",
+            "--keystore",
+            "k.keystore",
             "--archive",
-            "--retention-blocks", "1000",
+            "--retention-blocks",
+            "1000",
         ]);
         // clap parses both flags fine; the runtime check in run() rejects them.
         // We test the validation logic directly.
@@ -835,16 +892,15 @@ mod tests {
         assert_eq!(cli.retention_blocks, Some(1000));
         // The actual error is returned by run(), which we can't call without a full node.
         // Verify the condition that run() checks:
-        assert!(cli.archive && cli.retention_blocks.is_some(),
-            "both flags set should be rejected by run()");
+        assert!(
+            cli.archive && cli.retention_blocks.is_some(),
+            "both flags set should be rejected by run()"
+        );
     }
 
     #[test]
     fn default_is_archive_mode() {
-        let cli = Cli::try_parse_from([
-            "torus-node",
-            "--keystore", "k.keystore",
-        ]).unwrap();
+        let cli = Cli::try_parse_from(["torus-node", "--keystore", "k.keystore"]).unwrap();
         assert!(!cli.archive);
         assert!(cli.retention_blocks.is_none());
         // Neither flag -> archive mode (no pruning)
@@ -854,29 +910,38 @@ mod tests {
     fn retention_blocks_enables_pruning() {
         let cli = Cli::try_parse_from([
             "torus-node",
-            "--keystore", "k.keystore",
-            "--retention-blocks", "50000",
-        ]).unwrap();
+            "--keystore",
+            "k.keystore",
+            "--retention-blocks",
+            "50000",
+        ])
+        .unwrap();
         assert!(!cli.archive);
         assert_eq!(cli.retention_blocks, Some(50000));
     }
 
     #[test]
     fn metrics_addr_default() {
-        let cli = Cli::try_parse_from([
-            "torus-node",
-            "--keystore", "k.keystore",
-        ]).unwrap();
-        assert_eq!(cli.metrics_addr, "0.0.0.0:9090".parse::<SocketAddr>().unwrap());
+        let cli = Cli::try_parse_from(["torus-node", "--keystore", "k.keystore"]).unwrap();
+        assert_eq!(
+            cli.metrics_addr,
+            "0.0.0.0:9090".parse::<SocketAddr>().unwrap()
+        );
     }
 
     #[test]
     fn metrics_addr_custom() {
         let cli = Cli::try_parse_from([
             "torus-node",
-            "--keystore", "k.keystore",
-            "--metrics-addr", "127.0.0.1:9091",
-        ]).unwrap();
-        assert_eq!(cli.metrics_addr, "127.0.0.1:9091".parse::<SocketAddr>().unwrap());
+            "--keystore",
+            "k.keystore",
+            "--metrics-addr",
+            "127.0.0.1:9091",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.metrics_addr,
+            "127.0.0.1:9091".parse::<SocketAddr>().unwrap()
+        );
     }
 }

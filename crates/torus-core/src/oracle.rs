@@ -335,7 +335,11 @@ impl<T: StateBackend> OracleManager<T> {
     /// AUDIT FIX ECON-FIND-20: `get_last_valid_price` now enforces the same
     /// staleness check as `get_price`. Without this, a price from block 0 could
     /// be returned as if current when used as a fallback in `aggregate_price`.
-    fn get_last_valid_price(&self, market_id: MarketId, current_block: u64) -> Result<FixedPoint, CoreError> {
+    fn get_last_valid_price(
+        &self,
+        market_id: MarketId,
+        current_block: u64,
+    ) -> Result<FixedPoint, CoreError> {
         let key = aggregated_price_key(market_id);
         match self.state.get_cf_raw(CF_NATIVE_ORACLE, &key)? {
             Some(data) => {

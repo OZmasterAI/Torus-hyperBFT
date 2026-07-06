@@ -104,7 +104,12 @@ impl HotStuffMessage {
     /// ProposalHeaders must bypass because bodies may still be in-flight when
     /// the view advances (e.g. rapid timeouts at startup).
     pub fn is_block_data_msg(&self) -> bool {
-        matches!(self, HotStuffMessage::BlockDataRequest(_) | HotStuffMessage::BlockDataResponse(_) | HotStuffMessage::ProposalHeader(_))
+        matches!(
+            self,
+            HotStuffMessage::BlockDataRequest(_)
+                | HotStuffMessage::BlockDataResponse(_)
+                | HotStuffMessage::ProposalHeader(_)
+        )
     }
 
     /// Returns the number of bytes required to store a given instance of the [`HotStuffMessage`] enum.
@@ -473,9 +478,9 @@ pub type PendingBodies = HashMap<CryptoHash, Block>;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use borsh::BorshDeserialize;
     use crate::hotstuff::types::PhaseCertificate;
     use crate::types::data_types::*;
+    use borsh::BorshDeserialize;
 
     fn genesis_pc() -> PhaseCertificate {
         PhaseCertificate::genesis_pc()
@@ -495,7 +500,11 @@ mod tests {
             has_validator_set_updates: false,
         };
         let bytes = header.try_to_vec().unwrap();
-        assert!(bytes.len() < 1024, "header serialized to {} bytes, must be <1KB", bytes.len());
+        assert!(
+            bytes.len() < 1024,
+            "header serialized to {} bytes, must be <1KB",
+            bytes.len()
+        );
         let decoded = ProposalHeader::try_from_slice(&bytes).unwrap();
         assert!(header == decoded, "roundtrip mismatch");
     }
@@ -534,7 +543,11 @@ mod tests {
             block_hash: CryptoHash::new([0xDD; 32]),
         };
         let bytes = req.try_to_vec().unwrap();
-        assert!(bytes.len() < 100, "request serialized to {} bytes", bytes.len());
+        assert!(
+            bytes.len() < 100,
+            "request serialized to {} bytes",
+            bytes.len()
+        );
         let decoded = BlockDataRequest::try_from_slice(&bytes).unwrap();
         assert!(req == decoded, "roundtrip mismatch");
     }
@@ -547,12 +560,18 @@ mod tests {
             CryptoHash::new([0xCC; 32]),
             Data::new(vec![Datum::new(vec![0u8; 4000])]),
         );
-        let resp = BlockDataResponse { view: ViewNumber::new(1), block: block.clone() };
+        let resp = BlockDataResponse {
+            view: ViewNumber::new(1),
+            block: block.clone(),
+        };
         let bytes = resp.try_to_vec().unwrap();
         // Block-data responses ride the dedicated /torus/block-data protocol
         // (16 MB codec cap in torus-network), NOT /torus/direct — 4 MB here is
         // just a conservative bound for this small fixture.
-        assert!(bytes.len() < 4 * 1024 * 1024, "response must stay well under the block-data codec cap");
+        assert!(
+            bytes.len() < 4 * 1024 * 1024,
+            "response must stay well under the block-data codec cap"
+        );
         let decoded = BlockDataResponse::try_from_slice(&bytes).unwrap();
         assert_eq!(decoded.block.hash, block.hash);
     }

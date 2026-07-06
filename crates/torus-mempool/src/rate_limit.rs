@@ -194,7 +194,6 @@ pub fn native_block_bytes_cap() -> usize {
 /// full recover + slash (safe). ~32B/entry => ~0.5MB at this cap.
 pub const VERIFIED_SENDER_CACHE_CAP: usize = 16_384;
 
-
 /// Number of individual orders/operations an action represents.
 ///
 /// A `PlaceOrderBatch` counts as its length; every other action counts as 1.
@@ -247,7 +246,10 @@ mod tests {
         let p = sample_params();
         assert_eq!(order_count(&NativeAction::CancelOrder { order_id: 1 }), 1);
         assert_eq!(order_count(&NativeAction::PlaceOrder(p.clone())), 1);
-        assert_eq!(order_count(&NativeAction::PlaceOrderBatch(vec![p.clone(); 5])), 5);
+        assert_eq!(
+            order_count(&NativeAction::PlaceOrderBatch(vec![p.clone(); 5])),
+            5
+        );
         assert_eq!(order_count(&NativeAction::PlaceOrderBatch(vec![])), 0);
     }
 

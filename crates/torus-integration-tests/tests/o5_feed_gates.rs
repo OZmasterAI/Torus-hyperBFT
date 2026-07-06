@@ -56,9 +56,15 @@ fn max_pull_chunk_fits_native_da_codec() {
     let batch = SignedNativeAction {
         action: NativeAction::PlaceOrderBatch(vec![order; NATIVE_ORDERS_PER_BATCH_CAP]),
         nonce: 0,
-        signature: ActionSignature::Eip712(Signature { v: 27, r: [0u8; 32], s: [0u8; 32] }),
+        signature: ActionSignature::Eip712(Signature {
+            v: 27,
+            r: [0u8; 32],
+            s: [0u8; 32],
+        }),
     };
-    let one = bincode::serialize(&batch).expect("serialize max batch").len();
+    let one = bincode::serialize(&batch)
+        .expect("serialize max batch")
+        .len();
     let envelope_slack = 64; // per-body framing in the response
     assert!(
         torus_network::bridge::NATIVE_DA_FETCH_CHUNK * (one + envelope_slack)

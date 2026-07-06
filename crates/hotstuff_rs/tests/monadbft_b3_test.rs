@@ -6,9 +6,7 @@
 use borsh::BorshSerialize;
 use rand_core::OsRng;
 
-use hotstuff_rs::hotstuff::types::{
-    EquivocationEvidence, LeaderReputation, LeaderReputationEntry,
-};
+use hotstuff_rs::hotstuff::types::{EquivocationEvidence, LeaderReputation, LeaderReputationEntry};
 use hotstuff_rs::pacemaker::{
     reputation_leader_selection_enabled, select_leader, select_leader_reputation_weighted,
     select_leader_with_reputation, set_reputation_leader_selection,
@@ -361,7 +359,11 @@ fn reputation_recovery_after_poor_performance() {
     }
     // Now: 22 successes / 30 total = 73%
     let score = rep.score_bps(&keypairs[0].verifying_key());
-    assert!(score > 7000, "Score should recover above 70%, got {}", score);
+    assert!(
+        score > 7000,
+        "Score should recover above 70%, got {}",
+        score
+    );
 }
 
 /// Determinism: same events produce identical reputation on different nodes.
@@ -394,7 +396,10 @@ fn reputation_determinism() {
         }
     }
 
-    assert_eq!(rep_a, rep_b, "Same event sequence must produce identical reputation");
+    assert_eq!(
+        rep_a, rep_b,
+        "Same event sequence must produce identical reputation"
+    );
 
     // Same reputation → same leader selection.
     let vs = {

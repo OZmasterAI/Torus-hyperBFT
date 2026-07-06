@@ -162,10 +162,10 @@ mod tests {
     #[test]
     fn global_addresses_accepted() {
         for s in [
-            "/ip4/95.111.231.121/udp/30333/quic-v1", // live seed
-            "/ip4/84.32.108.220/udp/30333/quic-v1",  // val1
-            "/ip4/100.128.0.1/udp/30333/quic-v1",    // just past CGNAT range
-            "/ip6/2a01:4f8::1/udp/30333/quic-v1",    // public v6
+            "/ip4/95.111.231.121/udp/30333/quic-v1",    // live seed
+            "/ip4/84.32.108.220/udp/30333/quic-v1",     // val1
+            "/ip4/100.128.0.1/udp/30333/quic-v1",       // just past CGNAT range
+            "/ip6/2a01:4f8::1/udp/30333/quic-v1",       // public v6
             "/dns4/seed.example.org/udp/30333/quic-v1", // no IP component
         ] {
             assert!(is_global_addr(&addr(s)), "{s} must be accepted");

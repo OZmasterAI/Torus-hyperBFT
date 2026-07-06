@@ -231,9 +231,11 @@ pub fn eip712_struct_hash(action: &NativeAction, nonce: u64) -> B256 {
         NativeAction::ListMarket(listing) => hash_list_market(listing, nonce),
         NativeAction::DelistMarket { market_id } => hash_delist_market(*market_id, nonce),
         NativeAction::TopUpSelfStake { amount } => hash_top_up_self_stake(amount, nonce),
-        NativeAction::CreateSession { session_pubkey, expiry, scope } => {
-            hash_create_session(session_pubkey, *expiry, *scope, nonce)
-        }
+        NativeAction::CreateSession {
+            session_pubkey,
+            expiry,
+            scope,
+        } => hash_create_session(session_pubkey, *expiry, *scope, nonce),
         NativeAction::RevokeSession { session_pubkey } => {
             hash_revoke_session(session_pubkey, nonce)
         }
@@ -561,7 +563,8 @@ fn hash_top_up_self_stake(amount: &U256, nonce: u64) -> B256 {
 }
 
 fn hash_create_session(pubkey: &[u8; 32], expiry: u64, scope: SessionScope, nonce: u64) -> B256 {
-    let th = keccak256("CreateSession(bytes32 sessionPubkey,uint64 expiry,uint8 scope,uint64 nonce)");
+    let th =
+        keccak256("CreateSession(bytes32 sessionPubkey,uint64 expiry,uint8 scope,uint64 nonce)");
     let mut buf = Vec::with_capacity(5 * 32);
     buf.extend_from_slice(&th.0);
     buf.extend_from_slice(pubkey);
@@ -598,9 +601,7 @@ fn hash_proposal_action(action: &ProposalAction) -> B256 {
             buf.extend_from_slice(&encode_string(value));
             keccak256(&buf)
         }
-        ProposalAction::ValidatorRegistration { candidate } => {
-            keccak256(encode_address(candidate))
-        }
+        ProposalAction::ValidatorRegistration { candidate } => keccak256(encode_address(candidate)),
     }
 }
 
@@ -770,7 +771,10 @@ impl SignedNativeAction {
     /// Does NOT check session state (expiry, scope) — caller must do that.
     pub fn verify_session_signature(&self) -> Result<[u8; 32], Eip712Error> {
         match &self.signature {
-            ActionSignature::Session { session_pubkey, sig } => {
+            ActionSignature::Session {
+                session_pubkey,
+                sig,
+            } => {
                 let vk = Ed25519VerifyingKey::from_bytes(session_pubkey)
                     .map_err(|_| Eip712Error::SessionSignatureInvalid)?;
                 let ed_sig = ed25519_dalek::Signature::from_bytes(&sig.0);
@@ -803,7 +807,10 @@ impl SignedNativeAction {
                 let signing_hash = eip712_signing_hash(domain, struct_hash);
                 ecrecover(&signing_hash, sig)
             }
-            ActionSignature::Session { session_pubkey, sig } => {
+            ActionSignature::Session {
+                session_pubkey,
+                sig,
+            } => {
                 if requires_eip712(&self.action) {
                     return Err(Eip712Error::RequiresEip712);
                 }
@@ -815,8 +822,7 @@ impl SignedNativeAction {
                 let signing_hash = eip712_signing_hash(domain, struct_hash);
                 vk.verify(signing_hash.as_slice(), &ed_sig)
                     .map_err(|_| Eip712Error::SessionSignatureInvalid)?;
-                let session = session_lookup(session_pubkey)
-                    .ok_or(Eip712Error::SessionNotFound)?;
+                let session = session_lookup(session_pubkey).ok_or(Eip712Error::SessionNotFound)?;
                 if current_timestamp > session.expiry {
                     return Err(Eip712Error::SessionExpired);
                 }
@@ -1125,11 +1131,18 @@ mod tests {
             reduce_only: false,
             client_order_id: coid,
         };
-        let orders = vec![mk(1, true, Some(1)), mk(2, false, Some(2)), mk(3, true, None)];
+        let orders = vec![
+            mk(1, true, Some(1)),
+            mk(2, false, Some(2)),
+            mk(3, true, None),
+        ];
 
         // ONE signature covers all N orders (the throughput keystone).
-        let signed =
-            sign_native_action(NativeAction::PlaceOrderBatch(orders.clone()), TEST_NONCE, &key);
+        let signed = sign_native_action(
+            NativeAction::PlaceOrderBatch(orders.clone()),
+            TEST_NONCE,
+            &key,
+        );
         assert_eq!(signed.recover_sender().unwrap(), expected);
 
         // Tampering with ANY order in the batch breaks the signature
@@ -1458,11 +1471,10 @@ mod tests {
         assert_eq!(got, owner);
 
         // Exec/consensus path agrees.
-        let senders = batch_verify_native_actions(
-            std::slice::from_ref(&signed),
-            TEST_NONCE,
-            |pk| (pk == &pubkey).then(|| trading.clone()),
-        );
+        let senders =
+            batch_verify_native_actions(std::slice::from_ref(&signed), TEST_NONCE, |pk| {
+                (pk == &pubkey).then(|| trading.clone())
+            });
         assert_eq!(senders[0], Some(owner));
 
         // TransfersOnly still rejects with the precise scope error.
@@ -1506,7 +1518,11 @@ mod tests {
 
         let actions = vec![
             sign_native_action(NativeAction::ClaimRewards, TEST_NONCE, &key), // 0: EIP-712 valid
-            sign_action_with_session(NativeAction::CancelOrder { order_id: 1 }, TEST_NONCE, &ed_key), // 1: session valid
+            sign_action_with_session(
+                NativeAction::CancelOrder { order_id: 1 },
+                TEST_NONCE,
+                &ed_key,
+            ), // 1: session valid
             sign_action_with_session(
                 NativeAction::CancelOrder { order_id: 2 },
                 TEST_NONCE,
@@ -1528,7 +1544,10 @@ mod tests {
         assert_eq!(senders[0], actions[0].recover_sender().ok());
         // Session: resolved sender == session owner, and == resolve_sender().
         assert_eq!(senders[1], Some(owner));
-        assert_eq!(senders[1], actions[1].resolve_sender(TEST_NONCE, lookup).ok());
+        assert_eq!(
+            senders[1],
+            actions[1].resolve_sender(TEST_NONCE, lookup).ok()
+        );
         // Invalid action -> None.
         assert_eq!(senders[2], None);
     }
@@ -1546,18 +1565,20 @@ mod tests {
         let pubkey = ed_key.verifying_key().to_bytes();
         let owner = Address::from([0x33; 20]);
         let session = make_session(owner);
-        let action =
-            sign_action_with_session(NativeAction::CancelOrder { order_id: 9 }, TEST_NONCE, &ed_key);
+        let action = sign_action_with_session(
+            NativeAction::CancelOrder { order_id: 9 },
+            TEST_NONCE,
+            &ed_key,
+        );
 
         // The bug's mechanism: the old non-attested path can't verify sessions.
         assert!(action.recover_sender().is_err());
 
         // Fix: a registered session resolves to its owner (ACCEPT).
-        let with_session = batch_verify_native_actions(
-            std::slice::from_ref(&action),
-            TEST_NONCE,
-            |pk| (pk == &pubkey).then(|| session.clone()),
-        );
+        let with_session =
+            batch_verify_native_actions(std::slice::from_ref(&action), TEST_NONCE, |pk| {
+                (pk == &pubkey).then(|| session.clone())
+            });
         assert_eq!(with_session[0], Some(owner));
 
         // ...but an unregistered session still fails (REJECT — no security hole).
@@ -1586,7 +1607,11 @@ mod tests {
             actions.push(match i % 4 {
                 0 => sign_native_action(NativeAction::ClaimRewards, nonce, &key),
                 1 => sign_native_action(NativeAction::UnjailSelf, nonce, &key2),
-                2 => sign_action_with_session(NativeAction::CancelOrder { order_id: 1 }, nonce, &ed_key),
+                2 => sign_action_with_session(
+                    NativeAction::CancelOrder { order_id: 1 },
+                    nonce,
+                    &ed_key,
+                ),
                 _ => sign_action_with_session(
                     NativeAction::CancelOrder { order_id: 1 },
                     nonce,
@@ -1606,13 +1631,21 @@ mod tests {
             .collect();
 
         let got = batch_verify_native_actions(&actions, TEST_NONCE, |pk| {
-            if pk == &pubkey { Some(session.clone()) } else { None }
+            if pk == &pubkey {
+                Some(session.clone())
+            } else {
+                None
+            }
         });
         assert_eq!(got, expected);
 
         // Determinism: a second run is identical (no thread-order dependence).
         let again = batch_verify_native_actions(&actions, TEST_NONCE, |pk| {
-            if pk == &pubkey { Some(session.clone()) } else { None }
+            if pk == &pubkey {
+                Some(session.clone())
+            } else {
+                None
+            }
         });
         assert_eq!(got, again);
     }
@@ -1646,7 +1679,11 @@ mod tests {
             ),
         ];
         let invalid = invalid_indices(&batch_verify_native_actions(&actions, TEST_NONCE, |pk| {
-            if pk == &pubkey { Some(session.clone()) } else { None }
+            if pk == &pubkey {
+                Some(session.clone())
+            } else {
+                None
+            }
         }));
         assert!(invalid.is_empty());
     }
@@ -1676,7 +1713,11 @@ mod tests {
         assert_eq!(invalid, vec![1, 2]);
 
         let invalid = invalid_indices(&batch_verify_native_actions(&actions, TEST_NONCE, |pk| {
-            if pk == &pubkey { Some(session.clone()) } else { None }
+            if pk == &pubkey {
+                Some(session.clone())
+            } else {
+                None
+            }
         }));
         assert!(invalid.is_empty());
     }
@@ -1697,7 +1738,11 @@ mod tests {
         }
 
         let invalid = invalid_indices(&batch_verify_native_actions(&[action], TEST_NONCE, |pk| {
-            if pk == &pubkey { Some(session.clone()) } else { None }
+            if pk == &pubkey {
+                Some(session.clone())
+            } else {
+                None
+            }
         }));
         assert_eq!(invalid, vec![0]);
     }
@@ -1723,7 +1768,11 @@ mod tests {
         );
 
         let invalid = invalid_indices(&batch_verify_native_actions(&[action], TEST_NONCE, |pk| {
-            if pk == &pubkey { Some(session.clone()) } else { None }
+            if pk == &pubkey {
+                Some(session.clone())
+            } else {
+                None
+            }
         }));
         assert_eq!(invalid, vec![0]);
     }

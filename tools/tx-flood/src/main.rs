@@ -42,10 +42,17 @@ const MEMPOOL_MAX_PER_SENDER: u64 = 16;
 const DRAIN_PER_SENDER_PER_BLOCK: u64 = 4;
 
 #[derive(Parser)]
-#[command(name = "torus-tx-flood", about = "Saturate Torus devnet with pre-signed EVM transfers")]
+#[command(
+    name = "torus-tx-flood",
+    about = "Saturate Torus devnet with pre-signed EVM transfers"
+)]
 struct Cli {
     /// RPC endpoints (comma-separated). Txs fan out to ALL (no mempool gossip).
-    #[arg(short, long, default_value = "http://localhost:8545,http://localhost:8546,http://localhost:8547,http://localhost:8548")]
+    #[arg(
+        short,
+        long,
+        default_value = "http://localhost:8545,http://localhost:8546,http://localhost:8547,http://localhost:8548"
+    )]
     rpc_urls: String,
 
     /// Total number of transactions per account
@@ -182,22 +189,32 @@ async fn fetch_block_info(client: &reqwest::Client, url: &str) -> Option<(u64, u
         "params": ["latest", false],
         "id": 1
     });
-    let resp: serde_json::Value = client.post(url).json(&body).send().await.ok()?.json().await.ok()?;
+    let resp: serde_json::Value = client
+        .post(url)
+        .json(&body)
+        .send()
+        .await
+        .ok()?
+        .json()
+        .await
+        .ok()?;
     let block = resp.get("result")?;
-    let number = u64::from_str_radix(
-        block["number"].as_str()?.strip_prefix("0x")?,
-        16,
-    ).ok()?;
-    let gas_used = u64::from_str_radix(
-        block["gasUsed"].as_str()?.strip_prefix("0x")?,
-        16,
-    ).ok()?;
-    let tx_count = block["transactions"].as_array().map(|a| a.len()).unwrap_or(0);
+    let number = u64::from_str_radix(block["number"].as_str()?.strip_prefix("0x")?, 16).ok()?;
+    let gas_used = u64::from_str_radix(block["gasUsed"].as_str()?.strip_prefix("0x")?, 16).ok()?;
+    let tx_count = block["transactions"]
+        .as_array()
+        .map(|a| a.len())
+        .unwrap_or(0);
     Some((number, gas_used, tx_count))
 }
 
 /// Send raw tx to ONE endpoint, checking JSON-RPC error body (not just HTTP status).
-async fn send_raw_tx(client: &reqwest::Client, url: &str, raw_hex: &str, id: u64) -> Result<String, String> {
+async fn send_raw_tx(
+    client: &reqwest::Client,
+    url: &str,
+    raw_hex: &str,
+    id: u64,
+) -> Result<String, String> {
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "method": "eth_sendRawTransaction",
@@ -215,7 +232,12 @@ async fn send_raw_tx(client: &reqwest::Client, url: &str, raw_hex: &str, id: u64
         .map_err(|e| format!("parse: {e}"))?;
 
     if let Some(err) = resp.get("error") {
-        return Err(format!("rpc: {}", err.get("message").and_then(|m| m.as_str()).unwrap_or("unknown")));
+        return Err(format!(
+            "rpc: {}",
+            err.get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("unknown")
+        ));
     }
     resp["result"]
         .as_str()
@@ -234,8 +256,12 @@ async fn send_to_all(
     let mut last_err = String::new();
     for url in urls {
         match send_raw_tx(client, url, raw_hex, id).await {
-            Ok(hash) => { any_hash = Some(hash); }
-            Err(e) => { last_err = e; }
+            Ok(hash) => {
+                any_hash = Some(hash);
+            }
+            Err(e) => {
+                last_err = e;
+            }
         }
     }
     any_hash.ok_or(last_err)
@@ -245,13 +271,16 @@ async fn send_to_all(
 async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
     let cli = Cli::parse();
-    let rpc_urls: Vec<String> = cli.rpc_urls.split(',').map(|s| s.trim().to_string()).collect();
+    let rpc_urls: Vec<String> = cli
+        .rpc_urls
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .collect();
     let num_accounts = cli.accounts.clamp(1, 20);
     let gas_price = (cli.gas_price_gwei as u128) * 1_000_000_000;
     let batch_per_sender = cli.batch_per_sender.min(MEMPOOL_MAX_PER_SENDER);
@@ -263,14 +292,23 @@ async fn main() {
     println!("RPC endpoints:      {}", rpc_urls.join(", "));
     println!("Accounts:           {num_accounts}");
     println!("Txs per account:    {}", cli.txs_per_account);
-    println!("Total txs:          {}", num_accounts as u64 * cli.txs_per_account);
+    println!(
+        "Total txs:          {}",
+        num_accounts as u64 * cli.txs_per_account
+    );
     println!("Batch per sender:   {batch_per_sender} (mempool cap: {MEMPOOL_MAX_PER_SENDER})");
     println!("Drain strategy:     nonce-poll (timeout: {drain_timeout_secs}s)");
     println!("Concurrency:        {}", cli.concurrency);
     println!("Gas price:          {} gwei", cli.gas_price_gwei);
-    println!("Fan-out:            ALL {} endpoints (no mempool gossip)", rpc_urls.len());
-    println!("Est. throughput:    ~{} tx/block ({} gas/block)",
-        max_txs_per_block, max_txs_per_block * 21_000);
+    println!(
+        "Fan-out:            ALL {} endpoints (no mempool gossip)",
+        rpc_urls.len()
+    );
+    println!(
+        "Est. throughput:    ~{} tx/block ({} gas/block)",
+        max_txs_per_block,
+        max_txs_per_block * 21_000
+    );
     println!();
 
     let client = reqwest::Client::builder()
@@ -335,7 +373,14 @@ async fn main() {
             }
             let to = accounts[recv_idx].address;
             let raw = sign_eip1559_tx(
-                &acc.key, CHAIN_ID, base_nonce + seq, to, value, gas_price, 21_000, Bytes::new(),
+                &acc.key,
+                CHAIN_ID,
+                base_nonce + seq,
+                to,
+                value,
+                gas_price,
+                21_000,
+                Bytes::new(),
             );
             sender_txs.push(format!("0x{}", hex::encode(&raw)));
         }
@@ -351,7 +396,10 @@ async fn main() {
     println!();
 
     if cli.dry_run {
-        println!("Dry run — not sending. First tx: {}", &signed_txs[0][0][..40]);
+        println!(
+            "Dry run — not sending. First tx: {}",
+            &signed_txs[0][0][..40]
+        );
         return;
     }
 
@@ -391,7 +439,11 @@ async fn main() {
                     blocks_seen += new_blocks;
                     last_block = num;
                     let pct = gas as f64 / 30_000_000.0 * 100.0;
-                    let avg_txs = if blocks_seen > 0 { total_block_txs as f64 / blocks_seen as f64 } else { 0.0 };
+                    let avg_txs = if blocks_seen > 0 {
+                        total_block_txs as f64 / blocks_seen as f64
+                    } else {
+                        0.0
+                    };
                     format!("blk #{num}: {txs} txs ({pct:.0}%) | avg: {avg_txs:.1} tx/blk")
                 } else {
                     format!("blk #{num} (same)")
@@ -400,14 +452,21 @@ async fn main() {
                 "blk: ?".to_string()
             };
 
-            let rate = if elapsed > 0.0 { acc as f64 / elapsed } else { 0.0 };
+            let rate = if elapsed > 0.0 {
+                acc as f64 / elapsed
+            } else {
+                0.0
+            };
             println!(
                 "[{elapsed:6.1}s] sub: {sub} | ok: {acc} | err: {rej} | {rate:.0} accepted/s | {block_str}"
             );
         }
     });
 
-    println!("Drip-feeding txs in batches of {batch_per_sender}/sender to ALL {} endpoints...", rpc_urls.len());
+    println!(
+        "Drip-feeding txs in batches of {batch_per_sender}/sender to ALL {} endpoints...",
+        rpc_urls.len()
+    );
     println!();
 
     let rpc_urls = Arc::new(rpc_urls);
@@ -416,7 +475,10 @@ async fn main() {
 
     loop {
         // Check if all txs have been submitted
-        let all_done = cursor.iter().enumerate().all(|(i, &c)| c >= signed_txs[i].len() as u64);
+        let all_done = cursor
+            .iter()
+            .enumerate()
+            .all(|(i, &c)| c >= signed_txs[i].len() as u64);
         if all_done {
             break;
         }
@@ -447,8 +509,12 @@ async fn main() {
                     let _permit = permit;
                     submitted.fetch_add(1, Ordering::Relaxed);
                     match send_to_all(&client, &urls, &raw_hex, tx_id).await {
-                        Ok(_) => { accepted.fetch_add(1, Ordering::Relaxed); }
-                        Err(_) => { rejected.fetch_add(1, Ordering::Relaxed); }
+                        Ok(_) => {
+                            accepted.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(_) => {
+                            rejected.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }));
                 batch_count += 1;
@@ -476,7 +542,8 @@ async fn main() {
             let mut all_confirmed = true;
             for sender_idx in 0..num_accounts {
                 let expected_nonce = nonces[sender_idx] + cursor[sender_idx];
-                let addr_hex = format!("0x{}", hex::encode(accounts[sender_idx].address.as_slice()));
+                let addr_hex =
+                    format!("0x{}", hex::encode(accounts[sender_idx].address.as_slice()));
                 if let Ok(current) = fetch_nonce(&client, &rpc_urls[0], &addr_hex).await {
                     if current < expected_nonce {
                         all_confirmed = false;

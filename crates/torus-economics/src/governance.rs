@@ -192,32 +192,39 @@ pub enum ExecutionPayload {
         initial_margin: FixedPoint,
     },
     /// Whitelist a candidate address for validator registration (Phase 3: 3.2.1).
-    ValidatorRegistration {
-        candidate: Address,
-    },
+    ValidatorRegistration { candidate: Address },
     /// Unlock permanently staked tokens via governance supermajority vote.
-    PermanentUnlock {
-        staker: Address,
-        amount: U256,
-    },
+    PermanentUnlock { staker: Address, amount: U256 },
 }
 
 impl BorshSerialize for ExecutionPayload {
     fn serialize<W: Write>(&self, writer: &mut W) -> io::Result<()> {
         match self {
-            Self::ParameterChange { param_key, new_value } => {
+            Self::ParameterChange {
+                param_key,
+                new_value,
+            } => {
                 writer.write_all(&[0u8])?;
                 BorshSerialize::serialize(param_key, writer)?;
                 BorshSerialize::serialize(new_value, writer)?;
             }
-            Self::TreasurySpend { recipient, amount, reason } => {
+            Self::TreasurySpend {
+                recipient,
+                amount,
+                reason,
+            } => {
                 writer.write_all(&[1u8])?;
                 borsh_write_address(recipient, writer)?;
                 borsh_write_u256(amount, writer)?;
                 BorshSerialize::serialize(reason, writer)?;
             }
             Self::MarketListing {
-                market_id, base_asset, quote_asset, lot_size, tick_size, initial_margin,
+                market_id,
+                base_asset,
+                quote_asset,
+                lot_size,
+                tick_size,
+                initial_margin,
             } => {
                 writer.write_all(&[2u8])?;
                 BorshSerialize::serialize(market_id, writer)?;
@@ -249,13 +256,20 @@ impl BorshDeserialize for ExecutionPayload {
             0 => {
                 let param_key = String::deserialize_reader(reader)?;
                 let new_value = String::deserialize_reader(reader)?;
-                Ok(Self::ParameterChange { param_key, new_value })
+                Ok(Self::ParameterChange {
+                    param_key,
+                    new_value,
+                })
             }
             1 => {
                 let recipient = borsh_read_address(reader)?;
                 let amount = borsh_read_u256(reader)?;
                 let reason = String::deserialize_reader(reader)?;
-                Ok(Self::TreasurySpend { recipient, amount, reason })
+                Ok(Self::TreasurySpend {
+                    recipient,
+                    amount,
+                    reason,
+                })
             }
             2 => {
                 let market_id = u64::deserialize_reader(reader)?;
@@ -265,7 +279,12 @@ impl BorshDeserialize for ExecutionPayload {
                 let tick_size = FixedPoint::from_raw(i128::deserialize_reader(reader)?);
                 let initial_margin = FixedPoint::from_raw(i128::deserialize_reader(reader)?);
                 Ok(Self::MarketListing {
-                    market_id, base_asset, quote_asset, lot_size, tick_size, initial_margin,
+                    market_id,
+                    base_asset,
+                    quote_asset,
+                    lot_size,
+                    tick_size,
+                    initial_margin,
                 })
             }
             3 => {
@@ -357,9 +376,19 @@ impl BorshDeserialize for Proposal {
             Some(ExecutionPayload::deserialize_reader(reader)?)
         };
         Ok(Self {
-            id, proposer, title, description, proposal_type, status,
-            votes_for, votes_against, start_block, end_block,
-            executable_after, snapshot_block, execution_payload,
+            id,
+            proposer,
+            title,
+            description,
+            proposal_type,
+            status,
+            votes_for,
+            votes_against,
+            start_block,
+            end_block,
+            executable_after,
+            snapshot_block,
+            execution_payload,
         })
     }
 }
@@ -397,7 +426,13 @@ impl BorshDeserialize for Vote {
         let support = bool::deserialize_reader(reader)?;
         let weight = borsh_read_u256(reader)?;
         let block_number = u64::deserialize_reader(reader)?;
-        Ok(Self { voter, proposal_id, support, weight, block_number })
+        Ok(Self {
+            voter,
+            proposal_id,
+            support,
+            weight,
+            block_number,
+        })
     }
 }
 
@@ -466,9 +501,14 @@ impl BorshDeserialize for GovernanceParams {
         let permanent_unlock_threshold_bps = u64::deserialize_reader(reader)
             .unwrap_or(crate::types::DEFAULT_PERMANENT_UNLOCK_THRESHOLD_BPS);
         Ok(Self {
-            voting_period_blocks, quorum_bps, min_proposal_stake,
-            permanent_weight_multiplier_num, permanent_weight_multiplier_den,
-            treasury_address, timelock_blocks, permanent_unlock_threshold_bps,
+            voting_period_blocks,
+            quorum_bps,
+            min_proposal_stake,
+            permanent_weight_multiplier_num,
+            permanent_weight_multiplier_den,
+            treasury_address,
+            timelock_blocks,
+            permanent_unlock_threshold_bps,
         })
     }
 }
@@ -515,9 +555,12 @@ impl<T: StateBackend> GovernanceManager<T> {
     fn validate_param_change(key: &str, value: &str) -> Result<()> {
         match key {
             "maintenance_margin_bps" => {
-                let v: u64 = value.parse().map_err(|_| EconomicsError::InvalidParameterValue {
-                    key: key.to_string(), reason: "must be a valid u64".to_string(),
-                })?;
+                let v: u64 = value
+                    .parse()
+                    .map_err(|_| EconomicsError::InvalidParameterValue {
+                        key: key.to_string(),
+                        reason: "must be a valid u64".to_string(),
+                    })?;
                 if v < 25 || v > 5000 {
                     return Err(EconomicsError::InvalidParameterValue {
                         key: key.to_string(),
@@ -526,9 +569,12 @@ impl<T: StateBackend> GovernanceManager<T> {
                 }
             }
             "max_leverage" => {
-                let v: u32 = value.parse().map_err(|_| EconomicsError::InvalidParameterValue {
-                    key: key.to_string(), reason: "must be a valid u32".to_string(),
-                })?;
+                let v: u32 = value
+                    .parse()
+                    .map_err(|_| EconomicsError::InvalidParameterValue {
+                        key: key.to_string(),
+                        reason: "must be a valid u32".to_string(),
+                    })?;
                 if v == 0 || v > 200 {
                     return Err(EconomicsError::InvalidParameterValue {
                         key: key.to_string(),
@@ -537,9 +583,12 @@ impl<T: StateBackend> GovernanceManager<T> {
                 }
             }
             "voting_period_blocks" => {
-                let v: u64 = value.parse().map_err(|_| EconomicsError::InvalidParameterValue {
-                    key: key.to_string(), reason: "must be a valid u64".to_string(),
-                })?;
+                let v: u64 = value
+                    .parse()
+                    .map_err(|_| EconomicsError::InvalidParameterValue {
+                        key: key.to_string(),
+                        reason: "must be a valid u64".to_string(),
+                    })?;
                 if v < 1000 || v > 1_000_000 {
                     return Err(EconomicsError::InvalidParameterValue {
                         key: key.to_string(),
@@ -548,9 +597,12 @@ impl<T: StateBackend> GovernanceManager<T> {
                 }
             }
             "quorum_bps" => {
-                let v: u64 = value.parse().map_err(|_| EconomicsError::InvalidParameterValue {
-                    key: key.to_string(), reason: "must be a valid u64".to_string(),
-                })?;
+                let v: u64 = value
+                    .parse()
+                    .map_err(|_| EconomicsError::InvalidParameterValue {
+                        key: key.to_string(),
+                        reason: "must be a valid u64".to_string(),
+                    })?;
                 if v < 1000 || v > 6700 {
                     return Err(EconomicsError::InvalidParameterValue {
                         key: key.to_string(),
@@ -559,9 +611,12 @@ impl<T: StateBackend> GovernanceManager<T> {
                 }
             }
             "permanent_weight_multiplier_num" => {
-                let v: u64 = value.parse().map_err(|_| EconomicsError::InvalidParameterValue {
-                    key: key.to_string(), reason: "must be a valid u64".to_string(),
-                })?;
+                let v: u64 = value
+                    .parse()
+                    .map_err(|_| EconomicsError::InvalidParameterValue {
+                        key: key.to_string(),
+                        reason: "must be a valid u64".to_string(),
+                    })?;
                 if v == 0 || v > 100 {
                     return Err(EconomicsError::InvalidParameterValue {
                         key: key.to_string(),
@@ -570,9 +625,12 @@ impl<T: StateBackend> GovernanceManager<T> {
                 }
             }
             "permanent_weight_multiplier_den" => {
-                let v: u64 = value.parse().map_err(|_| EconomicsError::InvalidParameterValue {
-                    key: key.to_string(), reason: "must be a valid u64".to_string(),
-                })?;
+                let v: u64 = value
+                    .parse()
+                    .map_err(|_| EconomicsError::InvalidParameterValue {
+                        key: key.to_string(),
+                        reason: "must be a valid u64".to_string(),
+                    })?;
                 if v == 0 || v > 100 {
                     return Err(EconomicsError::InvalidParameterValue {
                         key: key.to_string(),
@@ -581,9 +639,12 @@ impl<T: StateBackend> GovernanceManager<T> {
                 }
             }
             "liquidation_penalty_bps" => {
-                let v: u64 = value.parse().map_err(|_| EconomicsError::InvalidParameterValue {
-                    key: key.to_string(), reason: "must be a valid u64".to_string(),
-                })?;
+                let v: u64 = value
+                    .parse()
+                    .map_err(|_| EconomicsError::InvalidParameterValue {
+                        key: key.to_string(),
+                        reason: "must be a valid u64".to_string(),
+                    })?;
                 if v > 1000 {
                     return Err(EconomicsError::InvalidParameterValue {
                         key: key.to_string(),
@@ -592,9 +653,12 @@ impl<T: StateBackend> GovernanceManager<T> {
                 }
             }
             "timelock_blocks" => {
-                let v: u64 = value.parse().map_err(|_| EconomicsError::InvalidParameterValue {
-                    key: key.to_string(), reason: "must be a valid u64".to_string(),
-                })?;
+                let v: u64 = value
+                    .parse()
+                    .map_err(|_| EconomicsError::InvalidParameterValue {
+                        key: key.to_string(),
+                        reason: "must be a valid u64".to_string(),
+                    })?;
                 // FIX MED-NEW-16: Enforce minimum timelock to prevent governance from
                 // disabling the delay entirely. 10 blocks ≈ 20s at 2s block time.
                 if v < 10 || v > 100_000 {
@@ -605,9 +669,12 @@ impl<T: StateBackend> GovernanceManager<T> {
                 }
             }
             "permanent_unlock_threshold_bps" => {
-                let v: u64 = value.parse().map_err(|_| EconomicsError::InvalidParameterValue {
-                    key: key.to_string(), reason: "must be a valid u64".to_string(),
-                })?;
+                let v: u64 = value
+                    .parse()
+                    .map_err(|_| EconomicsError::InvalidParameterValue {
+                        key: key.to_string(),
+                        reason: "must be a valid u64".to_string(),
+                    })?;
                 if v < 5000 || v > 10000 {
                     return Err(EconomicsError::InvalidParameterValue {
                         key: key.to_string(),
@@ -637,11 +704,15 @@ impl<T: StateBackend> GovernanceManager<T> {
         current_block: u64,
     ) -> Result<u64> {
         if title.len() > MAX_TITLE_LEN {
-            return Err(EconomicsError::TitleTooLong { len: title.len(), max: MAX_TITLE_LEN });
+            return Err(EconomicsError::TitleTooLong {
+                len: title.len(),
+                max: MAX_TITLE_LEN,
+            });
         }
         if description.len() > MAX_DESCRIPTION_LEN {
             return Err(EconomicsError::DescriptionTooLong {
-                len: description.len(), max: MAX_DESCRIPTION_LEN,
+                len: description.len(),
+                max: MAX_DESCRIPTION_LEN,
             });
         }
 
@@ -652,13 +723,15 @@ impl<T: StateBackend> GovernanceManager<T> {
             self.total_delegated_for(&proposer)? + self.permanent_stake_for(&proposer)?;
         if total_stake < params.min_proposal_stake {
             return Err(EconomicsError::InsufficientProposalStake {
-                have: total_stake, need: params.min_proposal_stake,
+                have: total_stake,
+                need: params.min_proposal_stake,
             });
         }
 
         // FIX 13: Validate parameter changes at submission time (defense-in-depth).
         if let Some(ExecutionPayload::ParameterChange {
-            ref param_key, ref new_value,
+            ref param_key,
+            ref new_value,
         }) = execution_payload
         {
             Self::validate_param_change(param_key, new_value)?;
@@ -753,7 +826,13 @@ impl<T: StateBackend> GovernanceManager<T> {
         self.put_proposal(&proposal)?;
 
         // Store vote record.
-        let vote = Vote { voter, proposal_id, support, weight, block_number: current_block };
+        let vote = Vote {
+            voter,
+            proposal_id,
+            support,
+            weight,
+            block_number: current_block,
+        };
         let data = borsh::to_vec(&vote).map_err(|e| EconomicsError::Borsh(e.to_string()))?;
         self.state.put_cf_raw(CF_GOVERNANCE_VOTES, &vkey, &data)?;
 
@@ -799,9 +878,11 @@ impl<T: StateBackend> GovernanceManager<T> {
 
         // Store vote record (support=false as placeholder, weight recorded for quorum)
         let vote = Vote {
-            voter, proposal_id,
+            voter,
+            proposal_id,
             support: false, // abstain -- does not affect tally
-            weight, block_number: current_block,
+            weight,
+            block_number: current_block,
         };
         let data = borsh::to_vec(&vote).map_err(|e| EconomicsError::Borsh(e.to_string()))?;
         self.state.put_cf_raw(CF_GOVERNANCE_VOTES, &vkey, &data)?;
@@ -915,10 +996,7 @@ impl<T: StateBackend> GovernanceManager<T> {
     /// Process all active proposals whose voting period has ended,
     /// and execute passed proposals whose timelock has expired (FIX 15).
     /// Called once per block during block validation.
-    pub fn process_pending_proposals(
-        &self,
-        current_block: u64,
-    ) -> Result<Vec<ProposalOutcome>> {
+    pub fn process_pending_proposals(&self, current_block: u64) -> Result<Vec<ProposalOutcome>> {
         // FIX MED-NEW-07: Skip full CF scan when no proposals have ever been created.
         let proposal_count = match self.state.get_cf_raw(CF_FEE_CONFIG, PROPOSAL_COUNTER_KEY)? {
             Some(data) if data.len() == 8 => u64::from_be_bytes(data.try_into().unwrap()),
@@ -942,9 +1020,7 @@ impl<T: StateBackend> GovernanceManager<T> {
         // Execute passed proposals whose timelock has expired.
         let passed = self.get_proposals_by_status(ProposalStatus::Passed)?;
         for proposal in passed {
-            if current_block >= proposal.executable_after
-                && proposal.execution_payload.is_some()
-            {
+            if current_block >= proposal.executable_after && proposal.execution_payload.is_some() {
                 let outcome = self.execute_proposal(proposal.id, current_block)?;
                 outcomes.push(outcome);
             }
@@ -964,14 +1040,21 @@ impl<T: StateBackend> GovernanceManager<T> {
         current_block: u64,
     ) -> Result<()> {
         match payload {
-            ExecutionPayload::ParameterChange { param_key, new_value } => {
+            ExecutionPayload::ParameterChange {
+                param_key,
+                new_value,
+            } => {
                 // FIX 13: Validate parameter change at execution time (defense-in-depth).
                 Self::validate_param_change(param_key, new_value)?;
                 self.state
                     .put_cf_raw(CF_FEE_CONFIG, param_key.as_bytes(), new_value.as_bytes())?;
                 tracing::info!(param_key, new_value, "governance parameter updated");
             }
-            ExecutionPayload::TreasurySpend { recipient, amount, reason } => {
+            ExecutionPayload::TreasurySpend {
+                recipient,
+                amount,
+                reason,
+            } => {
                 // Debit treasury account.
                 let mut treasury_acct = self
                     .state
@@ -979,22 +1062,28 @@ impl<T: StateBackend> GovernanceManager<T> {
                     .unwrap_or_default();
                 if treasury_acct.balance < *amount {
                     return Err(EconomicsError::InsufficientTreasury {
-                        have: treasury_acct.balance, need: *amount,
+                        have: treasury_acct.balance,
+                        need: *amount,
                     });
                 }
                 treasury_acct.balance -= *amount;
-                self.state.put_account(&params.treasury_address, &treasury_acct)?;
+                self.state
+                    .put_account(&params.treasury_address, &treasury_acct)?;
 
                 // Credit recipient.
-                let mut recipient_acct =
-                    self.state.get_account(recipient)?.unwrap_or_default();
+                let mut recipient_acct = self.state.get_account(recipient)?.unwrap_or_default();
                 recipient_acct.balance += *amount;
                 self.state.put_account(recipient, &recipient_acct)?;
 
                 tracing::info!(%recipient, %amount, reason, "treasury spend executed");
             }
             ExecutionPayload::MarketListing {
-                market_id, base_asset, quote_asset, lot_size, tick_size, initial_margin,
+                market_id,
+                base_asset,
+                quote_asset,
+                lot_size,
+                tick_size,
+                initial_margin,
             } => {
                 let key = market_id.to_be_bytes();
                 let mut data = Vec::new();
@@ -1011,7 +1100,10 @@ impl<T: StateBackend> GovernanceManager<T> {
                 self.state.put_cf_raw(CF_NATIVE_MARKETS, &key, &data)?;
 
                 tracing::info!(
-                    market_id, base_asset, quote_asset, "market listed via governance"
+                    market_id,
+                    base_asset,
+                    quote_asset,
+                    "market listed via governance"
                 );
             }
             ExecutionPayload::ValidatorRegistration { candidate } => {
@@ -1053,7 +1145,9 @@ impl<T: StateBackend> GovernanceManager<T> {
         let entries = self.state.iterate_cf(CF_GOVERNANCE_PROPOSALS, None)?;
         let mut proposals = Vec::new();
         for (key, value) in &entries {
-            if key.len() != 8 { continue; }
+            if key.len() != 8 {
+                continue;
+            }
             let proposal = Proposal::try_from_slice(value)
                 .map_err(|e| EconomicsError::Borsh(e.to_string()))?;
             if proposal.status == status {
@@ -1067,8 +1161,7 @@ impl<T: StateBackend> GovernanceManager<T> {
         let vkey = vote_key(proposal_id, voter);
         match self.state.get_cf_raw(CF_GOVERNANCE_VOTES, &vkey)? {
             Some(data) => Ok(Some(
-                Vote::try_from_slice(&data)
-                    .map_err(|e| EconomicsError::Borsh(e.to_string()))?,
+                Vote::try_from_slice(&data).map_err(|e| EconomicsError::Borsh(e.to_string()))?,
             )),
             None => Ok(None),
         }
@@ -1082,8 +1175,8 @@ impl<T: StateBackend> GovernanceManager<T> {
             if key.starts_with(b"snap") {
                 continue;
             }
-            let vote = Vote::try_from_slice(value)
-                .map_err(|e| EconomicsError::Borsh(e.to_string()))?;
+            let vote =
+                Vote::try_from_slice(value).map_err(|e| EconomicsError::Borsh(e.to_string()))?;
             if vote.voter == *voter {
                 votes.push(vote);
             }
@@ -1095,7 +1188,10 @@ impl<T: StateBackend> GovernanceManager<T> {
     /// instead of silently defaulting to treasury_address = Address::ZERO (which
     /// would permanently burn any treasury spend proposals).
     pub fn get_governance_params(&self) -> Result<GovernanceParams> {
-        match self.state.get_cf_raw(CF_FEE_CONFIG, GOVERNANCE_PARAMS_KEY)? {
+        match self
+            .state
+            .get_cf_raw(CF_FEE_CONFIG, GOVERNANCE_PARAMS_KEY)?
+        {
             Some(data) => Ok(GovernanceParams::try_from_slice(&data)
                 .map_err(|e| EconomicsError::Borsh(e.to_string()))?),
             None => Err(EconomicsError::GovernanceNotInitialized),
@@ -1104,7 +1200,8 @@ impl<T: StateBackend> GovernanceManager<T> {
 
     pub fn set_governance_params(&self, params: &GovernanceParams) -> Result<()> {
         let data = borsh::to_vec(params).map_err(|e| EconomicsError::Borsh(e.to_string()))?;
-        self.state.put_cf_raw(CF_FEE_CONFIG, GOVERNANCE_PARAMS_KEY, &data)?;
+        self.state
+            .put_cf_raw(CF_FEE_CONFIG, GOVERNANCE_PARAMS_KEY, &data)?;
         Ok(())
     }
 
@@ -1177,9 +1274,8 @@ impl<T: StateBackend> GovernanceManager<T> {
                 reason: "denominator must not be zero".to_string(),
             });
         }
-        let weighted_permanent = permanent
-            * U256::from(params.permanent_weight_multiplier_num)
-            / U256::from(den);
+        let weighted_permanent =
+            permanent * U256::from(params.permanent_weight_multiplier_num) / U256::from(den);
         Ok(delegated + weighted_permanent)
     }
 
@@ -1222,7 +1318,9 @@ impl<T: StateBackend> GovernanceManager<T> {
         // Sum delegated amounts per delegator (key = delegator(20) + validator(20)).
         let delegation_entries = self.state.iterate_cf(CF_STAKING_DELEGATIONS, None)?;
         for (key, value) in &delegation_entries {
-            if key.len() < 20 { continue; }
+            if key.len() < 20 {
+                continue;
+            }
             let delegator = Address::from_slice(&key[..20]);
             let delegation = Delegation::try_from_slice(value)
                 .map_err(|e| EconomicsError::Borsh(e.to_string()))?;
@@ -1233,7 +1331,9 @@ impl<T: StateBackend> GovernanceManager<T> {
         let mut voter_permanent: HashMap<Address, U256> = HashMap::new();
         let permanent_entries = self.state.iterate_cf(CF_STAKING_PERMANENT, None)?;
         for (key, value) in &permanent_entries {
-            if key.len() < 20 { continue; }
+            if key.len() < 20 {
+                continue;
+            }
             let staker = Address::from_slice(&key[..20]);
             let info = PermanentStakeInfo::try_from_slice(value)
                 .map_err(|e| EconomicsError::Borsh(e.to_string()))?;
@@ -1246,15 +1346,15 @@ impl<T: StateBackend> GovernanceManager<T> {
         } else {
             params.permanent_weight_multiplier_den
         };
-        let mut all_voters: std::collections::HashSet<Address> = voter_delegated.keys().copied().collect();
+        let mut all_voters: std::collections::HashSet<Address> =
+            voter_delegated.keys().copied().collect();
         all_voters.extend(voter_permanent.keys());
 
         for voter in all_voters {
             let delegated = voter_delegated.get(&voter).copied().unwrap_or(U256::ZERO);
             let permanent = voter_permanent.get(&voter).copied().unwrap_or(U256::ZERO);
-            let weighted_permanent = permanent
-                * U256::from(params.permanent_weight_multiplier_num)
-                / U256::from(den);
+            let weighted_permanent =
+                permanent * U256::from(params.permanent_weight_multiplier_num) / U256::from(den);
             let weight = delegated + weighted_permanent;
             if !weight.is_zero() {
                 let snap_key = snapshot_weight_key(proposal_id, &voter);
@@ -1275,8 +1375,8 @@ impl<T: StateBackend> GovernanceManager<T> {
         let entries = self.state.iterate_cf(CF_GOVERNANCE_VOTES, Some(&prefix))?;
         let mut total = U256::ZERO;
         for (_key, value) in &entries {
-            let vote = Vote::try_from_slice(value)
-                .map_err(|e| EconomicsError::Borsh(e.to_string()))?;
+            let vote =
+                Vote::try_from_slice(value).map_err(|e| EconomicsError::Borsh(e.to_string()))?;
             total += vote.weight;
         }
         Ok(total)
@@ -1306,7 +1406,9 @@ impl<T: StateBackend> GovernanceManager<T> {
     /// Total delegated stake for a voter (prefix scan on delegator address).
     fn total_delegated_for(&self, voter: &Address) -> Result<U256> {
         let prefix = voter.as_slice();
-        let entries = self.state.iterate_cf(CF_STAKING_DELEGATIONS, Some(prefix))?;
+        let entries = self
+            .state
+            .iterate_cf(CF_STAKING_DELEGATIONS, Some(prefix))?;
         let mut total = U256::ZERO;
         for (_key, value) in &entries {
             let delegation = Delegation::try_from_slice(value)
@@ -1318,7 +1420,10 @@ impl<T: StateBackend> GovernanceManager<T> {
 
     /// Permanent stake for a voter.
     fn permanent_stake_for(&self, voter: &Address) -> Result<U256> {
-        match self.state.get_cf_raw(CF_STAKING_PERMANENT, voter.as_slice())? {
+        match self
+            .state
+            .get_cf_raw(CF_STAKING_PERMANENT, voter.as_slice())?
+        {
             Some(data) => {
                 let info = PermanentStakeInfo::try_from_slice(&data)
                     .map_err(|e| EconomicsError::Borsh(e.to_string()))?;
@@ -1358,7 +1463,8 @@ impl<T: StateBackend> GovernanceManager<T> {
     fn put_proposal(&self, proposal: &Proposal) -> Result<()> {
         let key = proposal.id.to_be_bytes();
         let data = borsh::to_vec(proposal).map_err(|e| EconomicsError::Borsh(e.to_string()))?;
-        self.state.put_cf_raw(CF_GOVERNANCE_PROPOSALS, &key, &data)?;
+        self.state
+            .put_cf_raw(CF_GOVERNANCE_PROPOSALS, &key, &data)?;
         Ok(())
     }
 }
@@ -1401,7 +1507,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = StateDb::open(dir.path()).unwrap();
         let gm = GovernanceManager::new(db);
-        gm.set_governance_params(&GovernanceParams::defaults(Address::ZERO)).unwrap();
+        gm.set_governance_params(&GovernanceParams::defaults(Address::ZERO))
+            .unwrap();
         (dir, gm)
     }
 
@@ -1413,19 +1520,31 @@ mod tests {
     fn reject_disallowed_parameter_key() {
         let (_dir, _gm) = setup();
         let result = GovernanceManager::<StateDb>::validate_param_change("evil_key", "666");
-        assert!(matches!(result, Err(EconomicsError::ParameterNotModifiable(_))));
+        assert!(matches!(
+            result,
+            Err(EconomicsError::ParameterNotModifiable(_))
+        ));
     }
 
     #[test]
     fn reject_out_of_range_parameter() {
         let (_dir, _gm) = setup();
-        let result = GovernanceManager::<StateDb>::validate_param_change("maintenance_margin_bps", "0");
-        assert!(matches!(result, Err(EconomicsError::InvalidParameterValue { .. })));
+        let result =
+            GovernanceManager::<StateDb>::validate_param_change("maintenance_margin_bps", "0");
+        assert!(matches!(
+            result,
+            Err(EconomicsError::InvalidParameterValue { .. })
+        ));
 
-        let result = GovernanceManager::<StateDb>::validate_param_change("maintenance_margin_bps", "10000");
-        assert!(matches!(result, Err(EconomicsError::InvalidParameterValue { .. })));
+        let result =
+            GovernanceManager::<StateDb>::validate_param_change("maintenance_margin_bps", "10000");
+        assert!(matches!(
+            result,
+            Err(EconomicsError::InvalidParameterValue { .. })
+        ));
 
-        let result = GovernanceManager::<StateDb>::validate_param_change("maintenance_margin_bps", "500");
+        let result =
+            GovernanceManager::<StateDb>::validate_param_change("maintenance_margin_bps", "500");
         assert!(result.is_ok());
     }
 
@@ -1433,9 +1552,13 @@ mod tests {
     fn reject_zero_multiplier_den() {
         let (_dir, _gm) = setup();
         let result = GovernanceManager::<StateDb>::validate_param_change(
-            "permanent_weight_multiplier_den", "0",
+            "permanent_weight_multiplier_den",
+            "0",
         );
-        assert!(matches!(result, Err(EconomicsError::InvalidParameterValue { .. })));
+        assert!(matches!(
+            result,
+            Err(EconomicsError::InvalidParameterValue { .. })
+        ));
     }
 
     #[test]

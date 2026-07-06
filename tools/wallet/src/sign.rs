@@ -17,7 +17,9 @@ use crate::Cli;
 
 pub(crate) fn load_signing_key(cli: &Cli) -> Result<SigningKey, String> {
     if let Some(ref key_hex) = cli.key {
-        eprintln!("WARNING: Using --key flag exposes your private key in shell history and process list.");
+        eprintln!(
+            "WARNING: Using --key flag exposes your private key in shell history and process list."
+        );
         eprintln!("         Use --keystore for production use.");
         let hex_str = key_hex.strip_prefix("0x").unwrap_or(key_hex);
         let bytes = hex::decode(hex_str).map_err(|e| format!("invalid key hex: {e}"))?;

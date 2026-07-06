@@ -86,8 +86,7 @@ impl StateDb {
         }
 
         // Create checkpoint (atomic, hardlink-based)
-        let checkpoint = Checkpoint::new(self.inner())
-            .map_err(|e| StateError::RocksDb(e))?;
+        let checkpoint = Checkpoint::new(self.inner()).map_err(|e| StateError::RocksDb(e))?;
         checkpoint
             .create_checkpoint(output_path)
             .map_err(|e| StateError::RocksDb(e))?;
@@ -371,10 +370,15 @@ mod tests {
         let snap_dir = TempDir::new().unwrap();
         let snap_path = snap_dir.path().join("snap1");
 
-        db.create_snapshot(&snap_path, &test_metadata(state_root)).unwrap();
+        db.create_snapshot(&snap_path, &test_metadata(state_root))
+            .unwrap();
 
         let result = StateDb::verify_snapshot(&snap_path).unwrap();
-        assert!(result.verified, "snapshot should verify: {:?}", result.error);
+        assert!(
+            result.verified,
+            "snapshot should verify: {:?}",
+            result.error
+        );
         assert_eq!(result.block_height, 100);
         assert_eq!(result.recorded_state_root, result.computed_state_root);
     }
@@ -387,7 +391,8 @@ mod tests {
 
         let snap_dir = TempDir::new().unwrap();
         let snap_path = snap_dir.path().join("snap_corrupt");
-        db.create_snapshot(&snap_path, &test_metadata(state_root)).unwrap();
+        db.create_snapshot(&snap_path, &test_metadata(state_root))
+            .unwrap();
 
         // Corrupt: write a wrong state root in metadata
         let bad_root = B256::repeat_byte(0xFF);
@@ -413,7 +418,8 @@ mod tests {
 
         let snap_dir = TempDir::new().unwrap();
         let snap_path = snap_dir.path().join("snap_restore");
-        db.create_snapshot(&snap_path, &test_metadata(state_root)).unwrap();
+        db.create_snapshot(&snap_path, &test_metadata(state_root))
+            .unwrap();
         drop(db);
 
         // Restore to a new directory
@@ -440,7 +446,8 @@ mod tests {
 
         let snap_dir = TempDir::new().unwrap();
         let snap_path = snap_dir.path().join("snap_bad");
-        db.create_snapshot(&snap_path, &test_metadata(state_root)).unwrap();
+        db.create_snapshot(&snap_path, &test_metadata(state_root))
+            .unwrap();
 
         // Corrupt metadata
         let bad_meta = test_metadata(B256::repeat_byte(0xAA));

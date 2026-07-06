@@ -1,7 +1,10 @@
 use clap::Parser;
 
 #[derive(Parser, Clone, Debug)]
-#[command(name = "torus-explorer", about = "Block explorer backend for Torus-hyperBFT")]
+#[command(
+    name = "torus-explorer",
+    about = "Block explorer backend for Torus-hyperBFT"
+)]
 pub struct Config {
     /// JSON-RPC HTTP endpoint of the Torus node
     #[arg(long, default_value = "http://localhost:8545")]

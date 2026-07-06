@@ -8,8 +8,12 @@
 //!
 //! Main type: [`HotStuff`].
 
-use std::{collections::HashSet, sync::mpsc::Sender, time::{Duration, Instant, SystemTime}};
 use borsh::BorshSerialize;
+use std::{
+    collections::HashSet,
+    sync::mpsc::Sender,
+    time::{Duration, Instant, SystemTime},
+};
 
 use ed25519_dalek::VerifyingKey;
 
@@ -30,8 +34,8 @@ use crate::{
     hotstuff::{
         messages::{
             BlockDataRequest, BlockDataResponse, HotStuffMessage, NEMessage, NERequest, NewView,
-            Nudge, PhaseVote, Proposal, ProposalHeader, ProposalRequest, ProposalResponse,
-            PendingBodies, PendingHeaders,
+            Nudge, PendingBodies, PendingHeaders, PhaseVote, Proposal, ProposalHeader,
+            ProposalRequest, ProposalResponse,
         },
         roles::{is_phase_voter, is_proposer, new_view_recipients_with_reputation},
         types::{valid_nec, NECollector, Phase, PhaseVoteCollector},
@@ -50,7 +54,7 @@ use crate::{
     },
 };
 
-use super::roles::{phase_vote_recipient_with_reputation, is_proposer_with_reputation};
+use super::roles::{is_proposer_with_reputation, phase_vote_recipient_with_reputation};
 
 /// A single participant in the HotStuff subprotocol.
 ///
@@ -158,7 +162,8 @@ impl<N: Network> HotStuff<N> {
             }
         }
         if let Some(vs_updates) = result.validator_set_updates {
-            self.validator_set_update_handle.update_validator_set(vs_updates);
+            self.validator_set_update_handle
+                .update_validator_set(vs_updates);
         }
     }
 
@@ -241,11 +246,16 @@ impl<N: Network> HotStuff<N> {
                     } = app.produce_block(produce_block_request);
 
                     let block = Block::new(child_height, highest_pc, data_hash, data);
-                    block_tree.insert(&block, app_state_updates.as_ref(), validator_set_updates.as_ref())?;
+                    block_tree.insert(
+                        &block,
+                        app_state_updates.as_ref(),
+                        validator_set_updates.as_ref(),
+                    )?;
                     Event::InsertBlock(InsertBlockEvent {
                         timestamp: SystemTime::now(),
                         block: block.clone(),
-                    }).publish(&self.event_publisher);
+                    })
+                    .publish(&self.event_publisher);
                     let update_result = block_tree.update(&block.justify, &self.event_publisher).unwrap_or_else(|e| {
                         if let BlockTreeError::BlockExpectedButNotFound { block: missing } = &e {
                             log::warn!("enter_view: missing block {:?} in commit chain — triggering sync", missing);
@@ -268,7 +278,8 @@ impl<N: Network> HotStuff<N> {
                     Event::Propose(ProposeEvent {
                         timestamp: SystemTime::now(),
                         proposal,
-                    }).publish(&self.event_publisher);
+                    })
+                    .publish(&self.event_publisher);
                 }
             }
             return Ok(());
@@ -285,7 +296,11 @@ impl<N: Network> HotStuff<N> {
 
         // FIX CONS-PF-10: Use reputation-weighted leader for NewView routing.
         let reputation = block_tree.leader_reputation().ok();
-        match new_view_recipients_with_reputation(&new_view, &validator_set_state, reputation.as_ref()) {
+        match new_view_recipients_with_reputation(
+            &new_view,
+            &validator_set_state,
+            reputation.as_ref(),
+        ) {
             (committed_vs_leader, None) => self
                 .sender_handle
                 .send::<HotStuffMessage>(committed_vs_leader, new_view.clone().into()),
@@ -370,9 +385,9 @@ impl<N: Network> HotStuff<N> {
             // MonadBFT: Check if the previous view timed out and produced a TC.
             if let Some(tc) = block_tree.highest_tc()? {
                 if tc.view + 1 == self.view_info.view {
-                    if let Some(proposal) = self.create_proposal_based_on_tc(
-                        &tc, block_tree, app,
-                    )? {
+                    if let Some(proposal) =
+                        self.create_proposal_based_on_tc(&tc, block_tree, app)?
+                    {
                         self.broadcast_proposal_as_header(&proposal, false);
                         Event::Propose(ProposeEvent {
                             timestamp: SystemTime::now(),
@@ -429,9 +444,12 @@ impl<N: Network> HotStuff<N> {
                     })
                     .publish(&self.event_publisher);
 
-                    let update_result =
-                        block_tree.update(&block.justify, &self.event_publisher)
-                            .unwrap_or(UpdateResult { validator_set_updates: None, committed_block_hashes: vec![] });
+                    let update_result = block_tree
+                        .update(&block.justify, &self.event_publisher)
+                        .unwrap_or(UpdateResult {
+                            validator_set_updates: None,
+                            committed_block_hashes: vec![],
+                        });
                     self.process_update_result(update_result, block_tree, app);
 
                     let proposal = Proposal {
@@ -481,11 +499,18 @@ impl<N: Network> HotStuff<N> {
     ///   RECOVER is async: sends ProposalRequest/NERequest, stores RecoveryState,
     ///   returns None. The event loop handles responses via on_receive_proposal_response
     ///   and on_receive_ne. If the view timer expires, recovery is abandoned.
-    fn broadcast_proposal_as_header(&mut self, proposal: &Proposal, has_validator_set_updates: bool) {
-        self.pending_bodies.insert(proposal.block.hash, proposal.block.clone());
-        self.sender_handle.store_block_for_serving(proposal.block.hash, proposal.block.clone());
+    fn broadcast_proposal_as_header(
+        &mut self,
+        proposal: &Proposal,
+        has_validator_set_updates: bool,
+    ) {
+        self.pending_bodies
+            .insert(proposal.block.hash, proposal.block.clone());
+        self.sender_handle
+            .store_block_for_serving(proposal.block.hash, proposal.block.clone());
         let header = ProposalHeader::from_proposal(proposal, has_validator_set_updates);
-        self.sender_handle.broadcast::<HotStuffMessage>(header.into());
+        self.sender_handle
+            .broadcast::<HotStuffMessage>(header.into());
     }
 
     fn create_proposal_based_on_tc<K: KVStore>(
@@ -513,7 +538,11 @@ impl<N: Network> HotStuff<N> {
                 let validator_set_state = block_tree.validator_set_state()?;
                 let validator_set = validator_set_state.committed_validator_set().clone();
                 let total_power = validator_set.total_power().int() as u64;
-                let f = if total_power > 0 { (total_power - 1) / 3 } else { 0 };
+                let f = if total_power > 0 {
+                    (total_power - 1) / 3
+                } else {
+                    0
+                };
                 let kappa = (f + 1) as usize; // κ = f+1 guarantees at least one honest responder
 
                 // Step 1: Send ProposalRequest to κ validators (prefer those from TC's tips_views).
@@ -523,7 +552,8 @@ impl<N: Network> HotStuff<N> {
                     tc: tc.clone(),
                 };
                 // FIX CONS-FIND-28: Shuffle recipients to prevent deterministic withholding.
-                let mut recipients: Vec<_> = validator_set.validators_and_powers()
+                let mut recipients: Vec<_> = validator_set
+                    .validators_and_powers()
                     .into_iter()
                     .map(|(vk, _)| vk)
                     .filter(|vk| *vk != self.config.keypair.public())
@@ -534,17 +564,17 @@ impl<N: Network> HotStuff<N> {
                 let len = recipients.len();
                 if len > 1 {
                     for i in (1..len).rev() {
-                        let j = (seed.wrapping_mul(6364136223846793005).wrapping_add(i as u64)
+                        let j = (seed
+                            .wrapping_mul(6364136223846793005)
+                            .wrapping_add(i as u64)
                             % (i as u64 + 1)) as usize;
                         recipients.swap(i, j);
                     }
                 }
 
                 for vk in recipients.into_iter().take(kappa) {
-                    self.sender_handle.send::<HotStuffMessage>(
-                        vk,
-                        req.clone().into(),
-                    );
+                    self.sender_handle
+                        .send::<HotStuffMessage>(vk, req.clone().into());
                 }
 
                 // Step 2: Broadcast NERequest to ALL validators.
@@ -553,7 +583,8 @@ impl<N: Network> HotStuff<N> {
                     view: self.view_info.view,
                     tc: tc.clone(),
                 };
-                self.sender_handle.broadcast::<HotStuffMessage>(ne_req.into());
+                self.sender_handle
+                    .broadcast::<HotStuffMessage>(ne_req.into());
 
                 // Step 3: Store recovery state for async completion.
                 let high_tip_qc_view = tip.block_justify.view;
@@ -598,8 +629,17 @@ impl<N: Network> HotStuff<N> {
             HotStuffMessage::NewView(_) => "NewView",
             _ => "Other",
         };
-        log::info!("on_receive_msg: type={}, view={}", msg_type, self.view_info.view.int());
-        if matches!(msg, HotStuffMessage::Proposal(_) | HotStuffMessage::Nudge(_) | HotStuffMessage::ProposalHeader(_)) {
+        log::info!(
+            "on_receive_msg: type={}, view={}",
+            msg_type,
+            self.view_info.view.int()
+        );
+        if matches!(
+            msg,
+            HotStuffMessage::Proposal(_)
+                | HotStuffMessage::Nudge(_)
+                | HotStuffMessage::ProposalHeader(_)
+        ) {
             let validator_set_state = block_tree.validator_set_state()?;
 
             // For ProposalHeaders that bypass view filtering, verify the sender
@@ -650,12 +690,8 @@ impl<N: Network> HotStuff<N> {
             HotStuffMessage::ProposalResponse(resp) => {
                 self.on_receive_proposal_response(resp, origin, block_tree, app)
             }
-            HotStuffMessage::NERequest(req) => {
-                self.on_receive_ne_request(req, origin, block_tree)
-            }
-            HotStuffMessage::NE(ne) => {
-                self.on_receive_ne(ne, origin, block_tree, app)
-            }
+            HotStuffMessage::NERequest(req) => self.on_receive_ne_request(req, origin, block_tree),
+            HotStuffMessage::NE(ne) => self.on_receive_ne(ne, origin, block_tree, app),
             // Hybrid pipelining
             HotStuffMessage::ProposalHeader(header) => {
                 self.on_receive_proposal_header(header, origin, block_tree, app)
@@ -755,7 +791,8 @@ impl<N: Network> HotStuff<N> {
             }
             // Same block hash = duplicate, handled by ProposalStatus below.
         } else {
-            self.seen_proposals.insert(proposal_key, proposal.block.hash);
+            self.seen_proposals
+                .insert(proposal_key, proposal.block.hash);
         }
 
         // MonadBFT B2: validate NEC if present.
@@ -786,11 +823,15 @@ impl<N: Network> HotStuff<N> {
             if let Some(ref tc) = proposal.tc {
                 let tc_valid = tc.is_correct(block_tree)?
                     && self.view_info.view == tc.view + 1
-                    && tc.high_tip.as_ref().map_or(false, |tip| tip.block_hash == proposal.block.hash);
+                    && tc
+                        .high_tip
+                        .as_ref()
+                        .map_or(false, |tip| tip.block_hash == proposal.block.hash);
                 if !tc_valid {
                     match self.proposal_status {
                         ProposalStatus::WaitingForProposal => {
-                            self.proposal_status = ProposalStatus::OneLeaderProposed { leader: *origin }
+                            self.proposal_status =
+                                ProposalStatus::OneLeaderProposed { leader: *origin }
                         }
                         ProposalStatus::OneLeaderProposed { leader: _ } => {
                             self.proposal_status = ProposalStatus::AllLeadersProposed
@@ -806,7 +847,11 @@ impl<N: Network> HotStuff<N> {
 
         // 1. Check if block is correct and safe.
         let is_correct = proposal.block.is_correct(block_tree)?;
-        let is_safe = if is_correct { safe_block(&proposal.block, block_tree, self.config.chain_id)? } else { false };
+        let is_safe = if is_correct {
+            safe_block(&proposal.block, block_tree, self.config.chain_id)?
+        } else {
+            false
+        };
         if !is_correct || !is_safe {
             let justify_block_known = block_tree.contains(&proposal.block.justify.block);
             log::warn!(
@@ -858,9 +903,12 @@ impl<N: Network> HotStuff<N> {
             .publish(&self.event_publisher);
 
             // 3. Trigger block tree updates: update highestPC, lock, commit.
-            let update_result =
-                block_tree.update(&proposal.block.justify, &self.event_publisher)
-                    .unwrap_or(UpdateResult { validator_set_updates: None, committed_block_hashes: vec![] });
+            let update_result = block_tree
+                .update(&proposal.block.justify, &self.event_publisher)
+                .unwrap_or(UpdateResult {
+                    validator_set_updates: None,
+                    committed_block_hashes: vec![],
+                });
             self.process_update_result(update_result, block_tree, app);
 
             // 4. Access the possibly updated validator set state, and update the vote collectors if needed.
@@ -893,7 +941,11 @@ impl<N: Network> HotStuff<N> {
                 );
                 // FIX CONS-FIND-13: Use reputation-weighted vote recipient.
                 let reputation = block_tree.leader_reputation().ok();
-                let vote_recipient = phase_vote_recipient_with_reputation(&phase_vote, &validator_set_state, reputation.as_ref());
+                let vote_recipient = phase_vote_recipient_with_reputation(
+                    &phase_vote,
+                    &validator_set_state,
+                    reputation.as_ref(),
+                );
                 self.sender_handle
                     .send::<HotStuffMessage>(vote_recipient, phase_vote.clone().into());
 
@@ -990,9 +1042,12 @@ impl<N: Network> HotStuff<N> {
         }
 
         // 2. Trigger block tree updates: update highestPC, lock, commit.
-        let update_result =
-            block_tree.update(&nudge.justify, &self.event_publisher)
-                .unwrap_or(UpdateResult { validator_set_updates: None, committed_block_hashes: vec![] });
+        let update_result = block_tree
+            .update(&nudge.justify, &self.event_publisher)
+            .unwrap_or(UpdateResult {
+                validator_set_updates: None,
+                committed_block_hashes: vec![],
+            });
         self.process_update_result(update_result, block_tree, app);
 
         // 3. Access the possibly updated validator set state, and update the vote collectors if needed.
@@ -1041,7 +1096,11 @@ impl<N: Network> HotStuff<N> {
             );
             // FIX CONS-FIND-13: Use reputation-weighted vote recipient.
             let reputation = block_tree.leader_reputation().ok();
-            let vote_recipient = phase_vote_recipient_with_reputation(&vote, &validator_set_state, reputation.as_ref());
+            let vote_recipient = phase_vote_recipient_with_reputation(
+                &vote,
+                &validator_set_state,
+                reputation.as_ref(),
+            );
             self.sender_handle
                 .send::<HotStuffMessage>(vote_recipient, vote.clone().into());
 
@@ -1126,10 +1185,13 @@ impl<N: Network> HotStuff<N> {
                 //    first, then attempt full update for commits.
                 let _ = block_tree.advance_highest_pc_from_remote(&new_pc, &self.event_publisher);
                 let update_result =
-                    block_tree.update(&new_pc, &self.event_publisher)
-                        .unwrap_or(UpdateResult { validator_set_updates: None, committed_block_hashes: vec![] });
+                    block_tree
+                        .update(&new_pc, &self.event_publisher)
+                        .unwrap_or(UpdateResult {
+                            validator_set_updates: None,
+                            committed_block_hashes: vec![],
+                        });
                 self.process_update_result(update_result, block_tree, app);
-
 
                 // MonadBFT B2: Speculative commit — 1-QC for fresh proposals.
                 // A block qualifies for speculative commit if it was a fresh
@@ -1194,9 +1256,12 @@ impl<N: Network> HotStuff<N> {
             && safe_pc(&new_view.highest_pc, block_tree, self.config.chain_id)?
         {
             // 2. Trigger block tree updates: update highestPC, lock, commit (if new PC collected).
-            let update_result =
-                block_tree.update(&new_view.highest_pc, &self.event_publisher)
-                    .unwrap_or(UpdateResult { validator_set_updates: None, committed_block_hashes: vec![] });
+            let update_result = block_tree
+                .update(&new_view.highest_pc, &self.event_publisher)
+                .unwrap_or(UpdateResult {
+                    validator_set_updates: None,
+                    committed_block_hashes: vec![],
+                });
             self.process_update_result(update_result, block_tree, app);
 
             // 3. Access the possibly updated validator set state, and update the phase vote collectors if needed
@@ -1239,7 +1304,8 @@ impl<N: Network> HotStuff<N> {
                         nec: None,
                     },
                 };
-                self.sender_handle.send::<HotStuffMessage>(*origin, response.into());
+                self.sender_handle
+                    .send::<HotStuffMessage>(*origin, response.into());
             }
         }
         Ok(())
@@ -1368,7 +1434,8 @@ impl<N: Network> HotStuff<N> {
                     validator_set_state.committed_validator_set(),
                 ),
             };
-            self.sender_handle.send::<HotStuffMessage>(leader, ne.into());
+            self.sender_handle
+                .send::<HotStuffMessage>(leader, ne.into());
             self.ne_sent_views.insert(req.view);
         }
 
@@ -1389,7 +1456,11 @@ impl<N: Network> HotStuff<N> {
         }
 
         // Only process if we are currently recovering.
-        let nec_opt = if let RecoveryState::Recovering { ref mut ne_collector, .. } = self.recovery_state {
+        let nec_opt = if let RecoveryState::Recovering {
+            ref mut ne_collector,
+            ..
+        } = self.recovery_state
+        {
             ne_collector.collect(origin, ne.view, ne.high_tip_qc_view, ne.signature)
         } else {
             return Ok(());
@@ -1418,9 +1489,9 @@ impl<N: Network> HotStuff<N> {
                 Some(high_tip_qc.block)
             };
             let child_height = if let Some(ref pb) = parent_block {
-                let h = block_tree.block_height(pb)?.ok_or(
-                    BlockTreeError::BlockExpectedButNotFound { block: *pb },
-                )?;
+                let h = block_tree
+                    .block_height(pb)?
+                    .ok_or(BlockTreeError::BlockExpectedButNotFound { block: *pb })?;
                 h + 1
             } else {
                 BlockHeight::new(0)
@@ -1447,9 +1518,12 @@ impl<N: Network> HotStuff<N> {
                 tc: Some(tc),
                 nec: Some(nec),
             };
-            self.pending_bodies.insert(proposal.block.hash, proposal.block.clone());
-            self.sender_handle.store_block_for_serving(proposal.block.hash, proposal.block.clone());
-            self.sender_handle.broadcast::<HotStuffMessage>(proposal.clone().into());
+            self.pending_bodies
+                .insert(proposal.block.hash, proposal.block.clone());
+            self.sender_handle
+                .store_block_for_serving(proposal.block.hash, proposal.block.clone());
+            self.sender_handle
+                .broadcast::<HotStuffMessage>(proposal.clone().into());
             Event::Propose(ProposeEvent {
                 timestamp: SystemTime::now(),
                 proposal,
@@ -1515,7 +1589,10 @@ impl<N: Network> HotStuff<N> {
         // Verify block_hash = hash(height, justify, data_hash) — all from the header.
         let expected_hash = Block::hash(header.height, &header.justify, &header.data_hash);
         if header.block_hash != expected_hash {
-            log::warn!("dropping proposal header: hash mismatch, view={}", header.view.int());
+            log::warn!(
+                "dropping proposal header: hash mismatch, view={}",
+                header.view.int()
+            );
             return Ok(());
         }
 
@@ -1538,9 +1615,8 @@ impl<N: Network> HotStuff<N> {
         // (body still in flight) but we already validated and voted for it. Tracked
         // entries in pending_headers/pending_bodies are proof of prior validation.
         let justify_correct = header.justify.is_correct(block_tree)?;
-        let justify_previously_validated =
-            self.pending_headers.contains_key(&header.justify.block)
-                || self.pending_bodies.contains_key(&header.justify.block);
+        let justify_previously_validated = self.pending_headers.contains_key(&header.justify.block)
+            || self.pending_bodies.contains_key(&header.justify.block);
         let is_safe = if justify_correct {
             if justify_previously_validated {
                 header.justify.is_block_justify()
@@ -1622,7 +1698,8 @@ impl<N: Network> HotStuff<N> {
                 block_hash: header.block_hash,
             };
             self.sender_handle.request_block_data(*origin, req);
-            self.body_fetch_tracker.insert(header.block_hash, (Instant::now(), 0, *origin));
+            self.body_fetch_tracker
+                .insert(header.block_hash, (Instant::now(), 0, *origin));
             self.pending_headers.insert(header.block_hash, header);
         }
 
@@ -1654,7 +1731,10 @@ impl<N: Network> HotStuff<N> {
         };
 
         if let Some(block) = block {
-            let resp = BlockDataResponse { view: req.view, block };
+            let resp = BlockDataResponse {
+                view: req.view,
+                block,
+            };
             self.sender_handle
                 .send::<HotStuffMessage>(*origin, resp.into());
         }
@@ -1725,15 +1805,22 @@ impl<N: Network> HotStuff<N> {
             })
             .publish(&self.event_publisher);
 
-            let update_result =
-                block_tree.update(&block.justify, &self.event_publisher).unwrap_or_else(|e| {
+            let update_result = block_tree
+                .update(&block.justify, &self.event_publisher)
+                .unwrap_or_else(|e| {
                     if let BlockTreeError::BlockExpectedButNotFound { block: missing } = &e {
-                        log::warn!("body insert: missing block {:?} in commit chain — triggering sync", missing);
+                        log::warn!(
+                            "body insert: missing block {:?} in commit chain — triggering sync",
+                            missing
+                        );
                         self.sync_needed = true;
                     } else {
                         log::warn!("block_tree.update after body insert: {:?}", e);
                     }
-                    UpdateResult { validator_set_updates: None, committed_block_hashes: vec![] }
+                    UpdateResult {
+                        validator_set_updates: None,
+                        committed_block_hashes: vec![],
+                    }
                 });
             self.process_update_result(update_result, block_tree, app);
 
@@ -1824,7 +1911,10 @@ impl<N: Network> HotStuff<N> {
                 let Some(target) =
                     rotated_body_fetch_target(*count, MAX_BODY_RETRIES, origin, &others)
                 else {
-                    log::warn!("body fetch has no remaining targets for {:?} — falling back to sync", hash);
+                    log::warn!(
+                        "body fetch has no remaining targets for {:?} — falling back to sync",
+                        hash
+                    );
                     expired.push(*hash);
                     continue;
                 };
@@ -1836,7 +1926,11 @@ impl<N: Network> HotStuff<N> {
                 self.sender_handle.request_block_data(target, req);
                 *last_req = now;
                 *count += 1;
-                log::debug!("body fetch retry {} (target rotation) for {:?}", count, hash);
+                log::debug!(
+                    "body fetch retry {} (target rotation) for {:?}",
+                    count,
+                    hash
+                );
             } else {
                 expired.push(*hash);
             }
@@ -1908,8 +2002,14 @@ mod body_fetch_rotation_tests {
                 "attempts 0-2 target the proposer"
             );
         }
-        assert_eq!(rotated_body_fetch_target(3, 3, &origin, &others), Some(others[0]));
-        assert_eq!(rotated_body_fetch_target(4, 3, &origin, &others), Some(others[1]));
+        assert_eq!(
+            rotated_body_fetch_target(3, 3, &origin, &others),
+            Some(others[0])
+        );
+        assert_eq!(
+            rotated_body_fetch_target(4, 3, &origin, &others),
+            Some(others[1])
+        );
         assert_eq!(
             rotated_body_fetch_target(5, 3, &origin, &others),
             Some(others[0]),

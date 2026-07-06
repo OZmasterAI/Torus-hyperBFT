@@ -431,12 +431,10 @@ pub(crate) fn pc_to_lock<K: KVStore>(
     let locked_pc = block_tree.locked_pc()?;
     let pc_to_lock = match justify.phase {
         // If `justify.phase` is `Generic`, lock on `justify.block.justify`.
-        Phase::Generic => {
-            match block_tree.block_justify(&justify.block) {
-                Ok(parent_justify) => Some(parent_justify.clone()),
-                Err(_) => return Ok(None),
-            }
-        }
+        Phase::Generic => match block_tree.block_justify(&justify.block) {
+            Ok(parent_justify) => Some(parent_justify.clone()),
+            Err(_) => return Ok(None),
+        },
 
         // If `justify.phase` is `Prepare`, don't lock.
         Phase::Prepare => None,
@@ -521,7 +519,9 @@ pub(crate) fn block_to_commit<K: KVStore>(
             let parent_justify = match block_tree.block_justify(&justify.block) {
                 Ok(pj) => pj,
                 Err(_) => {
-                    log::debug!("block_to_commit: justify.block not in tree yet (pending body), deferring");
+                    log::debug!(
+                        "block_to_commit: justify.block not in tree yet (pending body), deferring"
+                    );
                     return Ok(None);
                 }
             };

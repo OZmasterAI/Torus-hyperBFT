@@ -111,14 +111,19 @@ struct JsonRpcResponse {
 }
 
 impl FaucetState {
-    async fn rpc_call(&self, method: &str, params: &serde_json::Value) -> Result<serde_json::Value, String> {
+    async fn rpc_call(
+        &self,
+        method: &str,
+        params: &serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
         let body = serde_json::json!({
             "jsonrpc": "2.0",
             "method": method,
             "params": params,
             "id": 1
         });
-        let resp = self.http_client
+        let resp = self
+            .http_client
             .post(&self.rpc_url)
             .json(&body)
             .send()
@@ -131,33 +136,48 @@ impl FaucetState {
         if let Some(err) = rpc.error {
             return Err(format!("RPC error: {err}"));
         }
-        rpc.result.ok_or_else(|| "RPC returned null result".to_string())
+        rpc.result
+            .ok_or_else(|| "RPC returned null result".to_string())
     }
 
     async fn get_balance(&self) -> Result<U256, String> {
         let addr = format!("0x{}", hex::encode(self.faucet_address));
-        let result = self.rpc_call("eth_getBalance", &serde_json::json!([addr, "latest"])).await?;
+        let result = self
+            .rpc_call("eth_getBalance", &serde_json::json!([addr, "latest"]))
+            .await?;
         let hex_str = result.as_str().ok_or("balance not a string")?;
         parse_hex_u256(hex_str)
     }
 
     async fn get_nonce(&self) -> Result<u64, String> {
         let addr = format!("0x{}", hex::encode(self.faucet_address));
-        let result = self.rpc_call("eth_getTransactionCount", &serde_json::json!([addr, "latest"])).await?;
+        let result = self
+            .rpc_call(
+                "eth_getTransactionCount",
+                &serde_json::json!([addr, "latest"]),
+            )
+            .await?;
         let hex_str = result.as_str().ok_or("nonce not a string")?;
         parse_hex_u64(hex_str)
     }
 
     async fn get_gas_price(&self) -> Result<u128, String> {
-        let result = self.rpc_call("eth_gasPrice", &serde_json::json!([])).await?;
+        let result = self
+            .rpc_call("eth_gasPrice", &serde_json::json!([]))
+            .await?;
         let hex_str = result.as_str().ok_or("gasPrice not a string")?;
         parse_hex_u128(hex_str)
     }
 
     async fn send_raw_tx(&self, raw: &[u8]) -> Result<String, String> {
         let hex_data = format!("0x{}", hex::encode(raw));
-        let result = self.rpc_call("eth_sendRawTransaction", &serde_json::json!([hex_data])).await?;
-        result.as_str().map(|s| s.to_string()).ok_or("tx hash not a string".to_string())
+        let result = self
+            .rpc_call("eth_sendRawTransaction", &serde_json::json!([hex_data]))
+            .await?;
+        result
+            .as_str()
+            .map(|s| s.to_string())
+            .ok_or("tx hash not a string".to_string())
     }
 }
 
@@ -271,7 +291,11 @@ async fn handle_request(state: &Arc<FaucetState>, request: &str) -> (u16, String
     let first_line = request.lines().next().unwrap_or("");
     let parts: Vec<&str> = first_line.split_whitespace().collect();
     if parts.len() < 2 {
-        return (400, "application/json".into(), r#"{"error":"bad request"}"#.into());
+        return (
+            400,
+            "application/json".into(),
+            r#"{"error":"bad request"}"#.into(),
+        );
     }
     let (method, path) = (parts[0], parts[1]);
 
@@ -284,12 +308,18 @@ async fn handle_request(state: &Arc<FaucetState>, request: &str) -> (u16, String
         ("GET", "/health") => handle_health(state).await,
         ("POST", "/faucet") => {
             // Extract JSON body (everything after the blank line)
-            let body = request.split("\r\n\r\n").nth(1)
+            let body = request
+                .split("\r\n\r\n")
+                .nth(1)
                 .or_else(|| request.split("\n\n").nth(1))
                 .unwrap_or("");
             handle_faucet(state, body).await
         }
-        _ => (404, "application/json".into(), r#"{"error":"not found"}"#.into()),
+        _ => (
+            404,
+            "application/json".into(),
+            r#"{"error":"not found"}"#.into(),
+        ),
     }
 }
 
@@ -304,11 +334,22 @@ async fn handle_health(state: &Arc<FaucetState>) -> (u16, String, String) {
                 drip_amount_trs: format_trs(state.drip_amount),
                 cooldown_seconds: state.cooldown.as_secs(),
             };
-            (200, "application/json".into(), serde_json::to_string(&resp).unwrap())
+            (
+                200,
+                "application/json".into(),
+                serde_json::to_string(&resp).unwrap(),
+            )
         }
         Err(e) => {
-            let resp = ErrorResponse { error: format!("cannot query balance: {e}"), retry_after_seconds: None };
-            (503, "application/json".into(), serde_json::to_string(&resp).unwrap())
+            let resp = ErrorResponse {
+                error: format!("cannot query balance: {e}"),
+                retry_after_seconds: None,
+            };
+            (
+                503,
+                "application/json".into(),
+                serde_json::to_string(&resp).unwrap(),
+            )
         }
     }
 }
@@ -318,8 +359,15 @@ async fn handle_faucet(state: &Arc<FaucetState>, body: &str) -> (u16, String, St
     let req: FaucetRequest = match serde_json::from_str(body) {
         Ok(r) => r,
         Err(_) => {
-            let resp = ErrorResponse { error: "invalid JSON body, expected {\"address\":\"0x...\"}".into(), retry_after_seconds: None };
-            return (400, "application/json".into(), serde_json::to_string(&resp).unwrap());
+            let resp = ErrorResponse {
+                error: "invalid JSON body, expected {\"address\":\"0x...\"}".into(),
+                retry_after_seconds: None,
+            };
+            return (
+                400,
+                "application/json".into(),
+                serde_json::to_string(&resp).unwrap(),
+            );
         }
     };
 
@@ -327,8 +375,15 @@ async fn handle_faucet(state: &Arc<FaucetState>, body: &str) -> (u16, String, St
     let to_addr = match parse_address(&req.address) {
         Ok(a) => a,
         Err(_) => {
-            let resp = ErrorResponse { error: "invalid Ethereum address".into(), retry_after_seconds: None };
-            return (400, "application/json".into(), serde_json::to_string(&resp).unwrap());
+            let resp = ErrorResponse {
+                error: "invalid Ethereum address".into(),
+                retry_after_seconds: None,
+            };
+            return (
+                400,
+                "application/json".into(),
+                serde_json::to_string(&resp).unwrap(),
+            );
         }
     };
 
@@ -343,7 +398,11 @@ async fn handle_faucet(state: &Arc<FaucetState>, body: &str) -> (u16, String, St
                     error: format!("address is rate-limited, try again in {remaining}s"),
                     retry_after_seconds: Some(remaining),
                 };
-                return (429, "application/json".into(), serde_json::to_string(&resp).unwrap());
+                return (
+                    429,
+                    "application/json".into(),
+                    serde_json::to_string(&resp).unwrap(),
+                );
             }
         }
     }
@@ -352,14 +411,28 @@ async fn handle_faucet(state: &Arc<FaucetState>, body: &str) -> (u16, String, St
     let balance = match state.get_balance().await {
         Ok(b) => b,
         Err(e) => {
-            let resp = ErrorResponse { error: format!("cannot query faucet balance: {e}"), retry_after_seconds: None };
-            return (503, "application/json".into(), serde_json::to_string(&resp).unwrap());
+            let resp = ErrorResponse {
+                error: format!("cannot query faucet balance: {e}"),
+                retry_after_seconds: None,
+            };
+            return (
+                503,
+                "application/json".into(),
+                serde_json::to_string(&resp).unwrap(),
+            );
         }
     };
 
     if balance < state.drip_amount {
-        let resp = ErrorResponse { error: "faucet is empty, please try again later".into(), retry_after_seconds: None };
-        return (503, "application/json".into(), serde_json::to_string(&resp).unwrap());
+        let resp = ErrorResponse {
+            error: "faucet is empty, please try again later".into(),
+            retry_after_seconds: None,
+        };
+        return (
+            503,
+            "application/json".into(),
+            serde_json::to_string(&resp).unwrap(),
+        );
     }
 
     if balance < state.low_balance_threshold {
@@ -375,15 +448,20 @@ async fn handle_faucet(state: &Arc<FaucetState>, body: &str) -> (u16, String, St
         let mut nonce_lock = state.nonce.lock().await;
         let n = match *nonce_lock {
             Some(cached) => cached,
-            None => {
-                match state.get_nonce().await {
-                    Ok(n) => n,
-                    Err(e) => {
-                        let resp = ErrorResponse { error: format!("cannot query nonce: {e}"), retry_after_seconds: None };
-                        return (500, "application/json".into(), serde_json::to_string(&resp).unwrap());
-                    }
+            None => match state.get_nonce().await {
+                Ok(n) => n,
+                Err(e) => {
+                    let resp = ErrorResponse {
+                        error: format!("cannot query nonce: {e}"),
+                        retry_after_seconds: None,
+                    };
+                    return (
+                        500,
+                        "application/json".into(),
+                        serde_json::to_string(&resp).unwrap(),
+                    );
                 }
-            }
+            },
         };
         *nonce_lock = Some(n + 1);
         n
@@ -393,8 +471,15 @@ async fn handle_faucet(state: &Arc<FaucetState>, body: &str) -> (u16, String, St
     let gas_price = match state.get_gas_price().await {
         Ok(p) => p,
         Err(e) => {
-            let resp = ErrorResponse { error: format!("cannot query gas price: {e}"), retry_after_seconds: None };
-            return (500, "application/json".into(), serde_json::to_string(&resp).unwrap());
+            let resp = ErrorResponse {
+                error: format!("cannot query gas price: {e}"),
+                retry_after_seconds: None,
+            };
+            return (
+                500,
+                "application/json".into(),
+                serde_json::to_string(&resp).unwrap(),
+            );
         }
     };
 
@@ -422,14 +507,25 @@ async fn handle_faucet(state: &Arc<FaucetState>, body: &str) -> (u16, String, St
                 tx_hash,
                 amount: format_trs(state.drip_amount),
             };
-            (200, "application/json".into(), serde_json::to_string(&resp).unwrap())
+            (
+                200,
+                "application/json".into(),
+                serde_json::to_string(&resp).unwrap(),
+            )
         }
         Err(e) => {
             // Reset nonce cache on send failure
             *state.nonce.lock().await = None;
             error!(error = %e, "failed to send faucet tx");
-            let resp = ErrorResponse { error: "transaction failed, please try again".into(), retry_after_seconds: None };
-            (500, "application/json".into(), serde_json::to_string(&resp).unwrap())
+            let resp = ErrorResponse {
+                error: "transaction failed, please try again".into(),
+                retry_after_seconds: None,
+            };
+            (
+                500,
+                "application/json".into(),
+                serde_json::to_string(&resp).unwrap(),
+            )
         }
     }
 }
@@ -499,7 +595,8 @@ async fn main() {
     let cli = Cli::parse();
 
     // Load private key from flag or env var
-    let key_hex = cli.faucet_key
+    let key_hex = cli
+        .faucet_key
         .or_else(|| std::env::var("FAUCET_PRIVATE_KEY").ok())
         .expect("faucet private key required: set FAUCET_PRIVATE_KEY or use --faucet-key");
 
@@ -510,8 +607,7 @@ async fn main() {
     let signing_key = SigningKey::from_slice(&key_bytes).expect("invalid secp256k1 key");
     let faucet_address = address_from_signing_key(&signing_key);
 
-    let drip_amount = U256::from_str_radix(&cli.drip_amount, 10)
-        .expect("invalid drip amount");
+    let drip_amount = U256::from_str_radix(&cli.drip_amount, 10).expect("invalid drip amount");
     let low_balance_threshold = U256::from_str_radix(&cli.low_balance_threshold, 10)
         .expect("invalid low balance threshold");
 
@@ -550,21 +646,30 @@ mod tests {
 
     #[test]
     fn test_is_valid_address() {
-        assert!(is_valid_address("0x0000000000000000000000000000000000000001"));
-        assert!(is_valid_address("0xAbCdEf0123456789AbCdEf0123456789AbCdEf01"));
+        assert!(is_valid_address(
+            "0x0000000000000000000000000000000000000001"
+        ));
+        assert!(is_valid_address(
+            "0xAbCdEf0123456789AbCdEf0123456789AbCdEf01"
+        ));
         assert!(!is_valid_address("0x123")); // too short
         assert!(!is_valid_address("not_an_address"));
-        assert!(!is_valid_address("0xGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG"));
+        assert!(!is_valid_address(
+            "0xGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG"
+        ));
     }
 
     #[test]
     fn test_parse_address() {
         let addr = parse_address("0x0000000000000000000000000000000000000001").unwrap();
-        assert_eq!(addr, Address::from_slice(&{
-            let mut b = [0u8; 20];
-            b[19] = 1;
-            b
-        }));
+        assert_eq!(
+            addr,
+            Address::from_slice(&{
+                let mut b = [0u8; 20];
+                b[19] = 1;
+                b
+            })
+        );
         assert!(parse_address("invalid").is_err());
     }
 
@@ -601,7 +706,8 @@ mod tests {
             let mut b = [0u8; 32];
             b[31] = 1;
             b
-        }).unwrap();
+        })
+        .unwrap();
         let addr = address_from_signing_key(&key);
         // The address for private key 1 is well-known
         assert_eq!(addr.len(), 20);
@@ -614,7 +720,8 @@ mod tests {
             let mut b = [0u8; 32];
             b[31] = 1;
             b
-        }).unwrap();
+        })
+        .unwrap();
 
         let to = Address::from_slice(&[0xAA; 20]);
         let value = U256::from(1_000_000_000_000_000_000u64); // 1 TRS

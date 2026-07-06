@@ -10,9 +10,7 @@ use std::time::Instant;
 
 use alloy_primitives::Address;
 use torus_bridge::native_executor::NativeExecutor;
-use torus_types::{
-    FixedPoint, NativeAction, OrderType, PlaceOrderParams, TimeInForce,
-};
+use torus_types::{FixedPoint, NativeAction, OrderType, PlaceOrderParams, TimeInForce};
 
 use crate::common::TestHarness;
 
@@ -84,9 +82,7 @@ fn generate_action(seed: usize, market_id: u64) -> NativeAction {
 }
 
 /// Verify order book invariants for all books in the context.
-fn verify_all_book_invariants(
-    ctx: &torus_bridge::native_executor::NativeExecContext,
-) {
+fn verify_all_book_invariants(ctx: &torus_bridge::native_executor::NativeExecContext) {
     for (_market_id, book) in &ctx.order_books {
         book.verify_invariants();
     }
@@ -143,9 +139,7 @@ fn test_sustained_throughput() {
     let funding_per_trader = fp(1_000_000);
 
     // Create and fund 100 traders (seeds 1..=100).
-    let traders: Vec<Address> = (1..=num_traders)
-        .map(|i| addr(i as u8))
-        .collect();
+    let traders: Vec<Address> = (1..=num_traders).map(|i| addr(i as u8)).collect();
     for t in &traders {
         h.fund_native(t, funding_per_trader);
     }
@@ -187,8 +181,7 @@ fn test_sustained_throughput() {
 
     // Print performance metrics (no timing assertions).
     let total_orders = num_blocks * orders_per_block;
-    let avg_block_ms =
-        block_times.iter().map(|d| d.as_millis()).sum::<u128>() / num_blocks as u128;
+    let avg_block_ms = block_times.iter().map(|d| d.as_millis()).sum::<u128>() / num_blocks as u128;
     let orders_per_sec = total_orders as f64 / total_elapsed.as_secs_f64();
     println!(
         "Sustained throughput: {total_orders} orders in {:.2?} | avg block {avg_block_ms}ms | {orders_per_sec:.0} orders/sec",
@@ -207,9 +200,7 @@ fn test_multi_market_stress() {
     let orders_per_market = 1000usize;
     let funding_per_trader = fp(10_000_000);
 
-    let traders: Vec<Address> = (1..=num_traders)
-        .map(|i| addr(i as u8))
-        .collect();
+    let traders: Vec<Address> = (1..=num_traders).map(|i| addr(i as u8)).collect();
     for t in &traders {
         h.fund_native(t, funding_per_trader);
     }
@@ -522,10 +513,9 @@ fn test_deep_book_sweep() {
     assert!(
         entry_diff < 1000,
         "Entry price too far from expected: got {} expected {expected_entry}, diff_raw={}",
-        pos.entry_price, pos.entry_price.raw() - expected_entry.raw()
+        pos.entry_price,
+        pos.entry_price.raw() - expected_entry.raw()
     );
 
-    println!(
-        "Deep book sweep: 1,000 fills across 100 levels in {sweep_elapsed:.2?}"
-    );
+    println!("Deep book sweep: 1,000 fills across 100 levels in {sweep_elapsed:.2?}");
 }

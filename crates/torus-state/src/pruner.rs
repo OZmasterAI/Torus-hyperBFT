@@ -243,9 +243,7 @@ impl StatePruner {
 /// Read the pruned-up-to height from the database.
 fn read_prune_meta(db: &StateDb) -> Result<u64, StateError> {
     match db.get_cf_raw(CF_BLOCK_HEADERS, PRUNE_META_KEY)? {
-        Some(data) if data.len() == 8 => {
-            Ok(u64::from_be_bytes(data[..8].try_into().unwrap()))
-        }
+        Some(data) if data.len() == 8 => Ok(u64::from_be_bytes(data[..8].try_into().unwrap())),
         _ => Ok(0),
     }
 }
@@ -499,10 +497,16 @@ mod tests {
         pruner.maybe_prune(15).unwrap();
 
         // Query pruned block body → None
-        assert!(db.get_cf_raw(CF_BLOCK_BODIES, &0u64.to_be_bytes()).unwrap().is_none());
+        assert!(db
+            .get_cf_raw(CF_BLOCK_BODIES, &0u64.to_be_bytes())
+            .unwrap()
+            .is_none());
 
         // Query retained block body → Some
-        assert!(db.get_cf_raw(CF_BLOCK_BODIES, &10u64.to_be_bytes()).unwrap().is_some());
+        assert!(db
+            .get_cf_raw(CF_BLOCK_BODIES, &10u64.to_be_bytes())
+            .unwrap()
+            .is_some());
 
         // Query pruned receipt → None
         let mut key = [0u8; 12];

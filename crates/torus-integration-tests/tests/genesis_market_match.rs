@@ -40,8 +40,7 @@ fn shipped_genesis_makes_bench_orders_match() {
     let h = TestHarness::new();
 
     // Seed from the REAL shipped testnet genesis: market 1 + 20 funded hardhat balances.
-    let genesis_path =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testnet/genesis.json");
+    let genesis_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testnet/genesis.json");
     let genesis = Genesis::from_file(&genesis_path)
         .unwrap_or_else(|e| panic!("load {}: {e}", genesis_path.display()));
     genesis
@@ -49,8 +48,12 @@ fn shipped_genesis_makes_bench_orders_match() {
         .expect("seed genesis into state db");
 
     // hardhat #0 and #1 — both pre-funded with a native balance by genesis (no deposit).
-    let maker: Address = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266".parse().unwrap();
-    let taker: Address = "0x70997970c51812dc3a010c7d01b50e0d17dc79c8".parse().unwrap();
+    let maker: Address = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"
+        .parse()
+        .unwrap();
+    let taker: Address = "0x70997970c51812dc3a010c7d01b50e0d17dc79c8"
+        .parse()
+        .unwrap();
     let market = 1u64;
 
     // Precondition: genesis actually funded these accounts' native (perp) balance —

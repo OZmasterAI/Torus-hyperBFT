@@ -85,9 +85,7 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for TorusPrecompiles<'_> {
             let r;
             let input_bytes: &[u8] = match &inputs.input {
                 CallInput::SharedBuffer(range) => {
-                    if let Some(slice) =
-                        context.local().shared_memory_buffer_slice(range.clone())
-                    {
+                    if let Some(slice) = context.local().shared_memory_buffer_slice(range.clone()) {
                         r = slice;
                         r.as_ref()
                     } else {

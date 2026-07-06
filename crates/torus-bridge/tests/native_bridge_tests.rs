@@ -13,14 +13,13 @@ use torus_bridge::BlockValidator;
 use torus_evm::{EvmExecutor, TORUS_CHAIN_ID};
 use torus_state::StateDb;
 use torus_types::{
-    FixedPoint, NativeAction, PlaceOrderParams, OrderType, TimeInForce,
-    TorusBlock, TorusBlockHeader,
+    FixedPoint, NativeAction, OrderType, PlaceOrderParams, TimeInForce, TorusBlock,
+    TorusBlockHeader,
 };
 
 const KECCAK_EMPTY: B256 = B256::new([
-    0xc5, 0xd2, 0x46, 0x01, 0x86, 0xf7, 0x23, 0x3c, 0x92, 0x7e, 0x7d, 0xb2, 0xdc, 0xc7, 0x03,
-    0xc0, 0xe5, 0x00, 0xb6, 0x53, 0xca, 0x82, 0x27, 0x3b, 0x7b, 0xfa, 0xd8, 0x04, 0x5d, 0x85,
-    0xa4, 0x70,
+    0xc5, 0xd2, 0x46, 0x01, 0x86, 0xf7, 0x23, 0x3c, 0x92, 0x7e, 0x7d, 0xb2, 0xdc, 0xc7, 0x03, 0xc0,
+    0xe5, 0x00, 0xb6, 0x53, 0xca, 0x82, 0x27, 0x3b, 0x7b, 0xfa, 0xd8, 0x04, 0x5d, 0x85, 0xa4, 0x70,
 ]);
 
 // ---- Test helpers ----
@@ -42,14 +41,14 @@ fn fp(v: i64) -> FixedPoint {
 fn make_ctx(state_db: StateDb) -> NativeExecContext {
     NativeExecContext::new(
         state_db,
-        1,            // block_height
-        1000,         // timestamp
-        0,            // epoch
-        100,          // epoch_length
-        10,           // max_validators
-        addr(99),     // proposer
-        addr(100),    // treasury
-        addr(101),    // dev_pool
+        1,         // block_height
+        1000,      // timestamp
+        0,         // epoch
+        100,       // epoch_length
+        10,        // max_validators
+        addr(99),  // proposer
+        addr(100), // treasury
+        addr(101), // dev_pool
     )
 }
 
@@ -166,27 +165,33 @@ fn classify_lockbox_transfer() {
 #[test]
 fn sort_cancels_before_orders() {
     let actions = vec![
-        (addr(1), NativeAction::PlaceOrder(PlaceOrderParams {
-            market_id: 1,
-            is_buy: true,
-            price: fp(100),
-            quantity: fp(1),
-            order_type: OrderType::Limit,
-            time_in_force: TimeInForce::GTC,
-            reduce_only: false,
-            client_order_id: None,
-        })),
+        (
+            addr(1),
+            NativeAction::PlaceOrder(PlaceOrderParams {
+                market_id: 1,
+                is_buy: true,
+                price: fp(100),
+                quantity: fp(1),
+                order_type: OrderType::Limit,
+                time_in_force: TimeInForce::GTC,
+                reduce_only: false,
+                client_order_id: None,
+            }),
+        ),
         (addr(2), NativeAction::CancelOrder { order_id: 1 }),
-        (addr(3), NativeAction::PlaceOrder(PlaceOrderParams {
-            market_id: 1,
-            is_buy: false,
-            price: fp(200),
-            quantity: fp(1),
-            order_type: OrderType::Limit,
-            time_in_force: TimeInForce::IOC,
-            reduce_only: false,
-            client_order_id: None,
-        })),
+        (
+            addr(3),
+            NativeAction::PlaceOrder(PlaceOrderParams {
+                market_id: 1,
+                is_buy: false,
+                price: fp(200),
+                quantity: fp(1),
+                order_type: OrderType::Limit,
+                time_in_force: TimeInForce::IOC,
+                reduce_only: false,
+                client_order_id: None,
+            }),
+        ),
     ];
 
     let (pre_evm, post_evm) = sort_native_actions(&actions);
@@ -204,13 +209,27 @@ fn sort_cancels_before_orders() {
 #[test]
 fn sort_mixed_actions_correct_category_order() {
     let actions = vec![
-        (addr(1), NativeAction::Delegate { validator: addr(10), amount: U256::from(100u64) }),
-        (addr(2), NativeAction::SubmitOraclePrices(torus_types::OracleSubmission {
-            prices: vec![(1, fp(500))],
-            timestamp: 1000,
-        })),
+        (
+            addr(1),
+            NativeAction::Delegate {
+                validator: addr(10),
+                amount: U256::from(100u64),
+            },
+        ),
+        (
+            addr(2),
+            NativeAction::SubmitOraclePrices(torus_types::OracleSubmission {
+                prices: vec![(1, fp(500))],
+                timestamp: 1000,
+            }),
+        ),
         (addr(3), NativeAction::CancelOrder { order_id: 5 }),
-        (addr(4), NativeAction::TransferToPerp { amount: U256::from(50u64) }),
+        (
+            addr(4),
+            NativeAction::TransferToPerp {
+                amount: U256::from(50u64),
+            },
+        ),
     ];
 
     let (pre_evm, post_evm) = sort_native_actions(&actions);
@@ -247,8 +266,14 @@ fn execute_batch_continues_on_failure() {
 
     // Both actions attempted — batch did not stop on first failure.
     assert_eq!(result.results.len(), 2);
-    assert!(!result.results[0].success, "cancel of non-existent should fail");
-    assert!(!result.results[1].success, "claim with no rewards should fail");
+    assert!(
+        !result.results[0].success,
+        "cancel of non-existent should fail"
+    );
+    assert!(
+        !result.results[1].success,
+        "claim with no rewards should fail"
+    );
 }
 
 #[test]
@@ -296,26 +321,32 @@ fn deterministic_native_execution() {
     let (_dir2, db2) = open_test_db();
 
     let actions = vec![
-        (addr(1), NativeAction::PlaceOrder(PlaceOrderParams {
-            market_id: 1,
-            is_buy: true,
-            price: fp(100),
-            quantity: fp(10),
-            order_type: OrderType::Limit,
-            time_in_force: TimeInForce::GTC,
-            reduce_only: false,
-            client_order_id: None,
-        })),
-        (addr(2), NativeAction::PlaceOrder(PlaceOrderParams {
-            market_id: 1,
-            is_buy: false,
-            price: fp(100),
-            quantity: fp(5),
-            order_type: OrderType::Limit,
-            time_in_force: TimeInForce::GTC,
-            reduce_only: false,
-            client_order_id: None,
-        })),
+        (
+            addr(1),
+            NativeAction::PlaceOrder(PlaceOrderParams {
+                market_id: 1,
+                is_buy: true,
+                price: fp(100),
+                quantity: fp(10),
+                order_type: OrderType::Limit,
+                time_in_force: TimeInForce::GTC,
+                reduce_only: false,
+                client_order_id: None,
+            }),
+        ),
+        (
+            addr(2),
+            NativeAction::PlaceOrder(PlaceOrderParams {
+                market_id: 1,
+                is_buy: false,
+                price: fp(100),
+                quantity: fp(5),
+                order_type: OrderType::Limit,
+                time_in_force: TimeInForce::GTC,
+                reduce_only: false,
+                client_order_id: None,
+            }),
+        ),
     ];
 
     let mut ctx1 = make_ctx(db1.clone());
@@ -338,7 +369,10 @@ fn deterministic_native_execution() {
     // Same native state root.
     let root1 = compute_native_state_root(&db1).unwrap();
     let root2 = compute_native_state_root(&db2).unwrap();
-    assert_eq!(root1, root2, "deterministic execution should yield identical native roots");
+    assert_eq!(
+        root1, root2,
+        "deterministic execution should yield identical native roots"
+    );
 }
 
 // ============================================================================
@@ -376,11 +410,7 @@ fn empty_native_actions_evm_only() {
 
     // FIX CONS-PF-02: validate_block_with_native now recovers senders from
     // SignedNativeActions in the block (no separate senders parameter).
-    let result = validator.validate_block_with_native(
-        &block,
-        &state_db,
-        &evm_executor,
-    );
+    let result = validator.validate_block_with_native(&block, &state_db, &evm_executor);
 
     // Will fail on state root mismatch (B256::ZERO != computed root), which is
     // expected — the test verifies the pipeline runs without panic.
@@ -405,8 +435,9 @@ fn native_only_block_no_evm() {
     fund_native(&ctx, &addr(1), fp(1_000_000));
 
     // Execute native actions with no EVM transactions.
-    let actions = vec![
-        (addr(1), NativeAction::PlaceOrder(PlaceOrderParams {
+    let actions = vec![(
+        addr(1),
+        NativeAction::PlaceOrder(PlaceOrderParams {
             market_id: 1,
             is_buy: true,
             price: fp(1000),
@@ -415,8 +446,8 @@ fn native_only_block_no_evm() {
             time_in_force: TimeInForce::GTC,
             reduce_only: false,
             client_order_id: None,
-        })),
-    ];
+        }),
+    )];
 
     let result = NativeExecutor::execute_batch(&mut ctx, &actions);
     assert_eq!(result.results.len(), 1);
@@ -450,16 +481,19 @@ fn cancel_executes_before_new_orders() {
     // Now create a batch with both a cancel and a new order.
     // When sorted, the cancel should execute first.
     let actions = vec![
-        (addr(2), NativeAction::PlaceOrder(PlaceOrderParams {
-            market_id: 1,
-            is_buy: false,
-            price: fp(100),
-            quantity: fp(5),
-            order_type: OrderType::Limit,
-            time_in_force: TimeInForce::GTC,
-            reduce_only: false,
-            client_order_id: None,
-        })),
+        (
+            addr(2),
+            NativeAction::PlaceOrder(PlaceOrderParams {
+                market_id: 1,
+                is_buy: false,
+                price: fp(100),
+                quantity: fp(5),
+                order_type: OrderType::Limit,
+                time_in_force: TimeInForce::GTC,
+                reduce_only: false,
+                client_order_id: None,
+            }),
+        ),
         (addr(1), NativeAction::CancelOrder { order_id: 1 }),
     ];
 
@@ -473,7 +507,10 @@ fn cancel_executes_before_new_orders() {
 
     // Execute pre_evm first (cancel), then post_evm (new order).
     let cancel_result = NativeExecutor::execute_batch(&mut ctx, &pre_evm);
-    assert!(cancel_result.results[0].success, "cancel should succeed since order 1 exists");
+    assert!(
+        cancel_result.results[0].success,
+        "cancel should succeed since order 1 exists"
+    );
 
     let place_result = NativeExecutor::execute_batch(&mut ctx, &post_evm);
     assert!(place_result.results[0].success, "new order should succeed");
@@ -491,31 +528,43 @@ fn batch_accumulates_gas() {
     fund_native(&ctx, &addr(2), fp(1_000_000));
 
     let actions = vec![
-        (addr(1), NativeAction::PlaceOrder(PlaceOrderParams {
-            market_id: 1,
-            is_buy: true,
-            price: fp(100),
-            quantity: fp(1),
-            order_type: OrderType::Limit,
-            time_in_force: TimeInForce::GTC,
-            reduce_only: false,
-            client_order_id: None,
-        })),
-        (addr(2), NativeAction::PlaceOrder(PlaceOrderParams {
-            market_id: 1,
-            is_buy: false,
-            price: fp(200),
-            quantity: fp(1),
-            order_type: OrderType::Limit,
-            time_in_force: TimeInForce::GTC,
-            reduce_only: false,
-            client_order_id: None,
-        })),
+        (
+            addr(1),
+            NativeAction::PlaceOrder(PlaceOrderParams {
+                market_id: 1,
+                is_buy: true,
+                price: fp(100),
+                quantity: fp(1),
+                order_type: OrderType::Limit,
+                time_in_force: TimeInForce::GTC,
+                reduce_only: false,
+                client_order_id: None,
+            }),
+        ),
+        (
+            addr(2),
+            NativeAction::PlaceOrder(PlaceOrderParams {
+                market_id: 1,
+                is_buy: false,
+                price: fp(200),
+                quantity: fp(1),
+                order_type: OrderType::Limit,
+                time_in_force: TimeInForce::GTC,
+                reduce_only: false,
+                client_order_id: None,
+            }),
+        ),
     ];
 
     let result = NativeExecutor::execute_batch(&mut ctx, &actions);
-    assert!(result.total_gas > 0, "batch should accumulate gas from individual actions");
-    assert_eq!(result.total_gas, result.results.iter().map(|r| r.gas_used).sum::<u64>());
+    assert!(
+        result.total_gas > 0,
+        "batch should accumulate gas from individual actions"
+    );
+    assert_eq!(
+        result.total_gas,
+        result.results.iter().map(|r| r.gas_used).sum::<u64>()
+    );
 }
 
 // ============================================================================
@@ -616,8 +665,8 @@ fn proposer_validator_pipeline_parity() {
             &state_db,
             &evm_executor,
             &parent,
-            vec![],       // no native actions
-            vec![],       // no EVM transactions
+            vec![], // no native actions
+            vec![], // no EVM transactions
             1000,
             addr(99),
         )
@@ -625,11 +674,7 @@ fn proposer_validator_pipeline_parity() {
 
     // Validate the proposed block with the validator.
     // FIX CONS-PF-02: senders recovered from block's SignedNativeActions.
-    let validated = validator.validate_block_with_native(
-        &proposed.block,
-        &state_db,
-        &evm_executor,
-    );
+    let validated = validator.validate_block_with_native(&proposed.block, &state_db, &evm_executor);
 
     // The validator should accept the block (state roots match).
     match validated {
@@ -669,7 +714,10 @@ fn canonical_bytes_deterministic_across_calls() {
     // Different actions must produce different bytes.
     let action2 = NativeAction::CancelOrder { order_id: 1 };
     let bytes3 = action2.canonical_bytes();
-    assert_ne!(bytes1, bytes3, "different actions must have different canonical bytes");
+    assert_ne!(
+        bytes1, bytes3,
+        "different actions must have different canonical bytes"
+    );
 }
 
 #[test]
@@ -700,14 +748,20 @@ fn sort_uses_canonical_bytes_not_debug() {
     // Verify that action sorting uses canonical bytes (the function compiles and runs
     // without relying on Debug formatting).
     let actions = vec![
-        (addr(1), NativeAction::Delegate {
-            validator: addr(10),
-            amount: U256::from(100u64),
-        }),
-        (addr(2), NativeAction::Delegate {
-            validator: addr(20),
-            amount: U256::from(200u64),
-        }),
+        (
+            addr(1),
+            NativeAction::Delegate {
+                validator: addr(10),
+                amount: U256::from(100u64),
+            },
+        ),
+        (
+            addr(2),
+            NativeAction::Delegate {
+                validator: addr(20),
+                amount: U256::from(200u64),
+            },
+        ),
     ];
 
     // sort_native_actions internally uses action_sort_key which now calls canonical_bytes.
@@ -720,6 +774,9 @@ fn sort_uses_canonical_bytes_not_debug() {
     let (pre2, post2) = sort_native_actions(&actions);
     assert_eq!(pre.len(), pre2.len());
     for (a, b) in post.iter().zip(post2.iter()) {
-        assert_eq!(a.0, b.0, "deterministic sort must produce same sender order");
+        assert_eq!(
+            a.0, b.0,
+            "deterministic sort must produce same sender order"
+        );
     }
 }

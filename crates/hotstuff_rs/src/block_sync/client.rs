@@ -27,9 +27,7 @@ use rand::seq::IteratorRandom;
 
 use crate::{
     app::{App, ValidateBlockRequest, ValidateBlockResponse},
-    block_sync::messages::{
-        AdvertiseBlock, AdvertisePC, BlockSyncAdvertiseMessage,
-    },
+    block_sync::messages::{AdvertiseBlock, AdvertisePC, BlockSyncAdvertiseMessage},
     block_tree::{
         accessors::internal::{BlockTreeError, BlockTreeSingleton, UpdateResult},
         invariants::safe_pc,
@@ -187,10 +185,7 @@ impl<N: Network> BlockSyncClient<N> {
                 if peer != session.peer {
                     return;
                 }
-                log::info!(
-                    "block_sync: worker returned {} blocks",
-                    blocks.len()
-                );
+                log::info!("block_sync: worker returned {} blocks", blocks.len());
                 session.pending_blocks.extend(blocks);
                 session.highest_pc = Some(highest_pc);
                 session.awaiting_fetch = false;
@@ -223,9 +218,10 @@ impl<N: Network> BlockSyncClient<N> {
         block_tree: &mut BlockTreeSingleton<K>,
         app: &mut impl App<K>,
     ) -> Result<bool, BlockSyncClientError> {
-        let has_work = self.pending_sync.as_ref().map_or(false, |s| {
-            !s.awaiting_fetch && !s.pending_blocks.is_empty()
-        });
+        let has_work = self
+            .pending_sync
+            .as_ref()
+            .map_or(false, |s| !s.awaiting_fetch && !s.pending_blocks.is_empty());
         if !has_work {
             // If session exists, not awaiting, and blocks empty → request next batch
             if let Some(session) = &self.pending_sync {
@@ -266,10 +262,8 @@ impl<N: Network> BlockSyncClient<N> {
         // valid committed blocks during catch-up.
         if !block.is_correct(block_tree)? {
             log::warn!("block_sync: block failed is_correct, blacklisting peer");
-            self.block_sync_client_state.blacklist_sync_server(
-                peer,
-                self.config.blacklist_expiry_time,
-            );
+            self.block_sync_client_state
+                .blacklist_sync_server(peer, self.config.blacklist_expiry_time);
             self.end_session();
             return Ok(true);
         }
@@ -306,10 +300,14 @@ impl<N: Network> BlockSyncClient<N> {
             })
             .publish(&self.event_publisher);
 
-            let update_result =
-                block_tree.update(&block.justify, &self.event_publisher).unwrap_or_else(|e| {
+            let update_result = block_tree
+                .update(&block.justify, &self.event_publisher)
+                .unwrap_or_else(|e| {
                     log::warn!("block_sync: block_tree.update failed: {:?}", e);
-                    UpdateResult { validator_set_updates: None, committed_block_hashes: vec![] }
+                    UpdateResult {
+                        validator_set_updates: None,
+                        committed_block_hashes: vec![],
+                    }
                 });
 
             // Call on_committed_block for each newly committed block during sync.
@@ -328,18 +326,22 @@ impl<N: Network> BlockSyncClient<N> {
 
             // Apply highest_pc from the response if valid
             if let Some(ref highest_pc) = session.highest_pc.clone() {
-                if highest_pc.is_correct(block_tree)?
-                    && safe_pc(highest_pc, block_tree, chain_id)?
+                if highest_pc.is_correct(block_tree)? && safe_pc(highest_pc, block_tree, chain_id)?
                 {
-                    let update_result2 = block_tree.update(highest_pc, &self.event_publisher)
-                        .unwrap_or(UpdateResult { validator_set_updates: None, committed_block_hashes: vec![] });
+                    let update_result2 = block_tree
+                        .update(highest_pc, &self.event_publisher)
+                        .unwrap_or(UpdateResult {
+                            validator_set_updates: None,
+                            committed_block_hashes: vec![],
+                        });
                     for committed_hash in &update_result2.committed_block_hashes {
                         if let Ok(Some(committed_block)) = block_tree.block(committed_hash) {
                             app.on_committed_block(&committed_block, *committed_hash);
                         }
                     }
                     if let Some(vs_updates) = update_result2.validator_set_updates {
-                        self.validator_set_update_handle.update_validator_set(vs_updates);
+                        self.validator_set_update_handle
+                            .update_validator_set(vs_updates);
                     }
                 }
             }
@@ -350,10 +352,8 @@ impl<N: Network> BlockSyncClient<N> {
             );
         } else if should_blacklist {
             log::warn!("block_sync: block failed app validation (invalid), blacklisting peer");
-            self.block_sync_client_state.blacklist_sync_server(
-                peer,
-                self.config.blacklist_expiry_time,
-            );
+            self.block_sync_client_state
+                .blacklist_sync_server(peer, self.config.blacklist_expiry_time);
             self.end_session();
             return Ok(true);
         } else {
@@ -554,10 +554,8 @@ impl<N: Network> BlockSyncClient<N> {
             {
                 let min_blocks_expected = advertised_height - session.init_height;
                 if session.blocks_synced < min_blocks_expected {
-                    self.block_sync_client_state.blacklist_sync_server(
-                        peer,
-                        self.config.blacklist_expiry_time,
-                    );
+                    self.block_sync_client_state
+                        .blacklist_sync_server(peer, self.config.blacklist_expiry_time);
                 }
             }
         }
@@ -569,10 +567,10 @@ impl<N: Network> BlockSyncClient<N> {
             // s350 FIX C: zero-block sessions feed the trigger backoff; any
             // productive session resets it so a lagging replica stays fast.
             if session.blocks_synced == 0 {
-                self.block_sync_client_state.consecutive_futile_sessions =
-                    self.block_sync_client_state
-                        .consecutive_futile_sessions
-                        .saturating_add(1);
+                self.block_sync_client_state.consecutive_futile_sessions = self
+                    .block_sync_client_state
+                    .consecutive_futile_sessions
+                    .saturating_add(1);
             } else {
                 self.block_sync_client_state.consecutive_futile_sessions = 0;
             }

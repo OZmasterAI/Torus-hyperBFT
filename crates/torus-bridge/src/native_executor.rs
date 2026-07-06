@@ -9,23 +9,23 @@
 use std::collections::HashMap;
 
 use alloy_primitives::{Address, B256};
+use torus_core::error::CoreError;
 use torus_core::liquidation::LiquidationEngine;
 use torus_core::lockbox::{fp_to_u256, u256_to_fp, Lockbox};
 use torus_core::margin::{effective_max_leverage, MarketMarginConfig};
 use torus_core::oracle::{OracleConfig, OracleManager};
-use torus_core::error::CoreError;
 use torus_core::order_book::{OrderBook, OrderStatus};
 use torus_core::position::{MarginType, NativeBalance, PositionManager};
 use torus_core::precompiles::{CoreWriterQueue, QueuedAction, QueuedActionKind};
+use torus_economics::epoch::ValidatorSetDiff;
 use torus_economics::{
     EpochManager, GovernanceManager, RewardDistributor, StakingManager, ValidatorStatus,
 };
-use torus_economics::epoch::ValidatorSetDiff;
 use torus_state::cf::{CF_NATIVE_TRADES, CF_NATIVE_USER_TRADES};
 use torus_state::{RawCfKv, StateBackend, StateDb};
 use torus_types::{
     FixedPoint, MarketId, NativeAction, OrderType, PlaceOrderParams, PublicKey, SessionScope, Side,
-    TimeInForce, U256, ValidatorInfo, ValidatorSet, VoteOption,
+    TimeInForce, ValidatorInfo, ValidatorSet, VoteOption, U256,
 };
 
 use crate::market_workers::{MarketWorkerPool, MatchRequest};
@@ -419,7 +419,9 @@ impl NativeExecutor {
                     gas_used: batch.total_gas,
                 }
             }
-            NativeAction::CancelOrder { order_id } => Self::exec_cancel_order(ctx, sender, *order_id),
+            NativeAction::CancelOrder { order_id } => {
+                Self::exec_cancel_order(ctx, sender, *order_id)
+            }
             NativeAction::CancelAllOrders { market_id } => {
                 Self::exec_cancel_all(ctx, sender, *market_id)
             }
@@ -449,9 +451,12 @@ impl NativeExecutor {
             }
 
             // ---- Oracle ----
-            NativeAction::SubmitOraclePrices(submission) => {
-                Self::exec_submit_oracle_prices(ctx, sender, &submission.prices, submission.timestamp)
-            }
+            NativeAction::SubmitOraclePrices(submission) => Self::exec_submit_oracle_prices(
+                ctx,
+                sender,
+                &submission.prices,
+                submission.timestamp,
+            ),
 
             // ---- Governance ----
             NativeAction::SubmitProposal(proposal) => {
@@ -488,9 +493,11 @@ impl NativeExecutor {
             }
 
             // ---- Session Keys ----
-            NativeAction::CreateSession { session_pubkey, expiry, scope } => {
-                Self::exec_create_session(ctx, sender, session_pubkey, *expiry, *scope)
-            }
+            NativeAction::CreateSession {
+                session_pubkey,
+                expiry,
+                scope,
+            } => Self::exec_create_session(ctx, sender, session_pubkey, *expiry, *scope),
             NativeAction::RevokeSession { session_pubkey } => {
                 Self::exec_revoke_session(ctx, sender, session_pubkey)
             }
@@ -945,10 +952,7 @@ impl NativeExecutor {
                 fill.price,
                 MarginType::Cross,
             ) {
-                return NativeActionResult::err(
-                    "place_order",
-                    format!("taker fill failed: {e}"),
-                );
+                return NativeActionResult::err("place_order", format!("taker fill failed: {e}"));
             }
             if let Err(e) = ctx.positions.apply_fill(
                 &fill.maker,
@@ -958,10 +962,7 @@ impl NativeExecutor {
                 fill.price,
                 MarginType::Cross,
             ) {
-                return NativeActionResult::err(
-                    "place_order",
-                    format!("maker fill failed: {e}"),
-                );
+                return NativeActionResult::err("place_order", format!("maker fill failed: {e}"));
             }
         }
 
@@ -1040,7 +1041,9 @@ impl NativeExecutor {
             ctx.pending_trades
                 .push((CF_NATIVE_USER_TRADES, taker_key.to_vec(), taker_data));
         } else {
-            let _ = ctx.state.put_cf_raw(CF_NATIVE_TRADES, &trade_key, &trade_data);
+            let _ = ctx
+                .state
+                .put_cf_raw(CF_NATIVE_TRADES, &trade_key, &trade_data);
             let _ = ctx
                 .state
                 .put_cf_raw(CF_NATIVE_USER_TRADES, &maker_key, &maker_data);
@@ -1053,7 +1056,11 @@ impl NativeExecutor {
     }
 
     /// FIX CONS-FIND-30: Ownership check added -- only the order's trader can cancel.
-    fn exec_cancel_order<T: StateBackend>(ctx: &mut NativeExecContext<T>, sender: &Address, order_id: u128) -> NativeActionResult {
+    fn exec_cancel_order<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+        sender: &Address,
+        order_id: u128,
+    ) -> NativeActionResult {
         // Check ownership before cancelling (cheaper than cancel + re-insert).
         for book in ctx.order_books.values() {
             if let Some(order) = book.get_order(order_id) {
@@ -1139,8 +1146,7 @@ impl NativeExecutor {
                                 .get(&mid)
                                 .map(|c| effective_max_leverage(&c.tiers, notional))
                                 .unwrap_or(20);
-                            let lev_fp =
-                                FixedPoint::from_raw(max_lev as i128 * FixedPoint::SCALE);
+                            let lev_fp = FixedPoint::from_raw(max_lev as i128 * FixedPoint::SCALE);
                             total_margin_release = total_margin_release + notional / lev_fp;
                         }
                     }
@@ -1270,7 +1276,10 @@ impl NativeExecutor {
         }
     }
 
-    fn exec_claim_rewards<T: StateBackend>(ctx: &mut NativeExecContext<T>, sender: &Address) -> NativeActionResult {
+    fn exec_claim_rewards<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+        sender: &Address,
+    ) -> NativeActionResult {
         match ctx.staking.claim_rewards(*sender) {
             Ok(_) => NativeActionResult::ok("claim_rewards", 1500),
             Err(e) => NativeActionResult::err("claim_rewards", e.to_string()),
@@ -1294,7 +1303,10 @@ impl NativeExecutor {
         }
     }
 
-    fn exec_unjail_self<T: StateBackend>(ctx: &mut NativeExecContext<T>, sender: &Address) -> NativeActionResult {
+    fn exec_unjail_self<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+        sender: &Address,
+    ) -> NativeActionResult {
         match ctx.staking.unjail(sender, ctx.block_height) {
             Ok(()) => NativeActionResult::ok("unjail_self", 2000),
             Err(e) => NativeActionResult::err("unjail_self", e.to_string()),
@@ -1393,7 +1405,7 @@ impl NativeExecutor {
         expiry: u64,
         scope: SessionScope,
     ) -> NativeActionResult {
-        use torus_types::eip712::{MAX_SESSION_EXPIRY_MS, MAX_SESSIONS_PER_ADDRESS};
+        use torus_types::eip712::{MAX_SESSIONS_PER_ADDRESS, MAX_SESSION_EXPIRY_MS};
 
         // The block timestamp is SECONDS (header.timestamp = .as_secs()), but
         // `expiry`, MAX_SESSION_EXPIRY_MS, and order-time validation (resolve_sender
@@ -1459,10 +1471,7 @@ impl NativeExecutor {
         match ctx.state.get_session(session_pubkey) {
             Ok(Some(data)) => {
                 if data.owner != *sender {
-                    return NativeActionResult::err(
-                        "revoke_session",
-                        "not session owner".into(),
-                    );
+                    return NativeActionResult::err("revoke_session", "not session owner".into());
                 }
             }
             Ok(None) => {
@@ -1714,9 +1723,7 @@ impl NativeExecutor {
                 .aggregate_price(market_id, ctx.block_height, validator_stakes)
             {
                 Ok(_) => results.push(NativeActionResult::ok("oracle_aggregate", 500)),
-                Err(e) => {
-                    results.push(NativeActionResult::err("oracle_aggregate", e.to_string()))
-                }
+                Err(e) => results.push(NativeActionResult::err("oracle_aggregate", e.to_string())),
             }
         }
         results
@@ -1791,7 +1798,10 @@ impl NativeExecutor {
     }
 
     /// Distribute fees at end of block.
-    pub fn distribute_fees<T: StateBackend>(ctx: &mut NativeExecContext<T>, total_evm_fees: u128) -> NativeActionResult {
+    pub fn distribute_fees<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+        total_evm_fees: u128,
+    ) -> NativeActionResult {
         let total_fees = U256::from(ctx.total_native_fees as u128 + total_evm_fees);
         if total_fees.is_zero() {
             return NativeActionResult::ok("fee_distribution", 0);
@@ -1822,24 +1832,24 @@ impl NativeExecutor {
     /// Phase B — Rotation: computes new validator set, applies rotation cap,
     /// updates statuses, logs changes. Errors on compute_new_validator_set
     /// early-return (broken validator set is a consensus-safety issue).
-    pub fn process_epoch_boundary<T: StateBackend>(ctx: &mut NativeExecContext<T>) -> Option<EpochBoundaryResult> {
+    pub fn process_epoch_boundary<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+    ) -> Option<EpochBoundaryResult> {
         if !EpochManager::is_epoch_boundary(ctx.block_height, ctx.epoch_length) {
             return None;
         }
 
         // --- Phase A: Reward distribution (uses CURRENT active set) ---
 
-        if let Err(e) = RewardDistributor::distribute_permanent_staking_rewards(
-            &ctx.staking,
-            ctx.epoch_length,
-        ) {
+        if let Err(e) =
+            RewardDistributor::distribute_permanent_staking_rewards(&ctx.staking, ctx.epoch_length)
+        {
             tracing::error!(%e, "permanent staking rewards failed");
         }
 
-        if let Err(e) = RewardDistributor::distribute_validator_inflation(
-            &ctx.staking,
-            ctx.epoch_length,
-        ) {
+        if let Err(e) =
+            RewardDistributor::distribute_validator_inflation(&ctx.staking, ctx.epoch_length)
+        {
             tracing::error!(%e, "validator inflation distribution failed");
         }
 
@@ -1897,23 +1907,25 @@ impl NativeExecutor {
     }
 
     /// Process pending governance proposals.
-    pub fn process_governance<T: StateBackend>(ctx: &mut NativeExecContext<T>) -> Vec<NativeActionResult> {
+    pub fn process_governance<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+    ) -> Vec<NativeActionResult> {
         match ctx.governance.process_pending_proposals(ctx.block_height) {
             Ok(outcomes) => outcomes
                 .iter()
                 .map(|_| NativeActionResult::ok("governance_process", 1000))
                 .collect(),
-            Err(e) => vec![NativeActionResult::err(
-                "governance_process",
-                e.to_string(),
-            )],
+            Err(e) => vec![NativeActionResult::err("governance_process", e.to_string())],
         }
     }
 }
 
 /// Build a ValidatorSet from current Active validators in staking state.
 /// Uses the same power conversion as `EpochManager::compute_new_validator_set`.
-fn build_current_validator_set(staking: &StakingManager<impl StateBackend>, epoch: u64) -> ValidatorSet {
+fn build_current_validator_set(
+    staking: &StakingManager<impl StateBackend>,
+    epoch: u64,
+) -> ValidatorSet {
     let wei = U256::from(10u64).pow(U256::from(18u64));
     let validators: Vec<ValidatorInfo> = match staking.all_validators() {
         Ok(all) => all
@@ -2072,9 +2084,9 @@ fn core_writer_to_native(qa: &QueuedAction) -> NativeAction {
             reduce_only: false,
             client_order_id: None,
         }),
-        QueuedActionKind::CancelOrder { order_id } => {
-            NativeAction::CancelOrder { order_id: *order_id }
-        }
+        QueuedActionKind::CancelOrder { order_id } => NativeAction::CancelOrder {
+            order_id: *order_id,
+        },
         QueuedActionKind::CancelAll { market_id } => NativeAction::CancelAllOrders {
             market_id: Some(*market_id),
         },

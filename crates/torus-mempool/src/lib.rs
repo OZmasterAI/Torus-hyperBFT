@@ -30,8 +30,8 @@ fn now_ms() -> u64 {
 }
 
 pub use crate::error::MempoolError;
-pub use crate::native_pool::is_cancel;
 pub use crate::evm_pool::EvmPoolEntry;
+pub use crate::native_pool::is_cancel;
 
 /// Mempool configuration.
 #[derive(Clone, Debug)]
@@ -184,7 +184,8 @@ impl Mempool {
 
     /// Enable or disable native action gossip at runtime.
     pub fn set_native_gossip_enabled(&self, enabled: bool) {
-        self.native_gossip_enabled.store(enabled, std::sync::atomic::Ordering::Relaxed);
+        self.native_gossip_enabled
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Set the outbound gossip channel for native actions.
@@ -228,9 +229,7 @@ impl Mempool {
 
         // Memory budget check (Phase 3: 3.1.7).
         if self.config.max_memory_bytes > 0 {
-            let current = self
-                .memory_used
-                .load(std::sync::atomic::Ordering::Relaxed);
+            let current = self.memory_used.load(std::sync::atomic::Ordering::Relaxed);
             if current + tx_size > self.config.max_memory_bytes {
                 return Err(MempoolError::PoolFull);
             }
@@ -452,10 +451,14 @@ impl Mempool {
             .as_millis() as u64;
         use torus_types::eip712::NONCE_WINDOW_MS;
         if action.nonce.saturating_add(NONCE_WINDOW_MS) < current_time_ms {
-            return Err(MempoolError::NativeValidationFailed("nonce too old (>60s)".into()));
+            return Err(MempoolError::NativeValidationFailed(
+                "nonce too old (>60s)".into(),
+            ));
         }
         if action.nonce > current_time_ms.saturating_add(NONCE_WINDOW_MS) {
-            return Err(MempoolError::NativeValidationFailed("nonce too far in future".into()));
+            return Err(MempoolError::NativeValidationFailed(
+                "nonce too far in future".into(),
+            ));
         }
         self.submit_native_action_inner(sender, action, verified_locally)
     }
@@ -464,7 +467,10 @@ impl Mempool {
     /// Disabled when direct-to-leader forwarding is active (avoids flooding
     /// the GossipSub mesh and starving consensus messages under load).
     fn gossip_native_action(&self, sender: alloy_primitives::Address, action: &SignedNativeAction) {
-        if !self.native_gossip_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+        if !self
+            .native_gossip_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
             return;
         }
         if let Some(tx) = self.native_gossip_tx.get() {
@@ -609,8 +615,14 @@ impl Mempool {
         self.native.write().unwrap().select_for_block(limit)
     }
 
-    pub fn select_native_for_block_with_senders(&self, limit: usize) -> Vec<(alloy_primitives::Address, SignedNativeAction)> {
-        self.native.write().unwrap().select_for_block_with_senders(limit)
+    pub fn select_native_for_block_with_senders(
+        &self,
+        limit: usize,
+    ) -> Vec<(alloy_primitives::Address, SignedNativeAction)> {
+        self.native
+            .write()
+            .unwrap()
+            .select_for_block_with_senders(limit)
     }
 
     /// Pipeline-aware variant: skips actions whose hash is in `exclude` (the
@@ -658,8 +670,7 @@ impl Mempool {
 
     /// Approximate total memory used by pooled transactions (Phase 3: 3.1.7).
     pub fn memory_used(&self) -> usize {
-        self.memory_used
-            .load(std::sync::atomic::Ordering::Relaxed)
+        self.memory_used.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Drain both pools for a block proposal.
@@ -750,7 +761,11 @@ impl Mempool {
                 .fetch_sub(total_freed, std::sync::atomic::Ordering::Relaxed);
         }
         if total_pruned > 0 {
-            tracing::info!(pruned = total_pruned, senders = senders.len(), "pruned stale txs on block commit");
+            tracing::info!(
+                pruned = total_pruned,
+                senders = senders.len(),
+                "pruned stale txs on block commit"
+            );
         }
     }
 }
@@ -839,12 +854,22 @@ mod tests {
         // A peer gossiping a forged (sender, action) pair must not pollute the
         // pool — but the body stays DA-mirrored (availability ≠ validity).
         let forged = alloy_primitives::Address::repeat_byte(0xEE);
-        assert!(pool.add_native_action_from_gossip(forged, signed.clone()).is_err());
-        assert_eq!(pool.native_pool_size(), 0, "forged sender must not enter pool");
-        assert!(pool.get_native_da(&hash).is_some(), "body still DA-mirrored");
+        assert!(pool
+            .add_native_action_from_gossip(forged, signed.clone())
+            .is_err());
+        assert_eq!(
+            pool.native_pool_size(),
+            0,
+            "forged sender must not enter pool"
+        );
+        assert!(
+            pool.get_native_da(&hash).is_some(),
+            "body still DA-mirrored"
+        );
 
         // The genuine sender is admitted.
-        pool.add_native_action_from_gossip(real_sender, signed).unwrap();
+        pool.add_native_action_from_gossip(real_sender, signed)
+            .unwrap();
         assert_eq!(pool.native_pool_size(), 1);
     }
 
@@ -885,12 +910,21 @@ mod tests {
         );
         let sender = over.recover_sender().unwrap();
         let over_hash = torus_types::compute_action_hash(&over);
-        assert!(pool.add_native_action_from_gossip(sender, over.clone()).is_err());
+        assert!(pool
+            .add_native_action_from_gossip(sender, over.clone())
+            .is_err());
         assert!(pool
             .add_native_action_from_gossip_trusted(sender, over)
             .is_err());
-        assert_eq!(pool.native_pool_size(), 0, "oversize batch must never enter the pool");
-        assert!(pool.get_native_da(&over_hash).is_some(), "body still DA-mirrored");
+        assert_eq!(
+            pool.native_pool_size(),
+            0,
+            "oversize batch must never enter the pool"
+        );
+        assert!(
+            pool.get_native_da(&over_hash).is_some(),
+            "body still DA-mirrored"
+        );
 
         // Empty batch: same rejection.
         let empty = torus_types::eip712::sign_native_action(
@@ -903,10 +937,7 @@ mod tests {
 
         // At-cap batch: admitted (boundary).
         let at_cap = torus_types::eip712::sign_native_action(
-            torus_types::NativeAction::PlaceOrderBatch(vec![
-                params;
-                NATIVE_ORDERS_PER_BATCH_CAP
-            ]),
+            torus_types::NativeAction::PlaceOrderBatch(vec![params; NATIVE_ORDERS_PER_BATCH_CAP]),
             now + 2,
             &key,
         );
@@ -1686,18 +1717,46 @@ mod tests {
         // Submit with identical gas prices.
         let pool1 = Mempool::new(state.clone(), config.clone());
         pool1
-            .add_evm_tx(create_eip1559_tx(&ka, 0, 1_000_000_000, 100_000_000, 21_000, U256::ZERO))
+            .add_evm_tx(create_eip1559_tx(
+                &ka,
+                0,
+                1_000_000_000,
+                100_000_000,
+                21_000,
+                U256::ZERO,
+            ))
             .unwrap();
         pool1
-            .add_evm_tx(create_eip1559_tx(&kb, 0, 1_000_000_000, 100_000_000, 21_000, U256::ZERO))
+            .add_evm_tx(create_eip1559_tx(
+                &kb,
+                0,
+                1_000_000_000,
+                100_000_000,
+                21_000,
+                U256::ZERO,
+            ))
             .unwrap();
 
         let pool2 = Mempool::new(state.clone(), config);
         pool2
-            .add_evm_tx(create_eip1559_tx(&ka, 0, 1_000_000_000, 100_000_000, 21_000, U256::ZERO))
+            .add_evm_tx(create_eip1559_tx(
+                &ka,
+                0,
+                1_000_000_000,
+                100_000_000,
+                21_000,
+                U256::ZERO,
+            ))
             .unwrap();
         pool2
-            .add_evm_tx(create_eip1559_tx(&kb, 0, 1_000_000_000, 100_000_000, 21_000, U256::ZERO))
+            .add_evm_tx(create_eip1559_tx(
+                &kb,
+                0,
+                1_000_000_000,
+                100_000_000,
+                21_000,
+                U256::ZERO,
+            ))
             .unwrap();
 
         // Same parent hash → same ordering (deterministic).
@@ -1726,8 +1785,14 @@ mod tests {
         // Add transactions and track memory
         for i in 0..3u64 {
             pool.add_evm_tx(create_eip1559_tx(
-                &k, i, 1_000_000_000, 100_000_000, 21_000, U256::ZERO,
-            )).unwrap();
+                &k,
+                i,
+                1_000_000_000,
+                100_000_000,
+                21_000,
+                U256::ZERO,
+            ))
+            .unwrap();
         }
 
         let mem_after_add = pool.memory_used();
@@ -1738,12 +1803,21 @@ mod tests {
         assert_eq!(drained.len(), 3);
 
         let mem_after_drain = pool.memory_used();
-        assert_eq!(mem_after_drain, 0, "memory should be zero after draining all txs");
+        assert_eq!(
+            mem_after_drain, 0,
+            "memory should be zero after draining all txs"
+        );
 
         // Add more — must succeed, not PoolFull
         pool.add_evm_tx(create_eip1559_tx(
-            &k, 0, 1_000_000_000, 100_000_000, 21_000, U256::ZERO,
-        )).unwrap();
+            &k,
+            0,
+            1_000_000_000,
+            100_000_000,
+            21_000,
+            U256::ZERO,
+        ))
+        .unwrap();
         assert_eq!(pool.evm_pool_size(), 1);
     }
 
@@ -1778,10 +1852,26 @@ mod tests {
 
         assert_eq!(pool.pending_nonce(&addr), 0);
 
-        pool.add_evm_tx(create_eip1559_tx(&k, 0, 1_000_000_000, 100_000_000, 21_000, U256::ZERO)).unwrap();
+        pool.add_evm_tx(create_eip1559_tx(
+            &k,
+            0,
+            1_000_000_000,
+            100_000_000,
+            21_000,
+            U256::ZERO,
+        ))
+        .unwrap();
         assert_eq!(pool.pending_nonce(&addr), 1);
 
-        pool.add_evm_tx(create_eip1559_tx(&k, 1, 1_000_000_000, 100_000_000, 21_000, U256::ZERO)).unwrap();
+        pool.add_evm_tx(create_eip1559_tx(
+            &k,
+            1,
+            1_000_000_000,
+            100_000_000,
+            21_000,
+            U256::ZERO,
+        ))
+        .unwrap();
         assert_eq!(pool.pending_nonce(&addr), 2);
     }
 
@@ -1794,12 +1884,36 @@ mod tests {
         fund(&state, &addr, U256::from(10u64.pow(18)), 0);
 
         // Insert nonces 0 and 2 (skip 1) — pending nonce should be 1
-        pool.add_evm_tx(create_eip1559_tx(&k, 0, 1_000_000_000, 100_000_000, 21_000, U256::ZERO)).unwrap();
-        pool.add_evm_tx(create_eip1559_tx(&k, 2, 1_000_000_000, 100_000_000, 21_000, U256::ZERO)).unwrap();
+        pool.add_evm_tx(create_eip1559_tx(
+            &k,
+            0,
+            1_000_000_000,
+            100_000_000,
+            21_000,
+            U256::ZERO,
+        ))
+        .unwrap();
+        pool.add_evm_tx(create_eip1559_tx(
+            &k,
+            2,
+            1_000_000_000,
+            100_000_000,
+            21_000,
+            U256::ZERO,
+        ))
+        .unwrap();
         assert_eq!(pool.pending_nonce(&addr), 1);
 
         // Fill the gap — now pending nonce should jump to 3
-        pool.add_evm_tx(create_eip1559_tx(&k, 1, 1_000_000_000, 100_000_000, 21_000, U256::ZERO)).unwrap();
+        pool.add_evm_tx(create_eip1559_tx(
+            &k,
+            1,
+            1_000_000_000,
+            100_000_000,
+            21_000,
+            U256::ZERO,
+        ))
+        .unwrap();
         assert_eq!(pool.pending_nonce(&addr), 3);
     }
 
@@ -1812,7 +1926,15 @@ mod tests {
         fund(&state, &addr, U256::from(10u64.pow(18)), 0);
 
         for i in 0..4u64 {
-            pool.add_evm_tx(create_eip1559_tx(&k, i, 1_000_000_000, 100_000_000, 21_000, U256::ZERO)).unwrap();
+            pool.add_evm_tx(create_eip1559_tx(
+                &k,
+                i,
+                1_000_000_000,
+                100_000_000,
+                21_000,
+                U256::ZERO,
+            ))
+            .unwrap();
         }
         assert_eq!(pool.evm_pool_size(), 4);
 
@@ -1930,8 +2052,15 @@ mod tests {
         );
 
         // Nonce chain unaffected: the SAME nonce at the floor is admitted cleanly.
-        pool.add_evm_tx(create_eip1559_tx(&k, 0, 1_000_000_000, 100, 21_000, U256::ZERO))
-            .unwrap();
+        pool.add_evm_tx(create_eip1559_tx(
+            &k,
+            0,
+            1_000_000_000,
+            100,
+            21_000,
+            U256::ZERO,
+        ))
+        .unwrap();
         assert_eq!(pool.pending_nonce(&addr), 1);
     }
 
@@ -1942,8 +2071,15 @@ mod tests {
         let k = key(98);
         fund(&state, &address_from_key(&k), U256::from(10u64.pow(18)), 0);
 
-        pool.add_evm_tx(create_eip1559_tx(&k, 0, 1_000_000_000, 100, 21_000, U256::ZERO))
-            .unwrap();
+        pool.add_evm_tx(create_eip1559_tx(
+            &k,
+            0,
+            1_000_000_000,
+            100,
+            21_000,
+            U256::ZERO,
+        ))
+        .unwrap();
 
         // Floor rises after admission: the tx must NOT be selected, but stays pooled.
         pool.set_base_fee(2_000_000_000);
@@ -1951,7 +2087,11 @@ mod tests {
             pool.drain_evm(30_000_000, B256::ZERO).is_empty(),
             "below-floor tx must not be drained into a block"
         );
-        assert_eq!(pool.evm_pool_size(), 1, "tx stays pooled for when the fee drops");
+        assert_eq!(
+            pool.evm_pool_size(),
+            1,
+            "tx stays pooled for when the fee drops"
+        );
 
         // Floor falls back: the tx becomes selectable again.
         pool.set_base_fee(1_000_000_000);
@@ -1977,7 +2117,8 @@ mod tests {
             input: Bytes::new(),
         };
         let raw = sign_envelope(&k, tx);
-        pool.add_evm_tx(raw).expect("pre-155 legacy tx must be admitted");
+        pool.add_evm_tx(raw)
+            .expect("pre-155 legacy tx must be admitted");
         assert_eq!(pool.evm_pool_size(), 1);
     }
 }

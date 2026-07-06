@@ -11,9 +11,7 @@
 use alloy_primitives::Address;
 use torus_bridge::native_executor::{NativeExecContext, NativeExecutor};
 use torus_state::StateDb;
-use torus_types::{
-    FixedPoint, NativeAction, OrderType, PlaceOrderParams, TimeInForce,
-};
+use torus_types::{FixedPoint, NativeAction, OrderType, PlaceOrderParams, TimeInForce};
 
 fn open_test_db() -> (tempfile::TempDir, StateDb) {
     let dir = tempfile::tempdir().expect("create temp dir");

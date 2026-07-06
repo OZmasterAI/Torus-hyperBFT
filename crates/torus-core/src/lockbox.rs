@@ -17,9 +17,8 @@ use crate::position::NativeBalance;
 
 /// KECCAK_EMPTY — code hash for EOA accounts with no code.
 const KECCAK_EMPTY: [u8; 32] = [
-    0xc5, 0xd2, 0x46, 0x01, 0x86, 0xf7, 0x23, 0x3c, 0x92, 0x7e, 0x7d, 0xb2, 0xdc, 0xc7, 0x03,
-    0xc0, 0xe5, 0x00, 0xb6, 0x53, 0xca, 0x82, 0x27, 0x3b, 0x7b, 0xfa, 0xd8, 0x04, 0x5d, 0x85,
-    0xa4, 0x70,
+    0xc5, 0xd2, 0x46, 0x01, 0x86, 0xf7, 0x23, 0x3c, 0x92, 0x7e, 0x7d, 0xb2, 0xdc, 0xc7, 0x03, 0xc0,
+    0xe5, 0x00, 0xb6, 0x53, 0xca, 0x82, 0x27, 0x3b, 0x7b, 0xfa, 0xd8, 0x04, 0x5d, 0x85, 0xa4, 0x70,
 ];
 
 pub struct Lockbox;
@@ -55,11 +54,20 @@ impl Lockbox {
 
         // Atomic write: debit EVM + credit native.
         let evm_data = build_evm_balance_update(state, trader, evm_balance - evm_amount)?;
-        let native_data = borsh::to_vec(&native_bal).map_err(|e| CoreError::Borsh(e.to_string()))?;
+        let native_data =
+            borsh::to_vec(&native_bal).map_err(|e| CoreError::Borsh(e.to_string()))?;
 
         state.atomic_write(&[
-            AtomicWriteOp::Put { cf: CF_ACCOUNTS, key: trader.as_slice(), value: &evm_data },
-            AtomicWriteOp::Put { cf: CF_NATIVE_BALANCES, key: trader.as_slice(), value: &native_data },
+            AtomicWriteOp::Put {
+                cf: CF_ACCOUNTS,
+                key: trader.as_slice(),
+                value: &evm_data,
+            },
+            AtomicWriteOp::Put {
+                cf: CF_NATIVE_BALANCES,
+                key: trader.as_slice(),
+                value: &native_data,
+            },
         ])?;
         Ok(())
     }
@@ -99,8 +107,16 @@ impl Lockbox {
         let evm_data = build_evm_balance_update(state, trader, evm_balance + evm_amount)?;
 
         state.atomic_write(&[
-            AtomicWriteOp::Put { cf: CF_NATIVE_BALANCES, key: trader.as_slice(), value: &native_data },
-            AtomicWriteOp::Put { cf: CF_ACCOUNTS, key: trader.as_slice(), value: &evm_data },
+            AtomicWriteOp::Put {
+                cf: CF_NATIVE_BALANCES,
+                key: trader.as_slice(),
+                value: &native_data,
+            },
+            AtomicWriteOp::Put {
+                cf: CF_ACCOUNTS,
+                key: trader.as_slice(),
+                value: &evm_data,
+            },
         ])?;
         Ok(())
     }
@@ -142,8 +158,16 @@ impl Lockbox {
         let evm_data = build_evm_balance_update(state, to, evm_balance + evm_amount)?;
 
         state.atomic_write(&[
-            AtomicWriteOp::Put { cf: CF_NATIVE_BALANCES, key: sender.as_slice(), value: &native_data },
-            AtomicWriteOp::Put { cf: CF_ACCOUNTS, key: to.as_slice(), value: &evm_data },
+            AtomicWriteOp::Put {
+                cf: CF_NATIVE_BALANCES,
+                key: sender.as_slice(),
+                value: &native_data,
+            },
+            AtomicWriteOp::Put {
+                cf: CF_ACCOUNTS,
+                key: to.as_slice(),
+                value: &evm_data,
+            },
         ])?;
         Ok(())
     }
@@ -185,10 +209,13 @@ fn build_evm_balance_update(
 // Native balance helpers
 // ============================================================================
 
-fn get_native_balance(state: &impl StateBackend, trader: &Address) -> Result<NativeBalance, CoreError> {
+fn get_native_balance(
+    state: &impl StateBackend,
+    trader: &Address,
+) -> Result<NativeBalance, CoreError> {
     match state.get_cf_raw(CF_NATIVE_BALANCES, trader.as_slice())? {
         Some(data) => Ok(
-            NativeBalance::try_from_slice(&data).map_err(|e| CoreError::Borsh(e.to_string()))?,
+            NativeBalance::try_from_slice(&data).map_err(|e| CoreError::Borsh(e.to_string()))?
         ),
         None => Ok(NativeBalance::default()),
     }

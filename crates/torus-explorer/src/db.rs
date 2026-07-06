@@ -284,9 +284,19 @@ impl ExplorerDb {
               base_fee, tx_count, native_action_count, epoch, validator_set_hash, state_root)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
             params![
-                b.height, b.hash, b.parent_hash, b.timestamp, b.proposer,
-                b.gas_used, b.gas_limit, b.base_fee, b.tx_count,
-                b.native_action_count, b.epoch, b.validator_set_hash, b.state_root,
+                b.height,
+                b.hash,
+                b.parent_hash,
+                b.timestamp,
+                b.proposer,
+                b.gas_used,
+                b.gas_limit,
+                b.base_fee,
+                b.tx_count,
+                b.native_action_count,
+                b.epoch,
+                b.validator_set_hash,
+                b.state_root,
             ],
         )?;
         Ok(())
@@ -300,9 +310,20 @@ impl ExplorerDb {
               gas_used, gas_price, input_data, nonce, status, contract_address, tx_type)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
             params![
-                t.hash, t.block_height, t.tx_index, t.from_addr, t.to_addr,
-                t.value, t.gas_limit, t.gas_used, t.gas_price, t.input_data,
-                t.nonce, t.status as i32, t.contract_address, t.tx_type,
+                t.hash,
+                t.block_height,
+                t.tx_index,
+                t.from_addr,
+                t.to_addr,
+                t.value,
+                t.gas_limit,
+                t.gas_used,
+                t.gas_price,
+                t.input_data,
+                t.nonce,
+                t.status as i32,
+                t.contract_address,
+                t.tx_type,
             ],
         )?;
         Ok(())
@@ -315,8 +336,15 @@ impl ExplorerDb {
              (block_height, tx_hash, log_index, address, topic0, topic1, topic2, topic3, data)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
             params![
-                l.block_height, l.tx_hash, l.log_index, l.address,
-                l.topic0, l.topic1, l.topic2, l.topic3, l.data,
+                l.block_height,
+                l.tx_hash,
+                l.log_index,
+                l.address,
+                l.topic0,
+                l.topic1,
+                l.topic2,
+                l.topic3,
+                l.data,
             ],
         )?;
         Ok(())
@@ -330,20 +358,38 @@ impl ExplorerDb {
               validator, target, amount, proposal_id, payload)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
             params![
-                a.block_height, a.action_index, a.action_type, a.market_id,
-                a.order_id, a.validator, a.target, a.amount, a.proposal_id, a.payload,
+                a.block_height,
+                a.action_index,
+                a.action_type,
+                a.market_id,
+                a.order_id,
+                a.validator,
+                a.target,
+                a.amount,
+                a.proposal_id,
+                a.payload,
             ],
         )?;
         Ok(())
     }
 
-    pub fn insert_validator_snapshot(&self, v: &ValidatorSnapshotRow) -> Result<(), rusqlite::Error> {
+    pub fn insert_validator_snapshot(
+        &self,
+        v: &ValidatorSnapshotRow,
+    ) -> Result<(), rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO validator_snapshots
              (block_height, address, pubkey, power, commission_bps, status)
              VALUES (?1,?2,?3,?4,?5,?6)",
-            params![v.block_height, v.address, v.pubkey, v.power, v.commission_bps, v.status],
+            params![
+                v.block_height,
+                v.address,
+                v.pubkey,
+                v.power,
+                v.commission_bps,
+                v.status
+            ],
         )?;
         Ok(())
     }
@@ -357,12 +403,7 @@ impl ExplorerDb {
         price_raw: i64,
         qty_raw: i64,
     ) -> Result<(), rusqlite::Error> {
-        const INTERVALS: &[(&str, i64)] = &[
-            ("1m", 60),
-            ("5m", 300),
-            ("15m", 900),
-            ("1h", 3600),
-        ];
+        const INTERVALS: &[(&str, i64)] = &[("1m", 60), ("5m", 300), ("15m", 900), ("1h", 3600)];
         let conn = self.conn.lock().unwrap();
         for &(interval, secs) in INTERVALS {
             let open_time = (timestamp / secs) * secs;
@@ -443,9 +484,18 @@ impl ExplorerDb {
     pub fn delete_block_data(&self, height: i64) -> Result<(), rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM logs WHERE block_height = ?1", params![height])?;
-        conn.execute("DELETE FROM transactions WHERE block_height = ?1", params![height])?;
-        conn.execute("DELETE FROM native_actions WHERE block_height = ?1", params![height])?;
-        conn.execute("DELETE FROM validator_snapshots WHERE block_height = ?1", params![height])?;
+        conn.execute(
+            "DELETE FROM transactions WHERE block_height = ?1",
+            params![height],
+        )?;
+        conn.execute(
+            "DELETE FROM native_actions WHERE block_height = ?1",
+            params![height],
+        )?;
+        conn.execute(
+            "DELETE FROM validator_snapshots WHERE block_height = ?1",
+            params![height],
+        )?;
         conn.execute("DELETE FROM blocks WHERE height = ?1", params![height])?;
         Ok(())
     }
@@ -480,7 +530,11 @@ impl ExplorerDb {
         }
     }
 
-    pub fn get_blocks(&self, page: u32, limit: u32) -> Result<(Vec<BlockRow>, i64), rusqlite::Error> {
+    pub fn get_blocks(
+        &self,
+        page: u32,
+        limit: u32,
+    ) -> Result<(Vec<BlockRow>, i64), rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
         let total: i64 = conn.query_row("SELECT COUNT(*) FROM blocks", [], |r| r.get(0))?;
         let offset = (page.saturating_sub(1) * limit) as i64;
@@ -529,7 +583,10 @@ impl ExplorerDb {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
-    pub fn get_block_native_actions(&self, height: i64) -> Result<Vec<NativeActionRow>, rusqlite::Error> {
+    pub fn get_block_native_actions(
+        &self,
+        height: i64,
+    ) -> Result<Vec<NativeActionRow>, rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT block_height,action_index,action_type,market_id,order_id,
@@ -541,12 +598,16 @@ impl ExplorerDb {
     }
 
     pub fn get_address_transactions(
-        &self, addr: &str, page: u32, limit: u32,
+        &self,
+        addr: &str,
+        page: u32,
+        limit: u32,
     ) -> Result<(Vec<TxRow>, i64), rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
         let total: i64 = conn.query_row(
             "SELECT COUNT(*) FROM transactions WHERE from_addr = ?1 OR to_addr = ?1",
-            params![addr], |r| r.get(0),
+            params![addr],
+            |r| r.get(0),
         )?;
         let offset = (page.saturating_sub(1) * limit) as i64;
         let mut stmt = conn.prepare(
@@ -560,12 +621,16 @@ impl ExplorerDb {
     }
 
     pub fn get_address_actions(
-        &self, addr: &str, page: u32, limit: u32,
+        &self,
+        addr: &str,
+        page: u32,
+        limit: u32,
     ) -> Result<(Vec<NativeActionRow>, i64), rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
         let total: i64 = conn.query_row(
             "SELECT COUNT(*) FROM native_actions WHERE validator = ?1 OR target = ?1",
-            params![addr], |r| r.get(0),
+            params![addr],
+            |r| r.get(0),
         )?;
         let offset = (page.saturating_sub(1) * limit) as i64;
         let mut stmt = conn.prepare(
@@ -582,7 +647,8 @@ impl ExplorerDb {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
             "SELECT COUNT(*) FROM transactions WHERE from_addr = ?1 OR to_addr = ?1",
-            params![addr], |r| r.get(0),
+            params![addr],
+            |r| r.get(0),
         )
     }
 
@@ -590,14 +656,19 @@ impl ExplorerDb {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
             "SELECT COUNT(*) FROM native_actions WHERE validator = ?1 OR target = ?1",
-            params![addr], |r| r.get(0),
+            params![addr],
+            |r| r.get(0),
         )
     }
 
     pub fn get_latest_validators(&self) -> Result<Vec<ValidatorSnapshotRow>, rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
         let max_height: Option<i64> = conn
-            .query_row("SELECT MAX(block_height) FROM validator_snapshots", [], |r| r.get(0))
+            .query_row(
+                "SELECT MAX(block_height) FROM validator_snapshots",
+                [],
+                |r| r.get(0),
+            )
             .ok();
         let height = match max_height {
             Some(h) => h,
@@ -611,7 +682,10 @@ impl ExplorerDb {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
-    pub fn get_validator_detail(&self, addr: &str) -> Result<Option<ValidatorSnapshotRow>, rusqlite::Error> {
+    pub fn get_validator_detail(
+        &self,
+        addr: &str,
+    ) -> Result<Option<ValidatorSnapshotRow>, rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT block_height,address,pubkey,power,commission_bps,status
@@ -627,27 +701,38 @@ impl ExplorerDb {
 
     pub fn get_validator_blocks_proposed(&self, addr: &str) -> Result<i64, rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
-        conn.query_row("SELECT COUNT(*) FROM blocks WHERE proposer = ?1", params![addr], |r| r.get(0))
+        conn.query_row(
+            "SELECT COUNT(*) FROM blocks WHERE proposer = ?1",
+            params![addr],
+            |r| r.get(0),
+        )
     }
 
     pub fn get_stats(&self) -> Result<Stats, rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
         let total_blocks: i64 = conn.query_row("SELECT COUNT(*) FROM blocks", [], |r| r.get(0))?;
-        let total_txs: i64 = conn.query_row("SELECT COUNT(*) FROM transactions", [], |r| r.get(0))?;
-        let total_native_actions: i64 = conn.query_row("SELECT COUNT(*) FROM native_actions", [], |r| r.get(0))?;
+        let total_txs: i64 =
+            conn.query_row("SELECT COUNT(*) FROM transactions", [], |r| r.get(0))?;
+        let total_native_actions: i64 =
+            conn.query_row("SELECT COUNT(*) FROM native_actions", [], |r| r.get(0))?;
 
-        let avg_block_time: f64 = if total_blocks > 1 {
-            conn.query_row(
+        let avg_block_time: f64 =
+            if total_blocks > 1 {
+                conn.query_row(
                 "SELECT CAST(MAX(timestamp) - MIN(timestamp) AS REAL) / (COUNT(*) - 1) FROM blocks",
                 [], |r| r.get(0),
             ).unwrap_or(0.0)
-        } else {
-            0.0
-        };
+            } else {
+                0.0
+            };
 
         let active_validators: i64 = {
             let max_height: Option<i64> = conn
-                .query_row("SELECT MAX(block_height) FROM validator_snapshots", [], |r| r.get(0))
+                .query_row(
+                    "SELECT MAX(block_height) FROM validator_snapshots",
+                    [],
+                    |r| r.get(0),
+                )
                 .ok();
             match max_height {
                 Some(h) => conn.query_row(
@@ -659,12 +744,22 @@ impl ExplorerDb {
         };
 
         let (latest_block, latest_epoch) = conn
-            .query_row("SELECT height, epoch FROM blocks ORDER BY height DESC LIMIT 1", [], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
-            })
+            .query_row(
+                "SELECT height, epoch FROM blocks ORDER BY height DESC LIMIT 1",
+                [],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+            )
             .unwrap_or((0, 0));
 
-        Ok(Stats { total_blocks, total_txs, total_native_actions, avg_block_time, active_validators, latest_block, latest_epoch })
+        Ok(Stats {
+            total_blocks,
+            total_txs,
+            total_native_actions,
+            avg_block_time,
+            active_validators,
+            latest_block,
+            latest_epoch,
+        })
     }
 }
 
@@ -674,46 +769,78 @@ impl ExplorerDb {
 
 fn row_to_block(row: &rusqlite::Row) -> Result<BlockRow, rusqlite::Error> {
     Ok(BlockRow {
-        height: row.get(0)?, hash: row.get(1)?, parent_hash: row.get(2)?,
-        timestamp: row.get(3)?, proposer: row.get(4)?, gas_used: row.get(5)?,
-        gas_limit: row.get(6)?, base_fee: row.get(7)?, tx_count: row.get(8)?,
-        native_action_count: row.get(9)?, epoch: row.get(10)?,
-        validator_set_hash: row.get(11)?, state_root: row.get(12)?,
+        height: row.get(0)?,
+        hash: row.get(1)?,
+        parent_hash: row.get(2)?,
+        timestamp: row.get(3)?,
+        proposer: row.get(4)?,
+        gas_used: row.get(5)?,
+        gas_limit: row.get(6)?,
+        base_fee: row.get(7)?,
+        tx_count: row.get(8)?,
+        native_action_count: row.get(9)?,
+        epoch: row.get(10)?,
+        validator_set_hash: row.get(11)?,
+        state_root: row.get(12)?,
     })
 }
 
 fn row_to_tx(row: &rusqlite::Row) -> Result<TxRow, rusqlite::Error> {
     Ok(TxRow {
-        hash: row.get(0)?, block_height: row.get(1)?, tx_index: row.get(2)?,
-        from_addr: row.get(3)?, to_addr: row.get(4)?, value: row.get(5)?,
-        gas_limit: row.get(6)?, gas_used: row.get(7)?, gas_price: row.get(8)?,
-        input_data: row.get(9)?, nonce: row.get(10)?,
-        status: row.get::<_, i32>(11)? != 0, contract_address: row.get(12)?,
+        hash: row.get(0)?,
+        block_height: row.get(1)?,
+        tx_index: row.get(2)?,
+        from_addr: row.get(3)?,
+        to_addr: row.get(4)?,
+        value: row.get(5)?,
+        gas_limit: row.get(6)?,
+        gas_used: row.get(7)?,
+        gas_price: row.get(8)?,
+        input_data: row.get(9)?,
+        nonce: row.get(10)?,
+        status: row.get::<_, i32>(11)? != 0,
+        contract_address: row.get(12)?,
         tx_type: row.get(13)?,
     })
 }
 
 fn row_to_log(row: &rusqlite::Row) -> Result<LogRow, rusqlite::Error> {
     Ok(LogRow {
-        block_height: row.get(0)?, tx_hash: row.get(1)?, log_index: row.get(2)?,
-        address: row.get(3)?, topic0: row.get(4)?, topic1: row.get(5)?,
-        topic2: row.get(6)?, topic3: row.get(7)?, data: row.get(8)?,
+        block_height: row.get(0)?,
+        tx_hash: row.get(1)?,
+        log_index: row.get(2)?,
+        address: row.get(3)?,
+        topic0: row.get(4)?,
+        topic1: row.get(5)?,
+        topic2: row.get(6)?,
+        topic3: row.get(7)?,
+        data: row.get(8)?,
     })
 }
 
 fn row_to_native_action(row: &rusqlite::Row) -> Result<NativeActionRow, rusqlite::Error> {
     Ok(NativeActionRow {
-        block_height: row.get(0)?, action_index: row.get(1)?, action_type: row.get(2)?,
-        market_id: row.get(3)?, order_id: row.get(4)?, validator: row.get(5)?,
-        target: row.get(6)?, amount: row.get(7)?, proposal_id: row.get(8)?,
+        block_height: row.get(0)?,
+        action_index: row.get(1)?,
+        action_type: row.get(2)?,
+        market_id: row.get(3)?,
+        order_id: row.get(4)?,
+        validator: row.get(5)?,
+        target: row.get(6)?,
+        amount: row.get(7)?,
+        proposal_id: row.get(8)?,
         payload: row.get(9)?,
     })
 }
 
 fn row_to_validator_snapshot(row: &rusqlite::Row) -> Result<ValidatorSnapshotRow, rusqlite::Error> {
     Ok(ValidatorSnapshotRow {
-        block_height: row.get(0)?, address: row.get(1)?, pubkey: row.get(2)?,
-        power: row.get(3)?, commission_bps: row.get(4)?, status: row.get(5)?,
+        block_height: row.get(0)?,
+        address: row.get(1)?,
+        pubkey: row.get(2)?,
+        power: row.get(3)?,
+        commission_bps: row.get(4)?,
+        status: row.get(5)?,
     })
 }
 
@@ -732,8 +859,12 @@ mod tests {
             parent_hash: format!("0x{:064x}", height.saturating_sub(1)),
             timestamp: 1_700_000_000 + height,
             proposer: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
-            gas_used: 21000, gas_limit: 30_000_000, base_fee: 1_000_000_000,
-            tx_count: 1, native_action_count: 2, epoch: height / 100,
+            gas_used: 21000,
+            gas_limit: 30_000_000,
+            base_fee: 1_000_000_000,
+            tx_count: 1,
+            native_action_count: 2,
+            epoch: height / 100,
             validator_set_hash: format!("0x{:064x}", 0),
             state_root: format!("0x{:064x}", 1),
         }
@@ -741,21 +872,34 @@ mod tests {
 
     fn test_tx(hash: &str, height: i64) -> TxRow {
         TxRow {
-            hash: hash.into(), block_height: height, tx_index: 0,
+            hash: hash.into(),
+            block_height: height,
+            tx_index: 0,
             from_addr: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
             to_addr: Some("0xcccccccccccccccccccccccccccccccccccccccc".into()),
-            value: "0x1000".into(), gas_limit: 21000, gas_used: 21000,
-            gas_price: "0x3b9aca00".into(), input_data: "0x".into(),
-            nonce: 0, status: true, contract_address: None, tx_type: 2,
+            value: "0x1000".into(),
+            gas_limit: 21000,
+            gas_used: 21000,
+            gas_price: "0x3b9aca00".into(),
+            input_data: "0x".into(),
+            nonce: 0,
+            status: true,
+            contract_address: None,
+            tx_type: 2,
         }
     }
 
     fn test_native_action(height: i64, idx: i32) -> NativeActionRow {
         NativeActionRow {
-            block_height: height, action_index: idx, action_type: "Delegate".into(),
-            market_id: None, order_id: None,
+            block_height: height,
+            action_index: idx,
+            action_type: "Delegate".into(),
+            market_id: None,
+            order_id: None,
             validator: Some("0xdddddddddddddddddddddddddddddddddddddd".into()),
-            target: None, amount: Some("0x1000".into()), proposal_id: None,
+            target: None,
+            amount: Some("0x1000".into()),
+            proposal_id: None,
             payload: r#"{"Delegate":{"validator":"0xdd","amount":"0x1000"}}"#.into(),
         }
     }
@@ -776,7 +920,9 @@ mod tests {
     #[test]
     fn insert_and_query_blocks() {
         let db = ExplorerDb::open_in_memory().unwrap();
-        for h in 0..5 { db.insert_block(&test_block(h)).unwrap(); }
+        for h in 0..5 {
+            db.insert_block(&test_block(h)).unwrap();
+        }
         let (blocks, total) = db.get_blocks(1, 3).unwrap();
         assert_eq!(total, 5);
         assert_eq!(blocks.len(), 3);
@@ -800,10 +946,14 @@ mod tests {
         let db = ExplorerDb::open_in_memory().unwrap();
         db.insert_block(&test_block(1)).unwrap();
         db.insert_transaction(&test_tx("0xabc", 1)).unwrap();
-        let (txs, total) = db.get_address_transactions("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", 1, 10).unwrap();
+        let (txs, total) = db
+            .get_address_transactions("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", 1, 10)
+            .unwrap();
         assert_eq!(total, 1);
         assert_eq!(txs[0].hash, "0xabc");
-        let (txs2, _) = db.get_address_transactions("0xcccccccccccccccccccccccccccccccccccccccc", 1, 10).unwrap();
+        let (txs2, _) = db
+            .get_address_transactions("0xcccccccccccccccccccccccccccccccccccccccc", 1, 10)
+            .unwrap();
         assert_eq!(txs2.len(), 1);
     }
 
@@ -813,7 +963,9 @@ mod tests {
         db.insert_block(&test_block(1)).unwrap();
         db.insert_native_action(&test_native_action(1, 0)).unwrap();
         db.insert_native_action(&test_native_action(1, 1)).unwrap();
-        let (actions, total) = db.get_address_actions("0xdddddddddddddddddddddddddddddddddddddd", 1, 10).unwrap();
+        let (actions, total) = db
+            .get_address_actions("0xdddddddddddddddddddddddddddddddddddddd", 1, 10)
+            .unwrap();
         assert_eq!(total, 2);
         assert_eq!(actions[0].action_type, "Delegate");
     }
@@ -838,7 +990,9 @@ mod tests {
     #[test]
     fn stats() {
         let db = ExplorerDb::open_in_memory().unwrap();
-        for h in 0..10 { db.insert_block(&test_block(h)).unwrap(); }
+        for h in 0..10 {
+            db.insert_block(&test_block(h)).unwrap();
+        }
         let stats = db.get_stats().unwrap();
         assert_eq!(stats.total_blocks, 10);
         assert_eq!(stats.latest_block, 9);
@@ -849,7 +1003,8 @@ mod tests {
         let db = ExplorerDb::open_in_memory().unwrap();
         for h in 1..=10 {
             db.insert_block(&test_block(h)).unwrap();
-            db.set_indexer_state("last_indexed_height", &h.to_string()).unwrap();
+            db.set_indexer_state("last_indexed_height", &h.to_string())
+                .unwrap();
         }
         assert_eq!(db.get_last_indexed_height().unwrap(), Some(10));
         assert!(db.get_block(1).unwrap().is_some());
@@ -861,7 +1016,10 @@ mod tests {
     fn search_by_hash() {
         let db = ExplorerDb::open_in_memory().unwrap();
         db.insert_block(&test_block(42)).unwrap();
-        let block = db.get_block_by_hash(&format!("0x{:064x}", 42)).unwrap().unwrap();
+        let block = db
+            .get_block_by_hash(&format!("0x{:064x}", 42))
+            .unwrap()
+            .unwrap();
         assert_eq!(block.height, 42);
     }
 
@@ -871,13 +1029,22 @@ mod tests {
         db.insert_block(&test_block(1)).unwrap();
         db.insert_transaction(&test_tx("0xabc", 1)).unwrap();
         db.insert_log(&LogRow {
-            block_height: 1, tx_hash: "0xabc".into(), log_index: 0,
+            block_height: 1,
+            tx_hash: "0xabc".into(),
+            log_index: 0,
             address: "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".into(),
-            topic0: Some("0xddf252ad".into()), topic1: None, topic2: None,
-            topic3: None, data: "0x1234".into(),
-        }).unwrap();
+            topic0: Some("0xddf252ad".into()),
+            topic1: None,
+            topic2: None,
+            topic3: None,
+            data: "0x1234".into(),
+        })
+        .unwrap();
         let logs = db.get_transaction_logs("0xabc").unwrap();
         assert_eq!(logs.len(), 1);
-        assert_eq!(logs[0].address, "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
+        assert_eq!(
+            logs[0].address,
+            "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        );
     }
 }

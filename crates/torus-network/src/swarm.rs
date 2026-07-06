@@ -14,18 +14,20 @@ use tracing::{debug, info, warn};
 
 use torus_state::NativeDaStore;
 
-use crate::behaviour::{TorusBehaviour, TorusBehaviourEvent, CONSENSUS_TOPIC, NATIVE_ACTION_TOPIC, TX_TOPIC};
+use crate::behaviour::{
+    TorusBehaviour, TorusBehaviourEvent, CONSENSUS_TOPIC, NATIVE_ACTION_TOPIC, TX_TOPIC,
+};
 use crate::codec::{
     BlockDataNetRequest, BlockDataNetResponse, DirectRequest, DirectResponse, NativeDaNetRequest,
     NativeDaNetResponse,
 };
 use crate::config::NetworkConfig;
 use crate::peer::PeerMap;
-use crate::pending_send::PendingSendQueue;
 use crate::peer_scoring::{
     ConsensusRateLimiter, PeerScoring, PENALTY_INVALID_CONSENSUS_MSG, PENALTY_INVALID_TX,
     REWARD_BLOCK_RELAY,
 };
+use crate::pending_send::PendingSendQueue;
 use crate::tx_gossip::TxGossipState;
 
 pub enum NetworkCommand {
@@ -246,7 +248,9 @@ pub struct SharedState {
     pub block_data_inbound: Mutex<VecDeque<(VerifyingKey, u64, Vec<u8>)>>,
     /// Inbound native actions received from gossip (deserialized by swarm, consumed by mempool task).
     /// Tuple: (pre-verified sender address, signed action) — receivers skip ECDSA recovery.
-    pub native_action_inbound: Option<tokio::sync::mpsc::UnboundedSender<(torus_types::Address, torus_types::SignedNativeAction)>>,
+    pub native_action_inbound: Option<
+        tokio::sync::mpsc::UnboundedSender<(torus_types::Address, torus_types::SignedNativeAction)>,
+    >,
     /// Inbound forwarded EVM transactions (raw RLP) received on the leader from a peer's
     /// direct-to-leader forward (Option B). Consumed by the node's ingest task → `add_evm_tx`.
     pub evm_tx_inbound: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
@@ -258,7 +262,12 @@ pub struct SharedState {
     /// In-flight direct consensus sends, keyed by request id, so a `Direct`
     /// `OutboundFailure` (previously swallowed by `_ => {}`) can re-enqueue the
     /// message for the next reconnect flush instead of dropping it (Task 3).
-    pub outbound_direct: Mutex<HashMap<request_response::OutboundRequestId, (VerifyingKey, hotstuff_rs::networking::messages::Message)>>,
+    pub outbound_direct: Mutex<
+        HashMap<
+            request_response::OutboundRequestId,
+            (VerifyingKey, hotstuff_rs::networking::messages::Message),
+        >,
+    >,
     /// Bounded ring of recent pre-proposal action bundle envelopes (Task 4).
     /// Re-pushed to a validator that (re)connects after the original push, so its
     /// mempool catches up before the next CompactBlock it must reconstruct.
@@ -324,7 +333,10 @@ struct DaServePool {
 
 impl DaServePool {
     fn new(tx: mpsc::UnboundedSender<DaServeDone>) -> Self {
-        Self { tx, inflight: Arc::new(AtomicUsize::new(0)) }
+        Self {
+            tx,
+            inflight: Arc::new(AtomicUsize::new(0)),
+        }
     }
 
     /// Reserve a serve slot; `false` = at capacity (the caller answers
@@ -335,7 +347,12 @@ impl DaServePool {
             if cur >= MAX_DA_SERVE_INFLIGHT {
                 return false;
             }
-            match self.inflight.compare_exchange_weak(cur, cur + 1, Ordering::Relaxed, Ordering::Relaxed) {
+            match self.inflight.compare_exchange_weak(
+                cur,
+                cur + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
                 Ok(_) => return true,
                 Err(actual) => cur = actual,
             }
@@ -424,7 +441,11 @@ fn publish_native_batch(
     let count = batch.len();
     batch.clear();
     *batch_bytes = NATIVE_BATCH_HEADER_BYTES;
-    match swarm.behaviour_mut().gossipsub.publish(topic.clone(), payload) {
+    match swarm
+        .behaviour_mut()
+        .gossipsub
+        .publish(topic.clone(), payload)
+    {
         Ok(_) => {
             debug!(count, trigger, "published native action batch to gossipsub");
             if let Some(ref m) = shared.metrics {
@@ -498,7 +519,16 @@ pub async fn run_swarm(
     shared: Arc<SharedState>,
     local_key: VerifyingKey,
 ) {
-    run_swarm_with_config(swarm, command_rx, tx_rx, native_action_rx, shared, local_key, &NetworkConfig::default()).await
+    run_swarm_with_config(
+        swarm,
+        command_rx,
+        tx_rx,
+        native_action_rx,
+        shared,
+        local_key,
+        &NetworkConfig::default(),
+    )
+    .await
 }
 
 pub async fn run_swarm_with_config(
@@ -521,11 +551,10 @@ pub async fn run_swarm_with_config(
 
     subscribe_gossip_topics(&mut swarm.behaviour_mut().gossipsub);
 
-    let mut tx_gossip_state = TxGossipState::new(
-        config.tx_dedup_window_secs,
-        config.tx_rate_limit_per_peer,
-    );
-    let mut consensus_rate_limiter = ConsensusRateLimiter::new(config.consensus_rate_limit_per_peer);
+    let mut tx_gossip_state =
+        TxGossipState::new(config.tx_dedup_window_secs, config.tx_rate_limit_per_peer);
+    let mut consensus_rate_limiter =
+        ConsensusRateLimiter::new(config.consensus_rate_limit_per_peer);
     let mut peer_scoring = PeerScoring::new(config.ban_list_path.clone());
 
     // Block any previously banned peers
@@ -871,7 +900,11 @@ fn handle_event(
                     let count = actions.len();
                     let mut ok = 0usize;
                     for action_bytes in actions {
-                        match bincode::deserialize::<(torus_types::Address, torus_types::SignedNativeAction)>(action_bytes) {
+                        match bincode::deserialize::<(
+                            torus_types::Address,
+                            torus_types::SignedNativeAction,
+                        )>(action_bytes)
+                        {
                             Ok(pair) => {
                                 if let Some(ref tx) = shared.native_action_inbound {
                                     let _ = tx.send(pair);
@@ -883,12 +916,19 @@ fn handle_event(
                             }
                         }
                     }
-                    debug!(count, ok, "received native action batch from {propagation_source}");
+                    debug!(
+                        count,
+                        ok, "received native action batch from {propagation_source}"
+                    );
                     if let Some(ref m) = shared.metrics {
                         m.native_gossip_received_actions.inc_by(ok as u64);
                     }
                 } else {
-                    match bincode::deserialize::<(torus_types::Address, torus_types::SignedNativeAction)>(&message.data) {
+                    match bincode::deserialize::<(
+                        torus_types::Address,
+                        torus_types::SignedNativeAction,
+                    )>(&message.data)
+                    {
                         Ok(pair) => {
                             if let Some(ref tx) = shared.native_action_inbound {
                                 let _ = tx.send(pair);
@@ -946,21 +986,24 @@ fn handle_event(
             }
 
             // FIX 2 (CONS-FIND-04): Verify claimed sender matches authenticated peer.
-            let sender_vk = match verify_sender_key(
-                &request.sender_key, &peer, shared, peer_scoring, "direct",
-            ) {
-                Some(vk) => vk,
-                None => {
-                    let _ = swarm
-                        .behaviour_mut()
-                        .direct
-                        .send_response(channel, DirectResponse);
-                    return;
-                }
-            };
+            let sender_vk =
+                match verify_sender_key(&request.sender_key, &peer, shared, peer_scoring, "direct")
+                {
+                    Some(vk) => vk,
+                    None => {
+                        let _ = swarm
+                            .behaviour_mut()
+                            .direct
+                            .send_response(channel, DirectResponse);
+                        return;
+                    }
+                };
             if request.payload.first() == Some(&PRE_PROPOSAL_BATCH_MARKER) {
                 let batch_bytes = &request.payload[1..];
-                match bincode::deserialize::<Vec<(torus_types::Address, torus_types::SignedNativeAction)>>(batch_bytes) {
+                match bincode::deserialize::<
+                    Vec<(torus_types::Address, torus_types::SignedNativeAction)>,
+                >(batch_bytes)
+                {
                     Ok(pairs) => {
                         let count = pairs.len();
                         if let Some(ref tx) = shared.native_action_inbound {
@@ -1003,7 +1046,9 @@ fn handle_event(
                 let action_bytes = &request.payload[1..];
                 if action_bytes.len() > 20 {
                     let sender_addr = torus_types::Address::from_slice(&action_bytes[..20]);
-                    if let Ok(action) = serde_json::from_slice::<torus_types::SignedNativeAction>(&action_bytes[20..]) {
+                    if let Ok(action) = serde_json::from_slice::<torus_types::SignedNativeAction>(
+                        &action_bytes[20..],
+                    ) {
                         if let Some(ref tx) = shared.native_action_inbound {
                             let _ = tx.send((sender_addr, action));
                         }
@@ -1023,7 +1068,11 @@ fn handle_event(
                 enqueue_inbound(&shared.inbound, sender_vk, msg);
                 peer_scoring.reward(&peer, REWARD_BLOCK_RELAY);
             } else {
-                peer_scoring.penalize(&peer, PENALTY_INVALID_CONSENSUS_MSG, "malformed direct message");
+                peer_scoring.penalize(
+                    &peer,
+                    PENALTY_INVALID_CONSENSUS_MSG,
+                    "malformed direct message",
+                );
             }
             let _ = swarm
                 .behaviour_mut()
@@ -1045,12 +1094,21 @@ fn handle_event(
         // ConnectionEstablished flush re-delivers it; nudge a dial. Untracked
         // payloads (native push / forward) are logged only — T4 re-pushes those.
         SwarmEvent::Behaviour(TorusBehaviourEvent::Direct(
-            request_response::Event::OutboundFailure { peer, request_id, error, .. }
+            request_response::Event::OutboundFailure {
+                peer,
+                request_id,
+                error,
+                ..
+            },
         )) => {
             let tracked = shared.outbound_direct.lock().unwrap().remove(&request_id);
             if let Some((target, message)) = tracked {
                 warn!(%peer, ?error, "direct send failed — re-enqueueing consensus message for reconnect flush");
-                shared.pending_sends.lock().unwrap().enqueue(&target, message);
+                shared
+                    .pending_sends
+                    .lock()
+                    .unwrap()
+                    .enqueue(&target, message);
                 if let Some(ref m) = shared.metrics {
                     m.pending_sends_enqueued.inc();
                 }
@@ -1068,7 +1126,7 @@ fn handle_event(
             dispatch_next_push(swarm, shared, local_key, request_id);
         }
         SwarmEvent::Behaviour(TorusBehaviourEvent::Direct(
-            request_response::Event::InboundFailure { peer, error, .. }
+            request_response::Event::InboundFailure { peer, error, .. },
         )) => {
             warn!(%peer, ?error, "direct inbound failure");
         }
@@ -1083,7 +1141,10 @@ fn handle_event(
                 return;
             }
             // Extract ed25519 key before consuming other fields.
-            let maybe_vk = info.public_key.try_into_ed25519().ok()
+            let maybe_vk = info
+                .public_key
+                .try_into_ed25519()
+                .ok()
                 .and_then(|ed_pk| VerifyingKey::from_bytes(&ed_pk.to_bytes()).ok());
             for addr in info.listen_addrs {
                 // A NAT'd peer advertises its loopback/LAN listen addrs; storing
@@ -1107,17 +1168,25 @@ fn handle_event(
             }
         }
         // Block-data fetch protocol: inbound request — serve from network-thread block store.
-        SwarmEvent::Behaviour(TorusBehaviourEvent::BlockData(request_response::Event::Message {
-            message: request_response::Message::Request { request, channel, .. },
-            peer,
-            ..
-        })) => {
+        SwarmEvent::Behaviour(TorusBehaviourEvent::BlockData(
+            request_response::Event::Message {
+                message:
+                    request_response::Message::Request {
+                        request, channel, ..
+                    },
+                peer,
+                ..
+            },
+        )) => {
             // Validator-set peers exempt (s350 FIX B): refusing block-data serve
             // to a validator starves its sync and breaks cluster liveness.
             if should_drop_banned_gossip(&mut *peer_scoring, shared, &peer) {
                 let _ = swarm.behaviour_mut().block_data.send_response(
                     channel,
-                    BlockDataNetResponse { view: request.view, payload: Vec::new() },
+                    BlockDataNetResponse {
+                        view: request.view,
+                        payload: Vec::new(),
+                    },
                 );
                 return;
             }
@@ -1143,17 +1212,25 @@ fn handle_event(
             }
             if let Err(resp) = swarm.behaviour_mut().block_data.send_response(
                 channel,
-                BlockDataNetResponse { view: request.view, payload },
+                BlockDataNetResponse {
+                    view: request.view,
+                    payload,
+                },
             ) {
-                warn!(view = resp.view, "block-data send_response FAILED (channel dead)");
+                warn!(
+                    view = resp.view,
+                    "block-data send_response FAILED (channel dead)"
+                );
             }
         }
         // Block-data fetch protocol: inbound response — forward to algorithm thread.
-        SwarmEvent::Behaviour(TorusBehaviourEvent::BlockData(request_response::Event::Message {
-            message: request_response::Message::Response { response, .. },
-            peer,
-            ..
-        })) => {
+        SwarmEvent::Behaviour(TorusBehaviourEvent::BlockData(
+            request_response::Event::Message {
+                message: request_response::Message::Response { response, .. },
+                peer,
+                ..
+            },
+        )) => {
             if response.payload.is_empty() {
                 warn!(%peer, "block-data response: empty payload (block not found on server)");
                 return;
@@ -1175,23 +1252,28 @@ fn handle_event(
             }
         }
         SwarmEvent::Behaviour(TorusBehaviourEvent::BlockData(
-            request_response::Event::OutboundFailure { peer, error, .. }
+            request_response::Event::OutboundFailure { peer, error, .. },
         )) => {
             warn!(%peer, ?error, "block-data OUTBOUND FAILURE");
         }
         SwarmEvent::Behaviour(TorusBehaviourEvent::BlockData(
-            request_response::Event::InboundFailure { peer, error, .. }
+            request_response::Event::InboundFailure { peer, error, .. },
         )) => {
             warn!(%peer, ?error, "block-data INBOUND FAILURE");
         }
         SwarmEvent::Behaviour(TorusBehaviourEvent::BlockData(_)) => {}
         // Native-DA fetch protocol: inbound request — serve bodies by-hash from the
         // durable DA store (Task 5). The RARE pull-fallback; push covers the common case.
-        SwarmEvent::Behaviour(TorusBehaviourEvent::NativeDa(request_response::Event::Message {
-            message: request_response::Message::Request { request, channel, .. },
-            peer,
-            ..
-        })) => {
+        SwarmEvent::Behaviour(TorusBehaviourEvent::NativeDa(
+            request_response::Event::Message {
+                message:
+                    request_response::Message::Request {
+                        request, channel, ..
+                    },
+                peer,
+                ..
+            },
+        )) => {
             // Banned peers (validator-set peers exempt, s350 FIX B: empty DA
             // responses to a validator make its pull-fallback fail and veto valid
             // proposals — s339: val1's 16 unrecovered pulls each broke a view's
@@ -1241,11 +1323,13 @@ fn handle_event(
         // consensus app to insert into its DA store and retry reconstruct (Task 6).
         // Responses are solicited (request_response only delivers for our own
         // outbound request), so no sender verification is needed.
-        SwarmEvent::Behaviour(TorusBehaviourEvent::NativeDa(request_response::Event::Message {
-            message: request_response::Message::Response { response, .. },
-            peer,
-            ..
-        })) => {
+        SwarmEvent::Behaviour(TorusBehaviourEvent::NativeDa(
+            request_response::Event::Message {
+                message: request_response::Message::Response { response, .. },
+                peer,
+                ..
+            },
+        )) => {
             let mut queue = shared.native_da_inbound.lock().unwrap();
             let mut queued = 0usize;
             for body in response.bodies {
@@ -1284,7 +1368,11 @@ fn handle_event(
             debug!("sync protocol event (not yet handled)");
         }
         SwarmEvent::NewListenAddr { address, .. } => info!("Listening on {address}"),
-        SwarmEvent::ConnectionEstablished { peer_id, num_established, .. } => {
+        SwarmEvent::ConnectionEstablished {
+            peer_id,
+            num_established,
+            ..
+        } => {
             // Validator-set peers exempt (s350 FIX B): never refuse a quorum
             // member's connection — a banned validator that reconnects mid-ban
             // would otherwise be severed entirely until expiry.
@@ -1332,8 +1420,13 @@ fn handle_event(
                     // validator's mempool catches up before the next CompactBlock it
                     // must reconstruct. Validator-gated; dedup is free on the receiver.
                     if shared.validators.read().unwrap().contains(&vk.to_bytes()) {
-                        let bundles: Vec<Vec<u8>> =
-                            shared.recent_native_bundles.lock().unwrap().iter().cloned().collect();
+                        let bundles: Vec<Vec<u8>> = shared
+                            .recent_native_bundles
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .cloned()
+                            .collect();
                         if !bundles.is_empty() {
                             info!(%peer_id, count = bundles.len(), "re-pushing recent native bundles on (re)connect");
                             for envelope in bundles {
@@ -1386,11 +1479,15 @@ fn handle_event(
             warn!(%error, "incoming connection failed");
         }
         SwarmEvent::Behaviour(TorusBehaviourEvent::Kademlia(
-            kad::Event::OutboundQueryProgressed { result: kad::QueryResult::Bootstrap(Ok(_)), .. }
+            kad::Event::OutboundQueryProgressed {
+                result: kad::QueryResult::Bootstrap(Ok(_)),
+                ..
+            },
         )) => {
             let local_pid = *swarm.local_peer_id();
             let peer_map = shared.peer_map.read().unwrap();
-            let to_dial: Vec<PeerId> = peer_map.peer_ids()
+            let to_dial: Vec<PeerId> = peer_map
+                .peer_ids()
                 .filter(|pid| **pid != local_pid && !swarm.is_connected(pid))
                 .copied()
                 .collect();
@@ -1405,7 +1502,9 @@ fn handle_event(
         // they land so stale loopback/container addresses can't re-enter via a
         // peer that still carries them.
         SwarmEvent::Behaviour(TorusBehaviourEvent::Kademlia(kad::Event::RoutingUpdated {
-            peer, addresses, ..
+            peer,
+            addresses,
+            ..
         })) => {
             if !shared.allow_private_addrs {
                 for addr in addresses.iter() {
@@ -1470,8 +1569,17 @@ fn handle_command(
                 }
             }
         }
-        NetworkCommand::BlockDataRequest { target, block_hash, view } => {
-            let peer_id = shared.peer_map.read().unwrap().get_peer_id(&target).copied();
+        NetworkCommand::BlockDataRequest {
+            target,
+            block_hash,
+            view,
+        } => {
+            let peer_id = shared
+                .peer_map
+                .read()
+                .unwrap()
+                .get_peer_id(&target)
+                .copied();
             if let Some(pid) = peer_id {
                 let req = BlockDataNetRequest { block_hash, view };
                 swarm.behaviour_mut().block_data.send_request(&pid, req);
@@ -1480,10 +1588,19 @@ fn handle_command(
             }
         }
         NetworkCommand::StoreBlock { hash, block_bytes } => {
-            shared.block_store.write().unwrap().insert(hash, block_bytes);
+            shared
+                .block_store
+                .write()
+                .unwrap()
+                .insert(hash, block_bytes);
         }
         NetworkCommand::ForwardNativeAction { target, payload } => {
-            let peer_id = shared.peer_map.read().unwrap().get_peer_id(&target).copied();
+            let peer_id = shared
+                .peer_map
+                .read()
+                .unwrap()
+                .get_peer_id(&target)
+                .copied();
             if let Some(pid) = peer_id {
                 let mut envelope = vec![FORWARD_ACTION_MARKER];
                 envelope.extend_from_slice(&payload);
@@ -1497,7 +1614,12 @@ fn handle_command(
             }
         }
         NetworkCommand::ForwardEvmTx { target, payload } => {
-            let peer_id = shared.peer_map.read().unwrap().get_peer_id(&target).copied();
+            let peer_id = shared
+                .peer_map
+                .read()
+                .unwrap()
+                .get_peer_id(&target)
+                .copied();
             if let Some(pid) = peer_id {
                 let req = DirectRequest {
                     sender_key: local_key.to_bytes(),
@@ -1536,7 +1658,12 @@ fn handle_command(
             }
         }
         NetworkCommand::FetchNativeActions { target, hashes } => {
-            let peer_id = shared.peer_map.read().unwrap().get_peer_id(&target).copied();
+            let peer_id = shared
+                .peer_map
+                .read()
+                .unwrap()
+                .get_peer_id(&target)
+                .copied();
             if let Some(pid) = peer_id {
                 let req = NativeDaNetRequest { hashes };
                 swarm.behaviour_mut().native_da.send_request(&pid, req);
@@ -1557,10 +1684,7 @@ const MAX_PREWARM_HASHES: usize = 100_000;
 /// per-request hash chunks (≤ `NATIVE_DA_FETCH_CHUNK`) for the pre-warm pull (Phase 2.3 #5).
 /// `None` on a malformed, empty, or over-cap manifest — nothing is pulled, so the node falls
 /// back to the hot-path pull when the CompactBlock arrives.
-fn plan_prewarm_requests(
-    body: &[u8],
-    store: Option<&NativeDaStore>,
-) -> Option<Vec<Vec<[u8; 32]>>> {
+fn plan_prewarm_requests(body: &[u8], store: Option<&NativeDaStore>) -> Option<Vec<Vec<[u8; 32]>>> {
     let Ok(hashes) = bincode::deserialize::<Vec<[u8; 32]>>(body) else {
         warn!("pre-proposal hash manifest decode failed -- no pre-warm");
         return None;
@@ -1569,7 +1693,10 @@ fn plan_prewarm_requests(
         return None;
     }
     if hashes.len() > MAX_PREWARM_HASHES {
-        warn!(count = hashes.len(), "pre-proposal hash manifest over cap -- no pre-warm");
+        warn!(
+            count = hashes.len(),
+            "pre-proposal hash manifest over cap -- no pre-warm"
+        );
         return None;
     }
     // Pull ONLY what we don't already hold (#6 fix C): ingest pushes + the gossip
@@ -1742,7 +1869,11 @@ fn send_direct(
         Some(pid) => pid,
         None => {
             // Not mapped yet (rare for validators) — buffer until registration.
-            shared.pending_sends.lock().unwrap().enqueue(target, message);
+            shared
+                .pending_sends
+                .lock()
+                .unwrap()
+                .enqueue(target, message);
             if let Some(ref m) = shared.metrics {
                 m.pending_sends_enqueued.inc();
             }
@@ -1751,7 +1882,11 @@ fn send_direct(
     };
     if !swarm.is_connected(&pid) {
         // Mapped but disconnected — buffer + nudge a dial; flush on reconnect.
-        shared.pending_sends.lock().unwrap().enqueue(target, message);
+        shared
+            .pending_sends
+            .lock()
+            .unwrap()
+            .enqueue(target, message);
         if let Some(ref m) = shared.metrics {
             m.pending_sends_enqueued.inc();
         }
@@ -1848,16 +1983,18 @@ fn handle_consensus_gossip(
 ) {
     if data.len() < 33 {
         warn!("Consensus message too short ({} bytes)", data.len());
-        peer_scoring.penalize(source, PENALTY_INVALID_CONSENSUS_MSG, "consensus message too short");
+        peer_scoring.penalize(
+            source,
+            PENALTY_INVALID_CONSENSUS_MSG,
+            "consensus message too short",
+        );
         return;
     }
     let sender_bytes: [u8; 32] = data[..32].try_into().unwrap();
     let msg_bytes = &data[32..];
 
     // FIX 1 (CONS-PF-12): Verify claimed sender matches authenticated peer.
-    let sender_vk = match verify_sender_key(
-        &sender_bytes, source, shared, peer_scoring, "gossip",
-    ) {
+    let sender_vk = match verify_sender_key(&sender_bytes, source, shared, peer_scoring, "gossip") {
         Some(vk) => vk,
         None => return,
     };
@@ -1869,7 +2006,11 @@ fn handle_consensus_gossip(
         }
         Err(e) => {
             warn!("Failed to deserialize consensus message: {e}");
-            peer_scoring.penalize(source, PENALTY_INVALID_CONSENSUS_MSG, "malformed consensus message");
+            peer_scoring.penalize(
+                source,
+                PENALTY_INVALID_CONSENSUS_MSG,
+                "malformed consensus message",
+            );
         }
     }
 }
@@ -1917,20 +2058,37 @@ mod tests {
 
         // No store attached (`None`) => pull every manifest hash, as before.
         let chunks = plan_prewarm_requests(&body, None).expect("a valid manifest yields chunks");
-        assert_eq!(chunks.len(), hashes.len().div_ceil(chunk), "ceil(40/16) = 3 chunks");
+        assert_eq!(
+            chunks.len(),
+            hashes.len().div_ceil(chunk),
+            "ceil(40/16) = 3 chunks"
+        );
         assert!(
             chunks.iter().all(|c| (1..=chunk).contains(&c.len())),
             "each chunk carries 1..=NATIVE_DA_FETCH_CHUNK hashes"
         );
-        assert_eq!(chunks.concat(), hashes, "every hash covered exactly once, in order");
+        assert_eq!(
+            chunks.concat(),
+            hashes,
+            "every hash covered exactly once, in order"
+        );
 
-        assert!(plan_prewarm_requests(b"\x00\x01not-bincode", None).is_none(), "garbage -> no pull");
+        assert!(
+            plan_prewarm_requests(b"\x00\x01not-bincode", None).is_none(),
+            "garbage -> no pull"
+        );
         let empty = bincode::serialize::<Vec<[u8; 32]>>(&vec![]).unwrap();
-        assert!(plan_prewarm_requests(&empty, None).is_none(), "empty manifest -> no pull");
+        assert!(
+            plan_prewarm_requests(&empty, None).is_none(),
+            "empty manifest -> no pull"
+        );
 
         // Review F6: a manifest exceeding the defensive cap is rejected (no pre-warm fan).
         let over_cap = bincode::serialize(&vec![[0u8; 32]; MAX_PREWARM_HASHES + 1]).unwrap();
-        assert!(plan_prewarm_requests(&over_cap, None).is_none(), "over-cap manifest -> no pull");
+        assert!(
+            plan_prewarm_requests(&over_cap, None).is_none(),
+            "over-cap manifest -> no pull"
+        );
     }
 
     /// EVM direct-to-leader forward (Option B), RED first: the EVM forward marker must not
@@ -1959,9 +2117,17 @@ mod tests {
         let rlp = vec![0x02u8, 0xf8, 0x6c, 0x01, 0x02, 0x03]; // arbitrary RLP-shaped bytes
         let env = encode_forwarded_evm(&rlp);
         assert_eq!(env.first(), Some(&FORWARD_EVM_MARKER), "marker prefixed");
-        assert_eq!(parse_forwarded_evm_tx(&env), Some(rlp.as_slice()), "round-trips to raw RLP");
+        assert_eq!(
+            parse_forwarded_evm_tx(&env),
+            Some(rlp.as_slice()),
+            "round-trips to raw RLP"
+        );
 
-        assert_eq!(parse_forwarded_evm_tx(&[FORWARD_EVM_MARKER]), None, "marker-only -> None");
+        assert_eq!(
+            parse_forwarded_evm_tx(&[FORWARD_EVM_MARKER]),
+            None,
+            "marker-only -> None"
+        );
         assert_eq!(parse_forwarded_evm_tx(&[]), None, "empty -> None");
     }
 
@@ -1990,7 +2156,10 @@ mod tests {
         for _ in 0..30 {
             scoring.penalize(&peer, PENALTY_INVALID_CONSENSUS_MSG, "test");
         }
-        assert!(scoring.is_banned(&peer), "precondition: the validator IS banned");
+        assert!(
+            scoring.is_banned(&peer),
+            "precondition: the validator IS banned"
+        );
         assert!(
             !should_drop_banned_gossip(&mut scoring, &shared, &peer),
             "validator-set member must keep consensus service while banned"
@@ -2024,7 +2193,11 @@ mod tests {
         );
         assert_eq!(hit, Some(author));
         assert_eq!(scoring.score(&author), INITIAL_SCORE - PENALTY_INVALID_TX);
-        assert_eq!(scoring.score(&forwarder), INITIAL_SCORE, "forwarder untouched");
+        assert_eq!(
+            scoring.score(&forwarder),
+            INITIAL_SCORE,
+            "forwarder untouched"
+        );
 
         let none = penalize_gossip_author(&mut scoring, None, PENALTY_INVALID_TX, "no author");
         assert_eq!(none, None, "no author -> no penalty");
@@ -2182,7 +2355,10 @@ mod tests {
         }
         assert_eq!(ring.len(), RECENT_NATIVE_BUNDLES_CAP);
         assert_eq!(ring.front().unwrap(), &vec![2u8]);
-        assert_eq!(ring.back().unwrap(), &vec![RECENT_NATIVE_BUNDLES_CAP as u8 + 1]);
+        assert_eq!(
+            ring.back().unwrap(),
+            &vec![RECENT_NATIVE_BUNDLES_CAP as u8 + 1]
+        );
     }
 
     /// Task 5: the `/torus/native-da/1.0` serve path returns the stored body bytes
@@ -2203,7 +2379,11 @@ mod tests {
         let action = SignedNativeAction {
             action: NativeAction::ClaimRewards,
             nonce: 7,
-            signature: ActionSignature::Eip712(Signature { v: 27, r: [0u8; 32], s: [0u8; 32] }),
+            signature: ActionSignature::Eip712(Signature {
+                v: 27,
+                r: [0u8; 32],
+                s: [0u8; 32],
+            }),
         };
         let known: [u8; 32] = compute_action_hash(&action).0;
         let unknown = [9u8; 32];
@@ -2216,7 +2396,11 @@ mod tests {
         assert!(bodies[1].is_empty(), "unknown hash -> empty (not found)");
         let got: SignedNativeAction =
             bincode::deserialize(&bodies[0]).expect("served bytes deserialize");
-        assert_eq!(compute_action_hash(&got).0, known, "served body round-trips to its hash");
+        assert_eq!(
+            compute_action_hash(&got).0,
+            known,
+            "served body round-trips to its hash"
+        );
 
         // No store attached -> one empty entry per requested hash.
         let none = serve_native_da_bodies(None, &[known, unknown]);
@@ -2235,19 +2419,41 @@ mod tests {
         let env2 = vec![PRE_PROPOSAL_BATCH_MARKER, 4, 5, 6];
 
         // Two pushes while the target is disconnected -> both queued, none dropped.
-        shared.pending_native_pushes.lock().unwrap().enqueue(&vk, env1.clone());
-        shared.pending_native_pushes.lock().unwrap().enqueue(&vk, env2.clone());
+        shared
+            .pending_native_pushes
+            .lock()
+            .unwrap()
+            .enqueue(&vk, env1.clone());
+        shared
+            .pending_native_pushes
+            .lock()
+            .unwrap()
+            .enqueue(&vk, env2.clone());
 
         // On (re)connect -> flushed in enqueue order, then the queue is cleared.
         let flushed = shared.pending_native_pushes.lock().unwrap().flush(&vk);
-        assert_eq!(flushed, vec![env1, env2], "queued pushes delivered in order on connect");
+        assert_eq!(
+            flushed,
+            vec![env1, env2],
+            "queued pushes delivered in order on connect"
+        );
         assert!(
-            shared.pending_native_pushes.lock().unwrap().flush(&vk).is_empty(),
+            shared
+                .pending_native_pushes
+                .lock()
+                .unwrap()
+                .flush(&vk)
+                .is_empty(),
             "queue cleared after flush"
         );
 
         // A different validator's queue is independent (no cross-delivery).
-        assert!(shared.pending_native_pushes.lock().unwrap().flush(&test_vk(8)).is_empty());
+        assert!(shared
+            .pending_native_pushes
+            .lock()
+            .unwrap()
+            .flush(&test_vk(8))
+            .is_empty());
     }
 
     /// #4 Task 3 (RED first): the native-action push loop must cap concurrent in-flight
@@ -2273,18 +2479,26 @@ mod tests {
                 sched.enqueue(test_peer(1), vec![id as u8]);
             }
         }
-        assert_eq!(dispatched, 2, "only PUSH_MAX_INFLIGHT sends go in-flight at once");
+        assert_eq!(
+            dispatched, 2,
+            "only PUSH_MAX_INFLIGHT sends go in-flight at once"
+        );
         assert_eq!(sched.inflight_len(), 2);
         assert_eq!(sched.queued_len(), 3, "overflow is queued, not dropped");
 
         // An untracked completion (a consensus send shares the Direct protocol) is ignored.
-        assert!(sched.complete(999).is_none(), "a non-push id dispatches nothing");
+        assert!(
+            sched.complete(999).is_none(),
+            "a non-push id dispatches nothing"
+        );
         assert_eq!(sched.inflight_len(), 2);
 
         // Completing each in-flight push frees a slot and yields one queued push; the
         // caller records the redispatch, so in-flight never exceeds the cap.
         for completed in [1u64, 2, 3] {
-            let _ = sched.complete(completed).expect("completion dispatches the next queued push");
+            let _ = sched
+                .complete(completed)
+                .expect("completion dispatches the next queued push");
             id += 1;
             sched.record(id);
             assert!(sched.inflight_len() <= 2, "in-flight never exceeds the cap");
@@ -2293,7 +2507,11 @@ mod tests {
 
         // With an empty queue, a completion frees the slot but dispatches nothing.
         assert!(sched.complete(5).is_none());
-        assert_eq!(sched.inflight_len(), 1, "freed a slot, nothing left to re-dispatch");
+        assert_eq!(
+            sched.inflight_len(),
+            1,
+            "freed a slot, nothing left to re-dispatch"
+        );
     }
 
     /// #4 Task 3: the push queue is BOUNDED at `PUSH_QUEUE_CAP` — overflow drops the
@@ -2306,10 +2524,23 @@ mod tests {
         sched.record(1); // fill the single in-flight slot
         assert!(!sched.has_capacity());
 
-        assert!(!sched.enqueue(test_peer(1), vec![1]), "1st fits under the cap");
-        assert!(!sched.enqueue(test_peer(2), vec![2]), "2nd fits under the cap");
-        assert!(sched.enqueue(test_peer(3), vec![3]), "3rd overflows -> drops oldest");
-        assert_eq!(sched.queued_len(), 2, "queue stays bounded at PUSH_QUEUE_CAP");
+        assert!(
+            !sched.enqueue(test_peer(1), vec![1]),
+            "1st fits under the cap"
+        );
+        assert!(
+            !sched.enqueue(test_peer(2), vec![2]),
+            "2nd fits under the cap"
+        );
+        assert!(
+            sched.enqueue(test_peer(3), vec![3]),
+            "3rd overflows -> drops oldest"
+        );
+        assert_eq!(
+            sched.queued_len(),
+            2,
+            "queue stays bounded at PUSH_QUEUE_CAP"
+        );
 
         // Oldest ([1]) was dropped; FIFO order preserved for the rest ([2] then [3]).
         assert_eq!(sched.complete(1).unwrap().1, vec![2u8]);
@@ -2365,7 +2596,11 @@ mod tests {
             SignedNativeAction {
                 action: NativeAction::PlaceOrderBatch(vec![order; n_orders]),
                 nonce,
-                signature: ActionSignature::Eip712(Signature { v: 27, r: [0u8; 32], s: [0u8; 32] }),
+                signature: ActionSignature::Eip712(Signature {
+                    v: 27,
+                    r: [0u8; 32],
+                    s: [0u8; 32],
+                }),
             }
         }
 
@@ -2401,12 +2636,20 @@ mod tests {
                 // Client → server: the request round-trips through the codec.
                 let mut wbuf = Cursor::new(Vec::new());
                 codec
-                    .write_request(&proto, &mut wbuf, NativeDaNetRequest { hashes: chunk.to_vec() })
+                    .write_request(
+                        &proto,
+                        &mut wbuf,
+                        NativeDaNetRequest {
+                            hashes: chunk.to_vec(),
+                        },
+                    )
                     .await
                     .expect("write request");
                 let mut rbuf = Cursor::new(wbuf.into_inner());
-                let served_req =
-                    codec.read_request(&proto, &mut rbuf).await.expect("read request");
+                let served_req = codec
+                    .read_request(&proto, &mut rbuf)
+                    .await
+                    .expect("read request");
 
                 // Server serves the bodies for those hashes from its DA store.
                 let bodies = serve_native_da_bodies(Some(&store), &served_req.hashes);
@@ -2421,8 +2664,10 @@ mod tests {
                 let response_bytes = wbuf.into_inner();
                 max_response_bytes = max_response_bytes.max(response_bytes.len());
                 let mut rbuf = Cursor::new(response_bytes);
-                let served =
-                    codec.read_response(&proto, &mut rbuf).await.expect("read response");
+                let served = codec
+                    .read_response(&proto, &mut rbuf)
+                    .await
+                    .expect("read response");
 
                 // Client absorbs by RECOMPUTED hash (a peer cannot place a body under a
                 // hash it does not own) — mirrors `app.rs::absorb_fetched_bodies`.
@@ -2458,7 +2703,11 @@ mod tests {
             "{} of {N_BODIES} bodies missing after reconstruct",
             missing.len()
         );
-        assert_eq!(reconstructed.len(), N_BODIES, "all 100 distinct bodies recovered");
+        assert_eq!(
+            reconstructed.len(),
+            N_BODIES,
+            "all 100 distinct bodies recovered"
+        );
     }
 
     /// #6 fix A: the off-loop DA serve pool admits at most `MAX_DA_SERVE_INFLIGHT`
@@ -2472,9 +2721,15 @@ mod tests {
 
         // Admit exactly the cap, then refuse the next.
         for i in 0..MAX_DA_SERVE_INFLIGHT {
-            assert!(pool.try_admit(), "admission {i} within the cap must succeed");
+            assert!(
+                pool.try_admit(),
+                "admission {i} within the cap must succeed"
+            );
         }
-        assert!(!pool.try_admit(), "admission past the cap must fail (answer empty inline)");
+        assert!(
+            !pool.try_admit(),
+            "admission past the cap must fail (answer empty inline)"
+        );
 
         // A running job releasing its slot re-opens exactly one admission.
         pool.inflight.fetch_sub(1, Ordering::Relaxed);
@@ -2499,13 +2754,13 @@ mod tests {
         let hashes: Vec<[u8; 32]> = (0..40u8).map(|i| [i; 32]).collect();
         // Seed the FIRST 25 as present; the last 15 stay missing.
         for h in &hashes[..25] {
-            db.put_cf_raw(CF_NATIVE_PENDING, h, b"body-bytes").expect("seed present body");
+            db.put_cf_raw(CF_NATIVE_PENDING, h, b"body-bytes")
+                .expect("seed present body");
         }
         let store = NativeDaStore::new(db);
 
         let body = bincode::serialize(&hashes).unwrap();
-        let chunks =
-            plan_prewarm_requests(&body, Some(&store)).expect("15 missing -> a plan");
+        let chunks = plan_prewarm_requests(&body, Some(&store)).expect("15 missing -> a plan");
         assert!(
             chunks.iter().all(|c| (1..=chunk).contains(&c.len())),
             "each chunk carries 1..=NATIVE_DA_FETCH_CHUNK hashes"
@@ -2530,7 +2785,8 @@ mod tests {
         let db = StateDb::open(dir.path()).expect("open db");
         let hashes: Vec<[u8; 32]> = (0..40u8).map(|i| [i; 32]).collect();
         for h in &hashes {
-            db.put_cf_raw(CF_NATIVE_PENDING, h, b"body-bytes").expect("seed present body");
+            db.put_cf_raw(CF_NATIVE_PENDING, h, b"body-bytes")
+                .expect("seed present body");
         }
         let store = NativeDaStore::new(db);
 
@@ -2554,6 +2810,10 @@ mod tests {
             chunks.iter().all(|c| (1..=chunk).contains(&c.len())),
             "each chunk carries 1..=NATIVE_DA_FETCH_CHUNK hashes"
         );
-        assert_eq!(chunks.concat(), hashes, "all 40 hashes pulled, order preserved");
+        assert_eq!(
+            chunks.concat(),
+            hashes,
+            "all 40 hashes pulled, order preserved"
+        );
     }
 }

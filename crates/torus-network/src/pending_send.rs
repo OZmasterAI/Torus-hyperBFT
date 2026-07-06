@@ -1,5 +1,5 @@
-use std::collections::{HashMap, VecDeque};
 use ed25519_dalek::VerifyingKey;
+use std::collections::{HashMap, VecDeque};
 
 /// Bounded per-peer buffer of items awaiting peer (re)connection.
 ///
@@ -14,7 +14,10 @@ pub struct PendingSendQueue<T> {
 
 impl<T> PendingSendQueue<T> {
     pub fn new(max_per_key: usize) -> Self {
-        Self { map: HashMap::new(), max_per_key }
+        Self {
+            map: HashMap::new(),
+            max_per_key,
+        }
     }
 
     /// Buffer `item` for `vk`, evicting the oldest if the per-key cap is hit.
@@ -28,7 +31,10 @@ impl<T> PendingSendQueue<T> {
 
     /// Remove and return all queued items for `vk`, in enqueue order.
     pub fn flush(&mut self, vk: &VerifyingKey) -> Vec<T> {
-        self.map.remove(&vk.to_bytes()).map(Vec::from).unwrap_or_default()
+        self.map
+            .remove(&vk.to_bytes())
+            .map(Vec::from)
+            .unwrap_or_default()
     }
 }
 

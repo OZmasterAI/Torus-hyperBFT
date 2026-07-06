@@ -92,10 +92,21 @@ impl Network for ChannelNetwork {
     }
 
     fn request_block_data(&mut self, peer: VerifyingKey, request: BlockDataRequest) {
-        let block = self.block_store.lock().unwrap().get(&request.block_hash).cloned();
+        let block = self
+            .block_store
+            .lock()
+            .unwrap()
+            .get(&request.block_hash)
+            .cloned();
         if let Some(block) = block {
-            let resp = BlockDataResponse { view: request.view, block };
-            self.block_data_inbox.lock().unwrap().push_back((peer, resp));
+            let resp = BlockDataResponse {
+                view: request.view,
+                block,
+            };
+            self.block_data_inbox
+                .lock()
+                .unwrap()
+                .push_back((peer, resp));
         }
     }
 

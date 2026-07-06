@@ -2,8 +2,7 @@ use std::time::Duration;
 
 use libp2p::swarm::NetworkBehaviour;
 use libp2p::{
-    allow_block_list, connection_limits, gossipsub, identify, kad, request_response,
-    StreamProtocol,
+    allow_block_list, connection_limits, gossipsub, identify, kad, request_response, StreamProtocol,
 };
 
 use crate::codec::{BlockDataCodec, BorshCodec, NativeDaCodec};

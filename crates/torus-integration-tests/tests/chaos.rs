@@ -9,7 +9,9 @@
 mod common;
 
 use alloy_primitives::Address;
-use torus_bridge::native_executor::{classify_action, sort_native_actions, NativeExecContext, NativeExecutor};
+use torus_bridge::native_executor::{
+    classify_action, sort_native_actions, NativeExecContext, NativeExecutor,
+};
 use torus_bridge::state_root::compute_native_state_root;
 use torus_core::position::PositionManager;
 use torus_state::StateDb;
@@ -150,10 +152,7 @@ fn test_state_recovery_after_crash() {
                 reduce_only: false,
                 client_order_id: None,
             });
-            NativeExecutor::execute_batch(
-                &mut ctx,
-                &[(trader_a, buy), (trader_b, sell)],
-            );
+            NativeExecutor::execute_batch(&mut ctx, &[(trader_a, buy), (trader_b, sell)]);
             ctx.block_height += 1;
             ctx.timestamp += 1;
             let _ = block;
@@ -229,10 +228,7 @@ fn test_state_recovery_after_crash() {
             reduce_only: false,
             client_order_id: None,
         });
-        let batch = NativeExecutor::execute_batch(
-            &mut ctx,
-            &[(trader_a, buy), (trader_b, sell)],
-        );
+        let batch = NativeExecutor::execute_batch(&mut ctx, &[(trader_a, buy), (trader_b, sell)]);
         assert!(batch.results[0].success, "Block 11 buy should succeed");
         assert!(batch.results[1].success, "Block 11 sell should succeed");
 
@@ -329,7 +325,9 @@ fn test_replay_determinism() {
 /// the actual native-CF write patterns of orders / cancels / oracle / lockbox / governance / fees.
 #[test]
 fn native_incremental_root_matches_full_scan_under_real_execution() {
-    use torus_state::native_trie::{build_native_trie_to_cf, native_root_full, persisted_native_root};
+    use torus_state::native_trie::{
+        build_native_trie_to_cf, native_root_full, persisted_native_root,
+    };
     use torus_state::NativeStateOverlay;
 
     let tmp = tempfile::TempDir::new().unwrap();
@@ -462,10 +460,7 @@ fn test_execution_ordering_enforced() {
     assert_eq!(pre_evm.len(), 4, "pre-EVM should have 4 actions");
 
     // Verify ordering within pre-EVM: cancellations (category 0) before non-GTC (category 1).
-    let pre_categories: Vec<_> = pre_evm
-        .iter()
-        .map(|(_, a)| classify_action(a))
-        .collect();
+    let pre_categories: Vec<_> = pre_evm.iter().map(|(_, a)| classify_action(a)).collect();
     for window in pre_categories.windows(2) {
         assert!(
             window[0] <= window[1],
@@ -479,10 +474,7 @@ fn test_execution_ordering_enforced() {
     // Should have: 1 GTC + 1 lockbox + 1 oracle + 1 governance = 4 actions.
     assert_eq!(post_evm.len(), 4, "post-EVM should have 4 actions");
 
-    let post_categories: Vec<_> = post_evm
-        .iter()
-        .map(|(_, a)| classify_action(a))
-        .collect();
+    let post_categories: Vec<_> = post_evm.iter().map(|(_, a)| classify_action(a)).collect();
     for window in post_categories.windows(2) {
         assert!(
             window[0] <= window[1],
@@ -521,10 +513,8 @@ fn test_duplicate_action_handling() {
 
     // Cancel the same order twice in one batch.
     let cancel = NativeAction::CancelOrder { order_id: 1 };
-    let batch = NativeExecutor::execute_batch(
-        &mut ctx,
-        &[(trader, cancel.clone()), (trader, cancel)],
-    );
+    let batch =
+        NativeExecutor::execute_batch(&mut ctx, &[(trader, cancel.clone()), (trader, cancel)]);
 
     assert_eq!(batch.results.len(), 2);
     // First cancel succeeds.
@@ -593,9 +583,7 @@ fn test_all_actions_fail() {
         // Cancel all on empty book
         (
             unfunded,
-            NativeAction::CancelAllOrders {
-                market_id: Some(1),
-            },
+            NativeAction::CancelAllOrders { market_id: Some(1) },
         ),
         // Withdraw with zero balance
         (

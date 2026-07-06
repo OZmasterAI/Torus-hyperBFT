@@ -163,7 +163,10 @@ impl<T: StateBackend> StakingManager<T> {
         // FIX ECON-FIND-30: Cap unbonding entries to prevent DoS via queue bloat.
         const MAX_UNBONDING_ENTRIES: usize = 100;
         if delegation.unbonding.len() >= MAX_UNBONDING_ENTRIES {
-            return Err(EconomicsError::TooManyUnbondingEntries { delegator, validator });
+            return Err(EconomicsError::TooManyUnbondingEntries {
+                delegator,
+                validator,
+            });
         }
 
         // Add unbonding entry.
@@ -553,7 +556,12 @@ impl<T: StateBackend> StakingManager<T> {
 
         // Check >2/3 threshold: vote_weight * 3 > active_stake * 2
         if total_vote_weight * U256::from(3u64) > total_active_stake * U256::from(2u64) {
-            self.slash(target, DOWNTIME_SLASH_BPS, SlashReason::JailVote, current_block)?;
+            self.slash(
+                target,
+                DOWNTIME_SLASH_BPS,
+                SlashReason::JailVote,
+                current_block,
+            )?;
             self.jail_validator(&target, JAIL_DURATION_BLOCKS, current_block)?;
             tracing::info!(%target, "jail vote threshold reached, validator jailed");
             return Ok(true);
@@ -698,8 +706,7 @@ impl<T: StateBackend> StakingManager<T> {
     ) -> Result<()> {
         let key = slash_record_key(validator, block_height);
         let data = borsh::to_vec(record).map_err(|e| EconomicsError::Borsh(e.to_string()))?;
-        self.state
-            .put_cf_raw(CF_SLASH_RECORDS, &key, &data)?;
+        self.state.put_cf_raw(CF_SLASH_RECORDS, &key, &data)?;
         Ok(())
     }
 
@@ -739,8 +746,7 @@ impl<T: StateBackend> StakingManager<T> {
 
     fn put_delegation_raw(&self, key: &[u8; 40], delegation: &Delegation) -> Result<()> {
         let data = borsh::to_vec(delegation).map_err(|e| EconomicsError::Borsh(e.to_string()))?;
-        self.state
-            .put_cf_raw(CF_STAKING_DELEGATIONS, key, &data)?;
+        self.state.put_cf_raw(CF_STAKING_DELEGATIONS, key, &data)?;
         Ok(())
     }
 
@@ -858,7 +864,9 @@ impl<T: StateBackend> StakingManager<T> {
 
     /// Read all delegations for a specific delegator (prefix scan on delegator address).
     pub fn delegations_for_delegator(&self, delegator: &Address) -> Result<Vec<Delegation>> {
-        let entries = self.state.iterate_cf(CF_STAKING_DELEGATIONS, Some(delegator.as_slice()))?;
+        let entries = self
+            .state
+            .iterate_cf(CF_STAKING_DELEGATIONS, Some(delegator.as_slice()))?;
         let mut delegations = Vec::new();
         for (_key, value) in &entries {
             let delegation = Delegation::try_from_slice(value)
@@ -1441,7 +1449,9 @@ mod tests {
             .unwrap();
 
         // Try to unjail before cooldown
-        let err = mgr.unjail(&validator, 1000 + JAIL_DURATION_BLOCKS - 1).unwrap_err();
+        let err = mgr
+            .unjail(&validator, 1000 + JAIL_DURATION_BLOCKS - 1)
+            .unwrap_err();
         assert!(matches!(err, EconomicsError::UnjailCooldownNotExpired(_)));
     }
 
@@ -1456,7 +1466,8 @@ mod tests {
             .unwrap();
 
         // Slash to bring below minimum, then jail
-        mgr.slash(validator, 500, SlashReason::Downtime, 100).unwrap();
+        mgr.slash(validator, 500, SlashReason::Downtime, 100)
+            .unwrap();
 
         let val = mgr.get_validator(&validator).unwrap().unwrap();
         assert_eq!(val.status, ValidatorStatus::Jailed);
@@ -1645,11 +1656,16 @@ mod tests {
 
         let val = mgr.get_validator(&validator).unwrap().unwrap();
         let delegations = mgr.delegations_for_validator(&validator).unwrap();
-        let sum_delegated: U256 = delegations.iter().map(|d| d.amount).fold(U256::ZERO, |a, b| a + b);
+        let sum_delegated: U256 = delegations
+            .iter()
+            .map(|d| d.amount)
+            .fold(U256::ZERO, |a, b| a + b);
 
         // total_delegated must match actual sum of delegation amounts
-        assert_eq!(val.total_delegated, sum_delegated,
-            "total_delegated diverged from sum of delegations after dust slash");
+        assert_eq!(
+            val.total_delegated, sum_delegated,
+            "total_delegated diverged from sum of delegations after dust slash"
+        );
     }
 
     // ====================================================================
@@ -1729,7 +1745,10 @@ mod tests {
             .unwrap();
 
         let result = mgr.top_up_self_stake(validator, wei(1));
-        assert!(matches!(result, Err(EconomicsError::InsufficientBalance { .. })));
+        assert!(matches!(
+            result,
+            Err(EconomicsError::InsufficientBalance { .. })
+        ));
     }
 
     // ====================================================================
@@ -1776,7 +1795,10 @@ mod tests {
         // With fix (current weights): v1(~2500) + v2(~2500) + v3(25000) = ~30000
         //   vs total_active = ~55000.
         //   30000*3 = 90000 vs 55000*2 = 110000 → should NOT jail
-        assert!(!jailed, "jail vote should not pass when voters' stakes were slashed");
+        assert!(
+            !jailed,
+            "jail vote should not pass when voters' stakes were slashed"
+        );
     }
 
     // ====================================================================

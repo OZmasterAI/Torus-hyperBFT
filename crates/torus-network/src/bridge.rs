@@ -8,12 +8,12 @@ use hotstuff_rs::networking::messages::Message;
 use hotstuff_rs::networking::network::Network;
 use hotstuff_rs::types::block::Block;
 use hotstuff_rs::types::data_types::{CryptoHash, ViewNumber};
-use zeroize::Zeroize;
 use hotstuff_rs::types::update_sets::ValidatorSetUpdates;
 use hotstuff_rs::types::validator_set::ValidatorSet;
 use libp2p::{identity, multiaddr::Protocol, Multiaddr, PeerId, SwarmBuilder};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
+use zeroize::Zeroize;
 
 use crate::behaviour::TorusBehaviour;
 use crate::config::NetworkConfig;
@@ -58,7 +58,8 @@ fn tune_quic_config(mut cfg: libp2p::quic::Config) -> libp2p::quic::Config {
 pub struct LibP2PNetwork {
     command_tx: mpsc::UnboundedSender<NetworkCommand>,
     shared: Arc<SharedState>,
-    native_inbound_rx: Option<mpsc::UnboundedReceiver<(torus_types::Address, torus_types::SignedNativeAction)>>,
+    native_inbound_rx:
+        Option<mpsc::UnboundedReceiver<(torus_types::Address, torus_types::SignedNativeAction)>>,
     /// Inbound forwarded EVM txs (raw RLP) received on the leader (Option B). Taken once at
     /// startup to drive an ingest task → `add_evm_tx`.
     evm_inbound_rx: Option<mpsc::UnboundedReceiver<Vec<u8>>>,
@@ -274,11 +275,24 @@ impl LibP2PNetwork {
         let config_clone = config.clone();
         tokio::spawn(async move {
             run_swarm_with_config(
-                swarm, command_rx, tx_rx, native_rx, shared_clone, local_key, &config_clone,
-            ).await
+                swarm,
+                command_rx,
+                tx_rx,
+                native_rx,
+                shared_clone,
+                local_key,
+                &config_clone,
+            )
+            .await
         });
 
-        let network = Self { command_tx, shared, native_inbound_rx: Some(native_inbound_rx), evm_inbound_rx: Some(evm_inbound_rx), local_key };
+        let network = Self {
+            command_tx,
+            shared,
+            native_inbound_rx: Some(native_inbound_rx),
+            evm_inbound_rx: Some(evm_inbound_rx),
+            local_key,
+        };
         let tx_handle = TxGossipHandle { tx_sender: tx_tx };
         let native_handle = NativeGossipHandle { sender: native_tx };
         Ok((network, tx_handle, native_handle))
@@ -286,7 +300,10 @@ impl LibP2PNetwork {
 
     /// Take the inbound native action receiver. Called once at startup to
     /// spawn a task that drains gossip-received actions into the mempool.
-    pub fn take_native_action_rx(&mut self) -> Option<mpsc::UnboundedReceiver<(torus_types::Address, torus_types::SignedNativeAction)>> {
+    pub fn take_native_action_rx(
+        &mut self,
+    ) -> Option<mpsc::UnboundedReceiver<(torus_types::Address, torus_types::SignedNativeAction)>>
+    {
         self.native_inbound_rx.take()
     }
 
@@ -315,17 +332,23 @@ impl LibP2PNetwork {
     /// Forward a native action directly to a specific peer (leader).
     /// Payload format: sender_address(20) + serde_json(SignedNativeAction).
     pub fn forward_native_action(&self, target: VerifyingKey, payload: Vec<u8>) {
-        let _ = self.command_tx.send(NetworkCommand::ForwardNativeAction { target, payload });
+        let _ = self
+            .command_tx
+            .send(NetworkCommand::ForwardNativeAction { target, payload });
     }
 
     /// Forward a raw RLP EVM transaction directly to the leader (Option B — EVM tx
     /// dissemination). Payload is the raw RLP; the leader full-validates via `add_evm_tx`.
     pub fn forward_evm_tx(&self, target: VerifyingKey, payload: Vec<u8>) {
-        let _ = self.command_tx.send(NetworkCommand::ForwardEvmTx { target, payload });
+        let _ = self
+            .command_tx
+            .send(NetworkCommand::ForwardEvmTx { target, payload });
     }
 
     pub fn broadcast_native_actions(&self, payload: Vec<u8>) {
-        let _ = self.command_tx.send(NetworkCommand::BroadcastNativeActions { payload });
+        let _ = self
+            .command_tx
+            .send(NetworkCommand::BroadcastNativeActions { payload });
     }
 
     /// Push only the action HASHES (a tiny manifest) for an oversized pre-proposal batch;
@@ -333,7 +356,9 @@ impl LibP2PNetwork {
     /// disseminate within the view, so the full-body push would wedge it (bs≈500 VIEW
     /// TIMEOUT on big-body dissemination, mem f58957c6).
     pub fn broadcast_native_action_hashes(&self, hashes: Vec<[u8; 32]>) {
-        let _ = self.command_tx.send(NetworkCommand::BroadcastNativeActionHashes { hashes });
+        let _ = self
+            .command_tx
+            .send(NetworkCommand::BroadcastNativeActionHashes { hashes });
     }
 
     /// Attach the durable native-action DA store so the swarm can SERVE bodies
@@ -451,7 +476,13 @@ impl Network for LibP2PNetwork {
     fn recv_block_data(&mut self) -> Option<(VerifyingKey, BlockDataResponse)> {
         let (vk, view, block_bytes) = self.shared.block_data_inbound.lock().unwrap().pop_front()?;
         match borsh::BorshDeserialize::try_from_slice(&block_bytes) {
-            Ok(block) => Some((vk, BlockDataResponse { view: ViewNumber::new(view), block })),
+            Ok(block) => Some((
+                vk,
+                BlockDataResponse {
+                    view: ViewNumber::new(view),
+                    block,
+                },
+            )),
             Err(e) => {
                 tracing::warn!(
                     view,
@@ -583,7 +614,10 @@ mod tests {
                 "each request carries 1..=NATIVE_DA_FETCH_CHUNK hashes, got {}",
                 hashes.len()
             );
-            per_target.entry(target.to_bytes()).or_default().extend(hashes);
+            per_target
+                .entry(target.to_bytes())
+                .or_default()
+                .extend(hashes);
         }
 
         let chunks_per_validator = hashes.len().div_ceil(NATIVE_DA_FETCH_CHUNK); // 7
@@ -592,13 +626,20 @@ mod tests {
             chunks_per_validator * 2,
             "ceil(100/16)=7 chunks × 2 non-self validators = 14 commands"
         );
-        assert_eq!(per_target.len(), 2, "exactly the 2 non-self validators are targeted");
+        assert_eq!(
+            per_target.len(),
+            2,
+            "exactly the 2 non-self validators are targeted"
+        );
         assert!(
             !per_target.contains_key(&local.verifying_key().to_bytes()),
             "self is never a fetch target"
         );
         for got in per_target.values() {
-            assert_eq!(got, &hashes, "every hash delivered exactly once per validator, in order");
+            assert_eq!(
+                got, &hashes,
+                "every hash delivered exactly once per validator, in order"
+            );
         }
     }
 
@@ -623,7 +664,11 @@ mod tests {
         else {
             panic!("expected a BroadcastNativeActionHashes command");
         };
-        assert_eq!(hashes, vec![[7u8; 32], [9u8; 32]], "the exact manifest hashes are forwarded");
+        assert_eq!(
+            hashes,
+            vec![[7u8; 32], [9u8; 32]],
+            "the exact manifest hashes are forwarded"
+        );
     }
 
     /// Phase 2.3 (#5, RED first): pre-proposal pushes above `HASH_ONLY_PUSH_THRESHOLD`
@@ -634,7 +679,10 @@ mod tests {
     /// MUST fail before Task 1 (no `should_push_hashes_only` / `HASH_ONLY_PUSH_THRESHOLD`).
     #[test]
     fn hash_only_gate_triggers_above_threshold() {
-        assert!(!should_push_hashes_only(0), "empty/small batch keeps the full-body push");
+        assert!(
+            !should_push_hashes_only(0),
+            "empty/small batch keeps the full-body push"
+        );
         assert!(
             !should_push_hashes_only(HASH_ONLY_PUSH_THRESHOLD),
             "at the threshold stays full-body (boundary is exclusive)"

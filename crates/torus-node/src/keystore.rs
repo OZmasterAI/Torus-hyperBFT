@@ -64,8 +64,8 @@ pub fn write_keystore(
         .map_err(|e| format!("argon2 key derivation failed: {e}"))?;
 
     // Encrypt the private key with AES-256-GCM
-    let cipher = Aes256Gcm::new_from_slice(&derived_key)
-        .map_err(|e| format!("cipher init failed: {e}"))?;
+    let cipher =
+        Aes256Gcm::new_from_slice(&derived_key).map_err(|e| format!("cipher init failed: {e}"))?;
     let nonce = Nonce::from_slice(&nonce_bytes);
     let ciphertext = cipher
         .encrypt(nonce, key.as_bytes().as_ref())
@@ -104,8 +104,8 @@ pub fn load_keystore(
 ) -> Result<SigningKey, Box<dyn std::error::Error>> {
     let json = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read keystore file {}: {e}", path.display()))?;
-    let keystore: KeystoreFile = serde_json::from_str(&json)
-        .map_err(|e| format!("invalid keystore JSON: {e}"))?;
+    let keystore: KeystoreFile =
+        serde_json::from_str(&json).map_err(|e| format!("invalid keystore JSON: {e}"))?;
 
     if keystore.version != 1 {
         return Err(format!("unsupported keystore version: {}", keystore.version).into());
@@ -117,10 +117,10 @@ pub fn load_keystore(
         return Err(format!("unsupported KDF: {}", keystore.crypto.kdf).into());
     }
 
-    let salt = hex::decode(&keystore.crypto.kdf_salt)
-        .map_err(|e| format!("invalid salt hex: {e}"))?;
-    let nonce_bytes = hex::decode(&keystore.crypto.nonce)
-        .map_err(|e| format!("invalid nonce hex: {e}"))?;
+    let salt =
+        hex::decode(&keystore.crypto.kdf_salt).map_err(|e| format!("invalid salt hex: {e}"))?;
+    let nonce_bytes =
+        hex::decode(&keystore.crypto.nonce).map_err(|e| format!("invalid nonce hex: {e}"))?;
     let ciphertext = hex::decode(&keystore.crypto.ciphertext)
         .map_err(|e| format!("invalid ciphertext hex: {e}"))?;
 
@@ -132,8 +132,8 @@ pub fn load_keystore(
         .map_err(|e| format!("argon2 key derivation failed: {e}"))?;
 
     // Decrypt
-    let cipher = Aes256Gcm::new_from_slice(&derived_key)
-        .map_err(|e| format!("cipher init failed: {e}"))?;
+    let cipher =
+        Aes256Gcm::new_from_slice(&derived_key).map_err(|e| format!("cipher init failed: {e}"))?;
     let nonce = Nonce::from_slice(&nonce_bytes);
     let plaintext = cipher
         .decrypt(nonce, ciphertext.as_ref())

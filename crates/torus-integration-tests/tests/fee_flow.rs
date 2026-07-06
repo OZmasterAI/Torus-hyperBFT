@@ -72,7 +72,9 @@ fn test_full_fee_pipeline_conservation() {
     FeeSplitter::execute_burn(&staking, split.burn).unwrap();
     FeeSplitter::distribute_validator_rewards(&staking, &proposer, split.validators).unwrap();
     FeeSplitter::credit_treasury(&staking, &treasury, split.treasury).unwrap();
-    staking.credit_balance(&dev_pool_addr, split.dev_pool).unwrap();
+    staking
+        .credit_balance(&dev_pool_addr, split.dev_pool)
+        .unwrap();
 
     // Verify: burn recorded in supply tracker.
     let tracker = FeeSplitter::get_supply_tracker(&staking).unwrap();
@@ -117,10 +119,7 @@ fn test_fee_ratio_interpolation() {
     assert_eq!(val_0, 0);
     assert_eq!(trs_0, 4500);
     // dev_pool implied = 10000 - 1000 - 0 - 4500 = 4500.
-    assert_eq!(
-        10000u32 - burn_0 as u32 - val_0 as u32 - trs_0 as u32,
-        4500
-    );
+    assert_eq!(10000u32 - burn_0 as u32 - val_0 as u32 - trs_0 as u32, 4500);
 
     // Verify FeeSplitter at epoch 0 conserves.
     let total = wei(10_000);
