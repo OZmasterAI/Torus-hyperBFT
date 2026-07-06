@@ -249,7 +249,7 @@ impl NativePool {
     }
 
     pub fn select_for_block_with_senders(&mut self, limit: usize) -> Vec<(Address, SignedNativeAction)> {
-        self.select_for_block_with_senders_excluding(limit, &HashSet::new(), usize::MAX)
+        self.select_for_block_with_senders_excluding(limit, &HashSet::new(), usize::MAX, usize::MAX)
     }
 
     /// Like `select_for_block_with_senders`, but skips any action whose hash is in
@@ -267,11 +267,15 @@ impl NativePool {
     /// entry that would exceed it (deterministic prefix), so a flood of huge
     /// batch actions degrades to more, smaller blocks instead of an
     /// undisseminatable mega-block (s334 bs1000 wedge).
+    /// `orders_cap` bounds the summed `order_count` of selected actions (G2:
+    /// without it, 100 actions × 1024-order batches = 102,400 orders vs the
+    /// documented 50k ceiling). Same deterministic-prefix rule as `bytes_cap`.
     pub fn select_for_block_with_senders_excluding(
         &mut self,
         limit: usize,
         exclude: &HashSet<B256>,
         bytes_cap: usize,
+        orders_cap: usize,
     ) -> Vec<(Address, SignedNativeAction)> {
         self.entries.sort_by(|a, b| {
             let a_pri = if a.is_cancel { 0u8 } else { 1 };
@@ -289,23 +293,37 @@ impl NativePool {
         let mut block_counts: HashMap<Address, usize> = HashMap::new();
         let mut selected = Vec::new();
         let mut bytes_used: usize = 0;
+        let mut orders_used: usize = 0;
 
         for entry in &self.entries {
             if selected.len() >= limit {
                 break;
+            }
+            // Skip in-flight (already-proposed) entries BEFORE the budget gates:
+            // an excluded entry is never selected, so it must neither charge nor
+            // trip the byte/order budget — otherwise a large in-flight batch
+            // sitting early in the sort would halt selection and under-fill the
+            // block with valid later entries.
+            if exclude.contains(&entry.action_hash) {
+                continue;
             }
             if bytes_used.saturating_add(entry.encoded_len) > bytes_cap {
                 // Deterministic prefix: stop at the first entry that would blow
                 // the body-byte budget rather than skipping past it.
                 break;
             }
-            if exclude.contains(&entry.action_hash) {
-                continue;
+            let entry_orders = crate::rate_limit::order_count(&entry.action.action);
+            if orders_used.saturating_add(entry_orders) > orders_cap {
+                // Deterministic prefix for the ORDER budget too (O2/G2) —
+                // bounds worst-case matching/exec time per block. Cancels sort
+                // first and count 1 each, so cancels-first is preserved.
+                break;
             }
             let count = block_counts.get(&entry.sender).copied().unwrap_or(0);
             if count < self.max_per_block {
                 *block_counts.entry(entry.sender).or_insert(0) += 1;
                 bytes_used = bytes_used.saturating_add(entry.encoded_len);
+                orders_used = orders_used.saturating_add(entry_orders);
                 selected.push((entry.sender, entry.action.clone()));
             }
         }
@@ -456,11 +474,11 @@ mod tests {
         // Budget for exactly 3.5 actions -> 3 selected.
         let cap = per_action * 7 / 2;
         let selected =
-            pool.select_for_block_with_senders_excluding(100, &HashSet::new(), cap);
+            pool.select_for_block_with_senders_excluding(100, &HashSet::new(), cap, usize::MAX);
         assert_eq!(selected.len(), 3);
         // usize::MAX preserves uncapped behavior.
         let all =
-            pool.select_for_block_with_senders_excluding(100, &HashSet::new(), usize::MAX);
+            pool.select_for_block_with_senders_excluding(100, &HashSet::new(), usize::MAX, usize::MAX);
         assert_eq!(all.len(), 10);
     }
 
@@ -714,15 +732,74 @@ mod tests {
         assert_eq!(first.len(), 5);
         let exclude: HashSet<B256> = first.iter().map(|(_, a)| compute_action_hash(a)).collect();
 
-        let second = pool.select_for_block_with_senders_excluding(5, &exclude, usize::MAX);
+        let second = pool.select_for_block_with_senders_excluding(5, &exclude, usize::MAX, usize::MAX);
         assert!(second.is_empty(), "in-flight actions must not be re-selected");
         assert_eq!(pool.size(), 5, "selection stays non-destructive");
 
         // A fresh (non-excluded) action is still selectable past the exclusion set.
         pool.insert(sender, make_action(99, NativeAction::ClaimRewards))
             .unwrap();
-        let third = pool.select_for_block_with_senders_excluding(5, &exclude, usize::MAX);
+        let third = pool.select_for_block_with_senders_excluding(5, &exclude, usize::MAX, usize::MAX);
         assert_eq!(third.len(), 1, "only the fresh action is selected");
         assert_eq!(third[0].1.nonce, 99);
+    }
+
+    #[test]
+    fn order_budget_bounds_selection_and_preserves_cancels_first() {
+        let mut pool = NativePool::new(100, 64, 16);
+        let p = torus_types::PlaceOrderParams {
+            market_id: 1,
+            is_buy: true,
+            price: torus_types::FixedPoint::from_raw(100),
+            quantity: torus_types::FixedPoint::from_raw(100),
+            order_type: torus_types::OrderType::Limit,
+            time_in_force: torus_types::TimeInForce::GTC,
+            reduce_only: false,
+            client_order_id: None,
+        };
+        // 5 batches of 10 orders + 2 cancels, distinct senders.
+        for i in 0..5u8 {
+            pool.insert(
+                Address::repeat_byte(i + 1),
+                make_action(
+                    1_000 + i as u64,
+                    NativeAction::PlaceOrderBatch(vec![p.clone(); 10]),
+                ),
+            )
+            .unwrap();
+        }
+        pool.insert(
+            Address::repeat_byte(10),
+            make_action(2_000, NativeAction::CancelOrder { order_id: 1 }),
+        )
+        .unwrap();
+        pool.insert(
+            Address::repeat_byte(11),
+            make_action(2_001, NativeAction::CancelOrder { order_id: 2 }),
+        )
+        .unwrap();
+
+        // Order budget 25: cancels first (1+1), then TWO batches (10+10 -> 22);
+        // a third batch would reach 32 > 25 -> deterministic-prefix break.
+        let sel = pool.select_for_block_with_senders_excluding(
+            100,
+            &HashSet::new(),
+            usize::MAX,
+            25,
+        );
+        assert_eq!(sel.len(), 4, "2 cancels + 2 batches fit the 25-order budget");
+        assert!(matches!(sel[0].1.action, NativeAction::CancelOrder { .. }));
+        assert!(matches!(sel[1].1.action, NativeAction::CancelOrder { .. }));
+        assert!(matches!(sel[2].1.action, NativeAction::PlaceOrderBatch(_)));
+        assert!(matches!(sel[3].1.action, NativeAction::PlaceOrderBatch(_)));
+
+        // usize::MAX order budget preserves today's behavior exactly.
+        let all = pool.select_for_block_with_senders_excluding(
+            100,
+            &HashSet::new(),
+            usize::MAX,
+            usize::MAX,
+        );
+        assert_eq!(all.len(), 7);
     }
 }

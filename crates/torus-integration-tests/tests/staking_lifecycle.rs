@@ -169,13 +169,15 @@ fn test_governance_permanent_weight_decides_outcome() {
     gov.set_governance_params(&params).unwrap();
 
     // Submit ParameterChange proposal (delegator has 5,000 > min 1,000).
+    // FIX 13 whitelists param keys at submission — use a whitelisted key
+    // (same fixture as governance_tests.rs execute_parameter_change).
     let prop_id = gov
         .submit_proposal(
             delegator,
-            "Change fee param".to_string(),
-            "Set trading_fee to 50".to_string(),
+            "Change leverage param".to_string(),
+            "Set max_leverage to 50".to_string(),
             Some(ExecutionPayload::ParameterChange {
-                param_key: "trading_fee".to_string(),
+                param_key: "max_leverage".to_string(),
                 new_value: "50".to_string(),
             }),
             100,
@@ -198,14 +200,17 @@ fn test_governance_permanent_weight_decides_outcome() {
         "permanent stake gives 1.5x governance weight"
     );
 
-    // Finalize after voting period (block 111 > end_block 110).
+    // Finalize after voting period (block 111 > end_block 110), then execute
+    // after the timelock (FIX 15 two-phase contract).
     let outcome = gov.finalize_proposal(prop_id, 111).unwrap();
+    assert_eq!(outcome, ProposalOutcome::Passed(prop_id));
+    let outcome = gov.execute_proposal(prop_id, 116).unwrap();
     assert_eq!(outcome, ProposalOutcome::Executed(prop_id));
 
     // Verify parameter was actually updated in CF_FEE_CONFIG.
     let stored = h
         .state_db
-        .get_cf_raw(CF_FEE_CONFIG, b"trading_fee")
+        .get_cf_raw(CF_FEE_CONFIG, b"max_leverage")
         .unwrap();
     assert_eq!(stored.unwrap(), b"50");
 
@@ -262,7 +267,10 @@ fn test_governance_treasury_spend_execution() {
 
     gov.cast_vote(proposer, prop_id, true, 205).unwrap();
 
+    // FIX 15 two-phase: finalize starts the timelock, execute applies payload.
     let outcome = gov.finalize_proposal(prop_id, 211).unwrap();
+    assert_eq!(outcome, ProposalOutcome::Passed(prop_id));
+    let outcome = gov.execute_proposal(prop_id, 216).unwrap();
     assert_eq!(outcome, ProposalOutcome::Executed(prop_id));
 
     // Treasury debited, recipient credited.

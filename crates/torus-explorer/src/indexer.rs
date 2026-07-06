@@ -125,7 +125,7 @@ impl Indexer {
         }
 
         // Snapshot validators every 100 blocks
-        if height % 100 == 0 {
+        if height.is_multiple_of(100) {
             if let Err(e) = self.snapshot_validators(h).await {
                 warn!("Failed to snapshot validators at height {height}: {e}");
             }

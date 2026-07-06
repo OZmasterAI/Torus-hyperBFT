@@ -109,29 +109,59 @@ pub const NATIVE_PER_SENDER_CAP: usize = 512;
 
 /// Max orders a single `PlaceOrderBatch` may carry (Phase B throughput keystone).
 ///
-/// Chain-side safety ceiling rejected at RPC ingress + block validation. Clients
-/// (market makers) tune their *actual* batch size up to this bound — that's the
-/// "configurable" knob for finding the throughput sweet spot. Bytes per batch
-/// ≈ size × ~70B, so a full block of batches must stay under
-/// `max_consensus_message_size` — Phase C raises that limit and this cap together.
-pub const NATIVE_ORDERS_PER_BATCH_CAP: usize = 1024;
+/// Canonical definition lives in `torus-types` (single source shared with the
+/// exec-side deterministic skip in torus-bridge). Enforced at RPC ingress
+/// (`validate_batch_size`, torus-rpc torus.rs), at gossip/DA admission
+/// (`Mempool::admit_gossip`), and — the consensus-critical layer — at the
+/// `execute_batch` flatten, which skips an oversize batch wholesale on every
+/// node identically. Clients (market makers) tune their actual batch size up
+/// to this bound. Bytes per batch ≈ size × ~70B.
+pub use torus_types::NATIVE_ORDERS_PER_BATCH_CAP;
 
 /// Max total orders (individual `PlaceOrder` + expanded `PlaceOrderBatch`) admitted
 /// per block. Bounds worst-case matching/execution time so block production stays
 /// within the consensus view budget.
 ///
-/// NOTE: enforcement is wired into `produce_block` order-aware selection in Phase C
-/// (alongside raising `NATIVE_TOTAL_BLOCK_CAP`). Today selection counts *actions*;
-/// this constant documents the target order ceiling. See `order_count`.
+/// NOTE: Enforced in `select_for_block_with_senders_excluding` via
+/// `order_count` (O2/G2, S416); selection-only — `validate_block` does not
+/// reject on order count, so mixed values cannot fork.
 pub const NATIVE_ORDERS_PER_BLOCK_CAP: usize = 50_000;
+
+/// Effective per-block ORDER budget: `TORUS_NATIVE_ORDERS_PER_BLOCK_CAP`
+/// overrides the compiled default PER NODE (same OnceLock pattern as
+/// `TORUS_NATIVE_TOTAL_BLOCK_CAP`). Proposer-local selection policy —
+/// validate_block does not reject on order count — mixed values cannot fork.
+pub fn native_orders_per_block_cap() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        let parsed = std::env::var("TORUS_NATIVE_ORDERS_PER_BLOCK_CAP")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(NATIVE_ORDERS_PER_BLOCK_CAP);
+        // Floor at the per-batch cap: selection breaks on the first entry whose
+        // order_count would exceed the budget, so any value below a single
+        // legal batch (or 0) silently wedges native selection to empty blocks.
+        // Clamp + WARN rather than obey it (same doctrine as the O5 env floors).
+        if parsed < NATIVE_ORDERS_PER_BATCH_CAP {
+            tracing::warn!(
+                requested = parsed,
+                floor = NATIVE_ORDERS_PER_BATCH_CAP,
+                "TORUS_NATIVE_ORDERS_PER_BLOCK_CAP below the per-batch cap would starve \
+                 native selection; clamping to the floor"
+            );
+            return NATIVE_ORDERS_PER_BATCH_CAP;
+        }
+        parsed
+    })
+}
 
 /// Hard ceiling on the summed bincode-encoded size of native-action bodies in
 /// one block (bytes) — the WAN dissemination budget. Selection stops before
 /// exceeding this, so a flooded mempool degrades to more, smaller blocks
 /// instead of undisseminatable ones (s334 bs1000 wedge: ~7.5MB bodies, body
-/// fetches exhausted, every leader re-proposed the same mega-block). Unlike
-/// `NATIVE_ORDERS_PER_BLOCK_CAP` (documented target, not yet enforced), this
-/// IS enforced in `select_for_block_with_senders_excluding`.
+/// fetches exhausted, every leader re-proposed the same mega-block). Like
+/// `NATIVE_ORDERS_PER_BLOCK_CAP` (O2/G2, S416), this is enforced in
+/// `select_for_block_with_senders_excluding`.
 ///
 /// 2MB was the push/manifest-pull-only budget (s334 measured 34.5k orders/s
 /// pinned at exactly this cap × block rate). With Sprint 3 native-action
@@ -178,15 +208,14 @@ pub fn order_count(action: &NativeAction) -> usize {
 }
 
 /// Reject malformed batches at ingress: empty (no-op spam) or larger than
-/// [`NATIVE_ORDERS_PER_BATCH_CAP`]. Non-batch actions always pass.
+/// [`NATIVE_ORDERS_PER_BATCH_CAP`]. Non-batch actions always pass. Shares the
+/// exact validity predicate ([`torus_types::batch_len_within_cap`]) with the
+/// consensus exec-side skip, so admit and exec can never disagree on the bound.
 pub fn validate_batch_size(action: &NativeAction) -> Result<(), String> {
     if let NativeAction::PlaceOrderBatch(orders) = action {
-        if orders.is_empty() {
-            return Err("empty PlaceOrderBatch".to_string());
-        }
-        if orders.len() > NATIVE_ORDERS_PER_BATCH_CAP {
+        if !torus_types::batch_len_within_cap(orders.len()) {
             return Err(format!(
-                "PlaceOrderBatch size {} exceeds NATIVE_ORDERS_PER_BATCH_CAP {}",
+                "PlaceOrderBatch size {} outside [1, {}]",
                 orders.len(),
                 NATIVE_ORDERS_PER_BATCH_CAP
             ));

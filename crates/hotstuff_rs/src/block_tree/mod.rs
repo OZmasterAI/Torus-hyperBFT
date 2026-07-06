@@ -16,7 +16,7 @@
 //! tree:
 //! 1. **Committed Blocks**: blocks in the linked list. These are permanently part of the block tree.
 //! 2. **Speculative Blocks**: blocks in the tree. These, along with their descendants, are "pruned"
-//!   when a "conflicting" block is committed.
+//!    when a "conflicting" block is committed.
 //!
 //! A speculative block is committed when a 3-Chain is formed extending it. This is the point at which
 //! the HotStuff subprotocol can guarantee that a block that conflicts with the block can never be

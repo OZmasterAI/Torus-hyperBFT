@@ -105,6 +105,7 @@ fn load_accounts(count: usize) -> Vec<Account> {
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sign_eip1559_tx(
     key: &SigningKey,
     chain_id: u64,
@@ -251,7 +252,7 @@ async fn main() {
 
     let cli = Cli::parse();
     let rpc_urls: Vec<String> = cli.rpc_urls.split(',').map(|s| s.trim().to_string()).collect();
-    let num_accounts = cli.accounts.min(20).max(1);
+    let num_accounts = cli.accounts.clamp(1, 20);
     let gas_price = (cli.gas_price_gwei as u128) * 1_000_000_000;
     let batch_per_sender = cli.batch_per_sender.min(MEMPOOL_MAX_PER_SENDER);
     let drain_timeout_secs = cli.drain_timeout_secs;
@@ -431,6 +432,7 @@ async fn main() {
                 continue;
             }
 
+            #[allow(clippy::needless_range_loop)]
             for seq in start..end {
                 let raw_hex = signed_txs[sender_idx][seq].clone();
                 let permit = semaphore.clone().acquire_owned().await.unwrap();

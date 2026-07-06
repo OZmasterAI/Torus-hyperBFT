@@ -489,7 +489,7 @@ impl ExplorerDb {
                     base_fee,tx_count,native_action_count,epoch,validator_set_hash,state_root
              FROM blocks ORDER BY height DESC LIMIT ?1 OFFSET ?2",
         )?;
-        let rows = stmt.query_map(params![limit as i64, offset], |row| row_to_block(row))?;
+        let rows = stmt.query_map(params![limit as i64, offset], row_to_block)?;
         let blocks: Vec<BlockRow> = rows.filter_map(|r| r.ok()).collect();
         Ok((blocks, total))
     }
@@ -501,7 +501,7 @@ impl ExplorerDb {
                     gas_used,gas_price,input_data,nonce,status,contract_address,tx_type
              FROM transactions WHERE block_height = ?1 ORDER BY tx_index",
         )?;
-        let rows = stmt.query_map(params![height], |row| row_to_tx(row))?;
+        let rows = stmt.query_map(params![height], row_to_tx)?;
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
@@ -525,7 +525,7 @@ impl ExplorerDb {
             "SELECT block_height,tx_hash,log_index,address,topic0,topic1,topic2,topic3,data
              FROM logs WHERE tx_hash = ?1 ORDER BY log_index",
         )?;
-        let rows = stmt.query_map(params![tx_hash], |row| row_to_log(row))?;
+        let rows = stmt.query_map(params![tx_hash], row_to_log)?;
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
@@ -536,7 +536,7 @@ impl ExplorerDb {
                     validator,target,amount,proposal_id,payload
              FROM native_actions WHERE block_height = ?1 ORDER BY action_index",
         )?;
-        let rows = stmt.query_map(params![height], |row| row_to_native_action(row))?;
+        let rows = stmt.query_map(params![height], row_to_native_action)?;
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
@@ -555,7 +555,7 @@ impl ExplorerDb {
              FROM transactions WHERE from_addr = ?1 OR to_addr = ?1
              ORDER BY block_height DESC, tx_index DESC LIMIT ?2 OFFSET ?3",
         )?;
-        let rows = stmt.query_map(params![addr, limit as i64, offset], |row| row_to_tx(row))?;
+        let rows = stmt.query_map(params![addr, limit as i64, offset], row_to_tx)?;
         Ok((rows.filter_map(|r| r.ok()).collect(), total))
     }
 
@@ -574,7 +574,7 @@ impl ExplorerDb {
              FROM native_actions WHERE validator = ?1 OR target = ?1
              ORDER BY block_height DESC, action_index DESC LIMIT ?2 OFFSET ?3",
         )?;
-        let rows = stmt.query_map(params![addr, limit as i64, offset], |row| row_to_native_action(row))?;
+        let rows = stmt.query_map(params![addr, limit as i64, offset], row_to_native_action)?;
         Ok((rows.filter_map(|r| r.ok()).collect(), total))
     }
 
@@ -607,7 +607,7 @@ impl ExplorerDb {
             "SELECT block_height,address,pubkey,power,commission_bps,status
              FROM validator_snapshots WHERE block_height = ?1 ORDER BY power DESC",
         )?;
-        let rows = stmt.query_map(params![height], |row| row_to_validator_snapshot(row))?;
+        let rows = stmt.query_map(params![height], row_to_validator_snapshot)?;
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 

@@ -193,7 +193,7 @@ pub struct PublicKey(pub [u8; 32]);
 /// Scope of actions a session key is authorized to perform.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SessionScope {
-    /// PlaceOrder, CancelOrder, ModifyOrder, CancelAllOrders only.
+    /// PlaceOrder, PlaceOrderBatch, CancelOrder, ModifyOrder, CancelAllOrders only.
     Trading,
     /// TransferToPerp, TransferToSpot only.
     TransfersOnly,
@@ -205,9 +205,17 @@ pub enum SessionScope {
 impl SessionScope {
     pub fn allows(&self, action: &NativeAction) -> bool {
         match self {
+            // LOCKSTEP-DEPLOY WARNING (O2/G3): scope is enforced on the
+            // CONSENSUS path too (eip712.rs batch verify guard) — on an old
+            // validator a Trading-scoped PlaceOrderBatch resolves to None,
+            // which the exec pipeline treats as an invalid signature and
+            // SLASHES + TOMBSTONES the block's PROPOSER (app.rs invalid-
+            // attestation arm). The ENTIRE fleet must run this change before
+            // any client signs batches under a Trading-scoped session.
             SessionScope::Trading => matches!(
                 action,
                 NativeAction::PlaceOrder(_)
+                    | NativeAction::PlaceOrderBatch(_)
                     | NativeAction::CancelOrder { .. }
                     | NativeAction::ModifyOrder { .. }
                     | NativeAction::CancelAllOrders { .. }
@@ -438,7 +446,7 @@ impl CompactBlock {
         let hashes = block
             .native_actions
             .iter()
-            .map(|a| compute_action_hash(a))
+            .map(compute_action_hash)
             .collect();
         Self {
             header: block.header.clone(),
@@ -452,6 +460,25 @@ impl CompactBlock {
 // ============================================================================
 // Native Action Types (§5.6)
 // ============================================================================
+
+/// Max orders a single `PlaceOrderBatch` may carry — the consensus-facing
+/// safety ceiling. SINGLE SOURCE OF TRUTH for every enforcement layer:
+/// RPC ingress + gossip/DA admission (torus-mempool `rate_limit` re-exports
+/// this) and the deterministic exec-side skip (torus-bridge
+/// `NativeExecutor::execute_batch` flatten). Lives here because torus-bridge
+/// cannot depend on torus-mempool (both depend on torus-types).
+pub const NATIVE_ORDERS_PER_BATCH_CAP: usize = 1024;
+
+/// The consensus batch-size validity rule, as one function so every
+/// enforcement layer (RPC `validate_batch_size`, gossip/DA admission, and the
+/// exec-side skip) agrees byte-for-byte. A `PlaceOrderBatch` is valid iff it
+/// carries `[1, NATIVE_ORDERS_PER_BATCH_CAP]` orders — empty and oversize both
+/// fail. Callers own their own error text; only the predicate is shared, so the
+/// rule can never drift between the layer that admits and the layer that skips.
+#[inline]
+pub fn batch_len_within_cap(len: usize) -> bool {
+    (1..=NATIVE_ORDERS_PER_BATCH_CAP).contains(&len)
+}
 
 /// All native (non-EVM) actions processed by torus-core.
 /// Analogous to Hyperliquid's ~70 HyperCore action types.

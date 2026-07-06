@@ -75,7 +75,7 @@ use crate::{
 /// method bodies depend on and **only on** the information that is available through the public methods
 /// of their request type. In particular, this means not reading the block tree through a
 /// `BlockTreeSnapshot`, but reading it only through [`AppBlockTreeView`].
-
+///
 /// # Timing requirements
 ///
 /// HotStuff-rs calls `produce_block` when a replica has to produce a block, and calls `validate_block`
@@ -293,7 +293,7 @@ impl<'a, 'b, K: KVStore> ValidateBlockRequest<'a, 'b, K> {
 
     /// Get a current view of the block tree that this `validate_block` call can safely read from without
     /// risking [non-determinism](Self#determinism-requirements).
-    pub fn block_tree(&self) -> &AppBlockTreeView<K> {
+    pub fn block_tree(&self) -> &AppBlockTreeView<'_, K> {
         &self.block_tree_view
     }
 }

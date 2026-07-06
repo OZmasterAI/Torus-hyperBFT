@@ -67,12 +67,20 @@ Testnet state: STOPPED 2026-07-05 20:43Z at height 1,114,439 / view 1,198,460
   pull the fast path). Compiled default stays 512KB. → RELAUNCH follow-ups:
   seed-only WAN A/B 512KB vs clamped-4MB; likely DROP the 6MB env from
   seed+val1 (it forces 2.8MB WAN pushes and now clamps anyway).
-- [ ] **O2 PlaceOrderBatch** — one signed action carrying Vec of orders: one
-  ecrecover + one manifest entry per batch. Collapses the ~1700-orders/block
-  wire cap and per-order sig cost; prerequisite for 20k-order blocks (200k/s
-  target, mem 9af8b543816e63f7). NEEDS WRITING-PLANS: EIP-712 schema, executor
-  path, atomic-vs-partial batch failure semantics, RPC surface. Depends on O5
-  to be benchable end-to-end.
+- [ ] **O2 PlaceOrderBatch** — CORRECTION: feature SHIPPED 2026-06-06 as Phase B
+  B1–B5 (b58f858) — one ecrecover + one manifest entry per batch; the old entry
+  ("NEEDS WRITING-PLANS") was stale (premise fix: mem 27a66377be573bc0). S416
+  close-out (design docs/plans/o2-placeorderbatch-design.md, impl
+  docs/plans/o2-placeorderbatch-impl.md): deterministic exec-side batch cap
+  (skip-wholesale at the execute_batch flatten, G1) + gossip/DA-admit checks;
+  order-aware selection budget (order_count → NATIVE_ORDERS_PER_BLOCK_CAP, G2);
+  SessionScope::Trading += PlaceOrderBatch (G3, LOCKSTEP: whole fleet before
+  clients sign Trading-scoped batches); partial-per-order contract pinned by
+  test (G4); PlaceOrderBatch golden vectors multi+single (G5 — TS parity in
+  torus-trading-app is an external follow-up); exec_place_batch criterion
+  bench + BS={1,100,400,1024} sweep script (G6,
+  devnet/sweep-o2-batchsize-s416.sh). REMAINING to check off: run the sweep
+  (0 wedges, orders/s + block_ms_fit table) and paste the verdict here.
 
 ## Phase 3 — load-tail levers (measurable only with Phase-2 traffic)
 

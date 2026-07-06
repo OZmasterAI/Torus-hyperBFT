@@ -373,6 +373,50 @@ fn all_vectors() -> Vec<Vector> {
                 maintenance_margin_bps: 300,
             }),
         ),
+        // O2/G5: the action market makers actually sign. Multi-order + a
+        // batch-of-ONE — the latter pins that PlaceOrderBatch([x]) hashes
+        // DIFFERENTLY from PlaceOrder(x) (distinct PlaceOrderItem typehash,
+        // item hash carries no nonce); the struct-hash-uniqueness assert in
+        // write_eip712_fixture_file enforces the non-collision. Inner order
+        // of the batch-of-one deliberately equals PlaceOrder_Limit_Buy_GTC.
+        build_vector(
+            "PlaceOrderBatch_TwoOrders",
+            NativeAction::PlaceOrderBatch(vec![
+                PlaceOrderParams {
+                    market_id: 1,
+                    is_buy: true,
+                    price: FixedPoint::from_raw(6_500_000_000_000),
+                    quantity: FixedPoint::from_raw(10_000_000),
+                    order_type: OrderType::Limit,
+                    time_in_force: TimeInForce::GTC,
+                    reduce_only: false,
+                    client_order_id: Some(42),
+                },
+                PlaceOrderParams {
+                    market_id: 2,
+                    is_buy: false,
+                    price: FixedPoint::from_raw(3_200_000_000_000),
+                    quantity: FixedPoint::from_raw(5_000_000),
+                    order_type: OrderType::Limit,
+                    time_in_force: TimeInForce::PostOnly,
+                    reduce_only: false,
+                    client_order_id: None,
+                },
+            ]),
+        ),
+        build_vector(
+            "PlaceOrderBatch_SingleOrder",
+            NativeAction::PlaceOrderBatch(vec![PlaceOrderParams {
+                market_id: 1,
+                is_buy: true,
+                price: FixedPoint::from_raw(6_500_000_000_000),
+                quantity: FixedPoint::from_raw(10_000_000),
+                order_type: OrderType::Limit,
+                time_in_force: TimeInForce::GTC,
+                reduce_only: false,
+                client_order_id: Some(42),
+            }]),
+        ),
     ]
 }
 

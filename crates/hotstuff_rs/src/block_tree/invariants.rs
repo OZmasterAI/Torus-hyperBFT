@@ -107,7 +107,7 @@
 //! This section explains how the methods in this module work together to maintain blockchain
 //! consistency. The discussion is split into two parts:
 //! 1. First, [Locking](#locking) discusses an intermediate state that blocks enter after being inserted
-//! but before being committed, that is, being "Locked".
+//!    but before being committed, that is, being "Locked".
 //! 2. Then, [Committing](#committing) discusses how blocks move between being locked into being committed.
 //!
 //! ## Locking

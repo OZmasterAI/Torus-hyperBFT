@@ -706,3 +706,118 @@ fn same_sender_multi_market_settle_balance_exact() {
     assert_eq!(pos2.size, fp(1), "A's mkt2 position size must be 1");
     assert_eq!(pos2.entry_price, fp(50), "A's mkt2 entry price must be maker 50");
 }
+
+// ============================================================================
+// Test 12: O2 contract pin — mixed pass/fail batch: per-order isolation,
+// failed order consumes NO order-id, state == equivalent singles minus failed
+// ============================================================================
+
+#[test]
+fn mixed_batch_pass_fail_pins_partial_per_order_contract() {
+    // Run A: one batch [ok, margin-fail, ok]. Margin per order = price*qty/20
+    // (default max leverage, native_executor.rs:591-599): 100*10/20 = 50.
+    // Fund 120: order0 reserves 50 (70 left), order1 needs 100*40/20 = 200
+    // -> FAILS, order2 reserves 50 (20 left) — isolation from the failure.
+    let (_dir, db) = open_test_db();
+    let mut ctx_batch = make_ctx(db.clone());
+    let mm = addr(1);
+    fund_native(&ctx_batch, &mm, fp(120));
+
+    let batch = NativeAction::PlaceOrderBatch(vec![
+        limit_buy(1, 100, 10), // 50 — ok
+        limit_buy(2, 100, 40), // 200 — insufficient margin — FAILS
+        limit_buy(3, 100, 10), // 50 — ok (must be unaffected by #1's failure)
+    ]);
+    let id0 = ctx_batch.next_global_order_id;
+    let res = NativeExecutor::execute_batch(&mut ctx_batch, &[(mm, batch)]);
+
+    assert_eq!(res.results.len(), 3, "flattened: one result per order");
+    assert!(res.results[0].success, "order 0: {:?}", res.results[0].error);
+    assert!(!res.results[1].success, "order 1 must fail on margin");
+    assert!(res.results[1]
+        .error
+        .as_ref()
+        .unwrap()
+        .contains("insufficient margin"));
+    assert!(
+        res.results[2].success,
+        "order 2 must be isolated from order 1's failure: {:?}",
+        res.results[2].error
+    );
+    // THE contract detail G4 left untested: the margin-fail `continue`
+    // (native_executor.rs:615) precedes ID assignment (:629), so a failed
+    // order consumes NO global order id.
+    assert_eq!(
+        ctx_batch.next_global_order_id,
+        id0 + 2,
+        "failed order must not consume an order id"
+    );
+
+    // Run B: the two GOOD orders as singles on a fresh ctx — end state must match.
+    let (_dir2, db2) = open_test_db();
+    let mut ctx_singles = make_ctx(db2.clone());
+    fund_native(&ctx_singles, &mm, fp(120));
+    let singles: Vec<(Address, NativeAction)> = vec![
+        (mm, NativeAction::PlaceOrder(limit_buy(1, 100, 10))),
+        (mm, NativeAction::PlaceOrder(limit_buy(3, 100, 10))),
+    ];
+    let res_singles = NativeExecutor::execute_batch(&mut ctx_singles, &singles);
+    assert!(res_singles.results.iter().all(|r| r.success));
+
+    let b = ctx_batch.positions.get_native_balance(&mm).unwrap();
+    let s = ctx_singles.positions.get_native_balance(&mm).unwrap();
+    assert_eq!(b.available, s.available, "available: batch == singles minus failed");
+    assert_eq!(b.order_margin, s.order_margin, "reserved margin: batch == singles minus failed");
+    assert_eq!(
+        ctx_batch.next_global_order_id, ctx_singles.next_global_order_id,
+        "order-id consumption: batch == singles minus failed"
+    );
+    assert_eq!(ctx_batch.trade_index, ctx_singles.trade_index);
+}
+
+// ============================================================================
+// Test 13: G1 — oversize batch is skipped WHOLESALE at exec (deterministic);
+// the block continues and a valid sibling action still executes
+// ============================================================================
+
+#[test]
+fn oversize_batch_skipped_deterministically_sibling_executes() {
+    use torus_types::NATIVE_ORDERS_PER_BATCH_CAP;
+    let (_dir, db) = open_test_db();
+    let mut ctx = make_ctx(db.clone());
+    let attacker = addr(1);
+    let honest = addr(2);
+    fund_native(&ctx, &attacker, fp(100_000_000));
+    fund_native(&ctx, &honest, fp(100_000));
+
+    // CAP+1 batch crafted DIRECTLY — models a malicious proposer / direct-push
+    // body that never saw the RPC or admit checks.
+    let oversize =
+        NativeAction::PlaceOrderBatch(vec![limit_buy(1, 100, 1); NATIVE_ORDERS_PER_BATCH_CAP + 1]);
+    let sibling = NativeAction::PlaceOrder(limit_buy(2, 50, 1));
+
+    let id0 = ctx.next_global_order_id;
+    let res = NativeExecutor::execute_batch(&mut ctx, &[(attacker, oversize), (honest, sibling)]);
+
+    // Whole batch skipped at flatten: only the sibling's result exists, only
+    // one order id consumed, zero attacker margin reserved.
+    assert_eq!(res.results.len(), 1, "oversize batch must not flatten into results");
+    assert!(res.results[0].success, "sibling: {:?}", res.results[0].error);
+    assert_eq!(ctx.next_global_order_id, id0 + 1, "no ids for the skipped batch");
+    assert_eq!(
+        ctx.positions.get_native_balance(&attacker).unwrap().order_margin,
+        FixedPoint::ZERO,
+        "skipped batch must reserve nothing"
+    );
+
+    // Boundary: an AT-CAP batch still executes (flattens to CAP results;
+    // book-level per-trader caps may reject some — length is the invariant).
+    let at_cap =
+        NativeAction::PlaceOrderBatch(vec![limit_buy(1, 100, 1); NATIVE_ORDERS_PER_BATCH_CAP]);
+    let res2 = NativeExecutor::execute_batch(&mut ctx, &[(attacker, at_cap)]);
+    assert_eq!(res2.results.len(), NATIVE_ORDERS_PER_BATCH_CAP);
+
+    // Empty batch: skipped by the same rule (mirrors validate_batch_size).
+    let res3 = NativeExecutor::execute_batch(&mut ctx, &[(attacker, NativeAction::PlaceOrderBatch(vec![]))]);
+    assert_eq!(res3.results.len(), 0);
+}

@@ -149,7 +149,7 @@ pub struct Metrics {
     /// Sub-phase decomposition of one `execute_batch` call (s372). `exec_engine`
     /// above times the whole native section (two execute_batch calls + governance
     /// + fees + epoch); these three split a single call into margin reservation /
-    /// parallel matching / settlement so we can see which phase dominates.
+    ///   parallel matching / settlement so we can see which phase dominates.
     pub exec_phase_margin_seconds: Histogram,
     pub exec_phase_match_seconds: Histogram,
     pub exec_phase_settle_seconds: Histogram,
