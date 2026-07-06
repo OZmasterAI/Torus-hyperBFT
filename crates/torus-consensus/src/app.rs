@@ -612,6 +612,13 @@ pub struct TorusApp {
     /// by-hash on a reconstruction miss. Injected at startup over `/torus/native-da/1.0`;
     /// `None` in consensus-only tests (no fetch fires).
     da_fetcher: Option<Arc<dyn NativeDaFetcher>>,
+    /// BS-4a: off-thread recovery of push-missed native-action bodies. The hot
+    /// validate path hands true push misses here (non-blocking) and fails the
+    /// view with MissingData; the worker pulls with the roomier ~1 s WORKER
+    /// budget so the re-proposed view finds the bodies durably local. `None`
+    /// when the mempool or fetcher is absent (consensus-only tests) — a miss
+    /// then fails the view without a handoff, same as before BS-4a.
+    da_recovery: Option<DaRecoveryWorker>,
 }
 
 /// Actions the proposer pushes to validators via unicast before broadcasting CompactBlock.
@@ -706,6 +713,7 @@ fn recover_bodies_bounded(
     retries: usize,
     delay: std::time::Duration,
     metrics: Option<&torus_telemetry::Metrics>,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> bool {
     if missing.is_empty() {
         return true;
@@ -738,6 +746,13 @@ fn recover_bodies_bounded(
     // deadline keeps the total budget honest regardless of load.
     let deadline = std::time::Instant::now() + delay * retries as u32;
     loop {
+        // BS-4a worker shutdown: abandon the in-flight budget the moment the caller
+        // cancels — a dying node has no use for the bodies (a dropped pull just
+        // re-fires on the re-proposed view). Bounds Drop-join to ~one slice + O(1).
+        // The SYNC caller passes None, so its behavior is bit-identical.
+        if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
+            return false;
+        }
         let now = std::time::Instant::now();
         if now >= deadline {
             break;
@@ -782,7 +797,6 @@ const WORKER_PULL_DELAY: std::time::Duration = std::time::Duration::from_millis(
 /// `Drop` must close the channel BEFORE joining, and the only way to drop a
 /// field early is `Option::take` — same shape as the O3 `BackgroundCfWriter`
 /// (torus-state/src/bg_writer.rs).
-#[allow(dead_code)] // wired in BS-4a Task 4
 struct DaRecoveryWorker {
     tx: Option<std::sync::mpsc::SyncSender<Vec<torus_types::B256>>>,
     handle: Option<std::thread::JoinHandle<()>>,
@@ -793,12 +807,13 @@ struct DaRecoveryWorker {
 /// submits arrive at view cadence (~2/s) while the worker drains at ~1/s (each
 /// unrecoverable batch burns the full ~1 s budget), so an UNBOUNDED channel would
 /// grow without limit AND make shutdown drain block queue_depth × ~1 s. Capping at
-/// 8 bounds both: memory (≤ 8 queued batches) and shutdown latency (see `Drop`). A
-/// full queue means recovery is already saturated — dropping the newest batch is
-/// harmless, the re-proposed view resubmits the same hashes next view.
+/// 8 bounds both: memory (≤ 8 queued batches) and shutdown latency (see `Drop`).
+/// Since Fix A the worker COALESCES all pending batches into one cycle (drains up
+/// to cap+1 per ~1 s), so a full queue is pathological-only and dropping a Full
+/// try_send is truly harmless — the re-proposed view resubmits those hashes, which
+/// get coalesced into the next cycle rather than starving behind the backlog.
 const WORKER_QUEUE_CAP: usize = 8;
 
-#[allow(dead_code)] // wired in BS-4a Task 4
 impl DaRecoveryWorker {
     /// Spawn the recovery thread. It owns clones of the mempool/fetcher Arcs, so
     /// it needs nothing from `TorusApp` and stays alive until the channel closes.
@@ -817,7 +832,7 @@ impl DaRecoveryWorker {
                 // recv() yields queued batches even after the sender is dropped,
                 // then errors — the shutdown flag below turns that drain into an
                 // early exit so a dying node never spends budget on stale work.
-                while let Ok(batch) = rx.recv() {
+                while let Ok(mut batch) = rx.recv() {
                     // Shutdown wins immediately: queued recovery work is worthless
                     // on a node that is going down. Unlike O3's DB writes there is
                     // NO data-loss concern here (a dropped pull just re-fires on the
@@ -826,9 +841,24 @@ impl DaRecoveryWorker {
                     if worker_shutdown.load(std::sync::atomic::Ordering::Relaxed) {
                         break;
                     }
-                    // A hash may have landed (late push, pre-warm, another batch)
-                    // while this one sat queued — drop what's already in the store
-                    // so we never fire a redundant network fetch.
+                    // BS-4a Fix A (coalesce): drain everything else pending into THIS
+                    // cycle before the dedup, so a fresh recoverable batch never
+                    // starves behind a queue of dead ones (each of which would burn
+                    // the full ~1 s budget FIFO). The queue drains in gulps of up to
+                    // cap+1 batches per ~1 s cycle, so a Full try_send is now
+                    // pathological-only and the drop-is-harmless claim holds: a
+                    // dropped resubmit is coalesced into the next cycle.
+                    while let Ok(more) = rx.try_recv() {
+                        batch.extend(more);
+                    }
+                    // Dedup the merged set: the same hash resubmitted across views (or
+                    // shared between coalesced batches) would otherwise appear multiple
+                    // times — recover_bodies_bounded iterates `missing` per tick, so
+                    // duplicates are wasteful, not harmful. Then drop hashes already
+                    // durably local (late push, pre-warm, an earlier merged batch) so
+                    // we never fire a redundant network fetch.
+                    batch.sort_unstable();
+                    batch.dedup();
                     let still_missing: Vec<torus_types::B256> = batch
                         .into_iter()
                         .filter(|h| mempool.get_native_da(h).is_none())
@@ -836,6 +866,11 @@ impl DaRecoveryWorker {
                     if still_missing.is_empty() {
                         continue;
                     }
+                    // A recoverable hash merged with never-arriving (dead) hashes is
+                    // still recovered mid-loop: absorb_fetched_bodies stores each body
+                    // the moment it arrives, even though the batch's overall return is
+                    // false when the dead hashes never land. `Some(&worker_shutdown)`
+                    // lets Drop abandon the in-flight budget at the next slice (Fix C).
                     recover_bodies_bounded(
                         &mempool,
                         fetcher.as_ref(),
@@ -843,6 +878,7 @@ impl DaRecoveryWorker {
                         WORKER_PULL_RETRIES,
                         WORKER_PULL_DELAY,
                         metrics.as_deref(),
+                        Some(&worker_shutdown),
                     );
                 }
             })
@@ -881,10 +917,12 @@ impl Drop for DaRecoveryWorker {
         // Signal shutdown BEFORE closing the channel: the worker checks the flag
         // right after each recv() Ok and bails, so batches still queued (≤
         // WORKER_QUEUE_CAP) are DISCARDED in O(1), not drained (no data-loss concern
-        // here — dropped pulls re-fire on the re-proposed view). Join is therefore
-        // bounded by at most ONE in-flight batch already inside
-        // recover_bodies_bounded (deadline-bounded ≤ ~1 s) plus O(1). Closing tx
-        // then unblocks a worker parked in recv().
+        // here — dropped pulls re-fire on the re-proposed view). Since Fix C the
+        // in-flight batch inside recover_bodies_bounded also observes this flag
+        // (passed as `cancel`) at the top of its wait loop, so it abandons its
+        // budget at the NEXT ~20 ms slice boundary instead of running the full
+        // ~1 s. Join is therefore bounded by ~one slice + O(1). Closing tx then
+        // unblocks a worker parked in recv().
         self.shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
         drop(self.tx.take());
         if let Some(h) = self.handle.take() {
@@ -896,22 +934,14 @@ impl Drop for DaRecoveryWorker {
     }
 }
 
-/// Bounded LOCAL retry on the hot validate path: a racing pre-proposal PUSH that lands
-/// just after the CompactBlock usually arrives within this window, so the common case
-/// never touches the network (keeps the pull rare). 5 × 20 ms = 100 ms.
-const RECONSTRUCT_RETRIES: usize = 5;
+/// Bounded LOCAL retry on the hot validate path (BS-4a): ONE 20 ms wake-on-arrival
+/// slice, just enough to catch the racing pre-proposal PUSH that lands right after
+/// the CompactBlock (the common case; keeps recovery rare). OPEN QUESTION: the
+/// racing-push window distribution is unmeasured — measure on devnet before
+/// finalizing the consts (1 vs 2 slices). The old 5 × 20 ms in-line budget moved
+/// off-thread to the recovery worker (`WORKER_PULL_RETRIES`/`WORKER_PULL_DELAY`).
+const RECONSTRUCT_RETRIES: usize = 1;
 const RECONSTRUCT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(20);
-
-/// SHORT hot-path PULL budget (#4 Task 1 — the un-wedge): when the LOCAL retry still
-/// misses (a true push miss), the hot validate path fires a bounded native-DA pull and
-/// re-checks instead of giving up. 8 × 20 ms = 160 ms. Combined with the local retry
-/// (100 ms) the hot path blocks ≤ 260 ms — well under the 500 ms view timeout
-/// (`hot_pull_budget_under_view_timeout`), so a body that cannot be pulled in-budget
-/// fails the view (re-proposed next view) rather than hanging past it. Distinct from the
-/// ~1 s SYNC budget (`PULL_RETRIES`/`PULL_DELAY`), which may safely block because it is
-/// off the consensus voting path (mem 8ee99db3).
-const HOT_PULL_RETRIES: usize = 8;
-const HOT_PULL_DELAY: std::time::Duration = std::time::Duration::from_millis(20);
 
 impl TorusApp {
     pub fn new(
@@ -1036,6 +1066,7 @@ impl TorusApp {
             leader_state,
             pre_proposal_tx: None,
             da_fetcher: None,
+            da_recovery: None,
         }
     }
 
@@ -1049,7 +1080,21 @@ impl TorusApp {
 
     /// Attach the RARE pull-fallback transport (Task 6). Called once at startup with
     /// a handle over the `/torus/native-da/1.0` protocol.
+    ///
+    /// BS-4a: when a mempool (durable DA store) is wired too, this also spawns the
+    /// off-thread `DaRecoveryWorker` over the same fetcher. Calling this again
+    /// replaces the worker — the assignment drops the previous one, whose `Drop`
+    /// joins the thread (bounded ≤ ~1 s), so no thread leaks. With no mempool the
+    /// fetcher is stored but the worker stays `None`: a hot-path miss then fails
+    /// the view without a handoff, same as the pre-BS-4a no-mempool behavior.
     pub fn set_native_da_fetcher(&mut self, fetcher: Arc<dyn NativeDaFetcher>) {
+        if let Some(ref mempool) = self.mempool {
+            self.da_recovery = Some(DaRecoveryWorker::spawn(
+                mempool.clone(),
+                fetcher.clone(),
+                self.metrics.clone(),
+            ));
+        }
         self.da_fetcher = Some(fetcher);
     }
 
@@ -1234,10 +1279,10 @@ impl TorusApp {
     /// the durable DA store, polling `retries` times with `delay` between drains. Returns
     /// `true` once all are present (or were already), `false` on timeout.
     ///
-    /// The budget is the caller's: the SYNC path passes the ~1 s `PULL_RETRIES`/`PULL_DELAY`
-    /// (safe to block off the voting path); the HOT validate path passes the short
-    /// `HOT_PULL_RETRIES`/`HOT_PULL_DELAY` (≪ the 500 ms view timeout) so a body that
-    /// can't be pulled in-budget fails the view instead of hanging past it (#4 Task 1).
+    /// The budget is the caller's — and since BS-4a the only caller is the SYNC path,
+    /// with the ~1 s `PULL_RETRIES`/`PULL_DELAY` (safe to block off the voting path).
+    /// The HOT validate path no longer pulls in-line; its off-thread recovery worker
+    /// calls `recover_bodies_bounded` directly with the WORKER budget.
     fn pull_missing_bodies_bounded(
         &self,
         missing: &[torus_types::B256],
@@ -1258,25 +1303,26 @@ impl TorusApp {
             retries,
             delay,
             self.metrics.as_deref(),
+            None, // SYNC path is uncancellable — bit-identical to pre-BS-4a
         )
     }
 
     /// Reconstruct a CompactBlock's native-action bodies for the HOT validate path
-    /// (#4 Task 1). Bodies travel out-of-band (proposer PUSH → durable DA store), so a
+    /// (BS-4a). Bodies travel out-of-band (proposer PUSH → durable DA store), so a
     /// CompactBlock can reference a body the local store does not have yet:
     ///
-    /// 1. Fast local lookup, then a bounded LOCAL retry — a racing pre-proposal PUSH
-    ///    usually lands here (the common case; keeps the pull rare).
-    /// 2. On a remaining miss, fire a SHORT bounded native-DA PULL
-    ///    (`HOT_PULL_RETRIES` × `HOT_PULL_DELAY`, budgeted ≪ the 500 ms view timeout) and
-    ///    re-check. This is the un-wedge: a push miss is now recoverable on the HOT path,
-    ///    not only on sync (mem 8ee99db3 left the hot path pull-free, so a live push miss
-    ///    wedged consensus at high batch_size — mem 28e1a821 / bs=1000).
+    /// 1. Fast local lookup, then ONE bounded wake-on-arrival slice — a racing
+    ///    pre-proposal PUSH usually lands here (the common case; keeps recovery rare).
+    /// 2. On a remaining miss (a true push miss), a NON-BLOCKING handoff to the
+    ///    `DaRecoveryWorker` plus fail-fast `Err` — not an in-line pull. The worker
+    ///    owns recovery (off-thread, ~1 s budget), so the re-proposed view finds
+    ///    the bodies durably local.
     ///
-    /// Returns the reconstructed actions (in `hashes` order) when every body is present
-    /// in-budget, or `Err(missing_count)` so the caller votes MissingData — failing THIS
-    /// view (re-proposed next view, by which point the body has likely arrived) rather
-    /// than blocking past the view timeout. Only call with a non-empty `hashes`.
+    /// Consensus-thread budget: one ~20 ms slice plus bookkeeping. Returns the
+    /// reconstructed actions (in `hashes` order) when every body is present, or
+    /// `Err(missing_count)` so the caller votes MissingData — NOT Invalid, no
+    /// blacklisting (mem 28e1a821 lineage): the block is simply re-proposed next
+    /// view. Only call with a non-empty `hashes`.
     fn reconstruct_native_actions_hot(
         &self,
         hashes: &[torus_types::B256],
@@ -1305,7 +1351,7 @@ impl TorusApp {
             // S391 wake-on-arrival: block on the DA-store arrival notifier with the
             // same 20ms slice instead of a fixed sleep — a racing push wakes this
             // thread at delivery time, while the worst case stays the old tick
-            // cadence (the ≤260ms hot-path budget is unchanged).
+            // cadence (one ~20ms slice since BS-4a shrank RECONSTRUCT_RETRIES).
             let mut seen = torus_state::NativeDaStore::arrival_generation();
             // Deadline-bounded like the pull loop below (S395): iteration-count
             // bounds stack scheduler overshoot past the hot budget under load.
@@ -1343,24 +1389,14 @@ impl TorusApp {
             }
         }
 
-        // (2) HOT pull-fallback (#4 Task 1): the push truly missed — pull the bodies
-        // by-hash on the HOT path too, with a SHORT budget so we never block past the
-        // view timeout. Reuses the proven sync pull infra (mem 4d99a78e) with hot consts.
+        // (2) BS-4a: a true push miss no longer burns the consensus thread on an
+        // in-line pull. Hand the misses to the recovery worker (off-thread, roomier
+        // budget) and fail THIS view — MissingData, re-proposed next view, by which
+        // point the worker has the bodies durably local. mem 7efe7062.
         if !missing.is_empty() {
-            let missing_hashes: Vec<torus_types::B256> =
-                missing.iter().map(|&i| hashes[i]).collect();
-            if self.pull_missing_bodies_bounded(&missing_hashes, HOT_PULL_RETRIES, HOT_PULL_DELAY) {
-                missing.retain(|&i| match mempool.get_native_da(&hashes[i]) {
-                    Some(action) => {
-                        actions[i] = Some(action);
-                        false
-                    }
-                    None => true,
-                });
+            if let Some(ref worker) = self.da_recovery {
+                worker.submit(missing.iter().map(|&i| hashes[i]).collect());
             }
-        }
-
-        if !missing.is_empty() {
             return Err(missing.len());
         }
         Ok(actions
@@ -3111,12 +3147,16 @@ mod crash_recovery_tests {
     }
 
     /// BS-4a: dropping the worker with an in-flight batch AND a queued backlog must
-    /// join within ~one batch budget — queued batches are DISCARDED via the shutdown
-    /// flag, not drained (old defect: drop drained queue_depth x ~1s). Uses a
-    /// never-delivering fetcher so every batch would burn the full ~1s budget if
-    /// processed; the 3s bound cleanly separates fixed (~1s) from regressed (~9s)
-    /// while staying load-tolerant (elapsed bounds flake under parallel-suite load,
-    /// mem 96dfce88).
+    /// join fast. Queued batches are DISCARDED via the shutdown flag (old defect:
+    /// drop drained queue_depth x ~1s), and since Fix C the IN-FLIGHT batch inside
+    /// recover_bodies_bounded also observes the flag (`cancel`) at the top of its
+    /// wait loop, so it abandons its ~1s budget at the NEXT ~20ms slice boundary
+    /// after the flag is set instead of running to completion. Uses a
+    /// never-delivering fetcher so any processed batch would otherwise burn the full
+    /// ~1s budget; the 3s bound is the regression separator — it cleanly separates
+    /// fixed (≤~100ms: one slice) from regressed (≥~1s in-flight, up to ~9s without
+    /// coalesce) while staying load-tolerant (elapsed bounds flake under
+    /// parallel-suite load, mem 96dfce88).
     #[test]
     fn recovery_worker_drop_discards_backlog_and_joins_bounded() {
         let (_config, state_db) = make_test_config_and_db();
@@ -3125,74 +3165,31 @@ mod crash_recovery_tests {
             torus_mempool::MempoolConfig::default(),
         ));
 
-        // NeverFetcher delivers nothing, so each batch runs the full ~1s budget if
-        // processed — 9 backlogged batches would take ~9s to drain, ~1s to discard.
+        // NeverFetcher delivers nothing, so the in-flight batch would burn the full
+        // ~1s budget if it were not cancellable — the regression this test guards.
         let worker = DaRecoveryWorker::spawn(mempool.clone(), Arc::new(NeverFetcher), None);
 
         // 9 distinct single-hash batches: never-arriving hashes, so the worker's
-        // store-check dedup can't drop them. First is taken in-flight; the next 8
-        // fill the cap-8 queue (a 9th queued would warn+drop — fine either way).
+        // store-check dedup can't drop them. First is taken in-flight; the rest are
+        // coalesced into that same cycle (Fix A drains the queue via try_recv), so a
+        // 9th queued would warn+drop — fine either way.
         for nonce in 100u64..109 {
             let hash = torus_types::compute_action_hash(&sign_claim_rewards(nonce));
             worker.submit(vec![hash]);
         }
 
-        // Let the worker pick up one batch in-flight (now inside recover_bodies_bounded).
+        // Let the worker pick up a batch in-flight (now inside recover_bodies_bounded,
+        // parked in its wait loop where the cancel check lives).
         std::thread::sleep(std::time::Duration::from_millis(50));
 
         let t = std::time::Instant::now();
         drop(worker);
         let elapsed = t.elapsed();
-        // Visible under `--nocapture`: fixed ≈ one budget (~1s), regressed ≈ 9s.
+        // Visible under `--nocapture`: fixed ≈ one slice (≤~100ms), regressed ≥~1s.
         println!("drop-join elapsed: {elapsed:?}");
         assert!(
             elapsed < std::time::Duration::from_secs(3),
             "drop must not drain the backlog: took {elapsed:?}",
-        );
-    }
-
-    /// #4 Task 1 (RED first): a CompactBlock body absent from the local DA store is
-    /// recovered on the HOT validate path via a SHORT bounded native-DA pull — not only
-    /// on the sync path. Until now the hot path was pull-free by design (mem 8ee99db3) to
-    /// protect the view timeout, so a live PUSH miss was unrecoverable and wedged consensus
-    /// at high batch_size (mem 28e1a821 / bs=1000). The body is delivered by the fetcher a
-    /// few drains in; only a hot-path PULL drains the fetcher, so this passes ONLY once the
-    /// hot path pulls. MUST fail before Task 1 lands.
-    #[test]
-    fn hot_path_pulls_missing_body_within_budget() {
-        let (config, state_db) = make_test_config_and_db();
-        let mempool = Arc::new(torus_mempool::Mempool::new(
-            state_db.clone(),
-            torus_mempool::MempoolConfig::default(),
-        ));
-        let mut app = TorusApp::new(state_db.clone(), &config, None, Some(mempool.clone()), None);
-
-        let action = sign_claim_rewards(7);
-        let hash = torus_types::compute_action_hash(&action);
-        let body = bincode::serialize(&action).expect("serialize body");
-        // Delivered on the 3rd drain — within the hot budget (HOT_PULL_RETRIES drains).
-        let fetcher = Arc::new(LateFetcher {
-            body,
-            deliver_on_drain: 3,
-            drains: std::sync::atomic::AtomicUsize::new(0),
-        });
-        app.set_native_da_fetcher(fetcher);
-
-        assert!(
-            mempool.get_native_da(&hash).is_none(),
-            "body absent before the hot pull"
-        );
-        let actions = app
-            .reconstruct_native_actions_hot(&[hash])
-            .expect("hot path must pull + recover the missing body");
-        assert_eq!(
-            actions.len(),
-            1,
-            "the recovered action is returned (in hash order)"
-        );
-        assert!(
-            mempool.get_native_da(&hash).is_some(),
-            "the recovered body landed in the durable DA store",
         );
     }
 
@@ -3243,11 +3240,12 @@ mod crash_recovery_tests {
         );
     }
 
-    /// #4 Task 1 (RED first): when the body NEVER arrives, the hot path must FAIL THE VIEW
-    /// (Err with the missing count) and return WITHIN the hot budget — it must not block
-    /// past the 500 ms view timeout (which would burn the view and worsen the wedge). The
-    /// block is simply re-proposed next view, by which point the body has likely arrived.
-    /// MUST fail before Task 1 (today the hot path is neither pull-backed nor pull-bounded).
+    /// BS-4a: when the body NEVER arrives, the hot path must FAIL THE VIEW (Err with
+    /// the missing count) FAST — the contract is now fail-fast (one ~20 ms local slice
+    /// + a non-blocking worker handoff), not merely under the 500 ms view timeout. The
+    /// block is simply re-proposed next view. The 80 ms bound is 4x the 20 ms slice:
+    /// under parallel-suite load elapsed bounds can flake (mem 96dfce88), so keep
+    /// headroom above the nominal slice.
     #[test]
     fn hot_path_fails_view_fast_when_body_never_arrives() {
         let (config, state_db) = make_test_config_and_db();
@@ -3271,24 +3269,31 @@ mod crash_recovery_tests {
             "a never-arriving body fails the view, reporting the missing count",
         );
         assert!(
-            elapsed < std::time::Duration::from_millis(config.timeout_base_ms),
-            "hot path must return within the {}ms view timeout, not hang: took {elapsed:?}",
-            config.timeout_base_ms,
+            elapsed < std::time::Duration::from_millis(80),
+            "hot path must fail fast (one local slice + non-blocking handoff): took {elapsed:?}",
         );
     }
 
-    /// #4 Task 1: the HOT-path reconstruction budget (local retry + short pull) must stay
-    /// strictly under the 500 ms view timeout, so validate_block fails a missed view
-    /// instead of burning it (hotstuff: 4*EWNL + produce + validate < max_view_time). The
-    /// UPPER-bound mirror of `pull_budget_is_at_least_one_second` (the sync LOWER bound).
+    /// BS-4a: both recovery budgets stay within bounds. (a) The consensus-thread share
+    /// of hot reconstruction is ONE local wake-on-arrival slice — well under the 500 ms
+    /// view timeout (hotstuff: 4*EWNL + produce + validate < max_view_time), so
+    /// validate_block fails a missed view instead of burning it. (b) The worker's
+    /// off-thread pull budget stays under ~2 s, so an unrecoverable batch never
+    /// outlives more than a couple of re-propose cycles (which resubmit the same
+    /// hashes anyway). Companion of `pull_budget_is_at_least_one_second` (sync LOWER
+    /// bound). Renamed from `hot_pull_budget_under_view_timeout` — there is no in-line
+    /// hot pull anymore.
     #[test]
-    fn hot_pull_budget_under_view_timeout() {
+    fn recovery_budgets_within_bounds() {
         let local = RECONSTRUCT_RETRY_DELAY * RECONSTRUCT_RETRIES as u32;
-        let pull = HOT_PULL_DELAY * HOT_PULL_RETRIES as u32;
-        let total = local + pull;
         assert!(
-            total < std::time::Duration::from_millis(500),
-            "hot-path budget {total:?} (local {local:?} + pull {pull:?}) must be < 500 ms view timeout",
+            local < std::time::Duration::from_millis(50),
+            "consensus-thread budget {local:?} (one slice) must be well under the 500 ms view timeout",
+        );
+        let worker = WORKER_PULL_DELAY * WORKER_PULL_RETRIES as u32;
+        assert!(
+            worker < std::time::Duration::from_secs(2),
+            "worker pull budget {worker:?} must not outlive a couple of re-propose cycles",
         );
     }
 }
