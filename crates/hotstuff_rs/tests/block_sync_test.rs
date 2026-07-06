@@ -1,4 +1,4 @@
-use std::{thread, time::Duration};
+use std::time::Duration;
 
 use rand_core::OsRng;
 
@@ -13,7 +13,11 @@ use common::{
     network::mock_network,
     node::Node,
     number_app::{NumberApp, NumberAppTransaction},
+    poll::wait_until,
 };
+
+/// Interval between polls of cluster state.
+const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Tests block sync.
 ///
@@ -77,9 +81,21 @@ fn block_sync_test() {
         None,
         "Polling the app state of the live replicas until each sees the number as 2.",
     );
-    while !live_nodes.iter().all(|node| node.number() == 2) {
-        thread::sleep(Duration::from_millis(500));
-    }
+    wait_until(
+        Duration::from_secs(120),
+        POLL_INTERVAL,
+        "all 3 live replicas to see the number as 2",
+        || live_nodes.iter().all(|node| node.number() == 2),
+        || {
+            format!(
+                "live replica numbers = {:?}",
+                live_nodes
+                    .iter()
+                    .map(|node| node.number())
+                    .collect::<Vec<_>>()
+            )
+        },
+    );
 
     // 3. Test whether the lagging replica can sync up to the live replicas.
 
@@ -94,7 +110,11 @@ fn block_sync_test() {
 
     // 3.2. Poll the app state of the lagging replica until it sees the number as 2.
     log_with_context(None, "Polling the app state of the lagging replica.");
-    while lagging_node.number() != 2 {
-        thread::sleep(Duration::from_millis(500));
-    }
+    wait_until(
+        Duration::from_secs(300),
+        POLL_INTERVAL,
+        "the lagging replica to sync and see the number as 2",
+        || lagging_node.number() == 2,
+        || format!("lagging replica number = {}", lagging_node.number()),
+    );
 }

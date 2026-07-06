@@ -1,4 +1,4 @@
-use std::{thread, time::Duration};
+use std::time::Duration;
 
 use rand_core::OsRng;
 
@@ -10,7 +10,12 @@ use common::{logging::log_with_context, number_app::NumberApp};
 
 mod common;
 
-use crate::common::{network::mock_network, node::Node, number_app::NumberAppTransaction};
+use crate::common::{
+    network::mock_network, node::Node, number_app::NumberAppTransaction, poll::wait_until,
+};
+
+/// Interval between polls of cluster state.
+const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Tests app state updates and "simple" validator set updates.
 ///
@@ -60,9 +65,18 @@ fn progress_and_validator_set_update_test() {
         None,
         "Polling the app state of every replica until the value is 1.",
     );
-    while !nodes.iter().all(|node| node.number() == 1) {
-        thread::sleep(Duration::from_millis(500));
-    }
+    wait_until(
+        Duration::from_secs(120),
+        POLL_INTERVAL,
+        "every replica to see the number as 1",
+        || nodes.iter().all(|node| node.number() == 1),
+        || {
+            format!(
+                "replica numbers = {:?}",
+                nodes.iter().map(|node| node.number()).collect::<Vec<_>>()
+            )
+        },
+    );
 
     // 3. Test dynamically expanding the validator set.
 
@@ -78,12 +92,25 @@ fn progress_and_validator_set_update_test() {
         None,
         "Polling the validator set of every replica until we have 3 validators.",
     );
-    while !nodes
-        .iter()
-        .all(|node| node.committed_validator_set().len() == 3)
-    {
-        thread::sleep(Duration::from_millis(500));
-    }
+    wait_until(
+        Duration::from_secs(120),
+        POLL_INTERVAL,
+        "every replica to see 3 validators in their committed validator set",
+        || {
+            nodes
+                .iter()
+                .all(|node| node.committed_validator_set().len() == 3)
+        },
+        || {
+            format!(
+                "committed validator set sizes = {:?}",
+                nodes
+                    .iter()
+                    .map(|node| node.committed_validator_set().len())
+                    .collect::<Vec<_>>()
+            )
+        },
+    );
 
     // 4. Test updating the app state now that we have 3 validators.
 
@@ -101,7 +128,16 @@ fn progress_and_validator_set_update_test() {
         None,
         "Polling the app state of every replica until the value is 4",
     );
-    while !nodes.iter().all(|node| node.number() == 4) {
-        thread::sleep(Duration::from_millis(500));
-    }
+    wait_until(
+        Duration::from_secs(120),
+        POLL_INTERVAL,
+        "every replica to see the number as 4",
+        || nodes.iter().all(|node| node.number() == 4),
+        || {
+            format!(
+                "replica numbers = {:?}",
+                nodes.iter().map(|node| node.number()).collect::<Vec<_>>()
+            )
+        },
+    );
 }

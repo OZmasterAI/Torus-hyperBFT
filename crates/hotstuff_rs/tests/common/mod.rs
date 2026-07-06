@@ -12,4 +12,6 @@ pub(crate) mod node;
 
 pub(crate) mod number_app;
 
+pub(crate) mod poll;
+
 pub(crate) mod verifying_key_bytes;
