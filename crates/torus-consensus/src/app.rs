@@ -2872,6 +2872,47 @@ mod crash_recovery_tests {
         );
     }
 
+    /// BS-4a (RED first): a true push miss must NOT block the consensus thread on the
+    /// in-line pull budget. reconstruct returns Err (MissingData) within the shrunken
+    /// local slice, and the RECOVERY WORKER pulls + absorbs the body in the background
+    /// so the re-proposed view finds it locally. MUST fail before BS-4a lands (today
+    /// the hot path blocks ~260ms and returns Ok via the in-line pull).
+    #[test]
+    fn hot_path_hands_off_and_recovers_in_background() {
+        let (config, state_db) = make_test_config_and_db();
+        let mempool = Arc::new(torus_mempool::Mempool::new(
+            state_db.clone(),
+            torus_mempool::MempoolConfig::default(),
+        ));
+        let mut app = TorusApp::new(state_db.clone(), &config, None, Some(mempool.clone()), None);
+
+        let action = sign_claim_rewards(13);
+        let hash = torus_types::compute_action_hash(&action);
+        let body = bincode::serialize(&action).expect("serialize body");
+        let fetcher = Arc::new(LateFetcher {
+            body,
+            deliver_on_drain: 3,
+            drains: std::sync::atomic::AtomicUsize::new(0),
+        });
+        app.set_native_da_fetcher(fetcher);
+
+        let start = std::time::Instant::now();
+        let result = app.reconstruct_native_actions_hot(&[hash]);
+        let elapsed = start.elapsed();
+
+        assert_eq!(result.err(), Some(1), "a push miss fails THIS view immediately");
+        assert!(
+            elapsed < std::time::Duration::from_millis(80),
+            "consensus thread must not run the pull budget in-line: took {elapsed:?}",
+        );
+        // The worker recovers the body off-thread well before the next view.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while mempool.get_native_da(&hash).is_none() {
+            assert!(std::time::Instant::now() < deadline, "worker never recovered the body");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     /// #4 Task 1 (RED first): a CompactBlock body absent from the local DA store is
     /// recovered on the HOT validate path via a SHORT bounded native-DA pull — not only
     /// on the sync path. Until now the hot path was pull-free by design (mem 8ee99db3) to
