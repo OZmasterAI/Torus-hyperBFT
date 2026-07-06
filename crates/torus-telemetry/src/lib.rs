@@ -159,6 +159,9 @@ pub struct Metrics {
     /// Committed blocks handed to the exec channel but not yet fully executed.
     /// Pinned near the channel bound (64) = execution is the bottleneck.
     pub exec_queue_depth: Gauge,
+    /// O3: per-block trade-history batches queued to the background CF writer
+    /// but not yet written. Sustained growth = RocksDB stalling behind exec.
+    pub trade_writer_queued_batches: Gauge,
 
     // View-phase timing (hotstuff replica lifecycle, fed by ViewMetricsRecorder).
     // Decomposes per-leg block cadence per node: leader build + QC collection,
@@ -607,6 +610,13 @@ impl Metrics {
             exec_queue_depth.clone(),
         );
 
+        let trade_writer_queued_batches = Gauge::default();
+        registry.register(
+            "torus_trade_writer_queued_batches",
+            "Trade-history KV batches queued to the background CF writer but not yet written",
+            trade_writer_queued_batches.clone(),
+        );
+
         let view_duration_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 15));
         registry.register(
             "torus_view_duration_seconds",
@@ -778,6 +788,7 @@ impl Metrics {
             exec_flush_seconds,
             exec_block_seconds,
             exec_queue_depth,
+            trade_writer_queued_batches,
             view_duration_seconds,
             view_propose_delay_seconds,
             view_propose_build_seconds,

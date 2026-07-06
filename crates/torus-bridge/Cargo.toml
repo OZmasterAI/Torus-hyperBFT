@@ -34,3 +34,7 @@ criterion = { workspace = true }
 [[bench]]
 name = "exec_batch_margin"
 harness = false
+
+[[bench]]
+name = "exec_batch_trades"
+harness = false

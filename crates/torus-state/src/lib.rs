@@ -1,6 +1,7 @@
 //! RocksDB storage, revm Database trait, and MPT state root computation.
 
 pub mod backend;
+pub mod bg_writer;
 pub mod cf;
 pub mod db;
 pub mod error;
@@ -14,6 +15,7 @@ pub mod trie;
 pub mod trie_cursor;
 
 pub use backend::{AtomicWriteOp, NativeStateOverlay, StateBackend};
+pub use bg_writer::{BackgroundCfWriter, RawCfKv};
 pub use db::StateDb;
 pub use error::StateError;
 pub use native_da::NativeDaStore;

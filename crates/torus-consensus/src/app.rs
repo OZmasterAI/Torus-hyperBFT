@@ -117,6 +117,13 @@ struct ExecutionContext {
     /// time (today's behavior). A HIT is deterministic (== fresh recover), so this
     /// only changes performance, never the resolved sender or state.
     exec_trust_cache: bool,
+    /// O3: background writer for trade-history CFs (node-local, non-root).
+    /// `Some` on the live node — fills buffer their KVs during exec and this
+    /// writer applies them off the execution thread. `None` in tests -> trades
+    /// write inline through the overlay exactly as before O3. Dropped with the
+    /// ExecutionContext at execution-thread exit, which drains the queue before
+    /// `TorusApp::Drop`'s join returns (shutdown flush ordering).
+    trade_writer: Option<torus_state::BackgroundCfWriter>,
 }
 
 // ---- Standalone helpers (used by both execution thread and crash recovery) ----
@@ -398,6 +405,10 @@ impl ExecutionContext {
                 self.dev_pool_address,
             );
             ctx.metrics = self.metrics.clone();
+            // O3: with a background writer present, fills buffer their
+            // trade-history KVs (node-local, non-root CFs) instead of paying
+            // per-fill overlay PUTs; they are handed over after the flush below.
+            ctx.defer_trades = self.trade_writer.is_some();
 
             let engine_timer = std::time::Instant::now();
             NativeExecutor::execute_batch(&mut ctx, &pre_evm);
@@ -449,6 +460,28 @@ impl ExecutionContext {
             }
             if let Some(ref m) = self.metrics {
                 m.exec_flush_seconds.observe(flush_timer.elapsed().as_secs_f64());
+            }
+
+            // O3: hand this block's buffered trade-history KVs to the background
+            // writer — off the execution thread, after the atomic state flush.
+            // Keys are deterministic per block, so a crash-replay rewrite is
+            // idempotent; a hard crash can lose the last few queued batches,
+            // which is a cosmetic RPC trade-history gap, never consensus state.
+            let trades = ctx.take_pending_trades();
+            if !trades.is_empty() {
+                let fallback = match &self.trade_writer {
+                    Some(writer) => writer.send(trades).err(),
+                    None => Some(trades),
+                };
+                // Writer gone (or absent): write synchronously so no rows are lost.
+                if let Some(kvs) = fallback {
+                    for (cf, key, value) in &kvs {
+                        let _ = self.state_db.put_cf_raw(cf, key, value);
+                    }
+                }
+                if let (Some(m), Some(w)) = (&self.metrics, &self.trade_writer) {
+                    m.trade_writer_queued_batches.set(w.queued_batches() as i64);
+                }
             }
         }
 
@@ -717,6 +750,13 @@ impl TorusApp {
             metrics: metrics.clone(),
             mempool: mempool.clone(),
             exec_trust_cache: config.exec_trust_cache,
+            // O3: 256 queued blocks of trade KVs max — a full queue blocks the
+            // execution thread (backpressure) instead of ballooning memory.
+            trade_writer: Some(torus_state::BackgroundCfWriter::spawn(
+                state_db.clone(),
+                "torus-trade-writer",
+                256,
+            )),
         };
 
         // Phase A: ensure the persistent incremental trie exists before any commit (including
@@ -2259,6 +2299,9 @@ mod crash_recovery_tests {
             metrics: None,
             mempool,
             exec_trust_cache,
+            // None -> trades write inline through the overlay (pre-O3 behavior),
+            // keeping these tests' reads deterministic right after execution.
+            trade_writer: None,
         }
     }
 
@@ -2507,6 +2550,79 @@ mod crash_recovery_tests {
                 .is_some(),
             "consumed nonce should be recorded",
         );
+    }
+
+    /// O3: with a background trade writer attached, fills buffer their
+    /// trade-history KVs during exec (`ctx.defer_trades`) and the writer
+    /// persists them off the execution thread. Dropping the ExecutionContext
+    /// closes the writer's channel, drains the queue, and joins — the shutdown
+    /// flush ordering — so every row must be durable afterwards.
+    #[test]
+    fn deferred_trades_reach_db_via_background_writer() {
+        let (config, state_db) = make_test_config_and_db();
+        let mut exec_ctx = make_exec_ctx(&config, &state_db);
+        exec_ctx.trade_writer = Some(torus_state::BackgroundCfWriter::spawn(
+            state_db.clone(),
+            "test-trade-writer",
+            8,
+        ));
+
+        let k_sell = k256::ecdsa::SigningKey::from_slice(&[31u8; 32]).unwrap();
+        let k_buy = k256::ecdsa::SigningKey::from_slice(&[32u8; 32]).unwrap();
+
+        // Block 1: fund native balances through the public path (EVM balance ->
+        // TransferToPerp), so block 2's margin reserve succeeds.
+        let deposit_raw: u128 = 1_000 * FixedPoint::ONE.raw() as u128; // 1000.0
+        let deposit = U256::from(deposit_raw);
+        let mut transfers = Vec::new();
+        for (i, key) in [&k_sell, &k_buy].into_iter().enumerate() {
+            let signed = torus_types::eip712::sign_native_action(
+                NativeAction::TransferToPerp { amount: deposit },
+                9_000 + i as u64,
+                key,
+            );
+            fund_evm_balance(&state_db, signed.recover_sender().unwrap(), deposit);
+            transfers.push(signed);
+        }
+        exec_ctx.execute_committed_block(&make_block(1, transfers), vec![]);
+
+        // Block 2: a resting sell crossed by a buy -> exactly one fill.
+        let order = |is_buy: bool| torus_types::PlaceOrderParams {
+            market_id: 1,
+            is_buy,
+            price: FixedPoint::from_raw(100 * FixedPoint::SCALE),
+            quantity: FixedPoint::from_raw(FixedPoint::SCALE),
+            order_type: torus_types::OrderType::Limit,
+            time_in_force: torus_types::TimeInForce::GTC,
+            reduce_only: false,
+            client_order_id: None,
+        };
+        let sell = torus_types::eip712::sign_native_action(
+            NativeAction::PlaceOrder(order(false)),
+            9_002,
+            &k_sell,
+        );
+        let buy = torus_types::eip712::sign_native_action(
+            NativeAction::PlaceOrder(order(true)),
+            9_003,
+            &k_buy,
+        );
+        exec_ctx.execute_committed_block(&make_block(2, vec![sell, buy]), vec![]);
+
+        // Shutdown flush ordering: drop drains + joins the writer before reads.
+        drop(exec_ctx);
+
+        let trades =
+            StateBackend::iterate_cf(&state_db, torus_state::cf::CF_NATIVE_TRADES, None).unwrap();
+        let user_trades =
+            StateBackend::iterate_cf(&state_db, torus_state::cf::CF_NATIVE_USER_TRADES, None)
+                .unwrap();
+        assert_eq!(
+            trades.len(),
+            1,
+            "one fill -> one trade row via the background writer"
+        );
+        assert_eq!(user_trades.len(), 2, "maker + taker user-trade rows");
     }
 
     #[test]

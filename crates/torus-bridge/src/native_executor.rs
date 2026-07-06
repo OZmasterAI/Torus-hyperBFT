@@ -22,7 +22,7 @@ use torus_economics::{
 };
 use torus_economics::epoch::ValidatorSetDiff;
 use torus_state::cf::{CF_NATIVE_TRADES, CF_NATIVE_USER_TRADES};
-use torus_state::{StateBackend, StateDb};
+use torus_state::{RawCfKv, StateBackend, StateDb};
 use torus_types::{
     FixedPoint, MarketId, NativeAction, OrderType, PlaceOrderParams, PublicKey, SessionScope, Side,
     TimeInForce, U256, ValidatorInfo, ValidatorSet, VoteOption,
@@ -209,6 +209,16 @@ pub struct NativeExecContext<T: StateBackend = StateDb> {
     /// Per-block trade counter for unique trade keys.
     pub trade_index: u32,
 
+    /// O3: when set, trade-history writes (`CF_NATIVE_TRADES` /
+    /// `CF_NATIVE_USER_TRADES` — node-local CFs outside the native consensus
+    /// root, never read during execution) are buffered in `pending_trades`
+    /// instead of PUT into the state backend, for the caller to hand to a
+    /// background writer after all exec phases. Off by default: every existing
+    /// caller keeps inline writes.
+    pub defer_trades: bool,
+    /// Raw trade-history KVs buffered while `defer_trades` is set.
+    pending_trades: Vec<RawCfKv>,
+
     /// Optional metrics handle for Prometheus instrumentation.
     pub metrics: Option<std::sync::Arc<torus_telemetry::Metrics>>,
 }
@@ -261,8 +271,16 @@ impl<T: StateBackend> NativeExecContext<T> {
             dev_pool_address,
             total_native_fees: 0,
             trade_index: 0,
+            defer_trades: false,
+            pending_trades: Vec::new(),
             metrics: None,
         }
+    }
+
+    /// Drain the trade-history KVs buffered under `defer_trades`. The caller
+    /// owns durability from here (background writer, or synchronous fallback).
+    pub fn take_pending_trades(&mut self) -> Vec<RawCfKv> {
+        std::mem::take(&mut self.pending_trades)
     }
 
     /// FIX 1 (ECON-FIND-02): Load order books from DB. Returns (books, next_global_order_id).
@@ -909,57 +927,7 @@ impl NativeExecutor {
         // Persist trades to CF_NATIVE_TRADES and CF_NATIVE_USER_TRADES.
         // These CFs are NOT in the state root, so writes cannot affect consensus.
         for fill in &result.fills {
-            let taker_side: u8 = if fill.maker_side == Side::Buy { 1 } else { 0 };
-
-            // Primary key: market_id(8) + block_number(8) + trade_index(4)
-            let mut trade_key = [0u8; 20];
-            trade_key[..8].copy_from_slice(&market_id.to_be_bytes());
-            trade_key[8..16].copy_from_slice(&ctx.block_height.to_be_bytes());
-            trade_key[16..20].copy_from_slice(&ctx.trade_index.to_be_bytes());
-
-            let trade_id = ctx.trade_index as u128;
-            let price_raw = fill.price.raw();
-            let quantity_raw = fill.quantity.raw();
-
-            // Borsh-serialize trade data (matches StoredTrade layout)
-            let mut trade_data = Vec::with_capacity(64);
-            trade_data.extend_from_slice(&trade_id.to_le_bytes());
-            trade_data.extend_from_slice(&price_raw.to_le_bytes());
-            trade_data.extend_from_slice(&quantity_raw.to_le_bytes());
-            trade_data.push(taker_side);
-            trade_data.extend_from_slice(&ctx.block_height.to_le_bytes());
-            trade_data.extend_from_slice(&ctx.timestamp.to_le_bytes());
-
-            let _ = ctx.state.put_cf_raw(CF_NATIVE_TRADES, &trade_key, &trade_data);
-
-            // Secondary index: per-user trades (descending block order)
-            let desc_block = u64::MAX - ctx.block_height;
-            let mut user_trade_data = Vec::with_capacity(80);
-            user_trade_data.extend_from_slice(&trade_id.to_le_bytes());
-            user_trade_data.extend_from_slice(&market_id.to_le_bytes());
-            user_trade_data.extend_from_slice(&price_raw.to_le_bytes());
-            user_trade_data.extend_from_slice(&quantity_raw.to_le_bytes());
-            user_trade_data.push(taker_side);
-            user_trade_data.push(0u8); // role: maker
-            user_trade_data.extend_from_slice(&ctx.block_height.to_le_bytes());
-            user_trade_data.extend_from_slice(&ctx.timestamp.to_le_bytes());
-
-            // Maker entry
-            let mut maker_key = [0u8; 32];
-            maker_key[..20].copy_from_slice(fill.maker.as_slice());
-            maker_key[20..28].copy_from_slice(&desc_block.to_be_bytes());
-            maker_key[28..32].copy_from_slice(&ctx.trade_index.to_be_bytes());
-            let _ = ctx.state.put_cf_raw(CF_NATIVE_USER_TRADES, &maker_key, &user_trade_data);
-
-            // Taker entry (flip role byte at offset 57: 16+8+16+16+1)
-            user_trade_data[57] = 1u8; // role: taker
-            let mut taker_key = [0u8; 32];
-            taker_key[..20].copy_from_slice(fill.taker.as_slice());
-            taker_key[20..28].copy_from_slice(&desc_block.to_be_bytes());
-            taker_key[28..32].copy_from_slice(&ctx.trade_index.to_be_bytes());
-            let _ = ctx.state.put_cf_raw(CF_NATIVE_USER_TRADES, &taker_key, &user_trade_data);
-
-            ctx.trade_index += 1;
+            Self::persist_trade(ctx, market_id, fill);
         }
 
         if let Some(ref m) = ctx.metrics {
@@ -969,7 +937,9 @@ impl NativeExecutor {
         NativeActionResult::ok("place_order", 1000)
     }
 
-    /// Persist a single fill to CF_NATIVE_TRADES and CF_NATIVE_USER_TRADES.
+    /// Persist a single fill to CF_NATIVE_TRADES and CF_NATIVE_USER_TRADES —
+    /// inline, or buffered for a background writer when `ctx.defer_trades`
+    /// (O3; both CFs are node-local, outside the native consensus root).
     fn persist_trade<T: StateBackend>(
         ctx: &mut NativeExecContext<T>,
         market_id: MarketId,
@@ -977,6 +947,7 @@ impl NativeExecutor {
     ) {
         let taker_side: u8 = if fill.maker_side == Side::Buy { 1 } else { 0 };
 
+        // Primary key: market_id(8) + block_number(8) + trade_index(4)
         let mut trade_key = [0u8; 20];
         trade_key[..8].copy_from_slice(&market_id.to_be_bytes());
         trade_key[8..16].copy_from_slice(&ctx.block_height.to_be_bytes());
@@ -986,6 +957,7 @@ impl NativeExecutor {
         let price_raw = fill.price.raw();
         let quantity_raw = fill.quantity.raw();
 
+        // Borsh-serialize trade data (matches StoredTrade layout)
         let mut trade_data = Vec::with_capacity(64);
         trade_data.extend_from_slice(&trade_id.to_le_bytes());
         trade_data.extend_from_slice(&price_raw.to_le_bytes());
@@ -994,31 +966,47 @@ impl NativeExecutor {
         trade_data.extend_from_slice(&ctx.block_height.to_le_bytes());
         trade_data.extend_from_slice(&ctx.timestamp.to_le_bytes());
 
-        let _ = ctx.state.put_cf_raw(CF_NATIVE_TRADES, &trade_key, &trade_data);
-
+        // Secondary index: per-user trades (descending block order)
         let desc_block = u64::MAX - ctx.block_height;
-        let mut user_trade_data = Vec::with_capacity(80);
-        user_trade_data.extend_from_slice(&trade_id.to_le_bytes());
-        user_trade_data.extend_from_slice(&market_id.to_le_bytes());
-        user_trade_data.extend_from_slice(&price_raw.to_le_bytes());
-        user_trade_data.extend_from_slice(&quantity_raw.to_le_bytes());
-        user_trade_data.push(taker_side);
-        user_trade_data.push(0u8); // role: maker
-        user_trade_data.extend_from_slice(&ctx.block_height.to_le_bytes());
-        user_trade_data.extend_from_slice(&ctx.timestamp.to_le_bytes());
+        let mut maker_data = Vec::with_capacity(80);
+        maker_data.extend_from_slice(&trade_id.to_le_bytes());
+        maker_data.extend_from_slice(&market_id.to_le_bytes());
+        maker_data.extend_from_slice(&price_raw.to_le_bytes());
+        maker_data.extend_from_slice(&quantity_raw.to_le_bytes());
+        maker_data.push(taker_side);
+        maker_data.push(0u8); // role: maker
+        maker_data.extend_from_slice(&ctx.block_height.to_le_bytes());
+        maker_data.extend_from_slice(&ctx.timestamp.to_le_bytes());
 
         let mut maker_key = [0u8; 32];
         maker_key[..20].copy_from_slice(fill.maker.as_slice());
         maker_key[20..28].copy_from_slice(&desc_block.to_be_bytes());
         maker_key[28..32].copy_from_slice(&ctx.trade_index.to_be_bytes());
-        let _ = ctx.state.put_cf_raw(CF_NATIVE_USER_TRADES, &maker_key, &user_trade_data);
 
-        user_trade_data[57] = 1u8; // role: taker
+        // Taker entry (flip role byte at offset 57: 16+8+16+16+1)
+        let mut taker_data = maker_data.clone();
+        taker_data[57] = 1u8; // role: taker
         let mut taker_key = [0u8; 32];
         taker_key[..20].copy_from_slice(fill.taker.as_slice());
         taker_key[20..28].copy_from_slice(&desc_block.to_be_bytes());
         taker_key[28..32].copy_from_slice(&ctx.trade_index.to_be_bytes());
-        let _ = ctx.state.put_cf_raw(CF_NATIVE_USER_TRADES, &taker_key, &user_trade_data);
+
+        if ctx.defer_trades {
+            ctx.pending_trades
+                .push((CF_NATIVE_TRADES, trade_key.to_vec(), trade_data));
+            ctx.pending_trades
+                .push((CF_NATIVE_USER_TRADES, maker_key.to_vec(), maker_data));
+            ctx.pending_trades
+                .push((CF_NATIVE_USER_TRADES, taker_key.to_vec(), taker_data));
+        } else {
+            let _ = ctx.state.put_cf_raw(CF_NATIVE_TRADES, &trade_key, &trade_data);
+            let _ = ctx
+                .state
+                .put_cf_raw(CF_NATIVE_USER_TRADES, &maker_key, &maker_data);
+            let _ = ctx
+                .state
+                .put_cf_raw(CF_NATIVE_USER_TRADES, &taker_key, &taker_data);
+        }
 
         ctx.trade_index += 1;
     }
