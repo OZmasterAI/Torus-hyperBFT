@@ -27,13 +27,20 @@ BENCH=../target/release/bench-throughput
 [ -x "$BIN" ] || { echo "missing $BIN — lap build on laptop, rsync back (see header)"; exit 1; }
 [ -x "$BENCH" ] || { echo "missing $BENCH — lap build on laptop, rsync back (see header)"; exit 1; }
 
-DURATION=${DURATION:-90}
+DURATION=${DURATION:-50}   # pre-signed nonces expire 60s after signing (bench
+                           # nonce window) — the whole paced burn must fit inside
+                           # it, so keep DURATION under ~55s when PRESIGN is on
 BS=${BS:-400}              # orders per PlaceOrderBatch (bodies ~28KB/action)
 SENDERS=${SENDERS:-20}     # genesis-funded market-maker accounts (bench cap)
-RATE=${RATE:-6}            # actions/s/sender, paced (s367: burst under-measures);
-                           # 20x6=120 actions/s -> ~40+ actions/block: bodies
-                           # ~1.2MB+, BETWEEN the legs' thresholds by design.
-SIGN=${SIGN:-session}      # ed25519 session keys: stream-signing keeps pace
+RATE=${RATE:-3}            # actions/s/sender, paced (s367: burst under-measures).
+                           # 20x3=60 actions/s -> ~20-30 actions/block: bodies
+                           # 560-840KB, BETWEEN the legs' thresholds by design.
+                           # First run at RATE=6 CPU-wedged the box (8 cores,
+                           # load 19.6): 4 validators x 17k-order exec + bench
+                           # signing starved push AND pull into timeouts.
+SIGN=${SIGN:-session}      # ed25519 session keys
+PRESIGN=${PRESIGN:-$((DURATION * RATE))}  # ammo/sender signed BEFORE the window
+                           # so the bench is CPU-idle while we measure the chain
 MARKETS=${MARKETS:-4}
 OUT=${OUT:-sweep-o5-s415.csv}
 RPCS="http://localhost:8645,http://localhost:8546,http://localhost:8547,http://localhost:8548"
@@ -51,7 +58,7 @@ pulls() { # sum of torus_native_da_pull_requests across the 4 validators
     local total=0 v p
     for p in $METRICS_PORTS; do
         v=$(curl -s -m 2 "http://localhost:$p/metrics" \
-            | awk '$1=="torus_native_da_pull_requests" {print int($2); found=1} END {if(!found) print 0}')
+            | awk '$1 ~ /^torus_native_da_pull_requests(_total)?$/ {print int($2); found=1; exit} END {if(!found) print 0}')
         total=$((total + v))
     done
     echo "$total"
@@ -78,7 +85,8 @@ EOF
 
 echo "leg,threshold,orders_s,block_ms_fit,avg_native_per_block,pull_delta,wedged" > "$OUT"
 
-for leg in control:524288 fullpush:3145728; do
+LEGS=${LEGS:-"control:524288 fullpush:3145728"}  # override to reverse order (A/B/A confound check)
+for leg in $LEGS; do
     name=${leg%%:*}; thr=${leg##*:}
     echo "=== leg $name  TORUS_PUSH_THRESHOLD=$thr ==="
     export TORUS_PUSH_THRESHOLD=$thr
@@ -105,8 +113,14 @@ for leg in control:524288 fullpush:3145728; do
     ) &
     sampler=$!
 
-    "$BENCH" consensus --rpc-urls "$RPCS" --batch-size "$BS" --senders "$SENDERS" \
-        --duration "$DURATION" --rate "$RATE" --sign-mode "$SIGN" --markets "$MARKETS" \
+    # Bench runs INSIDE the devnet image (host network): the binary is built on
+    # the ThinkPad (glibc 2.43) and cannot run on this 24.04 host (glibc 2.39).
+    docker run --rm --network host --entrypoint /bench \
+        -v "$(cd .. && pwd)/target/release/bench-throughput:/bench:ro" \
+        torus-devnet-node:local \
+        consensus --rpc-urls "$RPCS" --batch-size "$BS" --senders "$SENDERS" \
+        --duration "$DURATION" --rate "$RATE" --pre-sign "$PRESIGN" \
+        --sign-mode "$SIGN" --markets "$MARKETS" \
         --format bin 2>&1 | tee "bench-o5-$name.txt"
 
     wait "$sampler" || true

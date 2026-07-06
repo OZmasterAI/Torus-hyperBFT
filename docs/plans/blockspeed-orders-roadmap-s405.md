@@ -53,11 +53,20 @@ Testnet state: STOPPED 2026-07-05 20:43Z at height 1,114,439 / view 1,198,460
 
 ## Phase 2 — capacity unlocks (ordered by dependency)
 
-- [ ] **O5 feed/dissemination gates** — reconcile max_consensus_message_size
-  256KB vs gossip 2MiB vs direct 4MB so bs400+ blocks disseminate (today
-  512KB manifest vs 2.8MB bodies self-limits inclusion). NEEDS WRITING-PLANS:
-  consensus-facing size caps = mixed-fleet compat + rollout ordering (same
-  care class as explicit peers).
+- [x] **O5 feed/dissemination gates** — DONE S415 (code 97b931b; plan+outcome
+  docs/plans/o5-feed-gates-impl.md). Accept-first ladder: caps.rs single
+  source of truth + test-enforced ordering; consensus accept 256KB→1MB
+  (closes the EVM-inline livelock trap — a LEGAL 319.8KB compact proposal
+  exceeded the old gate → drop+penalize loop; red→green proven); direct read
+  4→8MB with LEGACY_FLEET_DIRECT_MSG_FLOOR=4MB pinning send policy; env
+  threshold CLAMPED to floor+WARN (S388's 6MB env > 4MB codec was a live
+  silent violation); gossip transmit config-wired (S391 drift class).
+  Devnet bs400 sweep ×2 (order-reversed, 0 wedges): 512KB manifest+pull
+  11.4k orders/s STABLE vs 3MB full-push 0.5-4.5k with 6-14× more fallback
+  pulls — "512KB too eager" FALSIFIED on loopback (off-loop serving made
+  pull the fast path). Compiled default stays 512KB. → RELAUNCH follow-ups:
+  seed-only WAN A/B 512KB vs clamped-4MB; likely DROP the 6MB env from
+  seed+val1 (it forces 2.8MB WAN pushes and now clamps anyway).
 - [ ] **O2 PlaceOrderBatch** — one signed action carrying Vec of orders: one
   ecrecover + one manifest entry per batch. Collapses the ~1700-orders/block
   wire cap and per-order sig cost; prerequisite for 20k-order blocks (200k/s

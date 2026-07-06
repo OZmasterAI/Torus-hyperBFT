@@ -343,3 +343,47 @@ outcome.
   (accept gates — no protocol state, no migration).
 - Task 5: revert restores verbatim env honoring (and the silent violation).
 - Task 6: env-only; nothing to roll back (devnet torn down after).
+
+## Outcome (S415) — sweep verdict INVERTS the threshold hypothesis
+
+Tasks 1-5 landed as planned (commit 97b931b): red→green proven (319,796 B
+legal proposal vs 262,144 B gate → green at 1 MB), all suites green on the
+laptop executor, zero behavior change at default config except the accept
+raises and the env clamp.
+
+Task 6 ran twice (second run leg-order REVERSED to kill the ordering
+confound), 4 legs total, bs400, presigned ammo (bench CPU-idle in window),
+~20-54 actions/block (~0.6-1.5 MB bodies), no wedges:
+
+| leg | threshold | orders/s | block-ms fit | act/blk | pulls |
+|-----|-----------|----------|--------------|---------|-------|
+| control (run2) | 512 KB | 11,388 | 432.8 | 54 | 49 |
+| fullpush (run2) | 3 MB | 4,518 | 472.8 | 41 | 326 |
+| fullpush (run3, FIRST) | 3 MB | 456 | 596.0 | 9 | 284 |
+| control (run3) | 512 KB | 11,449 | 498.2 | 54 | 21 |
+
+**The plan's Task-6 acceptance predicate (full-push: pulls ≈ 0, block time ≤
+control) FAILED — and that is the finding, not a broken test.** Multi-MB
+direct pushes arrive late/fail on the loaded event loop and receivers fall
+back to budgeted pulls (326 vs 49); manifest+pull with S387's off-loop
+serving is the FAST path on loopback, stable at ~11.4k orders/s in both leg
+positions. bridge.rs's "512 KB is likely too eager" hypothesis is FALSIFIED
+on loopback. (First attempt at RATE=6 stream-signing CPU-wedged the whole
+box — 8 cores, load 19.6, both legs stalled identically; environment, not
+signal. Presign + RATE=3 fixed it.)
+
+Consequences:
+1. **Compiled 512 KB default STAYS** — as planned, but now evidence-backed
+   rather than caution-backed.
+2. **The S388 `TORUS_HASH_ONLY_PUSH_THRESHOLD=6000000` env on seed+val1 is
+   suspect** — it forces 2.8 MB full pushes over WAN. It now clamps to 4 MB
+   (WARN at startup). The relaunch WAN A/B should test REMOVING it (512 KB)
+   vs the clamped 4 MB — loopback says pull wins, WAN RTT may flip it; that
+   is precisely what the 150 s seed-only A/B decides.
+3. devnet compose keeps `${TORUS_PUSH_THRESHOLD:-6000000}` for continuity
+   with the testnet mirror, but the sweep tooling
+   (`devnet/sweep-o5-threshold-s415.sh`, LEGS/OUT/RATE env-parameterized)
+   makes re-measuring a one-liner.
+4. Accept-gate raises (1 MB consensus / 8 MB direct) are orthogonal to this
+   verdict and stand: they close the EVM-inline livelock trap and un-pin the
+   future, regardless of which push mode wins on WAN.

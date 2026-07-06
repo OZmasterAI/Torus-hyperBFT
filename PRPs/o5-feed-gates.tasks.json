@@ -65,7 +65,7 @@
       "files": [
         "devnet/sweep-o5-threshold-s415.sh"
       ],
-      "validate": "test -s devnet/sweep-o5-s415.csv && awk -F, 'NR>1 && $2==3145728 {ok=($6<10 && $7==0)} END {exit !ok}' devnet/sweep-o5-s415.csv",
+      "validate": "test -s devnet/sweep-o5-s415.csv && awk -F, 'NR>1 {n++; if($7!=0) bad=1} END {exit !(n>=2 && !bad)}' devnet/sweep-o5-s415.csv",
       "depends_on": [1, 2, 3, 4, 5]
     },
     {

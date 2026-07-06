@@ -1,7 +1,11 @@
 # Fast devnet image — copies pre-built binary from host.
 # Requires: cargo build --release -p torus-node
 # For full in-Docker build, use Dockerfile.full-build instead.
-FROM ubuntu:24.04
+# Base must carry glibc >= the build host's: binaries come from the ThinkPad
+# dev-executor (Ubuntu 26.04, glibc 2.43); ubuntu:24.04 (2.39) cannot load
+# them. NOTE the same constraint applies to deploying laptop builds on the
+# 24.04 testnet boxes — those still need a VPS-side (or 24.04-container) build.
+FROM ubuntu:26.04
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
