@@ -96,7 +96,11 @@ fn whitelist_candidate(
     gov.cast_vote(*proposer, prop_id, true, block + 1)
         .unwrap();
 
+    // FIX 15 (745a98a): finalize starts the 5-block timelock; execution is a
+    // separate step (same two-phase contract as governance_tests.rs).
     let outcome = gov.finalize_proposal(prop_id, block + 11).unwrap();
+    assert_eq!(outcome, ProposalOutcome::Passed(prop_id));
+    let outcome = gov.execute_proposal(prop_id, block + 16).unwrap();
     assert_eq!(outcome, ProposalOutcome::Executed(prop_id));
 }
 
@@ -166,9 +170,10 @@ fn test_whitelist_expiry() {
     // Valid right after approval
     assert!(gov.is_whitelisted(&candidate, 115).unwrap());
 
-    // Expired after WHITELIST_EXPIRY_BLOCKS
+    // Expired after WHITELIST_EXPIRY_BLOCKS. The whitelist entry is created at
+    // execution (block 116 = finalize 111 + timelock 5), not at finalize.
     assert!(!gov
-        .is_whitelisted(&candidate, 115 + WHITELIST_EXPIRY_BLOCKS + 1)
+        .is_whitelisted(&candidate, 116 + WHITELIST_EXPIRY_BLOCKS + 1)
         .unwrap());
 }
 

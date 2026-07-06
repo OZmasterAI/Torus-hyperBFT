@@ -335,6 +335,11 @@ async fn torus_get_proposal_exists() {
     let (_dir, state, mempool, executor) = setup();
     let gov = GovernanceManager::new(state.clone());
     let staking = StakingManager::new(state.clone());
+    // FIX MED-NEW-15: params must be initialized before submit_proposal.
+    gov.set_governance_params(
+        &torus_economics::governance::GovernanceParams::defaults(Address::ZERO),
+    )
+    .unwrap();
 
     let proposer = addr(1);
     let validator = addr(2);
@@ -403,6 +408,11 @@ async fn torus_get_proposals_by_status_and_all() {
     let (_dir, state, mempool, executor) = setup();
     let gov = GovernanceManager::new(state.clone());
     let staking = StakingManager::new(state.clone());
+    // FIX MED-NEW-15: params must be initialized before submit_proposal.
+    gov.set_governance_params(
+        &torus_economics::governance::GovernanceParams::defaults(Address::ZERO),
+    )
+    .unwrap();
 
     let proposer = addr(1);
     let validator = addr(2);

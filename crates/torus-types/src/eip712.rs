@@ -1689,7 +1689,7 @@ mod tests {
         assert_ne!(sentinel, real);
 
         let got = batch_verify_native_actions_cached(
-            &[action.clone()],
+            std::slice::from_ref(&action),
             TEST_NONCE,
             |_| None,
             |k| if *k == ck { Some(sentinel) } else { None },
