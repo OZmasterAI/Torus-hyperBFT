@@ -7,10 +7,7 @@ use k256::ecdsa::SigningKey;
 
 use torus_bridge::native_executor::{NativeExecContext, NativeExecutor};
 use torus_state::StateDb;
-use torus_types::eip712::{
-    eip712_domain_separator, eip712_signing_hash, eip712_struct_hash, sign_native_action,
-    MAX_SESSIONS_PER_ADDRESS, MAX_SESSION_EXPIRY_MS,
-};
+use torus_types::eip712::{eip712_domain_separator, eip712_signing_hash, eip712_struct_hash};
 use torus_types::{
     ActionSignature, Ed25519Sig, FixedPoint, NativeAction, OrderType, PlaceOrderParams,
     SessionData, SessionScope, SignedNativeAction, TimeInForce,
@@ -42,6 +39,7 @@ fn make_ctx(state_db: StateDb, timestamp: u64) -> NativeExecContext {
     )
 }
 
+#[allow(dead_code)]
 fn test_ecdsa_key() -> SigningKey {
     let mut bytes = [0u8; 32];
     bytes[31] = 1;

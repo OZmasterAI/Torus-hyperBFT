@@ -225,6 +225,7 @@ pub struct NativeExecContext<T: StateBackend = StateDb> {
 
 impl<T: StateBackend> NativeExecContext<T> {
     /// Create a new execution context from a state backend and block metadata.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         state: T,
         block_height: u64,
@@ -662,8 +663,8 @@ impl NativeExecutor {
                             );
                             continue;
                         }
-                        bal.available = bal.available - order_margin_required;
-                        bal.order_margin = bal.order_margin + order_margin_required;
+                        bal.available -= order_margin_required;
+                        bal.order_margin += order_margin_required;
                         bal_cache.set(sender, bal);
                     }
                     Err(e) => {
@@ -768,8 +769,8 @@ impl NativeExecutor {
 
                     if margin_to_release > FixedPoint::ZERO {
                         if let Ok(mut bal) = bal_cache.load(&ctx.positions, &prep.sender) {
-                            bal.order_margin = bal.order_margin - margin_to_release;
-                            bal.available = bal.available + margin_to_release;
+                            bal.order_margin -= margin_to_release;
+                            bal.available += margin_to_release;
                             bal_cache.set(&prep.sender, bal);
                         }
                     }
@@ -887,8 +888,8 @@ impl NativeExecutor {
                             ),
                         );
                     }
-                    bal.available = bal.available - order_margin_required;
-                    bal.order_margin = bal.order_margin + order_margin_required;
+                    bal.available -= order_margin_required;
+                    bal.order_margin += order_margin_required;
                     if let Err(e) = ctx.positions.put_native_balance(sender, &bal) {
                         return NativeActionResult::err("place_order", e.to_string());
                     }
@@ -933,8 +934,8 @@ impl NativeExecutor {
 
             if margin_to_release > FixedPoint::ZERO {
                 if let Ok(mut bal) = ctx.positions.get_native_balance(sender) {
-                    bal.order_margin = bal.order_margin - margin_to_release;
-                    bal.available = bal.available + margin_to_release;
+                    bal.order_margin -= margin_to_release;
+                    bal.available += margin_to_release;
                     let _ = ctx.positions.put_native_balance(sender, &bal);
                 }
             }
@@ -1093,8 +1094,8 @@ impl NativeExecutor {
                 if margin_to_release > FixedPoint::ZERO {
                     if let Ok(mut bal) = ctx.positions.get_native_balance(&cancelled.trader) {
                         let release = margin_to_release.min(bal.order_margin);
-                        bal.order_margin = bal.order_margin - release;
-                        bal.available = bal.available + release;
+                        bal.order_margin -= release;
+                        bal.available += release;
                         let _ = ctx.positions.put_native_balance(&cancelled.trader, &bal);
                     }
                 }
@@ -1127,7 +1128,7 @@ impl NativeExecutor {
                             .map(|c| effective_max_leverage(&c.tiers, notional))
                             .unwrap_or(20);
                         let lev_fp = FixedPoint::from_raw(max_lev as i128 * FixedPoint::SCALE);
-                        total_margin_release = total_margin_release + notional / lev_fp;
+                        total_margin_release += notional / lev_fp;
                     }
                 }
             }
@@ -1147,7 +1148,7 @@ impl NativeExecutor {
                                 .map(|c| effective_max_leverage(&c.tiers, notional))
                                 .unwrap_or(20);
                             let lev_fp = FixedPoint::from_raw(max_lev as i128 * FixedPoint::SCALE);
-                            total_margin_release = total_margin_release + notional / lev_fp;
+                            total_margin_release += notional / lev_fp;
                         }
                     }
                 }
@@ -1157,8 +1158,8 @@ impl NativeExecutor {
         if total_margin_release > FixedPoint::ZERO {
             if let Ok(mut bal) = ctx.positions.get_native_balance(sender) {
                 let release = total_margin_release.min(bal.order_margin);
-                bal.order_margin = bal.order_margin - release;
-                bal.available = bal.available + release;
+                bal.order_margin -= release;
+                bal.available += release;
                 let _ = ctx.positions.put_native_balance(sender, &bal);
             }
         }
@@ -1211,16 +1212,16 @@ impl NativeExecutor {
                                     ),
                                 );
                             }
-                            bal.available = bal.available - delta;
-                            bal.order_margin = bal.order_margin + delta;
+                            bal.available -= delta;
+                            bal.order_margin += delta;
                             let _ = ctx.positions.put_native_balance(&modified.trader, &bal);
                         }
                     } else if old_margin > new_margin {
                         let delta = old_margin - new_margin;
                         if let Ok(mut bal) = ctx.positions.get_native_balance(&modified.trader) {
                             let release = delta.min(bal.order_margin);
-                            bal.order_margin = bal.order_margin - release;
-                            bal.available = bal.available + release;
+                            bal.order_margin -= release;
+                            bal.available += release;
                             let _ = ctx.positions.put_native_balance(&modified.trader, &bal);
                         }
                     }
@@ -2015,6 +2016,7 @@ pub fn classify_action(action: &NativeAction) -> ActionCategory {
 /// (sender_address, action_content_hash) for determinism. This prevents a
 /// validator-proposer from manipulating within-category ordering by choosing
 /// submission order.
+#[allow(clippy::type_complexity)]
 pub fn sort_native_actions(
     actions: &[(Address, NativeAction)],
 ) -> (Vec<(Address, NativeAction)>, Vec<(Address, NativeAction)>) {
@@ -2042,7 +2044,7 @@ pub fn sort_native_actions(
 /// the sort key is identical across compiler versions and crate updates.
 fn action_sort_key(sender: &Address, action: &NativeAction) -> (ActionCategory, Address, B256) {
     let category = classify_action(action);
-    let hash = alloy_primitives::keccak256(&action.canonical_bytes());
+    let hash = alloy_primitives::keccak256(action.canonical_bytes());
     (category, *sender, hash)
 }
 

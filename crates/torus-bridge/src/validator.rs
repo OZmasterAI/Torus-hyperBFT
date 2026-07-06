@@ -485,7 +485,7 @@ pub fn merge_bundle_into(dst: &mut BundleState, src: &BundleState) {
         }
         entry.info = src_acct.info.clone();
         for (slot, slot_val) in &src_acct.storage {
-            entry.storage.insert(*slot, slot_val.clone());
+            entry.storage.insert(*slot, *slot_val);
         }
     }
     for (hash, bytecode) in &src.contracts {

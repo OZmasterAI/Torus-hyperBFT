@@ -445,7 +445,7 @@ fn read_open_orders(
     prefix[..20].copy_from_slice(trader.as_slice());
     prefix[20..28].copy_from_slice(&market_id.to_be_bytes());
 
-    let iter = db.prefix_iterator_cf(cf, &prefix);
+    let iter = db.prefix_iterator_cf(cf, prefix);
     let mut order_ids = Vec::new();
     let mut prices = Vec::new();
     let mut quantities = Vec::new();
@@ -1044,7 +1044,7 @@ impl CoreWriterQueue {
             .ok_or(CoreError::MissingCf(CF_CORE_WRITER_QUEUE))?;
 
         let prefix = block_number.to_be_bytes();
-        let iter = db.prefix_iterator_cf(cf, &prefix);
+        let iter = db.prefix_iterator_cf(cf, prefix);
 
         let mut count = 0usize;
         for item in iter {

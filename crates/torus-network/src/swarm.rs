@@ -793,6 +793,7 @@ pub async fn run_swarm_with_config(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_event(
     event: SwarmEvent<TorusBehaviourEvent>,
     swarm: &mut Swarm<TorusBehaviour>,

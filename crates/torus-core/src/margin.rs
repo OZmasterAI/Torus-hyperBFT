@@ -87,6 +87,7 @@ pub struct MarginEngine;
 impl MarginEngine {
     /// Check margin at order submission time.
     /// Returns Ok(()) if the trader has sufficient margin for the new order.
+    #[allow(clippy::too_many_arguments)]
     pub fn check_initial_margin(
         positions: &PositionManager<impl StateBackend>,
         trader: &Address,
@@ -146,6 +147,7 @@ impl MarginEngine {
 
     /// Double-check margin at match time. Same logic as initial but called during fill.
     /// If margin fails, the order should be cancelled (not executed).
+    #[allow(clippy::too_many_arguments)]
     pub fn check_margin_at_match(
         positions: &PositionManager<impl StateBackend>,
         trader: &Address,
@@ -190,7 +192,7 @@ impl MarginEngine {
                 continue;
             }
             if let Some(mark) = oracle_price_for(oracle_prices, pos.market_id) {
-                equity = equity + pos.unrealized_pnl(mark);
+                equity += pos.unrealized_pnl(mark);
             }
         }
         Ok(equity)
@@ -220,7 +222,7 @@ impl MarginEngine {
                 let maint_num =
                     FixedPoint::from_raw(config.maintenance_factor_bps as i128 * FixedPoint::SCALE);
                 let bps_denom = FixedPoint::from_raw(10_000 * FixedPoint::SCALE);
-                total = total + initial * maint_num / bps_denom;
+                total += initial * maint_num / bps_denom;
             }
         }
         Ok(total)

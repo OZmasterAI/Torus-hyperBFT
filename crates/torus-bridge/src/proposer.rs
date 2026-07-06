@@ -8,7 +8,7 @@ use torus_evm::{
 use torus_state::StateDb;
 use torus_types::{Receipt, SignedNativeAction, TorusBlock, TorusBlockHeader};
 
-use crate::decode::{decode_all_txs, DecodedTx};
+use crate::decode::decode_all_txs;
 use crate::error::BridgeError;
 use crate::state_root::{
     compute_full_composite_root, compute_post_bundle_state_root, flagged_native_root,
@@ -166,9 +166,10 @@ impl BlockProposer {
     ///   2. Non-GTC orders (pre-EVM)
     ///   3. EVM transactions
     ///   4. GTC limit orders (post-EVM)
-    ///   5-8: CoreWriter drain, governance, fee distribution, epoch boundary
+    ///      5-8: CoreWriter drain, governance, fee distribution, epoch boundary
     ///
     /// Senders are recovered from EIP-712 signatures on SignedNativeActions.
+    #[allow(clippy::too_many_arguments)]
     pub fn build_block_with_native(
         &self,
         state_db: &StateDb,
@@ -285,20 +286,6 @@ impl BlockProposer {
     }
 }
 
-/// Set tx_hash and block_number on each receipt.
-fn set_receipt_metadata(
-    exec_result: &mut BlockExecResult,
-    decoded_txs: &[DecodedTx],
-    block_height: u64,
-) {
-    for (i, receipt) in exec_result.receipts.iter_mut().enumerate() {
-        if let Some(dtx) = decoded_txs.get(i) {
-            receipt.tx_hash = dtx.tx_hash;
-        }
-        receipt.block_number = block_height;
-    }
-}
-
 /// Deterministic receipts root: keccak256 of serde-serialised receipts.
 ///
 /// FIX EVM-FIND-16: Returns `Result` instead of panicking on serialization failure.
@@ -341,7 +328,7 @@ fn attestation_digest(actions: &[SignedNativeAction]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     for action in actions {
-        hasher.update(&bincode::serialize(action).unwrap_or_default());
+        hasher.update(bincode::serialize(action).unwrap_or_default());
     }
     hasher.finalize().into()
 }

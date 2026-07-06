@@ -561,7 +561,7 @@ impl<T: StateBackend> GovernanceManager<T> {
                         key: key.to_string(),
                         reason: "must be a valid u64".to_string(),
                     })?;
-                if v < 25 || v > 5000 {
+                if !(25..=5000).contains(&v) {
                     return Err(EconomicsError::InvalidParameterValue {
                         key: key.to_string(),
                         reason: "must be between 25 and 5000 (0.25% - 50%)".to_string(),
@@ -589,7 +589,7 @@ impl<T: StateBackend> GovernanceManager<T> {
                         key: key.to_string(),
                         reason: "must be a valid u64".to_string(),
                     })?;
-                if v < 1000 || v > 1_000_000 {
+                if !(1000..=1_000_000).contains(&v) {
                     return Err(EconomicsError::InvalidParameterValue {
                         key: key.to_string(),
                         reason: "must be between 1000 and 1000000 blocks".to_string(),
@@ -603,7 +603,7 @@ impl<T: StateBackend> GovernanceManager<T> {
                         key: key.to_string(),
                         reason: "must be a valid u64".to_string(),
                     })?;
-                if v < 1000 || v > 6700 {
+                if !(1000..=6700).contains(&v) {
                     return Err(EconomicsError::InvalidParameterValue {
                         key: key.to_string(),
                         reason: "must be between 1000 and 6700 (10% - 67%)".to_string(),
@@ -661,7 +661,7 @@ impl<T: StateBackend> GovernanceManager<T> {
                     })?;
                 // FIX MED-NEW-16: Enforce minimum timelock to prevent governance from
                 // disabling the delay entirely. 10 blocks ≈ 20s at 2s block time.
-                if v < 10 || v > 100_000 {
+                if !(10..=100_000).contains(&v) {
                     return Err(EconomicsError::InvalidParameterValue {
                         key: key.to_string(),
                         reason: "must be between 10 and 100000 blocks".to_string(),
@@ -675,7 +675,7 @@ impl<T: StateBackend> GovernanceManager<T> {
                         key: key.to_string(),
                         reason: "must be a valid u64".to_string(),
                     })?;
-                if v < 5000 || v > 10000 {
+                if !(5000..=10000).contains(&v) {
                     return Err(EconomicsError::InvalidParameterValue {
                         key: key.to_string(),
                         reason: "must be between 5000 and 10000 (50% - 100%)".to_string(),

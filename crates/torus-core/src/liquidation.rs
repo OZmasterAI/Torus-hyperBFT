@@ -214,7 +214,7 @@ impl LiquidationEngine {
         // Credit insurance fund
         let state = positions.state();
         let mut fund_balance = Self::get_insurance_fund(state)?;
-        fund_balance = fund_balance + liquidation_penalty;
+        fund_balance += liquidation_penalty;
         Self::set_insurance_fund(state, fund_balance)?;
 
         // Credit/debit PnL to trader balance, minus the penalty
@@ -223,7 +223,7 @@ impl LiquidationEngine {
 
         // For isolated margin, return isolated_margin to balance before accounting
         if pos.margin_type == MarginType::Isolated {
-            bal.available = bal.available + pos.isolated_margin;
+            bal.available += pos.isolated_margin;
         }
 
         // Remove the position
@@ -325,10 +325,10 @@ impl LiquidationEngine {
 
             // Credit realized PnL to the deleveraged trader
             let mut bal = positions.get_native_balance(trader)?;
-            bal.available = bal.available + realized_pnl;
+            bal.available += realized_pnl;
             positions.put_native_balance(trader, &bal)?;
 
-            loss_amount = loss_amount - realized_pnl;
+            loss_amount -= realized_pnl;
 
             results.push(AdlResult {
                 trader: *trader,
@@ -361,7 +361,7 @@ impl LiquidationEngine {
                 Self::set_insurance_fund(state, fund_balance - remaining_loss)?;
                 return Ok(());
             }
-            remaining_loss = remaining_loss - fund_balance;
+            remaining_loss -= fund_balance;
             Self::set_insurance_fund(state, FixedPoint::ZERO)?;
         }
 
@@ -376,7 +376,7 @@ impl LiquidationEngine {
         for trader in traders {
             if let Some(pos) = positions.get_position(trader, market_id)? {
                 traders_with_size.push((*trader, pos.size));
-                total_size = total_size + pos.size;
+                total_size += pos.size;
             }
         }
 
@@ -404,7 +404,7 @@ impl LiquidationEngine {
         // Recalculate total_size for eligible traders only
         let mut eligible_total_size = FixedPoint::ZERO;
         for (_, size) in &eligible_traders {
-            eligible_total_size = eligible_total_size + *size;
+            eligible_total_size += *size;
         }
 
         if eligible_total_size <= FixedPoint::ZERO || eligible_traders.is_empty() {
@@ -421,7 +421,7 @@ impl LiquidationEngine {
             let share = *size / eligible_total_size;
             let deduction = remaining_loss * share;
             let mut bal = positions.get_native_balance(trader)?;
-            bal.available = bal.available - deduction;
+            bal.available -= deduction;
             positions.put_native_balance(trader, &bal)?;
         }
 

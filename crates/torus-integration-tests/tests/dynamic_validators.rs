@@ -6,8 +6,8 @@
 mod common;
 
 use alloy_primitives::{Address, U256};
-use torus_economics::epoch::{EpochManager, ValidatorSetDiff};
-use torus_economics::governance::{ExecutionPayload, ProposalOutcome, ProposalStatus};
+use torus_economics::epoch::EpochManager;
+use torus_economics::governance::{ExecutionPayload, ProposalOutcome};
 use torus_economics::types::*;
 use torus_economics::{GovernanceManager, GovernanceParams, StakingManager};
 use torus_types::{PublicKey, ValidatorInfo, ValidatorSet};
@@ -26,6 +26,7 @@ fn addr(n: u8) -> Address {
     Address::new([n; 20])
 }
 
+#[allow(dead_code)]
 fn balance(h: &TestHarness, a: &Address) -> U256 {
     h.state_db
         .get_account(a)
@@ -533,8 +534,8 @@ fn test_jailed_validator_removed_and_replaced() {
     let staking = StakingManager::new(h.state_db.clone());
 
     let v1 = register_validator(&staking, 1, 100_000);
-    let v2 = register_validator(&staking, 2, 80_000);
-    let v3 = register_validator(&staking, 3, 60_000);
+    let _v2 = register_validator(&staking, 2, 80_000);
+    let _v3 = register_validator(&staking, 3, 60_000);
     let v4 = register_validator(&staking, 4, 40_000); // waiting in queue
 
     // Epoch 1: top 3 active

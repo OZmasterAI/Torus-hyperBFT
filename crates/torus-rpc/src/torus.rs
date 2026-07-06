@@ -301,6 +301,7 @@ fn verify_one_action_with(
 }
 
 /// JSON-ingress wrapper kept for the single-action endpoint and tests.
+#[allow(dead_code)]
 pub(crate) fn verify_one_action(
     signed_action: &str,
     chain_id: u64,
@@ -743,7 +744,7 @@ impl TorusApiServer for RpcState {
             .map_err(ErrorObjectOwned::from)?;
         let mut total_margin = native_bal.order_margin;
         for pos in &positions {
-            total_margin = total_margin + pos.isolated_margin;
+            total_margin += pos.isolated_margin;
         }
 
         // Permanent stake from CF_STAKING_PERMANENT
@@ -1410,7 +1411,7 @@ impl TorusApiServer for RpcState {
             let mid = parse_u64(mid_str).map_err(ErrorObjectOwned::from)?;
             let key = mid.to_be_bytes();
             if let Some(data) = db
-                .get_cf(cf, &key)
+                .get_cf(cf, key)
                 .map_err(|e| RpcError::Internal(format!("rocksdb: {e}")))
                 .map_err(ErrorObjectOwned::from)?
             {
@@ -1488,9 +1489,9 @@ impl TorusApiServer for RpcState {
                 .map_err(|e| RpcError::Internal(format!("borsh decode position: {e}")))
                 .map_err(ErrorObjectOwned::from)?;
             if pos.is_long {
-                long_oi = long_oi + pos.size;
+                long_oi += pos.size;
             } else {
-                short_oi = short_oi + pos.size;
+                short_oi += pos.size;
             }
         }
 
@@ -1753,7 +1754,7 @@ fn order_to_rpc(order: &torus_core::order_book::Order, market_id: u64) -> RpcOpe
         order_type: order_type.to_string(),
         time_in_force: time_in_force.to_string(),
         reduce_only: order.reduce_only,
-        client_order_id: order.client_order_id.map(|id| hex_u64(id)),
+        client_order_id: order.client_order_id.map(hex_u64),
         timestamp: order.timestamp,
     }
 }

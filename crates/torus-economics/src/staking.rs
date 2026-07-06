@@ -632,6 +632,7 @@ impl<T: StateBackend> StakingManager<T> {
     /// - Status must be Jailed (NOT Tombstoned)
     /// - Cooldown expired (current_block >= jailed_until)
     /// - self_stake >= MIN_SELF_DELEGATION
+    ///
     /// Sets status to Candidate (must wait for next epoch to become Active).
     pub fn unjail(&self, validator_addr: &Address, current_block: u64) -> Result<()> {
         let mut val = self

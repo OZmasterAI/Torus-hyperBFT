@@ -6,13 +6,12 @@
 
 mod common;
 
-use alloy_primitives::Address;
 use torus_bridge::native_executor::NativeExecutor;
 use torus_core::precompiles::{
     abi, execute_precompile, precompile_address, CoreWriterQueue, QueuedAction, QueuedActionKind,
-    ADDR_CORE_WRITER, ADDR_CORE_WRITER_STAKING,
+    ADDR_CORE_WRITER,
 };
-use torus_types::{FixedPoint, NativeAction, OrderType, PlaceOrderParams, TimeInForce};
+use torus_types::{NativeAction, OrderType, PlaceOrderParams, TimeInForce};
 
 use crate::common::TestHarness;
 

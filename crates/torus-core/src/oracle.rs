@@ -385,7 +385,7 @@ fn mean_abs_deviation(prices: &[FixedPoint], median: FixedPoint) -> FixedPoint {
     for &p in prices {
         let diff = p - median;
         let abs_diff = if diff < FixedPoint::ZERO { -diff } else { diff };
-        sum = sum + abs_diff;
+        sum += abs_diff;
     }
     sum / n
 }
@@ -441,7 +441,7 @@ fn weighted_median(pairs: &[(FixedPoint, FixedPoint)]) -> FixedPoint {
 
     let mut cumulative = FixedPoint::ZERO;
     for &(price, stake) in &sorted {
-        cumulative = cumulative + stake;
+        cumulative += stake;
         if cumulative >= half_stake {
             return price;
         }

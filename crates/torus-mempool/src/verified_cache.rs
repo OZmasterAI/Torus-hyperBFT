@@ -83,6 +83,7 @@ impl<K: Hash + Eq + Clone, V: Clone> FifoCache<K, V> {
     }
 
     /// Number of live entries.
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.map.len()
     }

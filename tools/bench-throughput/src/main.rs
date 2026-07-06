@@ -216,6 +216,7 @@ fn sign_one(
 /// hex payload strings and the advanced nonce watermark — nonces must be
 /// strictly increasing per sender because the committed (sender, nonce) replay
 /// guard silently drops same-ms duplicates.
+#[allow(clippy::too_many_arguments)]
 fn sign_payload_batch(
     rng: &mut impl Rng,
     key: &k256::ecdsa::SigningKey,
@@ -255,6 +256,7 @@ fn sign_payload_batch(
 /// regardless of signing speed. `base_nonce` should be ~`now_ms` and the span
 /// (`count * submit_batch`) must stay inside the chain's `NONCE_WINDOW_MS` (60s)
 /// or late ammo is rejected as "too far in future".
+#[allow(clippy::too_many_arguments)]
 fn pregen_ammo(
     rng: &mut impl Rng,
     key: &k256::ecdsa::SigningKey,
@@ -1003,13 +1005,14 @@ fn summarize_included(blocks: &[SweptBlock]) -> IncludedSummary {
     }
     IncludedSummary {
         slots,
-        unique: identities_complete.then(|| seen.len() as u64),
+        unique: identities_complete.then_some(seen.len() as u64),
         block_count: blocks.len() as u64,
         peak_actions,
         peak_block,
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_consensus(
     rpc_urls_str: &str,
     senders: usize,

@@ -54,11 +54,11 @@ impl BlockCommitter {
                     for (slot, slot_val) in &bundle_acct.storage {
                         let key = storage_key(address, slot);
                         if slot_val.present_value.is_zero() {
-                            batch.delete_cf(cf_storage, &key);
+                            batch.delete_cf(cf_storage, key);
                         } else {
                             batch.put_cf(
                                 cf_storage,
-                                &key,
+                                key,
                                 slot_val.present_value.to_be_bytes::<32>(),
                             );
                         }
@@ -73,8 +73,8 @@ impl BlockCommitter {
                     // Handles same-block create+destroy (orphaned storage) and
                     // normal destruction. Delete all storage entries tracked by the
                     // bundle rather than writing them.
-                    for (slot, _) in &bundle_acct.storage {
-                        batch.delete_cf(cf_storage, &storage_key(address, slot));
+                    for slot in bundle_acct.storage.keys() {
+                        batch.delete_cf(cf_storage, storage_key(address, slot));
                     }
                 }
             }
@@ -99,13 +99,13 @@ impl BlockCommitter {
         let mut header_data = Vec::with_capacity(32 + header_json.len());
         header_data.extend_from_slice(block_hash.as_slice());
         header_data.extend_from_slice(&header_json);
-        batch.put_cf(cf_headers, &height_key, &header_data);
+        batch.put_cf(cf_headers, height_key, &header_data);
 
         // 4. Store block body.
         let body = block.body();
         let body_bytes =
             serde_json::to_vec(&body).map_err(|e| BridgeError::Serialization(e.to_string()))?;
-        batch.put_cf(cf_bodies, &height_key, &body_bytes);
+        batch.put_cf(cf_bodies, height_key, &body_bytes);
 
         // 5. Store receipts (key = height(8) || tx_index(4)).
         for receipt in receipts {
@@ -114,11 +114,11 @@ impl BlockCommitter {
             key[8..12].copy_from_slice(&receipt.tx_index.to_be_bytes());
             let receipt_bytes = serde_json::to_vec(receipt)
                 .map_err(|e| BridgeError::Serialization(e.to_string()))?;
-            batch.put_cf(cf_receipts, &key, &receipt_bytes);
+            batch.put_cf(cf_receipts, key, &receipt_bytes);
         }
 
         // 6. Block hash → number index.
-        batch.put_cf(cf_hash_to_num, block_hash.as_slice(), &height_key);
+        batch.put_cf(cf_hash_to_num, block_hash.as_slice(), height_key);
 
         // 7. Tx hash → location index (height(8) || tx_index(4)).
         // D5 (S392): drive off the receipts, not a positional zip — when a tx is
@@ -128,7 +128,7 @@ impl BlockCommitter {
             let mut location = [0u8; 12];
             location[..8].copy_from_slice(&height_key);
             location[8..12].copy_from_slice(&receipt.tx_index.to_be_bytes());
-            batch.put_cf(cf_tx_loc, receipt.tx_hash.as_slice(), &location);
+            batch.put_cf(cf_tx_loc, receipt.tx_hash.as_slice(), location);
         }
 
         // Atomic write — all or nothing.
@@ -163,12 +163,12 @@ impl BlockCommitter {
         let mut header_data = Vec::with_capacity(32 + header_json.len());
         header_data.extend_from_slice(block_hash.as_slice());
         header_data.extend_from_slice(&header_json);
-        batch.put_cf(cf_headers, &height_key, &header_data);
+        batch.put_cf(cf_headers, height_key, &header_data);
 
         let body = block.body();
         let body_bytes =
             serde_json::to_vec(&body).map_err(|e| BridgeError::Serialization(e.to_string()))?;
-        batch.put_cf(cf_bodies, &height_key, &body_bytes);
+        batch.put_cf(cf_bodies, height_key, &body_bytes);
 
         for receipt in receipts {
             let mut key = [0u8; 12];
@@ -176,10 +176,10 @@ impl BlockCommitter {
             key[8..12].copy_from_slice(&receipt.tx_index.to_be_bytes());
             let receipt_bytes = serde_json::to_vec(receipt)
                 .map_err(|e| BridgeError::Serialization(e.to_string()))?;
-            batch.put_cf(cf_receipts_cf, &key, &receipt_bytes);
+            batch.put_cf(cf_receipts_cf, key, &receipt_bytes);
         }
 
-        batch.put_cf(cf_hash_to_num, block_hash.as_slice(), &height_key);
+        batch.put_cf(cf_hash_to_num, block_hash.as_slice(), height_key);
 
         // D5 (S392): drive off the receipts (see commit_block step 7) — skipped
         // txs get no receipt and therefore no location entry.
@@ -187,7 +187,7 @@ impl BlockCommitter {
             let mut location = [0u8; 12];
             location[..8].copy_from_slice(&height_key);
             location[8..12].copy_from_slice(&receipt.tx_index.to_be_bytes());
-            batch.put_cf(cf_tx_loc, receipt.tx_hash.as_slice(), &location);
+            batch.put_cf(cf_tx_loc, receipt.tx_hash.as_slice(), location);
         }
 
         state_db.write(batch)?;
@@ -216,11 +216,11 @@ impl BlockCommitter {
                     for (slot, slot_val) in &bundle_acct.storage {
                         let key = storage_key(address, slot);
                         if slot_val.present_value.is_zero() {
-                            batch.delete_cf(cf_storage, &key);
+                            batch.delete_cf(cf_storage, key);
                         } else {
                             batch.put_cf(
                                 cf_storage,
-                                &key,
+                                key,
                                 slot_val.present_value.to_be_bytes::<32>(),
                             );
                         }
@@ -230,8 +230,8 @@ impl BlockCommitter {
                     if bundle_acct.original_info.is_some() {
                         batch.delete_cf(cf_accounts, address.as_slice());
                     }
-                    for (slot, _) in &bundle_acct.storage {
-                        batch.delete_cf(cf_storage, &storage_key(address, slot));
+                    for slot in bundle_acct.storage.keys() {
+                        batch.delete_cf(cf_storage, storage_key(address, slot));
                     }
                 }
             }

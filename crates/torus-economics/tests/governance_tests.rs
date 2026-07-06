@@ -6,9 +6,7 @@ use torus_economics::governance::{
     ExecutionPayload, GovernanceManager, GovernanceParams, ProposalOutcome, ProposalStatus,
     ProposalType,
 };
-use torus_economics::{
-    EconomicsError, StakingManager, MIN_SELF_DELEGATION, TARGET_BLOCK_TIME_SECS,
-};
+use torus_economics::{EconomicsError, StakingManager, MIN_SELF_DELEGATION};
 use torus_state::cf::{CF_FEE_CONFIG, CF_NATIVE_MARKETS};
 use torus_state::StateDb;
 use torus_types::FixedPoint;

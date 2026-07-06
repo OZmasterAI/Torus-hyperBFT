@@ -188,15 +188,16 @@ impl OrderBook {
         }
 
         // FIX 8 (ECON-FIND-11): Enforce tick size for limit orders
-        if matches!(params.order_type, OrderType::Limit) && self.tick_size > FixedPoint::ZERO {
-            if params.price.raw() % self.tick_size.raw() != 0 {
-                return PlaceResult {
-                    order_id,
-                    status: OrderStatus::Rejected,
-                    fills: vec![],
-                    self_trade_cancels: vec![],
-                };
-            }
+        if matches!(params.order_type, OrderType::Limit)
+            && self.tick_size > FixedPoint::ZERO
+            && params.price.raw() % self.tick_size.raw() != 0
+        {
+            return PlaceResult {
+                order_id,
+                status: OrderStatus::Rejected,
+                fills: vec![],
+                self_trade_cancels: vec![],
+            };
         }
 
         // FIX 10 (ECON-FIND-17): Limit orders per trader per market

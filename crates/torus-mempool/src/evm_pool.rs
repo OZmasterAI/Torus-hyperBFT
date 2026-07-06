@@ -79,7 +79,7 @@ fn compute_shuffle_key(parent_hash: &B256, sender: &Address, nonce: u64) -> u64 
     data[..32].copy_from_slice(parent_hash.as_slice());
     data[32..52].copy_from_slice(sender.as_slice());
     data[52..60].copy_from_slice(&nonce.to_be_bytes());
-    let hash = keccak256(&data);
+    let hash = keccak256(data);
     u64::from_be_bytes(hash.as_slice()[..8].try_into().unwrap())
 }
 
@@ -261,7 +261,7 @@ impl EvmPool {
                 self.size -= 1;
             }
         }
-        if self.by_sender.get(sender).map_or(true, |m| m.is_empty()) {
+        if self.by_sender.get(sender).is_none_or(|m| m.is_empty()) {
             self.by_sender.remove(sender);
         }
         (stale.len(), freed_bytes)

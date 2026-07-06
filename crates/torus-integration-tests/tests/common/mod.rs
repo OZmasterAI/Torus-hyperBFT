@@ -1,4 +1,8 @@
 //! Shared test harness for integration tests.
+//!
+//! Compiled once per test binary; helpers used by one binary look dead in
+//! another, so dead_code is allowed module-wide.
+#![allow(dead_code)]
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -10,15 +14,14 @@ use revm::state::AccountInfo;
 use tempfile::TempDir;
 
 use torus_bridge::native_executor::NativeExecContext;
-use torus_core::oracle::{OracleConfig, OracleManager};
-use torus_core::position::{NativeBalance, PositionManager};
+use torus_core::position::PositionManager;
 use torus_core::precompiles::{OrderBookSnapshot, PriceLevel};
 use torus_evm::{EvmExecutor, TORUS_CHAIN_ID};
 use torus_mempool::{Mempool, MempoolConfig};
 use torus_rpc::{BlockNotifier, RpcServer};
 use torus_state::cf::{CF_NATIVE_MARKETS, CF_NATIVE_ORACLE, CF_NATIVE_ORDER_BOOKS};
 use torus_state::StateDb;
-use torus_types::{Address as TAddress, FixedPoint, MarketId, U256};
+use torus_types::{FixedPoint, MarketId, U256};
 
 /// Central test harness holding a temporary DB and all managers.
 pub struct TestHarness {

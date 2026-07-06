@@ -337,8 +337,8 @@ impl<T: StateBackend> PositionManager<T> {
                     } else {
                         pos.entry_price - fill_price
                     };
-                    pos.realized_pnl = pos.realized_pnl + pnl_per * fill_qty;
-                    pos.size = pos.size - fill_qty;
+                    pos.realized_pnl += pnl_per * fill_qty;
+                    pos.size -= fill_qty;
                     self.put_position(&pos)?;
                     self.credit_realized_pnl(trader, pnl_per * fill_qty)?;
                 } else if fill_qty == pos.size {
@@ -381,7 +381,7 @@ impl<T: StateBackend> PositionManager<T> {
     /// Credit (or debit if negative) realized PnL to native balance.
     fn credit_realized_pnl(&self, trader: &Address, pnl: FixedPoint) -> Result<(), CoreError> {
         let mut bal = self.get_native_balance(trader)?;
-        bal.available = bal.available + pnl;
+        bal.available += pnl;
         self.put_native_balance(trader, &bal)?;
         Ok(())
     }

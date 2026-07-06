@@ -92,7 +92,7 @@ impl LeaderState {
 
     pub fn current_leader(&self) -> Option<VerifyingKey> {
         let vs = self.validators.read().unwrap();
-        if vs.len() == 0 {
+        if vs.is_empty() {
             return None;
         }
         let view =
@@ -167,7 +167,7 @@ fn find_last_committed_height(state_db: &StateDb) -> Option<u64> {
 }
 
 fn persist_block_header(state_db: &StateDb, block: &TorusBlock) {
-    let block_hash = alloy_primitives::keccak256(&block.header.canonical_header_bytes());
+    let block_hash = alloy_primitives::keccak256(block.header.canonical_header_bytes());
     let header_json = match serde_json::to_vec(&block.header) {
         Ok(j) => j,
         Err(e) => {
@@ -212,7 +212,7 @@ impl ExecutionContext {
         for slash in pending_slashes {
             match self
                 .staking
-                .slash(slash.validator, slash.fraction_bps, slash.reason.clone(), 0)
+                .slash(slash.validator, slash.fraction_bps, slash.reason, 0)
             {
                 Ok(amount) => {
                     tracing::info!(
@@ -646,9 +646,9 @@ pub trait NativeDaFetcher: Send + Sync {
 /// flip it only in a coordinated relaunch where every validator runs the fixed
 /// binary (Phase C Task 9). Re-enabling compact is what unlocks 400k orders/sec — a
 /// block referencing ~20–40k orders ≈ 1–2 MB of bodies far exceeds the 256 KB
-/// `max_consensus_message_size`, so bodies must travel out-of-band (durable DA store
-/// + push T7 + rare pull T6). Default `false` keeps the proven full-block path until
-/// that coordinated flip. Does NOT affect the EVM/RPC header hash
+/// `max_consensus_message_size`, so bodies must travel out-of-band (durable DA
+/// store + push T7 + rare pull T6). Default `false` keeps the proven full-block
+/// path until that coordinated flip. Does NOT affect the EVM/RPC header hash
 /// (`keccak256(canonical_header_bytes)`), which is identical in both encodings.
 ///
 /// ENABLED (Task 9): all validators MUST run this binary in a coordinated relaunch.
@@ -1618,11 +1618,11 @@ impl App<RocksKVStore> for TorusApp {
             return ValidateBlockResponse::Invalid;
         };
 
-        if !torus_block.evm_transactions.is_empty() {
-            if decode_all_txs(&torus_block.evm_transactions).is_err() {
-                tracing::warn!("validate_block: REJECTED -- invalid EVM transactions");
-                return ValidateBlockResponse::Invalid;
-            }
+        if !torus_block.evm_transactions.is_empty()
+            && decode_all_txs(&torus_block.evm_transactions).is_err()
+        {
+            tracing::warn!("validate_block: REJECTED -- invalid EVM transactions");
+            return ValidateBlockResponse::Invalid;
         }
 
         if !torus_block.native_actions.is_empty() {

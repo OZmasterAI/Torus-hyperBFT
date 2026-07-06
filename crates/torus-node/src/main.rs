@@ -217,7 +217,7 @@ fn apply_config_defaults(cli: &mut Cli, cfg: ConfigFile) {
         cli.p2p_peers = cfg.p2p_peers;
     }
     if let Some(dir) = cfg.data_dir {
-        if cli.data_dir == PathBuf::from("./data") {
+        if cli.data_dir == std::path::Path::new("./data") {
             cli.data_dir = dir;
         }
     }

@@ -224,7 +224,6 @@ impl Mempool {
         )?;
 
         let hash = entry.hash;
-        let sender = entry.sender;
         let tx_size = raw_rlp.len();
 
         // Memory budget check (Phase 3: 3.1.7).

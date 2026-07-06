@@ -779,7 +779,7 @@ impl EthApiServer for RpcState {
             None => return Ok(None),
         };
         // Check pruning when full body data is needed
-        if (full_txs || header.evm_tx_count > 0) && header.evm_tx_count > 0 {
+        if header.evm_tx_count > 0 {
             check_pruned(self, height)?;
         }
         let body = if full_txs || header.evm_tx_count > 0 {

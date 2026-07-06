@@ -50,7 +50,7 @@ impl Lockbox {
 
         // Credit native balance
         let mut native_bal = get_native_balance(state, trader)?;
-        native_bal.available = native_bal.available + amount;
+        native_bal.available += amount;
 
         // Atomic write: debit EVM + credit native.
         let evm_data = build_evm_balance_update(state, trader, evm_balance - evm_amount)?;
@@ -95,7 +95,7 @@ impl Lockbox {
 
         // Debit native balance
         let mut updated_bal = native_bal;
-        updated_bal.available = updated_bal.available - amount;
+        updated_bal.available -= amount;
 
         // Credit EVM balance
         let evm_amount = fp_to_u256(amount);
@@ -146,7 +146,7 @@ impl Lockbox {
 
         // Debit sender's native balance
         let mut updated_bal = native_bal;
-        updated_bal.available = updated_bal.available - amount;
+        updated_bal.available -= amount;
 
         // Credit recipient's EVM balance
         let evm_amount = fp_to_u256(amount);
