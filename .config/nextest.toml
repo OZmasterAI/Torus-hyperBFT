@@ -1,0 +1,19 @@
+# Nextest config — hygiene S420.
+# The hotstuff_rs integration tests contain unbounded while-loops
+# (e.g. block_sync_test, see S391) that can wedge a run for 50+ minutes
+# when consensus stalls. Cap every test: flagged slow at 60s, killed
+# at 10 minutes, so a full workspace run always terminates.
+
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 10 }
+
+[profile.ci]
+slow-timeout = { period = "60s", terminate-after = 10 }
+fail-fast = false
+
+# The pacemaker cumulative-deadline test asserts wall-clock schedule math
+# (S395 absolute-deadline design); under full-suite parallel load the
+# on-schedule advance lands late and the assert flakes. Passes solo.
+[[profile.default.overrides]]
+filter = "test(update_view_on_schedule_keeps_cumulative_deadline)"
+retries = 2
