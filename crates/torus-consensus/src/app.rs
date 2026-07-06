@@ -2137,14 +2137,18 @@ mod crash_recovery_tests {
 
     /// Task 9 (scale milestone, deterministic proof): the bs=500 flood collapsed
     /// because a block of ~50k orders serializes to ~2.5 MB as a FULL TorusBlock —
-    /// far over the 256 KB `max_consensus_message_size` — so the proposal could not
-    /// disseminate and the chain stalled (mem 41ca452). The COMPACT encoding carries
-    /// only action hashes, so the SAME block fits comfortably: this is the encoding
-    /// change that lets the bs=500 flood hold and unblocks the path to 400k orders/sec.
+    /// far over the then-256 KB `max_consensus_message_size` — so the proposal could
+    /// not disseminate and the chain stalled (mem 41ca452). The COMPACT encoding
+    /// carries only action hashes, so the SAME block fits comfortably: this is the
+    /// encoding change that lets the bs=500 flood hold and unblocks the path to 400k
+    /// orders/sec. The collapse reproduces against today's raised gate too: the full
+    /// block is ~2.5 MB, over the 1 MB accept limit.
     #[test]
     fn compact_proposal_holds_where_full_block_collapsed_at_bs500() {
-        // torus-network NetworkConfig default (config.rs:79).
-        const MAX_CONSENSUS_MESSAGE_SIZE: usize = 256 * 1024;
+        // Mirrors torus-network `NetworkConfig::default().max_consensus_message_size`
+        // (torus-consensus has no torus-network dep). O5 raised it 256 KB -> 1 MB;
+        // keep in sync with config.rs.
+        const MAX_CONSENSUS_MESSAGE_SIZE: usize = 1024 * 1024;
 
         // The bs=500 block shape: 100 actions x 500-order batches = 50k orders.
         let actions: Vec<SignedNativeAction> =

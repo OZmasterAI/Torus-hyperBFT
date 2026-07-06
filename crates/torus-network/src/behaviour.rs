@@ -45,13 +45,19 @@ pub struct TorusBehaviour {
 /// than designed.
 pub const DEFAULT_GOSSIPSUB_HEARTBEAT_MS: u64 = 100;
 
-/// Build the consensus gossipsub config with the given heartbeat interval.
-/// Extracted (and unit-tested) so the heartbeat can never silently drift from
-/// `NetworkConfig.gossipsub_heartbeat_ms` again.
-pub fn gossipsub_config(heartbeat_ms: u64) -> Result<gossipsub::Config, String> {
+/// Build the consensus gossipsub config with the given heartbeat interval and
+/// transport frame cap. Extracted (and unit-tested) so neither value can
+/// silently drift from its source of truth again — S391: this site hardcoded
+/// a 500ms heartbeat while config said 100ms; O5: it hardcoded a 2 MiB frame
+/// cap while the accept gates it must dominate live in `NetworkConfig`
+/// (ladder ordering asserted in `caps::tests`).
+pub fn gossipsub_config(
+    heartbeat_ms: u64,
+    max_transmit: usize,
+) -> Result<gossipsub::Config, String> {
     gossipsub::ConfigBuilder::default()
         .heartbeat_interval(Duration::from_millis(heartbeat_ms))
-        .max_transmit_size(2 * 1024 * 1024)
+        .max_transmit_size(max_transmit)
         .validation_mode(gossipsub::ValidationMode::Strict)
         .build()
         .map_err(|e| format!("gossipsub config: {e}"))
@@ -66,18 +72,24 @@ impl TorusBehaviour {
         key: &libp2p::identity::Keypair,
         max_peers: usize,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        Self::with_limits_and_heartbeat(key, max_peers, DEFAULT_GOSSIPSUB_HEARTBEAT_MS)
+        Self::with_limits_and_heartbeat(
+            key,
+            max_peers,
+            DEFAULT_GOSSIPSUB_HEARTBEAT_MS,
+            crate::caps::GOSSIP_MAX_TRANSMIT_SIZE,
+        )
     }
 
     pub fn with_limits_and_heartbeat(
         key: &libp2p::identity::Keypair,
         max_peers: usize,
         gossipsub_heartbeat_ms: u64,
+        gossip_max_transmit: usize,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let peer_id = key.public().to_peer_id();
 
         // GossipSub
-        let gossipsub_config = gossipsub_config(gossipsub_heartbeat_ms)?;
+        let gossipsub_config = gossipsub_config(gossipsub_heartbeat_ms, gossip_max_transmit)?;
         let gossipsub = gossipsub::Behaviour::new(
             gossipsub::MessageAuthenticity::Signed(key.clone()),
             gossipsub_config,
@@ -189,9 +201,11 @@ mod tests {
     /// heartbeat must come from the caller.
     #[test]
     fn gossipsub_heartbeat_comes_from_caller() {
-        let cfg = gossipsub_config(100).expect("build gossipsub config");
+        let cfg = gossipsub_config(100, crate::caps::GOSSIP_MAX_TRANSMIT_SIZE)
+            .expect("build gossipsub config");
         assert_eq!(cfg.heartbeat_interval(), Duration::from_millis(100));
-        let cfg = gossipsub_config(500).expect("build gossipsub config");
+        let cfg = gossipsub_config(500, crate::caps::GOSSIP_MAX_TRANSMIT_SIZE)
+            .expect("build gossipsub config");
         assert_eq!(cfg.heartbeat_interval(), Duration::from_millis(500));
     }
 
@@ -212,7 +226,24 @@ mod tests {
     #[test]
     fn with_limits_and_heartbeat_constructs() {
         let key = libp2p::identity::Keypair::generate_ed25519();
-        TorusBehaviour::with_limits_and_heartbeat(&key, 50, 250)
-            .expect("behaviour with custom heartbeat");
+        TorusBehaviour::with_limits_and_heartbeat(
+            &key,
+            50,
+            250,
+            crate::caps::GOSSIP_MAX_TRANSMIT_SIZE,
+        )
+        .expect("behaviour with custom heartbeat");
+    }
+
+    /// O5: the transmit cap must come from the caller (config-wired), not a
+    /// hardcoded literal at the builder call site — and the default path must
+    /// stay byte-identical to the shipped 2 MiB behavior.
+    #[test]
+    fn gossipsub_transmit_cap_is_configurable_not_hardcoded() {
+        let cfg = gossipsub_config(100, 3 * 1024 * 1024).expect("build gossipsub config");
+        assert_eq!(cfg.max_transmit_size(), 3 * 1024 * 1024);
+        let default_cfg = gossipsub_config(100, crate::caps::GOSSIP_MAX_TRANSMIT_SIZE)
+            .expect("build gossipsub config");
+        assert_eq!(default_cfg.max_transmit_size(), 2 * 1024 * 1024);
     }
 }

@@ -24,15 +24,9 @@ impl BorshCodec {
     const MAX_MSG_SIZE: usize = MAX_DIRECT_MSG_SIZE;
 }
 
-/// `/torus/direct` push-path cap (unchanged — the per-validator push backpressure
-/// fix is tracked separately). Oversized pre-proposal bodies are recovered via the
-/// chunked `/torus/native-da` pull path instead.
-const MAX_DIRECT_MSG_SIZE: usize = 4 * 1024 * 1024; // 4 MB
-/// `/torus/native-da` response cap — generous headroom; bodies are pulled in
-/// size-bounded chunks (`NATIVE_DA_FETCH_CHUNK`), so a response stays well under this.
-const MAX_NATIVE_DA_MSG_SIZE: usize = 8 * 1024 * 1024; // 8 MB
-/// `/torus/block-data` response cap — must fit a full big block during sync.
-const MAX_BLOCK_DATA_MSG_SIZE: usize = 16 * 1024 * 1024; // 16 MB
+// Codec caps live in `caps` — the single source of truth for the size-cap
+// ladder (O5), where their ordering is test-enforced.
+use crate::caps::{MAX_BLOCK_DATA_MSG_SIZE, MAX_DIRECT_MSG_SIZE, MAX_NATIVE_DA_MSG_SIZE};
 
 #[async_trait]
 impl libp2p::request_response::Codec for BorshCodec {

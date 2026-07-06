@@ -103,14 +103,35 @@ pub const HASH_ONLY_PUSH_THRESHOLD: usize = 512 * 1024; // 512 KB
 /// pulling only missing bodies, the 512 KB default is likely too eager, but a raise must be
 /// measured on WAN (the view-timeout wedge it guards against is bandwidth-bound, mem
 /// f58957c6) — this makes that sweep a restart, not a rebuild/redeploy.
+///
+/// O5: the request is CLAMPED to `caps::LEGACY_FLEET_DIRECT_MSG_FLOOR`. A threshold above
+/// the floor orders full-body pushes that the oldest fleet codec must reject at read time —
+/// the S388 `=6000000` deployment did exactly this: every body set in (4 MB, 6 MB] was
+/// pushed, rejected by the receiver's 4 MB codec, and survived only via pull fallback.
+/// Above-floor requests WARN once at first use and run at the floor.
 fn hash_only_push_threshold() -> usize {
     static THRESHOLD: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *THRESHOLD.get_or_init(|| {
-        std::env::var("TORUS_HASH_ONLY_PUSH_THRESHOLD")
+        let requested = std::env::var("TORUS_HASH_ONLY_PUSH_THRESHOLD")
             .ok()
             .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(HASH_ONLY_PUSH_THRESHOLD)
+            .unwrap_or(HASH_ONLY_PUSH_THRESHOLD);
+        let floor = crate::caps::LEGACY_FLEET_DIRECT_MSG_FLOOR;
+        if requested > floor {
+            warn!(
+                requested,
+                floor, "TORUS_HASH_ONLY_PUSH_THRESHOLD above fleet direct-msg floor — clamped"
+            );
+        }
+        effective_push_threshold_at(requested, floor)
     })
+}
+
+/// Pure clamp seam for [`hash_only_push_threshold`]: the effective threshold never
+/// exceeds the fleet's direct-msg read floor, so a configured full-body push is always
+/// one every peer's codec can actually accept.
+fn effective_push_threshold_at(requested: usize, floor: usize) -> usize {
+    requested.min(floor)
 }
 
 /// Whether a pre-proposal push of `encoded_len` bytes (the bincoded action bodies) should
@@ -187,6 +208,12 @@ impl LibP2PNetwork {
 
         let max_peers = config.max_peers;
         let gossipsub_heartbeat_ms = config.gossipsub_heartbeat_ms;
+        // O5: the transport frame cap must dominate every app-level accept
+        // gate riding gossip, or a config raise silently makes legal messages
+        // unpublishable (ladder ordering asserted in caps::tests).
+        let gossip_max_transmit = crate::caps::GOSSIP_MAX_TRANSMIT_SIZE
+            .max(config.max_consensus_message_size)
+            .max(config.max_tx_message_size);
         // DNS wraps the dial filter which wraps QUIC, so /dns4 bootstrap
         // entries resolve BEFORE the filter judges the literal IP. Kademlia
         // query dials to stale private records (re-learned from peers that
@@ -215,8 +242,13 @@ impl LibP2PNetwork {
             .with_dns()
             .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?
             .with_behaviour(|key| {
-                TorusBehaviour::with_limits_and_heartbeat(key, max_peers, gossipsub_heartbeat_ms)
-                    .expect("failed to create TorusBehaviour")
+                TorusBehaviour::with_limits_and_heartbeat(
+                    key,
+                    max_peers,
+                    gossipsub_heartbeat_ms,
+                    gossip_max_transmit,
+                )
+                .expect("failed to create TorusBehaviour")
             })
             .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?
             .with_swarm_config(|cfg| {
@@ -632,5 +664,31 @@ mod tests {
                 "above threshold {threshold} ships hashes only"
             );
         }
+    }
+
+    /// O5: an env-requested threshold above the fleet's direct-msg read floor is
+    /// clamped (pure seam — OnceLock env state is process-wide, so the clamp rule
+    /// is tested parameterized). The S388 live value (6 MB > 4 MB floor) is the
+    /// motivating case: it ordered pushes every receiver's codec had to reject.
+    #[test]
+    fn env_threshold_clamps_to_fleet_floor() {
+        use crate::caps::LEGACY_FLEET_DIRECT_MSG_FLOOR;
+        // S388 live value: 6 MB requested, 4 MB fleet floor -> clamped.
+        assert_eq!(
+            effective_push_threshold_at(6_000_000, LEGACY_FLEET_DIRECT_MSG_FLOOR),
+            LEGACY_FLEET_DIRECT_MSG_FLOOR
+        );
+        // At or under the floor: honored verbatim.
+        assert_eq!(
+            effective_push_threshold_at(512 * 1024, LEGACY_FLEET_DIRECT_MSG_FLOOR),
+            512 * 1024
+        );
+        assert_eq!(
+            effective_push_threshold_at(
+                LEGACY_FLEET_DIRECT_MSG_FLOOR,
+                LEGACY_FLEET_DIRECT_MSG_FLOOR
+            ),
+            LEGACY_FLEET_DIRECT_MSG_FLOOR
+        );
     }
 }

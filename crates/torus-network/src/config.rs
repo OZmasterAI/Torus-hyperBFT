@@ -13,7 +13,14 @@ pub struct NetworkConfig {
     pub max_peers: usize,
     /// GossipSub heartbeat interval in milliseconds.
     pub gossipsub_heartbeat_ms: u64,
-    /// Maximum message size for consensus gossipsub (bytes).
+    /// Maximum message size for consensus gossipsub (bytes). ACCEPT gate only
+    /// — enforced on RECEIVE (swarm oversized-consensus path: drop + penalize
+    /// the author); there is no send-side check. O5 sized it for the worst
+    /// legal compact proposal (EVM gas budget 5M / 16 gas-per-calldata-byte
+    /// ≈ 312.5 KB inline + manifest) with ~3x headroom, ≤ gossip transmit
+    /// (ladder asserted in `caps::tests`). Senders must NOT produce bigger
+    /// consensus messages until the whole fleet carries at least this accept
+    /// value — stragglers drop AND penalize.
     pub max_consensus_message_size: usize,
     /// Maximum message size for transaction gossipsub (bytes).
     pub max_tx_message_size: usize,
@@ -115,7 +122,7 @@ impl Default for NetworkConfig {
             bootstrap_peers: Vec::new(),
             max_peers: 100,
             gossipsub_heartbeat_ms: crate::behaviour::DEFAULT_GOSSIPSUB_HEARTBEAT_MS,
-            max_consensus_message_size: 256 * 1024,
+            max_consensus_message_size: 1024 * 1024, // O5: was 256 KB (< EVM worst case — livelock trap)
             max_tx_message_size: 128 * 1024,
             tx_rate_limit_per_peer: 100,
             tx_dedup_window_secs: 60,

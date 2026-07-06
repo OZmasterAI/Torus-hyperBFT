@@ -549,7 +549,10 @@ mod tests {
         );
         let resp = BlockDataResponse { view: ViewNumber::new(1), block: block.clone() };
         let bytes = resp.try_to_vec().unwrap();
-        assert!(bytes.len() < 4 * 1024 * 1024, "response must fit in 4MB direct msg");
+        // Block-data responses ride the dedicated /torus/block-data protocol
+        // (16 MB codec cap in torus-network), NOT /torus/direct — 4 MB here is
+        // just a conservative bound for this small fixture.
+        assert!(bytes.len() < 4 * 1024 * 1024, "response must stay well under the block-data codec cap");
         let decoded = BlockDataResponse::try_from_slice(&bytes).unwrap();
         assert_eq!(decoded.block.hash, block.hash);
     }

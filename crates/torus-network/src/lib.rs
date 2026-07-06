@@ -13,6 +13,7 @@
 
 pub mod behaviour;
 pub mod bridge;
+pub mod caps;
 pub mod codec;
 pub mod config;
 pub mod mesh_watchdog;

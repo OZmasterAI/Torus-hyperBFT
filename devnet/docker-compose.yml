@@ -30,7 +30,9 @@ services:
       # Mirror the live testnet's body-push threshold: at bs400 a 100-action
       # block body is ~2.8MB; the 512KB default forces hash-only manifests and
       # the mesh can't reconstruct in time (S395 failed-view collapse).
-      - TORUS_HASH_ONLY_PUSH_THRESHOLD=6000000
+      # Overridable per leg by sweep-o5-threshold-s415.sh; NOTE the node clamps
+      # requests above the 4MB fleet direct-msg floor since O5 (WARN in log).
+      - TORUS_HASH_ONLY_PUSH_THRESHOLD=${TORUS_PUSH_THRESHOLD:-6000000}
     volumes:
       - ./genesis.json:/genesis/genesis.json:ro
       - validator-0-data:/data
@@ -60,13 +62,16 @@ services:
       # Mirror the live testnet's body-push threshold: at bs400 a 100-action
       # block body is ~2.8MB; the 512KB default forces hash-only manifests and
       # the mesh can't reconstruct in time (S395 failed-view collapse).
-      - TORUS_HASH_ONLY_PUSH_THRESHOLD=6000000
+      # Overridable per leg by sweep-o5-threshold-s415.sh; NOTE the node clamps
+      # requests above the 4MB fleet direct-msg floor since O5 (WARN in log).
+      - TORUS_HASH_ONLY_PUSH_THRESHOLD=${TORUS_PUSH_THRESHOLD:-6000000}
     volumes:
       - ./genesis.json:/genesis/genesis.json:ro
       - validator-1-data:/data
     ports:
       - "30334:30334/udp"
       - "8546:8545"
+      - "9092:9090"
     networks:
       torus-devnet:
         ipv4_address: 172.28.0.11
@@ -88,13 +93,16 @@ services:
       # Mirror the live testnet's body-push threshold: at bs400 a 100-action
       # block body is ~2.8MB; the 512KB default forces hash-only manifests and
       # the mesh can't reconstruct in time (S395 failed-view collapse).
-      - TORUS_HASH_ONLY_PUSH_THRESHOLD=6000000
+      # Overridable per leg by sweep-o5-threshold-s415.sh; NOTE the node clamps
+      # requests above the 4MB fleet direct-msg floor since O5 (WARN in log).
+      - TORUS_HASH_ONLY_PUSH_THRESHOLD=${TORUS_PUSH_THRESHOLD:-6000000}
     volumes:
       - ./genesis.json:/genesis/genesis.json:ro
       - validator-2-data:/data
     ports:
       - "30335:30335/udp"
       - "8547:8545"
+      - "9093:9090"
     networks:
       torus-devnet:
         ipv4_address: 172.28.0.12
@@ -116,13 +124,16 @@ services:
       # Mirror the live testnet's body-push threshold: at bs400 a 100-action
       # block body is ~2.8MB; the 512KB default forces hash-only manifests and
       # the mesh can't reconstruct in time (S395 failed-view collapse).
-      - TORUS_HASH_ONLY_PUSH_THRESHOLD=6000000
+      # Overridable per leg by sweep-o5-threshold-s415.sh; NOTE the node clamps
+      # requests above the 4MB fleet direct-msg floor since O5 (WARN in log).
+      - TORUS_HASH_ONLY_PUSH_THRESHOLD=${TORUS_PUSH_THRESHOLD:-6000000}
     volumes:
       - ./genesis.json:/genesis/genesis.json:ro
       - validator-3-data:/data
     ports:
       - "30336:30336/udp"
       - "8548:8545"
+      - "9094:9090"
     networks:
       torus-devnet:
         ipv4_address: 172.28.0.13
@@ -144,7 +155,9 @@ services:
       # Mirror the live testnet's body-push threshold: at bs400 a 100-action
       # block body is ~2.8MB; the 512KB default forces hash-only manifests and
       # the mesh can't reconstruct in time (S395 failed-view collapse).
-      - TORUS_HASH_ONLY_PUSH_THRESHOLD=6000000
+      # Overridable per leg by sweep-o5-threshold-s415.sh; NOTE the node clamps
+      # requests above the 4MB fleet direct-msg floor since O5 (WARN in log).
+      - TORUS_HASH_ONLY_PUSH_THRESHOLD=${TORUS_PUSH_THRESHOLD:-6000000}
     volumes:
       - ./genesis.json:/genesis/genesis.json:ro
       - rpc-node-data:/data
