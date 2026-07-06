@@ -41,10 +41,15 @@ Testnet state: STOPPED 2026-07-05 20:43Z at height 1,114,439 / view 1,198,460
   overlay, not a read cache. Bench: `exec_phase_margin_seconds` phase table
   under native-order-flood, before/after on devnet. Baseline mem: 2484d5d60814db2b
   (engine ~28µs/order, ceiling ~36k/s contended).
-- [ ] **O3 trade-history CF off critical path** (small, ~5–10% + tail
-  smoothing). CF_NATIVE_TRADES / CF_USER_TRADES are node-local (not in root
-  CFs) → background writer. Quick-fix loop, no plan; care point = shutdown
-  flush ordering. Same bench harness as O1.
+- [x] **O3 trade-history CF off critical path** — DONE S414 (commit 1a51d1e).
+  `ctx.defer_trades` buffers fill KVs; `torus_state::BackgroundCfWriter`
+  (ExecutionContext-owned, drain-on-drop = shutdown flush ordering) writes
+  them off the exec thread; sync fallback if the writer dies. Micro-bench
+  (exec_batch_trades.rs, 200-fill block): 2.15ms → 1.30ms median (−39%),
+  non-overlapping CIs. Live A/B (exec_flush_seconds tail +
+  torus_trade_writer_queued_batches gauge) joins the O1 proof at relaunch.
+  Known window: hard crash loses queued batches (cosmetic RPC history gap,
+  replay-idempotent, never consensus).
 
 ## Phase 2 — capacity unlocks (ordered by dependency)
 
