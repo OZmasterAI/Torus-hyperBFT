@@ -10,8 +10,12 @@
 #   bs=400  rate=3    -> 24,000 orders/s  (exec-bound; S415 measured 11.4k sustained)
 #   bs=1024 rate=2    -> 40,960 orders/s  (exec-bound, at-cap batch)
 #
-# Unlike the O5 sweep this script exports NO TORUS_PUSH_THRESHOLD — it runs the
-# compiled 512KB manifest+pull default (the S415-proven stable config).
+# THRESHOLD (S419 fix): docker-compose.yml defaults TORUS_PUSH_THRESHOLD to
+# 6000000 (testnet mirror, clamped to 4MB) when unset — "no export" does NOT
+# mean the compiled 512KB default. S419 run under that 4MB fallback reproduced
+# the S415 fullpush collapse (bs400: 448 orders/s, failed body pulls, empty
+# blocks). Export the S415-proven 512KB control config explicitly:
+export TORUS_PUSH_THRESHOLD=${TORUS_PUSH_THRESHOLD:-524288}
 #
 # Bench signs with --sign-mode session, registering SessionScope::Full sessions
 # (main.rs:603) — the sweep does NOT depend on Task 5 (Trading-scope extension);
