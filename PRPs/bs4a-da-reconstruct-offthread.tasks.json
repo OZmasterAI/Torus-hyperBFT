@@ -1,0 +1,70 @@
+{
+  "prp": "bs4a-da-reconstruct-offthread",
+  "created": "2026-07-06T20:35:00Z",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "RED test: hot path hands off and returns Err fast; worker recovers in background",
+      "status": "pending",
+      "files": ["crates/torus-consensus/src/app.rs"],
+      "validate": "cargo test -p torus-consensus hot_path_hands_off_and_recovers_in_background 2>&1 | grep -q 'FAILED\\|panicked' && echo RED-OK",
+      "depends_on": []
+    },
+    {
+      "id": 2,
+      "name": "Extract free recover_bodies_bounded shared by sync path and worker (pure refactor)",
+      "status": "pending",
+      "files": ["crates/torus-consensus/src/app.rs"],
+      "validate": "cargo test -p torus-consensus pull_ && cargo clippy -p torus-consensus -- -D warnings",
+      "depends_on": []
+    },
+    {
+      "id": 3,
+      "name": "DaRecoveryWorker: channel + named thread + store-check dedup + drop-join",
+      "status": "pending",
+      "files": ["crates/torus-consensus/src/app.rs"],
+      "validate": "cargo test -p torus-consensus recovery_worker_recovers_late_body_off_thread",
+      "depends_on": [2]
+    },
+    {
+      "id": 4,
+      "name": "Wire worker into TorusApp; shrink local retry to one slice; replace in-line hot pull with handoff",
+      "status": "pending",
+      "files": ["crates/torus-consensus/src/app.rs"],
+      "validate": "cargo test -p torus-consensus hot_path_hands_off_and_recovers_in_background prewarmed_bodies_absorbed_without_redundant_hot_fetch",
+      "depends_on": [1, 3]
+    },
+    {
+      "id": 5,
+      "name": "Rewrite superseded #4 Task-1 hot-path tests + budget const test",
+      "status": "pending",
+      "files": ["crates/torus-consensus/src/app.rs"],
+      "validate": "cargo test -p torus-consensus -- hot_path hot_pull_budget",
+      "depends_on": [4]
+    },
+    {
+      "id": 6,
+      "name": "Telemetry: native_da_recovery_handoffs + native_da_recovery_timeouts counters",
+      "status": "pending",
+      "files": ["crates/torus-telemetry/src/lib.rs", "crates/torus-consensus/src/app.rs"],
+      "validate": "cargo test -p torus-telemetry && cargo test -p torus-consensus",
+      "depends_on": [4]
+    },
+    {
+      "id": 7,
+      "name": "BS-4b: single event-driven mid-budget re-fetch in recover_bodies_bounded",
+      "status": "pending",
+      "files": ["crates/torus-consensus/src/app.rs"],
+      "validate": "cargo test -p torus-consensus recover_bodies",
+      "depends_on": [2]
+    },
+    {
+      "id": 8,
+      "name": "Full sweep: fmt, clippy -D warnings workspace, nextest vs S420 baseline",
+      "status": "pending",
+      "files": [],
+      "validate": "cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && cargo nextest run --workspace",
+      "depends_on": [1, 2, 3, 4, 5, 6, 7]
+    }
+  ]
+}
