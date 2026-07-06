@@ -138,6 +138,12 @@ pub struct Metrics {
     /// capacity (requester retries/rotates). A sustained rate = raise the pool
     /// cap or the pull storm is back.
     pub native_da_serve_dropped: Counter,
+    /// Hot-path native-DA misses handed off to the recovery worker (BS-4a: each =
+    /// one view failed fast with MissingData).
+    pub native_da_recovery_handoffs: Counter,
+    /// Recovery-worker batches whose pull budget expired without recovering every
+    /// body.
+    pub native_da_recovery_timeouts: Counter,
 
     // Exec-ceiling Option A (s351) — phase decomposition of the execution
     // thread. Phase histograms observe only when a block enters the native
@@ -538,6 +544,20 @@ impl Metrics {
             native_da_serve_dropped.clone(),
         );
 
+        let native_da_recovery_handoffs = Counter::default();
+        registry.register(
+            "torus_native_da_recovery_handoffs",
+            "Hot-path native-DA misses handed off to the recovery worker (BS-4a: each = one view failed fast with MissingData)",
+            native_da_recovery_handoffs.clone(),
+        );
+
+        let native_da_recovery_timeouts = Counter::default();
+        registry.register(
+            "torus_native_da_recovery_timeouts",
+            "Recovery-worker batches whose pull budget expired without recovering every body",
+            native_da_recovery_timeouts.clone(),
+        );
+
         let exec_verify_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
         registry.register(
             "torus_exec_verify_seconds",
@@ -776,6 +796,8 @@ impl Metrics {
             native_da_pull_recovered,
             native_da_served,
             native_da_serve_dropped,
+            native_da_recovery_handoffs,
+            native_da_recovery_timeouts,
             exec_verify_seconds,
             exec_replay_guard_seconds,
             exec_engine_seconds,
@@ -985,6 +1007,23 @@ mod tests {
             "torus_verified_sender_cache_hits",
             "torus_verified_sender_cache_misses",
             "torus_verified_sender_cache_evictions",
+        ] {
+            assert!(text.contains(name), "{name} not registered:\n{text}");
+        }
+    }
+
+    /// BS-4a: the off-thread DA recovery worker's counters must be registered so
+    /// the relaunch A/B can see the lever move (handoffs = hot-path misses handed
+    /// off; timeouts = worker budget exhausted without recovery).
+    #[test]
+    fn da_recovery_metrics_register() {
+        let m = Metrics::new();
+        m.native_da_recovery_handoffs.inc();
+        m.native_da_recovery_timeouts.inc();
+        let text = m.encode();
+        for name in [
+            "torus_native_da_recovery_handoffs",
+            "torus_native_da_recovery_timeouts",
         ] {
             assert!(text.contains(name), "{name} not registered:\n{text}");
         }

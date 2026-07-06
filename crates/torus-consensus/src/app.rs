@@ -871,7 +871,7 @@ impl DaRecoveryWorker {
                     // the moment it arrives, even though the batch's overall return is
                     // false when the dead hashes never land. `Some(&worker_shutdown)`
                     // lets Drop abandon the in-flight budget at the next slice (Fix C).
-                    recover_bodies_bounded(
+                    let recovered = recover_bodies_bounded(
                         &mempool,
                         fetcher.as_ref(),
                         &still_missing,
@@ -880,6 +880,16 @@ impl DaRecoveryWorker {
                         metrics.as_deref(),
                         Some(&worker_shutdown),
                     );
+                    // A cancelled in-flight batch (shutdown) is not a budget timeout —
+                    // only count as a timeout when the budget genuinely expired without
+                    // recovering every body and we are NOT shutting down.
+                    if !recovered
+                        && !worker_shutdown.load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        if let Some(ref m) = metrics {
+                            m.native_da_recovery_timeouts.inc();
+                        }
+                    }
                 }
             })
             .expect("spawn torus-da-recovery thread");
@@ -1396,6 +1406,9 @@ impl TorusApp {
         if !missing.is_empty() {
             if let Some(ref worker) = self.da_recovery {
                 worker.submit(missing.iter().map(|&i| hashes[i]).collect());
+                if let Some(ref m) = self.metrics {
+                    m.native_da_recovery_handoffs.inc();
+                }
             }
             return Err(missing.len());
         }
