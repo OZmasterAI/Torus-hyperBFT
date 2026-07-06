@@ -67,7 +67,7 @@ Testnet state: STOPPED 2026-07-05 20:43Z at height 1,114,439 / view 1,198,460
   pull the fast path). Compiled default stays 512KB. → RELAUNCH follow-ups:
   seed-only WAN A/B 512KB vs clamped-4MB; likely DROP the 6MB env from
   seed+val1 (it forces 2.8MB WAN pushes and now clamps anyway).
-- [ ] **O2 PlaceOrderBatch** — CORRECTION: feature SHIPPED 2026-06-06 as Phase B
+- [x] **O2 PlaceOrderBatch** — CORRECTION: feature SHIPPED 2026-06-06 as Phase B
   B1–B5 (b58f858) — one ecrecover + one manifest entry per batch; the old entry
   ("NEEDS WRITING-PLANS") was stale (premise fix: mem 27a66377be573bc0). S416
   close-out (design docs/plans/o2-placeorderbatch-design.md, impl
@@ -79,8 +79,24 @@ Testnet state: STOPPED 2026-07-05 20:43Z at height 1,114,439 / view 1,198,460
   test (G4); PlaceOrderBatch golden vectors multi+single (G5 — TS parity in
   torus-trading-app is an external follow-up); exec_place_batch criterion
   bench + BS={1,100,400,1024} sweep script (G6,
-  devnet/sweep-o2-batchsize-s416.sh). REMAINING to check off: run the sweep
-  (0 wedges, orders/s + block_ms_fit table) and paste the verdict here.
+  devnet/sweep-o2-batchsize-s416.sh).
+  **S419 SWEEP VERDICT (devnet 1-box, 512KB threshold, 4-market genesis, all
+  legs wedged=0):** sequential 4-leg orders/s|block_ms_fit|native/blk|pulls:
+  bs1 293|468|89|70 · bs100 11,213|443|84|26 · bs400 7,405|492|43|55 ·
+  bs1024 2,223|406|16|7. Single-first-leg trials at bs400 (clean unit,
+  n=4 interleaved incl. semantic-noop control): 10,967–13,312 — batching
+  lifts throughput ~38x (293 → 11.2k) to the 1-box exec ceiling; beats the
+  S415 baseline (11,388). Strict bs1→400 monotonicity fails only as a
+  same-ceiling technicality in the sequential run (leg-position drag);
+  single-leg runs are the trustworthy protocol for devnet perf claims.
+  Two harness bugs found+fixed en route: compose-fallback
+  TORUS_PUSH_THRESHOLD=6MB (sweep now exports 524288) and genesis seeding
+  only market 1 (now 1–4; pre-O2 runs rode phantom auto-created books).
+  WATCH-ITEM for testnet relaunch: ~2/7 O2-head devnet runs hit a
+  stochastic body-miss death spiral (0–1.5k, MissingData view churn,
+  nonce mass-eviction); never reproduced in clean single-leg trials,
+  pre-O2 immunity unproven (n=3). bs1024 degradation = order-budget trim
+  (48/blk) + 4x oversubmission, by design.
 
 ## Phase 3 — load-tail levers (measurable only with Phase-2 traffic)
 
