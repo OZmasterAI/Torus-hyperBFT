@@ -5,7 +5,8 @@
     {
       "id": 1,
       "name": "RED test: hot path hands off and returns Err fast; worker recovers in background",
-      "status": "pending",
+      "status": "done",
+      "commit": "99dc36e",
       "files": ["crates/torus-consensus/src/app.rs"],
       "validate": "cargo test -p torus-consensus hot_path_hands_off_and_recovers_in_background 2>&1 | grep -q 'FAILED\\|panicked' && echo RED-OK",
       "depends_on": []

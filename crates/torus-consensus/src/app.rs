@@ -696,6 +696,74 @@ fn sync_pull_retries(missing: usize) -> usize {
     (missing / 2).clamp(PULL_RETRIES, MAX_SYNC_PULL_RETRIES)
 }
 
+/// Shared bounded fetch-wait-absorb loop: used by the SYNC path (in-line, ~1-8s)
+/// and the BS-4a recovery worker (off-thread, ~1s). Wake-on-arrival (S391),
+/// deadline-bounded (S395).
+fn recover_bodies_bounded(
+    mempool: &Mempool,
+    fetcher: &dyn NativeDaFetcher,
+    missing: &[torus_types::B256],
+    retries: usize,
+    delay: std::time::Duration,
+    metrics: Option<&torus_telemetry::Metrics>,
+) -> bool {
+    if missing.is_empty() {
+        return true;
+    }
+
+    // Pre-warm fast path (review F2): a body pushed-as-hash may already be sitting in the
+    // fetcher inbound (the receiver pre-warm-pulled it) but not yet absorbed — e.g. it
+    // landed just after the hot local-retry's last drain. Absorb + re-check BEFORE issuing
+    // a network fetch, so a pre-warmed (or late) body never triggers a redundant fetch.
+    TorusApp::absorb_fetched_bodies(mempool, fetcher);
+    if missing.iter().all(|h| mempool.get_native_da(h).is_some()) {
+        return true;
+    }
+
+    let hashes: Vec<[u8; 32]> = missing.iter().map(|h| h.0).collect();
+    // S391 wake-on-arrival: snapshot before firing the fetch so a push that
+    // races the pull wakes the first wait. Pull responses themselves land in
+    // the fetcher inbound and still need this thread's absorb, so the slices
+    // keep the old `delay` cadence as the worst case.
+    let mut seen = torus_state::NativeDaStore::arrival_generation();
+    fetcher.fetch(hashes);
+
+    if let Some(m) = metrics {
+        m.native_da_pull_requests.inc();
+    }
+
+    // Deadline-bounded loop (S395): a loaded scheduler overshoots each individual
+    // wait slice, and with per-ITERATION bounds those overshoots stack (13 x 20ms
+    // nominal was observed at 500ms+ wall under load). Bounding by wall-clock
+    // deadline keeps the total budget honest regardless of load.
+    let deadline = std::time::Instant::now() + delay * retries as u32;
+    loop {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        torus_state::NativeDaStore::wait_for_arrival(
+            seen,
+            std::cmp::min(delay, deadline - now),
+        );
+        TorusApp::absorb_fetched_bodies(mempool, fetcher);
+        if missing.iter().all(|h| mempool.get_native_da(h).is_some()) {
+            if let Some(m) = metrics {
+                m.native_da_pull_recovered.inc();
+            }
+            tracing::info!(count = missing.len(), "native-da pull: bodies recovered");
+            return true;
+        }
+        // Fold in our own absorb puts so they don't self-wake the next wait.
+        seen = torus_state::NativeDaStore::arrival_generation();
+    }
+    tracing::warn!(
+        count = missing.len(),
+        "native-da pull: bodies NOT recovered within budget"
+    );
+    false
+}
+
 /// Bounded LOCAL retry on the hot validate path: a racing pre-proposal PUSH that lands
 /// just after the CompactBlock usually arrives within this window, so the common case
 /// never touches the network (keeps the pull rare). 5 × 20 ms = 100 ms.
@@ -1045,64 +1113,20 @@ impl TorusApp {
         delay: std::time::Duration,
     ) -> bool {
         if missing.is_empty() {
-            return true;
+            return true; // nothing to recover, even with no transport wired
         }
         let (Some(fetcher), Some(mempool)) = (self.da_fetcher.as_ref(), self.mempool.as_ref())
         else {
             return false; // no transport/store wired (consensus-only tests)
         };
-
-        // Pre-warm fast path (review F2): a body pushed-as-hash may already be sitting in the
-        // fetcher inbound (the receiver pre-warm-pulled it) but not yet absorbed — e.g. it
-        // landed just after the hot local-retry's last drain. Absorb + re-check BEFORE issuing
-        // a network fetch, so a pre-warmed (or late) body never triggers a redundant fetch.
-        Self::absorb_fetched_bodies(mempool, fetcher.as_ref());
-        if missing.iter().all(|h| mempool.get_native_da(h).is_some()) {
-            return true;
-        }
-
-        let hashes: Vec<[u8; 32]> = missing.iter().map(|h| h.0).collect();
-        // S391 wake-on-arrival: snapshot before firing the fetch so a push that
-        // races the pull wakes the first wait. Pull responses themselves land in
-        // the fetcher inbound and still need this thread's absorb, so the slices
-        // keep the old `delay` cadence as the worst case.
-        let mut seen = torus_state::NativeDaStore::arrival_generation();
-        fetcher.fetch(hashes);
-
-        if let Some(ref m) = self.metrics {
-            m.native_da_pull_requests.inc();
-        }
-
-        // Deadline-bounded loop (S395): a loaded scheduler overshoots each individual
-        // wait slice, and with per-ITERATION bounds those overshoots stack (13 x 20ms
-        // nominal was observed at 500ms+ wall under load). Bounding by wall-clock
-        // deadline keeps the total budget honest regardless of load.
-        let deadline = std::time::Instant::now() + delay * retries as u32;
-        loop {
-            let now = std::time::Instant::now();
-            if now >= deadline {
-                break;
-            }
-            torus_state::NativeDaStore::wait_for_arrival(
-                seen,
-                std::cmp::min(delay, deadline - now),
-            );
-            Self::absorb_fetched_bodies(mempool, fetcher.as_ref());
-            if missing.iter().all(|h| mempool.get_native_da(h).is_some()) {
-                if let Some(ref m) = self.metrics {
-                    m.native_da_pull_recovered.inc();
-                }
-                tracing::info!(count = missing.len(), "native-da pull: bodies recovered");
-                return true;
-            }
-            // Fold in our own absorb puts so they don't self-wake the next wait.
-            seen = torus_state::NativeDaStore::arrival_generation();
-        }
-        tracing::warn!(
-            count = missing.len(),
-            "native-da pull: bodies NOT recovered within budget"
-        );
-        false
+        recover_bodies_bounded(
+            mempool,
+            fetcher.as_ref(),
+            missing,
+            retries,
+            delay,
+            self.metrics.as_deref(),
+        )
     }
 
     /// Reconstruct a CompactBlock's native-action bodies for the HOT validate path
