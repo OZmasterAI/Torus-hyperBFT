@@ -1,0 +1,116 @@
+{
+  "prp": "o2-placeorderbatch",
+  "created": "2026-07-06T00:00:00Z",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Spec-pin: mixed pass/fail batch test (per-order isolation, failed order consumes no order-id, state == singles minus failed) — MUST PASS against current code",
+      "status": "pending",
+      "files": [
+        "crates/torus-bridge/tests/parallel_matching_tests.rs"
+      ],
+      "validate": "lap test -p torus-bridge --test parallel_matching_tests mixed_batch_pass_fail_pins_partial_per_order_contract",
+      "depends_on": []
+    },
+    {
+      "id": 2,
+      "name": "G1 exec-side deterministic oversize-batch skip at the execute_batch flatten + wrapper-arm guard; move NATIVE_ORDERS_PER_BATCH_CAP to torus-types with rate_limit.rs re-export (bridge cannot dep mempool) — test FAILS first",
+      "status": "pending",
+      "files": [
+        "crates/torus-types/src/lib.rs",
+        "crates/torus-mempool/src/rate_limit.rs",
+        "crates/torus-bridge/src/native_executor.rs",
+        "crates/torus-bridge/tests/parallel_matching_tests.rs"
+      ],
+      "validate": "lap test -p torus-bridge --test parallel_matching_tests oversize_batch_skipped_deterministically_sibling_executes && lap test -p torus-mempool && lap test -p torus-integration-tests --test o5_feed_gates",
+      "depends_on": [1]
+    },
+    {
+      "id": 3,
+      "name": "G1 gossip/DA-admit defensive validate_batch_size in Mempool::admit_gossip (AFTER mirror_to_da — availability != validity); covers gossip topic + pre-proposal push + forward + trusted paths — test FAILS first",
+      "status": "pending",
+      "files": [
+        "crates/torus-mempool/src/lib.rs"
+      ],
+      "validate": "lap test -p torus-mempool gossip_admit_rejects_oversize_and_empty_batch_but_keeps_da_mirror",
+      "depends_on": [2]
+    },
+    {
+      "id": 4,
+      "name": "G2 order-aware selection budget: orders_cap param on select_for_block_with_senders_excluding (deterministic-prefix break via order_count), native_orders_per_block_cap() env accessor, app.rs produce_block wired — test FAILS first (signature change)",
+      "status": "pending",
+      "files": [
+        "crates/torus-mempool/src/rate_limit.rs",
+        "crates/torus-mempool/src/native_pool.rs",
+        "crates/torus-mempool/src/lib.rs",
+        "crates/torus-consensus/src/app.rs"
+      ],
+      "validate": "lap test -p torus-mempool order_budget_bounds_selection_and_preserves_cancels_first && lap test -p torus-consensus",
+      "depends_on": []
+    },
+    {
+      "id": 5,
+      "name": "G3 SessionScope::Trading += PlaceOrderBatch with LOCKSTEP-DEPLOY doc comment on the match arm (consensus verify path slashes proposers on old validators) — test FAILS first",
+      "status": "pending",
+      "files": [
+        "crates/torus-types/src/lib.rs",
+        "crates/torus-types/src/eip712.rs"
+      ],
+      "validate": "lap test -p torus-types trading_scope_allows_place_order_batch_transfers_only_rejects",
+      "depends_on": []
+    },
+    {
+      "id": 6,
+      "name": "RPC-only unknown-market ingress guard (validate_known_markets: CF_NATIVE_MARKETS point-get, dedup'd for batches) in verify_one_action_with + submit_native_action; closes the phantom tick=1/lot=1 book trap at ingress — test FAILS first",
+      "status": "pending",
+      "files": [
+        "crates/torus-rpc/src/torus.rs",
+        "crates/torus-rpc/src/lib.rs"
+      ],
+      "validate": "lap test -p torus-rpc submit_rejects_unknown_market_single_and_batch",
+      "depends_on": []
+    },
+    {
+      "id": 7,
+      "name": "G5 PlaceOrderBatch golden vectors (PlaceOrderBatch_TwoOrders + PlaceOrderBatch_SingleOrder) in all_vectors(); drift gate fails RED until fixture regenerated on laptop and rsynced back; TS parity = external follow-up in torus-trading-app",
+      "status": "pending",
+      "files": [
+        "crates/torus-types/tests/eip712_vectors.rs",
+        "crates/torus-types/tests/fixtures/eip712_vectors.json"
+      ],
+      "validate": "lap sh 'cd ~/projects/Torus-hyperBFT && PATH=$HOME/.cargo/bin:$PATH cargo test -p torus-types --test eip712_vectors write_eip712_fixture_file -- --ignored' && rsync -az -e \"ssh -p 2222\" oz@localhost:projects/Torus-hyperBFT/crates/torus-types/tests/fixtures/eip712_vectors.json crates/torus-types/tests/fixtures/ && lap test -p torus-types --test eip712_vectors",
+      "depends_on": []
+    },
+    {
+      "id": 8,
+      "name": "G6 criterion bench exec_place_batch: 400 signed singles vs 1 signed batch of 400 (same orders, equivalence asserted in setup); timed path = batch_verify_native_actions + execute_batch; register [[bench]] in torus-bridge Cargo.toml",
+      "status": "pending",
+      "files": [
+        "crates/torus-bridge/benches/exec_place_batch.rs",
+        "crates/torus-bridge/Cargo.toml"
+      ],
+      "validate": "lap sh 'cd ~/projects/Torus-hyperBFT && PATH=$HOME/.cargo/bin:$PATH cargo bench -p torus-bridge --bench exec_place_batch'",
+      "depends_on": [1, 2]
+    },
+    {
+      "id": 9,
+      "name": "Devnet sweep script sweep-o2-batchsize-s416.sh (S415 methodology, legs bs:rate = 1:100 100:10 400:3 1024:2, no TORUS_PUSH_THRESHOLD override) + roadmap O2 stale-entry rewrite + handoff state note; sweep EXECUTION deferred to a later session",
+      "status": "pending",
+      "files": [
+        "devnet/sweep-o2-batchsize-s416.sh",
+        "docs/plans/blockspeed-orders-roadmap-s405.md",
+        ".claude-state.json"
+      ],
+      "validate": "bash -n devnet/sweep-o2-batchsize-s416.sh",
+      "depends_on": [2, 3, 4, 5, 6, 7, 8]
+    },
+    {
+      "id": 10,
+      "name": "End-to-end gate: workspace tests green + clippy -D warnings green on the laptop",
+      "status": "pending",
+      "files": [],
+      "validate": "lap sh 'cd ~/projects/Torus-hyperBFT && PATH=$HOME/.cargo/bin:$PATH cargo test --workspace' && lap sh 'cd ~/projects/Torus-hyperBFT && PATH=$HOME/.cargo/bin:$PATH cargo clippy --workspace --all-targets -- -D warnings'",
+      "depends_on": [1, 2, 3, 4, 5, 6, 7, 8, 9]
+    }
+  ]
+}
