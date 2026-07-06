@@ -12,14 +12,13 @@
 
 mod common;
 
-use alloy_primitives::{Address, B256, U256};
-use revm::state::AccountInfo;
+use alloy_primitives::{Address, B256};
 
 use torus_bridge::native_executor::{NativeExecContext, NativeExecutor};
 use torus_core::precompiles::{CoreWriterQueue, QueuedAction, QueuedActionKind};
 use torus_mempool::{Mempool, MempoolConfig};
 use torus_state::StateDb;
-use torus_types::{ActionSignature, FixedPoint, NativeAction, Signature, SignedNativeAction};
+use torus_types::{ActionSignature, NativeAction, Signature, SignedNativeAction};
 
 fn addr(n: u8) -> Address {
     Address::new([n; 20])
@@ -136,8 +135,15 @@ fn native_per_block_cap_defers_excess() {
     let pool = Mempool::new(state.clone(), config);
 
     let sender = addr(1);
+    // Nonces are ms timestamps (Hyperliquid-style): drain_native runs evict_expired,
+    // which drops anything older than NONCE_WINDOW_MS — toy sequence nonces get
+    // mass-evicted before the drain can ever see them.
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
     for i in 1..=5 {
-        pool.submit_native_action(sender, make_native(i, NativeAction::ClaimRewards))
+        pool.submit_native_action(sender, make_native(now_ms + i, NativeAction::ClaimRewards))
             .unwrap();
     }
 
@@ -249,8 +255,6 @@ fn same_gas_price_ordering_deterministic_by_parent_hash() {
     // the ordering changes when the parent hash changes.
     // We test this at the pool level since creating real EVM txs is complex.
 
-    use torus_mempool::evm_pool::EvmPoolEntry;
-
     // We can't easily test EvmPool directly since it's pub(crate).
     // Instead, we verify via the Mempool drain with different parent hashes.
     // The key property: same pool contents + different parent hash → potentially
@@ -279,7 +283,7 @@ fn same_gas_price_ordering_deterministic_by_parent_hash() {
 
 #[test]
 fn native_actions_ordered_by_sender_within_category() {
-    use torus_bridge::native_executor::{classify_action, sort_native_actions, ActionCategory};
+    use torus_bridge::native_executor::sort_native_actions;
 
     // Two senders with actions in the same category.
     let sender_a = addr(0xAA);

@@ -19,12 +19,15 @@ use torus_types::{
     SignedNativeAction, TorusBlockHeader,
 };
 
-/// Mock pull transport standing in for `/torus/native-da/1.0`. `fetch` records the
-/// call; `drain` hands over the bodies the peer "holds" (staged by the test) once,
-/// modelling a successful response landing on the inbound queue.
+/// Mock pull transport standing in for `/torus/native-da/1.0`. The peer "holds"
+/// the staged bodies; they land on the inbound queue only when `fetch` is called,
+/// modelling a response to an actual request. (The F2 pre-warm absorb drains the
+/// inbound BEFORE fetching — an unconditionally-full inbound would satisfy the miss
+/// without any fetch and break the fetch-count assertions.)
 struct MockFetcher {
     fetch_calls: AtomicUsize,
     staged: Mutex<Vec<Vec<u8>>>,
+    inbound: Mutex<Vec<Vec<u8>>>,
 }
 
 impl MockFetcher {
@@ -32,6 +35,7 @@ impl MockFetcher {
         Self {
             fetch_calls: AtomicUsize::new(0),
             staged: Mutex::new(bodies),
+            inbound: Mutex::new(Vec::new()),
         }
     }
     fn fetch_calls(&self) -> usize {
@@ -42,9 +46,11 @@ impl MockFetcher {
 impl NativeDaFetcher for MockFetcher {
     fn fetch(&self, _hashes: Vec<[u8; 32]>) {
         self.fetch_calls.fetch_add(1, Ordering::SeqCst);
+        let staged = std::mem::take(&mut *self.staged.lock().unwrap());
+        self.inbound.lock().unwrap().extend(staged);
     }
     fn drain(&self) -> Vec<Vec<u8>> {
-        std::mem::take(&mut *self.staged.lock().unwrap())
+        std::mem::take(&mut *self.inbound.lock().unwrap())
     }
 }
 

@@ -6,7 +6,7 @@ use alloy_primitives::{Address, B256, U256};
 use revm::state::AccountInfo;
 use tempfile::TempDir;
 
-use torus_economics::{EpochManager, StakingManager};
+use torus_economics::StakingManager;
 use torus_state::{SnapshotConfig, SnapshotManager, SnapshotMetadata, StateDb};
 use torus_types::{NativeAction, PublicKey};
 
@@ -58,8 +58,10 @@ fn snapshot_lifecycle_create_verify_restore() {
             .unwrap();
     }
 
-    // Compute state root
-    let state_root = torus_state::trie::compute_state_root_from_db(&db).unwrap();
+    // Compute state root (composite EVM+native, matching what verify_snapshot recomputes)
+    let evm_root = torus_state::trie::compute_state_root_from_db(&db).unwrap();
+    let native_root = torus_state::native_trie::native_root_full(&db).unwrap();
+    let state_root = torus_state::trie::compute_composite_root(evm_root, native_root);
 
     // Create snapshot
     let snap_dir = TempDir::new().unwrap();
@@ -97,9 +99,9 @@ fn snapshot_lifecycle_create_verify_restore() {
         assert_eq!(acct.balance, U256::from(1000u64 + i as u64));
     }
 
-    // Verify state root matches
+    // Verify state root matches (EVM half; the native half is covered by verify_snapshot above)
     let restored_root = torus_state::trie::compute_state_root_from_db(&restored_db).unwrap();
-    assert_eq!(restored_root, state_root);
+    assert_eq!(restored_root, evm_root);
 }
 
 #[test]
@@ -107,7 +109,11 @@ fn snapshot_corrupted_metadata_rejected() {
     let (dir, db) = setup_db();
     fund(&db, &addr(1), U256::from(1000u64));
 
-    let state_root = torus_state::trie::compute_state_root_from_db(&db).unwrap();
+    // Composite root so the uncorrupted snapshot would actually verify —
+    // keeps this test failing for the corruption, not for a root-type mismatch.
+    let evm_root = torus_state::trie::compute_state_root_from_db(&db).unwrap();
+    let native_root = torus_state::native_trie::native_root_full(&db).unwrap();
+    let state_root = torus_state::trie::compute_composite_root(evm_root, native_root);
 
     let snap_dir = TempDir::new().unwrap();
     let snap_path = snap_dir.path().join("snap_corrupt");
@@ -263,6 +269,15 @@ fn ban_list_persists_across_restarts() {
         for _ in 0..10 {
             scoring.penalize(&peer, PENALTY_INVALID_CONSENSUS_MSG, "attack");
         }
+    }
+
+    // save_bans writes on a detached background thread (CONS-FIND-29);
+    // wait for the flush before reloading, like peer_scoring::ban_list_persistence.
+    for _ in 0..100 {
+        if ban_file.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 
     // Reload
