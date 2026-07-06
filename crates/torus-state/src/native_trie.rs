@@ -345,6 +345,7 @@ fn read_node(
 
 /// Read a bucket's current members from the mirror (prefix scan), decoded as `(cf_tag, key) -> value`
 /// in canonical order.
+#[allow(clippy::type_complexity)]
 fn read_bucket_members(
     db: &StateDb,
     bucket: u16,
@@ -380,6 +381,7 @@ fn compute_native_dirty_ops(
     let mut ops: Vec<NodeOp> = Vec::new();
 
     // 1. Group dirty entries by bucket.
+    #[allow(clippy::type_complexity)]
     let mut by_bucket: BTreeMap<u16, Vec<((u8, Vec<u8>), Option<Vec<u8>>)>> = BTreeMap::new();
     for ((tag, key), val) in dirty {
         let b = bucket_id(*tag, key);

@@ -48,6 +48,7 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
     const MAX_SYNC_BLOCKS_PER_TICK: usize = 128;
 
     /// Create an instance of the algorithm thread.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         chain_id: ChainID,
         hotstuff_config: HotStuffConfiguration,

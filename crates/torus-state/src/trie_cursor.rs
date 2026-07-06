@@ -288,7 +288,7 @@ impl<'a> RocksTrieCursor<'a> {
         let path = Nibbles::from_nibbles_unchecked(nibble_bytes);
         let value = self.iter.value().expect("valid iterator has a value");
         let node = decode_branch_node(value).map_err(to_db_err)?;
-        self.current = Some(path.clone());
+        self.current = Some(path);
         Ok(Some((path, node)))
     }
 }
@@ -325,7 +325,7 @@ impl<'a> TrieCursor for RocksTrieCursor<'a> {
     }
 
     fn current(&mut self) -> Result<Option<Nibbles>, DatabaseError> {
-        Ok(self.current.clone())
+        Ok(self.current)
     }
 
     fn reset(&mut self) {
@@ -513,13 +513,10 @@ impl<'a> HashedCursor for RocksHashedStorageCursor<'a> {
 
 impl<'a> HashedStorageCursor for RocksHashedStorageCursor<'a> {
     fn is_storage_empty(&mut self) -> Result<bool, DatabaseError> {
-        self.iter.seek(&self.prefix);
+        self.iter.seek(self.prefix);
         self.iter.status().map_err(to_db_err)?;
-        let has_entry = self.iter.valid()
-            && self
-                .iter
-                .key()
-                .map_or(false, |k| k.starts_with(&self.prefix));
+        let has_entry =
+            self.iter.valid() && self.iter.key().is_some_and(|k| k.starts_with(&self.prefix));
         Ok(!has_entry)
     }
 

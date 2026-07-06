@@ -74,7 +74,6 @@ impl<N: Network> Pacemaker<N> {
         let timeout = state
             .timeouts
             .get(&init_view)
-            .clone()
             .ok_or(UpdateViewError::GetViewTimeoutError { view: init_view })?;
         let view_info = ViewInfo::new(init_view, *timeout);
         Ok(Self {
@@ -232,7 +231,7 @@ impl<N: Network> Pacemaker<N> {
     ) -> Result<(), PacemakerError> {
         Event::ReceiveTimeoutVote(ReceiveTimeoutVoteEvent {
             timestamp: SystemTime::now(),
-            origin: origin.clone(),
+            origin: *origin,
             timeout_vote: timeout_vote.clone(),
         })
         .publish(&self.event_publisher);
@@ -257,7 +256,7 @@ impl<N: Network> Pacemaker<N> {
                     .state
                     .bracha_timeout_voters
                     .entry(timeout_vote.view)
-                    .or_insert_with(BTreeSet::new);
+                    .or_default();
                 if !voters.contains(&voter_key) {
                     voters.insert(voter_key);
                     // Look up voter's power and accumulate.
@@ -287,12 +286,12 @@ impl<N: Network> Pacemaker<N> {
                 } else {
                     0
                 };
-                if accumulated_power >= f + 1
+                if accumulated_power > f
                     && is_validator(&self.config.keypair.public(), &validator_set_state)
                     && self
                         .state
                         .last_timeout_vote_view
-                        .map_or(true, |v| v < timeout_vote.view)
+                        .is_none_or(|v| v < timeout_vote.view)
                 {
                     let own_timeout = PacemakerMessage::timeout_vote(
                         &self.config.keypair,
@@ -431,7 +430,7 @@ impl<N: Network> Pacemaker<N> {
     ) -> Result<(), PacemakerError> {
         Event::ReceiveAdvanceView(ReceiveAdvanceViewEvent {
             timestamp: SystemTime::now(),
-            origin: origin.clone(),
+            origin: *origin,
             advance_view: advance_view.clone(),
         })
         .publish(&self.event_publisher);
@@ -448,7 +447,7 @@ impl<N: Network> Pacemaker<N> {
             ProgressCertificate::PhaseCertificate(pc) => pc.is_correct(block_tree)?,
             // FIX CONS-FIND-18: Accept TCs in AdvanceView for ANY view, not just
             // epoch-change views. TCs are valid for liveness at any view.
-            ProgressCertificate::TimeoutCertificate(tc) => tc.is_correct(&block_tree)?,
+            ProgressCertificate::TimeoutCertificate(tc) => tc.is_correct(block_tree)?,
         };
 
         if is_valid {
@@ -467,7 +466,7 @@ impl<N: Network> Pacemaker<N> {
                 if block_tree.highest_tc()?.is_none()
                     || tc.view > block_tree.highest_tc()?.unwrap().view
                 {
-                    block_tree.set_highest_tc(&tc)?;
+                    block_tree.set_highest_tc(tc)?;
                     Event::UpdateHighestTC(UpdateHighestTCEvent {
                         timestamp: SystemTime::now(),
                         highest_tc: tc.clone(),
@@ -591,9 +590,7 @@ impl<N: Network> Pacemaker<N> {
         // 1. Confirm that the current view is an Epoch-Change View.
         let cur_view = self.view_info.view;
         if !is_epoch_change_view(&cur_view, self.config.epoch_length) {
-            return Err(ExtendViewError::TriedToExtendNonEpochView {
-                view: cur_view.clone(),
-            });
+            return Err(ExtendViewError::TriedToExtendNonEpochView { view: cur_view });
         };
 
         // 2. Increase the timeout of the current view inside `PacemakerState`.
@@ -730,15 +727,16 @@ impl PacemakerState {
 
 /// Enumerates the different ways a call to any of [`Pacemaker`]'s methods can fail.
 #[derive(Debug)]
+#[allow(clippy::enum_variant_names)]
 pub enum PacemakerError {
     /// See: [`UpdateViewError`].
-    UpdateViewError(UpdateViewError),
+    UpdateViewError(#[allow(dead_code)] UpdateViewError),
 
     /// See: [`ExtendViewError`].
-    ExtendViewError(ExtendViewError),
+    ExtendViewError(#[allow(dead_code)] ExtendViewError),
 
     /// See: [`BlockTreeError`]
-    BlockTreeError(BlockTreeError),
+    BlockTreeError(#[allow(dead_code)] BlockTreeError),
 }
 
 impl From<BlockTreeError> for PacemakerError {
@@ -766,26 +764,37 @@ pub enum UpdateViewError {
     /// must be monotonically increasing.
     NonIncreasingViewError {
         /// The current view.
+        #[allow(dead_code)]
         cur_view: ViewNumber,
 
         /// The lower view that the caller tried to change the current view to.
+        #[allow(dead_code)]
         next_view: ViewNumber,
     },
 
     /// The timeout for a requested view cannot be found in the [`PacemakerState`]. This violates the invariant
     /// that the `Pacemaker` should be able to provide the timeout of any view it returns from
     /// [`view_info`](Pacemaker::view_info).
-    GetViewTimeoutError { view: ViewNumber },
+    GetViewTimeoutError {
+        #[allow(dead_code)]
+        view: ViewNumber,
+    },
 }
 
 /// Enumerates the different ways a [`Pacemaker::extend_view`] call can fail.
 #[derive(Debug)]
 pub enum ExtendViewError {
     /// An attempt was made to extend a view that is not an Epoch-Change view.
-    TriedToExtendNonEpochView { view: ViewNumber },
+    TriedToExtendNonEpochView {
+        #[allow(dead_code)]
+        view: ViewNumber,
+    },
 
     /// Same as [`UpdateViewError::GetViewTimeoutError`].
-    GetViewTimeoutError { view: ViewNumber },
+    GetViewTimeoutError {
+        #[allow(dead_code)]
+        view: ViewNumber,
+    },
 }
 
 /// Describes a view (most often the current view), in terms of its view number and its view deadline (the
@@ -980,7 +989,7 @@ fn is_epoch_change_view(view: &ViewNumber, epoch_length: EpochLength) -> bool {
     if el == 0 {
         return false;
     }
-    view.int() % el == 0
+    view.int().is_multiple_of(el)
 }
 
 /// Compute the current epoch based on the current `view` and the configured `epoch_length`.

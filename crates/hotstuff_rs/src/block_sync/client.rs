@@ -221,7 +221,7 @@ impl<N: Network> BlockSyncClient<N> {
         let has_work = self
             .pending_sync
             .as_ref()
-            .map_or(false, |s| !s.awaiting_fetch && !s.pending_blocks.is_empty());
+            .is_some_and(|s| !s.awaiting_fetch && !s.pending_blocks.is_empty());
         if !has_work {
             // If session exists, not awaiting, and blocks empty → request next batch
             if let Some(session) = &self.pending_sync {
@@ -238,7 +238,7 @@ impl<N: Network> BlockSyncClient<N> {
         while session
             .pending_blocks
             .front()
-            .map_or(false, |b| block_tree.contains(&b.hash))
+            .is_some_and(|b| block_tree.contains(&b.hash))
         {
             session.pending_blocks.pop_front();
         }
@@ -618,10 +618,7 @@ impl BlockSyncClientState {
     }
 
     fn blacklist_contains_server_address(&self, sync_server: &VerifyingKey) -> bool {
-        self.blacklist
-            .iter()
-            .find(|(vk, _)| vk == sync_server)
-            .is_some()
+        self.blacklist.iter().any(|(vk, _)| vk == sync_server)
     }
 
     fn register_or_update_sync_server(
@@ -766,7 +763,7 @@ mod blacklist_decision_tests {
 
 #[derive(Debug)]
 pub enum BlockSyncClientError {
-    BlockTreeError(BlockTreeError),
+    BlockTreeError(#[allow(dead_code)] BlockTreeError),
 }
 
 impl From<BlockTreeError> for BlockSyncClientError {
@@ -804,8 +801,7 @@ fn is_sync_server_address<K: KVStore>(
                 });
 
             Ok(speculative_vs_updates
-                .find(|vs_updates| vs_updates.get_insert(verifying_key).is_some())
-                .is_some())
+                .any(|vs_updates| vs_updates.get_insert(verifying_key).is_some()))
         }
         None => Ok(false),
     }

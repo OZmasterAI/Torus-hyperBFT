@@ -33,6 +33,7 @@ fn make_validator_set(n: usize) -> (Vec<SigningKey>, ValidatorSet) {
     (keypairs, vs)
 }
 
+#[allow(dead_code)]
 fn genesis_pc() -> PhaseCertificate {
     PhaseCertificate::genesis_pc()
 }

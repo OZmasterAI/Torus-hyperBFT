@@ -55,6 +55,7 @@ pub struct TimeoutCertificate {
     /// Each entry corresponds to the same position as in `signatures`:
     /// (optional local_tip block hash, optional (highest_qc view, highest_qc block hash)).
     /// This enables TC verification to reconstruct per-voter message bytes.
+    #[allow(clippy::type_complexity)]
     pub voter_metadata: Vec<(Option<CryptoHash>, Option<(ViewNumber, CryptoHash)>)>,
 }
 
@@ -150,6 +151,7 @@ pub(crate) struct TimeoutVoteCollector {
     high_qc: Option<PhaseCertificate>,
     /// Per-voter metadata: (optional local_tip hash, optional (highest_qc view, highest_qc block)).
     /// Indexed by validator position, enables TC signature verification.
+    #[allow(clippy::type_complexity)]
     voter_metadata: Vec<(Option<CryptoHash>, Option<(ViewNumber, CryptoHash)>)>,
 }
 

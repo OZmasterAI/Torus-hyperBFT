@@ -86,10 +86,10 @@ impl StateDb {
         }
 
         // Create checkpoint (atomic, hardlink-based)
-        let checkpoint = Checkpoint::new(self.inner()).map_err(|e| StateError::RocksDb(e))?;
+        let checkpoint = Checkpoint::new(self.inner()).map_err(StateError::RocksDb)?;
         checkpoint
             .create_checkpoint(output_path)
-            .map_err(|e| StateError::RocksDb(e))?;
+            .map_err(StateError::RocksDb)?;
 
         // Write metadata sidecar
         let metadata_path = output_path.join(METADATA_FILENAME);
@@ -126,7 +126,7 @@ impl StateDb {
             .collect();
 
         let db = DB::open_cf_descriptors_read_only(&opts, snapshot_path, cf_descriptors, false)
-            .map_err(|e| StateError::RocksDb(e))?;
+            .map_err(StateError::RocksDb)?;
 
         let snapshot_db = StateDb::from_existing_db(db);
 
@@ -234,7 +234,7 @@ impl SnapshotManager {
     pub fn should_snapshot(&self, block_height: u64) -> bool {
         self.config.snapshot_interval > 0
             && block_height > 0
-            && block_height % self.config.snapshot_interval == 0
+            && block_height.is_multiple_of(self.config.snapshot_interval)
     }
 
     /// Create a snapshot and prune old ones if needed.

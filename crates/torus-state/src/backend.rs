@@ -28,6 +28,7 @@ pub trait StateBackend: Clone + Send + Sync {
 
     /// Iterate entries in a column family. `prefix: Some(p)` returns only keys
     /// starting with `p`; `None` returns all entries. Results are in sorted key order.
+    #[allow(clippy::type_complexity)]
     fn iterate_cf(
         &self,
         cf: &str,
@@ -404,14 +405,14 @@ impl StateBackend for NativeStateOverlay {
             .writes
             .range((cf_str.clone(), Vec::new())..)
             .take_while(|((c, _), _)| c == &cf_str)
-            .filter(|((_, k), _)| prefix.map_or(true, |p| k.starts_with(p)))
+            .filter(|((_, k), _)| prefix.is_none_or(|p| k.starts_with(p)))
             .map(|((_, k), v)| (k.clone(), v.clone()))
             .collect();
 
         let tombstones: HashSet<Vec<u8>> = state
             .deletes
             .iter()
-            .filter(|(c, k)| c == &cf_str && prefix.map_or(true, |p| k.starts_with(p)))
+            .filter(|(c, k)| c == &cf_str && prefix.is_none_or(|p| k.starts_with(p)))
             .map(|(_, k)| k.clone())
             .collect();
         drop(state);

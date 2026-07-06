@@ -164,9 +164,9 @@ impl From<NewView> for HotStuffMessage {
     }
 }
 
-impl Into<ProgressMessage> for HotStuffMessage {
-    fn into(self) -> ProgressMessage {
-        ProgressMessage::HotStuffMessage(self)
+impl From<HotStuffMessage> for ProgressMessage {
+    fn from(val: HotStuffMessage) -> Self {
+        ProgressMessage::HotStuffMessage(val)
     }
 }
 
@@ -192,7 +192,7 @@ pub struct Proposal {
 impl Proposal {
     /// Returns true if this proposal is a reproposal (MonadBFT Case 4).
     pub fn is_reproposal(&self) -> bool {
-        self.tc.as_ref().map_or(false, |tc| tc.high_tip_is_winner)
+        self.tc.as_ref().is_some_and(|tc| tc.high_tip_is_winner)
     }
 }
 
@@ -479,7 +479,7 @@ pub type PendingBodies = HashMap<CryptoHash, Block>;
 mod tests {
     use super::*;
     use crate::hotstuff::types::PhaseCertificate;
-    use crate::types::data_types::*;
+
     use borsh::BorshDeserialize;
 
     fn genesis_pc() -> PhaseCertificate {

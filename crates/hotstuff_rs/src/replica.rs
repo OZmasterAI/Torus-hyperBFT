@@ -247,46 +247,39 @@ pub struct Configuration {
     pub log_events: bool,
 }
 
-impl
-    Into<(
+impl From<Configuration>
+    for (
         HotStuffConfiguration,
         PacemakerConfiguration,
         BlockSyncClientConfiguration,
         BlockSyncServerConfiguration,
-    )> for Configuration
+    )
 {
-    fn into(
-        self,
-    ) -> (
-        HotStuffConfiguration,
-        PacemakerConfiguration,
-        BlockSyncClientConfiguration,
-        BlockSyncServerConfiguration,
-    ) {
-        let keypair = Keypair::new(self.me);
+    fn from(val: Configuration) -> Self {
+        let keypair = Keypair::new(val.me);
         let hotstuff_config = HotStuffConfiguration {
-            chain_id: self.chain_id,
+            chain_id: val.chain_id,
             keypair: keypair.clone(),
         };
         let pacemaker_config = PacemakerConfiguration {
-            chain_id: self.chain_id,
+            chain_id: val.chain_id,
             keypair: keypair.clone(),
-            epoch_length: self.epoch_length,
-            max_view_time: self.max_view_time,
+            epoch_length: val.epoch_length,
+            max_view_time: val.max_view_time,
         };
         let block_sync_client_config = BlockSyncClientConfiguration {
-            chain_id: self.chain_id,
-            request_limit: self.block_sync_request_limit,
-            response_timeout: self.block_sync_response_timeout,
-            blacklist_expiry_time: self.block_sync_blacklist_expiry_time,
-            block_sync_trigger_min_view_difference: self.block_sync_trigger_min_view_difference,
-            block_sync_trigger_timeout: self.block_sync_trigger_timeout,
+            chain_id: val.chain_id,
+            request_limit: val.block_sync_request_limit,
+            response_timeout: val.block_sync_response_timeout,
+            blacklist_expiry_time: val.block_sync_blacklist_expiry_time,
+            block_sync_trigger_min_view_difference: val.block_sync_trigger_min_view_difference,
+            block_sync_trigger_timeout: val.block_sync_trigger_timeout,
         };
         let block_sync_server_config = BlockSyncServerConfiguration {
-            chain_id: self.chain_id,
+            chain_id: val.chain_id,
             keypair: keypair.clone(),
-            request_limit: self.block_sync_request_limit,
-            advertise_time: self.block_sync_server_advertise_time,
+            request_limit: val.block_sync_request_limit,
+            advertise_time: val.block_sync_server_advertise_time,
         };
         (
             hotstuff_config,

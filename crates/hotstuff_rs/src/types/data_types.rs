@@ -374,6 +374,11 @@ impl SignatureSet {
     pub fn len(&self) -> usize {
         self.0.len()
     }
+
+    /// Returns `true` if the inner `Vec<Option<SignatureBytes>>` of this `SignatureSet` is empty.
+    pub fn is_empty(&self) -> bool {
+        self.0.len() == 0
+    }
 }
 
 /// View number. Starts at 0 and increases by 1 every time the [Pacemaker](crate::pacemaker) times out.

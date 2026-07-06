@@ -563,7 +563,7 @@ pub(crate) fn block_to_commit<K: KVStore>(
             let not_committed_yet = {
                 let parent_height = block_tree.block_height(&justify.block)?.ok_or(
                     BlockTreeError::BlockExpectedButNotFound {
-                        block: justify.block.clone(),
+                        block: justify.block,
                     },
                 )?;
                 let highest_committed_block_height = block_tree.highest_committed_block_height()?;
@@ -626,9 +626,8 @@ fn extends_locked_pc_block<K: KVStore>(
     let locked_pc = block_tree.locked_pc()?;
     let block = pc.block;
     let block_parent = block_tree.block_justify(&block).ok().map(|pc| pc.block);
-    let block_grandparent = block_parent
-        .map(|b| block_tree.block_justify(&b).ok().map(|pc| pc.block))
-        .flatten();
+    let block_grandparent =
+        block_parent.and_then(|b| block_tree.block_justify(&b).ok().map(|pc| pc.block));
     Ok(block == locked_pc.block
         || block_parent.is_some_and(|b| b == locked_pc.block)
         || block_grandparent.is_some_and(|b| b == locked_pc.block))

@@ -81,6 +81,7 @@ pub struct UpdateResult {
 /// 3. [Helper functions called by `BlockTree::update`](#impl-BlockTreeSingleton<K>-2).
 /// 4. [Basic state getters](#impl-BlockTreeSingleton<K>-3).
 /// 5. [Extra state getters](#impl-BlockTreeSingleton<K>-4).
+///
 /// `self.0` is the backing key-value store; `self.1` is a write-through in-memory
 /// cache of the deserialized `LeaderReputation` (MonadBFT B3). It is lazily loaded
 /// on first read and refreshed on every reputation write, eliminating the ~9 KV
@@ -144,8 +145,8 @@ impl<K: KVStore> BlockTreeSingleton<K> {
         let update_height = initial_validator_set_state.update_height();
         let update_decided = initial_validator_set_state.update_decided();
 
-        wb.set_committed_validator_set(&committed_validator_set)?;
-        wb.set_previous_validator_set(&previous_validator_set)?;
+        wb.set_committed_validator_set(committed_validator_set)?;
+        wb.set_previous_validator_set(previous_validator_set)?;
         if let Some(height) = *update_height {
             wb.set_validator_set_update_block_height(height)?
         }
@@ -179,40 +180,28 @@ impl<K: KVStore> BlockTreeSingleton<K> {
         parent: Option<&CryptoHash>,
     ) -> Result<AppBlockTreeView<'a, K>, BlockTreeError> {
         let highest_committed_block_height = self.highest_committed_block_height()?;
-        let parent = match parent {
-            None => None,
-            Some(&b) => Some(b),
-        };
+        let parent = parent.copied();
 
         // Obtain an iterator over the ancestors starting from the parent, all the way until genesis,
         // from newest (parent) to oldest.
         let ancestors_iter = successors(parent, |b| {
-            self.block_justify(b)
-                .ok()
-                .map(|pc| {
-                    if !pc.is_genesis_pc() {
-                        Some(pc.block)
-                    } else {
-                        None
-                    }
-                })
-                .flatten()
+            self.block_justify(b).ok().and_then(|pc| {
+                if !pc.is_genesis_pc() {
+                    Some(pc.block)
+                } else {
+                    None
+                }
+            })
         });
 
         let ancestors_heights_iter = ancestors_iter
             .clone()
-            .map(|block| {
-                self.block_height(&block).map(|res| {
-                    if res.is_none() {
-                        Err(BlockTreeError::BlockExpectedButNotFound {
-                            block: block.clone(),
-                        })
-                    } else {
-                        Ok(res.unwrap())
-                    }
+            .flat_map(|block| {
+                self.block_height(&block).map(|res| match res {
+                    Some(height) => Ok(height),
+                    None => Err(BlockTreeError::BlockExpectedButNotFound { block }),
                 })
             })
-            .flatten()
             .flatten();
 
         // Obtain an iterator over the uncomitted ancestors starting from the parent,
@@ -229,8 +218,7 @@ impl<K: KVStore> BlockTreeSingleton<K> {
         // starting from the parent, ending at the oldest uncommitted ancestor.
         let pending_ancestors_app_state_updates: Vec<Option<AppStateUpdates>> =
             uncommitted_ancestors_iter
-                .map(|block| self.pending_app_state_updates(&block))
-                .flatten()
+                .flat_map(|block| self.pending_app_state_updates(&block))
                 .collect();
 
         Ok(AppBlockTreeView {
@@ -281,9 +269,7 @@ impl<K: KVStore> BlockTreeSingleton<K> {
         }
 
         // Mark the block as a child of its parent block.
-        let mut siblings = self
-            .children(&block.justify.block)
-            .unwrap_or(ChildrenList::default());
+        let mut siblings = self.children(&block.justify.block).unwrap_or_default();
         siblings.push(block.hash);
         wb.set_children(&block.justify.block, &siblings)?;
 
@@ -329,13 +315,13 @@ impl<K: KVStore> BlockTreeSingleton<K> {
         }
 
         // 2. Update lockedPC if needed.
-        if let Some(new_locked_pc) = invariants::pc_to_lock(justify, &self)? {
+        if let Some(new_locked_pc) = invariants::pc_to_lock(justify, self)? {
             wb.set_locked_pc(&new_locked_pc)?;
             update_locked_pc = Some(new_locked_pc)
         }
 
         // 3. Commit block(s) if needed (MonadBFT 2-chain irrevocable commit).
-        if let Some(block) = invariants::block_to_commit(justify, &self)? {
+        if let Some(block) = invariants::block_to_commit(justify, self)? {
             committed_blocks = self.commit(&mut wb, &block)?;
         }
 
@@ -555,16 +541,13 @@ impl<K: KVStore> BlockTreeSingleton<K> {
     ) -> Result<Vec<(CryptoHash, Option<ValidatorSetUpdates>)>, BlockTreeError> {
         // Obtain an iterator over the "block" and its ancestors, all the way until genesis, from newest ("block") to oldest.
         let blocks_iter = successors(Some(*block), |b| {
-            self.block_justify(b)
-                .ok()
-                .map(|pc| {
-                    if !pc.is_genesis_pc() {
-                        Some(pc.block)
-                    } else {
-                        None
-                    }
-                })
-                .flatten()
+            self.block_justify(b).ok().and_then(|pc| {
+                if !pc.is_genesis_pc() {
+                    Some(pc.block)
+                } else {
+                    None
+                }
+            })
         });
 
         // Newest committed block height, we do not consider the blocks from this height downwards.
@@ -576,12 +559,8 @@ impl<K: KVStore> BlockTreeSingleton<K> {
         // newest.
         let uncommitted_blocks_iter = blocks_iter.take_while(|b| {
             min_height.is_none()
-                || min_height.is_some_and(|h| {
-                    self.block_height(b)
-                        .ok()
-                        .flatten()
-                        .map_or(false, |bh| bh > h)
-                })
+                || min_height
+                    .is_some_and(|h| self.block_height(b).ok().flatten().is_some_and(|bh| bh > h))
         });
         let uncommitted_blocks = uncommitted_blocks_iter.collect::<Vec<CryptoHash>>();
         let uncommitted_blocks_ordered_iter = uncommitted_blocks.iter().rev();
@@ -602,7 +581,7 @@ impl<K: KVStore> BlockTreeSingleton<K> {
 
                 let block_height = self
                     .block_height(b)?
-                    .ok_or(BlockTreeError::BlockExpectedButNotFound { block: b.clone() })?;
+                    .ok_or(BlockTreeError::BlockExpectedButNotFound { block: *b })?;
                 // Work steps:
 
                 // Set block at height.
@@ -726,12 +705,12 @@ impl<K: KVStore> BlockTreeSingleton<K> {
         event_publisher: &Option<Sender<Event>>,
         update_highest_pc: Option<PhaseCertificate>,
         update_locked_pc: Option<PhaseCertificate>,
-        committed_blocks: &Vec<(CryptoHash, Option<ValidatorSetUpdates>)>,
+        committed_blocks: &[(CryptoHash, Option<ValidatorSetUpdates>)],
     ) {
         if let Some(highest_pc) = update_highest_pc {
             Event::UpdateHighestPC(UpdateHighestPCEvent {
                 timestamp: SystemTime::now(),
-                highest_pc: highest_pc,
+                highest_pc,
             })
             .publish(event_publisher)
         };
@@ -749,12 +728,12 @@ impl<K: KVStore> BlockTreeSingleton<K> {
             .for_each(|(b, validator_set_updates_opt)| {
                 Event::PruneBlock(PruneBlockEvent {
                     timestamp: SystemTime::now(),
-                    block: b.clone(),
+                    block: *b,
                 })
                 .publish(event_publisher);
                 Event::CommitBlock(CommitBlockEvent {
                     timestamp: SystemTime::now(),
-                    block: b.clone(),
+                    block: *b,
                 })
                 .publish(event_publisher);
                 if let Some(validator_set_updates) = validator_set_updates_opt {
@@ -958,9 +937,7 @@ impl<W: WriteBatch> BlockTreeWriteBatch<W> {
                 .height
                 .try_to_vec()
                 .map_err(|err| KVSetError::SerializeValueError {
-                    key: Key::BlockHeight {
-                        block: block.hash.clone(),
-                    },
+                    key: Key::BlockHeight { block: block.hash },
                     source: err,
                 })?,
         );
@@ -970,9 +947,7 @@ impl<W: WriteBatch> BlockTreeWriteBatch<W> {
                 .justify
                 .try_to_vec()
                 .map_err(|err| KVSetError::SerializeValueError {
-                    key: Key::BlockJustify {
-                        block: block.hash.clone(),
-                    },
+                    key: Key::BlockJustify { block: block.hash },
                     source: err,
                 })?,
         );
@@ -982,9 +957,7 @@ impl<W: WriteBatch> BlockTreeWriteBatch<W> {
                 .data_hash
                 .try_to_vec()
                 .map_err(|err| KVSetError::SerializeValueError {
-                    key: Key::BlockDataHash {
-                        block: block.hash.clone(),
-                    },
+                    key: Key::BlockDataHash { block: block.hash },
                     source: err,
                 })?,
         );
@@ -995,9 +968,7 @@ impl<W: WriteBatch> BlockTreeWriteBatch<W> {
                 .len()
                 .try_to_vec()
                 .map_err(|err| KVSetError::SerializeValueError {
-                    key: Key::BlockDataLength {
-                        block: block.hash.clone(),
-                    },
+                    key: Key::BlockDataLength { block: block.hash },
                     source: err,
                 })?,
         );
@@ -1010,9 +981,7 @@ impl<W: WriteBatch> BlockTreeWriteBatch<W> {
                 &(i as u32)
                     .try_to_vec()
                     .map_err(|err| KVSetError::SerializeValueError {
-                        key: Key::BlockData {
-                            block: block.hash.clone(),
-                        },
+                        key: Key::BlockData { block: block.hash },
                         source: err,
                     })?,
             );
@@ -1048,7 +1017,7 @@ impl<W: WriteBatch> BlockTreeWriteBatch<W> {
         height: BlockHeight,
         block: &CryptoHash,
     ) -> Result<(), BlockTreeError> {
-        Ok(self.0.set(
+        let _: () = self.0.set(
             &concat(&variables::BLOCK_AT_HEIGHT, &height.try_to_vec().unwrap()),
             &block
                 .try_to_vec()
@@ -1056,7 +1025,8 @@ impl<W: WriteBatch> BlockTreeWriteBatch<W> {
                     key: Key::BlockAtHeight { height },
                     source: err,
                 })?,
-        ))
+        );
+        Ok(())
     }
 
     /// Block-tree pruner: delete the height -> hash mapping for a pruned height.
@@ -1073,7 +1043,7 @@ impl<W: WriteBatch> BlockTreeWriteBatch<W> {
         &mut self,
         height: BlockHeight,
     ) -> Result<(), BlockTreeError> {
-        Ok(self.0.set(
+        let _: () = self.0.set(
             &variables::BLOCK_TREE_PRUNED_HEIGHT,
             &height
                 .try_to_vec()
@@ -1081,7 +1051,8 @@ impl<W: WriteBatch> BlockTreeWriteBatch<W> {
                     key: Key::BlockAtHeight { height },
                     source: err,
                 })?,
-        ))
+        );
+        Ok(())
     }
 
     /* ↓↓↓ Block to Children ↓↓↓ */
@@ -1091,17 +1062,16 @@ impl<W: WriteBatch> BlockTreeWriteBatch<W> {
         block: &CryptoHash,
         children: &ChildrenList,
     ) -> Result<(), BlockTreeError> {
-        Ok(self.0.set(
+        let _: () = self.0.set(
             &concat(&variables::BLOCK_TO_CHILDREN, &block.bytes()),
             &children
                 .try_to_vec()
                 .map_err(|err| KVSetError::SerializeValueError {
-                    key: Key::BlockChildren {
-                        block: block.clone(),
-                    },
+                    key: Key::BlockChildren { block: *block },
                     source: err,
                 })?,
-        ))
+        );
+        Ok(())
     }
 
     pub fn delete_children(&mut self, block: &CryptoHash) {
@@ -1127,17 +1097,16 @@ impl<W: WriteBatch> BlockTreeWriteBatch<W> {
         block: &CryptoHash,
         app_state_updates: &AppStateUpdates,
     ) -> Result<(), KVSetError> {
-        Ok(self.0.set(
+        let _: () = self.0.set(
             &concat(&variables::PENDING_APP_STATE_UPDATES, &block.bytes()),
             &app_state_updates
                 .try_to_vec()
                 .map_err(|err| KVSetError::SerializeValueError {
-                    key: Key::PendingAppStateUpdates {
-                        block: block.clone(),
-                    },
+                    key: Key::PendingAppStateUpdates { block: *block },
                     source: err,
                 })?,
-        ))
+        );
+        Ok(())
     }
 
     pub fn apply_app_state_updates(&mut self, app_state_updates: &AppStateUpdates) {
@@ -1164,7 +1133,7 @@ impl<W: WriteBatch> BlockTreeWriteBatch<W> {
         validator_set: &ValidatorSet,
     ) -> Result<(), BlockTreeError> {
         let validator_set_bytes: ValidatorSetBytes = validator_set.into();
-        Ok(self.0.set(
+        let _: () = self.0.set(
             &variables::COMMITTED_VALIDATOR_SET,
             &validator_set_bytes
                 .try_to_vec()
@@ -1172,7 +1141,8 @@ impl<W: WriteBatch> BlockTreeWriteBatch<W> {
                     key: Key::CommittedValidatorSet,
                     source: err,
                 })?,
-        ))
+        );
+        Ok(())
     }
 
     /* ↓↓↓ Pending Validator Set Updates */
@@ -1184,17 +1154,16 @@ impl<W: WriteBatch> BlockTreeWriteBatch<W> {
     ) -> Result<(), BlockTreeError> {
         let block_vs_updates_bytes =
             ValidatorSetUpdatesStatusBytes::Pending(validator_set_updates.into());
-        Ok(self.0.set(
+        let _: () = self.0.set(
             &concat(&variables::VALIDATOR_SET_UPDATES_STATUS, &block.bytes()),
             &block_vs_updates_bytes.try_to_vec().map_err(|err| {
                 KVSetError::SerializeValueError {
-                    key: Key::ValidatorSetUpdatesStatus {
-                        block: block.clone(),
-                    },
+                    key: Key::ValidatorSetUpdatesStatus { block: *block },
                     source: err,
                 }
             })?,
-        ))
+        );
+        Ok(())
     }
 
     pub fn set_committed_validator_set_updates(
@@ -1202,17 +1171,16 @@ impl<W: WriteBatch> BlockTreeWriteBatch<W> {
         block: &CryptoHash,
     ) -> Result<(), BlockTreeError> {
         let block_vs_updates_bytes = ValidatorSetUpdatesStatusBytes::Committed;
-        Ok(self.0.set(
+        let _: () = self.0.set(
             &concat(&variables::VALIDATOR_SET_UPDATES_STATUS, &block.bytes()),
             &block_vs_updates_bytes.try_to_vec().map_err(|err| {
                 KVSetError::SerializeValueError {
-                    key: Key::ValidatorSetUpdatesStatus {
-                        block: block.clone(),
-                    },
+                    key: Key::ValidatorSetUpdatesStatus { block: *block },
                     source: err,
                 }
             })?,
-        ))
+        );
+        Ok(())
     }
 
     pub fn delete_block_validator_set_updates(&mut self, block: &CryptoHash) {
@@ -1225,20 +1193,21 @@ impl<W: WriteBatch> BlockTreeWriteBatch<W> {
     /* ↓↓↓ Locked PC ↓↓↓ */
 
     pub fn set_locked_pc(&mut self, pc: &PhaseCertificate) -> Result<(), BlockTreeError> {
-        Ok(self.0.set(
+        let _: () = self.0.set(
             &variables::LOCKED_PC,
             &pc.try_to_vec()
                 .map_err(|err| KVSetError::SerializeValueError {
                     key: Key::LockedPC,
                     source: err,
                 })?,
-        ))
+        );
+        Ok(())
     }
 
     /* ↓↓↓ Highest View Entered ↓↓↓ */
 
     pub fn set_highest_view_entered(&mut self, view: ViewNumber) -> Result<(), BlockTreeError> {
-        Ok(self.0.set(
+        let _: () = self.0.set(
             &variables::HIGHEST_VIEW_ENTERED,
             &view
                 .try_to_vec()
@@ -1246,20 +1215,22 @@ impl<W: WriteBatch> BlockTreeWriteBatch<W> {
                     key: Key::HighestTC,
                     source: err,
                 })?,
-        ))
+        );
+        Ok(())
     }
 
     /* ↓↓↓ Highest Phase Certificate ↓↓↓ */
 
     pub fn set_highest_pc(&mut self, pc: &PhaseCertificate) -> Result<(), BlockTreeError> {
-        Ok(self.0.set(
+        let _: () = self.0.set(
             &variables::HIGHEST_PC,
             &pc.try_to_vec()
                 .map_err(|err| KVSetError::SerializeValueError {
                     key: Key::HighestTC,
                     source: err,
                 })?,
-        ))
+        );
+        Ok(())
     }
 
     /* ↓↓↓ Highest Committed Block ↓↓↓ */
@@ -1268,7 +1239,7 @@ impl<W: WriteBatch> BlockTreeWriteBatch<W> {
         &mut self,
         block: &CryptoHash,
     ) -> Result<(), BlockTreeError> {
-        Ok(self.0.set(
+        let _: () = self.0.set(
             &variables::HIGHEST_COMMITTED_BLOCK,
             &block
                 .try_to_vec()
@@ -1276,13 +1247,14 @@ impl<W: WriteBatch> BlockTreeWriteBatch<W> {
                     key: Key::HighestCommittedBlock,
                     source: err,
                 })?,
-        ))
+        );
+        Ok(())
     }
 
     /* ↓↓↓ Newest Block ↓↓↓ */
 
     pub fn set_newest_block(&mut self, block: &CryptoHash) -> Result<(), BlockTreeError> {
-        Ok(self.0.set(
+        let _: () = self.0.set(
             &variables::NEWEST_BLOCK,
             &block
                 .try_to_vec()
@@ -1290,20 +1262,22 @@ impl<W: WriteBatch> BlockTreeWriteBatch<W> {
                     key: Key::NewestBlock,
                     source: err,
                 })?,
-        ))
+        );
+        Ok(())
     }
 
     /* ↓↓↓ Highest Timeout Certificate ↓↓↓ */
 
     pub fn set_highest_tc(&mut self, tc: &TimeoutCertificate) -> Result<(), BlockTreeError> {
-        Ok(self.0.set(
+        let _: () = self.0.set(
             &variables::HIGHEST_TC,
             &tc.try_to_vec()
                 .map_err(|err| KVSetError::SerializeValueError {
                     key: Key::HighestTC,
                     source: err,
                 })?,
-        ))
+        );
+        Ok(())
     }
 
     /* ↓↓↓ Previous Validator Set  ↓↓↓ */
@@ -1312,7 +1286,7 @@ impl<W: WriteBatch> BlockTreeWriteBatch<W> {
         validator_set: &ValidatorSet,
     ) -> Result<(), BlockTreeError> {
         let validator_set_bytes: ValidatorSetBytes = validator_set.into();
-        Ok(self.0.set(
+        let _: () = self.0.set(
             &variables::PREVIOUS_VALIDATOR_SET,
             &validator_set_bytes
                 .try_to_vec()
@@ -1320,7 +1294,8 @@ impl<W: WriteBatch> BlockTreeWriteBatch<W> {
                     key: Key::PreviousValidatorSet,
                     source: err,
                 })?,
-        ))
+        );
+        Ok(())
     }
 
     /* ↓↓↓ Validator Set Update Block Height ↓↓↓ */
@@ -1328,7 +1303,7 @@ impl<W: WriteBatch> BlockTreeWriteBatch<W> {
         &mut self,
         height: BlockHeight,
     ) -> Result<(), BlockTreeError> {
-        Ok(self.0.set(
+        let _: () = self.0.set(
             &variables::VALIDATOR_SET_UPDATE_BLOCK_HEIGHT,
             &height
                 .try_to_vec()
@@ -1336,7 +1311,8 @@ impl<W: WriteBatch> BlockTreeWriteBatch<W> {
                     key: Key::ValidatorSetUpdateHeight,
                     source: err,
                 })?,
-        ))
+        );
+        Ok(())
     }
 
     /* ↓↓↓ Validator Set Update Decided ↓↓↓ */
@@ -1345,7 +1321,7 @@ impl<W: WriteBatch> BlockTreeWriteBatch<W> {
         &mut self,
         update_complete: bool,
     ) -> Result<(), BlockTreeError> {
-        Ok(self.0.set(
+        let _: () = self.0.set(
             &variables::VALIDATOR_SET_UPDATE_DECIDED,
             &update_complete
                 .try_to_vec()
@@ -1353,13 +1329,14 @@ impl<W: WriteBatch> BlockTreeWriteBatch<W> {
                     key: Key::ValidatorSetUpdateDecided,
                     source: err,
                 })?,
-        ))
+        );
+        Ok(())
     }
 
     /* ↓↓↓ Highest View Phase-Voted ↓↓↓ */
 
     pub fn set_highest_view_phase_voted(&mut self, view: ViewNumber) -> Result<(), BlockTreeError> {
-        Ok(self.0.set(
+        let _: () = self.0.set(
             &variables::HIGHEST_VIEW_PHASE_VOTED,
             &view
                 .try_to_vec()
@@ -1367,7 +1344,8 @@ impl<W: WriteBatch> BlockTreeWriteBatch<W> {
                     key: Key::HighestViewPhaseVoted,
                     source: err,
                 })?,
-        ))
+        );
+        Ok(())
     }
 }
 
@@ -1703,6 +1681,7 @@ impl<K: KVStore> BlockTreeSingleton<K> {
     }
 
     /// Get all stored equivocation evidence.
+    #[allow(clippy::type_complexity)]
     pub fn get_equivocation_evidence(
         &self,
     ) -> Result<Vec<(ViewNumber, [u8; 32], CryptoHash, CryptoHash)>, BlockTreeError> {
@@ -1792,7 +1771,7 @@ impl<K: KVStore> BlockTreeSingleton<K> {
         rep.record_timeout(leader);
         // Decay periodically: every `window_size` total events.
         let total_events: u32 = rep.entries.iter().map(|(_, e)| e.total).sum();
-        if total_events > 0 && total_events % rep.window_size == 0 {
+        if total_events > 0 && total_events.is_multiple_of(rep.window_size) {
             rep.decay();
         }
         self.set_leader_reputation(&rep)

@@ -248,7 +248,7 @@ fn reputation_serialization_roundtrip() {
 /// With all validators at full reputation, selection matches standard IWRR.
 #[test]
 fn reputation_weighted_selection_matches_standard_at_full_rep() {
-    let (keypairs, vs) = make_validator_set(4);
+    let (_keypairs, vs) = make_validator_set(4);
     let rep = LeaderReputation::new(100); // No entries = all at 10000
 
     // For all views, reputation-weighted and standard should select the same leader.

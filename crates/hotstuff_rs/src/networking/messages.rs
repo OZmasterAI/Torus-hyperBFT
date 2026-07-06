@@ -13,6 +13,7 @@ use crate::{
 
 /// All message variants used in HotStuff-rs.
 #[derive(Clone, BorshSerialize, BorshDeserialize)]
+#[allow(clippy::large_enum_variant)]
 pub enum Message {
     /// See: [`ProgressMessage`].
     ProgressMessage(ProgressMessage),
@@ -94,9 +95,6 @@ impl ProgressMessage {
 
     /// Check whether the inner message is a [`BlockSyncAdvertiseMessage`].
     pub fn is_block_sync_trigger_msg(&self) -> bool {
-        match self {
-            ProgressMessage::BlockSyncAdvertiseMessage(_) => true,
-            _ => false,
-        }
+        matches!(self, ProgressMessage::BlockSyncAdvertiseMessage(_))
     }
 }

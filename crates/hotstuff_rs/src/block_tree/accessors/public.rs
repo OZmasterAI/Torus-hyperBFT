@@ -53,11 +53,11 @@ impl<S: KVGet> BlockTreeSnapshot<S> {
         // Get committed blocks starting from the specified height.
         let mut cursor = height;
         while let Some(block_hash) = self.0.block_at_height(cursor)? {
-            res.push(self.0.block(&block_hash)?.ok_or(
-                BlockTreeError::BlockExpectedButNotFound {
-                    block: block_hash.clone(),
-                },
-            )?);
+            res.push(
+                self.0
+                    .block(&block_hash)?
+                    .ok_or(BlockTreeError::BlockExpectedButNotFound { block: block_hash })?,
+            );
             cursor += 1;
 
             if res.len() == limit as usize {
@@ -87,12 +87,10 @@ impl<S: KVGet> BlockTreeSnapshot<S> {
         if let Some(newest_block) = self.0.newest_block()? {
             let mut cursor = newest_block;
             loop {
-                let block =
-                    self.0
-                        .block(&cursor)?
-                        .ok_or(BlockTreeError::BlockExpectedButNotFound {
-                            block: cursor.clone(),
-                        })?;
+                let block = self
+                    .0
+                    .block(&cursor)?
+                    .ok_or(BlockTreeError::BlockExpectedButNotFound { block: cursor })?;
                 let block_justify = block.justify.clone();
                 res.push(block);
 

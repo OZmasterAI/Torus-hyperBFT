@@ -639,6 +639,12 @@ pub struct LeaderReputationEntry {
     pub total: u32,
 }
 
+impl Default for LeaderReputationEntry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LeaderReputationEntry {
     pub fn new() -> Self {
         Self {

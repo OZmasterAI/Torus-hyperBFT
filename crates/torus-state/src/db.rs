@@ -299,12 +299,10 @@ impl StateDb {
         let cf = self.cf(crate::cf::CF_SESSIONS)?;
         let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
         let mut count = 0;
-        for item in iter {
-            if let Ok((_key, value)) = item {
-                if let Ok(data) = serde_json::from_slice::<torus_types::SessionData>(&value) {
-                    if data.owner == *owner {
-                        count += 1;
-                    }
+        for (_key, value) in iter.flatten() {
+            if let Ok(data) = serde_json::from_slice::<torus_types::SessionData>(&value) {
+                if data.owner == *owner {
+                    count += 1;
                 }
             }
         }

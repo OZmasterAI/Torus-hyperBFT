@@ -100,6 +100,7 @@ impl EventHandlers {
     /// Creates the [handler pairs](HandlerPair) for all pre-defined event types from
     /// [events](crate::events) given the user-defined handlers, and information on whether logging is
     /// enabled.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         log: bool,
         insert_block_handler: Option<HandlerPtr<InsertBlockEvent>>,
@@ -509,7 +510,7 @@ pub(crate) fn start_event_bus(
         // S370: block (with a short timeout so shutdown stays responsive) instead of
         // busy-polling try_recv — an idle node must not spin a whole core here.
         match event_subscriber.recv_timeout(std::time::Duration::from_millis(100)) {
-            Ok(event) => (&event_handlers).fire_handlers(event),
+            Ok(event) => event_handlers.fire_handlers(event),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => (),
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 panic!("The algorithm thread (event publisher) disconnected from the channel")

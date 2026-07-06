@@ -26,7 +26,7 @@ pub trait KVStore: KVGet + Clone + Send + 'static {
 
     fn write(&mut self, wb: Self::WriteBatch);
     fn clear(&mut self);
-    fn snapshot<'b>(&'b self) -> Self::Snapshot<'_>;
+    fn snapshot(&self) -> Self::Snapshot<'_>;
 }
 
 pub trait KVGet {
@@ -45,17 +45,13 @@ pub trait KVGet {
 
         if data_hash.is_none() {
             return Err(KVGetError::ValueExpectedButNotFound {
-                key: Key::BlockDataHash {
-                    block: block.clone(),
-                },
+                key: Key::BlockDataHash { block: *block },
             });
         }
 
         if data.is_none() {
             return Err(KVGetError::ValueExpectedButNotFound {
-                key: Key::BlockData {
-                    block: block.clone(),
-                },
+                key: Key::BlockData { block: *block },
             });
         }
 
@@ -75,9 +71,7 @@ pub trait KVGet {
             Ok(Some(
                 BlockHeight::deserialize(&mut bytes.as_slice()).map_err(|err| {
                     KVGetError::DeserializeValueError {
-                        key: Key::BlockHeight {
-                            block: block.clone(),
-                        },
+                        key: Key::BlockHeight { block: *block },
                         source: err,
                     }
                 })?,
@@ -95,15 +89,11 @@ pub trait KVGet {
                     &concat(&block.bytes(), &variables::BLOCK_JUSTIFY),
                 ))
                 .ok_or(KVGetError::ValueExpectedButNotFound {
-                    key: Key::BlockJustify {
-                        block: block.clone(),
-                    },
+                    key: Key::BlockJustify { block: *block },
                 })?,
         )
         .map_err(|err| KVGetError::DeserializeValueError {
-            key: Key::BlockJustify {
-                block: block.clone(),
-            },
+            key: Key::BlockJustify { block: *block },
             source: err,
         })
     }
@@ -115,9 +105,7 @@ pub trait KVGet {
         )) {
             Ok(Some(CryptoHash::deserialize(&mut &*bytes).map_err(
                 |err| KVGetError::DeserializeValueError {
-                    key: Key::BlockDataHash {
-                        block: block.clone(),
-                    },
+                    key: Key::BlockDataHash { block: *block },
                     source: err,
                 },
             )?))
@@ -133,9 +121,7 @@ pub trait KVGet {
         )) {
             Ok(Some(DataLen::deserialize(&mut &*bytes).map_err(|err| {
                 KVGetError::DeserializeValueError {
-                    key: Key::BlockDataLength {
-                        block: block.clone(),
-                    },
+                    key: Key::BlockDataLength { block: *block },
                     source: err,
                 }
             })?))
@@ -153,9 +139,7 @@ pub trait KVGet {
                     (0..len.int()).map(|i| self.block_datum(block, i)).collect();
                 if datums.iter().any(|d| d.is_none()) {
                     Err(KVGetError::ValueExpectedButNotFound {
-                        key: Key::BlockData {
-                            block: block.clone(),
-                        },
+                        key: Key::BlockData { block: *block },
                     })
                 } else {
                     Ok(Some(Data::new(
@@ -175,7 +159,7 @@ pub trait KVGet {
             &block_data_prefix,
             &datum_index.try_to_vec().unwrap(),
         ))
-        .map(|bytes| Datum::new(bytes))
+        .map(Datum::new)
     }
 
     /* ↓↓↓ Block Height to Block ↓↓↓ */
@@ -203,15 +187,11 @@ pub trait KVGet {
             &mut &*self
                 .get(&concat(&variables::BLOCK_TO_CHILDREN, &block.bytes()))
                 .ok_or(KVGetError::ValueExpectedButNotFound {
-                    key: Key::BlockChildren {
-                        block: block.clone(),
-                    },
+                    key: Key::BlockChildren { block: *block },
                 })?,
         )
         .map_err(|err| KVGetError::DeserializeValueError {
-            key: Key::BlockChildren {
-                block: block.clone(),
-            },
+            key: Key::BlockChildren { block: *block },
             source: err,
         })
     }
@@ -234,9 +214,7 @@ pub trait KVGet {
         )) {
             Ok(Some(AppStateUpdates::deserialize(&mut &*bytes).map_err(
                 |err| KVGetError::DeserializeValueError {
-                    key: Key::PendingAppStateUpdates {
-                        block: block.clone(),
-                    },
+                    key: Key::PendingAppStateUpdates { block: *block },
                     source: err,
                 },
             )?))
@@ -281,9 +259,7 @@ pub trait KVGet {
             Some(bytes) => {
                 ValidatorSetUpdatesStatusBytes::deserialize(&mut &*bytes).map_err(|err| {
                     KVGetError::DeserializeValueError {
-                        key: Key::ValidatorSetUpdatesStatus {
-                            block: block.clone(),
-                        },
+                        key: Key::ValidatorSetUpdatesStatus { block: *block },
                         source: err,
                     }
                 })?
@@ -291,9 +267,7 @@ pub trait KVGet {
         };
         ValidatorSetUpdatesStatus::try_from(validator_set_updates_status_bytes).map_err(|err| {
             KVGetError::Ed25519DalekError {
-                key: Key::ValidatorSetUpdatesStatus {
-                    block: block.clone(),
-                },
+                key: Key::ValidatorSetUpdatesStatus { block: *block },
                 source: err,
             }
         })
@@ -517,32 +491,32 @@ pub enum Key {
 
 impl Display for Key {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self {
-            &Key::BlockHeight { block } => write!(f, "Block Height for block {}", block),
-            &Key::BlockJustify { block } => write!(f, "Block Justify for block {}", block),
-            &Key::BlockDataHash { block } => write!(f, "Block Data Hash for block {}", block),
-            &Key::BlockDataLength { block } => write!(f, "Block Data length for block {}", block),
-            &Key::BlockData { block } => write!(f, "Block Data for block {}", block),
-            &Key::BlockAtHeight { height } => write!(f, "Block at height {}", height.int()),
-            &Key::BlockChildren { block } => write!(f, "Block children for block {}", block),
-            &Key::CommittedAppState { key } => write!(f, "Committed App State for key {:#?}", key),
-            &Key::PendingAppStateUpdates { block } => {
+        match self {
+            Key::BlockHeight { block } => write!(f, "Block Height for block {}", block),
+            Key::BlockJustify { block } => write!(f, "Block Justify for block {}", block),
+            Key::BlockDataHash { block } => write!(f, "Block Data Hash for block {}", block),
+            Key::BlockDataLength { block } => write!(f, "Block Data length for block {}", block),
+            Key::BlockData { block } => write!(f, "Block Data for block {}", block),
+            Key::BlockAtHeight { height } => write!(f, "Block at height {}", height.int()),
+            Key::BlockChildren { block } => write!(f, "Block children for block {}", block),
+            Key::CommittedAppState { key } => write!(f, "Committed App State for key {:#?}", key),
+            Key::PendingAppStateUpdates { block } => {
                 write!(f, "Pending App State Updates for block {}", block)
             }
-            &Key::CommittedValidatorSet => write!(f, "Committed Validator Set"),
-            &Key::ValidatorSetUpdatesStatus { block } => {
+            Key::CommittedValidatorSet => write!(f, "Committed Validator Set"),
+            Key::ValidatorSetUpdatesStatus { block } => {
                 write!(f, "Validator Set Updates Status for block {}", block)
             }
-            &Key::LockedPC => write!(f, "Locked PC"),
-            &Key::HighestViewEntered => write!(f, "Highest View Entered"),
-            &Key::HighestPC => write!(f, "Highest Phase Certificate"),
-            &Key::HighestCommittedBlock => write!(f, "Highest Committed Block"),
-            &Key::NewestBlock => write!(f, "Newest Block"),
-            &Key::HighestTC => write!(f, "Highest Timeout Certificate"),
-            &Key::PreviousValidatorSet => write!(f, "Previous Validator Set"),
-            &Key::ValidatorSetUpdateHeight => write!(f, "Validator Set Update Block Height"),
-            &Key::ValidatorSetUpdateDecided => write!(f, "Validator Set Update Decided"),
-            &Key::HighestViewPhaseVoted => write!(f, "Highest View Phase-Voted"),
+            Key::LockedPC => write!(f, "Locked PC"),
+            Key::HighestViewEntered => write!(f, "Highest View Entered"),
+            Key::HighestPC => write!(f, "Highest Phase Certificate"),
+            Key::HighestCommittedBlock => write!(f, "Highest Committed Block"),
+            Key::NewestBlock => write!(f, "Newest Block"),
+            Key::HighestTC => write!(f, "Highest Timeout Certificate"),
+            Key::PreviousValidatorSet => write!(f, "Previous Validator Set"),
+            Key::ValidatorSetUpdateHeight => write!(f, "Validator Set Update Block Height"),
+            Key::ValidatorSetUpdateDecided => write!(f, "Validator Set Update Decided"),
+            Key::HighestViewPhaseVoted => write!(f, "Highest View Phase-Voted"),
         }
     }
 }

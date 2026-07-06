@@ -118,7 +118,7 @@ impl ValidatorSet {
     }
 
     /// Get an iterator through validators' verifying keys which walks through them in ascending order.
-    pub fn validators(&self) -> slice::Iter<VerifyingKey> {
+    pub fn validators(&self) -> slice::Iter<'_, VerifyingKey> {
         self.validators.iter()
     }
 
@@ -143,13 +143,9 @@ impl ValidatorSet {
     /// `VerifyingKey`s in the validator set, if it is actually in the validator set.
     pub fn position(&self, validator: &VerifyingKey) -> Option<usize> {
         let validator_bytes = validator.to_bytes();
-        match self
-            .validators
+        self.validators
             .binary_search_by(|v| v.to_bytes().cmp(&validator_bytes))
-        {
-            Ok(pos) => Some(pos),
-            Err(_) => None,
-        }
+            .ok()
     }
 
     /// Compute the total power that a certificate must match or exceed (`>=`) in order to count as a quorum
@@ -200,7 +196,7 @@ impl TryFrom<ValidatorSetBytes> for ValidatorSet {
         let new_validators = value
             .validators
             .iter()
-            .flat_map(|pk_bytes| VerifyingKey::from_bytes(pk_bytes))
+            .flat_map(VerifyingKey::from_bytes)
             .collect();
 
         let mut new_powers = <HashMap<VerifyingKey, Power>>::new();
@@ -223,17 +219,17 @@ impl TryFrom<ValidatorSetBytes> for ValidatorSet {
     }
 }
 
-impl Into<ValidatorSetBytes> for &ValidatorSet {
-    fn into(self) -> ValidatorSetBytes {
-        let new_validators = self.validators.iter().map(|pk| pk.to_bytes()).collect();
+impl From<&ValidatorSet> for ValidatorSetBytes {
+    fn from(val: &ValidatorSet) -> Self {
+        let new_validators = val.validators.iter().map(|pk| pk.to_bytes()).collect();
 
         let mut new_powers = <HashMap<VerifyingKeyBytes, Power>>::new();
-        self.powers
+        val.powers
             .keys()
-            .zip(self.powers.values())
-            .for_each(|(k, v)| match new_powers.insert(k.to_bytes(), *v) {
-                _ => (),
-            }); // Safety: Insert should always return None
+            .zip(val.powers.values())
+            .for_each(|(k, v)| {
+                new_powers.insert(k.to_bytes(), *v); // Safety: Insert should always return None
+            });
 
         ValidatorSetBytes {
             validators: new_validators,
@@ -322,10 +318,7 @@ impl ValidatorSetUpdatesStatus {
 
     /// Check whether the updates status is `Pending`.
     pub fn is_pending(&self) -> bool {
-        match self {
-            Self::Pending(_) => true,
-            _ => false,
-        }
+        matches!(self, Self::Pending(_))
     }
 }
 

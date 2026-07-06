@@ -524,15 +524,15 @@ fn secs_since_unix_epoch(timestamp: SystemTime) -> u64 {
 
 fn progress_certificate_info(certificate: &ProgressCertificate) -> String {
     match certificate {
-        ProgressCertificate::PhaseCertificate(pc) => String::from(format!(
+        ProgressCertificate::PhaseCertificate(pc) => format!(
             "Phase Certificate, view: {}, phase: {:?}, block: {}, no. of signatures: {}",
             pc.view,
             pc.phase,
             first_seven_base64_chars(&pc.block.bytes()),
             pc.signatures.iter().filter(|sig| sig.is_some()).count()
-        )),
+        ),
         ProgressCertificate::TimeoutCertificate(tc) => {
-            String::from(format!("Timeout Certificate, view: {}", tc.view))
+            format!("Timeout Certificate, view: {}", tc.view)
         }
     }
 }

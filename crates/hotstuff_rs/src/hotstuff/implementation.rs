@@ -37,7 +37,7 @@ use crate::{
             Nudge, PendingBodies, PendingHeaders, PhaseVote, Proposal, ProposalHeader,
             ProposalRequest, ProposalResponse,
         },
-        roles::{is_phase_voter, is_proposer, new_view_recipients_with_reputation},
+        roles::{is_phase_voter, new_view_recipients_with_reputation},
         types::{valid_nec, NECollector, Phase, PhaseVoteCollector},
     },
     networking::{
@@ -182,10 +182,12 @@ impl<N: Network> HotStuff<N> {
         self.proposal_deferred
     }
 
+    #[allow(dead_code)]
     pub(crate) fn pending_body(&self, hash: &CryptoHash) -> Option<&Block> {
         self.pending_bodies.get(hash)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn take_pending_body(&mut self, hash: &CryptoHash) -> Option<Block> {
         self.pending_bodies.remove(hash)
     }
@@ -340,7 +342,7 @@ impl<N: Network> HotStuff<N> {
 
         Event::StartView(StartViewEvent {
             timestamp: SystemTime::now(),
-            view: self.view_info.view.clone(),
+            view: self.view_info.view,
         })
         .publish(&self.event_publisher);
 
@@ -662,12 +664,11 @@ impl<N: Network> HotStuff<N> {
 
             // Skip duplicate proposals for the current view (not applicable to
             // late-arriving ProposalHeaders from past views).
-            if !matches!(msg, HotStuffMessage::ProposalHeader(_)) {
-                if self.proposal_status.has_one_leader_proposed(origin)
-                    || self.proposal_status.have_all_leaders_proposed()
-                {
-                    return Ok(());
-                }
+            if !matches!(msg, HotStuffMessage::ProposalHeader(_))
+                && (self.proposal_status.has_one_leader_proposed(origin)
+                    || self.proposal_status.have_all_leaders_proposed())
+            {
+                return Ok(());
             }
         }
 
@@ -826,7 +827,7 @@ impl<N: Network> HotStuff<N> {
                     && tc
                         .high_tip
                         .as_ref()
-                        .map_or(false, |tip| tip.block_hash == proposal.block.hash);
+                        .is_some_and(|tip| tip.block_hash == proposal.block.hash);
                 if !tc_valid {
                     match self.proposal_status {
                         ProposalStatus::WaitingForProposal => {
@@ -2056,7 +2057,7 @@ pub(crate) struct HotStuffConfiguration {
 /// The different ways a call to a method of the `HotStuff` struct can fail.
 #[derive(Debug)]
 pub enum HotStuffError {
-    BlockTreeError(BlockTreeError),
+    BlockTreeError(#[allow(dead_code)] BlockTreeError),
 }
 
 impl From<BlockTreeError> for HotStuffError {
@@ -2119,6 +2120,7 @@ impl ProposalStatus {
 /// - When ProposalResponse or enough NE messages arrive, the leader completes
 ///   the proposal via on_receive_proposal_response or on_receive_ne
 /// - If the view timer expires, entering a new view clears the recovery state
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum RecoveryState {
     /// No recovery in progress.
     None,

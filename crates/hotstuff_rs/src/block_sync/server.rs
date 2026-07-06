@@ -138,7 +138,7 @@ impl<N: Network + 'static, K: KVStore> BlockSyncServer<N, K> {
                             timestamp: SystemTime::now(),
                             peer: origin,
                             blocks,
-                            highest_pc: highest_pc,
+                            highest_pc,
                         })
                         .publish(&self.event_publisher)
                     }

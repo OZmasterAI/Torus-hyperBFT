@@ -76,9 +76,9 @@ impl Block {
         data_hash: &CryptoHash,
     ) -> CryptoHash {
         let mut hasher = CryptoHasher::new();
-        hasher.update(&height.try_to_vec().unwrap());
-        hasher.update(&justify.try_to_vec().unwrap());
-        hasher.update(&data_hash.try_to_vec().unwrap());
+        hasher.update(height.try_to_vec().unwrap());
+        hasher.update(justify.try_to_vec().unwrap());
+        hasher.update(data_hash.try_to_vec().unwrap());
         CryptoHash::new(hasher.finalize().into())
     }
 

@@ -27,6 +27,15 @@ pub struct UpdateSet<K: Eq + Hash, V: Eq + Hash> {
     deletes: HashSet<K>,
 }
 
+impl<K: Eq + Hash, V: Eq + Hash> Default for UpdateSet<K, V>
+where
+    K:,
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<K: Eq + Hash, V: Eq + Hash> UpdateSet<K, V>
 where
     K:,
@@ -69,12 +78,12 @@ where
     }
 
     /// Get an iterator over all of the key-value pairs that this `UpdateSet` will insert.
-    pub fn inserts(&self) -> hash_map::Iter<K, V> {
+    pub fn inserts(&self) -> hash_map::Iter<'_, K, V> {
         self.inserts.iter()
     }
 
     /// Get an iterator over all of the keys that this `UpdateSet` will delete.
-    pub fn deletes(&self) -> hash_set::Iter<K> {
+    pub fn deletes(&self) -> hash_set::Iter<'_, K> {
         self.deletes.iter()
     }
 }
@@ -107,7 +116,7 @@ impl TryFrom<ValidatorSetUpdatesBytes> for ValidatorSetUpdates {
 
             deletes: vsu_bytes
                 .deletes()
-                .map(|vk_bytes| VerifyingKey::from_bytes(vk_bytes))
+                .map(VerifyingKey::from_bytes)
                 .collect::<Result<HashSet<VerifyingKey>, Self::Error>>()?,
         })
     }

@@ -23,6 +23,7 @@ use super::types::{TimeoutCertificate, TipInfo};
 
 /// Enum wrapper around any kind of message sent between replicas as part of the Pacemaker subprotocol.
 #[derive(Clone, BorshSerialize, BorshDeserialize)]
+#[allow(clippy::large_enum_variant)]
 pub enum PacemakerMessage {
     /// See [`TimeoutVote`].
     TimeoutVote(TimeoutVote),
@@ -106,9 +107,9 @@ impl Cacheable for PacemakerMessage {
     }
 }
 
-impl Into<ProgressMessage> for PacemakerMessage {
-    fn into(self) -> ProgressMessage {
-        ProgressMessage::PacemakerMessage(self)
+impl From<PacemakerMessage> for ProgressMessage {
+    fn from(val: PacemakerMessage) -> Self {
+        ProgressMessage::PacemakerMessage(val)
     }
 }
 
@@ -190,6 +191,7 @@ pub struct AdvanceView {
 /// Enum wrapper around every kind of [`Certificate`](crate::types::signed_messages::Certificate) that
 /// can cause a replica to move to another view.
 #[derive(Clone, BorshSerialize, BorshDeserialize)]
+#[allow(clippy::large_enum_variant)]
 pub enum ProgressCertificate {
     TimeoutCertificate(TimeoutCertificate),
     PhaseCertificate(PhaseCertificate),

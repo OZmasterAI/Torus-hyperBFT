@@ -28,6 +28,7 @@ use super::{
 /// 2. Block sync requests (processed by [`BlockSyncServer`][crate::block_sync::server::BlockSyncServer]),
 ///    and
 /// 3. Block sync responses (processed by [`BlockSyncClient`][crate::block_sync::client::BlockSyncClient]).
+#[allow(clippy::type_complexity)]
 pub(crate) fn start_polling<N: Network + 'static>(
     mut network: N,
     shutdown_signal: Receiver<()>,
@@ -272,9 +273,7 @@ impl ProgressMessageBuffer {
         // We only store the message in the buffer if either:
         // (1) There is no risk of overloading the buffer upon storing this message, or
         // (2) The buffer might be overloaded, but we have already made space for the new message.
-        if !buffer_will_be_overloaded
-            || (buffer_will_be_overloaded && cache_message_if_buffer_will_be_overloaded)
-        {
+        if !buffer_will_be_overloaded || cache_message_if_buffer_will_be_overloaded {
             let msg_queue = if let Some(msg_queue) = self.buffer.get_mut(&msg.view()) {
                 msg_queue
             } else {
@@ -295,8 +294,7 @@ impl ProgressMessageBuffer {
     fn get_msg(&mut self, view: &ViewNumber) -> Option<(VerifyingKey, ProgressMessage)> {
         self.buffer
             .get_mut(view)
-            .map(|msg_queue| msg_queue.pop_front())
-            .flatten()
+            .and_then(|msg_queue| msg_queue.pop_front())
     }
 
     /// Given the number of bytes that need to be removed, removes just enough highest-viewed messages
@@ -324,7 +322,7 @@ impl ProgressMessageBuffer {
                         }
                     })
                     .count() as u64;
-                let _ = (0..removals).into_iter().for_each(|_| {
+                (0..removals).for_each(|_| {
                     let _ = msg_queue.pop_back();
                 });
                 if msg_queue.is_empty() {

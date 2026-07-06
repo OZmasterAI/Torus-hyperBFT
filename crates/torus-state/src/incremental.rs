@@ -79,8 +79,10 @@ pub fn build_trie_to_cf(db: &StateDb) -> Result<B256, StateError> {
 
     // 2. Compute root + full TrieUpdates over the (empty) trie cursor + populated hashed cursor,
     //    marking everything changed so reth walks and rebuilds the whole trie.
-    let mut prefix_sets = TriePrefixSetsMut::default();
-    prefix_sets.account_prefix_set = PrefixSetMut::all();
+    let mut prefix_sets = TriePrefixSetsMut {
+        account_prefix_set: PrefixSetMut::all(),
+        ..Default::default()
+    };
     for hashed_address in &storage_addrs {
         prefix_sets
             .storage_prefix_sets
@@ -271,7 +273,7 @@ pub fn apply_bundle_plain(
                 if bundle_acct.original_info.is_some() {
                     batch.delete_cf(cf_accounts, address.as_slice());
                 }
-                for (slot, _) in &bundle_acct.storage {
+                for slot in bundle_acct.storage.keys() {
                     batch.delete_cf(cf_storage, storage_key(address, slot));
                 }
             }

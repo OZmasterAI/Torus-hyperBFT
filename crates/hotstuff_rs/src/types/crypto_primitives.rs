@@ -29,7 +29,7 @@ impl Keypair {
     }
 
     /// Sign an arbitrary `message` with the `Keypair`.
-    pub(crate) fn sign(&self, message: &Vec<u8>) -> SignatureBytes {
+    pub(crate) fn sign(&self, message: &[u8]) -> SignatureBytes {
         SignatureBytes::new(self.0.sign(message).to_bytes())
     }
 
