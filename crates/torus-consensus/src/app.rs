@@ -761,10 +761,7 @@ fn recover_bodies_bounded(
         if now >= deadline {
             break;
         }
-        torus_state::NativeDaStore::wait_for_arrival(
-            seen,
-            std::cmp::min(delay, deadline - now),
-        );
+        torus_state::NativeDaStore::wait_for_arrival(seen, std::cmp::min(delay, deadline - now));
         TorusApp::absorb_fetched_bodies(mempool, fetcher);
         if missing.iter().all(|h| mempool.get_native_da(h).is_some()) {
             if let Some(m) = metrics {
@@ -843,8 +840,7 @@ impl DaRecoveryWorker {
         fetcher: Arc<dyn NativeDaFetcher>,
         metrics: Option<Arc<torus_telemetry::Metrics>>,
     ) -> Self {
-        let (tx, rx) =
-            std::sync::mpsc::sync_channel::<Vec<torus_types::B256>>(WORKER_QUEUE_CAP);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<torus_types::B256>>(WORKER_QUEUE_CAP);
         let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let worker_shutdown = shutdown.clone();
         let handle = std::thread::Builder::new()
@@ -904,9 +900,7 @@ impl DaRecoveryWorker {
                     // A cancelled in-flight batch (shutdown) is not a budget timeout —
                     // only count as a timeout when the budget genuinely expired without
                     // recovering every body and we are NOT shutting down.
-                    if !recovered
-                        && !worker_shutdown.load(std::sync::atomic::Ordering::Relaxed)
-                    {
+                    if !recovered && !worker_shutdown.load(std::sync::atomic::Ordering::Relaxed) {
                         if let Some(ref m) = metrics {
                             m.native_da_recovery_timeouts.inc();
                         }
@@ -954,7 +948,8 @@ impl Drop for DaRecoveryWorker {
         // budget at the NEXT ~20 ms slice boundary instead of running the full
         // ~1 s. Join is therefore bounded by ~one slice + O(1). Closing tx then
         // unblocks a worker parked in recv().
-        self.shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.shutdown
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         drop(self.tx.take());
         if let Some(h) = self.handle.take() {
             // A worker panic must not propagate out of Drop — log, never unwrap.
@@ -3159,7 +3154,11 @@ mod crash_recovery_tests {
         let result = app.reconstruct_native_actions_hot(&[hash]);
         let elapsed = start.elapsed();
 
-        assert_eq!(result.err(), Some(1), "a push miss fails THIS view immediately");
+        assert_eq!(
+            result.err(),
+            Some(1),
+            "a push miss fails THIS view immediately"
+        );
         assert!(
             elapsed < std::time::Duration::from_millis(80),
             "consensus thread must not run the pull budget in-line: took {elapsed:?}",
@@ -3167,7 +3166,10 @@ mod crash_recovery_tests {
         // The worker recovers the body off-thread well before the next view.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while mempool.get_native_da(&hash).is_none() {
-            assert!(std::time::Instant::now() < deadline, "worker never recovered the body");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker never recovered the body"
+            );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
@@ -3397,7 +3399,10 @@ mod crash_recovery_tests {
             None,
             None,
         );
-        assert!(!recovered, "a never-arriving body is not recovered in-budget");
+        assert!(
+            !recovered,
+            "a never-arriving body is not recovered in-budget"
+        );
         assert_eq!(
             fetcher
                 .fetch_calls

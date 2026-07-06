@@ -49,7 +49,8 @@
     {
       "id": 6,
       "name": "Telemetry: native_da_recovery_handoffs + native_da_recovery_timeouts counters",
-      "status": "pending",
+      "status": "done",
+      "commit": "4fe1bb9",
       "files": ["crates/torus-telemetry/src/lib.rs", "crates/torus-consensus/src/app.rs"],
       "validate": "cargo test -p torus-telemetry && cargo test -p torus-consensus",
       "depends_on": [4]
@@ -57,7 +58,8 @@
     {
       "id": 7,
       "name": "BS-4b: single event-driven mid-budget re-fetch in recover_bodies_bounded",
-      "status": "pending",
+      "status": "done",
+      "commit": "1f206f1",
       "files": ["crates/torus-consensus/src/app.rs"],
       "validate": "cargo test -p torus-consensus recover_bodies",
       "depends_on": [2]
