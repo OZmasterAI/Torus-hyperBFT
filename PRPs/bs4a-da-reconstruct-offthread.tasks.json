@@ -67,7 +67,8 @@
     {
       "id": 8,
       "name": "Full sweep: fmt, clippy -D warnings workspace, nextest vs S420 baseline",
-      "status": "pending",
+      "status": "done",
+      "result": "fmt clean (after efccb57), clippy --workspace -D warnings EXIT 0, nextest 1071/1075: only non-passes = known pacemaker load-flake (passes solo, proven) + 3 known 10min-capped hangers. Final fable review: 2 LOW findings, counter-gating fixed in 6e9a7ec. NOTE: clippy --all-targets has 6 pre-existing errors in hotstuff_rs/tests/common (inherited from base 7c122f7, crate untouched by this branch).",
       "files": [],
       "validate": "cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && cargo nextest run --workspace",
       "depends_on": [1, 2, 3, 4, 5, 6, 7]
