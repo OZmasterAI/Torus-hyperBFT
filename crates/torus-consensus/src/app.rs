@@ -705,7 +705,7 @@ fn sync_pull_retries(missing: usize) -> usize {
 
 /// Shared bounded fetch-wait-absorb loop: used by the SYNC path (in-line, ~1-8s)
 /// and the BS-4a recovery worker (off-thread, ~1s). Wake-on-arrival (S391),
-/// deadline-bounded (S395).
+/// deadline-bounded (S395), with ONE event-driven mid-budget re-fetch (BS-4b).
 fn recover_bodies_bounded(
     mempool: &Mempool,
     fetcher: &dyn NativeDaFetcher,
@@ -744,7 +744,11 @@ fn recover_bodies_bounded(
     // wait slice, and with per-ITERATION bounds those overshoots stack (13 x 20ms
     // nominal was observed at 500ms+ wall under load). Bounding by wall-clock
     // deadline keeps the total budget honest regardless of load.
-    let deadline = std::time::Instant::now() + delay * retries as u32;
+    let budget = delay * retries as u32;
+    let deadline = std::time::Instant::now() + budget;
+    // BS-4b: one event-driven mid-budget re-fetch (fires once at `refetch_at`).
+    let refetch_at = deadline - budget / 2;
+    let mut refetched = false;
     loop {
         // BS-4a worker shutdown: abandon the in-flight budget the moment the caller
         // cancels — a dying node has no use for the bodies (a dropped pull just
@@ -768,6 +772,23 @@ fn recover_bodies_bounded(
             }
             tracing::info!(count = missing.len(), "native-da pull: bodies recovered");
             return true;
+        }
+        // BS-4b: one event-driven mid-budget re-fetch — covers a lost pull request or
+        // response (the fan-out already rotates validators, bridge.rs:390). Fires at
+        // most once, and only for bodies STILL absent at the midpoint, so an already-
+        // absorbed body is never re-requested (pull stays rare, mem a6cf33a9). Placed
+        // after the absorb+recheck so the still-missing filter sees fresh state, and
+        // unreachable when the body arrived earlier (the return above already fired).
+        if !refetched && std::time::Instant::now() >= refetch_at {
+            let still: Vec<[u8; 32]> = missing
+                .iter()
+                .filter(|h| mempool.get_native_da(h).is_none())
+                .map(|h| h.0)
+                .collect();
+            if !still.is_empty() {
+                fetcher.fetch(still);
+            }
+            refetched = true;
         }
         // Fold in our own absorb puts so they don't self-wake the next wait.
         seen = torus_state::NativeDaStore::arrival_generation();
@@ -2299,6 +2320,39 @@ mod crash_recovery_tests {
         }
     }
 
+    /// Test double (BS-4b): counts `fetch()` calls and delivers `body` on the
+    /// `deliver_on_drain`-th `drain()` (0 = never). Like a real pull, the body only
+    /// lands in the inbound AFTER a request was issued, so `drain()` returns empty
+    /// until the first `fetch()` — this makes the F2 pre-warm absorb (which drains
+    /// before any fetch) a no-op, so the counted fetches are exactly those
+    /// `recover_bodies_bounded` issued. Lets a test assert the mid-budget re-fetch
+    /// fires exactly once for a stuck body and never for one that arrives early.
+    struct CountingFetcher {
+        body: Vec<u8>,
+        deliver_on_drain: usize,
+        fetch_calls: std::sync::atomic::AtomicUsize,
+        drains: std::sync::atomic::AtomicUsize,
+    }
+    impl NativeDaFetcher for CountingFetcher {
+        fn fetch(&self, _hashes: Vec<[u8; 32]>) {
+            self.fetch_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        fn drain(&self) -> Vec<Vec<u8>> {
+            use std::sync::atomic::Ordering;
+            // No response can land before a request is issued (pre-warm absorb drains empty).
+            if self.fetch_calls.load(Ordering::Relaxed) == 0 {
+                return Vec::new();
+            }
+            let n = self.drains.fetch_add(1, Ordering::Relaxed) + 1;
+            if self.deliver_on_drain != 0 && n >= self.deliver_on_drain {
+                vec![self.body.clone()]
+            } else {
+                Vec::new()
+            }
+        }
+    }
+
     #[test]
     fn crash_recovery_replays_committed_block() {
         let (config, state_db) = make_test_config_and_db();
@@ -3307,6 +3361,90 @@ mod crash_recovery_tests {
         assert!(
             worker < std::time::Duration::from_secs(2),
             "worker pull budget {worker:?} must not outlive a couple of re-propose cycles",
+        );
+    }
+
+    /// BS-4b (RED first): a body that never arrives must trigger EXACTLY ONE
+    /// mid-budget re-fetch — covering a lost pull request/response — on top of the
+    /// initial fetch, and NOT one re-fetch per wait tick. Drives `recover_bodies_bounded`
+    /// directly with a small budget (10 × 10 ms = 100 ms, midpoint ~50 ms). Before the
+    /// re-fetch lands this fails on `fetch_calls == 2` (today only the initial fetch fires).
+    #[test]
+    fn recover_bodies_refetches_once_mid_budget() {
+        let (_config, state_db) = make_test_config_and_db();
+        let mempool = Arc::new(torus_mempool::Mempool::new(
+            state_db.clone(),
+            torus_mempool::MempoolConfig::default(),
+        ));
+
+        let action = sign_claim_rewards(77);
+        let hash = torus_types::compute_action_hash(&action);
+        let body = bincode::serialize(&action).expect("serialize body");
+        // Never delivered: the body stays missing for the whole budget.
+        let fetcher = Arc::new(CountingFetcher {
+            body,
+            deliver_on_drain: 0,
+            fetch_calls: std::sync::atomic::AtomicUsize::new(0),
+            drains: std::sync::atomic::AtomicUsize::new(0),
+        });
+
+        let recovered = recover_bodies_bounded(
+            &mempool,
+            fetcher.as_ref(),
+            &[hash],
+            10,
+            std::time::Duration::from_millis(10),
+            None,
+            None,
+        );
+        assert!(!recovered, "a never-arriving body is not recovered in-budget");
+        assert_eq!(
+            fetcher
+                .fetch_calls
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "initial fetch + exactly one mid-budget re-fetch (not one per tick)",
+        );
+    }
+
+    /// BS-4b: a body that arrives well before the budget midpoint must NOT trigger a
+    /// re-fetch — the initial fetch is the only one. `deliver_on_drain: 1` lands the
+    /// body on the first wait-loop drain (~10 ms into the ~100 ms budget, midpoint ~50 ms).
+    #[test]
+    fn recover_bodies_no_refetch_when_body_arrives_early() {
+        let (_config, state_db) = make_test_config_and_db();
+        let mempool = Arc::new(torus_mempool::Mempool::new(
+            state_db.clone(),
+            torus_mempool::MempoolConfig::default(),
+        ));
+
+        let action = sign_claim_rewards(88);
+        let hash = torus_types::compute_action_hash(&action);
+        let body = bincode::serialize(&action).expect("serialize body");
+        // Delivered on the first drain after the initial fetch — well before the midpoint.
+        let fetcher = Arc::new(CountingFetcher {
+            body,
+            deliver_on_drain: 1,
+            fetch_calls: std::sync::atomic::AtomicUsize::new(0),
+            drains: std::sync::atomic::AtomicUsize::new(0),
+        });
+
+        let recovered = recover_bodies_bounded(
+            &mempool,
+            fetcher.as_ref(),
+            &[hash],
+            10,
+            std::time::Duration::from_millis(10),
+            None,
+            None,
+        );
+        assert!(recovered, "an early-arriving body is recovered");
+        assert_eq!(
+            fetcher
+                .fetch_calls
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "body arrived before the midpoint — only the initial fetch, no re-fetch",
         );
     }
 }
