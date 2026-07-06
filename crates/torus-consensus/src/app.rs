@@ -919,19 +919,25 @@ impl DaRecoveryWorker {
     /// the consensus thread calls this, so it must NEVER block or panic. On a full
     /// queue (recovery already saturated) or a dead worker the batch is dropped with
     /// a warning — harmless, the re-proposed view resubmits the same hashes.
-    fn submit(&self, hashes: Vec<torus_types::B256>) {
+    ///
+    /// Returns `true` iff the batch was actually queued, so the caller can gate the
+    /// `native_da_recovery_handoffs` counter on real handoffs — a dead worker must
+    /// not paint the A/B dashboard green (final-review finding 1).
+    fn submit(&self, hashes: Vec<torus_types::B256>) -> bool {
         use std::sync::mpsc::TrySendError;
         let Some(tx) = &self.tx else {
             tracing::warn!("da-recovery worker: sender already closed; dropping batch");
-            return;
+            return false;
         };
         match tx.try_send(hashes) {
-            Ok(()) => {}
+            Ok(()) => true,
             Err(TrySendError::Full(_)) => {
                 tracing::warn!("da-recovery worker queue full; dropping missing-hash batch");
+                false
             }
             Err(TrySendError::Disconnected(_)) => {
                 tracing::warn!("da-recovery worker thread gone; dropping missing-hash batch");
+                false
             }
         }
     }
@@ -1421,9 +1427,13 @@ impl TorusApp {
         // point the worker has the bodies durably local. mem 7efe7062.
         if !missing.is_empty() {
             if let Some(ref worker) = self.da_recovery {
-                worker.submit(missing.iter().map(|&i| hashes[i]).collect());
-                if let Some(ref m) = self.metrics {
-                    m.native_da_recovery_handoffs.inc();
+                // Count only batches the worker actually queued: a dead worker or
+                // full queue must not paint the A/B handoff signal green while
+                // recovery is silently dropped (final-review finding 1).
+                if worker.submit(missing.iter().map(|&i| hashes[i]).collect()) {
+                    if let Some(ref m) = self.metrics {
+                        m.native_da_recovery_handoffs.inc();
+                    }
                 }
             }
             return Err(missing.len());
