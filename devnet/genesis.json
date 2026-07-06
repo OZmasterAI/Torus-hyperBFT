@@ -592,6 +592,33 @@
             "tick_size": "1.0",
             "initial_margin": "5.0",
             "note": "bench market 1 (BTC-USD perp). tick/lot are cosmetic here — the runtime order book auto-creates with tick=lot=1.0"
+        },
+        {
+            "market_id": 2,
+            "base_asset": "ETH",
+            "quote_asset": "USD",
+            "lot_size": "1.0",
+            "tick_size": "1.0",
+            "initial_margin": "5.0",
+            "note": "bench market 2 — bench --markets 4 spreads orders over ids 1..=4; must exist in genesis since the O2 RPC unknown-market guard (S419) rejects unseeded ids the runtime used to auto-create"
+        },
+        {
+            "market_id": 3,
+            "base_asset": "SOL",
+            "quote_asset": "USD",
+            "lot_size": "1.0",
+            "tick_size": "1.0",
+            "initial_margin": "5.0",
+            "note": "bench market 3 (see market 2 note)"
+        },
+        {
+            "market_id": 4,
+            "base_asset": "DOGE",
+            "quote_asset": "USD",
+            "lot_size": "1.0",
+            "tick_size": "1.0",
+            "initial_margin": "5.0",
+            "note": "bench market 4 (see market 2 note)"
         }
     ],
     "precompiles": {},
