@@ -1176,10 +1176,23 @@ impl<N: Network> HotStuff<N> {
                 // (n wasted ed25519 verifies per QC). Remote PCs (a proposal's
                 // `justify`, AdvanceView, sync) still get fully verified at their
                 // own entry points.
-                debug_assert!(
-                    new_pc.is_correct(block_tree)?,
-                    "locally-collected PC must be correct by construction"
-                );
+                // S430 correction to the S395 shave: during an in-flight
+                // validator-set transition the collector pair is phase-blind —
+                // the PVS collector can assemble a Decide PC carrying an
+                // old-set quorum, but the protocol requires Decide PCs to
+                // carry a new-set quorum (see roles::is_phase_voter). The
+                // unconditional `is_correct` filter that the S395 shave
+                // removed was silently discarding those PCs. Restore it for
+                // the transition window only; in steady state the sole CVS
+                // collector's PCs remain correct by construction.
+                if block_tree.validator_set_state()?.update_decided() {
+                    debug_assert!(
+                        new_pc.is_correct(block_tree)?,
+                        "locally-collected steady-state PC must be correct by construction"
+                    );
+                } else if !new_pc.is_correct(block_tree)? {
+                    return Ok(());
+                }
                 let pc_block_pending = self.pending_headers.contains_key(&new_pc.block)
                     || self.pending_bodies.contains_key(&new_pc.block);
                 let pc_safe =
