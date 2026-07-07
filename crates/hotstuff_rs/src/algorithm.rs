@@ -189,6 +189,9 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
             // 6c. Retry stale body fetches (proposer first, then rotate across the
             // other validators); trigger sync after max retries.
             self.hotstuff.tick_pending_body_retries(&self.block_tree);
+            // 6d. S426: retry by-hash fetches for unknown justify blocks (a QC that
+            // formed on an undisseminated block); fall back to sync on exhaustion.
+            self.hotstuff.tick_justify_fetch_retries(&self.block_tree);
             if self.hotstuff.take_sync_needed() {
                 if let Err(e) = self.block_sync_client.trigger_sync(&mut self.block_tree) {
                     log::error!(
@@ -203,6 +206,7 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
             let recv_deadline = if self.block_sync_client.has_pending_sync()
                 || self.hotstuff.has_deferred_proposal()
                 || self.hotstuff.has_pending_body_fetches()
+                || self.hotstuff.has_pending_justify_fetches()
             {
                 std::cmp::min(
                     view_info.deadline,

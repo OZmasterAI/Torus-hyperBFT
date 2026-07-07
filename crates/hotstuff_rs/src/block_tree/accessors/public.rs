@@ -53,11 +53,15 @@ impl<S: KVGet> BlockTreeSnapshot<S> {
         // Get committed blocks starting from the specified height.
         let mut cursor = height;
         while let Some(block_hash) = self.0.block_at_height(cursor)? {
-            res.push(
-                self.0
-                    .block(&block_hash)?
-                    .ok_or(BlockTreeError::BlockExpectedButNotFound { block: block_hash })?,
-            );
+            // S426: best-effort serve. If a body is missing, stop and return the
+            // contiguous prefix gathered so far instead of failing the whole sync
+            // response — returning fewer blocks is safe (the client validates each
+            // block independently) and lets a stuck peer at least make committed
+            // progress. A committed block should never be missing, but tolerate it.
+            match self.0.block(&block_hash)? {
+                Some(block) => res.push(block),
+                None => return Ok(res),
+            }
             cursor += 1;
 
             if res.len() == limit as usize {
@@ -87,10 +91,22 @@ impl<S: KVGet> BlockTreeSnapshot<S> {
         if let Some(newest_block) = self.0.newest_block()? {
             let mut cursor = newest_block;
             loop {
-                let block = self
-                    .0
-                    .block(&cursor)?
-                    .ok_or(BlockTreeError::BlockExpectedButNotFound { block: cursor })?;
+                // S426: best-effort serve. A QC can form on a block whose body this
+                // node never obtained (votes are cast on the header before the body
+                // arrives), leaving a gap in the speculative chain. On a missing
+                // body, stop the walk and return the (newest-side) portion gathered
+                // so far rather than propagating Err — the sync server would
+                // otherwise send no response at all, wedging the requesting peer.
+                let block = match self.0.block(&cursor)? {
+                    Some(block) => block,
+                    None => {
+                        log::debug!(
+                            "sync serve: speculative block {:?} missing — truncating walk",
+                            cursor
+                        );
+                        break;
+                    }
+                };
                 let block_justify = block.justify.clone();
                 res.push(block);
 
