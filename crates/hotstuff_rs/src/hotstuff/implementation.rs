@@ -98,6 +98,13 @@ pub(crate) struct HotStuff<N: Network> {
     pending_headers: PendingHeaders,
     /// Hybrid pipelining: tracks body fetch retries. Maps block_hash → (last_request_time, retry_count, origin_peer).
     body_fetch_tracker: std::collections::HashMap<CryptoHash, (Instant, u8, VerifyingKey)>,
+    /// S426 by-hash justify recovery: a QC can form on a block this node never
+    /// obtained (votes are cast on the header before the body arrives), and
+    /// height-range block_sync cannot heal a missing speculative body. Tracks
+    /// by-hash BlockDataRequests for such unknown justify blocks.
+    /// Maps justify_block_hash → (last_request_time, retry_count, origin_peer, view).
+    justify_fetch_tracker:
+        std::collections::HashMap<CryptoHash, (Instant, u8, VerifyingKey, ViewNumber)>,
     /// Hybrid pipelining: bodies received but parent not yet in tree. Retried after each insertion.
     deferred_bodies: PendingBodies,
     /// True when enter_view succeeded but proposal production failed (parent block not yet in tree).
@@ -136,6 +143,7 @@ impl<N: Network> HotStuff<N> {
             pending_bodies: PendingBodies::new(),
             pending_headers: PendingHeaders::new(),
             body_fetch_tracker: std::collections::HashMap::new(),
+            justify_fetch_tracker: std::collections::HashMap::new(),
             deferred_bodies: PendingBodies::new(),
             proposal_deferred: false,
         }
@@ -1639,6 +1647,15 @@ impl<N: Network> HotStuff<N> {
             );
             if !justify_block_known {
                 self.sync_needed = true;
+                // S426: the justify block is unknown because a QC formed on a block
+                // this node never obtained. Height-range block_sync cannot heal a
+                // missing speculative body, so directly fetch the justify block by
+                // hash from the header's origin (a proposer always holds its own
+                // justify block). The tracker dedups/backs off so churning views do
+                // not cause request storms; on continued failure the retry tick
+                // rotates across the committed validators (a superset of the QC's
+                // signers, which by definition hold the block).
+                self.request_justify_block(header.justify.block, header.justify.view, origin);
             }
             match self.proposal_status {
                 ProposalStatus::WaitingForProposal => {
@@ -1755,17 +1772,27 @@ impl<N: Network> HotStuff<N> {
         let block = resp.block;
         let block_hash = block.hash;
 
-        if !self.pending_headers.contains_key(&block_hash) {
+        // Accept blocks we asked for either as a proposal body (pending_headers) or
+        // as a by-hash justify recovery (justify_fetch_tracker, S426). The justify
+        // fetch has no pending header — that missing header is the whole problem —
+        // so it must be admitted here explicitly. Insertion still goes through the
+        // normal is_correct/validate_block path in try_insert_body; receiving a
+        // block never implies a vote (safe_pc gates any vote independently).
+        let tracked_as_body = self.pending_headers.contains_key(&block_hash);
+        let tracked_as_justify = self.justify_fetch_tracker.contains_key(&block_hash);
+        if !tracked_as_body && !tracked_as_justify {
             return Ok(());
         }
 
         if self.try_insert_body(block.clone(), block_tree, app)? {
             self.pending_headers.remove(&block_hash);
             self.body_fetch_tracker.remove(&block_hash);
+            self.justify_fetch_tracker.remove(&block_hash);
             self.drain_deferred_bodies(block_tree, app)?;
         } else {
             self.deferred_bodies.insert(block_hash, block);
             self.body_fetch_tracker.remove(&block_hash);
+            self.justify_fetch_tracker.remove(&block_hash);
         }
 
         Ok(())
@@ -1947,6 +1974,100 @@ impl<N: Network> HotStuff<N> {
 
     pub(crate) fn has_pending_body_fetches(&self) -> bool {
         !self.body_fetch_tracker.is_empty()
+    }
+
+    /// S426: send a by-hash `BlockDataRequest` for an unknown justify block to the
+    /// header's origin and register it for retry. Deduped by hash so repeated
+    /// proposal-header drops for the same justify (churning views) issue at most
+    /// one in-flight fetch until it resolves or the retry budget expires.
+    fn request_justify_block(
+        &mut self,
+        justify_hash: CryptoHash,
+        justify_view: ViewNumber,
+        origin: &VerifyingKey,
+    ) {
+        if self.justify_fetch_tracker.contains_key(&justify_hash) {
+            return;
+        }
+        let req = BlockDataRequest {
+            chain_id: self.config.chain_id,
+            view: justify_view,
+            block_hash: justify_hash,
+        };
+        self.sender_handle.request_block_data(*origin, req);
+        self.justify_fetch_tracker.insert(
+            justify_hash,
+            (Instant::now(), 0, *origin, justify_view),
+        );
+    }
+
+    /// S426: re-request unknown justify blocks (by hash) for stale entries. The
+    /// origin is asked first (`MAX_BODY_RETRIES` attempts), then the request
+    /// rotates across the other committed validators — a superset of the justify
+    /// QC's signers, which by definition hold the block. Entries are dropped once
+    /// the block arrives by any path or the retry budget is exhausted (falling
+    /// back to height-range sync). Mirrors `tick_pending_body_retries`.
+    pub(crate) fn tick_justify_fetch_retries<K: KVStore>(
+        &mut self,
+        block_tree: &BlockTreeSingleton<K>,
+    ) {
+        let now = Instant::now();
+        let me = self.config.keypair.public();
+        let mut arrived = Vec::new();
+        let mut expired = Vec::new();
+        for (hash, (last_req, count, origin, view)) in self.justify_fetch_tracker.iter_mut() {
+            // Stop retrying once the block arrived (via this fetch, a later
+            // proposal body, or height-range sync).
+            if block_tree.contains(hash) {
+                arrived.push(*hash);
+                continue;
+            }
+            if now.duration_since(*last_req) < BODY_RETRY_INTERVAL {
+                continue;
+            }
+            if *count >= MAX_BODY_RETRIES_TOTAL {
+                log::warn!(
+                    "justify fetch exhausted {} retries for {:?} — falling back to sync",
+                    MAX_BODY_RETRIES_TOTAL,
+                    hash
+                );
+                expired.push(*hash);
+                continue;
+            }
+            let others: Vec<VerifyingKey> = block_tree
+                .committed_validator_set()
+                .map(|vs| {
+                    vs.validators()
+                        .filter(|vk| **vk != me && *vk != origin)
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
+            let Some(target) =
+                rotated_body_fetch_target(*count, MAX_BODY_RETRIES, origin, &others)
+            else {
+                expired.push(*hash);
+                continue;
+            };
+            let req = BlockDataRequest {
+                chain_id: self.config.chain_id,
+                view: *view,
+                block_hash: *hash,
+            };
+            self.sender_handle.request_block_data(target, req);
+            *last_req = now;
+            *count += 1;
+        }
+        for hash in arrived.iter().chain(expired.iter()) {
+            self.justify_fetch_tracker.remove(hash);
+        }
+        if !expired.is_empty() {
+            self.sync_needed = true;
+        }
+    }
+
+    pub(crate) fn has_pending_justify_fetches(&self) -> bool {
+        !self.justify_fetch_tracker.is_empty()
     }
 }
 

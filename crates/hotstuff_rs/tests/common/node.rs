@@ -54,6 +54,29 @@ impl Node {
         init_as_updates: AppStateUpdates,
         init_vs_updates: ValidatorSetUpdates,
     ) -> Node {
+        // Preserve the historical default of a 10s max view time.
+        Self::new_with_max_view_time(
+            keypair,
+            network_stub,
+            init_as_updates,
+            init_vs_updates,
+            Duration::from_millis(10000),
+        )
+    }
+
+    /// Like [`new`](Self::new), but lets the caller pick `max_view_time`.
+    ///
+    /// Tests that need the cluster to burn views quickly (so a stall becomes observable in seconds
+    /// rather than tens of seconds) can pass a smaller value. `max_view_time` must be **at least**
+    /// 500 milliseconds, since `NumberApp`'s `produce_block` and `validate_block` each take a minimum
+    /// of 250 milliseconds to complete.
+    pub(crate) fn new_with_max_view_time(
+        keypair: SigningKey,
+        network_stub: NetworkStub,
+        init_as_updates: AppStateUpdates,
+        init_vs_updates: ValidatorSetUpdates,
+        max_view_time: Duration,
+    ) -> Node {
         let kv_store = MemDB::new();
 
         let mut init_vs = ValidatorSet::new();
@@ -78,7 +101,7 @@ impl Node {
             .epoch_length(EpochLength::new(50))
             // `max_view_time` must be **at least** 500 milliseconds, since `NumberApp`'s `produce_block` and
             // `validate_block` each take a minimum of 250 milliseconds to complete.
-            .max_view_time(Duration::from_millis(10000))
+            .max_view_time(max_view_time)
             .log_events(false)
             .build();
 
@@ -119,6 +142,38 @@ impl Node {
             .snapshot()
             .committed_validator_set()
             .expect("should have been able to get the committed validator set from the block tree")
+    }
+
+    /// Query the height of the highest *committed* block in the node's local block tree, or `None`
+    /// if the node has not committed any block yet.
+    ///
+    /// Derived purely from the block tree's public snapshot API (`highest_committed_block` +
+    /// `block_height`) so that no product-code accessor needs to be exposed for tests.
+    pub(crate) fn committed_height(&self) -> Option<u64> {
+        let snapshot = self.replica.block_tree_camera().snapshot();
+        match snapshot.highest_committed_block() {
+            Ok(Some(block_hash)) => snapshot
+                .block_height(&block_hash)
+                .ok()
+                .flatten()
+                .map(|h| h.int()),
+            _ => None,
+        }
+    }
+
+    /// Query the height of the block certified by the node's Highest PC, or `None` if that block is
+    /// not present in the node's block tree (e.g. a starved node whose Highest PC certifies a block
+    /// whose body it never received).
+    pub(crate) fn highest_pc_height(&self) -> Option<u64> {
+        let snapshot = self.replica.block_tree_camera().snapshot();
+        match snapshot.highest_pc() {
+            Ok(pc) => snapshot
+                .block_height(&pc.block)
+                .ok()
+                .flatten()
+                .map(|h| h.int()),
+            Err(_) => None,
+        }
     }
 
     /// Query the highest view entered in the node's local block tree.
