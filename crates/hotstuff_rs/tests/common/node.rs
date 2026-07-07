@@ -1,7 +1,10 @@
 //! `[Node]`, a wrapper that manages access to a replica built around `NumberApp`.
 
 use std::{
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
@@ -23,7 +26,7 @@ use hotstuff_rs::{
 use crate::common::{
     mem_db::MemDB,
     network::NetworkStub,
-    number_app::{NumberApp, NumberAppTransaction},
+    number_app::{NumberApp, NumberAppTransaction, QueuedTransaction},
     verifying_key_bytes::VerifyingKeyBytes,
 };
 
@@ -37,7 +40,7 @@ use super::logging::{first_seven_base64_chars, log_with_context};
 /// [`verifying_key`](Self::verifying_key), [`committed_validator_set`](Self::committed_validator_set)).
 pub(crate) struct Node {
     verifying_key: VerifyingKeyBytes,
-    tx_queue: Arc<Mutex<Vec<NumberAppTransaction>>>,
+    tx_queue: Arc<Mutex<Vec<QueuedTransaction>>>,
     replica: Replica<MemDB>,
 }
 
@@ -77,6 +80,55 @@ impl Node {
         init_vs_updates: ValidatorSetUpdates,
         max_view_time: Duration,
     ) -> Node {
+        Self::build(
+            keypair,
+            network_stub,
+            init_as_updates,
+            init_vs_updates,
+            max_view_time,
+            true,
+        )
+    }
+
+    /// Like [`new_with_max_view_time`](Self::new_with_max_view_time), but with height-range block
+    /// sync effectively **disabled** (its trigger thresholds are pushed far beyond any realistic
+    /// test window).
+    ///
+    /// Height-range block sync is the *fallback* recovery path in production: it heals a node that
+    /// fell behind, but only after a multi-view lag / long timeout. The S430 body-starvation livelock
+    /// is precisely a node that becomes a *proposer* while missing the body of its `highest_pc.block`
+    /// and — before the fix — never actively fetches it, relying solely on this laggy sync path.
+    /// Disabling sync here isolates the by-hash parent-fetch heal (`enter_view` →
+    /// `request_justify_block`) as the *only* fast recovery route, so a test can observe whether the
+    /// starved leader recovers on its own (fix present) or wedges (fix absent).
+    pub(crate) fn new_with_max_view_time_sync_disabled(
+        keypair: SigningKey,
+        network_stub: NetworkStub,
+        init_as_updates: AppStateUpdates,
+        init_vs_updates: ValidatorSetUpdates,
+        max_view_time: Duration,
+    ) -> Node {
+        Self::build(
+            keypair,
+            network_stub,
+            init_as_updates,
+            init_vs_updates,
+            max_view_time,
+            false,
+        )
+    }
+
+    /// Shared constructor. When `block_sync_enabled` is `false`, the height-range block sync trigger
+    /// thresholds are set so high that sync never fires within a test — see
+    /// [`new_with_max_view_time_sync_disabled`](Self::new_with_max_view_time_sync_disabled).
+    fn build(
+        keypair: SigningKey,
+        network_stub: NetworkStub,
+        init_as_updates: AppStateUpdates,
+        init_vs_updates: ValidatorSetUpdates,
+        max_view_time: Duration,
+        block_sync_enabled: bool,
+    ) -> Node {
         let kv_store = MemDB::new();
 
         let mut init_vs = ValidatorSet::new();
@@ -88,6 +140,14 @@ impl Node {
         let verifying_key = keypair.verifying_key().to_bytes();
         let tx_queue = Arc::new(Mutex::new(Vec::new()));
 
+        // Sync trigger knobs: enabled uses the historical aggressive defaults; disabled pushes the
+        // trigger far past any test window so height-range sync never fires.
+        let (sync_min_view_diff, sync_trigger_timeout) = if block_sync_enabled {
+            (2, Duration::new(60, 0))
+        } else {
+            (1_000_000, Duration::new(86_400, 0))
+        };
+
         let configuration = Configuration::builder()
             .me(keypair)
             .chain_id(ChainID::new(0))
@@ -95,8 +155,8 @@ impl Node {
             .block_sync_server_advertise_time(Duration::new(10, 0))
             .block_sync_response_timeout(Duration::new(3, 0))
             .block_sync_blacklist_expiry_time(Duration::new(10, 0))
-            .block_sync_trigger_min_view_difference(2)
-            .block_sync_trigger_timeout(Duration::new(60, 0))
+            .block_sync_trigger_min_view_difference(sync_min_view_diff)
+            .block_sync_trigger_timeout(sync_trigger_timeout)
             .progress_msg_buffer_capacity(BufferSize::new(1024))
             .epoch_length(EpochLength::new(50))
             // `max_view_time` must be **at least** 500 milliseconds, since `NumberApp`'s `produce_block` and
@@ -126,8 +186,17 @@ impl Node {
     }
 
     /// Push the transaction `txn` to the node's local number app transaction queue.
+    ///
+    /// Each submission is tagged with a process-unique id (a single static
+    /// counter shared by every `Node` in the test process, so ids are globally
+    /// unique across nodes). The id rides with the transaction inside the block's
+    /// `Data`, letting `NumberApp` apply each logical transaction exactly once —
+    /// even if the same transaction is re-proposed after an orphaned proposal.
     pub(crate) fn submit_transaction(&mut self, txn: NumberAppTransaction) {
-        self.tx_queue.lock().unwrap().push(txn);
+        static NEXT_TX_ID: AtomicU64 = AtomicU64::new(1);
+        let id = NEXT_TX_ID.fetch_add(1, Ordering::Relaxed);
+        let tx: QueuedTransaction = (id, txn);
+        self.tx_queue.lock().unwrap().push(tx);
     }
 
     /// Query the number in the node's local app state.
@@ -211,7 +280,7 @@ fn receive_proposal_handler(
     verifying_key: VerifyingKeyBytes,
 ) -> impl Fn(&ReceiveProposalEvent) + Send + 'static {
     move |receive_proposal_event| {
-        let txn = Vec::<NumberAppTransaction>::deserialize(
+        let txn = Vec::<QueuedTransaction>::deserialize(
             &mut &*receive_proposal_event.proposal.block.data.vec()[0]
                 .bytes()
                 .as_slice(),
@@ -223,7 +292,7 @@ fn receive_proposal_handler(
         } else {
             let all: Vec<String> = txn
                 .iter()
-                .map(|tx| match tx {
+                .map(|(_id, tx)| match tx {
                     NumberAppTransaction::Increment => String::from("Increment"),
                     NumberAppTransaction::SetValidator(_, _) => String::from("Set Validator"),
                     NumberAppTransaction::DeleteValidator(_) => String::from("Delete Validator"),

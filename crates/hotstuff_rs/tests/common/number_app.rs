@@ -13,6 +13,7 @@ use hotstuff_rs::{
     },
     block_tree::{accessors::public::BlockTreeSnapshot, pluggables::KVGet},
     types::{
+        block::Block,
         crypto_primitives::{CryptoHasher, Digest, VerifyingKey},
         data_types::{CryptoHash, Data, Datum, Power},
         update_sets::{AppStateUpdates, ValidatorSetUpdates},
@@ -20,6 +21,13 @@ use hotstuff_rs::{
 };
 
 use crate::common::{mem_db::MemDB, verifying_key_bytes::VerifyingKeyBytes};
+
+/// A queued transaction paired with a process-unique id assigned by the
+/// submitter (see `Node::submit_transaction`). The id travels with the tx inside
+/// the block's `Data`, letting the app apply each logical transaction *exactly
+/// once* (via per-tx applied-markers in [`NumberApp::execute`]) even when the
+/// same tx is re-proposed after its first proposal is orphaned.
+pub(crate) type QueuedTransaction = (u64, NumberAppTransaction);
 
 /// A simple implementation of [`App`] for use in integration tests.
 ///
@@ -36,7 +44,7 @@ use crate::common::{mem_db::MemDB, verifying_key_bytes::VerifyingKeyBytes};
 /// This means that at the *bare minimum*, replicas maintaining a `NumberApp` should configure their
 /// `max_view_time` to be 500 milliseconds if they are to consistently make progress.
 pub(crate) struct NumberApp {
-    tx_queue: Arc<Mutex<Vec<NumberAppTransaction>>>,
+    tx_queue: Arc<Mutex<Vec<QueuedTransaction>>>,
 }
 
 /// User-sent instructions that number app execute in [`produce_block`](App::produce_block) and
@@ -58,13 +66,26 @@ pub enum NumberAppTransaction {
 // The key in the app state where the "number" is stored.
 const NUMBER_KEY: [u8; 1] = [0];
 
+/// App-state key recording that the transaction with the given process-unique
+/// `id` has already been applied. Prefixed with `1` so it never collides with
+/// [`NUMBER_KEY`] (`[0]`). Committing this marker alongside a transaction's
+/// effect makes application idempotent: a re-proposed (previously orphaned) or
+/// pipelined re-embedded transaction is skipped the second time, so an
+/// Increment is never applied twice while still being re-proposable if orphaned.
+fn applied_marker_key(id: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(9);
+    key.push(1u8);
+    key.extend_from_slice(&id.to_le_bytes());
+    key
+}
+
 impl NumberApp {
     /// Create a new number app that which will pop and execute transactions from the provided
     /// `tx_queue`.
     ///
     /// Callers should clone a reference to the `tx_queue` before calling this constructor and use the
     /// reference to insert transactions to the `tx_queue` whenever needed.
-    pub(crate) fn new(tx_queue: Arc<Mutex<Vec<NumberAppTransaction>>>) -> NumberApp {
+    pub(crate) fn new(tx_queue: Arc<Mutex<Vec<QueuedTransaction>>>) -> NumberApp {
         Self { tx_queue }
     }
 
@@ -95,9 +116,15 @@ impl App<MemDB> for NumberApp {
                 .unwrap(),
         );
 
-        let mut tx_queue = self.tx_queue.lock().unwrap();
+        let tx_queue = self.tx_queue.lock().unwrap();
 
-        let (app_state_updates, validator_set_updates) = self.execute(initial_number, &tx_queue);
+        let (app_state_updates, validator_set_updates) =
+            self.execute(initial_number, &tx_queue, |id| {
+                request
+                    .block_tree()
+                    .app_state(&applied_marker_key(id))
+                    .is_some()
+            });
         let data = Data::new(vec![Datum::new(tx_queue.try_to_vec().unwrap())]);
         let data_hash = {
             let mut hasher = CryptoHasher::new();
@@ -106,7 +133,12 @@ impl App<MemDB> for NumberApp {
             CryptoHash::new(bytes)
         };
 
-        tx_queue.clear();
+        // Intentionally do NOT clear the queue here. A transaction is removed
+        // only once a block containing it COMMITS (see `on_committed_block`), so
+        // if this proposal is orphaned its transactions remain queued and are
+        // re-proposable. Exactly-once application is guaranteed independently by
+        // the applied-markers written in `execute`, so re-embedding a committed
+        // (or pipelined-ancestor) transaction is a no-op.
 
         ProduceBlockResponse {
             data_hash,
@@ -146,11 +178,16 @@ impl App<MemDB> for NumberApp {
                     .unwrap(),
             );
 
-            if let Ok(transactions) = Vec::<NumberAppTransaction>::deserialize(
+            if let Ok(transactions) = Vec::<QueuedTransaction>::deserialize(
                 &mut &*request.proposed_block().data.vec()[0].bytes().as_slice(),
             ) {
                 let (app_state_updates, validator_set_updates) =
-                    self.execute(initial_number, &transactions);
+                    self.execute(initial_number, &transactions, |id| {
+                        request
+                            .block_tree()
+                            .app_state(&applied_marker_key(id))
+                            .is_some()
+                    });
                 ValidateBlockResponse::Valid {
                     app_state_updates,
                     validator_set_updates,
@@ -160,20 +197,60 @@ impl App<MemDB> for NumberApp {
             }
         }
     }
+
+    /// Once a block irrevocably commits, drop the transactions it contains from
+    /// the local queue so they are no longer re-proposed. Exactly-once
+    /// application does not depend on this (the applied-markers guarantee it) —
+    /// this only keeps the queue bounded and lets it drain to empty, which is
+    /// what the progress tests observe. Transactions in an *orphaned* proposal
+    /// never reach here, so they stay queued and remain re-proposable.
+    fn on_committed_block(&mut self, block: &Block, _committed_hash: CryptoHash) {
+        let data = &block.data;
+        if data.vec().is_empty() {
+            return;
+        }
+        if let Ok(transactions) =
+            Vec::<QueuedTransaction>::deserialize(&mut &*data.vec()[0].bytes().as_slice())
+        {
+            if transactions.is_empty() {
+                return;
+            }
+            let committed_ids: std::collections::HashSet<u64> =
+                transactions.iter().map(|(id, _)| *id).collect();
+            let mut tx_queue = self.tx_queue.lock().unwrap();
+            tx_queue.retain(|(id, _)| !committed_ids.contains(id));
+        }
+    }
 }
 
 impl NumberApp {
-    /// Given the `current_number`, execute the given `transactions` and return the resulting
-    /// `AppStateUpdates` and `ValidatorSetUpdates`.
+    /// Given the `current_number` and the block's `transactions`, compute the
+    /// resulting `AppStateUpdates` and `ValidatorSetUpdates`.
+    ///
+    /// `is_applied(id)` reports whether the transaction with that id has already
+    /// been applied by an ancestor (committed or pending) block — read from the
+    /// parent `AppBlockTreeView` via its applied-marker. Any transaction that is
+    /// already applied is skipped, guaranteeing **exactly-once** application: a
+    /// transaction re-proposed after an orphaned proposal, or re-embedded in a
+    /// pipelined descendant before its first block commits, is not double-applied.
+    /// Every transaction this call *does* apply records its own applied-marker in
+    /// the returned `AppStateUpdates`, which commits atomically with the block.
     fn execute(
         &self,
         current_number: u32,
-        transactions: &Vec<NumberAppTransaction>,
+        transactions: &[QueuedTransaction],
+        is_applied: impl Fn(u64) -> bool,
     ) -> (Option<AppStateUpdates>, Option<ValidatorSetUpdates>) {
         let mut number = current_number;
         let mut validator_set_updates: Option<ValidatorSetUpdates> = None;
+        let mut app_state_updates = AppStateUpdates::new();
+        let mut any_applied = false;
 
-        for transaction in transactions {
+        for (id, transaction) in transactions {
+            // Exactly-once: skip a transaction already applied by an ancestor.
+            if is_applied(*id) {
+                continue;
+            }
             match transaction {
                 NumberAppTransaction::Increment => {
                     number += 1;
@@ -189,12 +266,18 @@ impl NumberApp {
                         .delete(VerifyingKey::from_bytes(validator).unwrap());
                 }
             }
+            // Record that this transaction has now been applied so any later
+            // re-proposal / re-embedding of it is a no-op.
+            app_state_updates.insert(applied_marker_key(*id), vec![1u8]);
+            any_applied = true;
         }
 
-        let app_state_updates = if number != current_number {
-            let mut updates = AppStateUpdates::new();
-            updates.insert(NUMBER_KEY.to_vec(), number.try_to_vec().unwrap());
-            Some(updates)
+        if number != current_number {
+            app_state_updates.insert(NUMBER_KEY.to_vec(), number.try_to_vec().unwrap());
+        }
+
+        let app_state_updates = if any_applied {
+            Some(app_state_updates)
         } else {
             None
         };
