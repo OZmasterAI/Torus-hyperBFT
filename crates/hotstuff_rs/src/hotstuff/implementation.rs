@@ -110,6 +110,10 @@ pub(crate) struct HotStuff<N: Network> {
     /// True when enter_view succeeded but proposal production failed (parent block not yet in tree).
     /// The algorithm loop should retry the proposal after polling messages.
     proposal_deferred: bool,
+    /// S432 follower body-starvation heal: throttles [`tick_missing_pc_block_fetch`]
+    /// (which does a `block_tree.contains` DB read) to at most one evaluation per
+    /// [`BODY_RETRY_INTERVAL`] on the hot algorithm loop.
+    last_missing_pc_check: Instant,
 }
 
 impl<N: Network> HotStuff<N> {
@@ -146,6 +150,7 @@ impl<N: Network> HotStuff<N> {
             justify_fetch_tracker: std::collections::HashMap::new(),
             deferred_bodies: PendingBodies::new(),
             proposal_deferred: false,
+            last_missing_pc_check: Instant::now(),
         }
     }
 
@@ -237,6 +242,13 @@ impl<N: Network> HotStuff<N> {
                         match block_tree.block_height(&highest_pc.block)? {
                             Some(h) => (Some(highest_pc.block), h + 1),
                             None => {
+                                // S430: proactively by-hash fetch the missing parent
+                                // instead of waiting for laggy height-range sync.
+                                self.request_missing_parent(
+                                    highest_pc.block,
+                                    highest_pc.view,
+                                    &validator_set_state,
+                                );
                                 self.proposal_deferred = true;
                                 return Ok(());
                             }
@@ -420,6 +432,13 @@ impl<N: Network> HotStuff<N> {
                         match block_tree.block_height(&highest_pc.block)? {
                             Some(parent_height) => (Some(highest_pc.block), parent_height + 1),
                             None => {
+                                // S430: proactively by-hash fetch the missing parent
+                                // instead of waiting for laggy height-range sync.
+                                self.request_missing_parent(
+                                    highest_pc.block,
+                                    highest_pc.view,
+                                    &validator_set_state,
+                                );
                                 self.proposal_deferred = true;
                                 return Ok(());
                             }
@@ -1803,6 +1822,25 @@ impl<N: Network> HotStuff<N> {
             self.justify_fetch_tracker.remove(&block_hash);
             self.drain_deferred_bodies(block_tree, app)?;
         } else {
+            // Parent state isn't available yet, so this body can't be inserted.
+            // Before parking it, actively fetch the MISSING PARENT by hash so the
+            // gap closes on its own instead of waiting for the 60s no-progress
+            // block-sync timeout (the follower body-starvation livelock, S432):
+            // parking here previously dropped both fetch trackers and nothing
+            // re-armed a request for the parent. Skip when the justify is a
+            // genesis PC (no parent), or the parent is already in the tree or
+            // already parked (walking it is pointless — the generic
+            // `tick_missing_pc_block_fetch` handles those deeper stalls).
+            if !block.justify.is_genesis_pc() {
+                let parent_hash = block.justify.block;
+                let parent_view = block.justify.view;
+                if !block_tree.contains(&parent_hash)
+                    && !self.deferred_bodies.contains_key(&parent_hash)
+                {
+                    let validator_set_state = block_tree.validator_set_state()?;
+                    self.request_missing_parent(parent_hash, parent_view, &validator_set_state);
+                }
+            }
             self.deferred_bodies.insert(block_hash, block);
             self.body_fetch_tracker.remove(&block_hash);
             self.justify_fetch_tracker.remove(&block_hash);
@@ -2012,6 +2050,55 @@ impl<N: Network> HotStuff<N> {
             .insert(justify_hash, (Instant::now(), 0, *origin, justify_view));
     }
 
+    /// S430: a proposer entered its view but the parent block it must build on
+    /// (`highest_pc.block`, whose body it never obtained) is missing from the
+    /// tree, so it must defer its proposal. Before the fix nothing actively
+    /// fetched that parent — height-range block sync only triggers at a
+    /// multi-view lag, so leadership rotating onto body-less validators burned
+    /// full view timeouts (the "header-first body starvation" livelock).
+    ///
+    /// Proactively fetch the missing parent by hash via the S426 machinery. The
+    /// leader of `justify_view` proposed — and therefore holds — the certified
+    /// block, so ask it first; fall back to any other committed validator if we
+    /// are that leader. `request_justify_block` dedups by hash and
+    /// [`tick_justify_fetch_retries`](Self::tick_justify_fetch_retries) rotates
+    /// across the remaining committed validators (a superset of the QC's signers,
+    /// which by definition hold the block), so repeated deferred re-entries into
+    /// the same view are free. Never implies a vote: the block is admitted
+    /// through the normal validation path in `on_receive_block_data_response`.
+    fn request_missing_parent(
+        &mut self,
+        justify_hash: CryptoHash,
+        justify_view: ViewNumber,
+        validator_set_state: &ValidatorSetState,
+    ) {
+        // If we already hold this block's body but cannot insert it yet because
+        // its OWN ancestors are missing (a deep gap — e.g. a validator that just
+        // joined via a validator-set transition and is many blocks behind), then
+        // re-fetching it is futile: `on_receive_block_data_response` parks it in
+        // `deferred_bodies` and drops the tracker entry, so an unguarded
+        // proposer-defer path would re-request the same block on every loop
+        // iteration — a fetch storm that starves message processing and the
+        // height-range block sync that alone can fill the deeper gap. Only
+        // by-hash fetch when we genuinely lack the body (a shallow tip gap, which
+        // is what this heal path is for).
+        if self.deferred_bodies.contains_key(&justify_hash) {
+            return;
+        }
+        let me = self.config.keypair.public();
+        let committed_vs = validator_set_state.committed_validator_set();
+        // The leader of the justify's view proposed the certified block and holds it.
+        let leader = crate::pacemaker::implementation::select_leader(justify_view, committed_vs);
+        let first_target = if leader != me {
+            Some(leader)
+        } else {
+            committed_vs.validators().find(|vk| **vk != me).cloned()
+        };
+        if let Some(target) = first_target {
+            self.request_justify_block(justify_hash, justify_view, &target);
+        }
+    }
+
     /// S426: re-request unknown justify blocks (by hash) for stale entries. The
     /// origin is asked first (`MAX_BODY_RETRIES` attempts), then the request
     /// rotates across the other committed validators — a superset of the justify
@@ -2078,6 +2165,73 @@ impl<N: Network> HotStuff<N> {
 
     pub(crate) fn has_pending_justify_fetches(&self) -> bool {
         !self.justify_fetch_tracker.is_empty()
+    }
+
+    /// S432 follower body-starvation heal (the dominant starvation mode).
+    ///
+    /// A validator that joins via a validator-set transition receives the VS
+    /// block's PCs — so its `highest_pc` advances and is *view-current* — but
+    /// never obtains that block's BODY. It therefore cannot vote Decide, the old
+    /// leader re-votes alone, and 10s views burn. Height-range block sync is
+    /// structurally blind to this: its fast trigger keys on `highest_pc_view`
+    /// lag, which is zero here; only the 60s no-commit-progress timeout heals it.
+    /// The header-receipt body fetch is also defeated — the return path parks the
+    /// body in `deferred_bodies` (parent missing) and drops the trackers.
+    ///
+    /// This tick actively closes the gap: if `highest_pc` points at a block we do
+    /// not have in the tree, by-hash fetch it (a shallow tip gap). If we already
+    /// hold that block's body but parked it because ITS ancestors are missing (a
+    /// deep gap), instead fetch that parked block's own missing parent — so a deep
+    /// gap walks backward one fetch per tick instead of waiting 60s. Dedup in
+    /// `request_missing_parent`/`justify_fetch_tracker` keeps this to one in-flight
+    /// request per hash per retry budget; re-arming after a budget exhausts is
+    /// fine (the block is still missing and sync also proceeds in that case).
+    ///
+    /// `block_tree.contains` is a DB read, and this runs on the hot algorithm
+    /// loop, so evaluation is throttled to once per [`BODY_RETRY_INTERVAL`].
+    pub(crate) fn tick_missing_pc_block_fetch<K: KVStore>(
+        &mut self,
+        block_tree: &BlockTreeSingleton<K>,
+    ) -> Result<(), HotStuffError> {
+        let now = Instant::now();
+        if now.duration_since(self.last_missing_pc_check) < BODY_RETRY_INTERVAL {
+            return Ok(());
+        }
+        self.last_missing_pc_check = now;
+
+        let highest_pc = block_tree.highest_pc()?;
+        // Genesis PC has no block to fetch; a present block needs no heal.
+        if highest_pc.is_genesis_pc() || block_tree.contains(&highest_pc.block) {
+            return Ok(());
+        }
+
+        // Decide what to fetch. If the PC block itself is parked (body held,
+        // ancestors missing), walk one step back to ITS missing parent; else
+        // fetch the PC block by hash. Extract only Copy values so the immutable
+        // `deferred_bodies` borrow is released before the `&mut self` fetch call.
+        let target = if let Some(parked) = self.deferred_bodies.get(&highest_pc.block) {
+            if parked.justify.is_genesis_pc() {
+                None
+            } else {
+                let parent_hash = parked.justify.block;
+                let parent_view = parked.justify.view;
+                if block_tree.contains(&parent_hash)
+                    || self.deferred_bodies.contains_key(&parent_hash)
+                {
+                    None
+                } else {
+                    Some((parent_hash, parent_view))
+                }
+            }
+        } else {
+            Some((highest_pc.block, highest_pc.view))
+        };
+
+        if let Some((hash, view)) = target {
+            let validator_set_state = block_tree.validator_set_state()?;
+            self.request_missing_parent(hash, view, &validator_set_state);
+        }
+        Ok(())
     }
 }
 

@@ -192,6 +192,13 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
             // 6d. S426: retry by-hash fetches for unknown justify blocks (a QC that
             // formed on an undisseminated block); fall back to sync on exhaustion.
             self.hotstuff.tick_justify_fetch_retries(&self.block_tree);
+            // 6e. S432: follower body-starvation heal — if our (view-current)
+            // highest_pc points at a block whose body we never obtained, by-hash
+            // fetch it (or walk back a parked block's missing parent) instead of
+            // waiting for the 60s no-progress sync timeout. Self-throttled.
+            if let Err(e) = self.hotstuff.tick_missing_pc_block_fetch(&self.block_tree) {
+                log::error!("HotStuff tick_missing_pc_block_fetch error: {:?}", e);
+            }
             if self.hotstuff.take_sync_needed() {
                 if let Err(e) = self.block_sync_client.trigger_sync(&mut self.block_tree) {
                     log::error!(
