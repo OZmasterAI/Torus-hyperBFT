@@ -149,7 +149,9 @@ fn justify_block_livelock_test() {
     wait_until(
         Duration::from_secs(180),
         POLL_INTERVAL,
-        &format!("all 4 nodes to commit at least {BASELINE_TARGET_HEIGHT} blocks (baseline liveness)"),
+        &format!(
+            "all 4 nodes to commit at least {BASELINE_TARGET_HEIGHT} blocks (baseline liveness)"
+        ),
         || min_committed(&nodes) >= BASELINE_TARGET_HEIGHT,
         || describe_cluster(&nodes),
     );
@@ -158,7 +160,10 @@ fn justify_block_livelock_test() {
     let baseline_h = min_committed(&nodes);
     log_with_context(
         None,
-        &format!("Baseline committed. H = {baseline_h}. {}", describe_cluster(&nodes)),
+        &format!(
+            "Baseline committed. H = {baseline_h}. {}",
+            describe_cluster(&nodes)
+        ),
     );
 
     // 3. Starve node 3 of proposal headers and block bodies while the other three (a quorum) keep
@@ -201,7 +206,10 @@ fn justify_block_livelock_test() {
     );
     log_with_context(
         None,
-        &format!("Split induced (node 3 left behind). {}", describe_cluster(&nodes)),
+        &format!(
+            "Split induced (node 3 left behind). {}",
+            describe_cluster(&nodes)
+        ),
     );
 
     // 4. Heal the network completely. From here on nothing is dropped. The S426 hypothesis was that
