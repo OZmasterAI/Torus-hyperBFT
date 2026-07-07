@@ -1,0 +1,37 @@
+# A1.6 large-state bake override (S426) — pass the incremental-state-root
+# controls through from the HOST env to every node. Use with:
+#   docker compose -f docker-compose.yml -f docker-compose.bake.yml up -d
+#
+# Bare-name entries (no `=`) are the deliberate contract: docker compose resolves
+# them from the host env and, when the host var is UNSET, leaves them ABSENT in
+# the container. That matters because:
+#   * TORUS_INCREMENTAL_ORACLE is PRESENCE-based on-node
+#     (state_root.rs: `std::env::var(...).is_ok()`), so an empty string counts as
+#     ON. To turn the oracle OFF the bake `unset`s the host var; bare passthrough
+#     then omits it entirely, which is the only correct "off".
+#   * TORUS_INCREMENTAL_STATE_ROOT is value-based ("0"/"false" = off, anything
+#     else = on, absent = on-default); the bake exports =1 or =0 per leg.
+# The base compose still supplies TORUS_HASH_ONLY_PUSH_THRESHOLD (pinned by the
+# bake's TORUS_PUSH_THRESHOLD export); this file only adds the two toggles and
+# does NOT edit docker-compose.yml.
+services:
+  validator-0:
+    environment:
+      - TORUS_INCREMENTAL_STATE_ROOT
+      - TORUS_INCREMENTAL_ORACLE
+  validator-1:
+    environment:
+      - TORUS_INCREMENTAL_STATE_ROOT
+      - TORUS_INCREMENTAL_ORACLE
+  validator-2:
+    environment:
+      - TORUS_INCREMENTAL_STATE_ROOT
+      - TORUS_INCREMENTAL_ORACLE
+  validator-3:
+    environment:
+      - TORUS_INCREMENTAL_STATE_ROOT
+      - TORUS_INCREMENTAL_ORACLE
+  rpc-node:
+    environment:
+      - TORUS_INCREMENTAL_STATE_ROOT
+      - TORUS_INCREMENTAL_ORACLE
