@@ -198,7 +198,7 @@ mkdir -p "$OUTROOT"
 GROW_CSV="$OUTROOT/grow-stages.csv"
 M_CSV="$OUTROOT/measure-legs.csv"
 echo "stage,height,ddsize_bytes_total,new_recipients,mismatch" >"$GROW_CSV"
-echo "leg,flag,oracle,h_start,h_end,block_ms_fit,p50_view_ms,p99_view_ms,sr_count,mismatch,ddsize_bytes_total" >"$M_CSV"
+echo "leg,flag,oracle,h_start,h_end,block_ms_fit,p50_view_ms,p99_view_ms,sr_p50_ms,sr_p99_ms,sr_count,mismatch,ddsize_bytes_total" >"$M_CSV"
 
 echo "############################################################"
 echo "# A1.6 BAKE  SMOKE=$SMOKE  stages=$GROW_STAGES grow=${GROW_DURATION}s burn=${BURN}s legs=[$M_LEGS]"
@@ -267,8 +267,39 @@ leg_params() { # $1=leg -> "flag oracle"
         M1*) echo "1 on" ;;
         M2*) echo "1 off" ;;
         M3*) echo "0 off" ;;
+        E2*) echo "1 off" ;; # EVM-load leg: incremental only — A1.6 flatness signal
+        E3*) echo "0 off" ;; # EVM-load leg: full-scan control — must grow with state
         *)  echo "1 off" ;;
     esac
+}
+
+# ---- EVM-load burn for E* legs (state-grow.py, fresh accounts) --------------
+# Drives the exec-pipeline EVM root compute (validate_block_for_catchup ->
+# compute_post_bundle_state_root) so torus_state_root_compute_seconds samples —
+# the native bench never reaches that path (produce_block stamps the parent
+# root, so native-only M legs read sr_count=0 by design; S428 finding). The
+# global OFFSET continues from phase G so recipients stay fresh and state keeps
+# GROWING between E legs — that is what makes E2a-vs-E2b a flatness comparison.
+E_DURATION=${E_DURATION:-150}
+run_evm_burn() { # $1=dir
+    local dir=$1
+    snap_metrics "$dir" before
+    : >"$dir/heights.tsv"
+    (
+        local end=$((SECONDS + E_DURATION + 10))
+        while [ $SECONDS -lt $end ]; do
+            printf '%s\t%s\n' "$(date +%s.%N)" "$(height)" >>"$dir/heights.tsv"
+            sleep 2
+        done
+    ) &
+    local sampler=$!
+    DURATION=$E_DURATION OFFSET=$OFFSET SENDERS=$GROW_SENDERS RPCS="$RPCS" \
+        python3 scripts/state-grow.py 2>&1 | tee "$dir/grow.log" || true
+    wait "$sampler" 2>/dev/null || true
+    local newoff
+    newoff=$(grep -oE 'NEXT_OFFSET=[0-9]+' "$dir/grow.log" | tail -1 | cut -d= -f2)
+    [ -n "$newoff" ] && OFFSET=$newoff
+    snap_metrics "$dir" after
 }
 
 for leg in $M_LEGS; do
@@ -285,20 +316,23 @@ for leg in $M_LEGS; do
     if ! wait_up "$((h_pre > 3 ? h_pre - 3 : 2))" || ! wait_producing; then
         echo "$leg: chain did not resume producing" >&2
         save_logs "$ldir"
-        echo "$leg,$flag,$oracle,$h_pre,0,0,na,na,na,na,na" >>"$M_CSV"
+        echo "$leg,$flag,$oracle,$h_pre,0,0,na,na,na,na,na,na,na" >>"$M_CSV"
         continue
     fi
     verify_on_node "$ldir"
     h0=$(height)
-    run_burn "$ldir"
+    case "$leg" in
+        E*) run_evm_burn "$ldir" ;;
+        *) run_burn "$ldir" ;;
+    esac
     h1=$(height)
     ddtot=$(datadir_sizes "$ldir" after)
     save_logs "$ldir"
     mm=$(mismatch_count "$ldir")
     block_ms=$(python3 "$PY" fit "$ldir/heights.tsv" 2>/dev/null || echo 0)
     read -r p50 p99 _vc <<<"$(python3 "$PY" hist "$ldir" --hist "$VIEW_HIST" 2>/dev/null | tr ',' ' ')"
-    read -r _s50 _s99 srcount <<<"$(python3 "$PY" hist "$ldir" --hist "$SR_HIST" 2>/dev/null | tr ',' ' ')"
-    echo "$leg,$flag,$oracle,$h0,$h1,${block_ms:-0},${p50:-na},${p99:-na},${srcount:-na},$mm,$ddtot" >>"$M_CSV"
+    read -r s50 s99 srcount <<<"$(python3 "$PY" hist "$ldir" --hist "$SR_HIST" 2>/dev/null | tr ',' ' ')"
+    echo "$leg,$flag,$oracle,$h0,$h1,${block_ms:-0},${p50:-na},${p99:-na},${s50:-na},${s99:-na},${srcount:-na},$mm,$ddtot" >>"$M_CSV"
     tail -1 "$M_CSV"
     if [ "$mm" -ne 0 ]; then echo "!!! $leg: mismatch=$mm" >&2; fi
 done
