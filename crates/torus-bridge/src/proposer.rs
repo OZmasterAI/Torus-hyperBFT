@@ -123,7 +123,12 @@ impl BlockProposer {
         }
 
         // 7. Compute state root without modifying DB.
+        let root_timer = std::time::Instant::now();
         let state_root = compute_post_bundle_state_root(state_db, &exec_result.bundle)?;
+        if let Some(ref m) = self.metrics {
+            m.state_root_compute_seconds
+                .observe(root_timer.elapsed().as_secs_f64());
+        }
 
         // 8. Compute receipts root (deterministic hash of serialised receipts).
         let receipts_root = compute_receipts_root(&exec_result.receipts)
@@ -251,8 +256,13 @@ impl BlockProposer {
         }
 
         // Compute composite state root (lagged native root — reads unmodified DB).
+        let root_timer = std::time::Instant::now();
         let native_root = flagged_native_root(state_db)?;
         let state_root = compute_full_composite_root(state_db, &exec_result.bundle, native_root)?;
+        if let Some(ref m) = self.metrics {
+            m.state_root_compute_seconds
+                .observe(root_timer.elapsed().as_secs_f64());
+        }
         let receipts_root = compute_receipts_root(&exec_result.receipts)
             .map_err(|e| BridgeError::Serialization(format!("receipts: {e}")))?;
 

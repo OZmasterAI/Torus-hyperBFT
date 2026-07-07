@@ -1995,10 +1995,8 @@ impl<N: Network> HotStuff<N> {
             block_hash: justify_hash,
         };
         self.sender_handle.request_block_data(*origin, req);
-        self.justify_fetch_tracker.insert(
-            justify_hash,
-            (Instant::now(), 0, *origin, justify_view),
-        );
+        self.justify_fetch_tracker
+            .insert(justify_hash, (Instant::now(), 0, *origin, justify_view));
     }
 
     /// S426: re-request unknown justify blocks (by hash) for stale entries. The
@@ -2043,8 +2041,7 @@ impl<N: Network> HotStuff<N> {
                         .collect()
                 })
                 .unwrap_or_default();
-            let Some(target) =
-                rotated_body_fetch_target(*count, MAX_BODY_RETRIES, origin, &others)
+            let Some(target) = rotated_body_fetch_target(*count, MAX_BODY_RETRIES, origin, &others)
             else {
                 expired.push(*hash);
                 continue;

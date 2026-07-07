@@ -180,7 +180,12 @@ impl BlockValidator {
             }
         }
 
+        let root_timer = std::time::Instant::now();
         let computed_root = compute_post_bundle_state_root(state_db, &exec_result.bundle)?;
+        if let Some(ref m) = self.metrics {
+            m.state_root_compute_seconds
+                .observe(root_timer.elapsed().as_secs_f64());
+        }
 
         if !skip_state_root_check && computed_root != block.header.state_root {
             return Err(BridgeError::StateRootMismatch {
@@ -276,7 +281,12 @@ impl BlockValidator {
         // and verify against state_db (the last committed base).
         let mut verification_bundle = merged_parent_bundle.clone();
         merge_bundle_into(&mut verification_bundle, &exec_result.bundle);
+        let root_timer = std::time::Instant::now();
         let computed_root = compute_post_bundle_state_root(state_db, &verification_bundle)?;
+        if let Some(ref m) = self.metrics {
+            m.state_root_compute_seconds
+                .observe(root_timer.elapsed().as_secs_f64());
+        }
 
         if computed_root != block.header.state_root {
             return Err(BridgeError::StateRootMismatch {
@@ -428,9 +438,14 @@ impl BlockValidator {
         }
 
         // Compute composite state root (lagged native root — reads unmodified DB).
+        let root_timer = std::time::Instant::now();
         let native_root = flagged_native_root(state_db)?;
         let computed_root =
             compute_full_composite_root(state_db, &exec_result.bundle, native_root)?;
+        if let Some(ref m) = self.metrics {
+            m.state_root_compute_seconds
+                .observe(root_timer.elapsed().as_secs_f64());
+        }
 
         if !skip_state_root_check && computed_root != block.header.state_root {
             return Err(BridgeError::StateRootMismatch {
