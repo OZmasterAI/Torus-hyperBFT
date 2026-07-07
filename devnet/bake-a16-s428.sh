@@ -347,7 +347,7 @@ trap - EXIT
 
 # Verdict: zero mismatch everywhere; M2 flat & sub-100ms; M3 (if present) higher.
 total_mm=$(awk -F, 'NR>1{s+=$5} END{print s+0}' "$GROW_CSV")
-m_mm=$(awk -F, 'NR>1 && $10!="na"{s+=$10} END{print s+0}' "$M_CSV")
+m_mm=$(awk -F, 'NR>1 && $12!="na"{s+=$12} END{print s+0}' "$M_CSV")
 rc=0
 [ "$total_mm" -eq 0 ] && [ "$m_mm" -eq 0 ] || rc=1
 echo "$rc bake-a16 done grow_mismatch=$total_mm measure_mismatch=$m_mm" >"$OUTROOT/.done"
