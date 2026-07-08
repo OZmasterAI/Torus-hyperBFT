@@ -177,4 +177,7 @@ pub(crate) mod sequence_flow;
 pub(crate) mod roles;
 
 #[cfg(test)]
+mod header_fast_path_regression_test;
+
+#[cfg(test)]
 mod pc_discard_regression_test;

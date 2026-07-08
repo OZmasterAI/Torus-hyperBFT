@@ -30,7 +30,7 @@ use crate::{
     block_sync::messages::{AdvertiseBlock, AdvertisePC, BlockSyncAdvertiseMessage},
     block_tree::{
         accessors::internal::{BlockTreeError, BlockTreeSingleton, UpdateResult},
-        invariants::safe_pc,
+        invariants::{safe_pc, safe_pc_lock_clause},
         pluggables::KVStore,
     },
     events::{EndSyncEvent, Event, InsertBlockEvent, StartSyncEvent},
@@ -266,6 +266,25 @@ impl<N: Network> BlockSyncClient<N> {
                 .blacklist_sync_server(peer, self.config.blacklist_expiry_time);
             self.end_session();
             return Ok(true);
+        }
+
+        // T1.3 observability: since safe_pc is skipped above, its lock clause is skipped too. A
+        // synced block whose justify conflicts with our locked_pc means the peer's committed
+        // chain supersedes a branch this replica was locked on. That is legal during catch-up
+        // (the lock rule exists to prevent conflicting *votes*, and no vote is cast on synced
+        // blocks), but it must be visible when it happens. Log-only: errors are swallowed and
+        // behavior is unchanged.
+        if !safe_pc_lock_clause(&block.justify, block_tree).unwrap_or(true) {
+            if let Ok(locked_pc) = block_tree.locked_pc() {
+                log::warn!(
+                    "block_sync: synced block {:?} justify (block={:?}, view={}) conflicts with local locked_pc (block={:?}, view={}) — proceeding with catch-up, lock superseded by peer's committed chain",
+                    block.hash,
+                    block.justify.block,
+                    block.justify.view.int(),
+                    locked_pc.block,
+                    locked_pc.view.int(),
+                );
+            }
         }
 
         let parent_block = if block.justify.is_genesis_pc() {

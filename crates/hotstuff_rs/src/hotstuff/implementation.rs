@@ -23,7 +23,7 @@ use crate::{
     },
     block_tree::{
         accessors::internal::{BlockTreeError, BlockTreeSingleton, UpdateResult},
-        invariants::{repropose_block, safe_block, safe_nudge, safe_pc},
+        invariants::{repropose_block, safe_block, safe_nudge, safe_pc, safe_pc_lock_clause},
         pluggables::KVStore,
     },
     events::{
@@ -98,6 +98,16 @@ pub(crate) struct HotStuff<N: Network> {
     pending_headers: PendingHeaders,
     /// Hybrid pipelining: tracks body fetch retries. Maps block_hash → (last_request_time, retry_count, origin_peer).
     body_fetch_tracker: std::collections::HashMap<CryptoHash, (Instant, u8, VerifyingKey)>,
+    /// T1.3 observability: block hashes this replica phase-voted for on the header fast path
+    /// *before* `app.validate_block` ran (validation is deferred until the body arrives in
+    /// [`try_insert_body`](Self::try_insert_body)). Entries are removed as soon as the body's
+    /// validation outcome is known, or when the body fetch is abandoned, so the set is bounded by
+    /// the number of in-flight header votes.
+    header_voted: HashSet<CryptoHash>,
+    /// T1.3 metric: number of header-fast-path votes cast on blocks whose bodies
+    /// `app.validate_block` later found invalid. Monotone; each block is counted at most once
+    /// (the removal from [`header_voted`](Self::header_voted) is the increment guard).
+    header_vote_invalid_count: u64,
     /// S426 by-hash justify recovery: a QC can form on a block this node never
     /// obtained (votes are cast on the header before the body arrives), and
     /// height-range block_sync cannot heal a missing speculative body. Tracks
@@ -147,6 +157,8 @@ impl<N: Network> HotStuff<N> {
             pending_bodies: PendingBodies::new(),
             pending_headers: PendingHeaders::new(),
             body_fetch_tracker: std::collections::HashMap::new(),
+            header_voted: HashSet::new(),
+            header_vote_invalid_count: 0,
             justify_fetch_tracker: std::collections::HashMap::new(),
             deferred_bodies: PendingBodies::new(),
             proposal_deferred: false,
@@ -158,6 +170,14 @@ impl<N: Network> HotStuff<N> {
         let needed = self.sync_needed;
         self.sync_needed = false;
         needed
+    }
+
+    /// T1.3 metric accessor: how many times this replica phase-voted on a proposal header whose
+    /// body was later found invalid by `app.validate_block`. A non-zero value is observable
+    /// evidence that the header-first fast-path relaxation (vote before validation) fired.
+    #[allow(dead_code)]
+    pub(crate) fn header_vote_invalid_count(&self) -> u64 {
+        self.header_vote_invalid_count
     }
 
     /// Process an `UpdateResult` from `block_tree.update()`:
@@ -1660,9 +1680,26 @@ impl<N: Network> HotStuff<N> {
             || self.pending_bodies.contains_key(&header.justify.block);
         let is_safe = if justify_correct {
             if justify_previously_validated {
+                // T1.3: the pending-block bypass exists because the justify's block may not be in
+                // the tree yet (body in flight) even though this replica already validated and
+                // voted on its header. Accordingly, it may skip ONLY the block-in-tree predicate
+                // of `safe_pc` (clause 2) — and clause 4, which needs the block's on-tree
+                // validator-set-updates status. The LOCK clause (clause 3: `pc.view >
+                // locked_pc.view` OR `pc.block` extends `locked_pc.block`) needs no tree
+                // membership and is enforced unconditionally.
+                //
+                // Why this cannot reduce liveness: in the steady fast path the justify is a QC
+                // formed in a recent view, and `locked_pc` always trails the highest QC (in
+                // pipelined mode it is the justify of the QC block's parent), so `pc.view >
+                // locked_pc.view` holds for every honest proposal built on the current tip. The
+                // clause only rejects justifies STALER than our lock that also do not extend the
+                // locked block — exactly the votes the HotStuff safety argument forbids — and such
+                // headers are equally rejected by the non-bypass `safe_pc` path below, so no
+                // header that could contribute to a QC is lost.
                 header.justify.is_block_justify()
                     && (header.justify.chain_id == self.config.chain_id
                         || header.justify.is_genesis_pc())
+                    && safe_pc_lock_clause(&header.justify, block_tree)?
             } else {
                 safe_pc(&header.justify, block_tree, self.config.chain_id)?
                     && header.justify.is_block_justify()
@@ -1733,6 +1770,13 @@ impl<N: Network> HotStuff<N> {
                 .send::<HotStuffMessage>(vote_recipient, phase_vote.clone().into());
 
             block_tree.set_vote_state_atomic(self.view_info.view, header.block_hash)?;
+            // T1.3 observability: this vote was cast before `app.validate_block` ran on the body
+            // (unless the block is already in the tree, in which case it was validated on
+            // insertion). If the body later turns out app-invalid, `try_insert_body` increments
+            // `header_vote_invalid_count`.
+            if !block_already_in_tree {
+                self.header_voted.insert(header.block_hash);
+            }
             Event::PhaseVote(PhaseVoteEvent {
                 timestamp: SystemTime::now(),
                 vote: phase_vote,
@@ -1867,12 +1911,16 @@ impl<N: Network> HotStuff<N> {
             Err(_) => return Ok(false),
         };
         let validate_block_request = ValidateBlockRequest::new(&block, app_view);
+        let validation = app.validate_block(validate_block_request);
+        // Read the discriminant before the `if let` below moves `validation`'s fields.
+        let app_invalid = matches!(validation, ValidateBlockResponse::Invalid);
 
         if let ValidateBlockResponse::Valid {
             app_state_updates,
             validator_set_updates,
-        } = app.validate_block(validate_block_request)
+        } = validation
         {
+            self.header_voted.remove(&block.hash);
             block_tree.insert(
                 &block,
                 app_state_updates.as_ref(),
@@ -1909,6 +1957,19 @@ impl<N: Network> HotStuff<N> {
                 .update_validator_sets(&validator_set_state);
             Ok(true)
         } else {
+            // T1.3 metric: this replica phase-voted on the block's header before the app could
+            // validate the body (the header-first fast-path relaxation), and the body has now
+            // been found app-invalid. Count it — once per block, the `remove` is the increment
+            // guard — so the relaxation's cost is observable. `MissingData` is excluded: it means
+            // out-of-band data is not yet available, not that the block is invalid.
+            if app_invalid && self.header_voted.remove(&block.hash) {
+                self.header_vote_invalid_count += 1;
+                log::error!(
+                    "T1.3: header-voted block {:?} failed app validation after the vote was sent (header_vote_invalid_count={})",
+                    block.hash,
+                    self.header_vote_invalid_count
+                );
+            }
             log::warn!("body validation failed for block hash={:?}", block.hash);
             Ok(false)
         }
@@ -2017,6 +2078,9 @@ impl<N: Network> HotStuff<N> {
         for hash in &expired {
             self.body_fetch_tracker.remove(hash);
             self.pending_headers.remove(hash);
+            // T1.3: the body fetch is abandoned, so this block's validation outcome will never be
+            // observed by `try_insert_body` — drop the vote-tracking entry to keep the set bounded.
+            self.header_voted.remove(hash);
         }
         if !expired.is_empty() {
             self.sync_needed = true;

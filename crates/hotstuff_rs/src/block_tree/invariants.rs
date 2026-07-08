@@ -364,6 +364,22 @@ pub(crate) fn safe_pc<K: KVStore>(
     )
 }
 
+/// T1.3: The "lock clause" of [`safe_pc`] (predicate 3) in isolation: either `pc.view` is
+/// (strictly) greater than `block_tree`'s `locked_pc.view`, or `pc.block` extends from
+/// `locked_pc.block`.
+///
+/// Unlike the block-in-tree predicate (predicate 2 of `safe_pc`), this clause does not require
+/// `pc.block` to be in the block tree: [`extends_locked_pc_block`] degrades gracefully for unknown
+/// blocks (only the direct `pc.block == locked_pc.block` comparison can then succeed). This makes
+/// the clause enforceable on the header-first fast path — where the justify's block body may still
+/// be in flight — and checkable (for observability) on the block-sync path.
+pub(crate) fn safe_pc_lock_clause<K: KVStore>(
+    pc: &PhaseCertificate,
+    block_tree: &BlockTreeSingleton<K>,
+) -> Result<bool, BlockTreeError> {
+    Ok(pc.view > block_tree.locked_pc()?.view || extends_locked_pc_block(pc, block_tree)?)
+}
+
 /// Check whether `nudge` can safely cause updates to `block_tree`, given the replica's `current_view`
 /// and `chain_id`.
 ///
