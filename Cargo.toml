@@ -99,6 +99,11 @@ prometheus-client = "0.24"
 k256 = "0.13"
 sha3 = "0.10"
 sha2 = "0.10"
+# Erasure coding (Sprint 5 T3.1 — recovery-path RS(k,n) body dissemination scaffold).
+# Mature, arbitrary k/n, SIMD-accelerated GF(2^8). Default pick per
+# docs/plans/sprint5-erasure-coding.md ("Library" section). galois_8 bounds n<=255,
+# far above the 21-validator cap.
+reed-solomon-erasure = "6"
 thiserror = "2"
 ed25519-dalek = { version = "2", features = ["batch"] }
 ethnum = "1.5"

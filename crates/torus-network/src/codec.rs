@@ -408,6 +408,125 @@ impl libp2p::request_response::Codec for NativeDaCodec {
     }
 }
 
+// ============================================================================
+// Erasure-coded shard fetch — `/torus/native-da-shards/1.0` (Sprint 5 T3.1)
+// ============================================================================
+//
+// SCAFFOLD (recovery-path Phase A of docs/plans/sprint5-erasure-coding.md).
+// A lagging node that is missing a body fetches shard `i` from `k` DIFFERENT
+// peers instead of the whole body from ONE — killing the s338 single-source
+// hotspot. Each shard ships with its Merkle proof against the committed
+// `erasure_root` so it is self-verifying (verify-then-reconstruct). A node that
+// cannot gather `k` shards FALLS BACK to the existing whole-body
+// `/torus/native-da/{1.0,2.0}` pull — additive, never a new wedge.
+//
+// STATUS: wire types + length-prefixed borsh codec are defined and unit-tested
+// for round-trip. Behaviour registration + the serve/fetch/reconstruct loop are
+// DEFERRED (TODO below) to keep this diff off the consensus-critical swarm event
+// loop until a toolchain can compile it. `NATIVE_DA_SHARDS_PROTOCOL` mirrors the
+// zstd 2.0-first per-peer-fallback precedent (mixed-binary safe).
+//
+// TODO(T3.1): (1) add a `native_da_shards: request_response::Behaviour<NativeDaShardsCodec>`
+// field in behaviour.rs (mirror `native_da`); (2) serve from `CF_NATIVE_SHARDS`
+// off the consensus loop; (3) on a body miss, request `k` shards from distinct
+// peers, `verify_shard` each, `reconstruct`, then apply the body-hash backstop
+// before absorbing into `CF_NATIVE_PENDING`.
+
+/// Protocol id for erasure-shard fetch. `/1.0` only for now; a future `/2.0`
+/// would add zstd framing exactly like `native-da/2.0`.
+pub const NATIVE_DA_SHARDS_PROTOCOL: &str = "/torus/native-da-shards/1.0";
+
+/// Request one shard of a body: `body_hash` identifies the erasure set,
+/// `shard_index` selects the shard (`0..n`).
+#[derive(borsh::BorshSerialize, borsh::BorshDeserialize, Debug, Clone)]
+pub struct NativeDaShardRequest {
+    pub body_hash: [u8; 32],
+    pub shard_index: u16,
+}
+
+/// Response carrying one shard plus everything a fetcher needs to verify it
+/// standalone. `present == false` ⇒ the server does not custody this shard (the
+/// fetcher tries another peer / index, or falls back to whole-body pull).
+///
+/// `proof` is the bottom-up sibling path (`torus_state::erasure::ShardProof`,
+/// re-expressed as raw 32-byte hashes to keep the network crate free of a
+/// state-crate dependency). `k`/`n`/`body_len`/`erasure_root` let the fetcher
+/// verify-then-reconstruct without any out-of-band metadata.
+#[derive(borsh::BorshSerialize, borsh::BorshDeserialize, Debug, Clone)]
+pub struct NativeDaShardResponse {
+    pub present: bool,
+    pub shard_index: u16,
+    pub shard_bytes: Vec<u8>,
+    pub proof: Vec<[u8; 32]>,
+    pub erasure_root: [u8; 32],
+    pub k: u16,
+    pub n: u16,
+    pub body_len: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct NativeDaShardsCodec;
+
+impl NativeDaShardsCodec {
+    // A single shard is at most ~body/k; reuse the whole-body cap as a safe
+    // upper bound (shards are strictly smaller). TODO(T3.1): give shards their
+    // own tighter cap in `caps` once the serve path lands.
+    const MAX_MSG_SIZE: usize = MAX_NATIVE_DA_MSG_SIZE;
+}
+
+#[async_trait]
+impl libp2p::request_response::Codec for NativeDaShardsCodec {
+    type Protocol = StreamProtocol;
+    type Request = NativeDaShardRequest;
+    type Response = NativeDaShardResponse;
+
+    async fn read_request<T>(
+        &mut self,
+        protocol: &Self::Protocol,
+        io: &mut T,
+    ) -> io::Result<Self::Request>
+    where
+        T: AsyncRead + Unpin + Send,
+    {
+        read_frame(protocol, io, Self::MAX_MSG_SIZE).await
+    }
+
+    async fn read_response<T>(
+        &mut self,
+        protocol: &Self::Protocol,
+        io: &mut T,
+    ) -> io::Result<Self::Response>
+    where
+        T: AsyncRead + Unpin + Send,
+    {
+        read_frame(protocol, io, Self::MAX_MSG_SIZE).await
+    }
+
+    async fn write_request<T>(
+        &mut self,
+        protocol: &Self::Protocol,
+        io: &mut T,
+        req: Self::Request,
+    ) -> io::Result<()>
+    where
+        T: AsyncWrite + Unpin + Send,
+    {
+        write_frame(protocol, io, &req, WirePath::NativeDa).await
+    }
+
+    async fn write_response<T>(
+        &mut self,
+        protocol: &Self::Protocol,
+        io: &mut T,
+        res: Self::Response,
+    ) -> io::Result<()>
+    where
+        T: AsyncWrite + Unpin + Send,
+    {
+        write_frame(protocol, io, &res, WirePath::NativeDa).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -442,6 +561,53 @@ mod tests {
         let back = NativeDaNetResponse::try_from_slice(&bytes).expect("deserialize response");
         assert_eq!(back.bodies, resp.bodies);
         assert!(back.bodies[1].is_empty(), "not-found entry stays empty");
+    }
+
+    /// T3.1 (RED on HEAD — no shard types exist): the
+    /// `/torus/native-da-shards/1.0` request/response round-trips through borsh,
+    /// including the `present == false` (not-custodied) case and the proof path.
+    #[test]
+    fn native_da_shards_protocol_roundtrip() {
+        let req = NativeDaShardRequest { body_hash: [7u8; 32], shard_index: 2 };
+        let bytes = req.try_to_vec().expect("serialize shard request");
+        let back = NativeDaShardRequest::try_from_slice(&bytes).expect("deserialize");
+        assert_eq!(back.body_hash, req.body_hash);
+        assert_eq!(back.shard_index, req.shard_index);
+
+        // A found shard with a 2-level Merkle proof.
+        let resp = NativeDaShardResponse {
+            present: true,
+            shard_index: 2,
+            shard_bytes: vec![1, 2, 3, 4, 5],
+            proof: vec![[9u8; 32], [8u8; 32]],
+            erasure_root: [4u8; 32],
+            k: 2,
+            n: 3,
+            body_len: 4096,
+        };
+        let bytes = resp.try_to_vec().expect("serialize shard response");
+        let back = NativeDaShardResponse::try_from_slice(&bytes).expect("deserialize");
+        assert!(back.present);
+        assert_eq!(back.shard_bytes, resp.shard_bytes);
+        assert_eq!(back.proof, resp.proof);
+        assert_eq!(back.erasure_root, resp.erasure_root);
+        assert_eq!((back.k, back.n, back.body_len), (2, 3, 4096));
+
+        // Not-custodied: present=false with empty payload round-trips.
+        let miss = NativeDaShardResponse {
+            present: false,
+            shard_index: 5,
+            shard_bytes: Vec::new(),
+            proof: Vec::new(),
+            erasure_root: [0u8; 32],
+            k: 2,
+            n: 3,
+            body_len: 0,
+        };
+        let bytes = miss.try_to_vec().unwrap();
+        let back = NativeDaShardResponse::try_from_slice(&bytes).unwrap();
+        assert!(!back.present, "not-custodied marker must survive");
+        assert!(back.shard_bytes.is_empty());
     }
 
     /// Sprint 5 T1: a `/2.0` protocol round-trips zstd-framed borsh through every

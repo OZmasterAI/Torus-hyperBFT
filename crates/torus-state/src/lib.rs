@@ -4,6 +4,7 @@ pub mod backend;
 pub mod bg_writer;
 pub mod cf;
 pub mod db;
+pub mod erasure;
 pub mod error;
 pub mod incremental;
 pub mod native_da;

@@ -76,6 +76,18 @@ pub fn native_nonce_key(sender: &alloy_primitives::Address, nonce: u64) -> [u8; 
 /// ingest/produce/receive path; served by-hash on a miss via /torus/native-da/1.0.
 pub const CF_NATIVE_PENDING: &str = "cf_native_pending";
 
+/// Erasure-shard custody store (Sprint 5 T3.1, recovery-path scaffold).
+/// Key: `body_hash(32) ++ shard_index(2 BE)` -> `bincode(StoredShard)` (shard
+/// bytes + Merkle proof + erasure-root + `(k, n)` + `body_len`). Populated by
+/// the shard-encode path and served over `/torus/native-da-shards/1.0`; a
+/// reconstructing node verifies each shard's proof, rebuilds from any `k`, and
+/// falls back to the whole-body `CF_NATIVE_PENDING` pull on `< k`. Additive:
+/// the whole-body path is unchanged.
+/// TODO(T3.1): the writer/serve wiring is deferred (see erasure.rs + codec.rs
+/// scaffold); this CF is registered now so mixed-binary peers agree on the DB
+/// layout ahead of the protocol landing.
+pub const CF_NATIVE_SHARDS: &str = "cf_native_shards";
+
 // Session keys
 /// Session key storage. Key: ed25519 pubkey (32 bytes). Value: JSON-encoded SessionData.
 pub const CF_SESSIONS: &str = "cf_sessions";
@@ -147,6 +159,7 @@ pub const ALL_CF_NAMES: &[&str] = &[
     CF_JAIL_VOTES,
     CF_NATIVE_NONCES,
     CF_NATIVE_PENDING,
+    CF_NATIVE_SHARDS,
     CF_SESSIONS,
     CF_CORE_WRITER_QUEUE,
     CF_CONSENSUS_META,
