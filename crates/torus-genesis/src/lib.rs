@@ -638,7 +638,7 @@ mod tests {
         let genesis = Genesis::from_json(json).expect("real testnet/genesis.json must parse");
 
         assert_eq!(genesis.chain_id, 7778, "testnet chain_id");
-        assert_eq!(genesis.validators.len(), 3, "3-validator set");
+        assert_eq!(genesis.validators.len(), 4, "4-validator set");
 
         // 10 markets, ids exactly 1..=10.
         let mut ids: Vec<u64> = genesis.markets.iter().map(|m| m.market_id).collect();
