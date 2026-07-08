@@ -55,7 +55,7 @@ wiped.** No key change — reuse your keystore (your libp2p peer id must stay th
 ```bash
 cd <your-torus-hyperbft-repo>
 git fetch origin integration/bs4a-livelock-s428
-git checkout <RELAUNCH-COMMIT>     # coordinator gives the exact hash once it's pushed
+git checkout 5a90c2f     # the S434 relaunch commit (4-validator genesis + bench fixes)
 cargo build --release
 ```
 
