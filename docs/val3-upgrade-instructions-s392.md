@@ -1,4 +1,4 @@
-# val3 relaunch instructions — FRESH 10-MARKET GENESIS (commit `6fe1314`)
+# val3 relaunch instructions — FRESH 10-MARKET GENESIS (commit `831187c`)
 
 Copy-paste for the val3 operator (3rd validator, self-hosted). **Supersedes the
 S433/928b700 upgrade instructions entirely.** Prepared 2026-07-08.
@@ -36,8 +36,8 @@ the same).
 ```bash
 cd <your-torus-hyperbft-repo>
 git fetch origin integration/bs4a-livelock-s428
-git checkout 6fe1314
-git log --oneline -1        # must print: 6fe1314 feat(genesis): fresh 10-market testnet genesis + governance stakers (S434)
+git checkout 831187c
+git log --oneline -1        # must print: 831187c feat(genesis): fresh 10-market testnet genesis + governance stakers (S434)
 cargo build --release
 ```
 
