@@ -1,97 +1,119 @@
-# val3 upgrade instructions — S433 (code tip 928b700)
+# val3 relaunch instructions — FRESH 10-MARKET GENESIS (commit `6fe1314`)
 
-Copy-paste for the val3 operator (3rd validator, self-hosted). Supersedes the
-S420/6e03294 instructions — this replaces them entirely. Prepared 2026-07-08.
+Copy-paste for the val3 operator (3rd validator, self-hosted). **Supersedes the
+S433/928b700 upgrade instructions entirely.** Prepared 2026-07-08.
 
 ---
 
-New build ready: branch `integration/bs4a-livelock-s428`, commit `928b700`
-(pushed to origin). **Unlike last time, the chain is NOT halted — it's live
-and producing blocks right now.** So please **build now, but do NOT restart
-your node yet.** All three nodes move to this exact commit *together* in a
-short coordinated window; running the new binary against the old fleet (or
-vice-versa) is not supported. We'll pick the restart window with you once
-you're actively at your machine — ping me and we'll do our side in lockstep.
+## ⚠️ This is a FRESH GENESIS relaunch — we WIPE the chain this time
 
-What's in it since your last upgrade (6e03294) — all consensus robustness,
-no config or key changes:
+Unlike every recent upgrade, this is **not** a resume. We're starting a brand-new
+chain from a new `genesis.json` that ships **10 perpetual markets** (was 1) plus
+pre-seeded governance stakers, so we can test adding markets by on-chain vote.
+**The current chain is being abandoned.** Same validator keys, same `chain_id`
+(7778) — the fresh start comes entirely from *every node wiping its data dir
+together*.
 
-- **Tip-fork livelock fix (S426/S428)** — a node that missed a QC'd block at
-  the tip could pin the commit frontier forever. Now healed via by-hash
-  justify recovery + gap-tolerant block-sync serving. This is the big one.
-- **Off-thread DA body recovery (BS-4a/4b)** — failed views recover missing
-  native-DA block bodies on a background worker instead of blocking consensus,
-  with one event-driven mid-budget re-fetch. Faster, non-stalling recovery.
-- **Header-first body-starvation heal (S432)** — a validator that received a
-  header but not its body now *proactively fetches* the missing body instead
-  of stalling behind it.
-- **Wrong-set PC discard (S430)** — locally-collected phase-certificates from
-  the wrong validator set are discarded during validator-set transitions
-  (safety hardening; inert at our current fixed set, correct for the future).
-- Telemetry: new `torus_state_root_compute_seconds` metric at all root-compute
-  sites; native-DA recovery counters.
+### Why the wipe must be coordinated (this bit us twice before)
 
-No key or config migration. No env-var changes this time. You can build now,
-well before the restart window.
+Because we reuse the same validator keys, a freshly-wiped node running the new
+genesis will still **re-sync the OLD chain** from any old peer that is still up —
+the old chain is consensus-compatible with our key set, and neither the timestamp
+nor the chain_id isolates it. So the *only* thing that makes the new chain take
+hold is:
 
-**1. Update + rebuild (safe to do now, node keeps running):**
+> **All three nodes DOWN + data WIPED + auto-restart DISABLED before ANY node
+> starts on the new genesis.** One straggler re-infects everyone.
+
+**Do not start your node on the new genesis until I confirm all three are down
+and wiped.** No key change — reuse your keystore (your libp2p peer id must stay
+the same).
+
+---
+
+## 1. Update + rebuild (safe to do now, before the window)
 
 ```bash
 cd <your-torus-hyperbft-repo>
 git fetch origin integration/bs4a-livelock-s428
-git checkout 928b700   # build this EXACT code commit so all three of us are on identical code.
-                       # (the branch tip has a docs-only commit above 928b700 that changes no code;
-                       #  checking out the commit directly keeps your `git log -1` matching this doc.)
-git log --oneline -1   # must print: 928b700 test(hotstuff): fix stale justify_block_livelock split-precondition (S433)
+git checkout 6fe1314
+git log --oneline -1        # must print: 6fe1314 feat(genesis): fresh 10-market testnet genesis + governance stakers (S434)
 cargo build --release
 ```
 
-Building does not touch your running node — it just produces the new binary
-at `target/release/torus-node`, ready for the restart window.
+Build this **exact** commit. A stale binary seeds a *different* genesis state
+(markets + permanent stakes) and forks off on block 1. Building does not touch a
+running node — it just produces `target/release/torus-node`.
 
-**2. Do NOT touch your keys or data directory.** Same keystore, same data
-dir. Your libp2p peer id is derived from your validator key — if you
-regenerate anything we're worse off.
-
-**3. Check your start flags** (same as last time — keep these):
-
-- `--retention-blocks 100000` — without it your database grows forever and
-  your node gets slower with height
-- keep **both** of our nodes as peers:
-
-  ```
-  --p2p-peers /ip4/95.111.231.121/udp/30333/quic-v1/p2p/12D3KooWQeKf21QBchGQUr25U6w6yNB4P78PPQZivhHRAqFnMK24,/ip4/84.32.108.220/udp/30333/quic-v1/p2p/12D3KooWK5QYy1chfBmWpk6kfu9KTpq4rqfnRkXFuXmAc4DCPUze
-  ```
-
-- make sure you're NOT passing `--native-gossip=false`
-
-**4. Restart protocol — ONLY during the coordinated window, and do NOT use
-`systemctl restart` or a quick kill+start.** A fast in-place restart races the
-dying connection and can leave your node connected but gossip-mute, which
-stalls the whole chain (this has bitten us; the watchdog helps, but don't lean
-on it):
+Confirm the genesis you'll launch is the one from git (do **not** hand-edit it):
 
 ```bash
-sudo systemctl stop <your-service>     # or however you normally stop it
-sleep 20
-sudo systemctl start <your-service>    # or your normal start command
+grep -c '"market_id"' testnet/genesis.json    # must be 10
+grep '"timestamp"'   testnet/genesis.json     # must be 1783468800 (2026-07-08 era)
 ```
 
-If the process ignores the stop and hangs (no new log lines), `kill -9` it —
-then still wait 20 seconds before starting.
+---
 
-Because the chain is live, the restart window is a brief deliberate halt: when
-you're ready, ping me, we stop our two nodes, you stop yours, everyone starts
-on `928b700`, and the chain resumes on its own once all three are up. Timing
-within the window is relaxed — a node on the new binary just idles until the
-other two join.
+## 2. The coordinated wipe window (do these together, on my go)
 
-**5. Verify after restart:**
+Ping me when you're built and ready. Then, in lockstep with us:
+
+**a. Stop AND disable your service so nothing auto-restarts it:**
+
+```bash
+sudo systemctl stop <your-service>
+sudo systemctl disable <your-service>   # the last fresh relaunch FAILED because a
+                                        # node auto-restarted and re-served the old chain
+pgrep -af torus-node                    # must print NOTHING — confirm it's really gone
+```
+
+**b. Back up + wipe your chain data (KEEP your keystore):**
+
+```bash
+mv <your-data-dir> <your-data-dir>.bak-fresh-genesis-$(date +%s)
+# your keystore/passphrase files are separate — do NOT touch them
+```
+
+**c. Tell me "down + wiped". Wait for my "all three down + wiped" confirmation
+before starting.** This is the make-or-break step.
+
+---
+
+## 3. Start on the new genesis (still in the window)
+
+Because your data dir is now empty, you **must** pass `--genesis` on this first
+boot (a resume never needed it):
+
+```bash
+target/release/torus-node \
+  --genesis testnet/genesis.json \
+  --data-dir <your-data-dir> \
+  --keystore <your-keystore> --passphrase-file <your-passphrase-file> \
+  --retention-blocks 100000 \
+  --p2p-peers /ip4/95.111.231.121/udp/30333/quic-v1/p2p/12D3KooWQeKf21QBchGQUr25U6w6yNB4P78PPQZivhHRAqFnMK24,/ip4/84.32.108.220/udp/30333/quic-v1/p2p/12D3KooWK5QYy1chfBmWpk6kfu9KTpq4rqfnRkXFuXmAc4DCPUze
+# do NOT pass --native-gossip=false
+```
+
+If you launch via systemd, make sure the unit's `ExecStart` includes
+`--genesis testnet/genesis.json` **for this first boot**, then re-enable it:
+`sudo systemctl enable <your-service>`. (Once block 1 is committed, the
+`--genesis` flag is ignored on later restarts — harmless to leave in.)
+
+Keep your flags from before: `--retention-blocks 100000` (without it the DB grows
+forever), both of our nodes as peers (above), and **not** `--native-gossip=false`.
+
+---
+
+## 4. Verify after start
 
 ```bash
 curl -s localhost:9090/metrics | grep -c torus_state_root_compute_seconds   # >0 = new binary
-# once all three nodes are up, your committed height should climb steadily
-# if you see NoPeersSubscribedToTopic spam: stop, wait 20s, start again
 ```
 
-Ping me when it's up — I'll verify from our side and re-measure block speed.
+The decisive check that the wipe worked: **your committed height starts near 0
+and climbs.** If you see the old height (~500k+), your node re-synced the OLD
+chain — stop, wipe again, and we hunt down whichever old peer is still serving
+it. The chain resumes on its own once all three fresh nodes are up.
+
+Ping me when it's up — I'll confirm all 10 markets are live from our side and
+re-measure block speed.
