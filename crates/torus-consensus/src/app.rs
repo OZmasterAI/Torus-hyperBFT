@@ -26,7 +26,7 @@ use hotstuff_rs::types::block::Block;
 use hotstuff_rs::types::data_types::{CryptoHash, Data, Datum, Power};
 use hotstuff_rs::types::update_sets::ValidatorSetUpdates;
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, RwLock};
 use std::thread::JoinHandle;
@@ -127,6 +127,11 @@ struct ExecutionContext {
     /// ExecutionContext at execution-thread exit, which drains the queue before
     /// `TorusApp::Drop`'s join returns (shutdown flush ordering).
     trade_writer: Option<torus_state::BackgroundCfWriter>,
+    /// T1.5 fail-stop latch, shared with `TorusApp` on the consensus thread.
+    /// Set (never cleared) when block execution hits a fatal error (e.g. a
+    /// market worker panicked and its book is lost). The execution loop exits
+    /// on it and the node stops producing, voting, and finalizing.
+    exec_failed: Arc<AtomicBool>,
 }
 
 // ---- Standalone helpers (used by both execution thread and crash recovery) ----
@@ -156,14 +161,17 @@ fn write_native_applied_height(state_db: &StateDb, height: u64) {
 fn find_last_committed_height(state_db: &StateDb) -> Option<u64> {
     let db = state_db.inner();
     let cf = db.cf_handle(CF_BLOCK_HEADERS)?;
-    let mut iter = db.iterator_cf(cf, rocksdb::IteratorMode::End);
-    iter.next().and_then(|r| r.ok()).and_then(|(key, _)| {
+    // T1.6: scan from the end, SKIPPING non-height keys. The pruner stores its
+    // 16-byte PRUNE_META_KEY (first byte 0x5F) in this CF, which sorts AFTER
+    // every 8-byte BE height key — reading only the last key returned None
+    // after the first prune, silently skipping crash-replay.
+    for entry in db.iterator_cf(cf, rocksdb::IteratorMode::End) {
+        let Ok((key, _)) = entry else { return None };
         if key.len() == 8 {
-            Some(u64::from_be_bytes(key[..8].try_into().ok()?))
-        } else {
-            None
+            return Some(u64::from_be_bytes(key[..8].try_into().ok()?));
         }
-    })
+    }
+    None
 }
 
 fn persist_block_header(state_db: &StateDb, block: &TorusBlock) {
@@ -429,6 +437,20 @@ impl ExecutionContext {
             let engine_timer = std::time::Instant::now();
             NativeExecutor::execute_batch(&mut ctx, &pre_evm);
             NativeExecutor::execute_batch(&mut ctx, &post_evm);
+            // T1.5 FAIL-STOP: a market worker panicked mid-match — its book
+            // was consumed and this block's post-state is unreconstructable.
+            // Do NOT run the remaining phases, do NOT flush the overlay or
+            // mark the block applied; latch the failure so the execution loop
+            // halts and consensus stops instead of zombie-advancing.
+            if let Some(reason) = ctx.fatal_error.take() {
+                tracing::error!(
+                    height,
+                    %reason,
+                    "FATAL: native execution failed — halting execution pipeline (fail-stop)"
+                );
+                self.exec_failed.store(true, Ordering::SeqCst);
+                return;
+            }
             let _ = NativeExecutor::drain_core_writer(&mut ctx);
             NativeExecutor::process_governance(&mut ctx);
             NativeExecutor::distribute_fees(&mut ctx, computed_fee_revenue);
@@ -531,12 +553,35 @@ impl ExecutionContext {
 fn execution_loop(rx: std::sync::mpsc::Receiver<CommittedBlockMsg>, ctx: ExecutionContext) {
     tracing::info!("execution pipeline thread started");
     while let Ok(msg) = rx.recv() {
-        ctx.execute_committed_block(&msg.torus_block, msg.pending_slashes);
+        let CommittedBlockMsg {
+            torus_block,
+            pending_slashes,
+        } = msg;
+        let height = torus_block.header.height;
+        // T1.5: contain execution panics — a panic here must become a
+        // controlled fail-stop (latch + loop exit), not silent thread death
+        // with consensus zombie-advancing while state is frozen.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ctx.execute_committed_block(&torus_block, pending_slashes)
+        }));
+        if result.is_err() {
+            ctx.exec_failed.store(true, Ordering::SeqCst);
+            tracing::error!(height, "execution pipeline PANICKED executing committed block");
+        }
         // Paired with the inc() at the `exec_tx.send` site: dec AFTER execution
         // so the gauge counts queued + in-flight blocks (pinned near the channel
         // bound 64 = execution is the bottleneck).
         if let Some(ref m) = ctx.metrics {
             m.exec_queue_depth.dec();
+        }
+        if ctx.exec_failed.load(Ordering::SeqCst) {
+            // Dropping `rx` closes the channel: the consensus thread's next
+            // send fails and latches the same fail-stop on the TorusApp side.
+            tracing::error!(
+                height,
+                "execution pipeline halting (FAIL-STOP) — node must stop, not zombie-advance"
+            );
+            return;
         }
     }
     tracing::info!("execution pipeline thread shutting down");
@@ -611,6 +656,10 @@ pub struct TorusApp {
     signing_key: Option<ed25519_dalek::SigningKey>,
     exec_tx: Option<SyncSender<CommittedBlockMsg>>,
     exec_handle: Option<JoinHandle<()>>,
+    /// T1.5 fail-stop latch, shared with the execution pipeline thread. Once
+    /// set (never cleared) the node stops producing, voting, and finalizing —
+    /// exec-thread death must be a loud halt, not zombie-advance.
+    exec_failed: Arc<AtomicBool>,
     leader_state: Arc<LeaderState>,
     pre_proposal_tx: Option<std::sync::mpsc::SyncSender<PreProposalBundle>>,
     /// RARE pull-fallback transport (Task 6): fetch missing native-action bodies
@@ -1012,6 +1061,10 @@ impl TorusApp {
                     epoch: 0,
                 });
 
+        // T1.5 fail-stop latch, shared between the execution pipeline thread
+        // and the consensus-side TorusApp (see `exec_failed` field docs).
+        let exec_failed = Arc::new(AtomicBool::new(false));
+
         // Execution pipeline context — owns its own copies for thread safety.
         let mut exec_validator = BlockValidator::new(
             config.chain_id,
@@ -1040,6 +1093,7 @@ impl TorusApp {
                 "torus-trade-writer",
                 256,
             )),
+            exec_failed: exec_failed.clone(),
         };
 
         // Phase A: ensure the persistent incremental trie exists before any commit (including
@@ -1100,6 +1154,7 @@ impl TorusApp {
             mempool,
             exec_tx: Some(exec_tx),
             exec_handle: Some(exec_handle),
+            exec_failed,
             leader_state,
             pre_proposal_tx: None,
             da_fetcher: None,
@@ -1109,6 +1164,19 @@ impl TorusApp {
 
     pub fn leader_state(&self) -> Arc<LeaderState> {
         self.leader_state.clone()
+    }
+
+    /// T1.5: true once the execution pipeline is dead (panic, fatal error, or
+    /// closed channel) — the node is in fail-stop and must not produce, vote,
+    /// or finalize.
+    fn is_exec_failed(&self) -> bool {
+        self.exec_failed.load(Ordering::SeqCst)
+    }
+
+    /// T1.5: shared fail-stop latch for the node binary to watch (terminate or
+    /// alert once the execution pipeline has died).
+    pub fn exec_failed_handle(&self) -> Arc<AtomicBool> {
+        self.exec_failed.clone()
     }
 
     pub fn set_pre_proposal_tx(&mut self, tx: std::sync::mpsc::SyncSender<PreProposalBundle>) {
@@ -1598,6 +1666,23 @@ impl App<RocksKVStore> for TorusApp {
         &mut self,
         request: ProduceBlockRequest<RocksKVStore>,
     ) -> ProduceBlockResponse {
+        // T1.5 FAIL-STOP: with the execution pipeline dead, state is frozen —
+        // do not drain the mempool or build a block on top of unexecuted
+        // history. The `App` trait has no "refuse" variant, so return an
+        // empty, datum-less response that every honest validate_block rejects
+        // (datums.len() != 1): this node's leader views time out instead of
+        // zombie-advancing the chain.
+        if self.is_exec_failed() {
+            tracing::error!(
+                "produce_block: execution pipeline dead — FAIL-STOP, refusing to build a block"
+            );
+            return ProduceBlockResponse {
+                data_hash: CryptoHash::new(Self::hash_datum(&[])),
+                data: Data::new(vec![]),
+                app_state_updates: None,
+                validator_set_updates: None,
+            };
+        }
         let parent_header = if let Some(parent_hash) = request.parent_block() {
             if let Ok(Some(parent_block)) = request.block_tree().block(&parent_hash) {
                 let datums = parent_block.data.vec();
@@ -1767,6 +1852,16 @@ impl App<RocksKVStore> for TorusApp {
         request: ValidateBlockRequest<RocksKVStore>,
     ) -> ValidateBlockResponse {
         tracing::info!("validate_block called (CTE)");
+
+        // T1.5 FAIL-STOP: a dead execution pipeline means committed blocks are
+        // no longer applied here — stop voting so this node cannot help
+        // finalize blocks it will never execute.
+        if self.is_exec_failed() {
+            tracing::error!(
+                "validate_block: execution pipeline dead — FAIL-STOP, refusing to vote"
+            );
+            return ValidateBlockResponse::Invalid;
+        }
 
         let block = request.proposed_block();
         let datums = block.data.vec();
@@ -1964,6 +2059,16 @@ impl App<RocksKVStore> for TorusApp {
 
     /// Send committed block to the execution pipeline thread.
     fn on_committed_block(&mut self, block: &Block, _committed_hash: CryptoHash) {
+        // T1.5 FAIL-STOP: once the execution pipeline is dead, do NOT advance
+        // height/view or accept further finalization — consensus finalizing
+        // while state is frozen is exactly the zombie-advance this latch stops.
+        if self.is_exec_failed() {
+            tracing::error!(
+                "on_committed_block: execution pipeline dead — FAIL-STOP, ignoring committed block"
+            );
+            return;
+        }
+
         let datums = block.data.vec();
         let Some(datum) = datums.first() else {
             tracing::debug!("on_committed_block: no datums in block");
@@ -2073,13 +2178,19 @@ impl App<RocksKVStore> for TorusApp {
                 m.exec_queue_depth.inc();
             }
             if tx.send(msg).is_err() {
-                tracing::error!(
-                    height,
-                    "execution pipeline channel closed — block will not be executed!"
-                );
                 if let Some(ref m) = self.metrics {
                     m.exec_queue_depth.dec();
                 }
+                // T1.5 FAIL-STOP: the execution thread is gone (panic or
+                // fatal) — this block is committed by consensus but will
+                // NEVER execute here. Latch the failure: the node stops
+                // producing, voting, and finalizing, and crash-replay closes
+                // the gap on restart. Never zombie-advance past a dead pipeline.
+                self.exec_failed.store(true, Ordering::SeqCst);
+                tracing::error!(
+                    height,
+                    "execution pipeline channel closed — FAIL-STOP: halting block production, voting, and finalization"
+                );
             }
         }
     }
@@ -2271,6 +2382,122 @@ mod crash_recovery_tests {
                 &body_bytes,
             )
             .unwrap();
+    }
+
+    /// The pruner's meta key, byte-for-byte (torus-state pruner.rs
+    /// `PRUNE_META_KEY`): 16 bytes, first byte 0x5F ('_'), stored in
+    /// `cf_block_headers` where it sorts AFTER every 8-byte BE height key.
+    const PRUNE_META_KEY: &[u8; 16] = b"__prune_meta__\x00\x00";
+
+    /// T1.6 RED-first: with the pruner's meta key present in
+    /// `cf_block_headers`, `find_last_committed_height` must skip it and
+    /// return the real last height.
+    ///
+    /// RED on pre-fix code: the function read only the LAST key of the CF;
+    /// after the first prune that key is the 16-byte meta key, so it returned
+    /// `None` and crash-replay was silently skipped. GREEN after: non-8-byte
+    /// keys are skipped, so the true height (7) is found.
+    #[test]
+    fn find_last_committed_height_skips_prune_meta_key() {
+        let (_config, state_db) = make_test_config_and_db();
+        for h in 1..=7u64 {
+            persist_block_for_test(&state_db, &make_block(h, vec![]));
+        }
+        state_db
+            .put_cf_raw(CF_BLOCK_HEADERS, PRUNE_META_KEY, &3u64.to_be_bytes())
+            .unwrap();
+
+        assert_eq!(
+            find_last_committed_height(&state_db),
+            Some(7),
+            "prune meta key in cf_block_headers must not mask the last committed height"
+        );
+    }
+
+    /// T1.6 RED-first: crash-replay must still RUN after the pruner has
+    /// written its meta key. Committed tip = 5, applied = 2 (execution died
+    /// mid-pipeline), prune meta present.
+    ///
+    /// RED on pre-fix code: `find_last_committed_height` returned `None`, so
+    /// `replay_committed` bailed at its first match arm — the returned header
+    /// stayed at genesis (height 0) and the applied height stayed 2. GREEN
+    /// after: the committed tip (5) is found, the gap is detected, and the
+    /// (empty) block is marked applied.
+    #[test]
+    fn crash_replay_runs_after_pruning() {
+        let (config, state_db) = make_test_config_and_db();
+        let exec_ctx = make_exec_ctx(&config, &state_db);
+
+        for h in 1..=5u64 {
+            persist_block_for_test(&state_db, &make_block(h, vec![]));
+        }
+        write_native_applied_height(&state_db, 2);
+        state_db
+            .put_cf_raw(CF_BLOCK_HEADERS, PRUNE_META_KEY, &1u64.to_be_bytes())
+            .unwrap();
+
+        let last = TorusApp::replay_committed(&state_db, &exec_ctx);
+
+        assert_eq!(
+            last.height, 5,
+            "replay must find the committed tip despite the prune meta key"
+        );
+        assert_eq!(
+            read_native_applied_height(&state_db),
+            Some(5),
+            "replay must close the execution gap left by the crash"
+        );
+    }
+
+    /// T1.5 RED-first: a closed execution channel (= the execution thread
+    /// died) must FAIL-STOP the node, not let consensus keep finalizing over
+    /// frozen state.
+    ///
+    /// RED on pre-fix code: the failed `send` only logged
+    /// "block will not be executed!" and returned — no latch existed
+    /// (`exec_failed`/`is_exec_failed` did not compile) and a later committed
+    /// block still advanced `last_header` to height 2 (zombie-advance). GREEN
+    /// after: the first failed send latches the fail-stop and the second
+    /// commit is ignored, freezing the node at height 1.
+    #[test]
+    fn closed_exec_channel_fail_stops_instead_of_zombie_advancing() {
+        use hotstuff_rs::hotstuff::types::PhaseCertificate;
+        use hotstuff_rs::types::data_types::BlockHeight;
+
+        let mut app = TorusApp::stub();
+
+        // Simulate execution-thread death: swap in a sender whose receiver is
+        // already gone (the old sender drops; the stub's real exec thread
+        // exits cleanly on its closed channel).
+        let (dead_tx, dead_rx) = std::sync::mpsc::sync_channel::<CommittedBlockMsg>(1);
+        drop(dead_rx);
+        app.exec_tx = Some(dead_tx);
+
+        let committed = |height: u64| {
+            let datum = bincode::serialize(&make_block(height, vec![])).unwrap();
+            let hash = TorusApp::hash_datum(&datum);
+            Block::new(
+                BlockHeight::new(height),
+                PhaseCertificate::genesis_pc(),
+                CryptoHash::new(hash),
+                Data::new(vec![Datum::new(datum)]),
+            )
+        };
+
+        let b1 = committed(1);
+        app.on_committed_block(&b1, b1.hash);
+        assert!(
+            app.is_exec_failed(),
+            "a closed exec channel must latch the fail-stop"
+        );
+        assert_eq!(app.last_header.height, 1);
+
+        let b2 = committed(2);
+        app.on_committed_block(&b2, b2.hash);
+        assert_eq!(
+            app.last_header.height, 1,
+            "node kept finalizing after execution death (zombie-advance)"
+        );
     }
 
     /// Test double: a `NativeDaFetcher` whose body only appears on the
@@ -2651,6 +2878,7 @@ mod crash_recovery_tests {
             // None -> trades write inline through the overlay (pre-O3 behavior),
             // keeping these tests' reads deterministic right after execution.
             trade_writer: None,
+            exec_failed: Arc::new(AtomicBool::new(false)),
         }
     }
 

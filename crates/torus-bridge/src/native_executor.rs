@@ -221,6 +221,12 @@ pub struct NativeExecContext<T: StateBackend = StateDb> {
 
     /// Optional metrics handle for Prometheus instrumentation.
     pub metrics: Option<std::sync::Arc<torus_telemetry::Metrics>>,
+
+    /// T1.5: set (never cleared) when a market worker panicked mid-matching.
+    /// The panicking worker consumed its market's `OrderBook`, so this block's
+    /// post-state is unreconstructable — the committer MUST treat this as
+    /// fatal (fail-stop the node), never flush state or mark the block applied.
+    pub fatal_error: Option<String>,
 }
 
 impl<T: StateBackend> NativeExecContext<T> {
@@ -275,6 +281,7 @@ impl<T: StateBackend> NativeExecContext<T> {
             defer_trades: false,
             pending_trades: Vec::new(),
             metrics: None,
+            fatal_error: None,
         }
     }
 
@@ -717,7 +724,33 @@ impl NativeExecutor {
             worker_batches.insert(market_id, (book, requests));
         }
 
-        let market_results = MarketWorkerPool::match_parallel(worker_batches, ctx.timestamp);
+        let market_results = match MarketWorkerPool::match_parallel(worker_batches, ctx.timestamp)
+        {
+            Ok(r) => r,
+            Err(panic) => {
+                // T1.5 FAIL-STOP: the panicking worker consumed its market's
+                // book (and this block's other books were consumed with it),
+                // so settlement cannot proceed and the block must never be
+                // applied. Latch the fatal on the context — the committer
+                // halts the execution pipeline on it — and bail out loudly.
+                tracing::error!(
+                    market_id = panic.market_id,
+                    message = %panic.message,
+                    "market worker panicked — FATAL, block cannot be executed"
+                );
+                for &i in &place_order_indices {
+                    results[i] = NativeActionResult::err(
+                        "place_order",
+                        "market worker panicked — block execution aborted".to_string(),
+                    );
+                }
+                ctx.fatal_error = Some(format!(
+                    "market worker panicked (market {}): {}",
+                    panic.market_id, panic.message
+                ));
+                return NativeBatchResult { results, total_gas };
+            }
+        };
         if let Some(ref m) = ctx.metrics {
             m.exec_phase_match_seconds
                 .observe(match_timer.elapsed().as_secs_f64());

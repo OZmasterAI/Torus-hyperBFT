@@ -317,7 +317,7 @@ fn same_trader_insufficient_margin_second_order_fails() {
 #[test]
 fn worker_pool_empty_batch_noop() {
     let batches: HashMap<MarketId, (OrderBook, Vec<MatchRequest>)> = HashMap::new();
-    let results = MarketWorkerPool::match_parallel(batches, 1000);
+    let results = MarketWorkerPool::match_parallel(batches, 1000).expect("no worker panicked");
     assert!(results.is_empty());
 }
 
@@ -333,7 +333,7 @@ fn worker_pool_single_market_no_thread_overhead() {
     let mut batches = HashMap::new();
     batches.insert(1u64, (book, requests));
 
-    let results = MarketWorkerPool::match_parallel(batches, 1000);
+    let results = MarketWorkerPool::match_parallel(batches, 1000).expect("no worker panicked");
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].market_id, 1);
     assert_eq!(results[0].results.len(), 1);
@@ -374,7 +374,7 @@ fn worker_pool_multiple_markets_parallel() {
     batches.insert(2u64, (book2, requests2));
     batches.insert(3u64, (book3, requests3));
 
-    let results = MarketWorkerPool::match_parallel(batches, 1000);
+    let results = MarketWorkerPool::match_parallel(batches, 1000).expect("no worker panicked");
     assert_eq!(results.len(), 3);
 
     // Find market 1's result — it should have fills
