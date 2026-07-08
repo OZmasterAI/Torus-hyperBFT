@@ -306,6 +306,98 @@ fn fire_interval(submit_batch: usize, rate: usize) -> Option<Duration> {
     Some(Duration::from_secs_f64(submit_batch as f64 / rate as f64))
 }
 
+/// Whether a leg fires pre-signed ammo or streams freshly-signed ammo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AmmoPlan {
+    /// Sign everything up front; the timed window is pure network I/O.
+    Presign,
+    /// Sign fresh, just ahead of firing (T6 pipeline) — nonces never age.
+    Stream,
+}
+
+/// Decide whether the pre-sign fast path is safe for this leg, or whether it
+/// would fall into the S387 "presign trap" and must stream instead.
+///
+/// Pre-sign stamps each action's nonce ONCE, up front, as a wall-clock ms led by
+/// `lead_ms`, but the ammo is not fired until the *whole* presign phase finishes
+/// (`total_actions / sign_rate_per_s`) and then over the `duration_secs` window.
+/// The chain rejects any nonce older than `window_ms`. On a core-pinned bench a
+/// large presign signs serial and can outlast the window, so the oldest ammo is
+/// "nonce too old" on arrival and the leg silently carries ZERO load.
+///
+/// `sign_rate_per_s` is the *aggregate* box signing rate (single-core rate x the
+/// usable core budget), so a core-pinned bench streams while an unpinned box
+/// still clears pre-sign for the same sender count.
+fn choose_ammo_plan(
+    total_actions: u64,
+    sign_rate_per_s: f64,
+    lead_ms: u64,
+    duration_secs: u64,
+    window_ms: u64,
+) -> AmmoPlan {
+    if total_actions == 0 || sign_rate_per_s <= 0.0 {
+        return AmmoPlan::Stream;
+    }
+    let projected_presign_ms = (total_actions as f64 / sign_rate_per_s * 1000.0) as u64;
+    // The oldest ammo (nonce = t0 + lead_ms) fires first, right after the presign
+    // phase, and must still be inside the window at the END of the run.
+    let oldest_age_at_run_end_ms =
+        projected_presign_ms.saturating_sub(lead_ms) + duration_secs * 1000;
+    // Margin below the hard window: block times stretch under load, so real fire
+    // time drifts past the nominal duration.
+    const SAFETY_MS: u64 = 8_000;
+    if oldest_age_at_run_end_ms + SAFETY_MS <= window_ms {
+        AmmoPlan::Presign
+    } else {
+        AmmoPlan::Stream
+    }
+}
+
+#[cfg(test)]
+mod ammo_plan_tests {
+    use super::*;
+
+    const W: u64 = 60_000; // NONCE_WINDOW_MS
+    const LEAD: u64 = 30_000; // now + window/2, the current pre-sign lead
+
+    // pre_sign == 0, or a rate we couldn't measure, always streams.
+    #[test]
+    fn zero_or_unmeasurable_streams() {
+        assert_eq!(choose_ammo_plan(0, 373.0, LEAD, 20, W), AmmoPlan::Stream);
+        assert_eq!(choose_ammo_plan(16_500, 0.0, LEAD, 20, W), AmmoPlan::Stream);
+    }
+
+    // s=20,b=400: ~16.5k actions @ ~373/s on one pinned core = ~44s presign;
+    // oldest ammo ~34s old by run-end, still inside the 60s window -> pre-sign
+    // OK (this is the cell that actually produced load).
+    #[test]
+    fn small_leg_presigns() {
+        assert_eq!(choose_ammo_plan(16_500, 373.0, LEAD, 20, W), AmmoPlan::Presign);
+    }
+
+    // s=60,b=400: ~49.5k actions @ ~373/s = ~133s presign -> oldest ammo ~123s
+    // old on arrival -> dead. Must stream. (The cell that silently returned 0.)
+    #[test]
+    fn high_sender_leg_streams() {
+        assert_eq!(choose_ammo_plan(49_500, 373.0, LEAD, 20, W), AmmoPlan::Stream);
+    }
+
+    // b=1000 makes each action heavier to build; the slower rate blows the
+    // window even at the same action count -> stream.
+    #[test]
+    fn large_batch_leg_streams() {
+        assert_eq!(choose_ammo_plan(16_500, 150.0, LEAD, 20, W), AmmoPlan::Stream);
+    }
+
+    // The SAME 49.5k actions on an UNPINNED 8-core box (aggregate ~3000/s)
+    // presign in ~16s and fit — pinning is what triggers the fallback, not the
+    // sender count itself.
+    #[test]
+    fn unpinned_box_presigns_high_sender() {
+        assert_eq!(choose_ammo_plan(49_500, 3_000.0, LEAD, 20, W), AmmoPlan::Presign);
+    }
+}
+
 /// Build one action carrying `batch_size` orders. `batch_size <= 1` returns a plain
 /// `PlaceOrder` (the legacy single path) for apples-to-apples A/B runs.
 ///
@@ -1156,11 +1248,66 @@ async fn run_consensus(
     let submitted = Arc::new(AtomicU64::new(0));
     let included = Arc::new(AtomicU64::new(0));
 
+    // Ammo strategy. Pre-sign stamps every nonce up front (now + window/2); if
+    // signing ALL of it outlasts the nonce window the ammo is "too old" on arrival
+    // and the leg silently carries zero load (S387 presign trap). Calibrate this
+    // box's signing rate and fall back to the streaming pipeline (fresh nonces)
+    // when pre-sign wouldn't fit — e.g. many senders on a core-pinned bench.
+    let mut stream = pre_sign == 0;
+    if pre_sign > 0 {
+        let calib_key = keys[0].signing_key.clone();
+        let calib_session = keys[0].session_key.clone();
+        let (calib_actions, calib_secs) = tokio::task::spawn_blocking(move || {
+            let mut rng = StdRng::from_entropy();
+            let t = Instant::now();
+            let mut n = 0u64;
+            for _ in 0..3 {
+                let (p, _) = sign_payload_batch(
+                    &mut rng, &calib_key, &calib_session, sign_mode, batch_size,
+                    submit_batch, 0, bin, markets,
+                );
+                n += p.len() as u64;
+            }
+            (n, t.elapsed().as_secs_f64())
+        })
+        .await
+        .expect("calibration signer panicked");
+        let per_core = if calib_secs > 0.0 {
+            calib_actions as f64 / calib_secs
+        } else {
+            f64::INFINITY
+        };
+        // Pre-sign spawns one blocking signer per sender; the affinity-limited core
+        // budget bounds real parallelism, so a core-pinned bench signs serial while
+        // an unpinned box fans out. available_parallelism() honours sched affinity.
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        let sign_rate = per_core * num_senders.min(cores).max(1) as f64;
+        let total_actions = (num_senders * pre_sign * submit_batch) as u64;
+        if choose_ammo_plan(
+            total_actions,
+            sign_rate,
+            torus_types::eip712::NONCE_WINDOW_MS / 2,
+            duration_secs,
+            torus_types::eip712::NONCE_WINDOW_MS,
+        ) == AmmoPlan::Stream
+        {
+            println!(
+                "Pre-sign SKIPPED: {total_actions} actions @ ~{sign_rate:.0}/s ≈ {:.0}s would \
+                 outlast the {}s nonce window — streaming fresh nonces instead.",
+                total_actions as f64 / sign_rate,
+                torus_types::eip712::NONCE_WINDOW_MS / 1000,
+            );
+            stream = true;
+        }
+    }
+
     // Pre-sign mode: build ALL ammo BEFORE the clock so the timed window is pure
     // submission (no signing CPU competing). Each sender signs in parallel on the
     // blocking pool; nonces start at now_ms and run contiguously per sender.
     let mut ammo: Vec<Vec<Vec<String>>> = Vec::new();
-    if pre_sign > 0 {
+    if !stream {
         // Lead the nonces by half the window so they're still valid AFTER the
         // (potentially long) pre-sign phase: the chain rejects nonce < now-60s,
         // and signing a big ammo can take tens of seconds. now_ms + 30s keeps the
@@ -1340,7 +1487,7 @@ async fn run_consensus(
         let submitted = submitted.clone();
         let semaphore = semaphore.clone();
         let url_count = urls.len();
-        let sender_ammo = if pre_sign > 0 {
+        let sender_ammo = if !stream {
             std::mem::take(&mut ammo[sender_idx])
         } else {
             Vec::new()
@@ -1350,7 +1497,7 @@ async fn run_consensus(
             let mut req_id: u64 = sender_idx as u64 * 1_000_000;
             let mut url_idx: usize = sender_idx % url_count;
 
-            if pre_sign > 0 {
+            if !stream {
                 // Pre-sign mode: fire pre-built ammo, ZERO signing in the timed
                 // window — submit rate is now bounded by the chain/network, not
                 // this box's signer. Stops early if a sender runs out of ammo.
@@ -1421,11 +1568,25 @@ async fn run_consensus(
                     }
                 });
                 let mut starved_ns: u128 = 0;
+                // Pace the fire loop to the offered rate, same cadence as the
+                // presign branch. Unpaced streaming lets 60 senders stampede the
+                // local RPC ingress ('error sending request' + lost acks), so the
+                // submitted counter undercounts even though the node commits fine.
+                let pace = fire_interval(submit_batch, rate);
+                let mut next_fire = Instant::now();
 
                 while Instant::now() < deadline {
                     let wait_t0 = Instant::now();
                     let Some(payloads) = pregen_rx.recv().await else { break };
                     starved_ns += wait_t0.elapsed().as_nanos();
+
+                    if let Some(iv) = pace {
+                        let now = Instant::now();
+                        if now < next_fire {
+                            tokio::time::sleep(next_fire - now).await;
+                        }
+                        next_fire = next_fire.max(now) + iv;
+                    }
 
                     let permit = semaphore.clone().acquire_owned().await.unwrap();
                     let url = urls[url_idx % url_count].clone();
