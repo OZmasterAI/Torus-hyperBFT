@@ -446,11 +446,19 @@ pub(crate) fn pc_to_lock<K: KVStore>(
     // Determine the `PhaseCertificate` to lock according to `justify.phase`.
     let locked_pc = block_tree.locked_pc()?;
     let pc_to_lock = match justify.phase {
-        // If `justify.phase` is `Generic`, lock on `justify.block.justify`.
-        Phase::Generic => match block_tree.block_justify(&justify.block) {
-            Ok(parent_justify) => Some(parent_justify.clone()),
-            Err(_) => return Ok(None),
-        },
+        // If `justify.phase` is `Generic`, lock on `justify` itself (lock-on-parent).
+        //
+        // T1.2 SAFETY FIX: the 2-chain commit rule (block_to_commit, Generic) commits the block
+        // `justify` certifies once two consecutive-view QCs form. It therefore requires the
+        // commit-enabling quorum to be LOCKED on that same block. The prior rule locked on
+        // `justify.block.justify` (the grandparent), one generation too shallow, so an honest
+        // member of the QC(X) quorum was only locked on the common ancestor A and could still
+        // vote a conflicting sibling P' that extends A -> two honest validators commit conflicting
+        // blocks at the same height (confirmed n=4/f=1 agreement violation, ~88% two-analysis
+        // agreement). Locking on `justify` (== the parent of the voted block) matches
+        // HotStuff-2/Jolteon and closes the gap: P' then fails safe_pc for every honest QC(X)
+        // voter. See specs/consensus/stateright_2chain_safety.md (run the model to confirm).
+        Phase::Generic => Some(justify.clone()),
 
         // If `justify.phase` is `Prepare`, don't lock.
         Phase::Prepare => None,
