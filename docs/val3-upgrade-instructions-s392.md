@@ -1,95 +1,119 @@
-# val3 upgrade instructions — S420 (code tip 6e03294)
+# val3 relaunch instructions — FRESH 10-MARKET GENESIS (commit `831187c`)
 
-Copy-paste for the val3 operator (3rd validator, self-hosted). Supersedes the
-S403/c949c7b instructions — this replaces them entirely. Prepared 2026-07-06.
+Copy-paste for the val3 operator (3rd validator, self-hosted). **Supersedes the
+S433/928b700 upgrade instructions entirely.** Prepared 2026-07-08.
 
 ---
 
-New build ready: branch `sprint/blockspeed-orders-s395`, commit `6e03294`
-(pushed to origin). The chain is currently **halted** at height 1,114,439 —
-we stopped it deliberately for this upgrade, so nothing is waiting on you
-being fast, but the network can't restart without you (3-of-3 quorum). All
-three nodes move to this exact commit together; running the old binary
-against the new fleet is not supported.
+## ⚠️ This is a FRESH GENESIS relaunch — we WIPE the chain this time
 
-What's in it since your last upgrade (c949c7b):
+Unlike every recent upgrade, this is **not** a resume. We're starting a brand-new
+chain from a new `genesis.json` that ships **10 perpetual markets** (was 1) plus
+pre-seeded governance stakers, so we can test adding markets by on-chain vote.
+**The current chain is being abandoned.** Same validator keys, same `chain_id`
+(7778) — the fresh start comes entirely from *every node wiping its data dir
+together*.
 
-- **Root-cause fix for the block-time slowdown** — leader selection cost grew
-  with chain height (this was the ~270ms → ~450ms drag). Proposals no longer
-  slow down as the chain grows.
-- **Mesh watchdog + explicit validator peering** — detects and heals the
-  gossip-mute wedge that used to stall the chain after restarts. This only
-  works when all validators run it, which is why we upgrade in lockstep.
-- **Exec/throughput work** — batched order placement, background trade-history
-  writes, balance caching. Also new message-size gates with saner defaults.
-- Telemetry and an RPC safety fix.
+### Why the wipe must be coordinated (this bit us twice before)
 
-No key or config migration. You can build now, before the restart window.
+Because we reuse the same validator keys, a freshly-wiped node running the new
+genesis will still **re-sync the OLD chain** from any old peer that is still up —
+the old chain is consensus-compatible with our key set, and neither the timestamp
+nor the chain_id isolates it. So the *only* thing that makes the new chain take
+hold is:
 
-**1. Update + rebuild:**
+> **All three nodes DOWN + data WIPED + auto-restart DISABLED before ANY node
+> starts on the new genesis.** One straggler re-infects everyone.
+
+**Do not start your node on the new genesis until I confirm all three are down
+and wiped.** No key change — reuse your keystore (your libp2p peer id must stay
+the same).
+
+---
+
+## 1. Update + rebuild (safe to do now, before the window)
 
 ```bash
 cd <your-torus-hyperbft-repo>
-git fetch origin sprint/blockspeed-orders-s395
-git checkout sprint/blockspeed-orders-s395
-git pull --ff-only origin sprint/blockspeed-orders-s395
-git log --oneline -1   # must print: 6e03294 chore(test): nextest config — bound the suite, cap hanging integ tests
+git fetch origin integration/bs4a-livelock-s428
+git checkout 831187c
+git log --oneline -1        # must print: 831187c feat(genesis): fresh 10-market testnet genesis + governance stakers (S434)
 cargo build --release
 ```
 
-**2. Do NOT touch your keys or data directory.** Same keystore, same data
-dir. Your libp2p peer id is derived from your validator key — if you
-regenerate anything we're worse off.
+Build this **exact** commit. A stale binary seeds a *different* genesis state
+(markets + permanent stakes) and forks off on block 1. Building does not touch a
+running node — it just produces `target/release/torus-node`.
 
-**3. REMOVE the DA threshold env var** (we previously asked you to set it —
-that advice is withdrawn; measurements showed the compiled default is faster
-and the new build ignores oversized values anyway):
+Confirm the genesis you'll launch is the one from git (do **not** hand-edit it):
 
-- systemd: `sudo systemctl edit <your-service>` and delete the
-  `Environment=TORUS_HASH_ONLY_PUSH_THRESHOLD=6000000` line (leave the
-  `[Service]` section empty or remove the override), then
-  `sudo systemctl daemon-reload`
-- or if you start it by hand, just drop the
-  `TORUS_HASH_ONLY_PUSH_THRESHOLD=6000000` prefix from your command
+```bash
+grep -c '"market_id"' testnet/genesis.json    # must be 10
+grep '"timestamp"'   testnet/genesis.json     # must be 1783468800 (2026-07-08 era)
+```
 
-**4. Check your start flags** (same as last time — keep these):
+---
 
-- `--retention-blocks 100000` — without it your database grows forever and
-  your node gets slower with height
-- keep **both** of our nodes as peers:
+## 2. The coordinated wipe window (do these together, on my go)
 
-  ```
+Ping me when you're built and ready. Then, in lockstep with us:
+
+**a. Stop AND disable your service so nothing auto-restarts it:**
+
+```bash
+sudo systemctl stop <your-service>
+sudo systemctl disable <your-service>   # the last fresh relaunch FAILED because a
+                                        # node auto-restarted and re-served the old chain
+pgrep -af torus-node                    # must print NOTHING — confirm it's really gone
+```
+
+**b. Back up + wipe your chain data (KEEP your keystore):**
+
+```bash
+mv <your-data-dir> <your-data-dir>.bak-fresh-genesis-$(date +%s)
+# your keystore/passphrase files are separate — do NOT touch them
+```
+
+**c. Tell me "down + wiped". Wait for my "all three down + wiped" confirmation
+before starting.** This is the make-or-break step.
+
+---
+
+## 3. Start on the new genesis (still in the window)
+
+Because your data dir is now empty, you **must** pass `--genesis` on this first
+boot (a resume never needed it):
+
+```bash
+target/release/torus-node \
+  --genesis testnet/genesis.json \
+  --data-dir <your-data-dir> \
+  --keystore <your-keystore> --passphrase-file <your-passphrase-file> \
+  --retention-blocks 100000 \
   --p2p-peers /ip4/95.111.231.121/udp/30333/quic-v1/p2p/12D3KooWQeKf21QBchGQUr25U6w6yNB4P78PPQZivhHRAqFnMK24,/ip4/84.32.108.220/udp/30333/quic-v1/p2p/12D3KooWK5QYy1chfBmWpk6kfu9KTpq4rqfnRkXFuXmAc4DCPUze
-  ```
-
-- make sure you're NOT passing `--native-gossip=false`
-
-**5. Restart protocol — IMPORTANT, do NOT use `systemctl restart` or a quick
-kill+start.** A fast in-place restart races the dying connection and can
-leave your node connected but gossip-mute, which stalls the whole chain
-(this has bitten us three times; the new watchdog helps, but don't lean on
-it):
-
-```bash
-sudo systemctl stop <your-service>     # or however you normally stop it
-sleep 20
-sudo systemctl start <your-service>    # or your normal start command
+# do NOT pass --native-gossip=false
 ```
 
-If the process ignores the stop and hangs (no new log lines), `kill -9` it —
-then still wait 20 seconds before starting.
+If you launch via systemd, make sure the unit's `ExecStart` includes
+`--genesis testnet/genesis.json` **for this first boot**, then re-enable it:
+`sudo systemctl enable <your-service>`. (Once block 1 is committed, the
+`--genesis` flag is ignored on later restarts — harmless to leave in.)
 
-Since the chain is halted, timing doesn't need to be exact: bring your node
-up on the new binary whenever you're ready and it will idle until all three
-of us are up, then the chain resumes on its own. Ping me when you start it
-and we'll bring up our side.
+Keep your flags from before: `--retention-blocks 100000` (without it the DB grows
+forever), both of our nodes as peers (above), and **not** `--native-gossip=false`.
 
-**6. Verify after restart:**
+---
+
+## 4. Verify after start
 
 ```bash
-curl -s localhost:9090/metrics | grep -c torus_view_duration_seconds   # >0 = new binary
-# once all three nodes are up, heights should climb past 1,114,439 within a minute
-# if you see NoPeersSubscribedToTopic spam: stop, wait 20s, start again
+curl -s localhost:9090/metrics | grep -c torus_state_root_compute_seconds   # >0 = new binary
 ```
 
-Ping me when it's up — I'll verify from our side and re-measure block speed.
+The decisive check that the wipe worked: **your committed height starts near 0
+and climbs.** If you see the old height (~500k+), your node re-synced the OLD
+chain — stop, wipe again, and we hunt down whichever old peer is still serving
+it. The chain resumes on its own once all three fresh nodes are up.
+
+Ping me when it's up — I'll confirm all 10 markets are live from our side and
+re-measure block speed.

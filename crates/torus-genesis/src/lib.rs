@@ -628,6 +628,47 @@ mod tests {
         .to_string()
     }
 
+    /// Regression guard for the shipped testnet genesis: the fleet relaunch seeds
+    /// 10 perp markets (ids 1..=10) and 10 permanent stakers (hardhat #0..#9) so
+    /// governance market-listing is actually testable. If this file is edited in a
+    /// way that breaks the struct shape or drops a market/staker, this test fails.
+    #[test]
+    fn parse_real_testnet_genesis() {
+        let json = include_str!("../../../testnet/genesis.json");
+        let genesis = Genesis::from_json(json).expect("real testnet/genesis.json must parse");
+
+        assert_eq!(genesis.chain_id, 7778, "testnet chain_id");
+        assert_eq!(genesis.validators.len(), 3, "3-validator set");
+
+        // 10 markets, ids exactly 1..=10.
+        let mut ids: Vec<u64> = genesis.markets.iter().map(|m| m.market_id).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, (1..=10).collect::<Vec<_>>(), "markets 1..=10 seeded");
+
+        // 10 permanent stakers, each with non-zero stake so they carry voting weight.
+        assert_eq!(genesis.permanent_stakes.len(), 10, "10 governance stakers");
+        for ps in &genesis.permanent_stakes {
+            assert!(
+                parse_u256(&ps.amount).unwrap() > U256::ZERO,
+                "staker {} must have non-zero permanent stake",
+                ps.address
+            );
+        }
+
+        // Every staker must also be a signable EVM account (has a genesis balance)
+        // so it can EIP-712-sign and submit its own Vote native action.
+        for ps in &genesis.permanent_stakes {
+            assert!(
+                genesis
+                    .accounts
+                    .iter()
+                    .any(|a| a.address.eq_ignore_ascii_case(&ps.address)),
+                "staker {} must have an EVM account balance to sign votes",
+                ps.address
+            );
+        }
+    }
+
     #[test]
     fn parse_genesis_json() {
         let genesis = Genesis::from_json(&sample_genesis_json()).unwrap();

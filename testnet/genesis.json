@@ -1,7 +1,7 @@
 {
     "chain_id": 7778,
     "chain_name": "torus-testnet",
-    "timestamp": 1782691200,
+    "timestamp": 1783468800,
     "consensus": {
         "protocol": "hotstuff",
         "epoch_length": 100,
@@ -101,6 +101,11 @@
             "balance": "1000000000000000000000000",
             "note": "test-account-4 (hardhat #4)"
         },
+        { "address": "0x9965507d1a55bcc2695c58ba16fb37d819b0a4dc", "balance": "1000000000000000000000000", "note": "test-account-5 (hardhat #5) — governance staker" },
+        { "address": "0x976ea74026e726554db657fa54763abd0c3a0aa9", "balance": "1000000000000000000000000", "note": "test-account-6 (hardhat #6) — governance staker" },
+        { "address": "0x14dc79964da2c08b23698b3d3cc7ca32193d9955", "balance": "1000000000000000000000000", "note": "test-account-7 (hardhat #7) — governance staker" },
+        { "address": "0x23618e81e3f5cdf7f54c3d65f7fbc0abf5b21e8f", "balance": "1000000000000000000000000", "note": "test-account-8 (hardhat #8) — governance staker" },
+        { "address": "0xa0ee7a142d267c1f36714e4a8f75612f20a79720", "balance": "1000000000000000000000000", "note": "test-account-9 (hardhat #9) — governance staker" },
         { "address": "0xd5e87531b4d7dab180ca474efc23073ee1842652", "balance": "1000000000000000000000000", "note": "bench sender 20" },
         { "address": "0x21e2791132f625878858ec56808742af418d1924", "balance": "1000000000000000000000000", "note": "bench sender 21" },
         { "address": "0x4a44dff6effd1bb57363d623f6e764bcfecfe4e9", "balance": "1000000000000000000000000", "note": "bench sender 22" },
@@ -144,17 +149,30 @@
     ],
     "evm_alloc": {},
     "markets": [
-        {
-            "market_id": 1,
-            "base_asset": "BTC",
-            "quote_asset": "USD",
-            "lot_size": "1.0",
-            "tick_size": "1.0",
-            "initial_margin": "5.0",
-            "note": "bench market 1 (BTC-USD perp). tick/lot are cosmetic here — the runtime order book auto-creates with tick=lot=1.0"
-        }
+        { "market_id": 1,  "base_asset": "BTC",   "quote_asset": "USD", "lot_size": "1.0", "tick_size": "1.0", "initial_margin": "5.0", "note": "BTC-USD perp. tick/lot cosmetic — runtime order book auto-creates tick=lot=1.0" },
+        { "market_id": 2,  "base_asset": "ETH",   "quote_asset": "USD", "lot_size": "1.0", "tick_size": "1.0", "initial_margin": "5.0", "note": "ETH-USD perp" },
+        { "market_id": 3,  "base_asset": "SOL",   "quote_asset": "USD", "lot_size": "1.0", "tick_size": "1.0", "initial_margin": "5.0", "note": "SOL-USD perp" },
+        { "market_id": 4,  "base_asset": "AVAX",  "quote_asset": "USD", "lot_size": "1.0", "tick_size": "1.0", "initial_margin": "5.0", "note": "AVAX-USD perp" },
+        { "market_id": 5,  "base_asset": "ARB",   "quote_asset": "USD", "lot_size": "1.0", "tick_size": "1.0", "initial_margin": "5.0", "note": "ARB-USD perp" },
+        { "market_id": 6,  "base_asset": "OP",    "quote_asset": "USD", "lot_size": "1.0", "tick_size": "1.0", "initial_margin": "5.0", "note": "OP-USD perp" },
+        { "market_id": 7,  "base_asset": "DOGE",  "quote_asset": "USD", "lot_size": "1.0", "tick_size": "1.0", "initial_margin": "5.0", "note": "DOGE-USD perp" },
+        { "market_id": 8,  "base_asset": "LINK",  "quote_asset": "USD", "lot_size": "1.0", "tick_size": "1.0", "initial_margin": "5.0", "note": "LINK-USD perp" },
+        { "market_id": 9,  "base_asset": "MATIC", "quote_asset": "USD", "lot_size": "1.0", "tick_size": "1.0", "initial_margin": "5.0", "note": "MATIC-USD perp" },
+        { "market_id": 10, "base_asset": "APT",   "quote_asset": "USD", "lot_size": "1.0", "tick_size": "1.0", "initial_margin": "5.0", "note": "APT-USD perp" }
     ],
     "precompiles": {},
+    "permanent_stakes": [
+        { "address": "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266", "amount": "100000000000000000000000", "note": "hardhat #0 — 100k permanent stake (governance voter)" },
+        { "address": "0x70997970c51812dc3a010c7d01b50e0d17dc79c8", "amount": "100000000000000000000000", "note": "hardhat #1 — 100k permanent stake (governance voter)" },
+        { "address": "0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc", "amount": "100000000000000000000000", "note": "hardhat #2 — 100k permanent stake (governance voter)" },
+        { "address": "0x90f79bf6eb2c4f870365e785982e1f101e93b906", "amount": "100000000000000000000000", "note": "hardhat #3 — 100k permanent stake (governance voter)" },
+        { "address": "0x15d34aaf54267db7d7c367839aaf71a00a2c6a65", "amount": "100000000000000000000000", "note": "hardhat #4 — 100k permanent stake (governance voter)" },
+        { "address": "0x9965507d1a55bcc2695c58ba16fb37d819b0a4dc", "amount": "100000000000000000000000", "note": "hardhat #5 — 100k permanent stake (governance voter)" },
+        { "address": "0x976ea74026e726554db657fa54763abd0c3a0aa9", "amount": "100000000000000000000000", "note": "hardhat #6 — 100k permanent stake (governance voter)" },
+        { "address": "0x14dc79964da2c08b23698b3d3cc7ca32193d9955", "amount": "100000000000000000000000", "note": "hardhat #7 — 100k permanent stake (governance voter)" },
+        { "address": "0x23618e81e3f5cdf7f54c3d65f7fbc0abf5b21e8f", "amount": "100000000000000000000000", "note": "hardhat #8 — 100k permanent stake (governance voter)" },
+        { "address": "0xa0ee7a142d267c1f36714e4a8f75612f20a79720", "amount": "100000000000000000000000", "note": "hardhat #9 — 100k permanent stake (governance voter)" }
+    ],
     "native_balances": [
         { "address": "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266", "available": "1000000000000.0", "note": "hardhat #0 (bench market-maker)" },
         { "address": "0x70997970c51812dc3a010c7d01b50e0d17dc79c8", "available": "1000000000000.0", "note": "hardhat #1 (bench market-maker)" },
