@@ -16,3 +16,10 @@ rand = "0.7"
 rand_core = { version = "0.6.4", features = ["getrandom"] }
 sha2 = "0.10"
 typed-builder = "0.16.2"
+
+[dev-dependencies]
+# T1.2 (CONSENSUS-SAFETY): machine-checkable model of the 2-chain-commit /
+# grandparent-lock interaction. Test-only; never enters the production build.
+# See crates/hotstuff_rs/tests/stateright_2chain_safety.rs and
+# specs/consensus/stateright_2chain_safety.md.
+stateright = "0.30"

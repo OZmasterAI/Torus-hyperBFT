@@ -249,6 +249,24 @@ view numbers, showing that the 2-chain creates an "unbreakable" quorum lock.
 Our implementation follows the paper's locking rule exactly (lock on
 grandparent for Generic phase), so the paper's proof applies.
 
+> **[T1.2 CORRECTION — this "weakest point" is a real defect, not just a gap.]**
+> The claim that "our implementation follows the paper's locking rule exactly"
+> is **false**. The paper's 2-chain lock is lock-on-**parent** (lock on
+> `justify.block`); our `pc_to_lock` Generic arm locks on `justify.block.justify`
+> (the **grandparent**), which was the correct rule for the *3-chain* commit but
+> is one level too shallow for the *2-chain* commit this code now uses. Because
+> the commit rule was moved up to the grandparent without moving the lock up,
+> the locked block and the committed block sit at the **same** depth, and Step 1
+> above ("at least 2f+1 validators are locked on a QC for block B") does **not**
+> follow from the code — the quorum that forms the commit-enabling QC is locked
+> on `parent(B)`, not `B`. This is refuted with a concrete n=4, f=1 asynchronous
+> counterexample (two honest validators commit conflicting siblings) in
+> [`stateright_2chain_safety.md`](./stateright_2chain_safety.md), with a
+> machine-checkable model in
+> `crates/hotstuff_rs/tests/stateright_2chain_safety.rs`. **Fix**: change the
+> Generic arm of `pc_to_lock` to `Some(justify.clone())` (lock-on-parent). This
+> is a verification finding; the production fix is tracked separately.
+
 **Code anchors that enforce this property**:
 - Vote-once-per-view: `implementation.rs:659-660` (`highest_view_voted` check)
 - Locking rule: `invariants.rs:421-464` (`pc_to_lock`)
