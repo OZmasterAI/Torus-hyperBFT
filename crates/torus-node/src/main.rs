@@ -512,15 +512,51 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // Spawn inbound native action gossip → mempool task
     if let Some(mut native_rx) = network.take_native_action_rx() {
         let mempool_for_gossip = mempool.clone();
+        // T2.1: gossip-ingest verify runs on a DEDICATED rayon pool — the one
+        // serial inbound task capped verified ingest at a single ecrecover at
+        // a time, and the GLOBAL pool is off-limits (a shared pool starved
+        // consensus verify historically, s352). Half the cores (min 2) keeps
+        // ingest parallel without starving the consensus threads.
+        let gossip_verify_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(
+                (std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(8)
+                    / 2)
+                .max(2),
+            )
+            .thread_name(|i| format!("torus-gossip-verify-{i}"))
+            .build()
+            .expect("build gossip verify pool");
+        // Bounded handoff: past this many queued verifies, ingest inline on
+        // the inbound task (the old serial behavior) so a gossip flood exerts
+        // backpressure instead of growing the pool queue without bound.
+        const GOSSIP_VERIFY_MAX_INFLIGHT: usize = 1024;
+        let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         tokio::spawn(async move {
             while let Some((sender, action)) = native_rx.recv().await {
+                let mempool = mempool_for_gossip.clone();
                 // Verified ingest: authenticates the claimed sender (forged
                 // gossip pairs must not pollute the pool); DA-mirrors first.
-                match mempool_for_gossip.add_native_action_from_gossip(sender, action) {
+                // Dedups against the verified-sender trust cache before the
+                // recover (T2.1) — re-gossiped known bodies skip the ecrecover.
+                let ingest = move || match mempool.add_native_action_from_gossip(sender, action) {
                     Ok(()) => {}
                     Err(torus_mempool::MempoolError::DuplicateNativeAction) => {}
                     Err(e) => tracing::debug!("gossip native action rejected: {e}"),
+                };
+                if in_flight.load(std::sync::atomic::Ordering::Relaxed)
+                    >= GOSSIP_VERIFY_MAX_INFLIGHT
+                {
+                    ingest();
+                    continue;
                 }
+                in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let in_flight_done = in_flight.clone();
+                gossip_verify_pool.spawn(move || {
+                    ingest();
+                    in_flight_done.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                });
             }
         });
     }

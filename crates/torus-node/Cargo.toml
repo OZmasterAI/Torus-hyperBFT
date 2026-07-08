@@ -23,6 +23,8 @@ clap = { workspace = true }
 
 # Async runtime
 tokio = { workspace = true }
+# Dedicated gossip-ingest verify pool (T2.1) — never the global pool
+rayon = "1"
 
 # Logging
 tracing = { workspace = true }

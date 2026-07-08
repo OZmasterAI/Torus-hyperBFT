@@ -3,12 +3,24 @@
 //! Task 3.1.4: Hardens the native pool that previously had no per-sender
 //! limits and no dedup. Adds pool size cap with priority-based eviction.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use alloy_primitives::{Address, B256};
 use torus_types::{compute_action_hash, NativeAction, SignedNativeAction};
 
 use crate::error::MempoolError;
+
+/// Selection-order key (T2.3): `(cancel-priority, sender, nonce, seq)`.
+///
+/// A `BTreeMap` over this key IS the pool's selection order, maintained
+/// incrementally at insert/remove instead of a full `sort_by` plus
+/// `hash_index` rebuild under the write lock on every `produce_block`.
+/// Iteration reproduces the previous stable
+/// `sort_by(cancel-priority, sender, nonce)` EXACTLY: `seq` is a
+/// monotonically increasing insertion counter, so entries with equal
+/// `(priority, sender, nonce)` iterate in insertion order — precisely the
+/// tie order the stable sort preserved.
+type SortKey = (u8, Address, u64, u64);
 
 /// Entry in the native action pool with pre-recovered sender and dedup hash.
 pub(crate) struct NativePoolEntry {
@@ -30,10 +42,13 @@ pub(crate) struct NativePoolEntry {
 
 /// Native action pool with per-sender tracking, dedup, and size limits.
 pub(crate) struct NativePool {
-    entries: Vec<NativePoolEntry>,
+    /// Entries in selection order (see [`SortKey`]) — incrementally sorted.
+    entries: BTreeMap<SortKey, NativePoolEntry>,
     sender_counts: HashMap<Address, usize>,
     seen: HashSet<(Address, B256)>,
-    hash_index: HashMap<B256, usize>,
+    hash_index: HashMap<B256, SortKey>,
+    /// Insertion counter feeding [`SortKey`] tie order.
+    next_seq: u64,
     max_size: usize,
     max_per_sender: usize,
     max_per_block: usize,
@@ -42,10 +57,11 @@ pub(crate) struct NativePool {
 impl NativePool {
     pub fn new(max_size: usize, max_per_sender: usize, max_per_block: usize) -> Self {
         Self {
-            entries: Vec::new(),
+            entries: BTreeMap::new(),
             sender_counts: HashMap::new(),
             seen: HashSet::new(),
             hash_index: HashMap::new(),
+            next_seq: 0,
             max_size,
             max_per_sender,
             max_per_block,
@@ -65,7 +81,7 @@ impl NativePool {
     pub fn get_by_hash(&self, hash: &B256) -> Option<SignedNativeAction> {
         self.hash_index
             .get(hash)
-            .and_then(|&idx| self.entries.get(idx))
+            .and_then(|key| self.entries.get(key))
             .map(|e| e.action.clone())
     }
 
@@ -78,8 +94,8 @@ impl NativePool {
     pub fn verified_restash_keys(&self, hashes: &[B256]) -> Vec<(B256, Address)> {
         let mut out = Vec::new();
         for h in hashes {
-            if let Some(&idx) = self.hash_index.get(h) {
-                if let Some(entry) = self.entries.get(idx) {
+            if let Some(key) = self.hash_index.get(h) {
+                if let Some(entry) = self.entries.get(key) {
                     if entry.verified_locally {
                         if let Some(key) = torus_types::verified_cache_key(&entry.action) {
                             out.push((key, entry.sender));
@@ -138,17 +154,16 @@ impl NativePool {
         // Pool size cap with priority-based eviction.
         if self.entries.len() >= self.max_size {
             if is_cancel {
-                // High-priority: evict a non-cancel action.
-                if let Some(idx) = self.entries.iter().rposition(|e| !e.is_cancel) {
-                    let evicted = self.entries.swap_remove(idx);
-                    self.dec_sender_count(&evicted.sender);
-                    self.seen.remove(&(evicted.sender, evicted.action_hash));
-                    self.hash_index.remove(&evicted.action_hash);
-                    if idx < self.entries.len() {
-                        self.hash_index.insert(self.entries[idx].action_hash, idx);
-                    }
-                } else {
-                    return Err(MempoolError::NativePoolFull);
+                // High-priority: evict the lowest-priority non-cancel — the
+                // LAST entry in selection order (cancels sort first, so if any
+                // non-cancel exists it sits at the back of the map).
+                let evict_key = match self.entries.iter().next_back() {
+                    Some((key, entry)) if !entry.is_cancel => *key,
+                    _ => return Err(MempoolError::NativePoolFull),
+                };
+                if let Some(evicted) = self.remove_entry_by_key(&evict_key) {
+                    let dropped = HashSet::from([evicted.action_hash]);
+                    self.repoint_hash_survivors(&dropped);
                 }
             } else {
                 return Err(MempoolError::NativePoolFull);
@@ -157,84 +172,106 @@ impl NativePool {
 
         *self.sender_counts.entry(sender).or_insert(0) += 1;
         self.seen.insert((sender, action_hash));
-        let idx = self.entries.len();
-        self.entries.push(NativePoolEntry {
-            sender,
-            action,
-            action_hash,
-            is_cancel,
-            encoded_len,
-            verified_locally,
-        });
-        self.hash_index.insert(action_hash, idx);
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1);
+        let key: SortKey = (u8::from(!is_cancel), sender, action.nonce, seq);
+        self.hash_index.insert(action_hash, key);
+        self.entries.insert(
+            key,
+            NativePoolEntry {
+                sender,
+                action,
+                action_hash,
+                is_cancel,
+                encoded_len,
+                verified_locally,
+            },
+        );
 
         Ok(action_hash)
+    }
+
+    /// Remove one entry by its selection-order key, maintaining `seen`,
+    /// `sender_counts`, and `hash_index` (the mapping is dropped only when it
+    /// points at this key — a same-hash duplicate may still own it). Callers
+    /// whose removal can leave a same-hash survivor re-point it via
+    /// [`Self::repoint_hash_survivors`].
+    fn remove_entry_by_key(&mut self, key: &SortKey) -> Option<NativePoolEntry> {
+        let entry = self.entries.remove(key)?;
+        self.seen.remove(&(entry.sender, entry.action_hash));
+        self.dec_sender_count(&entry.sender);
+        if self.hash_index.get(&entry.action_hash) == Some(key) {
+            self.hash_index.remove(&entry.action_hash);
+        }
+        Some(entry)
+    }
+
+    /// Re-point each of `hashes` at a surviving same-hash entry, preserving
+    /// `get_by_hash` for duplicate action hashes (same payload+nonce under
+    /// different signatures) after one copy is removed — the same net result
+    /// the old full `hash_index` rebuild produced. No-op for hashes still
+    /// indexed or without a survivor.
+    fn repoint_hash_survivors(&mut self, hashes: &HashSet<B256>) {
+        let mut missing: HashSet<B256> = hashes
+            .iter()
+            .filter(|hash| !self.hash_index.contains_key(*hash))
+            .copied()
+            .collect();
+        if missing.is_empty() {
+            return;
+        }
+        for (key, entry) in &self.entries {
+            if missing.remove(&entry.action_hash) {
+                self.hash_index.insert(entry.action_hash, *key);
+                if missing.is_empty() {
+                    break;
+                }
+            }
+        }
     }
 
     /// Drain up to `limit` actions in priority order with per-sender-per-block caps.
     ///
     /// Cancellations first (highest priority), then remaining actions.
-    /// Within each priority group, ordered by (sender, nonce) for determinism.
+    /// Within each priority group, ordered by (sender, nonce) for determinism
+    /// — the incremental [`SortKey`] iteration order (T2.3), no re-sort.
     /// Excess actions from rate-limited senders stay in pool for next block.
     pub fn drain(&mut self, limit: usize) -> Vec<SignedNativeAction> {
-        // Sort: cancels first, then by (sender, nonce) for determinism.
-        self.entries.sort_by(|a, b| {
-            let a_pri = if a.is_cancel { 0u8 } else { 1 };
-            let b_pri = if b.is_cancel { 0u8 } else { 1 };
-            a_pri
-                .cmp(&b_pri)
-                .then_with(|| a.sender.cmp(&b.sender))
-                .then_with(|| a.action.nonce.cmp(&b.action.nonce))
-        });
-
-        // Take ownership of all entries, then partition into taken/remaining.
-        let all_entries = std::mem::take(&mut self.entries);
-        self.hash_index.clear();
         let mut block_counts: HashMap<Address, usize> = HashMap::new();
-        let mut taken = Vec::new();
-
-        for entry in all_entries {
-            if taken.len() < limit {
-                let count = block_counts.get(&entry.sender).copied().unwrap_or(0);
-                if count < self.max_per_block {
-                    *block_counts.entry(entry.sender).or_insert(0) += 1;
-                    self.dec_sender_count(&entry.sender);
-                    self.seen.remove(&(entry.sender, entry.action_hash));
-                    taken.push(entry.action);
-                    continue;
-                }
+        let mut take_keys: Vec<SortKey> = Vec::new();
+        for (key, entry) in &self.entries {
+            if take_keys.len() >= limit {
+                break;
             }
-            // Not taken — put back in pool.
-            let idx = self.entries.len();
-            self.hash_index.insert(entry.action_hash, idx);
-            self.entries.push(entry);
+            let count = block_counts.get(&entry.sender).copied().unwrap_or(0);
+            if count < self.max_per_block {
+                *block_counts.entry(entry.sender).or_insert(0) += 1;
+                take_keys.push(*key);
+            }
         }
+
+        let mut taken = Vec::with_capacity(take_keys.len());
+        let mut dropped: HashSet<B256> = HashSet::new();
+        for key in &take_keys {
+            if let Some(entry) = self.remove_entry_by_key(key) {
+                dropped.insert(entry.action_hash);
+                taken.push(entry.action);
+            }
+        }
+        self.repoint_hash_survivors(&dropped);
 
         taken
     }
 
     /// Select up to `limit` actions for a block WITHOUT removing them from the pool.
     /// Actions stay in the pool until `remove_committed` is called after commit.
-    /// Uses the same priority order as `drain`.
-    pub fn select_for_block(&mut self, limit: usize) -> Vec<SignedNativeAction> {
-        self.entries.sort_by(|a, b| {
-            let a_pri = if a.is_cancel { 0u8 } else { 1 };
-            let b_pri = if b.is_cancel { 0u8 } else { 1 };
-            a_pri
-                .cmp(&b_pri)
-                .then_with(|| a.sender.cmp(&b.sender))
-                .then_with(|| a.action.nonce.cmp(&b.action.nonce))
-        });
-        // Rebuild hash_index after sort
-        self.hash_index.clear();
-        for (i, entry) in self.entries.iter().enumerate() {
-            self.hash_index.insert(entry.action_hash, i);
-        }
-
+    /// Uses the same priority order as `drain`. Read-only (T2.3): callers select
+    /// from a shared snapshot under the read lock — no sort, no index rebuild.
+    pub fn select_for_block(&self, limit: usize) -> Vec<SignedNativeAction> {
         let mut block_counts: HashMap<Address, usize> = HashMap::new();
         let mut selected = Vec::new();
 
-        for entry in &self.entries {
+        for entry in self.entries.values() {
             if selected.len() >= limit {
                 break;
             }
@@ -249,7 +286,7 @@ impl NativePool {
     }
 
     pub fn select_for_block_with_senders(
-        &mut self,
+        &self,
         limit: usize,
     ) -> Vec<(Address, SignedNativeAction)> {
         self.select_for_block_with_senders_excluding(limit, &HashSet::new(), usize::MAX, usize::MAX)
@@ -274,31 +311,18 @@ impl NativePool {
     /// without it, 100 actions × 1024-order batches = 102,400 orders vs the
     /// documented 50k ceiling). Same deterministic-prefix rule as `bytes_cap`.
     pub fn select_for_block_with_senders_excluding(
-        &mut self,
+        &self,
         limit: usize,
         exclude: &HashSet<B256>,
         bytes_cap: usize,
         orders_cap: usize,
     ) -> Vec<(Address, SignedNativeAction)> {
-        self.entries.sort_by(|a, b| {
-            let a_pri = if a.is_cancel { 0u8 } else { 1 };
-            let b_pri = if b.is_cancel { 0u8 } else { 1 };
-            a_pri
-                .cmp(&b_pri)
-                .then_with(|| a.sender.cmp(&b.sender))
-                .then_with(|| a.action.nonce.cmp(&b.action.nonce))
-        });
-        self.hash_index.clear();
-        for (i, entry) in self.entries.iter().enumerate() {
-            self.hash_index.insert(entry.action_hash, i);
-        }
-
         let mut block_counts: HashMap<Address, usize> = HashMap::new();
         let mut selected = Vec::new();
         let mut bytes_used: usize = 0;
         let mut orders_used: usize = 0;
 
-        for entry in &self.entries {
+        for entry in self.entries.values() {
             if selected.len() >= limit {
                 break;
             }
@@ -343,48 +367,31 @@ impl NativePool {
     /// from the selection/drain wrappers. Returns the number evicted.
     pub fn evict_expired(&mut self, now_ms: u64) -> usize {
         use torus_types::eip712::NONCE_WINDOW_MS;
-        let mut removed = Vec::new();
-        self.entries.retain(|entry| {
-            if entry.action.nonce.saturating_add(NONCE_WINDOW_MS) < now_ms {
-                removed.push((entry.sender, entry.action_hash));
-                false
-            } else {
-                true
-            }
-        });
-        for (sender, hash) in &removed {
-            self.seen.remove(&(*sender, *hash));
-            self.dec_sender_count(sender);
+        let expired: Vec<SortKey> = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| entry.action.nonce.saturating_add(NONCE_WINDOW_MS) < now_ms)
+            .map(|(key, _)| *key)
+            .collect();
+        // Same-hash duplicates share the nonce, so they expire together — no
+        // surviving entry can need a hash_index re-point here.
+        for key in &expired {
+            self.remove_entry_by_key(key);
         }
-        self.hash_index.clear();
-        for (i, entry) in self.entries.iter().enumerate() {
-            self.hash_index.insert(entry.action_hash, i);
-        }
-        removed.len()
+        expired.len()
     }
 
     /// Remove actions that were included in a committed block.
     pub fn remove_committed(&mut self, hashes: &[B256]) {
         let to_remove: HashSet<B256> = hashes.iter().copied().collect();
-        let mut removed_entries = Vec::new();
-
-        self.entries.retain(|entry| {
-            if to_remove.contains(&entry.action_hash) {
-                removed_entries.push((entry.sender, entry.action_hash));
-                false
-            } else {
-                true
-            }
-        });
-
-        for (sender, hash) in &removed_entries {
-            self.seen.remove(&(*sender, *hash));
-            self.dec_sender_count(sender);
-        }
-
-        self.hash_index.clear();
-        for (i, entry) in self.entries.iter().enumerate() {
-            self.hash_index.insert(entry.action_hash, i);
+        let keys: Vec<SortKey> = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| to_remove.contains(&entry.action_hash))
+            .map(|(key, _)| *key)
+            .collect();
+        for key in &keys {
+            self.remove_entry_by_key(key);
         }
     }
 
@@ -509,6 +516,113 @@ mod tests {
         // seen/sender_counts cleaned: the same (sender, action) is insertable again.
         pool.insert(sender, stale).unwrap();
         assert_eq!(pool.size(), 2);
+    }
+
+    /// T2.3 (RED-first: `select_for_block*` previously took `&mut self` for a
+    /// full re-sort + `hash_index` rebuild, so this did not compile): the
+    /// selection order is maintained incrementally, selection is read-only
+    /// and works through a SHARED reference — the `Mempool` wrappers select
+    /// under the read lock, off the ingress write path.
+    #[test]
+    fn selection_is_read_only_through_shared_ref() {
+        let mut pool = NativePool::new(100, 64, 16);
+        pool.insert(
+            Address::repeat_byte(1),
+            make_action(1, NativeAction::ClaimRewards),
+        )
+        .unwrap();
+        let shared: &NativePool = &pool;
+        assert_eq!(shared.select_for_block(10).len(), 1);
+        assert_eq!(shared.select_for_block_with_senders(10).len(), 1);
+        assert_eq!(
+            shared
+                .select_for_block_with_senders_excluding(
+                    10,
+                    &HashSet::new(),
+                    usize::MAX,
+                    usize::MAX
+                )
+                .len(),
+            1
+        );
+    }
+
+    /// T2.3: the incremental BTreeMap order must reproduce the previous STABLE
+    /// `sort_by(cancel-priority, sender, nonce)` EXACTLY for identical pool
+    /// state — including insertion-order ties (equal priority, sender, nonce)
+    /// — since the proposer's selection order feeds the block body.
+    #[test]
+    fn selection_order_identical_to_reference_stable_sort() {
+        let mut pool = NativePool::new(100, 64, 16);
+        // Shuffled inserts across senders/nonces with cancels interleaved,
+        // plus a deliberate tie: same sender + nonce, two distinct cancels.
+        let inserts: Vec<(Address, SignedNativeAction)> = vec![
+            (
+                Address::repeat_byte(3),
+                make_action(7, NativeAction::ClaimRewards),
+            ),
+            (
+                Address::repeat_byte(1),
+                make_action(9, NativeAction::ClaimRewards),
+            ),
+            (
+                Address::repeat_byte(2),
+                make_action(5, NativeAction::CancelOrder { order_id: 8 }),
+            ),
+            (
+                Address::repeat_byte(1),
+                make_action(2, NativeAction::ClaimRewards),
+            ),
+            // Tie with the order_id-8 cancel above: stable sort keeps the
+            // earlier insert first.
+            (
+                Address::repeat_byte(2),
+                make_action(5, NativeAction::CancelOrder { order_id: 3 }),
+            ),
+            (
+                Address::repeat_byte(3),
+                make_action(4, NativeAction::CancelOrder { order_id: 1 }),
+            ),
+            (
+                Address::repeat_byte(2),
+                make_action(6, NativeAction::ClaimRewards),
+            ),
+        ];
+        for (sender, action) in &inserts {
+            pool.insert(*sender, action.clone()).unwrap();
+        }
+
+        // Reference = the previous algorithm verbatim: a STABLE sort of the
+        // inserted list by (cancel-priority, sender, nonce).
+        let mut reference = inserts.clone();
+        reference.sort_by(|(sa, aa), (sb, ab)| {
+            let a_pri = if is_cancel(&aa.action) { 0u8 } else { 1 };
+            let b_pri = if is_cancel(&ab.action) { 0u8 } else { 1 };
+            a_pri
+                .cmp(&b_pri)
+                .then_with(|| sa.cmp(sb))
+                .then_with(|| aa.nonce.cmp(&ab.nonce))
+        });
+
+        let selected = pool.select_for_block_with_senders(inserts.len());
+        let got: Vec<(Address, B256)> = selected
+            .iter()
+            .map(|(s, a)| (*s, compute_action_hash(a)))
+            .collect();
+        let want: Vec<(Address, B256)> = reference
+            .iter()
+            .map(|(s, a)| (*s, compute_action_hash(a)))
+            .collect();
+        assert_eq!(
+            got, want,
+            "incremental selection order must equal the reference stable sort"
+        );
+
+        // Drain follows the identical order.
+        let drained = pool.drain(inserts.len());
+        let drained_hashes: Vec<B256> = drained.iter().map(compute_action_hash).collect();
+        let want_hashes: Vec<B256> = want.iter().map(|(_, h)| *h).collect();
+        assert_eq!(drained_hashes, want_hashes, "drain order matches too");
     }
 
     #[test]

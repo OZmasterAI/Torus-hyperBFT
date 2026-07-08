@@ -91,6 +91,17 @@ impl Default for MempoolConfig {
     }
 }
 
+/// Flush the ingress DA-mirror buffer once this many bodies are pending (T2.2).
+const DA_MIRROR_BATCH_MAX: usize = 128;
+/// ... or once the oldest pending body has waited this long.
+const DA_MIRROR_MAX_AGE: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Buffered ingress DA mirrors awaiting a coalesced flush (T2.2).
+struct PendingDaMirrors {
+    actions: Vec<SignedNativeAction>,
+    first_at: Option<std::time::Instant>,
+}
+
 /// Thread-safe transaction mempool combining EVM and native action pools.
 pub struct Mempool {
     evm: RwLock<evm_pool::EvmPool>,
@@ -98,6 +109,10 @@ pub struct Mempool {
     state: StateDb,
     /// Durable, nonce-gate-decoupled native-action body store (out-of-band DA).
     da_store: NativeDaStore,
+    /// Coalesced ingress DA mirrors (T2.2): per-action ingest puts are buffered
+    /// briefly and flushed as ONE `WriteBatch` (by size/age, and ALWAYS before
+    /// selection or a DA read), instead of one RocksDB write per ingress body.
+    da_pending: std::sync::Mutex<PendingDaMirrors>,
     config: MempoolConfig,
     /// Current base fee in wei — the D4 admission/drain fee floor. Written from
     /// committed block headers; read on every add_evm_tx and drain.
@@ -136,6 +151,10 @@ impl Mempool {
             native: RwLock::new(native_pool),
             state,
             da_store,
+            da_pending: std::sync::Mutex::new(PendingDaMirrors {
+                actions: Vec::new(),
+                first_at: None,
+            }),
             config,
             current_base_fee: std::sync::atomic::AtomicU64::new(initial_base_fee),
             memory_used: std::sync::atomic::AtomicUsize::new(0),
@@ -382,9 +401,22 @@ impl Mempool {
     ) -> Result<(), MempoolError> {
         self.mirror_to_da(&action);
         let verified_sender = match &action.signature {
-            torus_types::ActionSignature::Eip712(_) => action.recover_sender().map_err(|e| {
-                MempoolError::NativeValidationFailed(format!("gossip sig recovery: {e}"))
-            })?,
+            torus_types::ActionSignature::Eip712(_) => {
+                // T2.1 fast-path: dedup against the verified-sender trust
+                // cache BEFORE paying the ecrecover. The cache key commits to
+                // the FULL signature, so a HIT can only ever return the
+                // sender a fresh recover of these exact bytes would — this
+                // node derived it locally on an earlier ingest of the same
+                // signed action (RPC ingress or a prior gossip copy).
+                let cached = torus_types::verified_cache_key(&action)
+                    .and_then(|key| self.verified_sender(&key));
+                match cached {
+                    Some(sender) => sender,
+                    None => action.recover_sender().map_err(|e| {
+                        MempoolError::NativeValidationFailed(format!("gossip sig recovery: {e}"))
+                    })?,
+                }
+            }
             torus_types::ActionSignature::Session { .. } => {
                 let pubkey = action.verify_session_signature().map_err(|e| {
                     MempoolError::NativeValidationFailed(format!("gossip session sig: {e}"))
@@ -540,6 +572,8 @@ impl Mempool {
     /// Returns up to `limit` actions in priority order (cancels first).
     /// Per-sender-per-block caps are enforced internally.
     pub fn drain_native(&self, limit: usize) -> Vec<SignedNativeAction> {
+        // Durable-before-selectable (T2.2): land buffered ingress mirrors first.
+        self.flush_da_mirrors();
         let mut pool = self.native.write().unwrap();
         let evicted = pool.evict_expired(now_ms());
         if evicted > 0 {
@@ -578,6 +612,8 @@ impl Mempool {
     /// eviction, and a process restart. Compact-block reconstruction MUST use this
     /// (not the ephemeral pool) to avoid the missing-body livelock (mem 28e1a821).
     pub fn get_native_da(&self, hash: &B256) -> Option<SignedNativeAction> {
+        // A buffered ingress mirror (T2.2) must be observable here too.
+        self.flush_da_mirrors();
         match self.da_store.get(hash) {
             Ok(v) => v,
             Err(e) => {
@@ -597,13 +633,55 @@ impl Mempool {
         }
     }
 
-    /// Best-effort durable mirror of one native-action body. A DA write failure is
-    /// logged, never propagated: it must not fail an ingest path (the rare
-    /// pull-fallback is the safety net), but it is loud because a lost body can
-    /// later force a fetch or, worst case, a stall.
+    /// Best-effort durable mirror of one native-action body, COALESCED (T2.2):
+    /// every ingress path used to pay its own RocksDB put here; bodies are now
+    /// buffered and flushed as one `WriteBatch` once [`DA_MIRROR_BATCH_MAX`]
+    /// are pending or the oldest has waited [`DA_MIRROR_MAX_AGE`] — and always
+    /// before selection or a DA read ([`Mempool::flush_da_mirrors`]), so a
+    /// body stays durable before its action can be selected into a proposal.
+    /// A DA write failure is logged, never propagated: it must not fail an
+    /// ingest path (the rare pull-fallback is the safety net), but it is loud
+    /// because a lost body can later force a fetch or, worst case, a stall.
     fn mirror_to_da(&self, action: &SignedNativeAction) {
-        if let Err(e) = self.da_store.put(action) {
-            tracing::error!("native DA store write failed: {e}");
+        let flush = {
+            let mut pending = self.da_pending.lock().unwrap();
+            pending.actions.push(action.clone());
+            if pending.first_at.is_none() {
+                pending.first_at = Some(std::time::Instant::now());
+            }
+            let due = pending.actions.len() >= DA_MIRROR_BATCH_MAX
+                || pending
+                    .first_at
+                    .map_or(false, |first| first.elapsed() >= DA_MIRROR_MAX_AGE);
+            if due {
+                pending.first_at = None;
+                Some(std::mem::take(&mut pending.actions))
+            } else {
+                None
+            }
+        };
+        if let Some(actions) = flush {
+            if let Err(e) = self.da_store.put_batch(&actions) {
+                tracing::error!("native DA store batch write failed: {e}");
+            }
+        }
+    }
+
+    /// Flush buffered ingress DA mirrors as one `WriteBatch` (T2.2). Called
+    /// before every selection path (a body must be durable before its action
+    /// can be selected) and before DA reads, plus opportunistically by
+    /// size/age from [`Mempool::mirror_to_da`].
+    pub fn flush_da_mirrors(&self) {
+        let actions = {
+            let mut pending = self.da_pending.lock().unwrap();
+            if pending.actions.is_empty() {
+                return;
+            }
+            pending.first_at = None;
+            std::mem::take(&mut pending.actions)
+        };
+        if let Err(e) = self.da_store.put_batch(&actions) {
+            tracing::error!("native DA store batch write failed: {e}");
         }
     }
 
@@ -611,15 +689,19 @@ impl Mempool {
     /// Actions stay in the pool for other validators' `get_by_hash` lookups.
     /// Call `remove_committed_native` after the block is committed.
     pub fn select_native_for_block(&self, limit: usize) -> Vec<SignedNativeAction> {
-        self.native.write().unwrap().select_for_block(limit)
+        // Durable-before-selectable (T2.2): land buffered ingress mirrors first.
+        self.flush_da_mirrors();
+        // T2.3: selection is read-only over the incrementally-sorted pool.
+        self.native.read().unwrap().select_for_block(limit)
     }
 
     pub fn select_native_for_block_with_senders(
         &self,
         limit: usize,
     ) -> Vec<(alloy_primitives::Address, SignedNativeAction)> {
+        self.flush_da_mirrors();
         self.native
-            .write()
+            .read()
             .unwrap()
             .select_for_block_with_senders(limit)
     }
@@ -638,12 +720,22 @@ impl Mempool {
         bytes_cap: usize,
         orders_cap: usize,
     ) -> Vec<(alloy_primitives::Address, SignedNativeAction)> {
-        let mut pool = self.native.write().unwrap();
-        let evicted = pool.evict_expired(now_ms());
-        if evicted > 0 {
-            tracing::info!(evicted, "evicted nonce-expired native actions from pool");
+        // Durable-before-selectable (T2.2): land buffered ingress mirrors first.
+        self.flush_da_mirrors();
+        {
+            let mut pool = self.native.write().unwrap();
+            let evicted = pool.evict_expired(now_ms());
+            if evicted > 0 {
+                tracing::info!(evicted, "evicted nonce-expired native actions from pool");
+            }
         }
-        pool.select_for_block_with_senders_excluding(limit, exclude, bytes_cap, orders_cap)
+        // T2.3: selection is read-only over the incrementally-sorted pool —
+        // no re-sort, no hash_index rebuild, and ingress inserts only contend
+        // with a read lock for the clone-out.
+        self.native
+            .read()
+            .unwrap()
+            .select_for_block_with_senders_excluding(limit, exclude, bytes_cap, orders_cap)
     }
 
     /// Remove native actions that were included in a committed block.
@@ -870,6 +962,95 @@ mod tests {
         pool.add_native_action_from_gossip(real_sender, signed)
             .unwrap();
         assert_eq!(pool.native_pool_size(), 1);
+    }
+
+    /// T2.1 (RED-first): gossip ingest dedups against the verified-sender
+    /// trust cache BEFORE paying the ecrecover. The cache key commits to the
+    /// full signature, so a HIT can only return what a fresh recover would —
+    /// proven here with an action whose signature CANNOT recover (garbage
+    /// sig): the old always-recover path rejects it even with a warm cache,
+    /// the cache-dedup path admits it.
+    #[test]
+    fn gossip_ingest_dedups_against_trust_cache_before_recover() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state, MempoolConfig::default());
+        let claimed = Address::repeat_byte(0x42);
+        let action = torus_types::SignedNativeAction {
+            action: torus_types::NativeAction::ClaimRewards,
+            nonce: now_ms(),
+            signature: torus_types::ActionSignature::Eip712(torus_types::Signature {
+                v: 27,
+                r: [0u8; 32],
+                s: [0u8; 32],
+            }),
+        };
+        let key = torus_types::verified_cache_key(&action).expect("eip712 is cacheable");
+
+        // Cold cache: recovery of the garbage signature fails -> rejected.
+        assert!(pool
+            .add_native_action_from_gossip(claimed, action.clone())
+            .is_err());
+        assert_eq!(pool.native_pool_size(), 0);
+
+        // Warm cache (as if this node had locally verified the same signed
+        // bytes earlier): ingest must trust the HIT and skip the recover.
+        pool.cache_verified_sender(key, claimed);
+        pool.add_native_action_from_gossip(claimed, action).unwrap();
+        assert_eq!(pool.native_pool_size(), 1);
+    }
+
+    /// T2.2 (RED-first): ingress DA mirrors are COALESCED — a lone ingested
+    /// action must NOT issue its own immediate RocksDB put (the old
+    /// one-write-per-action behavior fails the `is_none` below), yet the body
+    /// must be durable before any selection path can pick the action
+    /// (flush-before-select) and observable through `get_native_da`
+    /// (flush-before-read).
+    #[test]
+    fn ingress_da_mirror_batches_and_flushes_before_selection() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state.clone(), MempoolConfig::default());
+        let key = k256::ecdsa::SigningKey::from_slice(
+            &alloy_primitives::hex::decode(
+                "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let now = now_ms();
+        let a1 = torus_types::eip712::sign_native_action(
+            torus_types::NativeAction::ClaimRewards,
+            now,
+            &key,
+        );
+        let sender = a1.recover_sender().unwrap();
+        let h1 = torus_types::compute_action_hash(&a1);
+        pool.add_native_action_presigned(sender, a1).unwrap();
+
+        // RED on the old per-action-put code: the body was already durable.
+        let raw_store = NativeDaStore::new(state);
+        assert!(
+            raw_store.get(&h1).unwrap().is_none(),
+            "a lone ingress mirror must be buffered, not an immediate put"
+        );
+
+        // Selection flushes the buffer first: durable-before-selectable.
+        let selected = pool.select_native_for_block(10);
+        assert_eq!(selected.len(), 1);
+        assert!(
+            raw_store.get(&h1).unwrap().is_some(),
+            "body durable in the DA store before its action can be selected"
+        );
+
+        // And a DA read observes a still-buffered body (flush-before-read).
+        let a2 = torus_types::eip712::sign_native_action(
+            torus_types::NativeAction::ClaimRewards,
+            now + 1,
+            &key,
+        );
+        let h2 = torus_types::compute_action_hash(&a2);
+        pool.add_native_action_presigned(sender, a2).unwrap();
+        assert!(pool.get_native_da(&h2).is_some(), "flush-on-read");
+        assert!(raw_store.get(&h2).unwrap().is_some());
     }
 
     #[test]

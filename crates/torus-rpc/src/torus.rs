@@ -295,13 +295,17 @@ fn verify_one_action_with(
         .map_err(|e| format!("signature verification failed: {e}"))?;
     // Canonical bytes stay serde_json regardless of ingress format: the
     // action hash, gossip body, and leader-forward payload all derive here.
+    // T2.4: computed exactly ONCE per ingress action — every endpoint
+    // (single, batch-JSON, batch-bin) reuses the returned `action_bytes` /
+    // `hash` instead of re-serializing + re-hashing on its own. The hash
+    // DEFINITION (keccak over the serde_json canonical re-serialization) is
+    // consensus-facing and unchanged.
     let action_bytes = serde_json::to_vec(&action).map_err(|e| format!("serialize action: {e}"))?;
     let hash = keccak256(&action_bytes);
     Ok((sender, action, action_bytes, hash))
 }
 
-/// JSON-ingress wrapper kept for the single-action endpoint and tests.
-#[allow(dead_code)]
+/// JSON-ingress wrapper shared by the single-action endpoint and tests.
 pub(crate) fn verify_one_action(
     signed_action: &str,
     chain_id: u64,
@@ -1012,41 +1016,22 @@ impl TorusApiServer for RpcState {
             .ok_or_else(|| {
                 ErrorObjectOwned::from(RpcError::Internal("server overloaded, try again".into()))
             })?;
-        let bytes = parse_bytes(&signed_action).map_err(ErrorObjectOwned::from)?;
-
         // Offload deserialization + ECDSA verification to the blocking thread pool
         // so heavy crypto doesn't starve the async runtime under load.
+        // T2.4: same shared verify path as the batch endpoints — the canonical
+        // bytes + action hash are computed ONCE there (at first decode) and
+        // reused below for both the ack hash and the leader-forward payload,
+        // instead of this endpoint re-serializing serde_json + keccak in its
+        // own copy of the pipeline.
         let state_db = self.state.clone();
         let chain_id = self.chain_id;
         let (sender, action, action_bytes, hash) = tokio::task::spawn_blocking(move || {
-            let action: torus_types::SignedNativeAction = serde_json::from_slice(&bytes)
-                .map_err(|e| RpcError::InvalidParams(format!("invalid action encoding: {e}")))?;
-
-            // Reject malformed batches (empty / over NATIVE_ORDERS_PER_BATCH_CAP) before
-            // spending an ecrecover on them.
-            torus_mempool::rate_limit::validate_batch_size(&action.action)
-                .map_err(RpcError::InvalidParams)?;
-
-            validate_known_markets(&action.action, &state_db).map_err(RpcError::InvalidParams)?;
-
             let current_time_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("system clock before epoch")
                 .as_millis() as u64;
-
-            let sender = action
-                .validate_with_sessions(current_time_ms, chain_id, |pubkey| {
-                    state_db.get_session(pubkey).ok().flatten()
-                })
-                .map_err(|e| {
-                    RpcError::InvalidParams(format!("signature verification failed: {e}"))
-                })?;
-
-            let action_bytes = serde_json::to_vec(&action)
-                .map_err(|e| RpcError::Internal(format!("serialize action: {e}")))?;
-            let hash = keccak256(&action_bytes);
-
-            Ok::<_, RpcError>((sender, action, action_bytes, hash))
+            verify_one_action(&signed_action, chain_id, &state_db, current_time_ms)
+                .map_err(RpcError::InvalidParams)
         })
         .await
         .map_err(|e| ErrorObjectOwned::from(RpcError::Internal(format!("spawn_blocking: {e}"))))?

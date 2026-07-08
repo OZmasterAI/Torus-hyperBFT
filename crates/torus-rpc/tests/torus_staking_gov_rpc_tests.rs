@@ -320,6 +320,70 @@ async fn torus_submit_native_action_invalid_encoding() {
     handle.stop().unwrap();
 }
 
+/// T2.4 (determinism guard): `torus_submitNativeAction` (single-action path)
+/// and `torus_submitNativeActions` (batch-json path) share ONE canonicalization
+/// site (`verify_one_action_with` in torus.rs) instead of each re-serializing
+/// its own copy of the action to compute the hash. For byte-identical signed
+/// actions, both endpoints — and an independent fresh `keccak256(serde_json)`
+/// recompute — must agree exactly. Guards against the two paths silently
+/// diverging if a future edit changes the hash definition in only one place.
+#[tokio::test]
+async fn submit_native_action_hash_matches_batch_and_fresh_recompute() {
+    let (_dir, state, mempool, executor) = setup();
+    let (handle, saddr) = start_server(state, mempool, executor).await;
+    let client = HttpClientBuilder::default()
+        .build(format!("http://{saddr}"))
+        .unwrap();
+
+    let key = k256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap();
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let single_signed =
+        torus_types::eip712::sign_native_action(torus_types::NativeAction::ClaimRewards, nonce, &key);
+    let fresh_hash = alloy_primitives::keccak256(&serde_json::to_vec(&single_signed).unwrap());
+    let single_hex = format!(
+        "0x{}",
+        hex::encode(serde_json::to_vec(&single_signed).unwrap())
+    );
+
+    let single_result: String = client
+        .request("torus_submitNativeAction", rpc_params![single_hex])
+        .await
+        .unwrap();
+    assert_eq!(
+        single_result,
+        hex_b256(fresh_hash),
+        "single-action hash must equal a fresh independent recompute"
+    );
+
+    // Distinct nonce so the batch submit isn't rejected as a duplicate of the
+    // action just admitted above.
+    let batch_signed = torus_types::eip712::sign_native_action(
+        torus_types::NativeAction::ClaimRewards,
+        nonce + 1,
+        &key,
+    );
+    let batch_fresh_hash = alloy_primitives::keccak256(&serde_json::to_vec(&batch_signed).unwrap());
+    let batch_hex = format!(
+        "0x{}",
+        hex::encode(serde_json::to_vec(&batch_signed).unwrap())
+    );
+    let batch_results: Vec<RpcSubmitResult> = client
+        .request("torus_submitNativeActions", rpc_params![vec![batch_hex]])
+        .await
+        .unwrap();
+    let batch_hash = batch_results[0].hash.as_ref().expect("batch admitted");
+    assert_eq!(
+        *batch_hash,
+        hex_b256(batch_fresh_hash),
+        "batch-path hash must equal a fresh independent recompute"
+    );
+
+    handle.stop().unwrap();
+}
+
 // ============================================================================
 // Governance tests (2.9.5)
 // ============================================================================
