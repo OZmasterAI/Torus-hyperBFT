@@ -8,7 +8,7 @@ use revm::{Context, ExecuteCommitEvm, MainBuilder, MainContext};
 
 use crate::precompile_provider::TorusPrecompiles;
 
-use torus_state::{StateDb, StateOverlay};
+use torus_state::{NativeStateOverlay, StateDb, StateOverlay};
 use torus_types::{Log as TorusLog, Receipt};
 
 use crate::bloom::logs_bloom;
@@ -144,15 +144,30 @@ impl EvmExecutor {
         // In call-simulation mode (eth_call / eth_estimateGas) run the precompiles
         // read-only so the Torus writer precompiles cannot durably mutate the shared
         // StateDb outside consensus (they bypass revm's revert sandbox).
+        //
+        // T4.4: writer-precompile side effects are journaled per transaction — they
+        // buffer in `journal` during execution and only become durable if the tx
+        // succeeds, so an EVM revert also reverts native side effects.
+        let journal = NativeStateOverlay::new(state_db.clone());
         let mut evm = ctx
             .build_mainnet()
             .with_precompiles(TorusPrecompiles::with_mode(
                 SpecId::CANCUN,
-                state_db,
+                journal.clone(),
                 block_cfg.number,
                 call_mode,
             ));
         let result = evm.transact_commit(tx).map_err(map_evm_err)?;
+
+        // T4.4: persist journaled precompile writes only on tx success (never in call
+        // mode, where writer precompiles are denied and the journal stays empty).
+        if !call_mode && result.is_success() {
+            journal
+                .commit_tx(state_db)
+                .map_err(|e| EvmError::Internal(format!("precompile journal commit: {e}")))?;
+        } else {
+            journal.discard_tx();
+        }
 
         let tx_result = build_tx_result(&result);
 
@@ -191,9 +206,13 @@ impl EvmExecutor {
             .modify_block_chained(|b| apply_block_env(b, block_cfg))
             .with_db(state);
 
+        // T4.4: per-tx journal for writer-precompile side effects — committed to the
+        // StateDb only when the tx succeeds, discarded on revert/halt. Applied-write
+        // ordering for successful txs matches the pre-journal direct-write behavior.
+        let journal = NativeStateOverlay::new(state_db.clone());
         let mut evm = ctx.build_mainnet().with_precompiles(TorusPrecompiles::new(
             SpecId::CANCUN,
-            state_db,
+            journal.clone(),
             block_cfg.number,
         ));
 
@@ -211,6 +230,7 @@ impl EvmExecutor {
                 Ok(r) => r,
                 Err(EVMError::Transaction(tx_err)) if skip_invalid => {
                     tracing::warn!(idx, ?tx_err, "skipping invalid tx during block proposal");
+                    journal.discard_tx();
                     continue;
                 }
                 Err(e) => return Err(map_evm_err(e)),
@@ -234,6 +254,15 @@ impl EvmExecutor {
             }
 
             let success = result.is_success();
+
+            // T4.4: revert must revert writer-precompile side effects too.
+            if success {
+                journal
+                    .commit_tx(state_db)
+                    .map_err(|e| EvmError::Internal(format!("precompile journal commit: {e}")))?;
+            } else {
+                journal.discard_tx();
+            }
 
             // Only include logs from successful transactions.
             let (torus_logs, tx_bloom) = if success {
@@ -314,9 +343,13 @@ impl EvmExecutor {
             .modify_block_chained(|b| apply_block_env(b, block_cfg))
             .with_db(state);
 
+        // T4.4: per-tx journal for writer-precompile side effects. Precompiles still
+        // read/write native state against the underlying `state_db` (the overlay base),
+        // exactly as before — but durably only when the calling tx succeeds.
+        let journal = NativeStateOverlay::new(overlay.base().clone());
         let mut evm = ctx.build_mainnet().with_precompiles(TorusPrecompiles::new(
             SpecId::CANCUN,
-            overlay.base(),
+            journal.clone(),
             block_cfg.number,
         ));
 
@@ -334,6 +367,7 @@ impl EvmExecutor {
                 Ok(r) => r,
                 Err(EVMError::Transaction(tx_err)) if skip_invalid => {
                     tracing::warn!(idx, ?tx_err, "skipping invalid tx during block proposal");
+                    journal.discard_tx();
                     continue;
                 }
                 Err(e) => return Err(map_evm_err(e)),
@@ -357,6 +391,15 @@ impl EvmExecutor {
             }
 
             let success = result.is_success();
+
+            // T4.4: revert must revert writer-precompile side effects too.
+            if success {
+                journal
+                    .commit_tx(overlay.base())
+                    .map_err(|e| EvmError::Internal(format!("precompile journal commit: {e}")))?;
+            } else {
+                journal.discard_tx();
+            }
 
             let (torus_logs, tx_bloom) = if success {
                 let evm_logs = result.logs();

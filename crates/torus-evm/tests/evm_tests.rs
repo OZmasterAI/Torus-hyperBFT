@@ -4,6 +4,7 @@ use alloy_primitives::{Address, Bloom, Bytes, B256, U256};
 use revm::context::TxEnv;
 use revm::primitives::TxKind;
 use revm::state::AccountInfo;
+use torus_core::precompiles::CoreWriterQueue;
 use torus_evm::{calc_next_block_base_fee, BlockEnvCfg, EvmExecutor, TORUS_CHAIN_ID};
 use torus_state::StateDb;
 
@@ -711,6 +712,183 @@ fn eip1559_unused_gas_refunded() {
     assert_eq!(
         block_result.gas_used, 21_000,
         "block gas_used must be actual gas, refund does not count as block gas"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T4.4: EVM revert must revert writer-precompile side effects (per-tx journal)
+// ---------------------------------------------------------------------------
+
+/// Runtime bytecode for a proxy contract that forwards its calldata to the
+/// CoreWriter precompile (0x0810) and then executes `tail` (STOP or REVERT).
+fn core_writer_proxy_code(tail: &[u8]) -> Vec<u8> {
+    #[rustfmt::skip]
+    let mut code = vec![
+        0x36,             // CALLDATASIZE
+        0x5f, 0x5f,       // PUSH0 PUSH0
+        0x37,             // CALLDATACOPY   mem[0..cds] = calldata
+        0x5f,             // PUSH0          retSize
+        0x5f,             // PUSH0          retOffset
+        0x36,             // CALLDATASIZE   argsSize
+        0x5f,             // PUSH0          argsOffset
+        0x5f,             // PUSH0          value
+        0x61, 0x08, 0x10, // PUSH2 0x0810   CoreWriter precompile
+        0x5a,             // GAS
+        0xf1,             // CALL
+        0x50,             // POP
+    ];
+    code.extend_from_slice(tail);
+    code
+}
+
+/// Install `code` as `address`'s runtime bytecode.
+fn install_contract(db: &StateDb, address: &Address, code: &[u8]) {
+    let code_hash = alloy_primitives::keccak256(code);
+    db.put_code(&code_hash, code).unwrap();
+    db.put_account(
+        address,
+        &AccountInfo {
+            balance: U256::ZERO,
+            nonce: 1,
+            code_hash,
+            code: None,
+            account_id: None,
+        },
+    )
+    .unwrap();
+}
+
+/// ABI calldata for CoreWriter.cancelOrder(bytes32).
+fn cancel_order_calldata(order_id: u128) -> Vec<u8> {
+    let sig_hash = alloy_primitives::keccak256("cancelOrder(bytes32)".as_bytes());
+    let mut calldata = Vec::with_capacity(36);
+    calldata.extend_from_slice(&sig_hash[..4]);
+    let mut word = [0u8; 32];
+    word[16..32].copy_from_slice(&order_id.to_be_bytes());
+    calldata.extend_from_slice(&word);
+    calldata
+}
+
+/// T4.4 RED-FIRST: a tx that calls a writer precompile and then REVERTS must leave
+/// NO durable native-state write. Before journaling, CoreWriter's enqueue hit
+/// RocksDB directly during EVM execution and survived the revert
+/// (pending_count == 1); with the per-tx journal it is discarded (== 0).
+#[test]
+fn reverting_tx_discards_writer_precompile_side_effects() {
+    let (_dir, db) = open_test_db();
+    let ten_eth = U256::from(10_000_000_000_000_000_000u128);
+    db.put_account(&ALICE, &test_account(ten_eth)).unwrap();
+
+    // Proxy calls CoreWriter, then PUSH0 PUSH0 REVERT.
+    let contract = Address::new([0xC0; 20]);
+    install_contract(&db, &contract, &core_writer_proxy_code(&[0x5f, 0x5f, 0xfd]));
+
+    let block_cfg = default_block_cfg(); // number = 1
+    let tx = TxEnv {
+        caller: ALICE,
+        gas_limit: 300_000,
+        gas_price: block_cfg.base_fee as u128,
+        kind: TxKind::Call(contract),
+        value: U256::ZERO,
+        data: Bytes::from(cancel_order_calldata(42)),
+        nonce: 0,
+        chain_id: Some(TORUS_CHAIN_ID),
+        ..Default::default()
+    };
+
+    let executor = EvmExecutor::new(TORUS_CHAIN_ID);
+    let (result, _bundle) = executor.execute_tx(&db, &block_cfg, tx).unwrap();
+    assert!(!result.success, "proxy contract always reverts");
+
+    // The enqueue targeted block 2 (current 1 + anti-frontrunning delay). The tx
+    // reverted, so the native side effect must have been reverted with it.
+    assert_eq!(
+        CoreWriterQueue::pending_count(&db, block_cfg.number + 1).unwrap(),
+        0,
+        "reverted tx must leave no durable CoreWriter action"
+    );
+}
+
+/// T4.4 parity guard: the SAME precompile call in a SUCCESSFUL tx stays durable —
+/// journaling must not change committed behavior for successful txs (this passes
+/// both before and after the journal change, pinning state-root determinism).
+#[test]
+fn successful_tx_persists_writer_precompile_side_effects() {
+    let (_dir, db) = open_test_db();
+    let ten_eth = U256::from(10_000_000_000_000_000_000u128);
+    db.put_account(&ALICE, &test_account(ten_eth)).unwrap();
+
+    // Proxy calls CoreWriter, then STOP.
+    let contract = Address::new([0xC0; 20]);
+    install_contract(&db, &contract, &core_writer_proxy_code(&[0x00]));
+
+    let block_cfg = default_block_cfg(); // number = 1
+    let tx = TxEnv {
+        caller: ALICE,
+        gas_limit: 300_000,
+        gas_price: block_cfg.base_fee as u128,
+        kind: TxKind::Call(contract),
+        value: U256::ZERO,
+        data: Bytes::from(cancel_order_calldata(42)),
+        nonce: 0,
+        chain_id: Some(TORUS_CHAIN_ID),
+        ..Default::default()
+    };
+
+    let executor = EvmExecutor::new(TORUS_CHAIN_ID);
+    let (result, _bundle) = executor.execute_tx(&db, &block_cfg, tx).unwrap();
+    assert!(result.success, "proxy with STOP tail must succeed");
+
+    assert_eq!(
+        CoreWriterQueue::pending_count(&db, block_cfg.number + 1).unwrap(),
+        1,
+        "successful tx must keep its CoreWriter action durable"
+    );
+}
+
+/// T4.4 block-path variant (the consensus path): in a block with one reverting and
+/// one successful writer-precompile tx, only the successful tx's action survives.
+#[test]
+fn block_execution_journals_writer_precompiles_per_tx() {
+    let (_dir, db) = open_test_db();
+    let ten_eth = U256::from(10_000_000_000_000_000_000u128);
+    db.put_account(&ALICE, &test_account(ten_eth)).unwrap();
+
+    let reverter = Address::new([0xC1; 20]);
+    let stopper = Address::new([0xC2; 20]);
+    install_contract(&db, &reverter, &core_writer_proxy_code(&[0x5f, 0x5f, 0xfd]));
+    install_contract(&db, &stopper, &core_writer_proxy_code(&[0x00]));
+
+    let block_cfg = default_block_cfg(); // number = 1
+    let make_tx = |to: Address, nonce: u64| TxEnv {
+        caller: ALICE,
+        gas_limit: 300_000,
+        gas_price: block_cfg.base_fee as u128,
+        kind: TxKind::Call(to),
+        value: U256::ZERO,
+        data: Bytes::from(cancel_order_calldata(42)),
+        nonce,
+        chain_id: Some(TORUS_CHAIN_ID),
+        ..Default::default()
+    };
+
+    let executor = EvmExecutor::new(TORUS_CHAIN_ID);
+    let result = executor
+        .execute_block(
+            &db,
+            &block_cfg,
+            vec![make_tx(reverter, 0), make_tx(stopper, 1)],
+            false,
+        )
+        .unwrap();
+
+    assert!(!result.receipts[0].status, "first tx reverts");
+    assert!(result.receipts[1].status, "second tx succeeds");
+
+    assert_eq!(
+        CoreWriterQueue::pending_count(&db, block_cfg.number + 1).unwrap(),
+        1,
+        "only the successful tx's CoreWriter action may be durable"
     );
 }
 

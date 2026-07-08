@@ -253,13 +253,15 @@ fn selector_for(sig: &str) -> u32 {
 /// * `address` — 20-byte precompile address
 /// * `input` — ABI-encoded input (4-byte selector + params)
 /// * `caller` — msg.sender (used by CoreWriter and Lockbox)
-/// * `state_db` — state access
+/// * `state_db` — state access. T4.4: any [`StateBackend`] — real block execution passes
+///   a per-tx journaled overlay so writer side effects only become durable on tx success
+///   (reads fall through to the base DB, preserving read-your-writes within the tx)
 /// * `current_block` — current block number
 pub fn execute_precompile(
     address: &Address,
     input: &[u8],
     caller: &Address,
-    state_db: &StateDb,
+    state_db: &impl StateBackend,
     current_block: u64,
 ) -> Result<Vec<u8>, CoreError> {
     execute_precompile_inner(address, input, caller, state_db, current_block, false)
@@ -277,7 +279,7 @@ pub fn execute_precompile_read_only(
     address: &Address,
     input: &[u8],
     caller: &Address,
-    state_db: &StateDb,
+    state_db: &impl StateBackend,
     current_block: u64,
 ) -> Result<Vec<u8>, CoreError> {
     execute_precompile_inner(address, input, caller, state_db, current_block, true)
@@ -287,7 +289,7 @@ fn execute_precompile_inner(
     address: &Address,
     input: &[u8],
     caller: &Address,
-    state_db: &StateDb,
+    state_db: &impl StateBackend,
     current_block: u64,
     read_only: bool,
 ) -> Result<Vec<u8>, CoreError> {
@@ -325,7 +327,7 @@ fn execute_precompile_inner(
 // OrderBookReader (0x0800) — tasks 2.4.1
 // ============================================================================
 
-fn order_book_reader(input: &[u8], state_db: &StateDb) -> Result<Vec<u8>, CoreError> {
+fn order_book_reader(input: &[u8], state_db: &impl StateBackend) -> Result<Vec<u8>, CoreError> {
     let sel = abi::selector(input)?;
 
     if sel == selector_for("getOrderBook(bytes32)") {
@@ -345,7 +347,10 @@ fn order_book_reader(input: &[u8], state_db: &StateDb) -> Result<Vec<u8>, CoreEr
 }
 
 /// getOrderBook → (uint128[] bid_prices, uint128[] bid_qtys, uint128[] ask_prices, uint128[] ask_qtys)
-fn read_order_book(state_db: &StateDb, market_id: MarketId) -> Result<Vec<u8>, CoreError> {
+fn read_order_book(
+    state_db: &impl StateBackend,
+    market_id: MarketId,
+) -> Result<Vec<u8>, CoreError> {
     let key = market_id.to_be_bytes();
     let snapshot = match state_db.get_cf_raw(CF_NATIVE_ORDER_BOOKS, &key)? {
         Some(data) => {
@@ -388,7 +393,7 @@ fn read_order_book(state_db: &StateDb, market_id: MarketId) -> Result<Vec<u8>, C
 
 /// getPosition → (int128 size, uint128 entry_price, int128 unrealized_pnl, int128 realized_pnl, uint128 margin)
 fn read_position(
-    state_db: &StateDb,
+    state_db: &impl StateBackend,
     trader: &Address,
     market_id: MarketId,
 ) -> Result<Vec<u8>, CoreError> {
@@ -431,33 +436,23 @@ fn read_position(
 
 /// getOpenOrders → (bytes32[] order_ids, uint128[] prices, uint128[] quantities, uint8[] sides)
 fn read_open_orders(
-    state_db: &StateDb,
+    state_db: &impl StateBackend,
     trader: &Address,
     market_id: MarketId,
 ) -> Result<Vec<u8>, CoreError> {
-    let db = state_db.inner();
-    let cf = db
-        .cf_handle(CF_NATIVE_ORDERS)
-        .ok_or(CoreError::MissingCf(CF_NATIVE_ORDERS))?;
-
     // Prefix: trader(20) + market_id(8)
     let mut prefix = [0u8; 28];
     prefix[..20].copy_from_slice(trader.as_slice());
     prefix[20..28].copy_from_slice(&market_id.to_be_bytes());
 
-    let iter = db.prefix_iterator_cf(cf, prefix);
+    let entries = state_db.iterate_cf(CF_NATIVE_ORDERS, Some(&prefix))?;
     let mut order_ids = Vec::new();
     let mut prices = Vec::new();
     let mut quantities = Vec::new();
     let mut sides = Vec::new();
 
-    for item in iter {
-        let (key, value) =
-            item.map_err(|e| CoreError::State(torus_state::StateError::RocksDb(e)))?;
-        if !key.starts_with(&prefix) {
-            break;
-        }
-        if let Ok(order) = StoredOrder::try_from_slice(&value) {
+    for (_key, value) in &entries {
+        if let Ok(order) = StoredOrder::try_from_slice(value) {
             order_ids.push(abi::encode_order_id(order.order_id));
             prices.push(abi::encode_fp_as_u128(order.price));
             quantities.push(abi::encode_fp_as_u128(order.remaining_qty));
@@ -477,7 +472,7 @@ fn read_open_orders(
 // BalanceReader (0x0801) — tasks 2.4.1
 // ============================================================================
 
-fn balance_reader(input: &[u8], state_db: &StateDb) -> Result<Vec<u8>, CoreError> {
+fn balance_reader(input: &[u8], state_db: &impl StateBackend) -> Result<Vec<u8>, CoreError> {
     let sel = abi::selector(input)?;
 
     if sel == selector_for("getBalances(address)") {
@@ -491,7 +486,7 @@ fn balance_reader(input: &[u8], state_db: &StateDb) -> Result<Vec<u8>, CoreError
 }
 
 /// getBalances → (uint128 native_balance, uint128 evm_balance, uint128 total_margin_used, uint128 available)
-fn read_balances(state_db: &StateDb, trader: &Address) -> Result<Vec<u8>, CoreError> {
+fn read_balances(state_db: &impl StateBackend, trader: &Address) -> Result<Vec<u8>, CoreError> {
     // Native balance from CF_NATIVE_BALANCES
     let native_bal = match state_db.get_cf_raw(CF_NATIVE_BALANCES, trader.as_slice())? {
         Some(data) => {
@@ -521,19 +516,12 @@ fn read_balances(state_db: &StateDb, trader: &Address) -> Result<Vec<u8>, CoreEr
 }
 
 /// getMarkets → (bytes32[] market_ids, bool[] active)
-fn read_markets(state_db: &StateDb) -> Result<Vec<u8>, CoreError> {
-    let db = state_db.inner();
-    let cf = db
-        .cf_handle(CF_NATIVE_MARKETS)
-        .ok_or(CoreError::MissingCf(CF_NATIVE_MARKETS))?;
-
-    let iter = db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+fn read_markets(state_db: &impl StateBackend) -> Result<Vec<u8>, CoreError> {
+    let entries = state_db.iterate_cf(CF_NATIVE_MARKETS, None)?;
     let mut market_ids = Vec::new();
     let mut active_flags = Vec::new();
 
-    for item in iter {
-        let (key, value) =
-            item.map_err(|e| CoreError::State(torus_state::StateError::RocksDb(e)))?;
+    for (key, value) in &entries {
         if key.len() == 8 {
             let mid = u64::from_be_bytes(key[..8].try_into().unwrap());
             market_ids.push(abi::encode_market_id(mid));
@@ -554,7 +542,7 @@ use crate::oracle::DEFAULT_MAX_ORACLE_AGE;
 
 fn oracle_reader(
     input: &[u8],
-    state_db: &StateDb,
+    state_db: &impl StateBackend,
     current_block: u64,
 ) -> Result<Vec<u8>, CoreError> {
     let sel = abi::selector(input)?;
@@ -571,7 +559,7 @@ fn oracle_reader(
 
 /// getPrice → (uint128 price, uint64 block_number, bool stale)
 fn read_oracle_price(
-    state_db: &StateDb,
+    state_db: &impl StateBackend,
     market_id: MarketId,
     current_block: u64,
 ) -> Result<Vec<u8>, CoreError> {
@@ -593,25 +581,18 @@ fn read_oracle_price(
 }
 
 /// getAllPrices → (bytes32[] market_ids, uint128[] prices, bool[] stale_flags)
-fn read_all_oracle_prices(state_db: &StateDb, current_block: u64) -> Result<Vec<u8>, CoreError> {
-    let db = state_db.inner();
-    let cf = db
-        .cf_handle(CF_NATIVE_ORACLE)
-        .ok_or(CoreError::MissingCf(CF_NATIVE_ORACLE))?;
-
+fn read_all_oracle_prices(
+    state_db: &impl StateBackend,
+    current_block: u64,
+) -> Result<Vec<u8>, CoreError> {
     let prefix = b"agg";
-    let iter = db.prefix_iterator_cf(cf, prefix);
+    let entries = state_db.iterate_cf(CF_NATIVE_ORACLE, Some(prefix))?;
 
     let mut market_ids = Vec::new();
     let mut prices = Vec::new();
     let mut stale_flags = Vec::new();
 
-    for item in iter {
-        let (key, value) =
-            item.map_err(|e| CoreError::State(torus_state::StateError::RocksDb(e)))?;
-        if !key.starts_with(prefix) {
-            break;
-        }
+    for (key, value) in &entries {
         if key.len() == 11 && value.len() >= 28 {
             let mid = u64::from_be_bytes(key[3..11].try_into().unwrap());
             let price = FixedPoint::from_raw(i128::from_be_bytes(value[..16].try_into().unwrap()));
@@ -640,7 +621,10 @@ fn oracle_agg_key(market_id: MarketId) -> Vec<u8> {
 }
 
 /// Read the oracle price as FixedPoint (helper for other precompiles).
-fn get_oracle_price_fp(state_db: &StateDb, market_id: MarketId) -> Result<FixedPoint, CoreError> {
+fn get_oracle_price_fp(
+    state_db: &impl StateBackend,
+    market_id: MarketId,
+) -> Result<FixedPoint, CoreError> {
     let key = oracle_agg_key(market_id);
     match state_db.get_cf_raw(CF_NATIVE_ORACLE, &key)? {
         Some(data) if data.len() >= 16 => Ok(FixedPoint::from_raw(i128::from_be_bytes(
@@ -654,7 +638,7 @@ fn get_oracle_price_fp(state_db: &StateDb, market_id: MarketId) -> Result<FixedP
 // StakingReader (0x0803) — tasks 2.4.2
 // ============================================================================
 
-fn staking_reader(input: &[u8], state_db: &StateDb) -> Result<Vec<u8>, CoreError> {
+fn staking_reader(input: &[u8], state_db: &impl StateBackend) -> Result<Vec<u8>, CoreError> {
     let sel = abi::selector(input)?;
 
     if sel == selector_for("getStakingInfo(address)") {
@@ -668,29 +652,23 @@ fn staking_reader(input: &[u8], state_db: &StateDb) -> Result<Vec<u8>, CoreError
 }
 
 /// getStakingInfo → (uint128 delegated, uint128 permanent, uint128 rewards_pending, address validator)
-fn read_staking_info(state_db: &StateDb, staker: &Address) -> Result<Vec<u8>, CoreError> {
+fn read_staking_info(state_db: &impl StateBackend, staker: &Address) -> Result<Vec<u8>, CoreError> {
     // Read delegation info: scan CF_STAKING_DELEGATIONS with prefix = staker(20)
-    let db = state_db.inner();
     let mut total_delegated = U256::ZERO;
     let mut first_validator = Address::ZERO;
 
-    if let Some(cf) = db.cf_handle(CF_STAKING_DELEGATIONS) {
-        let prefix = staker.as_slice();
-        let iter = db.prefix_iterator_cf(cf, prefix);
-        for item in iter {
-            let (key, value) =
-                item.map_err(|e| CoreError::State(torus_state::StateError::RocksDb(e)))?;
-            if !key.starts_with(prefix) || key.len() != 40 {
-                break;
+    let entries = state_db.iterate_cf(CF_STAKING_DELEGATIONS, Some(staker.as_slice()))?;
+    for (key, value) in &entries {
+        if key.len() != 40 {
+            break;
+        }
+        // Value starts with: delegator(20) + validator(20) + amount(U256 32 BE)
+        if value.len() >= 72 {
+            let amount = U256::from_be_slice(&value[40..72]);
+            if !amount.is_zero() && first_validator == Address::ZERO {
+                first_validator = Address::from_slice(&value[20..40]);
             }
-            // Value starts with: delegator(20) + validator(20) + amount(U256 32 BE)
-            if value.len() >= 72 {
-                let amount = U256::from_be_slice(&value[40..72]);
-                if !amount.is_zero() && first_validator == Address::ZERO {
-                    first_validator = Address::from_slice(&value[20..40]);
-                }
-                total_delegated += amount;
-            }
+            total_delegated += amount;
         }
     }
 
@@ -726,26 +704,19 @@ fn read_staking_info(state_db: &StateDb, staker: &Address) -> Result<Vec<u8>, Co
 }
 
 /// getValidators → (address[] validators, uint128[] stakes, uint128[] commissions)
-fn read_validators(state_db: &StateDb) -> Result<Vec<u8>, CoreError> {
-    let db = state_db.inner();
-    let cf = db
-        .cf_handle(CF_STAKING_VALIDATORS)
-        .ok_or(CoreError::MissingCf(CF_STAKING_VALIDATORS))?;
-
-    let iter = db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+fn read_validators(state_db: &impl StateBackend) -> Result<Vec<u8>, CoreError> {
+    let entries = state_db.iterate_cf(CF_STAKING_VALIDATORS, None)?;
     let mut validators = Vec::new();
     let mut stakes = Vec::new();
     let mut commissions = Vec::new();
 
-    for item in iter {
-        let (key, value) =
-            item.map_err(|e| CoreError::State(torus_state::StateError::RocksDb(e)))?;
+    for (key, value) in &entries {
         if key.len() != 20 {
             continue;
         }
         // FIX MED-NEW-14: Use Borsh deserialization instead of fragile byte-offset parsing.
         // Manual offsets silently break if ValidatorState fields are added/reordered.
-        if let Ok(vs) = torus_economics::types::ValidatorState::try_from_slice(&value) {
+        if let Ok(vs) = torus_economics::types::ValidatorState::try_from_slice(value) {
             let total = vs.self_stake + vs.total_delegated;
             validators.push(abi::encode_address(&vs.address));
             stakes.push(abi::encode_u128(u256_to_u128_saturating(total)));
@@ -778,7 +749,7 @@ fn u256_to_u128_saturating(val: U256) -> u128 {
 fn core_writer(
     input: &[u8],
     caller: &Address,
-    state_db: &StateDb,
+    state_db: &impl StateBackend,
     current_block: u64,
 ) -> Result<Vec<u8>, CoreError> {
     let sel = abi::selector(input)?;
@@ -868,7 +839,7 @@ fn core_writer(
 fn core_writer_staking(
     input: &[u8],
     caller: &Address,
-    state_db: &StateDb,
+    state_db: &impl StateBackend,
     current_block: u64,
 ) -> Result<Vec<u8>, CoreError> {
     let sel = abi::selector(input)?;
@@ -952,7 +923,7 @@ fn core_writer_staking(
 fn lockbox_precompile(
     input: &[u8],
     caller: &Address,
-    state_db: &StateDb,
+    state_db: &impl StateBackend,
 ) -> Result<Vec<u8>, CoreError> {
     let sel = abi::selector(input)?;
 
@@ -992,7 +963,10 @@ pub struct CoreWriterQueue;
 impl CoreWriterQueue {
     /// Enqueue a CoreWriter action for execution in the next block.
     /// Returns the sequence number assigned to this action.
-    pub fn enqueue(state_db: &StateDb, action: &QueuedAction) -> Result<u64, CoreError> {
+    ///
+    /// T4.4: takes any [`StateBackend`] so EVM execution can enqueue into a per-tx
+    /// journaled overlay (durable only if the calling tx succeeds).
+    pub fn enqueue(state_db: &impl StateBackend, action: &QueuedAction) -> Result<u64, CoreError> {
         let target_block = action.block_queued + 1; // anti-frontrunning: execute next block
 
         // Determine next sequence number for this target block
@@ -1061,29 +1035,20 @@ impl CoreWriterQueue {
 
     /// Find the next sequence number for a target block.
     ///
-    /// FIX EVM-PF-16: Uses reverse seek (O(1)) instead of full prefix scan (O(n)).
-    fn next_sequence(state_db: &StateDb, target_block: u64) -> Result<u64, CoreError> {
-        let db = state_db.inner();
-        let cf = db
-            .cf_handle(CF_CORE_WRITER_QUEUE)
-            .ok_or(CoreError::MissingCf(CF_CORE_WRITER_QUEUE))?;
-
+    /// T4.4: goes through [`StateBackend::iterate_cf`] (instead of the FIX EVM-PF-16 raw
+    /// reverse seek) so pending journal writes from earlier calls in the SAME tx/block are
+    /// visible (read-your-writes — two placeOrder calls in one tx must get seq 0 then 1).
+    /// The scan is bounded to a single target-block prefix (only actions queued for the
+    /// next block), so it stays small.
+    fn next_sequence(state_db: &impl StateBackend, target_block: u64) -> Result<u64, CoreError> {
         let prefix = target_block.to_be_bytes();
+        let entries = state_db.iterate_cf(CF_CORE_WRITER_QUEUE, Some(&prefix))?;
 
-        // Seek to the last possible key with this block prefix (prefix + 0xFF..FF).
-        let mut seek_key = Vec::with_capacity(16);
-        seek_key.extend_from_slice(&prefix);
-        seek_key.extend_from_slice(&[0xFF; 8]);
-
-        let mut iter = db.raw_iterator_cf(cf);
-        iter.seek_for_prev(&seek_key);
-
-        if iter.valid() {
-            if let Some(key) = iter.key() {
-                if key.starts_with(&prefix) && key.len() == 16 {
-                    let seq = u64::from_be_bytes(key[8..16].try_into().unwrap());
-                    return Ok(seq + 1);
-                }
+        // Entries are in sorted key order; the last well-formed key holds the max seq.
+        if let Some((key, _)) = entries.last() {
+            if key.len() == 16 {
+                let seq = u64::from_be_bytes(key[8..16].try_into().unwrap());
+                return Ok(seq + 1);
             }
         }
         Ok(0)

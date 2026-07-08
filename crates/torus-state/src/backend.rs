@@ -236,6 +236,42 @@ impl NativeStateOverlay {
         target.write(batch)
     }
 
+    /// T4.4: Persist all pending writes to `target` in one atomic batch, then clear the
+    /// journal. This is the per-transaction COMMIT for writer-precompile side effects —
+    /// the EVM executor calls it only when the calling tx succeeded. A no-op when the
+    /// journal is empty, so read-only paths never touch the database.
+    pub fn commit_tx(&self, target: &StateDb) -> Result<(), StateError> {
+        let mut state = self.pending.write().unwrap();
+        if state.writes.is_empty() && state.deletes.is_empty() {
+            return Ok(());
+        }
+        let db = target.inner();
+        let mut batch = WriteBatch::default();
+        for ((cf_name, key), value) in &state.writes {
+            let cf = db
+                .cf_handle(cf_name)
+                .ok_or_else(|| StateError::MissingColumnFamily(cf_name.clone()))?;
+            batch.put_cf(cf, key, value);
+        }
+        for (cf_name, key) in &state.deletes {
+            if let Some(cf) = db.cf_handle(cf_name) {
+                batch.delete_cf(cf, key);
+            }
+        }
+        target.write(batch)?;
+        state.writes.clear();
+        state.deletes.clear();
+        Ok(())
+    }
+
+    /// T4.4: Drop all pending writes without persisting them — the per-transaction
+    /// REVERT for writer-precompile side effects (calling EVM tx reverted or halted).
+    pub fn discard_tx(&self) {
+        let mut state = self.pending.write().unwrap();
+        state.writes.clear();
+        state.deletes.clear();
+    }
+
     /// Pre-populate CF_ACCOUNTS from an EVM BundleState so that native execution
     /// (specifically Lockbox) can read EVM account changes from this block.
     pub fn seed_from_bundle(&self, bundle: &revm::database::BundleState) {
@@ -610,6 +646,43 @@ mod tests {
             StateDb::get_cf_raw(&db, cf, b"added").unwrap().unwrap(),
             b"fresh"
         );
+    }
+
+    /// T4.4: `commit_tx` persists pending writes and clears the journal so the next
+    /// transaction starts from a clean buffer.
+    #[test]
+    fn overlay_commit_tx_persists_and_clears() {
+        let (db, _dir) = temp_db();
+        let cf = CF_NATIVE_BALANCES;
+
+        let overlay = NativeStateOverlay::new(db.clone());
+        StateBackend::put_cf_raw(&overlay, cf, b"k1", b"v1").unwrap();
+        assert_eq!(overlay.pending_write_count(), 1);
+
+        overlay.commit_tx(&db).unwrap();
+        assert_eq!(
+            StateDb::get_cf_raw(&db, cf, b"k1").unwrap().unwrap(),
+            b"v1"
+        );
+        assert_eq!(overlay.pending_write_count(), 0, "journal cleared on commit");
+
+        // Empty commit is a no-op (must not error).
+        overlay.commit_tx(&db).unwrap();
+    }
+
+    /// T4.4: `discard_tx` drops pending writes — nothing reaches the database.
+    #[test]
+    fn overlay_discard_tx_drops_pending() {
+        let (db, _dir) = temp_db();
+        let cf = CF_NATIVE_BALANCES;
+
+        let overlay = NativeStateOverlay::new(db.clone());
+        StateBackend::put_cf_raw(&overlay, cf, b"k1", b"v1").unwrap();
+        StateBackend::delete_cf_raw(&overlay, cf, b"k2").unwrap();
+
+        overlay.discard_tx();
+        assert_eq!(overlay.pending_write_count(), 0);
+        assert!(StateDb::get_cf_raw(&db, cf, b"k1").unwrap().is_none());
     }
 
     #[test]

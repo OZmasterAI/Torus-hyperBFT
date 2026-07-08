@@ -14,44 +14,51 @@ use torus_core::precompiles::{
     execute_precompile, execute_precompile_read_only, is_precompile, precompile_gas,
     ALL_PRECOMPILE_ADDRESSES,
 };
-use torus_state::StateDb;
+use torus_state::NativeStateOverlay;
 
 /// Precompile provider combining standard Ethereum precompiles with
 /// Torus cross-VM precompiles (order book, balance, oracle, staking readers
 /// and core writer / lockbox).
-pub struct TorusPrecompiles<'a> {
+pub struct TorusPrecompiles {
     eth: EthPrecompiles,
-    state_db: &'a StateDb,
+    /// T4.4: per-transaction journal for writer-precompile side effects. Writes buffer
+    /// in this overlay during EVM execution (reads fall through to the base `StateDb`,
+    /// preserving read-your-writes); the executor persists them via
+    /// [`NativeStateOverlay::commit_tx`] only when the calling tx SUCCEEDS and drops
+    /// them via [`NativeStateOverlay::discard_tx`] on revert/halt — so an EVM revert
+    /// also reverts native side effects.
+    journal: NativeStateOverlay,
     current_block: u64,
     /// eth_call / eth_estimateGas simulation: deny state-mutating (writer) precompiles so
     /// a simulation can't durably mutate the shared `StateDb` outside consensus.
     read_only: bool,
 }
 
-impl<'a> TorusPrecompiles<'a> {
-    /// Create a provider for real transaction/block execution (writer precompiles enabled).
-    pub fn new(spec: SpecId, state_db: &'a StateDb, current_block: u64) -> Self {
-        Self::with_mode(spec, state_db, current_block, false)
+impl TorusPrecompiles {
+    /// Create a provider for real transaction/block execution (writer precompiles enabled,
+    /// buffered in `journal` until the executor commits or discards them per tx).
+    pub fn new(spec: SpecId, journal: NativeStateOverlay, current_block: u64) -> Self {
+        Self::with_mode(spec, journal, current_block, false)
     }
 
     /// Create a provider for eth_call / eth_estimateGas simulation, where `read_only`
     /// denies writer precompiles (they would bypass the EVM sandbox and mutate the DB).
     pub fn with_mode(
         spec: SpecId,
-        state_db: &'a StateDb,
+        journal: NativeStateOverlay,
         current_block: u64,
         read_only: bool,
     ) -> Self {
         Self {
             eth: EthPrecompiles::new(spec),
-            state_db,
+            journal,
             current_block,
             read_only,
         }
     }
 }
 
-impl<CTX: ContextTr> PrecompileProvider<CTX> for TorusPrecompiles<'_> {
+impl<CTX: ContextTr> PrecompileProvider<CTX> for TorusPrecompiles {
     type Output = InterpreterResult;
 
     fn set_spec(&mut self, spec: <CTX::Cfg as Cfg>::Spec) -> bool {
@@ -100,7 +107,7 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for TorusPrecompiles<'_> {
                     &address,
                     input_bytes,
                     &inputs.caller,
-                    self.state_db,
+                    &self.journal,
                     self.current_block,
                 )
             } else {
@@ -108,7 +115,7 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for TorusPrecompiles<'_> {
                     &address,
                     input_bytes,
                     &inputs.caller,
-                    self.state_db,
+                    &self.journal,
                     self.current_block,
                 )
             }

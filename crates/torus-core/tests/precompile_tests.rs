@@ -5,7 +5,7 @@ use torus_core::error::CoreError;
 use torus_core::lockbox::Lockbox;
 use torus_core::position::{NativeBalance, Position, PositionManager};
 use torus_core::precompiles::*;
-use torus_state::StateDb;
+use torus_state::{NativeStateOverlay, StateDb};
 use torus_types::{Address, FixedPoint, MarketId, U256};
 
 // ============================================================================
@@ -483,6 +483,55 @@ fn core_writer_staking_delegate_queues_action() {
     assert_eq!(output[31], 1); // success
 
     assert_eq!(CoreWriterQueue::pending_count(&db, 51).unwrap(), 1);
+}
+
+// ============================================================================
+// T4.4: writer precompiles through a journaled overlay
+// ============================================================================
+
+/// T4.4 RED-FIRST: `execute_precompile` accepts any `StateBackend`, so writer side
+/// effects can buffer in a `NativeStateOverlay` journal — invisible to the base DB
+/// until commit (discard = revert), with read-your-writes sequence numbering.
+/// (Does not compile before T4.4: `execute_precompile` demanded a concrete `&StateDb`
+/// and the overlay had no `commit_tx`.)
+#[test]
+fn writer_precompile_journals_through_overlay() {
+    let (_dir, db) = setup();
+    let caller = addr(1);
+    let overlay = NativeStateOverlay::new(db.clone());
+
+    let address = precompile_address(ADDR_CORE_WRITER);
+    let input = build_input(
+        "placeOrder(bytes32,uint8,uint8,uint128,uint128,uint8)",
+        &[
+            encode_market_id(1),
+            abi::encode_u8(0),                          // Buy
+            abi::encode_u8(0),                          // Limit
+            abi::encode_u128(fp(50_000).raw() as u128), // price
+            abi::encode_u128(fp(5).raw() as u128),      // quantity
+            abi::encode_u8(0),                          // GTC
+        ],
+    );
+
+    // Two placeOrder calls in the same journal: read-your-writes gives seq 0 then 1.
+    // (order_id = (block+1) << 64 | seq, so the low 64 bits carry the sequence.)
+    let out0 = execute_precompile(&address, &input, &caller, &overlay, 100).unwrap();
+    let out1 = execute_precompile(&address, &input, &caller, &overlay, 100).unwrap();
+    let id0 = u128::from_be_bytes(out0[16..32].try_into().unwrap());
+    let id1 = u128::from_be_bytes(out1[16..32].try_into().unwrap());
+    assert_eq!(id0 & u64::MAX as u128, 0, "first enqueue gets seq 0");
+    assert_eq!(
+        id1 & u64::MAX as u128,
+        1,
+        "second enqueue must see the first one's journal write and get seq 1"
+    );
+
+    // Nothing durable yet — a discard here would be a clean revert.
+    assert_eq!(CoreWriterQueue::pending_count(&db, 101).unwrap(), 0);
+
+    // Commit (= calling tx succeeded): both actions become durable, in order.
+    overlay.commit_tx(&db).unwrap();
+    assert_eq!(CoreWriterQueue::pending_count(&db, 101).unwrap(), 2);
 }
 
 // ============================================================================
