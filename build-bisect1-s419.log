@@ -1,0 +1,253 @@
+   Compiling torus-types v0.1.0 (/tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/b487b463-3064-4bde-bdb9-4fb28565f781/scratchpad/bisect1/crates/torus-types)
+   Compiling torus-telemetry v0.1.0 (/tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/b487b463-3064-4bde-bdb9-4fb28565f781/scratchpad/bisect1/crates/torus-telemetry)
+   Compiling hotstuff_rs v0.4.0 (/tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/b487b463-3064-4bde-bdb9-4fb28565f781/scratchpad/bisect1/crates/hotstuff_rs)
+warning: unused import: `is_proposer`
+  --> crates/hotstuff_rs/src/hotstuff/implementation.rs:36:33
+   |
+36 |         roles::{is_phase_voter, is_proposer, new_view_recipients_with_reputation},
+   |                                 ^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `0` is never read
+   --> crates/hotstuff_rs/src/pacemaker/implementation.rs:722:21
+    |
+722 |     UpdateViewError(UpdateViewError),
+    |     --------------- ^^^^^^^^^^^^^^^
+    |     |
+    |     field in this variant
+    |
+    = note: `PacemakerError` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+help: consider changing the field to be of unit type to suppress this warning while preserving the field numbering, or remove the field
+    |
+722 -     UpdateViewError(UpdateViewError),
+722 +     UpdateViewError(()),
+    |
+
+warning: field `0` is never read
+   --> crates/hotstuff_rs/src/pacemaker/implementation.rs:725:21
+    |
+725 |     ExtendViewError(ExtendViewError),
+    |     --------------- ^^^^^^^^^^^^^^^
+    |     |
+    |     field in this variant
+    |
+    = note: `PacemakerError` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+help: consider changing the field to be of unit type to suppress this warning while preserving the field numbering, or remove the field
+    |
+725 -     ExtendViewError(ExtendViewError),
+725 +     ExtendViewError(()),
+    |
+
+warning: field `0` is never read
+   --> crates/hotstuff_rs/src/pacemaker/implementation.rs:728:20
+    |
+728 |     BlockTreeError(BlockTreeError),
+    |     -------------- ^^^^^^^^^^^^^^
+    |     |
+    |     field in this variant
+    |
+    = note: `PacemakerError` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+help: consider changing the field to be of unit type to suppress this warning while preserving the field numbering, or remove the field
+    |
+728 -     BlockTreeError(BlockTreeError),
+728 +     BlockTreeError(()),
+    |
+
+warning: fields `cur_view` and `next_view` are never read
+   --> crates/hotstuff_rs/src/pacemaker/implementation.rs:756:9
+    |
+754 |     NonIncreasingViewError {
+    |     ---------------------- fields in this variant
+755 |         /// The current view.
+756 |         cur_view: ViewNumber,
+    |         ^^^^^^^^
+...
+759 |         next_view: ViewNumber,
+    |         ^^^^^^^^^
+    |
+    = note: `UpdateViewError` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: field `view` is never read
+   --> crates/hotstuff_rs/src/pacemaker/implementation.rs:765:27
+    |
+765 |     GetViewTimeoutError { view: ViewNumber },
+    |     -------------------   ^^^^
+    |     |
+    |     field in this variant
+    |
+    = note: `UpdateViewError` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: field `view` is never read
+   --> crates/hotstuff_rs/src/pacemaker/implementation.rs:772:33
+    |
+772 |     TriedToExtendNonEpochView { view: ViewNumber },
+    |     -------------------------   ^^^^
+    |     |
+    |     field in this variant
+    |
+    = note: `ExtendViewError` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+   Compiling torus-state v0.1.0 (/tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/b487b463-3064-4bde-bdb9-4fb28565f781/scratchpad/bisect1/crates/torus-state)
+warning: field `view` is never read
+   --> crates/hotstuff_rs/src/pacemaker/implementation.rs:775:27
+    |
+775 |     GetViewTimeoutError { view: ViewNumber },
+    |     -------------------   ^^^^
+    |     |
+    |     field in this variant
+    |
+    = note: `ExtendViewError` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: methods `pending_body` and `take_pending_body` are never used
+   --> crates/hotstuff_rs/src/hotstuff/implementation.rs:180:19
+    |
+104 | impl<N: Network> HotStuff<N> {
+    | ---------------------------- methods in this implementation
+...
+180 |     pub(crate) fn pending_body(&self, hash: &CryptoHash) -> Option<&Block> {
+    |                   ^^^^^^^^^^^^
+...
+184 |     pub(crate) fn take_pending_body(&mut self, hash: &CryptoHash) -> Option<Block> {
+    |                   ^^^^^^^^^^^^^^^^^
+
+warning: field `0` is never read
+    --> crates/hotstuff_rs/src/hotstuff/implementation.rs:1959:20
+     |
+1959 |     BlockTreeError(BlockTreeError),
+     |     -------------- ^^^^^^^^^^^^^^
+     |     |
+     |     field in this variant
+     |
+     = note: `HotStuffError` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+help: consider changing the field to be of unit type to suppress this warning while preserving the field numbering, or remove the field
+     |
+1959 -     BlockTreeError(BlockTreeError),
+1959 +     BlockTreeError(()),
+     |
+
+warning: field `0` is never read
+   --> crates/hotstuff_rs/src/block_sync/client.rs:771:20
+    |
+771 |     BlockTreeError(BlockTreeError),
+    |     -------------- ^^^^^^^^^^^^^^
+    |     |
+    |     field in this variant
+    |
+    = note: `BlockSyncClientError` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+help: consider changing the field to be of unit type to suppress this warning while preserving the field numbering, or remove the field
+    |
+771 -     BlockTreeError(BlockTreeError),
+771 +     BlockTreeError(()),
+    |
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+  --> crates/hotstuff_rs/src/types/update_sets.rs:72:20
+   |
+72 |     pub fn inserts(&self) -> hash_map::Iter<K, V> {
+   |                    ^^^^^     ^^^^^^^^^^^^^^^^^^^^ the same lifetime is hidden here
+   |                    |
+   |                    the lifetime is elided here
+   |
+   = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+   = note: `#[warn(mismatched_lifetime_syntaxes)]` on by default
+help: use `'_` for type paths
+   |
+72 |     pub fn inserts(&self) -> hash_map::Iter<'_, K, V> {
+   |                                             +++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+  --> crates/hotstuff_rs/src/types/update_sets.rs:77:20
+   |
+77 |     pub fn deletes(&self) -> hash_set::Iter<K> {
+   |                    ^^^^^     ^^^^^^^^^^^^^^^^^ the same lifetime is hidden here
+   |                    |
+   |                    the lifetime is elided here
+   |
+   = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+   |
+77 |     pub fn deletes(&self) -> hash_set::Iter<'_, K> {
+   |                                             +++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> crates/hotstuff_rs/src/types/validator_set.rs:121:23
+    |
+121 |     pub fn validators(&self) -> slice::Iter<VerifyingKey> {
+    |                       ^^^^^     ^^^^^^^^^^^^^^^^^^^^^^^^^ the same lifetime is hidden here
+    |                       |
+    |                       the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+    |
+121 |     pub fn validators(&self) -> slice::Iter<'_, VerifyingKey> {
+    |                                             +++
+
+warning: eliding a lifetime that's named elsewhere is confusing
+  --> crates/hotstuff_rs/src/block_tree/pluggables.rs:29:49
+   |
+29 |     fn snapshot<'b>(&'b self) -> Self::Snapshot<'_>;
+   |                      --                         ^^ the same lifetime is elided here
+   |                      |
+   |                      the lifetime is named here
+   |
+   = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: consistently use `'b`
+   |
+29 -     fn snapshot<'b>(&'b self) -> Self::Snapshot<'_>;
+29 +     fn snapshot<'b>(&'b self) -> Self::Snapshot<'b>;
+   |
+
+   Compiling torus-economics v0.1.0 (/tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/b487b463-3064-4bde-bdb9-4fb28565f781/scratchpad/bisect1/crates/torus-economics)
+   Compiling torus-mempool v0.1.0 (/tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/b487b463-3064-4bde-bdb9-4fb28565f781/scratchpad/bisect1/crates/torus-mempool)
+   Compiling torus-network v0.1.0 (/tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/b487b463-3064-4bde-bdb9-4fb28565f781/scratchpad/bisect1/crates/torus-network)
+warning: `hotstuff_rs` (lib) generated 15 warnings (run `cargo fix --lib -p hotstuff_rs` to apply 5 suggestions)
+warning: unused variable: `sender`
+   --> crates/torus-mempool/src/lib.rs:226:13
+    |
+226 |         let sender = entry.sender;
+    |             ^^^^^^ help: if this is intentional, prefix it with an underscore: `_sender`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `len` is never used
+  --> crates/torus-mempool/src/verified_cache.rs:86:12
+   |
+32 | impl<K: Hash + Eq + Clone, V: Clone> FifoCache<K, V> {
+   | ---------------------------------------------------- method in this implementation
+...
+86 |     pub fn len(&self) -> usize {
+   |            ^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+   Compiling torus-core v0.1.0 (/tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/b487b463-3064-4bde-bdb9-4fb28565f781/scratchpad/bisect1/crates/torus-core)
+warning: `torus-mempool` (lib) generated 2 warnings (run `cargo fix --lib -p torus-mempool` to apply 1 suggestion)
+   Compiling torus-evm v0.1.0 (/tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/b487b463-3064-4bde-bdb9-4fb28565f781/scratchpad/bisect1/crates/torus-evm)
+   Compiling torus-genesis v0.1.0 (/tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/b487b463-3064-4bde-bdb9-4fb28565f781/scratchpad/bisect1/crates/torus-genesis)
+   Compiling torus-bridge v0.1.0 (/tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/b487b463-3064-4bde-bdb9-4fb28565f781/scratchpad/bisect1/crates/torus-bridge)
+warning: function `set_receipt_metadata` is never used
+   --> crates/torus-bridge/src/proposer.rs:268:4
+    |
+268 | fn set_receipt_metadata(
+    |    ^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+   Compiling torus-rpc v0.1.0 (/tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/b487b463-3064-4bde-bdb9-4fb28565f781/scratchpad/bisect1/crates/torus-rpc)
+   Compiling torus-consensus v0.1.0 (/tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/b487b463-3064-4bde-bdb9-4fb28565f781/scratchpad/bisect1/crates/torus-consensus)
+warning: function `verify_one_action` is never used
+   --> crates/torus-rpc/src/torus.rs:297:15
+    |
+297 | pub(crate) fn verify_one_action(
+    |               ^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `torus-bridge` (lib) generated 1 warning
+   Compiling bench-throughput v0.1.0 (/tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/b487b463-3064-4bde-bdb9-4fb28565f781/scratchpad/bisect1/tools/bench-throughput)
+warning: `torus-rpc` (lib) generated 1 warning
+   Compiling torus-node v0.1.0 (/tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/b487b463-3064-4bde-bdb9-4fb28565f781/scratchpad/bisect1/crates/torus-node)
+    Finished `release` profile [optimized] target(s) in 5m 55s

@@ -5,6 +5,7 @@
 //! per-block incremental path (`incremental_evm_root`, Task A1.3) builds on the same cursor
 //! factories from `trie_cursor`.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 
 use alloy_primitives::{keccak256, Address, B256, U256};
@@ -12,7 +13,7 @@ use reth_primitives_traits::Account;
 use reth_trie::hashed_cursor::HashedPostStateCursorFactory;
 use reth_trie::prefix_set::{PrefixSetMut, TriePrefixSetsMut};
 use reth_trie::StateRoot;
-use reth_trie_common::updates::TrieUpdates;
+pub use reth_trie_common::updates::TrieUpdates;
 use reth_trie_common::{HashedPostState, KeccakKeyHasher};
 use revm::database::BundleState;
 use revm::state::AccountInfo;
@@ -23,6 +24,22 @@ use crate::db::{decode_account_info, encode_account_info, storage_key, StateDb, 
 use crate::error::StateError;
 use crate::trie::{compute_state_root, compute_storage_root, TrieAccount, EMPTY_ROOT_HASH};
 use crate::trie_cursor::{write_trie_updates, RocksHashedCursorFactory, RocksTrieCursorFactory};
+
+thread_local! {
+    /// Node-local diagnostic: per-thread count of per-block EVM `StateRoot` engine runs
+    /// ([`incremental_evm_root`] plus [`resync_evm_accounts`]' repair pass). Test hook for the
+    /// T4.1 "root computed exactly once per committed block" guarantee — never consensus-visible.
+    static EVM_ROOT_ENGINE_RUNS: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Current thread's EVM `StateRoot` engine-run count (see `EVM_ROOT_ENGINE_RUNS`).
+pub fn evm_root_engine_runs() -> u64 {
+    EVM_ROOT_ENGINE_RUNS.with(|c| c.get())
+}
+
+fn note_engine_run() {
+    EVM_ROOT_ENGINE_RUNS.with(|c| c.set(c.get() + 1));
+}
 
 /// Storage key in `CF_HASHED_STORAGE`: keccak(address)(32) ++ keccak(slot)(32).
 fn hashed_storage_key(hashed_address: &B256, hashed_slot: &B256) -> [u8; 64] {
@@ -239,6 +256,7 @@ pub fn incremental_evm_root(
         HashedPostStateCursorFactory::new(RocksHashedCursorFactory::new(db), &sorted);
     let trie_factory = RocksTrieCursorFactory::new(db);
 
+    note_engine_run();
     StateRoot::new(trie_factory, hashed_factory)
         .with_prefix_sets(prefix_sets)
         .root_with_updates()
@@ -352,11 +370,20 @@ pub fn apply_bundle_hashed(
 /// Crash-consistent: plain state (`CF_ACCOUNTS`/`CF_STORAGE`), the hashed mirror (`CF_HASHED_*`),
 /// and the trie nodes (`CF_TRIE_*`) all land together or not at all. The root + `TrieUpdates` are
 /// computed over the committed base BEFORE the batch is written (no mid-commit mutation).
+///
+/// T4.1: `precomputed` reuses a `(root, TrieUpdates)` pair from an earlier
+/// [`incremental_evm_root`] run on the SAME bundle over the SAME committed base (the catchup
+/// validator's single run, plumbed through `ValidatedBlock`) so the committed-block path never
+/// recomputes the root; `None` computes it here as before.
 pub fn commit_evm_bundle_incremental(
     db: &StateDb,
     bundle: &BundleState,
+    precomputed: Option<(B256, TrieUpdates)>,
 ) -> Result<B256, StateError> {
-    let (root, trie_updates) = incremental_evm_root(db, bundle)?;
+    let (root, trie_updates) = match precomputed {
+        Some(pair) => pair,
+        None => incremental_evm_root(db, bundle)?,
+    };
     let mut batch = WriteBatch::default();
     apply_bundle_plain(db, &mut batch, bundle)?;
     apply_bundle_hashed(db, &mut batch, bundle)?;
@@ -374,24 +401,45 @@ pub fn commit_evm_bundle_incremental(
 /// `HashedStorage` entries). Reads the FINAL `CF_ACCOUNTS` value (EIP-161: empty -> deleted) for
 /// each address. Without this, `CF_HASHED_*`/`CF_TRIE_*` drift from `CF_ACCOUNTS` after every
 /// fee-bearing block and the incremental root diverges from the full scan (devnet-smoke finding).
+///
+/// T4.1: the dirty list is conservative — `seed_from_bundle` marks every EVM-bundle account dirty
+/// in the overlay, so most entries were already synced by [`commit_evm_bundle_incremental`].
+/// Accounts whose `CF_HASHED_ACCOUNTS` mirror already byte-equals their final plain value are
+/// skipped (mirror and trie advance in one atomic batch, so mirror-equal implies trie-equal); when
+/// nothing genuinely drifted there is NO third `StateRoot` engine run at all.
 pub fn resync_evm_accounts(db: &StateDb, addresses: &[Address]) -> Result<(), StateError> {
     let unique: std::collections::BTreeSet<Address> = addresses.iter().copied().collect();
     if unique.is_empty() {
         return Ok(());
     }
 
+    let cf_acc = db.cf_handle(CF_HASHED_ACCOUNTS)?;
     let mut hashed = HashedPostState::default();
+    let mut mirror_writes: Vec<(B256, Option<[u8; 72]>)> = Vec::new();
     for addr in &unique {
         let hashed_address = keccak256(addr.as_slice());
-        let account = match db.get_account(addr)? {
-            Some(info) if !is_empty_account(&info) => Some(Account::from(&info)),
+        let live = match db.get_account(addr)? {
+            Some(info) if !is_empty_account(&info) => Some(info),
             _ => None,
         };
-        hashed.accounts.insert(hashed_address, account);
+        let encoded = live.as_ref().map(encode_account_info);
+        let mirrored = db.get_cf_raw(CF_HASHED_ACCOUNTS, hashed_address.as_slice())?;
+        if mirrored.as_deref() == encoded.as_ref().map(|e| e.as_slice()) {
+            // Already in sync — the incremental commit covered this account.
+            continue;
+        }
+        hashed
+            .accounts
+            .insert(hashed_address, live.as_ref().map(Account::from));
+        mirror_writes.push((hashed_address, encoded));
+    }
+    if mirror_writes.is_empty() {
+        return Ok(());
     }
 
     let prefix_sets = hashed.construct_prefix_sets().freeze();
     let sorted = hashed.into_sorted();
+    note_engine_run();
     let (_root, trie_updates) = StateRoot::new(
         RocksTrieCursorFactory::new(db),
         HashedPostStateCursorFactory::new(RocksHashedCursorFactory::new(db), &sorted),
@@ -401,20 +449,10 @@ pub fn resync_evm_accounts(db: &StateDb, addresses: &[Address]) -> Result<(), St
     .map_err(|e| StateError::InvalidData(format!("resync evm accounts: {e}")))?;
 
     let mut batch = WriteBatch::default();
-    let cf_acc = db.cf_handle(CF_HASHED_ACCOUNTS)?;
-    for addr in &unique {
-        let hashed_address = keccak256(addr.as_slice());
-        match db.get_account(addr)? {
-            Some(info) if !is_empty_account(&info) => {
-                batch.put_cf(
-                    cf_acc,
-                    hashed_address.as_slice(),
-                    encode_account_info(&info),
-                );
-            }
-            _ => {
-                batch.delete_cf(cf_acc, hashed_address.as_slice());
-            }
+    for (hashed_address, encoded) in &mirror_writes {
+        match encoded {
+            Some(bytes) => batch.put_cf(cf_acc, hashed_address.as_slice(), bytes),
+            None => batch.delete_cf(cf_acc, hashed_address.as_slice()),
         }
     }
     write_trie_updates(db, &mut batch, &trie_updates)?;
@@ -741,7 +779,7 @@ mod tests {
             let db = StateDb::open(&path).expect("open db");
             seed(&db);
             build_trie_to_cf(&db).expect("migration");
-            let root = commit_evm_bundle_incremental(&db, &bundle).expect("commit");
+            let root = commit_evm_bundle_incremental(&db, &bundle, None).expect("commit");
             assert_eq!(
                 incremental_evm_root(&db, &empty()).unwrap().0,
                 root,
@@ -832,7 +870,7 @@ mod tests {
                 "round {round}: incremental != full over evolved base (PRE-commit oracle check)"
             );
 
-            commit_evm_bundle_incremental(&db, &bundle).expect("commit");
+            commit_evm_bundle_incremental(&db, &bundle, None).expect("commit");
 
             // And the committed trie itself stays consistent.
             let incremental = incremental_evm_root(&db, &empty()).unwrap().0;
@@ -858,7 +896,7 @@ mod tests {
         let bundle = BundleState::builder(0..=0)
             .state_present_account_info(user, eoa(500_000, 3))
             .build();
-        commit_evm_bundle_incremental(&db, &bundle).expect("commit");
+        commit_evm_bundle_incremental(&db, &bundle, None).expect("commit");
 
         // Simulate native post-commit: credit EVM balances DIRECTLY to CF_ACCOUNTS, bypassing the
         // trie (exactly what NativeStateOverlay::flush does for treasury/dev_pool fee distribution).
@@ -880,6 +918,132 @@ mod tests {
             incremental_evm_root(&db, &empty()).unwrap().0,
             full_post_bundle_evm_root(&db, &empty()).unwrap(),
             "after resync: incremental must equal full scan"
+        );
+    }
+
+    /// T4.1 RED-first: given the validator's precomputed `(root, TrieUpdates)` pair, the commit
+    /// must NOT run the `StateRoot` engine a second time — and the committed trie must be
+    /// byte-identical to the compute-inside-commit path.
+    ///
+    /// RED on the pre-T4.1 behavior: the commit unconditionally recomputed
+    /// `incremental_evm_root` (engine-run delta 1, not 0).
+    #[test]
+    fn commit_reuses_precomputed_pair_without_second_engine_run() {
+        use super::evm_root_engine_runs;
+        let (db, _dir) = temp_db();
+        seed(&db);
+        build_trie_to_cf(&db).expect("migration");
+
+        let user = address!("0000000000000000000000000000000000000001");
+        let bundle = BundleState::builder(0..=0)
+            .state_present_account_info(user, eoa(9_999, 5))
+            .build();
+
+        // The single validation-time run (what validate_block_for_catchup plumbs through).
+        let pair = incremental_evm_root(&db, &bundle).expect("validator run");
+        let expected_root = pair.0;
+
+        let before = evm_root_engine_runs();
+        let root = commit_evm_bundle_incremental(&db, &bundle, Some(pair)).expect("commit");
+        assert_eq!(
+            evm_root_engine_runs() - before,
+            0,
+            "commit must reuse the precomputed pair, not rerun the StateRoot engine"
+        );
+        assert_eq!(root, expected_root);
+
+        // Committed trie is consistent: the determinism ORACLE still holds post-commit.
+        let empty = || BundleState::builder(0..=0).build();
+        assert_eq!(incremental_evm_root(&db, &empty()).unwrap().0, root);
+        assert_eq!(full_post_bundle_evm_root(&db, &empty()).unwrap(), root);
+    }
+
+    /// T4.1 determinism: committing with the reused pair must leave the DB root-identical to the
+    /// old 3x path (commit-recompute + conservative resync of every bundle account) on the same
+    /// fixed bundle over the same seeded base.
+    #[test]
+    fn precomputed_commit_root_identical_to_recompute_path() {
+        use super::resync_evm_accounts;
+        let user = address!("0000000000000000000000000000000000000001");
+        let fixed_bundle = || {
+            BundleState::builder(0..=0)
+                .state_present_account_info(user, eoa(777_000, 4))
+                .build()
+        };
+        let empty = || BundleState::builder(0..=0).build();
+
+        // Path A (new): one engine run at "validation", pair reused by the commit.
+        let (db_a, _dir_a) = temp_db();
+        seed(&db_a);
+        build_trie_to_cf(&db_a).expect("migration");
+        let pair = incremental_evm_root(&db_a, &fixed_bundle()).expect("validator run");
+        let root_a =
+            commit_evm_bundle_incremental(&db_a, &fixed_bundle(), Some(pair)).expect("commit A");
+
+        // Path B (old 3x): commit recomputes, then the conservative resync re-walks the bundle
+        // account (exactly what app.rs did via seed_from_bundle -> dirty_evm_accounts).
+        let (db_b, _dir_b) = temp_db();
+        seed(&db_b);
+        build_trie_to_cf(&db_b).expect("migration");
+        let root_b = commit_evm_bundle_incremental(&db_b, &fixed_bundle(), None).expect("commit B");
+        resync_evm_accounts(&db_b, &[user]).expect("resync B");
+
+        assert_eq!(root_a, root_b, "reused-pair commit root != recompute root");
+        assert_eq!(
+            incremental_evm_root(&db_a, &empty()).unwrap().0,
+            incremental_evm_root(&db_b, &empty()).unwrap().0,
+            "committed tries diverged between the once and 3x paths"
+        );
+        assert_eq!(
+            full_post_bundle_evm_root(&db_a, &empty()).unwrap(),
+            full_post_bundle_evm_root(&db_b, &empty()).unwrap(),
+        );
+    }
+
+    /// T4.1 RED-first: resyncing accounts the commit already synced (the conservative
+    /// `seed_from_bundle` dirty list) must be a no-op — no third `StateRoot` engine run. A
+    /// genuinely drifted account (native bypass write) still gets exactly one repair run.
+    ///
+    /// RED on the pre-T4.1 behavior: `resync_evm_accounts` always ran the engine over every
+    /// listed account (engine-run delta 1 for the no-drift call, not 0).
+    #[test]
+    fn resync_skips_engine_when_accounts_already_synced() {
+        use super::{evm_root_engine_runs, resync_evm_accounts};
+        let (db, _dir) = temp_db();
+        seed(&db);
+        build_trie_to_cf(&db).expect("migration");
+
+        let user = address!("0000000000000000000000000000000000000001");
+        let bundle = BundleState::builder(0..=0)
+            .state_present_account_info(user, eoa(500_000, 3))
+            .build();
+        commit_evm_bundle_incremental(&db, &bundle, None).expect("commit");
+
+        // Already synced by the commit — the conservative dirty list must cost no engine run.
+        let before = evm_root_engine_runs();
+        resync_evm_accounts(&db, &[user]).expect("resync (no drift)");
+        assert_eq!(
+            evm_root_engine_runs() - before,
+            0,
+            "no-drift resync must not run the StateRoot engine"
+        );
+
+        // A native-style bypass write still gets exactly one repair run over the drifted subset.
+        let treasury = address!("f000000000000000000000000000000000000001");
+        db.put_account(&treasury, &eoa(123_456, 0)).unwrap();
+        let before = evm_root_engine_runs();
+        resync_evm_accounts(&db, &[user, treasury]).expect("resync (repair)");
+        assert_eq!(
+            evm_root_engine_runs() - before,
+            1,
+            "drifted account must trigger exactly one repair run"
+        );
+
+        let empty = || BundleState::builder(0..=0).build();
+        assert_eq!(
+            incremental_evm_root(&db, &empty()).unwrap().0,
+            full_post_bundle_evm_root(&db, &empty()).unwrap(),
+            "after filtered resync: incremental must equal full scan"
         );
     }
 

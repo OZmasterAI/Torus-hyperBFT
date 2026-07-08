@@ -11,6 +11,7 @@ use revm::state::AccountInfo;
 
 use torus_state::db::StateDb;
 use torus_state::error::StateError;
+use torus_state::incremental::TrieUpdates;
 use torus_state::trie::{
     compute_composite_root, compute_state_root, compute_storage_root, TrieAccount, EMPTY_ROOT_HASH,
 };
@@ -29,18 +30,22 @@ fn incremental_state_root_enabled() -> bool {
 
 /// EVM post-bundle root honoring the incremental flag. Split out with an explicit `incremental`
 /// param so both paths are unit-testable without touching process env.
+///
+/// T4.1: also surfaces the incremental engine's [`TrieUpdates`] so the ONE validation-time
+/// computation can be reused by `commit_evm_bundle_incremental` (plumbed via `ValidatedBlock`);
+/// the full-scan fallback yields `None`.
 fn evm_root_routed(
     state_db: &StateDb,
     bundle: &BundleState,
     incremental: bool,
-) -> Result<B256, StateError> {
+) -> Result<(B256, Option<TrieUpdates>), StateError> {
     // Fall back to the full scan when incremental is off OR the persistent trie hasn't been built
     // yet (an unmigrated DB — production builds it at boot, but unit tests may bypass that). This
     // keeps default-on safe: a missing trie yields the correct full-scan root, never a wrong one.
     if !incremental || !torus_state::incremental::is_trie_built(state_db)? {
-        return compute_post_bundle_evm_root(state_db, bundle);
+        return Ok((compute_post_bundle_evm_root(state_db, bundle)?, None));
     }
-    let (root, _updates) = torus_state::incremental::incremental_evm_root(state_db, bundle)?;
+    let (root, updates) = torus_state::incremental::incremental_evm_root(state_db, bundle)?;
     // Runtime determinism oracle: under debug or TORUS_INCREMENTAL_ORACLE, cross-check against the
     // full scan and fail loudly on any divergence (a consensus-splitting bug) rather than voting it.
     if cfg!(debug_assertions) || std::env::var("TORUS_INCREMENTAL_ORACLE").is_ok() {
@@ -51,11 +56,14 @@ fn evm_root_routed(
             )));
         }
     }
-    Ok(root)
+    Ok((root, Some(updates)))
 }
 
 /// EVM post-bundle root, routed by the runtime flag ([`incremental_state_root_enabled`]).
-fn flagged_evm_root(state_db: &StateDb, bundle: &BundleState) -> Result<B256, StateError> {
+fn flagged_evm_root(
+    state_db: &StateDb,
+    bundle: &BundleState,
+) -> Result<(B256, Option<TrieUpdates>), StateError> {
     evm_root_routed(state_db, bundle, incremental_state_root_enabled())
 }
 
@@ -97,8 +105,22 @@ pub fn compute_post_bundle_state_root(
     state_db: &StateDb,
     bundle: &BundleState,
 ) -> Result<B256, StateError> {
-    let evm_root = flagged_evm_root(state_db, bundle)?;
-    Ok(compute_composite_root(evm_root, EMPTY_ROOT_HASH))
+    Ok(compute_post_bundle_state_root_with_updates(state_db, bundle)?.0)
+}
+
+/// [`compute_post_bundle_state_root`] variant that also surfaces the incremental engine's
+/// `(evm_root, TrieUpdates)` pair when it ran (T4.1). The pair is reusable by
+/// `commit_evm_bundle_incremental` for the SAME bundle over the SAME committed base, so the
+/// committed-block path computes the EVM root exactly once.
+pub fn compute_post_bundle_state_root_with_updates(
+    state_db: &StateDb,
+    bundle: &BundleState,
+) -> Result<(B256, Option<(B256, TrieUpdates)>), StateError> {
+    let (evm_root, updates) = flagged_evm_root(state_db, bundle)?;
+    Ok((
+        compute_composite_root(evm_root, EMPTY_ROOT_HASH),
+        updates.map(|u| (evm_root, u)),
+    ))
 }
 
 /// Compute the composite state root (EVM + native) with an explicit native root.
@@ -110,8 +132,22 @@ pub fn compute_full_composite_root(
     bundle: &BundleState,
     native_root: B256,
 ) -> Result<B256, StateError> {
-    let evm_root = flagged_evm_root(state_db, bundle)?;
-    Ok(compute_composite_root(evm_root, native_root))
+    Ok(compute_full_composite_root_with_updates(state_db, bundle, native_root)?.0)
+}
+
+/// [`compute_full_composite_root`] variant surfacing the incremental engine's
+/// `(evm_root, TrieUpdates)` pair when it ran — the native-pipeline twin of
+/// [`compute_post_bundle_state_root_with_updates`] (T4.1).
+pub fn compute_full_composite_root_with_updates(
+    state_db: &StateDb,
+    bundle: &BundleState,
+    native_root: B256,
+) -> Result<(B256, Option<(B256, TrieUpdates)>), StateError> {
+    let (evm_root, updates) = flagged_evm_root(state_db, bundle)?;
+    Ok((
+        compute_composite_root(evm_root, native_root),
+        updates.map(|u| (evm_root, u)),
+    ))
 }
 
 /// Compute a native state root by hashing key native column families.
@@ -305,11 +341,18 @@ mod tests {
             )
             .build();
 
-        let full = evm_root_routed(&db, &bundle, false).unwrap();
-        let incremental = evm_root_routed(&db, &bundle, true).unwrap();
+        let (full, full_updates) = evm_root_routed(&db, &bundle, false).unwrap();
+        let (incremental, incr_updates) = evm_root_routed(&db, &bundle, true).unwrap();
         assert_eq!(
             full, incremental,
             "bridge routing: incremental EVM root must equal full scan"
+        );
+        // T4.1: the incremental path must surface its TrieUpdates for commit-time reuse;
+        // the full scan has none to offer.
+        assert!(full_updates.is_none(), "full-scan path yields no updates");
+        assert!(
+            incr_updates.is_some(),
+            "incremental path must surface TrieUpdates for reuse"
         );
     }
 }

@@ -5,13 +5,15 @@ use alloy_primitives::{Address, B256};
 use revm::database::BundleState;
 
 use torus_evm::{BlockEnvCfg, EvmExecutor};
+use torus_state::incremental::TrieUpdates;
 use torus_state::{StateDb, StateOverlay};
 use torus_types::{NativeAction, Receipt, TorusBlock};
 
 use crate::decode::{decode_all_txs, decode_txs_lossy, DecodedTx};
 use crate::error::BridgeError;
 use crate::state_root::{
-    compute_full_composite_root, compute_post_bundle_state_root, flagged_native_root,
+    compute_full_composite_root_with_updates, compute_post_bundle_state_root,
+    compute_post_bundle_state_root_with_updates, flagged_native_root,
 };
 
 /// Successfully validated block — ready for commitment.
@@ -23,6 +25,11 @@ pub struct ValidatedBlock {
     pub bundle: BundleState,
     /// Computed state root (matches the block header).
     pub state_root: B256,
+    /// EVM `(root, TrieUpdates)` pair from this validation's single incremental StateRoot run
+    /// (T4.1) — `Some` only when the incremental engine produced it (flag on + trie built).
+    /// Reused by `commit_evm_bundle_incremental` so the committed-block path never recomputes
+    /// the root. Node-local; never serialized or consensus-visible.
+    pub evm_root_updates: Option<(B256, TrieUpdates)>,
     /// Recovered (sender, action) pairs for post-commit native execution.
     pub native_sender_actions: Vec<(Address, NativeAction)>,
     /// Consumed nonces for post-commit persistence.
@@ -181,7 +188,8 @@ impl BlockValidator {
         }
 
         let root_timer = std::time::Instant::now();
-        let computed_root = compute_post_bundle_state_root(state_db, &exec_result.bundle)?;
+        let (computed_root, evm_root_updates) =
+            compute_post_bundle_state_root_with_updates(state_db, &exec_result.bundle)?;
         if let Some(ref m) = self.metrics {
             m.state_root_compute_seconds
                 .observe(root_timer.elapsed().as_secs_f64());
@@ -198,6 +206,7 @@ impl BlockValidator {
             receipts: exec_result.receipts,
             bundle: exec_result.bundle,
             state_root: computed_root,
+            evm_root_updates,
             native_sender_actions: vec![],
             native_consumed_nonces: vec![],
         })
@@ -299,6 +308,9 @@ impl BlockValidator {
             receipts: exec_result.receipts,
             bundle: exec_result.bundle,
             state_root: computed_root,
+            // Root computed over the MERGED multi-block bundle — its TrieUpdates are not
+            // reusable for a single-block commit.
+            evm_root_updates: None,
             native_sender_actions: vec![],
             native_consumed_nonces: vec![],
         })
@@ -440,8 +452,8 @@ impl BlockValidator {
         // Compute composite state root (lagged native root — reads unmodified DB).
         let root_timer = std::time::Instant::now();
         let native_root = flagged_native_root(state_db)?;
-        let computed_root =
-            compute_full_composite_root(state_db, &exec_result.bundle, native_root)?;
+        let (computed_root, evm_root_updates) =
+            compute_full_composite_root_with_updates(state_db, &exec_result.bundle, native_root)?;
         if let Some(ref m) = self.metrics {
             m.state_root_compute_seconds
                 .observe(root_timer.elapsed().as_secs_f64());
@@ -458,6 +470,7 @@ impl BlockValidator {
             receipts: exec_result.receipts,
             bundle: exec_result.bundle,
             state_root: computed_root,
+            evm_root_updates,
             native_sender_actions: sender_actions,
             native_consumed_nonces: consumed_nonces,
         })

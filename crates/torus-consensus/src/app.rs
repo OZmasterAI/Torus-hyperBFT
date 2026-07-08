@@ -265,6 +265,10 @@ impl ExecutionContext {
                 Ok(validated) => {
                     computed_fee_revenue =
                         torus_bridge::proposer::compute_fee_revenue(&validated.receipts);
+                    // T4.1: reuse the validation-time (root, TrieUpdates) pair — computed by the
+                    // ONE StateRoot run inside validate_block_for_catchup over this same committed
+                    // base — so the commit never recomputes the EVM root for this block.
+                    let precomputed_root = validated.evm_root_updates;
                     // Phase A: commit EVM plain state + the hashed mirror + the incremental trie
                     // nodes in ONE atomic batch, so CF_HASHED_*/CF_TRIE_* stay in lockstep with
                     // CF_ACCOUNTS (keeps the incremental root's base correct across restarts/replay).
@@ -273,6 +277,7 @@ impl ExecutionContext {
                     match torus_state::incremental::commit_evm_bundle_incremental(
                         &self.state_db,
                         &validated.bundle,
+                        precomputed_root,
                     ) {
                         Ok(_root) => {}
                         Err(e) => {

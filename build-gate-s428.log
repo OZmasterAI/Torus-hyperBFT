@@ -1,0 +1,94 @@
+=== CLIPPY START 11:59:06Z ===
+   |
+
+warning: manual implementation of an assign operation
+   --> crates/torus-integration-tests/tests/stress.rs:106:9
+    |
+106 |         total_available = total_available + bal.available;
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: replace it with: `total_available += bal.available`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.93.0/index.html#assign_op_pattern
+
+warning: manual implementation of an assign operation
+   --> crates/torus-integration-tests/tests/stress.rs:110:13
+    |
+110 |             total_unrealized = total_unrealized + pos.unrealized_pnl(mark_price);
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: replace it with: `total_unrealized += pos.unrealized_pnl(mark_price)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.93.0/index.html#assign_op_pattern
+
+warning: `torus-integration-tests` (test "stress") generated 7 warnings (3 duplicates) (run `cargo clippy --fix --test "stress" -p torus-integration-tests` to apply 4 suggestions)
+warning: length comparison to zero
+   --> crates/torus-genesis/src/lib.rs:748:17
+    |
+748 |         assert!(committed.len() > 0);
+    |                 ^^^^^^^^^^^^^^^^^^^ help: using `!is_empty` is clearer and more explicit: `!committed.is_empty()`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.93.0/index.html#len_zero
+    = note: `#[warn(clippy::len_zero)]` on by default
+
+warning: `torus-genesis` (lib test) generated 1 warning (run `cargo clippy --fix --lib -p torus-genesis --tests` to apply 1 suggestion)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3m 58s
+CLIPPY_RC=0
+=== NEXTEST START 12:03:07Z ===
+                                   at /home/crab/projects/Torus-hyperBFT/crates/hotstuff_rs/tests/progress_and_validator_set_update_test.rs:25:44
+      26:     0x5bf768e174a6 - core::ops::function::FnOnce::call_once::h025b62a50b1bf116
+                                   at /home/crab/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5
+      27:     0x5bf768e8838b - core::ops::function::FnOnce::call_once::h0217b30cfdee2e67
+                                   at /rustc/254b59607d4417e9dffbc307138ae5c86280fe4c/library/core/src/ops/function.rs:250:5
+      28:     0x5bf768e8838b - test::__rust_begin_short_backtrace::h6d98714a1e28f556
+                                   at /rustc/254b59607d4417e9dffbc307138ae5c86280fe4c/library/test/src/lib.rs:663:18
+      29:     0x5bf768e9bd1a - test::run_test_in_process::{{closure}}::he2c70d2634d3a3cc
+                                   at /rustc/254b59607d4417e9dffbc307138ae5c86280fe4c/library/test/src/lib.rs:686:74
+      30:     0x5bf768e9bd1a - <core::panic::unwind_safe::AssertUnwindSafe<F> as core::ops::function::FnOnce<()>>::call_once::h40a0a825bcf17fdd
+                                   at /rustc/254b59607d4417e9dffbc307138ae5c86280fe4c/library/core/src/panic/unwind_safe.rs:274:9
+      31:     0x5bf768e9bd1a - std::panicking::catch_unwind::do_call::h6c8eb5dd6e7b5975
+                                   at /rustc/254b59607d4417e9dffbc307138ae5c86280fe4c/library/std/src/panicking.rs:581:40
+      32:     0x5bf768e9bd1a - std::panicking::catch_unwind::h55455eac2972ad1e
+                                   at /rustc/254b59607d4417e9dffbc307138ae5c86280fe4c/library/std/src/panicking.rs:544:19
+      33:     0x5bf768e9bd1a - std::panic::catch_unwind::h0025465150a5e558
+                                   at /rustc/254b59607d4417e9dffbc307138ae5c86280fe4c/library/std/src/panic.rs:359:14
+      34:     0x5bf768e9bd1a - test::run_test_in_process::hb61e682f9b630fbc
+                                   at /rustc/254b59607d4417e9dffbc307138ae5c86280fe4c/library/test/src/lib.rs:686:27
+      35:     0x5bf768e9bd1a - test::run_test::{{closure}}::hc2c2a7a38ab176e2
+                                   at /rustc/254b59607d4417e9dffbc307138ae5c86280fe4c/library/test/src/lib.rs:607:43
+      36:     0x5bf768e75fb4 - test::run_test::{{closure}}::ha91867b85cd2a911
+                                   at /rustc/254b59607d4417e9dffbc307138ae5c86280fe4c/library/test/src/lib.rs:637:41
+      37:     0x5bf768e75fb4 - std::sys::backtrace::__rust_begin_short_backtrace::ha00a9fe02049c339
+                                   at /rustc/254b59607d4417e9dffbc307138ae5c86280fe4c/library/std/src/sys/backtrace.rs:160:18
+      38:     0x5bf768e798e2 - std::thread::lifecycle::spawn_unchecked::{{closure}}::{{closure}}::hd629fba9153dfb55
+                                   at /rustc/254b59607d4417e9dffbc307138ae5c86280fe4c/library/std/src/thread/lifecycle.rs:92:13
+      39:     0x5bf768e798e2 - <core::panic::unwind_safe::AssertUnwindSafe<F> as core::ops::function::FnOnce<()>>::call_once::h4189018816a5c5d9
+                                   at /rustc/254b59607d4417e9dffbc307138ae5c86280fe4c/library/core/src/panic/unwind_safe.rs:274:9
+      40:     0x5bf768e798e2 - std::panicking::catch_unwind::do_call::hf9fcdbca3c2e9877
+                                   at /rustc/254b59607d4417e9dffbc307138ae5c86280fe4c/library/std/src/panicking.rs:581:40
+      41:     0x5bf768e798e2 - std::panicking::catch_unwind::h97b92d88631c7c64
+                                   at /rustc/254b59607d4417e9dffbc307138ae5c86280fe4c/library/std/src/panicking.rs:544:19
+      42:     0x5bf768e798e2 - std::panic::catch_unwind::ha77cdbb68e725e5e
+                                   at /rustc/254b59607d4417e9dffbc307138ae5c86280fe4c/library/std/src/panic.rs:359:14
+      43:     0x5bf768e798e2 - std::thread::lifecycle::spawn_unchecked::{{closure}}::h511f05bc1a132253
+                                   at /rustc/254b59607d4417e9dffbc307138ae5c86280fe4c/library/std/src/thread/lifecycle.rs:90:26
+      44:     0x5bf768e798e2 - core::ops::function::FnOnce::call_once{{vtable.shim}}::h6b68b31e9b685cb8
+                                   at /rustc/254b59607d4417e9dffbc307138ae5c86280fe4c/library/core/src/ops/function.rs:250:5
+      45:     0x5bf768fe0a5f - <alloc::boxed::Box<F,A> as core::ops::function::FnOnce<Args>>::call_once::h22a27d165e4e871d
+                                   at /rustc/254b59607d4417e9dffbc307138ae5c86280fe4c/library/alloc/src/boxed.rs:2206:9
+      46:     0x5bf768fe0a5f - std::sys::thread::unix::Thread::new::thread_start::h45cc87bb053add0f
+                                   at /rustc/254b59607d4417e9dffbc307138ae5c86280fe4c/library/std/src/sys/thread/unix.rs:118:17
+      47:     0x749cfe09caa4 - <unknown>
+      48:     0x749cfe129c6c - <unknown>
+      49:                0x0 - <unknown>
+
+    thread 'progress_and_validator_set_update_test' (329953) panicked at library/core/src/panicking.rs:233:5:
+    panic in a destructor during cleanup
+    thread caused non-unwinding panic. aborting.
+
+    (test aborted with signal 6: SIGABRT)
+
+────────────
+     Summary [ 138.893s] 76/1075 tests run: 73 passed, 3 failed, 9 skipped
+  TRY 3 FAIL [   1.092s] (  69/1075) hotstuff_rs pacemaker::implementation::update_view_on_schedule_keeps_cumulative_deadline
+        FAIL [ 121.434s] (  75/1075) hotstuff_rs::block_sync_test block_sync_test
+     SIGABRT [ 135.430s] (  76/1075) hotstuff_rs::progress_and_validator_set_update_test progress_and_validator_set_update_test
+warning: 999/1075 tests were not run due to test failure (run with --no-fail-fast to run all tests, or run with --max-fail)
+error: test run failed
+NEXTEST_RC=100
