@@ -611,6 +611,32 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let network_for_fwd = network.clone();
     let network_for_evm_fwd = network.clone();
 
+    // 5c-fail-stop (P1(b)): watch the execution pipeline's fail-stop latch and
+    // turn it into real process termination. `TorusApp` SETs this shared flag
+    // (never clears it) when block execution dies — a panicked market worker,
+    // a fatal exec error, or a closed exec channel — after which the node must
+    // NOT keep producing, voting, or finalizing over frozen state. The latch was
+    // exposed via `exec_failed_handle()` but had no consumer repo-wide, so
+    // fail-stop was in-process only: consensus stopped advancing but the process
+    // never actually halted (no alert, no restart trigger). This lightweight
+    // poller (grabbed BEFORE the replica consumes `app` on `.app(app)`) logs a
+    // fatal line and exits non-zero so a supervisor can alert/restart the node.
+    let exec_failed = app.exec_failed_handle();
+    tokio::spawn(async move {
+        loop {
+            if exec_failed.load(std::sync::atomic::Ordering::SeqCst) {
+                error!(
+                    "FATAL: execution pipeline has died (fail-stop latch set) — \
+                     terminating node to avoid finalizing over frozen state"
+                );
+                // Let tracing flush the fatal line before the process goes away.
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                std::process::exit(70); // sysexits.h EX_SOFTWARE
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    });
+
     // 6. Consensus configuration
     // Leader-selection mode is consensus-critical: every validator must run the
     // same setting or replicas disagree on leaders and finalization halts.

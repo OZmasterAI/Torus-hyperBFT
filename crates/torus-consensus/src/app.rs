@@ -165,8 +165,37 @@ fn find_last_committed_height(state_db: &StateDb) -> Option<u64> {
     // 16-byte PRUNE_META_KEY (first byte 0x5F) in this CF, which sorts AFTER
     // every 8-byte BE height key — reading only the last key returned None
     // after the first prune, silently skipping crash-replay.
-    for entry in db.iterator_cf(cf, rocksdb::IteratorMode::End) {
-        let Ok((key, _)) = entry else { return None };
+    scan_last_committed_height(db.iterator_cf(cf, rocksdb::IteratorMode::End))
+}
+
+/// Core end-first scan for [`find_last_committed_height`], factored out so the
+/// skip-prune-meta and continue-past-error paths are unit-testable without a
+/// live RocksDB (which cannot be coerced into yielding an iterator `Err`).
+///
+/// P1(b): a transient RocksDB read error on ONE iterator entry must not abort
+/// the whole scan — aborting would mask a real committed height sitting BELOW
+/// the failing entry (end-first order) and silently skip crash-replay. So we
+/// log at warn and `continue`; only a scan that truly finds no 8-byte height
+/// key falls through to `None`.
+fn scan_last_committed_height<K, V, E>(
+    entries: impl IntoIterator<Item = Result<(K, V), E>>,
+) -> Option<u64>
+where
+    K: AsRef<[u8]>,
+    E: std::fmt::Display,
+{
+    for entry in entries {
+        let key = match entry {
+            Ok((key, _)) => key,
+            Err(e) => {
+                tracing::warn!(
+                    %e,
+                    "find_last_committed_height: transient iterator error, skipping entry"
+                );
+                continue;
+            }
+        };
+        let key = key.as_ref();
         if key.len() == 8 {
             return Some(u64::from_be_bytes(key[..8].try_into().ok()?));
         }
@@ -2411,6 +2440,57 @@ mod crash_recovery_tests {
             find_last_committed_height(&state_db),
             Some(7),
             "prune meta key in cf_block_headers must not mask the last committed height"
+        );
+    }
+
+    /// P1(b) RED-first: the end-first scan must SKIP the pruner's non-height
+    /// meta key AND CONTINUE past a transient iterator read error to still
+    /// surface the real committed height sitting below both.
+    ///
+    /// This drives `scan_last_committed_height` directly with a synthetic
+    /// end-first stream — a live RocksDB cannot be coerced into yielding an
+    /// iterator `Err`, so this is the only way to exercise the fault path.
+    ///
+    /// RED on pre-fix code: `find_last_committed_height` did
+    /// `let Ok((key, _)) = entry else { return None };` — the injected `Err`
+    /// aborted the whole scan and returned `None`, masking height 42 and
+    /// silently skipping crash-replay. GREEN after: the error is logged and
+    /// skipped, so the true height (42) is found.
+    #[test]
+    fn scan_last_committed_height_skips_meta_and_continues_past_error() {
+        // End-first order, as RocksDB's `IteratorMode::End` would yield:
+        //   1. the 16-byte prune meta key (sorts after every height) -> skip,
+        //   2. a transient read error                                -> warn+continue,
+        //   3. the real 8-byte committed height (42)                 -> return.
+        let empty: Box<[u8]> = Vec::new().into_boxed_slice();
+        let entries: Vec<Result<(Box<[u8]>, Box<[u8]>), String>> = vec![
+            Ok((PRUNE_META_KEY.to_vec().into_boxed_slice(), empty.clone())),
+            Err("injected transient rocksdb read error".to_string()),
+            Ok((42u64.to_be_bytes().to_vec().into_boxed_slice(), empty)),
+        ];
+
+        assert_eq!(
+            scan_last_committed_height(entries),
+            Some(42),
+            "scan must skip the meta key and continue past a read error to find the real height"
+        );
+    }
+
+    /// P1(b): a scan that finds no 8-byte height key (only a meta key and an
+    /// error) must return `None` — the continue-past-error path must not
+    /// invent a height where none exists.
+    #[test]
+    fn scan_last_committed_height_none_when_no_height_present() {
+        let empty: Box<[u8]> = Vec::new().into_boxed_slice();
+        let entries: Vec<Result<(Box<[u8]>, Box<[u8]>), String>> = vec![
+            Ok((PRUNE_META_KEY.to_vec().into_boxed_slice(), empty)),
+            Err("read error".to_string()),
+        ];
+
+        assert_eq!(
+            scan_last_committed_height(entries),
+            None,
+            "no genuine committed height exists, so the scan must return None"
         );
     }
 
