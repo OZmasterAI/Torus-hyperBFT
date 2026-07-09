@@ -113,6 +113,11 @@ pub struct Mempool {
     /// briefly and flushed as ONE `WriteBatch` (by size/age, and ALWAYS before
     /// selection or a DA read), instead of one RocksDB write per ingress body.
     da_pending: std::sync::Mutex<PendingDaMirrors>,
+    /// Count of coalesced DA-mirror flushes whose `put_batch` returned an error
+    /// (T2 hardening). The failed batch is re-queued to the front of `da_pending`
+    /// for a later flush to retry — never silently dropped — and this counter
+    /// surfaces the (rare) durability retries for ops/telemetry.
+    da_flush_failures: std::sync::atomic::AtomicU64,
     config: MempoolConfig,
     /// Current base fee in wei — the D4 admission/drain fee floor. Written from
     /// committed block headers; read on every add_evm_tx and drain.
@@ -155,6 +160,7 @@ impl Mempool {
                 actions: Vec::new(),
                 first_at: None,
             }),
+            da_flush_failures: std::sync::atomic::AtomicU64::new(0),
             config,
             current_base_fee: std::sync::atomic::AtomicU64::new(initial_base_fee),
             memory_used: std::sync::atomic::AtomicUsize::new(0),
@@ -446,29 +452,35 @@ impl Mempool {
         sender: alloy_primitives::Address,
         action: SignedNativeAction,
     ) -> Result<(), MempoolError> {
+        // DA store is DECOUPLED from the 60s nonce gate: a pushed/gossiped body is
+        // (or will be) block-referenced, so mirror it durably even when it is too
+        // stale for mempool admission -- otherwise the referencing block can never
+        // be reconstructed and consensus wedges (livelock root cause, mem 28e1a821).
+        // Mirror here (once) since the gossip-recover caller already mirrors before
+        // authenticating its claimed sender; admit_gossip itself no longer mirrors.
+        self.mirror_to_da(&action);
         // Sender is CLAIMED by the peer and NOT re-derived here -> not locally
         // verified; must never be short-circuited at exec.
         self.admit_gossip(sender, action, false)
     }
 
-    /// Shared gossip admission: durable DA mirror + nonce-window gate + pool insert
+    /// Shared gossip admission: nonce-window gate + batch-size guard + pool insert
     /// with the given provenance. `verified_locally` distinguishes the recover path
     /// (true, seeds the trust-cache) from the raw trusted path (false).
+    ///
+    /// The durable DA mirror is the CALLER's responsibility (each public entry
+    /// point mirrors the body exactly once, BEFORE authenticating/gating it) — so
+    /// this is not double-mirrored on the gossip-recover path, which already
+    /// mirrored before verifying the claimed sender.
     fn admit_gossip(
         &self,
         sender: alloy_primitives::Address,
         action: SignedNativeAction,
         verified_locally: bool,
     ) -> Result<(), MempoolError> {
-        // DA store is DECOUPLED from the 60s nonce gate: a pushed/gossiped body is
-        // (or will be) block-referenced, so mirror it durably even when it is too
-        // stale for mempool admission -- otherwise the referencing block can never
-        // be reconstructed and consensus wedges (livelock root cause, mem 28e1a821).
-        self.mirror_to_da(&action);
-
         // G1 defensive layer (O2): an oversize/empty batch must never enter
         // the POOL (an honest node must never SELECT it into a proposal). It
-        // is still DA-mirrored above: a malicious proposer may reference it,
+        // is still DA-mirrored by the caller: a malicious proposer may reference it,
         // and the block must stay reconstructable so the deterministic
         // exec-side skip can run (availability != validity, mem 28e1a821).
         // Covers every network ingest: gossip topic, pre-proposal full-body
@@ -663,6 +675,9 @@ impl Mempool {
         if let Some(actions) = flush {
             if let Err(e) = self.da_store.put_batch(&actions) {
                 tracing::error!("native DA store batch write failed: {e}");
+                // T2 hardening: a failed batch is re-queued, never dropped — its
+                // actions are still selectable and their bodies must stay durable.
+                self.requeue_failed_da_batch(actions);
             }
         }
     }
@@ -682,7 +697,41 @@ impl Mempool {
         };
         if let Err(e) = self.da_store.put_batch(&actions) {
             tracing::error!("native DA store batch write failed: {e}");
+            // T2 hardening: on a durable-write failure the taken batch would
+            // otherwise be lost while its pool entries stay selectable. Re-queue
+            // it (front, preserving age order) so a later flush retries.
+            self.requeue_failed_da_batch(actions);
         }
+    }
+
+    /// Re-queue a DA-mirror batch that failed to persist (`put_batch` Err) so a
+    /// later flush retries it, and bump the failure counter (T2 hardening).
+    ///
+    /// The failed batch is the OLDEST pending work, so it is spliced to the FRONT
+    /// of the buffer, ahead of anything mirrored since it was taken — preserving
+    /// arrival order. Guarantees the actions are never silently dropped while
+    /// their pool entries remain selectable (mem 28e1a821: a selected body must
+    /// stay reconstructable).
+    fn requeue_failed_da_batch(&self, mut actions: Vec<SignedNativeAction>) {
+        self.da_flush_failures
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if actions.is_empty() {
+            return;
+        }
+        let mut pending = self.da_pending.lock().unwrap();
+        // Prepend: `actions` (older) first, then whatever was buffered since.
+        actions.append(&mut pending.actions);
+        pending.actions = actions;
+        if pending.first_at.is_none() {
+            pending.first_at = Some(std::time::Instant::now());
+        }
+    }
+
+    /// Number of coalesced DA-mirror flushes that failed to persist and were
+    /// re-queued for retry (T2 hardening). Monotonic; 0 on a healthy store.
+    pub fn da_flush_failures(&self) -> u64 {
+        self.da_flush_failures
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Select native actions for a block proposal WITHOUT removing them.
@@ -1123,6 +1172,161 @@ mod tests {
         );
         pool.add_native_action_from_gossip(sender, at_cap).unwrap();
         assert_eq!(pool.native_pool_size(), 1);
+    }
+
+    /// P3 (T2 hardening, RED-first): a coalesced-flush `put_batch` failure must
+    /// NOT silently drop the taken batch — the actions are re-queued for a later
+    /// flush to retry, and the failure counter is bumped. On the old code the
+    /// `std::mem::take`n batch was lost on Err while its pool entries stayed
+    /// selectable (up to a batch of non-durable bodies).
+    #[test]
+    fn da_flush_failure_requeues_actions_and_bumps_counter() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state.clone(), MempoolConfig::default());
+        let raw_store = NativeDaStore::new(state);
+        let key = k256::ecdsa::SigningKey::from_slice(
+            &alloy_primitives::hex::decode(
+                "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let now = now_ms();
+        let action = torus_types::eip712::sign_native_action(
+            torus_types::NativeAction::ClaimRewards,
+            now,
+            &key,
+        );
+        let hash = torus_types::compute_action_hash(&action);
+
+        // Simulate a coalesced-flush put_batch failure: the taken batch is handed
+        // to the re-queue path instead of being dropped.
+        assert_eq!(pool.da_flush_failures(), 0);
+        pool.requeue_failed_da_batch(vec![action.clone()]);
+        assert_eq!(pool.da_flush_failures(), 1, "failure counter must bump");
+
+        // Not dropped: still buffered (not yet durable in the store)...
+        assert!(
+            raw_store.get(&hash).unwrap().is_none(),
+            "re-queued body must still be buffered, not lost"
+        );
+        // ...and a later successful flush retries it into the durable store.
+        pool.flush_da_mirrors();
+        assert!(
+            raw_store.get(&hash).unwrap().is_some(),
+            "re-queued body must be retried and persisted, never silently dropped"
+        );
+    }
+
+    /// The re-queued (failed) batch is the OLDEST pending work, so it must land at
+    /// the FRONT of the buffer, ahead of anything mirrored since it was taken —
+    /// arrival order preserved across the retry.
+    #[test]
+    fn da_flush_failure_requeues_ahead_of_newer_actions() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state, MempoolConfig::default());
+        let key = k256::ecdsa::SigningKey::from_slice(
+            &alloy_primitives::hex::decode(
+                "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let now = now_ms();
+        let older = torus_types::eip712::sign_native_action(
+            torus_types::NativeAction::ClaimRewards,
+            now,
+            &key,
+        );
+        let newer = torus_types::eip712::sign_native_action(
+            torus_types::NativeAction::ClaimRewards,
+            now + 1,
+            &key,
+        );
+        let older_hash = torus_types::compute_action_hash(&older);
+        let newer_hash = torus_types::compute_action_hash(&newer);
+
+        // Buffer a newer action normally (stays pending — below batch/age limits).
+        pool.mirror_to_da(&newer);
+        // A failed flush re-queues the older batch; it must land AHEAD of `newer`.
+        pool.requeue_failed_da_batch(vec![older]);
+
+        let pending = pool.da_pending.lock().unwrap();
+        let order: Vec<B256> = pending
+            .actions
+            .iter()
+            .map(torus_types::compute_action_hash)
+            .collect();
+        assert_eq!(
+            order,
+            vec![older_hash, newer_hash],
+            "failed (older) batch re-queues to the front, preserving arrival order"
+        );
+    }
+
+    /// P3 (T2 hardening): a single gossip ingest must buffer the body EXACTLY
+    /// once. The old code double-mirrored (outer `add_native_action_from_gossip`
+    /// + inner `admit_gossip`), buffering two copies of the same body.
+    #[test]
+    fn single_gossip_ingest_buffers_body_once() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state, MempoolConfig::default());
+        let key = k256::ecdsa::SigningKey::from_slice(
+            &alloy_primitives::hex::decode(
+                "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let now = now_ms();
+        let action = torus_types::eip712::sign_native_action(
+            torus_types::NativeAction::ClaimRewards,
+            now,
+            &key,
+        );
+        let sender = action.recover_sender().unwrap();
+
+        pool.add_native_action_from_gossip(sender, action).unwrap();
+
+        let pending = pool.da_pending.lock().unwrap();
+        assert_eq!(
+            pending.actions.len(),
+            1,
+            "a single gossip ingest must buffer the body exactly once (no double mirror)"
+        );
+    }
+
+    /// The gossip-TRUSTED path must also mirror exactly once — its mirror moved
+    /// from `admit_gossip` to the public entry point when the inner mirror was
+    /// removed, so it must neither double- nor zero-mirror.
+    #[test]
+    fn single_gossip_trusted_ingest_buffers_body_once() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state, MempoolConfig::default());
+        let key = k256::ecdsa::SigningKey::from_slice(
+            &alloy_primitives::hex::decode(
+                "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let now = now_ms();
+        let action = torus_types::eip712::sign_native_action(
+            torus_types::NativeAction::ClaimRewards,
+            now,
+            &key,
+        );
+        let sender = action.recover_sender().unwrap();
+
+        pool.add_native_action_from_gossip_trusted(sender, action)
+            .unwrap();
+
+        let pending = pool.da_pending.lock().unwrap();
+        assert_eq!(
+            pending.actions.len(),
+            1,
+            "a single gossip-trusted ingest must buffer the body exactly once"
+        );
     }
 
     #[test]
