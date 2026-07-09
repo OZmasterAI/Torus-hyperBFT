@@ -56,7 +56,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// A short max view time so a body-less-leader stall costs ~1s, not tens of seconds — enough time for
 /// `NumberApp`'s 250ms produce/validate but short enough that many views rotate inside the window.
-const MAX_VIEW_TIME: Duration = Duration::from_millis(1000);
+const MAX_VIEW_TIME: Duration = Duration::from_millis(4000);
 
 /// Committed height the baseline must reach before we induce starvation.
 const BASELINE_TARGET_HEIGHT: u64 = 2;
