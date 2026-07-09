@@ -892,6 +892,87 @@ fn block_execution_journals_writer_precompiles_per_tx() {
     );
 }
 
+/// Runtime bytecode for an OUTER contract A that forwards its calldata to `callee` via
+/// CALL, POPs (swallows) the sub-call's success flag — the raw-EVM equivalent of a
+/// Solidity `try { callee.foo() } catch {}` — then STOPs, so A itself returns success
+/// regardless of whether the inner call reverted.
+fn call_and_swallow_revert_code(callee: &Address) -> Vec<u8> {
+    #[rustfmt::skip]
+    let mut code = vec![
+        0x36,             // CALLDATASIZE
+        0x5f, 0x5f,       // PUSH0 PUSH0
+        0x37,             // CALLDATACOPY   mem[0..cds] = calldata
+        0x5f,             // PUSH0          retSize
+        0x5f,             // PUSH0          retOffset
+        0x36,             // CALLDATASIZE   argsSize
+        0x5f,             // PUSH0          argsOffset
+        0x5f,             // PUSH0          value
+        0x73,             // PUSH20         <callee address>
+    ];
+    code.extend_from_slice(callee.as_slice());
+    #[rustfmt::skip]
+    code.extend_from_slice(&[
+        0x5a,             // GAS
+        0xf1,             // CALL
+        0x50,             // POP            swallow success flag ("catch")
+        0x00,             // STOP           A returns success
+    ]);
+    code
+}
+
+/// T4.4 revert-safety — CAUGHT INNER-FRAME revert (prior-review finding C, RED).
+///
+/// Contract A CALLs sub-contract B, which invokes the CoreWriter precompile and then
+/// REVERTs; A swallows B's failure (the raw-EVM analogue of a Solidity try/catch) and
+/// STOPs, so the TOP-LEVEL transaction SUCCEEDS. B's native action was enqueued inside a
+/// reverted call frame, so it must NOT be durable despite the top-level success.
+///
+/// Before frame-level journaling the native override journal was a flat per-tx buffer with
+/// no call-frame checkpoints: the inner-frame write survived B's revert and was committed
+/// by the top-level success (pending_count == 1), corrupting native state. With per-frame
+/// checkpoint/revert it is discarded (== 0). This is the test that would have caught the bug.
+#[test]
+fn caught_inner_frame_revert_discards_writer_precompile_side_effects() {
+    let (_dir, db) = open_test_db();
+    let ten_eth = U256::from(10_000_000_000_000_000_000u128);
+    db.put_account(&ALICE, &test_account(ten_eth)).unwrap();
+
+    // B (inner): calls CoreWriter, then PUSH0 PUSH0 REVERT.
+    let inner = Address::new([0xB0; 20]);
+    install_contract(&db, &inner, &core_writer_proxy_code(&[0x5f, 0x5f, 0xfd]));
+    // A (outer): CALLs B, swallows the revert, STOPs (success).
+    let outer = Address::new([0xA0; 20]);
+    install_contract(&db, &outer, &call_and_swallow_revert_code(&inner));
+
+    let block_cfg = default_block_cfg(); // number = 1
+    let tx = TxEnv {
+        caller: ALICE,
+        gas_limit: 1_000_000,
+        gas_price: block_cfg.base_fee as u128,
+        kind: TxKind::Call(outer),
+        value: U256::ZERO,
+        data: Bytes::from(cancel_order_calldata(42)),
+        nonce: 0,
+        chain_id: Some(TORUS_CHAIN_ID),
+        ..Default::default()
+    };
+
+    let executor = EvmExecutor::new(TORUS_CHAIN_ID);
+    let (result, _bundle) = executor.execute_tx(&db, &block_cfg, tx).unwrap();
+    assert!(
+        result.success,
+        "outer contract swallows the inner revert and STOPs => top-level success"
+    );
+
+    // The inner frame that enqueued the CoreWriter action REVERTED, so — despite the
+    // top-level success — the native side effect must have been rolled back with it.
+    assert_eq!(
+        CoreWriterQueue::pending_count(&db, block_cfg.number + 1).unwrap(),
+        0,
+        "native write from a caught inner-frame revert must not be durable"
+    );
+}
+
 /// Convenience module for hex decoding in tests.
 mod hex {
     pub fn decode(s: &str) -> Result<Vec<u8>, String> {

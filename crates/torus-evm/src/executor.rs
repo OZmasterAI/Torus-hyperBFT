@@ -3,8 +3,9 @@ use revm::context::result::{EVMError, ExecutionResult, HaltReason, Output};
 use revm::context::{BlockEnv as RevmBlockEnv, TxEnv};
 use revm::database::states::bundle_state::BundleRetention;
 use revm::database::{BundleState, State};
+use revm::interpreter::{CallInputs, CallOutcome, CreateInputs, CreateOutcome};
 use revm::primitives::hardfork::SpecId;
-use revm::{Context, ExecuteCommitEvm, MainBuilder, MainContext};
+use revm::{Context, InspectCommitEvm, Inspector, MainBuilder, MainContext};
 
 use crate::precompile_provider::TorusPrecompiles;
 
@@ -16,6 +17,57 @@ use crate::error::EvmError;
 
 /// Torus mainnet chain ID.
 pub const TORUS_CHAIN_ID: u64 = 7778;
+
+/// T4.4 revert-safety: mirrors revm's call-frame checkpoint/commit/revert lifecycle onto
+/// the writer-precompile journal.
+///
+/// Writer precompiles (CoreWriter / Lockbox) buffer their native writes in a shared
+/// [`NativeStateOverlay`] journal. revm rolls back EVM state on a frame revert but knows
+/// nothing about that journal, so a native write made inside a CAUGHT inner-frame revert
+/// (a Solidity try/catch around a sub-call) would otherwise survive into the top-level tx
+/// commit and corrupt native state (prior-review finding C).
+///
+/// By opening a journal checkpoint on every CALL/CREATE frame entry and committing or
+/// reverting it on frame exit according to the frame's outcome, native side effects
+/// participate in exactly the same revert boundaries as EVM state. The journal is shared
+/// (Arc-backed clone) with the [`TorusPrecompiles`] provider and the executor, so all three
+/// observe the same buffer.
+struct NativeJournalInspector {
+    journal: NativeStateOverlay,
+}
+
+impl<CTX> Inspector<CTX> for NativeJournalInspector {
+    fn call(&mut self, _context: &mut CTX, _inputs: &mut CallInputs) -> Option<CallOutcome> {
+        self.journal.checkpoint();
+        None
+    }
+
+    fn call_end(&mut self, _context: &mut CTX, _inputs: &CallInputs, outcome: &mut CallOutcome) {
+        if outcome.result.result.is_ok() {
+            self.journal.commit_checkpoint();
+        } else {
+            self.journal.revert_to_checkpoint();
+        }
+    }
+
+    fn create(&mut self, _context: &mut CTX, _inputs: &mut CreateInputs) -> Option<CreateOutcome> {
+        self.journal.checkpoint();
+        None
+    }
+
+    fn create_end(
+        &mut self,
+        _context: &mut CTX,
+        _inputs: &CreateInputs,
+        outcome: &mut CreateOutcome,
+    ) {
+        if outcome.result.result.is_ok() {
+            self.journal.commit_checkpoint();
+        } else {
+            self.journal.revert_to_checkpoint();
+        }
+    }
+}
 
 /// Default block gas limit (30M).
 pub const DEFAULT_BLOCK_GAS_LIMIT: u64 = 30_000_000;
@@ -150,14 +202,18 @@ impl EvmExecutor {
         // succeeds, so an EVM revert also reverts native side effects.
         let journal = NativeStateOverlay::new(state_db.clone());
         let mut evm = ctx
-            .build_mainnet()
+            .build_mainnet_with_inspector(NativeJournalInspector {
+                journal: journal.clone(),
+            })
             .with_precompiles(TorusPrecompiles::with_mode(
                 SpecId::CANCUN,
                 journal.clone(),
                 block_cfg.number,
                 call_mode,
             ));
-        let result = evm.transact_commit(tx).map_err(map_evm_err)?;
+        // T4.4: run via the inspector path so `NativeJournalInspector` sees every call frame
+        // and can checkpoint/revert the writer-precompile journal at frame boundaries.
+        let result = evm.inspect_tx_commit(tx).map_err(map_evm_err)?;
 
         // T4.4: persist journaled precompile writes only on tx success (never in call
         // mode, where writer precompiles are denied and the journal stays empty).
@@ -210,11 +266,15 @@ impl EvmExecutor {
         // StateDb only when the tx succeeds, discarded on revert/halt. Applied-write
         // ordering for successful txs matches the pre-journal direct-write behavior.
         let journal = NativeStateOverlay::new(state_db.clone());
-        let mut evm = ctx.build_mainnet().with_precompiles(TorusPrecompiles::new(
-            SpecId::CANCUN,
-            journal.clone(),
-            block_cfg.number,
-        ));
+        let mut evm = ctx
+            .build_mainnet_with_inspector(NativeJournalInspector {
+                journal: journal.clone(),
+            })
+            .with_precompiles(TorusPrecompiles::new(
+                SpecId::CANCUN,
+                journal.clone(),
+                block_cfg.number,
+            ));
 
         let mut receipts = Vec::with_capacity(transactions.len());
         let mut cumulative_gas: u64 = 0;
@@ -226,7 +286,9 @@ impl EvmExecutor {
             let max_fee = tx.gas_price;
             let priority_fee = tx.gas_priority_fee;
 
-            let result = match evm.transact_commit(tx) {
+            // T4.4: inspector path so writer-precompile side effects are checkpointed
+            // per call frame (caught inner-frame reverts roll back their native writes).
+            let result = match evm.inspect_tx_commit(tx) {
                 Ok(r) => r,
                 Err(EVMError::Transaction(tx_err)) if skip_invalid => {
                     tracing::warn!(idx, ?tx_err, "skipping invalid tx during block proposal");
@@ -347,11 +409,15 @@ impl EvmExecutor {
         // read/write native state against the underlying `state_db` (the overlay base),
         // exactly as before — but durably only when the calling tx succeeds.
         let journal = NativeStateOverlay::new(overlay.base().clone());
-        let mut evm = ctx.build_mainnet().with_precompiles(TorusPrecompiles::new(
-            SpecId::CANCUN,
-            journal.clone(),
-            block_cfg.number,
-        ));
+        let mut evm = ctx
+            .build_mainnet_with_inspector(NativeJournalInspector {
+                journal: journal.clone(),
+            })
+            .with_precompiles(TorusPrecompiles::new(
+                SpecId::CANCUN,
+                journal.clone(),
+                block_cfg.number,
+            ));
 
         let mut receipts = Vec::with_capacity(transactions.len());
         let mut cumulative_gas: u64 = 0;
@@ -363,7 +429,9 @@ impl EvmExecutor {
             let max_fee = tx.gas_price;
             let priority_fee = tx.gas_priority_fee;
 
-            let result = match evm.transact_commit(tx) {
+            // T4.4: inspector path so writer-precompile side effects are checkpointed
+            // per call frame (caught inner-frame reverts roll back their native writes).
+            let result = match evm.inspect_tx_commit(tx) {
                 Ok(r) => r,
                 Err(EVMError::Transaction(tx_err)) if skip_invalid => {
                     tracing::warn!(idx, ?tx_err, "skipping invalid tx during block proposal");

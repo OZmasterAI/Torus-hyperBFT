@@ -196,9 +196,41 @@ impl StateBackend for StateDb {
 // NativeStateOverlay — in-memory pending map + RocksDB fallthrough
 // ============================================================================
 
+/// One recorded native-write mutation plus the prior state needed to undo it — an
+/// entry in [`NativeStateOverlay`]'s call-frame undo trail (T4.4 revert-safety).
+struct JournalEntry {
+    map_key: (String, Vec<u8>),
+    /// Value previously held in `writes` for `map_key` (`None` if it was absent).
+    prev_write: Option<Vec<u8>>,
+    /// Whether `map_key` was previously tombstoned in `deletes`.
+    prev_deleted: bool,
+}
+
 struct PendingState {
     writes: BTreeMap<(String, Vec<u8>), Vec<u8>>,
     deletes: HashSet<(String, Vec<u8>)>,
+    /// T4.4: append-only undo trail for writer-precompile side effects. `checkpoints`
+    /// holds savepoint lengths into this log so a call frame that reverts can roll its
+    /// native writes back (see [`NativeStateOverlay::checkpoint`]).
+    journal_log: Vec<JournalEntry>,
+    checkpoints: Vec<usize>,
+}
+
+impl PendingState {
+    /// Record the pre-mutation state of `map_key` so any open checkpoint can undo it.
+    /// No-op when no checkpoint is active — tx-scope writes made outside any EVM call
+    /// frame are reverted wholesale via [`NativeStateOverlay::discard_tx`], so they need
+    /// no per-mutation trail (and we avoid growing the log on that path).
+    fn record(&mut self, map_key: &(String, Vec<u8>)) {
+        if self.checkpoints.is_empty() {
+            return;
+        }
+        self.journal_log.push(JournalEntry {
+            map_key: map_key.clone(),
+            prev_write: self.writes.get(map_key).cloned(),
+            prev_deleted: self.deletes.contains(map_key),
+        });
+    }
 }
 
 #[derive(Clone)]
@@ -214,6 +246,8 @@ impl NativeStateOverlay {
             pending: Arc::new(RwLock::new(PendingState {
                 writes: BTreeMap::new(),
                 deletes: HashSet::new(),
+                journal_log: Vec::new(),
+                checkpoints: Vec::new(),
             })),
         }
     }
@@ -243,6 +277,10 @@ impl NativeStateOverlay {
     pub fn commit_tx(&self, target: &StateDb) -> Result<(), StateError> {
         let mut state = self.pending.write().unwrap();
         if state.writes.is_empty() && state.deletes.is_empty() {
+            // Per-tx reset even on the empty path: the frame checkpoint stack must not
+            // leak across transactions (see `checkpoint`).
+            state.journal_log.clear();
+            state.checkpoints.clear();
             return Ok(());
         }
         let db = target.inner();
@@ -261,6 +299,8 @@ impl NativeStateOverlay {
         target.write(batch)?;
         state.writes.clear();
         state.deletes.clear();
+        state.journal_log.clear();
+        state.checkpoints.clear();
         Ok(())
     }
 
@@ -270,6 +310,60 @@ impl NativeStateOverlay {
         let mut state = self.pending.write().unwrap();
         state.writes.clear();
         state.deletes.clear();
+        state.journal_log.clear();
+        state.checkpoints.clear();
+    }
+
+    /// T4.4 revert-safety: open a call-frame checkpoint over the writer-precompile journal.
+    ///
+    /// The EVM executor drives one checkpoint per revm CALL/CREATE frame (via an
+    /// inspector): a checkpoint is opened on frame entry and, on frame exit, either
+    /// [`commit_checkpoint`](Self::commit_checkpoint) (the frame succeeded — its native
+    /// writes flow up to the parent) or [`revert_to_checkpoint`](Self::revert_to_checkpoint)
+    /// (the frame reverted/halted — its native writes are dropped). This makes a native
+    /// side effect enqueued inside a CAUGHT inner-frame revert (e.g. a Solidity try/catch
+    /// around a sub-call) roll back even when the top-level transaction succeeds.
+    pub fn checkpoint(&self) {
+        let mut state = self.pending.write().unwrap();
+        let len = state.journal_log.len();
+        state.checkpoints.push(len);
+    }
+
+    /// T4.4: close the innermost checkpoint, keeping its native writes (they merge into the
+    /// enclosing frame's scope). When no checkpoint remains the undo trail is dead weight,
+    /// so it is cleared to bound memory — the surviving writes live in `writes`/`deletes`.
+    pub fn commit_checkpoint(&self) {
+        let mut state = self.pending.write().unwrap();
+        state.checkpoints.pop();
+        if state.checkpoints.is_empty() {
+            state.journal_log.clear();
+        }
+    }
+
+    /// T4.4: roll the journal back to the innermost checkpoint, undoing every native write
+    /// made since it was opened (including inner frames that had committed up into it). A
+    /// no-op if no checkpoint is open.
+    pub fn revert_to_checkpoint(&self) {
+        let mut state = self.pending.write().unwrap();
+        let Some(target) = state.checkpoints.pop() else {
+            return;
+        };
+        while state.journal_log.len() > target {
+            let entry = state.journal_log.pop().unwrap();
+            match entry.prev_write {
+                Some(v) => {
+                    state.writes.insert(entry.map_key.clone(), v);
+                }
+                None => {
+                    state.writes.remove(&entry.map_key);
+                }
+            }
+            if entry.prev_deleted {
+                state.deletes.insert(entry.map_key);
+            } else {
+                state.deletes.remove(&entry.map_key);
+            }
+        }
     }
 
     /// Pre-populate CF_ACCOUNTS from an EVM BundleState so that native execution
@@ -415,6 +509,7 @@ impl StateBackend for NativeStateOverlay {
     fn put_cf_raw(&self, cf: &str, key: &[u8], value: &[u8]) -> Result<(), StateError> {
         let mut state = self.pending.write().unwrap();
         let map_key = (cf.to_string(), key.to_vec());
+        state.record(&map_key);
         state.deletes.remove(&map_key);
         state.writes.insert(map_key, value.to_vec());
         Ok(())
@@ -423,6 +518,7 @@ impl StateBackend for NativeStateOverlay {
     fn delete_cf_raw(&self, cf: &str, key: &[u8]) -> Result<(), StateError> {
         let mut state = self.pending.write().unwrap();
         let map_key = (cf.to_string(), key.to_vec());
+        state.record(&map_key);
         state.writes.remove(&map_key);
         state.deletes.insert(map_key);
         Ok(())
@@ -473,11 +569,13 @@ impl StateBackend for NativeStateOverlay {
             match op {
                 AtomicWriteOp::Put { cf, key, value } => {
                     let map_key = (cf.to_string(), key.to_vec());
+                    state.record(&map_key);
                     state.deletes.remove(&map_key);
                     state.writes.insert(map_key, value.to_vec());
                 }
                 AtomicWriteOp::Delete { cf, key } => {
                     let map_key = (cf.to_string(), key.to_vec());
+                    state.record(&map_key);
                     state.writes.remove(&map_key);
                     state.deletes.insert(map_key);
                 }
@@ -745,5 +843,98 @@ mod tests {
             crate::native_trie::native_root_full(&db).unwrap()
         );
         assert_ne!(persisted, crate::trie::EMPTY_ROOT_HASH);
+    }
+
+    /// T4.4 revert-safety: reverting to a checkpoint rolls native writes made in the frame
+    /// back to their pre-checkpoint state (overwrites restored, fresh keys removed).
+    #[test]
+    fn checkpoint_revert_rolls_back_writes() {
+        let (db, _dir) = temp_db();
+        let cf = CF_NATIVE_BALANCES;
+        let overlay = NativeStateOverlay::new(db);
+
+        StateBackend::put_cf_raw(&overlay, cf, b"k", b"base").unwrap();
+        overlay.checkpoint();
+        StateBackend::put_cf_raw(&overlay, cf, b"k", b"inner").unwrap();
+        StateBackend::put_cf_raw(&overlay, cf, b"new", b"x").unwrap();
+        // Read-your-writes holds INSIDE the frame.
+        assert_eq!(
+            StateBackend::get_cf_raw(&overlay, cf, b"k").unwrap().unwrap(),
+            b"inner"
+        );
+
+        overlay.revert_to_checkpoint();
+        // Overwrite rolled back to the pre-checkpoint value; the fresh key is gone.
+        assert_eq!(
+            StateBackend::get_cf_raw(&overlay, cf, b"k").unwrap().unwrap(),
+            b"base"
+        );
+        assert!(StateBackend::get_cf_raw(&overlay, cf, b"new")
+            .unwrap()
+            .is_none());
+    }
+
+    /// T4.4: committing a checkpoint keeps the frame's native writes.
+    #[test]
+    fn checkpoint_commit_keeps_writes() {
+        let (db, _dir) = temp_db();
+        let cf = CF_NATIVE_BALANCES;
+        let overlay = NativeStateOverlay::new(db);
+
+        overlay.checkpoint();
+        StateBackend::put_cf_raw(&overlay, cf, b"k", b"v").unwrap();
+        overlay.commit_checkpoint();
+
+        assert_eq!(
+            StateBackend::get_cf_raw(&overlay, cf, b"k").unwrap().unwrap(),
+            b"v"
+        );
+    }
+
+    /// T4.4: an OUTER-frame revert must undo writes an inner frame had COMMITTED up into it
+    /// — the exact caught-inner-frame scenario (inner precompile-call frame returns Ok, its
+    /// enqueuing outer frame then reverts).
+    #[test]
+    fn nested_checkpoint_outer_revert_undoes_committed_inner() {
+        let (db, _dir) = temp_db();
+        let cf = CF_NATIVE_BALANCES;
+        let overlay = NativeStateOverlay::new(db);
+
+        overlay.checkpoint(); // outer frame A
+        StateBackend::put_cf_raw(&overlay, cf, b"a", b"1").unwrap();
+        overlay.checkpoint(); // inner frame B (e.g. a precompile call)
+        StateBackend::put_cf_raw(&overlay, cf, b"b", b"2").unwrap();
+        overlay.commit_checkpoint(); // B returns Ok -> its write flows up to A
+        assert_eq!(
+            StateBackend::get_cf_raw(&overlay, cf, b"b").unwrap().unwrap(),
+            b"2"
+        );
+
+        overlay.revert_to_checkpoint(); // A reverts -> BOTH a and b undone
+        assert!(StateBackend::get_cf_raw(&overlay, cf, b"a")
+            .unwrap()
+            .is_none());
+        assert!(StateBackend::get_cf_raw(&overlay, cf, b"b")
+            .unwrap()
+            .is_none());
+    }
+
+    /// T4.4: `discard_tx` resets the checkpoint stack so no undo trail leaks into the next tx.
+    #[test]
+    fn discard_tx_clears_checkpoint_state() {
+        let (db, _dir) = temp_db();
+        let cf = CF_NATIVE_BALANCES;
+        let overlay = NativeStateOverlay::new(db);
+
+        overlay.checkpoint();
+        StateBackend::put_cf_raw(&overlay, cf, b"k", b"v").unwrap();
+        overlay.discard_tx();
+        assert_eq!(overlay.pending_write_count(), 0);
+
+        // A fresh checkpoint/revert cycle must start clean (no stale entries).
+        overlay.checkpoint();
+        StateBackend::put_cf_raw(&overlay, cf, b"k2", b"v2").unwrap();
+        overlay.revert_to_checkpoint();
+        assert_eq!(overlay.pending_write_count(), 0);
     }
 }
