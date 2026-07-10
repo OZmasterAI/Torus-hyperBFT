@@ -60,10 +60,11 @@ height() {  # committed height as decimal (0 on failure)
         | grep -oE '"result":"0x[0-9a-fA-F]+"' | grep -oE '0x[0-9a-fA-F]+' | head -1)
   [ -n "$hex" ] && printf '%d\n' "$hex" 2>/dev/null || echo 0
 }
-native_balance() {  # hex native_balance for an EVM address ($1); empty on failure/absent
+native_balance() {  # hex native balance for an EVM address ($1); empty on failure/absent
+  # RPC serializes RpcBalances in camelCase -> "nativeBalance"; accept snake_case too.
   curl -s --max-time 5 -X POST "$RPC" -H 'content-type: application/json' \
        -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"torus_getBalances\",\"params\":[\"$1\"]}" 2>/dev/null \
-    | grep -oE '"native_balance":"0x[0-9a-fA-F]+"' | grep -oE '0x[0-9a-fA-F]+' | head -1
+    | grep -oiE '"native_?balance":"0x[0-9a-fA-F]+"' | grep -oE '0x[0-9a-fA-F]+' | head -1
 }
 sender_addr() {  # derived EVM address for sender index $1, SAME key path the bench uses
   "$BIN" gen-accounts --offset "$1" --count 1 2>/dev/null | awk '{print $2; exit}'
