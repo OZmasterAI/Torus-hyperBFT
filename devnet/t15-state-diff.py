@@ -201,7 +201,13 @@ def main():
         "--require-height-equal",
         type=int,
         default=1,
-        help="1 = refuse to diff unless all node heads are equal (default)",
+        help="1 = run the native-state torn-read guard (re-read must be unchanged)",
+    )
+    ap.add_argument(
+        "--max-head-spread",
+        type=int,
+        default=25,
+        help="max tolerated empty-block head spread across nodes before INCONCLUSIVE",
     )
     ap.add_argument("--out", default="", help="optional path to also write the report")
     args = ap.parse_args()
@@ -244,18 +250,29 @@ def main():
             sys.exit(3)
     emit("heads: " + ", ".join("%s=%d" % (l, heads[l]) for l, _ in nodes))
     hset = set(heads.values())
-    if args.require_height_equal and len(hset) != 1:
+    spread = max(hset) - min(hset)
+    # This chain runs a HotStuff pacemaker: it commits EMPTY blocks forever, so the
+    # block height NEVER freezes even after the mempool drains. Requiring an
+    # identical, frozen height would make this diff impossible to ever run. What
+    # actually matters for a native-state diff is that no NATIVE action lands during
+    # the read window — enforced below by a per-node state RE-READ guard (a torn-read
+    # check on the native state itself, not on the empty-block height). So we tolerate
+    # a small empty-block head spread and only refuse an implausibly large one, which
+    # would indicate a genuinely stuck/lagging node rather than pacemaker skew.
+    emit("head spread: %d (min %d .. max %d)" % (spread, min(hset), max(hset)))
+    if spread > args.max_head_spread:
         emit(
-            "INCONCLUSIVE: node heads are not all equal (spread %d..%d) — a native"
-            % (min(hset), max(hset))
+            "INCONCLUSIVE: head spread %d exceeds --max-head-spread %d — a node is"
+            % (spread, args.max_head_spread)
         )
-        emit(
-            "  state diff across unequal heights is meaningless; caller must quiesce first."
-        )
+        emit("  lagging/stuck, not merely empty-block skew; re-quiesce and retry.")
         _flush(args.out, out_lines)
         sys.exit(3)
     diff_height = max(hset)
-    emit("diffing at common height %d" % diff_height)
+    emit(
+        "diffing near height %d (empty-block skew tolerated; native torn-read guarded)"
+        % diff_height
+    )
     emit("")
 
     try:
@@ -281,29 +298,31 @@ def main():
             _flush(args.out, out_lines)
             sys.exit(3)
 
-    # ---- 2b. re-check heights did not move mid-snapshot (torn read guard) ---
+    # ---- 2b. torn-read guard: re-read each node's native state and require it
+    # UNCHANGED. The chain keeps producing empty blocks, so we cannot key this on
+    # height; instead we verify the NATIVE STATE itself did not mutate during the read
+    # window (the only thing that can invalidate the diff). If any node's native
+    # snapshot changed between the two reads, a native action was still landing => the
+    # mempool had not fully drained => INCONCLUSIVE (caller re-quiesces and retries).
     if args.require_height_equal:
-        moved = []
+        changed = []
         for label, urlv in nodes:
             try:
-                h2 = head(urlv)
+                snap2, _ = snapshot_node(urlv, market_hint, traders)
             except Exception as e:  # noqa: BLE001
                 emit(
-                    "FATAL: node %s unreachable on post-snapshot recheck: %s"
-                    % (label, e)
+                    "FATAL: node %s unreachable on torn-read recheck: %s" % (label, e)
                 )
                 _flush(args.out, out_lines)
                 sys.exit(3)
-            if h2 != diff_height:
-                moved.append((label, h2))
-        if moved:
+            if snap2 != snaps[label]:
+                changed.append(label)
+        if changed:
             emit(
-                "INCONCLUSIVE: height advanced mid-snapshot (%s) — chain was not"
-                % ", ".join("%s->%d" % (l, h) for l, h in moved)
+                "INCONCLUSIVE: native state still mutating on %s during the read window"
+                % ", ".join(changed)
             )
-            emit(
-                "  quiesced; snapshot is a torn read across heights. Re-quiesce and retry."
-            )
+            emit("  (mempool had not fully drained) — re-quiesce and retry.")
             _flush(args.out, out_lines)
             sys.exit(3)
 

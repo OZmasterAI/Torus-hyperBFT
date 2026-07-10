@@ -175,7 +175,7 @@ node_head() { # $1 = rpc port -> committed head (or -1 on failure)
 try:
     print(int(json.load(sys.stdin)["result"],16))
 except Exception:
-    print(-1)' 2>/dev/null || echo -1
+    print(-1)' 2>/dev/null | tail -n1
 }
 
 # Head from any currently-live node (prefers V0, falls back through the survivors).

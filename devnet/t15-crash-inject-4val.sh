@@ -203,7 +203,7 @@ node_head() { # $1 = rpc port -> committed head (or -1 on failure)
 try:
     print(int(json.load(sys.stdin)["result"],16))
 except Exception:
-    print(-1)' 2>/dev/null || echo -1
+    print(-1)' 2>/dev/null | tail -n1
 }
 
 live_head() { # head from any currently-up node
@@ -481,31 +481,45 @@ sleep 5
 # The native diff is only valid at an equal, non-moving height (there is no
 # "state as of height h" read — every torus_* read is of the latest committed
 # state). Require QUIESCE_STABLE consecutive identical all-equal samples.
-log "=== QUIESCE: waiting for all up nodes to reach one stable height ==="
+log "=== QUIESCE: waiting for all up nodes to advance in lockstep ==="
+# This chain runs a HotStuff pacemaker: it commits EMPTY blocks forever, so the block
+# height NEVER freezes even after the mempool drains. Native state DOES freeze once no
+# more native/evm actions are committed. So do NOT wait for a frozen identical height
+# (unsatisfiable). Instead: (1) drain the mempool for a fixed window after load stop,
+# then (2) require the HEAD SPREAD (max-min across up nodes) to stay within QUIESCE_LAG
+# for QUIESCE_STABLE consecutive samples — i.e. every up node is caught up and the
+# nodes are advancing empty blocks together (a large/growing spread = a stuck/lagging
+# node). The authoritative "no native mutation during the read" check is the native
+# state RE-READ guard inside t15-state-diff.py, retried below on exit 3.
 QUIESCE_STABLE=${QUIESCE_STABLE:-3}
-DOWN_OK=0                                  # count nodes that are in accepted fail-stop
-for i in 0 1 2 3; do [ -f "$RUN_DIR/v$i.down" ] && DOWN_OK=$((DOWN_OK + 1)); done
-stable=0; last_sig=""; waited=0; quiesced=0
+QUIESCE_LAG=${QUIESCE_LAG:-25}
+DRAIN_SECS=${DRAIN_SECS:-75}
+log "draining mempool for ${DRAIN_SECS}s after load stop"
+sleep "$DRAIN_SECS"
+stable=0; waited=0; quiesced=0
 while [ "$waited" -lt "$QUIESCE_SECS" ]; do
-    sig=""; alleq=1; first=""
+    reach=1; mn=""; mx=""; sig=""
     for i in 0 1 2 3; do
         [ -f "$RUN_DIR/v$i.down" ] && continue
         h=$(node_head "${RPC_PORTS[$i]}")
-        [ "$h" -ge 0 ] || { alleq=0; break; }
-        if [ -z "$first" ]; then first=$h; elif [ "$h" != "$first" ]; then alleq=0; fi
+        [ "$h" -ge 0 ] || { reach=0; break; }
+        [ -z "$mn" ] && mn=$h
+        [ -z "$mx" ] && mx=$h
+        [ "$h" -lt "$mn" ] && mn=$h
+        [ "$h" -gt "$mx" ] && mx=$h
         sig+="v$i=$h "
     done
-    if [ "$alleq" = 1 ] && [ -n "$first" ] && [ "$sig" = "$last_sig" ]; then
+    if [ "$reach" = 1 ] && [ -n "$mn" ] && [ "$((mx - mn))" -le "$QUIESCE_LAG" ]; then
         stable=$((stable + 1))
-        [ "$stable" -ge "$QUIESCE_STABLE" ] && { quiesced=1; log "quiesced at stable height $first ($sig)"; break; }
+        log "quiesce sample: ${sig}(spread $((mx - mn)) <= $QUIESCE_LAG) [$stable/$QUIESCE_STABLE]"
+        [ "$stable" -ge "$QUIESCE_STABLE" ] && { quiesced=1; log "quiesced: all up nodes in lockstep ($sig)"; break; }
     else
         stable=0
     fi
-    last_sig="$sig"
     sleep 3; waited=$((waited + 3))
 done
 if [ "$quiesced" -ne 1 ]; then
-    log "RESULT: FAIL — nodes never settled to one stable height (cannot run a valid native diff)"
+    log "RESULT: FAIL — up nodes never converged to a bounded head spread (a node is stuck/lagging)"
     echo "1 t15 FAILED (no-quiesce)" >"$RUN_DIR/.done"
     exit 1
 fi
@@ -532,11 +546,21 @@ fi
 # NATIVE STATE DIFF — the whole point. Cross-check native state across up nodes.
 # ===========================================================================
 log "=== NATIVE STATE DIFF across $UP_COUNT up node(s): $UP_RPCS ==="
-python3 "$DEVNET_DIR/t15-state-diff.py" \
-    --rpc-urls "$UP_RPCS" \
-    --genesis "$RUN_DIR/genesis.json" \
-    --out "$RUN_DIR/state-diff-report.txt"
-DIFF_RC=$?
+# 0 = identical (PASS), 2 = diverged (FAIL) are final verdicts. 3 = inconclusive
+# (native torn read: an action was still landing) means the chain had not fully
+# drained — wait briefly and retry rather than fail spuriously.
+DIFF_TRIES=${DIFF_TRIES:-5}
+DIFF_RC=3
+for dtry in $(seq 1 "$DIFF_TRIES"); do
+    python3 "$DEVNET_DIR/t15-state-diff.py" \
+        --rpc-urls "$UP_RPCS" \
+        --genesis "$RUN_DIR/genesis.json" \
+        --out "$RUN_DIR/state-diff-report.txt"
+    DIFF_RC=$?
+    [ "$DIFF_RC" != 3 ] && break
+    log "native diff inconclusive (torn read) — attempt $dtry/$DIFF_TRIES, re-settling"
+    sleep 5
+done
 
 # ---- secondary signal: committed block-hash agreement (reuse t12 checker) ----
 FORK_RC="skipped"
