@@ -897,24 +897,57 @@ pub struct SignedNativeAction {
     pub signature: ActionSignature,
 }
 
-/// Deterministic hash of a signed native action for dedup and compact block references.
+/// Deterministic content address of a signed native action, used for dedup, DA
+/// keying, and compact-block references.
 ///
-/// Uses `NativeAction::canonical_bytes()` + nonce for collision resistance.
+/// Preimage = `NativeAction::canonical_bytes()` || `nonce` (be) || signature.
+///
+/// F-2 (consensus format change, fresh-genesis only): the signature bytes are
+/// bound into the preimage with a per-variant domain-separation tag. Before this,
+/// the hash omitted the signature, so two actions with an identical payload+nonce
+/// but different signatures collided under the same content address. A Byzantine
+/// peer answering a DA heal-pull could serve the committed payload+nonce with a
+/// swapped/invalid signature that still hash-matched the quorum-agreed reference,
+/// diverging the healing node's native state (missed slash or wrong sender). By
+/// committing to the full signed bytes, `compute_action_hash(swapped_body)` no
+/// longer equals the referenced hash, so the substituted body is rejected on
+/// reconstruction. This RE-KEYS every stored/dedup hash — all validators must run
+/// this build and relaunch on fresh genesis with wiped data dirs.
 pub fn compute_action_hash(action: &SignedNativeAction) -> B256 {
     let mut data = action.action.canonical_bytes();
     data.extend_from_slice(&action.nonce.to_be_bytes());
+    // Domain-separated signature commitment. The leading tag byte keeps the two
+    // variants' encodings disjoint so an EIP-712 action can never share a preimage
+    // with a session action.
+    match &action.signature {
+        ActionSignature::Eip712(sig) => {
+            data.push(0x00);
+            data.push(sig.v);
+            data.extend_from_slice(&sig.r);
+            data.extend_from_slice(&sig.s);
+        }
+        ActionSignature::Session {
+            session_pubkey,
+            sig,
+        } => {
+            data.push(0x01);
+            data.extend_from_slice(session_pubkey);
+            data.extend_from_slice(&sig.0);
+        }
+    }
     alloy_primitives::keccak256(&data)
 }
 
 /// Signature-committing key for the exec trust-cache, or `None` when the action
 /// is not eligible for caching.
 ///
-/// `compute_action_hash` deliberately OMITS the signature, so it must NOT key the
-/// trust-cache: two actions with the same payload+nonce but different signatures
-/// (recovering to different/invalid senders) would collide, letting a warm-cache
-/// node reuse a sender a cold-cache node would never recover — a consensus FORK
-/// (or a missed slash). This key commits to the full signature, so any signature
-/// difference yields a different key => cache MISS => full recover + slash (safe).
+/// This is kept DISTINCT from `compute_action_hash` (which, since F-2, also
+/// commits to the full signature) because the trust-cache must additionally
+/// EXCLUDE session actions: this key returns `None` for them so they are always
+/// fully re-verified. For EIP-712 actions it commits to the full signature, so
+/// any signature difference yields a different key => cache MISS => full recover +
+/// slash (safe); it never lets a warm-cache node reuse a sender a cold-cache node
+/// would not recover (a consensus FORK / missed slash).
 ///
 /// Only EIP-712 actions are cacheable: their sender is a pure, stateless function
 /// of the signature (`ecrecover`). A session action resolves through exec-time
@@ -1531,6 +1564,110 @@ mod tests {
             }),
         };
         assert_ne!(compute_action_hash(&a1), compute_action_hash(&a2));
+    }
+
+    /// F-2 (consensus format change): the content address MUST commit to the
+    /// signature. Two actions with an identical payload+nonce but different
+    /// EIP-712 signatures must hash DIFFERENTLY, otherwise a Byzantine peer can
+    /// substitute the signature bytes of a DA-fetched body under the same hash.
+    #[test]
+    fn compute_action_hash_differs_by_eip712_signature() {
+        let base = SignedNativeAction {
+            action: NativeAction::ClaimRewards,
+            nonce: 7,
+            signature: ActionSignature::Eip712(Signature {
+                v: 27,
+                r: [1u8; 32],
+                s: [2u8; 32],
+            }),
+        };
+        // Same payload+nonce, one signature byte flipped (r differs).
+        let mut swapped_r = base.clone();
+        swapped_r.signature = ActionSignature::Eip712(Signature {
+            v: 27,
+            r: [0xAAu8; 32],
+            s: [2u8; 32],
+        });
+        // s differs.
+        let mut swapped_s = base.clone();
+        swapped_s.signature = ActionSignature::Eip712(Signature {
+            v: 27,
+            r: [1u8; 32],
+            s: [0xBBu8; 32],
+        });
+        // recovery id (v) differs.
+        let mut swapped_v = base.clone();
+        swapped_v.signature = ActionSignature::Eip712(Signature {
+            v: 28,
+            r: [1u8; 32],
+            s: [2u8; 32],
+        });
+
+        let h = compute_action_hash(&base);
+        assert_ne!(h, compute_action_hash(&swapped_r), "r must be bound");
+        assert_ne!(h, compute_action_hash(&swapped_s), "s must be bound");
+        assert_ne!(h, compute_action_hash(&swapped_v), "v must be bound");
+    }
+
+    /// F-2: session (ed25519) signatures must also be bound into the hash.
+    #[test]
+    fn compute_action_hash_differs_by_session_signature() {
+        let base = SignedNativeAction {
+            action: NativeAction::ClaimRewards,
+            nonce: 9,
+            signature: ActionSignature::Session {
+                session_pubkey: [3u8; 32],
+                sig: Ed25519Sig([4u8; 64]),
+            },
+        };
+        // Same payload+nonce+pubkey, different signature bytes.
+        let mut swapped_sig = base.clone();
+        swapped_sig.signature = ActionSignature::Session {
+            session_pubkey: [3u8; 32],
+            sig: Ed25519Sig([5u8; 64]),
+        };
+        // Same payload+nonce+sig, different session pubkey (different signer).
+        let mut swapped_pubkey = base.clone();
+        swapped_pubkey.signature = ActionSignature::Session {
+            session_pubkey: [6u8; 32],
+            sig: Ed25519Sig([4u8; 64]),
+        };
+        let h = compute_action_hash(&base);
+        assert_ne!(h, compute_action_hash(&swapped_sig), "session sig must be bound");
+        assert_ne!(
+            h,
+            compute_action_hash(&swapped_pubkey),
+            "session pubkey must be bound"
+        );
+    }
+
+    /// F-2: domain separation between signature variants — an EIP-712 action and
+    /// a session action must never share a content address even if their bound
+    /// bytes would otherwise line up.
+    #[test]
+    fn compute_action_hash_domain_separates_signature_variants() {
+        let eip712 = SignedNativeAction {
+            action: NativeAction::ClaimRewards,
+            nonce: 11,
+            signature: ActionSignature::Eip712(Signature {
+                v: 0,
+                r: [0u8; 32],
+                s: [0u8; 32],
+            }),
+        };
+        let session = SignedNativeAction {
+            action: NativeAction::ClaimRewards,
+            nonce: 11,
+            signature: ActionSignature::Session {
+                session_pubkey: [0u8; 32],
+                sig: Ed25519Sig([0u8; 64]),
+            },
+        };
+        assert_ne!(
+            compute_action_hash(&eip712),
+            compute_action_hash(&session),
+            "signature variants must be domain-separated"
+        );
     }
 
     #[test]
