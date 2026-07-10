@@ -115,10 +115,38 @@ Test scenario:
 **Depends on:** Task 4
 
 ## Known Limitations / Follow-ups
-1. **Single-block replay only:** This handles the common case (crash during the last block).
-   Multi-block gaps (theoretically impossible since commit_block is synchronous) are not handled.
-2. **Native writes still not batched:** Individual `put_cf_raw` calls within `execute_native_post_commit`
-   could leave partial state if crash happens mid-execution. Future: wrap in WriteBatch.
+1. **Single-block replay only:** ~~This handles the common case (crash during the last block).
+   Multi-block gaps (theoretically impossible since commit_block is synchronous) are not handled.~~
+
+   > **UPDATE (S442):** No longer single-block. Consensus finality is decoupled from local
+   > execution readiness (a committed block whose body isn't yet reconstructable still advances
+   > height), so multi-block execution gaps DO occur in practice. `replay_committed`
+   > (`app.rs:1511`) now replays the ENTIRE `[applied+1, committed]` range in ascending order
+   > via `replay_gap` (`app.rs:360`), failing loud on any hole rather than skipping it.
+2. **Native writes still not batched:** ~~Individual `put_cf_raw` calls within `execute_native_post_commit`
+   could leave partial state if crash happens mid-execution. Future: wrap in WriteBatch.~~
+
+   > **UPDATE (S442) — OUTDATED, superseded by the current tree.** This described a real
+   > past state: native post-commit once issued individual `put_cf_raw()` calls with no
+   > enclosing batch. That is no longer how it works. Native state now flushes through
+   > `NativeStateOverlay::flush_with_native_trie` (`crates/torus-state/src/backend.rs:454`),
+   > which builds a **single atomic `WriteBatch`** covering the native CF writes/deletes AND
+   > the incremental native-trie nodes (`flush_with_native_trie_inner`, `backend.rs:482-532`).
+   > The renamed function pointing at execution is now `execute_committed_block`
+   > (`crates/torus-consensus/src/app.rs:424`), not `execute_native_post_commit`.
+   >
+   > The crash-safety fix in this plan is folded into that same batch: when the native path
+   > runs, `execute_committed_block` calls `flush_with_native_trie_and_marker`
+   > (`backend.rs:471`, `app.rs:750`), appending `META_NATIVE_APPLIED_HEIGHT` (big-endian `u64`)
+   > to the SAME batch as the native writes. So native state and "this height is applied" now
+   > commit together — a hard crash can never leave native state flushed but the height
+   > un-marked (which would double-apply fees/epoch rewards on restart), nor the marker written
+   > without the state (which would silently drop it). A standalone marker write remains only for
+   > blocks that skip the native path entirely — empty / pure-EVM blocks whose re-execution is
+   > idempotent (`app.rs:807-808`). Startup replay is no longer single-block: `replay_committed`
+   > (`app.rs:1511`) loops the whole `[applied+1, committed]` gap in order via `replay_gap`
+   > (`app.rs:360`) and **fails loud** (`ReplayGapOutcome::Hole` → latch `exec_failed`) on any
+   > height it cannot reconstruct, instead of silently marking it applied.
 3. **EVM state not covered:** EVM commit via `commit_block` uses RocksDB WriteBatch
    (already atomic). This plan only addresses the native post-commit gap.
 

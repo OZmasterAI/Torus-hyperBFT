@@ -141,7 +141,21 @@ Add imports: `sort_native_actions`, `NativeExecContext`, `NativeExecutor`, `Nati
 **Depends on:** Task 4
 
 ## Known Limitations / Follow-ups
-1. **Native writes not atomic:** Native state writes go through individual `put_cf_raw()` calls, not WriteBatch. A crash between EVM commit and native execution completion could leave partial native state. Future: batch native writes too.
+1. **Native writes not atomic:** ~~Native state writes go through individual `put_cf_raw()` calls, not WriteBatch. A crash between EVM commit and native execution completion could leave partial native state. Future: batch native writes too.~~
+
+   > **UPDATE (S442) — OUTDATED, superseded.** This described a real past state (individual
+   > `put_cf_raw()` native writes with no batch). Native state now flushes through
+   > `NativeStateOverlay::flush_with_native_trie` / `flush_with_native_trie_and_marker`
+   > (`crates/torus-state/src/backend.rs:454,471`) — a **single atomic `WriteBatch`** covering the
+   > native CF writes/deletes, the incremental native-trie nodes, AND (in the `_and_marker`
+   > variant) the `META_NATIVE_APPLIED_HEIGHT` marker (`backend.rs:482-532`). The post-commit
+   > entry point renamed from `execute_native_post_commit` to `execute_committed_block`
+   > (`crates/torus-consensus/src/app.rs:424`), and it calls the marker-folding flush at
+   > `app.rs:750`. So native state + applied-height marker land together in one batch: a crash
+   > can no longer leave partial native state with an inconsistent marker. On restart, the whole
+   > execution gap is replayed with fail-loud holes (`replay_committed`/`replay_gap`,
+   > `app.rs:1511,360`). See `docs/plans/s442-consensus-findings-and-limitations.md` for the
+   > residual crash windows that remain (e.g. slash-atomicity, deferred-body holes).
 2. **Speculative rollback:** Pre-existing issue — EVM state committed during do_validate is not reverted on speculative rollback. Same applies to native now. The `on_speculative_rollback` comment at app.rs:556 acknowledges this.
 3. **Validator set updates lagged by 1 block:** Epoch boundary processing (staking changes) now happens post-commit, so validator set updates reflect block N-1's native state. Negligible impact (epoch_length=100).
 
