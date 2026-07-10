@@ -11,3 +11,9 @@ LIVE_STATE.json
 testnet/data/
 __pycache__/
 *.pyc
+
+# build / run markers (never commit these)
+build-*.done
+build-*.log
+*.done
+.lsp_pass_timestamp
