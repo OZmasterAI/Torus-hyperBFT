@@ -388,6 +388,33 @@ fn prune_commit_manifest(state_db: &StateDb, height: u64) {
     }
 }
 
+/// FIX 6 / F-1 (S443): heights present in [`CF_COMMIT_MANIFEST`] strictly above
+/// `floor`. These are committed-but-not-yet-dispatched heights (the manifest is
+/// written at commit and pruned at dispatch). When they sit ABOVE the
+/// `CF_BLOCK_HEADERS` frontier, their headers never persisted — a crash-in-hole
+/// left them recoverable ONLY from the manifest, and boot crash-recovery
+/// (`replay_committed`, keyed off the header frontier) can't see them. Boot
+/// reconciliation scans them here to park+heal.
+fn manifest_heights_above(state_db: &StateDb, floor: u64) -> Vec<u64> {
+    let db = state_db.inner();
+    let Some(cf) = db.cf_handle(CF_COMMIT_MANIFEST) else {
+        return vec![];
+    };
+    let mut out = Vec::new();
+    for item in db.iterator_cf(cf, rocksdb::IteratorMode::Start) {
+        let Ok((key, _)) = item else { continue };
+        // Manifest keys are 8-byte BE heights (see persist_commit_manifest).
+        if key.len() == 8 {
+            let h = u64::from_be_bytes(key.as_ref().try_into().unwrap());
+            if h > floor {
+                out.push(h);
+            }
+        }
+    }
+    out.sort_unstable();
+    out
+}
+
 /// Load a committed height's durable datum from [`CF_COMMIT_MANIFEST`], if present.
 fn load_commit_manifest(state_db: &StateDb, height: u64) -> Option<Vec<u8>> {
     match state_db.get_cf_raw(CF_COMMIT_MANIFEST, &height.to_be_bytes()) {
@@ -866,32 +893,44 @@ impl ExecutionContext {
                     .observe(verify_timer.elapsed().as_secs_f64());
             }
 
+            // FIX 2 (S443): exec-time signature/session resolution failure = DROP the
+            // action, NEVER slash the proposer.
+            //
+            // (a) REORDER: the replay/dedup guard is now folded into the SAME per-action
+            //     loop below and runs BEFORE any punitive accounting, so an already-
+            //     committed action that now fails resolution (its session was revoked
+            //     since it first committed) can never be counted as an attestation fault.
+            // (b) SOFTEN: a `None` at exec is either a STATE-DEPENDENT condition (a
+            //     missing/revoked/expired/out-of-scope session at the executed height —
+            //     deterministic across all nodes) or a STRUCTURALLY-invalid signature.
+            //     Neither is attributable to the proposer at execution time: under
+            //     compact proposals a body travels out-of-band and is content-addressed
+            //     by `compute_action_hash`, which OMITS the signature (F-2), so a
+            //     Byzantine heal-pull peer can substitute a body carrying a swapped/bad
+            //     signature under the same hash. Slashing here 100%-slashed + tombstoned
+            //     an HONEST proposer (t15 suicide chain) and is exploitable via F-2, so
+            //     we DROP-and-log instead. This is consensus-visible but fully
+            //     DETERMINISTIC: every node resolves the same senders against the same
+            //     state at the executed height and drops the same actions, so post-state
+            //     stays identical (all validators must run the same binary — already
+            //     mandated for the relaunch). Proposer accountability for genuinely-
+            //     Byzantine attestation moves to a provenance-bound mechanism once the
+            //     F-2 content-address fix lands.
             let invalid_count = resolved_senders.iter().filter(|s| s.is_none()).count();
             if invalid_count > 0 {
-                tracing::error!(
+                tracing::warn!(
                     count = invalid_count,
                     proposer = %torus_block.header.proposer,
-                    "SLASHING PROPOSER: attested block contained invalid signatures"
+                    height,
+                    "FIX 2: dropping native action(s) that failed signature/session resolution at \
+                     exec (state-dependent or unattributable under F-2) — NOT slashing the proposer"
                 );
-                if let Err(e) = self.staking.slash(
-                    torus_block.header.proposer,
-                    10000,
-                    SlashReason::InvalidAttestation,
-                    0,
-                ) {
-                    tracing::error!(%e, "CRITICAL: failed to slash proposer for invalid attestation");
-                }
-                if let Err(e) = self
-                    .staking
-                    .tombstone_validator(&torus_block.header.proposer)
-                {
-                    tracing::error!(%e, "CRITICAL: failed to tombstone proposer for invalid attestation");
-                }
             }
 
             let replay_guard_timer = std::time::Instant::now();
             let mut sender_actions = Vec::with_capacity(torus_block.native_actions.len());
             let mut consumed_nonces = Vec::new();
+            let mut dropped_invalid: u64 = 0;
             // Defense-in-depth replay guard. The non-destructive mempool selection ×
             // HotStuff 3-chain pipeline re-includes the same action in consecutive
             // blocks before the first commits and calls `remove_committed_native`
@@ -903,8 +942,16 @@ impl ExecutionContext {
             // (sender, nonce) repeated within a single block.
             let mut seen_in_block = std::collections::HashSet::new();
             for (i, signed) in torus_block.native_actions.iter().enumerate() {
+                // FIX 2b: resolution failure (bad sig OR missing/revoked/expired/out-of-
+                // scope session) => DROP this action. Deterministic at the executed
+                // height; the proposer is never punished here (see the block above).
                 let Some(sender) = resolved_senders.get(i).copied().flatten() else {
-                    tracing::error!(index = i, "INVALID SIG in attested block — skipping action");
+                    dropped_invalid += 1;
+                    tracing::warn!(
+                        index = i,
+                        height,
+                        "FIX 2: dropping native action with unresolvable signature/session at exec"
+                    );
                     continue;
                 };
                 let nonce_key = torus_state::cf::native_nonce_key(&sender, signed.nonce);
@@ -924,6 +971,17 @@ impl ExecutionContext {
                 }
                 consumed_nonces.push((sender, signed.nonce));
                 sender_actions.push((sender, signed.action.clone()));
+            }
+            if dropped_invalid > 0 {
+                // FIX 2: surface the count of dropped-at-exec actions (state-dependent
+                // session miss or structurally-invalid/substituted signature). This is
+                // the observability replacement for the removed slash — a spike here is
+                // the operator's signal to investigate (session churn or an F-2 probe).
+                tracing::warn!(
+                    dropped = dropped_invalid,
+                    height,
+                    "FIX 2: dropped native actions at exec that could not be resolved (no slash)"
+                );
             }
             if let Some(ref m) = self.metrics {
                 m.exec_replay_guard_seconds
@@ -1755,6 +1813,53 @@ impl TorusApp {
             );
         }
 
+        // FIX 6 / F-1 (S443): reconcile the committed frontier against the durable
+        // COMMIT MANIFEST. A SIGKILL taken WHILE a live body-hole was open can leave
+        // heights H..K committed in hotstuff (and written to CF_COMMIT_MANIFEST at
+        // commit) whose HEADERS never persisted — so `find_last_committed_height`
+        // (which reads the CF_BLOCK_HEADERS frontier) returns H−1, `replay_committed`
+        // sees NO gap, and nothing parks. On the next live commit `exec_next_height`
+        // seeds to H and `drain_exec_queue` would wait forever on a block that already
+        // arrived pre-crash. The manifests for H..K are on disk; park them here (same
+        // park+heal path FIX 1b uses) so the heal loop can drive the peer pull. No-op
+        // for a clean restart (dispatched heights had their manifests pruned).
+        {
+            let applied = read_native_applied_height(&app.state_db).unwrap_or(0);
+            let manifest_heights = manifest_heights_above(&app.state_db, applied);
+            if let Some(&manifest_max) = manifest_heights.iter().max() {
+                let first = applied + 1;
+                // Park ONLY heights that actually carry a durable manifest —
+                // `recovery_exec_source` yields a HEALABLE Compact/Ready source for
+                // them (the datum holds the native_action_hashes the pull needs).
+                // Do NOT Durable-fy a manifest-LESS height in the range: a Durable
+                // source has no hashes to fetch, so it fabricates an un-healable
+                // `missing=0` hole that can only fail-stop (observed: t15 cycle-3
+                // parked 630 as Durable and wedged). A committed height without a
+                // manifest is instead left for the live / block-sync commit path
+                // (which delivers it as Compact/Ready) and the drain watchdog.
+                for &h in &manifest_heights {
+                    app.deferred_exec.entry(h).or_insert_with(|| DeferredExecBlock {
+                        source: recovery_exec_source(&app.state_db, h),
+                        slashes: Vec::new(),
+                    });
+                }
+                app.exec_next_height =
+                    Some(app.exec_next_height.map_or(first, |n| n.min(first)));
+                if app.exec_hole_since.is_none() {
+                    app.exec_hole_since = Some(std::time::Instant::now());
+                }
+                tracing::error!(
+                    applied,
+                    manifest_max,
+                    parked_count = manifest_heights.len(),
+                    parked_from = first,
+                    "FIX 6 / F-1: committed heights ABOVE the header frontier found in the durable \
+                     commit manifest (crash-in-hole) — parking the manifest-backed heights for heal \
+                     instead of silently stalling execution on reboot"
+                );
+            }
+        }
+
         app
     }
 
@@ -2165,6 +2270,12 @@ impl TorusApp {
             new_set.clone()
         };
 
+        // FIX 4 (S443): keep the rotation quorum-viable. If it would drop the active
+        // set below the BFT minimum while the previous set met it, re-seat the
+        // highest-priority departed validator(s) for quorum math (t15 suicide chain).
+        let capped_set =
+            EpochManager::enforce_minimum_floor(&self.last_validator_set, capped_set);
+
         let diff = EpochManager::compute_validator_set_diff(&self.last_validator_set, &capped_set);
         if diff.is_empty() {
             self.last_validator_set = capped_set;
@@ -2300,48 +2411,13 @@ impl App<RocksKVStore> for TorusApp {
             .unwrap_or_default()
             .as_secs();
 
-        let (native_with_senders, evm_txs) = if let Some(ref mempool) = self.mempool {
-            let gas_limit = if parent_header.evm_gas_limit == 0 {
-                torus_evm::DEFAULT_BLOCK_GAS_LIMIT
-            } else {
-                parent_header.evm_gas_limit
-            };
-            // Pipeline-aware selection: exclude actions already carried by our
-            // in-flight (proposed-but-uncommitted) blocks so the non-destructive pool
-            // does not re-select them for N+1/N+2 before N commits and calls
-            // `remove_committed_native` — the root cause of duplicate native inclusion
-            // (memory 282f9818). `pending_proposals` is exactly that in-flight window.
-            let mut in_flight: std::collections::HashSet<torus_types::B256> = self
-                .pending_proposals
-                .values()
-                .flat_map(|b| {
-                    b.native_actions
-                        .iter()
-                        .map(torus_types::compute_action_hash)
-                })
-                .collect();
-            // Union the hash ledger: covers compact proposals whose bodies never
-            // reconstructed (MissingData) — absent from `pending_proposals` but
-            // still in flight on the wire (s355 duplicate-inclusion tail).
-            self.in_flight_hashes.extend_into(&mut in_flight);
-            let native = mempool.select_native_for_block_with_senders_excluding(
-                torus_mempool::rate_limit::native_total_block_cap(),
-                &in_flight,
-                torus_mempool::rate_limit::native_block_bytes_cap(),
-                torus_mempool::rate_limit::native_orders_per_block_cap(),
-            );
-            let evm = mempool.drain_evm(gas_limit, parent_header.state_root);
-            if !evm.is_empty() || !native.is_empty() {
-                tracing::info!(
-                    evm_txs = evm.len(),
-                    native_actions = native.len(),
-                    "selected actions for block"
-                );
-            }
-            (native, evm)
+        let gas_limit = if parent_header.evm_gas_limit == 0 {
+            torus_evm::DEFAULT_BLOCK_GAS_LIMIT
         } else {
-            (vec![], vec![])
+            parent_header.evm_gas_limit
         };
+        let (native_with_senders, evm_txs) =
+            self.select_block_payload(parent_header.height, gas_limit, parent_header.state_root);
 
         let native_actions: Vec<torus_types::SignedNativeAction> =
             native_with_senders.iter().map(|(_, a)| a.clone()).collect();
@@ -2844,6 +2920,89 @@ impl App<RocksKVStore> for TorusApp {
 }
 
 impl TorusApp {
+    /// FIX 1 (S443) catch-up gate: propose EMPTY payloads while the local committed
+    /// frontier lags the parent height by more than this. A just-rejoined leader
+    /// learns the chain tip (`parent_height`) from the high-QC long before it has
+    /// applied those heights, so its mempool/state view is stale; selecting native
+    /// actions from it re-proposes stale session-signed actions whose sessions were
+    /// revoked during the outage — the trigger of the t15 validator-suicide chain.
+    ///
+    /// The threshold MUST sit well above the normal HotStuff pipeline skew. In
+    /// healthy operation `last_header` (the committed frontier) trails the high-QC
+    /// block a leader extends by the 2-/3-chain depth plus any view latency —
+    /// observed at ~3 under load, and transiently higher during view churn. A tight
+    /// threshold (the original `2`) fired on EVERY healthy leader, so nearly every
+    /// block went out empty and 3-of-4 liveness collapsed under a fault (t12/t15
+    /// climbed 0). It only needs to catch a GENUINELY behind rejoining node — which
+    /// lags by hundreds (`parent_height=918 local_height=0`) — so a generous margin
+    /// is correct. And fix 2 (drop, don't slash, an unresolved action at exec) is the
+    /// deterministic safety net for any stale action that slips through, so erring
+    /// high costs nothing but a little rejoin-window throughput.
+    const CATCH_UP_LAG_THRESHOLD: u64 = 64;
+
+    /// Select the native + EVM payload for a proposal extending `parent_height`.
+    ///
+    /// CATCH-UP GATE (fix 1): when `parent_height - self.last_header.height >
+    /// CATCH_UP_LAG_THRESHOLD`, the node is behind — it still PROPOSES (leader
+    /// liveness must not stall) but with an EMPTY payload, so it never re-proposes
+    /// stale actions from an un-caught-up mempool. Once block-sync advances
+    /// `last_header` back within the threshold, full selection resumes automatically.
+    fn select_block_payload(
+        &self,
+        parent_height: u64,
+        gas_limit: u64,
+        parent_state_root: torus_types::B256,
+    ) -> (
+        Vec<(torus_types::Address, torus_types::SignedNativeAction)>,
+        Vec<Vec<u8>>,
+    ) {
+        let lag = parent_height.saturating_sub(self.last_header.height);
+        if lag > Self::CATCH_UP_LAG_THRESHOLD {
+            tracing::warn!(
+                parent_height,
+                local_height = self.last_header.height,
+                lag,
+                "FIX 1 CATCH-UP GATE: node lags the parent height — proposing an EMPTY payload \
+                 (leader liveness preserved) until block-sync catches it up; refuses to re-propose \
+                 stale session-signed actions from an un-caught-up mempool view"
+            );
+            return (vec![], vec![]);
+        }
+
+        let Some(ref mempool) = self.mempool else {
+            return (vec![], vec![]);
+        };
+        // Pipeline-aware selection: exclude actions already carried by our
+        // in-flight (proposed-but-uncommitted) blocks so the non-destructive pool
+        // does not re-select them for N+1/N+2 before N commits and calls
+        // `remove_committed_native` — the root cause of duplicate native inclusion
+        // (memory 282f9818). `pending_proposals` is exactly that in-flight window.
+        let mut in_flight: std::collections::HashSet<torus_types::B256> = self
+            .pending_proposals
+            .values()
+            .flat_map(|b| b.native_actions.iter().map(torus_types::compute_action_hash))
+            .collect();
+        // Union the hash ledger: covers compact proposals whose bodies never
+        // reconstructed (MissingData) — absent from `pending_proposals` but
+        // still in flight on the wire (s355 duplicate-inclusion tail).
+        self.in_flight_hashes.extend_into(&mut in_flight);
+        let native = mempool.select_native_for_block_with_senders_excluding(
+            torus_mempool::rate_limit::native_total_block_cap(),
+            &in_flight,
+            torus_mempool::rate_limit::native_block_bytes_cap(),
+            torus_mempool::rate_limit::native_orders_per_block_cap(),
+        );
+        let evm = mempool.drain_evm(gas_limit, parent_state_root);
+        if !evm.is_empty() || !native.is_empty() {
+            tracing::info!(
+                evm_txs = evm.len(),
+                native_actions = native.len(),
+                "selected actions for block"
+            );
+        }
+        (native, evm)
+    }
+
     /// Regime-B strict-order execution gate. Route a committed block into the
     /// execution pipeline while GUARANTEEING it is executed strictly in ascending
     /// height with no gaps — the only correct behaviour, because native matching
@@ -2910,9 +3069,31 @@ impl TorusApp {
                 Some(n) => n,
                 None => return,
             };
-            // Head-of-line not yet committed/buffered: NOT a hole (consensus commits
-            // every height in order, so it will arrive) — just wait.
+            // Head-of-line not yet committed/buffered: NORMALLY not a hole (consensus
+            // commits every height in order, so it will arrive) — just wait.
+            //
+            // FIX 6 / F-1 (S443) WATCHDOG: unless `next` was already committed +
+            // dispatched BEFORE a crash. Then it will NEVER re-arrive on the live path
+            // (it arrived pre-crash), and the silent `return` below is the permanent,
+            // logless execution stall F-1 describes. If a durable COMMIT MANIFEST
+            // exists for `next`, it IS such a committed height — recover it from the
+            // manifest (park+heal) and retry the drain. Only heights with a manifest
+            // are re-parked, so a genuinely-future (not-yet-committed) height stays
+            // benign. This also converts any unknown cousin of F-1 from silent to a
+            // loud, budget-bounded heal.
             let Some(entry) = self.deferred_exec.remove(&next) else {
+                if load_commit_manifest(&self.state_db, next).is_some() {
+                    let source = recovery_exec_source(&self.state_db, next);
+                    self.deferred_exec
+                        .insert(next, DeferredExecBlock { source, slashes: Vec::new() });
+                    tracing::error!(
+                        height = next,
+                        "FIX 6 / F-1 watchdog: execution head-of-line height was committed \
+                         pre-crash (durable manifest present) but never re-arrived on the live \
+                         path — re-parked from the manifest to heal instead of stalling silently"
+                    );
+                    continue;
+                }
                 return;
             };
             let DeferredExecBlock { source, slashes } = entry;
@@ -4309,6 +4490,56 @@ mod crash_recovery_tests {
         }
     }
 
+    /// FIX 1 (S443): the catch-up gate. A leader whose local committed frontier
+    /// (`last_header.height == 0` here, a fresh/rejoined node) lags the parent height
+    /// by more than the threshold MUST propose an EMPTY payload even with a full
+    /// mempool — re-proposing stale session-signed actions from an un-caught-up view
+    /// is what detonated the t15 suicide chain. Once the parent is within the
+    /// threshold (node caught up) the same call selects the full mempool.
+    /// RED at aff21fe: selection ignored the lag and returned all 100 actions.
+    #[test]
+    fn catch_up_gate_proposes_empty_while_lagging() {
+        let (config, state_db) = make_test_config_and_db();
+        let mempool = Arc::new(Mempool::new(
+            state_db.clone(),
+            torus_mempool::MempoolConfig::default(),
+        ));
+        let base = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        for i in 0..100u64 {
+            let mut seed = [0u8; 32];
+            seed[..8].copy_from_slice(&(i + 1).to_le_bytes());
+            let key = k256::ecdsa::SigningKey::from_slice(&seed).unwrap();
+            let a = torus_types::eip712::sign_native_action(
+                NativeAction::ClaimRewards,
+                base + i,
+                &key,
+            );
+            let s = a.recover_sender().unwrap();
+            mempool.add_native_action_presigned(s, a).unwrap();
+        }
+
+        let app = TorusApp::new(state_db.clone(), &config, None, Some(mempool), None);
+        assert_eq!(app.last_header.height, 0, "precondition: fresh/stale local frontier");
+
+        // Parent height far ahead of our applied frontier → EMPTY payload.
+        let (native_lag, _evm) = app.select_block_payload(918, 30_000_000, B256::ZERO);
+        assert!(
+            native_lag.is_empty(),
+            "lagging leader must propose an EMPTY payload, got {}",
+            native_lag.len()
+        );
+
+        // Parent within the catch-up threshold → normal full selection resumes.
+        let (native_ok, _) = app.select_block_payload(1, 30_000_000, B256::ZERO);
+        assert!(
+            !native_ok.is_empty(),
+            "a caught-up leader must select from its mempool"
+        );
+    }
+
     /// One PlaceOrderBatch action carrying `n_orders` orders (dummy signature — the
     /// proposal-size test below only measures encoded bytes; `compute_action_hash`
     /// omits the signature). Mirrors the bench's bs=N order shape.
@@ -4450,6 +4681,57 @@ mod crash_recovery_tests {
         let app = TorusApp::new(state_db.clone(), &config, None, None, None);
         assert_eq!(read_native_applied_height(&state_db), Some(5));
         assert_eq!(app.last_header.height, 0);
+    }
+
+    /// FIX 6 / F-1 (S443): crash-in-hole recovery. A node killed while a live body
+    /// hole was open can have heights committed (manifest written) whose HEADERS
+    /// never persisted. On reboot `find_last_committed_height` (header frontier) sees
+    /// no gap, so `replay_committed` parks nothing — yet the manifest holds a
+    /// committed height ABOVE the applied frontier. Boot must reconcile the manifest
+    /// and PARK that height for heal, not silently stall execution forever.
+    /// RED at aff21fe: boot ignored the manifest → `exec_next_height == None`,
+    /// `deferred_exec` empty → execution would wait forever on the next live commit.
+    #[test]
+    fn boot_reconciles_committed_manifest_above_header_frontier() {
+        let (config, state_db) = make_test_config_and_db();
+
+        // Headers + applied marker end at height 4 (a clean, gap-free frontier).
+        for h in 1..=4u64 {
+            persist_block_for_test(&state_db, &make_block(h, vec![]));
+        }
+        state_db
+            .put_cf_raw(
+                CF_CONSENSUS_META,
+                META_NATIVE_APPLIED_HEIGHT,
+                &4u64.to_be_bytes(),
+            )
+            .unwrap();
+
+        // But height 5 was committed pre-crash: its datum lives ONLY in the durable
+        // commit manifest (headers/bodies never persisted — the crash-in-hole window).
+        let datum = bincode::serialize(&make_block(5, vec![])).unwrap();
+        state_db
+            .put_cf_raw(
+                torus_state::cf::CF_COMMIT_MANIFEST,
+                &5u64.to_be_bytes(),
+                &datum,
+            )
+            .unwrap();
+
+        // Sanity: replay itself sees no gap (frontier == applied == 4).
+        assert_eq!(find_last_committed_height(&state_db), Some(4));
+
+        let app = TorusApp::new(state_db.clone(), &config, None, None, None);
+
+        assert_eq!(
+            app.exec_next_height,
+            Some(5),
+            "boot must park execution at the manifest-only committed height 5"
+        );
+        assert!(
+            app.deferred_exec.contains_key(&5),
+            "boot must seed the manifest-only committed height into the exec queue for heal"
+        );
     }
 
     #[test]
@@ -4605,6 +4887,114 @@ mod crash_recovery_tests {
             mempool.verified_sender(&trusted_key),
             None,
             "gossip-trusted (verified_locally=false) must not be cached"
+        );
+    }
+
+    // ---- FIX 2 (S443): exec-time signature/session failure = DROP, not slash ----
+
+    /// Register `proposer` as a funded validator so a slash/tombstone would actually
+    /// take effect (an unregistered proposer's slash is a logged no-op, which would
+    /// mask the bug).
+    fn register_proposer(state_db: &StateDb, proposer: Address) {
+        let staking = StakingManager::new(state_db.clone());
+        let stake = torus_economics::MIN_SELF_DELEGATION;
+        // Fund the account so register_validator's debit succeeds.
+        let mut rec = vec![0u8; 72];
+        rec[..32].copy_from_slice(&(stake * U256::from(2u8)).to_be_bytes::<32>());
+        state_db
+            .put_cf_raw(torus_state::cf::CF_ACCOUNTS, proposer.as_slice(), &rec)
+            .unwrap();
+        staking
+            .register_validator(proposer, [7u8; 32], 500, stake)
+            .unwrap();
+    }
+
+    fn block_with_proposer(
+        height: u64,
+        proposer: Address,
+        actions: Vec<SignedNativeAction>,
+    ) -> TorusBlock {
+        let mut b = make_block(height, actions);
+        b.header.proposer = proposer;
+        b
+    }
+
+    /// t15 root cause (fix 2b): a session-signed action whose session is MISSING at
+    /// exec time (revoked mid-outage by the bench's revoke/recreate cycle) is a
+    /// STATE-DEPENDENT condition, deterministic at the executed height. It must DROP
+    /// the action and leave the HONEST proposer untouched — NOT slash 100% + tombstone.
+    /// RED at aff21fe: the missing session yields `None`, the invalid-count slash
+    /// fires, and the proposer is tombstoned.
+    #[test]
+    fn missing_session_at_exec_drops_action_no_slash() {
+        let (config, state_db) = make_test_config_and_db();
+        let proposer = Address::new([0xAB; 20]);
+        register_proposer(&state_db, proposer);
+
+        // Session-signed action (valid ed25519) with NO session registered in state
+        // → resolve_sender returns SessionNotFound → None at exec.
+        let session_key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let action = torus_types::eip712::sign_native_action_with_session(
+            NativeAction::CancelOrder { order_id: 1 },
+            424_242,
+            &session_key,
+        );
+
+        let ctx = make_exec_ctx(&config, &state_db);
+        ctx.execute_committed_block(&block_with_proposer(1, proposer, vec![action]), vec![]);
+
+        let val = StakingManager::new(state_db.clone())
+            .get_validator(&proposer)
+            .unwrap()
+            .expect("proposer still registered");
+        assert_ne!(
+            val.status,
+            torus_economics::ValidatorStatus::Tombstoned,
+            "honest proposer must NOT be tombstoned for a state-dependent missing session"
+        );
+        assert_eq!(
+            val.self_stake,
+            torus_economics::MIN_SELF_DELEGATION,
+            "honest proposer must NOT be slashed for a state-dependent missing session"
+        );
+    }
+
+    /// Fix 2b + F-2 mitigation: a STRUCTURALLY-invalid signature at exec time also
+    /// DROPS the action without slashing the proposer. Provenance is unattributable
+    /// at exec time — a Byzantine heal-pull peer can serve a body with a swapped sig
+    /// under the same signature-less `compute_action_hash` (F-2), so an exec-time sig
+    /// failure cannot be pinned on the proposer. RED at aff21fe: it slashes+tombstones.
+    #[test]
+    fn structurally_invalid_sig_at_exec_drops_action_no_slash() {
+        use torus_types::ActionSignature;
+        let (config, state_db) = make_test_config_and_db();
+        let proposer = Address::new([0xCD; 20]);
+        register_proposer(&state_db, proposer);
+
+        let key = k256::ecdsa::SigningKey::from_slice(&[21u8; 32]).unwrap();
+        let mut action =
+            torus_types::eip712::sign_native_action(NativeAction::ClaimRewards, 424_242, &key);
+        if let ActionSignature::Eip712(ref mut sig) = action.signature {
+            sig.r = [0xff; 32];
+            sig.s = [0xff; 32];
+        }
+
+        let ctx = make_exec_ctx(&config, &state_db);
+        ctx.execute_committed_block(&block_with_proposer(1, proposer, vec![action]), vec![]);
+
+        let val = StakingManager::new(state_db.clone())
+            .get_validator(&proposer)
+            .unwrap()
+            .expect("proposer still registered");
+        assert_ne!(
+            val.status,
+            torus_economics::ValidatorStatus::Tombstoned,
+            "exec-time structural sig failure is unattributable (F-2) — must NOT tombstone"
+        );
+        assert_eq!(
+            val.self_stake,
+            torus_economics::MIN_SELF_DELEGATION,
+            "exec-time structural sig failure must NOT slash the proposer"
         );
     }
 

@@ -200,6 +200,8 @@ impl LibP2PNetwork {
             native_da_inbound: Mutex::new(VecDeque::new()),
             pending_native_pushes: Mutex::new(PendingSendQueue::new(8)),
             push_scheduler: Mutex::new(PushScheduler::for_pushes()),
+            recently_deposed: RwLock::new(HashMap::new()),
+            redial_backoff: Mutex::new(HashMap::new()),
             allow_private_addrs: config.allow_private_addrs,
         });
 
@@ -440,15 +442,26 @@ impl Network for LibP2PNetwork {
     fn update_validator_set(&mut self, updates: ValidatorSetUpdates) {
         let mut validators = self.shared.validators.write().unwrap();
         let mut peer_map = self.shared.peer_map.write().unwrap();
+        let mut deposed = self.shared.recently_deposed.write().unwrap();
+        let now = std::time::Instant::now();
         for (vk, _power) in updates.inserts() {
             validators.insert(vk.to_bytes());
             let peer_id = peer_id_from_verifying_key(vk);
             peer_map.insert(*vk, peer_id);
+            // Re-seated (or rejoining) — no longer deposed, drop any grace record.
+            deposed.remove(&vk.to_bytes());
         }
         for vk in updates.deletes() {
             validators.remove(&vk.to_bytes());
             peer_map.remove_by_vk(vk);
+            // FIX 3 (S443): stamp the deposition instant so the swarm loop grants a
+            // grace window before disconnecting the peer or penalizing its still-in-
+            // flight votes as an "unregistered peer" (t15). Bounded: only the deleted
+            // set is stored, and the grace check sweeps expired entries lazily.
+            deposed.insert(vk.to_bytes(), now);
         }
+        // Opportunistic sweep so the map can't grow across many rotations.
+        deposed.retain(|_, t| t.elapsed() < crate::swarm::DEPOSED_GRACE);
     }
 
     fn broadcast(&mut self, message: Message) {
@@ -530,6 +543,8 @@ mod tests {
             native_da_inbound: Mutex::new(VecDeque::new()),
             pending_native_pushes: Mutex::new(PendingSendQueue::new(8)),
             push_scheduler: Mutex::new(PushScheduler::for_pushes()),
+            recently_deposed: RwLock::new(HashMap::new()),
+            redial_backoff: Mutex::new(HashMap::new()),
             allow_private_addrs: false,
         })
     }

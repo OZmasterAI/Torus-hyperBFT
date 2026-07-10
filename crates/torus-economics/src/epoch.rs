@@ -296,6 +296,71 @@ impl EpochManager {
         Ok(())
     }
 
+    /// FIX 4 (S443): enforce the BFT-minimum floor across a rotation.
+    ///
+    /// If applying `new_set` would drop the ACTIVE set below
+    /// [`MIN_ACTIVE_VALIDATORS`](crate::types::MIN_ACTIVE_VALIDATORS) while the
+    /// previous set met it, re-seat the highest-priority departed validators so the
+    /// set stays quorum-viable. This is deliberately narrow: seated-for-quorum is
+    /// NOT the same as active-for-rewards — a re-seated validator may still be jailed
+    /// by [`update_validator_statuses`](Self::update_validator_statuses); this only
+    /// guarantees BFT can still form a quorum.
+    ///
+    /// Root cause it closes (t15 suicide chain): an honest validator was wrongly
+    /// auto-jailed and deposed at the epoch boundary, dropping the active set 4 → 3.
+    /// [`check_minimum_set`](Self::check_minimum_set) only WARNED and proceeded, so
+    /// the 4-validator cluster silently lost the quorum it needed to make progress.
+    ///
+    /// No-op when the new set already meets the floor, or when the OLD set was itself
+    /// below it (a genuine small network — dev/test or bootstrap — has nothing to
+    /// protect and must not be force-grown). Deterministic: the same (old, new) pair
+    /// yields the same result on every node (highest power, then address ascending).
+    pub fn enforce_minimum_floor(old_set: &ValidatorSet, new_set: ValidatorSet) -> ValidatorSet {
+        use crate::types::MIN_ACTIVE_VALIDATORS;
+        let mut new_set = new_set;
+
+        if new_set.validators.len() >= MIN_ACTIVE_VALIDATORS {
+            return new_set;
+        }
+        if old_set.validators.len() < MIN_ACTIVE_VALIDATORS {
+            // Old set already below the floor (dev/test / bootstrap) — nothing to protect.
+            return new_set;
+        }
+
+        let present: std::collections::BTreeSet<Address> =
+            new_set.validators.iter().map(|v| v.address).collect();
+        let mut departed: Vec<&ValidatorInfo> = old_set
+            .validators
+            .iter()
+            .filter(|v| !present.contains(&v.address))
+            .collect();
+        // Deterministic re-seat priority: highest power first, then address ascending
+        // — identical to the ranking used everywhere else in this module.
+        departed.sort_by(|a, b| b.power.cmp(&a.power).then_with(|| a.address.cmp(&b.address)));
+
+        let need = MIN_ACTIVE_VALIDATORS - new_set.validators.len();
+        let reseated = need.min(departed.len());
+        for v in departed.into_iter().take(reseated) {
+            new_set.validators.push(v.clone());
+        }
+        new_set.validators.sort_by(|a, b| {
+            b.power
+                .cmp(&a.power)
+                .then_with(|| a.address.cmp(&b.address))
+        });
+
+        tracing::warn!(
+            floored = new_set.validators.len(),
+            reseated,
+            min = MIN_ACTIVE_VALIDATORS,
+            "FIX 4: epoch rotation would have dropped the active set below the BFT minimum — \
+             re-seated the highest-priority departed validator(s) to keep quorum viable \
+             (seated for quorum math; reward/jail status is handled separately)"
+        );
+
+        new_set
+    }
+
     /// Update validator statuses after epoch rotation.
     pub fn update_validator_statuses<T: StateBackend>(
         staking: &StakingManager<T>,
@@ -551,5 +616,89 @@ mod tests {
         // 2 changes (1 departure + 1 arrival), cap is 10 — should pass through unchanged.
         let result = EpochManager::apply_rotation_cap(&old_set, new_set.clone(), 10);
         assert_eq!(result.validators.len(), new_set.validators.len());
+    }
+
+    // ---- FIX 4 (S443): BFT-minimum floor on epoch rotation ----
+
+    fn vinfo(n: u8, power: u64) -> ValidatorInfo {
+        ValidatorInfo {
+            address: Address::new([n; 20]),
+            pubkey: PublicKey([n; 32]),
+            power,
+            commission_bps: 500,
+        }
+    }
+
+    /// t15 root cause: an honest validator was (wrongly) deposed, dropping the
+    /// active set from 4 → 3 (below the BFT minimum). `check_minimum_set` only
+    /// WARNED and proceeded, so the cluster lost quorum. The floor guard must keep
+    /// the set quorum-viable (≥ MIN_ACTIVE_VALIDATORS) by re-seating the highest-
+    /// priority departed validator(s).
+    #[test]
+    fn floor_reseats_deposed_validator_to_keep_quorum() {
+        use crate::types::MIN_ACTIVE_VALIDATORS;
+        let old = ValidatorSet {
+            validators: vec![
+                vinfo(1, 400),
+                vinfo(2, 300),
+                vinfo(3, 200),
+                vinfo(4, 100),
+            ],
+            epoch: 1,
+        };
+        // Validator #4 deposed → 3 remain (below BFT minimum of 4).
+        let proposed = ValidatorSet {
+            validators: vec![vinfo(1, 400), vinfo(2, 300), vinfo(3, 200)],
+            epoch: 2,
+        };
+        let floored = EpochManager::enforce_minimum_floor(&old, proposed);
+        assert!(
+            floored.validators.len() >= MIN_ACTIVE_VALIDATORS,
+            "floor must keep the set quorum-viable, got {}",
+            floored.validators.len()
+        );
+        assert!(
+            floored.validators.iter().any(|v| v.address == Address::new([4; 20])),
+            "the deposed validator must be re-seated to preserve BFT quorum"
+        );
+        assert_eq!(floored.epoch, 2, "epoch number is preserved");
+    }
+
+    /// A rotation that stays at/above the floor is untouched.
+    #[test]
+    fn floor_noop_when_set_meets_minimum() {
+        let old = ValidatorSet {
+            validators: vec![vinfo(1, 400), vinfo(2, 300), vinfo(3, 200), vinfo(4, 100)],
+            epoch: 1,
+        };
+        let proposed = ValidatorSet {
+            validators: vec![vinfo(1, 400), vinfo(2, 300), vinfo(3, 200), vinfo(5, 150)],
+            epoch: 2,
+        };
+        let floored = EpochManager::enforce_minimum_floor(&old, proposed.clone());
+        assert_eq!(floored.validators.len(), proposed.validators.len());
+        // #5 stays, #4 stays deposed — the floor is not breached, so no re-seating.
+        assert!(floored.validators.iter().any(|v| v.address == Address::new([5; 20])));
+        assert!(!floored.validators.iter().any(|v| v.address == Address::new([4; 20])));
+    }
+
+    /// A genuinely small network (old set already below the minimum, e.g. dev/test
+    /// or bootstrap) is NOT force-grown — there is nothing to protect.
+    #[test]
+    fn floor_noop_when_old_set_below_minimum() {
+        let old = ValidatorSet {
+            validators: vec![vinfo(1, 400), vinfo(2, 300)],
+            epoch: 1,
+        };
+        let proposed = ValidatorSet {
+            validators: vec![vinfo(1, 400)],
+            epoch: 2,
+        };
+        let floored = EpochManager::enforce_minimum_floor(&old, proposed);
+        assert_eq!(
+            floored.validators.len(),
+            1,
+            "old set was already below the floor; nothing to re-seat"
+        );
     }
 }

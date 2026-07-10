@@ -1912,7 +1912,14 @@ impl NativeExecutor {
         let cap = EpochManager::safe_rotation_cap(old_set.validators.len());
         let new_set = EpochManager::apply_rotation_cap(&old_set, new_set, cap);
 
-        // B4: Check minimum set
+        // B3.5 (FIX 4, S443): enforce the BFT-minimum floor. If the capped rotation
+        // would drop the active set below MIN_ACTIVE_VALIDATORS while the old set met
+        // it, re-seat the highest-priority departed validator(s) so the cluster keeps
+        // a viable quorum (t15: a wrongful deposition dropped 4 → 3 and stalled).
+        let new_set = EpochManager::enforce_minimum_floor(&old_set, new_set);
+
+        // B4: Check minimum set (post-condition; floor guard above should keep this
+        // green whenever the old set met the minimum).
         if let Err(e) = EpochManager::check_minimum_set(&new_set) {
             tracing::error!(%e, "validator set below minimum");
         }

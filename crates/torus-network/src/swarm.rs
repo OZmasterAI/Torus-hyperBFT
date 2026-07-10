@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use ed25519_dalek::VerifyingKey;
@@ -297,6 +297,21 @@ pub struct SharedState {
     /// networks), loopback/private/link-local addresses are kept out of the
     /// kademlia address book — both identify-advertised and DHT-learned.
     pub allow_private_addrs: bool,
+    /// FIX 3 (S443): validators removed from the active set within the last
+    /// [`DEPOSED_GRACE`] window, keyed by verifying-key bytes → the instant they
+    /// were deposed. A just-deposed validator is deterministically a few seconds
+    /// behind the rotation and will keep sending votes / reconnecting until it
+    /// learns the new set; disconnecting it or applying `unregistered peer`
+    /// penalties during that window is what turned an epoch rotation into permanent
+    /// isolation (t15 suicide chain). Recorded on `update_validator_set` deletes,
+    /// cleared on re-insert, swept lazily by the grace check.
+    pub recently_deposed: RwLock<HashMap<[u8; 32], Instant>>,
+    /// FIX 5 (S443): per-peer redial backoff, `peer → (earliest_next_dial,
+    /// current_interval)`. A persistently-unreachable peer failing every buffered
+    /// direct send would otherwise fire a dial + WARN per message (~5.3k log
+    /// lines/s under a reconnect storm). Exponential backoff caps the redial+log
+    /// rate per peer; the entry is cleared on a successful `ConnectionEstablished`.
+    pub redial_backoff: Mutex<HashMap<PeerId, (Instant, Duration)>>,
 }
 
 enum SwarmAction {
@@ -401,6 +416,67 @@ fn should_drop_banned_gossip(
     peer: &PeerId,
 ) -> bool {
     scoring.is_banned(peer) && !is_validator_peer(shared, peer)
+}
+
+/// FIX 3 (S443): grace window after a validator is deposed from the active set.
+/// A just-deposed validator is deterministically a few seconds behind the rotation
+/// (it learns the new set only after the epoch-boundary block reaches it), so for
+/// this window its reconnects and still-in-flight votes are treated leniently:
+/// never disconnected, never penalized as an `unregistered peer`. Kept short — long
+/// enough to cover rotation propagation + a couple of view timeouts, short enough
+/// that a genuinely-removed node loses the exemption quickly.
+pub(crate) const DEPOSED_GRACE: Duration = Duration::from_secs(60);
+
+/// FIX 5 (S443) redial backoff bounds: first redial after a failure waits
+/// `REDIAL_BACKOFF_MIN`, doubling on each further failure up to `REDIAL_BACKOFF_MAX`.
+const REDIAL_BACKOFF_MIN: Duration = Duration::from_millis(500);
+const REDIAL_BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+/// Whether `peer` may be redialed now, advancing its exponential backoff. A
+/// persistently-unreachable peer is dialed at most once per (growing) interval, so
+/// the failure-driven dial + WARN storm is throttled to O(log) per outage instead
+/// of one-per-buffered-message. Cleared on a successful connect (fresh start).
+fn should_redial_now(shared: &SharedState, peer: &PeerId) -> bool {
+    let mut m = shared.redial_backoff.lock().unwrap();
+    let now = Instant::now();
+    match m.get_mut(peer) {
+        Some((next_at, interval)) => {
+            if now >= *next_at {
+                *interval = (*interval * 2).min(REDIAL_BACKOFF_MAX);
+                *next_at = now + *interval;
+                true
+            } else {
+                false
+            }
+        }
+        None => {
+            m.insert(*peer, (now + REDIAL_BACKOFF_MIN, REDIAL_BACKOFF_MIN));
+            true
+        }
+    }
+}
+
+/// Whether `vk_bytes` was deposed within [`DEPOSED_GRACE`].
+fn is_recently_deposed_key(shared: &SharedState, vk_bytes: &[u8; 32]) -> bool {
+    shared
+        .recently_deposed
+        .read()
+        .unwrap()
+        .get(vk_bytes)
+        .is_some_and(|t| t.elapsed() < DEPOSED_GRACE)
+}
+
+/// Whether `peer` corresponds to a validator deposed within [`DEPOSED_GRACE`].
+/// The deposed peer is no longer in `peer_map`, so it is matched by re-deriving each
+/// grace-listed key's PeerId (the set is tiny — only recently-deleted validators).
+fn is_recently_deposed_peer(shared: &SharedState, peer: &PeerId) -> bool {
+    let deposed = shared.recently_deposed.read().unwrap();
+    deposed.iter().any(|(vk_bytes, t)| {
+        t.elapsed() < DEPOSED_GRACE
+            && VerifyingKey::from_bytes(vk_bytes)
+                .map(|vk| crate::bridge::peer_id_from_verifying_key(&vk) == *peer)
+                .unwrap_or(false)
+    })
 }
 
 /// Penalize the cryptographic AUTHOR of an invalid gossip message — never the
@@ -1104,7 +1180,8 @@ fn handle_event(
         )) => {
             let tracked = shared.outbound_direct.lock().unwrap().remove(&request_id);
             if let Some((target, message)) = tracked {
-                warn!(%peer, ?error, "direct send failed — re-enqueueing consensus message for reconnect flush");
+                // Re-enqueue unconditionally (cheap; the queue is bounded) so the next
+                // reconnect flush re-delivers the message.
                 shared
                     .pending_sends
                     .lock()
@@ -1113,7 +1190,16 @@ fn handle_event(
                 if let Some(ref m) = shared.metrics {
                     m.pending_sends_enqueued.inc();
                 }
+                // FIX 5 (S443): ALWAYS redial immediately — the dial is cheap (libp2p
+                // dedupes a dial to an already-dialing/connected peer) and is
+                // LOAD-BEARING for reconnection during post-fault churn: gating it broke
+                // 3-of-4 liveness (a survivor-survivor link that hiccuped waited out the
+                // backoff and quorum never re-formed — t12/t15 climbed 0). Throttle ONLY
+                // the per-peer WARN log, which was the actual ~5.3k lines/s storm.
                 let _ = swarm.dial(peer);
+                if should_redial_now(shared, &peer) {
+                    warn!(%peer, ?error, "direct send failed — re-enqueued for reconnect flush; redialing (log throttled)");
+                }
             } else {
                 warn!(%peer, ?error, "direct send failed (untracked payload)");
                 if let Some(ref m) = shared.metrics {
@@ -1179,18 +1265,13 @@ fn handle_event(
                 ..
             },
         )) => {
-            // Validator-set peers exempt (s350 FIX B): refusing block-data serve
-            // to a validator starves its sync and breaks cluster liveness.
-            if should_drop_banned_gossip(&mut *peer_scoring, shared, &peer) {
-                let _ = swarm.behaviour_mut().block_data.send_response(
-                    channel,
-                    BlockDataNetResponse {
-                        view: request.view,
-                        payload: Vec::new(),
-                    },
-                );
-                return;
-            }
+            // FIX 3 (S443): block-sync READS are served to EVERY peer — including a
+            // banned or recently-deposed one. Chain data is public, and refusing it is
+            // exactly what strands a confused deposed validator: it can never learn the
+            // chain state that would un-confuse it, so a transient tx-layer ban becomes
+            // permanent isolation (t15). Write/vote paths keep their ban gating; only
+            // this read-serve is opened. (Validators were already exempt via s350 FIX
+            // B; this generalizes that exemption to all readers.)
             let store = shared.block_store.read().unwrap();
             let store_len = store.len();
             let payload = store.get(&request.block_hash).cloned().unwrap_or_default();
@@ -1275,15 +1356,15 @@ fn handle_event(
                 ..
             },
         )) => {
-            // Banned peers (validator-set peers exempt, s350 FIX B: empty DA
-            // responses to a validator make its pull-fallback fail and veto valid
-            // proposals — s339: val1's 16 unrecovered pulls each broke a view's
-            // quorum) and pool overload both answer all-empty inline; the
-            // requester retries/rotates.
-            let banned = should_drop_banned_gossip(&mut *peer_scoring, shared, &peer);
-            let overloaded = !banned && !da_serve.try_admit();
-            if banned || overloaded {
-                if overloaded {
+            // FIX 3 (S443): native-DA (block-body) READS are served to EVERY peer,
+            // banned or recently-deposed included — same rationale as block-data:
+            // refusing a deposed validator its bodies is what isolates it permanently
+            // (t15). Only the serve-pool OVERLOAD cap still sheds load; write/vote
+            // paths keep their ban gating. (Validators were already exempt, s350 FIX
+            // B — empty DA responses to a validator vetoed valid proposals, s339.)
+            let overloaded = !da_serve.try_admit();
+            if overloaded {
+                {
                     debug!(%peer, "native-da serve pool at capacity — answering empty");
                     if let Some(ref m) = shared.metrics {
                         m.native_da_serve_dropped.inc();
@@ -1377,11 +1458,21 @@ fn handle_event(
             // Validator-set peers exempt (s350 FIX B): never refuse a quorum
             // member's connection — a banned validator that reconnects mid-ban
             // would otherwise be severed entirely until expiry.
-            if should_drop_banned_gossip(&mut *peer_scoring, shared, &peer_id) {
+            // FIX 3 (S443): also exempt a RECENTLY-DEPOSED validator — it is
+            // deterministically a few seconds behind the rotation and needs the
+            // connection to block-sync back into agreement; severing it here is the
+            // step that made the t15 deposition permanent isolation.
+            if should_drop_banned_gossip(&mut *peer_scoring, shared, &peer_id)
+                && !is_recently_deposed_peer(shared, &peer_id)
+            {
                 let _ = swarm.disconnect_peer_id(peer_id);
                 debug!("Disconnected banned peer {peer_id}");
             } else {
                 info!(%peer_id, %num_established, "peer connected");
+                // FIX 5 (S443): reset this peer's redial backoff on a real connect, so
+                // a future outage starts fresh at REDIAL_BACKOFF_MIN rather than the
+                // capped interval left over from the previous storm.
+                shared.redial_backoff.lock().unwrap().remove(&peer_id);
                 if let Some(ref m) = shared.metrics {
                     let count = swarm.connected_peers().count() as i64;
                     m.peers_connected.set(count);
@@ -1951,6 +2042,20 @@ fn verify_sender_key(
             None
         }
         None => {
+            // FIX 3 (S443): a validator deposed within the grace window is not yet
+            // aware it was removed and keeps sending votes; it is deterministically
+            // behind the rotation, not Byzantine. Drop its message (it is not in the
+            // set) but SKIP the `unregistered peer` penalty during grace — the
+            // accumulating penalties are what banned the honest deposed node and
+            // completed the t15 isolation. After grace expires, penalties resume.
+            if is_recently_deposed_key(shared, claimed_key) {
+                debug!(
+                    %authenticated_peer,
+                    "{context}: message from a recently-deposed validator — dropping without \
+                     penalty (grace window)"
+                );
+                return None;
+            }
             warn!(%authenticated_peer, "{context}: peer not in peer map");
             peer_scoring.penalize(
                 authenticated_peer,
@@ -2289,6 +2394,8 @@ mod tests {
             native_da_inbound: Mutex::new(VecDeque::new()),
             pending_native_pushes: Mutex::new(PendingSendQueue::new(8)),
             push_scheduler: Mutex::new(PushScheduler::for_pushes()),
+            recently_deposed: RwLock::new(HashMap::new()),
+            redial_backoff: Mutex::new(HashMap::new()),
             allow_private_addrs: false,
         }
     }
@@ -2318,6 +2425,72 @@ mod tests {
         assert!(result.is_none());
         // Should have been penalized
         assert!(scoring.score(&peer) < 100);
+    }
+
+    /// FIX 3 (S443): a validator deposed within the grace window still has its
+    /// message DROPPED (it is not in the set) but is NOT penalized as an
+    /// `unregistered peer`. The accumulating penalties were the ban trigger that
+    /// completed the t15 isolation.
+    /// RED at aff21fe: no grace path → the deposed peer is penalized (score < 100).
+    #[test]
+    fn verify_sender_key_grace_skips_penalty_for_recently_deposed() {
+        let vk = test_vk(4);
+        let peer = test_peer(4);
+        let shared = test_shared();
+        // Deposed (removed from peer_map) but within the grace window.
+        shared
+            .recently_deposed
+            .write()
+            .unwrap()
+            .insert(vk.to_bytes(), Instant::now());
+        let mut scoring = PeerScoring::new(None);
+        let result = verify_sender_key(&vk.to_bytes(), &peer, &shared, &mut scoring, "test");
+        assert!(result.is_none(), "deposed peer's vote is still not accepted");
+        assert_eq!(
+            scoring.score(&peer),
+            100,
+            "but NO penalty is applied during the deposition grace window"
+        );
+    }
+
+    /// FIX 3: a recently-deposed validator is matched by its derived PeerId so the
+    /// connect-time disconnect gate can exempt it.
+    #[test]
+    fn recently_deposed_peer_matched_by_derived_peer_id() {
+        let vk = test_vk(5);
+        let shared = test_shared();
+        let peer = crate::bridge::peer_id_from_verifying_key(&vk);
+        assert!(!is_recently_deposed_peer(&shared, &peer));
+        shared
+            .recently_deposed
+            .write()
+            .unwrap()
+            .insert(vk.to_bytes(), Instant::now());
+        assert!(
+            is_recently_deposed_peer(&shared, &peer),
+            "a just-deposed validator must be recognized by its PeerId for the disconnect exemption"
+        );
+    }
+
+    /// FIX 5 (S443): repeated direct-send failures to an unreachable peer redial at
+    /// most once per (growing) backoff interval, not once per buffered message.
+    /// RED at aff21fe: every failure dialed + logged (the ~5.3k lines/s storm).
+    #[test]
+    fn redial_backoff_throttles_repeated_failures() {
+        let shared = test_shared();
+        let peer = test_peer(6);
+        assert!(
+            should_redial_now(&shared, &peer),
+            "first failure after a healthy link redials immediately"
+        );
+        assert!(
+            !should_redial_now(&shared, &peer),
+            "an immediate second failure is throttled by the backoff"
+        );
+        let m = shared.redial_backoff.lock().unwrap();
+        let (next_at, interval) = m.get(&peer).copied().unwrap();
+        assert!(interval >= REDIAL_BACKOFF_MIN, "backoff interval is recorded");
+        assert!(next_at > Instant::now(), "next dial is scheduled in the future");
     }
 
     #[test]
