@@ -10,6 +10,23 @@ pub const CF_BLOCK_HEADERS: &str = "cf_block_headers";
 pub const CF_BLOCK_BODIES: &str = "cf_block_bodies";
 pub const CF_BLOCK_HASH_TO_NUMBER: &str = "cf_block_hash_to_number";
 
+/// Durable COMMIT MANIFEST keyed by 8-byte BE height. Value: the committed
+/// consensus datum bytes verbatim (a `bincode(CompactBlock)` under compact
+/// proposals, or `bincode(TorusBlock)` under full proposals).
+///
+/// Written as the FIRST durable action on every commit callback
+/// (`on_committed_block`), BEFORE the body is reconstructed/persisted. Its sole
+/// purpose is crash-recovery of the HEAL CHANNEL: a `CompactBlock` carries the
+/// `native_action_hashes`, which a boot-parked body-hole needs to content-address
+/// the missing bodies from PEERS (`/torus/native-da/1.0`). The persisted header
+/// (`CF_BLOCK_HEADERS`) records only `native_action_count`, NOT the hashes, so
+/// without this manifest a boot-parked hole cannot drive a peer pull and can only
+/// (futilely) wait for a local durable body — the silent-stall root cause
+/// (t12-r3-full: `execution stalled at height 1165 ... missing=0`). Pruned at
+/// dispatch once the body is durable (`CF_BLOCK_BODIES`), so it stays bounded to
+/// the committed-but-not-yet-executed window.
+pub const CF_COMMIT_MANIFEST: &str = "cf_commit_manifest";
+
 // Receipts and logs
 pub const CF_RECEIPTS: &str = "cf_receipts";
 /// Reserved for future eth_getLogs indexing. Currently unpopulated.
@@ -133,6 +150,7 @@ pub const ALL_CF_NAMES: &[&str] = &[
     CF_CODE,
     CF_BLOCK_HEADERS,
     CF_BLOCK_BODIES,
+    CF_COMMIT_MANIFEST,
     CF_BLOCK_HASH_TO_NUMBER,
     CF_RECEIPTS,
     CF_LOGS,

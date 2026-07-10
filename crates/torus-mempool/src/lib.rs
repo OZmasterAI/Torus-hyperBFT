@@ -1013,6 +1013,47 @@ mod tests {
         assert_eq!(pool.native_pool_size(), 1);
     }
 
+    /// Heal-channel retention (part B server side). A committed native body must
+    /// stay in the durable DA store (`CF_NATIVE_PENDING`) AFTER commit-prune, so a
+    /// peer can still serve it by-hash on `/torus/native-da/1.0` for a LONG-PAST
+    /// committed height (t12-r3-full h1165 was ~2600 heights old). This refutes the
+    /// "the DA server evicts old heights" premise: `remove_committed_native` prunes
+    /// only the in-memory selection pool, never the durable store — so the server's
+    /// `store.get_raw` (the exact read the serve path uses) still hits.
+    #[test]
+    fn committed_native_body_survives_commit_prune_in_durable_da() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state, MempoolConfig::default());
+
+        let key = k256::ecdsa::SigningKey::from_slice(
+            &alloy_primitives::hex::decode(
+                "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let signed = torus_types::eip712::sign_native_action(
+            torus_types::NativeAction::ClaimRewards,
+            now_ms(),
+            &key,
+        );
+        let hash = torus_types::compute_action_hash(&signed);
+
+        // The body is DA-mirrored (proposer push / gossip), as for any block body.
+        pool.mirror_native_to_da(std::slice::from_ref(&signed));
+        assert!(pool.get_native_da(&hash).is_some(), "precondition: body in durable DA store");
+
+        // The block commits: the in-memory selection pool is pruned...
+        pool.remove_committed_native(&[hash]);
+
+        // ...but the durable DA store STILL serves it — the heal channel for a
+        // parked hole at this (now old) committed height stays open.
+        assert!(
+            pool.get_native_da(&hash).is_some(),
+            "commit-prune must NOT evict the durable DA body — peers must still serve it by-hash"
+        );
+    }
+
     /// T2.1 (RED-first): gossip ingest dedups against the verified-sender
     /// trust cache BEFORE paying the ecrecover. The cache key commits to the
     /// full signature, so a HIT can only return what a fresh recover would —

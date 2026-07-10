@@ -38,7 +38,8 @@ use torus_economics::{EpochManager, SlashReason, StakingManager};
 use torus_evm::{EvmExecutor, TORUS_CHAIN_ID};
 use torus_mempool::Mempool;
 use torus_state::cf::{
-    CF_BLOCK_BODIES, CF_BLOCK_HEADERS, CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT,
+    CF_BLOCK_BODIES, CF_BLOCK_HEADERS, CF_COMMIT_MANIFEST, CF_CONSENSUS_META,
+    META_NATIVE_APPLIED_HEIGHT,
 };
 use torus_state::{NativeStateOverlay, StateBackend, StateDb};
 use torus_types::{
@@ -345,6 +346,84 @@ fn persist_committed_block_durably(state_db: &StateDb, block: &TorusBlock) {
             );
         }
     }
+}
+
+/// FIX (heal-channel crash-safety). Persist the committed consensus DATUM
+/// verbatim, keyed by height, to [`CF_COMMIT_MANIFEST`]. Called as the FIRST
+/// durable action on every commit callback (`on_committed_block`), BEFORE the
+/// body is reconstructed or the block enters the execution pipeline.
+///
+/// ROOT CAUSE this closes (part B): a `SIGKILL` in the commit->execute window can
+/// leave a committed NON-EMPTY height with its body absent from `CF_BLOCK_BODIES`
+/// (the body write in `dispatch_to_exec` had not landed). Boot crash-recovery
+/// PARKS that hole (FIX 1b), but the parked source (`ExecSource::Durable`) had no
+/// way to HEAL it from peers: the persisted header carries only
+/// `native_action_count`, not the `native_action_hashes`, so the node could not
+/// content-address the missing bodies for the `/torus/native-da/1.0` pull. It
+/// therefore stalled forever (`missing=0`, t12-r3-full h1165). The datum here is a
+/// `CompactBlock` under compact proposals — it carries exactly those hashes — so
+/// recovery can rebuild the compact reference and drive the peer pull (see
+/// [`recovery_exec_source`]). Best-effort: a write failure is loud but never
+/// aborts the commit (it degrades to the same un-healable-but-loud hole, never a
+/// silent state loss).
+fn persist_commit_manifest(state_db: &StateDb, height: u64, datum_bytes: &[u8]) {
+    if let Err(e) = state_db.put_cf_raw(CF_COMMIT_MANIFEST, &height.to_be_bytes(), datum_bytes) {
+        tracing::error!(
+            %e,
+            height,
+            "failed to persist commit manifest at commit time (a boot-parked hole here could not heal from peers)"
+        );
+    }
+}
+
+/// Best-effort prune of a committed height's manifest once its body is durable in
+/// `CF_BLOCK_BODIES` (i.e. at `dispatch_to_exec`, after
+/// [`persist_committed_block_durably`]). Keeps [`CF_COMMIT_MANIFEST`] bounded to
+/// the committed-but-not-yet-dispatched window: a still-parked hole never
+/// dispatches, so its manifest is retained for the heal; a healthy in-order block
+/// drops its (now-redundant) manifest immediately.
+fn prune_commit_manifest(state_db: &StateDb, height: u64) {
+    if let Err(e) = state_db.delete_cf_raw(CF_COMMIT_MANIFEST, &height.to_be_bytes()) {
+        tracing::warn!(%e, height, "failed to prune commit manifest (harmless; grows the CF)");
+    }
+}
+
+/// Load a committed height's durable datum from [`CF_COMMIT_MANIFEST`], if present.
+fn load_commit_manifest(state_db: &StateDb, height: u64) -> Option<Vec<u8>> {
+    match state_db.get_cf_raw(CF_COMMIT_MANIFEST, &height.to_be_bytes()) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(%e, height, "crash recovery: failed to read commit manifest");
+            None
+        }
+    }
+}
+
+/// FIX (heal channel). Decide how a boot-parked committed `height` re-enters the
+/// strict-order execution queue.
+///
+/// Prefer the durable COMMIT MANIFEST (the committed datum): decoded to a
+/// [`CompactBlock`] it yields `ExecSource::Compact`, whose reconstruction returns
+/// the REAL missing `native_action_hashes` on a body miss — so the heal loop
+/// (`note_exec_hole`) fans a `/torus/native-da/1.0` pull for those exact hashes
+/// out to ALL peers, which serve them from their durable `CF_NATIVE_PENDING`.
+/// A FULL-block datum decodes to `ExecSource::Ready` (bodies inline — no pull
+/// needed). Only when NO manifest exists (legacy pre-fix DBs) does this fall back
+/// to `ExecSource::Durable`, which can heal solely from a local durable body.
+fn recovery_exec_source(state_db: &StateDb, height: u64) -> ExecSource {
+    if let Some(datum) = load_commit_manifest(state_db, height) {
+        if let Ok(full) = bincode::deserialize::<TorusBlock>(&datum) {
+            return ExecSource::Ready(full);
+        }
+        if let Ok(compact) = bincode::deserialize::<CompactBlock>(&datum) {
+            return ExecSource::Compact(compact);
+        }
+        tracing::error!(
+            height,
+            "crash recovery: commit manifest present but undecodable — falling back to durable-body heal"
+        );
+    }
+    ExecSource::Durable(height)
 }
 
 /// PART 2 (P0 SAFETY, "commit means commit"): when a block re-arrives at a
@@ -1650,10 +1729,17 @@ impl TorusApp {
         if let Some(hole) = parked_hole {
             let committed = find_last_committed_height(&app.state_db).unwrap_or(hole);
             for h in hole..=committed {
+                // FIX (heal channel): seed each parked height from its durable
+                // COMMIT MANIFEST when present — a `CompactBlock` source whose
+                // reconstruction yields the REAL missing `native_action_hashes`, so
+                // `note_exec_hole` can pull those bodies from peers. Only a legacy
+                // record with no manifest falls back to `Durable(h)` (local-body
+                // heal only). This is the difference between a hole that heals and
+                // one that stalls forever at `missing=0` (t12-r3-full h1165).
                 app.deferred_exec.insert(
                     h,
                     DeferredExecBlock {
-                        source: ExecSource::Durable(h),
+                        source: recovery_exec_source(&app.state_db, h),
                         slashes: Vec::new(),
                     },
                 );
@@ -2656,6 +2742,20 @@ impl App<RocksKVStore> for TorusApp {
         };
 
         let height = header.height;
+
+        // FIX (heal channel): make the committed DATUM durable NOW, as the FIRST
+        // durable action of the commit callback — BEFORE the block is buffered,
+        // reconstructed, or dispatched (any of which can be deferred behind an
+        // earlier hole, widening the loss window). Under compact proposals the
+        // datum carries the `native_action_hashes`, which a boot-parked hole needs
+        // to content-address the missing bodies from peers. Cheap: one RocksDB
+        // write per COMMITTED block (not per voted block), a `CompactBlock` being
+        // hashes + small inline EVM/core-writer refs; pruned again once the body is
+        // durable (`dispatch_to_exec`). Without this, a SIGKILL in the
+        // commit->persist window strands the hole with no way to pull bodies
+        // (`missing=0`, t12-r3-full h1165).
+        persist_commit_manifest(&self.state_db, height, datum_bytes);
+
         // Committed: these hashes leave the in-flight window. The mempool prunes
         // them via `remove_committed_native` when the block actually executes.
         self.in_flight_hashes.clear(height);
@@ -2899,6 +2999,13 @@ impl TorusApp {
         // here (bodies reconstructed from the durable DA store), so this write is
         // authoritative; the execution-time writes remain as idempotent repeats.
         persist_committed_block_durably(&self.state_db, &torus_block);
+
+        // The body is now durable in `CF_BLOCK_BODIES`; the commit manifest that
+        // guarded the heal channel for this height is redundant. Drop it (best
+        // effort) so `CF_COMMIT_MANIFEST` stays bounded to the committed-but-not-
+        // yet-dispatched window. A still-parked hole never reaches here, so its
+        // manifest is retained for the pull.
+        prune_commit_manifest(&self.state_db, height);
 
         tracing::info!(
             height,
@@ -3685,6 +3792,213 @@ mod crash_recovery_tests {
             "a parked hole that outlives its heal budget must latch the same fail-stop as a live hole"
         );
         std::env::remove_var("TORUS_EXEC_HOLE_BUDGET_SECS");
+    }
+
+    // ---- HEAL-CHANNEL fix (part A window + part B peer pull) ----
+
+    /// Part A (kill-window durability of the RECONSTRUCTION KEY). The commit
+    /// callback persists the committed DATUM to `CF_COMMIT_MANIFEST` as its FIRST
+    /// durable action. A SIGKILL immediately after (before the body reaches
+    /// `CF_BLOCK_BODIES`) must still leave the `native_action_hashes` durably
+    /// recoverable — that key is what lets a boot-parked hole heal from peers.
+    ///
+    /// RED at 98b69e0: `persist_commit_manifest` / `load_commit_manifest` /
+    /// `CF_COMMIT_MANIFEST` do not exist (compile failure); there was NO durable
+    /// artifact carrying the committed height's action hashes.
+    #[test]
+    fn commit_manifest_persists_native_action_hashes_at_commit() {
+        let (_config, state_db) = make_test_config_and_db();
+        let actions: Vec<SignedNativeAction> = (0..20).map(sign_claim_rewards).collect();
+        // Height 5 (small: `make_block` links parent hashes recursively — the real
+        // h1165 recurses too deep for a test stack; the height is cosmetic here).
+        let block = make_block(5, actions.clone());
+
+        // Exactly what the commit callback ships: the compact consensus datum.
+        let datum = encode_proposal_datum(&block, true);
+        persist_commit_manifest(&state_db, 5, &datum);
+
+        // Survives the kill window: reload + decode yields the reconstruction key.
+        let loaded = load_commit_manifest(&state_db, 5).expect("manifest durable at commit");
+        let compact: CompactBlock =
+            bincode::deserialize(&loaded).expect("manifest decodes to the committed CompactBlock");
+        let want: Vec<_> = actions.iter().map(torus_types::compute_action_hash).collect();
+        assert_eq!(
+            compact.native_action_hashes, want,
+            "the manifest must carry every committed action hash (the peer-pull key)"
+        );
+    }
+
+    /// Part B (the essential fix). A boot-parked hole seeded from its durable
+    /// manifest must ARM the peer pull: reconstruction against an empty DA store
+    /// returns the REAL missing hashes (which `note_exec_hole` fans out to peers),
+    /// NOT the empty set the pre-fix `Durable` seed returned.
+    ///
+    /// RED at 98b69e0: `recovery_exec_source` does not exist (compile failure), and
+    /// the boot seed was `ExecSource::Durable(h)` whose `materialize_owned` returns
+    /// `Err((_, []))` — an EMPTY missing set — so the parked node pulled NOTHING
+    /// (`missing=0`, t12-r3-full h1165) and stalled forever.
+    #[test]
+    fn boot_parked_hole_arms_peer_pull_with_real_hashes() {
+        let (config, state_db) = make_test_config_and_db();
+        let actions: Vec<SignedNativeAction> = (0..20).map(sign_claim_rewards).collect();
+        let want: Vec<_> = actions.iter().map(torus_types::compute_action_hash).collect();
+        // Height 5 (small: `make_block` recurses over parent hashes; h1165 would
+        // overflow the test stack). The height is cosmetic to the heal logic.
+        let block = make_block(5, actions);
+
+        // Kill-window state: header + manifest durable at commit; body NEVER landed.
+        persist_header_only_for_test(&state_db, &block);
+        persist_commit_manifest(&state_db, 5, &encode_proposal_datum(&block, true));
+        // Mark applied so `TorusApp::new`'s replay is a no-op (this test drives the
+        // recovery/reconstruct seams directly, not the boot park path).
+        write_native_applied_height(&state_db, 5);
+
+        // The heal-channel seed decodes the manifest to a Compact source.
+        let source = recovery_exec_source(&state_db, 5);
+        let compact = match source {
+            ExecSource::Compact(c) => c,
+            _ => panic!("a manifest-backed boot hole must seed ExecSource::Compact"),
+        };
+        assert_eq!(compact.native_action_hashes, want);
+
+        // Reconstruct against an EMPTY DA store: the miss reports the REAL hashes,
+        // so the pull is armed for exactly those bodies.
+        let mempool = Arc::new(torus_mempool::Mempool::new(
+            state_db.clone(),
+            torus_mempool::MempoolConfig::default(),
+        ));
+        let app = TorusApp::new(state_db.clone(), &config, None, Some(mempool), None);
+        let missing = app
+            .reconstruct_compact_from_da(&compact)
+            .expect_err("empty DA store must miss");
+        assert_eq!(
+            missing, want,
+            "the parked hole must pull the committed height's REAL action hashes, not an empty set"
+        );
+
+        // Contrast: the pre-fix Durable seed cannot name any hashes to pull.
+        let durable_missing = match app.materialize_owned(ExecSource::Durable(5)) {
+            Err((_, missing)) => missing,
+            Ok(_) => panic!("no durable body was written — Durable must miss"),
+        };
+        assert!(
+            durable_missing.is_empty(),
+            "regression guard: the old Durable seed pulls nothing (an empty miss) — the stall"
+        );
+    }
+
+    /// Part B end-to-end (strict-order drain). A manifest-seeded parked hole must
+    /// NOT advance while its bodies are absent, then HEAL in order the moment the
+    /// bodies arrive in the durable DA store (a peer served the `/torus/native-da`
+    /// pull) — draining the whole contiguous run without executing out of order.
+    ///
+    /// RED at 98b69e0: seeded as `ExecSource::Durable`, this hole could heal ONLY
+    /// from a local durable body (which never comes — it was lost in the crash);
+    /// peer-delivered bodies landing in the DA store did nothing.
+    #[test]
+    fn boot_parked_hole_heals_from_peer_da_bodies() {
+        let mut app = TorusApp::stub();
+        let mempool = Arc::new(torus_mempool::Mempool::new(
+            app.state_db.clone(),
+            torus_mempool::MempoolConfig::default(),
+        ));
+        app.mempool = Some(mempool.clone());
+
+        let a5: Vec<SignedNativeAction> = vec![sign_claim_rewards(5)];
+        let a6: Vec<SignedNativeAction> = vec![sign_claim_rewards(6)];
+        let b5 = make_block(5, a5.clone());
+        let b6 = make_block(6, a6.clone());
+
+        // Seed exactly as manifest-backed boot parking does: Compact sources.
+        app.exec_next_height = Some(5);
+        app.exec_hole_since = Some(std::time::Instant::now());
+        app.deferred_exec.insert(
+            5,
+            DeferredExecBlock {
+                source: ExecSource::Compact(CompactBlock::from_block(&b5)),
+                slashes: Vec::new(),
+            },
+        );
+        app.deferred_exec.insert(
+            6,
+            DeferredExecBlock {
+                source: ExecSource::Compact(CompactBlock::from_block(&b6)),
+                slashes: Vec::new(),
+            },
+        );
+
+        // Bodies absent from the DA store: the hole holds, no out-of-order exec.
+        app.drain_exec_queue();
+        assert_eq!(app.exec_next_height, Some(5), "a missing-body hole must NOT advance");
+        assert!(!app.is_exec_failed(), "still within budget — no latch");
+
+        // A peer serves height 5's bodies into the durable DA store.
+        mempool.mirror_native_to_da(&a5);
+        app.drain_exec_queue();
+        assert_eq!(
+            app.exec_next_height,
+            Some(6),
+            "peer-delivered bodies must heal height 5 in order and advance to 6"
+        );
+
+        // Height 6's bodies arrive too: the run drains fully.
+        mempool.mirror_native_to_da(&a6);
+        app.drain_exec_queue();
+        assert_eq!(app.exec_next_height, Some(7), "the whole contiguous run heals in order");
+        assert!(app.deferred_exec.is_empty(), "queue fully drained");
+    }
+
+    /// Part B retry policy (task B2). The parked-hole heal loop must keep pulling
+    /// the missing bodies on EVERY commit — far past 9 attempts — for the full
+    /// heal budget, never giving up. (Peer ROTATION is the fetcher's job:
+    /// `LibP2PNetwork::fetch_native_actions_from_validators` fans each request to
+    /// ALL other validators, bridge.rs.) The "9 retries then fall back to sync"
+    /// quote in the evidence is the hotstuff-layer tip fetch
+    /// (`tick_pending_body_retries`), a DIFFERENT mechanism — the app-layer hole
+    /// heal has no such cap.
+    #[test]
+    fn parked_hole_heal_retries_far_past_nine_within_budget() {
+        use std::sync::Mutex;
+
+        struct RecordingFetcher {
+            calls: Mutex<Vec<Vec<[u8; 32]>>>,
+        }
+        impl NativeDaFetcher for RecordingFetcher {
+            fn fetch(&self, hashes: Vec<[u8; 32]>) {
+                self.calls.lock().unwrap().push(hashes);
+            }
+            fn drain(&self) -> Vec<Vec<u8>> {
+                Vec::new()
+            }
+        }
+
+        let mut app = TorusApp::stub();
+        let fetcher = Arc::new(RecordingFetcher {
+            calls: Mutex::new(Vec::new()),
+        });
+        app.da_fetcher = Some(fetcher.clone());
+        app.exec_hole_since = Some(std::time::Instant::now());
+
+        let missing: Vec<torus_types::B256> =
+            (0..20u8).map(|i| torus_types::B256::from([i; 32])).collect();
+
+        // 40 commit-driven retries (>> the hotstuff 9-cap): every one must issue a
+        // fresh pull for the REAL missing hashes, and none may fail-stop (default
+        // 5-min budget, freshly started).
+        for _ in 0..40 {
+            app.note_exec_hole(1165, &missing);
+        }
+
+        let calls = fetcher.calls.lock().unwrap();
+        assert_eq!(calls.len(), 40, "the heal loop must pull on every retry, never give up at 9");
+        assert!(
+            calls.iter().all(|c| c.len() == missing.len()),
+            "every retry pulls the REAL missing bodies (non-empty) — not the stalling empty set"
+        );
+        assert!(
+            !app.is_exec_failed(),
+            "40 quick retries must stay within the heal budget — no premature fail-stop"
+        );
     }
 
     /// T1.5 RED-first: a closed execution channel (= the execution thread
