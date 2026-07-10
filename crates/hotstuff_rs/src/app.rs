@@ -187,6 +187,15 @@ pub trait App<K: KVStore>: Send {
     ///
     /// `committed_hash` is the CryptoHash of the committed block.
     ///
+    /// # Delivery contract (S444, [`committed_feed`](crate::committed_feed))
+    ///
+    /// Deliveries are **at-least-once, strictly ascending in height**: no
+    /// committed height is ever skipped or delivered out of order, but heights
+    /// MAY be re-delivered after a restart (the durable fed-frontier is written
+    /// AFTER the callback runs, so a crash in between replays). Implementations
+    /// must treat a re-delivery of a height at or below their own durable
+    /// execution frontier as a cheap no-op.
+    ///
     /// Default implementation is a no-op (for backward compatibility during migration).
     fn on_committed_block(&mut self, _block: &Block, _committed_hash: CryptoHash) {
         // Default no-op for backward compatibility.

@@ -128,6 +128,28 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
     }
 
     fn execute(mut self) {
+        // S444 BOOT RECONCILE: deliver any committed-but-never-delivered blocks
+        // to the app before entering the loop. `update()` durably advances
+        // `highest_committed` BEFORE its caller fires `on_committed_block`, so a
+        // crash in that window (t15 tight kills; widest during block-sync
+        // catch-up jumps) leaves heights the commit walk will never revisit —
+        // without this replay the app starves on them forever (the min-height
+        // exec-feed gap: v3 committed 962 / fed 678).
+        match crate::committed_feed::feed_committed_blocks_to_app(
+            &mut self.block_tree,
+            &mut self.app,
+        ) {
+            Ok(0) => {}
+            Ok(n) => log::warn!(
+                "app feed: boot reconciliation delivered {} committed height(s) the app had \
+                 never received (crash window between commit write and callbacks)",
+                n
+            ),
+            Err(e) => log::error!("app feed: boot reconciliation failed: {:?}", e),
+        }
+        // S444 LIVE RECONCILE watchdog cadence (see step 9 in the loop).
+        let mut last_feed_reconcile = Instant::now();
+
         loop {
             // 1. Check whether the library user has issued a shutdown command. If so, break.
             match self.shutdown_signal.try_recv() {
@@ -280,6 +302,29 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
             // 8. Let the block sync client update its internal state, and trigger sync if needed.
             if let Err(e) = self.block_sync_client.tick(&mut self.block_tree) {
                 log::error!("BlockSync tick error: {:?} — continuing", e);
+            }
+
+            // 9. S444 LIVE RECONCILE watchdog (throttled): every commit path is
+            // supposed to feed the app synchronously, so finding undelivered
+            // committed heights here means some path advanced `highest_committed`
+            // without feeding — an unknown cousin of the min-height exec-feed
+            // gap. Surface it LOUDLY, then heal it (the feed delivers in order).
+            // Cost when healthy: three point reads per second.
+            if last_feed_reconcile.elapsed() >= Duration::from_secs(1) {
+                last_feed_reconcile = Instant::now();
+                match crate::committed_feed::feed_committed_blocks_to_app(
+                    &mut self.block_tree,
+                    &mut self.app,
+                ) {
+                    Ok(0) => {}
+                    Ok(n) => log::error!(
+                        "app feed: LIVE reconcile found and delivered {} committed height(s) \
+                         that never reached the app — a commit path advanced highest_committed \
+                         without feeding (self-healed; investigate the cousin path)",
+                        n
+                    ),
+                    Err(e) => log::error!("app feed: live reconcile failed: {:?}", e),
+                }
             }
         }
     }

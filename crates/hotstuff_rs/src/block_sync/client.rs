@@ -364,14 +364,18 @@ impl<N: Network> BlockSyncClient<N> {
                     }
                 });
 
-            for committed_hash in &update_result.committed_block_hashes {
-                if let Ok(Some(committed_block)) = block_tree.block(committed_hash) {
-                    app.on_committed_block(&committed_block, *committed_hash);
+            if !update_result.committed_block_hashes.is_empty() {
+                // S444: deliver through the durable-frontier feed (replays any
+                // committed-but-never-delivered heights, strictly in order).
+                if let Err(e) =
+                    crate::committed_feed::feed_committed_blocks_to_app(block_tree, app)
+                {
+                    log::error!("app feed after sync re-drive commit failed: {:?}", e);
                 }
                 // Count commit progress so the session is not judged futile and the
                 // next batch start advances past the now-committed hole.
                 if let Some(session) = self.pending_sync.as_mut() {
-                    session.blocks_synced += 1;
+                    session.blocks_synced += update_result.committed_block_hashes.len() as u64;
                 }
             }
             if let Some(vs_updates) = update_result.validator_set_updates {
@@ -505,10 +509,13 @@ impl<N: Network> BlockSyncClient<N> {
                     }
                 });
 
-            // Call on_committed_block for each newly committed block during sync.
-            for committed_hash in &update_result.committed_block_hashes {
-                if let Ok(Some(committed_block)) = block_tree.block(committed_hash) {
-                    app.on_committed_block(&committed_block, *committed_hash);
+            // S444: deliver newly committed blocks through the durable-frontier
+            // feed (replays committed-but-never-delivered heights, in order).
+            if !update_result.committed_block_hashes.is_empty() {
+                if let Err(e) =
+                    crate::committed_feed::feed_committed_blocks_to_app(block_tree, app)
+                {
+                    log::error!("app feed after sync commit failed: {:?}", e);
                 }
             }
             if let Some(vs_updates) = update_result.validator_set_updates {
@@ -529,9 +536,11 @@ impl<N: Network> BlockSyncClient<N> {
                             validator_set_updates: None,
                             committed_block_hashes: vec![],
                         });
-                    for committed_hash in &update_result2.committed_block_hashes {
-                        if let Ok(Some(committed_block)) = block_tree.block(committed_hash) {
-                            app.on_committed_block(&committed_block, *committed_hash);
+                    if !update_result2.committed_block_hashes.is_empty() {
+                        if let Err(e) = crate::committed_feed::feed_committed_blocks_to_app(
+                            block_tree, app,
+                        ) {
+                            log::error!("app feed after sync highest_pc commit failed: {:?}", e);
                         }
                     }
                     if let Some(vs_updates) = update_result2.validator_set_updates {

@@ -1235,6 +1235,22 @@ impl<W: WriteBatch> BlockTreeWriteBatch<W> {
         Ok(())
     }
 
+    /// S444 app feed frontier: persist the highest committed height already
+    /// delivered to the app via `on_committed_block` (see
+    /// [`committed_feed`](crate::committed_feed)).
+    pub fn set_app_fed_block_height(&mut self, height: BlockHeight) -> Result<(), BlockTreeError> {
+        let _: () = self.0.set(
+            &variables::APP_FED_BLOCK_HEIGHT,
+            &height
+                .try_to_vec()
+                .map_err(|err| KVSetError::SerializeValueError {
+                    key: Key::BlockAtHeight { height },
+                    source: err,
+                })?,
+        );
+        Ok(())
+    }
+
     /* ↓↓↓ Block to Children ↓↓↓ */
 
     pub fn set_children(
@@ -1712,6 +1728,36 @@ impl<K: KVStore> BlockTreeSingleton<K> {
         } else {
             Ok(None)
         }
+    }
+
+    /// S444 app feed frontier: the highest committed height already delivered to
+    /// the app via `on_committed_block`. `None` if the feed has never run on this
+    /// store (fresh chain, or first boot after the feed was introduced).
+    pub fn app_fed_block_height(&self) -> Result<Option<BlockHeight>, BlockTreeError> {
+        use borsh::BorshDeserialize;
+        if let Some(bytes) = self.0.get(&variables::APP_FED_BLOCK_HEIGHT) {
+            let height = BlockHeight::deserialize(&mut bytes.as_slice()).map_err(|err| {
+                KVGetError::DeserializeValueError {
+                    key: Key::HighestCommittedBlock,
+                    source: err,
+                }
+            })?;
+            Ok(Some(height))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// S444 app feed frontier: durably advance the fed frontier (single small
+    /// write batch; called once per feed pass that delivered at least one block).
+    pub fn advance_app_fed_block_height(
+        &mut self,
+        height: BlockHeight,
+    ) -> Result<(), BlockTreeError> {
+        let mut wb: BlockTreeWriteBatch<K::WriteBatch> = BlockTreeWriteBatch::new();
+        wb.set_app_fed_block_height(height)?;
+        self.write(wb);
+        Ok(())
     }
 
     /// Block-tree pruner: prune committed blocks that fell out of the retention

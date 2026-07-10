@@ -181,17 +181,22 @@ impl<N: Network> HotStuff<N> {
     }
 
     /// Process an `UpdateResult` from `block_tree.update()`:
-    /// 1. Call `app.on_committed_block()` for each newly committed block (oldest first).
+    /// 1. Deliver newly committed blocks to the app (oldest first) through the
+    ///    durable-frontier feed ([`committed_feed`](crate::committed_feed), S444):
+    ///    the feed replays any committed-but-never-delivered heights too, so a
+    ///    crash between the commit write and the callbacks can never permanently
+    ///    starve execution (the min-height exec-feed gap).
     /// 2. Forward validator set updates to the network layer.
     fn process_update_result<K: KVStore>(
         &mut self,
         result: UpdateResult,
-        block_tree: &BlockTreeSingleton<K>,
+        block_tree: &mut BlockTreeSingleton<K>,
         app: &mut impl App<K>,
     ) {
-        for committed_hash in &result.committed_block_hashes {
-            if let Ok(Some(committed_block)) = block_tree.block(committed_hash) {
-                app.on_committed_block(&committed_block, *committed_hash);
+        if !result.committed_block_hashes.is_empty() {
+            if let Err(e) = crate::committed_feed::feed_committed_blocks_to_app(block_tree, app)
+            {
+                log::error!("app feed after commit failed: {:?}", e);
             }
         }
         if let Some(vs_updates) = result.validator_set_updates {

@@ -2819,6 +2819,29 @@ impl App<RocksKVStore> for TorusApp {
 
         let height = header.height;
 
+        // S444 AT-LEAST-ONCE FEED GUARD: hotstuff's committed-block feed is
+        // replayed from a durable frontier (the min-height exec-feed gap fix),
+        // so heights the app ALREADY dispatched to execution may be re-delivered
+        // after a restart. Skip them BEFORE any durable side effect: re-writing
+        // the commit manifest would leak it (manifests are pruned at dispatch),
+        // and re-buffering would churn the strict-order queue. Seeding mirrors
+        // `enqueue_for_execution` exactly, so the first-delivery path is
+        // unchanged. (`last_header` needs no advance here: a height below the
+        // exec frontier is at or below the durable header frontier too.)
+        let next_expected = *self.exec_next_height.get_or_insert_with(|| {
+            read_native_applied_height(&self.state_db)
+                .map(|a| a + 1)
+                .unwrap_or(height)
+        });
+        if height < next_expected {
+            tracing::debug!(
+                height,
+                next_expected,
+                "on_committed_block: benign re-delivery below the exec frontier — skipped"
+            );
+            return;
+        }
+
         // FIX (heal channel): make the committed DATUM durable NOW, as the FIRST
         // durable action of the commit callback — BEFORE the block is buffered,
         // reconstructed, or dispatched (any of which can be deferred behind an
@@ -5836,6 +5859,41 @@ mod crash_recovery_tests {
             msg.torus_block.header.canonical_header_bytes(),
             committed_block.header.canonical_header_bytes(),
             "header handed to execution must be byte-identical to the committed header"
+        );
+    }
+
+    /// S444 AT-LEAST-ONCE FEED, app-side idempotency (RED-first). The hotstuff
+    /// committed-block feed is replayed from a durable frontier after a restart
+    /// (the min-height exec-feed gap fix), so `on_committed_block` may re-deliver
+    /// heights the app has ALREADY sent to execution. A re-delivery below the
+    /// exec frontier must be a cheap no-op: no manifest re-write (they are pruned
+    /// at dispatch and would otherwise leak), no buffering, no frontier movement.
+    ///
+    /// RED at 2a80ff0: `persist_commit_manifest` ran unconditionally as the first
+    /// durable action of the callback, so a replayed height re-created its
+    /// (already pruned) CF_COMMIT_MANIFEST entry.
+    #[test]
+    fn redelivered_committed_height_below_exec_frontier_is_skipped() {
+        let mut app = TorusApp::stub();
+        app.exec_next_height = Some(10);
+
+        let old_block = make_block(5, vec![sign_claim_rewards(5)]);
+        let committed = committed_compact_block(&old_block);
+        app.on_committed_block(&committed, committed.hash);
+
+        assert!(
+            load_commit_manifest(&app.state_db, 5).is_none(),
+            "a benign re-delivery below the exec frontier must NOT re-write its commit \
+             manifest (pruned at dispatch; re-writing leaks it forever)"
+        );
+        assert!(
+            app.deferred_exec.is_empty(),
+            "a re-delivered height below the frontier must never be buffered for execution"
+        );
+        assert_eq!(
+            app.exec_next_height,
+            Some(10),
+            "the exec frontier must not move on a re-delivery"
         );
     }
 

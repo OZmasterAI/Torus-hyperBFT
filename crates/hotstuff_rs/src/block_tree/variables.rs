@@ -165,6 +165,12 @@ pub const EQUIVOCATION_EVIDENCE: [u8; 1] = [21];
 /// pointer). Heights below this have had their [`BLOCKS`], [`BLOCK_AT_HEIGHT`]
 /// and [`BLOCK_TO_CHILDREN`] entries deleted.
 pub const BLOCK_TREE_PRUNED_HEIGHT: [u8; 1] = [22];
+/// S444 app feed frontier: the highest committed height that has been DELIVERED
+/// to the [`App`](crate::app::App) via `on_committed_block`. Persisted AFTER the
+/// callbacks run (the reverse of `HIGHEST_COMMITTED_BLOCK`, which is persisted
+/// before), so a crash between the two re-delivers instead of losing heights —
+/// the `on_committed_block` contract is at-least-once, strictly ascending.
+pub const APP_FED_BLOCK_HEIGHT: [u8; 1] = [23];
 
 // Fields of Block
 pub const BLOCK_HEIGHT: [u8; 1] = [0];

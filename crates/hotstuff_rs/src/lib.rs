@@ -141,6 +141,8 @@ pub mod block_sync;
 
 pub mod replica;
 
+mod committed_feed;
+
 mod event_bus;
 
 pub mod events;
