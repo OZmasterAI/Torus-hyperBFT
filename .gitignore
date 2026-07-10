@@ -9,3 +9,5 @@ LIVE_STATE.json
 *.keystore
 .claude/
 testnet/data/
+__pycache__/
+*.pyc
