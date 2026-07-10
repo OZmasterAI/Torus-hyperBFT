@@ -452,6 +452,38 @@ impl NativeStateOverlay {
     /// the (off-by-default) incremental root is merely stale for that block (repaired by replay /
     /// caught by the runtime oracle).
     pub fn flush_with_native_trie(&self, target: &StateDb) -> Result<(), StateError> {
+        self.flush_with_native_trie_inner(target, None)
+    }
+
+    /// Like [`flush_with_native_trie`], but additionally folds the native applied-height marker
+    /// (`CF_CONSENSUS_META` / `META_NATIVE_APPLIED_HEIGHT`, big-endian `u64`) into the SAME atomic
+    /// `WriteBatch` as the native-CF writes and the trie/mirror updates.
+    ///
+    /// Crash-safety (T156-F1): previously `execute_committed_block` flushed native state and THEN
+    /// wrote the applied-height marker in a separate, error-swallowing call. A hard crash in that
+    /// window left the block's native state durable but the height still marked un-applied, so a
+    /// restart re-executed the block and double-applied non-nonce-guarded effects (fee distribution,
+    /// epoch rewards). Folding the marker into this batch makes native state and its "this height is
+    /// applied" marker commit together or not at all.
+    ///
+    /// The marker is encoded byte-for-byte identically to the old `write_native_applied_height`
+    /// (`META_NATIVE_APPLIED_HEIGHT` -> `applied_height.to_be_bytes()`).
+    pub fn flush_with_native_trie_and_marker(
+        &self,
+        target: &StateDb,
+        applied_height: u64,
+    ) -> Result<(), StateError> {
+        self.flush_with_native_trie_inner(target, Some(applied_height))
+    }
+
+    /// Shared implementation for [`flush_with_native_trie`] and
+    /// [`flush_with_native_trie_and_marker`]. When `applied_height` is `Some(h)`, the native
+    /// applied-height marker is appended to the same batch (T156-F1).
+    fn flush_with_native_trie_inner(
+        &self,
+        target: &StateDb,
+        applied_height: Option<u64>,
+    ) -> Result<(), StateError> {
         let state = self.pending.read().unwrap();
         let raw = target.inner();
         let mut batch = WriteBatch::default();
@@ -487,6 +519,18 @@ impl NativeStateOverlay {
         } else {
             crate::native_trie::apply_native_dirty_to_batch(target, &mut batch, &dirty).map(|_| ())
         };
+
+        // T156-F1: fold the native applied-height marker into the SAME batch as the native writes,
+        // so a crash can never leave native state flushed but the height still un-marked (which would
+        // double-apply the block on restart replay). Encoded exactly as write_native_applied_height.
+        if let Some(height) = applied_height {
+            let cf = raw.cf_handle(crate::cf::CF_CONSENSUS_META).ok_or_else(|| {
+                StateError::MissingColumnFamily(crate::cf::CF_CONSENSUS_META.to_string())
+            })?;
+            let marker = height.to_be_bytes();
+            batch.put_cf(cf, crate::cf::META_NATIVE_APPLIED_HEIGHT, marker);
+        }
+
         target.write(batch)?;
         trie_result
     }
@@ -843,6 +887,80 @@ mod tests {
             crate::native_trie::native_root_full(&db).unwrap()
         );
         assert_ne!(persisted, crate::trie::EMPTY_ROOT_HASH);
+    }
+
+    /// T156-F1 RED-first: `flush_with_native_trie_and_marker` must persist BOTH the native-CF writes
+    /// AND the applied-height marker atomically (one `WriteBatch`), so a crash can never leave native
+    /// state durable while the height is still marked un-applied (which double-applies on replay).
+    ///
+    /// RED on pre-fix code: the method did not exist — the marker was written by a separate call in
+    /// `execute_committed_block` AFTER the flush returned, so this test both fails to compile pre-fix
+    /// (missing symbol) and encodes the atomicity the fix guarantees. GREEN after: reading the DB
+    /// finds the native balance AND the marker, and the marker is byte-for-byte the height's BE bytes.
+    #[test]
+    fn flush_with_native_trie_and_marker_writes_marker_atomically() {
+        use crate::cf::{CF_CONSENSUS_META, CF_STAKING_VALIDATORS, META_NATIVE_APPLIED_HEIGHT};
+        let (db, _dir) = temp_db();
+        crate::native_trie::build_native_trie_to_cf(&db).unwrap(); // empty base
+
+        // Before the flush the marker is absent.
+        assert!(
+            StateDb::get_cf_raw(&db, CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT)
+                .unwrap()
+                .is_none(),
+            "marker must not exist before the flush"
+        );
+
+        let overlay = NativeStateOverlay::new(db.clone());
+        StateBackend::put_cf_raw(&overlay, CF_NATIVE_BALANCES, b"\x00\x01acct", b"bal1").unwrap();
+        StateBackend::put_cf_raw(&overlay, CF_STAKING_VALIDATORS, b"val1", b"stake").unwrap();
+
+        let height: u64 = 42;
+        overlay
+            .flush_with_native_trie_and_marker(&db, height)
+            .unwrap();
+
+        // Native write landed.
+        assert_eq!(
+            StateDb::get_cf_raw(&db, CF_NATIVE_BALANCES, b"\x00\x01acct")
+                .unwrap()
+                .unwrap(),
+            b"bal1"
+        );
+        // Marker landed in the SAME flush, byte-for-byte the BE height (== write_native_applied_height).
+        assert_eq!(
+            StateDb::get_cf_raw(&db, CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT)
+                .unwrap()
+                .unwrap(),
+            height.to_be_bytes().to_vec(),
+            "the applied-height marker must be flushed atomically with native state"
+        );
+        // The trie stayed consistent (marker put must not disturb native-root maintenance).
+        assert_eq!(
+            crate::native_trie::persisted_native_root(&db).unwrap(),
+            crate::native_trie::native_root_full(&db).unwrap()
+        );
+    }
+
+    /// T156-F1: the plain `flush_with_native_trie` (no marker) must NOT touch the applied-height
+    /// marker — only the `_and_marker` variant writes it. Guards against the marker leaking into
+    /// callers (chaos tests, incremental-root maintenance) that only want native state flushed.
+    #[test]
+    fn flush_with_native_trie_leaves_marker_untouched() {
+        use crate::cf::{CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT};
+        let (db, _dir) = temp_db();
+        crate::native_trie::build_native_trie_to_cf(&db).unwrap();
+
+        let overlay = NativeStateOverlay::new(db.clone());
+        StateBackend::put_cf_raw(&overlay, CF_NATIVE_BALANCES, b"\x00\x01acct", b"bal1").unwrap();
+        overlay.flush_with_native_trie(&db).unwrap();
+
+        assert!(
+            StateDb::get_cf_raw(&db, CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT)
+                .unwrap()
+                .is_none(),
+            "flush_with_native_trie must not write the applied-height marker"
+        );
     }
 
     /// T4.4 revert-safety: reverting to a checkpoint rolls native writes made in the frame

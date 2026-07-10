@@ -58,6 +58,54 @@ struct CommittedBlockMsg {
     pending_slashes: Vec<PendingSlash>,
 }
 
+/// Regime-B strict-order execution: how a committed block's bodies reach the
+/// execution pipeline. Either the bodies are already in hand (a FULL consensus
+/// datum, or a cached proposal whose action hashes match the committed compact),
+/// or only the compact reference is known and the bodies must be reconstructed
+/// from the durable DA store (which may still be missing them → a heal-able
+/// hole). Kept as a source (not a pre-reconstructed block) so a deferred hole is
+/// RE-reconstructed from the (healing) DA store on each drain attempt.
+enum ExecSource {
+    /// Bodies present now — send as soon as it is this height's turn in line.
+    Ready(TorusBlock),
+    /// Reconstruct from the durable DA store on each attempt (may miss → hole).
+    Compact(CompactBlock),
+}
+
+/// A committed block buffered awaiting its strictly-ordered turn to execute.
+/// Only ever populated while an earlier height is an unhealed hole — in the
+/// healthy in-order case the queue stays empty and the hot path never touches
+/// this map (see [`TorusApp::enqueue_for_execution`]).
+struct DeferredExecBlock {
+    source: ExecSource,
+    slashes: Vec<PendingSlash>,
+}
+
+/// Regime-B: how long an execution hole (a committed block whose native bodies
+/// cannot be reconstructed) may keep retrying before the node fail-stops. A node
+/// that cannot obtain a committed block's bodies is broken, and a silent
+/// divergence is far worse than a loud halt. Overridable via
+/// `TORUS_EXEC_HOLE_BUDGET_SECS` for ops; default ~5 min of retries.
+const EXEC_HOLE_FAILSTOP_BUDGET: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// Regime-B: throttle for the loud "execution stalled at height H" warning so an
+/// unrecoverable hole keeps screaming at a readable cadence (never silent, never
+/// per-tick spam) while it retries.
+const EXEC_HOLE_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Regime-B. The heal budget for an execution hole, [`EXEC_HOLE_FAILSTOP_BUDGET`]
+/// by default, overridable via `TORUS_EXEC_HOLE_BUDGET_SECS` (0 = fail-stop on
+/// the first stalled attempt — useful for tests / paranoid operators).
+fn exec_hole_failstop_budget() -> std::time::Duration {
+    match std::env::var("TORUS_EXEC_HOLE_BUDGET_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        Some(secs) => std::time::Duration::from_secs(secs),
+        None => EXEC_HOLE_FAILSTOP_BUDGET,
+    }
+}
+
 /// Shared consensus state for leader discovery by non-consensus components (RPC).
 pub struct LeaderState {
     view: AtomicU64,
@@ -203,6 +251,23 @@ where
     None
 }
 
+/// T1.2 completeness gate for the `on_committed_block` cache fast-path: a cached
+/// proposal may only supply the bodies for a committed compact when its native
+/// actions hash-for-hash (order + value) to the committed reference. Any drift
+/// (a stale same-height re-proposal, a partial/other action set) rejects the
+/// cache so the caller falls back to the all-or-nothing DA reconstruction.
+///
+/// Cost: O(n) `compute_action_hash` over the cached actions — the same order as
+/// the DA reconstruction's per-hash lookup it replaces, never heavier.
+fn cached_matches_compact(cached: &TorusBlock, compact: &CompactBlock) -> bool {
+    cached.native_actions.len() == compact.native_action_hashes.len()
+        && cached
+            .native_actions
+            .iter()
+            .map(torus_types::compute_action_hash)
+            .eq(compact.native_action_hashes.iter().copied())
+}
+
 fn persist_block_header(state_db: &StateDb, block: &TorusBlock) {
     let block_hash = alloy_primitives::keccak256(block.header.canonical_header_bytes());
     let header_json = match serde_json::to_vec(&block.header) {
@@ -221,6 +286,243 @@ fn persist_block_header(state_db: &StateDb, block: &TorusBlock) {
     }
 }
 
+/// PART 2 (P0 SAFETY, "commit means commit"): when a block re-arrives at a
+/// height we have ALREADY applied, decide whether it is a benign duplicate
+/// (same block hash → silent skip) or a CONFLICTING commit (a DIFFERENT block
+/// hash at a height we already finalized — a local agreement violation).
+///
+/// The persisted header at `CF_BLOCK_HEADERS[height]` stores the committed
+/// block's hash in its first 32 bytes (see [`persist_block_header`] /
+/// `BlockCommitter::commit_block_metadata`). We compare that against
+/// `incoming_hash` = `keccak256(header.canonical_header_bytes())`.
+///
+/// On a genuine conflict this SCREAMS with both hashes and latches `exec_failed`
+/// (the same fail-stop latch used by the T1.5 native-exec watcher), returning
+/// `true` so the caller aborts instead of silently dropping the divergent block.
+/// A same-hash duplicate, or no persisted header, returns `false` (unchanged
+/// silent-skip behavior).
+fn detect_conflicting_commit(
+    state_db: &StateDb,
+    height: u64,
+    incoming_hash: &alloy_primitives::B256,
+    exec_failed: &std::sync::atomic::AtomicBool,
+) -> bool {
+    let data = match state_db.get_cf_raw(CF_BLOCK_HEADERS, &height.to_be_bytes()) {
+        Ok(Some(d)) if d.len() >= 32 => d,
+        // No persisted header (or a truncated one) to compare against — cannot
+        // assert a conflict, so preserve the benign silent-skip behavior.
+        _ => return false,
+    };
+    if data[..32] == incoming_hash.as_slice()[..] {
+        // Same block re-arriving at an already-applied height: benign duplicate.
+        return false;
+    }
+
+    let persisted = alloy_primitives::B256::from_slice(&data[..32]);
+    tracing::error!(
+        height,
+        committed_hash = %persisted,
+        incoming_hash = %incoming_hash,
+        "CRITICAL SAFETY VIOLATION: a DIFFERENT block arrived at an already-applied height — \
+         two conflicting blocks were finalized at the same height. Latching fail-stop \
+         (commit means commit); halting the execution pipeline."
+    );
+    exec_failed.store(true, Ordering::SeqCst);
+    true
+}
+
+// ---- Crash-recovery gap replay (T156-F2) ----
+
+/// Load and deserialize the durable header for `height` from `CF_BLOCK_HEADERS`.
+/// Returns `None` when the header is missing OR corrupt — both are "cannot load" for replay.
+fn load_replay_header(state_db: &StateDb, height: u64) -> Option<TorusBlockHeader> {
+    match state_db.get_cf_raw(CF_BLOCK_HEADERS, &height.to_be_bytes()) {
+        Ok(Some(data)) if data.len() > 32 => match serde_json::from_slice(&data[32..]) {
+            Ok(h) => Some(h),
+            Err(e) => {
+                tracing::error!(%e, height, "crash recovery: failed to deserialize block header");
+                None
+            }
+        },
+        Ok(Some(_)) => {
+            tracing::error!(height, "crash recovery: block header record too short");
+            None
+        }
+        Ok(None) => None,
+        Err(e) => {
+            tracing::error!(%e, height, "crash recovery: error reading block header");
+            None
+        }
+    }
+}
+
+/// Load and deserialize the durable body for `height` from `CF_BLOCK_BODIES`.
+/// Returns `None` when the body is missing (never persisted / pruned) OR corrupt.
+fn load_replay_body(state_db: &StateDb, height: u64) -> Option<TorusBlockBody> {
+    match state_db.get_cf_raw(CF_BLOCK_BODIES, &height.to_be_bytes()) {
+        Ok(Some(data)) => match serde_json::from_slice(&data) {
+            Ok(b) => Some(b),
+            Err(e) => {
+                tracing::error!(%e, height, "crash recovery: failed to deserialize block body");
+                None
+            }
+        },
+        Ok(None) => None,
+        Err(e) => {
+            tracing::error!(%e, height, "crash recovery: error reading block body");
+            None
+        }
+    }
+}
+
+/// Outcome of replaying the `[applied+1, committed]` execution gap.
+#[derive(Debug)]
+enum ReplayGapOutcome {
+    /// Every height in the gap was loaded and executed in order; carries the last (== committed)
+    /// header so the caller can set `last_header` / the leader view.
+    Complete(TorusBlockHeader),
+    /// A height in the gap could NOT be reconstructed (missing/corrupt header, or a missing/corrupt
+    /// body while the header says the block is non-empty). The node must fail-stop rather than mark
+    /// the height applied without executing it (silent state loss). Carries the offending height and
+    /// the last header that WAS successfully executed before the hole.
+    Hole {
+        height: u64,
+        last_good: TorusBlockHeader,
+    },
+}
+
+/// Replay every committed-but-unexecuted block in `(applied, committed]`, in ascending height order
+/// (T156-F2). Factored out as a pure seam so the loop, the empty-vs-pruned decision, and the
+/// fail-stop-on-hole behavior are unit-testable without a live `TorusApp`/RocksDB.
+///
+/// For each height:
+///   - `load_header(h)` must return the header, else the block is unreconstructable -> `Hole`.
+///   - A header whose native/EVM counts are both zero is a genuine empty block: it is executed with
+///     empty bodies (no body load needed; `execute` just advances the applied marker).
+///   - A non-empty header requires `load_body(h)`; a missing/corrupt body (e.g. pruned) is a `Hole`.
+///     This replaces the old "no body -> silently mark applied" arm, which lost state for pruned
+///     bodies that are indistinguishable from empty blocks by presence alone.
+///
+/// On a `Hole` the loop STOPS immediately: it does NOT execute or mark the offending height (or any
+/// height past it), so `applied` stays below the hole and the caller can latch the fail-stop.
+fn replay_gap<H, B, X>(
+    applied: u64,
+    committed: u64,
+    mut load_header: H,
+    mut load_body: B,
+    mut execute: X,
+) -> ReplayGapOutcome
+where
+    H: FnMut(u64) -> Option<TorusBlockHeader>,
+    B: FnMut(u64) -> Option<TorusBlockBody>,
+    X: FnMut(&TorusBlock),
+{
+    let mut last_good = torus_bridge::genesis_parent_header();
+    for height in (applied + 1)..=committed {
+        let header = match load_header(height) {
+            Some(h) => h,
+            None => {
+                tracing::error!(
+                    height,
+                    committed_height = committed,
+                    "crash recovery: FAIL-STOP — cannot load header for committed gap height; refusing to skip it (would silently lose state)"
+                );
+                return ReplayGapOutcome::Hole { height, last_good };
+            }
+        };
+
+        let is_empty = header.native_action_count == 0 && header.evm_tx_count == 0;
+        let block = if is_empty {
+            TorusBlock {
+                header: header.clone(),
+                native_actions: vec![],
+                evm_transactions: vec![],
+                core_writer_actions: vec![],
+            }
+        } else {
+            match load_body(height) {
+                Some(body) => TorusBlock {
+                    header: header.clone(),
+                    native_actions: body.native_actions,
+                    evm_transactions: body.evm_transactions,
+                    core_writer_actions: body.core_writer_actions,
+                },
+                None => {
+                    tracing::error!(
+                        height,
+                        committed_height = committed,
+                        native_action_count = header.native_action_count,
+                        evm_tx_count = header.evm_tx_count,
+                        "crash recovery: FAIL-STOP — body missing/pruned for NON-EMPTY committed gap height; refusing to mark applied without executing (would silently lose state)"
+                    );
+                    return ReplayGapOutcome::Hole { height, last_good };
+                }
+            }
+        };
+
+        execute(&block);
+        last_good = header;
+    }
+    ReplayGapOutcome::Complete(last_good)
+}
+
+/// Authoritative ancestry check at commit/execution time.
+///
+/// Execution is sequential, so the parent (height-1) is guaranteed applied and
+/// persisted by the time we execute `height`. Regime-B strict-order execution
+/// STRENGTHENS this from "usually true" to STRICTLY SOUND: the pipeline never
+/// receives H+1 before H (a missing-body H holds every later height in the
+/// `deferred_exec` queue until it heals), so the parent is ALWAYS persisted
+/// before its child reaches this check — a mismatch here is therefore a genuine
+/// ancestry/fork violation, never an artefact of out-of-order execution.
+/// We compare the block's
+/// `parent_hash` against the keccak canonical hash we durably recorded for the
+/// parent (first 32 bytes of `CF_BLOCK_HEADERS[height-1]`, written by
+/// [`persist_block_header`] / `commit_block_metadata`). Unlike the best-effort
+/// voting-time check in `validate_block`, this cannot be fooled by a pending
+/// parent — the parent is already final here.
+///
+/// Genesis edge: the height-1 block's parent is the synthetic
+/// `genesis_parent_header` (never persisted), so its expected hash is computed
+/// directly. If the parent header cannot be resolved (missing/truncated) we
+/// cannot assert a conflict, so we allow — the same conservative stance as
+/// [`detect_conflicting_commit`].
+///
+/// On a genuine mismatch this SCREAMS with both hashes and latches the fail-stop
+/// (`exec_failed`), returning `true` so the caller aborts.
+fn detect_parent_link_violation(
+    state_db: &StateDb,
+    height: u64,
+    parent_hash: &alloy_primitives::B256,
+    exec_failed: &std::sync::atomic::AtomicBool,
+) -> bool {
+    if height == 0 {
+        return false;
+    }
+    let expected = if height == 1 {
+        alloy_primitives::keccak256(torus_bridge::genesis_parent_header().canonical_header_bytes())
+    } else {
+        match state_db.get_cf_raw(CF_BLOCK_HEADERS, &(height - 1).to_be_bytes()) {
+            Ok(Some(d)) if d.len() >= 32 => alloy_primitives::B256::from_slice(&d[..32]),
+            // Parent header not resolvable — cannot assert a conflict.
+            _ => return false,
+        }
+    };
+    if *parent_hash == expected {
+        return false;
+    }
+    tracing::error!(
+        height,
+        claimed_parent = %parent_hash,
+        expected_parent = %expected,
+        "CRITICAL SAFETY VIOLATION: committed block's parent_hash does not match the \
+         locally-finalized parent at height-1 — an ancestry/fork violation. Latching \
+         fail-stop (commit means commit); halting the execution pipeline."
+    );
+    exec_failed.store(true, Ordering::SeqCst);
+    true
+}
+
 // ---- Execution pipeline ----
 
 impl ExecutionContext {
@@ -231,8 +533,44 @@ impl ExecutionContext {
     ) {
         let height = torus_block.header.height;
 
+        // T1.2 body-determinism FAIL-STOP: the committed header is the consensus
+        // datum; its `native_action_count` is a hashed field of the eth header.
+        // If the body handed to execution carries a DIFFERENT number of native
+        // actions than the committed header commits to, executing it would (a)
+        // apply a divergent native-state subset and (b) persist an eth header
+        // whose count no longer matches the body executed — the exact minority
+        // divergence proven on devnet (t12-diag1: v2 executed 40 of a committed
+        // 59). The completeness fix in `on_committed_block` makes this
+        // unreachable; keep it as a hard latch so a partial body is NEVER
+        // executed and a divergent header is NEVER persisted.
+        if torus_block.native_actions.len() != torus_block.header.native_action_count as usize {
+            tracing::error!(
+                height,
+                header_count = torus_block.header.native_action_count,
+                body_count = torus_block.native_actions.len(),
+                "FATAL: committed body count != committed header native_action_count — refusing \
+                 to execute a partial body / persist a divergent header (fail-stop)"
+            );
+            self.exec_failed.store(true, Ordering::SeqCst);
+            return;
+        }
+
         if let Some(applied) = read_native_applied_height(&self.state_db) {
             if applied >= height {
+                // PART 2 (P0 SAFETY): before silently skipping an already-applied
+                // height, make sure this is the SAME block we finalized — not a
+                // conflicting sibling. A different hash at a committed height is a
+                // durable agreement violation; fail-stop instead of dropping it.
+                let incoming_hash =
+                    alloy_primitives::keccak256(torus_block.header.canonical_header_bytes());
+                if detect_conflicting_commit(
+                    &self.state_db,
+                    height,
+                    &incoming_hash,
+                    &self.exec_failed,
+                ) {
+                    return;
+                }
                 tracing::debug!(
                     height,
                     applied,
@@ -240,6 +578,18 @@ impl ExecutionContext {
                 );
                 return;
             }
+        }
+
+        // Authoritative ancestry check: the parent (height-1) is applied by now,
+        // so a mismatched parent_hash means two conflicting blocks share our
+        // ancestry — fail-stop instead of executing on a forked history.
+        if detect_parent_link_violation(
+            &self.state_db,
+            height,
+            &torus_block.header.parent_hash,
+            &self.exec_failed,
+        ) {
+            return;
         }
 
         // Exec-ceiling Option A: total timer starts AFTER the skip-check so
@@ -506,14 +856,16 @@ impl ExecutionContext {
                 );
             }
 
-            // Flush native state AND maintain the incremental native bucketed-Merkle trie in ONE
-            // atomic batch (Phase A A2.2). Unconditional like the EVM resync below — the trie is
-            // kept current regardless of TORUS_INCREMENTAL_STATE_ROOT so it is ready when the flag
-            // flips. A trie-maintenance failure never drops committed native state (the native-CF
-            // writes are in the same batch and are written even if the trie ops are skipped); it
-            // only leaves the off-by-default incremental native root stale for this block.
-            if let Err(e) = overlay.flush_with_native_trie(&self.state_db) {
-                tracing::error!(%e, height, "native overlay flush / incremental native trie maintenance failed");
+            // Flush native state, maintain the incremental native bucketed-Merkle trie, AND write the
+            // native applied-height marker — all in ONE atomic batch (Phase A A2.2 + T156-F1). The
+            // marker fold is the crash-safety fix: native state and "this height is applied" now
+            // commit together, so a hard crash can never re-execute this block on restart and
+            // double-apply its fee distribution / epoch rewards. A trie-maintenance failure still
+            // never drops committed native state (same batch); it only leaves the off-by-default
+            // incremental native root stale for this block. If the atomic write itself fails, NEITHER
+            // native state nor the marker is written, so replay correctly re-executes on restart.
+            if let Err(e) = overlay.flush_with_native_trie_and_marker(&self.state_db, height) {
+                tracing::error!(%e, height, "native overlay flush + applied-height marker failed (block NOT marked applied — restart will replay)");
             }
 
             // Phase A: native post-commit credited EVM account balances (fees / validator rewards)
@@ -563,7 +915,15 @@ impl ExecutionContext {
         }
 
         // ---- Update tracking ----
-        write_native_applied_height(&self.state_db, height);
+        // T156-F1: when the native execution path ran (native actions and/or fee revenue), the
+        // applied-height marker was already folded into that path's atomic flush batch above
+        // (flush_with_native_trie_and_marker), so native state and the marker committed together.
+        // Only blocks that skipped the native path entirely (no native actions AND no fee revenue —
+        // empty or pure-EVM blocks, whose re-execution is idempotent) still need a standalone marker
+        // write here.
+        if !(has_native || computed_fee_revenue > 0) {
+            write_native_applied_height(&self.state_db, height);
+        }
 
         if let Some(ref m) = self.metrics {
             m.block_height.set(height as i64);
@@ -702,6 +1062,25 @@ pub struct TorusApp {
     /// when the mempool or fetcher is absent (consensus-only tests) — a miss
     /// then fails the view without a handoff, same as before BS-4a.
     da_recovery: Option<DaRecoveryWorker>,
+    /// Regime-B strict-order execution. The next committed height the execution
+    /// pipeline must receive. Blocks are handed to `exec_tx` STRICTLY in
+    /// ascending height with NO gaps: native matching is order-dependent, so
+    /// executing H+1 before H produces a different state than peers and an
+    /// interior hole would be PERMANENT divergence. `None` until the first
+    /// committed block seeds it (from the applied marker, else that height).
+    exec_next_height: Option<u64>,
+    /// Regime-B. Committed blocks that arrived at/above the frontier while an
+    /// earlier height was still an unhealed hole — buffered here, keyed by
+    /// height, and drained in ascending order once the hole fills. Empty in the
+    /// healthy in-order case (the hot path bypasses it entirely).
+    deferred_exec: std::collections::BTreeMap<u64, DeferredExecBlock>,
+    /// Regime-B. When the current head-of-line execution hole was first detected
+    /// (heal budget + throttled-log clock). `None` when there is no hole.
+    exec_hole_since: Option<std::time::Instant>,
+    /// Regime-B. Last time the loud "execution stalled" warning fired (throttle).
+    exec_hole_last_log: Option<std::time::Instant>,
+    /// Regime-B. Retry attempts against the current hole (for the operator log).
+    exec_hole_retries: u64,
 }
 
 /// Actions the proposer pushes to validators via unicast before broadcasting CompactBlock.
@@ -1188,6 +1567,11 @@ impl TorusApp {
             pre_proposal_tx: None,
             da_fetcher: None,
             da_recovery: None,
+            exec_next_height: None,
+            deferred_exec: std::collections::BTreeMap::new(),
+            exec_hole_since: None,
+            exec_hole_last_log: None,
+            exec_hole_retries: 0,
         }
     }
 
@@ -1266,82 +1650,50 @@ impl TorusApp {
 
     /// Crash recovery: replay committed blocks whose execution was interrupted.
     fn replay_committed(state_db: &StateDb, exec_ctx: &ExecutionContext) -> TorusBlockHeader {
-        let mut last_header = torus_bridge::genesis_parent_header();
+        let genesis = torus_bridge::genesis_parent_header();
 
         let committed = match find_last_committed_height(state_db) {
             Some(h) if h > 0 => h,
-            _ => return last_header,
+            _ => return genesis,
         };
 
         let applied = read_native_applied_height(state_db).unwrap_or(0);
         if applied >= committed {
-            return last_header;
+            return genesis;
         }
 
         tracing::warn!(
             committed_height = committed,
             applied_height = applied,
+            gap = committed - applied,
             "crash recovery: execution gap detected, replaying"
         );
 
-        let header: TorusBlockHeader = match state_db
-            .get_cf_raw(CF_BLOCK_HEADERS, &committed.to_be_bytes())
-        {
-            Ok(Some(data)) if data.len() > 32 => match serde_json::from_slice(&data[32..]) {
-                Ok(h) => h,
-                Err(e) => {
-                    tracing::error!(%e, height = committed, "crash recovery: failed to deserialize header");
-                    write_native_applied_height(state_db, committed);
-                    return last_header;
-                }
-            },
-            _ => {
-                tracing::error!(height = committed, "crash recovery: block header not found");
-                write_native_applied_height(state_db, committed);
-                return last_header;
+        // T156-F2: replay the ENTIRE gap [applied+1, committed] in order — not just the single top
+        // committed block. If any height in the gap cannot be reconstructed, `replay_gap` stops at it
+        // WITHOUT marking it applied, and we latch the existing fail-stop (`exec_failed`) so the node
+        // aborts boot instead of running on with a silently-diverged state (was: silent mark-applied).
+        let outcome = replay_gap(
+            applied,
+            committed,
+            |height| load_replay_header(state_db, height),
+            |height| load_replay_body(state_db, height),
+            |block| exec_ctx.execute_committed_block(block, vec![]),
+        );
+
+        match outcome {
+            ReplayGapOutcome::Complete(last_header) => last_header,
+            ReplayGapOutcome::Hole { height, last_good } => {
+                tracing::error!(
+                    hole_height = height,
+                    committed_height = committed,
+                    applied_height = applied,
+                    "crash recovery: FAIL-STOP — execution gap could not be fully replayed; latching exec_failed so the node does not boot into a silently-diverged state"
+                );
+                exec_ctx.exec_failed.store(true, Ordering::SeqCst);
+                last_good
             }
-        };
-
-        last_header = header.clone();
-
-        let body: TorusBlockBody =
-            match state_db.get_cf_raw(CF_BLOCK_BODIES, &committed.to_be_bytes()) {
-                Ok(Some(data)) => match serde_json::from_slice(&data) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        tracing::error!(%e, "crash recovery: failed to deserialize block body");
-                        write_native_applied_height(state_db, committed);
-                        return last_header;
-                    }
-                },
-                _ => {
-                    tracing::info!(
-                        height = committed,
-                        "crash recovery: no block body (empty block), marking applied"
-                    );
-                    write_native_applied_height(state_db, committed);
-                    return last_header;
-                }
-            };
-
-        if body.native_actions.is_empty() && body.evm_transactions.is_empty() {
-            tracing::info!(
-                height = committed,
-                "crash recovery: empty block, marking applied"
-            );
-            write_native_applied_height(state_db, committed);
-            return last_header;
         }
-
-        let block = TorusBlock {
-            header,
-            native_actions: body.native_actions,
-            evm_transactions: body.evm_transactions,
-            core_writer_actions: body.core_writer_actions,
-        };
-        exec_ctx.execute_committed_block(&block, vec![]);
-
-        last_header
     }
 
     /// Reconstruct a `CompactBlock`'s full body set from the durable DA store.
@@ -1806,9 +2158,17 @@ impl App<RocksKVStore> for TorusApp {
         };
 
         use torus_types::{Bloom, B256};
+        // Ancestry commitment: bind this proposal to the exact parent header it
+        // was built on (`parent_header`). This is the keccak canonical hash — the
+        // same value RPC `parentHash` and the fork checker compare — and it is
+        // kept consistent with the hotstuff `justify.block` the QC points at (an
+        // honest leader builds on the block its high-QC justifies).
+        let parent_hash =
+            alloy_primitives::keccak256(parent_header.canonical_header_bytes());
         let block = TorusBlock {
             header: TorusBlockHeader {
                 height: parent_header.height + 1,
+                parent_hash,
                 timestamp,
                 proposer: self.proposer_address,
                 state_root: parent_header.state_root,
@@ -2040,7 +2400,34 @@ impl App<RocksKVStore> for TorusApp {
             }
         }
 
+        // Ancestry check (best-effort, voting time): if our latest committed
+        // header IS the claimed parent (its height is H-1), the proposal's
+        // `parent_hash` MUST equal the keccak canonical hash of that header. A
+        // mismatch means the proposer built on a DIFFERENT height-(H-1) block than
+        // we finalized — the exact fork/equivocation the hash-level fork checker
+        // exists to catch — so refuse to vote.
+        //
+        // When our `last_header` is NOT the parent (we are behind, or the parent
+        // is still pending in the header-first fast path) we cannot cheaply
+        // resolve the parent here, so we DEFER rather than reject (preserving
+        // liveness): the hotstuff justify QC still constrains ancestry at the
+        // consensus level, and the commit-time check in `execute_committed_block`
+        // re-verifies the link authoritatively once the parent is applied.
         let height = torus_block.header.height;
+        if height > 0 && self.last_header.height + 1 == height {
+            let expected_parent =
+                alloy_primitives::keccak256(self.last_header.canonical_header_bytes());
+            if torus_block.header.parent_hash != expected_parent {
+                tracing::warn!(
+                    height,
+                    claimed_parent = %torus_block.header.parent_hash,
+                    expected_parent = %expected_parent,
+                    "validate_block: REJECTED -- parent_hash does not match locally-known parent (ancestry violation)"
+                );
+                return ValidateBlockResponse::Invalid;
+            }
+        }
+
         self.pending_proposals.insert(height, torus_block);
         self.pending_proposals.retain(|&h, _| h + 10 > height);
 
@@ -2110,22 +2497,43 @@ impl App<RocksKVStore> for TorusApp {
         // UNCONDITIONALLY (below) so a missing body can never freeze consensus
         // height/view -- the livelock root cause (mem 28e1a821) was an early return
         // here, before last_header advanced, which froze RPC height and churned views.
-        let (header, reconstructed): (
-            TorusBlockHeader,
-            Result<TorusBlock, Vec<torus_types::B256>>,
-        ) = if let Ok(full) = bincode::deserialize::<TorusBlock>(datum_bytes) {
+        let (header, source): (TorusBlockHeader, ExecSource) = if let Ok(full) =
+            bincode::deserialize::<TorusBlock>(datum_bytes)
+        {
+            // FULL datum carries its bodies inline and its committed header — the
+            // consensus datum is self-consistent and authoritative. Drop any
+            // stale same-height cache entry (cleanup) but NEVER let it override
+            // the committed block (T1.2 body determinism).
             let height = full.header.height;
-            let block = self.pending_proposals.remove(&height).unwrap_or(full);
-            (block.header.clone(), Ok(block))
+            self.pending_proposals.remove(&height);
+            (full.header.clone(), ExecSource::Ready(full))
         } else if let Ok(compact) = bincode::deserialize::<CompactBlock>(datum_bytes) {
+            // The COMMITTED header is the consensus datum — taken VERBATIM,
+            // never rebuilt from a local cache or from execution results. The
+            // body is the set the committed compact references by hash: a cached
+            // proposal is a valid fast path ONLY when its action hashes match
+            // that reference exactly (skips a DA read); otherwise reconstruct
+            // all-or-nothing from the durable DA store. A stale same-height
+            // re-proposal (fewer / other actions, having overwritten this
+            // height's `pending_proposals` entry) must NEVER be executed in
+            // place of the committed block — that was the t12-diag1 divergence
+            // (proposer executed its cached 40 of the committed 59 and persisted
+            // a divergent header).
             let height = compact.header.height;
-            if let Some(cached) = self.pending_proposals.remove(&height) {
-                (cached.header.clone(), Ok(cached))
-            } else {
-                (
-                    compact.header.clone(),
-                    self.reconstruct_compact_from_da(&compact),
-                )
+            match self.pending_proposals.remove(&height) {
+                Some(cached) if cached_matches_compact(&cached, &compact) => {
+                    let ready = TorusBlock {
+                        header: compact.header.clone(),
+                        native_actions: cached.native_actions,
+                        evm_transactions: compact.evm_transactions.clone(),
+                        core_writer_actions: compact.core_writer_actions.clone(),
+                    };
+                    (compact.header.clone(), ExecSource::Ready(ready))
+                }
+                // Reconstruct lazily (and RE-try on each drain) from the durable DA
+                // store — a body still missing here becomes a heal-able hole, never
+                // an out-of-order execution.
+                _ => (compact.header.clone(), ExecSource::Compact(compact)),
             }
         } else {
             tracing::warn!("on_committed_block: failed to deserialize block datum");
@@ -2134,94 +2542,26 @@ impl App<RocksKVStore> for TorusApp {
 
         let height = header.height;
         // Committed: these hashes leave the in-flight window. The mempool prunes
-        // them via `remove_committed_native` further down this path.
+        // them via `remove_committed_native` when the block actually executes.
         self.in_flight_hashes.clear(height);
 
         // Track committed consensus height/view from the header regardless of body
         // availability (BFT finality is independent of local execution readiness).
+        // THIS UNCONDITIONAL ADVANCE IS LOAD-BEARING (livelock fix, mem 28e1a821):
+        // consensus voting/finalization runs ahead; execution lags and heals below.
         if height > self.last_header.height {
             self.last_header = header.clone();
             self.leader_state.set_view(height.saturating_add(1));
         }
 
-        let torus_block = match reconstructed {
-            Ok(b) => b,
-            Err(missing) => {
-                // An already-committed block whose bodies we cannot reconstruct. With
-                // the durable DA store + proposer mirror + push this is rare (a node that
-                // committed via QC without validating); the pull-fallback (Task 6) fetches
-                // and executes it. Loud, never silent -- and crucially the chain height
-                // has already advanced above, so consensus does NOT wedge.
-                tracing::error!(
-                    height,
-                    missing = missing.len(),
-                    "on_committed_block: missing native bodies for committed block -- execution deferred (fetch: Task 6)"
-                );
-                // NON-BLOCKING pull (Task 6): nudge the bodies toward the durable DA
-                // store so a re-sync / restart-replay of this committed block can
-                // reconstruct it. Do NOT wait here -- this is the consensus thread
-                // (mem 8ee99db3); height has already advanced above, so no wedge.
-                if let Some(fetcher) = self.da_fetcher.as_ref() {
-                    fetcher.fetch(missing.iter().map(|h| h.0).collect());
-                    if let Some(ref m) = self.metrics {
-                        m.native_da_pull_requests.inc();
-                    }
-                }
-                return;
-            }
-        };
+        // Slashes detected during THIS commit ride with THIS block into the
+        // strict-order queue (applied when the block executes, in order).
+        let slashes: Vec<PendingSlash> = self.pending_slashes.drain(..).collect();
 
-        tracing::info!(
-            height,
-            evm_txs = torus_block.evm_transactions.len(),
-            native = torus_block.native_actions.len(),
-            "on_committed_block: sending to execution pipeline"
-        );
-
-        if !torus_block.native_actions.is_empty() {
-            if let Some(ref mempool) = self.mempool {
-                let hashes: Vec<torus_types::B256> = torus_block
-                    .native_actions
-                    .iter()
-                    .map(torus_types::compute_action_hash)
-                    .collect();
-                mempool.remove_committed_native(&hashes);
-            }
-        }
-
-        // D4 (S392): pin the mempool's admission fee floor to the base fee
-        // committed blocks actually charge (frozen at 1 gwei today; follows
-        // the header once the fee market unfreezes).
-        if let Some(ref mempool) = self.mempool {
-            mempool.set_base_fee(torus_block.header.base_fee_per_gas);
-        }
-
-        if let Some(ref tx) = self.exec_tx {
-            let msg = CommittedBlockMsg {
-                torus_block,
-                pending_slashes: self.pending_slashes.drain(..).collect(),
-            };
-            // inc BEFORE the (possibly blocking) send so a consensus thread stalled
-            // on a full channel is visible as depth ≥ the bound, not hidden.
-            if let Some(ref m) = self.metrics {
-                m.exec_queue_depth.inc();
-            }
-            if tx.send(msg).is_err() {
-                if let Some(ref m) = self.metrics {
-                    m.exec_queue_depth.dec();
-                }
-                // T1.5 FAIL-STOP: the execution thread is gone (panic or
-                // fatal) — this block is committed by consensus but will
-                // NEVER execute here. Latch the failure: the node stops
-                // producing, voting, and finalizing, and crash-replay closes
-                // the gap on restart. Never zombie-advance past a dead pipeline.
-                self.exec_failed.store(true, Ordering::SeqCst);
-                tracing::error!(
-                    height,
-                    "execution pipeline channel closed — FAIL-STOP: halting block production, voting, and finalization"
-                );
-            }
-        }
+        // Regime-B strict-order execution: hand blocks to the pipeline strictly in
+        // ascending height with no gaps. A missing-body block becomes a head-of-line
+        // hole; every later committed block waits behind it until it heals.
+        self.enqueue_for_execution(height, source, slashes);
     }
 
     /// MonadBFT B3: Handle speculative rollback due to leader equivocation.
@@ -2269,6 +2609,262 @@ impl App<RocksKVStore> for TorusApp {
             rolled_back_block = ?block,
             "speculative rollback complete (no state to revert in CTE model)"
         );
+    }
+
+    /// FIX C2: consensus (block sync) detected a FATAL safety violation — a peer's
+    /// committed chain conflicts with a block we already committed at the same
+    /// height. Latch the shared `exec_failed` fail-stop (the SAME latch the T1.5
+    /// native-exec watcher and the conflicting-commit execution guard use). The
+    /// node binary watches this latch (`exec_failed_handle()`) and turns it into
+    /// process termination (`exit(70)`), so the node stops voting/finalizing over
+    /// an already-forked chain instead of merely ending the sync session.
+    fn on_fatal_safety_violation(&mut self) {
+        tracing::error!(
+            "CRITICAL SAFETY VIOLATION: block sync detected a peer's committed chain conflicting \
+             with our own committed chain (two honest quorums finalized conflicting blocks). \
+             Latching fail-stop to halt the node."
+        );
+        self.exec_failed.store(true, Ordering::SeqCst);
+    }
+}
+
+impl TorusApp {
+    /// Regime-B strict-order execution gate. Route a committed block into the
+    /// execution pipeline while GUARANTEEING it is executed strictly in ascending
+    /// height with no gaps — the only correct behaviour, because native matching
+    /// is order-dependent (executing H+1 before H diverges from peers and an
+    /// interior hole is PERMANENT divergence).
+    ///
+    /// HOT PATH: in the healthy in-order case (`deferred_exec` empty and this is
+    /// the expected height) the block is reconstructed + dispatched directly with
+    /// ZERO buffering — bit-identical cost to the pre-Regime-B send. The reorder
+    /// map and hole accounting are touched ONLY once a hole exists.
+    fn enqueue_for_execution(
+        &mut self,
+        height: u64,
+        source: ExecSource,
+        slashes: Vec<PendingSlash>,
+    ) {
+        let next = *self.exec_next_height.get_or_insert_with(|| {
+            // Seed from the durable applied marker (mid-chain / post-replay); with
+            // nothing applied yet (fresh genesis) the first committed height we see
+            // defines the baseline.
+            read_native_applied_height(&self.state_db)
+                .map(|a| a + 1)
+                .unwrap_or(height)
+        });
+
+        // Below the frontier we already sent to exec: a benign re-delivery. A
+        // genuine conflicting re-commit at an applied height is caught on the exec
+        // thread (`detect_conflicting_commit`); here we only avoid double-sending.
+        if height < next {
+            return;
+        }
+
+        // HOT PATH: no outstanding hole and this is exactly the next height.
+        if self.deferred_exec.is_empty() && height == next {
+            match self.materialize_owned(source) {
+                Ok(block) => {
+                    self.dispatch_to_exec(block, slashes);
+                    self.exec_next_height = Some(next + 1);
+                    return;
+                }
+                Err((source, missing)) => {
+                    // First block of a new hole: buffer it and begin heal accounting.
+                    self.deferred_exec
+                        .insert(height, DeferredExecBlock { source, slashes });
+                    self.note_exec_hole(height, &missing);
+                    return;
+                }
+            }
+        }
+
+        // A hole already exists, or this height is ahead of the frontier: buffer in
+        // ascending order and drain whatever is now contiguous.
+        self.deferred_exec
+            .insert(height, DeferredExecBlock { source, slashes });
+        self.drain_exec_queue();
+    }
+
+    /// Regime-B. Dispatch every contiguously-available buffered block starting at
+    /// `exec_next_height`, in ascending order, stopping at the first height whose
+    /// bodies are still missing (the head-of-line hole) or not yet committed.
+    fn drain_exec_queue(&mut self) {
+        loop {
+            let next = match self.exec_next_height {
+                Some(n) => n,
+                None => return,
+            };
+            // Head-of-line not yet committed/buffered: NOT a hole (consensus commits
+            // every height in order, so it will arrive) — just wait.
+            let Some(entry) = self.deferred_exec.remove(&next) else {
+                return;
+            };
+            let DeferredExecBlock { source, slashes } = entry;
+            match self.materialize_owned(source) {
+                Ok(block) => {
+                    self.dispatch_to_exec(block, slashes);
+                    self.exec_next_height = Some(next + 1);
+                    self.clear_exec_hole_state();
+                    // continue draining the next contiguous height
+                }
+                Err((source, missing)) => {
+                    // Head-of-line bodies still missing: a real hole. Put it back,
+                    // trigger the DA fetch + throttled log + budget check, and STOP —
+                    // never execute past it.
+                    self.deferred_exec
+                        .insert(next, DeferredExecBlock { source, slashes });
+                    self.note_exec_hole(next, &missing);
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Regime-B. Obtain the bodies for a source, consuming it. On a compact miss,
+    /// hands the source BACK (so the caller can re-buffer it and retry from the
+    /// healing DA store) alongside the missing hashes.
+    fn materialize_owned(
+        &self,
+        source: ExecSource,
+    ) -> Result<TorusBlock, (ExecSource, Vec<torus_types::B256>)> {
+        match source {
+            ExecSource::Ready(block) => Ok(block),
+            ExecSource::Compact(compact) => match self.reconstruct_compact_from_da(&compact) {
+                Ok(block) => Ok(block),
+                Err(missing) => Err((ExecSource::Compact(compact), missing)),
+            },
+        }
+    }
+
+    /// Regime-B. Send a fully-reconstructed committed block to the execution
+    /// thread, in order. Carries the mempool bookkeeping that must happen once a
+    /// block is actually executed (prune committed native hashes, pin the base
+    /// fee) plus the T1.5 closed-channel fail-stop.
+    fn dispatch_to_exec(&mut self, torus_block: TorusBlock, pending_slashes: Vec<PendingSlash>) {
+        let height = torus_block.header.height;
+
+        tracing::info!(
+            height,
+            evm_txs = torus_block.evm_transactions.len(),
+            native = torus_block.native_actions.len(),
+            "on_committed_block: sending to execution pipeline"
+        );
+
+        if !torus_block.native_actions.is_empty() {
+            if let Some(ref mempool) = self.mempool {
+                let hashes: Vec<torus_types::B256> = torus_block
+                    .native_actions
+                    .iter()
+                    .map(torus_types::compute_action_hash)
+                    .collect();
+                mempool.remove_committed_native(&hashes);
+            }
+        }
+
+        // D4 (S392): pin the mempool's admission fee floor to the base fee
+        // committed blocks actually charge (frozen at 1 gwei today; follows
+        // the header once the fee market unfreezes).
+        if let Some(ref mempool) = self.mempool {
+            mempool.set_base_fee(torus_block.header.base_fee_per_gas);
+        }
+
+        if let Some(ref tx) = self.exec_tx {
+            let msg = CommittedBlockMsg {
+                torus_block,
+                pending_slashes,
+            };
+            // inc BEFORE the (possibly blocking) send so a consensus thread stalled
+            // on a full channel is visible as depth ≥ the bound, not hidden.
+            if let Some(ref m) = self.metrics {
+                m.exec_queue_depth.inc();
+            }
+            if tx.send(msg).is_err() {
+                if let Some(ref m) = self.metrics {
+                    m.exec_queue_depth.dec();
+                }
+                // T1.5 FAIL-STOP: the execution thread is gone (panic or
+                // fatal) — this block is committed by consensus but will
+                // NEVER execute here. Latch the failure: the node stops
+                // producing, voting, and finalizing, and crash-replay closes
+                // the gap on restart. Never zombie-advance past a dead pipeline.
+                self.exec_failed.store(true, Ordering::SeqCst);
+                tracing::error!(
+                    height,
+                    "execution pipeline channel closed — FAIL-STOP: halting block production, voting, and finalization"
+                );
+            }
+        }
+    }
+
+    /// Regime-B. Account for a head-of-line execution hole: nudge the bodies via
+    /// the EXISTING DA fetch path (non-blocking — this is the consensus thread,
+    /// mem 8ee99db3; height has already advanced, so no wedge), log loudly but
+    /// throttled, and fail-stop once the heal budget is exhausted. Retries ride on
+    /// subsequent `on_committed_block` calls: consensus is provably live here (it
+    /// committed PAST the hole), so the drain re-attempts on every new commit.
+    fn note_exec_hole(&mut self, height: u64, missing: &[torus_types::B256]) {
+        let now = std::time::Instant::now();
+        let since = *self.exec_hole_since.get_or_insert(now);
+        self.exec_hole_retries = self.exec_hole_retries.saturating_add(1);
+
+        // Reuse the pull-fallback transport (Task 6) — do NOT invent new transport.
+        // Peers that executed this committed block have the bodies; a retrying pull
+        // must eventually land them in the durable DA store.
+        if let Some(fetcher) = self.da_fetcher.as_ref() {
+            fetcher.fetch(missing.iter().map(|h| h.0).collect());
+            if let Some(ref m) = self.metrics {
+                m.native_da_pull_requests.inc();
+            }
+        }
+
+        let elapsed = now.duration_since(since);
+
+        // Fail-stop budget: a committed block whose bodies cannot be obtained after
+        // a generous retry window means this node is broken. Silent divergence is
+        // worse than a halt — latch the SAME fail-stop the exec thread / crash
+        // replay use; the node binary turns it into process termination.
+        let budget = exec_hole_failstop_budget();
+        if elapsed >= budget {
+            tracing::error!(
+                height,
+                retries = self.exec_hole_retries,
+                elapsed_secs = elapsed.as_secs(),
+                missing = missing.len(),
+                "execution HOLE unrecoverable: committed block's native bodies could not be \
+                 obtained within the heal budget — latching fail-stop (halt, never diverge silently)"
+            );
+            self.exec_failed.store(true, Ordering::SeqCst);
+            return;
+        }
+
+        let due = match self.exec_hole_last_log {
+            None => true,
+            Some(t) => now.duration_since(t) >= EXEC_HOLE_LOG_INTERVAL,
+        };
+        if due {
+            self.exec_hole_last_log = Some(now);
+            tracing::warn!(
+                height,
+                retries = self.exec_hole_retries,
+                elapsed_secs = elapsed.as_secs(),
+                missing = missing.len(),
+                "execution stalled at height {} awaiting native bodies, retry {} — later committed \
+                 blocks are queued (NOT executed out of order); still pulling, will NOT go silent",
+                height,
+                self.exec_hole_retries,
+            );
+        }
+    }
+
+    /// Regime-B. Clear the hole clock/log/retry counters once the head-of-line
+    /// hole heals (a buffered block successfully dispatched).
+    fn clear_exec_hole_state(&mut self) {
+        if self.exec_hole_since.is_some() {
+            self.exec_hole_since = None;
+            self.exec_hole_last_log = None;
+            self.exec_hole_retries = 0;
+        }
     }
 }
 
@@ -2361,9 +2957,29 @@ mod crash_recovery_tests {
     }
 
     fn make_block(height: u64, native_actions: Vec<SignedNativeAction>) -> TorusBlock {
+        // Header-identity hardening: the commit-time ancestry check
+        // (`detect_parent_link_violation`) compares a block's `parent_hash`
+        // against the keccak canonical hash durably recorded for height-1. So a
+        // fixture chain must be genuinely linked or execution/replay fail-stops.
+        // We link to an EMPTY-ancestor chain (every intermediate block treated as
+        // `make_block(h-1, vec![])`), which matches every all-empty and
+        // single-height-1 fixture in this module. Height 1 links to the synthetic
+        // genesis parent header; height 0 (never a child) keeps `B256::ZERO`.
+        // Tests whose persisted parent is NON-empty override `parent_hash`
+        // explicitly (see `deferred_trades_*`, `duplicate_*`).
+        let parent_hash = match height {
+            0 => B256::ZERO,
+            1 => alloy_primitives::keccak256(
+                torus_bridge::genesis_parent_header().canonical_header_bytes(),
+            ),
+            _ => alloy_primitives::keccak256(
+                make_block(height - 1, vec![]).header.canonical_header_bytes(),
+            ),
+        };
         TorusBlock {
             header: TorusBlockHeader {
                 height,
+                parent_hash,
                 timestamp: 1000 + height,
                 proposer: Address::ZERO,
                 state_root: B256::ZERO,
@@ -2494,6 +3110,73 @@ mod crash_recovery_tests {
         );
     }
 
+    /// Header-identity hardening: the authoritative commit-time ancestry check
+    /// accepts a block whose `parent_hash` equals the keccak canonical hash of
+    /// the locally-finalized parent, and REJECTS (fail-stop latch) one that does
+    /// not. This is the sound half of the fork-detection fix — at execution time
+    /// the parent is guaranteed applied, so a mismatch is a real ancestry
+    /// violation, not a benign race.
+    #[test]
+    fn parent_link_violation_rejects_mismatched_parent() {
+        use std::sync::atomic::AtomicBool;
+        let (_config, state_db) = make_test_config_and_db();
+
+        // Finalize a parent at height 5; its durable hash is
+        // keccak(canonical_header_bytes) in the first 32 bytes of the record.
+        let parent = make_block(5, vec![]);
+        persist_block_for_test(&state_db, &parent);
+        let correct_parent_hash =
+            alloy_primitives::keccak256(parent.header.canonical_header_bytes());
+
+        // Correct link: child at height 6 pointing at the real parent -> accepted,
+        // latch stays clear.
+        let ef_ok = AtomicBool::new(false);
+        assert!(
+            !detect_parent_link_violation(&state_db, 6, &correct_parent_hash, &ef_ok),
+            "a child whose parent_hash matches the finalized parent must be accepted"
+        );
+        assert!(!ef_ok.load(Ordering::SeqCst), "no fail-stop on a valid link");
+
+        // Wrong link: child at height 6 with a bogus parent_hash -> rejected AND
+        // the fail-stop latch is set (commit means commit).
+        let ef_bad = AtomicBool::new(false);
+        let bogus = torus_types::B256::repeat_byte(0xEE);
+        assert!(
+            detect_parent_link_violation(&state_db, 6, &bogus, &ef_bad),
+            "a child whose parent_hash mismatches the finalized parent must be rejected"
+        );
+        assert!(
+            ef_bad.load(Ordering::SeqCst),
+            "an ancestry violation must latch the execution fail-stop"
+        );
+    }
+
+    /// Genesis edge of the ancestry check: the height-1 block's parent is the
+    /// synthetic `genesis_parent_header` (never persisted), so its expected
+    /// parent hash is computed directly. The correct genesis link is accepted;
+    /// a wrong one is rejected.
+    #[test]
+    fn parent_link_violation_genesis_edge() {
+        use std::sync::atomic::AtomicBool;
+        let (_config, state_db) = make_test_config_and_db();
+
+        let genesis_hash = alloy_primitives::keccak256(
+            torus_bridge::genesis_parent_header().canonical_header_bytes(),
+        );
+        let ef_ok = AtomicBool::new(false);
+        assert!(
+            !detect_parent_link_violation(&state_db, 1, &genesis_hash, &ef_ok),
+            "height-1 block committing to the genesis header hash must be accepted"
+        );
+
+        let ef_bad = AtomicBool::new(false);
+        assert!(
+            detect_parent_link_violation(&state_db, 1, &torus_types::B256::ZERO, &ef_bad),
+            "height-1 block whose parent_hash is not the genesis header hash must be rejected"
+        );
+        assert!(ef_bad.load(Ordering::SeqCst));
+    }
+
     /// T1.6 RED-first: crash-replay must still RUN after the pruner has
     /// written its meta key. Committed tip = 5, applied = 2 (execution died
     /// mid-pipeline), prune meta present.
@@ -2526,6 +3209,145 @@ mod crash_recovery_tests {
             read_native_applied_height(&state_db),
             Some(5),
             "replay must close the execution gap left by the crash"
+        );
+    }
+
+    /// Persist ONLY the header for a block (no body) — simulates a committed block whose body was
+    /// never persisted or was pruned. Mirrors the header half of `persist_block_for_test`.
+    fn persist_header_only_for_test(state_db: &StateDb, block: &TorusBlock) {
+        let block_hash = alloy_primitives::keccak256(&block.header.canonical_header_bytes());
+        let header_json = serde_json::to_vec(&block.header).unwrap();
+        let mut data = Vec::with_capacity(32 + header_json.len());
+        data.extend_from_slice(block_hash.as_slice());
+        data.extend_from_slice(&header_json);
+        state_db
+            .put_cf_raw(CF_BLOCK_HEADERS, &block.header.height.to_be_bytes(), &data)
+            .unwrap();
+    }
+
+    /// T156-F2 (T2) RED-first: `replay_gap` must replay EVERY height in the `(applied, committed]`
+    /// gap, in ascending order — not just the single top committed block.
+    ///
+    /// RED on pre-fix code: `replay_gap` did not exist (the whole seam is new), and the old
+    /// `replay_committed` only ever loaded+executed the single `committed` height, so an intermediate
+    /// height (H-1) was silently skipped and never executed. GREEN after: both H-1 and H execute, in
+    /// order, and the outcome carries the committed (H) header.
+    #[test]
+    fn replay_gap_executes_whole_gap_in_order() {
+        // committed = 3, applied = 1 => gap must execute heights 2 then 3.
+        let b2 = make_block(2, vec![sign_claim_rewards(2)]);
+        let b3 = make_block(3, vec![sign_claim_rewards(3)]);
+        assert_eq!(b2.header.native_action_count, 1, "sanity: non-empty header");
+
+        let headers: std::collections::HashMap<u64, TorusBlockHeader> =
+            [(2u64, b2.header.clone()), (3u64, b3.header.clone())]
+                .into_iter()
+                .collect();
+        let bodies: std::collections::HashMap<u64, TorusBlockBody> =
+            [(2u64, b2.body()), (3u64, b3.body())].into_iter().collect();
+
+        let mut executed_order: Vec<u64> = Vec::new();
+        let outcome = replay_gap(
+            1,
+            3,
+            |h| headers.get(&h).cloned(),
+            |h| bodies.get(&h).cloned(),
+            |block| executed_order.push(block.header.height),
+        );
+
+        assert_eq!(
+            executed_order,
+            vec![2, 3],
+            "replay must execute the whole gap in ascending order"
+        );
+        match outcome {
+            ReplayGapOutcome::Complete(h) => assert_eq!(h.height, 3),
+            other => panic!("expected Complete(3), got {other:?}"),
+        }
+    }
+
+    /// T156-F2 (T3) RED-first: when a body inside the gap is missing while its header says the block
+    /// is non-empty (e.g. a pruned body), `replay_gap` must FAIL LOUD (`Hole`) and must NOT execute
+    /// or mark that height (or any height past it) applied.
+    ///
+    /// RED on pre-fix code: no `replay_gap` seam existed; the old code's "no body -> mark applied"
+    /// arm would have silently advanced the applied marker for the pruned block (state loss). GREEN
+    /// after: the outcome is `Hole { height: H-1 }`, nothing in the gap executed, and H is never
+    /// reached.
+    #[test]
+    fn replay_gap_holes_on_missing_body_without_marking_applied() {
+        // committed = 3, applied = 1 => gap = {2, 3}. Body for height 2 (non-empty header) is missing.
+        let b2 = make_block(2, vec![sign_claim_rewards(2)]);
+        let b3 = make_block(3, vec![sign_claim_rewards(3)]);
+
+        let headers: std::collections::HashMap<u64, TorusBlockHeader> =
+            [(2u64, b2.header.clone()), (3u64, b3.header.clone())]
+                .into_iter()
+                .collect();
+        // Deliberately NO body for height 2.
+        let bodies: std::collections::HashMap<u64, TorusBlockBody> =
+            [(3u64, b3.body())].into_iter().collect();
+
+        let mut executed_order: Vec<u64> = Vec::new();
+        let outcome = replay_gap(
+            1,
+            3,
+            |h| headers.get(&h).cloned(),
+            |h| bodies.get(&h).cloned(),
+            |block| executed_order.push(block.header.height),
+        );
+
+        assert!(
+            executed_order.is_empty(),
+            "a hole at height 2 must stop replay before executing anything past it"
+        );
+        match outcome {
+            ReplayGapOutcome::Hole { height, .. } => assert_eq!(
+                height, 2,
+                "the hole must identify the unreconstructable height"
+            ),
+            other => panic!("expected Hole {{ height: 2 }}, got {other:?}"),
+        }
+    }
+
+    /// T156-F2 (T3b) RED-first, end-to-end through `replay_committed`: a committed block with a
+    /// pruned/missing body inside the gap must latch the fail-stop (`exec_failed`) and leave the
+    /// applied marker BELOW the hole — never silently marked applied.
+    ///
+    /// RED on pre-fix code: `replay_committed` handled only the top committed block and its
+    /// "no block body -> marking applied" arm would have marked the pruned height applied WITHOUT
+    /// executing it (silent state loss), and never latched `exec_failed`. GREEN after: heights below
+    /// the hole are replayed (applied advances to 3), the hole latches `exec_failed`, and the applied
+    /// marker never reaches the committed tip.
+    #[test]
+    fn replay_committed_fail_stops_on_pruned_body_in_gap() {
+        let (config, state_db) = make_test_config_and_db();
+        let exec_ctx = make_exec_ctx(&config, &state_db);
+
+        // Heights 1..=3 are empty (bodies present); height 4 has a NON-EMPTY header but NO body
+        // (pruned); height 5 is a later committed tip.
+        for h in 1..=3u64 {
+            persist_block_for_test(&state_db, &make_block(h, vec![]));
+        }
+        persist_header_only_for_test(&state_db, &make_block(4, vec![sign_claim_rewards(4)]));
+        persist_block_for_test(&state_db, &make_block(5, vec![]));
+
+        write_native_applied_height(&state_db, 2);
+
+        let last = TorusApp::replay_committed(&state_db, &exec_ctx);
+
+        assert!(
+            exec_ctx.exec_failed.load(std::sync::atomic::Ordering::SeqCst),
+            "a pruned body inside the replay gap must latch the fail-stop"
+        );
+        assert_eq!(
+            read_native_applied_height(&state_db),
+            Some(3),
+            "replay must advance applied only up to the block before the hole (height 3), never past it"
+        );
+        assert_eq!(
+            last.height, 3,
+            "the returned header must be the last successfully executed block, not the committed tip"
         );
     }
 
@@ -2578,6 +3400,87 @@ mod crash_recovery_tests {
             app.last_header.height, 1,
             "node kept finalizing after execution death (zombie-advance)"
         );
+    }
+
+    /// FIX C2: `App::on_fatal_safety_violation` (invoked by block sync when a
+    /// peer's committed chain conflicts with ours) must latch the shared
+    /// `exec_failed` fail-stop — the SAME latch the node binary watches and turns
+    /// into `exit(70)`. This proves the wiring reaches process halt (the exit
+    /// itself is exercised by the node-side watcher, not this unit test).
+    ///
+    /// RED before fix: `App::on_fatal_safety_violation` did not exist (compile
+    /// failure); a block-sync committed conflict only ended the sync session, so
+    /// the node kept voting/finalizing over an already-forked chain.
+    #[test]
+    fn fatal_safety_violation_latches_fail_stop() {
+        use hotstuff_rs::app::App;
+
+        let mut app = TorusApp::stub();
+        assert!(
+            !app.is_exec_failed(),
+            "precondition: a fresh app is not in fail-stop"
+        );
+
+        app.on_fatal_safety_violation();
+
+        assert!(
+            app.is_exec_failed(),
+            "on_fatal_safety_violation must latch the fail-stop so the node halts"
+        );
+    }
+
+    /// PART 2 (P0 SAFETY, "commit means commit"): a SECOND, DIFFERENT block
+    /// arriving at an already-applied height is a conflicting commit — it must
+    /// latch the fail-stop, not be silently dropped by the `applied >= height`
+    /// skip. A same-hash duplicate stays a benign silent skip.
+    ///
+    /// RED before fix: `detect_conflicting_commit` did not exist (compile
+    /// failure); the skip branch dropped every re-arriving block unconditionally,
+    /// so a divergent block at an already-finalized height was silently ignored.
+    #[test]
+    fn conflicting_commit_at_applied_height_fail_stops() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (_config, state_db) = make_test_config_and_db();
+
+        // Persist block X at height 5 (models a first, already-applied commit).
+        let block_x = make_block(5, vec![sign_claim_rewards(1)]);
+        persist_block_for_test(&state_db, &block_x);
+        let x_hash = alloy_primitives::keccak256(block_x.header.canonical_header_bytes());
+
+        // Same-hash duplicate → benign, must NOT latch.
+        let benign = AtomicBool::new(false);
+        assert!(
+            !detect_conflicting_commit(&state_db, 5, &x_hash, &benign),
+            "the same block re-arriving must be a benign duplicate"
+        );
+        assert!(
+            !benign.load(Ordering::SeqCst),
+            "a same-hash duplicate must NOT latch the fail-stop"
+        );
+
+        // A DIFFERENT block Y at the same height → conflicting commit, must latch.
+        let block_y = make_block(5, vec![sign_claim_rewards(2), sign_claim_rewards(3)]);
+        let y_hash = alloy_primitives::keccak256(block_y.header.canonical_header_bytes());
+        assert_ne!(x_hash, y_hash, "precondition: the two blocks must hash differently");
+
+        let latch = AtomicBool::new(false);
+        assert!(
+            detect_conflicting_commit(&state_db, 5, &y_hash, &latch),
+            "a different block at an already-persisted height must be flagged as a conflict"
+        );
+        assert!(
+            latch.load(Ordering::SeqCst),
+            "a conflicting commit must latch the fail-stop (commit means commit)"
+        );
+
+        // No header persisted at an unrelated height → nothing to conflict with.
+        let none_latch = AtomicBool::new(false);
+        assert!(
+            !detect_conflicting_commit(&state_db, 6, &y_hash, &none_latch),
+            "a height with no persisted header must not be treated as a conflict"
+        );
+        assert!(!none_latch.load(Ordering::SeqCst));
     }
 
     /// Test double: a `NativeDaFetcher` whose body only appears on the
@@ -2913,6 +3816,17 @@ mod crash_recovery_tests {
             .put_cf_raw(CF_BLOCK_HEADERS, &block.header.height.to_be_bytes(), &data)
             .unwrap();
 
+        // ADAPTED for T156-F2 whole-gap replay: replay now walks the ENTIRE
+        // [applied+1, committed] gap, not just the single top committed height.
+        // This test only persists height 3's header, so seed applied=2 to make
+        // the gap exactly {3}; otherwise heights 1..2 would be missing headers
+        // and replay would (correctly) fail-stop on the hole at height 1. The
+        // intent is unchanged: an empty committed block in the gap is executed
+        // (empty body) and marked applied.
+        state_db
+            .put_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT, &2u64.to_be_bytes())
+            .unwrap();
+
         let _app = TorusApp::new(state_db.clone(), &config, None, None, None);
         assert_eq!(
             read_native_applied_height(&state_db),
@@ -3194,8 +4108,18 @@ mod crash_recovery_tests {
         fund_evm_balance(&state_db, sender, start_balance);
 
         // Same action committed in three consecutive blocks (the proven bug scenario).
+        // Link each child to its ACTUAL (non-empty) parent so the commit-time
+        // ancestry check passes and the per-(sender,nonce) replay guard — not a
+        // parent-link fail-stop — is what dedups the 2nd/3rd inclusion.
+        let mut parent: Option<TorusBlock> = None;
         for height in 1..=3u64 {
-            exec_ctx.execute_committed_block(&make_block(height, vec![signed.clone()]), vec![]);
+            let mut block = make_block(height, vec![signed.clone()]);
+            if let Some(p) = &parent {
+                block.header.parent_hash =
+                    alloy_primitives::keccak256(p.header.canonical_header_bytes());
+            }
+            exec_ctx.execute_committed_block(&block, vec![]);
+            parent = Some(block);
         }
 
         let evm_after = read_evm_balance(&state_db, sender);
@@ -3249,7 +4173,8 @@ mod crash_recovery_tests {
             fund_evm_balance(&state_db, signed.recover_sender().unwrap(), deposit);
             transfers.push(signed);
         }
-        exec_ctx.execute_committed_block(&make_block(1, transfers), vec![]);
+        let block1 = make_block(1, transfers);
+        exec_ctx.execute_committed_block(&block1, vec![]);
 
         // Block 2: a resting sell crossed by a buy -> exactly one fill.
         let order = |is_buy: bool| torus_types::PlaceOrderParams {
@@ -3272,7 +4197,12 @@ mod crash_recovery_tests {
             9_003,
             &k_buy,
         );
-        exec_ctx.execute_committed_block(&make_block(2, vec![sell, buy]), vec![]);
+        // Link block 2 to the ACTUAL (non-empty) block 1 so the commit-time
+        // ancestry check passes (block 1 persisted its own canonical hash).
+        let mut block2 = make_block(2, vec![sell, buy]);
+        block2.header.parent_hash =
+            alloy_primitives::keccak256(block1.header.canonical_header_bytes());
+        exec_ctx.execute_committed_block(&block2, vec![]);
 
         // Shutdown flush ordering: drop drains + joins the writer before reads.
         drop(exec_ctx);
@@ -3317,8 +4247,15 @@ mod crash_recovery_tests {
         let sender = signed.recover_sender().expect("recover sender");
 
         // Same batch committed in two consecutive blocks (the proven dup scenario).
-        exec_ctx.execute_committed_block(&make_block(1, vec![signed.clone()]), vec![]);
-        exec_ctx.execute_committed_block(&make_block(2, vec![signed.clone()]), vec![]);
+        // Link block 2 to the ACTUAL (non-empty) block 1 so the commit-time
+        // ancestry check passes and the (sender, nonce) replay guard — not the
+        // parent-link fail-stop — is what skips the duplicate.
+        let block1 = make_block(1, vec![signed.clone()]);
+        exec_ctx.execute_committed_block(&block1, vec![]);
+        let mut block2 = make_block(2, vec![signed.clone()]);
+        block2.header.parent_hash =
+            alloy_primitives::keccak256(block1.header.canonical_header_bytes());
+        exec_ctx.execute_committed_block(&block2, vec![]);
 
         // Recorded exactly once; the stored value is the FIRST commit height (1),
         // proving the second commit was skipped (not re-executed / re-written).
@@ -3773,6 +4710,348 @@ mod crash_recovery_tests {
                 .load(std::sync::atomic::Ordering::Relaxed),
             1,
             "body arrived before the midpoint — only the initial fetch, no re-fetch",
+        );
+    }
+
+    // ========================================================================
+    // T1.2 body-determinism regression suite
+    //
+    // Instrumented devnet (t12-diag1) proved HotStuff consensus is SAFE — all
+    // nodes vote + commit an identical block — yet a minority node executed a
+    // DIFFERENT native-action body (native_count=40 of the committed 59) and
+    // persisted a divergent eth header. Root cause: `on_committed_block`
+    // preferred a stale `pending_proposals[height]` cache (a same-height
+    // re-proposal overwrote the entry) over the committed consensus datum, for
+    // BOTH the header and the body. These tests pin the two halves of the fix.
+    // ========================================================================
+
+    /// Build a committed HotStuff `Block` carrying a COMPACT datum for `block`.
+    fn committed_compact_block(block: &TorusBlock) -> hotstuff_rs::types::block::Block {
+        use hotstuff_rs::hotstuff::types::PhaseCertificate;
+        use hotstuff_rs::types::data_types::BlockHeight;
+        let datum = encode_proposal_datum(block, true);
+        let hash = TorusApp::hash_datum(&datum);
+        hotstuff_rs::types::block::Block::new(
+            BlockHeight::new(block.header.height),
+            PhaseCertificate::genesis_pc(),
+            CryptoHash::new(hash),
+            Data::new(vec![Datum::new(datum)]),
+        )
+    }
+
+    /// T1.2 (a) RED-first: a STALE same-height `pending_proposals` entry (fewer
+    /// actions than the committed block) must NEVER be executed in place of the
+    /// committed datum. The body handed to execution must carry the COMMITTED
+    /// action set (reconstructed from the durable DA store), never the cache's
+    /// partial subset.
+    ///
+    /// RED on pre-fix code: the compact path did
+    /// `if let Some(cached) = pending_proposals.remove(&height) { (cached.header, Ok(cached)) }`,
+    /// so it executed the cached 40-action block and its 40-count header.
+    /// GREEN after: header is taken verbatim from the committed compact and the
+    /// bodies are reconstructed from DA (all-or-nothing), so 59 actions execute.
+    #[test]
+    fn committed_block_ignores_stale_smaller_pending_proposal() {
+        let (config, state_db) = make_test_config_and_db();
+        let mempool = Arc::new(torus_mempool::Mempool::new(
+            state_db.clone(),
+            torus_mempool::MempoolConfig::default(),
+        ));
+
+        // The COMMITTED block: 59 native actions (nonces 1..=59).
+        let committed_actions: Vec<SignedNativeAction> =
+            (1..=59u64).map(sign_claim_rewards).collect();
+        let committed_block = make_block(130, committed_actions.clone());
+        // Every committed body lives in the durable DA store (proposer mirror).
+        mempool.mirror_native_to_da(&committed_actions);
+
+        let mut app = TorusApp::new(state_db.clone(), &config, None, Some(mempool), None);
+
+        // Capture what on_committed_block hands to the execution pipeline.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<CommittedBlockMsg>(4);
+        app.exec_tx = Some(tx);
+
+        // A STALE same-height re-proposal cached only 40 of those actions — the
+        // devnet "proposer executed 40 of its own 59" state.
+        let stale_actions: Vec<SignedNativeAction> = (1..=40u64).map(sign_claim_rewards).collect();
+        let stale_block = make_block(130, stale_actions);
+        app.pending_proposals.insert(130, stale_block);
+
+        let committed = committed_compact_block(&committed_block);
+        app.on_committed_block(&committed, committed.hash);
+
+        let msg = rx
+            .try_recv()
+            .expect("committed block must be sent to execution");
+        assert_eq!(
+            msg.torus_block.native_actions.len(),
+            59,
+            "execution must run the COMMITTED body (59), never the stale cache's 40"
+        );
+        assert_eq!(
+            msg.torus_block.header.native_action_count, 59,
+            "the persisted header count must be the committed 59, not the cache's 40"
+        );
+        assert_eq!(
+            msg.torus_block.header.canonical_header_bytes(),
+            committed_block.header.canonical_header_bytes(),
+            "header handed to execution must be byte-identical to the committed header"
+        );
+    }
+
+    /// T1.2 (b) RED-first: feeding the execute path a body with FEWER native
+    /// actions than the committed header's `native_action_count` must FAIL-STOP
+    /// (latch `exec_failed`) and persist NOTHING — never silently execute a
+    /// partial body and persist a header rebuilt from the wrong count.
+    ///
+    /// RED on pre-fix code: `execute_committed_block` had no body/header count
+    /// guard, so it executed the 2 actions and `persist_block_header` wrote the
+    /// (divergent) header verbatim — with `exec_failed` never latched.
+    /// GREEN after: the guard latches fail-stop and returns before any persist.
+    #[test]
+    fn execute_partial_body_vs_header_count_fail_stops() {
+        let (config, state_db) = make_test_config_and_db();
+        let exec_ctx = make_exec_ctx(&config, &state_db);
+
+        // Header claims 5 native actions; the body only carries 2 — the exact
+        // partial-body shape the completeness fix forbids.
+        let mut block = make_block(7, vec![sign_claim_rewards(1), sign_claim_rewards(2)]);
+        block.header.native_action_count = 5;
+
+        exec_ctx.execute_committed_block(&block, vec![]);
+
+        assert!(
+            exec_ctx.exec_failed.load(Ordering::SeqCst),
+            "a body/header native_action_count mismatch must latch the fail-stop"
+        );
+        assert!(
+            state_db
+                .get_cf_raw(CF_BLOCK_HEADERS, &7u64.to_be_bytes())
+                .unwrap()
+                .is_none(),
+            "a divergent header must NOT be persisted"
+        );
+        assert!(
+            read_native_applied_height(&state_db).is_none(),
+            "a fail-stopped block must not be marked applied"
+        );
+    }
+
+    /// T1.2 (c) guard: for a normal, well-formed block the persisted eth header
+    /// must be byte-identical to the committed header — the header-verbatim
+    /// invariant. Passes before and after the fix; a regression that rebuilds
+    /// the header from execution results would break it.
+    #[test]
+    fn persisted_header_equals_committed_header_byte_for_byte() {
+        let (config, state_db) = make_test_config_and_db();
+        let exec_ctx = make_exec_ctx(&config, &state_db);
+
+        let block = make_block(3, vec![sign_claim_rewards(11), sign_claim_rewards(12)]);
+        exec_ctx.execute_committed_block(&block, vec![]);
+
+        let stored = state_db
+            .get_cf_raw(CF_BLOCK_HEADERS, &3u64.to_be_bytes())
+            .unwrap()
+            .expect("normal block must persist a header");
+        // Layout (persist_block_header): [0..32] = committed block hash,
+        // [32..] = serde(header). Both derive from the committed header verbatim.
+        let want_hash = alloy_primitives::keccak256(block.header.canonical_header_bytes());
+        assert_eq!(
+            &stored[..32],
+            want_hash.as_slice(),
+            "persisted block hash must equal keccak(committed canonical header)"
+        );
+        let persisted_header: TorusBlockHeader =
+            serde_json::from_slice(&stored[32..]).expect("persisted header decodes");
+        assert_eq!(
+            persisted_header.canonical_header_bytes(),
+            block.header.canonical_header_bytes(),
+            "persisted header must be byte-identical to the committed header"
+        );
+    }
+
+    // ========================================================================
+    // Regime-B STRICT-ORDER EXECUTION (never execute H+1 before H).
+    //
+    // EVIDENCE: a full devnet run ended with permanently-missing executed
+    // heights (v2: 987-989, v3: 911-913) while LATER heights executed —
+    // consensus committed past a block whose native bodies were not
+    // reconstructable at that instant, the deferred-body path dropped it, and
+    // later blocks executed anyway. Native matching is order-dependent, so an
+    // interior hole is PERMANENT divergence. These tests pin the invariant:
+    // on_committed_block hands blocks to `exec_tx` strictly in ascending height
+    // with NO gaps; a missing-body height holds every later height until it heals.
+    // ========================================================================
+
+    /// Wire a TorusApp with a live mempool DA store and a RECORDING exec channel,
+    /// so a test can observe exactly what (and in what order) on_committed_block
+    /// hands to the execution pipeline. Returns the app, the receiver, and the
+    /// mempool (to mirror bodies into the DA store, i.e. make them reconstructable).
+    fn app_with_recording_exec(
+        config: &ChainConfig,
+        state_db: &StateDb,
+    ) -> (
+        TorusApp,
+        std::sync::mpsc::Receiver<CommittedBlockMsg>,
+        Arc<Mempool>,
+    ) {
+        let mempool = Arc::new(torus_mempool::Mempool::new(
+            state_db.clone(),
+            torus_mempool::MempoolConfig::default(),
+        ));
+        let mut app = TorusApp::new(state_db.clone(), config, None, Some(mempool.clone()), None);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<CommittedBlockMsg>(64);
+        app.exec_tx = Some(tx);
+        (app, rx, mempool)
+    }
+
+    /// RED-first (out-of-order delivery): the execution pipeline must NEVER
+    /// receive H+1 before H, even when H+1's bodies are fully available and H has
+    /// not yet arrived. RED on pre-fix code: `on_committed_block` sent every
+    /// reconstructable block immediately, so a committed H+1 executed while H was
+    /// still deferred — the permanent interior-hole divergence. GREEN: H+1 is
+    /// buffered until H arrives, then both drain in strict order.
+    #[test]
+    fn exec_pipeline_never_runs_higher_height_before_lower() {
+        let (config, state_db) = make_test_config_and_db();
+        let (mut app, rx, mempool) = app_with_recording_exec(&config, &state_db);
+
+        // Both bodies are present in the DA store (nothing missing here — this is
+        // pure ordering, not a hole).
+        let a5 = vec![sign_claim_rewards(5)];
+        let a6 = vec![sign_claim_rewards(6)];
+        mempool.mirror_native_to_da(&a5);
+        mempool.mirror_native_to_da(&a6);
+        let b5 = make_block(5, a5);
+        let b6 = make_block(6, a6);
+
+        // The pipeline expects height 5 next.
+        app.exec_next_height = Some(5);
+
+        // H+1 (6) is committed with its body READY, but H (5) has not arrived.
+        let c6 = committed_compact_block(&b6);
+        app.on_committed_block(&c6, c6.hash);
+        assert!(
+            rx.try_recv().is_err(),
+            "H+1 must NOT reach execution before H — strict height order (RED on pre-fix code)"
+        );
+
+        // H (5) arrives → 5 then 6 drain in ascending order.
+        let c5 = committed_compact_block(&b5);
+        app.on_committed_block(&c5, c5.hash);
+        assert_eq!(
+            rx.try_recv().unwrap().torus_block.header.height,
+            5,
+            "H executes first"
+        );
+        assert_eq!(
+            rx.try_recv().unwrap().torus_block.header.height,
+            6,
+            "then H+1"
+        );
+        assert!(rx.try_recv().is_err(), "nothing else queued");
+        assert!(!app.is_exec_failed(), "in-order delivery must not fail-stop");
+    }
+
+    /// RED-first (deferred hole heals): a committed block whose native bodies are
+    /// initially missing is DEFERRED (not executed); a later committed block waits
+    /// behind it; once the missing bodies land in the DA store, the next commit
+    /// drives BOTH (and the follower) through execution in strict order.
+    #[test]
+    fn deferred_hole_executes_in_order_once_bodies_arrive() {
+        let (config, state_db) = make_test_config_and_db();
+        let (mut app, rx, mempool) = app_with_recording_exec(&config, &state_db);
+
+        let a5 = vec![sign_claim_rewards(5)];
+        let a6 = vec![sign_claim_rewards(6)];
+        let a7 = vec![sign_claim_rewards(7)];
+        // Initially only 6 and 7 are reconstructable; 5's body is MISSING.
+        mempool.mirror_native_to_da(&a6);
+        mempool.mirror_native_to_da(&a7);
+        let b5 = make_block(5, a5.clone());
+        let b6 = make_block(6, a6);
+        let b7 = make_block(7, a7);
+
+        app.exec_next_height = Some(5);
+
+        // H=5 committed but body missing → deferred, nothing executes.
+        let c5 = committed_compact_block(&b5);
+        app.on_committed_block(&c5, c5.hash);
+        assert!(
+            rx.try_recv().is_err(),
+            "a missing-body committed block must defer, not execute"
+        );
+        assert!(
+            app.exec_hole_since.is_some(),
+            "the hole clock must start when the head-of-line body is missing"
+        );
+
+        // H+1=6 committed WITH its body → must wait behind the hole at 5.
+        let c6 = committed_compact_block(&b6);
+        app.on_committed_block(&c6, c6.hash);
+        assert!(
+            rx.try_recv().is_err(),
+            "H+1 must wait behind the deferred hole at H (no out-of-order execution)"
+        );
+
+        // Heal: 5's body arrives in the DA store; the next commit (7) drives the drain.
+        mempool.mirror_native_to_da(&a5);
+        let c7 = committed_compact_block(&b7);
+        app.on_committed_block(&c7, c7.hash);
+
+        assert_eq!(rx.try_recv().unwrap().torus_block.header.height, 5, "5 first");
+        assert_eq!(rx.try_recv().unwrap().torus_block.header.height, 6, "then 6");
+        assert_eq!(rx.try_recv().unwrap().torus_block.header.height, 7, "then 7");
+        assert!(rx.try_recv().is_err(), "exactly three blocks, in order");
+        assert!(
+            !app.is_exec_failed(),
+            "a healed hole must NOT latch fail-stop"
+        );
+        assert!(
+            app.exec_hole_since.is_none(),
+            "healing the hole must clear the hole clock"
+        );
+    }
+
+    /// RED-first (heal-budget exhaustion): an execution hole that cannot heal
+    /// within the budget must latch `exec_failed` — a node that cannot obtain a
+    /// committed block's bodies is broken, and a silent divergence is worse than a
+    /// halt. First detection stays WITHIN budget (retry, no latch); once the
+    /// budget elapses, the next re-attempt latches the fail-stop.
+    #[test]
+    fn exec_hole_budget_exhaustion_latches_fail_stop() {
+        let (config, state_db) = make_test_config_and_db();
+        let (mut app, _rx, _mempool) = app_with_recording_exec(&config, &state_db);
+
+        // 5's body is PERMANENTLY absent from the DA store (never mirrored).
+        let b5 = make_block(5, vec![sign_claim_rewards(5)]);
+        let b6 = make_block(6, vec![]); // empty follower, always reconstructable
+
+        app.exec_next_height = Some(5);
+
+        // First hit: hole detected, still within budget → retrying, NOT latched.
+        let c5 = committed_compact_block(&b5);
+        app.on_committed_block(&c5, c5.hash);
+        assert!(
+            !app.is_exec_failed(),
+            "a fresh hole within budget must keep retrying, not fail-stop"
+        );
+        assert!(
+            app.exec_hole_since.is_some(),
+            "the hole clock must start on first detection"
+        );
+
+        // Simulate the heal budget elapsing (default 5 min).
+        app.exec_hole_since =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(6 * 60));
+
+        // The next commit re-attempts the still-broken hole → budget exhausted →
+        // fail-stop latched (halt, never diverge silently).
+        let c6 = committed_compact_block(&b6);
+        app.on_committed_block(&c6, c6.hash);
+        assert!(
+            app.is_exec_failed(),
+            "a hole that cannot heal within the budget must latch exec_failed"
         );
     }
 }
