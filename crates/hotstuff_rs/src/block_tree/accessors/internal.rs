@@ -60,6 +60,36 @@ use super::super::{
 
 use super::{app::AppBlockTreeView, public::BlockTreeSnapshot};
 
+/// Throttled observability for a commit that is blocked on a missing ancestor
+/// (GAP-SAFE COMMIT). The commit walk runs on the single algorithm thread, so a
+/// `thread_local` per-block counter is race-free and cheap. Returns `Some(count)`
+/// once every [`GAP_COMMIT_WARN_EVERY`] consecutive deferrals for the SAME block
+/// so a genuine wedge SCREAMS (like the block-sync backfill logging) instead of
+/// staying a silent `debug!`, while a transient (different block each tick,
+/// counter resets) stays quiet.
+const GAP_COMMIT_WARN_EVERY: u64 = 50;
+
+fn note_gap_commit_deferral(block: &CryptoHash) -> Option<u64> {
+    use std::cell::RefCell;
+    thread_local! {
+        static STATE: RefCell<(CryptoHash, u64)> =
+            RefCell::new((CryptoHash::new([0u8; 32]), 0));
+    }
+    STATE.with(|s| {
+        let mut s = s.borrow_mut();
+        if s.0 == *block {
+            s.1 += 1;
+        } else {
+            *s = (*block, 1);
+        }
+        if s.1 % GAP_COMMIT_WARN_EVERY == 0 {
+            Some(s.1)
+        } else {
+            None
+        }
+    })
+}
+
 /// Result of a [`BlockTreeSingleton::update`] call, containing both the
 /// validator set updates (if any) and the list of newly committed block hashes
 /// (oldest to newest). The caller uses `committed_block_hashes` to invoke
@@ -659,6 +689,60 @@ impl<K: KVStore> BlockTreeSingleton<K> {
                     .is_some_and(|h| self.block_height(b).ok().flatten().is_some_and(|bh| bh > h))
         });
         let uncommitted_blocks = uncommitted_blocks_iter.collect::<Vec<CryptoHash>>();
+
+        // GAP-SAFE COMMIT (think-dev commit-pipeline wedge fix, 04f6c88 regression).
+        //
+        // The ancestor walk above follows `block_justify` and SILENTLY stops at the
+        // first ancestor that is missing from the tree (`successors` yields `None`
+        // when `block_justify(b)` errs, and the `take_while` drops any collected
+        // ancestor whose height cannot be read). On a tree assembled OUT OF ORDER
+        // — block-sync inserts high blocks skipping `safe_block`
+        // (block_sync/client.rs), then re-drives their `justify` through `update`
+        // (the 04f6c88 "re-drive already-present blocks" change) — that leaves
+        // `uncommitted_blocks` as a CONTIGUOUS TOP SEGMENT sitting ABOVE a hole.
+        //
+        // Committing that segment would `set_highest_committed_block` to the segment
+        // tip while every height below the hole never receives a `block_at_height`
+        // entry: a PERMANENT commit-index hole. Backfill then targets the hole but
+        // can never heal it — `block_to_commit`'s `not_committed_yet` gate
+        // (`grandparent_height > highest_committed`) refuses to re-commit anything
+        // below the now-inflated frontier, so the gap-driven backfill loops forever
+        // ("batch at height N made no progress"; devnet t12-regate-a: v0 wedged at
+        // h2 while `highest_committed` raced to 2139, v1/v3 at h693).
+        //
+        // Refuse to advance the committed frontier ACROSS a hole: the lowest block
+        // we are about to commit MUST chain directly to the current committed
+        // frontier (or to genesis). If it does not, a required ancestor is still
+        // missing — commit NOTHING and wait for it to arrive (block-sync backfill /
+        // body fetch). This preserves strict, contiguous commit order and makes the
+        // out-of-order re-drive a safe idempotent no-op instead of a wedge.
+        if let Some(lowest) = uncommitted_blocks.last() {
+            let lowest_justify = self.block_justify(lowest)?;
+            let contiguous = lowest_justify.is_genesis_pc()
+                || Some(lowest_justify.block) == self.highest_committed_block()?;
+            if !contiguous {
+                if let Some(n) = note_gap_commit_deferral(lowest) {
+                    log::warn!(
+                        "commit: REFUSING to commit across a hole ({} consecutive attempts) — \
+                         lowest uncommitted block {:?} does not chain to the committed frontier \
+                         {:?}; a required ancestor is missing from the tree and committing would \
+                         orphan the commit index below it. Deferring until block-sync backfill / \
+                         body fetch delivers the gap.",
+                        n,
+                        lowest,
+                        self.highest_committed_block()?,
+                    );
+                } else {
+                    log::debug!(
+                        "commit: deferring — lowest uncommitted block {:?} does not yet chain to \
+                         the committed frontier (missing ancestor); waiting for backfill",
+                        lowest,
+                    );
+                }
+                return Ok(Vec::new());
+            }
+        }
+
         let uncommitted_blocks_ordered_iter = uncommitted_blocks.iter().rev();
 
         // Helper closure that
@@ -2197,6 +2281,103 @@ mod block_tree_pruner_tests {
         bt.commit(&mut wb, &block.hash).unwrap();
         bt.write(wb);
         block.hash
+    }
+
+    /// GAP-SAFE COMMIT (think-dev commit-pipeline wedge, 04f6c88 regression).
+    ///
+    /// RED (pre-fix): `commit()` walked ancestors via `block_justify`, silently
+    /// stopped at a missing interior ancestor, then committed the contiguous TOP
+    /// segment and jumped `highest_committed_block` PAST the hole — leaving
+    /// `block_at_height` for the hole permanently unset. That is the devnet wedge
+    /// (t12-regate-a: v0 stuck at h2 while `highest_committed` raced to 2139,
+    /// backfill looping "made no progress" forever).
+    ///
+    /// GREEN (post-fix): `commit()` refuses to advance the frontier across a hole
+    /// and finalizes NOTHING until the missing ancestor arrives; then it commits
+    /// the whole contiguous run in order (backfill heal preserved).
+    #[test]
+    fn commit_refuses_to_advance_across_a_hole() {
+        let mut bt = BlockTreeSingleton::new(MemKV::default());
+        // Committed frontier at heights 0..=1 (tip = h1).
+        let hashes = seed_committed_chain(&mut bt, 2);
+        assert_eq!(
+            bt.highest_committed_block_height().unwrap(),
+            Some(BlockHeight::new(1))
+        );
+
+        // block@2 is a child of the committed tip (h1); block@3 is a child of
+        // block@2. Insert ONLY block@3 — block@2 is the missing interior ancestor
+        // (exactly what happens when block-sync inserts a high block skipping
+        // `safe_block`/its parent, then re-drives its justify through `update`).
+        let justify_h1 = PhaseCertificate {
+            chain_id: ChainID::new(0),
+            view: ViewNumber::new(2),
+            block: hashes[1],
+            phase: Phase::Generic,
+            signatures: SignatureSet::new(0),
+        };
+        let block2 = Block::new(
+            BlockHeight::new(2),
+            justify_h1,
+            CryptoHash::new([2u8; 32]),
+            Data::new(vec![]),
+        );
+        let justify_h2 = PhaseCertificate {
+            chain_id: ChainID::new(0),
+            view: ViewNumber::new(3),
+            block: block2.hash,
+            phase: Phase::Generic,
+            signatures: SignatureSet::new(0),
+        };
+        let block3 = Block::new(
+            BlockHeight::new(3),
+            justify_h2,
+            CryptoHash::new([3u8; 32]),
+            Data::new(vec![]),
+        );
+        bt.insert(&block3, None, None).unwrap(); // block2 NOT inserted -> hole at h2
+
+        // Attempt to commit block3 with the hole below it.
+        let mut wb = BlockTreeWriteBatch::new();
+        let committed = bt.commit(&mut wb, &block3.hash).unwrap();
+        bt.write(wb);
+
+        assert!(
+            committed.is_empty(),
+            "commit must NOT finalize a top segment sitting above a hole"
+        );
+        assert_eq!(
+            bt.highest_committed_block_height().unwrap(),
+            Some(BlockHeight::new(1)),
+            "the committed frontier must NOT jump past the missing ancestor at h2"
+        );
+        assert!(
+            bt.block_at_height(BlockHeight::new(2)).unwrap().is_none(),
+            "h2 stays a hole — never spuriously indexed"
+        );
+        assert!(
+            bt.block_at_height(BlockHeight::new(3)).unwrap().is_none(),
+            "h3 must NOT commit while its parent is missing (would orphan the index)"
+        );
+
+        // HEAL: the missing ancestor arrives (backfill / body fetch). The chain is
+        // now contiguous and the SAME commit call finalizes both h2 and h3 in order.
+        bt.insert(&block2, None, None).unwrap();
+        let mut wb2 = BlockTreeWriteBatch::new();
+        let committed2 = bt.commit(&mut wb2, &block3.hash).unwrap();
+        bt.write(wb2);
+
+        assert_eq!(
+            committed2.len(),
+            2,
+            "once the gap fills, both blocks commit in a single contiguous walk"
+        );
+        assert_eq!(
+            bt.highest_committed_block_height().unwrap(),
+            Some(BlockHeight::new(3))
+        );
+        assert!(bt.block_at_height(BlockHeight::new(2)).unwrap().is_some());
+        assert!(bt.block_at_height(BlockHeight::new(3)).unwrap().is_some());
     }
 
     /// Pruning removes every per-block key (BLOCKS fields, BLOCK_AT_HEIGHT,

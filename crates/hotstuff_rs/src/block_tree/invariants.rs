@@ -309,6 +309,37 @@ use super::{
     pluggables::KVStore,
 };
 
+/// Throttled observability for `block_to_commit` deferring on a QC whose
+/// certified block is not yet in the tree (pending body / undelivered ancestor).
+/// A transient defer (the body arrives a tick later) must stay quiet, but the
+/// same block deferring over and over is a COMMIT WEDGE that must SCREAM rather
+/// than hide in a `debug!` for minutes (devnet t12-regate-a: 1344+ silent
+/// deferrals over 5+ min). Runs on the single algorithm thread, so a
+/// `thread_local` per-block counter is race-free. Returns `Some(count)` once
+/// every [`DEFERRAL_WARN_EVERY`] consecutive deferrals for the SAME block.
+const DEFERRAL_WARN_EVERY: u64 = 50;
+
+fn note_pending_justify_deferral(block: &CryptoHash) -> Option<u64> {
+    use std::cell::RefCell;
+    thread_local! {
+        static STATE: RefCell<(CryptoHash, u64)> =
+            RefCell::new((CryptoHash::new([0u8; 32]), 0));
+    }
+    STATE.with(|s| {
+        let mut s = s.borrow_mut();
+        if s.0 == *block {
+            s.1 += 1;
+        } else {
+            *s = (*block, 1);
+        }
+        if s.1 % DEFERRAL_WARN_EVERY == 0 {
+            Some(s.1)
+        } else {
+            None
+        }
+    })
+}
+
 /// Check whether `block` can safely cause updates to `block_tree`, given the replica's `chain_id`.
 ///
 /// # Conditional checks
@@ -562,9 +593,20 @@ pub(crate) fn block_to_commit<K: KVStore>(
             let parent_justify = match block_tree.block_justify(&justify.block) {
                 Ok(pj) => pj,
                 Err(_) => {
-                    log::debug!(
-                        "block_to_commit: justify.block not in tree yet (pending body), deferring"
-                    );
+                    if let Some(n) = note_pending_justify_deferral(&justify.block) {
+                        log::warn!(
+                            "block_to_commit: justify.block {:?} STILL not in tree after {} \
+                             consecutive commit attempts (pending body / undelivered ancestor) — \
+                             the commit pipeline is WEDGED on this block; block-sync backfill / \
+                             body fetch must deliver it",
+                            justify.block,
+                            n,
+                        );
+                    } else {
+                        log::debug!(
+                            "block_to_commit: justify.block not in tree yet (pending body), deferring"
+                        );
+                    }
                     return Ok(None);
                 }
             };
