@@ -89,6 +89,7 @@ async fn bare_eth_call_succeeds_at_height_with_base_fee() {
     // server starts, so find_latest_height reports latest = 1.
     let header = torus_types::TorusBlockHeader {
         height: 1,
+        parent_hash: alloy_primitives::B256::ZERO,
         timestamp: 1000,
         proposer: alloy_primitives::Address::repeat_byte(0x99),
         state_root: alloy_primitives::B256::ZERO,

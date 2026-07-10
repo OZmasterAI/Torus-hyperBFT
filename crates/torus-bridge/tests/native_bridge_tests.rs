@@ -388,6 +388,7 @@ fn empty_native_actions_evm_only() {
     let block = TorusBlock {
         header: TorusBlockHeader {
             height: 1,
+            parent_hash: B256::ZERO,
             timestamp: 1000,
             proposer: addr(99),
             state_root: B256::ZERO,

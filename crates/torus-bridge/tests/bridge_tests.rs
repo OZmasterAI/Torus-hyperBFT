@@ -483,6 +483,7 @@ fn block_hash_uses_canonical_encoding() {
 
     let header = TorusBlockHeader {
         height: 42,
+        parent_hash: B256::new([9u8; 32]),
         timestamp: 1_700_000_000,
         proposer: Address::new([0xAA; 20]),
         state_root: B256::new([1u8; 32]),

@@ -507,6 +507,7 @@ mod tests {
     fn test_header(height: u64, gas_used: u64, base_fee: u64) -> TorusBlockHeader {
         TorusBlockHeader {
             height,
+            parent_hash: B256::ZERO,
             timestamp: 1_700_000_000 + height,
             proposer: Address::ZERO,
             state_root: B256::ZERO,

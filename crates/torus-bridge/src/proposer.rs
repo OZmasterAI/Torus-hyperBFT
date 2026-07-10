@@ -135,9 +135,12 @@ impl BlockProposer {
             .map_err(|e| BridgeError::Serialization(format!("receipts: {e}")))?;
 
         // 9. Assemble block with only the included txs.
+        // Ancestry commitment: bind this block to the parent it was built on.
+        let parent_hash = alloy_primitives::keccak256(parent.canonical_header_bytes());
         let block = TorusBlock {
             header: TorusBlockHeader {
                 height: block_height,
+                parent_hash,
                 timestamp,
                 proposer,
                 state_root,
@@ -266,9 +269,12 @@ impl BlockProposer {
         let receipts_root = compute_receipts_root(&exec_result.receipts)
             .map_err(|e| BridgeError::Serialization(format!("receipts: {e}")))?;
 
+        // Ancestry commitment: bind this block to the parent it was built on.
+        let parent_hash = alloy_primitives::keccak256(parent.canonical_header_bytes());
         let block = TorusBlock {
             header: TorusBlockHeader {
                 height: block_height,
+                parent_hash,
                 timestamp,
                 proposer,
                 state_root,
@@ -313,6 +319,10 @@ pub(crate) fn compute_receipts_root(
 pub fn genesis_parent_header() -> TorusBlockHeader {
     TorusBlockHeader {
         height: 0,
+        // Genesis is the ancestry root: no parent, so the parent commitment is
+        // zero. The first real block (height 1) commits to
+        // keccak256(genesis_parent_header().canonical_header_bytes()).
+        parent_hash: B256::ZERO,
         timestamp: 0,
         proposer: Address::ZERO,
         state_root: B256::ZERO,

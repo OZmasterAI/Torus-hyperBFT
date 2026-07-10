@@ -362,9 +362,42 @@ pub struct TorusBlock {
 pub struct TorusBlockHeader {
     /// Block height — populated from hotstuff_rs Block.height during bridge processing.
     pub height: u64,
+    /// Keccak canonical hash of the PARENT block's header
+    /// (`keccak256(parent.canonical_header_bytes())`).
+    ///
+    /// This is the ancestry commitment that makes block identity depend on the
+    /// chain that produced it: two blocks at the same height that descend from
+    /// DIFFERENT parents now hash differently, so a hash-vs-hash fork check at a
+    /// height is sound. Genesis (`genesis_parent_header`, height 0) uses
+    /// `B256::ZERO`; the first real block (height 1) commits to
+    /// `keccak256(genesis_parent_header().canonical_header_bytes())`.
+    ///
+    /// NOTE: this is the keccak canonical header hash (what RPC `parentHash` and
+    /// the fork checker compare), which is DISTINCT from the hotstuff consensus
+    /// `justify.block` id (`hash(height, justify, data_hash)`). Both identify the
+    /// same parent block: consensus safety is enforced by the justify QC, while
+    /// RPC/EVM-level ancestry soundness is enforced by this field. An honest
+    /// proposer keeps the two consistent (this field == keccak hash of the block
+    /// the justify QC points at).
+    ///
+    /// `#[serde(default)]` so pre-hardening stored/RPC header JSON still
+    /// deserializes (as `B256::ZERO`); moot on the approved fresh-genesis launch.
+    #[serde(default)]
+    pub parent_hash: B256,
     pub timestamp: u64,
     pub proposer: Address,
-    /// State root after executing all actions in this block.
+    /// State root. NOT part of `canonical_header_bytes` (block identity).
+    ///
+    /// This chain is commit-then-execute: headers are built PRE-execution
+    /// (`app.rs::produce_block`), so the real post-execution state root of THIS
+    /// block is not known when the header is hashed, and the already-computed
+    /// T4.1 post-exec root (`execute_committed_block`) is not persisted per height
+    /// for a parent-state-root lookup either. Rather than commit to a
+    /// perpetually-`0x0` value and pretend it is a state commitment, the field is
+    /// excluded from the hash preimage. Re-adding it under parent-state-root
+    /// semantics (header commits to the state root AFTER executing the PARENT)
+    /// requires persisting each block's post-exec composite root and guaranteeing
+    /// parent execution precedes child proposal — tracked as follow-up.
     pub state_root: B256,
     /// Receipts root (EVM transactions only).
     pub receipts_root: B256,
@@ -398,9 +431,16 @@ impl TorusBlockHeader {
     pub fn canonical_header_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(256);
         buf.extend_from_slice(&self.height.to_be_bytes());
+        // Ancestry commitment: the block hash now depends on the parent it was
+        // built on (see `parent_hash` field docs). Placed right after height so
+        // the (height, parent_hash) pair uniquely anchors the block in the chain.
+        buf.extend_from_slice(self.parent_hash.as_slice());
         buf.extend_from_slice(&self.timestamp.to_be_bytes());
         buf.extend_from_slice(self.proposer.as_slice());
-        buf.extend_from_slice(self.state_root.as_slice());
+        // NOTE: `state_root` is intentionally NOT hashed — it is a perpetual-0x0
+        // dead field under commit-then-execute (see field docs). Excluding it
+        // keeps the block identity honest instead of committing to a fake state
+        // commitment.
         buf.extend_from_slice(self.receipts_root.as_slice());
         buf.extend_from_slice(self.logs_bloom.as_slice());
         buf.extend_from_slice(&self.evm_gas_used.to_be_bytes());
@@ -1305,6 +1345,7 @@ mod tests {
     fn header_with_attestation_serializes() {
         let mut header = TorusBlockHeader {
             height: 1,
+            parent_hash: B256::ZERO,
             timestamp: 1000,
             proposer: Address::ZERO,
             state_root: B256::ZERO,
@@ -1336,6 +1377,7 @@ mod tests {
     fn test_header() -> TorusBlockHeader {
         TorusBlockHeader {
             height: 1,
+            parent_hash: B256::ZERO,
             timestamp: 1000,
             proposer: Address::ZERO,
             state_root: B256::ZERO,
@@ -1495,6 +1537,7 @@ mod tests {
     fn attestation_excluded_from_canonical_bytes() {
         let h1 = TorusBlockHeader {
             height: 1,
+            parent_hash: B256::ZERO,
             timestamp: 1000,
             proposer: Address::ZERO,
             state_root: B256::ZERO,
@@ -1513,5 +1556,57 @@ mod tests {
         let mut h2 = h1.clone();
         h2.sig_attestation = [0xff; 64];
         assert_eq!(h1.canonical_header_bytes(), h2.canonical_header_bytes());
+    }
+
+    /// RED before this fix: `canonical_header_bytes` did not include any parent
+    /// linkage, so two headers identical except for `parent_hash` produced the
+    /// SAME preimage (and thus the same block hash). This is the root cause of
+    /// the devnet fork-detection unsoundness (two different height-110 blocks
+    /// yielded byte-identical height-111 hashes). It must now hold that differing
+    /// only in `parent_hash` yields DIFFERENT canonical bytes / block hashes.
+    #[test]
+    fn parent_hash_included_in_canonical_bytes() {
+        let h1 = test_header();
+        let mut h2 = h1.clone();
+        h2.parent_hash = B256::repeat_byte(0xAB);
+        assert_ne!(
+            h1.canonical_header_bytes(),
+            h2.canonical_header_bytes(),
+            "headers differing only in parent_hash must hash differently"
+        );
+        assert_ne!(
+            alloy_primitives::keccak256(h1.canonical_header_bytes()),
+            alloy_primitives::keccak256(h2.canonical_header_bytes()),
+        );
+    }
+
+    /// Genesis zero-parent case: `genesis_parent_header`-style header (height 0)
+    /// carries `parent_hash == B256::ZERO`, and its canonical bytes commit to
+    /// that zero parent so the height-1 block can anchor to it deterministically.
+    #[test]
+    fn genesis_header_has_zero_parent_hash() {
+        let mut genesis = test_header();
+        genesis.height = 0;
+        genesis.parent_hash = B256::ZERO;
+        // The canonical bytes begin with height(8) || parent_hash(32); assert the
+        // parent_hash region is exactly zero for genesis.
+        let bytes = genesis.canonical_header_bytes();
+        assert_eq!(&bytes[8..40], &[0u8; 32], "genesis parent_hash must be zero");
+    }
+
+    /// `state_root` is intentionally excluded from the block identity (dead field
+    /// under commit-then-execute). Two headers differing ONLY in `state_root`
+    /// must therefore produce identical canonical bytes — pinning that the
+    /// perpetual-0x0 field can never silently fork or alter block identity.
+    #[test]
+    fn state_root_excluded_from_canonical_bytes() {
+        let h1 = test_header();
+        let mut h2 = h1.clone();
+        h2.state_root = B256::repeat_byte(0x11);
+        assert_eq!(
+            h1.canonical_header_bytes(),
+            h2.canonical_header_bytes(),
+            "state_root must NOT affect block identity (excluded from preimage)"
+        );
     }
 }

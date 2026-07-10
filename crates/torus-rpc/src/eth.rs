@@ -395,14 +395,14 @@ fn build_rpc_block(
                     .sum::<u64>()
             })
             .unwrap_or(0);
-    let parent_hash = if header.height > 0 {
-        match get_header_with_hash(state, header.height - 1)? {
-            Some((_, ph, _)) => hex_b256(ph),
-            None => hex_b256(B256::ZERO),
-        }
-    } else {
-        hex_b256(B256::ZERO)
-    };
+    // Serve the header's own ancestry field. Previously this was SYNTHESIZED by
+    // looking up this node's stored hash of block height-1, which meant parentHash
+    // was a per-node reconstruction rather than a committed part of the block.
+    // The header now carries `parent_hash` (keccak canonical hash of the parent,
+    // set at propose time and part of the block identity), so RPC ancestry is
+    // sound and identical across nodes. Genesis (height 0) header carries
+    // `B256::ZERO` by construction.
+    let parent_hash = hex_b256(header.parent_hash);
     Ok(RpcBlock {
         number: hex_u64(header.height),
         hash: hex_b256(hash),

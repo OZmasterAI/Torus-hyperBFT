@@ -94,6 +94,7 @@ fn compact_referencing(body: &SignedNativeAction, height: u64) -> CompactBlock {
     CompactBlock {
         header: TorusBlockHeader {
             height,
+            parent_hash: B256::ZERO,
             timestamp: 1000 + height,
             proposer: Address::ZERO,
             state_root: B256::ZERO,

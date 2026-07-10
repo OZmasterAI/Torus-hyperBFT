@@ -81,6 +81,7 @@ fn block_with_txs(evm_transactions: Vec<Vec<u8>>) -> TorusBlock {
     TorusBlock {
         header: TorusBlockHeader {
             height: 1,
+            parent_hash: B256::ZERO,
             timestamp: 1000,
             proposer: Address::repeat_byte(0x99),
             state_root: B256::ZERO,
