@@ -70,6 +70,14 @@ enum ExecSource {
     Ready(TorusBlock),
     /// Reconstruct from the durable DA store on each attempt (may miss → hole).
     Compact(CompactBlock),
+    /// FIX 1b (boot park+heal): a committed height whose header (and possibly
+    /// body) is only in the durable CFs — used to seed the strict-order queue at
+    /// boot when replay could not reconstruct a gap height locally. Re-loads
+    /// header (`CF_BLOCK_HEADERS`) + body (`CF_BLOCK_BODIES`) on each drain
+    /// attempt, so the hole heals the moment the body becomes durable (FIX 1a
+    /// write, or a block-sync re-delivery that writes it) instead of a boot
+    /// fail-stop. A still-missing body degrades to the same heal-able hole.
+    Durable(u64),
 }
 
 /// A committed block buffered awaiting its strictly-ordered turn to execute.
@@ -283,6 +291,59 @@ fn persist_block_header(state_db: &StateDb, block: &TorusBlock) {
     if let Err(e) = state_db.put_cf_raw(CF_BLOCK_HEADERS, &block.header.height.to_be_bytes(), &data)
     {
         tracing::error!(%e, height = block.header.height, "failed to persist block header");
+    }
+}
+
+/// FIX 1a (crash-safety, commit->execute kill-window durability). Persist a
+/// committed block's HEADER and BODY to the durable CFs AT COMMIT TIME — i.e. in
+/// `dispatch_to_exec`, BEFORE the block is handed to the execution pipeline.
+///
+/// ROOT CAUSE this closes: the body was previously written to `CF_BLOCK_BODIES`
+/// only at EXECUTION (`execute_committed_block` line ~910 / `commit_block_metadata`),
+/// and a native-only block's header only at execution too (`persist_block_header`
+/// in the `has_evm == false` arm). A `SIGKILL` in the commit->execute window
+/// therefore lost the body (and possibly the committed-height header), so boot
+/// crash-recovery (`replay_gap` -> `load_replay_body`, which reads ONLY
+/// `CF_BLOCK_BODIES`) found a committed NON-EMPTY height with no body and
+/// fail-stopped (devnet t12-final-a/c: `height=132`/`h224`, then `exit(70)`).
+/// The durable DA store (`CF_NATIVE_PENDING`) DID retain the native-action
+/// bodies, but the persisted header carries only `native_action_count`, NOT the
+/// `native_action_hashes` (those live only on the `CompactBlock`), so recovery
+/// had no way to reconstruct from the DA store by hash.
+///
+/// Writing header+body here makes every committed-and-dispatched block durably
+/// reconstructable on restart, regardless of where in the execute path a crash
+/// lands. The execution-time writes are kept (idempotent, same bytes; they also
+/// cover the boot-replay execute path and the EVM receipts/indices that are only
+/// known post-execution). Best-effort like the execution-time writes: a failure
+/// is loud but does not abort the commit (a still-missing body degrades to the
+/// same heal-able hole, never a silent state loss).
+fn persist_committed_block_durably(state_db: &StateDb, block: &TorusBlock) {
+    // Header first (find_last_committed_height scans CF_BLOCK_HEADERS): a crash
+    // between this and execution then still exposes the committed height so the
+    // gap is visible and replayable, rather than silently vanishing.
+    persist_block_header(state_db, block);
+    match serde_json::to_vec(&block.body()) {
+        Ok(body_bytes) => {
+            if let Err(e) = state_db.put_cf_raw(
+                CF_BLOCK_BODIES,
+                &block.header.height.to_be_bytes(),
+                &body_bytes,
+            ) {
+                tracing::error!(
+                    %e,
+                    height = block.header.height,
+                    "FIX1a: failed to persist committed block body at commit time (crash-recovery may hole here)"
+                );
+            }
+        }
+        Err(e) => {
+            tracing::error!(
+                %e,
+                height = block.header.height,
+                "FIX1a: failed to serialize committed block body at commit time"
+            );
+        }
     }
 }
 
@@ -1517,8 +1578,12 @@ impl TorusApp {
             tracing::warn!(%e, "failed to build initial native trie (incremental native root unavailable until rebuilt)");
         }
 
-        // Crash recovery runs synchronously before spawning the pipeline.
-        let last_header = Self::replay_committed(&state_db, &exec_ctx);
+        // Crash recovery runs synchronously before spawning the pipeline. FIX 1b:
+        // an unresolvable-at-boot gap yields `parked_hole = Some(h)` instead of a
+        // fail-stop latch — execution parks at `h` and the live heal loop + backfill
+        // get a bounded window to close it (see the `exec_next_height` /
+        // `exec_hole_since` wiring in the struct literal below).
+        let (last_header, parked_hole) = Self::replay_committed(&state_db, &exec_ctx);
 
         // Spawn execution pipeline: bounded channel (64 blocks) for backpressure.
         let (exec_tx, exec_rx) = std::sync::mpsc::sync_channel(64);
@@ -1531,7 +1596,7 @@ impl TorusApp {
         leader_state.sync_validators(&genesis_validator_set);
         leader_state.set_view(last_header.height.saturating_add(1));
 
-        Self {
+        let mut app = Self {
             state_db,
             proposer,
             validator,
@@ -1572,7 +1637,39 @@ impl TorusApp {
             exec_hole_since: None,
             exec_hole_last_log: None,
             exec_hole_retries: 0,
+        };
+
+        // FIX 1b: a boot replay hole PARKS instead of latching a pre-network
+        // fail-stop. Seed the strict-order execution queue with the committed
+        // heights [hole..=committed] as durable-reload sources, park
+        // `exec_next_height` at the hole, and start the heal-budget clock now so
+        // the live heal loop + block-sync backfill get the SAME bounded window a
+        // live hole gets. The node completes boot and rejoins consensus; the hole
+        // heals when its body becomes durable (FIX 1a) or a peer re-delivers the
+        // block, and fail-stops ONLY if the budget expires (see `note_exec_hole`).
+        if let Some(hole) = parked_hole {
+            let committed = find_last_committed_height(&app.state_db).unwrap_or(hole);
+            for h in hole..=committed {
+                app.deferred_exec.insert(
+                    h,
+                    DeferredExecBlock {
+                        source: ExecSource::Durable(h),
+                        slashes: Vec::new(),
+                    },
+                );
+            }
+            app.exec_next_height = Some(hole);
+            app.exec_hole_since = Some(std::time::Instant::now());
+            tracing::warn!(
+                hole_height = hole,
+                committed_height = committed,
+                parked = committed.saturating_sub(hole) + 1,
+                "FIX 1b: boot replay hole PARKED (not fail-stopped) — execution queued at the hole; \
+                 live heal loop + block-sync backfill will close it within the heal budget"
+            );
         }
+
+        app
     }
 
     pub fn leader_state(&self) -> Arc<LeaderState> {
@@ -1649,17 +1746,26 @@ impl TorusApp {
     }
 
     /// Crash recovery: replay committed blocks whose execution was interrupted.
-    fn replay_committed(state_db: &StateDb, exec_ctx: &ExecutionContext) -> TorusBlockHeader {
+    ///
+    /// Returns `(last_good_header, parked_hole)`. `parked_hole` is `Some(h)` when a
+    /// committed height in the gap could NOT be reconstructed locally (FIX 1b): the
+    /// caller parks execution at `h` and lets the live heal loop + block-sync
+    /// backfill get a bounded window to re-deliver and heal it, fail-stopping only
+    /// if the budget expires — instead of latching the fail-stop pre-network.
+    fn replay_committed(
+        state_db: &StateDb,
+        exec_ctx: &ExecutionContext,
+    ) -> (TorusBlockHeader, Option<u64>) {
         let genesis = torus_bridge::genesis_parent_header();
 
         let committed = match find_last_committed_height(state_db) {
             Some(h) if h > 0 => h,
-            _ => return genesis,
+            _ => return (genesis, None),
         };
 
         let applied = read_native_applied_height(state_db).unwrap_or(0);
         if applied >= committed {
-            return genesis;
+            return (genesis, None);
         }
 
         tracing::warn!(
@@ -1682,16 +1788,25 @@ impl TorusApp {
         );
 
         match outcome {
-            ReplayGapOutcome::Complete(last_header) => last_header,
+            ReplayGapOutcome::Complete(last_header) => (last_header, None),
             ReplayGapOutcome::Hole { height, last_good } => {
+                // FIX 1b: do NOT latch exec_failed / die pre-network. Park at the
+                // hole and let boot complete; the live strict-order heal loop +
+                // block-sync backfill get a bounded window (the same
+                // `exec_hole_failstop_budget`, started at boot in `new`) to
+                // re-deliver the block and heal it. Fail-stop ONLY if the budget
+                // expires with the hole still open. Preserves the invariants of the
+                // old latch: never execute out of order (applied stays below the
+                // hole), never mark an unexecuted height applied, loud logging.
                 tracing::error!(
                     hole_height = height,
                     committed_height = committed,
                     applied_height = applied,
-                    "crash recovery: FAIL-STOP — execution gap could not be fully replayed; latching exec_failed so the node does not boot into a silently-diverged state"
+                    "crash recovery: execution gap could not be fully replayed LOCALLY — parking \
+                     execution at the hole (FIX 1b) and deferring to the live heal + backfill \
+                     window; the node will fail-stop if the hole is not healed within the budget"
                 );
-                exec_ctx.exec_failed.store(true, Ordering::SeqCst);
-                last_good
+                (last_good, Some(height))
             }
         }
     }
@@ -2734,6 +2849,38 @@ impl TorusApp {
                 Ok(block) => Ok(block),
                 Err(missing) => Err((ExecSource::Compact(compact), missing)),
             },
+            // FIX 1b: a boot-parked hole. Re-load from the durable CFs on each
+            // attempt. The header carries only counts (not the native-action
+            // hashes), so a missing body cannot be DA-hash-fetched here — it heals
+            // when the body becomes durable locally (FIX 1a) or a block-sync
+            // re-delivery of this height arrives as `ExecSource::Ready` and
+            // overrides this placeholder. Return an EMPTY missing-hash set so the
+            // heal loop still accounts the hole + budget without a futile fetch.
+            ExecSource::Durable(height) => match load_replay_header(&self.state_db, height) {
+                Some(header) => {
+                    let is_empty =
+                        header.native_action_count == 0 && header.evm_tx_count == 0;
+                    if is_empty {
+                        Ok(TorusBlock {
+                            header,
+                            native_actions: vec![],
+                            evm_transactions: vec![],
+                            core_writer_actions: vec![],
+                        })
+                    } else {
+                        match load_replay_body(&self.state_db, height) {
+                            Some(body) => Ok(TorusBlock {
+                                header,
+                                native_actions: body.native_actions,
+                                evm_transactions: body.evm_transactions,
+                                core_writer_actions: body.core_writer_actions,
+                            }),
+                            None => Err((ExecSource::Durable(height), vec![])),
+                        }
+                    }
+                }
+                None => Err((ExecSource::Durable(height), vec![])),
+            },
         }
     }
 
@@ -2743,6 +2890,15 @@ impl TorusApp {
     /// fee) plus the T1.5 closed-channel fail-stop.
     fn dispatch_to_exec(&mut self, torus_block: TorusBlock, pending_slashes: Vec<PendingSlash>) {
         let height = torus_block.header.height;
+
+        // FIX 1a (crash-safety): make the committed block's header+body DURABLE
+        // NOW, at commit time, BEFORE it enters the execution pipeline. A crash in
+        // the commit->execute window previously lost the body (written only at
+        // execution), and boot crash-recovery fail-stopped on the committed-but-
+        // bodiless height (devnet t12-final-a/c). The block is fully materialized
+        // here (bodies reconstructed from the durable DA store), so this write is
+        // authoritative; the execution-time writes remain as idempotent repeats.
+        persist_committed_block_durably(&self.state_db, &torus_block);
 
         tracing::info!(
             height,
@@ -3199,8 +3355,12 @@ mod crash_recovery_tests {
             .put_cf_raw(CF_BLOCK_HEADERS, PRUNE_META_KEY, &1u64.to_be_bytes())
             .unwrap();
 
-        let last = TorusApp::replay_committed(&state_db, &exec_ctx);
+        let (last, parked) = TorusApp::replay_committed(&state_db, &exec_ctx);
 
+        assert_eq!(
+            parked, None,
+            "a fully-replayable gap must NOT park a hole"
+        );
         assert_eq!(
             last.height, 5,
             "replay must find the committed tip despite the prune meta key"
@@ -3222,6 +3382,16 @@ mod crash_recovery_tests {
         data.extend_from_slice(&header_json);
         state_db
             .put_cf_raw(CF_BLOCK_HEADERS, &block.header.height.to_be_bytes(), &data)
+            .unwrap();
+    }
+
+    /// Persist ONLY the body for a block (no header write) — simulates a late block-sync
+    /// delivery that lands the missing native bodies into `CF_BLOCK_BODIES` for a height
+    /// whose header is already durable. Mirrors the body half of `persist_block_for_test`.
+    fn persist_block_body_for_test(state_db: &StateDb, block: &TorusBlock) {
+        let body_bytes = serde_json::to_vec(&block.body()).unwrap();
+        state_db
+            .put_cf_raw(CF_BLOCK_BODIES, &block.header.height.to_be_bytes(), &body_bytes)
             .unwrap();
     }
 
@@ -3310,22 +3480,24 @@ mod crash_recovery_tests {
         }
     }
 
-    /// T156-F2 (T3b) RED-first, end-to-end through `replay_committed`: a committed block with a
-    /// pruned/missing body inside the gap must latch the fail-stop (`exec_failed`) and leave the
-    /// applied marker BELOW the hole — never silently marked applied.
+    /// FIX 1b RED-first, end-to-end through `replay_committed`: a committed block with a
+    /// missing body inside the gap must NOT latch a pre-network fail-stop. It PARKS the hole
+    /// (returns `parked = Some(hole)`) after replaying every height below it, so boot completes
+    /// and the live heal loop + block-sync backfill get a bounded window to close the hole.
+    /// The applied marker still stops BELOW the hole — a height is NEVER marked applied without
+    /// being executed.
     ///
-    /// RED on pre-fix code: `replay_committed` handled only the top committed block and its
-    /// "no block body -> marking applied" arm would have marked the pruned height applied WITHOUT
-    /// executing it (silent state loss), and never latched `exec_failed`. GREEN after: heights below
-    /// the hole are replayed (applied advances to 3), the hole latches `exec_failed`, and the applied
-    /// marker never reaches the committed tip.
+    /// RED on pre-fix code: `replay_committed` returned a bare header and LATCHED `exec_failed`
+    /// on a gap hole (pre-network fail-stop / boot into fail-stop). GREEN after FIX 1b: heights
+    /// below the hole are replayed (applied advances to 3), `exec_failed` is NOT latched, and the
+    /// returned tuple carries `parked = Some(4)` with `last_good.height == 3`.
     #[test]
-    fn replay_committed_fail_stops_on_pruned_body_in_gap() {
+    fn replay_committed_parks_hole_on_missing_body_in_gap() {
         let (config, state_db) = make_test_config_and_db();
         let exec_ctx = make_exec_ctx(&config, &state_db);
 
         // Heights 1..=3 are empty (bodies present); height 4 has a NON-EMPTY header but NO body
-        // (pruned); height 5 is a later committed tip.
+        // (lost in the commit->execute kill window); height 5 is a later committed tip.
         for h in 1..=3u64 {
             persist_block_for_test(&state_db, &make_block(h, vec![]));
         }
@@ -3334,11 +3506,16 @@ mod crash_recovery_tests {
 
         write_native_applied_height(&state_db, 2);
 
-        let last = TorusApp::replay_committed(&state_db, &exec_ctx);
+        let (last, parked) = TorusApp::replay_committed(&state_db, &exec_ctx);
 
         assert!(
-            exec_ctx.exec_failed.load(std::sync::atomic::Ordering::SeqCst),
-            "a pruned body inside the replay gap must latch the fail-stop"
+            !exec_ctx.exec_failed.load(std::sync::atomic::Ordering::SeqCst),
+            "FIX 1b: a boot gap hole must PARK, not latch a pre-network fail-stop"
+        );
+        assert_eq!(
+            parked,
+            Some(4),
+            "the parked hole must identify the unreconstructable committed height"
         );
         assert_eq!(
             read_native_applied_height(&state_db),
@@ -3349,6 +3526,165 @@ mod crash_recovery_tests {
             last.height, 3,
             "the returned header must be the last successfully executed block, not the committed tip"
         );
+    }
+
+    /// FIX 1a RED-first (crash-safety, commit->execute kill window). A NON-EMPTY block
+    /// committed and made durable AT COMMIT TIME (`persist_committed_block_durably`), then
+    /// killed BEFORE execution (applied never advanced), must be fully recoverable on boot:
+    /// crash-replay reconstructs it from the durable body and executes it — NO hole, NO
+    /// fail-stop.
+    ///
+    /// RED on pre-fix code: the body was written only at EXECUTION (`execute_committed_block`),
+    /// so a SIGKILL in the commit->execute window left `CF_BLOCK_BODIES[3]` empty; boot
+    /// `replay_gap` found a committed non-empty height with no body and fail-stopped (devnet
+    /// t12-final-a/c: `height=132`/`h224`, `exit(70)`). GREEN after FIX 1a: the commit-time
+    /// write makes the body durable, replay completes, and applied advances to the committed tip.
+    #[test]
+    fn crash_after_commit_before_execute_recovers_via_durable_body() {
+        let (config, state_db) = make_test_config_and_db();
+        let exec_ctx = make_exec_ctx(&config, &state_db);
+
+        // Heights 1..=2 fully applied (empty, bodies present).
+        for h in 1..=2u64 {
+            persist_block_for_test(&state_db, &make_block(h, vec![]));
+        }
+        write_native_applied_height(&state_db, 2);
+
+        // Height 3: a NON-EMPTY committed block. FIX 1a persists header+body at COMMIT time,
+        // BEFORE execution. Simulate a SIGKILL in the commit->execute window: committed and
+        // durable, but execution never ran (applied stays 2, no execution-time body write).
+        let b3 = make_block(3, vec![sign_claim_rewards(3)]);
+        assert_eq!(b3.header.native_action_count, 1, "sanity: non-empty block");
+        persist_committed_block_durably(&state_db, &b3);
+
+        // Boot crash-recovery over the gap {3}: the durable-at-commit body lets replay
+        // reconstruct and execute the block instead of holing.
+        let (last, parked) = TorusApp::replay_committed(&state_db, &exec_ctx);
+
+        assert_eq!(
+            parked, None,
+            "FIX 1a: a body made durable at commit must let replay COMPLETE, never hole"
+        );
+        assert!(
+            !exec_ctx.exec_failed.load(std::sync::atomic::Ordering::SeqCst),
+            "FIX 1a: recovery must not fail-stop when the committed body is durable"
+        );
+        assert_eq!(
+            read_native_applied_height(&state_db),
+            Some(3),
+            "the recovered committed block must execute (applied advances to the committed tip)"
+        );
+        assert_eq!(last.height, 3);
+    }
+
+    /// FIX 1a: `persist_committed_block_durably` writes BOTH the header (with the committed
+    /// block hash in the first 32 bytes, for `detect_conflicting_commit`) and the full body,
+    /// so the two crash-replay loaders (`load_replay_header` / `load_replay_body`) both resolve
+    /// immediately after commit — not only after execution.
+    #[test]
+    fn persist_committed_block_durably_writes_header_and_body() {
+        let (_config, state_db) = make_test_config_and_db();
+        let block = make_block(9, vec![sign_claim_rewards(9), sign_claim_rewards(9)]);
+        assert_eq!(block.header.native_action_count, 2);
+
+        persist_committed_block_durably(&state_db, &block);
+
+        let h = load_replay_header(&state_db, 9).expect("header durable at commit");
+        assert_eq!(h.height, 9);
+        assert_eq!(h.native_action_count, 2);
+        let b = load_replay_body(&state_db, 9)
+            .expect("FIX 1a: body durable at commit, not only at execution");
+        assert_eq!(b.native_actions.len(), 2);
+
+        // The header record must carry the committed block hash (conflict detection).
+        let raw = state_db
+            .get_cf_raw(CF_BLOCK_HEADERS, &9u64.to_be_bytes())
+            .unwrap()
+            .unwrap();
+        let expected = alloy_primitives::keccak256(&block.header.canonical_header_bytes());
+        assert_eq!(&raw[..32], expected.as_slice(), "header record must prefix the block hash");
+    }
+
+    /// FIX 1b RED-first (park + heal via the live strict-order queue). A boot-parked hole,
+    /// seeded into `deferred_exec` as an `ExecSource::Durable`, must NOT execute while the body
+    /// is missing, and must heal IN ORDER the moment the body becomes durable (a late block-sync
+    /// write) — draining the whole contiguous run without ever executing out of order.
+    ///
+    /// RED on pre-fix code: `ExecSource::Durable` did not exist and a boot hole latched
+    /// `exec_failed` (die), so there was no "park then heal on late body" path at all. GREEN
+    /// after FIX 1b: the durable source re-loads on each drain, so an injected body dispatches
+    /// the block and advances the frontier.
+    #[test]
+    fn parked_durable_hole_heals_on_late_body_injection() {
+        let mut app = TorusApp::stub();
+
+        // Two committed heights, 5 (the hole) and 6, seeded exactly as boot parking does.
+        let b5 = make_block(5, vec![sign_claim_rewards(5)]);
+        let b6 = make_block(6, vec![sign_claim_rewards(6)]);
+        // Header durable for both (as at commit); body durable for NEITHER yet (the kill window
+        // lost them and no peer has re-delivered).
+        persist_header_only_for_test(&app.state_db, &b5);
+        persist_header_only_for_test(&app.state_db, &b6);
+
+        app.exec_next_height = Some(5);
+        app.exec_hole_since = Some(std::time::Instant::now());
+        app.deferred_exec.insert(
+            5,
+            DeferredExecBlock { source: ExecSource::Durable(5), slashes: Vec::new() },
+        );
+        app.deferred_exec.insert(
+            6,
+            DeferredExecBlock { source: ExecSource::Durable(6), slashes: Vec::new() },
+        );
+
+        // Drain with both bodies missing: nothing executes, frontier stays at the hole.
+        app.drain_exec_queue();
+        assert_eq!(app.exec_next_height, Some(5), "a missing-body hole must NOT advance");
+        assert!(app.deferred_exec.contains_key(&5), "the hole stays buffered");
+        assert!(!app.is_exec_failed(), "still within budget — no latch");
+
+        // Late body injection for the hole (5) ONLY: block-sync wrote 5's body.
+        persist_block_body_for_test(&app.state_db, &b5);
+        app.drain_exec_queue();
+        assert_eq!(
+            app.exec_next_height,
+            Some(6),
+            "the injected body must heal height 5 in order and advance to 6"
+        );
+        assert!(app.deferred_exec.contains_key(&6), "6 waits — its body is still missing");
+
+        // Inject 6's body too: the run drains fully.
+        persist_block_body_for_test(&app.state_db, &b6);
+        app.drain_exec_queue();
+        assert_eq!(app.exec_next_height, Some(7), "the whole contiguous run heals in order");
+        assert!(app.deferred_exec.is_empty(), "queue fully drained");
+    }
+
+    /// FIX 1b: the heal budget still applies to a parked boot hole. With the budget set to 0
+    /// (fail-stop on the first stalled attempt), a drain that cannot reconstruct the head-of-line
+    /// durable source must latch `exec_failed` — the park is time-bounded, never an infinite hole.
+    #[test]
+    fn parked_durable_hole_fail_stops_on_budget_exhaustion() {
+        std::env::set_var("TORUS_EXEC_HOLE_BUDGET_SECS", "0");
+        let mut app = TorusApp::stub();
+
+        // Header present, body missing, seeded as a parked hole with the clock started.
+        let b5 = make_block(5, vec![sign_claim_rewards(5)]);
+        persist_header_only_for_test(&app.state_db, &b5);
+        app.exec_next_height = Some(5);
+        app.exec_hole_since = Some(std::time::Instant::now());
+        app.deferred_exec.insert(
+            5,
+            DeferredExecBlock { source: ExecSource::Durable(5), slashes: Vec::new() },
+        );
+
+        app.drain_exec_queue();
+
+        assert!(
+            app.is_exec_failed(),
+            "a parked hole that outlives its heal budget must latch the same fail-stop as a live hole"
+        );
+        std::env::remove_var("TORUS_EXEC_HOLE_BUDGET_SECS");
     }
 
     /// T1.5 RED-first: a closed execution channel (= the execution thread

@@ -323,21 +323,68 @@ impl<N: Network> BlockSyncClient<N> {
             return Ok(false);
         }
 
-        let session = self.pending_sync.as_mut().unwrap();
+        // s442 BACKFILL FIX. A block already present BY HASH may still be UNCOMMITTED
+        // at its height (`block_at_height == None`) — e.g. inserted during a
+        // tip-forward sync whose commit walk never reached it. The pre-fix loop
+        // popped such blocks WITHOUT running `update`, so their QC never re-drove
+        // the commit of their ancestors, and a gap-driven backfill for that height
+        // could NEVER make progress ("batch made no progress"; devnet
+        // t12-final-full h183 stayed a hole while the frontier raced to 3436).
+        //
+        // Re-drive each already-present block's `justify` through the commit walk so
+        // an uncommitted ancestor (the hole) commits and fires `on_committed_block`.
+        // `update` only advances monotonic state (highest_pc forward, `pc_to_lock`
+        // returns None once locked, `block_to_commit` returns only not-yet-committed
+        // blocks), so re-running it for a present block is idempotent — a pure no-op
+        // when nothing new can commit, and the missing commit when the hole is below.
+        loop {
+            let front_known = self
+                .pending_sync
+                .as_ref()
+                .and_then(|s| s.pending_blocks.front().cloned())
+                .filter(|b| block_tree.contains(&b.hash));
+            let known = match front_known {
+                Some(b) => b,
+                None => break,
+            };
+            // Consume it — it is already in the tree, so it is never re-inserted
+            // (`insert` is NOT idempotent: it appends to the parent's children list).
+            self.pending_sync.as_mut().unwrap().pending_blocks.pop_front();
 
-        // Skip blocks already in the tree
-        while session
-            .pending_blocks
-            .front()
-            .is_some_and(|b| block_tree.contains(&b.hash))
-        {
-            session.pending_blocks.pop_front();
+            let update_result = block_tree
+                .update(&known.justify, &self.event_publisher)
+                .unwrap_or_else(|e| {
+                    log::warn!(
+                        "block_sync: re-drive update for already-present block failed: {:?}",
+                        e
+                    );
+                    UpdateResult {
+                        validator_set_updates: None,
+                        committed_block_hashes: vec![],
+                    }
+                });
+
+            for committed_hash in &update_result.committed_block_hashes {
+                if let Ok(Some(committed_block)) = block_tree.block(committed_hash) {
+                    app.on_committed_block(&committed_block, *committed_hash);
+                }
+                // Count commit progress so the session is not judged futile and the
+                // next batch start advances past the now-committed hole.
+                if let Some(session) = self.pending_sync.as_mut() {
+                    session.blocks_synced += 1;
+                }
+            }
+            if let Some(vs_updates) = update_result.validator_set_updates {
+                self.validator_set_update_handle
+                    .update_validator_set(vs_updates);
+            }
         }
 
+        let session = self.pending_sync.as_mut().unwrap();
         let block = match session.pending_blocks.pop_front() {
             Some(b) => b,
             None => {
-                // All remaining blocks were already known
+                // All remaining blocks were already known (and re-driven above).
                 self.request_next_batch(block_tree)?;
                 return Ok(true);
             }
@@ -644,13 +691,24 @@ impl<N: Network> BlockSyncClient<N> {
         let highest_committed_block_height = block_tree.highest_committed_block_height()?;
         let (start_height, is_backfill) = self.compute_sync_start(block_tree)?;
 
-        // The peer must be at/above our committed frontier (it may then also
-        // retain the backfill range — unless it has pruned it, which surfaces at
-        // fetch time as an Empty/futile response, not here). Backfill and
-        // tip-sync use the same min-height filter.
+        // s442 BACKFILL PEER FIX: choose the peer-eligibility floor by the KIND of
+        // sync. A backfill targets a hole strictly BELOW our committed frontier, so
+        // the serving peer only needs to RETAIN that height — NOT be at/above our
+        // own frontier. Our frontier keeps racing UP via tip-sync while the hole
+        // stays put (devnet t12-final-full: committed 188->711 while the hole at
+        // 183 never healed), so the old "peer >= our committed frontier" filter
+        // rejected every otherwise-eligible peer and logged "no available sync
+        // servers" with servers present — a permanently blocked backfill. For a
+        // backfill, require only peer_committed >= backfill start height; tip-sync
+        // keeps the original "at/above us" requirement (it needs blocks we lack).
+        let peer_min_height = backfill_peer_min_height(
+            is_backfill,
+            start_height,
+            highest_committed_block_height,
+        );
         let peer = match self
             .block_sync_client_state
-            .random_sync_server(&highest_committed_block_height)
+            .random_sync_server(&peer_min_height)
         {
             Some(p) => p,
             None => {
@@ -1141,6 +1199,31 @@ fn select_start_height(highest_committed: Option<u64>, first_gap: Option<u64>) -
     }
 }
 
+/// s442 BACKFILL PEER FIX (pure, testable). The minimum advertised committed
+/// height a peer must have to be eligible to serve THIS sync request.
+///
+/// * tip-sync (`is_backfill == false`): the peer must be at/above our committed
+///   frontier — we want blocks we do not yet have, so an equal-or-ahead peer is
+///   required (unchanged behaviour).
+/// * backfill (`is_backfill == true`): the peer only needs to RETAIN the hole we
+///   are filling, which sits strictly below our frontier. Requiring it to be
+///   at/above our (continuously racing-ahead) frontier wrongly excludes every
+///   peer once tip-sync has carried us past them — the observed "no available
+///   sync servers" wedge with servers present (devnet t12-final-full h183). So
+///   the floor is the backfill `start_height`: any peer whose committed height
+///   reaches the hole can serve it.
+fn backfill_peer_min_height(
+    is_backfill: bool,
+    start_height: BlockHeight,
+    highest_committed: Option<BlockHeight>,
+) -> Option<BlockHeight> {
+    if is_backfill {
+        Some(start_height)
+    } else {
+        highest_committed
+    }
+}
+
 /// s428 BACKFILL FIX (pure, testable). Whether a scheduled no-server retry is
 /// due. A no-server trigger sets `retry_at = now + NO_SERVER_RETRY_INTERVAL`;
 /// this returns true once that instant passes so the client re-attempts rather
@@ -1222,8 +1305,48 @@ mod backfill_detection_tests {
     //! testable core of the backfill trigger: detect the lowest hole below the
     //! committed frontier, construct the fetch start height for it, and re-attempt
     //! (rather than go silent) when no sync server is available.
-    use super::{no_server_retry_due, scan_first_gap, select_start_height, GapScan};
+    use super::{
+        backfill_peer_min_height, no_server_retry_due, scan_first_gap, select_start_height, GapScan,
+    };
+    use crate::types::data_types::BlockHeight;
     use std::time::{Duration, Instant};
+
+    /// s442 BACKFILL PEER FIX (RED first — `backfill_peer_min_height` did not
+    /// exist; peer selection always used our own committed frontier). A backfill
+    /// targets a hole BELOW our frontier, so the eligible-peer floor must be the
+    /// hole height, NOT our racing-ahead committed height. Requiring the peer to be
+    /// at/above our frontier wedged the backfill ("no available sync servers" with
+    /// servers present; devnet t12-final-full: hole at 183, frontier racing to
+    /// 711+). Tip-sync keeps the original at/above-us requirement.
+    #[test]
+    fn backfill_peer_floor_is_the_hole_not_our_racing_frontier() {
+        let hole = BlockHeight::new(183);
+        let frontier = Some(BlockHeight::new(711));
+
+        // BACKFILL: eligible if the peer merely RETAINS height 183 — our frontier
+        // (711) is irrelevant. Pre-fix this returned Some(711) and rejected every
+        // peer below 711, the observed wedge.
+        assert_eq!(
+            backfill_peer_min_height(true, hole, frontier),
+            Some(hole),
+            "a backfill must accept any peer that retains the hole, not require peer >= our frontier"
+        );
+
+        // TIP-SYNC: unchanged — the peer must be at/above our committed frontier
+        // because we want blocks we do not yet have.
+        let tip_start = BlockHeight::new(712);
+        assert_eq!(
+            backfill_peer_min_height(false, tip_start, frontier),
+            frontier,
+            "tip-sync must still require a peer at/above our committed frontier"
+        );
+
+        // TIP-SYNC with nothing committed yet → no floor (any server is eligible).
+        assert_eq!(
+            backfill_peer_min_height(false, BlockHeight::new(0), None),
+            None
+        );
+    }
 
     /// TRIGGER-ON-HOLE DETECTION: a contiguous committed prefix has no gap; a
     /// hole below the frontier is found at its lowest height; and the scan
