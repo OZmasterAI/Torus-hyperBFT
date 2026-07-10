@@ -75,8 +75,10 @@ fn test_config() -> ChainConfig {
     }
 }
 
-/// A native-action body with a dummy signature. `compute_action_hash` omits the
-/// signature field (mem c5c97fd9), so this hashes/stores identically to a real one.
+/// A native-action body with a fixed dummy signature. Since F-2,
+/// `compute_action_hash` commits to the signature, so a body's content address is
+/// stable only while its signature bytes are fixed (as they are here) — distinct
+/// nonces still yield distinct hashes, which is all this fallback test relies on.
 fn make_action(nonce: u64) -> SignedNativeAction {
     SignedNativeAction {
         action: NativeAction::ClaimRewards,

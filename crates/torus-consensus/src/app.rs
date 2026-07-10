@@ -903,19 +903,21 @@ impl ExecutionContext {
             // (b) SOFTEN: a `None` at exec is either a STATE-DEPENDENT condition (a
             //     missing/revoked/expired/out-of-scope session at the executed height —
             //     deterministic across all nodes) or a STRUCTURALLY-invalid signature.
-            //     Neither is attributable to the proposer at execution time: under
-            //     compact proposals a body travels out-of-band and is content-addressed
-            //     by `compute_action_hash`, which OMITS the signature (F-2), so a
-            //     Byzantine heal-pull peer can substitute a body carrying a swapped/bad
-            //     signature under the same hash. Slashing here 100%-slashed + tombstoned
-            //     an HONEST proposer (t15 suicide chain) and is exploitable via F-2, so
-            //     we DROP-and-log instead. This is consensus-visible but fully
-            //     DETERMINISTIC: every node resolves the same senders against the same
-            //     state at the executed height and drops the same actions, so post-state
-            //     stays identical (all validators must run the same binary — already
-            //     mandated for the relaunch). Proposer accountability for genuinely-
-            //     Byzantine attestation moves to a provenance-bound mechanism once the
-            //     F-2 content-address fix lands.
+            //     Neither is attributable to the proposer at execution time. The
+            //     signature-substitution vector is now CLOSED: `compute_action_hash`
+            //     commits to the signature (F-2 fixed), so a Byzantine heal-pull peer
+            //     can no longer serve a swapped-signature body under the referenced
+            //     hash. The DROP-not-slash decision stands on the OTHER ground: a
+            //     state-dependent session `None` (expiry/scope/revocation resolved at
+            //     the executed height) is unattributable to the proposer — the action
+            //     was validly signed when proposed and only fails against later state —
+            //     so slashing here would 100%-slash + tombstone an HONEST proposer (the
+            //     t15 suicide chain). We DROP-and-log instead. This is consensus-visible
+            //     but fully DETERMINISTIC: every node resolves the same senders against
+            //     the same state at the executed height and drops the same actions, so
+            //     post-state stays identical (all validators must run the same binary —
+            //     already mandated for the relaunch). Proposer accountability for
+            //     genuinely-Byzantine attestation moves to a provenance-bound mechanism.
             let invalid_count = resolved_senders.iter().filter(|s| s.is_none()).count();
             if invalid_count > 0 {
                 tracing::warn!(
@@ -4564,8 +4566,8 @@ mod crash_recovery_tests {
     }
 
     /// One PlaceOrderBatch action carrying `n_orders` orders (dummy signature — the
-    /// proposal-size test below only measures encoded bytes; `compute_action_hash`
-    /// omits the signature). Mirrors the bench's bs=N order shape.
+    /// proposal-size test below only measures encoded bytes, so the signature value
+    /// is irrelevant here). Mirrors the bench's bs=N order shape.
     fn big_order_batch_action(nonce: u64, n_orders: usize) -> SignedNativeAction {
         use torus_types::{ActionSignature, OrderType, PlaceOrderParams, Signature, TimeInForce};
         let order = PlaceOrderParams {
@@ -4982,11 +4984,14 @@ mod crash_recovery_tests {
         );
     }
 
-    /// Fix 2b + F-2 mitigation: a STRUCTURALLY-invalid signature at exec time also
-    /// DROPS the action without slashing the proposer. Provenance is unattributable
-    /// at exec time — a Byzantine heal-pull peer can serve a body with a swapped sig
-    /// under the same signature-less `compute_action_hash` (F-2), so an exec-time sig
-    /// failure cannot be pinned on the proposer. RED at aff21fe: it slashes+tombstones.
+    /// Fix 2b: a STRUCTURALLY-invalid signature at exec time also DROPS the action
+    /// without slashing the proposer. The signature-substitution vector is now closed
+    /// (`compute_action_hash` commits to the signature since F-2, so a heal-pull peer
+    /// can no longer swap a body's signature under the referenced hash), but a bare
+    /// exec-time sig failure still is not proposer-attributable: block-level
+    /// attestation/QC — not per-action exec re-verification — is the accountability
+    /// mechanism, and a deterministic DROP keeps every node's post-state identical.
+    /// RED at aff21fe: it slashes+tombstones.
     #[test]
     fn structurally_invalid_sig_at_exec_drops_action_no_slash() {
         use torus_types::ActionSignature;

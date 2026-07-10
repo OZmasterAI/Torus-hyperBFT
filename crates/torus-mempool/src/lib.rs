@@ -132,9 +132,16 @@ pub struct Mempool {
     metrics: std::sync::OnceLock<std::sync::Arc<torus_telemetry::Metrics>>,
     /// Exec trust-cache: locally-verified action hash -> recovered sender, letting
     /// the execution thread skip a redundant secp256k1 recovery on a HIT. Keyed by
-    /// the signature-committing `torus_types::verified_cache_key` (NOT
-    /// `compute_action_hash`, which omits the signature). MISS => full recover +
-    /// slash. See `docs/plans/double-verify-trust-cache-impl.md`.
+    /// `torus_types::verified_cache_key`, which MUST stay distinct from
+    /// `compute_action_hash`. The load-bearing reason: `verified_cache_key` returns
+    /// `None` for SESSION actions, so session actions are never trust-cached and are
+    /// always fully re-verified. A session's sender resolves through exec-time state
+    /// (existence/expiry/scope/revocation), so a cached hit could diverge from a
+    /// fresh resolve — a consensus FORK. Keying this cache by `compute_action_hash`
+    /// (which since F-2 also commits to the signature, making the two look
+    /// interchangeable) would make session actions cacheable and reintroduce that
+    /// fork. DO NOT unify the two keys. MISS => full recover + slash. See
+    /// `docs/plans/double-verify-trust-cache-impl.md`.
     verified_senders: RwLock<FifoCache<B256, Address>>,
 }
 
@@ -173,10 +180,15 @@ impl Mempool {
 
     /// Record a locally-verified `key -> sender` mapping in the exec trust-cache.
     ///
-    /// `key` MUST be the signature-committing `torus_types::verified_cache_key`
-    /// (NOT `compute_action_hash`, which omits the signature) so that a later HIT
-    /// can only ever return the sender a fresh recover would. Only the verified
-    /// ingress / gossip-recover paths call this; gossip-TRUSTED admits must not.
+    /// `key` MUST be `torus_types::verified_cache_key`, NOT `compute_action_hash`:
+    /// the former returns `None` for session actions so they are never cached and
+    /// always fully re-verified against exec-time session state, whereas the latter
+    /// would admit session actions and let a warm-cache node skip that
+    /// state-dependent resolve — a consensus fork. (`compute_action_hash` commits to
+    /// the signature since F-2, but that is NOT why the keys differ — the session
+    /// exclusion is.) A later HIT can then only ever return the sender a fresh
+    /// recover would. Only the verified ingress / gossip-recover paths call this;
+    /// gossip-TRUSTED admits must not.
     pub fn cache_verified_sender(&self, key: B256, sender: Address) {
         let evicted = match self.verified_senders.write() {
             Ok(mut cache) => cache.insert(key, sender),
