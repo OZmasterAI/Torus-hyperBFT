@@ -181,3 +181,6 @@ mod header_fast_path_regression_test;
 
 #[cfg(test)]
 mod pc_discard_regression_test;
+
+#[cfg(test)]
+mod iter2_lock_safety_test;

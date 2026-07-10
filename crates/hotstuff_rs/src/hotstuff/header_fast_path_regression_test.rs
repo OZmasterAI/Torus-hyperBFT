@@ -31,6 +31,7 @@
 //! With T1.3 applied, all three pass.
 
 use std::collections::HashMap;
+use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use borsh::BorshSerialize;
@@ -41,6 +42,7 @@ use crate::app::{
 use crate::block_tree::accessors::internal::{BlockTreeSingleton, BlockTreeWriteBatch};
 use crate::block_tree::invariants::safe_pc_lock_clause;
 use crate::block_tree::pluggables::{KVGet, KVStore, WriteBatch};
+use crate::events::Event;
 use crate::hotstuff::implementation::{HotStuff, HotStuffConfiguration};
 use crate::hotstuff::messages::{BlockDataResponse, HotStuffMessage, ProposalHeader};
 use crate::hotstuff::roles::is_proposer_with_reputation;
@@ -289,6 +291,30 @@ fn hotstuff_at(
     )
 }
 
+/// Like [`hotstuff_at`], but wires an event publisher so a test can observe the
+/// ORDER in which block-tree updates and phase-votes are emitted.
+fn hotstuff_at_with_events(
+    view: ViewNumber,
+    local: SigningKey,
+    vss: ValidatorSetState,
+) -> (HotStuff<NullNetwork>, Receiver<Event>) {
+    let config = HotStuffConfiguration {
+        chain_id: CHAIN_ID,
+        keypair: Keypair::new(local),
+    };
+    let view_info = ViewInfo::new(view, Instant::now() + Duration::from_secs(3600));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let hotstuff = HotStuff::new(
+        config,
+        view_info,
+        SenderHandle::new(NullNetwork),
+        ValidatorSetUpdateHandle::new(NullNetwork),
+        vss,
+        Some(tx),
+    );
+    (hotstuff, rx)
+}
+
 // ---------------------------------------------------------------------------
 // Tests.
 // ---------------------------------------------------------------------------
@@ -505,5 +531,188 @@ fn safe_pc_lock_clause_semantics() {
     assert!(
         !safe_pc_lock_clause(&pc_conflicting, &block_tree).expect("lock clause must not error"),
         "a stale-view PC that does not extend the locked block must violate the lock clause"
+    );
+}
+
+/// PART 1 (PRIMARY): the header fast-path must advance `locked_pc` from the
+/// header's justify BEFORE emitting its phase-vote — mirroring the full-block
+/// path, which calls `block_tree.update(&justify)` (lock-on-parent via
+/// `pc_to_lock`) *before* voting. The broken fast-path voted WITHOUT locking,
+/// deferring the lock to body arrival and opening a conflicting-vote window.
+///
+/// RED on pre-fix code: `on_receive_proposal_header` never touched `locked_pc`,
+/// so after processing a safe header `locked_pc` stayed at the genesis PC and no
+/// `UpdateLockedPC` event was published.
+#[test]
+fn header_vote_locks_before_vote() {
+    let keys = signing_keys(&[1, 2, 3, 4]);
+    let set = validator_set(&keys);
+    let (mut block_tree, vss) = steady_block_tree(&set);
+
+    // Parent b1 (genesis-justified), inserted directly so the child header's
+    // Generic justify passes the FULL safe_pc path (block-in-tree + non-VS).
+    let b1 = Block::new(
+        BlockHeight::new(0),
+        PhaseCertificate::genesis_pc(),
+        CryptoHash::new([42u8; 32]),
+        Data::new(vec![]),
+    );
+    block_tree.insert(&b1, None, None).expect("insert parent b1");
+
+    // Header for child b2 whose justify is a correct Generic QC on b1 at view 1.
+    let justify = generic_pc(ViewNumber::new(1), b1.hash, &keys[..3], &set);
+    let b2 = Block::new(
+        BlockHeight::new(1),
+        justify.clone(),
+        CryptoHash::new([43u8; 32]),
+        Data::new(vec![]),
+    );
+    let view2 = ViewNumber::new(2);
+    let h2 = header_for(&b2, view2);
+
+    let (mut hotstuff, events) = hotstuff_at_with_events(view2, keys[0].clone(), vss.clone());
+    let mut app = NullApp;
+    let p2 = proposer_for(view2, &keys, &vss, &block_tree);
+    hotstuff
+        .on_receive_msg(
+            HotStuffMessage::ProposalHeader(h2),
+            &p2,
+            &mut block_tree,
+            &mut app,
+        )
+        .expect("processing a safe header must not error");
+
+    // The replica voted...
+    assert_eq!(
+        block_tree.highest_view_voted().expect("highest_view_voted"),
+        Some(view2),
+        "control: the safe header must be phase-voted"
+    );
+    // ...and locked on the header's justify (the parent). PhaseCertificate has
+    // no `Debug`, so compare the identifying fields.
+    let locked = block_tree.locked_pc().expect("locked_pc");
+    assert!(
+        locked.view == justify.view
+            && locked.block == justify.block
+            && locked.phase == justify.phase,
+        "the header fast-path must advance locked_pc to the header's justify at vote time \
+         (got view={}, expected view={})",
+        locked.view.int(),
+        justify.view.int()
+    );
+
+    // Event ORDER proves lock-before-vote: UpdateLockedPC precedes PhaseVote.
+    let mut locked_idx = None;
+    let mut vote_idx = None;
+    for (i, ev) in events.try_iter().enumerate() {
+        match ev {
+            Event::UpdateLockedPC(_) if locked_idx.is_none() => locked_idx = Some(i),
+            Event::PhaseVote(_) if vote_idx.is_none() => vote_idx = Some(i),
+            _ => {}
+        }
+    }
+    let locked_idx = locked_idx.expect("an UpdateLockedPC event must be published on the fast path");
+    let vote_idx = vote_idx.expect("a PhaseVote event must be published on the fast path");
+    assert!(
+        locked_idx < vote_idx,
+        "the lock must be updated BEFORE the vote is emitted (got locked@{locked_idx}, vote@{vote_idx})"
+    );
+}
+
+/// PART 1 regression — the double-vote window. A validator header-votes block C
+/// (justify QC(B)); with the fix it is now LOCKED on B. A conflicting sibling B'
+/// (child of A, justify QC(A)) then arrives in a LATER view. The vote-view gate
+/// is satisfied (later view), so ONLY the lock clause can refuse it — and it
+/// must: QC(A) neither out-views nor extends the locked block B.
+///
+/// RED on pre-fix code: header-voting C did NOT advance `locked_pc` (it stayed
+/// at genesis), so QC(A).view > locked.view and the conflicting sibling B' was
+/// (unsafely) voted in the later view.
+#[test]
+fn header_double_vote_window_refused() {
+    let keys = signing_keys(&[1, 2, 3, 4]);
+    let set = validator_set(&keys);
+    let (mut block_tree, vss) = steady_block_tree(&set);
+
+    // Chain A <- B, both inserted so headers built on their QCs pass safe_pc.
+    let a = Block::new(
+        BlockHeight::new(0),
+        PhaseCertificate::genesis_pc(),
+        CryptoHash::new([10u8; 32]),
+        Data::new(vec![]),
+    );
+    block_tree.insert(&a, None, None).expect("insert A");
+    let qc_a = generic_pc(ViewNumber::new(1), a.hash, &keys[..3], &set);
+    let b = Block::new(
+        BlockHeight::new(1),
+        qc_a.clone(),
+        CryptoHash::new([11u8; 32]),
+        Data::new(vec![]),
+    );
+    block_tree.insert(&b, None, None).expect("insert B");
+    let qc_b = generic_pc(ViewNumber::new(2), b.hash, &keys[..3], &set);
+
+    // C extends B. Header-vote C at view 3: this must lock on B (C's parent).
+    let c = Block::new(
+        BlockHeight::new(2),
+        qc_b.clone(),
+        CryptoHash::new([12u8; 32]),
+        Data::new(vec![]),
+    );
+    let view_c = ViewNumber::new(3);
+    let hc = header_for(&c, view_c);
+    let mut hs1 = hotstuff_at(view_c, keys[0].clone(), vss.clone());
+    let mut app = NullApp;
+    let prop_c = proposer_for(view_c, &keys, &vss, &block_tree);
+    hs1.on_receive_msg(
+        HotStuffMessage::ProposalHeader(hc),
+        &prop_c,
+        &mut block_tree,
+        &mut app,
+    )
+    .expect("processing C header must not error");
+    assert_eq!(
+        block_tree.highest_view_voted().expect("highest_view_voted"),
+        Some(view_c),
+        "precondition: C must be header-voted"
+    );
+    let locked_after_c = block_tree.locked_pc().expect("locked_pc");
+    assert!(
+        locked_after_c.view == qc_b.view
+            && locked_after_c.block == qc_b.block
+            && locked_after_c.phase == qc_b.phase,
+        "precondition: header-voting C must lock on B (its parent); \
+         got locked view={}, expected view={}",
+        locked_after_c.view.int(),
+        qc_b.view.int()
+    );
+
+    // Conflicting sibling B' of B (also a child of A, justify QC(A)) arrives in
+    // a LATER view 4. A fresh participant at view 4 over the SAME block tree
+    // (lock + highest_view_voted persist there) makes the vote-view gate pass,
+    // so ONLY the lock clause can refuse B'.
+    let b_prime = Block::new(
+        BlockHeight::new(1),
+        qc_a.clone(),
+        CryptoHash::new([99u8; 32]),
+        Data::new(vec![]),
+    );
+    let view_bp = ViewNumber::new(4);
+    let hbp = header_for(&b_prime, view_bp);
+    let mut hs2 = hotstuff_at(view_bp, keys[0].clone(), vss.clone());
+    let prop_bp = proposer_for(view_bp, &keys, &vss, &block_tree);
+    hs2.on_receive_msg(
+        HotStuffMessage::ProposalHeader(hbp),
+        &prop_bp,
+        &mut block_tree,
+        &mut app,
+    )
+    .expect("processing B' header must not error");
+
+    assert_eq!(
+        block_tree.highest_view_voted().expect("highest_view_voted"),
+        Some(view_c),
+        "the lock (advanced to B by header-voting C) must REFUSE the conflicting \
+         sibling B' even though B' arrives in a later, unvoted view"
     );
 }

@@ -20,8 +20,9 @@
 
       * 2-chain consecutive-views commit  (block_to_commit, Generic, :518-555):
           commit parent(J.block) iff J.view == J.block.justify.view + 1
-      * grandparent lock                  (pc_to_lock, Generic, :433-437):
-          lock on J.block.justify  (= QC of parent(J.block))
+      * parent lock                       (pc_to_lock, Generic, post-4a94e8b):
+          lock on J itself (= Some(justify.clone())); the model also encodes the
+          FORMER grandparent rule (lock J.block.justify) to prove it unsafe
       * safe_pc predicate 3               (:360):
           J.view > locked.view  ||  extends_locked_pc_block(J)   (grandparent depth, :622-634)
       * vote-once-per-view                (implementation.rs:954-955)
@@ -31,14 +32,16 @@
           safe_block (implementation.rs:1227-1235).
 
     The two lock rules are selectable via `LockRule`:
-      * `Grandparent` — the CURRENT production rule (lock J.block.justify).
-      * `Parent`      — the specified FIX (lock J.block, i.e. Some(justify.clone())).
+      * `Grandparent` — the FORMER production rule (lock J.block.justify), proven
+        unsafe by this model; fixed by 4a94e8b.
+      * `Parent`      — the CURRENT production rule since 4a94e8b (lock J.block,
+        i.e. Some(justify.clone())).
 
-    RED -> GREEN
+    RED -> GREEN (historical: fix 4a94e8b has landed; PRODUCTION == Parent)
       * `agreement_under_production_rule` (the RED-first test) configures the
-        model with `LockRule::PRODUCTION`. It FAILS today (PRODUCTION ==
-        Grandparent violates Agreement) and PASSES once the pc_to_lock fix is
-        applied and `LockRule::PRODUCTION` is repointed to `Parent`.
+        model with `LockRule::PRODUCTION`. It was RED while PRODUCTION ==
+        Grandparent and is GREEN now that the pc_to_lock fix is applied and
+        `LockRule::PRODUCTION` is repointed to `Parent`.
       * `grandparent_lock_violates_agreement` — asserts a counterexample exists
         (documents the bug; regression witness for the old rule).
       * `parent_lock_upholds_agreement` — asserts NO counterexample exists
@@ -119,16 +122,17 @@ struct Qc {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum LockRule {
-    /// CURRENT production rule: pc_to_lock(J) = J.block.justify  (grandparent).
+    /// FORMER production rule (pre-4a94e8b): pc_to_lock(J) = J.block.justify (grandparent).
     Grandparent,
-    /// Specified FIX: pc_to_lock(J) = J  (lock-on-parent; Some(justify.clone())).
+    /// CURRENT production rule (4a94e8b): pc_to_lock(J) = J (lock-on-parent; Some(justify.clone())).
     Parent,
 }
 
 impl LockRule {
-    /// Repoint this to `Parent` once the pc_to_lock fix (see spec §0) lands.
-    /// While it is `Grandparent`, `agreement_under_production_rule` is RED.
-    const PRODUCTION: LockRule = LockRule::Grandparent;
+    /// Manual mirror of the shipped pc_to_lock rule (invariants.rs, Generic arm).
+    /// The T1.2 fix (4a94e8b) landed lock-on-parent: `Phase::Generic => Some(justify.clone())`.
+    /// Keep this in sync with invariants.rs — the model cannot import the real rule.
+    const PRODUCTION: LockRule = LockRule::Parent;
 }
 
 /// n = 4, f = 1. Honest replicas are indices 0,1,2 (= v1,v2,v3). Index 3 (v4)
