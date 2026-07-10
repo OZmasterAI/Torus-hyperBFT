@@ -479,8 +479,27 @@ pub(crate) fn pc_to_lock<K: KVStore>(
         }
     };
 
-    // Prevent redundant locking by returning Some only if the PC to lock is not already the locked PC.
-    if pc_to_lock.as_ref().is_some_and(|pc| pc != &locked_pc) {
+    // Prevent redundant locking by returning Some only if the PC to lock is not already the locked
+    // PC, AND (FIX B, P0 safety) only if it advances the lock FORWARD in view.
+    //
+    // Locking must be MONOTONIC. Every non-`None` candidate above is `justify` itself (Generic,
+    // Precommit, Commit, Decide all lock `justify`; Prepare/Genesis return `None`), so the
+    // candidate's view is always `justify.view`. Without the view guard, a Generic QC with
+    // `view < locked_pc.view` (an out-of-order or conflicting-branch QC) regressed the lock
+    // backwards onto a sibling branch — un-protecting the node against a conflicting commit.
+    //
+    // The rule is STRICTLY GREATER: an equal-view candidate on a *different* block can only be a
+    // Byzantine equivocation (an honest quorum forms at most one QC per view), and replacing the
+    // lock with it would likewise un-protect us; an equal-view candidate on the *same* block is
+    // the redundant case already screened out by `pc != locked_pc`. This preserves every honest
+    // phase progression: Precommit→Commit→Decide on the SAME block hit the redundant-lock `None`
+    // arm above (block unchanged), and consecutive-view Generic/Precommit QCs always out-view the
+    // trailing lock. This guard is the single choke point shared by `update` (step 2) and
+    // `update_locks_only`, so both inherit monotonicity.
+    if pc_to_lock
+        .as_ref()
+        .is_some_and(|pc| pc != &locked_pc && pc.view > locked_pc.view)
+    {
         Ok(pc_to_lock)
     } else {
         Ok(None)

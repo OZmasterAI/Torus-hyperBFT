@@ -428,6 +428,102 @@ impl<K: KVStore> BlockTreeSingleton<K> {
         })
     }
 
+    /// Advance the Locked PC (and, in lockstep, the Highest PC and the
+    /// validator-set-decided flag) from a verified, safe `justify`, WITHOUT
+    /// running the commit walk.
+    ///
+    /// ## Why this exists (P0 consensus safety fix)
+    ///
+    /// This is the header-first fast-path analogue of [`update`](Self::update).
+    /// The full-block path locks-on-parent (via [`pc_to_lock`](invariants::pc_to_lock))
+    /// *before* voting; the header fast-path historically voted WITHOUT locking,
+    /// deferring the lock to body arrival. That gap let an honest replica vote
+    /// for conflicting siblings across views (quorum intersection voided), which
+    /// could durably commit conflicting blocks. This method restores the
+    /// lock-before-vote ordering on the header path.
+    ///
+    /// ## What it does — and deliberately does NOT do
+    ///
+    /// It performs exactly steps 1 (Highest PC), 2 (Locked PC), and 4 (decided
+    /// flag) of [`update`](Self::update), plus the same QC-advancement reputation
+    /// signal. It OMITS step 3 (commit).
+    ///
+    /// Committing is intentionally excluded: on the header fast path the block
+    /// bodies of `justify.block` and its ancestors may still be in flight, and
+    /// [`commit`](Self::commit) applies pending app-state updates and reads block
+    /// heights that only exist once bodies are inserted. Committing here could
+    /// therefore either be a no-op (bodies absent) or, worse, execute against
+    /// state that is not yet present. Commit stays deferred to the body-arrival
+    /// [`update`](Self::update) in `try_insert_body`, which runs the SAME
+    /// `justify` once the block is in the tree. That later `update` is idempotent
+    /// w.r.t. this method: [`pc_to_lock`](invariants::pc_to_lock) returns `None`
+    /// once the PC is already locked, and Highest PC only advances forward — so
+    /// no lock/highest state is rewound or double-applied.
+    ///
+    /// ## Preconditions
+    ///
+    /// `justify` must be cryptographically correct (verified by the caller) and
+    /// its containing header must satisfy the lock clause of
+    /// [`safe_pc`](invariants::safe_pc) (predicate 3) — the header handler checks
+    /// this before calling in.
+    pub(crate) fn update_locks_only(
+        &mut self,
+        justify: &PhaseCertificate,
+        event_publisher: &Option<Sender<Event>>,
+    ) -> Result<(), BlockTreeError> {
+        let mut wb = BlockTreeWriteBatch::new();
+
+        let mut update_locked_pc: Option<PhaseCertificate> = None;
+        let mut update_highest_pc: Option<PhaseCertificate> = None;
+
+        // 1. Update highestPC if needed (in lockstep with the lock so the
+        //    lockedPC.view <= highestPC.view invariant is preserved).
+        if justify.view > self.highest_pc()?.view {
+            wb.set_highest_pc(justify)?;
+            update_highest_pc = Some(justify.clone());
+        }
+
+        // 2. Update lockedPC if needed — this is the safety-critical write.
+        if let Some(new_locked_pc) = invariants::pc_to_lock(justify, self)? {
+            wb.set_locked_pc(&new_locked_pc)?;
+            update_locked_pc = Some(new_locked_pc);
+        }
+
+        // 3. (COMMIT) deliberately skipped — see the doc comment.
+
+        // 4. Set validator set updates as decided if needed.
+        if justify.phase.is_decide() {
+            wb.set_validator_set_update_decided(true)?;
+        }
+
+        self.write(wb);
+
+        // MonadBFT B3: record leader success on QC advancement (mirrors `update`).
+        if update_highest_pc.is_some() && !justify.is_genesis_pc() {
+            if let Ok(vs) = self.committed_validator_set() {
+                let qc_leader = match self.leader_reputation() {
+                    Ok(ref rep) => crate::pacemaker::implementation::select_leader_with_reputation(
+                        justify.view,
+                        &vs,
+                        rep,
+                    ),
+                    Err(_) => crate::pacemaker::implementation::select_leader(justify.view, &vs),
+                };
+                let _ = self.record_leader_success(&qc_leader);
+            }
+        }
+
+        // No committed blocks on this path.
+        Self::publish_update_block_tree_events(
+            event_publisher,
+            update_highest_pc,
+            update_locked_pc,
+            &[],
+        );
+
+        Ok(())
+    }
+
     /// Set the highest `TimeoutCertificate` to be `tc`.
     ///
     /// ## Preconditions

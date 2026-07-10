@@ -206,6 +206,23 @@ pub trait App<K: KVStore>: Send {
     fn on_speculative_rollback(&mut self, _block: CryptoHash, _evidence: &EquivocationEvidence) {
         // Default no-op for backward compatibility.
     }
+
+    /// FIX C2: called when consensus detects a FATAL, non-recoverable safety
+    /// violation — currently, block sync finding that a peer's COMMITTED chain
+    /// conflicts with a block this replica already committed at the same height
+    /// (two honest quorums finalized conflicting blocks). `hotstuff_rs` has no
+    /// process-halt authority of its own; this is the seam through which it hands
+    /// the fatal event to the host so the node can latch its fail-stop and
+    /// terminate (e.g. `torus-consensus` sets `exec_failed`, which the node binary
+    /// watches and turns into `exit(70)`), rather than continuing to vote/finalize
+    /// over a chain that has already forked.
+    ///
+    /// Default implementation is a no-op (for backward compatibility). Only
+    /// genuinely unrecoverable violations reach here; recoverable catch-up
+    /// conditions (e.g. a lock the peer's chain legitimately supersedes) do NOT.
+    fn on_fatal_safety_violation(&mut self) {
+        // Default no-op for backward compatibility.
+    }
 }
 
 /// Request for an `App` to produce a new block extending a specific `parent_block`.

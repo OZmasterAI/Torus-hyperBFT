@@ -1234,8 +1234,21 @@ impl<N: Network> HotStuff<N> {
                 }
                 let pc_block_pending = self.pending_headers.contains_key(&new_pc.block)
                     || self.pending_bodies.contains_key(&new_pc.block);
-                let pc_safe =
-                    pc_block_pending || safe_pc(&new_pc, block_tree, self.config.chain_id)?;
+                // FIX A (P0 safety): when the certified block is still pending
+                // (header/body in flight), `safe_pc`'s block-in-tree predicate
+                // (clause 2) and validator-set-updates predicate (clause 4) cannot
+                // be checked — but the LOCK clause (clause 3) needs neither and
+                // MUST be enforced. Previously a pending block short-circuited
+                // `pc_safe` to `true`, so the unguarded full `update()` below (lock
+                // advance + commit) ran on an out-of-order / conflicting-branch QC,
+                // letting it move the lock (even backwards) and commit. This mirrors
+                // the header fast-path guard in `on_receive_proposal_header`, which
+                // enforces the same `safe_pc_lock_clause` for pending justifies.
+                let pc_safe = if pc_block_pending {
+                    safe_pc_lock_clause(&new_pc, block_tree)?
+                } else {
+                    safe_pc(&new_pc, block_tree, self.config.chain_id)?
+                };
                 if !pc_safe {
                     return Ok(());
                 }
@@ -1737,6 +1750,22 @@ impl<N: Network> HotStuff<N> {
             }
             return Ok(());
         }
+
+        // P0 SAFETY: lock-before-vote. Mirror the full-block path, which calls
+        // `block_tree.update(&justify)` — advancing the lock via `pc_to_lock`
+        // (lock-on-parent) — BEFORE voting (on_receive_proposal steps 3→5). The
+        // header fast-path previously voted WITHOUT locking, deferring the lock
+        // to body arrival; in that window a replica could legally vote for
+        // conflicting siblings across views, voiding quorum intersection and
+        // durably committing conflicting blocks. `justify` is cryptographically
+        // verified above (justify_correct) and satisfies the safe_pc lock clause
+        // (both the pending-bypass and non-bypass branches enforce it), so its
+        // precondition for `update_locks_only` holds. Commit is intentionally
+        // NOT triggered here (the body may still be in flight) — it stays
+        // deferred to the idempotent body-arrival `update` in `try_insert_body`.
+        // This runs unconditionally (like the full path's update), even for a
+        // non-voting replica, so every replica advances its lock from the header.
+        block_tree.update_locks_only(&header.justify, &self.event_publisher)?;
 
         // Vote on the header (same voting logic as on_receive_proposal).
         let validator_set_state = block_tree.validator_set_state()?;
