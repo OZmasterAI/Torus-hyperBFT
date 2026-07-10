@@ -615,6 +615,46 @@ impl RpcState {
     }
 }
 
+/// Decode a `CF_NATIVE_ORDER_BOOKS` value into RPC price levels.
+///
+/// S444 / S395: the column family holds the PRODUCTION `OrderBook` blob
+/// (written by `save_order_books` every block); `OrderBookSnapshot` is a
+/// legacy format written only by old test scaffolding. `torus_getOrderBook`
+/// used to decode ONLY the snapshot format, so it Borsh-errored ("Not all
+/// bytes read") on every real book — first hit by the t15 native state-diff.
+/// Try the production format first, fall back to the legacy snapshot.
+fn decode_order_book_levels(
+    data: &[u8],
+) -> Result<(Vec<RpcPriceLevel>, Vec<RpcPriceLevel>), String> {
+    if let Ok(book) = OrderBook::try_from_slice(data) {
+        let to_levels = |depth: Vec<(FixedPoint, FixedPoint, usize)>| {
+            depth
+                .into_iter()
+                .map(|(price, quantity, n)| RpcPriceLevel {
+                    price: hex_fp(price),
+                    quantity: hex_fp(quantity),
+                    order_count: n as u32,
+                })
+                .collect::<Vec<_>>()
+        };
+        return Ok((to_levels(book.bid_depth()), to_levels(book.ask_depth())));
+    }
+
+    let snapshot = OrderBookSnapshot::try_from_slice(data)
+        .map_err(|e| format!("borsh decode: {e}"))?;
+    let to_levels = |levels: &[torus_core::precompiles::PriceLevel]| {
+        levels
+            .iter()
+            .map(|lvl| RpcPriceLevel {
+                price: hex_fp(lvl.price),
+                quantity: hex_fp(lvl.quantity),
+                order_count: 0,
+            })
+            .collect::<Vec<_>>()
+    };
+    Ok((to_levels(&snapshot.bids), to_levels(&snapshot.asks)))
+}
+
 #[async_trait]
 impl TorusApiServer for RpcState {
     // === 2.9.1: Trading reads ===
@@ -623,39 +663,13 @@ impl TorusApiServer for RpcState {
         let mid = parse_u64(&market_id).map_err(ErrorObjectOwned::from)?;
         let key = mid.to_be_bytes();
 
-        let snapshot = match self.state.get_cf_raw(CF_NATIVE_ORDER_BOOKS, &key) {
-            Ok(Some(data)) => OrderBookSnapshot::try_from_slice(&data)
-                .map_err(|e| RpcError::Internal(format!("borsh decode: {e}")))
+        let (bids, asks) = match self.state.get_cf_raw(CF_NATIVE_ORDER_BOOKS, &key) {
+            Ok(Some(data)) => decode_order_book_levels(&data)
+                .map_err(RpcError::Internal)
                 .map_err(ErrorObjectOwned::from)?,
-            Ok(None) => {
-                return Ok(RpcOrderBook {
-                    market_id,
-                    bids: vec![],
-                    asks: vec![],
-                });
-            }
+            Ok(None) => (vec![], vec![]),
             Err(e) => return Err(RpcError::State(e).into()),
         };
-
-        let bids: Vec<RpcPriceLevel> = snapshot
-            .bids
-            .iter()
-            .map(|lvl| RpcPriceLevel {
-                price: hex_fp(lvl.price),
-                quantity: hex_fp(lvl.quantity),
-                order_count: 0,
-            })
-            .collect();
-
-        let asks: Vec<RpcPriceLevel> = snapshot
-            .asks
-            .iter()
-            .map(|lvl| RpcPriceLevel {
-                price: hex_fp(lvl.price),
-                quantity: hex_fp(lvl.quantity),
-                order_count: 0,
-            })
-            .collect();
 
         Ok(RpcOrderBook {
             market_id,
@@ -1755,5 +1769,89 @@ fn parse_proposal_status(s: &str) -> Result<ProposalStatus, RpcError> {
         _ => Err(RpcError::InvalidParams(format!(
             "unknown proposal status: {s}"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod order_book_decode_tests {
+    //! S444 / S395 RED-first: `torus_getOrderBook` must decode the PRODUCTION
+    //! `OrderBook` blob stored in CF_NATIVE_ORDER_BOOKS. RED at 2a80ff0: the
+    //! handler decoded only the legacy test `OrderBookSnapshot` format, so it
+    //! errored `borsh decode: Not all bytes read` on every real book — which
+    //! blocked the t15 native state-diff the first time it ever ran.
+
+    use torus_core::order_book::OrderBook;
+    use torus_core::precompiles::{OrderBookSnapshot, PriceLevel};
+    use torus_types::{Address, FixedPoint, OrderType, PlaceOrderParams, TimeInForce};
+
+    use super::decode_order_book_levels;
+    use crate::types::hex_fp;
+
+    fn limit(is_buy: bool, price: FixedPoint, quantity: FixedPoint) -> PlaceOrderParams {
+        PlaceOrderParams {
+            market_id: 1,
+            is_buy,
+            price,
+            quantity,
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::GTC,
+            reduce_only: false,
+            client_order_id: None,
+        }
+    }
+
+    #[test]
+    fn decodes_production_order_book_blob() {
+        let tick = FixedPoint::from_raw(1);
+        let lot = FixedPoint::from_raw(1);
+        let mut book = OrderBook::new(1, tick, lot);
+
+        let bid_px = FixedPoint::from_raw(10_000);
+        let ask_px = FixedPoint::from_raw(11_000);
+        let q1 = FixedPoint::from_raw(500);
+        let q2 = FixedPoint::from_raw(700);
+        let q3 = FixedPoint::from_raw(300);
+
+        // Two resting bids on ONE level (aggregated), one resting ask. Prices
+        // do not cross, so nothing matches.
+        book.place_order(limit(true, bid_px, q1), Address::from([1u8; 20]), 1);
+        book.place_order(limit(true, bid_px, q2), Address::from([2u8; 20]), 2);
+        book.place_order(limit(false, ask_px, q3), Address::from([3u8; 20]), 3);
+
+        // Serialize exactly as `save_order_books` (torus-bridge native_executor.rs) does.
+        let blob = borsh::to_vec(&book).expect("serialize prod OrderBook");
+        let (bids, asks) =
+            decode_order_book_levels(&blob).expect("the PRODUCTION blob must decode");
+
+        assert_eq!(bids.len(), 1, "one aggregated bid level");
+        assert_eq!(bids[0].price, hex_fp(bid_px));
+        assert_eq!(
+            bids[0].quantity,
+            hex_fp(FixedPoint::from_raw(1_200)),
+            "level quantity must be the SUM of resting remaining quantities"
+        );
+        assert_eq!(bids[0].order_count, 2, "two resting orders on the level");
+
+        assert_eq!(asks.len(), 1);
+        assert_eq!(asks[0].price, hex_fp(ask_px));
+        assert_eq!(asks[0].quantity, hex_fp(q3));
+        assert_eq!(asks[0].order_count, 1);
+    }
+
+    #[test]
+    fn falls_back_to_legacy_snapshot_blob() {
+        let snap = OrderBookSnapshot {
+            bids: vec![PriceLevel {
+                price: FixedPoint::from_raw(9_000),
+                quantity: FixedPoint::from_raw(42),
+            }],
+            asks: vec![],
+        };
+        let blob = borsh::to_vec(&snap).expect("serialize legacy snapshot");
+        let (bids, asks) =
+            decode_order_book_levels(&blob).expect("the legacy snapshot must still decode");
+        assert_eq!(bids.len(), 1);
+        assert_eq!(bids[0].quantity, hex_fp(FixedPoint::from_raw(42)));
+        assert_eq!(asks.len(), 0);
     }
 }

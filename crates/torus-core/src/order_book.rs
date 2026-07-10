@@ -581,6 +581,36 @@ impl OrderBook {
         self.pending_stops.len()
     }
 
+    /// Aggregated bid depth, best (highest price) first:
+    /// `(price, total remaining quantity, resting order count)` per level.
+    /// Read-only view for RPC (S444: `torus_getOrderBook` reads the PROD
+    /// `OrderBook` blob, not the test-only `OrderBookSnapshot`).
+    pub fn bid_depth(&self) -> Vec<(FixedPoint, FixedPoint, usize)> {
+        self.bids
+            .iter()
+            .rev()
+            .map(|(price, q)| {
+                let total = q
+                    .iter()
+                    .fold(FixedPoint::ZERO, |acc, o| acc + o.remaining_qty);
+                (*price, total, q.len())
+            })
+            .collect()
+    }
+
+    /// Aggregated ask depth, best (lowest price) first — see [`Self::bid_depth`].
+    pub fn ask_depth(&self) -> Vec<(FixedPoint, FixedPoint, usize)> {
+        self.asks
+            .iter()
+            .map(|(price, q)| {
+                let total = q
+                    .iter()
+                    .fold(FixedPoint::ZERO, |acc, o| acc + o.remaining_qty);
+                (*price, total, q.len())
+            })
+            .collect()
+    }
+
     /// Verify internal book invariants. Panics if any invariant is violated.
     /// Used by fuzz tests and determinism tests.
     pub fn verify_invariants(&self) {
