@@ -1,70 +1,50 @@
 # val2 launch instructions (friend2 / big-server) — S448 fresh genesis
 
-You are being re-seated as a genesis validator on a fresh chain. **3 equal
-validators** (seed 4M · 18c 4M · **val2 4M**), chain_id **7778**. You run the
-**validator in archive mode**. (The indexer + block explorer are hosted on our
-18c box — you do **not** need to run those.)
+You run: the **validator (archive mode)** + the **indexer** + the **block explorer**,
+and expose the explorer to the web (you're the archive node / strongest box, so
+everything history-related lives here).
+
+Fresh chain, **3 equal validators** (seed / 18c / you, 4M each), chain_id **7778**.
 
 Your identity (your **existing** val2 keystore — same key as before):
 - pubkey  `0x537f761858a3b44a23a0d63e16d9e642a86c44aac98a94d39501d2115528a63c`
-- peer-id `12D3KooWFSJjbJhn6H92v7FbPGWXoCWLQFhH4koG56mS7Ps7KGPu`
 - listen  `103.167.235.250 :30333/udp` (QUIC)
 
 ---
 
-## ⚠️ Read first — either of these breaks the whole chain
+## ⚠️ Two things that halt the whole chain if wrong — read first
 
-**1. Port 30333/udp MUST be reachable inbound.** This is the big one. The set
-requires **all 3 validators live** — quorum is 8,000,001 and any two 4M nodes
-reach only 8,000,000, so if your node is unreachable the **entire chain halts**.
-Your node was firewalled/DROP before, so please confirm it's open now:
-
+**1. Port `30333/udp` MUST be open inbound.** This set needs all 3 validators live,
+so if your node is unreachable the chain stops. You were firewalled before — confirm:
 ```bash
-# host firewall (ufw example) — allow the QUIC/UDP port
-sudo ufw allow 30333/udp
-sudo ufw status | grep 30333
-
-# iptables example (if not using ufw)
+sudo ufw allow 30333/udp && sudo ufw status | grep 30333
+# or iptables:
 sudo iptables -A INPUT -p udp --dport 30333 -j ACCEPT
 ```
-If your box is behind a router/NAT, also **port-forward UDP 30333 → this host**.
-(We'll confirm the peer link lights up from the seed/18c side when you start.)
+If behind a router/NAT, also port-forward **UDP 30333** to this box.
 
-**2. Use your existing val2 keystore** (the one for pubkey `537f7618…`). The node
-prints its pubkey at startup — sanity-check it matches (see step 4). Don't run
-`keygen`; a new key would not be in genesis.
+**2. Use your existing val2 keystore** (pubkey `537f7618…`). Don't generate a new
+key. The node prints its pubkey at startup — sanity-check it matches.
 
 ---
 
-## 1. Sync code + build (branch `think-dev`)
-
+## 1. Build (branch `think-dev`)
 ```bash
 cd <your torus-hyperbft checkout>
-git fetch origin
-git checkout think-dev
-git pull --ff-only origin think-dev
-cargo build --release -p torus-node          # also pulls in the S447 native-DA fix
+git fetch origin && git checkout think-dev && git pull --ff-only origin think-dev
+cargo build --release -p torus-node -p bench-throughput -p torus-explorer
 ```
 
-## 2. Build the genesis deterministically and VERIFY the hash
-
-The full genesis (100k funded accounts) is regenerated locally — do NOT hand-copy it.
-
+## 2. Regenerate the genesis and VERIFY the hash
 ```bash
-cargo build --release -p bench-throughput    # gen-genesis needs this binary
 ./testnet/gen-weighted-genesis.sh
 sha256sum testnet/genesis-weighted-full.json
+# MUST equal:
+# 858639c5abe079a9b7a202578b5857ba7c0ef23af44c6de608f1bcd8d2eaea15
 ```
-The sha256 **must equal**:
-```
-858639c5abe079a9b7a202578b5857ba7c0ef23af44c6de608f1bcd8d2eaea15
-```
-If it differs, STOP and tell us — do not launch with a mismatched genesis.
+If it doesn't match, stop and tell us.
 
-## 3. Launch the validator (ARCHIVE mode)
-
-Replace the two keystore paths with your actual val2 keystore/passphrase.
-
+## 3. Launch the validator (ARCHIVE mode) — set your keystore paths
 ```bash
 ./target/release/torus-node \
   --genesis testnet/genesis-weighted-full.json \
@@ -78,29 +58,80 @@ Replace the two keystore paths with your actual val2 keystore/passphrase.
   --metrics-addr 127.0.0.1:9090 \
   --log-level info,hotstuff_rs=warn
 ```
-Notes:
-- `--archive` = keep ALL history (no pruning). Do **not** also pass
-  `--retention-blocks` (mutually exclusive). This makes you the full-history node.
-- Peers are seed (`95.111.231.121`) + 18c (`13.140.140.138`). val1 is dropped.
-- RPC on loopback is fine — nothing external needs it on your box.
-- Consider running it under systemd / `nohup` so it survives your SSH session.
+- `--archive` keeps full history — do **not** also pass `--retention-blocks`.
+- RPC/metrics stay on **loopback** — never expose them.
+- Confirm in the log: `pubkey=537f761858…` and height climbing.
 
-## 4. Confirm you actually joined
-
-In the node log at startup, check for:
-```
-pubkey=537f761858a3b44a23a0d63e16d9e642a86c44aac98a94d39501d2115528a63c
-```
-and your peer-id `12D3KooWFSJjbJhn6…`. If the pubkey differs → wrong keystore,
-stop. Then confirm the block height is climbing.
+> Don't hard-start yet — coordinated launch (step 6). Steps 4–5 you can set up now.
 
 ---
 
-## Coordination
-The chain is a coordinated fresh start — it only produces blocks once **seed +
-18c + val2 are all up and peered**. Ping us when:
-1. your node is built,
-2. the genesis sha matches `858639c5…`, and
-3. 30333/udp is confirmed open,
+## 4. Indexer (`torus-explorer`) — bound to loopback
+Backfills genesis→head from your local archive RPC into SQLite, serves `/api` locally.
+```bash
+./target/release/torus-explorer \
+  --rpc-url http://127.0.0.1:8545 \
+  --ws-url  ws://127.0.0.1:8545 \
+  --db-path ./explorer.db \
+  --listen  127.0.0.1:3001
+```
 
-and we'll bring all three up together.
+## 5. Block explorer UI (`torus-HBFT-explorer` — you have collaborator access)
+```bash
+git clone https://github.com/OZmasterAI/torus-HBFT-explorer
+cd torus-HBFT-explorer
+cp .env.example .env.local
+```
+Edit `.env.local`:
+```
+RPC_URL=http://127.0.0.1:8545
+NEXT_PUBLIC_RPC_URL=http://127.0.0.1:8545
+NEXT_PUBLIC_WS_URL=ws://127.0.0.1:8545
+NEXT_PUBLIC_MOCK_DATA=false
+NEXT_PUBLIC_EXPLORER_API_URL=
+```
+Build + run (bind to loopback; the reverse proxy is the only public door):
+```bash
+pnpm install
+pnpm approve-builds --all      # REQUIRED — compiles keccak/sharp/etc; build fails otherwise
+pnpm build
+pnpm start -- -H 127.0.0.1 -p 3000
+```
+
+## 6. Expose ONLY the UI to the web, safely (Caddy = automatic HTTPS)
+Everything above binds to loopback. Caddy is the single public entrypoint on 443,
+reverse-proxying to the UI. The node RPC (8545), metrics (9090) and indexer (3001)
+stay private.
+
+```bash
+# install caddy (https://caddyserver.com/docs/install) then:
+sudo tee /etc/caddy/Caddyfile >/dev/null <<'CADDY'
+# sslip.io gives you instant HTTPS on an IP-derived hostname — no DNS setup.
+# (Or use your own domain pointed at 103.167.235.250.)
+explorer.103-167-235-250.sslip.io {
+    reverse_proxy 127.0.0.1:3000
+}
+CADDY
+sudo systemctl restart caddy
+
+# firewall: open only web + keep the validator port
+sudo ufw allow 80/tcp && sudo ufw allow 443/tcp
+# DO NOT open 8545 / 9090 / 3000 / 3001 to the internet.
+```
+Then browse: **https://explorer.103-167-235-250.sslip.io**
+
+Notes:
+- Page data loads via the UI's server-side `/api` proxy → your local archive node,
+  so full history works. Browser-side live-WS + wallet-connect are disabled by the
+  loopback RPC (fine for viewing); ping us if you want those exposed too (testnet
+  RPC, acceptable) and we'll add a proxied `/ws` + `/rpc`.
+- For durability run the indexer + `pnpm start` + caddy under systemd so they
+  survive reboots/SSH logout.
+
+---
+
+## 7. Coordination
+It's a coordinated fresh start — blocks only flow once **seed + 18c + you** are all
+up and peered. Ping us once: (1) built, (2) genesis sha matches `858639c5…`, and
+(3) 30333/udp confirmed open. We start all three together, then you bring up the
+indexer + UI.
