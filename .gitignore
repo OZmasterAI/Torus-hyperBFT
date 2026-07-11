@@ -17,3 +17,4 @@ build-*.done
 build-*.log
 *.done
 .lsp_pass_timestamp
+testnet/genesis-weighted-full.json
