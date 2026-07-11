@@ -53,4 +53,10 @@ impl PeerMap {
     pub fn peer_ids(&self) -> impl Iterator<Item = &PeerId> {
         self.peer_to_vk.keys()
     }
+
+    /// S447: iterate the mapped VerifyingKeys — the fallback fan target set for
+    /// the native-DA pull when the committed validator set is empty/uninitialized.
+    pub fn vks(&self) -> impl Iterator<Item = &VerifyingKey> {
+        self.peer_to_vk.values()
+    }
 }

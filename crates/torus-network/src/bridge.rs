@@ -203,6 +203,9 @@ impl LibP2PNetwork {
             recently_deposed: RwLock::new(HashMap::new()),
             redial_backoff: Mutex::new(HashMap::new()),
             allow_private_addrs: config.allow_private_addrs,
+            pending_da_fetches: Mutex::new(PendingSendQueue::new(
+                crate::swarm::DA_FETCH_QUEUE_CAP,
+            )),
         });
 
         let (command_tx, command_rx) = mpsc::unbounded_channel();
@@ -394,7 +397,7 @@ impl LibP2PNetwork {
             return;
         }
         let local = self.local_key.to_bytes();
-        let targets: Vec<VerifyingKey> = {
+        let mut targets: Vec<VerifyingKey> = {
             let validators = self.shared.validators.read().unwrap();
             validators
                 .iter()
@@ -402,6 +405,27 @@ impl LibP2PNetwork {
                 .filter_map(|vk_bytes| VerifyingKey::from_bytes(vk_bytes).ok())
                 .collect()
         };
+        // S447 (body starvation): with an EMPTY/uninitialized validator set (an
+        // rpc-only node, or a pull racing `init_validator_set`) the committed-set
+        // fan resolved to ZERO targets and the pull was a SILENT NO-OP — the node
+        // could never source committed-block bodies. Fall back to the mapped
+        // peers (the connected mesh): every peer serves `/torus/native-da` reads
+        // (S443 FIX 3). The committed validator set stays the primary source, so
+        // the healthy validator path is bit-identical.
+        if targets.is_empty() {
+            let peer_map = self.shared.peer_map.read().unwrap();
+            targets = peer_map
+                .vks()
+                .filter(|vk| vk.to_bytes() != local)
+                .cloned()
+                .collect();
+            if !targets.is_empty() {
+                tracing::warn!(
+                    fallback_peers = targets.len(),
+                    "native-da pull: validator set empty — falling back to mapped peers"
+                );
+            }
+        }
         for target in targets {
             for chunk in hashes.chunks(NATIVE_DA_FETCH_CHUNK) {
                 let _ = self.command_tx.send(NetworkCommand::FetchNativeActions {
@@ -546,6 +570,9 @@ mod tests {
             recently_deposed: RwLock::new(HashMap::new()),
             redial_backoff: Mutex::new(HashMap::new()),
             allow_private_addrs: false,
+            pending_da_fetches: Mutex::new(PendingSendQueue::new(
+                crate::swarm::DA_FETCH_QUEUE_CAP,
+            )),
         })
     }
 
@@ -654,6 +681,85 @@ mod tests {
             assert_eq!(
                 got, &hashes,
                 "every hash delivered exactly once per validator, in order"
+            );
+        }
+    }
+
+    /// S447 val1 body starvation (RED first): with an EMPTY validator set (an
+    /// rpc-only node, or a pull racing `init_validator_set`) the committed-set
+    /// fan-out resolved to ZERO targets and the pull was a SILENT NO-OP — the
+    /// node could never source committed-block bodies and starved. The fix
+    /// keeps the committed validator set as the primary selection source
+    /// (healthy path bit-identical: see `fetch_native_actions_chunks_per_validator`)
+    /// and falls back to the MAPPED peers (the connected mesh — every peer
+    /// serves `/torus/native-da` since S443 FIX 3) only when the validator fan
+    /// yields no targets. Today this fails: zero commands are enqueued.
+    #[test]
+    fn fetch_native_actions_falls_back_to_mapped_peers_when_validator_set_empty() {
+        let local = test_signing_key(1);
+        let peer_a = test_signing_key(2).verifying_key();
+        let peer_b = test_signing_key(3).verifying_key();
+
+        let (command_tx, mut command_rx) = mpsc::unbounded_channel();
+        // EMPTY validator set — the starvation precondition.
+        let shared = shared_with_validators(&[]);
+        {
+            let mut pm = shared.peer_map.write().unwrap();
+            pm.insert(peer_a, peer_id_from_verifying_key(&peer_a));
+            pm.insert(peer_b, peer_id_from_verifying_key(&peer_b));
+            // Self is mapped too and must still be skipped.
+            pm.insert(
+                local.verifying_key(),
+                peer_id_from_verifying_key(&local.verifying_key()),
+            );
+        }
+        let net = LibP2PNetwork {
+            command_tx,
+            shared,
+            native_inbound_rx: None,
+            evm_inbound_rx: None,
+            local_key: local.verifying_key(),
+        };
+
+        let hashes: Vec<[u8; 32]> = (0..20u32)
+            .map(|i| {
+                let mut h = [0u8; 32];
+                h[..4].copy_from_slice(&i.to_le_bytes());
+                h
+            })
+            .collect();
+        net.fetch_native_actions_from_validators(hashes.clone());
+
+        let mut per_target: HashMap<[u8; 32], Vec<[u8; 32]>> = HashMap::new();
+        while let Ok(cmd) = command_rx.try_recv() {
+            let NetworkCommand::FetchNativeActions { target, hashes } = cmd else {
+                panic!("fetch must enqueue only FetchNativeActions commands");
+            };
+            assert!(
+                (1..=NATIVE_DA_FETCH_CHUNK).contains(&hashes.len()),
+                "fallback requests stay chunk-bounded, got {}",
+                hashes.len()
+            );
+            per_target
+                .entry(target.to_bytes())
+                .or_default()
+                .extend(hashes);
+        }
+
+        assert!(
+            !per_target.contains_key(&local.verifying_key().to_bytes()),
+            "self is never a fetch target"
+        );
+        assert_eq!(
+            per_target.len(),
+            2,
+            "empty validator set must fall back to the 2 mapped non-self peers \
+             instead of silently no-oping"
+        );
+        for got in per_target.values() {
+            assert_eq!(
+                got, &hashes,
+                "every hash delivered exactly once per fallback peer, in order"
             );
         }
     }

@@ -312,6 +312,18 @@ pub struct SharedState {
     /// lines/s under a reconnect storm). Exponential backoff caps the redial+log
     /// rate per peer; the entry is cleared on a successful `ConnectionEstablished`.
     pub redial_backoff: Mutex<HashMap<PeerId, (Instant, Duration)>>,
+    /// S447 (val1 body starvation): per-validator queue of native-DA fetch chunks
+    /// whose target was not connected at fetch time. The pull fan-out SELECTS the
+    /// committed validator set (bridge.rs `fetch_native_actions_from_validators`),
+    /// but delivery to a disconnected validator was fire-and-forget — dropped on
+    /// dial failure by the `native-da OUTBOUND FAILURE` arm — so the pull's
+    /// EFFECTIVE reach collapsed to currently-connected (gossip-mesh) peers.
+    /// Mirrors `pending_sends`/`pending_native_pushes`: flushed on the target's
+    /// `ConnectionEstablished`, so a mesh-degraded validator's fetch lands the
+    /// moment ANY link to a committed validator comes up. Bounded per key
+    /// ([`DA_FETCH_QUEUE_CAP`], oldest evicted — stale fetches are least useful;
+    /// re-delivered bodies are idempotent in the durable DA store).
+    pub pending_da_fetches: Mutex<PendingSendQueue<Vec<[u8; 32]>>>,
 }
 
 enum SwarmAction {
@@ -454,6 +466,43 @@ fn should_redial_now(shared: &SharedState, peer: &PeerId) -> bool {
             true
         }
     }
+}
+
+/// S447: per-validator cap on buffered native-DA fetch chunks. A full block's
+/// pull is ceil(100/16)=7 chunks, so 32 holds several in-flight pulls; under a
+/// sustained-miss regime against a long-offline peer the OLDEST chunk is
+/// evicted (a stale fetch is the least useful thing to keep — the app-level
+/// retry loops re-fire the fan anyway).
+pub(crate) const DA_FETCH_QUEUE_CAP: usize = 32;
+
+/// S447 (val1 body starvation): route one native-DA fetch chunk. Connected
+/// target → return the hashes for an immediate `send_request` (healthy path
+/// unchanged). Disconnected target → buffer the chunk in `pending_da_fetches`
+/// for the `ConnectionEstablished` flush and return `None` (the caller nudges a
+/// dial). Mirrors `send_direct`'s buffered seam so the pull's effective reach
+/// is the committed validator set, not just the currently-connected mesh.
+fn stage_da_fetch(
+    connected: bool,
+    shared: &SharedState,
+    target: &VerifyingKey,
+    hashes: Vec<[u8; 32]>,
+) -> Option<Vec<[u8; 32]>> {
+    if connected {
+        return Some(hashes);
+    }
+    shared
+        .pending_da_fetches
+        .lock()
+        .unwrap()
+        .enqueue(target, hashes);
+    None
+}
+
+/// S447: drain the native-DA fetch chunks buffered for `vk` while it was
+/// disconnected, in enqueue order. Called from the `ConnectionEstablished` arm
+/// (the same seam that flushes `pending_sends` and `pending_native_pushes`).
+fn flush_pending_da_fetches(shared: &SharedState, vk: &VerifyingKey) -> Vec<Vec<[u8; 32]>> {
+    shared.pending_da_fetches.lock().unwrap().flush(vk)
 }
 
 /// Whether `vk_bytes` was deposed within [`DEPOSED_GRACE`].
@@ -1508,6 +1557,20 @@ fn handle_event(
                             swarm.behaviour_mut().direct.send_request(&peer_id, req);
                         }
                     }
+                    // S447: deliver native-DA fetches that were BUFFERED while this
+                    // validator was disconnected — the pull-side twin of the queued
+                    // pushes above, so a mesh-degraded node's body pull reaches every
+                    // committed validator that (re)connects, not just its live mesh.
+                    let queued_fetches = flush_pending_da_fetches(shared, &vk);
+                    if !queued_fetches.is_empty() {
+                        info!(%peer_id, count = queued_fetches.len(), "flushing buffered native-DA fetches on (re)connect");
+                        for hashes in queued_fetches {
+                            swarm
+                                .behaviour_mut()
+                                .native_da
+                                .send_request(&peer_id, NativeDaNetRequest { hashes });
+                        }
+                    }
                     // T4: re-push recent native-action bundles so a (re)connecting
                     // validator's mempool catches up before the next CompactBlock it
                     // must reconstruct. Validator-gated; dedup is free on the receiver.
@@ -1757,8 +1820,24 @@ fn handle_command(
                 .get_peer_id(&target)
                 .copied();
             if let Some(pid) = peer_id {
-                let req = NativeDaNetRequest { hashes };
-                swarm.behaviour_mut().native_da.send_request(&pid, req);
+                // S447 (val1 body starvation): a fetch to a mapped-but-DISCONNECTED
+                // validator was fired into request-response and dropped on dial
+                // failure (`native-da OUTBOUND FAILURE`), collapsing the pull's
+                // effective reach to the connected (gossip-mesh) peers. Mirror
+                // `send_direct`: buffer the chunk + nudge a (backoff-throttled)
+                // dial; the `ConnectionEstablished` arm flushes it the moment any
+                // link to the validator lands (our dial or its inbound connect).
+                match stage_da_fetch(swarm.is_connected(&pid), shared, &target, hashes) {
+                    Some(hashes) => {
+                        let req = NativeDaNetRequest { hashes };
+                        swarm.behaviour_mut().native_da.send_request(&pid, req);
+                    }
+                    None => {
+                        if should_redial_now(shared, &pid) {
+                            let _ = swarm.dial(pid);
+                        }
+                    }
+                }
             } else {
                 warn!("FetchNativeActions target not in peer map — dropping");
             }
@@ -2397,6 +2476,7 @@ mod tests {
             recently_deposed: RwLock::new(HashMap::new()),
             redial_backoff: Mutex::new(HashMap::new()),
             allow_private_addrs: false,
+            pending_da_fetches: Mutex::new(PendingSendQueue::new(DA_FETCH_QUEUE_CAP)),
         }
     }
 
@@ -2491,6 +2571,81 @@ mod tests {
         let (next_at, interval) = m.get(&peer).copied().unwrap();
         assert!(interval >= REDIAL_BACKOFF_MIN, "backoff interval is recorded");
         assert!(next_at > Instant::now(), "next dial is scheduled in the future");
+    }
+
+    /// S447 val1 body starvation (RED first): a native-DA fetch to a
+    /// mapped-but-DISCONNECTED committed validator was fired straight into
+    /// request-response and silently DROPPED on dial failure (the `native-da
+    /// OUTBOUND FAILURE` arm only counts it) — unlike consensus sends, which
+    /// buffer into `pending_sends` and flush on `ConnectionEstablished`
+    /// (`send_direct`, Task 3). The EFFECTIVE pull reach therefore collapsed to
+    /// currently-connected (gossip-mesh) peers, starving a mesh-degraded
+    /// validator. `stage_da_fetch` must buffer the chunk for a disconnected
+    /// target so the (re)connect seam (`flush_pending_da_fetches`) delivers it
+    /// the moment ANY connection to that validator lands (mesh-maintenance dial
+    /// or inbound). MUST fail before the fix (no stage/flush helpers, no
+    /// `pending_da_fetches` field).
+    #[test]
+    fn da_fetch_to_disconnected_target_buffers_and_flushes_on_connect() {
+        let shared = test_shared();
+        let target = test_vk(9);
+        let hashes: Vec<[u8; 32]> = vec![[7u8; 32], [8u8; 32]];
+
+        // Disconnected: nothing to send NOW — the chunk is buffered.
+        assert_eq!(
+            stage_da_fetch(false, &shared, &target, hashes.clone()),
+            None,
+            "a fetch to a disconnected validator must be buffered, not fired-and-dropped"
+        );
+        // (Re)connect seam: the buffered chunk comes back, in enqueue order.
+        assert_eq!(
+            flush_pending_da_fetches(&shared, &target),
+            vec![hashes.clone()],
+            "the buffered fetch is delivered on ConnectionEstablished"
+        );
+        // The queue is drained by the flush.
+        assert!(
+            flush_pending_da_fetches(&shared, &target).is_empty(),
+            "flush empties the per-validator queue"
+        );
+
+        // Connected: passes straight through (healthy path unchanged), nothing buffered.
+        assert_eq!(
+            stage_da_fetch(true, &shared, &target, hashes.clone()),
+            Some(hashes),
+            "a fetch to a connected validator is sent immediately"
+        );
+        assert!(
+            flush_pending_da_fetches(&shared, &target).is_empty(),
+            "the connected path buffers nothing"
+        );
+    }
+
+    /// S447: the pending-fetch queue is bounded per validator — a sustained-miss
+    /// regime against a long-offline peer evicts the OLDEST chunk (stale fetches
+    /// are the least useful), never grows without limit.
+    #[test]
+    fn da_fetch_pending_queue_is_bounded_per_target() {
+        let shared = test_shared();
+        let target = test_vk(10);
+        for i in 0..(DA_FETCH_QUEUE_CAP + 3) {
+            let mut h = [0u8; 32];
+            h[0] = i as u8;
+            assert_eq!(stage_da_fetch(false, &shared, &target, vec![h]), None);
+        }
+        let flushed = flush_pending_da_fetches(&shared, &target);
+        assert_eq!(
+            flushed.len(),
+            DA_FETCH_QUEUE_CAP,
+            "per-target queue is capped at DA_FETCH_QUEUE_CAP"
+        );
+        // Oldest entries (0,1,2) evicted; the newest survive in order.
+        assert_eq!(flushed[0][0][0], 3, "oldest chunks are evicted first");
+        assert_eq!(
+            flushed.last().unwrap()[0][0],
+            (DA_FETCH_QUEUE_CAP + 2) as u8,
+            "newest chunk is retained"
+        );
     }
 
     #[test]
