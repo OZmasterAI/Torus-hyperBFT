@@ -1,0 +1,36 @@
+# seed relaunch (S448 fresh genesis) — local box 95.111.231.121 (8c/23G, SHARED with SurrealDB/Docker/Claude)
+# Runs as a transient USER systemd service (no sudo on this box; linger is ON so it survives logout).
+# Resource caps: MemoryMax=14G + AllowedCPUs=0-5 (validator confined to 6 of 8 cores, 14G RAM) so it
+#   can't starve the framework (SurrealDB/Claude) on this shared box. Restart=always for resilience.
+#   (SurrealDB was OOM-killed here before under memory contention — this cap prevents a repeat.)
+# Peers = val2 (103.167.235.250) + val4/18c (13.140.140.138). Dropped node 84.32.108.220 is NOT a peer.
+# Genesis sha256 must be 858639c5abe079a9b7a202578b5857ba7c0ef23af44c6de608f1bcd8d2eaea15
+# DO NOT START until val2 (friend2) is built + 30333/udp open, and we launch all three together.
+
+systemd-run --user --unit=torus-seed-validator \
+  --working-directory=/home/crab/projects/Torus-hyperBFT \
+  -p MemoryMax=14G \
+  -p AllowedCPUs=0-5 \
+  -p Restart=always \
+  -p RestartSec=10 \
+  -p StandardOutput=append:/home/crab/torus-seed-live/seed-relaunch-s448.log \
+  -p StandardError=append:/home/crab/torus-seed-live/seed-relaunch-s448.log \
+  /home/crab/torus-seed-live/torus-node \
+    --genesis /home/crab/torus-seed-live/genesis.json \
+    --data-dir /home/crab/projects/Torus-hyperBFT/testnet/data \
+    --keystore /home/crab/projects/Torus-hyperBFT/seed.keystore \
+    --passphrase-file /home/crab/projects/Torus-hyperBFT/seed.passphrase \
+    --retention-blocks 100000 \
+    --p2p-listen /ip4/0.0.0.0/udp/30333/quic-v1 \
+    --p2p-peers /ip4/103.167.235.250/udp/30333/quic-v1/p2p/12D3KooWFSJjbJhn6H92v7FbPGWXoCWLQFhH4koG56mS7Ps7KGPu,/ip4/13.140.140.138/udp/30333/quic-v1/p2p/12D3KooW9tETg7AgyXYvPzaQTFWi98g8msMMwx9GkezrDFPMQw7H \
+    --rpc-addr 127.0.0.1:8545 \
+    --metrics-addr 127.0.0.1:9090 \
+    --log-level info,hotstuff_rs=warn,torus_node=error,torus_genesis=warn
+
+# --- manage ---
+# status:  systemctl --user status torus-seed-validator
+# logs:    journalctl --user -u torus-seed-validator -f   (also mirrored to seed-relaunch-s448.log)
+# stop:    systemctl --user stop torus-seed-validator
+# NOTE: MemoryMax=14G is a HARD cap — if the validator exceeds it the cgroup OOM-kills it and
+#   Restart=always brings it back. On this tight box that's the intended guard; watch the log if
+#   it restart-loops under heavy load (then raise the cap or shed load).
