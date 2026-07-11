@@ -36,10 +36,11 @@ cd "$(dirname "$0")/.." || { echo "cannot cd to repo root"; exit 1; }
 BIN="${BIN:-./target/release/bench-throughput}"
 RPC="${RPC:-http://localhost:8545}"
 METRICS="${METRICS:-http://127.0.0.1:9090}"
-SENDER_OFFSET="${SENDER_OFFSET:-20}"   # first sender index; funded genesis window is 0..59
+SENDER_OFFSET="${SENDER_OFFSET:-20}"   # first sender index; funded genesis window is 0..FUNDED_CEIL-1
+FUNDED_CEIL="${FUNDED_CEIL:-100060}"   # genesis funds native accts 0..FUNDED_CEIL-1 (S446: 60 bench + 100k bulk = 100060; set 60 for the old 60-acct genesis)
 MARKETS_LIST="${MARKETS_LIST:-1 2 3 5 10}"
 BATCH_LIST="${BATCH_LIST:-100 200 400 500 600 1000}"
-SENDERS_LIST="${SENDERS_LIST:-2 10 20 40}"   # max 40 under default offset 20 (funded window ends at idx 59)
+SENDERS_LIST="${SENDERS_LIST:-2 10 20 40}"   # distinct senders/cell, up to FUNDED_CEIL-SENDER_OFFSET. Big fan-out: SENDER_OFFSET=0 SENDERS_LIST="100 200 500 1000 2000 5000 10000 25000 50000 100000"
 SIGN_LIST="${SIGN_LIST:-session eip712}"
 DUR="${DUR:-20}"                # timed window per cell (s)
 RATE="${RATE:-30}"              # actions/s PER sender (paced sustained ceiling); 0=burst under-measures — avoid
@@ -108,15 +109,15 @@ window_rate() {  # FILE DUR -> "node_actions_s blk_s" over the peak ~DUR-second 
   ' "$1"
 }
 
-# ---------- funded-range guard (genesis funds native bench senders idx 0..59) ----------
+# ---------- funded-range guard (genesis funds native bench senders idx 0..FUNDED_CEIL-1) ----------
 max_senders=0
 for s in $SENDERS_LIST; do [ "$s" -gt "$max_senders" ] && max_senders=$s; done
 last_idx=$(( SENDER_OFFSET + max_senders - 1 ))
-if [ "$(( SENDER_OFFSET + max_senders ))" -gt 60 ]; then
+if [ "$(( SENDER_OFFSET + max_senders ))" -gt "$FUNDED_CEIL" ]; then
   echo "!! ABORT: sender range exceeds the funded genesis window."
-  echo "   SENDER_OFFSET=$SENDER_OFFSET + max(SENDERS_LIST)=$max_senders  ->  last index $last_idx > 59"
-  echo "   genesis funds native bench senders indices 0..59 (index 0 = market-maker)."
-  echo "   lower SENDERS_LIST, or set SENDER_OFFSET=0 to use the full 0..59 window (e.g. 60 senders)."
+  echo "   SENDER_OFFSET=$SENDER_OFFSET + max(SENDERS_LIST)=$max_senders  ->  last index $last_idx > $((FUNDED_CEIL-1))"
+  echo "   genesis funds native bench senders indices 0..$((FUNDED_CEIL-1)) (index 0 = market-maker)."
+  echo "   lower SENDERS_LIST/SENDER_OFFSET, or raise FUNDED_CEIL to match your genesis's funded account count."
   exit 1
 fi
 
