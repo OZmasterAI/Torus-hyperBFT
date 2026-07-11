@@ -1,0 +1,18 @@
+# seed relaunch (S448 fresh genesis) — bare setsid process on the local box (95.111.231.121)
+# Binary + genesis staged in /home/crab/torus-seed-live; keystore/passphrase in the project dir.
+# Peers = val2 (103.167.235.250) + val4/18c (13.140.140.138). Dropped node 84.32.108.220 is NOT a peer.
+# Genesis sha256 must be 858639c5abe079a9b7a202578b5857ba7c0ef23af44c6de608f1bcd8d2eaea15
+# DO NOT START until val2 (friend2) is built + 30333/udp open, and we launch all three together.
+
+cd /home/crab/projects/Torus-hyperBFT && setsid /home/crab/torus-seed-live/torus-node \
+  --genesis /home/crab/torus-seed-live/genesis.json \
+  --data-dir /home/crab/projects/Torus-hyperBFT/testnet/data \
+  --keystore /home/crab/projects/Torus-hyperBFT/seed.keystore \
+  --passphrase-file /home/crab/projects/Torus-hyperBFT/seed.passphrase \
+  --retention-blocks 100000 \
+  --p2p-listen /ip4/0.0.0.0/udp/30333/quic-v1 \
+  --p2p-peers /ip4/103.167.235.250/udp/30333/quic-v1/p2p/12D3KooWFSJjbJhn6H92v7FbPGWXoCWLQFhH4koG56mS7Ps7KGPu,/ip4/13.140.140.138/udp/30333/quic-v1/p2p/12D3KooW9tETg7AgyXYvPzaQTFWi98g8msMMwx9GkezrDFPMQw7H \
+  --rpc-addr 127.0.0.1:8545 \
+  --metrics-addr 127.0.0.1:9090 \
+  --log-level info,hotstuff_rs=warn,torus_node=error,torus_genesis=warn \
+  > /home/crab/torus-seed-live/seed-relaunch-s448.log 2>&1
