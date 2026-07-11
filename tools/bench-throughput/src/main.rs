@@ -156,6 +156,11 @@ enum Command {
         /// How many sender addresses to derive.
         #[arg(long, default_value_t = 40)]
         count: usize,
+        /// Also print each account's hex private key (as "idx addr privkey").
+        /// For loading funded senders into external tools (e.g. tx-loop.sh).
+        /// These are deterministic bench keys — NEVER use on a real network.
+        #[arg(long, default_value_t = false)]
+        secret_keys: bool,
     },
 }
 
@@ -1728,7 +1733,7 @@ fn run_state_root_scaling(sizes_str: &str, changed: usize, blocks: usize) {
 /// bench uses, so genesis funding provably matches the senders. Mirrors the chain's
 /// `pubkey_to_address`: keccak256 of the 64-byte uncompressed pubkey, last 20 bytes.
 /// Emits `<idx> 0x<address>` per line for downstream genesis tooling.
-fn run_gen_accounts(offset: usize, count: usize) {
+fn run_gen_accounts(offset: usize, count: usize, secret_keys: bool) {
     let keys = load_sender_keys(count, offset);
     for (i, sk) in keys.iter().enumerate() {
         let idx = offset + i;
@@ -1736,7 +1741,13 @@ fn run_gen_accounts(offset: usize, count: usize) {
         let uncompressed = vk.to_encoded_point(false);
         let hash = alloy_primitives::keccak256(&uncompressed.as_bytes()[1..]);
         let addr = Address::from_slice(&hash[12..]);
-        println!("{idx} {addr:#x}");
+        if secret_keys {
+            // 32-byte scalar as 0x-prefixed hex — the same form cast/tx-loop expect.
+            let sk_hex = hex::encode(sk.signing_key.to_bytes());
+            println!("{idx} {addr:#x} 0x{sk_hex}");
+        } else {
+            println!("{idx} {addr:#x}");
+        }
     }
 }
 
@@ -1803,7 +1814,11 @@ async fn main() {
             changed,
             blocks,
         } => run_state_root_scaling(&sizes, changed, blocks),
-        Command::GenAccounts { offset, count } => run_gen_accounts(offset, count),
+        Command::GenAccounts {
+            offset,
+            count,
+            secret_keys,
+        } => run_gen_accounts(offset, count, secret_keys),
     }
 }
 
