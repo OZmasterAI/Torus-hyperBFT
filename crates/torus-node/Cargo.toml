@@ -49,6 +49,10 @@ sha2 = { workspace = true }
 
 # Consensus
 hotstuff_rs = { workspace = true }
+# PhaseCertificate (recovery-PC file) serialization for the torus-unwedge bin.
+# Pinned to hotstuff_rs's borsh major (0.10, try_to_vec API) — the workspace
+# borsh is v1 and its traits don't match hotstuff_rs types.
+borsh = "0.10"
 
 [dev-dependencies]
 tempfile = { workspace = true }

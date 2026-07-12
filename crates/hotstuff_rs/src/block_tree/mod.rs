@@ -60,6 +60,8 @@ pub mod accessors;
 
 pub mod invariants;
 
+pub mod recovery;
+
 pub mod variables;
 
 pub mod pluggables;

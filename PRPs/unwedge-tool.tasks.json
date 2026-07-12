@@ -1,0 +1,54 @@
+{
+  "prp": "unwedge-tool",
+  "created": "2026-07-12T16:30:00+02:00",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "recovery::inspect + WedgeReport",
+      "status": "pending",
+      "files": ["crates/hotstuff_rs/src/block_tree/recovery.rs", "crates/hotstuff_rs/src/block_tree/mod.rs"],
+      "validate": "cargo test -p hotstuff_rs recovery::tests::inspect_classifies_wedged_tree",
+      "depends_on": []
+    },
+    {
+      "id": 2,
+      "name": "recovery::prune_uncommitted",
+      "status": "pending",
+      "files": ["crates/hotstuff_rs/src/block_tree/recovery.rs"],
+      "validate": "cargo test -p hotstuff_rs recovery::tests::prune_removes_only_uncommitted",
+      "depends_on": [1]
+    },
+    {
+      "id": 3,
+      "name": "singleton resets + PC validation",
+      "status": "pending",
+      "files": ["crates/hotstuff_rs/src/block_tree/recovery.rs"],
+      "validate": "cargo test -p hotstuff_rs recovery::tests::singletons_reset_and_safety_vars_kept",
+      "depends_on": [2]
+    },
+    {
+      "id": 4,
+      "name": "post-apply verification + idempotency",
+      "status": "pending",
+      "files": ["crates/hotstuff_rs/src/block_tree/recovery.rs"],
+      "validate": "cargo test -p hotstuff_rs recovery::tests::apply_is_idempotent",
+      "depends_on": [3]
+    },
+    {
+      "id": 5,
+      "name": "torus-unwedge binary",
+      "status": "pending",
+      "files": ["crates/torus-node/src/bin/unwedge.rs", "crates/torus-node/Cargo.toml", "devnet/unwedge-smoke.sh"],
+      "validate": "bash devnet/unwedge-smoke.sh",
+      "depends_on": [4]
+    },
+    {
+      "id": 6,
+      "name": "full-suite regression + clippy",
+      "status": "pending",
+      "files": [],
+      "validate": "cargo test -p hotstuff_rs -p torus-consensus -p torus-node && cargo clippy -p hotstuff_rs -p torus-node -- -D warnings",
+      "depends_on": [5]
+    }
+  ]
+}

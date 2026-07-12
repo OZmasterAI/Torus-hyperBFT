@@ -92,6 +92,20 @@ impl StateDb {
         Self { db: Arc::new(db) }
     }
 
+    /// Open the database read-only (all column families). Works against a LIVE
+    /// primary too (no LOCK contention), but then sees data only as of the last
+    /// flush — recent memtable-only writes are invisible. Used by offline
+    /// tooling (`torus-unwedge --inspect`) for recon without stopping the node.
+    pub fn open_read_only(path: &Path) -> Result<Self, StateError> {
+        let opts = Options::default();
+        let cf_descriptors: Vec<ColumnFamilyDescriptor> = ALL_CF_NAMES
+            .iter()
+            .map(|name| ColumnFamilyDescriptor::new(*name, Options::default()))
+            .collect();
+        let db = DB::open_cf_descriptors_read_only(&opts, path, cf_descriptors, false)?;
+        Ok(Self { db: Arc::new(db) })
+    }
+
     /// Destroy the database at the given path (for testing).
     pub fn destroy(path: &Path) -> Result<(), StateError> {
         DB::destroy(&Options::default(), path)?;

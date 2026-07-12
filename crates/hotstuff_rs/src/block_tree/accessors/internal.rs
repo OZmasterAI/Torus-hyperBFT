@@ -1543,6 +1543,42 @@ impl<W: WriteBatch> BlockTreeWriteBatch<W> {
         );
         Ok(())
     }
+
+    /* ↓↓↓ Unwedge surgery helpers (S459) ↓↓↓ */
+
+    /// Delete the [`LOCAL_TIP`](variables::LOCAL_TIP) singleton. `None` is its
+    /// legal resting state (readers degrade gracefully). Additive helper used
+    /// by the [`recovery`](crate::block_tree::recovery) unwedge tool.
+    pub fn delete_local_tip(&mut self) {
+        self.0.delete(&variables::LOCAL_TIP);
+    }
+
+    /// Delete the [`HIGHEST_TC`](variables::HIGHEST_TC) singleton. Additive
+    /// helper used by the [`recovery`](crate::block_tree::recovery) unwedge
+    /// tool.
+    pub fn delete_highest_tc(&mut self) {
+        self.0.delete(&variables::HIGHEST_TC);
+    }
+
+    /// Overwrite the [`SPECULATIVE_COMMITS`](variables::SPECULATIVE_COMMITS)
+    /// list with `commits` (pass an empty slice to clear it). Additive helper
+    /// used by the [`recovery`](crate::block_tree::recovery) unwedge tool.
+    pub fn set_speculative_commits(
+        &mut self,
+        commits: &[CryptoHash],
+    ) -> Result<(), BlockTreeError> {
+        let _: () = self.0.set(
+            &variables::SPECULATIVE_COMMITS,
+            &commits
+                .to_vec()
+                .try_to_vec()
+                .map_err(|err| KVSetError::SerializeValueError {
+                    key: Key::HighestTC,
+                    source: err,
+                })?,
+        );
+        Ok(())
+    }
 }
 
 /// Error when writing a key-value pair to the [write batch][BlockTreeWriteBatch].
