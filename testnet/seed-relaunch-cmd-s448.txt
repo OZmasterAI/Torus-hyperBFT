@@ -4,7 +4,7 @@
 #   can't starve the framework (SurrealDB/Claude) on this shared box. Restart=always for resilience.
 #   (SurrealDB was OOM-killed here before under memory contention — this cap prevents a repeat.)
 # Peers = val2 (103.167.235.250) + val4/18c (13.140.140.138). Dropped node 84.32.108.220 is NOT a peer.
-# Genesis sha256 must be 858639c5abe079a9b7a202578b5857ba7c0ef23af44c6de608f1bcd8d2eaea15
+# Genesis sha256 must be 5042dbdb1429ae80bbcdbe87fdf8ef5bd0501be52740d184cf3ec119cab43951  (S459 new-genesis, era 2026-07-14; was 858639c5 pre-relaunch)
 # DO NOT START until val2 (friend2) is built + 30333/udp open, and we launch all three together.
 
 systemd-run --user --unit=torus-seed-validator \
