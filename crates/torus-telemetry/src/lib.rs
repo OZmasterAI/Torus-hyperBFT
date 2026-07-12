@@ -125,6 +125,11 @@ pub struct Metrics {
     pub pending_sends_flushed: Counter,
     pub native_bundle_repushed: Counter,
     pub missing_action_rejections: Counter,
+    /// S459: proposer `produce_block` calls that dropped native actions because the
+    /// durable DA-store mirror failed — proposed empty-native (which cannot wedge a
+    /// validator) rather than referencing a body no validator could reconstruct.
+    /// Monotonic; 0 on a healthy store.
+    pub proposer_body_mirror_failures: Counter,
     /// Native-DA pull-fallback fetches issued (Phase C Task 6). Must stay LOW under
     /// load — push covers the common case; a high rate signals push is failing.
     pub native_da_pull_requests: Counter,
@@ -522,6 +527,13 @@ impl Metrics {
             missing_action_rejections.clone(),
         );
 
+        let proposer_body_mirror_failures = Counter::default();
+        registry.register(
+            "torus_proposer_body_mirror_failures",
+            "produce_block proposals that dropped native actions on a durable DA mirror failure (S459)",
+            proposer_body_mirror_failures.clone(),
+        );
+
         let native_da_pull_requests = Counter::default();
         registry.register(
             "torus_native_da_pull_requests",
@@ -805,6 +817,7 @@ impl Metrics {
             pending_sends_flushed,
             native_bundle_repushed,
             missing_action_rejections,
+            proposer_body_mirror_failures,
             native_da_pull_requests,
             native_da_pull_recovered,
             native_da_served,

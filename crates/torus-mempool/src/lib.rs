@@ -16,7 +16,7 @@ mod verified_cache;
 use std::sync::RwLock;
 
 use alloy_primitives::{Address, B256};
-use torus_state::{NativeDaStore, StateDb};
+use torus_state::{NativeDaStore, StateDb, StateError};
 use torus_types::SignedNativeAction;
 
 use crate::verified_cache::FifoCache;
@@ -609,7 +609,10 @@ impl Mempool {
     /// Re-insert previously drained native actions (e.g., after reorg).
     pub fn reinsert_native(&self, actions: Vec<SignedNativeAction>) {
         // Keep the DA-store invariant: every pooled body stays reconstructable.
-        self.mirror_native_to_da(&actions);
+        // A failed durable write is already re-queued inside mirror_native_to_da;
+        // reinsert is best-effort here (the pool entry stays selectable and a later
+        // flush retries), so the Result is intentionally not propagated.
+        let _ = self.mirror_native_to_da(&actions);
         let mut pool = self.native.write().unwrap();
         pool.reinsert(actions);
     }
@@ -651,10 +654,18 @@ impl Mempool {
     /// every body referenced by a block we propose stays reconstructable).
     /// One atomic WriteBatch + one arrival-notifier wake for the whole block —
     /// this runs on the leader's produce_block critical path (S395).
-    pub fn mirror_native_to_da(&self, actions: &[SignedNativeAction]) {
+    pub fn mirror_native_to_da(&self, actions: &[SignedNativeAction]) -> Result<(), StateError> {
         if let Err(e) = self.da_store.put_batch(actions) {
             tracing::error!("native DA store batch write failed: {e}");
+            // S459: parity with `flush_da_mirrors`/`mirror_to_da` — a proposer/validator
+            // durability write must never be silently dropped. Re-queue for a later
+            // retry AND surface the error so callers fail-closed (a voter returns
+            // MissingData, a leader proposes empty-native) instead of voting for or
+            // proposing a body no node durably holds.
+            self.requeue_failed_da_batch(actions.to_vec());
+            return Err(e);
         }
+        Ok(())
     }
 
     /// Best-effort durable mirror of one native-action body, COALESCED (T2.2):
@@ -1052,7 +1063,8 @@ mod tests {
         let hash = torus_types::compute_action_hash(&signed);
 
         // The body is DA-mirrored (proposer push / gossip), as for any block body.
-        pool.mirror_native_to_da(std::slice::from_ref(&signed));
+        pool.mirror_native_to_da(std::slice::from_ref(&signed))
+            .expect("healthy temp-db mirror");
         assert!(pool.get_native_da(&hash).is_some(), "precondition: body in durable DA store");
 
         // The block commits: the in-memory selection pool is pruned...
@@ -1268,6 +1280,45 @@ mod tests {
         assert!(
             raw_store.get(&hash).unwrap().is_some(),
             "re-queued body must be retried and persisted, never silently dropped"
+        );
+    }
+
+    /// Task 1 (S459): `mirror_native_to_da` is fallible. On a healthy store it
+    /// returns `Ok(())`, the body lands durably in the DA store, and the failure
+    /// counter is UNTOUCHED (parity with the other two mirror paths, which re-queue
+    /// + bump only on a real `put_batch` Err). RED before Task 1: the method
+    /// returned `()` — the `Result<(), StateError>` binding did not compile.
+    #[test]
+    fn mirror_native_to_da_ok_persists_and_leaves_failure_counter() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state.clone(), MempoolConfig::default());
+        let raw_store = NativeDaStore::new(state);
+        let key = k256::ecdsa::SigningKey::from_slice(
+            &alloy_primitives::hex::decode(
+                "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let action = torus_types::eip712::sign_native_action(
+            torus_types::NativeAction::ClaimRewards,
+            now_ms(),
+            &key,
+        );
+        let hash = torus_types::compute_action_hash(&action);
+
+        assert_eq!(pool.da_flush_failures(), 0);
+        let res: Result<(), StateError> =
+            pool.mirror_native_to_da(std::slice::from_ref(&action));
+        assert!(res.is_ok(), "healthy temp-db mirror returns Ok(())");
+        assert!(
+            raw_store.get(&hash).unwrap().is_some(),
+            "body must be durable in the DA store immediately after the mirror"
+        );
+        assert_eq!(
+            pool.da_flush_failures(),
+            0,
+            "a successful mirror must not bump the failure counter"
         );
     }
 

@@ -2219,7 +2219,11 @@ impl TorusApp {
             .filter_map(|b| bincode::deserialize::<torus_types::SignedNativeAction>(b).ok())
             .collect();
         if !actions.is_empty() {
-            mempool.mirror_native_to_da(&actions);
+            // Best-effort: a failed durable write is re-queued inside
+            // mirror_native_to_da, and the subsequent `get_native_da` recheck on the
+            // reconstruct path already fails-closed on a miss, so the Result is not
+            // propagated here.
+            let _ = mempool.mirror_native_to_da(&actions);
         }
     }
 
@@ -2352,6 +2356,140 @@ impl Drop for TorusApp {
     }
 }
 
+impl TorusApp {
+    /// S459 proposer guarantee. Durably mirror every selected native body to THIS
+    /// node's DA store before it can be referenced by our proposal. On success the
+    /// selection is returned unchanged; on a durable-write failure the batch is
+    /// re-queued (inside `mirror_native_to_da`) and this returns an EMPTY selection
+    /// so `produce_block` proposes empty-native this view — a block that cannot wedge
+    /// a validator — instead of referencing a body no node durably holds. A metric
+    /// counts the drop. No mempool wired (test/edge) ⇒ pass-through unchanged.
+    fn mirror_or_drop_native(
+        &self,
+        native_with_senders: Vec<(torus_types::Address, torus_types::SignedNativeAction)>,
+    ) -> Vec<(torus_types::Address, torus_types::SignedNativeAction)> {
+        if native_with_senders.is_empty() {
+            return native_with_senders;
+        }
+        let Some(ref mempool) = self.mempool else {
+            return native_with_senders;
+        };
+        let actions: Vec<torus_types::SignedNativeAction> =
+            native_with_senders.iter().map(|(_, a)| a.clone()).collect();
+        match mempool.mirror_native_to_da(&actions) {
+            Ok(()) => native_with_senders,
+            Err(e) => {
+                tracing::error!(
+                    %e,
+                    count = actions.len(),
+                    "produce_block: durable body mirror FAILED — proposing without native actions"
+                );
+                if let Some(ref m) = self.metrics {
+                    m.proposer_body_mirror_failures.inc();
+                }
+                Vec::new()
+            }
+        }
+    }
+
+    /// Decode a proposal datum into a full `TorusBlock`, enforcing the S459
+    /// body-durability invariant BEFORE the caller may vote `Valid`.
+    ///
+    /// - Full inline `TorusBlock` (legacy path): the bodies travel inline, but the
+    ///   compact path guarantees every referenced body is durable locally
+    ///   (`reconstruct_native_actions_hot` reads from `da_store`). A full block must
+    ///   meet the SAME bar or a later restart/backfill cannot reconstruct it — so we
+    ///   mirror the bodies here and fail-closed to `MissingData` (re-proposed next
+    ///   view) if the durable write fails.
+    /// - Compact `CompactBlock`: reconstruct out-of-band bodies from the durable
+    ///   store (already fail-closed to `MissingData` on a miss).
+    ///
+    /// Returns the decoded block, or the `ValidateBlockResponse` to short-circuit.
+    fn decode_proposal_and_ensure_durable(
+        &mut self,
+        datum_bytes: &[u8],
+    ) -> Result<TorusBlock, ValidateBlockResponse> {
+        if let Ok(block) = bincode::deserialize::<TorusBlock>(datum_bytes) {
+            tracing::info!(
+                height = block.header.height,
+                evm_tx_count = block.evm_transactions.len(),
+                native_count = block.native_actions.len(),
+                "validate_block: TorusBlock deserialized"
+            );
+            // S459 wedge fix (PRIMARY): the legacy inline path used the bodies from
+            // `block.native_actions` and voted without ever persisting them. Mirror
+            // to the durable DA store so this node meets the same local-durability
+            // bar the compact path already guarantees. Fail-closed on error.
+            if !block.native_actions.is_empty() {
+                if let Some(ref mempool) = self.mempool {
+                    if let Err(e) = mempool.mirror_native_to_da(&block.native_actions) {
+                        tracing::warn!(
+                            %e,
+                            height = block.header.height,
+                            "validate_block: TorusBlock body mirror FAILED — MissingData (re-proposed next view)"
+                        );
+                        return Err(ValidateBlockResponse::MissingData);
+                    }
+                }
+            }
+            Ok(block)
+        } else if let Ok(compact) = bincode::deserialize::<CompactBlock>(datum_bytes) {
+            tracing::info!(
+                height = compact.header.height,
+                native_hashes = compact.native_action_hashes.len(),
+                "validate_block: CompactBlock fallback"
+            );
+
+            // Track these hashes BEFORE attempting reconstruction: if bodies are
+            // missing (MissingData below) this proposal never reaches
+            // `pending_proposals`, yet its actions are in flight on the wire — the
+            // next leader must still exclude them from selection or they are
+            // re-included 2–4x (the s355 duplicate-inclusion tail, mem c0f4f938).
+            self.in_flight_hashes.note(
+                compact.header.height,
+                compact.native_action_hashes.iter().copied(),
+            );
+
+            let native_actions = if compact.native_action_hashes.is_empty() {
+                vec![]
+            } else {
+                // Reconstruct out-of-band bodies for the HOT path: a fast local retry for
+                // a racing pre-proposal PUSH, then a SHORT bounded native-DA PULL so a
+                // genuine push miss is recovered live instead of wedging (#4 Task 1 — the
+                // un-wedge). Budget stays ≪ the 500 ms view timeout.
+                match self.reconstruct_native_actions_hot(&compact.native_action_hashes) {
+                    Ok(actions) => actions,
+                    Err(missing_count) => {
+                        if let Some(ref m) = self.metrics {
+                            m.missing_action_rejections.inc();
+                        }
+                        tracing::warn!(
+                            missing_count,
+                            height = compact.header.height,
+                            "validate_block: MISSING native action bodies after hot retry + pull -- fetch via DA (not invalid)"
+                        );
+                        // MissingData (NOT Invalid): the block is structurally fine, we
+                        // just lack the out-of-band bodies. The sync path must not
+                        // blacklist the serving peer for this (livelock root cause, mem
+                        // 28e1a821) — it re-pulls via the rare fallback instead.
+                        return Err(ValidateBlockResponse::MissingData);
+                    }
+                }
+            };
+
+            Ok(TorusBlock {
+                header: compact.header,
+                native_actions,
+                evm_transactions: compact.evm_transactions,
+                core_writer_actions: compact.core_writer_actions,
+            })
+        } else {
+            tracing::warn!("validate_block: REJECTED -- deserialization failed");
+            Err(ValidateBlockResponse::Invalid)
+        }
+    }
+}
+
 impl App<RocksKVStore> for TorusApp {
     /// Produce a block: drain mempool, build raw tx list, NO execution.
     ///
@@ -2421,15 +2559,18 @@ impl App<RocksKVStore> for TorusApp {
         let (native_with_senders, evm_txs) =
             self.select_block_payload(parent_header.height, gas_limit, parent_header.state_root);
 
+        // Proposer guarantee (S459): durably mirror every referenced body to THIS
+        // node's DA store BEFORE committing to reference it (livelock fix, mem
+        // 28e1a821 — any validator must be able to reconstruct a compact block
+        // out-of-band). If the durable write fails, DROP the native actions from
+        // this proposal: an empty-native block cannot wedge a validator, whereas a
+        // referenced-but-unbacked body can. The re-queued batch retries next view.
+        // `native_with_senders` and `native_actions` stay consistent so the
+        // pre-proposal push below never carries a dropped body.
+        let native_with_senders = self.mirror_or_drop_native(native_with_senders);
+
         let native_actions: Vec<torus_types::SignedNativeAction> =
             native_with_senders.iter().map(|(_, a)| a.clone()).collect();
-
-        // Proposer guarantee: mirror every referenced body to the durable DA store
-        // so any validator can reconstruct the block out-of-band, even when it is
-        // compact (push-primary, pull-rare). Livelock fix (mem 28e1a821).
-        if let Some(ref mempool) = self.mempool {
-            mempool.mirror_native_to_da(&native_actions);
-        }
 
         let sig_attestation = match self.signing_key {
             Some(ref key) => torus_bridge::proposer::generate_sig_attestation(&native_actions, key),
@@ -2553,68 +2694,14 @@ impl App<RocksKVStore> for TorusApp {
             return ValidateBlockResponse::Invalid;
         }
 
-        // Try TorusBlock first (new format), CompactBlock fallback (backward compat)
-        let torus_block = if let Ok(block) = bincode::deserialize::<TorusBlock>(datum_bytes) {
-            tracing::info!(
-                height = block.header.height,
-                evm_tx_count = block.evm_transactions.len(),
-                native_count = block.native_actions.len(),
-                "validate_block: TorusBlock deserialized"
-            );
-            block
-        } else if let Ok(compact) = bincode::deserialize::<CompactBlock>(datum_bytes) {
-            tracing::info!(
-                height = compact.header.height,
-                native_hashes = compact.native_action_hashes.len(),
-                "validate_block: CompactBlock fallback"
-            );
-
-            // Track these hashes BEFORE attempting reconstruction: if bodies are
-            // missing (MissingData below) this proposal never reaches
-            // `pending_proposals`, yet its actions are in flight on the wire — the
-            // next leader must still exclude them from selection or they are
-            // re-included 2–4x (the s355 duplicate-inclusion tail, mem c0f4f938).
-            self.in_flight_hashes.note(
-                compact.header.height,
-                compact.native_action_hashes.iter().copied(),
-            );
-
-            let native_actions = if compact.native_action_hashes.is_empty() {
-                vec![]
-            } else {
-                // Reconstruct out-of-band bodies for the HOT path: a fast local retry for
-                // a racing pre-proposal PUSH, then a SHORT bounded native-DA PULL so a
-                // genuine push miss is recovered live instead of wedging (#4 Task 1 — the
-                // un-wedge). Budget stays ≪ the 500 ms view timeout.
-                match self.reconstruct_native_actions_hot(&compact.native_action_hashes) {
-                    Ok(actions) => actions,
-                    Err(missing_count) => {
-                        if let Some(ref m) = self.metrics {
-                            m.missing_action_rejections.inc();
-                        }
-                        tracing::warn!(
-                            missing_count,
-                            height = compact.header.height,
-                            "validate_block: MISSING native action bodies after hot retry + pull -- fetch via DA (not invalid)"
-                        );
-                        // MissingData (NOT Invalid): the block is structurally fine, we
-                        // just lack the out-of-band bodies. The sync path must not
-                        // blacklist the serving peer for this (livelock root cause, mem
-                        // 28e1a821) — it re-pulls via the rare fallback instead.
-                        return ValidateBlockResponse::MissingData;
-                    }
-                }
-            };
-
-            TorusBlock {
-                header: compact.header,
-                native_actions,
-                evm_transactions: compact.evm_transactions,
-                core_writer_actions: compact.core_writer_actions,
-            }
-        } else {
-            tracing::warn!("validate_block: REJECTED -- deserialization failed");
-            return ValidateBlockResponse::Invalid;
+        // Decode the proposal (TorusBlock new format, CompactBlock fallback) and
+        // enforce the S459 body-durability invariant before we may vote `Valid`:
+        // every referenced native body is durable in THIS node's DA store, or we
+        // short-circuit (MissingData / Invalid). See
+        // `decode_proposal_and_ensure_durable`.
+        let torus_block = match self.decode_proposal_and_ensure_durable(datum_bytes) {
+            Ok(block) => block,
+            Err(response) => return response,
         };
 
         if !torus_block.evm_transactions.is_empty()
@@ -4139,7 +4226,7 @@ mod crash_recovery_tests {
         assert!(!app.is_exec_failed(), "still within budget — no latch");
 
         // A peer serves height 5's bodies into the durable DA store.
-        mempool.mirror_native_to_da(&a5);
+        let _ = mempool.mirror_native_to_da(&a5);
         app.drain_exec_queue();
         assert_eq!(
             app.exec_next_height,
@@ -4148,7 +4235,7 @@ mod crash_recovery_tests {
         );
 
         // Height 6's bodies arrive too: the run drains fully.
-        mempool.mirror_native_to_da(&a6);
+        let _ = mempool.mirror_native_to_da(&a6);
         app.drain_exec_queue();
         assert_eq!(app.exec_next_height, Some(7), "the whole contiguous run heals in order");
         assert!(app.deferred_exec.is_empty(), "queue fully drained");
@@ -4500,7 +4587,7 @@ mod crash_recovery_tests {
             state_db.clone(),
             torus_mempool::MempoolConfig::default(),
         ));
-        mempool.mirror_native_to_da(&actions); // models push/pull delivery into the DA store
+        let _ = mempool.mirror_native_to_da(&actions); // models push/pull delivery into the DA store
         let app = TorusApp::new(state_db.clone(), &config, None, Some(mempool), None);
         let reconstructed = app
             .reconstruct_compact_from_da(&compact)
@@ -4511,6 +4598,80 @@ mod crash_recovery_tests {
                 torus_types::compute_action_hash(got),
                 torus_types::compute_action_hash(want),
                 "reconstructed bodies match the referenced hashes"
+            );
+        }
+    }
+
+    /// Task 2 (S459 PRIMARY): a full-inline `TorusBlock` proposal carrying a native
+    /// action whose body is NOT pre-loaded into the DA store must, after
+    /// `validate_block`'s decode+durability step, have that body durably present —
+    /// the legacy path now mirrors to `da_store` before it can vote `Valid`, meeting
+    /// the same bar the compact path already guarantees. RED before Task 2: the
+    /// legacy branch returned the block without mirroring, so `get_native_da` was
+    /// `None` (a later restart/backfill could never reconstruct it → the wedge).
+    #[test]
+    fn validate_block_legacy_durable() {
+        let (config, state_db) = make_test_config_and_db();
+        let mempool = Arc::new(Mempool::new(
+            state_db.clone(),
+            torus_mempool::MempoolConfig::default(),
+        ));
+        let action = sign_claim_rewards(1);
+        let hash = torus_types::compute_action_hash(&action);
+
+        // Precondition: the body has never been mirrored/put — absent from the store.
+        assert!(
+            mempool.get_native_da(&hash).is_none(),
+            "precondition: body absent from the DA store before validation"
+        );
+
+        // A FULL inline TorusBlock datum (bodies inline, not out-of-band).
+        let block = make_block(1, vec![action.clone()]);
+        let datum = encode_proposal_datum(&block, false);
+
+        let mut app = TorusApp::new(state_db.clone(), &config, None, Some(mempool.clone()), None);
+        let decoded = match app.decode_proposal_and_ensure_durable(&datum) {
+            Ok(b) => b,
+            Err(_) => panic!("legacy full TorusBlock must decode as Valid, not short-circuit"),
+        };
+        assert_eq!(decoded.native_actions.len(), 1);
+
+        // The invariant: after the decode+durability step the body is durable.
+        assert!(
+            mempool.get_native_da(&hash).is_some(),
+            "legacy TorusBlock path must mirror the body into the DA store before Valid"
+        );
+    }
+
+    /// Task 3 (S459) happy-path invariant: `mirror_or_drop_native` durably stores
+    /// every selected body and returns the selection UNCHANGED on a healthy store.
+    /// Guards against regressing the proposer-side mirror out of the hot path (a
+    /// silent regression would re-open the leader half of the wedge).
+    #[test]
+    fn produce_block_bodies_durable() {
+        let (config, state_db) = make_test_config_and_db();
+        let mempool = Arc::new(Mempool::new(
+            state_db.clone(),
+            torus_mempool::MempoolConfig::default(),
+        ));
+        let actions: Vec<SignedNativeAction> = (0..5).map(sign_claim_rewards).collect();
+        let with_senders: Vec<(torus_types::Address, SignedNativeAction)> = actions
+            .iter()
+            .map(|a| (a.recover_sender().unwrap(), a.clone()))
+            .collect();
+
+        let app = TorusApp::new(state_db.clone(), &config, None, Some(mempool.clone()), None);
+        let kept = app.mirror_or_drop_native(with_senders.clone());
+        assert_eq!(
+            kept.len(),
+            with_senders.len(),
+            "a healthy durable mirror keeps every selected action"
+        );
+        for a in &actions {
+            let hash = torus_types::compute_action_hash(a);
+            assert!(
+                mempool.get_native_da(&hash).is_some(),
+                "every proposed body must be durable in the DA store after mirror_or_drop_native"
             );
         }
     }
@@ -4652,7 +4813,7 @@ mod crash_recovery_tests {
         ));
         // Mirror to the DA store WITHOUT mempool admission (mirror_native_to_da does
         // not touch the in-memory pool) -- exactly the "in DA, not in mempool" state.
-        mempool.mirror_native_to_da(std::slice::from_ref(&body));
+        let _ = mempool.mirror_native_to_da(std::slice::from_ref(&body));
         assert!(
             mempool.get_native_by_hash(&body_hash).is_none(),
             "precondition: body is NOT in the ephemeral mempool pool"
@@ -5831,7 +5992,7 @@ mod crash_recovery_tests {
             (1..=59u64).map(sign_claim_rewards).collect();
         let committed_block = make_block(130, committed_actions.clone());
         // Every committed body lives in the durable DA store (proposer mirror).
-        mempool.mirror_native_to_da(&committed_actions);
+        let _ = mempool.mirror_native_to_da(&committed_actions);
 
         let mut app = TorusApp::new(state_db.clone(), &config, None, Some(mempool), None);
 
@@ -6023,8 +6184,8 @@ mod crash_recovery_tests {
         // pure ordering, not a hole).
         let a5 = vec![sign_claim_rewards(5)];
         let a6 = vec![sign_claim_rewards(6)];
-        mempool.mirror_native_to_da(&a5);
-        mempool.mirror_native_to_da(&a6);
+        let _ = mempool.mirror_native_to_da(&a5);
+        let _ = mempool.mirror_native_to_da(&a6);
         let b5 = make_block(5, a5);
         let b6 = make_block(6, a6);
 
@@ -6069,8 +6230,8 @@ mod crash_recovery_tests {
         let a6 = vec![sign_claim_rewards(6)];
         let a7 = vec![sign_claim_rewards(7)];
         // Initially only 6 and 7 are reconstructable; 5's body is MISSING.
-        mempool.mirror_native_to_da(&a6);
-        mempool.mirror_native_to_da(&a7);
+        let _ = mempool.mirror_native_to_da(&a6);
+        let _ = mempool.mirror_native_to_da(&a7);
         let b5 = make_block(5, a5.clone());
         let b6 = make_block(6, a6);
         let b7 = make_block(7, a7);
@@ -6098,7 +6259,7 @@ mod crash_recovery_tests {
         );
 
         // Heal: 5's body arrives in the DA store; the next commit (7) drives the drain.
-        mempool.mirror_native_to_da(&a5);
+        let _ = mempool.mirror_native_to_da(&a5);
         let c7 = committed_compact_block(&b7);
         app.on_committed_block(&c7, c7.hash);
 

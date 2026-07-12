@@ -7,7 +7,7 @@
     {
       "id": 1,
       "name": "mirror_native_to_da -> Result + re-queue (parity with other mirror paths)",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/torus-mempool/src/lib.rs",
         "crates/torus-consensus/src/app.rs"
@@ -18,7 +18,7 @@
     {
       "id": 2,
       "name": "Legacy TorusBlock voter path mirrors bodies to da_store before Valid (PRIMARY)",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/torus-consensus/src/app.rs"
       ],
@@ -28,7 +28,7 @@
     {
       "id": 3,
       "name": "produce_block fail-closed: propose without native actions if durable mirror fails",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/torus-consensus/src/app.rs"
       ],
