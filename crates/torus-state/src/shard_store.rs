@@ -169,4 +169,33 @@ mod tests {
             assert!(back.verify(), "stored shard {i} must verify against its root");
         }
     }
+
+    /// T4: a shard built under one epoch's `(k,n)` carries its OWN params, so it
+    /// reconstructs correctly even after the derivation would return a different
+    /// `n` for a later epoch — no re-shard of historical bodies.
+    #[test]
+    fn stored_shard_carries_its_own_params() {
+        use crate::erasure::reconstruct;
+        let b = body(1000);
+        // Sharded when the set was 3 validators → (2,3).
+        let params3 = ErasureParams::for_validator_set(3);
+        assert_eq!((params3.k, params3.n), (2, 3));
+        let enc = encode(&b, params3).expect("encode");
+        let stored: Vec<StoredShard> =
+            (0..enc.params.n).map(|i| StoredShard::from_encoded_body(&enc, i)).collect();
+
+        // A later epoch would derive (2,4) for 4 validators — DIFFERENT n.
+        assert_ne!(ErasureParams::for_validator_set(4), params3);
+
+        // Each stored shard still reports the params it was built under, not the
+        // later epoch's, and reconstruct from its own params rebuilds the body.
+        for s in &stored {
+            assert_eq!((s.k, s.n), (2, 3));
+        }
+        let slots: Vec<Option<Vec<u8>>> =
+            stored.iter().map(|s| Some(s.shard_bytes.clone())).collect();
+        let out = reconstruct(slots, stored[0].params(), stored[0].body_len as usize)
+            .expect("reconstruct with the shard's own params");
+        assert_eq!(out, b, "stored shards must rebuild the original body");
+    }
 }

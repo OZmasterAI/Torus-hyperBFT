@@ -61,6 +61,39 @@ impl ErasureParams {
         Self { k, n }
     }
 
+    /// Derive `(k, n)` from the validator-set size (Polkadot-style custody, design Q1).
+    ///
+    /// ```text
+    /// n = |validators|
+    /// f = (n - 1) / 3          // classic BFT: n >= 3f + 1
+    /// k = max(2, f + 1)        // reconstruct from any f+1 honest custodians,
+    ///                          // FLOORED at 2 so even n=3 (f=0) fetches from
+    ///                          // >=2 sources — hotspot removal is the n=3 win
+    /// ```
+    ///
+    /// The floor is the deliberate n=3 decision: strict `f+1` gives `k=1` (a
+    /// single source, no spread), which defeats the purpose. It matches the
+    /// design-doc arithmetic table exactly: `3→(2,3) 4→(2,4) 7→(3,7) 10→(4,10)
+    /// 21→(7,21)`.
+    ///
+    /// `(k, n)` is epoch-stable (a pure function of set size), so every honest
+    /// node derives byte-identical shards/roots. A body is sharded under the
+    /// CURRENT set's params at mirror time and those params travel with each
+    /// stored shard, so an epoch set-change never invalidates already-stored
+    /// shards (no re-shard of historical bodies).
+    ///
+    /// Degenerate single-node (`n_validators < 2`): `(1, 1)` — well-formed, no
+    /// redundancy.
+    pub fn for_validator_set(n_validators: usize) -> Self {
+        let n = n_validators.max(1);
+        if n < 2 {
+            return Self { k: 1, n: 1 };
+        }
+        let f = (n - 1) / 3;
+        let k = (f + 1).max(2);
+        Self { k, n }
+    }
+
     /// Reject degenerate params before touching the RS backend. `galois_8`
     /// bounds `n <= 255`; we also require `1 <= k <= n` and at least one parity
     /// shard is optional (k == n is a valid no-parity split, though it offers no
@@ -402,6 +435,41 @@ mod tests {
         ];
         let err = reconstruct(sparse, params, enc.body_len).unwrap_err();
         assert_eq!(err, ErasureError::InsufficientShards { have: 2, need: 3 });
+    }
+
+    /// T4: `(k,n)` derivation matches the design-doc arithmetic table, including
+    /// the `k = max(2, f+1)` floor that keeps n=3 fetching from >=2 sources.
+    #[test]
+    fn params_for_set_matches_bft_table() {
+        let table = [
+            (3, 2, 3),   // f=0, floor lifts k to 2 (hotspot removal)
+            (4, 2, 4),   // f=1
+            (7, 3, 7),   // f=2
+            (10, 4, 10), // f=3
+            (21, 7, 21), // f=6 (validator cap)
+        ];
+        for (validators, want_k, want_n) in table {
+            let p = ErasureParams::for_validator_set(validators);
+            assert_eq!((p.k, p.n), (want_k, want_n), "n_validators={validators}");
+            p.validate().expect("derived params must be valid");
+            assert!(p.k <= p.n, "k must not exceed n");
+        }
+        // Degenerate single-node: well-formed (1,1), no redundancy.
+        assert_eq!(ErasureParams::for_validator_set(1), ErasureParams::new(1, 1));
+        assert_eq!(ErasureParams::for_validator_set(0), ErasureParams::new(1, 1));
+    }
+
+    /// Determinism: same set size ⇒ identical params on every node (shards/roots
+    /// must match across the fleet).
+    #[test]
+    fn params_are_deterministic_for_same_n() {
+        for n in 1..=21 {
+            assert_eq!(
+                ErasureParams::for_validator_set(n),
+                ErasureParams::for_validator_set(n),
+                "derivation must be a pure function of set size"
+            );
+        }
     }
 
     /// Determinism: identical (body, params) ⇒ identical shards + root on every
