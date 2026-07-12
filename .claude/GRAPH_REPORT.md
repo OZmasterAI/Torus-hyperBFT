@@ -1,54 +1,55 @@
 # Code Graph: Torus-hyperBFT
-_Auto-generated 2026-06-14 14:16 UTC — do not edit._
+_Auto-generated 2026-07-12 10:01 UTC — do not edit._
 
-**7476 nodes across 1285 files**
+**8105 nodes across 1565 files**
 
 ## Key Hubs
 | Node | File | Connections |
 |------|------|------------|
-| Ok | ../../.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/result.rs | 90 |
-| extend_from_slice | extend_from_slice | 89 |
-| place_order | crates/torus-core/src/order_book.rs | 83 |
-| unwrap | ../../.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/result.rs | 76 |
-| build | build | 75 |
-| addr | crates/torus-core/src/order_book.rs | 73 |
+| extend_from_slice | extend_from_slice | 100 |
+| build | build | 83 |
+| run | crates/torus-node/src/main.rs | 83 |
+| place_order | crates/torus-core/src/order_book.rs | 81 |
+| alloy_primitives | alloy_primitives | 80 |
+| to_bytes | to_bytes | 78 |
+| put_cf_raw | put_cf_raw | 76 |
+| verifying_key | verifying_key | 76 |
+| addr | crates/torus-core/src/order_book.rs | 72 |
 | fp | crates/torus-core/src/order_book.rs | 72 |
-| alloy_primitives | alloy_primitives | 71 |
-| book | crates/torus-core/src/order_book.rs | 71 |
-| run | crates/torus-node/src/main.rs | 66 |
-| put_cf_raw | put_cf_raw | 65 |
-| to_bytes | to_bytes | 65 |
-| std | std | 63 |
-| torus_types | torus_types | 62 |
-| put_account | put_account | 61 |
+| torus_types | torus_types | 72 |
+| book | crates/torus-core/src/order_book.rs | 70 |
+| put_account | put_account | 67 |
+| copy_from_slice | copy_from_slice | 66 |
+| get_cf_raw | get_cf_raw | 64 |
 
 ## Communities
-- **crates** (402) — files: `crates/torus-core/src/error.rs`, `crates/torus-economics/src/error.rs`, `torus_state::cf:`, `torus_state` | fns: `Borsh`, `Borsh`, `CF_ACCOUNTS`, `CF_ACCOUNTS`
-- **crates-1** (391) — files: `Cli`, `EconomicsError`, `EthApiServer`, `Logger` | fns: `MAX_ORDERS_PER_TRADER_PER_MARKET`, `MarketMarginConfig`, `crates/hotstuff_rs/src/hotstuff/mod.rs`, `crates/hotstuff_rs/src/lib.rs`
-- **crates-2** (314) — files: `crates/torus-explorer/src/api.rs`, `crates/torus-bridge/src/error.rs`, `tools/faucet/src/main.rs`, `tools/tx-flood/src/main.rs` | fns: `AppState`, `BridgeError`, `Cli`, `Cli`
-- **crates-3** (310) — files: `crates/hotstuff_rs/src/types/signed_messages.rs`, `crates/hotstuff_rs/src/block_sync/messages.rs`, `crates/hotstuff_rs/src/algorithm.rs`, `crates/hotstuff_rs/src/block_tree/variables.rs` | fns: `ActiveCollectorPair`, `AdvertiseBlock`, `AdvertisePC`, `Algorithm`
-- **crates-4** (294) — files: `crates/torus-economics/src/reward_distributor.rs`, `crates/torus-state/src/cf.rs`, `crates/torus-consensus/src/slashing.rs`, `crates/torus-economics/src/governance.rs` | fns: `BLOCKS_PER_YEAR`, `CF_FEE_CONFIG`, `CF_TREASURY`, `DowntimeTracker`
-- **crates-5** (277) — files: `Ed25519Sig`, `crates/hotstuff_rs/tests/common/node.rs`, `crates/hotstuff_rs/tests/common/number_app.rs`, `crates/torus-network/src/peer_scoring.rs` | fns: `Node`, `NumberAppTransaction`, `PeerScoring`, `SyncRequest`
-- **tools** (271) — files: `crates/torus-explorer/src/api.rs`, `torus_types:`, `IntoResponse`, `crates/torus-genesis/src/lib.rs` | fns: `ApiError`, `FixedPoint`, `InvalidAddress`, `InvalidAmount`
-- **crates-7** (267) — files: `crates/hotstuff_rs/src/block_tree/accessors/internal.rs`, `crates/hotstuff_rs/src/block_sync/messages.rs`, `../../.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/slice/iter.rs`, `../../.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/slice/iter/macros.rs` | fns: `add_speculative_commit`, `advance_highest_pc_from_remote`, `advertise_block`, `any`
-- **crates-8** (262) — files: `crates/torus-state/src/cf.rs`, `crate::cf`, `crates/torus-state/src/native_trie.rs`, `crates/torus-types/src/lib.rs` | fns: `CF_HASHED_ACCOUNTS`, `CF_HASHED_ACCOUNTS`, `CF_NATIVE_HASHED`, `CF_NATIVE_TRIE`
-- **crates-9** (205) — files: `torus_core::precompiles:`, `crates/torus-core/src/position.rs`, `torus_state::cf:`, `crates/torus-state/src/cf.rs` | fns: `ADDR_ORACLE_READER`, `ADDR_STAKING_READER`, `CF_NATIVE_BALANCES`, `CF_NATIVE_BALANCES`
-- **crates-10** (176) — files: `crates/torus-state/src/native_trie.rs`, `torus_state::cf:`, `crates/torus-bridge/src/error.rs:BridgeError:`, `crates/torus-integration-tests/tests/common/mod.rs` | fns: `CF_NATIVE_BALANCES`, `CF_NATIVE_MARKETS`, `CF_NATIVE_ORACLE`, `CF_NATIVE_ORACLE`
-- **crates-11** (157) — files: `torus_rpc`, `crates/torus-state/src/cf.rs`, `torus_evm`, `torus_mempool` | fns: `BlockNotifier`, `CF_STAKING_VALIDATORS`, `EvmExecutor`, `Mempool`
-- **crates-12** (154) — files: `std::ops`, `crates/torus-evm/src/executor.rs`, `crates/torus-rpc/src/lib.rs`, `Default` | fns: `Add`, `BlockEnvCfg`, `BlockNotifier`, `Div`
-- **crates-14** (145) — files: `crates/torus-state/src/cf.rs`, `rocksdb`, `crates/torus-types/src/lib.rs`, `crates/torus-bridge/src/error.rs` | fns: `CF_CONSENSUS_META`, `CF_NATIVE_NONCES`, `CF_NATIVE_PENDING`, `Cache`
+- **crates** (425) — files: `Cli`, `EconomicsError`, `EthApiServer`, `Logger` | fns: `NativeStateOverlay`, `crates/hotstuff_rs/src/lib.rs`, `crates/hotstuff_rs/src/networking/mod.rs`, `crates/torus-core/benches/order_book.rs`
+- **crates-1** (349) — files: `crates/torus-consensus/src/kv_store.rs`, `crates/torus-state/src/db.rs`, `crates/torus-state/src/trie_cursor.rs`, `addr_of` | fns: `Delete`, `Set`, `account_storage`, `account_trie_cursor`
+- **crates-2** (312) — files: `torus_consensus`, `hotstuff_rs`, `crates/torus-network/src/sync.rs`, `add_speculative_commit` | fns: `ChannelNetwork`, `GenesisConfig`, `Replica`, `RocksKVStore`
+- **crates-3** (281) — files: `Ed25519Sig`, `crates/hotstuff_rs/tests/common/verifying_key_bytes.rs`, `add_address`, `crates/torus-bridge/tests/session_key_tests.rs` | fns: `VerifyingKeyBytes`, `addr`, `address_from_signing_key`, `all_vectors`
+- **crates-4** (233) — files: `crates/torus-integration-tests/tests/fee_flow.rs`, `crates/torus-economics/tests/permanent_stake_tests.rs`, `crates/torus-integration-tests/tests/snapshot_dos_keys.rs`, `crates/torus-economics/tests/governance_tests.rs` | fns: `addr`, `addr`, `addr`, `addr`
+- **crates-5** (208) — files: `crates/torus-core/tests/precompile_tests.rs`, `crates/torus-core/src/liquidation.rs`, `crates/torus-integration-tests/tests/stress.rs`, `crates/torus-core/tests/margin_tests.rs` | fns: `abi_address_roundtrip`, `addr`, `addr`, `addr`
+- **crates-6** (199) — files: `abs_diff`, `crates/torus-economics/src/staking.rs`, `crates/torus-economics/src/governance.rs`, `crates/torus-economics/src/dev_pool.rs` | fns: `addr`, `addr`, `all_entries`, `all_pending_rotations`
+- **crates-7** (190) — files: `crates/torus-consensus/src/app.rs`, `add_native_action_from_gossip_trusted`, `crates/torus-rpc/src/lib.rs`, `as_millis` | fns: `absorb_fetched_bodies`, `admit_rejects_counted_by_reason`, `bare_eth_call_succeeds_at_height_with_base_fee`, `bincode_roundtrip_preserves_action_hash`
+- **crates-8** (172) — files: `crates/torus-explorer/src/api.rs`, `IntoResponse`, `Json`, `add_native_action_presigned` | fns: `ApiError`, `addr`, `base_fee`, `block_env_from_header`
+- **crates-9** (167) — files: `add_evm_tx`, `add_native_action_from_gossip`, `app`, `crates/torus-node/src/main.rs` | fns: `apply_config_defaults`, `apply_rotation_cap`, `arrival_generation`, `arrivals`
+- **..** (155) — files: `devnet/scripts/native-dup-factor.py`, `devnet/scripts/native-order-flood.py`, `devnet/scripts/native-transfer-probe.py`, `../../../linuxbrew/.linuxbrew/lib/node_modules/pyright/dist/typeshed-fallback/stdlib/collections/__init__.pyi` | fns: `(module) native-dup-factor.py`, `(module) native-order-flood.py`, `(module) native-transfer-probe.py`, `Counter`
+- **crates-11** (151) — files: `PublicKey`, `crates/torus-mempool/src/lib.rs`, `crates/torus-bridge/tests/exec_isolation_tests.rs`, `all_senders` | fns: `accepts_pre_eip155_legacy_tx`, `add_evm_tx`, `add_native_action`, `add_native_action_from_gossip`
 - **test** (145) — files: `db.rs`, `config.rs`, `serde`, `indexer.rs` | fns: `BlockRow`, `CandleRow`, `Config`, `Deserialize`
-- **crates-15** (137) — files: `torus_types`, `hotstuff_rs:app:`, `hotstuff_rs:types::update_sets:`, `data_types` | fns: `Address`, `App`, `AppStateUpdates`, `BlockHeight`
-- **..** (136) — files: `devnet/scripts/exec_phase_table.py`, `devnet/scripts/native-dup-factor.py`, `devnet/scripts/native-order-flood.py`, `devnet/scripts/native-transfer-probe.py` | fns: `(module) exec_phase_table.py`, `(module) native-dup-factor.py`, `(module) native-order-flood.py`, `(module) native-transfer-probe.py`
-- **crates-16** (136) — files: `torus_rpc:`, `common/mod.rs`, `torus_core::precompiles:`, `torus_economics::epoch:` | fns: `BlockNotifier`, `BlockNotifier`, `CoreWriterQueue`, `EpochManager`
-- **crates-18** (122) — files: `crates/torus-types/src/lib.rs`, `torus_types:`, `PublicKey`, `../../.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/option.rs` | fns: `ListMarket`, `MarketListing`, `MarketParams`, `SubmitProposal`
-- **crates-19** (109) — files: `crates/torus-core/src/order_book.rs`, `crates/torus-state/src/overlay.rs`, `is_none_or`, `modify_order` | fns: `accept_buy_stop_above_market`, `accept_valid_tick_size`, `addr`, `alloc_id`
+- **crates-12** (145) — files: `alloy_primitives`, `committer`, `committer.rs`, `error` | fns: `Address`, `B256`, `BlockCommitter`, `BlockCommitter`
+- **..-14** (138) — files: `crates/torus-state/src/cf.rs`, `rocksdb`, `crates/torus-consensus/src/network.rs`, `Clone` | fns: `CF_CONSENSUS_META`, `Cache`, `ChannelNetwork`, `ColumnFamilyDescriptor`
+- **crates-15** (131) — files: `torus_rpc:`, `common/mod.rs`, `torus_core::precompiles:`, `torus_economics::epoch:` | fns: `BlockNotifier`, `BlockNotifier`, `CoreWriterQueue`, `EpochManager`
+- **crates-17** (123) — files: `crates/hotstuff_rs/src/block_tree/accessors/internal.rs`, `crates/hotstuff_rs/src/block_sync/messages.rs`, `crates/hotstuff_rs/src/types/validator_set.rs`, `crates/hotstuff_rs/src/block_tree/pluggables.rs` | fns: `add_speculative_commit`, `advance_highest_pc_from_remote`, `advertise_block`, `app_view`
+- **crates-16** (123) — files: `abort`, `accept`, `crates/torus-network/src/transport.rs`, `tools/faucet/src/main.rs` | fns: `addr`, `address_from_signing_key`, `borsh_write_address`, `borsh_write_address`
+- **crates-18** (119) — files: `torus_types`, `hotstuff_rs:app:`, `hotstuff_rs:types::update_sets:`, `data_types` | fns: `Address`, `App`, `AppStateUpdates`, `BlockHeight`
+- **crates-19** (115) — files: `crates/torus-bridge/src/error.rs`, `crates/torus-bridge/src/error.rs:BridgeError:`, `crates/torus-core/src/error.rs`, `thiserror` | fns: `BridgeError`, `Core`, `CoreError`, `Error`
 
 ## Directory Map
-- `./` — 1034 files
-- `crates/` — 213 files
-- `tools/` — 26 files
-- `devnet/` — 12 files
+- `./` — 1242 files
+- `crates/` — 239 files
+- `devnet/` — 34 files
+- `tools/` — 29 files
+- `testnet/` — 21 files
 
 ---
 For deeper queries use `run_tool('indexer', '<tool>', ...)`:
