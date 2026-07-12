@@ -1,0 +1,49 @@
+{
+  "prp": "wedge-durability-fix",
+  "created": "2026-07-12",
+  "design": "docs/plans/wedge-durability-fix.md (Option A)",
+  "plan": "docs/plans/wedge-durability-fix-impl.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "mirror_native_to_da -> Result + re-queue (parity with other mirror paths)",
+      "status": "pending",
+      "files": [
+        "crates/torus-mempool/src/lib.rs",
+        "crates/torus-consensus/src/app.rs"
+      ],
+      "validate": "cargo build -p torus-mempool && cargo test -p torus-mempool",
+      "depends_on": []
+    },
+    {
+      "id": 2,
+      "name": "Legacy TorusBlock voter path mirrors bodies to da_store before Valid (PRIMARY)",
+      "status": "pending",
+      "files": [
+        "crates/torus-consensus/src/app.rs"
+      ],
+      "validate": "cargo test -p torus-consensus validate_block_legacy_durable",
+      "depends_on": [1]
+    },
+    {
+      "id": 3,
+      "name": "produce_block fail-closed: propose without native actions if durable mirror fails",
+      "status": "pending",
+      "files": [
+        "crates/torus-consensus/src/app.rs"
+      ],
+      "validate": "cargo test -p torus-consensus produce_block_bodies_durable",
+      "depends_on": [1]
+    },
+    {
+      "id": 4,
+      "name": "End-to-end regression: injection harness recovers + organic gossip-off 0/30",
+      "status": "pending",
+      "files": [
+        "devnet/wedge-repro-s459.sh"
+      ],
+      "validate": "PROVE_UNWEDGE=1 SKIP_BUILD=1 bash devnet/wedge-repro-s459.sh",
+      "depends_on": [2, 3]
+    }
+  ]
+}
