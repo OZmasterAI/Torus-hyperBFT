@@ -26,6 +26,9 @@ services:
       - --p2p-peers=/ip4/172.28.0.11/udp/30334/quic-v1/p2p/12D3KooWH3uVF6wv47WnArKHk5p6cvgCJEb74UTmxztmQDc298L3
       - --rpc-addr=0.0.0.0:8545
       - --log-level=info
+      # S458 direct-to-leader A/B: gossip pre-spread (default) vs unicast-to-leader
+      # (--native-gossip=false activates RPC leader forwarding, main.rs forward_bodies gate)
+      - --native-gossip=${TORUS_NATIVE_GOSSIP:-true}
     environment:
       # Mirror the live testnet's body-push threshold: at bs400 a 100-action
       # block body is ~2.8MB; the 512KB default forces hash-only manifests and
@@ -33,6 +36,7 @@ services:
       # Overridable per leg by sweep-o5-threshold-s415.sh; NOTE the node clamps
       # requests above the 4MB fleet direct-msg floor since O5 (WARN in log).
       - TORUS_HASH_ONLY_PUSH_THRESHOLD=${TORUS_PUSH_THRESHOLD:-6000000}
+      - TORUS_NATIVE_TOTAL_BLOCK_CAP=${TORUS_NATIVE_TOTAL_BLOCK_CAP:-100}
     volumes:
       - ./genesis.json:/genesis/genesis.json:ro
       - validator-0-data:/data
@@ -58,6 +62,9 @@ services:
       - --p2p-peers=/ip4/172.28.0.10/udp/30333/quic-v1/p2p/12D3KooWPjceQrSwdWXPyLLeABRXmuqt69Rg3sBYbU1Nft9HyQ6X
       - --rpc-addr=0.0.0.0:8545
       - --log-level=info
+      # S458 direct-to-leader A/B: gossip pre-spread (default) vs unicast-to-leader
+      # (--native-gossip=false activates RPC leader forwarding, main.rs forward_bodies gate)
+      - --native-gossip=${TORUS_NATIVE_GOSSIP:-true}
     environment:
       # Mirror the live testnet's body-push threshold: at bs400 a 100-action
       # block body is ~2.8MB; the 512KB default forces hash-only manifests and
@@ -65,6 +72,7 @@ services:
       # Overridable per leg by sweep-o5-threshold-s415.sh; NOTE the node clamps
       # requests above the 4MB fleet direct-msg floor since O5 (WARN in log).
       - TORUS_HASH_ONLY_PUSH_THRESHOLD=${TORUS_PUSH_THRESHOLD:-6000000}
+      - TORUS_NATIVE_TOTAL_BLOCK_CAP=${TORUS_NATIVE_TOTAL_BLOCK_CAP:-100}
     volumes:
       - ./genesis.json:/genesis/genesis.json:ro
       - validator-1-data:/data
@@ -89,6 +97,9 @@ services:
       - --p2p-peers=/ip4/172.28.0.10/udp/30333/quic-v1/p2p/12D3KooWPjceQrSwdWXPyLLeABRXmuqt69Rg3sBYbU1Nft9HyQ6X
       - --rpc-addr=0.0.0.0:8545
       - --log-level=info
+      # S458 direct-to-leader A/B: gossip pre-spread (default) vs unicast-to-leader
+      # (--native-gossip=false activates RPC leader forwarding, main.rs forward_bodies gate)
+      - --native-gossip=${TORUS_NATIVE_GOSSIP:-true}
     environment:
       # Mirror the live testnet's body-push threshold: at bs400 a 100-action
       # block body is ~2.8MB; the 512KB default forces hash-only manifests and
@@ -96,6 +107,7 @@ services:
       # Overridable per leg by sweep-o5-threshold-s415.sh; NOTE the node clamps
       # requests above the 4MB fleet direct-msg floor since O5 (WARN in log).
       - TORUS_HASH_ONLY_PUSH_THRESHOLD=${TORUS_PUSH_THRESHOLD:-6000000}
+      - TORUS_NATIVE_TOTAL_BLOCK_CAP=${TORUS_NATIVE_TOTAL_BLOCK_CAP:-100}
     volumes:
       - ./genesis.json:/genesis/genesis.json:ro
       - validator-2-data:/data
@@ -120,6 +132,9 @@ services:
       - --p2p-peers=/ip4/172.28.0.10/udp/30333/quic-v1/p2p/12D3KooWPjceQrSwdWXPyLLeABRXmuqt69Rg3sBYbU1Nft9HyQ6X
       - --rpc-addr=0.0.0.0:8545
       - --log-level=info
+      # S458 direct-to-leader A/B: gossip pre-spread (default) vs unicast-to-leader
+      # (--native-gossip=false activates RPC leader forwarding, main.rs forward_bodies gate)
+      - --native-gossip=${TORUS_NATIVE_GOSSIP:-true}
     environment:
       # Mirror the live testnet's body-push threshold: at bs400 a 100-action
       # block body is ~2.8MB; the 512KB default forces hash-only manifests and
@@ -127,6 +142,7 @@ services:
       # Overridable per leg by sweep-o5-threshold-s415.sh; NOTE the node clamps
       # requests above the 4MB fleet direct-msg floor since O5 (WARN in log).
       - TORUS_HASH_ONLY_PUSH_THRESHOLD=${TORUS_PUSH_THRESHOLD:-6000000}
+      - TORUS_NATIVE_TOTAL_BLOCK_CAP=${TORUS_NATIVE_TOTAL_BLOCK_CAP:-100}
     volumes:
       - ./genesis.json:/genesis/genesis.json:ro
       - validator-3-data:/data
@@ -151,6 +167,9 @@ services:
       - --p2p-peers=/ip4/172.28.0.10/udp/30333/quic-v1/p2p/12D3KooWPjceQrSwdWXPyLLeABRXmuqt69Rg3sBYbU1Nft9HyQ6X
       - --rpc-addr=0.0.0.0:8545
       - --log-level=info
+      # S458 direct-to-leader A/B: gossip pre-spread (default) vs unicast-to-leader
+      # (--native-gossip=false activates RPC leader forwarding, main.rs forward_bodies gate)
+      - --native-gossip=${TORUS_NATIVE_GOSSIP:-true}
     environment:
       # Mirror the live testnet's body-push threshold: at bs400 a 100-action
       # block body is ~2.8MB; the 512KB default forces hash-only manifests and

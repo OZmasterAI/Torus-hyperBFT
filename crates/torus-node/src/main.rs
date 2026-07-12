@@ -135,15 +135,28 @@ struct Cli {
     /// Gossip admitted native-action bodies to the validator mesh as they
     /// arrive at ingress (Sprint 3 pre-spread): by proposal time peers already
     /// hold the bodies, so compact proposals need only gap-pulls. Disable with
-    /// --native-gossip=false to fall back to push/pull-only dissemination.
-    #[arg(long, default_value_t = true)]
+    /// --native-gossip=false to fall back to push/pull-only dissemination
+    /// (activates RPC direct-to-leader body forwarding).
+    #[arg(
+        long,
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
     native_gossip: bool,
 
     /// Exec trust-cache: at execution, reuse a sender this node already verified at
     /// ingress/gossip instead of re-running secp256k1 recovery. Deterministic (a HIT
     /// equals a fresh recover), so it never affects consensus or state. ON by default
     /// (s376 bench: -77% exec-verify, +61% orders/s). Disable with --exec-trust-cache=false.
-    #[arg(long, default_value_t = true)]
+    #[arg(
+        long,
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
     exec_trust_cache: bool,
 }
 
@@ -966,6 +979,52 @@ mod tests {
         assert!(!cli.archive);
         assert!(cli.retention_blocks.is_none());
         // Neither flag -> archive mode (no pruning)
+    }
+
+    #[test]
+    fn native_gossip_flag_can_be_disabled() {
+        // S458: `--native-gossip=false` must parse and yield false — clap's
+        // inferred SetTrue action rejected the value, making the no-gossip
+        // direct-to-leader mode (main.rs forward_bodies gate) unreachable.
+        let cli = Cli::try_parse_from([
+            "torus-node",
+            "--keystore",
+            "k.keystore",
+            "--native-gossip=false",
+        ])
+        .expect("--native-gossip=false must parse");
+        assert!(!cli.native_gossip);
+
+        let cli =
+            Cli::try_parse_from(["torus-node", "--keystore", "k.keystore", "--native-gossip=true"])
+                .unwrap();
+        assert!(cli.native_gossip);
+
+        // Default stays ON with the flag absent.
+        let cli = Cli::try_parse_from(["torus-node", "--keystore", "k.keystore"]).unwrap();
+        assert!(cli.native_gossip);
+
+        // Bare `--native-gossip` (no value) keeps working as "true".
+        let cli =
+            Cli::try_parse_from(["torus-node", "--keystore", "k.keystore", "--native-gossip"])
+                .unwrap();
+        assert!(cli.native_gossip);
+    }
+
+    #[test]
+    fn exec_trust_cache_flag_can_be_disabled() {
+        // Same SetTrue defect as --native-gossip: "=false" was rejected.
+        let cli = Cli::try_parse_from([
+            "torus-node",
+            "--keystore",
+            "k.keystore",
+            "--exec-trust-cache=false",
+        ])
+        .expect("--exec-trust-cache=false must parse");
+        assert!(!cli.exec_trust_cache);
+
+        let cli = Cli::try_parse_from(["torus-node", "--keystore", "k.keystore"]).unwrap();
+        assert!(cli.exec_trust_cache);
     }
 
     #[test]
