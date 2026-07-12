@@ -230,10 +230,10 @@ pub fn verify_shard(
 /// Encode a body into `n` shards (first `k` systematic) and commit the erasure
 /// root. Deterministic in `(body, k, n)`.
 ///
-/// TODO(toolchain): confirm the `reed-solomon-erasure` v6 `encode(&mut [Vec<u8>])`
-/// signature and that systematic shards are shards `0..k` (they are for this
-/// crate's `galois_8` backend). If a future bump changes the shard container,
-/// adjust here only — callers use [`EncodedBody`].
+/// Confirmed against reed-solomon-erasure v6 (`galois_8` backend, S466): the
+/// `encode(&mut [Vec<u8>])` signature holds and systematic shards are `0..k`.
+/// If a future bump changes the shard container, adjust here only — callers use
+/// [`EncodedBody`].
 pub fn encode(body: &[u8], params: ErasureParams) -> Result<EncodedBody, ErasureError> {
     params.validate()?;
     let k = params.k;
@@ -274,9 +274,9 @@ pub fn encode(body: &[u8], params: ErasureParams) -> Result<EncodedBody, Erasure
 /// SECURITY: pass only shards that already passed [`verify_shard`]. This function
 /// trusts its inputs; the body-hash backstop at the call site is the final gate.
 ///
-/// TODO(toolchain): confirm v6 `reconstruct(&mut [Option<Vec<u8>>])` — `Option<Vec<u8>>`
-/// implements `ReconstructShard`, so a missing shard is `None` and present ones
-/// carry their bytes.
+/// Confirmed against reed-solomon-erasure v6 (S466): `Option<Vec<u8>>` implements
+/// `ReconstructShard`, so a missing shard is `None` and present ones carry their
+/// bytes; `reconstruct` rebuilds the data shards in place.
 pub fn reconstruct(
     mut shards: Vec<Option<Vec<u8>>>,
     params: ErasureParams,
