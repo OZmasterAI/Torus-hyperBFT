@@ -38,6 +38,15 @@ fi
 CT=${CARGO_TARGET_DIR:-$REPO/target}
 if [ "$CT" != "$REPO/target" ]; then
     mkdir -p "$REPO/target/release"
+    # NEVER overwrite a binary some process is executing — on 18c the LIVE
+    # validator runs <repo>/target/release/torus-node from its own checkout
+    # (S458 near-miss, saved by ETXTBSY). Run this script from an isolated
+    # worktree instead.
+    if fuser -s "$REPO/target/release/torus-node" 2>/dev/null; then
+        echo "FATAL: $REPO/target/release/torus-node is being EXECUTED (live validator?)." >&2
+        echo "Run from an isolated worktree, not the live checkout." >&2
+        exit 1
+    fi
     cp "$CT/release/torus-node" "$CT/release/bench-throughput" "$REPO/target/release/"
 fi
 for f in torus-node bench-throughput; do
@@ -87,6 +96,10 @@ def read(path):
             parts = line.split()
             if len(parts) == 2:
                 name = parts[0].split("{")[0]
+                # prometheus_client exports Counters with a `_total` suffix —
+                # fold it back so COUNTERS names match the registration names.
+                if name.endswith("_total"):
+                    name = name[: -len("_total")]
                 try:
                     vals[name] = vals.get(name, 0.0) + float(parts[1])
                 except ValueError:

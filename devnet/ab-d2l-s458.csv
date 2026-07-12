@@ -1,0 +1,9 @@
+trial,gossip,phase,rate,bs,orders_s,block_ms_fit,wedged,gsp_published,gsp_drop_full,gsp_drop_over,gsp_received,fwd_admits,direct_send_fail,da_pulls,da_recovered,da_pull_fail,da_handoffs,da_timeouts,v0_actions_processed,v0_blocks,mempool_native_after
+1,true,clean,3,400,23217,71.9,0,3041,0,0,9123,3041,0,1,1,0,1,0,3041,1166,0
+2,false,clean,3,400,23223,109.4,0,0,0,0,0,3041,0,0,0,0,0,0,3041,865,0
+3,true,clean,3,400,23225,71.8,0,3041,0,0,9123,3041,0,0,0,0,1,0,3041,1199,0
+4,false,clean,3,400,23218,78.5,0,0,0,0,0,3041,0,0,0,0,1,0,3041,1131,0
+5,true,flood,15,400,72643,314.5,0,12763,0,0,38289,14928,0,2,2,0,3,0,9510,568,0
+6,false,flood,15,400,89134,256.1,0,0,0,0,0,14947,0,43,43,0,55,0,11691,583,0
+7,true,flood,15,400,85261,316.6,0,12136,0,0,36408,14952,0,2,2,0,3,0,11141,711,0
+8,false,flood,15,400,97895,298.2,0,0,0,0,0,14752,0,43,43,0,53,0,12784,562,0
