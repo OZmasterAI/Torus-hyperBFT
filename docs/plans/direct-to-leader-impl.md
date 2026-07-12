@@ -10,10 +10,34 @@ Step 2 (leader forwarding) eliminates gossip amplification for order intake.
 - **Phasing**: Incremental (Step 1 → benchmark → Step 2)
 
 ## Success Criteria
-- Step 1: Chain does NOT stall under 3000+/sec native action load
-- Step 1: Benchmark measures >1000 included/sec sustained
-- Step 2: Benchmark measures >10,000 included/sec sustained
-- All existing tests pass (83 tests across torus-network, torus-mempool, torus-consensus)
+
+> **Baseline established S456** (val2 pre-fix, session-sig, shared 3-val testnet on B). The old
+> ">1000 / >10,000 included/sec" targets below were stale — the chain already commits far more.
+> Two honest reference numbers replace them:
+> - **Sustainable-today (0 drops, healthy blocks):** ~71–80k **committed** orders/s — val2 paced
+>   b=100 conc ramp, `send-queue-full` drops = 0 every cell, blk/s ≥ floor. *This is the floor to lift.*
+> - **Peak-committed under flood:** ~140–150k committed orders/s — but with **~44% native-action
+>   gossip drops** (`torus_native_gossip_dropped_full` / `_published_actions`) and blk/s degraded to
+>   2.6–3.6 (from ~15 healthy). *The chain ALREADY commits this; the job is to make it clean.*
+>
+> **Confirmed bottleneck (S456):** batch-dominated native-action **gossip** send-queue overflow on
+> the ingest node (bigger batch → bigger per-action bytes → the byte-bounded libp2p publish queue
+> overflows; concurrency is NOT the driver). Step 2 (unicast-to-leader) bypasses that gossip fan-out
+> and is the **primary lever** — not Step 1. Body-path zstd (`/torus/*/2.0`) is already on and does
+> NOT cover the gossip path (removed s364, DoS), so it does not address these drops.
+>
+> **Measure with the val2 OFAT ramp (`testnet/bench-ofat-ramp-s447.sh`), node-side `committed`
+> (`node_actions_s × batch`) — NOT the tool's submission-derived `orders_s`, which lies under load.**
+
+- **Step 1 (full blocks):** chain does NOT stall under sustained flood; no compact-block
+  reconstruction stalls; committed orders/s and blk/s **no worse** than the B baseline (full blocks
+  add body bytes — must not regress block health; relies on the already-negotiated `/2.0` body zstd).
+- **Step 2 (direct-to-leader):** native-action gossip drop rate (`dropped_full / published`) falls
+  from ~44% toward ~0; sustainable-clean throughput rises from ~80k toward the ~140k the chain
+  already commits under flood; blk/s holds ≥ floor at that load.
+- **Overall win:** hold **≥140k committed orders/s at ~0 drops** with **healthy block times
+  (~65–120ms / blk/s ≥ floor)**.
+- All existing tests pass (83 tests across torus-network, torus-mempool, torus-consensus).
 
 ---
 
@@ -150,9 +174,13 @@ Step 2 (leader forwarding) eliminates gossip amplification for order intake.
 
 ## Verification (end-to-end)
 1. `cargo test -p torus-consensus -p torus-network -p torus-mempool` — all pass
-2. Devnet benchmark: `bench-throughput consensus --duration 60 --senders 100`
-3. Step 1 target: >1000 included/sec, chain stable
-4. Step 2 target: >10,000 included/sec, chain stable
+2. Re-run the **identical val2 OFAT baseline** (`bench-ofat-ramp-s447.sh`, b=100 + b=400 conc ramps,
+   session-sig) so before/after is same-rig, same-harness. Read node-side `committed` + `blk/s`.
+3. Step 1 acceptance: no reconstruction stalls under flood; committed o/s + blk/s **≥ B baseline**
+   (no regression from the extra body bytes).
+4. Step 2 acceptance: `torus_native_gossip_dropped_full` drop rate → ~0; sustainable-clean throughput
+   climbs from ~80k toward ~140k; blk/s ≥ floor.
+5. Overall: ≥140k committed orders/s at ~0 drops, block times ~65–120ms.
 
 ## Rollback
 - CompactBlock deserialization fallback preserved in validate_block and on_committed_block

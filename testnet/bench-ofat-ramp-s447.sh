@@ -29,9 +29,18 @@ DUR="${DUR:-15}"
 COOLDOWN="${COOLDOWN:-6}"
 FLOOR_BPS="${FLOOR_BPS:-3}"
 SIGN_LIST="${SIGN_LIST:-eip712 session}"
+# health-guard behaviour: on an unhealthy chain, SKIP the cell + cooldown + continue (record
+# it to skipped.log, don't run it), instead of aborting the whole sweep. Give up only after
+# MAX_UNHEALTHY consecutive skips (chain truly wedged). RECOVER_COOLDOWN = extra settle time.
+MAX_UNHEALTHY="${MAX_UNHEALTHY:-3}"
+RECOVER_COOLDOWN="${RECOVER_COOLDOWN:-30}"
 
 # ---- baseline (held constant while sweeping a given axis) ----
-B_MK="${B_MK:-1}"; B_BATCH="${B_BATCH:-400}"; B_SEND="${B_SEND:-100}"; B_CONC="${B_CONC:-512}"
+# NOTE: B_CONC default is 16 (was 512). At the default b=400 on a backpressure-bound chain,
+# conc=512 (or even 128) drives block-rate to ~0 -> the baseline cell self-collapses and the
+# whole sweep floor-aborts before it can walk any axis (val2 s454/s456 baseline). 16 starts
+# healthy; sweep conc UP via CONC_LIST to find the knee. Override B_CONC to raise it.
+B_MK="${B_MK:-1}"; B_BATCH="${B_BATCH:-400}"; B_SEND="${B_SEND:-100}"; B_CONC="${B_CONC:-16}"
 
 # ---- per-axis sweep values ----
 SENDERS_LIST="${SENDERS_LIST:-1 10 25 50 100 200 500 1000 2000 5000}"
@@ -131,17 +140,29 @@ echo "baseline: mode=stream m=$B_MK b=$B_BATCH s=$B_SEND conc=$B_CONC submit=$SU
 echo "out=$OUTDIR  floor=${FLOOR_BPS}blk/s  baseline block rate: $(blkrate 2) blk/s"
 
 # ---------------- run ----------------
-i=0; ran=0
+i=0; ran=0; unhealthy_streak=0
 for spec in "${CELLS[@]}"; do
   i=$((i+1))
   IFS='|' read -r axis mode sg s m b c r <<< "$spec"
   key="$mode,$sg,$s,$m,$b,$SUBMIT,$c,$r"
   if cell_done "$key"; then echo "[$i/$total] skip done  ($axis) $key"; continue; fi
+  # health guard: don't pile load on a struggling chain. SKIP + cooldown + continue so the
+  # ramp can walk past a transient collapse and show recovery (val2's ask). Skipped cells go
+  # to skipped.log (NOT the resumable CSV) so a rerun still retries them. Abort only if the
+  # chain stays unhealthy MAX_UNHEALTHY cells in a row (genuinely wedged).
   if ! healthy; then
     br=$(blkrate 2)
-    echo "!! ABORT: block-rate ${br}/s < floor ${FLOOR_BPS} before cell $i" | tee "$OUTDIR/ABORTED"
-    break
+    unhealthy_streak=$((unhealthy_streak+1))
+    echo "[$i/$total] UNHEALTHY blk ${br}/s < floor ${FLOOR_BPS} — SKIP ($axis) $key [streak $unhealthy_streak/$MAX_UNHEALTHY], cooldown ${RECOVER_COOLDOWN}s"
+    echo "$i,$axis,$key,blk=$br" >> "$OUTDIR/skipped.log"
+    if [ "$unhealthy_streak" -ge "$MAX_UNHEALTHY" ]; then
+      echo "!! ABORT: chain unhealthy ${MAX_UNHEALTHY} cells in a row (wedged) — last blk ${br}/s" | tee "$OUTDIR/ABORTED"
+      break
+    fi
+    sleep "$RECOVER_COOLDOWN"
+    continue
   fi
+  unhealthy_streak=0
   # pre-sign ammo sizing: paced -> dur*rate/submit+15; burst -> fixed cap
   presign_arg=0
   if [ "$mode" = "presign" ]; then
