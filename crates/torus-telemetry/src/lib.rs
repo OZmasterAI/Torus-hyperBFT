@@ -209,6 +209,12 @@ pub struct Metrics {
     pub rocksdb_pending_compaction_bytes: Family<Vec<(String, String)>, Gauge>,
     /// Shared block-cache usage (DB-wide).
     pub rocksdb_block_cache_bytes: Gauge,
+    /// Cumulative pre-compression vs on-wire bytes per `/2.0` zstd wire path
+    /// (labels: `path`, `kind`={pre,wire}). Refreshed from
+    /// `torus_network::codec::wire_compression_stats`; ratio = pre/wire in PromQL.
+    /// Proves the shipped body zstd (`/torus/{direct,block-data,native-da}/2.0`)
+    /// is live on-wire and by how much (T3.2).
+    pub wire_compression_bytes: Family<Vec<(String, String)>, Gauge>,
 }
 
 impl Metrics {
@@ -747,6 +753,13 @@ impl Metrics {
             rocksdb_block_cache_bytes.clone(),
         );
 
+        let wire_compression_bytes = Family::<Vec<(String, String)>, Gauge>::default();
+        registry.register(
+            "torus_wire_compression_bytes",
+            "Cumulative bytes per /2.0 zstd wire path (labels: path, kind=pre|wire); ratio=pre/wire",
+            wire_compression_bytes.clone(),
+        );
+
         Self {
             registry,
             blocks_committed,
@@ -825,6 +838,7 @@ impl Metrics {
             rocksdb_memtable_bytes,
             rocksdb_pending_compaction_bytes,
             rocksdb_block_cache_bytes,
+            wire_compression_bytes,
         }
     }
 
@@ -976,6 +990,28 @@ mod tests {
         ] {
             assert!(text.contains(name), "{name} not registered:\n{text}");
         }
+    }
+
+    #[test]
+    fn wire_compression_metrics_register() {
+        let m = Metrics::new();
+        let pre = vec![
+            ("path".to_string(), "native-da".to_string()),
+            ("kind".to_string(), "pre".to_string()),
+        ];
+        let wire = vec![
+            ("path".to_string(), "native-da".to_string()),
+            ("kind".to_string(), "wire".to_string()),
+        ];
+        m.wire_compression_bytes.get_or_create(&pre).set(9400);
+        m.wire_compression_bytes.get_or_create(&wire).set(1000);
+        let text = m.encode();
+        assert!(
+            text.contains("torus_wire_compression_bytes"),
+            "torus_wire_compression_bytes not registered:\n{text}"
+        );
+        assert!(text.contains("kind=\"pre\""), "pre-bytes series missing:\n{text}");
+        assert!(text.contains("kind=\"wire\""), "wire-bytes series missing:\n{text}");
     }
 
     /// Mesh watchdog (S405): the consensus-mesh gauges and watchdog-kick counter

@@ -738,6 +738,24 @@ pub async fn run_swarm_with_config(
             _ = cleanup_interval.tick() => {
                 peer_scoring.cleanup_stale(stale_age);
                 consensus_rate_limiter.cleanup_stale();
+                // Publish the /2.0 zstd on-wire compression tallies (T3.2 proof):
+                // per-path cumulative (pre, wire) bytes -> ratio = pre/wire in PromQL.
+                if let Some(ref m) = shared.metrics {
+                    for (path, pre, wire) in crate::codec::wire_compression_stats() {
+                        m.wire_compression_bytes
+                            .get_or_create(&vec![
+                                ("path".into(), path.to_string()),
+                                ("kind".into(), "pre".into()),
+                            ])
+                            .set(pre as i64);
+                        m.wire_compression_bytes
+                            .get_or_create(&vec![
+                                ("path".into(), path.to_string()),
+                                ("kind".into(), "wire".into()),
+                            ])
+                            .set(wire as i64);
+                    }
+                }
                 continue;
             }
             _ = mesh_interval.tick() => {
