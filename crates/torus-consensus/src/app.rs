@@ -1255,6 +1255,13 @@ pub struct TorusApp {
     /// by-hash on a reconstruction miss. Injected at startup over `/torus/native-da/1.0`;
     /// `None` in consensus-only tests (no fetch fires).
     da_fetcher: Option<Arc<dyn NativeDaFetcher>>,
+    /// T8-integration increment 2: OPTIONAL erasure-shard recovery transport. When
+    /// present, the spawned `DaRecoveryWorker` runs a distinct-source shard gather as
+    /// an additive pre-step BEFORE the whole-body pull. `None` in consensus-only tests
+    /// and until increment 3 wires the real network impl — with `None` the worker's
+    /// recovery behavior is byte-identical to pre-increment-2 (whole-body pull only).
+    /// Must be set BEFORE `set_native_da_fetcher` so the worker captures it at spawn.
+    shard_fetcher: Option<Arc<dyn ShardFetcher>>,
     /// BS-4a: off-thread recovery of push-missed native-action bodies. The hot
     /// validate path hands true push misses here (non-blocking) and fails the
     /// view with MissingData; the worker pulls with the roomier ~1 s WORKER
@@ -1304,6 +1311,36 @@ pub trait NativeDaFetcher: Send + Sync {
     fn fetch(&self, hashes: Vec<[u8; 32]>);
     /// Drain native-action bodies received so far. Non-blocking.
     fn drain(&self) -> Vec<Vec<u8>>;
+}
+
+/// Opaque peer-identity bytes tagging a gathered shard's SOURCE. The distinct-
+/// source rule (k shards from k DIFFERENT peers) in
+/// [`shard_recovery::try_reconstruct_from_shards`] is enforced over this value, so
+/// two shards sharing a `ShardSource` count as ONE source. The consensus layer
+/// treats it as opaque; the network layer (increment 3) fills it with a real peer id.
+pub type ShardSource = Vec<u8>;
+
+/// Erasure-shard recovery transport (T8-integration increment 2).
+///
+/// The additive analog to [`NativeDaFetcher`], but instead of pulling a WHOLE body
+/// from one peer it gathers erasure SHARDS spread across DISTINCT peers — killing
+/// the s338 single-source serve hotspot. Injected from torus-node over the network
+/// protocol (increment 3); `None` in consensus-only tests (no shard fetch fires).
+///
+/// `fetch_shards` is **non-blocking** (it only enqueues per-body shard requests to
+/// the network thread). `drain_shards` returns the shards that have arrived since
+/// the last call, each tagged with the source peer that served it and the body
+/// index it belongs to (as a [`shard_recovery::GatheredShard`]). Target selection
+/// (which peers serve which index) is the implementation's concern, keeping the
+/// consensus layer free of peer identity. `want` is how many DISTINCT shards to
+/// request per body.
+pub trait ShardFetcher: Send + Sync {
+    /// Request up to `want` distinct-source shards for `body_hash` from peers.
+    /// Non-blocking.
+    fn fetch_shards(&self, body_hash: [u8; 32], want: u16);
+    /// Drain shards received so far, each tagged with its source peer and index.
+    /// Non-blocking.
+    fn drain_shards(&self) -> Vec<crate::shard_recovery::GatheredShard<ShardSource>>;
 }
 
 /// CONSENSUS-CRITICAL version flag: emit hash-only `CompactBlock` proposals
@@ -1467,6 +1504,108 @@ fn recover_bodies_bounded(
 const WORKER_PULL_RETRIES: usize = 50;
 const WORKER_PULL_DELAY: std::time::Duration = std::time::Duration::from_millis(20);
 
+/// T8-integration increment 2: how many DISTINCT shards to request per missing
+/// body in the erasure-shard recovery pre-step. The network layer (increment 3)
+/// clamps this to the number of connected peers, so requesting more than are
+/// reachable is harmless. For the live n=4 / f=1 set we run k=2, so 8 is ample
+/// headroom (any 2 of up to 8 distinct sources reconstruct). Precise (k,n)-aware
+/// fanout (request exactly enough to hit k distinct with margin) is a tuning
+/// follow-up; a flat generous value is correct-by-construction here.
+const SHARD_RECOVERY_FANOUT: u16 = 8;
+
+/// T8-integration increment 2: the shard pre-step gets ~HALF the worker budget; the
+/// whole-body fallback keeps its FULL `WORKER_PULL_RETRIES` budget so no fallback
+/// latency is lost. This means total WORST-CASE recovery latency grows (shard budget
+/// + whole-body budget when shards never arrive), but the worker runs OFF the
+/// consensus thread, so it costs ZERO hot-path latency — only the off-thread
+/// re-propose window widens, and the whole-body path stays exactly as roomy as before.
+const SHARD_RECOVERY_RETRIES: usize = WORKER_PULL_RETRIES / 2;
+
+/// T8-integration increment 2: erasure-shard recovery as an ADDITIVE pre-step to
+/// the whole-body pull. For each missing body it fires a distinct-source shard
+/// gather, then repeatedly drains arrivals into a growing pool and tries to
+/// reconstruct+verify+absorb each still-missing body via
+/// [`shard_recovery::try_reconstruct_from_shards`] (which enforces verify, one
+/// consistent set, k distinct sources, and the body-hash backstop internally).
+///
+/// It NEVER wedges: it returns the subset of `missing` that is STILL missing after
+/// its (halved) budget, so the caller falls through to the UNCHANGED whole-body
+/// pull for those — the whole-body path is byte-identical whether or not this ran
+/// (native-da-hash-only-push.md hard guardrail). A body recovered here is absorbed
+/// into the durable DA store exactly like a pulled whole body (`mirror_native_to_da`,
+/// hash recomputed), so a peer cannot place a body under a hash it does not own.
+///
+/// Unlike [`recover_bodies_bounded`], shard arrivals land in the SHARD fetcher's own
+/// inbound (not the DA-store arrival notifier), so this uses a plain deadline-bounded
+/// `sleep` between drains rather than `wait_for_arrival`.
+#[allow(clippy::too_many_arguments)]
+fn recover_bodies_via_shards(
+    mempool: &Mempool,
+    shard_fetcher: &dyn ShardFetcher,
+    missing: &[torus_types::B256],
+    want: u16,
+    retries: usize,
+    delay: std::time::Duration,
+    metrics: Option<&torus_telemetry::Metrics>,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Vec<torus_types::B256> {
+    if missing.is_empty() {
+        return Vec::new();
+    }
+
+    // Fire one distinct-source shard gather per missing body (non-blocking).
+    for h in missing {
+        shard_fetcher.fetch_shards(h.0, want);
+    }
+
+    // Accumulate arrivals across drains: a body's k shards may dribble in across
+    // several ticks from different peers, so the pool GROWS and is re-tried each
+    // tick until it holds a reconstructable distinct-source set (or the budget ends).
+    let mut pool: Vec<crate::shard_recovery::GatheredShard<ShardSource>> = Vec::new();
+    let mut still = missing.to_vec();
+
+    let deadline = std::time::Instant::now() + delay * retries as u32;
+    loop {
+        // Worker shutdown: abandon the in-flight budget the moment the caller
+        // cancels — a dying node has no use for the bodies (the re-proposed view
+        // re-fires). Returns whatever is STILL missing so the caller's fallback
+        // decision is unchanged. The free-fn tests pass None (behavior bit-identical).
+        if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
+            return still;
+        }
+        pool.extend(shard_fetcher.drain_shards());
+        still.retain(|h| {
+            match crate::shard_recovery::try_reconstruct_from_shards(&h.0, &pool) {
+                Some(body) => {
+                    if let Ok(action) =
+                        bincode::deserialize::<torus_types::SignedNativeAction>(&body)
+                    {
+                        if mempool.mirror_native_to_da(&[action]).is_ok() {
+                            if let Some(m) = metrics {
+                                m.native_da_shard_recovered.inc();
+                            }
+                            return false; // recovered → drop from still-missing
+                        }
+                    }
+                    true // reconstructed but decode/absorb failed → keep for fallback
+                }
+                None => true, // not yet reconstructable → keep trying / fall back
+            }
+        });
+        if still.is_empty() {
+            break;
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        // Plain sleep: shard arrivals are in the fetcher's own inbound, NOT the
+        // DA-store arrival notifier, so `wait_for_arrival` would not wake on them.
+        std::thread::sleep(std::cmp::min(delay, deadline - now));
+    }
+    still
+}
+
 /// BS-4a: owns the off-thread recovery of push-missed native-action bodies.
 /// The consensus thread hands missing hashes here and votes MissingData
 /// immediately; this thread runs the (event-driven, deadline-bounded) pull
@@ -1500,6 +1639,7 @@ impl DaRecoveryWorker {
     fn spawn(
         mempool: Arc<Mempool>,
         fetcher: Arc<dyn NativeDaFetcher>,
+        shard_fetcher: Option<Arc<dyn ShardFetcher>>,
         metrics: Option<Arc<torus_telemetry::Metrics>>,
     ) -> Self {
         let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<torus_types::B256>>(WORKER_QUEUE_CAP);
@@ -1545,20 +1685,52 @@ impl DaRecoveryWorker {
                     if still_missing.is_empty() {
                         continue;
                     }
-                    // A recoverable hash merged with never-arriving (dead) hashes is
-                    // still recovered mid-loop: absorb_fetched_bodies stores each body
-                    // the moment it arrives, even though the batch's overall return is
-                    // false when the dead hashes never land. `Some(&worker_shutdown)`
-                    // lets Drop abandon the in-flight budget at the next slice (Fix C).
-                    let recovered = recover_bodies_bounded(
-                        &mempool,
-                        fetcher.as_ref(),
-                        &still_missing,
-                        WORKER_PULL_RETRIES,
-                        WORKER_PULL_DELAY,
-                        metrics.as_deref(),
-                        Some(&worker_shutdown),
-                    );
+                    // T8-integration increment 2: ADDITIVE erasure-shard pre-step. When a
+                    // shard fetcher is wired, first try to reconstruct bodies from k
+                    // distinct-source shards (killing the s338 single-source pull hotspot),
+                    // then fall through to the UNCHANGED whole-body pull for whatever is
+                    // still missing. When no shard fetcher is wired we run the EXACT original
+                    // call, so no-shard behavior is byte-identical to pre-increment-2.
+                    let recovered = if let Some(sf) = shard_fetcher.as_ref() {
+                        let after_shards = recover_bodies_via_shards(
+                            &mempool,
+                            sf.as_ref(),
+                            &still_missing,
+                            SHARD_RECOVERY_FANOUT,
+                            SHARD_RECOVERY_RETRIES,
+                            WORKER_PULL_DELAY,
+                            metrics.as_deref(),
+                            Some(&worker_shutdown),
+                        );
+                        // Shards recovered everything → skip the whole-body fallback entirely.
+                        if after_shards.is_empty() {
+                            continue;
+                        }
+                        recover_bodies_bounded(
+                            &mempool,
+                            fetcher.as_ref(),
+                            &after_shards,
+                            WORKER_PULL_RETRIES,
+                            WORKER_PULL_DELAY,
+                            metrics.as_deref(),
+                            Some(&worker_shutdown),
+                        )
+                    } else {
+                        // A recoverable hash merged with never-arriving (dead) hashes is
+                        // still recovered mid-loop: absorb_fetched_bodies stores each body
+                        // the moment it arrives, even though the batch's overall return is
+                        // false when the dead hashes never land. `Some(&worker_shutdown)`
+                        // lets Drop abandon the in-flight budget at the next slice (Fix C).
+                        recover_bodies_bounded(
+                            &mempool,
+                            fetcher.as_ref(),
+                            &still_missing,
+                            WORKER_PULL_RETRIES,
+                            WORKER_PULL_DELAY,
+                            metrics.as_deref(),
+                            Some(&worker_shutdown),
+                        )
+                    };
                     // A cancelled in-flight batch (shutdown) is not a budget timeout —
                     // only count as a timeout when the budget genuinely expired without
                     // recovering every body and we are NOT shutting down.
@@ -1770,6 +1942,7 @@ impl TorusApp {
             leader_state,
             pre_proposal_tx: None,
             da_fetcher: None,
+            shard_fetcher: None,
             da_recovery: None,
             exec_next_height: None,
             deferred_exec: std::collections::BTreeMap::new(),
@@ -1900,10 +2073,21 @@ impl TorusApp {
             self.da_recovery = Some(DaRecoveryWorker::spawn(
                 mempool.clone(),
                 fetcher.clone(),
+                self.shard_fetcher.clone(),
                 self.metrics.clone(),
             ));
         }
         self.da_fetcher = Some(fetcher);
+    }
+
+    /// T8-integration increment 2: attach the OPTIONAL erasure-shard recovery
+    /// transport. The spawned `DaRecoveryWorker` runs a distinct-source shard gather
+    /// as an additive pre-step before the whole-body pull. Call this BEFORE
+    /// `set_native_da_fetcher` so the worker captures the shard fetcher at spawn time
+    /// (the worker is spawned inside `set_native_da_fetcher` and clones the field as
+    /// it stands then). Increment 3 wires the real network impl and enforces the order.
+    pub fn set_shard_fetcher(&mut self, f: Arc<dyn ShardFetcher>) {
+        self.shard_fetcher = Some(f);
     }
 
     /// Create a stub `TorusApp` without a database (for consensus-only tests).
@@ -5883,7 +6067,7 @@ mod crash_recovery_tests {
         });
 
         // No TorusApp: the worker is constructed directly from the Arcs it owns.
-        let worker = DaRecoveryWorker::spawn(mempool.clone(), fetcher, None);
+        let worker = DaRecoveryWorker::spawn(mempool.clone(), fetcher, None, None);
         assert!(
             mempool.get_native_da(&hash).is_none(),
             "body absent before the worker pull"
@@ -5901,6 +6085,130 @@ mod crash_recovery_tests {
 
         // Exercise Drop-join on a live worker thread — a hang here IS the defect.
         drop(worker);
+    }
+
+    /// T8-integration increment 2 test double: a `ShardFetcher` pre-seeded with a
+    /// pool of gathered shards. `fetch_shards` is a no-op (the shards are already
+    /// "arrived"); `drain_shards` returns AND CLEARS the pool, matching real drain
+    /// semantics (each shard delivered once). An empty pool models "no shards served".
+    struct MockShardFetcher {
+        pool: std::sync::Mutex<Vec<crate::shard_recovery::GatheredShard<ShardSource>>>,
+    }
+    impl ShardFetcher for MockShardFetcher {
+        fn fetch_shards(&self, _body_hash: [u8; 32], _want: u16) {}
+        fn drain_shards(&self) -> Vec<crate::shard_recovery::GatheredShard<ShardSource>> {
+            std::mem::take(&mut *self.pool.lock().unwrap())
+        }
+    }
+
+    /// Encode `action`'s body under `(k,n)` and return `(body_hash, all n StoredShards)`.
+    fn shards_for_action(
+        action: &SignedNativeAction,
+        k: usize,
+        n: usize,
+    ) -> ([u8; 32], Vec<torus_state::StoredShard>) {
+        let body = bincode::serialize(action).expect("serialize body");
+        let enc = torus_state::erasure::encode(&body, torus_state::ErasureParams::new(k, n))
+            .expect("encode");
+        let shards = (0..n)
+            .map(|i| torus_state::StoredShard::from_encoded_body(&enc, i))
+            .collect();
+        (torus_types::compute_action_hash(action).0, shards)
+    }
+
+    /// T8-int2 (RED first — `recover_bodies_via_shards` does not exist on base): the
+    /// shard pre-step gathers k=2 shards from DISTINCT peers, reconstructs+verifies,
+    /// and ABSORBS the body into the durable DA store — returning EMPTY (nothing left
+    /// for the whole-body fallback).
+    #[test]
+    fn recover_bodies_via_shards_absorbs_body() {
+        let (_config, state_db) = make_test_config_and_db();
+        let mempool = Arc::new(torus_mempool::Mempool::new(
+            state_db.clone(),
+            torus_mempool::MempoolConfig::default(),
+        ));
+
+        let action = sign_claim_rewards(101);
+        let hash = torus_types::compute_action_hash(&action);
+        // (k=2, n=3): 3 shards, any 2 distinct-source ones reconstruct.
+        let (_h, shards) = shards_for_action(&action, 2, 3);
+        // Two DISTINCT peers, distinct indices (0 from peerA, 2 from peerB).
+        let mock = MockShardFetcher {
+            pool: std::sync::Mutex::new(vec![
+                crate::shard_recovery::GatheredShard {
+                    source: b"peerA".to_vec(),
+                    shard: shards[0].clone(),
+                },
+                crate::shard_recovery::GatheredShard {
+                    source: b"peerB".to_vec(),
+                    shard: shards[2].clone(),
+                },
+            ]),
+        };
+
+        assert!(
+            mempool.get_native_da(&hash).is_none(),
+            "precondition: body absent before shard recovery"
+        );
+
+        let still = recover_bodies_via_shards(
+            &mempool,
+            &mock,
+            &[hash],
+            8,
+            4,
+            std::time::Duration::from_millis(5),
+            None,
+            None,
+        );
+
+        assert!(
+            still.is_empty(),
+            "all bodies recovered from shards → nothing left for whole-body fallback"
+        );
+        assert!(
+            mempool.get_native_da(&hash).is_some(),
+            "reconstructed body must be absorbed into the durable DA store"
+        );
+    }
+
+    /// T8-int2 (RED first): with NO shards served, the pre-step recovers nothing and
+    /// returns the hash as STILL missing — a clean fall-through to the UNCHANGED
+    /// whole-body pull (the full fallback wiring is exercised end-to-end in T9).
+    #[test]
+    fn recover_bodies_via_shards_returns_still_missing_when_no_shards() {
+        let (_config, state_db) = make_test_config_and_db();
+        let mempool = Arc::new(torus_mempool::Mempool::new(
+            state_db.clone(),
+            torus_mempool::MempoolConfig::default(),
+        ));
+
+        let action = sign_claim_rewards(102);
+        let hash = torus_types::compute_action_hash(&action);
+        let mock = MockShardFetcher {
+            pool: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let still = recover_bodies_via_shards(
+            &mempool,
+            &mock,
+            &[hash],
+            8,
+            4,
+            std::time::Duration::from_millis(5),
+            None,
+            None,
+        );
+
+        assert_eq!(
+            still,
+            vec![hash],
+            "no shards → body stays missing for the whole-body fallback"
+        );
+        assert!(
+            mempool.get_native_da(&hash).is_none(),
+            "no shards → nothing absorbed"
+        );
     }
 
     /// BS-4a: dropping the worker with an in-flight batch AND a queued backlog must
@@ -5924,7 +6232,7 @@ mod crash_recovery_tests {
 
         // NeverFetcher delivers nothing, so the in-flight batch would burn the full
         // ~1s budget if it were not cancellable — the regression this test guards.
-        let worker = DaRecoveryWorker::spawn(mempool.clone(), Arc::new(NeverFetcher), None);
+        let worker = DaRecoveryWorker::spawn(mempool.clone(), Arc::new(NeverFetcher), None, None);
 
         // 9 distinct single-hash batches: never-arriving hashes, so the worker's
         // store-check dedup can't drop them. First is taken in-flight; the rest are
