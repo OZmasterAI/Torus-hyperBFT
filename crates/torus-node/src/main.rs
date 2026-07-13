@@ -311,6 +311,8 @@ fn default_chain_config() -> ChainConfig {
         treasury_address: Address::ZERO,
         dev_pool_address: Address::ZERO,
         timeout_base_ms: 500,
+        backoff_factor: 2,
+        backoff_cap: 8,
         reputation_leader_selection: false,
         exec_trust_cache: false,
     }
@@ -719,6 +721,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         .chain_id(ChainID::new(chain_config.chain_id))
         .epoch_length(EpochLength::new(chain_config.epoch_length as u32))
         .max_view_time(Duration::from_millis(chain_config.timeout_base_ms))
+        .backoff_factor(chain_config.backoff_factor)
+        .backoff_cap(chain_config.backoff_cap)
         .progress_msg_buffer_capacity(BufferSize::new(1024))
         .block_sync_request_limit(128)
         .block_sync_server_advertise_time(Duration::new(10, 0))

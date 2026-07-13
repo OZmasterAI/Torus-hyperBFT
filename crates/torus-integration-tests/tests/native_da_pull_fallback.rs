@@ -70,6 +70,8 @@ fn test_config() -> ChainConfig {
         treasury_address: Address::ZERO,
         dev_pool_address: Address::ZERO,
         timeout_base_ms: 500,
+        backoff_factor: 2,
+        backoff_cap: 8,
         reputation_leader_selection: false,
         exec_trust_cache: false,
     }

@@ -623,6 +623,17 @@ pub(crate) struct PacemakerConfiguration {
 
     /// How much time can elapse in a view before it times out.
     pub(crate) max_view_time: Duration,
+
+    /// Base of the multiplicative view-timeout backoff: while views outrun the
+    /// QC frontier (a stall), each view's timeout is scaled by
+    /// `backoff_factor^min(stall_depth, backoff_cap)`. Consensus-liveness
+    /// critical — must be identical on every replica of a chain (genesis-sourced).
+    pub(crate) backoff_factor: u32,
+
+    /// Exponent cap of the view-timeout backoff. `0` is the runtime kill
+    /// switch: the multiplier is then constantly 1 and the schedule is exactly
+    /// the pre-backoff one. Fleet-wide (genesis-sourced), like `backoff_factor`.
+    pub(crate) backoff_cap: u32,
 }
 
 /// In-memory state of a [`Pacemaker`].
@@ -1172,6 +1183,8 @@ fn test_pacemaker(init_view: u64) -> (Pacemaker<NullNetwork>, ValidatorSetState)
         keypair: Keypair::new(keypair.clone()),
         epoch_length: EpochLength::new(100_000),
         max_view_time: Duration::from_millis(500),
+        backoff_factor: 2,
+        backoff_cap: 8,
     };
     let mut vs = ValidatorSet::new();
     let mut updates = ValidatorSetUpdates::new();
@@ -1227,6 +1240,37 @@ fn update_view_fast_run_deadline_bounded() {
         pacemaker.query().deadline <= Instant::now() + Duration::from_millis(500) * 2,
         "fast-run surplus must be bounded to 2x max_view_time"
     );
+}
+
+/// Task A (pacemaker backoff): the backoff knobs are fleet-wide configuration
+/// threaded from the replica [`Configuration`](crate::replica::Configuration)
+/// (genesis-sourced in the node), defaulting to factor=2 / cap=8 — active but
+/// neutral while the QC frontier keeps up with the view.
+#[test]
+fn pacemaker_config_has_backoff_defaults() {
+    use crate::{replica::Configuration, types::data_types::BufferSize};
+    use ed25519_dalek::SigningKey;
+    use rand_core::OsRng;
+
+    let mut csprg = OsRng {};
+    let config = Configuration::builder()
+        .me(SigningKey::generate(&mut csprg))
+        .chain_id(ChainID::new(0))
+        .block_sync_request_limit(10)
+        .block_sync_server_advertise_time(Duration::from_secs(10))
+        .block_sync_response_timeout(Duration::from_secs(3))
+        .block_sync_blacklist_expiry_time(Duration::from_secs(10))
+        .block_sync_trigger_min_view_difference(2)
+        .block_sync_trigger_timeout(Duration::from_secs(60))
+        .progress_msg_buffer_capacity(BufferSize::new(1024))
+        .epoch_length(EpochLength::new(100))
+        .max_view_time(Duration::from_millis(500))
+        .log_events(false)
+        .build();
+
+    let (_, pacemaker_config, _, _): (_, PacemakerConfiguration, _, _) = config.into();
+    assert_eq!(pacemaker_config.backoff_factor, 2);
+    assert_eq!(pacemaker_config.backoff_cap, 8);
 }
 
 /// The cumulative schedule is preserved while on/near schedule: a single-step

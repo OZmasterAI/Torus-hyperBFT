@@ -86,10 +86,26 @@ pub struct ConsensusConfig {
     pub epoch_length: u64,
     pub timeout_base_ms: u64,
     pub timeout_max_ms: u64,
+    /// Base of the multiplicative view-timeout backoff (Task A). Consensus-
+    /// liveness critical: identical on all validators. Absent in genesis → 2.
+    #[serde(default = "default_backoff_factor")]
+    pub backoff_factor: u32,
+    /// Exponent cap of the view-timeout backoff; 0 disables backoff (runtime
+    /// kill switch). Absent in genesis → 8.
+    #[serde(default = "default_backoff_cap")]
+    pub backoff_cap: u32,
     /// MonadBFT B3 reputation-weighted leader selection (consensus-critical:
     /// identical on all validators). Absent in genesis TOML → disabled.
     #[serde(default)]
     pub reputation_leader_selection: bool,
+}
+
+fn default_backoff_factor() -> u32 {
+    2
+}
+
+fn default_backoff_cap() -> u32 {
+    8
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -493,6 +509,8 @@ impl Genesis {
                 .and_then(|s| parse_address(s).ok())
                 .unwrap_or(Address::ZERO),
             timeout_base_ms: self.consensus.timeout_base_ms,
+            backoff_factor: self.consensus.backoff_factor,
+            backoff_cap: self.consensus.backoff_cap,
             reputation_leader_selection: self.consensus.reputation_leader_selection,
             // Node-local perf toggle; never sourced from genesis. Enabled per-node
             // via the `--exec-trust-cache` CLI flag.

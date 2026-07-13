@@ -243,6 +243,24 @@ pub struct Configuration {
         doc = "Set the maximum duration that should be allocated to each view. Required."
     ))]
     pub max_view_time: Duration,
+    #[builder(
+        default = 2,
+        setter(
+            doc = "Set the base of the multiplicative view-timeout backoff applied while views \
+    outrun the QC frontier. Consensus-liveness critical: every replica of a chain must use the \
+    same value. Optional (default: 2)."
+        )
+    )]
+    pub backoff_factor: u32,
+    #[builder(
+        default = 8,
+        setter(
+            doc = "Set the exponent cap of the view-timeout backoff; 0 disables backoff \
+    (multiplier constantly 1). Consensus-liveness critical: every replica of a chain must use \
+    the same value. Optional (default: 8)."
+        )
+    )]
+    pub backoff_cap: u32,
     #[builder(setter(doc = "Enable logging? Required."))]
     pub log_events: bool,
 }
@@ -266,6 +284,8 @@ impl From<Configuration>
             keypair: keypair.clone(),
             epoch_length: val.epoch_length,
             max_view_time: val.max_view_time,
+            backoff_factor: val.backoff_factor,
+            backoff_cap: val.backoff_cap,
         };
         let block_sync_client_config = BlockSyncClientConfiguration {
             chain_id: val.chain_id,

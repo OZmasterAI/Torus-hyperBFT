@@ -1155,6 +1155,16 @@ pub struct ChainConfig {
     /// Consensus view timeout in milliseconds (from genesis).
     #[serde(default = "default_timeout_base_ms")]
     pub timeout_base_ms: u64,
+    /// Base of the multiplicative view-timeout backoff applied while views
+    /// outrun the QC frontier (Task A). Consensus-liveness critical — every
+    /// validator of a chain must use the same value (genesis-sourced).
+    #[serde(default = "default_backoff_factor")]
+    pub backoff_factor: u32,
+    /// Exponent cap of the view-timeout backoff; 0 disables backoff entirely
+    /// (multiplier constantly 1 — runtime kill switch). Fleet-wide, like
+    /// `backoff_factor`.
+    #[serde(default = "default_backoff_cap")]
+    pub backoff_cap: u32,
     /// MonadBFT B3: weight leader selection by observed leader reputation.
     /// Consensus-critical — every validator of a chain must use the same value.
     /// Off by default: locally-observed reputation diverges across replicas
@@ -1172,6 +1182,14 @@ pub struct ChainConfig {
 
 fn default_timeout_base_ms() -> u64 {
     500
+}
+
+fn default_backoff_factor() -> u32 {
+    2
+}
+
+fn default_backoff_cap() -> u32 {
+    8
 }
 
 impl ChainConfig {
