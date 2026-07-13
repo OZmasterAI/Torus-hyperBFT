@@ -198,6 +198,7 @@ impl LibP2PNetwork {
             recent_native_bundles: Mutex::new(VecDeque::new()),
             native_da: RwLock::new(None),
             native_da_inbound: Mutex::new(VecDeque::new()),
+            native_da_shards_inbound: Mutex::new(VecDeque::new()),
             pending_native_pushes: Mutex::new(PendingSendQueue::new(8)),
             push_scheduler: Mutex::new(PushScheduler::for_pushes()),
             recently_deposed: RwLock::new(HashMap::new()),
@@ -442,6 +443,67 @@ impl LibP2PNetwork {
         let mut q = self.shared.native_da_inbound.lock().unwrap();
         q.drain(..).collect()
     }
+
+    /// Erasure-shard pull fan-out (T8-integration inc 3): the additive analog to
+    /// [`Self::fetch_native_actions_from_validators`], but instead of pulling the
+    /// WHOLE body from every peer it asks each DISTINCT validator for a DISTINCT
+    /// shard index → up to `want` shards from `want` distinct sources (killing the
+    /// s338 single-source serve hotspot). Every custodying peer holds all `n`
+    /// shards, so asking the j-th target for index `j` yields distinct shards from
+    /// distinct sources; `targets = committed validators − self = n − 1`, so every
+    /// requested index `j < n` is valid. Non-blocking — a reconstruction miss falls
+    /// back to the whole-body pull, so a skipped/disconnected peer never wedges.
+    pub fn fetch_shards_from_validators(&self, body_hash: [u8; 32], want: u16) {
+        if want == 0 {
+            return;
+        }
+        let local = self.local_key.to_bytes();
+        let mut targets: Vec<VerifyingKey> = {
+            let validators = self.shared.validators.read().unwrap();
+            validators
+                .iter()
+                .filter(|vk_bytes| **vk_bytes != local)
+                .filter_map(|vk_bytes| VerifyingKey::from_bytes(vk_bytes).ok())
+                .collect()
+        };
+        // Same S447 fallback as the whole-body pull: an EMPTY/uninitialized
+        // validator set (an rpc-only node, or a fetch racing `init_validator_set`)
+        // would otherwise make this a SILENT NO-OP. Fall back to the mapped peers
+        // (the connected mesh — every peer serves `/torus/native-da-shards`); the
+        // committed validator set stays the primary source so the healthy path is
+        // bit-identical.
+        if targets.is_empty() {
+            let peer_map = self.shared.peer_map.read().unwrap();
+            targets = peer_map
+                .vks()
+                .filter(|vk| vk.to_bytes() != local)
+                .cloned()
+                .collect();
+            if !targets.is_empty() {
+                tracing::warn!(
+                    fallback_peers = targets.len(),
+                    "shard pull: validator set empty — falling back to mapped peers"
+                );
+            }
+        }
+        for (j, target) in targets.into_iter().take(want as usize).enumerate() {
+            let _ = self.command_tx.send(NetworkCommand::FetchNativeDaShards {
+                target,
+                body_hash,
+                shard_index: j as u16,
+            });
+        }
+    }
+
+    /// Drain erasure shards received via the shard pull-fallback response
+    /// (T8-integration inc 3), each tagged with its source peer bytes. `torus-node`
+    /// maps these `(source, StoredShard)` tuples into
+    /// `torus_consensus::shard_recovery::GatheredShard` (the network crate stays
+    /// free of a consensus dependency). Non-blocking.
+    pub fn drain_native_da_shards_inbound(&self) -> Vec<(Vec<u8>, torus_state::StoredShard)> {
+        let mut q = self.shared.native_da_shards_inbound.lock().unwrap();
+        q.drain(..).collect()
+    }
 }
 
 impl Network for LibP2PNetwork {
@@ -565,6 +627,7 @@ mod tests {
             recent_native_bundles: Mutex::new(VecDeque::new()),
             native_da: RwLock::new(None),
             native_da_inbound: Mutex::new(VecDeque::new()),
+            native_da_shards_inbound: Mutex::new(VecDeque::new()),
             pending_native_pushes: Mutex::new(PendingSendQueue::new(8)),
             push_scheduler: Mutex::new(PushScheduler::for_pushes()),
             recently_deposed: RwLock::new(HashMap::new()),
@@ -762,6 +825,135 @@ mod tests {
                 "every hash delivered exactly once per fallback peer, in order"
             );
         }
+    }
+
+    /// T8-integration inc 3 (RED first): the erasure-shard pull fan-out must ask each
+    /// DISTINCT non-self validator for a DISTINCT shard index (0,1,2,…) so `want`
+    /// shards arrive from `want` distinct SOURCES (the s338 single-source hotspot
+    /// killer). Driving it against a 4-validator set (self + 3 peers) with `want=8`
+    /// (capped by the 3 available targets) must enqueue exactly ONE
+    /// `FetchNativeDaShards` per non-self validator, indices exactly {0,1,2}, all
+    /// carrying the right `body_hash`, and never targeting self. Today this fails
+    /// (no method / variant).
+    #[test]
+    fn fetch_shards_emits_distinct_index_per_peer() {
+        let local = test_signing_key(1);
+        let peer_a = test_signing_key(2).verifying_key();
+        let peer_b = test_signing_key(3).verifying_key();
+        let peer_c = test_signing_key(4).verifying_key();
+
+        let (command_tx, mut command_rx) = mpsc::unbounded_channel();
+        let shared =
+            shared_with_validators(&[local.verifying_key(), peer_a, peer_b, peer_c]);
+        let net = LibP2PNetwork {
+            command_tx,
+            shared,
+            native_inbound_rx: None,
+            evm_inbound_rx: None,
+            local_key: local.verifying_key(),
+        };
+
+        let body_hash = [0x5au8; 32];
+        net.fetch_shards_from_validators(body_hash, 8);
+
+        let mut targets: HashSet<[u8; 32]> = HashSet::new();
+        let mut indices: Vec<u16> = Vec::new();
+        while let Ok(cmd) = command_rx.try_recv() {
+            let NetworkCommand::FetchNativeDaShards {
+                target,
+                body_hash: got_hash,
+                shard_index,
+            } = cmd
+            else {
+                panic!("fetch must enqueue only FetchNativeDaShards commands");
+            };
+            assert_eq!(got_hash, body_hash, "the exact body_hash is forwarded");
+            assert!(
+                targets.insert(target.to_bytes()),
+                "each non-self validator is targeted exactly once (distinct source)"
+            );
+            indices.push(shard_index);
+        }
+
+        assert_eq!(
+            targets,
+            [peer_a, peer_b, peer_c]
+                .iter()
+                .map(|vk| vk.to_bytes())
+                .collect::<HashSet<_>>(),
+            "exactly the 3 non-self validators are targeted"
+        );
+        assert!(
+            !targets.contains(&local.verifying_key().to_bytes()),
+            "self is never a shard-fetch target"
+        );
+        indices.sort_unstable();
+        assert_eq!(
+            indices,
+            vec![0u16, 1, 2],
+            "distinct contiguous shard indices 0,1,2 — one per distinct source"
+        );
+    }
+
+    /// T8-integration inc 3 (RED first): with an EMPTY validator set the shard pull
+    /// must fall back to the MAPPED peers (same S447 no-op fix as the whole-body
+    /// pull) instead of silently enqueuing nothing — otherwise an rpc-only node (or
+    /// a fetch racing `init_validator_set`) could never source shards. Today this
+    /// fails: zero commands enqueued.
+    #[test]
+    fn fetch_shards_falls_back_to_peer_map_when_validators_empty() {
+        let local = test_signing_key(1);
+        let peer_a = test_signing_key(2).verifying_key();
+        let peer_b = test_signing_key(3).verifying_key();
+
+        let (command_tx, mut command_rx) = mpsc::unbounded_channel();
+        let shared = shared_with_validators(&[]);
+        {
+            let mut pm = shared.peer_map.write().unwrap();
+            pm.insert(peer_a, peer_id_from_verifying_key(&peer_a));
+            pm.insert(peer_b, peer_id_from_verifying_key(&peer_b));
+            // Self is mapped too and must still be skipped.
+            pm.insert(
+                local.verifying_key(),
+                peer_id_from_verifying_key(&local.verifying_key()),
+            );
+        }
+        let net = LibP2PNetwork {
+            command_tx,
+            shared,
+            native_inbound_rx: None,
+            evm_inbound_rx: None,
+            local_key: local.verifying_key(),
+        };
+
+        let body_hash = [0x11u8; 32];
+        net.fetch_shards_from_validators(body_hash, 8);
+
+        let mut targets: HashSet<[u8; 32]> = HashSet::new();
+        while let Ok(cmd) = command_rx.try_recv() {
+            let NetworkCommand::FetchNativeDaShards {
+                target,
+                body_hash: got_hash,
+                ..
+            } = cmd
+            else {
+                panic!("fetch must enqueue only FetchNativeDaShards commands");
+            };
+            assert_eq!(got_hash, body_hash);
+            targets.insert(target.to_bytes());
+        }
+        assert!(
+            !targets.contains(&local.verifying_key().to_bytes()),
+            "self is never a shard-fetch target"
+        );
+        assert_eq!(
+            targets,
+            [peer_a, peer_b]
+                .iter()
+                .map(|vk| vk.to_bytes())
+                .collect::<HashSet<_>>(),
+            "empty validator set falls back to the 2 mapped non-self peers instead of no-oping"
+        );
     }
 
     /// Phase 2.3 (#5, RED first): the hash-only push helper must enqueue a

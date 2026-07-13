@@ -17,9 +17,11 @@ use std::sync::{Condvar, Mutex, OnceLock};
 use alloy_primitives::B256;
 use torus_types::{compute_action_hash, SignedNativeAction};
 
-use crate::cf::CF_NATIVE_PENDING;
+use crate::cf::{CF_NATIVE_PENDING, CF_NATIVE_SHARDS};
 use crate::db::StateDb;
+use crate::erasure::{encode, ErasureParams};
 use crate::error::StateError;
+use crate::shard_store::{decode_stored_shard, encode_stored_shard, shard_key, StoredShard};
 
 /// Process-wide body-arrival notifier (S391). `NativeDaStore` instances are
 /// constructed independently over the one shared DB, so the notifier is a
@@ -169,6 +171,61 @@ impl NativeDaStore {
     pub fn contains(&self, hash: &[u8; 32]) -> Result<bool, StateError> {
         self.db.exists_cf_raw(CF_NATIVE_PENDING, hash.as_slice())
     }
+
+    /// Erasure-encode each body under `params` and persist all `n` shards into
+    /// [`CF_NATIVE_SHARDS`] in ONE atomic `WriteBatch` (Sprint 5 T5, recovery-path).
+    ///
+    /// ADDITIVE: the whole-body mirror ([`put_batch`](Self::put_batch)) remains the
+    /// durability guarantee; this only ADDS shard custody so a lagging peer can
+    /// reconstruct from `k` shards gathered across `k` DIFFERENT sources instead of
+    /// pulling the whole body from one (kills the s338 single-source hotspot). The
+    /// bytes sharded are the SAME `bincode(SignedNativeAction)` keyed by
+    /// [`compute_action_hash`], so the body-hash backstop at reconstruct time
+    /// re-hashes to exactly this. Empty input is a no-op.
+    pub fn put_shards_batch(
+        &self,
+        actions: &[SignedNativeAction],
+        params: ErasureParams,
+    ) -> Result<(), StateError> {
+        if actions.is_empty() {
+            return Ok(());
+        }
+        params
+            .validate()
+            .map_err(|e| StateError::InvalidData(e.to_string()))?;
+        let mut batch = rocksdb::WriteBatch::default();
+        let cf = self.db.cf_handle(CF_NATIVE_SHARDS)?;
+        for action in actions {
+            let hash = compute_action_hash(action);
+            let body =
+                bincode::serialize(action).map_err(|e| StateError::InvalidData(e.to_string()))?;
+            let enc = encode(&body, params).map_err(|e| StateError::InvalidData(e.to_string()))?;
+            for i in 0..enc.params.n {
+                let stored = StoredShard::from_encoded_body(&enc, i);
+                let bytes = encode_stored_shard(&stored)?;
+                batch.put_cf(cf, shard_key(&hash.0, i as u16), &bytes);
+            }
+        }
+        self.db.write(batch)?;
+        Ok(())
+    }
+
+    /// Fetch a single custodied shard for `(body_hash, index)`. `None` when this
+    /// node does not custody it (the serve path answers `present=false`; a fetcher
+    /// then tries another peer/index).
+    pub fn get_shard(
+        &self,
+        body_hash: &[u8; 32],
+        index: u16,
+    ) -> Result<Option<StoredShard>, StateError> {
+        match self
+            .db
+            .get_cf_raw(CF_NATIVE_SHARDS, &shard_key(body_hash, index))?
+        {
+            Some(bytes) => Ok(Some(decode_stored_shard(&bytes)?)),
+            None => Ok(None),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -244,6 +301,74 @@ mod tests {
         assert!(
             start.elapsed() < std::time::Duration::from_millis(1_500),
             "wait must return promptly after its timeout"
+        );
+    }
+
+    /// T5: mirroring encodes each body into exactly `n` shards keyed `0..n`, and
+    /// every stored shard verifies against its own committed root.
+    #[test]
+    fn mirror_encodes_and_persists_n_shards() {
+        let (_dir, store) = temp_store();
+        let action = dummy_action(1);
+        let params = ErasureParams::new(2, 3);
+        store
+            .put_shards_batch(std::slice::from_ref(&action), params)
+            .expect("put shards");
+        let hash = compute_action_hash(&action);
+        for i in 0..params.n as u16 {
+            let s = store.get_shard(&hash.0, i).expect("get").expect("shard present");
+            assert_eq!(s.shard_index, i);
+            assert!(s.verify(), "stored shard {i} must verify against its root");
+        }
+        // No (n+1)th shard.
+        assert!(store
+            .get_shard(&hash.0, params.n as u16)
+            .expect("get")
+            .is_none());
+    }
+
+    /// T5: the shards read back out reconstruct the ORIGINAL body bytes, which
+    /// re-hash to the action-hash used as the key (body-hash backstop identity).
+    #[test]
+    fn stored_shards_reconstruct_original_body() {
+        use crate::erasure::reconstruct;
+        let (_dir, store) = temp_store();
+        let action = dummy_action(42);
+        let params = ErasureParams::new(2, 3);
+        store
+            .put_shards_batch(std::slice::from_ref(&action), params)
+            .expect("put shards");
+        let hash = compute_action_hash(&action);
+        let mut slots: Vec<Option<Vec<u8>>> = Vec::new();
+        let mut body_len = 0usize;
+        for i in 0..params.n as u16 {
+            let s = store.get_shard(&hash.0, i).expect("get").expect("present");
+            body_len = s.body_len as usize;
+            slots.push(Some(s.shard_bytes));
+        }
+        let body = reconstruct(slots, params, body_len).expect("reconstruct");
+        let original = bincode::serialize(&action).expect("serialize");
+        assert_eq!(body, original, "reconstructed body must equal bincode(action)");
+        let decoded: SignedNativeAction = bincode::deserialize(&body).expect("decode");
+        assert_eq!(compute_action_hash(&decoded), hash, "backstop: re-hash matches key");
+    }
+
+    /// T5: shard encode is ADDITIVE — the whole-body store still serves the body
+    /// after both mirrors run (no disturbance to the durability path).
+    #[test]
+    fn mirror_still_populates_whole_body_store() {
+        let (_dir, store) = temp_store();
+        let action = dummy_action(7);
+        store
+            .put_batch(std::slice::from_ref(&action))
+            .expect("put_batch body");
+        store
+            .put_shards_batch(std::slice::from_ref(&action), ErasureParams::new(2, 3))
+            .expect("put shards");
+        let hash = compute_action_hash(&action);
+        assert!(
+            store.get(&hash).expect("get").is_some(),
+            "whole body still present after shard encode"
         );
     }
 }

@@ -48,6 +48,33 @@ impl NativeDaFetcher for NetworkDaFetcher {
     }
 }
 
+/// Production erasure-shard recovery transport (T8-integration inc 3): bridges the
+/// consensus app's [`torus_consensus::app::ShardFetcher`] to the libp2p
+/// `/torus/native-da-shards/1.0` protocol. `fetch_shards` fans one shard-index
+/// request out to each distinct validator (k shards from k distinct SOURCES);
+/// `drain_shards` converts the network layer's `(source, StoredShard)` tuples —
+/// the network crate cannot depend on torus-consensus — into `GatheredShard`s
+/// for reconstruction.
+struct NetworkShardFetcher {
+    network: LibP2PNetwork,
+}
+
+impl torus_consensus::app::ShardFetcher for NetworkShardFetcher {
+    fn fetch_shards(&self, body_hash: [u8; 32], want: u16) {
+        self.network.fetch_shards_from_validators(body_hash, want);
+    }
+
+    fn drain_shards(
+        &self,
+    ) -> Vec<torus_consensus::shard_recovery::GatheredShard<torus_consensus::app::ShardSource>> {
+        self.network
+            .drain_native_da_shards_inbound()
+            .into_iter()
+            .map(|(source, shard)| torus_consensus::shard_recovery::GatheredShard { source, shard })
+            .collect()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
@@ -516,6 +543,15 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // Attach the durable DA store so the swarm can SERVE native-action bodies
     // by-hash on /torus/native-da/1.0 (Phase C Task 5 — RARE pull-fallback).
     network.set_native_da_store(NativeDaStore::new(state_db.clone()));
+    // Wire the erasure-shard recovery pull to the network (T8-integration inc 3):
+    // an ADDITIVE pre-step to the whole-body pull — on a reconstruction miss it
+    // gathers erasure shards spread across DISTINCT peers before the single-source
+    // whole-body fetch, killing the s338 serve hotspot. Set BEFORE
+    // set_native_da_fetcher: the DA recovery worker that call spawns captures the
+    // shard fetcher, so it must already be installed.
+    app.set_shard_fetcher(Arc::new(NetworkShardFetcher {
+        network: network.clone(),
+    }));
     // Wire the consensus app's RARE pull-fallback to the network (Phase C Task 6):
     // on a CompactBlock reconstruction miss it fetches the missing bodies by-hash.
     app.set_native_da_fetcher(Arc::new(NetworkDaFetcher {

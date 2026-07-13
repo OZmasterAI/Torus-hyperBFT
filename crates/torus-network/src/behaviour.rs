@@ -5,7 +5,9 @@ use libp2p::{
     allow_block_list, connection_limits, gossipsub, identify, kad, request_response, StreamProtocol,
 };
 
-use crate::codec::{BlockDataCodec, BorshCodec, NativeDaCodec};
+use crate::codec::{
+    BlockDataCodec, BorshCodec, NativeDaCodec, NativeDaShardsCodec, NATIVE_DA_SHARDS_PROTOCOL,
+};
 use crate::sync::{SyncRequest, SyncResponse};
 
 pub const CONSENSUS_TOPIC: &str = "/torus/consensus/1.0";
@@ -33,6 +35,13 @@ pub struct TorusBehaviour {
     /// native-action bodies by-hash as the RARE pull-fallback for CompactBlock
     /// reconstruction. Push stays primary; this fires only on a miss.
     pub native_da: request_response::Behaviour<NativeDaCodec>,
+    /// Erasure-shard fetch protocol (Sprint 5 T6): serves a single erasure shard
+    /// of a native-action body by `(body_hash, index)` so a lagging node gathers
+    /// `k` shards from `k` DIFFERENT peers instead of pulling the whole body from
+    /// one. `/1.0` only for now (a future `/2.0` adds zstd like native-da/2.0);
+    /// negotiated per-peer, so a pre-shard binary simply never advertises it and
+    /// the fetcher falls back to the whole-body pull (mixed-binary safe).
+    pub native_da_shards: request_response::Behaviour<NativeDaShardsCodec>,
     /// Peer block list for banning (Phase 3: 3.1.7).
     pub block_list: allow_block_list::Behaviour<allow_block_list::BlockedPeers>,
 }
@@ -145,6 +154,19 @@ impl TorusBehaviour {
             request_response::Config::default().with_request_timeout(Duration::from_secs(10)),
         );
 
+        // Erasure-shard fetch request-response (borsh codec, Sprint 5 T6). Single
+        // `/1.0` protocol, negotiated per-peer: a pre-shard peer never advertises
+        // it, so `send_request` to it yields an unsupported-protocol OutboundFailure
+        // that the fetcher counts as "no shard" and falls back (T9). Mixed-binary
+        // safe by the same construction the zstd 2.0-first work proved (s356).
+        let native_da_shards = request_response::Behaviour::<NativeDaShardsCodec>::new(
+            [(
+                StreamProtocol::new(NATIVE_DA_SHARDS_PROTOCOL),
+                request_response::ProtocolSupport::Full,
+            )],
+            request_response::Config::default().with_request_timeout(Duration::from_secs(10)),
+        );
+
         // Block sync request-response (cbor codec)
         let sync_proto = request_response::cbor::Behaviour::<SyncRequest, SyncResponse>::new(
             [(
@@ -182,6 +204,7 @@ impl TorusBehaviour {
             direct,
             block_data,
             native_da,
+            native_da_shards,
             sync_proto,
             kademlia,
             identify,
@@ -217,6 +240,18 @@ mod tests {
             crate::config::NetworkConfig::default().gossipsub_heartbeat_ms,
             DEFAULT_GOSSIPSUB_HEARTBEAT_MS
         );
+    }
+
+    /// T6: the erasure-shard fetch protocol is registered on the behaviour. This
+    /// is a compile-gate (the `NetworkBehaviour` derive fails without the field)
+    /// plus a construction check; real coverage is the codec round-trip and the
+    /// serve/fetch tests (T7/T8).
+    #[test]
+    fn behaviour_registers_shard_protocol() {
+        let key = libp2p::identity::Keypair::generate_ed25519();
+        let b = TorusBehaviour::new(&key).expect("construct behaviour with shard protocol");
+        let _ = &b.native_da_shards;
+        assert_eq!(NATIVE_DA_SHARDS_PROTOCOL, "/torus/native-da-shards/1.0");
     }
 
     /// The wired constructor honors the requested heartbeat (construction

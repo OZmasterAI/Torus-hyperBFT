@@ -26,7 +26,10 @@ impl BorshCodec {
 
 // Codec caps live in `caps` — the single source of truth for the size-cap
 // ladder (O5), where their ordering is test-enforced.
-use crate::caps::{MAX_BLOCK_DATA_MSG_SIZE, MAX_DIRECT_MSG_SIZE, MAX_NATIVE_DA_MSG_SIZE};
+use crate::caps::{
+    MAX_BLOCK_DATA_MSG_SIZE, MAX_DIRECT_MSG_SIZE, MAX_NATIVE_DA_MSG_SIZE,
+    MAX_NATIVE_DA_SHARDS_MSG_SIZE,
+};
 
 #[async_trait]
 impl libp2p::request_response::Codec for BorshCodec {
@@ -468,10 +471,10 @@ pub struct NativeDaShardResponse {
 pub struct NativeDaShardsCodec;
 
 impl NativeDaShardsCodec {
-    // A single shard is at most ~body/k; reuse the whole-body cap as a safe
-    // upper bound (shards are strictly smaller). TODO(T3.1): give shards their
-    // own tighter cap in `caps` once the serve path lands.
-    const MAX_MSG_SIZE: usize = MAX_NATIVE_DA_MSG_SIZE;
+    // A single shard is at most ~body/k + proof + header — far below a whole
+    // body. Its own tight cap (caps.rs, T3) rejects an oversize shard frame at a
+    // bound that reflects a shard's true size, not a whole body's.
+    const MAX_MSG_SIZE: usize = MAX_NATIVE_DA_SHARDS_MSG_SIZE;
 }
 
 #[async_trait]
@@ -751,6 +754,30 @@ mod tests {
                 .read_response(&proto_v2, &mut rbuf)
                 .await
                 .expect_err("corrupt zstd frame must be rejected");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        });
+    }
+
+    /// Sprint 5 T3: a shard frame whose length prefix exceeds the (tighter)
+    /// shard cap is rejected at read (InvalidData) before the oversized buffer is
+    /// ever allocated — the shard protocol is `/1.0` (non-zstd), so the guard is
+    /// the plain length-prefix check.
+    #[test]
+    fn shard_frame_over_cap_rejected() {
+        use futures::io::Cursor;
+        use libp2p::request_response::Codec as _;
+        futures::executor::block_on(async {
+            // Only the 4-byte length prefix is needed: the cap check fires before
+            // the body is read. Claim one byte past the shard cap.
+            let over = (MAX_NATIVE_DA_SHARDS_MSG_SIZE + 1) as u32;
+            let frame = over.to_be_bytes().to_vec();
+            let proto_v1 = StreamProtocol::new(NATIVE_DA_SHARDS_PROTOCOL);
+            let mut codec = NativeDaShardsCodec;
+            let mut rbuf = Cursor::new(frame);
+            let err = codec
+                .read_response(&proto_v1, &mut rbuf)
+                .await
+                .expect_err("over-cap shard frame must be rejected");
             assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         });
     }

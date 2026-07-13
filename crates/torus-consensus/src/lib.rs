@@ -11,6 +11,7 @@ pub mod app;
 pub mod genesis;
 pub mod kv_store;
 pub mod network;
+pub mod shard_recovery;
 pub mod slashing;
 
 pub use app::{LeaderState, NativeDaFetcher, PreProposalBundle, TorusApp};

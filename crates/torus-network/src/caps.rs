@@ -26,6 +26,16 @@ pub const MAX_DIRECT_MSG_SIZE: usize = 8 * 1024 * 1024; // 8 MB
 /// size-bounded chunks (`NATIVE_DA_FETCH_CHUNK`), so a response stays well under this.
 pub const MAX_NATIVE_DA_MSG_SIZE: usize = 8 * 1024 * 1024; // 8 MB
 
+/// `/torus/native-da-shards` response cap (Sprint 5 T3.1). A single shard is at
+/// most `body/k + Merkle proof + fixed header`. The largest body is the 6 MB
+/// `NATIVE_BLOCK_BYTES_CAP` (torus-mempool `rate_limit.rs`) and the smallest `k`
+/// is `f+1 = 2` at n=3, so the worst-case data shard is ≤ ~3 MB, plus a proof
+/// (`≤ ceil(log2(255)) = 8` levels × 32 B = 256 B) and fixed fields (< 64 B).
+/// 4 MB sits comfortably above that worst case and strictly below the whole-body
+/// pull cap, so an oversize/bomb shard frame is rejected at a tight bound instead
+/// of being allowed to grow to a whole-body size.
+pub const MAX_NATIVE_DA_SHARDS_MSG_SIZE: usize = 4 * 1024 * 1024; // 4 MB
+
 /// `/torus/block-data` response cap — must fit a full big block during sync.
 pub const MAX_BLOCK_DATA_MSG_SIZE: usize = 16 * 1024 * 1024; // 16 MB
 
@@ -84,5 +94,25 @@ mod tests {
         // fallback must be able to carry anything the faster path gave up on.
         assert!(MAX_DIRECT_MSG_SIZE <= MAX_NATIVE_DA_MSG_SIZE);
         assert!(MAX_NATIVE_DA_MSG_SIZE <= MAX_BLOCK_DATA_MSG_SIZE);
+        // A single shard is strictly smaller than a whole body, so the shard cap
+        // is a tighter rung than the native-DA whole-body pull cap.
+        assert!(MAX_NATIVE_DA_SHARDS_MSG_SIZE <= MAX_NATIVE_DA_MSG_SIZE);
+    }
+
+    #[test]
+    fn shard_cap_admits_worst_case_shard() {
+        // Worst single data shard = largest body / smallest k, + proof + header.
+        // NATIVE_BLOCK_BYTES_CAP (6 MB) mirrors torus-mempool rate_limit.rs; the
+        // lower crate can't dep the mempool, so it's pinned here as a literal.
+        const NATIVE_BLOCK_BYTES_CAP: usize = 6 * 1024 * 1024;
+        const WORST_PROOF: usize = 8 * 32; // ≤ 8 Merkle levels × 32-byte hashes
+        const FIXED_HEADER: usize = 64; // index/k/n/body_len/root framing slack
+        let worst_shard = NATIVE_BLOCK_BYTES_CAP / 2 + WORST_PROOF + FIXED_HEADER;
+        assert!(
+            MAX_NATIVE_DA_SHARDS_MSG_SIZE >= worst_shard,
+            "shard cap {} must admit the worst-case single shard {}",
+            MAX_NATIVE_DA_SHARDS_MSG_SIZE,
+            worst_shard
+        );
     }
 }

@@ -16,7 +16,7 @@ mod verified_cache;
 use std::sync::RwLock;
 
 use alloy_primitives::{Address, B256};
-use torus_state::{NativeDaStore, StateDb, StateError};
+use torus_state::{ErasureParams, NativeDaStore, StateDb, StateError, StoredShard};
 use torus_types::SignedNativeAction;
 
 use crate::verified_cache::FifoCache;
@@ -650,6 +650,18 @@ impl Mempool {
         }
     }
 
+    /// Fetch a single custodied erasure shard by `(body hash, shard index)`.
+    ///
+    /// Mirrors the read style of [`get_native_da`](Self::get_native_da): thin
+    /// pass-through to [`NativeDaStore::get_shard`], with a store read-error
+    /// swallowed to `None` (to a fetcher, a read failure is indistinguishable
+    /// from "not custodied" — either way it tries another peer/index and never
+    /// wedges). Needed so the shard-serve path (and tests) can read back the
+    /// shards a proposer OR a validating peer custodied.
+    pub fn get_shard(&self, hash: &B256, index: u16) -> Option<StoredShard> {
+        self.da_store.get_shard(&hash.0, index).ok().flatten()
+    }
+
     /// Mirror native-action bodies into the durable DA store (proposer guarantee:
     /// every body referenced by a block we propose stays reconstructable).
     /// One atomic WriteBatch + one arrival-notifier wake for the whole block —
@@ -666,6 +678,21 @@ impl Mempool {
             return Err(e);
         }
         Ok(())
+    }
+
+    /// Additionally custody erasure shards for a proposed block's bodies (Sprint 5
+    /// T5). Thin pass-through to [`NativeDaStore::put_shards_batch`] under the
+    /// caller-supplied `(k, n)` (derived from the live validator set). ADDITIVE and
+    /// best-effort at the call site: the whole-body [`mirror_native_to_da`] is the
+    /// durability guarantee; a shard-custody failure only means this node can't
+    /// serve shards for these bodies (peers fall back to the whole-body pull, never
+    /// wedge), so the caller logs rather than fails the proposal.
+    pub fn mirror_native_shards(
+        &self,
+        actions: &[SignedNativeAction],
+        params: ErasureParams,
+    ) -> Result<(), StateError> {
+        self.da_store.put_shards_batch(actions, params)
     }
 
     /// Best-effort durable mirror of one native-action body, COALESCED (T2.2):
