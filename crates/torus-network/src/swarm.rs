@@ -786,6 +786,9 @@ pub async fn run_swarm_with_config(
             // prompt so pull latency stays low without store reads on the loop.
             done = da_serve_rx.recv() => SwarmAction::DaServeDone(done),
 
+            // P2.5b: completed off-loop shard serves (T7) — same class as body serves.
+            shard_done = shard_serve_rx.recv() => SwarmAction::DaShardServeDone(shard_done),
+
             // P3: EVM tx publish
             tx = tx_rx.recv() => SwarmAction::Tx(tx),
 
@@ -2876,6 +2879,80 @@ mod tests {
         // No store attached -> one empty entry per requested hash.
         let none = serve_native_da_bodies(None, &[known, unknown]);
         assert_eq!(none, vec![Vec::<u8>::new(), Vec::<u8>::new()]);
+    }
+
+    /// T7: a custodied shard is served `present=true` and the shipped
+    /// bytes+proof+root verify standalone (verify-then-reconstruct at the fetcher).
+    #[test]
+    fn serve_shard_present_for_custodied() {
+        use torus_state::db::StateDb;
+        use torus_state::erasure::{verify_shard, ErasureParams, ShardProof};
+        use torus_state::NativeDaStore;
+        use torus_types::{
+            compute_action_hash, ActionSignature, NativeAction, Signature, SignedNativeAction,
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = NativeDaStore::new(StateDb::open(dir.path()).expect("open db"));
+        let action = SignedNativeAction {
+            action: NativeAction::ClaimRewards,
+            nonce: 1,
+            signature: ActionSignature::Eip712(Signature { v: 27, r: [0u8; 32], s: [0u8; 32] }),
+        };
+        store
+            .put_shards_batch(std::slice::from_ref(&action), ErasureParams::new(2, 3))
+            .expect("custody shards");
+        let body_hash: [u8; 32] = compute_action_hash(&action).0;
+
+        let resp = serve_native_da_shard(Some(&store), &body_hash, 1);
+        assert!(resp.present, "custodied shard must be present");
+        assert_eq!(resp.shard_index, 1);
+        assert_eq!((resp.k, resp.n), (2, 3));
+        let proof = ShardProof { siblings: resp.proof.iter().map(|h| (*h).into()).collect() };
+        assert!(
+            verify_shard(resp.erasure_root.into(), 1, &resp.shard_bytes, &proof),
+            "served shard must verify against its shipped root"
+        );
+    }
+
+    /// T7: a body this node does not custody → `present=false`, empty bytes/proof
+    /// (the fetcher rotates to another peer or falls back to whole-body pull).
+    #[test]
+    fn serve_shard_absent_returns_present_false() {
+        use torus_state::db::StateDb;
+        use torus_state::NativeDaStore;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = NativeDaStore::new(StateDb::open(dir.path()).expect("open db"));
+        let resp = serve_native_da_shard(Some(&store), &[7u8; 32], 0);
+        assert!(!resp.present);
+        assert!(resp.shard_bytes.is_empty() && resp.proof.is_empty());
+        // No store attached → also present=false, no panic.
+        assert!(!serve_native_da_shard(None, &[7u8; 32], 0).present);
+    }
+
+    /// T7: an out-of-range shard index is just an absent lookup — `present=false`,
+    /// never a panic or OOB.
+    #[test]
+    fn serve_shard_out_of_range_index() {
+        use torus_state::db::StateDb;
+        use torus_state::erasure::ErasureParams;
+        use torus_state::NativeDaStore;
+        use torus_types::{
+            compute_action_hash, ActionSignature, NativeAction, Signature, SignedNativeAction,
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = NativeDaStore::new(StateDb::open(dir.path()).expect("open db"));
+        let action = SignedNativeAction {
+            action: NativeAction::ClaimRewards,
+            nonce: 2,
+            signature: ActionSignature::Eip712(Signature { v: 27, r: [0u8; 32], s: [0u8; 32] }),
+        };
+        store
+            .put_shards_batch(std::slice::from_ref(&action), ErasureParams::new(2, 3))
+            .expect("custody shards");
+        let body_hash: [u8; 32] = compute_action_hash(&action).0;
+        // n=3 → indices 0..3 exist; 3 (and 9) are out of range.
+        assert!(!serve_native_da_shard(Some(&store), &body_hash, 3).present);
+        assert!(!serve_native_da_shard(Some(&store), &body_hash, 9).present);
     }
 
     /// Task 7: a native-action push to a validator that is not yet connected is
