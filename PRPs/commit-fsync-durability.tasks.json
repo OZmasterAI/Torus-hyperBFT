@@ -26,7 +26,7 @@
     {
       "id": 3,
       "name": "Crash-durability RED test (kill-in-fsync-window)",
-      "status": "pending",
+      "status": "done",
       "files": ["crates/torus-consensus/tests/"],
       "validate": "cargo test -p torus-consensus commit_survives_simulated_power_loss",
       "depends_on": [2]

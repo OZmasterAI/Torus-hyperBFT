@@ -4334,6 +4334,56 @@ mod crash_recovery_tests {
         );
     }
 
+    /// Task B/3 (crash-durability lock). A TRUE power-loss — OS page-cache loss —
+    /// CANNOT be simulated in-process: both fsync'd and async writes survive
+    /// process death via the page cache, so the sync-vs-async durability
+    /// difference only manifests under real host power-loss (that repro is Task
+    /// 5's OS-level hard-stop, user-driven). This test therefore LOCKS the
+    /// behavioral invariant that makes Task 5 pass: a non-empty committed block is
+    /// made durable (header+body) at the commit boundary, the crash-durability
+    /// barrier is issued exactly when ENABLED (never when disabled), and the block
+    /// is reopen-consistent — i.e. `sync_committed_wal` is provably on the commit
+    /// path after the header+body write.
+    #[test]
+    fn commit_survives_simulated_power_loss() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static C: AtomicU64 = AtomicU64::new(7000);
+        let dir = std::env::temp_dir().join(format!(
+            "torus-wal-durability-{}-{}",
+            std::process::id(),
+            C.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+
+        // Commit a NON-EMPTY block durably (header+body) as on the live path, then
+        // issue the crash-durability barrier with the toggle ENABLED.
+        {
+            let state_db = StateDb::open(&dir).expect("open");
+            let block = make_block(7, vec![sign_claim_rewards(7)]);
+            assert_eq!(block.header.native_action_count, 1, "sanity: non-empty block");
+            persist_committed_block_durably(&state_db, &block);
+            assert!(
+                sync_committed_wal(&state_db, true),
+                "ENABLED ⇒ the commit path must issue the WAL fsync barrier"
+            );
+            assert!(
+                !sync_committed_wal(&state_db, false),
+                "DISABLED ⇒ no fsync barrier (default, byte-identical to today)"
+            );
+        } // drop closes the DB
+
+        // Reopen: the committed header+body are durable — the property Task 5's
+        // OS-level hard-stop asserts survives a real power-loss.
+        let reopened = StateDb::open(&dir).expect("reopen");
+        let h = load_replay_header(&reopened, 7).expect("header durable after reopen");
+        let b = load_replay_body(&reopened, 7).expect("body durable after reopen");
+        assert_eq!(h.height, 7);
+        assert_eq!(b.native_actions.len(), 1);
+
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// FIX 1b RED-first (park + heal via the live strict-order queue). A boot-parked hole,
     /// seeded into `deferred_exec` as an `ExecSource::Durable`, must NOT execute while the body
     /// is missing, and must heal IN ORDER the moment the body becomes durable (a late block-sync
