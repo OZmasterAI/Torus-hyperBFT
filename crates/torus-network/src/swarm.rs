@@ -3265,7 +3265,8 @@ mod tests {
     #[test]
     fn da_serve_pool_bounds_inflight() {
         let (tx, _rx) = mpsc::unbounded_channel();
-        let pool = DaServePool::new(tx);
+        let (shard_tx, _shard_rx) = mpsc::unbounded_channel();
+        let pool = DaServePool::new(tx, shard_tx);
 
         // Admit exactly the cap, then refuse the next.
         for i in 0..MAX_DA_SERVE_INFLIGHT {
