@@ -19,7 +19,7 @@ use crate::behaviour::{
 };
 use crate::codec::{
     BlockDataNetRequest, BlockDataNetResponse, DirectRequest, DirectResponse, NativeDaNetRequest,
-    NativeDaNetResponse,
+    NativeDaNetResponse, NativeDaShardResponse,
 };
 use crate::config::NetworkConfig;
 use crate::peer::PeerMap;
@@ -235,6 +235,49 @@ fn serve_native_da_bodies(store: Option<&NativeDaStore>, hashes: &[[u8; 32]]) ->
         .collect()
 }
 
+/// Serve ONE erasure shard for `(body_hash, shard_index)` from the durable shard
+/// custody store (Sprint 5 T7). `present=false` (empty bytes/proof) when this node
+/// does not custody the shard — the fetcher tries another peer/index or falls back
+/// to the whole-body pull, and out-of-range indices are just an absent lookup (no
+/// panic). Pure over the store handle so serve semantics are unit-testable without
+/// a live swarm. Fields map the stored record to the wire response 1:1.
+fn serve_native_da_shard(
+    store: Option<&NativeDaStore>,
+    body_hash: &[u8; 32],
+    shard_index: u16,
+) -> NativeDaShardResponse {
+    let absent = NativeDaShardResponse {
+        present: false,
+        shard_index,
+        shard_bytes: Vec::new(),
+        proof: Vec::new(),
+        erasure_root: [0u8; 32],
+        k: 0,
+        n: 0,
+        body_len: 0,
+    };
+    let Some(store) = store else {
+        return absent;
+    };
+    match store.get_shard(body_hash, shard_index) {
+        Ok(Some(s)) => NativeDaShardResponse {
+            present: true,
+            shard_index: s.shard_index,
+            shard_bytes: s.shard_bytes,
+            proof: s.proof,
+            erasure_root: s.erasure_root,
+            k: s.k,
+            n: s.n,
+            body_len: s.body_len,
+        },
+        Ok(None) => absent,
+        Err(e) => {
+            warn!(?e, "native-da shard serve: store read failed");
+            absent
+        }
+    }
+}
+
 pub struct SharedState {
     pub inbound: Mutex<VecDeque<(VerifyingKey, hotstuff_rs::networking::messages::Message)>>,
     pub peer_map: RwLock<PeerMap>,
@@ -333,6 +376,7 @@ enum SwarmAction {
     NativeAction(Option<Vec<u8>>),
     FlushNativeBatch,
     DaServeDone(Option<DaServeDone>),
+    DaShardServeDone(Option<DaShardServeDone>),
 }
 
 /// A completed off-loop native-DA serve: the response and its channel, ready for
@@ -340,6 +384,14 @@ enum SwarmAction {
 type DaServeDone = (
     request_response::ResponseChannel<NativeDaNetResponse>,
     NativeDaNetResponse,
+    PeerId,
+);
+
+/// A completed off-loop shard serve (Sprint 5 T7), posted back for `send_response`
+/// on the swarm loop (only the loop owns the behaviour).
+type DaShardServeDone = (
+    request_response::ResponseChannel<NativeDaShardResponse>,
+    NativeDaShardResponse,
     PeerId,
 );
 
@@ -355,13 +407,20 @@ const MAX_DA_SERVE_INFLIGHT: usize = 8;
 /// unserved (445 requester timeouts, zero serves).
 struct DaServePool {
     tx: mpsc::UnboundedSender<DaServeDone>,
+    /// Typed completion channel for shard serves (T7); shares the same inflight
+    /// budget as body serves — both are the same class of off-loop DA reads.
+    shard_tx: mpsc::UnboundedSender<DaShardServeDone>,
     inflight: Arc<AtomicUsize>,
 }
 
 impl DaServePool {
-    fn new(tx: mpsc::UnboundedSender<DaServeDone>) -> Self {
+    fn new(
+        tx: mpsc::UnboundedSender<DaServeDone>,
+        shard_tx: mpsc::UnboundedSender<DaShardServeDone>,
+    ) -> Self {
         Self {
             tx,
+            shard_tx,
             inflight: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -710,7 +769,8 @@ pub async fn run_swarm_with_config(
     // Off-loop native-DA serve pool (#6 fix A): completions come back through
     // this channel and are answered in the select below.
     let (da_serve_tx, mut da_serve_rx) = mpsc::unbounded_channel::<DaServeDone>();
-    let da_serve = DaServePool::new(da_serve_tx);
+    let (shard_serve_tx, mut shard_serve_rx) = mpsc::unbounded_channel::<DaShardServeDone>();
+    let da_serve = DaServePool::new(da_serve_tx, shard_serve_tx);
 
     loop {
         let action = tokio::select! {
