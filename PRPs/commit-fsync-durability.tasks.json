@@ -1,0 +1,51 @@
+{
+  "prp": "commit-fsync-durability",
+  "created": "2026-07-13",
+  "design_doc": "docs/plans/commit-fsync-durability-design.md",
+  "impl_plan": "docs/plans/commit-fsync-durability-impl.md",
+  "option": "C — per-commit flush_wal(sync)",
+  "branch": "feat/commit-fsync-durability",
+  "gate": "Only build if hard-power-loss is in the deployment threat model (process-kill already survived).",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Add StateDb::sync_wal() (flush_wal(true)) + per-node toggle default off",
+      "status": "pending",
+      "files": ["crates/torus-state/src/db.rs"],
+      "validate": "cargo test -p torus-state sync_wal",
+      "depends_on": []
+    },
+    {
+      "id": 2,
+      "name": "Call sync_wal() at commit boundary (persist_committed_block_durably), gated",
+      "status": "pending",
+      "files": ["crates/torus-consensus/src/app.rs"],
+      "validate": "cargo test -p torus-consensus commit_triggers_single_wal_flush",
+      "depends_on": [1]
+    },
+    {
+      "id": 3,
+      "name": "Crash-durability RED test (kill-in-fsync-window)",
+      "status": "pending",
+      "files": ["crates/torus-consensus/tests/"],
+      "validate": "cargo test -p torus-consensus commit_survives_simulated_power_loss",
+      "depends_on": [2]
+    },
+    {
+      "id": 4,
+      "name": "Commit-latency A/B + default decision",
+      "status": "pending",
+      "files": ["docs/plans/commit-fsync-durability-impl.md"],
+      "validate": "manual: same-machine A/B table + decision",
+      "depends_on": [3]
+    },
+    {
+      "id": 5,
+      "name": "Devnet hard-stop acceptance + threat-model write-up + sequencing",
+      "status": "pending",
+      "files": ["docs/plans/commit-fsync-durability-design.md"],
+      "validate": "manual: devnet hard-stop clean restart + review sign-off",
+      "depends_on": [4]
+    }
+  ]
+}

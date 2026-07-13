@@ -56,6 +56,16 @@ N ms).
 - **+** amortizes fsync; decouples from the hot path. **−** bounded loss window (up
   to the cadence); weaker than per-write sync. **Effort:** M · **Risk:** Med.
 
+## DECISION (user, this session)
+**Option C chosen** — per-commit `flush_wal(sync)`. Rationale: `kv_store` and
+`native_da` share ONE `Arc<DB>` / WAL (verified: `main.rs:453/505` build
+`RocksKVStore::new(state_db.db_arc())`, `native_da.rs:48-51` shares the same
+`StateDb`), so a single `flush_wal(true)` at the commit boundary makes the whole
+committed prefix (frontier + header + body) durable atomically-by-WAL-order — full
+coverage, 1 fsync, and no frontier-durable-but-body-not wedge hazard that Option B's
+two separate synced writes would place on the implementer. Impl plan:
+`commit-fsync-durability-impl.md`.
+
 ## Recommendation
 **Resolve the threat-model gate first.** If crash-durability is in scope:
 **Option B**, with a commit-latency A/B before defaulting it on (fall back to C's
