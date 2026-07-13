@@ -25,3 +25,8 @@ reed-solomon-erasure = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true }
+criterion = "0.5"
+
+[[bench]]
+name = "erasure"
+harness = false
