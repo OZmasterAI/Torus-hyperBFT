@@ -12,14 +12,14 @@ use sha3::{Digest, Keccak256};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use torus_state::NativeDaStore;
+use torus_state::{NativeDaStore, StoredShard};
 
 use crate::behaviour::{
     TorusBehaviour, TorusBehaviourEvent, CONSENSUS_TOPIC, NATIVE_ACTION_TOPIC, TX_TOPIC,
 };
 use crate::codec::{
     BlockDataNetRequest, BlockDataNetResponse, DirectRequest, DirectResponse, NativeDaNetRequest,
-    NativeDaNetResponse, NativeDaShardResponse,
+    NativeDaNetResponse, NativeDaShardRequest, NativeDaShardResponse,
 };
 use crate::config::NetworkConfig;
 use crate::peer::PeerMap;
@@ -86,6 +86,18 @@ pub enum NetworkCommand {
     FetchNativeActions {
         target: VerifyingKey,
         hashes: Vec<[u8; 32]>,
+    },
+    /// Erasure-shard pull (T8-integration inc 3): fetch ONE shard (`shard_index`)
+    /// of `body_hash` from `target` via `/torus/native-da-shards/1.0`. The bridge
+    /// fan-out asks each DISTINCT validator for a DISTINCT index → k shards from k
+    /// sources (killing the s338 single-source serve hotspot). A skipped
+    /// disconnected peer just yields fewer shards → whole-body fallback (never
+    /// wedges), so this stays deliberately simpler than the S447-buffered
+    /// `FetchNativeActions` path.
+    FetchNativeDaShards {
+        target: VerifyingKey,
+        body_hash: [u8; 32],
+        shard_index: u16,
     },
 }
 
@@ -324,6 +336,13 @@ pub struct SharedState {
     /// (each = `bincode(SignedNativeAction)`), drained by the consensus app on a
     /// reconstruction miss (Task 6). Bounded by `MAX_INBOUND_QUEUE`.
     pub native_da_inbound: Mutex<VecDeque<Vec<u8>>>,
+    /// Inbound erasure shards received via the shard pull-fallback response
+    /// (T8-integration inc 3), each tagged with the SOURCE peer (`PeerId::to_bytes`)
+    /// so the distinct-source reconstruction rule counts one peer once. `torus-node`
+    /// (which depends on both crates) converts these `(source, StoredShard)` tuples
+    /// into `torus_consensus::shard_recovery::GatheredShard` on drain — the network
+    /// crate stays free of a consensus dependency. Bounded by `MAX_INBOUND_QUEUE`.
+    pub native_da_shards_inbound: Mutex<VecDeque<(Vec<u8>, StoredShard)>>,
     /// Per-validator queue of pre-proposal native-action push envelopes whose target
     /// was not connected at push time (Task 7). Flushed on the validator's
     /// `ConnectionEstablished` so a push is DELIVERED on (re)connect instead of
@@ -1635,7 +1654,36 @@ fn handle_event(
                 });
             }
         }
-        // Non-request shard events (Response/failures) are handled in T8; ignore here.
+        // T8-integration inc 3: inbound shard RESPONSE. Solicited (request_response
+        // only delivers for our own outbound request), so no sender verification is
+        // needed here — each shard's Merkle proof against its committed root is
+        // verified at RECONSTRUCTION time (torus-consensus `shard_recovery`), so a
+        // Byzantine peer cannot poison the rebuild. Tag with the source peer bytes so
+        // the distinct-source rule counts one peer once.
+        SwarmEvent::Behaviour(TorusBehaviourEvent::NativeDaShards(
+            request_response::Event::Message {
+                message: request_response::Message::Response { response, .. },
+                peer,
+                ..
+            },
+        )) => {
+            enqueue_native_da_shard(shared, peer.to_bytes(), response);
+        }
+        // Shard OUTBOUND/INBOUND failures: a failed shard fetch just yields fewer
+        // shards → the consensus recovery falls back to the whole-body pull (never
+        // wedges), so these are ignored beyond a debug log. T9 refines fallback
+        // triggers off these signals.
+        SwarmEvent::Behaviour(TorusBehaviourEvent::NativeDaShards(
+            request_response::Event::OutboundFailure { peer, error, .. },
+        )) => {
+            debug!(%peer, ?error, "native-da-shards OUTBOUND FAILURE (ignored — whole-body fallback)");
+        }
+        SwarmEvent::Behaviour(TorusBehaviourEvent::NativeDaShards(
+            request_response::Event::InboundFailure { peer, error, .. },
+        )) => {
+            debug!(%peer, ?error, "native-da-shards INBOUND FAILURE (ignored)");
+        }
+        // Other shard events (e.g. ResponseSent) — no-op.
         SwarmEvent::Behaviour(TorusBehaviourEvent::NativeDaShards(_)) => {}
         // FIX 6 (CONS-FIND-25-32): Sync protocol events.
         // TODO: When sync serving is implemented, handle sync requests in a
@@ -1987,6 +2035,41 @@ fn handle_command(
                 warn!("FetchNativeActions target not in peer map — dropping");
             }
         }
+        NetworkCommand::FetchNativeDaShards {
+            target,
+            body_hash,
+            shard_index,
+        } => {
+            let peer_id = shared
+                .peer_map
+                .read()
+                .unwrap()
+                .get_peer_id(&target)
+                .copied();
+            if let Some(pid) = peer_id {
+                if swarm.is_connected(&pid) {
+                    let req = NativeDaShardRequest {
+                        body_hash,
+                        shard_index,
+                    };
+                    swarm
+                        .behaviour_mut()
+                        .native_da_shards
+                        .send_request(&pid, req);
+                } else {
+                    // KEEP IT SIMPLE (unlike the S447-buffered FetchNativeActions):
+                    // a skipped disconnected peer just means fewer shards → the
+                    // consensus recovery falls back to the whole-body pull, never a
+                    // wedge. Nudge a (backoff-throttled) redial so a later retry can
+                    // land, then drop this request.
+                    if should_redial_now(shared, &pid) {
+                        let _ = swarm.dial(pid);
+                    }
+                }
+            } else {
+                warn!("FetchNativeDaShards target not in peer map — dropping");
+            }
+        }
     }
 }
 
@@ -2289,6 +2372,45 @@ fn verify_sender_key(
             None
         }
     }
+}
+
+/// Convert a received [`NativeDaShardResponse`] into a durable [`StoredShard`],
+/// gating on `present`: a peer that does not custody the shard answers
+/// `present == false` and this yields `None` (dropped by the caller). The
+/// remaining fields are copied VERBATIM — `StoredShard` is field-for-field the
+/// response MINUS `present` — so the fetcher verifies-then-reconstructs with the
+/// exact `(k, n, erasure_root, body_len)` the shard was built under. Pure (no
+/// shared state) so the conversion + present-gate is unit-testable standalone.
+fn native_da_shard_response_to_stored(resp: NativeDaShardResponse) -> Option<StoredShard> {
+    if !resp.present {
+        return None;
+    }
+    Some(StoredShard {
+        shard_index: resp.shard_index,
+        shard_bytes: resp.shard_bytes,
+        proof: resp.proof,
+        erasure_root: resp.erasure_root,
+        k: resp.k,
+        n: resp.n,
+        body_len: resp.body_len,
+    })
+}
+
+/// Enqueue one received shard response onto the inbound shard collector, tagged
+/// with its `source` peer bytes. Drops absent (`present == false`) responses via
+/// [`native_da_shard_response_to_stored`] and respects the `MAX_INBOUND_QUEUE`
+/// cap (warn+drop on overflow, mirroring the native-DA body path). Free fn so the
+/// enqueue + present-gate is unit-testable without a live `Swarm`.
+fn enqueue_native_da_shard(shared: &SharedState, source: Vec<u8>, resp: NativeDaShardResponse) {
+    let Some(stored) = native_da_shard_response_to_stored(resp) else {
+        return;
+    };
+    let mut queue = shared.native_da_shards_inbound.lock().unwrap();
+    if queue.len() >= MAX_INBOUND_QUEUE {
+        warn!("native-da-shards inbound queue full — dropping shard");
+        return;
+    }
+    queue.push_back((source, stored));
 }
 
 /// Push a message to the inbound queue with capacity enforcement.
@@ -2616,6 +2738,7 @@ mod tests {
             recent_native_bundles: Mutex::new(VecDeque::new()),
             native_da: RwLock::new(None),
             native_da_inbound: Mutex::new(VecDeque::new()),
+            native_da_shards_inbound: Mutex::new(VecDeque::new()),
             pending_native_pushes: Mutex::new(PendingSendQueue::new(8)),
             push_scheduler: Mutex::new(PushScheduler::for_pushes()),
             recently_deposed: RwLock::new(HashMap::new()),
@@ -3364,5 +3487,100 @@ mod tests {
             hashes,
             "all 40 hashes pulled, order preserved"
         );
+    }
+
+    /// T8-integration inc 3 (RED first): a PRESENT shard response must be converted
+    /// into a `StoredShard` field-for-field (the response MINUS `present`) and
+    /// pushed onto the inbound shard collector tagged with its source peer bytes,
+    /// so torus-node can drain `(source, StoredShard)` and build a `GatheredShard`.
+    /// MUST fail before inc 3 (no `enqueue_native_da_shard` / collector field).
+    #[test]
+    fn enqueue_shard_response_present_pushes_stored_shard() {
+        let shared = test_shared();
+        let resp = NativeDaShardResponse {
+            present: true,
+            shard_index: 1,
+            shard_bytes: vec![1, 2, 3],
+            proof: vec![[9u8; 32]],
+            erasure_root: [7u8; 32],
+            k: 2,
+            n: 3,
+            body_len: 42,
+        };
+        enqueue_native_da_shard(&shared, b"peerA".to_vec(), resp);
+
+        let q = shared.native_da_shards_inbound.lock().unwrap();
+        assert_eq!(q.len(), 1, "one present shard is queued");
+        let (source, stored) = &q[0];
+        assert_eq!(source, b"peerA", "tagged with the source peer bytes");
+        assert_eq!(stored.shard_index, 1);
+        assert_eq!(stored.shard_bytes, vec![1, 2, 3]);
+        assert_eq!(stored.proof, vec![[9u8; 32]]);
+        assert_eq!(stored.erasure_root, [7u8; 32]);
+        assert_eq!(stored.k, 2);
+        assert_eq!(stored.n, 3);
+        assert_eq!(stored.body_len, 42);
+    }
+
+    /// T8-integration inc 3 (RED first): an ABSENT shard response (`present == false`
+    /// — the peer does not custody that shard) must be DROPPED, never queued, so a
+    /// not-found never poisons the reconstruction pool. MUST fail before inc 3.
+    #[test]
+    fn enqueue_shard_response_absent_is_dropped() {
+        let shared = test_shared();
+        let resp = NativeDaShardResponse {
+            present: false,
+            shard_index: 2,
+            shard_bytes: Vec::new(),
+            proof: Vec::new(),
+            erasure_root: [0u8; 32],
+            k: 0,
+            n: 0,
+            body_len: 0,
+        };
+        enqueue_native_da_shard(&shared, b"peerB".to_vec(), resp);
+        assert!(
+            shared.native_da_shards_inbound.lock().unwrap().is_empty(),
+            "an absent (present=false) response is dropped, not queued"
+        );
+    }
+
+    /// T8-integration inc 3 (RED first): the pure conversion gates on `present` and
+    /// copies every field verbatim (response MINUS `present`). MUST fail before inc 3
+    /// (no `native_da_shard_response_to_stored`).
+    #[test]
+    fn shard_response_conversion_gates_on_present() {
+        assert!(
+            native_da_shard_response_to_stored(NativeDaShardResponse {
+                present: false,
+                shard_index: 5,
+                shard_bytes: vec![1],
+                proof: vec![[1u8; 32]],
+                erasure_root: [2u8; 32],
+                k: 1,
+                n: 1,
+                body_len: 1,
+            })
+            .is_none(),
+            "present=false yields None"
+        );
+        let stored = native_da_shard_response_to_stored(NativeDaShardResponse {
+            present: true,
+            shard_index: 5,
+            shard_bytes: vec![4, 5, 6],
+            proof: vec![[3u8; 32], [4u8; 32]],
+            erasure_root: [8u8; 32],
+            k: 4,
+            n: 6,
+            body_len: 99,
+        })
+        .expect("present=true yields Some");
+        assert_eq!(stored.shard_index, 5);
+        assert_eq!(stored.shard_bytes, vec![4, 5, 6]);
+        assert_eq!(stored.proof, vec![[3u8; 32], [4u8; 32]]);
+        assert_eq!(stored.erasure_root, [8u8; 32]);
+        assert_eq!(stored.k, 4);
+        assert_eq!(stored.n, 6);
+        assert_eq!(stored.body_len, 99);
     }
 }
