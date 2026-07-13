@@ -2377,7 +2377,25 @@ impl TorusApp {
         let actions: Vec<torus_types::SignedNativeAction> =
             native_with_senders.iter().map(|(_, a)| a.clone()).collect();
         match mempool.mirror_native_to_da(&actions) {
-            Ok(()) => native_with_senders,
+            Ok(()) => {
+                // T5 (recovery-path erasure): the whole-body mirror above is the
+                // durability guarantee; ADDITIONALLY custody erasure shards under the
+                // live set's (k,n) so a lagging peer can reconstruct from k sources
+                // instead of pulling the whole body from one (kills the s338 hotspot).
+                // Best-effort: a shard-encode failure only costs this node its ability
+                // to SERVE shards for these bodies — peers fall back to whole-body pull
+                // and never wedge — so it is logged, not fail-closed like the body.
+                let n = self.last_validator_set.validators.len();
+                let params = torus_state::ErasureParams::for_validator_set(n);
+                if let Err(e) = mempool.mirror_native_shards(&actions, params) {
+                    tracing::warn!(
+                        %e,
+                        count = actions.len(),
+                        "produce_block: shard custody encode FAILED (peers fall back to whole-body pull)"
+                    );
+                }
+                native_with_senders
+            }
             Err(e) => {
                 tracing::error!(
                     %e,

@@ -16,7 +16,7 @@ mod verified_cache;
 use std::sync::RwLock;
 
 use alloy_primitives::{Address, B256};
-use torus_state::{NativeDaStore, StateDb, StateError};
+use torus_state::{ErasureParams, NativeDaStore, StateDb, StateError};
 use torus_types::SignedNativeAction;
 
 use crate::verified_cache::FifoCache;
@@ -666,6 +666,21 @@ impl Mempool {
             return Err(e);
         }
         Ok(())
+    }
+
+    /// Additionally custody erasure shards for a proposed block's bodies (Sprint 5
+    /// T5). Thin pass-through to [`NativeDaStore::put_shards_batch`] under the
+    /// caller-supplied `(k, n)` (derived from the live validator set). ADDITIVE and
+    /// best-effort at the call site: the whole-body [`mirror_native_to_da`] is the
+    /// durability guarantee; a shard-custody failure only means this node can't
+    /// serve shards for these bodies (peers fall back to the whole-body pull, never
+    /// wedge), so the caller logs rather than fails the proposal.
+    pub fn mirror_native_shards(
+        &self,
+        actions: &[SignedNativeAction],
+        params: ErasureParams,
+    ) -> Result<(), StateError> {
+        self.da_store.put_shards_batch(actions, params)
     }
 
     /// Best-effort durable mirror of one native-action body, COALESCED (T2.2):
