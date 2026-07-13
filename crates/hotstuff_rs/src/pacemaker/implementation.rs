@@ -130,7 +130,7 @@ impl<N: Network> Pacemaker<N> {
                 }
 
                 // We extend the view timeout so that we will broadcast a `TimeoutVote` when this view times out again.
-                self.extend_view()?
+                self.extend_view(block_tree.highest_pc()?.view)?
 
             // 1.2. MonadBFT: broadcast TimeoutVote before advancing on normal view timeout.
             } else {
@@ -632,11 +632,14 @@ impl<N: Network> Pacemaker<N> {
 
     /// Extend the timeout of the current view, which must be an Epoch-Change View.
     ///
+    /// `highest_qc_view` is the view of the block tree's Highest PC: the Task A
+    /// stall multiplier scales the extension while views have outrun QCs.
+    ///
     /// # Errors
     ///
     /// This function should only be called if the current view is an Epoch-Change View. Otherwise, an
     /// [`ExtendViewError`] will be returned.
-    fn extend_view(&mut self) -> Result<(), ExtendViewError> {
+    fn extend_view(&mut self, highest_qc_view: ViewNumber) -> Result<(), ExtendViewError> {
         // 1. Confirm that the current view is an Epoch-Change View.
         let cur_view = self.view_info.view;
         if !is_epoch_change_view(&cur_view, self.config.epoch_length) {
@@ -644,8 +647,11 @@ impl<N: Network> Pacemaker<N> {
         };
 
         // 2. Increase the timeout of the current view inside `PacemakerState`.
-        self.state
-            .extend_epoch_change_view_timeout(self.view_info.view, &self.config);
+        self.state.extend_epoch_change_view_timeout(
+            self.view_info.view,
+            &self.config,
+            highest_qc_view,
+        );
 
         // 3. Increase the timeout of the current view inside `ViewInfo`.
         let new_timeout = self
@@ -808,7 +814,9 @@ impl PacemakerState {
         }
     }
 
-    /// Extend the timeout of the `epoch_change_view` by another `config.max_view_time`.
+    /// Extend the timeout of the `epoch_change_view` by another `config.max_view_time`,
+    /// scaled by the Task A stall multiplier (1 while the QC frontier keeps up
+    /// — the legacy flat extend).
     ///
     /// # Preconditions
     ///
@@ -817,9 +825,13 @@ impl PacemakerState {
         &mut self,
         epoch_change_view: ViewNumber,
         config: &PacemakerConfiguration,
+        highest_qc_view: ViewNumber,
     ) {
-        self.timeouts
-            .insert(epoch_change_view, Instant::now() + config.max_view_time);
+        let multiplier = config.stall_multiplier(epoch_change_view, highest_qc_view);
+        self.timeouts.insert(
+            epoch_change_view,
+            Instant::now() + config.max_view_time * multiplier,
+        );
     }
 }
 
@@ -1391,6 +1403,38 @@ fn update_view_threads_qc_frontier() {
         "mid-epoch stalled entry must be stretched in place (depth 1 => x2)"
     );
     assert!(deadline <= after + mvt * 2);
+}
+
+/// Task A (pacemaker backoff): the epoch-change extend path scales with the
+/// stall multiplier too. A healthy frontier keeps the legacy flat
+/// `max_view_time` extend; a lagging frontier extends by
+/// `max_view_time * factor^min(depth, cap)`.
+#[test]
+fn extend_scales_with_gap() {
+    // The fixture's epoch length is 100_000, so view 100_000 is an
+    // epoch-change view (extend_view only accepts those).
+    let (mut pacemaker, _vss) = test_pacemaker(100_000);
+    let mvt = Duration::from_millis(500);
+
+    // Healthy: the QC for view 99_999 justifies the epoch-change view.
+    let before = Instant::now();
+    pacemaker.extend_view(ViewNumber::new(99_999)).unwrap();
+    let after = Instant::now();
+    let deadline = pacemaker.query().deadline;
+    assert!(
+        deadline >= before + mvt && deadline <= after + mvt,
+        "healthy extend must stay the legacy flat max_view_time"
+    );
+
+    // Stalled: frontier stuck 4 views behind the justified entry => x16.
+    let before = Instant::now();
+    pacemaker.extend_view(ViewNumber::new(99_995)).unwrap();
+    let after = Instant::now();
+    let deadline = pacemaker.query().deadline;
+    assert!(
+        deadline >= before + mvt * 16 && deadline <= after + mvt * 16,
+        "stalled extend must scale by the stall multiplier"
+    );
 }
 
 /// Task A (pacemaker backoff): the S395 rebase clamp must not swallow a
