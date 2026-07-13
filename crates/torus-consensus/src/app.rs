@@ -2379,21 +2379,15 @@ impl TorusApp {
         match mempool.mirror_native_to_da(&actions) {
             Ok(()) => {
                 // T5 (recovery-path erasure): the whole-body mirror above is the
-                // durability guarantee; ADDITIONALLY custody erasure shards under the
-                // live set's (k,n) so a lagging peer can reconstruct from k sources
-                // instead of pulling the whole body from one (kills the s338 hotspot).
-                // Best-effort: a shard-encode failure only costs this node its ability
-                // to SERVE shards for these bodies — peers fall back to whole-body pull
-                // and never wedge — so it is logged, not fail-closed like the body.
-                let n = self.last_validator_set.validators.len();
-                let params = torus_state::ErasureParams::for_validator_set(n);
-                if let Err(e) = mempool.mirror_native_shards(&actions, params) {
-                    tracing::warn!(
-                        %e,
-                        count = actions.len(),
-                        "produce_block: shard custody encode FAILED (peers fall back to whole-body pull)"
-                    );
-                }
+                // durability guarantee; ADDITIONALLY custody erasure shards so a
+                // lagging peer can reconstruct from k sources instead of pulling the
+                // whole body from one (kills the s338 hotspot). Best-effort — see
+                // `custody_native_shards_best_effort`.
+                self.custody_native_shards_best_effort(
+                    mempool,
+                    &actions,
+                    self.last_header.height.saturating_add(1),
+                );
                 native_with_senders
             }
             Err(e) => {
@@ -2407,6 +2401,44 @@ impl TorusApp {
                 }
                 Vec::new()
             }
+        }
+    }
+
+    /// Additively custody erasure shards for `actions` under the LIVE validator
+    /// set's `(k, n)` — best-effort, NEVER fails the caller (proposal or vote).
+    ///
+    /// The whole-body mirror (`mirror_native_to_da`) is the durability guarantee;
+    /// this ADDS shard custody so a lagging peer can reconstruct a body from `k`
+    /// shards gathered across `k` DIFFERENT sources instead of pulling the whole
+    /// body from ONE. Both the proposer (`produce_block`) AND every validating peer
+    /// (`validate_block`'s decode path) must call this: only then are there `k`
+    /// DISTINCT shard sources. With proposer-only custody there is a SINGLE source,
+    /// so every lagging peer falls back to whole-body pull — re-creating the s338
+    /// single-source hotspot (155 pull timeouts + 238 substream exhaustions to one
+    /// peer).
+    ///
+    /// A shard-encode/write failure only costs THIS node its ability to SERVE
+    /// shards for these bodies (peers fall back to whole-body pull and never
+    /// wedge), so it is logged — NOT fail-closed like the body mirror. `height` is
+    /// included in the warn log for correlation. Empty input is a no-op.
+    fn custody_native_shards_best_effort(
+        &self,
+        mempool: &torus_mempool::Mempool,
+        actions: &[torus_types::SignedNativeAction],
+        height: u64,
+    ) {
+        if actions.is_empty() {
+            return;
+        }
+        let n = self.last_validator_set.validators.len();
+        let params = torus_state::ErasureParams::for_validator_set(n);
+        if let Err(e) = mempool.mirror_native_shards(actions, params) {
+            tracing::warn!(
+                %e,
+                height,
+                count = actions.len(),
+                "shard custody encode FAILED (peers fall back to whole-body pull)"
+            );
         }
     }
 
@@ -2448,6 +2480,16 @@ impl TorusApp {
                         );
                         return Err(ValidateBlockResponse::MissingData);
                     }
+                    // T5 validator-side custody: the body is now durable locally, so
+                    // ALSO custody its shards — this validating peer becomes one of k
+                    // distinct shard sources. Proposer-only custody left a SINGLE
+                    // source, so every lagging peer fell back to whole-body pull (the
+                    // s338 hotspot). Best-effort, never fails the vote.
+                    self.custody_native_shards_best_effort(
+                        mempool,
+                        &block.native_actions,
+                        block.header.height,
+                    );
                 }
             }
             Ok(block)
@@ -2494,6 +2536,22 @@ impl TorusApp {
                     }
                 }
             };
+
+            // T5 validator-side custody (compact path): the reconstructed bodies are
+            // now durable in the DA store (`reconstruct_native_actions_hot` read them
+            // from `da_store`, or the recovery worker mirrored them), so custody their
+            // shards — this validating peer becomes one of k distinct shard sources
+            // instead of the proposer being the lone source (s338 hotspot).
+            // Best-effort, never fails the vote.
+            if !native_actions.is_empty() {
+                if let Some(ref mempool) = self.mempool {
+                    self.custody_native_shards_best_effort(
+                        mempool,
+                        &native_actions,
+                        compact.header.height,
+                    );
+                }
+            }
 
             Ok(TorusBlock {
                 header: compact.header,
@@ -3572,6 +3630,24 @@ mod crash_recovery_tests {
             native_actions,
             evm_transactions: vec![],
             core_writer_actions: vec![],
+        }
+    }
+
+    /// Build an `n`-entry validator set (only the entry COUNT is load-bearing here:
+    /// `ErasureParams::for_validator_set` derives `(k, n)` purely from the length).
+    /// Entries carry distinct addresses/pubkeys so the set is well-formed.
+    fn make_validator_set(n: usize) -> torus_types::ValidatorSet {
+        let validators = (0..n)
+            .map(|i| torus_types::ValidatorInfo {
+                address: Address::from([(i as u8) + 1; 20]),
+                pubkey: torus_types::PublicKey([(i as u8) + 1; 32]),
+                power: 1,
+                commission_bps: 0,
+            })
+            .collect();
+        torus_types::ValidatorSet {
+            validators,
+            epoch: 0,
         }
     }
 
@@ -4690,6 +4766,111 @@ mod crash_recovery_tests {
             assert!(
                 mempool.get_native_da(&hash).is_some(),
                 "every proposed body must be durable in the DA store after mirror_or_drop_native"
+            );
+        }
+    }
+
+    /// T8-integration piece 4 (RED-first): a VALIDATING peer that decodes a full
+    /// inline `TorusBlock` proposal must ALSO custody the body's erasure shards — not
+    /// just the proposer. Only then are there `k` distinct shard sources; with
+    /// proposer-only custody there is a single source and every lagging peer falls
+    /// back to whole-body pull (the s338 hotspot). n=4 live set ⇒ params (k=2, n=4),
+    /// so all 4 shards must be custodied after `decode_proposal_and_ensure_durable`.
+    /// RED on HEAD: the validate path mirrored the whole body but never custodied
+    /// shards ⇒ `get_shard` returned `None`.
+    #[test]
+    fn validate_block_custodies_shards_torusblock() {
+        let (config, state_db) = make_test_config_and_db();
+        let mempool = Arc::new(Mempool::new(
+            state_db.clone(),
+            torus_mempool::MempoolConfig::default(),
+        ));
+        let action = sign_claim_rewards(1);
+        let hash = torus_types::compute_action_hash(&action);
+
+        // Sanity: derived params for the n=4 live set are exactly (k=2, n=4).
+        let params = torus_state::ErasureParams::for_validator_set(4);
+        assert_eq!((params.k, params.n), (2, 4));
+
+        // Precondition: no shards custodied yet (validate has not run).
+        assert!(
+            mempool.get_shard(&hash, 0).is_none(),
+            "precondition: no shard 0 custodied before validation"
+        );
+
+        // A FULL inline TorusBlock datum (bodies inline).
+        let block = make_block(1, vec![action.clone()]);
+        let datum = encode_proposal_datum(&block, false);
+
+        let mut app =
+            TorusApp::new(state_db.clone(), &config, None, Some(mempool.clone()), None);
+        app.last_validator_set = make_validator_set(4);
+
+        match app.decode_proposal_and_ensure_durable(&datum) {
+            Ok(b) => assert_eq!(b.native_actions.len(), 1),
+            Err(_) => panic!("legacy full TorusBlock must decode as Valid, not short-circuit"),
+        }
+
+        // The invariant: the validating peer custodied all n=4 shards, so it is now a
+        // distinct shard source (kills the single-source hotspot).
+        for i in 0..params.n as u16 {
+            assert!(
+                mempool.get_shard(&hash, i).is_some(),
+                "validator must custody shard {i} after validate (k distinct sources)"
+            );
+        }
+    }
+
+    /// T8-integration piece 4 (RED-first), compact path: same custody invariant when
+    /// the proposal is a `CompactBlock` (bodies out-of-band). The body is pre-loaded
+    /// into the DA store (models push/pull delivery) so the hot reconstruct succeeds;
+    /// after decode the validating peer must have custodied the body's shards.
+    /// RED on HEAD: the compact branch reconstructed the body but never custodied
+    /// shards ⇒ `get_shard` returned `None`.
+    #[test]
+    fn validate_block_custodies_shards_compactblock() {
+        let (config, state_db) = make_test_config_and_db();
+        let mempool = Arc::new(Mempool::new(
+            state_db.clone(),
+            torus_mempool::MempoolConfig::default(),
+        ));
+        let action = sign_claim_rewards(2);
+        let hash = torus_types::compute_action_hash(&action);
+
+        // Pre-load the body so the compact hot-reconstruct finds it in the DA store
+        // (models the out-of-band push/pull delivery a validating peer sees).
+        mempool
+            .mirror_native_to_da(&[action.clone()])
+            .expect("mirror body into DA store");
+
+        // Precondition: body durable, but shards NOT yet custodied.
+        assert!(
+            mempool.get_native_da(&hash).is_some(),
+            "precondition: body durable before validation"
+        );
+        assert!(
+            mempool.get_shard(&hash, 0).is_none(),
+            "precondition: no shard 0 custodied before validation"
+        );
+
+        // A COMPACT datum (native_action_hashes only; bodies out-of-band).
+        let block = make_block(1, vec![action.clone()]);
+        let datum = encode_proposal_datum(&block, true);
+
+        let mut app =
+            TorusApp::new(state_db.clone(), &config, None, Some(mempool.clone()), None);
+        app.last_validator_set = make_validator_set(4);
+
+        match app.decode_proposal_and_ensure_durable(&datum) {
+            Ok(b) => assert_eq!(b.native_actions.len(), 1),
+            Err(_) => panic!("compact block with a pre-loaded body must decode as Valid"),
+        }
+
+        let params = torus_state::ErasureParams::for_validator_set(4);
+        for i in 0..params.n as u16 {
+            assert!(
+                mempool.get_shard(&hash, i).is_some(),
+                "validator (compact path) must custody shard {i} after validate"
             );
         }
     }

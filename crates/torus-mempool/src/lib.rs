@@ -16,7 +16,7 @@ mod verified_cache;
 use std::sync::RwLock;
 
 use alloy_primitives::{Address, B256};
-use torus_state::{ErasureParams, NativeDaStore, StateDb, StateError};
+use torus_state::{ErasureParams, NativeDaStore, StateDb, StateError, StoredShard};
 use torus_types::SignedNativeAction;
 
 use crate::verified_cache::FifoCache;
@@ -648,6 +648,18 @@ impl Mempool {
                 None
             }
         }
+    }
+
+    /// Fetch a single custodied erasure shard by `(body hash, shard index)`.
+    ///
+    /// Mirrors the read style of [`get_native_da`](Self::get_native_da): thin
+    /// pass-through to [`NativeDaStore::get_shard`], with a store read-error
+    /// swallowed to `None` (to a fetcher, a read failure is indistinguishable
+    /// from "not custodied" — either way it tries another peer/index and never
+    /// wedges). Needed so the shard-serve path (and tests) can read back the
+    /// shards a proposer OR a validating peer custodied.
+    pub fn get_shard(&self, hash: &B256, index: u16) -> Option<StoredShard> {
+        self.da_store.get_shard(&hash.0, index).ok().flatten()
     }
 
     /// Mirror native-action bodies into the durable DA store (proposer guarantee:
