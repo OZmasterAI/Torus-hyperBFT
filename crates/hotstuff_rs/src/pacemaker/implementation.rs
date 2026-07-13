@@ -993,6 +993,25 @@ pub fn select_leader_reputation_weighted(
     select_leader(view, &adjusted_vs)
 }
 
+/// Task A: multiplicative view-timeout backoff, derived purely from
+/// consensus-visible state — `factor^min(view − highest_qc_view, cap)`,
+/// saturating (never below 1, gap saturates at 0 when the QC frontier is
+/// ahead). Because `highest_qc_view` is a consensus object (frozen and
+/// identical across honest replicas exactly when backoff is active, i.e.
+/// during a stall), identical inputs yield an identical schedule on every
+/// replica: lockstep by construction. `cap = 0` (or `factor <= 1`) makes the
+/// multiplier constantly 1 — the pre-backoff schedule, byte-identical.
+///
+/// NOTE for callers: the QC for view v justifies *entering* v+1, so a healthy
+/// entry has `view == highest_qc_view + 1`. Consult sites that must stay
+/// neutral on the happy path evaluate `backoff_multiplier(view,
+/// highest_qc_view + 1, ..)` — see [`PacemakerState::stall_multiplier`].
+fn backoff_multiplier(view: ViewNumber, highest_qc_view: ViewNumber, factor: u32, cap: u32) -> u32 {
+    let gap = view.int().saturating_sub(highest_qc_view.int());
+    let exponent = gap.min(cap as u64) as u32;
+    factor.saturating_pow(exponent).max(1)
+}
+
 /// Check whether `view` is an epoch-change view given the configured `epoch_length`.
 /// FIX CONS-FIND-20: Guard against epoch_length=0 to prevent division by zero.
 fn is_epoch_change_view(view: &ViewNumber, epoch_length: EpochLength) -> bool {
@@ -1240,6 +1259,28 @@ fn update_view_fast_run_deadline_bounded() {
         pacemaker.query().deadline <= Instant::now() + Duration::from_millis(500) * 2,
         "fast-run surplus must be bounded to 2x max_view_time"
     );
+}
+
+/// Task A (pacemaker backoff): the multiplier is a pure function of
+/// `(view, highest_qc_view, factor, cap)` — no node-local timing state — so
+/// every honest replica derives the identical schedule (lockstep-exact).
+#[test]
+fn backoff_multiplier_table() {
+    let v = ViewNumber::new(1000);
+
+    // Gap 0: QC frontier caught up — neutral.
+    assert_eq!(backoff_multiplier(v, v, 2, 8), 1);
+    // Gap 3: geometric growth.
+    assert_eq!(backoff_multiplier(v + 3, v, 2, 8), 8);
+    // Deep stall: exponent capped at `cap`.
+    assert_eq!(backoff_multiplier(v + 100, v, 2, 8), 2u32.pow(8));
+    // QC frontier ahead of the view: gap saturates to 0 — neutral.
+    assert_eq!(backoff_multiplier(v, v + 5, 2, 8), 1);
+    // cap = 0 is the runtime kill switch: multiplier constantly 1.
+    assert_eq!(backoff_multiplier(v + 100, v, 2, 0), 1);
+    // Degenerate factors never zero the schedule: multiplier floors at 1.
+    assert_eq!(backoff_multiplier(v + 3, v, 0, 8), 1);
+    assert_eq!(backoff_multiplier(v + 3, v, 1, 8), 1);
 }
 
 /// Task A (pacemaker backoff): the backoff knobs are fleet-wide configuration
