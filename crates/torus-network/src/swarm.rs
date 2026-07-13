@@ -917,6 +917,17 @@ pub async fn run_swarm_with_config(
             }
             // Unreachable while `da_serve` (held by this loop) owns a sender.
             SwarmAction::DaServeDone(None) => {}
+            SwarmAction::DaShardServeDone(Some((channel, response, peer))) => {
+                if swarm
+                    .behaviour_mut()
+                    .native_da_shards
+                    .send_response(channel, response)
+                    .is_err()
+                {
+                    warn!(%peer, "native-da-shards send_response FAILED (channel dead)");
+                }
+            }
+            SwarmAction::DaShardServeDone(None) => {}
             SwarmAction::Command(Some(cmd)) => {
                 handle_command(*cmd, &mut swarm, &shared, &local_key, &consensus_topic);
             }
@@ -1570,9 +1581,58 @@ fn handle_event(
             warn!(%peer, ?error, "native-da INBOUND FAILURE");
         }
         SwarmEvent::Behaviour(TorusBehaviourEvent::NativeDa(_)) => {}
-        // Sprint 5 T6: erasure-shard fetch events. Registered/plumbed here so the
-        // match is explicit; the serve (Request) and fetch (Response/OutboundFailure)
-        // handlers land in T7/T8. Stubbed for now.
+        // Sprint 5 T7: erasure-shard fetch — inbound Request. Serve one shard OFF
+        // the consensus loop (a point-get of a ≤~3MB value; inline it would queue
+        // the loop behind recovery traffic, the S387 lesson). Reuse the da_serve
+        // admission gate; overloaded → present=false so the requester rotates.
+        SwarmEvent::Behaviour(TorusBehaviourEvent::NativeDaShards(
+            request_response::Event::Message {
+                message:
+                    request_response::Message::Request {
+                        request, channel, ..
+                    },
+                peer,
+                ..
+            },
+        )) => {
+            if !da_serve.try_admit() {
+                if let Some(ref m) = shared.metrics {
+                    m.native_da_serve_dropped.inc();
+                }
+                let resp = NativeDaShardResponse {
+                    present: false,
+                    shard_index: request.shard_index,
+                    shard_bytes: Vec::new(),
+                    proof: Vec::new(),
+                    erasure_root: [0u8; 32],
+                    k: 0,
+                    n: 0,
+                    body_len: 0,
+                };
+                if swarm
+                    .behaviour_mut()
+                    .native_da_shards
+                    .send_response(channel, resp)
+                    .is_err()
+                {
+                    warn!(%peer, "native-da-shards send_response FAILED (channel dead)");
+                }
+            } else {
+                let store = shared.native_da.read().unwrap().clone();
+                let tx = da_serve.shard_tx.clone();
+                let inflight = Arc::clone(&da_serve.inflight);
+                tokio::task::spawn_blocking(move || {
+                    let resp = serve_native_da_shard(
+                        store.as_ref(),
+                        &request.body_hash,
+                        request.shard_index,
+                    );
+                    let _ = tx.send((channel, resp, peer));
+                    inflight.fetch_sub(1, Ordering::Relaxed);
+                });
+            }
+        }
+        // Non-request shard events (Response/failures) are handled in T8; ignore here.
         SwarmEvent::Behaviour(TorusBehaviourEvent::NativeDaShards(_)) => {}
         // FIX 6 (CONS-FIND-25-32): Sync protocol events.
         // TODO: When sync serving is implemented, handle sync requests in a
