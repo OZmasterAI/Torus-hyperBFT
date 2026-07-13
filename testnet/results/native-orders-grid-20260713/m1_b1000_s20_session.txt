@@ -1,0 +1,59 @@
+=== Torus Throughput Benchmark ===
+Mode: consensus
+Sign mode: session (ed25519 fast path)
+Duration: 20s
+Senders: 20 (offset 20)
+Batch size: 1000 order(s)/action
+Submit batch: 15 action(s)/RPC call
+RPC endpoints: 1
+Pre-sign: 55 batches/sender (825 actions/sender, signed before the clock)
+Rate: 30 actions/s/sender (paced fire)
+
+Registering 20 ed25519 session(s) (scope: Full)...
+  20/20 session(s) admitted.
+  waiting for sessions to commit (canary probe)... live (canary accepted).
+Pre-signing 55 payloads x 20 senders...
+Pre-signed 16500 actions in 2.1s
+[1s] submitted: 15 actions (30/s) | included: 0 actions (0/s) | orders ~0/s | blk: #1835873 | 83ms/blk
+[1s] submitted: 15 actions (13/s) | included: 15 actions (13/s) | orders ~12645/s | blk: #1835885 | 56ms/blk
+[submit] parse: error decoding response body
+[submit] parse: error decoding response body
+[submit] parse: error decoding response body
+[submit] parse: error decoding response body
+[submit] parse: error decoding response body
+[2s] submitted: 930 actions (402/s) | included: 15 actions (6/s) | orders ~6483/s | blk: #1835904 | 59ms/blk
+[3s] submitted: 960 actions (341/s) | included: 15 actions (5/s) | orders ~5329/s | blk: #1835905 | 74ms/blk
+[3s] submitted: 960 actions (289/s) | included: 15 actions (5/s) | orders ~4523/s | blk: #1835905 | 74ms/blk
+[4s] submitted: 975 actions (255/s) | included: 15 actions (4/s) | orders ~3929/s | blk: #1835906 | 98ms/blk
+[5s] submitted: 1,005 actions (208/s) | included: 15 actions (3/s) | orders ~3111/s | blk: #1835906 | 98ms/blk
+[7s] submitted: 1,890 actions (286/s) | included: 15 actions (2/s) | orders ~2266/s | blk: #1835907 | 165ms/blk
+[7s] submitted: 1,965 actions (276/s) | included: 15 actions (2/s) | orders ~2107/s | blk: #1835907 | 165ms/blk
+[11s] submitted: 2,760 actions (258/s) | included: 15 actions (1/s) | orders ~1401/s | blk: #1835907 | 165ms/blk
+[11s] submitted: 2,940 actions (262/s) | included: 15 actions (1/s) | orders ~1339/s | blk: #1835907 | 165ms/blk
+[12s] submitted: 2,940 actions (251/s) | included: 15 actions (1/s) | orders ~1281/s | blk: #1835907 | 165ms/blk
+[13s] submitted: 3,015 actions (237/s) | included: 15 actions (1/s) | orders ~1180/s | blk: #1835907 | 165ms/blk
+[15s] submitted: 3,765 actions (253/s) | included: 15 actions (1/s) | orders ~1007/s | blk: #1835907 | 165ms/blk
+[15s] submitted: 3,960 actions (257/s) | included: 15 actions (1/s) | orders ~974/s | blk: #1835907 | 165ms/blk
+[16s] submitted: 3,960 actions (249/s) | included: 15 actions (1/s) | orders ~943/s | blk: #1835907 | 165ms/blk
+[18s] submitted: 3,975 actions (222/s) | included: 15 actions (1/s) | orders ~837/s | blk: #1835907 | 165ms/blk
+[19s] submitted: 4,860 actions (258/s) | included: 15 actions (1/s) | orders ~796/s | blk: #1835907 | 165ms/blk
+[19s] submitted: 4,920 actions (254/s) | included: 15 actions (1/s) | orders ~776/s | blk: #1835907 | 165ms/blk
+[20s] submitted: 4,935 actions (249/s) | included: 15 actions (1/s) | orders ~756/s | blk: #1835907 | 165ms/blk
+[21s] submitted: 4,995 actions (240/s) | included: 15 actions (1/s) | orders ~720/s | blk: #1835907 | 165ms/blk
+[21s] submitted: 4,995 actions (234/s) | included: 15 actions (1/s) | orders ~703/s | blk: #1835907 | 165ms/blk
+[22s] submitted: 5,895 actions (270/s) | included: 15 actions (1/s) | orders ~687/s | blk: #1835907 | 165ms/blk
+[drain] +150 actions in blocks #1835908..#1835910 (executor catching up)
+[drain] +350 actions in blocks #1835911..#1835918 (executor catching up)
+[drain] +250 actions in blocks #1835919..#1835923 (executor catching up)
+[drain] +250 actions in blocks #1835924..#1835943 (executor catching up)
+
+--- Results ---
+Submitted:  5,895 native actions (267/s)
+Included:   1,015 unique native actions (46/s) [1,015 slots, dup x1.00]
+Orders:     1,015,000 orders (46053/s)  [actions x1000 batch]
+Drop rate:  82.8%
+Block time: 165ms avg
+Blocks:     61 with bodies in #1835868..#1835928, 16 avg native/block
+
+Peak:       46/s included (block #1835908, 50 actions)
+Sustained:  46053 orders/s (46 actions/s) over 20s
