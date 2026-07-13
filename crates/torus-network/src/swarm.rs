@@ -1510,6 +1510,10 @@ fn handle_event(
             warn!(%peer, ?error, "native-da INBOUND FAILURE");
         }
         SwarmEvent::Behaviour(TorusBehaviourEvent::NativeDa(_)) => {}
+        // Sprint 5 T6: erasure-shard fetch events. Registered/plumbed here so the
+        // match is explicit; the serve (Request) and fetch (Response/OutboundFailure)
+        // handlers land in T7/T8. Stubbed for now.
+        SwarmEvent::Behaviour(TorusBehaviourEvent::NativeDaShards(_)) => {}
         // FIX 6 (CONS-FIND-25-32): Sync protocol events.
         // TODO: When sync serving is implemented, handle sync requests in a
         // spawned task (tokio::spawn) to avoid blocking the consensus event loop.
