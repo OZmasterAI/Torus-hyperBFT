@@ -153,7 +153,11 @@ impl<N: Network> Pacemaker<N> {
                         .publish(&self.event_publisher)
                     }
                 }
-                self.update_view(cur_view + 1, &validator_set_state)?;
+                self.update_view(
+                    cur_view + 1,
+                    &validator_set_state,
+                    block_tree.highest_pc()?.view,
+                )?;
             }
 
             return Ok(());
@@ -409,7 +413,11 @@ impl<N: Network> Pacemaker<N> {
 
                     let next_view = tc.view + 1;
                     if next_view > self.view_info.view {
-                        self.update_view(next_view, &validator_set_state)?
+                        self.update_view(
+                            next_view,
+                            &validator_set_state,
+                            block_tree.highest_pc()?.view,
+                        )?
                     }
                 }
             }
@@ -500,7 +508,11 @@ impl<N: Network> Pacemaker<N> {
 
             let next_view = progress_certificate.view() + 1;
             if next_view > self.view_info.view {
-                self.update_view(next_view, &validator_set_state)?
+                self.update_view(
+                    next_view,
+                    &validator_set_state,
+                    block_tree.highest_pc()?.view,
+                )?
             }
         }
 
@@ -508,6 +520,11 @@ impl<N: Network> Pacemaker<N> {
     }
 
     /// Update the Pacemaker's state in order to enter a specified `next_view`.
+    ///
+    /// `highest_qc_view` is the view of the block tree's Highest PC at entry
+    /// time. It drives the Task A stall multiplier: consensus-visible state
+    /// only, so every honest replica derives the identical (possibly
+    /// backed-off) deadline for `next_view`.
     ///
     /// # Preconditions
     ///
@@ -517,6 +534,7 @@ impl<N: Network> Pacemaker<N> {
         &mut self,
         next_view: ViewNumber,
         validator_set_state: &ValidatorSetState,
+        highest_qc_view: ViewNumber,
     ) -> Result<(), PacemakerError> {
         let cur_view = self.view_info.view;
 
@@ -532,10 +550,8 @@ impl<N: Network> Pacemaker<N> {
 
         // 2. If about to enter a new epoch, set timeouts for the new epoch.
         if epoch(cur_view, self.config.epoch_length) != epoch(next_view, self.config.epoch_length) {
-            // Interim (Task A/3): `next_view` as QC frontier keeps the
-            // multiplier at 1 until Task A/4 threads the real frontier.
             self.state
-                .update_timeouts(next_view, &self.config, next_view);
+                .update_timeouts(next_view, &self.config, highest_qc_view);
         }
 
         // 2b. S395 liveness fix: the per-epoch schedule assigns every view an ABSOLUTE
@@ -555,10 +571,29 @@ impl<N: Network> Pacemaker<N> {
             .get(&next_view)
             .ok_or(UpdateViewError::GetViewTimeoutError { view: next_view })?;
         if scheduled > Instant::now() + self.config.max_view_time * 2 {
-            // Interim (Task A/3): `next_view` as QC frontier keeps the
-            // multiplier at 1 until Task A/4 threads the real frontier.
             self.state
-                .update_timeouts(next_view, &self.config, next_view);
+                .update_timeouts(next_view, &self.config, highest_qc_view);
+        }
+
+        // 2c. Task A (adaptive backoff): if views have outrun the QC frontier —
+        // the lockstep-stall signature: views keep being abandoned without a
+        // new QC forming — stretch the entered view's deadline to
+        // `max_view_time * factor^min(stall_depth, cap)` from now, so honest
+        // replicas overlap in a view long enough for a QC to form. The
+        // multiplier is a pure function of `(next_view, highest_qc_view,
+        // fleet config)`: every honest replica derives the identical deadline.
+        // Healthy entries (multiplier 1) leave the schedule untouched.
+        let multiplier = self.config.stall_multiplier(next_view, highest_qc_view);
+        if multiplier > 1 {
+            let scheduled = *self
+                .state
+                .timeouts
+                .get(&next_view)
+                .ok_or(UpdateViewError::GetViewTimeoutError { view: next_view })?;
+            let backed_off = Instant::now() + self.config.max_view_time * multiplier;
+            if backed_off > scheduled {
+                self.state.timeouts.insert(next_view, backed_off);
+            }
         }
 
         // 3. Update the Pacemaker's `view_info` state.
@@ -1273,8 +1308,10 @@ fn update_view_jump_rebases_stale_schedule() {
     let (mut pacemaker, vss) = test_pacemaker(1);
     let max_view_time = Duration::from_millis(500);
 
+    // Healthy QC frontier (the jump was justified by a fresh certificate):
+    // the stall multiplier stays 1 and the legacy rebase semantics apply.
     pacemaker
-        .update_view(ViewNumber::new(39_000), &vss)
+        .update_view(ViewNumber::new(39_000), &vss, ViewNumber::new(38_999))
         .unwrap();
     assert!(
         pacemaker.query().deadline <= Instant::now() + max_view_time * 2,
@@ -1284,7 +1321,7 @@ fn update_view_jump_rebases_stale_schedule() {
     // Views AFTER the jump target must be rebased too, or every subsequent
     // sequential advance would park again.
     pacemaker
-        .update_view(ViewNumber::new(39_001), &vss)
+        .update_view(ViewNumber::new(39_001), &vss, ViewNumber::new(39_000))
         .unwrap();
     assert!(pacemaker.query().deadline <= Instant::now() + max_view_time * 2);
 }
@@ -1296,12 +1333,55 @@ fn update_view_jump_rebases_stale_schedule() {
 fn update_view_fast_run_deadline_bounded() {
     let (mut pacemaker, vss) = test_pacemaker(1);
     for v in 2..=50u64 {
-        pacemaker.update_view(ViewNumber::new(v), &vss).unwrap();
+        // Fast QC run: every entry is justified by the previous view's QC.
+        pacemaker
+            .update_view(ViewNumber::new(v), &vss, ViewNumber::new(v - 1))
+            .unwrap();
     }
     assert!(
         pacemaker.query().deadline <= Instant::now() + Duration::from_millis(500) * 2,
         "fast-run surplus must be bounded to 2x max_view_time"
     );
+}
+
+/// Task A (pacemaker backoff): entering a view while views have outrun the QC
+/// frontier must yield a deadline stretched to `max_view_time * multiplier`
+/// from now — through both the rebase path (scheduled deadline far off) and
+/// the in-place path (scheduled deadline near, the common mid-epoch stall).
+#[test]
+fn update_view_threads_qc_frontier() {
+    let mvt = Duration::from_millis(500);
+
+    // Rebase path: fresh schedule, entering view 5 with the QC frontier stuck
+    // at view 1 (views 2..=4 died without a QC => stall depth 3 => x8).
+    let (mut pacemaker, vss) = test_pacemaker(1);
+    let before = Instant::now();
+    pacemaker
+        .update_view(ViewNumber::new(5), &vss, ViewNumber::new(1))
+        .unwrap();
+    let after = Instant::now();
+    let deadline = pacemaker.query().deadline;
+    assert!(
+        deadline >= before + mvt * 8,
+        "stalled entry must back off the deadline by the multiplier"
+    );
+    assert!(deadline <= after + mvt * 8);
+
+    // In-place path: real time has consumed the schedule (deadline near), so
+    // the rebase clamp stays quiet and the entered view is stretched in place.
+    let (mut pacemaker, vss) = test_pacemaker(1);
+    std::thread::sleep(Duration::from_millis(1200));
+    let before = Instant::now();
+    pacemaker
+        .update_view(ViewNumber::new(3), &vss, ViewNumber::new(1))
+        .unwrap();
+    let after = Instant::now();
+    let deadline = pacemaker.query().deadline;
+    assert!(
+        deadline >= before + mvt * 2,
+        "mid-epoch stalled entry must be stretched in place (depth 1 => x2)"
+    );
+    assert!(deadline <= after + mvt * 2);
 }
 
 /// Task A (pacemaker backoff): a schedule rebuilt while the QC frontier is
@@ -1432,7 +1512,9 @@ fn pacemaker_config_has_backoff_defaults() {
 #[test]
 fn update_view_on_schedule_keeps_cumulative_deadline() {
     let (mut pacemaker, vss) = test_pacemaker(1);
-    pacemaker.update_view(ViewNumber::new(2), &vss).unwrap();
+    pacemaker
+        .update_view(ViewNumber::new(2), &vss, ViewNumber::new(1))
+        .unwrap();
     let deadline = pacemaker.query().deadline;
     assert!(
         deadline > Instant::now() + Duration::from_millis(600),
