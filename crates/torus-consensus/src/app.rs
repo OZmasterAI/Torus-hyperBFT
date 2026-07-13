@@ -6211,6 +6211,135 @@ mod crash_recovery_tests {
         );
     }
 
+    /// T9 REGRESSION-LOCK (not RED — `recover_bodies_via_shards` already exists since
+    /// inc2): the < k boundary. With SOME shards served but fewer than k (here exactly
+    /// ONE, for a (k=2,n=3) body), the shard pre-step must NOT reconstruct — a single
+    /// shard reconstructing would be a correctness break. It must return the hash STILL
+    /// missing (so the caller falls back to the whole-body pull → never wedges) and must
+    /// absorb NOTHING. Genuinely distinct from the "no shards" test (that had zero; this
+    /// has some, but under k). This locks the under-k fall-through against future refactor.
+    #[test]
+    fn recover_bodies_via_shards_under_k_falls_through() {
+        let (_config, state_db) = make_test_config_and_db();
+        let mempool = Arc::new(torus_mempool::Mempool::new(
+            state_db.clone(),
+            torus_mempool::MempoolConfig::default(),
+        ));
+
+        let action = sign_claim_rewards(103);
+        let hash = torus_types::compute_action_hash(&action);
+        // (k=2, n=3): reconstruction needs 2 distinct-source shards. Serve only ONE.
+        let (_h, shards) = shards_for_action(&action, 2, 3);
+        let mock = MockShardFetcher {
+            pool: std::sync::Mutex::new(vec![crate::shard_recovery::GatheredShard {
+                source: b"peerA".to_vec(),
+                shard: shards[0].clone(),
+            }]),
+        };
+
+        let still = recover_bodies_via_shards(
+            &mempool,
+            &mock,
+            &[hash],
+            8,
+            4,
+            std::time::Duration::from_millis(5),
+            None,
+            None,
+        );
+
+        assert_eq!(
+            still,
+            vec![hash],
+            "under-k shards → body stays missing for the whole-body fallback (never-wedge)"
+        );
+        assert!(
+            mempool.get_native_da(&hash).is_none(),
+            "a single shard (< k) must NOT reconstruct — nothing absorbed"
+        );
+    }
+
+    /// T9 CORE PROOF (never-wedge, caller side): the DaRecoveryWorker HONORS the
+    /// still-missing signal from an insufficient shard path by falling through to the
+    /// whole-body pull. The shard fetcher serves only 1 of the 2 shards needed for a
+    /// (k=2,n=3) body (never reconstructable); the whole-body fetcher records the pull
+    /// hashes AND stages the real body on drain, so the worker actually recovers it.
+    /// We assert the body becomes durable (never-wedge) AND that the whole-body fetcher
+    /// was asked for the hash — proving the shard path fell through rather than wedging.
+    #[test]
+    fn worker_falls_back_to_whole_body_when_shards_insufficient() {
+        let (_config, state_db) = make_test_config_and_db();
+        let mempool = Arc::new(torus_mempool::Mempool::new(
+            state_db.clone(),
+            torus_mempool::MempoolConfig::default(),
+        ));
+
+        let action = sign_claim_rewards(24);
+        let hash = torus_types::compute_action_hash(&action);
+        let body = bincode::serialize(&action).expect("serialize body");
+
+        // Shard fetcher serves only ONE shard (< k=2) → never reconstructable, so
+        // recover_bodies_via_shards returns the hash still-missing.
+        let (_h, shards) = shards_for_action(&action, 2, 3);
+        let shard_fetcher = Arc::new(MockShardFetcher {
+            pool: std::sync::Mutex::new(vec![crate::shard_recovery::GatheredShard {
+                source: b"peerA".to_vec(),
+                shard: shards[0].clone(),
+            }]),
+        });
+
+        // Whole-body fetcher: records the hashes it is asked to pull AND (once a fetch
+        // was issued) stages the real body on drain so the worker recovers it — proving
+        // the shard path fell THROUGH to whole-body rather than wedging.
+        struct RecordingWholeBodyFetcher {
+            body: Vec<u8>,
+            fetched: std::sync::Mutex<Vec<[u8; 32]>>,
+        }
+        impl NativeDaFetcher for RecordingWholeBodyFetcher {
+            fn fetch(&self, hashes: Vec<[u8; 32]>) {
+                self.fetched.lock().unwrap().extend(hashes);
+            }
+            fn drain(&self) -> Vec<Vec<u8>> {
+                if self.fetched.lock().unwrap().is_empty() {
+                    Vec::new()
+                } else {
+                    vec![self.body.clone()]
+                }
+            }
+        }
+        let whole = Arc::new(RecordingWholeBodyFetcher {
+            body,
+            fetched: std::sync::Mutex::new(Vec::new()),
+        });
+
+        let worker =
+            DaRecoveryWorker::spawn(mempool.clone(), whole.clone(), Some(shard_fetcher), None);
+        assert!(
+            mempool.get_native_da(&hash).is_none(),
+            "body absent before recovery"
+        );
+        worker.submit(vec![hash]);
+
+        // Shard budget (~500ms) + a fast whole-body recovery — a 3s deadline is a wide
+        // regression separator, not a tight race.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while mempool.get_native_da(&hash).is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker never recovered the body via the whole-body fallback (wedge!)"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        assert!(
+            whole.fetched.lock().unwrap().iter().any(|h| *h == hash.0),
+            "the insufficient shard path must fall through to the whole-body pull for the hash"
+        );
+
+        // Exercise Drop-join on a live worker thread.
+        drop(worker);
+    }
+
     /// BS-4a: dropping the worker with an in-flight batch AND a queued backlog must
     /// join fast. Queued batches are DISCARDED via the shutdown flag (old defect:
     /// drop drained queue_depth x ~1s), and since Fix C the IN-FLIGHT batch inside

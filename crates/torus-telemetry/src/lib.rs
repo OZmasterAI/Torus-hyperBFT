@@ -140,6 +140,12 @@ pub struct Metrics {
     /// fallback ran. The A/B signal that shard recovery is firing — a rising rate
     /// here vs `native_da_pull_recovered` shows the shard path offloading pulls.
     pub native_da_shard_recovered: Counter,
+    /// Shard fetch requests that hit a peer not speaking /torus/native-da-shards
+    /// (mixed-version fleet): the peer answered the shard request with libp2p
+    /// `OutboundFailure::UnsupportedProtocols`. Purely observational — the body
+    /// falls back to the whole-body pull (never wedges); a rising rate signals a
+    /// pre-shard-version cohort still in the fleet (T9).
+    pub native_da_shard_unsupported_peer: Counter,
     /// Native-DA pull requests this node SERVED (off-loop, #6 fix A). The serve
     /// side was previously invisible at info level — S387's `serving=0` false
     /// signal. served + serve_dropped ≈ inbound pull requests seen.
@@ -560,6 +566,13 @@ impl Metrics {
             native_da_shard_recovered.clone(),
         );
 
+        let native_da_shard_unsupported_peer = Counter::default();
+        registry.register(
+            "torus_native_da_shard_unsupported_peer",
+            "Shard fetch requests that hit a peer not speaking /torus/native-da-shards (mixed-version fleet); the body falls back to whole-body pull",
+            native_da_shard_unsupported_peer.clone(),
+        );
+
         let native_da_served = Counter::default();
         registry.register(
             "torus_native_da_served",
@@ -833,6 +846,7 @@ impl Metrics {
             native_da_pull_requests,
             native_da_pull_recovered,
             native_da_shard_recovered,
+            native_da_shard_unsupported_peer,
             native_da_served,
             native_da_serve_dropped,
             native_da_recovery_handoffs,

@@ -1676,7 +1676,22 @@ fn handle_event(
         SwarmEvent::Behaviour(TorusBehaviourEvent::NativeDaShards(
             request_response::Event::OutboundFailure { peer, error, .. },
         )) => {
-            debug!(%peer, ?error, "native-da-shards OUTBOUND FAILURE (ignored — whole-body fallback)");
+            // T9: distinguish the mixed-version case. `UnsupportedProtocols` means the
+            // peer does not speak /torus/native-da-shards (a pre-shard-version node) —
+            // count it for fleet observability. Control flow is UNCHANGED: every
+            // OutboundFailure yields fewer shards, so consensus recovery falls back to
+            // the whole-body pull (never wedges). The metric is purely observational.
+            match error {
+                request_response::OutboundFailure::UnsupportedProtocols => {
+                    if let Some(ref m) = shared.metrics {
+                        m.native_da_shard_unsupported_peer.inc();
+                    }
+                    debug!(%peer, "native-da-shards OUTBOUND FAILURE UnsupportedProtocols (mixed-version peer — whole-body fallback)");
+                }
+                _ => {
+                    debug!(%peer, ?error, "native-da-shards OUTBOUND FAILURE (ignored — whole-body fallback)");
+                }
+            }
         }
         SwarmEvent::Behaviour(TorusBehaviourEvent::NativeDaShards(
             request_response::Event::InboundFailure { peer, error, .. },
