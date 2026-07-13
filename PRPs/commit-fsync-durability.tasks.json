@@ -10,7 +10,7 @@
     {
       "id": 1,
       "name": "Add StateDb::sync_wal() (flush_wal(true)) + per-node toggle default off",
-      "status": "pending",
+      "status": "done",
       "files": ["crates/torus-state/src/db.rs"],
       "validate": "cargo test -p torus-state sync_wal",
       "depends_on": []

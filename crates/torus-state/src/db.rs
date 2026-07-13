@@ -141,6 +141,20 @@ impl StateDb {
         Ok(())
     }
 
+    /// Fsync the shared write-ahead log, making every write issued so far
+    /// crash-durable — surviving host power-loss / hard VM-stop, not just a
+    /// process kill (which the OS page cache already covers).
+    ///
+    /// Task B / Option C: `kv_store` (consensus-meta / commit-frontier) and
+    /// `native_da` (bodies) share this one `Arc<DB>` and therefore one WAL, so a
+    /// single `flush_wal(true)` at the commit boundary makes the whole committed
+    /// prefix (frontier + header + body) durable atomically-by-WAL-order. Call
+    /// it exactly ONCE per committed block — never per-write or per-action.
+    pub fn sync_wal(&self) -> Result<(), StateError> {
+        self.db.flush_wal(true)?;
+        Ok(())
+    }
+
     // ---- Account operations (cf_accounts) ----
 
     /// Get account info by address. Returns `None` for non-existent accounts.
@@ -451,4 +465,67 @@ pub fn storage_key(address: &Address, index: &U256) -> [u8; 52] {
     key[..20].copy_from_slice(address.as_slice());
     key[20..52].copy_from_slice(&index.to_be_bytes::<32>());
     key
+}
+
+/// Runtime toggle: fsync the WAL once per committed block ([`StateDb::sync_wal`]).
+///
+/// Default **OFF** ⇒ byte-identical to today's async-write behavior (no flush).
+/// Set `TORUS_SYNC_WAL_ON_COMMIT` to a truthy value (`1`/`true`/`yes`/`on`) to
+/// enable. Proposer/replica-local, format-neutral, needs no coordination — safe
+/// to A/B on a single node. Read once at first use (same pattern as
+/// `evm_block_gas_budget`).
+pub fn sync_wal_on_commit_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| parse_sync_wal_toggle(std::env::var("TORUS_SYNC_WAL_ON_COMMIT").ok()))
+}
+
+/// Pure parse of the `TORUS_SYNC_WAL_ON_COMMIT` value (default OFF). Split from
+/// the `OnceLock` reader so the default and accepted spellings are unit-testable
+/// without touching process-global state.
+fn parse_sync_wal_toggle(raw: Option<String>) -> bool {
+    match raw {
+        Some(v) => matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "on"),
+        None => false,
+    }
+}
+
+#[cfg(test)]
+mod sync_wal_tests {
+    use super::*;
+
+    // Task 1 (RED): crash-durable commit via a single WAL fsync per block.
+    // `kv_store` (consensus-meta/frontier) and `native_da` (bodies) share this
+    // one `Arc<DB>`/WAL, so one flush covers the whole committed prefix.
+
+    #[test]
+    fn sync_wal_flushes_and_write_survives_reopen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        {
+            let db = StateDb::open(dir.path()).expect("open temp StateDb");
+            db.put_cf_raw(CF_CONSENSUS_META, b"frontier", b"height-1")
+                .expect("put");
+            db.sync_wal().expect("sync_wal must succeed");
+        }
+        // Reopen the (cleanly-closed) DB: the synced write is present.
+        let db2 = StateDb::open(dir.path()).expect("reopen temp StateDb");
+        assert_eq!(
+            db2.get_cf_raw(CF_CONSENSUS_META, b"frontier").expect("get"),
+            Some(b"height-1".to_vec()),
+        );
+    }
+
+    #[test]
+    fn sync_wal_on_commit_defaults_off() {
+        // Env unset ⇒ toggle OFF ⇒ behavior byte-identical to today (no flush).
+        assert!(!parse_sync_wal_toggle(None));
+    }
+
+    #[test]
+    fn sync_wal_toggle_parses_truthy_spellings() {
+        assert!(parse_sync_wal_toggle(Some("1".to_string())));
+        assert!(parse_sync_wal_toggle(Some("true".to_string())));
+        assert!(parse_sync_wal_toggle(Some(" on ".to_string())));
+        assert!(!parse_sync_wal_toggle(Some("0".to_string())));
+        assert!(!parse_sync_wal_toggle(Some("".to_string())));
+    }
 }
