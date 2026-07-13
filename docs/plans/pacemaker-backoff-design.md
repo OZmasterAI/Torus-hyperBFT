@@ -93,6 +93,13 @@ today's binary. Only implement A/B/C if the model/repro shows the gap survives t
 `:554` clamp.
 - **Effort:** Small–Medium · **Risk:** Low (spends effort on evidence, not shipped code)
 
+## DECISION (user, this session)
+
+**Option C chosen** — state-derived, lockstep-exact multiplier. Implementation plan:
+`pacemaker-backoff-impl.md`. Validation (Option D's Stateright model + devnet
+lock-step repro) is folded in as the RED-test / acceptance layer of the C plan
+rather than run as a separate prior gate.
+
 ## Recommendation
 
 **Option D first, then Option C** if D confirms the gap. Rationale: the forensics
