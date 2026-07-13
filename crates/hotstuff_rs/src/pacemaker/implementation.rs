@@ -532,7 +532,10 @@ impl<N: Network> Pacemaker<N> {
 
         // 2. If about to enter a new epoch, set timeouts for the new epoch.
         if epoch(cur_view, self.config.epoch_length) != epoch(next_view, self.config.epoch_length) {
-            self.state.update_timeouts(next_view, &self.config);
+            // Interim (Task A/3): `next_view` as QC frontier keeps the
+            // multiplier at 1 until Task A/4 threads the real frontier.
+            self.state
+                .update_timeouts(next_view, &self.config, next_view);
         }
 
         // 2b. S395 liveness fix: the per-epoch schedule assigns every view an ABSOLUTE
@@ -552,7 +555,10 @@ impl<N: Network> Pacemaker<N> {
             .get(&next_view)
             .ok_or(UpdateViewError::GetViewTimeoutError { view: next_view })?;
         if scheduled > Instant::now() + self.config.max_view_time * 2 {
-            self.state.update_timeouts(next_view, &self.config);
+            // Interim (Task A/3): `next_view` as QC frontier keeps the
+            // multiplier at 1 until Task A/4 threads the real frontier.
+            self.state
+                .update_timeouts(next_view, &self.config, next_view);
         }
 
         // 3. Update the Pacemaker's `view_info` state.
@@ -636,6 +642,23 @@ pub(crate) struct PacemakerConfiguration {
     pub(crate) backoff_cap: u32,
 }
 
+impl PacemakerConfiguration {
+    /// Effective view-timeout multiplier for entering (or rebasing a schedule
+    /// at) `view` given the current QC frontier. The QC for view v justifies
+    /// *entering* v+1, so a healthy entry (`view == highest_qc_view + 1`) is
+    /// stall depth 0 — multiplier 1, schedule byte-identical to pre-backoff.
+    /// Each further view entered without the frontier advancing deepens the
+    /// stall by one and multiplies the timeout by another `backoff_factor`.
+    fn stall_multiplier(&self, view: ViewNumber, highest_qc_view: ViewNumber) -> u32 {
+        backoff_multiplier(
+            view,
+            highest_qc_view + 1,
+            self.backoff_factor,
+            self.backoff_cap,
+        )
+    }
+}
+
 /// In-memory state of a [`Pacemaker`].
 struct PacemakerState {
     /// Mapping between current and future view numbers and the timeout assigned to each.
@@ -664,6 +687,7 @@ impl PacemakerState {
         fn initial_timeouts(
             start_view: ViewNumber,
             config: &PacemakerConfiguration,
+            highest_qc_view: ViewNumber,
         ) -> BTreeMap<ViewNumber, Instant> {
             let mut timeouts = BTreeMap::new();
 
@@ -672,10 +696,15 @@ impl PacemakerState {
 
             let start_time = Instant::now();
 
+            // Task A: per-view slot scaled by the stall multiplier at the
+            // schedule base (1 while the QC frontier keeps up — see
+            // `stall_multiplier`).
+            let multiplier = config.stall_multiplier(start_view, highest_qc_view);
+
             // Add timeouts for all remaining views in the epoch of start_view.
             for view in start_view.int()..=epoch_view {
                 let time_to_view_deadline =
-                    config.max_view_time * (view - start_view.int() + 1) as u32;
+                    config.max_view_time * multiplier * (view - start_view.int() + 1) as u32;
                 timeouts.insert(ViewNumber::new(view), start_time + time_to_view_deadline);
             }
 
@@ -683,7 +712,9 @@ impl PacemakerState {
         }
 
         Self {
-            timeouts: initial_timeouts(init_view, config),
+            // At boot the replica has no evidence of an ongoing stall: treat
+            // `init_view` as justified (stall depth 0, multiplier 1).
+            timeouts: initial_timeouts(init_view, config, init_view),
             timeout_vote_collectors: <ActiveCollectorPair<TimeoutVoteCollector>>::new(
                 config.chain_id,
                 init_view,
@@ -696,8 +727,14 @@ impl PacemakerState {
         }
     }
 
-    /// Update the `PacemakerState`'s timeouts upon entering the epoch with the given `epoch_start_view`.
-    fn update_timeouts(&mut self, epoch_start_view: ViewNumber, config: &PacemakerConfiguration) {
+    /// Update the `PacemakerState`'s timeouts upon entering the epoch with the given `epoch_start_view`,
+    /// or upon rebasing a stale schedule at `epoch_start_view`.
+    fn update_timeouts(
+        &mut self,
+        epoch_start_view: ViewNumber,
+        config: &PacemakerConfiguration,
+        highest_qc_view: ViewNumber,
+    ) {
         // Remove timeouts for expired views.
         self.timeouts = self.timeouts.split_off(&epoch_start_view);
 
@@ -710,10 +747,16 @@ impl PacemakerState {
         // Set the current time as the epoch's start time.
         let epoch_start_time = Instant::now();
 
+        // Task A: per-view slot scaled by the stall multiplier at the schedule
+        // base — 1 while the QC frontier keeps up (healthy entries/rebases are
+        // byte-identical to the pre-backoff schedule), factor^min(depth, cap)
+        // while views outrun QCs.
+        let multiplier = config.stall_multiplier(epoch_start_view, highest_qc_view);
+
         // Populate `self.timeouts` with the timeouts of the views in the newly-entered epoch.
         for view in epoch_start_view.int()..=epoch_change_view {
             let time_to_view_deadline =
-                config.max_view_time * (view - epoch_start_view.int() + 1) as u32;
+                config.max_view_time * multiplier * (view - epoch_start_view.int() + 1) as u32;
             self.timeouts.insert(
                 ViewNumber::new(view),
                 epoch_start_time + time_to_view_deadline,
@@ -1005,7 +1048,7 @@ pub fn select_leader_reputation_weighted(
 /// NOTE for callers: the QC for view v justifies *entering* v+1, so a healthy
 /// entry has `view == highest_qc_view + 1`. Consult sites that must stay
 /// neutral on the happy path evaluate `backoff_multiplier(view,
-/// highest_qc_view + 1, ..)` — see [`PacemakerState::stall_multiplier`].
+/// highest_qc_view + 1, ..)` — see [`PacemakerConfiguration::stall_multiplier`].
 fn backoff_multiplier(view: ViewNumber, highest_qc_view: ViewNumber, factor: u32, cap: u32) -> u32 {
     let gap = view.int().saturating_sub(highest_qc_view.int());
     let exponent = gap.min(cap as u64) as u32;
@@ -1258,6 +1301,75 @@ fn update_view_fast_run_deadline_bounded() {
     assert!(
         pacemaker.query().deadline <= Instant::now() + Duration::from_millis(500) * 2,
         "fast-run surplus must be bounded to 2x max_view_time"
+    );
+}
+
+/// Task A (pacemaker backoff): a schedule rebuilt while the QC frontier is
+/// caught up (healthy entry: the QC for view v justifies entering v+1) must be
+/// byte-identical to the legacy formula `epoch_start_time + max_view_time *
+/// (view − start + 1)` — backoff is invisible on the happy path.
+#[test]
+fn update_timeouts_gap0_matches_legacy() {
+    let (mut pacemaker, _vss) = test_pacemaker(1);
+    let mvt = Duration::from_millis(500);
+
+    // Healthy rebase: QC for view 4 justifies entering view 5 (gap 0).
+    let start = ViewNumber::new(5);
+    let before = Instant::now();
+    pacemaker
+        .state
+        .update_timeouts(start, &pacemaker.config, ViewNumber::new(4));
+    let after = Instant::now();
+
+    for k in 0..5u32 {
+        let view = ViewNumber::new(5 + k as u64);
+        let deadline = *pacemaker.state.timeouts.get(&view).unwrap();
+        let legacy_increment = mvt * (k + 1);
+        assert!(
+            deadline >= before + legacy_increment && deadline <= after + legacy_increment,
+            "gap-0 schedule must equal the pre-backoff formula (view offset {k})"
+        );
+    }
+}
+
+/// Task A (pacemaker backoff): a schedule rebuilt while views have outrun the
+/// QC frontier scales every per-view increment by `factor^min(stall_depth,
+/// cap)`, where stall_depth counts the views entered beyond the one the QC
+/// justifies.
+#[test]
+fn update_timeouts_gap_scales() {
+    let (mut pacemaker, _vss) = test_pacemaker(1);
+    let mvt = Duration::from_millis(500);
+
+    // Entering view 9 with the QC frontier stuck at view 4: views 5..=8 died
+    // without a QC => stall depth 4 => increments scale by 2^4.
+    let before = Instant::now();
+    pacemaker
+        .state
+        .update_timeouts(ViewNumber::new(9), &pacemaker.config, ViewNumber::new(4));
+    let after = Instant::now();
+    for k in 0..3u32 {
+        let view = ViewNumber::new(9 + k as u64);
+        let deadline = *pacemaker.state.timeouts.get(&view).unwrap();
+        let scaled_increment = mvt * 16 * (k + 1);
+        assert!(
+            deadline >= before + scaled_increment && deadline <= after + scaled_increment,
+            "stalled schedule must scale increments by factor^stall_depth (view offset {k})"
+        );
+    }
+
+    // Deep stall: the exponent saturates at backoff_cap (2^8).
+    let before = Instant::now();
+    pacemaker.state.update_timeouts(
+        ViewNumber::new(200),
+        &pacemaker.config,
+        ViewNumber::new(100),
+    );
+    let after = Instant::now();
+    let deadline = *pacemaker.state.timeouts.get(&ViewNumber::new(200)).unwrap();
+    assert!(
+        deadline >= before + mvt * 256 && deadline <= after + mvt * 256,
+        "deep-stall multiplier must cap at factor^backoff_cap"
     );
 }
 
