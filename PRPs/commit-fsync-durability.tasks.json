@@ -18,7 +18,7 @@
     {
       "id": 2,
       "name": "Call sync_wal() at commit boundary (persist_committed_block_durably), gated",
-      "status": "pending",
+      "status": "done",
       "files": ["crates/torus-consensus/src/app.rs"],
       "validate": "cargo test -p torus-consensus commit_triggers_single_wal_flush",
       "depends_on": [1]

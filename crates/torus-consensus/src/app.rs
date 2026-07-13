@@ -346,6 +346,33 @@ fn persist_committed_block_durably(state_db: &StateDb, block: &TorusBlock) {
             );
         }
     }
+
+    // Task B (Option C): now that this block's header+body are in the shared WAL
+    // — alongside the HotStuff frontier write (durably advanced by the library
+    // BEFORE this callback, algorithm.rs:133) and the commit manifest — fsync the
+    // WAL ONCE to make the whole committed prefix crash-durable (survives host
+    // power-loss, not just a process kill). This is the LAST durability step at
+    // the commit boundary. Gated OFF by default ⇒ byte-identical to today.
+    sync_committed_wal(state_db, torus_state::db::sync_wal_on_commit_enabled());
+}
+
+/// Task B (Option C): fsync the shared RocksDB WAL at the commit boundary, iff
+/// the per-node toggle (`enabled`) is on. `kv_store` (consensus-meta / frontier)
+/// and `native_da` (bodies) share one `Arc<DB>` / WAL, so a single flush makes
+/// the whole committed prefix crash-durable. Returns whether a flush was issued
+/// — the per-commit "count" the tests assert. Best-effort like the header/body/
+/// manifest writes: a flush error is loud but never aborts the commit.
+fn sync_committed_wal(state_db: &StateDb, enabled: bool) -> bool {
+    if !enabled {
+        return false;
+    }
+    if let Err(e) = state_db.sync_wal() {
+        tracing::error!(
+            %e,
+            "Task B: commit-boundary WAL fsync failed (crash-durability degraded for this block)"
+        );
+    }
+    true
 }
 
 /// FIX (heal-channel crash-safety). Persist the committed consensus DATUM
@@ -4285,6 +4312,26 @@ mod crash_recovery_tests {
             .unwrap();
         let expected = alloy_primitives::keccak256(&block.header.canonical_header_bytes());
         assert_eq!(&raw[..32], expected.as_slice(), "header record must prefix the block hash");
+    }
+
+    /// Task B/2 RED-first (Option C, crash-durable commit). The commit boundary
+    /// fsyncs the shared WAL exactly ONCE per committed block when the per-node
+    /// toggle is ON, and NEVER when it is OFF (default ⇒ byte-identical to today).
+    /// `sync_committed_wal` is the single gated seam `persist_committed_block_durably`
+    /// calls after the header+body write; its bool return is the per-commit
+    /// flush "count" (frontier is already WAL-buffered before the callback, so one
+    /// flush here covers frontier + manifest + header + body).
+    #[test]
+    fn commit_triggers_single_wal_flush() {
+        let (_config, state_db) = make_test_config_and_db();
+        assert!(
+            sync_committed_wal(&state_db, true),
+            "toggle ON ⇒ the commit boundary must fsync the shared WAL once"
+        );
+        assert!(
+            !sync_committed_wal(&state_db, false),
+            "toggle OFF ⇒ zero WAL fsync (default, byte-identical to today)"
+        );
     }
 
     /// FIX 1b RED-first (park + heal via the live strict-order queue). A boot-parked hole,
