@@ -565,12 +565,22 @@ impl<N: Network> Pacemaker<N> {
         // minutes-long stall. When the deadline of the view we are ENTERING is more
         // than 2x max_view_time away, the remaining schedule is stale for this
         // replica: rebase it to start from now (same routine as an epoch entry).
+        // Task A: the stall multiplier for the view being entered — 1 while
+        // the QC frontier keeps up, factor^min(depth, cap) while views outrun
+        // QCs. Used by both the clamp threshold (2b) and the deadline stretch
+        // (2c) below.
+        let multiplier = self.config.stall_multiplier(next_view, highest_qc_view);
+
         let scheduled = *self
             .state
             .timeouts
             .get(&next_view)
             .ok_or(UpdateViewError::GetViewTimeoutError { view: next_view })?;
-        if scheduled > Instant::now() + self.config.max_view_time * 2 {
+        // Task A: the threshold scales with the multiplier so a legitimately
+        // backed-off schedule (slots are `max_view_time * multiplier` wide) is
+        // not rebased away on every entry, while a genuinely stale jump — whose
+        // surplus exceeds even the backed-off allowance — still rebases.
+        if scheduled > Instant::now() + self.config.max_view_time * 2 * multiplier {
             self.state
                 .update_timeouts(next_view, &self.config, highest_qc_view);
         }
@@ -583,7 +593,6 @@ impl<N: Network> Pacemaker<N> {
         // multiplier is a pure function of `(next_view, highest_qc_view,
         // fleet config)`: every honest replica derives the identical deadline.
         // Healthy entries (multiplier 1) leave the schedule untouched.
-        let multiplier = self.config.stall_multiplier(next_view, highest_qc_view);
         if multiplier > 1 {
             let scheduled = *self
                 .state
@@ -1382,6 +1391,49 @@ fn update_view_threads_qc_frontier() {
         "mid-epoch stalled entry must be stretched in place (depth 1 => x2)"
     );
     assert!(deadline <= after + mvt * 2);
+}
+
+/// Task A (pacemaker backoff): the S395 rebase clamp must not swallow a
+/// legitimate backoff. A schedule legitimately rebuilt with a stall multiplier
+/// has deadlines up to `max_view_time * multiplier * k` in the future; the
+/// clamp threshold therefore scales with the multiplier, so entering the next
+/// view keeps the backed-off cumulative grid intact instead of rebasing it
+/// away on every entry. (Genuinely stale jumps still rebase — the jump test
+/// pins that — because a healthy frontier keeps the multiplier at 1.)
+#[test]
+fn clamp_preserves_legitimate_backoff() {
+    let (mut pacemaker, vss) = test_pacemaker(1);
+    let mvt = Duration::from_millis(500);
+
+    // A legitimately backed-off schedule: rebased at view 10 while the QC
+    // frontier is stuck at view 5 (stall depth 4 => x16 slots).
+    let before = Instant::now();
+    pacemaker
+        .state
+        .update_timeouts(ViewNumber::new(10), &pacemaker.config, ViewNumber::new(5));
+    let after = Instant::now();
+
+    // Enter view 11 with the same stale frontier (stall depth 5 => x32).
+    pacemaker
+        .update_view(ViewNumber::new(11), &vss, ViewNumber::new(5))
+        .unwrap();
+    assert!(
+        pacemaker.query().deadline >= before + mvt * 32,
+        "entered view must keep a backed-off deadline"
+    );
+
+    // The discriminator: view 12's cumulative backed-off slot (3 x16 slots
+    // from the build time) must survive the entry un-churned.
+    let deadline_12 = *pacemaker
+        .state
+        .timeouts
+        .get(&ViewNumber::new(12))
+        .unwrap();
+    let cumulative = mvt * 16 * 3;
+    assert!(
+        deadline_12 >= before + cumulative && deadline_12 <= after + cumulative,
+        "clamp must not rebase away a legitimately backed-off grid"
+    );
 }
 
 /// Task A (pacemaker backoff): a schedule rebuilt while the QC frontier is
