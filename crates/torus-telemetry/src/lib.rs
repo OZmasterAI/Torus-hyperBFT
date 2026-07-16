@@ -1143,6 +1143,27 @@ mod tests {
         );
     }
 
+    /// B2 (consensus isolation): the direct-fan and dual-path-dedup counters
+    /// must be registered — the proof run watches `consensus_direct_fan_sent`
+    /// climb with block production while `consensus_timeout_total` stays flat,
+    /// and `consensus_dedup_dropped` confirms the gossip mirror's duplicates
+    /// are being swallowed rather than double-processed.
+    #[test]
+    fn consensus_isolation_metrics_register() {
+        let m = Metrics::new();
+        m.consensus_direct_fan_sent.inc();
+        m.consensus_direct_fan_buffered.inc();
+        m.consensus_dedup_dropped.inc();
+        let text = m.encode();
+        for name in [
+            "torus_consensus_direct_fan_sent",
+            "torus_consensus_direct_fan_buffered",
+            "torus_consensus_dedup_dropped",
+        ] {
+            assert!(text.contains(name), "{name} not registered:\n{text}");
+        }
+    }
+
     /// Exec trust-cache (double-verify-trust-cache T6): hit/miss/eviction counters
     /// must be registered so the cache hit-rate is observable for A/B measurement.
     #[test]

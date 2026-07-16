@@ -2789,6 +2789,13 @@ mod tests {
     }
 
     fn test_shared() -> SharedState {
+        // Defaults mirror `NetworkConfig::default()`: fan OFF, mirror ON —
+        // i.e. exact-today behavior.
+        test_shared_b2(false, true)
+    }
+
+    /// B2: a [`SharedState`] with the consensus-isolation flags set explicitly.
+    fn test_shared_b2(consensus_direct_fan: bool, consensus_gossip_mirror: bool) -> SharedState {
         SharedState {
             inbound: Mutex::new(VecDeque::new()),
             peer_map: RwLock::new(PeerMap::default()),
@@ -2810,6 +2817,9 @@ mod tests {
             redial_backoff: Mutex::new(HashMap::new()),
             allow_private_addrs: false,
             pending_da_fetches: Mutex::new(PendingSendQueue::new(DA_FETCH_QUEUE_CAP)),
+            consensus_direct_fan,
+            consensus_gossip_mirror,
+            consensus_dedup: Mutex::new(ConsensusDedup::with_cap(CONSENSUS_DEDUP_CAP)),
         }
     }
 
@@ -3647,5 +3657,255 @@ mod tests {
         assert_eq!(stored.k, 4);
         assert_eq!(stored.n, 6);
         assert_eq!(stored.body_len, 99);
+    }
+
+    // ------------------------------------------------------------------
+    // B2 — consensus isolation: broadcasts off gossipsub onto the
+    // /torus/direct unicast fan (design §2). All RED before B2 lands.
+    // ------------------------------------------------------------------
+
+    /// A consensus message value for exercising the broadcast/receive seams —
+    /// the variant is irrelevant, only bytes-identity matters for the dedup.
+    fn test_consensus_message() -> hotstuff_rs::networking::messages::Message {
+        hotstuff_rs::networking::messages::Message::BlockSyncMessage(
+            hotstuff_rs::block_sync::messages::BlockSyncMessage::block_sync_request(
+                hotstuff_rs::types::data_types::ChainID::new(9),
+                hotstuff_rs::types::data_types::BlockHeight::new(7),
+                4,
+            ),
+        )
+    }
+
+    /// A swarm over a dummy transport: no peer is ever connected, so every fan
+    /// send lands in `pending_sends` (the vote-path buffering seam) — which is
+    /// exactly what makes the fan observable without a live network.
+    fn test_swarm() -> Swarm<TorusBehaviour> {
+        use libp2p::core::transport::Transport as _;
+        let key = libp2p::identity::Keypair::generate_ed25519();
+        let behaviour = TorusBehaviour::new(&key).expect("build behaviour");
+        let transport = libp2p::core::transport::dummy::DummyTransport::<(
+            PeerId,
+            libp2p::core::muxing::StreamMuxerBox,
+        )>::new();
+        Swarm::new(
+            transport.boxed(),
+            behaviour,
+            key.public().to_peer_id(),
+            libp2p::swarm::Config::with_tokio_executor(),
+        )
+    }
+
+    /// B2 (RED first): the direct-fan target set is the intersection of the
+    /// registered validator set and the peer map (same resolution as
+    /// `fan_native_push`), excluding self (self-delivery stays the loopback
+    /// enqueue) and excluding mapped non-validators (observers/RPC nodes stay
+    /// on the gossip mirror). MUST fail before B2 (no `broadcast_fan_targets`).
+    #[test]
+    fn broadcast_fan_targets_are_mapped_validators_minus_self() {
+        let shared = test_shared_b2(true, true);
+        let local = test_vk(30);
+        let val_a = test_vk(31);
+        let val_b = test_vk(32);
+        let observer = test_vk(33); // mapped, NOT in the validator set
+        let unmapped_val = test_vk(34); // validator with no peer-map entry
+
+        {
+            let mut vals = shared.validators.write().unwrap();
+            for vk in [&local, &val_a, &val_b, &unmapped_val] {
+                vals.insert(vk.to_bytes());
+            }
+        }
+        {
+            let mut pm = shared.peer_map.write().unwrap();
+            for (i, vk) in [&local, &val_a, &val_b, &observer].iter().enumerate() {
+                pm.insert(**vk, test_peer(40 + i as u8));
+            }
+        }
+
+        let mut targets = broadcast_fan_targets(&shared, &local);
+        targets.sort_by_key(|vk| vk.to_bytes());
+        let mut expected = vec![val_a, val_b];
+        expected.sort_by_key(|vk| vk.to_bytes());
+        assert_eq!(
+            targets, expected,
+            "fan targets = validators ∩ peer_map, minus self and observers"
+        );
+    }
+
+    /// B2 (RED first): with `consensus_direct_fan` ON, `handle_command(Broadcast)`
+    /// produces one tracked direct send per registered validator — buffered in
+    /// `pending_sends` here because the dummy-transport swarm has no live
+    /// connections (the same seam that re-delivers votes on reconnect) — while
+    /// self-delivery is preserved and mapped non-validators are not fanned to.
+    /// With the flag OFF (the default), no direct sends happen at all:
+    /// exact-today behavior (the documented rollback).
+    #[tokio::test]
+    async fn consensus_direct_fan_one_buffered_send_per_validator() {
+        let local = test_vk(35);
+        let val_a = test_vk(36);
+        let val_b = test_vk(37);
+        let observer = test_vk(38);
+
+        for fan in [true, false] {
+            let shared = test_shared_b2(fan, true);
+            {
+                let mut vals = shared.validators.write().unwrap();
+                for vk in [&local, &val_a, &val_b] {
+                    vals.insert(vk.to_bytes());
+                }
+            }
+            {
+                let mut pm = shared.peer_map.write().unwrap();
+                for vk in [&local, &val_a, &val_b, &observer] {
+                    pm.insert(*vk, crate::bridge::peer_id_from_verifying_key(vk));
+                }
+            }
+            let mut swarm = test_swarm();
+            let topic = gossipsub::IdentTopic::new(CONSENSUS_TOPIC);
+            handle_command(
+                NetworkCommand::Broadcast {
+                    message: test_consensus_message(),
+                },
+                &mut swarm,
+                &shared,
+                &local,
+                &topic,
+            );
+
+            // Self-delivery is preserved in both modes (hotstuff_rs expects the
+            // proposer to receive its own broadcast).
+            let inbound: Vec<_> = shared.inbound.lock().unwrap().drain(..).collect();
+            assert_eq!(
+                inbound.len(),
+                1,
+                "exactly the loopback self-delivery (fan={fan})"
+            );
+            assert_eq!(inbound[0].0, local, "self-delivery sender is the local key");
+
+            let mut pending = shared.pending_sends.lock().unwrap();
+            let expected = usize::from(fan);
+            assert_eq!(
+                pending.flush(&val_a).len(),
+                expected,
+                "one direct send per validator (fan={fan})"
+            );
+            assert_eq!(
+                pending.flush(&val_b).len(),
+                expected,
+                "one direct send per validator (fan={fan})"
+            );
+            assert!(
+                pending.flush(&observer).is_empty(),
+                "mapped non-validators are never fanned to (they ride the mirror)"
+            );
+            assert!(pending.flush(&local).is_empty(), "no direct send to self");
+        }
+    }
+
+    /// B2 dedup (RED first): the same consensus payload arriving via BOTH the
+    /// gossip mirror and the direct fan is enqueued exactly ONCE when the fan
+    /// is enabled — and, rollback-critical, TWICE with the fan off (exact-today
+    /// duplicate tolerance, e.g. pacemaker rebroadcasts). Exercises the REAL
+    /// receive seams (`handle_consensus_gossip` / `handle_consensus_direct`)
+    /// in both arrival orders. MUST fail before B2 (no dedup, no
+    /// `handle_consensus_direct`).
+    #[test]
+    fn dedup_same_payload_via_both_paths_enqueues_once() {
+        for (fan, expected) in [(true, 1usize), (false, 2usize)] {
+            for direct_first in [false, true] {
+                let shared = test_shared_b2(fan, true);
+                let sender = test_vk(50);
+                let peer = test_peer(50);
+                shared.peer_map.write().unwrap().insert(sender, peer);
+                let mut scoring = PeerScoring::new(None);
+
+                let msg_bytes = test_consensus_message().try_to_vec().unwrap();
+                let mut envelope = sender.to_bytes().to_vec();
+                envelope.extend_from_slice(&msg_bytes);
+
+                let deliver_gossip = |scoring: &mut PeerScoring| {
+                    handle_consensus_gossip(&envelope, &shared, scoring, &peer);
+                };
+                let deliver_direct = |scoring: &mut PeerScoring| {
+                    assert!(
+                        handle_consensus_direct(&msg_bytes, sender, &shared, scoring, &peer),
+                        "a hotstuff message must be consumed by the direct branch"
+                    );
+                };
+                if direct_first {
+                    deliver_direct(&mut scoring);
+                    deliver_gossip(&mut scoring);
+                } else {
+                    deliver_gossip(&mut scoring);
+                    deliver_direct(&mut scoring);
+                }
+
+                assert_eq!(
+                    shared.inbound.lock().unwrap().len(),
+                    expected,
+                    "fan={fan} direct_first={direct_first}: dedup swallows the \
+                     dual-path duplicate ONLY when the fan is on"
+                );
+            }
+        }
+    }
+
+    /// B2: the dedup LRU is bounded — at capacity the OLDEST key is evicted (a
+    /// long-evicted payload is accepted again) while a fresh duplicate inside
+    /// the window is still suppressed. Guards against unbounded memory on the
+    /// hot receive path.
+    #[test]
+    fn consensus_dedup_lru_is_bounded_and_evicts_oldest() {
+        let sender = test_vk(51);
+        let mut dedup = ConsensusDedup::with_cap(4);
+        assert!(!dedup.contains(&sender, b"m0"), "unseen payload passes");
+        dedup.record(&sender, b"m0");
+        assert!(
+            dedup.contains(&sender, b"m0"),
+            "inside the window: duplicate detected"
+        );
+        for i in 1..=4u8 {
+            dedup.record(&sender, &[b'm', b'0' + i]);
+        }
+        assert!(
+            !dedup.contains(&sender, b"m0"),
+            "oldest key is evicted once the cap is exceeded"
+        );
+        assert!(dedup.contains(&sender, b"m4"), "newest key is retained");
+    }
+
+    /// B2: the dedup key includes the SENDER — identical payload bytes from two
+    /// different validators are two distinct messages, never cross-deduped.
+    #[test]
+    fn consensus_dedup_is_per_sender() {
+        let mut dedup = ConsensusDedup::with_cap(8);
+        dedup.record(&test_vk(52), b"payload");
+        assert!(
+            !dedup.contains(&test_vk(53), b"payload"),
+            "same bytes from a different sender must not be suppressed"
+        );
+    }
+
+    /// B2 (RED first): the gossip-mirror decision matrix. Fan OFF ⇒ ALWAYS
+    /// publish (exact-today behavior — the mirror flag is meaningless without
+    /// the fan, and (off, off) must never silently mute consensus). Fan ON ⇒
+    /// the mirror flag decides: default ON keeps observers and not-yet-flipped
+    /// nodes fed; OFF is the fully-isolated end-state (design test plan (c):
+    /// mirror off ⇒ no gossip publish).
+    #[test]
+    fn gossip_mirror_decision_matrix() {
+        assert!(should_gossip_broadcast(false, true), "today: gossip on");
+        assert!(
+            should_gossip_broadcast(false, false),
+            "fan off ⇒ mirror flag ignored (no silent consensus mute)"
+        );
+        assert!(
+            should_gossip_broadcast(true, true),
+            "staged rollout: fan + mirror both on"
+        );
+        assert!(
+            !should_gossip_broadcast(true, false),
+            "end-state: fan on + mirror off ⇒ NO gossip publish"
+        );
     }
 }

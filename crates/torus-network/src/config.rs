@@ -204,6 +204,48 @@ mod tests {
         assert_eq!(parse_gossip_queue_len(Some("")), default);
     }
 
+    /// B2 (consensus isolation): the `TORUS_CONSENSUS_DIRECT_FAN` /
+    /// `TORUS_CONSENSUS_GOSSIP_MIRROR` boolean parse seam. Unset or
+    /// unrecognized falls back to the per-knob default — fan OFF (exact-today
+    /// rollback), mirror ON (observers keep their live consensus feed).
+    #[test]
+    fn consensus_isolation_flag_parse_seam() {
+        // direct fan: default false
+        assert!(!parse_env_flag(None, false));
+        assert!(parse_env_flag(Some("1"), false));
+        assert!(parse_env_flag(Some("true"), false));
+        assert!(parse_env_flag(Some(" ON "), false));
+        assert!(parse_env_flag(Some("yes"), false));
+        assert!(!parse_env_flag(Some("0"), false));
+        assert!(!parse_env_flag(Some("garbage"), false));
+        assert!(!parse_env_flag(Some(""), false));
+        // gossip mirror: default true
+        assert!(parse_env_flag(None, true));
+        assert!(!parse_env_flag(Some("0"), true));
+        assert!(!parse_env_flag(Some("false"), true));
+        assert!(!parse_env_flag(Some(" off "), true));
+        assert!(!parse_env_flag(Some("no"), true));
+        assert!(parse_env_flag(Some("1"), true));
+        assert!(parse_env_flag(Some("garbage"), true));
+    }
+
+    /// B2: `NetworkConfig::default()` = exact-today behavior — direct fan OFF,
+    /// gossip mirror ON. Flipping the fan is a per-node opt-in
+    /// (`TORUS_CONSENSUS_DIRECT_FAN=1`); unset restores today's gossip-only
+    /// broadcast path byte-for-byte.
+    #[test]
+    fn network_config_default_consensus_isolation_flags() {
+        let cfg = NetworkConfig::default();
+        assert!(
+            !cfg.consensus_direct_fan,
+            "direct fan defaults OFF (rollback = today's behavior)"
+        );
+        assert!(
+            cfg.consensus_gossip_mirror,
+            "gossip mirror defaults ON (observers stay fed during rollout)"
+        );
+    }
+
     #[test]
     fn global_addresses_accepted() {
         for s in [
