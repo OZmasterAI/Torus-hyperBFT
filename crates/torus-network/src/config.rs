@@ -13,6 +13,14 @@ pub struct NetworkConfig {
     pub max_peers: usize,
     /// GossipSub heartbeat interval in milliseconds.
     pub gossipsub_heartbeat_ms: u64,
+    /// GossipSub per-peer connection-handler send-queue length (B3 send-queue
+    /// hygiene). One queue pair per peer, shared across ALL topics: len/2 is
+    /// the soft cap on queued `Publish` messages, so libp2p's 5000 default
+    /// let a consensus proposal sit FIFO behind up to 2500 bulk batches for
+    /// the full 5 s publish-abandonment window — invisibly. Default 512
+    /// bounds the backlog; `TORUS_GOSSIP_QUEUE_LEN=5000` restores exact-today
+    /// behavior (rollback knob).
+    pub gossipsub_queue_len: usize,
     /// Maximum message size for consensus gossipsub (bytes). ACCEPT gate only
     /// — enforced on RECEIVE (swarm oversized-consensus path: drop + penalize
     /// the author); there is no send-side check. O5 sized it for the worst
@@ -40,6 +48,28 @@ pub struct NetworkConfig {
     /// devnets / single-host meshes where the fabric IS a private subnet.
     /// Explicit `--p2p-peers` entries are always exempt — operator intent wins.
     pub allow_private_addrs: bool,
+}
+
+/// Effective gossipsub per-peer send-queue length: `TORUS_GOSSIP_QUEUE_LEN`
+/// overrides the compiled default (512) PER NODE, read once at first use.
+/// Node-local and transport-only — safe to A/B on a single validator without
+/// coordination (no wire format involved). `=5000` restores libp2p's shipped
+/// default, i.e. exact pre-B3 behavior (the documented rollback).
+pub fn gossip_queue_len() -> usize {
+    static LEN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LEN.get_or_init(|| {
+        parse_gossip_queue_len(std::env::var("TORUS_GOSSIP_QUEUE_LEN").ok().as_deref())
+    })
+}
+
+/// Pure parse seam for [`gossip_queue_len`] (unit-testable without touching
+/// process env, same idiom as `TORUS_HASH_ONLY_PUSH_THRESHOLD`). Unset,
+/// unparsable, or zero (a zero-length queue could never carry a message)
+/// falls back to the crate default.
+fn parse_gossip_queue_len(raw: Option<&str>) -> usize {
+    raw.and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(crate::behaviour::DEFAULT_GOSSIPSUB_QUEUE_LEN)
 }
 
 /// Whether `addr`'s IP component is globally dialable — i.e. not loopback,
@@ -122,6 +152,7 @@ impl Default for NetworkConfig {
             bootstrap_peers: Vec::new(),
             max_peers: 100,
             gossipsub_heartbeat_ms: crate::behaviour::DEFAULT_GOSSIPSUB_HEARTBEAT_MS,
+            gossipsub_queue_len: gossip_queue_len(),
             max_consensus_message_size: 1024 * 1024, // O5: was 256 KB (< EVM worst case — livelock trap)
             max_tx_message_size: 128 * 1024,
             tx_rate_limit_per_peer: 100,

@@ -221,6 +221,10 @@ impl LibP2PNetwork {
         let gossip_max_transmit = crate::caps::GOSSIP_MAX_TRANSMIT_SIZE
             .max(config.max_consensus_message_size)
             .max(config.max_tx_message_size);
+        // B3: per-peer send-queue length is config-wired (env
+        // TORUS_GOSSIP_QUEUE_LEN via NetworkConfig::default; =5000 restores
+        // libp2p's shipped default).
+        let gossipsub_queue_len = config.gossipsub_queue_len;
         // DNS wraps the dial filter which wraps QUIC, so /dns4 bootstrap
         // entries resolve BEFORE the filter judges the literal IP. Kademlia
         // query dials to stale private records (re-learned from peers that
@@ -254,6 +258,7 @@ impl LibP2PNetwork {
                     max_peers,
                     gossipsub_heartbeat_ms,
                     gossip_max_transmit,
+                    gossipsub_queue_len,
                 )
                 .expect("failed to create TorusBehaviour")
             })

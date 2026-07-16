@@ -658,6 +658,19 @@ fn publish_native_batch(
         }
         Err(e) => {
             warn!(count, trigger, "failed to publish native batch: {e:?}");
+            record_publish_failure(shared, &e);
+        }
+    }
+}
+
+/// B3 send-queue hygiene: count `AllQueuesFull` publish rejections. With
+/// flood_publish this fires only when EVERY recipient's per-peer send queue
+/// is full — the total-fan-out failure that was previously a warn-level log
+/// and nothing else. Partial per-peer misses surface via the SlowPeer arm.
+fn record_publish_failure(shared: &SharedState, err: &gossipsub::PublishError) {
+    if let gossipsub::PublishError::AllQueuesFull(_) = err {
+        if let Some(ref m) = shared.metrics {
+            m.gossip_publish_all_queues_full.inc();
         }
     }
 }
@@ -970,6 +983,7 @@ pub async fn run_swarm_with_config(
                     }
                     Err(e) => {
                         warn!("Failed to publish tx: {e:?}");
+                        record_publish_failure(&shared, &e);
                     }
                 }
             }
@@ -1201,6 +1215,41 @@ fn handle_event(
                 let tx_hash: [u8; 32] = Keccak256::digest(&message.data).into();
                 if tx_gossip_state.should_accept(tx_hash, propagation_source) {
                     debug!("Received new tx from {propagation_source}");
+                }
+            }
+        }
+        SwarmEvent::Behaviour(TorusBehaviourEvent::Gossipsub(gossipsub::Event::SlowPeer {
+            peer_id,
+            failed_messages,
+        })) => {
+            // B3 send-queue hygiene: a peer's per-connection send queue dropped
+            // or timed out messages this heartbeat — previously invisible (the
+            // 5 s publish abandonment that ate proposals surfaced ONLY here).
+            // debug-level log (can fire every 100 ms heartbeat per slow peer
+            // under exactly the overload it detects); counters carry the signal.
+            debug!(
+                %peer_id,
+                publish = failed_messages.publish,
+                forward = failed_messages.forward,
+                priority = failed_messages.priority,
+                non_priority = failed_messages.non_priority,
+                timeout = failed_messages.timeout,
+                "gossipsub slow peer"
+            );
+            if let Some(ref m) = shared.metrics {
+                m.gossipsub_slow_peer_events.inc();
+                for (kind, n) in [
+                    ("publish", failed_messages.publish),
+                    ("forward", failed_messages.forward),
+                    ("priority", failed_messages.priority),
+                    ("non_priority", failed_messages.non_priority),
+                    ("timeout", failed_messages.timeout),
+                ] {
+                    if n > 0 {
+                        m.gossipsub_slow_peer_failed_messages
+                            .get_or_create(&vec![("kind".to_string(), kind.to_string())])
+                            .inc_by(n as u64);
+                    }
                 }
             }
         }
@@ -1909,6 +1958,7 @@ fn handle_command(
                     }
                     Err(e) => {
                         warn!("Failed to publish consensus message: {e:?}");
+                        record_publish_failure(shared, &e);
                     }
                 }
             }

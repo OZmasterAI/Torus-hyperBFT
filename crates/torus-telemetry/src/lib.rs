@@ -231,6 +231,23 @@ pub struct Metrics {
     /// Proves the shipped body zstd (`/torus/{direct,block-data,native-da}/2.0`)
     /// is live on-wire and by how much (T3.2).
     pub wire_compression_bytes: Family<Vec<(String, String)>, Gauge>,
+
+    // B3 send-queue hygiene — gossipsub's per-peer send-queue failure modes,
+    // previously visible only as debug logs (the smoking gun of the proposal
+    // HoL-blocking collapse made countable).
+    /// Gossipsub `SlowPeer` events: heartbeats in which a peer's send queue
+    /// dropped or timed out messages. Must stay ~0; a sustained rate names
+    /// the overloaded/underprovisioned peer link.
+    pub gossipsub_slow_peer_events: Counter,
+    /// Messages gossipsub failed to deliver to a slow peer, by kind
+    /// (label `kind` = publish|forward|priority|non_priority|timeout),
+    /// accumulated from `SlowPeer.failed_messages`. `timeout` = queued
+    /// publishes abandoned after the 5 s window — the silent proposal killer.
+    pub gossipsub_slow_peer_failed_messages: Family<Vec<(String, String)>, Counter>,
+    /// Gossipsub publishes rejected with `AllQueuesFull` (every recipient's
+    /// send queue was full — with flood_publish this means the WHOLE fan-out
+    /// failed, not one peer). Partial per-peer misses show up as SlowPeer.
+    pub gossip_publish_all_queues_full: Counter,
 }
 
 impl Metrics {
@@ -797,6 +814,28 @@ impl Metrics {
             wire_compression_bytes.clone(),
         );
 
+        let gossipsub_slow_peer_events = Counter::default();
+        registry.register(
+            "torus_gossipsub_slow_peer_events",
+            "Gossipsub SlowPeer events (heartbeats where a peer's send queue dropped/timed out messages)",
+            gossipsub_slow_peer_events.clone(),
+        );
+
+        let gossipsub_slow_peer_failed_messages =
+            Family::<Vec<(String, String)>, Counter>::default();
+        registry.register(
+            "torus_gossipsub_slow_peer_failed_messages",
+            "Messages gossipsub failed to send to a slow peer, by kind (publish|forward|priority|non_priority|timeout)",
+            gossipsub_slow_peer_failed_messages.clone(),
+        );
+
+        let gossip_publish_all_queues_full = Counter::default();
+        registry.register(
+            "torus_gossip_publish_all_queues_full",
+            "Gossipsub publishes rejected with AllQueuesFull (every recipient send queue full)",
+            gossip_publish_all_queues_full.clone(),
+        );
+
         Self {
             registry,
             blocks_committed,
@@ -879,6 +918,9 @@ impl Metrics {
             rocksdb_pending_compaction_bytes,
             rocksdb_block_cache_bytes,
             wire_compression_bytes,
+            gossipsub_slow_peer_events,
+            gossipsub_slow_peer_failed_messages,
+            gossip_publish_all_queues_full,
         }
     }
 
