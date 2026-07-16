@@ -4203,6 +4203,420 @@ mod exec_throttle_tests {
 }
 
 #[cfg(test)]
+mod exec_dispatch_tests {
+    //! Package D rank 2 — non-blocking exec dispatch + bounded deferred_exec.
+    //!
+    //! RED-first: these tests pin the try_send/park/demote/drain contract
+    //! before the implementation exists. `TORUS_EXEC_NONBLOCKING_DISPATCH`
+    //! unset must stay bit-identical to today's blocking send; set, a full
+    //! exec channel must PARK the block in the strict-order `deferred_exec`
+    //! map (never block the consensus thread, never a heal-budget hole),
+    //! demote parked bodies to `ExecSource::Compact` beyond a byte budget,
+    //! and drain in strict height order via commits + the 1s reconcile tick.
+
+    use super::*;
+    use torus_types::{Bloom, NativeAction, SignedNativeAction, B256};
+
+    /// Same process-global env guard as the pacing tests (env vars are shared
+    /// across parallel test threads).
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        super::exec_throttle_tests::env_lock()
+    }
+
+    fn clear_dispatch_env() {
+        std::env::remove_var("TORUS_EXEC_NONBLOCKING_DISPATCH");
+        std::env::remove_var("TORUS_DEFERRED_EXEC_READY_BYTES");
+    }
+
+    fn signed(seed: u8, nonce: u64) -> SignedNativeAction {
+        let key = k256::ecdsa::SigningKey::from_slice(&[seed; 32]).unwrap();
+        torus_types::eip712::sign_native_action(NativeAction::ClaimRewards, nonce, &key)
+    }
+
+    /// Minimal committed-block fixture. Parent linkage is irrelevant here:
+    /// these tests swap `exec_tx` for their own channel, so no block ever
+    /// reaches `execute_committed_block` (where the ancestry check lives) —
+    /// only `persist_committed_block_durably` + the send path run.
+    fn block(height: u64, native_actions: Vec<SignedNativeAction>) -> TorusBlock {
+        TorusBlock {
+            header: TorusBlockHeader {
+                height,
+                parent_hash: B256::ZERO,
+                timestamp: 1000 + height,
+                proposer: Address::ZERO,
+                state_root: B256::ZERO,
+                receipts_root: B256::ZERO,
+                logs_bloom: Bloom::ZERO,
+                evm_gas_used: 0,
+                evm_fee_revenue: 0,
+                evm_gas_limit: 30_000_000,
+                native_action_count: native_actions.len() as u32,
+                evm_tx_count: 0,
+                base_fee_per_gas: 1_000_000_000,
+                epoch: 0,
+                validator_set_hash: B256::ZERO,
+                sig_attestation: [0u8; 64],
+            },
+            native_actions,
+            evm_transactions: vec![],
+            core_writer_actions: vec![],
+        }
+    }
+
+    /// Replace the app's exec channel with a test-owned one of capacity `cap`.
+    /// Dropping the original sender detaches the real execution thread (it
+    /// exits; `Drop` still joins it cleanly).
+    fn swap_exec_channel(
+        app: &mut TorusApp,
+        cap: usize,
+    ) -> std::sync::mpsc::Receiver<CommittedBlockMsg> {
+        let (tx, rx) = std::sync::mpsc::sync_channel(cap);
+        app.exec_tx = Some(tx);
+        rx
+    }
+
+    #[test]
+    fn nonblocking_toggle_defaults_off_and_zero_disables() {
+        // Unset/empty/"0" => blocking send, bit-identical to today.
+        assert!(!parse_nonblocking_dispatch_toggle(None));
+        assert!(!parse_nonblocking_dispatch_toggle(Some("".into())));
+        assert!(!parse_nonblocking_dispatch_toggle(Some("  ".into())));
+        assert!(!parse_nonblocking_dispatch_toggle(Some("0".into())));
+        assert!(!parse_nonblocking_dispatch_toggle(Some(" 0 ".into())));
+        assert!(parse_nonblocking_dispatch_toggle(Some("1".into())));
+        assert!(parse_nonblocking_dispatch_toggle(Some("true".into())));
+    }
+
+    #[test]
+    fn deferred_ready_bytes_parse_defaults_and_zero() {
+        assert_eq!(
+            parse_deferred_ready_bytes(None),
+            DEFERRED_EXEC_READY_BYTES_DEFAULT
+        );
+        assert_eq!(
+            parse_deferred_ready_bytes(Some("junk".into())),
+            DEFERRED_EXEC_READY_BYTES_DEFAULT
+        );
+        assert_eq!(parse_deferred_ready_bytes(Some("0".into())), 0);
+        assert_eq!(
+            parse_deferred_ready_bytes(Some(" 1048576 ".into())),
+            1 << 20
+        );
+    }
+
+    /// The rank-2 core: a FULL exec channel defers (parks) instead of blocking
+    /// the consensus thread, parked heights drain in STRICT ascending order as
+    /// capacity frees (via the reconcile tick), a park is NOT a heal-budget
+    /// hole, and nothing is lost — every enqueued block is eventually sent
+    /// exactly once, in order.
+    #[test]
+    fn full_channel_defers_instead_of_blocking_and_drains_in_strict_order() {
+        let _guard = env_lock();
+        clear_dispatch_env();
+        std::env::set_var("TORUS_EXEC_NONBLOCKING_DISPATCH", "1");
+
+        let mut app = TorusApp::stub();
+        let rx = swap_exec_channel(&mut app, 1);
+
+        let b1 = block(1, vec![]);
+        let b2 = block(2, vec![]);
+        let b3 = block(3, vec![]);
+
+        // Height 1 fills the capacity-1 channel.
+        app.enqueue_for_execution(1, ExecSource::Ready(b1), vec![]);
+        assert_eq!(app.exec_next_height, Some(2));
+        assert!(app.deferred_exec.is_empty());
+
+        // Height 2 hits a FULL channel. Run it on a helper thread so a
+        // regression to the blocking send shows up as a loud timeout here,
+        // not a wedged test binary.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let b2c = b2.clone();
+        std::thread::spawn(move || {
+            app.enqueue_for_execution(2, ExecSource::Ready(b2c), vec![]);
+            let _ = done_tx.send(app);
+        });
+        let mut app = done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("enqueue on a FULL exec channel must NOT block the consensus thread");
+
+        assert!(
+            app.deferred_exec.contains_key(&2),
+            "the full-channel block parks in the strict-order deferred map"
+        );
+        assert_eq!(
+            app.exec_next_height,
+            Some(2),
+            "a parked height must not advance the exec frontier"
+        );
+        assert!(
+            app.exec_hole_since.is_none(),
+            "a backpressure park is NOT a hole — it must never burn the heal fail-stop budget"
+        );
+
+        // Height 3 arrives behind the park: buffers behind it, still in order.
+        app.enqueue_for_execution(3, ExecSource::Ready(b3), vec![]);
+        assert_eq!(
+            app.deferred_exec.keys().copied().collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        assert!(app.exec_hole_since.is_none());
+
+        // Exactly one block crossed so far: height 1.
+        assert_eq!(rx.try_recv().expect("h1 was sent").torus_block.header.height, 1);
+        assert!(rx.try_recv().is_err(), "heights 2/3 are parked, not sent");
+
+        // Reconcile tick drains what now fits: 2 sends, 3 re-parks (Full again).
+        app.on_reconcile_tick();
+        assert_eq!(rx.try_recv().expect("h2 drains first").torus_block.header.height, 2);
+        assert_eq!(
+            app.deferred_exec.keys().copied().collect::<Vec<_>>(),
+            vec![3],
+            "strict order: only the head may leave the park"
+        );
+        assert_eq!(app.exec_next_height, Some(3));
+
+        app.on_reconcile_tick();
+        assert_eq!(rx.try_recv().expect("h3 drains last").torus_block.header.height, 3);
+        assert!(app.deferred_exec.is_empty(), "pacing defers; nothing is shed");
+        assert_eq!(app.exec_next_height, Some(4));
+        assert!(!app.is_exec_failed());
+
+        clear_dispatch_env();
+    }
+
+    /// Memory bound: beyond the Ready-byte budget a parked block is DEMOTED to
+    /// `ExecSource::Compact`, synthesized from the committed block's own action
+    /// hashes (never a proposal cache), and the drain REMATERIALIZES it from
+    /// the durable DA store into a byte-identical block — execution is a pure
+    /// function of block bytes + prior state, so byte-identical dispatch in
+    /// identical order IS byte-identical execution, Ready vs demoted alike.
+    #[test]
+    fn park_demotes_to_compact_beyond_budget_and_roundtrips_byte_identical() {
+        let _guard = env_lock();
+        clear_dispatch_env();
+        std::env::set_var("TORUS_EXEC_NONBLOCKING_DISPATCH", "1");
+        // Budget 0: every Ready park must demote (when locally durable).
+        std::env::set_var("TORUS_DEFERRED_EXEC_READY_BYTES", "0");
+
+        let mut app = TorusApp::stub();
+        let mempool = Arc::new(Mempool::new(
+            app.state_db.clone(),
+            torus_mempool::MempoolConfig::default(),
+        ));
+        app.mempool = Some(mempool.clone());
+        let rx = swap_exec_channel(&mut app, 1);
+
+        let base = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let b1 = block(1, vec![signed(21, base)]);
+        let b2 = block(2, vec![signed(22, base + 1), signed(23, base + 2)]);
+        let b3 = block(3, vec![signed(24, base + 3)]);
+
+        // The committed bodies are locally durable (S459: mirrored pre-vote on
+        // every real path) — the precondition demotion checks before it drops
+        // the in-memory copy.
+        mempool
+            .mirror_native_to_da(&b2.native_actions)
+            .expect("durable DA mirror");
+        mempool
+            .mirror_native_to_da(&b3.native_actions)
+            .expect("durable DA mirror");
+
+        app.enqueue_for_execution(1, ExecSource::Ready(b1), vec![]);
+        app.enqueue_for_execution(2, ExecSource::Ready(b2.clone()), vec![]);
+        app.enqueue_for_execution(3, ExecSource::Ready(b3.clone()), vec![]);
+
+        // Both parked heights demoted: hashes only, taken from the committed
+        // blocks' own actions.
+        for (h, original) in [(2u64, &b2), (3u64, &b3)] {
+            let expected: Vec<B256> = original
+                .native_actions
+                .iter()
+                .map(torus_types::compute_action_hash)
+                .collect();
+            match &app.deferred_exec.get(&h).expect("parked").source {
+                ExecSource::Compact(c) => assert_eq!(
+                    c.native_action_hashes, expected,
+                    "demotion must reference the committed block's action hashes"
+                ),
+                _ => panic!("height {h} must be DEMOTED to Compact beyond the byte budget"),
+            }
+        }
+
+        // Drain and compare bytes end-to-end.
+        assert_eq!(rx.try_recv().unwrap().torus_block.header.height, 1);
+        app.on_reconcile_tick();
+        let got2 = rx.try_recv().expect("h2 rematerialized + sent").torus_block;
+        assert_eq!(
+            bincode::serialize(&got2).unwrap(),
+            bincode::serialize(&b2).unwrap(),
+            "Compact demotion must round-trip the block BYTE-IDENTICAL"
+        );
+        app.on_reconcile_tick();
+        let got3 = rx.try_recv().expect("h3 rematerialized + sent").torus_block;
+        assert_eq!(
+            bincode::serialize(&got3).unwrap(),
+            bincode::serialize(&b3).unwrap()
+        );
+        assert!(app.deferred_exec.is_empty());
+        assert!(app.exec_hole_since.is_none(), "no heal budget burned");
+
+        clear_dispatch_env();
+    }
+
+    /// Demotion is fail-safe: a block whose bodies are NOT locally durable is
+    /// parked as Ready even over budget (never traded for an un-rematerializable
+    /// reference), and still drains byte-identical.
+    #[test]
+    fn demotion_skips_blocks_whose_bodies_are_not_locally_durable() {
+        let _guard = env_lock();
+        clear_dispatch_env();
+        std::env::set_var("TORUS_EXEC_NONBLOCKING_DISPATCH", "1");
+        std::env::set_var("TORUS_DEFERRED_EXEC_READY_BYTES", "0");
+
+        let mut app = TorusApp::stub();
+        let mempool = Arc::new(Mempool::new(
+            app.state_db.clone(),
+            torus_mempool::MempoolConfig::default(),
+        ));
+        app.mempool = Some(mempool);
+        let rx = swap_exec_channel(&mut app, 1);
+
+        let base = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let b1 = block(1, vec![]);
+        // Bodies deliberately NOT mirrored to the DA store.
+        let b2 = block(2, vec![signed(31, base)]);
+
+        app.enqueue_for_execution(1, ExecSource::Ready(b1), vec![]);
+        app.enqueue_for_execution(2, ExecSource::Ready(b2.clone()), vec![]);
+
+        assert!(
+            matches!(
+                app.deferred_exec.get(&2).expect("parked").source,
+                ExecSource::Ready(_)
+            ),
+            "a body set that is not locally durable must stay parked READY"
+        );
+
+        assert_eq!(rx.try_recv().unwrap().torus_block.header.height, 1);
+        app.on_reconcile_tick();
+        let got2 = rx.try_recv().expect("h2 drains from the Ready park").torus_block;
+        assert_eq!(
+            bincode::serialize(&got2).unwrap(),
+            bincode::serialize(&b2).unwrap()
+        );
+        assert!(app.exec_hole_since.is_none());
+
+        clear_dispatch_env();
+    }
+
+    /// T1.5 fail-stop must latch VERBATIM in both dispatch modes when the
+    /// execution thread is gone (channel disconnected): the node halts, it
+    /// never parks a block for a dead pipeline.
+    #[test]
+    fn exec_dead_fail_stop_latches_in_both_dispatch_modes() {
+        let _guard = env_lock();
+        for enable in [false, true] {
+            clear_dispatch_env();
+            if enable {
+                std::env::set_var("TORUS_EXEC_NONBLOCKING_DISPATCH", "1");
+            }
+
+            let mut app = TorusApp::stub();
+            let rx = swap_exec_channel(&mut app, 1);
+            drop(rx); // execution thread "dead": receiver gone
+
+            app.enqueue_for_execution(1, ExecSource::Ready(block(1, vec![])), vec![]);
+            assert!(
+                app.is_exec_failed(),
+                "disconnected exec channel must latch the fail-stop (mode enable={enable})"
+            );
+            assert!(
+                app.deferred_exec.is_empty(),
+                "a dead pipeline must fail-stop, never park (mode enable={enable})"
+            );
+        }
+        clear_dispatch_env();
+    }
+
+    /// With the flag OFF the reconcile tick must be a strict no-op — today's
+    /// hole-retry cadence (drain rides on commits only) is preserved
+    /// bit-identically.
+    #[test]
+    fn reconcile_tick_is_inert_when_flag_off() {
+        let _guard = env_lock();
+        clear_dispatch_env();
+
+        let mut app = TorusApp::stub();
+        app.exec_next_height = Some(1);
+        app.deferred_exec.insert(
+            1,
+            DeferredExecBlock {
+                source: ExecSource::Durable(1),
+                slashes: Vec::new(),
+                ready_bytes: 0,
+            },
+        );
+
+        app.on_reconcile_tick();
+
+        assert!(
+            app.deferred_exec.contains_key(&1),
+            "flag off: the tick must not drain"
+        );
+        assert!(
+            app.exec_hole_since.is_none() && app.exec_hole_retries == 0,
+            "flag off: the tick must not touch hole accounting"
+        );
+
+        clear_dispatch_env();
+    }
+
+    /// Bit-identical rollback pin: with the env UNSET the dispatch send still
+    /// BLOCKS on a full channel (today's semantics, no park), and completes
+    /// once the channel frees.
+    #[test]
+    fn blocking_mode_unchanged_when_env_unset() {
+        let _guard = env_lock();
+        clear_dispatch_env();
+
+        let mut app = TorusApp::stub();
+        let rx = swap_exec_channel(&mut app, 1);
+
+        app.enqueue_for_execution(1, ExecSource::Ready(block(1, vec![])), vec![]);
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let b2 = block(2, vec![]);
+        std::thread::spawn(move || {
+            app.enqueue_for_execution(2, ExecSource::Ready(b2), vec![]);
+            let _ = done_tx.send(app);
+        });
+
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "env unset: the dispatch send must still BLOCK on a full channel (bit-identical rollback)"
+        );
+
+        // Free a slot: the blocked send completes, nothing was parked.
+        assert_eq!(rx.recv().unwrap().torus_block.header.height, 1);
+        let app = done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("blocked send completes once the channel frees");
+        assert_eq!(rx.recv().unwrap().torus_block.header.height, 2);
+        assert!(app.deferred_exec.is_empty());
+        assert_eq!(app.exec_next_height, Some(3));
+    }
+}
+
+#[cfg(test)]
 mod in_flight_ledger_tests {
     use super::*;
     use torus_types::B256;
