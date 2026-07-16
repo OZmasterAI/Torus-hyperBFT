@@ -54,6 +54,31 @@ pub struct Metrics {
     pub orders_matched: Counter,
     pub liquidations_triggered: Counter,
 
+    // Order-funnel metrics (perf A1) — where PlaceOrder actions die inside
+    // execute_batch. Observability only: incremented in torus-bridge's
+    // native executor, never consulted by execution.
+    /// Orders accepted onto a book: status Filled | PartiallyFilled | Resting.
+    pub orders_placed_accepted: Counter,
+    /// Orders that left liquidity on the book: status Resting | PartiallyFilled.
+    pub orders_resting: Counter,
+    /// Orders rejected pre-book: available balance below the margin reserve.
+    pub orders_rejected_margin: Counter,
+    /// Orders the matching engine returned OrderStatus::Rejected for (dust qty,
+    /// non-positive/off-tick limit price, per-trader order cap, invalid stop
+    /// trigger, PostOnly cross, FOK unfillable, market order into empty book).
+    pub orders_rejected_book: Counter,
+    /// IOC/FOK/Market orders cancelled on arrival with zero fills.
+    pub orders_rejected_cancelled: Counter,
+    /// IOC/Market remainders cancelled after partial fills (the filled part
+    /// DID trade — counted separately so it never masquerades as a dead order).
+    pub orders_cancelled_partial_fill: Counter,
+    /// Resting maker orders auto-cancelled by self-trade prevention (counts
+    /// cancelled makers, not the incoming order that triggered them).
+    pub orders_self_trade_cancels: Counter,
+    /// Orders that died on other error paths: balance read/write failures,
+    /// fill-application failures.
+    pub orders_rejected_other: Counter,
+
     // Pruner metrics
     pub pruner_blocks_removed: Counter,
 
@@ -347,6 +372,62 @@ impl Metrics {
             "torus_liquidations_triggered",
             "Total liquidations triggered",
             liquidations_triggered.clone(),
+        );
+
+        let orders_placed_accepted = Counter::default();
+        registry.register(
+            "torus_orders_placed_accepted",
+            "Orders accepted onto a book (status Filled|PartiallyFilled|Resting)",
+            orders_placed_accepted.clone(),
+        );
+
+        let orders_resting = Counter::default();
+        registry.register(
+            "torus_orders_resting",
+            "Orders that left liquidity on the book (status Resting|PartiallyFilled)",
+            orders_resting.clone(),
+        );
+
+        let orders_rejected_margin = Counter::default();
+        registry.register(
+            "torus_orders_rejected_margin",
+            "Orders rejected pre-book: available balance below the required margin reserve",
+            orders_rejected_margin.clone(),
+        );
+
+        let orders_rejected_book = Counter::default();
+        registry.register(
+            "torus_orders_rejected_book",
+            "Orders the matching engine rejected (dust, off-tick, order cap, PostOnly cross, FOK unfillable, market into empty book, bad stop trigger)",
+            orders_rejected_book.clone(),
+        );
+
+        let orders_rejected_cancelled = Counter::default();
+        registry.register(
+            "torus_orders_rejected_cancelled",
+            "IOC/FOK/Market orders cancelled on arrival with zero fills",
+            orders_rejected_cancelled.clone(),
+        );
+
+        let orders_cancelled_partial_fill = Counter::default();
+        registry.register(
+            "torus_orders_cancelled_partial_fill",
+            "IOC/Market remainders cancelled after partial fills (filled part traded)",
+            orders_cancelled_partial_fill.clone(),
+        );
+
+        let orders_self_trade_cancels = Counter::default();
+        registry.register(
+            "torus_orders_self_trade_cancels",
+            "Resting maker orders auto-cancelled by self-trade prevention",
+            orders_self_trade_cancels.clone(),
+        );
+
+        let orders_rejected_other = Counter::default();
+        registry.register(
+            "torus_orders_rejected_other",
+            "Orders that died on other error paths (balance read/write or fill application failures)",
+            orders_rejected_other.clone(),
         );
 
         let pruner_blocks_removed = Counter::default();
@@ -815,6 +896,14 @@ impl Metrics {
             validator_set_size,
             orders_matched,
             liquidations_triggered,
+            orders_placed_accepted,
+            orders_resting,
+            orders_rejected_margin,
+            orders_rejected_book,
+            orders_rejected_cancelled,
+            orders_cancelled_partial_fill,
+            orders_self_trade_cancels,
+            orders_rejected_other,
             pruner_blocks_removed,
             rpc_requests_total,
             rpc_request_duration_seconds,

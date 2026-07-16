@@ -661,6 +661,10 @@ impl NativeExecutor {
                 match bal_cache.load(&ctx.positions, sender) {
                     Ok(mut bal) => {
                         if bal.available < order_margin_required {
+                            // Funnel (perf A1): died pre-book on the margin reserve.
+                            if let Some(ref m) = ctx.metrics {
+                                m.orders_rejected_margin.inc();
+                            }
                             results[i] = NativeActionResult::err(
                                 "place_order",
                                 format!(
@@ -675,6 +679,10 @@ impl NativeExecutor {
                         bal_cache.set(sender, bal);
                     }
                     Err(e) => {
+                        // Funnel (perf A1): died pre-book on a balance read error.
+                        if let Some(ref m) = ctx.metrics {
+                            m.orders_rejected_other.inc();
+                        }
                         results[i] = NativeActionResult::err("place_order", e.to_string());
                         continue;
                     }
@@ -778,6 +786,14 @@ impl NativeExecutor {
             for (match_result, prep) in mbr.results.iter().zip(prepared.iter()) {
                 let result = &match_result.result;
 
+                // Funnel (perf A1): STP maker cancels already happened in the
+                // book during matching, regardless of how settlement below
+                // turns out — count them here, not with the status outcome.
+                if let Some(ref m) = ctx.metrics {
+                    m.orders_self_trade_cancels
+                        .inc_by(result.self_trade_cancels.len() as u64);
+                }
+
                 // Release margin for filled/cancelled portion
                 if prep.margin_reserved > FixedPoint::ZERO {
                     let order_rests = matches!(
@@ -852,6 +868,10 @@ impl NativeExecutor {
                 }
 
                 if fill_failed {
+                    // Funnel (perf A1): died on fill application, not on the book.
+                    if let Some(ref m) = ctx.metrics {
+                        m.orders_rejected_other.inc();
+                    }
                     continue;
                 }
 
@@ -862,6 +882,7 @@ impl NativeExecutor {
 
                 if let Some(ref m) = ctx.metrics {
                     m.orders_matched.inc_by(result.fills.len() as u64);
+                    Self::record_order_status_funnel(m, &result.status, result.fills.len());
                 }
 
                 total_gas += 1000;
@@ -885,6 +906,43 @@ impl NativeExecutor {
     // ========================================================================
     // Order book handlers
     // ========================================================================
+
+    /// Funnel-truth (perf A1): classify one matching-engine outcome into the
+    /// order-funnel counters. Called exactly once per PlaceOrder that reached
+    /// the book AND settled (margin rejects, balance errors and fill-application
+    /// failures are counted at their own sites as `orders_rejected_margin` /
+    /// `orders_rejected_other`). Observability only: nothing in execution reads
+    /// these counters back.
+    fn record_order_status_funnel(
+        m: &torus_telemetry::Metrics,
+        status: &OrderStatus,
+        fill_count: usize,
+    ) {
+        match status {
+            OrderStatus::Filled => {
+                m.orders_placed_accepted.inc();
+            }
+            OrderStatus::Resting | OrderStatus::PartiallyFilled => {
+                m.orders_placed_accepted.inc();
+                m.orders_resting.inc();
+            }
+            OrderStatus::Rejected => {
+                m.orders_rejected_book.inc();
+            }
+            OrderStatus::Cancelled => {
+                if fill_count > 0 {
+                    // IOC/Market remainder cancelled after real fills — the
+                    // filled part DID trade, never count it as a dead order.
+                    m.orders_cancelled_partial_fill.inc();
+                } else {
+                    m.orders_rejected_cancelled.inc();
+                }
+            }
+            // Stop order queued for trigger: neither accepted onto the book
+            // nor dead — it re-enters the matching funnel when triggered.
+            OrderStatus::PendingTrigger => {}
+        }
+    }
 
     fn exec_place_order<T: StateBackend>(
         ctx: &mut NativeExecContext<T>,
@@ -913,6 +971,10 @@ impl NativeExecutor {
             match ctx.positions.get_native_balance(sender) {
                 Ok(mut bal) => {
                     if bal.available < order_margin_required {
+                        // Funnel (perf A1): died pre-book on the margin reserve.
+                        if let Some(ref m) = ctx.metrics {
+                            m.orders_rejected_margin.inc();
+                        }
                         return NativeActionResult::err(
                             "place_order",
                             format!(
@@ -924,10 +986,20 @@ impl NativeExecutor {
                     bal.available -= order_margin_required;
                     bal.order_margin += order_margin_required;
                     if let Err(e) = ctx.positions.put_native_balance(sender, &bal) {
+                        // Funnel (perf A1): died pre-book on a balance write error.
+                        if let Some(ref m) = ctx.metrics {
+                            m.orders_rejected_other.inc();
+                        }
                         return NativeActionResult::err("place_order", e.to_string());
                     }
                 }
-                Err(e) => return NativeActionResult::err("place_order", e.to_string()),
+                Err(e) => {
+                    // Funnel (perf A1): died pre-book on a balance read error.
+                    if let Some(ref m) = ctx.metrics {
+                        m.orders_rejected_other.inc();
+                    }
+                    return NativeActionResult::err("place_order", e.to_string());
+                }
             }
         }
 
@@ -942,6 +1014,13 @@ impl NativeExecutor {
         book.set_next_order_id(ctx.next_global_order_id);
         let result = book.place_order(params.clone(), *sender, ctx.timestamp);
         ctx.next_global_order_id = book.next_order_id();
+
+        // Funnel (perf A1): STP maker cancels already happened in the book,
+        // regardless of how settlement below turns out.
+        if let Some(ref m) = ctx.metrics {
+            m.orders_self_trade_cancels
+                .inc_by(result.self_trade_cancels.len() as u64);
+        }
 
         // FIX 2: Release margin for the filled portion; keep reserved for resting.
         if order_margin_required > FixedPoint::ZERO {
@@ -986,6 +1065,10 @@ impl NativeExecutor {
                 fill.price,
                 MarginType::Cross,
             ) {
+                // Funnel (perf A1): died on fill application, not on the book.
+                if let Some(ref m) = ctx.metrics {
+                    m.orders_rejected_other.inc();
+                }
                 return NativeActionResult::err("place_order", format!("taker fill failed: {e}"));
             }
             if let Err(e) = ctx.positions.apply_fill(
@@ -996,6 +1079,10 @@ impl NativeExecutor {
                 fill.price,
                 MarginType::Cross,
             ) {
+                // Funnel (perf A1): died on fill application, not on the book.
+                if let Some(ref m) = ctx.metrics {
+                    m.orders_rejected_other.inc();
+                }
                 return NativeActionResult::err("place_order", format!("maker fill failed: {e}"));
             }
         }
@@ -1008,6 +1095,7 @@ impl NativeExecutor {
 
         if let Some(ref m) = ctx.metrics {
             m.orders_matched.inc_by(result.fills.len() as u64);
+            Self::record_order_status_funnel(m, &result.status, result.fills.len());
         }
 
         NativeActionResult::ok("place_order", 1000)
