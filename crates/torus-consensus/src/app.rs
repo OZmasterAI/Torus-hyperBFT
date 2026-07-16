@@ -529,9 +529,12 @@ fn execution_loop(rx: std::sync::mpsc::Receiver<CommittedBlockMsg>, ctx: Executi
         ctx.execute_committed_block(&msg.torus_block, msg.pending_slashes);
         // Paired with the inc() at the `exec_tx.send` site: dec AFTER execution
         // so the gauge counts queued + in-flight blocks (pinned near the channel
-        // bound 64 = execution is the bottleneck).
+        // bound 64 = execution is the bottleneck). exec_queue_out is the counter
+        // twin (P2 funnel item 4): in − out = occupancy, race-proof across
+        // scrapes, and the out RATE is exec-thread block throughput.
         if let Some(ref m) = ctx.metrics {
             m.exec_queue_depth.dec();
+            m.exec_queue_out.inc();
         }
     }
     tracing::info!("execution pipeline thread shutting down");
@@ -2064,8 +2067,10 @@ impl App<RocksKVStore> for TorusApp {
             };
             // inc BEFORE the (possibly blocking) send so a consensus thread stalled
             // on a full channel is visible as depth ≥ the bound, not hidden.
+            // exec_queue_in mirrors the gauge inc (P2 funnel item 4).
             if let Some(ref m) = self.metrics {
                 m.exec_queue_depth.inc();
+                m.exec_queue_in.inc();
             }
             if tx.send(msg).is_err() {
                 tracing::error!(
@@ -2074,6 +2079,9 @@ impl App<RocksKVStore> for TorusApp {
                 );
                 if let Some(ref m) = self.metrics {
                     m.exec_queue_depth.dec();
+                    // Rebalance the counter pair too: the block never entered
+                    // the queue (shutdown race), so in − out must return to 0.
+                    m.exec_queue_out.inc();
                 }
             }
         }
@@ -3057,6 +3065,36 @@ mod crash_recovery_tests {
         assert!(
             text.contains("torus_exec_queue_depth 0"),
             "queue gauge must stay 0 on the direct-call path:\n{text}",
+        );
+    }
+
+    /// P2 funnel item 4: the exec handoff queue gets in/out COUNTERS next to the
+    /// existing depth gauge — a scrape race can't fake occupancy (in − out) and
+    /// the pair exposes flow rates. The out side is driven here through the real
+    /// `execution_loop`; the in side lives at the `exec_tx.send` site (verified
+    /// live: in − out == exec_queue_depth).
+    #[test]
+    fn exec_queue_out_counts_executed_blocks() {
+        let (config, state_db) = make_test_config_and_db();
+        let mut exec_ctx = make_exec_ctx(&config, &state_db);
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
+        exec_ctx.metrics = Some(metrics.clone());
+
+        let (tx, rx) = std::sync::mpsc::sync_channel(64);
+        for h in 1..=2u64 {
+            tx.send(CommittedBlockMsg {
+                torus_block: make_block(h, vec![]),
+                pending_slashes: vec![],
+            })
+            .unwrap();
+        }
+        drop(tx); // loop exits after draining both blocks
+        execution_loop(rx, exec_ctx);
+
+        let text = metrics.encode();
+        assert!(
+            text.contains("torus_exec_queue_out_total 2"),
+            "exec_queue_out must count each executed block:\n{text}"
         );
     }
 
