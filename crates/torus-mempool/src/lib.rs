@@ -92,6 +92,8 @@ pub struct MempoolConfig {
     pub native_per_sender_cap: usize,
     /// Capacity of the exec trust-cache (locally-verified action hash -> sender).
     pub verified_sender_cache_cap: usize,
+    /// Capacity of the exec-path session-owner cache (session_pubkey -> SessionData).
+    pub session_owner_cache_cap: usize,
     // ---- Memory budget (Phase 3: 3.1.7) ----
     /// Maximum combined memory for EVM + native pools in bytes (0 = unlimited).
     pub max_memory_bytes: usize,
@@ -112,6 +114,7 @@ impl Default for MempoolConfig {
             native_pool_max_size: rate_limit::native_pool_max_size(),
             native_per_sender_cap: rate_limit::native_per_sender_cap(),
             verified_sender_cache_cap: rate_limit::VERIFIED_SENDER_CACHE_CAP,
+            session_owner_cache_cap: rate_limit::SESSION_OWNER_CACHE_CAP,
             max_memory_bytes: 64 * 1024 * 1024, // 64 MB default
         }
     }
@@ -142,6 +145,20 @@ pub struct Mempool {
     /// `compute_action_hash`, which omits the signature). MISS => full recover +
     /// slash. See `docs/plans/double-verify-trust-cache-impl.md`.
     verified_senders: RwLock<FifoCache<B256, Address>>,
+    /// Exec-path session-owner cache: `session_pubkey -> SessionData`, letting the
+    /// execution thread skip the per-action `get_session` RocksDB read on a HIT.
+    /// This memoizes ONLY the DB read — the verify path still re-validates the
+    /// cached `SessionData` in full (expiry vs block timestamp, scope, and the
+    /// ed25519 signature over the action) on every action, so a HIT can never
+    /// accept an expired / out-of-scope / forged action. Correctness across
+    /// REVOCATION (and revoke->recreate owner rebinding) is preserved by
+    /// `invalidate_session`, called by the exec thread for every CreateSession /
+    /// RevokeSession action once the block that mutated the session is flushed
+    /// (`put_session`/`delete_session` in native_executor are the ONLY mutators).
+    /// Populated only after a real successful `get_session` resolution. A MISS (or
+    /// a stale-then-invalidated entry) falls through to the authoritative DB read,
+    /// so a HIT is indistinguishable from a MISS => deterministic across validators.
+    session_owners: RwLock<FifoCache<[u8; 32], torus_types::SessionData>>,
     /// P3 Round-2 scope 3: sojourn-gate drain estimator. `remove_committed_native`
     /// (consensus thread, sole writer) updates an EMA of the pool drain rate;
     /// the RPC admit path (readers) divides `pool_size` by it to estimate how
@@ -172,6 +189,7 @@ impl Mempool {
         // mempool sees is mirrored here durably (decoupled from the nonce gate).
         let da_store = NativeDaStore::new(state.clone());
         let verified_cap = config.verified_sender_cache_cap;
+        let session_owner_cap = config.session_owner_cache_cap;
         let initial_base_fee = config.initial_base_fee;
         Self {
             evm: RwLock::new(evm_pool::EvmPool::new()),
@@ -185,6 +203,7 @@ impl Mempool {
             native_gossip_enabled: std::sync::atomic::AtomicBool::new(false),
             metrics: std::sync::OnceLock::new(),
             verified_senders: RwLock::new(FifoCache::new(verified_cap)),
+            session_owners: RwLock::new(FifoCache::new(session_owner_cap)),
             sojourn: std::sync::Mutex::new(SojournState::default()),
         }
     }
@@ -223,6 +242,59 @@ impl Mempool {
             }
         }
         result
+    }
+
+    /// Exec-path session-owner cache HIT lookup: return the cached `SessionData`
+    /// for `session_pubkey`, avoiding the authoritative `get_session` RocksDB read.
+    ///
+    /// Read-only (no recency bump). `None` => MISS => the caller MUST resolve via
+    /// `get_session` (and then `cache_session_owner`). The returned `SessionData`
+    /// MUST still be re-validated by the caller exactly as an uncached resolution
+    /// would be (expiry vs block timestamp, scope, and the ed25519 signature over
+    /// the action); this method only skips the DB read, never the validation.
+    pub fn session_owner(&self, session_pubkey: &[u8; 32]) -> Option<torus_types::SessionData> {
+        let result = self
+            .session_owners
+            .read()
+            .ok()
+            .and_then(|cache| cache.get(session_pubkey).cloned());
+        if let Some(m) = self.metrics.get() {
+            if result.is_some() {
+                m.session_owner_cache_hits.inc();
+            } else {
+                m.session_owner_cache_misses.inc();
+            }
+        }
+        result
+    }
+
+    /// Populate the session-owner cache after a real successful `get_session`
+    /// resolution. MUST be called only with a `SessionData` that the authoritative
+    /// state DB just returned for `session_pubkey`, so a later HIT returns exactly
+    /// what a fresh `get_session` would (deterministic across validators).
+    pub fn cache_session_owner(&self, session_pubkey: [u8; 32], data: torus_types::SessionData) {
+        let evicted = match self.session_owners.write() {
+            Ok(mut cache) => cache.insert(session_pubkey, data),
+            Err(_) => return,
+        };
+        if evicted > 0 {
+            if let Some(m) = self.metrics.get() {
+                m.session_owner_cache_evictions.inc_by(evicted);
+            }
+        }
+    }
+
+    /// Invalidate the cached owner for `session_pubkey`. MUST be called by the exec
+    /// thread for every CreateSession / RevokeSession action in a committed block
+    /// (after the block's state mutations are flushed), because those are the ONLY
+    /// operations that change what `get_session` returns. Over-invalidation (e.g. on
+    /// a create/revoke that later fails) is safe: the next lookup simply MISSes and
+    /// re-resolves from the authoritative DB. Under-invalidation would be a
+    /// stale-accept bug, so this is deliberately unconditional on the action kind.
+    pub fn invalidate_session(&self, session_pubkey: &[u8; 32]) {
+        if let Ok(mut cache) = self.session_owners.write() {
+            cache.remove(session_pubkey);
+        }
     }
 
     /// Enable or disable native action gossip at runtime.
@@ -1294,6 +1366,74 @@ mod tests {
             None,
             "gossip-trusted must NOT seed the trust-cache (verified_locally=false)"
         );
+    }
+
+    #[test]
+    fn session_owner_cache_hit_miss_and_invalidate() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state, MempoolConfig::default());
+
+        let pk = [0x42u8; 32];
+        let data = torus_types::SessionData {
+            owner: alloy_primitives::Address::from([0xAA; 20]),
+            expiry: 9_999,
+            scope: torus_types::SessionScope::Trading,
+            created_at: 1,
+        };
+
+        // MISS before populate.
+        assert_eq!(pool.session_owner(&pk), None, "cold lookup MISSes");
+
+        // Populate -> HIT returns the exact SessionData a get_session would.
+        pool.cache_session_owner(pk, data.clone());
+        assert_eq!(pool.session_owner(&pk), Some(data.clone()), "warm lookup HITs");
+
+        // Invalidate (models a revoke / create in a committed block) -> MISS again,
+        // forcing a re-resolve from the authoritative DB on the next verify.
+        pool.invalidate_session(&pk);
+        assert_eq!(
+            pool.session_owner(&pk),
+            None,
+            "invalidated session MISSes (no stale HIT after revoke)"
+        );
+
+        // Re-populate with a DIFFERENT owner (revoke->recreate rebinding) -> HIT now
+        // returns the NEW owner, never the stale one.
+        let rebound = torus_types::SessionData {
+            owner: alloy_primitives::Address::from([0xBB; 20]),
+            ..data
+        };
+        pool.cache_session_owner(pk, rebound.clone());
+        assert_eq!(
+            pool.session_owner(&pk),
+            Some(rebound),
+            "rebound session resolves to the new owner"
+        );
+    }
+
+    #[test]
+    fn session_owner_cache_bounded_by_cap() {
+        let (_dir, state) = setup();
+        // Cap 2 => inserting a 3rd distinct session evicts the oldest.
+        let config = MempoolConfig {
+            session_owner_cache_cap: 2,
+            ..MempoolConfig::default()
+        };
+        let pool = Mempool::new(state, config);
+
+        let mk = |n: u8| torus_types::SessionData {
+            owner: alloy_primitives::Address::from([n; 20]),
+            expiry: u64::MAX,
+            scope: torus_types::SessionScope::Full,
+            created_at: 0,
+        };
+        pool.cache_session_owner([1u8; 32], mk(1));
+        pool.cache_session_owner([2u8; 32], mk(2));
+        pool.cache_session_owner([3u8; 32], mk(3)); // evicts oldest ([1])
+
+        assert_eq!(pool.session_owner(&[1u8; 32]), None, "oldest evicted at cap");
+        assert!(pool.session_owner(&[2u8; 32]).is_some());
+        assert!(pool.session_owner(&[3u8; 32]).is_some());
     }
 
     #[test]

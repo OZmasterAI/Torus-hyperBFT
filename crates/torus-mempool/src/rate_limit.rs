@@ -244,6 +244,16 @@ pub fn native_block_bytes_cap() -> usize {
 /// full recover + slash (safe). ~32B/entry => ~0.5MB at this cap.
 pub const VERIFIED_SENDER_CACHE_CAP: usize = 16_384;
 
+/// Capacity of the exec-path session-owner cache (`session_pubkey -> SessionData`).
+///
+/// The working set is tiny — sessions are long-lived and reused across thousands
+/// of actions (a live sender holds <=5, capped by `MAX_SESSIONS_PER_ADDRESS`), so
+/// even a few thousand distinct senders fit comfortably. Sized generously so a
+/// still-valid session is not evicted between uses; an eviction only forces a
+/// re-resolve (one `get_session` read) and never affects correctness. ~72B/entry
+/// => ~1.2MB at this cap.
+pub const SESSION_OWNER_CACHE_CAP: usize = 16_384;
+
 /// Number of individual orders/operations an action represents.
 ///
 /// A `PlaceOrderBatch` counts as its length; every other action counts as 1.

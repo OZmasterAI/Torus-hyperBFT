@@ -85,6 +85,18 @@ pub struct Metrics {
     pub verified_sender_cache_misses: Counter,
     /// Exec trust-cache evictions (FIFO cap reached). High vs hits => cap too small.
     pub verified_sender_cache_evictions: Counter,
+    /// Session-owner cache HITs: a cached `session_pubkey -> SessionData` was reused,
+    /// skipping the per-action `get_session` RocksDB read at exec-time verify. The
+    /// cached data is still fully re-validated (expiry/scope/ed25519) by the verify
+    /// path, so a HIT never accepts an expired/revoked/out-of-scope session — it only
+    /// removes the DB read (P3 exec_verify lever).
+    pub session_owner_cache_hits: Counter,
+    /// Session-owner cache MISSes: no cached owner, fell through to the authoritative
+    /// `get_session` DB read (which then populates the cache).
+    pub session_owner_cache_misses: Counter,
+    /// Session-owner cache evictions (FIFO cap reached). An eviction only forces a
+    /// re-resolve (extra DB read); it never affects correctness.
+    pub session_owner_cache_evictions: Counter,
     /// Exec-path signature verifications SKIPPED because a trust-cache HIT reused a
     /// previously-verified sender (keyed by the signature-committing
     /// `verified_cache_key`) instead of re-running the secp256k1 recover on commit.
@@ -534,6 +546,27 @@ impl Metrics {
             "torus_exec_verify_skipped",
             "Exec-path signature recovers skipped via a trust-cache HIT (pairs with exec_verify_seconds)",
             exec_verify_skipped.clone(),
+        );
+
+        let session_owner_cache_hits = Counter::default();
+        registry.register(
+            "torus_session_owner_cache_hits",
+            "Session-owner cache hits (cached session->owner reused, get_session DB read skipped; data still re-validated)",
+            session_owner_cache_hits.clone(),
+        );
+
+        let session_owner_cache_misses = Counter::default();
+        registry.register(
+            "torus_session_owner_cache_misses",
+            "Session-owner cache misses (fell through to the authoritative get_session DB read + populate)",
+            session_owner_cache_misses.clone(),
+        );
+
+        let session_owner_cache_evictions = Counter::default();
+        registry.register(
+            "torus_session_owner_cache_evictions",
+            "Session-owner cache FIFO evictions (forces a re-resolve; never affects correctness)",
+            session_owner_cache_evictions.clone(),
         );
 
         let rpc_submit_permit_wait_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
@@ -1102,6 +1135,9 @@ impl Metrics {
             verified_sender_cache_misses,
             verified_sender_cache_evictions,
             exec_verify_skipped,
+            session_owner_cache_hits,
+            session_owner_cache_misses,
+            session_owner_cache_evictions,
             rpc_submit_permit_wait_seconds,
             rpc_submit_verify_seconds,
             rpc_submit_verify_cpu_seconds,

@@ -1490,6 +1490,315 @@ mod tests {
         assert!(matches!(err, Eip712Error::SessionScopeViolation));
     }
 
+    // ------------------------------------------------------------------
+    // Session-owner cache: prove `batch_verify_native_actions_cached` is
+    // TRANSPARENT to a memoizing session_lookup (the P3 session-owner cache).
+    // A HIT (cache) must yield byte-identical accept/reject + resolved owner to a
+    // MISS (direct get_session), and must STILL enforce expiry / scope / ed25519.
+    // The memoizing closure below mirrors the production one in app.rs exactly:
+    // HIT -> cached SessionData; MISS -> authoritative store + populate.
+    // ------------------------------------------------------------------
+
+    /// Authoritative "state DB" for tests: session_pubkey -> SessionData.
+    type SessionStore = std::collections::HashMap<[u8; 32], SessionData>;
+
+    /// Build a memoizing session_lookup identical in shape to the app.rs closure.
+    /// `db_reads` counts MISSes (authoritative reads) so a test can assert that N
+    /// same-session actions cost exactly ONE read (1 miss + N-1 hits).
+    fn memoizing_lookup<'a>(
+        store: &'a SessionStore,
+        cache: &'a std::cell::RefCell<SessionStore>,
+        db_reads: &'a std::cell::Cell<usize>,
+    ) -> impl Fn(&[u8; 32]) -> Option<SessionData> + 'a {
+        move |pk| {
+            if let Some(d) = cache.borrow().get(pk) {
+                return Some(d.clone()); // HIT: no DB read
+            }
+            db_reads.set(db_reads.get() + 1); // MISS: authoritative read
+            let d = store.get(pk).cloned()?;
+            cache.borrow_mut().insert(*pk, d.clone());
+            Some(d)
+        }
+    }
+
+    fn sign_order(nonce: u64, ed_key: &ed25519_dalek::SigningKey) -> SignedNativeAction {
+        sign_action_with_session(
+            NativeAction::CancelOrder {
+                order_id: nonce as u128,
+            },
+            nonce,
+            ed_key,
+        )
+    }
+
+    /// (i) Same session across N actions => exactly 1 DB read (1 miss + N-1 hits),
+    /// all resolve to the identical owner, and the cached run is byte-identical to
+    /// the uncached (direct-lookup) run.
+    #[test]
+    fn session_cache_n_actions_one_read_identical_to_uncached() {
+        let ed_key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let pubkey = ed_key.verifying_key().to_bytes();
+        let owner = Address::from([0xAB; 20]);
+
+        let mut store = SessionStore::new();
+        store.insert(pubkey, make_session(owner)); // scope: Trading, expiry: MAX
+
+        let actions: Vec<SignedNativeAction> =
+            (1..=5).map(|n| sign_order(n, &ed_key)).collect();
+        let ts = 1_000;
+
+        // Uncached reference: direct lookup, every call reads the store.
+        let uncached =
+            batch_verify_native_actions(&actions, ts, |pk| store.get(pk).cloned());
+
+        // Cached: memoizing lookup.
+        let cache = std::cell::RefCell::new(SessionStore::new());
+        let db_reads = std::cell::Cell::new(0usize);
+        let cached = batch_verify_native_actions(
+            &actions,
+            ts,
+            memoizing_lookup(&store, &cache, &db_reads),
+        );
+
+        assert_eq!(cached, uncached, "cache HIT run must equal uncached run");
+        assert!(
+            cached.iter().all(|s| *s == Some(owner)),
+            "every action resolves to the identical owner"
+        );
+        assert_eq!(
+            db_reads.get(),
+            1,
+            "5 same-session actions => exactly 1 authoritative read (1 miss + 4 hits)"
+        );
+    }
+
+    /// (ii) An EXPIRED session is rejected on the HIT path exactly as uncached — a
+    /// cached SessionData does NOT bypass the `timestamp <= expiry` check.
+    #[test]
+    fn session_cache_hit_rejects_expired_exactly_as_uncached() {
+        let ed_key = ed25519_dalek::SigningKey::from_bytes(&[11u8; 32]);
+        let pubkey = ed_key.verifying_key().to_bytes();
+        let owner = Address::from([0xCD; 20]);
+        let expiry = 5_000u64;
+
+        let mut store = SessionStore::new();
+        store.insert(
+            pubkey,
+            SessionData {
+                owner,
+                expiry,
+                scope: SessionScope::Trading,
+                created_at: 0,
+            },
+        );
+
+        let action = sign_order(1, &ed_key);
+        let cache = std::cell::RefCell::new(SessionStore::new());
+        let db_reads = std::cell::Cell::new(0usize);
+
+        // First: verify BEFORE expiry -> accepted, populates the cache.
+        let before = batch_verify_native_actions(
+            std::slice::from_ref(&action),
+            expiry, // timestamp == expiry: still valid (<=)
+            memoizing_lookup(&store, &cache, &db_reads),
+        );
+        assert_eq!(before[0], Some(owner), "valid before/at expiry");
+        assert_eq!(db_reads.get(), 1, "populated from the DB");
+
+        // Now verify AFTER expiry. The entry is a cache HIT (no new DB read), yet the
+        // action must be REJECTED because expiry is re-checked against the cached data.
+        let after_cached = batch_verify_native_actions(
+            std::slice::from_ref(&action),
+            expiry + 1,
+            memoizing_lookup(&store, &cache, &db_reads),
+        );
+        assert_eq!(db_reads.get(), 1, "second verify was a cache HIT (no DB read)");
+        assert_eq!(
+            after_cached[0], None,
+            "expired session rejected on the HIT path"
+        );
+
+        // Identical to the uncached path at the same timestamp.
+        let after_uncached = batch_verify_native_actions(
+            std::slice::from_ref(&action),
+            expiry + 1,
+            |pk| store.get(pk).cloned(),
+        );
+        assert_eq!(after_cached, after_uncached, "hit == miss for expired");
+    }
+
+    /// (iii) A forged action carrying a VALID session pubkey but a BAD ed25519
+    /// signature is rejected on the HIT path — caching owner-resolution never skips
+    /// signature verification.
+    #[test]
+    fn session_cache_hit_rejects_forged_ed25519_signature() {
+        let ed_key = ed25519_dalek::SigningKey::from_bytes(&[13u8; 32]);
+        let pubkey = ed_key.verifying_key().to_bytes();
+        let owner = Address::from([0xEF; 20]);
+
+        let mut store = SessionStore::new();
+        store.insert(pubkey, make_session(owner));
+
+        // Pre-warm the cache with a legitimate action so the session is a HIT.
+        let legit = sign_order(1, &ed_key);
+        let cache = std::cell::RefCell::new(SessionStore::new());
+        let db_reads = std::cell::Cell::new(0usize);
+        let warm = batch_verify_native_actions(
+            std::slice::from_ref(&legit),
+            1_000,
+            memoizing_lookup(&store, &cache, &db_reads),
+        );
+        assert_eq!(warm[0], Some(owner));
+        assert_eq!(db_reads.get(), 1);
+
+        // Forge: keep the (cached) session pubkey, corrupt the ed25519 signature.
+        let mut forged = sign_order(2, &ed_key);
+        if let ActionSignature::Session { sig, .. } = &mut forged.signature {
+            sig.0[0] ^= 0xFF;
+        } else {
+            panic!("expected a session signature");
+        }
+
+        let out = batch_verify_native_actions(
+            std::slice::from_ref(&forged),
+            1_000,
+            memoizing_lookup(&store, &cache, &db_reads),
+        );
+        assert_eq!(db_reads.get(), 1, "session pubkey was a cache HIT (no DB read)");
+        assert_eq!(
+            out[0], None,
+            "forged ed25519 rejected even though the session pubkey HIT the cache"
+        );
+    }
+
+    /// (ii-b) A REVOKED session is rejected once the cache entry is invalidated —
+    /// exactly as uncached. Models app.rs's post-flush `invalidate_session`: the
+    /// authoritative store deletes the session AND the cache entry is removed, so
+    /// the next verify MISSes and resolves to None (rejected). Also asserts that
+    /// WITHOUT invalidation a stale HIT would wrongly accept — proving invalidation
+    /// is the load-bearing correctness mechanism.
+    #[test]
+    fn session_cache_revoked_rejected_after_invalidation() {
+        let ed_key = ed25519_dalek::SigningKey::from_bytes(&[15u8; 32]);
+        let pubkey = ed_key.verifying_key().to_bytes();
+        let owner = Address::from([0x77; 20]);
+
+        let mut store = SessionStore::new();
+        store.insert(pubkey, make_session(owner));
+
+        let action = sign_order(1, &ed_key);
+        let cache = std::cell::RefCell::new(SessionStore::new());
+        let db_reads = std::cell::Cell::new(0usize);
+
+        // Warm the cache with a valid resolution.
+        let warm = batch_verify_native_actions(
+            std::slice::from_ref(&action),
+            1_000,
+            memoizing_lookup(&store, &cache, &db_reads),
+        );
+        assert_eq!(warm[0], Some(owner));
+
+        // Revoke: authoritative delete_session.
+        store.remove(&pubkey);
+
+        // Danger demo: if the cache is NOT invalidated, a stale HIT wrongly accepts.
+        let stale = batch_verify_native_actions(
+            std::slice::from_ref(&action),
+            1_000,
+            memoizing_lookup(&store, &cache, &db_reads),
+        );
+        assert_eq!(
+            stale[0],
+            Some(owner),
+            "un-invalidated cache would serve a revoked session (why invalidation is required)"
+        );
+
+        // Correct behavior: invalidate (app.rs post-flush) => next verify MISSes =>
+        // authoritative store returns None => rejected, identical to uncached.
+        cache.borrow_mut().remove(&pubkey);
+        let db_reads2 = std::cell::Cell::new(0usize);
+        let after = batch_verify_native_actions(
+            std::slice::from_ref(&action),
+            1_000,
+            memoizing_lookup(&store, &cache, &db_reads2),
+        );
+        let uncached = batch_verify_native_actions(
+            std::slice::from_ref(&action),
+            1_000,
+            |pk| store.get(pk).cloned(),
+        );
+        assert_eq!(after[0], None, "revoked session rejected after invalidation");
+        assert_eq!(after, uncached, "hit(invalidated) == miss for revoked");
+        assert_eq!(db_reads2.get(), 1, "invalidation forced a fresh authoritative read");
+    }
+
+    /// (iv) Determinism: for a MIXED batch (valid / expired / scope-violation /
+    /// forged), the memoized (cache) run is element-for-element identical to the
+    /// uncached run.
+    #[test]
+    fn session_cache_determinism_hit_equals_miss_mixed_batch() {
+        let key_ok = ed25519_dalek::SigningKey::from_bytes(&[21u8; 32]);
+        let key_exp = ed25519_dalek::SigningKey::from_bytes(&[22u8; 32]);
+        let key_scope = ed25519_dalek::SigningKey::from_bytes(&[23u8; 32]);
+        let key_forge = ed25519_dalek::SigningKey::from_bytes(&[24u8; 32]);
+        let pk_ok = key_ok.verifying_key().to_bytes();
+        let pk_exp = key_exp.verifying_key().to_bytes();
+        let pk_scope = key_scope.verifying_key().to_bytes();
+        let pk_forge = key_forge.verifying_key().to_bytes();
+        let owner = Address::from([0x33; 20]);
+        let ts = 10_000u64;
+
+        let mut store = SessionStore::new();
+        store.insert(pk_ok, make_session(owner)); // Trading, MAX expiry
+        store.insert(
+            pk_exp,
+            SessionData {
+                owner,
+                expiry: ts - 1, // already expired at ts
+                scope: SessionScope::Trading,
+                created_at: 0,
+            },
+        );
+        store.insert(
+            pk_scope,
+            SessionData {
+                owner,
+                expiry: u64::MAX,
+                scope: SessionScope::TransfersOnly, // does NOT allow CancelOrder
+                created_at: 0,
+            },
+        );
+        store.insert(pk_forge, make_session(owner));
+
+        let a_ok = sign_order(1, &key_ok);
+        let a_exp = sign_order(2, &key_exp);
+        let a_scope = sign_order(3, &key_scope);
+        let mut a_forge = sign_order(4, &key_forge);
+        if let ActionSignature::Session { sig, .. } = &mut a_forge.signature {
+            sig.0[10] ^= 0xFF;
+        }
+        // Repeat a_ok to exercise the intra-batch HIT.
+        let a_ok2 = sign_order(5, &key_ok);
+        let actions = vec![a_ok, a_exp, a_scope, a_forge, a_ok2];
+
+        let uncached = batch_verify_native_actions(&actions, ts, |pk| store.get(pk).cloned());
+
+        let cache = std::cell::RefCell::new(SessionStore::new());
+        let db_reads = std::cell::Cell::new(0usize);
+        let cached =
+            batch_verify_native_actions(&actions, ts, memoizing_lookup(&store, &cache, &db_reads));
+
+        assert_eq!(cached, uncached, "cache run identical to uncached for mixed batch");
+        // Expected shape: ok, reject(exp), reject(scope), reject(forge), ok.
+        assert_eq!(cached[0], Some(owner));
+        assert_eq!(cached[1], None, "expired rejected");
+        assert_eq!(cached[2], None, "out-of-scope rejected");
+        assert_eq!(cached[3], None, "forged rejected");
+        assert_eq!(cached[4], Some(owner));
+        // pk_ok resolved once then HIT on the repeat: 4 distinct pubkeys => 4 reads.
+        assert_eq!(db_reads.get(), 4, "one read per distinct session pubkey");
+    }
+
     /// Collapse the positional sender vector back to the indices of invalid
     /// actions, so the existing index-based assertions stay meaningful.
     fn invalid_indices(senders: &[Option<Address>]) -> Vec<usize> {

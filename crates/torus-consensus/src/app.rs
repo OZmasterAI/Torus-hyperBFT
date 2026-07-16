@@ -312,7 +312,36 @@ impl ExecutionContext {
                 torus_types::eip712::batch_verify_native_actions_cached(
                     &torus_block.native_actions,
                     torus_block.header.timestamp,
-                    |pubkey| self.state_db.get_session(pubkey).ok().flatten(),
+                    // Session-owner cache (gated by --exec-trust-cache): on a HIT
+                    // reuse the cached SessionData and skip the per-action
+                    // `get_session` RocksDB read (the P3 exec_verify lever for the
+                    // session-signed workload). The verify path below STILL
+                    // re-validates whatever this returns in full — expiry vs block
+                    // timestamp, scope, and the ed25519 signature over the action —
+                    // exactly as an uncached resolution, so a HIT can never accept
+                    // an expired / out-of-scope / forged action; it only removes the
+                    // DB read. A MISS falls through to the authoritative
+                    // `get_session` and populates the cache. Correctness across a
+                    // session REVOKE (and revoke->recreate owner rebinding) is held
+                    // by `invalidate_session` on every CreateSession/RevokeSession
+                    // once this block is flushed (below), so a stale entry is never
+                    // served. A HIT is thus indistinguishable from a MISS =>
+                    // deterministic across validators (cache is a CPU optimization,
+                    // never a consensus input).
+                    |pubkey| {
+                        if self.exec_trust_cache {
+                            if let Some(m) = self.mempool.as_ref() {
+                                if let Some(data) = m.session_owner(pubkey) {
+                                    return Some(data); // HIT: skip get_session
+                                }
+                                // MISS: authoritative read, then populate.
+                                let data = self.state_db.get_session(pubkey).ok().flatten()?;
+                                m.cache_session_owner(*pubkey, data.clone());
+                                return Some(data);
+                            }
+                        }
+                        self.state_db.get_session(pubkey).ok().flatten()
+                    },
                     // Exec trust-cache read (gated by --exec-trust-cache, default
                     // off): when enabled, a HIT reuses a locally-verified sender
                     // (keyed by the signature-committing key) and skips the secp256k1
@@ -496,6 +525,31 @@ impl ExecutionContext {
             if let Some(ref m) = self.metrics {
                 m.exec_flush_seconds
                     .observe(flush_timer.elapsed().as_secs_f64());
+            }
+
+            // Session-owner cache invalidation. `put_session` / `delete_session`
+            // (native_executor `exec_create_session` / `exec_revoke_session`) are the
+            // ONLY operations that change what `get_session` returns, and both were
+            // just committed by the flush above. Drop the cached owner for every
+            // session_pubkey touched by a CreateSession / RevokeSession in THIS block
+            // so the next block's verify MISSes and re-resolves from the authoritative
+            // (post-mutation) state — this is what keeps a revoked (or revoke->recreate
+            // rebound) session from ever being served stale on a later HIT. Runs on
+            // the single exec thread, so it is ordered before the next block's verify.
+            // Over-invalidation (a create/revoke that failed) is safe: it only forces
+            // a re-resolve. Unconditional on outcome by design.
+            if self.exec_trust_cache {
+                if let Some(m) = self.mempool.as_ref() {
+                    for signed in &torus_block.native_actions {
+                        match &signed.action {
+                            torus_types::NativeAction::CreateSession { session_pubkey, .. }
+                            | torus_types::NativeAction::RevokeSession { session_pubkey } => {
+                                m.invalidate_session(session_pubkey);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
             }
 
             // O3: hand this block's buffered trade-history KVs to the background

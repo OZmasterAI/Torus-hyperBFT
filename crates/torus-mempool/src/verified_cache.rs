@@ -61,12 +61,13 @@ impl<K: Hash + Eq + Clone, V: Clone> FifoCache<K, V> {
                     .order
                     .pop_front()
                     .expect("order is non-empty while map exceeds cap");
-                let remaining = {
-                    let slot = self.map.get_mut(&cand).expect("ordered key is live");
-                    slot.1 -= 1;
-                    slot.1
+                // A key removed via `remove()` leaves stale slots behind in `order`
+                // with no `map` entry; treat those as already-evicted and skip them.
+                let Some(slot) = self.map.get_mut(&cand) else {
+                    continue;
                 };
-                if remaining == 0 {
+                slot.1 -= 1;
+                if slot.1 == 0 {
                     self.map.remove(&cand);
                     evicted += 1;
                     break;
@@ -75,6 +76,16 @@ impl<K: Hash + Eq + Clone, V: Clone> FifoCache<K, V> {
             }
         }
         evicted
+    }
+
+    /// Remove `key` entirely (all live occurrences). O(1): the entry is dropped
+    /// from `map`; any slots still sitting in `order` become stale and are
+    /// skipped lazily at eviction time. Used to invalidate a cached entry when
+    /// the underlying authoritative value changes (e.g. a session revoke), so a
+    /// later look-up MISSes and re-resolves from source-of-truth. A no-op if the
+    /// key is absent.
+    pub fn remove(&mut self, key: &K) {
+        self.map.remove(key);
     }
 
     /// Look up `key`. Read-only: never affects eviction order (no recency bump).
@@ -122,6 +133,39 @@ mod tests {
         assert_eq!(c.get(&1), None, "read must not refresh recency");
         assert_eq!(c.get(&2), Some(&20));
         assert_eq!(c.get(&3), Some(&30));
+    }
+
+    #[test]
+    fn remove_invalidates_entry() {
+        // remove() drops the entry so a later get() MISSes (the invalidation the
+        // session-owner cache needs on a revoke/create).
+        let mut c: FifoCache<u32, u32> = FifoCache::new(4);
+        c.insert(1, 10);
+        c.insert(2, 20);
+        assert_eq!(c.get(&1), Some(&10));
+        c.remove(&1);
+        assert_eq!(c.get(&1), None, "removed key MISSes");
+        assert_eq!(c.get(&2), Some(&20), "other keys untouched");
+        assert_eq!(c.len(), 1, "live count drops after remove");
+        // Removing an absent key is a no-op.
+        c.remove(&999);
+        assert_eq!(c.len(), 1);
+    }
+
+    #[test]
+    fn remove_then_reinsert_and_evict_stays_consistent() {
+        // A stale `order` slot left by remove() must not corrupt later eviction.
+        let mut c: FifoCache<u32, u32> = FifoCache::new(2);
+        c.insert(1, 10);
+        c.insert(2, 20);
+        c.remove(&1); // leaves a stale slot for key 1 in `order`
+        c.insert(3, 30); // key 1's stale slot must be skipped, no panic, no over-evict
+        c.insert(4, 40); // now over cap -> evict oldest live (key 2)
+        assert_eq!(c.get(&1), None);
+        assert_eq!(c.get(&2), None, "oldest live evicted");
+        assert_eq!(c.get(&3), Some(&30));
+        assert_eq!(c.get(&4), Some(&40));
+        assert_eq!(c.len(), 2, "stays at cap");
     }
 
     #[test]
