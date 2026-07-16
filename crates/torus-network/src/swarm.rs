@@ -1951,12 +1951,24 @@ fn verify_sender_key(
             None
         }
         None => {
-            warn!(%authenticated_peer, "{context}: peer not in peer map");
-            peer_scoring.penalize(
-                authenticated_peer,
-                PENALTY_INVALID_CONSENSUS_MSG,
-                &format!("{context}: unregistered peer"),
+            // RH2 (swarm-hunt finding #6): a peer that is NOT yet in the peer map
+            // is almost always an honest RPC/ingress node whose DirectRequests
+            // raced ahead of the identify exchange that registers its vk — routine
+            // on reconnect and under flood, when identify processing queues behind
+            // bulk. The old 20-point penalty 1h-banned such a node after 5 messages
+            // (INITIAL_SCORE 100 / TEMP_BAN at 0), silently severing an ingress
+            // node so it stops forwarding — indistinguishable from the admission
+            // collapse Round 2 is trying to fix. Drop WITHOUT penalty; a 20-point
+            // penalty is reserved for cryptographically-proven invalidity (the
+            // invalid-key and key-mismatch branches above). Per-author rate
+            // limiters still bound any abuse regardless of ban state.
+            debug!(
+                %authenticated_peer,
+                "{context}: unregistered peer (identify race) — dropping without penalty"
             );
+            if let Some(ref m) = shared.metrics {
+                m.unregistered_peer_no_penalty.inc();
+            }
             None
         }
     }
@@ -2019,7 +2031,7 @@ fn handle_consensus_gossip(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::peer_scoring::INITIAL_SCORE;
+    use crate::peer_scoring::{INITIAL_SCORE, TEMP_BAN_THRESHOLD};
 
     /// s364 DoS closure (RED first): no node may subscribe to the removed
     /// `/torus/native-actions/2.0` zstd gossip topic. Subscribing forces every
@@ -2320,26 +2332,92 @@ mod tests {
         assert!(scoring.score(&peer) < 100);
     }
 
+    /// RH2 (finding #6): a burst of Direct messages from a peer that is NOT in
+    /// the peer map (honest RPC/ingress racing identify) must be dropped WITHOUT
+    /// penalty — no accrual, so no 1h ban. Before RH2 each message cost 20 points
+    /// and the peer was temp-banned after 5. (RED before the None branch stopped
+    /// penalizing.)
     #[test]
-    fn verify_sender_key_rejects_unregistered_peer() {
+    fn verify_sender_key_unregistered_burst_never_bans() {
         let vk = test_vk(4);
         let peer = test_peer(4);
         let shared = test_shared();
-        // Don't register the peer
+        // Peer intentionally left unregistered (identify hasn't landed yet).
         let mut scoring = PeerScoring::new(None);
-        let result = verify_sender_key(&vk.to_bytes(), &peer, &shared, &mut scoring, "test");
-        assert!(result.is_none());
-        assert!(scoring.score(&peer) < 100);
+        // Well past the old 5-message ban distance.
+        for _ in 0..50 {
+            let result = verify_sender_key(&vk.to_bytes(), &peer, &shared, &mut scoring, "test");
+            assert!(result.is_none(), "unregistered peer must not verify");
+        }
+        assert_eq!(
+            scoring.score(&peer),
+            INITIAL_SCORE,
+            "unregistered-peer burst must not decrease the score"
+        );
+        assert!(
+            scoring.score(&peer) > TEMP_BAN_THRESHOLD,
+            "unregistered peer must stay above the ban threshold"
+        );
+        assert!(!scoring.is_banned(&peer), "unregistered peer must not be banned");
     }
 
+    /// RH2: narrowing the unregistered-peer penalty must NOT weaken slashing of
+    /// cryptographically-proven-invalid keys — an unparseable ed25519 key still
+    /// penalizes, and a sustained burst of them still bans.
     #[test]
-    fn verify_sender_key_rejects_invalid_key_bytes() {
+    fn verify_sender_key_invalid_key_still_penalizes_and_bans() {
         let peer = test_peer(5);
         let shared = test_shared();
         let mut scoring = PeerScoring::new(None);
-        // All zeros is not a valid ed25519 key
-        let result = verify_sender_key(&[0u8; 32], &peer, &shared, &mut scoring, "test");
+        // Find a 32-byte value that is NOT a valid ed25519 point encoding
+        // (~half of random strings fail Edwards decompression). Note all-zeros is
+        // actually a VALID (small-order) encoding, so we search for a truly
+        // undecodable one to exercise the invalid-key branch.
+        let mut bad = [0u8; 32];
+        for i in 1u16..=1024 {
+            bad[0] = (i & 0xff) as u8;
+            bad[1] = (i >> 8) as u8;
+            if ed25519_dalek::VerifyingKey::from_bytes(&bad).is_err() {
+                break;
+            }
+        }
+        assert!(
+            ed25519_dalek::VerifyingKey::from_bytes(&bad).is_err(),
+            "test setup: expected to find an invalid ed25519 key encoding"
+        );
+        let result = verify_sender_key(&bad, &peer, &shared, &mut scoring, "test");
         assert!(result.is_none());
+        assert!(
+            scoring.score(&peer) < INITIAL_SCORE,
+            "a cryptographically-invalid key must still be penalized"
+        );
+        // Enough invalid-key messages must still cross the ban threshold.
+        for _ in 0..5 {
+            verify_sender_key(&bad, &peer, &shared, &mut scoring, "test");
+        }
+        assert!(
+            scoring.is_banned(&peer),
+            "a burst of invalid keys must still ban (proven-invalidity slashing intact)"
+        );
+    }
+
+    /// RH2: a peer whose registered vk does NOT match the claimed key is a
+    /// genuine identity mismatch (spoof attempt), not an identify race — it must
+    /// still be penalized.
+    #[test]
+    fn verify_sender_key_mismatch_still_penalizes() {
+        let vk_a = test_vk(6);
+        let vk_b = test_vk(7);
+        let peer = test_peer(6);
+        let shared = test_shared();
+        shared.peer_map.write().unwrap().insert(vk_a, peer);
+        let mut scoring = PeerScoring::new(None);
+        let result = verify_sender_key(&vk_b.to_bytes(), &peer, &shared, &mut scoring, "test");
+        assert!(result.is_none());
+        assert!(
+            scoring.score(&peer) < INITIAL_SCORE,
+            "a claimed-key/registered-key mismatch must still be penalized"
+        );
     }
 
     #[test]
