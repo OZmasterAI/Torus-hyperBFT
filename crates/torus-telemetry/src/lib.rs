@@ -226,6 +226,10 @@ pub struct Metrics {
     /// O3: per-block trade-history batches queued to the background CF writer
     /// but not yet written. Sustained growth = RocksDB stalling behind exec.
     pub trade_writer_queued_batches: Gauge,
+    /// P3 Task-1: per-block CF_BLOCK_BODIES batches queued to the background body
+    /// writer but not yet written (TORUS_ASYNC_BODY_PERSIST). Sustained growth =
+    /// RocksDB stalling behind exec; a bounded queue backpressures the exec thread.
+    pub body_writer_queued_batches: Gauge,
 
     // View-phase timing (hotstuff replica lifecycle, fed by ViewMetricsRecorder).
     // Decomposes per-leg block cadence per node: leader build + QC collection,
@@ -892,6 +896,13 @@ impl Metrics {
             trade_writer_queued_batches.clone(),
         );
 
+        let body_writer_queued_batches = Gauge::default();
+        registry.register(
+            "torus_body_writer_queued_batches",
+            "Block-body batches queued to the background body writer but not yet written",
+            body_writer_queued_batches.clone(),
+        );
+
         let view_duration_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 15));
         registry.register(
             "torus_view_duration_seconds",
@@ -1240,6 +1251,7 @@ impl Metrics {
             exec_body_bytes,
             exec_queue_depth,
             trade_writer_queued_batches,
+            body_writer_queued_batches,
             view_duration_seconds,
             view_propose_delay_seconds,
             view_propose_build_seconds,

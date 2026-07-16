@@ -3,7 +3,9 @@
 //! Moves node-local CF writes off the execution thread: the exec path buffers
 //! raw KVs and hands each block's batch to this writer, which applies them in
 //! one `WriteBatch` on its own thread. Only valid for CFs OUTSIDE the consensus
-//! roots (trade history: `CF_NATIVE_TRADES` / `CF_NATIVE_USER_TRADES`) — the
+//! roots (trade history: `CF_NATIVE_TRADES` / `CF_NATIVE_USER_TRADES`; P3 Task-1
+//! block bodies: `CF_BLOCK_BODIES`, keyed by height, byte-identical JSON that
+//! never feeds a state root) — the
 //! rows land shortly after the block's atomic state flush, so a hard crash can
 //! lose the last few queued batches. Replay does not re-execute applied blocks,
 //! so such a gap stays a cosmetic hole in RPC trade history, never consensus

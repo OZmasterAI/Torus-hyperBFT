@@ -127,9 +127,39 @@ struct ExecutionContext {
     /// ExecutionContext at execution-thread exit, which drains the queue before
     /// `TorusApp::Drop`'s join returns (shutdown flush ordering).
     trade_writer: Option<torus_state::BackgroundCfWriter>,
+    /// P3 Task-1: background writer for the per-block CF_BLOCK_BODIES JSON write,
+    /// gated by TORUS_ASYNC_BODY_PERSIST. `Some` moves the RocksDB body put off
+    /// the execution thread (the block-body put was 12.7% of exec_block on the
+    /// bs400 cross-flow leg); the exec thread still serializes the body (bytes are
+    /// MOVED into the channel — no extra clone) and only the write is deferred.
+    /// `None` (default / tests) = synchronous put, byte-identical to pre-Task-1.
+    /// The stored JSON is unchanged, so every reader (RPC getBlock, pruner, crash
+    /// recovery) parses it exactly as before. Crash safety: replay only needs the
+    /// body of the single last-committed height, which crashed mid-execution
+    /// BEFORE reaching the body write, so it is absent under sync AND async; a
+    /// crash losing an async-queued body for an already-applied height leaves
+    /// state durable (flush precedes the body write) and only leaves a cosmetic
+    /// RPC/trade-history hole, never consensus divergence. Dropped with the
+    /// ExecutionContext at exec-thread exit, draining the queue before join.
+    body_writer: Option<torus_state::BackgroundCfWriter>,
 }
 
 // ---- Standalone helpers (used by both execution thread and crash recovery) ----
+
+/// Truthy check for a `TORUS_*` boolean env var (1/true/on/yes, case-insensitive,
+/// trimmed). Anything else — unset, empty, or unparseable — is false, so a typo
+/// leaves the safe default (synchronous behavior) in place.
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "on" | "yes"
+            )
+        })
+        .unwrap_or(false)
+}
 
 fn read_native_applied_height(state_db: &StateDb) -> Option<u64> {
     state_db
@@ -593,7 +623,12 @@ impl ExecutionContext {
         // ---- Persist block body for RPC queries ----
         // P3 Task-1: split serialize vs put so the exec-thread cost of the
         // per-block CF_BLOCK_BODIES JSON write is visible (prime unaccounted
-        // suspect — multi-MB serialize under load, every block).
+        // suspect — multi-MB serialize under load, every block). The put was
+        // 12.7% of exec_block on the bs400 cross-flow leg; with a body_writer
+        // (TORUS_ASYNC_BODY_PERSIST) it moves off the exec thread. The exec
+        // thread still serializes — the owned bytes are MOVED into the writer
+        // channel with no extra copy — and the stored JSON is byte-identical, so
+        // every reader (RPC getBlock, pruner, crash-recovery replay) is unchanged.
         let body_serialize_timer = std::time::Instant::now();
         if let Ok(body_bytes) = serde_json::to_vec(&torus_block.body()) {
             if let Some(ref m) = self.metrics {
@@ -602,12 +637,33 @@ impl ExecutionContext {
                 m.exec_body_bytes.inc_by(body_bytes.len() as u64);
             }
             let body_put_timer = std::time::Instant::now();
-            let _ = self
-                .state_db
-                .put_cf_raw(CF_BLOCK_BODIES, &height.to_be_bytes(), &body_bytes);
+            // Hand the write to the background body writer when present; on a
+            // gone/closed writer the batch comes back and we write it inline so a
+            // body is never silently lost. `None` = synchronous put (default).
+            let fallback = match &self.body_writer {
+                Some(writer) => writer
+                    .send(vec![(
+                        CF_BLOCK_BODIES,
+                        height.to_be_bytes().to_vec(),
+                        body_bytes,
+                    )])
+                    .err()
+                    .and_then(|kvs| kvs.into_iter().next().map(|(_, _, v)| v)),
+                None => Some(body_bytes),
+            };
+            if let Some(bytes) = fallback {
+                let _ = self
+                    .state_db
+                    .put_cf_raw(CF_BLOCK_BODIES, &height.to_be_bytes(), &bytes);
+            }
             if let Some(ref m) = self.metrics {
+                // On the async path this only times the send handoff (put is
+                // off-thread); on the sync/fallback path it times the real put.
                 m.exec_body_put_seconds
                     .observe(body_put_timer.elapsed().as_secs_f64());
+                if let Some(w) = &self.body_writer {
+                    m.body_writer_queued_batches.set(w.queued_batches() as i64);
+                }
             }
         }
 
@@ -1143,6 +1199,23 @@ impl TorusApp {
                 "torus-trade-writer",
                 256,
             )),
+            // P3 Task-1: opt-in async block-body persistence. When
+            // TORUS_ASYNC_BODY_PERSIST is truthy, the per-block CF_BLOCK_BODIES
+            // put moves onto this writer's thread (12.7% of exec_block on the
+            // bs400 cross-flow leg); a full 256-block queue backpressures the
+            // exec thread instead of ballooning memory. Default off = the
+            // synchronous put, byte-identical to prior behavior — the OFF leg of
+            // the A/B runs the same binary with the flag unset.
+            body_writer: if env_flag("TORUS_ASYNC_BODY_PERSIST") {
+                tracing::info!("async block-body persistence ENABLED (CF_BLOCK_BODIES put off exec thread)");
+                Some(torus_state::BackgroundCfWriter::spawn(
+                    state_db.clone(),
+                    "torus-body-writer",
+                    256,
+                ))
+            } else {
+                None
+            },
         };
 
         // Phase A: ensure the persistent incremental trie exists before any commit (including
@@ -2769,6 +2842,9 @@ mod crash_recovery_tests {
             // None -> trades write inline through the overlay (pre-O3 behavior),
             // keeping these tests' reads deterministic right after execution.
             trade_writer: None,
+            // None -> synchronous block-body put (pre-Task-1 behavior); tests that
+            // exercise the async path attach a writer explicitly.
+            body_writer: None,
         }
     }
 
@@ -3228,6 +3304,62 @@ mod crash_recovery_tests {
                 .unwrap()
                 .is_some(),
             "consumed nonce should be recorded",
+        );
+    }
+
+    /// P3 Task-1: with NO body writer (default), the per-block CF_BLOCK_BODIES
+    /// JSON is written synchronously and is immediately readable + byte-identical
+    /// to a fresh serialize — the exact contract the crash-recovery replay, RPC
+    /// getBlock, and pruner all depend on.
+    #[test]
+    fn body_persist_sync_readable_without_writer() {
+        let (config, state_db) = make_test_config_and_db();
+        let mut exec_ctx = make_exec_ctx(&config, &state_db);
+        assert!(exec_ctx.body_writer.is_none(), "default path is synchronous");
+
+        let block = make_block(1, vec![sign_claim_rewards(7)]);
+        exec_ctx.execute_committed_block(&block, vec![]);
+
+        let stored = state_db
+            .get_cf_raw(CF_BLOCK_BODIES, &1u64.to_be_bytes())
+            .unwrap()
+            .expect("body must be present immediately after synchronous commit");
+        let expected = serde_json::to_vec(&block.body()).unwrap();
+        assert_eq!(stored, expected, "stored body JSON must be byte-identical");
+        // ...and it must parse back through the recovery path's decoder.
+        let parsed: TorusBlockBody = serde_json::from_slice(&stored).unwrap();
+        assert_eq!(parsed.native_actions.len(), block.native_actions.len());
+    }
+
+    /// P3 Task-1: with a background body writer attached (TORUS_ASYNC_BODY_PERSIST
+    /// on the live node), the CF_BLOCK_BODIES put moves off the execution thread.
+    /// Dropping the writer drains + joins, so the body must then be durable AND
+    /// byte-identical to the synchronous path — the deferral changes only WHERE
+    /// the write happens, never the stored format the readers parse.
+    #[test]
+    fn body_persist_async_writer_roundtrip() {
+        let (config, state_db) = make_test_config_and_db();
+        let mut exec_ctx = make_exec_ctx(&config, &state_db);
+        exec_ctx.body_writer = Some(torus_state::BackgroundCfWriter::spawn(
+            state_db.clone(),
+            "test-body-writer",
+            8,
+        ));
+
+        let block = make_block(1, vec![sign_claim_rewards(7)]);
+        exec_ctx.execute_committed_block(&block, vec![]);
+
+        // Drop the writer -> channel closes, queue drains, thread joins.
+        exec_ctx.body_writer = None;
+
+        let stored = state_db
+            .get_cf_raw(CF_BLOCK_BODIES, &1u64.to_be_bytes())
+            .unwrap()
+            .expect("async body must be durable after the writer drains on drop");
+        let expected = serde_json::to_vec(&block.body()).unwrap();
+        assert_eq!(
+            stored, expected,
+            "async-written body JSON must be byte-identical to the synchronous path"
         );
     }
 
