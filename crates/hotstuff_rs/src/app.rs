@@ -232,6 +232,20 @@ pub trait App<K: KVStore>: Send {
     fn on_fatal_safety_violation(&mut self) {
         // Default no-op for backward compatibility.
     }
+
+    /// Called roughly once per second from the algorithm loop's reconcile pass
+    /// (see `algorithm.rs`), independent of message arrival or view changes.
+    ///
+    /// Hosts may use it to retry deferred LOCAL work that would otherwise wait
+    /// for the next committed block — e.g. draining a backed-up execution
+    /// dispatch queue once the executor frees capacity (torus-consensus,
+    /// Package D rank 2). It runs on the algorithm thread: implementations
+    /// MUST be cheap and non-blocking, and MUST NOT touch consensus state.
+    ///
+    /// Default implementation is a no-op (for backward compatibility).
+    fn on_reconcile_tick(&mut self) {
+        // Default no-op for backward compatibility.
+    }
 }
 
 /// Request for an `App` to produce a new block extending a specific `parent_block`.

@@ -88,6 +88,10 @@ enum ExecSource {
 struct DeferredExecBlock {
     source: ExecSource,
     slashes: Vec<PendingSlash>,
+    /// Rank 2: bincode size of a `Ready` source's block (0 for
+    /// `Compact`/`Durable`), computed ONCE at park time so the Ready-byte
+    /// budget check is an integer sum, never a re-serialization walk.
+    ready_bytes: usize,
 }
 
 /// Regime-B: how long an execution hole (a committed block whose native bodies
@@ -257,6 +261,65 @@ fn paced_selection_caps(
         }
         _ => PacedSelectionCaps::CancelsOnly,
     }
+}
+
+// ============================================================================
+// Package D rank 2 — non-blocking exec dispatch + bounded deferred_exec
+// ============================================================================
+
+/// Parse the `TORUS_EXEC_NONBLOCKING_DISPATCH` opt-in toggle (rank 2).
+/// Unset, empty, or `"0"` ⇒ FALSE = the blocking `exec_tx.send`, bit-identical
+/// to today (the rollback position). Any other non-empty value (`"1"`,
+/// `"true"`) ⇒ try_send + strict-order park on a full channel. MUST ship with
+/// rank 1's pacing: the park removes the consensus-freeze mode, pacing is the
+/// backpressure that keeps the park bounded.
+fn parse_nonblocking_dispatch_toggle(raw: Option<String>) -> bool {
+    match raw {
+        Some(v) => {
+            let t = v.trim();
+            !t.is_empty() && t != "0"
+        }
+        None => false,
+    }
+}
+
+/// Effective dispatch mode. Fresh env read per call, like
+/// [`exec_throttle_watermarks`]: dispatch runs once per committed block, the
+/// read is noise, and fresh reads keep same-process tests deterministic.
+fn nonblocking_exec_dispatch() -> bool {
+    parse_nonblocking_dispatch_toggle(std::env::var("TORUS_EXEC_NONBLOCKING_DISPATCH").ok())
+}
+
+/// Rank 2 memory bound: total bincode bytes of `ExecSource::Ready` bodies the
+/// `deferred_exec` park may hold before further Ready parks DEMOTE to
+/// `ExecSource::Compact` (hash references, rematerialized from the durable DA
+/// store on drain). 64 MiB ≈ ~10 full 6 MB (`NATIVE_BLOCK_BYTES_CAP`) bodies.
+const DEFERRED_EXEC_READY_BYTES_DEFAULT: usize = 64 * 1024 * 1024;
+
+/// Parse `TORUS_DEFERRED_EXEC_READY_BYTES` (rank 2): the Ready-park byte
+/// budget. Malformed/unset ⇒ the compiled default; `0` ⇒ demote every parked
+/// Ready block (maximum memory thrift; also the test lever).
+fn parse_deferred_ready_bytes(raw: Option<String>) -> usize {
+    raw.and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(DEFERRED_EXEC_READY_BYTES_DEFAULT)
+}
+
+/// Effective Ready-park byte budget (fresh read, same rationale as the toggle).
+fn deferred_exec_ready_bytes_budget() -> usize {
+    parse_deferred_ready_bytes(std::env::var("TORUS_DEFERRED_EXEC_READY_BYTES").ok())
+}
+
+/// Outcome of handing one materialized committed block to the exec channel.
+enum DispatchOutcome {
+    /// Entered the channel (or no channel wired): this height is done here.
+    Sent,
+    /// Rank 2, non-blocking mode only: the channel is FULL — the block comes
+    /// back to the caller for a strict-order park. NOT a failure and NOT a
+    /// heal-budget hole: execution is alive, just behind.
+    Full(TorusBlock, Vec<PendingSlash>),
+    /// The channel is disconnected: the execution thread is dead and the T1.5
+    /// fail-stop latch is already set (verbatim semantics, both modes).
+    Failed,
 }
 
 /// Shared consensus state for leader discovery by non-consensus components (RPC).
@@ -1473,6 +1536,12 @@ pub struct TorusApp {
     /// `metrics = None`. Proposer pacing adds `deferred_exec.len()` to this
     /// for the full backlog picture.
     exec_queue_len: Arc<AtomicU64>,
+    /// Package D rank 2: the height whose once-per-dispatch preparation
+    /// (durable body persist, manifest prune, mempool bookkeeping) already
+    /// ran, so a Full-park retry of the SAME height skips the multi-MB
+    /// re-encode/re-write on the consensus thread. Heights reach dispatch
+    /// strictly in ascending order, so a single `Option<u64>` suffices.
+    exec_prepared_height: Option<u64>,
 }
 
 /// Actions the proposer pushes to validators via unicast before broadcasting CompactBlock.
@@ -2140,6 +2209,7 @@ impl TorusApp {
             exec_hole_last_log: None,
             exec_hole_retries: 0,
             exec_queue_len,
+            exec_prepared_height: None,
         };
 
         // FIX 1b: a boot replay hole PARKS instead of latching a pre-network
@@ -2160,13 +2230,8 @@ impl TorusApp {
                 // record with no manifest falls back to `Durable(h)` (local-body
                 // heal only). This is the difference between a hole that heals and
                 // one that stalls forever at `missing=0` (t12-r3-full h1165).
-                app.deferred_exec.insert(
-                    h,
-                    DeferredExecBlock {
-                        source: recovery_exec_source(&app.state_db, h),
-                        slashes: Vec::new(),
-                    },
-                );
+                let source = recovery_exec_source(&app.state_db, h);
+                app.park_deferred(h, source, Vec::new());
             }
             app.exec_next_height = Some(hole);
             app.exec_hole_since = Some(std::time::Instant::now());
@@ -2204,10 +2269,12 @@ impl TorusApp {
                 // manifest is instead left for the live / block-sync commit path
                 // (which delivers it as Compact/Ready) and the drain watchdog.
                 for &h in &manifest_heights {
-                    app.deferred_exec.entry(h).or_insert_with(|| DeferredExecBlock {
-                        source: recovery_exec_source(&app.state_db, h),
-                        slashes: Vec::new(),
-                    });
+                    // Preserve any FIX 1b entry already parked at this height
+                    // (the old `.entry(h).or_insert_with(...)` semantics).
+                    if !app.deferred_exec.contains_key(&h) {
+                        let source = recovery_exec_source(&app.state_db, h);
+                        app.park_deferred(h, source, Vec::new());
+                    }
                 }
                 app.exec_next_height =
                     Some(app.exec_next_height.map_or(first, |n| n.min(first)));
@@ -3493,6 +3560,23 @@ impl App<RocksKVStore> for TorusApp {
         );
         self.exec_failed.store(true, Ordering::SeqCst);
     }
+
+    /// Package D rank 2: the ~1 s reconcile tick is the drain hook that frees
+    /// backpressure parks BETWEEN commits — once execution digests channel
+    /// slots, parked committed blocks must flow again even if consensus is
+    /// momentarily idle (no new commit to ride on). Touches ONLY local exec
+    /// dispatch state, never consensus state. Gated on the rank-2 flag so the
+    /// flag-off cadence (drain rides exclusively on commits) stays
+    /// bit-identical to today.
+    fn on_reconcile_tick(&mut self) {
+        if !nonblocking_exec_dispatch() {
+            return;
+        }
+        if self.is_exec_failed() || self.deferred_exec.is_empty() {
+            return;
+        }
+        self.drain_exec_queue();
+    }
 }
 
 impl TorusApp {
@@ -3676,24 +3760,32 @@ impl TorusApp {
         if self.deferred_exec.is_empty() && height == next {
             match self.materialize_owned(source) {
                 Ok(block) => {
-                    self.dispatch_to_exec(block, slashes);
-                    self.exec_next_height = Some(next + 1);
+                    match self.dispatch_to_exec(block, slashes) {
+                        DispatchOutcome::Full(block, slashes) => {
+                            // Rank 2: channel full — park at THIS height, the
+                            // frontier holds (never execute past an unsent
+                            // block). NOT a hole: no heal budget starts.
+                            self.park_deferred(height, ExecSource::Ready(block), slashes);
+                        }
+                        DispatchOutcome::Sent | DispatchOutcome::Failed => {
+                            self.exec_next_height = Some(next + 1);
+                        }
+                    }
                     return;
                 }
                 Err((source, missing)) => {
                     // First block of a new hole: buffer it and begin heal accounting.
-                    self.deferred_exec
-                        .insert(height, DeferredExecBlock { source, slashes });
+                    self.park_deferred(height, source, slashes);
                     self.note_exec_hole(height, &missing);
                     return;
                 }
             }
         }
 
-        // A hole already exists, or this height is ahead of the frontier: buffer in
-        // ascending order and drain whatever is now contiguous.
-        self.deferred_exec
-            .insert(height, DeferredExecBlock { source, slashes });
+        // A hole already exists, a rank-2 park is pending, or this height is
+        // ahead of the frontier: buffer in ascending order and drain whatever
+        // is now contiguous.
+        self.park_deferred(height, source, slashes);
         self.drain_exec_queue();
     }
 
@@ -3721,8 +3813,7 @@ impl TorusApp {
             let Some(entry) = self.deferred_exec.remove(&next) else {
                 if load_commit_manifest(&self.state_db, next).is_some() {
                     let source = recovery_exec_source(&self.state_db, next);
-                    self.deferred_exec
-                        .insert(next, DeferredExecBlock { source, slashes: Vec::new() });
+                    self.park_deferred(next, source, Vec::new());
                     tracing::error!(
                         height = next,
                         "FIX 6 / F-1 watchdog: execution head-of-line height was committed \
@@ -3733,20 +3824,65 @@ impl TorusApp {
                 }
                 return;
             };
-            let DeferredExecBlock { source, slashes } = entry;
+            let DeferredExecBlock {
+                source,
+                slashes,
+                ready_bytes: _,
+            } = entry;
+            // Rank 2: remember how a Full put-back re-parks WITHOUT recompute —
+            // a demoted head must go back as its (cheaply cloned) compact
+            // reference, not get re-hashed or re-promoted to Ready per attempt.
+            // Full is only possible in non-blocking mode; flag off skips the
+            // clone entirely (bit-identical cost to the pre-rank-2 drain).
+            let compact_for_putback = if nonblocking_exec_dispatch() {
+                match &source {
+                    ExecSource::Compact(c) => Some(c.clone()),
+                    _ => None,
+                }
+            } else {
+                None
+            };
             match self.materialize_owned(source) {
                 Ok(block) => {
-                    self.dispatch_to_exec(block, slashes);
-                    self.exec_next_height = Some(next + 1);
+                    // Bodies are in hand: whatever hole was open at this height
+                    // is healed, independent of channel state below.
                     self.clear_exec_hole_state();
-                    // continue draining the next contiguous height
+                    match self.dispatch_to_exec(block, slashes) {
+                        DispatchOutcome::Full(block, slashes) => {
+                            // Channel still full: put the head back and STOP —
+                            // later heights cannot send either. NOT a hole.
+                            match compact_for_putback {
+                                Some(c) => {
+                                    self.deferred_exec.insert(
+                                        next,
+                                        DeferredExecBlock {
+                                            source: ExecSource::Compact(c),
+                                            slashes,
+                                            ready_bytes: 0,
+                                        },
+                                    );
+                                }
+                                None => {
+                                    self.park_deferred(
+                                        next,
+                                        ExecSource::Ready(block),
+                                        slashes,
+                                    );
+                                }
+                            }
+                            return;
+                        }
+                        DispatchOutcome::Sent | DispatchOutcome::Failed => {
+                            self.exec_next_height = Some(next + 1);
+                            // continue draining the next contiguous height
+                        }
+                    }
                 }
                 Err((source, missing)) => {
                     // Head-of-line bodies still missing: a real hole. Put it back,
                     // trigger the DA fetch + throttled log + budget check, and STOP —
                     // never execute past it.
-                    self.deferred_exec
-                        .insert(next, DeferredExecBlock { source, slashes });
+                    self.park_deferred(next, source, slashes);
                     self.note_exec_hole(next, &missing);
                     return;
                 }
@@ -3806,48 +3942,72 @@ impl TorusApp {
     /// thread, in order. Carries the mempool bookkeeping that must happen once a
     /// block is actually executed (prune committed native hashes, pin the base
     /// fee) plus the T1.5 closed-channel fail-stop.
-    fn dispatch_to_exec(&mut self, torus_block: TorusBlock, pending_slashes: Vec<PendingSlash>) {
+    ///
+    /// Rank 2: returns a [`DispatchOutcome`]. In non-blocking mode
+    /// (`TORUS_EXEC_NONBLOCKING_DISPATCH`) a FULL channel hands the block back
+    /// as `Full(...)` for a strict-order park instead of blocking the single
+    /// HotStuff thread; the Disconnected fail-stop latch is verbatim in both
+    /// modes. Flag off ⇒ the blocking `send`, bit-identical to before rank 2.
+    fn dispatch_to_exec(
+        &mut self,
+        torus_block: TorusBlock,
+        pending_slashes: Vec<PendingSlash>,
+    ) -> DispatchOutcome {
         let height = torus_block.header.height;
 
-        // FIX 1a (crash-safety): make the committed block's header+body DURABLE
-        // NOW, at commit time, BEFORE it enters the execution pipeline. A crash in
-        // the commit->execute window previously lost the body (written only at
-        // execution), and boot crash-recovery fail-stopped on the committed-but-
-        // bodiless height (devnet t12-final-a/c). The block is fully materialized
-        // here (bodies reconstructed from the durable DA store), so this write is
-        // authoritative; the execution-time writes remain as idempotent repeats.
-        persist_committed_block_durably(&self.state_db, &torus_block);
+        // Once-per-height dispatch preparation. In blocking mode each height
+        // reaches this function exactly once (the frontier advances past it or
+        // the node fail-stops), so the gate never skips — bit-identical. In
+        // non-blocking mode a Full park RETRIES this function on every drain
+        // attempt (per commit + 1 s reconcile tick); without the gate each
+        // retry would re-encode + re-write a multi-MB body and re-walk the
+        // pool on the consensus thread — the exact cost rank 1/2 exist to
+        // remove. In-memory (`Option<u64>`): a fresh process re-prepares,
+        // which is the idempotent crash-safe behavior these writes had.
+        if self.exec_prepared_height != Some(height) {
+            // FIX 1a (crash-safety): make the committed block's header+body DURABLE
+            // NOW, at commit time, BEFORE it enters the execution pipeline. A crash in
+            // the commit->execute window previously lost the body (written only at
+            // execution), and boot crash-recovery fail-stopped on the committed-but-
+            // bodiless height (devnet t12-final-a/c). The block is fully materialized
+            // here (bodies reconstructed from the durable DA store), so this write is
+            // authoritative; the execution-time writes remain as idempotent repeats.
+            persist_committed_block_durably(&self.state_db, &torus_block);
 
-        // The body is now durable in `CF_BLOCK_BODIES`; the commit manifest that
-        // guarded the heal channel for this height is redundant. Drop it (best
-        // effort) so `CF_COMMIT_MANIFEST` stays bounded to the committed-but-not-
-        // yet-dispatched window. A still-parked hole never reaches here, so its
-        // manifest is retained for the pull.
-        prune_commit_manifest(&self.state_db, height);
+            // The body is now durable in `CF_BLOCK_BODIES`; the commit manifest that
+            // guarded the heal channel for this height is redundant. Drop it (best
+            // effort) so `CF_COMMIT_MANIFEST` stays bounded to the committed-but-not-
+            // yet-dispatched window. A still-parked hole never reaches here, so its
+            // manifest is retained for the pull. (A rank-2 backpressure park is safe
+            // too: the body write above already covers the crash-replay window.)
+            prune_commit_manifest(&self.state_db, height);
 
-        tracing::info!(
-            height,
-            evm_txs = torus_block.evm_transactions.len(),
-            native = torus_block.native_actions.len(),
-            "on_committed_block: sending to execution pipeline"
-        );
+            tracing::info!(
+                height,
+                evm_txs = torus_block.evm_transactions.len(),
+                native = torus_block.native_actions.len(),
+                "on_committed_block: sending to execution pipeline"
+            );
 
-        if !torus_block.native_actions.is_empty() {
-            if let Some(ref mempool) = self.mempool {
-                let hashes: Vec<torus_types::B256> = torus_block
-                    .native_actions
-                    .iter()
-                    .map(torus_types::compute_action_hash)
-                    .collect();
-                mempool.remove_committed_native(&hashes);
+            if !torus_block.native_actions.is_empty() {
+                if let Some(ref mempool) = self.mempool {
+                    let hashes: Vec<torus_types::B256> = torus_block
+                        .native_actions
+                        .iter()
+                        .map(torus_types::compute_action_hash)
+                        .collect();
+                    mempool.remove_committed_native(&hashes);
+                }
             }
-        }
 
-        // D4 (S392): pin the mempool's admission fee floor to the base fee
-        // committed blocks actually charge (frozen at 1 gwei today; follows
-        // the header once the fee market unfreezes).
-        if let Some(ref mempool) = self.mempool {
-            mempool.set_base_fee(torus_block.header.base_fee_per_gas);
+            // D4 (S392): pin the mempool's admission fee floor to the base fee
+            // committed blocks actually charge (frozen at 1 gwei today; follows
+            // the header once the fee market unfreezes).
+            if let Some(ref mempool) = self.mempool {
+                mempool.set_base_fee(torus_block.header.base_fee_per_gas);
+            }
+
+            self.exec_prepared_height = Some(height);
         }
 
         if let Some(ref tx) = self.exec_tx {
@@ -3861,7 +4021,50 @@ impl TorusApp {
                 m.exec_queue_depth.inc();
             }
             self.exec_queue_len.fetch_add(1, Ordering::Relaxed);
-            if tx.send(msg).is_err() {
+            if nonblocking_exec_dispatch() {
+                match tx.try_send(msg) {
+                    Ok(()) => {}
+                    Err(std::sync::mpsc::TrySendError::Full(msg)) => {
+                        // Rank 2: the channel is full — execution is alive but
+                        // behind. Hand the block back for a strict-order park;
+                        // it did NOT enter the channel, so the depth
+                        // gauge/mirror roll back (it is accounted as a
+                        // deferred height instead — rank 1 pacing sums both).
+                        if let Some(ref m) = self.metrics {
+                            m.exec_queue_depth.dec();
+                            m.exec_dispatch_deferred.inc();
+                        }
+                        self.exec_queue_len.fetch_sub(1, Ordering::Relaxed);
+                        tracing::debug!(
+                            height,
+                            "exec channel FULL — deferring committed block \
+                             (rank-2 park; drains on commits + the 1s reconcile tick)"
+                        );
+                        let CommittedBlockMsg {
+                            torus_block,
+                            pending_slashes,
+                        } = msg;
+                        return DispatchOutcome::Full(torus_block, pending_slashes);
+                    }
+                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                        if let Some(ref m) = self.metrics {
+                            m.exec_queue_depth.dec();
+                        }
+                        self.exec_queue_len.fetch_sub(1, Ordering::Relaxed);
+                        // T1.5 FAIL-STOP: the execution thread is gone (panic or
+                        // fatal) — this block is committed by consensus but will
+                        // NEVER execute here. Latch the failure: the node stops
+                        // producing, voting, and finalizing, and crash-replay closes
+                        // the gap on restart. Never zombie-advance past a dead pipeline.
+                        self.exec_failed.store(true, Ordering::SeqCst);
+                        tracing::error!(
+                            height,
+                            "execution pipeline channel closed — FAIL-STOP: halting block production, voting, and finalization"
+                        );
+                        return DispatchOutcome::Failed;
+                    }
+                }
+            } else if tx.send(msg).is_err() {
                 if let Some(ref m) = self.metrics {
                     m.exec_queue_depth.dec();
                 }
@@ -3876,8 +4079,63 @@ impl TorusApp {
                     height,
                     "execution pipeline channel closed — FAIL-STOP: halting block production, voting, and finalization"
                 );
+                return DispatchOutcome::Failed;
             }
         }
+        DispatchOutcome::Sent
+    }
+
+    /// Rank 2: the single choke point for LIVE inserts into the strict-order
+    /// `deferred_exec` park. With non-blocking dispatch enabled it bounds
+    /// parked memory: a `Ready` block whose bytes would push the park past
+    /// [`deferred_exec_ready_bytes_budget`] is DEMOTED to
+    /// `ExecSource::Compact`, its hash references synthesized from the
+    /// committed block's OWN actions (`CompactBlock::from_block` — never a
+    /// proposal cache), and rematerialized all-or-nothing from the durable DA
+    /// store on drain. Demotion is fail-safe: it only happens when every
+    /// referenced body is durably present locally RIGHT NOW — never trade an
+    /// in-hand body set for an unrecoverable reference (a drain miss would
+    /// fabricate a heal-hole from perfectly good data). Flag off ⇒ a verbatim
+    /// insert, bit-identical to the pre-rank-2 buffer.
+    fn park_deferred(&mut self, height: u64, source: ExecSource, slashes: Vec<PendingSlash>) {
+        let (source, ready_bytes) = match source {
+            ExecSource::Ready(block) if nonblocking_exec_dispatch() => {
+                let sz = bincode::serialized_size(&block)
+                    .map(|n| n as usize)
+                    .unwrap_or(usize::MAX / 2);
+                let parked: usize = self.deferred_exec.values().map(|e| e.ready_bytes).sum();
+                if parked.saturating_add(sz) > deferred_exec_ready_bytes_budget() {
+                    let compact = CompactBlock::from_block(&block);
+                    let locally_durable = self
+                        .mempool
+                        .as_ref()
+                        .map(|mp| mp.has_all_native_da(&compact.native_action_hashes))
+                        .unwrap_or(false);
+                    if locally_durable {
+                        tracing::debug!(
+                            height,
+                            parked_ready_bytes = parked,
+                            block_bytes = sz,
+                            "deferred_exec over Ready-byte budget — parking DEMOTED to Compact"
+                        );
+                        (ExecSource::Compact(compact), 0)
+                    } else {
+                        (ExecSource::Ready(block), sz)
+                    }
+                } else {
+                    (ExecSource::Ready(block), sz)
+                }
+            }
+            other => (other, 0),
+        };
+        self.deferred_exec.insert(
+            height,
+            DeferredExecBlock {
+                source,
+                slashes,
+                ready_bytes,
+            },
+        );
     }
 
     /// Regime-B. Account for a head-of-line execution hole: nudge the bodies via
@@ -4187,6 +4445,7 @@ mod exec_throttle_tests {
                 DeferredExecBlock {
                     source: ExecSource::Durable(h),
                     slashes: Vec::new(),
+                    ready_bytes: 0,
                 },
             );
         }
@@ -5312,11 +5571,19 @@ mod crash_recovery_tests {
         app.exec_hole_since = Some(std::time::Instant::now());
         app.deferred_exec.insert(
             5,
-            DeferredExecBlock { source: ExecSource::Durable(5), slashes: Vec::new() },
+            DeferredExecBlock {
+                source: ExecSource::Durable(5),
+                slashes: Vec::new(),
+                ready_bytes: 0,
+            },
         );
         app.deferred_exec.insert(
             6,
-            DeferredExecBlock { source: ExecSource::Durable(6), slashes: Vec::new() },
+            DeferredExecBlock {
+                source: ExecSource::Durable(6),
+                slashes: Vec::new(),
+                ready_bytes: 0,
+            },
         );
 
         // Drain with both bodies missing: nothing executes, frontier stays at the hole.
@@ -5357,7 +5624,11 @@ mod crash_recovery_tests {
         app.exec_hole_since = Some(std::time::Instant::now());
         app.deferred_exec.insert(
             5,
-            DeferredExecBlock { source: ExecSource::Durable(5), slashes: Vec::new() },
+            DeferredExecBlock {
+                source: ExecSource::Durable(5),
+                slashes: Vec::new(),
+                ready_bytes: 0,
+            },
         );
 
         app.drain_exec_queue();
@@ -5492,6 +5763,7 @@ mod crash_recovery_tests {
             DeferredExecBlock {
                 source: ExecSource::Compact(CompactBlock::from_block(&b5)),
                 slashes: Vec::new(),
+                ready_bytes: 0,
             },
         );
         app.deferred_exec.insert(
@@ -5499,6 +5771,7 @@ mod crash_recovery_tests {
             DeferredExecBlock {
                 source: ExecSource::Compact(CompactBlock::from_block(&b6)),
                 slashes: Vec::new(),
+                ready_bytes: 0,
             },
         );
 

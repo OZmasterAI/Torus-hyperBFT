@@ -650,6 +650,20 @@ impl Mempool {
         }
     }
 
+    /// Presence check for a SET of native-action bodies in the durable DA
+    /// store (Package D rank 2 demotion gate): flushes buffered ingress
+    /// mirrors once, then point-checks each hash WITHOUT copying bodies.
+    /// `true` iff every hash is durably present (vacuously true for an empty
+    /// set). Any store error reads as absent — fail-safe for callers deciding
+    /// whether an in-memory copy may be dropped.
+    pub fn has_all_native_da(&self, hashes: &[B256]) -> bool {
+        // A buffered ingress mirror (T2.2) must be observable here too.
+        self.flush_da_mirrors();
+        hashes
+            .iter()
+            .all(|h| self.da_store.contains(&h.0).unwrap_or(false))
+    }
+
     /// Fetch a single custodied erasure shard by `(body hash, shard index)`.
     ///
     /// Mirrors the read style of [`get_native_da`](Self::get_native_da): thin

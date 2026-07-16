@@ -325,6 +325,12 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
                     ),
                     Err(e) => log::error!("app feed: live reconcile failed: {:?}", e),
                 }
+                // Give the app its periodic tick AFTER the feed so any height
+                // the reconcile just delivered is already enqueued. Hosts use
+                // this to retry deferred LOCAL work (e.g. draining a
+                // backed-up execution dispatch queue) between commits; the
+                // default impl is a no-op.
+                self.app.on_reconcile_tick();
             }
         }
     }
