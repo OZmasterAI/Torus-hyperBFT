@@ -25,6 +25,8 @@ services:
       # validator-id dialing + inbound — and no testnet contact happens.
       - --p2p-peers=/ip4/172.28.0.11/udp/30334/quic-v1/p2p/12D3KooWH3uVF6wv47WnArKHk5p6cvgCJEb74UTmxztmQDc298L3
       - --rpc-addr=0.0.0.0:8545
+      # RH5 read/write RPC isolation: dedicated read-only server + runtime.
+      - --rpc-read-addr=0.0.0.0:8645
       - --log-level=info
     environment:
       # Mirror the live testnet's body-push threshold: at bs400 a 100-action
@@ -46,6 +48,8 @@ services:
       # (172.28.0.10:30333) and the bench (localhost:8645) are unaffected.
       - "30433:30333/udp"
       - "8645:8545"
+      # RH5 read-only RPC (container 8645) → host 8801.
+      - "8801:8645"
       - "9091:9090"
     networks:
       torus-devnet:
@@ -61,6 +65,8 @@ services:
       - --p2p-private-addrs
       - --p2p-peers=/ip4/172.28.0.10/udp/30333/quic-v1/p2p/12D3KooWPjceQrSwdWXPyLLeABRXmuqt69Rg3sBYbU1Nft9HyQ6X
       - --rpc-addr=0.0.0.0:8545
+      # RH5 read/write RPC isolation: dedicated read-only server + runtime.
+      - --rpc-read-addr=0.0.0.0:8645
       - --log-level=info
     environment:
       # Mirror the live testnet's body-push threshold: at bs400 a 100-action
@@ -79,6 +85,8 @@ services:
     ports:
       - "30334:30334/udp"
       - "8546:8545"
+      # RH5 read-only RPC (container 8645) → host 8802.
+      - "8802:8645"
       - "9092:9090"
     networks:
       torus-devnet:
@@ -96,6 +104,8 @@ services:
       - --p2p-private-addrs
       - --p2p-peers=/ip4/172.28.0.10/udp/30333/quic-v1/p2p/12D3KooWPjceQrSwdWXPyLLeABRXmuqt69Rg3sBYbU1Nft9HyQ6X
       - --rpc-addr=0.0.0.0:8545
+      # RH5 read/write RPC isolation: dedicated read-only server + runtime.
+      - --rpc-read-addr=0.0.0.0:8645
       - --log-level=info
     environment:
       # Mirror the live testnet's body-push threshold: at bs400 a 100-action
@@ -114,6 +124,8 @@ services:
     ports:
       - "30335:30335/udp"
       - "8547:8545"
+      # RH5 read-only RPC (container 8645) → host 8803.
+      - "8803:8645"
       - "9093:9090"
     networks:
       torus-devnet:
@@ -131,6 +143,8 @@ services:
       - --p2p-private-addrs
       - --p2p-peers=/ip4/172.28.0.10/udp/30333/quic-v1/p2p/12D3KooWPjceQrSwdWXPyLLeABRXmuqt69Rg3sBYbU1Nft9HyQ6X
       - --rpc-addr=0.0.0.0:8545
+      # RH5 read/write RPC isolation: dedicated read-only server + runtime.
+      - --rpc-read-addr=0.0.0.0:8645
       - --log-level=info
     environment:
       # Mirror the live testnet's body-push threshold: at bs400 a 100-action
@@ -149,6 +163,8 @@ services:
     ports:
       - "30336:30336/udp"
       - "8548:8545"
+      # RH5 read-only RPC (container 8645) → host 8804.
+      - "8804:8645"
       - "9094:9090"
     networks:
       torus-devnet:
@@ -166,6 +182,8 @@ services:
       - --p2p-private-addrs
       - --p2p-peers=/ip4/172.28.0.10/udp/30333/quic-v1/p2p/12D3KooWPjceQrSwdWXPyLLeABRXmuqt69Rg3sBYbU1Nft9HyQ6X
       - --rpc-addr=0.0.0.0:8545
+      # RH5 read/write RPC isolation: dedicated read-only server + runtime.
+      - --rpc-read-addr=0.0.0.0:8645
       - --log-level=info
     environment:
       # Mirror the live testnet's body-push threshold: at bs400 a 100-action
@@ -185,6 +203,8 @@ services:
     ports:
       - "30337:30337/udp"
       - "8549:8545"
+      # RH5 read-only RPC (container 8645) → host 8805.
+      - "8805:8645"
     networks:
       torus-devnet:
         ipv4_address: 172.28.0.20

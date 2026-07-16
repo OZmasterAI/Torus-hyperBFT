@@ -110,6 +110,21 @@ struct Cli {
     #[arg(long, default_value = "0.0.0.0:8545")]
     rpc_addr: String,
 
+    /// Read-only JSON-RPC listen address (RH5 read/write isolation). When set,
+    /// a SECOND jsonrpsee server starts on this address serving every read
+    /// namespace but no submit/write methods, on its own dedicated tokio
+    /// runtime with its own connection budget. This isolates read/observability
+    /// traffic (getOrderBook, eth_*, counters) from the submit flood that
+    /// monopolizes the main server's connections and verify-permit semaphore.
+    /// Unset (default) = read server OFF, no behavior change for the main port.
+    #[arg(long)]
+    rpc_read_addr: Option<String>,
+
+    /// Max simultaneous connections for the read-only RPC server (RH5). Only
+    /// used when --rpc-read-addr is set. Independent of the main server's budget.
+    #[arg(long, default_value_t = torus_rpc::READ_SERVER_MAX_CONNECTIONS)]
+    rpc_read_max_connections: u32,
+
     /// Log level (trace, debug, info, warn, error)
     #[arg(long, default_value = "info")]
     log_level: String,
@@ -892,6 +907,55 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // Extract shared handles before start() consumes the server
     let latest_height_handle = rpc_server.latest_height();
     let pruned_up_to_handle = rpc_server.pruned_up_to();
+
+    // RH5 read/write RPC isolation: when --rpc-read-addr is set, start a SECOND
+    // jsonrpsee server serving only read namespaces (submit/write methods
+    // stripped) on its OWN dedicated tokio runtime with its OWN connection
+    // budget. This keeps observability reads (getOrderBook, eth_*, counters)
+    // alive during a submit flood that monopolizes the main server's
+    // connections and its SUBMIT_PERMITS verify semaphore. Shares the same
+    // RpcState (same DB/height/notifier), so reads see the identical tip.
+    // Additive: unset = no read server, main port unchanged.
+    if let Some(read_addr_str) = cli.rpc_read_addr.clone() {
+        let read_addr: SocketAddr = read_addr_str.parse()?;
+        let read_max = cli.rpc_read_max_connections;
+        let read_state = rpc_server.state().clone();
+        let (read_addr_tx, read_addr_rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("rpc-read-runtime".into())
+            .spawn(move || {
+                // Small dedicated runtime: 2 workers + a bounded blocking pool.
+                // The submit path's spawn_blocking verify storm runs on the MAIN
+                // rpc runtime's blocking pool, so a separate pool here is what
+                // actually protects read latency under flood.
+                let rt = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .max_blocking_threads(4)
+                    .thread_name("rpc-read-worker")
+                    .enable_all()
+                    .build()
+                    .expect("failed to build read RPC runtime");
+                rt.block_on(async {
+                    match RpcServer::start_read_server(read_state, read_addr, read_max).await {
+                        Ok((handle, addr)) => {
+                            let _ = read_addr_tx.send(Ok(addr));
+                            handle.stopped().await;
+                        }
+                        Err(e) => {
+                            let _ = read_addr_tx.send(Err(format!("{e}")));
+                        }
+                    }
+                });
+            })?;
+        match read_addr_rx.recv()? {
+            Ok(addr) => info!(
+                %addr,
+                max_connections = read_max,
+                "read-only JSON-RPC server started (dedicated runtime, RH5)"
+            ),
+            Err(e) => return Err(e.into()),
+        }
+    }
 
     // Spawn RPC on a dedicated tokio runtime so user traffic can never
     // starve the consensus/libp2p runtime (same idea as Hyperliquid sentries).

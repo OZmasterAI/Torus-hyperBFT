@@ -31,6 +31,25 @@ pub(crate) const SUBMIT_QUEUE_TIMEOUT: std::time::Duration = std::time::Duration
 /// admits: ~100 ecrecovers ≈ 5–10ms on the blocking pool.
 pub(crate) const SUBMIT_BATCH_MAX: usize = 100;
 
+/// Write/submit methods that MUST NOT be served by the read-only RPC server
+/// (RH5 read/write isolation). The read server merges every namespace, then
+/// strips these names so a submit can never enter through the read port — its
+/// isolated connection budget and dedicated runtime stay reserved for reads,
+/// and it carries zero of the submit path's `spawn_blocking` verify work.
+/// These stay ONLY on the main server (existing tooling points at the old
+/// port), so this is purely additive.
+pub const WRITE_ONLY_METHODS: &[&str] = &[
+    "torus_submitNativeAction",
+    "torus_submitNativeActions",
+    "torus_submitNativeActionsBin",
+    "eth_sendRawTransaction",
+];
+
+/// Default max simultaneous connections for the read-only server. Its own
+/// budget (independent of the main server's 64) is the point: a submit flood
+/// that saturates the main server's connections can never starve reads.
+pub const READ_SERVER_MAX_CONNECTIONS: u32 = 128;
+
 /// Acquire a submission permit, waiting at most [`SUBMIT_QUEUE_TIMEOUT`].
 /// `None` ⇒ saturated past the queue bound (caller returns "overloaded").
 pub(crate) async fn acquire_submit_permit(
@@ -259,7 +278,29 @@ impl RpcServer {
         self.state.metrics = Some(metrics);
     }
 
-    /// Start the RPC server on the given address.
+    /// Build the combined RPC module (eth + net + web3 + torus) from the shared
+    /// state. When `read_only` is set, the write/submit methods
+    /// ([`WRITE_ONLY_METHODS`]) are stripped after the merge so the read server
+    /// physically cannot accept a submit.
+    fn build_module(
+        state: &RpcState,
+        read_only: bool,
+    ) -> Result<jsonrpsee::RpcModule<()>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut module = jsonrpsee::RpcModule::new(());
+        module.merge(EthApiServer::into_rpc(state.clone()))?;
+        module.merge(NetApiServer::into_rpc(state.clone()))?;
+        module.merge(Web3ApiServer::into_rpc(state.clone()))?;
+        module.merge(TorusApiServer::into_rpc(state.clone()))?;
+        if read_only {
+            for name in WRITE_ONLY_METHODS {
+                module.remove_method(name);
+            }
+        }
+        Ok(module)
+    }
+
+    /// Start the RPC server on the given address. Serves every namespace,
+    /// including submit/write methods — unchanged; existing tooling points here.
     pub async fn start(
         self,
         addr: SocketAddr,
@@ -276,11 +317,52 @@ impl RpcServer {
             .build(addr)
             .await?;
         let local_addr = server.local_addr()?;
-        let mut module = jsonrpsee::RpcModule::new(());
-        module.merge(EthApiServer::into_rpc(self.state.clone()))?;
-        module.merge(NetApiServer::into_rpc(self.state.clone()))?;
-        module.merge(Web3ApiServer::into_rpc(self.state.clone()))?;
-        module.merge(TorusApiServer::into_rpc(self.state.clone()))?;
+        let module = Self::build_module(&self.state, false)?;
+        let handle = server.start(module);
+        Ok((handle, local_addr))
+    }
+
+    /// Start a READ-ONLY RPC server on the given address (RH5 read/write
+    /// isolation). Serves every read namespace but strips the submit/write
+    /// methods ([`WRITE_ONLY_METHODS`]), with its own `max_connections` budget
+    /// so a submit flood that saturates the main server's connections and its
+    /// `SUBMIT_PERMITS` semaphore can never evict read traffic. Intended to run
+    /// on a dedicated tokio runtime (see torus-node `main`) so the submit path's
+    /// `spawn_blocking` verify storm on the main runtime's blocking pool cannot
+    /// starve read latency. Shares the same [`RpcState`] as the main server
+    /// (same DB, height counter, notifier), so reads observe the identical tip.
+    /// Takes `&self` so it starts alongside the main server before [`Self::start`]
+    /// consumes it.
+    pub async fn start_read_only(
+        &self,
+        addr: SocketAddr,
+        max_connections: u32,
+    ) -> Result<(ServerHandle, SocketAddr), Box<dyn std::error::Error + Send + Sync>> {
+        Self::start_read_server(self.state.clone(), addr, max_connections).await
+    }
+
+    /// Start a read-only server from an owned [`RpcState`] clone. Separated from
+    /// [`Self::start_read_only`] so the node can move the state into a dedicated
+    /// runtime thread and start the read server there, isolated from the main
+    /// RPC runtime and its submit-path blocking pool.
+    pub async fn start_read_server(
+        state: RpcState,
+        addr: SocketAddr,
+        max_connections: u32,
+    ) -> Result<(ServerHandle, SocketAddr), Box<dyn std::error::Error + Send + Sync>> {
+        let layer = MetricsLayer {
+            metrics: state.metrics.clone(),
+        };
+        let rpc_middleware = rpc_mw::RpcServiceBuilder::new().layer(layer);
+        let server_cfg = jsonrpsee::server::ServerConfig::builder()
+            .max_connections(max_connections)
+            .build();
+        let server = ServerBuilder::with_config(server_cfg)
+            .set_rpc_middleware(rpc_middleware)
+            .build(addr)
+            .await?;
+        let local_addr = server.local_addr()?;
+        let module = Self::build_module(&state, true)?;
         let handle = server.start(module);
         Ok((handle, local_addr))
     }
@@ -612,6 +694,96 @@ mod tests {
         .start("127.0.0.1:0".parse().unwrap())
         .await
         .unwrap()
+    }
+
+    /// RH5 read/write RPC isolation: the read-only server serves reads but
+    /// physically strips every submit/write method, while the main server keeps
+    /// them. Boots BOTH on ephemeral ports from one shared `RpcServer` and
+    /// asserts: (a) a read method answers on the read port, (b) each submit
+    /// method is method-not-found (-32601) on the read port, (c) submit is still
+    /// present AND reads still work on the main port (backward compatibility).
+    #[tokio::test]
+    async fn read_server_strips_submits_main_keeps_them() {
+        use jsonrpsee::core::client::ClientT;
+        use jsonrpsee::http_client::HttpClientBuilder;
+        use jsonrpsee::rpc_params;
+
+        let (_dir, state, mempool, executor) = setup();
+        let server = RpcServer::new(
+            state,
+            mempool,
+            executor,
+            TORUS_CHAIN_ID,
+            100,
+            BlockNotifier::new(),
+        );
+        // Read server borrows &self; main server consumes self — start read first.
+        let (read_handle, read_addr) = server
+            .start_read_only("127.0.0.1:0".parse().unwrap(), 32)
+            .await
+            .unwrap();
+        let (main_handle, main_addr) = server.start("127.0.0.1:0".parse().unwrap()).await.unwrap();
+
+        let read_client = HttpClientBuilder::default()
+            .build(format!("http://{read_addr}"))
+            .unwrap();
+        let main_client = HttpClientBuilder::default()
+            .build(format!("http://{main_addr}"))
+            .unwrap();
+
+        let is_method_not_found = |e: &jsonrpsee::core::ClientError| {
+            let s = e.to_string().to_lowercase();
+            s.contains("method not found") || s.contains("-32601")
+        };
+
+        // (a) a read method answers on the read port.
+        let bn: String = read_client
+            .request("eth_blockNumber", rpc_params![])
+            .await
+            .expect("eth_blockNumber must answer on the read port");
+        assert!(bn.starts_with("0x"), "unexpected blockNumber: {bn}");
+        // A torus_* read method too.
+        let _markets: serde_json::Value = read_client
+            .request("torus_getMarkets", rpc_params![])
+            .await
+            .expect("torus_getMarkets must answer on the read port");
+
+        // (b) every write/submit method is method-not-found on the read port.
+        for method in WRITE_ONLY_METHODS {
+            let err = read_client
+                .request::<serde_json::Value, _>(*method, rpc_params![vec!["0x00".to_string()]])
+                .await
+                .expect_err(&format!("{method} must be absent on the read port"));
+            assert!(
+                is_method_not_found(&err),
+                "{method} on read port should be method-not-found, got: {err}"
+            );
+        }
+
+        // (c) submit is still PRESENT on the main port (reaches the handler:
+        // a garbage payload yields a per-item error, NOT method-not-found).
+        let main_submit = main_client
+            .request::<Vec<RpcSubmitResult>, _>(
+                "torus_submitNativeActions",
+                rpc_params![vec!["0xzz-not-hex".to_string()]],
+            )
+            .await;
+        match main_submit {
+            Ok(results) => assert_eq!(results.len(), 1, "one per-item result on the main port"),
+            Err(e) => assert!(
+                !is_method_not_found(&e),
+                "submit must exist on the main port, got: {e}"
+            ),
+        }
+        // And a read method still works on the main port (backward compat).
+        let bn_main: String = main_client
+            .request("eth_blockNumber", rpc_params![])
+            .await
+            .expect("eth_blockNumber must still work on the main port");
+        assert!(bn_main.starts_with("0x"));
+
+        read_handle.stop().unwrap();
+        main_handle.stop().unwrap();
     }
 
     #[test]

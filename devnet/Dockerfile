@@ -13,6 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY target/release/torus-node /usr/local/bin/torus-node
 
-EXPOSE 30333/udp 8545 9090
+# 8645 = RH5 read-only RPC server (read/write isolation).
+EXPOSE 30333/udp 8545 8645 9090
 
 ENTRYPOINT ["torus-node"]
