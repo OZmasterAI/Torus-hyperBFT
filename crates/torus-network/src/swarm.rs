@@ -64,6 +64,16 @@ pub enum NetworkCommand {
         target: VerifyingKey,
         payload: Vec<u8>,
     },
+    /// B1: forward ONE coalesced batch of RPC-admitted native actions to the
+    /// leader as a single `/torus/direct` request, reusing the 0xFD
+    /// pre-proposal wire format (`0xFD ‖ bincode(pairs)`) that every deployed
+    /// binary already decodes/verifies/dedups. Routed through the
+    /// PushScheduler (unlike the per-action 0xFE forward, which bypasses it)
+    /// and tracked for ≤2 retries against the re-resolved leader.
+    ForwardNativeActionBatch {
+        target: VerifyingKey,
+        pairs: Vec<(torus_types::Address, torus_types::SignedNativeAction)>,
+    },
     /// Forward a raw EVM transaction directly to the leader node (Option B — EVM tx
     /// dissemination). Payload is raw RLP; the leader full-validates via `add_evm_tx`.
     ForwardEvmTx {
@@ -132,6 +142,79 @@ fn parse_forwarded_evm_tx(payload: &[u8]) -> Option<&[u8]> {
         Some((&FORWARD_EVM_MARKER, rest)) if !rest.is_empty() => Some(rest),
         _ => None,
     }
+}
+
+/// B1: encode a direct-to-leader forward batch as a 0xFD envelope —
+/// BYTE-IDENTICAL to the pre-proposal batch push (`0xFD ‖ bincode(pairs)`,
+/// see `BroadcastNativeActions` + torus-node main.rs), so every deployed
+/// binary already accepts it on the shipped receive path. `None` only on a
+/// bincode failure (not expected for these types).
+fn encode_forward_batch(
+    pairs: &[(torus_types::Address, torus_types::SignedNativeAction)],
+) -> Option<Vec<u8>> {
+    let body = bincode::serialize(pairs).ok()?;
+    let mut envelope = Vec::with_capacity(1 + body.len());
+    envelope.push(PRE_PROPOSAL_BATCH_MARKER);
+    envelope.extend_from_slice(&body);
+    Some(envelope)
+}
+
+/// Decode the body of a 0xFD envelope (marker already stripped) into
+/// (sender, action) pairs. THE receive seam for both the pre-proposal batch
+/// push and the B1 forward batch — factored out so the B1 encode round-trips
+/// through the exact decode the Direct request arm runs.
+fn decode_pre_proposal_batch(
+    bytes: &[u8],
+) -> Result<Vec<(torus_types::Address, torus_types::SignedNativeAction)>, Box<bincode::ErrorKind>>
+{
+    bincode::deserialize(bytes)
+}
+
+/// B1: max retries for a failed forward envelope. Each retry re-resolves the
+/// leader first, so a mid-window rotation (the reason the first send died)
+/// is healed rather than repeated; past the cap the envelope is dropped with
+/// a metric — the mempool retains every action and the re-forward sweep
+/// re-sends, so a drop is a latency event, never a loss.
+const FORWARD_BATCH_MAX_RETRIES: u8 = 2;
+
+/// B1: an in-flight forward envelope tracked for retry, keyed by its
+/// request-response `OutboundRequestId` in `SharedState::outbound_forward_batches`.
+pub(crate) struct ForwardBatchInFlight {
+    /// The leader the envelope was last sent to (retry fallback when no
+    /// resolver is installed).
+    pub(crate) target: VerifyingKey,
+    /// The full 0xFD envelope, kept for re-send (≤ the D2L byte cap; the map
+    /// holds at most `PUSH_MAX_INFLIGHT` entries).
+    pub(crate) envelope: Vec<u8>,
+    /// How many times this envelope has already been re-sent.
+    pub(crate) attempt: u8,
+}
+
+/// B1 retry policy (pure — the OutboundFailure arm applies it): retry with
+/// the CURRENT leader (falling back to the stale target when no hint is
+/// available), bumping the attempt count; `None` once retries are exhausted.
+fn plan_forward_batch_retry(
+    inflight: ForwardBatchInFlight,
+    resolved_leader: Option<VerifyingKey>,
+) -> Option<(VerifyingKey, Vec<u8>, u8)> {
+    if inflight.attempt >= FORWARD_BATCH_MAX_RETRIES {
+        return None;
+    }
+    let target = resolved_leader.unwrap_or(inflight.target);
+    Some((target, inflight.envelope, inflight.attempt + 1))
+}
+
+/// B1: the node-installed leader-hint callback (bridge
+/// `set_leader_resolver`), consulted when retrying a failed forward envelope
+/// so the retry targets the CURRENT leader, not the one that just failed.
+pub type LeaderResolver = Arc<dyn Fn() -> Option<[u8; 32]> + Send + Sync>;
+
+/// Resolve the current leader via the installed callback (`None` when no
+/// resolver is installed, the hint is empty, or the bytes are not a key).
+fn resolve_forward_leader(shared: &SharedState) -> Option<VerifyingKey> {
+    let resolver = shared.leader_resolver.read().unwrap().clone()?;
+    let vk_bytes = resolver()?;
+    VerifyingKey::from_bytes(&vk_bytes).ok()
 }
 
 /// Push `item` into a bounded ring, evicting the oldest when at `cap`.
@@ -407,6 +490,18 @@ pub struct SharedState {
     /// (pacemaker rebroadcasts produce identical bytes), but the LRU makes the
     /// dual-path duplication question moot (design §2).
     pub consensus_dedup: Mutex<ConsensusDedup>,
+    /// B1: in-flight forward envelopes tracked for retry — an
+    /// `OutboundFailure` re-resolves the leader and re-sends (≤2), a
+    /// `Response` clears the entry. Bounded in practice by the
+    /// PushScheduler's in-flight cap (every tracked envelope holds a
+    /// scheduler slot).
+    pub(crate) outbound_forward_batches:
+        Mutex<HashMap<request_response::OutboundRequestId, ForwardBatchInFlight>>,
+    /// B1: leader-hint callback installed by torus-node (bridge
+    /// `set_leader_resolver`) so a forward-envelope retry targets the CURRENT
+    /// leader. `None` (tests/observers, or `TORUS_D2L_BATCH=0`) falls back to
+    /// the envelope's original target.
+    pub(crate) leader_resolver: RwLock<Option<LeaderResolver>>,
 }
 
 /// Capacity of the B2 dual-path dedup LRU. Sized for arrival skew, not
@@ -1357,11 +1452,11 @@ fn handle_event(
                     }
                 };
             if request.payload.first() == Some(&PRE_PROPOSAL_BATCH_MARKER) {
+                // Carries BOTH the proposer's pre-proposal push and the B1
+                // direct-to-leader forward batch — deliberately byte-identical
+                // envelopes, one decode seam.
                 let batch_bytes = &request.payload[1..];
-                match bincode::deserialize::<
-                    Vec<(torus_types::Address, torus_types::SignedNativeAction)>,
-                >(batch_bytes)
-                {
+                match decode_pre_proposal_batch(batch_bytes) {
                     Ok(pairs) => {
                         let count = pairs.len();
                         if let Some(ref tx) = shared.native_action_inbound {
@@ -1448,6 +1543,13 @@ fn handle_event(
             ..
         })) => {
             shared.outbound_direct.lock().unwrap().remove(&request_id);
+            // B1: a forward envelope acked by the leader is done — clear its
+            // retry entry.
+            shared
+                .outbound_forward_batches
+                .lock()
+                .unwrap()
+                .remove(&request_id);
             // #4 Task 3: if this acked a native push, free its in-flight slot and
             // dispatch the next queued push (no-op for consensus/forward sends).
             dispatch_next_push(swarm, shared, local_key, request_id);
@@ -1464,7 +1566,22 @@ fn handle_event(
                 ..
             },
         )) => {
+            // #4 Task 3: a FAILED send frees its in-flight slot FIRST — both so a
+            // saturated link drains instead of stalling AND so the B1 retry below
+            // sees the freed scheduler slot (no-op for untracked consensus ids).
+            // The failed push body is recoverable via T4 re-push + the hot-path
+            // pull (#4 Task 1).
+            dispatch_next_push(swarm, shared, local_key, request_id);
             let tracked = shared.outbound_direct.lock().unwrap().remove(&request_id);
+            let tracked_forward = if tracked.is_none() {
+                shared
+                    .outbound_forward_batches
+                    .lock()
+                    .unwrap()
+                    .remove(&request_id)
+            } else {
+                None
+            };
             if let Some((target, message)) = tracked {
                 // Re-enqueue unconditionally (cheap; the queue is bounded) so the next
                 // reconnect flush re-delivers the message.
@@ -1486,17 +1603,31 @@ fn handle_event(
                 if should_redial_now(shared, &peer) {
                     warn!(%peer, ?error, "direct send failed — re-enqueued for reconnect flush; redialing (log throttled)");
                 }
+            } else if let Some(inflight) = tracked_forward {
+                // B1: a forward envelope died in flight — re-resolve the leader
+                // (the rotation that killed the send is exactly what the retry
+                // must heal) and re-send, ≤ FORWARD_BATCH_MAX_RETRIES times.
+                match plan_forward_batch_retry(inflight, resolve_forward_leader(shared)) {
+                    Some((target, envelope, attempt)) => {
+                        if let Some(ref m) = shared.metrics {
+                            m.d2l_envelopes_retried.inc();
+                        }
+                        warn!(%peer, ?error, attempt, "d2l forward envelope failed — retrying against current leader");
+                        send_forward_batch(swarm, shared, local_key, &target, envelope, attempt);
+                    }
+                    None => {
+                        if let Some(ref m) = shared.metrics {
+                            m.d2l_envelopes_dropped.inc();
+                        }
+                        warn!(%peer, ?error, "d2l forward envelope dropped after retries (pool retains; re-forward sweep re-sends)");
+                    }
+                }
             } else {
                 warn!(%peer, ?error, "direct send failed (untracked payload)");
                 if let Some(ref m) = shared.metrics {
                     m.direct_send_failures_untracked.inc();
                 }
             }
-            // #4 Task 3: a FAILED native push still frees its in-flight slot — dispatch
-            // the next queued push so a saturated link drains instead of stalling (no-op
-            // for consensus sends, already handled above). The failed body is recoverable
-            // via T4 re-push + the hot-path pull (#4 Task 1).
-            dispatch_next_push(swarm, shared, local_key, request_id);
         }
         SwarmEvent::Behaviour(TorusBehaviourEvent::Direct(
             request_response::Event::InboundFailure { peer, error, .. },
@@ -2131,6 +2262,20 @@ fn handle_command(
                 warn!("ForwardNativeAction: leader not in peer map");
             }
         }
+        NetworkCommand::ForwardNativeActionBatch { target, pairs } => {
+            // B1: ONE 0xFD envelope per (flush window, leader) — byte-identical
+            // to the pre-proposal batch push, so every deployed binary already
+            // decodes, verifies, dedups, and pool-inserts it.
+            match encode_forward_batch(&pairs) {
+                Some(envelope) => {
+                    if let Some(ref m) = shared.metrics {
+                        m.d2l_envelope_bytes.observe(envelope.len() as f64);
+                    }
+                    send_forward_batch(swarm, shared, local_key, &target, envelope, 0);
+                }
+                None => warn!("ForwardNativeActionBatch: bincode encode failed — dropping"),
+            }
+        }
         NetworkCommand::ForwardEvmTx { target, payload } => {
             let peer_id = shared
                 .peer_map
@@ -2386,6 +2531,66 @@ fn fan_native_push(
         // validator (re)connects, and the hot-path pull (#4 Task 1) recovers a still-missing
         // body.
         tracing::warn!(dropped, "native push queue saturated -- oldest pushes dropped (recoverable via re-push + hot pull)");
+    }
+}
+
+/// B1: dispatch one forward envelope to `target`, PushScheduler-bounded and
+/// retry-tracked. Unlike the per-action 0xFE forward (fire-and-forget,
+/// bypassing every bound), the envelope (a) consumes an in-flight scheduler
+/// slot so bursty forwards can't exhaust the bidi-stream window, (b) is
+/// recorded in `outbound_forward_batches` so an `OutboundFailure` retries it
+/// against the re-resolved leader. At scheduler saturation the envelope is
+/// queued like a native push (dispatched untracked as slots free); an
+/// unmapped leader is a counted drop — in every loss case the mempool retains
+/// the actions and the re-forward sweep re-sends them.
+fn send_forward_batch(
+    swarm: &mut Swarm<TorusBehaviour>,
+    shared: &SharedState,
+    local_key: &VerifyingKey,
+    target: &VerifyingKey,
+    envelope: Vec<u8>,
+    attempt: u8,
+) {
+    let peer_id = shared.peer_map.read().unwrap().get_peer_id(target).copied();
+    let Some(pid) = peer_id else {
+        warn!("ForwardNativeActionBatch: leader not in peer map — dropping (pool retains; sweep re-sends)");
+        if let Some(ref m) = shared.metrics {
+            m.d2l_envelopes_dropped.inc();
+        }
+        return;
+    };
+    let mut sched = shared.push_scheduler.lock().unwrap();
+    if sched.has_capacity() {
+        let req = DirectRequest {
+            sender_key: local_key.to_bytes(),
+            payload: envelope.clone(),
+        };
+        let id = swarm.behaviour_mut().direct.send_request(&pid, req);
+        sched.record(id);
+        drop(sched);
+        shared.outbound_forward_batches.lock().unwrap().insert(
+            id,
+            ForwardBatchInFlight {
+                target: *target,
+                envelope,
+                attempt,
+            },
+        );
+        if let Some(ref m) = shared.metrics {
+            m.d2l_envelopes_sent.inc();
+        }
+    } else {
+        // Saturated: queue behind the in-flight cap (bounded, drop-oldest).
+        // A queued envelope is later dispatched WITHOUT retry tracking — same
+        // policy as native pushes; the sweep is the recovery for a loss.
+        let dropped = sched.enqueue(pid, envelope);
+        drop(sched);
+        if dropped {
+            if let Some(ref m) = shared.metrics {
+                m.d2l_envelopes_dropped.inc();
+            }
+            warn!("d2l forward queue saturated — oldest queued push dropped (recoverable)");
+        }
     }
 }
 
@@ -3056,6 +3261,8 @@ mod tests {
             consensus_direct_fan,
             consensus_gossip_mirror,
             consensus_dedup: Mutex::new(ConsensusDedup::with_cap(CONSENSUS_DEDUP_CAP)),
+            outbound_forward_batches: Mutex::new(HashMap::new()),
+            leader_resolver: RwLock::new(None),
         }
     }
 

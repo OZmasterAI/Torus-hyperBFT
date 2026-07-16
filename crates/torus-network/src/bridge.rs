@@ -215,6 +215,10 @@ impl LibP2PNetwork {
             consensus_dedup: Mutex::new(crate::swarm::ConsensusDedup::with_cap(
                 crate::swarm::CONSENSUS_DEDUP_CAP,
             )),
+            // B1 batched d2l forward: envelope retry tracking + the
+            // node-installed leader-hint callback (set_leader_resolver).
+            outbound_forward_batches: Mutex::new(HashMap::new()),
+            leader_resolver: RwLock::new(None),
         });
 
         let (command_tx, command_rx) = mpsc::unbounded_channel();
@@ -354,6 +358,30 @@ impl LibP2PNetwork {
         let _ = self
             .command_tx
             .send(NetworkCommand::ForwardNativeAction { target, payload });
+    }
+
+    /// B1: forward one coalesced batch of RPC-admitted native actions to the
+    /// leader as a SINGLE `/torus/direct` request in the 0xFD pre-proposal
+    /// wire format (`0xFD ‖ bincode(pairs)`) — the receive path shipped with
+    /// every deployed binary. PushScheduler-bounded, retried ≤2 times against
+    /// the re-resolved leader on outbound failure (see `set_leader_resolver`).
+    pub fn forward_native_action_batch(
+        &self,
+        target: VerifyingKey,
+        pairs: Vec<(torus_types::Address, torus_types::SignedNativeAction)>,
+    ) {
+        let _ = self
+            .command_tx
+            .send(NetworkCommand::ForwardNativeActionBatch { target, pairs });
+    }
+
+    /// B1: install the leader-hint callback consulted when a forward envelope
+    /// fails in flight, so the retry targets the CURRENT leader (a mid-window
+    /// rotation is the expected failure cause) instead of re-hitting the node
+    /// that just failed. Unset (tests, `TORUS_D2L_BATCH=0`) falls back to the
+    /// envelope's original target.
+    pub fn set_leader_resolver(&self, resolver: crate::swarm::LeaderResolver) {
+        *self.shared.leader_resolver.write().unwrap() = Some(resolver);
     }
 
     /// Forward a raw RLP EVM transaction directly to the leader (Option B — EVM tx

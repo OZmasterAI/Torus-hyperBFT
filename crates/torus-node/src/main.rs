@@ -832,12 +832,22 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             .current_leader()
             .map(|vk| *vk.as_bytes())
     });
-    let (fwd_tx, mut fwd_rx) = tokio::sync::mpsc::unbounded_channel();
+    // B1: the native forward channel is BOUNDED and carries structured
+    // (leader hint, sender, parsed action) tuples — overflow is a counted
+    // drop on the RPC side (`rpc_forward_dropped_full`), never unbounded
+    // memory behind a stalled forwarder.
+    let (fwd_tx, fwd_rx) = tokio::sync::mpsc::channel(torus_rpc::FORWARD_CHANNEL_CAP);
     let (evm_fwd_tx, mut evm_fwd_rx) = tokio::sync::mpsc::unbounded_channel();
     // Full-body native forwards only in the no-gossip fallback: with pre-spread on,
     // gossip already delivers every body to the leader (Sprint 3.5). EVM forwarding has no
     // gossip path, so it is unconditional — wired via its own channel.
-    rpc_server.set_leader_forwarding(own_vk, leader_vk_fn, fwd_tx, evm_fwd_tx, !cli.native_gossip);
+    rpc_server.set_leader_forwarding(
+        own_vk,
+        leader_vk_fn.clone(),
+        fwd_tx,
+        evm_fwd_tx,
+        !cli.native_gossip,
+    );
 
     // Extract shared handles before start() consumes the server
     let latest_height_handle = rpc_server.latest_height();
@@ -872,14 +882,43 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
     info!(%actual_addr, "JSON-RPC server started (dedicated runtime)");
 
-    // Forwarding bridge: receives (target_vk_bytes, payload) from RPC, sends via network
-    tokio::spawn(async move {
-        while let Some((target_vk_bytes, payload)) = fwd_rx.recv().await {
-            if let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(&target_vk_bytes) {
-                network_for_fwd.forward_native_action(vk, payload);
+    // Forwarding bridge (B1): with `TORUS_D2L_BATCH=1` (default) the
+    // ForwardBatcher task coalesces the structured tuples into ONE 0xFD
+    // envelope per (flush window, leader) — leader re-resolved at flush time,
+    // PushScheduler-bounded, retried against the re-resolved leader, with the
+    // periodic re-forward sweep healing lost envelopes. `=0` restores today's
+    // per-action 0xFE forward byte-for-byte (the sender prefix + serde_json
+    // canonical bytes are reconstructed exactly as `verify_one_action`
+    // produced them).
+    if forward_batcher::d2l_batch_enabled() {
+        // Failed envelopes retry against the CURRENT leader, not the stale hint.
+        network_for_fwd.set_leader_resolver(leader_vk_fn.clone());
+        forward_batcher::spawn(
+            fwd_rx,
+            network_for_fwd,
+            leader_vk_fn.clone(),
+            own_vk,
+            mempool.clone(),
+        );
+    } else {
+        info!("B1 d2l batching disabled (TORUS_D2L_BATCH=0) — per-action 0xFE forwards");
+        let mut fwd_rx = fwd_rx;
+        tokio::spawn(async move {
+            while let Some((target_vk_bytes, sender, action)) = fwd_rx.recv().await {
+                if let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(&target_vk_bytes) {
+                    // Byte-identical rollback: 20-byte sender ‖ canonical
+                    // serde_json action bytes, one request per action.
+                    let Ok(action_json) = serde_json::to_vec(&action) else {
+                        continue;
+                    };
+                    let mut payload = Vec::with_capacity(20 + action_json.len());
+                    payload.extend_from_slice(sender.as_slice());
+                    payload.extend_from_slice(&action_json);
+                    network_for_fwd.forward_native_action(vk, payload);
+                }
             }
-        }
-    });
+        });
+    }
 
     // EVM forwarding bridge (Option B): (leader_vk_bytes, raw_rlp) from RPC → network unicast.
     tokio::spawn(async move {

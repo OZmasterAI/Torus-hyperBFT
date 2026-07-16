@@ -262,6 +262,29 @@ pub struct Metrics {
     /// the direct fan and the gossip mirror. Expected to track the mirror's
     /// delivery rate while both paths are on; zero cost, never a loss signal.
     pub consensus_dedup_dropped: Counter,
+
+    // B1 batched direct-to-leader forward (design §1).
+    /// RPC-admitted actions whose leader-forward was shed because the BOUNDED
+    /// RPC→batcher channel was full (drop-newest). Recoverable — the action is
+    /// already in the local pool and the re-forward sweep re-sends it — but a
+    /// sustained rate means the batcher/leader link cannot keep up with ingress.
+    pub rpc_forward_dropped_full: Counter,
+    /// 0xFD forward envelopes dispatched to the leader (one per flush window ×
+    /// target, plus retries). Proof run: O(10–200)/s INDEPENDENT of client
+    /// batch shape — vs O(actions/s) on the per-action 0xFE path.
+    pub d2l_envelopes_sent: Counter,
+    /// Forward envelopes re-sent after an `OutboundFailure`, re-targeted at the
+    /// re-resolved CURRENT leader (≤2 retries). Sustained rate names a
+    /// flapping leader link or a stale leader hint.
+    pub d2l_envelopes_retried: Counter,
+    /// Forward envelopes dropped: retries exhausted, leader not in the peer
+    /// map, or PushScheduler queue overflow. Never a loss of the actions —
+    /// the mempool retains them and the re-forward sweep re-sends.
+    pub d2l_envelopes_dropped: Counter,
+    /// Size (bytes) of dispatched forward envelopes — sizes the
+    /// `TORUS_D2L_BATCH_MAX_BYTES` cap against real traffic (design §7 flags
+    /// the per-order bincode size as unmeasured).
+    pub d2l_envelope_bytes: Histogram,
 }
 
 impl Metrics {
@@ -871,6 +894,43 @@ impl Metrics {
             consensus_dedup_dropped.clone(),
         );
 
+        let rpc_forward_dropped_full = Counter::default();
+        registry.register(
+            "torus_rpc_forward_dropped_full",
+            "Leader forwards shed because the bounded RPC forward channel was full (B1)",
+            rpc_forward_dropped_full.clone(),
+        );
+
+        let d2l_envelopes_sent = Counter::default();
+        registry.register(
+            "torus_d2l_envelopes_sent",
+            "Batched 0xFD direct-to-leader forward envelopes dispatched (B1)",
+            d2l_envelopes_sent.clone(),
+        );
+
+        let d2l_envelopes_retried = Counter::default();
+        registry.register(
+            "torus_d2l_envelopes_retried",
+            "Forward envelopes re-sent to the re-resolved leader after an outbound failure (B1)",
+            d2l_envelopes_retried.clone(),
+        );
+
+        let d2l_envelopes_dropped = Counter::default();
+        registry.register(
+            "torus_d2l_envelopes_dropped",
+            "Forward envelopes dropped after exhausted retries / unmapped leader / queue overflow (B1)",
+            d2l_envelopes_dropped.clone(),
+        );
+
+        // 1 KB → 4 MB: spans a single-action envelope up to the legacy-fleet
+        // direct-codec floor (the hard send cap).
+        let d2l_envelope_bytes = Histogram::new(exponential_buckets(1024.0, 2.0, 13));
+        registry.register(
+            "torus_d2l_envelope_bytes",
+            "Size in bytes of dispatched direct-to-leader forward envelopes (B1)",
+            d2l_envelope_bytes.clone(),
+        );
+
         Self {
             registry,
             blocks_committed,
@@ -959,6 +1019,11 @@ impl Metrics {
             consensus_direct_fan_sent,
             consensus_direct_fan_buffered,
             consensus_dedup_dropped,
+            rpc_forward_dropped_full,
+            d2l_envelopes_sent,
+            d2l_envelopes_retried,
+            d2l_envelopes_dropped,
+            d2l_envelope_bytes,
         }
     }
 

@@ -138,6 +138,20 @@ impl TxSubmitLimiter {
     }
 }
 
+/// One admitted native action queued for direct-to-leader forwarding (B1):
+/// `(leader vk hint at admission time, verified sender, parsed action)`.
+/// The node-side ForwardBatcher re-resolves the leader at flush time; the
+/// hint keys the accumulation bucket. Structured tuples end the JSON
+/// re-encode (2–4× wire bloat) the old `Vec<u8>` payload paid per action.
+pub type ForwardedAction = ([u8; 32], torus_types::Address, torus_types::SignedNativeAction);
+
+/// Bound on the RPC→batcher forward channel (B1). The old channel was
+/// UNBOUNDED — a stalled forwarder grew memory without limit. Overflow now
+/// drops the newest item with a `rpc_forward_dropped_full` count; the action
+/// is already admitted to the local pool, so the drop costs inclusion
+/// latency (healed by the re-forward sweep), never the action.
+pub const FORWARD_CHANNEL_CAP: usize = 65_536;
+
 /// Shared state for all RPC handlers.
 #[derive(Clone)]
 pub struct RpcState {
@@ -160,8 +174,12 @@ pub struct RpcState {
     pub(crate) own_vk: Option<[u8; 32]>,
     /// Returns the current leader's verifying key bytes.
     pub(crate) leader_vk_fn: Option<Arc<dyn Fn() -> Option<[u8; 32]> + Send + Sync>>,
-    /// Channel to forward native actions to the leader: (leader_vk, sender_addr ++ action_json).
-    pub(crate) forward_action_tx: Option<tokio::sync::mpsc::UnboundedSender<([u8; 32], Vec<u8>)>>,
+    /// Channel to forward native actions to the leader (B1): structured
+    /// (leader vk hint, verified sender, parsed action) tuples — no JSON
+    /// re-encode — BOUNDED ([`FORWARD_CHANNEL_CAP`]); overflow drops the
+    /// newest item and counts `rpc_forward_dropped_full` (recoverable: the
+    /// action is already pooled and the re-forward sweep re-sends it).
+    pub(crate) forward_action_tx: Option<tokio::sync::mpsc::Sender<ForwardedAction>>,
     /// Channel to forward raw EVM txs to the leader: (leader_vk, raw_rlp). Option B — EVM tx
     /// dissemination. Unconditional (no `forward_bodies` gate): EVM has no gossip pre-spread,
     /// so the unicast is the ONLY way a tx submitted to a non-proposer reaches the producer.
@@ -222,7 +240,7 @@ impl RpcServer {
         &mut self,
         own_vk: [u8; 32],
         leader_vk_fn: Arc<dyn Fn() -> Option<[u8; 32]> + Send + Sync>,
-        forward_tx: tokio::sync::mpsc::UnboundedSender<([u8; 32], Vec<u8>)>,
+        forward_tx: tokio::sync::mpsc::Sender<ForwardedAction>,
         evm_forward_tx: tokio::sync::mpsc::UnboundedSender<([u8; 32], Vec<u8>)>,
         forward_bodies: bool,
     ) {

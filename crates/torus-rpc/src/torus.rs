@@ -519,14 +519,23 @@ impl RpcState {
                         .expect("one verified result per proceed slot"),
                 };
                 match item {
-                    Ok((sender, action, action_bytes, hash)) => {
+                    Ok((sender, action, _action_bytes, hash)) => {
                         let insert_t0 = std::time::Instant::now();
+                        // B1: the leader-forward now carries the PARSED action
+                        // (structured tuple, no JSON re-encode), so keep a copy
+                        // for the forward — but ONLY when forwarding is armed
+                        // and this node is not the leader (the clone of a
+                        // PlaceOrderBatch is real work on the hot path).
+                        let fwd_target = self.forward_leader_target();
+                        let fwd_copy = fwd_target.map(|vk| (vk, action.clone()));
                         let admitted = self.mempool.add_native_action_presigned(sender, action);
                         insert_dur += insert_t0.elapsed();
                         match admitted {
                             Ok(()) => {
                                 let forward_t0 = std::time::Instant::now();
-                                self.forward_to_leader(&sender, &action_bytes);
+                                if let Some((leader_vk, fwd_action)) = fwd_copy {
+                                    self.push_forward(leader_vk, sender, fwd_action);
+                                }
                                 forward_dur += forward_t0.elapsed();
                                 RpcSubmitResult {
                                     hash: Some(hex_b256(hash)),
@@ -573,22 +582,42 @@ impl RpcState {
         Ok(results)
     }
 
-    /// Direct-to-leader forwarding tail shared by the single and batch submit
-    /// endpoints: no-op when this node IS the leader or forwarding is unwired.
-    fn forward_to_leader(&self, sender: &alloy_primitives::Address, action_bytes: &[u8]) {
+    /// B1: resolve where a leader-forward would go — `Some(leader_vk)` only
+    /// when full-body forwarding is armed (`forward_bodies`), the plumbing is
+    /// wired, a leader hint exists, and it is NOT this node. Shared gate for
+    /// the single and batch submit endpoints; also the "should I clone the
+    /// action for the forward?" decision on the batch hot path.
+    fn forward_leader_target(&self) -> Option<[u8; 32]> {
         if !self.forward_bodies {
-            return;
+            return None;
         }
-        if let (Some(ref leader_fn), Some(ref own_vk), Some(ref fwd_tx)) =
+        let (Some(ref leader_fn), Some(ref own_vk), Some(_)) =
             (&self.leader_vk_fn, &self.own_vk, &self.forward_action_tx)
-        {
-            if let Some(leader_vk) = leader_fn() {
-                if leader_vk != *own_vk {
-                    let mut payload = Vec::with_capacity(20 + action_bytes.len());
-                    payload.extend_from_slice(sender.as_slice());
-                    payload.extend_from_slice(action_bytes);
-                    let _ = fwd_tx.send((leader_vk, payload));
-                }
+        else {
+            return None;
+        };
+        let leader_vk = leader_fn()?;
+        (leader_vk != *own_vk).then_some(leader_vk)
+    }
+
+    /// B1: hand one admitted action to the node-side ForwardBatcher as a
+    /// structured `(leader hint, verified sender, parsed action)` tuple — no
+    /// JSON re-encode (the old payload was 20-byte sender ‖ serde_json, 2–4×
+    /// wire bloat). The channel is BOUNDED: overflow drops the NEWEST item and
+    /// counts `rpc_forward_dropped_full` — recoverable, the action is already
+    /// in the local pool and the re-forward sweep re-sends it.
+    fn push_forward(
+        &self,
+        leader_vk: [u8; 32],
+        sender: alloy_primitives::Address,
+        action: torus_types::SignedNativeAction,
+    ) {
+        let Some(ref fwd_tx) = self.forward_action_tx else {
+            return;
+        };
+        if fwd_tx.try_send((leader_vk, sender, action)).is_err() {
+            if let Some(ref m) = self.metrics {
+                m.rpc_forward_dropped_full.inc();
             }
         }
     }
@@ -1033,13 +1062,14 @@ impl TorusApiServer for RpcState {
         // Offload deserialization + ECDSA verification to the blocking thread pool
         // so heavy crypto doesn't starve the async runtime under load.
         // T2.4: same shared verify path as the batch endpoints — the canonical
-        // bytes + action hash are computed ONCE there (at first decode) and
-        // reused below for both the ack hash and the leader-forward payload,
-        // instead of this endpoint re-serializing serde_json + keccak in its
-        // own copy of the pipeline.
+        // bytes + action hash are computed ONCE there (at first decode) and the
+        // hash reused below for the ack, instead of this endpoint
+        // re-serializing serde_json + keccak in its own copy of the pipeline.
+        // (B1: the leader-forward now carries the parsed action itself, so the
+        // canonical bytes are no longer needed for the forward payload.)
         let state_db = self.state.clone();
         let chain_id = self.chain_id;
-        let (sender, action, action_bytes, hash) = tokio::task::spawn_blocking(move || {
+        let (sender, action, _action_bytes, hash) = tokio::task::spawn_blocking(move || {
             let current_time_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("system clock before epoch")
@@ -1055,7 +1085,10 @@ impl TorusApiServer for RpcState {
             .add_native_action_presigned(sender, action.clone())
             .map_err(|e| ErrorObjectOwned::from(RpcError::Internal(format!("mempool: {e}"))))?;
 
-        self.forward_to_leader(&sender, &action_bytes);
+        // B1: forward the PARSED action (structured tuple, no JSON re-encode).
+        if let Some(leader_vk) = self.forward_leader_target() {
+            self.push_forward(leader_vk, sender, action);
+        }
 
         Ok(hex_b256(hash))
     }
