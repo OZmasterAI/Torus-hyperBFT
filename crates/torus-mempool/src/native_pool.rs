@@ -28,12 +28,28 @@ pub(crate) struct NativePoolEntry {
     pub verified_locally: bool,
 }
 
+/// Number of most-recently-committed action hashes retained for the gossip
+/// prescreen dedup ring (P3 Round-2 scope 2). A gossiped copy of an action that
+/// was already committed (and thus pruned from the pool) must skip the expensive
+/// crypto verify AND never be re-selected into a later block — the committed
+/// ring closes that window the pool's own dedup (which forgets on prune) leaves
+/// open, killing the ×1.21–1.90 duplicate block-inclusion factor. Sized to cover
+/// many blocks' worth of committed actions (≥ the pool cap).
+pub const RECENTLY_COMMITTED_RING_CAP: usize = 65_536;
+
 /// Native action pool with per-sender tracking, dedup, and size limits.
 pub(crate) struct NativePool {
     entries: Vec<NativePoolEntry>,
     sender_counts: HashMap<Address, usize>,
     seen: HashSet<(Address, B256)>,
     hash_index: HashMap<B256, usize>,
+    /// Ring of recently-committed action hashes for the gossip prescreen (scope
+    /// 2). `remove_committed` feeds it; a bounded FIFO evicts the oldest. Kept in
+    /// lockstep: `recently_committed` is the membership set, `recently_committed_order`
+    /// the eviction order.
+    recently_committed: HashSet<B256>,
+    recently_committed_order: std::collections::VecDeque<B256>,
+    recently_committed_cap: usize,
     max_size: usize,
     max_per_sender: usize,
     max_per_block: usize,
@@ -46,6 +62,9 @@ impl NativePool {
             sender_counts: HashMap::new(),
             seen: HashSet::new(),
             hash_index: HashMap::new(),
+            recently_committed: HashSet::new(),
+            recently_committed_order: std::collections::VecDeque::new(),
+            recently_committed_cap: RECENTLY_COMMITTED_RING_CAP,
             max_size,
             max_per_sender,
             max_per_block,
@@ -116,6 +135,35 @@ impl NativePool {
         verified_locally: bool,
     ) -> Result<B256, MempoolError> {
         let action_hash = compute_action_hash(&action);
+        self.insert_verified_with_hash(sender, action, verified_locally, action_hash)
+    }
+
+    /// True iff `hash` is already pooled or was recently committed — the gossip
+    /// prescreen (scope 2) uses this to skip the crypto verify for a duplicate.
+    /// Dedup is by `compute_action_hash` (payload+nonce), identical to the pool's
+    /// existing `hash_index` and the DA-store key, so it introduces no new
+    /// collision surface; unique-per-action nonces make collisions non-occurring.
+    pub fn contains_or_recently_committed(&self, hash: &B256) -> bool {
+        self.hash_index.contains_key(hash) || self.recently_committed.contains(hash)
+    }
+
+    /// Insert with a PRECOMPUTED action hash — the gossip prescreen already
+    /// computed it (once) for the dedup/staleness checks, so this avoids the
+    /// redundant recompute at insert (scope 2; also covers swarm fold-in #15's
+    /// third hash). The caller MUST pass `compute_action_hash(&action)`; the hash
+    /// is over the action+nonce only, independent of `sender`.
+    pub fn insert_verified_with_hash(
+        &mut self,
+        sender: Address,
+        action: SignedNativeAction,
+        verified_locally: bool,
+        action_hash: B256,
+    ) -> Result<B256, MempoolError> {
+        debug_assert_eq!(
+            action_hash,
+            compute_action_hash(&action),
+            "precomputed prescreen hash must equal the canonical action hash (invariant 2)"
+        );
         let is_cancel = is_cancel(&action.action);
         // Serialization of a serde struct cannot realistically fail; if it ever
         // does, a half-cap sentinel keeps the entry out of byte-capped blocks
@@ -370,7 +418,19 @@ impl NativePool {
     }
 
     /// Remove actions that were included in a committed block.
+    ///
+    /// P3 Round-2 scope 2: EVERY committed hash is also recorded in the
+    /// recently-committed ring (bounded FIFO) so a later gossiped copy of an
+    /// already-committed action is prescreened out — skipping its crypto verify
+    /// AND preventing it being re-selected into a subsequent block (the source of
+    /// the ×1.21–1.90 duplicate block-inclusion factor). All committed hashes are
+    /// ringed, not just those still pooled, since a fast committer prunes an
+    /// action from the pool before its gossip echoes arrive.
     pub fn remove_committed(&mut self, hashes: &[B256]) {
+        for hash in hashes {
+            self.note_recently_committed(*hash);
+        }
+
         let to_remove: HashSet<B256> = hashes.iter().copied().collect();
         let mut removed_entries = Vec::new();
 
@@ -391,6 +451,23 @@ impl NativePool {
         self.hash_index.clear();
         for (i, entry) in self.entries.iter().enumerate() {
             self.hash_index.insert(entry.action_hash, i);
+        }
+    }
+
+    /// Record a committed hash in the bounded recently-committed ring, evicting
+    /// the oldest when at capacity. Idempotent: a repeat hash refreshes nothing
+    /// (already present) and does not double-count against the cap.
+    fn note_recently_committed(&mut self, hash: B256) {
+        if self.recently_committed_cap == 0 {
+            return;
+        }
+        if self.recently_committed.insert(hash) {
+            self.recently_committed_order.push_back(hash);
+            while self.recently_committed_order.len() > self.recently_committed_cap {
+                if let Some(old) = self.recently_committed_order.pop_front() {
+                    self.recently_committed.remove(&old);
+                }
+            }
         }
     }
 

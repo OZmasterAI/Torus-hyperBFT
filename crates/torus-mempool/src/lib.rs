@@ -389,6 +389,41 @@ impl Mempool {
         claimed_sender: alloy_primitives::Address,
         action: SignedNativeAction,
     ) -> Result<(), MempoolError> {
+        // P3 Round-2 scope 2: PRESCREEN before the expensive crypto verify. The
+        // body is already DA-mirrored (receipt worker), so both skip paths keep
+        // it reconstructable (mem 28e1a821); they only avoid paying verify.
+        // (1) Compute the canonical action hash ONCE — reused by the dedup check
+        //     AND the pool insert (invariant 2: identical to today's hash).
+        let action_hash = torus_types::compute_action_hash(&action);
+        // (2) DEDUP: an identical action already pooled or recently committed is a
+        //     no-op — skip verify, return Ok, pool unchanged. NEVER seeds the
+        //     trust-cache (invariant 3): we return before any insert. Also kills
+        //     duplicate block inclusion (the recently-committed ring).
+        if self
+            .native
+            .read()
+            .unwrap()
+            .contains_or_recently_committed(&action_hash)
+        {
+            if let Some(m) = self.metrics.get() {
+                m.native_ingest_dedup_skips.inc();
+            }
+            return Ok(());
+        }
+        // (3) STALENESS: past the 60s nonce window — skip verify (the body stays
+        //     DA-resident from the receipt mirror). NONCE_WINDOW_MS untouched.
+        use torus_types::eip712::NONCE_WINDOW_MS;
+        if action.nonce.saturating_add(NONCE_WINDOW_MS) < now_ms() {
+            if let Some(m) = self.metrics.get() {
+                m.native_ingest_stale_skips.inc();
+            }
+            return Err(MempoolError::NativeValidationFailed(
+                "nonce too old (>60s, prescreened)".into(),
+            ));
+        }
+
+        // (4) Crypto verify the CLAIMED sender (forged gossip pairs must not
+        //     pollute the pool).
         let verified_sender = match &action.signature {
             torus_types::ActionSignature::Eip712(_) => action.recover_sender().map_err(|e| {
                 MempoolError::NativeValidationFailed(format!("gossip sig recovery: {e}"))
@@ -413,8 +448,9 @@ impl Mempool {
             ));
         }
         // This node re-derived the sender from the signature above -> locally
-        // verified, so the entry may seed the exec trust-cache.
-        self.admit_gossip(claimed_sender, action, true)
+        // verified, so the entry may seed the exec trust-cache. Reuse the
+        // precomputed hash for the insert (stops the third recompute).
+        self.admit_gossip_with_hash(claimed_sender, action, true, Some(action_hash))
     }
 
     pub fn add_native_action_from_gossip_trusted(
@@ -444,6 +480,18 @@ impl Mempool {
         action: SignedNativeAction,
         verified_locally: bool,
     ) -> Result<(), MempoolError> {
+        self.admit_gossip_with_hash(sender, action, verified_locally, None)
+    }
+
+    /// `admit_gossip` variant that threads the gossip prescreen's precomputed
+    /// action hash (scope 2) into the pool insert so it is not recomputed.
+    fn admit_gossip_with_hash(
+        &self,
+        sender: alloy_primitives::Address,
+        action: SignedNativeAction,
+        verified_locally: bool,
+        precomputed_hash: Option<B256>,
+    ) -> Result<(), MempoolError> {
         // G1 defensive layer (O2): an oversize/empty batch must never enter
         // the POOL (an honest node must never SELECT it into a proposal). It is
         // still DA-mirrored at network receipt (by the off-loop mirror worker,
@@ -470,7 +518,7 @@ impl Mempool {
                 "nonce too far in future".into(),
             ));
         }
-        self.submit_native_action_inner(sender, action, verified_locally)
+        self.submit_native_action_inner(sender, action, verified_locally, precomputed_hash)
     }
 
     /// Gossip includes sender address so receivers can skip ECDSA recovery.
@@ -511,7 +559,7 @@ impl Mempool {
         sender: alloy_primitives::Address,
         action: SignedNativeAction,
     ) -> Result<(), MempoolError> {
-        self.submit_native_action_inner(sender, action, true)
+        self.submit_native_action_inner(sender, action, true, None)
     }
 
     /// Native insert with explicit provenance. `verified_locally` records whether
@@ -519,11 +567,17 @@ impl Mempool {
     /// or gossip-RECOVER). Only locally-verified EIP-712 actions seed the exec
     /// trust-cache (keyed by the signature-committing `verified_cache_key`);
     /// gossip-TRUSTED admits pass `false` and are never short-circuited at exec.
+    ///
+    /// `precomputed_hash` (P3 Round-2 scope 2) is the gossip prescreen's
+    /// already-computed `compute_action_hash`; when `Some`, insertion reuses it
+    /// instead of recomputing (must equal the canonical hash — invariant 2). RPC
+    /// ingress passes `None`.
     fn submit_native_action_inner(
         &self,
         sender: alloy_primitives::Address,
         action: SignedNativeAction,
         verified_locally: bool,
+        precomputed_hash: Option<B256>,
     ) -> Result<(), MempoolError> {
         // Derive the trust-cache key BEFORE `action` is moved into the pool. `None`
         // for non-EIP-712 (session) actions, which are never short-circuited.
@@ -535,7 +589,14 @@ impl Mempool {
 
         let size_after = {
             let mut pool = self.native.write().unwrap();
-            pool.insert_verified(sender, action, verified_locally)?;
+            match precomputed_hash {
+                Some(h) => {
+                    pool.insert_verified_with_hash(sender, action, verified_locally, h)?;
+                }
+                None => {
+                    pool.insert_verified(sender, action, verified_locally)?;
+                }
+            }
             pool.size()
         };
 

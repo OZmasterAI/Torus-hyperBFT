@@ -157,3 +157,131 @@ fn gossip_body_da_resident_before_verify() {
         "verified fresh body is now in the pool too"
     );
 }
+
+/// P3 Round-2 scope 2 (gossip prescreen) invariant: a duplicate copy of an
+/// action that is already POOLED skips the crypto verify (prescreen dedup) and
+/// leaves the pool state unchanged. Uses a forged sender on the second copy —
+/// which WOULD fail crypto verify (`gossip sender mismatch`) if verify ran — to
+/// prove the prescreen short-circuits BEFORE verify (Ok, not the mismatch Err).
+#[test]
+fn prescreen_duplicate_pooled_copy_skips_verify_pool_unchanged() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state = StateDb::open(dir.path()).expect("open db");
+    let pool = Mempool::new(state, MempoolConfig::default());
+
+    let key = k256::ecdsa::SigningKey::from_slice(
+        &alloy_primitives::hex::decode(
+            "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let now = now_ms();
+    let signed =
+        torus_types::eip712::sign_native_action(NativeAction::ClaimRewards, now, &key);
+    let real_sender = signed.recover_sender().unwrap();
+    let hash = compute_action_hash(&signed);
+
+    // Mirror + admit the genuine copy: now pooled.
+    pool.mirror_native_to_da(std::slice::from_ref(&signed));
+    pool.add_native_action_from_gossip(real_sender, signed.clone())
+        .expect("genuine copy admits");
+    assert_eq!(pool.native_pool_size(), 1);
+
+    // A second copy claiming a FORGED sender. If verify ran it would return the
+    // `gossip sender mismatch` Err. The prescreen dedup (hash already pooled)
+    // short-circuits with Ok BEFORE verify, and the pool is unchanged.
+    let forged = Address::repeat_byte(0xEE);
+    let res = pool.add_native_action_from_gossip(forged, signed);
+    assert!(
+        res.is_ok(),
+        "duplicate pooled copy must be prescreened Ok (verify skipped), got {res:?}"
+    );
+    assert_eq!(
+        pool.native_pool_size(),
+        1,
+        "pool unchanged by the deduped copy"
+    );
+    assert!(pool.get_native_da(&hash).is_some(), "body still DA-resident");
+}
+
+/// P3 Round-2 scope 2 invariant: a copy of an action that was already COMMITTED
+/// (and thus pruned from the pool) is still prescreened out via the
+/// recently-committed ring — skips verify AND is not re-admitted (kills
+/// duplicate block inclusion). Again a forged sender proves verify was skipped.
+#[test]
+fn prescreen_recently_committed_copy_skips_verify() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state = StateDb::open(dir.path()).expect("open db");
+    let pool = Mempool::new(state, MempoolConfig::default());
+
+    let key = k256::ecdsa::SigningKey::from_slice(
+        &alloy_primitives::hex::decode(
+            "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let now = now_ms();
+    let signed =
+        torus_types::eip712::sign_native_action(NativeAction::ClaimRewards, now, &key);
+    let real_sender = signed.recover_sender().unwrap();
+    let hash = compute_action_hash(&signed);
+
+    pool.mirror_native_to_da(std::slice::from_ref(&signed));
+    pool.add_native_action_from_gossip(real_sender, signed.clone())
+        .expect("genuine copy admits");
+    // Commit it: pruned from the pool, recorded in the recently-committed ring.
+    pool.remove_committed_native(&[hash]);
+    assert_eq!(pool.native_pool_size(), 0, "committed action pruned");
+
+    // A late gossip echo (forged sender) must be prescreened out via the ring,
+    // NOT re-admitted (duplicate block inclusion) and NOT verified.
+    let forged = Address::repeat_byte(0xEE);
+    let res = pool.add_native_action_from_gossip(forged, signed);
+    assert!(
+        res.is_ok(),
+        "recently-committed copy must be prescreened Ok (verify skipped), got {res:?}"
+    );
+    assert_eq!(
+        pool.native_pool_size(),
+        0,
+        "recently-committed action must NOT be re-admitted"
+    );
+}
+
+/// P3 Round-2 scope 2 invariant: a nonce-STALE gossip copy is prescreened out
+/// BEFORE verify (Err), yet the body stays DA-resident (mirror-worker stage) so
+/// a block referencing it is still reconstructable (missing-body livelock
+/// invariant, mem 28e1a821). Forged sender proves verify was skipped.
+#[test]
+fn prescreen_stale_copy_skips_verify_but_da_resident() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state = StateDb::open(dir.path()).expect("open db");
+    let pool = Mempool::new(state, MempoolConfig::default());
+    let now = now_ms();
+
+    let stale = SignedNativeAction {
+        action: NativeAction::CancelOrder { order_id: 7 },
+        nonce: now.saturating_sub(120_000), // ~2 min old -> past the 60s window
+        signature: sig(),
+    };
+    let stale_hash = compute_action_hash(&stale);
+
+    // Mirror-worker stage: DA-resident up front.
+    pool.mirror_native_to_da(std::slice::from_ref(&stale));
+
+    // Prescreen stale-skip: Err (rejected from pool), verify skipped — a forged
+    // sender would have surfaced as a sig/mismatch error had verify run.
+    let forged = Address::repeat_byte(0xEE);
+    let res = pool.add_native_action_from_gossip(forged, stale);
+    assert!(res.is_err(), "stale copy rejected from the pool");
+    assert!(
+        pool.get_native_da(&stale_hash).is_some(),
+        "stale body stays DA-resident (livelock invariant, mem 28e1a821)"
+    );
+    assert!(
+        pool.get_native_by_hash(&stale_hash).is_none(),
+        "stale body not admitted to the pool"
+    );
+}

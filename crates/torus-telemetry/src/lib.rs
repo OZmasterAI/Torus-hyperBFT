@@ -273,6 +273,15 @@ pub struct Metrics {
     /// the body is already DA-resident, so a drop only forfeits POOL candidacy,
     /// never availability (the R2.3 drop-safety property).
     pub native_verify_queue_dropped: Counter,
+    /// Gossip-ingest copies the prescreen (scope 2) skipped BEFORE crypto verify
+    /// because the action was already pooled or recently committed (dedup ring).
+    /// Ratio to `native_gossip_received_actions` ≈ the gossip duplication factor;
+    /// the verify CPU it saves is the prescreen's whole point.
+    pub native_ingest_dedup_skips: Counter,
+    /// Gossip-ingest copies the prescreen skipped BEFORE crypto verify because
+    /// the nonce was already past the 60s window (still DA-resident, just never
+    /// pays verify to be rejected).
+    pub native_ingest_stale_skips: Counter,
     /// Exec phase: deserializing every market's order book from the CF at the
     /// start of a block (native_executor `load_order_books`) — the O(markets×depth)
     /// per-block reload cost, invisible before this round.
@@ -955,6 +964,20 @@ impl Metrics {
             native_verify_queue_dropped.clone(),
         );
 
+        let native_ingest_dedup_skips = Counter::default();
+        registry.register(
+            "torus_native_ingest_dedup_skips",
+            "Gossip copies the prescreen skipped before verify (already pooled or recently committed)",
+            native_ingest_dedup_skips.clone(),
+        );
+
+        let native_ingest_stale_skips = Counter::default();
+        registry.register(
+            "torus_native_ingest_stale_skips",
+            "Gossip copies the prescreen skipped before verify (nonce past the 60s window)",
+            native_ingest_stale_skips.clone(),
+        );
+
         let exec_load_books_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
         registry.register(
             "torus_exec_load_books_seconds",
@@ -1108,6 +1131,8 @@ impl Metrics {
             native_da_mirror_actions,
             native_raw_inbound_dropped,
             native_verify_queue_dropped,
+            native_ingest_dedup_skips,
+            native_ingest_stale_skips,
             exec_load_books_seconds,
             exec_save_books_bytes,
             native_resting_depth,
