@@ -107,6 +107,9 @@ reed-solomon-erasure = "6"
 thiserror = "2"
 ed25519-dalek = { version = "2", features = ["batch"] }
 ethnum = "1.5"
+# rank-10 (perf): FxHash for order-book indices — never iterated, so hasher
+# choice is order-invisible; ~2-4x faster than SipHash on 16/20-byte keys.
+rustc-hash = "2"
 aes-gcm = "0.10"
 argon2 = "0.5"
 rpassword = "5"

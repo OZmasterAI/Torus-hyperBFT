@@ -9,10 +9,11 @@
 //! - All arithmetic via FixedPoint (no f64)
 //! - Deterministic: same input sequence → same state
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, Read as IoRead, Write as IoWrite};
 
 use borsh::{BorshDeserialize, BorshSerialize};
+use rustc_hash::FxHashMap;
 use torus_types::{
     Address, FixedPoint, MarketId, OrderId, OrderType, PlaceOrderParams, Side, TimeInForce,
 };
@@ -107,6 +108,9 @@ struct StopOrder {
 struct OrderLocation {
     side: Side,
     price: FixedPoint,
+    /// rank-10 (perf): back-index into `trader_orders[trader]` for O(1)
+    /// swap_remove instead of an O(n) retain scan.
+    trader_pos: usize,
 }
 
 // ============================================================================
@@ -121,9 +125,12 @@ pub struct OrderBook {
     /// Sell side: price → time-ordered queue. Best ask = first key (lowest).
     asks: BTreeMap<FixedPoint, VecDeque<Order>>,
     /// O(1) order lookup by ID → location.
-    order_index: HashMap<OrderId, OrderLocation>,
-    /// Per-trader order tracking for cancel-all.
-    trader_orders: HashMap<Address, Vec<OrderId>>,
+    /// FxHash (rank-10): never iterated, so hasher choice is order-invisible.
+    order_index: FxHashMap<OrderId, OrderLocation>,
+    /// Per-trader order tracking for cancel-all. Vec order is NOT insertion
+    /// order (swap_remove) — the only consensus consumer folds a commutative
+    /// sum over the cancelled set (see exec_cancel_all).
+    trader_orders: FxHashMap<Address, Vec<OrderId>>,
     /// Pending stop orders.
     pending_stops: Vec<StopOrder>,
     pub tick_size: FixedPoint,
@@ -140,8 +147,8 @@ impl OrderBook {
             market_id,
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
-            order_index: HashMap::new(),
-            trader_orders: HashMap::new(),
+            order_index: FxHashMap::default(),
+            trader_orders: FxHashMap::default(),
             pending_stops: Vec::new(),
             tick_size,
             lot_size,
@@ -411,11 +418,22 @@ impl OrderBook {
             book.remove(&loc.price);
         }
 
-        if let Some(ids) = self.trader_orders.get_mut(&order.trader) {
-            ids.retain(|&id| id != order_id);
-            if ids.is_empty() {
-                self.trader_orders.remove(&order.trader);
-            }
+        Self::remove_trader_index_entry(
+            &mut self.order_index,
+            &mut self.trader_orders,
+            &order.trader,
+            order_id,
+            loc.trader_pos,
+        );
+        // Prune an emptied vector on the cancel path ONLY (pre-change
+        // behavior — see remove_trader_index_entry for why this must not
+        // happen on the fill/self-trade paths).
+        if self
+            .trader_orders
+            .get(&order.trader)
+            .is_some_and(|ids| ids.is_empty())
+        {
+            self.trader_orders.remove(&order.trader);
         }
 
         Ok(order)
@@ -660,20 +678,24 @@ impl OrderBook {
                     let ids = self.trader_orders.get(&order.trader).unwrap_or_else(|| {
                         panic!("Order {} trader missing from trader_orders", order.id)
                     });
-                    assert!(
-                        ids.contains(&order.id),
-                        "Order {} missing from its trader_orders vec",
-                        order.id
+                    assert_eq!(
+                        ids.get(loc.trader_pos).copied(),
+                        Some(order.id),
+                        "Order {} back-index (trader_pos={}) does not point at itself",
+                        order.id,
+                        loc.trader_pos
                     );
                 }
             }
         }
         // Invariant 6 (index integrity, reverse direction): no dangling ids —
-        // every trader_orders id resolves through order_index, no empty
-        // trader vectors linger, and totals agree.
+        // every trader_orders id resolves through order_index, and totals
+        // agree. NOTE: empty trader vectors are LEGAL state — fill and
+        // self-trade removals have never pruned them, and cancel_all cancels
+        // a trader's pending stops only when an entry (even empty) exists,
+        // so entry presence is semantics-bearing and must be preserved.
         let mut trader_total = 0usize;
-        for (trader, ids) in &self.trader_orders {
-            assert!(!ids.is_empty(), "Empty trader_orders vec for {trader}");
+        for ids in self.trader_orders.values() {
             trader_total += ids.len();
             for id in ids {
                 assert!(
@@ -694,6 +716,11 @@ impl OrderBook {
     // ========================================================================
 
     /// Core matching: taker vs opposite side of the book.
+    ///
+    /// rank-10 (perf): single-descent price levels — `first_entry` /
+    /// `last_entry` replaces the old key-peek + `get_mut` + `get` + `remove`
+    /// sequence (four B-tree descents per level) with one descent and an
+    /// in-place entry removal. Match semantics are unchanged.
     fn execute_match(&mut self, taker: &mut Order, is_market: bool) -> (Vec<Fill>, Vec<Order>) {
         let mut fills = Vec::new();
         let mut self_trade_cancels = Vec::new();
@@ -701,49 +728,47 @@ impl OrderBook {
         match taker.side {
             Side::Buy => {
                 while taker.remaining_qty > FixedPoint::ZERO {
-                    let best_ask = match self.asks.keys().next().copied() {
-                        Some(p) => p,
-                        None => break,
+                    let Some(mut entry) = self.asks.first_entry() else {
+                        break;
                     };
+                    let best_ask = *entry.key();
                     if !is_market && best_ask > taker.price {
                         break;
                     }
-                    let queue = self.asks.get_mut(&best_ask).unwrap();
                     Self::match_at_level(
                         taker,
-                        queue,
+                        entry.get_mut(),
                         best_ask,
                         &mut fills,
                         &mut self_trade_cancels,
                         &mut self.order_index,
                         &mut self.trader_orders,
                     );
-                    if self.asks.get(&best_ask).is_none_or(|q| q.is_empty()) {
-                        self.asks.remove(&best_ask);
+                    if entry.get().is_empty() {
+                        entry.remove();
                     }
                 }
             }
             Side::Sell => {
                 while taker.remaining_qty > FixedPoint::ZERO {
-                    let best_bid = match self.bids.keys().next_back().copied() {
-                        Some(p) => p,
-                        None => break,
+                    let Some(mut entry) = self.bids.last_entry() else {
+                        break;
                     };
+                    let best_bid = *entry.key();
                     if !is_market && best_bid < taker.price {
                         break;
                     }
-                    let queue = self.bids.get_mut(&best_bid).unwrap();
                     Self::match_at_level(
                         taker,
-                        queue,
+                        entry.get_mut(),
                         best_bid,
                         &mut fills,
                         &mut self_trade_cancels,
                         &mut self.order_index,
                         &mut self.trader_orders,
                     );
-                    if self.bids.get(&best_bid).is_none_or(|q| q.is_empty()) {
-                        self.bids.remove(&best_bid);
+                    if entry.get().is_empty() {
+                        entry.remove();
                     }
                 }
             }
@@ -760,8 +785,8 @@ impl OrderBook {
         price: FixedPoint,
         fills: &mut Vec<Fill>,
         self_trade_cancels: &mut Vec<Order>,
-        order_index: &mut HashMap<OrderId, OrderLocation>,
-        trader_orders: &mut HashMap<Address, Vec<OrderId>>,
+        order_index: &mut FxHashMap<OrderId, OrderLocation>,
+        trader_orders: &mut FxHashMap<Address, Vec<OrderId>>,
     ) {
         while taker.remaining_qty > FixedPoint::ZERO && !queue.is_empty() {
             let maker = queue.front().unwrap();
@@ -769,9 +794,14 @@ impl OrderBook {
             // Self-trade prevention: cancel the resting (maker) order
             if maker.trader == taker.trader {
                 let cancelled = queue.pop_front().unwrap();
-                order_index.remove(&cancelled.id);
-                if let Some(ids) = trader_orders.get_mut(&cancelled.trader) {
-                    ids.retain(|&id| id != cancelled.id);
+                if let Some(loc) = order_index.remove(&cancelled.id) {
+                    Self::remove_trader_index_entry(
+                        order_index,
+                        trader_orders,
+                        &cancelled.trader,
+                        cancelled.id,
+                        loc.trader_pos,
+                    );
                 }
                 // A5: hand the whole cancelled order back so the executor can
                 // release its remaining order-margin reservation.
@@ -805,9 +835,49 @@ impl OrderBook {
 
             if maker.remaining_qty == FixedPoint::ZERO {
                 let filled = queue.pop_front().unwrap();
-                order_index.remove(&filled.id);
-                if let Some(ids) = trader_orders.get_mut(&filled.trader) {
-                    ids.retain(|&id| id != filled.id);
+                if let Some(loc) = order_index.remove(&filled.id) {
+                    Self::remove_trader_index_entry(
+                        order_index,
+                        trader_orders,
+                        &filled.trader,
+                        filled.id,
+                        loc.trader_pos,
+                    );
+                }
+            }
+        }
+    }
+
+    /// rank-10 (perf): O(1) removal of `order_id` from its trader's
+    /// `trader_orders` vector via `swap_remove` at the back-index recorded in
+    /// `OrderLocation::trader_pos`, repointing the displaced tail entry.
+    /// MUST be called AFTER `order_index.remove(&order_id)` (the removed
+    /// entry's `trader_pos` is passed in), so the repoint below can never
+    /// alias the order being removed.
+    ///
+    /// Deliberately does NOT prune an emptied vector: the pre-change code
+    /// pruned only on the `cancel_order` path (never on fill/self-trade
+    /// removal), and `cancel_all` cancels a trader's pending STOPS only when
+    /// a `trader_orders` entry — even an empty one — exists. Pruning here
+    /// would therefore change serialized `pending_stops` state. The caller
+    /// on the cancel path prunes, exactly as before.
+    fn remove_trader_index_entry(
+        order_index: &mut FxHashMap<OrderId, OrderLocation>,
+        trader_orders: &mut FxHashMap<Address, Vec<OrderId>>,
+        trader: &Address,
+        order_id: OrderId,
+        trader_pos: usize,
+    ) {
+        if let Some(ids) = trader_orders.get_mut(trader) {
+            debug_assert_eq!(
+                ids.get(trader_pos).copied(),
+                Some(order_id),
+                "trader back-index out of sync for order {order_id}"
+            );
+            ids.swap_remove(trader_pos);
+            if let Some(&moved) = ids.get(trader_pos) {
+                if let Some(loc) = order_index.get_mut(&moved) {
+                    loc.trader_pos = trader_pos;
                 }
             }
         }
@@ -826,8 +896,17 @@ impl OrderBook {
         };
         book.entry(price).or_default().push_back(order);
 
-        self.order_index.insert(id, OrderLocation { side, price });
-        self.trader_orders.entry(trader).or_default().push(id);
+        let ids = self.trader_orders.entry(trader).or_default();
+        let trader_pos = ids.len();
+        ids.push(id);
+        self.order_index.insert(
+            id,
+            OrderLocation {
+                side,
+                price,
+                trader_pos,
+            },
+        );
     }
 
     /// Would placing an order at `price` cross the spread?
@@ -1288,8 +1367,8 @@ impl BorshDeserialize for OrderBook {
             market_id,
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
-            order_index: HashMap::new(),
-            trader_orders: HashMap::new(),
+            order_index: FxHashMap::default(),
+            trader_orders: FxHashMap::default(),
             pending_stops: Vec::new(),
             tick_size,
             lot_size,
