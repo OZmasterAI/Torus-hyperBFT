@@ -84,7 +84,19 @@ impl FixedPoint {
     }
 
     /// Checked multiplication with i256 intermediate to avoid overflow.
+    ///
+    /// Fast path (perf, rank-13): when `a * b` fits in i128 the software-i256
+    /// multiply/divide is skipped entirely. Bit-identical to the i256 path
+    /// for ALL inputs: both `/` operators truncate toward zero, the exact
+    /// product is the same integer, and `product / SCALE` with `SCALE > 0`
+    /// always fits in i128 (|product/SCALE| <= |product| <= i128::MAX, and
+    /// i128::MIN / SCALE is in range), so the i256 path would have returned
+    /// `Ok` with the same value. Proven by the differential test in
+    /// `tests/fixed_point_fast_path.rs`.
     pub fn checked_mul(self, rhs: Self) -> Result<Self, ArithmeticError> {
+        if let Some(product) = self.0.checked_mul(rhs.0) {
+            return Ok(FixedPoint(product / Self::SCALE));
+        }
         use ethnum::i256;
         let result = i256::from(self.0) * i256::from(rhs.0) / i256::from(Self::SCALE);
         if result > i256::from(i128::MAX) || result < i256::from(i128::MIN) {
@@ -95,9 +107,21 @@ impl FixedPoint {
 
     /// Checked division with i256 intermediate.
     /// Returns `Err(ArithmeticError::DivisionByZero)` on zero divisor.
+    ///
+    /// Fast path (perf, rank-13): when `a * SCALE` fits in i128 the software
+    /// i256 ops are skipped. `checked_div` guards the single i128 division
+    /// overflow case (`i128::MIN / -1`), which falls through to the i256
+    /// path and reports `Overflow` exactly as before. Bit-identical for ALL
+    /// inputs (same truncation-toward-zero semantics); proven by the
+    /// differential test in `tests/fixed_point_fast_path.rs`.
     pub fn checked_div(self, rhs: Self) -> Result<Self, ArithmeticError> {
         if rhs.0 == 0 {
             return Err(ArithmeticError::DivisionByZero);
+        }
+        if let Some(scaled) = self.0.checked_mul(Self::SCALE) {
+            if let Some(quotient) = scaled.checked_div(rhs.0) {
+                return Ok(FixedPoint(quotient));
+            }
         }
         use ethnum::i256;
         let result = i256::from(self.0) * i256::from(Self::SCALE) / i256::from(rhs.0);
