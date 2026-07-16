@@ -3760,6 +3760,257 @@ impl TorusApp {
 }
 
 #[cfg(test)]
+mod exec_throttle_tests {
+    use super::*;
+    use torus_types::{NativeAction, B256};
+
+    /// Serialize tests that mutate process-global env vars (parallel test
+    /// threads share the environment). Poisoning is irrelevant — take the lock
+    /// either way.
+    pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    #[test]
+    fn watermark_parse_rejects_malformed_and_accepts_valid() {
+        assert_eq!(parse_exec_throttle_watermarks(None), None);
+        assert_eq!(parse_exec_throttle_watermarks(Some("".into())), None);
+        assert_eq!(parse_exec_throttle_watermarks(Some("  ".into())), None);
+        assert_eq!(parse_exec_throttle_watermarks(Some("16,32".into())), None);
+        assert_eq!(
+            parse_exec_throttle_watermarks(Some("16,32,48,64".into())),
+            None
+        );
+        assert_eq!(parse_exec_throttle_watermarks(Some("a,b,c".into())), None);
+        assert_eq!(
+            parse_exec_throttle_watermarks(Some("48,32,16".into())),
+            None,
+            "non-ascending watermarks must disable pacing, not misfire"
+        );
+        assert_eq!(
+            parse_exec_throttle_watermarks(Some("16,32,48".into())),
+            Some([16, 32, 48])
+        );
+        assert_eq!(
+            parse_exec_throttle_watermarks(Some(" 16 , 32 , 48 ".into())),
+            Some([16, 32, 48]),
+            "whitespace around watermarks is tolerated"
+        );
+    }
+
+    #[test]
+    fn throttle_tier_maps_backlog_to_tiers() {
+        let wm = Some([16, 32, 48]);
+        assert_eq!(exec_throttle_tier(0, wm), 0);
+        assert_eq!(exec_throttle_tier(15, wm), 0);
+        assert_eq!(exec_throttle_tier(16, wm), 1);
+        assert_eq!(exec_throttle_tier(31, wm), 1);
+        assert_eq!(exec_throttle_tier(32, wm), 2);
+        assert_eq!(exec_throttle_tier(47, wm), 2);
+        assert_eq!(exec_throttle_tier(48, wm), 3);
+        assert_eq!(exec_throttle_tier(u64::MAX, wm), 3);
+        // Unset watermarks: always tier 0 — static caps, bit-identical to today.
+        assert_eq!(exec_throttle_tier(u64::MAX, None), 0);
+    }
+
+    #[test]
+    fn paced_caps_scale_and_floor() {
+        use torus_mempool::rate_limit::NATIVE_ORDERS_PER_BATCH_CAP;
+        // Tier 0: caps handed through untouched.
+        assert_eq!(
+            paced_selection_caps(0, 100, 6_000_000, 50_000),
+            PacedSelectionCaps::Select {
+                action_cap: 100,
+                bytes_cap: 6_000_000,
+                orders_cap: 50_000
+            }
+        );
+        // Tier 1: half. Tier 2: quarter.
+        assert_eq!(
+            paced_selection_caps(1, 100, 6_000_000, 50_000),
+            PacedSelectionCaps::Select {
+                action_cap: 50,
+                bytes_cap: 3_000_000,
+                orders_cap: 25_000
+            }
+        );
+        assert_eq!(
+            paced_selection_caps(2, 100, 6_000_000, 50_000),
+            PacedSelectionCaps::Select {
+                action_cap: 25,
+                bytes_cap: 1_500_000,
+                orders_cap: 12_500
+            }
+        );
+        // Tier 3 (and anything deeper): cancels-only.
+        assert_eq!(
+            paced_selection_caps(3, 100, 6_000_000, 50_000),
+            PacedSelectionCaps::CancelsOnly
+        );
+        // Floors: at least 1 action and one legal batch of orders — a paced
+        // proposer must never wedge its own selection to permanently-empty.
+        assert_eq!(
+            paced_selection_caps(2, 2, 100, 10),
+            PacedSelectionCaps::Select {
+                action_cap: 1,
+                bytes_cap: 25,
+                orders_cap: NATIVE_ORDERS_PER_BATCH_CAP
+            }
+        );
+    }
+
+    fn signed_action(seed_byte: u8, nonce: u64, action: NativeAction) -> torus_types::SignedNativeAction {
+        let key = k256::ecdsa::SigningKey::from_slice(&[seed_byte; 32]).unwrap();
+        torus_types::eip712::sign_native_action(action, nonce, &key)
+    }
+
+    /// Integration (the rank-1 mechanism end-to-end): with watermarks set and a
+    /// deep LOCAL exec backlog, `select_block_payload` selects ONLY cancels
+    /// (deepest tier) while non-cancels stay pooled; once the backlog clears,
+    /// the same call returns EVERYTHING still pooled — pacing defers, never
+    /// drops, so total orders eventually committed equals orders submitted.
+    #[test]
+    fn select_block_payload_paces_by_exec_backlog_and_never_sheds() {
+        let _guard = env_lock();
+        std::env::set_var("TORUS_EXEC_THROTTLE_WATERMARKS", "4,8,12");
+
+        let (config, state_db) = {
+            // Reuse the crash-test fixture helpers (same file, different module).
+            use std::sync::atomic::{AtomicU64 as CounterU64, Ordering as CounterOrdering};
+            static COUNTER: CounterU64 = CounterU64::new(9000);
+            let id = COUNTER.fetch_add(1, CounterOrdering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "torus-throttle-test-{}-{}",
+                std::process::id(),
+                id
+            ));
+            let _ = std::fs::create_dir_all(&dir);
+            let state_db = StateDb::open(&dir).expect("open test db");
+            let config = ChainConfig {
+                chain_id: torus_evm::TORUS_CHAIN_ID,
+                chain_name: "throttle-test".to_string(),
+                evm_gas_limit: 30_000_000,
+                base_fee_per_gas: 1_000_000_000,
+                epoch_length: 100,
+                max_validators: 4,
+                min_stake: torus_economics::MIN_SELF_DELEGATION,
+                fee_burn_bps: 1000,
+                fee_validator_bps: 0,
+                fee_treasury_bps: 4500,
+                fee_dev_pool_bps: 4500,
+                treasury_address: Address::ZERO,
+                dev_pool_address: Address::ZERO,
+                timeout_base_ms: 500,
+                backoff_factor: 2,
+                backoff_cap: 8,
+                reputation_leader_selection: false,
+                exec_trust_cache: false,
+            };
+            (config, state_db)
+        };
+        let mempool = Arc::new(Mempool::new(
+            state_db.clone(),
+            torus_mempool::MempoolConfig::default(),
+        ));
+        let base = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        // 3 new orders + 2 cancels from distinct senders, all fresh nonces.
+        for i in 0..3u8 {
+            let a = signed_action(i + 1, base + i as u64, NativeAction::ClaimRewards);
+            let s = a.recover_sender().unwrap();
+            mempool.add_native_action_presigned(s, a).unwrap();
+        }
+        for i in 0..2u8 {
+            let a = signed_action(
+                i + 50,
+                base + 100 + i as u64,
+                NativeAction::CancelOrder {
+                    order_id: i as u128,
+                },
+            );
+            let s = a.recover_sender().unwrap();
+            mempool.add_native_action_presigned(s, a).unwrap();
+        }
+
+        let app = TorusApp::new(state_db.clone(), &config, None, Some(mempool), None);
+        assert_eq!(app.last_header.height, 0, "fresh chain");
+
+        // Deep backlog (>= w3): cancels-only.
+        app.exec_queue_len.store(12, Ordering::Relaxed);
+        let (paced, _evm) = app.select_block_payload(0, 30_000_000, B256::ZERO);
+        assert_eq!(paced.len(), 2, "cancels-only tier selects exactly the cancels");
+        assert!(
+            paced
+                .iter()
+                .all(|(_, a)| torus_mempool::is_cancel(&a.action)),
+            "no new orders may be placed at the deepest tier"
+        );
+
+        // Backlog cleared: the SAME pooled actions all select — nothing was shed.
+        app.exec_queue_len.store(0, Ordering::Relaxed);
+        let (full, _evm) = app.select_block_payload(0, 30_000_000, B256::ZERO);
+        assert_eq!(
+            full.len(),
+            5,
+            "pacing defers selection; once the backlog clears every submitted action is still selectable"
+        );
+
+        std::env::remove_var("TORUS_EXEC_THROTTLE_WATERMARKS");
+    }
+
+    /// The strict-order deferred buffer (rank-2 backpressure parks and heal
+    /// holes) counts toward the pacing backlog too: channel depth alone would
+    /// under-report how far execution actually lags.
+    #[test]
+    fn deferred_exec_counts_toward_pacing_backlog() {
+        let _guard = env_lock();
+        std::env::set_var("TORUS_EXEC_THROTTLE_WATERMARKS", "4,8,12");
+
+        let mut app = TorusApp::stub();
+        let mempool = Arc::new(Mempool::new(
+            app.state_db.clone(),
+            torus_mempool::MempoolConfig::default(),
+        ));
+        let base = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let a = signed_action(7, base, NativeAction::ClaimRewards);
+        let s = a.recover_sender().unwrap();
+        mempool.add_native_action_presigned(s, a).unwrap();
+        let c = signed_action(8, base + 1, NativeAction::CancelOrder { order_id: 9 });
+        let sc = c.recover_sender().unwrap();
+        mempool.add_native_action_presigned(sc, c).unwrap();
+        app.mempool = Some(mempool);
+
+        // No channel depth, but 12 heights parked in the deferred buffer.
+        app.exec_queue_len.store(0, Ordering::Relaxed);
+        for h in 1..=12u64 {
+            app.deferred_exec.insert(
+                h,
+                DeferredExecBlock {
+                    source: ExecSource::Durable(h),
+                    slashes: Vec::new(),
+                },
+            );
+        }
+        let (paced, _evm) = app.select_block_payload(0, 30_000_000, B256::ZERO);
+        assert_eq!(paced.len(), 1, "deep deferred buffer alone must pace to cancels-only");
+        assert!(torus_mempool::is_cancel(&paced[0].1.action));
+
+        app.deferred_exec.clear();
+        let (full, _evm) = app.select_block_payload(0, 30_000_000, B256::ZERO);
+        assert_eq!(full.len(), 2, "clearing the buffer restores full selection");
+
+        std::env::remove_var("TORUS_EXEC_THROTTLE_WATERMARKS");
+    }
+}
+
+#[cfg(test)]
 mod in_flight_ledger_tests {
     use super::*;
     use torus_types::B256;

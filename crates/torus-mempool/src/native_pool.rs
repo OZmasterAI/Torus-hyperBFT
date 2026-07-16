@@ -881,6 +881,79 @@ mod tests {
         assert_eq!(third[0].1.nonce, 99);
     }
 
+    /// Rank-1 (Package D) exec-backlog pacing, deepest tier: cancels-only
+    /// selection must take ONLY cancel actions (which sort first — the scan
+    /// stops at the first non-cancel), honor the exclude set and byte budget,
+    /// and stay NON-destructive: paced-out non-cancels remain pooled and fully
+    /// selectable by the normal path afterwards (pacing, not shedding).
+    #[test]
+    fn cancels_only_selection_takes_only_cancels_nondestructively() {
+        let mut pool = NativePool::new(100, 64, 16);
+        // 3 non-cancels + 3 cancels across distinct senders.
+        for i in 0..3u8 {
+            pool.insert(
+                Address::repeat_byte(i + 1),
+                make_action(10 + i as u64, NativeAction::ClaimRewards),
+            )
+            .unwrap();
+        }
+        let mut cancel_hashes = Vec::new();
+        let mut cancel_len = 0usize;
+        for i in 0..3u8 {
+            let a = make_action(
+                20 + i as u64,
+                NativeAction::CancelOrder {
+                    order_id: i as u128,
+                },
+            );
+            cancel_len = bincode::serialized_size(&a).unwrap() as usize;
+            cancel_hashes.push(compute_action_hash(&a));
+            pool.insert(Address::repeat_byte(i + 10), a).unwrap();
+        }
+
+        let sel = pool.select_cancels_for_block_with_senders_excluding(
+            100,
+            &HashSet::new(),
+            usize::MAX,
+            usize::MAX,
+        );
+        assert_eq!(sel.len(), 3, "exactly the cancels are selected");
+        assert!(
+            sel.iter().all(|(_, a)| is_cancel(&a.action)),
+            "cancels-only mode must never select a non-cancel"
+        );
+        assert_eq!(pool.size(), 6, "selection is non-destructive");
+
+        // Exclude one in-flight cancel: only the other two come back.
+        let exclude: HashSet<B256> = [cancel_hashes[0]].into_iter().collect();
+        let sel2 = pool.select_cancels_for_block_with_senders_excluding(
+            100,
+            &exclude,
+            usize::MAX,
+            usize::MAX,
+        );
+        assert_eq!(sel2.len(), 2, "in-flight cancels are excluded");
+
+        // Byte budget applies to cancels too (deterministic prefix).
+        let sel3 = pool.select_cancels_for_block_with_senders_excluding(
+            100,
+            &HashSet::new(),
+            cancel_len * 2,
+            usize::MAX,
+        );
+        assert_eq!(sel3.len(), 2, "byte budget bounds the cancel prefix");
+
+        // The paced-out non-cancels are STILL selectable by the normal path —
+        // nothing was dropped by the cancels-only tier.
+        let normal = pool.select_for_block_with_senders_excluding(
+            100,
+            &HashSet::new(),
+            usize::MAX,
+            usize::MAX,
+        );
+        assert_eq!(normal.len(), 6, "pacing defers non-cancels, never drops them");
+    }
+
     #[test]
     fn order_budget_bounds_selection_and_preserves_cancels_first() {
         let mut pool = NativePool::new(100, 64, 16);
