@@ -334,7 +334,7 @@ impl PendingState {
     /// and is silently skipped on the DELETE path.
     fn append_to_batch(&self, db: &rocksdb::DB, batch: &mut WriteBatch) -> Result<(), StateError> {
         for (idx, cfp) in self.cfs.iter().enumerate() {
-            let name = crate::cf::ALL_CF_NAMES[idx];
+            let name = CfId(idx as u8).name();
             if !cfp.writes.is_empty() {
                 let cf = db
                     .cf_handle(name)
@@ -360,7 +360,7 @@ impl PendingState {
     fn native_dirty(&self) -> BTreeMap<(u8, Vec<u8>), Option<Vec<u8>>> {
         let mut dirty: BTreeMap<(u8, Vec<u8>), Option<Vec<u8>>> = BTreeMap::new();
         for (idx, cfp) in self.cfs.iter().enumerate() {
-            let Some(tag) = crate::native_trie::cf_tag(crate::cf::ALL_CF_NAMES[idx]) else {
+            let Some(tag) = crate::native_trie::cf_tag(CfId(idx as u8).name()) else {
                 continue;
             };
             for (key, value) in &cfp.writes {
