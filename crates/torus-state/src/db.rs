@@ -154,6 +154,43 @@ impl StateDb {
         Ok(())
     }
 
+    /// Apply a WriteBatch with an optional WAL bypass (RH4). When `disable_wal`
+    /// is `true` the write skips the write-ahead log: it is durable only once the
+    /// memtable flushes, so a crash can lose the most recent such writes. Callers
+    /// MUST only pass `true` for data that is re-obtainable after a crash (e.g.
+    /// native-DA bodies, recoverable via the `/torus/native-da/1.0` pull path).
+    /// Every other CF keeps full WAL durability via [`write`](Self::write).
+    pub fn write_opt(&self, batch: WriteBatch, disable_wal: bool) -> Result<(), StateError> {
+        if disable_wal {
+            let mut wo = rocksdb::WriteOptions::default();
+            wo.disable_wal(true);
+            self.db.write_opt(batch, &wo)?;
+        } else {
+            self.db.write(batch)?;
+        }
+        Ok(())
+    }
+
+    /// Put a raw value into a column family with an optional WAL bypass (RH4).
+    /// See [`write_opt`](Self::write_opt) for the crash-durability contract.
+    pub fn put_cf_raw_opt(
+        &self,
+        cf_name: &str,
+        key: &[u8],
+        value: &[u8],
+        disable_wal: bool,
+    ) -> Result<(), StateError> {
+        let cf = self.cf(cf_name)?;
+        if disable_wal {
+            let mut wo = rocksdb::WriteOptions::default();
+            wo.disable_wal(true);
+            self.db.put_cf_opt(cf, key, value, &wo)?;
+        } else {
+            self.db.put_cf(cf, key, value)?;
+        }
+        Ok(())
+    }
+
     // ---- Account operations (cf_accounts) ----
 
     /// Get account info by address. Returns `None` for non-existent accounts.

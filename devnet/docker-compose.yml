@@ -39,6 +39,13 @@ services:
       # when set; default true = current behavior (CLI default ON since s376).
       - TORUS_EXEC_TRUST_CACHE=${TORUS_EXEC_TRUST_CACHE:-true}
       - TORUS_ASYNC_BODY_PERSIST=${TORUS_ASYNC_BODY_PERSIST:-false}
+      # RH4: durable DA-body hygiene. disable_wal bypasses the WAL for
+      # CF_NATIVE_PENDING body puts (bodies are re-obtainable via the
+      # /torus/native-da/1.0 pull path, so crash-loss only forces a re-pull);
+      # body-retention GC-deletes committed bodies this many blocks after their
+      # commit height (the window comfortably exceeds any live push-race lag).
+      - TORUS_DA_DISABLE_WAL=${TORUS_DA_DISABLE_WAL:-true}
+      - TORUS_DA_BODY_RETENTION=${TORUS_DA_BODY_RETENTION:-128}
     volumes:
       - ./genesis.json:/genesis/genesis.json:ro
       - validator-0-data:/data
@@ -79,6 +86,13 @@ services:
       # when set; default true = current behavior (CLI default ON since s376).
       - TORUS_EXEC_TRUST_CACHE=${TORUS_EXEC_TRUST_CACHE:-true}
       - TORUS_ASYNC_BODY_PERSIST=${TORUS_ASYNC_BODY_PERSIST:-false}
+      # RH4: durable DA-body hygiene. disable_wal bypasses the WAL for
+      # CF_NATIVE_PENDING body puts (bodies are re-obtainable via the
+      # /torus/native-da/1.0 pull path, so crash-loss only forces a re-pull);
+      # body-retention GC-deletes committed bodies this many blocks after their
+      # commit height (the window comfortably exceeds any live push-race lag).
+      - TORUS_DA_DISABLE_WAL=${TORUS_DA_DISABLE_WAL:-true}
+      - TORUS_DA_BODY_RETENTION=${TORUS_DA_BODY_RETENTION:-128}
     volumes:
       - ./genesis.json:/genesis/genesis.json:ro
       - validator-1-data:/data
@@ -118,6 +132,13 @@ services:
       # when set; default true = current behavior (CLI default ON since s376).
       - TORUS_EXEC_TRUST_CACHE=${TORUS_EXEC_TRUST_CACHE:-true}
       - TORUS_ASYNC_BODY_PERSIST=${TORUS_ASYNC_BODY_PERSIST:-false}
+      # RH4: durable DA-body hygiene. disable_wal bypasses the WAL for
+      # CF_NATIVE_PENDING body puts (bodies are re-obtainable via the
+      # /torus/native-da/1.0 pull path, so crash-loss only forces a re-pull);
+      # body-retention GC-deletes committed bodies this many blocks after their
+      # commit height (the window comfortably exceeds any live push-race lag).
+      - TORUS_DA_DISABLE_WAL=${TORUS_DA_DISABLE_WAL:-true}
+      - TORUS_DA_BODY_RETENTION=${TORUS_DA_BODY_RETENTION:-128}
     volumes:
       - ./genesis.json:/genesis/genesis.json:ro
       - validator-2-data:/data
@@ -157,6 +178,13 @@ services:
       # when set; default true = current behavior (CLI default ON since s376).
       - TORUS_EXEC_TRUST_CACHE=${TORUS_EXEC_TRUST_CACHE:-true}
       - TORUS_ASYNC_BODY_PERSIST=${TORUS_ASYNC_BODY_PERSIST:-false}
+      # RH4: durable DA-body hygiene. disable_wal bypasses the WAL for
+      # CF_NATIVE_PENDING body puts (bodies are re-obtainable via the
+      # /torus/native-da/1.0 pull path, so crash-loss only forces a re-pull);
+      # body-retention GC-deletes committed bodies this many blocks after their
+      # commit height (the window comfortably exceeds any live push-race lag).
+      - TORUS_DA_DISABLE_WAL=${TORUS_DA_DISABLE_WAL:-true}
+      - TORUS_DA_BODY_RETENTION=${TORUS_DA_BODY_RETENTION:-128}
     volumes:
       - ./genesis.json:/genesis/genesis.json:ro
       - validator-3-data:/data
@@ -197,6 +225,13 @@ services:
       # rpc-node included: --rpc-only nodes execute committed blocks too.
       - TORUS_EXEC_TRUST_CACHE=${TORUS_EXEC_TRUST_CACHE:-true}
       - TORUS_ASYNC_BODY_PERSIST=${TORUS_ASYNC_BODY_PERSIST:-false}
+      # RH4: durable DA-body hygiene. disable_wal bypasses the WAL for
+      # CF_NATIVE_PENDING body puts (bodies are re-obtainable via the
+      # /torus/native-da/1.0 pull path, so crash-loss only forces a re-pull);
+      # body-retention GC-deletes committed bodies this many blocks after their
+      # commit height (the window comfortably exceeds any live push-race lag).
+      - TORUS_DA_DISABLE_WAL=${TORUS_DA_DISABLE_WAL:-true}
+      - TORUS_DA_BODY_RETENTION=${TORUS_DA_BODY_RETENTION:-128}
     volumes:
       - ./genesis.json:/genesis/genesis.json:ro
       - rpc-node-data:/data

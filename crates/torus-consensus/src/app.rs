@@ -161,6 +161,61 @@ fn env_flag(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// RH4: DA-body GC retention window in blocks, from `TORUS_DA_BODY_RETENTION`.
+///
+/// A mirrored body is deleted once its commit height is this many blocks behind
+/// the current committed tip — the point past which no local reconstruct and no
+/// lagging peer's push-race pull can still need it. Default 128 (≈25 s at the
+/// idle ~5 blk/s cadence, far beyond the few-view live push-race window served
+/// by `/torus/native-da/1.0`). `0` disables GC (archive: mirror stays
+/// write-only). Unparseable → default, so a typo never silently disables GC.
+fn da_body_retention() -> u64 {
+    match std::env::var("TORUS_DA_BODY_RETENTION") {
+        Ok(v) => v.trim().parse::<u64>().unwrap_or(128),
+        Err(_) => 128,
+    }
+}
+
+/// RH4 GC windowing (pure, testable). Pushes `committed_hashes` for `height`
+/// onto the retention FIFO, then pops and returns the body-hashes of every
+/// buffered height that has aged strictly outside the window
+/// (`commit_height <= height - retention`). The FIFO is left holding only the
+/// in-window heights, so a body survives exactly `retention` blocks past its
+/// commit before becoming eligible for deletion.
+///
+/// Deferred (not commit-instant) because a lagging peer still executing that
+/// height reconstructs its `CompactBlock` bodies via the `/torus/native-da/1.0`
+/// pull path we serve; deleting at the local commit instant would recreate the
+/// missing-body stall (`missing_action_rejections` 0→nonzero, the R1 signature).
+/// The retention window (default 128 blocks) comfortably exceeds that live
+/// push-race lag. Committed-only: expired-but-never-committed bodies are NOT
+/// GC'd here — pool expiry is local-clock (`evict_expired` uses `now_ms`), so a
+/// peer could still include an action the instant before our local expiry.
+fn drain_da_gc_window(
+    pending: &mut std::collections::VecDeque<(u64, Vec<torus_types::B256>)>,
+    height: u64,
+    retention: u64,
+    committed_hashes: Vec<torus_types::B256>,
+) -> Vec<torus_types::B256> {
+    if !committed_hashes.is_empty() {
+        pending.push_back((height, committed_hashes));
+    }
+    // A body committed at height `h` is deletable once `h + retention <= tip`.
+    // The additive form (vs `h <= tip - retention`) is correct at genesis: with
+    // `tip < retention` nothing ages out, whereas `saturating_sub` would floor
+    // the cutoff to 0 and wrongly delete height 0.
+    let mut to_delete: Vec<torus_types::B256> = Vec::new();
+    while let Some((h, _)) = pending.front() {
+        if h.saturating_add(retention) <= height {
+            let (_, hashes) = pending.pop_front().expect("front just peeked");
+            to_delete.extend(hashes);
+        } else {
+            break;
+        }
+    }
+    to_delete
+}
+
 fn read_native_applied_height(state_db: &StateDb) -> Option<u64> {
     state_db
         .get_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT)
@@ -783,6 +838,17 @@ pub struct TorusApp {
     /// when the mempool or fetcher is absent (consensus-only tests) — a miss
     /// then fails the view without a handoff, same as before BS-4a.
     da_recovery: Option<DaRecoveryWorker>,
+    /// RH4 durable DA-body GC. `> 0` enables deferred deletion of mirrored
+    /// native-action bodies (`CF_NATIVE_PENDING`) `da_gc_retention` blocks after
+    /// their commit height — the point past which neither a local reconstruct nor
+    /// a lagging peer's push-race recovery can still need them. `0` = disabled
+    /// (archive; the mirror stays write-only, pre-RH4 behavior). From
+    /// `TORUS_DA_BODY_RETENTION` (default 128).
+    da_gc_retention: u64,
+    /// FIFO of `(commit_height, committed_action_hashes)` awaiting GC. Drained
+    /// front-to-back each commit as heights fall outside the retention window;
+    /// bounded by `da_gc_retention` heights of committed actions.
+    da_gc_pending: std::collections::VecDeque<(u64, Vec<torus_types::B256>)>,
 }
 
 /// Actions the proposer pushes to validators via unicast before broadcasting CompactBlock.
@@ -1280,6 +1346,8 @@ impl TorusApp {
             pre_proposal_tx: None,
             da_fetcher: None,
             da_recovery: None,
+            da_gc_retention: da_body_retention(),
+            da_gc_pending: std::collections::VecDeque::new(),
         }
     }
 
@@ -2259,14 +2327,39 @@ impl App<RocksKVStore> for TorusApp {
             "on_committed_block: sending to execution pipeline"
         );
 
-        if !torus_block.native_actions.is_empty() {
+        let committed_hashes: Vec<torus_types::B256> = if torus_block.native_actions.is_empty() {
+            Vec::new()
+        } else {
+            torus_block
+                .native_actions
+                .iter()
+                .map(torus_types::compute_action_hash)
+                .collect()
+        };
+        if !committed_hashes.is_empty() {
             if let Some(ref mempool) = self.mempool {
-                let hashes: Vec<torus_types::B256> = torus_block
-                    .native_actions
-                    .iter()
-                    .map(torus_types::compute_action_hash)
-                    .collect();
-                mempool.remove_committed_native(&hashes);
+                mempool.remove_committed_native(&committed_hashes);
+            }
+        }
+
+        // RH4 durable DA-body GC: record this height's committed body-hashes and
+        // delete the bodies of heights that have now aged out of the retention
+        // window. Runs every commit (even native-empty ones) so the window slides
+        // and the FIFO drains. Bounded per-commit work; best-effort.
+        if self.da_gc_retention > 0 {
+            let to_delete = drain_da_gc_window(
+                &mut self.da_gc_pending,
+                height,
+                self.da_gc_retention,
+                committed_hashes,
+            );
+            if !to_delete.is_empty() {
+                if let Some(ref mempool) = self.mempool {
+                    let deleted = mempool.gc_native_da_bodies(&to_delete);
+                    if let Some(ref m) = self.metrics {
+                        m.da_bodies_gc_deleted.inc_by(deleted as u64);
+                    }
+                }
             }
         }
 
@@ -2403,6 +2496,61 @@ mod in_flight_ledger_tests {
         ledger.note(7, [h(2)]);
         ledger.extend_into(&mut in_flight);
         assert!(in_flight.contains(&h(1)) && in_flight.contains(&h(2)));
+    }
+}
+
+#[cfg(test)]
+mod da_gc_window_tests {
+    use super::*;
+    use torus_types::B256;
+
+    fn h(n: u8) -> B256 {
+        B256::from([n; 32])
+    }
+
+    /// A body inside the retention window survives; one that ages strictly
+    /// outside it is returned for deletion.
+    #[test]
+    fn window_keeps_recent_and_deletes_aged() {
+        let mut q = std::collections::VecDeque::new();
+        // retention 4: a body committed at height H is deletable once tip >= H+4.
+        // Commit h(1)@10, h(2)@11.
+        assert!(drain_da_gc_window(&mut q, 10, 4, vec![h(1)]).is_empty());
+        assert!(drain_da_gc_window(&mut q, 11, 4, vec![h(2)]).is_empty());
+        // Tip 13: 10 <= 13-4=9? no. Nothing aged out yet — both in window.
+        assert!(drain_da_gc_window(&mut q, 13, 4, vec![]).is_empty());
+        // Tip 14: cutoff 10, 10 <= 10 -> height 10's body (h(1)) is deleted;
+        // height 11 (h(2)) still in window.
+        assert_eq!(drain_da_gc_window(&mut q, 14, 4, vec![]), vec![h(1)]);
+        // Tip 15: cutoff 11 -> h(2) now deleted.
+        assert_eq!(drain_da_gc_window(&mut q, 15, 4, vec![]), vec![h(2)]);
+        assert!(q.is_empty(), "FIFO fully drained");
+    }
+
+    /// Multiple hashes per committed height are all deleted together when that
+    /// height ages out, and native-empty heights buffer nothing.
+    #[test]
+    fn window_deletes_all_hashes_of_an_aged_height() {
+        let mut q = std::collections::VecDeque::new();
+        drain_da_gc_window(&mut q, 100, 2, vec![h(1), h(2), h(3)]);
+        // native-empty commits advance the window without buffering.
+        drain_da_gc_window(&mut q, 101, 2, vec![]);
+        // Tip 102: cutoff 100, 100 <= 100 -> all three bodies of height 100 go.
+        let deleted = drain_da_gc_window(&mut q, 102, 2, vec![]);
+        assert_eq!(deleted, vec![h(1), h(2), h(3)]);
+        assert!(q.is_empty());
+    }
+
+    /// A large retention window keeps everything (archive-ish); nothing deleted
+    /// until the tip climbs past commit_height + retention.
+    #[test]
+    fn window_large_retention_keeps_all() {
+        let mut q = std::collections::VecDeque::new();
+        for height in 0..50u64 {
+            let del = drain_da_gc_window(&mut q, height, 1000, vec![h(height as u8)]);
+            assert!(del.is_empty(), "retention 1000: nothing aged out by height {height}");
+        }
+        assert_eq!(q.len(), 50, "all committed heights still buffered");
     }
 }
 

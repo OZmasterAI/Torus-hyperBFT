@@ -40,6 +40,30 @@ fn arrivals() -> &'static ArrivalNotifier {
     })
 }
 
+/// RH4: whether native-DA body puts bypass the write-ahead log.
+///
+/// Bodies in [`CF_NATIVE_PENDING`] are re-obtainable after a crash via the
+/// `/torus/native-da/1.0` pull/recovery path, so WAL durability for them buys
+/// only the avoidance of a re-pull — while every put otherwise pays a WAL append
+/// + (grouped) fsync on the ingest/produce hot path. Gated by
+/// `TORUS_DA_DISABLE_WAL` (default OFF, same hygiene as `TORUS_ASYNC_BODY_PERSIST`);
+/// read once and cached. Only native-DA body writes consult this — no other CF
+/// shares these write calls, so no other CF loses WAL durability.
+fn da_disable_wal() -> bool {
+    static DISABLE_WAL: OnceLock<bool> = OnceLock::new();
+    *DISABLE_WAL.get_or_init(|| {
+        std::env::var("TORUS_DA_DISABLE_WAL")
+            .ok()
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "on" | "yes"
+                )
+            })
+            .unwrap_or(false)
+    })
+}
+
 /// Durable, nonce-gate-decoupled store of native-action bodies keyed by action-hash.
 ///
 /// CF-backed (survives restart). Cheap to clone — it shares the underlying
@@ -63,8 +87,12 @@ impl NativeDaStore {
         let hash = compute_action_hash(action);
         let bytes =
             bincode::serialize(action).map_err(|e| StateError::InvalidData(e.to_string()))?;
-        self.db
-            .put_cf_raw(CF_NATIVE_PENDING, hash.as_slice(), &bytes)?;
+        self.db.put_cf_raw_opt(
+            CF_NATIVE_PENDING,
+            hash.as_slice(),
+            &bytes,
+            da_disable_wal(),
+        )?;
         let notifier = arrivals();
         let mut generation = notifier
             .generation
@@ -94,7 +122,7 @@ impl NativeDaStore {
                 bincode::serialize(action).map_err(|e| StateError::InvalidData(e.to_string()))?;
             batch.put_cf(cf, hash.as_slice(), &bytes);
         }
-        self.db.write(batch)?;
+        self.db.write_opt(batch, da_disable_wal())?;
         let notifier = arrivals();
         let mut generation = notifier
             .generation
@@ -161,6 +189,26 @@ impl NativeDaStore {
             self.db.delete_cf_raw(CF_NATIVE_PENDING, h.as_slice())?;
         }
         Ok(())
+    }
+
+    /// RH4 body GC: delete many bodies in ONE atomic `WriteBatch`, returning the
+    /// number of delete tombstones issued (== `hashes.len()`; absent keys are
+    /// harmless no-ops). Called from the commit path once an action's body has
+    /// aged past the DA retention window (`TORUS_DA_BODY_RETENTION` blocks after
+    /// its commit height), after which no local reconstruct and no lagging peer's
+    /// push-race recovery can still need it. Empty input is a no-op. Deletes obey
+    /// the same WAL policy as the body puts ([`da_disable_wal`]).
+    pub fn remove_batch(&self, hashes: &[B256]) -> Result<usize, StateError> {
+        if hashes.is_empty() {
+            return Ok(0);
+        }
+        let mut batch = rocksdb::WriteBatch::default();
+        let cf = self.db.cf_handle(CF_NATIVE_PENDING)?;
+        for h in hashes {
+            batch.delete_cf(cf, h.as_slice());
+        }
+        self.db.write_opt(batch, da_disable_wal())?;
+        Ok(hashes.len())
     }
 
     /// Presence check by action-hash WITHOUT copying the body. The pre-warm pull
@@ -230,6 +278,59 @@ mod tests {
             start.elapsed() < std::time::Duration::from_millis(1_000),
             "waiter must wake on the arrival, not ride out the timeout (elapsed {:?})",
             start.elapsed()
+        );
+    }
+
+    /// RH4: `remove_batch` deletes exactly the named bodies in one atomic batch,
+    /// leaves the rest intact, and reports the number of tombstones issued.
+    #[test]
+    fn remove_batch_deletes_named_bodies() {
+        let (_dir, store) = temp_store();
+        let keep = dummy_action(1);
+        let drop = dummy_action(2);
+        store.put(&keep).expect("put keep");
+        store.put(&drop).expect("put drop");
+        let keep_h = compute_action_hash(&keep);
+        let drop_h = compute_action_hash(&drop);
+        assert!(store.get(&keep_h).expect("get keep").is_some());
+        assert!(store.get(&drop_h).expect("get drop").is_some());
+
+        let n = store.remove_batch(&[drop_h]).expect("remove_batch");
+        assert_eq!(n, 1, "one tombstone issued");
+        assert!(
+            store.get(&drop_h).expect("get drop").is_none(),
+            "GC'd body must be gone"
+        );
+        assert!(
+            store.get(&keep_h).expect("get keep").is_some(),
+            "in-window body must survive"
+        );
+
+        // Empty input is a no-op; deleting an absent key is harmless.
+        assert_eq!(store.remove_batch(&[]).expect("empty"), 0);
+        assert_eq!(store.remove_batch(&[drop_h]).expect("re-remove"), 1);
+    }
+
+    /// RH4: a body written with the WAL bypassed (`disable_wal=true`) is still
+    /// immediately readable — the memtable serves it regardless of WAL policy;
+    /// only crash-recovery durability differs. Exercised at the db layer so the
+    /// process-global `da_disable_wal()` cache does not couple to other tests.
+    #[test]
+    fn disable_wal_put_is_readable() {
+        let (_dir, store) = temp_store();
+        let key = [3u8; 32];
+        store
+            .db
+            .put_cf_raw_opt(CF_NATIVE_PENDING, &key, b"wal-bypassed-body", true)
+            .expect("wal-bypassed put");
+        assert_eq!(
+            store
+                .db
+                .get_cf_raw(CF_NATIVE_PENDING, &key)
+                .expect("get")
+                .as_deref(),
+            Some(b"wal-bypassed-body".as_slice()),
+            "wal-bypassed body must be readable from the memtable"
         );
     }
 

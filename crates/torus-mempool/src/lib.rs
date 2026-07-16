@@ -842,6 +842,20 @@ impl Mempool {
         }
     }
 
+    /// RH4 body GC: delete durable DA bodies whose commit height has aged past
+    /// the retention window. Returns the number of delete tombstones issued.
+    /// Best-effort: a write failure is logged, never propagated (GC must never
+    /// disturb the commit path). See [`NativeDaStore::remove_batch`].
+    pub fn gc_native_da_bodies(&self, hashes: &[B256]) -> usize {
+        match self.da_store.remove_batch(hashes) {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::error!("native DA body GC failed: {e}");
+                0
+            }
+        }
+    }
+
     /// Mirror native-action bodies into the durable DA store (proposer guarantee:
     /// every body referenced by a block we propose stays reconstructable).
     /// One atomic WriteBatch + one arrival-notifier wake for the whole block —

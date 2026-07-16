@@ -326,6 +326,11 @@ pub struct Metrics {
     /// availability signal: a block-referenced body is reconstructable this fast
     /// even while ingest verify is backed up (was the 76s stall, R1 proof).
     pub native_da_mirror_actions: Counter,
+    /// RH4: durable DA-body GC deletions — mirrored native-action bodies
+    /// (`CF_NATIVE_PENDING`) removed after they fell outside the commit-retention
+    /// window (`TORUS_DA_BODY_RETENTION` blocks). Without this the mirror was
+    /// write-only and grew unboundedly (1-4.5 GB junk per bench leg per node).
+    pub da_bodies_gc_deleted: Counter,
     /// Raw inbound native bodies DROPPED before the mirror stage — the DoS shed
     /// valve: either the bounded raw-intake channel was full, or a single peer
     /// exceeded its per-peer in-flight byte budget. Recoverable via gossip
@@ -1117,6 +1122,13 @@ impl Metrics {
             native_da_mirror_actions.clone(),
         );
 
+        let da_bodies_gc_deleted = Counter::default();
+        registry.register(
+            "torus_da_bodies_gc_deleted",
+            "Mirrored native-action bodies (CF_NATIVE_PENDING) GC-deleted after leaving the commit-retention window (RH4)",
+            da_bodies_gc_deleted.clone(),
+        );
+
         let native_raw_inbound_dropped = Counter::default();
         registry.register(
             "torus_native_raw_inbound_dropped",
@@ -1317,6 +1329,7 @@ impl Metrics {
             orders_rejected,
             native_pool_inserted,
             native_da_mirror_actions,
+            da_bodies_gc_deleted,
             native_raw_inbound_dropped,
             native_verify_queue_dropped,
             native_ingest_dedup_skips,
