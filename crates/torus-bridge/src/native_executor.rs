@@ -523,63 +523,63 @@ impl NativeExecutor {
         ctx: &mut NativeExecContext<T>,
         actions: &[(Address, NativeAction)],
     ) -> NativeBatchResult {
+        // One flattened executable entry: either a PlaceOrder's params (single or
+        // batch-expanded) or any other action. C2: everything is BORROWED from the
+        // caller's `actions` slice — the old Cow flatten deep-cloned every order
+        // AND every non-place action whenever a PlaceOrderBatch was present.
+        enum FlatAction<'a> {
+            Other(&'a NativeAction),
+            Place(&'a PlaceOrderParams),
+        }
+
         // Flatten any PlaceOrderBatch into individual (sender, PlaceOrder) entries so the
         // per-market parallel matching pipeline treats batched and singly-submitted orders
-        // identically. Deterministic: actions in slice order, orders in batch order. Zero-copy
-        // on the common no-batch path via Cow::Borrowed.
-        let flattened: std::borrow::Cow<[(Address, NativeAction)]> = if actions
-            .iter()
-            .any(|(_, a)| matches!(a, NativeAction::PlaceOrderBatch(_)))
-        {
-            let mut out = Vec::with_capacity(actions.len());
-            let mut skipped_batches = 0usize;
-            for (sender, action) in actions {
-                match action {
-                    NativeAction::PlaceOrderBatch(orders) => {
-                        // G1 (O2): DETERMINISTIC exec-side cap. The RPC/admit
-                        // checks are node-local policy; this is the consensus-
-                        // critical bound. An oversize (or empty) batch is
-                        // skipped WHOLESALE — same doctrine as the replay-guard
-                        // skip (app.rs warn + continue) — the block is never
-                        // aborted, and every correct node skips identically.
-                        //
-                        // LOCKSTEP-DEPLOY: this skip is a consensus-semantics
-                        // change (a pre-upgrade node flattens+executes an
-                        // oversize batch; an upgraded node skips it → divergent
-                        // state root on a block that carries one). The whole
-                        // fleet must run this before any block can legally carry
-                        // a batch above the cap — same deploy class as the
-                        // SessionScope::Trading widening (torus-types lib.rs).
-                        if !torus_types::batch_len_within_cap(orders.len()) {
-                            // Aggregate the count; do NOT log per batch. A
-                            // malicious proposer can pack a block with thousands
-                            // of tiny empty/oversize batches under the byte cap;
-                            // per-batch WARN with %sender formatting would stall
-                            // the single exec thread every block (log-DoS).
-                            skipped_batches += 1;
-                            continue;
-                        }
-                        for p in orders {
-                            out.push((*sender, NativeAction::PlaceOrder(p.clone())));
-                        }
+        // identically. Deterministic: actions in slice order, orders in batch order.
+        let mut flat: Vec<(Address, FlatAction<'_>)> = Vec::with_capacity(actions.len());
+        let mut skipped_batches = 0usize;
+        for (sender, action) in actions {
+            match action {
+                NativeAction::PlaceOrder(p) => flat.push((*sender, FlatAction::Place(p))),
+                NativeAction::PlaceOrderBatch(orders) => {
+                    // G1 (O2): DETERMINISTIC exec-side cap. The RPC/admit
+                    // checks are node-local policy; this is the consensus-
+                    // critical bound. An oversize (or empty) batch is
+                    // skipped WHOLESALE — same doctrine as the replay-guard
+                    // skip (app.rs warn + continue) — the block is never
+                    // aborted, and every correct node skips identically.
+                    //
+                    // LOCKSTEP-DEPLOY: this skip is a consensus-semantics
+                    // change (a pre-upgrade node flattens+executes an
+                    // oversize batch; an upgraded node skips it → divergent
+                    // state root on a block that carries one). The whole
+                    // fleet must run this before any block can legally carry
+                    // a batch above the cap — same deploy class as the
+                    // SessionScope::Trading widening (torus-types lib.rs).
+                    if !torus_types::batch_len_within_cap(orders.len()) {
+                        // Aggregate the count; do NOT log per batch. A
+                        // malicious proposer can pack a block with thousands
+                        // of tiny empty/oversize batches under the byte cap;
+                        // per-batch WARN with %sender formatting would stall
+                        // the single exec thread every block (log-DoS).
+                        skipped_batches += 1;
+                        continue;
                     }
-                    other => out.push((*sender, other.clone())),
+                    for p in orders {
+                        flat.push((*sender, FlatAction::Place(p)));
+                    }
                 }
+                other => flat.push((*sender, FlatAction::Other(other))),
             }
-            if skipped_batches > 0 {
-                tracing::warn!(
-                    skipped_batches,
-                    cap = torus_types::NATIVE_ORDERS_PER_BATCH_CAP,
-                    "skipped oversize/empty PlaceOrderBatch action(s) at exec (deterministic cap)"
-                );
-            }
-            std::borrow::Cow::Owned(out)
-        } else {
-            std::borrow::Cow::Borrowed(actions)
-        };
-        let actions: &[(Address, NativeAction)] = &flattened;
+        }
+        if skipped_batches > 0 {
+            tracing::warn!(
+                skipped_batches,
+                cap = torus_types::NATIVE_ORDERS_PER_BATCH_CAP,
+                "skipped oversize/empty PlaceOrderBatch action(s) at exec (deterministic cap)"
+            );
+        }
 
-        let n = actions.len();
+        let n = flat.len();
         let mut results: Vec<NativeActionResult> = (0..n)
             .map(|_| NativeActionResult::ok("pending", 0))
             .collect();
@@ -588,10 +588,10 @@ impl NativeExecutor {
         // ---- Phase 1: Partition and execute non-PlaceOrder actions ----
         let mut place_order_indices: Vec<usize> = Vec::new();
 
-        for (i, (sender, action)) in actions.iter().enumerate() {
-            match action {
-                NativeAction::PlaceOrder(_) => place_order_indices.push(i),
-                _ => {
+        for (i, (sender, entry)) in flat.iter().enumerate() {
+            match entry {
+                FlatAction::Place(_) => place_order_indices.push(i),
+                FlatAction::Other(action) => {
                     let result = Self::execute(ctx, sender, action);
                     total_gas += result.gas_used;
                     results[i] = result;
@@ -605,15 +605,18 @@ impl NativeExecutor {
 
         // ---- Phase 2: Pre-reserve margin, assign IDs, partition by market ----
         let margin_timer = std::time::Instant::now();
-        struct PreparedOrder {
+        // C2: `params` borrows from the caller's `actions` slice — the prepared
+        // order carries an 8-byte reference through Phases 2-4 instead of a
+        // per-order deep clone of `PlaceOrderParams`.
+        struct PreparedOrder<'a> {
             index: usize,
             sender: Address,
-            params: PlaceOrderParams,
+            params: &'a PlaceOrderParams,
             order_id: u128,
             margin_reserved: FixedPoint,
         }
 
-        let mut market_batches: HashMap<MarketId, Vec<PreparedOrder>> = HashMap::new();
+        let mut market_batches: HashMap<MarketId, Vec<PreparedOrder<'_>>> = HashMap::new();
 
         // O1: write-through balance cache, scoped to this execute_batch call. Serves
         // repeated Phase 2 reserve / Phase 4 release reads for the same sender without
@@ -625,10 +628,10 @@ impl NativeExecutor {
         let mut pos_cache = PositionCache::new();
 
         for &i in &place_order_indices {
-            let (sender, action) = &actions[i];
-            let params = match action {
-                NativeAction::PlaceOrder(p) => p,
-                _ => unreachable!(),
+            let (sender, entry) = &flat[i];
+            let params: &PlaceOrderParams = match entry {
+                FlatAction::Place(p) => p,
+                FlatAction::Other(_) => unreachable!(),
             };
 
             let market_id = params.market_id;
@@ -684,7 +687,7 @@ impl NativeExecutor {
                 .push(PreparedOrder {
                     index: i,
                     sender: *sender,
-                    params: params.clone(),
+                    params,
                     order_id,
                     margin_reserved: order_margin_required,
                 });
@@ -697,7 +700,8 @@ impl NativeExecutor {
 
         // ---- Phase 3: Parallel matching ----
         let match_timer = std::time::Instant::now();
-        let mut worker_batches: HashMap<MarketId, (OrderBook, Vec<MatchRequest>)> = HashMap::new();
+        let mut worker_batches: HashMap<MarketId, (OrderBook, Vec<MatchRequest<'_>>)> =
+            HashMap::new();
 
         for (&market_id, prepared) in &market_batches {
             let book = ctx
@@ -705,11 +709,11 @@ impl NativeExecutor {
                 .remove(&market_id)
                 .unwrap_or_else(|| OrderBook::new(market_id, FixedPoint::ONE, FixedPoint::ONE));
 
-            let requests: Vec<MatchRequest> = prepared
+            let requests: Vec<MatchRequest<'_>> = prepared
                 .iter()
                 .map(|p| MatchRequest {
                     sender: p.sender,
-                    params: p.params.clone(),
+                    params: p.params,
                     order_id: p.order_id,
                 })
                 .collect();

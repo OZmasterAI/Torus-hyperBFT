@@ -316,7 +316,7 @@ fn same_trader_insufficient_margin_second_order_fails() {
 
 #[test]
 fn worker_pool_empty_batch_noop() {
-    let batches: HashMap<MarketId, (OrderBook, Vec<MatchRequest>)> = HashMap::new();
+    let batches: HashMap<MarketId, (OrderBook, Vec<MatchRequest<'_>>)> = HashMap::new();
     let results = MarketWorkerPool::match_parallel(batches, 1000).expect("no worker panicked");
     assert!(results.is_empty());
 }
@@ -324,9 +324,10 @@ fn worker_pool_empty_batch_noop() {
 #[test]
 fn worker_pool_single_market_no_thread_overhead() {
     let book = OrderBook::new(1, fp(1), fp(1));
+    let buy = limit_buy(1, 100, 5);
     let requests = vec![MatchRequest {
         sender: addr(1),
-        params: limit_buy(1, 100, 5),
+        params: &buy,
         order_id: 1,
     }];
 
@@ -348,25 +349,28 @@ fn worker_pool_multiple_markets_parallel() {
     // Pre-place a sell at 100
     book1.place_order(limit_sell(1, 100, 5), addr(10), 999);
 
+    let buy1 = limit_buy(1, 100, 5);
     let requests1 = vec![MatchRequest {
         sender: addr(1),
-        params: limit_buy(1, 100, 5),
+        params: &buy1,
         order_id: 100,
     }];
 
     // Market 2: buy only → rests
     let book2 = OrderBook::new(2, fp(1), fp(1));
+    let buy2 = limit_buy(2, 200, 3);
     let requests2 = vec![MatchRequest {
         sender: addr(2),
-        params: limit_buy(2, 200, 3),
+        params: &buy2,
         order_id: 101,
     }];
 
     // Market 3: sell only → rests
     let book3 = OrderBook::new(3, fp(1), fp(1));
+    let sell3 = limit_sell(3, 300, 2);
     let requests3 = vec![MatchRequest {
         sender: addr(3),
-        params: limit_sell(3, 300, 2),
+        params: &sell3,
         order_id: 102,
     }];
 
@@ -912,4 +916,78 @@ fn oversize_batch_skipped_deterministically_sibling_executes() {
         &[(attacker, NativeAction::PlaceOrderBatch(vec![]))],
     );
     assert_eq!(res3.results.len(), 0);
+}
+
+// ============================================================================
+// Test 14 (C2): mixed batch API-equivalence pin for the borrowed flatten —
+// PlaceOrderBatch + singles + non-place actions must produce outputs identical
+// to the hand-flattened action list (result order, action types, success
+// flags, errors, gas, balances, order-ids, trades). This is the API-level
+// oracle for the clone-removal rewrite (FlatAction<'_> borrowing the caller's
+// slice instead of Cow-cloning every action).
+// ============================================================================
+
+#[test]
+fn mixed_batch_outputs_identical_to_hand_flattened() {
+    let mm = addr(1);
+    let tkr = addr(2);
+
+    let run = |actions: &[(Address, NativeAction)]| {
+        let (dir, db) = open_test_db();
+        let mut ctx = make_ctx(db.clone());
+        fund_native(&ctx, &mm, fp(1_000_000));
+        fund_native(&ctx, &tkr, fp(1_000_000));
+        let res = NativeExecutor::execute_batch(&mut ctx, actions);
+        (res, ctx, dir)
+    };
+
+    // Run A: a PlaceOrderBatch, a failing non-place action, and crossing singles.
+    let actions_a: Vec<(Address, NativeAction)> = vec![
+        (
+            mm,
+            NativeAction::PlaceOrderBatch(vec![limit_buy(1, 100, 5), limit_sell(2, 200, 3)]),
+        ),
+        (tkr, NativeAction::CancelOrder { order_id: 999 }), // fails: not found
+        (tkr, NativeAction::PlaceOrder(limit_sell(1, 100, 5))), // crosses batch buy
+        (tkr, NativeAction::PlaceOrder(limit_buy(2, 200, 3))), // crosses batch sell
+    ];
+
+    // Run B: the SAME executable sequence, batch hand-flattened.
+    let actions_b: Vec<(Address, NativeAction)> = vec![
+        (mm, NativeAction::PlaceOrder(limit_buy(1, 100, 5))),
+        (mm, NativeAction::PlaceOrder(limit_sell(2, 200, 3))),
+        (tkr, NativeAction::CancelOrder { order_id: 999 }),
+        (tkr, NativeAction::PlaceOrder(limit_sell(1, 100, 5))),
+        (tkr, NativeAction::PlaceOrder(limit_buy(2, 200, 3))),
+    ];
+
+    let (res_a, ctx_a, _dir_a) = run(&actions_a);
+    let (res_b, ctx_b, _dir_b) = run(&actions_b);
+
+    assert_eq!(
+        res_a.results.len(),
+        5,
+        "batch must flatten to one result per order"
+    );
+    assert_eq!(res_a.results.len(), res_b.results.len());
+    for (i, (a, b)) in res_a.results.iter().zip(res_b.results.iter()).enumerate() {
+        assert_eq!(a.action_type, b.action_type, "action_type diverges at {i}");
+        assert_eq!(
+            a.success, b.success,
+            "success diverges at {i}: A={a:?} B={b:?}"
+        );
+        assert_eq!(a.error, b.error, "error diverges at {i}");
+    }
+    assert_eq!(res_a.total_gas, res_b.total_gas, "gas diverges");
+    assert_eq!(ctx_a.next_global_order_id, ctx_b.next_global_order_id);
+    assert_eq!(ctx_a.trade_index, ctx_b.trade_index);
+    for who in [&mm, &tkr] {
+        let bal_a = ctx_a.positions.get_native_balance(who).unwrap();
+        let bal_b = ctx_b.positions.get_native_balance(who).unwrap();
+        assert_eq!(bal_a.available, bal_b.available, "available diverges");
+        assert_eq!(
+            bal_a.order_margin, bal_b.order_margin,
+            "order_margin diverges"
+        );
+    }
 }
