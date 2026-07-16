@@ -15,7 +15,7 @@ use torus_core::lockbox::{fp_to_u256, u256_to_fp, Lockbox};
 use torus_core::margin::{effective_max_leverage, MarketMarginConfig};
 use torus_core::oracle::{OracleConfig, OracleManager};
 use torus_core::order_book::{OrderBook, OrderStatus, PlaceResult};
-use torus_core::position::{MarginType, NativeBalance, PositionManager};
+use torus_core::position::{MarginType, NativeBalance, PositionCache, PositionManager};
 use torus_core::precompiles::{CoreWriterQueue, QueuedAction, QueuedActionKind};
 use torus_economics::epoch::ValidatorSetDiff;
 use torus_economics::{
@@ -94,14 +94,17 @@ pub struct EpochBoundaryResult {
 /// the overlay once (≈N PUTs), while first-read misses fall through to the overlay.
 ///
 /// Coherence (the overlay must be authoritative at every point some *other* reader could
-/// observe it): the only in-call reader that bypasses this cache is Phase 4 `apply_fill`,
-/// which credits realized PnL straight to the overlay. Before each `apply_fill`, the
-/// trader's pending balance is flushed and evicted (`flush_and_evict`) so `apply_fill`
-/// reads the post-release balance and the later `flush_all` cannot clobber the credit.
-/// `flush_all` runs at the end of the call, so the *next* `execute_batch` call and all
-/// post-batch consumers (`drain_core_writer`, `save_order_books`, block-end flush) see a
-/// fully materialized overlay. Flush order is over distinct per-sender keys, so it is
-/// state-independent of iteration order; the map is otherwise never iterated.
+/// observe it): NO in-call reader bypasses this cache (C1). Historically Phase 4
+/// `apply_fill` credited realized PnL straight to the overlay, which forced a
+/// flush-and-evict of both parties' balances before every fill; settlement now uses
+/// `apply_fill_cached`, which never touches balances — it RETURNS the PnL event and the
+/// executor credits it through this cache, keeping it the single balance authority for
+/// the whole call (and killing 2 overlay round-trips per fill). Position rows get the
+/// same treatment via `PositionCache`. `flush_all` runs at the end of the call, so the
+/// *next* `execute_batch` call and all post-batch consumers (`drain_core_writer`,
+/// `save_order_books`, block-end flush) see a fully materialized overlay. Flush order is
+/// over distinct per-sender keys, so it is state-independent of iteration order; the map
+/// is otherwise never iterated.
 struct BalanceCache {
     map: HashMap<Address, NativeBalance>,
     dirty: std::collections::HashSet<Address>,
@@ -133,22 +136,6 @@ impl BalanceCache {
     fn set(&mut self, addr: &Address, bal: NativeBalance) {
         self.map.insert(*addr, bal);
         self.dirty.insert(*addr);
-    }
-
-    /// Flush a trader's pending balance to the overlay (if dirty) and evict it, handing
-    /// authority back to the overlay. Called before `apply_fill` credits that trader
-    /// directly, so the credit lands on the post-release balance and survives `flush_all`.
-    fn flush_and_evict<T: StateBackend>(
-        &mut self,
-        positions: &PositionManager<T>,
-        addr: &Address,
-    ) -> Result<(), CoreError> {
-        if let Some(bal) = self.map.remove(addr) {
-            if self.dirty.remove(addr) {
-                positions.put_native_balance(addr, &bal)?;
-            }
-        }
-        Ok(())
     }
 
     /// Flush every pending dirty balance to the overlay (end of the `execute_batch` call).
@@ -632,6 +619,10 @@ impl NativeExecutor {
         // repeated Phase 2 reserve / Phase 4 release reads for the same sender without
         // re-hitting the overlay's lock + alloc + Borsh path.
         let mut bal_cache = BalanceCache::new();
+        // C1: same pattern for position rows — Phase 4 does two position
+        // read-modify-writes per fill; they hit this map and flush once
+        // (sorted keys) at the end of the call.
+        let mut pos_cache = PositionCache::new();
 
         for &i in &place_order_indices {
             let (sender, action) = &actions[i];
@@ -837,23 +828,24 @@ impl NativeExecutor {
                     }
                 }
 
-                // Apply fills to position manager
+                // Apply fills through the write-back caches (C1). Positions
+                // read-modify-write in pos_cache; realized-PnL events are
+                // credited through bal_cache — never straight to the overlay —
+                // so the old per-fill flush_and_evict (2 overlay round-trips
+                // per fill) is gone and both caches stay the single in-batch
+                // authority for their rows.
                 let mut fill_failed = false;
                 for fill in &result.fills {
-                    // apply_fill credits realized PnL straight to the overlay, bypassing
-                    // bal_cache. Flush+evict these traders' pending balances first so the
-                    // credit lands on the post-release balance and flush_all can't clobber
-                    // it; a later margin release for them re-reads the overlay (O1 coherence).
-                    let _ = bal_cache.flush_and_evict(&ctx.positions, &fill.taker);
-                    let _ = bal_cache.flush_and_evict(&ctx.positions, &fill.maker);
                     let taker_is_buy = fill.maker_side != Side::Buy;
-                    if let Err(e) = ctx.positions.apply_fill(
+                    if let Err(e) = Self::apply_fill_via_caches(
+                        &ctx.positions,
+                        &mut pos_cache,
+                        &mut bal_cache,
                         &fill.taker,
                         market_id,
                         taker_is_buy,
                         fill.quantity,
                         fill.price,
-                        MarginType::Cross,
                     ) {
                         results[prep.index] = NativeActionResult::err(
                             "place_order",
@@ -862,13 +854,15 @@ impl NativeExecutor {
                         fill_failed = true;
                         break;
                     }
-                    if let Err(e) = ctx.positions.apply_fill(
+                    if let Err(e) = Self::apply_fill_via_caches(
+                        &ctx.positions,
+                        &mut pos_cache,
+                        &mut bal_cache,
                         &fill.maker,
                         market_id,
                         fill.maker_side == Side::Buy,
                         fill.quantity,
                         fill.price,
-                        MarginType::Cross,
                     ) {
                         results[prep.index] = NativeActionResult::err(
                             "place_order",
@@ -920,10 +914,18 @@ impl NativeExecutor {
             }
         }
 
-        // O1: materialize all deferred balance mutations (reserves + releases) into the
-        // overlay before the call returns, so the next execute_batch call and every
-        // post-batch consumer sees authoritative state.
-        let _ = bal_cache.flush_all(&ctx.positions);
+        // C1/O1: materialize all deferred position + balance mutations into the
+        // overlay before the call returns (each in deterministic sorted-key
+        // order), so the next execute_batch call and every post-batch consumer
+        // sees authoritative state. A flush failure means committed fills are
+        // not in the overlay — that block must never be applied, so latch the
+        // fatal (the committer halts the execution pipeline on it).
+        if let Err(e) = pos_cache.flush_all(&ctx.positions) {
+            ctx.fatal_error = Some(format!("position cache flush failed: {e}"));
+        }
+        if let Err(e) = bal_cache.flush_all(&ctx.positions) {
+            ctx.fatal_error = Some(format!("balance cache flush failed: {e}"));
+        }
 
         if let Some(ref m) = ctx.metrics {
             m.exec_phase_settle_seconds
@@ -931,6 +933,39 @@ impl NativeExecutor {
         }
 
         NativeBatchResult { results, total_gas }
+    }
+
+    /// C1: apply one side of a fill entirely through the per-batch write-back
+    /// caches. The position read-modify-write hits `pos_cache`; if the fill
+    /// had a close component, `apply_fill_cached` returns the realized PnL and
+    /// it is credited through `bal_cache` (exactly when the classic
+    /// `apply_fill` would have written the balance row — including a zero PnL,
+    /// which still materializes the row). No overlay access on the hot path.
+    #[allow(clippy::too_many_arguments)]
+    fn apply_fill_via_caches<T: StateBackend>(
+        positions: &PositionManager<T>,
+        pos_cache: &mut PositionCache,
+        bal_cache: &mut BalanceCache,
+        trader: &Address,
+        market_id: MarketId,
+        is_buy: bool,
+        qty: FixedPoint,
+        price: FixedPoint,
+    ) -> Result<(), CoreError> {
+        if let Some(pnl) = positions.apply_fill_cached(
+            pos_cache,
+            trader,
+            market_id,
+            is_buy,
+            qty,
+            price,
+            MarginType::Cross,
+        )? {
+            let mut bal = bal_cache.load(positions, trader)?;
+            bal.available += pnl;
+            bal_cache.set(trader, bal);
+        }
+        Ok(())
     }
 
     // ========================================================================
