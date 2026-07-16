@@ -282,6 +282,11 @@ pub struct Metrics {
     /// the nonce was already past the 60s window (still DA-resident, just never
     /// pays verify to be rejected).
     pub native_ingest_stale_skips: Counter,
+    /// Pre-proposal body-push bundles dropped because the dissemination
+    /// sync_channel was full (scope 4). A drop forces replicas onto the slow DA
+    /// pull for that block's bodies; the proposer's own DA mirror makes it
+    /// recoverable. Was a silent warn before this counter.
+    pub native_pre_proposal_push_dropped: Counter,
     /// Exec phase: deserializing every market's order book from the CF at the
     /// start of a block (native_executor `load_order_books`) — the O(markets×depth)
     /// per-block reload cost, invisible before this round.
@@ -979,6 +984,13 @@ impl Metrics {
             native_ingest_stale_skips.clone(),
         );
 
+        let native_pre_proposal_push_dropped = Counter::default();
+        registry.register(
+            "torus_native_pre_proposal_push_dropped",
+            "Pre-proposal body-push bundles dropped because the dissemination sync_channel was full",
+            native_pre_proposal_push_dropped.clone(),
+        );
+
         let exec_load_books_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
         registry.register(
             "torus_exec_load_books_seconds",
@@ -1134,6 +1146,7 @@ impl Metrics {
             native_verify_queue_dropped,
             native_ingest_dedup_skips,
             native_ingest_stale_skips,
+            native_pre_proposal_push_dropped,
             exec_load_books_seconds,
             exec_save_books_bytes,
             native_resting_depth,

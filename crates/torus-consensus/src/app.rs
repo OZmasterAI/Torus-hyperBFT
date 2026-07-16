@@ -1734,7 +1734,17 @@ impl App<RocksKVStore> for TorusApp {
                     actions: native_with_senders,
                 }) {
                     Ok(()) => tracing::info!(count, height, "pre-proposal push sent"),
-                    Err(e) => tracing::warn!(count, height, %e, "pre-proposal push failed"),
+                    Err(e) => {
+                        // P3 Round-2 scope 4: a dropped bundle was previously a
+                        // silent warn — count it so a saturated dissemination
+                        // thread (replicas forced onto the slow DA pull) is
+                        // observable. The bodies are still mirrored to the
+                        // proposer's DA store above, so this is recoverable.
+                        if let Some(ref m) = self.metrics {
+                            m.native_pre_proposal_push_dropped.inc();
+                        }
+                        tracing::warn!(count, height, %e, "pre-proposal push failed");
+                    }
                 }
             }
         }

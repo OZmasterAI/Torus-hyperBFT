@@ -704,8 +704,13 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     info!(listen = %cli.p2p_listen, "p2p network started");
 
     // 5b. Pre-proposal action push: proposer → all validators via req/res (CompactBlock support)
+    // P3 Round-2 scope 4: widen the sync_channel 4 -> 64 so a transient stall in
+    // the pre-proposal dissemination thread (serialize + broadcast) does not
+    // back-pressure produce_block into dropping bundles under b400 bursts; the
+    // proposer still mirrors every referenced body to its own DA store, so a drop
+    // is recoverable, but a dropped bundle forces replicas onto the slow pull.
     let (pre_proposal_tx, pre_proposal_rx) =
-        std::sync::mpsc::sync_channel::<torus_consensus::PreProposalBundle>(4);
+        std::sync::mpsc::sync_channel::<torus_consensus::PreProposalBundle>(64);
     app.set_pre_proposal_tx(pre_proposal_tx);
     let network_for_pre_proposal = network.clone();
     std::thread::spawn(move || {
