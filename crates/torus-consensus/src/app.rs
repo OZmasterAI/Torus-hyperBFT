@@ -3768,6 +3768,109 @@ mod in_flight_ledger_tests {
 }
 
 #[cfg(test)]
+mod leader_state_tests {
+    use super::*;
+
+    /// Real ed25519 keys: `sync_validators` silently skips pubkey byte patterns
+    /// that are not valid curve points, so the set must come from generated keys.
+    fn make_set(n: u8) -> (torus_types::ValidatorSet, Vec<VerifyingKey>) {
+        let mut validators = Vec::new();
+        let mut vks = Vec::new();
+        for i in 0..n {
+            let sk = ed25519_dalek::SigningKey::from_bytes(&[i + 1; 32]);
+            let vk = sk.verifying_key();
+            validators.push(torus_types::ValidatorInfo {
+                address: Address::from([i + 1; 20]),
+                pubkey: torus_types::PublicKey(vk.to_bytes()),
+                power: 1,
+                commission_bps: 0,
+            });
+            vks.push(vk);
+        }
+        (
+            torus_types::ValidatorSet {
+                validators,
+                epoch: 0,
+            },
+            vks,
+        )
+    }
+
+    /// Plain IWRR over the LeaderState's synced validator set — the pre-fix
+    /// selection `current_leader()` always used.
+    fn plain_iwrr(ls: &LeaderState, view: u64) -> VerifyingKey {
+        let vs = ls.validators.read().unwrap();
+        hotstuff_rs::pacemaker::select_leader(
+            hotstuff_rs::types::data_types::ViewNumber::new(view),
+            &vs,
+        )
+    }
+
+    #[test]
+    fn leader_state_start_view_observation_beats_height_heuristic() {
+        let ls = LeaderState::new();
+        let (set, _) = make_set(3);
+        ls.sync_validators(&set);
+        // The pacemaker actually entered view 57 (timeout churn: views run
+        // ahead of commits)...
+        let observed = plain_iwrr(&ls, 57);
+        ls.observe_start_view(57, observed);
+        // ...while the commit path still reports committed_height + 1 = 11.
+        // The stale heuristic must NOT drag the hint backwards.
+        ls.set_view(11);
+        assert_eq!(
+            ls.current_view(),
+            57,
+            "observed pacemaker view must win over the height+1 heuristic"
+        );
+        assert_eq!(ls.current_leader(), Some(observed));
+    }
+
+    #[test]
+    fn leader_state_uses_pacemaker_observed_leader_not_plain_iwrr() {
+        // Under reputation-weighted selection the pacemaker's choice can differ
+        // from plain IWRR. The hint must follow whatever the pacemaker computed
+        // (carried on the StartView event), not re-derive plain IWRR locally.
+        let ls = LeaderState::new();
+        let (set, vks) = make_set(3);
+        ls.sync_validators(&set);
+        let plain = plain_iwrr(&ls, 40);
+        let reputation_choice = *vks.iter().find(|vk| **vk != plain).unwrap();
+        ls.observe_start_view(40, reputation_choice);
+        assert_eq!(
+            ls.current_leader(),
+            Some(reputation_choice),
+            "hint must be the pacemaker's actual selection, not plain IWRR"
+        );
+    }
+
+    #[test]
+    fn leader_state_falls_back_to_iwrr_without_observation() {
+        // Boot: no StartView observed yet -> height+1 heuristic + plain IWRR,
+        // exactly today's behavior.
+        let ls = LeaderState::new();
+        let (set, _) = make_set(3);
+        ls.sync_validators(&set);
+        ls.set_view(5);
+        assert_eq!(ls.current_view(), 5);
+        assert_eq!(ls.current_leader(), Some(plain_iwrr(&ls, 5)));
+    }
+
+    #[test]
+    fn leader_state_ignores_stale_out_of_order_observations() {
+        // Event-bus delivery is async; a late StartView for an older view must
+        // not regress a newer observation.
+        let ls = LeaderState::new();
+        let (set, vks) = make_set(3);
+        ls.sync_validators(&set);
+        ls.observe_start_view(50, vks[0]);
+        ls.observe_start_view(49, vks[1]);
+        assert_eq!(ls.current_view(), 50);
+        assert_eq!(ls.current_leader(), Some(vks[0]));
+    }
+}
+
+#[cfg(test)]
 mod crash_recovery_tests {
     use super::*;
     use torus_types::{Bloom, FixedPoint, NativeAction, SignedNativeAction, B256, U256};
