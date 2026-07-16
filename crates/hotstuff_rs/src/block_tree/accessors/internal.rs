@@ -2246,4 +2246,62 @@ mod block_tree_pruner_tests {
         // Reset for other tests in this process.
         set_block_tree_retention(None);
     }
+
+    /// The pruner must NEVER touch the consensus-safety singletons —
+    /// LEADER_REPUTATION, SPECULATIVE_COMMITS, EQUIVOCATION_EVIDENCE — no matter
+    /// how many committed block heights it removes. These are keyed by fixed
+    /// single-byte singleton keys ([20]/[19]/[21]), not by height, so a
+    /// height-range prune must leave them byte-for-byte intact (the design-doc
+    /// invariant that keeps a restarting/slashing validator sound).
+    #[test]
+    fn pruner_leaves_safety_singletons_untouched() {
+        use crate::hotstuff::types::{EquivocationEvidence, LeaderReputation};
+        use crate::types::data_types::ViewNumber;
+        use crate::types::validator_set::{SigningKey, VerifyingKey};
+
+        let mut bt = BlockTreeSingleton::new(MemKV::default());
+        seed_committed_chain(&mut bt, 51); // heights 0..=50
+
+        // Seed all three safety singletons with distinctive, non-default values.
+        let leader: VerifyingKey = SigningKey::from_bytes(&[7u8; 32]).verifying_key();
+        let mut rep = LeaderReputation::new(64);
+        rep.record_success(&leader);
+        bt.set_leader_reputation(&rep).unwrap();
+
+        let spec_hash = CryptoHash::new([200u8; 32]);
+        bt.add_speculative_commit(spec_hash).unwrap();
+
+        let evidence = EquivocationEvidence {
+            view: ViewNumber::new(3),
+            leader,
+            block_a: CryptoHash::new([1u8; 32]),
+            block_b: CryptoHash::new([2u8; 32]),
+        };
+        bt.store_equivocation_evidence(&evidence).unwrap();
+
+        // Prune the whole prunable backlog (heights 0..=41 with retention 8).
+        assert_eq!(bt.prune_old_committed_blocks_with(8).unwrap(), 42);
+
+        // All three singletons survive byte-for-byte.
+        assert_eq!(
+            bt.leader_reputation().unwrap(),
+            rep,
+            "LEADER_REPUTATION must survive pruning"
+        );
+        assert!(
+            bt.speculative_commits().unwrap().contains(&spec_hash),
+            "SPECULATIVE_COMMITS must survive pruning"
+        );
+        let ev = bt.get_equivocation_evidence().unwrap();
+        assert_eq!(
+            ev,
+            vec![(
+                evidence.view,
+                evidence.leader.to_bytes(),
+                evidence.block_a,
+                evidence.block_b
+            )],
+            "EQUIVOCATION_EVIDENCE must survive pruning"
+        );
+    }
 }
