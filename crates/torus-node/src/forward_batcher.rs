@@ -135,7 +135,10 @@ impl ForwardBatcher {
             .collect()
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
+    /// Test seam: nothing pending in any bucket (production code drains via
+    /// the tick's `flush_all`, which never needs to ask first).
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
         self.buckets.values().all(|b| b.pairs.is_empty())
     }
 
