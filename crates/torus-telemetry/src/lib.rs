@@ -228,8 +228,35 @@ pub struct Metrics {
     /// (status Resting / PartiallyFilled / PendingTrigger at placement).
     pub orders_placed: Counter,
     /// Exec-side order deaths by reason (insufficient_margin / balance_error /
-    /// fill_failed / engine_rejected / cancelled_unfilled / batch_cap_skipped).
+    /// fill_failed / engine_rejected / cancelled_unfilled / batch_cap_skipped /
+    /// trader_cap).
     pub orders_rejected: Family<Vec<(String, String)>, Counter>,
+
+    // P3 Round-1 ground-truth instrumentation (perf/p3-throughput) — closes the
+    // remaining blind spots the P2 funnel report named: the mis-wired pool
+    // occupancy gauge, book persistence (E4), and exec book IO cost.
+    /// Native-pool insertions that SUCCEEDED (admitted to the pool). Paired with
+    /// `mempool_native_size` (a working occupancy gauge, .set() after every
+    /// mutation) it closes the intake identity per cell: the P2 gauge read 0 at
+    /// every sample while thousands of actions were provably pooled.
+    pub native_pool_inserted: Counter,
+    /// Exec phase: deserializing every market's order book from the CF at the
+    /// start of a block (native_executor `load_order_books`) — the O(markets×depth)
+    /// per-block reload cost, invisible before this round.
+    pub exec_load_books_seconds: Histogram,
+    /// Bytes of Borsh-serialized order-book state written by `save_order_books`
+    /// per block (summed over dirty books). Book-depth ground truth by weight.
+    pub exec_save_books_bytes: Counter,
+    /// Per-market resting order-book depth (`OrderBook::order_count`) sampled
+    /// after `save_order_books` — the FIRST true depth ground truth at this base
+    /// (getOrderBook is borsh-broken). Pins at 200×senders under the trader cap.
+    pub native_resting_depth: Family<Vec<(String, String)>, Gauge>,
+    /// Order books successfully decoded from the CF at block load (E4 probe).
+    pub books_loaded: Counter,
+    /// Order-book rows that FAILED to Borsh-decode at load (the silent `if let Ok`
+    /// swallow, native_executor `load_order_books`). A nonzero value is a
+    /// correctness bug: books are silently losing state. Resolves E4.
+    pub books_decode_failed: Counter,
 
     // RocksDB runtime state (S405 BS-3) — the propose cost accumulates with
     // process lifetime, not persistent DB size; these expose the in-process
@@ -840,10 +867,53 @@ impl Metrics {
             "engine_rejected",
             "cancelled_unfilled",
             "batch_cap_skipped",
+            "trader_cap",
         ] {
             let _ =
                 orders_rejected.get_or_create(&vec![("reason".to_string(), reason.to_string())]);
         }
+
+        let native_pool_inserted = Counter::default();
+        registry.register(
+            "torus_native_pool_inserted",
+            "Native-pool insertions that succeeded (admitted to the pool)",
+            native_pool_inserted.clone(),
+        );
+
+        let exec_load_books_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
+        registry.register(
+            "torus_exec_load_books_seconds",
+            "Exec phase: deserializing every market's order book from the CF at block start",
+            exec_load_books_seconds.clone(),
+        );
+
+        let exec_save_books_bytes = Counter::default();
+        registry.register(
+            "torus_exec_save_books_bytes",
+            "Bytes of Borsh-serialized order-book state written by save_order_books per block",
+            exec_save_books_bytes.clone(),
+        );
+
+        let native_resting_depth = Family::<Vec<(String, String)>, Gauge>::default();
+        registry.register(
+            "torus_native_resting_depth",
+            "Resting order-book depth per market, sampled after save_order_books",
+            native_resting_depth.clone(),
+        );
+
+        let books_loaded = Counter::default();
+        registry.register(
+            "torus_books_loaded",
+            "Order books successfully decoded from the CF at block load (E4 probe)",
+            books_loaded.clone(),
+        );
+
+        let books_decode_failed = Counter::default();
+        registry.register(
+            "torus_books_decode_failed",
+            "Order-book rows that failed to Borsh-decode at load (nonzero = silent state loss)",
+            books_decode_failed.clone(),
+        );
 
         let rocksdb_l0_files = Family::<Vec<(String, String)>, Gauge>::default();
         registry.register(
@@ -956,6 +1026,12 @@ impl Metrics {
             exec_queue_out,
             orders_placed,
             orders_rejected,
+            native_pool_inserted,
+            exec_load_books_seconds,
+            exec_save_books_bytes,
+            native_resting_depth,
+            books_loaded,
+            books_decode_failed,
             rocksdb_l0_files,
             rocksdb_memtable_bytes,
             rocksdb_pending_compaction_bytes,
@@ -1205,6 +1281,50 @@ mod tests {
         assert!(
             text.contains(r#"torus_rpc_submit_admit_rejects_total{reason="duplicate"} 1"#),
             "labeled admit-reject series must encode:\n{text}"
+        );
+    }
+
+    /// P3 Round-1 ground-truth instrumentation (perf/p3-throughput): the pool
+    /// occupancy gauge fix companion counter, exec book-IO metrics, per-market
+    /// resting-depth gauge, and the E4 decode probes must all register and encode.
+    #[test]
+    fn p3_round1_metrics_register() {
+        let m = Metrics::new();
+        m.native_pool_inserted.inc();
+        m.exec_load_books_seconds.observe(0.01);
+        m.exec_save_books_bytes.inc_by(4096);
+        m.native_resting_depth
+            .get_or_create(&vec![("market".to_string(), "1".to_string())])
+            .set(200);
+        m.books_loaded.inc_by(4);
+        m.books_decode_failed.inc();
+        let text = m.encode();
+        for name in [
+            "torus_native_pool_inserted",
+            "torus_exec_load_books_seconds",
+            "torus_exec_save_books_bytes",
+            "torus_native_resting_depth",
+            "torus_books_loaded",
+            "torus_books_decode_failed",
+        ] {
+            assert!(text.contains(name), "{name} not registered:\n{text}");
+        }
+        assert!(
+            text.contains(r#"torus_native_resting_depth{market="1"} 200"#),
+            "labeled resting-depth series must encode:\n{text}"
+        );
+    }
+
+    /// P3 Round-1 item 3(d): the exec reject-reason set must include `trader_cap`
+    /// so 200-order trader-cap rejects are labeled instead of opaque
+    /// `engine_rejected`. The series is pre-seeded, so it scrapes at 0 from boot.
+    #[test]
+    fn orders_rejected_trader_cap_preseeded() {
+        let m = Metrics::new();
+        let text = m.encode();
+        assert!(
+            text.contains(r#"torus_orders_rejected_total{reason="trader_cap"} 0"#),
+            "trader_cap reject series must be pre-seeded at 0:\n{text}"
         );
     }
 
