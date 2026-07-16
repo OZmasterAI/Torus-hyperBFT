@@ -14,7 +14,7 @@ use torus_core::liquidation::LiquidationEngine;
 use torus_core::lockbox::{fp_to_u256, u256_to_fp, Lockbox};
 use torus_core::margin::{effective_max_leverage, MarketMarginConfig};
 use torus_core::oracle::{OracleConfig, OracleManager};
-use torus_core::order_book::{OrderBook, OrderStatus};
+use torus_core::order_book::{OrderBook, OrderStatus, PlaceResult};
 use torus_core::position::{MarginType, NativeBalance, PositionManager};
 use torus_core::precompiles::{CoreWriterQueue, QueuedAction, QueuedActionKind};
 use torus_economics::epoch::ValidatorSetDiff;
@@ -24,8 +24,8 @@ use torus_economics::{
 use torus_state::cf::{CF_NATIVE_TRADES, CF_NATIVE_USER_TRADES};
 use torus_state::{RawCfKv, StateBackend, StateDb};
 use torus_types::{
-    FixedPoint, MarketId, NativeAction, OrderType, PlaceOrderParams, PublicKey, SessionScope, Side,
-    TimeInForce, ValidatorInfo, ValidatorSet, VoteOption, U256,
+    FixedPoint, MarketId, NativeAction, OrderId, OrderType, PlaceOrderParams, PublicKey,
+    SessionScope, Side, TimeInForce, ValidatorInfo, ValidatorSet, VoteOption, U256,
 };
 
 use crate::market_workers::{MarketWorkerPool, MatchRequest};
@@ -643,16 +643,10 @@ impl NativeExecutor {
             let market_id = params.market_id;
             let is_market = matches!(params.order_type, OrderType::Market);
 
-            // Reserve margin (same logic as exec_place_order Phase 2)
-            let order_margin_required = if !is_market && params.price > FixedPoint::ZERO {
-                let notional = params.price * params.quantity;
-                let max_lev = ctx
-                    .margin_configs
-                    .get(&market_id)
-                    .map(|c| effective_max_leverage(&c.tiers, notional))
-                    .unwrap_or(20);
-                let lev_fp = FixedPoint::from_raw(max_lev as i128 * FixedPoint::SCALE);
-                notional / lev_fp
+            // Reserve margin (same logic as exec_place_order Phase 2).
+            // A5: reserve and every later release share reserve_for_qty.
+            let order_margin_required = if !is_market {
+                Self::reserve_for_qty(ctx, market_id, params.price, params.quantity)
             } else {
                 FixedPoint::ZERO
             };
@@ -732,7 +726,7 @@ impl NativeExecutor {
             worker_batches.insert(market_id, (book, requests));
         }
 
-        let market_results = match MarketWorkerPool::match_parallel(worker_batches, ctx.timestamp)
+        let mut market_results = match MarketWorkerPool::match_parallel(worker_batches, ctx.timestamp)
         {
             Ok(r) => r,
             Err(panic) => {
@@ -765,6 +759,13 @@ impl NativeExecutor {
         }
 
         // ---- Phase 4: Sequential settlement ----
+        // A5: settle markets in market-id order. `match_parallel` returns
+        // HashMap iteration order (random per instance) — balance mutations
+        // are commutative so consensus state never depended on it, but the
+        // per-block trade_index assignment (node-local trade keys) and the
+        // defensive `.min(order_margin)` clamps on the new cross-trader maker
+        // releases do observe settlement order. Sorting pins both.
+        market_results.sort_by_key(|m| m.market_id);
         let settle_timer = std::time::Instant::now();
         for mbr in market_results {
             let market_id = mbr.market_id;
@@ -811,15 +812,26 @@ impl NativeExecutor {
                     let margin_to_release = if !order_rests {
                         prep.margin_reserved
                     } else if filled_qty > FixedPoint::ZERO {
-                        prep.margin_reserved * filled_qty / prep.params.quantity
+                        // A5: telescoping release — reserved minus the reserve
+                        // still owed for the resting remainder, so the later
+                        // releases of that remainder (maker fills / cancel)
+                        // sum to EXACTLY the original reservation (no dust).
+                        prep.margin_reserved
+                            - Self::reserve_for_qty(
+                                ctx,
+                                market_id,
+                                prep.params.price,
+                                prep.params.quantity - filled_qty,
+                            )
                     } else {
                         FixedPoint::ZERO
                     };
 
                     if margin_to_release > FixedPoint::ZERO {
                         if let Ok(mut bal) = bal_cache.load(&ctx.positions, &prep.sender) {
-                            bal.order_margin -= margin_to_release;
-                            bal.available += margin_to_release;
+                            let release = margin_to_release.min(bal.order_margin);
+                            bal.order_margin -= release;
+                            bal.available += release;
                             bal_cache.set(&prep.sender, bal);
                         }
                     }
@@ -888,6 +900,24 @@ impl NativeExecutor {
                 total_gas += 1000;
                 results[prep.index] = NativeActionResult::ok("place_order", 1000);
             }
+
+            // A5 (maker-fill margin leak): release maker-side order margin for
+            // resting orders consumed by this batch's fills, and the full
+            // remaining reservation of makers STP-cancelled during matching.
+            // Aggregated once per market across ALL results (a maker can be
+            // consumed by several takers); amounts telescope on remaining
+            // quantity so total released == total reserved (see
+            // maker_margin_releases). Clamped so legacy state can't underflow.
+            for (trader, amount) in
+                Self::maker_margin_releases(ctx, market_id, mbr.results.iter().map(|m| &m.result))
+            {
+                if let Ok(mut bal) = bal_cache.load(&ctx.positions, &trader) {
+                    let release = amount.min(bal.order_margin);
+                    bal.order_margin -= release;
+                    bal.available += release;
+                    bal_cache.set(&trader, bal);
+                }
+            }
         }
 
         // O1: materialize all deferred balance mutations (reserves + releases) into the
@@ -944,6 +974,108 @@ impl NativeExecutor {
         }
     }
 
+    /// A5 (maker-fill margin leak): THE reserve/release formula.
+    ///
+    /// Margin reserved for `qty` of a limit order at `price` in `market_id`:
+    /// `notional / effective_max_leverage(notional)` (default 20x), FixedPoint
+    /// truncating arithmetic — byte-identical to the Phase-2 reserve.
+    ///
+    /// Exactness invariant: an order resting with remaining quantity `r` has
+    /// outstanding reservation EXACTLY `reserve(price, r)`. Every release is
+    /// computed as a difference of this function at two quantities
+    /// (telescoping), so over an order's whole lifetime
+    /// Σ releases == the original reservation — no truncation dust stranded
+    /// in `order_margin`, no over-release into other orders' reservations.
+    fn reserve_for_qty<T: StateBackend>(
+        ctx: &NativeExecContext<T>,
+        market_id: MarketId,
+        price: FixedPoint,
+        qty: FixedPoint,
+    ) -> FixedPoint {
+        if price <= FixedPoint::ZERO || qty <= FixedPoint::ZERO {
+            return FixedPoint::ZERO;
+        }
+        let notional = price * qty;
+        let max_lev = ctx
+            .margin_configs
+            .get(&market_id)
+            .map(|c| effective_max_leverage(&c.tiers, notional))
+            .unwrap_or(20);
+        notional / FixedPoint::from_raw(max_lev as i128 * FixedPoint::SCALE)
+    }
+
+    /// A5: margin releases owed to RESTING (maker) orders that were consumed
+    /// by fills or STP-cancelled during matching of `results` in `market_id`.
+    /// Returns deterministic `(trader, amount)` pairs (BTreeMap order-id order,
+    /// then STP order-id order).
+    ///
+    /// Per maker order the release telescopes over remaining quantity:
+    /// `reserve(r_before_fills) - reserve(r_after_fills)`, where the
+    /// post-fill remainder comes from the book (still resting), the captured
+    /// STP-cancelled order (remaining at cancel time), or zero (fully filled).
+    /// STP-cancelled makers additionally release `reserve(remaining_at_cancel)`
+    /// — their whole leftover reservation. Combined with the taker-side and
+    /// cancel-path releases this makes total released == total reserved.
+    ///
+    /// MUST be called ONCE per market over ALL of the batch's results: fills
+    /// from several takers consuming one maker order have to be aggregated
+    /// before comparing against the book's final remaining quantity.
+    fn maker_margin_releases<'a, T: StateBackend>(
+        ctx: &NativeExecContext<T>,
+        market_id: MarketId,
+        results: impl Iterator<Item = &'a PlaceResult>,
+    ) -> Vec<(Address, FixedPoint)> {
+        use std::collections::BTreeMap;
+
+        // maker order id -> (maker, resting price, total qty consumed by fills)
+        let mut consumed: BTreeMap<OrderId, (Address, FixedPoint, FixedPoint)> = BTreeMap::new();
+        // STP-cancelled maker id -> (trader, price, remaining_qty at cancel)
+        let mut stp: BTreeMap<OrderId, (Address, FixedPoint, FixedPoint)> = BTreeMap::new();
+
+        for r in results {
+            for f in &r.fills {
+                let e = consumed
+                    .entry(f.maker_order_id)
+                    .or_insert((f.maker, f.price, FixedPoint::ZERO));
+                e.2 += f.quantity;
+            }
+            for o in &r.self_trade_cancels {
+                stp.insert(o.id, (o.trader, o.price, o.remaining_qty));
+            }
+        }
+        if consumed.is_empty() && stp.is_empty() {
+            return Vec::new();
+        }
+
+        let book = ctx.order_books.get(&market_id);
+        let mut out = Vec::with_capacity(consumed.len() + stp.len());
+
+        for (&order_id, &(maker, price, qty_consumed)) in &consumed {
+            // Remaining AFTER all of this batch's fills on the order: still on
+            // the book, or captured at STP-cancel time, or 0 (fully filled).
+            let remaining_after = book
+                .and_then(|b| b.get_order(order_id))
+                .map(|o| o.remaining_qty)
+                .or_else(|| stp.get(&order_id).map(|&(_, _, rem)| rem))
+                .unwrap_or(FixedPoint::ZERO);
+            let release =
+                Self::reserve_for_qty(ctx, market_id, price, remaining_after + qty_consumed)
+                    - Self::reserve_for_qty(ctx, market_id, price, remaining_after);
+            if release > FixedPoint::ZERO {
+                out.push((maker, release));
+            }
+        }
+        for (&_order_id, &(trader, price, remaining)) in &stp {
+            // Full leftover reservation of the STP-cancelled maker (its fills
+            // earlier in the batch, if any, are covered by the pass above).
+            let release = Self::reserve_for_qty(ctx, market_id, price, remaining);
+            if release > FixedPoint::ZERO {
+                out.push((trader, release));
+            }
+        }
+        out
+    }
+
     fn exec_place_order<T: StateBackend>(
         ctx: &mut NativeExecContext<T>,
         sender: &Address,
@@ -954,15 +1086,9 @@ impl NativeExecutor {
 
         // FIX 2 (ECON-FIND-05): Reserve order margin before placing the order.
         // For market orders, margin is settled at fill time (no resting order).
-        let order_margin_required = if !is_market && params.price > FixedPoint::ZERO {
-            let notional = params.price * params.quantity;
-            let max_lev = ctx
-                .margin_configs
-                .get(&market_id)
-                .map(|c| effective_max_leverage(&c.tiers, notional))
-                .unwrap_or(20);
-            let lev_fp = FixedPoint::from_raw(max_lev as i128 * FixedPoint::SCALE);
-            notional / lev_fp
+        // A5: reserve and every later release share reserve_for_qty.
+        let order_margin_required = if !is_market {
+            Self::reserve_for_qty(ctx, market_id, params.price, params.quantity)
         } else {
             FixedPoint::ZERO
         };
@@ -1038,18 +1164,42 @@ impl NativeExecutor {
                 // Fully filled, cancelled, or rejected — release all reserved margin
                 order_margin_required
             } else if filled_qty > FixedPoint::ZERO {
-                // Partially filled — release proportional margin
-                order_margin_required * filled_qty / params.quantity
+                // A5: telescoping release — reserved minus the reserve still
+                // owed for the resting remainder, so the later releases of that
+                // remainder (maker fills / cancel) sum to EXACTLY the original
+                // reservation (no truncation dust).
+                order_margin_required
+                    - Self::reserve_for_qty(
+                        ctx,
+                        market_id,
+                        params.price,
+                        params.quantity - filled_qty,
+                    )
             } else {
                 FixedPoint::ZERO
             };
 
             if margin_to_release > FixedPoint::ZERO {
                 if let Ok(mut bal) = ctx.positions.get_native_balance(sender) {
-                    bal.order_margin -= margin_to_release;
-                    bal.available += margin_to_release;
+                    let release = margin_to_release.min(bal.order_margin);
+                    bal.order_margin -= release;
+                    bal.available += release;
                     let _ = ctx.positions.put_native_balance(sender, &bal);
                 }
+            }
+        }
+
+        // A5 (maker-fill margin leak): release maker-side order margin consumed
+        // by this order's fills, and the full remaining reservation of makers
+        // STP-cancelled during matching — mirrors execute_batch Phase 4.
+        for (trader, amount) in
+            Self::maker_margin_releases(ctx, market_id, std::iter::once(&result))
+        {
+            if let Ok(mut bal) = ctx.positions.get_native_balance(&trader) {
+                let release = amount.min(bal.order_margin);
+                bal.order_margin -= release;
+                bal.available += release;
+                let _ = ctx.positions.put_native_balance(&trader, &bal);
             }
         }
 

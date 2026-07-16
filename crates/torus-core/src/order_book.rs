@@ -27,7 +27,7 @@ const MAX_ORDERS_PER_TRADER_PER_MARKET: usize = 200;
 // ============================================================================
 
 /// An order resting on the book.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Order {
     pub id: OrderId,
     pub trader: Address,
@@ -61,7 +61,11 @@ pub struct PlaceResult {
     pub order_id: OrderId,
     pub status: OrderStatus,
     pub fills: Vec<Fill>,
-    pub self_trade_cancels: Vec<OrderId>,
+    /// A5: resting maker orders auto-cancelled by self-trade prevention,
+    /// captured WHOLE (not just the id) so the executor can release the
+    /// cancelled maker's remaining order-margin reservation
+    /// (`price × remaining_qty` at cancel time).
+    pub self_trade_cancels: Vec<Order>,
 }
 
 /// Order placement outcome.
@@ -648,7 +652,7 @@ impl OrderBook {
     // ========================================================================
 
     /// Core matching: taker vs opposite side of the book.
-    fn execute_match(&mut self, taker: &mut Order, is_market: bool) -> (Vec<Fill>, Vec<OrderId>) {
+    fn execute_match(&mut self, taker: &mut Order, is_market: bool) -> (Vec<Fill>, Vec<Order>) {
         let mut fills = Vec::new();
         let mut self_trade_cancels = Vec::new();
 
@@ -713,7 +717,7 @@ impl OrderBook {
         queue: &mut VecDeque<Order>,
         price: FixedPoint,
         fills: &mut Vec<Fill>,
-        self_trade_cancels: &mut Vec<OrderId>,
+        self_trade_cancels: &mut Vec<Order>,
         order_index: &mut HashMap<OrderId, OrderLocation>,
         trader_orders: &mut HashMap<Address, Vec<OrderId>>,
     ) {
@@ -727,7 +731,9 @@ impl OrderBook {
                 if let Some(ids) = trader_orders.get_mut(&cancelled.trader) {
                     ids.retain(|&id| id != cancelled.id);
                 }
-                self_trade_cancels.push(cancelled.id);
+                // A5: hand the whole cancelled order back so the executor can
+                // release its remaining order-margin reservation.
+                self_trade_cancels.push(cancelled);
                 continue;
             }
 
@@ -1869,7 +1875,8 @@ mod tests {
 
         // Trader 1 buys → skips own sell, fills against addr(2)
         let r = ob.place_order(limit_buy(fp(100), fp(5)), addr(1), 3);
-        assert_eq!(r.self_trade_cancels, vec![1]);
+        let cancelled_ids: Vec<_> = r.self_trade_cancels.iter().map(|o| o.id).collect();
+        assert_eq!(cancelled_ids, vec![1]);
         assert_eq!(r.fills.len(), 1);
         assert_eq!(r.fills[0].maker, addr(2));
         assert_eq!(r.status, OrderStatus::Filled);
