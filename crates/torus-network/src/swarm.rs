@@ -4144,4 +4144,175 @@ mod tests {
             "end-state: fan on + mirror off ⇒ NO gossip publish"
         );
     }
+
+    // ------------------------------------------------------------------
+    // B1 — batched direct-to-leader forward envelope (design §1). All RED
+    // before B1 lands.
+    // ------------------------------------------------------------------
+
+    /// A signed native action with a distinguishing nonce (signature bytes are
+    /// irrelevant here — the envelope carries them opaquely).
+    fn test_native_action(nonce: u64) -> torus_types::SignedNativeAction {
+        use torus_types::{ActionSignature, NativeAction, Signature, SignedNativeAction};
+        SignedNativeAction {
+            action: NativeAction::ClaimRewards,
+            nonce,
+            signature: ActionSignature::Eip712(Signature {
+                v: 27,
+                r: [0u8; 32],
+                s: [0u8; 32],
+            }),
+        }
+    }
+
+    fn test_addr(seed: u8) -> torus_types::Address {
+        torus_types::Address::from([seed; 20])
+    }
+
+    /// B1 (RED first): the forward envelope is BYTE-IDENTICAL to the 0xFD
+    /// pre-proposal batch (`0xFD ‖ bincode(Vec<(Address, SignedNativeAction)>)`,
+    /// produced at torus-node main.rs), and round-trips through the SAME
+    /// receive decode the swarm's Direct request arm uses — so every deployed
+    /// binary already accepts it (mixed-fleet safe by construction, no new
+    /// marker, no version byte). MUST fail before B1 (no `encode_forward_batch`
+    /// / `decode_pre_proposal_batch`).
+    #[test]
+    fn forward_batch_envelope_roundtrips_through_receive_decode() {
+        let pairs = vec![
+            (test_addr(1), test_native_action(11)),
+            (test_addr(2), test_native_action(22)),
+        ];
+        let envelope = encode_forward_batch(&pairs).expect("encode");
+
+        // Wire identity with the shipped pre-proposal batch push.
+        let mut expected = vec![PRE_PROPOSAL_BATCH_MARKER];
+        expected.extend_from_slice(&bincode::serialize(&pairs).unwrap());
+        assert_eq!(
+            envelope, expected,
+            "forward envelope must be byte-identical to the 0xFD pre-proposal batch"
+        );
+
+        // Round-trip through the receive seam (the Direct request arm strips
+        // the marker byte and decodes the rest).
+        let decoded = decode_pre_proposal_batch(&envelope[1..]).expect("decode");
+        assert_eq!(decoded.len(), pairs.len());
+        for ((da, dact), (ea, eact)) in decoded.iter().zip(&pairs) {
+            assert_eq!(da, ea, "sender address round-trips");
+            assert_eq!(
+                torus_types::compute_action_hash(dact),
+                torus_types::compute_action_hash(eact),
+                "action round-trips"
+            );
+        }
+
+        // Garbage after the marker fails decode (the receive arm warns + drops).
+        assert!(decode_pre_proposal_batch(b"\x01\x02not-bincode").is_err());
+    }
+
+    /// B1 (RED first): unlike today's 0xFE per-action forward (which bypasses
+    /// every bound), the batch envelope is routed THROUGH the PushScheduler —
+    /// it consumes an in-flight slot — and is tracked in the envelope-retry
+    /// map (attempt 0) so an `OutboundFailure` can retry it against the
+    /// re-resolved leader. MUST fail before B1 (no
+    /// `NetworkCommand::ForwardNativeActionBatch`, no
+    /// `outbound_forward_batches`).
+    #[tokio::test]
+    async fn forward_batch_consumes_push_scheduler_capacity_and_is_retry_tracked() {
+        let shared = test_shared();
+        let local = test_vk(61);
+        let leader = test_vk(60);
+        shared
+            .peer_map
+            .write()
+            .unwrap()
+            .insert(leader, test_peer(60));
+        let mut swarm = test_swarm();
+        let topic = gossipsub::IdentTopic::new(CONSENSUS_TOPIC);
+
+        handle_command(
+            NetworkCommand::ForwardNativeActionBatch {
+                target: leader,
+                pairs: vec![(test_addr(1), test_native_action(1))],
+            },
+            &mut swarm,
+            &shared,
+            &local,
+            &topic,
+        );
+
+        assert_eq!(
+            shared.push_scheduler.lock().unwrap().inflight_len(),
+            1,
+            "the envelope must consume PushScheduler capacity (0xFE bypassed it)"
+        );
+        let tracked = shared.outbound_forward_batches.lock().unwrap();
+        assert_eq!(tracked.len(), 1, "envelope tracked for retry");
+        let inflight = tracked.values().next().unwrap();
+        assert_eq!(inflight.attempt, 0);
+        assert_eq!(inflight.target, leader);
+        assert_eq!(
+            inflight.envelope.first(),
+            Some(&PRE_PROPOSAL_BATCH_MARKER),
+            "tracked payload is the 0xFD envelope"
+        );
+    }
+
+    /// B1: an envelope whose leader is not in the peer map is DROPPED (with
+    /// the drop metric), never queued — the mempool retains every action and
+    /// the re-forward sweep re-sends to the current leader, so buffering here
+    /// would only duplicate that recovery.
+    #[tokio::test]
+    async fn forward_batch_to_unmapped_leader_is_dropped_not_queued() {
+        let shared = test_shared();
+        let mut swarm = test_swarm();
+        let topic = gossipsub::IdentTopic::new(CONSENSUS_TOPIC);
+        handle_command(
+            NetworkCommand::ForwardNativeActionBatch {
+                target: test_vk(62), // never mapped
+                pairs: vec![(test_addr(1), test_native_action(1))],
+            },
+            &mut swarm,
+            &shared,
+            &test_vk(63),
+            &topic,
+        );
+        assert_eq!(shared.push_scheduler.lock().unwrap().inflight_len(), 0);
+        assert!(shared.outbound_forward_batches.lock().unwrap().is_empty());
+    }
+
+    /// B1 (RED first): the retry policy on `OutboundFailure` of a tracked
+    /// forward envelope — retry ≤ [`FORWARD_BATCH_MAX_RETRIES`] times against
+    /// the CURRENT leader (re-resolved via the installed callback; the
+    /// admission-time target is only the fallback), then drop (the mempool
+    /// retains; the sweep re-sends). MUST fail before B1 (no
+    /// `plan_forward_batch_retry`).
+    #[test]
+    fn forward_batch_retry_re_resolves_leader_and_caps_attempts() {
+        let orig = test_vk(64);
+        let new_leader = test_vk(65);
+        let mk = |attempt| ForwardBatchInFlight {
+            target: orig,
+            envelope: vec![PRE_PROPOSAL_BATCH_MARKER, 7],
+            attempt,
+        };
+
+        // First failure: re-resolved leader wins over the stale target.
+        let (target, envelope, attempt) =
+            plan_forward_batch_retry(mk(0), Some(new_leader)).expect("first failure retries");
+        assert_eq!(target, new_leader, "retry goes to the CURRENT leader");
+        assert_eq!(envelope, vec![PRE_PROPOSAL_BATCH_MARKER, 7]);
+        assert_eq!(attempt, 1);
+
+        // No resolver installed: fall back to the original target.
+        let (target, _, attempt) =
+            plan_forward_batch_retry(mk(1), None).expect("second failure retries");
+        assert_eq!(target, orig);
+        assert_eq!(attempt, 2);
+
+        // Attempts exhausted: drop.
+        assert!(
+            plan_forward_batch_retry(mk(FORWARD_BATCH_MAX_RETRIES), Some(new_leader)).is_none(),
+            "≤ {FORWARD_BATCH_MAX_RETRIES} retries, then drop with metric"
+        );
+    }
 }

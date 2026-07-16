@@ -1311,7 +1311,9 @@ mod tests {
             100,
             BlockNotifier::new(),
         );
-        let (fwd_tx, mut fwd_rx) = tokio::sync::mpsc::unbounded_channel();
+        // B1: the forward channel is BOUNDED and carries structured tuples
+        // (leader vk, sender, parsed action) — no JSON re-encode.
+        let (fwd_tx, mut fwd_rx) = tokio::sync::mpsc::channel(FORWARD_CHANNEL_CAP);
         let (evm_fwd_tx, _evm_fwd_rx) = tokio::sync::mpsc::unbounded_channel();
         server.set_leader_forwarding(
             own,
@@ -1349,7 +1351,7 @@ mod tests {
             100,
             BlockNotifier::new(),
         );
-        let (fwd_tx2, mut fwd_rx2) = tokio::sync::mpsc::unbounded_channel();
+        let (fwd_tx2, mut fwd_rx2) = tokio::sync::mpsc::channel(FORWARD_CHANNEL_CAP);
         let (evm_fwd_tx2, _evm_fwd_rx2) = tokio::sync::mpsc::unbounded_channel();
         server2.set_leader_forwarding(
             own,
@@ -1370,15 +1372,95 @@ mod tests {
             .await
             .unwrap();
         assert!(results2[0].hash.is_some());
-        let (vk, payload) = fwd_rx2
+        // B1: structured tuple, not a 20-byte-prefix + JSON blob.
+        let (vk, sender, action) = fwd_rx2
             .try_recv()
             .expect("full-body forward must still flow in fallback mode");
         assert_eq!(vk, leader);
-        assert!(
-            payload.len() > 20,
-            "payload is 20-byte sender prefix + action bytes"
+        assert_ne!(
+            sender,
+            Address::ZERO,
+            "verified sender address travels alongside the parsed action"
+        );
+        assert_eq!(
+            action.nonce,
+            now_ms + 1,
+            "the PARSED action is forwarded (no JSON re-encode on the hot path)"
         );
         handle2.stop().unwrap();
+    }
+
+    /// B1 (RED first): the RPC→batcher forward channel is BOUNDED — overflow
+    /// drops the NEWEST item and increments `rpc_forward_dropped_full`
+    /// (recoverable: the action is already admitted to the local pool and the
+    /// re-forward sweep re-sends pending actions to the leader). Mirrors the
+    /// mempool's `gossip_drop_increments_counter` pattern: capacity-1 channel
+    /// with a live but never-drained receiver. MUST fail before B1 (unbounded
+    /// channel, no counter).
+    #[tokio::test]
+    async fn forward_channel_overflow_counts_drop() {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        // Two DISTINCT senders so both actions admit cleanly.
+        let mk_payload = |key_hex: &str, nonce: u64| {
+            let key =
+                k256::ecdsa::SigningKey::from_slice(&hex::decode(key_hex).unwrap()).unwrap();
+            let signed = torus_types::eip712::sign_native_action(
+                torus_types::NativeAction::ClaimRewards,
+                nonce,
+                &key,
+            );
+            format!("0x{}", hex::encode(serde_json::to_vec(&signed).unwrap()))
+        };
+        let own = [1u8; 32];
+        let leader = [2u8; 32];
+
+        let (_dir, state, mempool, executor) = setup();
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
+        let mut server = RpcServer::new(
+            state,
+            mempool,
+            executor,
+            TORUS_CHAIN_ID,
+            100,
+            BlockNotifier::new(),
+        );
+        server.set_metrics(metrics.clone());
+        let (fwd_tx, _fwd_rx) = tokio::sync::mpsc::channel(1);
+        let (evm_fwd_tx, _evm_fwd_rx) = tokio::sync::mpsc::unbounded_channel();
+        server.set_leader_forwarding(own, Arc::new(move || Some(leader)), fwd_tx, evm_fwd_tx, true);
+        let (handle, addr) = server.start("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        use jsonrpsee::core::client::ClientT;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+
+        let batch = vec![
+            mk_payload(
+                "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+                now_ms,
+            ),
+            mk_payload(
+                "59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d",
+                now_ms,
+            ),
+        ];
+        let results: Vec<RpcSubmitResult> = client
+            .request("torus_submitNativeActions", jsonrpsee::rpc_params![batch])
+            .await
+            .unwrap();
+        assert!(
+            results.iter().all(|r| r.hash.is_some()),
+            "both actions admit — the DROP is forward-only, never an admission failure: {results:?}"
+        );
+        assert_eq!(
+            metrics.rpc_forward_dropped_full.get(),
+            1,
+            "second forward must be counted as a channel-full drop"
+        );
+        handle.stop().unwrap();
     }
 
     /// Option B (EVM tx dissemination): an EVM tx submitted to a NON-leader node must be

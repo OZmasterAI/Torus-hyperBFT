@@ -1202,6 +1202,32 @@ mod tests {
         }
     }
 
+    /// B1 (batched d2l forward): the forward-envelope counters and the
+    /// envelope-size histogram must be registered — the proof run watches
+    /// `d2l_envelopes_sent` sit at O(10–200)/s independent of client batch
+    /// shape, `retried`/`dropped` stay ~0 (a sustained rate names a
+    /// flapping/mis-hinted leader link), and `rpc_forward_dropped_full`
+    /// confirms the now-BOUNDED RPC forward channel is not shedding.
+    #[test]
+    fn d2l_forward_metrics_register() {
+        let m = Metrics::new();
+        m.rpc_forward_dropped_full.inc();
+        m.d2l_envelopes_sent.inc();
+        m.d2l_envelopes_retried.inc();
+        m.d2l_envelopes_dropped.inc();
+        m.d2l_envelope_bytes.observe(65_536.0);
+        let text = m.encode();
+        for name in [
+            "torus_rpc_forward_dropped_full",
+            "torus_d2l_envelopes_sent",
+            "torus_d2l_envelopes_retried",
+            "torus_d2l_envelopes_dropped",
+            "torus_d2l_envelope_bytes",
+        ] {
+            assert!(text.contains(name), "{name} not registered:\n{text}");
+        }
+    }
+
     /// Exec trust-cache (double-verify-trust-cache T6): hit/miss/eviction counters
     /// must be registered so the cache hit-rate is observable for A/B measurement.
     #[test]

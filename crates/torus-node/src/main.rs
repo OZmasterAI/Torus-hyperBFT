@@ -28,6 +28,7 @@ use torus_state::cf::CF_BLOCK_HEADERS;
 use torus_state::{NativeDaStore, PrunerConfig, StateDb, StatePruner};
 use torus_types::ChainConfig;
 
+mod forward_batcher;
 mod keystore;
 
 /// Production native-DA pull-fallback transport (Phase C Task 6): bridges the
