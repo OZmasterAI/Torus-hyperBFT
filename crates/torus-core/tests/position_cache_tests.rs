@@ -12,7 +12,7 @@
 use std::sync::{Arc, Mutex};
 
 use torus_core::position::{
-    position_key, MarginType, NativeBalance, Position, PositionCache, PositionManager,
+    position_key, MarginType, NativeBalance, PositionCache, PositionManager,
 };
 use torus_state::cf::{CF_NATIVE_BALANCES, CF_NATIVE_POSITIONS};
 use torus_state::{AtomicWriteOp, StateBackend, StateDb, StateError};
