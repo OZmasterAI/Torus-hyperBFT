@@ -113,6 +113,23 @@ pub struct Metrics {
     pub native_da_pull_failures: Counter,
     /// Untracked direct sends (native push / leader-forward) that failed.
     pub direct_send_failures_untracked: Counter,
+    /// Consensus (hotstuff) Broadcast messages whose gossipsub `publish` returned
+    /// an error (RH3 / finding #5). A proposer losing its own proposal this way
+    /// burns a full 500ms view fleet-wide; the value is now observable and the
+    /// envelope is re-enqueued for a bounded retry instead of silently dropped.
+    pub consensus_publish_failures: Counter,
+    /// Native-action pre-spread batches whose gossipsub `publish` returned an
+    /// error (RH3 / finding #5), counted by the number of actions in the failed
+    /// batch. The batch is already cleared before publish, so without this a
+    /// dropped pre-spread batch vanished silently (bodies still reach inclusion
+    /// via the pre-proposal push / DA pull path).
+    pub native_gossip_publish_failures: Counter,
+    /// Direct consensus messages from a peer NOT yet in the peer map that were
+    /// dropped WITHOUT penalty (RH2 / finding #6). Previously each such message
+    /// cost 20 points and 1h-banned an honest RPC/ingress node racing identify
+    /// in 5 messages; the penalty is now reserved for cryptographically-proven
+    /// invalidity. A rising value is the (now harmless) identify-race rate.
+    pub unregistered_peer_no_penalty: Counter,
 
     // Block detail metrics
     pub block_transactions_count: Histogram,
@@ -551,6 +568,27 @@ impl Metrics {
             direct_send_failures_untracked.clone(),
         );
 
+        let consensus_publish_failures = Counter::default();
+        registry.register(
+            "torus_consensus_publish_failures",
+            "Consensus Broadcast messages whose gossipsub publish failed (re-enqueued for bounded retry)",
+            consensus_publish_failures.clone(),
+        );
+
+        let native_gossip_publish_failures = Counter::default();
+        registry.register(
+            "torus_native_gossip_publish_failures",
+            "Native pre-spread actions lost to a failed gossipsub batch publish (summed per failed batch)",
+            native_gossip_publish_failures.clone(),
+        );
+
+        let unregistered_peer_no_penalty = Counter::default();
+        registry.register(
+            "torus_unregistered_peer_no_penalty",
+            "Direct consensus messages from an unregistered peer dropped without penalty (identify race, RH2)",
+            unregistered_peer_no_penalty.clone(),
+        );
+
         let block_transactions_count = Histogram::new(exponential_buckets(1.0, 2.0, 12));
         registry.register(
             "torus_block_transactions_count",
@@ -982,6 +1020,9 @@ impl Metrics {
             rpc_submit_admit_rejects,
             native_da_pull_failures,
             direct_send_failures_untracked,
+            consensus_publish_failures,
+            native_gossip_publish_failures,
+            unregistered_peer_no_penalty,
             block_transactions_count,
             consensus_timeout_total,
             pending_sends_enqueued,

@@ -14,6 +14,18 @@ use rocksdb::{
 use crate::cf::*;
 use crate::error::StateError;
 
+/// Upper bound on the total live WAL bytes (RH1 / swarm-hunt finding #10).
+///
+/// RocksDB frees a WAL segment only once every CF with data in it has flushed.
+/// Cold CFs (sessions, governance, staking) receive a trickle of writes and pin
+/// old segments indefinitely, so without a cap the log chain grows with height
+/// and drags every `db.write` (S405 fit: ~0.5 ms per 1k blocks on the propose
+/// path). Crossing this bound force-flushes the memtable pinning the oldest log,
+/// bounding both the chain and crash-recovery time. 256 MiB sits in the
+/// documented 256–512 MiB band: large enough to avoid write stalls at steady
+/// state, small enough to keep recovery bounded.
+pub const MAX_TOTAL_WAL_SIZE: u64 = 256 * 1024 * 1024;
+
 /// Keccak256 of empty bytes — the code hash for accounts with no code.
 pub const KECCAK_EMPTY: B256 = B256::new([
     0xc5, 0xd2, 0x46, 0x01, 0x86, 0xf7, 0x23, 0x3c, 0x92, 0x7e, 0x7d, 0xb2, 0xdc, 0xc7, 0x03, 0xc0,
@@ -39,6 +51,21 @@ impl StateDb {
         // heavy block writes. (Stock defaults run only 2 background jobs.)
         opts.set_max_background_jobs(4);
         opts.set_bytes_per_sync(1 << 20); // 1 MiB
+
+        // RH1 (swarm-hunt finding #9): let the WAL+memtable writes of concurrent
+        // writers overlap instead of serializing through one write group. The
+        // hotstuff consensus thread's small block-tree `db.write` otherwise queues
+        // behind the exec thread's O(depth) `flush_with_native_trie` mega-batch,
+        // adding exec-write-sized stalls to the propose/vote path. Writes are
+        // already independent per CF, so pipelining relaxes no ordering guarantee
+        // the code relies on. RocksDB keeps WAL append order and per-write
+        // atomicity under pipelined_write, so crash-recovery semantics and the
+        // state root are unchanged (state-root safety: no on-disk format change).
+        opts.set_enable_pipelined_write(true);
+
+        // RH1 (finding #10): bound the total live WAL so cold CFs can't pin old
+        // logs and drag every write with height. See `MAX_TOTAL_WAL_SIZE`.
+        opts.set_max_total_wal_size(MAX_TOTAL_WAL_SIZE);
 
         // Per-CF tuning, shared across every column family. RocksDB ships an
         // ~8 MiB block cache and NO bloom filters by default, which is poor for
@@ -437,4 +464,44 @@ pub fn storage_key(address: &Address, index: &U256) -> [u8; 52] {
     key[..20].copy_from_slice(address.as_slice());
     key[20..52].copy_from_slice(&index.to_be_bytes::<32>());
     key
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// RH1: the WAL cap must stay in the documented 256–512 MiB band — large
+    /// enough to avoid steady-state write stalls, small enough to bound crash
+    /// recovery. (RED before `MAX_TOTAL_WAL_SIZE` existed.)
+    #[test]
+    fn wal_size_bound_within_target_band() {
+        assert!(
+            (256 * 1024 * 1024..=512 * 1024 * 1024).contains(&MAX_TOTAL_WAL_SIZE),
+            "MAX_TOTAL_WAL_SIZE {MAX_TOTAL_WAL_SIZE} outside the 256..=512 MiB band"
+        );
+    }
+
+    /// RH1: opening with `enable_pipelined_write` + `max_total_wal_size` must be
+    /// behavior-preserving — the DB opens and an account read/write round-trips
+    /// unchanged. The rocksdb Rust wrapper exposes no getter for these Options,
+    /// so this asserts they are accepted at open and do not alter read/write
+    /// semantics (state-root safety: no on-disk format change). The WAL bound
+    /// itself is enforced internally by RocksDB.
+    #[test]
+    fn open_with_write_path_options_roundtrips() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = StateDb::open(dir.path()).expect("open with RH1 write-path options");
+        let addr = Address::from([7u8; 20]);
+        let info = AccountInfo {
+            balance: U256::from(1234u64),
+            nonce: 5,
+            code_hash: KECCAK_EMPTY,
+            account_id: None,
+            code: None,
+        };
+        db.put_account(&addr, &info).unwrap();
+        let got = db.get_account(&addr).unwrap().expect("account present");
+        assert_eq!(got.balance, U256::from(1234u64));
+        assert_eq!(got.nonce, 5);
+    }
 }
