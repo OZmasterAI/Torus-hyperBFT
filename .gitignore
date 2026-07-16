@@ -18,3 +18,4 @@ build-*.log
 *.done
 .lsp_pass_timestamp
 testnet/genesis-weighted-full.json
+devnet/wsl/genesis-3val.json
