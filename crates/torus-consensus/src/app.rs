@@ -1847,8 +1847,37 @@ impl App<RocksKVStore> for TorusApp {
                     "selected actions for block"
                 );
             }
+            // P3 Task-3 empty-block diagnosis: attribute WHY this proposal is
+            // native-empty. `native_pool_size` is the live pool depth AFTER the
+            // in-select expiry evict (non-destructive select, so == depth at
+            // selection); `in_flight.len()` is the exclude set. This distinguishes
+            // ingest lag (pool_drained) from pipeline back-pressure (all_in_flight)
+            // from cap/nonce gating on a live pool (pool_had_actions).
+            if let Some(ref m) = self.metrics {
+                let pool_size = mempool.native_pool_size();
+                let excluded = in_flight.len();
+                let reason = if !native.is_empty() {
+                    "nonempty"
+                } else if pool_size == 0 {
+                    "empty_pool_drained"
+                } else if excluded >= pool_size {
+                    "empty_all_in_flight"
+                } else {
+                    "empty_pool_had_actions"
+                };
+                m.produce_block_result
+                    .get_or_create(&vec![("reason".to_string(), reason.to_string())])
+                    .inc();
+                m.produce_block_pool_size.observe(pool_size as f64);
+                m.produce_block_excluded.observe(excluded as f64);
+            }
             (native, evm)
         } else {
+            if let Some(ref m) = self.metrics {
+                m.produce_block_result
+                    .get_or_create(&vec![("reason".to_string(), "empty_no_mempool".to_string())])
+                    .inc();
+            }
             (vec![], vec![])
         };
 

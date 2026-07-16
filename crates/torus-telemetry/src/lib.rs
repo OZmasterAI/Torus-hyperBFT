@@ -156,6 +156,24 @@ pub struct Metrics {
     // Block detail metrics
     pub block_transactions_count: Histogram,
 
+    // P3 Task-3 empty-block diagnosis (perf/p3-throughput). Proposer-local
+    // (leader-only) — explains WHY produce_block emits a native-EMPTY proposal
+    // while the pool holds actions. `reason` label:
+    //   nonempty            — selection returned >=1 action (a full/partial block)
+    //   empty_no_mempool    — node has no mempool wired (rpc-only / tests)
+    //   empty_pool_drained  — pool_size==0 at select (ingest lag / genuinely empty)
+    //   empty_all_in_flight — pool_size>0 but exclude_set covers every entry
+    //                         (in-flight window == whole pool; pipeline starvation)
+    //   empty_pool_had_actions — pool_size>0, exclude<pool, yet 0 selected
+    //                         (per-sender/nonce/byte/order-cap gating on a live pool)
+    pub produce_block_result: Family<Vec<(String, String)>, Counter>,
+    /// Native-pool depth (`native_pool_size`) sampled at each produce_block
+    /// selection — the "how full was the pool when I proposed" distribution.
+    pub produce_block_pool_size: Histogram,
+    /// Size of the in-flight exclude set (pending_proposals + in_flight_hashes)
+    /// at each produce_block selection — the pipeline back-pressure signal.
+    pub produce_block_excluded: Histogram,
+
     // Consensus timeout metrics
     pub consensus_timeout_total: Counter,
 
@@ -700,6 +718,27 @@ impl Metrics {
             block_transactions_count.clone(),
         );
 
+        let produce_block_result = Family::<Vec<(String, String)>, Counter>::default();
+        registry.register(
+            "torus_produce_block_result",
+            "produce_block outcomes by reason (empty-block diagnosis, leader-local)",
+            produce_block_result.clone(),
+        );
+
+        let produce_block_pool_size = Histogram::new(exponential_buckets(1.0, 2.0, 18));
+        registry.register(
+            "torus_produce_block_pool_size",
+            "Native-pool depth sampled at each produce_block selection",
+            produce_block_pool_size.clone(),
+        );
+
+        let produce_block_excluded = Histogram::new(exponential_buckets(1.0, 2.0, 18));
+        registry.register(
+            "torus_produce_block_excluded",
+            "In-flight exclude-set size at each produce_block selection",
+            produce_block_excluded.clone(),
+        );
+
         let consensus_timeout_total = Counter::default();
         registry.register(
             "torus_consensus_timeout_total",
@@ -1223,6 +1262,9 @@ impl Metrics {
             native_gossip_publish_failures,
             unregistered_peer_no_penalty,
             block_transactions_count,
+            produce_block_result,
+            produce_block_pool_size,
+            produce_block_excluded,
             consensus_timeout_total,
             pending_sends_enqueued,
             pending_sends_flushed,
