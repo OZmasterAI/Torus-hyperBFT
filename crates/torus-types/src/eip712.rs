@@ -906,9 +906,15 @@ impl SignedNativeAction {
 ///
 /// The EIP-712 ecrecovers (the dominant per-action cost) run in parallel via
 /// rayon; the result is order-preserving and identical to a serial run. Session
-/// verification stays sequential — its ed25519 work is already batched, and
-/// keeping `session_lookup` off the worker threads avoids forcing a `Sync` bound
-/// on callers.
+/// verification's per-action work (EIP-712 struct/signing-hash + ed25519 key
+/// decompression — the exec_verify hot path for the session-signed workload) also
+/// runs in parallel, after a short SEQUENTIAL, deduped pre-pass that calls
+/// `session_lookup` once per unique pubkey. That pre-pass keeps the deliberately
+/// non-`Sync` (and possibly side-effecting) `session_lookup` off the worker
+/// threads — so callers keep their non-`Sync` closures — while the pure hashing
+/// fans out. The ed25519 batch is assembled in index order, so `verify_batch`
+/// sees an identical message/key sequence and the output is byte-identical to a
+/// serial run.
 pub fn batch_verify_native_actions(
     actions: &[SignedNativeAction],
     timestamp: u64,
@@ -966,44 +972,94 @@ pub fn batch_verify_native_actions_cached(
         })
         .collect();
 
-    // Phase 2 (sequential): resolve session actions (needs `session_lookup`) and
-    // assemble the ed25519 batch.
+    // Phase 2: resolve session actions and assemble the ed25519 batch.
     let domain = eip712_domain_separator();
 
+    // Phase 2a — session-resolve pre-pass (SEQUENTIAL, deduped). Consult
+    // `session_lookup` exactly ONCE per unique session pubkey, and only for the
+    // session actions the serial loop would have consulted (i.e. NOT the
+    // `requires_eip712` ones, which it skipped before ever calling lookup). This
+    // keeps the deliberately non-`Sync` (and possibly side-effecting, e.g. the
+    // app.rs session-owner cache-populate) closure off the rayon workers, and the
+    // dedup means N actions sharing one pubkey cost one lookup — the caller's
+    // cache-populate is idempotent, so dedup only removes redundant reads and can
+    // never change the resolved result. `None` entries are cached too, so an
+    // unresolvable pubkey is looked up once, not once per action.
+    let mut resolved_sessions: std::collections::HashMap<[u8; 32], Option<crate::SessionData>> =
+        std::collections::HashMap::new();
+    for action in actions.iter() {
+        if let ActionSignature::Session { session_pubkey, .. } = &action.signature {
+            if requires_eip712(&action.action) {
+                continue;
+            }
+            if !resolved_sessions.contains_key(session_pubkey) {
+                let data = session_lookup(session_pubkey);
+                resolved_sessions.insert(*session_pubkey, data);
+            }
+        }
+    }
+
+    // Phase 2b — per-action verify prep (PARALLEL, order-preserving). For each
+    // session action, check expiry/scope against the pre-resolved session,
+    // decompress the ed25519 verifying key, and compute the EIP-712 struct/signing
+    // hash (the dominant keccak cost). Every step is pure and reads only the
+    // now-immutable `resolved_sessions` map (`SessionData` is `Sync`), so an
+    // indexed `par_iter` collect is deterministic and byte-identical to the serial
+    // loop. Non-session / requires_eip712 / unresolved / bad-scope / bad-key
+    // actions yield `None` — exactly the serial loop's `continue`/`_ => {}` skips.
+    struct EdItem {
+        message: Vec<u8>,
+        signature: ed25519_dalek::Signature,
+        key: Ed25519VerifyingKey,
+        owner: Address,
+    }
+    let per_index: Vec<Option<EdItem>> = actions
+        .par_iter()
+        .map(|action| {
+            let ActionSignature::Session {
+                session_pubkey,
+                sig,
+            } = &action.signature
+            else {
+                return None; // EIP-712 already resolved in phase 1
+            };
+            if requires_eip712(&action.action) {
+                return None;
+            }
+            let Some(Some(session)) = resolved_sessions.get(session_pubkey) else {
+                return None; // no session / lookup returned None
+            };
+            if !(timestamp <= session.expiry && session.scope.allows(&action.action)) {
+                return None; // expired or out of scope
+            }
+            let Ok(vk) = Ed25519VerifyingKey::from_bytes(session_pubkey) else {
+                return None;
+            };
+            let struct_hash = eip712_struct_hash(&action.action, action.nonce);
+            let signing_hash = eip712_signing_hash(domain, struct_hash);
+            Some(EdItem {
+                message: signing_hash.0.to_vec(),
+                signature: ed25519_dalek::Signature::from_bytes(&sig.0),
+                key: vk,
+                owner: session.owner,
+            })
+        })
+        .collect();
+
+    // Assemble the ed25519 batch in index order — the SAME push order as the
+    // serial loop, so `verify_batch` sees an identical message/key sequence — and
+    // set the tentative session-owner sender (cleared below if the batch fails).
     let mut ed_indices = Vec::new();
     let mut ed_messages = Vec::new();
     let mut ed_signatures = Vec::new();
     let mut ed_keys = Vec::new();
-
-    for (i, action) in actions.iter().enumerate() {
-        let ActionSignature::Session {
-            session_pubkey,
-            sig,
-        } = &action.signature
-        else {
-            continue; // EIP-712 already resolved in phase 1
-        };
-        if requires_eip712(&action.action) {
-            continue;
-        }
-        match session_lookup(session_pubkey) {
-            Some(session)
-                if timestamp <= session.expiry && session.scope.allows(&action.action) =>
-            {
-                let Ok(vk) = Ed25519VerifyingKey::from_bytes(session_pubkey) else {
-                    continue;
-                };
-                let struct_hash = eip712_struct_hash(&action.action, action.nonce);
-                let signing_hash = eip712_signing_hash(domain, struct_hash);
-
-                ed_indices.push(i);
-                ed_messages.push(signing_hash.0.to_vec());
-                ed_signatures.push(ed25519_dalek::Signature::from_bytes(&sig.0));
-                ed_keys.push(vk);
-                // Tentatively valid; cleared below if the batch ed25519 verify fails.
-                senders[i] = Some(session.owner);
-            }
-            _ => {}
+    for (i, item) in per_index.into_iter().enumerate() {
+        if let Some(item) = item {
+            ed_indices.push(i);
+            ed_messages.push(item.message);
+            ed_signatures.push(item.signature);
+            ed_keys.push(item.key);
+            senders[i] = Some(item.owner);
         }
     }
 
@@ -2134,5 +2190,346 @@ mod tests {
         );
         let got = batch_verify_native_actions_cached(&[action], TEST_NONCE, |_| None, |_| None);
         assert_eq!(got[0], None, "unresolvable action -> None (slash input)");
+    }
+
+    // ------------------------------------------------------------------
+    // Phase-2 parallelization characterization (Task 2, perf/p3-throughput).
+    //
+    // `reference_impl` below is a byte-for-byte copy of the ORIGINAL (serial
+    // Phase-2) `batch_verify_native_actions_cached` as it stood before the
+    // parallel refactor. Every case asserts the production function's output is
+    // bit-identical to this reference across the full matrix of session shapes,
+    // so the refactor is proven output-preserving (no consensus/hash change).
+    // ------------------------------------------------------------------
+
+    /// Verbatim pre-refactor implementation (serial Phase 2). Kept as the
+    /// characterization oracle; must never be "optimized".
+    fn reference_impl(
+        actions: &[SignedNativeAction],
+        timestamp: u64,
+        session_lookup: impl Fn(&[u8; 32]) -> Option<crate::SessionData>,
+        verified_lookup: impl Fn(&alloy_primitives::B256) -> Option<Address>,
+    ) -> Vec<Option<Address>> {
+        use rayon::prelude::*;
+
+        let cache_hits: Vec<Option<Address>> = actions
+            .iter()
+            .map(|action| crate::verified_cache_key(action).and_then(|k| verified_lookup(&k)))
+            .collect();
+
+        let mut senders: Vec<Option<Address>> = actions
+            .par_iter()
+            .zip(cache_hits.par_iter())
+            .map(|(action, hit)| {
+                if hit.is_some() {
+                    return *hit;
+                }
+                match &action.signature {
+                    ActionSignature::Eip712(_) => action.recover_sender().ok(),
+                    ActionSignature::Session { .. } => None,
+                }
+            })
+            .collect();
+
+        let domain = eip712_domain_separator();
+
+        let mut ed_indices = Vec::new();
+        let mut ed_messages = Vec::new();
+        let mut ed_signatures = Vec::new();
+        let mut ed_keys = Vec::new();
+
+        for (i, action) in actions.iter().enumerate() {
+            let ActionSignature::Session {
+                session_pubkey,
+                sig,
+            } = &action.signature
+            else {
+                continue;
+            };
+            if requires_eip712(&action.action) {
+                continue;
+            }
+            match session_lookup(session_pubkey) {
+                Some(session)
+                    if timestamp <= session.expiry && session.scope.allows(&action.action) =>
+                {
+                    let Ok(vk) = Ed25519VerifyingKey::from_bytes(session_pubkey) else {
+                        continue;
+                    };
+                    let struct_hash = eip712_struct_hash(&action.action, action.nonce);
+                    let signing_hash = eip712_signing_hash(domain, struct_hash);
+
+                    ed_indices.push(i);
+                    ed_messages.push(signing_hash.0.to_vec());
+                    ed_signatures.push(ed25519_dalek::Signature::from_bytes(&sig.0));
+                    ed_keys.push(vk);
+                    senders[i] = Some(session.owner);
+                }
+                _ => {}
+            }
+        }
+
+        if !ed_indices.is_empty() {
+            let msg_refs: Vec<&[u8]> = ed_messages.iter().map(|m| m.as_slice()).collect();
+            if ed25519_dalek::verify_batch(&msg_refs, &ed_signatures, &ed_keys).is_err() {
+                for j in 0..ed_indices.len() {
+                    if ed_keys[j]
+                        .verify(&ed_messages[j], &ed_signatures[j])
+                        .is_err()
+                    {
+                        senders[ed_indices[j]] = None;
+                    }
+                }
+            }
+        }
+
+        senders
+    }
+
+    /// Assert production == reference for a given batch + session store, on both
+    /// the cache-off and (trivial) cache-on paths.
+    fn assert_matches_reference(actions: &[SignedNativeAction], ts: u64, store: &SessionStore) {
+        let lookup = |pk: &[u8; 32]| store.get(pk).cloned();
+        let got = batch_verify_native_actions_cached(actions, ts, lookup, |_| None);
+        let want = reference_impl(actions, ts, lookup, |_| None);
+        assert_eq!(got, want, "parallel Phase-2 output must equal serial reference");
+    }
+
+    fn ed(seed: u8) -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
+    }
+
+    #[test]
+    fn phase2_char_empty_batch() {
+        let store = SessionStore::new();
+        assert_matches_reference(&[], TEST_NONCE, &store);
+    }
+
+    #[test]
+    fn phase2_char_all_valid_session() {
+        let k = ed(11);
+        let pk = k.verifying_key().to_bytes();
+        let owner = Address::from([0x11; 20]);
+        let mut store = SessionStore::new();
+        store.insert(pk, make_session(owner));
+        let actions: Vec<_> = (0..8u64)
+            .map(|i| sign_order(TEST_NONCE + i, &k))
+            .collect();
+        assert_matches_reference(&actions, TEST_NONCE, &store);
+    }
+
+    #[test]
+    fn phase2_char_expired_session() {
+        let k = ed(12);
+        let pk = k.verifying_key().to_bytes();
+        let mut store = SessionStore::new();
+        store.insert(
+            pk,
+            SessionData {
+                owner: Address::from([0x12; 20]),
+                expiry: TEST_NONCE - 1, // expired at `ts`
+                scope: SessionScope::Trading,
+                created_at: 0,
+            },
+        );
+        let actions = vec![sign_order(TEST_NONCE, &k)];
+        assert_matches_reference(&actions, TEST_NONCE, &store);
+    }
+
+    #[test]
+    fn phase2_char_out_of_scope_action() {
+        let k = ed(13);
+        let pk = k.verifying_key().to_bytes();
+        let mut store = SessionStore::new();
+        // TransfersOnly does NOT allow CancelOrder (what sign_order builds).
+        store.insert(
+            pk,
+            SessionData {
+                owner: Address::from([0x13; 20]),
+                expiry: u64::MAX,
+                scope: SessionScope::TransfersOnly,
+                created_at: 0,
+            },
+        );
+        let actions = vec![sign_order(TEST_NONCE, &k)];
+        assert_matches_reference(&actions, TEST_NONCE, &store);
+    }
+
+    #[test]
+    fn phase2_char_forged_sig_in_valid_batch() {
+        // Exercises the verify_batch-failure -> per-sig fallback path.
+        let k = ed(14);
+        let pk = k.verifying_key().to_bytes();
+        let owner = Address::from([0x14; 20]);
+        let mut store = SessionStore::new();
+        store.insert(pk, make_session(owner));
+
+        let mut actions: Vec<_> = (0..6u64)
+            .map(|i| sign_order(TEST_NONCE + i, &k))
+            .collect();
+        // Corrupt the ed25519 signature on index 3.
+        if let ActionSignature::Session { ref mut sig, .. } = actions[3].signature {
+            sig.0[0] ^= 0xFF;
+        }
+        assert_matches_reference(&actions, TEST_NONCE, &store);
+    }
+
+    #[test]
+    fn phase2_char_mixed_eip712_and_session() {
+        let key = test_key();
+        let k = ed(15);
+        let pk = k.verifying_key().to_bytes();
+        let owner = Address::from([0x15; 20]);
+        let mut store = SessionStore::new();
+        store.insert(pk, make_session(owner));
+
+        let mut actions = Vec::new();
+        for i in 0..12u64 {
+            let nonce = TEST_NONCE + i;
+            actions.push(if i % 2 == 0 {
+                sign_native_action(NativeAction::UnjailSelf, nonce, &key)
+            } else {
+                sign_order(nonce, &k)
+            });
+        }
+        assert_matches_reference(&actions, TEST_NONCE, &store);
+    }
+
+    #[test]
+    fn phase2_char_many_actions_share_one_pubkey() {
+        // The dedup pre-pass must resolve one lookup for all N; output identical.
+        let k = ed(16);
+        let pk = k.verifying_key().to_bytes();
+        let owner = Address::from([0x16; 20]);
+        let mut store = SessionStore::new();
+        store.insert(pk, make_session(owner));
+        let actions: Vec<_> = (0..32u64)
+            .map(|i| sign_order(TEST_NONCE + i, &k))
+            .collect();
+        assert_matches_reference(&actions, TEST_NONCE, &store);
+    }
+
+    #[test]
+    fn phase2_char_same_pubkey_lookup_none() {
+        // Many actions under a pubkey the store does NOT know -> all None.
+        let k = ed(17);
+        let store = SessionStore::new(); // empty: every lookup returns None
+        let actions: Vec<_> = (0..10u64)
+            .map(|i| sign_order(TEST_NONCE + i, &k))
+            .collect();
+        assert_matches_reference(&actions, TEST_NONCE, &store);
+    }
+
+    #[test]
+    fn phase2_char_requires_eip712_session_action() {
+        // A session-signed action that REQUIRES full EIP-712 (ClaimRewards) must be
+        // rejected (None) and must never trigger a session_lookup — the parallel
+        // path skips it exactly like the serial one.
+        let k = ed(18);
+        let pk = k.verifying_key().to_bytes();
+        let mut store = SessionStore::new();
+        store.insert(pk, make_session(Address::from([0x18; 20])));
+        let action = sign_action_with_session(NativeAction::ClaimRewards, TEST_NONCE, &k);
+        let actions = vec![action];
+        assert_matches_reference(&actions, TEST_NONCE, &store);
+    }
+
+    #[test]
+    fn phase2_char_dedup_lookup_count_matches_unique_pubkeys() {
+        // Prove the dedup contract directly: N actions across 3 unique pubkeys ->
+        // exactly 3 session_lookup calls (independent of the closure's own memo).
+        let keys = [ed(20), ed(21), ed(22)];
+        let owners = [
+            Address::from([0x20; 20]),
+            Address::from([0x21; 20]),
+            Address::from([0x22; 20]),
+        ];
+        let mut store = SessionStore::new();
+        for (k, o) in keys.iter().zip(owners.iter()) {
+            store.insert(k.verifying_key().to_bytes(), make_session(*o));
+        }
+        let mut actions = Vec::new();
+        for i in 0..30u64 {
+            actions.push(sign_order(TEST_NONCE + i, &keys[(i % 3) as usize]));
+        }
+        let calls = std::cell::Cell::new(0usize);
+        let lookup = |pk: &[u8; 32]| {
+            calls.set(calls.get() + 1);
+            store.get(pk).cloned()
+        };
+        let got = batch_verify_native_actions_cached(&actions, TEST_NONCE, lookup, |_| None);
+        assert_eq!(
+            calls.get(),
+            3,
+            "dedup pre-pass must call session_lookup once per unique pubkey"
+        );
+        // And still correct: every action resolves to its owner.
+        let want: Vec<Option<Address>> = (0..30u64)
+            .map(|i| Some(owners[(i % 3) as usize]))
+            .collect();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn phase2_char_large_mixed_stress() {
+        // Broad stress: valid/expired/out-of-scope/unknown/eip712/forged/requires-eip712
+        // all interleaved, several pubkeys shared, against the serial oracle.
+        let key = test_key();
+        let key2 = test_key_2();
+        let good = ed(30);
+        let good_pk = good.verifying_key().to_bytes();
+        let expired = ed(31);
+        let expired_pk = expired.verifying_key().to_bytes();
+        let oos = ed(32);
+        let oos_pk = oos.verifying_key().to_bytes();
+        let unknown = ed(33); // never inserted
+        let good2 = ed(34);
+        let good2_pk = good2.verifying_key().to_bytes();
+
+        let mut store = SessionStore::new();
+        store.insert(good_pk, make_session(Address::from([0x30; 20])));
+        store.insert(good2_pk, make_session(Address::from([0x34; 20])));
+        store.insert(
+            expired_pk,
+            SessionData {
+                owner: Address::from([0x31; 20]),
+                expiry: TEST_NONCE - 5,
+                scope: SessionScope::Trading,
+                created_at: 0,
+            },
+        );
+        store.insert(
+            oos_pk,
+            SessionData {
+                owner: Address::from([0x32; 20]),
+                expiry: u64::MAX,
+                scope: SessionScope::TransfersOnly,
+                created_at: 0,
+            },
+        );
+
+        let mut actions = Vec::new();
+        for i in 0..80u64 {
+            let n = TEST_NONCE + i;
+            let a = match i % 8 {
+                0 => sign_native_action(NativeAction::UnjailSelf, n, &key),
+                1 => sign_order(n, &good),
+                2 => sign_order(n, &expired),
+                3 => sign_order(n, &oos),
+                4 => sign_order(n, &unknown),
+                5 => sign_native_action(NativeAction::ClaimRewards, n, &key2),
+                6 => sign_order(n, &good2),
+                _ => sign_action_with_session(NativeAction::ClaimRewards, n, &good), // requires_eip712 via session
+            };
+            actions.push(a);
+        }
+        // Forge a couple of the otherwise-good session sigs to hit the fallback.
+        if let ActionSignature::Session { ref mut sig, .. } = actions[9].signature {
+            sig.0[5] ^= 0xAA;
+        }
+        if let ActionSignature::Session { ref mut sig, .. } = actions[49].signature {
+            sig.0[10] ^= 0x55;
+        }
+        assert_matches_reference(&actions, TEST_NONCE, &store);
     }
 }
