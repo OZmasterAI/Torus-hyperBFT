@@ -197,6 +197,40 @@ pub struct Metrics {
     /// unsubscribed past grace) to re-trigger the subscription exchange.
     pub mesh_watchdog_disconnects: Counter,
 
+    // P2 funnel instrumentation (perf/p2-funnel-instr) — closes the
+    // offered→executed order-loss ledger: every previously-silent sink gets a
+    // counter so sum(rejects + expiry + sheds + placed/filled) ≈ offered per cell.
+    /// Native-pool entries (actions) purged by the 60s nonce-window expiry —
+    /// previously info-log only, the biggest silent loss sink.
+    pub native_pool_expired_actions: Counter,
+    /// Orders purged with those expired actions (sum of `order_count` per
+    /// evicted entry — actions × batch size for PlaceOrderBatch).
+    pub native_pool_expired_orders: Counter,
+    /// Batch-submit items shed because no verify permit arrived within
+    /// SUBMIT_QUEUE_TIMEOUT ("server overloaded"). Counted in ITEMS (batch len)
+    /// where known so the ledger stays in action units; the single-action
+    /// endpoint counts 1 per shed call.
+    pub rpc_submit_shed: Counter,
+    /// Actions the single sequential gossip-ingest task pulled off `native_rx`
+    /// and handed to the mempool (admitted or rejected — this counts intake).
+    pub native_ingest_processed_actions: Counter,
+    /// Instantaneous queue depth of the gossip-ingest channel (`native_rx`),
+    /// sampled by the ingest task per message. Sustained growth = the single
+    /// ingest task is the bottleneck (Phase-1 prediction (a)).
+    pub native_ingest_rx_backlog: Gauge,
+    /// Committed blocks enqueued to the exec channel (paired with
+    /// `exec_queue_out`; in − out = occupancy incl. in-flight, and unlike the
+    /// gauge the pair survives scrape races and shows flow rates).
+    pub exec_queue_in: Counter,
+    /// Committed blocks fully executed by the exec thread.
+    pub exec_queue_out: Counter,
+    /// Orders that entered a book as resting at exec
+    /// (status Resting / PartiallyFilled / PendingTrigger at placement).
+    pub orders_placed: Counter,
+    /// Exec-side order deaths by reason (insufficient_margin / balance_error /
+    /// fill_failed / engine_rejected / cancelled_unfilled / batch_cap_skipped).
+    pub orders_rejected: Family<Vec<(String, String)>, Counter>,
+
     // RocksDB runtime state (S405 BS-3) — the propose cost accumulates with
     // process lifetime, not persistent DB size; these expose the in-process
     // storage state (all reset on restart) to correlate against.
@@ -459,6 +493,22 @@ impl Metrics {
             "Batch-submit items rejected at admission, by reason",
             rpc_submit_admit_rejects.clone(),
         );
+        // prometheus_client omits EMPTY families from encode(): without seeding,
+        // the counter is invisible on /metrics until the first reject and every
+        // before/after delta starts from null (P2 funnel item 2). Pre-create the
+        // known reason series at 0 so scrapes always see them.
+        for reason in [
+            "duplicate",
+            "sender_queue_full",
+            "pool_full",
+            "pool_full_preverify",
+            "rate_limited",
+            "verify_failed",
+            "other",
+        ] {
+            let _ = rpc_submit_admit_rejects
+                .get_or_create(&vec![("reason".to_string(), reason.to_string())]);
+        }
 
         let native_da_pull_failures = Counter::default();
         registry.register(
@@ -719,6 +769,82 @@ impl Metrics {
             mesh_watchdog_disconnects.clone(),
         );
 
+        let native_pool_expired_actions = Counter::default();
+        registry.register(
+            "torus_native_pool_expired_actions",
+            "Native-pool actions purged by the 60s nonce-window expiry",
+            native_pool_expired_actions.clone(),
+        );
+
+        let native_pool_expired_orders = Counter::default();
+        registry.register(
+            "torus_native_pool_expired_orders",
+            "Orders purged with nonce-expired native-pool actions (sum of order_count per evicted entry)",
+            native_pool_expired_orders.clone(),
+        );
+
+        let rpc_submit_shed = Counter::default();
+        registry.register(
+            "torus_rpc_submit_shed",
+            "Submit items shed on verify-permit timeout (server overloaded), in items where batch length is known",
+            rpc_submit_shed.clone(),
+        );
+
+        let native_ingest_processed_actions = Counter::default();
+        registry.register(
+            "torus_native_ingest_processed_actions",
+            "Actions the sequential gossip-ingest task drained from native_rx into the mempool",
+            native_ingest_processed_actions.clone(),
+        );
+
+        let native_ingest_rx_backlog = Gauge::default();
+        registry.register(
+            "torus_native_ingest_rx_backlog",
+            "Queued messages in the gossip-ingest channel (native_rx), sampled per processed message",
+            native_ingest_rx_backlog.clone(),
+        );
+
+        let exec_queue_in = Counter::default();
+        registry.register(
+            "torus_exec_queue_in",
+            "Committed blocks enqueued to the execution channel",
+            exec_queue_in.clone(),
+        );
+
+        let exec_queue_out = Counter::default();
+        registry.register(
+            "torus_exec_queue_out",
+            "Committed blocks fully executed by the execution thread",
+            exec_queue_out.clone(),
+        );
+
+        let orders_placed = Counter::default();
+        registry.register(
+            "torus_orders_placed",
+            "Orders that entered a book as resting at execution (Resting/PartiallyFilled/PendingTrigger)",
+            orders_placed.clone(),
+        );
+
+        let orders_rejected = Family::<Vec<(String, String)>, Counter>::default();
+        registry.register(
+            "torus_orders_rejected",
+            "Exec-side order deaths, by reason",
+            orders_rejected.clone(),
+        );
+        // Same empty-family pitfall as admit_rejects: pre-seed the fixed exec
+        // reject reasons so the series are scrapeable at 0 from boot.
+        for reason in [
+            "insufficient_margin",
+            "balance_error",
+            "fill_failed",
+            "engine_rejected",
+            "cancelled_unfilled",
+            "batch_cap_skipped",
+        ] {
+            let _ =
+                orders_rejected.get_or_create(&vec![("reason".to_string(), reason.to_string())]);
+        }
+
         let rocksdb_l0_files = Family::<Vec<(String, String)>, Gauge>::default();
         registry.register(
             "torus_rocksdb_l0_files",
@@ -821,6 +947,15 @@ impl Metrics {
             consensus_mesh_peers,
             consensus_subscribed_validators,
             mesh_watchdog_disconnects,
+            native_pool_expired_actions,
+            native_pool_expired_orders,
+            rpc_submit_shed,
+            native_ingest_processed_actions,
+            native_ingest_rx_backlog,
+            exec_queue_in,
+            exec_queue_out,
+            orders_placed,
+            orders_rejected,
             rocksdb_l0_files,
             rocksdb_memtable_bytes,
             rocksdb_pending_compaction_bytes,
@@ -1010,6 +1145,67 @@ mod tests {
         ] {
             assert!(text.contains(name), "{name} not registered:\n{text}");
         }
+    }
+
+    /// P2 funnel instrumentation (perf/p2-funnel-instr): every silent order-loss
+    /// sink gets a counter so the offered→executed ledger closes per bench cell.
+    /// All nine metrics must be registered and observable on /metrics.
+    #[test]
+    fn p2_funnel_metrics_register() {
+        let m = Metrics::new();
+        m.native_pool_expired_actions.inc();
+        m.native_pool_expired_orders.inc_by(400);
+        m.rpc_submit_shed.inc();
+        m.native_ingest_processed_actions.inc();
+        m.native_ingest_rx_backlog.set(3);
+        m.exec_queue_in.inc();
+        m.exec_queue_out.inc();
+        m.orders_placed.inc();
+        m.orders_rejected
+            .get_or_create(&vec![(
+                "reason".to_string(),
+                "insufficient_margin".to_string(),
+            )])
+            .inc();
+        let text = m.encode();
+        for name in [
+            "torus_native_pool_expired_actions",
+            "torus_native_pool_expired_orders",
+            "torus_rpc_submit_shed",
+            "torus_native_ingest_processed_actions",
+            "torus_native_ingest_rx_backlog",
+            "torus_exec_queue_in",
+            "torus_exec_queue_out",
+            "torus_orders_placed",
+            "torus_orders_rejected",
+        ] {
+            assert!(text.contains(name), "{name} not registered:\n{text}");
+        }
+        assert!(
+            text.contains(r#"torus_orders_rejected_total{reason="insufficient_margin"} 1"#),
+            "labeled reject series must encode:\n{text}"
+        );
+    }
+
+    /// P2 item 2: `torus_rpc_submit_admit_rejects` must be exported on /metrics —
+    /// both the family metadata (visible even before any reject) and a concrete
+    /// labeled series once a reason is counted.
+    #[test]
+    fn admit_rejects_family_exported() {
+        let m = Metrics::new();
+        let text = m.encode();
+        assert!(
+            text.contains("torus_rpc_submit_admit_rejects"),
+            "admit-rejects family metadata must be exported with zero series:\n{text}"
+        );
+        m.rpc_submit_admit_rejects
+            .get_or_create(&vec![("reason".to_string(), "duplicate".to_string())])
+            .inc();
+        let text = m.encode();
+        assert!(
+            text.contains(r#"torus_rpc_submit_admit_rejects_total{reason="duplicate"} 1"#),
+            "labeled admit-reject series must encode:\n{text}"
+        );
     }
 
     /// BS-4a: the off-thread DA recovery worker's counters must be registered so
