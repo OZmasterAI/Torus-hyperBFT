@@ -68,8 +68,10 @@ enum Command {
         rpc_urls: String,
         /// Number of distinct signing senders. Defaults to 20 — the hardhat market-maker
         /// accounts pre-funded with a native balance in genesis (`native_balances`). Orders
-        /// from UNFUNDED senders (index >= 20) are rejected for insufficient margin and never
-        /// match, so raising this above 20 needs matching genesis funding to be meaningful.
+        /// from UNFUNDED senders are rejected for insufficient margin and never match, so
+        /// sender range must match genesis funding: the weighted testnet genesis
+        /// (gen-weighted-genesis.sh) funds indices 60..60+100,000 — use
+        /// `--sender-offset 60` with up to 100k senders there.
         #[arg(long, default_value_t = 20)]
         senders: usize,
         #[arg(long, default_value_t = 30)]
@@ -117,6 +119,38 @@ enum Command {
         /// per-market parallel matching entirely (S372/S395).
         #[arg(long, default_value_t = 1)]
         markets: u64,
+        /// A4 economic load shape: margin-targeted sizing, balanced one-side-per-
+        /// (sender,market) maker/taker flow around a fixed mid, and interleaved
+        /// cancel-alls so per-sender margin reaches a steady state instead of
+        /// exhausting after ~8 orders. Default OFF = the legacy random shape
+        /// (price ~U[55k,65k] x qty ~U[1,100]) so prior cells stay reproducible.
+        #[arg(long, default_value_t = false)]
+        econ: bool,
+        /// econ: per-order Phase-2 margin target in whole TRS at the executor's
+        /// default 20x leverage. qty = target*20/price (>= 1 lot).
+        #[arg(long, default_value_t = 1500)]
+        target_margin: u64,
+        /// econ: probability an order is priced to CROSS the mid (taker-shaped;
+        /// matched fills are the mission metric). The remainder rest passive.
+        #[arg(long, default_value_t = 0.5)]
+        cross_fraction: f64,
+        /// econ: per-action probability of a CancelAllOrders (all markets)
+        /// instead of a PlaceOrderBatch — recycles resting GTC margin and keeps
+        /// per-(sender,market) resting counts under the book's 200-order cap.
+        #[arg(long, default_value_t = 0.05)]
+        cancel_fraction: f64,
+        /// econ: fixed mid price in whole TRS. 0 = derive as 20 x target-margin
+        /// so a 1-lot order's margin lands exactly on target.
+        #[arg(long, default_value_t = 0)]
+        econ_mid: u64,
+        /// econ: price-offset half-band in ticks (d ~ U[1, band] around mid).
+        #[arg(long, default_value_t = 5)]
+        band: u64,
+        /// econ: aggregate offered rate in actions/s across ALL senders (f64 —
+        /// allows per-sender rates below 1/s at high sender counts, which the
+        /// integer per-sender --rate cannot express). 0 = fall back to --rate.
+        #[arg(long, default_value_t = 0.0)]
+        rate_total: f64,
     },
     Combined {
         #[arg(
@@ -395,6 +429,353 @@ mod ammo_plan_tests {
     #[test]
     fn unpinned_box_presigns_high_sender() {
         assert_eq!(choose_ammo_plan(49_500, 3_000.0, LEAD, 20, W), AmmoPlan::Presign);
+    }
+}
+
+// ============================================================================
+// A4: economic load shape ("econ mode") — sustainable margin + real matching
+// ============================================================================
+//
+// The legacy generator (price ~U[55k,65k] x qty ~U[1,100], GTC, never cancelled)
+// needs ~151k TRS margin/order at the executor's default 20x leverage
+// (`margin_configs` is never populated -> `unwrap_or(20)`, native_executor.rs).
+// A 1M TRS genesis sender affords ~8 orders, then every subsequent order dies in
+// Phase-2 margin pre-reserve — the A3 funnel measured 99.987% rejected_margin.
+//
+// MARGIN SEMANTICS (ground truth from native_executor.rs / position.rs):
+//   * Phase 2 reserve (limit orders): m = price*qty/20 moves available -> order_margin.
+//   * Phase 4 release: FULL release when the incoming order does NOT rest
+//     (Filled / IOC-cancelled / Rejected); PROPORTIONAL release for the filled part
+//     of a partially-filled resting order. Release covers ONLY the in-batch
+//     (taker-side) reservation.
+//   * CancelOrder / CancelAllOrders release price*remaining_qty/20 (capped by
+//     order_margin) — i.e. only the UNFILLED remainder.
+//   * A resting order filled as MAKER by a later taker gets NO release anywhere:
+//     the reservation is permanently stranded in order_margin (node-side leak —
+//     out of scope to fix here, but it bounds any matched-flow run). STP
+//     maker-cancels leak the same way. Positions themselves reserve nothing
+//     (apply_fill only tracks size/entry and credits realized PnL), and
+//     liquidation never runs (it iterates the empty margin_configs).
+//
+// EQUILIBRIUM (per sender, balance B, per-order margin m ~= --target-margin):
+//   * taker fills and cancels round-trip their margin: net 0.
+//   * resting (not yet filled/cancelled) margin is bounded by the cancel-all
+//     cadence: <= batch_size * (1/cancel_fraction) * m expected, and hard-capped
+//     by the book's 200-orders/trader/market limit at 200 * markets * m
+//     (200 * 10 * 1.5k = 3M TRS with defaults — well under B).
+//   * maker fills leak m each: leak_rate/sender = (fills/s ÷ senders) * m.
+//     Horizon T = (B - locked) / leak_rate. With B = 100M TRS (bumped genesis),
+//     m = 1.5k, 150k fills/s: s=5,000 -> T ~= 37 min; s=100,000 -> T ~= 12 h.
+//     True indefinite steady state is impossible bench-side while the node
+//     strands maker-fill margin; scale senders and/or lower target-margin to
+//     stretch T.
+//
+// CROSSING SHAPE: every (sender, market) pair trades ONE side only
+// (parity of sender_idx + market_id), so a sender can never self-trade (STP
+// cancels would leak margin without producing a fill). Each order is priced off
+// a fixed per-run mid: passive (rests) at mid -/+ d and aggressive (crosses) at
+// mid +/- d, d ~ U[1, band] ticks, aggressive with probability --cross-fraction.
+// Aggressive orders lift the opposing passive queue -> real matched fills;
+// unfilled aggressive remainders rest at the top of book and are consumed first
+// by the next opposing aggressive order. Sizing: qty = target*20/price (>= 1
+// lot), so per-order margin ~= --target-margin regardless of mid.
+
+/// Executor default leverage for markets absent from `margin_configs`
+/// (`native_executor.rs` `unwrap_or(20)` — the map is never populated).
+const NATIVE_DEFAULT_LEVERAGE: i128 = 20;
+
+/// Econ-mode load shape (A4). See the module comment above for the margin
+/// semantics and the per-sender equilibrium arithmetic.
+#[derive(Clone, Copy, Debug)]
+struct EconShape {
+    /// Per-order margin target, whole TRS. qty = target*20/price.
+    target_margin: u64,
+    /// Fixed mid price, whole TRS (tick = 1.0 on auto-created books).
+    mid: u64,
+    /// Price offset half-band in ticks: d ~ U[1, band].
+    band: u64,
+    /// Probability an order is priced to CROSS the mid (taker-shaped).
+    cross_fraction: f64,
+    /// Per-action probability of a CancelAllOrders (all markets) instead of a
+    /// PlaceOrderBatch — recycles resting GTC margin back to `available`.
+    cancel_fraction: f64,
+}
+
+impl EconShape {
+    /// `mid == 0` derives mid = 20 x target-margin, so a 1-lot order's margin
+    /// lands exactly on target. Fractions are clamped into [0, 1]; band into
+    /// [1, mid-1] so prices stay positive.
+    fn new(
+        target_margin: u64,
+        mid: u64,
+        band: u64,
+        cross_fraction: f64,
+        cancel_fraction: f64,
+    ) -> Self {
+        let target_margin = target_margin.max(1);
+        let mid = if mid == 0 {
+            target_margin * NATIVE_DEFAULT_LEVERAGE as u64
+        } else {
+            mid
+        };
+        Self {
+            target_margin,
+            mid,
+            band: band.clamp(1, mid.saturating_sub(1).max(1)),
+            cross_fraction: cross_fraction.clamp(0.0, 1.0),
+            cancel_fraction: cancel_fraction.clamp(0.0, 1.0),
+        }
+    }
+}
+
+/// Fixed side per (sender, market): a sender only ever buys or only ever sells
+/// in a given market, so its taker orders can never hit its own resting orders
+/// (STP maker-cancels leak margin and produce no fill). Parity splits every
+/// market's senders 50/50 buyers/sellers, so aggregate flow is balanced and
+/// positions per (sender, market) grow one-directionally (no realized-PnL
+/// balance churn: apply_fill's reduce/close paths never trigger).
+fn econ_side_is_buy(sender_idx: usize, market_id: u64) -> bool {
+    (sender_idx as u64).wrapping_add(market_id) % 2 == 0
+}
+
+/// One econ-shaped order. Prices are whole-unit (tick 1.0) offsets from the
+/// fixed mid: passive orders rest inside their own side of the book, aggressive
+/// orders cross to the opposing side. Quantity targets `target_margin` TRS of
+/// Phase-2 margin at the executor's default 20x leverage, floored at 1 lot
+/// (the auto-created book's dust threshold).
+fn econ_place_order(
+    rng: &mut impl Rng,
+    sender_idx: usize,
+    market_id: u64,
+    shape: &EconShape,
+) -> PlaceOrderParams {
+    let is_buy = econ_side_is_buy(sender_idx, market_id);
+    let aggressive = rng.gen_bool(shape.cross_fraction);
+    let d = rng.gen_range(1..=shape.band as i128);
+    // Aggressive buy above mid / aggressive sell below mid cross the opposing
+    // passive queue; passive orders rest on their own side.
+    let price_units = if is_buy == aggressive {
+        shape.mid as i128 + d
+    } else {
+        shape.mid as i128 - d
+    };
+    let price = FixedPoint::from_raw(price_units * FixedPoint::SCALE);
+    let target = FixedPoint::from_raw(shape.target_margin as i128 * FixedPoint::SCALE);
+    let lev = FixedPoint::from_raw(NATIVE_DEFAULT_LEVERAGE * FixedPoint::SCALE);
+    let mut quantity = target * lev / price;
+    if quantity < FixedPoint::ONE {
+        quantity = FixedPoint::ONE;
+    }
+    PlaceOrderParams {
+        market_id,
+        is_buy,
+        price,
+        quantity,
+        order_type: OrderType::Limit,
+        time_in_force: TimeInForce::GTC,
+        reduce_only: false,
+        client_order_id: None,
+    }
+}
+
+/// One econ-mode action: with probability `cancel_fraction` a
+/// `CancelAllOrders` (all markets — one signature frees every resting
+/// reservation this sender still holds), otherwise a `PlaceOrderBatch` of
+/// `batch_size` econ-shaped orders spread uniformly across markets.
+fn econ_action(
+    rng: &mut impl Rng,
+    sender_idx: usize,
+    markets: u64,
+    batch_size: usize,
+    shape: &EconShape,
+) -> NativeAction {
+    if shape.cancel_fraction > 0.0 && rng.gen_bool(shape.cancel_fraction) {
+        return NativeAction::CancelAllOrders { market_id: None };
+    }
+    let markets = markets.max(1);
+    if batch_size <= 1 {
+        let market_id = rng.gen_range(1..=markets);
+        return NativeAction::PlaceOrder(econ_place_order(rng, sender_idx, market_id, shape));
+    }
+    let orders: Vec<PlaceOrderParams> = (0..batch_size)
+        .map(|_| {
+            let market_id = rng.gen_range(1..=markets);
+            econ_place_order(rng, sender_idx, market_id, shape)
+        })
+        .collect();
+    NativeAction::PlaceOrderBatch(orders)
+}
+
+#[cfg(test)]
+mod econ_shape_tests {
+    use super::*;
+
+    fn default_shape() -> EconShape {
+        // Defaults as wired in main(): target 1500, derived mid, band 5, cross 0.5,
+        // cancel 0.05.
+        EconShape::new(1500, 0, 5, 0.5, 0.05)
+    }
+
+    /// Margin the executor will reserve in Phase 2 for this order at the
+    /// default 20x leverage (margin_configs is never populated).
+    fn phase2_margin(p: &PlaceOrderParams) -> FixedPoint {
+        let lev = FixedPoint::from_raw(NATIVE_DEFAULT_LEVERAGE * FixedPoint::SCALE);
+        p.price * p.quantity / lev
+    }
+
+    #[test]
+    fn derived_mid_is_20x_target() {
+        let s = default_shape();
+        assert_eq!(s.mid, 30_000, "mid = target-margin x default 20x leverage");
+        // Explicit mid wins.
+        assert_eq!(EconShape::new(1500, 60_000, 5, 0.5, 0.05).mid, 60_000);
+    }
+
+    // The core economics invariant: every generated order's Phase-2 margin is
+    // within 1% of --target-margin, so per-order affordability is a constant of
+    // the run, not a lottery (the legacy shape spans 5.6k..324k TRS/order).
+    #[test]
+    fn per_order_margin_within_one_percent_of_target() {
+        let shape = default_shape();
+        let mut rng = StdRng::seed_from_u64(11);
+        let target = FixedPoint::from_raw(shape.target_margin as i128 * FixedPoint::SCALE);
+        let lo = FixedPoint::from_raw(target.raw() * 99 / 100);
+        let hi = FixedPoint::from_raw(target.raw() * 101 / 100);
+        for sender_idx in 0..50 {
+            for _ in 0..200 {
+                let market_id = rng.gen_range(1..=10);
+                let p = econ_place_order(&mut rng, sender_idx, market_id, &shape);
+                let m = phase2_margin(&p);
+                assert!(
+                    m >= lo && m <= hi,
+                    "margin {m:?} outside 1% of target {target:?} (price {:?} qty {:?})",
+                    p.price,
+                    p.quantity
+                );
+                assert!(
+                    p.quantity >= FixedPoint::ONE,
+                    "qty must clear the book's 1-lot dust threshold"
+                );
+                // Whole-unit prices satisfy the auto-created book's 1.0 tick.
+                assert_eq!(p.price.raw() % FixedPoint::SCALE, 0, "price must be tick-aligned");
+            }
+        }
+    }
+
+    // One side per (sender, market): a sender's taker orders can never cross
+    // its own resting orders (STP maker-cancels leak margin, produce no fill).
+    // Parity also splits every market's senders exactly 50/50, so aggregate
+    // buy and sell flow per market is balanced by construction.
+    #[test]
+    fn side_is_fixed_per_sender_market_and_globally_balanced() {
+        let shape = default_shape();
+        let mut rng = StdRng::seed_from_u64(12);
+        for market_id in 1..=10u64 {
+            let buyers = (0..1000)
+                .filter(|&idx| econ_side_is_buy(idx, market_id))
+                .count();
+            assert_eq!(buyers, 500, "market {market_id}: parity must split 50/50");
+        }
+        // And generated orders respect it: one sender, one market, one side.
+        for &(sender_idx, market_id) in &[(0usize, 1u64), (7, 3), (42, 10)] {
+            let want = econ_side_is_buy(sender_idx, market_id);
+            for _ in 0..100 {
+                let p = econ_place_order(&mut rng, sender_idx, market_id, &shape);
+                assert_eq!(p.is_buy, want, "side must never flip for a (sender, market)");
+            }
+        }
+    }
+
+    // cross-fraction is the crossing knob: 1.0 prices every order THROUGH the
+    // mid (buys above / sells below -> taker-shaped), 0.0 rests every order on
+    // its own side. The mid itself is never quoted, so the two regimes are
+    // disjoint price sets.
+    #[test]
+    fn cross_fraction_controls_which_side_of_mid() {
+        let mid = FixedPoint::from_raw(30_000 * FixedPoint::SCALE);
+        let mut rng = StdRng::seed_from_u64(13);
+
+        let aggr = EconShape::new(1500, 0, 5, 1.0, 0.0);
+        let passive = EconShape::new(1500, 0, 5, 0.0, 0.0);
+        for sender_idx in 0..20 {
+            for market_id in 1..=4u64 {
+                let a = econ_place_order(&mut rng, sender_idx, market_id, &aggr);
+                let p = econ_place_order(&mut rng, sender_idx, market_id, &passive);
+                if a.is_buy {
+                    assert!(a.price > mid, "aggressive buy must cross above mid");
+                } else {
+                    assert!(a.price < mid, "aggressive sell must cross below mid");
+                }
+                if p.is_buy {
+                    assert!(p.price < mid, "passive buy must rest below mid");
+                } else {
+                    assert!(p.price > mid, "passive sell must rest above mid");
+                }
+            }
+        }
+    }
+
+    // cancel-fraction interleaves CancelAllOrders actions (margin recycling);
+    // 0.0 must never emit one (pure placement stream for A/B cells).
+    #[test]
+    fn cancel_fraction_interleaves_cancel_all() {
+        let mut rng = StdRng::seed_from_u64(14);
+        let never = EconShape::new(1500, 0, 5, 0.5, 0.0);
+        for _ in 0..500 {
+            assert!(!matches!(
+                econ_action(&mut rng, 3, 10, 8, &never),
+                NativeAction::CancelAllOrders { .. }
+            ));
+        }
+        let mut cancels = 0usize;
+        let some = EconShape::new(1500, 0, 5, 0.5, 0.2);
+        for _ in 0..2000 {
+            if matches!(
+                econ_action(&mut rng, 3, 10, 8, &some),
+                NativeAction::CancelAllOrders { market_id: None }
+            ) {
+                cancels += 1;
+            }
+        }
+        // ~400 expected; wide band, this is a smoke bound not a stats test.
+        assert!(
+            (200..=600).contains(&cancels),
+            "cancel-fraction 0.2 should emit ~20% cancel-alls, got {cancels}/2000"
+        );
+    }
+
+    // Same seed -> byte-identical action stream (reproducible cells).
+    #[test]
+    fn generator_is_deterministic_with_seed() {
+        let shape = default_shape();
+        let gen_stream = |seed: u64| -> Vec<String> {
+            let mut rng = StdRng::seed_from_u64(seed);
+            (0..100)
+                .map(|_| {
+                    format!("{:?}", econ_action(&mut rng, 9, 10, 4, &shape))
+                })
+                .collect()
+        };
+        assert_eq!(gen_stream(99), gen_stream(99));
+        assert_ne!(gen_stream(99), gen_stream(100));
+    }
+
+    // Batch shape: batch_size orders per action, every market in 1..=markets.
+    #[test]
+    fn batch_carries_batch_size_orders_across_markets() {
+        let shape = default_shape();
+        let mut rng = StdRng::seed_from_u64(15);
+        match econ_action(&mut rng, 4, 10, 400, &shape) {
+            NativeAction::PlaceOrderBatch(orders) => {
+                assert_eq!(orders.len(), 400);
+                assert!(orders.iter().all(|o| (1..=10).contains(&o.market_id)));
+            }
+            other => panic!("expected PlaceOrderBatch, got {other:?}"),
+        }
+        match econ_action(&mut rng, 4, 10, 1, &shape) {
+            NativeAction::PlaceOrder(_) => {}
+            other => panic!("batch_size 1 must emit a plain PlaceOrder, got {other:?}"),
+        }
     }
 }
 
@@ -1123,6 +1504,8 @@ async fn run_consensus(
     rate: usize,
     sign_mode: SignMode,
     markets: u64,
+    econ: Option<EconShape>,
+    rate_total: f64,
 ) {
     let rpc_urls: Vec<String> = rpc_urls_str
         .split(',')
@@ -1132,6 +1515,16 @@ async fn run_consensus(
     let keys = load_sender_keys(num_senders, sender_offset);
     let orders_per_action = batch_size.max(1) as u64;
     let submit_batch = submit_batch.clamp(1, 100);
+
+    // Econ mode always streams (fresh wall-clock nonces, per-fire signing on the
+    // shared blocking pool) — pre-sign's per-sender resident signer model neither
+    // scales to thousands of senders nor matters once signing is off the hot loop.
+    let pre_sign = if econ.is_some() && pre_sign > 0 {
+        eprintln!("[econ] --pre-sign ignored: econ mode streams (per-fire blocking-pool signing)");
+        0
+    } else {
+        pre_sign
+    };
 
     // Pre-sign nonces run contiguously from now_ms; if the ammo span exceeds the
     // chain's 60s nonce window the tail is rejected as "too far in future".
@@ -1159,6 +1552,27 @@ async fn run_consensus(
     println!("Batch size: {orders_per_action} order(s)/action");
     println!("Submit batch: {submit_batch} action(s)/RPC call");
     println!("RPC endpoints: {}", rpc_urls.len());
+    if let Some(shape) = &econ {
+        println!(
+            "Econ shape: target-margin {} TRS/order | mid {} | band ±{} ticks | \
+             cross {:.0}% | cancel-all {:.1}%/action",
+            shape.target_margin,
+            shape.mid,
+            shape.band,
+            shape.cross_fraction * 100.0,
+            shape.cancel_fraction * 100.0,
+        );
+        if rate_total > 0.0 {
+            println!(
+                "Rate: {rate_total:.1} actions/s aggregate ({:.3}/s per sender)",
+                rate_total / num_senders as f64
+            );
+        } else if rate > 0 {
+            println!("Rate: {rate} actions/s/sender");
+        } else {
+            println!("Rate: unbounded (burst)");
+        }
+    }
     if pre_sign > 0 {
         println!(
             "Pre-sign: {pre_sign} batches/sender ({} actions/sender, signed before the clock)",
@@ -1479,6 +1893,17 @@ async fn run_consensus(
     // Sender tasks
     let mut sender_handles = Vec::new();
 
+    // Econ pacing: `--rate-total` divides an aggregate actions/s budget across
+    // all senders with a f64 interval (per-sender rates below 1/s are the norm
+    // at thousands of senders); otherwise the legacy integer per-sender --rate.
+    let econ_pace: Option<Duration> = if rate_total > 0.0 {
+        Some(Duration::from_secs_f64(
+            num_senders as f64 * submit_batch as f64 / rate_total,
+        ))
+    } else {
+        fire_interval(submit_batch, rate)
+    };
+
     for sender_idx in 0..num_senders {
         let key = keys[sender_idx].signing_key.clone();
         let session_key = keys[sender_idx].session_key.clone();
@@ -1496,6 +1921,82 @@ async fn run_consensus(
         sender_handles.push(tokio::spawn(async move {
             let mut req_id: u64 = sender_idx as u64 * 1_000_000;
             let mut url_idx: usize = sender_idx % url_count;
+
+            if let Some(shape) = econ {
+                // A4 econ loop. Scales to 100k senders: unlike the legacy
+                // streaming path (a RESIDENT spawn_blocking signer per sender,
+                // which exhausts tokio's 512-thread blocking pool above ~512
+                // senders and starves the rest), signing here is a SHORT-LIVED
+                // blocking task per fire, so the pool is shared across the
+                // whole fleet. Action generation is deterministic per
+                // (sender, fire ordinal) via a fixed per-sender seed.
+                let mut rng = StdRng::seed_from_u64(0xEC0A_0000_0000_0000 ^ sender_idx as u64);
+                // Phase jitter: spread the fleet uniformly over one pace
+                // interval so paced fires don't arrive as a synchronized burst.
+                if let Some(iv) = econ_pace {
+                    let jitter = iv.mul_f64(rng.gen_range(0.0..1.0));
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    tokio::time::sleep(jitter.min(left)).await;
+                }
+                let mut last_nonce = 0u64;
+                let mut next_fire = Instant::now();
+                while Instant::now() < deadline {
+                    if let Some(iv) = econ_pace {
+                        let now = Instant::now();
+                        if now < next_fire {
+                            tokio::time::sleep(next_fire - now).await;
+                        }
+                        next_fire = next_fire.max(now) + iv;
+                    }
+                    // Generate inline (cheap), sign+encode on the blocking pool
+                    // (the expensive ECDSA/serialize part). Nonces are wall-clock
+                    // ms, strictly increasing per sender.
+                    let mut batch_actions = Vec::with_capacity(submit_batch);
+                    for _ in 0..submit_batch {
+                        let action =
+                            econ_action(&mut rng, sender_idx, markets, batch_size, &shape);
+                        let base = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap()
+                            .as_millis() as u64;
+                        let nonce = base.max(last_nonce + 1);
+                        last_nonce = nonce;
+                        batch_actions.push((action, nonce));
+                    }
+                    let sign_key = key.clone();
+                    let sign_session = session_key.clone();
+                    let signed = tokio::task::spawn_blocking(move || {
+                        batch_actions
+                            .into_iter()
+                            .map(|(action, nonce)| {
+                                let s = sign_one(action, nonce, &sign_key, &sign_session, sign_mode);
+                                let bytes = if bin {
+                                    bincode::serialize(&s).unwrap()
+                                } else {
+                                    serde_json::to_vec(&s).unwrap()
+                                };
+                                format!("0x{}", hex::encode(&bytes))
+                            })
+                            .collect::<Vec<String>>()
+                    })
+                    .await;
+                    let payloads = match signed {
+                        Ok(p) => p,
+                        Err(_) => break, // signer panicked — stop this sender
+                    };
+                    let permit = semaphore.clone().acquire_owned().await.unwrap();
+                    let url = urls[url_idx % url_count].clone();
+                    url_idx += 1;
+                    req_id += 1;
+                    let client = client.clone();
+                    let submitted = submitted.clone();
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        submit_payloads(&client, &url, &payloads, req_id, bin, &submitted).await;
+                    });
+                }
+                return;
+            }
 
             if !stream {
                 // Pre-sign mode: fire pre-built ammo, ZERO signing in the timed
@@ -1936,6 +2437,13 @@ async fn main() {
             rate,
             sign_mode,
             markets,
+            econ,
+            target_margin,
+            cross_fraction,
+            cancel_fraction,
+            econ_mid,
+            band,
+            rate_total,
         } => {
             let bin = match format.as_str() {
                 "bin" => true,
@@ -1953,6 +2461,9 @@ async fn main() {
                     std::process::exit(2);
                 }
             };
+            let econ_shape = econ.then(|| {
+                EconShape::new(target_margin, econ_mid, band, cross_fraction, cancel_fraction)
+            });
             run_consensus(
                 &rpc_urls,
                 senders,
@@ -1966,6 +2477,8 @@ async fn main() {
                 rate,
                 mode,
                 markets,
+                econ_shape,
+                rate_total,
             )
             .await
         }
