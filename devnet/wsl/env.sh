@@ -38,6 +38,8 @@ PEER_TO_V1=/ip4/127.0.0.1/udp/$P2P1/quic-v1/p2p/$PID1
 # bench run (A3) executes against the same consensus config as idle bring-up.
 export TORUS_HASH_ONLY_PUSH_THRESHOLD="${TORUS_HASH_ONLY_PUSH_THRESHOLD:-6000000}"
 export TORUS_NATIVE_TOTAL_BLOCK_CAP="${TORUS_NATIVE_TOTAL_BLOCK_CAP:-100}"
+# perf A1 (landed 8fa6ccd): skip shard custody in the execute_batch funnel.
+export TORUS_SHARD_CUSTODY="${TORUS_SHARD_CUSTODY:-0}"
 
 METRICS_PORTS="$MET0 $MET1 $MET2"
 RPC_URLS="http://localhost:$RPC0 http://localhost:$RPC1 http://localhost:$RPC2"
