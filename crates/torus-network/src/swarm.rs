@@ -438,23 +438,55 @@ fn publish_native_batch(
     // compressing here forced every subscriber to inflate — a DoS vector. The
     // per-peer-negotiated zstd lives on the request_response body paths.
     let payload = serialize_native_batch(batch);
+    // RH3 (finding #5): `count` is captured BEFORE the clear so a failed publish
+    // is still attributable to the actions that were dropped from pre-spread.
     let count = batch.len();
     batch.clear();
     *batch_bytes = NATIVE_BATCH_HEADER_BYTES;
-    match swarm
+    let result = match swarm
         .behaviour_mut()
         .gossipsub
         .publish(topic.clone(), payload)
     {
-        Ok(_) => {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            debug!(count, trigger, "native batch gossipsub publish error: {e:?}");
+            Err(())
+        }
+    };
+    account_native_batch_publish(result, count, shared.metrics.as_ref(), trigger);
+}
+
+/// Record the outcome of a native-action pre-spread batch publish (RH3 / finding
+/// #5). On success bumps the published-actions counter; on failure bumps
+/// `native_gossip_publish_failures` by the batch size so a dropped pre-spread
+/// batch is OBSERVABLE instead of vanishing silently — the batch is already
+/// cleared before publish, and the bodies still reach inclusion via the
+/// pre-proposal push / DA pull path, so counting (not restoring) is the bounded,
+/// non-duplicating choice. Split out from [`publish_native_batch`] so the
+/// accounting is unit-testable without a live swarm.
+fn account_native_batch_publish(
+    result: Result<(), ()>,
+    count: usize,
+    metrics: Option<&Arc<torus_telemetry::Metrics>>,
+    trigger: &str,
+) {
+    match result {
+        Ok(()) => {
             debug!(count, trigger, "published native action batch to gossipsub");
-            if let Some(ref m) = shared.metrics {
+            if let Some(m) = metrics {
                 m.gossip_messages_sent.inc();
                 m.native_gossip_published_actions.inc_by(count as u64);
             }
         }
-        Err(e) => {
-            warn!(count, trigger, "failed to publish native batch: {e:?}");
+        Err(()) => {
+            warn!(
+                count,
+                trigger, "failed to publish native batch; actions dropped from pre-spread"
+            );
+            if let Some(m) = metrics {
+                m.native_gossip_publish_failures.inc_by(count as u64);
+            }
         }
     }
 }
@@ -587,7 +619,33 @@ pub async fn run_swarm_with_config(
     let (da_serve_tx, mut da_serve_rx) = mpsc::unbounded_channel::<DaServeDone>();
     let da_serve = DaServePool::new(da_serve_tx);
 
+    // RH3 (finding #5): consensus Broadcast envelopes whose gossipsub publish
+    // failed, awaiting a bounded retry on a later loop iteration.
+    let mut publish_retry = PublishRetryQueue::default();
+
     loop {
+        // RH3: retry any previously-failed consensus publishes before handling the
+        // next event, so a proposer's lost proposal is recovered instead of
+        // burning a 500ms view. Bounded by PUBLISH_MAX_RETRIES; exact bytes +
+        // FIFO order preserve message identity and ordering.
+        if !publish_retry.is_empty() {
+            publish_retry.retry(|envelope| {
+                match swarm
+                    .behaviour_mut()
+                    .gossipsub
+                    .publish(consensus_topic.clone(), envelope.to_vec())
+                {
+                    Ok(_) => {
+                        if let Some(ref m) = shared.metrics {
+                            m.gossip_messages_sent.inc();
+                        }
+                        Ok(())
+                    }
+                    Err(_) => Err(()),
+                }
+            });
+        }
+
         let action = tokio::select! {
             biased;
 
@@ -715,7 +773,14 @@ pub async fn run_swarm_with_config(
             // Unreachable while `da_serve` (held by this loop) owns a sender.
             SwarmAction::DaServeDone(None) => {}
             SwarmAction::Command(Some(cmd)) => {
-                handle_command(*cmd, &mut swarm, &shared, &local_key, &consensus_topic);
+                handle_command(
+                    *cmd,
+                    &mut swarm,
+                    &shared,
+                    &local_key,
+                    &consensus_topic,
+                    &mut publish_retry,
+                );
             }
             SwarmAction::Command(None) => {
                 info!("Command channel closed, shutting down swarm");
@@ -1521,12 +1586,81 @@ fn handle_event(
     }
 }
 
+/// Max retry attempts for a consensus Broadcast whose gossipsub `publish` failed
+/// (RH3 / finding #5). Bounded so a persistent mesh partition can't grow the
+/// retry set unboundedly; small because a proposal that still won't publish after
+/// a few loop iterations is already stale (the view has moved on).
+const PUBLISH_MAX_RETRIES: u8 = 3;
+
+/// Hard cap on queued failed-publish envelopes. Failures past this are dropped
+/// (still counted by the caller) rather than growing memory under a sustained
+/// outage.
+const PUBLISH_RETRY_QUEUE_CAP: usize = 512;
+
+/// Bounded FIFO retry buffer for consensus Broadcast envelopes whose gossipsub
+/// `publish` failed — `AllQueuesFull` under bulk pressure or `InsufficientPeers`
+/// during a mesh blip (RH3 / finding #5). A proposer that silently drops its own
+/// proposal here burns a full 500ms view fleet-wide.
+///
+/// Safety invariants: retrying the EXACT envelope bytes preserves message
+/// identity (gossipsub dedups by message-id, so no duplicate is ever delivered),
+/// and FIFO order preserves the relative order of retried messages. Consensus
+/// tolerates the reordering inherent to a later re-send; this queue never
+/// fabricates a duplicate or reorders a message ahead of one already sent.
+#[derive(Default)]
+struct PublishRetryQueue {
+    queue: VecDeque<(Vec<u8>, u8)>,
+}
+
+impl PublishRetryQueue {
+    fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.queue.len()
+    }
+
+    /// Enqueue a failed-publish envelope for bounded retry. Returns false (and
+    /// drops the envelope) once the queue is at capacity.
+    fn enqueue(&mut self, envelope: Vec<u8>) -> bool {
+        if self.queue.len() >= PUBLISH_RETRY_QUEUE_CAP {
+            return false;
+        }
+        self.queue.push_back((envelope, PUBLISH_MAX_RETRIES));
+        true
+    }
+
+    /// Attempt to republish every queued envelope once, in FIFO order. `publish`
+    /// returns `Ok` on success. Envelopes that still fail keep their place (order
+    /// preserved) with one fewer attempt; those that exhaust their retry budget
+    /// are dropped. Returns the number republished successfully.
+    fn retry<F: FnMut(&[u8]) -> Result<(), ()>>(&mut self, mut publish: F) -> usize {
+        let mut carry: VecDeque<(Vec<u8>, u8)> = VecDeque::with_capacity(self.queue.len());
+        let mut ok = 0usize;
+        while let Some((envelope, attempts)) = self.queue.pop_front() {
+            match publish(&envelope) {
+                Ok(()) => ok += 1,
+                Err(()) => {
+                    if attempts > 1 {
+                        carry.push_back((envelope, attempts - 1));
+                    }
+                }
+            }
+        }
+        self.queue = carry;
+        ok
+    }
+}
+
 fn handle_command(
     cmd: NetworkCommand,
     swarm: &mut Swarm<TorusBehaviour>,
     shared: &SharedState,
     local_key: &VerifyingKey,
     consensus_topic: &gossipsub::IdentTopic,
+    publish_retry: &mut PublishRetryQueue,
 ) {
     match cmd {
         NetworkCommand::Broadcast { message } => {
@@ -1538,7 +1672,7 @@ fn handle_command(
                 match swarm
                     .behaviour_mut()
                     .gossipsub
-                    .publish(consensus_topic.clone(), envelope)
+                    .publish(consensus_topic.clone(), envelope.clone())
                 {
                     Ok(_) => {
                         if let Some(ref m) = shared.metrics {
@@ -1546,7 +1680,18 @@ fn handle_command(
                         }
                     }
                     Err(e) => {
+                        // RH3 (finding #5): a proposer that silently drops its own
+                        // proposal here burns a full 500ms view fleet-wide. Count
+                        // the failure and re-enqueue the EXACT envelope for a
+                        // bounded retry on a later loop iteration — identity and
+                        // order preserved, gossipsub dedups by message-id so no
+                        // duplicate is delivered. Self-delivery already happened
+                        // above, so it is NOT repeated on retry.
                         warn!("Failed to publish consensus message: {e:?}");
+                        if let Some(ref m) = shared.metrics {
+                            m.consensus_publish_failures.inc();
+                        }
+                        publish_retry.enqueue(envelope);
                     }
                 }
             }
@@ -2423,6 +2568,95 @@ mod tests {
     #[test]
     fn inbound_queue_capacity_constant() {
         assert_eq!(MAX_INBOUND_QUEUE, 10_000);
+    }
+
+    /// RH3 (finding #5): a consensus envelope whose publish fails is re-enqueued
+    /// and retried on a later iteration; a transient failure recovers, delivering
+    /// the same bytes exactly once (identity preserved, no duplicate). RED before
+    /// the retry queue existed (a failed publish was warn-dropped).
+    #[test]
+    fn publish_retry_recovers_transient_failure() {
+        let mut q = PublishRetryQueue::default();
+        let env = vec![1u8, 2, 3];
+        assert!(q.enqueue(env.clone()));
+        assert_eq!(q.len(), 1);
+        // First retry: publish still failing -> stays queued.
+        let ok = q.retry(|_| Err(()));
+        assert_eq!(ok, 0);
+        assert_eq!(q.len(), 1, "a still-failing envelope stays queued for retry");
+        // Next iteration: publish succeeds -> drained, exact bytes delivered once.
+        let mut seen: Vec<Vec<u8>> = Vec::new();
+        let ok = q.retry(|bytes| {
+            seen.push(bytes.to_vec());
+            Ok(())
+        });
+        assert_eq!(ok, 1);
+        assert_eq!(seen, vec![env], "retried envelope carries the same identity");
+        assert!(q.is_empty(), "a recovered envelope is removed (no duplicate)");
+    }
+
+    /// RH3: retries are bounded — an envelope that never publishes is dropped
+    /// after PUBLISH_MAX_RETRIES so a persistent mesh partition can't grow the
+    /// queue unboundedly.
+    #[test]
+    fn publish_retry_is_bounded() {
+        let mut q = PublishRetryQueue::default();
+        q.enqueue(vec![9u8]);
+        for _ in 0..PUBLISH_MAX_RETRIES {
+            assert_eq!(q.len(), 1);
+            q.retry(|_| Err(()));
+        }
+        assert!(
+            q.is_empty(),
+            "envelope dropped after PUBLISH_MAX_RETRIES failures"
+        );
+    }
+
+    /// RH3: the retry queue is capacity-bounded; failures past the cap are
+    /// refused (still counted by the caller) rather than growing memory.
+    #[test]
+    fn publish_retry_queue_capacity_bounded() {
+        let mut q = PublishRetryQueue::default();
+        for i in 0..PUBLISH_RETRY_QUEUE_CAP {
+            assert!(q.enqueue(vec![(i & 0xff) as u8]));
+        }
+        assert_eq!(q.len(), PUBLISH_RETRY_QUEUE_CAP);
+        assert!(!q.enqueue(vec![0xAB]), "enqueue past cap is refused");
+        assert_eq!(q.len(), PUBLISH_RETRY_QUEUE_CAP);
+    }
+
+    /// RH3: FIFO order is preserved on retry so retried consensus messages keep
+    /// their relative order (never reordered ahead of one already sent).
+    #[test]
+    fn publish_retry_preserves_fifo_order() {
+        let mut q = PublishRetryQueue::default();
+        q.enqueue(vec![1u8]);
+        q.enqueue(vec![2u8]);
+        q.enqueue(vec![3u8]);
+        let mut order: Vec<u8> = Vec::new();
+        q.retry(|bytes| {
+            order.push(bytes[0]);
+            Ok(())
+        });
+        assert_eq!(order, vec![1, 2, 3], "retried in FIFO order");
+        assert!(q.is_empty());
+    }
+
+    /// RH3: a failed native-batch publish increments native_gossip_publish_failures
+    /// by the batch size (the batch was cleared before publish) and does NOT bump
+    /// the published counter — the dropped pre-spread batch is observable, not
+    /// silently lost. A success does the inverse.
+    #[test]
+    fn native_batch_publish_failure_is_counted() {
+        let metrics = std::sync::Arc::new(torus_telemetry::Metrics::new());
+        // Failure path: 7 actions counted as lost, none as published.
+        account_native_batch_publish(Err(()), 7, Some(&metrics), "test");
+        assert_eq!(metrics.native_gossip_publish_failures.get(), 7);
+        assert_eq!(metrics.native_gossip_published_actions.get(), 0);
+        // Success path: counts as published, no new failures.
+        account_native_batch_publish(Ok(()), 5, Some(&metrics), "test");
+        assert_eq!(metrics.native_gossip_published_actions.get(), 5);
+        assert_eq!(metrics.native_gossip_publish_failures.get(), 7);
     }
 
     #[test]
