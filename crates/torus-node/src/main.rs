@@ -161,6 +161,18 @@ enum Command {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Parse a TORUS_* boolean env value: 1/true/on/yes and 0/false/off/no
+/// (case-insensitive, trimmed). `None` = unparseable — caller warns and keeps
+/// the existing default so a typo can never silently flip a consensus-adjacent
+/// performance knob.
+fn parse_env_bool(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "on" | "yes" => Some(true),
+        "0" | "false" | "off" | "no" => Some(false),
+        _ => None,
+    }
+}
+
 fn decode_hex_key(hex_str: &str) -> Result<[u8; 32], Box<dyn std::error::Error>> {
     let hex_str = hex_str.strip_prefix("0x").unwrap_or(hex_str);
     if hex_str.len() != 64 {
@@ -430,13 +442,31 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         "chain configuration loaded"
     );
 
-    // Node-local override: `--exec-trust-cache` enables the exec trust-cache read
-    // path (default off). It is deterministic (a HIT equals a fresh recover), so
-    // toggling it per-node never affects consensus or state — purely an A/B and
-    // rollback switch.
+    // Node-local override: `--exec-trust-cache` gates the exec trust-cache read
+    // path (CLI default ON since s376; this line overrides whatever the
+    // genesis/default ChainConfig carried). It is deterministic (a HIT equals a
+    // fresh recover), so toggling it per-node never affects consensus or state —
+    // purely an A/B and rollback switch.
     chain_config.exec_trust_cache = cli.exec_trust_cache;
+    // TORUS_EXEC_TRUST_CACHE env var (P2 item 6): restart-only A/B toggle that
+    // needs no compose command-line edit. When set AND parseable it overrides
+    // the CLI flag; unset/garbage = current behavior (the CLI value).
+    if let Ok(raw) = std::env::var("TORUS_EXEC_TRUST_CACHE") {
+        match parse_env_bool(&raw) {
+            Some(v) => {
+                chain_config.exec_trust_cache = v;
+                info!(value = v, "exec trust-cache set from TORUS_EXEC_TRUST_CACHE env");
+            }
+            None => warn!(
+                raw,
+                "unparseable TORUS_EXEC_TRUST_CACHE (want true/false/1/0/on/off/yes/no); keeping --exec-trust-cache value"
+            ),
+        }
+    }
     if chain_config.exec_trust_cache {
         info!("exec trust-cache ENABLED: execution reuses locally-verified senders (skips re-recover)");
+    } else {
+        info!("exec trust-cache DISABLED: execution re-recovers every sender");
     }
 
     // 5. Build components
@@ -509,11 +539,19 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         network: network.clone(),
     }));
 
-    // Spawn inbound native action gossip → mempool task
+    // Spawn inbound native action gossip → mempool task.
+    // P2 funnel item 3: this SINGLE sequential task is the Phase-1 prime suspect
+    // for the intake ceiling (~0.14 ms/order verify). Instrument its throughput
+    // (processed counter) and its channel backlog (gauge, sampled per message)
+    // so busy-fraction ≈ 1.0 + growing backlog is directly observable.
     if let Some(mut native_rx) = network.take_native_action_rx() {
         let mempool_for_gossip = mempool.clone();
+        let metrics_for_ingest = metrics.clone();
         tokio::spawn(async move {
             while let Some((sender, action)) = native_rx.recv().await {
+                metrics_for_ingest
+                    .native_ingest_rx_backlog
+                    .set(native_rx.len() as i64);
                 // Verified ingest: authenticates the claimed sender (forged
                 // gossip pairs must not pollute the pool); DA-mirrors first.
                 match mempool_for_gossip.add_native_action_from_gossip(sender, action) {
@@ -521,6 +559,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     Err(torus_mempool::MempoolError::DuplicateNativeAction) => {}
                     Err(e) => tracing::debug!("gossip native action rejected: {e}"),
                 }
+                metrics_for_ingest.native_ingest_processed_actions.inc();
             }
         });
     }
@@ -874,6 +913,29 @@ mod hex {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    /// P2 item 6: TORUS_EXEC_TRUST_CACHE must parse the usual boolean spellings
+    /// and reject garbage (None → keep the CLI value, i.e. current behavior).
+    #[test]
+    fn parse_env_bool_accepts_common_spellings() {
+        for v in ["1", "true", "TRUE", "on", "yes", " True "] {
+            assert_eq!(parse_env_bool(v), Some(true), "{v:?} must parse true");
+        }
+        for v in ["0", "false", "FALSE", "off", "no", " Off "] {
+            assert_eq!(parse_env_bool(v), Some(false), "{v:?} must parse false");
+        }
+        for v in ["", "2", "enable", "tru"] {
+            assert_eq!(parse_env_bool(v), None, "{v:?} must be rejected");
+        }
+    }
+
+    /// The CLI flag stays the baseline: --exec-trust-cache defaults TRUE at this
+    /// commit (s376: -77% exec-verify, +61% orders/s). The env var only overrides.
+    #[test]
+    fn exec_trust_cache_cli_default_is_true() {
+        let cli = Cli::try_parse_from(["torus-node", "--keystore", "k.keystore"]).unwrap();
+        assert!(cli.exec_trust_cache, "CLI default must remain ON");
+    }
 
     #[test]
     fn archive_and_retention_mutually_exclusive() {

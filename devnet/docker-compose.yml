@@ -33,6 +33,9 @@ services:
       # Overridable per leg by sweep-o5-threshold-s415.sh; NOTE the node clamps
       # requests above the 4MB fleet direct-msg floor since O5 (WARN in log).
       - TORUS_HASH_ONLY_PUSH_THRESHOLD=${TORUS_PUSH_THRESHOLD:-6000000}
+      # Exec trust-cache A/B toggle (P2 item 6): overrides --exec-trust-cache
+      # when set; default true = current behavior (CLI default ON since s376).
+      - TORUS_EXEC_TRUST_CACHE=${TORUS_EXEC_TRUST_CACHE:-true}
     volumes:
       - ./genesis.json:/genesis/genesis.json:ro
       - validator-0-data:/data
@@ -65,6 +68,9 @@ services:
       # Overridable per leg by sweep-o5-threshold-s415.sh; NOTE the node clamps
       # requests above the 4MB fleet direct-msg floor since O5 (WARN in log).
       - TORUS_HASH_ONLY_PUSH_THRESHOLD=${TORUS_PUSH_THRESHOLD:-6000000}
+      # Exec trust-cache A/B toggle (P2 item 6): overrides --exec-trust-cache
+      # when set; default true = current behavior (CLI default ON since s376).
+      - TORUS_EXEC_TRUST_CACHE=${TORUS_EXEC_TRUST_CACHE:-true}
     volumes:
       - ./genesis.json:/genesis/genesis.json:ro
       - validator-1-data:/data
@@ -96,6 +102,9 @@ services:
       # Overridable per leg by sweep-o5-threshold-s415.sh; NOTE the node clamps
       # requests above the 4MB fleet direct-msg floor since O5 (WARN in log).
       - TORUS_HASH_ONLY_PUSH_THRESHOLD=${TORUS_PUSH_THRESHOLD:-6000000}
+      # Exec trust-cache A/B toggle (P2 item 6): overrides --exec-trust-cache
+      # when set; default true = current behavior (CLI default ON since s376).
+      - TORUS_EXEC_TRUST_CACHE=${TORUS_EXEC_TRUST_CACHE:-true}
     volumes:
       - ./genesis.json:/genesis/genesis.json:ro
       - validator-2-data:/data
@@ -127,6 +136,9 @@ services:
       # Overridable per leg by sweep-o5-threshold-s415.sh; NOTE the node clamps
       # requests above the 4MB fleet direct-msg floor since O5 (WARN in log).
       - TORUS_HASH_ONLY_PUSH_THRESHOLD=${TORUS_PUSH_THRESHOLD:-6000000}
+      # Exec trust-cache A/B toggle (P2 item 6): overrides --exec-trust-cache
+      # when set; default true = current behavior (CLI default ON since s376).
+      - TORUS_EXEC_TRUST_CACHE=${TORUS_EXEC_TRUST_CACHE:-true}
     volumes:
       - ./genesis.json:/genesis/genesis.json:ro
       - validator-3-data:/data
@@ -158,6 +170,10 @@ services:
       # Overridable per leg by sweep-o5-threshold-s415.sh; NOTE the node clamps
       # requests above the 4MB fleet direct-msg floor since O5 (WARN in log).
       - TORUS_HASH_ONLY_PUSH_THRESHOLD=${TORUS_PUSH_THRESHOLD:-6000000}
+      # Exec trust-cache A/B toggle (P2 item 6): overrides --exec-trust-cache
+      # when set; default true = current behavior (CLI default ON since s376).
+      # rpc-node included: --rpc-only nodes execute committed blocks too.
+      - TORUS_EXEC_TRUST_CACHE=${TORUS_EXEC_TRUST_CACHE:-true}
     volumes:
       - ./genesis.json:/genesis/genesis.json:ro
       - rpc-node-data:/data
