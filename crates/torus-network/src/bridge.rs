@@ -683,6 +683,9 @@ mod tests {
             consensus_dedup: Mutex::new(crate::swarm::ConsensusDedup::with_cap(
                 crate::swarm::CONSENSUS_DEDUP_CAP,
             )),
+            // B1: no in-flight forward envelopes, no leader resolver.
+            outbound_forward_batches: Mutex::new(HashMap::new()),
+            leader_resolver: RwLock::new(None),
         })
     }
 

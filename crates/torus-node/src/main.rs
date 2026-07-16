@@ -815,7 +815,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let rpc_addr: SocketAddr = cli.rpc_addr.parse()?;
     let mut rpc_server = RpcServer::new(
         state_db.clone(),
-        mempool,
+        mempool.clone(),
         executor,
         chain_config.chain_id,
         chain_config.epoch_length,
