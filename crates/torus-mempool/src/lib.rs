@@ -522,9 +522,19 @@ impl Mempool {
             None
         };
 
-        {
+        let size_after = {
             let mut pool = self.native.write().unwrap();
             pool.insert_verified(sender, action, verified_locally)?;
+            pool.size()
+        };
+
+        // P3 Round-1 item 1: a working pool-occupancy gauge (the P2 report found
+        // `mempool_native_size` mis-wired — `.set()` called NOWHERE — reading 0 at
+        // every 1s sample while thousands of actions were pooled) plus an
+        // insert-success counter, so the intake identity closes per cell.
+        if let Some(m) = self.metrics.get() {
+            m.native_pool_inserted.inc();
+            m.mempool_native_size.set(size_after as i64);
         }
 
         // Seed only after a successful insert, so a rejected (dup/full) action
@@ -536,14 +546,51 @@ impl Mempool {
         Ok(())
     }
 
+    /// P3 Round-1 item 1: refresh `torus_mempool_native_size` from the current
+    /// pool occupancy. Called after every pool mutation that is NOT already
+    /// gated behind a size read (insert refreshes inline). Cheap: one read-lock
+    /// + one atomic store when metrics are wired (absent in unit tests).
+    fn refresh_native_size_gauge(&self) {
+        if let Some(m) = self.metrics.get() {
+            let size = self.native.read().unwrap().size();
+            m.mempool_native_size.set(size as i64);
+        }
+    }
+
     /// Drain native actions for a block proposal.
     /// Returns up to `limit` actions in priority order (cancels first).
     /// Per-sender-per-block caps are enforced internally.
     pub fn drain_native(&self, limit: usize) -> Vec<SignedNativeAction> {
-        let mut pool = self.native.write().unwrap();
-        let (evicted, expired_orders) = pool.evict_expired(now_ms());
+        let (drained, size_after) = {
+            let mut pool = self.native.write().unwrap();
+            let (evicted, expired_orders) = pool.evict_expired(now_ms());
+            self.count_expired(evicted, expired_orders);
+            let drained = pool.drain(limit);
+            (drained, pool.size())
+        };
+        if let Some(m) = self.metrics.get() {
+            m.mempool_native_size.set(size_after as i64);
+        }
+        drained
+    }
+
+    /// P3 Round-1 item 2: continuous-expiry tick. A 1s cadence caller (the
+    /// torus-node runtime) invokes this so nonce-window eviction fires steadily
+    /// instead of as a single lump the next time a proposer happens to select —
+    /// which is what made `pool_expired_*` appear only at cooldown in P2 and left
+    /// the intake identity 22–55% unattributed mid-run. Purely additive: the
+    /// lazy evictions in `drain_native` / selection remain as a safety net, so
+    /// reverting to lazy-only expiry is just deleting the tick task.
+    pub fn tick_expiry(&self) {
+        let (evicted, expired_orders, size_after) = {
+            let mut pool = self.native.write().unwrap();
+            let (evicted, expired_orders) = pool.evict_expired(now_ms());
+            (evicted, expired_orders, pool.size())
+        };
         self.count_expired(evicted, expired_orders);
-        pool.drain(limit)
+        if let Some(m) = self.metrics.get() {
+            m.mempool_native_size.set(size_after as i64);
+        }
     }
 
     /// Count a nonce-expiry purge on the P2 funnel counters (the 60s window is
@@ -567,8 +614,14 @@ impl Mempool {
     pub fn reinsert_native(&self, actions: Vec<SignedNativeAction>) {
         // Keep the DA-store invariant: every pooled body stays reconstructable.
         self.mirror_native_to_da(&actions);
-        let mut pool = self.native.write().unwrap();
-        pool.reinsert(actions);
+        let size_after = {
+            let mut pool = self.native.write().unwrap();
+            pool.reinsert(actions);
+            pool.size()
+        };
+        if let Some(m) = self.metrics.get() {
+            m.mempool_native_size.set(size_after as i64);
+        }
     }
 
     /// Current native pool size.
@@ -653,10 +706,18 @@ impl Mempool {
         bytes_cap: usize,
         orders_cap: usize,
     ) -> Vec<(alloy_primitives::Address, SignedNativeAction)> {
-        let mut pool = self.native.write().unwrap();
-        let (evicted, expired_orders) = pool.evict_expired(now_ms());
-        self.count_expired(evicted, expired_orders);
-        pool.select_for_block_with_senders_excluding(limit, exclude, bytes_cap, orders_cap)
+        let (selected, size_after) = {
+            let mut pool = self.native.write().unwrap();
+            let (evicted, expired_orders) = pool.evict_expired(now_ms());
+            self.count_expired(evicted, expired_orders);
+            let selected =
+                pool.select_for_block_with_senders_excluding(limit, exclude, bytes_cap, orders_cap);
+            (selected, pool.size())
+        };
+        if let Some(m) = self.metrics.get() {
+            m.mempool_native_size.set(size_after as i64);
+        }
+        selected
     }
 
     /// Remove native actions that were included in a committed block.
@@ -678,6 +739,8 @@ impl Mempool {
             self.cache_verified_sender(key, sender);
         }
         self.native.write().unwrap().remove_committed(hashes);
+        // P3 Round-1 item 1: commit removal is a pool mutation — refresh the gauge.
+        self.refresh_native_size_gauge();
     }
 
     /// Approximate total memory used by pooled transactions (Phase 3: 3.1.7).
@@ -1137,6 +1200,104 @@ mod tests {
             3,
             "orders = actions × batch size"
         );
+    }
+
+    /// P3 Round-1 item 1: the pool-occupancy gauge (mis-wired in P2 — read 0 at
+    /// every sample) must go NONZERO on a successful insert, the insert-success
+    /// counter must advance, and the gauge must DECREMENT when the action is
+    /// removed on commit.
+    #[test]
+    fn native_size_gauge_tracks_insert_and_remove() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state, MempoolConfig::default());
+        let metrics = std::sync::Arc::new(torus_telemetry::Metrics::new());
+        pool.set_metrics(metrics.clone());
+        assert_eq!(metrics.mempool_native_size.get(), 0, "gauge starts at 0");
+
+        let k = k256::ecdsa::SigningKey::from_slice(
+            &alloy_primitives::hex::decode(
+                "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let base = now_ms();
+        let a = torus_types::eip712::sign_native_action(
+            torus_types::NativeAction::ClaimRewards,
+            base + 1,
+            &k,
+        );
+        let sender = a.recover_sender().unwrap();
+        let hash = torus_types::compute_action_hash(&a);
+
+        pool.add_native_action_presigned(sender, a).unwrap();
+        assert_eq!(
+            metrics.mempool_native_size.get(),
+            1,
+            "gauge nonzero after insert"
+        );
+        assert_eq!(
+            metrics.native_pool_inserted.get(),
+            1,
+            "insert-success counter advanced"
+        );
+
+        pool.remove_committed_native(&[hash]);
+        assert_eq!(
+            metrics.mempool_native_size.get(),
+            0,
+            "gauge decremented on commit removal"
+        );
+    }
+
+    /// P3 Round-1 item 2: the continuous-expiry tick must purge nonce-aged
+    /// entries and count them WITHOUT any selection/drain call, and must drive
+    /// the occupancy gauge back to 0 — the fix for P2's lump-at-cooldown expiry.
+    #[test]
+    fn tick_expiry_evicts_without_selection() {
+        use torus_types::eip712::NONCE_WINDOW_MS;
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state, MempoolConfig::default());
+        let metrics = std::sync::Arc::new(torus_telemetry::Metrics::new());
+        pool.set_metrics(metrics.clone());
+
+        let k = k256::ecdsa::SigningKey::from_slice(
+            &alloy_primitives::hex::decode(
+                "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let order = torus_types::PlaceOrderParams {
+            market_id: 1,
+            is_buy: true,
+            price: torus_types::FixedPoint::from_raw(100 * torus_types::FixedPoint::SCALE),
+            quantity: torus_types::FixedPoint::from_raw(torus_types::FixedPoint::SCALE),
+            order_type: torus_types::OrderType::Limit,
+            time_in_force: torus_types::TimeInForce::GTC,
+            reduce_only: false,
+            client_order_id: None,
+        };
+        // Plant an already-expired batch via the reorg path (skips the nonce gate).
+        let stale = torus_types::eip712::sign_native_action(
+            torus_types::NativeAction::PlaceOrderBatch(vec![order; 5]),
+            now_ms().saturating_sub(2 * NONCE_WINDOW_MS),
+            &k,
+        );
+        pool.reinsert_native(vec![stale]);
+        assert_eq!(pool.native_pool_size(), 1);
+        assert!(metrics.mempool_native_size.get() >= 1, "gauge saw the reinsert");
+
+        // The tick alone (no drain/select) must evict and count it.
+        pool.tick_expiry();
+        assert_eq!(pool.native_pool_size(), 0, "tick evicted the stale entry");
+        assert_eq!(metrics.native_pool_expired_actions.get(), 1);
+        assert_eq!(
+            metrics.native_pool_expired_orders.get(),
+            5,
+            "orders = actions × batch size"
+        );
+        assert_eq!(metrics.mempool_native_size.get(), 0, "gauge back to 0");
     }
 
     #[test]

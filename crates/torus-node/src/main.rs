@@ -539,6 +539,27 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         network: network.clone(),
     }));
 
+    // P3 Round-1 item 2: continuous nonce-window expiry tick (1s). Before this,
+    // eviction fired only lazily when a proposer selected/drained, so during a
+    // block-rate stall expired actions accumulated and purged as a single lump at
+    // cooldown — leaving the P2 intake identity 22–55% unattributed mid-run and
+    // hiding the pool-occupancy signal. A steady tick makes `pool_expired_*` and
+    // the occupancy gauge track reality every second. Purely additive (the lazy
+    // evictions remain) and cheap at idle — an empty pool's evict is a no-op.
+    // Revertible per the design's abort criterion: delete this task to restore
+    // lazy-only expiry.
+    {
+        let mempool_for_expiry = mempool.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                mempool_for_expiry.tick_expiry();
+            }
+        });
+    }
+
     // Spawn inbound native action gossip → mempool task.
     // P2 funnel item 3: this SINGLE sequential task is the Phase-1 prime suspect
     // for the intake ceiling (~0.14 ms/order verify). Instrument its throughput
