@@ -257,6 +257,22 @@ pub struct Metrics {
     /// mutation) it closes the intake identity per cell: the P2 gauge read 0 at
     /// every sample while thousands of actions were provably pooled.
     pub native_pool_inserted: Counter,
+    // P3 Round-2 (perf/p3-throughput) — availability fast-lane instrumentation.
+    /// Native-action bodies mirrored to the durable DA store by the OFF-LOOP
+    /// mirror worker AT NETWORK RECEIPT (scope 1), ahead of the verify FIFO. The
+    /// availability signal: a block-referenced body is reconstructable this fast
+    /// even while ingest verify is backed up (was the 76s stall, R1 proof).
+    pub native_da_mirror_actions: Counter,
+    /// Raw inbound native bodies DROPPED before the mirror stage — the DoS shed
+    /// valve: either the bounded raw-intake channel was full, or a single peer
+    /// exceeded its per-peer in-flight byte budget. Recoverable via gossip
+    /// redundancy / DA pull; devnet peers are validator-set-only (WAN review).
+    pub native_raw_inbound_dropped: Counter,
+    /// Decoded, ALREADY-DA-MIRRORED bodies dropped from the verify queue under
+    /// backpressure (bounded post-mirror channel full). Safe by construction:
+    /// the body is already DA-resident, so a drop only forfeits POOL candidacy,
+    /// never availability (the R2.3 drop-safety property).
+    pub native_verify_queue_dropped: Counter,
     /// Exec phase: deserializing every market's order book from the CF at the
     /// start of a block (native_executor `load_order_books`) — the O(markets×depth)
     /// per-block reload cost, invisible before this round.
@@ -918,6 +934,27 @@ impl Metrics {
             native_pool_inserted.clone(),
         );
 
+        let native_da_mirror_actions = Counter::default();
+        registry.register(
+            "torus_native_da_mirror_actions",
+            "Native bodies mirrored to the durable DA store by the off-loop receipt worker (ahead of verify)",
+            native_da_mirror_actions.clone(),
+        );
+
+        let native_raw_inbound_dropped = Counter::default();
+        registry.register(
+            "torus_native_raw_inbound_dropped",
+            "Raw inbound native bodies dropped before mirror (bounded intake full or per-peer byte budget)",
+            native_raw_inbound_dropped.clone(),
+        );
+
+        let native_verify_queue_dropped = Counter::default();
+        registry.register(
+            "torus_native_verify_queue_dropped",
+            "Already-DA-mirrored decoded bodies dropped from the verify queue under backpressure (safe: lose only pool candidacy)",
+            native_verify_queue_dropped.clone(),
+        );
+
         let exec_load_books_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
         registry.register(
             "torus_exec_load_books_seconds",
@@ -1068,6 +1105,9 @@ impl Metrics {
             orders_placed,
             orders_rejected,
             native_pool_inserted,
+            native_da_mirror_actions,
+            native_raw_inbound_dropped,
+            native_verify_queue_dropped,
             exec_load_books_seconds,
             exec_save_books_bytes,
             native_resting_depth,

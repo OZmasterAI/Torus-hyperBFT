@@ -17,6 +17,7 @@ pub mod caps;
 pub mod codec;
 pub mod config;
 pub mod mesh_watchdog;
+pub mod native_inbound;
 pub mod peer;
 pub mod peer_scoring;
 pub mod pending_send;
@@ -27,6 +28,7 @@ pub mod tx_gossip;
 
 pub use bridge::{should_push_hashes_only, LibP2PNetwork, HASH_ONLY_PUSH_THRESHOLD};
 pub use config::NetworkConfig;
+pub use native_inbound::{NativeInboundKind, PerPeerBudget, RawNativeInbound};
 pub use pending_send::PendingSendQueue;
 pub use sync::{SyncRequest, SyncResponse};
 pub use tx_gossip::{NativeGossipHandle, TxGossipHandle};

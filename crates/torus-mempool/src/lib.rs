@@ -368,19 +368,27 @@ impl Mempool {
     /// Insert a native action received from gossip with a pre-verified sender.
     /// Skips ECDSA recovery (the expensive part) — trusts that the originating
     /// node already verified the signature. Only checks nonce freshness.
-    /// Verified gossip ingest (Sprint 3 T2): DA-mirror first (availability ≠
-    /// validity — a block-referenced body must be reconstructable regardless),
-    /// then authenticate the CLAIMED sender before pool admission, since a
-    /// malicious peer could otherwise gossip forged `(sender, action)` pairs
-    /// into every validator's pool. Eip712: recovered signer must equal the
-    /// claim. Session: signature must verify and the registered session owner
-    /// must equal the claim.
+    ///
+    /// Verified gossip ingest, authenticate the CLAIMED sender before pool
+    /// admission, since a malicious peer could otherwise gossip forged
+    /// `(sender, action)` pairs into every validator's pool. Eip712: recovered
+    /// signer must equal the claim. Session: signature must verify and the
+    /// registered session owner must equal the claim.
+    ///
+    /// P3 Round-2 (scope 1): DA-mirroring is NO LONGER done here. The inbound
+    /// mirror was hoisted AHEAD of this verify FIFO into the off-loop mirror
+    /// worker (`mirror_native_to_da` at network receipt, torus-node), so a
+    /// block-referenced body becomes DA-resident immediately even while this
+    /// (slow) verify queue is backed up — the availability-starvation stall the
+    /// round removes (mem 28e1a821). Callers on the gossip ingest path MUST have
+    /// mirrored the body before calling this (the mirror worker does). The
+    /// availability ≠ validity split is unchanged: the mirror never trusts the
+    /// body for execution/pool admission; the crypto verify below is the gate.
     pub fn add_native_action_from_gossip(
         &self,
         claimed_sender: alloy_primitives::Address,
         action: SignedNativeAction,
     ) -> Result<(), MempoolError> {
-        self.mirror_to_da(&action);
         let verified_sender = match &action.signature {
             torus_types::ActionSignature::Eip712(_) => action.recover_sender().map_err(|e| {
                 MempoolError::NativeValidationFailed(format!("gossip sig recovery: {e}"))
@@ -419,28 +427,31 @@ impl Mempool {
         self.admit_gossip(sender, action, false)
     }
 
-    /// Shared gossip admission: durable DA mirror + nonce-window gate + pool insert
-    /// with the given provenance. `verified_locally` distinguishes the recover path
-    /// (true, seeds the trust-cache) from the raw trusted path (false).
+    /// Shared gossip admission: nonce-window gate + pool insert with the given
+    /// provenance. `verified_locally` distinguishes the recover path (true, seeds
+    /// the trust-cache) from the raw trusted path (false).
+    ///
+    /// P3 Round-2 (scope 1): the durable DA mirror that used to run HERE (once
+    /// per gossip action, decoupled from the nonce gate) was hoisted ahead of the
+    /// verify FIFO into the off-loop mirror worker at network receipt. That kept
+    /// the exact same nonce-gate-DECOUPLED semantics — a stale body is still
+    /// mirrored before this admission rejects it — but moved it off the slow
+    /// verify path and deleted the old per-action DOUBLE put (mem 28e1a821). The
+    /// gossip ingest callers MUST mirror before calling this.
     fn admit_gossip(
         &self,
         sender: alloy_primitives::Address,
         action: SignedNativeAction,
         verified_locally: bool,
     ) -> Result<(), MempoolError> {
-        // DA store is DECOUPLED from the 60s nonce gate: a pushed/gossiped body is
-        // (or will be) block-referenced, so mirror it durably even when it is too
-        // stale for mempool admission -- otherwise the referencing block can never
-        // be reconstructed and consensus wedges (livelock root cause, mem 28e1a821).
-        self.mirror_to_da(&action);
-
         // G1 defensive layer (O2): an oversize/empty batch must never enter
-        // the POOL (an honest node must never SELECT it into a proposal). It
-        // is still DA-mirrored above: a malicious proposer may reference it,
-        // and the block must stay reconstructable so the deterministic
-        // exec-side skip can run (availability != validity, mem 28e1a821).
-        // Covers every network ingest: gossip topic, pre-proposal full-body
-        // push, direct forward, and the gossip-trusted path.
+        // the POOL (an honest node must never SELECT it into a proposal). It is
+        // still DA-mirrored at network receipt (by the off-loop mirror worker,
+        // BEFORE this admission runs): a malicious proposer may reference it, and
+        // the block must stay reconstructable so the deterministic exec-side skip
+        // can run (availability != validity, mem 28e1a821). Covers every network
+        // ingest: gossip topic, pre-proposal full-body push, direct forward, and
+        // the gossip-trusted path.
         crate::rate_limit::validate_batch_size(&action.action)
             .map_err(MempoolError::NativeValidationFailed)?;
 
@@ -928,6 +939,10 @@ mod tests {
 
         // A peer gossiping a forged (sender, action) pair must not pollute the
         // pool — but the body stays DA-mirrored (availability ≠ validity).
+        // P3 Round-2 scope 1: the mirror is now the off-loop worker's job
+        // (mirror-at-receipt), modelled here by an explicit mirror stage BEFORE
+        // the admit/verify stage.
+        pool.mirror_native_to_da(std::slice::from_ref(&signed));
         let forged = alloy_primitives::Address::repeat_byte(0xEE);
         assert!(pool
             .add_native_action_from_gossip(forged, signed.clone())
@@ -985,6 +1000,11 @@ mod tests {
         );
         let sender = over.recover_sender().unwrap();
         let over_hash = torus_types::compute_action_hash(&over);
+        // P3 Round-2 scope 1: the receipt mirror worker mirrors EVERY decoded
+        // body (no validate_batch_size gate on the mirror), so an oversize batch
+        // is still reconstructable even though pool admission rejects it. Model
+        // that mirror stage explicitly.
+        pool.mirror_native_to_da(std::slice::from_ref(&over));
         assert!(pool
             .add_native_action_from_gossip(sender, over.clone())
             .is_err());

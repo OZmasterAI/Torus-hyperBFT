@@ -173,6 +173,46 @@ fn parse_env_bool(raw: &str) -> Option<bool> {
     }
 }
 
+/// P3 Round-2 scope 1: decode ONE raw inbound native item (off the swarm loop)
+/// into its `(sender, action)` pair(s), appended to `out`. The three wire kinds
+/// mirror the swarm receipt sites. A malformed body is debug-logged and skipped:
+/// an undecodable body can never match a referenced `compute_action_hash`, so it
+/// is never legitimately block-referenced — safe to drop before the mirror.
+fn decode_raw_native_inbound(
+    item: &torus_network::native_inbound::RawNativeInbound,
+    out: &mut Vec<(torus_types::Address, torus_types::SignedNativeAction)>,
+) {
+    use torus_network::native_inbound::NativeInboundKind;
+    match item.kind {
+        NativeInboundKind::Pair => match bincode::deserialize::<(
+            torus_types::Address,
+            torus_types::SignedNativeAction,
+        )>(&item.bytes)
+        {
+            Ok(pair) => out.push(pair),
+            Err(e) => tracing::debug!(%e, "malformed gossip native action (off-loop decode)"),
+        },
+        NativeInboundKind::PreProposalBatch => match bincode::deserialize::<
+            Vec<(torus_types::Address, torus_types::SignedNativeAction)>,
+        >(&item.bytes)
+        {
+            Ok(pairs) => out.extend(pairs),
+            Err(e) => tracing::debug!(%e, "malformed pre-proposal batch (off-loop decode)"),
+        },
+        NativeInboundKind::ForwardedJson => {
+            if item.bytes.len() > 20 {
+                let sender = torus_types::Address::from_slice(&item.bytes[..20]);
+                match serde_json::from_slice::<torus_types::SignedNativeAction>(&item.bytes[20..]) {
+                    Ok(action) => out.push((sender, action)),
+                    Err(e) => {
+                        tracing::debug!(%e, "malformed forwarded native action (off-loop decode)")
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn decode_hex_key(hex_str: &str) -> Result<[u8; 32], Box<dyn std::error::Error>> {
     let hex_str = hex_str.strip_prefix("0x").unwrap_or(hex_str);
     if hex_str.len() != 64 {
@@ -560,27 +600,88 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // Spawn inbound native action gossip → mempool task.
-    // P2 funnel item 3: this SINGLE sequential task is the Phase-1 prime suspect
-    // for the intake ceiling (~0.14 ms/order verify). Instrument its throughput
-    // (processed counter) and its channel backlog (gauge, sampled per message)
-    // so busy-fraction ≈ 1.0 + growing backlog is directly observable.
-    if let Some(mut native_rx) = network.take_native_action_rx() {
-        let mempool_for_gossip = mempool.clone();
-        let metrics_for_ingest = metrics.clone();
+    // P3 Round-2 scope 1 (+ swarm fold-in #1): inbound native-body intake is a
+    // TWO-STAGE off-loop pipeline that co-designs decode-off-loop with
+    // mirror-at-receipt so a body is decoded EXACTLY ONCE:
+    //   swarm loop (routing only) --RAW bytes--> mirror worker --decoded--> verify worker
+    //
+    //   * MIRROR WORKER (no crypto, fast): batch-drains raw items, decodes each
+    //     ONCE, mirrors EVERY body to the durable DA store at receipt (one
+    //     `put_batch` per drained batch) BEFORE the verify FIFO, then hands the
+    //     decoded action to the bounded verify queue. This decouples availability
+    //     from the slow verify: a block-referenced body is DA-resident within ms
+    //     even while verify is deeply backed up — the fix for the 76s
+    //     availability-starvation stall (R1 proof, mem 28e1a821).
+    //   * VERIFY WORKER: authenticates the claimed sender (forged gossip pairs
+    //     must not pollute the pool) + prescreen + pool insert. Its intake queue
+    //     is bounded; a drop there is safe (body already DA-mirrored — R2.3).
+    //
+    // The mirror worker must NEVER run on the swarm event loop (that reintroduces
+    // the head-of-line blocking) and never verify inline (that recouples
+    // availability to verify). Batch size + queue caps are env-tunable.
+    if let Some(mut raw_rx) = network.take_native_action_rx() {
+        let mempool_mirror = mempool.clone();
+        let mempool_verify = mempool.clone();
+        let metrics_mirror = metrics.clone();
+        let metrics_verify = metrics.clone();
+        let (verify_tx, mut verify_rx) =
+            tokio::sync::mpsc::channel::<(torus_types::Address, torus_types::SignedNativeAction)>(
+                torus_network::native_inbound::verify_queue_cap(),
+            );
+
+        // Mirror worker (off-loop, decode-once + mirror-at-receipt).
         tokio::spawn(async move {
-            while let Some((sender, action)) = native_rx.recv().await {
-                metrics_for_ingest
+            let batch_max = torus_network::native_inbound::mirror_batch_max();
+            let mut buf: Vec<torus_network::native_inbound::RawNativeInbound> =
+                Vec::with_capacity(batch_max);
+            loop {
+                let n = raw_rx.recv_many(&mut buf, batch_max).await;
+                if n == 0 {
+                    break; // channel closed
+                }
+                metrics_mirror
                     .native_ingest_rx_backlog
-                    .set(native_rx.len() as i64);
-                // Verified ingest: authenticates the claimed sender (forged
-                // gossip pairs must not pollute the pool); DA-mirrors first.
-                match mempool_for_gossip.add_native_action_from_gossip(sender, action) {
+                    .set(raw_rx.len() as i64);
+                let mut decoded: Vec<(torus_types::Address, torus_types::SignedNativeAction)> =
+                    Vec::with_capacity(n);
+                for item in buf.drain(..) {
+                    decode_raw_native_inbound(&item, &mut decoded);
+                }
+                // Mirror ALL decoded bodies in ONE batch BEFORE any verify. This
+                // is the availability guarantee (put_batch is decoupled from the
+                // 60s nonce gate — even stale bodies are mirrored, mem 28e1a821).
+                if !decoded.is_empty() {
+                    let bodies: Vec<torus_types::SignedNativeAction> =
+                        decoded.iter().map(|(_, a)| a.clone()).collect();
+                    mempool_mirror.mirror_native_to_da(&bodies);
+                    metrics_mirror
+                        .native_da_mirror_actions
+                        .inc_by(bodies.len() as u64);
+                }
+                // Hand each already-mirrored action to the verify queue.
+                for pair in decoded {
+                    match verify_tx.try_send(pair) {
+                        Ok(()) => {}
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                            // Safe: the body is already DA-resident; a drop only
+                            // forfeits pool candidacy (R2.3 drop-safety).
+                            metrics_mirror.native_verify_queue_dropped.inc();
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
+                    }
+                }
+            }
+        });
+
+        // Verify worker (crypto verify + prescreen + pool insert).
+        tokio::spawn(async move {
+            while let Some((sender, action)) = verify_rx.recv().await {
+                match mempool_verify.add_native_action_from_gossip(sender, action) {
                     Ok(()) => {}
                     Err(torus_mempool::MempoolError::DuplicateNativeAction) => {}
                     Err(e) => tracing::debug!("gossip native action rejected: {e}"),
                 }
-                metrics_for_ingest.native_ingest_processed_actions.inc();
+                metrics_verify.native_ingest_processed_actions.inc();
             }
         });
     }

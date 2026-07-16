@@ -58,8 +58,7 @@ fn tune_quic_config(mut cfg: libp2p::quic::Config) -> libp2p::quic::Config {
 pub struct LibP2PNetwork {
     command_tx: mpsc::UnboundedSender<NetworkCommand>,
     shared: Arc<SharedState>,
-    native_inbound_rx:
-        Option<mpsc::UnboundedReceiver<(torus_types::Address, torus_types::SignedNativeAction)>>,
+    native_inbound_rx: Option<mpsc::Receiver<crate::native_inbound::RawNativeInbound>>,
     /// Inbound forwarded EVM txs (raw RLP) received on the leader (Option B). Taken once at
     /// startup to drive an ingest task → `add_evm_tx`.
     evm_inbound_rx: Option<mpsc::UnboundedReceiver<Vec<u8>>>,
@@ -182,7 +181,15 @@ impl LibP2PNetwork {
         let libp2p_keypair =
             identity::Keypair::from(identity::ed25519::Keypair::from(libp2p_secret));
 
-        let (native_inbound_tx, native_inbound_rx) = mpsc::unbounded_channel();
+        // P3 Round-2 scope 1: BOUNDED raw-intake channel (was unbounded — the
+        // 17,205-deep backlog in the R1 stall). The off-loop mirror worker
+        // decodes + mirrors at receipt, so a full channel drops raw bytes safely
+        // (recoverable via gossip / DA pull). Per-peer byte budget guards it.
+        let (native_inbound_tx, native_inbound_rx) =
+            mpsc::channel(crate::native_inbound::raw_inbound_channel_cap());
+        let native_inbound_budget = crate::native_inbound::PerPeerBudget::new(
+            crate::native_inbound::per_peer_inbound_budget_bytes(),
+        );
         let (evm_inbound_tx, evm_inbound_rx) = mpsc::unbounded_channel();
         let shared = Arc::new(SharedState {
             inbound: Mutex::new(VecDeque::new()),
@@ -192,6 +199,7 @@ impl LibP2PNetwork {
             block_store: RwLock::new(HashMap::new()),
             block_data_inbound: Mutex::new(VecDeque::new()),
             native_action_inbound: Some(native_inbound_tx),
+            native_inbound_budget,
             evm_tx_inbound: Some(evm_inbound_tx),
             pending_sends: Mutex::new(PendingSendQueue::new(256)),
             outbound_direct: Mutex::new(HashMap::new()),
@@ -298,12 +306,12 @@ impl LibP2PNetwork {
         Ok((network, tx_handle, native_handle))
     }
 
-    /// Take the inbound native action receiver. Called once at startup to
-    /// spawn a task that drains gossip-received actions into the mempool.
+    /// Take the inbound RAW native-body receiver (P3 Round-2 scope 1). Called
+    /// once at startup to spawn the OFF-LOOP mirror worker that decodes once,
+    /// mirrors to the DA store at receipt, then forwards to the verify queue.
     pub fn take_native_action_rx(
         &mut self,
-    ) -> Option<mpsc::UnboundedReceiver<(torus_types::Address, torus_types::SignedNativeAction)>>
-    {
+    ) -> Option<mpsc::Receiver<crate::native_inbound::RawNativeInbound>> {
         self.native_inbound_rx.take()
     }
 
@@ -522,6 +530,7 @@ mod tests {
             block_store: RwLock::new(HashMap::new()),
             block_data_inbound: Mutex::new(VecDeque::new()),
             native_action_inbound: None,
+            native_inbound_budget: crate::native_inbound::PerPeerBudget::new(0),
             evm_tx_inbound: None,
             pending_sends: Mutex::new(PendingSendQueue::new(256)),
             outbound_direct: Mutex::new(HashMap::new()),

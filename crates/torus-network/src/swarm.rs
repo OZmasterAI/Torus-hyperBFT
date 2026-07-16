@@ -246,11 +246,18 @@ pub struct SharedState {
     /// Inbound block-data responses (separate from consensus inbound queue).
     /// Entries: (sender_vk, view, borsh-encoded Block bytes).
     pub block_data_inbound: Mutex<VecDeque<(VerifyingKey, u64, Vec<u8>)>>,
-    /// Inbound native actions received from gossip (deserialized by swarm, consumed by mempool task).
-    /// Tuple: (pre-verified sender address, signed action) — receivers skip ECDSA recovery.
-    pub native_action_inbound: Option<
-        tokio::sync::mpsc::UnboundedSender<(torus_types::Address, torus_types::SignedNativeAction)>,
-    >,
+    /// Inbound native bodies received from the network as RAW bytes (P3 Round-2
+    /// scope 1 + swarm fold-in #1). The swarm loop stays a pure router: it does
+    /// NOT decode here (bulk decode on the loop was head-of-line blocking under
+    /// load). The off-loop mirror worker decodes once, mirrors to the DA store at
+    /// receipt, then forwards to the verify queue. BOUNDED (memory + DoS bound);
+    /// a full channel drops + counts (recoverable via gossip / DA pull).
+    pub native_action_inbound:
+        Option<tokio::sync::mpsc::Sender<crate::native_inbound::RawNativeInbound>>,
+    /// Per-peer in-flight-byte budget guarding [`Self::native_action_inbound`] so
+    /// one flooding peer cannot monopolise the bounded intake. Devnet peers are
+    /// validator-set-only, so this is defence-in-depth flagged for WAN review.
+    pub native_inbound_budget: std::sync::Arc<crate::native_inbound::PerPeerBudget>,
     /// Inbound forwarded EVM transactions (raw RLP) received on the leader from a peer's
     /// direct-to-leader forward (Option B). Consumed by the node's ingest task → `add_evm_tx`.
     pub evm_tx_inbound: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
@@ -501,6 +508,46 @@ fn serialize_native_batch(actions: &[Vec<u8>]) -> Vec<u8> {
         buf.extend_from_slice(action);
     }
     buf
+}
+
+/// P3 Round-2 scope 1: forward one RAW inbound native body off the swarm event
+/// loop to the mirror worker, under the bounded channel + per-peer byte budget.
+/// A refused reservation (peer over budget) or a full channel DROPS the body and
+/// counts it — safe because the mirror worker will DA-mirror everything it does
+/// accept, and a dropped body is recoverable via gossip redundancy or the DA
+/// pull-fallback (the proposer always mirrors the bodies it includes). NEVER
+/// decodes or mirrors on the loop (that reintroduces the head-of-line blocking
+/// this round removes).
+fn forward_raw_native(
+    shared: &SharedState,
+    peer: &PeerId,
+    kind: crate::native_inbound::NativeInboundKind,
+    bytes: Vec<u8>,
+) {
+    let Some(ref tx) = shared.native_action_inbound else {
+        return;
+    };
+    let guard = match shared.native_inbound_budget.try_reserve(*peer, bytes.len()) {
+        Some(g) => g,
+        None => {
+            if let Some(ref m) = shared.metrics {
+                m.native_raw_inbound_dropped.inc();
+            }
+            return;
+        }
+    };
+    let item = crate::native_inbound::RawNativeInbound::new(kind, bytes, Some(guard));
+    match tx.try_send(item) {
+        Ok(()) => {}
+        // Full or closed: the item (and its budget guard) drops here, releasing
+        // the reservation. A full channel is the DoS shed valve.
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+            if let Some(ref m) = shared.metrics {
+                m.native_raw_inbound_dropped.inc();
+            }
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+    }
 }
 
 fn deserialize_native_batch(data: &[u8]) -> Option<Vec<&[u8]>> {
@@ -962,53 +1009,41 @@ fn handle_event(
                 // Native-action batches arrive RAW on the v1 topic (zstd gossip
                 // removed, s364) — parse directly, no decompress-on-receive step,
                 // which was the per-node DoS surface.
+                //
+                // P3 Round-2 scope 1 + fold-in #1: the swarm loop stays a pure
+                // ROUTER. `deserialize_native_batch` is cheap FRAMING only (it
+                // slices length-prefixed elements, it does NOT decode the
+                // `SignedNativeAction`). The expensive bincode decode is hoisted
+                // OFF this event loop into the mirror worker — each framed element
+                // (or the whole single-action message) is forwarded as RAW bytes.
+                use crate::native_inbound::NativeInboundKind;
                 if let Some(actions) = deserialize_native_batch(&message.data) {
                     let count = actions.len();
-                    let mut ok = 0usize;
-                    for action_bytes in actions {
-                        match bincode::deserialize::<(
-                            torus_types::Address,
-                            torus_types::SignedNativeAction,
-                        )>(action_bytes)
-                        {
-                            Ok(pair) => {
-                                if let Some(ref tx) = shared.native_action_inbound {
-                                    let _ = tx.send(pair);
-                                }
-                                ok += 1;
-                            }
-                            Err(e) => {
-                                debug!(peer = %propagation_source, %e, "malformed action in batch");
-                            }
-                        }
+                    for action_bytes in &actions {
+                        forward_raw_native(
+                            shared,
+                            &propagation_source,
+                            NativeInboundKind::Pair,
+                            action_bytes.to_vec(),
+                        );
                     }
-                    debug!(
-                        count,
-                        ok, "received native action batch from {propagation_source}"
-                    );
+                    debug!(count, "forwarded raw native action batch from {propagation_source}");
                     if let Some(ref m) = shared.metrics {
-                        m.native_gossip_received_actions.inc_by(ok as u64);
+                        m.native_gossip_received_actions.inc_by(count as u64);
                     }
                 } else {
-                    match bincode::deserialize::<(
-                        torus_types::Address,
-                        torus_types::SignedNativeAction,
-                    )>(&message.data)
-                    {
-                        Ok(pair) => {
-                            if let Some(ref tx) = shared.native_action_inbound {
-                                let _ = tx.send(pair);
-                            }
-                            debug!("received single native action from {propagation_source}");
-                        }
-                        Err(e) => {
-                            warn!(peer = %propagation_source, %e, "malformed native action gossip");
-                            peer_scoring.penalize(
-                                &propagation_source,
-                                PENALTY_INVALID_TX,
-                                "malformed native action",
-                            );
-                        }
+                    // Single-action gossip (no batch frame): forward the whole
+                    // message raw; the mirror worker decodes it off-loop and
+                    // debug-logs a malformed body there.
+                    forward_raw_native(
+                        shared,
+                        &propagation_source,
+                        NativeInboundKind::Pair,
+                        message.data.clone(),
+                    );
+                    debug!("forwarded raw single native action from {propagation_source}");
+                    if let Some(ref m) = shared.metrics {
+                        m.native_gossip_received_actions.inc();
                     }
                 }
             } else {
@@ -1065,24 +1100,18 @@ fn handle_event(
                     }
                 };
             if request.payload.first() == Some(&PRE_PROPOSAL_BATCH_MARKER) {
-                let batch_bytes = &request.payload[1..];
-                match bincode::deserialize::<
-                    Vec<(torus_types::Address, torus_types::SignedNativeAction)>,
-                >(batch_bytes)
-                {
-                    Ok(pairs) => {
-                        let count = pairs.len();
-                        if let Some(ref tx) = shared.native_action_inbound {
-                            for pair in pairs {
-                                let _ = tx.send(pair);
-                            }
-                        }
-                        tracing::info!(count, %peer, "received pre-proposal action batch");
-                    }
-                    Err(e) => {
-                        warn!(%peer, %e, "pre-proposal batch deserialization failed");
-                    }
-                }
+                // P3 Round-2 scope 1 + fold-in #1: forward the batch RAW; the
+                // off-loop mirror worker decodes the `Vec<(Address, action)>`
+                // once, mirrors every body at receipt, then feeds the verify
+                // queue. No on-loop decode (head-of-line blocking under load).
+                let batch_bytes = request.payload[1..].to_vec();
+                forward_raw_native(
+                    shared,
+                    &peer,
+                    crate::native_inbound::NativeInboundKind::PreProposalBatch,
+                    batch_bytes,
+                );
+                tracing::info!(%peer, "forwarded raw pre-proposal action batch");
             } else if request.payload.first() == Some(&PRE_PROPOSAL_HASHES_MARKER) {
                 // Phase 2.3 (#5): the proposer pushed only the HASHES (the body set was too
                 // big to disseminate within the view). PRE-WARM the bodies by pulling them
@@ -1109,18 +1138,17 @@ fn handle_event(
                     None => debug!(%peer, "pre-proposal hash manifest: nothing to pre-warm"),
                 }
             } else if request.payload.first() == Some(&FORWARD_ACTION_MARKER) {
+                // P3 Round-2 scope 1 + fold-in #1: forward RAW (20-byte sender
+                // prefix + serde_json body); the mirror worker splits + decodes
+                // off-loop, mirrors at receipt, then feeds the verify queue.
                 let action_bytes = &request.payload[1..];
                 if action_bytes.len() > 20 {
-                    let sender_addr = torus_types::Address::from_slice(&action_bytes[..20]);
-                    if let Ok(action) = serde_json::from_slice::<torus_types::SignedNativeAction>(
-                        &action_bytes[20..],
-                    ) {
-                        if let Some(ref tx) = shared.native_action_inbound {
-                            let _ = tx.send((sender_addr, action));
-                        }
-                    } else {
-                        warn!(%peer, "forwarded native action: deserialization failed");
-                    }
+                    forward_raw_native(
+                        shared,
+                        &peer,
+                        crate::native_inbound::NativeInboundKind::ForwardedJson,
+                        action_bytes.to_vec(),
+                    );
                 }
             } else if let Some(raw_rlp) = parse_forwarded_evm_tx(&request.payload) {
                 // Option B: a peer forwarded a raw EVM tx to us as (current) leader. Hand it to
@@ -2438,6 +2466,7 @@ mod tests {
             block_store: RwLock::new(HashMap::new()),
             block_data_inbound: Mutex::new(VecDeque::new()),
             native_action_inbound: None,
+            native_inbound_budget: crate::native_inbound::PerPeerBudget::new(0),
             evm_tx_inbound: None,
             pending_sends: Mutex::new(PendingSendQueue::new(256)),
             outbound_direct: Mutex::new(HashMap::new()),
