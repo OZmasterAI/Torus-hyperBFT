@@ -1073,6 +1073,34 @@ mod tests {
         }
     }
 
+    /// B3 (send-queue hygiene): gossipsub's per-peer send-queue failure modes
+    /// (SlowPeer events, per-kind failed-message counts, AllQueuesFull publish
+    /// errors) were previously invisible — a proposal silently abandoned after
+    /// 5 s behind bulk showed up only as a debug log. These counters must be
+    /// registered so the drops are on /metrics for the proof run.
+    #[test]
+    fn send_queue_hygiene_metrics_register() {
+        let m = Metrics::new();
+        m.gossipsub_slow_peer_events.inc();
+        m.gossip_publish_all_queues_full.inc();
+        let kind = vec![("kind".to_string(), "publish".to_string())];
+        m.gossipsub_slow_peer_failed_messages
+            .get_or_create(&kind)
+            .inc_by(3);
+        let text = m.encode();
+        for name in [
+            "torus_gossipsub_slow_peer_events",
+            "torus_gossip_publish_all_queues_full",
+            "torus_gossipsub_slow_peer_failed_messages",
+        ] {
+            assert!(text.contains(name), "{name} not registered:\n{text}");
+        }
+        assert!(
+            text.contains("kind=\"publish\""),
+            "failed-messages kind label missing:\n{text}"
+        );
+    }
+
     /// Exec trust-cache (double-verify-trust-cache T6): hit/miss/eviction counters
     /// must be registered so the cache hit-rate is observable for A/B measurement.
     #[test]

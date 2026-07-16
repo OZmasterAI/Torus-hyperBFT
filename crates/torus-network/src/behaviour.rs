@@ -274,10 +274,47 @@ mod tests {
     /// stay byte-identical to the shipped 2 MiB behavior.
     #[test]
     fn gossipsub_transmit_cap_is_configurable_not_hardcoded() {
-        let cfg = gossipsub_config(100, 3 * 1024 * 1024).expect("build gossipsub config");
-        assert_eq!(cfg.max_transmit_size(), 3 * 1024 * 1024);
-        let default_cfg = gossipsub_config(100, crate::caps::GOSSIP_MAX_TRANSMIT_SIZE)
+        let cfg = gossipsub_config(100, 3 * 1024 * 1024, DEFAULT_GOSSIPSUB_QUEUE_LEN)
             .expect("build gossipsub config");
+        assert_eq!(cfg.max_transmit_size(), 3 * 1024 * 1024);
+        let default_cfg = gossipsub_config(
+            100,
+            crate::caps::GOSSIP_MAX_TRANSMIT_SIZE,
+            DEFAULT_GOSSIPSUB_QUEUE_LEN,
+        )
+        .expect("build gossipsub config");
         assert_eq!(default_cfg.max_transmit_size(), 2 * 1024 * 1024);
+    }
+
+    /// B3 (send-queue hygiene): `connection_handler_queue_len` must come from
+    /// the caller, not libp2p's silent 5000 default — the default queue holds
+    /// up to 2500 queued Publish messages per peer (len/2 soft cap), i.e.
+    /// megabytes of bulk a 1–3 KB proposal sits FIFO behind for up to the 5 s
+    /// publish abandonment window. Mirrors the S391 heartbeat test: the value
+    /// must be config-wired so it can never silently drift again.
+    #[test]
+    fn gossipsub_queue_len_comes_from_caller() {
+        let cfg = gossipsub_config(100, crate::caps::GOSSIP_MAX_TRANSMIT_SIZE, 512)
+            .expect("build gossipsub config");
+        assert_eq!(cfg.connection_handler_queue_len(), 512);
+        // 5000 is libp2p's own default: TORUS_GOSSIP_QUEUE_LEN=5000 must
+        // restore exact-today behavior (the documented B3 rollback).
+        let cfg = gossipsub_config(100, crate::caps::GOSSIP_MAX_TRANSMIT_SIZE, 5000)
+            .expect("build gossipsub config");
+        assert_eq!(cfg.connection_handler_queue_len(), 5000);
+    }
+
+    /// The crate default and NetworkConfig's default must be the same value
+    /// (single source of truth), same contract as the heartbeat test above.
+    /// 512 is the B3 hygiene default: priority soft cap 256 publishes/peer
+    /// ≈ 32 MB worst-case of 128 KB batches — bounded latency instead of 5 s
+    /// of invisible backlog.
+    #[test]
+    fn network_config_default_queue_len_matches_crate_default() {
+        assert_eq!(DEFAULT_GOSSIPSUB_QUEUE_LEN, 512);
+        assert_eq!(
+            crate::config::NetworkConfig::default().gossipsub_queue_len,
+            DEFAULT_GOSSIPSUB_QUEUE_LEN
+        );
     }
 }

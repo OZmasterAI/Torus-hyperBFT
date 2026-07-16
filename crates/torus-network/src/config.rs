@@ -159,6 +159,20 @@ mod tests {
         }
     }
 
+    /// B3 (send-queue hygiene): the `TORUS_GOSSIP_QUEUE_LEN` parse seam.
+    /// Unset/garbage/zero fall back to the crate default (512); `5000`
+    /// restores libp2p's shipped default (exact-today rollback).
+    #[test]
+    fn gossip_queue_len_parse_seam() {
+        let default = crate::behaviour::DEFAULT_GOSSIPSUB_QUEUE_LEN;
+        assert_eq!(parse_gossip_queue_len(None), default);
+        assert_eq!(parse_gossip_queue_len(Some("5000")), 5000); // rollback-to-today
+        assert_eq!(parse_gossip_queue_len(Some(" 1024 ")), 1024);
+        assert_eq!(parse_gossip_queue_len(Some("0")), default); // 0 would deadlock sends
+        assert_eq!(parse_gossip_queue_len(Some("bogus")), default);
+        assert_eq!(parse_gossip_queue_len(Some("")), default);
+    }
+
     #[test]
     fn global_addresses_accepted() {
         for s in [
