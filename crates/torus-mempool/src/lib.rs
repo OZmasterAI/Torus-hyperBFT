@@ -33,6 +33,32 @@ pub use crate::error::MempoolError;
 pub use crate::evm_pool::EvmPoolEntry;
 pub use crate::native_pool::is_cancel;
 
+/// Pure decision for the sojourn admission gate (P3 Round-2 scope 3), factored
+/// out for deterministic unit testing. Returns true iff a new non-cancel action
+/// should be reject-retryable:
+/// - NEVER above the reject when `pool_size < floor` (blocks must never starve).
+/// - Boot grace: OFF until the first drain rate is measured (`seeded`).
+/// - Divide-by-zero guarded: a deep, non-draining pool (ema≈0) gates.
+/// - Otherwise gate when estimated drain time `pool_size / ema_per_ms > cap_ms`.
+fn sojourn_should_gate(
+    pool_size: usize,
+    floor: usize,
+    seeded: bool,
+    ema_per_ms: f64,
+    cap_ms: u64,
+) -> bool {
+    if pool_size < floor {
+        return false;
+    }
+    if !seeded {
+        return false;
+    }
+    if ema_per_ms <= f64::EPSILON {
+        return true;
+    }
+    (pool_size as f64 / ema_per_ms) > cap_ms as f64
+}
+
 /// Mempool configuration.
 #[derive(Clone, Debug)]
 pub struct MempoolConfig {
@@ -83,8 +109,8 @@ impl Default for MempoolConfig {
             evm_block_gas_budget: rate_limit::evm_block_gas_budget(),
             evm_sender_share_pct: rate_limit::evm_sender_share_pct(),
             native_per_block_cap: rate_limit::native_per_block_cap(),
-            native_pool_max_size: rate_limit::NATIVE_POOL_MAX_SIZE,
-            native_per_sender_cap: rate_limit::NATIVE_PER_SENDER_CAP,
+            native_pool_max_size: rate_limit::native_pool_max_size(),
+            native_per_sender_cap: rate_limit::native_per_sender_cap(),
             verified_sender_cache_cap: rate_limit::VERIFIED_SENDER_CACHE_CAP,
             max_memory_bytes: 64 * 1024 * 1024, // 64 MB default
         }
@@ -116,6 +142,22 @@ pub struct Mempool {
     /// `compute_action_hash`, which omits the signature). MISS => full recover +
     /// slash. See `docs/plans/double-verify-trust-cache-impl.md`.
     verified_senders: RwLock<FifoCache<B256, Address>>,
+    /// P3 Round-2 scope 3: sojourn-gate drain estimator. `remove_committed_native`
+    /// (consensus thread, sole writer) updates an EMA of the pool drain rate;
+    /// the RPC admit path (readers) divides `pool_size` by it to estimate how
+    /// long a newly-admitted action would sit before inclusion.
+    sojourn: std::sync::Mutex<SojournState>,
+}
+
+/// Drain-rate estimator backing the sojourn admission gate (scope 3).
+#[derive(Default)]
+struct SojournState {
+    /// EMA of the pool drain rate in actions-per-millisecond.
+    drain_ema_per_ms: f64,
+    /// Wall-clock ms of the last `remove_committed_native`; 0 = none yet.
+    last_remove_ms: u64,
+    /// False until the first drain interval is measured (boot grace).
+    seeded: bool,
 }
 
 impl Mempool {
@@ -143,6 +185,7 @@ impl Mempool {
             native_gossip_enabled: std::sync::atomic::AtomicBool::new(false),
             metrics: std::sync::OnceLock::new(),
             verified_senders: RwLock::new(FifoCache::new(verified_cap)),
+            sojourn: std::sync::Mutex::new(SojournState::default()),
         }
     }
 
@@ -811,8 +854,55 @@ impl Mempool {
             self.cache_verified_sender(key, sender);
         }
         self.native.write().unwrap().remove_committed(hashes);
+        // P3 Round-2 scope 3: feed the sojourn-gate drain estimator. Commit
+        // removal is the pool's drain event, so its rate (actions per ms) is the
+        // rate the gate compares pool depth against.
+        self.record_drain(hashes.len());
         // P3 Round-1 item 1: commit removal is a pool mutation — refresh the gauge.
         self.refresh_native_size_gauge();
+    }
+
+    /// Update the sojourn-gate drain EMA on a commit-drain of `drained` actions
+    /// (scope 3). Single-writer (consensus thread). The first interval seeds the
+    /// EMA directly; subsequent intervals blend with α=0.2. A zero-length or
+    /// zero-elapsed interval is ignored (divide-by-zero guarded).
+    fn record_drain(&self, drained: usize) {
+        let now = now_ms();
+        let mut st = self.sojourn.lock().unwrap();
+        if st.last_remove_ms > 0 && drained > 0 {
+            let dt = now.saturating_sub(st.last_remove_ms).max(1) as f64;
+            let rate = drained as f64 / dt; // actions per ms this interval
+            const ALPHA: f64 = 0.2;
+            st.drain_ema_per_ms = if st.seeded {
+                ALPHA * rate + (1.0 - ALPHA) * st.drain_ema_per_ms
+            } else {
+                rate
+            };
+            st.seeded = true;
+        }
+        st.last_remove_ms = now;
+    }
+
+    /// True when the RPC admit path should reject-RETRYABLE a new non-cancel
+    /// action because the pool's estimated drain time exceeds the sojourn cap
+    /// (scope 3). Guarantees blocks never starve: the pool must first be at least
+    /// `2 × per-block cap` deep (the FLOOR) before the gate can fire. Below the
+    /// floor, or before any drain is measured (boot grace), the gate is OFF, so
+    /// default behaviour is unchanged until the pool is genuinely deep and
+    /// draining slower than it fills. Divide-by-zero guarded.
+    pub fn sojourn_gate_active(&self) -> bool {
+        let pool_size = self.native_pool_size();
+        let (seeded, ema) = {
+            let st = self.sojourn.lock().unwrap();
+            (st.seeded, st.drain_ema_per_ms)
+        };
+        sojourn_should_gate(
+            pool_size,
+            rate_limit::native_total_block_cap().saturating_mul(2),
+            seeded,
+            ema,
+            rate_limit::pool_sojourn_cap_ms(),
+        )
     }
 
     /// Approximate total memory used by pooled transactions (Phase 3: 3.1.7).
@@ -914,6 +1004,50 @@ impl Mempool {
                 "pruned stale txs on block commit"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod sojourn_tests {
+    use super::sojourn_should_gate;
+
+    // P3 Round-2 scope 3: the sojourn gate rejects when the estimated drain time
+    // exceeds the cap, NEVER below the 2×-block-cap floor, and is off during boot
+    // grace / guarded against divide-by-zero.
+    const FLOOR: usize = 200; // 2 × the total block cap (100)
+    const CAP_MS: u64 = 25_000;
+
+    #[test]
+    fn never_gates_below_floor_even_with_stalled_drain() {
+        // Below the floor, no matter how slow the drain (even 0), blocks must
+        // always keep candidates -> gate OFF.
+        assert!(!sojourn_should_gate(FLOOR - 1, FLOOR, true, 0.0, CAP_MS));
+        assert!(!sojourn_should_gate(0, FLOOR, true, 0.0001, CAP_MS));
+    }
+
+    #[test]
+    fn boot_grace_gate_off_until_seeded() {
+        // Deep pool but no drain measured yet -> OFF (don't gate on no data).
+        assert!(!sojourn_should_gate(10_000, FLOOR, false, 0.0, CAP_MS));
+    }
+
+    #[test]
+    fn gates_above_floor_when_sojourn_exceeds_cap() {
+        // 10_000 actions draining at 0.1/ms => 100_000 ms sojourn > 25_000 cap.
+        assert!(sojourn_should_gate(10_000, FLOOR, true, 0.1, CAP_MS));
+    }
+
+    #[test]
+    fn does_not_gate_when_draining_fast_enough() {
+        // 10_000 actions draining at 1/ms => 10_000 ms sojourn < 25_000 cap.
+        assert!(!sojourn_should_gate(10_000, FLOOR, true, 1.0, CAP_MS));
+    }
+
+    #[test]
+    fn divide_by_zero_deep_stalled_pool_gates() {
+        // Above floor, seeded, but drain EMA ~0 (pool not draining) -> gate,
+        // no panic.
+        assert!(sojourn_should_gate(FLOOR + 1, FLOOR, true, 0.0, CAP_MS));
     }
 }
 

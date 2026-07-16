@@ -412,7 +412,22 @@ impl RpcState {
         // actions are doomed at admission — shed them after a decode-only
         // pass instead of paying signature verification. Cancels proceed to
         // full verification (admission evicts a non-cancel to make room).
-        let mut slots: Vec<SubmitSlot> = if self.mempool.native_pool_is_full() {
+        //
+        // P3 Round-2 scope 3: the SOJOURN GATE folds into the same decode-only
+        // screen. When the pool is deep AND draining slower than the sojourn cap,
+        // a non-cancel admitted now would sit past the cap (heading for a silent
+        // 60s-window expiry), so shed it RETRYABLE instead. Client contract is
+        // unchanged — the bench already retries pool-full rejects, so zero final
+        // drops. Cancels always bypass (they have pool-eviction priority and
+        // relieve depth). The gate NEVER fires below the 2×-block-cap floor.
+        let pool_full = self.mempool.native_pool_is_full();
+        let sojourn_gated = !pool_full && self.mempool.sojourn_gate_active();
+        let mut slots: Vec<SubmitSlot> = if pool_full || sojourn_gated {
+            let reject_msg: &'static str = if pool_full {
+                "mempool: pool full (pre-verify)"
+            } else {
+                "mempool: pool draining slowly, retry (sojourn)"
+            };
             let screened = tokio::task::spawn_blocking(move || {
                 signed_actions
                     .into_iter()
@@ -424,9 +439,7 @@ impl RpcState {
                             Ok(action) if torus_mempool::is_cancel(&action.action) => {
                                 SubmitSlot::Proceed(signed_action)
                             }
-                            Ok(_) => {
-                                SubmitSlot::Rejected("mempool: pool full (pre-verify)".to_string())
-                            }
+                            Ok(_) => SubmitSlot::Rejected(reject_msg.to_string()),
                             Err(e) => SubmitSlot::Rejected(e),
                         }
                     })
@@ -440,6 +453,8 @@ impl RpcState {
                 if let SubmitSlot::Rejected(msg) = slot {
                     self.count_admit_reject(if msg.ends_with("(pre-verify)") {
                         "pool_full_preverify"
+                    } else if msg.ends_with("(sojourn)") {
+                        "sojourn_gate"
                     } else {
                         "verify_failed"
                     });

@@ -103,9 +103,59 @@ pub fn native_total_block_cap() -> usize {
 /// actions from all peers, so this must be large enough for the full mesh.
 pub const NATIVE_POOL_MAX_SIZE: usize = 65536;
 
+/// Effective max native pool size: `TORUS_NATIVE_POOL_MAX_SIZE` overrides the
+/// compiled default PER NODE (P3 Round-2 scope 3; same OnceLock pattern). A
+/// local knob only — the pool is per-node, not consensus-visible — so it can be
+/// A/B'd without coordination. Default unchanged.
+pub fn native_pool_max_size() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("TORUS_NATIVE_POOL_MAX_SIZE")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(NATIVE_POOL_MAX_SIZE)
+    })
+}
+
 /// Max pending native actions per sender in the pool. With non-destructive
 /// selection (actions stay until commit), this must cover burst submissions.
 pub const NATIVE_PER_SENDER_CAP: usize = 512;
+
+/// Effective per-sender pool cap: `TORUS_NATIVE_PER_SENDER_CAP` overrides the
+/// compiled default PER NODE (P3 Round-2 scope 3). Local, non-consensus knob.
+/// Default unchanged.
+pub fn native_per_sender_cap() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("TORUS_NATIVE_PER_SENDER_CAP")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(NATIVE_PER_SENDER_CAP)
+    })
+}
+
+/// Sojourn admission cap in MILLISECONDS (P3 Round-2 scope 3). The RPC admit
+/// path reject-retryable when the pool's estimated drain time
+/// (`pool_size / drain_ema`) exceeds this — an action admitted now would sit
+/// longer than this before inclusion, so it is better to shed it retryably than
+/// let it expire silently at the 60s nonce window. 25s ≪ the 60s window, so an
+/// admitted action still has ample margin. `TORUS_POOL_SOJOURN_CAP_MS` overrides.
+pub const POOL_SOJOURN_CAP_MS: u64 = 25_000;
+
+/// Effective sojourn cap; `TORUS_POOL_SOJOURN_CAP_MS` overrides. Local, retryable
+/// admission policy — no consensus surface. Default unchanged.
+pub fn pool_sojourn_cap_ms() -> u64 {
+    static CAP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("TORUS_POOL_SOJOURN_CAP_MS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(POOL_SOJOURN_CAP_MS)
+    })
+}
 
 /// Max orders a single `PlaceOrderBatch` may carry (Phase B throughput keystone).
 ///

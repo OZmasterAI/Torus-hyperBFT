@@ -571,6 +571,7 @@ impl Metrics {
             "sender_queue_full",
             "pool_full",
             "pool_full_preverify",
+            "sojourn_gate",
             "rate_limited",
             "verify_failed",
             "other",
