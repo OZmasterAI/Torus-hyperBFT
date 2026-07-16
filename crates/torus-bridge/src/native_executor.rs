@@ -385,6 +385,32 @@ impl<T: StateBackend> NativeExecContext<T> {
 pub struct NativeExecutor;
 
 impl NativeExecutor {
+    /// P2 funnel item 5: count exec-side order deaths under a concrete reason
+    /// label. Fixed reason set (pre-seeded in torus-telemetry): insufficient_margin,
+    /// balance_error, fill_failed, engine_rejected, cancelled_unfilled,
+    /// batch_cap_skipped. Zero-cost when metrics are absent or n == 0.
+    fn count_orders_rejected<T: StateBackend>(ctx: &NativeExecContext<T>, reason: &str, n: u64) {
+        if n == 0 {
+            return;
+        }
+        if let Some(ref m) = ctx.metrics {
+            m.orders_rejected
+                .get_or_create(&vec![("reason".to_string(), reason.to_string())])
+                .inc_by(n);
+        }
+    }
+
+    /// P2 funnel item 5: an order entered a book as resting
+    /// (Resting / PartiallyFilled / PendingTrigger at placement).
+    fn count_orders_placed<T: StateBackend>(ctx: &NativeExecContext<T>, n: u64) {
+        if n == 0 {
+            return;
+        }
+        if let Some(ref m) = ctx.metrics {
+            m.orders_placed.inc_by(n);
+        }
+    }
+
     /// Execute a single native action for the given sender.
     pub fn execute<T: StateBackend>(
         ctx: &mut NativeExecContext<T>,
@@ -539,6 +565,7 @@ impl NativeExecutor {
         {
             let mut out = Vec::with_capacity(actions.len());
             let mut skipped_batches = 0usize;
+            let mut skipped_orders = 0u64;
             for (sender, action) in actions {
                 match action {
                     NativeAction::PlaceOrderBatch(orders) => {
@@ -563,6 +590,7 @@ impl NativeExecutor {
                             // per-batch WARN with %sender formatting would stall
                             // the single exec thread every block (log-DoS).
                             skipped_batches += 1;
+                            skipped_orders += orders.len() as u64;
                             continue;
                         }
                         for p in orders {
@@ -575,9 +603,11 @@ impl NativeExecutor {
             if skipped_batches > 0 {
                 tracing::warn!(
                     skipped_batches,
+                    skipped_orders,
                     cap = torus_types::NATIVE_ORDERS_PER_BATCH_CAP,
                     "skipped oversize/empty PlaceOrderBatch action(s) at exec (deterministic cap)"
                 );
+                Self::count_orders_rejected(ctx, "batch_cap_skipped", skipped_orders);
             }
             std::borrow::Cow::Owned(out)
         } else {
@@ -621,6 +651,15 @@ impl NativeExecutor {
 
         let mut market_batches: HashMap<MarketId, Vec<PreparedOrder>> = HashMap::new();
 
+        // P2 funnel item 5: per-batch fate accumulators, flushed once to the
+        // metrics after settlement (keeps the hot loops free of label allocs).
+        let mut fate_placed = 0u64;
+        let mut fate_insufficient_margin = 0u64;
+        let mut fate_balance_error = 0u64;
+        let mut fate_fill_failed = 0u64;
+        let mut fate_engine_rejected = 0u64;
+        let mut fate_cancelled_unfilled = 0u64;
+
         // O1: write-through balance cache, scoped to this execute_batch call. Serves
         // repeated Phase 2 reserve / Phase 4 release reads for the same sender without
         // re-hitting the overlay's lock + alloc + Borsh path.
@@ -661,6 +700,7 @@ impl NativeExecutor {
                                     bal.available
                                 ),
                             );
+                            fate_insufficient_margin += 1;
                             continue;
                         }
                         bal.available -= order_margin_required;
@@ -669,6 +709,7 @@ impl NativeExecutor {
                     }
                     Err(e) => {
                         results[i] = NativeActionResult::err("place_order", e.to_string());
+                        fate_balance_error += 1;
                         continue;
                     }
                 }
@@ -819,6 +860,7 @@ impl NativeExecutor {
                 }
 
                 if fill_failed {
+                    fate_fill_failed += 1;
                     continue;
                 }
 
@@ -831,10 +873,32 @@ impl NativeExecutor {
                     m.orders_matched.inc_by(result.fills.len() as u64);
                 }
 
+                // P2 funnel: classify the order's fate. Fully-filled takers (and
+                // IOC/Market remainders WITH fills) are covered by orders_matched;
+                // everything else is either placed (rests) or an engine death.
+                match result.status {
+                    OrderStatus::Resting
+                    | OrderStatus::PartiallyFilled
+                    | OrderStatus::PendingTrigger => fate_placed += 1,
+                    OrderStatus::Rejected => fate_engine_rejected += 1,
+                    OrderStatus::Cancelled if result.fills.is_empty() => {
+                        fate_cancelled_unfilled += 1
+                    }
+                    _ => {}
+                }
+
                 total_gas += 1000;
                 results[prep.index] = NativeActionResult::ok("place_order", 1000);
             }
         }
+
+        // Flush the per-batch fate accumulators (zero behavior change; pure counters).
+        Self::count_orders_placed(ctx, fate_placed);
+        Self::count_orders_rejected(ctx, "insufficient_margin", fate_insufficient_margin);
+        Self::count_orders_rejected(ctx, "balance_error", fate_balance_error);
+        Self::count_orders_rejected(ctx, "fill_failed", fate_fill_failed);
+        Self::count_orders_rejected(ctx, "engine_rejected", fate_engine_rejected);
+        Self::count_orders_rejected(ctx, "cancelled_unfilled", fate_cancelled_unfilled);
 
         // O1: materialize all deferred balance mutations (reserves + releases) into the
         // overlay before the call returns, so the next execute_batch call and every
@@ -880,6 +944,7 @@ impl NativeExecutor {
             match ctx.positions.get_native_balance(sender) {
                 Ok(mut bal) => {
                     if bal.available < order_margin_required {
+                        Self::count_orders_rejected(ctx, "insufficient_margin", 1);
                         return NativeActionResult::err(
                             "place_order",
                             format!(
@@ -891,10 +956,14 @@ impl NativeExecutor {
                     bal.available -= order_margin_required;
                     bal.order_margin += order_margin_required;
                     if let Err(e) = ctx.positions.put_native_balance(sender, &bal) {
+                        Self::count_orders_rejected(ctx, "balance_error", 1);
                         return NativeActionResult::err("place_order", e.to_string());
                     }
                 }
-                Err(e) => return NativeActionResult::err("place_order", e.to_string()),
+                Err(e) => {
+                    Self::count_orders_rejected(ctx, "balance_error", 1);
+                    return NativeActionResult::err("place_order", e.to_string());
+                }
             }
         }
 
@@ -953,6 +1022,7 @@ impl NativeExecutor {
                 fill.price,
                 MarginType::Cross,
             ) {
+                Self::count_orders_rejected(ctx, "fill_failed", 1);
                 return NativeActionResult::err("place_order", format!("taker fill failed: {e}"));
             }
             if let Err(e) = ctx.positions.apply_fill(
@@ -963,6 +1033,7 @@ impl NativeExecutor {
                 fill.price,
                 MarginType::Cross,
             ) {
+                Self::count_orders_rejected(ctx, "fill_failed", 1);
                 return NativeActionResult::err("place_order", format!("maker fill failed: {e}"));
             }
         }
@@ -975,6 +1046,18 @@ impl NativeExecutor {
 
         if let Some(ref m) = ctx.metrics {
             m.orders_matched.inc_by(result.fills.len() as u64);
+        }
+
+        // P2 funnel: fate classification (mirrors the execute_batch settle path).
+        match result.status {
+            OrderStatus::Resting | OrderStatus::PartiallyFilled | OrderStatus::PendingTrigger => {
+                Self::count_orders_placed(ctx, 1)
+            }
+            OrderStatus::Rejected => Self::count_orders_rejected(ctx, "engine_rejected", 1),
+            OrderStatus::Cancelled if result.fills.is_empty() => {
+                Self::count_orders_rejected(ctx, "cancelled_unfilled", 1)
+            }
+            _ => {}
         }
 
         NativeActionResult::ok("place_order", 1000)
