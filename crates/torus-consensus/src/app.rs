@@ -115,6 +115,41 @@ fn exec_hole_failstop_budget() -> std::time::Duration {
     }
 }
 
+/// Runtime toggle (perf A1): erasure-shard custody of native bodies
+/// (`custody_native_shards_best_effort`). Default ON — unset/`"1"`/anything
+/// but `"0"` keeps current behavior. `TORUS_SHARD_CUSTODY=0` skips custody:
+/// safe because the whole-body DA mirror stays the durability guarantee and
+/// peers fall back to whole-body pull (never wedge). Read once per process.
+fn shard_custody_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| parse_shard_custody_toggle(std::env::var("TORUS_SHARD_CUSTODY").ok()))
+}
+
+/// Pure parse of the `TORUS_SHARD_CUSTODY` value (default ON; only `"0"`
+/// disables). Split from the `OnceLock` reader so it is unit-testable without
+/// touching process-global state (same idiom as `parse_sync_wal_toggle`).
+fn parse_shard_custody_toggle(raw: Option<String>) -> bool {
+    match raw {
+        Some(v) => v.trim() != "0",
+        None => true,
+    }
+}
+
+#[cfg(test)]
+mod shard_custody_toggle_tests {
+    use super::parse_shard_custody_toggle;
+
+    #[test]
+    fn default_is_on_and_only_zero_disables() {
+        assert!(parse_shard_custody_toggle(None));
+        assert!(parse_shard_custody_toggle(Some("1".into())));
+        assert!(parse_shard_custody_toggle(Some("true".into())));
+        assert!(parse_shard_custody_toggle(Some("".into())));
+        assert!(!parse_shard_custody_toggle(Some("0".into())));
+        assert!(!parse_shard_custody_toggle(Some(" 0 ".into())));
+    }
+}
+
 /// Shared consensus state for leader discovery by non-consensus components (RPC).
 pub struct LeaderState {
     view: AtomicU64,
@@ -2634,12 +2669,23 @@ impl TorusApp {
     /// shards for these bodies (peers fall back to whole-body pull and never
     /// wedge), so it is logged — NOT fail-closed like the body mirror. `height` is
     /// included in the warn log for correlation. Empty input is a no-op.
+    ///
+    /// Runtime toggle (perf A1): `TORUS_SHARD_CUSTODY=0` skips shard custody at
+    /// ALL THREE call sites (proposer `produce_block`, validator full-block and
+    /// compact-block decode paths). Default `"1"` = custody on, byte-identical
+    /// to prior behavior. Skipping is safe because the whole-body mirror above
+    /// remains the durability guarantee — peers fall back to whole-body pull
+    /// and never wedge. Read once per process (OnceLock, same idiom as
+    /// `sync_wal_on_commit_enabled`).
     fn custody_native_shards_best_effort(
         &self,
         mempool: &torus_mempool::Mempool,
         actions: &[torus_types::SignedNativeAction],
         height: u64,
     ) {
+        if !shard_custody_enabled() {
+            return;
+        }
         if actions.is_empty() {
             return;
         }
