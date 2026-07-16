@@ -117,6 +117,13 @@ enum Command {
         /// per-market parallel matching entirely (S372/S395).
         #[arg(long, default_value_t = 1)]
         markets: u64,
+        /// Order-flow shape (P3 Round-1). "rest" (DEFAULT, unchanged) uniform
+        /// 60,000±5,000 → ~98% resting (A/B baseline; self-poisons at the trader
+        /// cap on multi-minute runs); "cross" tight ±50 band so most orders MATCH
+        /// (sustained proof mode); "churn" rest-shaped with a CancelAllOrders every
+        /// 16th action/sender to bound book depth.
+        #[arg(long, default_value = "rest")]
+        flow: String,
     },
     Combined {
         #[arg(
@@ -159,18 +166,64 @@ enum Command {
     },
 }
 
-fn random_place_order(rng: &mut impl Rng, market_id: u64) -> NativeAction {
+/// Order-flow shape (P3 Round-1 item 4). Selects the price band and whether
+/// periodic `CancelAllOrders` actions are injected, so a multi-minute proof run
+/// can avoid the rest-flow book self-poisoning (200×senders×markets resting →
+/// 100% `trader_cap` reject) that made sustained throughput un-measurable in P2.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Flow {
+    /// DEFAULT / unchanged: uniform 60,000±5,000 mid. ~98% of orders rest (the
+    /// P2 A/B baseline — orders rarely cross, books accumulate then poison).
+    Rest,
+    /// Tight ±50 band around the 60,000 mid so buys and sells overlap and most
+    /// orders MATCH instead of resting — keeps resting depth < the trader cap.
+    Cross,
+    /// Rest-shaped placement, but every `CHURN_K`-th action per sender is a
+    /// `CancelAllOrders` that clears that sender's resting orders — bounds book
+    /// depth without relying on matching.
+    Churn,
+}
+
+impl Flow {
+    fn parse(s: &str) -> Result<Flow, String> {
+        match s.to_ascii_lowercase().as_str() {
+            "rest" => Ok(Flow::Rest),
+            "cross" => Ok(Flow::Cross),
+            "churn" => Ok(Flow::Churn),
+            other => Err(format!("unknown --flow '{other}' (want rest|cross|churn)")),
+        }
+    }
+}
+
+/// One `CancelAllOrders` every K actions per sender in `--flow churn`.
+const CHURN_K: u64 = 16;
+
+fn random_place_order(rng: &mut impl Rng, market_id: u64, flow: Flow) -> NativeAction {
     // Prices MUST be tick-aligned or the matching engine rejects the order outright
     // (`order_book.rs`: `price.raw() % tick_size.raw() != 0` -> Rejected). The runtime
     // order book is auto-created with tick = lot = FixedPoint::ONE (whole units), so
-    // generate whole-unit prices around a 60,000 mid (±5,000) — these always satisfy a
-    // 1.0 tick and cross often enough to actually exercise the matching engine.
+    // generate whole-unit prices around a 60,000 mid — these always satisfy a 1.0 tick.
     let mid: i128 = 60_000;
-    let offset = rng.gen_range(-5_000i128..=5_000);
-    let price = FixedPoint::from_raw((mid + offset) * FixedPoint::SCALE);
+    let is_buy = rng.gen_bool(0.5);
+    let price_raw = match flow {
+        // MARKETABLE tight band (±50): buyers bid AT/ABOVE the mid, sellers ask
+        // AT/BELOW it, so a resting order on the opposite side is always crossable
+        // (best ask <= mid <= any bid). Orders MATCH instead of resting, keeping
+        // book depth below the 200-order trader cap. The P2 sustained-proof mode.
+        Flow::Cross => {
+            if is_buy {
+                mid + rng.gen_range(0i128..=50)
+            } else {
+                mid - rng.gen_range(0i128..=50)
+            }
+        }
+        // Wide symmetric ±5,000 band, side-independent: opposing orders rarely
+        // cross, so ~98% rest — the A/B baseline that self-poisons at the cap.
+        Flow::Rest | Flow::Churn => mid + rng.gen_range(-5_000i128..=5_000),
+    };
+    let price = FixedPoint::from_raw(price_raw * FixedPoint::SCALE);
     let qty_units = rng.gen_range(1i128..=100);
     let quantity = FixedPoint::from_raw(qty_units * FixedPoint::SCALE);
-    let is_buy = rng.gen_bool(0.5);
 
     NativeAction::PlaceOrder(PlaceOrderParams {
         market_id,
@@ -227,10 +280,12 @@ fn sign_payload_batch(
     mut last_nonce: u64,
     bin: bool,
     markets: u64,
+    flow: Flow,
+    seq: &mut u64,
 ) -> (Vec<String>, u64) {
     let mut payloads = Vec::with_capacity(submit_batch);
     for _ in 0..submit_batch {
-        let action = random_place_order_action(rng, markets, batch_size);
+        let action = random_place_order_action(rng, markets, batch_size, flow, seq);
         let base = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -268,13 +323,17 @@ fn pregen_ammo(
     bin: bool,
     base_nonce: u64,
     markets: u64,
+    flow: Flow,
 ) -> Vec<Vec<String>> {
     let mut nonce = base_nonce;
     let mut ammo = Vec::with_capacity(count);
+    // Per-sender churn ordinal — persists across every ammo batch this sender
+    // pre-generates so `CancelAllOrders` lands every CHURN_K actions overall.
+    let mut seq: u64 = 0;
     for _ in 0..count {
         let mut payloads = Vec::with_capacity(submit_batch);
         for _ in 0..submit_batch {
-            let action = random_place_order_action(rng, markets, batch_size);
+            let action = random_place_order_action(rng, markets, batch_size, flow, &mut seq);
             let signed = sign_one(action, nonce, key, session, mode);
             nonce += 1;
             let bytes = if bin {
@@ -401,16 +460,36 @@ mod ammo_plan_tests {
 /// load shape skips `MarketWorkerPool::match_parallel` entirely
 /// (market_workers.rs single-market fast path) and measures one book's
 /// sequential ceiling, not the chain's (S372 finding, S395 knob).
-fn random_place_order_action(rng: &mut impl Rng, markets: u64, batch_size: usize) -> NativeAction {
+/// `flow` selects the price band and churn injection (P3 Round-1 item 4). `seq`
+/// is this sender's running action ordinal, advanced by one per call — in
+/// `--flow churn` every `CHURN_K`-th action becomes a `CancelAllOrders` (across
+/// all of the sender's markets) so resting depth stays bounded.
+fn random_place_order_action(
+    rng: &mut impl Rng,
+    markets: u64,
+    batch_size: usize,
+    flow: Flow,
+    seq: &mut u64,
+) -> NativeAction {
     let markets = markets.max(1);
+    let n = *seq;
+    *seq = seq.wrapping_add(1);
+
+    if flow == Flow::Churn && n > 0 && n % CHURN_K == 0 {
+        // Clear this sender's resting orders on ALL markets (market_id: None).
+        // CancelAllOrders is permitted under SessionScope::Full (the bench's mode)
+        // and gets pool-selection priority (cancels sort first).
+        return NativeAction::CancelAllOrders { market_id: None };
+    }
+
     if batch_size <= 1 {
         let market_id = rng.gen_range(1..=markets);
-        return random_place_order(rng, market_id);
+        return random_place_order(rng, market_id, flow);
     }
     let orders: Vec<PlaceOrderParams> = (0..batch_size)
         .map(|_| {
             let market_id = rng.gen_range(1..=markets);
-            match random_place_order(rng, market_id) {
+            match random_place_order(rng, market_id, flow) {
                 NativeAction::PlaceOrder(p) => p,
                 _ => unreachable!(),
             }
@@ -505,7 +584,10 @@ fn run_matching_engine(orders: usize, markets: u64, warmup: usize, genesis_path:
         let warmup_actions: Vec<(Address, NativeAction)> = (0..warmup)
             .map(|_| {
                 let mid = rng.gen_range(0..market_count);
-                (random_address(&mut rng), random_place_order(&mut rng, mid))
+                (
+                    random_address(&mut rng),
+                    random_place_order(&mut rng, mid, Flow::Rest),
+                )
             })
             .collect();
         for (addr, _) in &warmup_actions {
@@ -540,7 +622,10 @@ fn run_matching_engine(orders: usize, markets: u64, warmup: usize, genesis_path:
         let actions: Vec<(Address, NativeAction)> = (0..batch_size)
             .map(|_| {
                 let mid = rng.gen_range(0..market_count);
-                (random_address(&mut rng), random_place_order(&mut rng, mid))
+                (
+                    random_address(&mut rng),
+                    random_place_order(&mut rng, mid, Flow::Rest),
+                )
             })
             .collect();
 
@@ -582,7 +667,12 @@ fn run_matching_engine(orders: usize, markets: u64, warmup: usize, genesis_path:
 
         for m in 0..market_count.min(4) {
             let actions: Vec<(Address, NativeAction)> = (0..orders)
-                .map(|_| (random_address(&mut rng), random_place_order(&mut rng, m)))
+                .map(|_| {
+                    (
+                        random_address(&mut rng),
+                        random_place_order(&mut rng, m, Flow::Rest),
+                    )
+                })
                 .collect();
 
             for (addr, _) in &actions {
@@ -1118,6 +1208,7 @@ async fn run_consensus(
     rate: usize,
     sign_mode: SignMode,
     markets: u64,
+    flow: Flow,
 ) {
     let rpc_urls: Vec<String> = rpc_urls_str
         .split(',')
@@ -1211,7 +1302,13 @@ async fn run_consensus(
             tokio::time::sleep(Duration::from_millis(750)).await;
             probe_nonce += 1;
             let canary = sign_native_action_with_session(
-                random_place_order_action(&mut StdRng::from_entropy(), 1, 1),
+                random_place_order_action(
+                    &mut StdRng::from_entropy(),
+                    1,
+                    1,
+                    Flow::Rest,
+                    &mut 0u64,
+                ),
                 probe_nonce,
                 canary_key,
             );
@@ -1256,10 +1353,11 @@ async fn run_consensus(
             let mut rng = StdRng::from_entropy();
             let t = Instant::now();
             let mut n = 0u64;
+            let mut calib_seq = 0u64;
             for _ in 0..3 {
                 let (p, _) = sign_payload_batch(
                     &mut rng, &calib_key, &calib_session, sign_mode, batch_size,
-                    submit_batch, 0, bin, markets,
+                    submit_batch, 0, bin, markets, flow, &mut calib_seq,
                 );
                 n += p.len() as u64;
             }
@@ -1331,6 +1429,7 @@ async fn run_consensus(
                     bin,
                     base_nonce,
                     markets,
+                    flow,
                 )
             }));
         }
@@ -1544,6 +1643,9 @@ async fn run_consensus(
                 let signer = tokio::task::spawn_blocking(move || {
                     let mut rng = StdRng::from_entropy();
                     let mut last_nonce: u64 = 0;
+                    // Per-sender churn ordinal, persistent across the stream so
+                    // CancelAllOrders lands every CHURN_K actions overall.
+                    let mut seq: u64 = 0;
                     loop {
                         let (payloads, n) = sign_payload_batch(
                             &mut rng,
@@ -1555,6 +1657,8 @@ async fn run_consensus(
                             last_nonce,
                             bin,
                             markets,
+                            flow,
+                            &mut seq,
                         );
                         last_nonce = n;
                         if pregen_tx.blocking_send(payloads).is_err() {
@@ -1925,6 +2029,7 @@ async fn main() {
             rate,
             sign_mode,
             markets,
+            flow,
         } => {
             let bin = match format.as_str() {
                 "bin" => true,
@@ -1942,6 +2047,13 @@ async fn main() {
                     std::process::exit(2);
                 }
             };
+            let flow = match Flow::parse(&flow) {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(2);
+                }
+            };
             run_consensus(
                 &rpc_urls,
                 senders,
@@ -1955,6 +2067,7 @@ async fn main() {
                 rate,
                 mode,
                 markets,
+                flow,
             )
             .await
         }
@@ -1971,7 +2084,7 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::{fire_interval, pregen_ammo, sign_one, sign_payload_batch, SignMode};
-    use super::{summarize_included, SweptBlock};
+    use super::{random_place_order_action, summarize_included, Flow, SweptBlock};
     use rand::{rngs::StdRng, SeedableRng};
 
     #[test]
@@ -1979,9 +2092,13 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(7);
         let key = k256::ecdsa::SigningKey::from_slice(&[0x11; 32]).unwrap();
         let ed = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]);
-        let (p1, n1) = sign_payload_batch(&mut rng, &key, &ed, SignMode::Eip712, 3, 4, 0, false, 1);
-        let (p2, n2) =
-            sign_payload_batch(&mut rng, &key, &ed, SignMode::Eip712, 3, 4, n1, false, 1);
+        let mut seq = 0u64;
+        let (p1, n1) = sign_payload_batch(
+            &mut rng, &key, &ed, SignMode::Eip712, 3, 4, 0, false, 1, Flow::Rest, &mut seq,
+        );
+        let (p2, n2) = sign_payload_batch(
+            &mut rng, &key, &ed, SignMode::Eip712, 3, 4, n1, false, 1, Flow::Rest, &mut seq,
+        );
         assert_eq!(p1.len(), 4);
         assert_eq!(p2.len(), 4);
         assert!(n2 > n1, "nonce watermark must advance across batches");
@@ -2042,6 +2159,7 @@ mod tests {
             false,
             BASE,
             1,
+            Flow::Rest,
         );
         assert_eq!(ammo.len(), 3, "one payload-vec per requested count");
         assert!(
@@ -2065,6 +2183,94 @@ mod tests {
                 "ammo nonces must be contiguous & strictly increasing from base_nonce: {nonces:?}"
             );
         }
+    }
+
+    /// P3 Round-1 item 4 (probe replay): `--flow cross`'s tight ±50 price band
+    /// must make most orders MATCH and keep resting depth well below the rest-flow
+    /// accumulation that self-poisons the book at the trader cap. Runs the bench's
+    /// own generator through the real torus-core matching engine.
+    #[test]
+    fn cross_flow_matches_and_bounds_resting_vs_rest() {
+        use alloy_primitives::Address;
+        use torus_core::order_book::OrderBook;
+        use torus_types::{FixedPoint, NativeAction};
+
+        // Returns (fills_events, placed_count, resting_after). `placed_count` is
+        // orders that entered a book as resting at placement; `resting_after` is
+        // depth at the end (resting makers that were later consumed drop out).
+        fn run(flow: Flow, n: usize) -> (usize, usize, usize) {
+            use torus_core::order_book::OrderStatus;
+            let mut rng = StdRng::seed_from_u64(99);
+            let mut book = OrderBook::new(1, FixedPoint::ONE, FixedPoint::ONE);
+            let mut seq = 0u64;
+            let mut fills = 0usize;
+            let mut placed = 0usize;
+            for i in 0..n {
+                let params = match random_place_order_action(&mut rng, 1, 1, flow, &mut seq) {
+                    NativeAction::PlaceOrder(p) => p,
+                    _ => continue,
+                };
+                // Distinct-ish traders keep every trader under the 200 cap and
+                // avoid self-trade-prevention cancels dominating the count.
+                let mut b = [0u8; 20];
+                b[12..20].copy_from_slice(&((i as u64 % 4096) + 1).to_be_bytes());
+                let r = book.place_order(params, Address::from(b), i as u64);
+                fills += r.fills.len();
+                if matches!(
+                    r.status,
+                    OrderStatus::Resting | OrderStatus::PartiallyFilled
+                ) {
+                    placed += 1;
+                }
+            }
+            (fills, placed, book.order_count())
+        }
+
+        let n = 4000;
+        let (cross_fills, _cross_placed, cross_resting) = run(Flow::Cross, n);
+        let (_rest_fills, _rest_placed, rest_resting) = run(Flow::Rest, n);
+
+        // "matched fraction": orders that did NOT remain resting — filled on
+        // arrival OR consumed as a resting maker (the node-meaningful sense; a
+        // per-order taker-only count structurally caps at ~50% in balanced flow).
+        let cross_consumed = n - cross_resting;
+        assert!(
+            cross_consumed * 2 >= n,
+            "cross-flow matched fraction must be >=50%: consumed {cross_consumed}/{n} \
+             (resting {cross_resting}, {cross_fills} fill events)"
+        );
+        assert!(
+            cross_resting < rest_resting,
+            "cross-flow must rest far fewer orders than rest-flow: {cross_resting} vs {rest_resting}"
+        );
+    }
+
+    /// P3 Round-1 item 4: `--flow churn` injects exactly one `CancelAllOrders`
+    /// every `CHURN_K` actions per sender (the depth-bounding mechanism), while
+    /// `rest`/`cross` never do.
+    #[test]
+    fn churn_flow_injects_periodic_cancel_all() {
+        use torus_types::NativeAction;
+        let total = super::CHURN_K as usize * 4; // seq 0..(4K-1) => cancels at K,2K,3K
+        let count_cancels = |flow: Flow| -> usize {
+            let mut rng = StdRng::seed_from_u64(1);
+            let mut seq = 0u64;
+            (0..total)
+                .filter(|_| {
+                    matches!(
+                        random_place_order_action(&mut rng, 4, 1, flow, &mut seq),
+                        NativeAction::CancelAllOrders { .. }
+                    )
+                })
+                .count()
+        };
+        assert_eq!(
+            count_cancels(Flow::Churn),
+            3,
+            "churn injects a CancelAllOrders every CHURN_K actions"
+        );
+        assert_eq!(count_cancels(Flow::Rest), 0, "rest flow never cancels");
+        assert_eq!(count_cancels(Flow::Cross), 0, "cross flow never cancels");
     }
 
     #[test]
