@@ -908,6 +908,51 @@ mod tests {
         handle.stop().unwrap();
     }
 
+    /// P2 funnel item 2: a batch submit that times out waiting for a verify
+    /// permit ("server overloaded") was a SILENT shed — Phase-1 measured
+    /// permit_wait p99 pinned at 250ms with 84–92% loss and no counter moving.
+    /// The shed must land on `torus_rpc_submit_shed` (in items, so the loss
+    /// ledger stays in action units).
+    #[tokio::test]
+    async fn permit_timeout_shed_increments_counter() {
+        let (_dir, state, mempool, executor) = setup();
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
+        let mut server = RpcServer::new(
+            state,
+            mempool,
+            executor,
+            TORUS_CHAIN_ID,
+            100,
+            BlockNotifier::new(),
+        );
+        server.set_metrics(metrics.clone());
+        // Hold EVERY permit so the submit path times out after
+        // SUBMIT_QUEUE_TIMEOUT and sheds. Clone the Arc before start() moves
+        // the server.
+        let sem = server.state.submit_semaphore.clone();
+        let _held: Vec<_> = (0..SUBMIT_PERMITS)
+            .map(|_| sem.clone().try_acquire_owned().expect("permit available"))
+            .collect();
+        let (handle, addr) = server.start("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        use jsonrpsee::core::client::ClientT;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+
+        let batch = vec!["0x00".to_string(), "0x01".to_string()];
+        let res: Result<Vec<RpcSubmitResult>, _> = client
+            .request("torus_submitNativeActions", jsonrpsee::rpc_params![batch])
+            .await;
+        assert!(res.is_err(), "saturated server must shed the batch");
+
+        let text = metrics.encode();
+        assert!(
+            text.contains("torus_rpc_submit_shed_total 2"),
+            "shed must count both batch items; metrics dump:\n{text}"
+        );
+        handle.stop().unwrap();
+    }
+
     /// Sprint 5 Task 2 (instrumentation): per-phase cost of `verify_one_action`
     /// at bs 1/100/500. Prints µs per phase under --nocapture; asserts only
     /// correctness so timing noise can't flake CI.

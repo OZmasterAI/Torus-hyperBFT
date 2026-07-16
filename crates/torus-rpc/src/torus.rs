@@ -389,11 +389,20 @@ impl RpcState {
         // permit bounds concurrent blocking-pool verify tasks, and the batch
         // runs as exactly one such task.
         let permit_wait_t0 = std::time::Instant::now();
-        let _permit = crate::acquire_submit_permit(&self.submit_semaphore)
-            .await
-            .ok_or_else(|| {
-                ErrorObjectOwned::from(RpcError::Internal("server overloaded, try again".into()))
-            })?;
+        let _permit = match crate::acquire_submit_permit(&self.submit_semaphore).await {
+            Some(permit) => permit,
+            None => {
+                // P2 funnel: permit-timeout shed was silent (Phase-1: permit_wait
+                // p99 pinned at 250ms while 84–92% of offered load vanished).
+                // Count in ITEMS so sum(sheds + rejects + admits) ≈ offered.
+                if let Some(ref m) = self.metrics {
+                    m.rpc_submit_shed.inc_by(signed_actions.len() as u64);
+                }
+                return Err(ErrorObjectOwned::from(RpcError::Internal(
+                    "server overloaded, try again".into(),
+                )));
+            }
+        };
         if let Some(ref m) = self.metrics {
             m.rpc_submit_permit_wait_seconds
                 .observe(permit_wait_t0.elapsed().as_secs_f64());
@@ -1007,11 +1016,19 @@ impl TorusApiServer for RpcState {
     async fn submit_native_action(&self, signed_action: String) -> RpcResult<String> {
         // Bounded queue: bursts wait up to SUBMIT_QUEUE_TIMEOUT for a permit
         // instead of instantly bouncing; sustained saturation still sheds.
-        let _permit = crate::acquire_submit_permit(&self.submit_semaphore)
-            .await
-            .ok_or_else(|| {
-                ErrorObjectOwned::from(RpcError::Internal("server overloaded, try again".into()))
-            })?;
+        let _permit = match crate::acquire_submit_permit(&self.submit_semaphore).await {
+            Some(permit) => permit,
+            None => {
+                // P2 funnel: count the silent permit-timeout shed (1 item on
+                // the single-action endpoint).
+                if let Some(ref m) = self.metrics {
+                    m.rpc_submit_shed.inc();
+                }
+                return Err(ErrorObjectOwned::from(RpcError::Internal(
+                    "server overloaded, try again".into(),
+                )));
+            }
+        };
         let bytes = parse_bytes(&signed_action).map_err(ErrorObjectOwned::from)?;
 
         // Offload deserialization + ECDSA verification to the blocking thread pool
