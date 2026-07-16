@@ -14,7 +14,7 @@ use torus_core::liquidation::LiquidationEngine;
 use torus_core::lockbox::{fp_to_u256, u256_to_fp, Lockbox};
 use torus_core::margin::{effective_max_leverage, MarketMarginConfig};
 use torus_core::oracle::{OracleConfig, OracleManager};
-use torus_core::order_book::{OrderBook, OrderStatus};
+use torus_core::order_book::{OrderBook, OrderStatus, RejectReason};
 use torus_core::position::{MarginType, NativeBalance, PositionManager};
 use torus_core::precompiles::{CoreWriterQueue, QueuedAction, QueuedActionKind};
 use torus_economics::epoch::ValidatorSetDiff;
@@ -194,6 +194,14 @@ pub struct NativeExecContext<T: StateBackend = StateDb> {
     /// advanced this block (or was never stored), so no-order blocks write nothing.
     loaded_next_global_order_id: Option<u128>,
 
+    /// P3 Round-1 item 3: per-block book-load ground truth, captured in `new()`
+    /// (which runs `load_order_books` BEFORE `metrics` is wired) and drained by
+    /// the caller into telemetry once `ctx.metrics` is set. `books_decode_failed`
+    /// > 0 is a correctness bug (silent state loss) — the E4 resolution.
+    pub load_books_seconds: f64,
+    pub books_loaded: u64,
+    pub books_decode_failed: u64,
+
     // Block metadata
     pub block_height: u64,
     pub timestamp: u64,
@@ -243,7 +251,11 @@ impl<T: StateBackend> NativeExecContext<T> {
         let governance = GovernanceManager::new(state.clone());
 
         // FIX 1 (ECON-FIND-02): Load persisted order books from DB on startup.
-        let (order_books, scanned_next_id) = Self::load_order_books(&state);
+        // P3 Round-1 item 3: time the load and count decoded / decode-failed rows.
+        let load_timer = std::time::Instant::now();
+        let (order_books, scanned_next_id, books_loaded, books_decode_failed) =
+            Self::load_order_books(&state);
+        let load_books_seconds = load_timer.elapsed().as_secs_f64();
         // S395: the durable counter row is authoritative when present — the
         // book-maxima scan resets to 1 once all books drain, silently reusing
         // order ids across a restart. max() keeps back-compat with DBs written
@@ -262,6 +274,9 @@ impl<T: StateBackend> NativeExecContext<T> {
             margin_configs: HashMap::new(),
             next_global_order_id,
             loaded_next_global_order_id: persisted_next_id,
+            load_books_seconds,
+            books_loaded,
+            books_decode_failed,
             block_height,
             timestamp,
             epoch,
@@ -284,24 +299,46 @@ impl<T: StateBackend> NativeExecContext<T> {
         std::mem::take(&mut self.pending_trades)
     }
 
-    /// FIX 1 (ECON-FIND-02): Load order books from DB. Returns (books, next_global_order_id).
-    fn load_order_books(state: &T) -> (HashMap<MarketId, OrderBook>, u128) {
+    /// FIX 1 (ECON-FIND-02): Load order books from DB. Returns
+    /// `(books, next_global_order_id, loaded, decode_failed)`.
+    ///
+    /// P3 Round-1 item 3(c): the `if let Ok(book)` here previously SWALLOWED any
+    /// row that failed to Borsh-decode with zero trace — the exact silent path
+    /// the P2 report flagged as E4 ("are books persisting, or silently losing
+    /// state?"). Decode failures are now counted and WARN-logged so a nonzero
+    /// `books_decode_failed` telemetry value flags a real correctness bug.
+    fn load_order_books(state: &T) -> (HashMap<MarketId, OrderBook>, u128, u64, u64) {
         use borsh::BorshDeserialize;
         use torus_state::cf::CF_NATIVE_ORDER_BOOKS;
 
         let mut books = HashMap::new();
         let mut max_order_id: u128 = 0;
+        let mut loaded: u64 = 0;
+        let mut decode_failed: u64 = 0;
 
         if let Ok(entries) = state.iterate_cf(CF_NATIVE_ORDER_BOOKS, None) {
             for (key, value) in entries {
                 if key.len() == 8 {
                     let market_id = u64::from_be_bytes(key[..8].try_into().unwrap());
-                    if let Ok(book) = OrderBook::try_from_slice(&value) {
-                        let book_next_id = book.next_order_id();
-                        if book_next_id > max_order_id {
-                            max_order_id = book_next_id;
+                    match OrderBook::try_from_slice(&value) {
+                        Ok(book) => {
+                            let book_next_id = book.next_order_id();
+                            if book_next_id > max_order_id {
+                                max_order_id = book_next_id;
+                            }
+                            books.insert(market_id, book);
+                            loaded += 1;
                         }
-                        books.insert(market_id, book);
+                        Err(e) => {
+                            decode_failed += 1;
+                            tracing::warn!(
+                                market_id,
+                                bytes = value.len(),
+                                error = %e,
+                                "order-book row failed to Borsh-decode at load — book state \
+                                 for this market is being silently dropped (E4 correctness flag)"
+                            );
+                        }
                     }
                 }
             }
@@ -309,7 +346,7 @@ impl<T: StateBackend> NativeExecContext<T> {
 
         // Global ID starts at max found + 1 (or 1 if no books loaded)
         let next_id = if max_order_id > 0 { max_order_id } else { 1 };
-        (books, next_id)
+        (books, next_id, loaded, decode_failed)
     }
 
     /// Durable global-order-id counter row. Lives in `CF_NATIVE_MARKETS` — a
@@ -339,6 +376,9 @@ impl<T: StateBackend> NativeExecContext<T> {
         use torus_state::cf::{CF_NATIVE_MARKETS, CF_NATIVE_ORDER_BOOKS};
 
         let mut written = 0;
+        // P3 Round-1 item 3(a): book-state bytes written this block (weight-based
+        // depth ground truth), summed over the dirty books actually persisted.
+        let mut bytes_written: u64 = 0;
         for &market_id in &self.dirty_books {
             let Some(book) = self.order_books.get(&market_id) else {
                 continue;
@@ -350,11 +390,17 @@ impl<T: StateBackend> NativeExecContext<T> {
                         tracing::error!(market_id, %e, "failed to persist order book");
                     } else {
                         written += 1;
+                        bytes_written += data.len() as u64;
                     }
                 }
                 Err(e) => {
                     tracing::error!(market_id, %e, "failed to serialize order book");
                 }
+            }
+        }
+        if bytes_written > 0 {
+            if let Some(ref m) = self.metrics {
+                m.exec_save_books_bytes.inc_by(bytes_written);
             }
         }
 
@@ -371,6 +417,37 @@ impl<T: StateBackend> NativeExecContext<T> {
         }
 
         written
+    }
+
+    /// P3 Round-1 item 3: publish the book-load ground truth captured in `new()`
+    /// to telemetry. Split from `new()` because the metrics handle is wired onto
+    /// the context AFTER construction (app.rs), so the load itself cannot record.
+    /// Call once per block, right after `ctx.metrics` is set.
+    pub fn record_book_load_metrics(&self) {
+        if let Some(ref m) = self.metrics {
+            m.exec_load_books_seconds.observe(self.load_books_seconds);
+            if self.books_loaded > 0 {
+                m.books_loaded.inc_by(self.books_loaded);
+            }
+            if self.books_decode_failed > 0 {
+                m.books_decode_failed.inc_by(self.books_decode_failed);
+            }
+        }
+    }
+
+    /// P3 Round-1 item 3(b): the FIRST true resting-depth ground truth at this
+    /// base (getOrderBook is borsh-broken). Sets the per-market
+    /// `native_resting_depth` gauge from the in-memory book after
+    /// `save_order_books`. Under the 200-order trader cap this pins at
+    /// 200×senders per market — the P2 book-poisoning signature made visible.
+    pub fn record_resting_depth(&self) {
+        if let Some(ref m) = self.metrics {
+            for (market_id, book) in &self.order_books {
+                m.native_resting_depth
+                    .get_or_create(&vec![("market".to_string(), market_id.to_string())])
+                    .set(book.order_count() as i64);
+            }
+        }
     }
 }
 
@@ -658,6 +735,7 @@ impl NativeExecutor {
         let mut fate_balance_error = 0u64;
         let mut fate_fill_failed = 0u64;
         let mut fate_engine_rejected = 0u64;
+        let mut fate_trader_cap = 0u64;
         let mut fate_cancelled_unfilled = 0u64;
 
         // O1: write-through balance cache, scoped to this execute_batch call. Serves
@@ -880,7 +958,16 @@ impl NativeExecutor {
                     OrderStatus::Resting
                     | OrderStatus::PartiallyFilled
                     | OrderStatus::PendingTrigger => fate_placed += 1,
-                    OrderStatus::Rejected => fate_engine_rejected += 1,
+                    // P3 Round-1 item 3(d): split the 200-order trader-cap reject
+                    // (the P2 book-poisoning root cause) out of the opaque
+                    // engine_rejected bucket so the live leg can prove it.
+                    OrderStatus::Rejected => {
+                        if result.reject_reason == Some(RejectReason::TraderCap) {
+                            fate_trader_cap += 1;
+                        } else {
+                            fate_engine_rejected += 1;
+                        }
+                    }
                     OrderStatus::Cancelled if result.fills.is_empty() => {
                         fate_cancelled_unfilled += 1
                     }
@@ -898,6 +985,7 @@ impl NativeExecutor {
         Self::count_orders_rejected(ctx, "balance_error", fate_balance_error);
         Self::count_orders_rejected(ctx, "fill_failed", fate_fill_failed);
         Self::count_orders_rejected(ctx, "engine_rejected", fate_engine_rejected);
+        Self::count_orders_rejected(ctx, "trader_cap", fate_trader_cap);
         Self::count_orders_rejected(ctx, "cancelled_unfilled", fate_cancelled_unfilled);
 
         // O1: materialize all deferred balance mutations (reserves + releases) into the
@@ -1053,7 +1141,15 @@ impl NativeExecutor {
             OrderStatus::Resting | OrderStatus::PartiallyFilled | OrderStatus::PendingTrigger => {
                 Self::count_orders_placed(ctx, 1)
             }
-            OrderStatus::Rejected => Self::count_orders_rejected(ctx, "engine_rejected", 1),
+            OrderStatus::Rejected => {
+                // P3 Round-1 item 3(d): label the 200-order trader-cap reject.
+                let reason = if result.reject_reason == Some(RejectReason::TraderCap) {
+                    "trader_cap"
+                } else {
+                    "engine_rejected"
+                };
+                Self::count_orders_rejected(ctx, reason, 1)
+            }
             OrderStatus::Cancelled if result.fills.is_empty() => {
                 Self::count_orders_rejected(ctx, "cancelled_unfilled", 1)
             }

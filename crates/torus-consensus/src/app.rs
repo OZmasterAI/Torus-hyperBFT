@@ -416,6 +416,9 @@ impl ExecutionContext {
                 self.dev_pool_address,
             );
             ctx.metrics = self.metrics.clone();
+            // P3 Round-1 item 3: the book load ran inside NativeExecContext::new
+            // (before metrics were wired) — publish its timing + decode counters now.
+            ctx.record_book_load_metrics();
             // O3: with a background writer present, fills buffer their
             // trade-history KVs (node-local, non-root CFs) instead of paying
             // per-fill overlay PUTs; they are handed over after the flush below.
@@ -439,6 +442,11 @@ impl ExecutionContext {
                 m.exec_save_books_seconds
                     .observe(save_books_timer.elapsed().as_secs_f64());
             }
+            // P3 Round-1 item 3(b): first true resting-depth ground truth — sample
+            // the in-memory books right after persistence (getOrderBook is
+            // borsh-broken at this base). exec_save_books_bytes is recorded inside
+            // save_order_books above.
+            ctx.record_resting_depth();
 
             let flush_timer = std::time::Instant::now();
             for (sender, nonce) in &consumed_nonces {
