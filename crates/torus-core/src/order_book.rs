@@ -55,6 +55,32 @@ pub struct Fill {
     pub timestamp: u64,
 }
 
+/// Why `place_order` produced `OrderStatus::Rejected`. Engine-internal telemetry
+/// surface only (P3 Round-1 item 3d): it is NEVER serialized into book state or a
+/// block, so it cannot perturb the state root — it exists purely so the executor
+/// can label the opaque `engine_rejected` bucket (e.g. the 200-order
+/// `TraderCap`, the P2 book-poisoning root cause) instead of one catch-all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RejectReason {
+    /// Quantity below the market lot size (dust).
+    DustQuantity,
+    /// Limit order with a non-positive price.
+    NonPositivePrice,
+    /// Limit price not aligned to the market tick size.
+    TickMisaligned,
+    /// The trader is at `MAX_ORDERS_PER_TRADER_PER_MARKET` resting orders on this
+    /// market — the P2-confirmed book-depth poisoning cause.
+    TraderCap,
+    /// Stop order whose trigger direction is invalid vs the last trade price.
+    StopTriggerInvalid,
+    /// PostOnly order that would cross the spread.
+    PostOnlyCross,
+    /// Market order with no liquidity on the opposing side.
+    NoLiquidity,
+    /// FOK order that cannot be completely filled.
+    FokUnfillable,
+}
+
 /// Result of placing an order.
 #[derive(Clone, Debug)]
 pub struct PlaceResult {
@@ -62,6 +88,9 @@ pub struct PlaceResult {
     pub status: OrderStatus,
     pub fills: Vec<Fill>,
     pub self_trade_cancels: Vec<OrderId>,
+    /// Set only when `status == Rejected` — the concrete rejection cause for
+    /// telemetry labeling. `None` for every non-rejected outcome.
+    pub reject_reason: Option<RejectReason>,
 }
 
 /// Order placement outcome.
@@ -174,6 +203,7 @@ impl OrderBook {
                 status: OrderStatus::Rejected,
                 fills: vec![],
                 self_trade_cancels: vec![],
+                reject_reason: Some(RejectReason::DustQuantity),
             };
         }
 
@@ -184,6 +214,7 @@ impl OrderBook {
                 status: OrderStatus::Rejected,
                 fills: vec![],
                 self_trade_cancels: vec![],
+                reject_reason: Some(RejectReason::NonPositivePrice),
             };
         }
 
@@ -197,6 +228,7 @@ impl OrderBook {
                 status: OrderStatus::Rejected,
                 fills: vec![],
                 self_trade_cancels: vec![],
+                reject_reason: Some(RejectReason::TickMisaligned),
             };
         }
 
@@ -208,6 +240,7 @@ impl OrderBook {
                 status: OrderStatus::Rejected,
                 fills: vec![],
                 self_trade_cancels: vec![],
+                reject_reason: Some(RejectReason::TraderCap),
             };
         }
 
@@ -226,6 +259,7 @@ impl OrderBook {
                             status: OrderStatus::Rejected,
                             fills: vec![],
                             self_trade_cancels: vec![],
+                            reject_reason: Some(RejectReason::StopTriggerInvalid),
                         };
                     }
                 }
@@ -247,6 +281,7 @@ impl OrderBook {
                     status: OrderStatus::PendingTrigger,
                     fills: vec![],
                     self_trade_cancels: vec![],
+                    reject_reason: None,
                 };
             }
             OrderType::StopLimit { trigger, limit } => {
@@ -262,6 +297,7 @@ impl OrderBook {
                             status: OrderStatus::Rejected,
                             fills: vec![],
                             self_trade_cancels: vec![],
+                            reject_reason: Some(RejectReason::StopTriggerInvalid),
                         };
                     }
                 }
@@ -283,6 +319,7 @@ impl OrderBook {
                     status: OrderStatus::PendingTrigger,
                     fills: vec![],
                     self_trade_cancels: vec![],
+                    reject_reason: None,
                 };
             }
             _ => {}
@@ -295,6 +332,7 @@ impl OrderBook {
                 status: OrderStatus::Rejected,
                 fills: vec![],
                 self_trade_cancels: vec![],
+                reject_reason: Some(RejectReason::PostOnlyCross),
             };
         }
 
@@ -312,6 +350,7 @@ impl OrderBook {
                     status: OrderStatus::Rejected,
                     fills: vec![],
                     self_trade_cancels: vec![],
+                    reject_reason: Some(RejectReason::NoLiquidity),
                 };
             }
         }
@@ -339,6 +378,7 @@ impl OrderBook {
                 status: OrderStatus::Rejected,
                 fills: vec![],
                 self_trade_cancels: vec![],
+                reject_reason: Some(RejectReason::FokUnfillable),
             };
         }
 
@@ -377,6 +417,7 @@ impl OrderBook {
             status,
             fills,
             self_trade_cancels,
+            reject_reason: None,
         }
     }
 
@@ -1519,6 +1560,35 @@ mod tests {
         let r = ob.place_order(market_buy(fp(10)), addr(1), 1);
         assert_eq!(r.status, OrderStatus::Rejected);
         assert!(r.fills.is_empty());
+        // P3 Round-1 item 3d: a no-liquidity market reject carries its reason.
+        assert_eq!(r.reject_reason, Some(RejectReason::NoLiquidity));
+    }
+
+    /// P3 Round-1 item 3d: the 200-order-per-trader cap (the P2-confirmed
+    /// book-poisoning root cause) must reject the 201st order with a
+    /// `TraderCap` reason so the executor labels it `orders_rejected{trader_cap}`
+    /// instead of the opaque `engine_rejected`. Resting orders below the cap
+    /// carry `reject_reason == None`.
+    #[test]
+    fn trader_cap_reject_carries_reason() {
+        let mut ob = book();
+        // 200 distinct resting bids for ONE trader (empty ask side => all rest).
+        for i in 0..MAX_ORDERS_PER_TRADER_PER_MARKET as u64 {
+            let r = ob.place_order(limit_buy(fp(100), fp(1)), addr(1), i);
+            assert_eq!(r.status, OrderStatus::Resting);
+            assert_eq!(r.reject_reason, None, "a resting order has no reject reason");
+        }
+        assert_eq!(ob.orders_for_trader(&addr(1)).len(), MAX_ORDERS_PER_TRADER_PER_MARKET);
+
+        // The 201st order for the same trader trips the cap.
+        let r = ob.place_order(limit_buy(fp(100), fp(1)), addr(1), 999);
+        assert_eq!(r.status, OrderStatus::Rejected);
+        assert_eq!(r.reject_reason, Some(RejectReason::TraderCap));
+
+        // A DIFFERENT trader is unaffected by the first trader's cap.
+        let r2 = ob.place_order(limit_buy(fp(100), fp(1)), addr(2), 1000);
+        assert_eq!(r2.status, OrderStatus::Resting);
+        assert_eq!(r2.reject_reason, None);
     }
 
     #[test]
