@@ -1,0 +1,363 @@
+=== Torus Throughput Benchmark ===
+Mode: consensus
+Sign mode: eip712 (secp256k1 ecrecover per action)
+Duration: 200s
+Senders: 20 (offset 60)
+Batch size: 400 order(s)/action
+Submit batch: 1 action(s)/RPC call
+RPC endpoints: 3
+
+[1s] submitted: 20 actions (40/s) | included: 0 actions (0/s) | orders ~0/s | blk: #11112 | 0ms/blk
+[1s] submitted: 60 actions (45/s) | included: 40 actions (30/s) | orders ~11974/s | blk: #11139 | 37ms/blk
+[2s] submitted: 80 actions (44/s) | included: 40 actions (22/s) | orders ~8705/s | blk: #11139 | 37ms/blk
+[3s] submitted: 120 actions (43/s) | included: 100 actions (36/s) | orders ~14248/s | blk: #11169 | 41ms/blk
+[3s] submitted: 140 actions (42/s) | included: 100 actions (30/s) | orders ~12064/s | blk: #11184 | 46ms/blk
+[4s] submitted: 180 actions (41/s) | included: 160 actions (37/s) | orders ~14755/s | blk: #11201 | 43ms/blk
+[5s] submitted: 200 actions (40/s) | included: 180 actions (36/s) | orders ~14527/s | blk: #11235 | 39ms/blk
+[6s] submitted: 240 actions (43/s) | included: 200 actions (36/s) | orders ~14284/s | blk: #11255 | 38ms/blk
+[6s] submitted: 260 actions (41/s) | included: 240 actions (38/s) | orders ~15192/s | blk: #11281 | 36ms/blk
+[7s] submitted: 280 actions (40/s) | included: 280 actions (40/s) | orders ~16046/s | blk: #11308 | 35ms/blk
+[7s] submitted: 300 actions (40/s) | included: 280 actions (37/s) | orders ~14969/s | blk: #11308 | 35ms/blk
+[8s] submitted: 340 actions (41/s) | included: 320 actions (38/s) | orders ~15387/s | blk: #11315 | 39ms/blk
+[9s] submitted: 360 actions (40/s) | included: 358 actions (40/s) | orders ~16006/s | blk: #11362 | 35ms/blk
+[10s] submitted: 391 actions (41/s) | included: 381 actions (40/s) | orders ~15975/s | blk: #11384 | 35ms/blk
+[10s] submitted: 420 actions (41/s) | included: 401 actions (39/s) | orders ~15754/s | blk: #11390 | 36ms/blk
+[11s] submitted: 440 actions (41/s) | included: 421 actions (39/s) | orders ~15653/s | blk: #11411 | 36ms/blk
+[11s] submitted: 460 actions (40/s) | included: 461 actions (40/s) | orders ~16137/s | blk: #11437 | 35ms/blk
+[12s] submitted: 480 actions (40/s) | included: 461 actions (39/s) | orders ~15457/s | blk: #11437 | 35ms/blk
+[13s] submitted: 520 actions (41/s) | included: 501 actions (39/s) | orders ~15731/s | blk: #11445 | 37ms/blk
+[13s] submitted: 540 actions (41/s) | included: 521 actions (39/s) | orders ~15655/s | blk: #11486 | 35ms/blk
+[14s] submitted: 560 actions (40/s) | included: 561 actions (40/s) | orders ~16091/s | blk: #11513 | 34ms/blk
+[14s] submitted: 580 actions (40/s) | included: 561 actions (39/s) | orders ~15532/s | blk: #11513 | 34ms/blk
+[15s] submitted: 620 actions (41/s) | included: 601 actions (39/s) | orders ~15746/s | blk: #11516 | 37ms/blk
+[16s] submitted: 640 actions (40/s) | included: 621 actions (39/s) | orders ~15668/s | blk: #11560 | 35ms/blk
+[16s] submitted: 660 actions (40/s) | included: 621 actions (38/s) | orders ~15187/s | blk: #11560 | 35ms/blk
+[17s] submitted: 700 actions (41/s) | included: 681 actions (40/s) | orders ~15804/s | blk: #11573 | 37ms/blk
+[18s] submitted: 720 actions (40/s) | included: 701 actions (39/s) | orders ~15738/s | blk: #11610 | 36ms/blk
+[18s] submitted: 740 actions (40/s) | included: 721 actions (39/s) | orders ~15593/s | blk: #11632 | 35ms/blk
+[19s] submitted: 780 actions (41/s) | included: 761 actions (40/s) | orders ~15890/s | blk: #11657 | 35ms/blk
+[20s] submitted: 800 actions (41/s) | included: 761 actions (39/s) | orders ~15484/s | blk: #11657 | 35ms/blk
+[20s] submitted: 820 actions (40/s) | included: 801 actions (39/s) | orders ~15654/s | blk: #11661 | 37ms/blk
+[21s] submitted: 859 actions (41/s) | included: 821 actions (39/s) | orders ~15584/s | blk: #11699 | 36ms/blk
+[22s] submitted: 880 actions (41/s) | included: 821 actions (38/s) | orders ~15215/s | blk: #11701 | 37ms/blk
+[22s] submitted: 900 actions (40/s) | included: 881 actions (39/s) | orders ~15727/s | blk: #11742 | 35ms/blk
+[23s] submitted: 940 actions (41/s) | included: 921 actions (40/s) | orders ~15960/s | blk: #11766 | 35ms/blk
+[24s] submitted: 960 actions (40/s) | included: 941 actions (40/s) | orders ~15879/s | blk: #11774 | 36ms/blk
+[24s] submitted: 980 actions (40/s) | included: 963 actions (40/s) | orders ~15864/s | blk: #11792 | 36ms/blk
+[25s] submitted: 1,000 actions (40/s) | included: 963 actions (39/s) | orders ~15543/s | blk: #11792 | 36ms/blk
+[26s] submitted: 1,040 actions (40/s) | included: 1,023 actions (40/s) | orders ~15932/s | blk: #11816 | 36ms/blk
+[26s] submitted: 1,060 actions (40/s) | included: 1,043 actions (40/s) | orders ~15891/s | blk: #11849 | 36ms/blk
+[27s] submitted: 1,080 actions (40/s) | included: 1,043 actions (39/s) | orders ~15592/s | blk: #11849 | 36ms/blk
+[28s] submitted: 1,120 actions (41/s) | included: 1,103 actions (40/s) | orders ~15961/s | blk: #11869 | 36ms/blk
+[28s] submitted: 1,140 actions (40/s) | included: 1,123 actions (40/s) | orders ~15920/s | blk: #11904 | 36ms/blk
+[29s] submitted: 1,160 actions (40/s) | included: 1,123 actions (39/s) | orders ~15641/s | blk: #11904 | 36ms/blk
+[29s] submitted: 1,180 actions (40/s) | included: 1,183 actions (40/s) | orders ~16060/s | blk: #11948 | 35ms/blk
+[30s] submitted: 1,200 actions (40/s) | included: 1,183 actions (39/s) | orders ~15790/s | blk: #11948 | 35ms/blk
+[31s] submitted: 1,240 actions (40/s) | included: 1,223 actions (40/s) | orders ~15923/s | blk: #11972 | 35ms/blk
+[31s] submitted: 1,260 actions (40/s) | included: 1,243 actions (40/s) | orders ~15883/s | blk: #11993 | 35ms/blk
+[32s] submitted: 1,280 actions (40/s) | included: 1,243 actions (39/s) | orders ~15632/s | blk: #11995 | 36ms/blk
+[33s] submitted: 1,320 actions (40/s) | included: 1,303 actions (40/s) | orders ~15988/s | blk: #12037 | 35ms/blk
+[33s] submitted: 1,340 actions (40/s) | included: 1,303 actions (39/s) | orders ~15745/s | blk: #12037 | 35ms/blk
+[34s] submitted: 1,360 actions (40/s) | included: 1,343 actions (40/s) | orders ~15879/s | blk: #12068 | 35ms/blk
+[35s] submitted: 1,386 actions (40/s) | included: 1,383 actions (40/s) | orders ~16024/s | blk: #12086 | 35ms/blk
+[35s] submitted: 1,412 actions (40/s) | included: 1,383 actions (39/s) | orders ~15782/s | blk: #12102 | 35ms/blk
+[36s] submitted: 1,440 actions (40/s) | included: 1,423 actions (40/s) | orders ~15931/s | blk: #12124 | 35ms/blk
+[36s] submitted: 1,460 actions (40/s) | included: 1,423 actions (39/s) | orders ~15710/s | blk: #12124 | 35ms/blk
+[37s] submitted: 1,492 actions (40/s) | included: 1,483 actions (40/s) | orders ~16011/s | blk: #12156 | 35ms/blk
+[38s] submitted: 1,520 actions (40/s) | included: 1,503 actions (40/s) | orders ~15954/s | blk: #12182 | 35ms/blk
+[38s] submitted: 1,540 actions (40/s) | included: 1,523 actions (40/s) | orders ~15924/s | blk: #12197 | 35ms/blk
+[39s] submitted: 1,560 actions (40/s) | included: 1,523 actions (39/s) | orders ~15716/s | blk: #12197 | 35ms/blk
+[40s] submitted: 1,586 actions (40/s) | included: 1,583 actions (40/s) | orders ~16021/s | blk: #12240 | 35ms/blk
+[40s] submitted: 1,607 actions (40/s) | included: 1,583 actions (40/s) | orders ~15820/s | blk: #12240 | 35ms/blk
+[41s] submitted: 1,640 actions (40/s) | included: 1,623 actions (40/s) | orders ~15919/s | blk: #12260 | 35ms/blk
+[41s] submitted: 1,660 actions (40/s) | included: 1,643 actions (40/s) | orders ~15865/s | blk: #12285 | 35ms/blk
+[42s] submitted: 1,700 actions (40/s) | included: 1,683 actions (40/s) | orders ~15991/s | blk: #12314 | 35ms/blk
+[43s] submitted: 1,720 actions (40/s) | included: 1,683 actions (40/s) | orders ~15803/s | blk: #12314 | 35ms/blk
+[43s] submitted: 1,740 actions (40/s) | included: 1,723 actions (40/s) | orders ~15899/s | blk: #12334 | 35ms/blk
+[44s] submitted: 1,760 actions (40/s) | included: 1,743 actions (40/s) | orders ~15871/s | blk: #12360 | 35ms/blk
+[44s] submitted: 1,780 actions (40/s) | included: 1,743 actions (39/s) | orders ~15692/s | blk: #12362 | 36ms/blk
+[45s] submitted: 1,820 actions (40/s) | included: 1,804 actions (40/s) | orders ~15946/s | blk: #12404 | 35ms/blk
+[46s] submitted: 1,840 actions (40/s) | included: 1,844 actions (40/s) | orders ~16069/s | blk: #12430 | 35ms/blk
+[46s] submitted: 1,860 actions (40/s) | included: 1,844 actions (40/s) | orders ~15895/s | blk: #12430 | 35ms/blk
+[47s] submitted: 1,900 actions (40/s) | included: 1,884 actions (40/s) | orders ~15968/s | blk: #12438 | 35ms/blk
+[48s] submitted: 1,920 actions (40/s) | included: 1,904 actions (40/s) | orders ~15935/s | blk: #12476 | 35ms/blk
+[48s] submitted: 1,940 actions (40/s) | included: 1,904 actions (39/s) | orders ~15769/s | blk: #12476 | 35ms/blk
+[49s] submitted: 1,980 actions (40/s) | included: 1,964 actions (40/s) | orders ~16000/s | blk: #12510 | 35ms/blk
+[50s] submitted: 2,000 actions (40/s) | included: 1,964 actions (40/s) | orders ~15837/s | blk: #12521 | 35ms/blk
+[50s] submitted: 2,020 actions (40/s) | included: 2,004 actions (40/s) | orders ~15916/s | blk: #12524 | 35ms/blk
+[51s] submitted: 2,040 actions (40/s) | included: 2,024 actions (40/s) | orders ~15895/s | blk: #12565 | 35ms/blk
+[52s] submitted: 2,080 actions (40/s) | included: 2,064 actions (40/s) | orders ~15986/s | blk: #12590 | 35ms/blk
+[52s] submitted: 2,100 actions (40/s) | included: 2,064 actions (40/s) | orders ~15832/s | blk: #12590 | 35ms/blk
+[53s] submitted: 2,120 actions (40/s) | included: 2,111 actions (40/s) | orders ~15951/s | blk: #12602 | 35ms/blk
+[54s] submitted: 2,140 actions (40/s) | included: 2,124 actions (40/s) | orders ~15879/s | blk: #12636 | 35ms/blk
+[54s] submitted: 2,180 actions (40/s) | included: 2,164 actions (40/s) | orders ~15973/s | blk: #12664 | 35ms/blk
+[55s] submitted: 2,200 actions (40/s) | included: 2,164 actions (40/s) | orders ~15827/s | blk: #12664 | 35ms/blk
+[55s] submitted: 2,220 actions (40/s) | included: 2,164 actions (39/s) | orders ~15683/s | blk: #12664 | 35ms/blk
+[56s] submitted: 2,240 actions (40/s) | included: 2,164 actions (39/s) | orders ~15541/s | blk: #12664 | 35ms/blk
+[56s] submitted: 2,260 actions (40/s) | included: 2,164 actions (39/s) | orders ~15403/s | blk: #12664 | 35ms/blk
+[57s] submitted: 2,280 actions (40/s) | included: 2,164 actions (38/s) | orders ~15266/s | blk: #12664 | 35ms/blk
+[57s] submitted: 2,300 actions (40/s) | included: 2,164 actions (38/s) | orders ~15132/s | blk: #12664 | 35ms/blk
+[58s] submitted: 2,320 actions (40/s) | included: 2,164 actions (38/s) | orders ~15001/s | blk: #12664 | 35ms/blk
+[58s] submitted: 2,340 actions (40/s) | included: 2,164 actions (37/s) | orders ~14871/s | blk: #12664 | 35ms/blk
+[59s] submitted: 2,360 actions (40/s) | included: 2,164 actions (37/s) | orders ~14744/s | blk: #12664 | 35ms/blk
+[59s] submitted: 2,380 actions (40/s) | included: 2,164 actions (37/s) | orders ~14619/s | blk: #12664 | 35ms/blk
+[60s] submitted: 2,400 actions (40/s) | included: 2,164 actions (36/s) | orders ~14496/s | blk: #12664 | 35ms/blk
+[60s] submitted: 2,420 actions (40/s) | included: 2,164 actions (36/s) | orders ~14376/s | blk: #12664 | 35ms/blk
+[61s] submitted: 2,440 actions (40/s) | included: 2,164 actions (36/s) | orders ~14257/s | blk: #12664 | 35ms/blk
+[61s] submitted: 2,460 actions (40/s) | included: 2,164 actions (35/s) | orders ~14140/s | blk: #12664 | 35ms/blk
+[62s] submitted: 2,480 actions (40/s) | included: 2,164 actions (35/s) | orders ~14025/s | blk: #12664 | 35ms/blk
+[62s] submitted: 2,500 actions (40/s) | included: 2,164 actions (35/s) | orders ~13912/s | blk: #12664 | 35ms/blk
+[63s] submitted: 2,520 actions (40/s) | included: 2,164 actions (35/s) | orders ~13801/s | blk: #12664 | 35ms/blk
+[63s] submitted: 2,540 actions (40/s) | included: 2,164 actions (34/s) | orders ~13691/s | blk: #12664 | 35ms/blk
+[64s] submitted: 2,560 actions (40/s) | included: 2,164 actions (34/s) | orders ~13583/s | blk: #12664 | 35ms/blk
+[64s] submitted: 2,580 actions (40/s) | included: 2,164 actions (34/s) | orders ~13477/s | blk: #12664 | 35ms/blk
+[65s] submitted: 2,600 actions (40/s) | included: 2,164 actions (33/s) | orders ~13372/s | blk: #12664 | 35ms/blk
+[65s] submitted: 2,620 actions (40/s) | included: 2,164 actions (33/s) | orders ~13269/s | blk: #12664 | 35ms/blk
+[68s] submitted: 2,720 actions (40/s) | included: 2,466 actions (36/s) | orders ~14585/s | blk: #12674 | 42ms/blk
+[69s] submitted: 2,780 actions (40/s) | included: 2,724 actions (39/s) | orders ~15683/s | blk: #12753 | 42ms/blk
+[70s] submitted: 2,820 actions (40/s) | included: 2,804 actions (40/s) | orders ~15920/s | blk: #12794 | 42ms/blk
+[71s] submitted: 2,850 actions (40/s) | included: 2,824 actions (40/s) | orders ~15902/s | blk: #12831 | 41ms/blk
+[72s] submitted: 2,871 actions (40/s) | included: 2,824 actions (39/s) | orders ~15791/s | blk: #12831 | 41ms/blk
+[72s] submitted: 2,900 actions (40/s) | included: 2,884 actions (40/s) | orders ~15958/s | blk: #12874 | 41ms/blk
+[73s] submitted: 2,920 actions (40/s) | included: 2,924 actions (40/s) | orders ~16038/s | blk: #12894 | 41ms/blk
+[73s] submitted: 2,940 actions (40/s) | included: 2,924 actions (40/s) | orders ~15928/s | blk: #12898 | 41ms/blk
+[74s] submitted: 2,960 actions (40/s) | included: 2,924 actions (40/s) | orders ~15820/s | blk: #12901 | 41ms/blk
+[75s] submitted: 3,000 actions (40/s) | included: 2,984 actions (40/s) | orders ~15974/s | blk: #12941 | 41ms/blk
+[75s] submitted: 3,020 actions (40/s) | included: 3,024 actions (40/s) | orders ~16049/s | blk: #12968 | 41ms/blk
+[76s] submitted: 3,040 actions (40/s) | included: 3,024 actions (40/s) | orders ~15943/s | blk: #12968 | 41ms/blk
+[77s] submitted: 3,080 actions (40/s) | included: 3,064 actions (40/s) | orders ~15994/s | blk: #12976 | 41ms/blk
+[77s] submitted: 3,100 actions (40/s) | included: 3,084 actions (40/s) | orders ~15977/s | blk: #13013 | 41ms/blk
+[78s] submitted: 3,120 actions (40/s) | included: 3,105 actions (40/s) | orders ~15960/s | blk: #13027 | 41ms/blk
+[78s] submitted: 3,140 actions (40/s) | included: 3,124 actions (40/s) | orders ~15941/s | blk: #13046 | 40ms/blk
+[79s] submitted: 3,180 actions (40/s) | included: 3,164 actions (40/s) | orders ~16004/s | blk: #13074 | 40ms/blk
+[80s] submitted: 3,200 actions (40/s) | included: 3,184 actions (40/s) | orders ~15980/s | blk: #13081 | 40ms/blk
+[80s] submitted: 3,220 actions (40/s) | included: 3,204 actions (40/s) | orders ~15963/s | blk: #13105 | 40ms/blk
+[81s] submitted: 3,240 actions (40/s) | included: 3,204 actions (40/s) | orders ~15864/s | blk: #13105 | 40ms/blk
+[82s] submitted: 3,280 actions (40/s) | included: 3,264 actions (40/s) | orders ~16004/s | blk: #13136 | 40ms/blk
+[82s] submitted: 3,300 actions (40/s) | included: 3,284 actions (40/s) | orders ~15975/s | blk: #13162 | 40ms/blk
+[83s] submitted: 3,320 actions (40/s) | included: 3,304 actions (40/s) | orders ~15962/s | blk: #13172 | 40ms/blk
+[83s] submitted: 3,340 actions (40/s) | included: 3,304 actions (40/s) | orders ~15866/s | blk: #13173 | 40ms/blk
+[84s] submitted: 3,380 actions (40/s) | included: 3,364 actions (40/s) | orders ~15996/s | blk: #13217 | 40ms/blk
+[85s] submitted: 3,400 actions (40/s) | included: 3,364 actions (40/s) | orders ~15901/s | blk: #13218 | 40ms/blk
+[85s] submitted: 3,420 actions (40/s) | included: 3,407 actions (40/s) | orders ~15965/s | blk: #13235 | 40ms/blk
+[86s] submitted: 3,440 actions (40/s) | included: 3,425 actions (40/s) | orders ~15937/s | blk: #13263 | 40ms/blk
+[87s] submitted: 3,480 actions (40/s) | included: 3,465 actions (40/s) | orders ~15999/s | blk: #13288 | 40ms/blk
+[87s] submitted: 3,500 actions (40/s) | included: 3,485 actions (40/s) | orders ~15983/s | blk: #13309 | 40ms/blk
+[88s] submitted: 3,520 actions (40/s) | included: 3,485 actions (40/s) | orders ~15891/s | blk: #13309 | 40ms/blk
+[89s] submitted: 3,560 actions (40/s) | included: 3,545 actions (40/s) | orders ~16005/s | blk: #13322 | 40ms/blk
+[89s] submitted: 3,580 actions (40/s) | included: 3,545 actions (40/s) | orders ~15913/s | blk: #13353 | 40ms/blk
+[90s] submitted: 3,600 actions (40/s) | included: 3,545 actions (40/s) | orders ~15824/s | blk: #13355 | 40ms/blk
+[90s] submitted: 3,620 actions (40/s) | included: 3,605 actions (40/s) | orders ~15958/s | blk: #13396 | 39ms/blk
+[91s] submitted: 3,640 actions (40/s) | included: 3,605 actions (40/s) | orders ~15870/s | blk: #13396 | 39ms/blk
+[92s] submitted: 3,680 actions (40/s) | included: 3,665 actions (40/s) | orders ~15994/s | blk: #13423 | 40ms/blk
+[92s] submitted: 3,700 actions (40/s) | included: 3,665 actions (40/s) | orders ~15906/s | blk: #13439 | 40ms/blk
+[93s] submitted: 3,720 actions (40/s) | included: 3,665 actions (40/s) | orders ~15820/s | blk: #13441 | 40ms/blk
+[94s] submitted: 3,746 actions (40/s) | included: 3,733 actions (40/s) | orders ~15964/s | blk: #13484 | 39ms/blk
+[94s] submitted: 3,780 actions (40/s) | included: 3,745 actions (40/s) | orders ~15921/s | blk: #13488 | 40ms/blk
+[95s] submitted: 3,800 actions (40/s) | included: 3,785 actions (40/s) | orders ~15972/s | blk: #13511 | 39ms/blk
+[95s] submitted: 3,820 actions (40/s) | included: 3,805 actions (40/s) | orders ~15960/s | blk: #13534 | 39ms/blk
+[96s] submitted: 3,851 actions (40/s) | included: 3,845 actions (40/s) | orders ~16014/s | blk: #13558 | 39ms/blk
+[97s] submitted: 3,871 actions (40/s) | included: 3,845 actions (40/s) | orders ~15931/s | blk: #13558 | 39ms/blk
+[97s] submitted: 3,900 actions (40/s) | included: 3,885 actions (40/s) | orders ~15970/s | blk: #13592 | 39ms/blk
+[98s] submitted: 3,920 actions (40/s) | included: 3,905 actions (40/s) | orders ~15953/s | blk: #13605 | 39ms/blk
+[98s] submitted: 3,940 actions (40/s) | included: 3,925 actions (40/s) | orders ~15939/s | blk: #13625 | 39ms/blk
+[99s] submitted: 3,960 actions (40/s) | included: 3,925 actions (40/s) | orders ~15859/s | blk: #13625 | 39ms/blk
+[100s] submitted: 4,000 actions (40/s) | included: 3,985 actions (40/s) | orders ~15977/s | blk: #13669 | 39ms/blk
+[100s] submitted: 4,020 actions (40/s) | included: 4,025 actions (40/s) | orders ~16030/s | blk: #13679 | 39ms/blk
+[101s] submitted: 4,040 actions (40/s) | included: 4,025 actions (40/s) | orders ~15949/s | blk: #13695 | 39ms/blk
+[101s] submitted: 4,060 actions (40/s) | included: 4,025 actions (40/s) | orders ~15870/s | blk: #13695 | 39ms/blk
+[102s] submitted: 4,100 actions (40/s) | included: 4,085 actions (40/s) | orders ~15993/s | blk: #13736 | 39ms/blk
+[103s] submitted: 4,120 actions (40/s) | included: 4,122 actions (40/s) | orders ~16027/s | blk: #13745 | 39ms/blk
+[103s] submitted: 4,140 actions (40/s) | included: 4,125 actions (40/s) | orders ~15959/s | blk: #13765 | 39ms/blk
+[104s] submitted: 4,160 actions (40/s) | included: 4,125 actions (40/s) | orders ~15882/s | blk: #13765 | 39ms/blk
+[105s] submitted: 4,200 actions (40/s) | included: 4,185 actions (40/s) | orders ~15970/s | blk: #13791 | 39ms/blk
+[105s] submitted: 4,220 actions (40/s) | included: 4,205 actions (40/s) | orders ~15957/s | blk: #13826 | 39ms/blk
+[106s] submitted: 4,260 actions (40/s) | included: 4,245 actions (40/s) | orders ~16006/s | blk: #13851 | 39ms/blk
+[107s] submitted: 4,280 actions (40/s) | included: 4,245 actions (40/s) | orders ~15930/s | blk: #13851 | 39ms/blk
+[107s] submitted: 4,300 actions (40/s) | included: 4,292 actions (40/s) | orders ~15998/s | blk: #13870 | 39ms/blk
+[108s] submitted: 4,320 actions (40/s) | included: 4,305 actions (40/s) | orders ~15964/s | blk: #13896 | 39ms/blk
+[109s] submitted: 4,340 actions (40/s) | included: 4,345 actions (40/s) | orders ~16018/s | blk: #13920 | 39ms/blk
+[109s] submitted: 4,380 actions (40/s) | included: 4,365 actions (40/s) | orders ~15997/s | blk: #13943 | 39ms/blk
+[110s] submitted: 4,400 actions (40/s) | included: 4,385 actions (40/s) | orders ~15987/s | blk: #13951 | 39ms/blk
+[110s] submitted: 4,420 actions (40/s) | included: 4,405 actions (40/s) | orders ~15977/s | blk: #13971 | 39ms/blk
+[111s] submitted: 4,440 actions (40/s) | included: 4,405 actions (40/s) | orders ~15904/s | blk: #13971 | 39ms/blk
+[112s] submitted: 4,480 actions (40/s) | included: 4,465 actions (40/s) | orders ~16006/s | blk: #13995 | 39ms/blk
+[112s] submitted: 4,500 actions (40/s) | included: 4,465 actions (40/s) | orders ~15933/s | blk: #14016 | 39ms/blk
+[113s] submitted: 4,520 actions (40/s) | included: 4,505 actions (40/s) | orders ~15973/s | blk: #14018 | 39ms/blk
+[113s] submitted: 4,540 actions (40/s) | included: 4,525 actions (40/s) | orders ~15963/s | blk: #14058 | 38ms/blk
+[114s] submitted: 4,560 actions (40/s) | included: 4,525 actions (40/s) | orders ~15892/s | blk: #14058 | 38ms/blk
+[115s] submitted: 4,600 actions (40/s) | included: 4,585 actions (40/s) | orders ~15983/s | blk: #14090 | 38ms/blk
+[115s] submitted: 4,620 actions (40/s) | included: 4,605 actions (40/s) | orders ~15972/s | blk: #14109 | 38ms/blk
+[116s] submitted: 4,640 actions (40/s) | included: 4,625 actions (40/s) | orders ~15961/s | blk: #14130 | 38ms/blk
+[116s] submitted: 4,660 actions (40/s) | included: 4,625 actions (40/s) | orders ~15892/s | blk: #14130 | 38ms/blk
+[117s] submitted: 4,700 actions (40/s) | included: 4,685 actions (40/s) | orders ~15981/s | blk: #14162 | 38ms/blk
+[118s] submitted: 4,720 actions (40/s) | included: 4,705 actions (40/s) | orders ~15972/s | blk: #14180 | 38ms/blk
+[118s] submitted: 4,740 actions (40/s) | included: 4,705 actions (40/s) | orders ~15904/s | blk: #14182 | 39ms/blk
+[119s] submitted: 4,780 actions (40/s) | included: 4,765 actions (40/s) | orders ~16000/s | blk: #14224 | 38ms/blk
+[120s] submitted: 4,800 actions (40/s) | included: 4,785 actions (40/s) | orders ~15985/s | blk: #14243 | 38ms/blk
+[120s] submitted: 4,820 actions (40/s) | included: 4,805 actions (40/s) | orders ~15976/s | blk: #14253 | 38ms/blk
+[121s] submitted: 4,840 actions (40/s) | included: 4,805 actions (40/s) | orders ~15909/s | blk: #14254 | 38ms/blk
+[122s] submitted: 4,880 actions (40/s) | included: 4,865 actions (40/s) | orders ~15999/s | blk: #14297 | 38ms/blk
+[122s] submitted: 4,900 actions (40/s) | included: 4,865 actions (40/s) | orders ~15933/s | blk: #14297 | 38ms/blk
+[123s] submitted: 4,920 actions (40/s) | included: 4,910 actions (40/s) | orders ~15985/s | blk: #14326 | 38ms/blk
+[123s] submitted: 4,940 actions (40/s) | included: 4,925 actions (40/s) | orders ~15962/s | blk: #14340 | 38ms/blk
+[124s] submitted: 4,980 actions (40/s) | included: 4,965 actions (40/s) | orders ~15993/s | blk: #14348 | 38ms/blk
+[125s] submitted: 5,000 actions (40/s) | included: 4,985 actions (40/s) | orders ~15982/s | blk: #14387 | 38ms/blk
+[125s] submitted: 5,020 actions (40/s) | included: 5,025 actions (40/s) | orders ~16027/s | blk: #14411 | 38ms/blk
+[126s] submitted: 5,046 actions (40/s) | included: 5,045 actions (40/s) | orders ~16014/s | blk: #14430 | 38ms/blk
+[127s] submitted: 5,068 actions (40/s) | included: 5,045 actions (40/s) | orders ~15948/s | blk: #14436 | 38ms/blk
+[127s] submitted: 5,100 actions (40/s) | included: 5,085 actions (40/s) | orders ~15991/s | blk: #14459 | 38ms/blk
+[128s] submitted: 5,120 actions (40/s) | included: 5,085 actions (40/s) | orders ~15928/s | blk: #14459 | 38ms/blk
+[128s] submitted: 5,140 actions (40/s) | included: 5,130 actions (40/s) | orders ~15970/s | blk: #14477 | 38ms/blk
+[129s] submitted: 5,180 actions (40/s) | included: 5,165 actions (40/s) | orders ~15997/s | blk: #14516 | 38ms/blk
+[130s] submitted: 5,200 actions (40/s) | included: 5,185 actions (40/s) | orders ~15988/s | blk: #14539 | 38ms/blk
+[130s] submitted: 5,220 actions (40/s) | included: 5,219 actions (40/s) | orders ~16011/s | blk: #14543 | 38ms/blk
+[131s] submitted: 5,240 actions (40/s) | included: 5,225 actions (40/s) | orders ~15964/s | blk: #14563 | 38ms/blk
+[132s] submitted: 5,280 actions (40/s) | included: 5,265 actions (40/s) | orders ~16005/s | blk: #14587 | 38ms/blk
+[132s] submitted: 5,300 actions (40/s) | included: 5,285 actions (40/s) | orders ~15994/s | blk: #14608 | 38ms/blk
+[133s] submitted: 5,320 actions (40/s) | included: 5,285 actions (40/s) | orders ~15934/s | blk: #14608 | 38ms/blk
+[133s] submitted: 5,340 actions (40/s) | included: 5,343 actions (40/s) | orders ~16013/s | blk: #14616 | 38ms/blk
+[134s] submitted: 5,360 actions (40/s) | included: 5,345 actions (40/s) | orders ~15956/s | blk: #14652 | 38ms/blk
+[135s] submitted: 5,400 actions (40/s) | included: 5,385 actions (40/s) | orders ~15996/s | blk: #14677 | 38ms/blk
+[135s] submitted: 5,420 actions (40/s) | included: 5,425 actions (40/s) | orders ~16039/s | blk: #14700 | 38ms/blk
+[136s] submitted: 5,440 actions (40/s) | included: 5,445 actions (40/s) | orders ~16027/s | blk: #14708 | 38ms/blk
+[136s] submitted: 5,460 actions (40/s) | included: 5,445 actions (40/s) | orders ~15968/s | blk: #14724 | 38ms/blk
+[137s] submitted: 5,500 actions (40/s) | included: 5,485 actions (40/s) | orders ~16006/s | blk: #14750 | 38ms/blk
+[138s] submitted: 5,520 actions (40/s) | included: 5,485 actions (40/s) | orders ~15947/s | blk: #14750 | 38ms/blk
+[138s] submitted: 5,540 actions (40/s) | included: 5,528 actions (40/s) | orders ~15984/s | blk: #14772 | 38ms/blk
+[139s] submitted: 5,560 actions (40/s) | included: 5,547 actions (40/s) | orders ~15973/s | blk: #14794 | 38ms/blk
+[139s] submitted: 5,580 actions (40/s) | included: 5,547 actions (40/s) | orders ~15915/s | blk: #14796 | 38ms/blk
+[140s] submitted: 5,620 actions (40/s) | included: 5,607 actions (40/s) | orders ~15999/s | blk: #14841 | 38ms/blk
+[141s] submitted: 5,640 actions (40/s) | included: 5,647 actions (40/s) | orders ~16037/s | blk: #14855 | 38ms/blk
+[141s] submitted: 5,660 actions (40/s) | included: 5,647 actions (40/s) | orders ~15979/s | blk: #14865 | 38ms/blk
+[142s] submitted: 5,680 actions (40/s) | included: 5,647 actions (40/s) | orders ~15923/s | blk: #14867 | 38ms/blk
+[143s] submitted: 5,720 actions (40/s) | included: 5,707 actions (40/s) | orders ~16004/s | blk: #14909 | 37ms/blk
+[143s] submitted: 5,740 actions (40/s) | included: 5,707 actions (40/s) | orders ~15948/s | blk: #14909 | 37ms/blk
+[144s] submitted: 5,760 actions (40/s) | included: 5,752 actions (40/s) | orders ~15988/s | blk: #14931 | 38ms/blk
+[144s] submitted: 5,780 actions (40/s) | included: 5,767 actions (40/s) | orders ~15969/s | blk: #14955 | 38ms/blk
+[145s] submitted: 5,800 actions (40/s) | included: 5,767 actions (40/s) | orders ~15913/s | blk: #14955 | 38ms/blk
+[145s] submitted: 5,820 actions (40/s) | included: 5,767 actions (40/s) | orders ~15858/s | blk: #14955 | 38ms/blk
+[146s] submitted: 5,840 actions (40/s) | included: 5,767 actions (40/s) | orders ~15804/s | blk: #14955 | 38ms/blk
+[146s] submitted: 5,860 actions (40/s) | included: 5,767 actions (39/s) | orders ~15750/s | blk: #14955 | 38ms/blk
+[147s] submitted: 5,880 actions (40/s) | included: 5,767 actions (39/s) | orders ~15696/s | blk: #14955 | 38ms/blk
+[147s] submitted: 5,900 actions (40/s) | included: 5,767 actions (39/s) | orders ~15643/s | blk: #14955 | 38ms/blk
+[148s] submitted: 5,920 actions (40/s) | included: 5,767 actions (39/s) | orders ~15589/s | blk: #14955 | 38ms/blk
+[148s] submitted: 5,940 actions (40/s) | included: 5,767 actions (39/s) | orders ~15537/s | blk: #14955 | 38ms/blk
+[149s] submitted: 5,960 actions (40/s) | included: 5,767 actions (39/s) | orders ~15484/s | blk: #14955 | 38ms/blk
+[149s] submitted: 5,980 actions (40/s) | included: 5,767 actions (39/s) | orders ~15432/s | blk: #14955 | 38ms/blk
+[150s] submitted: 6,000 actions (40/s) | included: 5,767 actions (38/s) | orders ~15381/s | blk: #14955 | 38ms/blk
+[150s] submitted: 6,020 actions (40/s) | included: 5,767 actions (38/s) | orders ~15329/s | blk: #14955 | 38ms/blk
+[151s] submitted: 6,040 actions (40/s) | included: 5,767 actions (38/s) | orders ~15278/s | blk: #14955 | 38ms/blk
+[151s] submitted: 6,060 actions (40/s) | included: 5,767 actions (38/s) | orders ~15228/s | blk: #14955 | 38ms/blk
+[152s] submitted: 6,080 actions (40/s) | included: 5,767 actions (38/s) | orders ~15177/s | blk: #14955 | 38ms/blk
+[152s] submitted: 6,100 actions (40/s) | included: 5,767 actions (38/s) | orders ~15127/s | blk: #14955 | 38ms/blk
+[153s] submitted: 6,120 actions (40/s) | included: 5,767 actions (38/s) | orders ~15078/s | blk: #14955 | 38ms/blk
+[153s] submitted: 6,140 actions (40/s) | included: 5,767 actions (38/s) | orders ~15029/s | blk: #14955 | 38ms/blk
+[154s] submitted: 6,160 actions (40/s) | included: 5,767 actions (37/s) | orders ~14979/s | blk: #14955 | 38ms/blk
+[155s] submitted: 6,180 actions (40/s) | included: 5,767 actions (37/s) | orders ~14931/s | blk: #14955 | 38ms/blk
+[155s] submitted: 6,200 actions (40/s) | included: 5,767 actions (37/s) | orders ~14882/s | blk: #14955 | 38ms/blk
+[156s] submitted: 6,220 actions (40/s) | included: 5,767 actions (37/s) | orders ~14834/s | blk: #14957 | 40ms/blk
+[158s] submitted: 6,320 actions (40/s) | included: 6,077 actions (39/s) | orders ~15423/s | blk: #14967 | 40ms/blk
+[160s] submitted: 6,400 actions (40/s) | included: 6,287 actions (39/s) | orders ~15750/s | blk: #15019 | 40ms/blk
+[161s] submitted: 6,440 actions (40/s) | included: 6,387 actions (40/s) | orders ~15906/s | blk: #15074 | 40ms/blk
+[161s] submitted: 6,460 actions (40/s) | included: 6,447 actions (40/s) | orders ~15980/s | blk: #15119 | 40ms/blk
+[162s] submitted: 6,480 actions (40/s) | included: 6,487 actions (40/s) | orders ~16016/s | blk: #15141 | 40ms/blk
+[163s] submitted: 6,520 actions (40/s) | included: 6,507 actions (40/s) | orders ~16004/s | blk: #15153 | 40ms/blk
+[163s] submitted: 6,540 actions (40/s) | included: 6,527 actions (40/s) | orders ~15998/s | blk: #15169 | 40ms/blk
+[164s] submitted: 6,560 actions (40/s) | included: 6,527 actions (40/s) | orders ~15949/s | blk: #15169 | 40ms/blk
+[164s] submitted: 6,580 actions (40/s) | included: 6,587 actions (40/s) | orders ~16019/s | blk: #15195 | 40ms/blk
+[165s] submitted: 6,620 actions (40/s) | included: 6,607 actions (40/s) | orders ~16008/s | blk: #15225 | 40ms/blk
+[166s] submitted: 6,640 actions (40/s) | included: 6,627 actions (40/s) | orders ~16001/s | blk: #15239 | 40ms/blk
+[166s] submitted: 6,660 actions (40/s) | included: 6,627 actions (40/s) | orders ~15952/s | blk: #15239 | 40ms/blk
+[167s] submitted: 6,680 actions (40/s) | included: 6,681 actions (40/s) | orders ~16007/s | blk: #15267 | 40ms/blk
+[167s] submitted: 6,700 actions (40/s) | included: 6,687 actions (40/s) | orders ~15971/s | blk: #15288 | 40ms/blk
+[168s] submitted: 6,720 actions (40/s) | included: 6,687 actions (40/s) | orders ~15923/s | blk: #15290 | 40ms/blk
+[169s] submitted: 6,760 actions (40/s) | included: 6,747 actions (40/s) | orders ~15992/s | blk: #15316 | 40ms/blk
+[169s] submitted: 6,780 actions (40/s) | included: 6,768 actions (40/s) | orders ~15986/s | blk: #15342 | 40ms/blk
+[170s] submitted: 6,800 actions (40/s) | included: 6,788 actions (40/s) | orders ~15978/s | blk: #15363 | 40ms/blk
+[171s] submitted: 6,840 actions (40/s) | included: 6,828 actions (40/s) | orders ~16010/s | blk: #15386 | 40ms/blk
+[171s] submitted: 6,860 actions (40/s) | included: 6,848 actions (40/s) | orders ~16000/s | blk: #15401 | 40ms/blk
+[172s] submitted: 6,880 actions (40/s) | included: 6,868 actions (40/s) | orders ~15994/s | blk: #15416 | 40ms/blk
+[172s] submitted: 6,900 actions (40/s) | included: 6,868 actions (40/s) | orders ~15948/s | blk: #15416 | 40ms/blk
+[173s] submitted: 6,940 actions (40/s) | included: 6,928 actions (40/s) | orders ~16011/s | blk: #15440 | 40ms/blk
+[174s] submitted: 6,960 actions (40/s) | included: 6,928 actions (40/s) | orders ~15961/s | blk: #15466 | 40ms/blk
+[174s] submitted: 6,980 actions (40/s) | included: 6,968 actions (40/s) | orders ~15994/s | blk: #15488 | 40ms/blk
+[175s] submitted: 7,000 actions (40/s) | included: 6,988 actions (40/s) | orders ~15988/s | blk: #15507 | 40ms/blk
+[175s] submitted: 7,020 actions (40/s) | included: 6,988 actions (40/s) | orders ~15943/s | blk: #15507 | 40ms/blk
+[176s] submitted: 7,060 actions (40/s) | included: 7,048 actions (40/s) | orders ~16008/s | blk: #15524 | 40ms/blk
+[177s] submitted: 7,080 actions (40/s) | included: 7,048 actions (40/s) | orders ~15960/s | blk: #15551 | 40ms/blk
+[177s] submitted: 7,100 actions (40/s) | included: 7,088 actions (40/s) | orders ~15992/s | blk: #15574 | 40ms/blk
+[178s] submitted: 7,120 actions (40/s) | included: 7,088 actions (40/s) | orders ~15946/s | blk: #15574 | 40ms/blk
+[179s] submitted: 7,160 actions (40/s) | included: 7,148 actions (40/s) | orders ~16007/s | blk: #15600 | 40ms/blk
+[179s] submitted: 7,180 actions (40/s) | included: 7,168 actions (40/s) | orders ~15998/s | blk: #15624 | 40ms/blk
+[180s] submitted: 7,200 actions (40/s) | included: 7,188 actions (40/s) | orders ~15992/s | blk: #15644 | 40ms/blk
+[180s] submitted: 7,220 actions (40/s) | included: 7,188 actions (40/s) | orders ~15947/s | blk: #15644 | 40ms/blk
+[181s] submitted: 7,260 actions (40/s) | included: 7,248 actions (40/s) | orders ~16002/s | blk: #15681 | 40ms/blk
+[182s] submitted: 7,280 actions (40/s) | included: 7,275 actions (40/s) | orders ~16004/s | blk: #15700 | 40ms/blk
+[182s] submitted: 7,300 actions (40/s) | included: 7,288 actions (40/s) | orders ~15983/s | blk: #15717 | 40ms/blk
+[183s] submitted: 7,330 actions (40/s) | included: 7,328 actions (40/s) | orders ~16014/s | blk: #15746 | 39ms/blk
+[184s] submitted: 7,351 actions (40/s) | included: 7,328 actions (40/s) | orders ~15971/s | blk: #15746 | 39ms/blk
+[184s] submitted: 7,380 actions (40/s) | included: 7,368 actions (40/s) | orders ~15993/s | blk: #15767 | 40ms/blk
+[185s] submitted: 7,400 actions (40/s) | included: 7,388 actions (40/s) | orders ~15987/s | blk: #15793 | 39ms/blk
+[185s] submitted: 7,420 actions (40/s) | included: 7,388 actions (40/s) | orders ~15944/s | blk: #15793 | 39ms/blk
+[186s] submitted: 7,460 actions (40/s) | included: 7,448 actions (40/s) | orders ~16003/s | blk: #15820 | 39ms/blk
+[187s] submitted: 7,480 actions (40/s) | included: 7,477 actions (40/s) | orders ~16008/s | blk: #15843 | 39ms/blk
+[187s] submitted: 7,500 actions (40/s) | included: 7,488 actions (40/s) | orders ~15986/s | blk: #15864 | 39ms/blk
+[188s] submitted: 7,520 actions (40/s) | included: 7,488 actions (40/s) | orders ~15943/s | blk: #15864 | 39ms/blk
+[189s] submitted: 7,560 actions (40/s) | included: 7,548 actions (40/s) | orders ~15994/s | blk: #15907 | 39ms/blk
+[189s] submitted: 7,580 actions (40/s) | included: 7,588 actions (40/s) | orders ~16024/s | blk: #15931 | 39ms/blk
+[190s] submitted: 7,600 actions (40/s) | included: 7,588 actions (40/s) | orders ~15982/s | blk: #15931 | 39ms/blk
+[191s] submitted: 7,640 actions (40/s) | included: 7,628 actions (40/s) | orders ~16004/s | blk: #15950 | 39ms/blk
+[191s] submitted: 7,660 actions (40/s) | included: 7,648 actions (40/s) | orders ~15996/s | blk: #15977 | 39ms/blk
+[192s] submitted: 7,680 actions (40/s) | included: 7,668 actions (40/s) | orders ~15990/s | blk: #15998 | 39ms/blk
+[192s] submitted: 7,700 actions (40/s) | included: 7,708 actions (40/s) | orders ~16020/s | blk: #16023 | 39ms/blk
+[193s] submitted: 7,720 actions (40/s) | included: 7,708 actions (40/s) | orders ~15978/s | blk: #16023 | 39ms/blk
+[194s] submitted: 7,760 actions (40/s) | included: 7,748 actions (40/s) | orders ~16001/s | blk: #16028 | 39ms/blk
+[194s] submitted: 7,780 actions (40/s) | included: 7,768 actions (40/s) | orders ~15994/s | blk: #16070 | 39ms/blk
+[195s] submitted: 7,800 actions (40/s) | included: 7,768 actions (40/s) | orders ~15953/s | blk: #16070 | 39ms/blk
+[195s] submitted: 7,820 actions (40/s) | included: 7,768 actions (40/s) | orders ~15912/s | blk: #16070 | 39ms/blk
+[196s] submitted: 7,840 actions (40/s) | included: 7,768 actions (40/s) | orders ~15871/s | blk: #16070 | 39ms/blk
+[196s] submitted: 7,860 actions (40/s) | included: 7,768 actions (40/s) | orders ~15830/s | blk: #16070 | 39ms/blk
+[197s] submitted: 7,880 actions (40/s) | included: 7,768 actions (39/s) | orders ~15790/s | blk: #16070 | 39ms/blk
+[197s] submitted: 7,900 actions (40/s) | included: 7,768 actions (39/s) | orders ~15750/s | blk: #16070 | 39ms/blk
+[198s] submitted: 7,920 actions (40/s) | included: 7,768 actions (39/s) | orders ~15710/s | blk: #16070 | 39ms/blk
+[198s] submitted: 7,940 actions (40/s) | included: 7,768 actions (39/s) | orders ~15670/s | blk: #16070 | 39ms/blk
+[199s] submitted: 7,960 actions (40/s) | included: 7,768 actions (39/s) | orders ~15630/s | blk: #16070 | 39ms/blk
+[199s] submitted: 7,980 actions (40/s) | included: 7,768 actions (39/s) | orders ~15591/s | blk: #16070 | 39ms/blk
+[200s] submitted: 8,000 actions (40/s) | included: 7,768 actions (39/s) | orders ~15552/s | blk: #16070 | 39ms/blk
+[sender 0] signer-starved 14.1ms total (signing slower than submits)
+[sender 3] signer-starved 22.5ms total (signing slower than submits)
+[sender 1] signer-starved 25.1ms total (signing slower than submits)
+[sender 11] signer-starved 23.6ms total (signing slower than submits)
+[sender 7] signer-starved 23.3ms total (signing slower than submits)
+[sender 9] signer-starved 12.8ms total (signing slower than submits)
+[sender 14] signer-starved 23.3ms total (signing slower than submits)
+[sender 8] signer-starved 29.6ms total (signing slower than submits)
+[sender 13] signer-starved 30.3ms total (signing slower than submits)
+[sender 18] signer-starved 46.4ms total (signing slower than submits)
+[sender 2] signer-starved 46.0ms total (signing slower than submits)
+[sender 4] signer-starved 43.9ms total (signing slower than submits)
+[sender 15] signer-starved 45.5ms total (signing slower than submits)
+[sender 10] signer-starved 45.1ms total (signing slower than submits)
+[sender 5] signer-starved 55.7ms total (signing slower than submits)
+[sender 12] signer-starved 38.9ms total (signing slower than submits)
+[sender 16] signer-starved 51.6ms total (signing slower than submits)
+[sender 6] signer-starved 55.1ms total (signing slower than submits)
+[sender 17] signer-starved 51.9ms total (signing slower than submits)
+[sender 19] signer-starved 51.8ms total (signing slower than submits)
+[200s] submitted: 8,020 actions (40/s) | included: 7,768 actions (39/s) | orders ~15513/s | blk: #16070 | 39ms/blk
+[201s] submitted: 8,020 actions (40/s) | included: 7,768 actions (39/s) | orders ~15474/s | blk: #16070 | 39ms/blk
+[201s] submitted: 8,020 actions (40/s) | included: 7,768 actions (39/s) | orders ~15436/s | blk: #16070 | 39ms/blk
+[202s] submitted: 8,020 actions (40/s) | included: 7,768 actions (38/s) | orders ~15397/s | blk: #16070 | 39ms/blk
+[drain] +260 actions in blocks #16071..#16233 (executor catching up)
+
+--- Results ---
+Submitted:  8,020 native actions (40/s)
+Included:   8,020 unique native actions (40/s) [8,028 slots, dup x1.00]
+Orders:     3,208,000 orders (15876/s)  [actions x400 batch]
+Drop rate:  0.0%
+Block time: 39ms avg
+Blocks:     4971 with bodies in #11113..#16083, 1 avg native/block
+
+Peak:       40/s included (block #12667, 100 actions)
+Sustained:  15876 orders/s (40 actions/s) over 200s
