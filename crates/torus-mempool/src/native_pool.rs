@@ -358,6 +358,60 @@ impl NativePool {
         selected
     }
 
+    /// Cancels-ONLY selection (Package D rank 1, deepest exec-backlog pacing
+    /// tier): the same walk, budgets, and per-sender cap as
+    /// [`Self::select_for_block_with_senders_excluding`], but the scan stops at
+    /// the first non-cancel entry. Cancels sort FIRST in [`SortKey`] (priority
+    /// byte 0), so this touches exactly the pooled cancel prefix and never
+    /// walks the (possibly huge) non-cancel tail. Non-destructive like every
+    /// selection: paced-out non-cancels stay pooled and remain fully
+    /// selectable by the normal path — pacing defers, never sheds.
+    pub fn select_cancels_for_block_with_senders_excluding(
+        &self,
+        limit: usize,
+        exclude: &HashSet<B256>,
+        bytes_cap: usize,
+        orders_cap: usize,
+    ) -> Vec<(Address, SignedNativeAction)> {
+        let mut block_counts: HashMap<Address, usize> = HashMap::new();
+        let mut selected = Vec::new();
+        let mut bytes_used: usize = 0;
+        let mut orders_used: usize = 0;
+
+        for entry in self.entries.values() {
+            if !entry.is_cancel {
+                // Cancels sort first: the first non-cancel ends the cancel
+                // prefix — nothing selectable remains beyond it in this mode.
+                break;
+            }
+            if selected.len() >= limit {
+                break;
+            }
+            // In-flight exclusion before the budget gates, exactly like the
+            // normal path: an excluded entry must neither charge nor trip them.
+            if exclude.contains(&entry.action_hash) {
+                continue;
+            }
+            if bytes_used.saturating_add(entry.encoded_len) > bytes_cap {
+                // Deterministic prefix, same rule as the normal path.
+                break;
+            }
+            let entry_orders = crate::rate_limit::order_count(&entry.action.action);
+            if orders_used.saturating_add(entry_orders) > orders_cap {
+                break;
+            }
+            let count = block_counts.get(&entry.sender).copied().unwrap_or(0);
+            if count < self.max_per_block {
+                *block_counts.entry(entry.sender).or_insert(0) += 1;
+                bytes_used = bytes_used.saturating_add(entry.encoded_len);
+                orders_used = orders_used.saturating_add(entry_orders);
+                selected.push((entry.sender, entry.action.clone()));
+            }
+        }
+
+        selected
+    }
+
     /// Evict entries whose nonce has aged out of the protocol validity window.
     ///
     /// An action with `nonce + NONCE_WINDOW_MS < now_ms` can never pass

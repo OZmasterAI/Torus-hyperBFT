@@ -150,6 +150,115 @@ mod shard_custody_toggle_tests {
     }
 }
 
+// ============================================================================
+// Package D rank 1 — exec-backlog watermark pacing
+// ============================================================================
+
+/// Parse `TORUS_EXEC_THROTTLE_WATERMARKS`: exactly three comma-separated,
+/// strictly-ascending exec-backlog depths `w1,w2,w3` (e.g. `"16,32,48"`),
+/// whitespace around each tolerated. Anything else — unset, malformed, wrong
+/// arity, non-ascending — yields `None` = pacing DISABLED, static caps,
+/// bit-identical selection to today. Strictness is deliberate: a
+/// misconfigured throttle must fail OPEN (no pacing), never misfire.
+fn parse_exec_throttle_watermarks(raw: Option<String>) -> Option<[u64; 3]> {
+    let raw = raw?;
+    let mut parts = [0u64; 3];
+    let mut n = 0usize;
+    for piece in raw.split(',') {
+        if n >= 3 {
+            return None; // more than three watermarks
+        }
+        parts[n] = piece.trim().parse::<u64>().ok()?;
+        n += 1;
+    }
+    if n != 3 {
+        return None; // fewer than three watermarks
+    }
+    if parts[0] < parts[1] && parts[1] < parts[2] {
+        Some(parts)
+    } else {
+        None // non-ascending must disable pacing, not misfire
+    }
+}
+
+/// Effective pacing watermarks. Read the env FRESH on each call — deliberately
+/// NOT the usual `OnceLock` read-once: this is consulted once per own-leader
+/// `select_block_payload` (a ~µs read at ≤ block rate, pure noise), and fresh
+/// reads keep same-process tests deterministic across env changes. Unset ⇒
+/// `None` ⇒ tier 0 ⇒ the exact static-cap selection call used today.
+fn exec_throttle_watermarks() -> Option<[u64; 3]> {
+    parse_exec_throttle_watermarks(std::env::var("TORUS_EXEC_THROTTLE_WATERMARKS").ok())
+}
+
+/// Map a LOCAL exec-backlog depth (queued+in-flight exec channel blocks plus
+/// strict-order deferred heights) to a pacing tier under `watermarks`:
+/// `0` = full caps (`< w1`), `1` = half (`w1..w2`), `2` = quarter (`w2..w3`),
+/// `3` = cancels-only (`>= w3`). `None` watermarks: always tier 0.
+fn exec_throttle_tier(depth: u64, watermarks: Option<[u64; 3]>) -> u8 {
+    match watermarks {
+        None => 0,
+        Some([w1, w2, w3]) => {
+            if depth >= w3 {
+                3
+            } else if depth >= w2 {
+                2
+            } else if depth >= w1 {
+                1
+            } else {
+                0
+            }
+        }
+    }
+}
+
+/// The native-selection budget a pacing tier allows the proposer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PacedSelectionCaps {
+    /// Normal selection under (possibly scaled) caps.
+    Select {
+        action_cap: usize,
+        bytes_cap: usize,
+        orders_cap: usize,
+    },
+    /// Deepest tier: propose ONLY pooled cancels — zero new orders enter the
+    /// exec pipeline while it digests the backlog (risk-reducing actions keep
+    /// flowing; selection stays non-destructive so nothing is shed).
+    CancelsOnly,
+}
+
+/// Scale the proposer's three native selection caps by pacing `tier`
+/// (rank 1): tier 0 hands the caps through untouched; tiers 1/2 halve/quarter
+/// them; tier 3+ is cancels-only. Floors on the scaled tiers keep a paced
+/// proposer from wedging its own selection permanently empty: at least 1
+/// action and one legal batch of orders (the same doctrine as the
+/// `native_orders_per_block_cap` env floor). Bytes scale unfloored — the
+/// real cap is MBs, and a sub-action byte budget already means the operator
+/// configured an unusably small block.
+fn paced_selection_caps(
+    tier: u8,
+    action_cap: usize,
+    bytes_cap: usize,
+    orders_cap: usize,
+) -> PacedSelectionCaps {
+    match tier {
+        0 => PacedSelectionCaps::Select {
+            action_cap,
+            bytes_cap,
+            orders_cap,
+        },
+        1 | 2 => {
+            let div = 1usize << tier; // tier 1 => /2, tier 2 => /4
+            PacedSelectionCaps::Select {
+                action_cap: (action_cap / div).max(1),
+                bytes_cap: bytes_cap / div,
+                orders_cap: (orders_cap / div)
+                    .max(torus_mempool::rate_limit::NATIVE_ORDERS_PER_BATCH_CAP),
+            }
+        }
+        _ => PacedSelectionCaps::CancelsOnly,
+    }
+}
+
 /// Shared consensus state for leader discovery by non-consensus components (RPC).
 pub struct LeaderState {
     view: AtomicU64,
@@ -224,6 +333,12 @@ struct ExecutionContext {
     /// market worker panicked and its book is lost). The execution loop exits
     /// on it and the node stops producing, voting, and finalizing.
     exec_failed: Arc<AtomicBool>,
+    /// Package D rank 1: local mirror of the `exec_queue_depth` gauge —
+    /// incremented on the consensus side before a block enters the exec
+    /// channel, decremented here AFTER it executes — so proposer pacing can
+    /// read the backlog depth even with `metrics = None`. Pairing with the
+    /// consensus-side `fetch_add` is the invariant that keeps it exact.
+    exec_queue_len: Arc<AtomicU64>,
 }
 
 // ---- Standalone helpers (used by both execution thread and crash recovery) ----
@@ -1225,6 +1340,8 @@ fn execution_loop(rx: std::sync::mpsc::Receiver<CommittedBlockMsg>, ctx: Executi
         if let Some(ref m) = ctx.metrics {
             m.exec_queue_depth.dec();
         }
+        // Rank 1: keep the metrics-free mirror in lockstep with the gauge.
+        ctx.exec_queue_len.fetch_sub(1, Ordering::Relaxed);
         if ctx.exec_failed.load(Ordering::SeqCst) {
             // Dropping `rx` closes the channel: the consensus thread's next
             // send fails and latches the same fail-stop on the TorusApp side.
@@ -1350,6 +1467,12 @@ pub struct TorusApp {
     exec_hole_last_log: Option<std::time::Instant>,
     /// Regime-B. Retry attempts against the current hole (for the operator log).
     exec_hole_retries: u64,
+    /// Package D rank 1: queued + in-flight exec channel depth — a local
+    /// mirror of the `exec_queue_depth` gauge (inc before the exec send, dec
+    /// on the exec thread after a block executes) readable with
+    /// `metrics = None`. Proposer pacing adds `deferred_exec.len()` to this
+    /// for the full backlog picture.
+    exec_queue_len: Arc<AtomicU64>,
 }
 
 /// Actions the proposer pushes to validators via unicast before broadcasting CompactBlock.
@@ -1907,6 +2030,10 @@ impl TorusApp {
         // and the consensus-side TorusApp (see `exec_failed` field docs).
         let exec_failed = Arc::new(AtomicBool::new(false));
 
+        // Rank 1: metrics-free exec-backlog mirror, shared with the exec thread
+        // (inc at dispatch, dec after execution — see field docs).
+        let exec_queue_len = Arc::new(AtomicU64::new(0));
+
         // Execution pipeline context — owns its own copies for thread safety.
         let mut exec_validator = BlockValidator::new(
             config.chain_id,
@@ -1936,6 +2063,7 @@ impl TorusApp {
                 256,
             )),
             exec_failed: exec_failed.clone(),
+            exec_queue_len: exec_queue_len.clone(),
         };
 
         // Phase A: ensure the persistent incremental trie exists before any commit (including
@@ -2011,6 +2139,7 @@ impl TorusApp {
             exec_hole_since: None,
             exec_hole_last_log: None,
             exec_hole_retries: 0,
+            exec_queue_len,
         };
 
         // FIX 1b: a boot replay hole PARKS instead of latching a pre-network
@@ -3433,12 +3562,73 @@ impl TorusApp {
         // reconstructed (MissingData) — absent from `pending_proposals` but
         // still in flight on the wire (s355 duplicate-inclusion tail).
         self.in_flight_hashes.extend_into(&mut in_flight);
-        let native = mempool.select_native_for_block_with_senders_excluding(
+
+        // Package D rank 1 — exec-backlog watermark pacing. The LOCAL backlog
+        // is queued+in-flight exec channel blocks (`exec_queue_len`, the
+        // metrics-free gauge mirror) PLUS the strict-order deferred buffer
+        // (`deferred_exec` — holes and rank-2 backpressure parks): channel
+        // depth alone would under-report how far execution actually lags.
+        // Scaling the caps DOWN as the backlog deepens converts the worst
+        // failure mode — exec hits the sync_channel(64) bound and the single
+        // HotStuff thread parks on the blocking send, stalling the whole
+        // fleet into a view-timeout cascade — into temporarily thinner blocks
+        // with QCs still forming. Selection is non-destructive, so paced-out
+        // actions stay pooled: pacing, not shedding. Proposer-local policy
+        // (validate_block rejects on neither action nor order count,
+        // rate_limit.rs:126-133) — heterogeneous settings cannot fork.
+        // `TORUS_EXEC_THROTTLE_WATERMARKS` unset ⇒ tier 0 ⇒ the exact
+        // static-cap call used before rank 1: bit-identical to today.
+        let exec_backlog = self
+            .exec_queue_len
+            .load(Ordering::Relaxed)
+            .saturating_add(self.deferred_exec.len() as u64);
+        let tier = exec_throttle_tier(exec_backlog, exec_throttle_watermarks());
+        if let Some(ref m) = self.metrics {
+            m.exec_throttle_tier.set(tier as i64);
+        }
+        let native = match paced_selection_caps(
+            tier,
             torus_mempool::rate_limit::native_total_block_cap(),
-            &in_flight,
             torus_mempool::rate_limit::native_block_bytes_cap(),
             torus_mempool::rate_limit::native_orders_per_block_cap(),
-        );
+        ) {
+            PacedSelectionCaps::Select {
+                action_cap,
+                bytes_cap,
+                orders_cap,
+            } => {
+                if tier > 0 {
+                    tracing::info!(
+                        exec_backlog,
+                        tier,
+                        action_cap,
+                        bytes_cap,
+                        orders_cap,
+                        "exec-backlog pacing: scaled native selection caps for this proposal"
+                    );
+                }
+                mempool.select_native_for_block_with_senders_excluding(
+                    action_cap,
+                    &in_flight,
+                    bytes_cap,
+                    orders_cap,
+                )
+            }
+            PacedSelectionCaps::CancelsOnly => {
+                tracing::warn!(
+                    exec_backlog,
+                    tier,
+                    "exec-backlog pacing: deepest tier — proposing CANCELS ONLY \
+                     (new orders stay pooled until execution catches up)"
+                );
+                mempool.select_native_cancels_for_block_with_senders_excluding(
+                    torus_mempool::rate_limit::native_total_block_cap(),
+                    &in_flight,
+                    torus_mempool::rate_limit::native_block_bytes_cap(),
+                    torus_mempool::rate_limit::native_orders_per_block_cap(),
+                )
+            }
+        };
         let evm = mempool.drain_evm(gas_limit, parent_state_root);
         if !evm.is_empty() || !native.is_empty() {
             tracing::info!(
@@ -3670,10 +3860,12 @@ impl TorusApp {
             if let Some(ref m) = self.metrics {
                 m.exec_queue_depth.inc();
             }
+            self.exec_queue_len.fetch_add(1, Ordering::Relaxed);
             if tx.send(msg).is_err() {
                 if let Some(ref m) = self.metrics {
                     m.exec_queue_depth.dec();
                 }
+                self.exec_queue_len.fetch_sub(1, Ordering::Relaxed);
                 // T1.5 FAIL-STOP: the execution thread is gone (panic or
                 // fatal) — this block is committed by consensus but will
                 // NEVER execute here. Latch the failure: the node stops
@@ -5772,6 +5964,7 @@ mod crash_recovery_tests {
             // keeping these tests' reads deterministic right after execution.
             trade_writer: None,
             exec_failed: Arc::new(AtomicBool::new(false)),
+            exec_queue_len: Arc::new(AtomicU64::new(0)),
         }
     }
 

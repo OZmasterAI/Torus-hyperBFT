@@ -837,6 +837,35 @@ impl Mempool {
             .select_for_block_with_senders_excluding(limit, exclude, bytes_cap, orders_cap)
     }
 
+    /// Cancels-only variant of
+    /// [`Self::select_native_for_block_with_senders_excluding`] (Package D
+    /// rank 1, deepest exec-backlog pacing tier): the same
+    /// durable-before-selectable mirror flush, the same lazy expiry eviction,
+    /// and the same budgets — but the pool walk takes ONLY cancel actions
+    /// (which sort first). Non-destructive: paced-out non-cancels stay pooled
+    /// and fully selectable once the proposer's exec backlog clears.
+    pub fn select_native_cancels_for_block_with_senders_excluding(
+        &self,
+        limit: usize,
+        exclude: &std::collections::HashSet<B256>,
+        bytes_cap: usize,
+        orders_cap: usize,
+    ) -> Vec<(alloy_primitives::Address, SignedNativeAction)> {
+        // Durable-before-selectable (T2.2): land buffered ingress mirrors first.
+        self.flush_da_mirrors();
+        {
+            let mut pool = self.native.write().unwrap();
+            let evicted = pool.evict_expired(now_ms());
+            if evicted > 0 {
+                tracing::info!(evicted, "evicted nonce-expired native actions from pool");
+            }
+        }
+        self.native
+            .read()
+            .unwrap()
+            .select_cancels_for_block_with_senders_excluding(limit, exclude, bytes_cap, orders_cap)
+    }
+
     /// Remove native actions that were included in a committed block.
     ///
     /// Before pruning, refresh-stash each locally-verified sender into the exec

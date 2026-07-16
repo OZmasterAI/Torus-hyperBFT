@@ -206,6 +206,10 @@ pub struct Metrics {
     /// Committed blocks handed to the exec channel but not yet fully executed.
     /// Pinned near the channel bound (64) = execution is the bottleneck.
     pub exec_queue_depth: Gauge,
+    /// Package D rank 1: the exec-backlog pacing tier the proposer applied to
+    /// its most recent native selection (0 full caps, 1 half, 2 quarter,
+    /// 3 cancels-only). Stays 0 with `TORUS_EXEC_THROTTLE_WATERMARKS` unset.
+    pub exec_throttle_tier: Gauge,
     /// O3: per-block trade-history batches queued to the background CF writer
     /// but not yet written. Sustained growth = RocksDB stalling behind exec.
     pub trade_writer_queued_batches: Gauge,
@@ -752,6 +756,14 @@ impl Metrics {
             exec_queue_depth.clone(),
         );
 
+        let exec_throttle_tier = Gauge::default();
+        registry.register(
+            "torus_exec_throttle_tier",
+            "Exec-backlog pacing tier applied to the proposer's latest native selection \
+             (0 full, 1 half, 2 quarter, 3 cancels-only)",
+            exec_throttle_tier.clone(),
+        );
+
         let trade_writer_queued_batches = Gauge::default();
         registry.register(
             "torus_trade_writer_queued_batches",
@@ -950,6 +962,7 @@ impl Metrics {
             exec_flush_seconds,
             exec_block_seconds,
             exec_queue_depth,
+            exec_throttle_tier,
             trade_writer_queued_batches,
             view_duration_seconds,
             view_propose_delay_seconds,
@@ -1094,6 +1107,7 @@ mod tests {
             "torus_exec_flush_seconds",
             "torus_exec_block_seconds",
             "torus_exec_queue_depth",
+            "torus_exec_throttle_tier",
         ] {
             assert!(text.contains(name), "{name} not registered:\n{text}");
         }
