@@ -119,6 +119,11 @@ fn exec_hole_failstop_budget() -> std::time::Duration {
 pub struct LeaderState {
     view: AtomicU64,
     validators: RwLock<hotstuff_rs::types::validator_set::ValidatorSet>,
+    /// `(view, leader)` as last observed from the pacemaker's own `StartView`
+    /// event — the REAL view (not the committed_height+1 heuristic, which goes
+    /// stale during timeout churn) and the REAL selection (reputation-aware
+    /// when the fleet runs it, unlike the plain-IWRR fallback below).
+    observed_leader: RwLock<Option<(u64, VerifyingKey)>>,
 }
 
 impl LeaderState {
@@ -126,11 +131,29 @@ impl LeaderState {
         Self {
             view: AtomicU64::new(1),
             validators: RwLock::new(hotstuff_rs::types::validator_set::ValidatorSet::new()),
+            observed_leader: RwLock::new(None),
         }
     }
 
+    /// Monotonic view advance. Callers feed two sources: the commit-path
+    /// committed_height+1 heuristic (a lower bound on the real view) and the
+    /// pacemaker's `StartView` observations; max() means the stale heuristic
+    /// can never drag the hint backwards once a real view has been observed.
     fn set_view(&self, view: u64) {
-        self.view.store(view, Ordering::Relaxed);
+        self.view.fetch_max(view, Ordering::Relaxed);
+    }
+
+    /// Record the pacemaker entering `view` with `leader` as its computed
+    /// proposer (from the `StartView` event, so it reflects the exact
+    /// selection mode the pacemaker runs — reputation-aware when enabled).
+    /// Out-of-order event delivery for an older view is ignored.
+    pub fn observe_start_view(&self, view: u64, leader: VerifyingKey) {
+        self.view.fetch_max(view, Ordering::Relaxed);
+        let mut obs = self.observed_leader.write().unwrap();
+        match *obs {
+            Some((v, _)) if v > view => {}
+            _ => *obs = Some((view, leader)),
+        }
     }
 
     fn sync_validators(&self, vs: &torus_types::ValidatorSet) {
@@ -148,13 +171,25 @@ impl LeaderState {
     }
 
     pub fn current_leader(&self) -> Option<VerifyingKey> {
+        let view = self.view.load(Ordering::Relaxed);
+        // Fresh pacemaker observation for exactly this view: authoritative
+        // (real view, real selection mode). Commits can't stale it — the
+        // heuristic is a lower bound, so fetch_max keeps view == observed view.
+        if let Some((observed_view, leader)) = *self.observed_leader.read().unwrap() {
+            if observed_view == view {
+                return Some(leader);
+            }
+        }
+        // Fallback (boot, or no StartView observed yet): plain IWRR over the
+        // synced validator set — today's behavior.
         let vs = self.validators.read().unwrap();
         if vs.is_empty() {
             return None;
         }
-        let view =
-            hotstuff_rs::types::data_types::ViewNumber::new(self.view.load(Ordering::Relaxed));
-        Some(hotstuff_rs::pacemaker::select_leader(view, &vs))
+        Some(hotstuff_rs::pacemaker::select_leader(
+            hotstuff_rs::types::data_types::ViewNumber::new(view),
+            &vs,
+        ))
     }
 }
 

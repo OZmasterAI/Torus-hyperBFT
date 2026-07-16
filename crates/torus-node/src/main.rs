@@ -760,12 +760,18 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // follower metric, so filter them out by origin.
     let own_hotstuff_vk = verifying_key;
     let timeout_counter = metrics.consensus_timeout_total.clone();
+    let leader_state_for_view = leader_state.clone();
     let _replica = ReplicaSpec::builder()
         .app(app)
         .network(network)
         .kv_store(kv_store)
         .configuration(hs_config)
         .on_start_view(move |ev: &StartViewEvent| {
+            // Leader-hint fix: feed the REAL pacemaker view and its actual
+            // (reputation-aware when enabled) leader into LeaderState, so the
+            // RPC d2l forward hint stays correct during timeout churn instead
+            // of trusting the committed_height+1 heuristic + plain IWRR.
+            leader_state_for_view.observe_start_view(ev.view.int(), ev.leader);
             rec_start.start_view(ev.timestamp, ev.view.int());
         })
         .on_propose(move |ev: &ProposeEvent| {

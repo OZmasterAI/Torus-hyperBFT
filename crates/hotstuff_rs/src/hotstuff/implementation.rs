@@ -37,7 +37,7 @@ use crate::{
             Nudge, PendingBodies, PendingHeaders, PhaseVote, Proposal, ProposalHeader,
             ProposalRequest, ProposalResponse,
         },
-        roles::{is_phase_voter, new_view_recipients_with_reputation},
+        roles::{is_phase_voter, new_view_recipients_with_reputation, view_leader_with_reputation},
         types::{valid_nec, NECollector, Phase, PhaseVoteCollector},
     },
     networking::{
@@ -385,9 +385,21 @@ impl<N: Network> HotStuff<N> {
         // 3. Set `highest_view_entered` in the block tree to the new view, then emit a `StartView` event.
         block_tree.set_highest_view_entered(self.view_info.view)?;
 
+        // Leader-hint fix: surface the leader this replica will treat as the
+        // proposer of the view — computed with the SAME (reputation-aware when
+        // enabled) selection used for `am_proposer` below — so external
+        // observers (RPC leader hint) follow the pacemaker's actual choice.
+        let reputation = block_tree.leader_reputation().ok();
+        let view_leader = view_leader_with_reputation(
+            self.view_info.view,
+            validator_set_state.committed_validator_set(),
+            reputation.as_ref(),
+        );
+
         Event::StartView(StartViewEvent {
             timestamp: SystemTime::now(),
             view: self.view_info.view,
+            leader: view_leader,
         })
         .publish(&self.event_publisher);
 
@@ -395,7 +407,6 @@ impl<N: Network> HotStuff<N> {
         //    If the parent block isn't in the tree yet (body fetch in progress),
         //    defer the proposal and retry after message polling.
         self.proposal_deferred = false;
-        let reputation = block_tree.leader_reputation().ok();
         let am_proposer = is_proposer_with_reputation(
             &self.config.keypair.public(),
             self.view_info.view,

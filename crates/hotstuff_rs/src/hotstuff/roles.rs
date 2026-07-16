@@ -274,6 +274,26 @@ pub(crate) fn new_view_recipients(
     )
 }
 
+/// Leader of `view` in a single validator set, using the same reputation-aware
+/// selection the rest of the protocol runs: `select_leader_with_reputation`
+/// when reputation state exists (which internally respects the
+/// [`set_reputation_leader_selection`](crate::pacemaker::implementation::set_reputation_leader_selection)
+/// kill switch), plain [`select_leader`] when it does not.
+///
+/// Surfaced on [`StartViewEvent`](crate::events::StartViewEvent) so external
+/// observers (the RPC leader hint) see the pacemaker's actual choice.
+pub(crate) fn view_leader_with_reputation(
+    view: ViewNumber,
+    validator_set: &crate::types::validator_set::ValidatorSet,
+    reputation: Option<&crate::hotstuff::types::LeaderReputation>,
+) -> VerifyingKey {
+    use crate::pacemaker::implementation::select_leader_with_reputation;
+    match reputation {
+        Some(rep) => select_leader_with_reputation(view, validator_set, rep),
+        None => select_leader(view, validator_set),
+    }
+}
+
 /// FIX CONS-PF-10: Reputation-weighted new_view recipients.
 pub(crate) fn new_view_recipients_with_reputation(
     new_view: &NewView,

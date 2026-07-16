@@ -263,6 +263,11 @@ pub struct ReceiveTimeoutVoteEvent {
 pub struct StartViewEvent {
     pub timestamp: SystemTime,
     pub view: ViewNumber,
+    /// The leader of `view` in the committed validator set, computed with the
+    /// same (reputation-aware when enabled) selection the protocol itself runs.
+    /// Lets external observers (e.g. an RPC leader hint) follow the pacemaker's
+    /// actual choice instead of re-deriving plain IWRR locally.
+    pub leader: VerifyingKey,
 }
 
 /// The replica's view, with a given [`ViewNumber`], timed out.
