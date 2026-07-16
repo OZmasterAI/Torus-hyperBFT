@@ -645,6 +645,48 @@ impl OrderBook {
         for queue in self.bids.values().chain(self.asks.values()) {
             assert!(!queue.is_empty(), "Empty price level in book");
         }
+        // Invariant 5 (index integrity): every resting order has an
+        // order_index entry with the correct side/price, and is tracked in
+        // its trader's trader_orders vector.
+        for (side, book) in [(Side::Buy, &self.bids), (Side::Sell, &self.asks)] {
+            for (&price, queue) in book {
+                for order in queue {
+                    let loc = self
+                        .order_index
+                        .get(&order.id)
+                        .unwrap_or_else(|| panic!("Order {} missing from order_index", order.id));
+                    assert_eq!(loc.side, side, "Order {} index side mismatch", order.id);
+                    assert_eq!(loc.price, price, "Order {} index price mismatch", order.id);
+                    let ids = self.trader_orders.get(&order.trader).unwrap_or_else(|| {
+                        panic!("Order {} trader missing from trader_orders", order.id)
+                    });
+                    assert!(
+                        ids.contains(&order.id),
+                        "Order {} missing from its trader_orders vec",
+                        order.id
+                    );
+                }
+            }
+        }
+        // Invariant 6 (index integrity, reverse direction): no dangling ids —
+        // every trader_orders id resolves through order_index, no empty
+        // trader vectors linger, and totals agree.
+        let mut trader_total = 0usize;
+        for (trader, ids) in &self.trader_orders {
+            assert!(!ids.is_empty(), "Empty trader_orders vec for {trader}");
+            trader_total += ids.len();
+            for id in ids {
+                assert!(
+                    self.order_index.contains_key(id),
+                    "trader_orders id {id} dangling (not in order_index)"
+                );
+            }
+        }
+        assert_eq!(
+            trader_total,
+            self.order_index.len(),
+            "trader_orders total != order_index size"
+        );
     }
 
     // ========================================================================
