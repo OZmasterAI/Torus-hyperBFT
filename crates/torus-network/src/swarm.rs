@@ -386,6 +386,78 @@ pub struct SharedState {
     /// ([`DA_FETCH_QUEUE_CAP`], oldest evicted — stale fetches are least useful;
     /// re-delivered bodies are idempotent in the durable DA store).
     pub pending_da_fetches: Mutex<PendingSendQueue<Vec<[u8; 32]>>>,
+    /// B2 consensus isolation: fan consensus broadcasts over `/torus/direct`
+    /// to every registered validator (reusing the vote-path send/buffer/redial
+    /// machinery) so a proposal never queues FIFO behind bulk native-action
+    /// batches in gossipsub's per-peer send queue. Mirror of
+    /// [`NetworkConfig::consensus_direct_fan`] (`TORUS_CONSENSUS_DIRECT_FAN`);
+    /// default OFF = exact-today behavior (the documented rollback).
+    pub consensus_direct_fan: bool,
+    /// B2: with the direct fan ON, ALSO publish consensus broadcasts to gossip
+    /// so non-validator observers and not-yet-flipped nodes keep their live
+    /// feed during staged rollout. Ignored while the fan is off — (fan=off,
+    /// mirror=off) must never silently mute consensus. Mirror of
+    /// [`NetworkConfig::consensus_gossip_mirror`]
+    /// (`TORUS_CONSENSUS_GOSSIP_MIRROR`, default ON).
+    pub consensus_gossip_mirror: bool,
+    /// B2 dual-path dedup: bounded LRU of `(sender vk, keccak256(payload))` so
+    /// a broadcast delivered by BOTH the direct fan and the gossip mirror is
+    /// enqueued to consensus exactly once. Checked only while
+    /// `consensus_direct_fan` is on — hotstuff tolerates duplicates today
+    /// (pacemaker rebroadcasts produce identical bytes), but the LRU makes the
+    /// dual-path duplication question moot (design §2).
+    pub consensus_dedup: Mutex<ConsensusDedup>,
+}
+
+/// Capacity of the B2 dual-path dedup LRU. Sized for arrival skew, not
+/// history: entries only need to outlive the direct-vs-gossip delivery gap
+/// (milliseconds to a few seconds); at ~22 broadcasts/s per sender and n≤32
+/// validators, 4096 entries cover several seconds of full-fleet traffic.
+pub const CONSENSUS_DEDUP_CAP: usize = 4096;
+
+/// B2 dual-path dedup set with FIFO eviction, keyed by
+/// `(sender vk bytes, keccak256(payload))` — keccak (already this crate's tx
+/// dedup hash) over the borsh message bytes, which are identical on both
+/// delivery paths. `contains`/`record` are deliberately split: a message the
+/// bounded inbound queue DROPS must not be marked seen, or a later rebroadcast
+/// of the same bytes would be swallowed until eviction.
+pub struct ConsensusDedup {
+    seen: HashSet<([u8; 32], [u8; 32])>,
+    order: VecDeque<([u8; 32], [u8; 32])>,
+    cap: usize,
+}
+
+impl ConsensusDedup {
+    pub fn with_cap(cap: usize) -> Self {
+        Self {
+            seen: HashSet::new(),
+            order: VecDeque::new(),
+            cap,
+        }
+    }
+
+    fn key(sender: &VerifyingKey, payload: &[u8]) -> ([u8; 32], [u8; 32]) {
+        (sender.to_bytes(), Keccak256::digest(payload).into())
+    }
+
+    /// Was `(sender, payload)` already delivered (and enqueued) once?
+    pub fn contains(&self, sender: &VerifyingKey, payload: &[u8]) -> bool {
+        self.seen.contains(&Self::key(sender, payload))
+    }
+
+    /// Mark `(sender, payload)` delivered, evicting the oldest entry past cap.
+    pub fn record(&mut self, sender: &VerifyingKey, payload: &[u8]) {
+        let key = Self::key(sender, payload);
+        if !self.seen.insert(key) {
+            return;
+        }
+        self.order.push_back(key);
+        if self.order.len() > self.cap {
+            if let Some(oldest) = self.order.pop_front() {
+                self.seen.remove(&oldest);
+            }
+        }
+    }
 }
 
 enum SwarmAction {
@@ -1348,11 +1420,16 @@ fn handle_event(
                 if let Some(ref tx) = shared.evm_tx_inbound {
                     let _ = tx.send(raw_rlp.to_vec());
                 }
-            } else if let Ok(msg) =
-                hotstuff_rs::networking::messages::Message::try_from_slice(&request.payload)
-            {
-                enqueue_inbound(&shared.inbound, sender_vk, msg);
-                peer_scoring.reward(&peer, REWARD_BLOCK_RELAY);
+            } else if handle_consensus_direct(
+                &request.payload,
+                sender_vk,
+                shared,
+                &mut *peer_scoring,
+                &peer,
+            ) {
+                // Consumed as a hotstuff consensus message (vote path and, with
+                // B2, the direct-fan broadcast path — dedup'd against the
+                // gossip mirror inside).
             } else {
                 peer_scoring.penalize(
                     &peer,
@@ -1943,22 +2020,50 @@ fn handle_command(
         NetworkCommand::Broadcast { message } => {
             // Self-delivery (hotstuff_rs expects proposer to receive its own broadcast)
             enqueue_inbound(&shared.inbound, *local_key, message.clone());
-            let mut envelope = local_key.to_bytes().to_vec();
-            if let Ok(msg_bytes) = message.try_to_vec() {
-                envelope.extend_from_slice(&msg_bytes);
-                match swarm
-                    .behaviour_mut()
-                    .gossipsub
-                    .publish(consensus_topic.clone(), envelope)
-                {
-                    Ok(_) => {
-                        if let Some(ref m) = shared.metrics {
-                            m.gossip_messages_sent.inc();
-                        }
+            // B2 consensus isolation: fan the broadcast over /torus/direct to
+            // every registered validator, reusing the vote-path machinery
+            // (pending-send buffering, redial, OutboundFailure re-enqueue,
+            // ConnectionEstablished flush) — a proposal on the direct fan
+            // never waits behind bulk batches in gossipsub's per-peer queue.
+            if shared.consensus_direct_fan {
+                let (mut sent, mut buffered) = (0u64, 0u64);
+                for target in broadcast_fan_targets(shared, local_key) {
+                    match send_direct(swarm, shared, local_key, &target, message.clone()) {
+                        DirectSendOutcome::Sent => sent += 1,
+                        DirectSendOutcome::Buffered => buffered += 1,
+                        // Self is excluded from the fan by construction; an
+                        // encode failure is skipped exactly as the pre-B2
+                        // send path did (borsh on a hotstuff message does not
+                        // fail in practice).
+                        DirectSendOutcome::SelfDelivered | DirectSendOutcome::EncodeFailed => {}
                     }
-                    Err(e) => {
-                        warn!("Failed to publish consensus message: {e:?}");
-                        record_publish_failure(shared, &e);
+                }
+                if let Some(ref m) = shared.metrics {
+                    m.consensus_direct_fan_sent.inc_by(sent);
+                    m.consensus_direct_fan_buffered.inc_by(buffered);
+                }
+            }
+            // Gossip publish: unconditional while the fan is off (exact-today
+            // behavior); mirror-gated once the fan carries the message.
+            if should_gossip_broadcast(shared.consensus_direct_fan, shared.consensus_gossip_mirror)
+            {
+                let mut envelope = local_key.to_bytes().to_vec();
+                if let Ok(msg_bytes) = message.try_to_vec() {
+                    envelope.extend_from_slice(&msg_bytes);
+                    match swarm
+                        .behaviour_mut()
+                        .gossipsub
+                        .publish(consensus_topic.clone(), envelope)
+                    {
+                        Ok(_) => {
+                            if let Some(ref m) = shared.metrics {
+                                m.gossip_messages_sent.inc();
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Failed to publish consensus message: {e:?}");
+                            record_publish_failure(shared, &e);
+                        }
                     }
                 }
             }
@@ -2309,6 +2414,52 @@ fn dispatch_next_push(
     }
 }
 
+/// B2: resolve the direct-fan target set for a consensus broadcast — the
+/// intersection of the registered validator set and the peer map (same
+/// resolution as [`fan_native_push`]), excluding self (self-delivery is the
+/// loopback enqueue in the `Broadcast` arm) and excluding mapped
+/// non-validators (observers/RPC nodes keep following consensus via the
+/// gossip mirror). A validator not yet in the peer map is unreachable by any
+/// path and is simply skipped — `init_validator_set` maps every validator at
+/// genesis, so this is a startup-transient at most.
+fn broadcast_fan_targets(shared: &SharedState, local_key: &VerifyingKey) -> Vec<VerifyingKey> {
+    let validators = shared.validators.read().unwrap();
+    let peer_map = shared.peer_map.read().unwrap();
+    peer_map
+        .peer_ids()
+        .filter_map(|pid| {
+            let vk = *peer_map.get_vk(pid)?;
+            if vk == *local_key || !validators.contains(&vk.to_bytes()) {
+                return None;
+            }
+            Some(vk)
+        })
+        .collect()
+}
+
+/// B2: whether a consensus broadcast is (also) published to gossipsub. Fan
+/// OFF ⇒ always true — exact-today behavior, and a (fan=off, mirror=off)
+/// misconfiguration must never silently mute consensus. Fan ON ⇒ the mirror
+/// flag decides: default ON keeps non-validator observers and not-yet-flipped
+/// nodes fed during staged rollout; OFF is the fully-isolated end-state.
+fn should_gossip_broadcast(direct_fan: bool, gossip_mirror: bool) -> bool {
+    !direct_fan || gossip_mirror
+}
+
+/// What happened to a direct consensus send (B2 fan visibility).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectSendOutcome {
+    /// `target == local key` — loopback enqueue to our own inbound queue.
+    SelfDelivered,
+    /// `send_request` fired on a live connection; tracked in `outbound_direct`.
+    Sent,
+    /// Buffered in `pending_sends` (unmapped or disconnected target) for the
+    /// `ConnectionEstablished` flush; a dial was nudged where applicable.
+    Buffered,
+    /// borsh encoding failed (not expected for hotstuff messages).
+    EncodeFailed,
+}
+
 /// Send a consensus message directly to `target`, buffering instead of dropping
 /// when the peer is unreachable (Task 3 — corrected delivery seam).
 ///
@@ -2323,10 +2474,10 @@ fn send_direct(
     local_key: &VerifyingKey,
     target: &VerifyingKey,
     message: hotstuff_rs::networking::messages::Message,
-) {
+) -> DirectSendOutcome {
     if target == local_key {
         enqueue_inbound(&shared.inbound, *local_key, message);
-        return;
+        return DirectSendOutcome::SelfDelivered;
     }
     let peer_id = shared.peer_map.read().unwrap().get_peer_id(target).copied();
     let pid = match peer_id {
@@ -2341,7 +2492,7 @@ fn send_direct(
             if let Some(ref m) = shared.metrics {
                 m.pending_sends_enqueued.inc();
             }
-            return;
+            return DirectSendOutcome::Buffered;
         }
     };
     if !swarm.is_connected(&pid) {
@@ -2355,23 +2506,25 @@ fn send_direct(
             m.pending_sends_enqueued.inc();
         }
         let _ = swarm.dial(pid);
-        return;
+        return DirectSendOutcome::Buffered;
     }
-    if let Ok(payload) = message.try_to_vec() {
-        let req = DirectRequest {
-            sender_key: local_key.to_bytes(),
-            payload,
-        };
-        let req_id = swarm.behaviour_mut().direct.send_request(&pid, req);
-        shared
-            .outbound_direct
-            .lock()
-            .unwrap()
-            .insert(req_id, (*target, message));
-        if let Some(ref m) = shared.metrics {
-            m.gossip_messages_sent.inc();
-        }
+    let Ok(payload) = message.try_to_vec() else {
+        return DirectSendOutcome::EncodeFailed;
+    };
+    let req = DirectRequest {
+        sender_key: local_key.to_bytes(),
+        payload,
+    };
+    let req_id = swarm.behaviour_mut().direct.send_request(&pid, req);
+    shared
+        .outbound_direct
+        .lock()
+        .unwrap()
+        .insert(req_id, (*target, message));
+    if let Some(ref m) = shared.metrics {
+        m.gossip_messages_sent.inc();
     }
+    DirectSendOutcome::Sent
 }
 
 /// Maximum number of inbound consensus messages before backpressure (Batch EK: CONS-FIND-10).
@@ -2478,18 +2631,95 @@ fn enqueue_native_da_shard(shared: &SharedState, source: Vec<u8>, resp: NativeDa
     queue.push_back((source, stored));
 }
 
-/// Push a message to the inbound queue with capacity enforcement.
+/// Push a message to the inbound queue with capacity enforcement. Returns
+/// whether the message was actually enqueued (false = dropped on a full
+/// queue) so the B2 dedup only records DELIVERED messages.
 fn enqueue_inbound(
     inbound: &Mutex<VecDeque<(VerifyingKey, hotstuff_rs::networking::messages::Message)>>,
     sender: VerifyingKey,
     msg: hotstuff_rs::networking::messages::Message,
-) {
+) -> bool {
     let mut queue = inbound.lock().unwrap();
     if queue.len() >= MAX_INBOUND_QUEUE {
         warn!("inbound queue full ({MAX_INBOUND_QUEUE}), dropping incoming message");
-        return;
+        return false;
     }
     queue.push_back((sender, msg));
+    true
+}
+
+/// Outcome of a consensus-message enqueue attempt (B2).
+#[derive(Debug, PartialEq, Eq)]
+enum ConsensusEnqueue {
+    Enqueued,
+    /// Dual-path duplicate (direct fan + gossip mirror) — already enqueued once.
+    Duplicate,
+    /// Inbound queue at capacity — dropped, and deliberately NOT marked seen:
+    /// a later rebroadcast of the same bytes must still be deliverable.
+    QueueFull,
+}
+
+/// Enqueue an inbound consensus message with the B2 dual-path dedup applied.
+/// `payload` is the borsh encoding of `msg` exactly as received on the wire —
+/// byte-identical on the gossip and direct paths, which is what makes the
+/// `(sender, hash)` key work. The dedup is active only while
+/// `consensus_direct_fan` is on: with the fan off (default) this is
+/// exact-today behavior, including today's duplicate tolerance for pacemaker
+/// rebroadcasts.
+fn enqueue_consensus_inbound(
+    shared: &SharedState,
+    sender: VerifyingKey,
+    msg: hotstuff_rs::networking::messages::Message,
+    payload: &[u8],
+) -> ConsensusEnqueue {
+    if shared.consensus_direct_fan
+        && shared
+            .consensus_dedup
+            .lock()
+            .unwrap()
+            .contains(&sender, payload)
+    {
+        if let Some(ref m) = shared.metrics {
+            m.consensus_dedup_dropped.inc();
+        }
+        return ConsensusEnqueue::Duplicate;
+    }
+    if !enqueue_inbound(&shared.inbound, sender, msg) {
+        return ConsensusEnqueue::QueueFull;
+    }
+    if shared.consensus_direct_fan {
+        shared
+            .consensus_dedup
+            .lock()
+            .unwrap()
+            .record(&sender, payload);
+    }
+    ConsensusEnqueue::Enqueued
+}
+
+/// B2: an inbound `/torus/direct` payload that borsh-parses as a hotstuff
+/// consensus [`Message`](hotstuff_rs::networking::messages::Message). This
+/// receive path predates B2 — votes/NewView always arrived here — which is
+/// what makes the direct fan sender-side-only and mixed-fleet safe. Returns
+/// `false` when the payload is not a consensus message so the caller can
+/// penalize the malformed envelope.
+fn handle_consensus_direct(
+    payload: &[u8],
+    sender_vk: VerifyingKey,
+    shared: &SharedState,
+    peer_scoring: &mut PeerScoring,
+    peer: &PeerId,
+) -> bool {
+    let Ok(msg) = hotstuff_rs::networking::messages::Message::try_from_slice(payload) else {
+        return false;
+    };
+    if enqueue_consensus_inbound(shared, sender_vk, msg, payload) == ConsensusEnqueue::Duplicate {
+        debug!(%peer, "dual-path duplicate consensus message (direct after gossip) — dropped");
+    }
+    // The delivery itself was valid either way — dual-path duplicates are a
+    // consequence of OUR mirror config, never the peer's fault.
+    peer_scoring.reward(peer, REWARD_BLOCK_RELAY);
+    true
 }
 
 fn handle_consensus_gossip(
@@ -2518,7 +2748,13 @@ fn handle_consensus_gossip(
 
     match hotstuff_rs::networking::messages::Message::try_from_slice(msg_bytes) {
         Ok(msg) => {
-            enqueue_inbound(&shared.inbound, sender_vk, msg);
+            if enqueue_consensus_inbound(shared, sender_vk, msg, msg_bytes)
+                == ConsensusEnqueue::Duplicate
+            {
+                debug!(%source, "dual-path duplicate consensus message (gossip after direct) — dropped");
+            }
+            // Relaying was valid regardless — the duplicate is a consequence
+            // of OUR dual-path config, never the relayer's fault.
             peer_scoring.reward(source, REWARD_BLOCK_RELAY);
         }
         Err(e) => {

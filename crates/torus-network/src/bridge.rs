@@ -207,6 +207,14 @@ impl LibP2PNetwork {
             pending_da_fetches: Mutex::new(PendingSendQueue::new(
                 crate::swarm::DA_FETCH_QUEUE_CAP,
             )),
+            // B2 consensus isolation (TORUS_CONSENSUS_DIRECT_FAN /
+            // TORUS_CONSENSUS_GOSSIP_MIRROR via NetworkConfig::default; fan
+            // OFF + mirror ON = exact-today rollback).
+            consensus_direct_fan: config.consensus_direct_fan,
+            consensus_gossip_mirror: config.consensus_gossip_mirror,
+            consensus_dedup: Mutex::new(crate::swarm::ConsensusDedup::with_cap(
+                crate::swarm::CONSENSUS_DEDUP_CAP,
+            )),
         });
 
         let (command_tx, command_rx) = mpsc::unbounded_channel();
@@ -640,6 +648,12 @@ mod tests {
             allow_private_addrs: false,
             pending_da_fetches: Mutex::new(PendingSendQueue::new(
                 crate::swarm::DA_FETCH_QUEUE_CAP,
+            )),
+            // B2 defaults (fan OFF, mirror ON) — exact-today behavior.
+            consensus_direct_fan: false,
+            consensus_gossip_mirror: true,
+            consensus_dedup: Mutex::new(crate::swarm::ConsensusDedup::with_cap(
+                crate::swarm::CONSENSUS_DEDUP_CAP,
             )),
         })
     }

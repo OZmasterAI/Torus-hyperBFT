@@ -40,6 +40,24 @@ pub struct NetworkConfig {
     pub consensus_rate_limit_per_peer: u32,
     /// Path to the peer ban list JSON file (Phase 3: 3.1.7).
     pub ban_list_path: Option<PathBuf>,
+    /// B2 consensus isolation: fan consensus broadcasts over `/torus/direct`
+    /// to every registered validator (reusing the vote-path send/buffer/redial
+    /// machinery) instead of relying on gossipsub delivery, where a 1–3 KB
+    /// proposal queues FIFO behind megabytes of bulk native-action batches and
+    /// is silently abandoned after 5 s. Sender-side only — every deployed
+    /// binary already parses hotstuff messages arriving on `/torus/direct`
+    /// (the vote path), so this is mixed-fleet safe and can be flipped one
+    /// node at a time. Default OFF: `TORUS_CONSENSUS_DIRECT_FAN` unset/`0` is
+    /// exact-today behavior (the documented rollback).
+    pub consensus_direct_fan: bool,
+    /// B2: with the direct fan ON, ALSO publish consensus broadcasts to
+    /// gossip (default ON) so non-validator observers (RPC nodes follow
+    /// consensus via gossip) and not-yet-flipped validators keep their live
+    /// feed during staged rollout. Ignored while the fan is off — a
+    /// (fan=off, mirror=off) misconfiguration must never silently mute
+    /// consensus. `TORUS_CONSENSUS_GOSSIP_MIRROR=0` is the fully-isolated
+    /// end-state once the whole fleet runs the fan.
+    pub consensus_gossip_mirror: bool,
     /// Accept loopback/private/link-local addresses into the kademlia address
     /// book (identify-advertised and DHT-learned). Off by default: on a public
     /// network these entries are never dialable from here (a NAT'd peer
@@ -70,6 +88,48 @@ fn parse_gossip_queue_len(raw: Option<&str>) -> usize {
     raw.and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|v| *v > 0)
         .unwrap_or(crate::behaviour::DEFAULT_GOSSIPSUB_QUEUE_LEN)
+}
+
+/// B2: effective `TORUS_CONSENSUS_DIRECT_FAN` — fan consensus broadcasts over
+/// `/torus/direct` to every registered validator. Read once at first use.
+/// Node-local and sender-side only (receivers need no change), so it is safe
+/// to flip one validator at a time. Default OFF = exact-today behavior (the
+/// documented rollback).
+pub fn consensus_direct_fan() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        parse_env_flag(
+            std::env::var("TORUS_CONSENSUS_DIRECT_FAN").ok().as_deref(),
+            false,
+        )
+    })
+}
+
+/// B2: effective `TORUS_CONSENSUS_GOSSIP_MIRROR` — keep publishing consensus
+/// broadcasts to gossip while the direct fan is on, so observers and
+/// not-yet-flipped nodes stay fed during staged rollout. Read once at first
+/// use. Default ON; `=0` is the fully-isolated end-state.
+pub fn consensus_gossip_mirror() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        parse_env_flag(
+            std::env::var("TORUS_CONSENSUS_GOSSIP_MIRROR").ok().as_deref(),
+            true,
+        )
+    })
+}
+
+/// Pure parse seam for the B2 boolean env knobs (unit-testable without
+/// touching process env, same idiom as [`parse_gossip_queue_len`]). Accepts
+/// `1`/`true`/`on`/`yes` and `0`/`false`/`off`/`no` (case- and
+/// whitespace-insensitive); unset or unrecognized falls back to `default` so
+/// a typo can never silently flip a consensus-path knob.
+fn parse_env_flag(raw: Option<&str>, default: bool) -> bool {
+    match raw.map(|v| v.trim().to_ascii_lowercase()) {
+        Some(v) if ["1", "true", "on", "yes"].contains(&v.as_str()) => true,
+        Some(v) if ["0", "false", "off", "no"].contains(&v.as_str()) => false,
+        _ => default,
+    }
 }
 
 /// Whether `addr`'s IP component is globally dialable — i.e. not loopback,
@@ -159,6 +219,8 @@ impl Default for NetworkConfig {
             tx_dedup_window_secs: 60,
             consensus_rate_limit_per_peer: 50,
             ban_list_path: None,
+            consensus_direct_fan: consensus_direct_fan(),
+            consensus_gossip_mirror: consensus_gossip_mirror(),
             allow_private_addrs: false,
         }
     }

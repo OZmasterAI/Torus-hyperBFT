@@ -248,6 +248,20 @@ pub struct Metrics {
     /// send queue was full — with flood_publish this means the WHOLE fan-out
     /// failed, not one peer). Partial per-peer misses show up as SlowPeer.
     pub gossip_publish_all_queues_full: Counter,
+    /// B2 consensus isolation: direct-fan sends fired on a live connection
+    /// (one per validator per broadcast when `TORUS_CONSENSUS_DIRECT_FAN=1`).
+    /// Proof run: this climbs with block production while
+    /// `consensus_timeout_total` stays flat.
+    pub consensus_direct_fan_sent: Counter,
+    /// B2: direct-fan sends buffered for a mapped-but-disconnected (or
+    /// not-yet-mapped) validator, delivered on the `ConnectionEstablished`
+    /// flush. A sustained rate names a flapping/unreachable validator link.
+    pub consensus_direct_fan_buffered: Counter,
+    /// B2: inbound consensus messages dropped as dual-path duplicates by the
+    /// (sender, payload-hash) dedup LRU — the same broadcast arriving via both
+    /// the direct fan and the gossip mirror. Expected to track the mirror's
+    /// delivery rate while both paths are on; zero cost, never a loss signal.
+    pub consensus_dedup_dropped: Counter,
 }
 
 impl Metrics {
@@ -836,6 +850,27 @@ impl Metrics {
             gossip_publish_all_queues_full.clone(),
         );
 
+        let consensus_direct_fan_sent = Counter::default();
+        registry.register(
+            "torus_consensus_direct_fan_sent",
+            "B2 consensus-isolation direct-fan sends fired on a live connection",
+            consensus_direct_fan_sent.clone(),
+        );
+
+        let consensus_direct_fan_buffered = Counter::default();
+        registry.register(
+            "torus_consensus_direct_fan_buffered",
+            "B2 direct-fan sends buffered for a disconnected validator (reconnect flush)",
+            consensus_direct_fan_buffered.clone(),
+        );
+
+        let consensus_dedup_dropped = Counter::default();
+        registry.register(
+            "torus_consensus_dedup_dropped",
+            "Inbound consensus messages dropped as dual-path duplicates (direct fan + gossip mirror)",
+            consensus_dedup_dropped.clone(),
+        );
+
         Self {
             registry,
             blocks_committed,
@@ -921,6 +956,9 @@ impl Metrics {
             gossipsub_slow_peer_events,
             gossipsub_slow_peer_failed_messages,
             gossip_publish_all_queues_full,
+            consensus_direct_fan_sent,
+            consensus_direct_fan_buffered,
+            consensus_dedup_dropped,
         }
     }
 
