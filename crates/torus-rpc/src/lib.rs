@@ -1554,7 +1554,7 @@ mod tests {
             100,
             BlockNotifier::new(),
         );
-        let (fwd_tx, _fwd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (fwd_tx, _fwd_rx) = tokio::sync::mpsc::channel(FORWARD_CHANNEL_CAP);
         let (evm_fwd_tx, mut evm_fwd_rx) = tokio::sync::mpsc::unbounded_channel();
         server.set_leader_forwarding(
             own,
@@ -1597,7 +1597,7 @@ mod tests {
             100,
             BlockNotifier::new(),
         );
-        let (fwd_tx2, _fwd_rx2) = tokio::sync::mpsc::unbounded_channel();
+        let (fwd_tx2, _fwd_rx2) = tokio::sync::mpsc::channel(FORWARD_CHANNEL_CAP);
         let (evm_fwd_tx2, mut evm_fwd_rx2) = tokio::sync::mpsc::unbounded_channel();
         server2.set_leader_forwarding(
             own,
