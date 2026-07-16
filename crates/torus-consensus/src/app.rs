@@ -443,9 +443,15 @@ impl ExecutionContext {
                     .inc_by(sender_actions.len() as u64);
             }
 
+            let seed_bundle_timer = std::time::Instant::now();
             let overlay = NativeStateOverlay::new(self.state_db.clone());
             overlay.seed_from_bundle(&bundle);
+            if let Some(ref m) = self.metrics {
+                m.exec_seed_bundle_seconds
+                    .observe(seed_bundle_timer.elapsed().as_secs_f64());
+            }
 
+            let ctx_setup_timer = std::time::Instant::now();
             let (pre_evm, post_evm) = sort_native_actions(&sender_actions);
             let mut ctx = NativeExecContext::new(
                 overlay.clone(),
@@ -466,6 +472,10 @@ impl ExecutionContext {
             // trade-history KVs (node-local, non-root CFs) instead of paying
             // per-fill overlay PUTs; they are handed over after the flush below.
             ctx.defer_trades = self.trade_writer.is_some();
+            if let Some(ref m) = self.metrics {
+                m.exec_ctx_setup_seconds
+                    .observe(ctx_setup_timer.elapsed().as_secs_f64());
+            }
 
             let engine_timer = std::time::Instant::now();
             NativeExecutor::execute_batch(&mut ctx, &pre_evm);
@@ -538,6 +548,7 @@ impl ExecutionContext {
             // the single exec thread, so it is ordered before the next block's verify.
             // Over-invalidation (a create/revoke that failed) is safe: it only forces
             // a re-resolve. Unconditional on outcome by design.
+            let post_native_timer = std::time::Instant::now();
             if self.exec_trust_cache {
                 if let Some(m) = self.mempool.as_ref() {
                     for signed in &torus_block.native_actions {
@@ -573,13 +584,31 @@ impl ExecutionContext {
                     m.trade_writer_queued_batches.set(w.queued_batches() as i64);
                 }
             }
+            if let Some(ref m) = self.metrics {
+                m.exec_post_native_seconds
+                    .observe(post_native_timer.elapsed().as_secs_f64());
+            }
         }
 
         // ---- Persist block body for RPC queries ----
+        // P3 Task-1: split serialize vs put so the exec-thread cost of the
+        // per-block CF_BLOCK_BODIES JSON write is visible (prime unaccounted
+        // suspect — multi-MB serialize under load, every block).
+        let body_serialize_timer = std::time::Instant::now();
         if let Ok(body_bytes) = serde_json::to_vec(&torus_block.body()) {
+            if let Some(ref m) = self.metrics {
+                m.exec_body_serialize_seconds
+                    .observe(body_serialize_timer.elapsed().as_secs_f64());
+                m.exec_body_bytes.inc_by(body_bytes.len() as u64);
+            }
+            let body_put_timer = std::time::Instant::now();
             let _ = self
                 .state_db
                 .put_cf_raw(CF_BLOCK_BODIES, &height.to_be_bytes(), &body_bytes);
+            if let Some(ref m) = self.metrics {
+                m.exec_body_put_seconds
+                    .observe(body_put_timer.elapsed().as_secs_f64());
+            }
         }
 
         // ---- Update tracking ----
@@ -3340,6 +3369,13 @@ mod crash_recovery_tests {
             "torus_exec_save_books_seconds",
             "torus_exec_flush_seconds",
             "torus_exec_block_seconds",
+            // P3 Task-1: unaccounted-gap decomposition families. Each fires once
+            // per native block (body_* fire on every block, native or empty).
+            "torus_exec_seed_bundle_seconds",
+            "torus_exec_ctx_setup_seconds",
+            "torus_exec_post_native_seconds",
+            "torus_exec_body_serialize_seconds",
+            "torus_exec_body_put_seconds",
         ] {
             assert!(
                 text.contains(&format!("{name}_count 1")),

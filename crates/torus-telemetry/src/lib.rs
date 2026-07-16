@@ -201,6 +201,25 @@ pub struct Metrics {
     pub exec_save_books_seconds: Histogram,
     pub exec_flush_seconds: Histogram,
     pub exec_block_seconds: Histogram,
+    // P3 Task-1 unaccounted-gap decomposition (perf/p3-throughput). These close
+    // the ~24% of exec_block that fell outside the six original phase timers.
+    /// Exec phase: NativeStateOverlay construction + BundleState seed into the
+    /// CF_ACCOUNTS overlay (empty/near-zero on the native-only workload).
+    pub exec_seed_bundle_seconds: Histogram,
+    /// Exec phase: native-action sort + NativeExecContext build (includes the
+    /// order-book load, which is ALSO attributed to exec_load_books_seconds).
+    pub exec_ctx_setup_seconds: Histogram,
+    /// Exec phase: post-flush native tail — session-owner cache invalidation
+    /// sweep over the block's actions + trade-writer handoff.
+    pub exec_post_native_seconds: Histogram,
+    /// Exec phase: serde_json serialize of the block body for CF_BLOCK_BODIES.
+    /// Fires on EVERY committed block (native or empty). P3 prime suspect: under
+    /// load blocks pack ~9k orders → multi-MB JSON on the exec thread each block.
+    pub exec_body_serialize_seconds: Histogram,
+    /// Exec phase: RocksDB put of the serialized block body to CF_BLOCK_BODIES.
+    pub exec_body_put_seconds: Histogram,
+    /// Bytes of the serialized block body written to CF_BLOCK_BODIES per block.
+    pub exec_body_bytes: Counter,
     /// Committed blocks handed to the exec channel but not yet fully executed.
     /// Pinned near the channel bound (64) = execution is the bottleneck.
     pub exec_queue_depth: Gauge,
@@ -817,6 +836,48 @@ impl Metrics {
             exec_block_seconds.clone(),
         );
 
+        let exec_seed_bundle_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
+        registry.register(
+            "torus_exec_seed_bundle_seconds",
+            "Exec phase: overlay construction + BundleState seed into CF_ACCOUNTS overlay",
+            exec_seed_bundle_seconds.clone(),
+        );
+
+        let exec_ctx_setup_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
+        registry.register(
+            "torus_exec_ctx_setup_seconds",
+            "Exec phase: native-action sort + NativeExecContext build (incl. order-book load)",
+            exec_ctx_setup_seconds.clone(),
+        );
+
+        let exec_post_native_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
+        registry.register(
+            "torus_exec_post_native_seconds",
+            "Exec phase: post-flush session-cache invalidation sweep + trade-writer handoff",
+            exec_post_native_seconds.clone(),
+        );
+
+        let exec_body_serialize_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
+        registry.register(
+            "torus_exec_body_serialize_seconds",
+            "Exec phase: serde_json serialize of the block body for CF_BLOCK_BODIES (every block)",
+            exec_body_serialize_seconds.clone(),
+        );
+
+        let exec_body_put_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
+        registry.register(
+            "torus_exec_body_put_seconds",
+            "Exec phase: RocksDB put of the serialized block body to CF_BLOCK_BODIES (every block)",
+            exec_body_put_seconds.clone(),
+        );
+
+        let exec_body_bytes = Counter::default();
+        registry.register(
+            "torus_exec_body_bytes",
+            "Bytes of the serialized block body written to CF_BLOCK_BODIES per block",
+            exec_body_bytes.clone(),
+        );
+
         let exec_queue_depth = Gauge::default();
         registry.register(
             "torus_exec_queue_depth",
@@ -1171,6 +1232,12 @@ impl Metrics {
             exec_save_books_seconds,
             exec_flush_seconds,
             exec_block_seconds,
+            exec_seed_bundle_seconds,
+            exec_ctx_setup_seconds,
+            exec_post_native_seconds,
+            exec_body_serialize_seconds,
+            exec_body_put_seconds,
+            exec_body_bytes,
             exec_queue_depth,
             trade_writer_queued_batches,
             view_duration_seconds,
@@ -1337,6 +1404,13 @@ mod tests {
             "torus_exec_block_seconds",
             "torus_exec_queue_depth",
             "torus_exec_verify_skipped",
+            // P3 Task-1 unaccounted-gap decomposition families.
+            "torus_exec_seed_bundle_seconds",
+            "torus_exec_ctx_setup_seconds",
+            "torus_exec_post_native_seconds",
+            "torus_exec_body_serialize_seconds",
+            "torus_exec_body_put_seconds",
+            "torus_exec_body_bytes",
         ] {
             assert!(text.contains(name), "{name} not registered:\n{text}");
         }
