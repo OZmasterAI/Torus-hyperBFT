@@ -320,7 +320,21 @@ impl ExecutionContext {
                     // full recover + slash below.
                     |key| {
                         if self.exec_trust_cache {
-                            self.mempool.as_ref().and_then(|m| m.verified_sender(key))
+                            let hit =
+                                self.mempool.as_ref().and_then(|m| m.verified_sender(key));
+                            // Proof-leg counter: a HIT here is exactly one secp256k1
+                            // recover skipped at execution. Incremented ONLY on Some,
+                            // so a MISS (None) never counts — the cache can only ever
+                            // reduce verify on the hit path, never skip-by-default on a
+                            // miss (security invariant 2). Pairs with
+                            // `exec_verify_seconds` so the proof leg shows skips rising
+                            // as verify time falls.
+                            if hit.is_some() {
+                                if let Some(ref m) = self.metrics {
+                                    m.exec_verify_skipped.inc();
+                                }
+                            }
+                            hit
                         } else {
                             None
                         }
@@ -2852,6 +2866,210 @@ mod crash_recovery_tests {
             read_evm_balance(&db, bogus),
             U256::ZERO,
             "poisoned cache entry must never be used when the flag is off"
+        );
+    }
+
+    /// `make_exec_ctx_with_mempool` + a wired metrics handle so the exec-side
+    /// `exec_verify_skipped` counter (trust-cache HITs) is observable in-test.
+    fn make_exec_ctx_with_metrics(
+        config: &ChainConfig,
+        state_db: &StateDb,
+        mempool: Option<Arc<Mempool>>,
+        exec_trust_cache: bool,
+        metrics: Arc<torus_telemetry::Metrics>,
+    ) -> ExecutionContext {
+        let mut ctx = make_exec_ctx_with_mempool(config, state_db, mempool, exec_trust_cache);
+        ctx.metrics = Some(metrics);
+        ctx
+    }
+
+    /// PROOF-LEG + INVARIANT 3 (determinism): an EIP-712 action verified at gossip
+    /// INGRESS (the real `add_native_action_from_gossip` recover path), then pruned
+    /// on commit via `remove_committed_native` (which refresh-stashes the verified
+    /// sender BEFORE the exec thread reads it), MUST skip re-verify on commit — and
+    /// reach byte-identical state to a cold (no-cache) full-recover run. The new
+    /// `exec_verify_skipped` counter proves the skip fired.
+    #[test]
+    fn trust_cache_ingress_then_commit_skips_reverify_and_matches_cold() {
+        let amount = U256::from(FixedPoint::ONE.raw() as u128);
+        let key = k256::ecdsa::SigningKey::from_slice(&[41u8; 32]).unwrap();
+        // Nonce in the live window so the real ingress admit path accepts it.
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let signed = torus_types::eip712::sign_native_action(
+            NativeAction::TransferToPerp { amount },
+            nonce,
+            &key,
+        );
+        let sender = signed.recover_sender().unwrap();
+        let start = amount * U256::from(10u8);
+
+        // --- COLD baseline: no mempool, cache off -> full recover every time. ---
+        let (config_off, db_off) = make_test_config_and_db();
+        let ctx_off = make_exec_ctx_with_mempool(&config_off, &db_off, None, false);
+        fund_evm_balance(&db_off, sender, start);
+        ctx_off.execute_committed_block(&make_block(1, vec![signed.clone()]), vec![]);
+        let cold_balance = read_evm_balance(&db_off, sender);
+
+        // --- WARM: verify at ingress, then commit-prune, then exec. ---
+        let (config_on, db_on) = make_test_config_and_db();
+        let mempool = Arc::new(Mempool::new(
+            db_on.clone(),
+            torus_mempool::MempoolConfig::default(),
+        ));
+        // Real gossip-ingress verify path: recovers the sender locally
+        // (verified_locally=true) and seeds the signature-committing key.
+        mempool
+            .add_native_action_from_gossip(sender, signed.clone())
+            .expect("gossip ingress verify + admit");
+        let hash = torus_types::compute_action_hash(&signed);
+        // Commit: refresh-stash the verified sender, then prune the pool entry —
+        // the exec thread (which lags commit) must still HIT.
+        mempool.remove_committed_native(&[hash]);
+
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
+        let ctx_on = make_exec_ctx_with_metrics(
+            &config_on,
+            &db_on,
+            Some(mempool.clone()),
+            true,
+            metrics.clone(),
+        );
+        fund_evm_balance(&db_on, sender, start);
+        ctx_on.execute_committed_block(&make_block(1, vec![signed.clone()]), vec![]);
+        let warm_balance = read_evm_balance(&db_on, sender);
+
+        // INVARIANT 3: hit-path state == miss-path state.
+        assert_eq!(
+            warm_balance, cold_balance,
+            "determinism: commit with a HIT must reach identical state to a cold recover"
+        );
+        assert_eq!(start - warm_balance, amount, "executed exactly once, correct debit");
+        // Proof leg: exactly one recover was skipped on the exec path.
+        assert_eq!(
+            metrics.exec_verify_skipped.get(),
+            1,
+            "the ingress-verified action must skip re-verify on commit (counter proves it)"
+        );
+    }
+
+    /// INVARIANT 2 (never skip-by-default): an action the validator saw ONLY inside
+    /// the block — never at gossip/RPC ingress, so never seeded — MUST be fully
+    /// verified on commit. Cache MISS => full recover, `exec_verify_skipped` stays 0.
+    #[test]
+    fn trust_cache_block_only_action_is_fully_verified_no_skip() {
+        let amount = U256::from(FixedPoint::ONE.raw() as u128);
+        let key = k256::ecdsa::SigningKey::from_slice(&[42u8; 32]).unwrap();
+        let signed = torus_types::eip712::sign_native_action(
+            NativeAction::TransferToPerp { amount },
+            424_242,
+            &key,
+        );
+        let sender = signed.recover_sender().unwrap();
+        let start = amount * U256::from(10u8);
+
+        let (config, db) = make_test_config_and_db();
+        // Empty mempool: the action was NEVER admitted/seeded (block-only).
+        let mempool = Arc::new(Mempool::new(
+            db.clone(),
+            torus_mempool::MempoolConfig::default(),
+        ));
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
+        // Flag ON, but the cache is empty -> MISS -> full recover (never skip).
+        let ctx = make_exec_ctx_with_metrics(&config, &db, Some(mempool), true, metrics.clone());
+        fund_evm_balance(&db, sender, start);
+        ctx.execute_committed_block(&make_block(1, vec![signed.clone()]), vec![]);
+
+        assert_eq!(
+            start - read_evm_balance(&db, sender),
+            amount,
+            "block-only action must still be fully verified and executed (invariant 2)"
+        );
+        assert_eq!(
+            metrics.exec_verify_skipped.get(),
+            0,
+            "a cache MISS must NEVER skip verification (no skip-by-default)"
+        );
+    }
+
+    /// INVARIANT 1 (key commits to the signature): `compute_action_hash` OMITS the
+    /// signature (torus-types:863), so it is an insufficient key. A cached entry for
+    /// action A (payload P, nonce N, sig_A) MUST NOT authorize a DIFFERENT action B
+    /// with the SAME payload+nonce (== same `compute_action_hash`) but a different /
+    /// forged signature. Because the trust-cache is keyed by the signature-committing
+    /// `verified_cache_key`, B's key differs => cache MISS => full recover: a valid
+    /// re-sign resolves to ITS OWN signer (never A's), and a forged sig resolves to
+    /// None (the slash signal) — the substitution attack is defeated.
+    #[test]
+    fn trust_cache_substitution_attack_rejected() {
+        use torus_types::ActionSignature;
+        let (_config, state_db) = make_test_config_and_db();
+        let mempool = Mempool::new(state_db.clone(), torus_mempool::MempoolConfig::default());
+        let base = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        let k_a = k256::ecdsa::SigningKey::from_slice(&[51u8; 32]).unwrap();
+        let k_b = k256::ecdsa::SigningKey::from_slice(&[52u8; 32]).unwrap();
+
+        // A: verified at ingress -> seeds cache[key(A)] = sender_a.
+        let action_a = torus_types::eip712::sign_native_action(NativeAction::ClaimRewards, base + 1, &k_a);
+        let sender_a = action_a.recover_sender().unwrap();
+        mempool
+            .add_native_action_from_gossip(sender_a, action_a.clone())
+            .expect("A admitted + seeded");
+
+        // B: SAME payload + SAME nonce as A (=> identical compute_action_hash) but a
+        // DIFFERENT, valid signature (signer k_b).
+        let action_b = torus_types::eip712::sign_native_action(NativeAction::ClaimRewards, base + 1, &k_b);
+        let sender_b = action_b.recover_sender().unwrap();
+        assert_ne!(sender_a, sender_b, "distinct signers");
+        assert_eq!(
+            torus_types::compute_action_hash(&action_a),
+            torus_types::compute_action_hash(&action_b),
+            "precondition: identical action-hash (signature omitted) — the substitution surface"
+        );
+        assert_ne!(
+            torus_types::verified_cache_key(&action_a),
+            torus_types::verified_cache_key(&action_b),
+            "the trust-cache key MUST differ because it commits to the signature"
+        );
+
+        // C: FORGED — A's payload+nonce with a corrupted signature (recovers to nobody).
+        let mut action_c = torus_types::eip712::sign_native_action(NativeAction::ClaimRewards, base + 1, &k_a);
+        if let ActionSignature::Eip712(ref mut sig) = action_c.signature {
+            sig.r = [0xff; 32];
+            sig.s = [0xff; 32];
+        }
+        assert_eq!(
+            torus_types::compute_action_hash(&action_a),
+            torus_types::compute_action_hash(&action_c),
+            "precondition: forged C shares A's action-hash"
+        );
+
+        // Verify B and C against the cache warmed by A. Neither may borrow A's sender.
+        let resolved = torus_types::eip712::batch_verify_native_actions_cached(
+            &[action_b.clone(), action_c.clone()],
+            base,
+            |_| None,
+            |key| mempool.verified_sender(key),
+        );
+        assert_eq!(
+            resolved[0],
+            Some(sender_b),
+            "B is re-verified to ITS OWN signer, never A's cached sender"
+        );
+        assert_ne!(
+            resolved[0],
+            Some(sender_a),
+            "the substitution MUST NOT resolve to A's cached sender"
+        );
+        assert_eq!(
+            resolved[1], None,
+            "forged C -> cache MISS -> recover fails -> None (slash signal)"
         );
     }
 

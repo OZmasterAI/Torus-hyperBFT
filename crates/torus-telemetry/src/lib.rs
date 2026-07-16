@@ -85,6 +85,16 @@ pub struct Metrics {
     pub verified_sender_cache_misses: Counter,
     /// Exec trust-cache evictions (FIFO cap reached). High vs hits => cap too small.
     pub verified_sender_cache_evictions: Counter,
+    /// Exec-path signature verifications SKIPPED because a trust-cache HIT reused a
+    /// previously-verified sender (keyed by the signature-committing
+    /// `verified_cache_key`) instead of re-running the secp256k1 recover on commit.
+    /// Pairs with `exec_verify_seconds`: on the proof leg, a rising
+    /// `exec_verify_skipped_total` should track a falling `exec_verify_seconds`.
+    /// Counted at the exec call site (app.rs), so it is unambiguously execution-path
+    /// (distinct from the mempool-namespaced `verified_sender_cache_hits`). A MISS —
+    /// or the flag being off, or a non-cacheable session action — never increments
+    /// it and always full-verifies (never skip-by-default).
+    pub exec_verify_skipped: Counter,
 
     // Submit-ack phase timing (Sprint 3.5) — decomposes where multi-second
     // batch-submit acks accrue: semaphore queue vs blocking-pool verify vs
@@ -517,6 +527,13 @@ impl Metrics {
             "torus_verified_sender_cache_evictions",
             "Exec trust-cache FIFO evictions",
             verified_sender_cache_evictions.clone(),
+        );
+
+        let exec_verify_skipped = Counter::default();
+        registry.register(
+            "torus_exec_verify_skipped",
+            "Exec-path signature recovers skipped via a trust-cache HIT (pairs with exec_verify_seconds)",
+            exec_verify_skipped.clone(),
         );
 
         let rpc_submit_permit_wait_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
@@ -1084,6 +1101,7 @@ impl Metrics {
             verified_sender_cache_hits,
             verified_sender_cache_misses,
             verified_sender_cache_evictions,
+            exec_verify_skipped,
             rpc_submit_permit_wait_seconds,
             rpc_submit_verify_seconds,
             rpc_submit_verify_cpu_seconds,
@@ -1282,6 +1300,7 @@ mod tests {
             "torus_exec_flush_seconds",
             "torus_exec_block_seconds",
             "torus_exec_queue_depth",
+            "torus_exec_verify_skipped",
         ] {
             assert!(text.contains(name), "{name} not registered:\n{text}");
         }
