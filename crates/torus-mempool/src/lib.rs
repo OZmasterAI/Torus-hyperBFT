@@ -541,11 +541,26 @@ impl Mempool {
     /// Per-sender-per-block caps are enforced internally.
     pub fn drain_native(&self, limit: usize) -> Vec<SignedNativeAction> {
         let mut pool = self.native.write().unwrap();
-        let evicted = pool.evict_expired(now_ms());
-        if evicted > 0 {
-            tracing::info!(evicted, "evicted nonce-expired native actions from pool");
-        }
+        let (evicted, expired_orders) = pool.evict_expired(now_ms());
+        self.count_expired(evicted, expired_orders);
         pool.drain(limit)
+    }
+
+    /// Count a nonce-expiry purge on the P2 funnel counters (the 60s window is
+    /// otherwise a silent loss sink — the pool "drains to 0" without any trace).
+    fn count_expired(&self, evicted: usize, expired_orders: u64) {
+        if evicted == 0 {
+            return;
+        }
+        if let Some(m) = self.metrics.get() {
+            m.native_pool_expired_actions.inc_by(evicted as u64);
+            m.native_pool_expired_orders.inc_by(expired_orders);
+        }
+        tracing::info!(
+            evicted,
+            expired_orders,
+            "evicted nonce-expired native actions from pool"
+        );
     }
 
     /// Re-insert previously drained native actions (e.g., after reorg).
@@ -639,10 +654,8 @@ impl Mempool {
         orders_cap: usize,
     ) -> Vec<(alloy_primitives::Address, SignedNativeAction)> {
         let mut pool = self.native.write().unwrap();
-        let evicted = pool.evict_expired(now_ms());
-        if evicted > 0 {
-            tracing::info!(evicted, "evicted nonce-expired native actions from pool");
-        }
+        let (evicted, expired_orders) = pool.evict_expired(now_ms());
+        self.count_expired(evicted, expired_orders);
         pool.select_for_block_with_senders_excluding(limit, exclude, bytes_cap, orders_cap)
     }
 
@@ -1070,6 +1083,59 @@ mod tests {
         assert!(
             pool.get_native_by_hash(&hash).is_none(),
             "pool entry removed after commit"
+        );
+    }
+
+    /// P2 funnel item 1: the 60s nonce-window purge was info-log only — the
+    /// biggest silent loss sink. Both counters (actions AND orders, the latter
+    /// batch-aware) must increment when the lazy eviction fires in drain_native.
+    #[test]
+    fn nonce_expiry_purge_increments_counters() {
+        use torus_types::eip712::NONCE_WINDOW_MS;
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state, MempoolConfig::default());
+        let metrics = std::sync::Arc::new(torus_telemetry::Metrics::new());
+        pool.set_metrics(metrics.clone());
+
+        let key = k256::ecdsa::SigningKey::from_slice(
+            &alloy_primitives::hex::decode(
+                "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let order = torus_types::PlaceOrderParams {
+            market_id: 1,
+            is_buy: true,
+            price: torus_types::FixedPoint::from_raw(100 * torus_types::FixedPoint::SCALE),
+            quantity: torus_types::FixedPoint::from_raw(torus_types::FixedPoint::SCALE),
+            order_type: torus_types::OrderType::Limit,
+            time_in_force: torus_types::TimeInForce::GTC,
+            reduce_only: false,
+            client_order_id: None,
+        };
+        // Already outside the 60s window. Admission would reject it, so plant it
+        // via reinsert_native (the reorg path, which skips the nonce gate) —
+        // exactly the class of entry the lazy eviction must purge and count.
+        let stale = torus_types::eip712::sign_native_action(
+            torus_types::NativeAction::PlaceOrderBatch(vec![order; 3]),
+            now_ms().saturating_sub(2 * NONCE_WINDOW_MS),
+            &key,
+        );
+        pool.reinsert_native(vec![stale]);
+        assert_eq!(pool.native_pool_size(), 1, "stale entry planted");
+
+        let drained = pool.drain_native(10);
+        assert!(drained.is_empty(), "expired entry must not be drained");
+        assert_eq!(
+            metrics.native_pool_expired_actions.get(),
+            1,
+            "one expired action counted"
+        );
+        assert_eq!(
+            metrics.native_pool_expired_orders.get(),
+            3,
+            "orders = actions × batch size"
         );
     }
 

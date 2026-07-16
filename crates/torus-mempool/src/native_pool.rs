@@ -340,13 +340,19 @@ impl NativePool {
     /// admission/validation again, so keeping it selectable only lets leaders
     /// propose blocks that cannot validate — the s334 bs1000 wedge had no
     /// self-heal precisely because nothing ever removed these. Called lazily
-    /// from the selection/drain wrappers. Returns the number evicted.
-    pub fn evict_expired(&mut self, now_ms: u64) -> usize {
+    /// from the selection/drain wrappers. Returns `(actions_evicted,
+    /// orders_evicted)` — the order count is batch-aware (`order_count` per
+    /// entry, i.e. actions × batch size for PlaceOrderBatch; non-order actions
+    /// count 1, same convention as the block orders budget) so the P2 funnel
+    /// counters can attribute the loss in order units.
+    pub fn evict_expired(&mut self, now_ms: u64) -> (usize, u64) {
         use torus_types::eip712::NONCE_WINDOW_MS;
         let mut removed = Vec::new();
+        let mut removed_orders: u64 = 0;
         self.entries.retain(|entry| {
             if entry.action.nonce.saturating_add(NONCE_WINDOW_MS) < now_ms {
                 removed.push((entry.sender, entry.action_hash));
+                removed_orders += crate::rate_limit::order_count(&entry.action.action) as u64;
                 false
             } else {
                 true
@@ -360,7 +366,7 @@ impl NativePool {
         for (i, entry) in self.entries.iter().enumerate() {
             self.hash_index.insert(entry.action_hash, i);
         }
-        removed.len()
+        (removed.len(), removed_orders)
     }
 
     /// Remove actions that were included in a committed block.
@@ -438,6 +444,19 @@ mod tests {
         }
     }
 
+    fn test_order_params() -> torus_types::PlaceOrderParams {
+        torus_types::PlaceOrderParams {
+            market_id: 1,
+            is_buy: true,
+            price: torus_types::FixedPoint::from_raw(100 * torus_types::FixedPoint::SCALE),
+            quantity: torus_types::FixedPoint::from_raw(torus_types::FixedPoint::SCALE),
+            order_type: torus_types::OrderType::Limit,
+            time_in_force: torus_types::TimeInForce::GTC,
+            reduce_only: false,
+            client_order_id: None,
+        }
+    }
+
     #[test]
     fn insert_and_drain() {
         let mut pool = NativePool::new(100, 64, 16);
@@ -496,14 +515,25 @@ mod tests {
         let sender = Address::repeat_byte(1);
         let now: u64 = 10 * NONCE_WINDOW_MS;
         let stale = make_action(now - 2 * NONCE_WINDOW_MS, NativeAction::ClaimRewards);
+        // A stale BATCH must report its order_count (3), not 1 — the expired-orders
+        // counter is actions×batch for PlaceOrderBatch (P2 funnel item 1).
+        let stale_batch = make_action(
+            now - 3 * NONCE_WINDOW_MS,
+            NativeAction::PlaceOrderBatch(vec![test_order_params(); 3]),
+        );
         let fresh = make_action(now, NativeAction::CancelOrder { order_id: 7 });
         let stale_hash = compute_action_hash(&stale);
         pool.insert(sender, stale.clone()).unwrap();
+        pool.insert(sender, stale_batch).unwrap();
         pool.insert(sender, fresh).unwrap();
-        assert_eq!(pool.size(), 2);
+        assert_eq!(pool.size(), 3);
 
-        let evicted = pool.evict_expired(now);
-        assert_eq!(evicted, 1);
+        let (evicted, expired_orders) = pool.evict_expired(now);
+        assert_eq!(evicted, 2, "both stale entries evicted");
+        assert_eq!(
+            expired_orders, 4,
+            "orders = order_count sum: ClaimRewards(1) + batch(3)"
+        );
         assert_eq!(pool.size(), 1);
         assert!(pool.get_by_hash(&stale_hash).is_none());
         // seen/sender_counts cleaned: the same (sender, action) is insertable again.
