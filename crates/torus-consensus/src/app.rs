@@ -930,6 +930,65 @@ pub trait NativeDaFetcher: Send + Sync {
 /// (different `data_hash` for the same block). Do NOT deploy piecemeal.
 const COMPACT_PROPOSALS: bool = true;
 
+/// Proposer-side near-expiry margin (milliseconds) for the Option-A session
+/// filter. At block production the proposer skips a session-signed action whose
+/// session expiry is within this margin of the proposal time (i.e. it includes
+/// the action only if `expiry >= now_ms + PROPOSAL_EXPIRY_MARGIN_MS`), so it never
+/// proposes an action execution would later reject as expired.
+///
+/// This is a proposer-LOCAL policy, NOT a consensus rule: different proposers may
+/// filter differently and the chain still agrees (execution — with the
+/// `SESSION_EXPIRY_EXEC_GRACE_MS` grace window — is the single source of truth).
+/// It is therefore safe to keep local and does not affect determinism. Combined
+/// with the 120 s exec grace, an action that passes this 60 s filter has ≥60 s to
+/// expiry at proposal and execution rejects only past expiry+120 s, so an honest
+/// proposer would be slashed only on a > 180 s proposal→commit gap (pathological).
+const PROPOSAL_EXPIRY_MARGIN_MS: u64 = 60_000;
+
+/// Proposer-side near-expiry filter (Option A). Returns `(kept, filtered_count)`:
+/// `kept` is `selected` minus any session-signed action whose session expiry is
+/// within `margin_ms` of `now_ms` (i.e. keeps it only if
+/// `expiry >= now_ms + margin_ms`). EIP-712 actions are always kept.
+/// `session_expiry(pubkey)` returns the session's expiry in ms, or `None` if the
+/// session can't be resolved — in which case the action is KEPT (execution is the
+/// authority; the filter is best-effort). Expiry is resolved at most once per
+/// unique pubkey.
+///
+/// This is a pure transform over the SELECTED list; it never touches the mempool,
+/// so a filtered action is NOT consumed and stays eligible for later blocks.
+fn filter_near_expiry_sessions(
+    selected: Vec<(Address, torus_types::SignedNativeAction)>,
+    now_ms: u64,
+    margin_ms: u64,
+    session_expiry: impl Fn(&[u8; 32]) -> Option<u64>,
+) -> (Vec<(Address, torus_types::SignedNativeAction)>, u64) {
+    let cutoff_ms = now_ms.saturating_add(margin_ms);
+    let mut cache: std::collections::HashMap<[u8; 32], Option<u64>> =
+        std::collections::HashMap::new();
+    let mut filtered: u64 = 0;
+    let kept = selected
+        .into_iter()
+        .filter(|(_, action)| {
+            let torus_types::ActionSignature::Session { session_pubkey, .. } = &action.signature
+            else {
+                return true; // EIP-712 action: not session-expiry-gated
+            };
+            let expiry = cache
+                .entry(*session_pubkey)
+                .or_insert_with(|| session_expiry(session_pubkey));
+            match expiry {
+                Some(exp) if *exp >= cutoff_ms => true, // healthy: keep
+                Some(_) => {
+                    filtered += 1;
+                    false // within the margin of expiry: skip for this block
+                }
+                None => true, // unresolved: keep, execution decides
+            }
+        })
+        .collect();
+    (kept, filtered)
+}
+
 /// Encode the datum carried in a consensus proposal.
 ///
 /// With `compact = false` (default): the FULL, self-contained `TorusBlock` (native
@@ -1938,12 +1997,32 @@ impl App<RocksKVStore> for TorusApp {
             // reconstructed (MissingData) — absent from `pending_proposals` but
             // still in flight on the wire (s355 duplicate-inclusion tail).
             self.in_flight_hashes.extend_into(&mut in_flight);
-            let native = mempool.select_native_for_block_with_senders_excluding(
+            let selected = mempool.select_native_for_block_with_senders_excluding(
                 torus_mempool::rate_limit::native_total_block_cap(),
                 &in_flight,
                 torus_mempool::rate_limit::native_block_bytes_cap(),
                 torus_mempool::rate_limit::native_orders_per_block_cap(),
             );
+
+            // Proposer-side near-expiry filter (Option A) — proposer-LOCAL policy,
+            // NOT a consensus rule, so determinism is unaffected. NON-CONSUMPTION:
+            // the select above is non-destructive and did NOT mark these consumed —
+            // dropping them from THIS block leaves them in the pool, eligible for
+            // later blocks (they expire in the pool naturally). `now_ms` mirrors the
+            // exec unit (block timestamp is seconds; expiry is milliseconds).
+            let now_ms = timestamp.saturating_mul(1000);
+            let (native, expiry_filtered) = filter_near_expiry_sessions(
+                selected,
+                now_ms,
+                PROPOSAL_EXPIRY_MARGIN_MS,
+                |pk| self.state_db.get_session(pk).ok().flatten().map(|s| s.expiry),
+            );
+            if expiry_filtered > 0 {
+                if let Some(ref m) = self.metrics {
+                    m.proposal_expiry_filtered.inc_by(expiry_filtered);
+                }
+            }
+
             let evm = mempool.drain_evm(gas_limit, parent_header.state_root);
             if !evm.is_empty() || !native.is_empty() {
                 tracing::info!(
@@ -3562,6 +3641,116 @@ mod crash_recovery_tests {
             1,
             "a live session must still be accepted and processed at exec"
         );
+    }
+
+    // ---- proposer-side near-expiry filter (Option A) ----
+
+    /// The proposer filter drops ONLY session-signed actions within
+    /// `PROPOSAL_EXPIRY_MARGIN_MS` of expiry, reports the count, keeps healthy
+    /// sessions, keeps unresolved sessions (execution is the authority), and keeps
+    /// EIP-712 actions. NON-CONSUMPTION is structural: the helper is a pure
+    /// transform over the SELECTED list and never touches the mempool pool.
+    #[test]
+    fn proposer_filter_skips_near_expiry_counts_and_keeps_rest() {
+        let now_ms = 1_700_000_000_000u64;
+        let margin = super::PROPOSAL_EXPIRY_MARGIN_MS;
+
+        let ed_near = ed25519_dalek::SigningKey::from_bytes(&[81u8; 32]);
+        let pk_near = ed_near.verifying_key().to_bytes();
+        let ed_far = ed25519_dalek::SigningKey::from_bytes(&[82u8; 32]);
+        let pk_far = ed_far.verifying_key().to_bytes();
+
+        let a_near = (
+            Address::from([1; 20]),
+            torus_types::eip712::sign_native_action_with_session(
+                NativeAction::CancelOrder { order_id: 1 },
+                now_ms,
+                &ed_near,
+            ),
+        );
+        let a_far = (
+            Address::from([2; 20]),
+            torus_types::eip712::sign_native_action_with_session(
+                NativeAction::CancelOrder { order_id: 2 },
+                now_ms,
+                &ed_far,
+            ),
+        );
+        // Unknown session pubkey -> lookup None -> must be KEPT (exec decides).
+        let ed_unknown = ed25519_dalek::SigningKey::from_bytes(&[83u8; 32]);
+        let a_unknown = (
+            Address::from([3; 20]),
+            torus_types::eip712::sign_native_action_with_session(
+                NativeAction::CancelOrder { order_id: 3 },
+                now_ms,
+                &ed_unknown,
+            ),
+        );
+        let a_eip712 = (Address::from([4; 20]), sign_claim_rewards(now_ms));
+
+        let lookup = move |pk: &[u8; 32]| {
+            if pk == &pk_near {
+                Some(now_ms + margin - 1) // just inside the margin -> filtered
+            } else if pk == &pk_far {
+                Some(now_ms + margin + 10_000) // well beyond the margin -> kept
+            } else {
+                None // unknown -> None -> kept
+            }
+        };
+
+        let selected = vec![
+            a_near.clone(),
+            a_far.clone(),
+            a_unknown.clone(),
+            a_eip712.clone(),
+        ];
+        let (kept, filtered) =
+            super::filter_near_expiry_sessions(selected, now_ms, margin, lookup);
+
+        assert_eq!(filtered, 1, "exactly the near-expiry session action is filtered");
+        let hashes: Vec<_> = kept
+            .iter()
+            .map(|(_, a)| torus_types::compute_action_hash(a))
+            .collect();
+        assert!(
+            !hashes.contains(&torus_types::compute_action_hash(&a_near.1)),
+            "near-expiry session filtered out of the proposed block"
+        );
+        assert!(
+            hashes.contains(&torus_types::compute_action_hash(&a_far.1)),
+            "healthy session kept"
+        );
+        assert!(
+            hashes.contains(&torus_types::compute_action_hash(&a_unknown.1)),
+            "unresolved session kept (execution is the authority)"
+        );
+        assert!(
+            hashes.contains(&torus_types::compute_action_hash(&a_eip712.1)),
+            "EIP-712 action kept"
+        );
+        assert_eq!(kept.len(), 3);
+    }
+
+    /// Boundary: a session expiring EXACTLY at `now + margin` is kept (`>=` cutoff).
+    #[test]
+    fn proposer_filter_boundary_at_exactly_margin_is_kept() {
+        let now_ms = 1_700_000_000_000u64;
+        let margin = super::PROPOSAL_EXPIRY_MARGIN_MS;
+        let ed = ed25519_dalek::SigningKey::from_bytes(&[84u8; 32]);
+        let pk = ed.verifying_key().to_bytes();
+        let a = (
+            Address::from([9; 20]),
+            torus_types::eip712::sign_native_action_with_session(
+                NativeAction::CancelOrder { order_id: 5 },
+                now_ms,
+                &ed,
+            ),
+        );
+        let lookup = move |p: &[u8; 32]| (p == &pk).then_some(now_ms + margin);
+        let (kept, filtered) =
+            super::filter_near_expiry_sessions(vec![a], now_ms, margin, lookup);
+        assert_eq!(filtered, 0, "expiry exactly at the margin boundary is kept");
+        assert_eq!(kept.len(), 1);
     }
 
     /// INVARIANT 1 (key commits to the signature): `compute_action_hash` OMITS the

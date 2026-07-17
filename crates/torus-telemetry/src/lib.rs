@@ -374,6 +374,14 @@ pub struct Metrics {
     /// pull for that block's bodies; the proposer's own DA mirror makes it
     /// recoverable. Was a silent warn before this counter.
     pub native_pre_proposal_push_dropped: Counter,
+    /// Session-signed native actions SKIPPED by the proposer-side near-expiry
+    /// filter (Option A): at block production the proposer excludes a session
+    /// action whose session is within `PROPOSAL_EXPIRY_MARGIN_MS` of expiry, so it
+    /// never proposes an action execution would later reject. This is a
+    /// proposer-LOCAL policy (not a consensus rule): the action is NOT consumed and
+    /// stays eligible for later blocks. On a healthy workload (sessions far from
+    /// expiry) this reads 0.
+    pub proposal_expiry_filtered: Counter,
     /// Exec phase: deserializing every market's order book from the CF at the
     /// start of a block (native_executor `load_order_books`) — the O(markets×depth)
     /// per-block reload cost, invisible before this round.
@@ -1208,6 +1216,13 @@ impl Metrics {
             native_pre_proposal_push_dropped.clone(),
         );
 
+        let proposal_expiry_filtered = Counter::default();
+        registry.register(
+            "torus_proposal_expiry_filtered",
+            "Session-signed native actions skipped by the proposer-side near-expiry filter (Option A)",
+            proposal_expiry_filtered.clone(),
+        );
+
         let exec_load_books_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
         registry.register(
             "torus_exec_load_books_seconds",
@@ -1383,6 +1398,7 @@ impl Metrics {
             native_ingest_dedup_skips,
             native_ingest_stale_skips,
             native_pre_proposal_push_dropped,
+            proposal_expiry_filtered,
             exec_load_books_seconds,
             exec_save_books_bytes,
             native_resting_depth,
@@ -1497,6 +1513,18 @@ mod tests {
         ] {
             assert!(text.contains(name), "{name} not registered:\n{text}");
         }
+    }
+
+    /// Item #5 (Option A): the proposer-side near-expiry filter counter must be
+    /// registered so the proof leg can assert it reads 0 on a healthy workload.
+    #[test]
+    fn proposal_expiry_filtered_metric_registers() {
+        let m = Metrics::new();
+        let text = m.encode();
+        assert!(
+            text.contains("torus_proposal_expiry_filtered"),
+            "torus_proposal_expiry_filtered not registered:\n{text}"
+        );
     }
 
     /// Exec-ceiling Option A: the six execution-phase histograms and the
