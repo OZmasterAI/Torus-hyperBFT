@@ -9,6 +9,7 @@
 use alloy_primitives::{keccak256, Address, B256, U256};
 use ed25519_dalek::{Verifier, VerifyingKey as Ed25519VerifyingKey};
 use k256::ecdsa::{RecoveryId, SigningKey, VerifyingKey};
+use std::sync::LazyLock;
 
 use crate::{
     ActionSignature, FixedPoint, MarketId, MarketListing, MarketParams, NativeAction,
@@ -149,6 +150,26 @@ fn encode_string(s: &str) -> [u8; 32] {
 // Domain Separator
 // ============================================================================
 
+/// Precomputed Torus EIP-712 domain separator.
+///
+/// The domain is entirely compile-time constant (name "Torus", version "1",
+/// `TORUS_CHAIN_ID`, zero verifying contract), so the 4 constituent keccaks + the
+/// final one are computed exactly once on first use instead of per verify call.
+/// The value is byte-identical to the pre-hoist inline computation (asserted in
+/// `hoisted_domain_separator_matches_fresh`).
+static DOMAIN_SEPARATOR: LazyLock<B256> = LazyLock::new(|| {
+    let type_hash = keccak256(
+        "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)",
+    );
+    let mut buf = Vec::with_capacity(5 * 32);
+    buf.extend_from_slice(&type_hash.0);
+    buf.extend_from_slice(&encode_string("Torus"));
+    buf.extend_from_slice(&encode_string("1"));
+    buf.extend_from_slice(&encode_u256(&U256::from(TORUS_CHAIN_ID)));
+    buf.extend_from_slice(&encode_address(&Address::ZERO));
+    keccak256(&buf)
+});
+
 /// Compute the EIP-712 domain separator for Torus.
 ///
 /// ```text
@@ -161,16 +182,7 @@ fn encode_string(s: &str) -> [u8; 32] {
 /// )
 /// ```
 pub fn eip712_domain_separator() -> B256 {
-    let type_hash = keccak256(
-        "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)",
-    );
-    let mut buf = Vec::with_capacity(5 * 32);
-    buf.extend_from_slice(&type_hash.0);
-    buf.extend_from_slice(&encode_string("Torus"));
-    buf.extend_from_slice(&encode_string("1"));
-    buf.extend_from_slice(&encode_u256(&U256::from(TORUS_CHAIN_ID)));
-    buf.extend_from_slice(&encode_address(&Address::ZERO));
-    keccak256(&buf)
+    *DOMAIN_SEPARATOR
 }
 
 // ============================================================================
@@ -244,54 +256,69 @@ pub fn eip712_struct_hash(action: &NativeAction, nonce: u64) -> B256 {
 
 // ---------- order book ----------
 
-/// Append the 9 EIP-712 order fields (no typehash, no nonce) to `buf`.
+/// Encoded byte length of the 9 EIP-712 order fields (9 × 32-byte ABI words).
+const PLACE_ORDER_FIELDS_LEN: usize = 9 * 32;
+
+/// ABI-encode the 9 EIP-712 order fields (no typehash, no nonce) into a fixed
+/// stack buffer — no heap allocation per order.
 ///
 /// Shared by `hash_place_order` (single, nonce-bearing) and `hash_place_order_item`
-/// (batch element, nonce at the batch level) so the two paths cannot diverge.
-fn append_place_order_fields(buf: &mut Vec<u8>, p: &PlaceOrderParams) {
+/// (batch element, nonce at the batch level) so the two paths cannot diverge. The
+/// output is byte-identical to the pre-hoist `append_place_order_fields` (same
+/// field order, same encoders), asserted in `place_order_fields_encoding_matches`.
+fn encode_place_order_fields(p: &PlaceOrderParams) -> [u8; PLACE_ORDER_FIELDS_LEN] {
     let (coid, has_coid) = p.client_order_id.map_or((0, false), |id| (id, true));
-    buf.extend_from_slice(&encode_u64(p.market_id));
-    buf.extend_from_slice(&encode_bool(p.is_buy));
-    buf.extend_from_slice(&encode_i128(p.price.raw()));
-    buf.extend_from_slice(&encode_i128(p.quantity.raw()));
-    buf.extend_from_slice(&encode_u8(match p.order_type {
+    let mut buf = [0u8; PLACE_ORDER_FIELDS_LEN];
+    buf[0..32].copy_from_slice(&encode_u64(p.market_id));
+    buf[32..64].copy_from_slice(&encode_bool(p.is_buy));
+    buf[64..96].copy_from_slice(&encode_i128(p.price.raw()));
+    buf[96..128].copy_from_slice(&encode_i128(p.quantity.raw()));
+    buf[128..160].copy_from_slice(&encode_u8(match p.order_type {
         OrderType::Limit => 0,
         OrderType::Market => 1,
         OrderType::StopMarket { .. } => 2,
         OrderType::StopLimit { .. } => 3,
     }));
-    buf.extend_from_slice(&encode_u8(p.time_in_force as u8));
-    buf.extend_from_slice(&encode_bool(p.reduce_only));
-    buf.extend_from_slice(&encode_u64(coid));
-    buf.extend_from_slice(&encode_bool(has_coid));
+    buf[160..192].copy_from_slice(&encode_u8(p.time_in_force as u8));
+    buf[192..224].copy_from_slice(&encode_bool(p.reduce_only));
+    buf[224..256].copy_from_slice(&encode_u64(coid));
+    buf[256..288].copy_from_slice(&encode_bool(has_coid));
+    buf
 }
 
 fn hash_place_order(p: &PlaceOrderParams, nonce: u64) -> B256 {
-    let th = keccak256(
-        "PlaceOrder(uint64 marketId,bool isBuy,int128 price,int128 quantity,\
-         uint8 orderType,uint8 timeInForce,bool reduceOnly,\
-         uint64 clientOrderId,bool hasClientOrderId,uint64 nonce)",
-    );
-    let mut buf = Vec::with_capacity(11 * 32);
-    buf.extend_from_slice(&th.0);
-    append_place_order_fields(&mut buf, p);
-    buf.extend_from_slice(&encode_u64(nonce));
-    keccak256(&buf)
+    static TH: LazyLock<B256> = LazyLock::new(|| {
+        keccak256(
+            "PlaceOrder(uint64 marketId,bool isBuy,int128 price,int128 quantity,\
+             uint8 orderType,uint8 timeInForce,bool reduceOnly,\
+             uint64 clientOrderId,bool hasClientOrderId,uint64 nonce)",
+        )
+    });
+    // typehash (32) + 9 fields (288) + nonce (32) = 352 bytes, no heap alloc.
+    let mut buf = [0u8; 11 * 32];
+    buf[0..32].copy_from_slice(TH.as_slice());
+    buf[32..320].copy_from_slice(&encode_place_order_fields(p));
+    buf[320..352].copy_from_slice(&encode_u64(nonce));
+    keccak256(buf)
 }
 
 /// EIP-712 struct hash for one order *inside* a batch (no nonce — the nonce is
 /// bound once at the batch level). Distinct typehash from `PlaceOrder` so a single
 /// order and a batch element can never collide.
 fn hash_place_order_item(p: &PlaceOrderParams) -> B256 {
-    let th = keccak256(
-        "PlaceOrderItem(uint64 marketId,bool isBuy,int128 price,int128 quantity,\
-         uint8 orderType,uint8 timeInForce,bool reduceOnly,\
-         uint64 clientOrderId,bool hasClientOrderId)",
-    );
-    let mut buf = Vec::with_capacity(10 * 32);
-    buf.extend_from_slice(&th.0);
-    append_place_order_fields(&mut buf, p);
-    keccak256(&buf)
+    static TH: LazyLock<B256> = LazyLock::new(|| {
+        keccak256(
+            "PlaceOrderItem(uint64 marketId,bool isBuy,int128 price,int128 quantity,\
+             uint8 orderType,uint8 timeInForce,bool reduceOnly,\
+             uint64 clientOrderId,bool hasClientOrderId)",
+        )
+    });
+    // typehash (32) + 9 fields (288) = 320 bytes on the stack — the per-order Vec
+    // that dominated the b400 batch hash path is gone.
+    let mut buf = [0u8; 10 * 32];
+    buf[0..32].copy_from_slice(TH.as_slice());
+    buf[32..320].copy_from_slice(&encode_place_order_fields(p));
+    keccak256(buf)
 }
 
 /// EIP-712 struct hash for a batch of orders under one signature + one nonce.
@@ -301,22 +328,25 @@ fn hash_place_order_item(p: &PlaceOrderParams) -> B256 {
 /// keccak256(item_hash_1 || item_hash_2 || ...)`. `count` is bound explicitly so
 /// truncation/extension changes the hash even if it weren't already implied.
 fn hash_place_order_batch(orders: &[PlaceOrderParams], nonce: u64) -> B256 {
-    let th = keccak256("PlaceOrderBatch(bytes32 ordersHash,uint64 count,uint64 nonce)");
+    static TH: LazyLock<B256> =
+        LazyLock::new(|| keccak256("PlaceOrderBatch(bytes32 ordersHash,uint64 count,uint64 nonce)"));
     let mut acc = Vec::with_capacity(orders.len() * 32);
     for p in orders {
         acc.extend_from_slice(&hash_place_order_item(p).0);
     }
     let orders_hash = keccak256(&acc);
-    let mut buf = Vec::with_capacity(4 * 32);
-    buf.extend_from_slice(&th.0);
-    buf.extend_from_slice(&encode_bytes32(&orders_hash));
-    buf.extend_from_slice(&encode_u64(orders.len() as u64));
-    buf.extend_from_slice(&encode_u64(nonce));
-    keccak256(&buf)
+    let mut buf = [0u8; 4 * 32];
+    buf[0..32].copy_from_slice(TH.as_slice());
+    buf[32..64].copy_from_slice(&encode_bytes32(&orders_hash));
+    buf[64..96].copy_from_slice(&encode_u64(orders.len() as u64));
+    buf[96..128].copy_from_slice(&encode_u64(nonce));
+    keccak256(buf)
 }
 
 fn hash_cancel_order(order_id: OrderId, nonce: u64) -> B256 {
-    let th = keccak256("CancelOrder(uint128 orderId,uint64 nonce)");
+    static TH: LazyLock<B256> =
+        LazyLock::new(|| keccak256("CancelOrder(uint128 orderId,uint64 nonce)"));
+    let th = &*TH;
     let mut buf = Vec::with_capacity(3 * 32);
     buf.extend_from_slice(&th.0);
     buf.extend_from_slice(&encode_u128(order_id));
@@ -325,7 +355,9 @@ fn hash_cancel_order(order_id: OrderId, nonce: u64) -> B256 {
 }
 
 fn hash_cancel_all_orders(market_id: Option<MarketId>, nonce: u64) -> B256 {
-    let th = keccak256("CancelAllOrders(uint64 marketId,bool hasMarketId,uint64 nonce)");
+    static TH: LazyLock<B256> =
+        LazyLock::new(|| keccak256("CancelAllOrders(uint64 marketId,bool hasMarketId,uint64 nonce)"));
+    let th = &*TH;
     let (mid, has) = market_id.map_or((0, false), |id| (id, true));
     let mut buf = Vec::with_capacity(4 * 32);
     buf.extend_from_slice(&th.0);
@@ -341,10 +373,13 @@ fn hash_modify_order(
     new_qty: Option<FixedPoint>,
     nonce: u64,
 ) -> B256 {
-    let th = keccak256(
-        "ModifyOrder(uint128 orderId,int128 newPrice,bool hasNewPrice,\
-         int128 newQty,bool hasNewQty,uint64 nonce)",
-    );
+    static TH: LazyLock<B256> = LazyLock::new(|| {
+        keccak256(
+            "ModifyOrder(uint128 orderId,int128 newPrice,bool hasNewPrice,\
+             int128 newQty,bool hasNewQty,uint64 nonce)",
+        )
+    });
+    let th = &*TH;
     let (price, hp) = new_price.map_or((0, false), |p| (p.raw(), true));
     let (qty, hq) = new_qty.map_or((0, false), |q| (q.raw(), true));
     let mut buf = Vec::with_capacity(7 * 32);
@@ -361,7 +396,9 @@ fn hash_modify_order(
 // ---------- transfers ----------
 
 fn hash_transfer_to_perp(amount: &U256, nonce: u64) -> B256 {
-    let th = keccak256("TransferToPerp(uint256 amount,uint64 nonce)");
+    static TH: LazyLock<B256> =
+        LazyLock::new(|| keccak256("TransferToPerp(uint256 amount,uint64 nonce)"));
+    let th = &*TH;
     let mut buf = Vec::with_capacity(3 * 32);
     buf.extend_from_slice(&th.0);
     buf.extend_from_slice(&encode_u256(amount));
@@ -370,7 +407,9 @@ fn hash_transfer_to_perp(amount: &U256, nonce: u64) -> B256 {
 }
 
 fn hash_transfer_to_spot(amount: &U256, nonce: u64) -> B256 {
-    let th = keccak256("TransferToSpot(uint256 amount,uint64 nonce)");
+    static TH: LazyLock<B256> =
+        LazyLock::new(|| keccak256("TransferToSpot(uint256 amount,uint64 nonce)"));
+    let th = &*TH;
     let mut buf = Vec::with_capacity(3 * 32);
     buf.extend_from_slice(&th.0);
     buf.extend_from_slice(&encode_u256(amount));
@@ -379,7 +418,9 @@ fn hash_transfer_to_spot(amount: &U256, nonce: u64) -> B256 {
 }
 
 fn hash_withdraw(amount: &U256, to: &Address, nonce: u64) -> B256 {
-    let th = keccak256("Withdraw(uint256 amount,address to,uint64 nonce)");
+    static TH: LazyLock<B256> =
+        LazyLock::new(|| keccak256("Withdraw(uint256 amount,address to,uint64 nonce)"));
+    let th = &*TH;
     let mut buf = Vec::with_capacity(4 * 32);
     buf.extend_from_slice(&th.0);
     buf.extend_from_slice(&encode_u256(amount));
@@ -391,7 +432,9 @@ fn hash_withdraw(amount: &U256, to: &Address, nonce: u64) -> B256 {
 // ---------- staking ----------
 
 fn hash_delegate(validator: &Address, amount: &U256, nonce: u64) -> B256 {
-    let th = keccak256("Delegate(address validator,uint256 amount,uint64 nonce)");
+    static TH: LazyLock<B256> =
+        LazyLock::new(|| keccak256("Delegate(address validator,uint256 amount,uint64 nonce)"));
+    let th = &*TH;
     let mut buf = Vec::with_capacity(4 * 32);
     buf.extend_from_slice(&th.0);
     buf.extend_from_slice(&encode_address(validator));
@@ -401,7 +444,9 @@ fn hash_delegate(validator: &Address, amount: &U256, nonce: u64) -> B256 {
 }
 
 fn hash_undelegate(validator: &Address, amount: &U256, nonce: u64) -> B256 {
-    let th = keccak256("Undelegate(address validator,uint256 amount,uint64 nonce)");
+    static TH: LazyLock<B256> =
+        LazyLock::new(|| keccak256("Undelegate(address validator,uint256 amount,uint64 nonce)"));
+    let th = &*TH;
     let mut buf = Vec::with_capacity(4 * 32);
     buf.extend_from_slice(&th.0);
     buf.extend_from_slice(&encode_address(validator));
@@ -411,7 +456,9 @@ fn hash_undelegate(validator: &Address, amount: &U256, nonce: u64) -> B256 {
 }
 
 fn hash_permanent_stake(amount: &U256, nonce: u64) -> B256 {
-    let th = keccak256("PermanentStake(uint256 amount,uint64 nonce)");
+    static TH: LazyLock<B256> =
+        LazyLock::new(|| keccak256("PermanentStake(uint256 amount,uint64 nonce)"));
+    let th = &*TH;
     let mut buf = Vec::with_capacity(3 * 32);
     buf.extend_from_slice(&th.0);
     buf.extend_from_slice(&encode_u256(amount));
@@ -420,7 +467,8 @@ fn hash_permanent_stake(amount: &U256, nonce: u64) -> B256 {
 }
 
 fn hash_claim_rewards(nonce: u64) -> B256 {
-    let th = keccak256("ClaimRewards(uint64 nonce)");
+    static TH: LazyLock<B256> = LazyLock::new(|| keccak256("ClaimRewards(uint64 nonce)"));
+    let th = &*TH;
     let mut buf = Vec::with_capacity(2 * 32);
     buf.extend_from_slice(&th.0);
     buf.extend_from_slice(&encode_u64(nonce));
@@ -430,9 +478,10 @@ fn hash_claim_rewards(nonce: u64) -> B256 {
 // ---------- governance ----------
 
 fn hash_submit_proposal(proposal: &Proposal, nonce: u64) -> B256 {
-    let th = keccak256(
-        "SubmitProposal(string title,string description,bytes32 actionHash,uint64 nonce)",
-    );
+    static TH: LazyLock<B256> = LazyLock::new(|| {
+        keccak256("SubmitProposal(string title,string description,bytes32 actionHash,uint64 nonce)")
+    });
+    let th = &*TH;
     let action_hash = hash_proposal_action(&proposal.action);
     let mut buf = Vec::with_capacity(5 * 32);
     buf.extend_from_slice(&th.0);
@@ -444,7 +493,9 @@ fn hash_submit_proposal(proposal: &Proposal, nonce: u64) -> B256 {
 }
 
 fn hash_vote(proposal_id: u64, option: &VoteOption, nonce: u64) -> B256 {
-    let th = keccak256("Vote(uint64 proposalId,uint8 option,uint64 nonce)");
+    static TH: LazyLock<B256> =
+        LazyLock::new(|| keccak256("Vote(uint64 proposalId,uint8 option,uint64 nonce)"));
+    let th = &*TH;
     let opt = match option {
         VoteOption::Yes => 0u8,
         VoteOption::No => 1,
@@ -461,7 +512,10 @@ fn hash_vote(proposal_id: u64, option: &VoteOption, nonce: u64) -> B256 {
 // ---------- oracle ----------
 
 fn hash_submit_oracle_prices(sub: &OracleSubmission, nonce: u64) -> B256 {
-    let th = keccak256("SubmitOraclePrices(bytes32 pricesHash,uint64 timestamp,uint64 nonce)");
+    static TH: LazyLock<B256> = LazyLock::new(|| {
+        keccak256("SubmitOraclePrices(bytes32 pricesHash,uint64 timestamp,uint64 nonce)")
+    });
+    let th = &*TH;
     let prices_hash = hash_price_vec(&sub.prices);
     let mut buf = Vec::with_capacity(4 * 32);
     buf.extend_from_slice(&th.0);
@@ -474,7 +528,10 @@ fn hash_submit_oracle_prices(sub: &OracleSubmission, nonce: u64) -> B256 {
 // ---------- validator ----------
 
 fn hash_register_validator(pubkey: &PublicKey, commission: u16, nonce: u64) -> B256 {
-    let th = keccak256("RegisterValidator(bytes32 pubkey,uint16 commission,uint64 nonce)");
+    static TH: LazyLock<B256> = LazyLock::new(|| {
+        keccak256("RegisterValidator(bytes32 pubkey,uint16 commission,uint64 nonce)")
+    });
+    let th = &*TH;
     let pk = B256::from(pubkey.0);
     let mut buf = Vec::with_capacity(4 * 32);
     buf.extend_from_slice(&th.0);
@@ -485,7 +542,9 @@ fn hash_register_validator(pubkey: &PublicKey, commission: u16, nonce: u64) -> B
 }
 
 fn hash_update_commission(new_rate: u16, nonce: u64) -> B256 {
-    let th = keccak256("UpdateCommission(uint16 newRate,uint64 nonce)");
+    static TH: LazyLock<B256> =
+        LazyLock::new(|| keccak256("UpdateCommission(uint16 newRate,uint64 nonce)"));
+    let th = &*TH;
     let mut buf = Vec::with_capacity(3 * 32);
     buf.extend_from_slice(&th.0);
     buf.extend_from_slice(&encode_u16(new_rate));
@@ -494,7 +553,8 @@ fn hash_update_commission(new_rate: u16, nonce: u64) -> B256 {
 }
 
 fn hash_jail_vote(target: &Address, nonce: u64) -> B256 {
-    let th = keccak256("JailVote(address target,uint64 nonce)");
+    static TH: LazyLock<B256> = LazyLock::new(|| keccak256("JailVote(address target,uint64 nonce)"));
+    let th = &*TH;
     let mut buf = Vec::with_capacity(3 * 32);
     buf.extend_from_slice(&th.0);
     buf.extend_from_slice(&encode_address(target));
@@ -503,7 +563,8 @@ fn hash_jail_vote(target: &Address, nonce: u64) -> B256 {
 }
 
 fn hash_unjail_self(nonce: u64) -> B256 {
-    let th = keccak256("UnjailSelf(uint64 nonce)");
+    static TH: LazyLock<B256> = LazyLock::new(|| keccak256("UnjailSelf(uint64 nonce)"));
+    let th = &*TH;
     let mut buf = Vec::with_capacity(2 * 32);
     buf.extend_from_slice(&th.0);
     buf.extend_from_slice(&encode_u64(nonce));
@@ -511,7 +572,9 @@ fn hash_unjail_self(nonce: u64) -> B256 {
 }
 
 fn hash_rotate_validator_key(new_pubkey: &PublicKey, nonce: u64) -> B256 {
-    let th = keccak256("RotateValidatorKey(bytes32 newPubkey,uint64 nonce)");
+    static TH: LazyLock<B256> =
+        LazyLock::new(|| keccak256("RotateValidatorKey(bytes32 newPubkey,uint64 nonce)"));
+    let th = &*TH;
     let pk = B256::from(new_pubkey.0);
     let mut buf = Vec::with_capacity(3 * 32);
     buf.extend_from_slice(&th.0);
@@ -523,7 +586,10 @@ fn hash_rotate_validator_key(new_pubkey: &PublicKey, nonce: u64) -> B256 {
 // ---------- admin ----------
 
 fn hash_update_market_params(market_id: MarketId, params: &MarketParams, nonce: u64) -> B256 {
-    let th = keccak256("UpdateMarketParams(uint64 marketId,bytes32 paramsHash,uint64 nonce)");
+    static TH: LazyLock<B256> = LazyLock::new(|| {
+        keccak256("UpdateMarketParams(uint64 marketId,bytes32 paramsHash,uint64 nonce)")
+    });
+    let th = &*TH;
     let ph = hash_market_params(params);
     let mut buf = Vec::with_capacity(4 * 32);
     buf.extend_from_slice(&th.0);
@@ -534,7 +600,9 @@ fn hash_update_market_params(market_id: MarketId, params: &MarketParams, nonce: 
 }
 
 fn hash_list_market(listing: &MarketListing, nonce: u64) -> B256 {
-    let th = keccak256("ListMarket(bytes32 listingHash,uint64 nonce)");
+    static TH: LazyLock<B256> =
+        LazyLock::new(|| keccak256("ListMarket(bytes32 listingHash,uint64 nonce)"));
+    let th = &*TH;
     let lh = hash_market_listing(listing);
     let mut buf = Vec::with_capacity(3 * 32);
     buf.extend_from_slice(&th.0);
@@ -544,7 +612,9 @@ fn hash_list_market(listing: &MarketListing, nonce: u64) -> B256 {
 }
 
 fn hash_delist_market(market_id: MarketId, nonce: u64) -> B256 {
-    let th = keccak256("DelistMarket(uint64 marketId,uint64 nonce)");
+    static TH: LazyLock<B256> =
+        LazyLock::new(|| keccak256("DelistMarket(uint64 marketId,uint64 nonce)"));
+    let th = &*TH;
     let mut buf = Vec::with_capacity(3 * 32);
     buf.extend_from_slice(&th.0);
     buf.extend_from_slice(&encode_u64(market_id));
@@ -554,7 +624,9 @@ fn hash_delist_market(market_id: MarketId, nonce: u64) -> B256 {
 
 // FIX ECON-FIND-15: EIP-712 type hash for TopUpSelfStake.
 fn hash_top_up_self_stake(amount: &U256, nonce: u64) -> B256 {
-    let th = keccak256("TopUpSelfStake(uint256 amount,uint64 nonce)");
+    static TH: LazyLock<B256> =
+        LazyLock::new(|| keccak256("TopUpSelfStake(uint256 amount,uint64 nonce)"));
+    let th = &*TH;
     let mut buf = Vec::with_capacity(3 * 32);
     buf.extend_from_slice(&th.0);
     buf.extend_from_slice(&encode_u256(amount));
@@ -563,8 +635,10 @@ fn hash_top_up_self_stake(amount: &U256, nonce: u64) -> B256 {
 }
 
 fn hash_create_session(pubkey: &[u8; 32], expiry: u64, scope: SessionScope, nonce: u64) -> B256 {
-    let th =
-        keccak256("CreateSession(bytes32 sessionPubkey,uint64 expiry,uint8 scope,uint64 nonce)");
+    static TH: LazyLock<B256> = LazyLock::new(|| {
+        keccak256("CreateSession(bytes32 sessionPubkey,uint64 expiry,uint8 scope,uint64 nonce)")
+    });
+    let th = &*TH;
     let mut buf = Vec::with_capacity(5 * 32);
     buf.extend_from_slice(&th.0);
     buf.extend_from_slice(pubkey);
@@ -575,7 +649,9 @@ fn hash_create_session(pubkey: &[u8; 32], expiry: u64, scope: SessionScope, nonc
 }
 
 fn hash_revoke_session(pubkey: &[u8; 32], nonce: u64) -> B256 {
-    let th = keccak256("RevokeSession(bytes32 sessionPubkey,uint64 nonce)");
+    static TH: LazyLock<B256> =
+        LazyLock::new(|| keccak256("RevokeSession(bytes32 sessionPubkey,uint64 nonce)"));
+    let th = &*TH;
     let mut buf = Vec::with_capacity(3 * 32);
     buf.extend_from_slice(&th.0);
     buf.extend_from_slice(pubkey);
@@ -1116,6 +1192,155 @@ mod tests {
         let b = eip712_domain_separator();
         assert_eq!(a, b);
         assert_ne!(a, B256::ZERO);
+    }
+
+    // --- Feature #14: hoisted-constant-keccak byte-identity oracles ---
+    //
+    // Each test recomputes the expected hash from raw `keccak256` calls on the
+    // literal type strings (independent of the hoisted `LazyLock` statics and the
+    // stack-buffer field encoder), so a HIT proves the hoist is byte-identical to
+    // the pre-hoist inline computation. The unchanged ABI leaf encoders
+    // (`encode_u64` etc.) are reused only to assemble the oracle — they are not
+    // the code under test.
+
+    /// A representative order with a client order id (exercises `has_coid = true`).
+    fn oracle_order() -> PlaceOrderParams {
+        PlaceOrderParams {
+            market_id: 7,
+            is_buy: true,
+            price: FixedPoint::from_raw(-1_234_567_890),
+            quantity: FixedPoint::from_raw(98_765_432_100),
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::GTC,
+            reduce_only: true,
+            client_order_id: Some(0xDEAD_BEEF),
+        }
+    }
+
+    /// An order without a client order id (exercises `has_coid = false`).
+    fn oracle_order_no_coid() -> PlaceOrderParams {
+        PlaceOrderParams {
+            market_id: 3,
+            is_buy: false,
+            price: FixedPoint::from_raw(500),
+            quantity: FixedPoint::from_raw(9),
+            order_type: OrderType::Market,
+            time_in_force: TimeInForce::IOC,
+            reduce_only: false,
+            client_order_id: None,
+        }
+    }
+
+    /// Verbatim pre-hoist field assembly (the old `append_place_order_fields`),
+    /// used as the independent oracle for the new stack-buffer encoder.
+    fn oracle_fields(p: &PlaceOrderParams) -> Vec<u8> {
+        let (coid, has_coid) = p.client_order_id.map_or((0, false), |id| (id, true));
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&encode_u64(p.market_id));
+        buf.extend_from_slice(&encode_bool(p.is_buy));
+        buf.extend_from_slice(&encode_i128(p.price.raw()));
+        buf.extend_from_slice(&encode_i128(p.quantity.raw()));
+        buf.extend_from_slice(&encode_u8(match p.order_type {
+            OrderType::Limit => 0,
+            OrderType::Market => 1,
+            OrderType::StopMarket { .. } => 2,
+            OrderType::StopLimit { .. } => 3,
+        }));
+        buf.extend_from_slice(&encode_u8(p.time_in_force as u8));
+        buf.extend_from_slice(&encode_bool(p.reduce_only));
+        buf.extend_from_slice(&encode_u64(coid));
+        buf.extend_from_slice(&encode_bool(has_coid));
+        buf
+    }
+
+    #[test]
+    fn hoisted_domain_separator_matches_fresh() {
+        // Independent 5-field recomputation via raw keccak (no hoisted static).
+        let type_hash = keccak256(
+            "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)",
+        );
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&type_hash.0);
+        buf.extend_from_slice(&keccak256("Torus").0);
+        buf.extend_from_slice(&keccak256("1").0);
+        buf.extend_from_slice(&U256::from(TORUS_CHAIN_ID).to_be_bytes::<32>());
+        buf.extend_from_slice(&[0u8; 32]); // address(0), left-padded to 32 bytes
+        assert_eq!(eip712_domain_separator(), keccak256(&buf));
+    }
+
+    #[test]
+    fn place_order_fields_encoding_matches() {
+        for p in [oracle_order(), oracle_order_no_coid()] {
+            let got = encode_place_order_fields(&p);
+            assert_eq!(got.len(), 9 * 32, "9 ABI words");
+            assert_eq!(got.as_slice(), oracle_fields(&p).as_slice());
+        }
+    }
+
+    #[test]
+    fn hoisted_place_order_struct_hash_matches_fresh() {
+        let p = oracle_order();
+        let th = keccak256(
+            "PlaceOrder(uint64 marketId,bool isBuy,int128 price,int128 quantity,\
+             uint8 orderType,uint8 timeInForce,bool reduceOnly,\
+             uint64 clientOrderId,bool hasClientOrderId,uint64 nonce)",
+        );
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&th.0);
+        buf.extend_from_slice(&oracle_fields(&p));
+        buf.extend_from_slice(&encode_u64(TEST_NONCE));
+        let expected = keccak256(&buf);
+        assert_eq!(
+            eip712_struct_hash(&NativeAction::PlaceOrder(p), TEST_NONCE),
+            expected
+        );
+    }
+
+    #[test]
+    fn hoisted_place_order_batch_struct_hash_matches_fresh() {
+        let orders = vec![oracle_order(), oracle_order_no_coid(), oracle_order()];
+
+        // Fresh per-item hashes (PlaceOrderItem typehash, no nonce).
+        let item_th = keccak256(
+            "PlaceOrderItem(uint64 marketId,bool isBuy,int128 price,int128 quantity,\
+             uint8 orderType,uint8 timeInForce,bool reduceOnly,\
+             uint64 clientOrderId,bool hasClientOrderId)",
+        );
+        let mut acc = Vec::new();
+        for p in &orders {
+            let mut item = Vec::new();
+            item.extend_from_slice(&item_th.0);
+            item.extend_from_slice(&oracle_fields(p));
+            acc.extend_from_slice(&keccak256(&item).0);
+        }
+        let orders_hash = keccak256(&acc);
+
+        let batch_th = keccak256("PlaceOrderBatch(bytes32 ordersHash,uint64 count,uint64 nonce)");
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&batch_th.0);
+        buf.extend_from_slice(&orders_hash.0);
+        buf.extend_from_slice(&encode_u64(orders.len() as u64));
+        buf.extend_from_slice(&encode_u64(TEST_NONCE));
+        let expected = keccak256(&buf);
+
+        assert_eq!(
+            eip712_struct_hash(&NativeAction::PlaceOrderBatch(orders), TEST_NONCE),
+            expected
+        );
+    }
+
+    #[test]
+    fn hoisted_cancel_order_struct_hash_matches_fresh() {
+        let th = keccak256("CancelOrder(uint128 orderId,uint64 nonce)");
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&th.0);
+        buf.extend_from_slice(&encode_u128(42));
+        buf.extend_from_slice(&encode_u64(TEST_NONCE));
+        let expected = keccak256(&buf);
+        assert_eq!(
+            eip712_struct_hash(&NativeAction::CancelOrder { order_id: 42 }, TEST_NONCE),
+            expected
+        );
     }
 
     #[test]
