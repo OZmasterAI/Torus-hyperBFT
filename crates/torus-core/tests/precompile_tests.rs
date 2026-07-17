@@ -933,3 +933,142 @@ fn read_only_is_transparent_for_reader_precompiles() {
     );
     assert_eq!(ro.unwrap(), normal.unwrap());
 }
+
+// ============================================================================
+// Top-N bounded read + per-level gas (0x0800 top-N gas round)
+// ============================================================================
+
+fn encode_u32_word(v: u32) -> [u8; 32] {
+    let mut w = [0u8; 32];
+    w[28..].copy_from_slice(&v.to_be_bytes());
+    w
+}
+
+/// Seed a book with 5 bid levels (100..96) and 3 ask levels (101..103),
+/// one order each, qty = 10+level index for uniqueness.
+fn seed_multilevel_book(db: &StateDb, market_id: u64) {
+    use torus_core::order_book::OrderBook;
+    use torus_types::{OrderType, PlaceOrderParams, TimeInForce};
+    let limit = |is_buy: bool, price: i64, qty: i64| PlaceOrderParams {
+        market_id,
+        is_buy,
+        price: fp(price),
+        quantity: fp(qty),
+        order_type: OrderType::Limit,
+        time_in_force: TimeInForce::GTC,
+        reduce_only: false,
+        client_order_id: None,
+    };
+    let mut book = OrderBook::new(market_id, fp(1), fp(1));
+    for (i, p) in [100i64, 99, 98, 97, 96].iter().enumerate() {
+        book.place_order(limit(true, *p, 10 + i as i64), addr(i as u8 + 1), 1);
+    }
+    for (i, p) in [101i64, 102, 103].iter().enumerate() {
+        book.place_order(limit(false, *p, 20 + i as i64), addr(i as u8 + 10), 1);
+    }
+    torus_core::order_book_store::save_book_full(db, &mut book).unwrap();
+}
+
+#[test]
+fn get_order_book_explicit_n_truncates_best_first_and_charges_per_level() {
+    use torus_core::precompiles::{
+        execute_precompile_with_gas, GAS_PER_BOOK_LEVEL, GAS_PRECOMPILE_READ,
+    };
+    let (_dir, db) = setup();
+    seed_multilevel_book(&db, 11);
+    let address = precompile_address(ADDR_ORDER_BOOK_READER);
+
+    // n=2: best 2 bids (100, 99) and best 2 asks (101, 102).
+    let input = build_input(
+        "getOrderBook(bytes32,uint32)",
+        &[encode_market_id(11), encode_u32_word(2)],
+    );
+    let out = execute_precompile_with_gas(&address, &input, &addr(0), &db, 100).unwrap();
+    let arrays = decode_u128_arrays(&out.data, 4);
+    assert_eq!(
+        arrays[0],
+        vec![fp(100).raw() as u128, fp(99).raw() as u128],
+        "top-2 bids best-first"
+    );
+    assert_eq!(arrays[1], vec![fp(10).raw() as u128, fp(11).raw() as u128]);
+    assert_eq!(
+        arrays[2],
+        vec![fp(101).raw() as u128, fp(102).raw() as u128],
+        "top-2 asks best-first"
+    );
+    assert_eq!(arrays[3], vec![fp(20).raw() as u128, fp(21).raw() as u128]);
+    assert_eq!(
+        out.gas_used,
+        GAS_PRECOMPILE_READ + GAS_PER_BOOK_LEVEL * 4,
+        "base + k×(2 bids + 2 asks)"
+    );
+}
+
+#[test]
+fn get_order_book_legacy_selector_returns_all_levels_under_cap_with_surcharge() {
+    use torus_core::precompiles::{
+        execute_precompile_with_gas, GAS_PER_BOOK_LEVEL, GAS_PRECOMPILE_READ,
+    };
+    let (_dir, db) = setup();
+    seed_multilevel_book(&db, 12);
+    let address = precompile_address(ADDR_ORDER_BOOK_READER);
+
+    let input = build_input("getOrderBook(bytes32)", &[encode_market_id(12)]);
+    let out = execute_precompile_with_gas(&address, &input, &addr(0), &db, 100).unwrap();
+    let arrays = decode_u128_arrays(&out.data, 4);
+    assert_eq!(arrays[0].len(), 5, "all 5 bid levels (below N cap)");
+    assert_eq!(arrays[2].len(), 3, "all 3 ask levels");
+    assert_eq!(
+        arrays[0][0],
+        fp(100).raw() as u128,
+        "bids best(high)-first"
+    );
+    assert_eq!(arrays[2][0], fp(101).raw() as u128, "asks best(low)-first");
+    assert_eq!(
+        out.gas_used,
+        GAS_PRECOMPILE_READ + GAS_PER_BOOK_LEVEL * 8,
+        "base + k×(5+3)"
+    );
+}
+
+#[test]
+fn get_order_book_absent_market_is_empty_at_base_gas() {
+    use torus_core::precompiles::{execute_precompile_with_gas, GAS_PRECOMPILE_READ};
+    let (_dir, db) = setup();
+    let address = precompile_address(ADDR_ORDER_BOOK_READER);
+
+    let input = build_input("getOrderBook(bytes32)", &[encode_market_id(999)]);
+    let out = execute_precompile_with_gas(&address, &input, &addr(0), &db, 100).unwrap();
+    let arrays = decode_u128_arrays(&out.data, 4);
+    assert!(arrays.iter().all(|a| a.is_empty()), "absent market = empty");
+    assert_eq!(out.gas_used, GAS_PRECOMPILE_READ, "no levels → base gas only");
+}
+
+#[test]
+fn get_order_book_n_zero_is_empty_and_n_is_capped() {
+    use torus_core::precompiles::{
+        execute_precompile_with_gas, GAS_PRECOMPILE_READ, TOP_N_LEVELS_PER_SIDE,
+    };
+    let (_dir, db) = setup();
+    seed_multilevel_book(&db, 13);
+    let address = precompile_address(ADDR_ORDER_BOOK_READER);
+
+    // n=0 → empty arrays, base gas.
+    let input = build_input(
+        "getOrderBook(bytes32,uint32)",
+        &[encode_market_id(13), encode_u32_word(0)],
+    );
+    let out = execute_precompile_with_gas(&address, &input, &addr(0), &db, 100).unwrap();
+    assert!(decode_u128_arrays(&out.data, 4).iter().all(|a| a.is_empty()));
+    assert_eq!(out.gas_used, GAS_PRECOMPILE_READ);
+
+    // n=u32::MAX → clamped to TOP_N (all 5+3 levels here), never over cap.
+    let input = build_input(
+        "getOrderBook(bytes32,uint32)",
+        &[encode_market_id(13), encode_u32_word(u32::MAX)],
+    );
+    let out = execute_precompile_with_gas(&address, &input, &addr(0), &db, 100).unwrap();
+    let arrays = decode_u128_arrays(&out.data, 4);
+    assert_eq!(arrays[0].len(), 5);
+    assert!(TOP_N_LEVELS_PER_SIDE >= 5);
+}

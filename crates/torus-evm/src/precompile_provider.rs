@@ -11,7 +11,8 @@ use revm::primitives::hardfork::SpecId;
 use revm::primitives::{Address, Bytes};
 
 use torus_core::precompiles::{
-    execute_precompile, execute_precompile_read_only, is_precompile, precompile_gas,
+    execute_precompile_read_only_with_gas, execute_precompile_with_gas, is_precompile,
+    precompile_gas,
     ALL_PRECOMPILE_ADDRESSES,
 };
 use torus_state::StateDb;
@@ -71,7 +72,9 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for TorusPrecompiles<'_> {
             return self.eth.run(context, inputs);
         }
 
-        // Determine gas cost.
+        // Pre-check the flat schedule cost (the MINIMUM for this id — the
+        // order-book reader may charge more per level returned; that actual
+        // cost is checked after execution below).
         let id_bytes = address.as_slice();
         let id = u16::from_be_bytes([id_bytes[18], id_bytes[19]]);
         let gas_required = precompile_gas(id);
@@ -96,7 +99,7 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for TorusPrecompiles<'_> {
             };
 
             if self.read_only {
-                execute_precompile_read_only(
+                execute_precompile_read_only_with_gas(
                     &address,
                     input_bytes,
                     &inputs.caller,
@@ -104,7 +107,7 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for TorusPrecompiles<'_> {
                     self.current_block,
                 )
             } else {
-                execute_precompile(
+                execute_precompile_with_gas(
                     &address,
                     input_bytes,
                     &inputs.caller,
@@ -114,24 +117,33 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for TorusPrecompiles<'_> {
             }
         };
 
-        // Build InterpreterResult.
+        // Build InterpreterResult, charging the DETERMINISTIC actual cost
+        // (level-dependent for getOrderBook, flat otherwise). Insufficient
+        // gas_limit for the actual cost → OOG, output discarded. Reverts
+        // charge the flat schedule cost (pre-checked above).
         // FIX MED-NEW-05: Check gas.record_cost return value instead of discarding it.
         let mut gas = Gas::new(inputs.gas_limit);
-        if !gas.record_cost(gas_required) {
-            return Ok(Some(InterpreterResult::new_oog(inputs.gas_limit)));
-        }
-
         match result {
-            Ok(output) => Ok(Some(InterpreterResult {
-                result: InstructionResult::Return,
-                output: Bytes::from(output),
-                gas,
-            })),
-            Err(e) => Ok(Some(InterpreterResult {
-                result: InstructionResult::Revert,
-                output: Bytes::from(format!("{e}").into_bytes()),
-                gas,
-            })),
+            Ok(output) => {
+                if !gas.record_cost(output.gas_used) {
+                    return Ok(Some(InterpreterResult::new_oog(inputs.gas_limit)));
+                }
+                Ok(Some(InterpreterResult {
+                    result: InstructionResult::Return,
+                    output: Bytes::from(output.data),
+                    gas,
+                }))
+            }
+            Err(e) => {
+                if !gas.record_cost(gas_required) {
+                    return Ok(Some(InterpreterResult::new_oog(inputs.gas_limit)));
+                }
+                Ok(Some(InterpreterResult {
+                    result: InstructionResult::Revert,
+                    output: Bytes::from(format!("{e}").into_bytes()),
+                    gas,
+                }))
+            }
         }
     }
 

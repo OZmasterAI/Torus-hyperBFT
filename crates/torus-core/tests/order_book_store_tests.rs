@@ -186,13 +186,18 @@ fn cancel_after_save_deletes_row() {
     let ra = book.place_order(limit(1, true, 100, 5), addr(1), 10);
     book.place_order(limit(1, true, 99, 5), addr(2), 11);
     save_book_delta(&db, &mut book).unwrap();
-    assert_eq!(cf_dump(&db).len(), 3, "header + 2 rows");
+    assert_eq!(
+        cf_dump(&db).len(),
+        5,
+        "header + 2 order rows + 2 level rows"
+    );
 
     book.cancel_order(ra.order_id).unwrap();
     let stats = save_book_delta(&db, &mut book).unwrap();
     assert_eq!(stats.rows_deleted, 1);
+    assert_eq!(stats.levels_deleted, 1, "emptied level row deleted too");
     let dump = cf_dump(&db);
-    assert_eq!(dump.len(), 2, "header + 1 row after delete");
+    assert_eq!(dump.len(), 3, "header + 1 order row + 1 level row");
     assert!(!dump
         .iter()
         .any(|(k, _)| k == &order_row_key(1, ra.order_id).to_vec()));

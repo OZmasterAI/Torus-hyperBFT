@@ -718,3 +718,46 @@ fn consensus_meta_memtable_flushes_early() {
         "cf_consensus_meta memtable never flushed: {memtable} bytes retained of {written} written — write buffer too large for a hot rewrite-heavy CF"
     );
 }
+
+// ============================================================================
+// Bounded prefix iteration (0x0800 top-N gas round)
+// ============================================================================
+
+#[test]
+fn iterate_cf_bounded_matches_truncated_full_scan() {
+    use torus_state::StateBackend;
+    let (db, _dir) = temp_db();
+    let cf = torus_state::cf::CF_NATIVE_ORDER_BOOKS;
+
+    // Two disjoint prefixes, interleaved insert order.
+    for i in 0..12u8 {
+        db.put_cf_raw(cf, &[0xAA, i], &[i]).unwrap();
+        db.put_cf_raw(cf, &[0xBB, i], &[i]).unwrap();
+    }
+
+    let full = db.iterate_cf(cf, Some(&[0xAA])).unwrap();
+    assert_eq!(full.len(), 12);
+
+    // limit < total: exactly the first `limit` of the full scan.
+    let bounded = db.iterate_cf_bounded(cf, Some(&[0xAA]), 5).unwrap();
+    assert_eq!(bounded, full[..5].to_vec());
+
+    // limit > total: everything under the prefix, nothing from 0xBB.
+    let all = db.iterate_cf_bounded(cf, Some(&[0xAA]), 100).unwrap();
+    assert_eq!(all, full);
+
+    // limit 0: empty.
+    assert!(db.iterate_cf_bounded(cf, Some(&[0xAA]), 0).unwrap().is_empty());
+
+    // No-prefix mode also stops early.
+    let first3 = db.iterate_cf_bounded(cf, None, 3).unwrap();
+    assert_eq!(first3, db.iterate_cf(cf, None).unwrap()[..3].to_vec());
+
+    // Overlay (trait default): pending upsert + tombstone respected.
+    let overlay = torus_state::NativeStateOverlay::new(db);
+    overlay.put_cf_raw(cf, &[0xAA, 0x00], &[99]).unwrap(); // shadow first key
+    overlay.delete_cf_raw(cf, &[0xAA, 0x01]).unwrap(); // tombstone second
+    let ov = overlay.iterate_cf_bounded(cf, Some(&[0xAA]), 2).unwrap();
+    assert_eq!(ov[0], (vec![0xAA, 0x00], vec![99]), "overlay upsert wins");
+    assert_eq!(ov[1].0, vec![0xAA, 0x02], "tombstoned key skipped");
+}

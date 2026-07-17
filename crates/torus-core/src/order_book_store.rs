@@ -46,6 +46,50 @@ use crate::order_book::{Order, OrderBook};
 pub const ROW_TAG_HEADER: u8 = 0x00;
 /// Key-tag byte for per-order rows.
 pub const ROW_TAG_ORDER: u8 = 0x01;
+/// Key-tag byte for price-level aggregate rows (0x0800 top-N gas round).
+pub const ROW_TAG_LEVEL: u8 = 0x02;
+
+/// Side byte inside a level-row key. Bids sort before asks.
+pub const SIDE_TAG_BID: u8 = 0x00;
+pub const SIDE_TAG_ASK: u8 = 0x01;
+
+/// Canonical side byte for level-row keys.
+pub const fn side_tag(side: Side) -> u8 {
+    match side {
+        Side::Buy => SIDE_TAG_BID,
+        Side::Sell => SIDE_TAG_ASK,
+    }
+}
+
+/// Order-preserving price encoding for level-row keys: sign-flipped BE i128
+/// (total order for signed prices), bitwise-NOT for bids — so forward
+/// lexicographic iteration walks BOTH sides best-first (bids high→low,
+/// asks low→high).
+fn price_enc(tag: u8, raw_price: i128) -> [u8; 16] {
+    let mut b = ((raw_price as u128) ^ (1u128 << 127)).to_be_bytes();
+    if tag == SIDE_TAG_BID {
+        for byte in &mut b {
+            *byte = !*byte;
+        }
+    }
+    b
+}
+
+/// Level row key from raw journal parts: `market_id(8 BE) ‖ 0x02 ‖ side(1) ‖
+/// price_enc(16)` (26 bytes — length-disjoint from 8/9/25 layouts).
+fn level_row_key_tagged(market_id: MarketId, tag: u8, raw_price: i128) -> [u8; 26] {
+    let mut k = [0u8; 26];
+    k[..8].copy_from_slice(&market_id.to_be_bytes());
+    k[8] = ROW_TAG_LEVEL;
+    k[9] = tag;
+    k[10..].copy_from_slice(&price_enc(tag, raw_price));
+    k
+}
+
+/// Level row key: `market_id(8 BE) ‖ 0x02 ‖ side(1) ‖ price_enc(16)`.
+pub fn level_row_key(market_id: MarketId, side: Side, price: FixedPoint) -> [u8; 26] {
+    level_row_key_tagged(market_id, side_tag(side), price.raw())
+}
 
 /// Header row key: `market_id(8 BE) ‖ 0x00` (9 bytes — length-disjoint from
 /// both legacy keys (8) and order rows (25), so misreads are impossible).
@@ -78,6 +122,9 @@ fn key_hex(key: &[u8]) -> String {
 enum Row {
     Header(MarketId, Vec<u8>),
     Order(MarketId, OrderId, Vec<u8>),
+    /// Price-level aggregate row — derived read-side data; the book is
+    /// assembled from order rows only, so loads skip these.
+    Level,
 }
 
 /// Classify a raw CF entry, failing LOUDLY on legacy monolithic keys and on
@@ -96,6 +143,7 @@ fn classify(key: &[u8], value: Vec<u8>) -> Result<Row, CoreError> {
             u128::from_be_bytes(key[9..25].try_into().unwrap()),
             value,
         )),
+        26 if key[8] == ROW_TAG_LEVEL => Ok(Row::Level),
         _ => Err(CoreError::CorruptOrderBookRow {
             key_hex: key_hex(key),
         }),
@@ -145,6 +193,7 @@ pub fn load_book<B: StateBackend>(
                 }
                 orders.push((seq, order));
             }
+            Row::Level => {}
         }
     }
     match header {
@@ -177,6 +226,7 @@ pub fn load_all_books<B: StateBackend>(
                 }
                 grouped.entry(mid).or_default().1.push((seq, order));
             }
+            Row::Level => {}
         }
     }
     let mut books = HashMap::with_capacity(grouped.len());
@@ -189,6 +239,67 @@ pub fn load_all_books<B: StateBackend>(
         books.insert(mid, assemble(mid, h, orders)?);
     }
     Ok(books)
+}
+
+/// `(bids, asks)` as `(price, total_qty)` pairs, best-first per side.
+pub type LevelPairs = (
+    Vec<(FixedPoint, FixedPoint)>,
+    Vec<(FixedPoint, FixedPoint)>,
+);
+
+/// Best `n` price levels per side via the aggregate level rows — O(n) point
+/// reads per side (bounded scan, no full-book load), best-first on both
+/// sides (bids high→low, asks low→high). Returns `(bids, asks)` as
+/// `(price, total_qty)` pairs. Absent market / empty book → empty vecs; a
+/// LEGACY monolithic value fails loudly like every other load path.
+pub fn load_top_levels<B: StateBackend>(
+    state: &B,
+    market_id: MarketId,
+    n: usize,
+) -> Result<LevelPairs, CoreError> {
+    let read_side = |tag: u8| -> Result<Vec<(FixedPoint, FixedPoint)>, CoreError> {
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        let mut prefix = [0u8; 10];
+        prefix[..8].copy_from_slice(&market_id.to_be_bytes());
+        prefix[8] = ROW_TAG_LEVEL;
+        prefix[9] = tag;
+        let entries = state.iterate_cf_bounded(CF_NATIVE_ORDER_BOOKS, Some(&prefix), n)?;
+        let mut levels = Vec::with_capacity(entries.len());
+        for (key, value) in entries {
+            if key.len() != 26 || value.len() != 16 {
+                return Err(CoreError::CorruptOrderBookRow {
+                    key_hex: key_hex(&key),
+                });
+            }
+            let mut enc: [u8; 16] = key[10..26].try_into().unwrap();
+            if tag == SIDE_TAG_BID {
+                for b in &mut enc {
+                    *b = !*b;
+                }
+            }
+            let price = (u128::from_be_bytes(enc) ^ (1u128 << 127)) as i128;
+            let qty = i128::from_be_bytes(value.as_slice().try_into().unwrap());
+            levels.push((FixedPoint::from_raw(price), FixedPoint::from_raw(qty)));
+        }
+        Ok(levels)
+    };
+    let bids = read_side(SIDE_TAG_BID)?;
+    let asks = read_side(SIDE_TAG_ASK)?;
+    if bids.is_empty() && asks.is_empty() {
+        // Loud legacy check: a pre-round monolithic value at the bare 8-byte
+        // key MUST not be silently reported as an empty book.
+        if state
+            .get_cf_raw(CF_NATIVE_ORDER_BOOKS, &market_id.to_be_bytes())?
+            .is_some()
+        {
+            return Err(CoreError::LegacyOrderBookValue {
+                key_hex: key_hex(&market_id.to_be_bytes()),
+            });
+        }
+    }
+    Ok((bids, asks))
 }
 
 /// Read ONLY a market's `last_trade_price` (header decode; no rows touched).
@@ -219,11 +330,15 @@ pub fn load_last_trade_price<B: StateBackend>(
 }
 
 /// Stats returned by the save paths (telemetry / test hooks).
+/// `rows_*` count ORDER rows; level aggregate rows are counted separately
+/// (`levels_*`). `bytes_written` covers header + order rows + level rows.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SaveStats {
     pub rows_written: usize,
     pub rows_deleted: usize,
     pub bytes_written: u64,
+    pub levels_written: usize,
+    pub levels_deleted: usize,
 }
 
 /// Persist a book's delta since the last save: the header plus one
@@ -253,6 +368,23 @@ pub fn save_book_delta<B: StateBackend>(
             }
         }
     }
+
+    // Price-level aggregate rows: one upsert/delete per level TOUCHED this
+    // block. Same O(touched) shape as the order rows above.
+    for ((tag, raw_price), op) in book.take_level_ops() {
+        let key = level_row_key_tagged(market_id, tag, raw_price);
+        match op {
+            Some(qty) => {
+                stats.levels_written += 1;
+                stats.bytes_written += 16;
+                state.put_cf_raw(CF_NATIVE_ORDER_BOOKS, &key, &qty.raw().to_be_bytes())?;
+            }
+            None => {
+                stats.levels_deleted += 1;
+                state.delete_cf_raw(CF_NATIVE_ORDER_BOOKS, &key)?;
+            }
+        }
+    }
     Ok(stats)
 }
 
@@ -271,9 +403,15 @@ pub fn save_book_full<B: StateBackend>(
     let prefix = market_id.to_be_bytes();
     let existing = state.iterate_cf(CF_NATIVE_ORDER_BOOKS, Some(&prefix))?;
     let ops = book.full_row_ops();
+    let level_ops = book.full_level_ops();
     let keep: std::collections::HashSet<Vec<u8>> = ops
         .iter()
         .map(|(id, _)| order_row_key(market_id, *id).to_vec())
+        .chain(
+            level_ops
+                .iter()
+                .map(|((tag, raw), _)| level_row_key_tagged(market_id, *tag, *raw).to_vec()),
+        )
         .chain(std::iter::once(header_key(market_id).to_vec()))
         .collect();
     for (key, _) in existing {
@@ -293,6 +431,15 @@ pub fn save_book_full<B: StateBackend>(
             CF_NATIVE_ORDER_BOOKS,
             &order_row_key(market_id, order_id),
             &bytes,
+        )?;
+    }
+    for ((tag, raw_price), qty) in level_ops {
+        stats.levels_written += 1;
+        stats.bytes_written += 16;
+        state.put_cf_raw(
+            CF_NATIVE_ORDER_BOOKS,
+            &level_row_key_tagged(market_id, tag, raw_price),
+            &qty.raw().to_be_bytes(),
         )?;
     }
     Ok(stats)
