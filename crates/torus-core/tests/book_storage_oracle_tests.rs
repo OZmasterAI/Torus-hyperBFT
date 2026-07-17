@@ -49,21 +49,16 @@ fn market(market_id: u64, is_buy: bool, qty: i64) -> PlaceOrderParams {
 
 /// Persist a book through the PRODUCTION storage codec and reload it.
 /// This helper is the ONLY format-coupled code in this file: it follows
-/// whatever `save_order_books` / the exec load path actually do — today a
-/// monolithic borsh-`OrderBook` value in CF_NATIVE_ORDER_BOOKS.
+/// whatever `save_order_books` / the exec load path actually do — since the
+/// deep-book round, per-order rows via `torus_core::order_book_store`.
+/// (The assertions below are UNCHANGED from the monolithic-blob baseline.)
 fn persist_reload(book: &mut OrderBook) -> OrderBook {
-    use borsh::BorshDeserialize;
     let dir = tempfile::tempdir().expect("tempdir");
     let db = torus_state::StateDb::open(dir.path()).expect("open db");
-    let key = book.market_id.to_be_bytes();
-    let blob = borsh::to_vec(book).expect("serialize book");
-    db.put_cf_raw(torus_state::cf::CF_NATIVE_ORDER_BOOKS, &key, &blob)
-        .expect("persist book");
-    let bytes = db
-        .get_cf_raw(torus_state::cf::CF_NATIVE_ORDER_BOOKS, &key)
-        .expect("read book")
-        .expect("book present");
-    OrderBook::try_from_slice(&bytes).expect("reload book")
+    torus_core::order_book_store::save_book_full(&db, book).expect("save book");
+    torus_core::order_book_store::load_book(&db, book.market_id)
+        .expect("load book")
+        .expect("book present")
 }
 
 /// Debug-render the behavioral content of a PlaceResult (status, fills,

@@ -173,26 +173,28 @@ fn lockbox_insufficient_native_balance() {
 
 #[test]
 fn order_book_reader_get_order_book() {
+    use torus_core::order_book::OrderBook;
+    use torus_types::{OrderType, PlaceOrderParams, TimeInForce};
+
     let (_dir, db) = setup();
 
-    // Populate order book snapshot
-    let snapshot = OrderBookSnapshot {
-        bids: vec![
-            PriceLevel {
-                price: fp(50_000),
-                quantity: fp(10),
-            },
-            PriceLevel {
-                price: fp(49_900),
-                quantity: fp(20),
-            },
-        ],
-        asks: vec![PriceLevel {
-            price: fp(50_100),
-            quantity: fp(5),
-        }],
+    // Populate a real book producing the levels 50_000×10, 49_900×20 / 50_100×5
+    // and persist it through the production per-order-row store.
+    let limit = |is_buy: bool, price: i64, qty: i64| PlaceOrderParams {
+        market_id: 1,
+        is_buy,
+        price: fp(price),
+        quantity: fp(qty),
+        order_type: OrderType::Limit,
+        time_in_force: TimeInForce::GTC,
+        reduce_only: false,
+        client_order_id: None,
     };
-    write_order_book_snapshot(&db, 1, &snapshot).unwrap();
+    let mut book = OrderBook::new(1, fp(100), fp(1));
+    book.place_order(limit(true, 50_000, 10), addr(1), 1);
+    book.place_order(limit(true, 49_900, 20), addr(2), 1);
+    book.place_order(limit(false, 50_100, 5), addr(3), 1);
+    torus_core::order_book_store::save_book_full(&db, &mut book).unwrap();
 
     // Call precompile
     let address = precompile_address(ADDR_ORDER_BOOK_READER);
@@ -225,11 +227,11 @@ fn decode_u128_arrays(output: &[u8], n: usize) -> Vec<Vec<u128>> {
     out
 }
 
-/// CONSENSUS-VISIBLE regression: the reader precompile must decode the format
-/// `save_order_books` actually writes (a borsh-`OrderBook` blob), aggregating
-/// resting orders into price levels. Before the fix it decoded every value as
-/// `OrderBookSnapshot`, so a non-trivial book failed to borsh-decode and this
-/// precompile REVERTED (returned Err). Now it returns the levels.
+/// CONSENSUS-VISIBLE oracle: the reader precompile must decode the format
+/// `save_order_books` actually writes (since the deep-book round: per-order
+/// rows), aggregating resting orders into price levels. The expected level
+/// values are UNCHANGED from the monolithic-blob baseline — only the persist
+/// helper moved to the row store.
 #[test]
 fn order_book_reader_decodes_persisted_orderbook_blob() {
     use torus_core::order_book::OrderBook;
@@ -255,19 +257,13 @@ fn order_book_reader_decodes_persisted_orderbook_blob() {
     book.place_order(limit(false, 101, 4), addr(4), 1);
     book.place_order(limit(false, 102, 1), addr(5), 1);
 
-    // Write the ACTUAL persisted format (a borsh-OrderBook blob), not a snapshot.
-    db.put_cf_raw(
-        torus_state::cf::CF_NATIVE_ORDER_BOOKS,
-        &7u64.to_be_bytes(),
-        &borsh::to_vec(&book).unwrap(),
-    )
-    .unwrap();
+    // Write the ACTUAL persisted format (per-order rows).
+    torus_core::order_book_store::save_book_full(&db, &mut book).unwrap();
 
     let address = precompile_address(ADDR_ORDER_BOOK_READER);
     let input = build_input("getOrderBook(bytes32)", &[encode_market_id(7)]);
-    // Pre-fix this would be Err (borsh decode failure); post-fix it returns data.
     let output = execute_precompile(&address, &input, &addr(0), &db, 100)
-        .expect("real OrderBook blob must decode, not revert");
+        .expect("persisted book rows must decode, not revert");
 
     let arrays = decode_u128_arrays(&output, 4);
     let (bid_prices, bid_qtys, ask_prices, ask_qtys) =
@@ -279,6 +275,43 @@ fn order_book_reader_decodes_persisted_orderbook_blob() {
     // Asks ascending.
     assert_eq!(ask_prices, &[fp(101).raw() as u128, fp(102).raw() as u128]);
     assert_eq!(ask_qtys, &[fp(4).raw() as u128, fp(1).raw() as u128]);
+}
+
+/// Deep-book round: a LEGACY monolithic value (pre-round layout) makes the
+/// reader precompile revert LOUDLY — it must never be silently misread as an
+/// empty/partial book.
+#[test]
+fn order_book_reader_reverts_on_legacy_value() {
+    use torus_core::order_book::OrderBook;
+    use torus_types::{OrderType, PlaceOrderParams, TimeInForce};
+
+    let (_dir, db) = setup();
+    let mut legacy = OrderBook::new(9, fp(1), fp(1));
+    legacy.place_order(
+        PlaceOrderParams {
+            market_id: 9,
+            is_buy: true,
+            price: fp(100),
+            quantity: fp(5),
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::GTC,
+            reduce_only: false,
+            client_order_id: None,
+        },
+        addr(1),
+        1,
+    );
+    db.put_cf_raw(
+        torus_state::cf::CF_NATIVE_ORDER_BOOKS,
+        &9u64.to_be_bytes(),
+        &borsh::to_vec(&legacy).unwrap(),
+    )
+    .unwrap();
+
+    let address = precompile_address(ADDR_ORDER_BOOK_READER);
+    let input = build_input("getOrderBook(bytes32)", &[encode_market_id(9)]);
+    let result = execute_precompile(&address, &input, &addr(0), &db, 100);
+    assert!(result.is_err(), "legacy monolithic value must revert loudly");
 }
 
 #[test]

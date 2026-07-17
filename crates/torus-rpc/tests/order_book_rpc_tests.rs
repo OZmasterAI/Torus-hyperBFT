@@ -1,10 +1,9 @@
 //! Integration tests for the `getOrderBook` RPC handler's decode path.
 //!
-//! Regression: `save_order_books` persists a borsh-`OrderBook` blob, but the
-//! handler used to decode every value as `OrderBookSnapshot`, so non-trivial
-//! production books failed to borsh-decode. The handler now decodes `OrderBook`
-//! first (aggregating resting orders into price levels) and falls back to the
-//! historical `OrderBookSnapshot` layout.
+//! Deep-book storage round: the handler reconstructs books from PER-ORDER
+//! ROWS (`torus_core::order_book_store`). A pre-round monolithic value
+//! (either historical format) must error LOUDLY — the CF no longer holds
+//! whole-book blobs, and silently misreading one would hide real book state.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -71,16 +70,11 @@ async fn start_server(
     .unwrap()
 }
 
-fn write_raw(state: &StateDb, market_id: u64, bytes: &[u8]) {
-    state
-        .put_cf_raw(CF_NATIVE_ORDER_BOOKS, &market_id.to_be_bytes(), bytes)
-        .unwrap();
-}
-
-/// The value `save_order_books` actually writes — a borsh-`OrderBook` blob with
-/// resting orders — decodes into correctly-ordered, quantity-summed price levels.
+/// The rows `save_order_books` actually writes decode into correctly-ordered,
+/// quantity-summed price levels. (Assertions unchanged from the monolithic
+/// baseline; only the persist path moved to the row store.)
 #[tokio::test]
-async fn get_order_book_decodes_persisted_orderbook_blob() {
+async fn get_order_book_decodes_persisted_book_rows() {
     let (_dir, state, mempool, executor) = setup();
 
     // Build a non-trivial book: two bids at the same price (must sum) + one lower
@@ -91,7 +85,7 @@ async fn get_order_book_decodes_persisted_orderbook_blob() {
     book.place_order(limit(1, true, 99, 2), torus_types::Address::from([3; 20]), 1);
     book.place_order(limit(1, false, 101, 4), torus_types::Address::from([4; 20]), 1);
     book.place_order(limit(1, false, 102, 1), torus_types::Address::from([5; 20]), 1);
-    write_raw(&state, 1, &borsh::to_vec(&book).unwrap());
+    torus_core::order_book_store::save_book_full(&state, &mut book).unwrap();
 
     let (handle, addr) = start_server(state, mempool, executor).await;
     let client = HttpClientBuilder::default()
@@ -119,38 +113,53 @@ async fn get_order_book_decodes_persisted_orderbook_blob() {
     handle.stop().unwrap();
 }
 
-/// A legacy `OrderBookSnapshot` blob still decodes via the fallback path.
+/// LEGACY monolithic values (both historical formats) now error LOUDLY —
+/// they are never silently decoded or reported as an empty book.
 #[tokio::test]
-async fn get_order_book_falls_back_to_legacy_snapshot() {
+async fn get_order_book_errors_loudly_on_legacy_values() {
     let (_dir, state, mempool, executor) = setup();
 
+    // Historical format 1: a whole-book borsh-`OrderBook` blob.
+    let mut legacy_book = OrderBook::new(2, fp(1), fp(1));
+    legacy_book.place_order(limit(2, true, 50, 7), torus_types::Address::from([1; 20]), 1);
+    state
+        .put_cf_raw(
+            CF_NATIVE_ORDER_BOOKS,
+            &2u64.to_be_bytes(),
+            &borsh::to_vec(&legacy_book).unwrap(),
+        )
+        .unwrap();
+
+    // Historical format 2: an `OrderBookSnapshot` blob (test-only writer era).
     let snapshot = OrderBookSnapshot {
         bids: vec![PriceLevel {
             price: fp(50),
             quantity: fp(7),
         }],
-        asks: vec![PriceLevel {
-            price: fp(60),
-            quantity: fp(9),
-        }],
+        asks: vec![],
     };
-    write_raw(&state, 2, &borsh::to_vec(&snapshot).unwrap());
+    state
+        .put_cf_raw(
+            CF_NATIVE_ORDER_BOOKS,
+            &3u64.to_be_bytes(),
+            &borsh::to_vec(&snapshot).unwrap(),
+        )
+        .unwrap();
 
     let (handle, addr) = start_server(state, mempool, executor).await;
     let client = HttpClientBuilder::default()
         .build(format!("http://{addr}"))
         .unwrap();
-    let ob: RpcOrderBook = client
-        .request("torus_getOrderBook", rpc_params!["2"])
-        .await
-        .unwrap();
 
-    assert_eq!(ob.bids.len(), 1);
-    assert_eq!(ob.bids[0].price, hex_fp(fp(50)));
-    assert_eq!(ob.bids[0].quantity, hex_fp(fp(7)));
-    assert_eq!(ob.asks.len(), 1);
-    assert_eq!(ob.asks[0].price, hex_fp(fp(60)));
-    assert_eq!(ob.asks[0].quantity, hex_fp(fp(9)));
+    for mid in ["2", "3"] {
+        let res: Result<RpcOrderBook, _> = client
+            .request("torus_getOrderBook", rpc_params![mid])
+            .await;
+        assert!(
+            res.is_err(),
+            "market {mid}: legacy monolithic value must error, not decode silently"
+        );
+    }
 
     handle.stop().unwrap();
 }

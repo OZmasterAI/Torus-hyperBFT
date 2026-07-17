@@ -106,12 +106,45 @@ impl TestHarness {
             .unwrap();
     }
 
-    /// Persist an OrderBookSnapshot to CF_NATIVE_ORDER_BOOKS.
+    /// Persist a book with the given price levels to CF_NATIVE_ORDER_BOOKS
+    /// through the production per-order-row store (deep-book round): one
+    /// synthetic resting order per level reproduces the level exactly.
     pub fn persist_order_book(&self, market_id: MarketId, snapshot: &OrderBookSnapshot) {
-        let data = borsh::to_vec(snapshot).unwrap();
-        self.state_db
-            .put_cf_raw(CF_NATIVE_ORDER_BOOKS, &market_id.to_be_bytes(), &data)
-            .unwrap();
+        use torus_core::order_book::OrderBook;
+        use torus_types::{OrderType, PlaceOrderParams, TimeInForce};
+
+        // Finest tick/lot so arbitrary level prices/quantities are accepted.
+        let one_raw = FixedPoint::from_raw(1);
+        let mut book = OrderBook::new(market_id, one_raw, one_raw);
+        let mut place = |is_buy: bool, price: FixedPoint, quantity: FixedPoint, t: u8| {
+            let r = book.place_order(
+                PlaceOrderParams {
+                    market_id,
+                    is_buy,
+                    price,
+                    quantity,
+                    order_type: OrderType::Limit,
+                    time_in_force: TimeInForce::GTC,
+                    reduce_only: false,
+                    client_order_id: None,
+                },
+                Address::from([t; 20]),
+                1,
+            );
+            assert!(
+                matches!(r.status, torus_core::order_book::OrderStatus::Resting),
+                "persist_order_book level must rest (crossed levels?): {:?}",
+                r.status
+            );
+        };
+        // Asks first so bids can never cross into an empty opposing side.
+        for (i, level) in snapshot.asks.iter().enumerate() {
+            place(false, level.price, level.quantity, 0xE0 + i as u8);
+        }
+        for (i, level) in snapshot.bids.iter().enumerate() {
+            place(true, level.price, level.quantity, 0xC0 + i as u8);
+        }
+        torus_core::order_book_store::save_book_full(&self.state_db, &mut book).unwrap();
     }
 
     /// Write an aggregated oracle price directly to CF_NATIVE_ORACLE.

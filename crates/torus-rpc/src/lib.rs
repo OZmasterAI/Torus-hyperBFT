@@ -2039,7 +2039,7 @@ mod tests {
 
     use borsh::BorshSerialize;
     use torus_core::position::{MarginType, NativeBalance, Position, PositionManager};
-    use torus_core::precompiles::{write_order_book_snapshot, OrderBookSnapshot, PriceLevel};
+    use torus_core::order_book_store::save_book_full;
     use torus_state::cf::{CF_NATIVE_MARKETS, CF_NATIVE_TRADES};
     use torus_types::FixedPoint;
 
@@ -2090,30 +2090,27 @@ mod tests {
 
     #[tokio::test]
     async fn torus_get_order_book_with_orders() {
+        use torus_core::order_book::OrderBook;
+        use torus_types::{OrderType, PlaceOrderParams, TimeInForce};
         let (_dir, state, mempool, executor) = setup();
-        let snapshot = OrderBookSnapshot {
-            bids: vec![
-                PriceLevel {
-                    price: fp(50000),
-                    quantity: fp(10),
-                },
-                PriceLevel {
-                    price: fp(49900),
-                    quantity: fp(5),
-                },
-            ],
-            asks: vec![
-                PriceLevel {
-                    price: fp(50100),
-                    quantity: fp(8),
-                },
-                PriceLevel {
-                    price: fp(50200),
-                    quantity: fp(3),
-                },
-            ],
+        // Levels: bids 50000×10, 49900×5; asks 50100×8, 50200×3 — persisted
+        // through the production per-order-row store.
+        let mut book = OrderBook::new(1, fp(100), fp(1));
+        let limit = |is_buy: bool, price: i64, qty: i64| PlaceOrderParams {
+            market_id: 1,
+            is_buy,
+            price: fp(price),
+            quantity: fp(qty),
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::GTC,
+            reduce_only: false,
+            client_order_id: None,
         };
-        write_order_book_snapshot(&state, 1, &snapshot).unwrap();
+        book.place_order(limit(true, 50000, 10), Address::from([0x11; 20]), 1);
+        book.place_order(limit(true, 49900, 5), Address::from([0x12; 20]), 1);
+        book.place_order(limit(false, 50100, 8), Address::from([0x13; 20]), 1);
+        book.place_order(limit(false, 50200, 3), Address::from([0x14; 20]), 1);
+        save_book_full(&state, &mut book).unwrap();
         let (handle, addr) = start_server(state, mempool, executor).await;
         use jsonrpsee::core::client::ClientT;
         let client = jsonrpsee::http_client::HttpClientBuilder::default()
@@ -2437,7 +2434,7 @@ mod tests {
     // ========================================================================
 
     use torus_core::order_book::OrderBook;
-    use torus_state::cf::{CF_NATIVE_ORDER_BOOKS, CF_NATIVE_USER_TRADES};
+    use torus_state::cf::CF_NATIVE_USER_TRADES;
     use torus_types::{OrderType, PlaceOrderParams, Side, TimeInForce};
 
     fn store_order_book_with_orders(
@@ -2462,10 +2459,7 @@ mod tests {
                 1700000000,
             );
         }
-        let data = borsh::to_vec(&book).unwrap();
-        state
-            .put_cf_raw(CF_NATIVE_ORDER_BOOKS, &market_id.to_be_bytes(), &data)
-            .unwrap();
+        torus_core::order_book_store::save_book_full(state, &mut book).unwrap();
     }
 
     fn store_user_trade(
@@ -2656,13 +2650,7 @@ mod tests {
             Address::from([0x22; 20]),
             1700000001,
         );
-        state
-            .put_cf_raw(
-                CF_NATIVE_ORDER_BOOKS,
-                &1u64.to_be_bytes(),
-                &borsh::to_vec(&book).unwrap(),
-            )
-            .unwrap();
+        save_book_full(&state, &mut book).unwrap();
         let (handle, addr) = start_server(state, mempool, executor).await;
         use jsonrpsee::core::client::ClientT;
         let client = jsonrpsee::http_client::HttpClientBuilder::default()
@@ -2809,10 +2797,7 @@ mod tests {
         );
         // Cancel the first order before persisting.
         book.cancel_order(r1.order_id).unwrap();
-        let data = borsh::to_vec(&book).unwrap();
-        state
-            .put_cf_raw(CF_NATIVE_ORDER_BOOKS, &1u64.to_be_bytes(), &data)
-            .unwrap();
+        save_book_full(&state, &mut book).unwrap();
 
         let (handle, addr) = start_server(state, mempool, executor).await;
         use jsonrpsee::core::client::ClientT;
@@ -2871,10 +2856,7 @@ mod tests {
             1700000001,
         );
         // Persist the post-fill book state.
-        let data = borsh::to_vec(&book).unwrap();
-        state
-            .put_cf_raw(CF_NATIVE_ORDER_BOOKS, &1u64.to_be_bytes(), &data)
-            .unwrap();
+        save_book_full(&state, &mut book).unwrap();
 
         let (handle, addr) = start_server(state, mempool, executor).await;
         use jsonrpsee::core::client::ClientT;
@@ -2935,10 +2917,7 @@ mod tests {
                     1_700_000_000 + i as u64,
                 );
             }
-            let data = borsh::to_vec(&book).unwrap();
-            state
-                .put_cf_raw(CF_NATIVE_ORDER_BOOKS, &market_id.to_be_bytes(), &data)
-                .unwrap();
+            save_book_full(&state, &mut book).unwrap();
         }
 
         // Market 3: 101 sell orders — brings the total to 501.
@@ -2959,10 +2938,7 @@ mod tests {
                 1_700_000_000 + i as u64,
             );
         }
-        let data3 = borsh::to_vec(&book3).unwrap();
-        state
-            .put_cf_raw(CF_NATIVE_ORDER_BOOKS, &3u64.to_be_bytes(), &data3)
-            .unwrap();
+        save_book_full(&state, &mut book3).unwrap();
 
         let (handle, addr) = start_server(state, mempool, executor).await;
         use jsonrpsee::core::client::ClientT;

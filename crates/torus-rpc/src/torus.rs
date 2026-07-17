@@ -11,9 +11,7 @@ use jsonrpsee::PendingSubscriptionSink;
 use rocksdb::IteratorMode;
 
 use torus_core::oracle::{OracleConfig, OracleManager};
-use torus_core::order_book::OrderBook;
 use torus_core::position::PositionManager;
-use torus_core::precompiles::OrderBookSnapshot;
 use torus_economics::governance::{GovernanceManager, ProposalStatus, ProposalType};
 use torus_economics::rewards::FeeSplitter;
 use torus_economics::staking::StakingManager;
@@ -24,8 +22,8 @@ use torus_economics::types::{
 };
 use torus_economics::{lerp_bps, PermanentStakeInfo};
 use torus_state::cf::{
-    CF_BLOCK_BODIES, CF_GOVERNANCE_PROPOSALS, CF_NATIVE_MARKETS, CF_NATIVE_ORDER_BOOKS,
-    CF_NATIVE_POSITIONS, CF_NATIVE_TRADES, CF_NATIVE_USER_TRADES, CF_STAKING_PERMANENT,
+    CF_BLOCK_BODIES, CF_GOVERNANCE_PROPOSALS, CF_NATIVE_MARKETS, CF_NATIVE_POSITIONS,
+    CF_NATIVE_TRADES, CF_NATIVE_USER_TRADES, CF_STAKING_PERMANENT,
 };
 use torus_types::FixedPoint;
 
@@ -662,22 +660,13 @@ impl TorusApiServer for RpcState {
 
     async fn get_order_book(&self, market_id: String) -> RpcResult<RpcOrderBook> {
         let mid = parse_u64(&market_id).map_err(ErrorObjectOwned::from)?;
-        let key = mid.to_be_bytes();
 
-        let snapshot = match self.state.get_cf_raw(CF_NATIVE_ORDER_BOOKS, &key) {
-            // Decode in the format `save_order_books` actually writes: a borsh
-            // `OrderBook` blob (native_executor.rs). Aggregate its resting orders
-            // into price levels via `to_snapshot()`. Fall back to the historical
-            // `OrderBookSnapshot` layout for any legacy value still in the CF (the
-            // column family has held both formats). Before this fix the handler
-            // decoded EVERY value as `OrderBookSnapshot`, so non-trivial production
-            // books failed to borsh-decode (~88% error rate under churn).
-            Ok(Some(data)) => match OrderBook::try_from_slice(&data) {
-                Ok(book) => book.to_snapshot(),
-                Err(_) => OrderBookSnapshot::try_from_slice(&data)
-                    .map_err(|e| RpcError::Internal(format!("borsh decode: {e}")))
-                    .map_err(ErrorObjectOwned::from)?,
-            },
+        // Deep-book round: reconstruct the book from its per-order rows
+        // (torus_core::order_book_store) and aggregate into price levels.
+        // A LEGACY monolithic value / corrupt row errors loudly instead of
+        // being misread.
+        let snapshot = match torus_core::order_book_store::load_book(&self.state, mid) {
+            Ok(Some(book)) => book.to_snapshot(),
             Ok(None) => {
                 return Ok(RpcOrderBook {
                     market_id,
@@ -685,7 +674,9 @@ impl TorusApiServer for RpcState {
                     asks: vec![],
                 });
             }
-            Err(e) => return Err(RpcError::State(e).into()),
+            Err(e) => {
+                return Err(RpcError::Internal(format!("order-book load: {e}")).into());
+            }
         };
 
         let bids: Vec<RpcPriceLevel> = snapshot
@@ -1461,26 +1452,15 @@ impl TorusApiServer for RpcState {
     ) -> RpcResult<Vec<RpcOpenOrder>> {
         let trader_addr = parse_address(&trader).map_err(ErrorObjectOwned::from)?;
 
-        let db = self.state.inner();
-        let cf = match db.cf_handle(CF_NATIVE_ORDER_BOOKS) {
-            Some(cf) => cf,
-            None => return Ok(vec![]),
-        };
-
         let mut orders = Vec::new();
 
         if let Some(ref mid_str) = market_id {
-            // Single market: read one OrderBook
+            // Single market: reconstruct one book from its per-order rows.
             let mid = parse_u64(mid_str).map_err(ErrorObjectOwned::from)?;
-            let key = mid.to_be_bytes();
-            if let Some(data) = db
-                .get_cf(cf, key)
-                .map_err(|e| RpcError::Internal(format!("rocksdb: {e}")))
-                .map_err(ErrorObjectOwned::from)?
-            {
-                let book = OrderBook::try_from_slice(&data)
-                    .map_err(|e| RpcError::Internal(format!("borsh decode order book: {e}")))
-                    .map_err(ErrorObjectOwned::from)?;
+            let book = torus_core::order_book_store::load_book(&self.state, mid)
+                .map_err(|e| RpcError::Internal(format!("order-book load: {e}")))
+                .map_err(ErrorObjectOwned::from)?;
+            if let Some(book) = book {
                 for order in book.orders_for_trader(&trader_addr) {
                     if orders.len() >= 500 {
                         break;
@@ -1489,26 +1469,17 @@ impl TorusApiServer for RpcState {
                 }
             }
         } else {
-            // All markets: iterate CF_NATIVE_ORDER_BOOKS
-            let iter = db.iterator_cf(cf, IteratorMode::Start);
-            for item in iter {
-                if orders.len() >= 500 {
-                    break;
-                }
-                let (key, value) = item
-                    .map_err(|e| RpcError::Internal(format!("rocksdb: {e}")))
-                    .map_err(ErrorObjectOwned::from)?;
-                if key.len() != 8 {
-                    continue;
-                }
-                let mid = u64::from_be_bytes(key[..8].try_into().unwrap());
-                let book = match OrderBook::try_from_slice(&value) {
-                    Ok(b) => b,
-                    Err(_) => continue,
-                };
-                for order in book.orders_for_trader(&trader_addr) {
+            // All markets, ascending market id (the CF iteration order the
+            // monolithic layout used — keeps the 500-order cap deterministic).
+            let books = torus_core::order_book_store::load_all_books(&self.state)
+                .map_err(|e| RpcError::Internal(format!("order-book load: {e}")))
+                .map_err(ErrorObjectOwned::from)?;
+            let mut mids: Vec<u64> = books.keys().copied().collect();
+            mids.sort_unstable();
+            'outer: for mid in mids {
+                for order in books[&mid].orders_for_trader(&trader_addr) {
                     if orders.len() >= 500 {
-                        break;
+                        break 'outer;
                     }
                     orders.push(order_to_rpc(order, mid));
                 }
@@ -1575,17 +1546,12 @@ impl TorusApiServer for RpcState {
             Err(_) => (FixedPoint::ZERO, FixedPoint::ZERO, 0),
         };
 
-        // Last trade price from the order book
-        let last_trade_price = match self
-            .state
-            .get_cf_raw(CF_NATIVE_ORDER_BOOKS, &mid.to_be_bytes())
-        {
-            Ok(Some(data)) => OrderBook::try_from_slice(&data)
-                .ok()
-                .and_then(|book| book.last_trade_price())
-                .unwrap_or(FixedPoint::ZERO),
-            _ => FixedPoint::ZERO,
-        };
+        // Last trade price from the book header row (per-order-row layout:
+        // no rows are touched). Legacy/corrupt values error loudly.
+        let last_trade_price = torus_core::order_book_store::load_last_trade_price(&self.state, mid)
+            .map_err(|e| RpcError::Internal(format!("order-book header: {e}")))
+            .map_err(ErrorObjectOwned::from)?
+            .unwrap_or(FixedPoint::ZERO);
 
         Ok(RpcMarkPrice {
             market_id,
