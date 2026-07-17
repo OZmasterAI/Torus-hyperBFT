@@ -172,6 +172,11 @@ pub mod types;
 
 pub(crate) mod implementation;
 
+/// Observability seam for the body-dissemination wedge — a monotonic count of
+/// body/justify fetch retry-budget exhaustions (fell back to sync). The node
+/// layer polls this into the `torus_body_fetch_exhaustions` Prometheus gauge.
+pub use implementation::body_fetch_exhaustions;
+
 pub(crate) mod sequence_flow;
 
 pub(crate) mod roles;

@@ -247,6 +247,29 @@ pub const NATIVE_BLOCK_BYTES_CAP: usize = 6_000_000;
 /// value (same doctrine as the order-cap per-batch floor).
 pub const NATIVE_BLOCK_BYTES_CAP_FLOOR: usize = 1_000_000;
 
+/// Hard CEILING on the effective native block bytes cap (12 MB) — the
+/// DISSEMINATION ceiling. A committed block's body must be movable over the
+/// widest recovery path, the `/torus/block-data/1.0` fetch/sync protocol, whose
+/// receive codec (`torus_network::caps::MAX_BLOCK_DATA_MSG_SIZE` = 16 MB) is
+/// zstd-decompress bomb-guarded: a frame whose RAW (decompressed) `Block`
+/// exceeds 16 MB fails at `codec.rs` decompress with capacity = the cap, so the
+/// response is structurally unreadable on EVERY peer and EVERY retry. When the
+/// proposer packs bodies past that ceiling the header-first body fetch exhausts
+/// its 9 retries → "falling back to sync" → sync uses the SAME 16 MB codec →
+/// the chain WEDGES on a cliff (endurance L0: bs400 rate15 cross packed a
+/// ~30 MB block at height 383 and stalled in ~30 s).
+///
+/// 12 MB leaves ~4 MB headroom under the 16 MB codec for block framing
+/// (header + justify/QC + borsh overhead) so the whole encoded `Block` stays
+/// well inside the decompress bound. This is the missing rung of the
+/// `torus_network::caps` size ladder: the mempool's block-byte budget was never
+/// asserted against the block-data codec, so a config raise (compose set 30 MB)
+/// silently produced undisseminatable blocks. Enforced here regardless of env —
+/// no `TORUS_NATIVE_BLOCK_BYTES_CAP` value can wedge dissemination. The
+/// cross-crate invariant `NATIVE_BLOCK_BYTES_CAP_CEILING < MAX_BLOCK_DATA_MSG_SIZE`
+/// is test-asserted in `torus-node` (both crates visible there).
+pub const NATIVE_BLOCK_BYTES_CAP_CEILING: usize = 12 * 1024 * 1024; // 12 MB
+
 /// Resolve the effective native block bytes cap from a raw env value (pure —
 /// no `OnceLock`, no `std::env` read — so parse/clamp/fallback is unit-testable
 /// without process-global state). `native_block_bytes_cap` is the cached,
@@ -254,7 +277,9 @@ pub const NATIVE_BLOCK_BYTES_CAP_FLOOR: usize = 1_000_000;
 ///
 /// Policy: parse `raw`; absent/unparseable falls back to the compiled default
 /// (a typo never silently shrinks blocks). Values below
-/// [`NATIVE_BLOCK_BYTES_CAP_FLOOR`] are clamped up + WARN.
+/// [`NATIVE_BLOCK_BYTES_CAP_FLOOR`] are clamped up + WARN; values above
+/// [`NATIVE_BLOCK_BYTES_CAP_CEILING`] are clamped DOWN + WARN (an over-large
+/// budget produces blocks the block-data fetch/sync path cannot move → wedge).
 fn resolve_block_bytes_cap(raw: Option<String>) -> usize {
     let parsed = raw
         .as_deref()
@@ -268,6 +293,16 @@ fn resolve_block_bytes_cap(raw: Option<String>) -> usize {
              selection; clamping to the floor"
         );
         return NATIVE_BLOCK_BYTES_CAP_FLOOR;
+    }
+    if parsed > NATIVE_BLOCK_BYTES_CAP_CEILING {
+        tracing::warn!(
+            requested = parsed,
+            ceiling = NATIVE_BLOCK_BYTES_CAP_CEILING,
+            "TORUS_NATIVE_BLOCK_BYTES_CAP above the dissemination ceiling would pack \
+             blocks the block-data fetch/sync path cannot move (>16 MB decompress \
+             bound) and WEDGE consensus; clamping to the ceiling"
+        );
+        return NATIVE_BLOCK_BYTES_CAP_CEILING;
     }
     parsed
 }
@@ -464,12 +499,40 @@ mod tests {
     }
 
     #[test]
-    fn bytes_cap_env_overrides() {
-        // The diagnostic-proven devnet value: 30 MB.
+    fn bytes_cap_env_overrides_within_band() {
+        // A value inside [floor, ceiling] is honored verbatim (e.g. 8 MB).
+        assert_eq!(
+            resolve_block_bytes_cap(Some((8 * 1024 * 1024).to_string())),
+            8 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn bytes_cap_above_ceiling_clamps_down() {
+        // The endurance-L0 devnet value (30 MB) exceeds what the block-data
+        // fetch/sync codec (16 MB decompress bound) can move → it MUST clamp to
+        // the dissemination ceiling, not pass through and wedge the chain.
         assert_eq!(
             resolve_block_bytes_cap(Some("31457280".to_string())),
-            31_457_280
+            NATIVE_BLOCK_BYTES_CAP_CEILING
         );
+        // One byte over the ceiling clamps; exactly at the ceiling is honored.
+        assert_eq!(
+            resolve_block_bytes_cap(Some((NATIVE_BLOCK_BYTES_CAP_CEILING + 1).to_string())),
+            NATIVE_BLOCK_BYTES_CAP_CEILING
+        );
+        assert_eq!(
+            resolve_block_bytes_cap(Some(NATIVE_BLOCK_BYTES_CAP_CEILING.to_string())),
+            NATIVE_BLOCK_BYTES_CAP_CEILING
+        );
+    }
+
+    #[test]
+    fn bytes_cap_ceiling_ladder_is_sane() {
+        // Floor < compiled default < ceiling — the band is non-degenerate and
+        // the shipped default stays comfortably inside it.
+        assert!(NATIVE_BLOCK_BYTES_CAP_FLOOR < NATIVE_BLOCK_BYTES_CAP);
+        assert!(NATIVE_BLOCK_BYTES_CAP < NATIVE_BLOCK_BYTES_CAP_CEILING);
     }
 
     #[test]

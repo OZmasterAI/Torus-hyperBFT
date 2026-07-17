@@ -1974,6 +1974,7 @@ impl<N: Network> HotStuff<N> {
                     MAX_BODY_RETRIES_TOTAL,
                     hash
                 );
+                BODY_FETCH_EXHAUSTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 expired.push(*hash);
                 continue;
             }
@@ -2129,6 +2130,7 @@ impl<N: Network> HotStuff<N> {
                     MAX_BODY_RETRIES_TOTAL,
                     hash
                 );
+                BODY_FETCH_EXHAUSTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 expired.push(*hash);
                 continue;
             }
@@ -2233,6 +2235,24 @@ impl<N: Network> HotStuff<N> {
         }
         Ok(())
     }
+}
+
+/// Process-global count of body/justify fetches that exhausted the full retry
+/// budget and fell back to sync. This is the body-dissemination WEDGE signal:
+/// a healthy chain sits at ~0; a sustained non-zero rate means some block body
+/// cannot be moved by the fetch path (e.g. it exceeds the `/torus/block-data`
+/// codec size bound) — the endurance-L0 cliff. hotstuff_rs carries no telemetry
+/// dependency, so this is a dependency-free atomic the node layer polls into a
+/// Prometheus gauge (`torus_body_fetch_exhaustions`). Read via
+/// [`body_fetch_exhaustions`].
+pub(crate) static BODY_FETCH_EXHAUSTIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Monotonic count of body/justify fetch retry-budget exhaustions (fell back to
+/// sync) since process start. Observability seam for the body-dissemination
+/// wedge; polled by the node into `torus_body_fetch_exhaustions`.
+pub fn body_fetch_exhaustions() -> u64 {
+    BODY_FETCH_EXHAUSTIONS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Cadence of body-fetch re-requests for a stale pending header. S391: was

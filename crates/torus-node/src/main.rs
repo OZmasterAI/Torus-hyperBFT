@@ -1082,6 +1082,11 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 interval.tick().await;
                 let size = torus_state::dir_size_bytes(&data_dir);
                 m.db_size_bytes.set(size as i64);
+                // Body-dissemination wedge signal: surface hotstuff's internal
+                // fetch-exhaustion counter (no telemetry dep in that crate) as a
+                // Prometheus gauge so testnet alerts on the cliff, not just logs.
+                m.body_fetch_exhaustions
+                    .set(hotstuff_rs::hotstuff::body_fetch_exhaustions() as i64);
                 for cf_name in torus_state::cf::ALL_CF_NAMES {
                     let Some(cf) = db.cf_handle(cf_name) else {
                         continue;
@@ -1126,6 +1131,37 @@ mod hex {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    /// Cross-crate dissemination invariant (the endurance-L0 body wedge):
+    /// the mempool's per-block BYTE budget ceiling must stay strictly under the
+    /// `/torus/block-data` fetch/sync receive codec cap. If a proposer can pack
+    /// a block body larger than that codec's zstd-decompress bound, the
+    /// header-first body fetch is structurally unreadable on every peer and
+    /// every retry → "body fetch exhausted 9 retries → falling back to sync" →
+    /// consensus wedge (bs400 rate15 cross, height 383, ~30 s). These two
+    /// constants live in sibling crates that don't depend on each other, so this
+    /// is the ONE place the ladder rung can be asserted. Keep a healthy margin
+    /// for block framing (header + justify/QC + borsh overhead).
+    #[test]
+    fn block_bytes_ceiling_under_block_data_codec() {
+        use torus_mempool::rate_limit::NATIVE_BLOCK_BYTES_CAP_CEILING;
+        use torus_network::caps::MAX_BLOCK_DATA_MSG_SIZE;
+        assert!(
+            NATIVE_BLOCK_BYTES_CAP_CEILING < MAX_BLOCK_DATA_MSG_SIZE,
+            "block bytes ceiling {} must stay under block-data codec cap {} \
+             (else the proposer can produce undisseminatable blocks and wedge)",
+            NATIVE_BLOCK_BYTES_CAP_CEILING,
+            MAX_BLOCK_DATA_MSG_SIZE
+        );
+        // Framing headroom: the encoded Block carries more than just bodies
+        // (header, justify/QC, borsh length prefixes). Require >= 2 MiB slack so
+        // a body-cap-sized block's whole encoding stays inside the decompress
+        // bound with room to spare.
+        assert!(
+            MAX_BLOCK_DATA_MSG_SIZE - NATIVE_BLOCK_BYTES_CAP_CEILING >= 2 * 1024 * 1024,
+            "insufficient framing headroom between body ceiling and codec cap"
+        );
+    }
 
     /// P2 item 6: TORUS_EXEC_TRUST_CACHE must parse the usual boolean spellings
     /// and reject garbage (None → keep the CLI value, i.e. current behavior).

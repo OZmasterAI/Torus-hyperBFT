@@ -46,6 +46,13 @@ pub struct Metrics {
     // Database metrics
     pub db_size_bytes: Gauge,
 
+    /// Body-dissemination WEDGE signal: monotonic count of body/justify fetch
+    /// retry-budget exhaustions (fell back to sync). Healthy ~0; a sustained
+    /// climb means some block body cannot be moved by the fetch path (e.g. it
+    /// exceeds the block-data codec size bound — endurance-L0 cliff). Polled
+    /// from `hotstuff_rs::hotstuff::body_fetch_exhaustions()`.
+    pub body_fetch_exhaustions: Gauge,
+
     // Epoch metrics
     pub epoch_number: Gauge,
     pub validator_set_size: Gauge,
@@ -521,6 +528,13 @@ impl Metrics {
             "torus_db_size_bytes",
             "Total RocksDB data directory size in bytes",
             db_size_bytes.clone(),
+        );
+
+        let body_fetch_exhaustions = Gauge::default();
+        registry.register(
+            "torus_body_fetch_exhaustions",
+            "Monotonic count of body/justify fetch retry-budget exhaustions (fell back to sync) — the body-dissemination wedge signal",
+            body_fetch_exhaustions.clone(),
         );
 
         let epoch_number = Gauge::default();
@@ -1348,6 +1362,7 @@ impl Metrics {
             mempool_native_size,
             peers_connected,
             db_size_bytes,
+            body_fetch_exhaustions,
             epoch_number,
             validator_set_size,
             orders_matched,

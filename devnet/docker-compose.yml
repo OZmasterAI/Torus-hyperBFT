@@ -62,9 +62,32 @@ services:
       # values can never fork the chain. SHIPPED DEFAULTS ARE UNCHANGED (action 100,
       # orders 50k, bytes 6 MB in rate_limit.rs): WAN safety of larger blocks is
       # UNPROVEN, so only this loopback compose opts in. Overridable per leg.
+      #
+      # BYTES CAP LOWERED 30 MB -> 2 MB (body-dissemination wedge, endurance L0).
+      # TWO failure layers this guards:
+      #   (1) STRUCTURAL: >16 MB blocks cannot be moved by the /torus/block-data
+      #       fetch/sync codec (16 MB zstd-decompress bound) -> permanent hard
+      #       wedge (height 383, ~30 s). The code ceiling
+      #       rate_limit::NATIVE_BLOCK_BYTES_CAP_CEILING (12 MB) is the guardrail
+      #       that clamps ANY env value under that bound (measured: 30 MB -> 12 MB).
+      #   (2) HASH-ONLY/PULL saturation: TORUS_HASH_ONLY_PUSH_THRESHOLD (above,
+      #       6 MB requested, CLAMPED to the 4 MB fleet floor) means blocks <= 4 MB
+      #       are FULL-PUSHED to the mesh (bodies arrive with the proposal), but
+      #       blocks > 4 MB ship a HASH-ONLY manifest and every peer must PULL the
+      #       bodies. Under SUSTAINED streaming the backlog packs every block to the
+      #       cap; once blocks exceed 4 MB the whole-block /torus/block-data fetch is
+      #       hammered, races the view timeout, and views cycle
+      #       (consensus_view >> blocks_committed) -> intermittent stalls even below
+      #       the 16 MB structural bound. Measured: 12 MB -> severe (189 fetch
+      #       exhaustions), 4 MB -> straddles the threshold, still stalls.
+      #       2 MB keeps EVERY block strictly under the 4 MB push threshold, so
+      #       bodies are always full-pushed and the pull/fetch path is never taken;
+      #       bs50 rate30 streaming ran 25 min clean at ~2.25 MB blocks.
+      # This loopback operating point is TUNABLE per leg; the code ceiling is the
+      # hard safety net. WAN/testnet must revalidate any raise (bandwidth-bound).
       - TORUS_NATIVE_TOTAL_BLOCK_CAP=${TORUS_NATIVE_TOTAL_BLOCK_CAP:-400}
       - TORUS_NATIVE_ORDERS_PER_BLOCK_CAP=${TORUS_NATIVE_ORDERS_PER_BLOCK_CAP:-400000}
-      - TORUS_NATIVE_BLOCK_BYTES_CAP=${TORUS_NATIVE_BLOCK_BYTES_CAP:-31457280}
+      - TORUS_NATIVE_BLOCK_BYTES_CAP=${TORUS_NATIVE_BLOCK_BYTES_CAP:-2097152}
     volumes:
       - ./genesis.json:/genesis/genesis.json:ro
       - validator-0-data:/data
@@ -123,9 +146,32 @@ services:
       # values can never fork the chain. SHIPPED DEFAULTS ARE UNCHANGED (action 100,
       # orders 50k, bytes 6 MB in rate_limit.rs): WAN safety of larger blocks is
       # UNPROVEN, so only this loopback compose opts in. Overridable per leg.
+      #
+      # BYTES CAP LOWERED 30 MB -> 2 MB (body-dissemination wedge, endurance L0).
+      # TWO failure layers this guards:
+      #   (1) STRUCTURAL: >16 MB blocks cannot be moved by the /torus/block-data
+      #       fetch/sync codec (16 MB zstd-decompress bound) -> permanent hard
+      #       wedge (height 383, ~30 s). The code ceiling
+      #       rate_limit::NATIVE_BLOCK_BYTES_CAP_CEILING (12 MB) is the guardrail
+      #       that clamps ANY env value under that bound (measured: 30 MB -> 12 MB).
+      #   (2) HASH-ONLY/PULL saturation: TORUS_HASH_ONLY_PUSH_THRESHOLD (above,
+      #       6 MB requested, CLAMPED to the 4 MB fleet floor) means blocks <= 4 MB
+      #       are FULL-PUSHED to the mesh (bodies arrive with the proposal), but
+      #       blocks > 4 MB ship a HASH-ONLY manifest and every peer must PULL the
+      #       bodies. Under SUSTAINED streaming the backlog packs every block to the
+      #       cap; once blocks exceed 4 MB the whole-block /torus/block-data fetch is
+      #       hammered, races the view timeout, and views cycle
+      #       (consensus_view >> blocks_committed) -> intermittent stalls even below
+      #       the 16 MB structural bound. Measured: 12 MB -> severe (189 fetch
+      #       exhaustions), 4 MB -> straddles the threshold, still stalls.
+      #       2 MB keeps EVERY block strictly under the 4 MB push threshold, so
+      #       bodies are always full-pushed and the pull/fetch path is never taken;
+      #       bs50 rate30 streaming ran 25 min clean at ~2.25 MB blocks.
+      # This loopback operating point is TUNABLE per leg; the code ceiling is the
+      # hard safety net. WAN/testnet must revalidate any raise (bandwidth-bound).
       - TORUS_NATIVE_TOTAL_BLOCK_CAP=${TORUS_NATIVE_TOTAL_BLOCK_CAP:-400}
       - TORUS_NATIVE_ORDERS_PER_BLOCK_CAP=${TORUS_NATIVE_ORDERS_PER_BLOCK_CAP:-400000}
-      - TORUS_NATIVE_BLOCK_BYTES_CAP=${TORUS_NATIVE_BLOCK_BYTES_CAP:-31457280}
+      - TORUS_NATIVE_BLOCK_BYTES_CAP=${TORUS_NATIVE_BLOCK_BYTES_CAP:-2097152}
     volumes:
       - ./genesis.json:/genesis/genesis.json:ro
       - validator-1-data:/data
@@ -183,9 +229,32 @@ services:
       # values can never fork the chain. SHIPPED DEFAULTS ARE UNCHANGED (action 100,
       # orders 50k, bytes 6 MB in rate_limit.rs): WAN safety of larger blocks is
       # UNPROVEN, so only this loopback compose opts in. Overridable per leg.
+      #
+      # BYTES CAP LOWERED 30 MB -> 2 MB (body-dissemination wedge, endurance L0).
+      # TWO failure layers this guards:
+      #   (1) STRUCTURAL: >16 MB blocks cannot be moved by the /torus/block-data
+      #       fetch/sync codec (16 MB zstd-decompress bound) -> permanent hard
+      #       wedge (height 383, ~30 s). The code ceiling
+      #       rate_limit::NATIVE_BLOCK_BYTES_CAP_CEILING (12 MB) is the guardrail
+      #       that clamps ANY env value under that bound (measured: 30 MB -> 12 MB).
+      #   (2) HASH-ONLY/PULL saturation: TORUS_HASH_ONLY_PUSH_THRESHOLD (above,
+      #       6 MB requested, CLAMPED to the 4 MB fleet floor) means blocks <= 4 MB
+      #       are FULL-PUSHED to the mesh (bodies arrive with the proposal), but
+      #       blocks > 4 MB ship a HASH-ONLY manifest and every peer must PULL the
+      #       bodies. Under SUSTAINED streaming the backlog packs every block to the
+      #       cap; once blocks exceed 4 MB the whole-block /torus/block-data fetch is
+      #       hammered, races the view timeout, and views cycle
+      #       (consensus_view >> blocks_committed) -> intermittent stalls even below
+      #       the 16 MB structural bound. Measured: 12 MB -> severe (189 fetch
+      #       exhaustions), 4 MB -> straddles the threshold, still stalls.
+      #       2 MB keeps EVERY block strictly under the 4 MB push threshold, so
+      #       bodies are always full-pushed and the pull/fetch path is never taken;
+      #       bs50 rate30 streaming ran 25 min clean at ~2.25 MB blocks.
+      # This loopback operating point is TUNABLE per leg; the code ceiling is the
+      # hard safety net. WAN/testnet must revalidate any raise (bandwidth-bound).
       - TORUS_NATIVE_TOTAL_BLOCK_CAP=${TORUS_NATIVE_TOTAL_BLOCK_CAP:-400}
       - TORUS_NATIVE_ORDERS_PER_BLOCK_CAP=${TORUS_NATIVE_ORDERS_PER_BLOCK_CAP:-400000}
-      - TORUS_NATIVE_BLOCK_BYTES_CAP=${TORUS_NATIVE_BLOCK_BYTES_CAP:-31457280}
+      - TORUS_NATIVE_BLOCK_BYTES_CAP=${TORUS_NATIVE_BLOCK_BYTES_CAP:-2097152}
     volumes:
       - ./genesis.json:/genesis/genesis.json:ro
       - validator-2-data:/data
@@ -243,9 +312,32 @@ services:
       # values can never fork the chain. SHIPPED DEFAULTS ARE UNCHANGED (action 100,
       # orders 50k, bytes 6 MB in rate_limit.rs): WAN safety of larger blocks is
       # UNPROVEN, so only this loopback compose opts in. Overridable per leg.
+      #
+      # BYTES CAP LOWERED 30 MB -> 2 MB (body-dissemination wedge, endurance L0).
+      # TWO failure layers this guards:
+      #   (1) STRUCTURAL: >16 MB blocks cannot be moved by the /torus/block-data
+      #       fetch/sync codec (16 MB zstd-decompress bound) -> permanent hard
+      #       wedge (height 383, ~30 s). The code ceiling
+      #       rate_limit::NATIVE_BLOCK_BYTES_CAP_CEILING (12 MB) is the guardrail
+      #       that clamps ANY env value under that bound (measured: 30 MB -> 12 MB).
+      #   (2) HASH-ONLY/PULL saturation: TORUS_HASH_ONLY_PUSH_THRESHOLD (above,
+      #       6 MB requested, CLAMPED to the 4 MB fleet floor) means blocks <= 4 MB
+      #       are FULL-PUSHED to the mesh (bodies arrive with the proposal), but
+      #       blocks > 4 MB ship a HASH-ONLY manifest and every peer must PULL the
+      #       bodies. Under SUSTAINED streaming the backlog packs every block to the
+      #       cap; once blocks exceed 4 MB the whole-block /torus/block-data fetch is
+      #       hammered, races the view timeout, and views cycle
+      #       (consensus_view >> blocks_committed) -> intermittent stalls even below
+      #       the 16 MB structural bound. Measured: 12 MB -> severe (189 fetch
+      #       exhaustions), 4 MB -> straddles the threshold, still stalls.
+      #       2 MB keeps EVERY block strictly under the 4 MB push threshold, so
+      #       bodies are always full-pushed and the pull/fetch path is never taken;
+      #       bs50 rate30 streaming ran 25 min clean at ~2.25 MB blocks.
+      # This loopback operating point is TUNABLE per leg; the code ceiling is the
+      # hard safety net. WAN/testnet must revalidate any raise (bandwidth-bound).
       - TORUS_NATIVE_TOTAL_BLOCK_CAP=${TORUS_NATIVE_TOTAL_BLOCK_CAP:-400}
       - TORUS_NATIVE_ORDERS_PER_BLOCK_CAP=${TORUS_NATIVE_ORDERS_PER_BLOCK_CAP:-400000}
-      - TORUS_NATIVE_BLOCK_BYTES_CAP=${TORUS_NATIVE_BLOCK_BYTES_CAP:-31457280}
+      - TORUS_NATIVE_BLOCK_BYTES_CAP=${TORUS_NATIVE_BLOCK_BYTES_CAP:-2097152}
     volumes:
       - ./genesis.json:/genesis/genesis.json:ro
       - validator-3-data:/data
@@ -303,9 +395,32 @@ services:
       # values can never fork the chain. SHIPPED DEFAULTS ARE UNCHANGED (action 100,
       # orders 50k, bytes 6 MB in rate_limit.rs): WAN safety of larger blocks is
       # UNPROVEN, so only this loopback compose opts in. Overridable per leg.
+      #
+      # BYTES CAP LOWERED 30 MB -> 2 MB (body-dissemination wedge, endurance L0).
+      # TWO failure layers this guards:
+      #   (1) STRUCTURAL: >16 MB blocks cannot be moved by the /torus/block-data
+      #       fetch/sync codec (16 MB zstd-decompress bound) -> permanent hard
+      #       wedge (height 383, ~30 s). The code ceiling
+      #       rate_limit::NATIVE_BLOCK_BYTES_CAP_CEILING (12 MB) is the guardrail
+      #       that clamps ANY env value under that bound (measured: 30 MB -> 12 MB).
+      #   (2) HASH-ONLY/PULL saturation: TORUS_HASH_ONLY_PUSH_THRESHOLD (above,
+      #       6 MB requested, CLAMPED to the 4 MB fleet floor) means blocks <= 4 MB
+      #       are FULL-PUSHED to the mesh (bodies arrive with the proposal), but
+      #       blocks > 4 MB ship a HASH-ONLY manifest and every peer must PULL the
+      #       bodies. Under SUSTAINED streaming the backlog packs every block to the
+      #       cap; once blocks exceed 4 MB the whole-block /torus/block-data fetch is
+      #       hammered, races the view timeout, and views cycle
+      #       (consensus_view >> blocks_committed) -> intermittent stalls even below
+      #       the 16 MB structural bound. Measured: 12 MB -> severe (189 fetch
+      #       exhaustions), 4 MB -> straddles the threshold, still stalls.
+      #       2 MB keeps EVERY block strictly under the 4 MB push threshold, so
+      #       bodies are always full-pushed and the pull/fetch path is never taken;
+      #       bs50 rate30 streaming ran 25 min clean at ~2.25 MB blocks.
+      # This loopback operating point is TUNABLE per leg; the code ceiling is the
+      # hard safety net. WAN/testnet must revalidate any raise (bandwidth-bound).
       - TORUS_NATIVE_TOTAL_BLOCK_CAP=${TORUS_NATIVE_TOTAL_BLOCK_CAP:-400}
       - TORUS_NATIVE_ORDERS_PER_BLOCK_CAP=${TORUS_NATIVE_ORDERS_PER_BLOCK_CAP:-400000}
-      - TORUS_NATIVE_BLOCK_BYTES_CAP=${TORUS_NATIVE_BLOCK_BYTES_CAP:-31457280}
+      - TORUS_NATIVE_BLOCK_BYTES_CAP=${TORUS_NATIVE_BLOCK_BYTES_CAP:-2097152}
     volumes:
       - ./genesis.json:/genesis/genesis.json:ro
       - rpc-node-data:/data
