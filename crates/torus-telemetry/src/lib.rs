@@ -108,6 +108,25 @@ pub struct Metrics {
     /// it and always full-verifies (never skip-by-default).
     pub exec_verify_skipped: Counter,
 
+    // Feature #13 — session signature-validity cache. Mempool-namespaced hit/miss
+    // for the cache read; `exec_session_sig_skipped` is the exec-path proof-leg
+    // counter (mirrors `exec_verify_skipped` for the session-signed workload).
+    /// Session sig-validity cache HITs: an ed25519 signature was already locally
+    /// verified, so the exec verify path skipped its EIP-712 struct/signing hash +
+    /// ed25519 verify. Stateful checks (session resolve/expiry/scope) still ran.
+    pub session_sig_cache_hits: Counter,
+    /// Session sig-validity cache MISSes: no cached validity, full ed25519 verify ran.
+    pub session_sig_cache_misses: Counter,
+    /// Session sig-validity cache evictions (FIFO cap reached).
+    pub session_sig_cache_evictions: Counter,
+    /// Exec-path ed25519 session-signature verifications SKIPPED via a sig-validity
+    /// cache HIT (the P3 exec_verify lever for the 100%-session-signed workload).
+    /// Pairs with `exec_verify_seconds`: a rising `exec_session_sig_skipped_total`
+    /// should track a falling `exec_verify_seconds`. Counted at the exec call site
+    /// (app.rs). Incremented ONLY on a HIT that skips verify — a MISS, the flag
+    /// being off, or a non-session action never increments it (never skip-by-default).
+    pub exec_session_sig_skipped: Counter,
+
     // Submit-ack phase timing (Sprint 3.5) — decomposes where multi-second
     // batch-submit acks accrue: semaphore queue vs blocking-pool verify vs
     // pool admission.
@@ -592,6 +611,31 @@ impl Metrics {
             "torus_exec_verify_skipped",
             "Exec-path signature recovers skipped via a trust-cache HIT (pairs with exec_verify_seconds)",
             exec_verify_skipped.clone(),
+        );
+
+        let session_sig_cache_hits = Counter::default();
+        registry.register(
+            "torus_session_sig_cache_hits",
+            "Session sig-validity cache hits (ed25519 verify skipped; stateful checks still run)",
+            session_sig_cache_hits.clone(),
+        );
+        let session_sig_cache_misses = Counter::default();
+        registry.register(
+            "torus_session_sig_cache_misses",
+            "Session sig-validity cache misses (full ed25519 verify ran)",
+            session_sig_cache_misses.clone(),
+        );
+        let session_sig_cache_evictions = Counter::default();
+        registry.register(
+            "torus_session_sig_cache_evictions",
+            "Session sig-validity cache FIFO evictions",
+            session_sig_cache_evictions.clone(),
+        );
+        let exec_session_sig_skipped = Counter::default();
+        registry.register(
+            "torus_exec_session_sig_skipped",
+            "Exec-path ed25519 session-signature verifies skipped via a sig-validity cache HIT (pairs with exec_verify_seconds)",
+            exec_session_sig_skipped.clone(),
         );
 
         let session_owner_cache_hits = Counter::default();
@@ -1258,6 +1302,10 @@ impl Metrics {
             verified_sender_cache_misses,
             verified_sender_cache_evictions,
             exec_verify_skipped,
+            session_sig_cache_hits,
+            session_sig_cache_misses,
+            session_sig_cache_evictions,
+            exec_session_sig_skipped,
             session_owner_cache_hits,
             session_owner_cache_misses,
             session_owner_cache_evictions,
@@ -1471,6 +1519,11 @@ mod tests {
             "torus_exec_block_seconds",
             "torus_exec_queue_depth",
             "torus_exec_verify_skipped",
+            // Feature #13 session sig-validity cache.
+            "torus_session_sig_cache_hits",
+            "torus_session_sig_cache_misses",
+            "torus_session_sig_cache_evictions",
+            "torus_exec_session_sig_skipped",
             // P3 Task-1 unaccounted-gap decomposition families.
             "torus_exec_seed_bundle_seconds",
             "torus_exec_ctx_setup_seconds",

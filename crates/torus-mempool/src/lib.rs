@@ -94,6 +94,9 @@ pub struct MempoolConfig {
     pub verified_sender_cache_cap: usize,
     /// Capacity of the exec-path session-owner cache (session_pubkey -> SessionData).
     pub session_owner_cache_cap: usize,
+    /// Capacity of the exec-path session signature-validity cache
+    /// (`session_validity_cache_key` -> presence).
+    pub session_sig_cache_cap: usize,
     // ---- Memory budget (Phase 3: 3.1.7) ----
     /// Maximum combined memory for EVM + native pools in bytes (0 = unlimited).
     pub max_memory_bytes: usize,
@@ -115,6 +118,7 @@ impl Default for MempoolConfig {
             native_per_sender_cap: rate_limit::native_per_sender_cap(),
             verified_sender_cache_cap: rate_limit::VERIFIED_SENDER_CACHE_CAP,
             session_owner_cache_cap: rate_limit::SESSION_OWNER_CACHE_CAP,
+            session_sig_cache_cap: rate_limit::SESSION_SIG_CACHE_CAP,
             max_memory_bytes: 64 * 1024 * 1024, // 64 MB default
         }
     }
@@ -159,6 +163,19 @@ pub struct Mempool {
     /// a stale-then-invalidated entry) falls through to the authoritative DB read,
     /// so a HIT is indistinguishable from a MISS => deterministic across validators.
     session_owners: RwLock<FifoCache<[u8; 32], torus_types::SessionData>>,
+    /// Exec-path session **signature-validity** cache: presence keyed by
+    /// `torus_types::session_validity_cache_key` (which commits to the FULL ed25519
+    /// signature + session pubkey). A HIT means "this exact signature was locally
+    /// verified here", letting the exec verify path skip the EIP-712 struct/signing
+    /// hash + the ed25519 verify for the 100%-session-signed workload. It caches
+    /// ONLY the stateless crypto fact — NOT the resolved sender (which is exec-time
+    /// state; see `session_validity_cache_key` and the s375 fork note). The exec
+    /// verify path STILL re-runs `session_lookup` + expiry + scope on every action,
+    /// HIT or MISS, so a HIT can never accept an expired/revoked/out-of-scope/forged
+    /// action and is observationally identical to a MISS (deterministic across
+    /// validators). Populated ONLY after a successful LOCAL verify (RPC ingress +
+    /// gossip-recover); gossip-TRUSTED / block-copy admits are never populated.
+    session_sig_verified: RwLock<FifoCache<B256, ()>>,
     /// P3 Round-2 scope 3: sojourn-gate drain estimator. `remove_committed_native`
     /// (consensus thread, sole writer) updates an EMA of the pool drain rate;
     /// the RPC admit path (readers) divides `pool_size` by it to estimate how
@@ -190,6 +207,7 @@ impl Mempool {
         let da_store = NativeDaStore::new(state.clone());
         let verified_cap = config.verified_sender_cache_cap;
         let session_owner_cap = config.session_owner_cache_cap;
+        let session_sig_cap = config.session_sig_cache_cap;
         let initial_base_fee = config.initial_base_fee;
         Self {
             evm: RwLock::new(evm_pool::EvmPool::new()),
@@ -204,6 +222,7 @@ impl Mempool {
             metrics: std::sync::OnceLock::new(),
             verified_senders: RwLock::new(FifoCache::new(verified_cap)),
             session_owners: RwLock::new(FifoCache::new(session_owner_cap)),
+            session_sig_verified: RwLock::new(FifoCache::new(session_sig_cap)),
             sojourn: std::sync::Mutex::new(SojournState::default()),
         }
     }
@@ -242,6 +261,46 @@ impl Mempool {
             }
         }
         result
+    }
+
+    /// Record that the ed25519 signature committed by `key`
+    /// (`torus_types::session_validity_cache_key`) was locally verified here, so a
+    /// later exec-path HIT can skip re-verifying it. `key` MUST commit to the FULL
+    /// signature + pubkey; only the LOCAL-verify paths (RPC ingress, gossip-recover)
+    /// call this — gossip-TRUSTED / block-copy admits must not, since they did not
+    /// verify the signature.
+    pub fn cache_session_sig_verified(&self, key: B256) {
+        let evicted = match self.session_sig_verified.write() {
+            Ok(mut cache) => cache.insert(key, ()),
+            Err(_) => return,
+        };
+        if evicted > 0 {
+            if let Some(m) = self.metrics.get() {
+                m.session_sig_cache_evictions.inc_by(evicted);
+            }
+        }
+    }
+
+    /// Session sig-validity cache HIT lookup: `true` iff the ed25519 signature
+    /// committed by `key` was locally verified. Read-only (no recency bump).
+    /// `false` => MISS => the caller MUST run the full ed25519 verify. A HIT lets
+    /// the caller skip ONLY the signature verify + its EIP-712 hash — never the
+    /// stateful session resolve / expiry / scope checks.
+    pub fn session_sig_verified(&self, key: &B256) -> bool {
+        let hit = self
+            .session_sig_verified
+            .read()
+            .ok()
+            .map(|cache| cache.get(key).is_some())
+            .unwrap_or(false);
+        if let Some(m) = self.metrics.get() {
+            if hit {
+                m.session_sig_cache_hits.inc();
+            } else {
+                m.session_sig_cache_misses.inc();
+            }
+        }
+        hit
     }
 
     /// Exec-path session-owner cache HIT lookup: return the cached `SessionData`
@@ -701,6 +760,17 @@ impl Mempool {
         } else {
             None
         };
+        // Feature #13: derive the session sig-validity key (Some only for session
+        // actions). `verified_locally` means THIS node re-derived the sender from
+        // the signature (RPC ingress or gossip-recover), so the ed25519 session
+        // signature was locally verified and its validity may be cached. A
+        // gossip-TRUSTED / block-copy admit passes `false` and is never cached —
+        // the same populate-on-verify invariant as the EIP-712 trust-cache.
+        let sig_key = if verified_locally {
+            torus_types::session_validity_cache_key(&action)
+        } else {
+            None
+        };
 
         let size_after = {
             let mut pool = self.native.write().unwrap();
@@ -728,6 +798,9 @@ impl Mempool {
         // never pollutes the cache.
         if let Some(key) = cache_key {
             self.cache_verified_sender(key, sender);
+        }
+        if let Some(key) = sig_key {
+            self.cache_session_sig_verified(key);
         }
         tracing::debug!(%sender, "native action added to mempool");
         Ok(())
@@ -1448,6 +1521,73 @@ mod tests {
         assert_eq!(pool.session_owner(&[1u8; 32]), None, "oldest evicted at cap");
         assert!(pool.session_owner(&[2u8; 32]).is_some());
         assert!(pool.session_owner(&[3u8; 32]).is_some());
+    }
+
+    /// Feature #13 — the load-bearing populate-on-verify invariant: a session
+    /// action admitted via a LOCAL-verify path (RPC presigned / gossip-recover)
+    /// caches its signature validity, but a gossip-TRUSTED admit (sender claimed,
+    /// signature NOT re-verified here) must NEVER populate it. The exec HIT path
+    /// skips ed25519 verification, so a forged/unverified sig must never reach the
+    /// cache — same invariant as the EIP-712 trust-cache.
+    #[test]
+    fn session_sig_cache_populate_on_local_verify_only() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state, MempoolConfig::default());
+        let base = now_ms();
+        let owner = alloy_primitives::Address::from([0xEE; 20]);
+
+        // Build a session-signed action directly — the admit paths under test do
+        // NOT verify the ed25519 signature (that is the caller's job); this test
+        // isolates the populate DISCIPLINE (verified_locally gate), and the sig
+        // key commits to the raw bytes regardless of validity.
+        let mk = |order_id: u128, nonce: u64| torus_types::SignedNativeAction {
+            action: torus_types::NativeAction::CancelOrder { order_id },
+            nonce,
+            signature: torus_types::ActionSignature::Session {
+                session_pubkey: [7u8; 32],
+                sig: torus_types::Ed25519Sig([9u8; 64]),
+            },
+        };
+
+        // Local-verify path: RPC presigned admit populates the sig cache.
+        let a = mk(9, base + 1);
+        let key_a = torus_types::session_validity_cache_key(&a).expect("session is keyed");
+        assert!(!pool.session_sig_verified(&key_a), "cold: not yet cached");
+        pool.add_native_action_presigned(owner, a).unwrap();
+        assert!(
+            pool.session_sig_verified(&key_a),
+            "local verify (presigned) must populate the sig cache"
+        );
+
+        // Gossip-TRUSTED path: sender claimed, sig not re-verified => NOT cached.
+        let b = mk(10, base + 2);
+        let key_b = torus_types::session_validity_cache_key(&b).unwrap();
+        pool.add_native_action_from_gossip_trusted(owner, b).unwrap();
+        assert!(
+            !pool.session_sig_verified(&key_b),
+            "gossip-trusted admit must NOT populate (not locally verified)"
+        );
+    }
+
+    /// Feature #13 — the sig cache is bounded: past the cap the oldest entry is
+    /// evicted (a MISS => full ed25519 verify, safe).
+    #[test]
+    fn session_sig_cache_bounded_by_cap() {
+        let (_dir, state) = setup();
+        let config = MempoolConfig {
+            session_sig_cache_cap: 2,
+            ..MempoolConfig::default()
+        };
+        let pool = Mempool::new(state, config);
+        let k1 = B256::from([1u8; 32]);
+        let k2 = B256::from([2u8; 32]);
+        let k3 = B256::from([3u8; 32]);
+        pool.cache_session_sig_verified(k1);
+        pool.cache_session_sig_verified(k2);
+        pool.cache_session_sig_verified(k3); // evicts oldest (k1)
+        assert!(!pool.session_sig_verified(&k1), "oldest evicted at cap");
+        assert!(pool.session_sig_verified(&k2));
+        assert!(pool.session_sig_verified(&k3));
     }
 
     #[test]

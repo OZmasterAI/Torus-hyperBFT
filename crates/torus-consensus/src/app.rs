@@ -453,6 +453,37 @@ impl ExecutionContext {
                             None
                         }
                     },
+                    // Feature #13: session signature-validity cache read (gated by
+                    // --exec-trust-cache). A HIT means this exact ed25519 signature
+                    // was already locally verified (RPC ingress / gossip-recover),
+                    // so the batch verify can skip the EIP-712 struct/signing hash +
+                    // ed25519 verify for this action — the dominant exec_verify cost
+                    // on the 100%-session-signed workload. The stateful checks
+                    // (session_lookup, expiry vs block timestamp, scope) STILL run
+                    // above on every action, so a HIT can never accept an
+                    // expired/revoked/out-of-scope/forged action; it is
+                    // observationally identical to a MISS. A MISS — or the flag being
+                    // off — full-verifies, exactly as today.
+                    |key| {
+                        if self.exec_trust_cache {
+                            let hit = self
+                                .mempool
+                                .as_ref()
+                                .map(|m| m.session_sig_verified(key))
+                                .unwrap_or(false);
+                            // Proof-leg counter: a HIT is exactly one ed25519 session
+                            // verify skipped at execution. Incremented ONLY on a HIT,
+                            // so a MISS never counts (never skip-by-default).
+                            if hit {
+                                if let Some(ref m) = self.metrics {
+                                    m.exec_session_sig_skipped.inc();
+                                }
+                            }
+                            hit
+                        } else {
+                            false
+                        }
+                    },
                 )
             } else {
                 vec![]
@@ -3082,6 +3113,7 @@ mod crash_recovery_tests {
             base,
             |_| None,
             |key| mempool.verified_sender(key),
+            |key| mempool.session_sig_verified(key),
         );
 
         assert_eq!(
@@ -3330,6 +3362,110 @@ mod crash_recovery_tests {
         );
     }
 
+    /// FEATURE #13 PROOF LEG + determinism: a SESSION-signed action verified at
+    /// gossip INGRESS (real `add_native_action_from_gossip` recover path, which
+    /// populates the sig-validity cache) then committed MUST skip the ed25519
+    /// re-verify at exec, and resolve to the SAME owner a cold full-verify would.
+    /// The `exec_session_sig_skipped` counter proves the skip fired. (Byte-identity
+    /// of the HIT vs MISS resolved-sender vector across every session shape is
+    /// exhaustively proven at the `batch_verify_native_actions_cached` level in
+    /// torus-types; here we prove the real ingress->commit->exec flow HITs.)
+    #[test]
+    fn session_sig_cache_ingress_then_commit_skips_verify() {
+        let ed = ed25519_dalek::SigningKey::from_bytes(&[55u8; 32]);
+        let pubkey = ed.verifying_key().to_bytes();
+        let owner = Address::from([0x5A; 20]);
+        let session = torus_types::SessionData {
+            owner,
+            expiry: u64::MAX,
+            scope: torus_types::SessionScope::Trading,
+            created_at: 0,
+        };
+        // Live-window nonce so the real ingress admit path accepts it.
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let signed = torus_types::eip712::sign_native_action_with_session(
+            NativeAction::CancelOrder { order_id: 7 },
+            nonce,
+            &ed,
+        );
+        let sig_key = torus_types::session_validity_cache_key(&signed).unwrap();
+
+        let (config_on, db_on) = make_test_config_and_db();
+        db_on.put_session(&pubkey, &session).unwrap();
+        let mempool = Arc::new(Mempool::new(
+            db_on.clone(),
+            torus_mempool::MempoolConfig::default(),
+        ));
+        // Real ingress verify path: validates the ed25519 session sig and populates
+        // the sig-validity cache (verified_locally=true).
+        mempool
+            .add_native_action_from_gossip(owner, signed.clone())
+            .expect("gossip ingress session verify + admit");
+        assert!(
+            mempool.session_sig_verified(&sig_key),
+            "ingress verify must populate the session sig cache"
+        );
+
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
+        let ctx_on = make_exec_ctx_with_metrics(
+            &config_on,
+            &db_on,
+            Some(mempool.clone()),
+            true,
+            metrics.clone(),
+        );
+        ctx_on.execute_committed_block(&make_block(1, vec![signed.clone()]), vec![]);
+
+        // Proof leg: exactly one ed25519 session verify was skipped at exec.
+        assert_eq!(
+            metrics.exec_session_sig_skipped.get(),
+            1,
+            "the ingress-verified session action must skip re-verify on commit"
+        );
+    }
+
+    /// FEATURE #13 INVARIANT 2 (never skip-by-default): a session action seen ONLY
+    /// inside the block — never verified at ingress, so never cached — MUST be fully
+    /// ed25519-verified on commit. Cache MISS => `exec_session_sig_skipped` stays 0.
+    #[test]
+    fn session_sig_cache_block_only_action_is_fully_verified_no_skip() {
+        let ed = ed25519_dalek::SigningKey::from_bytes(&[56u8; 32]);
+        let pubkey = ed.verifying_key().to_bytes();
+        let owner = Address::from([0x5B; 20]);
+        let session = torus_types::SessionData {
+            owner,
+            expiry: u64::MAX,
+            scope: torus_types::SessionScope::Trading,
+            created_at: 0,
+        };
+        let signed = torus_types::eip712::sign_native_action_with_session(
+            NativeAction::CancelOrder { order_id: 8 },
+            777_777,
+            &ed,
+        );
+
+        let (config, db) = make_test_config_and_db();
+        db.put_session(&pubkey, &session).unwrap();
+        // Empty mempool: the action was NEVER admitted/seeded (block-only).
+        let mempool = Arc::new(Mempool::new(
+            db.clone(),
+            torus_mempool::MempoolConfig::default(),
+        ));
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
+        // Flag ON, but the sig cache is empty -> MISS -> full ed25519 verify.
+        let ctx = make_exec_ctx_with_metrics(&config, &db, Some(mempool), true, metrics.clone());
+        ctx.execute_committed_block(&make_block(1, vec![signed.clone()]), vec![]);
+
+        assert_eq!(
+            metrics.exec_session_sig_skipped.get(),
+            0,
+            "a sig-cache MISS must NEVER skip ed25519 verify (no skip-by-default)"
+        );
+    }
+
     /// INVARIANT 1 (key commits to the signature): `compute_action_hash` OMITS the
     /// signature (torus-types:863), so it is an insufficient key. A cached entry for
     /// action A (payload P, nonce N, sig_A) MUST NOT authorize a DIFFERENT action B
@@ -3392,6 +3528,7 @@ mod crash_recovery_tests {
             base,
             |_| None,
             |key| mempool.verified_sender(key),
+            |key| mempool.session_sig_verified(key),
         );
         assert_eq!(
             resolved[0],

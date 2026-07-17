@@ -893,6 +893,41 @@ pub fn verified_cache_key(action: &SignedNativeAction) -> Option<B256> {
     Some(alloy_primitives::keccak256(&data))
 }
 
+/// Signature-committing key for the **session signature-validity** cache, or
+/// `None` for non-session (EIP-712) actions.
+///
+/// UNLIKE `verified_cache_key`, this does NOT cache a resolved sender — it keys a
+/// cache whose only stored fact is the STATELESS, non-forkable truth that the
+/// ed25519 signature `sig` by `session_pubkey` over this action's signing hash is
+/// cryptographically valid. That fact can never change or diverge across
+/// validators, so caching it (populate-on-verify only) is fork-safe where caching
+/// a session SENDER is not: the resolved owner depends on exec-time state
+/// (session existence, expiry, scope, revocation, revoke->recreate rebinding),
+/// which is why `verified_cache_key` returns `None` for sessions (s375). A
+/// consumer of THIS cache still re-runs every stateful check (session_lookup,
+/// expiry vs block timestamp, scope) on every action — a HIT only skips the
+/// ed25519 signature verification + the EIP-712 struct/signing-hash it needs.
+///
+/// The key commits to the FULL signature AND the pubkey (the s375 fork bug was a
+/// key that omitted the signature): any change to the payload, nonce, pubkey, or
+/// signature yields a different key => cache MISS => full verify. Used IDENTICALLY
+/// at populate (mempool, after a successful local verify) and read
+/// (`batch_verify_native_actions_cached` Phase 2).
+pub fn session_validity_cache_key(action: &SignedNativeAction) -> Option<B256> {
+    let ActionSignature::Session {
+        session_pubkey,
+        sig,
+    } = &action.signature
+    else {
+        return None;
+    };
+    let mut data = action.action.canonical_bytes();
+    data.extend_from_slice(&action.nonce.to_be_bytes());
+    data.extend_from_slice(session_pubkey);
+    data.extend_from_slice(&sig.0);
+    Some(alloy_primitives::keccak256(&data))
+}
+
 // ============================================================================
 // Order Types
 // ============================================================================
@@ -1513,5 +1548,67 @@ mod tests {
         let mut h2 = h1.clone();
         h2.sig_attestation = [0xff; 64];
         assert_eq!(h1.canonical_header_bytes(), h2.canonical_header_bytes());
+    }
+
+    // --- Feature #13: session_validity_cache_key commitment ---
+
+    #[test]
+    fn session_validity_cache_key_none_for_eip712() {
+        let a = SignedNativeAction {
+            action: NativeAction::CancelOrder { order_id: 7 },
+            nonce: 1,
+            signature: ActionSignature::Eip712(Signature {
+                v: 27,
+                r: [1u8; 32],
+                s: [2u8; 32],
+            }),
+        };
+        assert!(session_validity_cache_key(&a).is_none());
+        // And the EIP-712 key is Some for the same action.
+        assert!(verified_cache_key(&a).is_some());
+    }
+
+    #[test]
+    fn session_validity_cache_key_commits_to_every_field() {
+        let base = SignedNativeAction {
+            action: NativeAction::CancelOrder { order_id: 7 },
+            nonce: 100,
+            signature: ActionSignature::Session {
+                session_pubkey: [3u8; 32],
+                sig: Ed25519Sig([4u8; 64]),
+            },
+        };
+        let k0 = session_validity_cache_key(&base).expect("session is keyed");
+
+        // Same everything => same key (deterministic).
+        assert_eq!(k0, session_validity_cache_key(&base.clone()).unwrap());
+
+        // Different action payload => different key.
+        let mut a = base.clone();
+        a.action = NativeAction::CancelOrder { order_id: 8 };
+        assert_ne!(k0, session_validity_cache_key(&a).unwrap());
+
+        // Different nonce => different key.
+        let mut a = base.clone();
+        a.nonce = 101;
+        assert_ne!(k0, session_validity_cache_key(&a).unwrap());
+
+        // Different pubkey => different key.
+        let mut a = base.clone();
+        if let ActionSignature::Session {
+            ref mut session_pubkey,
+            ..
+        } = a.signature
+        {
+            session_pubkey[0] ^= 0xFF;
+        }
+        assert_ne!(k0, session_validity_cache_key(&a).unwrap());
+
+        // Different signature => different key (the s375 fork bug was omitting this).
+        let mut a = base.clone();
+        if let ActionSignature::Session { ref mut sig, .. } = a.signature {
+            sig.0[0] ^= 0xFF;
+        }
+        assert_ne!(k0, session_validity_cache_key(&a).unwrap());
     }
 }

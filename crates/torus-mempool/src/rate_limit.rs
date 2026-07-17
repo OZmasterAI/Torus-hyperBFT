@@ -254,6 +254,18 @@ pub const VERIFIED_SENDER_CACHE_CAP: usize = 16_384;
 /// => ~1.2MB at this cap.
 pub const SESSION_OWNER_CACHE_CAP: usize = 16_384;
 
+/// Capacity of the exec-path session **signature-validity** cache
+/// (`session_validity_cache_key -> ()`, presence = "this exact ed25519 signature
+/// was locally verified").
+///
+/// Sized like `VERIFIED_SENDER_CACHE_CAP`: it bridges the same in-flight window
+/// between ingress/gossip-recover and execution (exec lags up to the 64-block
+/// exec queue, each up to `NATIVE_TOTAL_BLOCK_CAP` (100) actions => a 6400 hard
+/// floor), at ~2.5x margin so churn / gossip dups don't evict still-needed entries
+/// before exec reads them. One key per distinct action signature. Over-cap or cold
+/// => cache MISS => full ed25519 verify (safe). ~32B/entry => ~0.5MB at this cap.
+pub const SESSION_SIG_CACHE_CAP: usize = 16_384;
+
 /// Number of individual orders/operations an action represents.
 ///
 /// A `PlaceOrderBatch` counts as its length; every other action counts as 1.

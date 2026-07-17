@@ -998,8 +998,8 @@ pub fn batch_verify_native_actions(
 ) -> Vec<Option<Address>> {
     // No exec trust-cache: every action is fully verified — exactly today's
     // behavior. The execution path uses `batch_verify_native_actions_cached`;
-    // passing a never-hitting lookup here makes "cache off" provably identical.
-    batch_verify_native_actions_cached(actions, timestamp, session_lookup, |_| None)
+    // passing never-hitting lookups here makes "cache off" provably identical.
+    batch_verify_native_actions_cached(actions, timestamp, session_lookup, |_| None, |_| false)
 }
 
 /// Trust-cache-aware variant of [`batch_verify_native_actions`].
@@ -1013,11 +1013,24 @@ pub fn batch_verify_native_actions(
 /// for which `verified_cache_key` returns `None`) falls through to full recover +
 /// session resolution. Cache consultation is a sequential pre-pass, kept off the
 /// rayon workers exactly like `session_lookup`.
+///
+/// `session_sig_verified(key)` is the read side of the **session signature-validity**
+/// cache (Feature #13). It returns `true` when the ed25519 signature committed by
+/// an action's [`crate::session_validity_cache_key`] was already locally verified
+/// (populate-on-verify, keyed by the FULL signature + pubkey). A HIT lets Phase 2
+/// skip the dominant EIP-712 struct/signing-hash + the ed25519 verify for that
+/// action — but ONLY that stateless crypto. Every stateful check
+/// (`session_lookup`, expiry vs block timestamp, scope) STILL runs on a HIT
+/// exactly as on a MISS, so the resolved sender vector is byte-identical whether
+/// the cache hits or misses (a HIT can never accept an expired / out-of-scope /
+/// revoked / forged action). Consulted in the same sequential pre-pass as
+/// `session_lookup`, so callers keep their non-`Sync` closures.
 pub fn batch_verify_native_actions_cached(
     actions: &[SignedNativeAction],
     timestamp: u64,
     session_lookup: impl Fn(&[u8; 32]) -> Option<crate::SessionData>,
     verified_lookup: impl Fn(&alloy_primitives::B256) -> Option<Address>,
+    session_sig_verified: impl Fn(&alloy_primitives::B256) -> bool,
 ) -> Vec<Option<Address>> {
     use rayon::prelude::*;
 
@@ -1075,67 +1088,115 @@ pub fn batch_verify_native_actions_cached(
         }
     }
 
+    // Sig-validity cache pre-pass (SEQUENTIAL, Feature #13). For each session
+    // action, consult the caller's `session_sig_verified` on its
+    // signature-committing key. A HIT asserts ONLY the stateless fact that the
+    // ed25519 signature is cryptographically valid, so Phase 2b can skip the
+    // dominant struct/signing-hash + the ed25519 verify for that action; the
+    // stateful expiry/scope/resolution checks below STILL run. `false` for
+    // non-session actions (key is `None`). Kept off the rayon workers exactly like
+    // `session_lookup`, so callers keep their non-`Sync` closures; the resulting
+    // `Vec<bool>` is `Sync` and read by the parallel prep below.
+    let sig_hits: Vec<bool> = actions
+        .iter()
+        .map(|action| {
+            crate::session_validity_cache_key(action)
+                .map(|k| session_sig_verified(&k))
+                .unwrap_or(false)
+        })
+        .collect();
+
     // Phase 2b — per-action verify prep (PARALLEL, order-preserving). For each
-    // session action, check expiry/scope against the pre-resolved session,
-    // decompress the ed25519 verifying key, and compute the EIP-712 struct/signing
-    // hash (the dominant keccak cost). Every step is pure and reads only the
-    // now-immutable `resolved_sessions` map (`SessionData` is `Sync`), so an
-    // indexed `par_iter` collect is deterministic and byte-identical to the serial
-    // loop. Non-session / requires_eip712 / unresolved / bad-scope / bad-key
-    // actions yield `None` — exactly the serial loop's `continue`/`_ => {}` skips.
+    // session action, check expiry/scope against the pre-resolved session. On a
+    // sig-cache MISS: decompress the ed25519 verifying key and compute the EIP-712
+    // struct/signing hash (the dominant keccak cost), then hand it to the ed25519
+    // batch. On a sig-cache HIT: the signature was already locally verified, so
+    // skip the struct/signing hash AND the ed25519 batch and resolve the owner
+    // directly — the stateful checks above already ran, so a HIT is observationally
+    // identical to a MISS. Every step is pure and reads only the now-immutable
+    // `resolved_sessions` map + `sig_hits` (both `Sync`), so an indexed `par_iter`
+    // collect is deterministic. Non-session / requires_eip712 / unresolved /
+    // bad-scope / bad-key actions yield `Skip` — exactly the serial loop's skips.
     struct EdItem {
         message: Vec<u8>,
         signature: ed25519_dalek::Signature,
         key: Ed25519VerifyingKey,
         owner: Address,
     }
-    let per_index: Vec<Option<EdItem>> = actions
+    enum SessionOutcome {
+        /// Not a resolvable session action (EIP-712, requires_eip712, unresolved,
+        /// expired, out-of-scope, or bad key) — leaves `senders[i]` as-is (`None`).
+        Skip,
+        /// Sig-cache HIT: owner resolved and stateful checks passed; the ed25519
+        /// signature was already locally verified, so this is final (no ed batch).
+        Hit(Address),
+        /// Sig-cache MISS: needs ed25519 batch verification. Boxed so the small
+        /// `Hit`/`Skip` variants don't pay the `EdItem` footprint per element.
+        Verify(Box<EdItem>),
+    }
+    let per_index: Vec<SessionOutcome> = actions
         .par_iter()
-        .map(|action| {
+        .enumerate()
+        .map(|(i, action)| {
             let ActionSignature::Session {
                 session_pubkey,
                 sig,
             } = &action.signature
             else {
-                return None; // EIP-712 already resolved in phase 1
+                return SessionOutcome::Skip; // EIP-712 already resolved in phase 1
             };
             if requires_eip712(&action.action) {
-                return None;
+                return SessionOutcome::Skip;
             }
             let Some(Some(session)) = resolved_sessions.get(session_pubkey) else {
-                return None; // no session / lookup returned None
+                return SessionOutcome::Skip; // no session / lookup returned None
             };
             if !(timestamp <= session.expiry && session.scope.allows(&action.action)) {
-                return None; // expired or out of scope
+                return SessionOutcome::Skip; // expired or out of scope
+            }
+            // Sig-cache HIT: the ed25519 signature over this exact
+            // (payload, nonce, pubkey, sig) was already locally verified, so skip
+            // the struct/signing hash + ed25519 verify. The expiry/scope checks
+            // above still ran, so the result is identical to the MISS path.
+            if sig_hits[i] {
+                return SessionOutcome::Hit(session.owner);
             }
             let Ok(vk) = Ed25519VerifyingKey::from_bytes(session_pubkey) else {
-                return None;
+                return SessionOutcome::Skip;
             };
             let struct_hash = eip712_struct_hash(&action.action, action.nonce);
             let signing_hash = eip712_signing_hash(domain, struct_hash);
-            Some(EdItem {
+            SessionOutcome::Verify(Box::new(EdItem {
                 message: signing_hash.0.to_vec(),
                 signature: ed25519_dalek::Signature::from_bytes(&sig.0),
                 key: vk,
                 owner: session.owner,
-            })
+            }))
         })
         .collect();
 
     // Assemble the ed25519 batch in index order — the SAME push order as the
     // serial loop, so `verify_batch` sees an identical message/key sequence — and
-    // set the tentative session-owner sender (cleared below if the batch fails).
+    // set the tentative session-owner sender (cleared below if the batch fails). A
+    // sig-cache HIT sets its final owner here directly and never enters the batch.
     let mut ed_indices = Vec::new();
     let mut ed_messages = Vec::new();
     let mut ed_signatures = Vec::new();
     let mut ed_keys = Vec::new();
-    for (i, item) in per_index.into_iter().enumerate() {
-        if let Some(item) = item {
-            ed_indices.push(i);
-            ed_messages.push(item.message);
-            ed_signatures.push(item.signature);
-            ed_keys.push(item.key);
-            senders[i] = Some(item.owner);
+    for (i, outcome) in per_index.into_iter().enumerate() {
+        match outcome {
+            SessionOutcome::Skip => {}
+            SessionOutcome::Hit(owner) => {
+                senders[i] = Some(owner); // sig already locally verified: final
+            }
+            SessionOutcome::Verify(item) => {
+                let item = *item; // move the EdItem out of the box
+                ed_indices.push(i);
+                ed_messages.push(item.message);
+                ed_signatures.push(item.signature);
+                ed_keys.push(item.key);
+                senders[i] = Some(item.owner);
+            }
         }
     }
 
@@ -2386,6 +2447,7 @@ mod tests {
             TEST_NONCE,
             |_| None,
             |k| if *k == ck { Some(sentinel) } else { None },
+            |_| false,
         );
         assert_eq!(
             got[0],
@@ -2394,7 +2456,8 @@ mod tests {
         );
 
         // MISS (empty cache) -> full recover yields the real signer (today's path).
-        let miss = batch_verify_native_actions_cached(&[action], TEST_NONCE, |_| None, |_| None);
+        let miss =
+            batch_verify_native_actions_cached(&[action], TEST_NONCE, |_| None, |_| None, |_| false);
         assert_eq!(miss[0], Some(real), "cache MISS must full-recover");
     }
 
@@ -2413,7 +2476,8 @@ mod tests {
             crate::verified_cache_key(&action).is_none(),
             "session actions are not cacheable"
         );
-        let got = batch_verify_native_actions_cached(&[action], TEST_NONCE, |_| None, |_| None);
+        let got =
+            batch_verify_native_actions_cached(&[action], TEST_NONCE, |_| None, |_| None, |_| false);
         assert_eq!(got[0], None, "unresolvable action -> None (slash input)");
     }
 
@@ -2511,13 +2575,48 @@ mod tests {
         senders
     }
 
-    /// Assert production == reference for a given batch + session store, on both
-    /// the cache-off and (trivial) cache-on paths.
+    /// The set of `session_validity_cache_key`s for every session action in
+    /// `actions` whose ed25519 signature actually verifies — i.e. EXACTLY what a
+    /// populate-on-verify sig cache would contain (a forged sig verifies false and
+    /// is never added). Used to drive the Feature #13 HIT-path determinism check.
+    fn valid_session_sig_keys(actions: &[SignedNativeAction]) -> std::collections::HashSet<B256> {
+        let mut set = std::collections::HashSet::new();
+        for a in actions {
+            if matches!(a.signature, ActionSignature::Session { .. })
+                && a.verify_session_signature().is_ok()
+            {
+                if let Some(k) = crate::session_validity_cache_key(a) {
+                    set.insert(k);
+                }
+            }
+        }
+        set
+    }
+
+    /// Assert production == reference for a given batch + session store.
+    ///
+    /// Runs THREE ways and requires byte-identical output for all:
+    ///   1. the always-miss serial `reference_impl` (Phase-2 parallelization oracle),
+    ///   2. production with both caches off,
+    ///   3. production with a session sig-validity cache that HITS every genuinely
+    ///      valid session signature (Feature #13 determinism: HIT == MISS).
     fn assert_matches_reference(actions: &[SignedNativeAction], ts: u64, store: &SessionStore) {
         let lookup = |pk: &[u8; 32]| store.get(pk).cloned();
-        let got = batch_verify_native_actions_cached(actions, ts, lookup, |_| None);
         let want = reference_impl(actions, ts, lookup, |_| None);
+
+        let got = batch_verify_native_actions_cached(actions, ts, lookup, |_| None, |_| false);
         assert_eq!(got, want, "parallel Phase-2 output must equal serial reference");
+
+        // Feature #13: a sig cache populated exactly as populate-on-verify would
+        // (only valid sigs) must produce identical output on the HIT path.
+        let valid_keys = valid_session_sig_keys(actions);
+        let hit = batch_verify_native_actions_cached(actions, ts, lookup, |_| None, |k| {
+            valid_keys.contains(k)
+        });
+        assert_eq!(
+            hit, want,
+            "session sig-cache HIT run must equal the always-miss reference"
+        );
     }
 
     fn ed(seed: u8) -> ed25519_dalek::SigningKey {
@@ -2682,7 +2781,8 @@ mod tests {
             calls.set(calls.get() + 1);
             store.get(pk).cloned()
         };
-        let got = batch_verify_native_actions_cached(&actions, TEST_NONCE, lookup, |_| None);
+        let got =
+            batch_verify_native_actions_cached(&actions, TEST_NONCE, lookup, |_| None, |_| false);
         assert_eq!(
             calls.get(),
             3,
@@ -2756,5 +2856,171 @@ mod tests {
             sig.0[10] ^= 0x55;
         }
         assert_matches_reference(&actions, TEST_NONCE, &store);
+    }
+
+    // ------------------------------------------------------------------
+    // Feature #13 — session signature-validity cache: security regressions.
+    //
+    // A sig-cache HIT asserts ONLY "this exact ed25519 signature is valid". Every
+    // stateful check (session resolve, expiry, scope) MUST still run on a HIT, and
+    // the key MUST commit to the full signature so a HIT can never authorize a
+    // different action. These mirror the 3312de5 trust-cache security suite.
+    // ------------------------------------------------------------------
+
+    /// A cache that HITS on the given key set (as populate-on-verify would).
+    fn hitting_cache(keys: std::collections::HashSet<B256>) -> impl Fn(&B256) -> bool {
+        move |k| keys.contains(k)
+    }
+
+    /// #13.1a — a HIT on a valid sig for an EXPIRED session is still rejected
+    /// (`None`): the stateful expiry check runs on the HIT path exactly as on MISS.
+    #[test]
+    fn sig_cache_hit_still_rejects_expired_session() {
+        let k = ed(40);
+        let pk = k.verifying_key().to_bytes();
+        let mut store = SessionStore::new();
+        store.insert(
+            pk,
+            SessionData {
+                owner: Address::from([0x40; 20]),
+                expiry: TEST_NONCE - 1, // expired at `ts`
+                scope: SessionScope::Trading,
+                created_at: 0,
+            },
+        );
+        let action = sign_order(TEST_NONCE, &k);
+        // The sig itself IS valid, so populate-on-verify would cache it.
+        assert!(action.verify_session_signature().is_ok());
+        let keys = valid_session_sig_keys(std::slice::from_ref(&action));
+        assert!(!keys.is_empty(), "valid sig must be cacheable");
+
+        let got = batch_verify_native_actions_cached(
+            std::slice::from_ref(&action),
+            TEST_NONCE,
+            |pk2| store.get(pk2).cloned(),
+            |_| None,
+            hitting_cache(keys),
+        );
+        assert_eq!(got[0], None, "expired session rejected even on a sig-cache HIT");
+    }
+
+    /// #13.1b — a HIT on a valid sig for an OUT-OF-SCOPE session is still rejected.
+    #[test]
+    fn sig_cache_hit_still_rejects_out_of_scope_session() {
+        let k = ed(41);
+        let pk = k.verifying_key().to_bytes();
+        let mut store = SessionStore::new();
+        store.insert(
+            pk,
+            SessionData {
+                owner: Address::from([0x41; 20]),
+                expiry: u64::MAX,
+                scope: SessionScope::TransfersOnly, // does NOT allow CancelOrder
+                created_at: 0,
+            },
+        );
+        let action = sign_order(TEST_NONCE, &k);
+        let keys = valid_session_sig_keys(std::slice::from_ref(&action));
+        let got = batch_verify_native_actions_cached(
+            std::slice::from_ref(&action),
+            TEST_NONCE,
+            |pk2| store.get(pk2).cloned(),
+            |_| None,
+            hitting_cache(keys),
+        );
+        assert_eq!(got[0], None, "out-of-scope rejected even on a sig-cache HIT");
+    }
+
+    /// #13.1c — a HIT on a valid sig whose session was REVOKED (absent from state)
+    /// is still rejected: the fresh `session_lookup` returns None on every action.
+    #[test]
+    fn sig_cache_hit_still_rejects_revoked_session() {
+        let k = ed(42);
+        let action = sign_order(TEST_NONCE, &k);
+        let keys = valid_session_sig_keys(std::slice::from_ref(&action));
+        // Empty store == the session was revoked / never existed.
+        let store = SessionStore::new();
+        let got = batch_verify_native_actions_cached(
+            std::slice::from_ref(&action),
+            TEST_NONCE,
+            |pk2| store.get(pk2).cloned(),
+            |_| None,
+            hitting_cache(keys),
+        );
+        assert_eq!(got[0], None, "revoked/unknown session rejected even on HIT");
+    }
+
+    /// #13.2 — a FORGED signature is never populated (populate only after a
+    /// successful verify), so the valid-key set excludes it and a cold exec still
+    /// rejects it. Even the always-miss path returns `None`.
+    #[test]
+    fn sig_cache_forged_sig_never_populated_and_cold_rejects() {
+        let k = ed(43);
+        let pk = k.verifying_key().to_bytes();
+        let owner = Address::from([0x43; 20]);
+        let mut store = SessionStore::new();
+        store.insert(pk, make_session(owner));
+
+        let mut action = sign_order(TEST_NONCE, &k);
+        // Forge the signature.
+        if let ActionSignature::Session { ref mut sig, .. } = action.signature {
+            sig.0[0] ^= 0xFF;
+        }
+        // A forged sig does NOT verify -> populate-on-verify never caches it.
+        assert!(action.verify_session_signature().is_err());
+        let keys = valid_session_sig_keys(std::slice::from_ref(&action));
+        assert!(keys.is_empty(), "forged sig must never enter the cache");
+
+        // Cold exec (always-miss) rejects it.
+        let miss = batch_verify_native_actions_cached(
+            std::slice::from_ref(&action),
+            TEST_NONCE,
+            |pk2| store.get(pk2).cloned(),
+            |_| None,
+            |_| false,
+        );
+        assert_eq!(miss[0], None, "forged sig rejected on the cold path");
+    }
+
+    /// #13.3 — key commitment at the consume site: a HIT populated for signature A
+    /// must NEVER validate a DIFFERENT action/nonce/sig B. Because the key commits
+    /// to the full (payload, nonce, pubkey, sig), B's key differs, so the cache
+    /// MISSes for B — and if B's own sig is forged, B is rejected.
+    #[test]
+    fn sig_cache_hit_for_sig_a_never_validates_action_b() {
+        let k = ed(44);
+        let pk = k.verifying_key().to_bytes();
+        let owner = Address::from([0x44; 20]);
+        let mut store = SessionStore::new();
+        store.insert(pk, make_session(owner));
+
+        // A: a legitimately signed, valid action -> its key is cached.
+        let action_a = sign_order(TEST_NONCE, &k);
+        let key_a =
+            crate::session_validity_cache_key(&action_a).expect("session action is keyed");
+
+        // B: a DIFFERENT action (different order id/nonce) with a FORGED sig.
+        let mut action_b = sign_order(TEST_NONCE + 1, &k);
+        if let ActionSignature::Session { ref mut sig, .. } = action_b.signature {
+            sig.0[0] ^= 0xFF;
+        }
+        let key_b = crate::session_validity_cache_key(&action_b).unwrap();
+        assert_ne!(key_a, key_b, "distinct actions must have distinct keys");
+
+        // Cache holds ONLY key A. Verify B: the cache does not hit for B, so B's
+        // forged sig hits the full-verify path and is rejected.
+        let mut only_a = std::collections::HashSet::new();
+        only_a.insert(key_a);
+        let got = batch_verify_native_actions_cached(
+            std::slice::from_ref(&action_b),
+            TEST_NONCE + 1,
+            |pk2| store.get(pk2).cloned(),
+            |_| None,
+            hitting_cache(only_a),
+        );
+        assert_eq!(
+            got[0], None,
+            "a HIT for sig A must never validate a different action B"
+        );
     }
 }
