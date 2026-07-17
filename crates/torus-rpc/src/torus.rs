@@ -644,9 +644,19 @@ impl TorusApiServer for RpcState {
         let key = mid.to_be_bytes();
 
         let snapshot = match self.state.get_cf_raw(CF_NATIVE_ORDER_BOOKS, &key) {
-            Ok(Some(data)) => OrderBookSnapshot::try_from_slice(&data)
-                .map_err(|e| RpcError::Internal(format!("borsh decode: {e}")))
-                .map_err(ErrorObjectOwned::from)?,
+            // Decode in the format `save_order_books` actually writes: a borsh
+            // `OrderBook` blob (native_executor.rs). Aggregate its resting orders
+            // into price levels via `to_snapshot()`. Fall back to the historical
+            // `OrderBookSnapshot` layout for any legacy value still in the CF (the
+            // column family has held both formats). Before this fix the handler
+            // decoded EVERY value as `OrderBookSnapshot`, so non-trivial production
+            // books failed to borsh-decode (~88% error rate under churn).
+            Ok(Some(data)) => match OrderBook::try_from_slice(&data) {
+                Ok(book) => book.to_snapshot(),
+                Err(_) => OrderBookSnapshot::try_from_slice(&data)
+                    .map_err(|e| RpcError::Internal(format!("borsh decode: {e}")))
+                    .map_err(ErrorObjectOwned::from)?,
+            },
             Ok(None) => {
                 return Ok(RpcOrderBook {
                     market_id,

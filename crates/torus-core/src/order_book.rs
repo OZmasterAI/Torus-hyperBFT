@@ -594,6 +594,38 @@ impl OrderBook {
         self.order_index.len()
     }
 
+    /// Aggregate the resting orders into price levels for the read side.
+    ///
+    /// Bids are returned DESCENDING (best/highest price first), asks ASCENDING
+    /// (best/lowest price first); the quantity of each level is the sum of the
+    /// remaining quantities of the orders resting at that price. This is the shape
+    /// both the `getOrderBook` RPC handler and the order-book reader precompile
+    /// return, and it decodes the format `save_order_books` actually persists (a
+    /// borsh-`OrderBook` blob) rather than the historical `OrderBookSnapshot`.
+    pub fn to_snapshot(&self) -> crate::precompiles::OrderBookSnapshot {
+        use crate::precompiles::{OrderBookSnapshot, PriceLevel};
+        let level = |queue: &VecDeque<Order>, price: FixedPoint| PriceLevel {
+            price,
+            quantity: queue
+                .iter()
+                .fold(FixedPoint::ZERO, |acc, o| acc + o.remaining_qty),
+        };
+        // Best bid = highest price first (BTreeMap iterates ascending, so reverse).
+        let bids = self
+            .bids
+            .iter()
+            .rev()
+            .map(|(price, queue)| level(queue, *price))
+            .collect();
+        // Best ask = lowest price first (natural ascending order).
+        let asks = self
+            .asks
+            .iter()
+            .map(|(price, queue)| level(queue, *price))
+            .collect();
+        OrderBookSnapshot { bids, asks }
+    }
+
     /// Number of bid price levels.
     pub fn bid_levels(&self) -> usize {
         self.bids.len()
@@ -2566,5 +2598,46 @@ mod tests {
         assert_eq!(restored.get_order(1).unwrap().remaining_qty, fp(10));
         assert!(restored.get_order(3).is_some());
         assert_eq!(restored.get_order(3).unwrap().remaining_qty, fp(8));
+    }
+
+    /// `to_snapshot` aggregates resting orders into price levels: bids descending
+    /// (best first), asks ascending (best first), quantities summed per price. The
+    /// round-trip through borsh proves the exact bytes `save_order_books` persists
+    /// decode into the correct read-side snapshot (the getOrderBook fix).
+    #[test]
+    fn to_snapshot_aggregates_levels_from_persisted_bytes() {
+        let mut ob = book();
+        // Two bids at 99 (must sum) + a lower bid at 98; two asks at 100 and 101.
+        ob.place_order(limit_buy(fp(99), fp(8)), addr(1), 1);
+        ob.place_order(limit_buy(fp(99), fp(2)), addr(2), 2);
+        ob.place_order(limit_buy(fp(98), fp(3)), addr(3), 3);
+        ob.place_order(limit_sell(fp(100), fp(4)), addr(4), 4);
+        ob.place_order(limit_sell(fp(101), fp(1)), addr(5), 5);
+
+        // Decode the persisted bytes exactly as a reader would, then snapshot.
+        let bytes = borsh::to_vec(&ob).unwrap();
+        let snap = OrderBook::try_from_slice(&bytes).unwrap().to_snapshot();
+
+        // Bids DESCENDING, summed.
+        assert_eq!(snap.bids.len(), 2);
+        assert_eq!(snap.bids[0].price, fp(99));
+        assert_eq!(snap.bids[0].quantity, fp(10), "8 + 2 summed at price 99");
+        assert_eq!(snap.bids[1].price, fp(98));
+        assert_eq!(snap.bids[1].quantity, fp(3));
+
+        // Asks ASCENDING.
+        assert_eq!(snap.asks.len(), 2);
+        assert_eq!(snap.asks[0].price, fp(100));
+        assert_eq!(snap.asks[0].quantity, fp(4));
+        assert_eq!(snap.asks[1].price, fp(101));
+        assert_eq!(snap.asks[1].quantity, fp(1));
+    }
+
+    /// Empty book snapshots to empty levels.
+    #[test]
+    fn to_snapshot_empty_book_is_empty() {
+        let snap = book().to_snapshot();
+        assert!(snap.bids.is_empty());
+        assert!(snap.asks.is_empty());
     }
 }
