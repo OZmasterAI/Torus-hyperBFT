@@ -35,6 +35,20 @@ pub trait StateBackend: Clone + Send + Sync {
         prefix: Option<&[u8]>,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StateError>;
 
+    /// First `limit` entries of [`Self::iterate_cf`], in the same order.
+    /// Default is scan-then-truncate (always correct); backends with real
+    /// iterators should override to stop early (0x0800 top-N gas round).
+    fn iterate_cf_bounded(
+        &self,
+        cf: &str,
+        prefix: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StateError> {
+        let mut entries = self.iterate_cf(cf, prefix)?;
+        entries.truncate(limit);
+        Ok(entries)
+    }
+
     fn atomic_write(&self, ops: &[AtomicWriteOp<'_>]) -> Result<(), StateError>;
 
     fn get_account(&self, address: &Address) -> Result<Option<AccountInfo>, StateError> {
@@ -132,6 +146,50 @@ impl StateBackend for StateDb {
                 for item in iter {
                     let (key, value) = item?;
                     results.push((key.to_vec(), value.to_vec()));
+                }
+            }
+        }
+        Ok(results)
+    }
+
+    /// Early-stop override: touches at most `limit` entries instead of
+    /// materializing the whole prefix (the point of the bounded read).
+    fn iterate_cf_bounded(
+        &self,
+        cf: &str,
+        prefix: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StateError> {
+        let db = self.inner();
+        let cf_handle = db
+            .cf_handle(cf)
+            .ok_or_else(|| StateError::MissingColumnFamily(cf.to_string()))?;
+        let mut results = Vec::with_capacity(limit.min(1024));
+        if limit == 0 {
+            return Ok(results);
+        }
+        match prefix {
+            Some(pfx) => {
+                let iter = db.prefix_iterator_cf(cf_handle, pfx);
+                for item in iter {
+                    let (key, value) = item?;
+                    if !key.starts_with(pfx) {
+                        break;
+                    }
+                    results.push((key.to_vec(), value.to_vec()));
+                    if results.len() >= limit {
+                        break;
+                    }
+                }
+            }
+            None => {
+                let iter = db.iterator_cf(cf_handle, rocksdb::IteratorMode::Start);
+                for item in iter {
+                    let (key, value) = item?;
+                    results.push((key.to_vec(), value.to_vec()));
+                    if results.len() >= limit {
+                        break;
+                    }
                 }
             }
         }

@@ -43,6 +43,14 @@ pub const GAS_PRECOMPILE_WRITE: u64 = 20_000;
 /// Complex operations (governance, liquidation).
 pub const GAS_PRECOMPILE_COMPLEX: u64 = 50_000;
 
+/// 0x0800 top-N gas round — CONSENSUS CONSTANTS (frozen at deploy).
+/// `getOrderBook` returns at most this many best price levels per side;
+/// bounds both the response and the validator work (O(N) level-row reads).
+pub const TOP_N_LEVELS_PER_SIDE: u32 = 200;
+/// Gas surcharge per price level actually returned by `getOrderBook`.
+/// Worst case: `GAS_PRECOMPILE_READ + GAS_PER_BOOK_LEVEL × 2×TOP_N` = 42,600.
+pub const GAS_PER_BOOK_LEVEL: u64 = 100;
+
 /// Gas cost for a precompile by address ID.
 pub const fn precompile_gas(id: u16) -> u64 {
     match id {
@@ -263,6 +271,41 @@ pub fn execute_precompile(
     current_block: u64,
 ) -> Result<Vec<u8>, CoreError> {
     execute_precompile_inner(address, input, caller, state_db, current_block, false)
+        .map(|out| out.data)
+}
+
+/// Precompile result with its deterministic gas cost. `gas_used` is a pure
+/// function of consensus state + calldata (getOrderBook charges per level
+/// returned; every other precompile is flat) — identical across validators
+/// and in eth_estimateGas.
+#[derive(Clone, Debug)]
+pub struct PrecompileOutput {
+    pub data: Vec<u8>,
+    pub gas_used: u64,
+}
+
+/// [`execute_precompile`] variant returning the deterministic gas cost
+/// alongside the output. The EVM provider charges THIS value.
+pub fn execute_precompile_with_gas(
+    address: &Address,
+    input: &[u8],
+    caller: &Address,
+    state_db: &StateDb,
+    current_block: u64,
+) -> Result<PrecompileOutput, CoreError> {
+    execute_precompile_inner(address, input, caller, state_db, current_block, false)
+}
+
+/// Read-only (eth_call / eth_estimateGas) variant of
+/// [`execute_precompile_with_gas`] — same gas function, writers denied.
+pub fn execute_precompile_read_only_with_gas(
+    address: &Address,
+    input: &[u8],
+    caller: &Address,
+    state_db: &StateDb,
+    current_block: u64,
+) -> Result<PrecompileOutput, CoreError> {
+    execute_precompile_inner(address, input, caller, state_db, current_block, true)
 }
 
 /// Read-only variant for eth_call / eth_estimateGas simulation.
@@ -281,6 +324,7 @@ pub fn execute_precompile_read_only(
     current_block: u64,
 ) -> Result<Vec<u8>, CoreError> {
     execute_precompile_inner(address, input, caller, state_db, current_block, true)
+        .map(|out| out.data)
 }
 
 fn execute_precompile_inner(
@@ -290,7 +334,7 @@ fn execute_precompile_inner(
     state_db: &StateDb,
     current_block: u64,
     read_only: bool,
-) -> Result<Vec<u8>, CoreError> {
+) -> Result<PrecompileOutput, CoreError> {
     let bytes = address.as_slice();
     if !bytes[..18].iter().all(|&b| b == 0) {
         return Err(CoreError::InvalidPrecompileInput(
@@ -307,14 +351,22 @@ fn execute_precompile_inner(
         ));
     }
 
+    // Only the order-book reader has level-dependent gas; every other
+    // precompile stays at its flat schedule cost.
+    let flat = |data: Vec<u8>| PrecompileOutput {
+        data,
+        gas_used: precompile_gas(id),
+    };
     match id {
         ADDR_ORDER_BOOK_READER => order_book_reader(input, state_db),
-        ADDR_BALANCE_READER => balance_reader(input, state_db),
-        ADDR_ORACLE_READER => oracle_reader(input, state_db, current_block),
-        ADDR_STAKING_READER => staking_reader(input, state_db),
-        ADDR_CORE_WRITER => core_writer(input, caller, state_db, current_block),
-        ADDR_CORE_WRITER_STAKING => core_writer_staking(input, caller, state_db, current_block),
-        ADDR_LOCKBOX => lockbox_precompile(input, caller, state_db),
+        ADDR_BALANCE_READER => balance_reader(input, state_db).map(flat),
+        ADDR_ORACLE_READER => oracle_reader(input, state_db, current_block).map(flat),
+        ADDR_STAKING_READER => staking_reader(input, state_db).map(flat),
+        ADDR_CORE_WRITER => core_writer(input, caller, state_db, current_block).map(flat),
+        ADDR_CORE_WRITER_STAKING => {
+            core_writer_staking(input, caller, state_db, current_block).map(flat)
+        }
+        ADDR_LOCKBOX => lockbox_precompile(input, caller, state_db).map(flat),
         _ => Err(CoreError::InvalidPrecompileInput(format!(
             "unknown precompile 0x{id:04x}"
         ))),
@@ -325,66 +377,66 @@ fn execute_precompile_inner(
 // OrderBookReader (0x0800) — tasks 2.4.1
 // ============================================================================
 
-fn order_book_reader(input: &[u8], state_db: &StateDb) -> Result<Vec<u8>, CoreError> {
+fn order_book_reader(input: &[u8], state_db: &StateDb) -> Result<PrecompileOutput, CoreError> {
     let sel = abi::selector(input)?;
+    let flat = |data: Vec<u8>| PrecompileOutput {
+        data,
+        gas_used: GAS_PRECOMPILE_READ,
+    };
 
     if sel == selector_for("getOrderBook(bytes32)") {
         let market_id = abi::decode_market_id(&abi::word(input, 0)?);
-        read_order_book(state_db, market_id)
+        read_order_book(state_db, market_id, TOP_N_LEVELS_PER_SIDE)
+    } else if sel == selector_for("getOrderBook(bytes32,uint32)") {
+        let market_id = abi::decode_market_id(&abi::word(input, 0)?);
+        let n_word = abi::word(input, 1)?;
+        // uint32 param: high words nonzero (or > cap) saturate to the cap —
+        // the caller can never request more than TOP_N_LEVELS_PER_SIDE.
+        let n = if n_word[..28].iter().any(|&b| b != 0) {
+            TOP_N_LEVELS_PER_SIDE
+        } else {
+            u32::from_be_bytes(n_word[28..].try_into().unwrap()).min(TOP_N_LEVELS_PER_SIDE)
+        };
+        read_order_book(state_db, market_id, n)
     } else if sel == selector_for("getPosition(address,bytes32)") {
         let trader = abi::decode_address(&abi::word(input, 0)?);
         let market_id = abi::decode_market_id(&abi::word(input, 1)?);
-        read_position(state_db, &trader, market_id)
+        read_position(state_db, &trader, market_id).map(flat)
     } else if sel == selector_for("getOpenOrders(address,bytes32)") {
         let trader = abi::decode_address(&abi::word(input, 0)?);
         let market_id = abi::decode_market_id(&abi::word(input, 1)?);
-        read_open_orders(state_db, &trader, market_id)
+        read_open_orders(state_db, &trader, market_id).map(flat)
     } else {
         Err(CoreError::UnknownSelector(sel))
     }
 }
 
 /// getOrderBook → (uint128[] bid_prices, uint128[] bid_qtys, uint128[] ask_prices, uint128[] ask_qtys)
-fn read_order_book(state_db: &StateDb, market_id: MarketId) -> Result<Vec<u8>, CoreError> {
-    // Deep-book round: reconstruct the book from its per-order rows and
-    // aggregate into price levels. An absent market returns empty levels; a
-    // LEGACY monolithic value or corrupt row propagates a loud error (the
-    // precompile reverts) instead of silently misreading book state.
-    let snapshot = match crate::order_book_store::load_book(state_db, market_id)? {
-        Some(book) => book.to_snapshot(),
-        None => OrderBookSnapshot {
-            bids: vec![],
-            asks: vec![],
-        },
-    };
+///
+/// 0x0800 top-N gas round: reads the best `n` levels per side from the
+/// aggregate LEVEL rows — O(n) point reads, NEVER a full-book row scan —
+/// and charges `GAS_PRECOMPILE_READ + GAS_PER_BOOK_LEVEL × levels_returned`.
+/// An absent market returns empty levels; a LEGACY monolithic value or a
+/// corrupt row propagates a loud error (the precompile reverts) instead of
+/// silently misreading book state.
+fn read_order_book(
+    state_db: &StateDb,
+    market_id: MarketId,
+    n: u32,
+) -> Result<PrecompileOutput, CoreError> {
+    let (bids, asks) = crate::order_book_store::load_top_levels(state_db, market_id, n as usize)?;
 
-    let bid_prices: Vec<[u8; 32]> = snapshot
-        .bids
-        .iter()
-        .map(|l| abi::encode_fp_as_u128(l.price))
-        .collect();
-    let bid_qtys: Vec<[u8; 32]> = snapshot
-        .bids
-        .iter()
-        .map(|l| abi::encode_fp_as_u128(l.quantity))
-        .collect();
-    let ask_prices: Vec<[u8; 32]> = snapshot
-        .asks
-        .iter()
-        .map(|l| abi::encode_fp_as_u128(l.price))
-        .collect();
-    let ask_qtys: Vec<[u8; 32]> = snapshot
-        .asks
-        .iter()
-        .map(|l| abi::encode_fp_as_u128(l.quantity))
-        .collect();
+    let bid_prices: Vec<[u8; 32]> = bids.iter().map(|l| abi::encode_fp_as_u128(l.0)).collect();
+    let bid_qtys: Vec<[u8; 32]> = bids.iter().map(|l| abi::encode_fp_as_u128(l.1)).collect();
+    let ask_prices: Vec<[u8; 32]> = asks.iter().map(|l| abi::encode_fp_as_u128(l.0)).collect();
+    let ask_qtys: Vec<[u8; 32]> = asks.iter().map(|l| abi::encode_fp_as_u128(l.1)).collect();
 
-    Ok(abi::encode_arrays_response(&[
-        &bid_prices,
-        &bid_qtys,
-        &ask_prices,
-        &ask_qtys,
-    ]))
+    let gas_used =
+        GAS_PRECOMPILE_READ + GAS_PER_BOOK_LEVEL * (bids.len() as u64 + asks.len() as u64);
+    Ok(PrecompileOutput {
+        data: abi::encode_arrays_response(&[&bid_prices, &bid_qtys, &ask_prices, &ask_qtys]),
+        gas_used,
+    })
 }
 
 /// getPosition → (int128 size, uint128 entry_price, int128 unrealized_pnl, int128 realized_pnl, uint128 margin)

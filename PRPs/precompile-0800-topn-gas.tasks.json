@@ -1,0 +1,61 @@
+{
+  "prp": "precompile-0800-topn-gas",
+  "created": "2026-07-17T13:30:00+02:00",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Level-row layer + journal (CF_NATIVE_BOOK_LEVELS, level_journal, save_book_delta)",
+      "status": "pending",
+      "files": [
+        "crates/torus-state/src/cf.rs",
+        "crates/torus-core/src/order_book.rs",
+        "crates/torus-core/src/order_book_store.rs"
+      ],
+      "validate": "cargo test -p torus-core order_book",
+      "depends_on": []
+    },
+    {
+      "id": 2,
+      "name": "Bounded backend iteration (iterate_cf_bounded: trait default, rocks early-stop, overlay merge)",
+      "status": "pending",
+      "files": ["crates/torus-state/src/backend.rs"],
+      "validate": "cargo test -p torus-state bounded",
+      "depends_on": []
+    },
+    {
+      "id": 3,
+      "name": "Bounded top-N read + getOrderBook(bytes32,uint32) selector",
+      "status": "pending",
+      "files": ["crates/torus-core/src/precompiles.rs"],
+      "validate": "cargo test -p torus-integration-tests --test cross_vm_read",
+      "depends_on": [1, 2]
+    },
+    {
+      "id": 4,
+      "name": "Dynamic gas plumbing (PrecompileOutput{data,gas_used}, provider post-exec record_cost)",
+      "status": "pending",
+      "files": [
+        "crates/torus-core/src/precompiles.rs",
+        "crates/torus-evm/src/precompile_provider.rs"
+      ],
+      "validate": "cargo test -p torus-evm",
+      "depends_on": [3]
+    },
+    {
+      "id": 5,
+      "name": "Full workspace suite + book-cache resume proof for level rows",
+      "status": "pending",
+      "files": ["crates/torus-bridge/tests/book_cache_tests.rs"],
+      "validate": "cargo test --workspace",
+      "depends_on": [4]
+    },
+    {
+      "id": 6,
+      "name": "Devnet no-regression A/B vs fd00010 (cross, 16k-depth, determinism, reader-spam)",
+      "status": "pending",
+      "files": ["devnet/docker-compose.yml"],
+      "validate": "scratchpad mission RESULTS.txt verdict PASS",
+      "depends_on": [5]
+    }
+  ]
+}

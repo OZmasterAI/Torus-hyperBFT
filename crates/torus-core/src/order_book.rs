@@ -178,6 +178,13 @@ pub struct OrderBook {
     /// save skip deletes for orders placed AND removed between two saves
     /// (no row was ever written).
     row_exists: HashSet<OrderId>,
+    /// Level journal (0x0800 top-N gas round): `(side_tag, raw_price)` of
+    /// every price level touched since the last save. Drained by
+    /// `take_level_ops` into aggregate level-row upserts/deletes.
+    level_journal: BTreeSet<(u8, i128)>,
+    /// Levels that currently have a persisted aggregate row in the CF
+    /// (same skip-useless-tombstones role as `row_exists`).
+    level_exists: HashSet<(u8, i128)>,
 }
 
 impl OrderBook {
@@ -198,6 +205,8 @@ impl OrderBook {
             next_seq: 1,
             row_journal: BTreeSet::new(),
             row_exists: HashSet::new(),
+            level_journal: BTreeSet::new(),
+            level_exists: HashSet::new(),
         }
     }
 
@@ -482,6 +491,8 @@ impl OrderBook {
 
         self.order_seq.remove(&order_id);
         self.row_journal.insert(order_id);
+        self.level_journal
+            .insert((crate::order_book_store::side_tag(order.side), order.price.raw()));
 
         Ok(order)
     }
@@ -505,6 +516,8 @@ impl OrderBook {
                         cancelled.push(queue.remove(pos).unwrap());
                         self.order_seq.remove(&order_id);
                         self.row_journal.insert(order_id);
+                        self.level_journal
+                            .insert((crate::order_book_store::side_tag(loc.side), loc.price.raw()));
                     }
                     if queue.is_empty() {
                         book.remove(&loc.price);
@@ -547,6 +560,10 @@ impl OrderBook {
                             let modified = order.clone();
                             // In-place change: same seq (priority kept), row rewritten.
                             self.row_journal.insert(order_id);
+                            self.level_journal.insert((
+                                crate::order_book_store::side_tag(loc.side),
+                                loc.price.raw(),
+                            ));
                             return Ok(modified);
                         }
                     }
@@ -777,12 +794,14 @@ impl OrderBook {
                         taker,
                         queue,
                         best_ask,
+                        Side::Sell,
                         &mut fills,
                         &mut self_trade_cancels,
                         &mut self.order_index,
                         &mut self.trader_orders,
                         &mut self.order_seq,
                         &mut self.row_journal,
+                        &mut self.level_journal,
                     );
                     if self.asks.get(&best_ask).is_none_or(|q| q.is_empty()) {
                         self.asks.remove(&best_ask);
@@ -803,12 +822,14 @@ impl OrderBook {
                         taker,
                         queue,
                         best_bid,
+                        Side::Buy,
                         &mut fills,
                         &mut self_trade_cancels,
                         &mut self.order_index,
                         &mut self.trader_orders,
                         &mut self.order_seq,
                         &mut self.row_journal,
+                        &mut self.level_journal,
                     );
                     if self.bids.get(&best_bid).is_none_or(|q| q.is_empty()) {
                         self.bids.remove(&best_bid);
@@ -827,13 +848,20 @@ impl OrderBook {
         taker: &mut Order,
         queue: &mut VecDeque<Order>,
         price: FixedPoint,
+        maker_side: Side,
         fills: &mut Vec<Fill>,
         self_trade_cancels: &mut Vec<OrderId>,
         order_index: &mut HashMap<OrderId, OrderLocation>,
         trader_orders: &mut HashMap<Address, Vec<OrderId>>,
         order_seq: &mut HashMap<OrderId, u64>,
         row_journal: &mut BTreeSet<OrderId>,
+        level_journal: &mut BTreeSet<(u8, i128)>,
     ) {
+        // Every path below mutates this maker level (self-trade pop, partial
+        // fill, full fill) — journal it once up front.
+        if taker.remaining_qty > FixedPoint::ZERO && !queue.is_empty() {
+            level_journal.insert((crate::order_book_store::side_tag(maker_side), price.raw()));
+        }
         while taker.remaining_qty > FixedPoint::ZERO && !queue.is_empty() {
             let maker = queue.front().unwrap();
 
@@ -910,6 +938,8 @@ impl OrderBook {
         self.next_seq += 1;
         self.order_seq.insert(id, seq);
         self.row_journal.insert(id);
+        self.level_journal
+            .insert((crate::order_book_store::side_tag(side), price.raw()));
     }
 
     /// Would placing an order at `price` cross the spread?
@@ -1382,6 +1412,8 @@ impl BorshDeserialize for OrderBook {
             next_seq: 1,
             row_journal: BTreeSet::new(),
             row_exists: HashSet::new(),
+            level_journal: BTreeSet::new(),
+            level_exists: HashSet::new(),
         };
 
         for _ in 0..order_count {
@@ -1538,6 +1570,10 @@ impl OrderBook {
         self.trader_orders.entry(trader).or_default().push(id);
         self.order_seq.insert(id, seq);
         self.row_exists.insert(id);
+        // A loaded order implies its level's aggregate row is persisted
+        // (save-path invariant) — mark it so a later emptying save deletes it.
+        self.level_exists
+            .insert((crate::order_book_store::side_tag(side), price.raw()));
         debug_assert!(seq < self.next_seq, "loaded seq {seq} >= header next_seq");
     }
 
@@ -1583,6 +1619,69 @@ impl OrderBook {
     /// Number of journaled (touched-since-last-save) rows — test/metrics hook.
     pub fn journaled_rows(&self) -> usize {
         self.row_journal.len()
+    }
+
+    /// Drain the level journal into aggregate level-row ops, O(touched
+    /// levels): `((side_tag, raw_price), Some(total_qty))` = upsert,
+    /// `((side_tag, raw_price), None)` = delete. Levels touched-and-emptied
+    /// with no persisted row are skipped (mirrors `take_row_ops`).
+    /// Deterministic: BTreeSet drain order.
+    pub(crate) fn take_level_ops(&mut self) -> Vec<((u8, i128), Option<FixedPoint>)> {
+        let keys = std::mem::take(&mut self.level_journal);
+        let mut ops = Vec::with_capacity(keys.len());
+        for key in keys {
+            let (tag, raw_price) = key;
+            let price = FixedPoint::from_raw(raw_price);
+            let book = if tag == crate::order_book_store::SIDE_TAG_BID {
+                &self.bids
+            } else {
+                &self.asks
+            };
+            let total = book.get(&price).filter(|q| !q.is_empty()).map(|queue| {
+                queue
+                    .iter()
+                    .fold(FixedPoint::ZERO, |acc, o| acc + o.remaining_qty)
+            });
+            match total {
+                Some(qty) => {
+                    self.level_exists.insert(key);
+                    ops.push((key, Some(qty)));
+                }
+                None => {
+                    if self.level_exists.remove(&key) {
+                        ops.push((key, None));
+                    }
+                }
+            }
+        }
+        ops
+    }
+
+    /// Aggregate level rows for EVERY non-empty level (full write — genesis,
+    /// tests, offline migration). Resets the level journal and marks all
+    /// level rows persisted. Deterministic: bids then asks, price ascending.
+    pub(crate) fn full_level_ops(&mut self) -> Vec<((u8, i128), FixedPoint)> {
+        self.level_journal.clear();
+        self.level_exists.clear();
+        let mut ops = Vec::with_capacity(self.bids.len() + self.asks.len());
+        for (side_book, tag) in [
+            (&self.bids, crate::order_book_store::SIDE_TAG_BID),
+            (&self.asks, crate::order_book_store::SIDE_TAG_ASK),
+        ] {
+            for (price, queue) in side_book {
+                if queue.is_empty() {
+                    continue;
+                }
+                let qty = queue
+                    .iter()
+                    .fold(FixedPoint::ZERO, |acc, o| acc + o.remaining_qty);
+                ops.push(((tag, price.raw()), qty));
+            }
+        }
+        for (key, _) in &ops {
+            self.level_exists.insert(*key);
+        }
+        ops
     }
 }
 
