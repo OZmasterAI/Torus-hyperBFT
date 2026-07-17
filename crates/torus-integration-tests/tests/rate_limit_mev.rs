@@ -294,6 +294,7 @@ fn native_actions_ordered_by_sender_within_category() {
         (sender_a, NativeAction::CancelOrder { order_id: 2 }),
     ];
 
+    let actions: Vec<_> = actions.iter().map(|(s, a)| (*s, a)).collect();
     let (pre_evm, _) = sort_native_actions(&actions);
     assert_eq!(pre_evm.len(), 2);
 
@@ -315,6 +316,7 @@ fn native_ordering_not_manipulable_by_submission_order() {
         (b, NativeAction::CancelOrder { order_id: 1 }),
         (a, NativeAction::CancelOrder { order_id: 2 }),
     ];
+    let actions_v1: Vec<_> = actions_v1.iter().map(|(s, a)| (*s, a)).collect();
     let (pre_v1, _) = sort_native_actions(&actions_v1);
 
     // Submit in order: A then B.
@@ -322,6 +324,7 @@ fn native_ordering_not_manipulable_by_submission_order() {
         (a, NativeAction::CancelOrder { order_id: 2 }),
         (b, NativeAction::CancelOrder { order_id: 1 }),
     ];
+    let actions_v2: Vec<_> = actions_v2.iter().map(|(s, a)| (*s, a)).collect();
     let (pre_v2, _) = sort_native_actions(&actions_v2);
 
     // Same result regardless of submission order.
