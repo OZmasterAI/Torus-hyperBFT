@@ -127,6 +127,16 @@ struct ExecutionContext {
     /// ExecutionContext at execution-thread exit, which drains the queue before
     /// `TorusApp::Drop`'s join returns (shutdown flush ordering).
     trade_writer: Option<torus_state::BackgroundCfWriter>,
+    /// Deep-book round (load side): cross-block book cache. Holds the post-
+    /// save in-memory books between consecutive committed heights so the next
+    /// block's `NativeExecContext` RESUMES instead of rebuilding every book
+    /// from its per-order rows (O(all resting orders) per block at depth).
+    /// Node-local pure read-avoidance — never changes what is written, so it
+    /// can never fork. Self-guarding: stored only after a SUCCESSFUL flush,
+    /// consumed only when its `next_height` matches the executing block, and
+    /// dropped otherwise (fall back to the disk load). Kill switch:
+    /// `TORUS_EXEC_BOOK_CACHE=0/false/off/no` restores per-block reload.
+    book_cache: std::sync::Mutex<Option<torus_bridge::native_executor::BookCacheState>>,
     /// P3 Task-1: background writer for the per-block CF_BLOCK_BODIES JSON write,
     /// gated by TORUS_ASYNC_BODY_PERSIST. `Some` moves the RocksDB body put off
     /// the execution thread (the block-body put was 12.7% of exec_block on the
@@ -159,6 +169,19 @@ fn env_flag(name: &str) -> bool {
             )
         })
         .unwrap_or(false)
+}
+
+/// Deep-book round: cross-block book cache kill switch. Default ON —
+/// `TORUS_EXEC_BOOK_CACHE=0/false/off/no` restores the per-block disk reload
+/// (same state either way; the cache is node-local read-avoidance only).
+fn book_cache_enabled() -> bool {
+    match std::env::var("TORUS_EXEC_BOOK_CACHE") {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        ),
+        Err(_) => true,
+    }
 }
 
 /// RH4: DA-body GC retention window in blocks, from `TORUS_DA_BODY_RETENTION`.
@@ -582,17 +605,44 @@ impl ExecutionContext {
 
             let ctx_setup_timer = std::time::Instant::now();
             let (pre_evm, post_evm) = sort_native_actions(&sender_actions);
-            let mut ctx = NativeExecContext::new(
-                overlay.clone(),
-                torus_block.header.height,
-                torus_block.header.timestamp,
-                torus_block.header.epoch,
-                self.epoch_length,
-                self.max_validators,
-                torus_block.header.proposer,
-                self.treasury_address,
-                self.dev_pool_address,
-            );
+            // Deep-book round: RESUME from the cross-block book cache when it
+            // is valid for exactly this height; otherwise (restart, replay,
+            // flush failure, kill switch) fall back to the disk load. The
+            // overlay is fresh either way — only the book READ is skipped.
+            let cached_books = if book_cache_enabled() {
+                self.book_cache
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .filter(|c| c.next_height == torus_block.header.height)
+            } else {
+                None
+            };
+            let mut ctx = match cached_books {
+                Some(cache) => NativeExecContext::resume(
+                    overlay.clone(),
+                    cache,
+                    torus_block.header.height,
+                    torus_block.header.timestamp,
+                    torus_block.header.epoch,
+                    self.epoch_length,
+                    self.max_validators,
+                    torus_block.header.proposer,
+                    self.treasury_address,
+                    self.dev_pool_address,
+                ),
+                None => NativeExecContext::new(
+                    overlay.clone(),
+                    torus_block.header.height,
+                    torus_block.header.timestamp,
+                    torus_block.header.epoch,
+                    self.epoch_length,
+                    self.max_validators,
+                    torus_block.header.proposer,
+                    self.treasury_address,
+                    self.dev_pool_address,
+                ),
+            };
             ctx.metrics = self.metrics.clone();
             // P3 Round-1 item 3: the book load ran inside NativeExecContext::new
             // (before metrics were wired) — publish its timing + decode counters now.
@@ -646,8 +696,22 @@ impl ExecutionContext {
             // flips. A trie-maintenance failure never drops committed native state (the native-CF
             // writes are in the same batch and are written even if the trie ops are skipped); it
             // only leaves the off-by-default incremental native root stale for this block.
-            if let Err(e) = overlay.flush_with_native_trie(&self.state_db) {
-                tracing::error!(%e, height, "native overlay flush / incremental native trie maintenance failed");
+            match overlay.flush_with_native_trie(&self.state_db) {
+                Ok(()) => {
+                    // Flush succeeded: the CF rows now hold exactly what the
+                    // in-memory books say — safe to carry them to height+1.
+                    if book_cache_enabled() {
+                        *self.book_cache.lock().unwrap() =
+                            Some(ctx.take_book_cache(height + 1));
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(%e, height, "native overlay flush / incremental native trie maintenance failed");
+                    // Disk may be behind the in-memory books — drop the cache
+                    // so the next block reloads from the durable rows (exactly
+                    // the pre-cache failure semantics).
+                    *self.book_cache.lock().unwrap() = None;
+                }
             }
 
             // Phase A: native post-commit credited EVM account balances (fees / validator rewards)
@@ -1361,6 +1425,7 @@ impl TorusApp {
             metrics: metrics.clone(),
             mempool: mempool.clone(),
             exec_trust_cache: config.exec_trust_cache,
+            book_cache: std::sync::Mutex::new(None),
             // O3: 256 queued blocks of trade KVs max — a full queue blocks the
             // execution thread (backpressure) instead of ballooning memory.
             trade_writer: Some(torus_state::BackgroundCfWriter::spawn(
@@ -3142,6 +3207,7 @@ mod crash_recovery_tests {
             metrics: None,
             mempool,
             exec_trust_cache,
+            book_cache: std::sync::Mutex::new(None),
             // None -> trades write inline through the overlay (pre-O3 behavior),
             // keeping these tests' reads deterministic right after execution.
             trade_writer: None,
