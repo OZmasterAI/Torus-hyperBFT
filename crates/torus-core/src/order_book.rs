@@ -9,7 +9,7 @@
 //! - All arithmetic via FixedPoint (no f64)
 //! - Deterministic: same input sequence → same state
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::{self, Read as IoRead, Write as IoWrite};
 
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -157,6 +157,27 @@ pub struct OrderBook {
     last_trade_price: Option<FixedPoint>,
     /// Guard against recursive stop triggering.
     triggering_stops: bool,
+
+    // ---- Per-order-row persistence state (deep-book storage round) ----
+    //
+    // CONSENSUS-CRITICAL: intra-price-level queue order is NOT ascending
+    // order-id (`modify_order` cancel+reinserts with the SAME id at the BACK
+    // of the queue), so every resting order carries an explicit insertion
+    // sequence. `next_seq` is persisted in the book header — recomputing it
+    // as max(seq)+1 at reload would assign different seqs on a restarted
+    // node whenever cancels left a gap at the top, forking the state root.
+    /// Insertion sequence per resting order (assigned by `insert_order`,
+    /// preserved by in-place modifies, reassigned on cancel+reinsert).
+    order_seq: HashMap<OrderId, u64>,
+    /// Monotonic seq allocator. Part of the persisted header (consensus state).
+    next_seq: u64,
+    /// Row journal: order ids whose persisted row must be upserted (still
+    /// resting) or deleted (gone) at the next save. Drained by `take_row_ops`.
+    row_journal: BTreeSet<OrderId>,
+    /// Order ids that currently have a persisted row in the CF — lets the
+    /// save skip deletes for orders placed AND removed between two saves
+    /// (no row was ever written).
+    row_exists: HashSet<OrderId>,
 }
 
 impl OrderBook {
@@ -173,6 +194,10 @@ impl OrderBook {
             next_id: 1,
             last_trade_price: None,
             triggering_stops: false,
+            order_seq: HashMap::new(),
+            next_seq: 1,
+            row_journal: BTreeSet::new(),
+            row_exists: HashSet::new(),
         }
     }
 
@@ -455,6 +480,9 @@ impl OrderBook {
             }
         }
 
+        self.order_seq.remove(&order_id);
+        self.row_journal.insert(order_id);
+
         Ok(order)
     }
 
@@ -475,6 +503,8 @@ impl OrderBook {
                 if let Some(queue) = book.get_mut(&loc.price) {
                     if let Some(pos) = queue.iter().position(|o| o.id == order_id) {
                         cancelled.push(queue.remove(pos).unwrap());
+                        self.order_seq.remove(&order_id);
+                        self.row_journal.insert(order_id);
                     }
                     if queue.is_empty() {
                         book.remove(&loc.price);
@@ -514,7 +544,10 @@ impl OrderBook {
                     if let Some(order) = queue.iter_mut().find(|o| o.id == order_id) {
                         if new_q > FixedPoint::ZERO && new_q < order.remaining_qty {
                             order.remaining_qty = new_q;
-                            return Ok(order.clone());
+                            let modified = order.clone();
+                            // In-place change: same seq (priority kept), row rewritten.
+                            self.row_journal.insert(order_id);
+                            return Ok(modified);
                         }
                     }
                 }
@@ -684,6 +717,40 @@ impl OrderBook {
         for queue in self.bids.values().chain(self.asks.values()) {
             assert!(!queue.is_empty(), "Empty price level in book");
         }
+        // Invariant 5 (per-order-row persistence): every resting order has an
+        // insertion seq below the allocator, and within each price level the
+        // seqs strictly increase front-to-back (seq order == queue order —
+        // what reload relies on).
+        assert_eq!(
+            self.order_seq.len(),
+            self.order_index.len(),
+            "order_seq({}) != order_index({})",
+            self.order_seq.len(),
+            self.order_index.len()
+        );
+        for queue in self.bids.values().chain(self.asks.values()) {
+            let mut prev: Option<u64> = None;
+            for order in queue {
+                let seq = *self
+                    .order_seq
+                    .get(&order.id)
+                    .unwrap_or_else(|| panic!("order {} missing seq", order.id));
+                assert!(
+                    seq < self.next_seq,
+                    "order {} seq {seq} >= next_seq {}",
+                    order.id,
+                    self.next_seq
+                );
+                if let Some(p) = prev {
+                    assert!(
+                        seq > p,
+                        "queue seq not strictly increasing: {seq} after {p} (order {})",
+                        order.id
+                    );
+                }
+                prev = Some(seq);
+            }
+        }
     }
 
     // ========================================================================
@@ -714,6 +781,8 @@ impl OrderBook {
                         &mut self_trade_cancels,
                         &mut self.order_index,
                         &mut self.trader_orders,
+                        &mut self.order_seq,
+                        &mut self.row_journal,
                     );
                     if self.asks.get(&best_ask).is_none_or(|q| q.is_empty()) {
                         self.asks.remove(&best_ask);
@@ -738,6 +807,8 @@ impl OrderBook {
                         &mut self_trade_cancels,
                         &mut self.order_index,
                         &mut self.trader_orders,
+                        &mut self.order_seq,
+                        &mut self.row_journal,
                     );
                     if self.bids.get(&best_bid).is_none_or(|q| q.is_empty()) {
                         self.bids.remove(&best_bid);
@@ -751,6 +822,7 @@ impl OrderBook {
 
     /// Match taker against orders at a single price level.
     /// Static method to satisfy the borrow checker (operates on disjoint fields).
+    #[allow(clippy::too_many_arguments)]
     fn match_at_level(
         taker: &mut Order,
         queue: &mut VecDeque<Order>,
@@ -759,6 +831,8 @@ impl OrderBook {
         self_trade_cancels: &mut Vec<OrderId>,
         order_index: &mut HashMap<OrderId, OrderLocation>,
         trader_orders: &mut HashMap<Address, Vec<OrderId>>,
+        order_seq: &mut HashMap<OrderId, u64>,
+        row_journal: &mut BTreeSet<OrderId>,
     ) {
         while taker.remaining_qty > FixedPoint::ZERO && !queue.is_empty() {
             let maker = queue.front().unwrap();
@@ -770,6 +844,8 @@ impl OrderBook {
                 if let Some(ids) = trader_orders.get_mut(&cancelled.trader) {
                     ids.retain(|&id| id != cancelled.id);
                 }
+                order_seq.remove(&cancelled.id);
+                row_journal.insert(cancelled.id);
                 self_trade_cancels.push(cancelled.id);
                 continue;
             }
@@ -798,17 +874,23 @@ impl OrderBook {
             let maker = queue.front_mut().unwrap();
             maker.remaining_qty -= fill_qty;
 
+            // Maker row changed either way: partial fill rewrites it,
+            // full fill deletes it.
+            row_journal.insert(maker_id);
             if maker.remaining_qty == FixedPoint::ZERO {
                 let filled = queue.pop_front().unwrap();
                 order_index.remove(&filled.id);
                 if let Some(ids) = trader_orders.get_mut(&filled.trader) {
                     ids.retain(|&id| id != filled.id);
                 }
+                order_seq.remove(&filled.id);
             }
         }
     }
 
     /// Insert an order into the book (at the back of its price level queue).
+    /// Assigns the order's insertion sequence (queue-priority persistence)
+    /// and journals its row.
     fn insert_order(&mut self, order: Order) {
         let side = order.side;
         let price = order.price;
@@ -823,6 +905,11 @@ impl OrderBook {
 
         self.order_index.insert(id, OrderLocation { side, price });
         self.trader_orders.entry(trader).or_default().push(id);
+
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.order_seq.insert(id, seq);
+        self.row_journal.insert(id);
     }
 
     /// Would placing an order at `price` cross the spread?
@@ -1291,6 +1378,10 @@ impl BorshDeserialize for OrderBook {
             next_id,
             last_trade_price,
             triggering_stops: false,
+            order_seq: HashMap::new(),
+            next_seq: 1,
+            row_journal: BTreeSet::new(),
+            row_exists: HashSet::new(),
         };
 
         for _ in 0..order_count {
@@ -1308,7 +1399,190 @@ impl BorshDeserialize for OrderBook {
             book.pending_stops.push(stop);
         }
 
+        // Deserializing is a LOAD, not a mutation: the insert_order calls
+        // above journaled every order — clear that. (This legacy monolithic
+        // codec is retained for tests/reference only; production persistence
+        // is the per-order-row store.)
+        book.row_journal.clear();
+
         Ok(book)
+    }
+}
+
+// ============================================================================
+// Per-order-row persistence codec (deep-book storage round)
+//
+// The CF layout itself (keys, legacy detection, save/load orchestration)
+// lives in `crate::order_book_store`; this block owns the VALUE encodings,
+// which need access to the book's private fields.
+//
+// STATE-ROOT PREIMAGE: header and row bytes are committed by the native
+// state root. The encodings below are FROZEN once deployed.
+// ============================================================================
+
+/// Version byte leading every persisted book-header value.
+pub const BOOK_HEADER_VERSION: u8 = 1;
+
+impl OrderBook {
+    /// Encode the book header: everything about the book EXCEPT its resting
+    /// orders. `market_id` is carried by the CF key, not repeated here.
+    ///
+    /// Layout (all integers big-endian):
+    /// `version(1) ‖ tick(16) ‖ lot(16) ‖ next_id(16) ‖ ltp_tag(1)[‖ltp(16)]
+    ///  ‖ next_seq(8) ‖ stop_count(4) ‖ stops…`
+    pub(crate) fn encode_header(&self) -> Vec<u8> {
+        let mut w = Vec::with_capacity(80 + self.pending_stops.len() * 96);
+        w.push(BOOK_HEADER_VERSION);
+        borsh_write_fp(&self.tick_size, &mut w).expect("vec write");
+        borsh_write_fp(&self.lot_size, &mut w).expect("vec write");
+        w.extend_from_slice(&self.next_id.to_be_bytes());
+        match &self.last_trade_price {
+            None => w.push(0u8),
+            Some(ltp) => {
+                w.push(1u8);
+                borsh_write_fp(ltp, &mut w).expect("vec write");
+            }
+        }
+        w.extend_from_slice(&self.next_seq.to_be_bytes());
+        w.extend_from_slice(&(self.pending_stops.len() as u32).to_be_bytes());
+        for stop in &self.pending_stops {
+            stop.serialize(&mut w).expect("vec write");
+        }
+        w
+    }
+
+    /// Decode a header value into an EMPTY book shell (no resting orders yet
+    /// — the caller streams rows in via [`OrderBook::insert_loaded_order`]).
+    pub(crate) fn from_header_bytes(market_id: MarketId, bytes: &[u8]) -> io::Result<Self> {
+        let mut r = bytes;
+        let mut ver = [0u8; 1];
+        r.read_exact(&mut ver)?;
+        if ver[0] != BOOK_HEADER_VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "unknown order-book header version {} (this binary reads v{})",
+                    ver[0], BOOK_HEADER_VERSION
+                ),
+            ));
+        }
+        let tick_size = borsh_read_fp(&mut r)?;
+        let lot_size = borsh_read_fp(&mut r)?;
+        let mut nid = [0u8; 16];
+        r.read_exact(&mut nid)?;
+        let next_id = u128::from_be_bytes(nid);
+        let mut tag = [0u8; 1];
+        r.read_exact(&mut tag)?;
+        let last_trade_price = if tag[0] == 0 {
+            None
+        } else {
+            Some(borsh_read_fp(&mut r)?)
+        };
+        let mut nseq = [0u8; 8];
+        r.read_exact(&mut nseq)?;
+        let next_seq = u64::from_be_bytes(nseq);
+        let mut sc = [0u8; 4];
+        r.read_exact(&mut sc)?;
+        let stop_count = u32::from_be_bytes(sc) as usize;
+        let mut pending_stops = Vec::with_capacity(stop_count.min(1024));
+        for _ in 0..stop_count {
+            pending_stops.push(StopOrder::deserialize_reader(&mut r)?);
+        }
+
+        let mut book = OrderBook::new(market_id, tick_size, lot_size);
+        book.next_id = next_id;
+        book.last_trade_price = last_trade_price;
+        book.next_seq = next_seq;
+        book.pending_stops = pending_stops;
+        Ok(book)
+    }
+
+    /// Encode one resting order's row value: `seq(8 BE) ‖ Order` (the frozen
+    /// `Order` borsh codec; the order id is repeated inside for integrity).
+    /// `None` if the order is not resting.
+    pub(crate) fn encode_order_row(&self, order_id: OrderId) -> Option<Vec<u8>> {
+        let seq = *self.order_seq.get(&order_id)?;
+        let order = self.get_order(order_id)?;
+        let mut w = Vec::with_capacity(8 + 112);
+        w.extend_from_slice(&seq.to_be_bytes());
+        order.serialize(&mut w).expect("vec write");
+        Some(w)
+    }
+
+    /// Decode an order-row value into `(seq, order)`.
+    pub(crate) fn decode_order_row(bytes: &[u8]) -> io::Result<(u64, Order)> {
+        let mut r = bytes;
+        let mut s = [0u8; 8];
+        r.read_exact(&mut s)?;
+        let seq = u64::from_be_bytes(s);
+        let order = Order::deserialize_reader(&mut r)?;
+        Ok((seq, order))
+    }
+
+    /// Insert an order loaded FROM a persisted row: restores its stored seq,
+    /// does NOT journal (a load is not a mutation), and marks its row as
+    /// persisted. Callers must insert in canonical order (per level: seq
+    /// ascending) — `order_book_store::load_book` owns that ordering.
+    pub(crate) fn insert_loaded_order(&mut self, order: Order, seq: u64) {
+        let side = order.side;
+        let price = order.price;
+        let id = order.id;
+        let trader = order.trader;
+
+        let book = match side {
+            Side::Buy => &mut self.bids,
+            Side::Sell => &mut self.asks,
+        };
+        book.entry(price).or_default().push_back(order);
+        self.order_index.insert(id, OrderLocation { side, price });
+        self.trader_orders.entry(trader).or_default().push(id);
+        self.order_seq.insert(id, seq);
+        self.row_exists.insert(id);
+        debug_assert!(seq < self.next_seq, "loaded seq {seq} >= header next_seq");
+    }
+
+    /// Drain the row journal into row ops, O(touched since last save):
+    /// `(order_id, Some(row_bytes))` = upsert, `(order_id, None)` = delete.
+    /// Ids placed AND removed since the last save (no row ever persisted)
+    /// are skipped. Deterministic ascending-id order.
+    pub(crate) fn take_row_ops(&mut self) -> Vec<(OrderId, Option<Vec<u8>>)> {
+        let ids = std::mem::take(&mut self.row_journal);
+        let mut ops = Vec::with_capacity(ids.len());
+        for id in ids {
+            if self.order_index.contains_key(&id) {
+                let bytes = self
+                    .encode_order_row(id)
+                    .expect("resting order must encode");
+                self.row_exists.insert(id);
+                ops.push((id, Some(bytes)));
+            } else if self.row_exists.remove(&id) {
+                ops.push((id, None));
+            }
+        }
+        ops
+    }
+
+    /// Row upserts for EVERY resting order (full write — genesis, tests,
+    /// offline migration). Resets the journal and marks all rows persisted.
+    pub(crate) fn full_row_ops(&mut self) -> Vec<(OrderId, Vec<u8>)> {
+        self.row_journal.clear();
+        self.row_exists.clear();
+        let mut ids: Vec<OrderId> = self.order_index.keys().copied().collect();
+        ids.sort_unstable();
+        let mut ops = Vec::with_capacity(ids.len());
+        for id in ids {
+            let bytes = self
+                .encode_order_row(id)
+                .expect("resting order must encode");
+            self.row_exists.insert(id);
+            ops.push((id, bytes));
+        }
+        ops
+    }
+
+    /// Number of journaled (touched-since-last-save) rows — test/metrics hook.
+    pub fn journaled_rows(&self) -> usize {
+        self.row_journal.len()
     }
 }
 

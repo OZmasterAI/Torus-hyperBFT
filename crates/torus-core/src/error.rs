@@ -95,6 +95,22 @@ pub enum CoreError {
     #[error("borsh error: {0}")]
     Borsh(String),
 
+    /// Deep-book storage round: CF_NATIVE_ORDER_BOOKS holds per-order rows;
+    /// a monolithic (pre-round) value means this DB predates the layout
+    /// change. Refuse LOUDLY — decoding it any other way would silently
+    /// misread book state and fork the chain.
+    #[error(
+        "LEGACY monolithic order-book value in CF_NATIVE_ORDER_BOOKS (key {key_hex}): this \
+         binary persists per-order rows (state-root preimage change). Boot from a fresh chain \
+         or run the offline book migration before starting this node."
+    )]
+    LegacyOrderBookValue { key_hex: String },
+
+    /// An order-book row key that is neither header, order row, nor legacy —
+    /// unrecognized layout (corruption or a future format).
+    #[error("unrecognized order-book row key {key_hex} in CF_NATIVE_ORDER_BOOKS")]
+    CorruptOrderBookRow { key_hex: String },
+
     #[error("missing column family: {0}")]
     MissingCf(&'static str),
 
