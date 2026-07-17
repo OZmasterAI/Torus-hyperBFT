@@ -453,6 +453,7 @@ fn test_execution_ordering_enforced() {
         (addr(8), NativeAction::CancelOrder { order_id: 2 }),
     ];
 
+    let actions: Vec<_> = actions.iter().map(|(s, a)| (*s, a)).collect();
     let (pre_evm, post_evm) = sort_native_actions(&actions);
 
     // Pre-EVM group: cancellations first, then non-GTC orders.
