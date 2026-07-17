@@ -203,6 +203,84 @@ fn order_book_reader_get_order_book() {
     assert!(output.len() > 128); // At least 4 offset words
 }
 
+/// Decode an `encode_arrays_response` payload of N u128 arrays (the getOrderBook
+/// shape). Returns each array as a `Vec<u128>`.
+fn decode_u128_arrays(output: &[u8], n: usize) -> Vec<Vec<u128>> {
+    let read_u32 = |off: usize| -> usize {
+        u32::from_be_bytes(output[off + 28..off + 32].try_into().unwrap()) as usize
+    };
+    let read_u128 = |off: usize| -> u128 {
+        u128::from_be_bytes(output[off + 16..off + 32].try_into().unwrap())
+    };
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let arr_off = read_u32(i * 32);
+        let len = read_u32(arr_off);
+        let mut arr = Vec::with_capacity(len);
+        for j in 0..len {
+            arr.push(read_u128(arr_off + 32 + j * 32));
+        }
+        out.push(arr);
+    }
+    out
+}
+
+/// CONSENSUS-VISIBLE regression: the reader precompile must decode the format
+/// `save_order_books` actually writes (a borsh-`OrderBook` blob), aggregating
+/// resting orders into price levels. Before the fix it decoded every value as
+/// `OrderBookSnapshot`, so a non-trivial book failed to borsh-decode and this
+/// precompile REVERTED (returned Err). Now it returns the levels.
+#[test]
+fn order_book_reader_decodes_persisted_orderbook_blob() {
+    use torus_core::order_book::OrderBook;
+    use torus_types::{OrderType, PlaceOrderParams, TimeInForce};
+
+    let (_dir, db) = setup();
+
+    let limit = |is_buy: bool, price: i64, qty: i64| PlaceOrderParams {
+        market_id: 7,
+        is_buy,
+        price: fp(price),
+        quantity: fp(qty),
+        order_type: OrderType::Limit,
+        time_in_force: TimeInForce::GTC,
+        reduce_only: false,
+        client_order_id: None,
+    };
+
+    let mut book = OrderBook::new(7, fp(1), fp(1));
+    book.place_order(limit(true, 100, 5), addr(1), 1);
+    book.place_order(limit(true, 100, 3), addr(2), 1); // same level -> sums to 8
+    book.place_order(limit(true, 99, 2), addr(3), 1);
+    book.place_order(limit(false, 101, 4), addr(4), 1);
+    book.place_order(limit(false, 102, 1), addr(5), 1);
+
+    // Write the ACTUAL persisted format (a borsh-OrderBook blob), not a snapshot.
+    db.put_cf_raw(
+        torus_state::cf::CF_NATIVE_ORDER_BOOKS,
+        &7u64.to_be_bytes(),
+        &borsh::to_vec(&book).unwrap(),
+    )
+    .unwrap();
+
+    let address = precompile_address(ADDR_ORDER_BOOK_READER);
+    let input = build_input("getOrderBook(bytes32)", &[encode_market_id(7)]);
+    // Pre-fix this would be Err (borsh decode failure); post-fix it returns data.
+    let output = execute_precompile(&address, &input, &addr(0), &db, 100)
+        .expect("real OrderBook blob must decode, not revert");
+
+    let arrays = decode_u128_arrays(&output, 4);
+    let (bid_prices, bid_qtys, ask_prices, ask_qtys) =
+        (&arrays[0], &arrays[1], &arrays[2], &arrays[3]);
+
+    // Bids descending, quantities summed.
+    assert_eq!(bid_prices, &[fp(100).raw() as u128, fp(99).raw() as u128]);
+    assert_eq!(bid_qtys, &[fp(8).raw() as u128, fp(2).raw() as u128]);
+    // Asks ascending.
+    assert_eq!(ask_prices, &[fp(101).raw() as u128, fp(102).raw() as u128]);
+    assert_eq!(ask_qtys, &[fp(4).raw() as u128, fp(1).raw() as u128]);
+}
+
 #[test]
 fn order_book_reader_get_position() {
     let (_dir, db) = setup();
