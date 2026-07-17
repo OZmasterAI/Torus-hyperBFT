@@ -59,6 +59,21 @@ enum Command {
         warmup: usize,
         #[arg(long, default_value = "devnet/genesis.json")]
         genesis: String,
+        /// C3: execute over a NativeStateOverlay (in-memory pending writes,
+        /// read-through to RocksDB) — the LIVE node's exec backend (app.rs).
+        /// Default off keeps the legacy raw-RocksDB shape for comparability.
+        #[arg(long, default_value_t = false)]
+        overlay: bool,
+        /// C3: buffer trade-history KVs instead of inline PUTs (the live
+        /// node's O3 background-writer config). Default off = legacy shape.
+        #[arg(long, default_value_t = false)]
+        defer_trades: bool,
+        /// C3: draw order senders from a fixed pool of N addresses (0 = the
+        /// legacy unique-address-per-order shape). Real chain load reuses
+        /// senders heavily — unique-per-order makes every position/balance
+        /// row cold and times the state backend instead of settlement.
+        #[arg(long, default_value_t = 0)]
+        senders: usize,
     },
     Consensus {
         #[arg(
@@ -843,12 +858,18 @@ fn metric_sum(encoded: &str, metric: &str) -> f64 {
     0.0
 }
 
-fn run_matching_engine(orders: usize, markets: u64, warmup: usize, genesis_path: &str) {
+fn run_matching_engine(
+    orders: usize,
+    markets: u64,
+    warmup: usize,
+    genesis_path: &str,
+    overlay: bool,
+    defer_trades: bool,
+    senders: usize,
+) {
     use tempfile::TempDir;
-    use torus_bridge::native_executor::{NativeExecContext, NativeExecutor};
-    use torus_core::position::NativeBalance;
     use torus_genesis::Genesis;
-    use torus_state::StateDb;
+    use torus_state::{NativeStateOverlay, StateDb};
 
     let dir = TempDir::new().unwrap();
     let state_db = StateDb::open(dir.path()).unwrap();
@@ -857,16 +878,90 @@ fn run_matching_engine(orders: usize, markets: u64, warmup: usize, genesis_path:
     let _state_root = genesis.initialize(&state_db).unwrap();
     let chain_config = genesis.chain_config();
 
+    println!("=== Matching Engine Benchmark ===");
+    println!(
+        "Backend: {} | trades: {}",
+        if overlay {
+            "NativeStateOverlay (live exec shape)"
+        } else {
+            "raw StateDb (legacy)"
+        },
+        if defer_trades {
+            "deferred (live O3 shape)"
+        } else {
+            "inline PUTs (legacy)"
+        },
+    );
+
+    // C3: the LIVE node executes over a NativeStateOverlay with trade-history
+    // writes deferred to a background writer — raw-StateDb inline-put mode
+    // times RocksDB, not the exec pipeline. Both shapes stay available.
+    if overlay {
+        run_matching_engine_on(
+            NativeStateOverlay::new(state_db),
+            &chain_config,
+            orders,
+            markets,
+            warmup,
+            defer_trades,
+            senders,
+        );
+    } else {
+        run_matching_engine_on(
+            state_db,
+            &chain_config,
+            orders,
+            markets,
+            warmup,
+            defer_trades,
+            senders,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_matching_engine_on<T: torus_state::StateBackend>(
+    backend: T,
+    chain_config: &torus_types::ChainConfig,
+    orders: usize,
+    markets: u64,
+    warmup: usize,
+    defer_trades: bool,
+    senders: usize,
+) {
+    use torus_bridge::native_executor::{NativeExecContext, NativeExecutor};
+    use torus_core::position::NativeBalance;
+
     let mut rng = rand::thread_rng();
     let market_count = markets.max(1);
 
-    println!("=== Matching Engine Benchmark ===");
+    // Sender pool (0 = legacy unique-address-per-order).
+    let sender_pool: Vec<Address> = (0..senders).map(|_| random_address(&mut rng)).collect();
+    let mut pick_sender = {
+        let pool = sender_pool.clone();
+        move |rng: &mut rand::rngs::ThreadRng| -> Address {
+            if pool.is_empty() {
+                random_address(rng)
+            } else {
+                pool[rng.gen_range(0..pool.len())]
+            }
+        }
+    };
+
     println!("Markets: {market_count}");
+    println!(
+        "Senders: {}",
+        if senders == 0 {
+            "unique per order (legacy)".to_string()
+        } else {
+            format_num(senders as u64)
+        }
+    );
     println!("Warmup:  {} orders", format_num(warmup as u64));
     println!();
 
     let mut ctx = NativeExecContext::new(
-        state_db,
+        backend,
         1,
         1_700_000_000,
         0,
@@ -876,6 +971,7 @@ fn run_matching_engine(orders: usize, markets: u64, warmup: usize, genesis_path:
         chain_config.treasury_address,
         chain_config.dev_pool_address,
     );
+    ctx.defer_trades = defer_trades;
 
     // Fund every generated sender so Phase-2 margin reservation never rejects.
     // Random bench senders are otherwise unfunded (`get_native_balance` returns a
@@ -891,7 +987,7 @@ fn run_matching_engine(orders: usize, markets: u64, warmup: usize, genesis_path:
         let warmup_actions: Vec<(Address, NativeAction)> = (0..warmup)
             .map(|_| {
                 let mid = rng.gen_range(0..market_count);
-                (random_address(&mut rng), random_place_order(&mut rng, mid))
+                (pick_sender(&mut rng), random_place_order(&mut rng, mid))
             })
             .collect();
         for (addr, _) in &warmup_actions {
@@ -926,7 +1022,7 @@ fn run_matching_engine(orders: usize, markets: u64, warmup: usize, genesis_path:
         let actions: Vec<(Address, NativeAction)> = (0..batch_size)
             .map(|_| {
                 let mid = rng.gen_range(0..market_count);
-                (random_address(&mut rng), random_place_order(&mut rng, mid))
+                (pick_sender(&mut rng), random_place_order(&mut rng, mid))
             })
             .collect();
 
@@ -938,17 +1034,24 @@ fn run_matching_engine(orders: usize, markets: u64, warmup: usize, genesis_path:
         // Fresh metrics handle so the per-phase histograms reflect THIS batch only.
         let phase_metrics = std::sync::Arc::new(torus_telemetry::Metrics::new());
         ctx.metrics = Some(phase_metrics.clone());
+        let fills_before = ctx.trade_index;
         let t = Instant::now();
         NativeExecutor::execute_batch(&mut ctx, &actions);
         let elapsed = t.elapsed();
         ctx.metrics = None;
+        // Live O3 shape: the node hands buffered trade KVs to a background
+        // writer after exec — draining here keeps the buffer from growing
+        // across batches without charging the exec timer.
+        let deferred_kvs = ctx.take_pending_trades().len();
         let rate = batch_size as f64 / elapsed.as_secs_f64();
 
         println!(
-            "Batch {}: {:.0} orders/sec ({:.1}ms)",
+            "Batch {}: {:.0} orders/sec ({:.1}ms) | fills {} | deferred KVs {}",
             format_num(batch_size as u64),
             rate,
             elapsed.as_secs_f64() * 1000.0,
+            format_num((ctx.trade_index - fills_before) as u64),
+            format_num(deferred_kvs as u64),
         );
         let enc = phase_metrics.encode();
         println!(
@@ -2423,7 +2526,10 @@ async fn main() {
             markets,
             warmup,
             genesis,
-        } => run_matching_engine(orders, markets, warmup, &genesis),
+            overlay,
+            defer_trades,
+            senders,
+        } => run_matching_engine(orders, markets, warmup, &genesis, overlay, defer_trades, senders),
         Command::Consensus {
             rpc_urls,
             senders,

@@ -157,6 +157,220 @@ impl BalanceCache {
     }
 }
 
+// ============================================================================
+// C3 — deterministic parallel Phase-4 settlement: plumbing types
+// ============================================================================
+
+/// C2/C3: one Phase-2-prepared PlaceOrder flowing through matching (Phase 3)
+/// and settlement (Phase 4). `params` borrows the caller's committed action
+/// slice — no per-order deep clone anywhere in the pipeline.
+struct PreparedOrder<'a> {
+    index: usize,
+    sender: Address,
+    params: &'a PlaceOrderParams,
+    order_id: u128,
+    margin_reserved: FixedPoint,
+}
+
+/// One fill's trade-history rows — exactly the bytes `persist_trade` has
+/// always written to `CF_NATIVE_TRADES` (primary) and `CF_NATIVE_USER_TRADES`
+/// (maker + taker secondary index). C3: settle workers build these off-thread
+/// with OPTIMISTIC per-block indexes (exact whenever no fill application
+/// fails); the apply pass verifies `index` against the live counter and only
+/// re-stamps on divergence (sick-node path).
+struct TradeKvs {
+    /// The per-block trade index these bytes were built with.
+    index: u32,
+    trade_key: [u8; 20],
+    trade_data: Vec<u8>,
+    maker_key: [u8; 32],
+    maker_data: Vec<u8>,
+    taker_key: [u8; 32],
+    taker_data: Vec<u8>,
+}
+
+impl TradeKvs {
+    /// Byte-identical to the classic inline `persist_trade` construction.
+    fn build(
+        market_id: MarketId,
+        block_height: u64,
+        timestamp: u64,
+        trade_index: u32,
+        fill: &torus_core::order_book::Fill,
+    ) -> Self {
+        let taker_side: u8 = if fill.maker_side == Side::Buy { 1 } else { 0 };
+
+        // Primary key: market_id(8) + block_number(8) + trade_index(4)
+        let mut trade_key = [0u8; 20];
+        trade_key[..8].copy_from_slice(&market_id.to_be_bytes());
+        trade_key[8..16].copy_from_slice(&block_height.to_be_bytes());
+        trade_key[16..20].copy_from_slice(&trade_index.to_be_bytes());
+
+        let trade_id = trade_index as u128;
+        let price_raw = fill.price.raw();
+        let quantity_raw = fill.quantity.raw();
+
+        // Borsh-serialize trade data (matches StoredTrade layout).
+        // 16+16+16+1+8+8 = 65 bytes exactly (the classic with_capacity(64)
+        // paid one realloc per fill).
+        let mut trade_data = Vec::with_capacity(65);
+        trade_data.extend_from_slice(&trade_id.to_le_bytes());
+        trade_data.extend_from_slice(&price_raw.to_le_bytes());
+        trade_data.extend_from_slice(&quantity_raw.to_le_bytes());
+        trade_data.push(taker_side);
+        trade_data.extend_from_slice(&block_height.to_le_bytes());
+        trade_data.extend_from_slice(&timestamp.to_le_bytes());
+
+        // Secondary index: per-user trades (descending block order).
+        // 16+8+16+16+1+1+8+8 = 74 bytes exactly.
+        let desc_block = u64::MAX - block_height;
+        let mut maker_data = Vec::with_capacity(74);
+        maker_data.extend_from_slice(&trade_id.to_le_bytes());
+        maker_data.extend_from_slice(&market_id.to_le_bytes());
+        maker_data.extend_from_slice(&price_raw.to_le_bytes());
+        maker_data.extend_from_slice(&quantity_raw.to_le_bytes());
+        maker_data.push(taker_side);
+        maker_data.push(0u8); // role: maker
+        maker_data.extend_from_slice(&block_height.to_le_bytes());
+        maker_data.extend_from_slice(&timestamp.to_le_bytes());
+
+        let mut maker_key = [0u8; 32];
+        maker_key[..20].copy_from_slice(fill.maker.as_slice());
+        maker_key[20..28].copy_from_slice(&desc_block.to_be_bytes());
+        maker_key[28..32].copy_from_slice(&trade_index.to_be_bytes());
+
+        // Taker entry (flip role byte at offset 57: 16+8+16+16+1)
+        let mut taker_data = maker_data.clone();
+        taker_data[57] = 1u8; // role: taker
+        let mut taker_key = [0u8; 32];
+        taker_key[..20].copy_from_slice(fill.taker.as_slice());
+        taker_key[20..28].copy_from_slice(&desc_block.to_be_bytes());
+        taker_key[28..32].copy_from_slice(&trade_index.to_be_bytes());
+
+        Self {
+            index: trade_index,
+            trade_key,
+            trade_data,
+            maker_key,
+            maker_data,
+            taker_key,
+            taker_data,
+        }
+    }
+
+    /// Stamp the definitive per-block trade index over the provisional one:
+    /// 4-byte BE index in each of the 3 keys, 16-byte LE trade_id at the head
+    /// of each of the 3 values. Offsets are fixed by the layouts in `build`.
+    fn stamp_trade_index(&mut self, idx: u32) {
+        let be = idx.to_be_bytes();
+        let id_le = (idx as u128).to_le_bytes();
+        self.index = idx;
+        self.trade_key[16..20].copy_from_slice(&be);
+        self.trade_data[0..16].copy_from_slice(&id_le);
+        self.maker_key[28..32].copy_from_slice(&be);
+        self.maker_data[0..16].copy_from_slice(&id_le);
+        self.taker_key[28..32].copy_from_slice(&be);
+        self.taker_data[0..16].copy_from_slice(&id_le);
+    }
+}
+
+/// C3: everything a settle worker precomputes for ONE prepared order —
+/// aligned index-for-index with the market's `PreparedOrder`s/match results.
+/// All of it is either market-local (position transitions live in the plan's
+/// `PositionCache`) or balance-INDEPENDENT amounts; every cross-market
+/// mutation (balance clamps, trade_index, results) happens later on the apply
+/// thread in canonical order.
+struct OrderSettlePlan {
+    /// Taker-side order-margin release amount (pre-clamp; ZERO = none).
+    margin_release: FixedPoint,
+    /// Realized-PnL events in exact fill-application order: (side label for
+    /// error text, trader, pnl). Emitted precisely when `apply_fill_cached`
+    /// returns `Some` — including `Some(ZERO)` (still materializes the row).
+    pnl_events: Vec<(&'static str, Address, FixedPoint)>,
+    /// First position-side fill-application failure, pre-formatted like the
+    /// sequential path ("taker fill failed: …" / "maker fill failed: …").
+    fill_error: Option<String>,
+    /// Prebuilt trade rows (provisional index), empty when `fill_error`.
+    trades: Vec<TradeKvs>,
+}
+
+/// C3: one market's full settlement plan, computed off-thread by a pure pass
+/// over `(MarketBatchResult, [PreparedOrder])`.
+struct MarketSettlePlan {
+    orders: Vec<OrderSettlePlan>,
+    /// This market's position mutations. Keys are `(trader, market_id)` — the
+    /// per-market key sets are disjoint, so merging into the batch cache in
+    /// sorted market order reproduces the sequential cache exactly.
+    pos_cache: PositionCache,
+    /// A5 maker/STP release amounts, in the deterministic order
+    /// `maker_margin_releases` has always produced.
+    maker_releases: Vec<(Address, FixedPoint)>,
+}
+
+/// C3 runtime toggle: `TORUS_PARALLEL_SETTLE=0` forces the sequential settle
+/// path; anything else (including unset) keeps parallel settle ON. Read once.
+fn parallel_settle_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        parse_parallel_settle_toggle(std::env::var("TORUS_PARALLEL_SETTLE").ok())
+    })
+}
+
+/// Pure parse of the `TORUS_PARALLEL_SETTLE` value (default ON; only `"0"`
+/// disables — mirrors the TORUS_SHARD_CUSTODY toggle doctrine).
+fn parse_parallel_settle_toggle(v: Option<String>) -> bool {
+    !matches!(v.as_deref().map(str::trim), Some("0"))
+}
+
+/// C3 auto-mode work gate: parallel settle pays a thread scope + plan handoff,
+/// so the env-driven path engages it only when the batch produced at least
+/// this many fills (across >=2 markets). Explicitly forced modes
+/// (`execute_batch_settle_mode`) bypass the gate — determinism holds at any
+/// size, this is purely a break-even heuristic. Tunable for bench sweeps via
+/// `TORUS_PARALLEL_SETTLE_MIN_FILLS`.
+fn parallel_settle_min_fills() -> usize {
+    static MIN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MIN.get_or_init(|| {
+        std::env::var("TORUS_PARALLEL_SETTLE_MIN_FILLS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(1024)
+    })
+}
+
+/// How the Phase-4 settle path is chosen.
+#[derive(Clone, Copy)]
+enum SettleMode {
+    /// Env toggle + work gate (the live `execute_batch` path).
+    Auto,
+    /// Pinned by the caller (tests / A-B benches): true = parallel whenever
+    /// >=2 markets have work, false = always the sequential loop.
+    Force(bool),
+}
+
+#[cfg(test)]
+mod parallel_settle_toggle_tests {
+    use super::parse_parallel_settle_toggle;
+
+    #[test]
+    fn default_is_on() {
+        assert!(parse_parallel_settle_toggle(None));
+    }
+
+    #[test]
+    fn zero_disables() {
+        assert!(!parse_parallel_settle_toggle(Some("0".to_string())));
+        assert!(!parse_parallel_settle_toggle(Some(" 0 ".to_string())));
+    }
+
+    #[test]
+    fn anything_else_stays_on() {
+        for v in ["1", "true", "on", "", "yes", "2"] {
+            assert!(parse_parallel_settle_toggle(Some(v.to_string())), "{v}");
+        }
+    }
+}
+
 pub struct NativeExecContext<T: StateBackend = StateDb> {
     pub positions: PositionManager<T>,
     pub oracle: OracleManager<T>,
@@ -516,12 +730,35 @@ impl NativeExecutor {
     ///   Phase 1 — Execute all non-PlaceOrder actions sequentially
     ///   Phase 2 — Pre-reserve margin, assign global order IDs, partition by market
     ///   Phase 3 — Parallel matching: one thread per market's OrderBook
-    ///   Phase 4 — Sequential settlement: release margin, apply fills, persist trades
+    ///   Phase 4 — Settlement: release margin, apply fills, persist trades.
+    ///             C3: parallel per-market compute + deterministic apply
+    ///             (`TORUS_PARALLEL_SETTLE=0` forces the classic sequential loop).
     ///
     /// Individual action failures do NOT stop the batch (deterministic semantics).
     pub fn execute_batch<T: StateBackend>(
         ctx: &mut NativeExecContext<T>,
         actions: &[(Address, NativeAction)],
+    ) -> NativeBatchResult {
+        Self::execute_batch_inner(ctx, actions, SettleMode::Auto)
+    }
+
+    /// `execute_batch` with the Phase-4 settle mode pinned explicitly —
+    /// `parallel = false` runs the classic sequential settle loop; `true`
+    /// runs the parallel path whenever >=2 markets have work (no size gate).
+    /// For A/B benches and the differential determinism tests (per-process
+    /// env vars race across test threads; this doesn't).
+    pub fn execute_batch_settle_mode<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+        actions: &[(Address, NativeAction)],
+        parallel: bool,
+    ) -> NativeBatchResult {
+        Self::execute_batch_inner(ctx, actions, SettleMode::Force(parallel))
+    }
+
+    fn execute_batch_inner<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+        actions: &[(Address, NativeAction)],
+        settle_mode: SettleMode,
     ) -> NativeBatchResult {
         // One flattened executable entry: either a PlaceOrder's params (single or
         // batch-expanded) or any other action. C2: everything is BORROWED from the
@@ -605,17 +842,9 @@ impl NativeExecutor {
 
         // ---- Phase 2: Pre-reserve margin, assign IDs, partition by market ----
         let margin_timer = std::time::Instant::now();
-        // C2: `params` borrows from the caller's `actions` slice — the prepared
-        // order carries an 8-byte reference through Phases 2-4 instead of a
-        // per-order deep clone of `PlaceOrderParams`.
-        struct PreparedOrder<'a> {
-            index: usize,
-            sender: Address,
-            params: &'a PlaceOrderParams,
-            order_id: u128,
-            margin_reserved: FixedPoint,
-        }
-
+        // C2: `PreparedOrder.params` borrows from the caller's `actions` slice
+        // — the prepared order carries an 8-byte reference through Phases 2-4
+        // instead of a per-order deep clone of `PlaceOrderParams`.
         let mut market_batches: HashMap<MarketId, Vec<PreparedOrder<'_>>> = HashMap::new();
 
         // O1: write-through balance cache, scoped to this execute_batch call. Serves
@@ -753,7 +982,7 @@ impl NativeExecutor {
                 .observe(match_timer.elapsed().as_secs_f64());
         }
 
-        // ---- Phase 4: Sequential settlement ----
+        // ---- Phase 4: settlement ----
         // A5: settle markets in market-id order. `match_parallel` returns
         // HashMap iteration order (random per instance) — balance mutations
         // are commutative so consensus state never depended on it, but the
@@ -762,6 +991,81 @@ impl NativeExecutor {
         // releases do observe settlement order. Sorting pins both.
         market_results.sort_by_key(|m| m.market_id);
         let settle_timer = std::time::Instant::now();
+        // C3: parallel settle pays a thread scope + plan handoff, so it needs
+        // >=2 markets with work (always) and, in Auto mode, enough fills to
+        // amortize the overhead. The sequential loop remains the canonical
+        // semantics that the parallel path must reproduce byte-for-byte.
+        let use_parallel = market_results.len() >= 2
+            && match settle_mode {
+                SettleMode::Force(parallel) => parallel,
+                SettleMode::Auto => {
+                    parallel_settle_enabled() && {
+                        let total_fills: usize = market_results
+                            .iter()
+                            .flat_map(|m| m.results.iter())
+                            .map(|r| r.result.fills.len())
+                            .sum();
+                        total_fills >= parallel_settle_min_fills()
+                    }
+                }
+            };
+        if use_parallel {
+            Self::settle_market_results_parallel(
+                ctx,
+                market_results,
+                &market_batches,
+                &mut results,
+                &mut total_gas,
+                &mut bal_cache,
+                &mut pos_cache,
+            );
+        } else {
+            Self::settle_market_results_sequential(
+                ctx,
+                market_results,
+                &market_batches,
+                &mut results,
+                &mut total_gas,
+                &mut bal_cache,
+                &mut pos_cache,
+            );
+        }
+
+        // C1/O1: materialize all deferred position + balance mutations into the
+        // overlay before the call returns (each in deterministic sorted-key
+        // order), so the next execute_batch call and every post-batch consumer
+        // sees authoritative state. A flush failure means committed fills are
+        // not in the overlay — that block must never be applied, so latch the
+        // fatal (the committer halts the execution pipeline on it).
+        if let Err(e) = pos_cache.flush_all(&ctx.positions) {
+            ctx.fatal_error = Some(format!("position cache flush failed: {e}"));
+        }
+        if let Err(e) = bal_cache.flush_all(&ctx.positions) {
+            ctx.fatal_error = Some(format!("balance cache flush failed: {e}"));
+        }
+
+        if let Some(ref m) = ctx.metrics {
+            m.exec_phase_settle_seconds
+                .observe(settle_timer.elapsed().as_secs_f64());
+        }
+
+        NativeBatchResult { results, total_gas }
+    }
+
+    /// Classic Phase-4 settlement: one thread walks the (market-id-sorted)
+    /// match results and performs every mutation inline. This is the CANONICAL
+    /// settle semantics — `settle_market_results_parallel` must produce
+    /// byte-identical state, and `TORUS_PARALLEL_SETTLE=0` falls back here.
+    #[allow(clippy::too_many_arguments)]
+    fn settle_market_results_sequential<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+        market_results: Vec<crate::market_workers::MarketBatchResult>,
+        market_batches: &HashMap<MarketId, Vec<PreparedOrder<'_>>>,
+        results: &mut [NativeActionResult],
+        total_gas: &mut u64,
+        bal_cache: &mut BalanceCache,
+        pos_cache: &mut PositionCache,
+    ) {
         for mbr in market_results {
             let market_id = mbr.market_id;
 
@@ -843,8 +1147,8 @@ impl NativeExecutor {
                     let taker_is_buy = fill.maker_side != Side::Buy;
                     if let Err(e) = Self::apply_fill_via_caches(
                         &ctx.positions,
-                        &mut pos_cache,
-                        &mut bal_cache,
+                        pos_cache,
+                        bal_cache,
                         &fill.taker,
                         market_id,
                         taker_is_buy,
@@ -860,8 +1164,8 @@ impl NativeExecutor {
                     }
                     if let Err(e) = Self::apply_fill_via_caches(
                         &ctx.positions,
-                        &mut pos_cache,
-                        &mut bal_cache,
+                        pos_cache,
+                        bal_cache,
                         &fill.maker,
                         market_id,
                         fill.maker_side == Side::Buy,
@@ -895,7 +1199,7 @@ impl NativeExecutor {
                     Self::record_order_status_funnel(m, &result.status, result.fills.len());
                 }
 
-                total_gas += 1000;
+                *total_gas += 1000;
                 results[prep.index] = NativeActionResult::ok("place_order", 1000);
             }
 
@@ -917,26 +1221,387 @@ impl NativeExecutor {
                 }
             }
         }
+    }
 
-        // C1/O1: materialize all deferred position + balance mutations into the
-        // overlay before the call returns (each in deterministic sorted-key
-        // order), so the next execute_batch call and every post-batch consumer
-        // sees authoritative state. A flush failure means committed fills are
-        // not in the overlay — that block must never be applied, so latch the
-        // fatal (the committer halts the execution pipeline on it).
-        if let Err(e) = pos_cache.flush_all(&ctx.positions) {
-            ctx.fatal_error = Some(format!("position cache flush failed: {e}"));
+    /// C3: deterministic parallel Phase-4 settlement.
+    ///
+    /// Pass A (parallel, scoped thread per market — same pool shape as
+    /// Phase-3 matching): a PURE compute of each market's settle plan. Workers
+    /// only BORROW (`&MarketBatchResult`, `&[PreparedOrder]`, `&PositionManager`)
+    /// and mutate nothing shared:
+    ///   - position transitions land in a per-market `PositionCache` — position
+    ///     keys are `(trader, market_id)`, so the per-market key sets are
+    ///     provably disjoint and within-market application order is preserved
+    ///     by the worker loop ⇒ merged caches are identical to the sequential
+    ///     shared cache;
+    ///   - realized-PnL events are RECORDED (not applied) in exact fill order —
+    ///     `fill_transition` never reads balances, so splitting position math
+    ///     from the balance credit cannot change any position outcome;
+    ///   - taker/maker margin-release AMOUNTS are precomputed — they are pure
+    ///     in (market config, params, match results, post-match book) and
+    ///     independent of balances (only the defensive clamp reads a balance);
+    ///   - trade-history rows are byte-built with a provisional index.
+    ///
+    /// Pass B (single-threaded): applies every cross-market mutation in
+    /// EXACTLY the sequential order — markets ascending by id, orders in
+    /// prepared order, PnL credits in fill order (taker then maker), then the
+    /// market's A5 maker releases — so every `.min(order_margin)` clamp sees
+    /// byte-identical balance state, and `trade_index` stamps the identical
+    /// key sequence. Merged position caches flush later through the one
+    /// sorted `flush_all`, identical to sequential.
+    ///
+    /// Determinism proof obligations (C3):
+    ///   - fee accounting order: NO fees are touched in Phase 4
+    ///     (`total_native_fees` is only read at the epoch boundary) — nothing
+    ///     to order;
+    ///   - realized-PnL accumulation order: position-side accumulation is
+    ///     market-local (worker order == sequential order); balance-side
+    ///     credits happen in pass B in the sequential order;
+    ///   - margin release order (A5): all releases apply in pass B in the
+    ///     sequential order with precomputed amounts.
+    ///
+    /// Failure semantics: a worker panic aborts NOTHING durable — since
+    /// workers borrow only, no shared state has mutated, so we log and fall
+    /// back to the sequential loop (which, being canonical, either succeeds
+    /// or fails exactly as a sequential node would). Position-load errors
+    /// inside a worker are captured per-order exactly like the sequential
+    /// path. The one sequential/parallel divergence window left is a FAILING
+    /// BALANCE-ROW READ at PnL-credit time (backend IO/corruption): both
+    /// modes fail the order and skip its trades, but the sequential loop also
+    /// stops applying that order's later-fill POSITION deltas, while the plan
+    /// already computed them. A node whose balance rows fail to read is
+    /// already diverging from healthy peers under sequential settle (the
+    /// order soft-fails node-locally); the state root catches it either way.
+    #[allow(clippy::too_many_arguments)]
+    fn settle_market_results_parallel<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+        market_results: Vec<crate::market_workers::MarketBatchResult>,
+        market_batches: &HashMap<MarketId, Vec<PreparedOrder<'_>>>,
+        results: &mut [NativeActionResult],
+        total_gas: &mut u64,
+        bal_cache: &mut BalanceCache,
+        pos_cache: &mut PositionCache,
+    ) {
+        // Optimistic per-market trade-index bases (market_results is sorted):
+        // exact whenever no fill application fails, because then EVERY fill of
+        // EVERY order consumes one index in settlement order. A worker-side
+        // fill failure aborts to the sequential fallback below, so used plans
+        // always carry final indexes and pass B appends without touching the
+        // row bytes again.
+        let trade_bases: Vec<u32> = {
+            let mut base = ctx.trade_index;
+            market_results
+                .iter()
+                .map(|mbr| {
+                    let b = base;
+                    let fills: usize =
+                        mbr.results.iter().map(|r| r.result.fills.len()).sum();
+                    base += fills as u32;
+                    b
+                })
+                .collect()
+        };
+
+        // ---- Pass A: pure per-market plans on scoped threads ----
+        let plans: Vec<Result<MarketSettlePlan, String>> = {
+            let positions = &ctx.positions;
+            let margin_configs = &ctx.margin_configs;
+            let (block_height, timestamp) = (ctx.block_height, ctx.timestamp);
+            std::thread::scope(|s| {
+                let handles: Vec<_> = market_results
+                    .iter()
+                    .zip(trade_bases.iter().copied())
+                    .map(|(mbr, trade_base)| {
+                        let prepared: &[PreparedOrder<'_>] = market_batches
+                            .get(&mbr.market_id)
+                            .map(|v| v.as_slice())
+                            .unwrap_or(&[]);
+                        let cfg = margin_configs.get(&mbr.market_id);
+                        s.spawn(move || {
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                Self::compute_market_settle_plan(
+                                    positions,
+                                    cfg,
+                                    mbr,
+                                    prepared,
+                                    block_height,
+                                    timestamp,
+                                    trade_base,
+                                )
+                            }))
+                            .map_err(|payload| {
+                                if let Some(s) = payload.downcast_ref::<&'static str>() {
+                                    (*s).to_string()
+                                } else if let Some(s) = payload.downcast_ref::<String>() {
+                                    s.clone()
+                                } else {
+                                    "non-string panic payload".to_string()
+                                }
+                            })
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| {
+                        h.join()
+                            .unwrap_or_else(|_| Err("settle worker thread died".to_string()))
+                    })
+                    .collect()
+            })
+        };
+
+        // Fallback triggers: a worker panic, or ANY position-side fill
+        // application failure (backend read error — sick-node territory).
+        // Workers borrowed only, so no shared state has mutated and the books
+        // are still owned by `market_results` — the canonical sequential loop
+        // reruns the whole settlement from scratch and is authoritative for
+        // error semantics (per-order failure results, skipped trades).
+        let fallback_reason = plans.iter().find_map(|p| match p {
+            Err(msg) => Some(msg.clone()),
+            Ok(plan) => plan
+                .orders
+                .iter()
+                .find_map(|o| o.fill_error.clone()),
+        });
+        if let Some(msg) = fallback_reason {
+            tracing::error!(
+                error = %msg,
+                "C3: parallel settle aborted (worker panic or fill failure) — falling back to sequential settlement"
+            );
+            return Self::settle_market_results_sequential(
+                ctx,
+                market_results,
+                market_batches,
+                results,
+                total_gas,
+                bal_cache,
+                pos_cache,
+            );
         }
-        if let Err(e) = bal_cache.flush_all(&ctx.positions) {
-            ctx.fatal_error = Some(format!("balance cache flush failed: {e}"));
+        let plans: Vec<MarketSettlePlan> = plans.into_iter().map(|p| p.unwrap()).collect();
+
+        // ---- Pass B: deterministic apply, markets ascending by id ----
+        for (mbr, plan) in market_results.into_iter().zip(plans) {
+            let market_id = mbr.market_id;
+
+            // Reinsert updated book
+            ctx.order_books.insert(market_id, mbr.book);
+            ctx.dirty_books.insert(market_id);
+
+            // Update global ID high-water mark
+            if mbr.next_order_id > ctx.next_global_order_id {
+                ctx.next_global_order_id = mbr.next_order_id;
+            }
+
+            // This market's position mutations become part of the batch cache
+            // (disjoint keys across markets; single sorted flush at call end).
+            pos_cache.merge_disjoint(plan.pos_cache);
+
+            let prepared = match market_batches.get(&market_id) {
+                Some(p) => p,
+                None => continue,
+            };
+
+            for ((match_result, prep), oplan) in
+                mbr.results.iter().zip(prepared.iter()).zip(plan.orders)
+            {
+                let result = &match_result.result;
+
+                // Funnel (perf A1): STP maker cancels already happened in the
+                // book during matching — same site as sequential.
+                if let Some(ref m) = ctx.metrics {
+                    m.orders_self_trade_cancels
+                        .inc_by(result.self_trade_cancels.len() as u64);
+                }
+
+                // Taker-side margin release (amount precomputed; clamp here,
+                // where the balance authority lives).
+                if oplan.margin_release > FixedPoint::ZERO {
+                    if let Ok(mut bal) = bal_cache.load(&ctx.positions, &prep.sender) {
+                        let release = oplan.margin_release.min(bal.order_margin);
+                        bal.order_margin -= release;
+                        bal.available += release;
+                        bal_cache.set(&prep.sender, bal);
+                    }
+                }
+
+                // Realized-PnL credits, in exact fill order. Sequential
+                // interleaves balance credits with position application, so a
+                // balance-row READ failure at event j fails the order AT j —
+                // before any later (position-side) failure the worker may have
+                // recorded. The worker's event stream already stops at its own
+                // position failure, so walking it in order and failing on the
+                // first balance error reproduces the sequential outcome
+                // exactly; if no balance error occurs, the worker's position
+                // failure (if any) stands.
+                let mut fill_failed: Option<String> = None;
+                for (side, trader, pnl) in &oplan.pnl_events {
+                    match bal_cache.load(&ctx.positions, trader) {
+                        Ok(mut bal) => {
+                            bal.available += *pnl;
+                            bal_cache.set(trader, bal);
+                        }
+                        Err(e) => {
+                            fill_failed = Some(format!("{side} fill failed: {e}"));
+                            break;
+                        }
+                    }
+                }
+                if fill_failed.is_none() {
+                    fill_failed = oplan.fill_error;
+                }
+
+                if let Some(err) = fill_failed {
+                    results[prep.index] = NativeActionResult::err("place_order", err);
+                    // Funnel (perf A1): died on fill application, not on the book.
+                    if let Some(ref m) = ctx.metrics {
+                        m.orders_rejected_other.inc();
+                    }
+                    continue;
+                }
+
+                // Persist trades: stamp the definitive per-block index into
+                // the worker-built bytes, then route exactly like persist_trade.
+                for mut kvs in oplan.trades {
+                    kvs.stamp_trade_index(ctx.trade_index);
+                    Self::route_trade_kvs(ctx, kvs);
+                    ctx.trade_index += 1;
+                }
+
+                if let Some(ref m) = ctx.metrics {
+                    m.orders_matched.inc_by(result.fills.len() as u64);
+                    Self::record_order_status_funnel(m, &result.status, result.fills.len());
+                }
+
+                *total_gas += 1000;
+                results[prep.index] = NativeActionResult::ok("place_order", 1000);
+            }
+
+            // A5 maker/STP releases — amounts precomputed by the worker in the
+            // canonical order; clamps applied here against live balances.
+            for (trader, amount) in plan.maker_releases {
+                if let Ok(mut bal) = bal_cache.load(&ctx.positions, &trader) {
+                    let release = amount.min(bal.order_margin);
+                    bal.order_margin -= release;
+                    bal.available += release;
+                    bal_cache.set(&trader, bal);
+                }
+            }
+        }
+    }
+
+    /// C3 pass-A worker: compute one market's settlement plan. PURE with
+    /// respect to shared state — reads positions through a fresh per-market
+    /// cache, mutates only plan-local data. Mirrors the sequential loop's
+    /// per-order semantics exactly (see `settle_market_results_sequential`).
+    fn compute_market_settle_plan<T: StateBackend>(
+        positions: &PositionManager<T>,
+        cfg: Option<&MarketMarginConfig>,
+        mbr: &crate::market_workers::MarketBatchResult,
+        prepared: &[PreparedOrder<'_>],
+        block_height: u64,
+        timestamp: u64,
+    ) -> MarketSettlePlan {
+        let market_id = mbr.market_id;
+        let mut pos_cache = PositionCache::new();
+        let mut orders = Vec::with_capacity(prepared.len());
+
+        for (match_result, prep) in mbr.results.iter().zip(prepared.iter()) {
+            let result = &match_result.result;
+
+            // Taker-side release amount — same formula as sequential.
+            let mut margin_release = FixedPoint::ZERO;
+            if prep.margin_reserved > FixedPoint::ZERO {
+                let order_rests = matches!(
+                    result.status,
+                    OrderStatus::Resting
+                        | OrderStatus::PartiallyFilled
+                        | OrderStatus::PendingTrigger
+                );
+                let filled_qty: FixedPoint = result
+                    .fills
+                    .iter()
+                    .map(|f| f.quantity)
+                    .fold(FixedPoint::ZERO, |a, b| a + b);
+
+                margin_release = if !order_rests {
+                    prep.margin_reserved
+                } else if filled_qty > FixedPoint::ZERO {
+                    prep.margin_reserved
+                        - Self::reserve_for_qty_cfg(
+                            cfg,
+                            prep.params.price,
+                            prep.params.quantity - filled_qty,
+                        )
+                } else {
+                    FixedPoint::ZERO
+                };
+            }
+
+            // Fill application: position transitions into the market-local
+            // cache; PnL events recorded in exact order; first POSITION-side
+            // failure stops the order like sequential (its message matches).
+            let mut pnl_events: Vec<(&'static str, Address, FixedPoint)> = Vec::new();
+            let mut fill_error: Option<String> = None;
+            'fills: for fill in &result.fills {
+                let taker_is_buy = fill.maker_side != Side::Buy;
+                for (side, trader, is_buy) in [
+                    ("taker", &fill.taker, taker_is_buy),
+                    ("maker", &fill.maker, fill.maker_side == Side::Buy),
+                ] {
+                    match positions.apply_fill_cached(
+                        &mut pos_cache,
+                        trader,
+                        market_id,
+                        is_buy,
+                        fill.quantity,
+                        fill.price,
+                        MarginType::Cross,
+                    ) {
+                        Ok(Some(pnl)) => pnl_events.push((side, *trader, pnl)),
+                        Ok(None) => {}
+                        Err(e) => {
+                            fill_error = Some(format!("{side} fill failed: {e}"));
+                            break 'fills;
+                        }
+                    }
+                }
+            }
+
+            // Trade rows (skipped wholesale on a failed order, like sequential;
+            // the definitive index is stamped in pass B).
+            let trades: Vec<TradeKvs> = if fill_error.is_none() {
+                result
+                    .fills
+                    .iter()
+                    .map(|f| TradeKvs::build(market_id, block_height, timestamp, 0, f))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+            orders.push(OrderSettlePlan {
+                margin_release,
+                pnl_events,
+                fill_error,
+                trades,
+            });
         }
 
-        if let Some(ref m) = ctx.metrics {
-            m.exec_phase_settle_seconds
-                .observe(settle_timer.elapsed().as_secs_f64());
-        }
+        // A5 maker/STP release amounts against the POST-MATCH book (the same
+        // object the sequential loop reads back out of ctx.order_books).
+        let maker_releases = Self::maker_margin_releases_cfg(
+            cfg,
+            Some(&mbr.book),
+            mbr.results.iter().map(|m| &m.result),
+        );
 
-        NativeBatchResult { results, total_gas }
+        MarketSettlePlan {
+            orders,
+            pos_cache,
+            maker_releases,
+        }
     }
 
     /// C1: apply one side of a fill entirely through the per-batch write-back
@@ -1031,13 +1696,22 @@ impl NativeExecutor {
         price: FixedPoint,
         qty: FixedPoint,
     ) -> FixedPoint {
+        Self::reserve_for_qty_cfg(ctx.margin_configs.get(&market_id), price, qty)
+    }
+
+    /// C3: ctx-free core of [`reserve_for_qty`] — pure in (market margin
+    /// config, price, qty), so settle-plan workers can compute release
+    /// amounts off-thread with byte-identical arithmetic.
+    fn reserve_for_qty_cfg(
+        cfg: Option<&MarketMarginConfig>,
+        price: FixedPoint,
+        qty: FixedPoint,
+    ) -> FixedPoint {
         if price <= FixedPoint::ZERO || qty <= FixedPoint::ZERO {
             return FixedPoint::ZERO;
         }
         let notional = price * qty;
-        let max_lev = ctx
-            .margin_configs
-            .get(&market_id)
+        let max_lev = cfg
             .map(|c| effective_max_leverage(&c.tiers, notional))
             .unwrap_or(20);
         notional / FixedPoint::from_raw(max_lev as i128 * FixedPoint::SCALE)
@@ -1064,6 +1738,22 @@ impl NativeExecutor {
         market_id: MarketId,
         results: impl Iterator<Item = &'a PlaceResult>,
     ) -> Vec<(Address, FixedPoint)> {
+        Self::maker_margin_releases_cfg(
+            ctx.margin_configs.get(&market_id),
+            ctx.order_books.get(&market_id),
+            results,
+        )
+    }
+
+    /// C3: ctx-free core of [`maker_margin_releases`] — pure in (market
+    /// margin config, post-match book, match results). Settle-plan workers
+    /// call it with the worker-owned post-match book (the same object the
+    /// sequential loop reads back out of `ctx.order_books` after reinsertion).
+    fn maker_margin_releases_cfg<'a>(
+        cfg: Option<&MarketMarginConfig>,
+        book: Option<&OrderBook>,
+        results: impl Iterator<Item = &'a PlaceResult>,
+    ) -> Vec<(Address, FixedPoint)> {
         use std::collections::BTreeMap;
 
         // maker order id -> (maker, resting price, total qty consumed by fills)
@@ -1086,7 +1776,6 @@ impl NativeExecutor {
             return Vec::new();
         }
 
-        let book = ctx.order_books.get(&market_id);
         let mut out = Vec::with_capacity(consumed.len() + stp.len());
 
         for (&order_id, &(maker, price, qty_consumed)) in &consumed {
@@ -1097,9 +1786,8 @@ impl NativeExecutor {
                 .map(|o| o.remaining_qty)
                 .or_else(|| stp.get(&order_id).map(|&(_, _, rem)| rem))
                 .unwrap_or(FixedPoint::ZERO);
-            let release =
-                Self::reserve_for_qty(ctx, market_id, price, remaining_after + qty_consumed)
-                    - Self::reserve_for_qty(ctx, market_id, price, remaining_after);
+            let release = Self::reserve_for_qty_cfg(cfg, price, remaining_after + qty_consumed)
+                - Self::reserve_for_qty_cfg(cfg, price, remaining_after);
             if release > FixedPoint::ZERO {
                 out.push((maker, release));
             }
@@ -1107,7 +1795,7 @@ impl NativeExecutor {
         for (&_order_id, &(trader, price, remaining)) in &stp {
             // Full leftover reservation of the STP-cancelled maker (its fills
             // earlier in the batch, if any, are covered by the pass above).
-            let release = Self::reserve_for_qty(ctx, market_id, price, remaining);
+            let release = Self::reserve_for_qty_cfg(cfg, price, remaining);
             if release > FixedPoint::ZERO {
                 out.push((trader, release));
             }
@@ -1298,72 +1986,38 @@ impl NativeExecutor {
         market_id: MarketId,
         fill: &torus_core::order_book::Fill,
     ) {
-        let taker_side: u8 = if fill.maker_side == Side::Buy { 1 } else { 0 };
+        let kvs = TradeKvs::build(
+            market_id,
+            ctx.block_height,
+            ctx.timestamp,
+            ctx.trade_index,
+            fill,
+        );
+        Self::route_trade_kvs(ctx, kvs);
+        ctx.trade_index += 1;
+    }
 
-        // Primary key: market_id(8) + block_number(8) + trade_index(4)
-        let mut trade_key = [0u8; 20];
-        trade_key[..8].copy_from_slice(&market_id.to_be_bytes());
-        trade_key[8..16].copy_from_slice(&ctx.block_height.to_be_bytes());
-        trade_key[16..20].copy_from_slice(&ctx.trade_index.to_be_bytes());
-
-        let trade_id = ctx.trade_index as u128;
-        let price_raw = fill.price.raw();
-        let quantity_raw = fill.quantity.raw();
-
-        // Borsh-serialize trade data (matches StoredTrade layout)
-        let mut trade_data = Vec::with_capacity(64);
-        trade_data.extend_from_slice(&trade_id.to_le_bytes());
-        trade_data.extend_from_slice(&price_raw.to_le_bytes());
-        trade_data.extend_from_slice(&quantity_raw.to_le_bytes());
-        trade_data.push(taker_side);
-        trade_data.extend_from_slice(&ctx.block_height.to_le_bytes());
-        trade_data.extend_from_slice(&ctx.timestamp.to_le_bytes());
-
-        // Secondary index: per-user trades (descending block order)
-        let desc_block = u64::MAX - ctx.block_height;
-        let mut maker_data = Vec::with_capacity(80);
-        maker_data.extend_from_slice(&trade_id.to_le_bytes());
-        maker_data.extend_from_slice(&market_id.to_le_bytes());
-        maker_data.extend_from_slice(&price_raw.to_le_bytes());
-        maker_data.extend_from_slice(&quantity_raw.to_le_bytes());
-        maker_data.push(taker_side);
-        maker_data.push(0u8); // role: maker
-        maker_data.extend_from_slice(&ctx.block_height.to_le_bytes());
-        maker_data.extend_from_slice(&ctx.timestamp.to_le_bytes());
-
-        let mut maker_key = [0u8; 32];
-        maker_key[..20].copy_from_slice(fill.maker.as_slice());
-        maker_key[20..28].copy_from_slice(&desc_block.to_be_bytes());
-        maker_key[28..32].copy_from_slice(&ctx.trade_index.to_be_bytes());
-
-        // Taker entry (flip role byte at offset 57: 16+8+16+16+1)
-        let mut taker_data = maker_data.clone();
-        taker_data[57] = 1u8; // role: taker
-        let mut taker_key = [0u8; 32];
-        taker_key[..20].copy_from_slice(fill.taker.as_slice());
-        taker_key[20..28].copy_from_slice(&desc_block.to_be_bytes());
-        taker_key[28..32].copy_from_slice(&ctx.trade_index.to_be_bytes());
-
+    /// Route one fill's trade rows: buffered under `defer_trades` (O3), else
+    /// inline overlay PUTs — exactly the classic persist_trade tail.
+    fn route_trade_kvs<T: StateBackend>(ctx: &mut NativeExecContext<T>, kvs: TradeKvs) {
         if ctx.defer_trades {
             ctx.pending_trades
-                .push((CF_NATIVE_TRADES, trade_key.to_vec(), trade_data));
+                .push((CF_NATIVE_TRADES, kvs.trade_key.to_vec(), kvs.trade_data));
             ctx.pending_trades
-                .push((CF_NATIVE_USER_TRADES, maker_key.to_vec(), maker_data));
+                .push((CF_NATIVE_USER_TRADES, kvs.maker_key.to_vec(), kvs.maker_data));
             ctx.pending_trades
-                .push((CF_NATIVE_USER_TRADES, taker_key.to_vec(), taker_data));
+                .push((CF_NATIVE_USER_TRADES, kvs.taker_key.to_vec(), kvs.taker_data));
         } else {
             let _ = ctx
                 .state
-                .put_cf_raw(CF_NATIVE_TRADES, &trade_key, &trade_data);
+                .put_cf_raw(CF_NATIVE_TRADES, &kvs.trade_key, &kvs.trade_data);
             let _ = ctx
                 .state
-                .put_cf_raw(CF_NATIVE_USER_TRADES, &maker_key, &maker_data);
+                .put_cf_raw(CF_NATIVE_USER_TRADES, &kvs.maker_key, &kvs.maker_data);
             let _ = ctx
                 .state
-                .put_cf_raw(CF_NATIVE_USER_TRADES, &taker_key, &taker_data);
+                .put_cf_raw(CF_NATIVE_USER_TRADES, &kvs.taker_key, &kvs.taker_data);
         }
-
-        ctx.trade_index += 1;
     }
 
     /// FIX CONS-FIND-30: Ownership check added -- only the order's trader can cancel.

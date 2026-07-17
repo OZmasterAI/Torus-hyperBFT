@@ -529,6 +529,18 @@ impl PositionCache {
         self.dirty.insert(key);
     }
 
+    /// C3 (parallel settle): absorb another cache — entries and dirty marks.
+    ///
+    /// Intended for merging PER-MARKET caches into the batch cache: position
+    /// keys are `(trader, market_id)`, so caches built from different markets
+    /// have provably disjoint key sets and the merged map is identical to
+    /// what one shared cache would hold after sequential settlement — in any
+    /// merge order. Callers merge in sorted market order anyway.
+    pub fn merge_disjoint(&mut self, other: PositionCache) {
+        self.map.extend(other.map);
+        self.dirty.extend(other.dirty);
+    }
+
     /// Write every dirty row to the backend once, in sorted key order
     /// (deterministic write sequence; see type-level docs). Clean entries
     /// (read-only hits/misses) are untouched. Clears the dirty set.
