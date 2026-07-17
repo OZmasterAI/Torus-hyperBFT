@@ -121,9 +121,17 @@ enum Command {
         /// 60,000±5,000 → ~98% resting (A/B baseline; self-poisons at the trader
         /// cap on multi-minute runs); "cross" tight ±50 band so most orders MATCH
         /// (sustained proof mode); "churn" rest-shaped with a CancelAllOrders every
-        /// 16th action/sender to bound book depth.
+        /// 16th action/sender to bound book depth; "match" a maker/taker split that
+        /// drives a crossing-heavy fill flow to measure the match-path ceiling
+        /// (see --taker-ratio). Prices are DETERMINISTIC per (sender, action-index).
         #[arg(long, default_value = "rest")]
         flow: String,
+        /// `--flow match` only: fraction of senders that act as TAKERS (marketable
+        /// crossing orders); the rest are MAKERS that maintain a two-sided resting
+        /// grid the takers lift. 0.25/0.5/0.75 sweep the maker:taker balance to
+        /// find the engine's honest matched/s ceiling. Ignored by other flows.
+        #[arg(long, default_value_t = 0.5)]
+        taker_ratio: f32,
     },
     Combined {
         #[arg(
@@ -170,7 +178,10 @@ enum Command {
 /// periodic `CancelAllOrders` actions are injected, so a multi-minute proof run
 /// can avoid the rest-flow book self-poisoning (200×senders×markets resting →
 /// 100% `trader_cap` reject) that made sustained throughput un-measurable in P2.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+// NOTE: `Match` carries an f32 so `Flow` is `Copy + PartialEq` but NOT `Eq`
+// (f32 has no total order). All existing comparisons use `==` (PartialEq), so
+// dropping `Eq` is safe; `Flow::Match` is only ever matched via `if let`.
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum Flow {
     /// DEFAULT / unchanged: uniform 60,000±5,000 mid. ~98% of orders rest (the
     /// P2 A/B baseline — orders rarely cross, books accumulate then poison).
@@ -182,21 +193,154 @@ enum Flow {
     /// `CancelAllOrders` that clears that sender's resting orders — bounds book
     /// depth without relying on matching.
     Churn,
+    /// Crossing-heavy fill flow (P3 Round-1, match-ceiling). Senders split into
+    /// MAKERS (maintain a two-sided resting grid around the mid) and TAKERS
+    /// (send marketable limit orders that cross the grid by construction). The
+    /// f32 is the taker fraction of senders. Prices are fully DETERMINISTIC per
+    /// (sender, action-index) — no RNG — so a run is bit-reproducible. Built to
+    /// stress the per-fill match path (position/margin, trade-history writer,
+    /// fill-heavy book saves) that the ~1% incidental fill rate never exercised.
+    Match { taker_ratio: f32 },
 }
 
 impl Flow {
-    fn parse(s: &str) -> Result<Flow, String> {
+    /// Parse `--flow`. `taker_ratio` is only consulted for `"match"`.
+    fn parse(s: &str, taker_ratio: f32) -> Result<Flow, String> {
         match s.to_ascii_lowercase().as_str() {
             "rest" => Ok(Flow::Rest),
             "cross" => Ok(Flow::Cross),
             "churn" => Ok(Flow::Churn),
-            other => Err(format!("unknown --flow '{other}' (want rest|cross|churn)")),
+            "match" => {
+                if !(0.0..=1.0).contains(&taker_ratio) {
+                    return Err(format!(
+                        "--taker-ratio {taker_ratio} out of range (want 0.0..=1.0)"
+                    ));
+                }
+                Ok(Flow::Match { taker_ratio })
+            }
+            other => Err(format!(
+                "unknown --flow '{other}' (want rest|cross|churn|match)"
+            )),
         }
     }
 }
 
 /// One `CancelAllOrders` every K actions per sender in `--flow churn`.
 const CHURN_K: u64 = 16;
+
+// --- `--flow match` deterministic geometry -------------------------------
+//
+// SINGLE-SIDED-PER-TRADER design (Round-1 revision). Each sender is fixed for
+// the whole run to ONE role (maker/taker, by --taker-ratio) AND one SIDE (by
+// sender-index parity). So a trader NEVER trades against itself — no self-trade-
+// prevention cancels, no intra-batch self-crossing. Prices span a wide band and
+// are staggered per sender, so the mempool/action stream is diverse rather than
+// a handful of identical price points. Every order is still fully deterministic
+// in `(role, side, sender_idx, ord)` — no RNG — so a run is bit-reproducible.
+//
+//   book (built by makers, lifted by takers):
+//     ask-makers (even idx): rest sells at MID+1 .. MID+GRID
+//     bid-makers (odd  idx): rest bids  at MID-1 .. MID-GRID
+//     buy-takers (odd  idx): buy  at MID+GRID+1 .. +PAD  (> every ask → crosses)
+//     sell-takers(even idx): sell at MID-GRID-1 .. -PAD  (< every bid → crosses)
+//
+/// Fixed mid the maker grid brackets. Whole units → satisfies the runtime
+/// book's 1.0 tick (auto-created tick = lot = FixedPoint::ONE).
+const MATCH_MID: i128 = 60_000;
+/// Maker grid half-width (levels each side). Makers spread resting depth across
+/// MID±1..=MID±GRID (staggered per sender) so the book is deep and price-diverse.
+const MATCH_GRID: i128 = 64;
+/// Taker overshoot band: a taker crosses the whole grid and its price varies over
+/// MID+GRID+1..=MID+GRID+PAD (buys) / MID-GRID-1..=MID-GRID-PAD (sells).
+const MATCH_CROSS_PAD: i128 = 16;
+/// Fixed order size (whole units) for both roles. Equal sizes keep fill
+/// accounting balanced — one taker order lifts ~one maker order at the touch.
+const MATCH_QTY: i128 = 5;
+
+/// A sender's role in `--flow match`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Role {
+    /// Rests limit orders on ITS ONE side (never crosses; never self-trades).
+    Maker,
+    /// Sends marketable orders on ITS ONE side that cross the grid (always
+    /// crossable; never self-trades since it only ever hits the opposite side).
+    Taker,
+}
+
+/// Deterministic maker/taker split. The first `num_makers` senders are makers,
+/// the rest takers, where `num_takers = round(num_senders * taker_ratio)`
+/// (clamped to the sender count). Deterministic in `sender_idx` so a run is
+/// reproducible and the split is testable in isolation.
+fn match_role(sender_idx: usize, num_senders: usize, taker_ratio: f32) -> Role {
+    let n = num_senders.max(1);
+    let num_takers = ((n as f32) * taker_ratio).round() as usize;
+    let num_takers = num_takers.min(n);
+    let num_makers = n - num_takers;
+    if sender_idx >= num_makers {
+        Role::Taker
+    } else {
+        Role::Maker
+    }
+}
+
+/// A sender's FIXED side for the whole run, by index parity. `true` = the sell
+/// side (ask-maker or sell-taker), `false` = the buy side. Fixing the side per
+/// trader is what guarantees no trader ever trades against its own resting order.
+fn match_is_sell(sender_idx: usize) -> bool {
+    sender_idx % 2 == 0
+}
+
+/// Build ONE order for `--flow match`, fully deterministic in
+/// `(role, sell_side, sender_idx, ord, markets)` — no RNG. `ord` is the sender's
+/// monotonic per-ORDER ordinal (`action_seq * batch_size + order_in_batch`).
+/// Invariants (unit-tested):
+///   * A trader is single-sided → NEVER self-trades (`is_buy` depends only on the
+///     sender's fixed side, so a whole batch shares one side).
+///   * Makers NEVER cross: asks live at >= MID+1, bids at <= MID-1.
+///   * Takers ALWAYS cross the whole grid: every taker buy (>= MID+GRID+1) is
+///     strictly above every maker ask (<= MID+GRID); every taker sell
+///     (<= MID-GRID-1) strictly below every maker bid (>= MID-GRID).
+fn match_order(
+    role: Role,
+    sell_side: bool,
+    sender_idx: usize,
+    ord: u64,
+    markets: u64,
+) -> PlaceOrderParams {
+    let market_id = 1 + (ord % markets.max(1));
+    // Per-sender stagger (coprime-ish stride) so makers spread across the grid
+    // and different senders populate different levels — a diverse action stream.
+    let jitter = ((ord.wrapping_add(sender_idx as u64 * 7)) % MATCH_GRID as u64) as i128; // 0..GRID-1
+    let (is_buy, price_raw) = match role {
+        Role::Maker => {
+            if sell_side {
+                (false, MATCH_MID + 1 + jitter) // ask: MID+1 ..= MID+GRID
+            } else {
+                (true, MATCH_MID - 1 - jitter) // bid: MID-1 ..= MID-GRID
+            }
+        }
+        Role::Taker => {
+            let over = ((ord.wrapping_add(sender_idx as u64 * 3)) % MATCH_CROSS_PAD as u64) as i128;
+            if sell_side {
+                (false, MATCH_MID - MATCH_GRID - 1 - over) // < every bid → crosses
+            } else {
+                (true, MATCH_MID + MATCH_GRID + 1 + over) // > every ask → crosses
+            }
+        }
+    };
+    let price = FixedPoint::from_raw(price_raw * FixedPoint::SCALE);
+    let quantity = FixedPoint::from_raw(MATCH_QTY * FixedPoint::SCALE);
+    PlaceOrderParams {
+        market_id,
+        is_buy,
+        price,
+        quantity,
+        order_type: OrderType::Limit,
+        time_in_force: TimeInForce::GTC,
+        reduce_only: false,
+        client_order_id: None,
+    }
+}
 
 fn random_place_order(rng: &mut impl Rng, market_id: u64, flow: Flow) -> NativeAction {
     // Prices MUST be tick-aligned or the matching engine rejects the order outright
@@ -220,6 +364,12 @@ fn random_place_order(rng: &mut impl Rng, market_id: u64, flow: Flow) -> NativeA
         // Wide symmetric ±5,000 band, side-independent: opposing orders rarely
         // cross, so ~98% rest — the A/B baseline that self-poisons at the cap.
         Flow::Rest | Flow::Churn => mid + rng.gen_range(-5_000i128..=5_000),
+        // `--flow match` is intercepted in `random_place_order_action` (it needs
+        // the sender's role + deterministic ordinal), so it never reaches this
+        // RNG-based per-order price generator.
+        Flow::Match { .. } => {
+            unreachable!("Flow::Match is handled in random_place_order_action, not here")
+        }
     };
     let price = FixedPoint::from_raw(price_raw * FixedPoint::SCALE);
     let qty_units = rng.gen_range(1i128..=100);
@@ -282,10 +432,13 @@ fn sign_payload_batch(
     markets: u64,
     flow: Flow,
     seq: &mut u64,
+    sender_idx: usize,
+    num_senders: usize,
 ) -> (Vec<String>, u64) {
     let mut payloads = Vec::with_capacity(submit_batch);
     for _ in 0..submit_batch {
-        let action = random_place_order_action(rng, markets, batch_size, flow, seq);
+        let action =
+            random_place_order_action(rng, markets, batch_size, flow, seq, sender_idx, num_senders);
         let base = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -324,16 +477,21 @@ fn pregen_ammo(
     base_nonce: u64,
     markets: u64,
     flow: Flow,
+    sender_idx: usize,
+    num_senders: usize,
 ) -> Vec<Vec<String>> {
     let mut nonce = base_nonce;
     let mut ammo = Vec::with_capacity(count);
-    // Per-sender churn ordinal — persists across every ammo batch this sender
-    // pre-generates so `CancelAllOrders` lands every CHURN_K actions overall.
+    // Per-sender action ordinal — persists across every ammo batch this sender
+    // pre-generates so churn's `CancelAllOrders` (and match's grid ordinal) walk
+    // continuously.
     let mut seq: u64 = 0;
     for _ in 0..count {
         let mut payloads = Vec::with_capacity(submit_batch);
         for _ in 0..submit_batch {
-            let action = random_place_order_action(rng, markets, batch_size, flow, &mut seq);
+            let action = random_place_order_action(
+                rng, markets, batch_size, flow, &mut seq, sender_idx, num_senders,
+            );
             let signed = sign_one(action, nonce, key, session, mode);
             nonce += 1;
             let bytes = if bin {
@@ -470,10 +628,28 @@ fn random_place_order_action(
     batch_size: usize,
     flow: Flow,
     seq: &mut u64,
+    sender_idx: usize,
+    num_senders: usize,
 ) -> NativeAction {
     let markets = markets.max(1);
     let n = *seq;
     *seq = seq.wrapping_add(1);
+
+    // `--flow match`: deterministic maker/taker orders (no RNG). This sender's
+    // role is fixed by (sender_idx, num_senders, taker_ratio); prices/sides are a
+    // pure function of the per-order ordinal, so runs are bit-reproducible.
+    if let Flow::Match { taker_ratio } = flow {
+        let role = match_role(sender_idx, num_senders, taker_ratio);
+        let sell = match_is_sell(sender_idx);
+        let bs = batch_size.max(1);
+        if bs <= 1 {
+            return NativeAction::PlaceOrder(match_order(role, sell, sender_idx, n, markets));
+        }
+        let orders: Vec<PlaceOrderParams> = (0..bs)
+            .map(|i| match_order(role, sell, sender_idx, n * bs as u64 + i as u64, markets))
+            .collect();
+        return NativeAction::PlaceOrderBatch(orders);
+    }
 
     if flow == Flow::Churn && n > 0 && n % CHURN_K == 0 {
         // Clear this sender's resting orders on ALL markets (market_id: None).
@@ -1308,6 +1484,8 @@ async fn run_consensus(
                     1,
                     Flow::Rest,
                     &mut 0u64,
+                    0,
+                    1,
                 ),
                 probe_nonce,
                 canary_key,
@@ -1357,7 +1535,7 @@ async fn run_consensus(
             for _ in 0..3 {
                 let (p, _) = sign_payload_batch(
                     &mut rng, &calib_key, &calib_session, sign_mode, batch_size,
-                    submit_batch, 0, bin, markets, flow, &mut calib_seq,
+                    submit_batch, 0, bin, markets, flow, &mut calib_seq, 0, num_senders,
                 );
                 n += p.len() as u64;
             }
@@ -1413,7 +1591,7 @@ async fn run_consensus(
         println!("Pre-signing {pre_sign} payloads x {num_senders} senders...");
         let t0 = Instant::now();
         let mut handles = Vec::with_capacity(num_senders);
-        for sk in &keys {
+        for (sender_idx, sk) in keys.iter().enumerate() {
             let key = sk.signing_key.clone();
             let session = sk.session_key.clone();
             handles.push(tokio::task::spawn_blocking(move || {
@@ -1430,6 +1608,8 @@ async fn run_consensus(
                     base_nonce,
                     markets,
                     flow,
+                    sender_idx,
+                    num_senders,
                 )
             }));
         }
@@ -1643,8 +1823,9 @@ async fn run_consensus(
                 let signer = tokio::task::spawn_blocking(move || {
                     let mut rng = StdRng::from_entropy();
                     let mut last_nonce: u64 = 0;
-                    // Per-sender churn ordinal, persistent across the stream so
-                    // CancelAllOrders lands every CHURN_K actions overall.
+                    // Per-sender action ordinal, persistent across the stream so
+                    // churn's CancelAllOrders (and match's grid ordinal) walk
+                    // continuously.
                     let mut seq: u64 = 0;
                     loop {
                         let (payloads, n) = sign_payload_batch(
@@ -1659,6 +1840,8 @@ async fn run_consensus(
                             markets,
                             flow,
                             &mut seq,
+                            sender_idx,
+                            num_senders,
                         );
                         last_nonce = n;
                         if pregen_tx.blocking_send(payloads).is_err() {
@@ -2030,6 +2213,7 @@ async fn main() {
             sign_mode,
             markets,
             flow,
+            taker_ratio,
         } => {
             let bin = match format.as_str() {
                 "bin" => true,
@@ -2047,7 +2231,7 @@ async fn main() {
                     std::process::exit(2);
                 }
             };
-            let flow = match Flow::parse(&flow) {
+            let flow = match Flow::parse(&flow, taker_ratio) {
                 Ok(f) => f,
                 Err(e) => {
                     eprintln!("{e}");
@@ -2094,10 +2278,10 @@ mod tests {
         let ed = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]);
         let mut seq = 0u64;
         let (p1, n1) = sign_payload_batch(
-            &mut rng, &key, &ed, SignMode::Eip712, 3, 4, 0, false, 1, Flow::Rest, &mut seq,
+            &mut rng, &key, &ed, SignMode::Eip712, 3, 4, 0, false, 1, Flow::Rest, &mut seq, 0, 1,
         );
         let (p2, n2) = sign_payload_batch(
-            &mut rng, &key, &ed, SignMode::Eip712, 3, 4, n1, false, 1, Flow::Rest, &mut seq,
+            &mut rng, &key, &ed, SignMode::Eip712, 3, 4, n1, false, 1, Flow::Rest, &mut seq, 0, 1,
         );
         assert_eq!(p1.len(), 4);
         assert_eq!(p2.len(), 4);
@@ -2160,6 +2344,8 @@ mod tests {
             BASE,
             1,
             Flow::Rest,
+            0,
+            1,
         );
         assert_eq!(ammo.len(), 3, "one payload-vec per requested count");
         assert!(
@@ -2206,7 +2392,7 @@ mod tests {
             let mut fills = 0usize;
             let mut placed = 0usize;
             for i in 0..n {
-                let params = match random_place_order_action(&mut rng, 1, 1, flow, &mut seq) {
+                let params = match random_place_order_action(&mut rng, 1, 1, flow, &mut seq, 0, 1) {
                     NativeAction::PlaceOrder(p) => p,
                     _ => continue,
                 };
@@ -2258,7 +2444,7 @@ mod tests {
             (0..total)
                 .filter(|_| {
                     matches!(
-                        random_place_order_action(&mut rng, 4, 1, flow, &mut seq),
+                        random_place_order_action(&mut rng, 4, 1, flow, &mut seq, 0, 1),
                         NativeAction::CancelAllOrders { .. }
                     )
                 })
@@ -2271,6 +2457,197 @@ mod tests {
         );
         assert_eq!(count_cancels(Flow::Rest), 0, "rest flow never cancels");
         assert_eq!(count_cancels(Flow::Cross), 0, "cross flow never cancels");
+    }
+
+    // === --flow match (P3 Round-1 match-ceiling) ==========================
+
+    /// The maker/taker split must honour `--taker-ratio`: `round(N*ratio)`
+    /// senders are takers, the rest makers, deterministically in `sender_idx`.
+    #[test]
+    fn match_role_split_honors_taker_ratio() {
+        use super::{match_role, Role};
+        let cases = [
+            (20usize, 0.25f32, 5usize), // round(5.0)  = 5 takers
+            (20, 0.5, 10),              // round(10.0) = 10 takers
+            (20, 0.75, 15),             // round(15.0) = 15 takers
+            (20, 0.0, 0),               // all makers
+            (20, 1.0, 20),              // all takers
+        ];
+        for (n, ratio, want_takers) in cases {
+            let takers = (0..n)
+                .filter(|&i| match_role(i, n, ratio) == Role::Taker)
+                .count();
+            assert_eq!(
+                takers, want_takers,
+                "N={n} ratio={ratio}: expected {want_takers} takers, got {takers}"
+            );
+            // The first (N - takers) senders are makers, the tail are takers —
+            // a contiguous split (no interleave), so role is monotone in idx.
+            let makers = n - want_takers;
+            for i in 0..n {
+                let want = if i < makers { Role::Maker } else { Role::Taker };
+                assert_eq!(match_role(i, n, ratio), want, "sender {i} role");
+            }
+        }
+    }
+
+    /// Prices/sides are a pure function of `(role, sell, sender_idx, ord)` — a run
+    /// replays bit-for-bit. No RNG is consulted, so two calls with the same inputs
+    /// are identical.
+    #[test]
+    fn match_generator_is_deterministic() {
+        use super::{match_is_sell, match_order, Role};
+        for role in [Role::Maker, Role::Taker] {
+            for sidx in 0..8usize {
+                let sell = match_is_sell(sidx);
+                for ord in 0..64u64 {
+                    let a = match_order(role, sell, sidx, ord, 4);
+                    let b = match_order(role, sell, sidx, ord, 4);
+                    assert_eq!(a.is_buy, b.is_buy, "{role:?} s{sidx} ord {ord} side stable");
+                    assert_eq!(a.price.raw(), b.price.raw(), "{role:?} s{sidx} ord {ord} price");
+                    assert_eq!(a.market_id, b.market_id, "{role:?} s{sidx} ord {ord} market");
+                }
+            }
+        }
+    }
+
+    /// The anti-self-trade invariant: a trader is single-sided for the whole run,
+    /// so EVERY order it emits (across all ordinals / all orders in every batch)
+    /// carries the same `is_buy`. This is what removes self-trade-prevention
+    /// cancels from the match flow.
+    #[test]
+    fn match_trader_is_single_sided() {
+        use super::{match_is_sell, match_order, Role};
+        for role in [Role::Maker, Role::Taker] {
+            for sidx in 0..16usize {
+                let sell = match_is_sell(sidx);
+                let first = match_order(role, sell, sidx, 0, 4).is_buy;
+                for ord in 0..2048u64 {
+                    assert_eq!(
+                        match_order(role, sell, sidx, ord, 4).is_buy,
+                        first,
+                        "{role:?} sender {sidx} flipped side at ord {ord} — would self-trade"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The two structural invariants: takers ALWAYS cross the whole maker grid,
+    /// makers NEVER cross their side. Checked against the actual price bands the
+    /// generator emits over many senders (jitter) and a long ordinal span.
+    #[test]
+    fn match_takers_always_cross_makers_never_do() {
+        use super::{match_order, Role, MATCH_MID};
+        use torus_types::FixedPoint;
+        let scale = FixedPoint::SCALE;
+        let senders = 0..16usize;
+        let ords = 0..4096u64;
+
+        let mut maker_asks = Vec::new();
+        let mut maker_bids = Vec::new();
+        for s in senders.clone() {
+            for ord in ords.clone() {
+                let ask = match_order(Role::Maker, true, s, ord, 4); // sell-side maker
+                assert!(!ask.is_buy, "sell-side maker must place an ask");
+                maker_asks.push(ask.price.raw() / scale);
+                let bid = match_order(Role::Maker, false, s, ord, 4); // buy-side maker
+                assert!(bid.is_buy, "buy-side maker must place a bid");
+                maker_bids.push(bid.price.raw() / scale);
+            }
+        }
+        let min_ask = *maker_asks.iter().min().unwrap();
+        let max_ask = *maker_asks.iter().max().unwrap();
+        let min_bid = *maker_bids.iter().min().unwrap();
+        let max_bid = *maker_bids.iter().max().unwrap();
+
+        assert!(min_ask > max_bid, "maker grid self-crosses: ask {min_ask} <= bid {max_bid}");
+        assert!(min_ask > MATCH_MID && max_bid < MATCH_MID, "grid must bracket the mid");
+
+        // Takers always cross the ENTIRE grid regardless of sender/ordinal.
+        for s in senders.clone() {
+            for ord in ords.clone() {
+                let buy = match_order(Role::Taker, false, s, ord, 4); // buy-side taker
+                assert!(buy.is_buy, "buy-side taker must buy");
+                let bp = buy.price.raw() / scale;
+                assert!(bp > max_ask, "taker buy {bp} (s{s} ord {ord}) must exceed top ask {max_ask}");
+                let sell = match_order(Role::Taker, true, s, ord, 4); // sell-side taker
+                assert!(!sell.is_buy, "sell-side taker must sell");
+                let sp = sell.price.raw() / scale;
+                assert!(sp < min_bid, "taker sell {sp} (s{s} ord {ord}) must undercut low bid {min_bid}");
+            }
+        }
+    }
+
+    /// End-to-end through the REAL torus-core matching engine: a maker/taker mix
+    /// generated by the bench must produce genuine fills (the metric this whole
+    /// flow exists to move), unlike rest-flow which barely crosses.
+    #[test]
+    fn match_flow_fills_through_real_engine() {
+        use super::{match_role, random_place_order_action, Flow, Role};
+        use alloy_primitives::Address;
+        use torus_core::order_book::{OrderBook, OrderStatus};
+        use torus_types::{FixedPoint, NativeAction};
+
+        let num_senders = 8usize;
+        let flow = Flow::Match { taker_ratio: 0.5 };
+        let mut book = OrderBook::new(1, FixedPoint::ONE, FixedPoint::ONE);
+        // One seq per sender (mirrors the run-loop's per-sender ordinal).
+        let mut seqs = vec![0u64; num_senders];
+        let mut rng = StdRng::seed_from_u64(1); // unused by match, but the API takes it
+        let mut fills = 0usize;
+        let mut taker_actions = 0usize;
+        // Round-robin senders so maker grid exists before takers lift it.
+        for round in 0..200 {
+            for s in 0..num_senders {
+                let is_taker = match_role(s, num_senders, 0.5) == Role::Taker;
+                let action = random_place_order_action(
+                    &mut rng,
+                    1, // single market for a self-contained book
+                    1,
+                    flow,
+                    &mut seqs[s],
+                    s,
+                    num_senders,
+                );
+                let NativeAction::PlaceOrder(p) = action else {
+                    continue;
+                };
+                if is_taker {
+                    taker_actions += 1;
+                }
+                // Distinct trader per sender keeps everyone under the 200 cap and
+                // avoids self-trade-prevention dominating.
+                let mut b = [0u8; 20];
+                b[12..20].copy_from_slice(&((s as u64) + 1).to_be_bytes());
+                let r = book.place_order(p, Address::from(b), (round * num_senders + s) as u64);
+                fills += r.fills.len();
+                let _ = OrderStatus::Resting; // (status variants referenced for clarity)
+            }
+        }
+        assert!(taker_actions > 0, "the 0.5 split must include takers");
+        assert!(
+            fills > 0,
+            "match flow must produce real fills through the engine (got {fills})"
+        );
+        // Fills should be a meaningful fraction of taker actions — takers cross by
+        // construction, so most that meet resting depth fill immediately.
+        assert!(
+            fills * 4 >= taker_actions,
+            "expected fills ({fills}) to be a real fraction of taker actions ({taker_actions})"
+        );
+    }
+
+    #[test]
+    fn match_flow_parses_with_taker_ratio() {
+        use super::Flow;
+        match Flow::parse("match", 0.75) {
+            Ok(Flow::Match { taker_ratio }) => assert!((taker_ratio - 0.75).abs() < 1e-6),
+            other => panic!("expected Flow::Match, got {other:?}"),
+        }
+        assert!(Flow::parse("match", 1.5).is_err(), "ratio > 1 must be rejected");
+        assert!(Flow::parse("match", -0.1).is_err(), "ratio < 0 must be rejected");
+        assert!(Flow::parse("bogus", 0.5).is_err(), "unknown flow rejected");
     }
 
     #[test]
