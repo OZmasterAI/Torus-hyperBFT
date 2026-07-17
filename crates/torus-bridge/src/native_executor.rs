@@ -170,6 +170,22 @@ impl BalanceCache {
     }
 }
 
+/// Cross-block book carry-over (deep-book round, load-side fix): the books,
+/// the global order-id counter, and the height the bundle is valid for.
+/// Node-local pure read-avoidance — the CF rows remain the durable authority
+/// (a restart reloads from them), so per-node use of the cache can never
+/// change what is written or fork the chain. The caller must verify
+/// `next_height` matches the block about to execute and otherwise fall back
+/// to a disk load (any out-of-order/replay path self-heals that way).
+pub struct BookCacheState {
+    pub next_height: u64,
+    pub order_books: HashMap<MarketId, OrderBook>,
+    pub next_global_order_id: u128,
+    /// Last known value of the persisted counter row (post-save), so a
+    /// resumed context keeps the "write only when advanced" behavior.
+    pub persisted_counter: Option<u128>,
+}
+
 pub struct NativeExecContext<T: StateBackend = StateDb> {
     pub positions: PositionManager<T>,
     pub oracle: OracleManager<T>,
@@ -293,6 +309,74 @@ impl<T: StateBackend> NativeExecContext<T> {
         }
     }
 
+    /// Deep-book round: construct a context RESUMING from a cross-block book
+    /// cache instead of reloading every book from its per-order rows. Byte-
+    /// equivalent to `new()` on the same state (proven by book_cache_tests):
+    /// the cached books ARE the post-save in-memory books of the previous
+    /// block, and the CF rows they were saved to are what `new()` would
+    /// rebuild from. `load_books_seconds` is 0 (real skip) — the telemetry
+    /// keeps recording so the A/B shows the load disappearing.
+    #[allow(clippy::too_many_arguments)]
+    pub fn resume(
+        state: T,
+        cache: BookCacheState,
+        block_height: u64,
+        timestamp: u64,
+        epoch: u64,
+        epoch_length: u64,
+        max_validators: u32,
+        proposer: Address,
+        treasury_address: Address,
+        dev_pool_address: Address,
+    ) -> Self {
+        debug_assert_eq!(cache.next_height, block_height, "stale book cache");
+        let positions = PositionManager::new(state.clone());
+        let oracle = OracleManager::new(state.clone(), OracleConfig::default());
+        let staking = StakingManager::new(state.clone());
+        let governance = GovernanceManager::new(state.clone());
+
+        Self {
+            positions,
+            oracle,
+            staking,
+            governance,
+            state,
+            order_books: cache.order_books,
+            dirty_books: std::collections::HashSet::new(),
+            margin_configs: HashMap::new(),
+            next_global_order_id: cache.next_global_order_id,
+            loaded_next_global_order_id: cache.persisted_counter,
+            load_books_seconds: 0.0,
+            books_loaded: 0,
+            books_decode_failed: 0,
+            block_height,
+            timestamp,
+            epoch,
+            epoch_length,
+            max_validators,
+            proposer,
+            treasury_address,
+            dev_pool_address,
+            total_native_fees: 0,
+            trade_index: 0,
+            defer_trades: false,
+            pending_trades: Vec::new(),
+            metrics: None,
+        }
+    }
+
+    /// Hand the books (+ counter state) off for the NEXT block. Call ONLY
+    /// after `save_order_books` and a SUCCESSFUL state flush — the cache must
+    /// represent exactly what the CF rows now hold.
+    pub fn take_book_cache(&mut self, next_height: u64) -> BookCacheState {
+        BookCacheState {
+            next_height,
+            order_books: std::mem::take(&mut self.order_books),
+            next_global_order_id: self.next_global_order_id,
+            persisted_counter: self.loaded_next_global_order_id,
+        }
+    }
+
     /// Drain the trade-history KVs buffered under `defer_trades`. The caller
     /// owns durability from here (background writer, or synchronous fallback).
     pub fn take_pending_trades(&mut self) -> Vec<RawCfKv> {
@@ -388,14 +472,21 @@ impl<T: StateBackend> NativeExecContext<T> {
         }
 
         // Persist the counter only when it moved (or was never stored), so
-        // blocks without order flow write nothing at all.
+        // blocks without order flow write nothing at all. On success the
+        // in-memory "persisted" watermark advances too, so a resumed context
+        // (book cache) keeps the write-only-when-advanced behavior.
         if self.loaded_next_global_order_id != Some(self.next_global_order_id) {
-            if let Err(e) = self.state.put_cf_raw(
+            match self.state.put_cf_raw(
                 CF_NATIVE_MARKETS,
                 Self::NEXT_GLOBAL_ORDER_ID_KEY,
                 &self.next_global_order_id.to_be_bytes(),
             ) {
-                tracing::error!(%e, "failed to persist next_global_order_id");
+                Ok(()) => {
+                    self.loaded_next_global_order_id = Some(self.next_global_order_id);
+                }
+                Err(e) => {
+                    tracing::error!(%e, "failed to persist next_global_order_id");
+                }
             }
         }
 
