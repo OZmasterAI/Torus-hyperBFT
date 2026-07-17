@@ -4119,6 +4119,34 @@ mod tests {
         )
     }
 
+    /// A one-shot-per-view HotStuff protocol message (a `Nudge`) — the message
+    /// class the B2 dual-path dedup MUST cover: never rebroadcast
+    /// byte-identically, so a repeat can only be the mirror/fan duplicate.
+    fn test_hotstuff_nudge_message() -> hotstuff_rs::networking::messages::Message {
+        hotstuff_rs::hotstuff::messages::HotStuffMessage::Nudge(
+            hotstuff_rs::hotstuff::messages::Nudge {
+                chain_id: hotstuff_rs::types::data_types::ChainID::new(9),
+                view: hotstuff_rs::types::data_types::ViewNumber::new(7),
+                justify: hotstuff_rs::hotstuff::types::PhaseCertificate::genesis_pc(),
+            },
+        )
+        .into()
+    }
+
+    /// A pacemaker message (an `AdvanceView`) — the message class the pacemaker
+    /// REBROADCASTS byte-identically on a timer (TimeoutVote every view-timeout
+    /// until a TC forms, AdvanceView re-sends): the receiver's designed
+    /// loss-recovery is exactly that redelivery, so the dedup must NEVER
+    /// suppress it.
+    fn test_pacemaker_message() -> hotstuff_rs::networking::messages::Message {
+        hotstuff_rs::pacemaker::messages::PacemakerMessage::advance_view(
+            hotstuff_rs::pacemaker::messages::ProgressCertificate::PhaseCertificate(
+                hotstuff_rs::hotstuff::types::PhaseCertificate::genesis_pc(),
+            ),
+        )
+        .into()
+    }
+
     /// A swarm over a dummy transport: no peer is ever connected, so every fan
     /// send lands in `pending_sends` (the vote-path buffering seam) — which is
     /// exactly what makes the fan observable without a live network.
@@ -4262,7 +4290,7 @@ mod tests {
                 shared.peer_map.write().unwrap().insert(sender, peer);
                 let mut scoring = PeerScoring::new(None);
 
-                let msg_bytes = test_consensus_message().try_to_vec().unwrap();
+                let msg_bytes = test_hotstuff_nudge_message().try_to_vec().unwrap();
                 let mut envelope = sender.to_bytes().to_vec();
                 envelope.extend_from_slice(&msg_bytes);
 
@@ -4290,6 +4318,61 @@ mod tests {
                      dual-path duplicate ONLY when the fan is on"
                 );
             }
+        }
+    }
+
+    /// B2 dedup SCOPE (verifier fix, RED first): the dedup must apply ONLY to
+    /// one-shot-per-view HotStuff protocol messages. Pacemaker messages
+    /// (TimeoutVote / AdvanceView) are rebroadcast BYTE-IDENTICALLY on a timer
+    /// (deterministic ed25519 over unchanged inputs during a stall —
+    /// `pacemaker/implementation.rs` tick: epoch-change views EXTEND and
+    /// re-broadcast the same TimeoutVote until a TC forms), and block-sync
+    /// advertisements re-send identical bytes every ~10 s while the chain is
+    /// stalled. The receiving side RELIES on those redeliveries: the
+    /// progress-message buffer evicts future-view messages under pressure
+    /// (`networking/receiving.rs`) and the timeout-vote collector only
+    /// collects votes for its current view (`pacemaker/types.rs` collect) —
+    /// the rebroadcast is the designed recovery. During a stall the LRU
+    /// barely churns (only pacemaker traffic), so a suppressed rebroadcast
+    /// stays suppressed ~indefinitely → liveness stall with the fan on.
+    /// Duplicates of these messages are cheap and fully idempotent (bracha
+    /// voter set, per-signer collectors, register_or_update sync server), so
+    /// passing them through is safe — it is also exactly today's gossip
+    /// behavior (gossipsub message-ids are (source, seqno): rebroadcasts get
+    /// fresh seqnos and are delivered, not deduped).
+    #[test]
+    fn dedup_exempts_timer_rebroadcast_message_types() {
+        // (message, dedup_applies?, name)
+        let cases = [
+            (test_hotstuff_nudge_message(), true, "hotstuff nudge"),
+            (test_pacemaker_message(), false, "pacemaker advance-view"),
+            (test_consensus_message(), false, "block-sync message"),
+        ];
+        for (msg, deduped, name) in cases {
+            let shared = test_shared_b2(true, true);
+            let sender = test_vk(54);
+            let peer = test_peer(54);
+            shared.peer_map.write().unwrap().insert(sender, peer);
+            let mut scoring = PeerScoring::new(None);
+
+            let msg_bytes = msg.try_to_vec().unwrap();
+            // Same bytes delivered twice via the direct path — a pacemaker
+            // rebroadcast after the first copy was lost inside hotstuff
+            // (progress-buffer eviction), or a dual-path duplicate for a
+            // one-shot message. Only the latter may be suppressed.
+            for _ in 0..2 {
+                assert!(
+                    handle_consensus_direct(&msg_bytes, sender, &shared, &mut scoring, &peer),
+                    "{name}: consensus message must be consumed by the direct branch"
+                );
+            }
+            let expected = if deduped { 1 } else { 2 };
+            assert_eq!(
+                shared.inbound.lock().unwrap().len(),
+                expected,
+                "{name}: timer-rebroadcast message classes must NOT be deduped \
+                 (fan on); one-shot hotstuff messages must be"
+            );
         }
     }
 

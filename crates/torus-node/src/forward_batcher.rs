@@ -516,4 +516,22 @@ mod tests {
         assert_eq!(parse_d2l_reforward_ms(Some("500")), 500);
         assert_eq!(parse_d2l_reforward_ms(Some("junk")), 2000);
     }
+
+    /// Verifier fix (RED first): the re-forward sweep must run ONLY when
+    /// leader-forwarding is armed (`--native-gossip=false`, the same
+    /// `forward_bodies` gate the RPC forward path honors). Default gossip mode
+    /// has NO direct-to-leader forwarding today — a sweep that ships pooled
+    /// actions to the leader every 2 s under stock flags is default-behavior
+    /// drift (the pre-spread already delivers those bodies), violating the
+    /// exact-today-default hard rule.
+    #[test]
+    fn sweep_only_when_forwarding_armed() {
+        // d2l mode (forwarding armed): sweep honors the ms knob.
+        assert!(sweep_enabled(2000, true));
+        assert!(!sweep_enabled(0, true), "TORUS_D2L_REFORWARD_MS=0 stays off");
+        // gossip mode (forwarding NOT armed): sweep must never run, whatever
+        // the knob says — exact-today default behavior.
+        assert!(!sweep_enabled(2000, false));
+        assert!(!sweep_enabled(0, false));
+    }
 }
