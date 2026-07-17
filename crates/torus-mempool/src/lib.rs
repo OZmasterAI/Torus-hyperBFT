@@ -97,6 +97,9 @@ pub struct MempoolConfig {
     /// Capacity of the exec-path session signature-validity cache
     /// (`session_validity_cache_key` -> presence).
     pub session_sig_cache_cap: usize,
+    /// Capacity of the verifying-key cache (`session_pubkey` -> decompressed
+    /// ed25519 key, Finding #17b). Shared by gossip ingest + RPC ingress.
+    pub vk_cache_cap: usize,
     // ---- Memory budget (Phase 3: 3.1.7) ----
     /// Maximum combined memory for EVM + native pools in bytes (0 = unlimited).
     pub max_memory_bytes: usize,
@@ -119,6 +122,7 @@ impl Default for MempoolConfig {
             verified_sender_cache_cap: rate_limit::VERIFIED_SENDER_CACHE_CAP,
             session_owner_cache_cap: rate_limit::SESSION_OWNER_CACHE_CAP,
             session_sig_cache_cap: rate_limit::SESSION_SIG_CACHE_CAP,
+            vk_cache_cap: rate_limit::VK_CACHE_CAP,
             max_memory_bytes: 64 * 1024 * 1024, // 64 MB default
         }
     }
@@ -176,6 +180,14 @@ pub struct Mempool {
     /// validators). Populated ONLY after a successful LOCAL verify (RPC ingress +
     /// gossip-recover); gossip-TRUSTED / block-copy admits are never populated.
     session_sig_verified: RwLock<FifoCache<B256, ()>>,
+    /// Finding #17b — verifying-key cache: `session_pubkey -> decompressed
+    /// ed25519 verifying key`. Shared by the gossip-ingest batch path and RPC
+    /// ingress to skip the per-action ~10-15µs point decompression. The value is
+    /// PURE deterministic math derived from the key (zero staleness risk — a
+    /// pubkey always decompresses to the same key), so unlike the session caches
+    /// there is no invalidation: a HIT is byte-identical to a fresh `from_bytes`.
+    /// Bounded (FIFO) so memory stays O(cap); a malformed key never enters it.
+    verifying_keys: RwLock<FifoCache<[u8; 32], torus_types::Ed25519VerifyingKey>>,
     /// P3 Round-2 scope 3: sojourn-gate drain estimator. `remove_committed_native`
     /// (consensus thread, sole writer) updates an EMA of the pool drain rate;
     /// the RPC admit path (readers) divides `pool_size` by it to estimate how
@@ -208,6 +220,7 @@ impl Mempool {
         let verified_cap = config.verified_sender_cache_cap;
         let session_owner_cap = config.session_owner_cache_cap;
         let session_sig_cap = config.session_sig_cache_cap;
+        let vk_cap = config.vk_cache_cap;
         let initial_base_fee = config.initial_base_fee;
         Self {
             evm: RwLock::new(evm_pool::EvmPool::new()),
@@ -223,6 +236,7 @@ impl Mempool {
             verified_senders: RwLock::new(FifoCache::new(verified_cap)),
             session_owners: RwLock::new(FifoCache::new(session_owner_cap)),
             session_sig_verified: RwLock::new(FifoCache::new(session_sig_cap)),
+            verifying_keys: RwLock::new(FifoCache::new(vk_cap)),
             sojourn: std::sync::Mutex::new(SojournState::default()),
         }
     }
@@ -301,6 +315,47 @@ impl Mempool {
             }
         }
         hit
+    }
+
+    /// Finding #17b — resolve a session pubkey to its decompressed ed25519
+    /// verifying key, reusing a cached key on a HIT to skip the ~10-15µs point
+    /// decompression. Returns `None` for a MALFORMED key (`from_bytes` error),
+    /// which is NEVER cached — a later lookup re-attempts and re-rejects it, so a
+    /// forged/garbage pubkey can never occupy a cache slot. The value is pure
+    /// deterministic math derived from the key, so a HIT is byte-identical to a
+    /// fresh `from_bytes` — this can never change any verification verdict; it is
+    /// a pure CPU cache. Thread-safe (RwLock): reads hit under a read lock, a MISS
+    /// takes the write lock to insert.
+    pub fn resolve_verifying_key(
+        &self,
+        session_pubkey: &[u8; 32],
+    ) -> Option<torus_types::Ed25519VerifyingKey> {
+        if let Ok(cache) = self.verifying_keys.read() {
+            if let Some(vk) = cache.get(session_pubkey).copied() {
+                if let Some(m) = self.metrics.get() {
+                    m.vk_cache_hits.inc();
+                }
+                return Some(vk);
+            }
+        }
+        // MISS: decompress. A malformed key returns None and is NOT cached.
+        match torus_types::Ed25519VerifyingKey::from_bytes(session_pubkey) {
+            Ok(vk) => {
+                if let Ok(mut cache) = self.verifying_keys.write() {
+                    cache.insert(*session_pubkey, vk);
+                }
+                if let Some(m) = self.metrics.get() {
+                    m.vk_cache_misses.inc();
+                }
+                Some(vk)
+            }
+            Err(_) => {
+                if let Some(m) = self.metrics.get() {
+                    m.vk_cache_misses.inc();
+                }
+                None
+            }
+        }
     }
 
     /// Exec-path session-owner cache HIT lookup: return the cached `SessionData`
@@ -625,6 +680,144 @@ impl Mempool {
         // verified, so the entry may seed the exec trust-cache. Reuse the
         // precomputed hash for the insert (stops the third recompute).
         self.admit_gossip_with_hash(claimed_sender, action, true, Some(action_hash))
+    }
+
+    /// Finding #17a — micro-batched gossip ingest. Verifies a DRAINED set of
+    /// gossip actions (whatever the node ingest task could pull off `native_rx`
+    /// without blocking) with a SINGLE ed25519 `verify_batch` over the session
+    /// signatures, then admits each action with byte-identical PER-ACTION
+    /// semantics to [`Mempool::add_native_action_from_gossip`].
+    ///
+    /// The regression that must be impossible: an action whose signature the
+    /// per-action path would reject must NEVER be admitted by the batch path.
+    /// Every per-action outcome — dedup skip, staleness reject, signature reject,
+    /// unknown-session reject, sender-mismatch reject, or admission (with the same
+    /// sig-validity + trust-cache population) — is IDENTICAL to calling
+    /// `add_native_action_from_gossip` sequentially over `items` in order. Only the
+    /// ed25519 point arithmetic is amortized (batch + per-signature fallback),
+    /// which `torus_types::eip712::batch_verify_session_sigs` proves yields the
+    /// same per-action valid/invalid verdict as an individual `verify`.
+    ///
+    /// Determinism note: the dedup and admit run SEQUENTIALLY in `items` order and
+    /// interleaved (each admit inserts into the pool before the next action's
+    /// dedup check), so the dedup ring sees prior in-batch admissions exactly as N
+    /// sequential calls would — a within-batch duplicate is deduped identically.
+    ///
+    /// Returns per-input results aligned to `items` order (a dedup skip is `Ok`).
+    pub fn add_native_actions_from_gossip_batch(
+        &self,
+        items: Vec<(alloy_primitives::Address, SignedNativeAction)>,
+    ) -> Vec<Result<(), MempoolError>> {
+        let n = items.len();
+        if n == 0 {
+            return Vec::new();
+        }
+
+        // Compute each action's canonical hash ONCE (reused by the phase-3 dedup
+        // check AND the pool insert), exactly like the per-action prescreen.
+        let hashes: Vec<B256> = items
+            .iter()
+            .map(|(_, a)| torus_types::compute_action_hash(a))
+            .collect();
+
+        // Phase 2 (batch crypto): verify every SESSION signature in one aggregate,
+        // via the vk cache for decompression. `Some(pubkey)` for a valid session
+        // sig, `None` for non-session / malformed-key / invalid-sig — exactly what
+        // `verify_session_signature().ok()` returns per action. EIP-712 actions are
+        // recovered individually in phase 3 (rare on the session-signed workload).
+        let refs: Vec<&SignedNativeAction> = items.iter().map(|(_, a)| a).collect();
+        let verify_t0 = std::time::Instant::now();
+        let session_pubkeys = torus_types::eip712::batch_verify_session_sigs(&refs, |pk| {
+            self.resolve_verifying_key(pk)
+        });
+        if let Some(m) = self.metrics.get() {
+            let batched = refs
+                .iter()
+                .filter(|a| matches!(a.signature, torus_types::ActionSignature::Session { .. }))
+                .count();
+            if batched > 0 {
+                m.native_ingest_batch_verify_seconds
+                    .observe(verify_t0.elapsed().as_secs_f64());
+                m.native_ingest_batch_size.observe(batched as f64);
+            }
+        }
+
+        // Phase 3 (SEQUENTIAL admit) — replicates `add_native_action_from_gossip`
+        // per action, IN ORDER and interleaved with pool inserts.
+        use torus_types::eip712::NONCE_WINDOW_MS;
+        let mut out: Vec<Result<(), MempoolError>> = Vec::with_capacity(n);
+        for (i, (claimed_sender, action)) in items.into_iter().enumerate() {
+            let action_hash = hashes[i];
+            // (2) DEDUP first, exactly as the per-action path; sees admits from
+            //     earlier items in this same batch (interleaved inserts).
+            if self
+                .native
+                .read()
+                .unwrap()
+                .contains_or_recently_committed(&action_hash)
+            {
+                if let Some(m) = self.metrics.get() {
+                    m.native_ingest_dedup_skips.inc();
+                }
+                out.push(Ok(()));
+                continue;
+            }
+            // (3) STALENESS.
+            if action.nonce.saturating_add(NONCE_WINDOW_MS) < now_ms() {
+                if let Some(m) = self.metrics.get() {
+                    m.native_ingest_stale_skips.inc();
+                }
+                out.push(Err(MempoolError::NativeValidationFailed(
+                    "nonce too old (>60s, prescreened)".into(),
+                )));
+                continue;
+            }
+            // (4) Crypto verify the CLAIMED sender (using the batch result for
+            //     session sigs; EIP-712 recovered inline).
+            let verified_sender = match &action.signature {
+                torus_types::ActionSignature::Eip712(_) => match action.recover_sender() {
+                    Ok(s) => s,
+                    Err(e) => {
+                        out.push(Err(MempoolError::NativeValidationFailed(format!(
+                            "gossip sig recovery: {e}"
+                        ))));
+                        continue;
+                    }
+                },
+                torus_types::ActionSignature::Session { .. } => {
+                    let Some(pubkey) = session_pubkeys[i] else {
+                        // Batch (or per-sig fallback) rejected this signature.
+                        // Reproduce the exact per-action error via a single verify
+                        // of the failing action (the rare/attack path only).
+                        let e = action.verify_session_signature().err().unwrap_or(
+                            torus_types::eip712::Eip712Error::SessionSignatureInvalid,
+                        );
+                        out.push(Err(MempoolError::NativeValidationFailed(format!(
+                            "gossip session sig: {e}"
+                        ))));
+                        continue;
+                    };
+                    match self.state.get_session(&pubkey) {
+                        Ok(Some(session)) => session.owner,
+                        _ => {
+                            out.push(Err(MempoolError::NativeValidationFailed(
+                                "gossip session unknown".into(),
+                            )));
+                            continue;
+                        }
+                    }
+                }
+            };
+            if verified_sender != claimed_sender {
+                out.push(Err(MempoolError::NativeValidationFailed(
+                    "gossip sender mismatch".into(),
+                )));
+                continue;
+            }
+            // Locally verified => may seed the exec trust-cache + sig-validity cache.
+            out.push(self.admit_gossip_with_hash(claimed_sender, action, true, Some(action_hash)));
+        }
+        out
     }
 
     pub fn add_native_action_from_gossip_trusted(
@@ -2855,5 +3048,315 @@ mod tests {
         pool.add_evm_tx(raw)
             .expect("pre-155 legacy tx must be admitted");
         assert_eq!(pool.evm_pool_size(), 1);
+    }
+
+    // ================================================================
+    // Finding #17 — micro-batched gossip ingest equivalence tests.
+    //
+    // The regression that must be impossible: an action the OLD per-action
+    // path would reject must NEVER be admitted by the batch path. Each test
+    // runs `add_native_actions_from_gossip_batch` and the sequential
+    // `add_native_action_from_gossip` over IDENTICAL inputs + state, and
+    // asserts byte-for-byte parity of the whole admission outcome (admitted
+    // set, per-action reject/skip, and sig-validity cache population set).
+    // ================================================================
+
+    fn ed_key(seed: u8) -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
+    }
+
+    fn session_data(owner: Address) -> torus_types::SessionData {
+        torus_types::SessionData {
+            owner,
+            expiry: u64::MAX,
+            scope: torus_types::SessionScope::Full,
+            created_at: 0,
+        }
+    }
+
+    /// Register a session (pubkey -> owner) in a fresh state DB and return a pool.
+    fn pool_with_sessions(
+        sessions: &[(&ed25519_dalek::SigningKey, Address, torus_types::SessionData)],
+    ) -> (TempDir, Mempool) {
+        let dir = TempDir::new().unwrap();
+        let state = StateDb::open(dir.path()).unwrap();
+        for (k, _owner, data) in sessions {
+            state
+                .put_session(&k.verifying_key().to_bytes(), data)
+                .unwrap();
+        }
+        let pool = Mempool::new(state, MempoolConfig::default());
+        (dir, pool)
+    }
+
+    fn session_order(nonce: u64, k: &ed25519_dalek::SigningKey) -> SignedNativeAction {
+        torus_types::eip712::sign_native_action_with_session(
+            torus_types::NativeAction::CancelOrder {
+                order_id: nonce as u128,
+            },
+            nonce,
+            k,
+        )
+    }
+
+    /// Per-action admission snapshot: (in_pool, sig_validity_cache_present).
+    /// Reads private fields directly (same module) so there are no metric side
+    /// effects that could change observed state.
+    fn snapshot(pool: &Mempool, items: &[(Address, SignedNativeAction)]) -> Vec<(bool, bool)> {
+        items
+            .iter()
+            .map(|(_, a)| {
+                let h = torus_types::compute_action_hash(a);
+                let in_pool = pool
+                    .native
+                    .read()
+                    .unwrap()
+                    .contains_or_recently_committed(&h);
+                let sig_present = torus_types::session_validity_cache_key(a)
+                    .map(|k| pool.session_sig_verified.read().unwrap().get(&k).is_some())
+                    .unwrap_or(false);
+                (in_pool, sig_present)
+            })
+            .collect()
+    }
+
+    /// Run the SEQUENTIAL reference path over a fresh pool and return per-action
+    /// Ok/Err verdicts + the final admission snapshot.
+    fn run_sequential(
+        sessions: &[(&ed25519_dalek::SigningKey, Address, torus_types::SessionData)],
+        items: &[(Address, SignedNativeAction)],
+    ) -> (Vec<bool>, Vec<(bool, bool)>) {
+        let (_dir, pool) = pool_with_sessions(sessions);
+        for (_, a) in items {
+            pool.mirror_native_to_da(std::slice::from_ref(a));
+        }
+        let oks: Vec<bool> = items
+            .iter()
+            .map(|(s, a)| pool.add_native_action_from_gossip(*s, a.clone()).is_ok())
+            .collect();
+        (oks, snapshot(&pool, items))
+    }
+
+    /// Run the BATCH path over a fresh pool and return per-action Ok/Err verdicts
+    /// + the final admission snapshot.
+    fn run_batch(
+        sessions: &[(&ed25519_dalek::SigningKey, Address, torus_types::SessionData)],
+        items: &[(Address, SignedNativeAction)],
+    ) -> (Vec<bool>, Vec<(bool, bool)>) {
+        let (_dir, pool) = pool_with_sessions(sessions);
+        for (_, a) in items {
+            pool.mirror_native_to_da(std::slice::from_ref(a));
+        }
+        let oks: Vec<bool> = pool
+            .add_native_actions_from_gossip_batch(items.to_vec())
+            .into_iter()
+            .map(|r| r.is_ok())
+            .collect();
+        (oks, snapshot(&pool, items))
+    }
+
+    fn assert_batch_equals_sequential(
+        sessions: &[(&ed25519_dalek::SigningKey, Address, torus_types::SessionData)],
+        items: &[(Address, SignedNativeAction)],
+    ) {
+        let seq = run_sequential(sessions, items);
+        let bat = run_batch(sessions, items);
+        assert_eq!(seq.0, bat.0, "per-action Ok/Err verdicts must match");
+        assert_eq!(
+            seq.1, bat.1,
+            "admission snapshot (in_pool, sig_cache_present) must match"
+        );
+    }
+
+    fn malformed_key() -> [u8; 32] {
+        for seed in 0u8..=255 {
+            let mut c = [0xFFu8; 32];
+            c[0] = seed;
+            c[31] = 0x80 | seed;
+            if ed25519_dalek::VerifyingKey::from_bytes(&c).is_err() {
+                return c;
+            }
+        }
+        panic!("no malformed key found");
+    }
+
+    #[test]
+    fn batch_mixed_one_forged_rejects_only_forged() {
+        let k = ed_key(60);
+        let owner = Address::repeat_byte(0x60);
+        let sessions = [(&k, owner, session_data(owner))];
+        let now = now_ms();
+        let mut items: Vec<(Address, SignedNativeAction)> =
+            (0..8u64).map(|i| (owner, session_order(now + i, &k))).collect();
+        // Forge index 5 — the per-action path would reject exactly it.
+        if let torus_types::ActionSignature::Session { ref mut sig, .. } = items[5].1.signature {
+            sig.0[0] ^= 0xFF;
+        }
+
+        let (_dir, pool) = pool_with_sessions(&sessions);
+        for (_, a) in &items {
+            pool.mirror_native_to_da(std::slice::from_ref(a));
+        }
+        let results = pool.add_native_actions_from_gossip_batch(items.clone());
+        for (i, r) in results.iter().enumerate() {
+            if i == 5 {
+                assert!(r.is_err(), "the forged signature must be rejected");
+            } else {
+                assert!(r.is_ok(), "index {i} (valid) must be admitted");
+            }
+        }
+        assert_eq!(pool.native_pool_size(), 7, "exactly the 7 valid ones pooled");
+        assert_batch_equals_sequential(&sessions, &items);
+    }
+
+    #[test]
+    fn batch_all_forged_rejects_all() {
+        let k = ed_key(61);
+        let owner = Address::repeat_byte(0x61);
+        let sessions = [(&k, owner, session_data(owner))];
+        let now = now_ms();
+        let mut items: Vec<(Address, SignedNativeAction)> =
+            (0..6u64).map(|i| (owner, session_order(now + i, &k))).collect();
+        for (_, a) in items.iter_mut() {
+            if let torus_types::ActionSignature::Session { ref mut sig, .. } = a.signature {
+                sig.0[0] ^= 0xAA;
+                sig.0[20] ^= 0x55;
+            }
+        }
+        let (_dir, pool) = pool_with_sessions(&sessions);
+        for (_, a) in &items {
+            pool.mirror_native_to_da(std::slice::from_ref(a));
+        }
+        let results = pool.add_native_actions_from_gossip_batch(items.clone());
+        assert!(results.iter().all(|r| r.is_err()), "all forged => all reject");
+        assert_eq!(pool.native_pool_size(), 0);
+        assert_batch_equals_sequential(&sessions, &items);
+    }
+
+    #[test]
+    fn batch_single_message_equals_old_path() {
+        let k = ed_key(62);
+        let owner = Address::repeat_byte(0x62);
+        let sessions = [(&k, owner, session_data(owner))];
+        let now = now_ms();
+        // valid single
+        let items = vec![(owner, session_order(now, &k))];
+        assert_batch_equals_sequential(&sessions, &items);
+        // forged single
+        let mut forged = vec![(owner, session_order(now + 1, &k))];
+        if let torus_types::ActionSignature::Session { ref mut sig, .. } = forged[0].1.signature {
+            sig.0[0] ^= 0xFF;
+        }
+        assert_batch_equals_sequential(&sessions, &forged);
+    }
+
+    #[test]
+    fn batch_prescreen_dedup_ordering_preserved() {
+        // A within-batch duplicate: the SECOND/THIRD identical action must be
+        // deduped (Ok, never re-verified/re-admitted) EXACTLY as the sequential
+        // path, whose first admit makes the rest dedup.
+        let k = ed_key(63);
+        let owner = Address::repeat_byte(0x63);
+        let sessions = [(&k, owner, session_data(owner))];
+        let now = now_ms();
+        let a = session_order(now, &k);
+        let items = vec![(owner, a.clone()), (owner, a.clone()), (owner, a)];
+        let (_dir, pool) = pool_with_sessions(&sessions);
+        for (_, x) in &items {
+            pool.mirror_native_to_da(std::slice::from_ref(x));
+        }
+        let results = pool.add_native_actions_from_gossip_batch(items.clone());
+        assert!(results.iter().all(|r| r.is_ok()), "dup => Ok skip");
+        assert_eq!(pool.native_pool_size(), 1, "only one distinct action pooled");
+        assert_batch_equals_sequential(&sessions, &items);
+    }
+
+    #[test]
+    fn batch_equivalence_randomized_mix() {
+        // Property/equivalence over a randomized mix of valid / forged /
+        // expired-session / malformed-key / unknown-session / sender-mismatch
+        // actions: the batch admission outcome is byte-for-byte identical to the
+        // per-action reference over the WHOLE outcome (verdicts + snapshot).
+        let k_ok = ed_key(70);
+        let owner_ok = Address::repeat_byte(0x70);
+        let k_expired = ed_key(71);
+        let owner_expired = Address::repeat_byte(0x71);
+        let expired = torus_types::SessionData {
+            owner: owner_expired,
+            expiry: 1, // long past; ingest does NOT check expiry, so still admitted
+            scope: torus_types::SessionScope::Full,
+            created_at: 0,
+        };
+        let k_unknown = ed_key(72); // NOT registered => "session unknown"
+        let sessions = [
+            (&k_ok, owner_ok, session_data(owner_ok)),
+            (&k_expired, owner_expired, expired.clone()),
+        ];
+
+        let now = now_ms();
+        let mut items: Vec<(Address, SignedNativeAction)> = Vec::new();
+        let mut lcg: u64 = 0xdead_beef_1234_5678;
+        let mut next = || {
+            lcg = lcg
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (lcg >> 33) as u32
+        };
+        for i in 0..48u64 {
+            match next() % 6 {
+                0 => items.push((owner_ok, session_order(now + i, &k_ok))), // valid
+                1 => {
+                    let mut a = session_order(now + i, &k_ok); // forged sig
+                    if let torus_types::ActionSignature::Session { ref mut sig, .. } = a.signature {
+                        sig.0[(next() % 64) as usize] ^= 0xFF;
+                    }
+                    items.push((owner_ok, a));
+                }
+                2 => items.push((owner_expired, session_order(now + i, &k_expired))), // expired
+                3 => {
+                    let mut a = session_order(now + i, &k_ok); // malformed key
+                    if let torus_types::ActionSignature::Session {
+                        ref mut session_pubkey,
+                        ..
+                    } = a.signature
+                    {
+                        *session_pubkey = malformed_key();
+                    }
+                    items.push((owner_ok, a));
+                }
+                4 => items.push((owner_ok, session_order(now + i, &k_unknown))), // unknown session
+                _ => {
+                    // valid sig+session but WRONG claimed sender => mismatch reject
+                    items.push((Address::repeat_byte(0xEE), session_order(now + i, &k_ok)));
+                }
+            }
+        }
+        assert_batch_equals_sequential(&sessions, &items);
+    }
+
+    #[test]
+    fn vk_cache_hit_equals_fresh_decompression_and_never_caches_malformed() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state, MempoolConfig::default());
+        let k = ed_key(80);
+        let pubkey = k.verifying_key().to_bytes();
+
+        // First resolve: MISS + populate. Second: HIT. Both byte-identical to a
+        // fresh from_bytes.
+        let fresh = ed25519_dalek::VerifyingKey::from_bytes(&pubkey).unwrap();
+        let first = pool.resolve_verifying_key(&pubkey).unwrap();
+        let second = pool.resolve_verifying_key(&pubkey).unwrap();
+        assert_eq!(first.to_bytes(), fresh.to_bytes());
+        assert_eq!(second.to_bytes(), fresh.to_bytes());
+
+        // A malformed key returns None and is NEVER cached (a repeat still MISSes
+        // to None, never a spurious hit).
+        let bad = malformed_key();
+        assert!(pool.resolve_verifying_key(&bad).is_none());
+        assert!(pool.resolve_verifying_key(&bad).is_none());
+        assert!(
+            pool.verifying_keys.read().unwrap().get(&bad).is_none(),
+            "malformed key must never occupy a cache slot"
+        );
     }
 }

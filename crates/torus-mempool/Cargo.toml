@@ -21,3 +21,4 @@ tempfile = { workspace = true }
 k256 = { workspace = true }
 sha3 = { workspace = true }
 revm = { workspace = true }
+ed25519-dalek = { workspace = true }

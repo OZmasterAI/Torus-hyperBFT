@@ -127,6 +127,27 @@ pub struct Metrics {
     /// being off, or a non-session action never increments it (never skip-by-default).
     pub exec_session_sig_skipped: Counter,
 
+    // Finding #17b — verifying-key cache (session pubkey -> decompressed ed25519
+    // key). Shared by gossip ingest and RPC ingress; eliminates the per-action
+    // ~10-15µs point decompression. The mapping is pure deterministic math
+    // (value derived from key), so a HIT is byte-identical to a fresh decompress.
+    /// VK cache HITs: a cached decompressed ed25519 verifying key was reused.
+    pub vk_cache_hits: Counter,
+    /// VK cache MISSes: no cached key, a fresh `from_bytes` decompression ran
+    /// (a malformed key is a MISS and is never cached).
+    pub vk_cache_misses: Counter,
+
+    // Finding #17a — micro-batched gossip-ingest verification. Makes the batch
+    // win directly visible: per-batch verify wall time and batch size.
+    /// Wall time of one micro-batched gossip-ingest crypto-verify pass (the
+    /// `verify_batch` + per-signature fallback over a drained set). Divide by the
+    /// paired `native_ingest_batch_size` sample for the per-action verify cost.
+    pub native_ingest_batch_verify_seconds: Histogram,
+    /// Number of session-signed actions folded into one ingest `verify_batch`
+    /// call (the drained-set size after prescreen). A larger batch amortizes the
+    /// ed25519 fixed cost harder.
+    pub native_ingest_batch_size: Histogram,
+
     // Submit-ack phase timing (Sprint 3.5) — decomposes where multi-second
     // batch-submit acks accrue: semaphore queue vs blocking-pool verify vs
     // pool admission.
@@ -644,6 +665,33 @@ impl Metrics {
             "torus_exec_session_sig_skipped",
             "Exec-path ed25519 session-signature verifies skipped via a sig-validity cache HIT (pairs with exec_verify_seconds)",
             exec_session_sig_skipped.clone(),
+        );
+
+        let vk_cache_hits = Counter::default();
+        registry.register(
+            "torus_vk_cache_hits",
+            "Verifying-key cache hits (cached decompressed ed25519 key reused; point decompression skipped)",
+            vk_cache_hits.clone(),
+        );
+        let vk_cache_misses = Counter::default();
+        registry.register(
+            "torus_vk_cache_misses",
+            "Verifying-key cache misses (fresh ed25519 from_bytes decompression ran; malformed keys never cached)",
+            vk_cache_misses.clone(),
+        );
+
+        let native_ingest_batch_verify_seconds =
+            Histogram::new(exponential_buckets(0.00001, 2.0, 16));
+        registry.register(
+            "torus_native_ingest_batch_verify_seconds",
+            "Wall time of one micro-batched gossip-ingest crypto-verify pass (verify_batch + fallback)",
+            native_ingest_batch_verify_seconds.clone(),
+        );
+        let native_ingest_batch_size = Histogram::new(exponential_buckets(1.0, 2.0, 8));
+        registry.register(
+            "torus_native_ingest_batch_size",
+            "Session-signed actions folded into one ingest verify_batch call (drained-set size)",
+            native_ingest_batch_size.clone(),
         );
 
         let session_owner_cache_hits = Counter::default();
@@ -1321,6 +1369,10 @@ impl Metrics {
             session_sig_cache_misses,
             session_sig_cache_evictions,
             exec_session_sig_skipped,
+            vk_cache_hits,
+            vk_cache_misses,
+            native_ingest_batch_verify_seconds,
+            native_ingest_batch_size,
             session_owner_cache_hits,
             session_owner_cache_misses,
             session_owner_cache_evictions,
@@ -1552,6 +1604,11 @@ mod tests {
             "torus_session_sig_cache_misses",
             "torus_session_sig_cache_evictions",
             "torus_exec_session_sig_skipped",
+            // Finding #17 — vk cache + micro-batched ingest verify.
+            "torus_vk_cache_hits",
+            "torus_vk_cache_misses",
+            "torus_native_ingest_batch_verify_seconds",
+            "torus_native_ingest_batch_size",
             // P3 Task-1 unaccounted-gap decomposition families.
             "torus_exec_seed_bundle_seconds",
             "torus_exec_ctx_setup_seconds",

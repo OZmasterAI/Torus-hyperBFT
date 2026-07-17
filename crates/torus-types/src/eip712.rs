@@ -896,6 +896,31 @@ impl SignedNativeAction {
     where
         F: FnOnce(&[u8; 32]) -> Option<crate::SessionData>,
     {
+        // Delegate to the vk-resolver variant with the plain point-decompression
+        // resolver, so the two paths can never drift.
+        self.resolve_sender_with_vk(current_timestamp, session_lookup, |pk| {
+            Ed25519VerifyingKey::from_bytes(pk).ok()
+        })
+    }
+
+    /// [`resolve_sender`](Self::resolve_sender) with a caller-supplied verifying-key
+    /// resolver (Finding #17b). `vk_resolver(session_pubkey)` returns the
+    /// point-decompressed ed25519 key — from a cache on a HIT — and `None` for a
+    /// MALFORMED key. Because the resolved key is pure deterministic math derived
+    /// from the pubkey, a cached key is byte-identical to a fresh `from_bytes`, so
+    /// this can NEVER change the resolved sender vs [`resolve_sender`]; it only
+    /// skips the ~10-15µs decompression. Every stateful check (existence / STRICT
+    /// expiry / scope) is unchanged, so ingress semantics are preserved exactly.
+    pub fn resolve_sender_with_vk<F, G>(
+        &self,
+        current_timestamp: u64,
+        session_lookup: F,
+        vk_resolver: G,
+    ) -> Result<Address, Eip712Error>
+    where
+        F: FnOnce(&[u8; 32]) -> Option<crate::SessionData>,
+        G: FnOnce(&[u8; 32]) -> Option<Ed25519VerifyingKey>,
+    {
         match &self.signature {
             ActionSignature::Eip712(sig) => {
                 let domain = eip712_domain_separator();
@@ -910,8 +935,8 @@ impl SignedNativeAction {
                 if requires_eip712(&self.action) {
                     return Err(Eip712Error::RequiresEip712);
                 }
-                let vk = Ed25519VerifyingKey::from_bytes(session_pubkey)
-                    .map_err(|_| Eip712Error::SessionSignatureInvalid)?;
+                let vk =
+                    vk_resolver(session_pubkey).ok_or(Eip712Error::SessionSignatureInvalid)?;
                 let ed_sig = ed25519_dalek::Signature::from_bytes(&sig.0);
                 let domain = eip712_domain_separator();
                 let struct_hash = eip712_struct_hash(&self.action, self.nonce);
@@ -982,6 +1007,39 @@ impl SignedNativeAction {
         }
 
         self.resolve_sender(current_time_ms, session_lookup)
+    }
+
+    /// [`validate_with_sessions`](Self::validate_with_sessions) with a
+    /// caller-supplied verifying-key resolver (Finding #17b). Identical chain-id +
+    /// nonce-window gates; the only difference is the session ed25519 key is
+    /// resolved via `vk_resolver` (a cache) instead of a fresh `from_bytes`. The
+    /// resolved sender is byte-identical to `validate_with_sessions`.
+    pub fn validate_with_sessions_with_vk<F, G>(
+        &self,
+        current_time_ms: u64,
+        expected_chain_id: u64,
+        session_lookup: F,
+        vk_resolver: G,
+    ) -> Result<Address, Eip712Error>
+    where
+        F: FnOnce(&[u8; 32]) -> Option<crate::SessionData>,
+        G: FnOnce(&[u8; 32]) -> Option<Ed25519VerifyingKey>,
+    {
+        if expected_chain_id != TORUS_CHAIN_ID {
+            return Err(Eip712Error::ChainIdMismatch {
+                expected: TORUS_CHAIN_ID,
+                got: expected_chain_id,
+            });
+        }
+
+        if self.nonce.saturating_add(NONCE_WINDOW_MS) < current_time_ms {
+            return Err(Eip712Error::NonceTooOld);
+        }
+        if self.nonce > current_time_ms.saturating_add(NONCE_WINDOW_MS) {
+            return Err(Eip712Error::NonceTooFuture);
+        }
+
+        self.resolve_sender_with_vk(current_time_ms, session_lookup, vk_resolver)
     }
 }
 
@@ -1240,6 +1298,96 @@ pub fn batch_verify_native_actions_cached(
     }
 
     senders
+}
+
+/// Batch-verify the ed25519 **session** signatures of `actions` (Finding #17,
+/// gossip-ingest path), returning a vector parallel to `actions`. For element
+/// `i`:
+/// - `Some(session_pubkey)` iff `actions[i]` is a `Session`-signed action whose
+///   ed25519 signature is cryptographically valid over its EIP-712 signing hash —
+///   byte-identical to what [`SignedNativeAction::verify_session_signature`]
+///   returns on `Ok`.
+/// - `None` for a non-session (EIP-712) action, a malformed session pubkey
+///   (`from_bytes` error), or an invalid signature.
+///
+/// This is the INGEST analogue of `verify_session_signature`: PURE stateless
+/// crypto, with NO session-state checks (existence / expiry / scope). The caller
+/// runs those exactly as the per-action gossip path does, so folding this in place
+/// of N individual `verify_session_signature` calls cannot change any per-action
+/// admission verdict — it only amortizes the ed25519 point arithmetic.
+///
+/// The aggregate uses `ed25519_dalek::verify_batch` with the SAME per-signature
+/// fallback as the exec path (`batch_verify_native_actions_cached`): if the
+/// batch verify fails, every signature is re-verified INDIVIDUALLY and only the
+/// individually-failing ones are rejected. So a forged signature can never taint
+/// a valid one (batch-reject a good sig) and a batch can never admit a bad sig —
+/// the invariant that keeps a forged-sig action out of a block (and the proposer
+/// un-slashed). The batch is assembled in index order, so `verify_batch` sees an
+/// identical message/key sequence to a serial verify.
+///
+/// `vk_resolver` supplies the (optionally cached, Finding #17b) point-decompressed
+/// verifying key for a session pubkey; it MUST return `None` for a malformed key,
+/// which is then rejected (`None`) and NEVER entered into the batch — a malformed
+/// key must never poison the aggregate.
+pub fn batch_verify_session_sigs<G>(
+    actions: &[&SignedNativeAction],
+    vk_resolver: G,
+) -> Vec<Option<[u8; 32]>>
+where
+    G: Fn(&[u8; 32]) -> Option<Ed25519VerifyingKey>,
+{
+    let domain = eip712_domain_separator();
+    let mut out: Vec<Option<[u8; 32]>> = vec![None; actions.len()];
+
+    // Assemble the ed25519 batch in index order (identical message/key sequence
+    // to a serial verify). A non-session action or a malformed key is left as
+    // `None` here and never batched.
+    let mut ed_indices: Vec<usize> = Vec::new();
+    let mut ed_messages: Vec<Vec<u8>> = Vec::new();
+    let mut ed_signatures: Vec<ed25519_dalek::Signature> = Vec::new();
+    let mut ed_keys: Vec<Ed25519VerifyingKey> = Vec::new();
+    let mut ed_pubkeys: Vec<[u8; 32]> = Vec::new();
+
+    for (i, action) in actions.iter().enumerate() {
+        let ActionSignature::Session {
+            session_pubkey,
+            sig,
+        } = &action.signature
+        else {
+            continue; // non-session (EIP-712): None — caller recovers it directly
+        };
+        let Some(vk) = vk_resolver(session_pubkey) else {
+            continue; // malformed key: rejected (None), never batched
+        };
+        let struct_hash = eip712_struct_hash(&action.action, action.nonce);
+        let signing_hash = eip712_signing_hash(domain, struct_hash);
+        ed_indices.push(i);
+        ed_messages.push(signing_hash.0.to_vec());
+        ed_signatures.push(ed25519_dalek::Signature::from_bytes(&sig.0));
+        ed_keys.push(vk);
+        ed_pubkeys.push(*session_pubkey);
+    }
+
+    if ed_indices.is_empty() {
+        return out;
+    }
+
+    let msg_refs: Vec<&[u8]> = ed_messages.iter().map(|m| m.as_slice()).collect();
+    if ed25519_dalek::verify_batch(&msg_refs, &ed_signatures, &ed_keys).is_ok() {
+        // Aggregate valid: every batched signature is cryptographically valid.
+        for j in 0..ed_indices.len() {
+            out[ed_indices[j]] = Some(ed_pubkeys[j]);
+        }
+    } else {
+        // Aggregate failed: fall back to a per-signature verify and accept ONLY
+        // the individually-valid ones — reject exactly the forged signatures.
+        for j in 0..ed_indices.len() {
+            if ed_keys[j].verify(&ed_messages[j], &ed_signatures[j]).is_ok() {
+                out[ed_indices[j]] = Some(ed_pubkeys[j]);
+            }
+        }
+    }
+    out
 }
 
 // ============================================================================
@@ -3221,6 +3369,254 @@ mod tests {
         assert_eq!(
             got[0], None,
             "a HIT for sig A must never validate a different action B"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Finding #17: `batch_verify_session_sigs` — the gossip-ingest batch.
+    // Every test proves per-action verdict equivalence with the per-action
+    // `verify_session_signature`, so batching can never admit a forged sig.
+    // ------------------------------------------------------------------
+
+    /// Deterministically find a 32-byte string that is NOT a valid compressed
+    /// ed25519 point (`from_bytes` errors) — roughly half of all strings decode
+    /// to a point, so a short search always finds one.
+    fn malformed_ed25519_pubkey() -> [u8; 32] {
+        for seed in 0u8..=255 {
+            let mut candidate = [0xFFu8; 32];
+            candidate[0] = seed;
+            candidate[31] = 0x80 | seed; // perturb the sign/high bits
+            if Ed25519VerifyingKey::from_bytes(&candidate).is_err() {
+                return candidate;
+            }
+        }
+        panic!("could not construct a malformed ed25519 pubkey");
+    }
+
+    /// A vk_resolver that mirrors the production one (point-decompress; `None`
+    /// for a malformed key), byte-identical to what `verify_session_signature`
+    /// does internally.
+    fn plain_vk_resolver(pk: &[u8; 32]) -> Option<Ed25519VerifyingKey> {
+        Ed25519VerifyingKey::from_bytes(pk).ok()
+    }
+
+    /// Oracle: the per-action verdict `verify_session_signature` produces (the
+    /// path the batch must be byte-identical to).
+    fn per_action_session_verdict(action: &SignedNativeAction) -> Option<[u8; 32]> {
+        action.verify_session_signature().ok()
+    }
+
+    #[test]
+    fn batch_session_sigs_mixed_one_forged() {
+        // One forged signature among N valid: EXACTLY the forged one is rejected,
+        // every other is admitted with its pubkey.
+        let k = ed(30);
+        let pk = k.verifying_key().to_bytes();
+        let mut actions: Vec<_> = (0..8u64).map(|i| sign_order(TEST_NONCE + i, &k)).collect();
+        // Forge index 5.
+        if let ActionSignature::Session { ref mut sig, .. } = actions[5].signature {
+            sig.0[0] ^= 0xFF;
+        }
+        let refs: Vec<&SignedNativeAction> = actions.iter().collect();
+        let got = batch_verify_session_sigs(&refs, plain_vk_resolver);
+        for (i, action) in actions.iter().enumerate() {
+            let want = per_action_session_verdict(action);
+            assert_eq!(got[i], want, "index {i} verdict must match per-action path");
+            if i == 5 {
+                assert_eq!(got[i], None, "the forged signature must be rejected");
+            } else {
+                assert_eq!(got[i], Some(pk), "valid signatures must be admitted");
+            }
+        }
+    }
+
+    #[test]
+    fn batch_session_sigs_all_forged() {
+        let k = ed(31);
+        let mut actions: Vec<_> = (0..6u64).map(|i| sign_order(TEST_NONCE + i, &k)).collect();
+        for a in actions.iter_mut() {
+            if let ActionSignature::Session { ref mut sig, .. } = a.signature {
+                sig.0[0] ^= 0xAA;
+                sig.0[10] ^= 0x55;
+            }
+        }
+        let refs: Vec<&SignedNativeAction> = actions.iter().collect();
+        let got = batch_verify_session_sigs(&refs, plain_vk_resolver);
+        assert!(got.iter().all(|v| v.is_none()), "all forged => all rejected");
+        for (i, action) in actions.iter().enumerate() {
+            assert_eq!(got[i], per_action_session_verdict(action));
+        }
+    }
+
+    #[test]
+    fn batch_session_sigs_single_equals_per_action() {
+        // A single-element batch is byte-identical to the per-action path — both
+        // for a valid and a forged signature.
+        let k = ed(32);
+        let pk = k.verifying_key().to_bytes();
+        let valid = sign_order(TEST_NONCE, &k);
+        let got = batch_verify_session_sigs(&[&valid], plain_vk_resolver);
+        assert_eq!(got[0], Some(pk));
+        assert_eq!(got[0], per_action_session_verdict(&valid));
+
+        let mut forged = sign_order(TEST_NONCE + 1, &k);
+        if let ActionSignature::Session { ref mut sig, .. } = forged.signature {
+            sig.0[0] ^= 0xFF;
+        }
+        let got = batch_verify_session_sigs(&[&forged], plain_vk_resolver);
+        assert_eq!(got[0], None);
+        assert_eq!(got[0], per_action_session_verdict(&forged));
+    }
+
+    #[test]
+    fn batch_session_sigs_malformed_key_rejected_never_batched() {
+        // A malformed session pubkey (from_bytes error) must be rejected and must
+        // never enter the aggregate — proven by verifying a valid action sitting
+        // NEXT to it still passes (the bad key did not poison the batch).
+        let k = ed(33);
+        let pk = k.verifying_key().to_bytes();
+        let good = sign_order(TEST_NONCE, &k);
+
+        // Build an action whose session_pubkey is not a valid curve point.
+        let bad_key = malformed_ed25519_pubkey();
+        let mut bad = sign_order(TEST_NONCE + 1, &k);
+        if let ActionSignature::Session {
+            ref mut session_pubkey,
+            ..
+        } = bad.signature
+        {
+            *session_pubkey = bad_key;
+        }
+        assert!(
+            Ed25519VerifyingKey::from_bytes(&bad_key).is_err(),
+            "test premise: constructed a malformed key"
+        );
+
+        let refs = vec![&good, &bad];
+        let got = batch_verify_session_sigs(&refs, plain_vk_resolver);
+        assert_eq!(got[0], Some(pk), "the valid action must still verify");
+        assert_eq!(got[1], None, "malformed key => rejected");
+    }
+
+    #[test]
+    fn batch_session_sigs_non_session_yields_none() {
+        // An EIP-712 action in the slice is `None` (the caller recovers it).
+        let key = test_key();
+        let eip = sign_native_action(NativeAction::UnjailSelf, TEST_NONCE, &key);
+        let got = batch_verify_session_sigs(&[&eip], plain_vk_resolver);
+        assert_eq!(got[0], None);
+    }
+
+    #[test]
+    fn batch_session_sigs_equivalence_randomized_mix() {
+        // Property/equivalence: over a randomized mix of valid / forged / malformed
+        // -key / EIP-712 actions, the batch verdict vector is byte-identical to the
+        // per-action `verify_session_signature` verdict, element for element.
+        let mut actions: Vec<SignedNativeAction> = Vec::new();
+        let mut lcg: u64 = 0x1234_5678_9abc_def0;
+        let mut next = || {
+            lcg = lcg.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (lcg >> 33) as u32
+        };
+        for i in 0..64u64 {
+            let choice = next() % 4;
+            let k = ed((40 + (i % 7)) as u8);
+            match choice {
+                0 => actions.push(sign_order(TEST_NONCE + i, &k)), // valid session
+                1 => {
+                    let mut a = sign_order(TEST_NONCE + i, &k); // forged sig
+                    if let ActionSignature::Session { ref mut sig, .. } = a.signature {
+                        sig.0[(next() % 64) as usize] ^= 0xFF;
+                    }
+                    actions.push(a);
+                }
+                2 => {
+                    let mut a = sign_order(TEST_NONCE + i, &k); // malformed key
+                    if let ActionSignature::Session {
+                        ref mut session_pubkey,
+                        ..
+                    } = a.signature
+                    {
+                        *session_pubkey = [0xFFu8; 32];
+                    }
+                    actions.push(a);
+                }
+                _ => actions.push(sign_native_action(
+                    NativeAction::UnjailSelf,
+                    TEST_NONCE + i,
+                    &test_key(),
+                )),
+            }
+        }
+        let refs: Vec<&SignedNativeAction> = actions.iter().collect();
+        let got = batch_verify_session_sigs(&refs, plain_vk_resolver);
+        let want: Vec<Option<[u8; 32]>> =
+            actions.iter().map(per_action_session_verdict).collect();
+        assert_eq!(got, want, "batch verdicts must equal per-action verdicts");
+    }
+
+    #[test]
+    fn batch_session_sigs_empty() {
+        let got = batch_verify_session_sigs(&[], plain_vk_resolver);
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn resolve_sender_with_vk_equals_plain_resolve_sender() {
+        // Finding #17b: a cached (memoizing) vk resolver must produce the exact
+        // same resolved sender as the plain `resolve_sender`, for valid, forged,
+        // expired, out-of-scope and malformed-key session actions.
+        let k = ed(50);
+        let pk = k.verifying_key().to_bytes();
+        let owner = Address::from([0x50; 20]);
+
+        // A memoizing vk resolver (models the mempool cache): decompress once,
+        // reuse thereafter.
+        let cache = std::cell::RefCell::new(
+            std::collections::HashMap::<[u8; 32], Ed25519VerifyingKey>::new(),
+        );
+        let memo = |p: &[u8; 32]| -> Option<Ed25519VerifyingKey> {
+            if let Some(vk) = cache.borrow().get(p).copied() {
+                return Some(vk);
+            }
+            let vk = Ed25519VerifyingKey::from_bytes(p).ok()?;
+            cache.borrow_mut().insert(*p, vk);
+            Some(vk)
+        };
+
+        let valid = sign_order(TEST_NONCE, &k);
+        let mut forged = sign_order(TEST_NONCE + 1, &k);
+        if let ActionSignature::Session { ref mut sig, .. } = forged.signature {
+            sig.0[0] ^= 0xFF;
+        }
+        let mut malformed = sign_order(TEST_NONCE + 2, &k);
+        if let ActionSignature::Session {
+            ref mut session_pubkey,
+            ..
+        } = malformed.signature
+        {
+            *session_pubkey = malformed_ed25519_pubkey();
+        }
+
+        for action in [&valid, &forged, &malformed] {
+            for ts in [0u64, u64::MAX] {
+                let plain = action.resolve_sender(ts, |p| (p == &pk).then(|| make_session(owner)));
+                let cached = action.resolve_sender_with_vk(
+                    ts,
+                    |p| (p == &pk).then(|| make_session(owner)),
+                    memo,
+                );
+                assert_eq!(plain, cached, "cached vk resolve must equal plain resolve");
+            }
+        }
+        // Second pass hits the memo cache — still identical.
+        assert_eq!(
+            valid.resolve_sender(0, |p| (p == &pk).then(|| make_session(owner))),
+            valid.resolve_sender_with_vk(
+                0,
+                |p| (p == &pk).then(|| make_session(owner)),
+                memo
+            ),
         );
     }
 }

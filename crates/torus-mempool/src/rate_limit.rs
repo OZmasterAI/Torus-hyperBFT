@@ -266,6 +266,15 @@ pub const SESSION_OWNER_CACHE_CAP: usize = 16_384;
 /// => cache MISS => full ed25519 verify (safe). ~32B/entry => ~0.5MB at this cap.
 pub const SESSION_SIG_CACHE_CAP: usize = 16_384;
 
+/// Capacity of the verifying-key cache (`session_pubkey -> decompressed ed25519
+/// key`, Finding #17b). Unlike the sig-validity cache this is keyed by the
+/// SESSION KEY, not the per-action signature, so its working set is the number of
+/// distinct live session keys (tiny — one per active market-maker/session), not
+/// the per-action churn. The value is pure deterministic math derived from the
+/// key (zero staleness risk), so a modest bound is ample; over-cap or cold => a
+/// MISS re-decompresses (safe). ~64B/entry => ~64KB at this cap.
+pub const VK_CACHE_CAP: usize = 1_024;
+
 /// Number of individual orders/operations an action represents.
 ///
 /// A `PlaceOrderBatch` counts as its length; every other action counts as 1.

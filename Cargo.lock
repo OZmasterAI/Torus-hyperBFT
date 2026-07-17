@@ -6930,6 +6930,7 @@ dependencies = [
  "alloy-primitives",
  "alloy-rlp",
  "bincode",
+ "ed25519-dalek",
  "k256",
  "revm",
  "sha3",

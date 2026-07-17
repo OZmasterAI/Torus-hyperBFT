@@ -3,6 +3,9 @@
 //! Leaf crate with no internal dependencies. All other crates depend on this.
 
 pub use alloy_primitives::{Address, Bloom, Bytes, B256, U256};
+/// Re-export so downstream crates (mempool vk cache, Finding #17b) can name the
+/// decompressed ed25519 verifying-key type without a direct `ed25519_dalek` dep.
+pub use ed25519_dalek::VerifyingKey as Ed25519VerifyingKey;
 
 use serde::{Deserialize, Serialize};
 

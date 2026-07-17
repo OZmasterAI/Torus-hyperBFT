@@ -269,12 +269,13 @@ pub(crate) fn validate_known_markets(
 /// native action. Blocking-pool work (ecrecover); the batch endpoint runs a
 /// whole batch of these inside one `spawn_blocking`. Error is a per-item
 /// message, never a call-level failure.
-fn verify_one_action_with(
+fn verify_one_action_with<G>(
     decode: DecodeFn,
     signed_action: &str,
     chain_id: u64,
     state_db: &torus_state::StateDb,
     current_time_ms: u64,
+    vk_resolver: &G,
 ) -> Result<
     (
         alloy_primitives::Address,
@@ -283,15 +284,25 @@ fn verify_one_action_with(
         alloy_primitives::B256,
     ),
     String,
-> {
+>
+where
+    G: Fn(&[u8; 32]) -> Option<torus_types::Ed25519VerifyingKey>,
+{
     let bytes = parse_bytes(signed_action).map_err(|e| format!("invalid hex: {e}"))?;
     let action = decode(&bytes)?;
     torus_mempool::rate_limit::validate_batch_size(&action.action)?;
     validate_known_markets(&action.action, state_db)?;
+    // Finding #17b: resolve the session ed25519 key via the shared vk cache
+    // (skips the ~10-15µs point decompression on a HIT). Byte-identical to the
+    // plain `validate_with_sessions` — the strict-expiry ingress semantics are
+    // untouched.
     let sender = action
-        .validate_with_sessions(current_time_ms, chain_id, |pubkey| {
-            state_db.get_session(pubkey).ok().flatten()
-        })
+        .validate_with_sessions_with_vk(
+            current_time_ms,
+            chain_id,
+            |pubkey| state_db.get_session(pubkey).ok().flatten(),
+            |pubkey| vk_resolver(pubkey),
+        )
         .map_err(|e| format!("signature verification failed: {e}"))?;
     // Canonical bytes stay serde_json regardless of ingress format: the
     // action hash, gossip body, and leader-forward payload all derive here.
@@ -322,6 +333,9 @@ pub(crate) fn verify_one_action(
         chain_id,
         state_db,
         current_time_ms,
+        // Plain point-decompression resolver: the single-action / test path has no
+        // shared cache to consult (byte-identical to the pre-#17b behavior).
+        &|pk: &[u8; 32]| torus_types::Ed25519VerifyingKey::from_bytes(pk).ok(),
     )
 }
 
@@ -477,6 +491,10 @@ impl RpcState {
 
         let state_db = self.state.clone();
         let chain_id = self.chain_id;
+        // Finding #17b: share the mempool's verifying-key cache with RPC ingress so
+        // the parallel per-action verify skips the ed25519 point decompression on a
+        // HIT (`&Mempool` is `Sync`, safe to consult across the rayon workers).
+        let mempool_vk = self.mempool.clone();
         let verify_t0 = std::time::Instant::now();
         let (verified, verify_cpu) = tokio::task::spawn_blocking(move || {
             // Option A (ingress-verify-fix): verify the batch in PARALLEL —
@@ -492,6 +510,8 @@ impl RpcState {
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("system clock before epoch")
                 .as_millis() as u64;
+            let vk_resolver =
+                |pk: &[u8; 32]| mempool_vk.resolve_verifying_key(pk);
             let out = ingress_verify_pool().install(|| {
                 to_verify
                     .into_par_iter()
@@ -502,6 +522,7 @@ impl RpcState {
                             chain_id,
                             &state_db,
                             current_time_ms,
+                            &vk_resolver,
                         )
                     })
                     .collect::<Vec<_>>()

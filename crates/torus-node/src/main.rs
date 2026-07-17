@@ -689,14 +689,36 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         });
 
         // Verify worker (crypto verify + prescreen + pool insert).
+        //
+        // Finding #17a — micro-batched ingest: instead of one crypto verify per
+        // message, DRAIN whatever is already queued (up to N) without blocking and
+        // verify the session ed25519 signatures with a single `verify_batch` (+
+        // per-signature fallback). `recv_many` awaits at least ONE message, then
+        // pulls the rest that are ALREADY available — it never waits to fill the
+        // batch, so a single queued message is processed as a batch of one with no
+        // added latency under light load. Per-action admission outcomes are
+        // byte-identical to the old per-action path (proven by the mempool
+        // equivalence tests); only the ed25519 point arithmetic is amortized.
         tokio::spawn(async move {
-            while let Some((sender, action)) = verify_rx.recv().await {
-                match mempool_verify.add_native_action_from_gossip(sender, action) {
-                    Ok(()) => {}
-                    Err(torus_mempool::MempoolError::DuplicateNativeAction) => {}
-                    Err(e) => tracing::debug!("gossip native action rejected: {e}"),
+            const INGEST_BATCH_MAX: usize = 64;
+            loop {
+                let mut buf: Vec<(torus_types::Address, torus_types::SignedNativeAction)> =
+                    Vec::with_capacity(INGEST_BATCH_MAX);
+                let n = verify_rx.recv_many(&mut buf, INGEST_BATCH_MAX).await;
+                if n == 0 {
+                    break; // channel closed
                 }
-                metrics_verify.native_ingest_processed_actions.inc();
+                let count = buf.len() as u64;
+                for res in mempool_verify.add_native_actions_from_gossip_batch(buf) {
+                    match res {
+                        Ok(()) => {}
+                        Err(torus_mempool::MempoolError::DuplicateNativeAction) => {}
+                        Err(e) => tracing::debug!("gossip native action rejected: {e}"),
+                    }
+                }
+                metrics_verify
+                    .native_ingest_processed_actions
+                    .inc_by(count);
             }
         });
     }
