@@ -346,19 +346,12 @@ fn order_book_reader(input: &[u8], state_db: &StateDb) -> Result<Vec<u8>, CoreEr
 
 /// getOrderBook → (uint128[] bid_prices, uint128[] bid_qtys, uint128[] ask_prices, uint128[] ask_qtys)
 fn read_order_book(state_db: &StateDb, market_id: MarketId) -> Result<Vec<u8>, CoreError> {
-    let key = market_id.to_be_bytes();
-    let snapshot = match state_db.get_cf_raw(CF_NATIVE_ORDER_BOOKS, &key)? {
-        // Decode the format `save_order_books` actually writes: a borsh-`OrderBook`
-        // blob. Aggregate its resting orders into price levels via `to_snapshot`.
-        // Fall back to the historical `OrderBookSnapshot` layout for any legacy
-        // value still in the CF. Before this fix the reader decoded EVERY value as
-        // `OrderBookSnapshot`, so a real (non-trivial) book failed to borsh-decode
-        // and this precompile REVERTED; it now returns the book's levels.
-        Some(data) => match crate::order_book::OrderBook::try_from_slice(&data) {
-            Ok(book) => book.to_snapshot(),
-            Err(_) => OrderBookSnapshot::try_from_slice(&data)
-                .map_err(|e| CoreError::Borsh(e.to_string()))?,
-        },
+    // Deep-book round: reconstruct the book from its per-order rows and
+    // aggregate into price levels. An absent market returns empty levels; a
+    // LEGACY monolithic value or corrupt row propagates a loud error (the
+    // precompile reverts) instead of silently misreading book state.
+    let snapshot = match crate::order_book_store::load_book(state_db, market_id)? {
+        Some(book) => book.to_snapshot(),
         None => OrderBookSnapshot {
             bids: vec![],
             asks: vec![],
@@ -1378,18 +1371,10 @@ impl BorshDeserialize for StoredOrder {
     }
 }
 
-/// Write an order book snapshot to CF_NATIVE_ORDER_BOOKS.
-/// Used by the bridge layer to populate precompile-readable state.
-pub fn write_order_book_snapshot(
-    state_db: &StateDb,
-    market_id: MarketId,
-    snapshot: &OrderBookSnapshot,
-) -> Result<(), CoreError> {
-    let key = market_id.to_be_bytes();
-    let data = borsh::to_vec(snapshot).map_err(|e| CoreError::Borsh(e.to_string()))?;
-    state_db.put_cf_raw(CF_NATIVE_ORDER_BOOKS, &key, &data)?;
-    Ok(())
-}
+// Deep-book round: `write_order_book_snapshot` (the legacy monolithic
+// CF_NATIVE_ORDER_BOOKS writer) is REMOVED — the CF holds per-order rows
+// only (`torus_core::order_book_store`); a monolithic value now fails
+// loading loudly. Seed books via `order_book_store::save_book_full`.
 
 /// Write a stored order to CF_NATIVE_ORDERS.
 /// Key: trader(20) + market_id(8) + order_id(16).

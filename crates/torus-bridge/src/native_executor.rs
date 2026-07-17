@@ -299,54 +299,37 @@ impl<T: StateBackend> NativeExecContext<T> {
         std::mem::take(&mut self.pending_trades)
     }
 
-    /// FIX 1 (ECON-FIND-02): Load order books from DB. Returns
-    /// `(books, next_global_order_id, loaded, decode_failed)`.
+    /// FIX 1 (ECON-FIND-02) + deep-book round: load order books from their
+    /// per-order rows. Returns `(books, next_global_order_id, loaded,
+    /// decode_failed)`.
     ///
-    /// P3 Round-1 item 3(c): the `if let Ok(book)` here previously SWALLOWED any
-    /// row that failed to Borsh-decode with zero trace — the exact silent path
-    /// the P2 report flagged as E4 ("are books persisting, or silently losing
-    /// state?"). Decode failures are now counted and WARN-logged so a nonzero
-    /// `books_decode_failed` telemetry value flags a real correctness bug.
+    /// Failure policy (supersedes the E4 warn-and-count): book state is
+    /// consensus state — a row that fails to decode, an orphan row, or a
+    /// LEGACY monolithic value means this node would execute on wrong books
+    /// and fork. `load_all_books` errors loudly and we PANIC with the
+    /// migration story instead of continuing. `decode_failed` is kept for
+    /// the telemetry surface but is now always 0 on a running node.
     fn load_order_books(state: &T) -> (HashMap<MarketId, OrderBook>, u128, u64, u64) {
-        use borsh::BorshDeserialize;
-        use torus_state::cf::CF_NATIVE_ORDER_BOOKS;
+        let books = match torus_core::order_book_store::load_all_books(state) {
+            Ok(books) => books,
+            Err(e) => panic!(
+                "FATAL: cannot load order books from CF_NATIVE_ORDER_BOOKS: {e}. \
+                 This binary reads the per-order-row layout (state-root preimage \
+                 change; coordinated fleet deploy). A legacy monolithic value means \
+                 this DB predates the layout: start from a fresh chain or run the \
+                 offline book migration, then restart."
+            ),
+        };
 
-        let mut books = HashMap::new();
         let mut max_order_id: u128 = 0;
-        let mut loaded: u64 = 0;
-        let mut decode_failed: u64 = 0;
-
-        if let Ok(entries) = state.iterate_cf(CF_NATIVE_ORDER_BOOKS, None) {
-            for (key, value) in entries {
-                if key.len() == 8 {
-                    let market_id = u64::from_be_bytes(key[..8].try_into().unwrap());
-                    match OrderBook::try_from_slice(&value) {
-                        Ok(book) => {
-                            let book_next_id = book.next_order_id();
-                            if book_next_id > max_order_id {
-                                max_order_id = book_next_id;
-                            }
-                            books.insert(market_id, book);
-                            loaded += 1;
-                        }
-                        Err(e) => {
-                            decode_failed += 1;
-                            tracing::warn!(
-                                market_id,
-                                bytes = value.len(),
-                                error = %e,
-                                "order-book row failed to Borsh-decode at load — book state \
-                                 for this market is being silently dropped (E4 correctness flag)"
-                            );
-                        }
-                    }
-                }
-            }
+        for book in books.values() {
+            max_order_id = max_order_id.max(book.next_order_id());
         }
+        let loaded = books.len() as u64;
 
         // Global ID starts at max found + 1 (or 1 if no books loaded)
         let next_id = if max_order_id > 0 { max_order_id } else { 1 };
-        (books, next_id, loaded, decode_failed)
+        (books, next_id, loaded, 0)
     }
 
     /// Durable global-order-id counter row. Lives in `CF_NATIVE_MARKETS` — a
@@ -366,35 +349,35 @@ impl<T: StateBackend> NativeExecContext<T> {
         Some(u128::from_be_bytes(bytes.try_into().ok()?))
     }
 
-    /// FIX 1 (ECON-FIND-02) + S395 dirty-only rewrite: persist the order books
-    /// TOUCHED this block (placed / matched / cancelled / modified) and the
-    /// global order-id counter when it advanced. Untouched books already hold
-    /// identical bytes in the CF — the old rewrite-everything loop cost
-    /// O(all resting orders) in Borsh serialization per block. Returns the
-    /// number of book rows written (test hook). Called after block execution.
-    pub fn save_order_books(&self) -> usize {
-        use torus_state::cf::{CF_NATIVE_MARKETS, CF_NATIVE_ORDER_BOOKS};
+    /// FIX 1 (ECON-FIND-02) + S395 dirty-only + deep-book round: persist the
+    /// order books TOUCHED this block as PER-ORDER ROW DELTAS — the header
+    /// plus one upsert/delete per order touched this block — and the global
+    /// order-id counter when it advanced. Cost is O(orders touched this
+    /// block), independent of resting depth (the old monolithic rewrite was
+    /// O(all resting orders in every dirty book)). Returns the number of
+    /// dirty books persisted (test hook). Called after block execution.
+    pub fn save_order_books(&mut self) -> usize {
+        use torus_state::cf::CF_NATIVE_MARKETS;
 
         let mut written = 0;
         // P3 Round-1 item 3(a): book-state bytes written this block (weight-based
         // depth ground truth), summed over the dirty books actually persisted.
         let mut bytes_written: u64 = 0;
-        for &market_id in &self.dirty_books {
-            let Some(book) = self.order_books.get(&market_id) else {
+        // Deterministic per-market order (the overlay dedups by key anyway,
+        // but a stable write sequence keeps behavior reproducible).
+        let mut dirty: Vec<MarketId> = self.dirty_books.iter().copied().collect();
+        dirty.sort_unstable();
+        for market_id in dirty {
+            let Some(book) = self.order_books.get_mut(&market_id) else {
                 continue;
             };
-            let key = market_id.to_be_bytes();
-            match borsh::to_vec(book) {
-                Ok(data) => {
-                    if let Err(e) = self.state.put_cf_raw(CF_NATIVE_ORDER_BOOKS, &key, &data) {
-                        tracing::error!(market_id, %e, "failed to persist order book");
-                    } else {
-                        written += 1;
-                        bytes_written += data.len() as u64;
-                    }
+            match torus_core::order_book_store::save_book_delta(&self.state, book) {
+                Ok(stats) => {
+                    written += 1;
+                    bytes_written += stats.bytes_written;
                 }
                 Err(e) => {
-                    tracing::error!(market_id, %e, "failed to serialize order book");
+                    tracing::error!(market_id, %e, "failed to persist order book delta");
                 }
             }
         }
@@ -836,11 +819,20 @@ impl NativeExecutor {
             worker_batches.insert(market_id, (book, requests));
         }
 
-        let market_results = MarketWorkerPool::match_parallel(worker_batches, ctx.timestamp);
+        let mut market_results = MarketWorkerPool::match_parallel(worker_batches, ctx.timestamp);
         if let Some(ref m) = ctx.metrics {
             m.exec_phase_match_seconds
                 .observe(match_timer.elapsed().as_secs_f64());
         }
+
+        // Deterministic settlement order. `match_parallel` returns results in
+        // HashMap iteration order (per-process random seed): settling in that
+        // order made the per-block `trade_index` assignment — and the ORDER of
+        // apply_fill balance ops across markets — differ run-to-run and
+        // node-to-node. The final consensus state was saved by commutativity,
+        // but trade-history keys were not reproducible. Sort by market id so
+        // every node settles identically.
+        market_results.sort_by_key(|m| m.market_id);
 
         // ---- Phase 4: Sequential settlement ----
         let settle_timer = std::time::Instant::now();
@@ -1295,8 +1287,13 @@ impl NativeExecutor {
         match market_id {
             Some(mid) => {
                 if let Some(book) = ctx.order_books.get_mut(&mid) {
+                    // Deep-book round fix: cancel_all also drops the trader's
+                    // PENDING STOPS (persisted in the book header) — a trader
+                    // with only stops used to leave the book unmarked, so the
+                    // stop removal was never persisted.
+                    let stops_before = book.pending_stop_count();
                     let cancelled = book.cancel_all(*sender, Some(mid));
-                    if !cancelled.is_empty() {
+                    if !cancelled.is_empty() || book.pending_stop_count() != stops_before {
                         ctx.dirty_books.insert(mid);
                     }
                     for order in &cancelled {
@@ -1315,8 +1312,11 @@ impl NativeExecutor {
                 let market_ids: Vec<MarketId> = ctx.order_books.keys().copied().collect();
                 for mid in market_ids {
                     if let Some(book) = ctx.order_books.get_mut(&mid) {
+                        // See the single-market arm: stop removal alone must
+                        // also dirty the book (stops live in the header).
+                        let stops_before = book.pending_stop_count();
                         let cancelled = book.cancel_all(*sender, None);
-                        if !cancelled.is_empty() {
+                        if !cancelled.is_empty() || book.pending_stop_count() != stops_before {
                             ctx.dirty_books.insert(mid);
                         }
                         for order in &cancelled {

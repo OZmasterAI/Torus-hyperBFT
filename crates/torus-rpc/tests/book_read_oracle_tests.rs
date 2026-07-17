@@ -47,16 +47,12 @@ fn limit(market_id: u64, is_buy: bool, price: i64, qty: i64) -> PlaceOrderParams
     }
 }
 
-/// Persist `book` exactly the way production (`save_order_books`) does.
-/// The ONLY format-coupled code in this file.
+/// Persist `book` exactly the way production (`save_order_books`) does —
+/// since the deep-book round, per-order rows via the store. The ONLY
+/// format-coupled code in this file (assertions unchanged from the
+/// monolithic-blob baseline).
 fn persist_book(state: &StateDb, book: &mut OrderBook) {
-    state
-        .put_cf_raw(
-            torus_state::cf::CF_NATIVE_ORDER_BOOKS,
-            &book.market_id.to_be_bytes(),
-            &borsh::to_vec(book).unwrap(),
-        )
-        .unwrap();
+    torus_core::order_book_store::save_book_full(state, book).unwrap();
 }
 
 fn setup() -> (TempDir, StateDb, Arc<Mempool>, Arc<EvmExecutor>) {
