@@ -355,7 +355,12 @@ impl BlockValidator {
         let mut consumed_nonces: Vec<(Address, u64)> = Vec::new();
         for (i, signed) in block.native_actions.iter().enumerate() {
             let sender = signed
-                .resolve_sender(block.header.timestamp, |pubkey| {
+                // Seconds→ms: `header.timestamp` is SECONDS, session `expiry` is
+                // MILLISECONDS. Convert so this legacy native validate/catch-up path
+                // agrees on session expiry with the live exec/validate paths
+                // (app.rs). This helper is STRICT (no exec grace window); the
+                // authoritative live checks with the grace window live in app.rs.
+                .resolve_sender(block.header.timestamp.saturating_mul(1000), |pubkey| {
                     state_db.get_session(pubkey).ok().flatten()
                 })
                 .map_err(|e| {

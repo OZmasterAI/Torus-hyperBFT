@@ -811,6 +811,26 @@ pub fn sign_native_action_with_session(
 /// Maximum session key expiry: 24 hours in milliseconds.
 pub const MAX_SESSION_EXPIRY_MS: u64 = 24 * 60 * 60 * 1000;
 
+/// CONSENSUS PARAMETER — session-expiry grace window applied ONLY on the
+/// exec/block-validate path (`batch_verify_native_actions[_cached]`), in
+/// milliseconds. A session-signed action is accepted at execution as long as the
+/// block timestamp is `<= session.expiry + SESSION_EXPIRY_EXEC_GRACE_MS`.
+///
+/// This exists purely to absorb the admission→inclusion race: an action admitted
+/// at RPC ingress (checked STRICTLY against `expiry`, no grace) may sit in the
+/// mempool for a few seconds before a proposer includes it and the block commits.
+/// Without a grace window an action that was valid at admission could be rejected
+/// at commit — and, on an attested block, wrongly slash an honest proposer. The
+/// proposer-side near-expiry filter (`PROPOSAL_EXPIRY_MARGIN_MS`, 60 s) keeps any
+/// included action at least 60 s from expiry, so 120 s of exec grace makes an
+/// honest slash require a > 180 s proposal→commit gap — pathological.
+///
+/// This is a HARDCODED consensus parameter: it is the SAME on every validator and
+/// is NEVER env/CLI/per-node tunable. All validators must agree on it byte-for-byte
+/// or they fork on near-expiry session actions. Changing it is a coordinated
+/// fleet-wide deploy.
+pub const SESSION_EXPIRY_EXEC_GRACE_MS: u64 = 120_000;
+
 /// Maximum active sessions per address.
 pub const MAX_SESSIONS_PER_ADDRESS: usize = 5;
 
@@ -993,13 +1013,13 @@ impl SignedNativeAction {
 /// serial run.
 pub fn batch_verify_native_actions(
     actions: &[SignedNativeAction],
-    timestamp: u64,
+    timestamp_ms: u64,
     session_lookup: impl Fn(&[u8; 32]) -> Option<crate::SessionData>,
 ) -> Vec<Option<Address>> {
     // No exec trust-cache: every action is fully verified — exactly today's
     // behavior. The execution path uses `batch_verify_native_actions_cached`;
     // passing never-hitting lookups here makes "cache off" provably identical.
-    batch_verify_native_actions_cached(actions, timestamp, session_lookup, |_| None, |_| false)
+    batch_verify_native_actions_cached(actions, timestamp_ms, session_lookup, |_| None, |_| false)
 }
 
 /// Trust-cache-aware variant of [`batch_verify_native_actions`].
@@ -1027,7 +1047,7 @@ pub fn batch_verify_native_actions(
 /// `session_lookup`, so callers keep their non-`Sync` closures.
 pub fn batch_verify_native_actions_cached(
     actions: &[SignedNativeAction],
-    timestamp: u64,
+    timestamp_ms: u64,
     session_lookup: impl Fn(&[u8; 32]) -> Option<crate::SessionData>,
     verified_lookup: impl Fn(&alloy_primitives::B256) -> Option<Address>,
     session_sig_verified: impl Fn(&alloy_primitives::B256) -> bool,
@@ -1151,8 +1171,13 @@ pub fn batch_verify_native_actions_cached(
             let Some(Some(session)) = resolved_sessions.get(session_pubkey) else {
                 return SessionOutcome::Skip; // no session / lookup returned None
             };
-            if !(timestamp <= session.expiry && session.scope.allows(&action.action)) {
-                return SessionOutcome::Skip; // expired or out of scope
+            // Exec/validate expiry check with the consensus grace window (absorbs
+            // the admission→inclusion race; RPC ingress stays STRICT in
+            // `resolve_sender`). `saturating_add` so a `u64::MAX` (never-expiring)
+            // session can't overflow the window.
+            let expiry_deadline_ms = session.expiry.saturating_add(SESSION_EXPIRY_EXEC_GRACE_MS);
+            if !(timestamp_ms <= expiry_deadline_ms && session.scope.allows(&action.action)) {
+                return SessionOutcome::Skip; // expired (past grace) or out of scope
             }
             // Sig-cache HIT: the ed25519 signature over this exact
             // (payload, nonce, pubkey, sig) was already locally verified, so skip
@@ -1914,14 +1939,16 @@ mod tests {
         );
     }
 
-    /// (ii) An EXPIRED session is rejected on the HIT path exactly as uncached — a
-    /// cached SessionData does NOT bypass the `timestamp <= expiry` check.
+    /// (ii) An EXPIRED session (past the exec grace window) is rejected on the HIT
+    /// path exactly as uncached — a cached SessionData does NOT bypass the
+    /// `timestamp_ms <= expiry + GRACE` check. Uses ms-realistic values so the
+    /// grace window (`SESSION_EXPIRY_EXEC_GRACE_MS`) is exercised honestly.
     #[test]
     fn session_cache_hit_rejects_expired_exactly_as_uncached() {
         let ed_key = ed25519_dalek::SigningKey::from_bytes(&[11u8; 32]);
         let pubkey = ed_key.verifying_key().to_bytes();
         let owner = Address::from([0xCD; 20]);
-        let expiry = 5_000u64;
+        let expiry = 1_700_000_000_000u64; // realistic ms
 
         let mut store = SessionStore::new();
         store.insert(
@@ -1938,32 +1965,34 @@ mod tests {
         let cache = std::cell::RefCell::new(SessionStore::new());
         let db_reads = std::cell::Cell::new(0usize);
 
-        // First: verify BEFORE expiry -> accepted, populates the cache.
+        // First: verify AT the grace deadline -> accepted, populates the cache.
+        let grace_deadline = expiry + super::SESSION_EXPIRY_EXEC_GRACE_MS;
         let before = batch_verify_native_actions(
             std::slice::from_ref(&action),
-            expiry, // timestamp == expiry: still valid (<=)
+            grace_deadline, // timestamp == expiry+grace: still valid (<=)
             memoizing_lookup(&store, &cache, &db_reads),
         );
-        assert_eq!(before[0], Some(owner), "valid before/at expiry");
+        assert_eq!(before[0], Some(owner), "valid at the grace deadline");
         assert_eq!(db_reads.get(), 1, "populated from the DB");
 
-        // Now verify AFTER expiry. The entry is a cache HIT (no new DB read), yet the
-        // action must be REJECTED because expiry is re-checked against the cached data.
+        // Now verify PAST the grace deadline. The entry is a cache HIT (no new DB
+        // read), yet the action must be REJECTED because expiry+grace is re-checked
+        // against the cached data.
         let after_cached = batch_verify_native_actions(
             std::slice::from_ref(&action),
-            expiry + 1,
+            grace_deadline + 1,
             memoizing_lookup(&store, &cache, &db_reads),
         );
         assert_eq!(db_reads.get(), 1, "second verify was a cache HIT (no DB read)");
         assert_eq!(
             after_cached[0], None,
-            "expired session rejected on the HIT path"
+            "expired session (past grace) rejected on the HIT path"
         );
 
         // Identical to the uncached path at the same timestamp.
         let after_uncached = batch_verify_native_actions(
             std::slice::from_ref(&action),
-            expiry + 1,
+            grace_deadline + 1,
             |pk| store.get(pk).cloned(),
         );
         assert_eq!(after_cached, after_uncached, "hit == miss for expired");
@@ -2088,7 +2117,7 @@ mod tests {
         let pk_scope = key_scope.verifying_key().to_bytes();
         let pk_forge = key_forge.verifying_key().to_bytes();
         let owner = Address::from([0x33; 20]);
-        let ts = 10_000u64;
+        let ts = 1_700_000_000_000u64; // realistic ms
 
         let mut store = SessionStore::new();
         store.insert(pk_ok, make_session(owner)); // Trading, MAX expiry
@@ -2096,7 +2125,8 @@ mod tests {
             pk_exp,
             SessionData {
                 owner,
-                expiry: ts - 1, // already expired at ts
+                // Expired PAST the exec grace window, so it is rejected at ts.
+                expiry: ts - super::SESSION_EXPIRY_EXEC_GRACE_MS - 1,
                 scope: SessionScope::Trading,
                 created_at: 0,
             },
@@ -2495,7 +2525,7 @@ mod tests {
     /// characterization oracle; must never be "optimized".
     fn reference_impl(
         actions: &[SignedNativeAction],
-        timestamp: u64,
+        timestamp_ms: u64,
         session_lookup: impl Fn(&[u8; 32]) -> Option<crate::SessionData>,
         verified_lookup: impl Fn(&alloy_primitives::B256) -> Option<Address>,
     ) -> Vec<Option<Address>> {
@@ -2540,7 +2570,9 @@ mod tests {
             }
             match session_lookup(session_pubkey) {
                 Some(session)
-                    if timestamp <= session.expiry && session.scope.allows(&action.action) =>
+                    if timestamp_ms
+                        <= session.expiry.saturating_add(SESSION_EXPIRY_EXEC_GRACE_MS)
+                        && session.scope.allows(&action.action) =>
                 {
                     let Ok(vk) = Ed25519VerifyingKey::from_bytes(session_pubkey) else {
                         continue;
@@ -2651,7 +2683,8 @@ mod tests {
             pk,
             SessionData {
                 owner: Address::from([0x12; 20]),
-                expiry: TEST_NONCE - 1, // expired at `ts`
+                // Expired past the exec grace window at ts == TEST_NONCE.
+                expiry: TEST_NONCE - super::SESSION_EXPIRY_EXEC_GRACE_MS - 1,
                 scope: SessionScope::Trading,
                 created_at: 0,
             },
@@ -2818,7 +2851,7 @@ mod tests {
             expired_pk,
             SessionData {
                 owner: Address::from([0x31; 20]),
-                expiry: TEST_NONCE - 5,
+                expiry: TEST_NONCE - super::SESSION_EXPIRY_EXEC_GRACE_MS - 5,
                 scope: SessionScope::Trading,
                 created_at: 0,
             },
@@ -2883,7 +2916,8 @@ mod tests {
             pk,
             SessionData {
                 owner: Address::from([0x40; 20]),
-                expiry: TEST_NONCE - 1, // expired at `ts`
+                // Expired past the exec grace window at ts == TEST_NONCE.
+                expiry: TEST_NONCE - super::SESSION_EXPIRY_EXEC_GRACE_MS - 1,
                 scope: SessionScope::Trading,
                 created_at: 0,
             },
@@ -2902,6 +2936,172 @@ mod tests {
             hitting_cache(keys),
         );
         assert_eq!(got[0], None, "expired session rejected even on a sig-cache HIT");
+    }
+
+    // ------------------------------------------------------------------
+    // Session-expiry grace window (Option A) — exec/validate path ONLY.
+    // The exec/validate check is `timestamp_ms <= expiry + GRACE`; RPC ingress
+    // (`resolve_sender`) is STRICT (`timestamp_ms > expiry` rejects, no grace).
+    // ------------------------------------------------------------------
+
+    /// The exec/validate grace window is INCLUSIVE at `expiry + GRACE` and rejects
+    /// exactly one ms past it (`expiry+grace-1` accepted, `expiry+grace+1` rejected).
+    #[test]
+    fn exec_grace_window_boundary_accept_and_reject() {
+        let k = ed(60);
+        let pk = k.verifying_key().to_bytes();
+        let owner = Address::from([0x60; 20]);
+        let expiry = 1_700_000_000_000u64; // realistic ms
+        let mut store = SessionStore::new();
+        store.insert(
+            pk,
+            SessionData {
+                owner,
+                expiry,
+                scope: SessionScope::Trading,
+                created_at: 0,
+            },
+        );
+        let lookup = |p: &[u8; 32]| store.get(p).cloned();
+        let deadline = expiry + super::SESSION_EXPIRY_EXEC_GRACE_MS;
+        let action = sign_order(1, &k);
+
+        assert_eq!(
+            batch_verify_native_actions(std::slice::from_ref(&action), deadline - 1, lookup)[0],
+            Some(owner),
+            "expiry+grace-1 accepted"
+        );
+        assert_eq!(
+            batch_verify_native_actions(std::slice::from_ref(&action), deadline, lookup)[0],
+            Some(owner),
+            "expiry+grace (inclusive boundary) accepted"
+        );
+        assert_eq!(
+            batch_verify_native_actions(std::slice::from_ref(&action), deadline + 1, lookup)[0],
+            None,
+            "expiry+grace+1 rejected"
+        );
+    }
+
+    /// A never-expiring session (`expiry == u64::MAX`) must not overflow the grace
+    /// `saturating_add` and is always accepted at exec.
+    #[test]
+    fn exec_grace_window_saturates_at_u64_max_expiry() {
+        let k = ed(61);
+        let pk = k.verifying_key().to_bytes();
+        let owner = Address::from([0x61; 20]);
+        let mut store = SessionStore::new();
+        store.insert(
+            pk,
+            SessionData {
+                owner,
+                expiry: u64::MAX,
+                scope: SessionScope::Trading,
+                created_at: 0,
+            },
+        );
+        let action = sign_order(1, &k);
+        let got = batch_verify_native_actions(std::slice::from_ref(&action), u64::MAX, |p| {
+            store.get(p).cloned()
+        });
+        assert_eq!(
+            got[0],
+            Some(owner),
+            "u64::MAX expiry never overflows the grace add / never expires"
+        );
+    }
+
+    /// Driving regression at the batch level: a session whose MS expiry is well in
+    /// the past relative to a realistic seconds-derived MS block timestamp is
+    /// REJECTED once the caller passes MILLISECONDS. This is the unit twin of the
+    /// consensus bug — under the old seconds callers the comparison was
+    /// `1_700_000_000 (s) <= expiry_ms`, which was always true (sessions never
+    /// expired). Passing `ts_seconds * 1000` makes expiry enforceable again.
+    #[test]
+    fn expired_ms_session_rejected_when_caller_passes_milliseconds() {
+        let k = ed(63);
+        let pk = k.verifying_key().to_bytes();
+        let owner = Address::from([0x63; 20]);
+        let ts_seconds = 1_700_000_000u64;
+        // Expired ~200 s ago in ms terms — well past the 120 s exec grace window.
+        let expiry_ms = ts_seconds * 1000 - 200_000;
+        let mut store = SessionStore::new();
+        store.insert(
+            pk,
+            SessionData {
+                owner,
+                expiry: expiry_ms,
+                scope: SessionScope::Trading,
+                created_at: 0,
+            },
+        );
+        let action = sign_order(1, &k);
+
+        // BUGGY caller (seconds): tiny value vs a ms expiry => wrongly ACCEPTED.
+        let buggy = batch_verify_native_actions(std::slice::from_ref(&action), ts_seconds, |p| {
+            store.get(p).cloned()
+        });
+        assert_eq!(
+            buggy[0],
+            Some(owner),
+            "the old seconds caller wrongly accepts an expired session (bug reproduction)"
+        );
+
+        // FIXED caller (milliseconds): expiry is enforced => REJECTED.
+        let fixed =
+            batch_verify_native_actions(std::slice::from_ref(&action), ts_seconds * 1000, |p| {
+                store.get(p).cloned()
+            });
+        assert_eq!(
+            fixed[0], None,
+            "the ms caller correctly rejects the expired session"
+        );
+    }
+
+    /// RPC INGRESS stays STRICT: `resolve_sender` rejects at `expiry + 1` with NO
+    /// grace, so near-dead actions are never admitted. The grace exists ONLY to
+    /// protect the admission→inclusion race at exec, never to widen admission.
+    #[test]
+    fn ingress_resolve_sender_is_strict_no_grace() {
+        let k = ed(62);
+        let pk = k.verifying_key().to_bytes();
+        let owner = Address::from([0x62; 20]);
+        let expiry = 1_700_000_000_000u64;
+        let session = SessionData {
+            owner,
+            expiry,
+            scope: SessionScope::Trading,
+            created_at: 0,
+        };
+        let action = sign_order(1, &k);
+
+        // At expiry: valid (inclusive) at ingress too.
+        assert_eq!(
+            action
+                .resolve_sender(expiry, |p| (p == &pk).then(|| session.clone()))
+                .unwrap(),
+            owner,
+            "ingress valid at expiry"
+        );
+        // One ms past expiry: rejected with NO grace (unlike the exec path).
+        let err = action
+            .resolve_sender(expiry + 1, |p| (p == &pk).then(|| session.clone()))
+            .unwrap_err();
+        assert!(
+            matches!(err, Eip712Error::SessionExpired),
+            "ingress strict: expiry+1 rejected"
+        );
+        // Deep inside the exec grace window, yet ingress STILL rejects — proving the
+        // ingress/exec split: grace is exec-only.
+        let err2 = action
+            .resolve_sender(expiry + super::SESSION_EXPIRY_EXEC_GRACE_MS, |p| {
+                (p == &pk).then(|| session.clone())
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err2, Eip712Error::SessionExpired),
+            "ingress applies NO grace even inside the exec grace window"
+        );
     }
 
     /// #13.1b — a HIT on a valid sig for an OUT-OF-SCOPE session is still rejected.

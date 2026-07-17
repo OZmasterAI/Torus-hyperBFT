@@ -396,7 +396,13 @@ impl ExecutionContext {
             let resolved_senders = if has_native {
                 torus_types::eip712::batch_verify_native_actions_cached(
                     &torus_block.native_actions,
-                    torus_block.header.timestamp,
+                    // `header.timestamp` is SECONDS; session `expiry` is MILLISECONDS
+                    // (mem 0226e678: exec_create_session validates in ms). Convert so
+                    // the exec-side expiry comparison is unit-correct — before this
+                    // fix seconds-vs-ms meant sessions never expired on-chain
+                    // (~56000-year window). Grace window is applied inside
+                    // `batch_verify` (SESSION_EXPIRY_EXEC_GRACE_MS).
+                    torus_block.header.timestamp.saturating_mul(1000),
                     // Session-owner cache (gated by --exec-trust-cache): on a HIT
                     // reuse the cached SessionData and skip the per-action
                     // `get_session` RocksDB read (the P3 exec_verify lever for the
@@ -2194,7 +2200,10 @@ impl App<RocksKVStore> for TorusApp {
                 // tracked separately) — strictly better than rejecting all session blocks.
                 let resolved = torus_types::eip712::batch_verify_native_actions(
                     &torus_block.native_actions,
-                    torus_block.header.timestamp,
+                    // Seconds→ms: `header.timestamp` is SECONDS, session `expiry` is
+                    // MILLISECONDS. Must match the exec path (~L399) exactly or a
+                    // validator would disagree with execution on session expiry.
+                    torus_block.header.timestamp.saturating_mul(1000),
                     |pubkey| self.state_db.get_session(pubkey).ok().flatten(),
                 );
                 if let Some(i) = resolved.iter().position(|s| s.is_none()) {
@@ -3463,6 +3472,95 @@ mod crash_recovery_tests {
             metrics.exec_session_sig_skipped.get(),
             0,
             "a sig-cache MISS must NEVER skip ed25519 verify (no skip-by-default)"
+        );
+    }
+
+    /// DRIVING REGRESSION (item #5, seconds-vs-ms session expiry): a session whose
+    /// MS expiry is well in the past relative to a realistic SECONDS block timestamp
+    /// MUST be rejected at execution — it resolves to `None`, is skipped, and is
+    /// NOT counted in `native_actions_processed`.
+    ///
+    /// Before the fix the exec caller passed `header.timestamp` (SECONDS) into
+    /// `batch_verify`, whose expiry comparison is in MS; the tiny seconds value was
+    /// always `<=` any ms expiry, so on-chain sessions NEVER expired (~56000-year
+    /// window). The fix passes `header.timestamp.saturating_mul(1000)`. This test
+    /// FAILS on the old code (the expired action is wrongly processed = 1) and
+    /// PASSES post-fix (0).
+    #[test]
+    fn expired_session_rejected_at_exec_with_seconds_block_timestamp() {
+        let ed = ed25519_dalek::SigningKey::from_bytes(&[71u8; 32]);
+        let pubkey = ed.verifying_key().to_bytes();
+        let owner = Address::from([0x71; 20]);
+        let ts_seconds = 1_700_000_000u64;
+        // Expired ~200 s ago in ms terms — past the 120 s exec grace window.
+        let expiry_ms = ts_seconds * 1000 - 200_000;
+        let session = torus_types::SessionData {
+            owner,
+            expiry: expiry_ms,
+            scope: torus_types::SessionScope::Trading,
+            created_at: 0,
+        };
+        // Nonce value is irrelevant at exec (no nonce-window check on that path).
+        let signed = torus_types::eip712::sign_native_action_with_session(
+            NativeAction::CancelOrder { order_id: 9 },
+            expiry_ms,
+            &ed,
+        );
+
+        let (config, db) = make_test_config_and_db();
+        db.put_session(&pubkey, &session).unwrap();
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
+        let ctx = make_exec_ctx_with_metrics(&config, &db, None, false, metrics.clone());
+
+        // Block carries a realistic SECONDS timestamp, as real block headers do.
+        let mut block = make_block(1, vec![signed.clone()]);
+        block.header.timestamp = ts_seconds;
+        ctx.execute_committed_block(&block, vec![]);
+
+        assert_eq!(
+            metrics.native_actions_processed.get(),
+            0,
+            "expired session (ms expiry past grace) must be rejected at exec, not processed"
+        );
+    }
+
+    /// Companion to the driving regression: the SAME session, still LIVE in ms
+    /// terms (expiry comfortably in the future), is accepted and processed at exec
+    /// under the ms-correct caller — proving the fix doesn't over-reject live
+    /// sessions.
+    #[test]
+    fn live_session_accepted_at_exec_with_seconds_block_timestamp() {
+        let ed = ed25519_dalek::SigningKey::from_bytes(&[72u8; 32]);
+        let pubkey = ed.verifying_key().to_bytes();
+        let owner = Address::from([0x72; 20]);
+        let ts_seconds = 1_700_000_000u64;
+        // Live: expires 1 h in the future (ms).
+        let expiry_ms = ts_seconds * 1000 + 3_600_000;
+        let session = torus_types::SessionData {
+            owner,
+            expiry: expiry_ms,
+            scope: torus_types::SessionScope::Trading,
+            created_at: 0,
+        };
+        let signed = torus_types::eip712::sign_native_action_with_session(
+            NativeAction::CancelOrder { order_id: 10 },
+            ts_seconds * 1000,
+            &ed,
+        );
+
+        let (config, db) = make_test_config_and_db();
+        db.put_session(&pubkey, &session).unwrap();
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
+        let ctx = make_exec_ctx_with_metrics(&config, &db, None, false, metrics.clone());
+
+        let mut block = make_block(1, vec![signed.clone()]);
+        block.header.timestamp = ts_seconds;
+        ctx.execute_committed_block(&block, vec![]);
+
+        assert_eq!(
+            metrics.native_actions_processed.get(),
+            1,
+            "a live session must still be accepted and processed at exec"
         );
     }
 

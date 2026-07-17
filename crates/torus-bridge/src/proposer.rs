@@ -204,7 +204,11 @@ impl BlockProposer {
         // FIX ECON-FIND-03: Check persistent nonces to prevent replay.
         for signed in &signed_native_actions {
             let sender = signed
-                .resolve_sender(timestamp, |pubkey| {
+                // Seconds→ms: block `timestamp` is SECONDS, session `expiry` is
+                // MILLISECONDS. Convert for the session-expiry check. Legacy
+                // block-build path (superseded by CTE produce_block in app.rs, which
+                // carries the proposer-side near-expiry filter).
+                .resolve_sender(timestamp.saturating_mul(1000), |pubkey| {
                     state_db.get_session(pubkey).ok().flatten()
                 })
                 .map_err(|e| BridgeError::SignatureRecovery(format!("{e}")))?;
