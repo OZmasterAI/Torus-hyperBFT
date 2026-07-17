@@ -52,6 +52,19 @@ services:
       # commit height (the window comfortably exceeds any live push-race lag).
       - TORUS_DA_DISABLE_WAL=${TORUS_DA_DISABLE_WAL:-true}
       - TORUS_DA_BODY_RETENTION=${TORUS_DA_BODY_RETENTION:-128}
+      # CAP-TUNABLE: opt this LOOPBACK devnet into the diagnostic-proven block-size
+      # caps that reproduce the +65% native-placement result (diag-c400-lifted).
+      # The proven cell is a TRIPLE: the per-block ACTION cap must clear 125 (else
+      # it — not the order cap — binds at bs400: 50k orders / 400 = 125 actions),
+      # AND the order + byte budgets must be lifted so the larger action count can
+      # actually fill. All three are PROPOSER-LOCAL selection policy (produce_block
+      # only; validate_block never rejects on count/bytes/orders), so per-node
+      # values can never fork the chain. SHIPPED DEFAULTS ARE UNCHANGED (action 100,
+      # orders 50k, bytes 6 MB in rate_limit.rs): WAN safety of larger blocks is
+      # UNPROVEN, so only this loopback compose opts in. Overridable per leg.
+      - TORUS_NATIVE_TOTAL_BLOCK_CAP=${TORUS_NATIVE_TOTAL_BLOCK_CAP:-400}
+      - TORUS_NATIVE_ORDERS_PER_BLOCK_CAP=${TORUS_NATIVE_ORDERS_PER_BLOCK_CAP:-400000}
+      - TORUS_NATIVE_BLOCK_BYTES_CAP=${TORUS_NATIVE_BLOCK_BYTES_CAP:-31457280}
     volumes:
       - ./genesis.json:/genesis/genesis.json:ro
       - validator-0-data:/data
@@ -100,6 +113,19 @@ services:
       # commit height (the window comfortably exceeds any live push-race lag).
       - TORUS_DA_DISABLE_WAL=${TORUS_DA_DISABLE_WAL:-true}
       - TORUS_DA_BODY_RETENTION=${TORUS_DA_BODY_RETENTION:-128}
+      # CAP-TUNABLE: opt this LOOPBACK devnet into the diagnostic-proven block-size
+      # caps that reproduce the +65% native-placement result (diag-c400-lifted).
+      # The proven cell is a TRIPLE: the per-block ACTION cap must clear 125 (else
+      # it — not the order cap — binds at bs400: 50k orders / 400 = 125 actions),
+      # AND the order + byte budgets must be lifted so the larger action count can
+      # actually fill. All three are PROPOSER-LOCAL selection policy (produce_block
+      # only; validate_block never rejects on count/bytes/orders), so per-node
+      # values can never fork the chain. SHIPPED DEFAULTS ARE UNCHANGED (action 100,
+      # orders 50k, bytes 6 MB in rate_limit.rs): WAN safety of larger blocks is
+      # UNPROVEN, so only this loopback compose opts in. Overridable per leg.
+      - TORUS_NATIVE_TOTAL_BLOCK_CAP=${TORUS_NATIVE_TOTAL_BLOCK_CAP:-400}
+      - TORUS_NATIVE_ORDERS_PER_BLOCK_CAP=${TORUS_NATIVE_ORDERS_PER_BLOCK_CAP:-400000}
+      - TORUS_NATIVE_BLOCK_BYTES_CAP=${TORUS_NATIVE_BLOCK_BYTES_CAP:-31457280}
     volumes:
       - ./genesis.json:/genesis/genesis.json:ro
       - validator-1-data:/data
@@ -147,6 +173,19 @@ services:
       # commit height (the window comfortably exceeds any live push-race lag).
       - TORUS_DA_DISABLE_WAL=${TORUS_DA_DISABLE_WAL:-true}
       - TORUS_DA_BODY_RETENTION=${TORUS_DA_BODY_RETENTION:-128}
+      # CAP-TUNABLE: opt this LOOPBACK devnet into the diagnostic-proven block-size
+      # caps that reproduce the +65% native-placement result (diag-c400-lifted).
+      # The proven cell is a TRIPLE: the per-block ACTION cap must clear 125 (else
+      # it — not the order cap — binds at bs400: 50k orders / 400 = 125 actions),
+      # AND the order + byte budgets must be lifted so the larger action count can
+      # actually fill. All three are PROPOSER-LOCAL selection policy (produce_block
+      # only; validate_block never rejects on count/bytes/orders), so per-node
+      # values can never fork the chain. SHIPPED DEFAULTS ARE UNCHANGED (action 100,
+      # orders 50k, bytes 6 MB in rate_limit.rs): WAN safety of larger blocks is
+      # UNPROVEN, so only this loopback compose opts in. Overridable per leg.
+      - TORUS_NATIVE_TOTAL_BLOCK_CAP=${TORUS_NATIVE_TOTAL_BLOCK_CAP:-400}
+      - TORUS_NATIVE_ORDERS_PER_BLOCK_CAP=${TORUS_NATIVE_ORDERS_PER_BLOCK_CAP:-400000}
+      - TORUS_NATIVE_BLOCK_BYTES_CAP=${TORUS_NATIVE_BLOCK_BYTES_CAP:-31457280}
     volumes:
       - ./genesis.json:/genesis/genesis.json:ro
       - validator-2-data:/data
@@ -194,6 +233,19 @@ services:
       # commit height (the window comfortably exceeds any live push-race lag).
       - TORUS_DA_DISABLE_WAL=${TORUS_DA_DISABLE_WAL:-true}
       - TORUS_DA_BODY_RETENTION=${TORUS_DA_BODY_RETENTION:-128}
+      # CAP-TUNABLE: opt this LOOPBACK devnet into the diagnostic-proven block-size
+      # caps that reproduce the +65% native-placement result (diag-c400-lifted).
+      # The proven cell is a TRIPLE: the per-block ACTION cap must clear 125 (else
+      # it — not the order cap — binds at bs400: 50k orders / 400 = 125 actions),
+      # AND the order + byte budgets must be lifted so the larger action count can
+      # actually fill. All three are PROPOSER-LOCAL selection policy (produce_block
+      # only; validate_block never rejects on count/bytes/orders), so per-node
+      # values can never fork the chain. SHIPPED DEFAULTS ARE UNCHANGED (action 100,
+      # orders 50k, bytes 6 MB in rate_limit.rs): WAN safety of larger blocks is
+      # UNPROVEN, so only this loopback compose opts in. Overridable per leg.
+      - TORUS_NATIVE_TOTAL_BLOCK_CAP=${TORUS_NATIVE_TOTAL_BLOCK_CAP:-400}
+      - TORUS_NATIVE_ORDERS_PER_BLOCK_CAP=${TORUS_NATIVE_ORDERS_PER_BLOCK_CAP:-400000}
+      - TORUS_NATIVE_BLOCK_BYTES_CAP=${TORUS_NATIVE_BLOCK_BYTES_CAP:-31457280}
     volumes:
       - ./genesis.json:/genesis/genesis.json:ro
       - validator-3-data:/data
@@ -241,6 +293,19 @@ services:
       # commit height (the window comfortably exceeds any live push-race lag).
       - TORUS_DA_DISABLE_WAL=${TORUS_DA_DISABLE_WAL:-true}
       - TORUS_DA_BODY_RETENTION=${TORUS_DA_BODY_RETENTION:-128}
+      # CAP-TUNABLE: opt this LOOPBACK devnet into the diagnostic-proven block-size
+      # caps that reproduce the +65% native-placement result (diag-c400-lifted).
+      # The proven cell is a TRIPLE: the per-block ACTION cap must clear 125 (else
+      # it — not the order cap — binds at bs400: 50k orders / 400 = 125 actions),
+      # AND the order + byte budgets must be lifted so the larger action count can
+      # actually fill. All three are PROPOSER-LOCAL selection policy (produce_block
+      # only; validate_block never rejects on count/bytes/orders), so per-node
+      # values can never fork the chain. SHIPPED DEFAULTS ARE UNCHANGED (action 100,
+      # orders 50k, bytes 6 MB in rate_limit.rs): WAN safety of larger blocks is
+      # UNPROVEN, so only this loopback compose opts in. Overridable per leg.
+      - TORUS_NATIVE_TOTAL_BLOCK_CAP=${TORUS_NATIVE_TOTAL_BLOCK_CAP:-400}
+      - TORUS_NATIVE_ORDERS_PER_BLOCK_CAP=${TORUS_NATIVE_ORDERS_PER_BLOCK_CAP:-400000}
+      - TORUS_NATIVE_BLOCK_BYTES_CAP=${TORUS_NATIVE_BLOCK_BYTES_CAP:-31457280}
     volumes:
       - ./genesis.json:/genesis/genesis.json:ro
       - rpc-node-data:/data

@@ -177,31 +177,52 @@ pub use torus_types::NATIVE_ORDERS_PER_BATCH_CAP;
 /// reject on order count, so mixed values cannot fork.
 pub const NATIVE_ORDERS_PER_BLOCK_CAP: usize = 50_000;
 
+/// Resolve the effective per-block order budget from a raw env value (pure —
+/// no `OnceLock`, no `std::env` read — so the parse/clamp/fallback policy is
+/// unit-testable without process-global state). `native_orders_per_block_cap`
+/// is the cached, logged production wrapper.
+///
+/// Policy: parse `raw`; an absent/unparseable value falls back to the compiled
+/// default (a typo never silently wedges selection — same doctrine as
+/// `da_body_retention`). The per-batch cap is the floor: selection breaks on
+/// the first entry whose `order_count` would exceed the budget, so any value
+/// below a single legal batch (or 0) would starve native selection to empty
+/// blocks — clamp + WARN rather than obey it (O5 env-floor doctrine).
+fn resolve_orders_per_block_cap(raw: Option<String>) -> usize {
+    let parsed = raw
+        .as_deref()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(NATIVE_ORDERS_PER_BLOCK_CAP);
+    if parsed < NATIVE_ORDERS_PER_BATCH_CAP {
+        tracing::warn!(
+            requested = parsed,
+            floor = NATIVE_ORDERS_PER_BATCH_CAP,
+            "TORUS_NATIVE_ORDERS_PER_BLOCK_CAP below the per-batch cap would starve \
+             native selection; clamping to the floor"
+        );
+        return NATIVE_ORDERS_PER_BATCH_CAP;
+    }
+    parsed
+}
+
 /// Effective per-block ORDER budget: `TORUS_NATIVE_ORDERS_PER_BLOCK_CAP`
 /// overrides the compiled default PER NODE (same OnceLock pattern as
 /// `TORUS_NATIVE_TOTAL_BLOCK_CAP`). Proposer-local selection policy —
 /// validate_block does not reject on order count — mixed values cannot fork.
+/// Read + logged once at first use (startup); WARN-clamped to the per-batch
+/// floor by [`resolve_orders_per_block_cap`].
 pub fn native_orders_per_block_cap() -> usize {
     static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *CAP.get_or_init(|| {
-        let parsed = std::env::var("TORUS_NATIVE_ORDERS_PER_BLOCK_CAP")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(NATIVE_ORDERS_PER_BLOCK_CAP);
-        // Floor at the per-batch cap: selection breaks on the first entry whose
-        // order_count would exceed the budget, so any value below a single
-        // legal batch (or 0) silently wedges native selection to empty blocks.
-        // Clamp + WARN rather than obey it (same doctrine as the O5 env floors).
-        if parsed < NATIVE_ORDERS_PER_BATCH_CAP {
-            tracing::warn!(
-                requested = parsed,
-                floor = NATIVE_ORDERS_PER_BATCH_CAP,
-                "TORUS_NATIVE_ORDERS_PER_BLOCK_CAP below the per-batch cap would starve \
-                 native selection; clamping to the floor"
-            );
-            return NATIVE_ORDERS_PER_BATCH_CAP;
-        }
-        parsed
+        let effective =
+            resolve_orders_per_block_cap(std::env::var("TORUS_NATIVE_ORDERS_PER_BLOCK_CAP").ok());
+        tracing::info!(
+            effective = effective,
+            compiled_default = NATIVE_ORDERS_PER_BLOCK_CAP,
+            floor = NATIVE_ORDERS_PER_BATCH_CAP,
+            "native per-block ORDER budget (proposer-local selection policy)"
+        );
+        effective
     })
 }
 
@@ -220,17 +241,55 @@ pub fn native_orders_per_block_cap() -> usize {
 /// (~40k orders at ~150B/order). Gap-pulls + rotated body fetch cover misses.
 pub const NATIVE_BLOCK_BYTES_CAP: usize = 6_000_000;
 
+/// Floor for the effective native block bytes cap (1 MB). A per-block body
+/// budget below one useful block's worth of actions would degrade selection to
+/// near-empty blocks for no benefit; clamp + WARN rather than obey a degenerate
+/// value (same doctrine as the order-cap per-batch floor).
+pub const NATIVE_BLOCK_BYTES_CAP_FLOOR: usize = 1_000_000;
+
+/// Resolve the effective native block bytes cap from a raw env value (pure —
+/// no `OnceLock`, no `std::env` read — so parse/clamp/fallback is unit-testable
+/// without process-global state). `native_block_bytes_cap` is the cached,
+/// logged production wrapper.
+///
+/// Policy: parse `raw`; absent/unparseable falls back to the compiled default
+/// (a typo never silently shrinks blocks). Values below
+/// [`NATIVE_BLOCK_BYTES_CAP_FLOOR`] are clamped up + WARN.
+fn resolve_block_bytes_cap(raw: Option<String>) -> usize {
+    let parsed = raw
+        .as_deref()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(NATIVE_BLOCK_BYTES_CAP);
+    if parsed < NATIVE_BLOCK_BYTES_CAP_FLOOR {
+        tracing::warn!(
+            requested = parsed,
+            floor = NATIVE_BLOCK_BYTES_CAP_FLOOR,
+            "TORUS_NATIVE_BLOCK_BYTES_CAP below the 1 MB floor would starve native \
+             selection; clamping to the floor"
+        );
+        return NATIVE_BLOCK_BYTES_CAP_FLOOR;
+    }
+    parsed
+}
+
 /// Effective native block bytes cap: `TORUS_NATIVE_BLOCK_BYTES_CAP` overrides
 /// the compiled default PER NODE. Proposer-local (selection stops before the
 /// cap; validators execute whatever the committed block carries) — safe to A/B
-/// on one proposer without coordination.
+/// on one proposer without coordination. Read + logged once at first use
+/// (startup); WARN-clamped to [`NATIVE_BLOCK_BYTES_CAP_FLOOR`] by
+/// [`resolve_block_bytes_cap`].
 pub fn native_block_bytes_cap() -> usize {
     static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *CAP.get_or_init(|| {
-        std::env::var("TORUS_NATIVE_BLOCK_BYTES_CAP")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(NATIVE_BLOCK_BYTES_CAP)
+        let effective =
+            resolve_block_bytes_cap(std::env::var("TORUS_NATIVE_BLOCK_BYTES_CAP").ok());
+        tracing::info!(
+            effective = effective,
+            compiled_default = NATIVE_BLOCK_BYTES_CAP,
+            floor = NATIVE_BLOCK_BYTES_CAP_FLOOR,
+            "native per-block BYTE budget (proposer-local WAN dissemination guard)"
+        );
+        effective
     })
 }
 
@@ -332,6 +391,110 @@ mod tests {
             5
         );
         assert_eq!(order_count(&NativeAction::PlaceOrderBatch(vec![])), 0);
+    }
+
+    // ---- env-tunable block-size caps (CAP-TUNABLE) ----
+    // Exercised through the PURE resolvers (not the OnceLock wrappers) so the
+    // parse/clamp/fallback policy is testable without process-global state.
+
+    #[test]
+    fn shipped_cap_defaults_unchanged() {
+        // WAN safety of larger blocks is UNPROVEN; the shipped defaults must not
+        // drift. This guard fails loudly if a future edit changes them.
+        assert_eq!(NATIVE_ORDERS_PER_BLOCK_CAP, 50_000);
+        assert_eq!(NATIVE_BLOCK_BYTES_CAP, 6_000_000);
+    }
+
+    #[test]
+    fn orders_cap_unset_is_compiled_default() {
+        assert_eq!(
+            resolve_orders_per_block_cap(None),
+            NATIVE_ORDERS_PER_BLOCK_CAP
+        );
+    }
+
+    #[test]
+    fn orders_cap_env_overrides() {
+        // The diagnostic-proven devnet value.
+        assert_eq!(
+            resolve_orders_per_block_cap(Some("400000".to_string())),
+            400_000
+        );
+        // Whitespace is trimmed.
+        assert_eq!(
+            resolve_orders_per_block_cap(Some("  70000 ".to_string())),
+            70_000
+        );
+    }
+
+    #[test]
+    fn orders_cap_degenerate_clamps_to_per_batch_floor() {
+        // Below one legal batch (or 0) would starve selection to empty blocks.
+        assert_eq!(
+            resolve_orders_per_block_cap(Some("10".to_string())),
+            NATIVE_ORDERS_PER_BATCH_CAP
+        );
+        assert_eq!(
+            resolve_orders_per_block_cap(Some("0".to_string())),
+            NATIVE_ORDERS_PER_BATCH_CAP
+        );
+        // Exactly at the floor is honored (not clamped).
+        assert_eq!(
+            resolve_orders_per_block_cap(Some(NATIVE_ORDERS_PER_BATCH_CAP.to_string())),
+            NATIVE_ORDERS_PER_BATCH_CAP
+        );
+    }
+
+    #[test]
+    fn orders_cap_garbage_falls_back_to_default() {
+        // A typo must not silently wedge selection — fall back to the default.
+        assert_eq!(
+            resolve_orders_per_block_cap(Some("not-a-number".to_string())),
+            NATIVE_ORDERS_PER_BLOCK_CAP
+        );
+        assert_eq!(
+            resolve_orders_per_block_cap(Some("".to_string())),
+            NATIVE_ORDERS_PER_BLOCK_CAP
+        );
+    }
+
+    #[test]
+    fn bytes_cap_unset_is_compiled_default() {
+        assert_eq!(resolve_block_bytes_cap(None), NATIVE_BLOCK_BYTES_CAP);
+    }
+
+    #[test]
+    fn bytes_cap_env_overrides() {
+        // The diagnostic-proven devnet value: 30 MB.
+        assert_eq!(
+            resolve_block_bytes_cap(Some("31457280".to_string())),
+            31_457_280
+        );
+    }
+
+    #[test]
+    fn bytes_cap_degenerate_clamps_to_floor() {
+        assert_eq!(
+            resolve_block_bytes_cap(Some("500".to_string())),
+            NATIVE_BLOCK_BYTES_CAP_FLOOR
+        );
+        assert_eq!(
+            resolve_block_bytes_cap(Some("0".to_string())),
+            NATIVE_BLOCK_BYTES_CAP_FLOOR
+        );
+        // Exactly at the 1 MB floor is honored.
+        assert_eq!(
+            resolve_block_bytes_cap(Some(NATIVE_BLOCK_BYTES_CAP_FLOOR.to_string())),
+            NATIVE_BLOCK_BYTES_CAP_FLOOR
+        );
+    }
+
+    #[test]
+    fn bytes_cap_garbage_falls_back_to_default() {
+        assert_eq!(
+            resolve_block_bytes_cap(Some("thirty-megs".to_string())),
+            NATIVE_BLOCK_BYTES_CAP
+        );
     }
 
     #[test]
