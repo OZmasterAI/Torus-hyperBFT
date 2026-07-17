@@ -2197,13 +2197,18 @@ pub fn classify_action(action: &NativeAction) -> ActionCategory {
 /// submission order.
 #[allow(clippy::type_complexity)]
 pub fn sort_native_actions(
-    actions: &[(Address, NativeAction)],
+    actions: &[(Address, &NativeAction)],
 ) -> (Vec<(Address, NativeAction)>, Vec<(Address, NativeAction)>) {
     let mut pre_evm = Vec::new();
     let mut post_evm = Vec::new();
 
+    // Finding #18: inputs are BORROWED from the block body (exec consumes them
+    // read-only), so the caller no longer deep-clones every native body before
+    // this call. Each surviving action is cloned exactly ONCE here — into the
+    // owned pre/post vectors `execute_batch` needs — instead of the previous
+    // clone-in-caller + clone-here double copy of the 400-order batch bodies.
     for (sender, action) in actions {
-        let pair = (*sender, action.clone());
+        let pair = (*sender, (*action).clone());
         match classify_action(action) {
             ActionCategory::Cancellation | ActionCategory::NonGtcOrder => pre_evm.push(pair),
             _ => post_evm.push(pair),

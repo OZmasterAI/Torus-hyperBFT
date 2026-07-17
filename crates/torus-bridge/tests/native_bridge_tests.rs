@@ -34,6 +34,17 @@ fn addr(n: u8) -> Address {
     Address::new([n; 20])
 }
 
+/// Finding #18 — single seam that absorbs the `sort_native_actions` signature
+/// change (owned `(Address, NativeAction)` -> borrowed `(Address, &NativeAction)`),
+/// so every ordering test drives the SAME entry point. The refactor changes ONLY
+/// this wrapper's body; the ordering oracle assertions are unchanged.
+fn call_sort(
+    actions: &[(Address, NativeAction)],
+) -> (Vec<(Address, NativeAction)>, Vec<(Address, NativeAction)>) {
+    let refs: Vec<(Address, &NativeAction)> = actions.iter().map(|(s, a)| (*s, a)).collect();
+    sort_native_actions(&refs)
+}
+
 fn fp(v: i64) -> FixedPoint {
     FixedPoint::from_raw(v as i128 * FixedPoint::SCALE)
 }
@@ -194,7 +205,7 @@ fn sort_cancels_before_orders() {
         ),
     ];
 
-    let (pre_evm, post_evm) = sort_native_actions(&actions);
+    let (pre_evm, post_evm) = call_sort(&actions);
 
     // Pre-EVM: cancel (Cancellation) + IOC order (NonGtcOrder)
     assert_eq!(pre_evm.len(), 2);
@@ -232,7 +243,7 @@ fn sort_mixed_actions_correct_category_order() {
         ),
     ];
 
-    let (pre_evm, post_evm) = sort_native_actions(&actions);
+    let (pre_evm, post_evm) = call_sort(&actions);
 
     // Pre-EVM: only the cancel
     assert_eq!(pre_evm.len(), 1);
@@ -497,7 +508,7 @@ fn cancel_executes_before_new_orders() {
         (addr(1), NativeAction::CancelOrder { order_id: 1 }),
     ];
 
-    let (pre_evm, post_evm) = sort_native_actions(&actions);
+    let (pre_evm, post_evm) = call_sort(&actions);
 
     // Cancel is in pre_evm, GTC order is in post_evm.
     assert_eq!(pre_evm.len(), 1);
@@ -765,13 +776,13 @@ fn sort_uses_canonical_bytes_not_debug() {
     ];
 
     // sort_native_actions internally uses action_sort_key which now calls canonical_bytes.
-    let (pre, post) = sort_native_actions(&actions);
+    let (pre, post) = call_sort(&actions);
     // Both are staking actions (post-EVM).
     assert!(pre.is_empty());
     assert_eq!(post.len(), 2);
 
     // Run again — must produce the same order.
-    let (pre2, post2) = sort_native_actions(&actions);
+    let (pre2, post2) = call_sort(&actions);
     assert_eq!(pre.len(), pre2.len());
     for (a, b) in post.iter().zip(post2.iter()) {
         assert_eq!(
@@ -779,4 +790,174 @@ fn sort_uses_canonical_bytes_not_debug() {
             "deterministic sort must produce same sender order"
         );
     }
+}
+
+// ====================================================================
+// Finding #18 — sort_native_actions ORDERING ORACLE (characterization).
+//
+// Execution order is consensus state: any deviation is a determinism bug.
+// This oracle derives the EXACT expected (pre_evm, post_evm) ordering ONLY
+// from the public sort contract — split by category into pre/post, then a
+// STABLE sort by (category, sender, keccak(canonical_bytes)) with ties
+// broken by original input index (the stability `sort_by` guarantees).
+// It pins the ordering the CURRENT owned-signature implementation produces
+// and is kept as the oracle across the borrow refactor: the refactored
+// borrowed-input path must reproduce the IDENTICAL execution order.
+// ====================================================================
+
+/// Project a sort output to the consensus-visible ordering key sequence:
+/// (sender, content-hash) per position.
+fn projection(v: &[(Address, NativeAction)]) -> Vec<(Address, B256)> {
+    v.iter()
+        .map(|(s, a)| (*s, alloy_primitives::keccak256(a.canonical_bytes())))
+        .collect()
+}
+
+/// Independent oracle for the expected (pre_evm, post_evm) ordering.
+fn expected_split(
+    actions: &[(Address, NativeAction)],
+) -> (Vec<(Address, B256)>, Vec<(Address, B256)>) {
+    let mut pre: Vec<(ActionCategory, Address, B256, usize)> = Vec::new();
+    let mut post: Vec<(ActionCategory, Address, B256, usize)> = Vec::new();
+    for (i, (s, a)) in actions.iter().enumerate() {
+        let cat = classify_action(a);
+        let hash = alloy_primitives::keccak256(a.canonical_bytes());
+        let entry = (cat, *s, hash, i);
+        match cat {
+            ActionCategory::Cancellation | ActionCategory::NonGtcOrder => pre.push(entry),
+            _ => post.push(entry),
+        }
+    }
+    // STABLE sort by (category, sender, hash); ties preserve input order (index)
+    // exactly like the impl's `sort_by` (a stable sort) over the same key.
+    let sort_key = |e: &(ActionCategory, Address, B256, usize)| (e.0, e.1, e.2);
+    pre.sort_by(|x, y| sort_key(x).cmp(&sort_key(y)).then(x.3.cmp(&y.3)));
+    post.sort_by(|x, y| sort_key(x).cmp(&sort_key(y)).then(x.3.cmp(&y.3)));
+    (
+        pre.into_iter().map(|e| (e.1, e.2)).collect(),
+        post.into_iter().map(|e| (e.1, e.2)).collect(),
+    )
+}
+
+fn assert_matches_oracle(actions: &[(Address, NativeAction)]) {
+    let (pre, post) = call_sort(actions);
+    let (exp_pre, exp_post) = expected_split(actions);
+    assert_eq!(
+        projection(&pre),
+        exp_pre,
+        "pre_evm execution order must match the ordering oracle"
+    );
+    assert_eq!(
+        projection(&post),
+        exp_post,
+        "post_evm execution order must match the ordering oracle"
+    );
+    // Every input action appears exactly once across the two groups.
+    assert_eq!(
+        pre.len() + post.len(),
+        actions.len(),
+        "sort must neither drop nor duplicate actions"
+    );
+}
+
+fn place(market_id: u64, price: i64, tif: TimeInForce, ot: OrderType) -> NativeAction {
+    NativeAction::PlaceOrder(PlaceOrderParams {
+        market_id,
+        is_buy: true,
+        price: fp(price),
+        quantity: fp(1),
+        order_type: ot,
+        time_in_force: tif,
+        reduce_only: false,
+        client_order_id: None,
+    })
+}
+
+#[test]
+fn sort_oracle_empty() {
+    assert_matches_oracle(&[]);
+}
+
+#[test]
+fn sort_oracle_single_action() {
+    assert_matches_oracle(&[(addr(1), NativeAction::CancelOrder { order_id: 7 })]);
+    assert_matches_oracle(&[(addr(2), place(1, 100, TimeInForce::GTC, OrderType::Limit))]);
+}
+
+#[test]
+fn sort_oracle_multi_sender_interleaved_classes() {
+    // Multiple senders, interleaved pre-EVM (cancel, IOC/market) and post-EVM
+    // (GTC, lockbox, oracle, governance, staking) classes.
+    let actions = vec![
+        (addr(3), place(1, 100, TimeInForce::GTC, OrderType::Limit)), // post: GtcOrder
+        (addr(1), NativeAction::CancelOrder { order_id: 5 }),          // pre: Cancellation
+        (
+            addr(2),
+            NativeAction::TransferToPerp {
+                amount: U256::from(50u64),
+            },
+        ), // post: Lockbox
+        (addr(5), place(2, 200, TimeInForce::IOC, OrderType::Limit)), // pre: NonGtcOrder
+        (
+            addr(4),
+            NativeAction::SubmitOraclePrices(torus_types::OracleSubmission {
+                prices: vec![(1, fp(500))],
+                timestamp: 1000,
+            }),
+        ), // post: Oracle
+        (
+            addr(6),
+            NativeAction::Delegate {
+                validator: addr(10),
+                amount: U256::from(1u64),
+            },
+        ), // post: Staking
+        (addr(2), place(1, 90, TimeInForce::FOK, OrderType::Limit)),  // pre: NonGtcOrder
+        (addr(1), place(3, 300, TimeInForce::PostOnly, OrderType::Limit)), // post: GtcOrder
+    ];
+    assert_matches_oracle(&actions);
+}
+
+#[test]
+fn sort_oracle_duplicate_senders_and_tie_cases() {
+    // Duplicate senders AND exact ties (identical (sender, action) => equal sort
+    // key): stability must preserve their relative INPUT order. Include several
+    // identical entries so a non-stable sort would visibly reorder them.
+    let dup = place(1, 100, TimeInForce::GTC, OrderType::Limit);
+    let cancel = NativeAction::CancelOrder { order_id: 1 };
+    let actions = vec![
+        (addr(1), dup.clone()),
+        (addr(1), dup.clone()), // tie with previous (same sender+action)
+        (addr(1), cancel.clone()),
+        (addr(1), dup.clone()), // tie again
+        (addr(2), cancel.clone()),
+        (addr(2), cancel.clone()), // tie (same sender+action)
+        (addr(1), place(1, 100, TimeInForce::GTC, OrderType::Limit)), // == dup: tie
+        (addr(2), dup.clone()),
+    ];
+    assert_matches_oracle(&actions);
+}
+
+#[test]
+fn sort_oracle_all_categories_many_senders() {
+    // Broad coverage across all categories and 12 senders in shuffled input.
+    let mut actions: Vec<(Address, NativeAction)> = Vec::new();
+    for i in 0..12u8 {
+        let s = addr(i + 1);
+        let a = match i % 6 {
+            0 => NativeAction::CancelOrder { order_id: i as u128 },
+            1 => place(1, 100 + i as i64, TimeInForce::GTC, OrderType::Limit),
+            2 => place(2, 100 + i as i64, TimeInForce::IOC, OrderType::Limit),
+            3 => NativeAction::TransferToPerp {
+                amount: U256::from(i as u64),
+            },
+            4 => NativeAction::Delegate {
+                validator: addr(100 + i),
+                amount: U256::from(i as u64),
+            },
+            _ => place(3, 100 + i as i64, TimeInForce::GTC, OrderType::Market), // NonGtc (market)
+        };
+        actions.push((s, a));
+    }
+    assert_matches_oracle(&actions);
 }

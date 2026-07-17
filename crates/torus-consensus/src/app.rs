@@ -523,7 +523,14 @@ impl ExecutionContext {
             }
 
             let replay_guard_timer = std::time::Instant::now();
-            let mut sender_actions = Vec::with_capacity(torus_block.native_actions.len());
+            // Finding #18: borrow the action bodies from `torus_block` instead of
+            // deep-cloning each (a 400-order batch body per action). Exec consumes
+            // them read-only; the block is not mutated for the rest of this scope,
+            // and the borrow ends when `sort_native_actions` returns owned vectors
+            // below. `(Address, &NativeAction)` — sort clones each SURVIVING body
+            // exactly once (into the owned vec `execute_batch` needs).
+            let mut sender_actions: Vec<(torus_types::Address, &torus_types::NativeAction)> =
+                Vec::with_capacity(torus_block.native_actions.len());
             let mut consumed_nonces = Vec::new();
             // Defense-in-depth replay guard. The non-destructive mempool selection ×
             // HotStuff 3-chain pipeline re-includes the same action in consecutive
@@ -556,7 +563,7 @@ impl ExecutionContext {
                     continue;
                 }
                 consumed_nonces.push((sender, signed.nonce));
-                sender_actions.push((sender, signed.action.clone()));
+                sender_actions.push((sender, &signed.action));
             }
             if let Some(ref m) = self.metrics {
                 m.exec_replay_guard_seconds
