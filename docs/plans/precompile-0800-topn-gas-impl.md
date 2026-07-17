@@ -38,6 +38,23 @@ Other 0x0800 selectors (`getPosition`, `getOpenOrders`) keep flat gas:
 positions are O(1); open orders are bounded by trader_cap (200). 0x0801–0x0803
 untouched (O(1) reads — flat 2,600 stays honest).
 
+## Implementation deviations (as built — both simplifications)
+
+1. **No new CF.** Level rows live in `CF_NATIVE_ORDER_BOOKS` itself under a
+   new tag `0x02` (26-byte keys, length-disjoint from the 8/9/25 layouts) —
+   automatically inside the root preimage, zero `cf.rs`/descriptor churn.
+   Value = raw i128 BE total quantity (FixedPoint has no borsh impl —
+   explicit codec).
+2. **Additive gas API.** `execute_precompile`/`execute_precompile_read_only`
+   keep returning `Vec<u8>` (no churn across callers); new
+   `execute_precompile_with_gas` variants return
+   `PrecompileOutput { data, gas_used }` and the EVM provider charges
+   `gas_used` post-execution (OOG if over limit; reverts charge the flat
+   base). Only the provider ever charged gas, so nothing is lost.
+
+Constants SIGNED OFF 2026-07-17: TOP_N_LEVELS_PER_SIDE = 200,
+GAS_PER_BOOK_LEVEL = 100 (max getOrderBook call = 42,600 gas).
+
 ## Constants pending USER SIGN-OFF before merge-freeze
 
 - `TOP_N_LEVELS_PER_SIDE = 200` (per side)
