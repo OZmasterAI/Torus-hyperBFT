@@ -61,19 +61,13 @@
     {
       "address": "0xBd821A46F987B20989aEaAdB906505585adC206c",
       "pubkey": "0x99a80b340814939a241ecce1450df27edefccc19176ba793680f9519c3445780",
-      "stake": "3000000000000000000000000",
+      "stake": "1000000000000000000000000",
       "commission_bps": 500
     },
     {
       "address": "0x0936adb653ffd8ef521029ffbf27bc1c815a7cbb",
       "pubkey": "0x537f761858a3b44a23a0d63e16d9e642a86c44aac98a94d39501d2115528a63c",
-      "stake": "2000000000000000000000000",
-      "commission_bps": 500
-    },
-    {
-      "address": "0x7e7cfdb06a5c0e3cc85510ccaeed896f39c179f5",
-      "pubkey": "0x99f813745e8347609dda017afbbe4a963921ed32df40e1d215c56bb9ddb3a59f",
-      "stake": "1000000000000000000000000",
+      "stake": "3000000000000000000000000",
       "commission_bps": 500
     }
   ],
