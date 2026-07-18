@@ -5,7 +5,7 @@
   "consensus": {
     "protocol": "hotstuff",
     "epoch_length": 100,
-    "timeout_base_ms": 1000,
+    "timeout_base_ms": 500,
     "timeout_max_ms": 30000,
     "reputation_leader_selection": false
   },
@@ -47,8 +47,8 @@
   },
   "validators": [
     {
-      "address": "0x0936adb653ffd8ef521029ffbf27bc1c815a7cbb",
-      "pubkey": "0x537f761858a3b44a23a0d63e16d9e642a86c44aac98a94d39501d2115528a63c",
+      "address": "0x1000000000000000000000000000000000000001",
+      "pubkey": "0xdc4ca7a6ab405ad1da72806658b4f87282b25e448eb438b09a3034c7328cecf5",
       "stake": "3000000000000000000000000",
       "commission_bps": 500
     },
@@ -59,8 +59,14 @@
       "commission_bps": 500
     },
     {
-      "address": "0x1000000000000000000000000000000000000001",
-      "pubkey": "0xdc4ca7a6ab405ad1da72806658b4f87282b25e448eb438b09a3034c7328cecf5",
+      "address": "0xBd821A46F987B20989aEaAdB906505585adC206c",
+      "pubkey": "0x99a80b340814939a241ecce1450df27edefccc19176ba793680f9519c3445780",
+      "stake": "3000000000000000000000000",
+      "commission_bps": 500
+    },
+    {
+      "address": "0x0936adb653ffd8ef521029ffbf27bc1c815a7cbb",
+      "pubkey": "0x537f761858a3b44a23a0d63e16d9e642a86c44aac98a94d39501d2115528a63c",
       "stake": "2000000000000000000000000",
       "commission_bps": 500
     },
