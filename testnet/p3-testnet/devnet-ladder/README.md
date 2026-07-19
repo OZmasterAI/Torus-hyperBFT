@@ -7,6 +7,27 @@ matched/s, plus the per-phase exec timing that explains them.
 Built during the p3 fill-ladder round (2026-07-19). Everything below is a trap
 that already cost real measurement time — read before running.
 
+## FIRST: this harness must exist on every branch you test
+
+Building a per-branch image requires *checking out that branch* — which swaps the
+working tree, **including this harness**. A branch that does not carry it loses
+`./build-image.sh` mid-workflow.
+
+Carried on all three ladder branches: `perf/p3-throughput`,
+`perf/deep-book-storage`, `feat/precompile-0800-topn-gas`. Keep it that way —
+cherry-pick the devnet-ladder commit onto any new branch you add to the ladder.
+
+Alternative that survives any checkout (what the original round actually did):
+
+```bash
+git worktree add /tmp/ladder perf/p3-throughput
+/tmp/ladder/testnet/p3-testnet/devnet-ladder/run-leg.sh ...
+```
+
+`run-leg.sh` and `measure-leg.sh` both honour a `REPO` override for this reason.
+It is safe because the **image**, not the checkout, decides which branch is
+measured — `leg-config.json` records `leg_image` as the authoritative identity.
+
 ## Quick start
 
 ```bash
