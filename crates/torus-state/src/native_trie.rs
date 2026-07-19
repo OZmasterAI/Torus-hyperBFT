@@ -1991,4 +1991,90 @@ mod tests {
             "post-flush cached root must equal the oracle"
         );
     }
+
+    /// Per-bucket cost harness (round-3 proof-bench input). Measures the marginal
+    /// per-dirty-bucket cost of native-trie maintenance at ~10k dirty buckets for
+    /// serial-scan / parallel-scan / member-cached (no-scan) paths. Ignored by
+    /// default; run with:
+    ///   cargo test -p torus-state --lib -- --ignored --nocapture round3_perf_per_bucket_10k
+    #[test]
+    #[ignore]
+    fn round3_perf_per_bucket_10k() {
+        use std::time::Instant;
+        let (db, _d) = temp_db();
+        let n_seed = 120_000u32;
+        let mkkey = |i: u32| {
+            let mut k = i.to_le_bytes().to_vec();
+            k.push(0x11);
+            k
+        };
+        for i in 0..n_seed {
+            let (cf, _) = NATIVE_ROOT_CFS[(i % 6) as usize];
+            db.put_cf_raw(cf, &mkkey(i), &vec![0xAB; 48]).unwrap();
+        }
+        build_native_trie_to_cf(&db).unwrap();
+
+        // 10k DISTINCT buckets drawn from seeded (populated) keys, so each dirty
+        // bucket pays a realistic member scan on the uncached path.
+        let target = 10_000usize;
+        let mut seen = std::collections::HashSet::new();
+        let mut chosen: Vec<(u8, Vec<u8>)> = Vec::new();
+        let mut i = 0u32;
+        while chosen.len() < target && i < n_seed {
+            let tag = (i % 6) as u8;
+            let key = mkkey(i);
+            if seen.insert(bucket_id(tag, &key)) {
+                chosen.push((tag, key));
+            }
+            i += 1;
+        }
+        assert_eq!(chosen.len(), target, "need {target} distinct buckets");
+
+        // Warm a member cache for those buckets (and commit, so the mirror + cache
+        // agree). Big budget => no eviction.
+        let mut warm = NativeMemberCache::with_budget(512 * 1024 * 1024);
+        let d0: BTreeMap<(u8, Vec<u8>), Option<Vec<u8>>> = chosen
+            .iter()
+            .map(|(t, k)| ((*t, k.clone()), Some(vec![0xC0; 40])))
+            .collect();
+        for ((t, k), v) in &d0 {
+            let (cf, _) = NATIVE_ROOT_CFS[*t as usize];
+            db.put_cf_raw(cf, k, v.as_ref().unwrap()).unwrap();
+        }
+        commit_native_trie_incremental_full(&db, &d0, None, Some(&mut warm), 1).unwrap();
+
+        // Measured dirty set: same buckets, new values (real rehash). NOT committed
+        // — timing only reads + builds a throwaway batch, so it is repeatable.
+        let d1: BTreeMap<(u8, Vec<u8>), Option<Vec<u8>>> = chosen
+            .iter()
+            .map(|(t, k)| ((*t, k.clone()), Some(vec![0xD1; 44])))
+            .collect();
+        let nb = dirty_bucket_count(&d1);
+
+        let bench = |label: &str, mut member: Option<&mut NativeMemberCache>, parallel: usize| -> f64 {
+            let mut best = f64::INFINITY;
+            for _ in 0..6 {
+                let mut batch = WriteBatch::default();
+                let t = Instant::now();
+                apply_native_dirty(&db, &mut batch, &d1, None, member.as_deref_mut(), parallel)
+                    .unwrap();
+                best = best.min(t.elapsed().as_secs_f64());
+            }
+            let per_us = best / nb as f64 * 1e6;
+            println!("PERF {label:26} total={best:.4}s  per_bucket={per_us:.3}us");
+            per_us
+        };
+
+        println!("PERF dirty_buckets={nb}");
+        let a = bench("serial_scan", None, 1);
+        let b = bench("parallel8_scan", None, 8);
+        let c = bench("serial_membercache", Some(&mut warm), 1);
+        let d = bench("parallel8_membercache", Some(&mut warm), 8);
+        println!(
+            "PERF summary  parallel_speedup={:.2}x  member_scan_elim_serial={:.2}x  full_stack_vs_serial={:.2}x",
+            a / b,
+            a / c,
+            a / d
+        );
+    }
 }
