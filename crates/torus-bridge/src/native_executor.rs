@@ -775,6 +775,13 @@ impl<T: StateBackend> NativeExecContext<T> {
         std::mem::take(&mut self.pending_trades)
     }
 
+    /// PROFILER (s470): total resting orders across every loaded book. Sampled
+    /// once per block (after the constructor's load/rebuild) as the book-depth
+    /// axis for the depth-vs-cost correlation.
+    pub fn resting_order_count(&self) -> usize {
+        self.order_books.values().map(|b| b.order_count()).sum()
+    }
+
     /// True if `key` belongs to the C4 row schema (meta / order / stop row).
     fn is_book_row_key(key: &[u8]) -> bool {
         (key.len() == 9 && key[8] == BOOK_ROW_META)
