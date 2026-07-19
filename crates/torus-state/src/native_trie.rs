@@ -2000,9 +2000,17 @@ mod tests {
     #[test]
     #[ignore]
     fn round3_perf_per_bucket_10k() {
+        // THIN ~2 members/bucket (mirror scan cheap) and FAT ~14 members/bucket
+        // (mirror scan is the member cache's target cost).
+        for (n_seed, tag) in [(120_000u32, "THIN~2mem"), (900_000u32, "FAT~14mem")] {
+            println!("PERF ===== scenario {tag} (n_seed={n_seed}) =====");
+            round3_perf_scenario(n_seed);
+        }
+    }
+
+    fn round3_perf_scenario(n_seed: u32) {
         use std::time::Instant;
         let (db, _d) = temp_db();
-        let n_seed = 120_000u32;
         let mkkey = |i: u32| {
             let mut k = i.to_le_bytes().to_vec();
             k.push(0x11);
