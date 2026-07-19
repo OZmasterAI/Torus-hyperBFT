@@ -298,14 +298,43 @@ fn all_mode_combos_identical_state_and_roots() {
             assert_eq!(base.roots, r.roots, "{label}: per-block roots diverged");
             assert_eq!(base.dumps, r.dumps, "{label}: persisted CF bytes diverged");
             assert_eq!(base.oracle, r.oracle, "{label}: oracle diverged");
-            // The O(dirty) witness: cached combos may only elide (the script
-            // has no clean rewrites, so counts should be EQUAL — assert both
-            // directions to catch an over- or under-eliding differ).
-            assert_eq!(
-                base.dirty_buckets, r.dirty_buckets,
-                "{label}: rehashed-bucket counts diverged"
-            );
+            // The O(dirty) witness. Same cache flag ⇒ EXACT count equality
+            // (resident/parallel must not change the write stream). Cached vs
+            // uncached ⇒ cached can only shrink: the script contains one
+            // legitimate clean rewrite (block 2's fully-filled taker balance
+            // nets back to its pre-block bytes), which the cache elides.
+            if m.cache == bm.cache {
+                assert_eq!(
+                    base.dirty_buckets, r.dirty_buckets,
+                    "{label}: rehashed-bucket counts diverged"
+                );
+            } else {
+                for (blk, (b, c)) in base.dirty_buckets.iter().zip(&r.dirty_buckets).enumerate()
+                {
+                    let (unc, cach) = if bm.cache { (c, b) } else { (b, c) };
+                    assert!(
+                        cach <= unc,
+                        "{label}: block {}: cached rehash {} > uncached {}",
+                        blk + 1,
+                        cach,
+                        unc
+                    );
+                }
+            }
         }
+        // Elision actually fires somewhere in the script (the block-2 clean
+        // rewrite): total cached rehashes must be strictly below uncached.
+        let total = |cache: bool| -> usize {
+            group
+                .iter()
+                .find(|(m, _)| m.cache == cache && !m.resident && !m.parallel)
+                .map(|(_, r)| r.dirty_buckets.iter().sum())
+                .unwrap()
+        };
+        assert!(
+            total(true) < total(false),
+            "rows={rows}: expected at least one elided clean rewrite"
+        );
     }
 }
 
