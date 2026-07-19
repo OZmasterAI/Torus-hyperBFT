@@ -103,7 +103,7 @@ fn bench_trie(d: usize) {
 
     // --- build a BLOCK_N-op dirty block: half value-changes to existing rows,
     //     half deletes of other existing rows (a realistic fill/cancel mix) ---
-    let mut apply_block = |ov: &NativeStateOverlay, salt: u64| {
+    let apply_block = |ov: &NativeStateOverlay, salt: u64| {
         for j in 0..BLOCK_N {
             let idx = ((j as u64 * 2_654_435_761).wrapping_add(salt) as usize) % d;
             let mkt = (idx as u64) % N_MARKETS;
