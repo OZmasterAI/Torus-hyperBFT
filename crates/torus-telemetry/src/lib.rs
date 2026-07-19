@@ -203,6 +203,25 @@ pub struct Metrics {
     pub exec_save_books_seconds: Histogram,
     pub exec_flush_seconds: Histogram,
     pub exec_block_seconds: Histogram,
+    /// PROFILER (s470): the EVM section of block execution (validate + commit
+    /// bundle + block metadata). Near-zero in native-only bench cells; observed
+    /// on every block so the residual accounts for it.
+    pub exec_evm_seconds: Histogram,
+    /// PROFILER (s470): per-block order-book LOAD + REBUILD. `NativeExecContext`
+    /// is reconstructed every block, and its constructor scans the whole
+    /// `cf_native_order_books` CF and rebuilds every resting order into memory
+    /// (classic whole-book Borsh blobs, or C4 rows). O(total resting depth) per
+    /// block — previously buried in the unattributed residual because it runs
+    /// BEFORE `exec_engine_seconds` starts.
+    pub exec_load_books_seconds: Histogram,
+    /// PROFILER (s470): commit-callback persistence — block-body JSON write to
+    /// CF_BLOCK_BODIES (+ standalone applied-height marker on non-native blocks).
+    pub exec_body_persist_seconds: Histogram,
+    /// PROFILER (s470): total resting orders across all books, sampled once per
+    /// block right after the load/rebuild. Book-depth axis for the
+    /// depth-vs-cost correlation (the funnel `orders_resting` counter is a
+    /// monotonic event count, not current depth).
+    pub exec_resting_orders: Gauge,
     /// Committed blocks handed to the exec channel but not yet fully executed.
     /// Pinned near the channel bound (64) = execution is the bottleneck.
     pub exec_queue_depth: Gauge,
@@ -753,6 +772,35 @@ impl Metrics {
             exec_block_seconds.clone(),
         );
 
+        let exec_evm_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
+        registry.register(
+            "torus_exec_evm_seconds",
+            "Exec phase: EVM validate + commit bundle + block metadata (native-only cells ~0)",
+            exec_evm_seconds.clone(),
+        );
+
+        let exec_load_books_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
+        registry.register(
+            "torus_exec_load_books_seconds",
+            "Exec phase: per-block order-book load + rebuild from cf_native_order_books \
+             (O(total resting depth); classic blob or C4 rows depending on TORUS_BOOK_ROWS)",
+            exec_load_books_seconds.clone(),
+        );
+
+        let exec_body_persist_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
+        registry.register(
+            "torus_exec_body_persist_seconds",
+            "Exec phase: commit-callback block-body persist to CF_BLOCK_BODIES (+ marker)",
+            exec_body_persist_seconds.clone(),
+        );
+
+        let exec_resting_orders = Gauge::default();
+        registry.register(
+            "torus_exec_resting_orders",
+            "Total resting orders across all books, sampled per block after load/rebuild",
+            exec_resting_orders.clone(),
+        );
+
         let exec_queue_depth = Gauge::default();
         registry.register(
             "torus_exec_queue_depth",
@@ -973,6 +1021,10 @@ impl Metrics {
             exec_save_books_seconds,
             exec_flush_seconds,
             exec_block_seconds,
+            exec_evm_seconds,
+            exec_load_books_seconds,
+            exec_body_persist_seconds,
+            exec_resting_orders,
             exec_queue_depth,
             exec_throttle_tier,
             exec_dispatch_deferred,
@@ -1119,6 +1171,10 @@ mod tests {
             "torus_exec_save_books_seconds",
             "torus_exec_flush_seconds",
             "torus_exec_block_seconds",
+            "torus_exec_evm_seconds",
+            "torus_exec_load_books_seconds",
+            "torus_exec_body_persist_seconds",
+            "torus_exec_resting_orders",
             "torus_exec_queue_depth",
             "torus_exec_throttle_tier",
             "torus_exec_dispatch_deferred",
