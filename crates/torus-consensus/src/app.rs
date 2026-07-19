@@ -229,6 +229,12 @@ struct ExecutionContext {
     /// flag unset it stays empty forever and execution is byte-identical to
     /// the per-block reload path.
     resident_books: std::sync::Mutex<torus_bridge::native_executor::ResidentBooks>,
+    /// rank-root: cross-block in-RAM native-trie node cache
+    /// (`TORUS_NATIVE_ROOT_CACHE`). Value-neutral and node-local: persisted
+    /// trie bytes and the root are identical with or without it. Self-
+    /// authenticating staleness guard (persisted-root match) — see
+    /// torus_state::native_trie.
+    trie_cache: std::sync::Mutex<torus_state::native_trie::NativeTrieCache>,
 }
 
 // ---- Standalone helpers (used by both execution thread and crash recovery) ----
@@ -1145,8 +1151,31 @@ impl ExecutionContext {
             // never drops committed native state (same batch); it only leaves the off-by-default
             // incremental native root stale for this block. If the atomic write itself fails, NEITHER
             // native state nor the marker is written, so replay correctly re-executes on restart.
-            if let Err(e) = overlay.flush_with_native_trie_and_marker(&self.state_db, height) {
-                tracing::error!(%e, height, "native overlay flush + applied-height marker failed (block NOT marked applied — restart will replay)");
+            let flush_stats = {
+                // rank-root: optional in-RAM trie node cache (value-neutral;
+                // guarded by persisted-root self-authentication).
+                let mut trie_cache = self
+                    .trie_cache
+                    .lock()
+                    .expect("trie-cache mutex poisoned (exec thread panicked mid-block)");
+                let cache_opt = if torus_state::native_trie::native_root_cache_enabled() {
+                    Some(&mut *trie_cache)
+                } else {
+                    None
+                };
+                overlay.flush_with_native_trie_stats(&self.state_db, Some(height), cache_opt)
+            };
+            match &flush_stats {
+                Ok(stats) => {
+                    if let Some(ref m) = self.metrics {
+                        m.exec_root_seconds.observe(stats.root_seconds);
+                        m.exec_state_write_seconds.observe(stats.write_seconds);
+                        m.exec_root_dirty_buckets.observe(stats.dirty_buckets as f64);
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(%e, height, "native overlay flush + applied-height marker failed (block NOT marked applied — restart will replay)");
+                }
             }
 
             // Phase A: native post-commit credited EVM account balances (fees / validator rewards)
@@ -1155,10 +1184,15 @@ impl ExecutionContext {
             // the full scan (devnet-smoke finding). Best-effort: a failure only degrades the
             // flag-gated (off-by-default) incremental path, never the committed plain state.
             let native_evm_addrs = overlay.dirty_evm_accounts();
+            let resync_timer = std::time::Instant::now();
             if let Err(e) =
                 torus_state::incremental::resync_evm_accounts(&self.state_db, &native_evm_addrs)
             {
                 tracing::error!(%e, height, "failed to resync incremental trie after native post-commit");
+            }
+            if let Some(ref m) = self.metrics {
+                m.exec_evm_resync_seconds
+                    .observe(resync_timer.elapsed().as_secs_f64());
             }
             if let Some(ref m) = self.metrics {
                 m.exec_flush_seconds
@@ -1956,6 +1990,7 @@ impl TorusApp {
             )),
             exec_failed: exec_failed.clone(),
             resident_books: std::sync::Mutex::new(Default::default()),
+            trie_cache: std::sync::Mutex::new(Default::default()),
         };
 
         // Phase A: ensure the persistent incremental trie exists before any commit (including
@@ -5542,6 +5577,7 @@ mod crash_recovery_tests {
             trade_writer: None,
             exec_failed: Arc::new(AtomicBool::new(false)),
             resident_books: std::sync::Mutex::new(Default::default()),
+            trie_cache: std::sync::Mutex::new(Default::default()),
         }
     }
 

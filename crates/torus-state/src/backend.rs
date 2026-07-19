@@ -588,21 +588,66 @@ impl NativeStateOverlay {
         target: &StateDb,
         applied_height: Option<u64>,
     ) -> Result<(), StateError> {
+        self.flush_with_native_trie_stats(target, applied_height, None)
+            .map(|_| ())
+    }
+
+    /// rank-root: [`flush_with_native_trie_inner`] with (a) an optional in-RAM
+    /// trie cache (`TORUS_NATIVE_ROOT_CACHE` — sibling reads from RAM +
+    /// clean-write elision; persisted bytes identical either way) and (b) a
+    /// flush-phase breakdown for the exec metrics. `cache: None` is the
+    /// exact-today path — the legacy entry points delegate here with `None`
+    /// and discard the stats.
+    pub fn flush_with_native_trie_stats(
+        &self,
+        target: &StateDb,
+        applied_height: Option<u64>,
+        cache: Option<&mut crate::native_trie::NativeTrieCache>,
+    ) -> Result<NativeFlushStats, StateError> {
         let state = self.pending.read().unwrap();
         let raw = target.inner();
+
+        let build_timer = std::time::Instant::now();
         let mut batch = WriteBatch::default();
         state.append_to_batch(raw, &mut batch)?;
 
         // Native-root dirty map, folded into the SAME batch.
         let dirty = state.native_dirty();
+        let mut write_secs = build_timer.elapsed().as_secs_f64();
 
-        // apply_native_dirty_to_batch computes all ops before appending, so on Err nothing was
-        // appended and the native-CF writes still flush.
-        let trie_result = if dirty.is_empty() {
-            Ok(())
+        // Trie maintenance. Both variants compute all ops fallibly BEFORE
+        // appending, so on Err nothing was appended and the native-CF writes
+        // still flush (the incremental root is merely stale for the block).
+        let root_timer = std::time::Instant::now();
+        let mut cached_update: Option<crate::native_trie::CachedTrieUpdate> = None;
+        let mut cache_ref = cache;
+        let (trie_result, dirty_buckets) = if dirty.is_empty() {
+            (Ok(()), 0)
         } else {
-            crate::native_trie::apply_native_dirty_to_batch(target, &mut batch, &dirty).map(|_| ())
+            match cache_ref.as_deref_mut() {
+                Some(c) => {
+                    match crate::native_trie::apply_native_dirty_to_batch_cached(
+                        target, &mut batch, &dirty, c,
+                    ) {
+                        Ok(update) => {
+                            let n = update.rehashed_buckets;
+                            cached_update = Some(update);
+                            (Ok(()), n)
+                        }
+                        Err(e) => {
+                            c.invalidate();
+                            (Err(e), 0)
+                        }
+                    }
+                }
+                None => (
+                    crate::native_trie::apply_native_dirty_to_batch(target, &mut batch, &dirty)
+                        .map(|_| ()),
+                    crate::native_trie::dirty_bucket_count(&dirty),
+                ),
+            }
         };
+        let root_secs = root_timer.elapsed().as_secs_f64();
 
         // T156-F1: fold the native applied-height marker into the SAME batch as the native writes,
         // so a crash can never leave native state flushed but the height still un-marked (which would
@@ -615,9 +660,50 @@ impl NativeStateOverlay {
             batch.put_cf(cf, crate::cf::META_NATIVE_APPLIED_HEIGHT, marker);
         }
 
-        target.write(batch)?;
-        trie_result
+        let write_timer = std::time::Instant::now();
+        let write_result = target.write(batch);
+        write_secs += write_timer.elapsed().as_secs_f64();
+
+        match write_result {
+            Ok(()) => {
+                if let Some(c) = cache_ref {
+                    // Batch durable: fold the committed node changes into the
+                    // image. A trie-maintenance ERROR left the persisted trie
+                    // stale — the image must not pretend otherwise.
+                    match (&trie_result, &cached_update) {
+                        (Ok(()), Some(update)) => {
+                            crate::native_trie::commit_cached_update(c, update)
+                        }
+                        (Ok(()), None) => {} // empty dirty set — trie untouched
+                        (Err(_), _) => c.invalidate(),
+                    }
+                }
+            }
+            Err(e) => {
+                if let Some(c) = cache_ref {
+                    c.invalidate();
+                }
+                return Err(e.into());
+            }
+        }
+        trie_result?;
+        Ok(NativeFlushStats {
+            root_seconds: root_secs,
+            write_seconds: write_secs,
+            dirty_buckets,
+        })
     }
+}
+
+/// rank-root: flush-phase breakdown surfaced to the exec metrics
+/// (`exec_root_seconds` / `exec_state_write_seconds` / `exec_root_dirty_buckets`).
+pub struct NativeFlushStats {
+    /// Native-trie maintenance time (bucket rehash + path propagation).
+    pub root_seconds: f64,
+    /// WriteBatch build + atomic RocksDB write time.
+    pub write_seconds: f64,
+    /// Buckets rehashed (uncached: distinct dirty buckets; cached: post-elision).
+    pub dirty_buckets: usize,
 }
 
 impl StateBackend for NativeStateOverlay {
