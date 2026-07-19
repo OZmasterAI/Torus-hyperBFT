@@ -588,7 +588,7 @@ impl NativeStateOverlay {
         target: &StateDb,
         applied_height: Option<u64>,
     ) -> Result<(), StateError> {
-        self.flush_with_native_trie_stats(target, applied_height, None)
+        self.flush_with_native_trie_stats(target, applied_height, None, None)
             .map(|_| ())
     }
 
@@ -602,7 +602,8 @@ impl NativeStateOverlay {
         &self,
         target: &StateDb,
         applied_height: Option<u64>,
-        cache: Option<&mut crate::native_trie::NativeTrieCache>,
+        trie_cache: Option<&mut crate::native_trie::NativeTrieCache>,
+        member_cache: Option<&mut crate::native_trie::NativeMemberCache>,
     ) -> Result<NativeFlushStats, StateError> {
         let state = self.pending.read().unwrap();
         let raw = target.inner();
@@ -615,39 +616,57 @@ impl NativeStateOverlay {
         let dirty = state.native_dirty();
         let mut write_secs = build_timer.elapsed().as_secs_f64();
 
-        // Trie maintenance. Both variants compute all ops fallibly BEFORE
-        // appending, so on Err nothing was appended and the native-CF writes
-        // still flush (the incremental root is merely stale for the block).
+        // Trie maintenance (rank-root round-3): the unified append computes all
+        // ops fallibly BEFORE appending, so on Err nothing was appended and the
+        // native-CF writes still flush (the incremental root is merely stale for
+        // the block). Optionally uses the in-RAM trie node cache, the bucket-
+        // member cache, and parallel per-bucket hashing — any combination,
+        // always byte-identical to the serial uncached path.
         let root_timer = std::time::Instant::now();
-        let mut cached_update: Option<crate::native_trie::CachedTrieUpdate> = None;
-        let mut cache_ref = cache;
-        let (trie_result, dirty_buckets) = if dirty.is_empty() {
-            (Ok(()), 0)
+        let parallel = crate::native_trie::parallel_bucket_hash_threads();
+        let mut trie_cache = trie_cache;
+        let mut member_cache = member_cache;
+        let mut apply_out: Option<crate::native_trie::NativeTrieApply> = None;
+        let mut stats = NativeFlushStats {
+            root_seconds: 0.0,
+            write_seconds: 0.0,
+            dirty_buckets: 0,
+            bucket_scans: 0,
+            member_hits: 0,
+            member_misses: 0,
+            member_evictions: 0,
+        };
+        let trie_result = if dirty.is_empty() {
+            Ok(())
         } else {
-            match cache_ref.as_deref_mut() {
-                Some(c) => {
-                    match crate::native_trie::apply_native_dirty_to_batch_cached(
-                        target, &mut batch, &dirty, c,
-                    ) {
-                        Ok(update) => {
-                            let n = update.rehashed_buckets;
-                            cached_update = Some(update);
-                            (Ok(()), n)
-                        }
-                        Err(e) => {
-                            c.invalidate();
-                            (Err(e), 0)
-                        }
-                    }
+            match crate::native_trie::apply_native_dirty(
+                target,
+                &mut batch,
+                &dirty,
+                trie_cache.as_deref_mut(),
+                member_cache.as_deref_mut(),
+                parallel,
+            ) {
+                Ok(a) => {
+                    stats.dirty_buckets = a.rehashed_buckets;
+                    stats.bucket_scans = a.bucket_scans;
+                    stats.member_hits = a.member_hits;
+                    stats.member_misses = a.member_misses;
+                    apply_out = Some(a);
+                    Ok(())
                 }
-                None => (
-                    crate::native_trie::apply_native_dirty_to_batch(target, &mut batch, &dirty)
-                        .map(|_| ()),
-                    crate::native_trie::dirty_bucket_count(&dirty),
-                ),
+                Err(e) => {
+                    if let Some(c) = trie_cache.as_deref_mut() {
+                        c.invalidate();
+                    }
+                    if let Some(c) = member_cache.as_deref_mut() {
+                        c.invalidate();
+                    }
+                    Err(e)
+                }
             }
         };
-        let root_secs = root_timer.elapsed().as_secs_f64();
+        stats.root_seconds = root_timer.elapsed().as_secs_f64();
 
         // T156-F1: fold the native applied-height marker into the SAME batch as the native writes,
         // so a crash can never leave native state flushed but the height still un-marked (which would
@@ -663,35 +682,49 @@ impl NativeStateOverlay {
         let write_timer = std::time::Instant::now();
         let write_result = target.write(batch);
         write_secs += write_timer.elapsed().as_secs_f64();
+        stats.write_seconds = write_secs;
 
         match write_result {
             Ok(()) => {
-                if let Some(c) = cache_ref {
-                    // Batch durable: fold the committed node changes into the
-                    // image. A trie-maintenance ERROR left the persisted trie
-                    // stale — the image must not pretend otherwise.
-                    match (&trie_result, &cached_update) {
-                        (Ok(()), Some(update)) => {
-                            crate::native_trie::commit_cached_update(c, update)
+                // Batch durable: fold the committed changes into the caches. A
+                // trie-maintenance ERROR left the persisted trie stale — the
+                // images must not pretend otherwise (invalidate both, which
+                // share the staleness cause).
+                match (&trie_result, apply_out) {
+                    (Ok(()), Some(apply)) => {
+                        if let (Some(c), Some(changed)) =
+                            (trie_cache.as_deref_mut(), &apply.trie_changed)
+                        {
+                            c.commit_changed(changed, apply.root);
                         }
-                        (Ok(()), None) => {} // empty dirty set — trie untouched
-                        (Err(_), _) => c.invalidate(),
+                        if let Some(c) = member_cache.as_deref_mut() {
+                            stats.member_evictions =
+                                c.commit_finals(apply.member_finals, apply.root);
+                        }
+                    }
+                    (Ok(()), None) => {} // empty dirty set — trie untouched
+                    (Err(_), _) => {
+                        if let Some(c) = trie_cache.as_deref_mut() {
+                            c.invalidate();
+                        }
+                        if let Some(c) = member_cache.as_deref_mut() {
+                            c.invalidate();
+                        }
                     }
                 }
             }
             Err(e) => {
-                if let Some(c) = cache_ref {
+                if let Some(c) = trie_cache.as_deref_mut() {
+                    c.invalidate();
+                }
+                if let Some(c) = member_cache.as_deref_mut() {
                     c.invalidate();
                 }
                 return Err(e.into());
             }
         }
         trie_result?;
-        Ok(NativeFlushStats {
-            root_seconds: root_secs,
-            write_seconds: write_secs,
-            dirty_buckets,
-        })
+        Ok(stats)
     }
 }
 
@@ -704,6 +737,13 @@ pub struct NativeFlushStats {
     pub write_seconds: f64,
     /// Buckets rehashed (uncached: distinct dirty buckets; cached: post-elision).
     pub dirty_buckets: usize,
+    /// rank-root round-3: CF_NATIVE_HASHED prefix-scans performed this flush.
+    /// Drops below `dirty_buckets` as the bucket-member cache serves hits.
+    pub bucket_scans: usize,
+    /// rank-root round-3: bucket-member cache hits / misses / LRU evictions.
+    pub member_hits: usize,
+    pub member_misses: usize,
+    pub member_evictions: usize,
 }
 
 impl StateBackend for NativeStateOverlay {
