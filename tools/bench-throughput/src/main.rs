@@ -151,6 +151,20 @@ enum Command {
         /// integer per-sender --rate cannot express). 0 = fall back to --rate.
         #[arg(long, default_value_t = 0.0)]
         rate_total: f64,
+        /// #32: comma-separated node Prometheus `/metrics` endpoints (e.g.
+        /// http://localhost:9161,http://localhost:9162). When set, the mission
+        /// funnel counters' delta over the timed window (placed/s, matched/s)
+        /// becomes THE headline throughput measure, and the block-rate health
+        /// gate is reported from `torus_block_height`. Empty (default) = OFF:
+        /// the run behaves as before and reports only load-gen submit stats.
+        #[arg(long, default_value = "")]
+        metrics_urls: String,
+        /// #34/#35: re-fetch every block body after the run for deep per-action
+        /// accounting (unique-action dedup, dup factor, peak block). Default OFF
+        /// — #32's node counters are ground truth, and body sweeps both perturb
+        /// the SUT and can melt val0's RPC core. Turn on only for forensics.
+        #[arg(long, default_value_t = false)]
+        sweep_bodies: bool,
     },
     Combined {
         #[arg(
@@ -1490,6 +1504,286 @@ fn summarize_included(blocks: &[SweptBlock]) -> IncludedSummary {
     }
 }
 
+// ============================================================================
+// #32: node Prometheus counter scraper — THE headline throughput measure
+// ============================================================================
+//
+// The load-gen's own `included_actions x batch` figure inflates throughput
+// ~190x (S470) and the block-body sweep both perturbs and under-reports. The
+// ground truth is the node's own mission counters, scraped from its Prometheus
+// /metrics endpoint at bench start and end: the delta over the timed window is
+// the honest placed/s and matched/s. On the wire the prometheus-client encoder
+// suffixes counters with `_total`; the block-height gauge carries no suffix.
+
+/// Wire (OpenMetrics) names of the mission funnel counters + block height, as
+/// exposed on the node /metrics endpoint. `_total` is the counter suffix the
+/// prometheus-client encoder appends; `torus_block_height` is a bare gauge.
+const M_PLACED_ACCEPTED: &str = "torus_orders_placed_accepted_total";
+const M_MATCHED: &str = "torus_orders_matched_total";
+const M_RESTING: &str = "torus_orders_resting_total";
+const M_REJ_MARGIN: &str = "torus_orders_rejected_margin_total";
+const M_REJ_BOOK: &str = "torus_orders_rejected_book_total";
+const M_REJ_CANCELLED: &str = "torus_orders_rejected_cancelled_total";
+const M_CANCELLED_PARTIAL: &str = "torus_orders_cancelled_partial_fill_total";
+const M_SELF_TRADE_CANCELS: &str = "torus_orders_self_trade_cancels_total";
+const M_REJ_OTHER: &str = "torus_orders_rejected_other_total";
+const M_BLOCKS_COMMITTED: &str = "torus_blocks_committed_total";
+const M_BLOCK_HEIGHT: &str = "torus_block_height";
+
+/// Block-rate health gate (S470): idle chain produces ~29.8 blk/s; a run whose
+/// block rate falls below this floor is stalling the execution pipeline and its
+/// throughput number is not a healthy-chain measurement.
+const HEALTH_GATE_BLK_PER_S: f64 = 23.8;
+/// Reference idle block rate, for context in the gate line.
+const IDLE_BLK_PER_S_REF: f64 = 29.8;
+
+/// A point-in-time read of one node's mission funnel counters + block height.
+/// Missing metrics read as 0 so an older node (or a partial scrape) degrades
+/// gracefully rather than aborting the run.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct MetricsSnapshot {
+    placed_accepted: u64,
+    matched: u64,
+    resting: u64,
+    rejected_margin: u64,
+    rejected_book: u64,
+    rejected_cancelled: u64,
+    cancelled_partial_fill: u64,
+    self_trade_cancels: u64,
+    rejected_other: u64,
+    blocks_committed: u64,
+    block_height: u64,
+}
+
+impl MetricsSnapshot {
+    /// Parse a full OpenMetrics text body into a snapshot. Unlabeled scalar
+    /// lines only (`<name> <value>`); the mission counters carry no labels.
+    fn parse(encoded: &str) -> Self {
+        Self {
+            placed_accepted: metric_u64(encoded, M_PLACED_ACCEPTED),
+            matched: metric_u64(encoded, M_MATCHED),
+            resting: metric_u64(encoded, M_RESTING),
+            rejected_margin: metric_u64(encoded, M_REJ_MARGIN),
+            rejected_book: metric_u64(encoded, M_REJ_BOOK),
+            rejected_cancelled: metric_u64(encoded, M_REJ_CANCELLED),
+            cancelled_partial_fill: metric_u64(encoded, M_CANCELLED_PARTIAL),
+            self_trade_cancels: metric_u64(encoded, M_SELF_TRADE_CANCELS),
+            rejected_other: metric_u64(encoded, M_REJ_OTHER),
+            blocks_committed: metric_u64(encoded, M_BLOCKS_COMMITTED),
+            block_height: metric_u64(encoded, M_BLOCK_HEIGHT),
+        }
+    }
+
+    /// Field-wise `self - start`, saturating at 0. Saturation guards a node that
+    /// restarted mid-run (its counters reset to 0, so a naive subtraction would
+    /// underflow); such a node simply contributes a 0 delta for that field.
+    fn delta(&self, start: &MetricsSnapshot) -> MetricsSnapshot {
+        MetricsSnapshot {
+            placed_accepted: self.placed_accepted.saturating_sub(start.placed_accepted),
+            matched: self.matched.saturating_sub(start.matched),
+            resting: self.resting.saturating_sub(start.resting),
+            rejected_margin: self.rejected_margin.saturating_sub(start.rejected_margin),
+            rejected_book: self.rejected_book.saturating_sub(start.rejected_book),
+            rejected_cancelled: self
+                .rejected_cancelled
+                .saturating_sub(start.rejected_cancelled),
+            cancelled_partial_fill: self
+                .cancelled_partial_fill
+                .saturating_sub(start.cancelled_partial_fill),
+            self_trade_cancels: self
+                .self_trade_cancels
+                .saturating_sub(start.self_trade_cancels),
+            rejected_other: self.rejected_other.saturating_sub(start.rejected_other),
+            blocks_committed: self.blocks_committed.saturating_sub(start.blocks_committed),
+            block_height: self.block_height.saturating_sub(start.block_height),
+        }
+    }
+
+    /// Field-wise max — the aggregation across validators. Every validator
+    /// executes every committed block, so counters converge; taking the max
+    /// picks the least-truncated node (e.g. one that wasn't briefly unreachable)
+    /// rather than double-counting a sum across nodes.
+    fn max_with(&self, other: &MetricsSnapshot) -> MetricsSnapshot {
+        MetricsSnapshot {
+            placed_accepted: self.placed_accepted.max(other.placed_accepted),
+            matched: self.matched.max(other.matched),
+            resting: self.resting.max(other.resting),
+            rejected_margin: self.rejected_margin.max(other.rejected_margin),
+            rejected_book: self.rejected_book.max(other.rejected_book),
+            rejected_cancelled: self.rejected_cancelled.max(other.rejected_cancelled),
+            cancelled_partial_fill: self.cancelled_partial_fill.max(other.cancelled_partial_fill),
+            self_trade_cancels: self.self_trade_cancels.max(other.self_trade_cancels),
+            rejected_other: self.rejected_other.max(other.rejected_other),
+            blocks_committed: self.blocks_committed.max(other.blocks_committed),
+            block_height: self.block_height.max(other.block_height),
+        }
+    }
+}
+
+/// Read one unlabeled scalar metric by exact wire name, as u64 (values encode as
+/// integers for counters; a float encoding is truncated). Absent -> 0. Skips
+/// `#` HELP/TYPE lines and any labeled series (`name{...}`), which the mission
+/// funnel metrics never emit.
+fn metric_u64(encoded: &str, wire_name: &str) -> u64 {
+    for line in encoded.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut it = line.split_whitespace();
+        match it.next() {
+            Some(name) if name == wire_name => {
+                if let Some(tok) = it.next() {
+                    if let Ok(v) = tok.parse::<f64>() {
+                        return v.max(0.0) as u64;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    0
+}
+
+/// Scrape one node's /metrics endpoint into a snapshot. `None` on transport or
+/// read failure (caller treats a failed node as absent for that snapshot).
+async fn scrape_metrics(client: &reqwest::Client, url: &str) -> Option<MetricsSnapshot> {
+    let text = client
+        .get(url)
+        .send()
+        .await
+        .ok()?
+        .text()
+        .await
+        .ok()?;
+    Some(MetricsSnapshot::parse(&text))
+}
+
+/// Scrape every metrics endpoint and fold the reads into a single snapshot via
+/// field-wise max (see `max_with`). Returns `None` only if NO endpoint answered.
+async fn scrape_all_metrics(
+    client: &reqwest::Client,
+    urls: &[String],
+) -> Option<MetricsSnapshot> {
+    let mut agg: Option<MetricsSnapshot> = None;
+    for url in urls {
+        if let Some(s) = scrape_metrics(client, url).await {
+            agg = Some(match agg {
+                Some(a) => a.max_with(&s),
+                None => s,
+            });
+        }
+    }
+    agg
+}
+
+#[cfg(test)]
+mod scraper_tests {
+    use super::*;
+
+    // A representative /metrics body: HELP/TYPE comment lines, the mission
+    // counters with the `_total` suffix, the bare block-height gauge, and an
+    // unrelated labeled series that must be ignored.
+    const SAMPLE: &str = "\
+# HELP torus_orders_matched Orders matched
+# TYPE torus_orders_matched counter
+torus_orders_matched_total 42
+# TYPE torus_orders_placed_accepted counter
+torus_orders_placed_accepted_total 100
+torus_orders_resting_total 7
+torus_orders_rejected_margin_total 3
+torus_orders_rejected_book_total 1
+torus_orders_rejected_cancelled_total 2
+torus_orders_cancelled_partial_fill_total 4
+torus_orders_self_trade_cancels_total 5
+torus_orders_rejected_other_total 6
+torus_blocks_committed_total 900
+# TYPE torus_block_height gauge
+torus_block_height 1234
+torus_rpc_requests_total{method=\"eth_blockNumber\"} 555
+";
+
+    #[test]
+    fn parses_all_mission_counters() {
+        let s = MetricsSnapshot::parse(SAMPLE);
+        assert_eq!(s.matched, 42);
+        assert_eq!(s.placed_accepted, 100);
+        assert_eq!(s.resting, 7);
+        assert_eq!(s.rejected_margin, 3);
+        assert_eq!(s.rejected_book, 1);
+        assert_eq!(s.rejected_cancelled, 2);
+        assert_eq!(s.cancelled_partial_fill, 4);
+        assert_eq!(s.self_trade_cancels, 5);
+        assert_eq!(s.rejected_other, 6);
+        assert_eq!(s.blocks_committed, 900);
+        assert_eq!(s.block_height, 1234);
+    }
+
+    #[test]
+    fn absent_metric_reads_zero_not_error() {
+        let s = MetricsSnapshot::parse("torus_block_height 9\n");
+        assert_eq!(s.block_height, 9);
+        assert_eq!(s.matched, 0, "absent counter must read 0");
+        assert_eq!(s.placed_accepted, 0);
+    }
+
+    #[test]
+    fn labeled_series_with_same_prefix_is_not_matched() {
+        // `torus_orders_matched_total{market="1"} 8` must NOT satisfy a lookup
+        // for the unlabeled `torus_orders_matched_total`.
+        let s = MetricsSnapshot::parse("torus_orders_matched_total{market=\"1\"} 8\n");
+        assert_eq!(s.matched, 0);
+    }
+
+    #[test]
+    fn delta_is_field_wise_end_minus_start() {
+        let start = MetricsSnapshot::parse(SAMPLE);
+        let mut end = start;
+        end.matched += 1000;
+        end.placed_accepted += 2500;
+        end.block_height += 300;
+        let d = end.delta(&start);
+        assert_eq!(d.matched, 1000);
+        assert_eq!(d.placed_accepted, 2500);
+        assert_eq!(d.block_height, 300);
+        assert_eq!(d.resting, 0, "unchanged counter deltas to 0");
+    }
+
+    #[test]
+    fn delta_saturates_on_counter_reset() {
+        // A node that restarted mid-run: end < start. Saturating subtraction
+        // yields 0, never a wrapped/huge value.
+        let start = MetricsSnapshot {
+            matched: 5000,
+            block_height: 900,
+            ..Default::default()
+        };
+        let end = MetricsSnapshot {
+            matched: 10,
+            block_height: 5,
+            ..Default::default()
+        };
+        let d = end.delta(&start);
+        assert_eq!(d.matched, 0);
+        assert_eq!(d.block_height, 0);
+    }
+
+    #[test]
+    fn max_with_picks_least_truncated_node() {
+        let a = MetricsSnapshot { matched: 100, block_height: 50, ..Default::default() };
+        let b = MetricsSnapshot { matched: 90, block_height: 55, ..Default::default() };
+        let m = a.max_with(&b);
+        assert_eq!(m.matched, 100);
+        assert_eq!(m.block_height, 55);
+    }
+
+    #[test]
+    fn float_encoded_value_is_truncated() {
+        assert_eq!(metric_u64("torus_orders_matched_total 42.0\n", M_MATCHED), 42);
+        assert_eq!(metric_u64("torus_block_height 7.9\n", M_BLOCK_HEIGHT), 7);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_consensus(
     rpc_urls_str: &str,
@@ -1506,11 +1800,22 @@ async fn run_consensus(
     markets: u64,
     econ: Option<EconShape>,
     rate_total: f64,
+    metrics_urls_str: &str,
+    sweep_bodies: bool,
 ) {
     let rpc_urls: Vec<String> = rpc_urls_str
         .split(',')
         .map(|s| s.trim().to_string())
         .collect();
+    // #32: node /metrics endpoints. Empty (the default) = scraper OFF, so a run
+    // with no --metrics-urls behaves as before. When set, the mission-counter
+    // deltas over the timed window become THE headline throughput numbers.
+    let metrics_urls: Vec<String> = metrics_urls_str
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let scrape_on = !metrics_urls.is_empty();
     let num_senders = senders.max(1);
     let keys = load_sender_keys(num_senders, sender_offset);
     let orders_per_action = batch_size.max(1) as u64;
@@ -1552,6 +1857,15 @@ async fn run_consensus(
     println!("Batch size: {orders_per_action} order(s)/action");
     println!("Submit batch: {submit_batch} action(s)/RPC call");
     println!("RPC endpoints: {}", rpc_urls.len());
+    println!(
+        "Headline: {} | Body sweep: {}",
+        if scrape_on {
+            format!("node counters ({} /metrics endpoint(s))", metrics_urls.len())
+        } else {
+            "load-gen submit stats (no --metrics-urls)".to_string()
+        },
+        if sweep_bodies { "ON (--sweep-bodies)" } else { "off" },
+    );
     if let Some(shape) = &econ {
         println!(
             "Econ shape: target-margin {} TRS/order | mid {} | band ±{} ticks | \
@@ -1660,7 +1974,6 @@ async fn run_consensus(
     }
 
     let submitted = Arc::new(AtomicU64::new(0));
-    let included = Arc::new(AtomicU64::new(0));
 
     // Ammo strategy. Pre-sign stamps every nonce up front (now + window/2); if
     // signing ALL of it outlasts the nonce window the ammo is "too old" on arrival
@@ -1763,43 +2076,58 @@ async fn run_consensus(
         );
     }
 
+    // #32: START snapshot of the node funnel counters, taken as close to the
+    // timed window's t0 as possible — its delta vs the END snapshot is the
+    // headline throughput. Off (None) when --metrics-urls is unset.
+    let start_metrics: Option<MetricsSnapshot> = if scrape_on {
+        let s = scrape_all_metrics(&client, &metrics_urls).await;
+        if s.is_none() {
+            eprintln!(
+                "[metrics] WARNING: no /metrics endpoint answered at start — headline \
+                 counter scrape disabled for this run (checked {} url(s))",
+                metrics_urls.len()
+            );
+        }
+        s
+    } else {
+        None
+    };
+    let scrape_live = scrape_on && start_metrics.is_some();
+
     let start_block = fetch_block_number(&client, &rpc_urls[0]).await.unwrap_or(0);
     let deadline = Instant::now() + Duration::from_secs(duration_secs);
     let start_time = Instant::now();
     let semaphore = Arc::new(Semaphore::new(concurrency));
     let rpc_urls = Arc::new(rpc_urls);
 
-    // Block monitor
+    // Live block monitor. #34/#35: it polls ONLY cheap endpoints inside the
+    // timed window — block height (for block-time stats) and, when enabled, the
+    // node /metrics counters. It NEVER fetches full block bodies during the
+    // window (that perturbs the system under test); body accounting is now
+    // either the #32 counter scrape (ground truth) or the opt-in post-run sweep.
     let mon_client = client.clone();
     let mon_url = rpc_urls[0].clone();
-    let mon_included = included.clone();
     let mon_submitted = submitted.clone();
     let mon_start = start_time;
     let mon_deadline = deadline;
+    let mon_metrics_url = metrics_urls.first().cloned();
 
     struct BlockStats {
-        total_included: u64,
-        block_count: u64,
-        peak_actions: u64,
-        peak_block: u64,
         block_times: Vec<f64>,
     }
 
     let block_stats = Arc::new(tokio::sync::Mutex::new(BlockStats {
-        total_included: 0,
-        block_count: 0,
-        peak_actions: 0,
-        peak_block: 0,
         block_times: Vec::new(),
     }));
     let final_stats = block_stats.clone();
 
     let monitor_handle = tokio::spawn({
         let block_stats = block_stats.clone();
+        let mon_start_metrics = start_metrics;
         async move {
             let mut last_block = start_block;
             let mut last_block_time = Instant::now();
-            let mut pending_blocks: Vec<u64> = Vec::new();
+            let mut ticks: u64 = 0;
 
             loop {
                 tokio::time::sleep(Duration::from_millis(500)).await;
@@ -1807,6 +2135,7 @@ async fn run_consensus(
                 if Instant::now() > mon_deadline + Duration::from_secs(5) {
                     break;
                 }
+                ticks += 1;
 
                 let current_block = match fetch_block_number(&mon_client, &mon_url).await {
                     Some(n) => n,
@@ -1818,10 +2147,6 @@ async fn run_consensus(
                     let inter_block = now.duration_since(last_block_time).as_secs_f64()
                         / (current_block - last_block) as f64;
 
-                    for blk in (last_block + 1)..=current_block {
-                        pending_blocks.push(blk);
-                    }
-
                     let mut stats = block_stats.lock().await;
                     for _ in 0..(current_block - last_block) {
                         stats.block_times.push(inter_block);
@@ -1832,38 +2157,9 @@ async fn run_consensus(
                     last_block = current_block;
                 }
 
-                let mut still_pending = Vec::new();
-                let mut stats = block_stats.lock().await;
-                for blk in pending_blocks.drain(..) {
-                    match fetch_block_body(&mon_client, &mon_url, blk).await {
-                        Some((native_count, _ids)) => {
-                            stats.total_included += native_count;
-                            mon_included.store(stats.total_included, Ordering::Relaxed);
-                            stats.block_count += 1;
-                            if native_count > stats.peak_actions {
-                                stats.peak_actions = native_count;
-                                stats.peak_block = blk;
-                            }
-                        }
-                        None => still_pending.push(blk),
-                    }
-                }
-                drop(stats);
-                pending_blocks = still_pending;
-
                 let elapsed = mon_start.elapsed().as_secs_f64();
                 let sub = mon_submitted.load(Ordering::Relaxed);
-                let inc = mon_included.load(Ordering::Relaxed);
-                let sub_rate = if elapsed > 0.0 {
-                    sub as f64 / elapsed
-                } else {
-                    0.0
-                };
-                let inc_rate = if elapsed > 0.0 {
-                    inc as f64 / elapsed
-                } else {
-                    0.0
-                };
+                let sub_rate = if elapsed > 0.0 { sub as f64 / elapsed } else { 0.0 };
                 let avg_blk_ms = {
                     let stats = block_stats.lock().await;
                     if stats.block_times.is_empty() {
@@ -1874,18 +2170,45 @@ async fn run_consensus(
                     }
                 };
 
-                eprintln!(
-                    "[{:.0}s] submitted: {} actions ({:.0}/s) | included: {} actions ({:.0}/s) | \
-                     orders ~{:.0}/s | blk: #{} | {:.0}ms/blk",
-                    elapsed,
-                    format_num(sub),
-                    sub_rate,
-                    format_num(inc),
-                    inc_rate,
-                    inc_rate * orders_per_action as f64,
-                    current_block,
-                    avg_blk_ms,
-                );
+                // Live matched/placed from the node counters — scraped every ~2s
+                // (cheap GET, no bodies) so the live line reflects ground truth.
+                let live_matched = if scrape_live && ticks % 4 == 0 {
+                    match (&mon_metrics_url, &mon_start_metrics) {
+                        (Some(u), Some(s0)) => scrape_metrics(&mon_client, u)
+                            .await
+                            .map(|now| now.matched.saturating_sub(s0.matched)),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+
+                match live_matched {
+                    Some(m) => {
+                        let m_rate = if elapsed > 0.0 { m as f64 / elapsed } else { 0.0 };
+                        eprintln!(
+                            "[{:.0}s] submitted: {} actions ({:.0}/s) | matched: {} ({:.0}/s node ctr) \
+                             | blk: #{} | {:.0}ms/blk",
+                            elapsed,
+                            format_num(sub),
+                            sub_rate,
+                            format_num(m),
+                            m_rate,
+                            current_block,
+                            avg_blk_ms,
+                        );
+                    }
+                    None => {
+                        eprintln!(
+                            "[{:.0}s] submitted: {} actions ({:.0}/s) | blk: #{} | {:.0}ms/blk",
+                            elapsed,
+                            format_num(sub),
+                            sub_rate,
+                            current_block,
+                            avg_blk_ms,
+                        );
+                    }
+                }
             }
         }
     });
@@ -2128,69 +2451,87 @@ async fn run_consensus(
     let total_elapsed = start_time.elapsed();
     let final_submitted = submitted.load(Ordering::Relaxed);
 
-    // Authoritative inclusion count: re-sweep EVERY block body in the run window.
-    // The live monitor's running total undercounts ~3x at fast block times, so the
-    // reported throughput / drop-rate are computed from this full re-sweep instead.
-    //
-    // eth_blockNumber reports EXECUTION height, which lags consensus by blocks under
-    // load (CTE) — a window snapshotted right after the load phase cuts off the tail
-    // of the run while the executor drains its backlog. Keep extending the window
-    // until two consecutive extensions surface zero further orders (120s cap), then
-    // drop trailing empty blocks so a live chain's post-load block production does
-    // not dilute the stats.
+    // eth_blockNumber reports EXECUTION height, which lags consensus under load
+    // (CTE): after the load phase stops the executor keeps committing its
+    // backlog. Both the #32 counter delta and the opt-in body sweep want that
+    // drained tail, so we quiesce first (height poll only — never a body).
     let mut end_block = fetch_block_number(&client, &rpc_urls[0])
         .await
         .unwrap_or(start_block);
-    let mut swept = sweep_block_bodies(
-        client.clone(),
-        rpc_urls.clone(),
-        start_block,
-        end_block,
-        concurrency,
-    )
-    .await;
-    let drain_deadline = Instant::now() + Duration::from_secs(120);
-    let mut quiet_extensions = 0u32;
-    while quiet_extensions < 2 && Instant::now() < drain_deadline {
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        let cur = match fetch_block_number(&client, &rpc_urls[0]).await {
-            Some(n) if n > end_block => n,
-            // Height not advancing: executor still frozen or RPC hiccup — keep
-            // waiting (the 120s cap bounds a genuinely stuck chain).
-            _ => continue,
-        };
-        let delta = sweep_block_bodies(
-            client.clone(),
-            rpc_urls.clone(),
-            end_block,
-            cur,
-            concurrency,
-        )
-        .await;
-        let drained: u64 = delta.iter().map(|(_, c, _)| c).sum();
-        if drained == 0 {
-            quiet_extensions += 1;
-        } else {
-            quiet_extensions = 0;
-            eprintln!(
-                "[drain] +{} actions in blocks #{}..#{} (executor catching up)",
-                drained,
-                end_block + 1,
-                cur
-            );
+
+    // ---- opt-in post-run body sweep (#34/#35, default OFF) ----
+    // The #32 node counters are ground truth; the full block-body re-sweep is
+    // now behind --sweep-bodies for deep per-action accounting (identities, dup
+    // factor). Default OFF means NO body fetches anywhere in the run — neither
+    // in-window nor post-run — so the bench never melts val0's RPC core serving
+    // `getBlockBody` (#40). When on, it re-sweeps every body and extends the
+    // window until the executor's backlog drains (two quiet 2s extensions, 120s
+    // cap), exactly as before.
+    let sweep_summary: Option<IncludedSummary> = if sweep_bodies {
+        let mut swept =
+            sweep_block_bodies(client.clone(), rpc_urls.clone(), start_block, end_block, concurrency)
+                .await;
+        let drain_deadline = Instant::now() + Duration::from_secs(120);
+        let mut quiet_extensions = 0u32;
+        while quiet_extensions < 2 && Instant::now() < drain_deadline {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let cur = match fetch_block_number(&client, &rpc_urls[0]).await {
+                Some(n) if n > end_block => n,
+                _ => continue,
+            };
+            let delta =
+                sweep_block_bodies(client.clone(), rpc_urls.clone(), end_block, cur, concurrency)
+                    .await;
+            let drained: u64 = delta.iter().map(|(_, c, _)| c).sum();
+            if drained == 0 {
+                quiet_extensions += 1;
+            } else {
+                quiet_extensions = 0;
+                eprintln!(
+                    "[drain] +{} actions in blocks #{}..#{} (executor catching up)",
+                    drained,
+                    end_block + 1,
+                    cur
+                );
+            }
+            swept.extend(delta);
+            end_block = cur;
         }
-        swept.extend(delta);
-        end_block = cur;
-    }
-    swept.sort_unstable_by_key(|b| b.0);
-    trim_trailing_empty(&mut swept);
-    let end_block = swept.last().map(|b| b.0).unwrap_or(start_block);
-    let summary = summarize_included(&swept);
-    let block_count = summary.block_count;
-    // The honest throughput number: unique actions when identities were
-    // available, raw slots otherwise (old nodes). Slots inflate ~3x under
-    // 3-chain commit lag re-inclusion (s355 finding).
-    let final_included = summary.unique.unwrap_or(summary.slots);
+        swept.sort_unstable_by_key(|b| b.0);
+        trim_trailing_empty(&mut swept);
+        end_block = swept.last().map(|b| b.0).unwrap_or(start_block);
+        Some(summarize_included(&swept))
+    } else if scrape_live {
+        // Body-free quiescence wait so the END counter snapshot captures the
+        // drained backlog. Height only — never a body.
+        let drain_deadline = Instant::now() + Duration::from_secs(120);
+        let mut quiet = 0u32;
+        while quiet < 2 && Instant::now() < drain_deadline {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            match fetch_block_number(&client, &rpc_urls[0]).await {
+                Some(n) if n > end_block => {
+                    end_block = n;
+                    quiet = 0;
+                }
+                _ => quiet += 1,
+            }
+        }
+        None
+    } else {
+        None
+    };
+
+    // #32: END snapshot (after any quiescence above) and the headline delta.
+    let end_metrics = if scrape_live {
+        scrape_all_metrics(&client, &metrics_urls).await
+    } else {
+        None
+    };
+    let counter_elapsed = start_time.elapsed().as_secs_f64().max(f64::MIN_POSITIVE);
+    let counter_delta = match (start_metrics, end_metrics) {
+        (Some(s0), Some(s1)) => Some(s1.delta(&s0)),
+        _ => None,
+    };
 
     let avg_block_time_ms = {
         let stats = final_stats.lock().await;
@@ -2200,86 +2541,124 @@ async fn run_consensus(
             stats.block_times.iter().sum::<f64>() / stats.block_times.len() as f64 * 1000.0
         }
     };
-    let avg_native_per_block = if block_count > 0 {
-        final_included / block_count
-    } else {
-        0
-    };
 
-    let elapsed_secs = total_elapsed.as_secs_f64();
-    let submit_rate = if elapsed_secs > 0.0 {
-        final_submitted as f64 / elapsed_secs
-    } else {
-        0.0
-    };
-    let include_rate = if elapsed_secs > 0.0 {
-        final_included as f64 / elapsed_secs
-    } else {
-        0.0
-    };
-    let drop_rate = if final_submitted > 0 {
-        (1.0 - final_included as f64 / final_submitted as f64) * 100.0
-    } else {
-        0.0
-    };
+    let elapsed_secs = total_elapsed.as_secs_f64().max(f64::MIN_POSITIVE);
+    let submit_rate = final_submitted as f64 / elapsed_secs;
 
     println!();
     println!("--- Results ---");
+
+    // HEADLINE: node Prometheus counter deltas (#32) — the ground-truth
+    // throughput. The load-gen's own submit/`x batch` figures are demoted to
+    // clearly-labelled secondary/debug below.
+    if let Some(d) = counter_delta {
+        let placed_rate = d.placed_accepted as f64 / counter_elapsed;
+        let matched_rate = d.matched as f64 / counter_elapsed;
+        let blk_rate = d.block_height as f64 / counter_elapsed;
+        println!("HEADLINE — node counters over {counter_elapsed:.0}s (ground truth):");
+        println!(
+            "  Placed accepted:  {} ({:.0}/s)",
+            format_num(d.placed_accepted),
+            placed_rate,
+        );
+        println!(
+            "  Matched:          {} ({:.0}/s)",
+            format_num(d.matched),
+            matched_rate,
+        );
+        println!(
+            "  Funnel: resting {} | rej-margin {} | rej-book {} | rej-cancelled {} | \
+             partial-cancel {} | self-trade-cancel {} | rej-other {}",
+            format_num(d.resting),
+            format_num(d.rejected_margin),
+            format_num(d.rejected_book),
+            format_num(d.rejected_cancelled),
+            format_num(d.cancelled_partial_fill),
+            format_num(d.self_trade_cancels),
+            format_num(d.rejected_other),
+        );
+        let gate = if blk_rate >= HEALTH_GATE_BLK_PER_S {
+            "PASS"
+        } else {
+            "FAIL"
+        };
+        println!(
+            "  Health gate: {:.1} blk/s [{}] ({} committed; gate >= {:.1}, idle ref {:.1})",
+            blk_rate,
+            gate,
+            format_num(d.blocks_committed),
+            HEALTH_GATE_BLK_PER_S,
+            IDLE_BLK_PER_S_REF,
+        );
+    } else if scrape_on {
+        println!(
+            "HEADLINE: node-counter scrape requested but no /metrics endpoint answered — \
+             showing load-gen submit stats only (NOT ground truth)."
+        );
+    } else {
+        println!(
+            "HEADLINE: none — pass --metrics-urls http://host:9161,... for the ground-truth \
+             mission counters (placed/s, matched/s). The figures below are load-gen submit \
+             stats, NOT chain throughput."
+        );
+    }
+    println!();
+
+    // Secondary: what the load-gen itself observed (client-side, pre-execution).
     println!(
-        "Submitted:  {} native actions ({:.0}/s)",
+        "Submitted (load-gen accepted): {} native actions ({:.0}/s)  [secondary]",
         format_num(final_submitted),
         submit_rate,
     );
-    match summary.unique {
-        Some(unique) => {
-            let dup_factor = if unique > 0 {
-                summary.slots as f64 / unique as f64
-            } else {
-                1.0
-            };
+
+    // Debug: full body-sweep accounting, only when --sweep-bodies re-fetched it.
+    if let Some(summary) = &sweep_summary {
+        let final_included = summary.unique.unwrap_or(summary.slots);
+        let inc_rate = final_included as f64 / elapsed_secs;
+        match summary.unique {
+            Some(unique) => {
+                let dup = if unique > 0 {
+                    summary.slots as f64 / unique as f64
+                } else {
+                    1.0
+                };
+                println!(
+                    "Swept included: {} unique actions ({:.0}/s) [{} slots, dup x{:.2}]  [debug: --sweep-bodies]",
+                    format_num(unique),
+                    inc_rate,
+                    format_num(summary.slots),
+                    dup,
+                );
+            }
+            None => println!(
+                "Swept included: {} action slots ({:.0}/s) [no identities from node]  [debug: --sweep-bodies]",
+                format_num(final_included),
+                inc_rate,
+            ),
+        }
+        if orders_per_action > 1 {
+            // The load-gen's `included x batch` convention (~190x inflation,
+            // S470) — kept only as an explicitly-labelled debug figure, NEVER
+            // the headline.
             println!(
-                "Included:   {} unique native actions ({:.0}/s) [{} slots, dup x{:.2}]",
-                format_num(unique),
-                include_rate,
-                format_num(summary.slots),
-                dup_factor,
+                "  Orders (included x{} batch): {} ({:.0}/s)  [DEBUG: inflated convention, not headline]",
+                orders_per_action,
+                format_num(final_included * orders_per_action),
+                inc_rate * orders_per_action as f64,
             );
         }
-        None => println!(
-            "Included:   {} native action slots ({:.0}/s) [no identities from node; \
-             may overcount re-inclusions]",
-            format_num(final_included),
-            include_rate,
-        ),
+        if summary.peak_actions > 0 {
+            println!(
+                "  Peak swept block #{}: {} actions ({} blocks with bodies)",
+                summary.peak_block, summary.peak_actions, summary.block_count,
+            );
+        }
     }
-    if orders_per_action > 1 {
-        println!(
-            "Orders:     {} orders ({:.0}/s)  [actions x{} batch]",
-            format_num(final_included * orders_per_action),
-            include_rate * orders_per_action as f64,
-            orders_per_action,
-        );
-    }
-    println!("Drop rate:  {drop_rate:.1}%");
-    println!("Block time: {avg_block_time_ms:.0}ms avg");
+
     println!(
-        "Blocks:     {} with bodies in #{}..#{}, {} avg native/block",
-        block_count,
+        "Block time: {avg_block_time_ms:.0}ms avg (blocks #{}..#{}, over {duration_secs}s window)",
         start_block + 1,
         end_block,
-        avg_native_per_block,
-    );
-    println!();
-    if summary.peak_actions > 0 {
-        println!(
-            "Peak:       {:.0}/s included (block #{}, {} actions)",
-            include_rate, summary.peak_block, summary.peak_actions,
-        );
-    }
-    println!(
-        "Sustained:  {:.0} orders/s ({:.0} actions/s) over {duration_secs}s",
-        include_rate * orders_per_action as f64,
-        include_rate,
     );
 }
 
@@ -2444,6 +2823,8 @@ async fn main() {
             econ_mid,
             band,
             rate_total,
+            metrics_urls,
+            sweep_bodies,
         } => {
             let bin = match format.as_str() {
                 "bin" => true,
@@ -2479,6 +2860,8 @@ async fn main() {
                 markets,
                 econ_shape,
                 rate_total,
+                &metrics_urls,
+                sweep_bodies,
             )
             .await
         }
