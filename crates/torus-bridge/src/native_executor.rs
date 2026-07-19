@@ -846,19 +846,16 @@ impl<T: StateBackend> NativeExecContext<T> {
         let fail = |msg: String| (HashMap::new(), 1, HashMap::new(), Some(msg));
 
         // Per-market accumulators.
+        #[derive(Default)]
         struct Acc {
             meta: Option<BookMeta>,
             orders: Vec<(u64, torus_core::order_book::Order)>,
             stops: Vec<(u128, Vec<u8>)>,
         }
+        fn acc(m: &mut HashMap<MarketId, Acc>, id: MarketId) -> &mut Acc {
+            m.entry(id).or_default()
+        }
         let mut accs: HashMap<MarketId, Acc> = HashMap::new();
-        let acc = |m: &mut HashMap<MarketId, Acc>, id: MarketId| -> &mut Acc {
-            m.entry(id).or_insert_with(|| Acc {
-                meta: None,
-                orders: Vec::new(),
-                stops: Vec::new(),
-            })
-        };
 
         let entries = match state.iterate_cf(CF_NATIVE_ORDER_BOOKS, None) {
             Ok(e) => e,
