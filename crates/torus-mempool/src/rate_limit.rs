@@ -192,7 +192,39 @@ pub fn native_block_bytes_cap() -> usize {
 /// hard floor. Shipped at ~2.5x margin so churn / gossip dups don't evict
 /// still-needed entries before exec reads them. Over-cap or cold => cache MISS =>
 /// full recover + slash (safe). ~32B/entry => ~0.5MB at this cap.
+///
+/// PACKAGE D rank 3: this default's in-flight-window floor is `64 * 100`. Raising
+/// `TORUS_NATIVE_TOTAL_BLOCK_CAP` above 100 raises that floor proportionally
+/// (`64 * cap`) — at cap 400 the window is 64*400 = 25_600, ABOVE this 16_384
+/// default, so entries would evict before exec reads them and the exec hot path
+/// silently loses its secp256k1-recover skip (a MISS is still correct, just
+/// slower). A bench that raises the block cap should raise this in lockstep via
+/// `TORUS_VERIFIED_SENDER_CACHE_CAP` (e.g. ~40_000 keeps the ~2.5x margin at cap
+/// 400). This is NOT a clamp on the NUMBER of actions a block can carry — it never
+/// bounds selection — but it is the trust-cache sizing that keeps a raised cap
+/// fast. Default unchanged: unset env => byte-identical to today.
 pub const VERIFIED_SENDER_CACHE_CAP: usize = 16_384;
+
+/// Parse the raw `TORUS_VERIFIED_SENDER_CACHE_CAP` value (pure, so it is unit
+/// testable without env/OnceLock state — the rank-1 parser doctrine). Unset,
+/// malformed, or `0` => the compiled default (the `FifoCache` itself floors at 1,
+/// but `0` here means "operator left it effectively unset", so we keep the safe
+/// default rather than degrade the cache to a single entry).
+pub fn parse_verified_sender_cache_cap(raw: Option<String>) -> usize {
+    match raw.and_then(|v| v.trim().parse::<usize>().ok()) {
+        Some(n) if n > 0 => n,
+        _ => VERIFIED_SENDER_CACHE_CAP,
+    }
+}
+
+/// Effective exec trust-cache capacity: `TORUS_VERIFIED_SENDER_CACHE_CAP`
+/// overrides the compiled default PER NODE. Node-local sizing of a
+/// performance-only cache (a HIT == a fresh recover, a MISS falls through to full
+/// recover) — it can never change the resolved sender or fork, so mixed values
+/// across nodes are safe. Read at mempool construction; unset => the default.
+pub fn verified_sender_cache_cap() -> usize {
+    parse_verified_sender_cache_cap(std::env::var("TORUS_VERIFIED_SENDER_CACHE_CAP").ok())
+}
 
 /// Number of individual orders/operations an action represents.
 ///
@@ -251,6 +283,49 @@ mod tests {
             5
         );
         assert_eq!(order_count(&NativeAction::PlaceOrderBatch(vec![])), 0);
+    }
+
+    // ---- Package D rank 3: cap resolution + exact-today defaults ----
+
+    #[test]
+    fn native_block_cap_defaults_are_exactly_todays_values() {
+        // These pin the "unset env => byte-identical to ee763a2" contract: the
+        // per-block native TOTAL cap and per-SENDER cap defaults must not drift.
+        // A bench opts into a higher ceiling explicitly; the compiled defaults
+        // stay put.
+        assert_eq!(NATIVE_TOTAL_BLOCK_CAP, 100, "per-block total native cap default");
+        assert_eq!(NATIVE_PER_BLOCK_CAP, 64, "per-sender native cap default");
+        assert_eq!(
+            VERIFIED_SENDER_CACHE_CAP, 16_384,
+            "exec trust-cache default"
+        );
+    }
+
+    #[test]
+    fn verified_sender_cache_cap_parse_resolves_and_defaults() {
+        // Unset / malformed / zero => the compiled default (byte-identical).
+        assert_eq!(parse_verified_sender_cache_cap(None), VERIFIED_SENDER_CACHE_CAP);
+        assert_eq!(
+            parse_verified_sender_cache_cap(Some("not-a-number".into())),
+            VERIFIED_SENDER_CACHE_CAP
+        );
+        assert_eq!(
+            parse_verified_sender_cache_cap(Some("".into())),
+            VERIFIED_SENDER_CACHE_CAP
+        );
+        assert_eq!(
+            parse_verified_sender_cache_cap(Some("0".into())),
+            VERIFIED_SENDER_CACHE_CAP,
+            "0 means effectively-unset, keep the safe default rather than a 1-entry cache"
+        );
+        // A valid override is honored — this is the lever a cap-400 bench uses to
+        // keep the trust-cache in-flight window (64 * cap) covered.
+        assert_eq!(parse_verified_sender_cache_cap(Some("40000".into())), 40_000);
+        assert_eq!(
+            parse_verified_sender_cache_cap(Some("  40000  ".into())),
+            40_000,
+            "surrounding whitespace tolerated"
+        );
     }
 
     #[test]

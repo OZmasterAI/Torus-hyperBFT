@@ -358,6 +358,60 @@ impl NativePool {
         selected
     }
 
+    /// Cancels-ONLY selection (Package D rank 1, deepest exec-backlog pacing
+    /// tier): the same walk, budgets, and per-sender cap as
+    /// [`Self::select_for_block_with_senders_excluding`], but the scan stops at
+    /// the first non-cancel entry. Cancels sort FIRST in [`SortKey`] (priority
+    /// byte 0), so this touches exactly the pooled cancel prefix and never
+    /// walks the (possibly huge) non-cancel tail. Non-destructive like every
+    /// selection: paced-out non-cancels stay pooled and remain fully
+    /// selectable by the normal path — pacing defers, never sheds.
+    pub fn select_cancels_for_block_with_senders_excluding(
+        &self,
+        limit: usize,
+        exclude: &HashSet<B256>,
+        bytes_cap: usize,
+        orders_cap: usize,
+    ) -> Vec<(Address, SignedNativeAction)> {
+        let mut block_counts: HashMap<Address, usize> = HashMap::new();
+        let mut selected = Vec::new();
+        let mut bytes_used: usize = 0;
+        let mut orders_used: usize = 0;
+
+        for entry in self.entries.values() {
+            if !entry.is_cancel {
+                // Cancels sort first: the first non-cancel ends the cancel
+                // prefix — nothing selectable remains beyond it in this mode.
+                break;
+            }
+            if selected.len() >= limit {
+                break;
+            }
+            // In-flight exclusion before the budget gates, exactly like the
+            // normal path: an excluded entry must neither charge nor trip them.
+            if exclude.contains(&entry.action_hash) {
+                continue;
+            }
+            if bytes_used.saturating_add(entry.encoded_len) > bytes_cap {
+                // Deterministic prefix, same rule as the normal path.
+                break;
+            }
+            let entry_orders = crate::rate_limit::order_count(&entry.action.action);
+            if orders_used.saturating_add(entry_orders) > orders_cap {
+                break;
+            }
+            let count = block_counts.get(&entry.sender).copied().unwrap_or(0);
+            if count < self.max_per_block {
+                *block_counts.entry(entry.sender).or_insert(0) += 1;
+                bytes_used = bytes_used.saturating_add(entry.encoded_len);
+                orders_used = orders_used.saturating_add(entry_orders);
+                selected.push((entry.sender, entry.action.clone()));
+            }
+        }
+
+        selected
+    }
+
     /// Evict entries whose nonce has aged out of the protocol validity window.
     ///
     /// An action with `nonce + NONCE_WINDOW_MS < now_ms` can never pass
@@ -516,6 +570,44 @@ mod tests {
         // seen/sender_counts cleaned: the same (sender, action) is insertable again.
         pool.insert(sender, stale).unwrap();
         assert_eq!(pool.size(), 2);
+    }
+
+    /// Package D rank 3: a block genuinely carries MORE than 100 native actions
+    /// when the selection `limit` is raised above the historical 100 cap. The
+    /// `limit` argument is the ONLY per-block-count gate in the selection path
+    /// (proposer passes `native_total_block_cap()` here); nothing downstream
+    /// silently re-clamps to ~100. Uses enough distinct senders that the
+    /// per-sender cap (`max_per_block`, 64) never binds before the total limit.
+    #[test]
+    fn selection_carries_more_than_100_actions_when_limit_raised() {
+        // 10 senders * 40 distinct-nonce actions = 400 pooled entries; each
+        // sender stays under the 64 per-sender-per-block cap.
+        let mut pool = NativePool::new(4096, 512, 64);
+        for s in 0..10u8 {
+            let sender = Address::repeat_byte(s + 1);
+            for n in 0..40u64 {
+                let nonce = 1_000_000 + s as u64 * 1000 + n;
+                pool.insert(sender, make_action(nonce, NativeAction::ClaimRewards))
+                    .unwrap();
+            }
+        }
+        assert_eq!(pool.size(), 400);
+
+        // Historical cap: exactly 100 selected — the old ceiling.
+        let capped =
+            pool.select_for_block_with_senders_excluding(100, &HashSet::new(), usize::MAX, usize::MAX);
+        assert_eq!(capped.len(), 100, "limit=100 reproduces today's ceiling");
+
+        // Raised cap: the block carries all 400 — proof the limit is the sole
+        // count gate and 400 is reachable end-to-end in selection.
+        let raised =
+            pool.select_for_block_with_senders_excluding(400, &HashSet::new(), usize::MAX, usize::MAX);
+        assert_eq!(raised.len(), 400, "limit=400 genuinely selects >100 actions");
+
+        // A limit between the two resolves exactly, no hidden clamp near 100.
+        let mid =
+            pool.select_for_block_with_senders_excluding(250, &HashSet::new(), usize::MAX, usize::MAX);
+        assert_eq!(mid.len(), 250);
     }
 
     /// T2.3 (RED-first: `select_for_block*` previously took `&mut self` for a
@@ -879,6 +971,79 @@ mod tests {
             pool.select_for_block_with_senders_excluding(5, &exclude, usize::MAX, usize::MAX);
         assert_eq!(third.len(), 1, "only the fresh action is selected");
         assert_eq!(third[0].1.nonce, 99);
+    }
+
+    /// Rank-1 (Package D) exec-backlog pacing, deepest tier: cancels-only
+    /// selection must take ONLY cancel actions (which sort first — the scan
+    /// stops at the first non-cancel), honor the exclude set and byte budget,
+    /// and stay NON-destructive: paced-out non-cancels remain pooled and fully
+    /// selectable by the normal path afterwards (pacing, not shedding).
+    #[test]
+    fn cancels_only_selection_takes_only_cancels_nondestructively() {
+        let mut pool = NativePool::new(100, 64, 16);
+        // 3 non-cancels + 3 cancels across distinct senders.
+        for i in 0..3u8 {
+            pool.insert(
+                Address::repeat_byte(i + 1),
+                make_action(10 + i as u64, NativeAction::ClaimRewards),
+            )
+            .unwrap();
+        }
+        let mut cancel_hashes = Vec::new();
+        let mut cancel_len = 0usize;
+        for i in 0..3u8 {
+            let a = make_action(
+                20 + i as u64,
+                NativeAction::CancelOrder {
+                    order_id: i as u128,
+                },
+            );
+            cancel_len = bincode::serialized_size(&a).unwrap() as usize;
+            cancel_hashes.push(compute_action_hash(&a));
+            pool.insert(Address::repeat_byte(i + 10), a).unwrap();
+        }
+
+        let sel = pool.select_cancels_for_block_with_senders_excluding(
+            100,
+            &HashSet::new(),
+            usize::MAX,
+            usize::MAX,
+        );
+        assert_eq!(sel.len(), 3, "exactly the cancels are selected");
+        assert!(
+            sel.iter().all(|(_, a)| is_cancel(&a.action)),
+            "cancels-only mode must never select a non-cancel"
+        );
+        assert_eq!(pool.size(), 6, "selection is non-destructive");
+
+        // Exclude one in-flight cancel: only the other two come back.
+        let exclude: HashSet<B256> = [cancel_hashes[0]].into_iter().collect();
+        let sel2 = pool.select_cancels_for_block_with_senders_excluding(
+            100,
+            &exclude,
+            usize::MAX,
+            usize::MAX,
+        );
+        assert_eq!(sel2.len(), 2, "in-flight cancels are excluded");
+
+        // Byte budget applies to cancels too (deterministic prefix).
+        let sel3 = pool.select_cancels_for_block_with_senders_excluding(
+            100,
+            &HashSet::new(),
+            cancel_len * 2,
+            usize::MAX,
+        );
+        assert_eq!(sel3.len(), 2, "byte budget bounds the cancel prefix");
+
+        // The paced-out non-cancels are STILL selectable by the normal path —
+        // nothing was dropped by the cancels-only tier.
+        let normal = pool.select_for_block_with_senders_excluding(
+            100,
+            &HashSet::new(),
+            usize::MAX,
+            usize::MAX,
+        );
+        assert_eq!(normal.len(), 6, "pacing defers non-cancels, never drops them");
     }
 
     #[test]

@@ -85,7 +85,7 @@ impl Default for MempoolConfig {
             native_per_block_cap: rate_limit::native_per_block_cap(),
             native_pool_max_size: rate_limit::NATIVE_POOL_MAX_SIZE,
             native_per_sender_cap: rate_limit::NATIVE_PER_SENDER_CAP,
-            verified_sender_cache_cap: rate_limit::VERIFIED_SENDER_CACHE_CAP,
+            verified_sender_cache_cap: rate_limit::verified_sender_cache_cap(),
             max_memory_bytes: 64 * 1024 * 1024, // 64 MB default
         }
     }
@@ -650,6 +650,20 @@ impl Mempool {
         }
     }
 
+    /// Presence check for a SET of native-action bodies in the durable DA
+    /// store (Package D rank 2 demotion gate): flushes buffered ingress
+    /// mirrors once, then point-checks each hash WITHOUT copying bodies.
+    /// `true` iff every hash is durably present (vacuously true for an empty
+    /// set). Any store error reads as absent — fail-safe for callers deciding
+    /// whether an in-memory copy may be dropped.
+    pub fn has_all_native_da(&self, hashes: &[B256]) -> bool {
+        // A buffered ingress mirror (T2.2) must be observable here too.
+        self.flush_da_mirrors();
+        hashes
+            .iter()
+            .all(|h| self.da_store.contains(&h.0).unwrap_or(false))
+    }
+
     /// Fetch a single custodied erasure shard by `(body hash, shard index)`.
     ///
     /// Mirrors the read style of [`get_native_da`](Self::get_native_da): thin
@@ -835,6 +849,35 @@ impl Mempool {
             .read()
             .unwrap()
             .select_for_block_with_senders_excluding(limit, exclude, bytes_cap, orders_cap)
+    }
+
+    /// Cancels-only variant of
+    /// [`Self::select_native_for_block_with_senders_excluding`] (Package D
+    /// rank 1, deepest exec-backlog pacing tier): the same
+    /// durable-before-selectable mirror flush, the same lazy expiry eviction,
+    /// and the same budgets — but the pool walk takes ONLY cancel actions
+    /// (which sort first). Non-destructive: paced-out non-cancels stay pooled
+    /// and fully selectable once the proposer's exec backlog clears.
+    pub fn select_native_cancels_for_block_with_senders_excluding(
+        &self,
+        limit: usize,
+        exclude: &std::collections::HashSet<B256>,
+        bytes_cap: usize,
+        orders_cap: usize,
+    ) -> Vec<(alloy_primitives::Address, SignedNativeAction)> {
+        // Durable-before-selectable (T2.2): land buffered ingress mirrors first.
+        self.flush_da_mirrors();
+        {
+            let mut pool = self.native.write().unwrap();
+            let evicted = pool.evict_expired(now_ms());
+            if evicted > 0 {
+                tracing::info!(evicted, "evicted nonce-expired native actions from pool");
+            }
+        }
+        self.native
+            .read()
+            .unwrap()
+            .select_cancels_for_block_with_senders_excluding(limit, exclude, bytes_cap, orders_cap)
     }
 
     /// Remove native actions that were included in a committed block.

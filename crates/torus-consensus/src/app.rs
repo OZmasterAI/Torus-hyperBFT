@@ -88,6 +88,10 @@ enum ExecSource {
 struct DeferredExecBlock {
     source: ExecSource,
     slashes: Vec<PendingSlash>,
+    /// Rank 2: bincode size of a `Ready` source's block (0 for
+    /// `Compact`/`Durable`), computed ONCE at park time so the Ready-byte
+    /// budget check is an integer sum, never a re-serialization walk.
+    ready_bytes: usize,
 }
 
 /// Regime-B: how long an execution hole (a committed block whose native bodies
@@ -148,6 +152,174 @@ mod shard_custody_toggle_tests {
         assert!(!parse_shard_custody_toggle(Some("0".into())));
         assert!(!parse_shard_custody_toggle(Some(" 0 ".into())));
     }
+}
+
+// ============================================================================
+// Package D rank 1 — exec-backlog watermark pacing
+// ============================================================================
+
+/// Parse `TORUS_EXEC_THROTTLE_WATERMARKS`: exactly three comma-separated,
+/// strictly-ascending exec-backlog depths `w1,w2,w3` (e.g. `"16,32,48"`),
+/// whitespace around each tolerated. Anything else — unset, malformed, wrong
+/// arity, non-ascending — yields `None` = pacing DISABLED, static caps,
+/// bit-identical selection to today. Strictness is deliberate: a
+/// misconfigured throttle must fail OPEN (no pacing), never misfire.
+fn parse_exec_throttle_watermarks(raw: Option<String>) -> Option<[u64; 3]> {
+    let raw = raw?;
+    let mut parts = [0u64; 3];
+    let mut n = 0usize;
+    for piece in raw.split(',') {
+        if n >= 3 {
+            return None; // more than three watermarks
+        }
+        parts[n] = piece.trim().parse::<u64>().ok()?;
+        n += 1;
+    }
+    if n != 3 {
+        return None; // fewer than three watermarks
+    }
+    if parts[0] < parts[1] && parts[1] < parts[2] {
+        Some(parts)
+    } else {
+        None // non-ascending must disable pacing, not misfire
+    }
+}
+
+/// Effective pacing watermarks. Read the env FRESH on each call — deliberately
+/// NOT the usual `OnceLock` read-once: this is consulted once per own-leader
+/// `select_block_payload` (a ~µs read at ≤ block rate, pure noise), and fresh
+/// reads keep same-process tests deterministic across env changes. Unset ⇒
+/// `None` ⇒ tier 0 ⇒ the exact static-cap selection call used today.
+fn exec_throttle_watermarks() -> Option<[u64; 3]> {
+    parse_exec_throttle_watermarks(std::env::var("TORUS_EXEC_THROTTLE_WATERMARKS").ok())
+}
+
+/// Map a LOCAL exec-backlog depth (queued+in-flight exec channel blocks plus
+/// strict-order deferred heights) to a pacing tier under `watermarks`:
+/// `0` = full caps (`< w1`), `1` = half (`w1..w2`), `2` = quarter (`w2..w3`),
+/// `3` = cancels-only (`>= w3`). `None` watermarks: always tier 0.
+fn exec_throttle_tier(depth: u64, watermarks: Option<[u64; 3]>) -> u8 {
+    match watermarks {
+        None => 0,
+        Some([w1, w2, w3]) => {
+            if depth >= w3 {
+                3
+            } else if depth >= w2 {
+                2
+            } else if depth >= w1 {
+                1
+            } else {
+                0
+            }
+        }
+    }
+}
+
+/// The native-selection budget a pacing tier allows the proposer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PacedSelectionCaps {
+    /// Normal selection under (possibly scaled) caps.
+    Select {
+        action_cap: usize,
+        bytes_cap: usize,
+        orders_cap: usize,
+    },
+    /// Deepest tier: propose ONLY pooled cancels — zero new orders enter the
+    /// exec pipeline while it digests the backlog (risk-reducing actions keep
+    /// flowing; selection stays non-destructive so nothing is shed).
+    CancelsOnly,
+}
+
+/// Scale the proposer's three native selection caps by pacing `tier`
+/// (rank 1): tier 0 hands the caps through untouched; tiers 1/2 halve/quarter
+/// them; tier 3+ is cancels-only. Floors on the scaled tiers keep a paced
+/// proposer from wedging its own selection permanently empty: at least 1
+/// action and one legal batch of orders (the same doctrine as the
+/// `native_orders_per_block_cap` env floor). Bytes scale unfloored — the
+/// real cap is MBs, and a sub-action byte budget already means the operator
+/// configured an unusably small block.
+fn paced_selection_caps(
+    tier: u8,
+    action_cap: usize,
+    bytes_cap: usize,
+    orders_cap: usize,
+) -> PacedSelectionCaps {
+    match tier {
+        0 => PacedSelectionCaps::Select {
+            action_cap,
+            bytes_cap,
+            orders_cap,
+        },
+        1 | 2 => {
+            let div = 1usize << tier; // tier 1 => /2, tier 2 => /4
+            PacedSelectionCaps::Select {
+                action_cap: (action_cap / div).max(1),
+                bytes_cap: bytes_cap / div,
+                orders_cap: (orders_cap / div)
+                    .max(torus_mempool::rate_limit::NATIVE_ORDERS_PER_BATCH_CAP),
+            }
+        }
+        _ => PacedSelectionCaps::CancelsOnly,
+    }
+}
+
+// ============================================================================
+// Package D rank 2 — non-blocking exec dispatch + bounded deferred_exec
+// ============================================================================
+
+/// Parse the `TORUS_EXEC_NONBLOCKING_DISPATCH` opt-in toggle (rank 2).
+/// Unset, empty, or `"0"` ⇒ FALSE = the blocking `exec_tx.send`, bit-identical
+/// to today (the rollback position). Any other non-empty value (`"1"`,
+/// `"true"`) ⇒ try_send + strict-order park on a full channel. MUST ship with
+/// rank 1's pacing: the park removes the consensus-freeze mode, pacing is the
+/// backpressure that keeps the park bounded.
+fn parse_nonblocking_dispatch_toggle(raw: Option<String>) -> bool {
+    match raw {
+        Some(v) => {
+            let t = v.trim();
+            !t.is_empty() && t != "0"
+        }
+        None => false,
+    }
+}
+
+/// Effective dispatch mode. Fresh env read per call, like
+/// [`exec_throttle_watermarks`]: dispatch runs once per committed block, the
+/// read is noise, and fresh reads keep same-process tests deterministic.
+fn nonblocking_exec_dispatch() -> bool {
+    parse_nonblocking_dispatch_toggle(std::env::var("TORUS_EXEC_NONBLOCKING_DISPATCH").ok())
+}
+
+/// Rank 2 memory bound: total bincode bytes of `ExecSource::Ready` bodies the
+/// `deferred_exec` park may hold before further Ready parks DEMOTE to
+/// `ExecSource::Compact` (hash references, rematerialized from the durable DA
+/// store on drain). 64 MiB ≈ ~10 full 6 MB (`NATIVE_BLOCK_BYTES_CAP`) bodies.
+const DEFERRED_EXEC_READY_BYTES_DEFAULT: usize = 64 * 1024 * 1024;
+
+/// Parse `TORUS_DEFERRED_EXEC_READY_BYTES` (rank 2): the Ready-park byte
+/// budget. Malformed/unset ⇒ the compiled default; `0` ⇒ demote every parked
+/// Ready block (maximum memory thrift; also the test lever).
+fn parse_deferred_ready_bytes(raw: Option<String>) -> usize {
+    raw.and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(DEFERRED_EXEC_READY_BYTES_DEFAULT)
+}
+
+/// Effective Ready-park byte budget (fresh read, same rationale as the toggle).
+fn deferred_exec_ready_bytes_budget() -> usize {
+    parse_deferred_ready_bytes(std::env::var("TORUS_DEFERRED_EXEC_READY_BYTES").ok())
+}
+
+/// Outcome of handing one materialized committed block to the exec channel.
+enum DispatchOutcome {
+    /// Entered the channel (or no channel wired): this height is done here.
+    Sent,
+    /// Rank 2, non-blocking mode only: the channel is FULL — the block comes
+    /// back to the caller for a strict-order park. NOT a failure and NOT a
+    /// heal-budget hole: execution is alive, just behind.
+    Full(TorusBlock, Vec<PendingSlash>),
+    /// The channel is disconnected: the execution thread is dead and the T1.5
+    /// fail-stop latch is already set (verbatim semantics, both modes).
+    Failed,
 }
 
 /// Shared consensus state for leader discovery by non-consensus components (RPC).
@@ -224,6 +396,12 @@ struct ExecutionContext {
     /// market worker panicked and its book is lost). The execution loop exits
     /// on it and the node stops producing, voting, and finalizing.
     exec_failed: Arc<AtomicBool>,
+    /// Package D rank 1: local mirror of the `exec_queue_depth` gauge —
+    /// incremented on the consensus side before a block enters the exec
+    /// channel, decremented here AFTER it executes — so proposer pacing can
+    /// read the backlog depth even with `metrics = None`. Pairing with the
+    /// consensus-side `fetch_add` is the invariant that keeps it exact.
+    exec_queue_len: Arc<AtomicU64>,
 }
 
 // ---- Standalone helpers (used by both execution thread and crash recovery) ----
@@ -1225,6 +1403,8 @@ fn execution_loop(rx: std::sync::mpsc::Receiver<CommittedBlockMsg>, ctx: Executi
         if let Some(ref m) = ctx.metrics {
             m.exec_queue_depth.dec();
         }
+        // Rank 1: keep the metrics-free mirror in lockstep with the gauge.
+        ctx.exec_queue_len.fetch_sub(1, Ordering::Relaxed);
         if ctx.exec_failed.load(Ordering::SeqCst) {
             // Dropping `rx` closes the channel: the consensus thread's next
             // send fails and latches the same fail-stop on the TorusApp side.
@@ -1350,6 +1530,18 @@ pub struct TorusApp {
     exec_hole_last_log: Option<std::time::Instant>,
     /// Regime-B. Retry attempts against the current hole (for the operator log).
     exec_hole_retries: u64,
+    /// Package D rank 1: queued + in-flight exec channel depth — a local
+    /// mirror of the `exec_queue_depth` gauge (inc before the exec send, dec
+    /// on the exec thread after a block executes) readable with
+    /// `metrics = None`. Proposer pacing adds `deferred_exec.len()` to this
+    /// for the full backlog picture.
+    exec_queue_len: Arc<AtomicU64>,
+    /// Package D rank 2: the height whose once-per-dispatch preparation
+    /// (durable body persist, manifest prune, mempool bookkeeping) already
+    /// ran, so a Full-park retry of the SAME height skips the multi-MB
+    /// re-encode/re-write on the consensus thread. Heights reach dispatch
+    /// strictly in ascending order, so a single `Option<u64>` suffices.
+    exec_prepared_height: Option<u64>,
 }
 
 /// Actions the proposer pushes to validators via unicast before broadcasting CompactBlock.
@@ -1907,6 +2099,10 @@ impl TorusApp {
         // and the consensus-side TorusApp (see `exec_failed` field docs).
         let exec_failed = Arc::new(AtomicBool::new(false));
 
+        // Rank 1: metrics-free exec-backlog mirror, shared with the exec thread
+        // (inc at dispatch, dec after execution — see field docs).
+        let exec_queue_len = Arc::new(AtomicU64::new(0));
+
         // Execution pipeline context — owns its own copies for thread safety.
         let mut exec_validator = BlockValidator::new(
             config.chain_id,
@@ -1936,6 +2132,7 @@ impl TorusApp {
                 256,
             )),
             exec_failed: exec_failed.clone(),
+            exec_queue_len: exec_queue_len.clone(),
         };
 
         // Phase A: ensure the persistent incremental trie exists before any commit (including
@@ -2011,6 +2208,8 @@ impl TorusApp {
             exec_hole_since: None,
             exec_hole_last_log: None,
             exec_hole_retries: 0,
+            exec_queue_len,
+            exec_prepared_height: None,
         };
 
         // FIX 1b: a boot replay hole PARKS instead of latching a pre-network
@@ -2031,13 +2230,8 @@ impl TorusApp {
                 // record with no manifest falls back to `Durable(h)` (local-body
                 // heal only). This is the difference between a hole that heals and
                 // one that stalls forever at `missing=0` (t12-r3-full h1165).
-                app.deferred_exec.insert(
-                    h,
-                    DeferredExecBlock {
-                        source: recovery_exec_source(&app.state_db, h),
-                        slashes: Vec::new(),
-                    },
-                );
+                let source = recovery_exec_source(&app.state_db, h);
+                app.park_deferred(h, source, Vec::new());
             }
             app.exec_next_height = Some(hole);
             app.exec_hole_since = Some(std::time::Instant::now());
@@ -2075,10 +2269,12 @@ impl TorusApp {
                 // manifest is instead left for the live / block-sync commit path
                 // (which delivers it as Compact/Ready) and the drain watchdog.
                 for &h in &manifest_heights {
-                    app.deferred_exec.entry(h).or_insert_with(|| DeferredExecBlock {
-                        source: recovery_exec_source(&app.state_db, h),
-                        slashes: Vec::new(),
-                    });
+                    // Preserve any FIX 1b entry already parked at this height
+                    // (the old `.entry(h).or_insert_with(...)` semantics).
+                    if !app.deferred_exec.contains_key(&h) {
+                        let source = recovery_exec_source(&app.state_db, h);
+                        app.park_deferred(h, source, Vec::new());
+                    }
                 }
                 app.exec_next_height =
                     Some(app.exec_next_height.map_or(first, |n| n.min(first)));
@@ -3364,6 +3560,23 @@ impl App<RocksKVStore> for TorusApp {
         );
         self.exec_failed.store(true, Ordering::SeqCst);
     }
+
+    /// Package D rank 2: the ~1 s reconcile tick is the drain hook that frees
+    /// backpressure parks BETWEEN commits — once execution digests channel
+    /// slots, parked committed blocks must flow again even if consensus is
+    /// momentarily idle (no new commit to ride on). Touches ONLY local exec
+    /// dispatch state, never consensus state. Gated on the rank-2 flag so the
+    /// flag-off cadence (drain rides exclusively on commits) stays
+    /// bit-identical to today.
+    fn on_reconcile_tick(&mut self) {
+        if !nonblocking_exec_dispatch() {
+            return;
+        }
+        if self.is_exec_failed() || self.deferred_exec.is_empty() {
+            return;
+        }
+        self.drain_exec_queue();
+    }
 }
 
 impl TorusApp {
@@ -3433,12 +3646,73 @@ impl TorusApp {
         // reconstructed (MissingData) — absent from `pending_proposals` but
         // still in flight on the wire (s355 duplicate-inclusion tail).
         self.in_flight_hashes.extend_into(&mut in_flight);
-        let native = mempool.select_native_for_block_with_senders_excluding(
+
+        // Package D rank 1 — exec-backlog watermark pacing. The LOCAL backlog
+        // is queued+in-flight exec channel blocks (`exec_queue_len`, the
+        // metrics-free gauge mirror) PLUS the strict-order deferred buffer
+        // (`deferred_exec` — holes and rank-2 backpressure parks): channel
+        // depth alone would under-report how far execution actually lags.
+        // Scaling the caps DOWN as the backlog deepens converts the worst
+        // failure mode — exec hits the sync_channel(64) bound and the single
+        // HotStuff thread parks on the blocking send, stalling the whole
+        // fleet into a view-timeout cascade — into temporarily thinner blocks
+        // with QCs still forming. Selection is non-destructive, so paced-out
+        // actions stay pooled: pacing, not shedding. Proposer-local policy
+        // (validate_block rejects on neither action nor order count,
+        // rate_limit.rs:126-133) — heterogeneous settings cannot fork.
+        // `TORUS_EXEC_THROTTLE_WATERMARKS` unset ⇒ tier 0 ⇒ the exact
+        // static-cap call used before rank 1: bit-identical to today.
+        let exec_backlog = self
+            .exec_queue_len
+            .load(Ordering::Relaxed)
+            .saturating_add(self.deferred_exec.len() as u64);
+        let tier = exec_throttle_tier(exec_backlog, exec_throttle_watermarks());
+        if let Some(ref m) = self.metrics {
+            m.exec_throttle_tier.set(tier as i64);
+        }
+        let native = match paced_selection_caps(
+            tier,
             torus_mempool::rate_limit::native_total_block_cap(),
-            &in_flight,
             torus_mempool::rate_limit::native_block_bytes_cap(),
             torus_mempool::rate_limit::native_orders_per_block_cap(),
-        );
+        ) {
+            PacedSelectionCaps::Select {
+                action_cap,
+                bytes_cap,
+                orders_cap,
+            } => {
+                if tier > 0 {
+                    tracing::info!(
+                        exec_backlog,
+                        tier,
+                        action_cap,
+                        bytes_cap,
+                        orders_cap,
+                        "exec-backlog pacing: scaled native selection caps for this proposal"
+                    );
+                }
+                mempool.select_native_for_block_with_senders_excluding(
+                    action_cap,
+                    &in_flight,
+                    bytes_cap,
+                    orders_cap,
+                )
+            }
+            PacedSelectionCaps::CancelsOnly => {
+                tracing::warn!(
+                    exec_backlog,
+                    tier,
+                    "exec-backlog pacing: deepest tier — proposing CANCELS ONLY \
+                     (new orders stay pooled until execution catches up)"
+                );
+                mempool.select_native_cancels_for_block_with_senders_excluding(
+                    torus_mempool::rate_limit::native_total_block_cap(),
+                    &in_flight,
+                    torus_mempool::rate_limit::native_block_bytes_cap(),
+                    torus_mempool::rate_limit::native_orders_per_block_cap(),
+                )
+            }
+        };
         let evm = mempool.drain_evm(gas_limit, parent_state_root);
         if !evm.is_empty() || !native.is_empty() {
             tracing::info!(
@@ -3486,24 +3760,32 @@ impl TorusApp {
         if self.deferred_exec.is_empty() && height == next {
             match self.materialize_owned(source) {
                 Ok(block) => {
-                    self.dispatch_to_exec(block, slashes);
-                    self.exec_next_height = Some(next + 1);
+                    match self.dispatch_to_exec(block, slashes) {
+                        DispatchOutcome::Full(block, slashes) => {
+                            // Rank 2: channel full — park at THIS height, the
+                            // frontier holds (never execute past an unsent
+                            // block). NOT a hole: no heal budget starts.
+                            self.park_deferred(height, ExecSource::Ready(block), slashes);
+                        }
+                        DispatchOutcome::Sent | DispatchOutcome::Failed => {
+                            self.exec_next_height = Some(next + 1);
+                        }
+                    }
                     return;
                 }
                 Err((source, missing)) => {
                     // First block of a new hole: buffer it and begin heal accounting.
-                    self.deferred_exec
-                        .insert(height, DeferredExecBlock { source, slashes });
+                    self.park_deferred(height, source, slashes);
                     self.note_exec_hole(height, &missing);
                     return;
                 }
             }
         }
 
-        // A hole already exists, or this height is ahead of the frontier: buffer in
-        // ascending order and drain whatever is now contiguous.
-        self.deferred_exec
-            .insert(height, DeferredExecBlock { source, slashes });
+        // A hole already exists, a rank-2 park is pending, or this height is
+        // ahead of the frontier: buffer in ascending order and drain whatever
+        // is now contiguous.
+        self.park_deferred(height, source, slashes);
         self.drain_exec_queue();
     }
 
@@ -3531,8 +3813,7 @@ impl TorusApp {
             let Some(entry) = self.deferred_exec.remove(&next) else {
                 if load_commit_manifest(&self.state_db, next).is_some() {
                     let source = recovery_exec_source(&self.state_db, next);
-                    self.deferred_exec
-                        .insert(next, DeferredExecBlock { source, slashes: Vec::new() });
+                    self.park_deferred(next, source, Vec::new());
                     tracing::error!(
                         height = next,
                         "FIX 6 / F-1 watchdog: execution head-of-line height was committed \
@@ -3543,20 +3824,65 @@ impl TorusApp {
                 }
                 return;
             };
-            let DeferredExecBlock { source, slashes } = entry;
+            let DeferredExecBlock {
+                source,
+                slashes,
+                ready_bytes: _,
+            } = entry;
+            // Rank 2: remember how a Full put-back re-parks WITHOUT recompute —
+            // a demoted head must go back as its (cheaply cloned) compact
+            // reference, not get re-hashed or re-promoted to Ready per attempt.
+            // Full is only possible in non-blocking mode; flag off skips the
+            // clone entirely (bit-identical cost to the pre-rank-2 drain).
+            let compact_for_putback = if nonblocking_exec_dispatch() {
+                match &source {
+                    ExecSource::Compact(c) => Some(c.clone()),
+                    _ => None,
+                }
+            } else {
+                None
+            };
             match self.materialize_owned(source) {
                 Ok(block) => {
-                    self.dispatch_to_exec(block, slashes);
-                    self.exec_next_height = Some(next + 1);
+                    // Bodies are in hand: whatever hole was open at this height
+                    // is healed, independent of channel state below.
                     self.clear_exec_hole_state();
-                    // continue draining the next contiguous height
+                    match self.dispatch_to_exec(block, slashes) {
+                        DispatchOutcome::Full(block, slashes) => {
+                            // Channel still full: put the head back and STOP —
+                            // later heights cannot send either. NOT a hole.
+                            match compact_for_putback {
+                                Some(c) => {
+                                    self.deferred_exec.insert(
+                                        next,
+                                        DeferredExecBlock {
+                                            source: ExecSource::Compact(c),
+                                            slashes,
+                                            ready_bytes: 0,
+                                        },
+                                    );
+                                }
+                                None => {
+                                    self.park_deferred(
+                                        next,
+                                        ExecSource::Ready(block),
+                                        slashes,
+                                    );
+                                }
+                            }
+                            return;
+                        }
+                        DispatchOutcome::Sent | DispatchOutcome::Failed => {
+                            self.exec_next_height = Some(next + 1);
+                            // continue draining the next contiguous height
+                        }
+                    }
                 }
                 Err((source, missing)) => {
                     // Head-of-line bodies still missing: a real hole. Put it back,
                     // trigger the DA fetch + throttled log + budget check, and STOP —
                     // never execute past it.
-                    self.deferred_exec
-                        .insert(next, DeferredExecBlock { source, slashes });
+                    self.park_deferred(next, source, slashes);
                     self.note_exec_hole(next, &missing);
                     return;
                 }
@@ -3616,48 +3942,72 @@ impl TorusApp {
     /// thread, in order. Carries the mempool bookkeeping that must happen once a
     /// block is actually executed (prune committed native hashes, pin the base
     /// fee) plus the T1.5 closed-channel fail-stop.
-    fn dispatch_to_exec(&mut self, torus_block: TorusBlock, pending_slashes: Vec<PendingSlash>) {
+    ///
+    /// Rank 2: returns a [`DispatchOutcome`]. In non-blocking mode
+    /// (`TORUS_EXEC_NONBLOCKING_DISPATCH`) a FULL channel hands the block back
+    /// as `Full(...)` for a strict-order park instead of blocking the single
+    /// HotStuff thread; the Disconnected fail-stop latch is verbatim in both
+    /// modes. Flag off ⇒ the blocking `send`, bit-identical to before rank 2.
+    fn dispatch_to_exec(
+        &mut self,
+        torus_block: TorusBlock,
+        pending_slashes: Vec<PendingSlash>,
+    ) -> DispatchOutcome {
         let height = torus_block.header.height;
 
-        // FIX 1a (crash-safety): make the committed block's header+body DURABLE
-        // NOW, at commit time, BEFORE it enters the execution pipeline. A crash in
-        // the commit->execute window previously lost the body (written only at
-        // execution), and boot crash-recovery fail-stopped on the committed-but-
-        // bodiless height (devnet t12-final-a/c). The block is fully materialized
-        // here (bodies reconstructed from the durable DA store), so this write is
-        // authoritative; the execution-time writes remain as idempotent repeats.
-        persist_committed_block_durably(&self.state_db, &torus_block);
+        // Once-per-height dispatch preparation. In blocking mode each height
+        // reaches this function exactly once (the frontier advances past it or
+        // the node fail-stops), so the gate never skips — bit-identical. In
+        // non-blocking mode a Full park RETRIES this function on every drain
+        // attempt (per commit + 1 s reconcile tick); without the gate each
+        // retry would re-encode + re-write a multi-MB body and re-walk the
+        // pool on the consensus thread — the exact cost rank 1/2 exist to
+        // remove. In-memory (`Option<u64>`): a fresh process re-prepares,
+        // which is the idempotent crash-safe behavior these writes had.
+        if self.exec_prepared_height != Some(height) {
+            // FIX 1a (crash-safety): make the committed block's header+body DURABLE
+            // NOW, at commit time, BEFORE it enters the execution pipeline. A crash in
+            // the commit->execute window previously lost the body (written only at
+            // execution), and boot crash-recovery fail-stopped on the committed-but-
+            // bodiless height (devnet t12-final-a/c). The block is fully materialized
+            // here (bodies reconstructed from the durable DA store), so this write is
+            // authoritative; the execution-time writes remain as idempotent repeats.
+            persist_committed_block_durably(&self.state_db, &torus_block);
 
-        // The body is now durable in `CF_BLOCK_BODIES`; the commit manifest that
-        // guarded the heal channel for this height is redundant. Drop it (best
-        // effort) so `CF_COMMIT_MANIFEST` stays bounded to the committed-but-not-
-        // yet-dispatched window. A still-parked hole never reaches here, so its
-        // manifest is retained for the pull.
-        prune_commit_manifest(&self.state_db, height);
+            // The body is now durable in `CF_BLOCK_BODIES`; the commit manifest that
+            // guarded the heal channel for this height is redundant. Drop it (best
+            // effort) so `CF_COMMIT_MANIFEST` stays bounded to the committed-but-not-
+            // yet-dispatched window. A still-parked hole never reaches here, so its
+            // manifest is retained for the pull. (A rank-2 backpressure park is safe
+            // too: the body write above already covers the crash-replay window.)
+            prune_commit_manifest(&self.state_db, height);
 
-        tracing::info!(
-            height,
-            evm_txs = torus_block.evm_transactions.len(),
-            native = torus_block.native_actions.len(),
-            "on_committed_block: sending to execution pipeline"
-        );
+            tracing::info!(
+                height,
+                evm_txs = torus_block.evm_transactions.len(),
+                native = torus_block.native_actions.len(),
+                "on_committed_block: sending to execution pipeline"
+            );
 
-        if !torus_block.native_actions.is_empty() {
-            if let Some(ref mempool) = self.mempool {
-                let hashes: Vec<torus_types::B256> = torus_block
-                    .native_actions
-                    .iter()
-                    .map(torus_types::compute_action_hash)
-                    .collect();
-                mempool.remove_committed_native(&hashes);
+            if !torus_block.native_actions.is_empty() {
+                if let Some(ref mempool) = self.mempool {
+                    let hashes: Vec<torus_types::B256> = torus_block
+                        .native_actions
+                        .iter()
+                        .map(torus_types::compute_action_hash)
+                        .collect();
+                    mempool.remove_committed_native(&hashes);
+                }
             }
-        }
 
-        // D4 (S392): pin the mempool's admission fee floor to the base fee
-        // committed blocks actually charge (frozen at 1 gwei today; follows
-        // the header once the fee market unfreezes).
-        if let Some(ref mempool) = self.mempool {
-            mempool.set_base_fee(torus_block.header.base_fee_per_gas);
+            // D4 (S392): pin the mempool's admission fee floor to the base fee
+            // committed blocks actually charge (frozen at 1 gwei today; follows
+            // the header once the fee market unfreezes).
+            if let Some(ref mempool) = self.mempool {
+                mempool.set_base_fee(torus_block.header.base_fee_per_gas);
+            }
+
+            self.exec_prepared_height = Some(height);
         }
 
         if let Some(ref tx) = self.exec_tx {
@@ -3670,10 +4020,55 @@ impl TorusApp {
             if let Some(ref m) = self.metrics {
                 m.exec_queue_depth.inc();
             }
-            if tx.send(msg).is_err() {
+            self.exec_queue_len.fetch_add(1, Ordering::Relaxed);
+            if nonblocking_exec_dispatch() {
+                match tx.try_send(msg) {
+                    Ok(()) => {}
+                    Err(std::sync::mpsc::TrySendError::Full(msg)) => {
+                        // Rank 2: the channel is full — execution is alive but
+                        // behind. Hand the block back for a strict-order park;
+                        // it did NOT enter the channel, so the depth
+                        // gauge/mirror roll back (it is accounted as a
+                        // deferred height instead — rank 1 pacing sums both).
+                        if let Some(ref m) = self.metrics {
+                            m.exec_queue_depth.dec();
+                            m.exec_dispatch_deferred.inc();
+                        }
+                        self.exec_queue_len.fetch_sub(1, Ordering::Relaxed);
+                        tracing::debug!(
+                            height,
+                            "exec channel FULL — deferring committed block \
+                             (rank-2 park; drains on commits + the 1s reconcile tick)"
+                        );
+                        let CommittedBlockMsg {
+                            torus_block,
+                            pending_slashes,
+                        } = msg;
+                        return DispatchOutcome::Full(torus_block, pending_slashes);
+                    }
+                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                        if let Some(ref m) = self.metrics {
+                            m.exec_queue_depth.dec();
+                        }
+                        self.exec_queue_len.fetch_sub(1, Ordering::Relaxed);
+                        // T1.5 FAIL-STOP: the execution thread is gone (panic or
+                        // fatal) — this block is committed by consensus but will
+                        // NEVER execute here. Latch the failure: the node stops
+                        // producing, voting, and finalizing, and crash-replay closes
+                        // the gap on restart. Never zombie-advance past a dead pipeline.
+                        self.exec_failed.store(true, Ordering::SeqCst);
+                        tracing::error!(
+                            height,
+                            "execution pipeline channel closed — FAIL-STOP: halting block production, voting, and finalization"
+                        );
+                        return DispatchOutcome::Failed;
+                    }
+                }
+            } else if tx.send(msg).is_err() {
                 if let Some(ref m) = self.metrics {
                     m.exec_queue_depth.dec();
                 }
+                self.exec_queue_len.fetch_sub(1, Ordering::Relaxed);
                 // T1.5 FAIL-STOP: the execution thread is gone (panic or
                 // fatal) — this block is committed by consensus but will
                 // NEVER execute here. Latch the failure: the node stops
@@ -3684,8 +4079,63 @@ impl TorusApp {
                     height,
                     "execution pipeline channel closed — FAIL-STOP: halting block production, voting, and finalization"
                 );
+                return DispatchOutcome::Failed;
             }
         }
+        DispatchOutcome::Sent
+    }
+
+    /// Rank 2: the single choke point for LIVE inserts into the strict-order
+    /// `deferred_exec` park. With non-blocking dispatch enabled it bounds
+    /// parked memory: a `Ready` block whose bytes would push the park past
+    /// [`deferred_exec_ready_bytes_budget`] is DEMOTED to
+    /// `ExecSource::Compact`, its hash references synthesized from the
+    /// committed block's OWN actions (`CompactBlock::from_block` — never a
+    /// proposal cache), and rematerialized all-or-nothing from the durable DA
+    /// store on drain. Demotion is fail-safe: it only happens when every
+    /// referenced body is durably present locally RIGHT NOW — never trade an
+    /// in-hand body set for an unrecoverable reference (a drain miss would
+    /// fabricate a heal-hole from perfectly good data). Flag off ⇒ a verbatim
+    /// insert, bit-identical to the pre-rank-2 buffer.
+    fn park_deferred(&mut self, height: u64, source: ExecSource, slashes: Vec<PendingSlash>) {
+        let (source, ready_bytes) = match source {
+            ExecSource::Ready(block) if nonblocking_exec_dispatch() => {
+                let sz = bincode::serialized_size(&block)
+                    .map(|n| n as usize)
+                    .unwrap_or(usize::MAX / 2);
+                let parked: usize = self.deferred_exec.values().map(|e| e.ready_bytes).sum();
+                if parked.saturating_add(sz) > deferred_exec_ready_bytes_budget() {
+                    let compact = CompactBlock::from_block(&block);
+                    let locally_durable = self
+                        .mempool
+                        .as_ref()
+                        .map(|mp| mp.has_all_native_da(&compact.native_action_hashes))
+                        .unwrap_or(false);
+                    if locally_durable {
+                        tracing::debug!(
+                            height,
+                            parked_ready_bytes = parked,
+                            block_bytes = sz,
+                            "deferred_exec over Ready-byte budget — parking DEMOTED to Compact"
+                        );
+                        (ExecSource::Compact(compact), 0)
+                    } else {
+                        (ExecSource::Ready(block), sz)
+                    }
+                } else {
+                    (ExecSource::Ready(block), sz)
+                }
+            }
+            other => (other, 0),
+        };
+        self.deferred_exec.insert(
+            height,
+            DeferredExecBlock {
+                source,
+                slashes,
+                ready_bytes,
+            },
+        );
     }
 
     /// Regime-B. Account for a head-of-line execution hole: nudge the bodies via
@@ -3756,6 +4206,703 @@ impl TorusApp {
             self.exec_hole_last_log = None;
             self.exec_hole_retries = 0;
         }
+    }
+}
+
+#[cfg(test)]
+mod exec_throttle_tests {
+    use super::*;
+    use torus_types::{NativeAction, B256};
+
+    /// Serialize tests that mutate process-global env vars (parallel test
+    /// threads share the environment). Poisoning is irrelevant — take the lock
+    /// either way.
+    pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    #[test]
+    fn watermark_parse_rejects_malformed_and_accepts_valid() {
+        assert_eq!(parse_exec_throttle_watermarks(None), None);
+        assert_eq!(parse_exec_throttle_watermarks(Some("".into())), None);
+        assert_eq!(parse_exec_throttle_watermarks(Some("  ".into())), None);
+        assert_eq!(parse_exec_throttle_watermarks(Some("16,32".into())), None);
+        assert_eq!(
+            parse_exec_throttle_watermarks(Some("16,32,48,64".into())),
+            None
+        );
+        assert_eq!(parse_exec_throttle_watermarks(Some("a,b,c".into())), None);
+        assert_eq!(
+            parse_exec_throttle_watermarks(Some("48,32,16".into())),
+            None,
+            "non-ascending watermarks must disable pacing, not misfire"
+        );
+        assert_eq!(
+            parse_exec_throttle_watermarks(Some("16,32,48".into())),
+            Some([16, 32, 48])
+        );
+        assert_eq!(
+            parse_exec_throttle_watermarks(Some(" 16 , 32 , 48 ".into())),
+            Some([16, 32, 48]),
+            "whitespace around watermarks is tolerated"
+        );
+    }
+
+    #[test]
+    fn throttle_tier_maps_backlog_to_tiers() {
+        let wm = Some([16, 32, 48]);
+        assert_eq!(exec_throttle_tier(0, wm), 0);
+        assert_eq!(exec_throttle_tier(15, wm), 0);
+        assert_eq!(exec_throttle_tier(16, wm), 1);
+        assert_eq!(exec_throttle_tier(31, wm), 1);
+        assert_eq!(exec_throttle_tier(32, wm), 2);
+        assert_eq!(exec_throttle_tier(47, wm), 2);
+        assert_eq!(exec_throttle_tier(48, wm), 3);
+        assert_eq!(exec_throttle_tier(u64::MAX, wm), 3);
+        // Unset watermarks: always tier 0 — static caps, bit-identical to today.
+        assert_eq!(exec_throttle_tier(u64::MAX, None), 0);
+    }
+
+    #[test]
+    fn paced_caps_scale_and_floor() {
+        use torus_mempool::rate_limit::NATIVE_ORDERS_PER_BATCH_CAP;
+        // Tier 0: caps handed through untouched.
+        assert_eq!(
+            paced_selection_caps(0, 100, 6_000_000, 50_000),
+            PacedSelectionCaps::Select {
+                action_cap: 100,
+                bytes_cap: 6_000_000,
+                orders_cap: 50_000
+            }
+        );
+        // Tier 1: half. Tier 2: quarter.
+        assert_eq!(
+            paced_selection_caps(1, 100, 6_000_000, 50_000),
+            PacedSelectionCaps::Select {
+                action_cap: 50,
+                bytes_cap: 3_000_000,
+                orders_cap: 25_000
+            }
+        );
+        assert_eq!(
+            paced_selection_caps(2, 100, 6_000_000, 50_000),
+            PacedSelectionCaps::Select {
+                action_cap: 25,
+                bytes_cap: 1_500_000,
+                orders_cap: 12_500
+            }
+        );
+        // Tier 3 (and anything deeper): cancels-only.
+        assert_eq!(
+            paced_selection_caps(3, 100, 6_000_000, 50_000),
+            PacedSelectionCaps::CancelsOnly
+        );
+        // Floors: at least 1 action and one legal batch of orders — a paced
+        // proposer must never wedge its own selection to permanently-empty.
+        assert_eq!(
+            paced_selection_caps(2, 2, 100, 10),
+            PacedSelectionCaps::Select {
+                action_cap: 1,
+                bytes_cap: 25,
+                orders_cap: NATIVE_ORDERS_PER_BATCH_CAP
+            }
+        );
+        // Package D rank 3: the pacing scaler carries NO hardcoded 100 — it must
+        // scale a RAISED base action cap (e.g. 400 from
+        // `TORUS_NATIVE_TOTAL_BLOCK_CAP=400`) proportionally, so cap 400 stays
+        // reachable at tier 0 and paces cleanly under backlog.
+        assert_eq!(
+            paced_selection_caps(0, 400, 6_000_000, 50_000),
+            PacedSelectionCaps::Select {
+                action_cap: 400,
+                bytes_cap: 6_000_000,
+                orders_cap: 50_000
+            },
+            "tier 0 hands a raised base cap through untouched — 400 is reachable"
+        );
+        assert_eq!(
+            paced_selection_caps(1, 400, 6_000_000, 50_000),
+            PacedSelectionCaps::Select {
+                action_cap: 200,
+                bytes_cap: 3_000_000,
+                orders_cap: 25_000
+            },
+            "tier 1 halves the raised base cap (200), not a fixed 50"
+        );
+        assert_eq!(
+            paced_selection_caps(2, 400, 6_000_000, 50_000),
+            PacedSelectionCaps::Select {
+                action_cap: 100,
+                bytes_cap: 1_500_000,
+                orders_cap: 12_500
+            },
+            "tier 2 quarters the raised base cap (100), not a fixed 25"
+        );
+    }
+
+    fn signed_action(seed_byte: u8, nonce: u64, action: NativeAction) -> torus_types::SignedNativeAction {
+        let key = k256::ecdsa::SigningKey::from_slice(&[seed_byte; 32]).unwrap();
+        torus_types::eip712::sign_native_action(action, nonce, &key)
+    }
+
+    /// Integration (the rank-1 mechanism end-to-end): with watermarks set and a
+    /// deep LOCAL exec backlog, `select_block_payload` selects ONLY cancels
+    /// (deepest tier) while non-cancels stay pooled; once the backlog clears,
+    /// the same call returns EVERYTHING still pooled — pacing defers, never
+    /// drops, so total orders eventually committed equals orders submitted.
+    #[test]
+    fn select_block_payload_paces_by_exec_backlog_and_never_sheds() {
+        let _guard = env_lock();
+        std::env::set_var("TORUS_EXEC_THROTTLE_WATERMARKS", "4,8,12");
+
+        let (config, state_db) = {
+            // Reuse the crash-test fixture helpers (same file, different module).
+            use std::sync::atomic::{AtomicU64 as CounterU64, Ordering as CounterOrdering};
+            static COUNTER: CounterU64 = CounterU64::new(9000);
+            let id = COUNTER.fetch_add(1, CounterOrdering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "torus-throttle-test-{}-{}",
+                std::process::id(),
+                id
+            ));
+            let _ = std::fs::create_dir_all(&dir);
+            let state_db = StateDb::open(&dir).expect("open test db");
+            let config = ChainConfig {
+                chain_id: torus_evm::TORUS_CHAIN_ID,
+                chain_name: "throttle-test".to_string(),
+                evm_gas_limit: 30_000_000,
+                base_fee_per_gas: 1_000_000_000,
+                epoch_length: 100,
+                max_validators: 4,
+                min_stake: torus_economics::MIN_SELF_DELEGATION,
+                fee_burn_bps: 1000,
+                fee_validator_bps: 0,
+                fee_treasury_bps: 4500,
+                fee_dev_pool_bps: 4500,
+                treasury_address: Address::ZERO,
+                dev_pool_address: Address::ZERO,
+                timeout_base_ms: 500,
+                backoff_factor: 2,
+                backoff_cap: 8,
+                reputation_leader_selection: false,
+                exec_trust_cache: false,
+            };
+            (config, state_db)
+        };
+        let mempool = Arc::new(Mempool::new(
+            state_db.clone(),
+            torus_mempool::MempoolConfig::default(),
+        ));
+        let base = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        // 3 new orders + 2 cancels from distinct senders, all fresh nonces.
+        for i in 0..3u8 {
+            let a = signed_action(i + 1, base + i as u64, NativeAction::ClaimRewards);
+            let s = a.recover_sender().unwrap();
+            mempool.add_native_action_presigned(s, a).unwrap();
+        }
+        for i in 0..2u8 {
+            let a = signed_action(
+                i + 50,
+                base + 100 + i as u64,
+                NativeAction::CancelOrder {
+                    order_id: i as u128,
+                },
+            );
+            let s = a.recover_sender().unwrap();
+            mempool.add_native_action_presigned(s, a).unwrap();
+        }
+
+        let app = TorusApp::new(state_db.clone(), &config, None, Some(mempool), None);
+        assert_eq!(app.last_header.height, 0, "fresh chain");
+
+        // Deep backlog (>= w3): cancels-only.
+        app.exec_queue_len.store(12, Ordering::Relaxed);
+        let (paced, _evm) = app.select_block_payload(0, 30_000_000, B256::ZERO);
+        assert_eq!(paced.len(), 2, "cancels-only tier selects exactly the cancels");
+        assert!(
+            paced
+                .iter()
+                .all(|(_, a)| torus_mempool::is_cancel(&a.action)),
+            "no new orders may be placed at the deepest tier"
+        );
+
+        // Backlog cleared: the SAME pooled actions all select — nothing was shed.
+        app.exec_queue_len.store(0, Ordering::Relaxed);
+        let (full, _evm) = app.select_block_payload(0, 30_000_000, B256::ZERO);
+        assert_eq!(
+            full.len(),
+            5,
+            "pacing defers selection; once the backlog clears every submitted action is still selectable"
+        );
+
+        std::env::remove_var("TORUS_EXEC_THROTTLE_WATERMARKS");
+    }
+
+    /// The strict-order deferred buffer (rank-2 backpressure parks and heal
+    /// holes) counts toward the pacing backlog too: channel depth alone would
+    /// under-report how far execution actually lags.
+    #[test]
+    fn deferred_exec_counts_toward_pacing_backlog() {
+        let _guard = env_lock();
+        std::env::set_var("TORUS_EXEC_THROTTLE_WATERMARKS", "4,8,12");
+
+        let mut app = TorusApp::stub();
+        let mempool = Arc::new(Mempool::new(
+            app.state_db.clone(),
+            torus_mempool::MempoolConfig::default(),
+        ));
+        let base = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let a = signed_action(7, base, NativeAction::ClaimRewards);
+        let s = a.recover_sender().unwrap();
+        mempool.add_native_action_presigned(s, a).unwrap();
+        let c = signed_action(8, base + 1, NativeAction::CancelOrder { order_id: 9 });
+        let sc = c.recover_sender().unwrap();
+        mempool.add_native_action_presigned(sc, c).unwrap();
+        app.mempool = Some(mempool);
+
+        // No channel depth, but 12 heights parked in the deferred buffer.
+        app.exec_queue_len.store(0, Ordering::Relaxed);
+        for h in 1..=12u64 {
+            app.deferred_exec.insert(
+                h,
+                DeferredExecBlock {
+                    source: ExecSource::Durable(h),
+                    slashes: Vec::new(),
+                    ready_bytes: 0,
+                },
+            );
+        }
+        let (paced, _evm) = app.select_block_payload(0, 30_000_000, B256::ZERO);
+        assert_eq!(paced.len(), 1, "deep deferred buffer alone must pace to cancels-only");
+        assert!(torus_mempool::is_cancel(&paced[0].1.action));
+
+        app.deferred_exec.clear();
+        let (full, _evm) = app.select_block_payload(0, 30_000_000, B256::ZERO);
+        assert_eq!(full.len(), 2, "clearing the buffer restores full selection");
+
+        std::env::remove_var("TORUS_EXEC_THROTTLE_WATERMARKS");
+    }
+}
+
+#[cfg(test)]
+mod exec_dispatch_tests {
+    //! Package D rank 2 — non-blocking exec dispatch + bounded deferred_exec.
+    //!
+    //! RED-first: these tests pin the try_send/park/demote/drain contract
+    //! before the implementation exists. `TORUS_EXEC_NONBLOCKING_DISPATCH`
+    //! unset must stay bit-identical to today's blocking send; set, a full
+    //! exec channel must PARK the block in the strict-order `deferred_exec`
+    //! map (never block the consensus thread, never a heal-budget hole),
+    //! demote parked bodies to `ExecSource::Compact` beyond a byte budget,
+    //! and drain in strict height order via commits + the 1s reconcile tick.
+
+    use super::*;
+    use torus_types::{Bloom, NativeAction, SignedNativeAction, B256};
+
+    /// Same process-global env guard as the pacing tests (env vars are shared
+    /// across parallel test threads).
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        super::exec_throttle_tests::env_lock()
+    }
+
+    fn clear_dispatch_env() {
+        std::env::remove_var("TORUS_EXEC_NONBLOCKING_DISPATCH");
+        std::env::remove_var("TORUS_DEFERRED_EXEC_READY_BYTES");
+    }
+
+    fn signed(seed: u8, nonce: u64) -> SignedNativeAction {
+        let key = k256::ecdsa::SigningKey::from_slice(&[seed; 32]).unwrap();
+        torus_types::eip712::sign_native_action(NativeAction::ClaimRewards, nonce, &key)
+    }
+
+    /// Minimal committed-block fixture. Parent linkage is irrelevant here:
+    /// these tests swap `exec_tx` for their own channel, so no block ever
+    /// reaches `execute_committed_block` (where the ancestry check lives) —
+    /// only `persist_committed_block_durably` + the send path run.
+    fn block(height: u64, native_actions: Vec<SignedNativeAction>) -> TorusBlock {
+        TorusBlock {
+            header: TorusBlockHeader {
+                height,
+                parent_hash: B256::ZERO,
+                timestamp: 1000 + height,
+                proposer: Address::ZERO,
+                state_root: B256::ZERO,
+                receipts_root: B256::ZERO,
+                logs_bloom: Bloom::ZERO,
+                evm_gas_used: 0,
+                evm_fee_revenue: 0,
+                evm_gas_limit: 30_000_000,
+                native_action_count: native_actions.len() as u32,
+                evm_tx_count: 0,
+                base_fee_per_gas: 1_000_000_000,
+                epoch: 0,
+                validator_set_hash: B256::ZERO,
+                sig_attestation: [0u8; 64],
+            },
+            native_actions,
+            evm_transactions: vec![],
+            core_writer_actions: vec![],
+        }
+    }
+
+    /// Replace the app's exec channel with a test-owned one of capacity `cap`.
+    /// Dropping the original sender detaches the real execution thread (it
+    /// exits; `Drop` still joins it cleanly).
+    fn swap_exec_channel(
+        app: &mut TorusApp,
+        cap: usize,
+    ) -> std::sync::mpsc::Receiver<CommittedBlockMsg> {
+        let (tx, rx) = std::sync::mpsc::sync_channel(cap);
+        app.exec_tx = Some(tx);
+        rx
+    }
+
+    #[test]
+    fn nonblocking_toggle_defaults_off_and_zero_disables() {
+        // Unset/empty/"0" => blocking send, bit-identical to today.
+        assert!(!parse_nonblocking_dispatch_toggle(None));
+        assert!(!parse_nonblocking_dispatch_toggle(Some("".into())));
+        assert!(!parse_nonblocking_dispatch_toggle(Some("  ".into())));
+        assert!(!parse_nonblocking_dispatch_toggle(Some("0".into())));
+        assert!(!parse_nonblocking_dispatch_toggle(Some(" 0 ".into())));
+        assert!(parse_nonblocking_dispatch_toggle(Some("1".into())));
+        assert!(parse_nonblocking_dispatch_toggle(Some("true".into())));
+    }
+
+    #[test]
+    fn deferred_ready_bytes_parse_defaults_and_zero() {
+        assert_eq!(
+            parse_deferred_ready_bytes(None),
+            DEFERRED_EXEC_READY_BYTES_DEFAULT
+        );
+        assert_eq!(
+            parse_deferred_ready_bytes(Some("junk".into())),
+            DEFERRED_EXEC_READY_BYTES_DEFAULT
+        );
+        assert_eq!(parse_deferred_ready_bytes(Some("0".into())), 0);
+        assert_eq!(
+            parse_deferred_ready_bytes(Some(" 1048576 ".into())),
+            1 << 20
+        );
+    }
+
+    /// The rank-2 core: a FULL exec channel defers (parks) instead of blocking
+    /// the consensus thread, parked heights drain in STRICT ascending order as
+    /// capacity frees (via the reconcile tick), a park is NOT a heal-budget
+    /// hole, and nothing is lost — every enqueued block is eventually sent
+    /// exactly once, in order.
+    #[test]
+    fn full_channel_defers_instead_of_blocking_and_drains_in_strict_order() {
+        let _guard = env_lock();
+        clear_dispatch_env();
+        std::env::set_var("TORUS_EXEC_NONBLOCKING_DISPATCH", "1");
+
+        let mut app = TorusApp::stub();
+        let rx = swap_exec_channel(&mut app, 1);
+
+        let b1 = block(1, vec![]);
+        let b2 = block(2, vec![]);
+        let b3 = block(3, vec![]);
+
+        // Height 1 fills the capacity-1 channel.
+        app.enqueue_for_execution(1, ExecSource::Ready(b1), vec![]);
+        assert_eq!(app.exec_next_height, Some(2));
+        assert!(app.deferred_exec.is_empty());
+
+        // Height 2 hits a FULL channel. Run it on a helper thread so a
+        // regression to the blocking send shows up as a loud timeout here,
+        // not a wedged test binary.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let b2c = b2.clone();
+        std::thread::spawn(move || {
+            app.enqueue_for_execution(2, ExecSource::Ready(b2c), vec![]);
+            let _ = done_tx.send(app);
+        });
+        let mut app = done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("enqueue on a FULL exec channel must NOT block the consensus thread");
+
+        assert!(
+            app.deferred_exec.contains_key(&2),
+            "the full-channel block parks in the strict-order deferred map"
+        );
+        assert_eq!(
+            app.exec_next_height,
+            Some(2),
+            "a parked height must not advance the exec frontier"
+        );
+        assert!(
+            app.exec_hole_since.is_none(),
+            "a backpressure park is NOT a hole — it must never burn the heal fail-stop budget"
+        );
+
+        // Height 3 arrives behind the park: buffers behind it, still in order.
+        app.enqueue_for_execution(3, ExecSource::Ready(b3), vec![]);
+        assert_eq!(
+            app.deferred_exec.keys().copied().collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        assert!(app.exec_hole_since.is_none());
+
+        // Exactly one block crossed so far: height 1.
+        assert_eq!(rx.try_recv().expect("h1 was sent").torus_block.header.height, 1);
+        assert!(rx.try_recv().is_err(), "heights 2/3 are parked, not sent");
+
+        // Reconcile tick drains what now fits: 2 sends, 3 re-parks (Full again).
+        app.on_reconcile_tick();
+        assert_eq!(rx.try_recv().expect("h2 drains first").torus_block.header.height, 2);
+        assert_eq!(
+            app.deferred_exec.keys().copied().collect::<Vec<_>>(),
+            vec![3],
+            "strict order: only the head may leave the park"
+        );
+        assert_eq!(app.exec_next_height, Some(3));
+
+        app.on_reconcile_tick();
+        assert_eq!(rx.try_recv().expect("h3 drains last").torus_block.header.height, 3);
+        assert!(app.deferred_exec.is_empty(), "pacing defers; nothing is shed");
+        assert_eq!(app.exec_next_height, Some(4));
+        assert!(!app.is_exec_failed());
+
+        clear_dispatch_env();
+    }
+
+    /// Memory bound: beyond the Ready-byte budget a parked block is DEMOTED to
+    /// `ExecSource::Compact`, synthesized from the committed block's own action
+    /// hashes (never a proposal cache), and the drain REMATERIALIZES it from
+    /// the durable DA store into a byte-identical block — execution is a pure
+    /// function of block bytes + prior state, so byte-identical dispatch in
+    /// identical order IS byte-identical execution, Ready vs demoted alike.
+    #[test]
+    fn park_demotes_to_compact_beyond_budget_and_roundtrips_byte_identical() {
+        let _guard = env_lock();
+        clear_dispatch_env();
+        std::env::set_var("TORUS_EXEC_NONBLOCKING_DISPATCH", "1");
+        // Budget 0: every Ready park must demote (when locally durable).
+        std::env::set_var("TORUS_DEFERRED_EXEC_READY_BYTES", "0");
+
+        let mut app = TorusApp::stub();
+        let mempool = Arc::new(Mempool::new(
+            app.state_db.clone(),
+            torus_mempool::MempoolConfig::default(),
+        ));
+        app.mempool = Some(mempool.clone());
+        let rx = swap_exec_channel(&mut app, 1);
+
+        let base = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let b1 = block(1, vec![signed(21, base)]);
+        let b2 = block(2, vec![signed(22, base + 1), signed(23, base + 2)]);
+        let b3 = block(3, vec![signed(24, base + 3)]);
+
+        // The committed bodies are locally durable (S459: mirrored pre-vote on
+        // every real path) — the precondition demotion checks before it drops
+        // the in-memory copy.
+        mempool
+            .mirror_native_to_da(&b2.native_actions)
+            .expect("durable DA mirror");
+        mempool
+            .mirror_native_to_da(&b3.native_actions)
+            .expect("durable DA mirror");
+
+        app.enqueue_for_execution(1, ExecSource::Ready(b1), vec![]);
+        app.enqueue_for_execution(2, ExecSource::Ready(b2.clone()), vec![]);
+        app.enqueue_for_execution(3, ExecSource::Ready(b3.clone()), vec![]);
+
+        // Both parked heights demoted: hashes only, taken from the committed
+        // blocks' own actions.
+        for (h, original) in [(2u64, &b2), (3u64, &b3)] {
+            let expected: Vec<B256> = original
+                .native_actions
+                .iter()
+                .map(torus_types::compute_action_hash)
+                .collect();
+            match &app.deferred_exec.get(&h).expect("parked").source {
+                ExecSource::Compact(c) => assert_eq!(
+                    c.native_action_hashes, expected,
+                    "demotion must reference the committed block's action hashes"
+                ),
+                _ => panic!("height {h} must be DEMOTED to Compact beyond the byte budget"),
+            }
+        }
+
+        // Drain and compare bytes end-to-end.
+        assert_eq!(rx.try_recv().unwrap().torus_block.header.height, 1);
+        app.on_reconcile_tick();
+        let got2 = rx.try_recv().expect("h2 rematerialized + sent").torus_block;
+        assert_eq!(
+            bincode::serialize(&got2).unwrap(),
+            bincode::serialize(&b2).unwrap(),
+            "Compact demotion must round-trip the block BYTE-IDENTICAL"
+        );
+        app.on_reconcile_tick();
+        let got3 = rx.try_recv().expect("h3 rematerialized + sent").torus_block;
+        assert_eq!(
+            bincode::serialize(&got3).unwrap(),
+            bincode::serialize(&b3).unwrap()
+        );
+        assert!(app.deferred_exec.is_empty());
+        assert!(app.exec_hole_since.is_none(), "no heal budget burned");
+
+        clear_dispatch_env();
+    }
+
+    /// Demotion is fail-safe: a block whose bodies are NOT locally durable is
+    /// parked as Ready even over budget (never traded for an un-rematerializable
+    /// reference), and still drains byte-identical.
+    #[test]
+    fn demotion_skips_blocks_whose_bodies_are_not_locally_durable() {
+        let _guard = env_lock();
+        clear_dispatch_env();
+        std::env::set_var("TORUS_EXEC_NONBLOCKING_DISPATCH", "1");
+        std::env::set_var("TORUS_DEFERRED_EXEC_READY_BYTES", "0");
+
+        let mut app = TorusApp::stub();
+        let mempool = Arc::new(Mempool::new(
+            app.state_db.clone(),
+            torus_mempool::MempoolConfig::default(),
+        ));
+        app.mempool = Some(mempool);
+        let rx = swap_exec_channel(&mut app, 1);
+
+        let base = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let b1 = block(1, vec![]);
+        // Bodies deliberately NOT mirrored to the DA store.
+        let b2 = block(2, vec![signed(31, base)]);
+
+        app.enqueue_for_execution(1, ExecSource::Ready(b1), vec![]);
+        app.enqueue_for_execution(2, ExecSource::Ready(b2.clone()), vec![]);
+
+        assert!(
+            matches!(
+                app.deferred_exec.get(&2).expect("parked").source,
+                ExecSource::Ready(_)
+            ),
+            "a body set that is not locally durable must stay parked READY"
+        );
+
+        assert_eq!(rx.try_recv().unwrap().torus_block.header.height, 1);
+        app.on_reconcile_tick();
+        let got2 = rx.try_recv().expect("h2 drains from the Ready park").torus_block;
+        assert_eq!(
+            bincode::serialize(&got2).unwrap(),
+            bincode::serialize(&b2).unwrap()
+        );
+        assert!(app.exec_hole_since.is_none());
+
+        clear_dispatch_env();
+    }
+
+    /// T1.5 fail-stop must latch VERBATIM in both dispatch modes when the
+    /// execution thread is gone (channel disconnected): the node halts, it
+    /// never parks a block for a dead pipeline.
+    #[test]
+    fn exec_dead_fail_stop_latches_in_both_dispatch_modes() {
+        let _guard = env_lock();
+        for enable in [false, true] {
+            clear_dispatch_env();
+            if enable {
+                std::env::set_var("TORUS_EXEC_NONBLOCKING_DISPATCH", "1");
+            }
+
+            let mut app = TorusApp::stub();
+            let rx = swap_exec_channel(&mut app, 1);
+            drop(rx); // execution thread "dead": receiver gone
+
+            app.enqueue_for_execution(1, ExecSource::Ready(block(1, vec![])), vec![]);
+            assert!(
+                app.is_exec_failed(),
+                "disconnected exec channel must latch the fail-stop (mode enable={enable})"
+            );
+            assert!(
+                app.deferred_exec.is_empty(),
+                "a dead pipeline must fail-stop, never park (mode enable={enable})"
+            );
+        }
+        clear_dispatch_env();
+    }
+
+    /// With the flag OFF the reconcile tick must be a strict no-op — today's
+    /// hole-retry cadence (drain rides on commits only) is preserved
+    /// bit-identically.
+    #[test]
+    fn reconcile_tick_is_inert_when_flag_off() {
+        let _guard = env_lock();
+        clear_dispatch_env();
+
+        let mut app = TorusApp::stub();
+        app.exec_next_height = Some(1);
+        app.deferred_exec.insert(
+            1,
+            DeferredExecBlock {
+                source: ExecSource::Durable(1),
+                slashes: Vec::new(),
+                ready_bytes: 0,
+            },
+        );
+
+        app.on_reconcile_tick();
+
+        assert!(
+            app.deferred_exec.contains_key(&1),
+            "flag off: the tick must not drain"
+        );
+        assert!(
+            app.exec_hole_since.is_none() && app.exec_hole_retries == 0,
+            "flag off: the tick must not touch hole accounting"
+        );
+
+        clear_dispatch_env();
+    }
+
+    /// Bit-identical rollback pin: with the env UNSET the dispatch send still
+    /// BLOCKS on a full channel (today's semantics, no park), and completes
+    /// once the channel frees.
+    #[test]
+    fn blocking_mode_unchanged_when_env_unset() {
+        let _guard = env_lock();
+        clear_dispatch_env();
+
+        let mut app = TorusApp::stub();
+        let rx = swap_exec_channel(&mut app, 1);
+
+        app.enqueue_for_execution(1, ExecSource::Ready(block(1, vec![])), vec![]);
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let b2 = block(2, vec![]);
+        std::thread::spawn(move || {
+            app.enqueue_for_execution(2, ExecSource::Ready(b2), vec![]);
+            let _ = done_tx.send(app);
+        });
+
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "env unset: the dispatch send must still BLOCK on a full channel (bit-identical rollback)"
+        );
+
+        // Free a slot: the blocked send completes, nothing was parked.
+        assert_eq!(rx.recv().unwrap().torus_block.header.height, 1);
+        let app = done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("blocked send completes once the channel frees");
+        assert_eq!(rx.recv().unwrap().torus_block.header.height, 2);
+        assert!(app.deferred_exec.is_empty());
+        assert_eq!(app.exec_next_height, Some(3));
     }
 }
 
@@ -4455,11 +5602,19 @@ mod crash_recovery_tests {
         app.exec_hole_since = Some(std::time::Instant::now());
         app.deferred_exec.insert(
             5,
-            DeferredExecBlock { source: ExecSource::Durable(5), slashes: Vec::new() },
+            DeferredExecBlock {
+                source: ExecSource::Durable(5),
+                slashes: Vec::new(),
+                ready_bytes: 0,
+            },
         );
         app.deferred_exec.insert(
             6,
-            DeferredExecBlock { source: ExecSource::Durable(6), slashes: Vec::new() },
+            DeferredExecBlock {
+                source: ExecSource::Durable(6),
+                slashes: Vec::new(),
+                ready_bytes: 0,
+            },
         );
 
         // Drain with both bodies missing: nothing executes, frontier stays at the hole.
@@ -4500,7 +5655,11 @@ mod crash_recovery_tests {
         app.exec_hole_since = Some(std::time::Instant::now());
         app.deferred_exec.insert(
             5,
-            DeferredExecBlock { source: ExecSource::Durable(5), slashes: Vec::new() },
+            DeferredExecBlock {
+                source: ExecSource::Durable(5),
+                slashes: Vec::new(),
+                ready_bytes: 0,
+            },
         );
 
         app.drain_exec_queue();
@@ -4635,6 +5794,7 @@ mod crash_recovery_tests {
             DeferredExecBlock {
                 source: ExecSource::Compact(CompactBlock::from_block(&b5)),
                 slashes: Vec::new(),
+                ready_bytes: 0,
             },
         );
         app.deferred_exec.insert(
@@ -4642,6 +5802,7 @@ mod crash_recovery_tests {
             DeferredExecBlock {
                 source: ExecSource::Compact(CompactBlock::from_block(&b6)),
                 slashes: Vec::new(),
+                ready_bytes: 0,
             },
         );
 
@@ -5521,6 +6682,7 @@ mod crash_recovery_tests {
             // keeping these tests' reads deterministic right after execution.
             trade_writer: None,
             exec_failed: Arc::new(AtomicBool::new(false)),
+            exec_queue_len: Arc::new(AtomicU64::new(0)),
         }
     }
 
