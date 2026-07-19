@@ -4308,6 +4308,37 @@ mod exec_throttle_tests {
                 orders_cap: NATIVE_ORDERS_PER_BATCH_CAP
             }
         );
+        // Package D rank 3: the pacing scaler carries NO hardcoded 100 — it must
+        // scale a RAISED base action cap (e.g. 400 from
+        // `TORUS_NATIVE_TOTAL_BLOCK_CAP=400`) proportionally, so cap 400 stays
+        // reachable at tier 0 and paces cleanly under backlog.
+        assert_eq!(
+            paced_selection_caps(0, 400, 6_000_000, 50_000),
+            PacedSelectionCaps::Select {
+                action_cap: 400,
+                bytes_cap: 6_000_000,
+                orders_cap: 50_000
+            },
+            "tier 0 hands a raised base cap through untouched — 400 is reachable"
+        );
+        assert_eq!(
+            paced_selection_caps(1, 400, 6_000_000, 50_000),
+            PacedSelectionCaps::Select {
+                action_cap: 200,
+                bytes_cap: 3_000_000,
+                orders_cap: 25_000
+            },
+            "tier 1 halves the raised base cap (200), not a fixed 50"
+        );
+        assert_eq!(
+            paced_selection_caps(2, 400, 6_000_000, 50_000),
+            PacedSelectionCaps::Select {
+                action_cap: 100,
+                bytes_cap: 1_500_000,
+                orders_cap: 12_500
+            },
+            "tier 2 quarters the raised base cap (100), not a fixed 25"
+        );
     }
 
     fn signed_action(seed_byte: u8, nonce: u64, action: NativeAction) -> torus_types::SignedNativeAction {

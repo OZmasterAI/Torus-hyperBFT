@@ -572,6 +572,44 @@ mod tests {
         assert_eq!(pool.size(), 2);
     }
 
+    /// Package D rank 3: a block genuinely carries MORE than 100 native actions
+    /// when the selection `limit` is raised above the historical 100 cap. The
+    /// `limit` argument is the ONLY per-block-count gate in the selection path
+    /// (proposer passes `native_total_block_cap()` here); nothing downstream
+    /// silently re-clamps to ~100. Uses enough distinct senders that the
+    /// per-sender cap (`max_per_block`, 64) never binds before the total limit.
+    #[test]
+    fn selection_carries_more_than_100_actions_when_limit_raised() {
+        // 10 senders * 40 distinct-nonce actions = 400 pooled entries; each
+        // sender stays under the 64 per-sender-per-block cap.
+        let mut pool = NativePool::new(4096, 512, 64);
+        for s in 0..10u8 {
+            let sender = Address::repeat_byte(s + 1);
+            for n in 0..40u64 {
+                let nonce = 1_000_000 + s as u64 * 1000 + n;
+                pool.insert(sender, make_action(nonce, NativeAction::ClaimRewards))
+                    .unwrap();
+            }
+        }
+        assert_eq!(pool.size(), 400);
+
+        // Historical cap: exactly 100 selected — the old ceiling.
+        let capped =
+            pool.select_for_block_with_senders_excluding(100, &HashSet::new(), usize::MAX, usize::MAX);
+        assert_eq!(capped.len(), 100, "limit=100 reproduces today's ceiling");
+
+        // Raised cap: the block carries all 400 — proof the limit is the sole
+        // count gate and 400 is reachable end-to-end in selection.
+        let raised =
+            pool.select_for_block_with_senders_excluding(400, &HashSet::new(), usize::MAX, usize::MAX);
+        assert_eq!(raised.len(), 400, "limit=400 genuinely selects >100 actions");
+
+        // A limit between the two resolves exactly, no hidden clamp near 100.
+        let mid =
+            pool.select_for_block_with_senders_excluding(250, &HashSet::new(), usize::MAX, usize::MAX);
+        assert_eq!(mid.len(), 250);
+    }
+
     /// T2.3 (RED-first: `select_for_block*` previously took `&mut self` for a
     /// full re-sort + `hash_index` rebuild, so this did not compile): the
     /// selection order is maintained incrementally, selection is read-only

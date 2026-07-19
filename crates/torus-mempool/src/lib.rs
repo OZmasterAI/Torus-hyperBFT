@@ -85,7 +85,7 @@ impl Default for MempoolConfig {
             native_per_block_cap: rate_limit::native_per_block_cap(),
             native_pool_max_size: rate_limit::NATIVE_POOL_MAX_SIZE,
             native_per_sender_cap: rate_limit::NATIVE_PER_SENDER_CAP,
-            verified_sender_cache_cap: rate_limit::VERIFIED_SENDER_CACHE_CAP,
+            verified_sender_cache_cap: rate_limit::verified_sender_cache_cap(),
             max_memory_bytes: 64 * 1024 * 1024, // 64 MB default
         }
     }
