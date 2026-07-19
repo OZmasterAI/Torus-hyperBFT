@@ -9,6 +9,35 @@ Raw per-leg data: `testnet/p3-testnet/results/<label>/{summary.json,sampler.csv,
 
 ---
 
+> ## ⚠️ VERIFICATION STATUS (added 2026-07-19)
+> **The match-flow numbers below are NOT reproducible from the raw leg data in
+> `results/`, and two directional claims invert against it.** Treat them as
+> unverified pending the coordinator's (c18) raw data.
+>
+> | leg | this doc says | raw `summary.json` says |
+> |---|---|---|
+> | deep-book 0.5 | 2,054 matched/s, ~1 s blocks | **811.5** matched/s, **0.48 blk/s** |
+> | deep-book 0.4 | 1,676 matched/s, ~1 s blocks | **896.6** matched/s, 4.99 blk/s |
+> | topn 0.5 | 421 matched/s, ~6.6 s blocks | **259.5** matched/s, **2.31 blk/s** |
+>
+> 2,054 / 1,676 / 421 appear in no `sustained` or `peak` field of any local
+> summary. Two claims invert: this doc has deep-book **0.5 > 0.4** (raw: 0.4 >
+> 0.5), and topn blocks **6× slower** (raw: topn committed ~5× *faster*).
+>
+> What survives: the topn matched/s regression is real but ~3.1×, not 5×; the
+> 0.25 leg is genuinely all-zeros (wedge); there is genuinely no p3 match leg.
+>
+> **Caveat:** the coordinator was c18 and these local dirs are `val2solo`-labelled,
+> so the doc's numbers may derive from c18 data not present in this repo. This is
+> a *reproducibility* flag, not a claim that the doc is wrong.
+>
+> **Also:** `finding #3` (topn = block-body DA regression) is likely
+> **misattributed**. `feat/precompile-0800-topn-gas` is a *descendant* of
+> `perf/deep-book-storage`, and devnet measurement shows its exec profile is
+> identical to deep-book's (dirty keys 2,757 vs 2,778; flush 235 vs 238 ms). Its
+> slowdown is inherited from deep-book's per-order-row trie cost, not from the
+> 0x0800 precompile work. See `devnet-ladder/` for the harness and method.
+
 ## TL;DR
 
 - **Fill throughput is network-bound, not compute-bound.** The match engine never reached its raw ceiling; the **dissemination layer** (gossip + block-body DA) capped it first.
