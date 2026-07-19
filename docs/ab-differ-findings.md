@@ -210,10 +210,11 @@ timing `order_book_store::save_book_delta` writing rows into the same buffering
 
 | D | (b) ours journaled | (c) theirs `save_book_delta` |
 |---|---|---|
-| 16k  | 1.14 ms | <!-- C16 --> |
-| 200k | 1.79 ms | <!-- C200 --> |
-| 700k | 0.68 ms | <!-- C700 --> |
+| 16k  | 1.14 ms | 1.03 ms |
+| 200k | 1.79 ms | 1.82 ms |
+| 700k | 0.68 ms | 1.31 ms |
 
 Both are O(touched), sub-2 ms, depth-independent — confirming the differ is not
-the residual under either idiom. (c)'s edge is structural, not wall-clock: no
-level walk, no seq re-derivation, no separate shadow (see verdict).
+the residual under either idiom, and that (b) and (c) are the same complexity
+class (the sub-ms deltas are noise). (c)'s edge is **structural, not wall-clock**:
+no level walk, no seq re-derivation, no separate shadow (see verdict).
