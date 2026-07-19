@@ -31,6 +31,51 @@ pub(crate) const SUBMIT_QUEUE_TIMEOUT: std::time::Duration = std::time::Duration
 /// admits: ~100 ecrecovers ≈ 5–10ms on the blocking pool.
 pub(crate) const SUBMIT_BATCH_MAX: usize = 100;
 
+/// Default jsonrpsee max response body size, in MiB. Matches jsonrpsee 0.26's
+/// implicit default (`TEN_MB_SIZE_BYTES = 10 * 1024 * 1024`) so a node with no
+/// `TORUS_RPC_MAX_RESPONSE_MB` set behaves byte-for-byte as before. The full-
+/// est blocks (`torus_getBlockBody`) can exceed 10 MiB and get silently dropped,
+/// under-reporting throughput exactly when it matters most (#40) — a bench sets
+/// this higher explicitly via the env var below.
+pub(crate) const DEFAULT_MAX_RESPONSE_MB: u32 = 10;
+
+/// Default jsonrpsee `max_connections`. Today's hardcoded value (64) — a low cap
+/// both throttles ingress and starves the bench monitor's connections
+/// (measurement blind spot, #41). Overridable via `TORUS_RPC_MAX_CONNS`.
+pub(crate) const DEFAULT_MAX_CONNECTIONS: u32 = 64;
+
+/// Env var: max jsonrpsee response body size in MiB (#40).
+pub(crate) const ENV_MAX_RESPONSE_MB: &str = "TORUS_RPC_MAX_RESPONSE_MB";
+/// Env var: max concurrent jsonrpsee connections (#41).
+pub(crate) const ENV_MAX_CONNS: &str = "TORUS_RPC_MAX_CONNS";
+
+/// Resolve the jsonrpsee max response body size (bytes) from a raw env value.
+/// Pure (takes the raw string, not the process env) so it is unit-testable
+/// without env races. Empty / unset / unparsable / zero all fall back to the
+/// exact-today default (10 MiB). A configured MiB value is saturating-multiplied
+/// into bytes and clamped to `u32::MAX` (the jsonrpsee field width).
+pub(crate) fn resolve_max_response_bytes(raw: Option<&str>) -> u32 {
+    match raw.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) => match s.parse::<u32>() {
+            Ok(mb) if mb > 0 => mb.saturating_mul(1024 * 1024),
+            _ => DEFAULT_MAX_RESPONSE_MB.saturating_mul(1024 * 1024),
+        },
+        None => DEFAULT_MAX_RESPONSE_MB.saturating_mul(1024 * 1024),
+    }
+}
+
+/// Resolve jsonrpsee `max_connections` from a raw env value. Pure/testable;
+/// empty / unset / unparsable / zero fall back to the exact-today default (64).
+pub(crate) fn resolve_max_connections(raw: Option<&str>) -> u32 {
+    match raw.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) => match s.parse::<u32>() {
+            Ok(n) if n > 0 => n,
+            _ => DEFAULT_MAX_CONNECTIONS,
+        },
+        None => DEFAULT_MAX_CONNECTIONS,
+    }
+}
+
 /// Acquire a submission permit, waiting at most [`SUBMIT_QUEUE_TIMEOUT`].
 /// `None` ⇒ saturated past the queue bound (caller returns "overloaded").
 pub(crate) async fn acquire_submit_permit(
@@ -268,8 +313,16 @@ impl RpcServer {
             metrics: self.state.metrics.clone(),
         };
         let rpc_middleware = rpc_mw::RpcServiceBuilder::new().layer(layer);
+        // #40/#41: response-size and connection caps are env-configurable, both
+        // defaulting to today's values (10 MiB / 64) so an unset environment is
+        // byte-for-byte identical to the hardcoded config it replaces.
+        let max_response_bytes =
+            resolve_max_response_bytes(std::env::var(ENV_MAX_RESPONSE_MB).ok().as_deref());
+        let max_connections =
+            resolve_max_connections(std::env::var(ENV_MAX_CONNS).ok().as_deref());
         let server_cfg = jsonrpsee::server::ServerConfig::builder()
-            .max_connections(64)
+            .max_connections(max_connections)
+            .max_response_body_size(max_response_bytes)
             .build();
         let server = ServerBuilder::with_config(server_cfg)
             .set_rpc_middleware(rpc_middleware)
@@ -490,6 +543,61 @@ pub fn scan_trades_for_block(state: &StateDb, block_height: u64) -> Vec<serde_js
     }
 
     trades
+}
+
+#[cfg(test)]
+mod rpc_limit_env_tests {
+    use super::*;
+
+    const TEN_MIB: u32 = 10 * 1024 * 1024;
+
+    #[test]
+    fn max_response_unset_is_todays_10_mib_default() {
+        // Unset / empty / whitespace all resolve to jsonrpsee's implicit 10 MiB,
+        // so an env-free node is byte-for-byte identical to before (#40).
+        assert_eq!(resolve_max_response_bytes(None), TEN_MIB);
+        assert_eq!(resolve_max_response_bytes(Some("")), TEN_MIB);
+        assert_eq!(resolve_max_response_bytes(Some("   ")), TEN_MIB);
+        assert_eq!(TEN_MIB, DEFAULT_MAX_RESPONSE_MB * 1024 * 1024);
+    }
+
+    #[test]
+    fn max_response_parses_mib_to_bytes() {
+        assert_eq!(resolve_max_response_bytes(Some("64")), 64 * 1024 * 1024);
+        assert_eq!(resolve_max_response_bytes(Some(" 128 ")), 128 * 1024 * 1024);
+        assert_eq!(resolve_max_response_bytes(Some("1")), 1024 * 1024);
+    }
+
+    #[test]
+    fn max_response_bad_or_zero_falls_back_to_default() {
+        assert_eq!(resolve_max_response_bytes(Some("0")), TEN_MIB);
+        assert_eq!(resolve_max_response_bytes(Some("abc")), TEN_MIB);
+        assert_eq!(resolve_max_response_bytes(Some("-5")), TEN_MIB);
+    }
+
+    #[test]
+    fn max_response_saturates_instead_of_overflowing() {
+        // MiB values that would overflow u32 bytes clamp to u32::MAX rather than
+        // panicking or wrapping.
+        assert_eq!(resolve_max_response_bytes(Some("100000")), u32::MAX);
+    }
+
+    #[test]
+    fn max_connections_unset_is_todays_64_default() {
+        assert_eq!(resolve_max_connections(None), 64);
+        assert_eq!(resolve_max_connections(Some("")), 64);
+        assert_eq!(resolve_max_connections(Some("  ")), 64);
+        assert_eq!(DEFAULT_MAX_CONNECTIONS, 64);
+    }
+
+    #[test]
+    fn max_connections_parses_and_rejects_bad_values() {
+        assert_eq!(resolve_max_connections(Some("256")), 256);
+        assert_eq!(resolve_max_connections(Some(" 1024 ")), 1024);
+        // Zero / garbage fall back to the default rather than disabling ingress.
+        assert_eq!(resolve_max_connections(Some("0")), 64);
+        assert_eq!(resolve_max_connections(Some("xyz")), 64);
+    }
 }
 
 #[cfg(test)]
