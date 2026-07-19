@@ -2030,9 +2030,14 @@ mod tests {
         }
         assert_eq!(chosen.len(), target, "need {target} distinct buckets");
 
-        // Warm a member cache for those buckets (and commit, so the mirror + cache
-        // agree). Big budget => no eviction.
-        let mut warm = NativeMemberCache::with_budget(512 * 1024 * 1024);
+        // Warm a trie node cache + member cache for those buckets (and commit, so
+        // the persisted trie/mirror and both images agree). Big budgets => no
+        // eviction. The trie cache turns the depth-16 sibling fold into RAM reads;
+        // the member cache turns the mirror scan into a RAM hit — the two per-bucket
+        // terms round-3 attacks. Measured WITHOUT them, the uncached DB fold
+        // (~depth-16 point reads / changed leaf) dominates and masks both.
+        let mut warm_trie = NativeTrieCache::default();
+        let mut warm_member = NativeMemberCache::with_budget(512 * 1024 * 1024);
         let d0: BTreeMap<(u8, Vec<u8>), Option<Vec<u8>>> = chosen
             .iter()
             .map(|(t, k)| ((*t, k.clone()), Some(vec![0xC0; 40])))
@@ -2041,40 +2046,76 @@ mod tests {
             let (cf, _) = NATIVE_ROOT_CFS[*t as usize];
             db.put_cf_raw(cf, k, v.as_ref().unwrap()).unwrap();
         }
-        commit_native_trie_incremental_full(&db, &d0, None, Some(&mut warm), 1).unwrap();
+        commit_native_trie_incremental_full(
+            &db,
+            &d0,
+            Some(&mut warm_trie),
+            Some(&mut warm_member),
+            1,
+        )
+        .unwrap();
 
         // Measured dirty set: same buckets, new values (real rehash). NOT committed
-        // — timing only reads + builds a throwaway batch, so it is repeatable.
+        // — timing only reads + builds a throwaway batch, so it is repeatable and
+        // the warm images stay warm across reps.
         let d1: BTreeMap<(u8, Vec<u8>), Option<Vec<u8>>> = chosen
             .iter()
             .map(|(t, k)| ((*t, k.clone()), Some(vec![0xD1; 44])))
             .collect();
         let nb = dirty_bucket_count(&d1);
 
-        let bench = |label: &str, mut member: Option<&mut NativeMemberCache>, parallel: usize| -> f64 {
+        let bench = |label: &str,
+                     mut trie: Option<&mut NativeTrieCache>,
+                     mut member: Option<&mut NativeMemberCache>,
+                     parallel: usize|
+         -> f64 {
             let mut best = f64::INFINITY;
             for _ in 0..6 {
                 let mut batch = WriteBatch::default();
                 let t = Instant::now();
-                apply_native_dirty(&db, &mut batch, &d1, None, member.as_deref_mut(), parallel)
-                    .unwrap();
+                apply_native_dirty(
+                    &db,
+                    &mut batch,
+                    &d1,
+                    trie.as_deref_mut(),
+                    member.as_deref_mut(),
+                    parallel,
+                )
+                .unwrap();
                 best = best.min(t.elapsed().as_secs_f64());
             }
             let per_us = best / nb as f64 * 1e6;
-            println!("PERF {label:26} total={best:.4}s  per_bucket={per_us:.3}us");
+            println!("PERF {label:30} total={best:.4}s  per_bucket={per_us:.3}us");
             per_us
         };
 
         println!("PERF dirty_buckets={nb}");
-        let a = bench("serial_scan", None, 1);
-        let b = bench("parallel8_scan", None, 8);
-        let c = bench("serial_membercache", Some(&mut warm), 1);
-        let d = bench("parallel8_membercache", Some(&mut warm), 8);
-        println!(
-            "PERF summary  parallel_speedup={:.2}x  member_scan_elim_serial={:.2}x  full_stack_vs_serial={:.2}x",
-            a / b,
-            a / c,
-            a / d
+        // Uncached DB fold (round-1 baseline): the tree fold's DB point reads swamp
+        // the per-bucket scan+hash term.
+        let a = bench("serial_uncachedfold_scan", None, None, 1);
+        let b = bench("parallel8_uncachedfold_scan", None, None, 8);
+        // Trie cache on (round-2 baseline = production recommended): fold from RAM,
+        // so the residual per-bucket cost is scan + keccak — exactly round-3's target.
+        let c = bench("serial_triecache_scan", Some(&mut warm_trie), None, 1);
+        let d = bench("parallel8_triecache_scan", Some(&mut warm_trie), None, 8);
+        let e = bench(
+            "serial_triecache_membercache",
+            Some(&mut warm_trie),
+            Some(&mut warm_member),
+            1,
         );
+        let f = bench(
+            "parallel8_triecache_membercache",
+            Some(&mut warm_trie),
+            Some(&mut warm_member),
+            8,
+        );
+        println!("PERF summary (round-1 baseline = serial_uncachedfold_scan):");
+        println!("PERF   parallel_on_uncachedfold   {a:.1}->{b:.1}us  = {:.2}x", a / b);
+        println!("PERF   triecache_fold_elim         {a:.1}->{c:.1}us  = {:.2}x", a / c);
+        println!("PERF (round-2 baseline = serial_triecache_scan; isolates round-3's per-bucket term):");
+        println!("PERF   parallel_on_triecache       {c:.1}->{d:.1}us  = {:.2}x", c / d);
+        println!("PERF   membercache_scan_elim        {c:.1}->{e:.1}us  = {:.2}x", c / e);
+        println!("PERF   full_stack (par8+member)     {c:.1}->{f:.1}us  = {:.2}x", c / f);
     }
 }
