@@ -15,7 +15,7 @@ use torus_core::lockbox::{fp_to_u256, u256_to_fp, Lockbox};
 use torus_core::margin::{effective_max_leverage, MarketMarginConfig};
 use torus_core::oracle::{OracleConfig, OracleManager};
 use torus_core::order_book::{OrderBook, OrderStatus, PlaceResult};
-use torus_core::position::{MarginType, NativeBalance, PositionManager};
+use torus_core::position::{MarginType, NativeBalance, PositionCache, PositionManager};
 use torus_core::precompiles::{CoreWriterQueue, QueuedAction, QueuedActionKind};
 use torus_economics::epoch::ValidatorSetDiff;
 use torus_economics::{
@@ -94,14 +94,17 @@ pub struct EpochBoundaryResult {
 /// the overlay once (≈N PUTs), while first-read misses fall through to the overlay.
 ///
 /// Coherence (the overlay must be authoritative at every point some *other* reader could
-/// observe it): the only in-call reader that bypasses this cache is Phase 4 `apply_fill`,
-/// which credits realized PnL straight to the overlay. Before each `apply_fill`, the
-/// trader's pending balance is flushed and evicted (`flush_and_evict`) so `apply_fill`
-/// reads the post-release balance and the later `flush_all` cannot clobber the credit.
-/// `flush_all` runs at the end of the call, so the *next* `execute_batch` call and all
-/// post-batch consumers (`drain_core_writer`, `save_order_books`, block-end flush) see a
-/// fully materialized overlay. Flush order is over distinct per-sender keys, so it is
-/// state-independent of iteration order; the map is otherwise never iterated.
+/// observe it): NO in-call reader bypasses this cache (C1). Historically Phase 4
+/// `apply_fill` credited realized PnL straight to the overlay, which forced a
+/// flush-and-evict of both parties' balances before every fill; settlement now uses
+/// `apply_fill_cached`, which never touches balances — it RETURNS the PnL event and the
+/// executor credits it through this cache, keeping it the single balance authority for
+/// the whole call (and killing 2 overlay round-trips per fill). Position rows get the
+/// same treatment via `PositionCache`. `flush_all` runs at the end of the call, so the
+/// *next* `execute_batch` call and all post-batch consumers (`drain_core_writer`,
+/// `save_order_books`, block-end flush) see a fully materialized overlay. Flush order is
+/// over distinct per-sender keys, so it is state-independent of iteration order; the map
+/// is otherwise never iterated.
 struct BalanceCache {
     map: HashMap<Address, NativeBalance>,
     dirty: std::collections::HashSet<Address>,
@@ -135,22 +138,6 @@ impl BalanceCache {
         self.dirty.insert(*addr);
     }
 
-    /// Flush a trader's pending balance to the overlay (if dirty) and evict it, handing
-    /// authority back to the overlay. Called before `apply_fill` credits that trader
-    /// directly, so the credit lands on the post-release balance and survives `flush_all`.
-    fn flush_and_evict<T: StateBackend>(
-        &mut self,
-        positions: &PositionManager<T>,
-        addr: &Address,
-    ) -> Result<(), CoreError> {
-        if let Some(bal) = self.map.remove(addr) {
-            if self.dirty.remove(addr) {
-                positions.put_native_balance(addr, &bal)?;
-            }
-        }
-        Ok(())
-    }
-
     /// Flush every pending dirty balance to the overlay (end of the `execute_batch` call).
     /// Keys are distinct per sender, so final overlay state is independent of flush order;
     /// sorted anyway to keep the write sequence deterministic.
@@ -167,6 +154,451 @@ impl BalanceCache {
         }
         self.dirty.clear();
         Ok(())
+    }
+}
+
+// ============================================================================
+// C3 — deterministic parallel Phase-4 settlement: plumbing types
+// ============================================================================
+
+/// C2/C3: one Phase-2-prepared PlaceOrder flowing through matching (Phase 3)
+/// and settlement (Phase 4). `params` borrows the caller's committed action
+/// slice — no per-order deep clone anywhere in the pipeline.
+struct PreparedOrder<'a> {
+    index: usize,
+    sender: Address,
+    params: &'a PlaceOrderParams,
+    order_id: u128,
+    margin_reserved: FixedPoint,
+}
+
+/// One fill's trade-history rows — exactly the bytes `persist_trade` has
+/// always written to `CF_NATIVE_TRADES` (primary) and `CF_NATIVE_USER_TRADES`
+/// (maker + taker secondary index). C3: settle workers byte-build these
+/// off-thread with a PROVISIONAL trade index; the single-threaded apply pass
+/// stamps the definitive per-block index (`stamp_trade_index`) in canonical
+/// settlement order before routing, so the persisted key sequence is
+/// byte-identical to the sequential path's inline `persist_trade` calls.
+struct TradeKvs {
+    trade_key: [u8; 20],
+    trade_data: Vec<u8>,
+    maker_key: [u8; 32],
+    maker_data: Vec<u8>,
+    taker_key: [u8; 32],
+    taker_data: Vec<u8>,
+}
+
+impl TradeKvs {
+    /// Byte-identical to the classic inline `persist_trade` construction.
+    fn build(
+        market_id: MarketId,
+        block_height: u64,
+        timestamp: u64,
+        trade_index: u32,
+        fill: &torus_core::order_book::Fill,
+    ) -> Self {
+        let taker_side: u8 = if fill.maker_side == Side::Buy { 1 } else { 0 };
+
+        // Primary key: market_id(8) + block_number(8) + trade_index(4)
+        let mut trade_key = [0u8; 20];
+        trade_key[..8].copy_from_slice(&market_id.to_be_bytes());
+        trade_key[8..16].copy_from_slice(&block_height.to_be_bytes());
+        trade_key[16..20].copy_from_slice(&trade_index.to_be_bytes());
+
+        let trade_id = trade_index as u128;
+        let price_raw = fill.price.raw();
+        let quantity_raw = fill.quantity.raw();
+
+        // Borsh-serialize trade data (matches StoredTrade layout).
+        // 16+16+16+1+8+8 = 65 bytes exactly (the classic with_capacity(64)
+        // paid one realloc per fill).
+        let mut trade_data = Vec::with_capacity(65);
+        trade_data.extend_from_slice(&trade_id.to_le_bytes());
+        trade_data.extend_from_slice(&price_raw.to_le_bytes());
+        trade_data.extend_from_slice(&quantity_raw.to_le_bytes());
+        trade_data.push(taker_side);
+        trade_data.extend_from_slice(&block_height.to_le_bytes());
+        trade_data.extend_from_slice(&timestamp.to_le_bytes());
+
+        // Secondary index: per-user trades (descending block order).
+        // 16+8+16+16+1+1+8+8 = 74 bytes exactly.
+        let desc_block = u64::MAX - block_height;
+        let mut maker_data = Vec::with_capacity(74);
+        maker_data.extend_from_slice(&trade_id.to_le_bytes());
+        maker_data.extend_from_slice(&market_id.to_le_bytes());
+        maker_data.extend_from_slice(&price_raw.to_le_bytes());
+        maker_data.extend_from_slice(&quantity_raw.to_le_bytes());
+        maker_data.push(taker_side);
+        maker_data.push(0u8); // role: maker
+        maker_data.extend_from_slice(&block_height.to_le_bytes());
+        maker_data.extend_from_slice(&timestamp.to_le_bytes());
+
+        let mut maker_key = [0u8; 32];
+        maker_key[..20].copy_from_slice(fill.maker.as_slice());
+        maker_key[20..28].copy_from_slice(&desc_block.to_be_bytes());
+        maker_key[28..32].copy_from_slice(&trade_index.to_be_bytes());
+
+        // Taker entry (flip role byte at offset 57: 16+8+16+16+1)
+        let mut taker_data = maker_data.clone();
+        taker_data[57] = 1u8; // role: taker
+        let mut taker_key = [0u8; 32];
+        taker_key[..20].copy_from_slice(fill.taker.as_slice());
+        taker_key[20..28].copy_from_slice(&desc_block.to_be_bytes());
+        taker_key[28..32].copy_from_slice(&trade_index.to_be_bytes());
+
+        Self {
+            trade_key,
+            trade_data,
+            maker_key,
+            maker_data,
+            taker_key,
+            taker_data,
+        }
+    }
+
+    /// Stamp the definitive per-block trade index over the provisional one:
+    /// 4-byte BE index in each of the 3 keys, 16-byte LE trade_id at the head
+    /// of each of the 3 values. Offsets are fixed by the layouts in `build`.
+    fn stamp_trade_index(&mut self, idx: u32) {
+        let be = idx.to_be_bytes();
+        let id_le = (idx as u128).to_le_bytes();
+        self.trade_key[16..20].copy_from_slice(&be);
+        self.trade_data[0..16].copy_from_slice(&id_le);
+        self.maker_key[28..32].copy_from_slice(&be);
+        self.maker_data[0..16].copy_from_slice(&id_le);
+        self.taker_key[28..32].copy_from_slice(&be);
+        self.taker_data[0..16].copy_from_slice(&id_le);
+    }
+}
+
+/// C3: everything a settle worker precomputes for ONE prepared order —
+/// aligned index-for-index with the market's `PreparedOrder`s/match results.
+/// All of it is either market-local (position transitions live in the plan's
+/// `PositionCache`) or balance-INDEPENDENT amounts; every cross-market
+/// mutation (balance clamps, trade_index, results) happens later on the apply
+/// thread in canonical order.
+struct OrderSettlePlan {
+    /// Taker-side order-margin release amount (pre-clamp; ZERO = none).
+    margin_release: FixedPoint,
+    /// Realized-PnL events in exact fill-application order: (side label for
+    /// error text, trader, pnl). Emitted precisely when `apply_fill_cached`
+    /// returns `Some` — including `Some(ZERO)` (still materializes the row).
+    pnl_events: Vec<(&'static str, Address, FixedPoint)>,
+    /// First position-side fill-application failure, pre-formatted like the
+    /// sequential path ("taker fill failed: …" / "maker fill failed: …").
+    fill_error: Option<String>,
+    /// Prebuilt trade rows (provisional index), empty when `fill_error`.
+    trades: Vec<TradeKvs>,
+}
+
+/// C3: one market's full settlement plan, computed off-thread by a pure pass
+/// over `(MarketBatchResult, [PreparedOrder])`.
+struct MarketSettlePlan {
+    orders: Vec<OrderSettlePlan>,
+    /// This market's position mutations. Keys are `(trader, market_id)` — the
+    /// per-market key sets are disjoint, so merging into the batch cache in
+    /// sorted market order reproduces the sequential cache exactly.
+    pos_cache: PositionCache,
+    /// A5 maker/STP release amounts, in the deterministic order
+    /// `maker_margin_releases` has always produced.
+    maker_releases: Vec<(Address, FixedPoint)>,
+}
+
+/// C3 runtime toggle: `TORUS_PARALLEL_SETTLE=1` enables the parallel settle
+/// path; anything else (INCLUDING UNSET) keeps today's sequential loop.
+/// Default OFF — unset env is byte-identical to the pre-C3 serial semantics.
+/// Read once per process.
+fn parallel_settle_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        parse_parallel_settle_toggle(std::env::var("TORUS_PARALLEL_SETTLE").ok())
+    })
+}
+
+/// Pure parse of the `TORUS_PARALLEL_SETTLE` value: only `"1"` enables the
+/// parallel path (exact-today default — unset/`"0"`/garbage all mean the
+/// classic sequential settle loop).
+fn parse_parallel_settle_toggle(v: Option<String>) -> bool {
+    matches!(v.as_deref().map(str::trim), Some("1"))
+}
+
+/// C3 auto-mode work gate: parallel settle pays a thread scope + plan handoff,
+/// so the env-driven path engages it only when the batch produced at least
+/// this many fills (across >=2 markets). Explicitly forced modes
+/// (`execute_batch_settle_mode`) bypass the gate — determinism holds at any
+/// size, this is purely a break-even heuristic. Tunable for bench sweeps via
+/// `TORUS_PARALLEL_SETTLE_MIN_FILLS`.
+fn parallel_settle_min_fills() -> usize {
+    static MIN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MIN.get_or_init(|| {
+        std::env::var("TORUS_PARALLEL_SETTLE_MIN_FILLS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(1024)
+    })
+}
+
+/// How the Phase-4 settle path is chosen.
+#[derive(Clone, Copy)]
+enum SettleMode {
+    /// Env toggle + work gate (the live `execute_batch` path).
+    Auto,
+    /// Pinned by the caller (tests / A-B benches): true = parallel whenever
+    /// >=2 markets have work, false = always the sequential loop.
+    Force(bool),
+}
+
+#[cfg(test)]
+mod parallel_settle_toggle_tests {
+    use super::parse_parallel_settle_toggle;
+
+    #[test]
+    fn default_is_off() {
+        assert!(!parse_parallel_settle_toggle(None));
+    }
+
+    #[test]
+    fn one_enables() {
+        assert!(parse_parallel_settle_toggle(Some("1".to_string())));
+        assert!(parse_parallel_settle_toggle(Some(" 1 ".to_string())));
+    }
+
+    #[test]
+    fn anything_else_stays_off() {
+        for v in ["0", "true", "on", "", "yes", "2"] {
+            assert!(!parse_parallel_settle_toggle(Some(v.to_string())), "{v}");
+        }
+    }
+}
+
+// ============================================================================
+// C4 — per-order-row book persistence (`TORUS_BOOK_ROWS`)
+// ============================================================================
+//
+// Classic path (default): each market's ENTIRE `OrderBook` is Borsh-serialized
+// into one `CF_NATIVE_ORDER_BOOKS` row per touched block — O(book depth) bytes
+// serialized AND state-root-hashed per block, the 2GB-RSS / swap driver once
+// books hold >1M resting orders.
+//
+// Row path (`TORUS_BOOK_ROWS=1`): one KV row per resting order / pending stop
+// plus one small meta row per market. Saves write only the rows that changed
+// (new / partially-filled orders, cancels as deletes), so persistence AND
+// state-root work become O(changed orders).
+//
+// ############################ CONSENSUS WARNING ############################
+// `CF_NATIVE_ORDER_BOOKS` is one of the 6 native-state-root CFs. The row
+// layout stores DIFFERENT keys/values than the classic whole-book blob, so
+// THE FLAG CHANGES THE STATE-ROOT FORMAT:
+//   - every validator in a fleet MUST run the same TORUS_BOOK_ROWS value —
+//     a mixed fleet forks at the first block that touches any book;
+//   - enabling (or disabling) the flag on an existing chain REQUIRES a fresh
+//     genesis — there is no migration, and load refuses to start (fail-stop
+//     via ctx.fatal_error) when the CF's on-disk content does not match the
+//     configured mode.
+// Default OFF = byte-identical persistence and state root to today.
+// ###########################################################################
+//
+// Row schema (all integers big-endian, framed for future extension by key tag):
+//   meta  key `market_id(8) ‖ 0x00`            (9 bytes)
+//         val `next_seq(8) ‖ tick_raw(16) ‖ lot_raw(16) ‖ next_id(16) ‖
+//              ltp_tag(1) [‖ ltp_raw(16)]`
+//   order key `market_id(8) ‖ 0x01 ‖ order_id(16)`  (25 bytes)
+//         val `seq(8) ‖ Order borsh`
+//   stop  key `market_id(8) ‖ 0x02 ‖ stop_id(16)`   (25 bytes)
+//         val `StopOrder borsh`
+//
+// `seq` is the queue-priority sequence: within one (side, price) level, FIFO
+// order == ascending seq. Seqs are assigned at save time from the meta row's
+// `next_seq` counter, walking the book in canonical order — a pure function
+// of persisted consensus state and the block's book operations, so every
+// validator assigns identical seqs (they are part of the state root). An
+// order whose persisted seq no longer sorts consistently with its actual
+// queue position (a modify_order that lost time priority and re-entered at
+// the back of a queue with its old id) is detected by a per-level monotonicity
+// walk and re-stamped with a fresh seq.
+//
+// D-rank8 note (resident books): rows support cheap point updates — a fill
+// touches ONE order row, a cancel is ONE delete — so a future resident-book
+// cache can skip the per-block reload/rebuild entirely and drive row writes
+// straight from the op stream. Nothing in this schema assumes the per-block
+// reload below.
+
+/// C4 runtime toggle: `TORUS_BOOK_ROWS=1` enables per-order-row persistence;
+/// anything else (INCLUDING UNSET) keeps the classic whole-book blob —
+/// byte-identical state root to today. Read once per process. See the
+/// consensus warning above: must be fleet-uniform, needs fresh genesis.
+fn book_rows_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| parse_book_rows_toggle(std::env::var("TORUS_BOOK_ROWS").ok()))
+}
+
+/// Pure parse of the `TORUS_BOOK_ROWS` value: only `"1"` enables rows.
+fn parse_book_rows_toggle(v: Option<String>) -> bool {
+    matches!(v.as_deref().map(str::trim), Some("1"))
+}
+
+const BOOK_ROW_META: u8 = 0x00;
+const BOOK_ROW_ORDER: u8 = 0x01;
+const BOOK_ROW_STOP: u8 = 0x02;
+
+fn book_meta_key(market_id: MarketId) -> [u8; 9] {
+    let mut k = [0u8; 9];
+    k[..8].copy_from_slice(&market_id.to_be_bytes());
+    k[8] = BOOK_ROW_META;
+    k
+}
+
+fn book_order_key(market_id: MarketId, order_id: OrderId) -> [u8; 25] {
+    let mut k = [0u8; 25];
+    k[..8].copy_from_slice(&market_id.to_be_bytes());
+    k[8] = BOOK_ROW_ORDER;
+    k[9..].copy_from_slice(&order_id.to_be_bytes());
+    k
+}
+
+fn book_stop_key(market_id: MarketId, stop_id: OrderId) -> [u8; 25] {
+    let mut k = [0u8; 25];
+    k[..8].copy_from_slice(&market_id.to_be_bytes());
+    k[8] = BOOK_ROW_STOP;
+    k[9..].copy_from_slice(&stop_id.to_be_bytes());
+    k
+}
+
+/// Meta row value — see the schema comment above.
+fn book_meta_value(next_seq: u64, book: &OrderBook) -> Vec<u8> {
+    let mut v = Vec::with_capacity(8 + 16 + 16 + 16 + 1 + 16);
+    v.extend_from_slice(&next_seq.to_be_bytes());
+    v.extend_from_slice(&book.tick_size.raw().to_be_bytes());
+    v.extend_from_slice(&book.lot_size.raw().to_be_bytes());
+    v.extend_from_slice(&book.next_order_id().to_be_bytes());
+    match book.last_trade_price() {
+        None => v.push(0),
+        Some(p) => {
+            v.push(1);
+            v.extend_from_slice(&p.raw().to_be_bytes());
+        }
+    }
+    v
+}
+
+/// Parsed meta row.
+struct BookMeta {
+    next_seq: u64,
+    tick_size: FixedPoint,
+    lot_size: FixedPoint,
+    next_id: u128,
+    last_trade_price: Option<FixedPoint>,
+}
+
+fn parse_book_meta(v: &[u8]) -> Result<BookMeta, String> {
+    let need = |ok: bool| if ok { Ok(()) } else { Err("book meta row truncated".to_string()) };
+    need(v.len() >= 8 + 16 + 16 + 16 + 1)?;
+    let next_seq = u64::from_be_bytes(v[0..8].try_into().unwrap());
+    let tick = i128::from_be_bytes(v[8..24].try_into().unwrap());
+    let lot = i128::from_be_bytes(v[24..40].try_into().unwrap());
+    let next_id = u128::from_be_bytes(v[40..56].try_into().unwrap());
+    let last_trade_price = match v[56] {
+        0 => {
+            need(v.len() == 57)?;
+            None
+        }
+        1 => {
+            need(v.len() == 57 + 16)?;
+            Some(FixedPoint::from_raw(i128::from_be_bytes(
+                v[57..73].try_into().unwrap(),
+            )))
+        }
+        _ => return Err("book meta row: bad ltp tag".to_string()),
+    };
+    Ok(BookMeta {
+        next_seq,
+        tick_size: FixedPoint::from_raw(tick),
+        lot_size: FixedPoint::from_raw(lot),
+        next_id,
+        last_trade_price,
+    })
+}
+
+/// Order row value: `seq(8 BE) ‖ Order borsh`.
+fn book_order_value(seq: u64, order: &torus_core::order_book::Order) -> Vec<u8> {
+    let mut v = Vec::with_capacity(8 + 96);
+    v.extend_from_slice(&seq.to_be_bytes());
+    borsh::BorshSerialize::serialize(order, &mut v).expect("Order borsh serialize cannot fail");
+    v
+}
+
+fn parse_book_order_row(v: &[u8]) -> Result<(u64, torus_core::order_book::Order), String> {
+    use borsh::BorshDeserialize;
+    if v.len() < 8 {
+        return Err("book order row truncated".to_string());
+    }
+    let seq = u64::from_be_bytes(v[0..8].try_into().unwrap());
+    let order = torus_core::order_book::Order::try_from_slice(&v[8..])
+        .map_err(|e| format!("book order row borsh: {e}"))?;
+    Ok((seq, order))
+}
+
+/// Per-order persisted state the differ needs: the assigned queue seq plus
+/// every `Order` field that can MUTATE while the order rests. `modify_order`
+/// can change `price` (cancel+reinsert, same id), `remaining_qty` (partial
+/// fill / in-place decrease / replace), and `original_qty` (qty-increase
+/// modify); everything else (trader, side, type, tif, timestamp, reduce_only,
+/// client_order_id) is immutable for a given id. Equality on these three
+/// fields therefore means the persisted row bytes are current.
+/// INVARIANT: if `OrderBook` ever grows another mutable resting-order field,
+/// it must be added here or rows go stale.
+struct OrderShadow {
+    seq: u64,
+    price_raw: i128,
+    qty_raw: i128,
+    original_qty_raw: i128,
+    gen: u32,
+}
+
+impl OrderShadow {
+    fn matches(&self, o: &torus_core::order_book::Order) -> bool {
+        self.price_raw == o.price.raw()
+            && self.qty_raw == o.remaining_qty.raw()
+            && self.original_qty_raw == o.original_qty.raw()
+    }
+}
+
+/// One market's persisted-row shadow: what `CF_NATIVE_ORDER_BOOKS` currently
+/// holds for it under the row schema. Rebuilt from the CF at load, kept
+/// current by `save_order_books` — the differ that turns whole-book state
+/// into O(changed) row writes.
+#[derive(Default)]
+struct BookRowShadow {
+    orders: HashMap<OrderId, OrderShadow>,
+    stops: std::collections::HashSet<OrderId>,
+    /// Queue-seq allocator (persisted in the meta row — consensus state).
+    next_seq: u64,
+    /// Last persisted meta row value (empty = never written).
+    meta: Vec<u8>,
+    /// Mark-and-sweep generation for delete detection.
+    gen: u32,
+}
+
+#[cfg(test)]
+mod book_rows_toggle_tests {
+    use super::parse_book_rows_toggle;
+
+    #[test]
+    fn default_is_off() {
+        assert!(!parse_book_rows_toggle(None));
+    }
+
+    #[test]
+    fn one_enables() {
+        assert!(parse_book_rows_toggle(Some("1".to_string())));
+        assert!(parse_book_rows_toggle(Some(" 1 ".to_string())));
+    }
+
+    #[test]
+    fn anything_else_stays_off() {
+        for v in ["0", "true", "on", "", "yes", "2"] {
+            assert!(!parse_book_rows_toggle(Some(v.to_string())), "{v}");
+        }
     }
 }
 
@@ -227,10 +659,20 @@ pub struct NativeExecContext<T: StateBackend = StateDb> {
     /// post-state is unreconstructable — the committer MUST treat this as
     /// fatal (fail-stop the node), never flush state or mark the block applied.
     pub fatal_error: Option<String>,
+
+    /// C4: per-order-row book persistence (`TORUS_BOOK_ROWS=1`). CONSENSUS-
+    /// VISIBLE — see the module-level C4 schema comment: fleet-uniform flag,
+    /// fresh genesis required, mixed on-disk content fail-stops at load.
+    book_rows: bool,
+    /// C4: per-market shadow of the persisted rows (row differ state).
+    /// Populated only when `book_rows`.
+    book_shadows: HashMap<MarketId, BookRowShadow>,
 }
 
 impl<T: StateBackend> NativeExecContext<T> {
     /// Create a new execution context from a state backend and block metadata.
+    /// Book persistence mode comes from the `TORUS_BOOK_ROWS` env toggle
+    /// (default OFF = classic whole-book blobs).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         state: T,
@@ -243,13 +685,53 @@ impl<T: StateBackend> NativeExecContext<T> {
         treasury_address: Address,
         dev_pool_address: Address,
     ) -> Self {
+        Self::new_with_book_rows(
+            state,
+            block_height,
+            timestamp,
+            epoch,
+            epoch_length,
+            max_validators,
+            proposer,
+            treasury_address,
+            dev_pool_address,
+            book_rows_enabled(),
+        )
+    }
+
+    /// [`Self::new`] with the C4 book-persistence mode pinned explicitly
+    /// (tests / tooling — per-process env vars race across test threads).
+    /// `book_rows = false` is the classic whole-book path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_book_rows(
+        state: T,
+        block_height: u64,
+        timestamp: u64,
+        epoch: u64,
+        epoch_length: u64,
+        max_validators: u32,
+        proposer: Address,
+        treasury_address: Address,
+        dev_pool_address: Address,
+        book_rows: bool,
+    ) -> Self {
         let positions = PositionManager::new(state.clone());
         let oracle = OracleManager::new(state.clone(), OracleConfig::default());
         let staking = StakingManager::new(state.clone());
         let governance = GovernanceManager::new(state.clone());
 
         // FIX 1 (ECON-FIND-02): Load persisted order books from DB on startup.
-        let (order_books, scanned_next_id) = Self::load_order_books(&state);
+        // C4: the on-disk layout must match the configured mode — a mismatch
+        // (whole-book blobs under TORUS_BOOK_ROWS=1, or row keys without it)
+        // means this node's flag disagrees with the DB's history. Loading
+        // "what we can" would silently diverge from the fleet, so latch a
+        // fatal instead: the committer fail-stops before flushing anything.
+        let (order_books, scanned_next_id, book_shadows, load_error) = if book_rows {
+            Self::load_order_books_rows(&state)
+        } else {
+            let (books, next_id, err) = Self::load_order_books(&state);
+            (books, next_id, HashMap::new(), err)
+        };
         // S395: the durable counter row is authoritative when present — the
         // book-maxima scan resets to 1 once all books drain, silently reusing
         // order ids across a restart. max() keeps back-compat with DBs written
@@ -281,7 +763,9 @@ impl<T: StateBackend> NativeExecContext<T> {
             defer_trades: false,
             pending_trades: Vec::new(),
             metrics: None,
-            fatal_error: None,
+            fatal_error: load_error,
+            book_rows,
+            book_shadows,
         }
     }
 
@@ -291,8 +775,18 @@ impl<T: StateBackend> NativeExecContext<T> {
         std::mem::take(&mut self.pending_trades)
     }
 
-    /// FIX 1 (ECON-FIND-02): Load order books from DB. Returns (books, next_global_order_id).
-    fn load_order_books(state: &T) -> (HashMap<MarketId, OrderBook>, u128) {
+    /// True if `key` belongs to the C4 row schema (meta / order / stop row).
+    fn is_book_row_key(key: &[u8]) -> bool {
+        (key.len() == 9 && key[8] == BOOK_ROW_META)
+            || (key.len() == 25 && (key[8] == BOOK_ROW_ORDER || key[8] == BOOK_ROW_STOP))
+    }
+
+    /// FIX 1 (ECON-FIND-02): Load order books from DB (classic whole-book
+    /// blobs). Returns (books, next_global_order_id, fatal load error).
+    /// C4: finding row-schema keys here means the DB was written under
+    /// `TORUS_BOOK_ROWS=1` but this node runs without it — fatal (the classic
+    /// loader would silently see empty books and diverge from the fleet).
+    fn load_order_books(state: &T) -> (HashMap<MarketId, OrderBook>, u128, Option<String>) {
         use borsh::BorshDeserialize;
         use torus_state::cf::CF_NATIVE_ORDER_BOOKS;
 
@@ -301,6 +795,19 @@ impl<T: StateBackend> NativeExecContext<T> {
 
         if let Ok(entries) = state.iterate_cf(CF_NATIVE_ORDER_BOOKS, None) {
             for (key, value) in entries {
+                if Self::is_book_row_key(&key) {
+                    return (
+                        HashMap::new(),
+                        1,
+                        Some(
+                            "C4: cf_native_order_books holds per-order rows but \
+                             TORUS_BOOK_ROWS is not set — the flag must match the \
+                             DB's history (fleet-uniform; changing it needs a fresh \
+                             genesis)"
+                                .to_string(),
+                        ),
+                    );
+                }
                 if key.len() == 8 {
                     let market_id = u64::from_be_bytes(key[..8].try_into().unwrap());
                     if let Ok(book) = OrderBook::try_from_slice(&value) {
@@ -316,7 +823,164 @@ impl<T: StateBackend> NativeExecContext<T> {
 
         // Global ID starts at max found + 1 (or 1 if no books loaded)
         let next_id = if max_order_id > 0 { max_order_id } else { 1 };
-        (books, next_id)
+        (books, next_id, None)
+    }
+
+    /// C4: load order books from per-order rows (`TORUS_BOOK_ROWS=1`).
+    /// Rebuilds every book in the CANONICAL insertion order the classic
+    /// deserializer uses — bids ascending price then asks ascending price,
+    /// FIFO (= ascending seq) within a level; stops ascending id — and the
+    /// per-market row shadows the save-side differ needs.
+    /// Returns (books, next_global_order_id, shadows, fatal load error).
+    #[allow(clippy::type_complexity)]
+    fn load_order_books_rows(
+        state: &T,
+    ) -> (
+        HashMap<MarketId, OrderBook>,
+        u128,
+        HashMap<MarketId, BookRowShadow>,
+        Option<String>,
+    ) {
+        use torus_state::cf::CF_NATIVE_ORDER_BOOKS;
+
+        let fail = |msg: String| (HashMap::new(), 1, HashMap::new(), Some(msg));
+
+        // Per-market accumulators.
+        #[derive(Default)]
+        struct Acc {
+            meta: Option<BookMeta>,
+            orders: Vec<(u64, torus_core::order_book::Order)>,
+            stops: Vec<(u128, Vec<u8>)>,
+        }
+        fn acc(m: &mut HashMap<MarketId, Acc>, id: MarketId) -> &mut Acc {
+            m.entry(id).or_default()
+        }
+        let mut accs: HashMap<MarketId, Acc> = HashMap::new();
+
+        let entries = match state.iterate_cf(CF_NATIVE_ORDER_BOOKS, None) {
+            Ok(e) => e,
+            Err(e) => return fail(format!("C4: book row scan failed: {e}")),
+        };
+        for (key, value) in entries {
+            if key.len() == 8 {
+                return fail(
+                    "C4: TORUS_BOOK_ROWS=1 but cf_native_order_books holds classic \
+                     whole-book blobs — the flag must match the DB's history \
+                     (fleet-uniform; enabling it needs a fresh genesis)"
+                        .to_string(),
+                );
+            }
+            if !Self::is_book_row_key(&key) {
+                return fail(format!(
+                    "C4: unrecognized cf_native_order_books key (len {}) under \
+                     TORUS_BOOK_ROWS=1",
+                    key.len()
+                ));
+            }
+            let market_id = u64::from_be_bytes(key[..8].try_into().unwrap());
+            match key[8] {
+                BOOK_ROW_META => match parse_book_meta(&value) {
+                    Ok(m) => acc(&mut accs, market_id).meta = Some(m),
+                    Err(e) => return fail(format!("C4: market {market_id}: {e}")),
+                },
+                BOOK_ROW_ORDER => match parse_book_order_row(&value) {
+                    Ok(row) => acc(&mut accs, market_id).orders.push(row),
+                    Err(e) => return fail(format!("C4: market {market_id}: {e}")),
+                },
+                BOOK_ROW_STOP => {
+                    let stop_id = u128::from_be_bytes(key[9..25].try_into().unwrap());
+                    acc(&mut accs, market_id).stops.push((stop_id, value));
+                }
+                _ => unreachable!("is_book_row_key checked the tag"),
+            }
+        }
+
+        let mut books = HashMap::new();
+        let mut shadows = HashMap::new();
+        let mut max_order_id: u128 = 0;
+
+        // Deterministic rebuild order (market id ascending) — not strictly
+        // required (per-market state is independent), but keeps any log/debug
+        // output stable.
+        let mut market_ids: Vec<MarketId> = accs.keys().copied().collect();
+        market_ids.sort_unstable();
+
+        for market_id in market_ids {
+            let mut a = accs.remove(&market_id).unwrap();
+            let Some(meta) = a.meta else {
+                return fail(format!(
+                    "C4: market {market_id} has order/stop rows but no meta row \
+                     (corrupt row store)"
+                ));
+            };
+
+            let mut book = OrderBook::new(market_id, meta.tick_size, meta.lot_size);
+            book.set_next_order_id(meta.next_id);
+            book.set_last_trade_price(meta.last_trade_price);
+
+            // Canonical insertion order: bids ascending (price, seq), then
+            // asks ascending (price, seq) — exactly the classic deserializer's
+            // walk, so queue priority and index Vec orders match it.
+            let mut shadow = BookRowShadow {
+                next_seq: meta.next_seq,
+                ..Default::default()
+            };
+            let mut bids: Vec<(u64, torus_core::order_book::Order)> = Vec::new();
+            let mut asks: Vec<(u64, torus_core::order_book::Order)> = Vec::new();
+            for (seq, order) in a.orders.drain(..) {
+                if seq >= meta.next_seq {
+                    return fail(format!(
+                        "C4: market {market_id}: order row seq {seq} >= meta \
+                         next_seq {} (corrupt row store)",
+                        meta.next_seq
+                    ));
+                }
+                shadow.orders.insert(
+                    order.id,
+                    OrderShadow {
+                        seq,
+                        price_raw: order.price.raw(),
+                        qty_raw: order.remaining_qty.raw(),
+                        original_qty_raw: order.original_qty.raw(),
+                        gen: 0,
+                    },
+                );
+                match order.side {
+                    Side::Buy => bids.push((seq, order)),
+                    Side::Sell => asks.push((seq, order)),
+                }
+            }
+            bids.sort_by(|a, b| (a.1.price, a.0).cmp(&(b.1.price, b.0)));
+            asks.sort_by(|a, b| (a.1.price, a.0).cmp(&(b.1.price, b.0)));
+            for (_, order) in bids.into_iter().chain(asks) {
+                book.restore_resting_order(order);
+            }
+
+            a.stops.sort_by_key(|(id, _)| *id);
+            for (stop_id, bytes) in a.stops {
+                match book.restore_stop_row(&bytes) {
+                    Ok(id) if id == stop_id => shadow.stops.insert(id),
+                    Ok(id) => {
+                        return fail(format!(
+                            "C4: market {market_id}: stop row key id {stop_id} != \
+                             payload id {id} (corrupt row store)"
+                        ))
+                    }
+                    Err(e) => return fail(format!("C4: market {market_id}: {e}")),
+                };
+            }
+
+            shadow.meta = book_meta_value(shadow.next_seq, &book);
+            let book_next_id = book.next_order_id();
+            if book_next_id > max_order_id {
+                max_order_id = book_next_id;
+            }
+            books.insert(market_id, book);
+            shadows.insert(market_id, shadow);
+        }
+
+        let next_id = if max_order_id > 0 { max_order_id } else { 1 };
+        (books, next_id, shadows, None)
     }
 
     /// Durable global-order-id counter row. Lives in `CF_NATIVE_MARKETS` — a
@@ -341,8 +1005,16 @@ impl<T: StateBackend> NativeExecContext<T> {
     /// global order-id counter when it advanced. Untouched books already hold
     /// identical bytes in the CF — the old rewrite-everything loop cost
     /// O(all resting orders) in Borsh serialization per block. Returns the
-    /// number of book rows written (test hook). Called after block execution.
-    pub fn save_order_books(&self) -> usize {
+    /// number of CF writes performed (whole-book rows classically; row
+    /// puts + deletes under `TORUS_BOOK_ROWS=1` — test hook either way).
+    /// Called after block execution.
+    ///
+    /// C4 (`book_rows`): instead of one whole-book blob per dirty market, diff
+    /// each dirty book against its persisted-row shadow and write only the
+    /// changed rows — new/re-sequenced/refilled orders as puts, gone orders as
+    /// deletes, plus the small meta row. O(changed orders) in serialization,
+    /// CF bytes AND downstream state-root hashing.
+    pub fn save_order_books(&mut self) -> usize {
         use torus_state::cf::{CF_NATIVE_MARKETS, CF_NATIVE_ORDER_BOOKS};
 
         let mut written = 0;
@@ -350,17 +1022,31 @@ impl<T: StateBackend> NativeExecContext<T> {
             let Some(book) = self.order_books.get(&market_id) else {
                 continue;
             };
-            let key = market_id.to_be_bytes();
-            match borsh::to_vec(book) {
-                Ok(data) => {
-                    if let Err(e) = self.state.put_cf_raw(CF_NATIVE_ORDER_BOOKS, &key, &data) {
-                        tracing::error!(market_id, %e, "failed to persist order book");
-                    } else {
-                        written += 1;
+            if self.book_rows {
+                // Take the shadow out so the differ can borrow book + state
+                // freely; reinsert when done.
+                let mut shadow = self.book_shadows.remove(&market_id).unwrap_or_else(|| {
+                    BookRowShadow {
+                        next_seq: 1,
+                        ..Default::default()
                     }
-                }
-                Err(e) => {
-                    tracing::error!(market_id, %e, "failed to serialize order book");
+                });
+                written += Self::save_book_rows(&self.state, market_id, book, &mut shadow);
+                self.book_shadows.insert(market_id, shadow);
+            } else {
+                let key = market_id.to_be_bytes();
+                match borsh::to_vec(book) {
+                    Ok(data) => {
+                        if let Err(e) = self.state.put_cf_raw(CF_NATIVE_ORDER_BOOKS, &key, &data)
+                        {
+                            tracing::error!(market_id, %e, "failed to persist order book");
+                        } else {
+                            written += 1;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(market_id, %e, "failed to serialize order book");
+                    }
                 }
             }
         }
@@ -375,6 +1061,148 @@ impl<T: StateBackend> NativeExecContext<T> {
             ) {
                 tracing::error!(%e, "failed to persist next_global_order_id");
             }
+        }
+
+        written
+    }
+
+    /// C4 row differ: bring the CF rows for ONE market in line with `book`,
+    /// writing only what changed. Returns puts + deletes performed.
+    ///
+    /// Row-write triggers, per resting order (walking each (side, price) queue
+    /// front-to-back):
+    ///   - unknown id → new order: assign `seq = next_seq++`, put row;
+    ///   - known id whose seq is monotonic within its queue → row is current
+    ///     unless `remaining_qty` changed (partial fill / in-place qty-decrease
+    ///     modify) → put row with the SAME seq;
+    ///   - known id whose seq BREAKS queue monotonicity → the order lost time
+    ///     priority and re-entered at the back (modify_order cancel+reinsert
+    ///     keeps the id) → re-stamp `seq = next_seq++`, put row.
+    /// Orders in the shadow but no longer on the book (fills that consumed
+    /// them, cancels, STP) → delete row. Stops: content is immutable per id —
+    /// put new ids, delete gone ids. Meta row rewritten only when its bytes
+    /// changed (next_seq / next_order_id / last_trade_price movement).
+    ///
+    /// DETERMINISM: seq assignment walks the book in canonical order and draws
+    /// from the persisted `next_seq` counter, so it is a pure function of
+    /// consensus state + this block's operations — identical on every
+    /// validator. The seqs land in row VALUES (state root!): this is required
+    /// for FIFO rebuild and safe precisely because assignment is deterministic.
+    fn save_book_rows(
+        state: &T,
+        market_id: MarketId,
+        book: &OrderBook,
+        shadow: &mut BookRowShadow,
+    ) -> usize {
+        use torus_state::cf::CF_NATIVE_ORDER_BOOKS;
+
+        let mut written = 0usize;
+        shadow.gen = shadow.gen.wrapping_add(1);
+        let gen = shadow.gen;
+
+        // ---- Resting orders: walk every queue front-to-back ----
+        for (_price, queue) in book.bid_queues().chain(book.ask_queues()) {
+            // Highest seq emitted so far in THIS queue — rebuild sorts a level
+            // by seq, so persisted seqs must ascend front-to-back per queue.
+            let mut last_seq: u64 = 0;
+            for order in queue {
+                let (seq, needs_write) = match shadow.orders.get(&order.id) {
+                    // Known id, seq still monotonic in its queue: row is
+                    // current iff no mutable field moved.
+                    Some(sh) if sh.seq > last_seq => (sh.seq, !sh.matches(order)),
+                    // Known id whose seq breaks queue monotonicity: the order
+                    // lost time priority (modify re-insert) — fresh seq.
+                    Some(_) => {
+                        let s = shadow.next_seq;
+                        shadow.next_seq += 1;
+                        (s, true)
+                    }
+                    // New resting order.
+                    None => {
+                        let s = shadow.next_seq;
+                        shadow.next_seq += 1;
+                        (s, true)
+                    }
+                };
+                if needs_write {
+                    let key = book_order_key(market_id, order.id);
+                    let val = book_order_value(seq, order);
+                    if let Err(e) = state.put_cf_raw(CF_NATIVE_ORDER_BOOKS, &key, &val) {
+                        tracing::error!(market_id, order_id = %order.id, %e, "C4: order row put failed");
+                    } else {
+                        written += 1;
+                    }
+                }
+                shadow.orders.insert(
+                    order.id,
+                    OrderShadow {
+                        seq,
+                        price_raw: order.price.raw(),
+                        qty_raw: order.remaining_qty.raw(),
+                        original_qty_raw: order.original_qty.raw(),
+                        gen,
+                    },
+                );
+                last_seq = seq;
+            }
+        }
+
+        // Sweep: shadow entries not touched this walk are no longer resting.
+        // Sorted so the delete stream (not just the final state) is
+        // deterministic — HashMap iteration order is per-process random.
+        let mut stale: Vec<OrderId> = shadow
+            .orders
+            .iter()
+            .filter(|(_, sh)| sh.gen != gen)
+            .map(|(id, _)| *id)
+            .collect();
+        stale.sort_unstable();
+        for id in stale {
+            let key = book_order_key(market_id, id);
+            if let Err(e) = state.delete_cf_raw(CF_NATIVE_ORDER_BOOKS, &key) {
+                tracing::error!(market_id, order_id = %id, %e, "C4: order row delete failed");
+            } else {
+                written += 1;
+            }
+            shadow.orders.remove(&id);
+        }
+
+        // ---- Pending stops: immutable per id → put new, delete gone ----
+        let stops = book.stop_rows();
+        let mut live_stops = std::collections::HashSet::with_capacity(stops.len());
+        for (id, bytes) in stops {
+            if shadow.stops.insert(id) {
+                let key = book_stop_key(market_id, id);
+                if let Err(e) = state.put_cf_raw(CF_NATIVE_ORDER_BOOKS, &key, &bytes) {
+                    tracing::error!(market_id, stop_id = %id, %e, "C4: stop row put failed");
+                } else {
+                    written += 1;
+                }
+            }
+            live_stops.insert(id);
+        }
+        let mut gone: Vec<u128> = shadow.stops.difference(&live_stops).copied().collect();
+        gone.sort_unstable();
+        for id in gone {
+            let key = book_stop_key(market_id, id);
+            if let Err(e) = state.delete_cf_raw(CF_NATIVE_ORDER_BOOKS, &key) {
+                tracing::error!(market_id, stop_id = %id, %e, "C4: stop row delete failed");
+            } else {
+                written += 1;
+            }
+            shadow.stops.remove(&id);
+        }
+
+        // ---- Meta row (only when its bytes moved) ----
+        let meta = book_meta_value(shadow.next_seq, book);
+        if meta != shadow.meta {
+            let key = book_meta_key(market_id);
+            if let Err(e) = state.put_cf_raw(CF_NATIVE_ORDER_BOOKS, &key, &meta) {
+                tracing::error!(market_id, %e, "C4: meta row put failed");
+            } else {
+                written += 1;
+            }
+            shadow.meta = meta;
         }
 
         written
@@ -529,70 +1357,94 @@ impl NativeExecutor {
     ///   Phase 1 — Execute all non-PlaceOrder actions sequentially
     ///   Phase 2 — Pre-reserve margin, assign global order IDs, partition by market
     ///   Phase 3 — Parallel matching: one thread per market's OrderBook
-    ///   Phase 4 — Sequential settlement: release margin, apply fills, persist trades
+    ///   Phase 4 — Settlement: release margin, apply fills, persist trades.
+    ///             C3: `TORUS_PARALLEL_SETTLE=1` opts in to parallel per-market
+    ///             compute + deterministic apply; default (unset) is the
+    ///             classic sequential loop, byte-identical to pre-C3.
     ///
     /// Individual action failures do NOT stop the batch (deterministic semantics).
     pub fn execute_batch<T: StateBackend>(
         ctx: &mut NativeExecContext<T>,
         actions: &[(Address, NativeAction)],
     ) -> NativeBatchResult {
+        Self::execute_batch_inner(ctx, actions, SettleMode::Auto)
+    }
+
+    /// `execute_batch` with the Phase-4 settle mode pinned explicitly —
+    /// `parallel = false` runs the classic sequential settle loop; `true`
+    /// runs the parallel path whenever >=2 markets have work (no size gate).
+    /// For A/B benches and the differential determinism tests (per-process
+    /// env vars race across test threads; this doesn't).
+    pub fn execute_batch_settle_mode<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+        actions: &[(Address, NativeAction)],
+        parallel: bool,
+    ) -> NativeBatchResult {
+        Self::execute_batch_inner(ctx, actions, SettleMode::Force(parallel))
+    }
+
+    fn execute_batch_inner<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+        actions: &[(Address, NativeAction)],
+        settle_mode: SettleMode,
+    ) -> NativeBatchResult {
+        // One flattened executable entry: either a PlaceOrder's params (single or
+        // batch-expanded) or any other action. C2: everything is BORROWED from the
+        // caller's `actions` slice — the old Cow flatten deep-cloned every order
+        // AND every non-place action whenever a PlaceOrderBatch was present.
+        enum FlatAction<'a> {
+            Other(&'a NativeAction),
+            Place(&'a PlaceOrderParams),
+        }
+
         // Flatten any PlaceOrderBatch into individual (sender, PlaceOrder) entries so the
         // per-market parallel matching pipeline treats batched and singly-submitted orders
-        // identically. Deterministic: actions in slice order, orders in batch order. Zero-copy
-        // on the common no-batch path via Cow::Borrowed.
-        let flattened: std::borrow::Cow<[(Address, NativeAction)]> = if actions
-            .iter()
-            .any(|(_, a)| matches!(a, NativeAction::PlaceOrderBatch(_)))
-        {
-            let mut out = Vec::with_capacity(actions.len());
-            let mut skipped_batches = 0usize;
-            for (sender, action) in actions {
-                match action {
-                    NativeAction::PlaceOrderBatch(orders) => {
-                        // G1 (O2): DETERMINISTIC exec-side cap. The RPC/admit
-                        // checks are node-local policy; this is the consensus-
-                        // critical bound. An oversize (or empty) batch is
-                        // skipped WHOLESALE — same doctrine as the replay-guard
-                        // skip (app.rs warn + continue) — the block is never
-                        // aborted, and every correct node skips identically.
-                        //
-                        // LOCKSTEP-DEPLOY: this skip is a consensus-semantics
-                        // change (a pre-upgrade node flattens+executes an
-                        // oversize batch; an upgraded node skips it → divergent
-                        // state root on a block that carries one). The whole
-                        // fleet must run this before any block can legally carry
-                        // a batch above the cap — same deploy class as the
-                        // SessionScope::Trading widening (torus-types lib.rs).
-                        if !torus_types::batch_len_within_cap(orders.len()) {
-                            // Aggregate the count; do NOT log per batch. A
-                            // malicious proposer can pack a block with thousands
-                            // of tiny empty/oversize batches under the byte cap;
-                            // per-batch WARN with %sender formatting would stall
-                            // the single exec thread every block (log-DoS).
-                            skipped_batches += 1;
-                            continue;
-                        }
-                        for p in orders {
-                            out.push((*sender, NativeAction::PlaceOrder(p.clone())));
-                        }
+        // identically. Deterministic: actions in slice order, orders in batch order.
+        let mut flat: Vec<(Address, FlatAction<'_>)> = Vec::with_capacity(actions.len());
+        let mut skipped_batches = 0usize;
+        for (sender, action) in actions {
+            match action {
+                NativeAction::PlaceOrder(p) => flat.push((*sender, FlatAction::Place(p))),
+                NativeAction::PlaceOrderBatch(orders) => {
+                    // G1 (O2): DETERMINISTIC exec-side cap. The RPC/admit
+                    // checks are node-local policy; this is the consensus-
+                    // critical bound. An oversize (or empty) batch is
+                    // skipped WHOLESALE — same doctrine as the replay-guard
+                    // skip (app.rs warn + continue) — the block is never
+                    // aborted, and every correct node skips identically.
+                    //
+                    // LOCKSTEP-DEPLOY: this skip is a consensus-semantics
+                    // change (a pre-upgrade node flattens+executes an
+                    // oversize batch; an upgraded node skips it → divergent
+                    // state root on a block that carries one). The whole
+                    // fleet must run this before any block can legally carry
+                    // a batch above the cap — same deploy class as the
+                    // SessionScope::Trading widening (torus-types lib.rs).
+                    if !torus_types::batch_len_within_cap(orders.len()) {
+                        // Aggregate the count; do NOT log per batch. A
+                        // malicious proposer can pack a block with thousands
+                        // of tiny empty/oversize batches under the byte cap;
+                        // per-batch WARN with %sender formatting would stall
+                        // the single exec thread every block (log-DoS).
+                        skipped_batches += 1;
+                        continue;
                     }
-                    other => out.push((*sender, other.clone())),
+                    for p in orders {
+                        flat.push((*sender, FlatAction::Place(p)));
+                    }
                 }
+                other => flat.push((*sender, FlatAction::Other(other))),
             }
-            if skipped_batches > 0 {
-                tracing::warn!(
-                    skipped_batches,
-                    cap = torus_types::NATIVE_ORDERS_PER_BATCH_CAP,
-                    "skipped oversize/empty PlaceOrderBatch action(s) at exec (deterministic cap)"
-                );
-            }
-            std::borrow::Cow::Owned(out)
-        } else {
-            std::borrow::Cow::Borrowed(actions)
-        };
-        let actions: &[(Address, NativeAction)] = &flattened;
+        }
+        if skipped_batches > 0 {
+            tracing::warn!(
+                skipped_batches,
+                cap = torus_types::NATIVE_ORDERS_PER_BATCH_CAP,
+                "skipped oversize/empty PlaceOrderBatch action(s) at exec (deterministic cap)"
+            );
+        }
 
-        let n = actions.len();
+        let n = flat.len();
         let mut results: Vec<NativeActionResult> = (0..n)
             .map(|_| NativeActionResult::ok("pending", 0))
             .collect();
@@ -601,10 +1453,10 @@ impl NativeExecutor {
         // ---- Phase 1: Partition and execute non-PlaceOrder actions ----
         let mut place_order_indices: Vec<usize> = Vec::new();
 
-        for (i, (sender, action)) in actions.iter().enumerate() {
-            match action {
-                NativeAction::PlaceOrder(_) => place_order_indices.push(i),
-                _ => {
+        for (i, (sender, entry)) in flat.iter().enumerate() {
+            match entry {
+                FlatAction::Place(_) => place_order_indices.push(i),
+                FlatAction::Other(action) => {
                     let result = Self::execute(ctx, sender, action);
                     total_gas += result.gas_used;
                     results[i] = result;
@@ -618,26 +1470,25 @@ impl NativeExecutor {
 
         // ---- Phase 2: Pre-reserve margin, assign IDs, partition by market ----
         let margin_timer = std::time::Instant::now();
-        struct PreparedOrder {
-            index: usize,
-            sender: Address,
-            params: PlaceOrderParams,
-            order_id: u128,
-            margin_reserved: FixedPoint,
-        }
-
-        let mut market_batches: HashMap<MarketId, Vec<PreparedOrder>> = HashMap::new();
+        // C2: `PreparedOrder.params` borrows from the caller's `actions` slice
+        // — the prepared order carries an 8-byte reference through Phases 2-4
+        // instead of a per-order deep clone of `PlaceOrderParams`.
+        let mut market_batches: HashMap<MarketId, Vec<PreparedOrder<'_>>> = HashMap::new();
 
         // O1: write-through balance cache, scoped to this execute_batch call. Serves
         // repeated Phase 2 reserve / Phase 4 release reads for the same sender without
         // re-hitting the overlay's lock + alloc + Borsh path.
         let mut bal_cache = BalanceCache::new();
+        // C1: same pattern for position rows — Phase 4 does two position
+        // read-modify-writes per fill; they hit this map and flush once
+        // (sorted keys) at the end of the call.
+        let mut pos_cache = PositionCache::new();
 
         for &i in &place_order_indices {
-            let (sender, action) = &actions[i];
-            let params = match action {
-                NativeAction::PlaceOrder(p) => p,
-                _ => unreachable!(),
+            let (sender, entry) = &flat[i];
+            let params: &PlaceOrderParams = match entry {
+                FlatAction::Place(p) => p,
+                FlatAction::Other(_) => unreachable!(),
             };
 
             let market_id = params.market_id;
@@ -693,7 +1544,7 @@ impl NativeExecutor {
                 .push(PreparedOrder {
                     index: i,
                     sender: *sender,
-                    params: params.clone(),
+                    params,
                     order_id,
                     margin_reserved: order_margin_required,
                 });
@@ -706,7 +1557,8 @@ impl NativeExecutor {
 
         // ---- Phase 3: Parallel matching ----
         let match_timer = std::time::Instant::now();
-        let mut worker_batches: HashMap<MarketId, (OrderBook, Vec<MatchRequest>)> = HashMap::new();
+        let mut worker_batches: HashMap<MarketId, (OrderBook, Vec<MatchRequest<'_>>)> =
+            HashMap::new();
 
         for (&market_id, prepared) in &market_batches {
             let book = ctx
@@ -714,11 +1566,11 @@ impl NativeExecutor {
                 .remove(&market_id)
                 .unwrap_or_else(|| OrderBook::new(market_id, FixedPoint::ONE, FixedPoint::ONE));
 
-            let requests: Vec<MatchRequest> = prepared
+            let requests: Vec<MatchRequest<'_>> = prepared
                 .iter()
                 .map(|p| MatchRequest {
                     sender: p.sender,
-                    params: p.params.clone(),
+                    params: p.params,
                     order_id: p.order_id,
                 })
                 .collect();
@@ -758,7 +1610,7 @@ impl NativeExecutor {
                 .observe(match_timer.elapsed().as_secs_f64());
         }
 
-        // ---- Phase 4: Sequential settlement ----
+        // ---- Phase 4: settlement ----
         // A5: settle markets in market-id order. `match_parallel` returns
         // HashMap iteration order (random per instance) — balance mutations
         // are commutative so consensus state never depended on it, but the
@@ -767,6 +1619,81 @@ impl NativeExecutor {
         // releases do observe settlement order. Sorting pins both.
         market_results.sort_by_key(|m| m.market_id);
         let settle_timer = std::time::Instant::now();
+        // C3: parallel settle pays a thread scope + plan handoff, so it needs
+        // >=2 markets with work (always) and, in Auto mode, enough fills to
+        // amortize the overhead. The sequential loop remains the canonical
+        // semantics that the parallel path must reproduce byte-for-byte.
+        let use_parallel = market_results.len() >= 2
+            && match settle_mode {
+                SettleMode::Force(parallel) => parallel,
+                SettleMode::Auto => {
+                    parallel_settle_enabled() && {
+                        let total_fills: usize = market_results
+                            .iter()
+                            .flat_map(|m| m.results.iter())
+                            .map(|r| r.result.fills.len())
+                            .sum();
+                        total_fills >= parallel_settle_min_fills()
+                    }
+                }
+            };
+        if use_parallel {
+            Self::settle_market_results_parallel(
+                ctx,
+                market_results,
+                &market_batches,
+                &mut results,
+                &mut total_gas,
+                &mut bal_cache,
+                &mut pos_cache,
+            );
+        } else {
+            Self::settle_market_results_sequential(
+                ctx,
+                market_results,
+                &market_batches,
+                &mut results,
+                &mut total_gas,
+                &mut bal_cache,
+                &mut pos_cache,
+            );
+        }
+
+        // C1/O1: materialize all deferred position + balance mutations into the
+        // overlay before the call returns (each in deterministic sorted-key
+        // order), so the next execute_batch call and every post-batch consumer
+        // sees authoritative state. A flush failure means committed fills are
+        // not in the overlay — that block must never be applied, so latch the
+        // fatal (the committer halts the execution pipeline on it).
+        if let Err(e) = pos_cache.flush_all(&ctx.positions) {
+            ctx.fatal_error = Some(format!("position cache flush failed: {e}"));
+        }
+        if let Err(e) = bal_cache.flush_all(&ctx.positions) {
+            ctx.fatal_error = Some(format!("balance cache flush failed: {e}"));
+        }
+
+        if let Some(ref m) = ctx.metrics {
+            m.exec_phase_settle_seconds
+                .observe(settle_timer.elapsed().as_secs_f64());
+        }
+
+        NativeBatchResult { results, total_gas }
+    }
+
+    /// Classic Phase-4 settlement: one thread walks the (market-id-sorted)
+    /// match results and performs every mutation inline. This is the CANONICAL
+    /// settle semantics — `settle_market_results_parallel` must produce
+    /// byte-identical state, and `TORUS_PARALLEL_SETTLE=0` falls back here.
+    #[allow(clippy::too_many_arguments)]
+    fn settle_market_results_sequential<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+        market_results: Vec<crate::market_workers::MarketBatchResult>,
+        market_batches: &HashMap<MarketId, Vec<PreparedOrder<'_>>>,
+        results: &mut [NativeActionResult],
+        total_gas: &mut u64,
+        bal_cache: &mut BalanceCache,
+        pos_cache: &mut PositionCache,
+    ) {
         for mbr in market_results {
             let market_id = mbr.market_id;
 
@@ -837,23 +1764,24 @@ impl NativeExecutor {
                     }
                 }
 
-                // Apply fills to position manager
+                // Apply fills through the write-back caches (C1). Positions
+                // read-modify-write in pos_cache; realized-PnL events are
+                // credited through bal_cache — never straight to the overlay —
+                // so the old per-fill flush_and_evict (2 overlay round-trips
+                // per fill) is gone and both caches stay the single in-batch
+                // authority for their rows.
                 let mut fill_failed = false;
                 for fill in &result.fills {
-                    // apply_fill credits realized PnL straight to the overlay, bypassing
-                    // bal_cache. Flush+evict these traders' pending balances first so the
-                    // credit lands on the post-release balance and flush_all can't clobber
-                    // it; a later margin release for them re-reads the overlay (O1 coherence).
-                    let _ = bal_cache.flush_and_evict(&ctx.positions, &fill.taker);
-                    let _ = bal_cache.flush_and_evict(&ctx.positions, &fill.maker);
                     let taker_is_buy = fill.maker_side != Side::Buy;
-                    if let Err(e) = ctx.positions.apply_fill(
+                    if let Err(e) = Self::apply_fill_via_caches(
+                        &ctx.positions,
+                        pos_cache,
+                        bal_cache,
                         &fill.taker,
                         market_id,
                         taker_is_buy,
                         fill.quantity,
                         fill.price,
-                        MarginType::Cross,
                     ) {
                         results[prep.index] = NativeActionResult::err(
                             "place_order",
@@ -862,13 +1790,15 @@ impl NativeExecutor {
                         fill_failed = true;
                         break;
                     }
-                    if let Err(e) = ctx.positions.apply_fill(
+                    if let Err(e) = Self::apply_fill_via_caches(
+                        &ctx.positions,
+                        pos_cache,
+                        bal_cache,
                         &fill.maker,
                         market_id,
                         fill.maker_side == Side::Buy,
                         fill.quantity,
                         fill.price,
-                        MarginType::Cross,
                     ) {
                         results[prep.index] = NativeActionResult::err(
                             "place_order",
@@ -897,7 +1827,7 @@ impl NativeExecutor {
                     Self::record_order_status_funnel(m, &result.status, result.fills.len());
                 }
 
-                total_gas += 1000;
+                *total_gas += 1000;
                 results[prep.index] = NativeActionResult::ok("place_order", 1000);
             }
 
@@ -919,18 +1849,398 @@ impl NativeExecutor {
                 }
             }
         }
+    }
 
-        // O1: materialize all deferred balance mutations (reserves + releases) into the
-        // overlay before the call returns, so the next execute_batch call and every
-        // post-batch consumer sees authoritative state.
-        let _ = bal_cache.flush_all(&ctx.positions);
+    /// C3: deterministic parallel Phase-4 settlement.
+    ///
+    /// Pass A (parallel, scoped thread per market — same pool shape as
+    /// Phase-3 matching): a PURE compute of each market's settle plan. Workers
+    /// only BORROW (`&MarketBatchResult`, `&[PreparedOrder]`, `&PositionManager`)
+    /// and mutate nothing shared:
+    ///   - position transitions land in a per-market `PositionCache` — position
+    ///     keys are `(trader, market_id)`, so the per-market key sets are
+    ///     provably disjoint and within-market application order is preserved
+    ///     by the worker loop ⇒ merged caches are identical to the sequential
+    ///     shared cache;
+    ///   - realized-PnL events are RECORDED (not applied) in exact fill order —
+    ///     `fill_transition` never reads balances, so splitting position math
+    ///     from the balance credit cannot change any position outcome;
+    ///   - taker/maker margin-release AMOUNTS are precomputed — they are pure
+    ///     in (market config, params, match results, post-match book) and
+    ///     independent of balances (only the defensive clamp reads a balance);
+    ///   - trade-history rows are byte-built with a provisional index.
+    ///
+    /// Pass B (single-threaded): applies every cross-market mutation in
+    /// EXACTLY the sequential order — markets ascending by id, orders in
+    /// prepared order, PnL credits in fill order (taker then maker), then the
+    /// market's A5 maker releases — so every `.min(order_margin)` clamp sees
+    /// byte-identical balance state, and `trade_index` stamps the identical
+    /// key sequence. Merged position caches flush later through the one
+    /// sorted `flush_all`, identical to sequential.
+    ///
+    /// Determinism proof obligations (C3):
+    ///   - fee accounting order: NO fees are touched in Phase 4
+    ///     (`total_native_fees` is only read at the epoch boundary) — nothing
+    ///     to order;
+    ///   - realized-PnL accumulation order: position-side accumulation is
+    ///     market-local (worker order == sequential order); balance-side
+    ///     credits happen in pass B in the sequential order;
+    ///   - margin release order (A5): all releases apply in pass B in the
+    ///     sequential order with precomputed amounts.
+    ///
+    /// Failure semantics: a worker panic aborts NOTHING durable — since
+    /// workers borrow only, no shared state has mutated, so we log and fall
+    /// back to the sequential loop (which, being canonical, either succeeds
+    /// or fails exactly as a sequential node would). Position-load errors
+    /// inside a worker are captured per-order exactly like the sequential
+    /// path. The one sequential/parallel divergence window left is a FAILING
+    /// BALANCE-ROW READ at PnL-credit time (backend IO/corruption): both
+    /// modes fail the order and skip its trades, but the sequential loop also
+    /// stops applying that order's later-fill POSITION deltas, while the plan
+    /// already computed them. A node whose balance rows fail to read is
+    /// already diverging from healthy peers under sequential settle (the
+    /// order soft-fails node-locally); the state root catches it either way.
+    #[allow(clippy::too_many_arguments)]
+    fn settle_market_results_parallel<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+        market_results: Vec<crate::market_workers::MarketBatchResult>,
+        market_batches: &HashMap<MarketId, Vec<PreparedOrder<'_>>>,
+        results: &mut [NativeActionResult],
+        total_gas: &mut u64,
+        bal_cache: &mut BalanceCache,
+        pos_cache: &mut PositionCache,
+    ) {
+        // ---- Pass A: pure per-market plans on scoped threads ----
+        let plans: Vec<Result<MarketSettlePlan, String>> = {
+            let positions = &ctx.positions;
+            let margin_configs = &ctx.margin_configs;
+            let (block_height, timestamp) = (ctx.block_height, ctx.timestamp);
+            std::thread::scope(|s| {
+                let handles: Vec<_> = market_results
+                    .iter()
+                    .map(|mbr| {
+                        let prepared: &[PreparedOrder<'_>] = market_batches
+                            .get(&mbr.market_id)
+                            .map(|v| v.as_slice())
+                            .unwrap_or(&[]);
+                        let cfg = margin_configs.get(&mbr.market_id);
+                        s.spawn(move || {
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                Self::compute_market_settle_plan(
+                                    positions,
+                                    cfg,
+                                    mbr,
+                                    prepared,
+                                    block_height,
+                                    timestamp,
+                                )
+                            }))
+                            .map_err(|payload| {
+                                if let Some(s) = payload.downcast_ref::<&'static str>() {
+                                    (*s).to_string()
+                                } else if let Some(s) = payload.downcast_ref::<String>() {
+                                    s.clone()
+                                } else {
+                                    "non-string panic payload".to_string()
+                                }
+                            })
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| {
+                        h.join()
+                            .unwrap_or_else(|_| Err("settle worker thread died".to_string()))
+                    })
+                    .collect()
+            })
+        };
 
-        if let Some(ref m) = ctx.metrics {
-            m.exec_phase_settle_seconds
-                .observe(settle_timer.elapsed().as_secs_f64());
+        // Fallback triggers: a worker panic, or ANY position-side fill
+        // application failure (backend read error — sick-node territory).
+        // Workers borrowed only, so no shared state has mutated and the books
+        // are still owned by `market_results` — the canonical sequential loop
+        // reruns the whole settlement from scratch and is authoritative for
+        // error semantics (per-order failure results, skipped trades).
+        let fallback_reason = plans.iter().find_map(|p| match p {
+            Err(msg) => Some(msg.clone()),
+            Ok(plan) => plan
+                .orders
+                .iter()
+                .find_map(|o| o.fill_error.clone()),
+        });
+        if let Some(msg) = fallback_reason {
+            tracing::error!(
+                error = %msg,
+                "C3: parallel settle aborted (worker panic or fill failure) — falling back to sequential settlement"
+            );
+            return Self::settle_market_results_sequential(
+                ctx,
+                market_results,
+                market_batches,
+                results,
+                total_gas,
+                bal_cache,
+                pos_cache,
+            );
+        }
+        let plans: Vec<MarketSettlePlan> = plans.into_iter().map(|p| p.unwrap()).collect();
+
+        // ---- Pass B: deterministic apply, markets ascending by id ----
+        for (mbr, plan) in market_results.into_iter().zip(plans) {
+            let market_id = mbr.market_id;
+
+            // Reinsert updated book
+            ctx.order_books.insert(market_id, mbr.book);
+            ctx.dirty_books.insert(market_id);
+
+            // Update global ID high-water mark
+            if mbr.next_order_id > ctx.next_global_order_id {
+                ctx.next_global_order_id = mbr.next_order_id;
+            }
+
+            // This market's position mutations become part of the batch cache
+            // (disjoint keys across markets; single sorted flush at call end).
+            pos_cache.merge_disjoint(plan.pos_cache);
+
+            let prepared = match market_batches.get(&market_id) {
+                Some(p) => p,
+                None => continue,
+            };
+
+            for ((match_result, prep), oplan) in
+                mbr.results.iter().zip(prepared.iter()).zip(plan.orders)
+            {
+                let result = &match_result.result;
+
+                // Funnel (perf A1): STP maker cancels already happened in the
+                // book during matching — same site as sequential.
+                if let Some(ref m) = ctx.metrics {
+                    m.orders_self_trade_cancels
+                        .inc_by(result.self_trade_cancels.len() as u64);
+                }
+
+                // Taker-side margin release (amount precomputed; clamp here,
+                // where the balance authority lives).
+                if oplan.margin_release > FixedPoint::ZERO {
+                    if let Ok(mut bal) = bal_cache.load(&ctx.positions, &prep.sender) {
+                        let release = oplan.margin_release.min(bal.order_margin);
+                        bal.order_margin -= release;
+                        bal.available += release;
+                        bal_cache.set(&prep.sender, bal);
+                    }
+                }
+
+                // Realized-PnL credits, in exact fill order. Sequential
+                // interleaves balance credits with position application, so a
+                // balance-row READ failure at event j fails the order AT j —
+                // before any later (position-side) failure the worker may have
+                // recorded. The worker's event stream already stops at its own
+                // position failure, so walking it in order and failing on the
+                // first balance error reproduces the sequential outcome
+                // exactly; if no balance error occurs, the worker's position
+                // failure (if any) stands.
+                let mut fill_failed: Option<String> = None;
+                for (side, trader, pnl) in &oplan.pnl_events {
+                    match bal_cache.load(&ctx.positions, trader) {
+                        Ok(mut bal) => {
+                            bal.available += *pnl;
+                            bal_cache.set(trader, bal);
+                        }
+                        Err(e) => {
+                            fill_failed = Some(format!("{side} fill failed: {e}"));
+                            break;
+                        }
+                    }
+                }
+                if fill_failed.is_none() {
+                    fill_failed = oplan.fill_error;
+                }
+
+                if let Some(err) = fill_failed {
+                    results[prep.index] = NativeActionResult::err("place_order", err);
+                    // Funnel (perf A1): died on fill application, not on the book.
+                    if let Some(ref m) = ctx.metrics {
+                        m.orders_rejected_other.inc();
+                    }
+                    continue;
+                }
+
+                // Persist trades: stamp the definitive per-block index into
+                // the worker-built bytes, then route exactly like persist_trade.
+                for mut kvs in oplan.trades {
+                    kvs.stamp_trade_index(ctx.trade_index);
+                    Self::route_trade_kvs(ctx, kvs);
+                    ctx.trade_index += 1;
+                }
+
+                if let Some(ref m) = ctx.metrics {
+                    m.orders_matched.inc_by(result.fills.len() as u64);
+                    Self::record_order_status_funnel(m, &result.status, result.fills.len());
+                }
+
+                *total_gas += 1000;
+                results[prep.index] = NativeActionResult::ok("place_order", 1000);
+            }
+
+            // A5 maker/STP releases — amounts precomputed by the worker in the
+            // canonical order; clamps applied here against live balances.
+            for (trader, amount) in plan.maker_releases {
+                if let Ok(mut bal) = bal_cache.load(&ctx.positions, &trader) {
+                    let release = amount.min(bal.order_margin);
+                    bal.order_margin -= release;
+                    bal.available += release;
+                    bal_cache.set(&trader, bal);
+                }
+            }
+        }
+    }
+
+    /// C3 pass-A worker: compute one market's settlement plan. PURE with
+    /// respect to shared state — reads positions through a fresh per-market
+    /// cache, mutates only plan-local data. Mirrors the sequential loop's
+    /// per-order semantics exactly (see `settle_market_results_sequential`).
+    fn compute_market_settle_plan<T: StateBackend>(
+        positions: &PositionManager<T>,
+        cfg: Option<&MarketMarginConfig>,
+        mbr: &crate::market_workers::MarketBatchResult,
+        prepared: &[PreparedOrder<'_>],
+        block_height: u64,
+        timestamp: u64,
+    ) -> MarketSettlePlan {
+        let market_id = mbr.market_id;
+        let mut pos_cache = PositionCache::new();
+        let mut orders = Vec::with_capacity(prepared.len());
+
+        for (match_result, prep) in mbr.results.iter().zip(prepared.iter()) {
+            let result = &match_result.result;
+
+            // Taker-side release amount — same formula as sequential.
+            let mut margin_release = FixedPoint::ZERO;
+            if prep.margin_reserved > FixedPoint::ZERO {
+                let order_rests = matches!(
+                    result.status,
+                    OrderStatus::Resting
+                        | OrderStatus::PartiallyFilled
+                        | OrderStatus::PendingTrigger
+                );
+                let filled_qty: FixedPoint = result
+                    .fills
+                    .iter()
+                    .map(|f| f.quantity)
+                    .fold(FixedPoint::ZERO, |a, b| a + b);
+
+                margin_release = if !order_rests {
+                    prep.margin_reserved
+                } else if filled_qty > FixedPoint::ZERO {
+                    prep.margin_reserved
+                        - Self::reserve_for_qty_cfg(
+                            cfg,
+                            prep.params.price,
+                            prep.params.quantity - filled_qty,
+                        )
+                } else {
+                    FixedPoint::ZERO
+                };
+            }
+
+            // Fill application: position transitions into the market-local
+            // cache; PnL events recorded in exact order; first POSITION-side
+            // failure stops the order like sequential (its message matches).
+            let mut pnl_events: Vec<(&'static str, Address, FixedPoint)> = Vec::new();
+            let mut fill_error: Option<String> = None;
+            'fills: for fill in &result.fills {
+                let taker_is_buy = fill.maker_side != Side::Buy;
+                for (side, trader, is_buy) in [
+                    ("taker", &fill.taker, taker_is_buy),
+                    ("maker", &fill.maker, fill.maker_side == Side::Buy),
+                ] {
+                    match positions.apply_fill_cached(
+                        &mut pos_cache,
+                        trader,
+                        market_id,
+                        is_buy,
+                        fill.quantity,
+                        fill.price,
+                        MarginType::Cross,
+                    ) {
+                        Ok(Some(pnl)) => pnl_events.push((side, *trader, pnl)),
+                        Ok(None) => {}
+                        Err(e) => {
+                            fill_error = Some(format!("{side} fill failed: {e}"));
+                            break 'fills;
+                        }
+                    }
+                }
+            }
+
+            // Trade rows (skipped wholesale on a failed order, like sequential;
+            // the definitive index is stamped in pass B).
+            let trades: Vec<TradeKvs> = if fill_error.is_none() {
+                result
+                    .fills
+                    .iter()
+                    .map(|f| TradeKvs::build(market_id, block_height, timestamp, 0, f))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+            orders.push(OrderSettlePlan {
+                margin_release,
+                pnl_events,
+                fill_error,
+                trades,
+            });
         }
 
-        NativeBatchResult { results, total_gas }
+        // A5 maker/STP release amounts against the POST-MATCH book (the same
+        // object the sequential loop reads back out of ctx.order_books).
+        let maker_releases = Self::maker_margin_releases_cfg(
+            cfg,
+            Some(&mbr.book),
+            mbr.results.iter().map(|m| &m.result),
+        );
+
+        MarketSettlePlan {
+            orders,
+            pos_cache,
+            maker_releases,
+        }
+    }
+
+    /// C1: apply one side of a fill entirely through the per-batch write-back
+    /// caches. The position read-modify-write hits `pos_cache`; if the fill
+    /// had a close component, `apply_fill_cached` returns the realized PnL and
+    /// it is credited through `bal_cache` (exactly when the classic
+    /// `apply_fill` would have written the balance row — including a zero PnL,
+    /// which still materializes the row). No overlay access on the hot path.
+    #[allow(clippy::too_many_arguments)]
+    fn apply_fill_via_caches<T: StateBackend>(
+        positions: &PositionManager<T>,
+        pos_cache: &mut PositionCache,
+        bal_cache: &mut BalanceCache,
+        trader: &Address,
+        market_id: MarketId,
+        is_buy: bool,
+        qty: FixedPoint,
+        price: FixedPoint,
+    ) -> Result<(), CoreError> {
+        if let Some(pnl) = positions.apply_fill_cached(
+            pos_cache,
+            trader,
+            market_id,
+            is_buy,
+            qty,
+            price,
+            MarginType::Cross,
+        )? {
+            let mut bal = bal_cache.load(positions, trader)?;
+            bal.available += pnl;
+            bal_cache.set(trader, bal);
+        }
+        Ok(())
     }
 
     // ========================================================================
@@ -992,13 +2302,22 @@ impl NativeExecutor {
         price: FixedPoint,
         qty: FixedPoint,
     ) -> FixedPoint {
+        Self::reserve_for_qty_cfg(ctx.margin_configs.get(&market_id), price, qty)
+    }
+
+    /// C3: ctx-free core of [`reserve_for_qty`] — pure in (market margin
+    /// config, price, qty), so settle-plan workers can compute release
+    /// amounts off-thread with byte-identical arithmetic.
+    fn reserve_for_qty_cfg(
+        cfg: Option<&MarketMarginConfig>,
+        price: FixedPoint,
+        qty: FixedPoint,
+    ) -> FixedPoint {
         if price <= FixedPoint::ZERO || qty <= FixedPoint::ZERO {
             return FixedPoint::ZERO;
         }
         let notional = price * qty;
-        let max_lev = ctx
-            .margin_configs
-            .get(&market_id)
+        let max_lev = cfg
             .map(|c| effective_max_leverage(&c.tiers, notional))
             .unwrap_or(20);
         notional / FixedPoint::from_raw(max_lev as i128 * FixedPoint::SCALE)
@@ -1025,6 +2344,22 @@ impl NativeExecutor {
         market_id: MarketId,
         results: impl Iterator<Item = &'a PlaceResult>,
     ) -> Vec<(Address, FixedPoint)> {
+        Self::maker_margin_releases_cfg(
+            ctx.margin_configs.get(&market_id),
+            ctx.order_books.get(&market_id),
+            results,
+        )
+    }
+
+    /// C3: ctx-free core of [`maker_margin_releases`] — pure in (market
+    /// margin config, post-match book, match results). Settle-plan workers
+    /// call it with the worker-owned post-match book (the same object the
+    /// sequential loop reads back out of `ctx.order_books` after reinsertion).
+    fn maker_margin_releases_cfg<'a>(
+        cfg: Option<&MarketMarginConfig>,
+        book: Option<&OrderBook>,
+        results: impl Iterator<Item = &'a PlaceResult>,
+    ) -> Vec<(Address, FixedPoint)> {
         use std::collections::BTreeMap;
 
         // maker order id -> (maker, resting price, total qty consumed by fills)
@@ -1047,7 +2382,6 @@ impl NativeExecutor {
             return Vec::new();
         }
 
-        let book = ctx.order_books.get(&market_id);
         let mut out = Vec::with_capacity(consumed.len() + stp.len());
 
         for (&order_id, &(maker, price, qty_consumed)) in &consumed {
@@ -1058,9 +2392,8 @@ impl NativeExecutor {
                 .map(|o| o.remaining_qty)
                 .or_else(|| stp.get(&order_id).map(|&(_, _, rem)| rem))
                 .unwrap_or(FixedPoint::ZERO);
-            let release =
-                Self::reserve_for_qty(ctx, market_id, price, remaining_after + qty_consumed)
-                    - Self::reserve_for_qty(ctx, market_id, price, remaining_after);
+            let release = Self::reserve_for_qty_cfg(cfg, price, remaining_after + qty_consumed)
+                - Self::reserve_for_qty_cfg(cfg, price, remaining_after);
             if release > FixedPoint::ZERO {
                 out.push((maker, release));
             }
@@ -1068,7 +2401,7 @@ impl NativeExecutor {
         for (&_order_id, &(trader, price, remaining)) in &stp {
             // Full leftover reservation of the STP-cancelled maker (its fills
             // earlier in the batch, if any, are covered by the pass above).
-            let release = Self::reserve_for_qty(ctx, market_id, price, remaining);
+            let release = Self::reserve_for_qty_cfg(cfg, price, remaining);
             if release > FixedPoint::ZERO {
                 out.push((trader, release));
             }
@@ -1259,72 +2592,38 @@ impl NativeExecutor {
         market_id: MarketId,
         fill: &torus_core::order_book::Fill,
     ) {
-        let taker_side: u8 = if fill.maker_side == Side::Buy { 1 } else { 0 };
+        let kvs = TradeKvs::build(
+            market_id,
+            ctx.block_height,
+            ctx.timestamp,
+            ctx.trade_index,
+            fill,
+        );
+        Self::route_trade_kvs(ctx, kvs);
+        ctx.trade_index += 1;
+    }
 
-        // Primary key: market_id(8) + block_number(8) + trade_index(4)
-        let mut trade_key = [0u8; 20];
-        trade_key[..8].copy_from_slice(&market_id.to_be_bytes());
-        trade_key[8..16].copy_from_slice(&ctx.block_height.to_be_bytes());
-        trade_key[16..20].copy_from_slice(&ctx.trade_index.to_be_bytes());
-
-        let trade_id = ctx.trade_index as u128;
-        let price_raw = fill.price.raw();
-        let quantity_raw = fill.quantity.raw();
-
-        // Borsh-serialize trade data (matches StoredTrade layout)
-        let mut trade_data = Vec::with_capacity(64);
-        trade_data.extend_from_slice(&trade_id.to_le_bytes());
-        trade_data.extend_from_slice(&price_raw.to_le_bytes());
-        trade_data.extend_from_slice(&quantity_raw.to_le_bytes());
-        trade_data.push(taker_side);
-        trade_data.extend_from_slice(&ctx.block_height.to_le_bytes());
-        trade_data.extend_from_slice(&ctx.timestamp.to_le_bytes());
-
-        // Secondary index: per-user trades (descending block order)
-        let desc_block = u64::MAX - ctx.block_height;
-        let mut maker_data = Vec::with_capacity(80);
-        maker_data.extend_from_slice(&trade_id.to_le_bytes());
-        maker_data.extend_from_slice(&market_id.to_le_bytes());
-        maker_data.extend_from_slice(&price_raw.to_le_bytes());
-        maker_data.extend_from_slice(&quantity_raw.to_le_bytes());
-        maker_data.push(taker_side);
-        maker_data.push(0u8); // role: maker
-        maker_data.extend_from_slice(&ctx.block_height.to_le_bytes());
-        maker_data.extend_from_slice(&ctx.timestamp.to_le_bytes());
-
-        let mut maker_key = [0u8; 32];
-        maker_key[..20].copy_from_slice(fill.maker.as_slice());
-        maker_key[20..28].copy_from_slice(&desc_block.to_be_bytes());
-        maker_key[28..32].copy_from_slice(&ctx.trade_index.to_be_bytes());
-
-        // Taker entry (flip role byte at offset 57: 16+8+16+16+1)
-        let mut taker_data = maker_data.clone();
-        taker_data[57] = 1u8; // role: taker
-        let mut taker_key = [0u8; 32];
-        taker_key[..20].copy_from_slice(fill.taker.as_slice());
-        taker_key[20..28].copy_from_slice(&desc_block.to_be_bytes());
-        taker_key[28..32].copy_from_slice(&ctx.trade_index.to_be_bytes());
-
+    /// Route one fill's trade rows: buffered under `defer_trades` (O3), else
+    /// inline overlay PUTs — exactly the classic persist_trade tail.
+    fn route_trade_kvs<T: StateBackend>(ctx: &mut NativeExecContext<T>, kvs: TradeKvs) {
         if ctx.defer_trades {
             ctx.pending_trades
-                .push((CF_NATIVE_TRADES, trade_key.to_vec(), trade_data));
+                .push((CF_NATIVE_TRADES, kvs.trade_key.to_vec(), kvs.trade_data));
             ctx.pending_trades
-                .push((CF_NATIVE_USER_TRADES, maker_key.to_vec(), maker_data));
+                .push((CF_NATIVE_USER_TRADES, kvs.maker_key.to_vec(), kvs.maker_data));
             ctx.pending_trades
-                .push((CF_NATIVE_USER_TRADES, taker_key.to_vec(), taker_data));
+                .push((CF_NATIVE_USER_TRADES, kvs.taker_key.to_vec(), kvs.taker_data));
         } else {
             let _ = ctx
                 .state
-                .put_cf_raw(CF_NATIVE_TRADES, &trade_key, &trade_data);
+                .put_cf_raw(CF_NATIVE_TRADES, &kvs.trade_key, &kvs.trade_data);
             let _ = ctx
                 .state
-                .put_cf_raw(CF_NATIVE_USER_TRADES, &maker_key, &maker_data);
+                .put_cf_raw(CF_NATIVE_USER_TRADES, &kvs.maker_key, &kvs.maker_data);
             let _ = ctx
                 .state
-                .put_cf_raw(CF_NATIVE_USER_TRADES, &taker_key, &taker_data);
+                .put_cf_raw(CF_NATIVE_USER_TRADES, &kvs.taker_key, &kvs.taker_data);
         }
-
-        ctx.trade_index += 1;
     }
 
     /// FIX CONS-FIND-30: Ownership check added -- only the order's trader can cancel.

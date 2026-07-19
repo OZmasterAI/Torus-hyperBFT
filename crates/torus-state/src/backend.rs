@@ -1,5 +1,5 @@
-use std::collections::{BTreeMap, HashSet};
-use std::sync::{Arc, RwLock};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use alloy_primitives::Address;
 use revm::state::AccountInfo;
@@ -196,19 +196,76 @@ impl StateBackend for StateDb {
 // NativeStateOverlay — in-memory pending map + RocksDB fallthrough
 // ============================================================================
 
+/// C2 (perf): interned column-family id — an index into [`crate::cf::ALL_CF_NAMES`].
+///
+/// INTERNAL representation only. The overlay's public API still speaks `&str` CF
+/// names and `&[u8]` keys, and every flush resolves the id back to the exact
+/// `&'static str` it was interned from, so the byte-level RocksDB keys (and hence
+/// every hash preimage over them) are identical to the pre-interning
+/// `(String, Vec<u8>)` composite-key map — proven by
+/// `interned_overlay_stores_identical_rocksdb_keys` below.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+struct CfId(u8);
+
+/// Number of registered CFs — one overlay bucket per CF.
+const NUM_CFS: usize = crate::cf::ALL_CF_NAMES.len();
+
+impl CfId {
+    #[inline]
+    fn name(self) -> &'static str {
+        crate::cf::ALL_CF_NAMES[self.0 as usize]
+    }
+}
+
+/// Intern a CF name to its [`CfId`]. `None` for a name outside
+/// [`crate::cf::ALL_CF_NAMES`] — `StateDb::open` registers exactly that list, so
+/// such a CF cannot exist in any target database and no overlay entry for it
+/// could ever flush.
+#[inline]
+fn intern_cf(name: &str) -> Option<CfId> {
+    static TABLE: OnceLock<HashMap<&'static str, u8>> = OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        crate::cf::ALL_CF_NAMES
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (*n, i as u8))
+            .collect()
+    });
+    table.get(name).map(|&i| CfId(i))
+}
+
 /// One recorded native-write mutation plus the prior state needed to undo it — an
 /// entry in [`NativeStateOverlay`]'s call-frame undo trail (T4.4 revert-safety).
 struct JournalEntry {
-    map_key: (String, Vec<u8>),
-    /// Value previously held in `writes` for `map_key` (`None` if it was absent).
+    cf: CfId,
+    key: Vec<u8>,
+    /// Value previously held in `writes` for the key (`None` if it was absent).
     prev_write: Option<Vec<u8>>,
-    /// Whether `map_key` was previously tombstoned in `deletes`.
+    /// Whether the key was previously tombstoned in `deletes`.
     prev_deleted: bool,
 }
 
+/// Per-CF pending mutations. Keys are plain `Vec<u8>` — no `(String, Vec<u8>)`
+/// composite allocation per get/put, and lookups borrow the caller's `&[u8]`
+/// directly (zero allocations on the read path).
+#[derive(Default)]
+struct CfPending {
+    writes: BTreeMap<Vec<u8>, Vec<u8>>,
+    /// `BTreeSet` (was a `HashSet` over composite keys) so delete flush order is
+    /// deterministic; final state never depended on it (put/delete keys are
+    /// disjoint by invariant), this just removes the last order wobble.
+    deletes: BTreeSet<Vec<u8>>,
+}
+
+impl CfPending {
+    fn is_empty(&self) -> bool {
+        self.writes.is_empty() && self.deletes.is_empty()
+    }
+}
+
 struct PendingState {
-    writes: BTreeMap<(String, Vec<u8>), Vec<u8>>,
-    deletes: HashSet<(String, Vec<u8>)>,
+    /// Indexed by [`CfId`] — one bucket per registered CF.
+    cfs: [CfPending; NUM_CFS],
     /// T4.4: append-only undo trail for writer-precompile side effects. `checkpoints`
     /// holds savepoint lengths into this log so a call frame that reverts can roll its
     /// native writes back (see [`NativeStateOverlay::checkpoint`]).
@@ -217,19 +274,103 @@ struct PendingState {
 }
 
 impl PendingState {
-    /// Record the pre-mutation state of `map_key` so any open checkpoint can undo it.
+    fn new() -> Self {
+        Self {
+            cfs: std::array::from_fn(|_| CfPending::default()),
+            journal_log: Vec::new(),
+            checkpoints: Vec::new(),
+        }
+    }
+
+    #[inline]
+    fn cf(&self, id: CfId) -> &CfPending {
+        &self.cfs[id.0 as usize]
+    }
+
+    #[inline]
+    fn cf_mut(&mut self, id: CfId) -> &mut CfPending {
+        &mut self.cfs[id.0 as usize]
+    }
+
+    fn is_empty(&self) -> bool {
+        self.cfs.iter().all(CfPending::is_empty)
+    }
+
+    fn clear(&mut self) {
+        for cfp in &mut self.cfs {
+            cfp.writes.clear();
+            cfp.deletes.clear();
+        }
+        self.journal_log.clear();
+        self.checkpoints.clear();
+    }
+
+    /// Record the pre-mutation state of `(cf, key)` so any open checkpoint can undo it.
     /// No-op when no checkpoint is active — tx-scope writes made outside any EVM call
     /// frame are reverted wholesale via [`NativeStateOverlay::discard_tx`], so they need
     /// no per-mutation trail (and we avoid growing the log on that path).
-    fn record(&mut self, map_key: &(String, Vec<u8>)) {
+    fn record(&mut self, cf: CfId, key: &[u8]) {
         if self.checkpoints.is_empty() {
             return;
         }
-        self.journal_log.push(JournalEntry {
-            map_key: map_key.clone(),
-            prev_write: self.writes.get(map_key).cloned(),
-            prev_deleted: self.deletes.contains(map_key),
-        });
+        let cfp = self.cf(cf);
+        let entry = JournalEntry {
+            cf,
+            key: key.to_vec(),
+            prev_write: cfp.writes.get(key).cloned(),
+            prev_deleted: cfp.deletes.contains(key),
+        };
+        self.journal_log.push(entry);
+    }
+
+    /// Append every pending write and delete to `batch`, resolving each CF handle
+    /// ONCE per CF (was once per key). Byte-identical stored keys/values to the
+    /// pre-C2 composite-key loop; CF order is `ALL_CF_NAMES` order and keys are
+    /// sorted within a CF — put/delete keys are disjoint (put removes the
+    /// tombstone, delete removes the write), so batch entry order cannot change
+    /// the final state.
+    ///
+    /// Semantics preserved from pre-C2: a missing CF errors on the WRITE path
+    /// and is silently skipped on the DELETE path.
+    fn append_to_batch(&self, db: &rocksdb::DB, batch: &mut WriteBatch) -> Result<(), StateError> {
+        for (idx, cfp) in self.cfs.iter().enumerate() {
+            let name = CfId(idx as u8).name();
+            if !cfp.writes.is_empty() {
+                let cf = db
+                    .cf_handle(name)
+                    .ok_or_else(|| StateError::MissingColumnFamily(name.to_string()))?;
+                for (key, value) in &cfp.writes {
+                    batch.put_cf(cf, key, value);
+                }
+            }
+            if !cfp.deletes.is_empty() {
+                if let Some(cf) = db.cf_handle(name) {
+                    for key in &cfp.deletes {
+                        batch.delete_cf(cf, key);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The native-root dirty `(cf_tag, key) -> Option<value>` set these pending
+    /// mutations imply — writes (`Some`) and deletes (`None`) hitting the 6
+    /// native-root CFs only.
+    fn native_dirty(&self) -> BTreeMap<(u8, Vec<u8>), Option<Vec<u8>>> {
+        let mut dirty: BTreeMap<(u8, Vec<u8>), Option<Vec<u8>>> = BTreeMap::new();
+        for (idx, cfp) in self.cfs.iter().enumerate() {
+            let Some(tag) = crate::native_trie::cf_tag(CfId(idx as u8).name()) else {
+                continue;
+            };
+            for (key, value) in &cfp.writes {
+                dirty.insert((tag, key.clone()), Some(value.clone()));
+            }
+            for key in &cfp.deletes {
+                dirty.insert((tag, key.clone()), None);
+            }
+        }
+        dirty
     }
 }
 
@@ -243,30 +384,14 @@ impl NativeStateOverlay {
     pub fn new(db: StateDb) -> Self {
         Self {
             db,
-            pending: Arc::new(RwLock::new(PendingState {
-                writes: BTreeMap::new(),
-                deletes: HashSet::new(),
-                journal_log: Vec::new(),
-                checkpoints: Vec::new(),
-            })),
+            pending: Arc::new(RwLock::new(PendingState::new())),
         }
     }
 
     pub fn flush(&self, target: &StateDb) -> Result<(), StateError> {
         let state = self.pending.read().unwrap();
-        let db = target.inner();
         let mut batch = WriteBatch::default();
-        for ((cf_name, key), value) in &state.writes {
-            let cf = db
-                .cf_handle(cf_name)
-                .ok_or_else(|| StateError::MissingColumnFamily(cf_name.clone()))?;
-            batch.put_cf(cf, key, value);
-        }
-        for (cf_name, key) in &state.deletes {
-            if let Some(cf) = db.cf_handle(cf_name) {
-                batch.delete_cf(cf, key);
-            }
-        }
+        state.append_to_batch(target.inner(), &mut batch)?;
         target.write(batch)
     }
 
@@ -276,31 +401,17 @@ impl NativeStateOverlay {
     /// journal is empty, so read-only paths never touch the database.
     pub fn commit_tx(&self, target: &StateDb) -> Result<(), StateError> {
         let mut state = self.pending.write().unwrap();
-        if state.writes.is_empty() && state.deletes.is_empty() {
+        if state.is_empty() {
             // Per-tx reset even on the empty path: the frame checkpoint stack must not
             // leak across transactions (see `checkpoint`).
             state.journal_log.clear();
             state.checkpoints.clear();
             return Ok(());
         }
-        let db = target.inner();
         let mut batch = WriteBatch::default();
-        for ((cf_name, key), value) in &state.writes {
-            let cf = db
-                .cf_handle(cf_name)
-                .ok_or_else(|| StateError::MissingColumnFamily(cf_name.clone()))?;
-            batch.put_cf(cf, key, value);
-        }
-        for (cf_name, key) in &state.deletes {
-            if let Some(cf) = db.cf_handle(cf_name) {
-                batch.delete_cf(cf, key);
-            }
-        }
+        state.append_to_batch(target.inner(), &mut batch)?;
         target.write(batch)?;
-        state.writes.clear();
-        state.deletes.clear();
-        state.journal_log.clear();
-        state.checkpoints.clear();
+        state.clear();
         Ok(())
     }
 
@@ -308,10 +419,7 @@ impl NativeStateOverlay {
     /// REVERT for writer-precompile side effects (calling EVM tx reverted or halted).
     pub fn discard_tx(&self) {
         let mut state = self.pending.write().unwrap();
-        state.writes.clear();
-        state.deletes.clear();
-        state.journal_log.clear();
-        state.checkpoints.clear();
+        state.clear();
     }
 
     /// T4.4 revert-safety: open a call-frame checkpoint over the writer-precompile journal.
@@ -350,18 +458,19 @@ impl NativeStateOverlay {
         };
         while state.journal_log.len() > target {
             let entry = state.journal_log.pop().unwrap();
+            let cfp = state.cf_mut(entry.cf);
             match entry.prev_write {
                 Some(v) => {
-                    state.writes.insert(entry.map_key.clone(), v);
+                    cfp.writes.insert(entry.key.clone(), v);
                 }
                 None => {
-                    state.writes.remove(&entry.map_key);
+                    cfp.writes.remove(&entry.key);
                 }
             }
             if entry.prev_deleted {
-                state.deletes.insert(entry.map_key);
+                cfp.deletes.insert(entry.key);
             } else {
-                state.deletes.remove(&entry.map_key);
+                cfp.deletes.remove(&entry.key);
             }
         }
     }
@@ -396,7 +505,11 @@ impl NativeStateOverlay {
 
     pub fn pending_write_count(&self) -> usize {
         let state = self.pending.read().unwrap();
-        state.writes.len() + state.deletes.len()
+        state
+            .cfs
+            .iter()
+            .map(|c| c.writes.len() + c.deletes.len())
+            .sum()
     }
 
     /// Addresses whose `CF_ACCOUNTS` entry this overlay wrote or deleted.
@@ -407,15 +520,17 @@ impl NativeStateOverlay {
     /// `torus_state::incremental::resync_evm_accounts` so `CF_HASHED_*`/`CF_TRIE_*` keep tracking
     /// `CF_ACCOUNTS` (otherwise the incremental root drifts from the full scan — devnet-smoke find).
     pub fn dirty_evm_accounts(&self) -> Vec<Address> {
+        let accounts_cf = intern_cf(CF_ACCOUNTS).expect("CF_ACCOUNTS is registered");
         let state = self.pending.read().unwrap();
+        let cfp = state.cf(accounts_cf);
         let mut addrs = Vec::new();
-        for (cf_name, key) in state.writes.keys() {
-            if cf_name == CF_ACCOUNTS && key.len() == 20 {
+        for key in cfp.writes.keys() {
+            if key.len() == 20 {
                 addrs.push(Address::from_slice(key));
             }
         }
-        for (cf_name, key) in &state.deletes {
-            if cf_name == CF_ACCOUNTS && key.len() == 20 {
+        for key in &cfp.deletes {
+            if key.len() == 20 {
                 addrs.push(Address::from_slice(key));
             }
         }
@@ -428,18 +543,7 @@ impl NativeStateOverlay {
     /// (nonces, governance, markets, …) are excluded — they are not part of the native root.
     pub fn dirty_native_keys(&self) -> BTreeMap<(u8, Vec<u8>), Option<Vec<u8>>> {
         let state = self.pending.read().unwrap();
-        let mut dirty = BTreeMap::new();
-        for ((cf_name, key), value) in &state.writes {
-            if let Some(tag) = crate::native_trie::cf_tag(cf_name) {
-                dirty.insert((tag, key.clone()), Some(value.clone()));
-            }
-        }
-        for (cf_name, key) in &state.deletes {
-            if let Some(tag) = crate::native_trie::cf_tag(cf_name) {
-                dirty.insert((tag, key.clone()), None);
-            }
-        }
-        dirty
+        state.native_dirty()
     }
 
     /// Flush pending native writes AND maintain the bucketed native trie — the native-CF writes and
@@ -487,30 +591,10 @@ impl NativeStateOverlay {
         let state = self.pending.read().unwrap();
         let raw = target.inner();
         let mut batch = WriteBatch::default();
-        for ((cf_name, key), value) in &state.writes {
-            let cf = raw
-                .cf_handle(cf_name)
-                .ok_or_else(|| StateError::MissingColumnFamily(cf_name.clone()))?;
-            batch.put_cf(cf, key, value);
-        }
-        for (cf_name, key) in &state.deletes {
-            if let Some(cf) = raw.cf_handle(cf_name) {
-                batch.delete_cf(cf, key);
-            }
-        }
+        state.append_to_batch(raw, &mut batch)?;
 
         // Native-root dirty map, folded into the SAME batch.
-        let mut dirty: BTreeMap<(u8, Vec<u8>), Option<Vec<u8>>> = BTreeMap::new();
-        for ((cf_name, key), value) in &state.writes {
-            if let Some(tag) = crate::native_trie::cf_tag(cf_name) {
-                dirty.insert((tag, key.clone()), Some(value.clone()));
-            }
-        }
-        for (cf_name, key) in &state.deletes {
-            if let Some(tag) = crate::native_trie::cf_tag(cf_name) {
-                dirty.insert((tag, key.clone()), None);
-            }
-        }
+        let dirty = state.native_dirty();
 
         // apply_native_dirty_to_batch computes all ops before appending, so on Err nothing was
         // appended and the native-CF writes still flush.
@@ -538,33 +622,43 @@ impl NativeStateOverlay {
 
 impl StateBackend for NativeStateOverlay {
     fn get_cf_raw(&self, cf: &str, key: &[u8]) -> Result<Option<Vec<u8>>, StateError> {
-        let state = self.pending.read().unwrap();
-        let map_key = (cf.to_string(), key.to_vec());
-        if let Some(value) = state.writes.get(&map_key) {
-            return Ok(Some(value.clone()));
+        // C2: interned CF + borrowed key lookup — ZERO allocations on this path
+        // (was one String + one Vec<u8> per get). An unregistered CF name can
+        // never hold overlay entries (put/delete reject it), so it falls through
+        // to the database, which reports MissingColumnFamily exactly as before.
+        if let Some(id) = intern_cf(cf) {
+            let state = self.pending.read().unwrap();
+            let cfp = state.cf(id);
+            if let Some(value) = cfp.writes.get(key) {
+                return Ok(Some(value.clone()));
+            }
+            if cfp.deletes.contains(key) {
+                return Ok(None);
+            }
         }
-        if state.deletes.contains(&map_key) {
-            return Ok(None);
-        }
-        drop(state);
         self.db.get_cf_raw(cf, key)
     }
 
     fn put_cf_raw(&self, cf: &str, key: &[u8], value: &[u8]) -> Result<(), StateError> {
+        // C2: an unregistered CF errors HERE instead of at flush time (pre-C2 the
+        // write sat in the map and `flush` returned this same MissingColumnFamily).
+        // No registered-CF path changes; unknown names never occur in execution.
+        let id = intern_cf(cf).ok_or_else(|| StateError::MissingColumnFamily(cf.to_string()))?;
         let mut state = self.pending.write().unwrap();
-        let map_key = (cf.to_string(), key.to_vec());
-        state.record(&map_key);
-        state.deletes.remove(&map_key);
-        state.writes.insert(map_key, value.to_vec());
+        state.record(id, key);
+        let cfp = state.cf_mut(id);
+        cfp.deletes.remove(key);
+        cfp.writes.insert(key.to_vec(), value.to_vec());
         Ok(())
     }
 
     fn delete_cf_raw(&self, cf: &str, key: &[u8]) -> Result<(), StateError> {
+        let id = intern_cf(cf).ok_or_else(|| StateError::MissingColumnFamily(cf.to_string()))?;
         let mut state = self.pending.write().unwrap();
-        let map_key = (cf.to_string(), key.to_vec());
-        state.record(&map_key);
-        state.writes.remove(&map_key);
-        state.deletes.insert(map_key);
+        state.record(id, key);
+        let cfp = state.cf_mut(id);
+        cfp.writes.remove(key);
+        cfp.deletes.insert(key.to_vec());
         Ok(())
     }
 
@@ -573,23 +667,28 @@ impl StateBackend for NativeStateOverlay {
         cf: &str,
         prefix: Option<&[u8]>,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StateError> {
+        let Some(id) = intern_cf(cf) else {
+            // Unregistered CF: the overlay cannot hold entries for it; delegate
+            // (the DB reports MissingColumnFamily, same as pre-C2).
+            return StateBackend::iterate_cf(&self.db, cf, prefix);
+        };
         let state = self.pending.read().unwrap();
-        let cf_str = cf.to_string();
+        let cfp = state.cf(id);
 
-        // Collect pending writes matching this CF+prefix
-        let pending_entries: BTreeMap<Vec<u8>, Vec<u8>> = state
+        // Collect pending writes matching this prefix (per-CF map: no more
+        // range-scan over a composite (String, Vec<u8>) keyspace).
+        let pending_entries: BTreeMap<Vec<u8>, Vec<u8>> = cfp
             .writes
-            .range((cf_str.clone(), Vec::new())..)
-            .take_while(|((c, _), _)| c == &cf_str)
-            .filter(|((_, k), _)| prefix.is_none_or(|p| k.starts_with(p)))
-            .map(|((_, k), v)| (k.clone(), v.clone()))
+            .iter()
+            .filter(|(k, _)| prefix.is_none_or(|p| k.starts_with(p)))
+            .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
 
-        let tombstones: HashSet<Vec<u8>> = state
+        let tombstones: HashSet<Vec<u8>> = cfp
             .deletes
             .iter()
-            .filter(|(c, k)| c == &cf_str && prefix.is_none_or(|p| k.starts_with(p)))
-            .map(|(_, k)| k.clone())
+            .filter(|k| prefix.is_none_or(|p| k.starts_with(p)))
+            .cloned()
             .collect();
         drop(state);
 
@@ -608,20 +707,31 @@ impl StateBackend for NativeStateOverlay {
     }
 
     fn atomic_write(&self, ops: &[AtomicWriteOp<'_>]) -> Result<(), StateError> {
+        // Intern every CF FIRST so an unregistered name rejects the whole op set
+        // before any mutation (atomic even on the error path).
+        let ids: Vec<CfId> = ops
+            .iter()
+            .map(|op| {
+                let cf = match op {
+                    AtomicWriteOp::Put { cf, .. } | AtomicWriteOp::Delete { cf, .. } => cf,
+                };
+                intern_cf(cf).ok_or_else(|| StateError::MissingColumnFamily(cf.to_string()))
+            })
+            .collect::<Result<_, _>>()?;
         let mut state = self.pending.write().unwrap();
-        for op in ops {
+        for (op, &id) in ops.iter().zip(ids.iter()) {
             match op {
-                AtomicWriteOp::Put { cf, key, value } => {
-                    let map_key = (cf.to_string(), key.to_vec());
-                    state.record(&map_key);
-                    state.deletes.remove(&map_key);
-                    state.writes.insert(map_key, value.to_vec());
+                AtomicWriteOp::Put { key, value, .. } => {
+                    state.record(id, key);
+                    let cfp = state.cf_mut(id);
+                    cfp.deletes.remove(*key);
+                    cfp.writes.insert(key.to_vec(), value.to_vec());
                 }
-                AtomicWriteOp::Delete { cf, key } => {
-                    let map_key = (cf.to_string(), key.to_vec());
-                    state.record(&map_key);
-                    state.writes.remove(&map_key);
-                    state.deletes.insert(map_key);
+                AtomicWriteOp::Delete { key, .. } => {
+                    state.record(id, key);
+                    let cfp = state.cf_mut(id);
+                    cfp.writes.remove(*key);
+                    cfp.deletes.insert(key.to_vec());
                 }
             }
         }
@@ -1035,6 +1145,95 @@ mod tests {
         assert!(StateBackend::get_cf_raw(&overlay, cf, b"b")
             .unwrap()
             .is_none());
+    }
+
+    /// C2 RED-first (missing-symbol red, T156-F1 doctrine): every registered CF
+    /// name interns to a distinct id that resolves back to the SAME `&'static str`
+    /// — the flush path therefore addresses byte-identical CF names — and an
+    /// unregistered name does not intern.
+    #[test]
+    fn cf_interning_roundtrip_all_registered_names() {
+        let mut seen = std::collections::HashSet::new();
+        for name in crate::cf::ALL_CF_NAMES {
+            let id = intern_cf(name).unwrap_or_else(|| panic!("{name} must intern"));
+            assert_eq!(id.name(), *name, "intern must round-trip to the same name");
+            assert!(seen.insert(id), "ids must be distinct ({name})");
+        }
+        assert_eq!(seen.len(), NUM_CFS);
+        assert!(intern_cf("cf_not_a_real_family").is_none());
+        assert!(intern_cf("").is_none());
+    }
+
+    /// C2 equivalence proof: keys/values stored in RocksDB through the interned
+    /// overlay are BYTE-IDENTICAL to direct `StateDb` writes of the same
+    /// `(cf, key, value)` triples — across native-root and non-root CFs, with
+    /// binary keys (0x00 / 0xff bytes), an empty key, deletes, and overwrites.
+    /// Also pins that the consensus-authoritative native root over the two
+    /// databases is equal (identical hash preimages).
+    #[test]
+    fn interned_overlay_stores_identical_rocksdb_keys() {
+        use crate::cf::{CF_NATIVE_NONCES, CF_NATIVE_POSITIONS, CF_STAKING_VALIDATORS};
+
+        let triples: Vec<(&str, Vec<u8>, Vec<u8>)> = vec![
+            (CF_NATIVE_BALANCES, b"\x00\x01acct".to_vec(), b"bal".to_vec()),
+            (CF_NATIVE_BALANCES, vec![0xff; 28], b"maxkey".to_vec()),
+            (CF_NATIVE_BALANCES, Vec::new(), b"emptykey".to_vec()),
+            (CF_NATIVE_POSITIONS, b"trader1:mkt1".to_vec(), vec![0x00, 0xff, 0x7f]),
+            (CF_STAKING_VALIDATORS, b"val1".to_vec(), b"stake".to_vec()),
+            (CF_NATIVE_NONCES, b"sender\x00\x00\x00\x01".to_vec(), b"h".to_vec()),
+        ];
+        // Overwrite + delete exercised on both paths identically.
+        let overwrite = (CF_NATIVE_BALANCES, b"\x00\x01acct".to_vec(), b"bal2".to_vec());
+        let delete = (CF_NATIVE_POSITIONS, b"trader1:mkt1".to_vec());
+
+        // DB 1: direct StateDb writes.
+        let (db_direct, _dir1) = temp_db();
+        for (cf, key, value) in &triples {
+            StateDb::put_cf_raw(&db_direct, cf, key, value).unwrap();
+        }
+        StateDb::put_cf_raw(&db_direct, overwrite.0, &overwrite.1, &overwrite.2).unwrap();
+        StateDb::delete_cf_raw(&db_direct, delete.0, &delete.1).unwrap();
+
+        // DB 2: the same mutations through the interned overlay, then flush.
+        let (db_overlay, _dir2) = temp_db();
+        let overlay = NativeStateOverlay::new(db_overlay.clone());
+        for (cf, key, value) in &triples {
+            StateBackend::put_cf_raw(&overlay, cf, key, value).unwrap();
+        }
+        StateBackend::put_cf_raw(&overlay, overwrite.0, &overwrite.1, &overwrite.2).unwrap();
+        StateBackend::delete_cf_raw(&overlay, delete.0, &delete.1).unwrap();
+        overlay.flush(&db_overlay).unwrap();
+
+        // Every CF's full (key, value) listing must be byte-identical.
+        for cf in crate::cf::ALL_CF_NAMES {
+            let direct = StateBackend::iterate_cf(&db_direct, cf, None).unwrap();
+            let via_overlay = StateBackend::iterate_cf(&db_overlay, cf, None).unwrap();
+            assert_eq!(
+                direct, via_overlay,
+                "stored keys/values diverge in {cf}: interned overlay is NOT byte-identical"
+            );
+        }
+
+        // And the consensus-authoritative native root agrees (same hash preimages).
+        assert_eq!(
+            crate::native_trie::native_root_full(&db_direct).unwrap(),
+            crate::native_trie::native_root_full(&db_overlay).unwrap(),
+            "native state root must be identical for direct vs interned-overlay writes"
+        );
+    }
+
+    /// C2: an unregistered CF name is rejected at put/delete time with the SAME
+    /// error (`MissingColumnFamily`) that pre-C2 code deferred to flush time —
+    /// no such write can ever land in a `StateDb` (open registers ALL_CF_NAMES).
+    #[test]
+    fn unknown_cf_rejected_at_put_with_missing_cf_error() {
+        let (db, _dir) = temp_db();
+        let overlay = NativeStateOverlay::new(db);
+        let err = StateBackend::put_cf_raw(&overlay, "cf_bogus", b"k", b"v").unwrap_err();
+        assert!(matches!(err, StateError::MissingColumnFamily(ref n) if n == "cf_bogus"));
+        let err = StateBackend::delete_cf_raw(&overlay, "cf_bogus", b"k").unwrap_err();
+        assert!(matches!(err, StateError::MissingColumnFamily(ref n) if n == "cf_bogus"));
+        assert_eq!(overlay.pending_write_count(), 0, "nothing may be buffered");
     }
 
     /// T4.4: `discard_tx` resets the checkpoint stack so no undo trail leaks into the next tx.

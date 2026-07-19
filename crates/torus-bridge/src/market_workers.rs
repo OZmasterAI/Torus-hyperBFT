@@ -10,16 +10,20 @@ use torus_core::order_book::{OrderBook, PlaceResult};
 use torus_types::{MarketId, OrderId, PlaceOrderParams};
 
 /// A single order to be matched by a worker thread.
-pub struct MatchRequest {
+///
+/// C2: `params` is a BORROW of the caller's committed action data (the
+/// `(Address, NativeAction)` slice owned by the block executor) — the matching
+/// pipeline no longer deep-clones `PlaceOrderParams` per stage. The one copy
+/// left is at the book boundary (`OrderBook::place_order` takes ownership).
+pub struct MatchRequest<'a> {
     pub sender: Address,
-    pub params: PlaceOrderParams,
+    pub params: &'a PlaceOrderParams,
     pub order_id: OrderId,
 }
 
 /// Result of matching a single order.
 pub struct MatchResult {
     pub sender: Address,
-    pub params: PlaceOrderParams,
     pub order_id: OrderId,
     pub result: PlaceResult,
 }
@@ -60,7 +64,7 @@ impl MarketWorkerPool {
     /// `thread::scope` and killing the execution thread (which left consensus
     /// zombie-advancing on a closed exec channel).
     pub fn match_parallel(
-        batches: HashMap<MarketId, (OrderBook, Vec<MatchRequest>)>,
+        batches: HashMap<MarketId, (OrderBook, Vec<MatchRequest<'_>>)>,
         timestamp: u64,
     ) -> Result<Vec<MarketBatchResult>, MarketWorkerPanic> {
         if batches.is_empty() {
@@ -76,8 +80,10 @@ impl MarketWorkerPool {
             .map(|r| vec![r]);
         }
 
-        // Multiple markets — parallel via scoped threads
-        let batches_vec: Vec<(MarketId, OrderBook, Vec<MatchRequest>)> = batches
+        // Multiple markets — parallel via scoped threads. The borrowed
+        // `MatchRequest.params` refs outlive the scope (they borrow from the
+        // caller's action slice), so scoped threads may capture them freely.
+        let batches_vec: Vec<(MarketId, OrderBook, Vec<MatchRequest<'_>>)> = batches
             .into_iter()
             .map(|(id, (book, reqs))| (id, book, reqs))
             .collect();
@@ -141,18 +147,18 @@ impl MarketWorkerPool {
     fn match_market(
         market_id: MarketId,
         mut book: OrderBook,
-        requests: Vec<MatchRequest>,
+        requests: Vec<MatchRequest<'_>>,
         timestamp: u64,
     ) -> MarketBatchResult {
         let mut results = Vec::with_capacity(requests.len());
 
         for req in requests {
             book.set_next_order_id(req.order_id);
+            // C2: THE one params copy in the pipeline — the book takes ownership.
             let place_result = book.place_order(req.params.clone(), req.sender, timestamp);
 
             results.push(MatchResult {
                 sender: req.sender,
-                params: req.params,
                 order_id: req.order_id,
                 result: place_result,
             });
@@ -194,7 +200,7 @@ mod worker_panic_containment_tests {
     /// Healthy input keeps working through the new `Result` surface.
     #[test]
     fn empty_batches_return_ok_empty() {
-        let batches: HashMap<MarketId, (OrderBook, Vec<MatchRequest>)> = HashMap::new();
+        let batches: HashMap<MarketId, (OrderBook, Vec<MatchRequest<'_>>)> = HashMap::new();
         let results =
             MarketWorkerPool::match_parallel(batches, 1000).expect("no worker, no panic");
         assert!(results.is_empty());

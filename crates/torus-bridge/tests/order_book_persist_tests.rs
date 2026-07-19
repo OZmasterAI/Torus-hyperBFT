@@ -106,7 +106,7 @@ fn untouched_block_saves_nothing() {
     assert_eq!(ctx.save_order_books(), 1);
 
     // A block that executes NO order actions must not rewrite any book.
-    let ctx = make_ctx(db);
+    let mut ctx = make_ctx(db);
     assert_eq!(ctx.order_books.len(), 1);
     assert_eq!(ctx.save_order_books(), 0, "no mutations => no writes");
 }

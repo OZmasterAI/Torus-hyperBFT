@@ -2,6 +2,7 @@
 //!
 //! Stores positions in CF_NATIVE_POSITIONS and native balances in CF_NATIVE_BALANCES.
 
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
 
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -293,6 +294,14 @@ impl<T: StateBackend> PositionManager<T> {
     // ---- Fill application ----
 
     /// Update position after a fill. Handles open/increase/reduce/close/flip.
+    ///
+    /// Reads and writes the backend directly (one position read-modify-write
+    /// plus, on any close component, one balance read-modify-write). Batch
+    /// callers that settle many fills should use [`apply_fill_cached`]
+    /// (C1) — identical transition semantics via [`fill_transition`], but the
+    /// row round-trips hit an in-memory [`PositionCache`] instead.
+    ///
+    /// [`apply_fill_cached`]: Self::apply_fill_cached
     pub fn apply_fill(
         &self,
         trader: &Address,
@@ -303,66 +312,136 @@ impl<T: StateBackend> PositionManager<T> {
         margin_type: MarginType,
     ) -> Result<(), CoreError> {
         let existing = self.get_position(trader, market_id)?;
+        let (new_pos, pnl) =
+            fill_transition(existing, trader, market_id, is_buy, fill_qty, fill_price, margin_type);
+        match new_pos {
+            Some(pos) => self.put_position(&pos)?,
+            // `fill_transition` yields None only on a full close of an
+            // existing position, so the delete always targets a live row.
+            None => self.delete_position(trader, market_id)?,
+        }
+        if let Some(pnl) = pnl {
+            self.credit_realized_pnl(trader, pnl)?;
+        }
+        Ok(())
+    }
 
-        match existing {
-            None => {
-                // Open new position
-                self.put_position(&Position {
-                    trader: *trader,
-                    market_id,
-                    is_long: is_buy,
-                    size: fill_qty,
-                    entry_price: fill_price,
-                    realized_pnl: FixedPoint::ZERO,
-                    isolated_margin: FixedPoint::ZERO,
-                    margin_type,
-                })?;
-            }
-            Some(mut pos) => {
-                let same_dir = (is_buy && pos.is_long) || (!is_buy && !pos.is_long);
+    /// C1: `apply_fill`, but the position read-modify-write goes through a
+    /// write-back [`PositionCache`] and NO balance is touched — the realized
+    /// PnL (if the fill had a close component) is returned for the caller to
+    /// credit through whatever balance authority it maintains (the executor's
+    /// BalanceCache). `Some(pnl)` is emitted exactly when the classic path
+    /// would have called its internal PnL credit — including `Some(ZERO)` for
+    /// a flat close, which still materializes the trader's balance row.
+    pub fn apply_fill_cached(
+        &self,
+        cache: &mut PositionCache,
+        trader: &Address,
+        market_id: MarketId,
+        is_buy: bool,
+        fill_qty: FixedPoint,
+        fill_price: FixedPoint,
+        margin_type: MarginType,
+    ) -> Result<Option<FixedPoint>, CoreError> {
+        let existing = cache.load(self, trader, market_id)?;
+        let (new_pos, pnl) =
+            fill_transition(existing, trader, market_id, is_buy, fill_qty, fill_price, margin_type);
+        match new_pos {
+            Some(pos) => cache.set(pos),
+            None => cache.remove(trader, market_id),
+        }
+        Ok(pnl)
+    }
 
-                if same_dir {
-                    // Increase: weighted average entry
-                    let total_cost = pos.entry_price * pos.size + fill_price * fill_qty;
-                    let new_size = pos.size + fill_qty;
-                    if new_size > FixedPoint::ZERO {
-                        pos.entry_price = total_cost / new_size;
-                    }
-                    pos.size = new_size;
-                    self.put_position(&pos)?;
-                } else if fill_qty < pos.size {
-                    // Partial close
-                    let pnl_per = if pos.is_long {
-                        fill_price - pos.entry_price
-                    } else {
-                        pos.entry_price - fill_price
-                    };
-                    pos.realized_pnl += pnl_per * fill_qty;
-                    pos.size -= fill_qty;
-                    self.put_position(&pos)?;
-                    self.credit_realized_pnl(trader, pnl_per * fill_qty)?;
-                } else if fill_qty == pos.size {
-                    // Full close
-                    let pnl_per = if pos.is_long {
-                        fill_price - pos.entry_price
-                    } else {
-                        pos.entry_price - fill_price
-                    };
-                    let pnl = pnl_per * fill_qty;
-                    self.delete_position(trader, market_id)?;
-                    self.credit_realized_pnl(trader, pnl)?;
+    /// Credit (or debit if negative) realized PnL to native balance.
+    fn credit_realized_pnl(&self, trader: &Address, pnl: FixedPoint) -> Result<(), CoreError> {
+        let mut bal = self.get_native_balance(trader)?;
+        bal.available += pnl;
+        self.put_native_balance(trader, &bal)?;
+        Ok(())
+    }
+}
+
+// ============================================================================
+// Fill transition (pure) + PositionCache (C1)
+// ============================================================================
+
+/// Pure fill transition shared by [`PositionManager::apply_fill`] and
+/// [`PositionManager::apply_fill_cached`] so the two paths cannot drift.
+///
+/// Returns `(new_position, pnl_event)`:
+/// - `new_position`: `Some(pos)` to store, `None` when the fill fully closed
+///   an existing position (row must be deleted). A `None` input (no existing
+///   position) always opens, so `None` output implies the input was `Some`.
+/// - `pnl_event`: `Some(pnl)` iff the fill had a close component (partial
+///   close, full close, or flip) — exactly the cases where the classic path
+///   credited realized PnL to the trader's native balance. `Some(ZERO)` is
+///   meaningful: the credit of zero still creates/rewrites the balance row.
+fn fill_transition(
+    existing: Option<Position>,
+    trader: &Address,
+    market_id: MarketId,
+    is_buy: bool,
+    fill_qty: FixedPoint,
+    fill_price: FixedPoint,
+    margin_type: MarginType,
+) -> (Option<Position>, Option<FixedPoint>) {
+    match existing {
+        None => (
+            // Open new position
+            Some(Position {
+                trader: *trader,
+                market_id,
+                is_long: is_buy,
+                size: fill_qty,
+                entry_price: fill_price,
+                realized_pnl: FixedPoint::ZERO,
+                isolated_margin: FixedPoint::ZERO,
+                margin_type,
+            }),
+            None,
+        ),
+        Some(mut pos) => {
+            let same_dir = (is_buy && pos.is_long) || (!is_buy && !pos.is_long);
+
+            if same_dir {
+                // Increase: weighted average entry
+                let total_cost = pos.entry_price * pos.size + fill_price * fill_qty;
+                let new_size = pos.size + fill_qty;
+                if new_size > FixedPoint::ZERO {
+                    pos.entry_price = total_cost / new_size;
+                }
+                pos.size = new_size;
+                (Some(pos), None)
+            } else if fill_qty < pos.size {
+                // Partial close
+                let pnl_per = if pos.is_long {
+                    fill_price - pos.entry_price
                 } else {
-                    // Flip: close + open opposite
-                    let pnl_per = if pos.is_long {
-                        fill_price - pos.entry_price
-                    } else {
-                        pos.entry_price - fill_price
-                    };
-                    let close_pnl = pnl_per * pos.size;
-                    self.credit_realized_pnl(trader, close_pnl)?;
-
-                    let remainder = fill_qty - pos.size;
-                    self.put_position(&Position {
+                    pos.entry_price - fill_price
+                };
+                pos.realized_pnl += pnl_per * fill_qty;
+                pos.size -= fill_qty;
+                (Some(pos), Some(pnl_per * fill_qty))
+            } else if fill_qty == pos.size {
+                // Full close
+                let pnl_per = if pos.is_long {
+                    fill_price - pos.entry_price
+                } else {
+                    pos.entry_price - fill_price
+                };
+                (None, Some(pnl_per * fill_qty))
+            } else {
+                // Flip: close + open opposite
+                let pnl_per = if pos.is_long {
+                    fill_price - pos.entry_price
+                } else {
+                    pos.entry_price - fill_price
+                };
+                let close_pnl = pnl_per * pos.size;
+                let remainder = fill_qty - pos.size;
+                (
+                    Some(Position {
                         trader: *trader,
                         market_id,
                         is_long: is_buy,
@@ -371,18 +450,114 @@ impl<T: StateBackend> PositionManager<T> {
                         realized_pnl: FixedPoint::ZERO,
                         isolated_margin: FixedPoint::ZERO,
                         margin_type,
-                    })?;
-                }
+                    }),
+                    Some(close_pnl),
+                )
             }
         }
-        Ok(())
+    }
+}
+
+/// C1: per-batch write-back cache for `Position` rows, mirroring the
+/// executor's BalanceCache pattern.
+///
+/// Phase-4 settlement does two position read-modify-writes per fill; through
+/// the `NativeStateOverlay` each get/put takes an `RwLock` and allocates
+/// `(String, Vec<u8>)` map keys plus a Borsh round-trip. This cache keeps the
+/// working set in a typed in-memory map for the duration of a batch: first
+/// reads fall through to the backend, subsequent read-modify-writes are pure
+/// map operations, and each *unique* dirty row is written to the backend once
+/// by [`flush_all`].
+///
+/// Entries are `Option<Position>`: `Some` is a live row, `None` is either a
+/// cached miss or a tombstone from a full close (`remove`). Tombstoned dirty
+/// entries flush as deletes — including open-then-close within one batch,
+/// which matches the classic path's put-then-delete (both end in an overlay
+/// tombstone for the key).
+///
+/// Determinism: final backend state is order-independent anyway (distinct
+/// keys, last-write-wins), but [`flush_all`] additionally sorts dirty keys by
+/// `(trader, market_id)` — exactly the byte order of [`position_key`], since
+/// both encode big-endian — so every node issues the identical write
+/// sequence.
+///
+/// Coherence: the cache is only valid while it is the *single* authority for
+/// position rows — every in-batch position read/write must go through it, and
+/// `flush_all` must run before anything else (next batch, book persistence,
+/// block-end flush) reads positions from the backend.
+///
+/// [`flush_all`]: Self::flush_all
+#[derive(Default)]
+pub struct PositionCache {
+    map: HashMap<(Address, MarketId), Option<Position>>,
+    dirty: HashSet<(Address, MarketId)>,
+}
+
+impl PositionCache {
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    /// Credit (or debit if negative) realized PnL to native balance.
-    fn credit_realized_pnl(&self, trader: &Address, pnl: FixedPoint) -> Result<(), CoreError> {
-        let mut bal = self.get_native_balance(trader)?;
-        bal.available += pnl;
-        self.put_native_balance(trader, &bal)?;
+    /// Read-through load: cache hit, else fall through to the backend and
+    /// memoize (a miss caches `None` so repeat misses stay in-memory too).
+    pub fn load<T: StateBackend>(
+        &mut self,
+        positions: &PositionManager<T>,
+        trader: &Address,
+        market_id: MarketId,
+    ) -> Result<Option<Position>, CoreError> {
+        let key = (*trader, market_id);
+        if let Some(entry) = self.map.get(&key) {
+            return Ok(entry.clone());
+        }
+        let pos = positions.get_position(trader, market_id)?;
+        self.map.insert(key, pos.clone());
+        Ok(pos)
+    }
+
+    /// Store an updated position and mark it dirty (no backend write yet).
+    pub fn set(&mut self, pos: Position) {
+        let key = (pos.trader, pos.market_id);
+        self.map.insert(key, Some(pos));
+        self.dirty.insert(key);
+    }
+
+    /// Tombstone a fully-closed position (flushes as a delete).
+    pub fn remove(&mut self, trader: &Address, market_id: MarketId) {
+        let key = (*trader, market_id);
+        self.map.insert(key, None);
+        self.dirty.insert(key);
+    }
+
+    /// C3 (parallel settle): absorb another cache — entries and dirty marks.
+    ///
+    /// Intended for merging PER-MARKET caches into the batch cache: position
+    /// keys are `(trader, market_id)`, so caches built from different markets
+    /// have provably disjoint key sets and the merged map is identical to
+    /// what one shared cache would hold after sequential settlement — in any
+    /// merge order. Callers merge in sorted market order anyway.
+    pub fn merge_disjoint(&mut self, other: PositionCache) {
+        self.map.extend(other.map);
+        self.dirty.extend(other.dirty);
+    }
+
+    /// Write every dirty row to the backend once, in sorted key order
+    /// (deterministic write sequence; see type-level docs). Clean entries
+    /// (read-only hits/misses) are untouched. Clears the dirty set.
+    pub fn flush_all<T: StateBackend>(
+        &mut self,
+        positions: &PositionManager<T>,
+    ) -> Result<(), CoreError> {
+        let mut keys: Vec<(Address, MarketId)> = self.dirty.iter().copied().collect();
+        keys.sort();
+        for key in keys {
+            match self.map.get(&key) {
+                Some(Some(pos)) => positions.put_position(pos)?,
+                Some(None) => positions.delete_position(&key.0, key.1)?,
+                None => {}
+            }
+        }
+        self.dirty.clear();
         Ok(())
     }
 }
