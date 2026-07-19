@@ -912,6 +912,86 @@ impl OrderBook {
 }
 
 // ============================================================================
+// C4 (perf/exec-scaleup): canonical read access + rebuild hooks for
+// per-order-row book persistence (torus-bridge, `TORUS_BOOK_ROWS`).
+//
+// The row store persists each resting order / pending stop as its own KV row
+// instead of one whole-book Borsh blob, so it needs (a) level-structured
+// read access in the CANONICAL order (the exact order the whole-book Borsh
+// serializer walks: bids ascending price then asks ascending price, FIFO
+// within a level) and (b) rebuild hooks equivalent to what
+// `BorshDeserialize for OrderBook` does internally. Nothing here can express
+// a book state the classic (de)serializer couldn't.
+// ============================================================================
+
+impl OrderBook {
+    /// Bid price levels ascending (the whole-book serializer's walk order),
+    /// each with its FIFO queue (front = highest time priority).
+    pub fn bid_queues(&self) -> impl Iterator<Item = (&FixedPoint, &VecDeque<Order>)> {
+        self.bids.iter()
+    }
+
+    /// Ask price levels ascending, each with its FIFO queue.
+    pub fn ask_queues(&self) -> impl Iterator<Item = (&FixedPoint, &VecDeque<Order>)> {
+        self.asks.iter()
+    }
+
+    /// Re-insert a previously-resting order during a persistence rebuild.
+    /// Exactly what `BorshDeserialize for OrderBook` does per order: push to
+    /// the back of its price level's queue and index it. Callers MUST insert
+    /// in canonical order (bids ascending price then asks, FIFO within level)
+    /// to reproduce queue priority.
+    pub fn restore_resting_order(&mut self, order: Order) {
+        self.insert_order(order);
+    }
+
+    /// Set the last trade price during a persistence rebuild (the classic
+    /// blob carries it in its header).
+    pub fn set_last_trade_price(&mut self, ltp: Option<FixedPoint>) {
+        self.last_trade_price = ltp;
+    }
+
+    /// Pending stop orders as `(id, borsh bytes)` in trigger (Vec) order.
+    /// Stop ids are allocated monotonically and stops are only ever appended /
+    /// removed (`Vec::retain` preserves relative order), so Vec order ==
+    /// ascending id — the row store relies on this to rebuild trigger order
+    /// from id-sorted rows. Debug-asserted here.
+    pub fn stop_rows(&self) -> Vec<(OrderId, Vec<u8>)> {
+        debug_assert!(
+            self.pending_stops.windows(2).all(|w| w[0].id < w[1].id),
+            "pending_stops must stay id-ascending (rebuild order invariant)"
+        );
+        self.pending_stops
+            .iter()
+            .map(|s| {
+                (
+                    s.id,
+                    borsh::to_vec(s).expect("StopOrder borsh serialize cannot fail"),
+                )
+            })
+            .collect()
+    }
+
+    /// Rebuild one pending stop from its row bytes (see [`Self::stop_rows`]).
+    /// Callers MUST append in ascending id order. Returns the stop's id.
+    pub fn restore_stop_row(&mut self, bytes: &[u8]) -> io::Result<OrderId> {
+        let stop = StopOrder::try_from_slice(bytes)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        if let Some(last) = self.pending_stops.last() {
+            if stop.id <= last.id {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "stop rows must be restored in ascending id order",
+                ));
+            }
+        }
+        let id = stop.id;
+        self.pending_stops.push(stop);
+        Ok(id)
+    }
+}
+
+// ============================================================================
 // FIX 1 (ECON-FIND-02): Borsh Serialization for OrderBook
 // ============================================================================
 

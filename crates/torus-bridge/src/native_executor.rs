@@ -371,6 +371,237 @@ mod parallel_settle_toggle_tests {
     }
 }
 
+// ============================================================================
+// C4 — per-order-row book persistence (`TORUS_BOOK_ROWS`)
+// ============================================================================
+//
+// Classic path (default): each market's ENTIRE `OrderBook` is Borsh-serialized
+// into one `CF_NATIVE_ORDER_BOOKS` row per touched block — O(book depth) bytes
+// serialized AND state-root-hashed per block, the 2GB-RSS / swap driver once
+// books hold >1M resting orders.
+//
+// Row path (`TORUS_BOOK_ROWS=1`): one KV row per resting order / pending stop
+// plus one small meta row per market. Saves write only the rows that changed
+// (new / partially-filled orders, cancels as deletes), so persistence AND
+// state-root work become O(changed orders).
+//
+// ############################ CONSENSUS WARNING ############################
+// `CF_NATIVE_ORDER_BOOKS` is one of the 6 native-state-root CFs. The row
+// layout stores DIFFERENT keys/values than the classic whole-book blob, so
+// THE FLAG CHANGES THE STATE-ROOT FORMAT:
+//   - every validator in a fleet MUST run the same TORUS_BOOK_ROWS value —
+//     a mixed fleet forks at the first block that touches any book;
+//   - enabling (or disabling) the flag on an existing chain REQUIRES a fresh
+//     genesis — there is no migration, and load refuses to start (fail-stop
+//     via ctx.fatal_error) when the CF's on-disk content does not match the
+//     configured mode.
+// Default OFF = byte-identical persistence and state root to today.
+// ###########################################################################
+//
+// Row schema (all integers big-endian, framed for future extension by key tag):
+//   meta  key `market_id(8) ‖ 0x00`            (9 bytes)
+//         val `next_seq(8) ‖ tick_raw(16) ‖ lot_raw(16) ‖ next_id(16) ‖
+//              ltp_tag(1) [‖ ltp_raw(16)]`
+//   order key `market_id(8) ‖ 0x01 ‖ order_id(16)`  (25 bytes)
+//         val `seq(8) ‖ Order borsh`
+//   stop  key `market_id(8) ‖ 0x02 ‖ stop_id(16)`   (25 bytes)
+//         val `StopOrder borsh`
+//
+// `seq` is the queue-priority sequence: within one (side, price) level, FIFO
+// order == ascending seq. Seqs are assigned at save time from the meta row's
+// `next_seq` counter, walking the book in canonical order — a pure function
+// of persisted consensus state and the block's book operations, so every
+// validator assigns identical seqs (they are part of the state root). An
+// order whose persisted seq no longer sorts consistently with its actual
+// queue position (a modify_order that lost time priority and re-entered at
+// the back of a queue with its old id) is detected by a per-level monotonicity
+// walk and re-stamped with a fresh seq.
+//
+// D-rank8 note (resident books): rows support cheap point updates — a fill
+// touches ONE order row, a cancel is ONE delete — so a future resident-book
+// cache can skip the per-block reload/rebuild entirely and drive row writes
+// straight from the op stream. Nothing in this schema assumes the per-block
+// reload below.
+
+/// C4 runtime toggle: `TORUS_BOOK_ROWS=1` enables per-order-row persistence;
+/// anything else (INCLUDING UNSET) keeps the classic whole-book blob —
+/// byte-identical state root to today. Read once per process. See the
+/// consensus warning above: must be fleet-uniform, needs fresh genesis.
+fn book_rows_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| parse_book_rows_toggle(std::env::var("TORUS_BOOK_ROWS").ok()))
+}
+
+/// Pure parse of the `TORUS_BOOK_ROWS` value: only `"1"` enables rows.
+fn parse_book_rows_toggle(v: Option<String>) -> bool {
+    matches!(v.as_deref().map(str::trim), Some("1"))
+}
+
+const BOOK_ROW_META: u8 = 0x00;
+const BOOK_ROW_ORDER: u8 = 0x01;
+const BOOK_ROW_STOP: u8 = 0x02;
+
+fn book_meta_key(market_id: MarketId) -> [u8; 9] {
+    let mut k = [0u8; 9];
+    k[..8].copy_from_slice(&market_id.to_be_bytes());
+    k[8] = BOOK_ROW_META;
+    k
+}
+
+fn book_order_key(market_id: MarketId, order_id: OrderId) -> [u8; 25] {
+    let mut k = [0u8; 25];
+    k[..8].copy_from_slice(&market_id.to_be_bytes());
+    k[8] = BOOK_ROW_ORDER;
+    k[9..].copy_from_slice(&order_id.to_be_bytes());
+    k
+}
+
+fn book_stop_key(market_id: MarketId, stop_id: OrderId) -> [u8; 25] {
+    let mut k = [0u8; 25];
+    k[..8].copy_from_slice(&market_id.to_be_bytes());
+    k[8] = BOOK_ROW_STOP;
+    k[9..].copy_from_slice(&stop_id.to_be_bytes());
+    k
+}
+
+/// Meta row value — see the schema comment above.
+fn book_meta_value(next_seq: u64, book: &OrderBook) -> Vec<u8> {
+    let mut v = Vec::with_capacity(8 + 16 + 16 + 16 + 1 + 16);
+    v.extend_from_slice(&next_seq.to_be_bytes());
+    v.extend_from_slice(&book.tick_size.raw().to_be_bytes());
+    v.extend_from_slice(&book.lot_size.raw().to_be_bytes());
+    v.extend_from_slice(&book.next_order_id().to_be_bytes());
+    match book.last_trade_price() {
+        None => v.push(0),
+        Some(p) => {
+            v.push(1);
+            v.extend_from_slice(&p.raw().to_be_bytes());
+        }
+    }
+    v
+}
+
+/// Parsed meta row.
+struct BookMeta {
+    next_seq: u64,
+    tick_size: FixedPoint,
+    lot_size: FixedPoint,
+    next_id: u128,
+    last_trade_price: Option<FixedPoint>,
+}
+
+fn parse_book_meta(v: &[u8]) -> Result<BookMeta, String> {
+    let need = |ok: bool| if ok { Ok(()) } else { Err("book meta row truncated".to_string()) };
+    need(v.len() >= 8 + 16 + 16 + 16 + 1)?;
+    let next_seq = u64::from_be_bytes(v[0..8].try_into().unwrap());
+    let tick = i128::from_be_bytes(v[8..24].try_into().unwrap());
+    let lot = i128::from_be_bytes(v[24..40].try_into().unwrap());
+    let next_id = u128::from_be_bytes(v[40..56].try_into().unwrap());
+    let last_trade_price = match v[56] {
+        0 => {
+            need(v.len() == 57)?;
+            None
+        }
+        1 => {
+            need(v.len() == 57 + 16)?;
+            Some(FixedPoint::from_raw(i128::from_be_bytes(
+                v[57..73].try_into().unwrap(),
+            )))
+        }
+        _ => return Err("book meta row: bad ltp tag".to_string()),
+    };
+    Ok(BookMeta {
+        next_seq,
+        tick_size: FixedPoint::from_raw(tick),
+        lot_size: FixedPoint::from_raw(lot),
+        next_id,
+        last_trade_price,
+    })
+}
+
+/// Order row value: `seq(8 BE) ‖ Order borsh`.
+fn book_order_value(seq: u64, order: &torus_core::order_book::Order) -> Vec<u8> {
+    let mut v = Vec::with_capacity(8 + 96);
+    v.extend_from_slice(&seq.to_be_bytes());
+    borsh::BorshSerialize::serialize(order, &mut v).expect("Order borsh serialize cannot fail");
+    v
+}
+
+fn parse_book_order_row(v: &[u8]) -> Result<(u64, torus_core::order_book::Order), String> {
+    use borsh::BorshDeserialize;
+    if v.len() < 8 {
+        return Err("book order row truncated".to_string());
+    }
+    let seq = u64::from_be_bytes(v[0..8].try_into().unwrap());
+    let order = torus_core::order_book::Order::try_from_slice(&v[8..])
+        .map_err(|e| format!("book order row borsh: {e}"))?;
+    Ok((seq, order))
+}
+
+/// Per-order persisted state the differ needs: the assigned queue seq plus
+/// every `Order` field that can MUTATE while the order rests. `modify_order`
+/// can change `price` (cancel+reinsert, same id), `remaining_qty` (partial
+/// fill / in-place decrease / replace), and `original_qty` (qty-increase
+/// modify); everything else (trader, side, type, tif, timestamp, reduce_only,
+/// client_order_id) is immutable for a given id. Equality on these three
+/// fields therefore means the persisted row bytes are current.
+/// INVARIANT: if `OrderBook` ever grows another mutable resting-order field,
+/// it must be added here or rows go stale.
+struct OrderShadow {
+    seq: u64,
+    price_raw: i128,
+    qty_raw: i128,
+    original_qty_raw: i128,
+    gen: u32,
+}
+
+impl OrderShadow {
+    fn matches(&self, o: &torus_core::order_book::Order) -> bool {
+        self.price_raw == o.price.raw()
+            && self.qty_raw == o.remaining_qty.raw()
+            && self.original_qty_raw == o.original_qty.raw()
+    }
+}
+
+/// One market's persisted-row shadow: what `CF_NATIVE_ORDER_BOOKS` currently
+/// holds for it under the row schema. Rebuilt from the CF at load, kept
+/// current by `save_order_books` — the differ that turns whole-book state
+/// into O(changed) row writes.
+#[derive(Default)]
+struct BookRowShadow {
+    orders: HashMap<OrderId, OrderShadow>,
+    stops: std::collections::HashSet<OrderId>,
+    /// Queue-seq allocator (persisted in the meta row — consensus state).
+    next_seq: u64,
+    /// Last persisted meta row value (empty = never written).
+    meta: Vec<u8>,
+    /// Mark-and-sweep generation for delete detection.
+    gen: u32,
+}
+
+#[cfg(test)]
+mod book_rows_toggle_tests {
+    use super::parse_book_rows_toggle;
+
+    #[test]
+    fn default_is_off() {
+        assert!(!parse_book_rows_toggle(None));
+    }
+
+    #[test]
+    fn one_enables() {
+        assert!(parse_book_rows_toggle(Some("1".to_string())));
+        assert!(parse_book_rows_toggle(Some(" 1 ".to_string())));
+    }
+
+    #[test]
+    fn anything_else_stays_off() {
+        for v in ["0", "true", "on", "", "yes", "2"] {
+            assert!(!parse_book_rows_toggle(Some(v.to_string())), "{v}");
+        }
+    }
+}
+
 pub struct NativeExecContext<T: StateBackend = StateDb> {
     pub positions: PositionManager<T>,
     pub oracle: OracleManager<T>,
@@ -428,10 +659,20 @@ pub struct NativeExecContext<T: StateBackend = StateDb> {
     /// post-state is unreconstructable — the committer MUST treat this as
     /// fatal (fail-stop the node), never flush state or mark the block applied.
     pub fatal_error: Option<String>,
+
+    /// C4: per-order-row book persistence (`TORUS_BOOK_ROWS=1`). CONSENSUS-
+    /// VISIBLE — see the module-level C4 schema comment: fleet-uniform flag,
+    /// fresh genesis required, mixed on-disk content fail-stops at load.
+    book_rows: bool,
+    /// C4: per-market shadow of the persisted rows (row differ state).
+    /// Populated only when `book_rows`.
+    book_shadows: HashMap<MarketId, BookRowShadow>,
 }
 
 impl<T: StateBackend> NativeExecContext<T> {
     /// Create a new execution context from a state backend and block metadata.
+    /// Book persistence mode comes from the `TORUS_BOOK_ROWS` env toggle
+    /// (default OFF = classic whole-book blobs).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         state: T,
@@ -444,13 +685,53 @@ impl<T: StateBackend> NativeExecContext<T> {
         treasury_address: Address,
         dev_pool_address: Address,
     ) -> Self {
+        Self::new_with_book_rows(
+            state,
+            block_height,
+            timestamp,
+            epoch,
+            epoch_length,
+            max_validators,
+            proposer,
+            treasury_address,
+            dev_pool_address,
+            book_rows_enabled(),
+        )
+    }
+
+    /// [`Self::new`] with the C4 book-persistence mode pinned explicitly
+    /// (tests / tooling — per-process env vars race across test threads).
+    /// `book_rows = false` is the classic whole-book path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_book_rows(
+        state: T,
+        block_height: u64,
+        timestamp: u64,
+        epoch: u64,
+        epoch_length: u64,
+        max_validators: u32,
+        proposer: Address,
+        treasury_address: Address,
+        dev_pool_address: Address,
+        book_rows: bool,
+    ) -> Self {
         let positions = PositionManager::new(state.clone());
         let oracle = OracleManager::new(state.clone(), OracleConfig::default());
         let staking = StakingManager::new(state.clone());
         let governance = GovernanceManager::new(state.clone());
 
         // FIX 1 (ECON-FIND-02): Load persisted order books from DB on startup.
-        let (order_books, scanned_next_id) = Self::load_order_books(&state);
+        // C4: the on-disk layout must match the configured mode — a mismatch
+        // (whole-book blobs under TORUS_BOOK_ROWS=1, or row keys without it)
+        // means this node's flag disagrees with the DB's history. Loading
+        // "what we can" would silently diverge from the fleet, so latch a
+        // fatal instead: the committer fail-stops before flushing anything.
+        let (order_books, scanned_next_id, book_shadows, load_error) = if book_rows {
+            Self::load_order_books_rows(&state)
+        } else {
+            let (books, next_id, err) = Self::load_order_books(&state);
+            (books, next_id, HashMap::new(), err)
+        };
         // S395: the durable counter row is authoritative when present — the
         // book-maxima scan resets to 1 once all books drain, silently reusing
         // order ids across a restart. max() keeps back-compat with DBs written
@@ -482,7 +763,9 @@ impl<T: StateBackend> NativeExecContext<T> {
             defer_trades: false,
             pending_trades: Vec::new(),
             metrics: None,
-            fatal_error: None,
+            fatal_error: load_error,
+            book_rows,
+            book_shadows,
         }
     }
 
@@ -492,8 +775,18 @@ impl<T: StateBackend> NativeExecContext<T> {
         std::mem::take(&mut self.pending_trades)
     }
 
-    /// FIX 1 (ECON-FIND-02): Load order books from DB. Returns (books, next_global_order_id).
-    fn load_order_books(state: &T) -> (HashMap<MarketId, OrderBook>, u128) {
+    /// True if `key` belongs to the C4 row schema (meta / order / stop row).
+    fn is_book_row_key(key: &[u8]) -> bool {
+        (key.len() == 9 && key[8] == BOOK_ROW_META)
+            || (key.len() == 25 && (key[8] == BOOK_ROW_ORDER || key[8] == BOOK_ROW_STOP))
+    }
+
+    /// FIX 1 (ECON-FIND-02): Load order books from DB (classic whole-book
+    /// blobs). Returns (books, next_global_order_id, fatal load error).
+    /// C4: finding row-schema keys here means the DB was written under
+    /// `TORUS_BOOK_ROWS=1` but this node runs without it — fatal (the classic
+    /// loader would silently see empty books and diverge from the fleet).
+    fn load_order_books(state: &T) -> (HashMap<MarketId, OrderBook>, u128, Option<String>) {
         use borsh::BorshDeserialize;
         use torus_state::cf::CF_NATIVE_ORDER_BOOKS;
 
@@ -502,6 +795,19 @@ impl<T: StateBackend> NativeExecContext<T> {
 
         if let Ok(entries) = state.iterate_cf(CF_NATIVE_ORDER_BOOKS, None) {
             for (key, value) in entries {
+                if Self::is_book_row_key(&key) {
+                    return (
+                        HashMap::new(),
+                        1,
+                        Some(
+                            "C4: cf_native_order_books holds per-order rows but \
+                             TORUS_BOOK_ROWS is not set — the flag must match the \
+                             DB's history (fleet-uniform; changing it needs a fresh \
+                             genesis)"
+                                .to_string(),
+                        ),
+                    );
+                }
                 if key.len() == 8 {
                     let market_id = u64::from_be_bytes(key[..8].try_into().unwrap());
                     if let Ok(book) = OrderBook::try_from_slice(&value) {
@@ -517,7 +823,167 @@ impl<T: StateBackend> NativeExecContext<T> {
 
         // Global ID starts at max found + 1 (or 1 if no books loaded)
         let next_id = if max_order_id > 0 { max_order_id } else { 1 };
-        (books, next_id)
+        (books, next_id, None)
+    }
+
+    /// C4: load order books from per-order rows (`TORUS_BOOK_ROWS=1`).
+    /// Rebuilds every book in the CANONICAL insertion order the classic
+    /// deserializer uses — bids ascending price then asks ascending price,
+    /// FIFO (= ascending seq) within a level; stops ascending id — and the
+    /// per-market row shadows the save-side differ needs.
+    /// Returns (books, next_global_order_id, shadows, fatal load error).
+    #[allow(clippy::type_complexity)]
+    fn load_order_books_rows(
+        state: &T,
+    ) -> (
+        HashMap<MarketId, OrderBook>,
+        u128,
+        HashMap<MarketId, BookRowShadow>,
+        Option<String>,
+    ) {
+        use torus_state::cf::CF_NATIVE_ORDER_BOOKS;
+
+        let fail = |msg: String| (HashMap::new(), 1, HashMap::new(), Some(msg));
+
+        // Per-market accumulators.
+        struct Acc {
+            meta: Option<BookMeta>,
+            orders: Vec<(u64, torus_core::order_book::Order)>,
+            stops: Vec<(u128, Vec<u8>)>,
+        }
+        let mut accs: HashMap<MarketId, Acc> = HashMap::new();
+        let acc = |m: &mut HashMap<MarketId, Acc>, id: MarketId| -> &mut Acc {
+            m.entry(id).or_insert_with(|| Acc {
+                meta: None,
+                orders: Vec::new(),
+                stops: Vec::new(),
+            })
+        };
+
+        let entries = match state.iterate_cf(CF_NATIVE_ORDER_BOOKS, None) {
+            Ok(e) => e,
+            Err(e) => return fail(format!("C4: book row scan failed: {e}")),
+        };
+        for (key, value) in entries {
+            if key.len() == 8 {
+                return fail(
+                    "C4: TORUS_BOOK_ROWS=1 but cf_native_order_books holds classic \
+                     whole-book blobs — the flag must match the DB's history \
+                     (fleet-uniform; enabling it needs a fresh genesis)"
+                        .to_string(),
+                );
+            }
+            if !Self::is_book_row_key(&key) {
+                return fail(format!(
+                    "C4: unrecognized cf_native_order_books key (len {}) under \
+                     TORUS_BOOK_ROWS=1",
+                    key.len()
+                ));
+            }
+            let market_id = u64::from_be_bytes(key[..8].try_into().unwrap());
+            match key[8] {
+                BOOK_ROW_META => match parse_book_meta(&value) {
+                    Ok(m) => acc(&mut accs, market_id).meta = Some(m),
+                    Err(e) => return fail(format!("C4: market {market_id}: {e}")),
+                },
+                BOOK_ROW_ORDER => match parse_book_order_row(&value) {
+                    Ok(row) => acc(&mut accs, market_id).orders.push(row),
+                    Err(e) => return fail(format!("C4: market {market_id}: {e}")),
+                },
+                BOOK_ROW_STOP => {
+                    let stop_id = u128::from_be_bytes(key[9..25].try_into().unwrap());
+                    acc(&mut accs, market_id).stops.push((stop_id, value));
+                }
+                _ => unreachable!("is_book_row_key checked the tag"),
+            }
+        }
+
+        let mut books = HashMap::new();
+        let mut shadows = HashMap::new();
+        let mut max_order_id: u128 = 0;
+
+        // Deterministic rebuild order (market id ascending) — not strictly
+        // required (per-market state is independent), but keeps any log/debug
+        // output stable.
+        let mut market_ids: Vec<MarketId> = accs.keys().copied().collect();
+        market_ids.sort_unstable();
+
+        for market_id in market_ids {
+            let mut a = accs.remove(&market_id).unwrap();
+            let Some(meta) = a.meta else {
+                return fail(format!(
+                    "C4: market {market_id} has order/stop rows but no meta row \
+                     (corrupt row store)"
+                ));
+            };
+
+            let mut book = OrderBook::new(market_id, meta.tick_size, meta.lot_size);
+            book.set_next_order_id(meta.next_id);
+            book.set_last_trade_price(meta.last_trade_price);
+
+            // Canonical insertion order: bids ascending (price, seq), then
+            // asks ascending (price, seq) — exactly the classic deserializer's
+            // walk, so queue priority and index Vec orders match it.
+            let mut shadow = BookRowShadow {
+                next_seq: meta.next_seq,
+                ..Default::default()
+            };
+            let mut bids: Vec<(u64, torus_core::order_book::Order)> = Vec::new();
+            let mut asks: Vec<(u64, torus_core::order_book::Order)> = Vec::new();
+            for (seq, order) in a.orders.drain(..) {
+                if seq >= meta.next_seq {
+                    return fail(format!(
+                        "C4: market {market_id}: order row seq {seq} >= meta \
+                         next_seq {} (corrupt row store)",
+                        meta.next_seq
+                    ));
+                }
+                shadow.orders.insert(
+                    order.id,
+                    OrderShadow {
+                        seq,
+                        price_raw: order.price.raw(),
+                        qty_raw: order.remaining_qty.raw(),
+                        original_qty_raw: order.original_qty.raw(),
+                        gen: 0,
+                    },
+                );
+                match order.side {
+                    Side::Buy => bids.push((seq, order)),
+                    Side::Sell => asks.push((seq, order)),
+                }
+            }
+            bids.sort_by(|a, b| (a.1.price, a.0).cmp(&(b.1.price, b.0)));
+            asks.sort_by(|a, b| (a.1.price, a.0).cmp(&(b.1.price, b.0)));
+            for (_, order) in bids.into_iter().chain(asks) {
+                book.restore_resting_order(order);
+            }
+
+            a.stops.sort_by_key(|(id, _)| *id);
+            for (stop_id, bytes) in a.stops {
+                match book.restore_stop_row(&bytes) {
+                    Ok(id) if id == stop_id => shadow.stops.insert(id),
+                    Ok(id) => {
+                        return fail(format!(
+                            "C4: market {market_id}: stop row key id {stop_id} != \
+                             payload id {id} (corrupt row store)"
+                        ))
+                    }
+                    Err(e) => return fail(format!("C4: market {market_id}: {e}")),
+                };
+            }
+
+            shadow.meta = book_meta_value(shadow.next_seq, &book);
+            let book_next_id = book.next_order_id();
+            if book_next_id > max_order_id {
+                max_order_id = book_next_id;
+            }
+            books.insert(market_id, book);
+            shadows.insert(market_id, shadow);
+        }
+
+        let next_id = if max_order_id > 0 { max_order_id } else { 1 };
+        (books, next_id, shadows, None)
     }
 
     /// Durable global-order-id counter row. Lives in `CF_NATIVE_MARKETS` — a
@@ -542,8 +1008,16 @@ impl<T: StateBackend> NativeExecContext<T> {
     /// global order-id counter when it advanced. Untouched books already hold
     /// identical bytes in the CF — the old rewrite-everything loop cost
     /// O(all resting orders) in Borsh serialization per block. Returns the
-    /// number of book rows written (test hook). Called after block execution.
-    pub fn save_order_books(&self) -> usize {
+    /// number of CF writes performed (whole-book rows classically; row
+    /// puts + deletes under `TORUS_BOOK_ROWS=1` — test hook either way).
+    /// Called after block execution.
+    ///
+    /// C4 (`book_rows`): instead of one whole-book blob per dirty market, diff
+    /// each dirty book against its persisted-row shadow and write only the
+    /// changed rows — new/re-sequenced/refilled orders as puts, gone orders as
+    /// deletes, plus the small meta row. O(changed orders) in serialization,
+    /// CF bytes AND downstream state-root hashing.
+    pub fn save_order_books(&mut self) -> usize {
         use torus_state::cf::{CF_NATIVE_MARKETS, CF_NATIVE_ORDER_BOOKS};
 
         let mut written = 0;
@@ -551,17 +1025,31 @@ impl<T: StateBackend> NativeExecContext<T> {
             let Some(book) = self.order_books.get(&market_id) else {
                 continue;
             };
-            let key = market_id.to_be_bytes();
-            match borsh::to_vec(book) {
-                Ok(data) => {
-                    if let Err(e) = self.state.put_cf_raw(CF_NATIVE_ORDER_BOOKS, &key, &data) {
-                        tracing::error!(market_id, %e, "failed to persist order book");
-                    } else {
-                        written += 1;
+            if self.book_rows {
+                // Take the shadow out so the differ can borrow book + state
+                // freely; reinsert when done.
+                let mut shadow = self.book_shadows.remove(&market_id).unwrap_or_else(|| {
+                    BookRowShadow {
+                        next_seq: 1,
+                        ..Default::default()
                     }
-                }
-                Err(e) => {
-                    tracing::error!(market_id, %e, "failed to serialize order book");
+                });
+                written += Self::save_book_rows(&self.state, market_id, book, &mut shadow);
+                self.book_shadows.insert(market_id, shadow);
+            } else {
+                let key = market_id.to_be_bytes();
+                match borsh::to_vec(book) {
+                    Ok(data) => {
+                        if let Err(e) = self.state.put_cf_raw(CF_NATIVE_ORDER_BOOKS, &key, &data)
+                        {
+                            tracing::error!(market_id, %e, "failed to persist order book");
+                        } else {
+                            written += 1;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(market_id, %e, "failed to serialize order book");
+                    }
                 }
             }
         }
@@ -576,6 +1064,148 @@ impl<T: StateBackend> NativeExecContext<T> {
             ) {
                 tracing::error!(%e, "failed to persist next_global_order_id");
             }
+        }
+
+        written
+    }
+
+    /// C4 row differ: bring the CF rows for ONE market in line with `book`,
+    /// writing only what changed. Returns puts + deletes performed.
+    ///
+    /// Row-write triggers, per resting order (walking each (side, price) queue
+    /// front-to-back):
+    ///   - unknown id → new order: assign `seq = next_seq++`, put row;
+    ///   - known id whose seq is monotonic within its queue → row is current
+    ///     unless `remaining_qty` changed (partial fill / in-place qty-decrease
+    ///     modify) → put row with the SAME seq;
+    ///   - known id whose seq BREAKS queue monotonicity → the order lost time
+    ///     priority and re-entered at the back (modify_order cancel+reinsert
+    ///     keeps the id) → re-stamp `seq = next_seq++`, put row.
+    /// Orders in the shadow but no longer on the book (fills that consumed
+    /// them, cancels, STP) → delete row. Stops: content is immutable per id —
+    /// put new ids, delete gone ids. Meta row rewritten only when its bytes
+    /// changed (next_seq / next_order_id / last_trade_price movement).
+    ///
+    /// DETERMINISM: seq assignment walks the book in canonical order and draws
+    /// from the persisted `next_seq` counter, so it is a pure function of
+    /// consensus state + this block's operations — identical on every
+    /// validator. The seqs land in row VALUES (state root!): this is required
+    /// for FIFO rebuild and safe precisely because assignment is deterministic.
+    fn save_book_rows(
+        state: &T,
+        market_id: MarketId,
+        book: &OrderBook,
+        shadow: &mut BookRowShadow,
+    ) -> usize {
+        use torus_state::cf::CF_NATIVE_ORDER_BOOKS;
+
+        let mut written = 0usize;
+        shadow.gen = shadow.gen.wrapping_add(1);
+        let gen = shadow.gen;
+
+        // ---- Resting orders: walk every queue front-to-back ----
+        for (_price, queue) in book.bid_queues().chain(book.ask_queues()) {
+            // Highest seq emitted so far in THIS queue — rebuild sorts a level
+            // by seq, so persisted seqs must ascend front-to-back per queue.
+            let mut last_seq: u64 = 0;
+            for order in queue {
+                let (seq, needs_write) = match shadow.orders.get(&order.id) {
+                    // Known id, seq still monotonic in its queue: row is
+                    // current iff no mutable field moved.
+                    Some(sh) if sh.seq > last_seq => (sh.seq, !sh.matches(order)),
+                    // Known id whose seq breaks queue monotonicity: the order
+                    // lost time priority (modify re-insert) — fresh seq.
+                    Some(_) => {
+                        let s = shadow.next_seq;
+                        shadow.next_seq += 1;
+                        (s, true)
+                    }
+                    // New resting order.
+                    None => {
+                        let s = shadow.next_seq;
+                        shadow.next_seq += 1;
+                        (s, true)
+                    }
+                };
+                if needs_write {
+                    let key = book_order_key(market_id, order.id);
+                    let val = book_order_value(seq, order);
+                    if let Err(e) = state.put_cf_raw(CF_NATIVE_ORDER_BOOKS, &key, &val) {
+                        tracing::error!(market_id, order_id = %order.id, %e, "C4: order row put failed");
+                    } else {
+                        written += 1;
+                    }
+                }
+                shadow.orders.insert(
+                    order.id,
+                    OrderShadow {
+                        seq,
+                        price_raw: order.price.raw(),
+                        qty_raw: order.remaining_qty.raw(),
+                        original_qty_raw: order.original_qty.raw(),
+                        gen,
+                    },
+                );
+                last_seq = seq;
+            }
+        }
+
+        // Sweep: shadow entries not touched this walk are no longer resting.
+        // Sorted so the delete stream (not just the final state) is
+        // deterministic — HashMap iteration order is per-process random.
+        let mut stale: Vec<OrderId> = shadow
+            .orders
+            .iter()
+            .filter(|(_, sh)| sh.gen != gen)
+            .map(|(id, _)| *id)
+            .collect();
+        stale.sort_unstable();
+        for id in stale {
+            let key = book_order_key(market_id, id);
+            if let Err(e) = state.delete_cf_raw(CF_NATIVE_ORDER_BOOKS, &key) {
+                tracing::error!(market_id, order_id = %id, %e, "C4: order row delete failed");
+            } else {
+                written += 1;
+            }
+            shadow.orders.remove(&id);
+        }
+
+        // ---- Pending stops: immutable per id → put new, delete gone ----
+        let stops = book.stop_rows();
+        let mut live_stops = std::collections::HashSet::with_capacity(stops.len());
+        for (id, bytes) in stops {
+            if shadow.stops.insert(id) {
+                let key = book_stop_key(market_id, id);
+                if let Err(e) = state.put_cf_raw(CF_NATIVE_ORDER_BOOKS, &key, &bytes) {
+                    tracing::error!(market_id, stop_id = %id, %e, "C4: stop row put failed");
+                } else {
+                    written += 1;
+                }
+            }
+            live_stops.insert(id);
+        }
+        let mut gone: Vec<u128> = shadow.stops.difference(&live_stops).copied().collect();
+        gone.sort_unstable();
+        for id in gone {
+            let key = book_stop_key(market_id, id);
+            if let Err(e) = state.delete_cf_raw(CF_NATIVE_ORDER_BOOKS, &key) {
+                tracing::error!(market_id, stop_id = %id, %e, "C4: stop row delete failed");
+            } else {
+                written += 1;
+            }
+            shadow.stops.remove(&id);
+        }
+
+        // ---- Meta row (only when its bytes moved) ----
+        let meta = book_meta_value(shadow.next_seq, book);
+        if meta != shadow.meta {
+            let key = book_meta_key(market_id);
+            if let Err(e) = state.put_cf_raw(CF_NATIVE_ORDER_BOOKS, &key, &meta) {
+                tracing::error!(market_id, %e, "C4: meta row put failed");
+            } else {
+                written += 1;
+            }
+            shadow.meta = meta;
         }
 
         written
