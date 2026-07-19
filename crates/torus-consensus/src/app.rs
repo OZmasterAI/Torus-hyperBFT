@@ -224,6 +224,11 @@ struct ExecutionContext {
     /// market worker panicked and its book is lost). The execution loop exits
     /// on it and the node stops producing, voting, and finalizing.
     exec_failed: Arc<AtomicBool>,
+    /// rank8: cross-block resident order-book holder (`TORUS_RESIDENT_BOOKS`).
+    /// Only the execution thread touches it (Mutex is uncontended); with the
+    /// flag unset it stays empty forever and execution is byte-identical to
+    /// the per-block reload path.
+    resident_books: std::sync::Mutex<torus_bridge::native_executor::ResidentBooks>,
 }
 
 // ---- Standalone helpers (used by both execution thread and crash recovery) ----
@@ -1058,7 +1063,14 @@ impl ExecutionContext {
             overlay.seed_from_bundle(&bundle);
 
             let (pre_evm, post_evm) = sort_native_actions(&sender_actions);
-            let mut ctx = NativeExecContext::new(
+            // rank8: books come from the resident holder when
+            // TORUS_RESIDENT_BOOKS=1 (and its staleness guard passes);
+            // otherwise this is exactly the classic per-block reload.
+            let mut resident_books = self
+                .resident_books
+                .lock()
+                .expect("resident-books mutex poisoned (exec thread panicked mid-block)");
+            let mut ctx = NativeExecContext::new_env(
                 overlay.clone(),
                 torus_block.header.height,
                 torus_block.header.timestamp,
@@ -1068,6 +1080,7 @@ impl ExecutionContext {
                 torus_block.header.proposer,
                 self.treasury_address,
                 self.dev_pool_address,
+                &mut resident_books,
             );
             ctx.metrics = self.metrics.clone();
             // O3: with a background writer present, fills buffer their
@@ -1107,6 +1120,12 @@ impl ExecutionContext {
                 m.exec_save_books_seconds
                     .observe(save_books_timer.elapsed().as_secs_f64());
             }
+            // rank8: hand the books back to the cross-block holder (no-op for
+            // non-resident contexts). Safe before the overlay flush below: if
+            // that flush fails, the applied-height marker is not written and
+            // the staleness guard rebuilds from the DB next block.
+            ctx.stash_resident(&mut resident_books);
+            drop(resident_books);
 
             let flush_timer = std::time::Instant::now();
             for (sender, nonce) in &consumed_nonces {
@@ -1936,6 +1955,7 @@ impl TorusApp {
                 256,
             )),
             exec_failed: exec_failed.clone(),
+            resident_books: std::sync::Mutex::new(Default::default()),
         };
 
         // Phase A: ensure the persistent incremental trie exists before any commit (including
@@ -5521,6 +5541,7 @@ mod crash_recovery_tests {
             // keeping these tests' reads deterministic right after execution.
             trade_writer: None,
             exec_failed: Arc::new(AtomicBool::new(false)),
+            resident_books: std::sync::Mutex::new(Default::default()),
         }
     }
 

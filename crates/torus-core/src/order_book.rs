@@ -9,7 +9,7 @@
 //! - All arithmetic via FixedPoint (no f64)
 //! - Deterministic: same input sequence → same state
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::{self, Read as IoRead, Write as IoWrite};
 
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -109,6 +109,46 @@ struct OrderLocation {
     price: FixedPoint,
 }
 
+/// rank8 (resident books): order-level mutation journal. When enabled, every
+/// primitive that changes RESTING-order state records the order id here —
+/// `touched` (inserted / re-inserted / quantity changed, still resting) and
+/// `removed` (no longer resting), kept disjoint. The per-order-row persistence
+/// differ (torus-bridge, `TORUS_BOOK_ROWS` + `TORUS_RESIDENT_BOOKS`) drains it
+/// to write only the changed rows without walking the whole book.
+///
+/// Capture is at the OrderBook PRIMITIVES (insert_order / cancel_order /
+/// cancel_all / modify_order / match_at_level), not at callers — stop
+/// triggers, STP cancels and every executor path funnel through these, so no
+/// caller can bypass the journal. Pending stops are NOT journaled (the save
+/// path diffs the tiny stop set directly).
+///
+/// Disabled (default) it records nothing — zero behavior change. The journal
+/// is in-memory bookkeeping only: never serialized, never part of any hash.
+#[derive(Default)]
+pub struct BookJournal {
+    enabled: bool,
+    touched: HashSet<OrderId>,
+    removed: HashSet<OrderId>,
+}
+
+impl BookJournal {
+    #[inline]
+    fn touch(&mut self, id: OrderId) {
+        if self.enabled {
+            self.removed.remove(&id);
+            self.touched.insert(id);
+        }
+    }
+
+    #[inline]
+    fn remove(&mut self, id: OrderId) {
+        if self.enabled {
+            self.touched.remove(&id);
+            self.removed.insert(id);
+        }
+    }
+}
+
 // ============================================================================
 // OrderBook
 // ============================================================================
@@ -132,6 +172,9 @@ pub struct OrderBook {
     last_trade_price: Option<FixedPoint>,
     /// Guard against recursive stop triggering.
     triggering_stops: bool,
+    /// rank8: optional order-level mutation journal (see [`BookJournal`]).
+    /// Never serialized; fresh (disabled) on construction/deserialize.
+    journal: BookJournal,
 }
 
 impl OrderBook {
@@ -148,6 +191,7 @@ impl OrderBook {
             next_id: 1,
             last_trade_price: None,
             triggering_stops: false,
+            journal: BookJournal::default(),
         }
     }
 
@@ -418,6 +462,7 @@ impl OrderBook {
             }
         }
 
+        self.journal.remove(order_id);
         Ok(order)
     }
 
@@ -438,6 +483,7 @@ impl OrderBook {
                 if let Some(queue) = book.get_mut(&loc.price) {
                     if let Some(pos) = queue.iter().position(|o| o.id == order_id) {
                         cancelled.push(queue.remove(pos).unwrap());
+                        self.journal.remove(order_id);
                     }
                     if queue.is_empty() {
                         book.remove(&loc.price);
@@ -477,7 +523,9 @@ impl OrderBook {
                     if let Some(order) = queue.iter_mut().find(|o| o.id == order_id) {
                         if new_q > FixedPoint::ZERO && new_q < order.remaining_qty {
                             order.remaining_qty = new_q;
-                            return Ok(order.clone());
+                            let out = order.clone();
+                            self.journal.touch(order_id);
+                            return Ok(out);
                         }
                     }
                 }
@@ -675,6 +723,7 @@ impl OrderBook {
                         &mut self_trade_cancels,
                         &mut self.order_index,
                         &mut self.trader_orders,
+                        &mut self.journal,
                     );
                     if self.asks.get(&best_ask).is_none_or(|q| q.is_empty()) {
                         self.asks.remove(&best_ask);
@@ -699,6 +748,7 @@ impl OrderBook {
                         &mut self_trade_cancels,
                         &mut self.order_index,
                         &mut self.trader_orders,
+                        &mut self.journal,
                     );
                     if self.bids.get(&best_bid).is_none_or(|q| q.is_empty()) {
                         self.bids.remove(&best_bid);
@@ -720,6 +770,7 @@ impl OrderBook {
         self_trade_cancels: &mut Vec<Order>,
         order_index: &mut HashMap<OrderId, OrderLocation>,
         trader_orders: &mut HashMap<Address, Vec<OrderId>>,
+        journal: &mut BookJournal,
     ) {
         while taker.remaining_qty > FixedPoint::ZERO && !queue.is_empty() {
             let maker = queue.front().unwrap();
@@ -731,6 +782,7 @@ impl OrderBook {
                 if let Some(ids) = trader_orders.get_mut(&cancelled.trader) {
                     ids.retain(|&id| id != cancelled.id);
                 }
+                journal.remove(cancelled.id);
                 // A5: hand the whole cancelled order back so the executor can
                 // release its remaining order-margin reservation.
                 self_trade_cancels.push(cancelled);
@@ -767,6 +819,10 @@ impl OrderBook {
                 if let Some(ids) = trader_orders.get_mut(&filled.trader) {
                     ids.retain(|&id| id != filled.id);
                 }
+                journal.remove(filled.id);
+            } else {
+                // Partial consumption: the resting maker's remaining_qty moved.
+                journal.touch(maker_id);
             }
         }
     }
@@ -786,6 +842,7 @@ impl OrderBook {
 
         self.order_index.insert(id, OrderLocation { side, price });
         self.trader_orders.entry(trader).or_default().push(id);
+        self.journal.touch(id);
     }
 
     /// Would placing an order at `price` cross the spread?
@@ -970,6 +1027,46 @@ impl OrderBook {
                 )
             })
             .collect()
+    }
+
+    /// rank8: enable the order-level mutation journal (see [`BookJournal`]).
+    /// Idempotent; there is deliberately no disable — a book that ever
+    /// journaled under resident mode must never silently stop (a gap would
+    /// desync the row-store differ).
+    pub fn enable_mutation_journal(&mut self) {
+        self.journal.enabled = true;
+    }
+
+    /// rank8: whether the mutation journal is recording.
+    pub fn mutation_journal_enabled(&self) -> bool {
+        self.journal.enabled
+    }
+
+    /// rank8: drain the journal — `(touched, removed)`, disjoint sets.
+    /// `touched` ids are guaranteed still resting; `removed` ids are
+    /// guaranteed no longer resting.
+    pub fn take_mutation_journal(&mut self) -> (HashSet<OrderId>, HashSet<OrderId>) {
+        debug_assert!(
+            self.journal.touched.iter().all(|id| self.order_index.contains_key(id)),
+            "journal.touched must only hold resting orders"
+        );
+        debug_assert!(
+            self.journal.removed.iter().all(|id| !self.order_index.contains_key(id)),
+            "journal.removed must only hold non-resting orders"
+        );
+        (
+            std::mem::take(&mut self.journal.touched),
+            std::mem::take(&mut self.journal.removed),
+        )
+    }
+
+    /// rank8: the FIFO queue at one price level, if it exists. Read access for
+    /// the journal-driven row differ (walks only affected levels).
+    pub fn level_queue(&self, side: Side, price: FixedPoint) -> Option<&VecDeque<Order>> {
+        match side {
+            Side::Buy => self.bids.get(&price),
+            Side::Sell => self.asks.get(&price),
+        }
     }
 
     /// Rebuild one pending stop from its row bytes (see [`Self::stop_rows`]).
@@ -1334,6 +1431,7 @@ impl BorshDeserialize for OrderBook {
             next_id,
             last_trade_price,
             triggering_stops: false,
+            journal: BookJournal::default(),
         };
 
         for _ in 0..order_count {
