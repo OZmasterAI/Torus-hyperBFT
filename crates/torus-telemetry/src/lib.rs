@@ -212,6 +212,14 @@ pub struct Metrics {
     /// rank-root: buckets rehashed per block by the native-trie maintenance
     /// (the O(dirty) witness — compare against rows touched).
     pub exec_root_dirty_buckets: Histogram,
+    /// rank-root round-3: CF_NATIVE_HASHED prefix-scans performed by native-trie
+    /// maintenance. Drops below dirty-buckets as the bucket-member cache serves
+    /// hits — the per-bucket-cost win witness.
+    pub exec_root_bucket_scans: Counter,
+    /// rank-root round-3: bucket-member cache hits / misses / LRU evictions.
+    pub member_cache_hits: Counter,
+    pub member_cache_misses: Counter,
+    pub member_cache_evictions: Counter,
     pub exec_block_seconds: Histogram,
     /// PROFILER (s470): the EVM section of block execution (validate + commit
     /// bundle + block metadata). Near-zero in native-only bench cells; observed
@@ -803,6 +811,34 @@ impl Metrics {
             exec_root_dirty_buckets.clone(),
         );
 
+        let exec_root_bucket_scans = Counter::default();
+        registry.register(
+            "torus_exec_root_bucket_scans",
+            "CF_NATIVE_HASHED prefix-scans by native-trie maintenance (drops with member-cache hits)",
+            exec_root_bucket_scans.clone(),
+        );
+
+        let member_cache_hits = Counter::default();
+        registry.register(
+            "torus_member_cache_hits",
+            "Bucket-member cache hits (scan elided)",
+            member_cache_hits.clone(),
+        );
+
+        let member_cache_misses = Counter::default();
+        registry.register(
+            "torus_member_cache_misses",
+            "Bucket-member cache misses (mirror re-scanned)",
+            member_cache_misses.clone(),
+        );
+
+        let member_cache_evictions = Counter::default();
+        registry.register(
+            "torus_member_cache_evictions",
+            "Bucket-member cache LRU evictions (memory-budget pressure)",
+            member_cache_evictions.clone(),
+        );
+
         let exec_block_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
         registry.register(
             "torus_exec_block_seconds",
@@ -1062,6 +1098,10 @@ impl Metrics {
             exec_state_write_seconds,
             exec_evm_resync_seconds,
             exec_root_dirty_buckets,
+            exec_root_bucket_scans,
+            member_cache_hits,
+            member_cache_misses,
+            member_cache_evictions,
             exec_block_seconds,
             exec_evm_seconds,
             exec_load_books_seconds,

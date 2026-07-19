@@ -413,6 +413,12 @@ struct ExecutionContext {
     /// authenticating staleness guard (persisted-root match) — see
     /// torus_state::native_trie.
     trie_cache: std::sync::Mutex<torus_state::native_trie::NativeTrieCache>,
+    /// rank-root round-3: bounded bucket-member cache eliminating the
+    /// CF_NATIVE_HASHED prefix-scan on resident buckets
+    /// (`TORUS_BUCKET_MEMBER_CACHE_MB`). Value-neutral; self-authenticating on
+    /// the persisted root (shares the trie cache's staleness cause). Disabled
+    /// (budget 0) = exact-today.
+    member_cache: std::sync::Mutex<torus_state::native_trie::NativeMemberCache>,
 }
 
 // ---- Standalone helpers (used by both execution thread and crash recovery) ----
@@ -1359,7 +1365,23 @@ impl ExecutionContext {
                 } else {
                     None
                 };
-                overlay.flush_with_native_trie_stats(&self.state_db, Some(height), cache_opt)
+                // rank-root round-3: bucket-member cache (self-gating — disabled
+                // budget => is_enabled() false => exact-today).
+                let mut member_cache = self
+                    .member_cache
+                    .lock()
+                    .expect("member-cache mutex poisoned (exec thread panicked mid-block)");
+                let member_opt = if member_cache.is_enabled() {
+                    Some(&mut *member_cache)
+                } else {
+                    None
+                };
+                overlay.flush_with_native_trie_stats(
+                    &self.state_db,
+                    Some(height),
+                    cache_opt,
+                    member_opt,
+                )
             };
             match &flush_stats {
                 Ok(stats) => {
@@ -1367,6 +1389,10 @@ impl ExecutionContext {
                         m.exec_root_seconds.observe(stats.root_seconds);
                         m.exec_state_write_seconds.observe(stats.write_seconds);
                         m.exec_root_dirty_buckets.observe(stats.dirty_buckets as f64);
+                        m.exec_root_bucket_scans.inc_by(stats.bucket_scans as u64);
+                        m.member_cache_hits.inc_by(stats.member_hits as u64);
+                        m.member_cache_misses.inc_by(stats.member_misses as u64);
+                        m.member_cache_evictions.inc_by(stats.member_evictions as u64);
                     }
                 }
                 Err(e) => {
@@ -2213,6 +2239,11 @@ impl TorusApp {
             exec_queue_len: exec_queue_len.clone(),
             resident_books: std::sync::Mutex::new(Default::default()),
             trie_cache: std::sync::Mutex::new(Default::default()),
+            member_cache: std::sync::Mutex::new(
+                torus_state::native_trie::NativeMemberCache::with_budget(
+                    torus_state::native_trie::member_cache_budget_bytes(),
+                ),
+            ),
         };
 
         // Phase A: ensure the persistent incremental trie exists before any commit (including
@@ -6765,6 +6796,11 @@ mod crash_recovery_tests {
             exec_queue_len: Arc::new(AtomicU64::new(0)),
             resident_books: std::sync::Mutex::new(Default::default()),
             trie_cache: std::sync::Mutex::new(Default::default()),
+            member_cache: std::sync::Mutex::new(
+                torus_state::native_trie::NativeMemberCache::with_budget(
+                    torus_state::native_trie::member_cache_budget_bytes(),
+                ),
+            ),
         }
     }
 

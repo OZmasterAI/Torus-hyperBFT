@@ -240,6 +240,7 @@ fn run_combo(modes: Modes, restart_before: Option<u64>) -> ComboResult {
                 &db,
                 Some(height),
                 if modes.cache { Some(&mut trie_cache) } else { None },
+                None,
             )
             .expect("flush");
         roots.push(persisted_native_root(&db).unwrap());
@@ -393,7 +394,7 @@ fn flush_level_clean_rewrite_elision() {
             .unwrap();
     }
     let stats = overlay
-        .flush_with_native_trie_stats(&db, Some(1), Some(&mut cache))
+        .flush_with_native_trie_stats(&db, Some(1), Some(&mut cache), None)
         .unwrap();
     assert_eq!(stats.dirty_buckets, 0, "clean rewrite must be elided");
     assert_eq!(persisted_native_root(&db).unwrap(), root0, "root unchanged");
@@ -412,7 +413,7 @@ fn flush_level_clean_rewrite_elision() {
             .unwrap();
     }
     let stats2 = overlay2
-        .flush_with_native_trie_stats(&db, Some(2), None)
+        .flush_with_native_trie_stats(&db, Some(2), None, None)
         .unwrap();
     assert_eq!(stats2.dirty_buckets, 1, "uncached path rehashes the bucket");
     assert_eq!(persisted_native_root(&db).unwrap(), root0, "root still unchanged");
