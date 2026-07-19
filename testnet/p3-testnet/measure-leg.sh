@@ -59,10 +59,16 @@ fi
 LABEL=$1
 RESULTS_DIR=$2
 FLOW=${3:-cross}
-case "$FLOW" in rest|cross|churn) ;; *) echo "FATAL: flow must be rest|cross|churn (got '$FLOW')" >&2; exit 2 ;; esac
+# `match` accepted since the p3 devnet fill ladder: the bench has supported
+# --flow match / --taker-ratio since a616073, but this wrapper never plumbed it
+# through, which is why the testnet match legs had to bypass the harness and
+# fire bench-throughput by hand (losing summary.json / sampler.csv).
+case "$FLOW" in rest|cross|churn|match) ;; *) echo "FATAL: flow must be rest|cross|churn|match (got '$FLOW')" >&2; exit 2 ;; esac
 
 HERE=$(cd "$(dirname "$0")" && pwd)
-REPO=$(cd "$HERE/../.." && pwd)
+# Overridable so a copy of this harness can drive legs from outside the repo
+# (BENCH_BIN and the git provenance in leg-config.json resolve against it).
+REPO=${REPO:-$(cd "$HERE/../.." && pwd)}
 
 # --------------------------- config ----------------------------------------
 RPC=${RPC:-http://127.0.0.1:8555}
@@ -81,6 +87,9 @@ SUBMIT_BATCH=${SUBMIT_BATCH:-15}
 PRESIGN=${PRESIGN:-60}
 SIGN_MODE=${SIGN_MODE:-session}
 FORMAT=${FORMAT:-bin}
+# `--flow match` only: fraction of senders acting as TAKERS. The bench ignores
+# it for every other flow, so it is always safe to pass.
+TAKER_RATIO=${TAKER_RATIO:-0.5}
 
 LEG_DIR="$RESULTS_DIR/$LABEL"
 mkdir -p "$LEG_DIR"
@@ -160,14 +169,14 @@ T0=$(date +%s)
 log "window START t=$T0 height=$H0"
 
 if [ "$RUN_BENCH" -eq 1 ]; then
-    log "firing bench: senders=$SENDERS offset=$SENDER_OFFSET markets=$MARKETS flow=$FLOW b=$BATCH r=$RATE dur=$DURATION"
+    log "firing bench: senders=$SENDERS offset=$SENDER_OFFSET markets=$MARKETS flow=$FLOW taker=$TAKER_RATIO b=$BATCH r=$RATE dur=$DURATION"
     timeout $((DURATION + 180)) "$BENCH_BIN" consensus \
         --rpc-urls "$RPC" \
         --senders "$SENDERS" --sender-offset "$SENDER_OFFSET" \
         --duration "$DURATION" --batch-size "$BATCH" \
         --submit-batch "$SUBMIT_BATCH" --rate "$RATE" --pre-sign "$PRESIGN" \
         --sign-mode "$SIGN_MODE" --format "$FORMAT" \
-        --markets "$MARKETS" --flow "$FLOW" \
+        --markets "$MARKETS" --flow "$FLOW" --taker-ratio "$TAKER_RATIO" \
         > "$LEG_DIR/bench.log" 2>&1 \
         || log "WARN: bench exited non-zero (see bench.log) — measuring window regardless"
 else
@@ -235,4 +244,28 @@ print("NOTE: placed/matched/executed are CHAIN-GLOBAL (consensus-deterministic).
 print("      In a multi-box run, ONE measuring node = the aggregate. Do NOT sum.")
 PY
 
-log "done -> $LEG_DIR/ (summary.json, sampler.csv, counters-{before,after}.json, bench.log)"
+# Provenance: a ladder cell is only comparable to another if the offered load
+# shape matches, so record it NEXT TO the numbers rather than trusting the label.
+# LEG_IMAGE (set by run-leg.sh) is authoritative for which BRANCH ran: the git
+# checkout is NOT, because legs run pre-built per-branch images and the working
+# tree may sit on a different branch entirely.
+cat > "$LEG_DIR/leg-config.json" <<EOF
+{
+  "label": "$LABEL", "flow": "$FLOW", "taker_ratio": $TAKER_RATIO,
+  "duration_s": $DURATION, "subwin_s": $SUBWIN,
+  "markets": $MARKETS, "senders": $SENDERS, "sender_offset": $SENDER_OFFSET,
+  "batch": $BATCH, "rate": $RATE, "submit_batch": $SUBMIT_BATCH,
+  "pre_sign": $PRESIGN, "sign_mode": "$SIGN_MODE", "format": "$FORMAT",
+  "rpc": "$RPC", "metrics": "$METRICS", "run_bench": $RUN_BENCH,
+  "leg_image": "${LEG_IMAGE:-unknown}",
+  "caps": {
+    "total_block": "${TORUS_NATIVE_TOTAL_BLOCK_CAP:-compose-default}",
+    "orders_per_block": "${TORUS_NATIVE_ORDERS_PER_BLOCK_CAP:-compose-default}",
+    "block_bytes": "${TORUS_NATIVE_BLOCK_BYTES_CAP:-compose-default}"
+  },
+  "git_branch_at_runtime": "$(git -C "$REPO" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)",
+  "git_commit_at_runtime": "$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+}
+EOF
+
+log "done -> $LEG_DIR/ (summary.json, leg-config.json, sampler.csv, counters-{before,after}.json, bench.log)"
