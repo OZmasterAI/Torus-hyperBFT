@@ -1059,6 +1059,10 @@ impl ExecutionContext {
         );
 
         // ---- EVM execution ----
+        // PROFILER (s470): time the whole EVM section (validate + commit bundle +
+        // block metadata, or the bare header persist when there is no EVM) so it
+        // is attributed rather than sitting in the block residual.
+        let evm_timer = std::time::Instant::now();
         let mut bundle = BundleState::default();
         let mut computed_fee_revenue: u128 = 0;
         if has_evm {
@@ -1110,6 +1114,10 @@ impl ExecutionContext {
             }
         } else {
             persist_block_header(&self.state_db, torus_block);
+        }
+        if let Some(ref m) = self.metrics {
+            m.exec_evm_seconds
+                .observe(evm_timer.elapsed().as_secs_f64());
         }
 
         // ---- Native execution ----
@@ -1254,6 +1262,11 @@ impl ExecutionContext {
                 .resident_books
                 .lock()
                 .expect("resident-books mutex poisoned (exec thread panicked mid-block)");
+            // PROFILER (s470): with the resident holder cold or disabled, the
+            // context constructor scans cf_native_order_books and rebuilds
+            // EVERY resting order into memory — O(total resting depth) per
+            // block. Attribute it explicitly (near-zero when resident reuse hits).
+            let load_books_timer = std::time::Instant::now();
             let mut ctx = NativeExecContext::new_env(
                 overlay.clone(),
                 torus_block.header.height,
@@ -1266,6 +1279,11 @@ impl ExecutionContext {
                 self.dev_pool_address,
                 &mut resident_books,
             );
+            if let Some(ref m) = self.metrics {
+                m.exec_load_books_seconds
+                    .observe(load_books_timer.elapsed().as_secs_f64());
+                m.exec_resting_orders.set(ctx.resting_order_count() as i64);
+            }
             ctx.metrics = self.metrics.clone();
             // O3: with a background writer present, fills buffer their
             // trade-history KVs (node-local, non-root CFs) instead of paying
@@ -1401,6 +1419,9 @@ impl ExecutionContext {
         }
 
         // ---- Persist block body for RPC queries ----
+        // PROFILER (s470): commit-callback body persistence (block-body JSON
+        // write + the standalone marker below for non-native blocks).
+        let body_persist_timer = std::time::Instant::now();
         if let Ok(body_bytes) = serde_json::to_vec(&torus_block.body()) {
             let _ = self
                 .state_db
@@ -1416,6 +1437,10 @@ impl ExecutionContext {
         // write here.
         if !(has_native || computed_fee_revenue > 0) {
             write_native_applied_height(&self.state_db, height);
+        }
+        if let Some(ref m) = self.metrics {
+            m.exec_body_persist_seconds
+                .observe(body_persist_timer.elapsed().as_secs_f64());
         }
 
         if let Some(ref m) = self.metrics {
@@ -7270,6 +7295,9 @@ mod crash_recovery_tests {
             "torus_exec_save_books_seconds",
             "torus_exec_flush_seconds",
             "torus_exec_block_seconds",
+            "torus_exec_evm_seconds",
+            "torus_exec_load_books_seconds",
+            "torus_exec_body_persist_seconds",
         ] {
             assert!(
                 text.contains(&format!("{name}_count 1")),
