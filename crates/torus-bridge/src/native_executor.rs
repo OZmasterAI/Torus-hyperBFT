@@ -174,13 +174,12 @@ struct PreparedOrder<'a> {
 
 /// One fill's trade-history rows — exactly the bytes `persist_trade` has
 /// always written to `CF_NATIVE_TRADES` (primary) and `CF_NATIVE_USER_TRADES`
-/// (maker + taker secondary index). C3: settle workers build these off-thread
-/// with OPTIMISTIC per-block indexes (exact whenever no fill application
-/// fails); the apply pass verifies `index` against the live counter and only
-/// re-stamps on divergence (sick-node path).
+/// (maker + taker secondary index). C3: settle workers byte-build these
+/// off-thread with a PROVISIONAL trade index; the single-threaded apply pass
+/// stamps the definitive per-block index (`stamp_trade_index`) in canonical
+/// settlement order before routing, so the persisted key sequence is
+/// byte-identical to the sequential path's inline `persist_trade` calls.
 struct TradeKvs {
-    /// The per-block trade index these bytes were built with.
-    index: u32,
     trade_key: [u8; 20],
     trade_data: Vec<u8>,
     maker_key: [u8; 32],
@@ -248,7 +247,6 @@ impl TradeKvs {
         taker_key[28..32].copy_from_slice(&trade_index.to_be_bytes());
 
         Self {
-            index: trade_index,
             trade_key,
             trade_data,
             maker_key,
@@ -264,7 +262,6 @@ impl TradeKvs {
     fn stamp_trade_index(&mut self, idx: u32) {
         let be = idx.to_be_bytes();
         let id_le = (idx as u128).to_le_bytes();
-        self.index = idx;
         self.trade_key[16..20].copy_from_slice(&be);
         self.trade_data[0..16].copy_from_slice(&id_le);
         self.maker_key[28..32].copy_from_slice(&be);
@@ -307,8 +304,10 @@ struct MarketSettlePlan {
     maker_releases: Vec<(Address, FixedPoint)>,
 }
 
-/// C3 runtime toggle: `TORUS_PARALLEL_SETTLE=0` forces the sequential settle
-/// path; anything else (including unset) keeps parallel settle ON. Read once.
+/// C3 runtime toggle: `TORUS_PARALLEL_SETTLE=1` enables the parallel settle
+/// path; anything else (INCLUDING UNSET) keeps today's sequential loop.
+/// Default OFF — unset env is byte-identical to the pre-C3 serial semantics.
+/// Read once per process.
 fn parallel_settle_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -316,10 +315,11 @@ fn parallel_settle_enabled() -> bool {
     })
 }
 
-/// Pure parse of the `TORUS_PARALLEL_SETTLE` value (default ON; only `"0"`
-/// disables — mirrors the TORUS_SHARD_CUSTODY toggle doctrine).
+/// Pure parse of the `TORUS_PARALLEL_SETTLE` value: only `"1"` enables the
+/// parallel path (exact-today default — unset/`"0"`/garbage all mean the
+/// classic sequential settle loop).
 fn parse_parallel_settle_toggle(v: Option<String>) -> bool {
-    !matches!(v.as_deref().map(str::trim), Some("0"))
+    matches!(v.as_deref().map(str::trim), Some("1"))
 }
 
 /// C3 auto-mode work gate: parallel settle pays a thread scope + plan handoff,
@@ -353,20 +353,20 @@ mod parallel_settle_toggle_tests {
     use super::parse_parallel_settle_toggle;
 
     #[test]
-    fn default_is_on() {
-        assert!(parse_parallel_settle_toggle(None));
+    fn default_is_off() {
+        assert!(!parse_parallel_settle_toggle(None));
     }
 
     #[test]
-    fn zero_disables() {
-        assert!(!parse_parallel_settle_toggle(Some("0".to_string())));
-        assert!(!parse_parallel_settle_toggle(Some(" 0 ".to_string())));
+    fn one_enables() {
+        assert!(parse_parallel_settle_toggle(Some("1".to_string())));
+        assert!(parse_parallel_settle_toggle(Some(" 1 ".to_string())));
     }
 
     #[test]
-    fn anything_else_stays_on() {
-        for v in ["1", "true", "on", "", "yes", "2"] {
-            assert!(parse_parallel_settle_toggle(Some(v.to_string())), "{v}");
+    fn anything_else_stays_off() {
+        for v in ["0", "true", "on", "", "yes", "2"] {
+            assert!(!parse_parallel_settle_toggle(Some(v.to_string())), "{v}");
         }
     }
 }
@@ -731,8 +731,9 @@ impl NativeExecutor {
     ///   Phase 2 — Pre-reserve margin, assign global order IDs, partition by market
     ///   Phase 3 — Parallel matching: one thread per market's OrderBook
     ///   Phase 4 — Settlement: release margin, apply fills, persist trades.
-    ///             C3: parallel per-market compute + deterministic apply
-    ///             (`TORUS_PARALLEL_SETTLE=0` forces the classic sequential loop).
+    ///             C3: `TORUS_PARALLEL_SETTLE=1` opts in to parallel per-market
+    ///             compute + deterministic apply; default (unset) is the
+    ///             classic sequential loop, byte-identical to pre-C3.
     ///
     /// Individual action failures do NOT stop the batch (deterministic semantics).
     pub fn execute_batch<T: StateBackend>(
@@ -1282,26 +1283,6 @@ impl NativeExecutor {
         bal_cache: &mut BalanceCache,
         pos_cache: &mut PositionCache,
     ) {
-        // Optimistic per-market trade-index bases (market_results is sorted):
-        // exact whenever no fill application fails, because then EVERY fill of
-        // EVERY order consumes one index in settlement order. A worker-side
-        // fill failure aborts to the sequential fallback below, so used plans
-        // always carry final indexes and pass B appends without touching the
-        // row bytes again.
-        let trade_bases: Vec<u32> = {
-            let mut base = ctx.trade_index;
-            market_results
-                .iter()
-                .map(|mbr| {
-                    let b = base;
-                    let fills: usize =
-                        mbr.results.iter().map(|r| r.result.fills.len()).sum();
-                    base += fills as u32;
-                    b
-                })
-                .collect()
-        };
-
         // ---- Pass A: pure per-market plans on scoped threads ----
         let plans: Vec<Result<MarketSettlePlan, String>> = {
             let positions = &ctx.positions;
@@ -1310,8 +1291,7 @@ impl NativeExecutor {
             std::thread::scope(|s| {
                 let handles: Vec<_> = market_results
                     .iter()
-                    .zip(trade_bases.iter().copied())
-                    .map(|(mbr, trade_base)| {
+                    .map(|mbr| {
                         let prepared: &[PreparedOrder<'_>] = market_batches
                             .get(&mbr.market_id)
                             .map(|v| v.as_slice())
@@ -1326,7 +1306,6 @@ impl NativeExecutor {
                                     prepared,
                                     block_height,
                                     timestamp,
-                                    trade_base,
                                 )
                             }))
                             .map_err(|payload| {

@@ -14,9 +14,10 @@
 //! books, trade history, counters, and per-action results. The 50x rerun
 //! hunts scheduling nondeterminism.
 
-use alloy_primitives::Address;
+use alloy_primitives::{Address, B256};
 
 use torus_bridge::native_executor::{NativeExecContext, NativeExecutor};
+use torus_bridge::state_root::compute_native_state_root;
 use torus_core::position::NativeBalance;
 use torus_state::cf::{
     CF_NATIVE_BALANCES, CF_NATIVE_MARKETS, CF_NATIVE_ORDER_BOOKS, CF_NATIVE_POSITIONS,
@@ -103,6 +104,9 @@ struct RunFingerprint {
     total_gas: Vec<u64>,
     trade_index: u32,
     next_global_order_id: u128,
+    /// The consensus-authoritative native state root (full scan) — the
+    /// mission-level determinism contract is stated in terms of this root.
+    state_root: B256,
 }
 
 fn state_dump(ctx: &NativeExecContext) -> Vec<(String, Vec<u8>, Vec<u8>)> {
@@ -158,6 +162,7 @@ fn run_batches(batches: &[Vec<(Address, NativeAction)>], parallel: bool) -> RunF
         total_gas,
         trade_index: ctx.trade_index,
         next_global_order_id: ctx.next_global_order_id,
+        state_root: compute_native_state_root(&ctx.state).expect("state root"),
     }
 }
 
@@ -456,14 +461,145 @@ fn pnl_realizing_cross_market_flow_exact() {
 }
 
 // ============================================================================
-// 4. Default mode (env-driven) still settles a multi-market batch correctly
+// 4. A5 maker-release semantics survive parallel settlement
+// ============================================================================
+
+/// THE C3 core-correctness test: A5 (98c76c6) fixed the maker-side margin
+/// leak — resting orders consumed as maker (and STP-cancelled makers) release
+/// their reservation via telescoping `reserve()` differences, so over an
+/// order's lifetime Σreleased == reserved EXACTLY (truncation dust included).
+/// C3 moves that computation onto per-market settle-worker threads. This test
+/// spreads ONE maker's resting orders across three markets (plus an STP actor
+/// on a fourth), consumes them all in a single batch — so the three release
+/// amounts for the SAME balance row are computed on three different worker
+/// threads and applied in pass B — and asserts, against hand-computed values:
+///   - full-fill release, partial-fill telescoped release, truncation-dust
+///     telescoping, and the STP-cancel release all land exactly;
+///   - after cancelling every remainder, every actor is back to funding to
+///     the raw unit (Σreleased == Σreserved, no dust, no double-release);
+///   - the parallel path is byte-identical to sequential at every step.
+#[test]
+fn a5_maker_release_survives_parallel_settle() {
+    const FUNDING: i64 = 1_000;
+    let m = addr(1); // maker on markets 1, 2, 3
+    let t1 = addr(2);
+    let t2 = addr(3);
+    let t3 = addr(4);
+    let s = addr(5); // STP actor on market 4
+
+    let dusty = FixedPoint::from_raw(3 * FixedPoint::SCALE + 1); // 3.00000001
+
+    // Batch 1 — rest phase:
+    //   M buy mkt1 @100 q4          → reserve 20
+    //   M buy mkt2 @100 q5          → reserve 25
+    //   M buy mkt3 @1   q3.00000001 → reserve trunc(3.00000001/20) = raw 15_000_000
+    //   S buy mkt4 @100 q5          → reserve 25
+    let batch1 = vec![
+        place(m, gtc(1, true, 100, 4)),
+        place(m, gtc(2, true, 100, 5)),
+        place(m, order(3, true, fp(1), dusty, TimeInForce::GTC)),
+        place(s, gtc(4, true, 100, 5)),
+    ];
+    // Batch 2 — the storm (work on all four markets → four settle workers):
+    //   T1 sell mkt1 @100 q4 → M fully consumed as maker: release 20 (full)
+    //   T2 sell mkt2 @100 q2 → M partial: reserve(5)-reserve(3) = 25-15 = 10
+    //   T3 sell mkt3 @1   q1 → M dusty partial: 15_000_000 - 10_000_000 (raw)
+    //   S  sell mkt4 @100 q5 → STP cancels S's resting buy: release 25;
+    //                          the sell rests: reserve 25
+    let batch2 = vec![
+        place(t1, gtc(1, false, 100, 4)),
+        place(t2, gtc(2, false, 100, 2)),
+        place(t3, order(3, false, fp(1), fp(1), TimeInForce::GTC)),
+        place(s, gtc(4, false, 100, 5)),
+    ];
+    // Batch 3 — cancel every remainder: telescoping must land every actor
+    // EXACTLY back on funding.
+    let batch3 = vec![
+        (m, NativeAction::CancelAllOrders { market_id: None }),
+        (s, NativeAction::CancelAllOrders { market_id: None }),
+    ];
+
+    let run = |parallel: bool| -> (Vec<Vec<NativeBalance>>, Vec<(String, Vec<u8>, Vec<u8>)>) {
+        let (_dir, db) = open_test_db();
+        let mut ctx = make_ctx(db);
+        for t in [m, t1, t2, t3, s] {
+            fund_native(&ctx, &t, fp(FUNDING));
+        }
+        let mut per_batch = Vec::new();
+        for batch in [&batch1, &batch2, &batch3] {
+            let r = NativeExecutor::execute_batch_settle_mode(&mut ctx, batch, parallel);
+            for (i, ar) in r.results.iter().enumerate() {
+                assert!(ar.success, "action[{i}] failed: {:?}", ar.error);
+            }
+            assert!(ctx.fatal_error.is_none(), "fatal: {:?}", ctx.fatal_error);
+            per_batch.push(
+                [m, t1, t2, t3, s]
+                    .iter()
+                    .map(|a| ctx.positions.get_native_balance(a).unwrap())
+                    .collect::<Vec<_>>(),
+            );
+        }
+        ctx.save_order_books();
+        (per_batch, state_dump(&ctx))
+    };
+
+    let (seq_balances, seq_dump) = run(false);
+    let (par_balances, par_dump) = run(true);
+
+    // Parallel == sequential at every batch boundary, every actor, both fields.
+    for (bi, (sb, pb)) in seq_balances.iter().zip(par_balances.iter()).enumerate() {
+        for (ai, (sv, pv)) in sb.iter().zip(pb.iter()).enumerate() {
+            assert_eq!(
+                sv.available, pv.available,
+                "batch {bi} actor {ai}: available diverged"
+            );
+            assert_eq!(
+                sv.order_margin, pv.order_margin,
+                "batch {bi} actor {ai}: order_margin diverged"
+            );
+        }
+    }
+    assert_eq!(seq_dump, par_dump, "post-run state diverged");
+
+    // Hand-computed A5 truth, asserted on the PARALLEL run's own numbers.
+    let dust_reserved = FixedPoint::from_raw(15_000_000);
+    // Post-rest: M holds 20 + 25 + raw 15_000_000; S holds 25.
+    let m0 = &par_balances[0][0];
+    assert_eq!(m0.order_margin, fp(45) + dust_reserved, "M post-rest margin");
+    assert_eq!(m0.available, fp(FUNDING - 45) - dust_reserved, "M post-rest avail");
+    let s0 = &par_balances[0][4];
+    assert_eq!(s0.order_margin, fp(25), "S post-rest margin");
+
+    // Post-storm: M released 20 (full mkt1) + 10 (mkt2 telescoped) +
+    // raw 5_000_000 (mkt3 dusty telescoped) → holds 15 + raw 10_000_000.
+    let m1 = &par_balances[1][0];
+    let m_remaining = fp(15) + FixedPoint::from_raw(10_000_000);
+    assert_eq!(m1.order_margin, m_remaining, "M post-storm margin (A5 telescoping)");
+    assert_eq!(m1.available, fp(FUNDING) - m_remaining, "M post-storm avail");
+    // S: STP released the resting buy's 25 in full; the sell rests with 25.
+    let s1 = &par_balances[1][4];
+    assert_eq!(s1.order_margin, fp(25), "S post-STP margin");
+    assert_eq!(s1.available, fp(FUNDING - 25), "S post-STP avail");
+
+    // Post-cancel: Σreleased == Σreserved EXACTLY for every actor — no dust
+    // stranded, nothing double-released, under the parallel path.
+    for (ai, name) in ["M", "T1", "T2", "T3", "S"].iter().enumerate() {
+        let b = &par_balances[2][ai];
+        assert_eq!(b.order_margin, FixedPoint::ZERO, "{name}: margin fully released");
+        assert_eq!(b.available, fp(FUNDING), "{name}: exactly back to funding");
+    }
+}
+
+// ============================================================================
+// 5. Default mode (env-driven) still settles a multi-market batch correctly
 // ============================================================================
 
 #[test]
 fn default_mode_multi_market_settles() {
-    // Whatever TORUS_PARALLEL_SETTLE says in this environment (default ON),
-    // the plain execute_batch entry point must settle a cross-market batch
-    // with the same observable outcome as explicit sequential mode.
+    // Whatever TORUS_PARALLEL_SETTLE says in this environment (default OFF —
+    // unset means the classic sequential loop), the plain execute_batch entry
+    // point must settle a cross-market batch with the same observable outcome
+    // as explicit sequential mode.
     let batches = fuzz_batches(0x0BAD_F00D);
     let golden = run_batches(&batches, false);
 
