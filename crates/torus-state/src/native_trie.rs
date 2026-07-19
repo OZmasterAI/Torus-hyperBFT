@@ -662,6 +662,75 @@ pub fn dirty_bucket_count(dirty: &BTreeMap<(u8, Vec<u8>), Option<Vec<u8>>>) -> u
     buckets.len()
 }
 
+/// AB-DIFFER microbench decomposition (scratch branch `perf/ab-differ`, bench-
+/// only): replicates the per-dirty-bucket work of [`compute_native_dirty_ops`]
+/// — the `read_bucket_members` prefix-scan + the leaf keccak — with timers, so
+/// the residual "root" cost can be split into (a) the mirror member scan
+/// (O(bucket occupancy) = O(depth / NUM_BUCKETS) RocksDB reads per dirty
+/// bucket, NOT cached by rank-root) and (b) the keccak of the framed member
+/// set. Reads only; mutates nothing. Returns per-block aggregates.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BucketScanBreakdown {
+    /// Distinct dirty buckets (== `dirty_bucket_count`).
+    pub dirty_buckets: usize,
+    /// Total members read across all dirty buckets' prefix scans.
+    pub members_scanned: usize,
+    /// Total bytes framed into the leaf keccak inputs.
+    pub bytes_framed: u64,
+    /// Wall time in the `read_bucket_members` prefix scans.
+    pub scan_seconds: f64,
+    /// Wall time in the leaf keccak (framing + hash).
+    pub keccak_seconds: f64,
+}
+
+/// See [`BucketScanBreakdown`]. Pure read; safe to call on a populated trie DB.
+pub fn microbench_bucket_scan(
+    db: &StateDb,
+    dirty: &BTreeMap<(u8, Vec<u8>), Option<Vec<u8>>>,
+) -> Result<BucketScanBreakdown, StateError> {
+    let defaults = default_nodes();
+    let mut by_bucket: BTreeMap<u16, Vec<((u8, Vec<u8>), Option<Vec<u8>>)>> = BTreeMap::new();
+    for ((tag, key), val) in dirty {
+        by_bucket
+            .entry(bucket_id(*tag, key))
+            .or_default()
+            .push(((*tag, key.clone()), val.clone()));
+    }
+    let mut out = BucketScanBreakdown {
+        dirty_buckets: by_bucket.len(),
+        ..Default::default()
+    };
+    for (b, entries) in &by_bucket {
+        let t = std::time::Instant::now();
+        let mut members = read_bucket_members(db, *b)?;
+        out.scan_seconds += t.elapsed().as_secs_f64();
+        out.members_scanned += members.len();
+        for ((tag, key), val) in entries {
+            match val {
+                Some(v) => {
+                    members.insert((*tag, key.clone()), v.clone());
+                }
+                None => {
+                    members.remove(&(*tag, key.clone()));
+                }
+            }
+        }
+        let t = std::time::Instant::now();
+        let _leaf = if members.is_empty() {
+            defaults[TREE_DEPTH]
+        } else {
+            let mut data = Vec::new();
+            for ((tag, key), v) in &members {
+                frame_entry(&mut data, *tag, key, v);
+            }
+            out.bytes_framed += data.len() as u64;
+            keccak256(&data)
+        };
+        out.keccak_seconds += t.elapsed().as_secs_f64();
+    }
+    Ok(out)
+}
+
 /// rank-root: cached variant of [`compute_native_dirty_ops`] — sibling reads
 /// come from the in-RAM image (zero node point-reads) and buckets whose
 /// member set does not ACTUALLY change (clean rewrites / delete-of-absent)
