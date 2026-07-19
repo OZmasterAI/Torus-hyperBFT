@@ -202,6 +202,16 @@ pub struct Metrics {
     pub exec_phase_settle_seconds: Histogram,
     pub exec_save_books_seconds: Histogram,
     pub exec_flush_seconds: Histogram,
+    /// rank-root: flush breakdown — native trie maintenance (bucket rehash +
+    /// path propagation) inside the atomic flush.
+    pub exec_root_seconds: Histogram,
+    /// rank-root: flush breakdown — WriteBatch build + RocksDB write.
+    pub exec_state_write_seconds: Histogram,
+    /// rank-root: flush breakdown — post-flush EVM account resync.
+    pub exec_evm_resync_seconds: Histogram,
+    /// rank-root: buckets rehashed per block by the native-trie maintenance
+    /// (the O(dirty) witness — compare against rows touched).
+    pub exec_root_dirty_buckets: Histogram,
     pub exec_block_seconds: Histogram,
     /// Committed blocks handed to the exec channel but not yet fully executed.
     /// Pinned near the channel bound (64) = execution is the bottleneck.
@@ -746,6 +756,34 @@ impl Metrics {
             exec_flush_seconds.clone(),
         );
 
+        let exec_root_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
+        registry.register(
+            "torus_exec_root_seconds",
+            "Flush breakdown: incremental native-trie maintenance (bucket rehash + path)",
+            exec_root_seconds.clone(),
+        );
+
+        let exec_state_write_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
+        registry.register(
+            "torus_exec_state_write_seconds",
+            "Flush breakdown: WriteBatch build + atomic RocksDB write",
+            exec_state_write_seconds.clone(),
+        );
+
+        let exec_evm_resync_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
+        registry.register(
+            "torus_exec_evm_resync_seconds",
+            "Flush breakdown: post-flush incremental-trie EVM account resync",
+            exec_evm_resync_seconds.clone(),
+        );
+
+        let exec_root_dirty_buckets = Histogram::new(exponential_buckets(1.0, 2.0, 16));
+        registry.register(
+            "torus_exec_root_dirty_buckets",
+            "Buckets rehashed per block by native-trie maintenance (O(dirty) witness)",
+            exec_root_dirty_buckets.clone(),
+        );
+
         let exec_block_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
         registry.register(
             "torus_exec_block_seconds",
@@ -972,6 +1010,10 @@ impl Metrics {
             exec_phase_settle_seconds,
             exec_save_books_seconds,
             exec_flush_seconds,
+            exec_root_seconds,
+            exec_state_write_seconds,
+            exec_evm_resync_seconds,
+            exec_root_dirty_buckets,
             exec_block_seconds,
             exec_queue_depth,
             exec_throttle_tier,

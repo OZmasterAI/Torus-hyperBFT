@@ -28,7 +28,11 @@ fn fp(v: i64) -> FixedPoint {
 }
 
 fn make_ctx(state_db: StateDb) -> NativeExecContext {
-    NativeExecContext::new(
+    // These are CLASSIC whole-book persistence contracts (write counts per
+    // dirty market) — pin the mode so a TORUS_BOOK_ROWS=1 environment can't
+    // reroute them onto the row store (C4). The row-store equivalents live in
+    // book_rows_tests.rs.
+    NativeExecContext::new_with_book_rows(
         state_db,
         1,        // block_height
         1000,     // timestamp
@@ -38,6 +42,7 @@ fn make_ctx(state_db: StateDb) -> NativeExecContext {
         addr(99), // proposer
         addr(100),
         addr(101),
+        false,
     )
 }
 

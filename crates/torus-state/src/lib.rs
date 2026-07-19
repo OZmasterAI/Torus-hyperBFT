@@ -16,7 +16,7 @@ pub mod snapshot;
 pub mod trie;
 pub mod trie_cursor;
 
-pub use backend::{AtomicWriteOp, NativeStateOverlay, StateBackend};
+pub use backend::{AtomicWriteOp, NativeFlushStats, NativeStateOverlay, StateBackend};
 pub use bg_writer::{BackgroundCfWriter, RawCfKv};
 pub use db::StateDb;
 pub use error::StateError;
