@@ -1165,6 +1165,19 @@ pub struct ChainConfig {
     /// `backoff_factor`.
     #[serde(default = "default_backoff_cap")]
     pub backoff_cap: u32,
+    /// S470: exponent cap of the COMMIT-LAG view-timeout backoff, which
+    /// stretches view deadlines while the QC frontier outruns the commit
+    /// frontier (the header-pipeline commit wedge; the Task A stall term is
+    /// blind to it). 0 (the default, and the value for any genesis file that
+    /// omits the field) disables the term entirely — deadline schedule
+    /// byte-identical to pre-S470.
+    ///
+    /// FLEET-UNIFORM: consensus-liveness critical — every validator of a
+    /// chain must use the same value (genesis-sourced). Divergent values
+    /// across a fleet = divergent view-deadline schedules = degraded liveness
+    /// (premature Bracha timeouts), though never a safety violation.
+    #[serde(default)]
+    pub commit_lag_backoff_cap: u32,
     /// MonadBFT B3: weight leader selection by observed leader reputation.
     /// Consensus-critical — every validator of a chain must use the same value.
     /// Off by default: locally-observed reputation diverges across replicas
@@ -1260,6 +1273,32 @@ pub struct ValidatorSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// S470 knob default: a ChainConfig serialized before the field existed
+    /// (no `commit_lag_backoff_cap` key) must deserialize with the commit-lag
+    /// backoff OFF (0) — an un-upgraded genesis runs the exact pre-S470
+    /// deadline schedule.
+    #[test]
+    fn chain_config_commit_lag_backoff_cap_defaults_to_zero() {
+        let json = r#"{
+            "chain_id": 1,
+            "chain_name": "t",
+            "evm_gas_limit": 1,
+            "base_fee_per_gas": 1,
+            "epoch_length": 1,
+            "max_validators": 1,
+            "min_stake": "0x0",
+            "fee_burn_bps": 0,
+            "fee_validator_bps": 0,
+            "fee_treasury_bps": 0,
+            "fee_dev_pool_bps": 0
+        }"#;
+        let config: ChainConfig = serde_json::from_str(json).expect("legacy config must parse");
+        assert_eq!(config.commit_lag_backoff_cap, 0);
+        // The pre-existing backoff defaults are unchanged by S470.
+        assert_eq!(config.backoff_factor, 2);
+        assert_eq!(config.backoff_cap, 8);
+    }
 
     #[test]
     fn fixed_point_basic_arithmetic() {

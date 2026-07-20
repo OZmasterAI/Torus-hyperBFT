@@ -2177,6 +2177,7 @@ impl TorusApp {
             timeout_base_ms: 500,
             backoff_factor: 2,
             backoff_cap: 8,
+            commit_lag_backoff_cap: 0,
             reputation_leader_selection: false,
             exec_trust_cache: false,
         };
@@ -3843,6 +3844,7 @@ mod crash_recovery_tests {
             timeout_base_ms: 500,
             backoff_factor: 2,
             backoff_cap: 8,
+            commit_lag_backoff_cap: 0,
             reputation_leader_selection: false,
             exec_trust_cache: false,
         };

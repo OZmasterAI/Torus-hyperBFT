@@ -94,6 +94,13 @@ pub struct ConsensusConfig {
     /// kill switch). Absent in genesis → 8.
     #[serde(default = "default_backoff_cap")]
     pub backoff_cap: u32,
+    /// S470: exponent cap of the COMMIT-LAG view-timeout backoff (stretches
+    /// deadlines while the QC frontier outruns the commit frontier — the
+    /// header-pipeline commit wedge). 0 disables (kill switch). Absent in
+    /// genesis → 0 (off; deadline schedule byte-identical to pre-S470).
+    /// FLEET-UNIFORM: identical on all validators or liveness degrades.
+    #[serde(default)]
+    pub commit_lag_backoff_cap: u32,
     /// MonadBFT B3 reputation-weighted leader selection (consensus-critical:
     /// identical on all validators). Absent in genesis TOML → disabled.
     #[serde(default)]
@@ -511,6 +518,7 @@ impl Genesis {
             timeout_base_ms: self.consensus.timeout_base_ms,
             backoff_factor: self.consensus.backoff_factor,
             backoff_cap: self.consensus.backoff_cap,
+            commit_lag_backoff_cap: self.consensus.commit_lag_backoff_cap,
             reputation_leader_selection: self.consensus.reputation_leader_selection,
             // Node-local perf toggle; never sourced from genesis. Enabled per-node
             // via the `--exec-trust-cache` CLI flag.
@@ -685,6 +693,20 @@ mod tests {
                 ps.address
             );
         }
+    }
+
+    /// S470 knob default: a genesis whose consensus section omits
+    /// `commit_lag_backoff_cap` (every genesis written before S470) must map
+    /// to a ChainConfig with the commit-lag backoff OFF — the exact pre-S470
+    /// deadline schedule.
+    #[test]
+    fn genesis_without_commit_lag_backoff_cap_defaults_off() {
+        let genesis = Genesis::from_json(&sample_genesis_json()).unwrap();
+        assert_eq!(genesis.consensus.commit_lag_backoff_cap, 0);
+        assert_eq!(genesis.chain_config().commit_lag_backoff_cap, 0);
+        // Pre-existing Task A defaults are untouched by S470.
+        assert_eq!(genesis.chain_config().backoff_factor, 2);
+        assert_eq!(genesis.chain_config().backoff_cap, 8);
     }
 
     #[test]

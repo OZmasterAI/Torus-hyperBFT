@@ -107,6 +107,24 @@ impl<N: Network> Pacemaker<N> {
             })
             .publish(&self.event_publisher);
 
+            // S470 wedge diagnostics: the per-timeout (view − qc) and
+            // (qc − committed) series confirm (or rule out) the commit-wedge
+            // mechanism live: during the wedge, view − qc stays small while
+            // qc − committed races ahead.
+            if crate::logging::wedge_diag_enabled() {
+                let highest_pc = block_tree.highest_pc()?;
+                let locked_pc = block_tree.locked_pc()?;
+                let committed_view = block_tree.committed_qc_view()?;
+                log::info!(
+                    "wedge_diag view_timeout: view={} highest_pc_view={} locked_pc_view={} committed_view={} locked_block_prefix={}",
+                    cur_view.int(),
+                    highest_pc.view.int(),
+                    locked_pc.view.int(),
+                    committed_view.int(),
+                    crate::logging::block_prefix(&locked_pc.block),
+                );
+            }
+
             // 1.1. If the current view is an Epoch-Change view, broadcast a `TimeoutVote`, then extend the view.
             if is_epoch_change_view(&cur_view, self.config.epoch_length) {
                 if is_validator(&self.config.keypair.public(), &validator_set_state) {
@@ -130,7 +148,7 @@ impl<N: Network> Pacemaker<N> {
                 }
 
                 // We extend the view timeout so that we will broadcast a `TimeoutVote` when this view times out again.
-                self.extend_view(block_tree.highest_pc()?.view)?
+                self.extend_view(block_tree.highest_pc()?.view, block_tree.committed_qc_view()?)?
 
             // 1.2. MonadBFT: broadcast TimeoutVote before advancing on normal view timeout.
             } else {
@@ -157,6 +175,7 @@ impl<N: Network> Pacemaker<N> {
                     cur_view + 1,
                     &validator_set_state,
                     block_tree.highest_pc()?.view,
+                    block_tree.committed_qc_view()?,
                 )?;
             }
 
@@ -417,6 +436,7 @@ impl<N: Network> Pacemaker<N> {
                             next_view,
                             &validator_set_state,
                             block_tree.highest_pc()?.view,
+                            block_tree.committed_qc_view()?,
                         )?
                     }
                 }
@@ -512,6 +532,7 @@ impl<N: Network> Pacemaker<N> {
                     next_view,
                     &validator_set_state,
                     block_tree.highest_pc()?.view,
+                    block_tree.committed_qc_view()?,
                 )?
             }
         }
@@ -522,9 +543,11 @@ impl<N: Network> Pacemaker<N> {
     /// Update the Pacemaker's state in order to enter a specified `next_view`.
     ///
     /// `highest_qc_view` is the view of the block tree's Highest PC at entry
-    /// time. It drives the Task A stall multiplier: consensus-visible state
-    /// only, so every honest replica derives the identical (possibly
-    /// backed-off) deadline for `next_view`.
+    /// time, and `committed_view` (S470) is the justify-view of the highest
+    /// committed block (see `BlockTreeSingleton::committed_qc_view`). Together they drive the
+    /// Task A stall multiplier and the S470 commit-lag multiplier:
+    /// consensus-visible state only, so every honest replica derives the
+    /// identical (possibly backed-off) deadline for `next_view`.
     ///
     /// # Preconditions
     ///
@@ -535,6 +558,7 @@ impl<N: Network> Pacemaker<N> {
         next_view: ViewNumber,
         validator_set_state: &ValidatorSetState,
         highest_qc_view: ViewNumber,
+        committed_view: ViewNumber,
     ) -> Result<(), PacemakerError> {
         let cur_view = self.view_info.view;
 
@@ -551,7 +575,7 @@ impl<N: Network> Pacemaker<N> {
         // 2. If about to enter a new epoch, set timeouts for the new epoch.
         if epoch(cur_view, self.config.epoch_length) != epoch(next_view, self.config.epoch_length) {
             self.state
-                .update_timeouts(next_view, &self.config, highest_qc_view);
+                .update_timeouts(next_view, &self.config, highest_qc_view, committed_view);
         }
 
         // 2b. S395 liveness fix: the per-epoch schedule assigns every view an ABSOLUTE
@@ -567,9 +591,12 @@ impl<N: Network> Pacemaker<N> {
         // replica: rebase it to start from now (same routine as an epoch entry).
         // Task A: the stall multiplier for the view being entered — 1 while
         // the QC frontier keeps up, factor^min(depth, cap) while views outrun
-        // QCs. Used by both the clamp threshold (2b) and the deadline stretch
-        // (2c) below.
-        let multiplier = self.config.stall_multiplier(next_view, highest_qc_view);
+        // QCs. S470: also grows with the commit lag (QC frontier vs commit
+        // frontier) while `commit_lag_cap > 0`. Used by both the clamp
+        // threshold (2b) and the deadline stretch (2c) below.
+        let multiplier = self
+            .config
+            .stall_multiplier(next_view, highest_qc_view, committed_view);
 
         let scheduled = *self
             .state
@@ -582,7 +609,7 @@ impl<N: Network> Pacemaker<N> {
         // surplus exceeds even the backed-off allowance — still rebases.
         if scheduled > Instant::now() + self.config.max_view_time * 2 * multiplier {
             self.state
-                .update_timeouts(next_view, &self.config, highest_qc_view);
+                .update_timeouts(next_view, &self.config, highest_qc_view, committed_view);
         }
 
         // 2c. Task A (adaptive backoff): if views have outrun the QC frontier —
@@ -632,14 +659,21 @@ impl<N: Network> Pacemaker<N> {
 
     /// Extend the timeout of the current view, which must be an Epoch-Change View.
     ///
-    /// `highest_qc_view` is the view of the block tree's Highest PC: the Task A
-    /// stall multiplier scales the extension while views have outrun QCs.
+    /// `highest_qc_view` is the view of the block tree's Highest PC and
+    /// `committed_view` (S470) the justify-view of the highest committed
+    /// block: the Task A stall multiplier and the S470 commit-lag multiplier
+    /// scale the extension while views have outrun QCs or QCs have outrun
+    /// commits.
     ///
     /// # Errors
     ///
     /// This function should only be called if the current view is an Epoch-Change View. Otherwise, an
     /// [`ExtendViewError`] will be returned.
-    fn extend_view(&mut self, highest_qc_view: ViewNumber) -> Result<(), ExtendViewError> {
+    fn extend_view(
+        &mut self,
+        highest_qc_view: ViewNumber,
+        committed_view: ViewNumber,
+    ) -> Result<(), ExtendViewError> {
         // 1. Confirm that the current view is an Epoch-Change View.
         let cur_view = self.view_info.view;
         if !is_epoch_change_view(&cur_view, self.config.epoch_length) {
@@ -651,6 +685,7 @@ impl<N: Network> Pacemaker<N> {
             self.view_info.view,
             &self.config,
             highest_qc_view,
+            committed_view,
         );
 
         // 3. Increase the timeout of the current view inside `ViewInfo`.
@@ -690,6 +725,29 @@ pub(crate) struct PacemakerConfiguration {
     /// switch: the multiplier is then constantly 1 and the schedule is exactly
     /// the pre-backoff one. Fleet-wide (genesis-sourced), like `backoff_factor`.
     pub(crate) backoff_cap: u32,
+
+    /// Exponent cap of the COMMIT-LAG view-timeout backoff (S470 wedge fix).
+    ///
+    /// The Task A stall term is keyed on `view − highest_qc_view`, which stays
+    /// SMALL during the header-pipeline commit wedge (the QC frontier crawls
+    /// forward one QC every few views while the commit frontier freezes: body
+    /// execution is slower than the view timer, so no proposal ever lands in
+    /// `justify.view + 1` and the 2-chain consecutive-views commit rule never
+    /// fires). This second term is keyed on the gap that IS large during that
+    /// wedge: `highest_qc_view − committed_view` (QC frontier vs commit
+    /// frontier). See [`commit_lag_exponent`].
+    ///
+    /// `0` is the runtime kill switch (the default): the commit-lag term is
+    /// then constantly neutral and the deadline schedule is byte-identical to
+    /// the pre-S470 one — mirroring the `backoff_cap = 0` semantics.
+    ///
+    /// LOUD WARNING — fleet-uniform knob: this value must be IDENTICAL on
+    /// every replica of a chain (genesis-sourced). Divergent values across a
+    /// fleet mean divergent deadline schedules, which degrade liveness (the
+    /// earliest replica's timeout triggers Bracha amplification and collapses
+    /// lockstep view synchronization). Never a safety violation — but a
+    /// misconfigured fleet can stall.
+    pub(crate) commit_lag_cap: u32,
 }
 
 impl PacemakerConfiguration {
@@ -699,13 +757,37 @@ impl PacemakerConfiguration {
     /// stall depth 0 — multiplier 1, schedule byte-identical to pre-backoff.
     /// Each further view entered without the frontier advancing deepens the
     /// stall by one and multiplies the timeout by another `backoff_factor`.
-    fn stall_multiplier(&self, view: ViewNumber, highest_qc_view: ViewNumber) -> u32 {
-        backoff_multiplier(
-            view,
-            highest_qc_view + 1,
-            self.backoff_factor,
-            self.backoff_cap,
-        )
+    ///
+    /// S470: combined with the commit-lag term (see [`commit_lag_exponent`]),
+    /// which grows with `highest_qc_view − committed_view` instead. The two
+    /// exponents are combined by MAX (not sum), so each term alone reproduces
+    /// its standalone behavior and a wedge that trips both never
+    /// double-compounds. `commit_lag_cap = 0` (the default) makes the second
+    /// term constantly 0 — schedule byte-identical to the stall-only one.
+    ///
+    /// Lockstep safety: both inputs are CONSENSUS-VISIBLE quantities —
+    /// `highest_qc_view` is the view of the highest PhaseCertificate and
+    /// `committed_view` is the justify-view of the highest committed block
+    /// (the committed block is determined by the 2-chain rule over the QC
+    /// chain, not by local timing). Neither depends on node-local execution
+    /// state, so identical inputs yield identical deadlines on every honest
+    /// replica. Both frontiers propagate asynchronously, so replicas can
+    /// transiently disagree by a view or two — exactly as they already can on
+    /// `highest_qc_view` in the pre-S470 stall term — but both are FROZEN and
+    /// identical across honest replicas precisely when the backoff is active
+    /// (during a stall/wedge), which is when schedule agreement matters.
+    fn stall_multiplier(
+        &self,
+        view: ViewNumber,
+        highest_qc_view: ViewNumber,
+        committed_view: ViewNumber,
+    ) -> u32 {
+        let stall_exponent = backoff_exponent(view, highest_qc_view + 1, self.backoff_cap);
+        let lag_exponent =
+            commit_lag_exponent(highest_qc_view, committed_view, self.commit_lag_cap);
+        self.backoff_factor
+            .saturating_pow(stall_exponent.max(lag_exponent))
+            .max(1)
     }
 }
 
@@ -738,6 +820,7 @@ impl PacemakerState {
             start_view: ViewNumber,
             config: &PacemakerConfiguration,
             highest_qc_view: ViewNumber,
+            committed_view: ViewNumber,
         ) -> BTreeMap<ViewNumber, Instant> {
             let mut timeouts = BTreeMap::new();
 
@@ -749,7 +832,7 @@ impl PacemakerState {
             // Task A: per-view slot scaled by the stall multiplier at the
             // schedule base (1 while the QC frontier keeps up — see
             // `stall_multiplier`).
-            let multiplier = config.stall_multiplier(start_view, highest_qc_view);
+            let multiplier = config.stall_multiplier(start_view, highest_qc_view, committed_view);
 
             // Add timeouts for all remaining views in the epoch of start_view.
             for view in start_view.int()..=epoch_view {
@@ -763,8 +846,11 @@ impl PacemakerState {
 
         Self {
             // At boot the replica has no evidence of an ongoing stall: treat
-            // `init_view` as justified (stall depth 0, multiplier 1).
-            timeouts: initial_timeouts(init_view, config, init_view),
+            // `init_view` as justified and the commit frontier as caught up
+            // (stall depth 0, commit lag 0, multiplier 1). The first
+            // block-tree-informed entry (update_view) re-derives both terms
+            // from the persisted consensus frontiers.
+            timeouts: initial_timeouts(init_view, config, init_view, init_view),
             timeout_vote_collectors: <ActiveCollectorPair<TimeoutVoteCollector>>::new(
                 config.chain_id,
                 init_view,
@@ -784,6 +870,7 @@ impl PacemakerState {
         epoch_start_view: ViewNumber,
         config: &PacemakerConfiguration,
         highest_qc_view: ViewNumber,
+        committed_view: ViewNumber,
     ) {
         // Remove timeouts for expired views.
         self.timeouts = self.timeouts.split_off(&epoch_start_view);
@@ -800,8 +887,8 @@ impl PacemakerState {
         // Task A: per-view slot scaled by the stall multiplier at the schedule
         // base — 1 while the QC frontier keeps up (healthy entries/rebases are
         // byte-identical to the pre-backoff schedule), factor^min(depth, cap)
-        // while views outrun QCs.
-        let multiplier = config.stall_multiplier(epoch_start_view, highest_qc_view);
+        // while views outrun QCs. S470: also scaled while QCs outrun commits.
+        let multiplier = config.stall_multiplier(epoch_start_view, highest_qc_view, committed_view);
 
         // Populate `self.timeouts` with the timeouts of the views in the newly-entered epoch.
         for view in epoch_start_view.int()..=epoch_change_view {
@@ -826,8 +913,10 @@ impl PacemakerState {
         epoch_change_view: ViewNumber,
         config: &PacemakerConfiguration,
         highest_qc_view: ViewNumber,
+        committed_view: ViewNumber,
     ) {
-        let multiplier = config.stall_multiplier(epoch_change_view, highest_qc_view);
+        let multiplier =
+            config.stall_multiplier(epoch_change_view, highest_qc_view, committed_view);
         self.timeouts.insert(
             epoch_change_view,
             Instant::now() + config.max_view_time * multiplier,
@@ -1106,9 +1195,47 @@ pub fn select_leader_reputation_weighted(
 /// neutral on the happy path evaluate `backoff_multiplier(view,
 /// highest_qc_view + 1, ..)` — see [`PacemakerConfiguration::stall_multiplier`].
 fn backoff_multiplier(view: ViewNumber, highest_qc_view: ViewNumber, factor: u32, cap: u32) -> u32 {
-    let gap = view.int().saturating_sub(highest_qc_view.int());
-    let exponent = gap.min(cap as u64) as u32;
-    factor.saturating_pow(exponent).max(1)
+    factor
+        .saturating_pow(backoff_exponent(view, highest_qc_view, cap))
+        .max(1)
+}
+
+/// The stall exponent of the Task A backoff: `min(view − justified_view, cap)`,
+/// saturating at 0 when the frontier is ahead. Pure function of
+/// consensus-visible inputs (see [`backoff_multiplier`]).
+fn backoff_exponent(view: ViewNumber, justified_view: ViewNumber, cap: u32) -> u32 {
+    view.int()
+        .saturating_sub(justified_view.int())
+        .min(cap as u64) as u32
+}
+
+/// S470 wedge fix: healthy pipelined operation keeps the commit frontier a
+/// couple of views behind the QC frontier (the 2-chain rule commits the
+/// grandparent generation, and `committed_qc_view` reads the committed
+/// block's OWN justify — one more generation of skew). Lags at or below this
+/// grace never contribute to the deadline, so the happy-path schedule is
+/// untouched even with `commit_lag_cap > 0`.
+pub(crate) const COMMIT_LAG_GRACE: u64 = 4;
+
+/// The commit-lag exponent of the S470 wedge backoff:
+/// `min((highest_qc_view − committed_view).saturating_sub(GRACE), cap)`.
+///
+/// This is the term that engages during the header-pipeline commit wedge,
+/// where the stall exponent stays ~0 (QCs keep crawling forward, resetting
+/// `view − highest_qc_view`) while `highest_qc_view − committed_view` races
+/// into the tens or hundreds. Pure function of consensus-visible inputs —
+/// every honest replica with the same frontiers derives the same exponent.
+/// `cap = 0` is the runtime kill switch: exponent constantly 0.
+fn commit_lag_exponent(
+    highest_qc_view: ViewNumber,
+    committed_view: ViewNumber,
+    cap: u32,
+) -> u32 {
+    highest_qc_view
+        .int()
+        .saturating_sub(committed_view.int())
+        .saturating_sub(COMMIT_LAG_GRACE)
+        .min(cap as u64) as u32
 }
 
 /// Check whether `view` is an epoch-change view given the configured `epoch_length`.
@@ -1287,9 +1414,21 @@ impl Network for NullNetwork {
 }
 
 /// Single-validator pacemaker fixture starting at `init_view`, 500ms view time,
-/// 100k-view epochs (the live testnet shape).
+/// 100k-view epochs (the live testnet shape). `commit_lag_cap` defaults to 0
+/// (the production default — S470 commit-lag term off), so every pre-S470
+/// test in this file also proves the knob-off schedule is byte-identical to
+/// the pre-S470 one.
 #[cfg(test)]
 fn test_pacemaker(init_view: u64) -> (Pacemaker<NullNetwork>, ValidatorSetState) {
+    test_pacemaker_with_commit_lag_cap(init_view, 0)
+}
+
+/// Like [`test_pacemaker`] but with an explicit S470 `commit_lag_cap`.
+#[cfg(test)]
+fn test_pacemaker_with_commit_lag_cap(
+    init_view: u64,
+    commit_lag_cap: u32,
+) -> (Pacemaker<NullNetwork>, ValidatorSetState) {
     use crate::types::{data_types::Power, update_sets::ValidatorSetUpdates};
     use ed25519_dalek::SigningKey;
     use rand_core::OsRng;
@@ -1303,6 +1442,7 @@ fn test_pacemaker(init_view: u64) -> (Pacemaker<NullNetwork>, ValidatorSetState)
         max_view_time: Duration::from_millis(500),
         backoff_factor: 2,
         backoff_cap: 8,
+        commit_lag_cap,
     };
     let mut vs = ValidatorSet::new();
     let mut updates = ValidatorSetUpdates::new();
@@ -1332,7 +1472,7 @@ fn update_view_jump_rebases_stale_schedule() {
     // Healthy QC frontier (the jump was justified by a fresh certificate):
     // the stall multiplier stays 1 and the legacy rebase semantics apply.
     pacemaker
-        .update_view(ViewNumber::new(39_000), &vss, ViewNumber::new(38_999))
+        .update_view(ViewNumber::new(39_000), &vss, ViewNumber::new(38_999), ViewNumber::new(38_999))
         .unwrap();
     assert!(
         pacemaker.query().deadline <= Instant::now() + max_view_time * 2,
@@ -1342,7 +1482,7 @@ fn update_view_jump_rebases_stale_schedule() {
     // Views AFTER the jump target must be rebased too, or every subsequent
     // sequential advance would park again.
     pacemaker
-        .update_view(ViewNumber::new(39_001), &vss, ViewNumber::new(39_000))
+        .update_view(ViewNumber::new(39_001), &vss, ViewNumber::new(39_000), ViewNumber::new(39_000))
         .unwrap();
     assert!(pacemaker.query().deadline <= Instant::now() + max_view_time * 2);
 }
@@ -1356,7 +1496,7 @@ fn update_view_fast_run_deadline_bounded() {
     for v in 2..=50u64 {
         // Fast QC run: every entry is justified by the previous view's QC.
         pacemaker
-            .update_view(ViewNumber::new(v), &vss, ViewNumber::new(v - 1))
+            .update_view(ViewNumber::new(v), &vss, ViewNumber::new(v - 1), ViewNumber::new(v - 1))
             .unwrap();
     }
     assert!(
@@ -1378,7 +1518,7 @@ fn update_view_threads_qc_frontier() {
     let (mut pacemaker, vss) = test_pacemaker(1);
     let before = Instant::now();
     pacemaker
-        .update_view(ViewNumber::new(5), &vss, ViewNumber::new(1))
+        .update_view(ViewNumber::new(5), &vss, ViewNumber::new(1), ViewNumber::new(1))
         .unwrap();
     let after = Instant::now();
     let deadline = pacemaker.query().deadline;
@@ -1394,7 +1534,7 @@ fn update_view_threads_qc_frontier() {
     std::thread::sleep(Duration::from_millis(1200));
     let before = Instant::now();
     pacemaker
-        .update_view(ViewNumber::new(3), &vss, ViewNumber::new(1))
+        .update_view(ViewNumber::new(3), &vss, ViewNumber::new(1), ViewNumber::new(1))
         .unwrap();
     let after = Instant::now();
     let deadline = pacemaker.query().deadline;
@@ -1418,7 +1558,7 @@ fn extend_scales_with_gap() {
 
     // Healthy: the QC for view 99_999 justifies the epoch-change view.
     let before = Instant::now();
-    pacemaker.extend_view(ViewNumber::new(99_999)).unwrap();
+    pacemaker.extend_view(ViewNumber::new(99_999), ViewNumber::new(99_999)).unwrap();
     let after = Instant::now();
     let deadline = pacemaker.query().deadline;
     assert!(
@@ -1428,7 +1568,7 @@ fn extend_scales_with_gap() {
 
     // Stalled: frontier stuck 4 views behind the justified entry => x16.
     let before = Instant::now();
-    pacemaker.extend_view(ViewNumber::new(99_995)).unwrap();
+    pacemaker.extend_view(ViewNumber::new(99_995), ViewNumber::new(99_995)).unwrap();
     let after = Instant::now();
     let deadline = pacemaker.query().deadline;
     assert!(
@@ -1454,12 +1594,12 @@ fn clamp_preserves_legitimate_backoff() {
     let before = Instant::now();
     pacemaker
         .state
-        .update_timeouts(ViewNumber::new(10), &pacemaker.config, ViewNumber::new(5));
+        .update_timeouts(ViewNumber::new(10), &pacemaker.config, ViewNumber::new(5), ViewNumber::new(5));
     let after = Instant::now();
 
     // Enter view 11 with the same stale frontier (stall depth 5 => x32).
     pacemaker
-        .update_view(ViewNumber::new(11), &vss, ViewNumber::new(5))
+        .update_view(ViewNumber::new(11), &vss, ViewNumber::new(5), ViewNumber::new(5))
         .unwrap();
     assert!(
         pacemaker.query().deadline >= before + mvt * 32,
@@ -1494,7 +1634,7 @@ fn update_timeouts_gap0_matches_legacy() {
     let before = Instant::now();
     pacemaker
         .state
-        .update_timeouts(start, &pacemaker.config, ViewNumber::new(4));
+        .update_timeouts(start, &pacemaker.config, ViewNumber::new(4), ViewNumber::new(4));
     let after = Instant::now();
 
     for k in 0..5u32 {
@@ -1522,7 +1662,7 @@ fn update_timeouts_gap_scales() {
     let before = Instant::now();
     pacemaker
         .state
-        .update_timeouts(ViewNumber::new(9), &pacemaker.config, ViewNumber::new(4));
+        .update_timeouts(ViewNumber::new(9), &pacemaker.config, ViewNumber::new(4), ViewNumber::new(4));
     let after = Instant::now();
     for k in 0..3u32 {
         let view = ViewNumber::new(9 + k as u64);
@@ -1539,6 +1679,7 @@ fn update_timeouts_gap_scales() {
     pacemaker.state.update_timeouts(
         ViewNumber::new(200),
         &pacemaker.config,
+        ViewNumber::new(100),
         ViewNumber::new(100),
     );
     let after = Instant::now();
@@ -1600,6 +1741,9 @@ fn pacemaker_config_has_backoff_defaults() {
     let (_, pacemaker_config, _, _): (_, PacemakerConfiguration, _, _) = config.into();
     assert_eq!(pacemaker_config.backoff_factor, 2);
     assert_eq!(pacemaker_config.backoff_cap, 8);
+    // S470: the commit-lag term defaults OFF (cap 0 = kill switch) — a node
+    // that never sets the knob runs the exact pre-S470 deadline schedule.
+    assert_eq!(pacemaker_config.commit_lag_cap, 0);
 }
 
 /// The cumulative schedule is preserved while on/near schedule: a single-step
@@ -1609,7 +1753,7 @@ fn pacemaker_config_has_backoff_defaults() {
 fn update_view_on_schedule_keeps_cumulative_deadline() {
     let (mut pacemaker, vss) = test_pacemaker(1);
     pacemaker
-        .update_view(ViewNumber::new(2), &vss, ViewNumber::new(1))
+        .update_view(ViewNumber::new(2), &vss, ViewNumber::new(1), ViewNumber::new(1))
         .unwrap();
     let deadline = pacemaker.query().deadline;
     assert!(
@@ -1617,4 +1761,132 @@ fn update_view_on_schedule_keeps_cumulative_deadline() {
         "on-schedule advance must keep the cumulative deadline, not rebase"
     );
     assert!(deadline <= Instant::now() + Duration::from_millis(1100));
+}
+
+/// S470 (commit-lag backoff): the commit-lag exponent is a pure function of
+/// `(highest_qc_view, committed_view, cap)` — no node-local timing state — so
+/// every honest replica derives the identical schedule (lockstep-exact), and
+/// `cap = 0` is a hard kill switch.
+#[test]
+fn commit_lag_exponent_table() {
+    let v = |n: u64| ViewNumber::new(n);
+
+    // No lag / lag within the grace window: neutral.
+    assert_eq!(commit_lag_exponent(v(100), v(100), 8), 0);
+    assert_eq!(commit_lag_exponent(v(100), v(100 - COMMIT_LAG_GRACE), 8), 0);
+    // One past the grace window: exponent 1.
+    assert_eq!(
+        commit_lag_exponent(v(100), v(100 - COMMIT_LAG_GRACE - 1), 8),
+        1
+    );
+    // Deep wedge (the observed shape: qc − committed in the hundreds):
+    // exponent saturates at cap.
+    assert_eq!(commit_lag_exponent(v(500), v(100), 8), 8);
+    assert_eq!(commit_lag_exponent(v(500), v(100), 4), 4);
+    // Committed frontier ahead (impossible, but must saturate, not wrap).
+    assert_eq!(commit_lag_exponent(v(100), v(200), 8), 0);
+    // cap = 0 is the runtime kill switch: exponent constantly 0.
+    assert_eq!(commit_lag_exponent(v(500), v(0), 0), 0);
+}
+
+/// S470: with `commit_lag_cap = 0` (the shipped default) the combined
+/// multiplier equals the pre-S470 stall-only multiplier for EVERY combination
+/// of (view, qc frontier, commit frontier) — the schedule is byte-identical
+/// to today's, no matter how large the commit lag grows.
+#[test]
+fn commit_lag_cap_zero_is_exact_today() {
+    let (pacemaker, _vss) = test_pacemaker_with_commit_lag_cap(1, 0);
+    for view in [1u64, 2, 5, 10, 100, 1_000, 100_000] {
+        for qc_gap in [0u64, 1, 2, 3, 10, 300] {
+            for lag in [0u64, 1, COMMIT_LAG_GRACE, 10, 160, 100_000] {
+                let qc = ViewNumber::new(view.saturating_sub(qc_gap + 1));
+                let committed = ViewNumber::new(qc.int().saturating_sub(lag));
+                assert_eq!(
+                    pacemaker
+                        .config
+                        .stall_multiplier(ViewNumber::new(view), qc, committed),
+                    backoff_multiplier(ViewNumber::new(view), qc + 1, 2, 8),
+                    "cap=0 must be byte-identical to the stall-only multiplier \
+                     (view={view}, qc={}, committed={})",
+                    qc.int(),
+                    committed.int(),
+                );
+            }
+        }
+    }
+}
+
+/// S470: the two exponents combine by MAX — the wedge signature (stall term
+/// small, commit lag huge) backs off through the commit-lag term, a plain
+/// no-quorum stall (huge stall term, small lag) still backs off through the
+/// stall term, and a state tripping both never double-compounds.
+#[test]
+fn commit_lag_multiplier_combines_by_max() {
+    let (pacemaker, _vss) = test_pacemaker_with_commit_lag_cap(1, 8);
+    let v = |n: u64| ViewNumber::new(n);
+
+    // Wedge shape: entering view 101 justified by QC(100) — stall depth 0 —
+    // while the commit frontier is frozen 10+grace views back: lag exponent
+    // wins (2^10 capped to 2^8... lag 14 => exponent min(10, 8) = 8).
+    assert_eq!(
+        pacemaker
+            .config
+            .stall_multiplier(v(101), v(100), v(100 - COMMIT_LAG_GRACE - 10)),
+        2u32.pow(8)
+    );
+    // Same shape, shallower: lag = grace + 3 => exponent 3 => x8.
+    assert_eq!(
+        pacemaker
+            .config
+            .stall_multiplier(v(101), v(100), v(100 - COMMIT_LAG_GRACE - 3)),
+        8
+    );
+    // No-quorum stall shape: stall depth 4, commit frontier caught up.
+    assert_eq!(pacemaker.config.stall_multiplier(v(105), v(100), v(100)), 16);
+    // Both tripped: stall depth 4 (x16), lag exponent 3 (x8) => max => x16,
+    // NOT x128.
+    assert_eq!(
+        pacemaker
+            .config
+            .stall_multiplier(v(105), v(100), v(100 - COMMIT_LAG_GRACE - 3)),
+        16
+    );
+    // Healthy: both neutral.
+    assert_eq!(pacemaker.config.stall_multiplier(v(101), v(100), v(98)), 1);
+}
+
+/// S470: `update_view` threads the commit frontier — entering a view that is
+/// perfectly justified (stall depth 0: the exact wedge signature) with a
+/// large commit lag must stretch the deadline by the commit-lag multiplier;
+/// with `commit_lag_cap = 0` the same entry must keep the flat schedule.
+#[test]
+fn update_view_threads_commit_lag() {
+    let mvt = Duration::from_millis(500);
+
+    // Knob on: entering view 101 justified by QC(100), commit frontier frozen
+    // at view 100 − (grace + 3) => lag exponent 3 => x8.
+    let (mut pacemaker, vss) = test_pacemaker_with_commit_lag_cap(1, 8);
+    let committed = ViewNumber::new(100 - COMMIT_LAG_GRACE - 3);
+    let before = Instant::now();
+    pacemaker
+        .update_view(ViewNumber::new(101), &vss, ViewNumber::new(100), committed)
+        .unwrap();
+    let after = Instant::now();
+    let deadline = pacemaker.query().deadline;
+    assert!(
+        deadline >= before + mvt * 8,
+        "commit-lagged entry must back off the deadline by the commit-lag multiplier"
+    );
+    assert!(deadline <= after + mvt * 8);
+
+    // Kill switch: identical entry with cap 0 keeps the flat (rebased)
+    // schedule — within 2x max_view_time like any healthy jump entry.
+    let (mut pacemaker, vss) = test_pacemaker_with_commit_lag_cap(1, 0);
+    pacemaker
+        .update_view(ViewNumber::new(101), &vss, ViewNumber::new(100), committed)
+        .unwrap();
+    assert!(
+        pacemaker.query().deadline <= Instant::now() + mvt * 2,
+        "cap=0 must keep the exact pre-S470 schedule regardless of commit lag"
+    );
 }

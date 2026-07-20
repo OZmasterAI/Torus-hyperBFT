@@ -32,6 +32,27 @@ use crate::common::{
 
 use super::logging::{first_seven_base64_chars, log_with_context};
 
+/// S470 wedge-repro knobs for a test [`Node`]: `NumberApp` produce/validate
+/// delays plus the replica's commit-lag deadline backoff cap. The default is
+/// the historical harness behavior (250ms/250ms delays, commit-lag backoff
+/// OFF), so pre-S470 constructors are unchanged.
+#[derive(Clone, Copy)]
+pub(crate) struct WedgeOptions {
+    pub(crate) produce_delay: Duration,
+    pub(crate) validate_delay: Duration,
+    pub(crate) commit_lag_cap: u32,
+}
+
+impl Default for WedgeOptions {
+    fn default() -> Self {
+        Self {
+            produce_delay: Duration::from_millis(250),
+            validate_delay: Duration::from_millis(250),
+            commit_lag_cap: 0,
+        }
+    }
+}
+
 /// A single "node" in an integration test cluster built around number app.
 ///
 /// Users can do two sets of things with a `Node` by calling its methods:
@@ -87,6 +108,33 @@ impl Node {
             init_vs_updates,
             max_view_time,
             true,
+            WedgeOptions::default(),
+        )
+    }
+
+    /// S470 wedge-repro constructor: like [`new_with_max_view_time`], but with
+    /// caller-chosen `NumberApp` produce/validate delays (keep both under
+    /// `max_view_time` — see the S470 caution on `NumberApp`) and the S470
+    /// `commit_lag_cap` knob. The wedge itself is induced by pairing this
+    /// with `mock_network_with_body_delay`; `commit_lag_cap = 0` is today's
+    /// schedule (RED), `> 0` enables the commit-lag deadline backoff (GREEN).
+    #[allow(dead_code)]
+    pub(crate) fn new_with_wedge_options(
+        keypair: SigningKey,
+        network_stub: NetworkStub,
+        init_as_updates: AppStateUpdates,
+        init_vs_updates: ValidatorSetUpdates,
+        max_view_time: Duration,
+        wedge_options: WedgeOptions,
+    ) -> Node {
+        Self::build(
+            keypair,
+            network_stub,
+            init_as_updates,
+            init_vs_updates,
+            max_view_time,
+            true,
+            wedge_options,
         )
     }
 
@@ -115,6 +163,7 @@ impl Node {
             init_vs_updates,
             max_view_time,
             false,
+            WedgeOptions::default(),
         )
     }
 
@@ -128,6 +177,7 @@ impl Node {
         init_vs_updates: ValidatorSetUpdates,
         max_view_time: Duration,
         block_sync_enabled: bool,
+        wedge_options: WedgeOptions,
     ) -> Node {
         let kv_store = MemDB::new();
 
@@ -162,11 +212,17 @@ impl Node {
             // `max_view_time` must be **at least** 500 milliseconds, since `NumberApp`'s `produce_block` and
             // `validate_block` each take a minimum of 250 milliseconds to complete.
             .max_view_time(max_view_time)
+            // S470: commit-lag deadline backoff cap. 0 (the default) = today's schedule.
+            .commit_lag_cap(wedge_options.commit_lag_cap)
             .log_events(false)
             .build();
 
         let replica = ReplicaSpec::builder()
-            .app(NumberApp::new(tx_queue.clone()))
+            .app(NumberApp::new_with_delays(
+                tx_queue.clone(),
+                wedge_options.produce_delay,
+                wedge_options.validate_delay,
+            ))
             .network(network_stub)
             .kv_store(kv_store)
             .configuration(configuration)
@@ -243,6 +299,21 @@ impl Node {
                 .map(|h| h.int()),
             Err(_) => None,
         }
+    }
+
+    /// Query the VIEW of the node's Highest PC — the QC frontier's position in
+    /// view-number space. Unlike [`highest_pc_height`](Self::highest_pc_height)
+    /// this needs no block lookup, so it observes the frontier even when the
+    /// certified block's body was never received. Used by the S470 wedge-repro
+    /// test to show the QC frontier crawling while the commit frontier freezes.
+    #[allow(dead_code)]
+    pub(crate) fn highest_pc_view(&self) -> u64 {
+        self.replica
+            .block_tree_camera()
+            .snapshot()
+            .highest_pc()
+            .map(|pc| pc.view.int())
+            .unwrap_or(0)
     }
 
     /// Query the highest view entered in the node's local block tree.

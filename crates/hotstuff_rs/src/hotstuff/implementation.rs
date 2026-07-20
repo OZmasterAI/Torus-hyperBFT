@@ -172,6 +172,61 @@ impl<N: Network> HotStuff<N> {
         needed
     }
 
+    /// S470 Piece 2 (proposer exec-backpressure pacing): the number of blocks
+    /// this replica knows about but has not yet validated/inserted — headers
+    /// whose bodies are still in flight plus bodies parked waiting for parent
+    /// state. This is the consensus-visible proxy for the local execution
+    /// backlog: while it is deep, `highest_pc.block` is almost certainly not
+    /// executed locally, so producing a fresh proposal would either fail
+    /// (`app_view` unavailable) or fork off a stale executed tip.
+    fn exec_backlog(&self) -> usize {
+        self.pending_headers.len() + self.deferred_bodies.len()
+    }
+
+    /// S470 Piece 2: whether this leader should YIELD its proposal slot
+    /// because the local exec backlog exceeds `TORUS_PROPOSER_EXEC_WATERMARK`.
+    ///
+    /// Default OFF (env unset / unparsable / 0): never yields — behavior
+    /// byte-identical to today. The knob is NODE-LOCAL and always safe:
+    /// declining to propose is indistinguishable from a slow leader, which
+    /// the pacemaker already handles (view timeout passes leadership on).
+    ///
+    /// Yield-not-starve: the caller marks the proposal DEFERRED rather than
+    /// abandoned, so the algorithm loop re-checks every iteration and the
+    /// leader proposes the moment the backlog drains below the watermark —
+    /// within the same view if the deadline allows (which is what pairs this
+    /// knob with the S470 commit-lag backoff: longer views give the drain
+    /// time to complete). Worst case — the backlog never drains within the
+    /// view — is exactly one skipped proposal slot, never a tighter freeze.
+    fn should_yield_proposal_for_exec_backpressure(&self) -> bool {
+        static WATERMARK: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+        let watermark = *WATERMARK.get_or_init(|| {
+            std::env::var("TORUS_PROPOSER_EXEC_WATERMARK")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                // 0 would mean "always yield" — treat it as OFF, like unset.
+                .filter(|w| *w > 0)
+        });
+        match watermark {
+            Some(watermark) => {
+                let backlog = self.exec_backlog();
+                if backlog > watermark {
+                    log::debug!(
+                        "S470 exec-backpressure: yielding proposal slot at view={} \
+                         (exec backlog {} > watermark {})",
+                        self.view_info.view.int(),
+                        backlog,
+                        watermark,
+                    );
+                    true
+                } else {
+                    false
+                }
+            }
+            None => false,
+        }
+    }
+
     /// T1.3 metric accessor: how many times this replica phase-voted on a proposal header whose
     /// body was later found invalid by `app.validate_block`. A non-zero value is observable
     /// evidence that the header-first fast-path relaxation (vote before validation) fired.
@@ -261,6 +316,12 @@ impl<N: Network> HotStuff<N> {
                     &validator_set_state,
                     reputation.as_ref(),
                 ) {
+                    // S470 Piece 2: still over the exec watermark — keep the
+                    // proposal deferred (re-checked next loop iteration).
+                    if self.should_yield_proposal_for_exec_backpressure() {
+                        self.proposal_deferred = true;
+                        return Ok(());
+                    }
                     let (parent_block, child_height) = if highest_pc.is_genesis_pc() {
                         (None, BlockHeight::new(0))
                     } else {
@@ -451,6 +512,17 @@ impl<N: Network> HotStuff<N> {
             match highest_pc.phase {
                 // Produce and broadcast a new Proposal.
                 Phase::Generic | Phase::Decide => {
+                    // S470 Piece 2 (proposer exec-backpressure): a leader
+                    // whose exec backlog exceeds the watermark yields its
+                    // slot instead of producing off a stale executed tip.
+                    // Deferred, not abandoned: retried every loop iteration,
+                    // so the proposal fires as soon as the backlog drains
+                    // (yield-not-starve). Default OFF — see
+                    // `should_yield_proposal_for_exec_backpressure`.
+                    if self.should_yield_proposal_for_exec_backpressure() {
+                        self.proposal_deferred = true;
+                        return Ok(());
+                    }
                     let (parent_block, child_height) = if highest_pc.is_genesis_pc() {
                         (None, BlockHeight::new(0))
                     } else {
@@ -914,6 +986,31 @@ impl<N: Network> HotStuff<N> {
                 is_safe,
                 justify_block_known,
             );
+            // S470 wedge diagnostics — full-block twin of the header_drop line.
+            if crate::logging::wedge_diag_enabled() || log::log_enabled!(log::Level::Debug) {
+                let highest_pc = block_tree.highest_pc()?;
+                let locked_pc = block_tree.locked_pc()?;
+                let committed_view = block_tree.committed_qc_view()?;
+                let line = format!(
+                    "wedge_diag proposal_drop: view={} highest_pc_view={} locked_pc_view={} \
+                     committed_view={} justify_view={} justify_block_prefix={} \
+                     locked_block_prefix={} is_safe={} justify_block_known={}",
+                    self.view_info.view.int(),
+                    highest_pc.view.int(),
+                    locked_pc.view.int(),
+                    committed_view.int(),
+                    proposal.block.justify.view.int(),
+                    crate::logging::block_prefix(&proposal.block.justify.block),
+                    crate::logging::block_prefix(&locked_pc.block),
+                    is_safe,
+                    justify_block_known,
+                );
+                if crate::logging::wedge_diag_enabled() {
+                    log::info!("{line}");
+                } else {
+                    log::debug!("{line}");
+                }
+            }
             if !justify_block_known {
                 self.sync_needed = true;
             }
@@ -1732,6 +1829,34 @@ impl<N: Network> HotStuff<N> {
                 "dropping proposal header: view={}, justify_correct={}, is_safe={}, justify_block_known={}",
                 header.view.int(), justify_correct, is_safe, justify_block_known,
             );
+            // S470 wedge diagnostics: during the commit wedge the signature is
+            // `is_safe=false, justify_block_known=true` — a cross-branch lock
+            // rejection, not a data gap. Emit the consensus frontiers so the
+            // bench can confirm (or rule out) the mechanism live.
+            if crate::logging::wedge_diag_enabled() || log::log_enabled!(log::Level::Debug) {
+                let highest_pc = block_tree.highest_pc()?;
+                let locked_pc = block_tree.locked_pc()?;
+                let committed_view = block_tree.committed_qc_view()?;
+                let line = format!(
+                    "wedge_diag header_drop: view={} highest_pc_view={} locked_pc_view={} \
+                     committed_view={} justify_view={} justify_block_prefix={} \
+                     locked_block_prefix={} is_safe={} justify_block_known={}",
+                    header.view.int(),
+                    highest_pc.view.int(),
+                    locked_pc.view.int(),
+                    committed_view.int(),
+                    header.justify.view.int(),
+                    crate::logging::block_prefix(&header.justify.block),
+                    crate::logging::block_prefix(&locked_pc.block),
+                    is_safe,
+                    justify_block_known,
+                );
+                if crate::logging::wedge_diag_enabled() {
+                    log::info!("{line}");
+                } else {
+                    log::debug!("{line}");
+                }
+            }
             if !justify_block_known {
                 self.sync_needed = true;
                 // S426: the justify block is unknown because a QC formed on a block
