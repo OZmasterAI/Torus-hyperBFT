@@ -635,7 +635,14 @@ impl NativeStateOverlay {
             member_hits: 0,
             member_misses: 0,
             member_evictions: 0,
+            dirty_entries_by_cf: [0; 6],
         };
+        // 3c funnel attribution: dirty-entry composition per cf_tag.
+        for (tag, _) in dirty.keys() {
+            if let Some(slot) = stats.dirty_entries_by_cf.get_mut(*tag as usize) {
+                *slot += 1;
+            }
+        }
         let trie_result = if dirty.is_empty() {
             Ok(())
         } else {
@@ -744,6 +751,10 @@ pub struct NativeFlushStats {
     pub member_hits: usize,
     pub member_misses: usize,
     pub member_evictions: usize,
+    /// 3c: native-root dirty entries per cf_tag this flush (frozen
+    /// NATIVE_ROOT_CFS order) — funnel attribution of the dirty-set
+    /// composition.
+    pub dirty_entries_by_cf: [usize; 6],
 }
 
 impl StateBackend for NativeStateOverlay {

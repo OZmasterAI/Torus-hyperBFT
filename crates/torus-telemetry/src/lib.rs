@@ -220,6 +220,17 @@ pub struct Metrics {
     pub member_cache_hits: Counter,
     pub member_cache_misses: Counter,
     pub member_cache_evictions: Counter,
+    /// 3c: per-cf-tag native-root dirty entries per flush (funnel attribution
+    /// of the post-3c dirty-set composition). Indexed by the frozen cf_tag
+    /// order: balances / order_books / positions / oracle / staking_delegations
+    /// / staking_validators.
+    pub exec_dirty_entries_by_cf: [Counter; 6],
+    /// 3c mode 2: node-local order-row store writes/deletes per block.
+    pub exec_book_rows_written: Counter,
+    pub exec_book_rows_deleted: Counter,
+    /// 3c mode 2: root-CF level-row upserts/deletes per block.
+    pub exec_book_levels_written: Counter,
+    pub exec_book_levels_deleted: Counter,
     pub exec_block_seconds: Histogram,
     /// Committed blocks handed to the exec channel but not yet fully executed.
     /// Pinned near the channel bound (64) = execution is the bottleneck.
@@ -812,6 +823,51 @@ impl Metrics {
             member_cache_evictions.clone(),
         );
 
+        // 3c: per-cf-tag dirty-entry attribution (frozen NATIVE_ROOT_CFS order).
+        let exec_dirty_entries_by_cf: [Counter; 6] = Default::default();
+        for (i, suffix) in [
+            "balances",
+            "order_books",
+            "positions",
+            "oracle",
+            "staking_delegations",
+            "staking_validators",
+        ]
+        .iter()
+        .enumerate()
+        {
+            registry.register(
+                &format!("torus_exec_dirty_entries_{suffix}"),
+                "Native-root dirty entries per flush for this cf_tag (3c funnel attribution)",
+                exec_dirty_entries_by_cf[i].clone(),
+            );
+        }
+
+        let exec_book_rows_written = Counter::default();
+        registry.register(
+            "torus_exec_book_rows_written",
+            "Node-local order-row store upserts (3c mode 2)",
+            exec_book_rows_written.clone(),
+        );
+        let exec_book_rows_deleted = Counter::default();
+        registry.register(
+            "torus_exec_book_rows_deleted",
+            "Node-local order-row store deletes (3c mode 2)",
+            exec_book_rows_deleted.clone(),
+        );
+        let exec_book_levels_written = Counter::default();
+        registry.register(
+            "torus_exec_book_levels_written",
+            "Root-CF level-row upserts (3c mode 2)",
+            exec_book_levels_written.clone(),
+        );
+        let exec_book_levels_deleted = Counter::default();
+        registry.register(
+            "torus_exec_book_levels_deleted",
+            "Root-CF level-row deletes (3c mode 2)",
+            exec_book_levels_deleted.clone(),
+        );
+
         let exec_block_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
         registry.register(
             "torus_exec_block_seconds",
@@ -1030,6 +1086,11 @@ impl Metrics {
             member_cache_hits,
             member_cache_misses,
             member_cache_evictions,
+            exec_dirty_entries_by_cf,
+            exec_book_rows_written,
+            exec_book_rows_deleted,
+            exec_book_levels_written,
+            exec_book_levels_deleted,
             exec_block_seconds,
             exec_queue_depth,
             trade_writer_queued_batches,
