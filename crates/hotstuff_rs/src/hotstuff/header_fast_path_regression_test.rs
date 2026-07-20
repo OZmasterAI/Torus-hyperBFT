@@ -44,9 +44,7 @@ use crate::block_tree::accessors::internal::{BlockTreeSingleton, BlockTreeWriteB
 use crate::block_tree::invariants::safe_pc_lock_clause;
 use crate::block_tree::pluggables::{KVGet, KVStore, WriteBatch};
 use crate::events::Event;
-use crate::hotstuff::implementation::{
-    parse_inline_body_max_bytes, should_inline_body, HotStuff, HotStuffConfiguration,
-};
+use crate::hotstuff::implementation::{HotStuff, HotStuffConfiguration};
 use crate::hotstuff::messages::{
     BlockDataRequest, BlockDataResponse, HotStuffMessage, Proposal, ProposalHeader,
 };
@@ -723,15 +721,8 @@ fn header_double_vote_window_refused() {
 }
 
 // ---------------------------------------------------------------------------
-// L3 Fix #1: inline body for small blocks (TORUS_INLINE_BODY_MAX_BYTES).
-//
-// RED on pre-fix code: `HotStuff::set_inline_body_max_bytes`,
-// `parse_inline_body_max_bytes` and `should_inline_body` did not exist
-// (compile failure), and `broadcast_proposal_as_header` unconditionally
-// broadcast a `ProposalHeader`. GREEN with the fix: a leader whose proposal
-// body is at/under the threshold broadcasts the FULL `Proposal` (the existing
-// wire variant — no codec change), so followers insert-and-vote directly and
-// never issue a `BlockDataRequest`.
+// Recording-network fixtures (kept from the reverted inline-body change —
+// reusable for wire-level leader/follower assertions).
 // ---------------------------------------------------------------------------
 
 /// Network stub that records every outbound message (broadcast + direct) and
@@ -874,7 +865,6 @@ fn propose_as_leader(
     vss: &ValidatorSetState,
     block_tree: &mut BlockTreeSingleton<MemKV>,
     datums: Vec<Vec<u8>>,
-    inline_threshold: Option<u64>,
 ) -> RecordingNetwork {
     let leader_vk = proposer_for(view, keys, vss, block_tree);
     let leader_key = keys
@@ -883,9 +873,6 @@ fn propose_as_leader(
         .expect("proposer key must be among the fixture keys")
         .clone();
     let (mut leader, net) = hotstuff_recording_at(view, leader_key, vss.clone());
-    if let Some(threshold) = inline_threshold {
-        leader.set_inline_body_max_bytes(threshold);
-    }
     let mut app = FixedBodyApp { datums };
     leader
         .enter_view(
@@ -895,138 +882,4 @@ fn propose_as_leader(
         )
         .expect("enter_view as the proposer must not error");
     net
-}
-
-/// L3 Fix #1 (primary): with the inline threshold ON and the body under it,
-/// the leader must broadcast the FULL `Proposal` (no `ProposalHeader`), and a
-/// follower processing it must insert-and-vote directly — zero body fetches.
-#[test]
-fn inline_body_small_block_broadcasts_full_proposal_and_skips_body_fetch() {
-    let keys = signing_keys(&[1, 2, 3, 4]);
-    let set = validator_set(&keys);
-    let (mut leader_tree, vss) = steady_block_tree(&set);
-
-    let view1 = ViewNumber::new(1);
-    let leader_net = propose_as_leader(
-        view1,
-        &keys,
-        &vss,
-        &mut leader_tree,
-        vec![], // empty body — the idle-devnet case the attribution measured
-        Some(1024),
-    );
-
-    assert!(
-        leader_net.headers().is_empty(),
-        "with the body under the inline threshold, no ProposalHeader may be broadcast"
-    );
-    let proposals = leader_net.full_proposals();
-    assert_eq!(
-        proposals.len(),
-        1,
-        "the leader must broadcast exactly one full Proposal"
-    );
-    let proposal = proposals.into_iter().next().unwrap();
-
-    // Follower side: the full proposal is processed on the original
-    // validate-then-vote path — inserted and voted with NO body fetch.
-    let (mut follower_tree, _) = steady_block_tree(&set);
-    let leader_vk = proposer_for(view1, &keys, &vss, &follower_tree);
-    let follower_key = keys
-        .iter()
-        .find(|k| k.verifying_key() != leader_vk)
-        .expect("a non-leader key must exist")
-        .clone();
-    let (mut follower, follower_net) = hotstuff_recording_at(view1, follower_key, vss.clone());
-    let mut follower_app = FixedBodyApp { datums: vec![] };
-    follower
-        .on_receive_msg(
-            HotStuffMessage::Proposal(proposal.clone()),
-            &leader_vk,
-            &mut follower_tree,
-            &mut follower_app,
-        )
-        .expect("processing the inline proposal must not error");
-
-    assert!(
-        follower_tree.contains(&proposal.block.hash),
-        "the block must be inserted directly from the inline proposal"
-    );
-    assert_eq!(
-        follower_tree
-            .highest_view_voted()
-            .expect("highest_view_voted"),
-        Some(view1),
-        "the follower must phase-vote on the inline proposal"
-    );
-    assert_eq!(
-        follower_net.body_fetch_count(),
-        0,
-        "the body arrived inline — no BlockDataRequest may be issued"
-    );
-}
-
-/// L3 Fix #1 default: threshold unset/0 keeps the header-first pipeline
-/// byte-identical to today — a ProposalHeader is broadcast, never a full
-/// Proposal. Also pins the pure parse: unset and junk both mean 0 = OFF.
-#[test]
-fn inline_body_default_zero_keeps_header_only() {
-    // Pure parse semantics: default OFF.
-    assert_eq!(parse_inline_body_max_bytes(None), 0);
-    assert_eq!(parse_inline_body_max_bytes(Some("".to_string())), 0);
-    assert_eq!(parse_inline_body_max_bytes(Some("junk".to_string())), 0);
-    assert_eq!(parse_inline_body_max_bytes(Some(" 4096 ".to_string())), 4096);
-    assert!(!should_inline_body(0, 0), "0 means OFF even for an empty body");
-
-    let keys = signing_keys(&[1, 2, 3, 4]);
-    let set = validator_set(&keys);
-    let (mut leader_tree, vss) = steady_block_tree(&set);
-
-    let view1 = ViewNumber::new(1);
-    // No threshold override: the constructor default (env unset => 0) applies.
-    let leader_net = propose_as_leader(view1, &keys, &vss, &mut leader_tree, vec![], None);
-
-    assert_eq!(
-        leader_net.headers().len(),
-        1,
-        "default 0 = exact-today: the proposal must go out header-first"
-    );
-    assert!(
-        leader_net.full_proposals().is_empty(),
-        "default 0 = exact-today: no full Proposal may be broadcast"
-    );
-}
-
-/// L3 Fix #1 bound: a body over the threshold stays header-first even with the
-/// knob ON. Also pins the boundary semantics: at-threshold inlines, one byte
-/// over does not.
-#[test]
-fn inline_body_over_threshold_stays_header_first() {
-    // Boundary semantics of the pure decision.
-    assert!(should_inline_body(8, 8), "at-threshold must inline");
-    assert!(!should_inline_body(9, 8), "over-threshold must not inline");
-
-    let keys = signing_keys(&[1, 2, 3, 4]);
-    let set = validator_set(&keys);
-    let (mut leader_tree, vss) = steady_block_tree(&set);
-
-    let view1 = ViewNumber::new(1);
-    let leader_net = propose_as_leader(
-        view1,
-        &keys,
-        &vss,
-        &mut leader_tree,
-        vec![vec![0u8; 100]], // 100-byte body > 8-byte threshold
-        Some(8),
-    );
-
-    assert_eq!(
-        leader_net.headers().len(),
-        1,
-        "an over-threshold body must keep the header-first pipeline"
-    );
-    assert!(
-        leader_net.full_proposals().is_empty(),
-        "an over-threshold body must not be broadcast as a full Proposal"
-    );
 }
