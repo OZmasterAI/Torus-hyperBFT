@@ -2871,13 +2871,32 @@ enum ConsensusEnqueue {
 /// `consensus_direct_fan` is on: with the fan off (default) this is
 /// exact-today behavior, including today's duplicate tolerance for pacemaker
 /// rebroadcasts.
+/// B2 dedup scope (verifier fix): ONLY one-shot HotStuff progress messages may
+/// be dual-path-deduped — they are never rebroadcast byte-identically, so a
+/// repeat can only be the mirror/fan duplicate. Pacemaker messages
+/// (TimeoutVote every view-timeout until a TC forms; AdvanceView re-sends) and
+/// both block-sync classes re-send identical bytes on timers, and the
+/// receiving side RELIES on that redelivery as its designed loss-recovery (the
+/// progress buffer evicts future-view messages under pressure; the
+/// timeout-vote collector only collects for its current view). Suppressing
+/// them stalls liveness with the fan on; duplicates there are cheap and fully
+/// idempotent.
+fn dedup_applies(msg: &hotstuff_rs::networking::messages::Message) -> bool {
+    use hotstuff_rs::networking::messages::{Message, ProgressMessage};
+    matches!(
+        msg,
+        Message::ProgressMessage(ProgressMessage::HotStuffMessage(_))
+    )
+}
+
 fn enqueue_consensus_inbound(
     shared: &SharedState,
     sender: VerifyingKey,
     msg: hotstuff_rs::networking::messages::Message,
     payload: &[u8],
 ) -> ConsensusEnqueue {
-    if shared.consensus_direct_fan
+    let dedup = shared.consensus_direct_fan && dedup_applies(&msg);
+    if dedup
         && shared
             .consensus_dedup
             .lock()
@@ -2892,7 +2911,7 @@ fn enqueue_consensus_inbound(
     if !enqueue_inbound(&shared.inbound, sender, msg) {
         return ConsensusEnqueue::QueueFull;
     }
-    if shared.consensus_direct_fan {
+    if dedup {
         shared
             .consensus_dedup
             .lock()
