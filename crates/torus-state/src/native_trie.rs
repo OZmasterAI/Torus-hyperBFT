@@ -501,6 +501,18 @@ fn read_node(
 /// Read a bucket's current members from the mirror (prefix scan), decoded as
 /// `(cf_tag, key) -> value_hash` (32 B keccak of the live CF value — hash-only mirror) in
 /// canonical order.
+///
+/// L3 #2 (member-miss cost): the scan is bounded to `[bucket, bucket+1)` via a
+/// `ReadOptions` upper bound so RocksDB (a) prunes SST files whose key range does
+/// not overlap this 2-byte bucket, and (b) stops the merging iterator AT the
+/// bound instead of skipping every tombstone between the bucket and the next
+/// live key. On the churny hash-only mirror (802k writes / 593k deletes at
+/// cap-400) a cold miss on a new/near-empty bucket previously walked those
+/// tombstones to find the first live key of the NEXT bucket before the
+/// `starts_with` break rejected it; the upper bound makes that walk impossible.
+/// Byte-identical output to the unbounded scan for any input — the `starts_with`
+/// guard still defines the members, the bound only prunes work outside the
+/// bucket. Node-local, value-neutral.
 #[allow(clippy::type_complexity)]
 fn read_bucket_members(
     db: &StateDb,
@@ -509,7 +521,15 @@ fn read_bucket_members(
     let cf = db.cf_handle(CF_NATIVE_HASHED)?;
     let prefix = bucket.to_be_bytes();
     let mut out = BTreeMap::new();
-    let mut iter = db.inner().raw_iterator_cf(cf);
+    let mut ro = rocksdb::ReadOptions::default();
+    // First key strictly after this bucket = (bucket+1) as 2 BE bytes. For the
+    // last bucket (0xFFFF) there is no successor, so leave the scan unbounded
+    // (the `starts_with` break still terminates it) — that bucket simply forgoes
+    // SST pruning, a negligible edge.
+    if let Some(next) = bucket.checked_add(1) {
+        ro.set_iterate_upper_bound(next.to_be_bytes().to_vec());
+    }
+    let mut iter = db.inner().raw_iterator_cf_opt(cf, ro);
     iter.seek(prefix);
     while iter.valid() {
         let (k, v) = match (iter.key(), iter.value()) {
@@ -2008,6 +2028,92 @@ mod tests {
             persisted_native_root(&db).unwrap(),
             native_root_full(&db).unwrap(),
             "oracle must still agree after cached hits"
+        );
+    }
+
+    /// L3 #2 witness: on a tombstone-laden mirror a cold miss on an EMPTY bucket
+    /// must not walk the deleted range to reach the next live key. The bounded
+    /// scan (production `read_bucket_members`) returns byte-identically to the
+    /// unbounded scan for EVERY bucket, and is dramatically cheaper on the
+    /// all-tombstone runs the cap-400 churn produces. Run with
+    /// `cargo test -p torus-state read_bucket_members_bounded -- --nocapture`
+    /// to see the before/after timings.
+    #[test]
+    fn read_bucket_members_bounded_skips_tombstones() {
+        // Old, UNBOUNDED scan — the code before L3 #2, kept here as the A-side
+        // oracle so the witness proves identical membership and measures cost.
+        fn read_unbounded(db: &StateDb, bucket: u16) -> BTreeMap<(u8, Vec<u8>), Vec<u8>> {
+            let cf = db.cf_handle(CF_NATIVE_HASHED).unwrap();
+            let prefix = bucket.to_be_bytes();
+            let mut out = BTreeMap::new();
+            let mut iter = db.inner().raw_iterator_cf(cf);
+            iter.seek(prefix);
+            while iter.valid() {
+                let (k, v) = match (iter.key(), iter.value()) {
+                    (Some(k), Some(v)) if k.starts_with(&prefix) && k.len() >= 3 => {
+                        (k.to_vec(), v.to_vec())
+                    }
+                    _ => break,
+                };
+                out.insert((k[2], k[3..].to_vec()), v);
+                iter.next();
+            }
+            out
+        }
+
+        let (db, _d) = temp_db();
+        let cf = db.cf_handle(CF_NATIVE_HASHED).unwrap();
+
+        // Build a churny mirror: fill buckets 0..N with a couple of entries each,
+        // flush to SST, then DELETE every bucket except the last (tombstones in a
+        // fresh SST), and keep a handful of live buckets scattered near the top.
+        const N: u16 = 6000;
+        for b in 0..N {
+            for t in 0u8..2 {
+                let key = mirror_key(b, t, &b.to_le_bytes());
+                db.put_cf_raw(CF_NATIVE_HASHED, &key, &[t; 32]).unwrap();
+            }
+        }
+        db.inner().flush_cf(cf).unwrap();
+        // Delete everything below N-1 (all tombstones), leave bucket N-1 live.
+        for b in 0..(N - 1) {
+            for t in 0u8..2 {
+                let key = mirror_key(b, t, &b.to_le_bytes());
+                db.delete_cf_raw(CF_NATIVE_HASHED, &key).unwrap();
+            }
+        }
+        db.inner().flush_cf(cf).unwrap();
+
+        // Correctness: bounded == unbounded for a spread of buckets (empty ones
+        // amid tombstones, and the one live bucket).
+        for &b in &[0u16, 1, 100, 3000, N - 2, N - 1] {
+            assert_eq!(
+                read_bucket_members(&db, b).unwrap(),
+                read_unbounded(&db, b),
+                "bounded scan must equal unbounded scan for bucket {b}"
+            );
+        }
+
+        // Cost witness: scan the ~226 lowest (all-empty, tombstone-fronted)
+        // buckets — the cap-400 cold-miss shape — both ways and print timings.
+        const COLD: u16 = 226;
+        let t0 = std::time::Instant::now();
+        let mut sink = 0usize;
+        for b in 0..COLD {
+            sink += read_unbounded(&db, b).len();
+        }
+        let unbounded = t0.elapsed();
+        let t1 = std::time::Instant::now();
+        for b in 0..COLD {
+            sink += read_bucket_members(&db, b).unwrap().len();
+        }
+        let bounded = t1.elapsed();
+        assert_eq!(sink, 0, "these buckets are all-tombstone (empty)");
+        println!(
+            "L3#2 read_bucket_members over {COLD} tombstone-fronted empty buckets: \
+             unbounded={unbounded:?} ({:.1}us/bkt)  bounded={bounded:?} ({:.1}us/bkt)",
+            unbounded.as_secs_f64() * 1e6 / COLD as f64,
+            bounded.as_secs_f64() * 1e6 / COLD as f64,
         );
     }
 
