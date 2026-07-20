@@ -1,6 +1,21 @@
 # 3c — Level-rows-as-authority + hash-only native mirror (design)
 
-Status: **DESIGN — not implemented**. Round 3c of the throughput mission
+Status: **IMPLEMENTED** on `perf/level-rows` (3b `perf/root-cost` @ 5a443ab
+merged first per decision 6). Implementation notes / deviations from this
+design:
+- `diff_stop_rows` / `write_meta_if_moved` are STATELESS (persisted-state
+  compare: one meta point read + one bounded stop-prefix scan per dirty
+  market) instead of shadow-backed — `BookRowShadow` is gone entirely, so
+  resident holders carry only books (journals ride inside the book).
+- `take_level_ops` returns full `LevelRowData` (qty ‖ count ‖ hash);
+  modes 0/1 use `discard_level_ops`/`discard_row_ops` so no keccak or
+  encoding is spent outside mode 2.
+- Row/level key codecs live in `torus_core::book_rows` (codec-only module,
+  no StateBackend dep); order-row/meta VALUE codecs stay next to their
+  owners (book / executor).
+- `__book_mode__` marker is written on the first `save_order_books` call
+  (even with zero dirty books) — strongest empty-chain wrong-flag guard.
+Round 3c of the throughput mission
 (Layer 2, exec envelope). Branch `perf/level-rows`, cut from
 `perf/exec-scaleup` @ `81ea957` (the DESIGN BASE — all file:line anchors
 below refer to that commit unless a branch is named).
