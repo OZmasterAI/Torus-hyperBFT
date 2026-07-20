@@ -1,0 +1,122 @@
+=== Torus Throughput Benchmark ===
+Mode: consensus
+Sign mode: eip712 (secp256k1 ecrecover per action)
+Duration: 300s
+Senders: 5000 (offset 60)
+Batch size: 400 order(s)/action
+Submit batch: 1 action(s)/RPC call
+RPC endpoints: 1
+Headline: node counters (3 /metrics endpoint(s)) | Body sweep: off
+Econ shape: target-margin 1500 TRS/order | mid 30000 | band ±5 ticks | cross 50% | cancel-all 5.0%/action
+Rate: 750.0 actions/s aggregate (0.150/s per sender)
+
+[2s] submitted: 150 actions (93/s) | blk: #727 | 0ms/blk
+[submit] http: error sending request for url (http://127.0.0.1:8645/)
+[submit] http: error sending request for url (http://127.0.0.1:8645/)
+[submit] http: error sending request for url (http://127.0.0.1:8645/)
+[submit] http: error sending request for url (http://127.0.0.1:8645/)
+[submit] http: error sending request for url (http://127.0.0.1:8645/)
+[19s] submitted: 331 actions (18/s) | blk: #734 | 2700ms/blk
+[23s] submitted: 636 actions (28/s) | blk: #738 | 2092ms/blk
+[25s] submitted: 787 actions (32/s) | matched: 116,603 (4702/s node ctr) | blk: #738 | 2092ms/blk
+[30s] submitted: 1,220 actions (41/s) | blk: #738 | 2092ms/blk
+[34s] submitted: 1,493 actions (44/s) | blk: #738 | 2092ms/blk
+[35s] submitted: 1,582 actions (46/s) | blk: #738 | 2092ms/blk
+[38s] submitted: 1,897 actions (49/s) | matched: 125,797 (3268/s node ctr) | blk: #738 | 2092ms/blk
+[42s] submitted: 2,173 actions (52/s) | blk: #738 | 2092ms/blk
+[44s] submitted: 2,382 actions (54/s) | blk: #738 | 2092ms/blk
+[47s] submitted: 2,619 actions (56/s) | blk: #738 | 2092ms/blk
+[48s] submitted: 2,748 actions (57/s) | matched: 125,797 (2615/s node ctr) | blk: #738 | 2092ms/blk
+[56s] submitted: 3,381 actions (60/s) | blk: #738 | 2092ms/blk
+[57s] submitted: 3,472 actions (60/s) | blk: #738 | 2092ms/blk
+[59s] submitted: 3,658 actions (62/s) | blk: #738 | 2092ms/blk
+[61s] submitted: 3,804 actions (63/s) | matched: 125,797 (2072/s node ctr) | blk: #738 | 2092ms/blk
+[66s] submitted: 4,340 actions (65/s) | blk: #738 | 2092ms/blk
+[69s] submitted: 4,541 actions (66/s) | blk: #738 | 2092ms/blk
+[74s] submitted: 5,099 actions (69/s) | blk: #738 | 2092ms/blk
+[75s] submitted: 5,336 actions (71/s) | matched: 125,797 (1670/s node ctr) | blk: #738 | 2092ms/blk
+[81s] submitted: 5,826 actions (72/s) | blk: #738 | 2092ms/blk
+[82s] submitted: 5,957 actions (72/s) | blk: #738 | 2092ms/blk
+[85s] submitted: 6,254 actions (74/s) | blk: #738 | 2092ms/blk
+[88s] submitted: 6,602 actions (75/s) | matched: 125,797 (1428/s node ctr) | blk: #738 | 2092ms/blk
+[95s] submitted: 7,420 actions (78/s) | blk: #738 | 2092ms/blk
+[96s] submitted: 7,590 actions (79/s) | blk: #738 | 2092ms/blk
+[101s] submitted: 8,030 actions (79/s) | blk: #738 | 2092ms/blk
+[103s] submitted: 8,310 actions (80/s) | matched: 125,797 (1218/s node ctr) | blk: #738 | 2092ms/blk
+[106s] submitted: 8,666 actions (82/s) | blk: #738 | 2092ms/blk
+[107s] submitted: 8,748 actions (82/s) | blk: #738 | 2092ms/blk
+[113s] submitted: 9,334 actions (82/s) | blk: #738 | 2092ms/blk
+[115s] submitted: 9,608 actions (84/s) | matched: 125,797 (1095/s node ctr) | blk: #738 | 2092ms/blk
+[120s] submitted: 10,077 actions (84/s) | blk: #738 | 2092ms/blk
+[126s] submitted: 10,498 actions (84/s) | blk: #738 | 2092ms/blk
+[130s] submitted: 10,883 actions (83/s) | blk: #738 | 2092ms/blk
+[133s] submitted: 11,113 actions (84/s) | matched: 125,797 (949/s node ctr) | blk: #738 | 2092ms/blk
+[139s] submitted: 11,646 actions (84/s) | blk: #738 | 2092ms/blk
+[142s] submitted: 11,859 actions (84/s) | blk: #738 | 2092ms/blk
+[143s] submitted: 11,953 actions (84/s) | blk: #738 | 2092ms/blk
+[147s] submitted: 12,272 actions (84/s) | matched: 125,797 (858/s node ctr) | blk: #738 | 2092ms/blk
+[150s] submitted: 12,562 actions (84/s) | blk: #738 | 2092ms/blk
+[151s] submitted: 12,671 actions (84/s) | blk: #738 | 2092ms/blk
+[153s] submitted: 12,890 actions (84/s) | blk: #738 | 2092ms/blk
+[157s] submitted: 13,335 actions (85/s) | matched: 125,797 (802/s node ctr) | blk: #738 | 2092ms/blk
+[162s] submitted: 13,868 actions (86/s) | blk: #738 | 2092ms/blk
+[163s] submitted: 13,965 actions (85/s) | blk: #738 | 2092ms/blk
+[166s] submitted: 14,212 actions (86/s) | blk: #738 | 2092ms/blk
+[168s] submitted: 14,395 actions (86/s) | matched: 125,797 (750/s node ctr) | blk: #738 | 2092ms/blk
+[175s] submitted: 15,114 actions (86/s) | blk: #738 | 2092ms/blk
+[179s] submitted: 15,497 actions (87/s) | blk: #738 | 2092ms/blk
+[180s] submitted: 15,672 actions (87/s) | blk: #738 | 2092ms/blk
+[183s] submitted: 16,048 actions (88/s) | matched: 125,797 (687/s node ctr) | blk: #738 | 2092ms/blk
+[191s] submitted: 16,544 actions (87/s) | blk: #738 | 2092ms/blk
+[193s] submitted: 16,832 actions (87/s) | blk: #738 | 2092ms/blk
+[197s] submitted: 17,209 actions (87/s) | blk: #738 | 2092ms/blk
+[200s] submitted: 17,513 actions (88/s) | matched: 125,797 (629/s node ctr) | blk: #738 | 2092ms/blk
+[205s] submitted: 18,014 actions (88/s) | blk: #738 | 2092ms/blk
+[208s] submitted: 18,294 actions (88/s) | blk: #738 | 2092ms/blk
+[213s] submitted: 18,759 actions (88/s) | blk: #738 | 2092ms/blk
+[214s] submitted: 18,871 actions (88/s) | matched: 125,797 (588/s node ctr) | blk: #738 | 2092ms/blk
+[218s] submitted: 19,409 actions (89/s) | blk: #738 | 2092ms/blk
+[220s] submitted: 19,678 actions (89/s) | blk: #738 | 2092ms/blk
+[221s] submitted: 19,764 actions (89/s) | blk: #738 | 2092ms/blk
+[224s] submitted: 20,163 actions (90/s) | matched: 125,797 (561/s node ctr) | blk: #738 | 2092ms/blk
+[231s] submitted: 20,852 actions (90/s) | blk: #738 | 2092ms/blk
+[236s] submitted: 21,249 actions (90/s) | blk: #738 | 2092ms/blk
+[237s] submitted: 21,417 actions (90/s) | blk: #738 | 2092ms/blk
+[238s] submitted: 21,539 actions (90/s) | matched: 125,797 (528/s node ctr) | blk: #738 | 2092ms/blk
+[241s] submitted: 21,915 actions (91/s) | blk: #738 | 2092ms/blk
+[243s] submitted: 22,077 actions (91/s) | blk: #738 | 2092ms/blk
+[244s] submitted: 22,141 actions (91/s) | blk: #738 | 2092ms/blk
+[247s] submitted: 22,429 actions (91/s) | matched: 125,797 (509/s node ctr) | blk: #738 | 2092ms/blk
+[255s] submitted: 23,252 actions (91/s) | blk: #738 | 2092ms/blk
+[258s] submitted: 23,415 actions (91/s) | blk: #738 | 2092ms/blk
+[259s] submitted: 23,550 actions (91/s) | blk: #738 | 2092ms/blk
+[264s] submitted: 23,933 actions (91/s) | matched: 125,797 (477/s node ctr) | blk: #738 | 2092ms/blk
+[269s] submitted: 24,418 actions (91/s) | blk: #738 | 2092ms/blk
+[272s] submitted: 24,777 actions (91/s) | blk: #738 | 2092ms/blk
+[274s] submitted: 24,975 actions (91/s) | blk: #738 | 2092ms/blk
+[275s] submitted: 25,110 actions (91/s) | matched: 125,797 (457/s node ctr) | blk: #738 | 2092ms/blk
+[279s] submitted: 25,431 actions (91/s) | blk: #738 | 2092ms/blk
+[284s] submitted: 25,941 actions (91/s) | blk: #738 | 2092ms/blk
+[287s] submitted: 26,116 actions (91/s) | blk: #738 | 2092ms/blk
+[290s] submitted: 26,428 actions (91/s) | matched: 125,797 (434/s node ctr) | blk: #738 | 2092ms/blk
+[294s] submitted: 26,803 actions (91/s) | blk: #738 | 2092ms/blk
+[296s] submitted: 27,040 actions (91/s) | blk: #738 | 2092ms/blk
+[299s] submitted: 27,258 actions (91/s) | blk: #738 | 2092ms/blk
+[300s] submitted: 27,546 actions (92/s) | matched: 125,797 (419/s node ctr) | blk: #738 | 2092ms/blk
+[301s] submitted: 27,662 actions (92/s) | blk: #738 | 2092ms/blk
+[302s] submitted: 27,789 actions (92/s) | blk: #738 | 2092ms/blk
+[302s] submitted: 27,884 actions (92/s) | blk: #738 | 2092ms/blk
+[303s] submitted: 28,008 actions (92/s) | matched: 125,797 (415/s node ctr) | blk: #738 | 2092ms/blk
+[304s] submitted: 28,086 actions (92/s) | blk: #738 | 2092ms/blk
+[304s] submitted: 28,172 actions (93/s) | blk: #738 | 2092ms/blk
+[306s] submitted: 28,381 actions (93/s) | blk: #738 | 2092ms/blk
+
+--- Results ---
+HEADLINE — node counters over 336s (ground truth):
+  Placed accepted:  228,400 (681/s)
+  Matched:          179,312 (534/s)
+  Funnel: resting 136,710 | rej-margin 0 | rej-book 0 | rej-cancelled 0 | partial-cancel 0 | self-trade-cancel 0 | rej-other 0
+  Health gate: 0.1 blk/s [FAIL] (20 committed; gate >= 23.8, idle ref 29.8)
+
+Submitted (load-gen accepted): 30,765 native actions (94/s)  [secondary]
+Block time: 2092ms avg (blocks #728..#747, over 300s window)

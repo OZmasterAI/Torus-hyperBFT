@@ -1,0 +1,39 @@
+########## W2 ANALYSIS: CELL V1b ##########
+===== ENV VERIFICATION: S470 startup line per node =====
+val0: [2m2026-07-20T10:51:40.380034Z[0m [32m INFO[0m [2mtorus_node[0m[2m:[0m S470 commit-lag view backoff: ENABLED (0 = off / pre-S470 schedule; MUST be identical on every validator of the chain) [3mcommit_lag_cap[0m[2m=[0m8 [3mgenesis_value[0m[2m=[0m0
+val1: [2m2026-07-20T10:51:40.476015Z[0m [32m INFO[0m [2mtorus_node[0m[2m:[0m S470 commit-lag view backoff: ENABLED (0 = off / pre-S470 schedule; MUST be identical on every validator of the chain) [3mcommit_lag_cap[0m[2m=[0m8 [3mgenesis_value[0m[2m=[0m0
+val2: [2m2026-07-20T10:51:40.471590Z[0m [32m INFO[0m [2mtorus_node[0m[2m:[0m S470 commit-lag view backoff: ENABLED (0 = off / pre-S470 schedule; MUST be identical on every validator of the chain) [3mcommit_lag_cap[0m[2m=[0m8 [3mgenesis_value[0m[2m=[0m0
+(all-nodes-ENABLED=1)
+===== WEDGE_DIAG summary (all 3 nodes) =====
+proposal_drop lines=0  header_drop lines=21  view_timeout lines=412
+is_safe=false & justify_block_known=true drops (WEDGE SIGNATURE): 18
+is_safe=false (any) drops: 21
+--- (view-highest_pc_view) and (highest_pc_view-committed_view) over all frontier lines ---
+  frontier lines=433
+  view-qc:       avg=1.8 max=5
+  qc-committed:  avg=3.2 max=8  (lines with qc-committed>=10: 0)
+===== block_sync made-no-progress sessions =====
+10
+===== CSV commit analysis (val0 1Hz) =====
+samples=197 span=432s
+LONGEST ZERO-COMMIT GAP (height flat): 12 s   [ends at t+61s]
+longest gap (blocks_committed flat):   12 s
+freezes >=30s: 0
+height: first=635 last=1017 delta=382
+committed: first=635 last=1017 delta=382
+===== win60 =====
+samples=197 span=432s
+WINDOW-AVG: placed/s=5037.0 matched/s=4013.7 blk/s(height)=0.884 committed/s=0.884 actions/s=13.79
+BEST-60s:   placed/s=9093.3 matched/s=7256.9 blk/s=2.817
+WORST-60s:  blk/s(height)=0.129
+PEAK exec_queue_depth=66
+TOTALS: placed=2176000 matched=1733899 resting=0 committed=382 height_delta=382
+===== bench HEADLINE =====
+HEADLINE — node counters over 341s (ground truth):
+  Placed accepted:  1,622,000 (4758/s)
+  Matched:          1,291,588 (3789/s)
+  Funnel: resting 963,641 | rej-margin 0 | rej-book 0 | rej-cancelled 0 | partial-cancel 0 | self-trade-cancel 0 | rej-other 0
+  Health gate: 0.3 blk/s [FAIL] (94 committed; gate >= 23.8, idle ref 29.8)
+
+Submitted (load-gen accepted): 22,411 native actions (67/s)  [secondary]
+Block time: 2716ms avg (blocks #689..#805, over 300s window)
