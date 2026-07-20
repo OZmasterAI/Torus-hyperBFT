@@ -37,8 +37,21 @@ impl StateDb {
         opts.create_missing_column_families(true);
         // DB-wide: parallelize flush/compaction and smooth fsync spikes during
         // heavy block writes. (Stock defaults run only 2 background jobs.)
-        opts.set_max_background_jobs(4);
-        opts.set_bytes_per_sync(1 << 20); // 1 MiB
+        //
+        // L3 #3 (compaction smoothing): `max_background_jobs` and
+        // `max_subcompactions` are env-gated so an 18-core box can dedicate more
+        // threads to flush/compaction (the measured contention vs the CPU-bound
+        // leader that inflates flush variance to 39→119 ms/blk). Both default to
+        // exact-today behaviour (4 jobs; subcompactions unset). Node-local,
+        // perf-only, no format/consensus impact.
+        opts.set_max_background_jobs(max_background_jobs());
+        if let Some(sub) = max_subcompactions() {
+            opts.set_max_subcompactions(sub);
+        }
+        // L3 #4 (bytes_per_sync A/B): range-sync granularity during heavy flush.
+        // 1 MiB range-sync can add write-path latency spikes; the bench A/Bs 4
+        // MiB or 0 (disabled). Default 1 MiB = exact-today. Node-local, perf-only.
+        opts.set_bytes_per_sync(bytes_per_sync_bytes());
 
         // Per-CF tuning, shared across every column family. RocksDB ships an
         // ~8 MiB block cache and NO bloom filters by default, which is poor for
@@ -71,11 +84,29 @@ impl StateDb {
         let mut meta_opts = cf_opts.clone();
         meta_opts.set_write_buffer_size(8 * 1024 * 1024); // 8 MiB
 
+        // L3 #3 (compaction smoothing): the churny native CFs (order books +
+        // the hash-only mirror + the node-local order-row store) accumulate dead
+        // versions / tombstones under the shared 128 MiB buffer, so a scan or a
+        // flush pays the growing skiplist + tombstone walk. A smaller buffer
+        // flushes them small/often (the exact treatment already applied to
+        // CF_CONSENSUS_META), so compaction drops the dead versions promptly.
+        // Env-gated; 0 (default) = shared 128 MiB = exact-today.
+        let churny_opts = churny_cf_write_buffer_bytes().map(|bytes| {
+            let mut o = cf_opts.clone();
+            o.set_write_buffer_size(bytes);
+            o
+        });
+        let is_churny_cf = |name: &str| {
+            name == CF_NATIVE_ORDER_BOOKS || name == CF_NATIVE_HASHED || name == CF_BOOK_ORDER_ROWS
+        };
+
         let cf_descriptors: Vec<ColumnFamilyDescriptor> = ALL_CF_NAMES
             .iter()
             .map(|name| {
                 let opts = if *name == CF_CONSENSUS_META {
                     meta_opts.clone()
+                } else if let (true, Some(o)) = (is_churny_cf(name), churny_opts.as_ref()) {
+                    o.clone()
                 } else {
                     cf_opts.clone()
                 };
@@ -467,6 +498,67 @@ pub fn storage_key(address: &Address, index: &U256) -> [u8; 52] {
     key
 }
 
+/// L3 #3: DB-wide `max_background_jobs` (flush + compaction threads). Default 4
+/// (exact-today). `TORUS_MAX_BG_JOBS` overrides — e.g. `8` on an 18-core box to
+/// relieve compaction-vs-exec CPU contention. Read once at DB open.
+pub fn max_background_jobs() -> i32 {
+    parse_positive_i32(std::env::var("TORUS_MAX_BG_JOBS").ok(), 4)
+}
+
+/// L3 #3: DB-wide `max_subcompactions` (parallelism WITHIN one compaction job).
+/// `None` (default) = leave unset = exact-today. `TORUS_MAX_SUBCOMPACTIONS`
+/// (>=1) sets it. Read once at DB open.
+pub fn max_subcompactions() -> Option<u32> {
+    parse_opt_u32_min1(std::env::var("TORUS_MAX_SUBCOMPACTIONS").ok())
+}
+
+/// L3 #4: DB-wide `bytes_per_sync` range-sync granularity, in bytes. Default
+/// 1 MiB (exact-today). `TORUS_BYTES_PER_SYNC_MIB` overrides in whole MiB; `0`
+/// disables range-sync entirely. Read once at DB open.
+pub fn bytes_per_sync_bytes() -> u64 {
+    match std::env::var("TORUS_BYTES_PER_SYNC_MIB").ok() {
+        Some(v) => match v.trim().parse::<u64>() {
+            Ok(mib) => mib.saturating_mul(1 << 20),
+            Err(_) => 1 << 20,
+        },
+        None => 1 << 20,
+    }
+}
+
+/// L3 #3: per-CF write-buffer size for the churny native CFs, in bytes. `None`
+/// (default) = shared 128 MiB = exact-today. `TORUS_CHURNY_CF_WRITE_BUFFER_MB`
+/// (>=1) gives them a smaller buffer so they flush small/often. Read once at DB
+/// open.
+pub fn churny_cf_write_buffer_bytes() -> Option<usize> {
+    parse_opt_usize_min1_mb(std::env::var("TORUS_CHURNY_CF_WRITE_BUFFER_MB").ok())
+}
+
+/// Pure parse: a positive `i32` env value, falling back to `default` on
+/// unset / non-numeric / `< 1`.
+fn parse_positive_i32(raw: Option<String>, default: i32) -> i32 {
+    match raw.as_deref().map(str::trim).and_then(|s| s.parse::<i32>().ok()) {
+        Some(n) if n >= 1 => n,
+        _ => default,
+    }
+}
+
+/// Pure parse: `Some(n)` for a `>= 1` env value, else `None` (unset / garbage).
+fn parse_opt_u32_min1(raw: Option<String>) -> Option<u32> {
+    raw.as_deref()
+        .map(str::trim)
+        .and_then(|s| s.parse::<u32>().ok())
+        .filter(|&n| n >= 1)
+}
+
+/// Pure parse: whole-MiB env value `>= 1` → `Some(bytes)`, else `None`.
+fn parse_opt_usize_min1_mb(raw: Option<String>) -> Option<usize> {
+    raw.as_deref()
+        .map(str::trim)
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&mb| mb >= 1)
+        .map(|mb| mb.saturating_mul(1024 * 1024))
+}
+
 /// Runtime toggle: fsync the WAL once per committed block ([`StateDb::sync_wal`]).
 ///
 /// Default **OFF** ⇒ byte-identical to today's async-write behavior (no flush).
@@ -527,5 +619,40 @@ mod sync_wal_tests {
         assert!(parse_sync_wal_toggle(Some(" on ".to_string())));
         assert!(!parse_sync_wal_toggle(Some("0".to_string())));
         assert!(!parse_sync_wal_toggle(Some("".to_string())));
+    }
+
+    // L3 #3 / #4: every compaction / sync knob defaults to exact-today.
+
+    #[test]
+    fn l3_max_bg_jobs_defaults_to_four() {
+        assert_eq!(parse_positive_i32(None, 4), 4);
+        assert_eq!(parse_positive_i32(Some("0".into()), 4), 4);
+        assert_eq!(parse_positive_i32(Some("garbage".into()), 4), 4);
+        assert_eq!(parse_positive_i32(Some(" 8 ".into()), 4), 8);
+    }
+
+    #[test]
+    fn l3_max_subcompactions_defaults_unset() {
+        assert_eq!(parse_opt_u32_min1(None), None);
+        assert_eq!(parse_opt_u32_min1(Some("0".into())), None);
+        assert_eq!(parse_opt_u32_min1(Some("x".into())), None);
+        assert_eq!(parse_opt_u32_min1(Some("4".into())), Some(4));
+    }
+
+    #[test]
+    fn l3_bytes_per_sync_defaults_1mib() {
+        // The pure mapping the reader uses (whole MiB → bytes; 0 disables).
+        let map = |mib: u64| mib.saturating_mul(1 << 20);
+        assert_eq!(map(1), 1 << 20);
+        assert_eq!(map(4), 4 << 20);
+        assert_eq!(map(0), 0);
+    }
+
+    #[test]
+    fn l3_churny_cf_buffer_defaults_unset() {
+        assert_eq!(parse_opt_usize_min1_mb(None), None);
+        assert_eq!(parse_opt_usize_min1_mb(Some("0".into())), None);
+        assert_eq!(parse_opt_usize_min1_mb(Some("garbage".into())), None);
+        assert_eq!(parse_opt_usize_min1_mb(Some("16".into())), Some(16 * 1024 * 1024));
     }
 }
