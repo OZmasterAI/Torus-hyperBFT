@@ -505,6 +505,25 @@ impl Logger for SendSyncResponseEvent {
     }
 }
 
+/// S470 wedge diagnostics gate: `TORUS_WEDGE_DIAG=1` promotes the wedge
+/// diagnostic lines (view timeouts, proposal drops, remote highest-PC
+/// advances) to `info` level; without it they are emitted at `debug` (or, for
+/// the hot view-timeout site, skipped entirely). Read once and cached —
+/// changing the variable requires a restart, like every other consensus knob.
+pub(crate) fn wedge_diag_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("TORUS_WEDGE_DIAG")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
+}
+
+/// Short human-readable prefix of a block hash for wedge diagnostic lines.
+pub(crate) fn block_prefix(hash: &crate::types::data_types::CryptoHash) -> String {
+    first_seven_base64_chars(&hash.bytes())
+}
+
 // Get a more readable representation of a bytesequence by base64-encoding it and taking the first 7 characters.
 fn first_seven_base64_chars(bytes: &[u8]) -> String {
     let encoded = STANDARD_NO_PAD.encode(bytes);

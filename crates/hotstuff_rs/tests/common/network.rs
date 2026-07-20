@@ -85,6 +85,16 @@ pub(crate) struct NetworkStub {
     my_verifying_key: VerifyingKey,
     all_peers: HashMap<VerifyingKey, Sender<(VerifyingKey, Message)>>,
     inbox: Arc<Mutex<Receiver<(VerifyingKey, Message)>>>,
+    /// S470 wedge repro: when set, every BODY-carrying message
+    /// (`BlockDataResponse`, full `Proposal`) is delivered this much later
+    /// than it was sent, while headers, votes and pacemaker traffic stay
+    /// instant. This models the production header-first regime where
+    /// `highest_pc` advances at header speed but a block only becomes
+    /// INSERTABLE (disseminated + executed) seconds later — with the
+    /// algorithm thread and view clock fully live in between, which is what
+    /// lets views race ahead of the commit frontier. `None` (every pre-S470
+    /// constructor) is a plain instant network.
+    body_delay: Option<std::time::Duration>,
     /// Fast-path flag mirroring [`MessageFilter::enabled`], shared across all stubs. Checked with a
     /// single relaxed atomic load on every `send`/`broadcast` so that the *disabled* path (every
     /// existing test, and the healthy phases of the livelock test) never touches the mutex below.
@@ -108,7 +118,12 @@ impl Network for NetworkStub {
             return;
         }
         if let Some(peer_tx) = self.all_peers.get(&peer) {
-            let _ = peer_tx.send((self.my_verifying_key, message));
+            deliver(
+                self.my_verifying_key,
+                peer_tx.clone(),
+                message,
+                self.body_delay,
+            );
         }
     }
 
@@ -118,7 +133,12 @@ impl Network for NetworkStub {
             if active && self.filter.lock().unwrap().should_drop(recipient, &message) {
                 continue;
             }
-            let _ = peer_tx.send((self.my_verifying_key, message.clone()));
+            deliver(
+                self.my_verifying_key,
+                peer_tx.clone(),
+                message.clone(),
+                self.body_delay,
+            );
         }
     }
 
@@ -127,6 +147,37 @@ impl Network for NetworkStub {
             Ok(o_m) => Some(o_m),
             Err(TryRecvError::Empty) => None,
             Err(TryRecvError::Disconnected) => panic!(),
+        }
+    }
+}
+
+/// Deliver `message` to `peer_tx`, applying `body_delay` (if any) to
+/// body-carrying messages only. Delayed delivery uses one short-lived timer
+/// thread per body — bodies flow at most a few per view cycle in these tests,
+/// so this stays trivially cheap and preserves per-message ordering where it
+/// matters (headers/votes are never delayed, so consensus-critical ordering
+/// is untouched; bodies only gate insertion, which is retry-robust).
+fn deliver(
+    origin: VerifyingKey,
+    peer_tx: Sender<(VerifyingKey, Message)>,
+    message: Message,
+    body_delay: Option<std::time::Duration>,
+) {
+    let is_body = matches!(
+        &message,
+        Message::ProgressMessage(ProgressMessage::HotStuffMessage(
+            HotStuffMessage::BlockDataResponse(_) | HotStuffMessage::Proposal(_)
+        ))
+    );
+    match body_delay {
+        Some(delay) if is_body => {
+            std::thread::spawn(move || {
+                std::thread::sleep(delay);
+                let _ = peer_tx.send((origin, message));
+            });
+        }
+        _ => {
+            let _ = peer_tx.send((origin, message));
         }
     }
 }
@@ -197,10 +248,31 @@ pub(crate) fn mock_network_with_filter(
             my_verifying_key,
             all_peers: all_peers.clone(),
             inbox: Arc::new(Mutex::new(inbox)),
+            body_delay: None,
             filter_enabled: enabled.clone(),
             filter: filter.clone(),
         })
         .collect();
 
     (stubs, FilterHandle { enabled, filter })
+}
+
+/// S470 wedge repro: like [`mock_network`], but every body-carrying message
+/// (`BlockDataResponse`, full `Proposal`) to every recipient is delivered
+/// `body_delay` after it was sent, while headers/votes/pacemaker traffic stay
+/// instant. See the `body_delay` field docs on [`NetworkStub`] for why this is
+/// the faithful scale-down of the production wedge (an in-thread
+/// `validate_block` sleep would FREEZE the sleeping replica's view clock and
+/// mask the wedge; a delayed body keeps the view clock live, which is the
+/// wedge's precondition).
+#[allow(dead_code)]
+pub(crate) fn mock_network_with_body_delay(
+    peers: impl Iterator<Item = VerifyingKey>,
+    body_delay: std::time::Duration,
+) -> Vec<NetworkStub> {
+    let (mut stubs, _filter) = mock_network_with_filter(peers);
+    for stub in stubs.iter_mut() {
+        stub.body_delay = Some(body_delay);
+    }
+    stubs
 }

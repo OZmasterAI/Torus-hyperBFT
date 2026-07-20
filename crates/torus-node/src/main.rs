@@ -314,8 +314,50 @@ fn default_chain_config() -> ChainConfig {
         timeout_base_ms: 500,
         backoff_factor: 2,
         backoff_cap: 8,
+        commit_lag_backoff_cap: 0,
         reputation_leader_selection: false,
         exec_trust_cache: false,
+    }
+}
+
+/// S470: effective commit-lag backoff cap — the genesis value, overridable for
+/// DEVNETS via `TORUS_COMMIT_LAG_BACKOFF_CAP` (a well-formed u32 wins; unset,
+/// empty, or garbage falls back to genesis). The genesis default is 0 = off =
+/// deadline schedule byte-identical to pre-S470.
+///
+/// FLEET-UNIFORM WARNING: this knob is consensus-liveness critical. If the env
+/// override is used, it must be set to the SAME value on every validator of
+/// the chain — divergent values mean divergent view-deadline schedules and
+/// degraded liveness (premature Bracha timeouts), though never a safety
+/// violation. Production chains should set it in genesis only.
+fn resolve_commit_lag_cap(genesis_value: u32, env_value: Option<&str>) -> u32 {
+    env_value
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(genesis_value)
+}
+
+#[cfg(test)]
+mod commit_lag_cap_tests {
+    use super::resolve_commit_lag_cap;
+
+    /// S470 knob defaults: unset / empty / garbage env and an absent genesis
+    /// field (=> genesis_value 0) all resolve to 0 — the exact-today schedule.
+    #[test]
+    fn resolve_commit_lag_cap_defaults_off() {
+        assert_eq!(resolve_commit_lag_cap(0, None), 0);
+        assert_eq!(resolve_commit_lag_cap(0, Some("")), 0);
+        assert_eq!(resolve_commit_lag_cap(0, Some("garbage")), 0);
+        assert_eq!(resolve_commit_lag_cap(0, Some("-1")), 0);
+        assert_eq!(resolve_commit_lag_cap(0, Some("0")), 0);
+    }
+
+    /// Env override wins over genesis when well-formed; garbage falls back.
+    #[test]
+    fn resolve_commit_lag_cap_env_override() {
+        assert_eq!(resolve_commit_lag_cap(0, Some("4")), 4);
+        assert_eq!(resolve_commit_lag_cap(8, Some("0")), 0);
+        assert_eq!(resolve_commit_lag_cap(8, None), 8);
+        assert_eq!(resolve_commit_lag_cap(8, Some("not-a-number")), 8);
     }
 }
 
@@ -717,6 +759,22 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    // S470: commit-lag backoff cap — genesis-sourced, env-overridable for
+    // devnets (TORUS_COMMIT_LAG_BACKOFF_CAP). Fleet-uniform: see
+    // `resolve_commit_lag_cap`. Logged loudly because a divergent fleet
+    // degrades liveness.
+    let commit_lag_cap = resolve_commit_lag_cap(
+        chain_config.commit_lag_backoff_cap,
+        std::env::var("TORUS_COMMIT_LAG_BACKOFF_CAP").ok().as_deref(),
+    );
+    info!(
+        commit_lag_cap,
+        genesis_value = chain_config.commit_lag_backoff_cap,
+        "S470 commit-lag view backoff: {} (0 = off / pre-S470 schedule; \
+         MUST be identical on every validator of the chain)",
+        if commit_lag_cap == 0 { "DISABLED" } else { "ENABLED" },
+    );
+
     let hs_config = Configuration::builder()
         .me(signing_key)
         .chain_id(ChainID::new(chain_config.chain_id))
@@ -724,6 +782,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         .max_view_time(Duration::from_millis(chain_config.timeout_base_ms))
         .backoff_factor(chain_config.backoff_factor)
         .backoff_cap(chain_config.backoff_cap)
+        .commit_lag_cap(commit_lag_cap)
         .progress_msg_buffer_capacity(BufferSize::new(1024))
         .block_sync_request_limit(128)
         .block_sync_server_advertise_time(Duration::new(10, 0))

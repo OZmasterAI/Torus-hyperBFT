@@ -39,12 +39,21 @@ pub(crate) type QueuedTransaction = (u64, NumberAppTransaction);
 ///
 /// ## Timing
 ///
-/// In order to reduce the rate at which blocks are produced in integration tests `NumberApp` is hardcoded
-/// to spend at least 250 milliseconds in `produce_block`, and 250 milliseconds in `validate_block`.
-/// This means that at the *bare minimum*, replicas maintaining a `NumberApp` should configure their
-/// `max_view_time` to be 500 milliseconds if they are to consistently make progress.
+/// In order to reduce the rate at which blocks are produced in integration tests `NumberApp` spends
+/// at least `produce_delay` in `produce_block`, and `validate_delay` in `validate_block` (both
+/// default to 250 milliseconds via [`new`](NumberApp::new)). This means that at the *bare minimum*,
+/// replicas maintaining a default `NumberApp` should configure their `max_view_time` to be 500
+/// milliseconds if they are to consistently make progress.
+///
+/// S470 caution: these delays run ON the algorithm thread, so a sleeping replica's pacemaker
+/// stops ticking and its view clock freezes for the duration — a `validate_delay` above
+/// `max_view_time` therefore does NOT model a slow off-thread exec pipeline (the S470 wedge
+/// repro uses a network-side body delay instead, see `mock_network_with_body_delay`). Keep
+/// both delays under `max_view_time`.
 pub(crate) struct NumberApp {
     tx_queue: Arc<Mutex<Vec<QueuedTransaction>>>,
+    produce_delay: Duration,
+    validate_delay: Duration,
 }
 
 /// User-sent instructions that number app execute in [`produce_block`](App::produce_block) and
@@ -85,8 +94,31 @@ impl NumberApp {
     ///
     /// Callers should clone a reference to the `tx_queue` before calling this constructor and use the
     /// reference to insert transactions to the `tx_queue` whenever needed.
+    #[allow(dead_code)]
     pub(crate) fn new(tx_queue: Arc<Mutex<Vec<QueuedTransaction>>>) -> NumberApp {
-        Self { tx_queue }
+        Self::new_with_delays(
+            tx_queue,
+            Duration::from_millis(250),
+            Duration::from_millis(250),
+        )
+    }
+
+    /// Like [`new`](Self::new), but with caller-chosen `produce_block` /
+    /// `validate_block` delays (both must stay under `max_view_time` — see
+    /// the S470 caution in the struct docs). The S470 wedge-repro test uses
+    /// this to shrink `produce_delay` so proposal production is never the
+    /// bottleneck.
+    #[allow(dead_code)]
+    pub(crate) fn new_with_delays(
+        tx_queue: Arc<Mutex<Vec<QueuedTransaction>>>,
+        produce_delay: Duration,
+        validate_delay: Duration,
+    ) -> NumberApp {
+        Self {
+            tx_queue,
+            produce_delay,
+            validate_delay,
+        }
     }
 
     /// Return an `AppStateUpdates` that when applied on an empty app state will produce a good "initial"
@@ -105,7 +137,7 @@ impl NumberApp {
 
 impl App<MemDB> for NumberApp {
     fn produce_block(&mut self, request: ProduceBlockRequest<MemDB>) -> ProduceBlockResponse {
-        thread::sleep(Duration::from_millis(250));
+        thread::sleep(self.produce_delay);
 
         let initial_number = u32::from_le_bytes(
             request
@@ -149,7 +181,7 @@ impl App<MemDB> for NumberApp {
     }
 
     fn validate_block(&mut self, request: ValidateBlockRequest<MemDB>) -> ValidateBlockResponse {
-        thread::sleep(Duration::from_millis(250));
+        thread::sleep(self.validate_delay);
 
         self.validate_block_for_sync(request)
     }

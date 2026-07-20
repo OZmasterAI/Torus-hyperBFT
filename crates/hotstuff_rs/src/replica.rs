@@ -261,6 +261,19 @@ pub struct Configuration {
         )
     )]
     pub backoff_cap: u32,
+    #[builder(
+        default = 0,
+        setter(
+            doc = "Set the exponent cap of the S470 COMMIT-LAG view-timeout backoff, which \
+    stretches view deadlines while the QC frontier outruns the commit frontier (the \
+    header-pipeline commit wedge). 0 (the default) disables the term entirely — the deadline \
+    schedule is byte-identical to the pre-S470 one. Consensus-liveness critical: every replica \
+    of a chain must use the same value (fleet-uniform, genesis-sourced); divergent values mean \
+    divergent deadline schedules and degraded liveness (never a safety violation). \
+    Optional (default: 0 = off)."
+        )
+    )]
+    pub commit_lag_cap: u32,
     #[builder(setter(doc = "Enable logging? Required."))]
     pub log_events: bool,
 }
@@ -286,6 +299,7 @@ impl From<Configuration>
             max_view_time: val.max_view_time,
             backoff_factor: val.backoff_factor,
             backoff_cap: val.backoff_cap,
+            commit_lag_cap: val.commit_lag_cap,
         };
         let block_sync_client_config = BlockSyncClientConfiguration {
             chain_id: val.chain_id,

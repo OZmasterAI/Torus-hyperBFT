@@ -595,6 +595,23 @@ impl<K: KVStore> BlockTreeSingleton<K> {
                 highest_pc: pc.clone(),
             })
             .publish(event_publisher);
+            // S470 wedge diagnostics: the QC-frontier crawl. Paired with the
+            // view_timeout line, this gives the per-view (view − qc) and
+            // (qc − committed) series that confirm the wedge mechanism live.
+            if crate::logging::wedge_diag_enabled() {
+                log::info!(
+                    "wedge_diag highest_pc_advance: pc_view={} pc_block_prefix={} committed_view={}",
+                    pc.view.int(),
+                    crate::logging::block_prefix(&pc.block),
+                    self.committed_qc_view()?.int(),
+                );
+            } else {
+                log::debug!(
+                    "wedge_diag highest_pc_advance: pc_view={} pc_block_prefix={}",
+                    pc.view.int(),
+                    crate::logging::block_prefix(&pc.block),
+                );
+            }
         }
         Ok(())
     }
@@ -1066,6 +1083,20 @@ impl<K: KVStore> BlockTreeSingleton<K> {
         } else {
             Ok(None)
         }
+    }
+
+    /// S470: the view-number position of the COMMIT frontier — the justify-view
+    /// of the highest committed block (`None` committed maps to view 0, the
+    /// genesis view). Derived exclusively from consensus objects (the committed
+    /// block is fixed by the 2-chain rule over the QC chain, and its justify is
+    /// embedded in the block itself), never from local execution timing, so
+    /// honest replicas with the same frontiers derive the same value. Drives
+    /// the pacemaker's commit-lag backoff term and the wedge diagnostics.
+    pub fn committed_qc_view(&self) -> Result<ViewNumber, BlockTreeError> {
+        Ok(match self.highest_committed_block()? {
+            Some(block) => self.block_justify(&block)?.view,
+            None => ViewNumber::new(0),
+        })
     }
 }
 
