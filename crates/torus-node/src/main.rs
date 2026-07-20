@@ -964,6 +964,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             leader_vk_fn.clone(),
             own_vk,
             mempool.clone(),
+            // Same gate as the RPC forward path above: bodies flow to the
+            // leader only in no-gossip mode, and so does the healing sweep.
+            !cli.native_gossip,
         );
     } else {
         info!("B1 d2l batching disabled (TORUS_D2L_BATCH=0) — per-action 0xFE forwards");
