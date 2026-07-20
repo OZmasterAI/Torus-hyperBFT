@@ -1,0 +1,338 @@
+torus_blocks_committed_total 208
+# HELP torus_block_height Current block height.
+# TYPE torus_block_height gauge
+torus_block_height 208
+torus_native_actions_processed_total 1647
+torus_orders_matched_total 462369
+torus_orders_placed_accepted_total 585600
+torus_orders_resting_total 349755
+# HELP torus_exec_verify_seconds Exec phase: batch signature verification of native actions.
+# TYPE torus_exec_verify_seconds histogram
+torus_exec_verify_seconds_sum 5.250114051000001
+torus_exec_verify_seconds_count 28
+torus_exec_verify_seconds_bucket{le="0.001"} 1
+torus_exec_verify_seconds_bucket{le="0.002"} 1
+torus_exec_verify_seconds_bucket{le="0.004"} 3
+torus_exec_verify_seconds_bucket{le="0.008"} 5
+torus_exec_verify_seconds_bucket{le="0.016"} 7
+torus_exec_verify_seconds_bucket{le="0.032"} 7
+torus_exec_verify_seconds_bucket{le="0.064"} 7
+torus_exec_verify_seconds_bucket{le="0.128"} 14
+torus_exec_verify_seconds_bucket{le="0.256"} 17
+torus_exec_verify_seconds_bucket{le="0.512"} 27
+torus_exec_verify_seconds_bucket{le="1.024"} 28
+torus_exec_verify_seconds_bucket{le="2.048"} 28
+torus_exec_verify_seconds_bucket{le="4.096"} 28
+torus_exec_verify_seconds_bucket{le="8.192"} 28
+torus_exec_verify_seconds_bucket{le="+Inf"} 28
+# HELP torus_exec_replay_guard_seconds Exec phase: per-action (sender, nonce) replay-guard point reads.
+# TYPE torus_exec_replay_guard_seconds histogram
+torus_exec_replay_guard_seconds_sum 0.039800242
+torus_exec_replay_guard_seconds_count 28
+torus_exec_replay_guard_seconds_bucket{le="0.001"} 7
+torus_exec_replay_guard_seconds_bucket{le="0.002"} 26
+torus_exec_replay_guard_seconds_bucket{le="0.004"} 26
+torus_exec_replay_guard_seconds_bucket{le="0.008"} 28
+torus_exec_replay_guard_seconds_bucket{le="0.016"} 28
+torus_exec_replay_guard_seconds_bucket{le="0.032"} 28
+torus_exec_replay_guard_seconds_bucket{le="0.064"} 28
+torus_exec_replay_guard_seconds_bucket{le="0.128"} 28
+torus_exec_replay_guard_seconds_bucket{le="0.256"} 28
+torus_exec_replay_guard_seconds_bucket{le="0.512"} 28
+torus_exec_replay_guard_seconds_bucket{le="1.024"} 28
+torus_exec_replay_guard_seconds_bucket{le="2.048"} 28
+torus_exec_replay_guard_seconds_bucket{le="4.096"} 28
+torus_exec_replay_guard_seconds_bucket{le="8.192"} 28
+torus_exec_replay_guard_seconds_bucket{le="+Inf"} 28
+# HELP torus_exec_engine_seconds Exec phase: native engine batches, governance, fees and epoch boundary.
+# TYPE torus_exec_engine_seconds histogram
+torus_exec_engine_seconds_sum 9.637203454999998
+torus_exec_engine_seconds_count 28
+torus_exec_engine_seconds_bucket{le="0.001"} 1
+torus_exec_engine_seconds_bucket{le="0.002"} 1
+torus_exec_engine_seconds_bucket{le="0.004"} 1
+torus_exec_engine_seconds_bucket{le="0.008"} 1
+torus_exec_engine_seconds_bucket{le="0.016"} 1
+torus_exec_engine_seconds_bucket{le="0.032"} 2
+torus_exec_engine_seconds_bucket{le="0.064"} 2
+torus_exec_engine_seconds_bucket{le="0.128"} 8
+torus_exec_engine_seconds_bucket{le="0.256"} 11
+torus_exec_engine_seconds_bucket{le="0.512"} 23
+torus_exec_engine_seconds_bucket{le="1.024"} 28
+torus_exec_engine_seconds_bucket{le="2.048"} 28
+torus_exec_engine_seconds_bucket{le="4.096"} 28
+torus_exec_engine_seconds_bucket{le="8.192"} 28
+torus_exec_engine_seconds_bucket{le="+Inf"} 28
+# HELP torus_exec_phase_margin_seconds Exec sub-phase: per-order margin reservation + market partition (execute_batch Phase 2).
+# TYPE torus_exec_phase_margin_seconds histogram
+torus_exec_phase_margin_seconds_sum 1.5896372439999998
+torus_exec_phase_margin_seconds_count 27
+torus_exec_phase_margin_seconds_bucket{le="0.001"} 2
+torus_exec_phase_margin_seconds_bucket{le="0.002"} 4
+torus_exec_phase_margin_seconds_bucket{le="0.004"} 5
+torus_exec_phase_margin_seconds_bucket{le="0.008"} 7
+torus_exec_phase_margin_seconds_bucket{le="0.016"} 11
+torus_exec_phase_margin_seconds_bucket{le="0.032"} 11
+torus_exec_phase_margin_seconds_bucket{le="0.064"} 12
+torus_exec_phase_margin_seconds_bucket{le="0.128"} 26
+torus_exec_phase_margin_seconds_bucket{le="0.256"} 26
+torus_exec_phase_margin_seconds_bucket{le="0.512"} 27
+torus_exec_phase_margin_seconds_bucket{le="1.024"} 27
+torus_exec_phase_margin_seconds_bucket{le="2.048"} 27
+torus_exec_phase_margin_seconds_bucket{le="4.096"} 27
+torus_exec_phase_margin_seconds_bucket{le="8.192"} 27
+torus_exec_phase_margin_seconds_bucket{le="+Inf"} 27
+# HELP torus_exec_phase_match_seconds Exec sub-phase: per-market parallel order matching (execute_batch Phase 3).
+# TYPE torus_exec_phase_match_seconds histogram
+torus_exec_phase_match_seconds_sum 2.6463196090000009
+torus_exec_phase_match_seconds_count 27
+torus_exec_phase_match_seconds_bucket{le="0.001"} 0
+torus_exec_phase_match_seconds_bucket{le="0.002"} 0
+torus_exec_phase_match_seconds_bucket{le="0.004"} 0
+torus_exec_phase_match_seconds_bucket{le="0.008"} 1
+torus_exec_phase_match_seconds_bucket{le="0.016"} 4
+torus_exec_phase_match_seconds_bucket{le="0.032"} 9
+torus_exec_phase_match_seconds_bucket{le="0.064"} 9
+torus_exec_phase_match_seconds_bucket{le="0.128"} 21
+torus_exec_phase_match_seconds_bucket{le="0.256"} 26
+torus_exec_phase_match_seconds_bucket{le="0.512"} 27
+torus_exec_phase_match_seconds_bucket{le="1.024"} 27
+torus_exec_phase_match_seconds_bucket{le="2.048"} 27
+torus_exec_phase_match_seconds_bucket{le="4.096"} 27
+torus_exec_phase_match_seconds_bucket{le="8.192"} 27
+torus_exec_phase_match_seconds_bucket{le="+Inf"} 27
+# HELP torus_exec_phase_settle_seconds Exec sub-phase: settlement - margin release, fills, trade persist (execute_batch Phase 4).
+# TYPE torus_exec_phase_settle_seconds histogram
+torus_exec_phase_settle_seconds_sum 5.128049197999999
+torus_exec_phase_settle_seconds_count 27
+torus_exec_phase_settle_seconds_bucket{le="0.001"} 0
+torus_exec_phase_settle_seconds_bucket{le="0.002"} 0
+torus_exec_phase_settle_seconds_bucket{le="0.004"} 0
+torus_exec_phase_settle_seconds_bucket{le="0.008"} 0
+torus_exec_phase_settle_seconds_bucket{le="0.016"} 2
+torus_exec_phase_settle_seconds_bucket{le="0.032"} 4
+torus_exec_phase_settle_seconds_bucket{le="0.064"} 4
+torus_exec_phase_settle_seconds_bucket{le="0.128"} 13
+torus_exec_phase_settle_seconds_bucket{le="0.256"} 18
+torus_exec_phase_settle_seconds_bucket{le="0.512"} 26
+torus_exec_phase_settle_seconds_bucket{le="1.024"} 27
+torus_exec_phase_settle_seconds_bucket{le="2.048"} 27
+torus_exec_phase_settle_seconds_bucket{le="4.096"} 27
+torus_exec_phase_settle_seconds_bucket{le="8.192"} 27
+torus_exec_phase_settle_seconds_bucket{le="+Inf"} 27
+# HELP torus_exec_save_books_seconds Exec phase: serializing dirty order books into the overlay.
+# TYPE torus_exec_save_books_seconds histogram
+torus_exec_save_books_seconds_sum 3.7266509140000005
+torus_exec_save_books_seconds_count 27
+torus_exec_save_books_seconds_bucket{le="0.001"} 1
+torus_exec_save_books_seconds_bucket{le="0.002"} 1
+torus_exec_save_books_seconds_bucket{le="0.004"} 2
+torus_exec_save_books_seconds_bucket{le="0.008"} 6
+torus_exec_save_books_seconds_bucket{le="0.016"} 6
+torus_exec_save_books_seconds_bucket{le="0.032"} 6
+torus_exec_save_books_seconds_bucket{le="0.064"} 6
+torus_exec_save_books_seconds_bucket{le="0.128"} 17
+torus_exec_save_books_seconds_bucket{le="0.256"} 22
+torus_exec_save_books_seconds_bucket{le="0.512"} 27
+torus_exec_save_books_seconds_bucket{le="1.024"} 27
+torus_exec_save_books_seconds_bucket{le="2.048"} 27
+torus_exec_save_books_seconds_bucket{le="4.096"} 27
+torus_exec_save_books_seconds_bucket{le="8.192"} 27
+torus_exec_save_books_seconds_bucket{le="+Inf"} 27
+# HELP torus_exec_flush_seconds Exec phase: nonce writes, atomic overlay flush and incremental tries.
+# TYPE torus_exec_flush_seconds histogram
+torus_exec_flush_seconds_sum 30.007937197000009
+torus_exec_flush_seconds_count 27
+torus_exec_flush_seconds_bucket{le="0.001"} 1
+torus_exec_flush_seconds_bucket{le="0.002"} 1
+torus_exec_flush_seconds_bucket{le="0.004"} 1
+torus_exec_flush_seconds_bucket{le="0.008"} 1
+torus_exec_flush_seconds_bucket{le="0.016"} 1
+torus_exec_flush_seconds_bucket{le="0.032"} 1
+torus_exec_flush_seconds_bucket{le="0.064"} 1
+torus_exec_flush_seconds_bucket{le="0.128"} 1
+torus_exec_flush_seconds_bucket{le="0.256"} 3
+torus_exec_flush_seconds_bucket{le="0.512"} 7
+torus_exec_flush_seconds_bucket{le="1.024"} 13
+torus_exec_flush_seconds_bucket{le="2.048"} 25
+torus_exec_flush_seconds_bucket{le="4.096"} 27
+torus_exec_flush_seconds_bucket{le="8.192"} 27
+torus_exec_flush_seconds_bucket{le="+Inf"} 27
+# HELP torus_exec_root_seconds Flush breakdown: incremental native-trie maintenance (bucket rehash + path).
+# TYPE torus_exec_root_seconds histogram
+torus_exec_root_seconds_sum 16.993734048000005
+torus_exec_root_seconds_count 27
+torus_exec_root_seconds_bucket{le="0.001"} 1
+torus_exec_root_seconds_bucket{le="0.002"} 1
+torus_exec_root_seconds_bucket{le="0.004"} 1
+torus_exec_root_seconds_bucket{le="0.008"} 1
+torus_exec_root_seconds_bucket{le="0.016"} 1
+torus_exec_root_seconds_bucket{le="0.032"} 1
+torus_exec_root_seconds_bucket{le="0.064"} 1
+torus_exec_root_seconds_bucket{le="0.128"} 4
+torus_exec_root_seconds_bucket{le="0.256"} 6
+torus_exec_root_seconds_bucket{le="0.512"} 10
+torus_exec_root_seconds_bucket{le="1.024"} 22
+torus_exec_root_seconds_bucket{le="2.048"} 27
+torus_exec_root_seconds_bucket{le="4.096"} 27
+torus_exec_root_seconds_bucket{le="8.192"} 27
+torus_exec_root_seconds_bucket{le="+Inf"} 27
+# HELP torus_exec_state_write_seconds Flush breakdown: WriteBatch build + atomic RocksDB write.
+# TYPE torus_exec_state_write_seconds histogram
+torus_exec_state_write_seconds_sum 9.992265898
+torus_exec_state_write_seconds_count 27
+torus_exec_state_write_seconds_bucket{le="0.001"} 1
+torus_exec_state_write_seconds_bucket{le="0.002"} 1
+torus_exec_state_write_seconds_bucket{le="0.004"} 1
+torus_exec_state_write_seconds_bucket{le="0.008"} 1
+torus_exec_state_write_seconds_bucket{le="0.016"} 1
+torus_exec_state_write_seconds_bucket{le="0.032"} 1
+torus_exec_state_write_seconds_bucket{le="0.064"} 1
+torus_exec_state_write_seconds_bucket{le="0.128"} 6
+torus_exec_state_write_seconds_bucket{le="0.256"} 9
+torus_exec_state_write_seconds_bucket{le="0.512"} 21
+torus_exec_state_write_seconds_bucket{le="1.024"} 27
+torus_exec_state_write_seconds_bucket{le="2.048"} 27
+torus_exec_state_write_seconds_bucket{le="4.096"} 27
+torus_exec_state_write_seconds_bucket{le="8.192"} 27
+torus_exec_state_write_seconds_bucket{le="+Inf"} 27
+# HELP torus_exec_evm_resync_seconds Flush breakdown: post-flush incremental-trie EVM account resync.
+# TYPE torus_exec_evm_resync_seconds histogram
+torus_exec_evm_resync_seconds_sum 0.012433069000000002
+torus_exec_evm_resync_seconds_count 27
+torus_exec_evm_resync_seconds_bucket{le="0.001"} 26
+torus_exec_evm_resync_seconds_bucket{le="0.002"} 26
+torus_exec_evm_resync_seconds_bucket{le="0.004"} 26
+torus_exec_evm_resync_seconds_bucket{le="0.008"} 26
+torus_exec_evm_resync_seconds_bucket{le="0.016"} 27
+torus_exec_evm_resync_seconds_bucket{le="0.032"} 27
+torus_exec_evm_resync_seconds_bucket{le="0.064"} 27
+torus_exec_evm_resync_seconds_bucket{le="0.128"} 27
+torus_exec_evm_resync_seconds_bucket{le="0.256"} 27
+torus_exec_evm_resync_seconds_bucket{le="0.512"} 27
+torus_exec_evm_resync_seconds_bucket{le="1.024"} 27
+torus_exec_evm_resync_seconds_bucket{le="2.048"} 27
+torus_exec_evm_resync_seconds_bucket{le="4.096"} 27
+torus_exec_evm_resync_seconds_bucket{le="8.192"} 27
+torus_exec_evm_resync_seconds_bucket{le="+Inf"} 27
+# HELP torus_exec_root_dirty_buckets Buckets rehashed per block by native-trie maintenance (O(dirty) witness).
+# TYPE torus_exec_root_dirty_buckets histogram
+torus_exec_root_dirty_buckets_sum 229281.0
+torus_exec_root_dirty_buckets_count 27
+torus_exec_root_dirty_buckets_bucket{le="1.0"} 1
+torus_exec_root_dirty_buckets_bucket{le="2.0"} 1
+torus_exec_root_dirty_buckets_bucket{le="4.0"} 1
+torus_exec_root_dirty_buckets_bucket{le="8.0"} 1
+torus_exec_root_dirty_buckets_bucket{le="16.0"} 1
+torus_exec_root_dirty_buckets_bucket{le="32.0"} 1
+torus_exec_root_dirty_buckets_bucket{le="64.0"} 1
+torus_exec_root_dirty_buckets_bucket{le="128.0"} 1
+torus_exec_root_dirty_buckets_bucket{le="256.0"} 1
+torus_exec_root_dirty_buckets_bucket{le="512.0"} 1
+torus_exec_root_dirty_buckets_bucket{le="1024.0"} 3
+torus_exec_root_dirty_buckets_bucket{le="2048.0"} 4
+torus_exec_root_dirty_buckets_bucket{le="4096.0"} 9
+torus_exec_root_dirty_buckets_bucket{le="8192.0"} 12
+torus_exec_root_dirty_buckets_bucket{le="16384.0"} 27
+torus_exec_root_dirty_buckets_bucket{le="32768.0"} 27
+torus_exec_root_dirty_buckets_bucket{le="+Inf"} 27
+# HELP torus_exec_root_bucket_scans CF_NATIVE_HASHED prefix-scans by native-trie maintenance (drops with member-cache hits).
+# TYPE torus_exec_root_bucket_scans counter
+torus_exec_root_bucket_scans_total 61244
+# HELP torus_member_cache_hits Bucket-member cache hits (scan elided).
+# TYPE torus_member_cache_hits counter
+torus_member_cache_hits_total 168039
+# HELP torus_member_cache_misses Bucket-member cache misses (mirror re-scanned).
+# TYPE torus_member_cache_misses counter
+torus_member_cache_misses_total 61244
+# HELP torus_member_cache_evictions Bucket-member cache LRU evictions (memory-budget pressure).
+# TYPE torus_member_cache_evictions counter
+torus_member_cache_evictions_total 0
+# HELP torus_exec_block_seconds Total time to execute a committed block on the execution thread.
+# TYPE torus_exec_block_seconds histogram
+torus_exec_block_seconds_sum 57.459019497
+torus_exec_block_seconds_count 208
+torus_exec_block_seconds_bucket{le="0.001"} 179
+torus_exec_block_seconds_bucket{le="0.002"} 179
+torus_exec_block_seconds_bucket{le="0.004"} 179
+torus_exec_block_seconds_bucket{le="0.008"} 181
+torus_exec_block_seconds_bucket{le="0.016"} 181
+torus_exec_block_seconds_bucket{le="0.032"} 181
+torus_exec_block_seconds_bucket{le="0.064"} 181
+torus_exec_block_seconds_bucket{le="0.128"} 181
+torus_exec_block_seconds_bucket{le="0.256"} 182
+torus_exec_block_seconds_bucket{le="0.512"} 183
+torus_exec_block_seconds_bucket{le="1.024"} 187
+torus_exec_block_seconds_bucket{le="2.048"} 195
+torus_exec_block_seconds_bucket{le="4.096"} 207
+torus_exec_block_seconds_bucket{le="8.192"} 208
+torus_exec_block_seconds_bucket{le="+Inf"} 208
+# HELP torus_exec_evm_seconds Exec phase: EVM validate + commit bundle + block metadata (native-only cells ~0).
+# TYPE torus_exec_evm_seconds histogram
+torus_exec_evm_seconds_sum 3.1559551100000005
+torus_exec_evm_seconds_count 209
+torus_exec_evm_seconds_bucket{le="0.001"} 193
+torus_exec_evm_seconds_bucket{le="0.002"} 195
+torus_exec_evm_seconds_bucket{le="0.004"} 197
+torus_exec_evm_seconds_bucket{le="0.008"} 200
+torus_exec_evm_seconds_bucket{le="0.016"} 201
+torus_exec_evm_seconds_bucket{le="0.032"} 201
+torus_exec_evm_seconds_bucket{le="0.064"} 201
+torus_exec_evm_seconds_bucket{le="0.128"} 202
+torus_exec_evm_seconds_bucket{le="0.256"} 204
+torus_exec_evm_seconds_bucket{le="0.512"} 207
+torus_exec_evm_seconds_bucket{le="1.024"} 209
+torus_exec_evm_seconds_bucket{le="2.048"} 209
+torus_exec_evm_seconds_bucket{le="4.096"} 209
+torus_exec_evm_seconds_bucket{le="8.192"} 209
+torus_exec_evm_seconds_bucket{le="+Inf"} 209
+# HELP torus_exec_load_books_seconds Exec phase: per-block order-book load + rebuild from cf_native_order_books (O(total resting depth); classic blob or C4 rows depending on TORUS_BOOK_ROWS).
+# TYPE torus_exec_load_books_seconds histogram
+torus_exec_load_books_seconds_sum 0.23035968
+torus_exec_load_books_seconds_count 28
+torus_exec_load_books_seconds_bucket{le="0.001"} 27
+torus_exec_load_books_seconds_bucket{le="0.002"} 27
+torus_exec_load_books_seconds_bucket{le="0.004"} 27
+torus_exec_load_books_seconds_bucket{le="0.008"} 27
+torus_exec_load_books_seconds_bucket{le="0.016"} 27
+torus_exec_load_books_seconds_bucket{le="0.032"} 27
+torus_exec_load_books_seconds_bucket{le="0.064"} 27
+torus_exec_load_books_seconds_bucket{le="0.128"} 27
+torus_exec_load_books_seconds_bucket{le="0.256"} 28
+torus_exec_load_books_seconds_bucket{le="0.512"} 28
+torus_exec_load_books_seconds_bucket{le="1.024"} 28
+torus_exec_load_books_seconds_bucket{le="2.048"} 28
+torus_exec_load_books_seconds_bucket{le="4.096"} 28
+torus_exec_load_books_seconds_bucket{le="8.192"} 28
+torus_exec_load_books_seconds_bucket{le="+Inf"} 28
+# HELP torus_exec_body_persist_seconds Exec phase: commit-callback block-body persist to CF_BLOCK_BODIES (+ marker).
+# TYPE torus_exec_body_persist_seconds histogram
+torus_exec_body_persist_seconds_sum 5.625399829000003
+torus_exec_body_persist_seconds_count 208
+torus_exec_body_persist_seconds_bucket{le="0.001"} 180
+torus_exec_body_persist_seconds_bucket{le="0.002"} 180
+torus_exec_body_persist_seconds_bucket{le="0.004"} 182
+torus_exec_body_persist_seconds_bucket{le="0.008"} 182
+torus_exec_body_persist_seconds_bucket{le="0.016"} 182
+torus_exec_body_persist_seconds_bucket{le="0.032"} 182
+torus_exec_body_persist_seconds_bucket{le="0.064"} 183
+torus_exec_body_persist_seconds_bucket{le="0.128"} 195
+torus_exec_body_persist_seconds_bucket{le="0.256"} 201
+torus_exec_body_persist_seconds_bucket{le="0.512"} 206
+torus_exec_body_persist_seconds_bucket{le="1.024"} 208
+torus_exec_body_persist_seconds_bucket{le="2.048"} 208
+torus_exec_body_persist_seconds_bucket{le="4.096"} 208
+torus_exec_body_persist_seconds_bucket{le="8.192"} 208
+torus_exec_body_persist_seconds_bucket{le="+Inf"} 208
+# HELP torus_exec_resting_orders Total resting orders across all books, sampled per block after load/rebuild.
+# TYPE torus_exec_resting_orders gauge
+torus_exec_resting_orders 104743
+# HELP torus_exec_queue_depth Committed blocks sent to the execution channel but not yet executed.
+# TYPE torus_exec_queue_depth gauge
+torus_exec_queue_depth 66
+# HELP torus_exec_throttle_tier Exec-backlog pacing tier applied to the proposer's latest native selection (0 full, 1 half, 2 quarter, 3 cancels-only).
+# TYPE torus_exec_throttle_tier gauge
+torus_exec_throttle_tier 0
+# HELP torus_exec_dispatch_deferred Committed blocks parked (deferred) because the exec channel was full (non-blocking dispatch).
+# TYPE torus_exec_dispatch_deferred counter
+torus_exec_dispatch_deferred_total 0
