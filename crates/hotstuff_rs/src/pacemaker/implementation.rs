@@ -1747,20 +1747,41 @@ fn pacemaker_config_has_backoff_defaults() {
 }
 
 /// The cumulative schedule is preserved while on/near schedule: a single-step
-/// advance right after init keeps its scheduled deadline (~2 view times out)
-/// rather than being rebased to one view time.
+/// advance right after init keeps its scheduled deadline (exactly 2 view
+/// times from the schedule base) rather than being rebased to one view time.
+///
+/// Methodology note (S470 re-anchoring, invariant UNCHANGED): the original
+/// form asserted `deadline > Instant::now() + 600ms` AFTER the operation,
+/// which silently assumed the test thread is never descheduled for more than
+/// ~400ms between building the fixture (a 100k-entry epoch grid) and the
+/// assert. On a loaded 8-thread `cargo test` run that assumption fails
+/// deterministically (reproduced at the pre-S470 base commit a29a08e, 3/3,
+/// while 10/10 standalone runs pass) — the SCHEDULE was correct, the anchor
+/// was not. Re-anchored to the `[before, after]` bracket every other Task A
+/// test in this file uses: it pins the exact cumulative slot
+/// `schedule_start + 2 * max_view_time` (strictly tighter than the old
+/// 600–1100ms window) and stays valid under arbitrary scheduler starvation.
+/// A rebase-to-one-view-time regression still trips the lower bound exactly
+/// as before.
 #[test]
 fn update_view_on_schedule_keeps_cumulative_deadline() {
+    let mvt = Duration::from_millis(500);
+    let before = Instant::now();
     let (mut pacemaker, vss) = test_pacemaker(1);
     pacemaker
         .update_view(ViewNumber::new(2), &vss, ViewNumber::new(1), ViewNumber::new(1))
         .unwrap();
+    let after = Instant::now();
     let deadline = pacemaker.query().deadline;
     assert!(
-        deadline > Instant::now() + Duration::from_millis(600),
-        "on-schedule advance must keep the cumulative deadline, not rebase"
+        deadline >= before + mvt * 2,
+        "on-schedule advance must keep the cumulative deadline (schedule base + 2 slots), \
+         not rebase to one view time"
     );
-    assert!(deadline <= Instant::now() + Duration::from_millis(1100));
+    assert!(
+        deadline <= after + mvt * 2,
+        "on-schedule advance must not inflate the cumulative deadline"
+    );
 }
 
 /// S470 (commit-lag backoff): the commit-lag exponent is a pure function of
