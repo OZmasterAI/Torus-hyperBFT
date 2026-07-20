@@ -326,6 +326,11 @@ enum DispatchOutcome {
 pub struct LeaderState {
     view: AtomicU64,
     validators: RwLock<hotstuff_rs::types::validator_set::ValidatorSet>,
+    /// `(view, leader)` as last observed from the pacemaker's own `StartView`
+    /// event — the REAL view (not the committed_height+1 heuristic, which goes
+    /// stale during timeout churn) and the REAL selection (reputation-aware
+    /// when the fleet runs it, unlike the plain-IWRR fallback below).
+    observed_leader: RwLock<Option<(u64, VerifyingKey)>>,
 }
 
 impl LeaderState {
@@ -333,11 +338,29 @@ impl LeaderState {
         Self {
             view: AtomicU64::new(1),
             validators: RwLock::new(hotstuff_rs::types::validator_set::ValidatorSet::new()),
+            observed_leader: RwLock::new(None),
         }
     }
 
+    /// Monotonic view advance. Callers feed two sources: the commit-path
+    /// committed_height+1 heuristic (a lower bound on the real view) and the
+    /// pacemaker's `StartView` observations; max() means the stale heuristic
+    /// can never drag the hint backwards once a real view has been observed.
     fn set_view(&self, view: u64) {
-        self.view.store(view, Ordering::Relaxed);
+        self.view.fetch_max(view, Ordering::Relaxed);
+    }
+
+    /// Record the pacemaker entering `view` with `leader` as its computed
+    /// proposer (from the `StartView` event, so it reflects the exact
+    /// selection mode the pacemaker runs — reputation-aware when enabled).
+    /// Out-of-order event delivery for an older view is ignored.
+    pub fn observe_start_view(&self, view: u64, leader: VerifyingKey) {
+        self.view.fetch_max(view, Ordering::Relaxed);
+        let mut obs = self.observed_leader.write().unwrap();
+        match *obs {
+            Some((v, _)) if v > view => {}
+            _ => *obs = Some((view, leader)),
+        }
     }
 
     fn sync_validators(&self, vs: &torus_types::ValidatorSet) {
@@ -355,13 +378,25 @@ impl LeaderState {
     }
 
     pub fn current_leader(&self) -> Option<VerifyingKey> {
+        let view = self.view.load(Ordering::Relaxed);
+        // Fresh pacemaker observation for exactly this view: authoritative
+        // (real view, real selection mode). Commits can't stale it — the
+        // heuristic is a lower bound, so fetch_max keeps view == observed view.
+        if let Some((observed_view, leader)) = *self.observed_leader.read().unwrap() {
+            if observed_view == view {
+                return Some(leader);
+            }
+        }
+        // Fallback (boot, or no StartView observed yet): plain IWRR over the
+        // synced validator set — today's behavior.
         let vs = self.validators.read().unwrap();
         if vs.is_empty() {
             return None;
         }
-        let view =
-            hotstuff_rs::types::data_types::ViewNumber::new(self.view.load(Ordering::Relaxed));
-        Some(hotstuff_rs::pacemaker::select_leader(view, &vs))
+        Some(hotstuff_rs::pacemaker::select_leader(
+            hotstuff_rs::types::data_types::ViewNumber::new(view),
+            &vs,
+        ))
     }
 }
 
@@ -5068,6 +5103,109 @@ mod in_flight_ledger_tests {
         ledger.note(7, [h(2)]);
         ledger.extend_into(&mut in_flight);
         assert!(in_flight.contains(&h(1)) && in_flight.contains(&h(2)));
+    }
+}
+
+#[cfg(test)]
+mod leader_state_tests {
+    use super::*;
+
+    /// Real ed25519 keys: `sync_validators` silently skips pubkey byte patterns
+    /// that are not valid curve points, so the set must come from generated keys.
+    fn make_set(n: u8) -> (torus_types::ValidatorSet, Vec<VerifyingKey>) {
+        let mut validators = Vec::new();
+        let mut vks = Vec::new();
+        for i in 0..n {
+            let sk = ed25519_dalek::SigningKey::from_bytes(&[i + 1; 32]);
+            let vk = sk.verifying_key();
+            validators.push(torus_types::ValidatorInfo {
+                address: Address::from([i + 1; 20]),
+                pubkey: torus_types::PublicKey(vk.to_bytes()),
+                power: 1,
+                commission_bps: 0,
+            });
+            vks.push(vk);
+        }
+        (
+            torus_types::ValidatorSet {
+                validators,
+                epoch: 0,
+            },
+            vks,
+        )
+    }
+
+    /// Plain IWRR over the LeaderState's synced validator set — the pre-fix
+    /// selection `current_leader()` always used.
+    fn plain_iwrr(ls: &LeaderState, view: u64) -> VerifyingKey {
+        let vs = ls.validators.read().unwrap();
+        hotstuff_rs::pacemaker::select_leader(
+            hotstuff_rs::types::data_types::ViewNumber::new(view),
+            &vs,
+        )
+    }
+
+    #[test]
+    fn leader_state_start_view_observation_beats_height_heuristic() {
+        let ls = LeaderState::new();
+        let (set, _) = make_set(3);
+        ls.sync_validators(&set);
+        // The pacemaker actually entered view 57 (timeout churn: views run
+        // ahead of commits)...
+        let observed = plain_iwrr(&ls, 57);
+        ls.observe_start_view(57, observed);
+        // ...while the commit path still reports committed_height + 1 = 11.
+        // The stale heuristic must NOT drag the hint backwards.
+        ls.set_view(11);
+        assert_eq!(
+            ls.current_view(),
+            57,
+            "observed pacemaker view must win over the height+1 heuristic"
+        );
+        assert_eq!(ls.current_leader(), Some(observed));
+    }
+
+    #[test]
+    fn leader_state_uses_pacemaker_observed_leader_not_plain_iwrr() {
+        // Under reputation-weighted selection the pacemaker's choice can differ
+        // from plain IWRR. The hint must follow whatever the pacemaker computed
+        // (carried on the StartView event), not re-derive plain IWRR locally.
+        let ls = LeaderState::new();
+        let (set, vks) = make_set(3);
+        ls.sync_validators(&set);
+        let plain = plain_iwrr(&ls, 40);
+        let reputation_choice = *vks.iter().find(|vk| **vk != plain).unwrap();
+        ls.observe_start_view(40, reputation_choice);
+        assert_eq!(
+            ls.current_leader(),
+            Some(reputation_choice),
+            "hint must be the pacemaker's actual selection, not plain IWRR"
+        );
+    }
+
+    #[test]
+    fn leader_state_falls_back_to_iwrr_without_observation() {
+        // Boot: no StartView observed yet -> height+1 heuristic + plain IWRR,
+        // exactly today's behavior.
+        let ls = LeaderState::new();
+        let (set, _) = make_set(3);
+        ls.sync_validators(&set);
+        ls.set_view(5);
+        assert_eq!(ls.current_view(), 5);
+        assert_eq!(ls.current_leader(), Some(plain_iwrr(&ls, 5)));
+    }
+
+    #[test]
+    fn leader_state_ignores_stale_out_of_order_observations() {
+        // Event-bus delivery is async; a late StartView for an older view must
+        // not regress a newer observation.
+        let ls = LeaderState::new();
+        let (set, vks) = make_set(3);
+        ls.sync_validators(&set);
+        ls.observe_start_view(50, vks[0]);
+        ls.observe_start_view(49, vks[1]);
+        assert_eq!(ls.current_view(), 50);
+        assert_eq!(ls.current_leader(), Some(vks[0]));
     }
 }
 

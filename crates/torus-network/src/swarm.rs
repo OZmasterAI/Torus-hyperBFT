@@ -64,6 +64,16 @@ pub enum NetworkCommand {
         target: VerifyingKey,
         payload: Vec<u8>,
     },
+    /// B1: forward ONE coalesced batch of RPC-admitted native actions to the
+    /// leader as a single `/torus/direct` request, reusing the 0xFD
+    /// pre-proposal wire format (`0xFD ‖ bincode(pairs)`) that every deployed
+    /// binary already decodes/verifies/dedups. Routed through the
+    /// PushScheduler (unlike the per-action 0xFE forward, which bypasses it)
+    /// and tracked for ≤2 retries against the re-resolved leader.
+    ForwardNativeActionBatch {
+        target: VerifyingKey,
+        pairs: Vec<(torus_types::Address, torus_types::SignedNativeAction)>,
+    },
     /// Forward a raw EVM transaction directly to the leader node (Option B — EVM tx
     /// dissemination). Payload is raw RLP; the leader full-validates via `add_evm_tx`.
     ForwardEvmTx {
@@ -132,6 +142,79 @@ fn parse_forwarded_evm_tx(payload: &[u8]) -> Option<&[u8]> {
         Some((&FORWARD_EVM_MARKER, rest)) if !rest.is_empty() => Some(rest),
         _ => None,
     }
+}
+
+/// B1: encode a direct-to-leader forward batch as a 0xFD envelope —
+/// BYTE-IDENTICAL to the pre-proposal batch push (`0xFD ‖ bincode(pairs)`,
+/// see `BroadcastNativeActions` + torus-node main.rs), so every deployed
+/// binary already accepts it on the shipped receive path. `None` only on a
+/// bincode failure (not expected for these types).
+fn encode_forward_batch(
+    pairs: &[(torus_types::Address, torus_types::SignedNativeAction)],
+) -> Option<Vec<u8>> {
+    let body = bincode::serialize(pairs).ok()?;
+    let mut envelope = Vec::with_capacity(1 + body.len());
+    envelope.push(PRE_PROPOSAL_BATCH_MARKER);
+    envelope.extend_from_slice(&body);
+    Some(envelope)
+}
+
+/// Decode the body of a 0xFD envelope (marker already stripped) into
+/// (sender, action) pairs. THE receive seam for both the pre-proposal batch
+/// push and the B1 forward batch — factored out so the B1 encode round-trips
+/// through the exact decode the Direct request arm runs.
+fn decode_pre_proposal_batch(
+    bytes: &[u8],
+) -> Result<Vec<(torus_types::Address, torus_types::SignedNativeAction)>, Box<bincode::ErrorKind>>
+{
+    bincode::deserialize(bytes)
+}
+
+/// B1: max retries for a failed forward envelope. Each retry re-resolves the
+/// leader first, so a mid-window rotation (the reason the first send died)
+/// is healed rather than repeated; past the cap the envelope is dropped with
+/// a metric — the mempool retains every action and the re-forward sweep
+/// re-sends, so a drop is a latency event, never a loss.
+const FORWARD_BATCH_MAX_RETRIES: u8 = 2;
+
+/// B1: an in-flight forward envelope tracked for retry, keyed by its
+/// request-response `OutboundRequestId` in `SharedState::outbound_forward_batches`.
+pub(crate) struct ForwardBatchInFlight {
+    /// The leader the envelope was last sent to (retry fallback when no
+    /// resolver is installed).
+    pub(crate) target: VerifyingKey,
+    /// The full 0xFD envelope, kept for re-send (≤ the D2L byte cap; the map
+    /// holds at most `PUSH_MAX_INFLIGHT` entries).
+    pub(crate) envelope: Vec<u8>,
+    /// How many times this envelope has already been re-sent.
+    pub(crate) attempt: u8,
+}
+
+/// B1 retry policy (pure — the OutboundFailure arm applies it): retry with
+/// the CURRENT leader (falling back to the stale target when no hint is
+/// available), bumping the attempt count; `None` once retries are exhausted.
+fn plan_forward_batch_retry(
+    inflight: ForwardBatchInFlight,
+    resolved_leader: Option<VerifyingKey>,
+) -> Option<(VerifyingKey, Vec<u8>, u8)> {
+    if inflight.attempt >= FORWARD_BATCH_MAX_RETRIES {
+        return None;
+    }
+    let target = resolved_leader.unwrap_or(inflight.target);
+    Some((target, inflight.envelope, inflight.attempt + 1))
+}
+
+/// B1: the node-installed leader-hint callback (bridge
+/// `set_leader_resolver`), consulted when retrying a failed forward envelope
+/// so the retry targets the CURRENT leader, not the one that just failed.
+pub type LeaderResolver = Arc<dyn Fn() -> Option<[u8; 32]> + Send + Sync>;
+
+/// Resolve the current leader via the installed callback (`None` when no
+/// resolver is installed, the hint is empty, or the bytes are not a key).
+fn resolve_forward_leader(shared: &SharedState) -> Option<VerifyingKey> {
+    let resolver = shared.leader_resolver.read().unwrap().clone()?;
+    let vk_bytes = resolver()?;
+    VerifyingKey::from_bytes(&vk_bytes).ok()
 }
 
 /// Push `item` into a bounded ring, evicting the oldest when at `cap`.
@@ -386,6 +469,90 @@ pub struct SharedState {
     /// ([`DA_FETCH_QUEUE_CAP`], oldest evicted — stale fetches are least useful;
     /// re-delivered bodies are idempotent in the durable DA store).
     pub pending_da_fetches: Mutex<PendingSendQueue<Vec<[u8; 32]>>>,
+    /// B2 consensus isolation: fan consensus broadcasts over `/torus/direct`
+    /// to every registered validator (reusing the vote-path send/buffer/redial
+    /// machinery) so a proposal never queues FIFO behind bulk native-action
+    /// batches in gossipsub's per-peer send queue. Mirror of
+    /// [`NetworkConfig::consensus_direct_fan`] (`TORUS_CONSENSUS_DIRECT_FAN`);
+    /// default OFF = exact-today behavior (the documented rollback).
+    pub consensus_direct_fan: bool,
+    /// B2: with the direct fan ON, ALSO publish consensus broadcasts to gossip
+    /// so non-validator observers and not-yet-flipped nodes keep their live
+    /// feed during staged rollout. Ignored while the fan is off — (fan=off,
+    /// mirror=off) must never silently mute consensus. Mirror of
+    /// [`NetworkConfig::consensus_gossip_mirror`]
+    /// (`TORUS_CONSENSUS_GOSSIP_MIRROR`, default ON).
+    pub consensus_gossip_mirror: bool,
+    /// B2 dual-path dedup: bounded LRU of `(sender vk, keccak256(payload))` so
+    /// a broadcast delivered by BOTH the direct fan and the gossip mirror is
+    /// enqueued to consensus exactly once. Checked only while
+    /// `consensus_direct_fan` is on — hotstuff tolerates duplicates today
+    /// (pacemaker rebroadcasts produce identical bytes), but the LRU makes the
+    /// dual-path duplication question moot (design §2).
+    pub consensus_dedup: Mutex<ConsensusDedup>,
+    /// B1: in-flight forward envelopes tracked for retry — an
+    /// `OutboundFailure` re-resolves the leader and re-sends (≤2), a
+    /// `Response` clears the entry. Bounded in practice by the
+    /// PushScheduler's in-flight cap (every tracked envelope holds a
+    /// scheduler slot).
+    pub(crate) outbound_forward_batches:
+        Mutex<HashMap<request_response::OutboundRequestId, ForwardBatchInFlight>>,
+    /// B1: leader-hint callback installed by torus-node (bridge
+    /// `set_leader_resolver`) so a forward-envelope retry targets the CURRENT
+    /// leader. `None` (tests/observers, or `TORUS_D2L_BATCH=0`) falls back to
+    /// the envelope's original target.
+    pub(crate) leader_resolver: RwLock<Option<LeaderResolver>>,
+}
+
+/// Capacity of the B2 dual-path dedup LRU. Sized for arrival skew, not
+/// history: entries only need to outlive the direct-vs-gossip delivery gap
+/// (milliseconds to a few seconds); at ~22 broadcasts/s per sender and n≤32
+/// validators, 4096 entries cover several seconds of full-fleet traffic.
+pub const CONSENSUS_DEDUP_CAP: usize = 4096;
+
+/// B2 dual-path dedup set with FIFO eviction, keyed by
+/// `(sender vk bytes, keccak256(payload))` — keccak (already this crate's tx
+/// dedup hash) over the borsh message bytes, which are identical on both
+/// delivery paths. `contains`/`record` are deliberately split: a message the
+/// bounded inbound queue DROPS must not be marked seen, or a later rebroadcast
+/// of the same bytes would be swallowed until eviction.
+pub struct ConsensusDedup {
+    seen: HashSet<([u8; 32], [u8; 32])>,
+    order: VecDeque<([u8; 32], [u8; 32])>,
+    cap: usize,
+}
+
+impl ConsensusDedup {
+    pub fn with_cap(cap: usize) -> Self {
+        Self {
+            seen: HashSet::new(),
+            order: VecDeque::new(),
+            cap,
+        }
+    }
+
+    fn key(sender: &VerifyingKey, payload: &[u8]) -> ([u8; 32], [u8; 32]) {
+        (sender.to_bytes(), Keccak256::digest(payload).into())
+    }
+
+    /// Was `(sender, payload)` already delivered (and enqueued) once?
+    pub fn contains(&self, sender: &VerifyingKey, payload: &[u8]) -> bool {
+        self.seen.contains(&Self::key(sender, payload))
+    }
+
+    /// Mark `(sender, payload)` delivered, evicting the oldest entry past cap.
+    pub fn record(&mut self, sender: &VerifyingKey, payload: &[u8]) {
+        let key = Self::key(sender, payload);
+        if !self.seen.insert(key) {
+            return;
+        }
+        self.order.push_back(key);
+        if self.order.len() > self.cap {
+            if let Some(oldest) = self.order.pop_front() {
+                self.seen.remove(&oldest);
+            }
+        }
+    }
 }
 
 enum SwarmAction {
@@ -658,6 +825,19 @@ fn publish_native_batch(
         }
         Err(e) => {
             warn!(count, trigger, "failed to publish native batch: {e:?}");
+            record_publish_failure(shared, &e);
+        }
+    }
+}
+
+/// B3 send-queue hygiene: count `AllQueuesFull` publish rejections. With
+/// flood_publish this fires only when EVERY recipient's per-peer send queue
+/// is full — the total-fan-out failure that was previously a warn-level log
+/// and nothing else. Partial per-peer misses surface via the SlowPeer arm.
+fn record_publish_failure(shared: &SharedState, err: &gossipsub::PublishError) {
+    if let gossipsub::PublishError::AllQueuesFull(_) = err {
+        if let Some(ref m) = shared.metrics {
+            m.gossip_publish_all_queues_full.inc();
         }
     }
 }
@@ -970,6 +1150,7 @@ pub async fn run_swarm_with_config(
                     }
                     Err(e) => {
                         warn!("Failed to publish tx: {e:?}");
+                        record_publish_failure(&shared, &e);
                     }
                 }
             }
@@ -1204,6 +1385,41 @@ fn handle_event(
                 }
             }
         }
+        SwarmEvent::Behaviour(TorusBehaviourEvent::Gossipsub(gossipsub::Event::SlowPeer {
+            peer_id,
+            failed_messages,
+        })) => {
+            // B3 send-queue hygiene: a peer's per-connection send queue dropped
+            // or timed out messages this heartbeat — previously invisible (the
+            // 5 s publish abandonment that ate proposals surfaced ONLY here).
+            // debug-level log (can fire every 100 ms heartbeat per slow peer
+            // under exactly the overload it detects); counters carry the signal.
+            debug!(
+                %peer_id,
+                publish = failed_messages.publish,
+                forward = failed_messages.forward,
+                priority = failed_messages.priority,
+                non_priority = failed_messages.non_priority,
+                timeout = failed_messages.timeout,
+                "gossipsub slow peer"
+            );
+            if let Some(ref m) = shared.metrics {
+                m.gossipsub_slow_peer_events.inc();
+                for (kind, n) in [
+                    ("publish", failed_messages.publish),
+                    ("forward", failed_messages.forward),
+                    ("priority", failed_messages.priority),
+                    ("non_priority", failed_messages.non_priority),
+                    ("timeout", failed_messages.timeout),
+                ] {
+                    if n > 0 {
+                        m.gossipsub_slow_peer_failed_messages
+                            .get_or_create(&vec![("kind".to_string(), kind.to_string())])
+                            .inc_by(n as u64);
+                    }
+                }
+            }
+        }
         SwarmEvent::Behaviour(TorusBehaviourEvent::Direct(request_response::Event::Message {
             message:
                 request_response::Message::Request {
@@ -1236,11 +1452,11 @@ fn handle_event(
                     }
                 };
             if request.payload.first() == Some(&PRE_PROPOSAL_BATCH_MARKER) {
+                // Carries BOTH the proposer's pre-proposal push and the B1
+                // direct-to-leader forward batch — deliberately byte-identical
+                // envelopes, one decode seam.
                 let batch_bytes = &request.payload[1..];
-                match bincode::deserialize::<
-                    Vec<(torus_types::Address, torus_types::SignedNativeAction)>,
-                >(batch_bytes)
-                {
+                match decode_pre_proposal_batch(batch_bytes) {
                     Ok(pairs) => {
                         let count = pairs.len();
                         if let Some(ref tx) = shared.native_action_inbound {
@@ -1299,11 +1515,16 @@ fn handle_event(
                 if let Some(ref tx) = shared.evm_tx_inbound {
                     let _ = tx.send(raw_rlp.to_vec());
                 }
-            } else if let Ok(msg) =
-                hotstuff_rs::networking::messages::Message::try_from_slice(&request.payload)
-            {
-                enqueue_inbound(&shared.inbound, sender_vk, msg);
-                peer_scoring.reward(&peer, REWARD_BLOCK_RELAY);
+            } else if handle_consensus_direct(
+                &request.payload,
+                sender_vk,
+                shared,
+                &mut *peer_scoring,
+                &peer,
+            ) {
+                // Consumed as a hotstuff consensus message (vote path and, with
+                // B2, the direct-fan broadcast path — dedup'd against the
+                // gossip mirror inside).
             } else {
                 peer_scoring.penalize(
                     &peer,
@@ -1322,6 +1543,13 @@ fn handle_event(
             ..
         })) => {
             shared.outbound_direct.lock().unwrap().remove(&request_id);
+            // B1: a forward envelope acked by the leader is done — clear its
+            // retry entry.
+            shared
+                .outbound_forward_batches
+                .lock()
+                .unwrap()
+                .remove(&request_id);
             // #4 Task 3: if this acked a native push, free its in-flight slot and
             // dispatch the next queued push (no-op for consensus/forward sends).
             dispatch_next_push(swarm, shared, local_key, request_id);
@@ -1338,7 +1566,22 @@ fn handle_event(
                 ..
             },
         )) => {
+            // #4 Task 3: a FAILED send frees its in-flight slot FIRST — both so a
+            // saturated link drains instead of stalling AND so the B1 retry below
+            // sees the freed scheduler slot (no-op for untracked consensus ids).
+            // The failed push body is recoverable via T4 re-push + the hot-path
+            // pull (#4 Task 1).
+            dispatch_next_push(swarm, shared, local_key, request_id);
             let tracked = shared.outbound_direct.lock().unwrap().remove(&request_id);
+            let tracked_forward = if tracked.is_none() {
+                shared
+                    .outbound_forward_batches
+                    .lock()
+                    .unwrap()
+                    .remove(&request_id)
+            } else {
+                None
+            };
             if let Some((target, message)) = tracked {
                 // Re-enqueue unconditionally (cheap; the queue is bounded) so the next
                 // reconnect flush re-delivers the message.
@@ -1360,17 +1603,31 @@ fn handle_event(
                 if should_redial_now(shared, &peer) {
                     warn!(%peer, ?error, "direct send failed — re-enqueued for reconnect flush; redialing (log throttled)");
                 }
+            } else if let Some(inflight) = tracked_forward {
+                // B1: a forward envelope died in flight — re-resolve the leader
+                // (the rotation that killed the send is exactly what the retry
+                // must heal) and re-send, ≤ FORWARD_BATCH_MAX_RETRIES times.
+                match plan_forward_batch_retry(inflight, resolve_forward_leader(shared)) {
+                    Some((target, envelope, attempt)) => {
+                        if let Some(ref m) = shared.metrics {
+                            m.d2l_envelopes_retried.inc();
+                        }
+                        warn!(%peer, ?error, attempt, "d2l forward envelope failed — retrying against current leader");
+                        send_forward_batch(swarm, shared, local_key, &target, envelope, attempt);
+                    }
+                    None => {
+                        if let Some(ref m) = shared.metrics {
+                            m.d2l_envelopes_dropped.inc();
+                        }
+                        warn!(%peer, ?error, "d2l forward envelope dropped after retries (pool retains; re-forward sweep re-sends)");
+                    }
+                }
             } else {
                 warn!(%peer, ?error, "direct send failed (untracked payload)");
                 if let Some(ref m) = shared.metrics {
                     m.direct_send_failures_untracked.inc();
                 }
             }
-            // #4 Task 3: a FAILED native push still frees its in-flight slot — dispatch
-            // the next queued push so a saturated link drains instead of stalling (no-op
-            // for consensus sends, already handled above). The failed body is recoverable
-            // via T4 re-push + the hot-path pull (#4 Task 1).
-            dispatch_next_push(swarm, shared, local_key, request_id);
         }
         SwarmEvent::Behaviour(TorusBehaviourEvent::Direct(
             request_response::Event::InboundFailure { peer, error, .. },
@@ -1894,21 +2151,50 @@ fn handle_command(
         NetworkCommand::Broadcast { message } => {
             // Self-delivery (hotstuff_rs expects proposer to receive its own broadcast)
             enqueue_inbound(&shared.inbound, *local_key, message.clone());
-            let mut envelope = local_key.to_bytes().to_vec();
-            if let Ok(msg_bytes) = message.try_to_vec() {
-                envelope.extend_from_slice(&msg_bytes);
-                match swarm
-                    .behaviour_mut()
-                    .gossipsub
-                    .publish(consensus_topic.clone(), envelope)
-                {
-                    Ok(_) => {
-                        if let Some(ref m) = shared.metrics {
-                            m.gossip_messages_sent.inc();
-                        }
+            // B2 consensus isolation: fan the broadcast over /torus/direct to
+            // every registered validator, reusing the vote-path machinery
+            // (pending-send buffering, redial, OutboundFailure re-enqueue,
+            // ConnectionEstablished flush) — a proposal on the direct fan
+            // never waits behind bulk batches in gossipsub's per-peer queue.
+            if shared.consensus_direct_fan {
+                let (mut sent, mut buffered) = (0u64, 0u64);
+                for target in broadcast_fan_targets(shared, local_key) {
+                    match send_direct(swarm, shared, local_key, &target, message.clone()) {
+                        DirectSendOutcome::Sent => sent += 1,
+                        DirectSendOutcome::Buffered => buffered += 1,
+                        // Self is excluded from the fan by construction; an
+                        // encode failure is skipped exactly as the pre-B2
+                        // send path did (borsh on a hotstuff message does not
+                        // fail in practice).
+                        DirectSendOutcome::SelfDelivered | DirectSendOutcome::EncodeFailed => {}
                     }
-                    Err(e) => {
-                        warn!("Failed to publish consensus message: {e:?}");
+                }
+                if let Some(ref m) = shared.metrics {
+                    m.consensus_direct_fan_sent.inc_by(sent);
+                    m.consensus_direct_fan_buffered.inc_by(buffered);
+                }
+            }
+            // Gossip publish: unconditional while the fan is off (exact-today
+            // behavior); mirror-gated once the fan carries the message.
+            if should_gossip_broadcast(shared.consensus_direct_fan, shared.consensus_gossip_mirror)
+            {
+                let mut envelope = local_key.to_bytes().to_vec();
+                if let Ok(msg_bytes) = message.try_to_vec() {
+                    envelope.extend_from_slice(&msg_bytes);
+                    match swarm
+                        .behaviour_mut()
+                        .gossipsub
+                        .publish(consensus_topic.clone(), envelope)
+                    {
+                        Ok(_) => {
+                            if let Some(ref m) = shared.metrics {
+                                m.gossip_messages_sent.inc();
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Failed to publish consensus message: {e:?}");
+                            record_publish_failure(shared, &e);
+                        }
                     }
                 }
             }
@@ -1974,6 +2260,20 @@ fn handle_command(
                 swarm.behaviour_mut().direct.send_request(&pid, req);
             } else {
                 warn!("ForwardNativeAction: leader not in peer map");
+            }
+        }
+        NetworkCommand::ForwardNativeActionBatch { target, pairs } => {
+            // B1: ONE 0xFD envelope per (flush window, leader) — byte-identical
+            // to the pre-proposal batch push, so every deployed binary already
+            // decodes, verifies, dedups, and pool-inserts it.
+            match encode_forward_batch(&pairs) {
+                Some(envelope) => {
+                    if let Some(ref m) = shared.metrics {
+                        m.d2l_envelope_bytes.observe(envelope.len() as f64);
+                    }
+                    send_forward_batch(swarm, shared, local_key, &target, envelope, 0);
+                }
+                None => warn!("ForwardNativeActionBatch: bincode encode failed — dropping"),
             }
         }
         NetworkCommand::ForwardEvmTx { target, payload } => {
@@ -2234,6 +2534,66 @@ fn fan_native_push(
     }
 }
 
+/// B1: dispatch one forward envelope to `target`, PushScheduler-bounded and
+/// retry-tracked. Unlike the per-action 0xFE forward (fire-and-forget,
+/// bypassing every bound), the envelope (a) consumes an in-flight scheduler
+/// slot so bursty forwards can't exhaust the bidi-stream window, (b) is
+/// recorded in `outbound_forward_batches` so an `OutboundFailure` retries it
+/// against the re-resolved leader. At scheduler saturation the envelope is
+/// queued like a native push (dispatched untracked as slots free); an
+/// unmapped leader is a counted drop — in every loss case the mempool retains
+/// the actions and the re-forward sweep re-sends them.
+fn send_forward_batch(
+    swarm: &mut Swarm<TorusBehaviour>,
+    shared: &SharedState,
+    local_key: &VerifyingKey,
+    target: &VerifyingKey,
+    envelope: Vec<u8>,
+    attempt: u8,
+) {
+    let peer_id = shared.peer_map.read().unwrap().get_peer_id(target).copied();
+    let Some(pid) = peer_id else {
+        warn!("ForwardNativeActionBatch: leader not in peer map — dropping (pool retains; sweep re-sends)");
+        if let Some(ref m) = shared.metrics {
+            m.d2l_envelopes_dropped.inc();
+        }
+        return;
+    };
+    let mut sched = shared.push_scheduler.lock().unwrap();
+    if sched.has_capacity() {
+        let req = DirectRequest {
+            sender_key: local_key.to_bytes(),
+            payload: envelope.clone(),
+        };
+        let id = swarm.behaviour_mut().direct.send_request(&pid, req);
+        sched.record(id);
+        drop(sched);
+        shared.outbound_forward_batches.lock().unwrap().insert(
+            id,
+            ForwardBatchInFlight {
+                target: *target,
+                envelope,
+                attempt,
+            },
+        );
+        if let Some(ref m) = shared.metrics {
+            m.d2l_envelopes_sent.inc();
+        }
+    } else {
+        // Saturated: queue behind the in-flight cap (bounded, drop-oldest).
+        // A queued envelope is later dispatched WITHOUT retry tracking — same
+        // policy as native pushes; the sweep is the recovery for a loss.
+        let dropped = sched.enqueue(pid, envelope);
+        drop(sched);
+        if dropped {
+            if let Some(ref m) = shared.metrics {
+                m.d2l_envelopes_dropped.inc();
+            }
+            warn!("d2l forward queue saturated — oldest queued push dropped (recoverable)");
+        }
+    }
+}
+
 /// On a completed Direct send (`Response`/`OutboundFailure`), if it was a tracked native
 /// push, free its in-flight slot and dispatch the next queued push (#4 Task 3 — bounded
 /// backpressure). No-op for consensus/forward sends, which the scheduler does not track.
@@ -2259,6 +2619,52 @@ fn dispatch_next_push(
     }
 }
 
+/// B2: resolve the direct-fan target set for a consensus broadcast — the
+/// intersection of the registered validator set and the peer map (same
+/// resolution as [`fan_native_push`]), excluding self (self-delivery is the
+/// loopback enqueue in the `Broadcast` arm) and excluding mapped
+/// non-validators (observers/RPC nodes keep following consensus via the
+/// gossip mirror). A validator not yet in the peer map is unreachable by any
+/// path and is simply skipped — `init_validator_set` maps every validator at
+/// genesis, so this is a startup-transient at most.
+fn broadcast_fan_targets(shared: &SharedState, local_key: &VerifyingKey) -> Vec<VerifyingKey> {
+    let validators = shared.validators.read().unwrap();
+    let peer_map = shared.peer_map.read().unwrap();
+    peer_map
+        .peer_ids()
+        .filter_map(|pid| {
+            let vk = *peer_map.get_vk(pid)?;
+            if vk == *local_key || !validators.contains(&vk.to_bytes()) {
+                return None;
+            }
+            Some(vk)
+        })
+        .collect()
+}
+
+/// B2: whether a consensus broadcast is (also) published to gossipsub. Fan
+/// OFF ⇒ always true — exact-today behavior, and a (fan=off, mirror=off)
+/// misconfiguration must never silently mute consensus. Fan ON ⇒ the mirror
+/// flag decides: default ON keeps non-validator observers and not-yet-flipped
+/// nodes fed during staged rollout; OFF is the fully-isolated end-state.
+fn should_gossip_broadcast(direct_fan: bool, gossip_mirror: bool) -> bool {
+    !direct_fan || gossip_mirror
+}
+
+/// What happened to a direct consensus send (B2 fan visibility).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectSendOutcome {
+    /// `target == local key` — loopback enqueue to our own inbound queue.
+    SelfDelivered,
+    /// `send_request` fired on a live connection; tracked in `outbound_direct`.
+    Sent,
+    /// Buffered in `pending_sends` (unmapped or disconnected target) for the
+    /// `ConnectionEstablished` flush; a dial was nudged where applicable.
+    Buffered,
+    /// borsh encoding failed (not expected for hotstuff messages).
+    EncodeFailed,
+}
+
 /// Send a consensus message directly to `target`, buffering instead of dropping
 /// when the peer is unreachable (Task 3 — corrected delivery seam).
 ///
@@ -2273,10 +2679,10 @@ fn send_direct(
     local_key: &VerifyingKey,
     target: &VerifyingKey,
     message: hotstuff_rs::networking::messages::Message,
-) {
+) -> DirectSendOutcome {
     if target == local_key {
         enqueue_inbound(&shared.inbound, *local_key, message);
-        return;
+        return DirectSendOutcome::SelfDelivered;
     }
     let peer_id = shared.peer_map.read().unwrap().get_peer_id(target).copied();
     let pid = match peer_id {
@@ -2291,7 +2697,7 @@ fn send_direct(
             if let Some(ref m) = shared.metrics {
                 m.pending_sends_enqueued.inc();
             }
-            return;
+            return DirectSendOutcome::Buffered;
         }
     };
     if !swarm.is_connected(&pid) {
@@ -2305,23 +2711,25 @@ fn send_direct(
             m.pending_sends_enqueued.inc();
         }
         let _ = swarm.dial(pid);
-        return;
+        return DirectSendOutcome::Buffered;
     }
-    if let Ok(payload) = message.try_to_vec() {
-        let req = DirectRequest {
-            sender_key: local_key.to_bytes(),
-            payload,
-        };
-        let req_id = swarm.behaviour_mut().direct.send_request(&pid, req);
-        shared
-            .outbound_direct
-            .lock()
-            .unwrap()
-            .insert(req_id, (*target, message));
-        if let Some(ref m) = shared.metrics {
-            m.gossip_messages_sent.inc();
-        }
+    let Ok(payload) = message.try_to_vec() else {
+        return DirectSendOutcome::EncodeFailed;
+    };
+    let req = DirectRequest {
+        sender_key: local_key.to_bytes(),
+        payload,
+    };
+    let req_id = swarm.behaviour_mut().direct.send_request(&pid, req);
+    shared
+        .outbound_direct
+        .lock()
+        .unwrap()
+        .insert(req_id, (*target, message));
+    if let Some(ref m) = shared.metrics {
+        m.gossip_messages_sent.inc();
     }
+    DirectSendOutcome::Sent
 }
 
 /// Maximum number of inbound consensus messages before backpressure (Batch EK: CONS-FIND-10).
@@ -2428,18 +2836,95 @@ fn enqueue_native_da_shard(shared: &SharedState, source: Vec<u8>, resp: NativeDa
     queue.push_back((source, stored));
 }
 
-/// Push a message to the inbound queue with capacity enforcement.
+/// Push a message to the inbound queue with capacity enforcement. Returns
+/// whether the message was actually enqueued (false = dropped on a full
+/// queue) so the B2 dedup only records DELIVERED messages.
 fn enqueue_inbound(
     inbound: &Mutex<VecDeque<(VerifyingKey, hotstuff_rs::networking::messages::Message)>>,
     sender: VerifyingKey,
     msg: hotstuff_rs::networking::messages::Message,
-) {
+) -> bool {
     let mut queue = inbound.lock().unwrap();
     if queue.len() >= MAX_INBOUND_QUEUE {
         warn!("inbound queue full ({MAX_INBOUND_QUEUE}), dropping incoming message");
-        return;
+        return false;
     }
     queue.push_back((sender, msg));
+    true
+}
+
+/// Outcome of a consensus-message enqueue attempt (B2).
+#[derive(Debug, PartialEq, Eq)]
+enum ConsensusEnqueue {
+    Enqueued,
+    /// Dual-path duplicate (direct fan + gossip mirror) — already enqueued once.
+    Duplicate,
+    /// Inbound queue at capacity — dropped, and deliberately NOT marked seen:
+    /// a later rebroadcast of the same bytes must still be deliverable.
+    QueueFull,
+}
+
+/// Enqueue an inbound consensus message with the B2 dual-path dedup applied.
+/// `payload` is the borsh encoding of `msg` exactly as received on the wire —
+/// byte-identical on the gossip and direct paths, which is what makes the
+/// `(sender, hash)` key work. The dedup is active only while
+/// `consensus_direct_fan` is on: with the fan off (default) this is
+/// exact-today behavior, including today's duplicate tolerance for pacemaker
+/// rebroadcasts.
+fn enqueue_consensus_inbound(
+    shared: &SharedState,
+    sender: VerifyingKey,
+    msg: hotstuff_rs::networking::messages::Message,
+    payload: &[u8],
+) -> ConsensusEnqueue {
+    if shared.consensus_direct_fan
+        && shared
+            .consensus_dedup
+            .lock()
+            .unwrap()
+            .contains(&sender, payload)
+    {
+        if let Some(ref m) = shared.metrics {
+            m.consensus_dedup_dropped.inc();
+        }
+        return ConsensusEnqueue::Duplicate;
+    }
+    if !enqueue_inbound(&shared.inbound, sender, msg) {
+        return ConsensusEnqueue::QueueFull;
+    }
+    if shared.consensus_direct_fan {
+        shared
+            .consensus_dedup
+            .lock()
+            .unwrap()
+            .record(&sender, payload);
+    }
+    ConsensusEnqueue::Enqueued
+}
+
+/// B2: an inbound `/torus/direct` payload that borsh-parses as a hotstuff
+/// consensus [`Message`](hotstuff_rs::networking::messages::Message). This
+/// receive path predates B2 — votes/NewView always arrived here — which is
+/// what makes the direct fan sender-side-only and mixed-fleet safe. Returns
+/// `false` when the payload is not a consensus message so the caller can
+/// penalize the malformed envelope.
+fn handle_consensus_direct(
+    payload: &[u8],
+    sender_vk: VerifyingKey,
+    shared: &SharedState,
+    peer_scoring: &mut PeerScoring,
+    peer: &PeerId,
+) -> bool {
+    let Ok(msg) = hotstuff_rs::networking::messages::Message::try_from_slice(payload) else {
+        return false;
+    };
+    if enqueue_consensus_inbound(shared, sender_vk, msg, payload) == ConsensusEnqueue::Duplicate {
+        debug!(%peer, "dual-path duplicate consensus message (direct after gossip) — dropped");
+    }
+    // The delivery itself was valid either way — dual-path duplicates are a
+    // consequence of OUR mirror config, never the peer's fault.
+    peer_scoring.reward(peer, REWARD_BLOCK_RELAY);
+    true
 }
 
 fn handle_consensus_gossip(
@@ -2468,7 +2953,13 @@ fn handle_consensus_gossip(
 
     match hotstuff_rs::networking::messages::Message::try_from_slice(msg_bytes) {
         Ok(msg) => {
-            enqueue_inbound(&shared.inbound, sender_vk, msg);
+            if enqueue_consensus_inbound(shared, sender_vk, msg, msg_bytes)
+                == ConsensusEnqueue::Duplicate
+            {
+                debug!(%source, "dual-path duplicate consensus message (gossip after direct) — dropped");
+            }
+            // Relaying was valid regardless — the duplicate is a consequence
+            // of OUR dual-path config, never the relayer's fault.
             peer_scoring.reward(source, REWARD_BLOCK_RELAY);
         }
         Err(e) => {
@@ -2739,6 +3230,13 @@ mod tests {
     }
 
     fn test_shared() -> SharedState {
+        // Defaults mirror `NetworkConfig::default()`: fan OFF, mirror ON —
+        // i.e. exact-today behavior.
+        test_shared_b2(false, true)
+    }
+
+    /// B2: a [`SharedState`] with the consensus-isolation flags set explicitly.
+    fn test_shared_b2(consensus_direct_fan: bool, consensus_gossip_mirror: bool) -> SharedState {
         SharedState {
             inbound: Mutex::new(VecDeque::new()),
             peer_map: RwLock::new(PeerMap::default()),
@@ -2760,6 +3258,11 @@ mod tests {
             redial_backoff: Mutex::new(HashMap::new()),
             allow_private_addrs: false,
             pending_da_fetches: Mutex::new(PendingSendQueue::new(DA_FETCH_QUEUE_CAP)),
+            consensus_direct_fan,
+            consensus_gossip_mirror,
+            consensus_dedup: Mutex::new(ConsensusDedup::with_cap(CONSENSUS_DEDUP_CAP)),
+            outbound_forward_batches: Mutex::new(HashMap::new()),
+            leader_resolver: RwLock::new(None),
         }
     }
 
@@ -3597,5 +4100,509 @@ mod tests {
         assert_eq!(stored.k, 4);
         assert_eq!(stored.n, 6);
         assert_eq!(stored.body_len, 99);
+    }
+
+    // ------------------------------------------------------------------
+    // B2 — consensus isolation: broadcasts off gossipsub onto the
+    // /torus/direct unicast fan (design §2). All RED before B2 lands.
+    // ------------------------------------------------------------------
+
+    /// A consensus message value for exercising the broadcast/receive seams —
+    /// the variant is irrelevant, only bytes-identity matters for the dedup.
+    fn test_consensus_message() -> hotstuff_rs::networking::messages::Message {
+        hotstuff_rs::networking::messages::Message::BlockSyncMessage(
+            hotstuff_rs::block_sync::messages::BlockSyncMessage::block_sync_request(
+                hotstuff_rs::types::data_types::ChainID::new(9),
+                hotstuff_rs::types::data_types::BlockHeight::new(7),
+                4,
+            ),
+        )
+    }
+
+    /// A one-shot-per-view HotStuff protocol message (a `Nudge`) — the message
+    /// class the B2 dual-path dedup MUST cover: never rebroadcast
+    /// byte-identically, so a repeat can only be the mirror/fan duplicate.
+    fn test_hotstuff_nudge_message() -> hotstuff_rs::networking::messages::Message {
+        hotstuff_rs::hotstuff::messages::HotStuffMessage::Nudge(
+            hotstuff_rs::hotstuff::messages::Nudge {
+                chain_id: hotstuff_rs::types::data_types::ChainID::new(9),
+                view: hotstuff_rs::types::data_types::ViewNumber::new(7),
+                justify: hotstuff_rs::hotstuff::types::PhaseCertificate::genesis_pc(),
+            },
+        )
+        .into()
+    }
+
+    /// A pacemaker message (an `AdvanceView`) — the message class the pacemaker
+    /// REBROADCASTS byte-identically on a timer (TimeoutVote every view-timeout
+    /// until a TC forms, AdvanceView re-sends): the receiver's designed
+    /// loss-recovery is exactly that redelivery, so the dedup must NEVER
+    /// suppress it.
+    fn test_pacemaker_message() -> hotstuff_rs::networking::messages::Message {
+        hotstuff_rs::pacemaker::messages::PacemakerMessage::advance_view(
+            hotstuff_rs::pacemaker::messages::ProgressCertificate::PhaseCertificate(
+                hotstuff_rs::hotstuff::types::PhaseCertificate::genesis_pc(),
+            ),
+        )
+        .into()
+    }
+
+    /// A swarm over a dummy transport: no peer is ever connected, so every fan
+    /// send lands in `pending_sends` (the vote-path buffering seam) — which is
+    /// exactly what makes the fan observable without a live network.
+    fn test_swarm() -> Swarm<TorusBehaviour> {
+        use libp2p::core::transport::Transport as _;
+        let key = libp2p::identity::Keypair::generate_ed25519();
+        let behaviour = TorusBehaviour::new(&key).expect("build behaviour");
+        let transport = libp2p::core::transport::dummy::DummyTransport::<(
+            PeerId,
+            libp2p::core::muxing::StreamMuxerBox,
+        )>::new();
+        Swarm::new(
+            transport.boxed(),
+            behaviour,
+            key.public().to_peer_id(),
+            libp2p::swarm::Config::with_tokio_executor(),
+        )
+    }
+
+    /// B2 (RED first): the direct-fan target set is the intersection of the
+    /// registered validator set and the peer map (same resolution as
+    /// `fan_native_push`), excluding self (self-delivery stays the loopback
+    /// enqueue) and excluding mapped non-validators (observers/RPC nodes stay
+    /// on the gossip mirror). MUST fail before B2 (no `broadcast_fan_targets`).
+    #[test]
+    fn broadcast_fan_targets_are_mapped_validators_minus_self() {
+        let shared = test_shared_b2(true, true);
+        let local = test_vk(30);
+        let val_a = test_vk(31);
+        let val_b = test_vk(32);
+        let observer = test_vk(33); // mapped, NOT in the validator set
+        let unmapped_val = test_vk(34); // validator with no peer-map entry
+
+        {
+            let mut vals = shared.validators.write().unwrap();
+            for vk in [&local, &val_a, &val_b, &unmapped_val] {
+                vals.insert(vk.to_bytes());
+            }
+        }
+        {
+            let mut pm = shared.peer_map.write().unwrap();
+            for (i, vk) in [&local, &val_a, &val_b, &observer].iter().enumerate() {
+                pm.insert(**vk, test_peer(40 + i as u8));
+            }
+        }
+
+        let mut targets = broadcast_fan_targets(&shared, &local);
+        targets.sort_by_key(|vk| vk.to_bytes());
+        let mut expected = vec![val_a, val_b];
+        expected.sort_by_key(|vk| vk.to_bytes());
+        assert_eq!(
+            targets, expected,
+            "fan targets = validators ∩ peer_map, minus self and observers"
+        );
+    }
+
+    /// B2 (RED first): with `consensus_direct_fan` ON, `handle_command(Broadcast)`
+    /// produces one tracked direct send per registered validator — buffered in
+    /// `pending_sends` here because the dummy-transport swarm has no live
+    /// connections (the same seam that re-delivers votes on reconnect) — while
+    /// self-delivery is preserved and mapped non-validators are not fanned to.
+    /// With the flag OFF (the default), no direct sends happen at all:
+    /// exact-today behavior (the documented rollback).
+    #[tokio::test]
+    async fn consensus_direct_fan_one_buffered_send_per_validator() {
+        let local = test_vk(35);
+        let val_a = test_vk(36);
+        let val_b = test_vk(37);
+        let observer = test_vk(38);
+
+        for fan in [true, false] {
+            let shared = test_shared_b2(fan, true);
+            {
+                let mut vals = shared.validators.write().unwrap();
+                for vk in [&local, &val_a, &val_b] {
+                    vals.insert(vk.to_bytes());
+                }
+            }
+            {
+                let mut pm = shared.peer_map.write().unwrap();
+                for vk in [&local, &val_a, &val_b, &observer] {
+                    pm.insert(*vk, crate::bridge::peer_id_from_verifying_key(vk));
+                }
+            }
+            let mut swarm = test_swarm();
+            let topic = gossipsub::IdentTopic::new(CONSENSUS_TOPIC);
+            handle_command(
+                NetworkCommand::Broadcast {
+                    message: test_consensus_message(),
+                },
+                &mut swarm,
+                &shared,
+                &local,
+                &topic,
+            );
+
+            // Self-delivery is preserved in both modes (hotstuff_rs expects the
+            // proposer to receive its own broadcast).
+            let inbound: Vec<_> = shared.inbound.lock().unwrap().drain(..).collect();
+            assert_eq!(
+                inbound.len(),
+                1,
+                "exactly the loopback self-delivery (fan={fan})"
+            );
+            assert_eq!(inbound[0].0, local, "self-delivery sender is the local key");
+
+            let mut pending = shared.pending_sends.lock().unwrap();
+            let expected = usize::from(fan);
+            assert_eq!(
+                pending.flush(&val_a).len(),
+                expected,
+                "one direct send per validator (fan={fan})"
+            );
+            assert_eq!(
+                pending.flush(&val_b).len(),
+                expected,
+                "one direct send per validator (fan={fan})"
+            );
+            assert!(
+                pending.flush(&observer).is_empty(),
+                "mapped non-validators are never fanned to (they ride the mirror)"
+            );
+            assert!(pending.flush(&local).is_empty(), "no direct send to self");
+        }
+    }
+
+    /// B2 dedup (RED first): the same consensus payload arriving via BOTH the
+    /// gossip mirror and the direct fan is enqueued exactly ONCE when the fan
+    /// is enabled — and, rollback-critical, TWICE with the fan off (exact-today
+    /// duplicate tolerance, e.g. pacemaker rebroadcasts). Exercises the REAL
+    /// receive seams (`handle_consensus_gossip` / `handle_consensus_direct`)
+    /// in both arrival orders. MUST fail before B2 (no dedup, no
+    /// `handle_consensus_direct`).
+    #[test]
+    fn dedup_same_payload_via_both_paths_enqueues_once() {
+        for (fan, expected) in [(true, 1usize), (false, 2usize)] {
+            for direct_first in [false, true] {
+                let shared = test_shared_b2(fan, true);
+                let sender = test_vk(50);
+                let peer = test_peer(50);
+                shared.peer_map.write().unwrap().insert(sender, peer);
+                let mut scoring = PeerScoring::new(None);
+
+                let msg_bytes = test_hotstuff_nudge_message().try_to_vec().unwrap();
+                let mut envelope = sender.to_bytes().to_vec();
+                envelope.extend_from_slice(&msg_bytes);
+
+                let deliver_gossip = |scoring: &mut PeerScoring| {
+                    handle_consensus_gossip(&envelope, &shared, scoring, &peer);
+                };
+                let deliver_direct = |scoring: &mut PeerScoring| {
+                    assert!(
+                        handle_consensus_direct(&msg_bytes, sender, &shared, scoring, &peer),
+                        "a hotstuff message must be consumed by the direct branch"
+                    );
+                };
+                if direct_first {
+                    deliver_direct(&mut scoring);
+                    deliver_gossip(&mut scoring);
+                } else {
+                    deliver_gossip(&mut scoring);
+                    deliver_direct(&mut scoring);
+                }
+
+                assert_eq!(
+                    shared.inbound.lock().unwrap().len(),
+                    expected,
+                    "fan={fan} direct_first={direct_first}: dedup swallows the \
+                     dual-path duplicate ONLY when the fan is on"
+                );
+            }
+        }
+    }
+
+    /// B2 dedup SCOPE (verifier fix, RED first): the dedup must apply ONLY to
+    /// one-shot-per-view HotStuff protocol messages. Pacemaker messages
+    /// (TimeoutVote / AdvanceView) are rebroadcast BYTE-IDENTICALLY on a timer
+    /// (deterministic ed25519 over unchanged inputs during a stall —
+    /// `pacemaker/implementation.rs` tick: epoch-change views EXTEND and
+    /// re-broadcast the same TimeoutVote until a TC forms), and block-sync
+    /// advertisements re-send identical bytes every ~10 s while the chain is
+    /// stalled. The receiving side RELIES on those redeliveries: the
+    /// progress-message buffer evicts future-view messages under pressure
+    /// (`networking/receiving.rs`) and the timeout-vote collector only
+    /// collects votes for its current view (`pacemaker/types.rs` collect) —
+    /// the rebroadcast is the designed recovery. During a stall the LRU
+    /// barely churns (only pacemaker traffic), so a suppressed rebroadcast
+    /// stays suppressed ~indefinitely → liveness stall with the fan on.
+    /// Duplicates of these messages are cheap and fully idempotent (bracha
+    /// voter set, per-signer collectors, register_or_update sync server), so
+    /// passing them through is safe — it is also exactly today's gossip
+    /// behavior (gossipsub message-ids are (source, seqno): rebroadcasts get
+    /// fresh seqnos and are delivered, not deduped).
+    #[test]
+    fn dedup_exempts_timer_rebroadcast_message_types() {
+        // (message, dedup_applies?, name)
+        let cases = [
+            (test_hotstuff_nudge_message(), true, "hotstuff nudge"),
+            (test_pacemaker_message(), false, "pacemaker advance-view"),
+            (test_consensus_message(), false, "block-sync message"),
+        ];
+        for (msg, deduped, name) in cases {
+            let shared = test_shared_b2(true, true);
+            let sender = test_vk(54);
+            let peer = test_peer(54);
+            shared.peer_map.write().unwrap().insert(sender, peer);
+            let mut scoring = PeerScoring::new(None);
+
+            let msg_bytes = msg.try_to_vec().unwrap();
+            // Same bytes delivered twice via the direct path — a pacemaker
+            // rebroadcast after the first copy was lost inside hotstuff
+            // (progress-buffer eviction), or a dual-path duplicate for a
+            // one-shot message. Only the latter may be suppressed.
+            for _ in 0..2 {
+                assert!(
+                    handle_consensus_direct(&msg_bytes, sender, &shared, &mut scoring, &peer),
+                    "{name}: consensus message must be consumed by the direct branch"
+                );
+            }
+            let expected = if deduped { 1 } else { 2 };
+            assert_eq!(
+                shared.inbound.lock().unwrap().len(),
+                expected,
+                "{name}: timer-rebroadcast message classes must NOT be deduped \
+                 (fan on); one-shot hotstuff messages must be"
+            );
+        }
+    }
+
+    /// B2: the dedup LRU is bounded — at capacity the OLDEST key is evicted (a
+    /// long-evicted payload is accepted again) while a fresh duplicate inside
+    /// the window is still suppressed. Guards against unbounded memory on the
+    /// hot receive path.
+    #[test]
+    fn consensus_dedup_lru_is_bounded_and_evicts_oldest() {
+        let sender = test_vk(51);
+        let mut dedup = ConsensusDedup::with_cap(4);
+        assert!(!dedup.contains(&sender, b"m0"), "unseen payload passes");
+        dedup.record(&sender, b"m0");
+        assert!(
+            dedup.contains(&sender, b"m0"),
+            "inside the window: duplicate detected"
+        );
+        for i in 1..=4u8 {
+            dedup.record(&sender, &[b'm', b'0' + i]);
+        }
+        assert!(
+            !dedup.contains(&sender, b"m0"),
+            "oldest key is evicted once the cap is exceeded"
+        );
+        assert!(dedup.contains(&sender, b"m4"), "newest key is retained");
+    }
+
+    /// B2: the dedup key includes the SENDER — identical payload bytes from two
+    /// different validators are two distinct messages, never cross-deduped.
+    #[test]
+    fn consensus_dedup_is_per_sender() {
+        let mut dedup = ConsensusDedup::with_cap(8);
+        dedup.record(&test_vk(52), b"payload");
+        assert!(
+            !dedup.contains(&test_vk(53), b"payload"),
+            "same bytes from a different sender must not be suppressed"
+        );
+    }
+
+    /// B2 (RED first): the gossip-mirror decision matrix. Fan OFF ⇒ ALWAYS
+    /// publish (exact-today behavior — the mirror flag is meaningless without
+    /// the fan, and (off, off) must never silently mute consensus). Fan ON ⇒
+    /// the mirror flag decides: default ON keeps observers and not-yet-flipped
+    /// nodes fed; OFF is the fully-isolated end-state (design test plan (c):
+    /// mirror off ⇒ no gossip publish).
+    #[test]
+    fn gossip_mirror_decision_matrix() {
+        assert!(should_gossip_broadcast(false, true), "today: gossip on");
+        assert!(
+            should_gossip_broadcast(false, false),
+            "fan off ⇒ mirror flag ignored (no silent consensus mute)"
+        );
+        assert!(
+            should_gossip_broadcast(true, true),
+            "staged rollout: fan + mirror both on"
+        );
+        assert!(
+            !should_gossip_broadcast(true, false),
+            "end-state: fan on + mirror off ⇒ NO gossip publish"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // B1 — batched direct-to-leader forward envelope (design §1). All RED
+    // before B1 lands.
+    // ------------------------------------------------------------------
+
+    /// A signed native action with a distinguishing nonce (signature bytes are
+    /// irrelevant here — the envelope carries them opaquely).
+    fn test_native_action(nonce: u64) -> torus_types::SignedNativeAction {
+        use torus_types::{ActionSignature, NativeAction, Signature, SignedNativeAction};
+        SignedNativeAction {
+            action: NativeAction::ClaimRewards,
+            nonce,
+            signature: ActionSignature::Eip712(Signature {
+                v: 27,
+                r: [0u8; 32],
+                s: [0u8; 32],
+            }),
+        }
+    }
+
+    fn test_addr(seed: u8) -> torus_types::Address {
+        torus_types::Address::from([seed; 20])
+    }
+
+    /// B1 (RED first): the forward envelope is BYTE-IDENTICAL to the 0xFD
+    /// pre-proposal batch (`0xFD ‖ bincode(Vec<(Address, SignedNativeAction)>)`,
+    /// produced at torus-node main.rs), and round-trips through the SAME
+    /// receive decode the swarm's Direct request arm uses — so every deployed
+    /// binary already accepts it (mixed-fleet safe by construction, no new
+    /// marker, no version byte). MUST fail before B1 (no `encode_forward_batch`
+    /// / `decode_pre_proposal_batch`).
+    #[test]
+    fn forward_batch_envelope_roundtrips_through_receive_decode() {
+        let pairs = vec![
+            (test_addr(1), test_native_action(11)),
+            (test_addr(2), test_native_action(22)),
+        ];
+        let envelope = encode_forward_batch(&pairs).expect("encode");
+
+        // Wire identity with the shipped pre-proposal batch push.
+        let mut expected = vec![PRE_PROPOSAL_BATCH_MARKER];
+        expected.extend_from_slice(&bincode::serialize(&pairs).unwrap());
+        assert_eq!(
+            envelope, expected,
+            "forward envelope must be byte-identical to the 0xFD pre-proposal batch"
+        );
+
+        // Round-trip through the receive seam (the Direct request arm strips
+        // the marker byte and decodes the rest).
+        let decoded = decode_pre_proposal_batch(&envelope[1..]).expect("decode");
+        assert_eq!(decoded.len(), pairs.len());
+        for ((da, dact), (ea, eact)) in decoded.iter().zip(&pairs) {
+            assert_eq!(da, ea, "sender address round-trips");
+            assert_eq!(
+                torus_types::compute_action_hash(dact),
+                torus_types::compute_action_hash(eact),
+                "action round-trips"
+            );
+        }
+
+        // Garbage after the marker fails decode (the receive arm warns + drops).
+        assert!(decode_pre_proposal_batch(b"\x01\x02not-bincode").is_err());
+    }
+
+    /// B1 (RED first): unlike today's 0xFE per-action forward (which bypasses
+    /// every bound), the batch envelope is routed THROUGH the PushScheduler —
+    /// it consumes an in-flight slot — and is tracked in the envelope-retry
+    /// map (attempt 0) so an `OutboundFailure` can retry it against the
+    /// re-resolved leader. MUST fail before B1 (no
+    /// `NetworkCommand::ForwardNativeActionBatch`, no
+    /// `outbound_forward_batches`).
+    #[tokio::test]
+    async fn forward_batch_consumes_push_scheduler_capacity_and_is_retry_tracked() {
+        let shared = test_shared();
+        let local = test_vk(61);
+        let leader = test_vk(60);
+        shared
+            .peer_map
+            .write()
+            .unwrap()
+            .insert(leader, test_peer(60));
+        let mut swarm = test_swarm();
+        let topic = gossipsub::IdentTopic::new(CONSENSUS_TOPIC);
+
+        handle_command(
+            NetworkCommand::ForwardNativeActionBatch {
+                target: leader,
+                pairs: vec![(test_addr(1), test_native_action(1))],
+            },
+            &mut swarm,
+            &shared,
+            &local,
+            &topic,
+        );
+
+        assert_eq!(
+            shared.push_scheduler.lock().unwrap().inflight_len(),
+            1,
+            "the envelope must consume PushScheduler capacity (0xFE bypassed it)"
+        );
+        let tracked = shared.outbound_forward_batches.lock().unwrap();
+        assert_eq!(tracked.len(), 1, "envelope tracked for retry");
+        let inflight = tracked.values().next().unwrap();
+        assert_eq!(inflight.attempt, 0);
+        assert_eq!(inflight.target, leader);
+        assert_eq!(
+            inflight.envelope.first(),
+            Some(&PRE_PROPOSAL_BATCH_MARKER),
+            "tracked payload is the 0xFD envelope"
+        );
+    }
+
+    /// B1: an envelope whose leader is not in the peer map is DROPPED (with
+    /// the drop metric), never queued — the mempool retains every action and
+    /// the re-forward sweep re-sends to the current leader, so buffering here
+    /// would only duplicate that recovery.
+    #[tokio::test]
+    async fn forward_batch_to_unmapped_leader_is_dropped_not_queued() {
+        let shared = test_shared();
+        let mut swarm = test_swarm();
+        let topic = gossipsub::IdentTopic::new(CONSENSUS_TOPIC);
+        handle_command(
+            NetworkCommand::ForwardNativeActionBatch {
+                target: test_vk(62), // never mapped
+                pairs: vec![(test_addr(1), test_native_action(1))],
+            },
+            &mut swarm,
+            &shared,
+            &test_vk(63),
+            &topic,
+        );
+        assert_eq!(shared.push_scheduler.lock().unwrap().inflight_len(), 0);
+        assert!(shared.outbound_forward_batches.lock().unwrap().is_empty());
+    }
+
+    /// B1 (RED first): the retry policy on `OutboundFailure` of a tracked
+    /// forward envelope — retry ≤ [`FORWARD_BATCH_MAX_RETRIES`] times against
+    /// the CURRENT leader (re-resolved via the installed callback; the
+    /// admission-time target is only the fallback), then drop (the mempool
+    /// retains; the sweep re-sends). MUST fail before B1 (no
+    /// `plan_forward_batch_retry`).
+    #[test]
+    fn forward_batch_retry_re_resolves_leader_and_caps_attempts() {
+        let orig = test_vk(64);
+        let new_leader = test_vk(65);
+        let mk = |attempt| ForwardBatchInFlight {
+            target: orig,
+            envelope: vec![PRE_PROPOSAL_BATCH_MARKER, 7],
+            attempt,
+        };
+
+        // First failure: re-resolved leader wins over the stale target.
+        let (target, envelope, attempt) =
+            plan_forward_batch_retry(mk(0), Some(new_leader)).expect("first failure retries");
+        assert_eq!(target, new_leader, "retry goes to the CURRENT leader");
+        assert_eq!(envelope, vec![PRE_PROPOSAL_BATCH_MARKER, 7]);
+        assert_eq!(attempt, 1);
+
+        // No resolver installed: fall back to the original target.
+        let (target, _, attempt) =
+            plan_forward_batch_retry(mk(1), None).expect("second failure retries");
+        assert_eq!(target, orig);
+        assert_eq!(attempt, 2);
+
+        // Attempts exhausted: drop.
+        assert!(
+            plan_forward_batch_retry(mk(FORWARD_BATCH_MAX_RETRIES), Some(new_leader)).is_none(),
+            "≤ {FORWARD_BATCH_MAX_RETRIES} retries, then drop with metric"
+        );
     }
 }

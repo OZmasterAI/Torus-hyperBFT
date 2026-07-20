@@ -53,19 +53,35 @@ pub struct TorusBehaviour {
 /// than designed.
 pub const DEFAULT_GOSSIPSUB_HEARTBEAT_MS: u64 = 100;
 
-/// Build the consensus gossipsub config with the given heartbeat interval and
-/// transport frame cap. Extracted (and unit-tested) so neither value can
-/// silently drift from its source of truth again — S391: this site hardcoded
-/// a 500ms heartbeat while config said 100ms; O5: it hardcoded a 2 MiB frame
-/// cap while the accept gates it must dominate live in `NetworkConfig`
-/// (ladder ordering asserted in `caps::tests`).
+/// Default per-peer connection-handler send-queue length (B3 send-queue
+/// hygiene). libp2p's own default is 5000, of which len/2 = 2500 is the
+/// priority-queue soft cap — i.e. up to 2500 queued `Publish` messages PER
+/// PEER, shared across ALL topics, with queued publishes silently abandoned
+/// after 5 s. A 1–3 KB consensus proposal sits FIFO behind megabytes of
+/// queued 128 KB native-action batches and gets dropped invisibly (the
+/// observed 21.5 → 1.15 blk/s collapse). 512 bounds the per-peer backlog to
+/// 256 publishes ≈ 32 MB worst-case ≈ ~250 ms at 1 Gbps: overload becomes
+/// fast, VISIBLE drops (SlowPeer / AllQueuesFull counters) instead of 5 s of
+/// bufferbloat. Rollback to exact-today behavior: `TORUS_GOSSIP_QUEUE_LEN=5000`.
+pub const DEFAULT_GOSSIPSUB_QUEUE_LEN: usize = 512;
+
+/// Build the consensus gossipsub config with the given heartbeat interval,
+/// transport frame cap, and per-peer connection-handler queue length.
+/// Extracted (and unit-tested) so none of these values can silently drift
+/// from their source of truth again — S391: this site hardcoded a 500ms
+/// heartbeat while config said 100ms; O5: it hardcoded a 2 MiB frame cap
+/// while the accept gates it must dominate live in `NetworkConfig` (ladder
+/// ordering asserted in `caps::tests`); B3: it silently inherited libp2p's
+/// 5000-deep per-peer send queue (5 s of invisible head-of-line blocking).
 pub fn gossipsub_config(
     heartbeat_ms: u64,
     max_transmit: usize,
+    queue_len: usize,
 ) -> Result<gossipsub::Config, String> {
     gossipsub::ConfigBuilder::default()
         .heartbeat_interval(Duration::from_millis(heartbeat_ms))
         .max_transmit_size(max_transmit)
+        .connection_handler_queue_len(queue_len)
         .validation_mode(gossipsub::ValidationMode::Strict)
         .build()
         .map_err(|e| format!("gossipsub config: {e}"))
@@ -85,6 +101,9 @@ impl TorusBehaviour {
             max_peers,
             DEFAULT_GOSSIPSUB_HEARTBEAT_MS,
             crate::caps::GOSSIP_MAX_TRANSMIT_SIZE,
+            // Env-honoring, same as `NetworkConfig::default()` — the fallback
+            // constructors must match a default-configured node.
+            crate::config::gossip_queue_len(),
         )
     }
 
@@ -93,11 +112,16 @@ impl TorusBehaviour {
         max_peers: usize,
         gossipsub_heartbeat_ms: u64,
         gossip_max_transmit: usize,
+        gossipsub_queue_len: usize,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let peer_id = key.public().to_peer_id();
 
         // GossipSub
-        let gossipsub_config = gossipsub_config(gossipsub_heartbeat_ms, gossip_max_transmit)?;
+        let gossipsub_config = gossipsub_config(
+            gossipsub_heartbeat_ms,
+            gossip_max_transmit,
+            gossipsub_queue_len,
+        )?;
         let gossipsub = gossipsub::Behaviour::new(
             gossipsub::MessageAuthenticity::Signed(key.clone()),
             gossipsub_config,
@@ -223,11 +247,19 @@ mod tests {
     /// heartbeat must come from the caller.
     #[test]
     fn gossipsub_heartbeat_comes_from_caller() {
-        let cfg = gossipsub_config(100, crate::caps::GOSSIP_MAX_TRANSMIT_SIZE)
-            .expect("build gossipsub config");
+        let cfg = gossipsub_config(
+            100,
+            crate::caps::GOSSIP_MAX_TRANSMIT_SIZE,
+            DEFAULT_GOSSIPSUB_QUEUE_LEN,
+        )
+        .expect("build gossipsub config");
         assert_eq!(cfg.heartbeat_interval(), Duration::from_millis(100));
-        let cfg = gossipsub_config(500, crate::caps::GOSSIP_MAX_TRANSMIT_SIZE)
-            .expect("build gossipsub config");
+        let cfg = gossipsub_config(
+            500,
+            crate::caps::GOSSIP_MAX_TRANSMIT_SIZE,
+            DEFAULT_GOSSIPSUB_QUEUE_LEN,
+        )
+        .expect("build gossipsub config");
         assert_eq!(cfg.heartbeat_interval(), Duration::from_millis(500));
     }
 
@@ -265,6 +297,7 @@ mod tests {
             50,
             250,
             crate::caps::GOSSIP_MAX_TRANSMIT_SIZE,
+            DEFAULT_GOSSIPSUB_QUEUE_LEN,
         )
         .expect("behaviour with custom heartbeat");
     }
@@ -274,10 +307,47 @@ mod tests {
     /// stay byte-identical to the shipped 2 MiB behavior.
     #[test]
     fn gossipsub_transmit_cap_is_configurable_not_hardcoded() {
-        let cfg = gossipsub_config(100, 3 * 1024 * 1024).expect("build gossipsub config");
-        assert_eq!(cfg.max_transmit_size(), 3 * 1024 * 1024);
-        let default_cfg = gossipsub_config(100, crate::caps::GOSSIP_MAX_TRANSMIT_SIZE)
+        let cfg = gossipsub_config(100, 3 * 1024 * 1024, DEFAULT_GOSSIPSUB_QUEUE_LEN)
             .expect("build gossipsub config");
+        assert_eq!(cfg.max_transmit_size(), 3 * 1024 * 1024);
+        let default_cfg = gossipsub_config(
+            100,
+            crate::caps::GOSSIP_MAX_TRANSMIT_SIZE,
+            DEFAULT_GOSSIPSUB_QUEUE_LEN,
+        )
+        .expect("build gossipsub config");
         assert_eq!(default_cfg.max_transmit_size(), 2 * 1024 * 1024);
+    }
+
+    /// B3 (send-queue hygiene): `connection_handler_queue_len` must come from
+    /// the caller, not libp2p's silent 5000 default — the default queue holds
+    /// up to 2500 queued Publish messages per peer (len/2 soft cap), i.e.
+    /// megabytes of bulk a 1–3 KB proposal sits FIFO behind for up to the 5 s
+    /// publish abandonment window. Mirrors the S391 heartbeat test: the value
+    /// must be config-wired so it can never silently drift again.
+    #[test]
+    fn gossipsub_queue_len_comes_from_caller() {
+        let cfg = gossipsub_config(100, crate::caps::GOSSIP_MAX_TRANSMIT_SIZE, 512)
+            .expect("build gossipsub config");
+        assert_eq!(cfg.connection_handler_queue_len(), 512);
+        // 5000 is libp2p's own default: TORUS_GOSSIP_QUEUE_LEN=5000 must
+        // restore exact-today behavior (the documented B3 rollback).
+        let cfg = gossipsub_config(100, crate::caps::GOSSIP_MAX_TRANSMIT_SIZE, 5000)
+            .expect("build gossipsub config");
+        assert_eq!(cfg.connection_handler_queue_len(), 5000);
+    }
+
+    /// The crate default and NetworkConfig's default must be the same value
+    /// (single source of truth), same contract as the heartbeat test above.
+    /// 512 is the B3 hygiene default: priority soft cap 256 publishes/peer
+    /// ≈ 32 MB worst-case of 128 KB batches — bounded latency instead of 5 s
+    /// of invisible backlog.
+    #[test]
+    fn network_config_default_queue_len_matches_crate_default() {
+        assert_eq!(DEFAULT_GOSSIPSUB_QUEUE_LEN, 512);
+        assert_eq!(
+            crate::config::NetworkConfig::default().gossipsub_queue_len,
+            DEFAULT_GOSSIPSUB_QUEUE_LEN
+        );
     }
 }

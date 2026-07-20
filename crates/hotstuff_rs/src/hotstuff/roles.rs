@@ -274,6 +274,26 @@ pub(crate) fn new_view_recipients(
     )
 }
 
+/// Leader of `view` in a single validator set, using the same reputation-aware
+/// selection the rest of the protocol runs: `select_leader_with_reputation`
+/// when reputation state exists (which internally respects the
+/// [`set_reputation_leader_selection`](crate::pacemaker::implementation::set_reputation_leader_selection)
+/// kill switch), plain [`select_leader`] when it does not.
+///
+/// Surfaced on [`StartViewEvent`](crate::events::StartViewEvent) so external
+/// observers (the RPC leader hint) see the pacemaker's actual choice.
+pub(crate) fn view_leader_with_reputation(
+    view: ViewNumber,
+    validator_set: &crate::types::validator_set::ValidatorSet,
+    reputation: Option<&crate::hotstuff::types::LeaderReputation>,
+) -> VerifyingKey {
+    use crate::pacemaker::implementation::select_leader_with_reputation;
+    match reputation {
+        Some(rep) => select_leader_with_reputation(view, validator_set, rep),
+        None => select_leader(view, validator_set),
+    }
+}
+
 /// FIX CONS-PF-10: Reputation-weighted new_view recipients.
 pub(crate) fn new_view_recipients_with_reputation(
     new_view: &NewView,
@@ -299,4 +319,59 @@ pub(crate) fn new_view_recipients_with_reputation(
             ))
         },
     )
+}
+
+#[cfg(test)]
+mod view_leader_tests {
+    use super::*;
+    use crate::hotstuff::types::LeaderReputation;
+    use crate::pacemaker::implementation::select_leader_with_reputation;
+    use crate::types::{
+        data_types::Power, update_sets::ValidatorSetUpdates, validator_set::ValidatorSet,
+    };
+    use ed25519_dalek::SigningKey;
+
+    fn make_validator_set(n: u8) -> (ValidatorSet, Vec<VerifyingKey>) {
+        let vks: Vec<VerifyingKey> = (0..n)
+            .map(|i| SigningKey::from_bytes(&[i + 1; 32]).verifying_key())
+            .collect();
+        let mut vs = ValidatorSet::new();
+        let mut updates = ValidatorSetUpdates::new();
+        for vk in &vks {
+            updates.insert(*vk, Power::new(1));
+        }
+        vs.apply_updates(&updates);
+        (vs, vks)
+    }
+
+    /// The single-VK view-leader helper (surfaced on `StartViewEvent` for the
+    /// RPC leader hint) must be byte-for-byte the protocol's own selection:
+    /// `select_leader_with_reputation` when reputation state exists, plain
+    /// `select_leader` when it does not. Covers views on both sides of the
+    /// reputation warm-up boundary (view 20).
+    #[test]
+    fn view_leader_with_reputation_matches_protocol_selection() {
+        let (vs, vks) = make_validator_set(4);
+        // Skewed reputation: vks[0] times out constantly.
+        let mut rep = LeaderReputation::new(100);
+        for _ in 0..10 {
+            rep.record_timeout(&vks[0]);
+            rep.record_success(&vks[1]);
+            rep.record_success(&vks[2]);
+            rep.record_success(&vks[3]);
+        }
+        for v in 0..40u64 {
+            let view = ViewNumber::new(v);
+            assert_eq!(
+                view_leader_with_reputation(view, &vs, Some(&rep)),
+                select_leader_with_reputation(view, &vs, &rep),
+                "view {v}: Some(rep) must delegate to select_leader_with_reputation"
+            );
+            assert_eq!(
+                view_leader_with_reputation(view, &vs, None),
+                select_leader(view, &vs),
+                "view {v}: None must delegate to plain select_leader"
+            );
+        }
+    }
 }

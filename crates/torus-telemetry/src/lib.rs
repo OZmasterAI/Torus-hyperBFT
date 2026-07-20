@@ -301,6 +301,60 @@ pub struct Metrics {
     /// Proves the shipped body zstd (`/torus/{direct,block-data,native-da}/2.0`)
     /// is live on-wire and by how much (T3.2).
     pub wire_compression_bytes: Family<Vec<(String, String)>, Gauge>,
+
+    // B3 send-queue hygiene — gossipsub's per-peer send-queue failure modes,
+    // previously visible only as debug logs (the smoking gun of the proposal
+    // HoL-blocking collapse made countable).
+    /// Gossipsub `SlowPeer` events: heartbeats in which a peer's send queue
+    /// dropped or timed out messages. Must stay ~0; a sustained rate names
+    /// the overloaded/underprovisioned peer link.
+    pub gossipsub_slow_peer_events: Counter,
+    /// Messages gossipsub failed to deliver to a slow peer, by kind
+    /// (label `kind` = publish|forward|priority|non_priority|timeout),
+    /// accumulated from `SlowPeer.failed_messages`. `timeout` = queued
+    /// publishes abandoned after the 5 s window — the silent proposal killer.
+    pub gossipsub_slow_peer_failed_messages: Family<Vec<(String, String)>, Counter>,
+    /// Gossipsub publishes rejected with `AllQueuesFull` (every recipient's
+    /// send queue was full — with flood_publish this means the WHOLE fan-out
+    /// failed, not one peer). Partial per-peer misses show up as SlowPeer.
+    pub gossip_publish_all_queues_full: Counter,
+    /// B2 consensus isolation: direct-fan sends fired on a live connection
+    /// (one per validator per broadcast when `TORUS_CONSENSUS_DIRECT_FAN=1`).
+    /// Proof run: this climbs with block production while
+    /// `consensus_timeout_total` stays flat.
+    pub consensus_direct_fan_sent: Counter,
+    /// B2: direct-fan sends buffered for a mapped-but-disconnected (or
+    /// not-yet-mapped) validator, delivered on the `ConnectionEstablished`
+    /// flush. A sustained rate names a flapping/unreachable validator link.
+    pub consensus_direct_fan_buffered: Counter,
+    /// B2: inbound consensus messages dropped as dual-path duplicates by the
+    /// (sender, payload-hash) dedup LRU — the same broadcast arriving via both
+    /// the direct fan and the gossip mirror. Expected to track the mirror's
+    /// delivery rate while both paths are on; zero cost, never a loss signal.
+    pub consensus_dedup_dropped: Counter,
+
+    // B1 batched direct-to-leader forward (design §1).
+    /// RPC-admitted actions whose leader-forward was shed because the BOUNDED
+    /// RPC→batcher channel was full (drop-newest). Recoverable — the action is
+    /// already in the local pool and the re-forward sweep re-sends it — but a
+    /// sustained rate means the batcher/leader link cannot keep up with ingress.
+    pub rpc_forward_dropped_full: Counter,
+    /// 0xFD forward envelopes dispatched to the leader (one per flush window ×
+    /// target, plus retries). Proof run: O(10–200)/s INDEPENDENT of client
+    /// batch shape — vs O(actions/s) on the per-action 0xFE path.
+    pub d2l_envelopes_sent: Counter,
+    /// Forward envelopes re-sent after an `OutboundFailure`, re-targeted at the
+    /// re-resolved CURRENT leader (≤2 retries). Sustained rate names a
+    /// flapping leader link or a stale leader hint.
+    pub d2l_envelopes_retried: Counter,
+    /// Forward envelopes dropped: retries exhausted, leader not in the peer
+    /// map, or PushScheduler queue overflow. Never a loss of the actions —
+    /// the mempool retains them and the re-forward sweep re-sends.
+    pub d2l_envelopes_dropped: Counter,
+    /// Size (bytes) of dispatched forward envelopes — sizes the
+    /// `TORUS_D2L_BATCH_MAX_BYTES` cap against real traffic (design §7 flags
+    /// the per-order bincode size as unmeasured).
+    pub d2l_envelope_bytes: Histogram,
 }
 
 impl Metrics {
@@ -1024,6 +1078,86 @@ impl Metrics {
             wire_compression_bytes.clone(),
         );
 
+        let gossipsub_slow_peer_events = Counter::default();
+        registry.register(
+            "torus_gossipsub_slow_peer_events",
+            "Gossipsub SlowPeer events (heartbeats where a peer's send queue dropped/timed out messages)",
+            gossipsub_slow_peer_events.clone(),
+        );
+
+        let gossipsub_slow_peer_failed_messages =
+            Family::<Vec<(String, String)>, Counter>::default();
+        registry.register(
+            "torus_gossipsub_slow_peer_failed_messages",
+            "Messages gossipsub failed to send to a slow peer, by kind (publish|forward|priority|non_priority|timeout)",
+            gossipsub_slow_peer_failed_messages.clone(),
+        );
+
+        let gossip_publish_all_queues_full = Counter::default();
+        registry.register(
+            "torus_gossip_publish_all_queues_full",
+            "Gossipsub publishes rejected with AllQueuesFull (every recipient send queue full)",
+            gossip_publish_all_queues_full.clone(),
+        );
+
+        let consensus_direct_fan_sent = Counter::default();
+        registry.register(
+            "torus_consensus_direct_fan_sent",
+            "B2 consensus-isolation direct-fan sends fired on a live connection",
+            consensus_direct_fan_sent.clone(),
+        );
+
+        let consensus_direct_fan_buffered = Counter::default();
+        registry.register(
+            "torus_consensus_direct_fan_buffered",
+            "B2 direct-fan sends buffered for a disconnected validator (reconnect flush)",
+            consensus_direct_fan_buffered.clone(),
+        );
+
+        let consensus_dedup_dropped = Counter::default();
+        registry.register(
+            "torus_consensus_dedup_dropped",
+            "Inbound consensus messages dropped as dual-path duplicates (direct fan + gossip mirror)",
+            consensus_dedup_dropped.clone(),
+        );
+
+        let rpc_forward_dropped_full = Counter::default();
+        registry.register(
+            "torus_rpc_forward_dropped_full",
+            "Leader forwards shed because the bounded RPC forward channel was full (B1)",
+            rpc_forward_dropped_full.clone(),
+        );
+
+        let d2l_envelopes_sent = Counter::default();
+        registry.register(
+            "torus_d2l_envelopes_sent",
+            "Batched 0xFD direct-to-leader forward envelopes dispatched (B1)",
+            d2l_envelopes_sent.clone(),
+        );
+
+        let d2l_envelopes_retried = Counter::default();
+        registry.register(
+            "torus_d2l_envelopes_retried",
+            "Forward envelopes re-sent to the re-resolved leader after an outbound failure (B1)",
+            d2l_envelopes_retried.clone(),
+        );
+
+        let d2l_envelopes_dropped = Counter::default();
+        registry.register(
+            "torus_d2l_envelopes_dropped",
+            "Forward envelopes dropped after exhausted retries / unmapped leader / queue overflow (B1)",
+            d2l_envelopes_dropped.clone(),
+        );
+
+        // 1 KB → 4 MB: spans a single-action envelope up to the legacy-fleet
+        // direct-codec floor (the hard send cap).
+        let d2l_envelope_bytes = Histogram::new(exponential_buckets(1024.0, 2.0, 13));
+        registry.register(
+            "torus_d2l_envelope_bytes",
+            "Size in bytes of dispatched direct-to-leader forward envelopes (B1)",
+            d2l_envelope_bytes.clone(),
+        );
+
         Self {
             registry,
             blocks_committed,
@@ -1128,6 +1262,17 @@ impl Metrics {
             rocksdb_pending_compaction_bytes,
             rocksdb_block_cache_bytes,
             wire_compression_bytes,
+            gossipsub_slow_peer_events,
+            gossipsub_slow_peer_failed_messages,
+            gossip_publish_all_queues_full,
+            consensus_direct_fan_sent,
+            consensus_direct_fan_buffered,
+            consensus_dedup_dropped,
+            rpc_forward_dropped_full,
+            d2l_envelopes_sent,
+            d2l_envelopes_retried,
+            d2l_envelopes_dropped,
+            d2l_envelope_bytes,
         }
     }
 
@@ -1323,6 +1468,81 @@ mod tests {
             "torus_consensus_mesh_peers",
             "torus_consensus_subscribed_validators",
             "torus_mesh_watchdog_disconnects",
+        ] {
+            assert!(text.contains(name), "{name} not registered:\n{text}");
+        }
+    }
+
+    /// B3 (send-queue hygiene): gossipsub's per-peer send-queue failure modes
+    /// (SlowPeer events, per-kind failed-message counts, AllQueuesFull publish
+    /// errors) were previously invisible — a proposal silently abandoned after
+    /// 5 s behind bulk showed up only as a debug log. These counters must be
+    /// registered so the drops are on /metrics for the proof run.
+    #[test]
+    fn send_queue_hygiene_metrics_register() {
+        let m = Metrics::new();
+        m.gossipsub_slow_peer_events.inc();
+        m.gossip_publish_all_queues_full.inc();
+        let kind = vec![("kind".to_string(), "publish".to_string())];
+        m.gossipsub_slow_peer_failed_messages
+            .get_or_create(&kind)
+            .inc_by(3);
+        let text = m.encode();
+        for name in [
+            "torus_gossipsub_slow_peer_events",
+            "torus_gossip_publish_all_queues_full",
+            "torus_gossipsub_slow_peer_failed_messages",
+        ] {
+            assert!(text.contains(name), "{name} not registered:\n{text}");
+        }
+        assert!(
+            text.contains("kind=\"publish\""),
+            "failed-messages kind label missing:\n{text}"
+        );
+    }
+
+    /// B2 (consensus isolation): the direct-fan and dual-path-dedup counters
+    /// must be registered — the proof run watches `consensus_direct_fan_sent`
+    /// climb with block production while `consensus_timeout_total` stays flat,
+    /// and `consensus_dedup_dropped` confirms the gossip mirror's duplicates
+    /// are being swallowed rather than double-processed.
+    #[test]
+    fn consensus_isolation_metrics_register() {
+        let m = Metrics::new();
+        m.consensus_direct_fan_sent.inc();
+        m.consensus_direct_fan_buffered.inc();
+        m.consensus_dedup_dropped.inc();
+        let text = m.encode();
+        for name in [
+            "torus_consensus_direct_fan_sent",
+            "torus_consensus_direct_fan_buffered",
+            "torus_consensus_dedup_dropped",
+        ] {
+            assert!(text.contains(name), "{name} not registered:\n{text}");
+        }
+    }
+
+    /// B1 (batched d2l forward): the forward-envelope counters and the
+    /// envelope-size histogram must be registered — the proof run watches
+    /// `d2l_envelopes_sent` sit at O(10–200)/s independent of client batch
+    /// shape, `retried`/`dropped` stay ~0 (a sustained rate names a
+    /// flapping/mis-hinted leader link), and `rpc_forward_dropped_full`
+    /// confirms the now-BOUNDED RPC forward channel is not shedding.
+    #[test]
+    fn d2l_forward_metrics_register() {
+        let m = Metrics::new();
+        m.rpc_forward_dropped_full.inc();
+        m.d2l_envelopes_sent.inc();
+        m.d2l_envelopes_retried.inc();
+        m.d2l_envelopes_dropped.inc();
+        m.d2l_envelope_bytes.observe(65_536.0);
+        let text = m.encode();
+        for name in [
+            "torus_rpc_forward_dropped_full",
+            "torus_d2l_envelopes_sent",
+            "torus_d2l_envelopes_retried",
+            "torus_d2l_envelopes_dropped",
+            "torus_d2l_envelope_bytes",
         ] {
             assert!(text.contains(name), "{name} not registered:\n{text}");
         }
