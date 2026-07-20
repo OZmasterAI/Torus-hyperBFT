@@ -132,3 +132,66 @@ scenario before flipping any default.
 - honest-durability contract: `insert_persist` unchanged (~1–2ms);
   `vote_delay` ≈ 8ms (one grouped dsync). Total mandatory synchronous cost per
   view = one ~7ms dsync — nothing else on the path needs to be synchronous.
+
+## 6. ADDENDUM — inline-body A/B post-mortem (18c cells-inlineab, 2026-07-20)
+
+Fix #1 as implemented (commit 0c3ea78: threshold-gated switch from
+`ProposalHeader` broadcast to full-`Proposal` broadcast) confirmed the latency
+mechanism (idle insert_persist 12.1→0.9ms, proposal_arrival 9.0→3.1ms) but has
+a **liveness defect**: idle views halved (5275→2541, view_duration 41.3→85.5ms)
+and the loaded cell collapsed (0 matched, 124.8s block time, ~2 commits/300s).
+
+### Root cause: the full-Proposal receive path lost three properties the
+### header-first machinery is load-bearing for
+
+1. **View-agnostic delivery.** `ProgressMessageStub::recv` returns a HotStuff
+   message only when `msg.view == cur_view`; future views are buffered, PAST
+   views are silently dropped and purged
+   (crates/hotstuff_rs/src/networking/receiving.rs:146-152, 188-196).
+   `ProposalHeader` is exempt via `is_block_data_msg`
+   (hotstuff/messages.rs:106-113) and its handler checks the proposer against
+   the HEADER's view (implementation.rs:782-787). A full `Proposal` arriving at
+   any replica whose pacemaker already advanced past its view is **dropped
+   forever** — no reprocessing, no fetch fallback. Each such drop burns the
+   view to timeout. Loaded log signature (IB400-on/val0.log): height 943
+   re-proposed in views 958/960/961 at exact view-timeout spacing (2s), then
+   S470 commit-lag backoff balloons deadlines (block_sync retriggers at
+   21:37:34 → 21:39:38 → 21:41:48; commit gap 21:36:31→21:40:47). Idle
+   signature: views halved with leader fraction unchanged.
+
+2. **Vote-before-DA.** On the strict path, `app.validate_block` runs BEFORE
+   the vote; a CompactBlock whose out-of-band bodies are not yet locally
+   durable returns `MissingData` (torus-consensus/src/app.rs:3128-3140) and
+   `on_receive_proposal` silently casts NO vote and drops the proposal — the
+   `if let Valid` has no else arm and none of the pending-header/deferred-body
+   retry machinery engages (implementation.rs:1050-1144). The header path votes
+   first and parks/retries the body. Log proof of the race: proposal (view 966)
+   received at 21:38:39.901 BEFORE its own pre-proposal body batch (.906).
+   This reintroduces exec/DA-before-vote under load — the exact relaxation
+   header-first exists to provide.
+
+3. **Transport-size hypothesis refuted for this bench**: order-carrying
+   proposals are CompactBlocks (~11KB, `native_hashes=100`, push `bytes=11009`)
+   — far under the 1MiB accept gate (torus-network/src/config.rs:216) and 2MiB
+   gossip transmit (caps.rs:47). No `oversized consensus message` warns in
+   val0.log. (A legacy full-TorusBlock inline body could still exceed the 1MiB
+   accept gate; a v2 must cap the threshold regardless.) Leader-side inline
+   branch skips nothing besides the header broadcast — bookkeeping identical.
+
+### Verdict: current mechanism NO-GO; objective REPAIRABLE via v2 = body push
+
+Switching receive paths is architecturally regressive. The v2 that keeps every
+header-first property: leader broadcasts the `ProposalHeader` UNCHANGED and
+immediately pushes the body as an unsolicited `BlockDataResponse` (existing
+wire variant, `is_block_data_msg` = view-exempt) into the existing
+pending-header machinery; receivers vote on the header as today and insert on
+the pushed body with zero fetch RTT. Gate: `TORUS_BODY_PUSH_MAX_BYTES`,
+default 0, hard-capped ≤ 64KB (≪ every transport limit). Honors all three
+constraints: transport-safe, vote stays ahead of DA, empty/tiny blocks only.
+
+**Recommendation for the in-tree code**: revert the inline branch of
+0c3ea78 (`broadcast_proposal_as_header`) and its three tests in the next
+change round — the knob is default-off and inert, but it is a proven
+liveness hazard if ever enabled and should not survive as a footgun. The
+attribution (§1-5) and the recording-network test fixtures remain valid and
+reusable for v2.
