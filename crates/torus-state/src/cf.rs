@@ -138,9 +138,10 @@ pub const CF_HASHED_STORAGE: &str = "cf_hashed_storage";
 /// Replaces the O(total) flat keccak over the 6 native CFs with an O(changed)/block root.
 pub const CF_NATIVE_TRIE: &str = "cf_native_trie";
 /// Bucket-ordered mirror of the 6 native-root CFs (analog of `CF_HASHED_*` for the EVM trie).
-/// Key: `bucket_id(2 BE) ++ cf_tag(1) ++ native_key` -> native value. A prefix-scan on a 2-byte
-/// bucket id yields that bucket's members in `(cf_tag, key)` order, so a changed bucket re-hashes
-/// in O(bucket) instead of O(total). Phase A.
+/// Key: `bucket_id(2 BE) ++ cf_tag(1) ++ native_key` -> `keccak256(native value)` (32 B —
+/// hash-only mirror, 3c preimage round). A prefix-scan on a 2-byte bucket id yields that bucket's
+/// members in `(cf_tag, key)` order, so a changed bucket re-hashes in O(bucket) instead of
+/// O(total). Phase A.
 pub const CF_NATIVE_HASHED: &str = "cf_native_hashed";
 
 /// All column family names. RocksDB requires these at open time.
