@@ -124,6 +124,13 @@ pub(crate) struct HotStuff<N: Network> {
     /// (which does a `block_tree.contains` DB read) to at most one evaluation per
     /// [`BODY_RETRY_INTERVAL`] on the hot algorithm loop.
     last_missing_pc_check: Instant,
+    /// L3 Fix #1 (inline body): body-size threshold in bytes at/below which this
+    /// leader broadcasts the FULL [`Proposal`] instead of a [`ProposalHeader`],
+    /// sparing followers the body-fetch round trip (see
+    /// docs/l3-persist-attribution.md). Read once from
+    /// `TORUS_INLINE_BODY_MAX_BYTES` at construction. 0 = OFF — header-first
+    /// unconditional, exact-today behavior.
+    inline_body_max_bytes: u64,
 }
 
 impl<N: Network> HotStuff<N> {
@@ -163,7 +170,15 @@ impl<N: Network> HotStuff<N> {
             deferred_bodies: PendingBodies::new(),
             proposal_deferred: false,
             last_missing_pc_check: Instant::now(),
+            inline_body_max_bytes: inline_body_max_bytes_from_env(),
         }
+    }
+
+    /// Test-only override of the inline-body threshold, bypassing the
+    /// process-global env cache so each test can pin its own value.
+    #[cfg(test)]
+    pub(crate) fn set_inline_body_max_bytes(&mut self, max_bytes: u64) {
+        self.inline_body_max_bytes = max_bytes;
     }
 
     pub(crate) fn take_sync_needed(&mut self) -> bool {
@@ -636,6 +651,22 @@ impl<N: Network> HotStuff<N> {
     ///   RECOVER is async: sends ProposalRequest/NERequest, stores RecoveryState,
     ///   returns None. The event loop handles responses via on_receive_proposal_response
     ///   and on_receive_ne. If the view timer expires, recovery is abandoned.
+    /// Broadcast `proposal` to the network — header-first by default.
+    ///
+    /// L3 Fix #1 (inline body): when `TORUS_INLINE_BODY_MAX_BYTES` is set (> 0)
+    /// and the proposal's body is at or under the threshold, the FULL
+    /// [`Proposal`] is broadcast instead of a [`ProposalHeader`]. Receivers
+    /// then take the original validate-then-vote path
+    /// ([`on_receive_proposal`](Self::on_receive_proposal)) and never issue a
+    /// `BlockDataRequest`, removing the body-fetch round trip from the next
+    /// leader's critical path (attribution: docs/l3-persist-attribution.md).
+    /// Reuses the existing `HotStuffMessage::Proposal` wire variant that every
+    /// replica already handles — no codec change, mixed fleets interoperate.
+    /// Default 0 = OFF: header-first unconditional, exact-today behavior.
+    ///
+    /// Both branches keep the proposer-side body bookkeeping (`pending_bodies`
+    /// + `store_block_for_serving`) so a straggler's `BlockDataRequest` is
+    /// served identically either way.
     fn broadcast_proposal_as_header(
         &mut self,
         proposal: &Proposal,
@@ -645,6 +676,11 @@ impl<N: Network> HotStuff<N> {
             .insert(proposal.block.hash, proposal.block.clone());
         self.sender_handle
             .store_block_for_serving(proposal.block.hash, proposal.block.clone());
+        if should_inline_body(proposal_body_len(proposal), self.inline_body_max_bytes) {
+            self.sender_handle
+                .broadcast::<HotStuffMessage>(proposal.clone().into());
+            return;
+        }
         let header = ProposalHeader::from_proposal(proposal, has_validator_set_updates);
         self.sender_handle
             .broadcast::<HotStuffMessage>(header.into());
@@ -2481,6 +2517,41 @@ pub(crate) const MAX_BODY_RETRIES: u8 = 2;
 /// rotated across the other validators (Sprint 3 T3 — a non-serving proposer
 /// must not defeat the fetch when another validator holds the body).
 pub(crate) const MAX_BODY_RETRIES_TOTAL: u8 = 9;
+
+/// L3 Fix #1 (inline body): pure parse of `TORUS_INLINE_BODY_MAX_BYTES`. Split
+/// from the env read so the default and the parse are unit-testable without
+/// touching process-global state (same idiom as `parse_sync_wal_toggle` in
+/// torus-state). Unset / unparsable => 0 = OFF (exact-today header-first).
+pub(crate) fn parse_inline_body_max_bytes(raw: Option<String>) -> u64 {
+    raw.and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0)
+}
+
+/// Cached env read of the inline-body threshold (bytes). Read once per
+/// process, at first `HotStuff` construction.
+fn inline_body_max_bytes_from_env() -> u64 {
+    static MAX: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| {
+        parse_inline_body_max_bytes(std::env::var("TORUS_INLINE_BODY_MAX_BYTES").ok())
+    })
+}
+
+/// L3 Fix #1 decision, pure: inline iff the knob is ON (`max_bytes > 0`) and
+/// the body fits (`body_len <= max_bytes`).
+pub(crate) fn should_inline_body(body_len: u64, max_bytes: u64) -> bool {
+    max_bytes > 0 && body_len <= max_bytes
+}
+
+/// The proposal's body payload size: the sum of its datum byte lengths — the
+/// bytes a follower would otherwise have to pull via `BlockDataRequest`.
+fn proposal_body_len(proposal: &Proposal) -> u64 {
+    proposal
+        .block
+        .data
+        .vec()
+        .iter()
+        .map(|d| d.bytes().len() as u64)
+        .sum()
+}
 
 /// Pick the target for body-fetch attempt number `attempt` (0-based): the first
 /// `max_origin_retries` attempts go to `origin` (the proposer — overwhelmingly
