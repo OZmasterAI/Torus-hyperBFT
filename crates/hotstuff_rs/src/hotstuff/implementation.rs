@@ -10,7 +10,7 @@
 
 use borsh::BorshSerialize;
 use std::{
-    collections::HashSet,
+    collections::{HashSet, VecDeque},
     sync::mpsc::Sender,
     time::{Duration, Instant, SystemTime},
 };
@@ -124,6 +124,21 @@ pub(crate) struct HotStuff<N: Network> {
     /// (which does a `block_tree.contains` DB read) to at most one evaluation per
     /// [`BODY_RETRY_INTERVAL`] on the hot algorithm loop.
     last_missing_pc_check: Instant,
+    /// L3 v2 (body push): body-payload threshold in bytes at/below which this
+    /// LEADER, right after its (unchanged) header broadcast, pushes the body to
+    /// the other committed validators as unsolicited [`BlockDataResponse`]s —
+    /// sparing them the body-fetch round trip that dominates `insert_persist`
+    /// (docs/l3-persist-attribution.md §6). Read once from
+    /// `TORUS_BODY_PUSH_MAX_BYTES` at construction, clamped to
+    /// [`BODY_PUSH_HARD_CAP_BYTES`]. 0 = OFF — exact-today behavior (header +
+    /// solicited fetch only).
+    body_push_max_bytes: u64,
+    /// L3 v2 (body push): unsolicited pushed bodies that arrived BEFORE their
+    /// header, parked until [`on_receive_proposal_header`](Self::on_receive_proposal_header)
+    /// consumes them (or FIFO eviction reclaims the slot). Bounded by
+    /// [`PUSHED_BODY_BUFFER_CAP`] entries of at most
+    /// [`BODY_PUSH_HARD_CAP_BYTES`] body payload each (~1 MiB worst case).
+    pushed_bodies: VecDeque<(CryptoHash, Block)>,
 }
 
 impl<N: Network> HotStuff<N> {
@@ -163,7 +178,23 @@ impl<N: Network> HotStuff<N> {
             deferred_bodies: PendingBodies::new(),
             proposal_deferred: false,
             last_missing_pc_check: Instant::now(),
+            body_push_max_bytes: body_push_max_bytes_from_env(),
+            pushed_bodies: VecDeque::new(),
         }
+    }
+
+    /// Test-only override of the body-push threshold, bypassing the
+    /// process-global env cache so each test can pin its own value. Clamped to
+    /// [`BODY_PUSH_HARD_CAP_BYTES`], exactly like the env parse.
+    #[cfg(test)]
+    pub(crate) fn set_body_push_max_bytes(&mut self, max_bytes: u64) {
+        self.body_push_max_bytes = max_bytes.min(BODY_PUSH_HARD_CAP_BYTES);
+    }
+
+    /// Test-only: number of unsolicited pushed bodies currently parked.
+    #[cfg(test)]
+    pub(crate) fn pushed_body_buffer_len(&self) -> usize {
+        self.pushed_bodies.len()
     }
 
     pub(crate) fn take_sync_needed(&mut self) -> bool {
@@ -382,7 +413,11 @@ impl<N: Network> HotStuff<N> {
                         tc: None,
                         nec: None,
                     };
-                    self.broadcast_proposal_as_header(&proposal, validator_set_updates.is_some());
+                    self.broadcast_proposal_as_header(
+                        &proposal,
+                        validator_set_updates.is_some(),
+                        block_tree,
+                    );
                     Event::Propose(ProposeEvent {
                         timestamp: SystemTime::now(),
                         proposal,
@@ -490,7 +525,7 @@ impl<N: Network> HotStuff<N> {
                     nec: None,
                 };
 
-                self.broadcast_proposal_as_header(&proposal, true);
+                self.broadcast_proposal_as_header(&proposal, true, block_tree);
 
                 Event::Propose(ProposeEvent {
                     timestamp: SystemTime::now(),
@@ -507,7 +542,7 @@ impl<N: Network> HotStuff<N> {
                     if let Some(proposal) =
                         self.create_proposal_based_on_tc(&tc, block_tree, app)?
                     {
-                        self.broadcast_proposal_as_header(&proposal, false);
+                        self.broadcast_proposal_as_header(&proposal, false, block_tree);
                         Event::Propose(ProposeEvent {
                             timestamp: SystemTime::now(),
                             proposal,
@@ -597,7 +632,11 @@ impl<N: Network> HotStuff<N> {
                         nec: None,
                     };
 
-                    self.broadcast_proposal_as_header(&proposal, validator_set_updates.is_some());
+                    self.broadcast_proposal_as_header(
+                        &proposal,
+                        validator_set_updates.is_some(),
+                        block_tree,
+                    );
 
                     Event::Propose(ProposeEvent {
                         timestamp: SystemTime::now(),
@@ -636,10 +675,31 @@ impl<N: Network> HotStuff<N> {
     ///   RECOVER is async: sends ProposalRequest/NERequest, stores RecoveryState,
     ///   returns None. The event loop handles responses via on_receive_proposal_response
     ///   and on_receive_ne. If the view timer expires, recovery is abandoned.
-    fn broadcast_proposal_as_header(
+    /// Broadcast `proposal` to the network, header-first — the header bytes on
+    /// the wire are unconditional and identical to today.
+    ///
+    /// L3 v2 (body push): when `TORUS_BODY_PUSH_MAX_BYTES` is set (> 0) and
+    /// the proposal's body payload is at/below the (hard-capped ≤ 64 KiB)
+    /// threshold, the leader ADDITIONALLY pushes the body right after the
+    /// header, as an unsolicited [`BlockDataResponse`] direct-sent to each
+    /// other committed validator. `BlockDataResponse` is an existing wire
+    /// variant every replica already handles, is view-exempt
+    /// ([`HotStuffMessage::is_block_data_msg`]), and feeds the existing
+    /// pending-header / `try_insert_body` machinery — so receivers still vote
+    /// on the header exactly as today (vote-before-DA preserved); the push
+    /// only pre-delivers the body, removing the `BlockDataRequest` round trip
+    /// from the next leader's critical path (docs/l3-persist-attribution.md
+    /// §6). A lost push is harmless: the solicited fetch + retry machinery is
+    /// fully intact. Default 0 = OFF — no push, exact-today behavior.
+    ///
+    /// The proposer-side body bookkeeping (`pending_bodies` +
+    /// `store_block_for_serving`) is kept in all cases, so a straggler's
+    /// `BlockDataRequest` is served identically either way.
+    fn broadcast_proposal_as_header<K: KVStore>(
         &mut self,
         proposal: &Proposal,
         has_validator_set_updates: bool,
+        block_tree: &BlockTreeSingleton<K>,
     ) {
         self.pending_bodies
             .insert(proposal.block.hash, proposal.block.clone());
@@ -648,6 +708,19 @@ impl<N: Network> HotStuff<N> {
         let header = ProposalHeader::from_proposal(proposal, has_validator_set_updates);
         self.sender_handle
             .broadcast::<HotStuffMessage>(header.into());
+        if should_push_body(body_payload_len(&proposal.block), self.body_push_max_bytes) {
+            let me = self.config.keypair.public();
+            if let Ok(validator_set) = block_tree.committed_validator_set() {
+                let resp = BlockDataResponse {
+                    view: proposal.view,
+                    block: proposal.block.clone(),
+                };
+                for validator in validator_set.validators().filter(|vk| **vk != me) {
+                    self.sender_handle
+                        .send::<HotStuffMessage>(*validator, resp.clone().into());
+                }
+            }
+        }
     }
 
     fn create_proposal_based_on_tc<K: KVStore>(
@@ -1551,7 +1624,7 @@ impl<N: Network> HotStuff<N> {
             tc: Some(tc),
             nec: None,
         };
-        self.broadcast_proposal_as_header(&proposal, false);
+        self.broadcast_proposal_as_header(&proposal, false, block_tree);
         Event::Propose(ProposeEvent {
             timestamp: SystemTime::now(),
             proposal,
@@ -1954,17 +2027,42 @@ impl<N: Network> HotStuff<N> {
             .publish(&self.event_publisher);
         }
 
-        // Request the body via the dedicated block-data protocol (skip if already self-inserted).
+        // Obtain the body (skip if already self-inserted).
+        //
+        // L3 v2 (body push): if the leader's unsolicited push already delivered
+        // this body — it arrived before the header and was parked in
+        // `pushed_bodies` — consume it NOW and insert with zero fetch round
+        // trips. The phase-vote above has already been sent, so the
+        // header-first vote-before-DA order is untouched. Any non-success
+        // (no push arrived, parent missing, app-invalid) falls through to
+        // today's request + retry machinery unchanged: the push is an
+        // accelerator, never a load-bearing delivery path.
         if !block_already_in_tree {
-            let req = BlockDataRequest {
-                chain_id: header.chain_id,
-                view: header.view,
-                block_hash: header.block_hash,
+            let block_hash = header.block_hash;
+            let chain_id = header.chain_id;
+            let view = header.view;
+            self.pending_headers.insert(block_hash, header);
+            let inserted_from_push = match self.take_pushed_body(&block_hash) {
+                Some(block) => {
+                    let inserted = self.try_insert_body(block, block_tree, app)?;
+                    if inserted {
+                        self.pending_headers.remove(&block_hash);
+                        self.drain_deferred_bodies(block_tree, app)?;
+                    }
+                    inserted
+                }
+                None => false,
             };
-            self.sender_handle.request_block_data(*origin, req);
-            self.body_fetch_tracker
-                .insert(header.block_hash, (Instant::now(), 0, *origin));
-            self.pending_headers.insert(header.block_hash, header);
+            if !inserted_from_push {
+                let req = BlockDataRequest {
+                    chain_id,
+                    view,
+                    block_hash,
+                };
+                self.sender_handle.request_block_data(*origin, req);
+                self.body_fetch_tracker
+                    .insert(block_hash, (Instant::now(), 0, *origin));
+            }
         }
 
         // Update proposal status.
@@ -2027,6 +2125,15 @@ impl<N: Network> HotStuff<N> {
         let tracked_as_body = self.pending_headers.contains_key(&block_hash);
         let tracked_as_justify = self.justify_fetch_tracker.contains_key(&block_hash);
         if !tracked_as_body && !tracked_as_justify {
+            // L3 v2 (body push): an unsolicited pushed body can legitimately
+            // beat its own header (the leader pushes immediately after the
+            // header broadcast, on a different delivery path). Park it in the
+            // bounded `pushed_bodies` buffer so the header handler can consume
+            // it without a fetch round trip. Everything else about the
+            // untracked case stays exact-today: nothing is validated, inserted,
+            // or voted here, and bodies that no header ever claims simply age
+            // out of the FIFO buffer.
+            self.park_pushed_body(block, block_tree);
             return Ok(());
         }
 
@@ -2061,6 +2168,53 @@ impl<N: Network> HotStuff<N> {
         }
 
         Ok(())
+    }
+
+    /// L3 v2 (body push): park an unsolicited [`BlockDataResponse`] body that
+    /// arrived before its header. Bounded and cheap by construction:
+    ///
+    /// - Structural gate only: the block's outer hash must recompute from its
+    ///   `(height, justify, data_hash)` tuple. Full verification is NOT run
+    ///   here — it happens exactly where it happens today, when the header
+    ///   (whose own hash is verified against the same tuple and whose sender
+    ///   is proposer-gated) claims the parked body and runs it through
+    ///   [`try_insert_body`](Self::try_insert_body) → `app.validate_block`
+    ///   (which checks the data against `data_hash`). The structural gate
+    ///   means a parked body claiming hash `H` carries exactly the tuple the
+    ///   verified header for `H` binds.
+    /// - Body payload must be at/below [`BODY_PUSH_HARD_CAP_BYTES`] (a
+    ///   compliant pusher never exceeds it), the block must not already be in
+    ///   the tree, first copy wins, and the buffer holds at most
+    ///   [`PUSHED_BODY_BUFFER_CAP`] entries with FIFO eviction — worst-case
+    ///   memory is ~1 MiB regardless of sender behavior.
+    fn park_pushed_body<K: KVStore>(&mut self, block: Block, block_tree: &BlockTreeSingleton<K>) {
+        if body_payload_len(&block) > BODY_PUSH_HARD_CAP_BYTES {
+            return;
+        }
+        if block.hash != Block::hash(block.height, &block.justify, &block.data_hash) {
+            return;
+        }
+        if self
+            .pushed_bodies
+            .iter()
+            .any(|(hash, _)| *hash == block.hash)
+        {
+            return;
+        }
+        if block_tree.contains(&block.hash) {
+            return;
+        }
+        if self.pushed_bodies.len() >= PUSHED_BODY_BUFFER_CAP {
+            self.pushed_bodies.pop_front();
+        }
+        self.pushed_bodies.push_back((block.hash, block));
+    }
+
+    /// L3 v2 (body push): remove and return the parked pushed body for `hash`,
+    /// if one arrived ahead of its header.
+    fn take_pushed_body(&mut self, hash: &CryptoHash) -> Option<Block> {
+        let idx = self.pushed_bodies.iter().position(|(h, _)| h == hash)?;
+        self.pushed_bodies.remove(idx).map(|(_, block)| block)
     }
 
     /// Attempt to validate and insert a block body. Returns true on success, false if
@@ -2481,6 +2635,57 @@ pub(crate) const MAX_BODY_RETRIES: u8 = 2;
 /// rotated across the other validators (Sprint 3 T3 — a non-serving proposer
 /// must not defeat the fetch when another validator holds the body).
 pub(crate) const MAX_BODY_RETRIES_TOTAL: u8 = 9;
+
+/// L3 v2 (body push): hard cap on the effective push threshold, enforced at
+/// the decision point regardless of the env value. Transport safety: a legacy
+/// full-TorusBlock body could exceed the network's 1 MiB direct-message accept
+/// gate, while 64 KiB sits far below every transport limit (1 MiB direct
+/// accept, 2 MiB gossip transmit).
+pub(crate) const BODY_PUSH_HARD_CAP_BYTES: u64 = 65536;
+
+/// L3 v2 (body push): max entries in the unsolicited pushed-body park buffer.
+/// Bounds worst-case buffer memory at
+/// `PUSHED_BODY_BUFFER_CAP * BODY_PUSH_HARD_CAP_BYTES` ≈ 1 MiB.
+pub(crate) const PUSHED_BODY_BUFFER_CAP: usize = 16;
+
+/// L3 v2 (body push): pure parse of `TORUS_BODY_PUSH_MAX_BYTES`. Split from
+/// the env read so the default and the parse are unit-testable without
+/// touching process-global state (same idiom as `parse_sync_wal_toggle` in
+/// torus-state). Unset / unparsable => 0 = OFF (exact-today: header broadcast
+/// + solicited fetch only). Any parsed value is clamped to
+/// [`BODY_PUSH_HARD_CAP_BYTES`].
+pub(crate) fn parse_body_push_max_bytes(raw: Option<String>) -> u64 {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+        .min(BODY_PUSH_HARD_CAP_BYTES)
+}
+
+/// Cached env read of the body-push threshold (bytes). Read once per process,
+/// at first `HotStuff` construction.
+fn body_push_max_bytes_from_env() -> u64 {
+    static MAX: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| parse_body_push_max_bytes(std::env::var("TORUS_BODY_PUSH_MAX_BYTES").ok()))
+}
+
+/// L3 v2 (body push) decision, pure: push iff the knob is ON (`max_bytes > 0`)
+/// and the body payload fits. The hard cap is re-applied here so no code path
+/// (env, test override, future caller) can ever push a body above
+/// [`BODY_PUSH_HARD_CAP_BYTES`].
+pub(crate) fn should_push_body(body_len: u64, max_bytes: u64) -> bool {
+    let effective = max_bytes.min(BODY_PUSH_HARD_CAP_BYTES);
+    effective > 0 && body_len <= effective
+}
+
+/// A block's body payload size: the sum of its datum byte lengths — the bytes
+/// a follower would otherwise have to pull via `BlockDataRequest`.
+fn body_payload_len(block: &Block) -> u64 {
+    block
+        .data
+        .vec()
+        .iter()
+        .map(|d| d.bytes().len() as u64)
+        .sum()
+}
 
 /// Pick the target for body-fetch attempt number `attempt` (0-based): the first
 /// `max_origin_retries` attempts go to `origin` (the proposer — overwhelmingly
