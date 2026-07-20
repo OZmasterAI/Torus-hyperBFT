@@ -9,7 +9,7 @@
 //! - All arithmetic via FixedPoint (no f64)
 //! - Deterministic: same input sequence → same state
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::{self, Read as IoRead, Write as IoWrite};
 
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -109,49 +109,20 @@ struct OrderLocation {
     price: FixedPoint,
 }
 
-/// rank8 (resident books): order-level mutation journal. When enabled, every
-/// primitive that changes RESTING-order state records the order id here —
-/// `touched` (inserted / re-inserted / quantity changed, still resting) and
-/// `removed` (no longer resting), kept disjoint. The per-order-row persistence
-/// differ (torus-bridge, `TORUS_BOOK_ROWS` + `TORUS_RESIDENT_BOOKS`) drains it
-/// to write only the changed rows without walking the whole book.
-///
-/// Capture is at the OrderBook PRIMITIVES (insert_order / cancel_order /
-/// cancel_all / modify_order / match_at_level), not at callers — stop
-/// triggers, STP cancels and every executor path funnel through these, so no
-/// caller can bypass the journal. Pending stops are NOT journaled (the save
-/// path diffs the tiny stop set directly).
-///
-/// Disabled (default) it records nothing — zero behavior change. The journal
-/// is in-memory bookkeeping only: never serialized, never part of any hash.
-#[derive(Default)]
-pub struct BookJournal {
-    enabled: bool,
-    touched: HashSet<OrderId>,
-    removed: HashSet<OrderId>,
-}
-
-impl BookJournal {
-    #[inline]
-    fn touch(&mut self, id: OrderId) {
-        if self.enabled {
-            self.removed.remove(&id);
-            self.touched.insert(id);
-        }
-    }
-
-    #[inline]
-    fn remove(&mut self, id: OrderId) {
-        if self.enabled {
-            self.touched.remove(&id);
-            self.removed.insert(id);
-        }
-    }
-}
-
 // ============================================================================
 // OrderBook
 // ============================================================================
+//
+// 3c journal-in-book (ported from the deep-book/level-rows lineage, replacing
+// the rank8 `BookJournal`): every primitive that changes RESTING-order state
+// journals the order id (`row_journal`) AND its `(side_tag, raw_price)` level
+// (`level_journal`). Capture is at the OrderBook PRIMITIVES (insert_order /
+// cancel_order / cancel_all / modify_order / match_at_level) — stop triggers,
+// STP cancels and every executor path funnel through these, so no caller can
+// bypass the journals. Pending stops are NOT journaled (the save path diffs
+// the tiny stop set directly). The journals are in-memory bookkeeping only:
+// never serialized, never part of any hash; the SAVE PATH decides what (if
+// anything) to do with them per persistence mode.
 
 /// Price-time priority Central Limit Order Book.
 pub struct OrderBook {
@@ -172,9 +143,33 @@ pub struct OrderBook {
     last_trade_price: Option<FixedPoint>,
     /// Guard against recursive stop triggering.
     triggering_stops: bool,
-    /// rank8: optional order-level mutation journal (see [`BookJournal`]).
-    /// Never serialized; fresh (disabled) on construction/deserialize.
-    journal: BookJournal,
+
+    // ---- Per-order-row persistence state (journal-in-book, 3c) ----
+    //
+    // CONSENSUS-CRITICAL: intra-price-level queue order is NOT ascending
+    // order-id (`modify_order` cancel+reinserts with the SAME id at the BACK
+    // of the queue), so every resting order carries an explicit insertion
+    // sequence, ASSIGNED AT INSERT TIME by the book. `next_seq` is persisted
+    // in the meta row — recomputing it as max(seq)+1 at reload would assign
+    // different seqs on a restarted node whenever cancels left a gap at the
+    // top, forking the state root.
+    /// Insertion sequence per resting order (assigned by `insert_order`,
+    /// preserved by in-place modifies, reassigned on cancel+reinsert).
+    order_seq: HashMap<OrderId, u64>,
+    /// Monotonic seq allocator. Part of the persisted meta row (consensus).
+    next_seq: u64,
+    /// Row journal: order ids whose persisted row must be upserted (still
+    /// resting) or deleted (gone) at the next save. Drained by `take_row_ops`.
+    row_journal: BTreeSet<OrderId>,
+    /// Order ids that currently have a persisted row — lets the save skip
+    /// deletes for orders placed AND removed between two saves.
+    row_exists: HashSet<OrderId>,
+    /// Level journal: `(side_tag, raw_price)` of every price level touched
+    /// since the last save. Drained by `take_level_ops`.
+    level_journal: BTreeSet<(u8, i128)>,
+    /// Levels that currently have a persisted level row (skip-useless-
+    /// tombstones role, mirrors `row_exists`).
+    level_exists: HashSet<(u8, i128)>,
 }
 
 impl OrderBook {
@@ -191,7 +186,12 @@ impl OrderBook {
             next_id: 1,
             last_trade_price: None,
             triggering_stops: false,
-            journal: BookJournal::default(),
+            order_seq: HashMap::new(),
+            next_seq: 1,
+            row_journal: BTreeSet::new(),
+            row_exists: HashSet::new(),
+            level_journal: BTreeSet::new(),
+            level_exists: HashSet::new(),
         }
     }
 
@@ -462,7 +462,10 @@ impl OrderBook {
             }
         }
 
-        self.journal.remove(order_id);
+        self.order_seq.remove(&order_id);
+        self.row_journal.insert(order_id);
+        self.level_journal
+            .insert((crate::book_rows::side_tag(order.side), order.price.raw()));
         Ok(order)
     }
 
@@ -483,7 +486,10 @@ impl OrderBook {
                 if let Some(queue) = book.get_mut(&loc.price) {
                     if let Some(pos) = queue.iter().position(|o| o.id == order_id) {
                         cancelled.push(queue.remove(pos).unwrap());
-                        self.journal.remove(order_id);
+                        self.order_seq.remove(&order_id);
+                        self.row_journal.insert(order_id);
+                        self.level_journal
+                            .insert((crate::book_rows::side_tag(loc.side), loc.price.raw()));
                     }
                     if queue.is_empty() {
                         book.remove(&loc.price);
@@ -524,7 +530,10 @@ impl OrderBook {
                         if new_q > FixedPoint::ZERO && new_q < order.remaining_qty {
                             order.remaining_qty = new_q;
                             let out = order.clone();
-                            self.journal.touch(order_id);
+                            // In-place change: same seq (priority kept), row rewritten.
+                            self.row_journal.insert(order_id);
+                            self.level_journal
+                                .insert((crate::book_rows::side_tag(loc.side), loc.price.raw()));
                             return Ok(out);
                         }
                     }
@@ -719,11 +728,14 @@ impl OrderBook {
                         taker,
                         queue,
                         best_ask,
+                        Side::Sell,
                         &mut fills,
                         &mut self_trade_cancels,
                         &mut self.order_index,
                         &mut self.trader_orders,
-                        &mut self.journal,
+                        &mut self.order_seq,
+                        &mut self.row_journal,
+                        &mut self.level_journal,
                     );
                     if self.asks.get(&best_ask).is_none_or(|q| q.is_empty()) {
                         self.asks.remove(&best_ask);
@@ -744,11 +756,14 @@ impl OrderBook {
                         taker,
                         queue,
                         best_bid,
+                        Side::Buy,
                         &mut fills,
                         &mut self_trade_cancels,
                         &mut self.order_index,
                         &mut self.trader_orders,
-                        &mut self.journal,
+                        &mut self.order_seq,
+                        &mut self.row_journal,
+                        &mut self.level_journal,
                     );
                     if self.bids.get(&best_bid).is_none_or(|q| q.is_empty()) {
                         self.bids.remove(&best_bid);
@@ -762,16 +777,25 @@ impl OrderBook {
 
     /// Match taker against orders at a single price level.
     /// Static method to satisfy the borrow checker (operates on disjoint fields).
+    #[allow(clippy::too_many_arguments)]
     fn match_at_level(
         taker: &mut Order,
         queue: &mut VecDeque<Order>,
         price: FixedPoint,
+        maker_side: Side,
         fills: &mut Vec<Fill>,
         self_trade_cancels: &mut Vec<Order>,
         order_index: &mut HashMap<OrderId, OrderLocation>,
         trader_orders: &mut HashMap<Address, Vec<OrderId>>,
-        journal: &mut BookJournal,
+        order_seq: &mut HashMap<OrderId, u64>,
+        row_journal: &mut BTreeSet<OrderId>,
+        level_journal: &mut BTreeSet<(u8, i128)>,
     ) {
+        // Every path below mutates this maker level (self-trade pop, partial
+        // fill, full fill) — journal it once up front.
+        if taker.remaining_qty > FixedPoint::ZERO && !queue.is_empty() {
+            level_journal.insert((crate::book_rows::side_tag(maker_side), price.raw()));
+        }
         while taker.remaining_qty > FixedPoint::ZERO && !queue.is_empty() {
             let maker = queue.front().unwrap();
 
@@ -782,7 +806,8 @@ impl OrderBook {
                 if let Some(ids) = trader_orders.get_mut(&cancelled.trader) {
                     ids.retain(|&id| id != cancelled.id);
                 }
-                journal.remove(cancelled.id);
+                order_seq.remove(&cancelled.id);
+                row_journal.insert(cancelled.id);
                 // A5: hand the whole cancelled order back so the executor can
                 // release its remaining order-margin reservation.
                 self_trade_cancels.push(cancelled);
@@ -813,21 +838,23 @@ impl OrderBook {
             let maker = queue.front_mut().unwrap();
             maker.remaining_qty -= fill_qty;
 
+            // Maker row changed either way: partial fill rewrites it,
+            // full fill deletes it.
+            row_journal.insert(maker_id);
             if maker.remaining_qty == FixedPoint::ZERO {
                 let filled = queue.pop_front().unwrap();
                 order_index.remove(&filled.id);
                 if let Some(ids) = trader_orders.get_mut(&filled.trader) {
                     ids.retain(|&id| id != filled.id);
                 }
-                journal.remove(filled.id);
-            } else {
-                // Partial consumption: the resting maker's remaining_qty moved.
-                journal.touch(maker_id);
+                order_seq.remove(&filled.id);
             }
         }
     }
 
     /// Insert an order into the book (at the back of its price level queue).
+    /// Assigns the order's insertion sequence (queue-priority persistence)
+    /// and journals its row + level.
     fn insert_order(&mut self, order: Order) {
         let side = order.side;
         let price = order.price;
@@ -842,7 +869,13 @@ impl OrderBook {
 
         self.order_index.insert(id, OrderLocation { side, price });
         self.trader_orders.entry(trader).or_default().push(id);
-        self.journal.touch(id);
+
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.order_seq.insert(id, seq);
+        self.row_journal.insert(id);
+        self.level_journal
+            .insert((crate::book_rows::side_tag(side), price.raw()));
     }
 
     /// Would placing an order at `price` cross the spread?
@@ -993,15 +1026,6 @@ impl OrderBook {
         self.asks.iter()
     }
 
-    /// Re-insert a previously-resting order during a persistence rebuild.
-    /// Exactly what `BorshDeserialize for OrderBook` does per order: push to
-    /// the back of its price level's queue and index it. Callers MUST insert
-    /// in canonical order (bids ascending price then asks, FIFO within level)
-    /// to reproduce queue priority.
-    pub fn restore_resting_order(&mut self, order: Order) {
-        self.insert_order(order);
-    }
-
     /// Set the last trade price during a persistence rebuild (the classic
     /// blob carries it in its header).
     pub fn set_last_trade_price(&mut self, ltp: Option<FixedPoint>) {
@@ -1029,37 +1053,6 @@ impl OrderBook {
             .collect()
     }
 
-    /// rank8: enable the order-level mutation journal (see [`BookJournal`]).
-    /// Idempotent; there is deliberately no disable — a book that ever
-    /// journaled under resident mode must never silently stop (a gap would
-    /// desync the row-store differ).
-    pub fn enable_mutation_journal(&mut self) {
-        self.journal.enabled = true;
-    }
-
-    /// rank8: whether the mutation journal is recording.
-    pub fn mutation_journal_enabled(&self) -> bool {
-        self.journal.enabled
-    }
-
-    /// rank8: drain the journal — `(touched, removed)`, disjoint sets.
-    /// `touched` ids are guaranteed still resting; `removed` ids are
-    /// guaranteed no longer resting.
-    pub fn take_mutation_journal(&mut self) -> (HashSet<OrderId>, HashSet<OrderId>) {
-        debug_assert!(
-            self.journal.touched.iter().all(|id| self.order_index.contains_key(id)),
-            "journal.touched must only hold resting orders"
-        );
-        debug_assert!(
-            self.journal.removed.iter().all(|id| !self.order_index.contains_key(id)),
-            "journal.removed must only hold non-resting orders"
-        );
-        (
-            std::mem::take(&mut self.journal.touched),
-            std::mem::take(&mut self.journal.removed),
-        )
-    }
-
     /// rank8: the FIFO queue at one price level, if it exists. Read access for
     /// the journal-driven row differ (walks only affected levels).
     pub fn level_queue(&self, side: Side, price: FixedPoint) -> Option<&VecDeque<Order>> {
@@ -1085,6 +1078,228 @@ impl OrderBook {
         let id = stop.id;
         self.pending_stops.push(stop);
         Ok(id)
+    }
+}
+
+// ============================================================================
+// Journal-in-book persistence codec (3c)
+//
+// The row/level KEY layouts live in `crate::book_rows`; this block owns the
+// VALUE encodings and journal draining, which need the book's private fields.
+//
+// STATE-ROOT PREIMAGE: order-row bytes (mode 1) and level-row bytes incl.
+// `level_hash` (mode 2) are committed by the native state root. FROZEN once
+// deployed.
+// ============================================================================
+
+impl OrderBook {
+    /// The book-owned monotonic queue-seq allocator (persisted in the meta row).
+    pub fn next_seq(&self) -> u64 {
+        self.next_seq
+    }
+
+    /// Restore the seq allocator during a persistence rebuild.
+    pub fn set_next_seq(&mut self, next_seq: u64) {
+        self.next_seq = next_seq;
+    }
+
+    /// The insertion seq of a resting order (test/verify hook).
+    pub fn order_seq_of(&self, order_id: OrderId) -> Option<u64> {
+        self.order_seq.get(&order_id).copied()
+    }
+
+    /// Encode one resting order's row value: `seq(8 BE) ‖ borsh(Order)` (the
+    /// frozen `Order` codec; the id is repeated inside for integrity).
+    /// `None` if the order is not resting.
+    pub fn encode_order_row(&self, order_id: OrderId) -> Option<Vec<u8>> {
+        let seq = *self.order_seq.get(&order_id)?;
+        let order = self.get_order(order_id)?;
+        Some(Self::encode_order_row_parts(seq, order))
+    }
+
+    /// `seq(8 BE) ‖ borsh(Order)` from parts (shared with the level hasher).
+    fn encode_order_row_parts(seq: u64, order: &Order) -> Vec<u8> {
+        let mut w = Vec::with_capacity(8 + 112);
+        w.extend_from_slice(&seq.to_be_bytes());
+        order.serialize(&mut w).expect("vec write");
+        w
+    }
+
+    /// Decode an order-row value into `(seq, order)`.
+    pub fn decode_order_row(bytes: &[u8]) -> io::Result<(u64, Order)> {
+        let mut r = bytes;
+        let mut s = [0u8; 8];
+        r.read_exact(&mut s)?;
+        let seq = u64::from_be_bytes(s);
+        let order = Order::deserialize_reader(&mut r)?;
+        Ok((seq, order))
+    }
+
+    /// Insert an order loaded FROM a persisted row: restores its stored seq,
+    /// does NOT journal (a load is not a mutation), and marks its row + level
+    /// as persisted. Callers must insert in canonical order (bids ascending
+    /// (price, seq), then asks) — the loader owns that ordering.
+    pub fn insert_loaded_order(&mut self, order: Order, seq: u64) {
+        let side = order.side;
+        let price = order.price;
+        let id = order.id;
+        let trader = order.trader;
+
+        let book = match side {
+            Side::Buy => &mut self.bids,
+            Side::Sell => &mut self.asks,
+        };
+        book.entry(price).or_default().push_back(order);
+        self.order_index.insert(id, OrderLocation { side, price });
+        self.trader_orders.entry(trader).or_default().push(id);
+        self.order_seq.insert(id, seq);
+        self.row_exists.insert(id);
+        // A loaded order implies its level's persisted row exists (save-path
+        // invariant) — mark it so a later emptying save deletes it.
+        self.level_exists
+            .insert((crate::book_rows::side_tag(side), price.raw()));
+        debug_assert!(seq < self.next_seq, "loaded seq {seq} >= meta next_seq");
+    }
+
+    /// Drain the row journal into row ops, O(touched since last save):
+    /// `(order_id, Some(row_bytes))` = upsert, `(order_id, None)` = delete.
+    /// Ids placed AND removed since the last save (no row ever persisted)
+    /// are skipped. Deterministic ascending-id order.
+    pub fn take_row_ops(&mut self) -> Vec<(OrderId, Option<Vec<u8>>)> {
+        let ids = std::mem::take(&mut self.row_journal);
+        let mut ops = Vec::with_capacity(ids.len());
+        for id in ids {
+            if self.order_index.contains_key(&id) {
+                let bytes = self
+                    .encode_order_row(id)
+                    .expect("resting order must encode");
+                self.row_exists.insert(id);
+                ops.push((id, Some(bytes)));
+            } else if self.row_exists.remove(&id) {
+                ops.push((id, None));
+            }
+        }
+        ops
+    }
+
+    /// Row upserts for EVERY resting order (full write — genesis, tests,
+    /// offline rebuild). Resets the journal and marks all rows persisted.
+    /// Deterministic ascending-id order.
+    pub fn full_row_ops(&mut self) -> Vec<(OrderId, Vec<u8>)> {
+        self.row_journal.clear();
+        self.row_exists.clear();
+        let mut ids: Vec<OrderId> = self.order_index.keys().copied().collect();
+        ids.sort_unstable();
+        let mut ops = Vec::with_capacity(ids.len());
+        for id in ids {
+            let bytes = self
+                .encode_order_row(id)
+                .expect("resting order must encode");
+            self.row_exists.insert(id);
+            ops.push((id, bytes));
+        }
+        ops
+    }
+
+    /// Number of journaled (touched-since-last-save) rows — test/metrics hook.
+    pub fn journaled_rows(&self) -> usize {
+        self.row_journal.len()
+    }
+
+    /// The consensus aggregate of one price level (level-row VALUE parts), or
+    /// `None` if the level has no resting orders. O(orders in the level):
+    /// sums `remaining_qty` and keccaks the framed order rows front→back.
+    pub fn level_row_data(&self, tag: u8, raw_price: i128) -> Option<crate::book_rows::LevelRowData> {
+        let price = FixedPoint::from_raw(raw_price);
+        let side_book = if tag == crate::book_rows::SIDE_TAG_BID {
+            &self.bids
+        } else {
+            &self.asks
+        };
+        let queue = side_book.get(&price).filter(|q| !q.is_empty())?;
+        let mut total = FixedPoint::ZERO;
+        let mut preimage: Vec<u8> = Vec::with_capacity(queue.len() * 160);
+        for order in queue {
+            total += order.remaining_qty;
+            let seq = *self
+                .order_seq
+                .get(&order.id)
+                .expect("resting order must have a seq");
+            let row = Self::encode_order_row_parts(seq, order);
+            preimage.extend_from_slice(&(row.len() as u32).to_le_bytes());
+            preimage.extend_from_slice(&row);
+        }
+        Some(crate::book_rows::LevelRowData {
+            total_qty_raw: total.raw(),
+            order_count: queue.len() as u32,
+            level_hash: alloy_primitives::keccak256(&preimage).0,
+        })
+    }
+
+    /// Drain the level journal into level-row ops, O(touched levels) journal
+    /// work + O(orders in touched levels) hashing:
+    /// `((side_tag, raw_price), Some(data))` = upsert, `(_, None)` = delete.
+    /// Levels touched-and-emptied with no persisted row are skipped (mirrors
+    /// `take_row_ops`). Deterministic: BTreeSet drain order.
+    pub fn take_level_ops(
+        &mut self,
+    ) -> Vec<((u8, i128), Option<crate::book_rows::LevelRowData>)> {
+        let keys = std::mem::take(&mut self.level_journal);
+        let mut ops = Vec::with_capacity(keys.len());
+        for key in keys {
+            let (tag, raw_price) = key;
+            match self.level_row_data(tag, raw_price) {
+                Some(data) => {
+                    self.level_exists.insert(key);
+                    ops.push((key, Some(data)));
+                }
+                None => {
+                    if self.level_exists.remove(&key) {
+                        ops.push((key, None));
+                    }
+                }
+            }
+        }
+        ops
+    }
+
+    /// Modes 0/1 never persist level rows: drop the journaled level keys
+    /// without computing any aggregates (no keccak spent).
+    pub fn discard_level_ops(&mut self) {
+        self.level_journal.clear();
+    }
+
+    /// Classic mode never persists per-order rows: drop journaled ids without
+    /// encoding anything.
+    pub fn discard_row_ops(&mut self) {
+        self.row_journal.clear();
+    }
+
+    /// Level rows for EVERY non-empty level (full write — genesis, tests,
+    /// offline rebuild). Resets the level journal and marks all level rows
+    /// persisted. Deterministic: bids then asks, price ascending.
+    pub fn full_level_ops(&mut self) -> Vec<((u8, i128), crate::book_rows::LevelRowData)> {
+        self.level_journal.clear();
+        self.level_exists.clear();
+        let keys: Vec<(u8, i128)> = self
+            .bids
+            .keys()
+            .map(|p| (crate::book_rows::SIDE_TAG_BID, p.raw()))
+            .chain(
+                self.asks
+                    .keys()
+                    .map(|p| (crate::book_rows::SIDE_TAG_ASK, p.raw())),
+            )
+            .collect();
+        let mut ops = Vec::with_capacity(keys.len());
+        for key in keys {
+            let data = self
+                .level_row_data(key.0, key.1)
+                .expect("non-empty level must aggregate");
+            self.level_exists.insert(key);
+            ops.push((key, data));
+        }
+        ops
     }
 }
 
@@ -1431,7 +1646,12 @@ impl BorshDeserialize for OrderBook {
             next_id,
             last_trade_price,
             triggering_stops: false,
-            journal: BookJournal::default(),
+            order_seq: HashMap::new(),
+            next_seq: 1,
+            row_journal: BTreeSet::new(),
+            row_exists: HashSet::new(),
+            level_journal: BTreeSet::new(),
+            level_exists: HashSet::new(),
         };
 
         for _ in 0..order_count {
@@ -1448,6 +1668,12 @@ impl BorshDeserialize for OrderBook {
             let stop = StopOrder::deserialize_reader(r)?;
             book.pending_stops.push(stop);
         }
+
+        // Deserializing is a LOAD, not a mutation: the insert_order calls
+        // above journaled every order/level — clear that (classic mode never
+        // drains the journals; leaving them populated only leaks memory).
+        book.row_journal.clear();
+        book.level_journal.clear();
 
         Ok(book)
     }

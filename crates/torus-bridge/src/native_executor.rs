@@ -372,7 +372,8 @@ mod parallel_settle_toggle_tests {
 }
 
 // ============================================================================
-// C4 — per-order-row book persistence (`TORUS_BOOK_ROWS`)
+// Book persistence modes — C4 rows (`TORUS_BOOK_ROWS=1`) + 3c level authority
+// (`TORUS_BOOK_ROWS=2`)
 // ============================================================================
 //
 // Classic path (default): each market's ENTIRE `OrderBook` is Borsh-serialized
@@ -380,94 +381,99 @@ mod parallel_settle_toggle_tests {
 // serialized AND state-root-hashed per block, the 2GB-RSS / swap driver once
 // books hold >1M resting orders.
 //
-// Row path (`TORUS_BOOK_ROWS=1`): one KV row per resting order / pending stop
-// plus one small meta row per market. Saves write only the rows that changed
-// (new / partially-filled orders, cancels as deletes), so persistence AND
-// state-root work become O(changed orders).
+// OrderRows (`TORUS_BOOK_ROWS=1`, C4): one root-CF KV row per resting order /
+// pending stop plus one small meta row per market. Saves drain the book's own
+// mutation journal (journal-in-book, 3c port) — O(touched orders).
+//
+// LevelAuthority (`TORUS_BOOK_ROWS=2`, 3c): per-price-level aggregate rows
+// (tag 0x03, value = total_qty ‖ order_count ‖ level_hash) become the root
+// authority; full order rows move to the NODE-LOCAL `CF_BOOK_ORDER_ROWS`
+// (never bucketed/mirrored/hashed). Root dirty entries scale with touched
+// LEVELS (10s–100s), not touched orders (~16k). Order identity stays
+// consensus-committed via the per-level keccak commitment inside the level
+// row; the node-local store is verified against it at boot.
 //
 // ############################ CONSENSUS WARNING ############################
-// `CF_NATIVE_ORDER_BOOKS` is one of the 6 native-state-root CFs. The row
-// layout stores DIFFERENT keys/values than the classic whole-book blob, so
-// THE FLAG CHANGES THE STATE-ROOT FORMAT:
+// `CF_NATIVE_ORDER_BOOKS` is one of the 6 native-state-root CFs. Each mode
+// stores DIFFERENT keys/values, so THE MODE CHANGES THE STATE-ROOT FORMAT:
 //   - every validator in a fleet MUST run the same TORUS_BOOK_ROWS value —
 //     a mixed fleet forks at the first block that touches any book;
-//   - enabling (or disabling) the flag on an existing chain REQUIRES a fresh
-//     genesis — there is no migration, and load refuses to start (fail-stop
-//     via ctx.fatal_error) when the CF's on-disk content does not match the
-//     configured mode.
-// Default OFF = byte-identical persistence and state root to today.
+//   - flipping the mode on an existing chain REQUIRES a fresh genesis —
+//     there is no migration, and load refuses to start (fail-stop via
+//     ctx.fatal_error) when the CF's on-disk content OR the node-local
+//     `__book_mode__` marker does not match the configured mode.
+// Default (unset/other) = Classic = byte-identical persistence to today.
 // ###########################################################################
 //
-// Row schema (all integers big-endian, framed for future extension by key tag):
-//   meta  key `market_id(8) ‖ 0x00`            (9 bytes)
-//         val `next_seq(8) ‖ tick_raw(16) ‖ lot_raw(16) ‖ next_id(16) ‖
-//              ltp_tag(1) [‖ ltp_raw(16)]`
-//   order key `market_id(8) ‖ 0x01 ‖ order_id(16)`  (25 bytes)
-//         val `seq(8) ‖ Order borsh`
-//   stop  key `market_id(8) ‖ 0x02 ‖ stop_id(16)`   (25 bytes)
-//         val `StopOrder borsh`
+// Row schema: see `torus_core::book_rows` (frozen key/value layouts; level
+// tag 0x03 — 0x02 stays frozen as stops).
 //
 // `seq` is the queue-priority sequence: within one (side, price) level, FIFO
-// order == ascending seq. Seqs are assigned at save time from the meta row's
-// `next_seq` counter, walking the book in canonical order — a pure function
-// of persisted consensus state and the block's book operations, so every
-// validator assigns identical seqs (they are part of the state root). An
-// order whose persisted seq no longer sorts consistently with its actual
-// queue position (a modify_order that lost time priority and re-entered at
-// the back of a queue with its old id) is detected by a per-level monotonicity
-// walk and re-stamped with a fresh seq.
-//
-// D-rank8 note (resident books): rows support cheap point updates — a fill
-// touches ONE order row, a cancel is ONE delete — so a future resident-book
-// cache can skip the per-block reload/rebuild entirely and drive row writes
-// straight from the op stream. Nothing in this schema assumes the per-block
-// reload below.
+// order == ascending seq. 3c: seqs are assigned AT INSERT TIME by the book
+// itself (`OrderBook::insert_order`) and persisted via the meta row's
+// `next_seq` — a pure function of consensus history, identical on every
+// validator. (This differs from the pre-3c save-time canonical-walk
+// assignment: same determinism, different bytes — part of the batched 3c
+// preimage round, never to be back-ported alone.)
 
-/// C4 runtime toggle: `TORUS_BOOK_ROWS=1` enables per-order-row persistence;
-/// anything else (INCLUDING UNSET) keeps the classic whole-book blob —
-/// byte-identical state root to today. Read once per process. See the
-/// consensus warning above: must be fleet-uniform, needs fresh genesis.
-fn book_rows_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| parse_book_rows_toggle(std::env::var("TORUS_BOOK_ROWS").ok()))
+/// Consensus-visible book persistence mode (see the warning above).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BookMode {
+    /// Whole-book borsh blob per market (8-byte key) — exact-today default.
+    Classic,
+    /// C4 per-order rows in the root CF (`TORUS_BOOK_ROWS=1`).
+    OrderRows,
+    /// 3c level rows in the root CF + node-local order rows (`TORUS_BOOK_ROWS=2`).
+    LevelAuthority,
 }
 
-/// Pure parse of the `TORUS_BOOK_ROWS` value: only `"1"` enables rows.
-fn parse_book_rows_toggle(v: Option<String>) -> bool {
-    matches!(v.as_deref().map(str::trim), Some("1"))
+impl BookMode {
+    /// One-byte discriminant persisted in the `__book_mode__` marker row.
+    fn marker_byte(self) -> u8 {
+        match self {
+            BookMode::Classic => 0,
+            BookMode::OrderRows => 1,
+            BookMode::LevelAuthority => 2,
+        }
+    }
+
+    fn describe(self) -> &'static str {
+        match self {
+            BookMode::Classic => "classic (whole-book blobs)",
+            BookMode::OrderRows => "order rows (TORUS_BOOK_ROWS=1)",
+            BookMode::LevelAuthority => "level authority (TORUS_BOOK_ROWS=2)",
+        }
+    }
 }
 
-const BOOK_ROW_META: u8 = 0x00;
-const BOOK_ROW_ORDER: u8 = 0x01;
-const BOOK_ROW_STOP: u8 = 0x02;
-
-fn book_meta_key(market_id: MarketId) -> [u8; 9] {
-    let mut k = [0u8; 9];
-    k[..8].copy_from_slice(&market_id.to_be_bytes());
-    k[8] = BOOK_ROW_META;
-    k
+/// Runtime mode: `TORUS_BOOK_ROWS=1` → OrderRows, `=2` → LevelAuthority;
+/// anything else (INCLUDING UNSET) → Classic — byte-identical state root to
+/// today. Read once per process. Fleet-uniform, fresh genesis to change.
+fn book_mode() -> BookMode {
+    static MODE: std::sync::OnceLock<BookMode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| parse_book_rows_mode(std::env::var("TORUS_BOOK_ROWS").ok()))
 }
 
-fn book_order_key(market_id: MarketId, order_id: OrderId) -> [u8; 25] {
-    let mut k = [0u8; 25];
-    k[..8].copy_from_slice(&market_id.to_be_bytes());
-    k[8] = BOOK_ROW_ORDER;
-    k[9..].copy_from_slice(&order_id.to_be_bytes());
-    k
+/// Pure parse of the `TORUS_BOOK_ROWS` value (same trim/strictness as C4).
+fn parse_book_rows_mode(v: Option<String>) -> BookMode {
+    match v.as_deref().map(str::trim) {
+        Some("1") => BookMode::OrderRows,
+        Some("2") => BookMode::LevelAuthority,
+        _ => BookMode::Classic,
+    }
 }
 
-fn book_stop_key(market_id: MarketId, stop_id: OrderId) -> [u8; 25] {
-    let mut k = [0u8; 25];
-    k[..8].copy_from_slice(&market_id.to_be_bytes());
-    k[8] = BOOK_ROW_STOP;
-    k[9..].copy_from_slice(&stop_id.to_be_bytes());
-    k
-}
+// Frozen key layouts — single source of truth in torus-core.
+use torus_core::book_rows::{
+    book_meta_key, book_order_key, book_stop_key, level_row_key_tagged, LevelRowData,
+    ROW_TAG_LEVEL, ROW_TAG_META, ROW_TAG_ORDER, ROW_TAG_STOP,
+};
 
-/// Meta row value — see the schema comment above.
-fn book_meta_value(next_seq: u64, book: &OrderBook) -> Vec<u8> {
+/// Meta row value — layout unchanged from C4 (`next_seq` now sourced from the
+/// book's own allocator, journal-in-book).
+fn book_meta_value(book: &OrderBook) -> Vec<u8> {
     let mut v = Vec::with_capacity(8 + 16 + 16 + 16 + 1 + 16);
-    v.extend_from_slice(&next_seq.to_be_bytes());
+    v.extend_from_slice(&book.next_seq().to_be_bytes());
     v.extend_from_slice(&book.tick_size.raw().to_be_bytes());
     v.extend_from_slice(&book.lot_size.raw().to_be_bytes());
     v.extend_from_slice(&book.next_order_id().to_be_bytes());
@@ -519,14 +525,6 @@ fn parse_book_meta(v: &[u8]) -> Result<BookMeta, String> {
     })
 }
 
-/// Order row value: `seq(8 BE) ‖ Order borsh`.
-fn book_order_value(seq: u64, order: &torus_core::order_book::Order) -> Vec<u8> {
-    let mut v = Vec::with_capacity(8 + 96);
-    v.extend_from_slice(&seq.to_be_bytes());
-    borsh::BorshSerialize::serialize(order, &mut v).expect("Order borsh serialize cannot fail");
-    v
-}
-
 fn parse_book_order_row(v: &[u8]) -> Result<(u64, torus_core::order_book::Order), String> {
     use borsh::BorshDeserialize;
     if v.len() < 8 {
@@ -538,66 +536,33 @@ fn parse_book_order_row(v: &[u8]) -> Result<(u64, torus_core::order_book::Order)
     Ok((seq, order))
 }
 
-/// Per-order persisted state the differ needs: the assigned queue seq plus
-/// every `Order` field that can MUTATE while the order rests. `modify_order`
-/// can change `price` (cancel+reinsert, same id), `remaining_qty` (partial
-/// fill / in-place decrease / replace), and `original_qty` (qty-increase
-/// modify); everything else (trader, side, type, tif, timestamp, reduce_only,
-/// client_order_id) is immutable for a given id. Equality on these three
-/// fields therefore means the persisted row bytes are current.
-/// INVARIANT: if `OrderBook` ever grows another mutable resting-order field,
-/// it must be added here or rows go stale.
-struct OrderShadow {
-    seq: u64,
-    price_raw: i128,
-    qty_raw: i128,
-    original_qty_raw: i128,
-    gen: u32,
-}
-
-impl OrderShadow {
-    fn matches(&self, o: &torus_core::order_book::Order) -> bool {
-        self.price_raw == o.price.raw()
-            && self.qty_raw == o.remaining_qty.raw()
-            && self.original_qty_raw == o.original_qty.raw()
-    }
-}
-
-/// One market's persisted-row shadow: what `CF_NATIVE_ORDER_BOOKS` currently
-/// holds for it under the row schema. Rebuilt from the CF at load, kept
-/// current by `save_order_books` — the differ that turns whole-book state
-/// into O(changed) row writes.
-#[derive(Default)]
-struct BookRowShadow {
-    orders: HashMap<OrderId, OrderShadow>,
-    stops: std::collections::HashSet<OrderId>,
-    /// Queue-seq allocator (persisted in the meta row — consensus state).
-    next_seq: u64,
-    /// Last persisted meta row value (empty = never written).
-    meta: Vec<u8>,
-    /// Mark-and-sweep generation for delete detection.
-    gen: u32,
-}
-
 #[cfg(test)]
 mod book_rows_toggle_tests {
-    use super::parse_book_rows_toggle;
+    use super::{parse_book_rows_mode, BookMode};
 
     #[test]
-    fn default_is_off() {
-        assert!(!parse_book_rows_toggle(None));
+    fn default_is_classic() {
+        assert_eq!(parse_book_rows_mode(None), BookMode::Classic);
     }
 
     #[test]
-    fn one_enables() {
-        assert!(parse_book_rows_toggle(Some("1".to_string())));
-        assert!(parse_book_rows_toggle(Some(" 1 ".to_string())));
+    fn one_is_order_rows_two_is_level_authority() {
+        assert_eq!(parse_book_rows_mode(Some("1".to_string())), BookMode::OrderRows);
+        assert_eq!(parse_book_rows_mode(Some(" 1 ".to_string())), BookMode::OrderRows);
+        assert_eq!(
+            parse_book_rows_mode(Some("2".to_string())),
+            BookMode::LevelAuthority
+        );
+        assert_eq!(
+            parse_book_rows_mode(Some(" 2 ".to_string())),
+            BookMode::LevelAuthority
+        );
     }
 
     #[test]
-    fn anything_else_stays_off() {
-        for v in ["0", "true", "on", "", "yes", "2"] {
-            assert!(!parse_book_rows_toggle(Some(v.to_string())), "{v}");
+    fn anything_else_stays_classic() {
+        for v in ["0", "true", "on", "", "yes", "3", "12", "level"] {
+            assert_eq!(parse_book_rows_mode(Some(v.to_string())), BookMode::Classic, "{v}");
         }
     }
 }
@@ -661,7 +626,6 @@ pub struct ResidentBooks {
 
 struct ResidentInner {
     books: HashMap<MarketId, OrderBook>,
-    shadows: HashMap<MarketId, BookRowShadow>,
     /// Post-block global order-id high-water mark (replaces the load scan).
     next_global_order_id: u128,
     /// The block height whose POST-state this reflects (staleness guard).
@@ -761,13 +725,13 @@ pub struct NativeExecContext<T: StateBackend = StateDb> {
     /// fatal (fail-stop the node), never flush state or mark the block applied.
     pub fatal_error: Option<String>,
 
-    /// C4: per-order-row book persistence (`TORUS_BOOK_ROWS=1`). CONSENSUS-
-    /// VISIBLE — see the module-level C4 schema comment: fleet-uniform flag,
-    /// fresh genesis required, mixed on-disk content fail-stops at load.
-    book_rows: bool,
-    /// C4: per-market shadow of the persisted rows (row differ state).
-    /// Populated only when `book_rows`.
-    book_shadows: HashMap<MarketId, BookRowShadow>,
+    /// Book persistence mode (`TORUS_BOOK_ROWS`). CONSENSUS-VISIBLE — see the
+    /// module-level schema comment: fleet-uniform, fresh genesis required,
+    /// mixed on-disk content fail-stops at load.
+    book_mode: BookMode,
+    /// Whether the node-local `__book_mode__` marker row already exists (and
+    /// matched); when false, the first save writes it.
+    book_mode_marker_present: bool,
     /// rank8: this context participates in resident-book handoff (was
     /// constructed with a holder). NOT consensus-visible — resident mode
     /// must be byte-identical to the reload path.
@@ -793,7 +757,7 @@ impl<T: StateBackend> NativeExecContext<T> {
         treasury_address: Address,
         dev_pool_address: Address,
     ) -> Self {
-        Self::new_with_book_rows(
+        Self::new_with_mode(
             state,
             block_height,
             timestamp,
@@ -803,13 +767,14 @@ impl<T: StateBackend> NativeExecContext<T> {
             proposer,
             treasury_address,
             dev_pool_address,
-            book_rows_enabled(),
+            book_mode(),
+            None,
         )
     }
 
-    /// [`Self::new`] with the C4 book-persistence mode pinned explicitly
-    /// (tests / tooling — per-process env vars race across test threads).
-    /// `book_rows = false` is the classic whole-book path.
+    /// [`Self::new`] with the book-persistence mode pinned as a bool (legacy
+    /// C4 test/tooling shim): `false` = Classic, `true` = OrderRows. New code
+    /// (and anything exercising mode 2) uses [`Self::new_with_mode`].
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_book_rows(
         state: T,
@@ -823,7 +788,7 @@ impl<T: StateBackend> NativeExecContext<T> {
         dev_pool_address: Address,
         book_rows: bool,
     ) -> Self {
-        Self::new_with_modes(
+        Self::new_with_mode(
             state,
             block_height,
             timestamp,
@@ -833,7 +798,7 @@ impl<T: StateBackend> NativeExecContext<T> {
             proposer,
             treasury_address,
             dev_pool_address,
-            book_rows,
+            if book_rows { BookMode::OrderRows } else { BookMode::Classic },
             None,
         )
     }
@@ -856,7 +821,7 @@ impl<T: StateBackend> NativeExecContext<T> {
         resident: &mut ResidentBooks,
     ) -> Self {
         let use_resident = resident_books_enabled();
-        Self::new_with_modes(
+        Self::new_with_mode(
             state,
             block_height,
             timestamp,
@@ -866,20 +831,13 @@ impl<T: StateBackend> NativeExecContext<T> {
             proposer,
             treasury_address,
             dev_pool_address,
-            book_rows_enabled(),
+            book_mode(),
             if use_resident { Some(resident) } else { None },
         )
     }
 
-    /// Full-control constructor: C4 persistence mode + optional rank8
-    /// resident-book holder, both pinned explicitly.
-    ///
-    /// With `resident: Some(holder)`, the holder's state is TAKEN and reused
-    /// iff the staleness guard passes (`holder.height + 1 == block_height`,
-    /// and the DB's applied-height marker — when present — equals
-    /// `holder.height`); otherwise it is dropped and books rebuild from
-    /// persisted state exactly like the non-resident path. Give the state
-    /// back with [`Self::stash_resident`] after `save_order_books`.
+    /// Legacy bool shim for [`Self::new_with_mode`] (`false` = Classic,
+    /// `true` = OrderRows) — existing C4/rank8 tests.
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_modes(
         state: T,
@@ -892,6 +850,44 @@ impl<T: StateBackend> NativeExecContext<T> {
         treasury_address: Address,
         dev_pool_address: Address,
         book_rows: bool,
+        resident: Option<&mut ResidentBooks>,
+    ) -> Self {
+        Self::new_with_mode(
+            state,
+            block_height,
+            timestamp,
+            epoch,
+            epoch_length,
+            max_validators,
+            proposer,
+            treasury_address,
+            dev_pool_address,
+            if book_rows { BookMode::OrderRows } else { BookMode::Classic },
+            resident,
+        )
+    }
+
+    /// Full-control constructor: book persistence mode + optional rank8
+    /// resident-book holder, both pinned explicitly.
+    ///
+    /// With `resident: Some(holder)`, the holder's state is TAKEN and reused
+    /// iff the staleness guard passes (`holder.height + 1 == block_height`,
+    /// and the DB's applied-height marker — when present — equals
+    /// `holder.height`); otherwise it is dropped and books rebuild from
+    /// persisted state exactly like the non-resident path. Give the state
+    /// back with [`Self::stash_resident`] after `save_order_books`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_mode(
+        state: T,
+        block_height: u64,
+        timestamp: u64,
+        epoch: u64,
+        epoch_length: u64,
+        max_validators: u32,
+        proposer: Address,
+        treasury_address: Address,
+        dev_pool_address: Address,
+        book_mode: BookMode,
         resident: Option<&mut ResidentBooks>,
     ) -> Self {
         let positions = PositionManager::new(state.clone());
@@ -926,31 +922,38 @@ impl<T: StateBackend> NativeExecContext<T> {
         let resident_reused = reused_inner.is_some();
 
         // FIX 1 (ECON-FIND-02): Load persisted order books from DB on startup.
-        // C4: the on-disk layout must match the configured mode — a mismatch
-        // (whole-book blobs under TORUS_BOOK_ROWS=1, or row keys without it)
+        // The on-disk layout must match the configured mode — a mismatch
         // means this node's flag disagrees with the DB's history. Loading
         // "what we can" would silently diverge from the fleet, so latch a
         // fatal instead: the committer fail-stops before flushing anything.
-        let (mut order_books, scanned_next_id, book_shadows, load_error) = match reused_inner {
-            Some(inner) => (inner.books, inner.next_global_order_id, inner.shadows, None),
-            None => {
-                if book_rows {
-                    Self::load_order_books_rows(&state)
-                } else {
-                    let (books, next_id, err) = Self::load_order_books(&state);
-                    (books, next_id, HashMap::new(), err)
-                }
-            }
+        let (order_books, scanned_next_id, mut load_error) = match reused_inner {
+            Some(inner) => (inner.books, inner.next_global_order_id, None),
+            None => match book_mode {
+                BookMode::Classic => Self::load_order_books(&state),
+                BookMode::OrderRows => Self::load_order_books_rows(&state),
+                BookMode::LevelAuthority => Self::load_order_books_levels(&state),
+            },
         };
 
-        // rank8 + rows: saves are journal-driven, so every resident book must
-        // record mutations from the moment it enters the context (idempotent
-        // for books reused from the holder).
-        if resident_mode && book_rows {
-            for book in order_books.values_mut() {
-                book.enable_mutation_journal();
+        // 3c robustness marker: `__book_mode__` (node-local, non-root) catches
+        // wrong-flag restarts even on chains whose books are still empty
+        // (content sniffing has nothing to sniff there). Checked regardless of
+        // resident reuse (one point read).
+        let book_mode_marker_present = match Self::load_book_mode_marker(&state) {
+            Some(byte) if byte == book_mode.marker_byte() => true,
+            Some(byte) => {
+                if load_error.is_none() {
+                    load_error = Some(format!(
+                        "book-mode marker mismatch: DB was written under mode {byte} but \
+                         this node runs {} — TORUS_BOOK_ROWS must match the DB's history \
+                         (fleet-uniform; changing it needs a fresh genesis)",
+                        book_mode.describe()
+                    ));
+                }
+                true
             }
-        }
+            None => false,
+        };
 
         // S395: the durable counter row is authoritative when present — the
         // book-maxima scan resets to 1 once all books drain, silently reusing
@@ -985,8 +988,8 @@ impl<T: StateBackend> NativeExecContext<T> {
             pending_trades: Vec::new(),
             metrics: None,
             fatal_error: load_error,
-            book_rows,
-            book_shadows,
+            book_mode,
+            book_mode_marker_present,
             resident: resident_mode,
             resident_reused,
         }
@@ -998,11 +1001,12 @@ impl<T: StateBackend> NativeExecContext<T> {
         self.resident_reused
     }
 
-    /// rank8: hand the books (and row shadows + order-id high-water mark)
-    /// back to the cross-block holder. Call AFTER `save_order_books`. No-op
-    /// for non-resident contexts. A context that latched `fatal_error`
-    /// INVALIDATES the holder instead — its in-memory state may not match
-    /// what was (not) persisted, so the next block must rebuild from the DB.
+    /// rank8: hand the books (their journals ride inside, journal-in-book)
+    /// and the order-id high-water mark back to the cross-block holder. Call
+    /// AFTER `save_order_books`. No-op for non-resident contexts. A context
+    /// that latched `fatal_error` INVALIDATES the holder instead — its
+    /// in-memory state may not match what was (not) persisted, so the next
+    /// block must rebuild from the DB.
     pub fn stash_resident(&mut self, resident: &mut ResidentBooks) {
         if !self.resident {
             return;
@@ -1013,7 +1017,6 @@ impl<T: StateBackend> NativeExecContext<T> {
         }
         resident.inner = Some(ResidentInner {
             books: std::mem::take(&mut self.order_books),
-            shadows: std::mem::take(&mut self.book_shadows),
             next_global_order_id: self.next_global_order_id,
             height: self.block_height,
         });
@@ -1035,17 +1038,20 @@ impl<T: StateBackend> NativeExecContext<T> {
         std::mem::take(&mut self.pending_trades)
     }
 
-    /// True if `key` belongs to the C4 row schema (meta / order / stop row).
+    /// True if `key` belongs to the tagged row schema (meta / order / stop /
+    /// level row — modes 1/2).
     fn is_book_row_key(key: &[u8]) -> bool {
-        (key.len() == 9 && key[8] == BOOK_ROW_META)
-            || (key.len() == 25 && (key[8] == BOOK_ROW_ORDER || key[8] == BOOK_ROW_STOP))
+        (key.len() == 9 && key[8] == ROW_TAG_META)
+            || (key.len() == 25 && (key[8] == ROW_TAG_ORDER || key[8] == ROW_TAG_STOP))
+            || (key.len() == 26 && key[8] == ROW_TAG_LEVEL)
     }
 
     /// FIX 1 (ECON-FIND-02): Load order books from DB (classic whole-book
     /// blobs). Returns (books, next_global_order_id, fatal load error).
-    /// C4: finding row-schema keys here means the DB was written under
-    /// `TORUS_BOOK_ROWS=1` but this node runs without it — fatal (the classic
-    /// loader would silently see empty books and diverge from the fleet).
+    /// Finding tagged row-schema keys here (9/25/26 bytes) means the DB was
+    /// written under `TORUS_BOOK_ROWS=1/2` but this node runs without it —
+    /// fatal (the classic loader would silently see empty books and diverge
+    /// from the fleet).
     fn load_order_books(state: &T) -> (HashMap<MarketId, OrderBook>, u128, Option<String>) {
         use borsh::BorshDeserialize;
         use torus_state::cf::CF_NATIVE_ORDER_BOOKS;
@@ -1060,7 +1066,7 @@ impl<T: StateBackend> NativeExecContext<T> {
                         HashMap::new(),
                         1,
                         Some(
-                            "C4: cf_native_order_books holds per-order rows but \
+                            "C4: cf_native_order_books holds per-order/level rows but \
                              TORUS_BOOK_ROWS is not set — the flag must match the \
                              DB's history (fleet-uniform; changing it needs a fresh \
                              genesis)"
@@ -1086,24 +1092,63 @@ impl<T: StateBackend> NativeExecContext<T> {
         (books, next_id, None)
     }
 
-    /// C4: load order books from per-order rows (`TORUS_BOOK_ROWS=1`).
-    /// Rebuilds every book in the CANONICAL insertion order the classic
-    /// deserializer uses — bids ascending price then asks ascending price,
-    /// FIFO (= ascending seq) within a level; stops ascending id — and the
-    /// per-market row shadows the save-side differ needs.
-    /// Returns (books, next_global_order_id, shadows, fatal load error).
-    #[allow(clippy::type_complexity)]
+    /// Rebuild one market's book from parsed meta + `(seq, order)` rows +
+    /// stop rows, in the CANONICAL insertion order the classic deserializer
+    /// uses — bids ascending (price, seq), then asks ascending (price, seq);
+    /// stops ascending id. Shared by the mode-1 and mode-2 loaders.
+    fn rebuild_book(
+        market_id: MarketId,
+        meta: BookMeta,
+        mut orders: Vec<(u64, torus_core::order_book::Order)>,
+        mut stops: Vec<(u128, Vec<u8>)>,
+    ) -> Result<OrderBook, String> {
+        let mut book = OrderBook::new(market_id, meta.tick_size, meta.lot_size);
+        book.set_next_order_id(meta.next_id);
+        book.set_last_trade_price(meta.last_trade_price);
+        book.set_next_seq(meta.next_seq);
+
+        for (seq, _) in &orders {
+            if *seq >= meta.next_seq {
+                return Err(format!(
+                    "market {market_id}: order row seq {seq} >= meta next_seq {} \
+                     (corrupt row store)",
+                    meta.next_seq
+                ));
+            }
+        }
+        orders.sort_by(|a, b| {
+            let rank = |o: &torus_core::order_book::Order| u8::from(o.side == Side::Sell);
+            (rank(&a.1), a.1.price, a.0).cmp(&(rank(&b.1), b.1.price, b.0))
+        });
+        for (seq, order) in orders {
+            book.insert_loaded_order(order, seq);
+        }
+
+        stops.sort_by_key(|(id, _)| *id);
+        for (stop_id, bytes) in stops {
+            match book.restore_stop_row(&bytes) {
+                Ok(id) if id == stop_id => {}
+                Ok(id) => {
+                    return Err(format!(
+                        "market {market_id}: stop row key id {stop_id} != payload id \
+                         {id} (corrupt row store)"
+                    ))
+                }
+                Err(e) => return Err(format!("market {market_id}: {e}")),
+            }
+        }
+        Ok(book)
+    }
+
+    /// C4 / mode 1: load order books from per-order ROOT-CF rows
+    /// (`TORUS_BOOK_ROWS=1`). Journal-in-book: seqs restore straight into the
+    /// book (no shadows). Returns (books, next_global_order_id, fatal error).
     fn load_order_books_rows(
         state: &T,
-    ) -> (
-        HashMap<MarketId, OrderBook>,
-        u128,
-        HashMap<MarketId, BookRowShadow>,
-        Option<String>,
-    ) {
+    ) -> (HashMap<MarketId, OrderBook>, u128, Option<String>) {
         use torus_state::cf::CF_NATIVE_ORDER_BOOKS;
 
-        let fail = |msg: String| (HashMap::new(), 1, HashMap::new(), Some(msg));
+        let fail = |msg: String| (HashMap::new(), 1, Some(msg));
 
         // Per-market accumulators.
         #[derive(Default)]
@@ -1130,6 +1175,14 @@ impl<T: StateBackend> NativeExecContext<T> {
                         .to_string(),
                 );
             }
+            if key.len() == 26 && key[8] == ROW_TAG_LEVEL {
+                return fail(
+                    "C4: TORUS_BOOK_ROWS=1 but cf_native_order_books holds level rows \
+                     — the DB was written under TORUS_BOOK_ROWS=2 (fleet-uniform; \
+                     changing the mode needs a fresh genesis)"
+                        .to_string(),
+                );
+            }
             if !Self::is_book_row_key(&key) {
                 return fail(format!(
                     "C4: unrecognized cf_native_order_books key (len {}) under \
@@ -1139,15 +1192,15 @@ impl<T: StateBackend> NativeExecContext<T> {
             }
             let market_id = u64::from_be_bytes(key[..8].try_into().unwrap());
             match key[8] {
-                BOOK_ROW_META => match parse_book_meta(&value) {
+                ROW_TAG_META => match parse_book_meta(&value) {
                     Ok(m) => acc(&mut accs, market_id).meta = Some(m),
                     Err(e) => return fail(format!("C4: market {market_id}: {e}")),
                 },
-                BOOK_ROW_ORDER => match parse_book_order_row(&value) {
+                ROW_TAG_ORDER => match parse_book_order_row(&value) {
                     Ok(row) => acc(&mut accs, market_id).orders.push(row),
                     Err(e) => return fail(format!("C4: market {market_id}: {e}")),
                 },
-                BOOK_ROW_STOP => {
+                ROW_TAG_STOP => {
                     let stop_id = u128::from_be_bytes(key[9..25].try_into().unwrap());
                     acc(&mut accs, market_id).stops.push((stop_id, value));
                 }
@@ -1156,91 +1209,275 @@ impl<T: StateBackend> NativeExecContext<T> {
         }
 
         let mut books = HashMap::new();
-        let mut shadows = HashMap::new();
         let mut max_order_id: u128 = 0;
 
-        // Deterministic rebuild order (market id ascending) — not strictly
-        // required (per-market state is independent), but keeps any log/debug
-        // output stable.
+        // Deterministic rebuild order (market id ascending).
         let mut market_ids: Vec<MarketId> = accs.keys().copied().collect();
         market_ids.sort_unstable();
 
         for market_id in market_ids {
-            let mut a = accs.remove(&market_id).unwrap();
+            let a = accs.remove(&market_id).unwrap();
             let Some(meta) = a.meta else {
                 return fail(format!(
                     "C4: market {market_id} has order/stop rows but no meta row \
                      (corrupt row store)"
                 ));
             };
-
-            let mut book = OrderBook::new(market_id, meta.tick_size, meta.lot_size);
-            book.set_next_order_id(meta.next_id);
-            book.set_last_trade_price(meta.last_trade_price);
-
-            // Canonical insertion order: bids ascending (price, seq), then
-            // asks ascending (price, seq) — exactly the classic deserializer's
-            // walk, so queue priority and index Vec orders match it.
-            let mut shadow = BookRowShadow {
-                next_seq: meta.next_seq,
-                ..Default::default()
+            let book = match Self::rebuild_book(market_id, meta, a.orders, a.stops) {
+                Ok(b) => b,
+                Err(e) => return fail(format!("C4: {e}")),
             };
-            let mut bids: Vec<(u64, torus_core::order_book::Order)> = Vec::new();
-            let mut asks: Vec<(u64, torus_core::order_book::Order)> = Vec::new();
-            for (seq, order) in a.orders.drain(..) {
-                if seq >= meta.next_seq {
-                    return fail(format!(
-                        "C4: market {market_id}: order row seq {seq} >= meta \
-                         next_seq {} (corrupt row store)",
-                        meta.next_seq
-                    ));
-                }
-                shadow.orders.insert(
-                    order.id,
-                    OrderShadow {
-                        seq,
-                        price_raw: order.price.raw(),
-                        qty_raw: order.remaining_qty.raw(),
-                        original_qty_raw: order.original_qty.raw(),
-                        gen: 0,
-                    },
-                );
-                match order.side {
-                    Side::Buy => bids.push((seq, order)),
-                    Side::Sell => asks.push((seq, order)),
-                }
-            }
-            bids.sort_by(|a, b| (a.1.price, a.0).cmp(&(b.1.price, b.0)));
-            asks.sort_by(|a, b| (a.1.price, a.0).cmp(&(b.1.price, b.0)));
-            for (_, order) in bids.into_iter().chain(asks) {
-                book.restore_resting_order(order);
-            }
-
-            a.stops.sort_by_key(|(id, _)| *id);
-            for (stop_id, bytes) in a.stops {
-                match book.restore_stop_row(&bytes) {
-                    Ok(id) if id == stop_id => shadow.stops.insert(id),
-                    Ok(id) => {
-                        return fail(format!(
-                            "C4: market {market_id}: stop row key id {stop_id} != \
-                             payload id {id} (corrupt row store)"
-                        ))
-                    }
-                    Err(e) => return fail(format!("C4: market {market_id}: {e}")),
-                };
-            }
-
-            shadow.meta = book_meta_value(shadow.next_seq, &book);
             let book_next_id = book.next_order_id();
             if book_next_id > max_order_id {
                 max_order_id = book_next_id;
             }
             books.insert(market_id, book);
-            shadows.insert(market_id, shadow);
         }
 
         let next_id = if max_order_id > 0 { max_order_id } else { 1 };
-        (books, next_id, shadows, None)
+        (books, next_id, None)
+    }
+
+    /// 3c / mode 2: load order books under LEVEL AUTHORITY
+    /// (`TORUS_BOOK_ROWS=2`). Root CF holds meta + stop + level rows ONLY;
+    /// full order rows live in the node-local `CF_BOOK_ORDER_ROWS`. Rebuilds
+    /// every book from the node-local store, then BYTE-VERIFIES the
+    /// root-committed meta/stop/level rows (incl. every `level_hash`) against
+    /// the rebuilt books — any mismatch means the node-local store is
+    /// corrupt/stale and the node must not serve or sign (fatal).
+    /// Returns (books, next_global_order_id, fatal error).
+    fn load_order_books_levels(
+        state: &T,
+    ) -> (HashMap<MarketId, OrderBook>, u128, Option<String>) {
+        use torus_state::cf::{CF_BOOK_ORDER_ROWS, CF_NATIVE_ORDER_BOOKS};
+
+        let fail = |msg: String| (HashMap::new(), 1, Some(msg));
+
+        // ---- Root CF scan: meta + stops + level rows (consensus) ----
+        #[derive(Default)]
+        struct RootAcc {
+            meta: Option<(BookMeta, Vec<u8>)>,
+            stops: Vec<(u128, Vec<u8>)>,
+            /// level key (26 B) -> stored 52 B value
+            levels: std::collections::BTreeMap<Vec<u8>, Vec<u8>>,
+        }
+        let mut roots: HashMap<MarketId, RootAcc> = HashMap::new();
+
+        let entries = match state.iterate_cf(CF_NATIVE_ORDER_BOOKS, None) {
+            Ok(e) => e,
+            Err(e) => return fail(format!("3c: book row scan failed: {e}")),
+        };
+        for (key, value) in entries {
+            if key.len() == 8 {
+                return fail(
+                    "3c: TORUS_BOOK_ROWS=2 but cf_native_order_books holds classic \
+                     whole-book blobs — the flag must match the DB's history \
+                     (fleet-uniform; enabling it needs a fresh genesis)"
+                        .to_string(),
+                );
+            }
+            if key.len() == 25 && key[8] == ROW_TAG_ORDER {
+                return fail(
+                    "3c: TORUS_BOOK_ROWS=2 but cf_native_order_books holds per-order \
+                     rows — the DB was written under TORUS_BOOK_ROWS=1 (fleet-uniform; \
+                     changing the mode needs a fresh genesis)"
+                        .to_string(),
+                );
+            }
+            if !Self::is_book_row_key(&key) {
+                return fail(format!(
+                    "3c: unrecognized cf_native_order_books key (len {}) under \
+                     TORUS_BOOK_ROWS=2",
+                    key.len()
+                ));
+            }
+            let market_id = u64::from_be_bytes(key[..8].try_into().unwrap());
+            let acc = roots.entry(market_id).or_default();
+            match key[8] {
+                ROW_TAG_META => match parse_book_meta(&value) {
+                    Ok(m) => acc.meta = Some((m, value)),
+                    Err(e) => return fail(format!("3c: market {market_id}: {e}")),
+                },
+                ROW_TAG_STOP => {
+                    let stop_id = u128::from_be_bytes(key[9..25].try_into().unwrap());
+                    acc.stops.push((stop_id, value));
+                }
+                ROW_TAG_LEVEL => {
+                    if value.len() != torus_core::book_rows::LEVEL_ROW_VALUE_LEN {
+                        return fail(format!(
+                            "3c: market {market_id}: level row value len {} != {} \
+                             (corrupt level row)",
+                            value.len(),
+                            torus_core::book_rows::LEVEL_ROW_VALUE_LEN
+                        ));
+                    }
+                    acc.levels.insert(key, value);
+                }
+                _ => unreachable!("is_book_row_key checked the tag"),
+            }
+        }
+
+        // ---- Node-local order-row store scan ----
+        let mut store_orders: HashMap<MarketId, Vec<(u64, torus_core::order_book::Order)>> =
+            HashMap::new();
+        let store_entries = match state.iterate_cf(CF_BOOK_ORDER_ROWS, None) {
+            Ok(e) => e,
+            Err(e) => return fail(format!("3c: order-row store scan failed: {e}")),
+        };
+        let store_nonempty = !store_entries.is_empty();
+        for (key, value) in store_entries {
+            if key.len() != 25 || key[8] != ROW_TAG_ORDER {
+                return fail(format!(
+                    "3c: unrecognized cf_book_order_rows key (len {}) — corrupt \
+                     node-local order store",
+                    key.len()
+                ));
+            }
+            let market_id = u64::from_be_bytes(key[..8].try_into().unwrap());
+            let order_id = u128::from_be_bytes(key[9..25].try_into().unwrap());
+            match parse_book_order_row(&value) {
+                Ok((seq, order)) => {
+                    if order.id != order_id {
+                        return fail(format!(
+                            "3c: market {market_id}: order row key id {order_id} != \
+                             payload id {} (corrupt node-local order store)",
+                            order.id
+                        ));
+                    }
+                    store_orders.entry(market_id).or_default().push((seq, order));
+                }
+                Err(e) => return fail(format!("3c: market {market_id}: {e}")),
+            }
+        }
+
+        // Split-brain: an order store with content while the root CF commits
+        // no books at all.
+        if store_nonempty && roots.is_empty() {
+            return fail(
+                "3c: cf_book_order_rows is non-empty but cf_native_order_books has \
+                 no meta/level rows — split-brain between the node-local order \
+                 store and the consensus root (corrupt DB)"
+                    .to_string(),
+            );
+        }
+
+        // ---- Rebuild + boot verification ----
+        let mut books = HashMap::new();
+        let mut max_order_id: u128 = 0;
+
+        // Orders for a market that has no root presence at all: fatal.
+        for mid in store_orders.keys() {
+            if !roots.contains_key(mid) {
+                return fail(format!(
+                    "3c: market {mid} has node-local order rows but no root-CF rows \
+                     (split-brain store)"
+                ));
+            }
+        }
+
+        let mut market_ids: Vec<MarketId> = roots.keys().copied().collect();
+        market_ids.sort_unstable();
+
+        for market_id in market_ids {
+            let acc = roots.remove(&market_id).unwrap();
+            let Some((meta, stored_meta_bytes)) = acc.meta else {
+                return fail(format!(
+                    "3c: market {market_id} has stop/level rows but no meta row \
+                     (corrupt row store)"
+                ));
+            };
+            let orders = store_orders.remove(&market_id).unwrap_or_default();
+            let stop_bytes = acc.stops.clone();
+            let book = match Self::rebuild_book(market_id, meta, orders, acc.stops) {
+                Ok(b) => b,
+                Err(e) => return fail(format!("3c: {e}")),
+            };
+
+            // -- Boot verify 1: meta row bytes --
+            let recomputed_meta = book_meta_value(&book);
+            if recomputed_meta != stored_meta_bytes {
+                return fail(format!(
+                    "3c: market {market_id}: recomputed meta row != root-committed \
+                     meta row (node-local order store corrupt/stale — refusing to \
+                     serve or sign)"
+                ));
+            }
+
+            // -- Boot verify 2: stop rows (content-checked by rebuild; the set
+            //    is exactly what the root CF holds by construction, so only the
+            //    id/content integrity check in rebuild_book applies). Recompute
+            //    the serialized set for byte parity anyway (cheap).
+            let live_stops: Vec<(u128, Vec<u8>)> = book.stop_rows();
+            let mut stored_stops = stop_bytes;
+            stored_stops.sort_by_key(|(id, _)| *id);
+            if live_stops != stored_stops {
+                return fail(format!(
+                    "3c: market {market_id}: rebuilt stop set != root-committed stop \
+                     rows (corrupt row store)"
+                ));
+            }
+
+            // -- Boot verify 3: full level-row set incl. level_hash --
+            let mut recomputed: std::collections::BTreeMap<Vec<u8>, Vec<u8>> =
+                std::collections::BTreeMap::new();
+            for ((tag, raw_price), data) in Self::live_level_rows(&book) {
+                recomputed.insert(
+                    level_row_key_tagged(market_id, tag, raw_price).to_vec(),
+                    data.encode().to_vec(),
+                );
+            }
+            if recomputed != acc.levels {
+                return fail(format!(
+                    "3c: market {market_id}: recomputed level rows != root-committed \
+                     level rows (node-local order store corrupt/stale — refusing to \
+                     serve or sign)"
+                ));
+            }
+
+            let book_next_id = book.next_order_id();
+            if book_next_id > max_order_id {
+                max_order_id = book_next_id;
+            }
+            books.insert(market_id, book);
+        }
+
+        let next_id = if max_order_id > 0 { max_order_id } else { 1 };
+        (books, next_id, None)
+    }
+
+    /// Read-only recompute of EVERY non-empty level's row data for a book
+    /// (boot verify / staleness-guard verify — does NOT touch the journals).
+    fn live_level_rows(book: &OrderBook) -> Vec<((u8, i128), LevelRowData)> {
+        use torus_core::book_rows::{SIDE_TAG_ASK, SIDE_TAG_BID};
+        let mut out = Vec::new();
+        for (tag, prices) in [
+            (SIDE_TAG_BID, book.bid_queues().map(|(p, _)| p.raw()).collect::<Vec<_>>()),
+            (SIDE_TAG_ASK, book.ask_queues().map(|(p, _)| p.raw()).collect::<Vec<_>>()),
+        ] {
+            for raw in prices {
+                if let Some(data) = book.level_row_data(tag, raw) {
+                    out.push(((tag, raw), data));
+                }
+            }
+        }
+        out
+    }
+
+    /// Node-local `__book_mode__` marker row (CF_NATIVE_MARKETS — same
+    /// classification as `NEXT_GLOBAL_ORDER_ID_KEY`: non-root, key length
+    /// != 8 so every market reader skips it). Written on first save, checked
+    /// at boot — catches wrong-flag restarts on chains whose books are still
+    /// empty.
+    const BOOK_MODE_MARKER_KEY: &'static [u8] = b"__book_mode__";
+
+    /// Read the persisted book-mode marker byte, if the row exists.
+    fn load_book_mode_marker(state: &T) -> Option<u8> {
+        use torus_state::cf::CF_NATIVE_MARKETS;
+        let bytes = state
+            .get_cf_raw(CF_NATIVE_MARKETS, Self::BOOK_MODE_MARKER_KEY)
+            .ok()
+            .flatten()?;
+        (bytes.len() == 1).then(|| bytes[0])
     }
 
     /// Durable global-order-id counter row. Lives in `CF_NATIVE_MARKETS` — a
@@ -1263,58 +1500,130 @@ impl<T: StateBackend> NativeExecContext<T> {
     /// FIX 1 (ECON-FIND-02) + S395 dirty-only rewrite: persist the order books
     /// TOUCHED this block (placed / matched / cancelled / modified) and the
     /// global order-id counter when it advanced. Untouched books already hold
-    /// identical bytes in the CF — the old rewrite-everything loop cost
-    /// O(all resting orders) in Borsh serialization per block. Returns the
-    /// number of CF writes performed (whole-book rows classically; row
-    /// puts + deletes under `TORUS_BOOK_ROWS=1` — test hook either way).
-    /// Called after block execution.
+    /// identical bytes in the CF. Returns the number of CF writes performed
+    /// (whole-book rows classically; row/level puts + deletes under modes 1/2
+    /// — test hook either way; node-local order-row writes under mode 2 are
+    /// NOT counted, they are outside the root).
     ///
-    /// C4 (`book_rows`): instead of one whole-book blob per dirty market, diff
-    /// each dirty book against its persisted-row shadow and write only the
-    /// changed rows — new/re-sequenced/refilled orders as puts, gone orders as
-    /// deletes, plus the small meta row. O(changed orders) in serialization,
-    /// CF bytes AND downstream state-root hashing.
+    /// Journal-in-book (3c): modes 1/2 drain the book's own journals — no
+    /// shadow, no whole-book walk, no save-time seq derivation:
+    ///   mode 1: `take_row_ops` → root-CF order rows; level ops DISCARDED;
+    ///           stops + meta shared.
+    ///   mode 2: `take_row_ops` → NODE-LOCAL `CF_BOOK_ORDER_ROWS`;
+    ///           `take_level_ops` → root-CF level rows (qty ‖ count ‖ hash);
+    ///           stops + meta shared.
     pub fn save_order_books(&mut self) -> usize {
-        use torus_state::cf::{CF_NATIVE_MARKETS, CF_NATIVE_ORDER_BOOKS};
+        use torus_state::cf::{
+            CF_BOOK_ORDER_ROWS, CF_NATIVE_MARKETS, CF_NATIVE_ORDER_BOOKS,
+        };
 
         let mut written = 0;
-        for &market_id in &self.dirty_books {
-            if self.book_rows {
-                let Some(book) = self.order_books.get_mut(&market_id) else {
-                    continue;
-                };
-                // Take the shadow out so the differ can borrow book + state
-                // freely; reinsert when done.
-                let mut shadow = self.book_shadows.remove(&market_id).unwrap_or_else(|| {
-                    BookRowShadow {
-                        next_seq: 1,
-                        ..Default::default()
-                    }
-                });
-                // rank8: journaling books (resident mode) diff only what the
-                // op stream touched; otherwise the classic full walk.
-                written += if book.mutation_journal_enabled() {
-                    Self::save_book_rows_journaled(&self.state, market_id, book, &mut shadow)
-                } else {
-                    Self::save_book_rows(&self.state, market_id, book, &mut shadow)
-                };
-                self.book_shadows.insert(market_id, shadow);
-            } else {
-                let Some(book) = self.order_books.get(&market_id) else {
-                    continue;
-                };
-                let key = market_id.to_be_bytes();
-                match borsh::to_vec(book) {
-                    Ok(data) => {
-                        if let Err(e) = self.state.put_cf_raw(CF_NATIVE_ORDER_BOOKS, &key, &data)
-                        {
-                            tracing::error!(market_id, %e, "failed to persist order book");
-                        } else {
-                            written += 1;
+        // Deterministic save order (market id ascending) — the overlay is
+        // keyed so final bytes never depend on order, but stable iteration
+        // keeps write counts and logs reproducible.
+        let mut dirty: Vec<MarketId> = self.dirty_books.iter().copied().collect();
+        dirty.sort_unstable();
+        for market_id in dirty {
+            let Some(book) = self.order_books.get_mut(&market_id) else {
+                continue;
+            };
+            match self.book_mode {
+                BookMode::Classic => {
+                    let key = market_id.to_be_bytes();
+                    match borsh::to_vec(&*book) {
+                        Ok(data) => {
+                            if let Err(e) =
+                                self.state.put_cf_raw(CF_NATIVE_ORDER_BOOKS, &key, &data)
+                            {
+                                tracing::error!(market_id, %e, "failed to persist order book");
+                            } else {
+                                written += 1;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(market_id, %e, "failed to serialize order book");
                         }
                     }
-                    Err(e) => {
-                        tracing::error!(market_id, %e, "failed to serialize order book");
+                    // Classic never drains the journals — cap their memory.
+                    book.discard_row_ops();
+                    book.discard_level_ops();
+                }
+                BookMode::OrderRows => {
+                    for (order_id, op) in book.take_row_ops() {
+                        let key = book_order_key(market_id, order_id);
+                        let res = match &op {
+                            Some(bytes) => {
+                                self.state.put_cf_raw(CF_NATIVE_ORDER_BOOKS, &key, bytes)
+                            }
+                            None => self.state.delete_cf_raw(CF_NATIVE_ORDER_BOOKS, &key),
+                        };
+                        match res {
+                            Ok(()) => written += 1,
+                            Err(e) => tracing::error!(
+                                market_id, order_id = %order_id, %e,
+                                "C4: order row write failed"
+                            ),
+                        }
+                    }
+                    // Mode 1 has no level rows: drop journaled levels unhashed.
+                    book.discard_level_ops();
+                    written += Self::diff_stop_rows(&self.state, market_id, book);
+                    written += Self::write_meta_if_moved(&self.state, market_id, book);
+                }
+                BookMode::LevelAuthority => {
+                    let mut rows_written = 0usize;
+                    let mut rows_deleted = 0usize;
+                    for (order_id, op) in book.take_row_ops() {
+                        let key = book_order_key(market_id, order_id);
+                        let res = match &op {
+                            Some(bytes) => {
+                                rows_written += 1;
+                                self.state.put_cf_raw(CF_BOOK_ORDER_ROWS, &key, bytes)
+                            }
+                            None => {
+                                rows_deleted += 1;
+                                self.state.delete_cf_raw(CF_BOOK_ORDER_ROWS, &key)
+                            }
+                        };
+                        if let Err(e) = res {
+                            tracing::error!(
+                                market_id, order_id = %order_id, %e,
+                                "3c: node-local order row write failed"
+                            );
+                        }
+                    }
+                    let mut levels_written = 0usize;
+                    let mut levels_deleted = 0usize;
+                    for ((tag, raw_price), op) in book.take_level_ops() {
+                        let key = level_row_key_tagged(market_id, tag, raw_price);
+                        let res = match &op {
+                            Some(data) => {
+                                levels_written += 1;
+                                self.state.put_cf_raw(
+                                    CF_NATIVE_ORDER_BOOKS,
+                                    &key,
+                                    &data.encode(),
+                                )
+                            }
+                            None => {
+                                levels_deleted += 1;
+                                self.state.delete_cf_raw(CF_NATIVE_ORDER_BOOKS, &key)
+                            }
+                        };
+                        match res {
+                            Ok(()) => written += 1,
+                            Err(e) => tracing::error!(
+                                market_id, %e, "3c: level row write failed"
+                            ),
+                        }
+                    }
+                    written += Self::diff_stop_rows(&self.state, market_id, book);
+                    written += Self::write_meta_if_moved(&self.state, market_id, book);
+                    if let Some(ref m) = self.metrics {
+                        m.exec_book_rows_written.inc_by(rows_written as u64);
+                        m.exec_book_rows_deleted.inc_by(rows_deleted as u64);
+                        m.exec_book_levels_written.inc_by(levels_written as u64);
+                        m.exec_book_levels_deleted.inc_by(levels_deleted as u64);
                     }
                 }
             }
@@ -1332,275 +1641,202 @@ impl<T: StateBackend> NativeExecContext<T> {
             }
         }
 
-        written
-    }
-
-    /// C4 row differ: bring the CF rows for ONE market in line with `book`,
-    /// writing only what changed. Returns puts + deletes performed.
-    ///
-    /// Row-write triggers, per resting order (walking each (side, price) queue
-    /// front-to-back):
-    ///   - unknown id → new order: assign `seq = next_seq++`, put row;
-    ///   - known id whose seq is monotonic within its queue → row is current
-    ///     unless `remaining_qty` changed (partial fill / in-place qty-decrease
-    ///     modify) → put row with the SAME seq;
-    ///   - known id whose seq BREAKS queue monotonicity → the order lost time
-    ///     priority and re-entered at the back (modify_order cancel+reinsert
-    ///     keeps the id) → re-stamp `seq = next_seq++`, put row.
-    /// Orders in the shadow but no longer on the book (fills that consumed
-    /// them, cancels, STP) → delete row. Stops: content is immutable per id —
-    /// put new ids, delete gone ids. Meta row rewritten only when its bytes
-    /// changed (next_seq / next_order_id / last_trade_price movement).
-    ///
-    /// DETERMINISM: seq assignment walks the book in canonical order and draws
-    /// from the persisted `next_seq` counter, so it is a pure function of
-    /// consensus state + this block's operations — identical on every
-    /// validator. The seqs land in row VALUES (state root!): this is required
-    /// for FIFO rebuild and safe precisely because assignment is deterministic.
-    fn save_book_rows(
-        state: &T,
-        market_id: MarketId,
-        book: &OrderBook,
-        shadow: &mut BookRowShadow,
-    ) -> usize {
-        let mut written = 0usize;
-        shadow.gen = shadow.gen.wrapping_add(1);
-        let gen = shadow.gen;
-
-        // ---- Resting orders: walk every queue front-to-back ----
-        for (_price, queue) in book.bid_queues().chain(book.ask_queues()) {
-            written += Self::diff_queue_rows(state, market_id, queue, shadow, gen);
-        }
-
-        // Sweep: shadow entries not touched this walk are no longer resting.
-        // Sorted so the delete stream (not just the final state) is
-        // deterministic — HashMap iteration order is per-process random.
-        let mut stale: Vec<OrderId> = shadow
-            .orders
-            .iter()
-            .filter(|(_, sh)| sh.gen != gen)
-            .map(|(id, _)| *id)
-            .collect();
-        stale.sort_unstable();
-        written += Self::delete_order_rows(state, market_id, &stale, shadow);
-
-        written += Self::diff_stop_rows(state, market_id, book, shadow);
-        written += Self::write_meta_if_moved(state, market_id, book, shadow);
-        written
-    }
-
-    /// rank8 row differ: journal-driven variant of [`Self::save_book_rows`] —
-    /// O(touched orders + affected levels), no whole-book walk.
-    ///
-    /// EQUIVALENCE ARGUMENT (this must stay byte-identical to the full walk,
-    /// or resident and non-resident nodes fork):
-    ///   - deletes: the journal's `removed` set ∩ persisted-shadow == exactly
-    ///     the ids the full walk's mark-and-sweep would delete;
-    ///   - row writes and fresh-seq assignment: only levels containing a
-    ///     journal-`touched` order can hold new orders, value changes, or
-    ///     seq-monotonicity violators (an untouched level's membership and
-    ///     order are unchanged since the last save, which left it monotonic
-    ///     and value-current). Processing exactly those levels IN CANONICAL
-    ///     ORDER (bids ascending price, then asks — the BTreeSet key below)
-    ///     with the SAME per-queue walk (`diff_queue_rows`) therefore
-    ///     consumes fresh seqs for the same orders in the same sequence as
-    ///     the full walk, producing identical row bytes;
-    ///   - stops and meta: shared helpers, identical by construction.
-    /// If a journal invariant is ever violated (a touched id not resting),
-    /// fall back to the full walk — correct regardless of journal state.
-    fn save_book_rows_journaled(
-        state: &T,
-        market_id: MarketId,
-        book: &mut OrderBook,
-        shadow: &mut BookRowShadow,
-    ) -> usize {
-        use std::collections::BTreeSet;
-
-        let (touched, removed) = book.take_mutation_journal();
-        // Defensive: journal invariant break ⇒ loud + full walk (self-healing).
-        if touched.iter().any(|id| book.get_order(*id).is_none()) {
-            tracing::error!(
-                market_id,
-                "rank8: journal.touched holds a non-resting order — falling back to full-walk save"
-            );
-            return Self::save_book_rows(state, market_id, book, shadow);
-        }
-        let book = &*book;
-
-        let mut written = 0usize;
-        shadow.gen = shadow.gen.wrapping_add(1);
-        let gen = shadow.gen;
-
-        // Deletes: journaled removals that were actually persisted (an order
-        // placed and consumed within the same save window was never written).
-        let mut stale: Vec<OrderId> = removed
-            .into_iter()
-            .filter(|id| shadow.orders.contains_key(id))
-            .collect();
-        stale.sort_unstable();
-        written += Self::delete_order_rows(state, market_id, &stale, shadow);
-
-        // Affected levels in canonical order: bid levels ascending price,
-        // then ask levels ascending price (bid tag 0 < ask tag 1).
-        let mut levels: BTreeSet<(u8, FixedPoint)> = BTreeSet::new();
-        for id in &touched {
-            // Unwrap is safe: the fallback above verified every touched id.
-            let o = book.get_order(*id).expect("touched order rests");
-            levels.insert((u8::from(o.side == Side::Sell), o.price));
-        }
-        for (side_tag, price) in levels {
-            let side = if side_tag == 0 { Side::Buy } else { Side::Sell };
-            let Some(queue) = book.level_queue(side, price) else {
-                continue; // unreachable: touched orders rest at this level
-            };
-            written += Self::diff_queue_rows(state, market_id, queue, shadow, gen);
-        }
-
-        written += Self::diff_stop_rows(state, market_id, book, shadow);
-        written += Self::write_meta_if_moved(state, market_id, book, shadow);
-        written
-    }
-
-    /// Shared C4/rank8 differ core: bring the rows for ONE (side, price)
-    /// queue in line with the book, front-to-back, assigning fresh seqs from
-    /// the shadow's counter exactly per the schema rules. Both the full walk
-    /// and the journal-driven save call THIS — the two paths cannot diverge
-    /// on row bytes or seq assignment.
-    fn diff_queue_rows(
-        state: &T,
-        market_id: MarketId,
-        queue: &std::collections::VecDeque<torus_core::order_book::Order>,
-        shadow: &mut BookRowShadow,
-        gen: u32,
-    ) -> usize {
-        use torus_state::cf::CF_NATIVE_ORDER_BOOKS;
-
-        let mut written = 0usize;
-        // Highest seq emitted so far in THIS queue — rebuild sorts a level
-        // by seq, so persisted seqs must ascend front-to-back per queue.
-        let mut last_seq: u64 = 0;
-        for order in queue {
-            let (seq, needs_write) = match shadow.orders.get(&order.id) {
-                // Known id, seq still monotonic in its queue: row is
-                // current iff no mutable field moved.
-                Some(sh) if sh.seq > last_seq => (sh.seq, !sh.matches(order)),
-                // Known id whose seq breaks queue monotonicity: the order
-                // lost time priority (modify re-insert) — fresh seq.
-                Some(_) => {
-                    let s = shadow.next_seq;
-                    shadow.next_seq += 1;
-                    (s, true)
-                }
-                // New resting order.
-                None => {
-                    let s = shadow.next_seq;
-                    shadow.next_seq += 1;
-                    (s, true)
-                }
-            };
-            if needs_write {
-                let key = book_order_key(market_id, order.id);
-                let val = book_order_value(seq, order);
-                if let Err(e) = state.put_cf_raw(CF_NATIVE_ORDER_BOOKS, &key, &val) {
-                    tracing::error!(market_id, order_id = %order.id, %e, "C4: order row put failed");
-                } else {
-                    written += 1;
-                }
+        // 3c: write the node-local mode marker once (first save on this DB).
+        if !self.book_mode_marker_present {
+            match self.state.put_cf_raw(
+                CF_NATIVE_MARKETS,
+                Self::BOOK_MODE_MARKER_KEY,
+                &[self.book_mode.marker_byte()],
+            ) {
+                Ok(()) => self.book_mode_marker_present = true,
+                Err(e) => tracing::error!(%e, "failed to persist __book_mode__ marker"),
             }
-            shadow.orders.insert(
-                order.id,
-                OrderShadow {
-                    seq,
-                    price_raw: order.price.raw(),
-                    qty_raw: order.remaining_qty.raw(),
-                    original_qty_raw: order.original_qty.raw(),
-                    gen,
-                },
-            );
-            last_seq = seq;
         }
+
         written
     }
 
-    /// Shared: delete the given (sorted) order rows and drop them from the
-    /// shadow. Returns deletes performed.
-    fn delete_order_rows(
-        state: &T,
-        market_id: MarketId,
-        ids: &[OrderId],
-        shadow: &mut BookRowShadow,
-    ) -> usize {
+    /// Shared modes 1/2: pending stops are immutable per id → put new ids,
+    /// delete gone ids. Stateless diff against the persisted stop rows (one
+    /// bounded prefix scan over `market ‖ 0x02` — the stop set is tiny).
+    fn diff_stop_rows(state: &T, market_id: MarketId, book: &OrderBook) -> usize {
         use torus_state::cf::CF_NATIVE_ORDER_BOOKS;
-        let mut written = 0usize;
-        for &id in ids {
-            let key = book_order_key(market_id, id);
-            if let Err(e) = state.delete_cf_raw(CF_NATIVE_ORDER_BOOKS, &key) {
-                tracing::error!(market_id, order_id = %id, %e, "C4: order row delete failed");
-            } else {
-                written += 1;
-            }
-            shadow.orders.remove(&id);
-        }
-        written
-    }
+        let mut prefix = [0u8; 9];
+        prefix[..8].copy_from_slice(&market_id.to_be_bytes());
+        prefix[8] = ROW_TAG_STOP;
+        let persisted: std::collections::HashSet<u128> = state
+            .iterate_cf(CF_NATIVE_ORDER_BOOKS, Some(&prefix))
+            .map(|rows| {
+                rows.iter()
+                    .filter(|(k, _)| k.len() == 25 && k[8] == ROW_TAG_STOP)
+                    .map(|(k, _)| u128::from_be_bytes(k[9..25].try_into().unwrap()))
+                    .collect()
+            })
+            .unwrap_or_default();
 
-    /// Shared: pending stops are immutable per id → put new ids, delete gone
-    /// ids (the stop set is tiny; no journal needed).
-    fn diff_stop_rows(
-        state: &T,
-        market_id: MarketId,
-        book: &OrderBook,
-        shadow: &mut BookRowShadow,
-    ) -> usize {
-        use torus_state::cf::CF_NATIVE_ORDER_BOOKS;
         let mut written = 0usize;
         let stops = book.stop_rows();
-        let mut live_stops = std::collections::HashSet::with_capacity(stops.len());
+        let mut live = std::collections::HashSet::with_capacity(stops.len());
         for (id, bytes) in stops {
-            if shadow.stops.insert(id) {
+            live.insert(id);
+            if !persisted.contains(&id) {
                 let key = book_stop_key(market_id, id);
                 if let Err(e) = state.put_cf_raw(CF_NATIVE_ORDER_BOOKS, &key, &bytes) {
-                    tracing::error!(market_id, stop_id = %id, %e, "C4: stop row put failed");
+                    tracing::error!(market_id, stop_id = %id, %e, "stop row put failed");
                 } else {
                     written += 1;
                 }
             }
-            live_stops.insert(id);
         }
-        let mut gone: Vec<u128> = shadow.stops.difference(&live_stops).copied().collect();
+        let mut gone: Vec<u128> = persisted.difference(&live).copied().collect();
         gone.sort_unstable();
         for id in gone {
             let key = book_stop_key(market_id, id);
             if let Err(e) = state.delete_cf_raw(CF_NATIVE_ORDER_BOOKS, &key) {
-                tracing::error!(market_id, stop_id = %id, %e, "C4: stop row delete failed");
+                tracing::error!(market_id, stop_id = %id, %e, "stop row delete failed");
             } else {
                 written += 1;
             }
-            shadow.stops.remove(&id);
         }
         written
     }
 
-    /// Shared: rewrite the meta row only when its bytes moved.
-    fn write_meta_if_moved(
-        state: &T,
-        market_id: MarketId,
-        book: &OrderBook,
-        shadow: &mut BookRowShadow,
-    ) -> usize {
+    /// Shared modes 1/2: rewrite the meta row only when its bytes moved
+    /// (stateless compare against the persisted row — one point read).
+    fn write_meta_if_moved(state: &T, market_id: MarketId, book: &OrderBook) -> usize {
         use torus_state::cf::CF_NATIVE_ORDER_BOOKS;
-        let meta = book_meta_value(shadow.next_seq, book);
-        if meta == shadow.meta {
-            return 0;
-        }
+        let meta = book_meta_value(book);
         let key = book_meta_key(market_id);
+        match state.get_cf_raw(CF_NATIVE_ORDER_BOOKS, &key) {
+            Ok(Some(existing)) if existing == meta => return 0,
+            Ok(_) => {}
+            Err(e) => {
+                tracing::error!(market_id, %e, "meta row read failed");
+            }
+        }
         if let Err(e) = state.put_cf_raw(CF_NATIVE_ORDER_BOOKS, &key, &meta) {
-            tracing::error!(market_id, %e, "C4: meta row put failed");
-            shadow.meta = meta;
+            tracing::error!(market_id, %e, "meta row put failed");
             return 0;
         }
-        shadow.meta = meta;
         1
+    }
+
+    /// Persist ONE book IN FULL under `mode` — genesis seeding, tests,
+    /// offline rebuild (the block path is [`Self::save_order_books`]).
+    /// Reconciles: deletes every persisted key for this market that the
+    /// fresh write does not overwrite, in BOTH the root CF and (mode 2) the
+    /// node-local order-row store.
+    pub fn save_book_full(state: &T, book: &mut OrderBook, mode: BookMode) -> usize {
+        use torus_state::cf::{CF_BOOK_ORDER_ROWS, CF_NATIVE_ORDER_BOOKS};
+        let market_id = book.market_id;
+        let mut written = 0usize;
+
+        if mode == BookMode::Classic {
+            let key = market_id.to_be_bytes();
+            if let Ok(data) = borsh::to_vec(&*book) {
+                if state.put_cf_raw(CF_NATIVE_ORDER_BOOKS, &key, &data).is_ok() {
+                    written += 1;
+                }
+            }
+            book.discard_row_ops();
+            book.discard_level_ops();
+            return written;
+        }
+
+        let row_ops = book.full_row_ops();
+        let level_ops = book.full_level_ops();
+        let meta = book_meta_value(book);
+        let stops = book.stop_rows();
+
+        // Fresh key set per CF.
+        let mut keep_root: std::collections::HashSet<Vec<u8>> =
+            std::collections::HashSet::new();
+        let mut keep_store: std::collections::HashSet<Vec<u8>> =
+            std::collections::HashSet::new();
+        keep_root.insert(book_meta_key(market_id).to_vec());
+        for (id, _) in &stops {
+            keep_root.insert(book_stop_key(market_id, *id).to_vec());
+        }
+        match mode {
+            BookMode::OrderRows => {
+                for (id, _) in &row_ops {
+                    keep_root.insert(book_order_key(market_id, *id).to_vec());
+                }
+            }
+            BookMode::LevelAuthority => {
+                for (id, _) in &row_ops {
+                    keep_store.insert(book_order_key(market_id, *id).to_vec());
+                }
+                for ((tag, raw), _) in &level_ops {
+                    keep_root.insert(level_row_key_tagged(market_id, *tag, *raw).to_vec());
+                }
+            }
+            BookMode::Classic => unreachable!(),
+        }
+
+        // Reconcile-delete stale keys.
+        let prefix = market_id.to_be_bytes();
+        if let Ok(existing) = state.iterate_cf(CF_NATIVE_ORDER_BOOKS, Some(&prefix)) {
+            for (key, _) in existing {
+                if !keep_root.contains(&key)
+                    && state.delete_cf_raw(CF_NATIVE_ORDER_BOOKS, &key).is_ok()
+                {
+                    written += 1;
+                }
+            }
+        }
+        if mode == BookMode::LevelAuthority {
+            if let Ok(existing) = state.iterate_cf(CF_BOOK_ORDER_ROWS, Some(&prefix)) {
+                for (key, _) in existing {
+                    if !keep_store.contains(&key) {
+                        let _ = state.delete_cf_raw(CF_BOOK_ORDER_ROWS, &key);
+                    }
+                }
+            }
+        }
+
+        // Fresh writes.
+        let _ = state.put_cf_raw(CF_NATIVE_ORDER_BOOKS, &book_meta_key(market_id), &meta);
+        written += 1;
+        for (id, bytes) in &stops {
+            let _ = state.put_cf_raw(
+                CF_NATIVE_ORDER_BOOKS,
+                &book_stop_key(market_id, *id),
+                bytes,
+            );
+            written += 1;
+        }
+        match mode {
+            BookMode::OrderRows => {
+                for (id, bytes) in &row_ops {
+                    let _ = state.put_cf_raw(
+                        CF_NATIVE_ORDER_BOOKS,
+                        &book_order_key(market_id, *id),
+                        bytes,
+                    );
+                    written += 1;
+                }
+            }
+            BookMode::LevelAuthority => {
+                for (id, bytes) in &row_ops {
+                    let _ = state.put_cf_raw(
+                        CF_BOOK_ORDER_ROWS,
+                        &book_order_key(market_id, *id),
+                        bytes,
+                    );
+                }
+                for ((tag, raw), data) in &level_ops {
+                    let _ = state.put_cf_raw(
+                        CF_NATIVE_ORDER_BOOKS,
+                        &level_row_key_tagged(market_id, *tag, *raw),
+                        &data.encode(),
+                    );
+                    written += 1;
+                }
+            }
+            BookMode::Classic => unreachable!(),
+        }
+        written
     }
 }
 
@@ -1956,15 +2192,10 @@ impl NativeExecutor {
             HashMap::new();
 
         for (&market_id, prepared) in &market_batches {
-            let book = ctx.order_books.remove(&market_id).unwrap_or_else(|| {
-                let mut b = OrderBook::new(market_id, FixedPoint::ONE, FixedPoint::ONE);
-                // rank8: new market under resident+rows — journal from birth
-                // (the journaled save must see its very first insertions).
-                if ctx.resident && ctx.book_rows {
-                    b.enable_mutation_journal();
-                }
-                b
-            });
+            let book = ctx
+                .order_books
+                .remove(&market_id)
+                .unwrap_or_else(|| OrderBook::new(market_id, FixedPoint::ONE, FixedPoint::ONE));
 
             let requests: Vec<MatchRequest<'_>> = prepared
                 .iter()
@@ -2864,15 +3095,10 @@ impl NativeExecutor {
 
         // Get or create order book for this market.
         ctx.dirty_books.insert(market_id);
-        let journal_new = ctx.resident && ctx.book_rows;
-        let book = ctx.order_books.entry(market_id).or_insert_with(|| {
-            let mut b = OrderBook::new(market_id, FixedPoint::ONE, FixedPoint::ONE);
-            // rank8: new market under resident+rows — journal from birth.
-            if journal_new {
-                b.enable_mutation_journal();
-            }
-            b
-        });
+        let book = ctx
+            .order_books
+            .entry(market_id)
+            .or_insert_with(|| OrderBook::new(market_id, FixedPoint::ONE, FixedPoint::ONE));
 
         // FIX 6 (ECON-FIND-09): Sync global order ID counter to prevent cross-market collisions.
         book.set_next_order_id(ctx.next_global_order_id);
