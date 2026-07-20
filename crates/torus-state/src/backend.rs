@@ -635,7 +635,14 @@ impl NativeStateOverlay {
             member_hits: 0,
             member_misses: 0,
             member_evictions: 0,
+            dirty_entries_by_cf: [0; 6],
         };
+        // 3c funnel attribution: dirty-entry composition per cf_tag.
+        for (tag, _) in dirty.keys() {
+            if let Some(slot) = stats.dirty_entries_by_cf.get_mut(*tag as usize) {
+                *slot += 1;
+            }
+        }
         let trie_result = if dirty.is_empty() {
             Ok(())
         } else {
@@ -744,6 +751,10 @@ pub struct NativeFlushStats {
     pub member_hits: usize,
     pub member_misses: usize,
     pub member_evictions: usize,
+    /// 3c: native-root dirty entries per cf_tag this flush (frozen
+    /// NATIVE_ROOT_CFS order) — funnel attribution of the dirty-set
+    /// composition.
+    pub dirty_entries_by_cf: [usize; 6],
 }
 
 impl StateBackend for NativeStateOverlay {
@@ -1360,6 +1371,49 @@ mod tests {
         let err = StateBackend::delete_cf_raw(&overlay, "cf_bogus", b"k").unwrap_err();
         assert!(matches!(err, StateError::MissingColumnFamily(ref n) if n == "cf_bogus"));
         assert_eq!(overlay.pending_write_count(), 0, "nothing may be buffered");
+    }
+
+    /// 3c: `CF_BOOK_ORDER_ROWS` is NODE-LOCAL — it must never contribute to the
+    /// native root. Witness: (a) it has no `cf_tag`, (b) overlay writes to it do
+    /// NOT appear in `native_dirty()`, (c) flushing a write to it leaves the
+    /// native root oracle unchanged while the bytes ARE durable.
+    #[test]
+    fn book_order_rows_cf_is_excluded_from_native_root() {
+        use crate::cf::CF_BOOK_ORDER_ROWS;
+
+        assert!(
+            crate::native_trie::cf_tag(CF_BOOK_ORDER_ROWS).is_none(),
+            "CF_BOOK_ORDER_ROWS must not be a native-root CF"
+        );
+
+        let (db, _dir) = temp_db();
+        crate::native_trie::build_native_trie_to_cf(&db).unwrap();
+        let root_before = crate::native_trie::native_root_full(&db).unwrap();
+
+        let overlay = NativeStateOverlay::new(db.clone());
+        StateBackend::put_cf_raw(&overlay, CF_BOOK_ORDER_ROWS, b"\x00\x00\x00\x00\x00\x00\x00\x01\x01k", b"orderrow").unwrap();
+        {
+            let state = overlay.pending.read().unwrap();
+            assert!(
+                state.native_dirty().is_empty(),
+                "order-row store writes must not enter the native dirty set"
+            );
+        }
+        overlay
+            .flush_with_native_trie_stats(&db, Some(1), None, None)
+            .unwrap();
+
+        assert_eq!(
+            crate::native_trie::native_root_full(&db).unwrap(),
+            root_before,
+            "node-local order-row store must not perturb the native root"
+        );
+        assert!(
+            StateDb::get_cf_raw(&db, CF_BOOK_ORDER_ROWS, b"\x00\x00\x00\x00\x00\x00\x00\x01\x01k")
+                .unwrap()
+                .is_some(),
+            "the write must still be durable"
+        );
     }
 
     /// T4.4: `discard_tx` resets the checkpoint stack so no undo trail leaks into the next tx.

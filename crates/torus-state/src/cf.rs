@@ -43,6 +43,19 @@ pub const CF_NATIVE_POSITIONS: &str = "cf_native_positions";
 pub const CF_NATIVE_BALANCES: &str = "cf_native_balances";
 pub const CF_NATIVE_ORDER_BOOKS: &str = "cf_native_order_books";
 pub const CF_NATIVE_MARKETS: &str = "cf_native_markets";
+/// 3c (level-rows-as-authority, `TORUS_BOOK_ROWS=2`): NODE-LOCAL full order-row
+/// store. Key/value schema = the C4 order row, byte-identical:
+/// `market_id(8 BE) ‖ 0x01 ‖ order_id(16 BE)` -> `seq(8 BE) ‖ borsh(Order)`.
+///
+/// DETERMINISM RULE: this CF is a deterministic materialization of consensus
+/// state (every validator holds identical bytes) but it is NODE-LOCAL by
+/// classification — it MUST NOT be in `NATIVE_ROOT_CFS`, is never bucketed /
+/// mirrored / hashed, and no reader may feed it into a root preimage except by
+/// way of the boot-verified book rebuild (level-hash byte-compare). Written
+/// through the same `NativeStateOverlay` atomic batch as the root CFs, trie,
+/// mirror and applied-height marker, so a crash cannot split root state from
+/// the order store.
+pub const CF_BOOK_ORDER_ROWS: &str = "cf_book_order_rows";
 
 // Staking
 pub const CF_STAKING_VALIDATORS: &str = "cf_staking_validators";
@@ -138,9 +151,10 @@ pub const CF_HASHED_STORAGE: &str = "cf_hashed_storage";
 /// Replaces the O(total) flat keccak over the 6 native CFs with an O(changed)/block root.
 pub const CF_NATIVE_TRIE: &str = "cf_native_trie";
 /// Bucket-ordered mirror of the 6 native-root CFs (analog of `CF_HASHED_*` for the EVM trie).
-/// Key: `bucket_id(2 BE) ++ cf_tag(1) ++ native_key` -> native value. A prefix-scan on a 2-byte
-/// bucket id yields that bucket's members in `(cf_tag, key)` order, so a changed bucket re-hashes
-/// in O(bucket) instead of O(total). Phase A.
+/// Key: `bucket_id(2 BE) ++ cf_tag(1) ++ native_key` -> `keccak256(native value)` (32 B —
+/// hash-only mirror, 3c preimage round). A prefix-scan on a 2-byte bucket id yields that bucket's
+/// members in `(cf_tag, key)` order, so a changed bucket re-hashes in O(bucket) instead of
+/// O(total). Phase A.
 pub const CF_NATIVE_HASHED: &str = "cf_native_hashed";
 
 /// All column family names. RocksDB requires these at open time.
@@ -188,4 +202,5 @@ pub const ALL_CF_NAMES: &[&str] = &[
     CF_HASHED_STORAGE,
     CF_NATIVE_TRIE,
     CF_NATIVE_HASHED,
+    CF_BOOK_ORDER_ROWS,
 ];

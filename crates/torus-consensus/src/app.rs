@@ -1428,6 +1428,10 @@ impl ExecutionContext {
                         m.member_cache_hits.inc_by(stats.member_hits as u64);
                         m.member_cache_misses.inc_by(stats.member_misses as u64);
                         m.member_cache_evictions.inc_by(stats.member_evictions as u64);
+                        // 3c: per-cf-tag dirty-entry attribution.
+                        for (i, n) in stats.dirty_entries_by_cf.iter().enumerate() {
+                            m.exec_dirty_entries_by_cf[i].inc_by(*n as u64);
+                        }
                     }
                 }
                 Err(e) => {

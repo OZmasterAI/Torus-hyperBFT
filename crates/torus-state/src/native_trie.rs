@@ -11,6 +11,13 @@
 //! buckets (with default-node compression) yields the root. Only changed buckets + their tree paths
 //! are touched per block, so the root is O(changed).
 //!
+//! HASH-ONLY MIRROR (3c batched preimage round, design inherited from
+//! `docs/plans/hash-only-native-mirror.md`): the mirror (`CF_NATIVE_HASHED`) stores
+//! `keccak256(value)` (32 B) instead of the full value, and bucket leaves are defined over the
+//! per-entry VALUE HASHES: `leaf = keccak(frame(cf_tag, key, value_hash) ...)`. This is a
+//! CONSENSUS-VISIBLE preimage change (all 6 CFs, every mode): fleet-uniform, fresh genesis /
+//! offline mirror rebuild required. `bucket_id`, tree shape, node keys and defaults are unchanged.
+//!
 //! Determinism is #1: [`native_root_full`] (full O(total) recompute) is the oracle; the persisted
 //! incremental root must equal it byte-for-byte, every block (the A2 gate). Both go through the same
 //! [`build_tree`] so they cannot diverge.
@@ -107,6 +114,7 @@ fn frame_entry(out: &mut Vec<u8>, tag: u8, key: &[u8], value: &[u8]) {
 
 /// Mirror key in `CF_NATIVE_HASHED`: `bucket(2 BE) ‖ cf_tag(1) ‖ native_key`. A prefix scan on the
 /// 2-byte bucket yields the bucket's members in `(cf_tag, key)` order — the canonical hash order.
+/// The mirror VALUE is `keccak256(native value)` (32 B) — hash-only mirror, see module docs.
 fn mirror_key(bucket: u16, tag: u8, key: &[u8]) -> Vec<u8> {
     let mut k = Vec::with_capacity(3 + key.len());
     k.extend_from_slice(&bucket.to_be_bytes());
@@ -200,7 +208,8 @@ fn leaves_from_db(db: &StateDb) -> Result<BTreeMap<u16, B256>, StateError> {
         for item in iter {
             let (key, value) = item?;
             let b = bucket_id(tag, &key);
-            frame_entry(acc.entry(b).or_default(), tag, &key, &value);
+            // Hash-only mirror: leaves are defined over per-entry value hashes.
+            frame_entry(acc.entry(b).or_default(), tag, &key, keccak256(&value).as_slice());
         }
     }
     Ok(acc
@@ -251,8 +260,10 @@ pub fn build_native_trie_to_cf(db: &StateDb) -> Result<B256, StateError> {
         for item in iter {
             let (key, value) = item?;
             let b = bucket_id(tag, &key);
-            batch.put_cf(mirror_cf, mirror_key(b, tag, &key), &value);
-            frame_entry(acc.entry(b).or_default(), tag, &key, &value);
+            // Hash-only mirror: store keccak(value), frame the hash into the leaf preimage.
+            let vh = keccak256(&value);
+            batch.put_cf(mirror_cf, mirror_key(b, tag, &key), vh.as_slice());
+            frame_entry(acc.entry(b).or_default(), tag, &key, vh.as_slice());
         }
     }
     let leaves: BTreeMap<u16, B256> = acc
@@ -487,8 +498,9 @@ fn read_node(
     }
 }
 
-/// Read a bucket's current members from the mirror (prefix scan), decoded as `(cf_tag, key) -> value`
-/// in canonical order.
+/// Read a bucket's current members from the mirror (prefix scan), decoded as
+/// `(cf_tag, key) -> value_hash` (32 B keccak of the live CF value — hash-only mirror) in
+/// canonical order.
 #[allow(clippy::type_complexity)]
 fn read_bucket_members(
     db: &StateDb,
@@ -544,7 +556,8 @@ fn read_bucket_members(
 // Memory-bounded: LRU eviction to the byte budget; an evicted bucket re-scans.
 // Composes with the trie cache and parallelism in every on/off combination.
 
-/// Decoded members of one bucket, in canonical `(cf_tag, key)` order.
+/// Decoded members of one bucket, in canonical `(cf_tag, key)` order. Values are
+/// the 32 B per-entry value hashes (hash-only mirror).
 pub(crate) type Members = BTreeMap<(u8, Vec<u8>), Vec<u8>>;
 
 /// Hard cap on `TORUS_PARALLEL_BUCKET_HASH` worker threads.
@@ -784,17 +797,21 @@ fn process_bucket(
         let mk = mirror_key(bucket, *tag, key);
         match val {
             Some(v) => {
+                // Hash-only mirror: members / mirror rows hold keccak(value); the
+                // clean-write elision compares stored hash == hash of the new value
+                // (identical semantics — a keccak collision is a broken world anyway).
+                let vh = keccak256(v);
                 if elide
                     && members.get(&(*tag, key.clone())).map(|m| m.as_slice())
-                        == Some(v.as_slice())
+                        == Some(vh.as_slice())
                 {
                     continue; // clean rewrite — idempotent (cached path elides)
                 }
-                members.insert((*tag, key.clone()), v.clone());
+                members.insert((*tag, key.clone()), vh.as_slice().to_vec());
                 mirror_ops.push(NodeOp {
                     target: CfTarget::Mirror,
                     key: mk,
-                    value: Some(v.clone()),
+                    value: Some(vh.as_slice().to_vec()),
                 });
                 bucket_changed = true;
             }
@@ -1471,6 +1488,72 @@ mod tests {
                 incr, full,
                 "round {round}: incremental != full-scan over evolved base"
             );
+        }
+    }
+
+    /// Assert every `CF_NATIVE_HASHED` row is exactly 32 B and equals the keccak of the
+    /// live CF value it mirrors, and that no live entry is missing a mirror row
+    /// (the hash-only-mirror witness).
+    fn assert_mirror_is_hash_only(db: &StateDb) {
+        let mirror_cf = db.cf_handle(CF_NATIVE_HASHED).unwrap();
+        let mut mirror_rows = 0usize;
+        for item in db.inner().iterator_cf(mirror_cf, rocksdb::IteratorMode::Start) {
+            let (k, v) = item.unwrap();
+            assert!(k.len() >= 3, "mirror key too short");
+            assert_eq!(v.len(), 32, "mirror value must be a 32 B hash");
+            let tag = k[2];
+            let native_key = &k[3..];
+            let (cf_name, _) = NATIVE_ROOT_CFS
+                .iter()
+                .find(|(_, t)| *t == tag)
+                .expect("mirror row tags a native-root CF");
+            let live = db
+                .get_cf_raw(cf_name, native_key)
+                .unwrap()
+                .expect("mirror row must have a live CF entry");
+            assert_eq!(
+                v.as_ref(),
+                keccak256(&live).as_slice(),
+                "mirror value != keccak(live value)"
+            );
+            // Key placement: the bucket prefix must match bucket_id(tag, key).
+            let b = u16::from_be_bytes([k[0], k[1]]);
+            assert_eq!(b, bucket_id(tag, native_key), "mirror bucket prefix wrong");
+            mirror_rows += 1;
+        }
+        // Completeness: every live native-root entry has a mirror row.
+        let mut live_rows = 0usize;
+        for (cf_name, _) in NATIVE_ROOT_CFS {
+            if let Some(cf) = db.inner().cf_handle(cf_name) {
+                live_rows += db
+                    .inner()
+                    .iterator_cf(cf, rocksdb::IteratorMode::Start)
+                    .count();
+            }
+        }
+        assert_eq!(mirror_rows, live_rows, "mirror row count != live entry count");
+    }
+
+    /// Hash-only mirror witness: after a full build AND after incremental commits
+    /// (inserts / updates / deletes), every mirror row is exactly `keccak(value)`.
+    #[test]
+    fn mirror_stores_value_hashes_only() {
+        let (db, _dir) = temp_db();
+        seed(&db);
+        build_native_trie_to_cf(&db).unwrap();
+        assert_mirror_is_hash_only(&db);
+
+        let cases: Vec<Vec<(usize, Vec<u8>, Option<Vec<u8>>)>> = vec![
+            vec![(0, key_for(0, 5), Some(vec![1, 2, 3, 4]))],
+            vec![(2, b"hash-only-new-key".to_vec(), Some(vec![9; 20]))],
+            vec![(3, key_for(3, 10), None)],
+            vec![(2, b"hash-only-new-key".to_vec(), None)],
+        ];
+        for ops in &cases {
+            let dirty = apply_ops(&db, ops);
+            let incr = commit_native_trie_incremental(&db, &dirty).unwrap();
+            assert_eq!(incr, native_root_full(&db).unwrap());
+            assert_mirror_is_hash_only(&db);
         }
     }
 
