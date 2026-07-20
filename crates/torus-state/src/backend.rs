@@ -1362,6 +1362,49 @@ mod tests {
         assert_eq!(overlay.pending_write_count(), 0, "nothing may be buffered");
     }
 
+    /// 3c: `CF_BOOK_ORDER_ROWS` is NODE-LOCAL — it must never contribute to the
+    /// native root. Witness: (a) it has no `cf_tag`, (b) overlay writes to it do
+    /// NOT appear in `native_dirty()`, (c) flushing a write to it leaves the
+    /// native root oracle unchanged while the bytes ARE durable.
+    #[test]
+    fn book_order_rows_cf_is_excluded_from_native_root() {
+        use crate::cf::CF_BOOK_ORDER_ROWS;
+
+        assert!(
+            crate::native_trie::cf_tag(CF_BOOK_ORDER_ROWS).is_none(),
+            "CF_BOOK_ORDER_ROWS must not be a native-root CF"
+        );
+
+        let (db, _dir) = temp_db();
+        crate::native_trie::build_native_trie_to_cf(&db).unwrap();
+        let root_before = crate::native_trie::native_root_full(&db).unwrap();
+
+        let overlay = NativeStateOverlay::new(db.clone());
+        StateBackend::put_cf_raw(&overlay, CF_BOOK_ORDER_ROWS, b"\x00\x00\x00\x00\x00\x00\x00\x01\x01k", b"orderrow").unwrap();
+        {
+            let state = overlay.pending.read().unwrap();
+            assert!(
+                state.native_dirty().is_empty(),
+                "order-row store writes must not enter the native dirty set"
+            );
+        }
+        overlay
+            .flush_with_native_trie_stats(&db, Some(1), None, None)
+            .unwrap();
+
+        assert_eq!(
+            crate::native_trie::native_root_full(&db).unwrap(),
+            root_before,
+            "node-local order-row store must not perturb the native root"
+        );
+        assert!(
+            StateDb::get_cf_raw(&db, CF_BOOK_ORDER_ROWS, b"\x00\x00\x00\x00\x00\x00\x00\x01\x01k")
+                .unwrap()
+                .is_some(),
+            "the write must still be durable"
+        );
+    }
+
     /// T4.4: `discard_tx` resets the checkpoint stack so no undo trail leaks into the next tx.
     #[test]
     fn discard_tx_clears_checkpoint_state() {
