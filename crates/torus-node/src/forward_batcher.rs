@@ -245,6 +245,15 @@ fn d2l_reforward_ms() -> u64 {
 // The batcher task (replaces the per-item RPC→network forward bridge).
 // ---------------------------------------------------------------------------
 
+/// B2 verifier gate: the re-forward sweep runs ONLY when leader-forwarding is
+/// armed (`--native-gossip=false`, the same `forward_bodies` gate the RPC
+/// forward path honors) AND the ms knob is non-zero. In default gossip mode
+/// the pre-spread already delivers every body to the leader — a sweep there
+/// ships pooled actions the leader already has (default-behavior drift).
+fn sweep_enabled(reforward_ms: u64, forwarding_armed: bool) -> bool {
+    forwarding_armed && reforward_ms > 0
+}
+
 /// Spawn the B1 ForwardBatcher task: consume structured
 /// `(leader hint, sender, action)` tuples from the bounded RPC forward
 /// channel, coalesce per target, and ship ONE 0xFD envelope per
@@ -259,13 +268,15 @@ pub(crate) fn spawn(
     leader_vk_fn: Arc<dyn Fn() -> Option<[u8; 32]> + Send + Sync>,
     own_vk: [u8; 32],
     mempool: Arc<torus_mempool::Mempool>,
+    forwarding_armed: bool,
 ) {
     let batch_ms = d2l_batch_ms();
     let max_bytes = d2l_batch_max_bytes();
     let reforward_ms = d2l_reforward_ms();
+    let sweep_on = sweep_enabled(reforward_ms, forwarding_armed);
     info!(
         batch_ms,
-        max_bytes, reforward_ms, "B1 d2l forward batcher armed (TORUS_D2L_BATCH=1)"
+        max_bytes, reforward_ms, sweep_on, "B1 d2l forward batcher armed (TORUS_D2L_BATCH=1)"
     );
     tokio::spawn(async move {
         let mut batcher = ForwardBatcher::new(max_bytes);
@@ -294,7 +305,7 @@ pub(crate) fn spawn(
                         dispatch(&network, &leader_vk_fn, own_vk, t, pairs);
                     }
                 }
-                _ = sweep.tick(), if reforward_ms > 0 => {
+                _ = sweep.tick(), if sweep_on => {
                     // Re-forward the oldest still-pending pool actions to the
                     // CURRENT leader. Selection is read-only over the sorted
                     // pool; the byte cap slices the re-sends into envelopes.
