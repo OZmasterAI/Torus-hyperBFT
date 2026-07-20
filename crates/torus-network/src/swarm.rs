@@ -2881,11 +2881,25 @@ enum ConsensusEnqueue {
 /// timeout-vote collector only collects for its current view). Suppressing
 /// them stalls liveness with the fan on; duplicates there are cheap and fully
 /// idempotent.
+///
+/// L3 v2 follow-through: the block-data fetch messages
+/// (`BlockDataRequest`/`BlockDataResponse`/`ProposalHeader`,
+/// `is_block_data_msg`) are HotStuffMessage variants but belong to the
+/// timer-redelivery class, not the one-shot class: `tick_pending_body_retries`
+/// re-sends a byte-identical `BlockDataRequest` every retry interval, the
+/// proposer serves byte-identical `BlockDataResponse`s to re-requests, and the
+/// v2 body push direct-sends a response whose bytes equal a later solicited
+/// serve from the same proposer. Deduping any of them can swallow the only
+/// copy of a body (the pushed copy may arrive pre-header and be benignly
+/// dropped by hotstuff) and stall the fetch until target rotation. They are
+/// exempt for exactly the 4f832e5 reason — like pacemaker/block-sync, their
+/// redelivery is the loss-recovery, and hotstuff handles duplicates
+/// idempotently.
 fn dedup_applies(msg: &hotstuff_rs::networking::messages::Message) -> bool {
     use hotstuff_rs::networking::messages::{Message, ProgressMessage};
     matches!(
         msg,
-        Message::ProgressMessage(ProgressMessage::HotStuffMessage(_))
+        Message::ProgressMessage(ProgressMessage::HotStuffMessage(m)) if !m.is_block_data_msg()
     )
 }
 
@@ -4152,6 +4166,40 @@ mod tests {
         .into()
     }
 
+    /// A block-data fetch request — a HotStuffMessage variant that
+    /// `tick_pending_body_retries` re-sends BYTE-IDENTICALLY on its retry
+    /// tick: the redelivery is the loss-recovery, so the dedup must never
+    /// suppress it.
+    fn test_block_data_request_message() -> hotstuff_rs::networking::messages::Message {
+        hotstuff_rs::hotstuff::messages::HotStuffMessage::BlockDataRequest(
+            hotstuff_rs::hotstuff::messages::BlockDataRequest {
+                chain_id: hotstuff_rs::types::data_types::ChainID::new(9),
+                view: hotstuff_rs::types::data_types::ViewNumber::new(7),
+                block_hash: hotstuff_rs::types::data_types::CryptoHash::new([3u8; 32]),
+            },
+        )
+        .into()
+    }
+
+    /// A block-data response — served byte-identically to every re-request,
+    /// and (L3 v2) direct-pushed by the proposer with bytes equal to a later
+    /// solicited serve. Deduping it can swallow the only deliverable copy of
+    /// a body, so it must be exempt.
+    fn test_block_data_response_message() -> hotstuff_rs::networking::messages::Message {
+        hotstuff_rs::hotstuff::messages::HotStuffMessage::BlockDataResponse(
+            hotstuff_rs::hotstuff::messages::BlockDataResponse {
+                view: hotstuff_rs::types::data_types::ViewNumber::new(7),
+                block: hotstuff_rs::types::block::Block::new(
+                    hotstuff_rs::types::data_types::BlockHeight::new(0),
+                    hotstuff_rs::hotstuff::types::PhaseCertificate::genesis_pc(),
+                    hotstuff_rs::types::data_types::CryptoHash::new([4u8; 32]),
+                    hotstuff_rs::types::data_types::Data::new(vec![]),
+                ),
+            },
+        )
+        .into()
+    }
+
     /// A pacemaker message (an `AdvanceView`) — the message class the pacemaker
     /// REBROADCASTS byte-identically on a timer (TimeoutVote every view-timeout
     /// until a TC forms, AdvanceView re-sends): the receiver's designed
@@ -4366,6 +4414,16 @@ mod tests {
             (test_hotstuff_nudge_message(), true, "hotstuff nudge"),
             (test_pacemaker_message(), false, "pacemaker advance-view"),
             (test_consensus_message(), false, "block-sync message"),
+            (
+                test_block_data_request_message(),
+                false,
+                "block-data request (retry-tick redelivery)",
+            ),
+            (
+                test_block_data_response_message(),
+                false,
+                "block-data response (re-serve / v2 push + solicited serve)",
+            ),
         ];
         for (msg, deduped, name) in cases {
             let shared = test_shared_b2(true, true);
