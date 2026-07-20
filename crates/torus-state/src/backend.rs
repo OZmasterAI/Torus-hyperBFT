@@ -635,6 +635,7 @@ impl NativeStateOverlay {
             member_hits: 0,
             member_misses: 0,
             member_evictions: 0,
+            member_resident_buckets: 0,
             dirty_entries_by_cf: [0; 6],
         };
         // 3c funnel attribution: dirty-entry composition per cf_tag.
@@ -730,6 +731,10 @@ impl NativeStateOverlay {
                 return Err(e.into());
             }
         }
+        // L3 #2: record post-flush residency for the eviction-pressure gauge.
+        if let Some(c) = member_cache.as_deref() {
+            stats.member_resident_buckets = c.len();
+        }
         trie_result?;
         Ok(stats)
     }
@@ -751,6 +756,9 @@ pub struct NativeFlushStats {
     pub member_hits: usize,
     pub member_misses: usize,
     pub member_evictions: usize,
+    /// L3 #2: resident bucket count in the member cache after this flush's
+    /// write-through (0 when the cache is disabled) — eviction-pressure witness.
+    pub member_resident_buckets: usize,
     /// 3c: native-root dirty entries per cf_tag this flush (frozen
     /// NATIVE_ROOT_CFS order) — funnel attribution of the dirty-set
     /// composition.

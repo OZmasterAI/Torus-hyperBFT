@@ -220,6 +220,10 @@ pub struct Metrics {
     pub member_cache_hits: Counter,
     pub member_cache_misses: Counter,
     pub member_cache_evictions: Counter,
+    /// L3 #2: resident bucket count in the member cache after the last flush —
+    /// the eviction-pressure witness (near the budget-implied cap ⇒ evicting ⇒
+    /// misses are cold re-scans, not cold-start).
+    pub member_cache_resident_buckets: Gauge,
     /// 3c: per-cf-tag native-root dirty entries per flush (funnel attribution
     /// of the post-3c dirty-set composition). Indexed by the frozen cf_tag
     /// order: balances / order_books / positions / oracle / staking_delegations
@@ -904,6 +908,13 @@ impl Metrics {
             member_cache_evictions.clone(),
         );
 
+        let member_cache_resident_buckets = Gauge::default();
+        registry.register(
+            "torus_member_cache_resident_buckets",
+            "Bucket-member cache resident bucket count after the last flush (eviction-pressure witness)",
+            member_cache_resident_buckets.clone(),
+        );
+
         // 3c: per-cf-tag dirty-entry attribution (frozen NATIVE_ROOT_CFS order).
         let exec_dirty_entries_by_cf: [Counter; 6] = Default::default();
         for (i, suffix) in [
@@ -1292,6 +1303,7 @@ impl Metrics {
             member_cache_hits,
             member_cache_misses,
             member_cache_evictions,
+            member_cache_resident_buckets,
             exec_dirty_entries_by_cf,
             exec_book_rows_written,
             exec_book_rows_deleted,
