@@ -31,7 +31,3 @@ devnet/wsl/genesis-3val.json
 *.pid
 testnet/p3-testnet/__pycache__/
 testnet/p3-testnet/results/
-
-# validator secrets — NEVER commit (seed.passphrase was public in git until 2026-07-21)
-*.passphrase
-*.keystore
