@@ -78,12 +78,21 @@ deliver. Pipeline-latency levers are EXHAUSTED. Layer 3 = cut replica per-view W
   docs/l3-savebooks-attribution.md @ 7d729b9 on perf/l3-savebooks (b18c).
   Async-post-flush A/B NEUTRAL in vivo — default-off, deprioritized. Queue is
   BIMODAL (pegged↔drained; only ~39% of blocks loaded).
-- **IN FLIGHT: level-hash sponge cache (Fable, perf/l3-levelhash-cache)** —
-  incremental keccak absorb for tail-append-only levels, byte-identical commitment
-  (clone cached hasher state, absorb tail, finalize; ANY non-append op invalidates
-  → full-rehash fallback), TORUS_LEVEL_HASH_CACHE default-off, node-local. Target
-  ~107→1-5ms on append-heavy shapes. Proper pre-mainnet fix stays chunked level
-  commitment O(√depth) (consensus-visible, tag 0x04+ reserved, production debt).
+- **LEVEL-HASH SPONGE CACHE: PROVEN AND MERGED (session close, 2026-07-21)** —
+  incremental keccak absorb for tail-append-only levels, byte-identical commitment,
+  staged seeding (probe → seed after one clean append-only interval → O(tail) hits),
+  TORUS_LEVEL_HASH_CACHE default-off, node-local. Design docs/design-levelhash-cache.md;
+  in-vivo A/B devnet/wsl/results/cacheab-18c-13bd833.md: **+45% blk/s (6.89→9.96),
+  +81% matched/s (1,623→2,932), worst-60s 6.7× (0.672→4.500), view 134→97ms,
+  save_books 83→37ms**; engine/flush −20-24% free from released CPU. Merged into
+  re-proof5 @ b4dc190. **Gate 21.0 still FAILS (4.50)** — decay damped, not cured;
+  residual loaded chain ~125ms = engine 41.6 (2.6× contention vs 16 serial) + flush
+  38.3 + save residual 37.1 (match-invalidated level fronts break the keccak prefix
+  — that class is fixable only by the chunked commitment, consensus-visible, tag
+  0x04+ reserved, production debt). Next-round ranked list in cacheab doc §Next:
+  cache-stats Prometheus export (debt), flush-at-depth, engine-contention
+  re-measure, cap re-sweep (drain equilibrium shifted). Orientation doc for cold
+  starts: docs/re-proof5-context.md.
 - **New known-flaky test**: exec_hole_budget_exhaustion_latches_fail_stop
   (torus-consensus lib) — 3/3 standalone green on branch + 2/2 on base, fails only
   under parallel in-binary test load. justify_block_livelock_test failed 1× standalone
