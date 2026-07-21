@@ -44,7 +44,7 @@ cargo build --release -p torus-node -p bench-throughput -p torus-explorer
 ./testnet/gen-weighted-genesis.sh
 sha256sum testnet/genesis-weighted-full.json
 # MUST equal:
-# 2c0d9cb52cd10c4996f2e4f43b29d54b97016e3ed91bb3984ce2725c66beb4ab
+# ffb28a50fad4d8e82b3ac78da5c53ad0311f1b2fb1c50d032ccb923c3cc2d655
 ```
 **If it doesn't match, stop and tell us.**
 
@@ -100,7 +100,7 @@ serving the old chain undoes the whole relaunch.
   --data-dir ./data \
   --archive \
   --p2p-listen /ip4/0.0.0.0/udp/30333/quic-v1 \
-  --p2p-peers /ip4/95.111.231.121/udp/30333/quic-v1/p2p/12D3KooWQeKf21QBchGQUr25U6w6yNB4P78PPQZivhHRAqFnMK24,/ip4/13.140.140.138/udp/30333/quic-v1/p2p/12D3KooW9tETg7AgyXYvPzaQTFWi98g8msMMwx9GkezrDFPMQw7H \
+  --p2p-peers /ip4/95.111.231.121/udp/30333/quic-v1/p2p/12D3KooWQeKf21QBchGQUr25U6w6yNB4P78PPQZivhHRAqFnMK24,/ip4/13.140.140.138/udp/30333/quic-v1/p2p/12D3KooWJaBxZM8SUgML4FhA9NgBrgLktFS2jaySxmV3Q8F1KUYy \
   --rpc-addr 127.0.0.1:8545 \
   --metrics-addr 127.0.0.1:9090 \
   --log-level info,hotstuff_rs=warn
@@ -183,6 +183,6 @@ and peered. Those three carry 12M of the 14M power, which clears the 9.3334M quo
 their own, so the chain starts without waiting on **val3** — val3 is NAT/dials-out and
 joins itself whenever it comes up. Do not list val3 in `--p2p-peers`; it dials you.
 
-Ping us once: (1) built, (2) genesis sha matches `2c0d9cb52cd10c4996f2e4f43b29d54b97016e3ed91bb3984ce2725c66beb4ab`, and
+Ping us once: (1) built, (2) genesis sha matches `ffb28a50fad4d8e82b3ac78da5c53ad0311f1b2fb1c50d032ccb923c3cc2d655`, and
 (3) 30333/udp confirmed open. We start all three together, then you bring up the
 indexer + UI.

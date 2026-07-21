@@ -56,7 +56,7 @@ the same bytes:
 ./testnet/gen-weighted-genesis.sh
 sha256sum testnet/genesis-weighted-full.json
 # MUST equal:
-# 2c0d9cb52cd10c4996f2e4f43b29d54b97016e3ed91bb3984ce2725c66beb4ab
+# ffb28a50fad4d8e82b3ac78da5c53ad0311f1b2fb1c50d032ccb923c3cc2d655
 ```
 
 **If it doesn't match, stop and tell us.** A different hash means a different state
@@ -91,7 +91,7 @@ mv <your-data-dir> <your-data-dir>.bak-$(date +%s)
   --data-dir <your-data-dir> \
   --keystore <your-keystore> --passphrase-file <your-passphrase-file> \
   --retention-blocks 100000 \
-  --p2p-peers /ip4/95.111.231.121/udp/30333/quic-v1/p2p/12D3KooWQeKf21QBchGQUr25U6w6yNB4P78PPQZivhHRAqFnMK24,/ip4/103.167.235.250/udp/30333/quic-v1/p2p/12D3KooWFSJjbJhn6H92v7FbPGWXoCWLQFhH4koG56mS7Ps7KGPu,/ip4/13.140.140.138/udp/30333/quic-v1/p2p/12D3KooW9tETg7AgyXYvPzaQTFWi98g8msMMwx9GkezrDFPMQw7H \
+  --p2p-peers /ip4/95.111.231.121/udp/30333/quic-v1/p2p/12D3KooWQeKf21QBchGQUr25U6w6yNB4P78PPQZivhHRAqFnMK24,/ip4/103.167.235.250/udp/30333/quic-v1/p2p/12D3KooWFSJjbJhn6H92v7FbPGWXoCWLQFhH4koG56mS7Ps7KGPu,/ip4/13.140.140.138/udp/30333/quic-v1/p2p/12D3KooWJaBxZM8SUgML4FhA9NgBrgLktFS2jaySxmV3Q8F1KUYy \
   --rpc-addr 127.0.0.1:8545 \
   --metrics-addr 127.0.0.1:9090 \
   --log-level info,hotstuff_rs=warn
