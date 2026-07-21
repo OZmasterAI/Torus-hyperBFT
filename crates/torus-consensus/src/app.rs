@@ -290,6 +290,29 @@ fn nonblocking_exec_dispatch() -> bool {
     parse_nonblocking_dispatch_toggle(std::env::var("TORUS_EXEC_NONBLOCKING_DISPATCH").ok())
 }
 
+/// L3 flush-pipe (b): `TORUS_ASYNC_POST_FLUSH`. Unset / empty / `"0"` ⇒ FALSE =
+/// the exec-time block-body write (CF_BLOCK_BODIES) stays SYNCHRONOUS on the exec
+/// critical chain, byte-identical to today. Any other non-empty value (`"1"`,
+/// `"true"`) ⇒ the exec-time body write is handed to a bounded background writer
+/// off the exec thread. SAFE because the body is ALREADY durable from the
+/// commit-time write (`persist_committed_block_durably`, FIX 1a) before the block
+/// enters the exec channel — the exec-time write is an idempotent repeat that no
+/// crash-replay or block-sync reader depends on. Read once at exec-context build.
+fn parse_async_post_flush_toggle(raw: Option<String>) -> bool {
+    match raw {
+        Some(v) => {
+            let t = v.trim();
+            !t.is_empty() && t != "0"
+        }
+        None => false,
+    }
+}
+
+/// Effective async-post-flush mode (read once when the execution context is built).
+fn async_post_flush_enabled() -> bool {
+    parse_async_post_flush_toggle(std::env::var("TORUS_ASYNC_POST_FLUSH").ok())
+}
+
 /// Rank 2 memory bound: total bincode bytes of `ExecSource::Ready` bodies the
 /// `deferred_exec` park may hold before further Ready parks DEMOTE to
 /// `ExecSource::Compact` (hash references, rematerialized from the durable DA
@@ -426,6 +449,13 @@ struct ExecutionContext {
     /// ExecutionContext at execution-thread exit, which drains the queue before
     /// `TorusApp::Drop`'s join returns (shutdown flush ordering).
     trade_writer: Option<torus_state::BackgroundCfWriter>,
+    /// L3 flush-pipe (b): background writer for the exec-time block-body persist
+    /// (CF_BLOCK_BODIES), gated by `TORUS_ASYNC_POST_FLUSH`. `Some` moves the
+    /// (already-durable-at-dispatch) exec-time body rewrite off the exec critical
+    /// chain; `None` = the synchronous exact-today write. Dropped with the
+    /// ExecutionContext at execution-thread exit, draining the queue before
+    /// `TorusApp::Drop`'s join returns (same shutdown ordering as `trade_writer`).
+    post_flush_writer: Option<torus_state::BackgroundCfWriter>,
     /// T1.5 fail-stop latch, shared with `TorusApp` on the consensus thread.
     /// Set (never cleared) when block execution hits a fatal error (e.g. a
     /// market worker panicked and its book is lost). The execution loop exits
@@ -1490,9 +1520,35 @@ impl ExecutionContext {
         // write + the standalone marker below for non-native blocks).
         let body_persist_timer = std::time::Instant::now();
         if let Ok(body_bytes) = serde_json::to_vec(&torus_block.body()) {
-            let _ = self
-                .state_db
-                .put_cf_raw(CF_BLOCK_BODIES, &height.to_be_bytes(), &body_bytes);
+            // L3 flush-pipe (b): with the post-flush writer present, hand this
+            // block's body KV to the background writer instead of doing the
+            // RocksDB put on the exec critical chain. SAFE: the AUTHORITATIVE
+            // durable body write already happened at commit/dispatch
+            // (`persist_committed_block_durably`, FIX 1a) before this block entered
+            // the exec channel, so a crash that loses a queued body still leaves
+            // the dispatch-time copy — crash-replay and block-sync serving read
+            // that one. Commit order is preserved (single ordered queue); a full
+            // queue blocks here (backpressure). If the writer is gone, the bytes
+            // are written synchronously so no body is ever lost.
+            match &self.post_flush_writer {
+                Some(writer) => {
+                    let kv = (CF_BLOCK_BODIES, height.to_be_bytes().to_vec(), body_bytes);
+                    if let Err(back) = writer.send(vec![kv]) {
+                        for (cf, key, value) in &back {
+                            let _ = self.state_db.put_cf_raw(cf, key, value);
+                        }
+                    }
+                    if let Some(ref m) = self.metrics {
+                        m.post_flush_writer_queued_batches
+                            .set(writer.queued_batches() as i64);
+                    }
+                }
+                None => {
+                    let _ = self
+                        .state_db
+                        .put_cf_raw(CF_BLOCK_BODIES, &height.to_be_bytes(), &body_bytes);
+                }
+            }
         }
 
         // ---- Update tracking ----
@@ -2276,6 +2332,13 @@ impl TorusApp {
                 "torus-trade-writer",
                 256,
             )),
+            // L3 flush-pipe (b): 256 queued blocks of body KVs max — a full queue
+            // blocks the exec thread (backpressure onto the exec critical chain,
+            // entirely downstream of the 64-slot exec channel), never balloons
+            // memory. `None` unless TORUS_ASYNC_POST_FLUSH is on ⇒ exact-today.
+            post_flush_writer: async_post_flush_enabled().then(|| {
+                torus_state::BackgroundCfWriter::spawn(state_db.clone(), "torus-post-flush-writer", 256)
+            }),
             exec_failed: exec_failed.clone(),
             exec_queue_len: exec_queue_len.clone(),
             resident_books: std::sync::Mutex::new(Default::default()),
@@ -6939,6 +7002,9 @@ mod crash_recovery_tests {
             // None -> trades write inline through the overlay (pre-O3 behavior),
             // keeping these tests' reads deterministic right after execution.
             trade_writer: None,
+            // None -> exec-time body write is synchronous (exact-today). Tests that
+            // exercise the async stage build their own writer explicitly.
+            post_flush_writer: None,
             exec_failed: Arc::new(AtomicBool::new(false)),
             exec_queue_len: Arc::new(AtomicU64::new(0)),
             resident_books: std::sync::Mutex::new(Default::default()),
@@ -7404,6 +7470,202 @@ mod crash_recovery_tests {
             "one fill -> one trade row via the background writer"
         );
         assert_eq!(user_trades.len(), 2, "maker + taker user-trade rows");
+    }
+
+    // ---- L3 flush-pipe (b): async post-flush stage (TORUS_ASYNC_POST_FLUSH) ----
+
+    /// Executing an identical native-action block sequence with the post-flush
+    /// writer OFF (synchronous, exact-today) and ON (async body persist) must leave
+    /// BYTE-IDENTICAL state after the writer drains — every consensus/native CF,
+    /// including CF_BLOCK_BODIES, CF_NATIVE_NONCES, and the native mirror/trie. The
+    /// async stage only moves the (already-durable-at-dispatch) body rewrite off the
+    /// exec chain; it changes no bytes.
+    #[test]
+    fn async_post_flush_state_identical_over_sequence() {
+        let run = |async_on: bool| -> Vec<Vec<(Vec<u8>, Vec<u8>)>> {
+            let (config, state_db) = make_test_config_and_db();
+            let mut exec_ctx = make_exec_ctx(&config, &state_db);
+            if async_on {
+                exec_ctx.post_flush_writer = Some(torus_state::BackgroundCfWriter::spawn(
+                    state_db.clone(),
+                    "test-post-flush",
+                    256,
+                ));
+            }
+            // Each block dirties native state + consumes a nonce + writes a body.
+            let mut prev: Option<TorusBlock> = None;
+            for h in 1..=5u64 {
+                let mut block = make_block(h, vec![sign_claim_rewards(h)]);
+                if let Some(p) = &prev {
+                    block.header.parent_hash =
+                        alloy_primitives::keccak256(p.header.canonical_header_bytes());
+                }
+                exec_ctx.execute_committed_block(&block, vec![]);
+                prev = Some(block);
+            }
+            // Shutdown flush ordering: drop drains + joins the writer before reads.
+            drop(exec_ctx);
+
+            [
+                torus_state::cf::CF_BLOCK_BODIES,
+                torus_state::cf::CF_NATIVE_NONCES,
+                torus_state::cf::CF_ACCOUNTS,
+                torus_state::cf::CF_NATIVE_HASHED,
+                torus_state::cf::CF_NATIVE_TRIE,
+            ]
+            .iter()
+            .map(|cf| StateBackend::iterate_cf(&state_db, cf, None).unwrap())
+            .collect::<Vec<Vec<(Vec<u8>, Vec<u8>)>>>()
+        };
+
+        let off = run(false);
+        let on = run(true);
+        assert_eq!(off.len(), on.len());
+        for (i, (a, b)) in off.iter().zip(on.iter()).enumerate() {
+            assert_eq!(
+                a, b,
+                "CF index {i} diverged between synchronous and async post-flush"
+            );
+        }
+        assert_eq!(
+            on[0].len(),
+            5,
+            "all 5 block bodies must be durable via the async writer after drain"
+        );
+    }
+
+    /// Crash window W3 (design-flush-pipeline.md §3): the flush marker is advanced
+    /// (native state N durable) but the async exec-time body write is LOST before it
+    /// drains to the real DB — simulated by diverting the post-flush writer to a
+    /// throwaway DB. Because the AUTHORITATIVE body write already happened at
+    /// commit/dispatch (`persist_committed_block_durably`, FIX 1a), the real DB still
+    /// has the body and crash-replay reconstructs identical state — no hole, no
+    /// fail-stop. This is the async analogue of
+    /// `crash_after_commit_before_execute_recovers_via_durable_body`.
+    #[test]
+    fn async_post_flush_crash_window_body_survives_via_dispatch_write() {
+        let (config, state_db) = make_test_config_and_db();
+
+        // Heights 1..=2 applied (empty, bodies present).
+        for h in 1..=2u64 {
+            persist_block_for_test(&state_db, &make_block(h, vec![]));
+        }
+        write_native_applied_height(&state_db, 2);
+
+        // Height 3: FIX 1a persists header+body durably at COMMIT/DISPATCH, before exec.
+        let b3 = make_block(3, vec![sign_claim_rewards(3)]);
+        persist_committed_block_durably(&state_db, &b3);
+
+        // Divert the async exec-time body write to a THROWAWAY db, so the real DB
+        // never receives the deferred exec-time rewrite (== a crash losing the
+        // queued batch before drain).
+        let (_scratch_cfg, scratch_db) = make_test_config_and_db();
+        let mut exec_ctx = make_exec_ctx(&config, &state_db);
+        exec_ctx.post_flush_writer = Some(torus_state::BackgroundCfWriter::spawn(
+            scratch_db.clone(),
+            "test-post-flush-lost",
+            256,
+        ));
+        exec_ctx.execute_committed_block(&b3, vec![]);
+        drop(exec_ctx); // drains the (diverted) writer; the real DB is unaffected
+
+        // The real DB still has body[3] — from the dispatch-time durable write, not
+        // the lost async exec-time write.
+        assert!(
+            state_db
+                .get_cf_raw(CF_BLOCK_BODIES, &3u64.to_be_bytes())
+                .unwrap()
+                .is_some(),
+            "body[3] must survive via the dispatch-time durable write despite the lost async write"
+        );
+        assert_eq!(
+            read_native_applied_height(&state_db),
+            Some(3),
+            "height 3 must be marked applied (flush marker committed)"
+        );
+
+        // Crash-replay from the marker: height 3 is already applied (marker durable),
+        // so replay is correctly a no-op (`applied >= committed` ⇒ returns genesis,
+        // no hole, no fail-stop). The body must remain present afterwards.
+        let exec_ctx2 = make_exec_ctx(&config, &state_db);
+        let (_last, parked) = TorusApp::replay_committed(&state_db, &exec_ctx2);
+        assert_eq!(parked, None, "no parked hole after async-loss crash window");
+        assert!(
+            !exec_ctx2
+                .exec_failed
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "async body loss must NOT fail-stop recovery (dispatch-time body covers it)"
+        );
+        assert_eq!(
+            read_native_applied_height(&state_db),
+            Some(3),
+            "applied height unchanged by the no-op replay"
+        );
+        assert!(
+            state_db
+                .get_cf_raw(CF_BLOCK_BODIES, &3u64.to_be_bytes())
+                .unwrap()
+                .is_some(),
+            "body[3] still present after restart+replay (dispatch-time durable write)"
+        );
+    }
+
+    #[test]
+    fn parse_async_post_flush_toggle_default_off() {
+        assert!(!parse_async_post_flush_toggle(None));
+        assert!(!parse_async_post_flush_toggle(Some("".into())));
+        assert!(!parse_async_post_flush_toggle(Some("0".into())));
+        assert!(parse_async_post_flush_toggle(Some("1".into())));
+        assert!(parse_async_post_flush_toggle(Some("true".into())));
+    }
+
+    /// Acceptance (e): exec-critical-chain wall per block, serial vs pipelined.
+    /// Measures the wall to execute a native-action block sequence on the single
+    /// exec thread (the throughput-binding path) with the post-flush writer OFF vs
+    /// ON. With ON, the body write leaves the exec chain (drain overlaps), so the
+    /// per-block exec-chain wall should be <= serial. `#[ignore]` (timing; run on a
+    /// quiet box): `cargo test -p torus-consensus --release bench_exec_chain -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "timing microbench; run explicitly on a quiet box with --nocapture"]
+    fn bench_exec_chain_body_persist_serial_vs_async() {
+        let n = 300u64;
+        let bench = |async_on: bool| -> f64 {
+            let (config, state_db) = make_test_config_and_db();
+            let mut exec_ctx = make_exec_ctx(&config, &state_db);
+            if async_on {
+                exec_ctx.post_flush_writer = Some(torus_state::BackgroundCfWriter::spawn(
+                    state_db.clone(),
+                    "bench-post-flush",
+                    256,
+                ));
+            }
+            // Pre-build the linked chain so build cost is out of the timed region.
+            let mut blocks: Vec<TorusBlock> = Vec::with_capacity(n as usize);
+            for h in 1..=n {
+                let mut b = make_block(h, vec![sign_claim_rewards(h)]);
+                if let Some(p) = blocks.last() {
+                    b.header.parent_hash =
+                        alloy_primitives::keccak256(p.header.canonical_header_bytes());
+                }
+                blocks.push(b);
+            }
+            let t = std::time::Instant::now();
+            for b in &blocks {
+                exec_ctx.execute_committed_block(b, vec![]);
+            }
+            let wall = t.elapsed().as_secs_f64();
+            drop(exec_ctx); // drain excluded from the exec-chain measurement above
+            wall
+        };
+        let serial = bench(false);
+        let pipelined = bench(true);
+        println!(
+            "BENCH exec-chain over {n} blocks: serial={serial:.4}s ({:.3} ms/blk)  \
+             pipelined={pipelined:.4}s ({:.3} ms/blk)  delta={:.1}%",
+            serial / n as f64 * 1e3,
+            pipelined / n as f64 * 1e3,
+            (serial - pipelined) / serial * 100.0,
+        );
     }
 
     #[test]

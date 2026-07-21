@@ -624,6 +624,9 @@ impl NativeStateOverlay {
         // always byte-identical to the serial uncached path.
         let root_timer = std::time::Instant::now();
         let parallel = crate::native_trie::parallel_bucket_hash_threads();
+        // L3 flush-pipe (a): adaptive engagement threshold — parallel per-bucket
+        // hashing engages only above this dirty-bucket count (default 1 = exact-today).
+        let bucket_hash_min = crate::native_trie::bucket_hash_min_buckets();
         let mut trie_cache = trie_cache;
         let mut member_cache = member_cache;
         let mut apply_out: Option<crate::native_trie::NativeTrieApply> = None;
@@ -654,6 +657,7 @@ impl NativeStateOverlay {
                 trie_cache.as_deref_mut(),
                 member_cache.as_deref_mut(),
                 parallel,
+                bucket_hash_min,
             ) {
                 Ok(a) => {
                     stats.dirty_buckets = a.rehashed_buckets;

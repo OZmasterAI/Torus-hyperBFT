@@ -599,6 +599,29 @@ fn parse_parallel_threads(v: Option<String>) -> usize {
     }
 }
 
+/// L3 flush-pipe (a): adaptive engagement threshold for the parallel bucket-hash
+/// state-root. The parallel path engages ONLY when the dirty-bucket count exceeds
+/// this value; at or below it the serial path runs even when
+/// `TORUS_PARALLEL_BUCKET_HASH >= 2`. Rationale (l3-diagnosis §1): at the cap-400
+/// shape (~226 dirty buckets) scoped-thread spawn cost dominates (p1 4.22 ms vs
+/// p4 6.47 ms); parallel only wins on large dirty sets (uncapped). Unset / garbage
+/// → `1`, which reproduces the pre-existing `work.len() <= 1` gate byte-for-byte
+/// (parallel engages at `>= 2` buckets exactly as today) for every value of
+/// `TORUS_PARALLEL_BUCKET_HASH`. Read once per process.
+pub fn bucket_hash_min_buckets() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| parse_bucket_hash_min_buckets(std::env::var("TORUS_BUCKET_HASH_MIN_BUCKETS").ok()))
+}
+
+/// Pure parse for [`bucket_hash_min_buckets`]. Unset / garbage / `< 1` → `1`
+/// (exact-today). A valid `>= 1` value is the crossover bucket count.
+fn parse_bucket_hash_min_buckets(v: Option<String>) -> usize {
+    match v.as_deref().map(str::trim).and_then(|s| s.parse::<usize>().ok()) {
+        Some(n) if n >= 1 => n,
+        _ => 1,
+    }
+}
+
 /// `TORUS_BUCKET_MEMBER_CACHE_MB` = RAM budget (MB) for the bucket-member cache.
 /// `>= 1` enables; unset / `"0"` / garbage → `0` (disabled = exact-today). Read
 /// once per process.
@@ -895,8 +918,12 @@ fn run_buckets(
     elide: bool,
     defaults: &[B256; TREE_DEPTH + 1],
     parallel: usize,
+    min_buckets: usize,
 ) -> Result<BTreeMap<u16, BucketOutcome>, StateError> {
-    if parallel <= 1 || work.len() <= 1 {
+    // L3 flush-pipe (a): serial unless parallelism is enabled AND the dirty-bucket
+    // count exceeds the adaptive threshold. `min_buckets == 1` (default) is the
+    // pre-existing `work.len() <= 1` gate. Output is byte-identical on either path.
+    if parallel <= 1 || work.len() <= min_buckets.max(1) {
         let mut out = BTreeMap::new();
         for (b, entries, hit) in &work {
             let o = process_bucket(db, *b, entries, hit.as_ref(), member_enabled, elide, defaults)?;
@@ -1006,6 +1033,7 @@ pub struct NativeTrieApply {
 /// leaf hashing — in ANY combination, always byte-identical to the serial
 /// uncached path. The caller applies `trie_changed` / `member_finals` to the
 /// caches ONLY after the batch commits, and invalidates on any failure.
+#[allow(clippy::too_many_arguments)]
 pub fn apply_native_dirty(
     db: &StateDb,
     batch: &mut WriteBatch,
@@ -1013,6 +1041,7 @@ pub fn apply_native_dirty(
     trie_cache: Option<&mut NativeTrieCache>,
     member_cache: Option<&mut NativeMemberCache>,
     parallel: usize,
+    min_buckets: usize,
 ) -> Result<NativeTrieApply, StateError> {
     let defaults = default_nodes();
 
@@ -1076,7 +1105,7 @@ pub fn apply_native_dirty(
     }
 
     // 4. Per-bucket rehash (serial or scoped-thread parallel; identical output).
-    let outcomes = run_buckets(db, work, member_enabled, elide, &defaults, parallel)?;
+    let outcomes = run_buckets(db, work, member_enabled, elide, &defaults, parallel, min_buckets)?;
 
     // 5. Merge deterministically in bucket order.
     let mut ops: Vec<NodeOp> = Vec::new();
@@ -1209,7 +1238,7 @@ pub fn commit_native_trie_incremental(
     dirty: &BTreeMap<(u8, Vec<u8>), Option<Vec<u8>>>,
 ) -> Result<B256, StateError> {
     let mut batch = WriteBatch::default();
-    let apply = apply_native_dirty(db, &mut batch, dirty, None, None, 1)?;
+    let apply = apply_native_dirty(db, &mut batch, dirty, None, None, 1, 1)?;
     db.write(batch)?;
     Ok(apply.root)
 }
@@ -1269,6 +1298,8 @@ pub fn commit_native_trie_incremental_full(
     parallel: usize,
 ) -> Result<(B256, usize, usize), StateError> {
     let mut batch = WriteBatch::default();
+    // Differential-test entry: threshold fixed at 1 (exact-today engagement) so the
+    // explicit `parallel` alone selects serial vs parallel, as before.
     let apply = match apply_native_dirty(
         db,
         &mut batch,
@@ -1276,6 +1307,7 @@ pub fn commit_native_trie_incremental_full(
         trie_cache.as_deref_mut(),
         member_cache.as_deref_mut(),
         parallel,
+        1,
     ) {
         Ok(a) => a,
         Err(e) => {
@@ -1810,6 +1842,81 @@ mod tests {
         }
     }
 
+    // ---- L3 flush-pipe (a): adaptive parallel state-root threshold ----
+
+    #[test]
+    fn flushpipe_parse_bucket_hash_min_buckets_default_exact_today() {
+        // Unset / garbage / < 1 → 1, which reproduces the pre-existing
+        // `work.len() <= 1` gate byte-for-byte (parallel engages at >= 2 buckets).
+        assert_eq!(parse_bucket_hash_min_buckets(None), 1);
+        assert_eq!(parse_bucket_hash_min_buckets(Some("0".into())), 1);
+        for v in ["", "x", "-1", "on", "true"] {
+            assert_eq!(parse_bucket_hash_min_buckets(Some(v.into())), 1, "{v}");
+        }
+        // Valid crossover values pass through (e.g. the l3-diagnosis ~3000).
+        assert_eq!(parse_bucket_hash_min_buckets(Some("1".into())), 1);
+        assert_eq!(parse_bucket_hash_min_buckets(Some(" 3000 ".into())), 3000);
+    }
+
+    /// The adaptive threshold only SELECTS serial vs parallel; root + persisted
+    /// trie/mirror bytes are byte-identical whichever side of the boundary the
+    /// dirty-bucket count falls. Build a dirty set of exactly K buckets, apply it
+    /// with parallel=4 on twin seeded DBs — one with `min_buckets=K` (K <= K ⇒
+    /// SERIAL) and one with `min_buckets=K-1` (K > K-1 ⇒ PARALLEL) — assert equal,
+    /// and equal to the serial-uncached full-scan oracle.
+    #[test]
+    fn flushpipe_bucket_hash_threshold_boundary_determinism() {
+        let (db_serial, _d1) = temp_db();
+        seed(&db_serial);
+        build_native_trie_to_cf(&db_serial).unwrap();
+        let (db_parallel, _d2) = temp_db();
+        seed(&db_parallel);
+        build_native_trie_to_cf(&db_parallel).unwrap();
+
+        // Deterministic dirty set touching several distinct buckets.
+        let mut ops = Vec::new();
+        for i in 0..24u32 {
+            ops.push((1usize, key_for(1, i), Some(vec![0xB0u8 ^ (i as u8); 40])));
+        }
+        let dirty_s = apply_ops(&db_serial, &ops);
+        let dirty_p = apply_ops(&db_parallel, &ops);
+        assert_eq!(dirty_s, dirty_p, "twin DBs must derive identical dirty maps");
+        let k = dirty_bucket_count(&dirty_s);
+        assert!(k >= 2, "need >= 2 buckets to distinguish the paths (got {k})");
+
+        // SERIAL: min_buckets = k ⇒ work.len() (== k) <= k ⇒ serial even at parallel=4.
+        let mut batch_s = WriteBatch::default();
+        let apply_s =
+            apply_native_dirty(&db_serial, &mut batch_s, &dirty_s, None, None, 4, k).unwrap();
+        db_serial.write(batch_s).unwrap();
+
+        // PARALLEL: min_buckets = k-1 ⇒ work.len() (== k) > k-1 ⇒ parallel path.
+        let mut batch_p = WriteBatch::default();
+        let apply_p =
+            apply_native_dirty(&db_parallel, &mut batch_p, &dirty_p, None, None, 4, k - 1).unwrap();
+        db_parallel.write(batch_p).unwrap();
+
+        assert_eq!(
+            apply_s.root, apply_p.root,
+            "threshold boundary: root diverged serial vs parallel"
+        );
+        assert_eq!(
+            dump(&db_serial, CF_NATIVE_TRIE),
+            dump(&db_parallel, CF_NATIVE_TRIE),
+            "threshold boundary: trie CF diverged"
+        );
+        assert_eq!(
+            dump(&db_serial, CF_NATIVE_HASHED),
+            dump(&db_parallel, CF_NATIVE_HASHED),
+            "threshold boundary: mirror CF diverged"
+        );
+        assert_eq!(
+            apply_s.root,
+            native_root_full(&db_serial).unwrap(),
+            "threshold boundary: root != serial-uncached full-scan oracle"
+        );
+    }
+
     fn xorshift(s: &mut u64) -> u64 {
         *s ^= *s << 13;
         *s ^= *s >> 7;
@@ -2277,6 +2384,7 @@ mod tests {
                     trie.as_deref_mut(),
                     member.as_deref_mut(),
                     parallel,
+                    1,
                 )
                 .unwrap();
                 best = best.min(t.elapsed().as_secs_f64());
