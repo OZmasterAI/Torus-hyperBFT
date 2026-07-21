@@ -156,6 +156,30 @@ mod tests {
     }
 
     #[test]
+    fn bounded_queue_applies_backpressure_without_loss() {
+        // cap << N: the bounded `sync_channel` forces the producer to BLOCK
+        // (backpressure) instead of buffering unboundedly — memory stays bounded to
+        // ~cap in-flight batches, and every batch still lands after drain. This is
+        // the L3 post-flush-writer bound (queue never grows without limit).
+        let (_dir, db) = open_test_db();
+        let writer = BackgroundCfWriter::spawn(db.clone(), "test-cf-writer", 4);
+        let n = 500u32;
+        for i in 0..n {
+            writer
+                .send(vec![(CF_NATIVE_TRADES, i.to_be_bytes().to_vec(), vec![i as u8])])
+                .expect("send must block under backpressure, never error/drop");
+        }
+        drop(writer); // drain + join
+        for i in 0..n {
+            assert_eq!(
+                db.get_cf_raw(CF_NATIVE_TRADES, &i.to_be_bytes()).unwrap(),
+                Some(vec![i as u8]),
+                "batch {i} must be durable despite cap=4 backpressure"
+            );
+        }
+    }
+
+    #[test]
     fn queued_batches_returns_to_zero() {
         let (_dir, db) = open_test_db();
         let writer = BackgroundCfWriter::spawn(db.clone(), "test-cf-writer", 8);
