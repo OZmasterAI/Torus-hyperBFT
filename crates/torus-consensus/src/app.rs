@@ -7606,6 +7606,55 @@ mod crash_recovery_tests {
         assert!(parse_async_post_flush_toggle(Some("true".into())));
     }
 
+    /// Acceptance (e): exec-critical-chain wall per block, serial vs pipelined.
+    /// Measures the wall to execute a native-action block sequence on the single
+    /// exec thread (the throughput-binding path) with the post-flush writer OFF vs
+    /// ON. With ON, the body write leaves the exec chain (drain overlaps), so the
+    /// per-block exec-chain wall should be <= serial. `#[ignore]` (timing; run on a
+    /// quiet box): `cargo test -p torus-consensus --release bench_exec_chain -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "timing microbench; run explicitly on a quiet box with --nocapture"]
+    fn bench_exec_chain_body_persist_serial_vs_async() {
+        let n = 300u64;
+        let bench = |async_on: bool| -> f64 {
+            let (config, state_db) = make_test_config_and_db();
+            let mut exec_ctx = make_exec_ctx(&config, &state_db);
+            if async_on {
+                exec_ctx.post_flush_writer = Some(torus_state::BackgroundCfWriter::spawn(
+                    state_db.clone(),
+                    "bench-post-flush",
+                    256,
+                ));
+            }
+            // Pre-build the linked chain so build cost is out of the timed region.
+            let mut blocks: Vec<TorusBlock> = Vec::with_capacity(n as usize);
+            for h in 1..=n {
+                let mut b = make_block(h, vec![sign_claim_rewards(h)]);
+                if let Some(p) = blocks.last() {
+                    b.header.parent_hash =
+                        alloy_primitives::keccak256(p.header.canonical_header_bytes());
+                }
+                blocks.push(b);
+            }
+            let t = std::time::Instant::now();
+            for b in &blocks {
+                exec_ctx.execute_committed_block(b, vec![]);
+            }
+            let wall = t.elapsed().as_secs_f64();
+            drop(exec_ctx); // drain excluded from the exec-chain measurement above
+            wall
+        };
+        let serial = bench(false);
+        let pipelined = bench(true);
+        println!(
+            "BENCH exec-chain over {n} blocks: serial={serial:.4}s ({:.3} ms/blk)  \
+             pipelined={pipelined:.4}s ({:.3} ms/blk)  delta={:.1}%",
+            serial / n as f64 * 1e3,
+            pipelined / n as f64 * 1e3,
+            (serial - pipelined) / serial * 100.0,
+        );
+    }
+
     #[test]
     fn duplicate_committed_native_batch_consumes_nonce_once() {
         // Phase B / Task B5: a PlaceOrderBatch carries many orders but ONE (sender, nonce),
