@@ -160,7 +160,10 @@ enforcement.
   be identical), plus a full-combo cell (BookMode::LevelAuthority + resident
   books) since book mode/resident are the only bench-combo flags that touch
   this code path (root-cache/bucket-hash/member-cache act at flush time,
-  after `execute_batch` returns).
+  after `execute_batch` returns). Round-1 finding: the combo cell's first
+  failure was a test-strength bug, not a determinism gap — `trade_index` is
+  per-block (fresh context per height), so the scenario-strength assertion
+  must sum trades across blocks; every differential comparison passed.
 - µbench: `#[ignore]`d timed test, cap-400 shape (400 orders, 10 markets,
   40 senders, seeded resting ladders, crossing flow), serial vs threads
   {2,4,8}, printed ms — run on 18c.

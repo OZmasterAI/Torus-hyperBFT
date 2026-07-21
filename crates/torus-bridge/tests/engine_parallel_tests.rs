@@ -471,7 +471,9 @@ fn full_combo_level_authority_resident_identical() {
     let run = |threads: usize| -> (Vec<(String, Vec<u8>, Vec<u8>)>, B256, u128, u32) {
         let (_dir, db) = open_test_db();
         let mut resident = ResidentBooks::default();
-        let mut trade_index_last = 0u32;
+        // NB `trade_index` is PER-BLOCK (fresh context each height) — sum it
+        // across blocks for the scenario-strength assertion.
+        let mut trades_total = 0u32;
         let mut next_id_last = 0u128;
         // Fund via a throwaway ctx (positions live on the shared db).
         {
@@ -501,11 +503,11 @@ fn full_combo_level_authority_resident_identical() {
             }
             ctx.save_order_books();
             ctx.stash_resident(&mut resident);
-            trade_index_last = ctx.trade_index;
+            trades_total += ctx.trade_index;
             next_id_last = ctx.next_global_order_id;
         }
         let root = compute_native_state_root(&db).expect("state root");
-        (state_dump_db(&db), root, next_id_last, trade_index_last)
+        (state_dump_db(&db), root, next_id_last, trades_total)
     };
 
     let golden = run(0);
