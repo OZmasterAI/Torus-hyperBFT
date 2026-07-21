@@ -7584,9 +7584,11 @@ mod crash_recovery_tests {
             "height 3 must be marked applied (flush marker committed)"
         );
 
-        // Crash-replay from the marker completes with no hole and no fail-stop.
+        // Crash-replay from the marker: height 3 is already applied (marker durable),
+        // so replay is correctly a no-op (`applied >= committed` ⇒ returns genesis,
+        // no hole, no fail-stop). The body must remain present afterwards.
         let exec_ctx2 = make_exec_ctx(&config, &state_db);
-        let (last, parked) = TorusApp::replay_committed(&state_db, &exec_ctx2);
+        let (_last, parked) = TorusApp::replay_committed(&state_db, &exec_ctx2);
         assert_eq!(parked, None, "no parked hole after async-loss crash window");
         assert!(
             !exec_ctx2
@@ -7594,7 +7596,18 @@ mod crash_recovery_tests {
                 .load(std::sync::atomic::Ordering::SeqCst),
             "async body loss must NOT fail-stop recovery (dispatch-time body covers it)"
         );
-        assert_eq!(last.height, 3);
+        assert_eq!(
+            read_native_applied_height(&state_db),
+            Some(3),
+            "applied height unchanged by the no-op replay"
+        );
+        assert!(
+            state_db
+                .get_cf_raw(CF_BLOCK_BODIES, &3u64.to_be_bytes())
+                .unwrap()
+                .is_some(),
+            "body[3] still present after restart+replay (dispatch-time durable write)"
+        );
     }
 
     #[test]
