@@ -201,47 +201,75 @@ fn savebooks_deep_book_accumulate() {
     }
 }
 
-/// Characterize level_row_data (O(orders at touched level)): seed a standing
-/// book of DEPTH orders per level, then touch one order at each level and time
-/// the resulting re-hash. Shows the scaling hazard when resting depth is NOT 0.
+/// Realistic-depth sweep (multi-trader, bypasses the 200/trader/market cap).
+/// Seed DEPTH resting orders at each of 40 levels across all 10 markets (=
+/// 400·DEPTH total resting, mirroring the in-vivo 195k), then in the next block
+/// touch every level once and time the save. save_books re-hashes 400 levels ×
+/// DEPTH orders (level_row_data is O(orders at level)) — the whole span.
+/// Run single-threaded (`--test-threads=1`) for uncontended numbers.
 #[test]
 #[ignore = "perf µbench; run with --ignored --nocapture"]
 fn savebooks_depth_sweep() {
-    println!("\n=== level-hash depth sweep (single market, touch 1 order/level) ===");
-    println!("{:>6} | {:>7} | {:>9} | {:>10}", "depth", "levels", "lvls_us", "us/level");
-    println!("{}", "-".repeat(44));
-    for depth in [1usize, 2, 4, 8, 16, 32, 64] {
+    const LEVELS: i64 = 40;
+    println!("\n=== realistic depth sweep (10 mkts × 40 levels; touch all levels) ===");
+    println!(
+        "{:>6} | {:>9} | {:>8} {:>8} {:>8} {:>8} | {:>9}",
+        "depth", "resting", "rows_us", "lvls_us", "stops_us", "meta_us", "SAVE_us"
+    );
+    println!("{}", "-".repeat(72));
+    for depth in [1usize, 5, 25, 50, 100, 200, 400] {
         let (_d, db) = open_db();
         let mut holder = ResidentBooks::default();
-        let levels = 20i64;
-        // Block 1: seed `depth` resting bids at each of `levels` price levels.
+        // Fund a trader pool big enough for the deepest seed (≤200/trader/market).
+        let n_traders = ((LEVELS as usize * depth).div_ceil(200)).max(1) as u16 + 1;
+        // Block 1: seed. trader index rotates every 200 orders within a market.
         let ov = NativeStateOverlay::new(db.clone());
         let mut ctx = make_ctx(ov.clone(), 1, &mut holder);
-        fund(&ctx, &addr(1), fp(1_000_000_000_000));
+        for t in 1..=n_traders {
+            fund(&ctx, &addr(t as u8), fp(1_000_000_000_000));
+        }
         let mut seed = Vec::new();
-        for lvl in 0..levels {
-            for _ in 0..depth {
-                seed.push(place(addr(1), gtc(1, true, 50 + lvl, 2)));
+        for m in 1..=N_MARKETS {
+            let mut slot = 0usize;
+            for lvl in 0..LEVELS {
+                for _ in 0..depth {
+                    let t = (slot / 200) as u16 + 1;
+                    slot += 1;
+                    seed.push(place(addr(t as u8), gtc(m, true, 300 + lvl, 1)));
+                }
             }
         }
         let _ = NativeExecutor::execute_batch(&mut ctx, &seed);
+        let resting = ctx.resting_order_count();
         ctx.save_order_books();
         ctx.stash_resident(&mut holder);
         ov.flush(&db).unwrap();
-        // Block 2: add ONE order to each level (touches the level → full re-hash).
+        // Block 2: touch every level once (one fresh order/level/market).
         let ov = NativeStateOverlay::new(db.clone());
         let mut ctx = make_ctx(ov.clone(), 2, &mut holder);
-        fund(&ctx, &addr(1), fp(1_000_000_000_000));
+        fund(&ctx, &addr(255), fp(1_000_000_000_000));
         let mut touch = Vec::new();
-        for lvl in 0..levels {
-            touch.push(place(addr(1), gtc(1, true, 50 + lvl, 2)));
+        for m in 1..=N_MARKETS {
+            for lvl in 0..LEVELS {
+                touch.push(place(addr(255), gtc(m, true, 300 + lvl, 1)));
+            }
         }
         let _ = NativeExecutor::execute_batch(&mut ctx, &touch);
         ctx.collect_save_timings = true;
+        let t = Instant::now();
         ctx.save_order_books();
+        let us = t.elapsed().as_micros();
         let s = ctx.last_save_timings;
-        let per = s.levels_ns / 1000 / levels as u128;
-        println!("{:>6} | {:>7} | {:>9} | {:>10}", depth, levels, s.levels_ns / 1000, per);
+        println!(
+            "{:>6} | {:>9} | {:>8} {:>8} {:>8} {:>8} | {:>9}",
+            depth,
+            resting,
+            s.rows_ns / 1000,
+            s.levels_ns / 1000,
+            s.stops_ns / 1000,
+            s.meta_ns / 1000,
+            us,
+        );
         ov.flush(&db).unwrap();
     }
 }
