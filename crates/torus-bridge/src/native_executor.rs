@@ -138,6 +138,14 @@ impl BalanceCache {
         self.dirty.insert(*addr);
     }
 
+    /// L3-ENG: absorb a Phase-2 worker's cache. Caller guarantees the key
+    /// sets are DISJOINT (workers are sharded by sender), so merge order
+    /// cannot affect any entry and the result equals the serial cache.
+    fn merge_disjoint(&mut self, other: BalanceCache) {
+        self.map.extend(other.map);
+        self.dirty.extend(other.dirty);
+    }
+
     /// Flush every pending dirty balance to the overlay (end of the `execute_batch` call).
     /// Keys are distinct per sender, so final overlay state is independent of flush order;
     /// sorted anyway to keep the write sequence deterministic.
@@ -367,6 +375,116 @@ mod parallel_settle_toggle_tests {
     fn anything_else_stays_off() {
         for v in ["0", "true", "on", "", "yes", "2"] {
             assert!(!parse_parallel_settle_toggle(Some(v.to_string())), "{v}");
+        }
+    }
+}
+
+// ============================================================================
+// L3-ENG — TORUS_PARALLEL_ENGINE: sender-sharded parallel Phase-2 prepare +
+// parallel-settle engagement at cap-400 block shapes.
+// See docs/design-parallel-engine.md for the determinism argument (the
+// phase-sequencing law: all of Phase 2 precedes all matching precedes all
+// settlement, so cross-market coupling through shared trader balances exists
+// ONLY inside Phase 2 — serialized per sender by sharding on sender — and
+// inside Phase 4 — serialized by the C3 pass-B canonical apply).
+// ============================================================================
+
+/// L3-ENG runtime toggle: `TORUS_PARALLEL_ENGINE=N` with N>=2 enables the
+/// parallel engine path with N Phase-2 workers; anything else (INCLUDING
+/// UNSET, `0`, `1`) keeps today's serial prepare — exact-today default.
+/// Read once per process. Node-local: outputs are byte-identical either way.
+fn parallel_engine_threads() -> usize {
+    static THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *THREADS.get_or_init(|| {
+        parse_parallel_engine_threads(std::env::var("TORUS_PARALLEL_ENGINE").ok())
+    })
+}
+
+/// Pure parse of the `TORUS_PARALLEL_ENGINE` value: only an integer N>=2
+/// enables (capped at 32 workers); unset/`0`/`1`/garbage all mean OFF.
+fn parse_parallel_engine_threads(v: Option<String>) -> usize {
+    match v.as_deref().map(str::trim).and_then(|s| s.parse::<usize>().ok()) {
+        Some(n) if n >= 2 => n.min(32),
+        _ => 0,
+    }
+}
+
+/// L3-ENG work gate: sharded Phase-2 prepare pays a thread scope + outcome
+/// stitch, so the env-driven path engages only when the batch carries at
+/// least this many PlaceOrders (across >=2 senders). Forced modes bypass it —
+/// determinism holds at any size; this is purely break-even. Tunable via
+/// `TORUS_PARALLEL_ENGINE_MIN_ORDERS`.
+fn parallel_engine_min_orders() -> usize {
+    static MIN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MIN.get_or_init(|| {
+        std::env::var("TORUS_PARALLEL_ENGINE_MIN_ORDERS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(64)
+    })
+}
+
+/// L3-ENG settle-engagement gate: with the engine on, the C3 parallel settle
+/// engages from this many fills (vs `TORUS_PARALLEL_SETTLE`'s 1024 default,
+/// which never fires at cap-400). Perf-only. Tunable via
+/// `TORUS_PARALLEL_ENGINE_MIN_FILLS`.
+fn parallel_engine_min_fills() -> usize {
+    static MIN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MIN.get_or_init(|| {
+        std::env::var("TORUS_PARALLEL_ENGINE_MIN_FILLS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(64)
+    })
+}
+
+/// How the engine (Phase-2 prepare) path is chosen.
+#[derive(Clone, Copy)]
+enum EngineMode {
+    /// Env toggle + work gates (the live `execute_batch` path).
+    Auto,
+    /// Pinned by the caller (tests / benches): 0 or 1 = serial prepare,
+    /// N>=2 = sharded prepare with N workers, gates bypassed.
+    Force(usize),
+}
+
+/// L3-ENG: one Phase-2 outcome for a single flattened PlaceOrder, computed by
+/// a sharded worker and applied by the serial stitch in flat order.
+enum PrepOutcome {
+    /// Margin reserved (possibly ZERO for market orders) — the stitch assigns
+    /// the global order id and builds the `PreparedOrder`.
+    Pass(FixedPoint),
+    /// Rejected pre-book. `margin` selects the funnel counter
+    /// (`orders_rejected_margin` vs `orders_rejected_other`); `msg` is the
+    /// exact serial-path error string.
+    Reject { margin: bool, msg: String },
+}
+
+#[cfg(test)]
+mod parallel_engine_toggle_tests {
+    use super::parse_parallel_engine_threads;
+
+    #[test]
+    fn default_is_off() {
+        assert_eq!(parse_parallel_engine_threads(None), 0);
+    }
+
+    #[test]
+    fn n_at_least_two_enables() {
+        assert_eq!(parse_parallel_engine_threads(Some("2".to_string())), 2);
+        assert_eq!(parse_parallel_engine_threads(Some(" 8 ".to_string())), 8);
+        assert_eq!(parse_parallel_engine_threads(Some("18".to_string())), 18);
+    }
+
+    #[test]
+    fn capped_at_32() {
+        assert_eq!(parse_parallel_engine_threads(Some("4096".to_string())), 32);
+    }
+
+    #[test]
+    fn zero_one_and_garbage_stay_off() {
+        for v in ["0", "1", "true", "on", "", "yes", "-2", "2.5"] {
+            assert_eq!(parse_parallel_engine_threads(Some(v.to_string())), 0, "{v}");
         }
     }
 }
@@ -2005,12 +2123,13 @@ impl NativeExecutor {
         ctx: &mut NativeExecContext<T>,
         actions: &[(Address, NativeAction)],
     ) -> NativeBatchResult {
-        Self::execute_batch_inner(ctx, actions, SettleMode::Auto)
+        Self::execute_batch_inner(ctx, actions, SettleMode::Auto, EngineMode::Auto)
     }
 
     /// `execute_batch` with the Phase-4 settle mode pinned explicitly —
     /// `parallel = false` runs the classic sequential settle loop; `true`
     /// runs the parallel path whenever >=2 markets have work (no size gate).
+    /// The L3-ENG engine path is pinned OFF (pre-engine behavior, exactly).
     /// For A/B benches and the differential determinism tests (per-process
     /// env vars race across test threads; this doesn't).
     pub fn execute_batch_settle_mode<T: StateBackend>(
@@ -2018,13 +2137,38 @@ impl NativeExecutor {
         actions: &[(Address, NativeAction)],
         parallel: bool,
     ) -> NativeBatchResult {
-        Self::execute_batch_inner(ctx, actions, SettleMode::Force(parallel))
+        Self::execute_batch_inner(ctx, actions, SettleMode::Force(parallel), EngineMode::Force(0))
+    }
+
+    /// L3-ENG: `execute_batch` with the engine thread count pinned explicitly
+    /// (tests / benches — immune to per-process env races). `threads <= 1`
+    /// pins the CANONICAL serial path (serial Phase-2 prepare + sequential
+    /// settle); `threads >= 2` pins sharded Phase-2 prepare with that worker
+    /// count + forced parallel settle whenever >=2 markets have work (all
+    /// work gates bypassed). The differential contract: any `threads` value
+    /// must produce byte-identical state, events, and results.
+    pub fn execute_batch_engine_mode<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+        actions: &[(Address, NativeAction)],
+        threads: usize,
+    ) -> NativeBatchResult {
+        if threads >= 2 {
+            Self::execute_batch_inner(
+                ctx,
+                actions,
+                SettleMode::Force(true),
+                EngineMode::Force(threads),
+            )
+        } else {
+            Self::execute_batch_inner(ctx, actions, SettleMode::Force(false), EngineMode::Force(0))
+        }
     }
 
     fn execute_batch_inner<T: StateBackend>(
         ctx: &mut NativeExecContext<T>,
         actions: &[(Address, NativeAction)],
         settle_mode: SettleMode,
+        engine_mode: EngineMode,
     ) -> NativeBatchResult {
         // One flattened executable entry: either a PlaceOrder's params (single or
         // batch-expanded) or any other action. C2: everything is BORROWED from the
@@ -2122,70 +2266,174 @@ impl NativeExecutor {
         // (sorted keys) at the end of the call.
         let mut pos_cache = PositionCache::new();
 
-        for &i in &place_order_indices {
-            let (sender, entry) = &flat[i];
-            let params: &PlaceOrderParams = match entry {
-                FlatAction::Place(p) => p,
-                FlatAction::Other(_) => unreachable!(),
-            };
+        // L3-ENG: resolve the engine worker count (0 = serial prepare).
+        let engine_threads = match engine_mode {
+            EngineMode::Force(t) => {
+                if t >= 2 {
+                    t
+                } else {
+                    0
+                }
+            }
+            EngineMode::Auto => parallel_engine_threads(),
+        };
 
-            let market_id = params.market_id;
-            let is_market = matches!(params.order_type, OrderType::Market);
-
-            // Reserve margin (same logic as exec_place_order Phase 2).
-            // A5: reserve and every later release share reserve_for_qty.
-            let order_margin_required = if !is_market {
-                Self::reserve_for_qty(ctx, market_id, params.price, params.quantity)
-            } else {
-                FixedPoint::ZERO
-            };
-
-            if order_margin_required > FixedPoint::ZERO {
-                match bal_cache.load(&ctx.positions, sender) {
-                    Ok(mut bal) => {
-                        if bal.available < order_margin_required {
-                            // Funnel (perf A1): died pre-book on the margin reserve.
-                            if let Some(ref m) = ctx.metrics {
-                                m.orders_rejected_margin.inc();
-                            }
-                            results[i] = NativeActionResult::err(
-                                "place_order",
-                                format!(
-                                    "insufficient margin: need {order_margin_required}, have {}",
-                                    bal.available
-                                ),
-                            );
-                            continue;
-                        }
-                        bal.available -= order_margin_required;
-                        bal.order_margin += order_margin_required;
-                        bal_cache.set(sender, bal);
+        // L3-ENG: sharded Phase-2 prepare. Workers compute each sender's
+        // pass/fail fold on disjoint sender shards; the serial stitch below
+        // replays flat order to assign order ids — byte-identical to the
+        // serial loop (docs/design-parallel-engine.md §3). Any worker panic
+        // falls back to the serial loop with nothing shared mutated.
+        let mut prep_outcomes: Option<Vec<Option<PrepOutcome>>> = None;
+        if engine_threads >= 2
+            && (matches!(engine_mode, EngineMode::Force(_))
+                || place_order_indices.len() >= parallel_engine_min_orders())
+        {
+            // Group place indices by sender, first-appearance order (order of
+            // groups is irrelevant — shards are disjoint — but keep it
+            // deterministic anyway).
+            let mut groups: Vec<(Address, Vec<(usize, &PlaceOrderParams)>)> = Vec::new();
+            let mut group_of: HashMap<Address, usize> = HashMap::new();
+            for &i in &place_order_indices {
+                let (sender, entry) = &flat[i];
+                let params: &PlaceOrderParams = match entry {
+                    FlatAction::Place(p) => p,
+                    FlatAction::Other(_) => unreachable!(),
+                };
+                let gi = *group_of.entry(*sender).or_insert_with(|| {
+                    groups.push((*sender, Vec::new()));
+                    groups.len() - 1
+                });
+                groups[gi].1.push((i, params));
+            }
+            if groups.len() >= 2 {
+                match Self::phase2_parallel_prepare(
+                    &ctx.positions,
+                    &ctx.margin_configs,
+                    &groups,
+                    engine_threads,
+                    n,
+                ) {
+                    Some((outcomes, worker_cache)) => {
+                        // Sender shards are disjoint, so the merged cache is
+                        // exactly the serial loop's cache.
+                        bal_cache.merge_disjoint(worker_cache);
+                        prep_outcomes = Some(outcomes);
                     }
-                    Err(e) => {
-                        // Funnel (perf A1): died pre-book on a balance read error.
-                        if let Some(ref m) = ctx.metrics {
-                            m.orders_rejected_other.inc();
-                        }
-                        results[i] = NativeActionResult::err("place_order", e.to_string());
-                        continue;
+                    None => {
+                        tracing::error!(
+                            "L3-ENG: phase-2 prepare worker panicked — falling back to serial prepare"
+                        );
                     }
                 }
             }
+        }
 
-            // Assign global order ID (monotonic, pre-matching)
-            let order_id = ctx.next_global_order_id;
-            ctx.next_global_order_id += 1;
+        if let Some(mut outcomes) = prep_outcomes {
+            // Serial stitch in flat order: ids go to passing orders exactly
+            // as the serial loop assigns them.
+            for &i in &place_order_indices {
+                let (sender, entry) = &flat[i];
+                let params: &PlaceOrderParams = match entry {
+                    FlatAction::Place(p) => p,
+                    FlatAction::Other(_) => unreachable!(),
+                };
+                let Some(outcome) = outcomes[i].take() else {
+                    unreachable!("every place index has a worker outcome");
+                };
+                match outcome {
+                    PrepOutcome::Pass(margin_reserved) => {
+                        let order_id = ctx.next_global_order_id;
+                        ctx.next_global_order_id += 1;
+                        market_batches
+                            .entry(params.market_id)
+                            .or_default()
+                            .push(PreparedOrder {
+                                index: i,
+                                sender: *sender,
+                                params,
+                                order_id,
+                                margin_reserved,
+                            });
+                    }
+                    PrepOutcome::Reject { margin, msg } => {
+                        // Funnel (perf A1): same counters as the serial loop.
+                        if let Some(ref m) = ctx.metrics {
+                            if margin {
+                                m.orders_rejected_margin.inc();
+                            } else {
+                                m.orders_rejected_other.inc();
+                            }
+                        }
+                        results[i] = NativeActionResult::err("place_order", msg);
+                    }
+                }
+            }
+        } else {
+            for &i in &place_order_indices {
+                let (sender, entry) = &flat[i];
+                let params: &PlaceOrderParams = match entry {
+                    FlatAction::Place(p) => p,
+                    FlatAction::Other(_) => unreachable!(),
+                };
 
-            market_batches
-                .entry(market_id)
-                .or_default()
-                .push(PreparedOrder {
-                    index: i,
-                    sender: *sender,
-                    params,
-                    order_id,
-                    margin_reserved: order_margin_required,
-                });
+                let market_id = params.market_id;
+                let is_market = matches!(params.order_type, OrderType::Market);
+
+                // Reserve margin (same logic as exec_place_order Phase 2).
+                // A5: reserve and every later release share reserve_for_qty.
+                let order_margin_required = if !is_market {
+                    Self::reserve_for_qty(ctx, market_id, params.price, params.quantity)
+                } else {
+                    FixedPoint::ZERO
+                };
+
+                if order_margin_required > FixedPoint::ZERO {
+                    match bal_cache.load(&ctx.positions, sender) {
+                        Ok(mut bal) => {
+                            if bal.available < order_margin_required {
+                                // Funnel (perf A1): died pre-book on the margin reserve.
+                                if let Some(ref m) = ctx.metrics {
+                                    m.orders_rejected_margin.inc();
+                                }
+                                results[i] = NativeActionResult::err(
+                                    "place_order",
+                                    format!(
+                                        "insufficient margin: need {order_margin_required}, have {}",
+                                        bal.available
+                                    ),
+                                );
+                                continue;
+                            }
+                            bal.available -= order_margin_required;
+                            bal.order_margin += order_margin_required;
+                            bal_cache.set(sender, bal);
+                        }
+                        Err(e) => {
+                            // Funnel (perf A1): died pre-book on a balance read error.
+                            if let Some(ref m) = ctx.metrics {
+                                m.orders_rejected_other.inc();
+                            }
+                            results[i] = NativeActionResult::err("place_order", e.to_string());
+                            continue;
+                        }
+                    }
+                }
+
+                // Assign global order ID (monotonic, pre-matching)
+                let order_id = ctx.next_global_order_id;
+                ctx.next_global_order_id += 1;
+
+                market_batches
+                    .entry(market_id)
+                    .or_default()
+                    .push(PreparedOrder {
+                        index: i,
+                        sender: *sender,
+                        params,
+                        order_id,
+                        margin_reserved: order_margin_required,
+                    });
+            }
         }
 
         if let Some(ref m) = ctx.metrics {
@@ -2265,14 +2513,16 @@ impl NativeExecutor {
             && match settle_mode {
                 SettleMode::Force(parallel) => parallel,
                 SettleMode::Auto => {
-                    parallel_settle_enabled() && {
-                        let total_fills: usize = market_results
-                            .iter()
-                            .flat_map(|m| m.results.iter())
-                            .map(|r| r.result.fills.len())
-                            .sum();
-                        total_fills >= parallel_settle_min_fills()
-                    }
+                    let total_fills: usize = market_results
+                        .iter()
+                        .flat_map(|m| m.results.iter())
+                        .map(|r| r.result.fills.len())
+                        .sum();
+                    // L3-ENG: with the engine on, the (byte-identical) C3
+                    // parallel settle engages from a much lower fill count —
+                    // cap-400 blocks never reach the classic 1024 gate.
+                    (parallel_settle_enabled() && total_fills >= parallel_settle_min_fills())
+                        || (engine_threads >= 2 && total_fills >= parallel_engine_min_fills())
                 }
             };
         if use_parallel {
@@ -2316,6 +2566,119 @@ impl NativeExecutor {
         }
 
         NativeBatchResult { results, total_gas }
+    }
+
+    /// L3-ENG: sharded Phase-2 prepare. `groups` is the per-sender partition
+    /// of the batch's PlaceOrders (each sender's orders in flat order);
+    /// workers process disjoint contiguous shards of the sender list, each
+    /// replaying its senders' balance folds against a worker-local
+    /// `BalanceCache` (read-through to the shared overlay, which at this
+    /// point holds all Phase-1 effects — exactly what the serial loop reads).
+    ///
+    /// Determinism (docs/design-parallel-engine.md §3): an order's outcome is
+    /// a pure function of (margin config, params, its sender's balance
+    /// trajectory), and the trajectory is a fold over that sender's own
+    /// orders only — no other Phase-2 step touches it — so outcomes are
+    /// independent of shard assignment and thread count. Returns the
+    /// per-flat-index outcomes plus the merged (sender-disjoint) cache;
+    /// `None` if any worker panicked (caller falls back to the serial loop —
+    /// nothing shared has been mutated).
+    fn phase2_parallel_prepare<T: StateBackend>(
+        positions: &PositionManager<T>,
+        margin_configs: &HashMap<MarketId, MarketMarginConfig>,
+        groups: &[(Address, Vec<(usize, &PlaceOrderParams)>)],
+        threads: usize,
+        n: usize,
+    ) -> Option<(Vec<Option<PrepOutcome>>, BalanceCache)> {
+        let workers = threads.min(groups.len()).max(1);
+        let shard = groups.len().div_ceil(workers);
+
+        type WorkerOut = (Vec<(usize, PrepOutcome)>, BalanceCache);
+        let worker_results: Vec<Result<WorkerOut, ()>> = std::thread::scope(|s| {
+            let handles: Vec<_> = groups
+                .chunks(shard)
+                .map(|shard_groups| {
+                    s.spawn(move || {
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            let mut cache = BalanceCache::new();
+                            let mut out: Vec<(usize, PrepOutcome)> = Vec::with_capacity(
+                                shard_groups.iter().map(|(_, o)| o.len()).sum(),
+                            );
+                            for (sender, orders) in shard_groups {
+                                for &(i, params) in orders {
+                                    let is_market =
+                                        matches!(params.order_type, OrderType::Market);
+                                    // Same formula as the serial loop / exec_place_order.
+                                    let required = if !is_market {
+                                        Self::reserve_for_qty_cfg(
+                                            margin_configs.get(&params.market_id),
+                                            params.price,
+                                            params.quantity,
+                                        )
+                                    } else {
+                                        FixedPoint::ZERO
+                                    };
+                                    if required > FixedPoint::ZERO {
+                                        match cache.load(positions, sender) {
+                                            Ok(mut bal) => {
+                                                if bal.available < required {
+                                                    out.push((
+                                                        i,
+                                                        PrepOutcome::Reject {
+                                                            margin: true,
+                                                            msg: format!(
+                                                                "insufficient margin: need {required}, have {}",
+                                                                bal.available
+                                                            ),
+                                                        },
+                                                    ));
+                                                    continue;
+                                                }
+                                                bal.available -= required;
+                                                bal.order_margin += required;
+                                                cache.set(sender, bal);
+                                            }
+                                            Err(e) => {
+                                                out.push((
+                                                    i,
+                                                    PrepOutcome::Reject {
+                                                        margin: false,
+                                                        msg: e.to_string(),
+                                                    },
+                                                ));
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                    out.push((i, PrepOutcome::Pass(required)));
+                                }
+                            }
+                            (out, cache)
+                        }))
+                        .map_err(|_| ())
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap_or(Err(())))
+                .collect()
+        });
+
+        let mut outcomes: Vec<Option<PrepOutcome>> = (0..n).map(|_| None).collect();
+        let mut merged = BalanceCache::new();
+        for r in worker_results {
+            match r {
+                Ok((out, cache)) => {
+                    for (i, o) in out {
+                        outcomes[i] = Some(o);
+                    }
+                    merged.merge_disjoint(cache);
+                }
+                Err(()) => return None,
+            }
+        }
+        Some((outcomes, merged))
     }
 
     /// Classic Phase-4 settlement: one thread walks the (market-id-sorted)
