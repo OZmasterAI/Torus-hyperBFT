@@ -274,6 +274,144 @@ fn savebooks_depth_sweep() {
     }
 }
 
+/// L3 level-hash cache A/B (perf/l3-levelhash-cache): the depth-5 / 2000-frame
+/// shape (the 106.6 ms attribution cell) under two workloads × cache off/on:
+///   append — each block appends 1 fresh resting order at every level (the
+///            dominant resting-heavy case; cache-on should collapse lvls_us);
+///   invalidate — each block does an in-place qty-decrease ModifyOrder on the
+///            FRONT order of every level (every prefix invalidated ⇒ full
+///            rehash; cache-on must be parity with cache-off, no regression).
+/// Byte-identity is enforced by asserting identical level-row CF bytes
+/// between the off and on universes after every block.
+#[test]
+#[ignore = "perf µbench; run with --ignored --nocapture"]
+fn savebooks_levelcache_ab() {
+    const LEVELS: i64 = 40;
+    const DEPTH: usize = 5;
+    // 5 append blocks × 40 levels = 200 orders/market for the append trader —
+    // exactly the per-trader-per-market cap; a 6th block would be rejected.
+    const MEASURED: u64 = 5;
+
+    // One universe: seed depth-5 books, then MEASURED workload blocks.
+    // Returns (per-block lvls_us, per-block SAVE_us, level-row CF dump).
+    let run = |cache_mb: usize, invalidate: bool| -> (Vec<u128>, Vec<u128>, Vec<Vec<(Vec<u8>, Vec<u8>)>>) {
+        let (_d, db) = open_db();
+        let mut holder = ResidentBooks::default();
+        // Seed block: DEPTH resting bids at each of LEVELS levels, all markets.
+        let ov = NativeStateOverlay::new(db.clone());
+        let mut ctx = make_ctx(ov.clone(), 1, &mut holder);
+        ctx.level_hash_cache_bytes = cache_mb * 1024 * 1024;
+        for t in 1..=3u8 {
+            fund(&ctx, &addr(t), fp(1_000_000_000_000));
+        }
+        fund(&ctx, &addr(255), fp(1_000_000_000_000));
+        let mut seed = Vec::new();
+        for m in 1..=N_MARKETS {
+            let mut slot = 0usize;
+            for lvl in 0..LEVELS {
+                for _ in 0..DEPTH {
+                    let t = (slot / 200) as u8 + 1;
+                    slot += 1;
+                    seed.push(place(addr(t), gtc(m, true, 300 + lvl, 10)));
+                }
+            }
+        }
+        let _ = NativeExecutor::execute_batch(&mut ctx, &seed);
+        ctx.save_order_books();
+        ctx.stash_resident(&mut holder);
+        ov.flush(&db).unwrap();
+
+        let mut lvls_us = Vec::new();
+        let mut save_us = Vec::new();
+        let mut dumps = Vec::new();
+        for b in 1..=MEASURED {
+            let ov = NativeStateOverlay::new(db.clone());
+            let mut ctx = make_ctx(ov.clone(), 1 + b, &mut holder);
+            ctx.level_hash_cache_bytes = cache_mb * 1024 * 1024;
+            let mut batch = Vec::new();
+            if invalidate {
+                // In-place qty decrease on the FRONT order of every level.
+                // Seed ids are sequential in batch order starting at 1.
+                for m in 1..=N_MARKETS {
+                    for lvl in 0..LEVELS {
+                        let front_id: u128 =
+                            ((m - 1) as u128) * (LEVELS as u128) * (DEPTH as u128)
+                                + (lvl as u128) * (DEPTH as u128)
+                                + 1;
+                        batch.push((
+                            addr(1),
+                            torus_types::NativeAction::ModifyOrder {
+                                order_id: front_id,
+                                new_price: None,
+                                new_qty: Some(fp(10 - b as i64)),
+                            },
+                        ));
+                    }
+                }
+            } else {
+                // Append one fresh resting order at every level.
+                for m in 1..=N_MARKETS {
+                    for lvl in 0..LEVELS {
+                        batch.push(place(addr(255), gtc(m, true, 300 + lvl, 1)));
+                    }
+                }
+            }
+            let _ = NativeExecutor::execute_batch(&mut ctx, &batch);
+            ctx.collect_save_timings = true;
+            let t = Instant::now();
+            ctx.save_order_books();
+            let us = t.elapsed().as_micros();
+            lvls_us.push(ctx.last_save_timings.levels_ns / 1000);
+            save_us.push(us);
+            ctx.stash_resident(&mut holder);
+            ov.flush(&db).unwrap();
+            // Level rows are root-CF entries with 26-byte keys, tag 0x03.
+            let rows: Vec<(Vec<u8>, Vec<u8>)> =
+                torus_state::StateBackend::iterate_cf(
+                    &db,
+                    torus_state::cf::CF_NATIVE_ORDER_BOOKS,
+                    None,
+                )
+                .unwrap()
+                .into_iter()
+                .filter(|(k, _)| k.len() == 26 && k[8] == 0x03)
+                .collect();
+            dumps.push(rows);
+        }
+        (lvls_us, save_us, dumps)
+    };
+
+    for (label, invalidate) in [("append-heavy", false), ("worst-case invalidate", true)] {
+        let (off_lvls, off_save, off_dumps) = run(0, invalidate);
+        let (on_lvls, on_save, on_dumps) = run(64, invalidate);
+        assert_eq!(
+            off_dumps, on_dumps,
+            "{label}: level-row CF bytes diverged between cache off/on"
+        );
+        // The workload must actually be changing level rows every block
+        // (guards against silently-failing ModifyOrder targets).
+        for w in off_dumps.windows(2) {
+            assert_ne!(w[0], w[1], "{label}: workload block changed no level row");
+        }
+        println!("\n=== levelcache A/B — {label} (depth {DEPTH}, {LEVELS} lvls × {N_MARKETS} mkts) ===");
+        println!(
+            "{:>4} | {:>10} {:>10} | {:>10} {:>10}",
+            "blk", "off_lvls", "on_lvls", "off_SAVE", "on_SAVE"
+        );
+        println!("{}", "-".repeat(56));
+        for i in 0..off_lvls.len() {
+            println!(
+                "{:>4} | {:>10} {:>10} | {:>10} {:>10}",
+                i + 1,
+                off_lvls[i],
+                on_lvls[i],
+                off_save[i],
+                on_save[i]
+            );
+        }
+    }
+}
+
 /// Isolate the two per-market RocksDB reads (diff_stop_rows seek +
 /// write_meta_if_moved point read) vs LSM churn — resting≈0 so writes are ~nil.
 #[test]

@@ -24,12 +24,22 @@ serde_json = { workspace = true }
 bincode = { workspace = true }
 tracing = { workspace = true }
 
+[features]
+# L3 save-books attribution sub-timers (SaveTimings). µbench-only: production
+# builds compile the instrumentation out entirely. Enabled by the
+# l3_savebooks_ubench test target below.
+save-timings = []
+
 [dev-dependencies]
 tempfile = { workspace = true }
 k256 = { workspace = true }
 ed25519-dalek = { workspace = true }
 alloy-eips = { workspace = true }
 criterion = { workspace = true }
+
+[[test]]
+name = "l3_savebooks_ubench"
+required-features = ["save-timings"]
 
 [[bench]]
 name = "exec_batch_margin"

@@ -581,6 +581,29 @@ fn parse_book_rows_mode(v: Option<String>) -> BookMode {
     }
 }
 
+/// L3 level-hash sponge cache budget (`TORUS_LEVEL_HASH_CACHE`, whole MB).
+/// Unset / `0` / invalid = DISABLED (exact-today one-shot rehash). NODE-LOCAL
+/// and byte-identical either way (docs/design-levelhash-cache.md): the cache
+/// only changes how the frozen mode-2 `level_hash` digest is computed in the
+/// tail-append case. Engages exclusively in the mode-2 save arm. Read once
+/// per process; tests override the ctx field directly.
+fn level_hash_cache_env_bytes() -> usize {
+    static BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BYTES.get_or_init(|| {
+        parse_level_hash_cache_mb(std::env::var("TORUS_LEVEL_HASH_CACHE").ok())
+            .saturating_mul(1024 * 1024)
+    })
+}
+
+/// Pure parse of the `TORUS_LEVEL_HASH_CACHE` value (MB; same trim rules as
+/// the sibling toggles).
+fn parse_level_hash_cache_mb(v: Option<String>) -> usize {
+    v.as_deref()
+        .map(str::trim)
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0)
+}
+
 // Frozen key layouts — single source of truth in torus-core.
 use torus_core::book_rows::{
     book_meta_key, book_order_key, book_stop_key, level_row_key_tagged, LevelRowData,
@@ -857,16 +880,25 @@ pub struct NativeExecContext<T: StateBackend = StateDb> {
     /// rank8: whether resident state was actually reused this block (vs a
     /// rebuild from persisted state — first block, restart, or stale guard).
     resident_reused: bool,
-    /// L3 save-books attribution (TEMPORARY, perf/l3-savebooks): when set, the
-    /// mode-2 `save_order_books` arm accumulates per-sub-step timings into
-    /// `last_save_timings`. Default false = zero hot-path cost.
+    /// L3: level-hash sponge cache budget in BYTES for mode-2 saves
+    /// (`TORUS_LEVEL_HASH_CACHE` env, MB). 0 = disabled (exact-today).
+    /// Node-local, byte-identical output; tests may override per ctx.
+    pub level_hash_cache_bytes: usize,
+    /// L3 save-books attribution (µbench-only, feature `save-timings`): when
+    /// set, the mode-2 `save_order_books` arm accumulates per-sub-step
+    /// timings into `last_save_timings`. Compiled out of production builds.
+    #[cfg(feature = "save-timings")]
     pub collect_save_timings: bool,
-    /// L3 save-books attribution (TEMPORARY): last block's sub-step timings.
+    /// L3 save-books attribution (µbench-only): last block's sub-step timings.
+    #[cfg(feature = "save-timings")]
     pub last_save_timings: SaveTimings,
 }
 
-/// L3 save-books attribution (TEMPORARY, perf/l3-savebooks): breakdown of the
-/// mode-2 `save_order_books` span into its four per-market sub-steps.
+/// L3 save-books attribution (µbench-only): breakdown of the mode-2
+/// `save_order_books` span into its four per-market sub-steps. The struct is
+/// always compiled (the accumulator code is statically dead when the
+/// `save-timings` feature is off); the ctx fields and collection flag exist
+/// only under the feature.
 #[derive(Default, Clone, Copy, Debug)]
 pub struct SaveTimings {
     /// take_row_ops drain + encode_order_row + CF_BOOK_ORDER_ROWS put/delete.
@@ -1134,7 +1166,10 @@ impl<T: StateBackend> NativeExecContext<T> {
             book_mode_marker_present,
             resident: resident_mode,
             resident_reused,
+            level_hash_cache_bytes: level_hash_cache_env_bytes(),
+            #[cfg(feature = "save-timings")]
             collect_save_timings: false,
+            #[cfg(feature = "save-timings")]
             last_save_timings: SaveTimings::default(),
         }
     }
@@ -1674,10 +1709,26 @@ impl<T: StateBackend> NativeExecContext<T> {
         // keeps write counts and logs reproducible.
         let mut dirty: Vec<MarketId> = self.dirty_books.iter().copied().collect();
         dirty.sort_unstable();
-        // L3 attribution (TEMPORARY): per-sub-step accumulators.
+        // L3 attribution (µbench-only): per-sub-step accumulators. With the
+        // `save-timings` feature off, `timed` is statically false and every
+        // accumulator below is dead code.
+        #[cfg(feature = "save-timings")]
         let timed = self.collect_save_timings;
-        let n_dirty = dirty.len() as u32;
-        let mut acc = SaveTimings::default();
+        #[cfg(not(feature = "save-timings"))]
+        let timed = false;
+        let mut acc = SaveTimings {
+            markets: dirty.len() as u32,
+            ..SaveTimings::default()
+        };
+        // L3: mode-2 level-hash sponge cache — global budget split across
+        // live books (docs/design-levelhash-cache.md §2). 0 = disabled.
+        let level_cache_per_book = if matches!(self.book_mode, BookMode::LevelAuthority)
+            && self.level_hash_cache_bytes > 0
+        {
+            (self.level_hash_cache_bytes / self.order_books.len().max(1)).max(1)
+        } else {
+            0
+        };
         for market_id in dirty {
             let Some(book) = self.order_books.get_mut(&market_id) else {
                 continue;
@@ -1726,6 +1777,14 @@ impl<T: StateBackend> NativeExecContext<T> {
                     written += Self::write_meta_if_moved(&self.state, market_id, book);
                 }
                 BookMode::LevelAuthority => {
+                    // L3: enable/refresh (or actively drop, when budget = 0)
+                    // the level-hash sponge cache before draining level ops.
+                    // Byte-identical output in both states.
+                    if level_cache_per_book > 0 {
+                        book.ensure_level_hash_cache(level_cache_per_book);
+                    } else {
+                        book.disable_level_hash_cache();
+                    }
                     let mut rows_written = 0usize;
                     let mut rows_deleted = 0usize;
                     let t_rows = timed.then(std::time::Instant::now);
@@ -1824,10 +1883,12 @@ impl<T: StateBackend> NativeExecContext<T> {
             }
         }
 
+        #[cfg(feature = "save-timings")]
         if timed {
-            acc.markets = n_dirty;
             self.last_save_timings = acc;
         }
+        #[cfg(not(feature = "save-timings"))]
+        let _ = acc;
 
         written
     }

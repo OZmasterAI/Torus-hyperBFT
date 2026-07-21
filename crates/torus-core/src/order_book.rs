@@ -110,6 +110,75 @@ struct OrderLocation {
 }
 
 // ============================================================================
+// L3 level-hash sponge cache (node-local, in-RAM only)
+// ============================================================================
+//
+// See docs/design-levelhash-cache.md. Keccak absorbs sequentially and pads
+// only at finalization, so for a level whose queue only APPENDED at the tail
+// since the last save we can keep the un-finalized hasher state (post-absorb
+// of the first `frame_count` frames), absorb just the new tail frames, and
+// finalize a clone — a byte-identical digest in O(new frames) instead of
+// O(depth). Validity of the cached prefix is proven by the per-level
+// monotonic `level_epoch`: EVERY non-append queue mutation (front pop,
+// mid-queue removal, in-place qty change — see the bump sites) increments it;
+// an entry is usable only if its recorded epoch still matches. Any mismatch,
+// or any doubt, falls back to the full rehash (today's exact behavior).
+//
+// The cache is never serialized, never part of any hash or row, and every
+// book-rebuild path constructs a fresh OrderBook (empty cache + empty epoch
+// map) — a dropped cache is only a cold start, never a correctness event.
+
+/// Estimated in-RAM cost of one cache entry (keccak state ~200 B + block
+/// buffer ~136 B + metadata + map overhead), used to convert a byte budget
+/// into an entry cap.
+const LEVEL_CACHE_ENTRY_COST: usize = 512;
+
+struct LevelHashCacheEntry {
+    /// `level_epoch` value observed when this state was absorbed.
+    epoch: u64,
+    /// Number of queue frames absorbed into `hasher`.
+    frame_count: u32,
+    /// Total bytes absorbed (bookkeeping / debug identity check).
+    absorbed_len: u64,
+    /// Sum of `remaining_qty` over the absorbed prefix, accumulated in the
+    /// same front→back `+=` order as the one-shot path.
+    prefix_qty: FixedPoint,
+    /// Un-finalized keccak-256 sponge state after absorbing the prefix.
+    hasher: sha3::Keccak256,
+    /// LRU tick for eviction.
+    last_used: u64,
+}
+
+/// Per-book incremental level-hash cache (L3, `TORUS_LEVEL_HASH_CACHE`).
+struct LevelHashCache {
+    entries: HashMap<(u8, i128), LevelHashCacheEntry>,
+    max_entries: usize,
+    tick: u64,
+    hits: u64,
+    misses: u64,
+}
+
+impl LevelHashCache {
+    fn insert_bounded(&mut self, key: (u8, i128), entry: LevelHashCacheEntry) {
+        if self.entries.len() >= self.max_entries && !self.entries.contains_key(&key) {
+            // Evict the least-recently-used quarter in one batch (rare;
+            // amortized cheap). Eviction is always safe — cold start only.
+            let mut by_age: Vec<((u8, i128), u64)> = self
+                .entries
+                .iter()
+                .map(|(k, e)| (*k, e.last_used))
+                .collect();
+            by_age.sort_unstable_by_key(|(_, t)| *t);
+            let evict = (self.max_entries / 4).max(1);
+            for (k, _) in by_age.into_iter().take(evict) {
+                self.entries.remove(&k);
+            }
+        }
+        self.entries.insert(key, entry);
+    }
+}
+
+// ============================================================================
 // OrderBook
 // ============================================================================
 //
@@ -170,6 +239,16 @@ pub struct OrderBook {
     /// Levels that currently have a persisted level row (skip-useless-
     /// tombstones role, mirrors `row_exists`).
     level_exists: HashSet<(u8, i128)>,
+
+    // ---- L3 level-hash sponge cache (node-local, in-RAM only) ----
+    /// Per-level prefix-invalidation epoch: bumped by EVERY non-append queue
+    /// mutation while the cache is enabled. Entries are NEVER removed for the
+    /// lifetime of this book instance (a re-created level must not see a
+    /// reset epoch). Never serialized.
+    level_epoch: HashMap<(u8, i128), u64>,
+    /// The cache itself. `None` = disabled (default; `take_level_ops` runs
+    /// today's exact one-shot path). Never serialized.
+    level_hash_cache: Option<Box<LevelHashCache>>,
 }
 
 impl OrderBook {
@@ -192,6 +271,8 @@ impl OrderBook {
             row_exists: HashSet::new(),
             level_journal: BTreeSet::new(),
             level_exists: HashSet::new(),
+            level_epoch: HashMap::new(),
+            level_hash_cache: None,
         }
     }
 
@@ -466,6 +547,13 @@ impl OrderBook {
         self.row_journal.insert(order_id);
         self.level_journal
             .insert((crate::book_rows::side_tag(order.side), order.price.raw()));
+        // L3: mid-queue removal invalidates any cached level-hash prefix.
+        Self::bump_level_epoch(
+            self.level_hash_cache.is_some(),
+            &mut self.level_epoch,
+            crate::book_rows::side_tag(order.side),
+            order.price.raw(),
+        );
         Ok(order)
     }
 
@@ -477,6 +565,7 @@ impl OrderBook {
         };
 
         let mut cancelled = Vec::with_capacity(order_ids.len());
+        let cache_on = self.level_hash_cache.is_some();
         for order_id in order_ids {
             if let Some(loc) = self.order_index.remove(&order_id) {
                 let book = match loc.side {
@@ -490,6 +579,13 @@ impl OrderBook {
                         self.row_journal.insert(order_id);
                         self.level_journal
                             .insert((crate::book_rows::side_tag(loc.side), loc.price.raw()));
+                        // L3: removal invalidates the cached level-hash prefix.
+                        Self::bump_level_epoch(
+                            cache_on,
+                            &mut self.level_epoch,
+                            crate::book_rows::side_tag(loc.side),
+                            loc.price.raw(),
+                        );
                     }
                     if queue.is_empty() {
                         book.remove(&loc.price);
@@ -521,6 +617,7 @@ impl OrderBook {
                     .ok_or(CoreError::OrderNotFound(order_id))?
                     .clone();
 
+                let cache_on = self.level_hash_cache.is_some();
                 let book = match loc.side {
                     Side::Buy => &mut self.bids,
                     Side::Sell => &mut self.asks,
@@ -534,6 +631,14 @@ impl OrderBook {
                             self.row_journal.insert(order_id);
                             self.level_journal
                                 .insert((crate::book_rows::side_tag(loc.side), loc.price.raw()));
+                            // L3: in-place qty mutation changes an existing
+                            // frame's bytes — invalidate the cached prefix.
+                            Self::bump_level_epoch(
+                                cache_on,
+                                &mut self.level_epoch,
+                                crate::book_rows::side_tag(loc.side),
+                                loc.price.raw(),
+                            );
                             return Ok(out);
                         }
                     }
@@ -712,6 +817,7 @@ impl OrderBook {
     fn execute_match(&mut self, taker: &mut Order, is_market: bool) -> (Vec<Fill>, Vec<Order>) {
         let mut fills = Vec::new();
         let mut self_trade_cancels = Vec::new();
+        let cache_on = self.level_hash_cache.is_some();
 
         match taker.side {
             Side::Buy => {
@@ -736,6 +842,8 @@ impl OrderBook {
                         &mut self.order_seq,
                         &mut self.row_journal,
                         &mut self.level_journal,
+                        &mut self.level_epoch,
+                        cache_on,
                     );
                     if self.asks.get(&best_ask).is_none_or(|q| q.is_empty()) {
                         self.asks.remove(&best_ask);
@@ -764,6 +872,8 @@ impl OrderBook {
                         &mut self.order_seq,
                         &mut self.row_journal,
                         &mut self.level_journal,
+                        &mut self.level_epoch,
+                        cache_on,
                     );
                     if self.bids.get(&best_bid).is_none_or(|q| q.is_empty()) {
                         self.bids.remove(&best_bid);
@@ -790,11 +900,21 @@ impl OrderBook {
         order_seq: &mut HashMap<OrderId, u64>,
         row_journal: &mut BTreeSet<OrderId>,
         level_journal: &mut BTreeSet<(u8, i128)>,
+        level_epoch: &mut HashMap<(u8, i128), u64>,
+        cache_on: bool,
     ) {
         // Every path below mutates this maker level (self-trade pop, partial
-        // fill, full fill) — journal it once up front.
+        // fill, full fill) — journal it once up front. Every such mutation
+        // touches the FRONT of the queue, so the cached level-hash prefix is
+        // invalidated at the same guard (L3).
         if taker.remaining_qty > FixedPoint::ZERO && !queue.is_empty() {
             level_journal.insert((crate::book_rows::side_tag(maker_side), price.raw()));
+            Self::bump_level_epoch(
+                cache_on,
+                level_epoch,
+                crate::book_rows::side_tag(maker_side),
+                price.raw(),
+            );
         }
         while taker.remaining_qty > FixedPoint::ZERO && !queue.is_empty() {
             let maker = queue.front().unwrap();
@@ -849,6 +969,24 @@ impl OrderBook {
                 }
                 order_seq.remove(&filled.id);
             }
+        }
+    }
+
+    /// L3: bump a level's prefix-invalidation epoch. Called from EVERY
+    /// non-append queue mutation site (front pop, mid-queue removal, in-place
+    /// qty change). Gated on `cache_on` so the disabled state pays zero cost;
+    /// entries are never removed for the book's lifetime (a re-created level
+    /// must not see a reset epoch). Appends (`insert_order`) do NOT bump —
+    /// they are the cacheable case.
+    #[inline]
+    fn bump_level_epoch(
+        cache_on: bool,
+        level_epoch: &mut HashMap<(u8, i128), u64>,
+        tag: u8,
+        raw_price: i128,
+    ) {
+        if cache_on {
+            *level_epoch.entry((tag, raw_price)).or_insert(0) += 1;
         }
     }
 
@@ -1237,30 +1375,173 @@ impl OrderBook {
     }
 
     /// Drain the level journal into level-row ops, O(touched levels) journal
-    /// work + O(orders in touched levels) hashing:
+    /// work + O(orders in touched levels) hashing (or O(appended tail) per
+    /// level when the L3 sponge cache holds a valid prefix):
     /// `((side_tag, raw_price), Some(data))` = upsert, `(_, None)` = delete.
     /// Levels touched-and-emptied with no persisted row are skipped (mirrors
-    /// `take_row_ops`). Deterministic: BTreeSet drain order.
+    /// `take_row_ops`). Deterministic: BTreeSet drain order. Cache-on and
+    /// cache-off produce BYTE-IDENTICAL data (the cache only changes how the
+    /// same keccak digest is computed — docs/design-levelhash-cache.md).
     pub fn take_level_ops(
         &mut self,
     ) -> Vec<((u8, i128), Option<crate::book_rows::LevelRowData>)> {
         let keys = std::mem::take(&mut self.level_journal);
+        // Move the cache out to sidestep the &self/&mut cache split borrow.
+        let mut cache = self.level_hash_cache.take();
         let mut ops = Vec::with_capacity(keys.len());
         for key in keys {
             let (tag, raw_price) = key;
-            match self.level_row_data(tag, raw_price) {
+            let data = match cache.as_deref_mut() {
+                Some(c) => self.level_row_data_cached(tag, raw_price, c),
+                None => self.level_row_data(tag, raw_price),
+            };
+            match data {
                 Some(data) => {
                     self.level_exists.insert(key);
                     ops.push((key, Some(data)));
                 }
                 None => {
+                    // Emptied level: drop its cache entry (its epoch entry
+                    // stays — see bump_level_epoch).
+                    if let Some(c) = cache.as_deref_mut() {
+                        c.entries.remove(&key);
+                    }
                     if self.level_exists.remove(&key) {
                         ops.push((key, None));
                     }
                 }
             }
         }
+        self.level_hash_cache = cache;
         ops
+    }
+
+    /// L3 cached variant of [`Self::level_row_data`] — byte-identical output.
+    /// HIT (epoch match): clone-extend the stored sponge state with only the
+    /// appended tail frames. MISS/any doubt: full front→back absorb (the same
+    /// byte stream as the one-shot path), re-seeding the entry.
+    fn level_row_data_cached(
+        &self,
+        tag: u8,
+        raw_price: i128,
+        cache: &mut LevelHashCache,
+    ) -> Option<crate::book_rows::LevelRowData> {
+        use sha3::Digest;
+        let price = FixedPoint::from_raw(raw_price);
+        let side_book = if tag == crate::book_rows::SIDE_TAG_BID {
+            &self.bids
+        } else {
+            &self.asks
+        };
+        let queue = side_book.get(&price).filter(|q| !q.is_empty())?;
+        let key = (tag, raw_price);
+        let epoch = self.level_epoch.get(&key).copied().unwrap_or(0);
+        let n = queue.len();
+        cache.tick += 1;
+        let tick = cache.tick;
+
+        if let Some(e) = cache.entries.get_mut(&key) {
+            let start = e.frame_count as usize;
+            if e.epoch == epoch && start <= n {
+                // HIT: no invalidating op since the prefix was absorbed ⇒ the
+                // first `start` frames are byte-identical to what the sponge
+                // holds (design doc §1). Absorb only the appended tail.
+                for order in queue.iter().skip(start) {
+                    // Same FixedPoint += order as the one-shot sum.
+                    e.prefix_qty += order.remaining_qty;
+                    let seq = *self
+                        .order_seq
+                        .get(&order.id)
+                        .expect("resting order must have a seq");
+                    let row = Self::encode_order_row_parts(seq, order);
+                    e.hasher.update((row.len() as u32).to_le_bytes());
+                    e.hasher.update(&row);
+                    e.absorbed_len += 4 + row.len() as u64;
+                }
+                e.frame_count = n as u32;
+                e.last_used = tick;
+                cache.hits += 1;
+                let digest: [u8; 32] = e.hasher.clone().finalize().into();
+                return Some(crate::book_rows::LevelRowData {
+                    total_qty_raw: e.prefix_qty.raw(),
+                    order_count: n as u32,
+                    level_hash: digest,
+                });
+            }
+            // Stale (epoch mismatch or impossible frame count): fall through
+            // to the full rehash below; the entry is replaced.
+        }
+
+        // MISS: full absorb front→back — the identical byte stream the
+        // one-shot `level_row_data` keccaks — keeping the un-finalized state.
+        cache.misses += 1;
+        let mut hasher = sha3::Keccak256::new();
+        let mut total = FixedPoint::ZERO;
+        let mut absorbed: u64 = 0;
+        for order in queue {
+            total += order.remaining_qty;
+            let seq = *self
+                .order_seq
+                .get(&order.id)
+                .expect("resting order must have a seq");
+            let row = Self::encode_order_row_parts(seq, order);
+            hasher.update((row.len() as u32).to_le_bytes());
+            hasher.update(&row);
+            absorbed += 4 + row.len() as u64;
+        }
+        let digest: [u8; 32] = hasher.clone().finalize().into();
+        cache.insert_bounded(
+            key,
+            LevelHashCacheEntry {
+                epoch,
+                frame_count: n as u32,
+                absorbed_len: absorbed,
+                prefix_qty: total,
+                hasher,
+                last_used: tick,
+            },
+        );
+        Some(crate::book_rows::LevelRowData {
+            total_qty_raw: total.raw(),
+            order_count: n as u32,
+            level_hash: digest,
+        })
+    }
+
+    /// L3: enable (or re-size) the level-hash sponge cache with a byte
+    /// budget. `0` disables (drops) it — the default state; disabled =
+    /// exact-today one-shot hashing. Node-local: output bytes are identical
+    /// either way.
+    pub fn ensure_level_hash_cache(&mut self, budget_bytes: usize) {
+        if budget_bytes == 0 {
+            self.level_hash_cache = None;
+            return;
+        }
+        let max_entries = (budget_bytes / LEVEL_CACHE_ENTRY_COST).max(1);
+        match &mut self.level_hash_cache {
+            Some(c) => c.max_entries = max_entries,
+            None => {
+                self.level_hash_cache = Some(Box::new(LevelHashCache {
+                    entries: HashMap::new(),
+                    max_entries,
+                    tick: 0,
+                    hits: 0,
+                    misses: 0,
+                }))
+            }
+        }
+    }
+
+    /// L3: drop the level-hash cache (returns to exact-today hashing).
+    pub fn disable_level_hash_cache(&mut self) {
+        self.level_hash_cache = None;
+    }
+
+    /// L3 test/metrics hook: `(hits, misses, live entries)` if enabled.
+    pub fn level_hash_cache_stats(&self) -> Option<(u64, u64, usize)> {
+        self.level_hash_cache
+            .as_ref()
+            .map(|c| (c.hits, c.misses, c.entries.len()))
     }
 
     /// Modes 0/1 never persist level rows: drop the journaled level keys
@@ -1281,6 +1562,11 @@ impl OrderBook {
     pub fn full_level_ops(&mut self) -> Vec<((u8, i128), crate::book_rows::LevelRowData)> {
         self.level_journal.clear();
         self.level_exists.clear();
+        // L3: full writes (genesis / offline rebuild) use the plain path;
+        // drop any cached sponge states defensively.
+        if let Some(c) = self.level_hash_cache.as_deref_mut() {
+            c.entries.clear();
+        }
         let keys: Vec<(u8, i128)> = self
             .bids
             .keys()
@@ -1652,6 +1938,8 @@ impl BorshDeserialize for OrderBook {
             row_exists: HashSet::new(),
             level_journal: BTreeSet::new(),
             level_exists: HashSet::new(),
+            level_epoch: HashMap::new(),
+            level_hash_cache: None,
         };
 
         for _ in 0..order_count {
@@ -1754,6 +2042,88 @@ mod tests {
             reduce_only: false,
             client_order_id: None,
         }
+    }
+
+    // ====================================================================
+    // L3 level-hash cache — crypto-equivalence witnesses
+    // ====================================================================
+
+    /// The sponge-cache correctness axioms, checked as executable facts:
+    /// (1) streaming sha3::Keccak256 over arbitrary split points equals the
+    ///     one-shot alloy_primitives::keccak256 (same function, cross-impl);
+    /// (2) a CLONED mid-absorb state, extended and finalized, equals the
+    ///     one-shot digest of the full stream (clone+extend ≡ absorb-all),
+    ///     and finalizing the clone does not perturb the original state.
+    #[test]
+    fn keccak_stream_clone_equivalence() {
+        use sha3::Digest;
+        let mut s = 0x1234_5678_9ABC_DEF0u64;
+        let mut xs = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        for len in [0usize, 1, 7, 135, 136, 137, 200, 1000, 5000] {
+            let data: Vec<u8> = (0..len).map(|_| (xs() & 0xFF) as u8).collect();
+            let oneshot = alloy_primitives::keccak256(&data).0;
+            // Random split points, including 0 and len.
+            for _ in 0..8 {
+                let cut = (xs() as usize) % (len + 1);
+                let mut h = sha3::Keccak256::new();
+                h.update(&data[..cut]);
+                // Snapshot mid-absorb (the cached state), then extend both
+                // the original and the snapshot with the tail.
+                let mut snap = h.clone();
+                h.update(&data[cut..]);
+                snap.update(&data[cut..]);
+                // Finalizing a CLONE of the extended state must not perturb
+                // further use of the state itself.
+                let d1: [u8; 32] = h.clone().finalize().into();
+                let d2: [u8; 32] = snap.finalize().into();
+                assert_eq!(d1, oneshot, "streamed != one-shot (len={len} cut={cut})");
+                assert_eq!(d2, oneshot, "cloned-state != one-shot (len={len} cut={cut})");
+                // The original is still usable and still agrees.
+                let d3: [u8; 32] = h.finalize().into();
+                assert_eq!(d3, oneshot, "post-clone original diverged");
+            }
+        }
+    }
+
+    /// Cache-on take_level_ops equals a plain recompute after append-heavy
+    /// then invalidating ops (unit-level smoke; the exhaustive differential
+    /// lives in tests/level_rows_core_tests.rs and torus-bridge).
+    #[test]
+    fn level_hash_cache_smoke_append_then_invalidate() {
+        let mut ob = book();
+        ob.ensure_level_hash_cache(1 << 20);
+        // Seed and save (miss path seeds sponge states).
+        for i in 0..5 {
+            ob.place_order(limit_buy(fp(100), fp(1 + i)), addr(1), i as u64);
+        }
+        let ops1 = ob.take_level_ops();
+        assert_eq!(ops1.len(), 1);
+        // Append-only block → hit path.
+        ob.place_order(limit_buy(fp(100), fp(9)), addr(2), 10);
+        let ops2 = ob.take_level_ops();
+        let (hits, _m, _l) = ob.level_hash_cache_stats().unwrap();
+        assert_eq!(hits, 1, "tail append must hit the sponge cache");
+        // Oracle: plain recompute (the frozen one-shot path).
+        let plain = ob.level_row_data(crate::book_rows::SIDE_TAG_BID, fp(100).raw());
+        assert_eq!(ops2[0].1, plain, "cached digest != one-shot digest");
+        // Invalidate (cancel mid-queue) → full rehash, still identical.
+        let victim = ob
+            .level_queue(Side::Buy, fp(100))
+            .unwrap()
+            .get(2)
+            .unwrap()
+            .id;
+        ob.cancel_order(victim).unwrap();
+        let ops3 = ob.take_level_ops();
+        let plain = ob.level_row_data(crate::book_rows::SIDE_TAG_BID, fp(100).raw());
+        assert_eq!(ops3[0].1, plain, "post-invalidation digest != one-shot");
+        let (hits, misses, _l) = ob.level_hash_cache_stats().unwrap();
+        assert_eq!((hits, misses), (1, 2), "cancel must force the miss path");
     }
 
     // ====================================================================
