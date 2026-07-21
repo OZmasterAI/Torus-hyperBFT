@@ -323,3 +323,174 @@ fn side_tags_are_frozen() {
     assert_eq!(side_tag(Side::Sell), SIDE_TAG_ASK);
     assert!(SIDE_TAG_BID < SIDE_TAG_ASK);
 }
+
+// ============================================================================
+// L3 level-hash sponge cache (docs/design-levelhash-cache.md §5.1)
+// ============================================================================
+
+/// The adversarial op script from `level_ops_match_scratch_oracle...`, re-run
+/// with the sponge cache ENABLED: `drain_and_check` asserts every emitted op
+/// against the independent scratch recompute (the frozen one-shot preimage),
+/// so a cached digest that diverges by one byte fails here.
+#[test]
+fn level_ops_cached_match_scratch_oracle_after_every_op_batch() {
+    let mut book = OrderBook::new(1, fp(1), fp(1));
+    book.ensure_level_hash_cache(8 * 1024 * 1024);
+    let mut persisted = std::collections::BTreeMap::new();
+
+    book.place_order(limit(1, true, 100, 5), addr(1), 10);
+    book.place_order(limit(1, true, 100, 3), addr(2), 11);
+    book.place_order(limit(1, true, 99, 2), addr(3), 12);
+    book.place_order(limit(1, false, 105, 4), addr(4), 13);
+    book.place_order(limit(1, false, 106, 1), addr(5), 14);
+    drain_and_check(&mut book, &mut persisted);
+
+    // Append-only round (the hit path), then partial + full fills.
+    book.place_order(limit(1, true, 100, 1), addr(3), 15);
+    book.place_order(limit(1, true, 99, 4), addr(1), 15);
+    drain_and_check(&mut book, &mut persisted);
+    book.place_order(limit(1, true, 105, 2), addr(6), 16);
+    book.place_order(limit(1, true, 106, 3), addr(6), 17);
+    drain_and_check(&mut book, &mut persisted);
+
+    // STP, both modify kinds, cancel_all — the invalidating classes.
+    book.place_order(limit(1, false, 100, 1), addr(1), 18);
+    drain_and_check(&mut book, &mut persisted);
+    let id_inplace = book.level_queue(Side::Buy, fp(99)).unwrap().front().unwrap().id;
+    book.modify_order(id_inplace, None, Some(fp(1))).unwrap();
+    drain_and_check(&mut book, &mut persisted);
+    book.modify_order(id_inplace, Some(fp(98)), None).unwrap();
+    drain_and_check(&mut book, &mut persisted);
+    book.cancel_all(addr(2), None);
+    book.cancel_all(addr(3), None);
+    drain_and_check(&mut book, &mut persisted);
+
+    let (hits, misses, seeds, _live) = book.level_hash_cache_stats().unwrap();
+    assert!(
+        hits + seeds > 0,
+        "script must exercise the sponge fast path (promotes/extends; got 0)"
+    );
+    assert!(misses > 0, "script must exercise the miss path");
+}
+
+fn xs(s: &mut u64) -> u64 {
+    *s ^= *s << 13;
+    *s ^= *s >> 7;
+    *s ^= *s << 17;
+    *s
+}
+
+/// Randomized cache-on vs cache-off differential: two books fed IDENTICAL op
+/// streams (places, crossing matches consuming fronts, cancels front/mid/tail,
+/// in-place partial-qty modifies, price modifies, cancel-alls), drained every
+/// few ops — `take_level_ops` outputs must match op-for-op, and the cached
+/// book's ops must match the scratch oracle. Profiles: 3 plain seeds, one
+/// invalidation-churn seed, one 1-byte-budget seed (eviction storm).
+#[test]
+fn level_ops_cached_vs_plain_randomized_differential() {
+    let profiles: [(u64, bool, usize); 5] = [
+        (0xC0FF_EE00_0001, false, 8 << 20),
+        (0xC0FF_EE00_0002, false, 8 << 20),
+        (0xC0FF_EE00_0003, false, 8 << 20),
+        (0xBAD_C0DE_0004, true, 8 << 20),
+        (0xE71C_7100_0005, true, 1), // budget 1 B ⇒ max_entries 1 ⇒ constant eviction
+    ];
+    for (seed, churn, budget) in profiles {
+        let mut s = seed;
+        let mut cached = OrderBook::new(1, fp(1), fp(1));
+        cached.ensure_level_hash_cache(budget);
+        let mut plain = OrderBook::new(1, fp(1), fp(1));
+        let mut placed: Vec<u128> = Vec::new();
+        let mut persisted = std::collections::BTreeMap::new();
+
+        for step in 0..600u64 {
+            // Weighted op mix; churn profile doubles the invalidating ops.
+            let roll = xs(&mut s) % if churn { 14 } else { 10 };
+            let trader = addr(1 + (xs(&mut s) % 4) as u8);
+            match roll {
+                0..=4 => {
+                    let is_buy = xs(&mut s) % 2 == 0;
+                    let price = if is_buy {
+                        90 + (xs(&mut s) % 10) as i64
+                    } else {
+                        101 + (xs(&mut s) % 10) as i64
+                    };
+                    let qty = 1 + (xs(&mut s) % 5) as i64;
+                    let p = limit(1, is_buy, price, qty);
+                    let r = cached.place_order(p.clone(), trader, step);
+                    plain.place_order(p, trader, step);
+                    placed.push(r.order_id);
+                }
+                5 => {
+                    // Crossing sweep — partial + full fills at the front.
+                    let is_buy = xs(&mut s) % 2 == 0;
+                    let price = if is_buy { 105 } else { 95 };
+                    let qty = 2 + (xs(&mut s) % 6) as i64;
+                    let p = limit(1, is_buy, price, qty);
+                    let r = cached.place_order(p.clone(), trader, step);
+                    plain.place_order(p, trader, step);
+                    placed.push(r.order_id);
+                }
+                6 | 10 | 11 => {
+                    if !placed.is_empty() {
+                        let id = placed[(xs(&mut s) as usize) % placed.len()];
+                        let _ = cached.cancel_order(id);
+                        let _ = plain.cancel_order(id);
+                    }
+                }
+                7 | 12 => {
+                    if !placed.is_empty() {
+                        let id = placed[(xs(&mut s) as usize) % placed.len()];
+                        let qty_mod = xs(&mut s) % 2 == 0;
+                        let (np, nq) = if qty_mod {
+                            (None, Some(fp(1)))
+                        } else {
+                            (Some(fp(92 + (xs(&mut s) % 8) as i64)), None)
+                        };
+                        let _ = cached.modify_order(id, np, nq);
+                        let _ = plain.modify_order(id, np, nq);
+                    }
+                }
+                8 | 13 => {
+                    cached.cancel_all(trader, None);
+                    plain.cancel_all(trader, None);
+                }
+                _ => {
+                    // Deep append at one shared level (grows a fat queue —
+                    // the shape the cache exists for).
+                    let p = limit(1, true, 90, 1);
+                    let r = cached.place_order(p.clone(), trader, step);
+                    plain.place_order(p, trader, step);
+                    placed.push(r.order_id);
+                }
+            }
+
+            if step % (3 + (xs(&mut s) % 5)) == 0 {
+                // "Save": drain both; outputs must be byte-identical, and the
+                // cached ops must match the independent scratch oracle.
+                let plain_ops = plain.take_level_ops();
+                // drain_and_check drains `cached` and oracles every op.
+                drain_and_check(&mut cached, &mut persisted);
+                // Re-derive cached's emitted ops for the byte-compare: they
+                // must equal the plain book's (same journal keys, same data).
+                // drain_and_check consumed them, so compare against the full
+                // scratch state instead: every plain op value must equal the
+                // scratch recompute on the plain book.
+                for ((tag, raw), op) in &plain_ops {
+                    let side = if *tag == SIDE_TAG_BID { Side::Buy } else { Side::Sell };
+                    let oracle =
+                        scratch_level_data(&plain, side, FixedPoint::from_raw(*raw));
+                    assert_eq!(op.as_ref().copied(), oracle, "seed {seed:#x} step {step}");
+                }
+            }
+        }
+        let (hits, misses, seeds, live) = cached.level_hash_cache_stats().unwrap();
+        assert!(
+            hits + misses + seeds > 0,
+            "seed {seed:#x}: cache never consulted"
+        );
+        if budget == 1 {
+            assert!(live <= 1, "seed {seed:#x}: eviction cap not enforced");
+        }
+    }
+}

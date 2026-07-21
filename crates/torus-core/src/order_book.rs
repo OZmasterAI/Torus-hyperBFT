@@ -110,6 +110,113 @@ struct OrderLocation {
 }
 
 // ============================================================================
+// L3 level-hash sponge cache (node-local, in-RAM only)
+// ============================================================================
+//
+// See docs/design-levelhash-cache.md. Keccak absorbs sequentially and pads
+// only at finalization, so for a level whose queue only APPENDED at the tail
+// since the last save we can keep the un-finalized hasher state (post-absorb
+// of the first `frame_count` frames), absorb just the new tail frames, and
+// finalize a clone — a byte-identical digest in O(new frames) instead of
+// O(depth). Validity of the cached prefix is proven by the per-level
+// monotonic `level_epoch`: EVERY non-append queue mutation (front pop,
+// mid-queue removal, in-place qty change — see the bump sites) increments it;
+// an entry is usable only if its recorded epoch still matches. Any mismatch,
+// or any doubt, falls back to the full rehash (today's exact behavior).
+//
+// The cache is never serialized, never part of any hash or row, and every
+// book-rebuild path constructs a fresh OrderBook (empty cache + empty epoch
+// map) — a dropped cache is only a cold start, never a correctness event.
+
+/// Estimated in-RAM cost of one cache entry (keccak state ~200 B + block
+/// buffer ~136 B + metadata + map overhead), used to convert a byte budget
+/// into an entry cap.
+const LEVEL_CACHE_ENTRY_COST: usize = 512;
+
+/// One cache slot for a price level. **Staged seeding** (the miss-path fix):
+/// a level that just missed holds only a cheap `Probe` (epoch + frame count,
+/// no sponge). The un-finalized sponge is built (`Seeded`) only once the level
+/// survives one full append-only save interval — i.e. the NEXT save observes
+/// the SAME epoch, proving no invalidating op ran in between. A churning level
+/// therefore never pays the streaming absorb + hasher-clone that the frozen
+/// one-shot path (asm-backed `alloy_primitives::keccak256`) avoids: its miss is
+/// just the plain one-shot digest plus a cheap probe record.
+enum LevelHashCacheEntry {
+    /// Recorded after a miss: no sponge yet. Promoted to `Seeded` on the next
+    /// save of this level iff its epoch is unchanged (append-only interval).
+    Probe {
+        /// `level_epoch` observed when the probe was recorded.
+        epoch: u64,
+        /// Queue length observed (bookkeeping only; promotion needs epoch).
+        frame_count: u32,
+        /// LRU tick for eviction.
+        last_used: u64,
+    },
+    /// Full un-finalized keccak-256 sponge state after a confirmed append-only
+    /// interval; extended in O(new tail) on subsequent append-only saves.
+    Seeded {
+        /// `level_epoch` value observed when this state was absorbed.
+        epoch: u64,
+        /// Number of queue frames absorbed into `hasher`.
+        frame_count: u32,
+        /// Total bytes absorbed (bookkeeping / debug identity check).
+        absorbed_len: u64,
+        /// Sum of `remaining_qty` over the absorbed prefix, accumulated in the
+        /// same front→back `+=` order as the one-shot path.
+        prefix_qty: FixedPoint,
+        /// Un-finalized keccak-256 sponge state after absorbing the prefix.
+        hasher: sha3::Keccak256,
+        /// LRU tick for eviction.
+        last_used: u64,
+    },
+}
+
+impl LevelHashCacheEntry {
+    #[inline]
+    fn last_used(&self) -> u64 {
+        match self {
+            LevelHashCacheEntry::Probe { last_used, .. }
+            | LevelHashCacheEntry::Seeded { last_used, .. } => *last_used,
+        }
+    }
+}
+
+/// Per-book incremental level-hash cache (L3, `TORUS_LEVEL_HASH_CACHE`).
+struct LevelHashCache {
+    entries: HashMap<(u8, i128), LevelHashCacheEntry>,
+    max_entries: usize,
+    tick: u64,
+    /// O(new-tail) sponge extensions on a `Seeded` entry.
+    hits: u64,
+    /// Plain one-shot fallbacks (no entry, churning probe, or stale seed) —
+    /// each records/refreshes a cheap `Probe`.
+    misses: u64,
+    /// Sponge investments: a `Probe` promoted to `Seeded` after a confirmed
+    /// append-only interval (one full front→back absorb, amortized by hits).
+    seeds: u64,
+}
+
+impl LevelHashCache {
+    fn insert_bounded(&mut self, key: (u8, i128), entry: LevelHashCacheEntry) {
+        if self.entries.len() >= self.max_entries && !self.entries.contains_key(&key) {
+            // Evict the least-recently-used quarter in one batch (rare;
+            // amortized cheap). Eviction is always safe — cold start only.
+            let mut by_age: Vec<((u8, i128), u64)> = self
+                .entries
+                .iter()
+                .map(|(k, e)| (*k, e.last_used()))
+                .collect();
+            by_age.sort_unstable_by_key(|(_, t)| *t);
+            let evict = (self.max_entries / 4).max(1);
+            for (k, _) in by_age.into_iter().take(evict) {
+                self.entries.remove(&k);
+            }
+        }
+        self.entries.insert(key, entry);
+    }
+}
+
+// ============================================================================
 // OrderBook
 // ============================================================================
 //
@@ -170,6 +277,16 @@ pub struct OrderBook {
     /// Levels that currently have a persisted level row (skip-useless-
     /// tombstones role, mirrors `row_exists`).
     level_exists: HashSet<(u8, i128)>,
+
+    // ---- L3 level-hash sponge cache (node-local, in-RAM only) ----
+    /// Per-level prefix-invalidation epoch: bumped by EVERY non-append queue
+    /// mutation while the cache is enabled. Entries are NEVER removed for the
+    /// lifetime of this book instance (a re-created level must not see a
+    /// reset epoch). Never serialized.
+    level_epoch: HashMap<(u8, i128), u64>,
+    /// The cache itself. `None` = disabled (default; `take_level_ops` runs
+    /// today's exact one-shot path). Never serialized.
+    level_hash_cache: Option<Box<LevelHashCache>>,
 }
 
 impl OrderBook {
@@ -192,6 +309,8 @@ impl OrderBook {
             row_exists: HashSet::new(),
             level_journal: BTreeSet::new(),
             level_exists: HashSet::new(),
+            level_epoch: HashMap::new(),
+            level_hash_cache: None,
         }
     }
 
@@ -466,6 +585,13 @@ impl OrderBook {
         self.row_journal.insert(order_id);
         self.level_journal
             .insert((crate::book_rows::side_tag(order.side), order.price.raw()));
+        // L3: mid-queue removal invalidates any cached level-hash prefix.
+        Self::bump_level_epoch(
+            self.level_hash_cache.is_some(),
+            &mut self.level_epoch,
+            crate::book_rows::side_tag(order.side),
+            order.price.raw(),
+        );
         Ok(order)
     }
 
@@ -477,6 +603,7 @@ impl OrderBook {
         };
 
         let mut cancelled = Vec::with_capacity(order_ids.len());
+        let cache_on = self.level_hash_cache.is_some();
         for order_id in order_ids {
             if let Some(loc) = self.order_index.remove(&order_id) {
                 let book = match loc.side {
@@ -490,6 +617,13 @@ impl OrderBook {
                         self.row_journal.insert(order_id);
                         self.level_journal
                             .insert((crate::book_rows::side_tag(loc.side), loc.price.raw()));
+                        // L3: removal invalidates the cached level-hash prefix.
+                        Self::bump_level_epoch(
+                            cache_on,
+                            &mut self.level_epoch,
+                            crate::book_rows::side_tag(loc.side),
+                            loc.price.raw(),
+                        );
                     }
                     if queue.is_empty() {
                         book.remove(&loc.price);
@@ -521,6 +655,7 @@ impl OrderBook {
                     .ok_or(CoreError::OrderNotFound(order_id))?
                     .clone();
 
+                let cache_on = self.level_hash_cache.is_some();
                 let book = match loc.side {
                     Side::Buy => &mut self.bids,
                     Side::Sell => &mut self.asks,
@@ -534,6 +669,14 @@ impl OrderBook {
                             self.row_journal.insert(order_id);
                             self.level_journal
                                 .insert((crate::book_rows::side_tag(loc.side), loc.price.raw()));
+                            // L3: in-place qty mutation changes an existing
+                            // frame's bytes — invalidate the cached prefix.
+                            Self::bump_level_epoch(
+                                cache_on,
+                                &mut self.level_epoch,
+                                crate::book_rows::side_tag(loc.side),
+                                loc.price.raw(),
+                            );
                             return Ok(out);
                         }
                     }
@@ -712,6 +855,7 @@ impl OrderBook {
     fn execute_match(&mut self, taker: &mut Order, is_market: bool) -> (Vec<Fill>, Vec<Order>) {
         let mut fills = Vec::new();
         let mut self_trade_cancels = Vec::new();
+        let cache_on = self.level_hash_cache.is_some();
 
         match taker.side {
             Side::Buy => {
@@ -736,6 +880,8 @@ impl OrderBook {
                         &mut self.order_seq,
                         &mut self.row_journal,
                         &mut self.level_journal,
+                        &mut self.level_epoch,
+                        cache_on,
                     );
                     if self.asks.get(&best_ask).is_none_or(|q| q.is_empty()) {
                         self.asks.remove(&best_ask);
@@ -764,6 +910,8 @@ impl OrderBook {
                         &mut self.order_seq,
                         &mut self.row_journal,
                         &mut self.level_journal,
+                        &mut self.level_epoch,
+                        cache_on,
                     );
                     if self.bids.get(&best_bid).is_none_or(|q| q.is_empty()) {
                         self.bids.remove(&best_bid);
@@ -790,11 +938,21 @@ impl OrderBook {
         order_seq: &mut HashMap<OrderId, u64>,
         row_journal: &mut BTreeSet<OrderId>,
         level_journal: &mut BTreeSet<(u8, i128)>,
+        level_epoch: &mut HashMap<(u8, i128), u64>,
+        cache_on: bool,
     ) {
         // Every path below mutates this maker level (self-trade pop, partial
-        // fill, full fill) — journal it once up front.
+        // fill, full fill) — journal it once up front. Every such mutation
+        // touches the FRONT of the queue, so the cached level-hash prefix is
+        // invalidated at the same guard (L3).
         if taker.remaining_qty > FixedPoint::ZERO && !queue.is_empty() {
             level_journal.insert((crate::book_rows::side_tag(maker_side), price.raw()));
+            Self::bump_level_epoch(
+                cache_on,
+                level_epoch,
+                crate::book_rows::side_tag(maker_side),
+                price.raw(),
+            );
         }
         while taker.remaining_qty > FixedPoint::ZERO && !queue.is_empty() {
             let maker = queue.front().unwrap();
@@ -849,6 +1007,24 @@ impl OrderBook {
                 }
                 order_seq.remove(&filled.id);
             }
+        }
+    }
+
+    /// L3: bump a level's prefix-invalidation epoch. Called from EVERY
+    /// non-append queue mutation site (front pop, mid-queue removal, in-place
+    /// qty change). Gated on `cache_on` so the disabled state pays zero cost;
+    /// entries are never removed for the book's lifetime (a re-created level
+    /// must not see a reset epoch). Appends (`insert_order`) do NOT bump —
+    /// they are the cacheable case.
+    #[inline]
+    fn bump_level_epoch(
+        cache_on: bool,
+        level_epoch: &mut HashMap<(u8, i128), u64>,
+        tag: u8,
+        raw_price: i128,
+    ) {
+        if cache_on {
+            *level_epoch.entry((tag, raw_price)).or_insert(0) += 1;
         }
     }
 
@@ -1237,30 +1413,257 @@ impl OrderBook {
     }
 
     /// Drain the level journal into level-row ops, O(touched levels) journal
-    /// work + O(orders in touched levels) hashing:
+    /// work + O(orders in touched levels) hashing (or O(appended tail) per
+    /// level when the L3 sponge cache holds a valid prefix):
     /// `((side_tag, raw_price), Some(data))` = upsert, `(_, None)` = delete.
     /// Levels touched-and-emptied with no persisted row are skipped (mirrors
-    /// `take_row_ops`). Deterministic: BTreeSet drain order.
+    /// `take_row_ops`). Deterministic: BTreeSet drain order. Cache-on and
+    /// cache-off produce BYTE-IDENTICAL data (the cache only changes how the
+    /// same keccak digest is computed — docs/design-levelhash-cache.md).
     pub fn take_level_ops(
         &mut self,
     ) -> Vec<((u8, i128), Option<crate::book_rows::LevelRowData>)> {
         let keys = std::mem::take(&mut self.level_journal);
+        // Move the cache out to sidestep the &self/&mut cache split borrow.
+        let mut cache = self.level_hash_cache.take();
         let mut ops = Vec::with_capacity(keys.len());
         for key in keys {
             let (tag, raw_price) = key;
-            match self.level_row_data(tag, raw_price) {
+            let data = match cache.as_deref_mut() {
+                Some(c) => self.level_row_data_cached(tag, raw_price, c),
+                None => self.level_row_data(tag, raw_price),
+            };
+            match data {
                 Some(data) => {
                     self.level_exists.insert(key);
                     ops.push((key, Some(data)));
                 }
                 None => {
+                    // Emptied level: drop its cache entry (its epoch entry
+                    // stays — see bump_level_epoch).
+                    if let Some(c) = cache.as_deref_mut() {
+                        c.entries.remove(&key);
+                    }
                     if self.level_exists.remove(&key) {
                         ops.push((key, None));
                     }
                 }
             }
         }
+        self.level_hash_cache = cache;
         ops
+    }
+
+    /// L3 cached variant of [`Self::level_row_data`] — byte-identical output,
+    /// with **staged seeding** (docs/design-levelhash-cache.md §1.3): three
+    /// mutually-exclusive arms keyed on the level's slot state and epoch:
+    ///
+    /// - **HIT** (`Seeded`, epoch unchanged): clone-extend the stored sponge
+    ///   with only the appended tail frames — O(new tail).
+    /// - **PROMOTE** (`Probe`, epoch unchanged): the level survived one full
+    ///   append-only interval, so invest now — one full front→back absorb that
+    ///   both yields this save's digest and seeds the `Seeded` sponge for the
+    ///   future O(tail) hits.
+    /// - **MISS** (no slot, churning `Probe`, or stale `Seeded`): the frozen
+    ///   one-shot path verbatim (`Self::level_row_data`, asm-backed keccak) plus
+    ///   a cheap `Probe` record — NO streaming absorb, NO sponge clone. A level
+    ///   that invalidates every save pays only the plain cost + one map insert.
+    fn level_row_data_cached(
+        &self,
+        tag: u8,
+        raw_price: i128,
+        cache: &mut LevelHashCache,
+    ) -> Option<crate::book_rows::LevelRowData> {
+        use sha3::Digest;
+        let price = FixedPoint::from_raw(raw_price);
+        let side_book = if tag == crate::book_rows::SIDE_TAG_BID {
+            &self.bids
+        } else {
+            &self.asks
+        };
+        let queue = side_book.get(&price).filter(|q| !q.is_empty())?;
+        let key = (tag, raw_price);
+        let epoch = self.level_epoch.get(&key).copied().unwrap_or(0);
+        let n = queue.len();
+        cache.tick += 1;
+        let tick = cache.tick;
+
+        // Classify the slot without holding a borrow across the plain recompute.
+        enum Arm {
+            Hit,
+            /// Carries the probe's recorded frame count for the append-only
+            /// invariant check.
+            Promote(u32),
+            Miss,
+        }
+        let arm = match cache.entries.get(&key) {
+            Some(LevelHashCacheEntry::Seeded { epoch: e, frame_count, .. })
+                if *e == epoch && *frame_count as usize <= n =>
+            {
+                Arm::Hit
+            }
+            Some(LevelHashCacheEntry::Probe { epoch: e, frame_count, .. }) if *e == epoch => {
+                Arm::Promote(*frame_count)
+            }
+            // No slot, churning probe (epoch moved), or stale seed ⇒ plain path.
+            _ => Arm::Miss,
+        };
+
+        match arm {
+            Arm::Hit => {
+                // No invalidating op since the prefix was absorbed ⇒ the first
+                // `start` frames are byte-identical to what the sponge holds
+                // (design doc §1). Absorb only the appended tail.
+                let LevelHashCacheEntry::Seeded {
+                    frame_count,
+                    absorbed_len,
+                    prefix_qty,
+                    hasher,
+                    last_used,
+                    ..
+                } = cache.entries.get_mut(&key).expect("slot present")
+                else {
+                    unreachable!("classified Hit ⇒ Seeded slot")
+                };
+                let start = *frame_count as usize;
+                for order in queue.iter().skip(start) {
+                    // Same FixedPoint += order as the one-shot sum.
+                    *prefix_qty += order.remaining_qty;
+                    let seq = *self
+                        .order_seq
+                        .get(&order.id)
+                        .expect("resting order must have a seq");
+                    let row = Self::encode_order_row_parts(seq, order);
+                    hasher.update((row.len() as u32).to_le_bytes());
+                    hasher.update(&row);
+                    *absorbed_len += 4 + row.len() as u64;
+                }
+                *frame_count = n as u32;
+                *last_used = tick;
+                let total_qty_raw = prefix_qty.raw();
+                let digest: [u8; 32] = hasher.clone().finalize().into();
+                cache.hits += 1;
+                Some(crate::book_rows::LevelRowData {
+                    total_qty_raw,
+                    order_count: n as u32,
+                    level_hash: digest,
+                })
+            }
+            Arm::Promote(probe_frames) => {
+                // Epoch unchanged since the probe ⇒ only appends ran between the
+                // two saves ⇒ the queue can only have grown (the probe's prefix
+                // is still a prefix). A shrink here would mean an invalidating
+                // op bumped nothing — the fatal direction ruled out in §1.2.
+                debug_assert!(
+                    n >= probe_frames as usize,
+                    "append-only interval must not shrink the level \
+                     (n={n} < probe frames={probe_frames})"
+                );
+                // Second consecutive save with no epoch bump ⇒ the interval was
+                // append-only. INVEST: one full front→back absorb — the exact
+                // byte stream the one-shot path keccaks — that yields this
+                // save's digest AND seeds the sponge (replaces the probe slot,
+                // so no entry-count growth ⇒ no eviction needed).
+                let (total, absorbed, hasher) = self.absorb_level(queue);
+                let digest: [u8; 32] = hasher.clone().finalize().into();
+                cache.entries.insert(
+                    key,
+                    LevelHashCacheEntry::Seeded {
+                        epoch,
+                        frame_count: n as u32,
+                        absorbed_len: absorbed,
+                        prefix_qty: total,
+                        hasher,
+                        last_used: tick,
+                    },
+                );
+                cache.seeds += 1;
+                Some(crate::book_rows::LevelRowData {
+                    total_qty_raw: total.raw(),
+                    order_count: n as u32,
+                    level_hash: digest,
+                })
+            }
+            Arm::Miss => {
+                // Plain one-shot path VERBATIM (asm-backed one-shot keccak) plus
+                // a cheap probe: the sponge investment is deferred until this
+                // level proves append-only (the next same-epoch save).
+                let data = self.level_row_data(tag, raw_price)?;
+                cache.insert_bounded(
+                    key,
+                    LevelHashCacheEntry::Probe {
+                        epoch,
+                        frame_count: n as u32,
+                        last_used: tick,
+                    },
+                );
+                cache.misses += 1;
+                Some(data)
+            }
+        }
+    }
+
+    /// Full front→back streaming absorb of a level's framed order rows into a
+    /// fresh keccak sponge, returning `(Σ remaining_qty, absorbed byte count,
+    /// un-finalized hasher)`. The absorbed byte stream is identical to the
+    /// one-shot `level_row_data` preimage (same `encode_order_row_parts` +
+    /// u32-LE length framing), so `hasher.clone().finalize()` is byte-identical.
+    fn absorb_level(&self, queue: &VecDeque<Order>) -> (FixedPoint, u64, sha3::Keccak256) {
+        use sha3::Digest;
+        let mut hasher = sha3::Keccak256::new();
+        let mut total = FixedPoint::ZERO;
+        let mut absorbed: u64 = 0;
+        for order in queue {
+            total += order.remaining_qty;
+            let seq = *self
+                .order_seq
+                .get(&order.id)
+                .expect("resting order must have a seq");
+            let row = Self::encode_order_row_parts(seq, order);
+            hasher.update((row.len() as u32).to_le_bytes());
+            hasher.update(&row);
+            absorbed += 4 + row.len() as u64;
+        }
+        (total, absorbed, hasher)
+    }
+
+    /// L3: enable (or re-size) the level-hash sponge cache with a byte
+    /// budget. `0` disables (drops) it — the default state; disabled =
+    /// exact-today one-shot hashing. Node-local: output bytes are identical
+    /// either way.
+    pub fn ensure_level_hash_cache(&mut self, budget_bytes: usize) {
+        if budget_bytes == 0 {
+            self.level_hash_cache = None;
+            return;
+        }
+        let max_entries = (budget_bytes / LEVEL_CACHE_ENTRY_COST).max(1);
+        match &mut self.level_hash_cache {
+            Some(c) => c.max_entries = max_entries,
+            None => {
+                self.level_hash_cache = Some(Box::new(LevelHashCache {
+                    entries: HashMap::new(),
+                    max_entries,
+                    tick: 0,
+                    hits: 0,
+                    misses: 0,
+                    seeds: 0,
+                }))
+            }
+        }
+    }
+
+    /// L3: drop the level-hash cache (returns to exact-today hashing).
+    pub fn disable_level_hash_cache(&mut self) {
+        self.level_hash_cache = None;
+    }
+
+    /// L3 test/metrics hook: `(hits, misses, seeds, live entries)` if enabled.
+    /// `hits` = O(tail) sponge extensions, `misses` = plain one-shot fallbacks,
+    /// `seeds` = probe→sponge promotions (staged-seeding investments).
+    pub fn level_hash_cache_stats(&self) -> Option<(u64, u64, u64, usize)> {
+        self.level_hash_cache
+            .as_ref()
+            .map(|c| (c.hits, c.misses, c.seeds, c.entries.len()))
     }
 
     /// Modes 0/1 never persist level rows: drop the journaled level keys
@@ -1281,6 +1684,11 @@ impl OrderBook {
     pub fn full_level_ops(&mut self) -> Vec<((u8, i128), crate::book_rows::LevelRowData)> {
         self.level_journal.clear();
         self.level_exists.clear();
+        // L3: full writes (genesis / offline rebuild) use the plain path;
+        // drop any cached sponge states defensively.
+        if let Some(c) = self.level_hash_cache.as_deref_mut() {
+            c.entries.clear();
+        }
         let keys: Vec<(u8, i128)> = self
             .bids
             .keys()
@@ -1652,6 +2060,8 @@ impl BorshDeserialize for OrderBook {
             row_exists: HashSet::new(),
             level_journal: BTreeSet::new(),
             level_exists: HashSet::new(),
+            level_epoch: HashMap::new(),
+            level_hash_cache: None,
         };
 
         for _ in 0..order_count {
@@ -1754,6 +2164,105 @@ mod tests {
             reduce_only: false,
             client_order_id: None,
         }
+    }
+
+    // ====================================================================
+    // L3 level-hash cache — crypto-equivalence witnesses
+    // ====================================================================
+
+    /// The sponge-cache correctness axioms, checked as executable facts:
+    /// (1) streaming sha3::Keccak256 over arbitrary split points equals the
+    ///     one-shot alloy_primitives::keccak256 (same function, cross-impl);
+    /// (2) a CLONED mid-absorb state, extended and finalized, equals the
+    ///     one-shot digest of the full stream (clone+extend ≡ absorb-all),
+    ///     and finalizing the clone does not perturb the original state.
+    #[test]
+    fn keccak_stream_clone_equivalence() {
+        use sha3::Digest;
+        let mut s = 0x1234_5678_9ABC_DEF0u64;
+        let mut xs = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        for len in [0usize, 1, 7, 135, 136, 137, 200, 1000, 5000] {
+            let data: Vec<u8> = (0..len).map(|_| (xs() & 0xFF) as u8).collect();
+            let oneshot = alloy_primitives::keccak256(&data).0;
+            // Random split points, including 0 and len.
+            for _ in 0..8 {
+                let cut = (xs() as usize) % (len + 1);
+                let mut h = sha3::Keccak256::new();
+                h.update(&data[..cut]);
+                // Snapshot mid-absorb (the cached state), then extend both
+                // the original and the snapshot with the tail.
+                let mut snap = h.clone();
+                h.update(&data[cut..]);
+                snap.update(&data[cut..]);
+                // Finalizing a CLONE of the extended state must not perturb
+                // further use of the state itself.
+                let d1: [u8; 32] = h.clone().finalize().into();
+                let d2: [u8; 32] = snap.finalize().into();
+                assert_eq!(d1, oneshot, "streamed != one-shot (len={len} cut={cut})");
+                assert_eq!(d2, oneshot, "cloned-state != one-shot (len={len} cut={cut})");
+                // The original is still usable and still agrees.
+                let d3: [u8; 32] = h.finalize().into();
+                assert_eq!(d3, oneshot, "post-clone original diverged");
+            }
+        }
+    }
+
+    /// Staged-seeding smoke: exercises all three arms of the cached path
+    /// (miss→probe, probe→promote/seed, seeded→extend hit, stale→miss) and
+    /// asserts byte-identity with the frozen one-shot recompute at each stage
+    /// (the exhaustive differential lives in tests/level_rows_core_tests.rs and
+    /// torus-bridge).
+    #[test]
+    fn level_hash_cache_smoke_staged_seeding() {
+        let mut ob = book();
+        ob.ensure_level_hash_cache(1 << 20);
+        // Seed 5 resting orders and save: no slot ⇒ MISS (plain one-shot path
+        // + a cheap probe; no sponge is built on a level's first save).
+        for i in 0..5 {
+            ob.place_order(limit_buy(fp(100), fp(1 + i)), addr(1), i as u64);
+        }
+        let ops1 = ob.take_level_ops();
+        assert_eq!(ops1.len(), 1);
+        let (h, m, s, _) = ob.level_hash_cache_stats().unwrap();
+        assert_eq!((h, m, s), (0, 1, 0), "first save of a level is a plain miss");
+
+        // Append-only save #2: the probe's epoch is unchanged ⇒ the interval
+        // was append-only ⇒ PROMOTE (invest one full absorb, seed the sponge).
+        ob.place_order(limit_buy(fp(100), fp(9)), addr(2), 10);
+        let ops2 = ob.take_level_ops();
+        let (h, m, s, _) = ob.level_hash_cache_stats().unwrap();
+        assert_eq!((h, m, s), (0, 1, 1), "append-only interval promotes probe→sponge");
+        let plain = ob.level_row_data(crate::book_rows::SIDE_TAG_BID, fp(100).raw());
+        assert_eq!(ops2[0].1, plain, "promoted digest != one-shot");
+
+        // Append-only save #3: now a Seeded entry with unchanged epoch ⇒ HIT
+        // (O(tail) sponge extension), still byte-identical.
+        ob.place_order(limit_buy(fp(100), fp(7)), addr(2), 11);
+        let ops3 = ob.take_level_ops();
+        let (h, m, s, _) = ob.level_hash_cache_stats().unwrap();
+        assert_eq!((h, m, s), (1, 1, 1), "second append-only interval extends the sponge");
+        let plain = ob.level_row_data(crate::book_rows::SIDE_TAG_BID, fp(100).raw());
+        assert_eq!(ops3[0].1, plain, "cached extend digest != one-shot");
+
+        // Invalidate (cancel mid-queue) ⇒ epoch bump ⇒ stale seed ⇒ MISS
+        // (plain one-shot + fresh probe), byte-identical.
+        let victim = ob
+            .level_queue(Side::Buy, fp(100))
+            .unwrap()
+            .get(2)
+            .unwrap()
+            .id;
+        ob.cancel_order(victim).unwrap();
+        let ops4 = ob.take_level_ops();
+        let plain = ob.level_row_data(crate::book_rows::SIDE_TAG_BID, fp(100).raw());
+        assert_eq!(ops4[0].1, plain, "post-invalidation digest != one-shot");
+        let (h, m, s, _) = ob.level_hash_cache_stats().unwrap();
+        assert_eq!((h, m, s), (1, 2, 1), "invalidation forces the plain miss path");
     }
 
     // ====================================================================

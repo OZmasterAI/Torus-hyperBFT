@@ -486,8 +486,19 @@ fn xorshift(s: &mut u64) -> u64 {
 /// and cancels/modifies can target real (or recently-consumed — failures are
 /// deterministic too) orders.
 fn adversarial_batches(blocks: usize) -> Vec<Vec<(Address, NativeAction)>> {
+    adversarial_batches_seeded(blocks, 0xC0FFEE_D00Du64, false)
+}
+
+/// Seed-parameterized variant; `churn = true` biases the mix heavily toward
+/// the cache-INVALIDATING classes (cancels, crossing sweeps, modifies,
+/// cancel-alls) — the L3 level-hash-cache adversarial cell.
+fn adversarial_batches_seeded(
+    blocks: usize,
+    seed: u64,
+    churn: bool,
+) -> Vec<Vec<(Address, NativeAction)>> {
     let traders = [addr(1), addr(2), addr(3), addr(4)];
-    let mut s = 0xC0FFEE_D00Du64;
+    let mut s = seed;
     let mut next_id: u128 = 1;
     let mut placed: Vec<u128> = Vec::new();
     let mut out = Vec::with_capacity(blocks);
@@ -497,7 +508,18 @@ fn adversarial_batches(blocks: usize) -> Vec<Vec<(Address, NativeAction)>> {
         for _ in 0..n {
             let t = traders[(xorshift(&mut s) % 4) as usize];
             let market = 1 + (xorshift(&mut s) % 3) as u64;
-            match xorshift(&mut s) % 10 {
+            // churn: remap two thirds of the resting-spray rolls onto the
+            // invalidating ops (crossing sweep / cancel / modify) so almost
+            // every touched level gets its cached prefix invalidated.
+            let roll = {
+                let r = xorshift(&mut s) % 10;
+                if churn && r <= 4 && xorshift(&mut s) % 3 != 0 {
+                    5 + (xorshift(&mut s) % 3)
+                } else {
+                    r
+                }
+            };
+            match roll {
                 0..=4 => {
                     // resting-ish limit spray
                     let is_buy = xorshift(&mut s) % 2 == 0;
@@ -705,6 +727,144 @@ fn mode2_combo_matrix_byte_identical_with_midrun_restart() {
         assert_eq!(base.dumps.len(), r.dumps.len(), "{label}: CF row counts diverged");
         assert_eq!(base.dumps, r.dumps, "{label}: persisted CF bytes diverged");
         assert_eq!(base.oracle, r.oracle, "{label}: oracle diverged");
+    }
+}
+
+// ============================================================================
+// 5b. L3 level-hash sponge cache — byte-identity differential matrix
+//     (docs/design-levelhash-cache.md §5.2)
+// ============================================================================
+
+struct CacheRunResult {
+    /// Per-block: persisted state root.
+    roots: Vec<B256>,
+    /// Per-block: FULL byte dumps of both book CFs (level rows are root
+    /// entries; order rows are the node-local store).
+    book_dumps: Vec<Vec<(&'static str, Vec<u8>, Vec<u8>)>>,
+    /// Final full dumps across all interesting CFs.
+    dumps: Vec<(&'static str, Vec<u8>, Vec<u8>)>,
+    oracle: B256,
+}
+
+/// One mode-2 universe (resident books, serial flush) driven by a seeded
+/// adversarial sequence, with the level-hash cache set to `cache_mb` (0 =
+/// today's exact path). `restart_before` drops the resident holder — a
+/// mid-sequence restart, which for cache-on is a cold empty cache.
+fn run_levelcache_universe(
+    cache_mb: usize,
+    seed: u64,
+    churn: bool,
+    blocks: usize,
+    restart_before: Option<u64>,
+) -> CacheRunResult {
+    let (_dir, db) = open_test_db();
+    {
+        let ctx0 = make_ctx(db.clone(), 0, BookMode::LevelAuthority);
+        for t in [addr(1), addr(2), addr(3), addr(4)] {
+            fund_native(&ctx0, &t, fp(100_000_000));
+        }
+    }
+    build_native_trie_to_cf(&db).unwrap();
+
+    let mut books = ResidentBooks::default();
+    let batches = adversarial_batches_seeded(blocks, seed, churn);
+    let mut roots = Vec::new();
+    let mut book_dumps = Vec::new();
+
+    for (i, batch) in batches.iter().enumerate() {
+        let height = (i + 1) as u64;
+        if restart_before == Some(height) {
+            books = ResidentBooks::default();
+        }
+        let overlay = NativeStateOverlay::new(db.clone());
+        let mut ctx = NativeExecContext::new_with_mode(
+            overlay.clone(),
+            height,
+            1000 + height,
+            0,
+            100,
+            10,
+            addr(99),
+            addr(100),
+            addr(101),
+            BookMode::LevelAuthority,
+            Some(&mut books),
+        );
+        ctx.level_hash_cache_bytes = cache_mb * 1024 * 1024;
+        assert!(ctx.fatal_error.is_none(), "load {height}: {:?}", ctx.fatal_error);
+        let _ = NativeExecutor::execute_batch(&mut ctx, batch);
+        assert!(ctx.fatal_error.is_none(), "exec {height}: {:?}", ctx.fatal_error);
+        ctx.save_order_books();
+        ctx.stash_resident(&mut books);
+        overlay
+            .flush_with_native_trie_stats(
+                &db,
+                Some(height),
+                None::<&mut NativeTrieCache>,
+                None::<&mut NativeMemberCache>,
+            )
+            .expect("flush");
+        roots.push(persisted_native_root(&db).unwrap());
+        let mut per_block = Vec::new();
+        for cf in [CF_NATIVE_ORDER_BOOKS, CF_BOOK_ORDER_ROWS] {
+            for (k, v) in dump_cf(&db, cf) {
+                per_block.push((cf, k, v));
+            }
+        }
+        book_dumps.push(per_block);
+    }
+
+    let mut dumps = Vec::new();
+    for cf in [
+        CF_NATIVE_BALANCES,
+        CF_NATIVE_POSITIONS,
+        CF_NATIVE_ORDER_BOOKS,
+        CF_BOOK_ORDER_ROWS,
+        CF_NATIVE_TRIE,
+        CF_NATIVE_HASHED,
+    ] {
+        for (k, v) in dump_cf(&db, cf) {
+            dumps.push((cf, k, v));
+        }
+    }
+    CacheRunResult {
+        roots,
+        book_dumps,
+        dumps,
+        oracle: native_root_full(&db).unwrap(),
+    }
+}
+
+/// L3 acceptance (a): cache-on vs cache-off over long randomized op sequences
+/// (places, matches consuming fronts, front/mid/tail cancels, in-place
+/// partial-qty modifies, price modifies, cancel-alls, stops), replayed with a
+/// mid-sequence restart, 3 seeds + an adversarial invalidation-churn seed +
+/// a 1 MB tight-budget cell (eviction churn) ⇒ level hashes, book rows and
+/// state roots BYTE-IDENTICAL at EVERY block.
+#[test]
+fn levelhash_cache_differential_matrix_byte_identical() {
+    let cells: [(u64, bool, usize); 5] = [
+        (0xC0FFEE_D00D, false, 64),      // the standing adversarial seed
+        (0xDEAD_BEEF_5EED, false, 64),   // fresh seed 2
+        (0x1234_5678_9ABC, false, 64),   // fresh seed 3
+        (0xBAD_CAFE_C4A0, true, 64),     // invalidation-churn maximizer
+        (0xC0FFEE_D00D, false, 1),       // tight budget: eviction correctness
+    ];
+    for (seed, churn, cache_mb) in cells {
+        let off = run_levelcache_universe(0, seed, churn, 40, Some(20));
+        let on = run_levelcache_universe(cache_mb, seed, churn, 40, Some(20));
+        let label = format!("seed={seed:#x} churn={churn} cache_mb={cache_mb}");
+        assert_eq!(off.roots, on.roots, "{label}: per-block roots diverged");
+        for (h, (a, b)) in off.book_dumps.iter().zip(on.book_dumps.iter()).enumerate() {
+            assert_eq!(a, b, "{label}: block {} book/level CF bytes diverged", h + 1);
+        }
+        assert_eq!(off.dumps, on.dumps, "{label}: final CF dumps diverged");
+        assert_eq!(off.oracle, on.oracle, "{label}: full-scan oracle diverged");
+        assert_eq!(
+            *on.roots.last().unwrap(),
+            on.oracle,
+            "{label}: cache-on persisted root != oracle"
+        );
     }
 }
 
