@@ -71,7 +71,27 @@ The script finds `bench-throughput` via `cargo metadata`, so a redirected
 not need the binary at `./target/release/`. If it still can't find it, the error
 tells you exactly where it looked and what to build.
 
-## 3. Launch the validator (ARCHIVE mode) — set your keystore paths
+## 3. Stop the old node and WIPE its data dir (keep your keystore)
+
+**This is the make-or-break step.** `torus-node` logs `"database already
+initialized, skipping genesis"` (main.rs:502) and resumes whatever chain is in the
+data dir — so launching on top of your old data silently ignores the new genesis
+and puts you back on the DEAD chain. With your same keys you would then serve that
+old chain to the fresh nodes and re-infect them.
+
+```bash
+sudo systemctl stop <your-service>
+sudo systemctl disable <your-service>   # nothing may auto-restart mid-window
+pgrep -af torus-node                    # must print NOTHING
+
+mv ./data ./data.bak-$(date +%s)        # MOVE, don't delete — lets us roll back
+# do NOT touch your keystore / passphrase files, they live separately
+```
+
+Tell us "down + wiped" and **wait for the go** before starting. One node still
+serving the old chain undoes the whole relaunch.
+
+## 4. Launch the validator (ARCHIVE mode) — set your keystore paths
 ```bash
 ./target/release/torus-node \
   --genesis testnet/genesis-weighted-full.json \
@@ -89,11 +109,11 @@ tells you exactly where it looked and what to build.
 - RPC/metrics stay on **loopback** — never expose them.
 - Confirm in the log: `pubkey=537f761858…` and height climbing.
 
-> Don't hard-start yet — coordinated launch (step 6). Steps 4–5 you can set up now.
+> Don't hard-start yet — coordinated launch (step 8). Steps 5–6 you can set up now.
 
 ---
 
-## 4. Indexer (`torus-explorer`) — bound to loopback
+## 5. Indexer (`torus-explorer`) — bound to loopback
 Backfills genesis→head from your local archive RPC into SQLite, serves `/api` locally.
 ```bash
 ./target/release/torus-explorer \
@@ -103,7 +123,7 @@ Backfills genesis→head from your local archive RPC into SQLite, serves `/api` 
   --listen  127.0.0.1:3001
 ```
 
-## 5. Block explorer UI (`torus-HBFT-explorer` — you have collaborator access)
+## 6. Block explorer UI (`torus-HBFT-explorer` — you have collaborator access)
 ```bash
 git clone https://github.com/OZmasterAI/torus-HBFT-explorer
 cd torus-HBFT-explorer
@@ -125,7 +145,7 @@ pnpm build
 pnpm start -- -H 127.0.0.1 -p 3000
 ```
 
-## 6. Expose ONLY the UI to the web, safely (Caddy = automatic HTTPS)
+## 7. Expose ONLY the UI to the web, safely (Caddy = automatic HTTPS)
 Everything above binds to loopback. Caddy is the single public entrypoint on 443,
 reverse-proxying to the UI. The node RPC (8545), metrics (9090) and indexer (3001)
 stay private.
@@ -157,7 +177,7 @@ Notes:
 
 ---
 
-## 7. Coordination
+## 8. Coordination
 It's a coordinated fresh start — blocks only flow once **seed + 18c + you** are all up
 and peered. Those three carry 12M of the 14M power, which clears the 9.3334M quorum on
 their own, so the chain starts without waiting on **val3** — val3 is NAT/dials-out and
