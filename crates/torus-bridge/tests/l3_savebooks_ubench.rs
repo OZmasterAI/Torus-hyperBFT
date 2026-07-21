@@ -158,6 +158,49 @@ fn savebooks_cell_shape() {
     }
 }
 
+/// THE in-vivo regime: `torus_exec_resting_orders = 195024` at the pegged cell
+/// (offered 300k/s ≫ matched 2.4k/s ⇒ ~99% of orders rest, the book grows
+/// monotonically). Reproduce it: 10 markets × 40 price levels, one new resting
+/// bid per level per block (400 orders/block, no matching), so each level's
+/// queue depth == block number. save_books touches all 40 levels every block
+/// and re-hashes each over its full (growing) queue — level_row_data is
+/// O(orders at level). Watch lvls_us climb toward the in-vivo 107 ms as
+/// resting → ~195k. THIS is the attribution.
+#[test]
+#[ignore = "perf µbench; run with --ignored --nocapture"]
+fn savebooks_deep_book_accumulate() {
+    let (_d, db) = open_db();
+    let mut holder = ResidentBooks::default();
+    const LEVELS: i64 = 40;
+    hdr("deep book accumulate (resting grows; depth/level == block#)");
+    let sample: &[u64] = &[1, 5, 25, 50, 100, 200, 300, 400, 490];
+    for h in 1..=500u64 {
+        let ov = NativeStateOverlay::new(db.clone());
+        let mut ctx = make_ctx(ov.clone(), h, &mut holder);
+        if h == 1 {
+            fund(&ctx, &addr(1), fp(1_000_000_000_000));
+        }
+        // 40 bids/market at fixed prices (300..339) — never cross, always rest.
+        let mut batch = Vec::with_capacity(400);
+        for m in 1..=N_MARKETS {
+            for lvl in 0..LEVELS {
+                batch.push(place(addr(1), gtc(m, true, 300 + lvl, 1)));
+            }
+        }
+        let _ = NativeExecutor::execute_batch(&mut ctx, &batch);
+        let take = sample.contains(&h);
+        ctx.collect_save_timings = take;
+        let t = Instant::now();
+        let w = ctx.save_order_books();
+        let us = t.elapsed().as_micros();
+        if take {
+            row(h, &ctx, us, w);
+        }
+        ctx.stash_resident(&mut holder);
+        ov.flush(&db).unwrap();
+    }
+}
+
 /// Characterize level_row_data (O(orders at touched level)): seed a standing
 /// book of DEPTH orders per level, then touch one order at each level and time
 /// the resulting re-hash. Shows the scaling hazard when resting depth is NOT 0.
@@ -174,7 +217,7 @@ fn savebooks_depth_sweep() {
         // Block 1: seed `depth` resting bids at each of `levels` price levels.
         let ov = NativeStateOverlay::new(db.clone());
         let mut ctx = make_ctx(ov.clone(), 1, &mut holder);
-        fund(&ctx, &addr(1), fp(50_000_000_000));
+        fund(&ctx, &addr(1), fp(1_000_000_000_000));
         let mut seed = Vec::new();
         for lvl in 0..levels {
             for _ in 0..depth {
@@ -188,7 +231,7 @@ fn savebooks_depth_sweep() {
         // Block 2: add ONE order to each level (touches the level → full re-hash).
         let ov = NativeStateOverlay::new(db.clone());
         let mut ctx = make_ctx(ov.clone(), 2, &mut holder);
-        fund(&ctx, &addr(1), fp(50_000_000_000));
+        fund(&ctx, &addr(1), fp(1_000_000_000_000));
         let mut touch = Vec::new();
         for lvl in 0..levels {
             touch.push(place(addr(1), gtc(1, true, 50 + lvl, 2)));
