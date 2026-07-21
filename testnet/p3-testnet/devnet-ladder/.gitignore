@@ -1,0 +1,3 @@
+# Leg outputs and the local image manifest are run artifacts, not source.
+results/
+image-manifest.txt

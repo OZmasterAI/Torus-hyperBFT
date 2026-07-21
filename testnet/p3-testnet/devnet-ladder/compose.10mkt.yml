@@ -1,0 +1,44 @@
+# Compose OVERRIDE for the devnet fill ladder: 10-market genesis + per-branch image.
+#
+# WHY 10 MARKETS: markets are registered ONLY at genesis or via governance — the
+# RPC ingress rejects an unknown market_id (S432), so `bench-throughput --markets 10`
+# requires all ten seeded. The stock devnet genesis seeds only 4.
+#
+# WHY A PINNED IMAGE: the ladder runs the SAME genesis against several branches.
+# DEVNET_IMAGE is mandatory (no default) so a leg can never silently run the
+# other branch's binary, or a stale `:local` tag.
+#
+# Paths are relative to the COMPOSE PROJECT DIR (the directory of the FIRST -f
+# file, i.e. devnet/), not to this file.
+#
+# Usage — env must ride INLINE on sudo, which strips the caller environment:
+#   sudo -n env DEVNET_IMAGE=torus-devnet-node:mytag \
+#     docker compose -p p3ladder \
+#       -f devnet/docker-compose.yml \
+#       -f testnet/p3-testnet/devnet-ladder/compose.10mkt.yml up -d
+services:
+  validator-0:
+    image: ${DEVNET_IMAGE:?DEVNET_IMAGE must be set (per-branch tag)}
+    volumes:
+      - ../testnet/p3-testnet/devnet-ladder/genesis-10mkt.json:/genesis/genesis.json:ro
+      - validator-0-data:/data
+  validator-1:
+    image: ${DEVNET_IMAGE:?DEVNET_IMAGE must be set (per-branch tag)}
+    volumes:
+      - ../testnet/p3-testnet/devnet-ladder/genesis-10mkt.json:/genesis/genesis.json:ro
+      - validator-1-data:/data
+  validator-2:
+    image: ${DEVNET_IMAGE:?DEVNET_IMAGE must be set (per-branch tag)}
+    volumes:
+      - ../testnet/p3-testnet/devnet-ladder/genesis-10mkt.json:/genesis/genesis.json:ro
+      - validator-2-data:/data
+  validator-3:
+    image: ${DEVNET_IMAGE:?DEVNET_IMAGE must be set (per-branch tag)}
+    volumes:
+      - ../testnet/p3-testnet/devnet-ladder/genesis-10mkt.json:/genesis/genesis.json:ro
+      - validator-3-data:/data
+  rpc-node:
+    image: ${DEVNET_IMAGE:?DEVNET_IMAGE must be set (per-branch tag)}
+    volumes:
+      - ../testnet/p3-testnet/devnet-ladder/genesis-10mkt.json:/genesis/genesis.json:ro
+      - rpc-node-data:/data

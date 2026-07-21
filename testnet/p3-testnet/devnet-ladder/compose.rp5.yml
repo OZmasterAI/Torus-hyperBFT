@@ -1,0 +1,75 @@
+# SHIM for the re-proof5 leg ONLY. Generated from devnet/docker-compose.yml.
+#
+# WHY: re-proof5 has no split read-only RPC listener. Its clap struct declares
+# only `rpc_addr` (crates/torus-node/src/main.rs:138). clap derive is strict, so
+# a container started with --rpc-read-addr exits immediately at startup.
+# p3 has both listeners (main.rs:121); re-proof5 has one.
+#
+# This overlay restates each service's `command` with --rpc-read-addr removed.
+# Compose REPLACES list-valued `command`, so this is a clean override.
+#
+# Ports are deliberately NOT touched: host 8801 -> container 8645 simply maps to
+# a port nothing listens on under re-proof5. Harmless, and leaving it keeps the
+# bench target (host 8645 -> container 8545) byte-identical across both legs.
+#
+# Usage - MUST be the LAST -f, after compose.10mkt.yml:
+#   sudo -n env DEVNET_IMAGE=torus-devnet-node:ladder-rp5 \
+#     docker compose -p p3ladder \
+#       -f devnet/docker-compose.yml \
+#       -f testnet/p3-testnet/devnet-ladder/compose.10mkt.yml \
+#       -f testnet/p3-testnet/devnet-ladder/compose.rp5.yml up -d
+services:
+  validator-0:
+    command:
+    - --genesis=/genesis/genesis.json
+    - --data-dir=/data
+    - --validator-key=0100000000000000000000000000000000000000000000000000000000000000
+    - --retention-blocks=${VAL0_RETENTION:-100000}
+    - --p2p-listen=/ip4/0.0.0.0/udp/30333/quic-v1
+    - --p2p-private-addrs
+    - --p2p-peers=/ip4/172.28.0.11/udp/30334/quic-v1/p2p/12D3KooWH3uVF6wv47WnArKHk5p6cvgCJEb74UTmxztmQDc298L3
+    - --rpc-addr=0.0.0.0:8545
+    - --log-level=info
+  validator-1:
+    command:
+    - --genesis=/genesis/genesis.json
+    - --data-dir=/data
+    - --validator-key=0200000000000000000000000000000000000000000000000000000000000000
+    - --retention-blocks=${VAL1_RETENTION:-100000}
+    - --p2p-listen=/ip4/0.0.0.0/udp/30334/quic-v1
+    - --p2p-private-addrs
+    - --p2p-peers=/ip4/172.28.0.10/udp/30333/quic-v1/p2p/12D3KooWPjceQrSwdWXPyLLeABRXmuqt69Rg3sBYbU1Nft9HyQ6X
+    - --rpc-addr=0.0.0.0:8545
+    - --log-level=info
+  validator-2:
+    command:
+    - --genesis=/genesis/genesis.json
+    - --data-dir=/data
+    - --validator-key=0300000000000000000000000000000000000000000000000000000000000000
+    - --retention-blocks=${VAL2_RETENTION:-100000}
+    - --p2p-listen=/ip4/0.0.0.0/udp/30335/quic-v1
+    - --p2p-private-addrs
+    - --p2p-peers=/ip4/172.28.0.10/udp/30333/quic-v1/p2p/12D3KooWPjceQrSwdWXPyLLeABRXmuqt69Rg3sBYbU1Nft9HyQ6X
+    - --rpc-addr=0.0.0.0:8545
+    - --log-level=info
+  validator-3:
+    command:
+    - --genesis=/genesis/genesis.json
+    - --data-dir=/data
+    - --validator-key=0400000000000000000000000000000000000000000000000000000000000000
+    - --retention-blocks=${VAL3_RETENTION:-100000}
+    - --p2p-listen=/ip4/0.0.0.0/udp/30336/quic-v1
+    - --p2p-private-addrs
+    - --p2p-peers=/ip4/172.28.0.10/udp/30333/quic-v1/p2p/12D3KooWPjceQrSwdWXPyLLeABRXmuqt69Rg3sBYbU1Nft9HyQ6X
+    - --rpc-addr=0.0.0.0:8545
+    - --log-level=info
+  rpc-node:
+    command:
+    - --rpc-only
+    - --genesis=/genesis/genesis.json
+    - --data-dir=/data
+    - --p2p-listen=/ip4/0.0.0.0/udp/30337/quic-v1
+    - --p2p-private-addrs
+    - --p2p-peers=/ip4/172.28.0.10/udp/30333/quic-v1/p2p/12D3KooWPjceQrSwdWXPyLLeABRXmuqt69Rg3sBYbU1Nft9HyQ6X
+    - --rpc-addr=0.0.0.0:8545
+    - --log-level=info

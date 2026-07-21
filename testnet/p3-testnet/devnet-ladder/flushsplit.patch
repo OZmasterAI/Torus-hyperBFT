@@ -1,0 +1,59 @@
+diff --git a/crates/torus-state/src/backend.rs b/crates/torus-state/src/backend.rs
+index ae37edb..20ec7f3 100644
+--- a/crates/torus-state/src/backend.rs
++++ b/crates/torus-state/src/backend.rs
+@@ -322,6 +322,10 @@ impl NativeStateOverlay {
+     /// the (off-by-default) incremental root is merely stale for that block (repaired by replay /
+     /// caught by the runtime oracle).
+     pub fn flush_with_native_trie(&self, target: &StateDb) -> Result<(), StateError> {
++        // DIAGNOSTIC (uncommitted): torus_exec_flush_seconds spans this whole
++        // function, so a flush regression cannot be attributed to the trie vs the
++        // RocksDB write from that metric alone. These four spans separate them.
++        let t_batch = std::time::Instant::now();
+         let state = self.pending.read().unwrap();
+         let raw = target.inner();
+         let mut batch = WriteBatch::default();
+@@ -336,6 +340,8 @@ impl NativeStateOverlay {
+                 batch.delete_cf(cf, key);
+             }
+         }
++        let d_batch = t_batch.elapsed();
++        let t_dirty = std::time::Instant::now();
+ 
+         // Native-root dirty map, folded into the SAME batch.
+         let mut dirty: BTreeMap<(u8, Vec<u8>), Option<Vec<u8>>> = BTreeMap::new();
+@@ -350,14 +356,34 @@ impl NativeStateOverlay {
+             }
+         }
+ 
++        let d_dirty = t_dirty.elapsed();
++        let n_dirty = dirty.len();
++        let n_writes = state.writes.len();
++
+         // apply_native_dirty_to_batch computes all ops before appending, so on Err nothing was
+         // appended and the native-CF writes still flush.
++        let t_trie = std::time::Instant::now();
+         let trie_result = if dirty.is_empty() {
+             Ok(())
+         } else {
+             crate::native_trie::apply_native_dirty_to_batch(target, &mut batch, &dirty).map(|_| ())
+         };
++        let d_trie = t_trie.elapsed();
++
++        let t_write = std::time::Instant::now();
+         target.write(batch)?;
++        let d_write = t_write.elapsed();
++
++        tracing::info!(
++            target: "flushsplit",
++            batch_us = d_batch.as_micros() as u64,
++            dirty_us = d_dirty.as_micros() as u64,
++            trie_us = d_trie.as_micros() as u64,
++            write_us = d_write.as_micros() as u64,
++            n_dirty,
++            n_writes,
++            "flushsplit"
++        );
+         trie_result
+     }
+ }
