@@ -7515,7 +7515,7 @@ mod crash_recovery_tests {
             ]
             .iter()
             .map(|cf| StateBackend::iterate_cf(&state_db, cf, None).unwrap())
-            .collect::<Vec<_>>()
+            .collect::<Vec<Vec<(Vec<u8>, Vec<u8>)>>>()
         };
 
         let off = run(false);

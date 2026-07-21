@@ -1875,7 +1875,7 @@ mod tests {
 
         // Deterministic dirty set touching several distinct buckets.
         let mut ops = Vec::new();
-        for i in 0..24u64 {
+        for i in 0..24u32 {
             ops.push((1usize, key_for(1, i), Some(vec![0xB0u8 ^ (i as u8); 40])));
         }
         let dirty_s = apply_ops(&db_serial, &ops);
