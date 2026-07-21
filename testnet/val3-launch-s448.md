@@ -1,8 +1,9 @@
 # val3 launch instructions — 4-validator fresh genesis
 
-Copy-paste for the val3 operator. **Supersedes `docs/val3-upgrade-instructions-s392.md`
-entirely** — that doc targets a dead era (10 markets, `testnet/genesis.json`, and it
-lists a peer we have since dropped).
+Copy-paste for the val3 operator. This is the only current val3 doc — the older
+`docs/val3-upgrade-instructions-s392.md` was deleted (dead era: 10 markets, a genesis
+file that no longer exists, and a peer we have since dropped). If you have an older
+copy saved locally, discard it.
 
 You are back in the genesis validator set. Same keystore, same key, same peer id.
 

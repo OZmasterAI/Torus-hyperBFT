@@ -109,11 +109,7 @@ cargo build --release -p torus-node -p bench-throughput
 # fresh genesis: copy the SAME genesis-weighted-full.json the seed produced (verify sha matches)
 mv data data.bisect-bak-$(date +%s)            # fresh chain
 ./target/release/torus-node \
-  # ⚠️ SUPERSEDED PATH — testnet/genesis.json no longer exists. It was a second lean
-  # base producing a DIFFERENT state root; following this line boots a genesis the
-  # rest of the fleet cannot join. Current: testnet/genesis-weighted-full.json,
-  # produced by ./testnet/gen-weighted-genesis.sh (verify the sha before launch).
-  --genesis /home/18c/torus-hyperbft/testnet/genesis.json \
+  --genesis /home/18c/torus-hyperbft/testnet/genesis-weighted-full.json \
   --keystore /home/18c/.torus-hbft/validator.keystore \
   --passphrase-file /home/18c/.torus-hbft/validator.passphrase \
   --data-dir /home/18c/torus-hyperbft/data \
