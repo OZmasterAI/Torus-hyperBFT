@@ -21,7 +21,10 @@
 #   python3 testnet/cap-probe/analyze.py out-cap1000
 set -u
 ROOT="$(git rev-parse --show-toplevel)"
-BIN="${BIN:-$ROOT/target/release/bench-throughput}"
+# Resolve via cargo metadata: a redirected [build] target-dir means a successful
+# `cargo build --release` leaves target/release EMPTY. See testnet/lib/cargo-bin.sh.
+. "$ROOT/testnet/lib/cargo-bin.sh"
+BIN="${BIN:-$(cargo_bin bench-throughput "$ROOT")}"
 
 # ---- target config (override via env). Defaults = local docker devnet. ----
 RPCS="${RPCS:-http://127.0.0.1:8645 http://127.0.0.1:8546 http://127.0.0.1:8547 http://127.0.0.1:8548}"

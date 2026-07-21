@@ -8,8 +8,11 @@
 # Env: BASE BIN OUT BULK_OFFSET BULK_COUNT NATIVE_AVAIL EVM_WEI
 set -euo pipefail
 cd "$(dirname "$0")/.."
+# Resolve bench-throughput via cargo metadata — a redirected [build] target-dir
+# means a successful `cargo build --release` leaves ./target/release EMPTY.
+. "$(dirname "$0")/lib/cargo-bin.sh"
 BASE="${BASE:-testnet/genesis-weighted-base.json}"
-BIN="${BIN:-./target/release/bench-throughput}"
+BIN="${BIN:-$(cargo_bin bench-throughput "$PWD")}"
 OUT="${OUT:-testnet/genesis-weighted-full.json}"
 BULK_OFFSET="${BULK_OFFSET:-60}"        # start index (0..59 already in base)
 BULK_COUNT="${BULK_COUNT:-100000}"      # how many bulk test senders

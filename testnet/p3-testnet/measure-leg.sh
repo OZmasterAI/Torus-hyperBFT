@@ -73,7 +73,10 @@ REPO=${REPO:-$(cd "$HERE/../.." && pwd)}
 # --------------------------- config ----------------------------------------
 RPC=${RPC:-http://127.0.0.1:8555}
 METRICS=${METRICS:-http://127.0.0.1:9090}
-BENCH_BIN=${BENCH_BIN:-$REPO/target/release/bench-throughput}
+# Resolve via cargo metadata: a redirected [build] target-dir means a successful
+# `cargo build --release` leaves $REPO/target/release EMPTY. See lib/cargo-bin.sh.
+. "$REPO/testnet/lib/cargo-bin.sh"
+BENCH_BIN=${BENCH_BIN:-$(cargo_bin bench-throughput "$REPO")}
 RUN_BENCH=${RUN_BENCH:-1}
 
 DURATION=${DURATION:-120}

@@ -18,7 +18,10 @@
 set -u
 cd "$(dirname "$0")/.." || { echo "cannot cd to repo root"; exit 1; }
 
-BIN="${BIN:-./target/release/bench-throughput}"
+# Resolve via cargo metadata: a redirected [build] target-dir means a successful
+# `cargo build --release` leaves target/release EMPTY. See testnet/lib/cargo-bin.sh.
+. "$PWD/testnet/lib/cargo-bin.sh"
+BIN="${BIN:-$(cargo_bin bench-throughput "$PWD")}"
 RPC="${RPC:-http://127.0.0.1:8555}"
 METRICS="${METRICS:-http://127.0.0.1:9090}"
 SENDER_OFFSET="${SENDER_OFFSET:-0}"

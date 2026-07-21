@@ -14,7 +14,11 @@
 # PREREQ: your box must run the FIXED (session-key) binary + the SAME genesis, or
 # session-signed orders are rejected ("session key not found").
 set -euo pipefail
-BIN="${BIN:-./target/release/bench-throughput}"
+# Resolve via cargo metadata: a redirected [build] target-dir means a successful
+# `cargo build --release` leaves target/release EMPTY. See testnet/lib/cargo-bin.sh.
+_R="$(git rev-parse --show-toplevel 2>/dev/null || echo .)"
+. "$_R/testnet/lib/cargo-bin.sh"
+BIN="${BIN:-$(cargo_bin bench-throughput "$_R")}"
 RPC="${RPC:-http://localhost:8545}"
 SIGN_MODE="${SIGN_MODE:-session}"
 echo "[bench FRIEND2] senders 40..59 | sign=$SIGN_MODE | rpc=$RPC" >&2

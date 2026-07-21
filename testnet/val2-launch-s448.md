@@ -51,14 +51,10 @@ sha256sum testnet/genesis-weighted-full.json
 Expect ~28MB, 100,060 native + 100,052 EVM accounts. Run the script with the
 **default `NATIVE_AVAIL`** — overriding it changes the hash.
 
-If `gen-weighted-genesis.sh` dies with `No such file or directory`, your cargo
-`target-dir` is redirected (see `~/.cargo/config.toml`) and the binary is not at
-`./target/release/`. Stage it:
-```bash
-install -Dm755 "$(cargo metadata --format-version 1 --no-deps \
-  | python3 -c 'import sys,json;print(json.load(sys.stdin)["target_directory"])')/release/bench-throughput" \
-  target/release/bench-throughput
-```
+The script finds `bench-throughput` via `cargo metadata`, so a redirected
+`[build] target-dir` in `~/.cargo/config.toml` is handled automatically — you do
+not need the binary at `./target/release/`. If it still can't find it, the error
+tells you exactly where it looked and what to build.
 
 ## 3. Launch the validator (ARCHIVE mode) — set your keystore paths
 ```bash

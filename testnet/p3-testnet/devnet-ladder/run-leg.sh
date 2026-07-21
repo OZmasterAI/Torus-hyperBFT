@@ -33,7 +33,10 @@ RESULTS_DIR=${RESULTS_DIR:-$HERE/results}
 IMAGE=${1:?image}; LABEL=${2:?label}; TAKER=${3:?taker_ratio}
 MARKETS=${4:-10}; SENDERS=${5:-60}; DUR=${6:-120}
 PRESIGN=${PRESIGN:-400}
-BENCH_BIN=${BENCH_BIN:-$REPO/target/release/bench-throughput}
+# Resolve via cargo metadata: a redirected [build] target-dir means a successful
+# `cargo build --release` leaves $REPO/target/release EMPTY. See lib/cargo-bin.sh.
+. "$REPO/testnet/lib/cargo-bin.sh"
+BENCH_BIN=${BENCH_BIN:-$(cargo_bin bench-throughput "$REPO" || true)}
 
 echo "###### LEG $LABEL (flow=${FLOW:-match} taker=$TAKER markets=$MARKETS senders=$SENDERS dur=${DUR}s) ######"
 [ -x "$BENCH_BIN" ] || { echo "FATAL: bench binary missing: $BENCH_BIN (cargo build --release -p bench-throughput)"; exit 1; }

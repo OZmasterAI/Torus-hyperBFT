@@ -6955,6 +6955,7 @@ dependencies = [
  "criterion",
  "proptest",
  "rocksdb",
+ "sha3",
  "tempfile",
  "thiserror 2.0.18",
  "torus-economics",

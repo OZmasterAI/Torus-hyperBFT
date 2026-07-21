@@ -9,7 +9,11 @@
 # A/B (lever 1): SIGN_MODE=eip712 ./testnet/bench-our.sh   # baseline (ecrecover/action)
 #                ./testnet/bench-our.sh                    # session fast path (default)
 set -euo pipefail
-BIN="${BIN:-./target/release/bench-throughput}"
+# Resolve via cargo metadata: a redirected [build] target-dir means a successful
+# `cargo build --release` leaves target/release EMPTY. See testnet/lib/cargo-bin.sh.
+_R="$(git rev-parse --show-toplevel 2>/dev/null || echo .)"
+. "$_R/testnet/lib/cargo-bin.sh"
+BIN="${BIN:-$(cargo_bin bench-throughput "$_R")}"
 RPC="${RPC:-http://localhost:8545}"
 SIGN_MODE="${SIGN_MODE:-session}"
 echo "[bench OUR] senders 0..19 | sign=$SIGN_MODE | rpc=$RPC" >&2

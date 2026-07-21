@@ -1,5 +1,15 @@
 # Bisect A/B runbook — S448 val2 flood-collapse (throughput ceiling: regression vs. flood-shape)
 
+> **HISTORICAL — superseded, do not follow verbatim.** This documents a completed
+> investigation pinned to commits `6728150` (A) and `5ff2974` (B) and to the era whose
+> genesis sha256 was `858639c5…`. Those values are correct *for what this runbook
+> describes* and are deliberately left unchanged.
+>
+> The current testnet is a different era: 4 validators (seed 4M / 18c 4M / val2 4M /
+> val3 2M), genesis sha256 `624c8a67269dca117da54de30175b7b903fb5ab068d90692b8408fcdbd64dc61`,
+> built from branch `perf/re-proof5`. For a live run use `val2-launch-s448.md` and
+> `seed-relaunch-cmd-s448.txt`; reuse only the *method* below, never its constants.
+
 **Goal:** determine whether the native-order flood collapse val2 saw on S448 is a **code
 regression** (something between the 207k S444 run and current lowered the ceiling) or just a
 **harder flood-shape** (same ceiling, pushed past it).

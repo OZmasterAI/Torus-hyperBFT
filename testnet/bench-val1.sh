@@ -11,7 +11,11 @@
 # if val1's block production stalls (prior val1-localhost runs used rate 30, sb 15).
 # PREREQ: val1 on the FIXED (session-key) binary + this genesis.
 set -euo pipefail
-BIN="${BIN:-./target/release/bench-throughput}"
+# Resolve via cargo metadata: a redirected [build] target-dir means a successful
+# `cargo build --release` leaves target/release EMPTY. See testnet/lib/cargo-bin.sh.
+_R="$(git rev-parse --show-toplevel 2>/dev/null || echo .)"
+. "$_R/testnet/lib/cargo-bin.sh"
+BIN="${BIN:-$(cargo_bin bench-throughput "$_R")}"
 RPC="${RPC:-http://localhost:8545}"
 SIGN_MODE="${SIGN_MODE:-session}"
 echo "[bench VAL1] senders 20..39 | sign=$SIGN_MODE | rpc=$RPC" >&2
