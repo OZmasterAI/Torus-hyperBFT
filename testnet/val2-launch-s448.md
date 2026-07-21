@@ -4,7 +4,8 @@ You run: the **validator (archive mode)** + the **indexer** + the **block explor
 and expose the explorer to the web (you're the archive node / strongest box, so
 everything history-related lives here).
 
-Fresh chain, **3 equal validators** (seed / 18c / you, 4M each), chain_id **7778**.
+Fresh chain, **4 validators**, chain_id **7778**: seed / 18c / you at **4M** each,
+plus **val3** (NAT box, dials out) at **2M**. Total power 14M.
 
 Your identity (your **existing** val2 keystore — same key as before):
 - pubkey  `0x537f761858a3b44a23a0d63e16d9e642a86c44aac98a94d39501d2115528a63c`
@@ -14,8 +15,11 @@ Your identity (your **existing** val2 keystore — same key as before):
 
 ## ⚠️ Two things that halt the whole chain if wrong — read first
 
-**1. Port `30333/udp` MUST be open inbound.** This set needs all 3 validators live,
-so if your node is unreachable the chain stops. You were firewalled before — confirm:
+**1. Port `30333/udp` MUST be open inbound.** Quorum is `(14M*2/3)+1` = **9.3334M**, so
+the chain survives ANY ONE validator being down (worst case 10M remains) but halts the
+moment a **second** one drops. Your node alone going dark no longer stops the chain — but
+it removes all slack, and you are also the archive/explorer host. You were firewalled
+before — confirm:
 ```bash
 sudo ufw allow 30333/udp && sudo ufw status | grep 30333
 # or iptables:
@@ -28,10 +32,10 @@ key. The node prints its pubkey at startup — sanity-check it matches.
 
 ---
 
-## 1. Build (branch `think-dev`)
+## 1. Build (branch `perf/re-proof5`)
 ```bash
 cd <your torus-hyperbft checkout>
-git fetch origin && git checkout think-dev && git pull --ff-only origin think-dev
+git fetch origin && git checkout perf/re-proof5 && git pull --ff-only origin perf/re-proof5
 cargo build --release -p torus-node -p bench-throughput -p torus-explorer
 ```
 
@@ -40,9 +44,21 @@ cargo build --release -p torus-node -p bench-throughput -p torus-explorer
 ./testnet/gen-weighted-genesis.sh
 sha256sum testnet/genesis-weighted-full.json
 # MUST equal:
-# 858639c5abe079a9b7a202578b5857ba7c0ef23af44c6de608f1bcd8d2eaea15
+# 624c8a67269dca117da54de30175b7b903fb5ab068d90692b8408fcdbd64dc61
 ```
-If it doesn't match, stop and tell us.
+**If it doesn't match, stop and tell us.**
+
+Expect ~28MB, 100,060 native + 100,052 EVM accounts. Run the script with the
+**default `NATIVE_AVAIL`** — overriding it changes the hash.
+
+If `gen-weighted-genesis.sh` dies with `No such file or directory`, your cargo
+`target-dir` is redirected (see `~/.cargo/config.toml`) and the binary is not at
+`./target/release/`. Stage it:
+```bash
+install -Dm755 "$(cargo metadata --format-version 1 --no-deps \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["target_directory"])')/release/bench-throughput" \
+  target/release/bench-throughput
+```
 
 ## 3. Launch the validator (ARCHIVE mode) — set your keystore paths
 ```bash
@@ -131,7 +147,11 @@ Notes:
 ---
 
 ## 7. Coordination
-It's a coordinated fresh start — blocks only flow once **seed + 18c + you** are all
-up and peered. Ping us once: (1) built, (2) genesis sha matches `858639c5…`, and
+It's a coordinated fresh start — blocks only flow once **seed + 18c + you** are all up
+and peered. Those three carry 12M of the 14M power, which clears the 9.3334M quorum on
+their own, so the chain starts without waiting on **val3** — val3 is NAT/dials-out and
+joins itself whenever it comes up. Do not list val3 in `--p2p-peers`; it dials you.
+
+Ping us once: (1) built, (2) genesis sha matches `624c8a67269dca117da54de30175b7b903fb5ab068d90692b8408fcdbd64dc61`, and
 (3) 30333/udp confirmed open. We start all three together, then you bring up the
 indexer + UI.

@@ -4,7 +4,12 @@
 #   can't starve the framework (SurrealDB/Claude) on this shared box. Restart=always for resilience.
 #   (SurrealDB was OOM-killed here before under memory contention — this cap prevents a repeat.)
 # Peers = val2 (103.167.235.250) + val4/18c (13.140.140.138). Dropped node 84.32.108.220 is NOT a peer.
-# Genesis sha256 must be 5042dbdb1429ae80bbcdbe87fdf8ef5bd0501be52740d184cf3ec119cab43951  (S459 new-genesis, era 2026-07-14; was 858639c5 pre-relaunch)
+#   val3 is NAT/dials-out — it is deliberately NOT in this peer list; it dials us.
+# Validator set (4): seed 4M + 18c 4M + val2 4M + val3 2M = 14M power, quorum 9.3334M.
+#   Survives any ONE validator down; a SECOND one halts the chain.
+# Build branch for this era: perf/re-proof5 (carries the 4-validator genesis base).
+# Genesis sha256 must be 624c8a67269dca117da54de30175b7b903fb5ab068d90692b8408fcdbd64dc61  (new 4-val genesis, era 2026-07-22;
+#   supersedes 5042dbdb… era 2026-07-14 and 858639c5… before it)
 # DO NOT START until val2 (friend2) is built + 30333/udp open, and we launch all three together.
 
 systemd-run --user --unit=torus-seed-validator \
