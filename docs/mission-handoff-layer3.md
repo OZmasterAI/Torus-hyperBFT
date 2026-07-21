@@ -58,11 +58,16 @@ deliver. Pipeline-latency levers are EXHAUSTED. Layer 3 = cut replica per-view W
   ~18ms cold). `perf/l3-verify-par` @ a2bcb88 adds TORUS_PARALLEL_VERIFY control,
   mode-pinned test entrypoint, differential/cache tests, µbench. NOTE: cold-cache
   verify ~18ms ≫ the 2-6ms trust-cache estimate — in-vivo hit rate unknown.
-- **Flush stream (new)**: `perf/l3-flush-pipe` — only body_persist is safely
-  deferrable (~5-10ms; authoritative durable body already written at dispatch,
-  app.rs:4128); state_write + evm_resync must stay sync (read-your-writes for
-  engine/verify(N+1)). Plus TORUS_BUCKET_HASH_MIN_BUCKETS adaptive root threshold
-  (helps uncapped only). In test-debug at handoff time.
+- **Flush stream ACCEPTED with caveat**: `perf/l3-flush-pipe` @ 5401bd5 — only
+  body_persist is safely deferrable (authoritative durable body already written at
+  dispatch, app.rs:4128; crash-window W3 test green 3/3); state_write + evm_resync
+  must stay sync (read-your-writes for engine/verify(N+1)). Plus
+  TORUS_BUCKET_HASH_MIN_BUCKETS adaptive root threshold (helps uncapped only).
+  Acceptance: 99 workspace suites green (1 failure = the classified
+  exec_hole load-flake). CAVEAT: exec-chain µbench shows async body-persist
+  LOSING 22% at small synthetic shape (0.543→0.664 ms/blk — queue hand-off >
+  deferred write); win at real cap-400 body sizes UNPROVEN — needs in-vivo A/B
+  before any claim. Both flags stay default-off.
 - **PIVOTED SCOPE**: measured/addressable new savings sum to ~10-15ms of the 113→48
   gap. The ~40-50ms UNTIMED exec-loop residual (persist_committed_block_durably,
   dispatch prep, deschedule tax — never directly measured) is now the whole game.
