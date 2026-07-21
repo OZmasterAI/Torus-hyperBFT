@@ -1,0 +1,99 @@
+=== Torus Throughput Benchmark ===
+Mode: consensus
+Sign mode: session (ed25519 fast path)
+Duration: 20s
+Senders: 20 (offset 20)
+Batch size: 400 order(s)/action
+Submit batch: 15 action(s)/RPC call
+RPC endpoints: 1
+Pre-sign: 55 batches/sender (825 actions/sender, signed before the clock)
+Rate: 30 actions/s/sender (paced fire)
+
+Registering 20 ed25519 session(s) (scope: Full)...
+  20/20 session(s) admitted.
+  waiting for sessions to commit (canary probe)... live (canary accepted).
+Pre-signing 55 payloads x 20 senders...
+Pre-signed 16500 actions in 0.9s
+[1s] submitted: 300 actions (592/s) | included: 0 actions (0/s) | orders ~0/s | blk: #1834826 | 84ms/blk
+[1s] submitted: 600 actions (594/s) | included: 0 actions (0/s) | orders ~0/s | blk: #1834828 | 126ms/blk
+[2s] submitted: 900 actions (596/s) | included: 0 actions (0/s) | orders ~0/s | blk: #1834828 | 126ms/blk
+[2s] submitted: 1,200 actions (596/s) | included: 0 actions (0/s) | orders ~0/s | blk: #1834828 | 126ms/blk
+[3s] submitted: 1,500 actions (597/s) | included: 0 actions (0/s) | orders ~0/s | blk: #1834828 | 126ms/blk
+[3s] submitted: 1,800 actions (597/s) | included: 0 actions (0/s) | orders ~0/s | blk: #1834828 | 126ms/blk
+[4s] submitted: 2,100 actions (597/s) | included: 0 actions (0/s) | orders ~0/s | blk: #1834828 | 126ms/blk
+[4s] submitted: 2,415 actions (601/s) | included: 0 actions (0/s) | orders ~0/s | blk: #1834828 | 126ms/blk
+[5s] submitted: 2,700 actions (597/s) | included: 0 actions (0/s) | orders ~0/s | blk: #1834828 | 126ms/blk
+[5s] submitted: 3,000 actions (597/s) | included: 0 actions (0/s) | orders ~0/s | blk: #1834828 | 126ms/blk
+[6s] submitted: 3,315 actions (600/s) | included: 0 actions (0/s) | orders ~0/s | blk: #1834828 | 126ms/blk
+[6s] submitted: 3,600 actions (598/s) | included: 0 actions (0/s) | orders ~0/s | blk: #1834828 | 126ms/blk
+[7s] submitted: 3,900 actions (598/s) | included: 0 actions (0/s) | orders ~0/s | blk: #1834828 | 126ms/blk
+[7s] submitted: 4,200 actions (598/s) | included: 0 actions (0/s) | orders ~0/s | blk: #1834828 | 126ms/blk
+[8s] submitted: 4,515 actions (600/s) | included: 0 actions (0/s) | orders ~0/s | blk: #1834828 | 126ms/blk
+[8s] submitted: 4,815 actions (600/s) | included: 0 actions (0/s) | orders ~0/s | blk: #1834828 | 126ms/blk
+[9s] submitted: 5,100 actions (598/s) | included: 0 actions (0/s) | orders ~0/s | blk: #1834828 | 126ms/blk
+[9s] submitted: 5,400 actions (598/s) | included: 0 actions (0/s) | orders ~0/s | blk: #1834828 | 126ms/blk
+[10s] submitted: 5,700 actions (598/s) | included: 0 actions (0/s) | orders ~0/s | blk: #1834828 | 126ms/blk
+[10s] submitted: 6,000 actions (598/s) | included: 0 actions (0/s) | orders ~0/s | blk: #1834828 | 126ms/blk
+[11s] submitted: 6,300 actions (598/s) | included: 0 actions (0/s) | orders ~0/s | blk: #1834828 | 126ms/blk
+[11s] submitted: 6,600 actions (598/s) | included: 0 actions (0/s) | orders ~0/s | blk: #1834828 | 126ms/blk
+[12s] submitted: 6,915 actions (599/s) | included: 0 actions (0/s) | orders ~0/s | blk: #1834828 | 126ms/blk
+[12s] submitted: 7,200 actions (598/s) | included: 0 actions (0/s) | orders ~0/s | blk: #1834828 | 126ms/blk
+[13s] submitted: 7,515 actions (599/s) | included: 0 actions (0/s) | orders ~0/s | blk: #1834828 | 126ms/blk
+[13s] submitted: 7,770 actions (596/s) | included: 0 actions (0/s) | orders ~0/s | blk: #1834828 | 126ms/blk
+[14s] submitted: 8,085 actions (597/s) | included: 0 actions (0/s) | orders ~0/s | blk: #1834828 | 126ms/blk
+[14s] submitted: 8,385 actions (597/s) | included: 0 actions (0/s) | orders ~0/s | blk: #1834828 | 126ms/blk
+[15s] submitted: 8,445 actions (580/s) | included: 0 actions (0/s) | orders ~0/s | blk: #1834828 | 126ms/blk
+[15s] submitted: 8,955 actions (592/s) | included: 0 actions (0/s) | orders ~0/s | blk: #1834828 | 126ms/blk
+[16s] submitted: 9,300 actions (595/s) | included: 0 actions (0/s) | orders ~0/s | blk: #1834828 | 126ms/blk
+[16s] submitted: 9,585 actions (594/s) | included: 0 actions (0/s) | orders ~0/s | blk: #1834828 | 126ms/blk
+[17s] submitted: 9,900 actions (595/s) | included: 0 actions (0/s) | orders ~0/s | blk: #1834828 | 126ms/blk
+[17s] submitted: 9,930 actions (580/s) | included: 0 actions (0/s) | orders ~0/s | blk: #1834828 | 126ms/blk
+[18s] submitted: 10,240 actions (581/s) | included: 0 actions (0/s) | orders ~0/s | blk: #1834828 | 126ms/blk
+[submit] 0 accepted (15 sent): "mempool: too many pending native actions for 0xD7c8a70C55F95E0f1F2A6428F51dF9217Db77708"
+[submit] 0 accepted (15 sent): "mempool: too many pending native actions for 0x18809bA729BAb1a7643b0f9bA9541D5Dc09303bb"
+[submit] 0 accepted (15 sent): "mempool: too many pending native actions for 0xd5E87531b4d7DAB180cA474EFC23073Ee1842652"
+[submit] 0 accepted (15 sent): "mempool: too many pending native actions for 0xaA68F6cfeb044a0DC6fa899111a83a6EA2DbD46D"
+[submit] 0 accepted (15 sent): "mempool: too many pending native actions for 0xDcFda1F542F9d72fFA675E23ed91bE2682688550"
+[18s] submitted: 10,240 actions (565/s) | included: 0 actions (0/s) | orders ~0/s | blk: #1834828 | 126ms/blk
+[19s] submitted: 10,240 actions (549/s) | included: 0 actions (0/s) | orders ~0/s | blk: #1834828 | 126ms/blk
+[19s] submitted: 10,240 actions (535/s) | included: 0 actions (0/s) | orders ~0/s | blk: #1834828 | 126ms/blk
+[20s] submitted: 10,240 actions (521/s) | included: 0 actions (0/s) | orders ~0/s | blk: #1834828 | 126ms/blk
+[20s] submitted: 10,240 actions (508/s) | included: 0 actions (0/s) | orders ~0/s | blk: #1834828 | 126ms/blk
+[21s] submitted: 10,240 actions (496/s) | included: 0 actions (0/s) | orders ~0/s | blk: #1834828 | 126ms/blk
+[21s] submitted: 10,240 actions (484/s) | included: 0 actions (0/s) | orders ~0/s | blk: #1834828 | 126ms/blk
+[22s] submitted: 10,240 actions (473/s) | included: 0 actions (0/s) | orders ~0/s | blk: #1834828 | 126ms/blk
+[drain] +107 actions in blocks #1834829..#1834831 (executor catching up)
+[drain] +300 actions in blocks #1834832..#1834834 (executor catching up)
+[drain] +500 actions in blocks #1834835..#1834839 (executor catching up)
+[drain] +500 actions in blocks #1834840..#1834844 (executor catching up)
+[drain] +400 actions in blocks #1834845..#1834848 (executor catching up)
+[drain] +500 actions in blocks #1834849..#1834853 (executor catching up)
+[drain] +300 actions in blocks #1834854..#1834856 (executor catching up)
+[drain] +300 actions in blocks #1834857..#1834859 (executor catching up)
+[drain] +400 actions in blocks #1834860..#1834863 (executor catching up)
+[drain] +500 actions in blocks #1834864..#1834868 (executor catching up)
+[drain] +100 actions in blocks #1834869..#1834869 (executor catching up)
+[drain] +300 actions in blocks #1834870..#1834872 (executor catching up)
+[drain] +600 actions in blocks #1834873..#1834878 (executor catching up)
+[drain] +100 actions in blocks #1834879..#1834879 (executor catching up)
+[drain] +100 actions in blocks #1834880..#1834880 (executor catching up)
+[drain] +200 actions in blocks #1834881..#1834882 (executor catching up)
+[drain] +300 actions in blocks #1834883..#1834885 (executor catching up)
+[drain] +700 actions in blocks #1834886..#1834892 (executor catching up)
+[drain] +300 actions in blocks #1834893..#1834895 (executor catching up)
+[drain] +500 actions in blocks #1834896..#1834900 (executor catching up)
+[drain] +500 actions in blocks #1834901..#1834905 (executor catching up)
+[drain] +600 actions in blocks #1834906..#1834911 (executor catching up)
+[drain] +500 actions in blocks #1834912..#1834916 (executor catching up)
+[drain] +400 actions in blocks #1834917..#1834944 (executor catching up)
+
+--- Results ---
+Submitted:  10,240 native actions (465/s)
+Included:   9,007 unique native actions (409/s) [9,007 slots, dup x1.00]
+Orders:     3,602,800 orders (163683/s)  [actions x400 batch]
+Drop rate:  12.0%
+Block time: 126ms avg
+Blocks:     100 with bodies in #1834821..#1834920, 90 avg native/block
+
+Peak:       409/s included (block #1834831, 100 actions)
+Sustained:  163683 orders/s (409 actions/s) over 20s

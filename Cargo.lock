@@ -7207,6 +7207,7 @@ dependencies = [
  "alloy-primitives",
  "alloy-rlp",
  "bincode",
+ "criterion",
  "reed-solomon-erasure",
  "reth-primitives-traits",
  "reth-storage-errors",

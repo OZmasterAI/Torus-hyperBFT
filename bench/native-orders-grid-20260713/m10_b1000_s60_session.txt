@@ -1,0 +1,66 @@
+=== Torus Throughput Benchmark ===
+Mode: consensus
+Sign mode: session (ed25519 fast path)
+Duration: 20s
+Senders: 60 (offset 20)
+Batch size: 1000 order(s)/action
+Submit batch: 15 action(s)/RPC call
+RPC endpoints: 1
+Pre-sign: 55 batches/sender (825 actions/sender, signed before the clock)
+Rate: 30 actions/s/sender (paced fire)
+
+Registering 60 ed25519 session(s) (scope: Full)...
+  60/60 session(s) admitted.
+  waiting for sessions to commit (canary probe)... live (canary accepted).
+Pre-signing 55 payloads x 60 senders...
+Pre-signed 49500 actions in 4.2s
+[1s] submitted: 0 actions (0/s) | included: 0 actions (0/s) | orders ~0/s | blk: #1838112 | 63ms/blk
+[submit] http: error sending request for url (http://127.0.0.1:28545/)
+[submit] http: error sending request for url (http://127.0.0.1:28545/)
+[submit] http: error sending request for url (http://127.0.0.1:28545/)
+[submit] http: error sending request for url (http://127.0.0.1:28545/)
+[submit] http: error sending request for url (http://127.0.0.1:28545/)
+[3s] submitted: 960 actions (376/s) | included: 15 actions (6/s) | orders ~5878/s | blk: #1838133 | 78ms/blk
+[5s] submitted: 1,890 actions (351/s) | included: 15 actions (3/s) | orders ~2789/s | blk: #1838133 | 78ms/blk
+[8s] submitted: 2,835 actions (338/s) | included: 15 actions (2/s) | orders ~1788/s | blk: #1838133 | 78ms/blk
+[10s] submitted: 2,880 actions (277/s) | included: 15 actions (1/s) | orders ~1443/s | blk: #1838133 | 78ms/blk
+[11s] submitted: 3,810 actions (335/s) | included: 15 actions (1/s) | orders ~1318/s | blk: #1838133 | 78ms/blk
+[13s] submitted: 3,885 actions (301/s) | included: 15 actions (1/s) | orders ~1164/s | blk: #1838133 | 78ms/blk
+[15s] submitted: 4,770 actions (325/s) | included: 15 actions (1/s) | orders ~1022/s | blk: #1838133 | 78ms/blk
+[17s] submitted: 4,935 actions (287/s) | included: 15 actions (1/s) | orders ~873/s | blk: #1838133 | 78ms/blk
+[18s] submitted: 5,445 actions (305/s) | included: 15 actions (1/s) | orders ~839/s | blk: #1838133 | 78ms/blk
+[18s] submitted: 5,895 actions (321/s) | included: 15 actions (1/s) | orders ~816/s | blk: #1838133 | 78ms/blk
+[21s] submitted: 6,735 actions (321/s) | included: 15 actions (1/s) | orders ~714/s | blk: #1838133 | 78ms/blk
+[21s] submitted: 6,840 actions (318/s) | included: 15 actions (1/s) | orders ~698/s | blk: #1838133 | 78ms/blk
+[22s] submitted: 6,840 actions (311/s) | included: 15 actions (1/s) | orders ~682/s | blk: #1838133 | 78ms/blk
+[drain] +200 actions in blocks #1838136..#1838139 (executor catching up)
+[drain] +300 actions in blocks #1838140..#1838145 (executor catching up)
+[drain] +50 actions in blocks #1838146..#1838146 (executor catching up)
+[drain] +200 actions in blocks #1838147..#1838150 (executor catching up)
+[drain] +50 actions in blocks #1838151..#1838151 (executor catching up)
+[drain] +100 actions in blocks #1838152..#1838153 (executor catching up)
+[drain] +100 actions in blocks #1838154..#1838155 (executor catching up)
+[drain] +150 actions in blocks #1838156..#1838158 (executor catching up)
+[drain] +200 actions in blocks #1838159..#1838162 (executor catching up)
+[drain] +150 actions in blocks #1838163..#1838165 (executor catching up)
+[drain] +150 actions in blocks #1838166..#1838168 (executor catching up)
+[drain] +50 actions in blocks #1838169..#1838169 (executor catching up)
+[drain] +100 actions in blocks #1838170..#1838171 (executor catching up)
+[drain] +100 actions in blocks #1838172..#1838173 (executor catching up)
+[drain] +200 actions in blocks #1838174..#1838177 (executor catching up)
+[drain] +200 actions in blocks #1838178..#1838181 (executor catching up)
+[drain] +150 actions in blocks #1838182..#1838184 (executor catching up)
+[drain] +50 actions in blocks #1838185..#1838185 (executor catching up)
+[drain] +150 actions in blocks #1838186..#1838188 (executor catching up)
+[drain] +200 actions in blocks #1838189..#1838198 (executor catching up)
+
+--- Results ---
+Submitted:  6,840 native actions (309/s)
+Included:   2,865 unique native actions (129/s) [2,865 slots, dup x1.00]
+Orders:     2,865,000 orders (129456/s)  [actions x1000 batch]
+Drop rate:  58.1%
+Block time: 78ms avg
+Blocks:     88 with bodies in #1838105..#1838192, 32 avg native/block
+
+Peak:       129/s included (block #1838136, 50 actions)
+Sustained:  129456 orders/s (129 actions/s) over 20s
