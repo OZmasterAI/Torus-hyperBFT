@@ -365,8 +365,11 @@ fn level_ops_cached_match_scratch_oracle_after_every_op_batch() {
     book.cancel_all(addr(3), None);
     drain_and_check(&mut book, &mut persisted);
 
-    let (hits, misses, _live) = book.level_hash_cache_stats().unwrap();
-    assert!(hits > 0, "script must exercise the hit path (got 0 hits)");
+    let (hits, misses, seeds, _live) = book.level_hash_cache_stats().unwrap();
+    assert!(
+        hits + seeds > 0,
+        "script must exercise the sponge fast path (promotes/extends; got 0)"
+    );
     assert!(misses > 0, "script must exercise the miss path");
 }
 
@@ -481,8 +484,11 @@ fn level_ops_cached_vs_plain_randomized_differential() {
                 }
             }
         }
-        let (hits, misses, live) = cached.level_hash_cache_stats().unwrap();
-        assert!(hits + misses > 0, "seed {seed:#x}: cache never consulted");
+        let (hits, misses, seeds, live) = cached.level_hash_cache_stats().unwrap();
+        assert!(
+            hits + misses + seeds > 0,
+            "seed {seed:#x}: cache never consulted"
+        );
         if budget == 1 {
             assert!(live <= 1, "seed {seed:#x}: eviction cap not enforced");
         }

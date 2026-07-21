@@ -106,6 +106,51 @@ append-only costs performance never correctness (epoch bump ⇒ full rehash);
 the only fatal direction would be an unclassified queue mutation that bumps
 nothing — impossible outside the enumerated file-local surface above.
 
+### 1.3 Staged seeding (the miss-path refinement)
+
+A naïve miss path re-seeds the sponge on *every* miss: it runs a full **streaming**
+`sha3::Keccak256` absorb and stores the un-finalized state. On a level that
+invalidates every save (all-churn worst case) that is pure overhead — the entry
+is never reused, and the streaming absorb + hasher clone is measurably slower
+than the frozen one-shot path, whose `alloy_primitives::keccak256` is asm-backed
+(keccak-asm) and never builds a resumable state. The round-1 DEBUG µbench showed
+this as a +15–30 % worst-case regression against the parity target.
+
+The fix stages the sponge investment. A level's cache slot is now one of two
+states:
+
+- **`Probe { epoch, frame_count }`** — a cheap record (no sponge), written after
+  a miss.
+- **`Seeded { epoch, frame_count, hasher, prefix_qty, … }`** — the full
+  un-finalized sponge (as before).
+
+The cached path picks exactly one arm per save:
+
+- **MISS** (no slot, a `Probe`/`Seeded` whose epoch moved, or `N > len`): run the
+  frozen one-shot path VERBATIM (`level_row_data`) — same asm keccak, same bytes,
+  same cost as cache-off — and write a `Probe(epoch, N)`. No streaming absorb, no
+  state clone. A level that invalidates every save therefore pays only the plain
+  one-shot cost plus one `HashMap` insert.
+- **PROMOTE** (`Probe` present, epoch unchanged): the level survived one full
+  append-only interval (epoch equality between the probe's save and this one
+  proves no invalidating op ran between them, §1.2). Only now is the sponge
+  investment made: one full front→back absorb that both produces this save's
+  digest and seeds the `Seeded` sponge. It replaces the probe in place (no
+  entry-count growth, no eviction).
+- **HIT** (`Seeded`, epoch unchanged, `N ≥ frame_count`): the O(new-tail)
+  clone-extend, unchanged from §1.1.
+
+So the sponge is built only for a level that has demonstrated append-only
+behaviour across a whole save interval — precisely the levels that will yield
+hits — and a churning level is demoted back to a `Probe` (via the MISS arm) the
+moment it invalidates, never paying to rebuild a state it won't reuse. Output is
+byte-identical in every arm (the PROMOTE absorb and the MISS one-shot hash the
+identical framed byte stream, §0/§3). The change is entirely inside the cache
+module (`level_row_data_cached` + the `LevelHashCacheEntry` enum); no commitment
+byte, epoch-bump site, or engagement-path code outside the cache moved.
+`level_hash_cache_stats` now reports `(hits, misses, seeds, entries)` — `seeds`
+counting the PROMOTE investments.
+
 ## 2. Cache lifecycle
 
 - **Storage**: `Option<Box<LevelHashCache>>` inside `OrderBook` (like the 3c

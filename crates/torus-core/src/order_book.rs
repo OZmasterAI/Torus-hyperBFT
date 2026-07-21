@@ -133,20 +133,52 @@ struct OrderLocation {
 /// into an entry cap.
 const LEVEL_CACHE_ENTRY_COST: usize = 512;
 
-struct LevelHashCacheEntry {
-    /// `level_epoch` value observed when this state was absorbed.
-    epoch: u64,
-    /// Number of queue frames absorbed into `hasher`.
-    frame_count: u32,
-    /// Total bytes absorbed (bookkeeping / debug identity check).
-    absorbed_len: u64,
-    /// Sum of `remaining_qty` over the absorbed prefix, accumulated in the
-    /// same front→back `+=` order as the one-shot path.
-    prefix_qty: FixedPoint,
-    /// Un-finalized keccak-256 sponge state after absorbing the prefix.
-    hasher: sha3::Keccak256,
-    /// LRU tick for eviction.
-    last_used: u64,
+/// One cache slot for a price level. **Staged seeding** (the miss-path fix):
+/// a level that just missed holds only a cheap `Probe` (epoch + frame count,
+/// no sponge). The un-finalized sponge is built (`Seeded`) only once the level
+/// survives one full append-only save interval — i.e. the NEXT save observes
+/// the SAME epoch, proving no invalidating op ran in between. A churning level
+/// therefore never pays the streaming absorb + hasher-clone that the frozen
+/// one-shot path (asm-backed `alloy_primitives::keccak256`) avoids: its miss is
+/// just the plain one-shot digest plus a cheap probe record.
+enum LevelHashCacheEntry {
+    /// Recorded after a miss: no sponge yet. Promoted to `Seeded` on the next
+    /// save of this level iff its epoch is unchanged (append-only interval).
+    Probe {
+        /// `level_epoch` observed when the probe was recorded.
+        epoch: u64,
+        /// Queue length observed (bookkeeping only; promotion needs epoch).
+        frame_count: u32,
+        /// LRU tick for eviction.
+        last_used: u64,
+    },
+    /// Full un-finalized keccak-256 sponge state after a confirmed append-only
+    /// interval; extended in O(new tail) on subsequent append-only saves.
+    Seeded {
+        /// `level_epoch` value observed when this state was absorbed.
+        epoch: u64,
+        /// Number of queue frames absorbed into `hasher`.
+        frame_count: u32,
+        /// Total bytes absorbed (bookkeeping / debug identity check).
+        absorbed_len: u64,
+        /// Sum of `remaining_qty` over the absorbed prefix, accumulated in the
+        /// same front→back `+=` order as the one-shot path.
+        prefix_qty: FixedPoint,
+        /// Un-finalized keccak-256 sponge state after absorbing the prefix.
+        hasher: sha3::Keccak256,
+        /// LRU tick for eviction.
+        last_used: u64,
+    },
+}
+
+impl LevelHashCacheEntry {
+    #[inline]
+    fn last_used(&self) -> u64 {
+        match self {
+            LevelHashCacheEntry::Probe { last_used, .. }
+            | LevelHashCacheEntry::Seeded { last_used, .. } => *last_used,
+        }
+    }
 }
 
 /// Per-book incremental level-hash cache (L3, `TORUS_LEVEL_HASH_CACHE`).
@@ -154,8 +186,14 @@ struct LevelHashCache {
     entries: HashMap<(u8, i128), LevelHashCacheEntry>,
     max_entries: usize,
     tick: u64,
+    /// O(new-tail) sponge extensions on a `Seeded` entry.
     hits: u64,
+    /// Plain one-shot fallbacks (no entry, churning probe, or stale seed) —
+    /// each records/refreshes a cheap `Probe`.
     misses: u64,
+    /// Sponge investments: a `Probe` promoted to `Seeded` after a confirmed
+    /// append-only interval (one full front→back absorb, amortized by hits).
+    seeds: u64,
 }
 
 impl LevelHashCache {
@@ -166,7 +204,7 @@ impl LevelHashCache {
             let mut by_age: Vec<((u8, i128), u64)> = self
                 .entries
                 .iter()
-                .map(|(k, e)| (*k, e.last_used))
+                .map(|(k, e)| (*k, e.last_used()))
                 .collect();
             by_age.sort_unstable_by_key(|(_, t)| *t);
             let evict = (self.max_entries / 4).max(1);
@@ -1416,10 +1454,20 @@ impl OrderBook {
         ops
     }
 
-    /// L3 cached variant of [`Self::level_row_data`] — byte-identical output.
-    /// HIT (epoch match): clone-extend the stored sponge state with only the
-    /// appended tail frames. MISS/any doubt: full front→back absorb (the same
-    /// byte stream as the one-shot path), re-seeding the entry.
+    /// L3 cached variant of [`Self::level_row_data`] — byte-identical output,
+    /// with **staged seeding** (docs/design-levelhash-cache.md §1.3): three
+    /// mutually-exclusive arms keyed on the level's slot state and epoch:
+    ///
+    /// - **HIT** (`Seeded`, epoch unchanged): clone-extend the stored sponge
+    ///   with only the appended tail frames — O(new tail).
+    /// - **PROMOTE** (`Probe`, epoch unchanged): the level survived one full
+    ///   append-only interval, so invest now — one full front→back absorb that
+    ///   both yields this save's digest and seeds the `Seeded` sponge for the
+    ///   future O(tail) hits.
+    /// - **MISS** (no slot, churning `Probe`, or stale `Seeded`): the frozen
+    ///   one-shot path verbatim (`Self::level_row_data`, asm-backed keccak) plus
+    ///   a cheap `Probe` record — NO streaming absorb, NO sponge clone. A level
+    ///   that invalidates every save pays only the plain cost + one map insert.
     fn level_row_data_cached(
         &self,
         tag: u8,
@@ -1440,41 +1488,115 @@ impl OrderBook {
         cache.tick += 1;
         let tick = cache.tick;
 
-        if let Some(e) = cache.entries.get_mut(&key) {
-            let start = e.frame_count as usize;
-            if e.epoch == epoch && start <= n {
-                // HIT: no invalidating op since the prefix was absorbed ⇒ the
-                // first `start` frames are byte-identical to what the sponge
-                // holds (design doc §1). Absorb only the appended tail.
+        // Classify the slot without holding a borrow across the plain recompute.
+        enum Arm {
+            Hit,
+            Promote,
+            Miss,
+        }
+        let arm = match cache.entries.get(&key) {
+            Some(LevelHashCacheEntry::Seeded { epoch: e, frame_count, .. })
+                if *e == epoch && *frame_count as usize <= n =>
+            {
+                Arm::Hit
+            }
+            Some(LevelHashCacheEntry::Probe { epoch: e, .. }) if *e == epoch => Arm::Promote,
+            // No slot, churning probe (epoch moved), or stale seed ⇒ plain path.
+            _ => Arm::Miss,
+        };
+
+        match arm {
+            Arm::Hit => {
+                // No invalidating op since the prefix was absorbed ⇒ the first
+                // `start` frames are byte-identical to what the sponge holds
+                // (design doc §1). Absorb only the appended tail.
+                let LevelHashCacheEntry::Seeded {
+                    frame_count,
+                    absorbed_len,
+                    prefix_qty,
+                    hasher,
+                    last_used,
+                    ..
+                } = cache.entries.get_mut(&key).expect("slot present")
+                else {
+                    unreachable!("classified Hit ⇒ Seeded slot")
+                };
+                let start = *frame_count as usize;
                 for order in queue.iter().skip(start) {
                     // Same FixedPoint += order as the one-shot sum.
-                    e.prefix_qty += order.remaining_qty;
+                    *prefix_qty += order.remaining_qty;
                     let seq = *self
                         .order_seq
                         .get(&order.id)
                         .expect("resting order must have a seq");
                     let row = Self::encode_order_row_parts(seq, order);
-                    e.hasher.update((row.len() as u32).to_le_bytes());
-                    e.hasher.update(&row);
-                    e.absorbed_len += 4 + row.len() as u64;
+                    hasher.update((row.len() as u32).to_le_bytes());
+                    hasher.update(&row);
+                    *absorbed_len += 4 + row.len() as u64;
                 }
-                e.frame_count = n as u32;
-                e.last_used = tick;
+                *frame_count = n as u32;
+                *last_used = tick;
+                let total_qty_raw = prefix_qty.raw();
+                let digest: [u8; 32] = hasher.clone().finalize().into();
                 cache.hits += 1;
-                let digest: [u8; 32] = e.hasher.clone().finalize().into();
-                return Some(crate::book_rows::LevelRowData {
-                    total_qty_raw: e.prefix_qty.raw(),
+                Some(crate::book_rows::LevelRowData {
+                    total_qty_raw,
                     order_count: n as u32,
                     level_hash: digest,
-                });
+                })
             }
-            // Stale (epoch mismatch or impossible frame count): fall through
-            // to the full rehash below; the entry is replaced.
+            Arm::Promote => {
+                // Second consecutive save with no epoch bump ⇒ the interval was
+                // append-only. INVEST: one full front→back absorb — the exact
+                // byte stream the one-shot path keccaks — that yields this
+                // save's digest AND seeds the sponge (replaces the probe slot,
+                // so no entry-count growth ⇒ no eviction needed).
+                let (total, absorbed, hasher) = self.absorb_level(queue);
+                let digest: [u8; 32] = hasher.clone().finalize().into();
+                cache.entries.insert(
+                    key,
+                    LevelHashCacheEntry::Seeded {
+                        epoch,
+                        frame_count: n as u32,
+                        absorbed_len: absorbed,
+                        prefix_qty: total,
+                        hasher,
+                        last_used: tick,
+                    },
+                );
+                cache.seeds += 1;
+                Some(crate::book_rows::LevelRowData {
+                    total_qty_raw: total.raw(),
+                    order_count: n as u32,
+                    level_hash: digest,
+                })
+            }
+            Arm::Miss => {
+                // Plain one-shot path VERBATIM (asm-backed one-shot keccak) plus
+                // a cheap probe: the sponge investment is deferred until this
+                // level proves append-only (the next same-epoch save).
+                let data = self.level_row_data(tag, raw_price)?;
+                cache.insert_bounded(
+                    key,
+                    LevelHashCacheEntry::Probe {
+                        epoch,
+                        frame_count: n as u32,
+                        last_used: tick,
+                    },
+                );
+                cache.misses += 1;
+                Some(data)
+            }
         }
+    }
 
-        // MISS: full absorb front→back — the identical byte stream the
-        // one-shot `level_row_data` keccaks — keeping the un-finalized state.
-        cache.misses += 1;
+    /// Full front→back streaming absorb of a level's framed order rows into a
+    /// fresh keccak sponge, returning `(Σ remaining_qty, absorbed byte count,
+    /// un-finalized hasher)`. The absorbed byte stream is identical to the
+    /// one-shot `level_row_data` preimage (same `encode_order_row_parts` +
+    /// u32-LE length framing), so `hasher.clone().finalize()` is byte-identical.
+    fn absorb_level(&self, queue: &VecDeque<Order>) -> (FixedPoint, u64, sha3::Keccak256) {
+        use sha3::Digest;
         let mut hasher = sha3::Keccak256::new();
         let mut total = FixedPoint::ZERO;
         let mut absorbed: u64 = 0;
@@ -1489,23 +1611,7 @@ impl OrderBook {
             hasher.update(&row);
             absorbed += 4 + row.len() as u64;
         }
-        let digest: [u8; 32] = hasher.clone().finalize().into();
-        cache.insert_bounded(
-            key,
-            LevelHashCacheEntry {
-                epoch,
-                frame_count: n as u32,
-                absorbed_len: absorbed,
-                prefix_qty: total,
-                hasher,
-                last_used: tick,
-            },
-        );
-        Some(crate::book_rows::LevelRowData {
-            total_qty_raw: total.raw(),
-            order_count: n as u32,
-            level_hash: digest,
-        })
+        (total, absorbed, hasher)
     }
 
     /// L3: enable (or re-size) the level-hash sponge cache with a byte
@@ -1527,6 +1633,7 @@ impl OrderBook {
                     tick: 0,
                     hits: 0,
                     misses: 0,
+                    seeds: 0,
                 }))
             }
         }
@@ -1537,11 +1644,13 @@ impl OrderBook {
         self.level_hash_cache = None;
     }
 
-    /// L3 test/metrics hook: `(hits, misses, live entries)` if enabled.
-    pub fn level_hash_cache_stats(&self) -> Option<(u64, u64, usize)> {
+    /// L3 test/metrics hook: `(hits, misses, seeds, live entries)` if enabled.
+    /// `hits` = O(tail) sponge extensions, `misses` = plain one-shot fallbacks,
+    /// `seeds` = probe→sponge promotions (staged-seeding investments).
+    pub fn level_hash_cache_stats(&self) -> Option<(u64, u64, u64, usize)> {
         self.level_hash_cache
             .as_ref()
-            .map(|c| (c.hits, c.misses, c.entries.len()))
+            .map(|c| (c.hits, c.misses, c.seeds, c.entries.len()))
     }
 
     /// Modes 0/1 never persist level rows: drop the journaled level keys
@@ -2090,28 +2199,45 @@ mod tests {
         }
     }
 
-    /// Cache-on take_level_ops equals a plain recompute after append-heavy
-    /// then invalidating ops (unit-level smoke; the exhaustive differential
-    /// lives in tests/level_rows_core_tests.rs and torus-bridge).
+    /// Staged-seeding smoke: exercises all three arms of the cached path
+    /// (miss→probe, probe→promote/seed, seeded→extend hit, stale→miss) and
+    /// asserts byte-identity with the frozen one-shot recompute at each stage
+    /// (the exhaustive differential lives in tests/level_rows_core_tests.rs and
+    /// torus-bridge).
     #[test]
-    fn level_hash_cache_smoke_append_then_invalidate() {
+    fn level_hash_cache_smoke_staged_seeding() {
         let mut ob = book();
         ob.ensure_level_hash_cache(1 << 20);
-        // Seed and save (miss path seeds sponge states).
+        // Seed 5 resting orders and save: no slot ⇒ MISS (plain one-shot path
+        // + a cheap probe; no sponge is built on a level's first save).
         for i in 0..5 {
             ob.place_order(limit_buy(fp(100), fp(1 + i)), addr(1), i as u64);
         }
         let ops1 = ob.take_level_ops();
         assert_eq!(ops1.len(), 1);
-        // Append-only block → hit path.
+        let (h, m, s, _) = ob.level_hash_cache_stats().unwrap();
+        assert_eq!((h, m, s), (0, 1, 0), "first save of a level is a plain miss");
+
+        // Append-only save #2: the probe's epoch is unchanged ⇒ the interval
+        // was append-only ⇒ PROMOTE (invest one full absorb, seed the sponge).
         ob.place_order(limit_buy(fp(100), fp(9)), addr(2), 10);
         let ops2 = ob.take_level_ops();
-        let (hits, _m, _l) = ob.level_hash_cache_stats().unwrap();
-        assert_eq!(hits, 1, "tail append must hit the sponge cache");
-        // Oracle: plain recompute (the frozen one-shot path).
+        let (h, m, s, _) = ob.level_hash_cache_stats().unwrap();
+        assert_eq!((h, m, s), (0, 1, 1), "append-only interval promotes probe→sponge");
         let plain = ob.level_row_data(crate::book_rows::SIDE_TAG_BID, fp(100).raw());
-        assert_eq!(ops2[0].1, plain, "cached digest != one-shot digest");
-        // Invalidate (cancel mid-queue) → full rehash, still identical.
+        assert_eq!(ops2[0].1, plain, "promoted digest != one-shot");
+
+        // Append-only save #3: now a Seeded entry with unchanged epoch ⇒ HIT
+        // (O(tail) sponge extension), still byte-identical.
+        ob.place_order(limit_buy(fp(100), fp(7)), addr(2), 11);
+        let ops3 = ob.take_level_ops();
+        let (h, m, s, _) = ob.level_hash_cache_stats().unwrap();
+        assert_eq!((h, m, s), (1, 1, 1), "second append-only interval extends the sponge");
+        let plain = ob.level_row_data(crate::book_rows::SIDE_TAG_BID, fp(100).raw());
+        assert_eq!(ops3[0].1, plain, "cached extend digest != one-shot");
+
+        // Invalidate (cancel mid-queue) ⇒ epoch bump ⇒ stale seed ⇒ MISS
+        // (plain one-shot + fresh probe), byte-identical.
         let victim = ob
             .level_queue(Side::Buy, fp(100))
             .unwrap()
@@ -2119,11 +2245,11 @@ mod tests {
             .unwrap()
             .id;
         ob.cancel_order(victim).unwrap();
-        let ops3 = ob.take_level_ops();
+        let ops4 = ob.take_level_ops();
         let plain = ob.level_row_data(crate::book_rows::SIDE_TAG_BID, fp(100).raw());
-        assert_eq!(ops3[0].1, plain, "post-invalidation digest != one-shot");
-        let (hits, misses, _l) = ob.level_hash_cache_stats().unwrap();
-        assert_eq!((hits, misses), (1, 2), "cancel must force the miss path");
+        assert_eq!(ops4[0].1, plain, "post-invalidation digest != one-shot");
+        let (h, m, s, _) = ob.level_hash_cache_stats().unwrap();
+        assert_eq!((h, m, s), (1, 2, 1), "invalidation forces the plain miss path");
     }
 
     // ====================================================================
