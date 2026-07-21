@@ -19,3 +19,15 @@ build-*.log
 .lsp_pass_timestamp
 testnet/genesis-weighted-full.json
 devnet/wsl/genesis-3val.json
+
+.torus/
+
+# runtime / bench artifacts (kept on disk, ignored in git)
+/data/
+/data.*/
+/node.log
+/node.log.*
+/node.pid
+*.pid
+testnet/p3-testnet/__pycache__/
+testnet/p3-testnet/results/
