@@ -1491,7 +1491,9 @@ impl OrderBook {
         // Classify the slot without holding a borrow across the plain recompute.
         enum Arm {
             Hit,
-            Promote,
+            /// Carries the probe's recorded frame count for the append-only
+            /// invariant check.
+            Promote(u32),
             Miss,
         }
         let arm = match cache.entries.get(&key) {
@@ -1500,7 +1502,9 @@ impl OrderBook {
             {
                 Arm::Hit
             }
-            Some(LevelHashCacheEntry::Probe { epoch: e, .. }) if *e == epoch => Arm::Promote,
+            Some(LevelHashCacheEntry::Probe { epoch: e, frame_count, .. }) if *e == epoch => {
+                Arm::Promote(*frame_count)
+            }
             // No slot, churning probe (epoch moved), or stale seed ⇒ plain path.
             _ => Arm::Miss,
         };
@@ -1545,7 +1549,16 @@ impl OrderBook {
                     level_hash: digest,
                 })
             }
-            Arm::Promote => {
+            Arm::Promote(probe_frames) => {
+                // Epoch unchanged since the probe ⇒ only appends ran between the
+                // two saves ⇒ the queue can only have grown (the probe's prefix
+                // is still a prefix). A shrink here would mean an invalidating
+                // op bumped nothing — the fatal direction ruled out in §1.2.
+                debug_assert!(
+                    n >= probe_frames as usize,
+                    "append-only interval must not shrink the level \
+                     (n={n} < probe frames={probe_frames})"
+                );
                 // Second consecutive save with no epoch bump ⇒ the interval was
                 // append-only. INVEST: one full front→back absorb — the exact
                 // byte stream the one-shot path keccaks — that yields this

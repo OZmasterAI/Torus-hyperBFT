@@ -238,10 +238,29 @@ the instruction was to STOP; both properties hold for `sha3 = 0.10`
    compared at EVERY block: state root, level-row/book CF bytes; with a
    mid-sequence restart (fresh holder ⇒ cold cache) and ≥3 seeds plus an
    adversarial churn seed; final full CF dumps + `native_root_full` oracle.
-3. **µbench** (`l3_savebooks_ubench.rs`): depth-5/2000-frame append-heavy
-   shape cache-on vs off (expect ~107 ms → single-digit ms), and an
-   all-invalidated worst case (in-place front modify at every level each
-   block; expect parity with today within noise).
+3. **µbench** (`l3_savebooks_ubench.rs`): depth-5 append-heavy shape cache-on
+   vs off, and an all-invalidated worst case (in-place front modify at every
+   level each block). **RELEASE A/B** (`savebooks_levelcache_ab`, `--release
+   --features save-timings`, 40 levels × 10 markets; `lvls_us` = level-hash
+   sub-step):
+
+   ```
+   append-heavy    off_lvls  on_lvls        worst-case      off_lvls  on_lvls
+   blk 1 (seed→promote) 2496     1980        blk 1               2651     2263
+   blk 2 (hit)          2364     1096        blk 2               2139     2236
+   blk 3 (hit)          5405     1089        blk 3               2245     2179
+   blk 4 (hit)         11248     1252        blk 4               2209     2671
+   blk 5 (hit)          4169     1994        blk 5               1998     2118
+   ```
+
+   Append-heavy: cache-off `lvls_us` climbs with queue depth (each block
+   re-hashes every level's whole growing FIFO) while cache-on stays flat at
+   ~1–2 µs/level after the one-block promote — up to ~9× at block 4 (11.2 ms
+   → 1.25 ms) and growing with depth. Worst case (staged seeding): cache-on
+   tracks cache-off within noise on both `lvls_us` and end-to-end `SAVE_us`
+   — the round-1 +15–30 % all-invalidate regression is gone, because a
+   churning level now takes the plain one-shot path plus a cheap probe rather
+   than re-seeding a sponge it never reuses (§1.3).
 4. Existing suites: torus-core book/rows/level tests, 12-combo byte-identity
    matrix, dirty-bound witness, full workspace `--no-fail-fast`.
 
