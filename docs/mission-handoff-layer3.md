@@ -68,13 +68,22 @@ deliver. Pipeline-latency levers are EXHAUSTED. Layer 3 = cut replica per-view W
   LOSING 22% at small synthetic shape (0.543→0.664 ms/blk — queue hand-off >
   deferred write); win at real cap-400 body sizes UNPROVEN — needs in-vivo A/B
   before any claim. Both flags stay default-off.
-- **PIVOTED SCOPE**: measured/addressable new savings sum to ~10-15ms of the 113→48
-  gap. The ~40-50ms UNTIMED exec-loop residual (persist_committed_block_durably,
-  dispatch prep, deschedule tax — never directly measured) is now the whole game.
-  NEXT: (a) pegged cap-400 cell scraping ALL exec_* + exec_queue_depth (needs devnet
-  go) — THE decisive measurement; (b) then either attack the revealed untimed
-  consumers or build Option 2 (two-stage exec pipeline, overlap flush(N) with
-  engine(N+1) behind snapshot reads, ≈16ms, node-local, design in l3-work-budget §4).
+- **RESIDUAL SOLVED (scrape @ b1aba10, doc l3scrape-18c-b1aba10.md)**: the untimed
+  giant is **save_books = 106.7ms/loaded block** — `level_row_data` keccak-rehashes
+  the ENTIRE FIFO of every touched price level, O(orders-at-level); driver is 195k
+  resting orders (funnel "resting" counter reads 0 = BROKEN, new debt; use
+  torus_exec_resting_orders). µbench depth-5/2000-frame = 106.6ms uncontended ⇒
+  pure CPU, zero deschedule share. Explains gate decay (best-60s 24 blk/s early
+  small books → 8 avg as books deepen; worst-60s = deep-book endgame). Attribution:
+  docs/l3-savebooks-attribution.md @ 7d729b9 on perf/l3-savebooks (b18c).
+  Async-post-flush A/B NEUTRAL in vivo — default-off, deprioritized. Queue is
+  BIMODAL (pegged↔drained; only ~39% of blocks loaded).
+- **IN FLIGHT: level-hash sponge cache (Fable, perf/l3-levelhash-cache)** —
+  incremental keccak absorb for tail-append-only levels, byte-identical commitment
+  (clone cached hasher state, absorb tail, finalize; ANY non-append op invalidates
+  → full-rehash fallback), TORUS_LEVEL_HASH_CACHE default-off, node-local. Target
+  ~107→1-5ms on append-heavy shapes. Proper pre-mainnet fix stays chunked level
+  commitment O(√depth) (consensus-visible, tag 0x04+ reserved, production debt).
 - **New known-flaky test**: exec_hole_budget_exhaustion_latches_fail_stop
   (torus-consensus lib) — 3/3 standalone green on branch + 2/2 on base, fails only
   under parallel in-binary test load. justify_block_livelock_test failed 1× standalone
