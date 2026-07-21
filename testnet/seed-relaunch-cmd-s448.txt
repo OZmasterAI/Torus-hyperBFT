@@ -8,7 +8,7 @@
 # Validator set (4): seed 4M + 18c 4M + val2 4M + val3 2M = 14M power, quorum 9.3334M.
 #   Survives any ONE validator down; a SECOND one halts the chain.
 # Build branch for this era: perf/re-proof5 (carries the 4-validator genesis base).
-# Genesis sha256 must be 624c8a67269dca117da54de30175b7b903fb5ab068d90692b8408fcdbd64dc61  (new 4-val genesis, era 2026-07-22;
+# Genesis sha256 must be 2c0d9cb52cd10c4996f2e4f43b29d54b97016e3ed91bb3984ce2725c66beb4ab  (new 4-val genesis, era 2026-07-22;
 #   supersedes 5042dbdb… era 2026-07-14 and 858639c5… before it)
 # DO NOT START until val2 (friend2) is built + 30333/udp open, and we launch all three together.
 

@@ -424,6 +424,816 @@
       "tick_size": "1.0",
       "initial_margin": "5.0",
       "note": "APT-USD perp"
+    },
+    {
+      "market_id": 11,
+      "base_asset": "S11",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S11-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 12,
+      "base_asset": "S12",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S12-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 13,
+      "base_asset": "S13",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S13-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 14,
+      "base_asset": "S14",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S14-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 15,
+      "base_asset": "S15",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S15-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 16,
+      "base_asset": "S16",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S16-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 17,
+      "base_asset": "S17",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S17-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 18,
+      "base_asset": "S18",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S18-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 19,
+      "base_asset": "S19",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S19-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 20,
+      "base_asset": "S20",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S20-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 21,
+      "base_asset": "S21",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S21-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 22,
+      "base_asset": "S22",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S22-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 23,
+      "base_asset": "S23",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S23-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 24,
+      "base_asset": "S24",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S24-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 25,
+      "base_asset": "S25",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S25-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 26,
+      "base_asset": "S26",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S26-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 27,
+      "base_asset": "S27",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S27-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 28,
+      "base_asset": "S28",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S28-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 29,
+      "base_asset": "S29",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S29-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 30,
+      "base_asset": "S30",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S30-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 31,
+      "base_asset": "S31",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S31-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 32,
+      "base_asset": "S32",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S32-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 33,
+      "base_asset": "S33",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S33-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 34,
+      "base_asset": "S34",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S34-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 35,
+      "base_asset": "S35",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S35-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 36,
+      "base_asset": "S36",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S36-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 37,
+      "base_asset": "S37",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S37-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 38,
+      "base_asset": "S38",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S38-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 39,
+      "base_asset": "S39",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S39-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 40,
+      "base_asset": "S40",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S40-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 41,
+      "base_asset": "S41",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S41-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 42,
+      "base_asset": "S42",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S42-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 43,
+      "base_asset": "S43",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S43-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 44,
+      "base_asset": "S44",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S44-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 45,
+      "base_asset": "S45",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S45-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 46,
+      "base_asset": "S46",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S46-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 47,
+      "base_asset": "S47",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S47-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 48,
+      "base_asset": "S48",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S48-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 49,
+      "base_asset": "S49",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S49-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 50,
+      "base_asset": "S50",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S50-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 51,
+      "base_asset": "S51",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S51-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 52,
+      "base_asset": "S52",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S52-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 53,
+      "base_asset": "S53",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S53-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 54,
+      "base_asset": "S54",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S54-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 55,
+      "base_asset": "S55",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S55-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 56,
+      "base_asset": "S56",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S56-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 57,
+      "base_asset": "S57",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S57-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 58,
+      "base_asset": "S58",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S58-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 59,
+      "base_asset": "S59",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S59-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 60,
+      "base_asset": "S60",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S60-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 61,
+      "base_asset": "S61",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S61-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 62,
+      "base_asset": "S62",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S62-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 63,
+      "base_asset": "S63",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S63-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 64,
+      "base_asset": "S64",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S64-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 65,
+      "base_asset": "S65",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S65-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 66,
+      "base_asset": "S66",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S66-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 67,
+      "base_asset": "S67",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S67-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 68,
+      "base_asset": "S68",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S68-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 69,
+      "base_asset": "S69",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S69-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 70,
+      "base_asset": "S70",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S70-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 71,
+      "base_asset": "S71",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S71-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 72,
+      "base_asset": "S72",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S72-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 73,
+      "base_asset": "S73",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S73-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 74,
+      "base_asset": "S74",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S74-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 75,
+      "base_asset": "S75",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S75-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 76,
+      "base_asset": "S76",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S76-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 77,
+      "base_asset": "S77",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S77-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 78,
+      "base_asset": "S78",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S78-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 79,
+      "base_asset": "S79",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S79-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 80,
+      "base_asset": "S80",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S80-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 81,
+      "base_asset": "S81",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S81-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 82,
+      "base_asset": "S82",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S82-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 83,
+      "base_asset": "S83",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S83-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 84,
+      "base_asset": "S84",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S84-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 85,
+      "base_asset": "S85",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S85-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 86,
+      "base_asset": "S86",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S86-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 87,
+      "base_asset": "S87",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S87-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 88,
+      "base_asset": "S88",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S88-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 89,
+      "base_asset": "S89",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S89-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 90,
+      "base_asset": "S90",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S90-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 91,
+      "base_asset": "S91",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S91-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 92,
+      "base_asset": "S92",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S92-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 93,
+      "base_asset": "S93",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S93-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 94,
+      "base_asset": "S94",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S94-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 95,
+      "base_asset": "S95",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S95-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 96,
+      "base_asset": "S96",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S96-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 97,
+      "base_asset": "S97",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S97-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 98,
+      "base_asset": "S98",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S98-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 99,
+      "base_asset": "S99",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S99-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 100,
+      "base_asset": "S100",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S100-USD (added for multi-market throughput sweeps)"
     }
   ],
   "precompiles": {},

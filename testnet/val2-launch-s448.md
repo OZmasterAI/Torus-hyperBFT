@@ -44,12 +44,27 @@ cargo build --release -p torus-node -p bench-throughput -p torus-explorer
 ./testnet/gen-weighted-genesis.sh
 sha256sum testnet/genesis-weighted-full.json
 # MUST equal:
-# 624c8a67269dca117da54de30175b7b903fb5ab068d90692b8408fcdbd64dc61
+# 2c0d9cb52cd10c4996f2e4f43b29d54b97016e3ed91bb3984ce2725c66beb4ab
 ```
 **If it doesn't match, stop and tell us.**
 
-Expect ~28MB, 100,060 native + 100,052 EVM accounts. Run the script with the
-**default `NATIVE_AVAIL`** — overriding it changes the hash.
+Expect ~28MB, 100,060 native + 100,052 EVM accounts, and **100 markets**. Run the
+script with the **default `NATIVE_AVAIL`** — overriding it changes the hash.
+
+**On the 100 markets:** ids 1–10 are the named pairs (BTC/ETH/SOL/…), 11–100 are
+synthetic `S11…S100-USD`, pre-seeded so throughput sweeps can pick any market count
+without a new genesis. This is the only cheap way to get them: markets do NOT
+auto-create by trading — RPC ingress rejects unknown `market_id` against
+`CF_NATIVE_MARKETS`, so post-genesis registration needs a **governance proposal per
+market** (S432). Registering at genesis is nearly free: that CF is **off the
+consensus state root**, and matching threads spawn per *market with orders in a
+block*, not per registered market. Idle markets cost nothing.
+
+**Do not read 100 as a recommended load.** Your own finding is that matching
+oversubscribes past `markets ≈ cores` (64→128 regressed 90,598 → 22,800 fills/s).
+Every validator executes every block, so the ceiling is set by the WEAKEST box, not
+yours: seed has 6 cores allotted (`AllowedCPUs=0-5`), 18c has 18, you have 64. Sweep
+market count upward and find the cliff rather than assuming your 64 transfers.
 
 The script finds `bench-throughput` via `cargo metadata`, so a redirected
 `[build] target-dir` in `~/.cargo/config.toml` is handled automatically — you do
@@ -148,6 +163,6 @@ and peered. Those three carry 12M of the 14M power, which clears the 9.3334M quo
 their own, so the chain starts without waiting on **val3** — val3 is NAT/dials-out and
 joins itself whenever it comes up. Do not list val3 in `--p2p-peers`; it dials you.
 
-Ping us once: (1) built, (2) genesis sha matches `624c8a67269dca117da54de30175b7b903fb5ab068d90692b8408fcdbd64dc61`, and
+Ping us once: (1) built, (2) genesis sha matches `2c0d9cb52cd10c4996f2e4f43b29d54b97016e3ed91bb3984ce2725c66beb4ab`, and
 (3) 30333/udp confirmed open. We start all three together, then you bring up the
 indexer + UI.

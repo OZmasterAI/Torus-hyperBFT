@@ -6,7 +6,7 @@
 > describes* and are deliberately left unchanged.
 >
 > The current testnet is a different era: 4 validators (seed 4M / 18c 4M / val2 4M /
-> val3 2M), genesis sha256 `624c8a67269dca117da54de30175b7b903fb5ab068d90692b8408fcdbd64dc61`,
+> val3 2M), genesis sha256 `2c0d9cb52cd10c4996f2e4f43b29d54b97016e3ed91bb3984ce2725c66beb4ab`,
 > built from branch `perf/re-proof5`. For a live run use `val2-launch-s448.md` and
 > `seed-relaunch-cmd-s448.txt`; reuse only the *method* below, never its constants.
 
