@@ -893,6 +893,117 @@ impl SignedNativeAction {
 // Batch Verification
 // ============================================================================
 
+/// Execution strategy for the Phase-1 EIP-712 recovery pass, selected by the
+/// node-local `TORUS_PARALLEL_VERIFY` env var (L3 compute round).
+///
+/// NODE-LOCAL and PERFORMANCE-ONLY: every mode returns a byte-identical result
+/// vector (index order preserved by `collect`), so it can never change which
+/// senders resolve, which actions are rejected, the order of any downstream
+/// rejection log, or the trust-cache insert/lookup sequence (the cache pre-pass
+/// is always sequential). It therefore cannot fork the chain and needs no fleet
+/// coordination — a mixed fleet is safe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VerifyMode {
+    /// Unset / empty / unrecognized: today's exact behavior — the shared global
+    /// rayon pool. This is the `exact-today` default (zero regression from the
+    /// always-parallel tip this landed on).
+    Default,
+    /// `0` or `1`: single-threaded serial recovery, no rayon. The differential
+    /// suite's "off" cell.
+    Serial,
+    /// `N >= 2`: a dedicated rayon pool of exactly N worker threads, isolated
+    /// from the global pool (so verify parallelism is controllable independently
+    /// of settle / bucket-hash, which matters on a CPU-saturated box).
+    Pool(usize),
+}
+
+/// Pure parse of `TORUS_PARALLEL_VERIFY` (no env / OnceLock, so it is unit
+/// testable — the rank-1 parser doctrine). unset/empty/garbage => `Default`
+/// (byte-exact today); `"0"` / `"1"` => `Serial`; `"N">=2` => `Pool(N)`.
+pub fn parse_parallel_verify(raw: Option<String>) -> VerifyMode {
+    match raw.as_deref().map(str::trim) {
+        None | Some("") => VerifyMode::Default,
+        Some(s) => match s.parse::<usize>() {
+            Ok(0) | Ok(1) => VerifyMode::Serial,
+            Ok(n) => VerifyMode::Pool(n),
+            Err(_) => VerifyMode::Default,
+        },
+    }
+}
+
+/// Effective verify mode: `TORUS_PARALLEL_VERIFY` read once per process.
+fn verify_mode() -> VerifyMode {
+    static MODE: std::sync::OnceLock<VerifyMode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| parse_parallel_verify(std::env::var("TORUS_PARALLEL_VERIFY").ok()))
+}
+
+/// Live-path dedicated verify pool, built ONCE to the env-configured worker
+/// count. `Some` only when `verify_mode()` is `Pool(n)`; a build failure (rare)
+/// degrades to the global pool, still correct.
+fn live_verify_pool() -> Option<&'static rayon::ThreadPool> {
+    static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| match verify_mode() {
+        VerifyMode::Pool(n) => rayon::ThreadPoolBuilder::new()
+            .num_threads(n)
+            .thread_name(|i| format!("verify-{i}"))
+            .build()
+            .ok(),
+        _ => None,
+    })
+    .as_ref()
+}
+
+/// Phase-1 EIP-712 recovery under a chosen [`VerifyMode`]. Order-preserving in
+/// every arm, so the returned vector is byte-identical regardless of mode or
+/// thread count — the invariant the differential tests pin.
+fn recover_senders_phase1(
+    actions: &[SignedNativeAction],
+    cache_hits: &[Option<Address>],
+    mode: VerifyMode,
+    dedicated: Option<&rayon::ThreadPool>,
+) -> Vec<Option<Address>> {
+    // Per-action recovery: a trust-cache HIT is reused verbatim (skips the
+    // secp256k1 recover); an EIP-712 miss recovers; a session action is left
+    // `None` here and resolved in the sequential Phase 2. Captures nothing, so
+    // it is `Sync` and safe to hand to rayon.
+    let recover_one = |action: &SignedNativeAction, hit: &Option<Address>| -> Option<Address> {
+        if hit.is_some() {
+            return *hit;
+        }
+        match &action.signature {
+            ActionSignature::Eip712(_) => action.recover_sender().ok(),
+            ActionSignature::Session { .. } => None,
+        }
+    };
+    match mode {
+        VerifyMode::Serial => actions
+            .iter()
+            .zip(cache_hits.iter())
+            .map(|(a, h)| recover_one(a, h))
+            .collect(),
+        VerifyMode::Default => par_recover(actions, cache_hits, &recover_one),
+        VerifyMode::Pool(_) => match dedicated {
+            Some(pool) => pool.install(|| par_recover(actions, cache_hits, &recover_one)),
+            None => par_recover(actions, cache_hits, &recover_one),
+        },
+    }
+}
+
+/// Order-preserving parallel recovery over the (global or installed dedicated)
+/// rayon pool. Split out so the serial and parallel arms share one closure.
+fn par_recover(
+    actions: &[SignedNativeAction],
+    cache_hits: &[Option<Address>],
+    recover_one: &(impl Fn(&SignedNativeAction, &Option<Address>) -> Option<Address> + Sync),
+) -> Vec<Option<Address>> {
+    use rayon::prelude::*;
+    actions
+        .par_iter()
+        .zip(cache_hits.par_iter())
+        .map(|(a, h)| recover_one(a, h))
+        .collect()
+}
+
 /// Batch-verify native action signatures AND resolve each sender in one pass.
 ///
 /// Returns a vector parallel to `actions`: `Some(sender)` for a valid action
@@ -904,11 +1015,11 @@ impl SignedNativeAction {
 /// would return, so callers reuse it directly instead of recovering a second
 /// time — secp256k1 ecrecover happens once per action, not twice.
 ///
-/// The EIP-712 ecrecovers (the dominant per-action cost) run in parallel via
-/// rayon; the result is order-preserving and identical to a serial run. Session
-/// verification stays sequential — its ed25519 work is already batched, and
-/// keeping `session_lookup` off the worker threads avoids forcing a `Sync` bound
-/// on callers.
+/// The EIP-712 ecrecovers (the dominant per-action cost) run under the
+/// [`VerifyMode`] from `TORUS_PARALLEL_VERIFY`; the result is order-preserving
+/// and identical to a serial run. Session verification stays sequential — its
+/// ed25519 work is already batched, and keeping `session_lookup` off the worker
+/// threads avoids forcing a `Sync` bound on callers.
 pub fn batch_verify_native_actions(
     actions: &[SignedNativeAction],
     timestamp: u64,
@@ -920,7 +1031,9 @@ pub fn batch_verify_native_actions(
     batch_verify_native_actions_cached(actions, timestamp, session_lookup, |_| None)
 }
 
-/// Trust-cache-aware variant of [`batch_verify_native_actions`].
+/// Trust-cache-aware variant of [`batch_verify_native_actions`]. Reads the verify
+/// mode from `TORUS_PARALLEL_VERIFY` once per process; use
+/// [`batch_verify_native_actions_cached_with_mode`] to pin a mode (tests / bench).
 ///
 /// `verified_lookup(key)` returns a previously locally-verified sender for an
 /// action's signature-committing [`verified_cache_key`]. On a HIT the secp256k1
@@ -930,41 +1043,76 @@ pub fn batch_verify_native_actions(
 /// resolved sender or fork the chain. A MISS (or a non-cacheable session action,
 /// for which `verified_cache_key` returns `None`) falls through to full recover +
 /// session resolution. Cache consultation is a sequential pre-pass, kept off the
-/// rayon workers exactly like `session_lookup`.
+/// rayon workers exactly like `session_lookup` — so the trust-cache insert/lookup
+/// sequence is identical in every mode.
 pub fn batch_verify_native_actions_cached(
     actions: &[SignedNativeAction],
     timestamp: u64,
     session_lookup: impl Fn(&[u8; 32]) -> Option<crate::SessionData>,
     verified_lookup: impl Fn(&alloy_primitives::B256) -> Option<Address>,
 ) -> Vec<Option<Address>> {
-    use rayon::prelude::*;
+    let mode = verify_mode();
+    let pool = if matches!(mode, VerifyMode::Pool(_)) {
+        live_verify_pool()
+    } else {
+        None
+    };
+    batch_verify_impl(actions, timestamp, session_lookup, verified_lookup, mode, pool)
+}
 
-    // Pre-pass (sequential): consult the trust-cache. For a locally-verified
-    // EIP-712 action a HIT yields the sender a fresh recover would produce, so the
-    // dominant ecrecover below is skipped. `verified_cache_key` returns None for
-    // session / non-EIP-712 actions, which are never short-circuited.
+/// [`batch_verify_native_actions_cached`] with an explicit [`VerifyMode`],
+/// bypassing the `TORUS_PARALLEL_VERIFY` env read. For `Pool(n)` it builds an
+/// EPHEMERAL n-thread pool per call (test/bench cost, not the live path). The
+/// differential suite and the µbench drive this to exercise every thread count
+/// in one process.
+pub fn batch_verify_native_actions_cached_with_mode(
+    actions: &[SignedNativeAction],
+    timestamp: u64,
+    session_lookup: impl Fn(&[u8; 32]) -> Option<crate::SessionData>,
+    verified_lookup: impl Fn(&alloy_primitives::B256) -> Option<Address>,
+    mode: VerifyMode,
+) -> Vec<Option<Address>> {
+    match mode {
+        VerifyMode::Pool(n) => {
+            let pool = rayon::ThreadPoolBuilder::new().num_threads(n).build().ok();
+            batch_verify_impl(
+                actions,
+                timestamp,
+                session_lookup,
+                verified_lookup,
+                mode,
+                pool.as_ref(),
+            )
+        }
+        _ => batch_verify_impl(actions, timestamp, session_lookup, verified_lookup, mode, None),
+    }
+}
+
+/// Shared body for the env-driven and mode-pinned entrypoints.
+fn batch_verify_impl(
+    actions: &[SignedNativeAction],
+    timestamp: u64,
+    session_lookup: impl Fn(&[u8; 32]) -> Option<crate::SessionData>,
+    verified_lookup: impl Fn(&alloy_primitives::B256) -> Option<Address>,
+    mode: VerifyMode,
+    dedicated: Option<&rayon::ThreadPool>,
+) -> Vec<Option<Address>> {
+    // Pre-pass (sequential, mode-independent): consult the trust-cache. For a
+    // locally-verified EIP-712 action a HIT yields the sender a fresh recover
+    // would produce, so the dominant ecrecover below is skipped.
+    // `verified_cache_key` returns None for session / non-EIP-712 actions, which
+    // are never short-circuited.
     let cache_hits: Vec<Option<Address>> = actions
         .iter()
         .map(|action| crate::verified_cache_key(action).and_then(|k| verified_lookup(&k)))
         .collect();
 
-    // Phase 1 (parallel): recover EIP-712 senders for cache MISSES only. Each
-    // ecrecover is pure, independent crypto with no shared/borrowed state; `collect`
-    // over an indexed parallel iterator preserves order, so the output is
-    // deterministic and identical to a serial run.
-    let mut senders: Vec<Option<Address>> = actions
-        .par_iter()
-        .zip(cache_hits.par_iter())
-        .map(|(action, hit)| {
-            if hit.is_some() {
-                return *hit; // trust-cache HIT: reuse sender, skip recover
-            }
-            match &action.signature {
-                ActionSignature::Eip712(_) => action.recover_sender().ok(),
-                ActionSignature::Session { .. } => None,
-            }
-        })
-        .collect();
+    // Phase 1: recover EIP-712 senders for cache MISSES only, under the chosen
+    // mode. Each ecrecover is pure, independent crypto; the collect is
+    // order-preserving, so the output is deterministic and identical across
+    // serial / global / dedicated-pool at any thread count.
+    let mut senders: Vec<Option<Address>> =
+        recover_senders_phase1(actions, &cache_hits, mode, dedicated);
 
     // Phase 2 (sequential): resolve session actions (needs `session_lookup`) and
     // assemble the ed25519 batch.
@@ -1825,5 +1973,213 @@ mod tests {
         );
         let got = batch_verify_native_actions_cached(&[action], TEST_NONCE, |_| None, |_| None);
         assert_eq!(got[0], None, "unresolvable action -> None (slash input)");
+    }
+
+    // ========================================================================
+    // L3 — TORUS_PARALLEL_VERIFY env gate + thread-count differential
+    // ========================================================================
+
+    #[test]
+    fn parse_parallel_verify_resolves_modes() {
+        use super::{parse_parallel_verify, VerifyMode};
+        // unset / empty / garbage => Default (byte-exact today).
+        assert_eq!(parse_parallel_verify(None), VerifyMode::Default);
+        assert_eq!(parse_parallel_verify(Some("".into())), VerifyMode::Default);
+        assert_eq!(parse_parallel_verify(Some("   ".into())), VerifyMode::Default);
+        assert_eq!(parse_parallel_verify(Some("on".into())), VerifyMode::Default);
+        assert_eq!(parse_parallel_verify(Some("true".into())), VerifyMode::Default);
+        // 0 / 1 => Serial (the "off" cell).
+        assert_eq!(parse_parallel_verify(Some("0".into())), VerifyMode::Serial);
+        assert_eq!(parse_parallel_verify(Some("1".into())), VerifyMode::Serial);
+        assert_eq!(parse_parallel_verify(Some(" 1 ".into())), VerifyMode::Serial);
+        // N>=2 => Pool(N).
+        assert_eq!(parse_parallel_verify(Some("2".into())), VerifyMode::Pool(2));
+        assert_eq!(parse_parallel_verify(Some("8".into())), VerifyMode::Pool(8));
+        assert_eq!(parse_parallel_verify(Some(" 16 ".into())), VerifyMode::Pool(16));
+    }
+
+    /// Build a large mixed batch: valid EIP-712 (two keys), valid session,
+    /// invalid session (unregistered), plus a STRUCTURALLY-broken EIP-712 whose
+    /// signature cannot recover. Returns `(actions, expected_senders, pubkey,
+    /// session)` so every differential case shares one ground truth.
+    fn mixed_verify_fixture(
+        n: usize,
+    ) -> (Vec<SignedNativeAction>, Vec<Option<Address>>, [u8; 32], SessionData) {
+        let key = test_key();
+        let key2 = test_key_2();
+        let ed_key = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
+        let pubkey = ed_key.verifying_key().to_bytes();
+        let owner = Address::from([0x11; 20]);
+        let session = make_session(owner);
+        let ed_key_unknown = ed25519_dalek::SigningKey::from_bytes(&[99u8; 32]);
+
+        let mut actions = Vec::with_capacity(n);
+        let mut expected = Vec::with_capacity(n);
+        for i in 0..n as u64 {
+            let nonce = TEST_NONCE + i;
+            match i % 5 {
+                0 => {
+                    actions.push(sign_native_action(NativeAction::ClaimRewards, nonce, &key));
+                    expected.push(Some(signer_address(&key)));
+                }
+                1 => {
+                    actions.push(sign_native_action(NativeAction::UnjailSelf, nonce, &key2));
+                    expected.push(Some(signer_address(&key2)));
+                }
+                2 => {
+                    actions.push(sign_action_with_session(
+                        NativeAction::CancelOrder { order_id: i as u128 },
+                        nonce,
+                        &ed_key,
+                    ));
+                    expected.push(Some(owner));
+                }
+                3 => {
+                    actions.push(sign_action_with_session(
+                        NativeAction::CancelOrder { order_id: i as u128 },
+                        nonce,
+                        &ed_key_unknown,
+                    ));
+                    expected.push(None); // session not registered
+                }
+                _ => {
+                    // Structurally-broken EIP-712: corrupt r so ecrecover fails
+                    // or yields a wrong (still-Some) address. Either way the
+                    // result must be IDENTICAL across modes; we compute the
+                    // ground truth from a serial run below rather than asserting
+                    // a specific address here.
+                    let mut a = sign_native_action(NativeAction::ClaimRewards, nonce, &key);
+                    if let ActionSignature::Eip712(ref mut sig) = a.signature {
+                        sig.r[0] ^= 0xff;
+                    }
+                    // Placeholder; overwritten by the serial ground truth.
+                    expected.push(a.recover_sender().ok());
+                    actions.push(a);
+                }
+            }
+        }
+        (actions, expected, pubkey, session)
+    }
+
+    /// Core L3 acceptance (a): the rejection set (indeed the FULL resolved-sender
+    /// vector) is byte-identical across {off, 2, 4, 8}, and stable across repeats
+    /// (schedule nondeterminism). Serial is the ground truth.
+    #[test]
+    fn parallel_verify_identical_across_thread_counts() {
+        use super::{batch_verify_native_actions_cached_with_mode as verify_mode_fn, VerifyMode};
+        let (actions, _expected_hint, pubkey, session) = mixed_verify_fixture(200);
+        let lookup = |pk: &[u8; 32]| (pk == &pubkey).then(|| session.clone());
+
+        // Ground truth: serial.
+        let serial = verify_mode_fn(&actions, TEST_NONCE, lookup, |_| None, VerifyMode::Serial);
+
+        for mode in [
+            VerifyMode::Serial,
+            VerifyMode::Default,
+            VerifyMode::Pool(2),
+            VerifyMode::Pool(4),
+            VerifyMode::Pool(8),
+        ] {
+            // Repeat each mode to shake out any thread-order dependence.
+            for rep in 0..4 {
+                let got = verify_mode_fn(&actions, TEST_NONCE, lookup, |_| None, mode);
+                assert_eq!(
+                    got, serial,
+                    "mode {mode:?} rep {rep} diverged from serial ground truth"
+                );
+                // And the rejection set specifically.
+                let rej: Vec<usize> = got
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| s.is_none())
+                    .map(|(i, _)| i)
+                    .collect();
+                let rej_serial: Vec<usize> = serial
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| s.is_none())
+                    .map(|(i, _)| i)
+                    .collect();
+                assert_eq!(rej, rej_serial, "mode {mode:?} rep {rep}: rejection set drift");
+            }
+        }
+    }
+
+    /// L3 acceptance (b): the trust-cache produces IDENTICAL insert/lookup
+    /// semantics under every mode — a HIT is reused verbatim and a MISS
+    /// full-recovers, no matter the thread count. A sentinel address distinct
+    /// from the real signer proves the HIT short-circuited recovery in each mode.
+    #[test]
+    fn parallel_verify_cache_interaction_identical_across_modes() {
+        use super::{batch_verify_native_actions_cached_with_mode as verify_mode_fn, VerifyMode};
+        let key = test_key();
+        // Two valid EIP-712 actions; only the FIRST is "warm" in the cache.
+        let a0 = sign_native_action(NativeAction::ClaimRewards, TEST_NONCE, &key);
+        let a1 = sign_native_action(NativeAction::UnjailSelf, TEST_NONCE + 1, &key);
+        let real = signer_address(&key);
+        let ck0 = crate::verified_cache_key(&a0).expect("eip712 cacheable");
+        let sentinel = Address::from([0xAB; 20]);
+        assert_ne!(sentinel, real);
+        let actions = [a0, a1];
+        let cache = |k: &alloy_primitives::B256| (*k == ck0).then_some(sentinel);
+
+        for mode in [
+            VerifyMode::Serial,
+            VerifyMode::Default,
+            VerifyMode::Pool(2),
+            VerifyMode::Pool(4),
+            VerifyMode::Pool(8),
+        ] {
+            let got = verify_mode_fn(&actions, TEST_NONCE, |_| None, cache, mode);
+            assert_eq!(
+                got[0],
+                Some(sentinel),
+                "mode {mode:?}: warm cache HIT must be reused verbatim (recover skipped)"
+            );
+            assert_eq!(
+                got[1],
+                Some(real),
+                "mode {mode:?}: cold entry must full-recover to the real signer"
+            );
+        }
+    }
+
+    /// L3 acceptance (e): in-proc µbench — N=400 and N=25k mixed ed25519+eip712
+    /// verifications, serial vs parallel wall time. `#[ignore]` (perf, not a gate);
+    /// run with `cargo test -p torus-types --release parallel_verify_microbench
+    /// -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn parallel_verify_microbench() {
+        use super::{batch_verify_impl, VerifyMode};
+        use std::time::Instant;
+        for &n in &[400usize, 25_000usize] {
+            let (actions, _e, pubkey, session) = mixed_verify_fixture(n);
+            let lookup = |pk: &[u8; 32]| (pk == &pubkey).then(|| session.clone());
+            // Build each dedicated pool ONCE so spin-up is excluded from timings
+            // (the live path caches its pool too).
+            let p2 = rayon::ThreadPoolBuilder::new().num_threads(2).build().unwrap();
+            let p4 = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+            let p8 = rayon::ThreadPoolBuilder::new().num_threads(8).build().unwrap();
+            let cases: [(&str, VerifyMode, Option<&rayon::ThreadPool>); 5] = [
+                ("serial", VerifyMode::Serial, None),
+                ("global", VerifyMode::Default, None),
+                ("pool-2", VerifyMode::Pool(2), Some(&p2)),
+                ("pool-4", VerifyMode::Pool(4), Some(&p4)),
+                ("pool-8", VerifyMode::Pool(8), Some(&p8)),
+            ];
+            println!("\n== parallel_verify µbench: N={n} ==");
+            for (label, mode, pool) in cases {
+                // Warm once.
+                let _ = batch_verify_impl(&actions, TEST_NONCE, lookup, |_| None, mode, pool);
+                let iters = if n >= 25_000 { 5 } else { 50 };
+                let t = Instant::now();
+                for _ in 0..iters {
+                    let _ = batch_verify_impl(&actions, TEST_NONCE, lookup, |_| None, mode, pool);
+                }
+                let per = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
+                println!("  {label:8} {per:8.3} ms/batch");
+            }
+        }
     }
 }
