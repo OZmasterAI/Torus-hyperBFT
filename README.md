@@ -21,9 +21,18 @@ cargo build --release -p torus-node
 # 1. Generate your validator key
 ./target/release/torus-node keygen --output my-key.json
 
-# 2. Start the node (auto-connects to seed nodes)
-./target/release/torus-node --keystore my-key.json --genesis testnet/genesis.json --rpc-only
+# 2. Build the genesis (expands the tracked base into the full file nodes boot)
+./testnet/gen-weighted-genesis.sh
+
+# 3. Start the node (auto-connects to seed nodes)
+./target/release/torus-node --keystore my-key.json \
+  --genesis testnet/genesis-weighted-full.json --rpc-only
 ```
+
+> `testnet/genesis-weighted-full.json` is **generated**, not tracked — it carries
+> ~100k bulk bench accounts and is too large for git. The tracked source is
+> `testnet/genesis-weighted-base.json`. Every node must run the generator and end
+> up with the **same sha256**, or it builds a different state root and cannot join.
 
 The node will automatically discover the network via hardcoded bootstrap peers.
 
@@ -32,7 +41,7 @@ The node will automatically discover the network via hardcoded bootstrap peers.
 Instead of CLI flags, create a `torus.toml`:
 
 ```toml
-genesis = "testnet/genesis.json"
+genesis = "testnet/genesis-weighted-full.json"
 keystore = "my-key.json"
 data-dir = "./data"
 log-level = "info"

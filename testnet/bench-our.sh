@@ -3,7 +3,7 @@
 # Run AT THE SAME TIME as bench-val1.sh (20..39) and bench-friend2.sh (40..59).
 # Disjoint sender ranges so nonces / accounts / rate-limits never collide; each box
 # benches its OWN local node (spreads ingress across all 3). All 60 senders are
-# funded in testnet/genesis.json (era 1781913600, chain_id 7778).
+# funded in testnet/genesis-weighted-base.json (era 1781913600, chain_id 7778).
 #
 # PREREQ: all 3 validators on the FIXED (session-key seconds/ms) binary + this genesis.
 # A/B (lever 1): SIGN_MODE=eip712 ./testnet/bench-our.sh   # baseline (ecrecover/action)

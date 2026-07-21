@@ -654,22 +654,34 @@ mod tests {
         .to_string()
     }
 
-    /// Regression guard for the shipped testnet genesis: the fleet relaunch seeds
-    /// 10 perp markets (ids 1..=10) and 10 permanent stakers (hardhat #0..#9) so
-    /// governance market-listing is actually testable. If this file is edited in a
-    /// way that breaks the struct shape or drops a market/staker, this test fails.
+    /// Regression guard for the shipped testnet genesis BASE.
+    ///
+    /// Guards `testnet/genesis-weighted-base.json`, which is the human-editable
+    /// source of truth: `testnet/gen-weighted-genesis.sh` expands it into
+    /// `genesis-weighted-full.json` (gitignored, ~28MB of bulk bench accounts),
+    /// and THAT is what nodes boot. The old `testnet/genesis.json` was a second
+    /// lean base serving the same role; it was deleted because two plausible
+    /// bases produce DIFFERENT state roots — hence mutually unjoinable chains —
+    /// and only one can be canonical.
+    ///
+    /// The set seeds 100 perp markets (ids 1..=100: 1-10 named pairs, 11-100
+    /// synthetic S11..S100 for throughput sweeps) and 10 permanent stakers
+    /// (hardhat #0..#9) so governance market-listing stays testable. If this file
+    /// is edited in a way that breaks the struct shape or drops a market/staker,
+    /// this test fails.
     #[test]
     fn parse_real_testnet_genesis() {
-        let json = include_str!("../../../testnet/genesis.json");
-        let genesis = Genesis::from_json(json).expect("real testnet/genesis.json must parse");
+        let json = include_str!("../../../testnet/genesis-weighted-base.json");
+        let genesis =
+            Genesis::from_json(json).expect("real testnet/genesis-weighted-base.json must parse");
 
         assert_eq!(genesis.chain_id, 7778, "testnet chain_id");
-        assert_eq!(genesis.validators.len(), 3, "3-validator set");
+        assert_eq!(genesis.validators.len(), 4, "4-validator set (seed/18c/val2/val3)");
 
-        // 10 markets, ids exactly 1..=10.
+        // 100 markets, ids exactly 1..=100.
         let mut ids: Vec<u64> = genesis.markets.iter().map(|m| m.market_id).collect();
         ids.sort_unstable();
-        assert_eq!(ids, (1..=10).collect::<Vec<_>>(), "markets 1..=10 seeded");
+        assert_eq!(ids, (1..=100).collect::<Vec<_>>(), "markets 1..=100 seeded");
 
         // 10 permanent stakers, each with non-zero stake so they carry voting weight.
         assert_eq!(genesis.permanent_stakes.len(), 10, "10 governance stakers");

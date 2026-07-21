@@ -1,5 +1,16 @@
 # val3 relaunch instructions — FRESH 10-MARKET GENESIS (commit `831187c`)
 
+> **HISTORICAL — superseded by `testnet/val3-launch-s448.md`. Do not follow.**
+> This targets the 2026-07-08 era (commit `831187c`, 10 markets, era `1783468800`)
+> and is preserved as a record of what was actually sent. Three things in it are now
+> actively wrong: it boots `testnet/genesis.json`, which **no longer exists**; it
+> lists `84.32.108.220` (val1) as a peer, and val1 was **dropped** from the set; and
+> it expects 10 markets where the current genesis seeds **100**.
+> Current era: 4 validators, genesis sha256
+> `2c0d9cb52cd10c4996f2e4f43b29d54b97016e3ed91bb3984ce2725c66beb4ab`, branch
+> `perf/re-proof5`. (S395 already lost a relaunch window to a stale peer id in this
+> exact file — check `val3-launch-s448.md` is what you're sending.)
+
 Copy-paste for the val3 operator (3rd validator, self-hosted). **Supersedes the
 S433/928b700 upgrade instructions entirely.** Prepared 2026-07-08.
 

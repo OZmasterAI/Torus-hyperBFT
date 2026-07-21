@@ -2,7 +2,7 @@
 # Session throughput bench — VAL1 box (box 2 of 3, friend1's 4-core server, ssh).
 # Senders 20..39. Run AT THE SAME TIME as bench-our.sh (0..19) and
 # bench-friend2.sh (40..59). Disjoint ranges so nonces/accounts never collide;
-# benches val1's OWN local node. 60 senders funded in testnet/genesis.json
+# benches val1's OWN local node. 60 senders funded in testnet/genesis-weighted-base.json
 # (era 1781913600, chain_id 7778).
 #
 # RUN ON VAL1 (we have ssh): scp the bench-throughput binary + this script over, then

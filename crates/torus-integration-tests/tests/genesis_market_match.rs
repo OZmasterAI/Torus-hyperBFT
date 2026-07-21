@@ -39,8 +39,13 @@ fn limit(market_id: u64, is_buy: bool, price: FixedPoint, qty: FixedPoint) -> Na
 fn shipped_genesis_makes_bench_orders_match() {
     let h = TestHarness::new();
 
-    // Seed from the REAL shipped testnet genesis: market 1 + 20 funded hardhat balances.
-    let genesis_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testnet/genesis.json");
+    // Seed from the REAL shipped testnet genesis BASE: market 1 + funded hardhat
+    // balances. This is the tracked source that gen-weighted-genesis.sh expands into
+    // genesis-weighted-full.json (gitignored) — the bulk bench accounts it adds are
+    // irrelevant here, so the base is the right fixture. The former testnet/genesis.json
+    // was a second lean base and was deleted; two bases produce different state roots.
+    let genesis_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../testnet/genesis-weighted-base.json");
     let genesis = Genesis::from_file(&genesis_path)
         .unwrap_or_else(|e| panic!("load {}: {e}", genesis_path.display()));
     genesis
