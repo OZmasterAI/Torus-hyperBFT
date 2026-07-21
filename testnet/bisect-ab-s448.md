@@ -120,7 +120,10 @@ mv data data.bisect-bak-$(date +%s)            # fresh chain
   --log-level info,hotstuff_rs=warn,torus_node=error \
   >> /home/18c/torus-bisect-<A|B>.log 2>&1 &
 ```
-> NOTE: 18c has Anvil on :8545 — torus RPC stays on **:8555** (leave as-is).
+> NOTE: 18c ran Anvil on :8545 at the time of this runbook, hence torus RPC on :8555.
+> As of 2026-07-21 that is NO LONGER TRUE — 8545/8555/9090/30333 are all free on 18c
+> (verified with `ss`; no anvil process). :8555 is kept anyway so the port map matches
+> the rest of the fleet docs.
 
 ### val2 (frend2, 103.167.235.250) — his launch doc (`testnet/val2-launch-s448.md`), swap COMMIT + fresh genesis + fresh data, then run the grid above.
 

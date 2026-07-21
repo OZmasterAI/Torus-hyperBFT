@@ -20,8 +20,8 @@ systemd-run --user --unit=torus-seed-validator \
   -p RestartSec=10 \
   -p StandardOutput=append:/home/crab/torus-seed-live/seed-relaunch-s448.log \
   -p StandardError=append:/home/crab/torus-seed-live/seed-relaunch-s448.log \
-  /home/crab/torus-seed-live/torus-node \
-    --genesis /home/crab/torus-seed-live/genesis.json \
+  /home/crab/torus-seed-live/torus-node.reproof5-8672c06 \
+    --genesis /home/crab/torus-seed-live/genesis.ffb28a50.json \
     --data-dir /home/crab/projects/Torus-hyperBFT/testnet/data \
     --keystore /home/crab/projects/Torus-hyperBFT/seed.keystore \
     --passphrase-file /home/crab/projects/Torus-hyperBFT/seed.passphrase \
