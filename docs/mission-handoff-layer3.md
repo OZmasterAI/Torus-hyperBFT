@@ -37,6 +37,48 @@ deliver. Pipeline-latency levers are EXHAUSTED. Layer 3 = cut replica per-view W
    consensus-visible = Fable + stateright).
 4. **Then**: re-proof at cap-400 vs the 21.0 gate; if passed, re-open uncapped
    throughput with the compute headroom (engine share dominates uncapped too).
+
+### Layer-3 round-1 outcomes (2026-07-21, this session — items 1-3 RESOLVED, scope pivoted)
+
+- **Item 3 (overlap) CANCELLED as consensus work**: `docs/l3-work-budget.md` @ c1f3d1b
+  proved votes already wait only on header-DA + safety + lock advance (~1.6ms) — never
+  on exec or body. Exec is async post-commit, one worker, ≤64 blocks deep; view wall =
+  exec-worker per-block wall via channel backpressure. Nothing consensus-visible to do;
+  the S470 negative constraint (keep qc−committed lag visible + 64-cap) stands.
+- **Item 1 (engine parallelism) NEGATIVE RESULT**: `perf/l3-engine-par` @ 21b3073
+  (design + verdict in docs/design-parallel-engine.md). KEY CORRECTION: cross-market
+  matching was ALREADY parallel (always-on MarketWorkerPool::match_parallel); the
+  serial residue is Phase-2 prepare + inherently-ordered settle pass-B, which
+  determinism forbids parallelizing. µbench: serial wins at cap-400 AND 5k; +9-13% at
+  25k only. TORUS_PARALLEL_ENGINE (sender-sharded Phase-2, determinism matrix proven
+  20×) stays in-tree default-OFF; not the lever. Also corrected: margin IS reserved
+  (default 20× leverage fallback) — "margin_configs empty ⇒ zero margin" is wrong.
+- **Item 2 (parallel verify) ALREADY BANKED**: exec-path verify was already
+  global-rayon-parallel + ed25519-batched (serial would be 81ms at cap-400; today
+  ~18ms cold). `perf/l3-verify-par` @ a2bcb88 adds TORUS_PARALLEL_VERIFY control,
+  mode-pinned test entrypoint, differential/cache tests, µbench. NOTE: cold-cache
+  verify ~18ms ≫ the 2-6ms trust-cache estimate — in-vivo hit rate unknown.
+- **Flush stream (new)**: `perf/l3-flush-pipe` — only body_persist is safely
+  deferrable (~5-10ms; authoritative durable body already written at dispatch,
+  app.rs:4128); state_write + evm_resync must stay sync (read-your-writes for
+  engine/verify(N+1)). Plus TORUS_BUCKET_HASH_MIN_BUCKETS adaptive root threshold
+  (helps uncapped only). In test-debug at handoff time.
+- **PIVOTED SCOPE**: measured/addressable new savings sum to ~10-15ms of the 113→48
+  gap. The ~40-50ms UNTIMED exec-loop residual (persist_committed_block_durably,
+  dispatch prep, deschedule tax — never directly measured) is now the whole game.
+  NEXT: (a) pegged cap-400 cell scraping ALL exec_* + exec_queue_depth (needs devnet
+  go) — THE decisive measurement; (b) then either attack the revealed untimed
+  consumers or build Option 2 (two-stage exec pipeline, overlap flush(N) with
+  engine(N+1) behind snapshot reads, ≈16ms, node-local, design in l3-work-budget §4).
+- **New known-flaky test**: exec_hole_budget_exhaustion_latches_fail_stop
+  (torus-consensus lib) — 3/3 standalone green on branch + 2/2 on base, fails only
+  under parallel in-binary test load. justify_block_livelock_test failed 1× standalone
+  on quiet 18c (130s) — base comparison pending at handoff time.
+- **Ops lessons**: `echo EXIT=$?` inside nested bash -c quoting expands at LAUNCH
+  (always 0) — detached runs must use uploaded script files with single-quoted flock
+  bodies; never trust old-pattern markers, grep FAILED. Never pipe triage runs
+  through tail (destroys evidence). Env-var-toggled features need mode-pinned test
+  entrypoints (process-global set_var contaminates parallel in-binary tests).
 5. **Parked (Layer-3b, after gate)**: RPC/ingress ceiling (~17k/s accepted at all
    offered rates), real-WAN 3-machine testnet (user may provide 3rd box; Package B
    never WAN-tested), production-debt list below.
