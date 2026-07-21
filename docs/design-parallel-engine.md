@@ -167,3 +167,63 @@ enforcement.
 - µbench: `#[ignore]`d timed test, cap-400 shape (400 orders, 10 markets,
   40 senders, seeded resting ladders, crossing flow), serial vs threads
   {2,4,8}, printed ms — run on 18c.
+
+## 7. Performance verdict (2026-07-21) — NEGATIVE RESULT
+
+µbench on 18c (`engine_parallel_bench`, release, behind the build lock;
+raw logs `~/bench-results-18c/engpar-round{2,3}.log`). Determinism matrix
+{off,2,4,8} ×20 reruns + all adversarial cells: GREEN throughout.
+
+**cap-400 shape** (400 orders, 10 markets, 40 senders, 342 trades/blk,
+15 iters — round-2 run, cell ran alone):
+
+| mode   | min ms | median ms |
+|--------|-------:|----------:|
+| serial |  11.0  |   15.8    |
+| thr=2  |  13.9  |   25.7    |
+| thr=4  |  15.5  |   19.8    |
+| thr=8  |  13.7  |   25.6    |
+
+**large-5k** (5,000 orders, 10 markets, 100 senders, 3,646 trades/blk, 7 iters):
+
+| mode   | min ms | median ms |
+|--------|-------:|----------:|
+| serial | 109.8  |  127.6    |
+| thr=4  | 122.4  |  180.5    |
+| thr=8  | 112.9  |  132.2    |
+| thr=16 | 124.1  |  171.8    |
+
+**large-25k** (25,000 orders, 20 markets, 200 senders, 17,846 trades/blk, 5 iters):
+
+| mode   | min ms | median ms |
+|--------|-------:|----------:|
+| serial | 542.5  |  609.3    |
+| thr=4  | 528.1  |  678.5    |
+| thr=8  | 491.9  |  523.6    |
+| thr=16 | 473.8  |  537.0    |
+
+(Caveat: in round 3 the harness ran the cap-400 and large-5k cells
+concurrently on two test threads, so those two cells carry some co-load;
+the 25k cell ran after cap-400 completed. The clean round-2 cap-400 cell
+agrees with round 3's, and the verdict is unchanged by the overlap.)
+
+**Verdict: engine parallelism across markets is NOT the Layer-3 lever.**
+Serial wins outright at cap-400 and 5k; at the extreme uncapped shape (25k
+orders) parallel gains only ~9–13% (thr=16 473.8/537.0 vs serial 542.5/609.3).
+
+**Why (grounded in the instrumented paths):** Phase-3 matching — the actual
+matching engine — is already per-market parallel, so this flag can only
+parallelize Phase-2 prepare and pass-A of settlement. The dominant remaining
+work is inherently ordered by the determinism contract itself: at these fill
+rates (~85% of orders trade) most settle cost sits in pass B — the
+single-threaded canonical apply of per-fill balance credits, `.min` clamps,
+and trade-index stamping — which parallel settle cannot touch, and Phase-2's
+per-order cost is too small for spawn/coordination to amortize below ~5k
+orders (the same fixed-overhead lesson as TORUS_PARALLEL_BUCKET_HASH at 226
+buckets). Amdahl closes the rest.
+
+**Recommendation:** keep the machinery in-tree (determinism matrix is proven
+and the flag is default-OFF = exact-today); do NOT enable it in the
+bench-standard env and do NOT add an adaptive threshold — there is no shape
+where it wins enough to justify one. Candidate value only for >25k-order
+uncapped blocks at ~10%, to be revisited if the uncapped round re-opens.
