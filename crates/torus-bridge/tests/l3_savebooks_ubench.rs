@@ -1,13 +1,18 @@
 //! L3 save-books attribution µbench (perf/l3-savebooks, TEMPORARY).
 //!
-//! Reproduces the pegged cap-400 cell shape in isolation — 10 markets, ~400
-//! orders/block, heavy matching, resting≈0 — under mode-2 (LevelAuthority) +
-//! resident books, and times `save_order_books` broken into its four
+//! Times `save_order_books` broken into its four mode-2 (LevelAuthority)
 //! per-market sub-steps (row journal, level journal+hash, stop-row diff, meta
-//! read). The point is UNCONTENDED numbers plus the growth curve as
-//! CF_NATIVE_ORDER_BOOKS fills with level-row tombstones, so the deschedule
-//! share of the ~107 ms in-vivo wall can be computed and the read-amplification
-//! hypothesis (per-market RocksDB seek + point read every block) tested.
+//! read), OVERLAY-BACKED exactly like production (`app.rs` builds a
+//! `NativeStateOverlay`, so save-time `put_cf_raw` is a cheap in-RAM insert and
+//! the real RocksDB writes are deferred to the SEPARATE `exec_flush` span — a
+//! StateDb-direct ctx would wrongly bill those writes to save_books).
+//!
+//! Three probes:
+//!   `savebooks_cell_shape`   — the pegged cap-400 cell: 10 markets, ~400
+//!                              orders/block, heavy matching, resting≈0.
+//!   `savebooks_depth_sweep`  — level_row_data is O(orders at touched level);
+//!                              sweep standing depth to characterize the hash.
+//!   `savebooks_read_probe`   — isolate the two per-market RocksDB reads.
 //!
 //! Run: `cargo test -p torus-bridge --test l3_savebooks_ubench -- --ignored --nocapture`
 
@@ -17,15 +22,15 @@ use alloy_primitives::Address;
 
 use torus_bridge::native_executor::{BookMode, NativeExecContext, NativeExecutor, ResidentBooks};
 use torus_core::position::NativeBalance;
-use torus_state::StateDb;
+use torus_state::{NativeStateOverlay, StateDb};
 use torus_types::{
     FixedPoint, MarketId, NativeAction, OrderType, PlaceOrderParams, TimeInForce,
 };
 
 const N_MARKETS: u64 = 10;
 
-fn open_test_db() -> (tempfile::TempDir, StateDb) {
-    let dir = tempfile::tempdir().expect("create temp dir");
+fn open_db() -> (tempfile::TempDir, StateDb) {
+    let dir = tempfile::tempdir().expect("tempdir");
     let db = StateDb::open(dir.path()).expect("open db");
     (dir, db)
 }
@@ -33,18 +38,19 @@ fn open_test_db() -> (tempfile::TempDir, StateDb) {
 fn addr(n: u8) -> Address {
     Address::new([n; 20])
 }
-
 fn fp(v: i64) -> FixedPoint {
     FixedPoint::from_raw(v as i128 * FixedPoint::SCALE)
 }
 
-fn make_ctx(
-    db: StateDb,
+/// Overlay-backed ctx (production shape). Returns the ctx plus a cloned overlay
+/// handle (Arc-shared pending) for flushing to the db after save.
+fn make_ctx<'a>(
+    ov: NativeStateOverlay,
     height: u64,
-    holder: &mut ResidentBooks,
-) -> NativeExecContext {
+    holder: &'a mut ResidentBooks,
+) -> NativeExecContext<NativeStateOverlay> {
     NativeExecContext::new_with_mode(
-        db,
+        ov,
         height,
         1000 + height,
         0,
@@ -58,21 +64,17 @@ fn make_ctx(
     )
 }
 
-fn fund(ctx: &NativeExecContext, trader: &Address, amount: FixedPoint) {
-    let bal = NativeBalance {
-        available: amount,
-        order_margin: FixedPoint::ZERO,
-    };
-    ctx.positions.put_native_balance(trader, &bal).unwrap();
+fn fund(ctx: &NativeExecContext<NativeStateOverlay>, t: &Address, amt: FixedPoint) {
+    let bal = NativeBalance { available: amt, order_margin: FixedPoint::ZERO };
+    ctx.positions.put_native_balance(t, &bal).unwrap();
 }
 
 fn place(sender: Address, p: PlaceOrderParams) -> (Address, NativeAction) {
     (sender, NativeAction::PlaceOrder(p))
 }
-
-fn gtc(market_id: MarketId, is_buy: bool, price: i64, qty: i64) -> PlaceOrderParams {
+fn gtc(m: MarketId, is_buy: bool, price: i64, qty: i64) -> PlaceOrderParams {
     PlaceOrderParams {
-        market_id,
+        market_id: m,
         is_buy,
         price: fp(price),
         quantity: fp(qty),
@@ -83,140 +85,153 @@ fn gtc(market_id: MarketId, is_buy: bool, price: i64, qty: i64) -> PlaceOrderPar
     }
 }
 
-/// Build one block's batch across all 10 markets. `rest_side` alternates: on
-/// even blocks the maker rests fresh bids across 20 price levels (writes level
-/// rows); on odd blocks the taker sweeps the previous block's bids (deletes
-/// level rows → tombstones) AND rests a fresh band. Net: ~400 orders/block,
-/// heavy matching, resting oscillates near-zero, and CF_NATIVE_ORDER_BOOKS
-/// churns level-row writes+deletes every block — the in-vivo signature.
-fn block_batch(rest_bids: bool) -> Vec<(Address, NativeAction)> {
-    let maker = addr(1);
-    let taker = addr(2);
+fn hdr(title: &str) {
+    println!("\n=== {title} ===");
+    println!(
+        "{:>5} | {:>4} | {:>8} {:>8} {:>8} {:>8} | {:>9} | {:>6} {:>7}",
+        "blk", "mkt", "rows_us", "lvls_us", "stops_us", "meta_us", "SAVE_us", "writes", "resting"
+    );
+    println!("{}", "-".repeat(84));
+}
+fn row(h: u64, ctx: &NativeExecContext<NativeStateOverlay>, save_us: u128, writes: usize) {
+    let s = ctx.last_save_timings;
+    println!(
+        "{:>5} | {:>4} | {:>8} {:>8} {:>8} {:>8} | {:>9} | {:>6} {:>7}",
+        h,
+        s.markets,
+        s.rows_ns / 1000,
+        s.levels_ns / 1000,
+        s.stops_ns / 1000,
+        s.meta_ns / 1000,
+        save_us,
+        writes,
+        ctx.resting_order_count(),
+    );
+}
+
+/// THE cell: resting≈0. Per market: place 20 sells then 20 buys at the same
+/// prices so they fully cross in-block (different senders → no STP). Direction
+/// alternates each block so positions oscillate near 0 (funding never depletes).
+/// ~400 orders/block, ~200 trades, resting drains to 0 every block.
+fn cell_batch(h: u64) -> Vec<(Address, NativeAction)> {
+    let a = addr(1);
+    let b = addr(2);
+    let (maker, taker) = if h % 2 == 0 { (a, b) } else { (b, a) };
     let mut batch = Vec::with_capacity(400);
     for m in 1..=N_MARKETS {
-        if rest_bids {
-            // 20 resting bids spread over 20 levels (90..109) — these persist.
-            for lvl in 0..20i64 {
-                batch.push(place(maker, gtc(m, true, 90 + lvl, 2)));
-            }
-            // 20 resting asks above the book (200..219) — also persist.
-            for lvl in 0..20i64 {
-                batch.push(place(maker, gtc(m, false, 200 + lvl, 2)));
-            }
-        } else {
-            // 20 asks that sweep the previous block's bids (90..109) — matches,
-            // deletes those bid level rows. 20 buys sweeping the resting asks
-            // (200..219). Fully crossing → resting drains to ~0.
-            for lvl in 0..20i64 {
-                batch.push(place(taker, gtc(m, false, 90 + lvl, 2)));
-            }
-            for lvl in 0..20i64 {
-                batch.push(place(taker, gtc(m, true, 200 + lvl, 2)));
-            }
+        // maker rests 20 asks across 20 levels; taker buys them all out.
+        for lvl in 0..20i64 {
+            batch.push(place(maker, gtc(m, false, 100 + lvl, 2)));
+        }
+        for lvl in 0..20i64 {
+            batch.push(place(taker, gtc(m, true, 100 + lvl, 2)));
         }
     }
     batch
 }
 
 #[test]
-#[ignore = "perf µbench; run explicitly with --ignored --nocapture"]
-fn savebooks_span_breakdown() {
-    let (_dir, db) = open_test_db();
+#[ignore = "perf µbench; run with --ignored --nocapture"]
+fn savebooks_cell_shape() {
+    let (_d, db) = open_db();
     let mut holder = ResidentBooks::default();
-
-    // Warm/churn for many blocks; sample the save breakdown at a spread of
-    // heights to expose growth as the CF's memtable/LSM fills with tombstones.
-    const BLOCKS: u64 = 600;
-    let sample_at: &[u64] = &[2, 5, 10, 25, 50, 100, 200, 300, 400, 500, 599];
-
-    println!(
-        "\n{:>5} | {:>6} | {:>8} {:>8} {:>8} {:>8} {:>8} | {:>9} | {:>6} {:>7}",
-        "blk", "mkts", "rows_us", "lvls_us", "stops_us", "meta_us", "other_us",
-        "TOTAL_us", "writes", "resting"
-    );
-    println!("{}", "-".repeat(96));
-
-    for h in 1..=BLOCKS {
-        let mut ctx = make_ctx(db.clone(), h, &mut holder);
+    hdr("cell shape (resting≈0, overlay-backed = production save_books span)");
+    let sample: &[u64] = &[2, 5, 10, 50, 100, 300, 600, 999];
+    for h in 1..=1000u64 {
+        let ov = NativeStateOverlay::new(db.clone());
+        let mut ctx = make_ctx(ov.clone(), h, &mut holder);
         if h == 1 {
-            fund(&ctx, &addr(1), fp(1_000_000_000));
-            fund(&ctx, &addr(2), fp(1_000_000_000));
+            fund(&ctx, &addr(1), fp(5_000_000_000));
+            fund(&ctx, &addr(2), fp(5_000_000_000));
         }
-        let batch = block_batch(h % 2 == 0);
-        let _ = NativeExecutor::execute_batch(&mut ctx, &batch);
-
-        let sample = sample_at.contains(&h);
-        ctx.collect_save_timings = sample;
-
+        let _ = NativeExecutor::execute_batch(&mut ctx, &cell_batch(h));
+        let take = sample.contains(&h);
+        ctx.collect_save_timings = take;
         let t = Instant::now();
-        let writes = ctx.save_order_books();
-        let total_us = t.elapsed().as_micros();
-        let resting = ctx.resting_order_count();
-
-        if sample {
-            let s = ctx.last_save_timings;
-            println!(
-                "{:>5} | {:>6} | {:>8} {:>8} {:>8} {:>8} {:>8} | {:>9} | {:>6} {:>7}",
-                h,
-                s.markets,
-                s.rows_ns / 1000,
-                s.levels_ns / 1000,
-                s.stops_ns / 1000,
-                s.meta_ns / 1000,
-                s.other_ns / 1000,
-                total_us,
-                writes,
-                resting,
-            );
+        let w = ctx.save_order_books();
+        let us = t.elapsed().as_micros();
+        if take {
+            row(h, &ctx, us, w);
         }
         ctx.stash_resident(&mut holder);
+        ov.flush(&db).unwrap(); // defer real writes to "flush", grow the LSM
     }
-    println!();
 }
 
-/// Isolate the pure READ cost: after churning the CF, time save_order_books on
-/// a block whose books have ~0 dirty writes. If save time is dominated by
-/// stops+meta and grows with churn, the per-market RocksDB reads are the cause.
+/// Characterize level_row_data (O(orders at touched level)): seed a standing
+/// book of DEPTH orders per level, then touch one order at each level and time
+/// the resulting re-hash. Shows the scaling hazard when resting depth is NOT 0.
 #[test]
-#[ignore = "perf µbench; run explicitly with --ignored --nocapture"]
-fn savebooks_read_cost_vs_churn() {
-    let (_dir, db) = open_test_db();
-    let mut holder = ResidentBooks::default();
-
-    println!("\nchurn_blocks | stops_us | meta_us | rows_us | lvls_us | total_us (10 mkts, ~0 net writes)");
-    println!("{}", "-".repeat(90));
-
-    let checkpoints: &[u64] = &[10, 50, 100, 200, 400, 600, 800];
-    let mut next_cp = 0usize;
-
-    for h in 1..=800u64 {
-        let mut ctx = make_ctx(db.clone(), h, &mut holder);
-        if h == 1 {
-            fund(&ctx, &addr(1), fp(2_000_000_000));
-            fund(&ctx, &addr(2), fp(2_000_000_000));
+#[ignore = "perf µbench; run with --ignored --nocapture"]
+fn savebooks_depth_sweep() {
+    println!("\n=== level-hash depth sweep (single market, touch 1 order/level) ===");
+    println!("{:>6} | {:>7} | {:>9} | {:>10}", "depth", "levels", "lvls_us", "us/level");
+    println!("{}", "-".repeat(44));
+    for depth in [1usize, 2, 4, 8, 16, 32, 64] {
+        let (_d, db) = open_db();
+        let mut holder = ResidentBooks::default();
+        let levels = 20i64;
+        // Block 1: seed `depth` resting bids at each of `levels` price levels.
+        let ov = NativeStateOverlay::new(db.clone());
+        let mut ctx = make_ctx(ov.clone(), 1, &mut holder);
+        fund(&ctx, &addr(1), fp(50_000_000_000));
+        let mut seed = Vec::new();
+        for lvl in 0..levels {
+            for _ in 0..depth {
+                seed.push(place(addr(1), gtc(1, true, 50 + lvl, 2)));
+            }
         }
-        let batch = block_batch(h % 2 == 0);
-        let _ = NativeExecutor::execute_batch(&mut ctx, &batch);
+        let _ = NativeExecutor::execute_batch(&mut ctx, &seed);
+        ctx.save_order_books();
+        ctx.stash_resident(&mut holder);
+        ov.flush(&db).unwrap();
+        // Block 2: add ONE order to each level (touches the level → full re-hash).
+        let ov = NativeStateOverlay::new(db.clone());
+        let mut ctx = make_ctx(ov.clone(), 2, &mut holder);
+        fund(&ctx, &addr(1), fp(50_000_000_000));
+        let mut touch = Vec::new();
+        for lvl in 0..levels {
+            touch.push(place(addr(1), gtc(1, true, 50 + lvl, 2)));
+        }
+        let _ = NativeExecutor::execute_batch(&mut ctx, &touch);
+        ctx.collect_save_timings = true;
+        ctx.save_order_books();
+        let s = ctx.last_save_timings;
+        let per = s.levels_ns / 1000 / levels as u128;
+        println!("{:>6} | {:>7} | {:>9} | {:>10}", depth, levels, s.levels_ns / 1000, per);
+        ov.flush(&db).unwrap();
+    }
+}
 
-        let at_cp = next_cp < checkpoints.len() && checkpoints[next_cp] == h;
-        ctx.collect_save_timings = at_cp;
+/// Isolate the two per-market RocksDB reads (diff_stop_rows seek +
+/// write_meta_if_moved point read) vs LSM churn — resting≈0 so writes are ~nil.
+#[test]
+#[ignore = "perf µbench; run with --ignored --nocapture"]
+fn savebooks_read_probe() {
+    let (_d, db) = open_db();
+    let mut holder = ResidentBooks::default();
+    println!("\n=== read probe (10 mkts, resting≈0): does stops/meta grow with churn? ===");
+    println!("{:>5} | {:>8} | {:>8} | {:>8}", "blk", "stops_us", "meta_us", "SAVE_us");
+    println!("{}", "-".repeat(40));
+    let cps: &[u64] = &[10, 50, 100, 200, 400, 700, 1000];
+    for h in 1..=1000u64 {
+        let ov = NativeStateOverlay::new(db.clone());
+        let mut ctx = make_ctx(ov.clone(), h, &mut holder);
+        if h == 1 {
+            fund(&ctx, &addr(1), fp(5_000_000_000));
+            fund(&ctx, &addr(2), fp(5_000_000_000));
+        }
+        let _ = NativeExecutor::execute_batch(&mut ctx, &cell_batch(h));
+        let take = cps.contains(&h);
+        ctx.collect_save_timings = take;
         let t = Instant::now();
         let _ = ctx.save_order_books();
-        let total_us = t.elapsed().as_micros();
-        if at_cp {
+        let us = t.elapsed().as_micros();
+        if take {
             let s = ctx.last_save_timings;
-            println!(
-                "{:>12} | {:>8} | {:>7} | {:>7} | {:>7} | {:>8}",
-                h,
-                s.stops_ns / 1000,
-                s.meta_ns / 1000,
-                s.rows_ns / 1000,
-                s.levels_ns / 1000,
-                total_us,
-            );
-            next_cp += 1;
+            println!("{:>5} | {:>8} | {:>8} | {:>8}", h, s.stops_ns / 1000, s.meta_ns / 1000, us);
         }
         ctx.stash_resident(&mut holder);
+        ov.flush(&db).unwrap();
     }
-    println!();
 }
