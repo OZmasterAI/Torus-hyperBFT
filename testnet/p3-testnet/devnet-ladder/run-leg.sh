@@ -47,7 +47,23 @@ for v in TORUS_NATIVE_TOTAL_BLOCK_CAP TORUS_NATIVE_ORDERS_PER_BLOCK_CAP TORUS_NA
 done
 echo "cap overrides: ${CAPENV[*]:-<none, devnet compose defaults 400/400k/2MB>}"
 
+# EXTRA_COMPOSE: space-separated overlay paths appended AFTER compose.10mkt.yml.
+# Exists for branches whose node CLI does not accept every arg this compose
+# passes — perf/re-proof5 has no split read-only RPC listener (its clap struct
+# declares only rpc_addr, crates/torus-node/src/main.rs:138), so it rejects
+# --rpc-read-addr and the container exits at startup. That leg runs with
+# EXTRA_COMPOSE=.../compose.rp5.yml to restate `command` without the flag.
+#
+# Always run BOTH sides of an A/B from the SAME repo checkout: the branches'
+# own docker-compose.yml files differ substantially, and a leg pair that varies
+# the compose as well as the image is not a controlled comparison. The IMAGE is
+# the variable; topology, env, caps and ports are the control.
 COMPOSE=(-f "$REPO/devnet/docker-compose.yml" -f "$HERE/compose.10mkt.yml")
+for extra in ${EXTRA_COMPOSE:-}; do
+    [ -f "$extra" ] || { echo "FATAL: EXTRA_COMPOSE file not found: $extra"; exit 1; }
+    COMPOSE+=(-f "$extra")
+done
+echo "compose overlays: ${EXTRA_COMPOSE:-<none>}"
 cd "$REPO"
 sudo -n env DEVNET_IMAGE="$IMAGE" "${CAPENV[@]}" docker compose -p "$PROJ" "${COMPOSE[@]}" \
     down -v --remove-orphans >/dev/null 2>&1 || true
