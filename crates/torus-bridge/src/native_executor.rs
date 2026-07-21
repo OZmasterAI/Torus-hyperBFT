@@ -857,6 +857,30 @@ pub struct NativeExecContext<T: StateBackend = StateDb> {
     /// rank8: whether resident state was actually reused this block (vs a
     /// rebuild from persisted state — first block, restart, or stale guard).
     resident_reused: bool,
+    /// L3 save-books attribution (TEMPORARY, perf/l3-savebooks): when set, the
+    /// mode-2 `save_order_books` arm accumulates per-sub-step timings into
+    /// `last_save_timings`. Default false = zero hot-path cost.
+    pub collect_save_timings: bool,
+    /// L3 save-books attribution (TEMPORARY): last block's sub-step timings.
+    pub last_save_timings: SaveTimings,
+}
+
+/// L3 save-books attribution (TEMPORARY, perf/l3-savebooks): breakdown of the
+/// mode-2 `save_order_books` span into its four per-market sub-steps.
+#[derive(Default, Clone, Copy, Debug)]
+pub struct SaveTimings {
+    /// take_row_ops drain + encode_order_row + CF_BOOK_ORDER_ROWS put/delete.
+    pub rows_ns: u128,
+    /// take_level_ops drain + level_row_data keccak + CF level put/delete.
+    pub levels_ns: u128,
+    /// diff_stop_rows — the per-market RocksDB prefix seek over stop rows.
+    pub stops_ns: u128,
+    /// write_meta_if_moved — the per-market RocksDB meta point read + compare.
+    pub meta_ns: u128,
+    /// counter row + book-mode marker (once) + loop overhead.
+    pub other_ns: u128,
+    /// number of dirty markets saved this block.
+    pub markets: u32,
 }
 
 impl<T: StateBackend> NativeExecContext<T> {
@@ -1110,6 +1134,8 @@ impl<T: StateBackend> NativeExecContext<T> {
             book_mode_marker_present,
             resident: resident_mode,
             resident_reused,
+            collect_save_timings: false,
+            last_save_timings: SaveTimings::default(),
         }
     }
 
@@ -1648,6 +1674,10 @@ impl<T: StateBackend> NativeExecContext<T> {
         // keeps write counts and logs reproducible.
         let mut dirty: Vec<MarketId> = self.dirty_books.iter().copied().collect();
         dirty.sort_unstable();
+        // L3 attribution (TEMPORARY): per-sub-step accumulators.
+        let timed = self.collect_save_timings;
+        let n_dirty = dirty.len() as u32;
+        let mut acc = SaveTimings::default();
         for market_id in dirty {
             let Some(book) = self.order_books.get_mut(&market_id) else {
                 continue;
@@ -1698,6 +1728,7 @@ impl<T: StateBackend> NativeExecContext<T> {
                 BookMode::LevelAuthority => {
                     let mut rows_written = 0usize;
                     let mut rows_deleted = 0usize;
+                    let t_rows = timed.then(std::time::Instant::now);
                     for (order_id, op) in book.take_row_ops() {
                         let key = book_order_key(market_id, order_id);
                         let res = match &op {
@@ -1717,8 +1748,12 @@ impl<T: StateBackend> NativeExecContext<T> {
                             );
                         }
                     }
+                    if let Some(t) = t_rows {
+                        acc.rows_ns += t.elapsed().as_nanos();
+                    }
                     let mut levels_written = 0usize;
                     let mut levels_deleted = 0usize;
+                    let t_levels = timed.then(std::time::Instant::now);
                     for ((tag, raw_price), op) in book.take_level_ops() {
                         let key = level_row_key_tagged(market_id, tag, raw_price);
                         let res = match &op {
@@ -1742,8 +1777,19 @@ impl<T: StateBackend> NativeExecContext<T> {
                             ),
                         }
                     }
+                    if let Some(t) = t_levels {
+                        acc.levels_ns += t.elapsed().as_nanos();
+                    }
+                    let t_stops = timed.then(std::time::Instant::now);
                     written += Self::diff_stop_rows(&self.state, market_id, book);
+                    if let Some(t) = t_stops {
+                        acc.stops_ns += t.elapsed().as_nanos();
+                    }
+                    let t_meta = timed.then(std::time::Instant::now);
                     written += Self::write_meta_if_moved(&self.state, market_id, book);
+                    if let Some(t) = t_meta {
+                        acc.meta_ns += t.elapsed().as_nanos();
+                    }
                     if let Some(ref m) = self.metrics {
                         m.exec_book_rows_written.inc_by(rows_written as u64);
                         m.exec_book_rows_deleted.inc_by(rows_deleted as u64);
@@ -1776,6 +1822,11 @@ impl<T: StateBackend> NativeExecContext<T> {
                 Ok(()) => self.book_mode_marker_present = true,
                 Err(e) => tracing::error!(%e, "failed to persist __book_mode__ marker"),
             }
+        }
+
+        if timed {
+            acc.markets = n_dirty;
+            self.last_save_timings = acc;
         }
 
         written
