@@ -2,12 +2,14 @@
 
 use alloy_primitives::Address;
 
-use torus_bridge::market_workers::{MarketWorkerPool, MatchRequest};
+use torus_bridge::market_workers::{MarketBatchResult, MarketWorkerPool, MatchRequest};
 use torus_bridge::native_executor::{NativeExecContext, NativeExecutor};
 use torus_core::order_book::OrderBook;
 use torus_core::position::NativeBalance;
 use torus_state::StateDb;
-use torus_types::{FixedPoint, MarketId, NativeAction, OrderType, PlaceOrderParams, TimeInForce};
+use torus_types::{
+    FixedPoint, MarketId, NativeAction, OrderId, OrderType, PlaceOrderParams, TimeInForce,
+};
 
 use std::collections::HashMap;
 
@@ -916,6 +918,132 @@ fn oversize_batch_skipped_deterministically_sibling_executes() {
         &[(attacker, NativeAction::PlaceOrderBatch(vec![]))],
     );
     assert_eq!(res3.results.len(), 0);
+}
+
+// ============================================================================
+// Test 15: capped worker model — chunking a market set across a small worker
+// cap must produce per-market results identical to today's one-thread-per-market
+// behavior (max_workers == market count). Books are independent, so the chunk
+// layout cannot change any market's fills, statuses, or next_order_id.
+// ============================================================================
+
+/// Owned request params per market so the borrowed `MatchRequest.params` outlive
+/// the batches map. Each market: crossing buy (fills), resting buy, resting sell.
+fn capped_req_params(n_markets: u64) -> Vec<Vec<PlaceOrderParams>> {
+    (1..=n_markets)
+        .map(|m| {
+            vec![
+                limit_buy(m, 100, 5),  // crosses the seeded resting sell → fills
+                limit_buy(m, 90, 2),   // rests (best bid 90 < seeded ask)
+                limit_sell(m, 110, 1), // rests (110 > best bid)
+            ]
+        })
+        .collect()
+}
+
+/// Fresh batches for `n_markets`; each book is seeded with resting sell liquidity
+/// so the first request crosses. Order ids are globally unique and deterministic.
+fn capped_batches<'a>(
+    n_markets: u64,
+    req_params: &'a [Vec<PlaceOrderParams>],
+) -> HashMap<MarketId, (OrderBook, Vec<MatchRequest<'a>>)> {
+    let mut batches = HashMap::new();
+    for m in 1..=n_markets {
+        let mut book = OrderBook::new(m, fp(1), fp(1));
+        book.place_order(limit_sell(m, 100, 10), addr(200), 999);
+        let params = &req_params[(m - 1) as usize];
+        let requests = vec![
+            MatchRequest {
+                sender: addr(1),
+                params: &params[0],
+                order_id: (m * 100 + 1) as OrderId,
+            },
+            MatchRequest {
+                sender: addr(2),
+                params: &params[1],
+                order_id: (m * 100 + 2) as OrderId,
+            },
+            MatchRequest {
+                sender: addr(3),
+                params: &params[2],
+                order_id: (m * 100 + 3) as OrderId,
+            },
+        ];
+        batches.insert(m, (book, requests));
+    }
+    batches
+}
+
+fn sorted_by_market(mut v: Vec<MarketBatchResult>) -> Vec<MarketBatchResult> {
+    v.sort_by_key(|r| r.market_id);
+    v
+}
+
+#[test]
+fn capped_matches_uncapped_per_market() {
+    let n = 16u64;
+    let rp = capped_req_params(n);
+
+    let capped =
+        MarketWorkerPool::match_parallel_capped(capped_batches(n, &rp), 1000, 3).expect("no panic");
+    let full = MarketWorkerPool::match_parallel_capped(capped_batches(n, &rp), 1000, n as usize)
+        .expect("no panic");
+
+    let capped = sorted_by_market(capped);
+    let full = sorted_by_market(full);
+    assert_eq!(capped.len(), full.len(), "same market count");
+
+    let mut total_fills = 0usize;
+    for (a, b) in capped.iter().zip(full.iter()) {
+        assert_eq!(a.market_id, b.market_id);
+        assert_eq!(
+            a.next_order_id, b.next_order_id,
+            "next_order_id diverges for market {}",
+            a.market_id
+        );
+        assert_eq!(a.results.len(), b.results.len());
+        for (ra, rb) in a.results.iter().zip(b.results.iter()) {
+            assert_eq!(ra.order_id, rb.order_id);
+            assert_eq!(ra.sender, rb.sender);
+            assert_eq!(ra.result.status, rb.result.status);
+            assert_eq!(ra.result.fills.len(), rb.result.fills.len());
+            for (fa, fb) in ra.result.fills.iter().zip(rb.result.fills.iter()) {
+                assert_eq!(fa.price, fb.price);
+                assert_eq!(fa.quantity, fb.quantity);
+            }
+            total_fills += ra.result.fills.len();
+        }
+    }
+    assert!(
+        total_fills >= n as usize,
+        "every market's crossing buy must fill: {total_fills}"
+    );
+}
+
+#[test]
+fn capped_is_deterministic() {
+    let n = 16u64;
+    let rp = capped_req_params(n);
+
+    let run = || {
+        let r =
+            MarketWorkerPool::match_parallel_capped(capped_batches(n, &rp), 1000, 3).expect("ok");
+        sorted_by_market(r)
+            .into_iter()
+            .map(|m| {
+                (
+                    m.market_id,
+                    m.next_order_id,
+                    m.results
+                        .into_iter()
+                        .map(|res| (res.order_id, res.result.status, res.result.fills.len()))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(run(), run(), "capped matching must be deterministic");
 }
 
 // ============================================================================
