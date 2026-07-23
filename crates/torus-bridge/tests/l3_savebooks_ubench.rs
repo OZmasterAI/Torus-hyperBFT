@@ -444,3 +444,73 @@ fn savebooks_read_probe() {
         ov.flush(&db).unwrap();
     }
 }
+
+/// perf/l3-cache-stats: the context-level aggregator that feeds the Prometheus
+/// gauges must sum the per-book level-hash cache stats and return `None` when
+/// the cache is off. Mode-pinned by setting `level_hash_cache_bytes` directly
+/// (no `TORUS_LEVEL_HASH_CACHE` set_var — that global would leak into other
+/// tests sharing this binary). A regular #[test], not a µbench.
+#[test]
+fn level_hash_cache_stats_aggregates_across_books() {
+    // Cache OFF (bytes = 0): stats fn returns None so the export site skips.
+    {
+        let (_d, db) = open_db();
+        let mut holder = ResidentBooks::default();
+        let ov = NativeStateOverlay::new(db.clone());
+        let mut ctx = make_ctx(ov.clone(), 1, &mut holder);
+        fund(&ctx, &addr(1), fp(1_000_000_000_000));
+        let mut batch = Vec::new();
+        for m in 1..=N_MARKETS {
+            for lvl in 0..4i64 {
+                batch.push(place(addr(1), gtc(m, true, 100 + lvl, 5)));
+            }
+        }
+        let _ = NativeExecutor::execute_batch(&mut ctx, &batch);
+        ctx.save_order_books();
+        assert!(
+            ctx.level_hash_cache_stats().is_none(),
+            "cache off ⇒ aggregate must be None"
+        );
+    }
+
+    // Cache ON: resting bids across every market ⇒ first save of each level is a
+    // MISS. The aggregate must be Some and equal the manual fold over books.
+    {
+        let (_d, db) = open_db();
+        let mut holder = ResidentBooks::default();
+        let ov = NativeStateOverlay::new(db.clone());
+        let mut ctx = make_ctx(ov.clone(), 1, &mut holder);
+        ctx.level_hash_cache_bytes = 1024 * 1024;
+        fund(&ctx, &addr(1), fp(1_000_000_000_000));
+        let levels_per_market = 4i64;
+        let mut batch = Vec::new();
+        for m in 1..=N_MARKETS {
+            for lvl in 0..levels_per_market {
+                batch.push(place(addr(1), gtc(m, true, 100 + lvl, 5)));
+            }
+        }
+        let _ = NativeExecutor::execute_batch(&mut ctx, &batch);
+        ctx.save_order_books();
+
+        // Manual fold: what the exported gauges should read.
+        let mut want = (0u64, 0u64, 0u64, 0u64);
+        for book in ctx.order_books.values() {
+            if let Some((h, m, s, e)) = book.level_hash_cache_stats() {
+                want.0 += h;
+                want.1 += m;
+                want.2 += s;
+                want.3 += e as u64;
+            }
+        }
+        let got = ctx
+            .level_hash_cache_stats()
+            .expect("cache on ⇒ aggregate must be Some");
+        assert_eq!(got, want, "aggregate must equal the per-book fold");
+        // First save of freshly-seeded levels: every touched level is a plain
+        // miss (10 markets × 4 levels), no hits/seeds yet.
+        let expected_misses = (N_MARKETS as i64 * levels_per_market) as u64;
+        assert_eq!(got.1, expected_misses, "first-save misses = total levels");
+        assert_eq!(got.0, 0, "no sponge extensions on a first save");
+        assert_eq!(got.2, 0, "no promotions on a first save");
+    }
+}

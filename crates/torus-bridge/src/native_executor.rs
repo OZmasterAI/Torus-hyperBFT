@@ -1224,6 +1224,28 @@ impl<T: StateBackend> NativeExecContext<T> {
         self.order_books.values().map(|b| b.order_count()).sum()
     }
 
+    /// L3 metrics hook: fold the per-book level-hash sponge cache stats across
+    /// every loaded book into `(hits, misses, seeds, live entries)`. `hits` /
+    /// `misses` / `seeds` are cumulative sums (monotonic while books persist as
+    /// resident); `entries` is the instantaneous resident-sponge count. Returns
+    /// `None` when the cache is disabled (no book reports stats), so the export
+    /// site skips the metric update entirely — zero cost with
+    /// `TORUS_LEVEL_HASH_CACHE` off. Mirrors `OrderBook::level_hash_cache_stats`.
+    pub fn level_hash_cache_stats(&self) -> Option<(u64, u64, u64, u64)> {
+        let mut any = false;
+        let mut agg = (0u64, 0u64, 0u64, 0u64);
+        for book in self.order_books.values() {
+            if let Some((hits, misses, seeds, entries)) = book.level_hash_cache_stats() {
+                any = true;
+                agg.0 += hits;
+                agg.1 += misses;
+                agg.2 += seeds;
+                agg.3 += entries as u64;
+            }
+        }
+        any.then_some(agg)
+    }
+
     /// True if `key` belongs to the tagged row schema (meta / order / stop /
     /// level row — modes 1/2).
     fn is_book_row_key(key: &[u8]) -> bool {

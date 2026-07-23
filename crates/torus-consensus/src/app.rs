@@ -1392,6 +1392,15 @@ impl ExecutionContext {
             if let Some(ref m) = self.metrics {
                 m.exec_save_books_seconds
                     .observe(save_books_timer.elapsed().as_secs_f64());
+                // L3: publish the level-hash sponge cache effectiveness, summed
+                // across all books, right after the save that populates it. None
+                // when TORUS_LEVEL_HASH_CACHE is off ⇒ skip (gauges stay at 0).
+                if let Some((hits, misses, seeds, entries)) = ctx.level_hash_cache_stats() {
+                    m.exec_level_hash_cache_hits.set(hits as i64);
+                    m.exec_level_hash_cache_misses.set(misses as i64);
+                    m.exec_level_hash_cache_seeds.set(seeds as i64);
+                    m.exec_level_hash_cache_entries.set(entries as i64);
+                }
             }
             // rank8: hand the books back to the cross-block holder (no-op for
             // non-resident contexts). Safe before the overlay flush below: if

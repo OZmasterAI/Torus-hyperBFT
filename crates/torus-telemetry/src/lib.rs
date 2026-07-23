@@ -273,6 +273,23 @@ pub struct Metrics {
     /// background writer but not yet written (`TORUS_ASYNC_POST_FLUSH`). Sustained
     /// growth = RocksDB stalling behind exec (backpressure onto the exec chain).
     pub post_flush_writer_queued_batches: Gauge,
+    /// L3 level-hash sponge cache (`TORUS_LEVEL_HASH_CACHE`, default-off): cumulative
+    /// O(tail) sponge extensions summed across every book, sampled per block after
+    /// `save_order_books`. Set-as-Gauge of a monotonic sum (see `misses`/`seeds`).
+    /// Stays 0 while the cache is disabled.
+    pub exec_level_hash_cache_hits: Gauge,
+    /// L3 level-hash cache: cumulative plain one-shot fallbacks summed across books
+    /// (a level's first save, or a stale/invalidated seed) — the recompute the cache
+    /// could not save. hits/(hits+misses) is the node-local sponge-reuse rate.
+    pub exec_level_hash_cache_misses: Gauge,
+    /// L3 level-hash cache: cumulative probe→sponge promotions summed across books
+    /// (staged-seeding investments — one full absorb spent to seed a level so later
+    /// append-only saves become hits).
+    pub exec_level_hash_cache_seeds: Gauge,
+    /// L3 level-hash cache: live seeded-sponge entries resident across all books at
+    /// the last save (the memory-footprint / eviction-pressure witness, near the
+    /// budget-implied cap ⇒ evicting). Instantaneous, not cumulative.
+    pub exec_level_hash_cache_entries: Gauge,
 
     // View-phase timing (hotstuff replica lifecycle, fed by ViewMetricsRecorder).
     // Decomposes per-leg block cadence per node: leader build + QC collection,
@@ -1037,6 +1054,31 @@ impl Metrics {
             post_flush_writer_queued_batches.clone(),
         );
 
+        let exec_level_hash_cache_hits = Gauge::default();
+        registry.register(
+            "torus_exec_level_hash_cache_hits",
+            "L3 level-hash sponge cache O(tail) extensions, summed across books (cumulative sum-as-gauge)",
+            exec_level_hash_cache_hits.clone(),
+        );
+        let exec_level_hash_cache_misses = Gauge::default();
+        registry.register(
+            "torus_exec_level_hash_cache_misses",
+            "L3 level-hash cache plain one-shot fallbacks, summed across books (cumulative sum-as-gauge)",
+            exec_level_hash_cache_misses.clone(),
+        );
+        let exec_level_hash_cache_seeds = Gauge::default();
+        registry.register(
+            "torus_exec_level_hash_cache_seeds",
+            "L3 level-hash cache probe→sponge promotions, summed across books (cumulative sum-as-gauge)",
+            exec_level_hash_cache_seeds.clone(),
+        );
+        let exec_level_hash_cache_entries = Gauge::default();
+        registry.register(
+            "torus_exec_level_hash_cache_entries",
+            "L3 level-hash cache live seeded-sponge entries resident across books at last save (instantaneous)",
+            exec_level_hash_cache_entries.clone(),
+        );
+
         let view_duration_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 15));
         registry.register(
             "torus_view_duration_seconds",
@@ -1330,6 +1372,10 @@ impl Metrics {
             exec_dispatch_deferred,
             trade_writer_queued_batches,
             post_flush_writer_queued_batches,
+            exec_level_hash_cache_hits,
+            exec_level_hash_cache_misses,
+            exec_level_hash_cache_seeds,
+            exec_level_hash_cache_entries,
             view_duration_seconds,
             view_propose_delay_seconds,
             view_propose_build_seconds,
@@ -1490,6 +1536,24 @@ mod tests {
             "torus_exec_queue_depth",
             "torus_exec_throttle_tier",
             "torus_exec_dispatch_deferred",
+        ] {
+            assert!(text.contains(name), "{name} not registered:\n{text}");
+        }
+    }
+
+    /// L3 level-hash sponge cache stats (perf/l3-cache-stats): the aggregated
+    /// hit/miss/seed/entries gauges must be registered so the cache's node-local
+    /// effectiveness is scrapeable when `TORUS_LEVEL_HASH_CACHE` is on. Gauges
+    /// stay at 0 (and thus visible) with the cache off.
+    #[test]
+    fn level_hash_cache_metrics_register() {
+        let m = Metrics::new();
+        let text = m.encode();
+        for name in [
+            "torus_exec_level_hash_cache_hits",
+            "torus_exec_level_hash_cache_misses",
+            "torus_exec_level_hash_cache_seeds",
+            "torus_exec_level_hash_cache_entries",
         ] {
             assert!(text.contains(name), "{name} not registered:\n{text}");
         }
