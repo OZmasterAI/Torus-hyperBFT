@@ -1294,11 +1294,26 @@ impl OrderBook {
     }
 
     /// `seq(8 BE) ‖ borsh(Order)` from parts (shared with the level hasher).
+    ///
+    /// Thin owning wrapper over [`Self::encode_order_row_into`] — ONE encoding
+    /// path, so the allocating and the buffer-reusing callers can never drift.
     fn encode_order_row_parts(seq: u64, order: &Order) -> Vec<u8> {
         let mut w = Vec::with_capacity(8 + 112);
-        w.extend_from_slice(&seq.to_be_bytes());
-        order.serialize(&mut w).expect("vec write");
+        Self::encode_order_row_into(&mut w, seq, order);
         w
+    }
+
+    /// The frozen row encoding staged into a CALLER-OWNED buffer:
+    /// `seq(8 BE) ‖ borsh(Order)`, byte-for-byte what
+    /// [`Self::encode_order_row_parts`] returns — only WHERE the bytes land
+    /// differs. `buf` is truncated first, so on return it holds EXACTLY the
+    /// row and `buf.len()` is the row length the level hasher must frame with.
+    /// Hot-path form: hoist one buffer out of a per-order loop and the
+    /// malloc/free pair per resting order disappears (the capacity is reused).
+    fn encode_order_row_into(buf: &mut Vec<u8>, seq: u64, order: &Order) {
+        buf.clear();
+        buf.extend_from_slice(&seq.to_be_bytes());
+        order.serialize(buf).expect("vec write");
     }
 
     /// Decode an order-row value into `(seq, order)`.
@@ -1395,15 +1410,19 @@ impl OrderBook {
         let queue = side_book.get(&price).filter(|q| !q.is_empty())?;
         let mut total = FixedPoint::ZERO;
         let mut preimage: Vec<u8> = Vec::with_capacity(queue.len() * 160);
+        // ONE scratch row for the whole level: `encode_order_row_into` clears
+        // it per order, so each iteration stages the same bytes a fresh Vec
+        // would have held — without the per-order malloc/free.
+        let mut scratch: Vec<u8> = Vec::with_capacity(8 + 112);
         for order in queue {
             total += order.remaining_qty;
             let seq = *self
                 .order_seq
                 .get(&order.id)
                 .expect("resting order must have a seq");
-            let row = Self::encode_order_row_parts(seq, order);
-            preimage.extend_from_slice(&(row.len() as u32).to_le_bytes());
-            preimage.extend_from_slice(&row);
+            Self::encode_order_row_into(&mut scratch, seq, order);
+            preimage.extend_from_slice(&(scratch.len() as u32).to_le_bytes());
+            preimage.extend_from_slice(&scratch);
         }
         Some(crate::book_rows::LevelRowData {
             total_qty_raw: total.raw(),
@@ -1526,6 +1545,9 @@ impl OrderBook {
                     unreachable!("classified Hit ⇒ Seeded slot")
                 };
                 let start = *frame_count as usize;
+                // One hoisted scratch row for the whole tail (see
+                // `encode_order_row_into`) — same bytes, no per-order alloc.
+                let mut scratch: Vec<u8> = Vec::with_capacity(8 + 112);
                 for order in queue.iter().skip(start) {
                     // Same FixedPoint += order as the one-shot sum.
                     *prefix_qty += order.remaining_qty;
@@ -1533,10 +1555,10 @@ impl OrderBook {
                         .order_seq
                         .get(&order.id)
                         .expect("resting order must have a seq");
-                    let row = Self::encode_order_row_parts(seq, order);
-                    hasher.update((row.len() as u32).to_le_bytes());
-                    hasher.update(&row);
-                    *absorbed_len += 4 + row.len() as u64;
+                    Self::encode_order_row_into(&mut scratch, seq, order);
+                    hasher.update((scratch.len() as u32).to_le_bytes());
+                    hasher.update(&scratch);
+                    *absorbed_len += 4 + scratch.len() as u64;
                 }
                 *frame_count = n as u32;
                 *last_used = tick;
@@ -1613,16 +1635,19 @@ impl OrderBook {
         let mut hasher = sha3::Keccak256::new();
         let mut total = FixedPoint::ZERO;
         let mut absorbed: u64 = 0;
+        // One hoisted scratch row for the whole level (see
+        // `encode_order_row_into`) — same bytes, no per-order alloc.
+        let mut scratch: Vec<u8> = Vec::with_capacity(8 + 112);
         for order in queue {
             total += order.remaining_qty;
             let seq = *self
                 .order_seq
                 .get(&order.id)
                 .expect("resting order must have a seq");
-            let row = Self::encode_order_row_parts(seq, order);
-            hasher.update((row.len() as u32).to_le_bytes());
-            hasher.update(&row);
-            absorbed += 4 + row.len() as u64;
+            Self::encode_order_row_into(&mut scratch, seq, order);
+            hasher.update((scratch.len() as u32).to_le_bytes());
+            hasher.update(&scratch);
+            absorbed += 4 + scratch.len() as u64;
         }
         (total, absorbed, hasher)
     }
@@ -3446,5 +3471,352 @@ mod tests {
         assert_eq!(restored.get_order(1).unwrap().remaining_qty, fp(10));
         assert!(restored.get_order(3).is_some());
         assert_eq!(restored.get_order(3).unwrap().remaining_qty, fp(8));
+    }
+}
+
+// ============================================================================
+// CONSENSUS PREIMAGE CHARACTERIZATION TESTS
+//
+// `level_hash` is committed by the native state root: one byte of drift is a
+// hard fork. These tests PIN the observable output of the level-hash preimage
+// builder against hard-coded constants captured from the pre-refactor encoder,
+// so any change to WHAT bytes are produced (as opposed to WHERE they are
+// staged) fails here. Fixtures are built from fixed seeds — no clocks, no RNG,
+// no HashMap iteration order (the preimage walks the level's VecDeque).
+// ============================================================================
+#[cfg(test)]
+mod level_preimage_characterization {
+    use super::*;
+
+    const LEVEL_PRICE_RAW: i128 = 100 * FixedPoint::SCALE;
+
+    fn hex32(b: &[u8; 32]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    /// Deterministic order derived from `i` alone (splitmix-style avalanche —
+    /// no RNG crate, no clock). Cycles every `OrderType`, every `TimeInForce`,
+    /// both `reduce_only` values and both `client_order_id` shapes.
+    fn fixture_order(i: u64) -> Order {
+        let mut m = i.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        m = (m ^ (m >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        m = (m ^ (m >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        m ^= m >> 31;
+        let qty = (m % 1_000_000) as i128 + 1;
+        Order {
+            id: (i + 1) as OrderId,
+            trader: Address::from([(m & 0xff) as u8; 20]),
+            side: Side::Buy,
+            price: FixedPoint::from_raw(LEVEL_PRICE_RAW),
+            remaining_qty: FixedPoint::from_raw(qty),
+            original_qty: FixedPoint::from_raw(qty + 7),
+            order_type: match m % 4 {
+                0 => OrderType::Limit,
+                1 => OrderType::Market,
+                2 => OrderType::StopMarket {
+                    trigger: FixedPoint::from_raw(qty * 3 - 11),
+                },
+                _ => OrderType::StopLimit {
+                    trigger: FixedPoint::from_raw(-(qty * 5) - 1),
+                    limit: FixedPoint::from_raw(qty * 7),
+                },
+            },
+            time_in_force: match (m >> 8) % 4 {
+                0 => TimeInForce::GTC,
+                1 => TimeInForce::IOC,
+                2 => TimeInForce::FOK,
+                _ => TimeInForce::PostOnly,
+            },
+            timestamp: m >> 17,
+            reduce_only: (m >> 5) & 1 == 1,
+            client_order_id: if (m >> 6) & 1 == 1 { Some(m) } else { None },
+        }
+    }
+
+    /// A book holding exactly `depth` resting orders on ONE bid level, in
+    /// insertion order, with pinned seqs (500.., independent of any allocator).
+    fn fixture_book(depth: usize) -> OrderBook {
+        let mut ob = OrderBook::new(1, FixedPoint::from_raw(1), FixedPoint::from_raw(1));
+        ob.set_next_seq(depth as u64 + 10_000);
+        for i in 0..depth {
+            ob.insert_loaded_order(fixture_order(i as u64), 500 + i as u64);
+        }
+        ob
+    }
+
+    /// Independent scratch oracle: the frozen wire shape spelled out by hand,
+    /// `u32_LE(row_len) ‖ seq(8 BE) ‖ borsh(Order)` front→back, keccak.
+    fn oracle(ob: &OrderBook, depth: usize) -> crate::book_rows::LevelRowData {
+        let queue = ob
+            .level_queue(Side::Buy, FixedPoint::from_raw(LEVEL_PRICE_RAW))
+            .expect("level exists");
+        assert_eq!(queue.len(), depth);
+        let mut total: i128 = 0;
+        let mut preimage: Vec<u8> = Vec::new();
+        for o in queue {
+            total += o.remaining_qty.raw();
+            let seq = ob.order_seq_of(o.id).expect("resting order has a seq");
+            let mut row = Vec::new();
+            row.extend_from_slice(&seq.to_be_bytes());
+            borsh::BorshSerialize::serialize(o, &mut row).unwrap();
+            preimage.extend_from_slice(&(row.len() as u32).to_le_bytes());
+            preimage.extend_from_slice(&row);
+        }
+        crate::book_rows::LevelRowData {
+            total_qty_raw: total,
+            order_count: queue.len() as u32,
+            level_hash: alloy_primitives::keccak256(&preimage).0,
+        }
+    }
+
+    /// A spread of `Order` shapes for the row-codec pin: every TIF, every
+    /// order type, both `reduce_only`, all `client_order_id` shapes, and i128
+    /// extremes (incl. negatives and MIN/MAX) in the price/qty fields.
+    fn shape_spread() -> Vec<(u64, Order)> {
+        let mut v = Vec::new();
+        let base = Order {
+            id: 7,
+            trader: Address::from([0xAB; 20]),
+            side: Side::Sell,
+            price: FixedPoint::from_raw(1),
+            remaining_qty: FixedPoint::from_raw(2),
+            original_qty: FixedPoint::from_raw(3),
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::GTC,
+            timestamp: 0,
+            reduce_only: false,
+            client_order_id: None,
+        };
+        for (idx, tif) in [
+            TimeInForce::GTC,
+            TimeInForce::IOC,
+            TimeInForce::FOK,
+            TimeInForce::PostOnly,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut o = base.clone();
+            o.time_in_force = tif;
+            o.id = 100 + idx as OrderId;
+            v.push((idx as u64, o));
+        }
+        for (idx, ro) in [false, true].into_iter().enumerate() {
+            let mut o = base.clone();
+            o.reduce_only = ro;
+            o.id = 200 + idx as OrderId;
+            v.push((u64::MAX - idx as u64, o));
+        }
+        for (idx, coid) in [None, Some(0u64), Some(u64::MAX)].into_iter().enumerate() {
+            let mut o = base.clone();
+            o.client_order_id = coid;
+            o.id = 300 + idx as OrderId;
+            v.push((idx as u64 * 1_000_003, o));
+        }
+        for (idx, ot) in [
+            OrderType::Limit,
+            OrderType::Market,
+            OrderType::StopMarket {
+                trigger: FixedPoint::from_raw(i128::MIN),
+            },
+            OrderType::StopLimit {
+                trigger: FixedPoint::from_raw(i128::MAX),
+                limit: FixedPoint::from_raw(-1),
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut o = base.clone();
+            o.order_type = ot;
+            o.id = 400 + idx as OrderId;
+            v.push((0xDEAD_BEEF_CAFE_0000 + idx as u64, o));
+        }
+        for (idx, raw) in [i128::MIN, i128::MIN + 1, -1i128, 0, i128::MAX]
+            .into_iter()
+            .enumerate()
+        {
+            let mut o = base.clone();
+            o.price = FixedPoint::from_raw(raw);
+            o.remaining_qty = FixedPoint::from_raw(raw);
+            o.original_qty = FixedPoint::from_raw(raw.wrapping_neg());
+            o.side = if idx % 2 == 0 { Side::Buy } else { Side::Sell };
+            o.timestamp = u64::MAX - idx as u64;
+            o.id = 500 + idx as OrderId;
+            v.push((idx as u64, o));
+        }
+        v
+    }
+
+    /// PIN 1 — `level_row_data` output at depths 1 / 2 / 100 / 1000, as
+    /// `(depth, level_hash hex, total_qty_raw, order_count)`, captured from the
+    /// pre-refactor encoder. These are consensus bytes: if this test fails, the
+    /// state-root preimage changed.
+    const PINNED_LEVELS: [(usize, &str, i128, u32); 4] = [
+        (
+            1,
+            "dda17d0ba0f95ca56ec1cb4c3dc3b8a99d1406fc6b11eaa43851f0f19b880f14",
+            607_536,
+            1,
+        ),
+        (
+            2,
+            "a5773c2b3a041435f7d6995bb82b932ca63d9646358ab3e7ae4522fe5f9cead1",
+            1_430_002,
+            2,
+        ),
+        (
+            100,
+            "6f53fb7754706154ef65538416629cb4e4d70388ee835fee48d4833147f5f485",
+            51_292_508,
+            100,
+        ),
+        (
+            1000,
+            "232826303bfc2d1b335f41a54707104aa246f639fb97856cdfaa643b7f517ecc",
+            491_881_418,
+            1000,
+        ),
+    ];
+
+    /// PIN 2 — keccak over the concatenation of every `encode_order_row_parts`
+    /// output in `shape_spread()`, each framed by its u32-LE length (so a
+    /// length drift is caught as well as a content drift).
+    const PINNED_SHAPE_SPREAD: &str =
+        "f5d7a4b2fb1f3a56db9d6f62a902e988eff5e51cd9ebf655b78476415b2687a9";
+
+    /// Dump helper for (re-)capturing the pins. Ignored by default; run with
+    /// `--ignored --nocapture` to print the current constants.
+    #[test]
+    #[ignore]
+    fn dump_pins() {
+        for depth in [1usize, 2, 100, 1000] {
+            let ob = fixture_book(depth);
+            let d = ob
+                .level_row_data(crate::book_rows::SIDE_TAG_BID, LEVEL_PRICE_RAW)
+                .expect("level exists");
+            println!(
+                "PIN_LEVEL ({}, \"{}\", {}, {}),",
+                depth,
+                hex32(&d.level_hash),
+                d.total_qty_raw,
+                d.order_count
+            );
+        }
+        let mut cat: Vec<u8> = Vec::new();
+        for (seq, o) in shape_spread() {
+            let row = OrderBook::encode_order_row_parts(seq, &o);
+            cat.extend_from_slice(&(row.len() as u32).to_le_bytes());
+            cat.extend_from_slice(&row);
+        }
+        println!(
+            "PIN_SHAPES \"{}\" bytes={}",
+            hex32(&alloy_primitives::keccak256(&cat).0),
+            cat.len()
+        );
+    }
+
+    #[test]
+    fn level_row_data_matches_pinned_consensus_bytes() {
+        for (depth, hash_hex, total, count) in PINNED_LEVELS {
+            let ob = fixture_book(depth);
+            let d = ob
+                .level_row_data(crate::book_rows::SIDE_TAG_BID, LEVEL_PRICE_RAW)
+                .expect("level exists");
+            assert_eq!(hex32(&d.level_hash), hash_hex, "level_hash drift @depth {depth}");
+            assert_eq!(d.total_qty_raw, total, "total_qty_raw drift @depth {depth}");
+            assert_eq!(d.order_count, count, "order_count drift @depth {depth}");
+            // Cross-check against the hand-written wire-shape oracle.
+            assert_eq!(d, oracle(&ob, depth), "oracle mismatch @depth {depth}");
+        }
+    }
+
+    /// All three cached arms (Miss → Promote → Hit, including a Hit that
+    /// absorbs an appended tail) must reproduce the plain one-shot bytes.
+    #[test]
+    fn cached_arms_match_plain() {
+        let tag = crate::book_rows::SIDE_TAG_BID;
+        let mut ob = fixture_book(100);
+        ob.ensure_level_hash_cache(1 << 20);
+        let mut cache = ob.level_hash_cache.take().expect("cache enabled");
+
+        // Miss (no slot yet) — plain path verbatim + probe record.
+        let miss = ob.level_row_data_cached(tag, LEVEL_PRICE_RAW, &mut cache).unwrap();
+        assert_eq!(miss, ob.level_row_data(tag, LEVEL_PRICE_RAW).unwrap());
+        assert_eq!(cache.misses, 1);
+
+        // Promote (probe, same epoch) — full front→back streaming absorb.
+        let promote = ob.level_row_data_cached(tag, LEVEL_PRICE_RAW, &mut cache).unwrap();
+        assert_eq!(promote, ob.level_row_data(tag, LEVEL_PRICE_RAW).unwrap());
+        assert_eq!(cache.seeds, 1);
+
+        // Hit with NO new tail.
+        let hit0 = ob.level_row_data_cached(tag, LEVEL_PRICE_RAW, &mut cache).unwrap();
+        assert_eq!(hit0, ob.level_row_data(tag, LEVEL_PRICE_RAW).unwrap());
+
+        // Hit WITH an appended tail (appends do not bump the level epoch).
+        for i in 100..137u64 {
+            ob.insert_loaded_order(fixture_order(i), 500 + i);
+        }
+        let hit1 = ob.level_row_data_cached(tag, LEVEL_PRICE_RAW, &mut cache).unwrap();
+        assert_eq!(hit1, ob.level_row_data(tag, LEVEL_PRICE_RAW).unwrap());
+        assert_eq!(hit1.order_count, 137);
+        assert_eq!(cache.hits, 2);
+    }
+
+    #[test]
+    fn encode_order_row_parts_shape_spread_is_pinned() {
+        let mut cat: Vec<u8> = Vec::new();
+        for (seq, o) in shape_spread() {
+            let row = OrderBook::encode_order_row_parts(seq, &o);
+            // Structural invariant: seq is the first 8 bytes, big-endian...
+            assert_eq!(&row[..8], &seq.to_be_bytes());
+            // ...and the remainder is exactly borsh(Order).
+            let mut expect = Vec::new();
+            borsh::BorshSerialize::serialize(&o, &mut expect).unwrap();
+            assert_eq!(&row[8..], &expect[..]);
+            cat.extend_from_slice(&(row.len() as u32).to_le_bytes());
+            cat.extend_from_slice(&row);
+        }
+        assert_eq!(
+            hex32(&alloy_primitives::keccak256(&cat).0),
+            PINNED_SHAPE_SPREAD,
+            "order-row codec drift"
+        );
+    }
+
+    /// The one bug the buffer-reuse refactor could introduce: a missing or
+    /// mis-ordered `clear()`, which would leave stale bytes in front of the
+    /// row AND inflate `buf.len()` — i.e. corrupt both the payload and the
+    /// u32-LE framing length. A DIRTY buffer must produce exactly what a fresh
+    /// one does, byte-for-byte and length-for-length, for every shape.
+    #[test]
+    fn encode_order_row_into_is_dirty_buffer_proof() {
+        // Junk shapes: shorter than a row, exactly a row, far longer than a
+        // row, and a buffer with a big spare capacity but zero length.
+        let junks: [Vec<u8>; 5] = [
+            vec![],
+            vec![0xFF; 3],
+            vec![0x5A; 120],
+            vec![0xA5; 4096],
+            Vec::with_capacity(8192),
+        ];
+        for (seq, o) in shape_spread() {
+            let fresh = OrderBook::encode_order_row_parts(seq, &o);
+            for junk in &junks {
+                let mut dirty = junk.clone();
+                OrderBook::encode_order_row_into(&mut dirty, seq, &o);
+                assert_eq!(dirty.len(), fresh.len(), "framing length drift on dirty buf");
+                assert_eq!(dirty, fresh, "byte drift on dirty buf (seq={seq})");
+            }
+            // Reuse ACROSS orders (the actual hot-path pattern): the buffer
+            // still holds the previous, possibly longer, row.
+            let mut reused = Vec::new();
+            for (seq2, o2) in shape_spread() {
+                OrderBook::encode_order_row_into(&mut reused, seq2, &o2);
+            }
+            OrderBook::encode_order_row_into(&mut reused, seq, &o);
+            assert_eq!(reused, fresh, "byte drift on cross-order reuse");
+        }
     }
 }
