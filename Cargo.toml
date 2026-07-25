@@ -53,7 +53,30 @@ hotstuff_rs = { path = "crates/hotstuff_rs" }
 revm = { version = "36", features = ["optional_no_base_fee"] }
 
 # Ethereum types (alloy)
-alloy-primitives = { version = "1.5", features = ["serde"] }
+# `asm-keccak`: routes `alloy_primitives::keccak256` (and the streaming
+# `alloy_primitives::Keccak256`) through the cryptogams assembly backend
+# (`keccak-asm` → `sha3-asm`) instead of the pure-Rust `sha3` core. Keccak-256
+# is ONE mathematical function — this swaps the implementation, never a
+# preimage, so every committed digest (state root, level_hash, tx hash) is
+# byte-identical. Pinned against known-good vectors in
+# `crates/torus-core/tests/keccak_backend_vectors.rs`.
+# Measured on the 18c box: keccak 206 → 248 MB/s (1.20x); end-to-end level-hash
+# 630 → 481 ns/frame (1.31x). It speeds up EVERY keccak in the system,
+# including the native-trie `root_seconds`. Declared here so feature
+# unification carries it into every member crate — verify with
+# `cargo tree -p torus-node -i keccak-asm`.
+#
+# BUILD PREREQS (new): `sha3-asm`'s build script generates the assembly with
+# `perl` (cryptogams perlasm) and compiles it with the `cc` crate, so a perl
+# interpreter and a C compiler must be on PATH. Both are present on
+# `ubuntu-latest` CI runners and in the documented Linux build environment
+# (see README "Prerequisites").
+# PORTABILITY: `sha3-asm/build.rs` supports arm, aarch64, x86 (requires MMX),
+# x86_64, mips, powerpc, riscv and s390x, and PANICS with "unsupported target
+# arch" on anything else — notably wasm32. This workspace builds native targets
+# only (CI: ubuntu-latest x86_64; no wasm or cross jobs). Adding a wasm target
+# would require making this feature target-conditional.
+alloy-primitives = { version = "1.5", features = ["serde", "asm-keccak"] }
 alloy-consensus = "1.8"
 alloy-eips = "1.8"
 alloy-rlp = "0.3"

@@ -8,6 +8,14 @@ High-performance EVM-compatible blockchain with HotStuff BFT consensus. Sub-100m
 
 - Rust 1.82+
 - Linux (Ubuntu 22.04+ recommended)
+- A C/C++ toolchain (`build-essential` / `clang`) and **`perl`** — the workspace
+  enables `alloy-primitives/asm-keccak`, whose `sha3-asm` build script generates
+  the Keccak assembly with perl (cryptogams perlasm) and compiles it with `cc`.
+  Both are preinstalled on `ubuntu-latest` CI runners.
+  Supported build architectures: `x86_64`, `aarch64`, `arm`, `x86` (needs MMX),
+  `mips`, `powerpc`, `riscv`, `s390x`. Other targets (notably `wasm32`) fail at
+  build time with `unsupported target arch`; a wasm build would first have to
+  make that feature target-conditional in the root `Cargo.toml`.
 
 ### Build
 
