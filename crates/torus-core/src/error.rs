@@ -98,6 +98,14 @@ pub enum CoreError {
     #[error("missing column family: {0}")]
     MissingCf(&'static str),
 
+    /// The persisted order-book layout could not be decoded (wrong / mixed /
+    /// corrupt row layout, missing meta row, stale node-local order store).
+    /// Readers MUST surface this instead of reporting an empty book — a
+    /// silently empty book is indistinguishable from "no orders" and has
+    /// already shipped one production bug.
+    #[error("order-book layout error: {0}")]
+    BookLayout(String),
+
     // FIX ECON-FIND-20: Stale oracle fallback price
     #[error("stale oracle price for market {0}")]
     StaleOraclePrice(MarketId),

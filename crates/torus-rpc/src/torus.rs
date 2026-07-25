@@ -10,6 +10,7 @@ use jsonrpsee::types::ErrorObjectOwned;
 use jsonrpsee::PendingSubscriptionSink;
 use rocksdb::IteratorMode;
 
+use torus_core::book_reader::{self, BookLayout};
 use torus_core::oracle::{OracleConfig, OracleManager};
 use torus_core::order_book::OrderBook;
 use torus_core::position::PositionManager;
@@ -684,6 +685,33 @@ fn decode_order_book_levels(
     Ok((to_levels(&snapshot.bids), to_levels(&snapshot.asks)))
 }
 
+/// Row-layout depth (`TORUS_BOOK_ROWS=1/2`) in RPC shape. Mode 2 is served
+/// from the ROOT-CF level rows; mode 1 aggregates the per-order rows.
+fn row_levels(levels: Vec<book_reader::DepthLevel>) -> Vec<RpcPriceLevel> {
+    levels
+        .into_iter()
+        .map(|l| RpcPriceLevel {
+            price: hex_fp(l.price),
+            quantity: hex_fp(l.quantity),
+            order_count: l.order_count,
+        })
+        .collect()
+}
+
+/// The layout actually on disk. Never derived from this process's env — an RPC
+/// node must serve whatever the DB holds.
+fn book_layout(state: &torus_state::StateDb) -> Result<BookLayout, ErrorObjectOwned> {
+    book_reader::detect_layout(state)
+        .map_err(|e| ErrorObjectOwned::from(RpcError::Internal(e.to_string())))
+}
+
+fn book_read_err(e: torus_core::error::CoreError) -> ErrorObjectOwned {
+    ErrorObjectOwned::from(RpcError::Internal(e.to_string()))
+}
+
+/// Response cap for `torus_getOpenOrders` (unchanged from the classic path).
+const OPEN_ORDERS_LIMIT: usize = 500;
+
 #[async_trait]
 impl TorusApiServer for RpcState {
     // === 2.9.1: Trading reads ===
@@ -692,12 +720,24 @@ impl TorusApiServer for RpcState {
         let mid = parse_u64(&market_id).map_err(ErrorObjectOwned::from)?;
         let key = mid.to_be_bytes();
 
-        let (bids, asks) = match self.state.get_cf_raw(CF_NATIVE_ORDER_BOOKS, &key) {
-            Ok(Some(data)) => decode_order_book_levels(&data)
-                .map_err(RpcError::Internal)
-                .map_err(ErrorObjectOwned::from)?,
-            Ok(None) => (vec![], vec![]),
-            Err(e) => return Err(RpcError::State(e).into()),
+        // The book CF holds one of three layouts (classic blob / order rows /
+        // level rows). Reading the classic key only — which is what this
+        // handler used to do — silently returns an EMPTY book on a mode-1/2
+        // node. Serve what is on disk, and error rather than fake an empty
+        // book when the layout cannot be decoded.
+        let layout = book_layout(&self.state)?;
+        let (bids, asks) = if layout.is_rows() {
+            let depth =
+                book_reader::read_book_depth(&self.state, mid, layout).map_err(book_read_err)?;
+            (row_levels(depth.bids), row_levels(depth.asks))
+        } else {
+            match self.state.get_cf_raw(CF_NATIVE_ORDER_BOOKS, &key) {
+                Ok(Some(data)) => decode_order_book_levels(&data)
+                    .map_err(RpcError::Internal)
+                    .map_err(ErrorObjectOwned::from)?,
+                Ok(None) => (vec![], vec![]),
+                Err(e) => return Err(RpcError::State(e).into()),
+            }
         };
 
         Ok(RpcOrderBook {
@@ -1430,6 +1470,31 @@ impl TorusApiServer for RpcState {
     ) -> RpcResult<Vec<RpcOpenOrder>> {
         let trader_addr = parse_address(&trader).map_err(ErrorObjectOwned::from)?;
 
+        // Row layouts: orders live in tagged rows (mode 1: root CF; mode 2:
+        // the node-local order store). The classic branches below key on an
+        // 8-byte market key, so on a mode-1/2 node the all-markets branch's
+        // `key.len() != 8` filter matched NOTHING and this endpoint always
+        // returned `[]`.
+        let layout = book_layout(&self.state)?;
+        if layout.is_rows() {
+            let market = match market_id {
+                Some(ref s) => Some(parse_u64(s).map_err(ErrorObjectOwned::from)?),
+                None => None,
+            };
+            let rows = book_reader::read_open_orders(
+                &self.state,
+                &trader_addr,
+                market,
+                layout,
+                OPEN_ORDERS_LIMIT,
+            )
+            .map_err(book_read_err)?;
+            return Ok(rows
+                .iter()
+                .map(|(mid, order)| order_to_rpc(order, *mid))
+                .collect());
+        }
+
         let db = self.state.inner();
         let cf = match db.cf_handle(CF_NATIVE_ORDER_BOOKS) {
             Some(cf) => cf,
@@ -1544,16 +1609,26 @@ impl TorusApiServer for RpcState {
             Err(_) => (FixedPoint::ZERO, FixedPoint::ZERO, 0),
         };
 
-        // Last trade price from the order book
-        let last_trade_price = match self
-            .state
-            .get_cf_raw(CF_NATIVE_ORDER_BOOKS, &mid.to_be_bytes())
-        {
-            Ok(Some(data)) => OrderBook::try_from_slice(&data)
-                .ok()
-                .and_then(|book| book.last_trade_price())
-                .unwrap_or(FixedPoint::ZERO),
-            _ => FixedPoint::ZERO,
+        // Last trade price from the order book. Under the row layouts it lives
+        // in the meta row's `ltp_tag` / `ltp_raw` suffix — reading only the
+        // classic blob key reported 0 for every traded market on a mode-1/2
+        // node.
+        let layout = book_layout(&self.state)?;
+        let last_trade_price = if layout.is_rows() {
+            book_reader::read_last_trade_price(&self.state, mid, layout)
+                .map_err(book_read_err)?
+                .unwrap_or(FixedPoint::ZERO)
+        } else {
+            match self
+                .state
+                .get_cf_raw(CF_NATIVE_ORDER_BOOKS, &mid.to_be_bytes())
+            {
+                Ok(Some(data)) => OrderBook::try_from_slice(&data)
+                    .ok()
+                    .and_then(|book| book.last_trade_price())
+                    .unwrap_or(FixedPoint::ZERO),
+                _ => FixedPoint::ZERO,
+            }
         };
 
         Ok(RpcMarkPrice {

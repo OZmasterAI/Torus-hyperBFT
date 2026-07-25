@@ -7189,6 +7189,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "torus-bridge",
  "torus-core",
  "torus-economics",
  "torus-evm",

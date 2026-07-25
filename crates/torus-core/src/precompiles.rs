@@ -346,42 +346,72 @@ fn order_book_reader(input: &[u8], state_db: &impl StateBackend) -> Result<Vec<u
     }
 }
 
+/// `(price, quantity)` per aggregated price level, best-first.
+type PriceQtyLevels = Vec<(FixedPoint, FixedPoint)>;
+
 /// getOrderBook → (uint128[] bid_prices, uint128[] bid_qtys, uint128[] ask_prices, uint128[] ask_qtys)
+///
+/// EVM-VISIBLE / CONSENSUS-RELEVANT. Layout handling is deliberately
+/// asymmetric:
+///
+/// * **Row layouts (`TORUS_BOOK_ROWS` 1 / 2)** — this reader used to look only
+///   for the classic 8-byte key, find nothing, and hand contracts an EMPTY
+///   book. It now serves the real depth (mode 2 straight from the ROOT-CF
+///   level rows, i.e. the consensus aggregate). Those layouts require a fresh
+///   genesis, so no already-deployed chain observes a change here.
+/// * **Classic** — UNCHANGED on purpose. It still decodes only the legacy
+///   `OrderBookSnapshot`, so a production whole-book blob still makes this
+///   precompile revert. Changing that alters EVM-visible output for an
+///   already-deployed layout: a consensus decision, not a refactor. Pinned by
+///   `torus-bridge/tests/book_read_modes_tests.rs::
+///   classic_precompile_behaviour_is_unchanged`.
+///
+/// GAS: `precompile_gas(0x0800)` is FLAT (`GAS_PRECOMPILE_READ`) while the
+/// returned level count is unbounded — see the top-N + metered-gas work on
+/// `feat/precompile-0800-topn-gas`. That bound must land before mode 1/2
+/// chains expose this selector to untrusted EVM traffic.
 fn read_order_book(
     state_db: &impl StateBackend,
     market_id: MarketId,
 ) -> Result<Vec<u8>, CoreError> {
-    let key = market_id.to_be_bytes();
-    let snapshot = match state_db.get_cf_raw(CF_NATIVE_ORDER_BOOKS, &key)? {
-        Some(data) => {
-            OrderBookSnapshot::try_from_slice(&data).map_err(|e| CoreError::Borsh(e.to_string()))?
-        }
-        None => OrderBookSnapshot {
-            bids: vec![],
-            asks: vec![],
-        },
-    };
+    // (price, quantity) per level, best-first — the shape both arms feed.
+    let (bids, asks): (PriceQtyLevels, PriceQtyLevels) =
+        match crate::book_reader::detect_layout(state_db)? {
+            layout if layout.is_rows() => {
+                let depth = crate::book_reader::read_book_depth(state_db, market_id, layout)?;
+                let pairs = |levels: Vec<crate::book_reader::DepthLevel>| {
+                    levels
+                        .into_iter()
+                        .map(|l| (l.price, l.quantity))
+                        .collect::<Vec<_>>()
+                };
+                (pairs(depth.bids), pairs(depth.asks))
+            }
+            _ => {
+                // Classic arm — the pre-existing behaviour, untouched.
+                let key = market_id.to_be_bytes();
+                let snapshot = match state_db.get_cf_raw(CF_NATIVE_ORDER_BOOKS, &key)? {
+                    Some(data) => OrderBookSnapshot::try_from_slice(&data)
+                        .map_err(|e| CoreError::Borsh(e.to_string()))?,
+                    None => OrderBookSnapshot {
+                        bids: vec![],
+                        asks: vec![],
+                    },
+                };
+                let pairs = |levels: &[PriceLevel]| {
+                    levels
+                        .iter()
+                        .map(|l| (l.price, l.quantity))
+                        .collect::<Vec<_>>()
+                };
+                (pairs(&snapshot.bids), pairs(&snapshot.asks))
+            }
+        };
 
-    let bid_prices: Vec<[u8; 32]> = snapshot
-        .bids
-        .iter()
-        .map(|l| abi::encode_fp_as_u128(l.price))
-        .collect();
-    let bid_qtys: Vec<[u8; 32]> = snapshot
-        .bids
-        .iter()
-        .map(|l| abi::encode_fp_as_u128(l.quantity))
-        .collect();
-    let ask_prices: Vec<[u8; 32]> = snapshot
-        .asks
-        .iter()
-        .map(|l| abi::encode_fp_as_u128(l.price))
-        .collect();
-    let ask_qtys: Vec<[u8; 32]> = snapshot
-        .asks
-        .iter()
-        .map(|l| abi::encode_fp_as_u128(l.quantity))
-        .collect();
+    let bid_prices: Vec<[u8; 32]> = bids.iter().map(|l| abi::encode_fp_as_u128(l.0)).collect();
+    let bid_qtys: Vec<[u8; 32]> = bids.iter().map(|l| abi::encode_fp_as_u128(l.1)).collect();
+    let ask_prices: Vec<[u8; 32]> = asks.iter().map(|l| abi::encode_fp_as_u128(l.0)).collect();
+    let ask_qtys: Vec<[u8; 32]> = asks.iter().map(|l| abi::encode_fp_as_u128(l.1)).collect();
 
     Ok(abi::encode_arrays_response(&[
         &bid_prices,
@@ -1335,13 +1365,39 @@ impl BorshDeserialize for StoredOrder {
     }
 }
 
-/// Write an order book snapshot to CF_NATIVE_ORDER_BOOKS.
-/// Used by the bridge layer to populate precompile-readable state.
+/// Write a legacy order-book snapshot to CF_NATIVE_ORDER_BOOKS under the
+/// CLASSIC 8-byte market key.
+///
+/// # DANGER — test scaffolding only
+///
+/// This has NO production caller (only `torus-core/tests/precompile_tests.rs`
+/// and the `torus-rpc` in-crate tests). `cf_native_order_books` is one of the
+/// `NATIVE_ROOT_CFS`, and under `TORUS_BOOK_ROWS=1/2` an 8-byte classic key in
+/// that CF is exactly the artifact the executor's loaders treat as a FATAL
+/// wrong-layout signal — a single call against a mode-1/2 DB poisons the CF
+/// and the node fail-stops at every subsequent boot, permanently.
+///
+/// It is therefore GUARDED: the write is refused unless the DB's observed
+/// layout is Classic. (A hard `#[cfg(test)]` gate was rejected because both
+/// existing callers are integration tests in OTHER crates, which do not see
+/// `cfg(test)` of this crate; the runtime guard protects production DBs
+/// without a feature-flag dance.)
 pub fn write_order_book_snapshot(
     state_db: &StateDb,
     market_id: MarketId,
     snapshot: &OrderBookSnapshot,
 ) -> Result<(), CoreError> {
+    match crate::book_reader::detect_layout(state_db)? {
+        crate::book_reader::BookLayout::Classic => {}
+        layout => {
+            return Err(CoreError::BookLayout(format!(
+                "write_order_book_snapshot is classic-layout-only test scaffolding, but \
+                 this DB is written in {} — refusing to poison cf_native_order_books \
+                 (an 8-byte key there is a permanent boot fail-stop under row layouts)",
+                layout.describe()
+            )))
+        }
+    }
     let key = market_id.to_be_bytes();
     let data = borsh::to_vec(snapshot).map_err(|e| CoreError::Borsh(e.to_string()))?;
     state_db.put_cf_raw(CF_NATIVE_ORDER_BOOKS, &key, &data)?;

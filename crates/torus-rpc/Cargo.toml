@@ -34,3 +34,7 @@ tempfile = { workspace = true }
 revm = { workspace = true }
 k256 = { workspace = true }
 sha3 = { workspace = true }
+# Read-path tests seed the book CFs with the REAL executor save path so the
+# fixtures cannot drift from the writer. Dev-only: torus-bridge does not depend
+# on torus-rpc, so this adds no cycle to the production graph.
+torus-bridge = { workspace = true }

@@ -1,5 +1,6 @@
 //! Native execution engine: order book CLOB, margin engine, liquidations.
 
+pub mod book_reader;
 pub mod book_rows;
 pub mod error;
 pub mod liquidation;

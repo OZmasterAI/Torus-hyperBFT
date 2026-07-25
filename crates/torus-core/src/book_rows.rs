@@ -129,6 +129,82 @@ pub fn level_row_key(market_id: MarketId, side: Side, price: FixedPoint) -> [u8;
     level_row_key_tagged(market_id, side_tag(side), price.raw())
 }
 
+/// Minimum meta-row length: `next_seq(8) ‖ tick(16) ‖ lot(16) ‖ next_id(16) ‖
+/// ltp_tag(1)`, plus `ltp_raw(16)` when the tag is 1.
+pub const META_ROW_MIN_LEN: usize = 8 + 16 + 16 + 16 + 1;
+
+/// Parsed meta row — the per-market header every row layout (modes 1 and 2)
+/// carries instead of the classic whole-book blob's header fields.
+///
+/// Single source of truth for the meta-row VALUE codec: the executor's save
+/// path and every read path (RPC, precompiles) encode/decode through here, so
+/// a reader can never drift from the writer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BookMetaRow {
+    /// The book's monotonic queue-seq allocator.
+    pub next_seq: u64,
+    pub tick_size: FixedPoint,
+    pub lot_size: FixedPoint,
+    /// The book's per-market next order id.
+    pub next_id: u128,
+    pub last_trade_price: Option<FixedPoint>,
+}
+
+impl BookMetaRow {
+    /// Encode the meta-row value (frozen layout — see the module header).
+    pub fn encode(&self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(META_ROW_MIN_LEN + 16);
+        v.extend_from_slice(&self.next_seq.to_be_bytes());
+        v.extend_from_slice(&self.tick_size.raw().to_be_bytes());
+        v.extend_from_slice(&self.lot_size.raw().to_be_bytes());
+        v.extend_from_slice(&self.next_id.to_be_bytes());
+        match self.last_trade_price {
+            None => v.push(0),
+            Some(p) => {
+                v.push(1);
+                v.extend_from_slice(&p.raw().to_be_bytes());
+            }
+        }
+        v
+    }
+
+    /// Strict decode of a meta-row value (exact length for the ltp tag).
+    pub fn decode(v: &[u8]) -> Result<Self, String> {
+        let need = |ok: bool| {
+            if ok {
+                Ok(())
+            } else {
+                Err("book meta row truncated".to_string())
+            }
+        };
+        need(v.len() >= META_ROW_MIN_LEN)?;
+        let next_seq = u64::from_be_bytes(v[0..8].try_into().unwrap());
+        let tick = i128::from_be_bytes(v[8..24].try_into().unwrap());
+        let lot = i128::from_be_bytes(v[24..40].try_into().unwrap());
+        let next_id = u128::from_be_bytes(v[40..56].try_into().unwrap());
+        let last_trade_price = match v[56] {
+            0 => {
+                need(v.len() == META_ROW_MIN_LEN)?;
+                None
+            }
+            1 => {
+                need(v.len() == META_ROW_MIN_LEN + 16)?;
+                Some(FixedPoint::from_raw(i128::from_be_bytes(
+                    v[57..73].try_into().unwrap(),
+                )))
+            }
+            _ => return Err("book meta row: bad ltp tag".to_string()),
+        };
+        Ok(Self {
+            next_seq,
+            tick_size: FixedPoint::from_raw(tick),
+            lot_size: FixedPoint::from_raw(lot),
+            next_id,
+            last_trade_price,
+        })
+    }
+}
+
 /// One price level's consensus aggregate — the level-row VALUE parts.
 ///
 /// `level_hash` is the order-identity commitment:
@@ -216,6 +292,40 @@ mod tests {
         let mut long = enc.to_vec();
         long.push(0);
         assert!(LevelRowData::decode(&long).is_err());
+    }
+
+    #[test]
+    fn meta_row_roundtrip_and_strict_length() {
+        for ltp in [None, Some(FixedPoint::from_raw(-7)), Some(FixedPoint::from_raw(9_000))] {
+            let m = BookMetaRow {
+                next_seq: 42,
+                tick_size: FixedPoint::from_raw(1),
+                lot_size: FixedPoint::from_raw(2),
+                next_id: u128::MAX - 3,
+                last_trade_price: ltp,
+            };
+            let enc = m.encode();
+            assert_eq!(
+                enc.len(),
+                META_ROW_MIN_LEN + if ltp.is_some() { 16 } else { 0 }
+            );
+            assert_eq!(BookMetaRow::decode(&enc).unwrap(), m);
+            assert!(BookMetaRow::decode(&enc[..enc.len() - 1]).is_err());
+            let mut long = enc.clone();
+            long.push(0);
+            assert!(BookMetaRow::decode(&long).is_err());
+        }
+        // Bad ltp tag.
+        let mut bad = BookMetaRow {
+            next_seq: 0,
+            tick_size: FixedPoint::from_raw(1),
+            lot_size: FixedPoint::from_raw(1),
+            next_id: 1,
+            last_trade_price: None,
+        }
+        .encode();
+        bad[56] = 2;
+        assert!(BookMetaRow::decode(&bad).is_err());
     }
 
     #[test]

@@ -610,60 +610,26 @@ use torus_core::book_rows::{
     ROW_TAG_LEVEL, ROW_TAG_META, ROW_TAG_ORDER, ROW_TAG_STOP,
 };
 
+/// Parsed meta row — the codec itself lives in `torus_core::book_rows` so the
+/// save path here and every READ path (RPC, precompiles) share one source of
+/// truth for these bytes.
+type BookMeta = torus_core::book_rows::BookMetaRow;
+
 /// Meta row value — layout unchanged from C4 (`next_seq` now sourced from the
 /// book's own allocator, journal-in-book).
 fn book_meta_value(book: &OrderBook) -> Vec<u8> {
-    let mut v = Vec::with_capacity(8 + 16 + 16 + 16 + 1 + 16);
-    v.extend_from_slice(&book.next_seq().to_be_bytes());
-    v.extend_from_slice(&book.tick_size.raw().to_be_bytes());
-    v.extend_from_slice(&book.lot_size.raw().to_be_bytes());
-    v.extend_from_slice(&book.next_order_id().to_be_bytes());
-    match book.last_trade_price() {
-        None => v.push(0),
-        Some(p) => {
-            v.push(1);
-            v.extend_from_slice(&p.raw().to_be_bytes());
-        }
+    BookMeta {
+        next_seq: book.next_seq(),
+        tick_size: book.tick_size,
+        lot_size: book.lot_size,
+        next_id: book.next_order_id(),
+        last_trade_price: book.last_trade_price(),
     }
-    v
-}
-
-/// Parsed meta row.
-struct BookMeta {
-    next_seq: u64,
-    tick_size: FixedPoint,
-    lot_size: FixedPoint,
-    next_id: u128,
-    last_trade_price: Option<FixedPoint>,
+    .encode()
 }
 
 fn parse_book_meta(v: &[u8]) -> Result<BookMeta, String> {
-    let need = |ok: bool| if ok { Ok(()) } else { Err("book meta row truncated".to_string()) };
-    need(v.len() >= 8 + 16 + 16 + 16 + 1)?;
-    let next_seq = u64::from_be_bytes(v[0..8].try_into().unwrap());
-    let tick = i128::from_be_bytes(v[8..24].try_into().unwrap());
-    let lot = i128::from_be_bytes(v[24..40].try_into().unwrap());
-    let next_id = u128::from_be_bytes(v[40..56].try_into().unwrap());
-    let last_trade_price = match v[56] {
-        0 => {
-            need(v.len() == 57)?;
-            None
-        }
-        1 => {
-            need(v.len() == 57 + 16)?;
-            Some(FixedPoint::from_raw(i128::from_be_bytes(
-                v[57..73].try_into().unwrap(),
-            )))
-        }
-        _ => return Err("book meta row: bad ltp tag".to_string()),
-    };
-    Ok(BookMeta {
-        next_seq,
-        tick_size: FixedPoint::from_raw(tick),
-        lot_size: FixedPoint::from_raw(lot),
-        next_id,
-        last_trade_price,
-    })
+    BookMeta::decode(v)
 }
 
 fn parse_book_order_row(v: &[u8]) -> Result<(u64, torus_core::order_book::Order), String> {
