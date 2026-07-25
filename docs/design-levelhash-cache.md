@@ -1,7 +1,11 @@
 # L3 — Incremental level-hash sponge cache (`TORUS_LEVEL_HASH_CACHE`)
 
-Branch `perf/l3-levelhash-cache`, base `perf/l3-savebooks` @ 7d729b9. Node-local,
-env-gated, **default OFF = exact-today**. The consensus commitment is FROZEN
+Branch `perf/l3-levelhash-cache`, base `perf/l3-savebooks` @ 7d729b9. Node-local
+and env-gated. **Default: ON at 256 MB** (`DEFAULT_LEVEL_HASH_CACHE_MB`,
+`native_executor.rs`) — the budget the in-vivo A/B actually ran;
+`TORUS_LEVEL_HASH_CACHE=0` is the explicit opt-out back to exact-today. It
+shipped default-OFF originally and was flipped once §5.3's A/B and the
+byte-identity matrix had both landed. The consensus commitment is FROZEN
 (`docs/design-level-rows-authority.md` §1.3): mode-2 `level_hash =
 keccak256(for each order front→back: row_len(u32 LE) ‖ seq(8 BE) ‖ borsh(Order))`.
 Nothing here changes those bytes — the cache changes only *how* the identical
@@ -16,6 +20,16 @@ O(orders-at-level) per touch. At resting-heavy load ~99 % of orders *rest*
 (appends at the FIFO tail); matches consume the *front*. The deep, expensive
 levels are exactly the append-mostly ones — the cacheable case is the dominant
 case.
+
+**Scope of the win — what this cache CANNOT do.** It helps append-heavy,
+low-churn levels only. It can never help a MATCH-touched level:
+`OrderBook::match_at_level` bumps that level's `level_epoch` unconditionally at
+loop entry, on every taker touch, which forces the MISS arm (§1.3) — a plain
+one-shot rehash, still O(depth), plus one probe insert. That is by construction,
+not a tuning gap: keccak absorbs front→back and a match pops the FRONT, so no
+prefix survives. The residual `save_books` time in the in-vivo A/B below (37 ms,
+down from 83) is exactly this class. Bounding it needs a commitment change
+(chunked/Merkle level hashing — consensus-visible, out of scope here).
 
 ## 0. The mechanism
 
@@ -112,9 +126,21 @@ A naïve miss path re-seeds the sponge on *every* miss: it runs a full **streami
 `sha3::Keccak256` absorb and stores the un-finalized state. On a level that
 invalidates every save (all-churn worst case) that is pure overhead — the entry
 is never reused, and the streaming absorb + hasher clone is measurably slower
-than the frozen one-shot path, whose `alloy_primitives::keccak256` is asm-backed
-(keccak-asm) and never builds a resumable state. The round-1 DEBUG µbench showed
-this as a +15–30 % worst-case regression against the parity target.
+than the frozen one-shot path, whose `alloy_primitives::keccak256` never builds
+a resumable state. The round-1 DEBUG µbench showed this as a +15–30 % worst-case
+regression against the parity target.
+
+> **Correction (s450).** Earlier revisions of this section and of the MISS arm
+> below asserted that the one-shot path was "asm-backed (keccak-asm)". That was
+> FALSE for every build up to that point: the workspace never enabled
+> `alloy-primitives/asm-keccak`, so `alloy_primitives::keccak256` compiled down
+> to the pure-Rust `sha3` core, and `cargo tree -p torus-node -i keccak-asm`
+> printed "nothing to print". The feature is now enabled workspace-wide in the
+> root `Cargo.toml`, so the claim is true as of that change — verify it for any
+> given build with that same `cargo tree` command rather than trusting this
+> paragraph. The staged-seeding argument above never depended on the backend:
+> the one-shot path wins the all-churn case because it does not build a
+> resumable state, whichever Keccak implementation is compiled in.
 
 The fix stages the sponge investment. A level's cache slot is now one of two
 states:
@@ -127,8 +153,8 @@ states:
 The cached path picks exactly one arm per save:
 
 - **MISS** (no slot, a `Probe`/`Seeded` whose epoch moved, or `N > len`): run the
-  frozen one-shot path VERBATIM (`level_row_data`) — same asm keccak, same bytes,
-  same cost as cache-off — and write a `Probe(epoch, N)`. No streaming absorb, no
+  frozen one-shot path VERBATIM (`level_row_data`) — same keccak backend, same
+  bytes, same cost as cache-off — and write a `Probe(epoch, N)`. No streaming absorb, no
   state clone. A level that invalidates every save therefore pays only the plain
   one-shot cost plus one `HashMap` insert.
 - **PROMOTE** (`Probe` present, epoch unchanged): the level survived one full
@@ -165,7 +191,7 @@ counting the PROMOTE investments.
   cache. Correctness never depends on cache contents; a dropped cache is only
   a cold start.
 - **Enablement**: `TORUS_LEVEL_HASH_CACHE` (MB, parsed once per process;
-  unset/`0`/invalid = OFF). The executor enables it ONLY in the
+  unset or unparseable = the 256 MB default, explicit `0` = OFF). The executor enables it ONLY in the
   `BookMode::LevelAuthority` (mode 2) save arm — one
   `ensure_level_hash_cache(per_book_budget)` per dirty book per save (no-op
   when already enabled); budget 0 actively drops any cache. Modes 0/1 never
@@ -173,9 +199,14 @@ counting the PROMOTE investments.
   untouched. Entries are created only at save time from the live queue, so a
   mid-run enable is safe: an entry is always a truthful snapshot at creation,
   and bumps are active from the moment the cache exists.
-- **Bounding**: global budget split evenly across live books; entry cost
+- **Bounding**: global budget split evenly across live books
+  (`level_hash_cache_bytes / order_books.len()`, `native_executor.rs`), so a
+  node with many markets gets a thinner slice per book — market count shrinks
+  the per-book budget, it never grows the total. Entry cost
   modeled at 512 B (keccak state ~200 B + block buffer ~136 B + metadata +
-  map overhead). LRU-approximate eviction: when a book's cache is full, the
+  map overhead), so the 256 MB default models ~524k cached levels across the
+  whole node, allocated only for books dirtied in a mode-2 save.
+  LRU-approximate eviction: when a book's cache is full, the
   least-recently-used quarter is evicted in one batch (rare, amortized
   cheap). Eviction is always safe — it is a cold start for that level.
 - **Deletes**: when a save observes an emptied level (delete op), its cache
@@ -197,16 +228,20 @@ counting the PROMOTE investments.
   P ‖ S would reach. No internal length caching or midstream padding exists
   in the sponge construction that could distinguish the two.
 - **Cross-implementation**: the frozen one-shot path (`level_row_data`) uses
-  `alloy_primitives::keccak256`, which (in this workspace's dependency graph)
-  is itself backed by the same Keccak-256 function (sha3/keccak-asm). Both
-  compute FIPS-202-draft Keccak-256 with the 0x01 domain padding — a single
-  mathematical function. This is enforced, not assumed: a unit test hashes
-  random inputs at random split points through the streaming `sha3::Keccak256`
-  and compares against `alloy_primitives::keccak256`; the cached path's frame
-  encoding is the SAME helper (`encode_order_row_parts` + u32-LE length
-  framing) the one-shot path uses, so the absorbed byte stream is identical
-  by construction.
-- **Fallback identity**: with the env unset (default), `take_level_ops` runs
+  `alloy_primitives::keccak256`, which since the workspace enabled
+  `alloy-primitives/asm-keccak` is the cryptogams assembly backend
+  (`keccak-asm` → `sha3-asm`) rather than the pure-Rust `sha3` core the cached
+  path streams. Both compute FIPS-202-draft Keccak-256 with the 0x01 domain
+  padding — a single mathematical function, two implementations. This is
+  enforced, not assumed, at two levels: `keccak_stream_clone_equivalence`
+  (`torus-core/src/order_book.rs`) hashes random inputs at random split points
+  through the streaming `sha3::Keccak256` and compares against
+  `alloy_primitives::keccak256`, and `keccak_backend_vectors.rs`
+  (`torus-core/tests/`) pins the compiled-in backend against fixed digests
+  across the 136-byte rate boundary. The cached path's frame encoding is the
+  SAME helper (`encode_order_row_parts` + u32-LE length framing) the one-shot
+  path uses, so the absorbed byte stream is identical by construction.
+- **Fallback identity**: with `TORUS_LEVEL_HASH_CACHE=0`, `take_level_ops` runs
   the pre-existing `level_row_data` code verbatim — not a re-implementation.
   Cache-on differs only in which correct algorithm computes the same digest.
 

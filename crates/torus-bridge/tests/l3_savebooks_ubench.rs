@@ -453,11 +453,15 @@ fn savebooks_read_probe() {
 #[test]
 fn level_hash_cache_stats_aggregates_across_books() {
     // Cache OFF (bytes = 0): stats fn returns None so the export site skips.
+    // Pinned EXPLICITLY — the process default is now ON
+    // (`DEFAULT_LEVEL_HASH_CACHE_MB` = 256), so this arm must opt out by hand
+    // instead of relying on the constructor's default.
     {
         let (_d, db) = open_db();
         let mut holder = ResidentBooks::default();
         let ov = NativeStateOverlay::new(db.clone());
         let mut ctx = make_ctx(ov.clone(), 1, &mut holder);
+        ctx.level_hash_cache_bytes = 0;
         fund(&ctx, &addr(1), fp(1_000_000_000_000));
         let mut batch = Vec::new();
         for m in 1..=N_MARKETS {

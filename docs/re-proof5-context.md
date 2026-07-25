@@ -71,7 +71,8 @@ to per-view CPU work. Findings:
   not deschedule inflation. The `level_hash` is the consensus-frozen state-root
   preimage, so an O(√depth) chunked/Merkle fix is consensus-visible (production debt).
 - **Level-hash sponge cache — built and proven in vivo.** `TORUS_LEVEL_HASH_CACHE`
-  (`design-levelhash-cache.md`) keeps each append-only level's un-finalized keccak
+  (`design-levelhash-cache.md`, now **default-ON at 256 MB** — the A/B's own budget;
+  `=0` opts out) keeps each append-only level's un-finalized keccak
   sponge state and absorbs only new tail frames → byte-identical digest in O(delta);
   any non-append op bumps a per-level epoch → full-rehash fallback; staged seeding
   (Probe→Promote→Hit) avoids re-seeding churning levels. A/B (`cacheab-18c-13bd833`):
@@ -93,7 +94,7 @@ plus genesis/env `TORUS_COMMIT_LAG_BACKOFF_CAP=8` (fleet-uniform) and
 |---|---|---|---|
 | `TORUS_BOOK_ROWS` | 0 (off) | **consensus-visible** (fresh genesis) | =2 selects level-rows-as-authority mode 2; state-root preimage |
 | `TORUS_COMMIT_LAG_BACKOFF_CAP` | fleet field | **consensus-visible** (fresh genesis) | =8 is the S470 wedge fix; qc−committed backoff |
-| `TORUS_LEVEL_HASH_CACHE` | unset/0 = OFF | node-local | level-hash sponge cache (MB budget); byte-identical |
+| `TORUS_LEVEL_HASH_CACHE` | **unset = ON @ 256 MB**; `0` = OFF | node-local | level-hash sponge cache (MB budget); byte-identical; only engages under `TORUS_BOOK_ROWS=2` |
 | `TORUS_PARALLEL_ENGINE` | OFF | node-local | sender-sharded Phase-2; determinism-proven; not the lever |
 | `TORUS_PARALLEL_VERIFY` | (verify already parallel) | node-local | control/test entrypoint over the banked win |
 | `TORUS_ASYNC_POST_FLUSH` | OFF | node-local | defers body_persist only; NEUTRAL in vivo |

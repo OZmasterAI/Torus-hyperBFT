@@ -581,12 +581,43 @@ fn parse_book_rows_mode(v: Option<String>) -> BookMode {
     }
 }
 
+/// Default `TORUS_LEVEL_HASH_CACHE` budget in whole MB, applied when the env
+/// var is unset or unparseable. `TORUS_LEVEL_HASH_CACHE=0` is the explicit
+/// opt-out (restores the exact-today one-shot rehash).
+///
+/// WHY 256: it is the value the only in-vivo A/B actually ran
+/// (`devnet/wsl/results/cacheab-18c-13bd833.md`, cap-400 bench-standard, 300 s
+/// @ rate 750, one binary, env unset vs `256`), so shipping it on by default
+/// ships the configuration that was measured rather than an extrapolation.
+///
+/// Memory: this is a GLOBAL ceiling, not a per-book one — `save_order_books`
+/// derives the per-book budget as `level_hash_cache_bytes / order_books.len()`,
+/// so a node with many markets gets a smaller slice per book, never more total
+/// RAM. Each book converts its slice to an entry cap at
+/// `torus_core::order_book::LEVEL_CACHE_ENTRY_COST` (512 B modelled per level:
+/// keccak state ~200 B + block buffer ~136 B + metadata), and only DIRTY books
+/// in the mode-2 save arm ever allocate one.
+///
+/// Blast radius: the cache engages ONLY under `BookMode::LevelAuthority`
+/// (`TORUS_BOOK_ROWS=2`). Classic and OrderRows nodes `discard_level_ops` and
+/// never reach the arm, so for them this default costs exactly zero bytes.
+const DEFAULT_LEVEL_HASH_CACHE_MB: usize = 256;
+
 /// L3 level-hash sponge cache budget (`TORUS_LEVEL_HASH_CACHE`, whole MB).
-/// Unset / `0` / invalid = DISABLED (exact-today one-shot rehash). NODE-LOCAL
-/// and byte-identical either way (docs/design-levelhash-cache.md): the cache
-/// only changes how the frozen mode-2 `level_hash` digest is computed in the
-/// tail-append case. Engages exclusively in the mode-2 save arm. Read once
-/// per process; tests override the ctx field directly.
+/// Unset / invalid = [`DEFAULT_LEVEL_HASH_CACHE_MB`] (ON); `0` = explicit
+/// opt-out, restoring the exact-today one-shot rehash. NODE-LOCAL and
+/// byte-identical either way (docs/design-levelhash-cache.md): the cache only
+/// changes how the frozen mode-2 `level_hash` digest is computed in the
+/// tail-append case — proven by `savebooks_levelcache_ab` and
+/// `levelhash_cache_differential_matrix_byte_identical`, which compare
+/// per-block book-CF bytes and state roots with the cache on vs off. Engages
+/// exclusively in the mode-2 save arm. Read once per process; tests override
+/// the ctx field directly.
+///
+/// SCOPE OF THE WIN (do not oversell): the win is on append-heavy / low-churn
+/// levels. It CANNOT help match-touched levels — `OrderBook::match_at_level`
+/// bumps `level_epoch` unconditionally on every taker touch, which forces the
+/// Miss arm (a plain one-shot rehash plus a cheap probe insert).
 fn level_hash_cache_env_bytes() -> usize {
     static BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *BYTES.get_or_init(|| {
@@ -596,12 +627,65 @@ fn level_hash_cache_env_bytes() -> usize {
 }
 
 /// Pure parse of the `TORUS_LEVEL_HASH_CACHE` value (MB; same trim rules as
-/// the sibling toggles).
+/// the sibling toggles). An explicit `0` disables; anything unparseable falls
+/// back to [`DEFAULT_LEVEL_HASH_CACHE_MB`], matching how `TORUS_BOOK_ROWS`
+/// treats garbage (fall back to the default, never to a third behaviour).
 fn parse_level_hash_cache_mb(v: Option<String>) -> usize {
     v.as_deref()
         .map(str::trim)
         .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(0)
+        .unwrap_or(DEFAULT_LEVEL_HASH_CACHE_MB)
+}
+
+#[cfg(test)]
+mod level_hash_cache_toggle_tests {
+    use super::{parse_level_hash_cache_mb, DEFAULT_LEVEL_HASH_CACHE_MB};
+
+    /// The shipped default is ON at the budget the in-vivo A/B measured
+    /// (`devnet/wsl/results/cacheab-18c-13bd833.md` ran `=256`). If this
+    /// constant is ever retuned, retune it against a fresh A/B, not by feel.
+    #[test]
+    fn default_budget_is_the_proven_256_mb() {
+        assert_eq!(DEFAULT_LEVEL_HASH_CACHE_MB, 256);
+    }
+
+    /// Unset env ⇒ the cache is ON at the default budget (previously 0/OFF).
+    #[test]
+    fn unset_is_default_on() {
+        let mb = parse_level_hash_cache_mb(None);
+        assert_eq!(mb, DEFAULT_LEVEL_HASH_CACHE_MB);
+        assert!(mb > 0, "default must be non-zero");
+    }
+
+    /// `TORUS_LEVEL_HASH_CACHE=0` remains the explicit opt-out — the ONLY way
+    /// back to the exact-today one-shot rehash.
+    #[test]
+    fn explicit_zero_still_disables() {
+        for v in ["0", " 0 ", "0\n", "\t0"] {
+            assert_eq!(parse_level_hash_cache_mb(Some(v.to_string())), 0, "{v:?}");
+        }
+    }
+
+    /// An explicit budget wins over the default, trimmed like the siblings.
+    #[test]
+    fn explicit_budget_is_honoured() {
+        assert_eq!(parse_level_hash_cache_mb(Some("1".to_string())), 1);
+        assert_eq!(parse_level_hash_cache_mb(Some(" 64 ".to_string())), 64);
+        assert_eq!(parse_level_hash_cache_mb(Some("512".to_string())), 512);
+    }
+
+    /// Garbage falls back to the default (same policy as `TORUS_BOOK_ROWS`),
+    /// never to a silent third behaviour.
+    #[test]
+    fn garbage_falls_back_to_default() {
+        for v in ["", "on", "true", "-1", "256MB", "1.5", "yes"] {
+            assert_eq!(
+                parse_level_hash_cache_mb(Some(v.to_string())),
+                DEFAULT_LEVEL_HASH_CACHE_MB,
+                "{v:?}"
+            );
+        }
+    }
 }
 
 // Frozen key layouts — single source of truth in torus-core.
@@ -847,7 +931,9 @@ pub struct NativeExecContext<T: StateBackend = StateDb> {
     /// rebuild from persisted state — first block, restart, or stale guard).
     resident_reused: bool,
     /// L3: level-hash sponge cache budget in BYTES for mode-2 saves
-    /// (`TORUS_LEVEL_HASH_CACHE` env, MB). 0 = disabled (exact-today).
+    /// (`TORUS_LEVEL_HASH_CACHE` env, MB; default
+    /// [`DEFAULT_LEVEL_HASH_CACHE_MB`] = ON). 0 = disabled (exact-today),
+    /// reachable only via an explicit `TORUS_LEVEL_HASH_CACHE=0`.
     /// Node-local, byte-identical output; tests may override per ctx.
     pub level_hash_cache_bytes: usize,
     /// L3 save-books attribution (µbench-only, feature `save-timings`): when
@@ -1708,8 +1794,11 @@ impl<T: StateBackend> NativeExecContext<T> {
             markets: dirty.len() as u32,
             ..SaveTimings::default()
         };
-        // L3: mode-2 level-hash sponge cache — global budget split across
-        // live books (docs/design-levelhash-cache.md §2). 0 = disabled.
+        // L3: mode-2 level-hash sponge cache — GLOBAL budget split across
+        // live books (docs/design-levelhash-cache.md §2), so more markets ⇒ a
+        // smaller slice each, never more total RAM. On by default
+        // (`DEFAULT_LEVEL_HASH_CACHE_MB`); 0 = explicit opt-out. Modes 0/1
+        // never reach this arm, so they pay nothing.
         let level_cache_per_book = if matches!(self.book_mode, BookMode::LevelAuthority)
             && self.level_hash_cache_bytes > 0
         {

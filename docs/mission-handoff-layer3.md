@@ -81,7 +81,9 @@ deliver. Pipeline-latency levers are EXHAUSTED. Layer 3 = cut replica per-view W
 - **LEVEL-HASH SPONGE CACHE: PROVEN AND MERGED (session close, 2026-07-21)** —
   incremental keccak absorb for tail-append-only levels, byte-identical commitment,
   staged seeding (probe → seed after one clean append-only interval → O(tail) hits),
-  TORUS_LEVEL_HASH_CACHE default-off, node-local. Design docs/design-levelhash-cache.md;
+  TORUS_LEVEL_HASH_CACHE node-local — shipped default-OFF, later flipped to
+  **default-ON at 256 MB** (the budget this very A/B ran); `=0` opts out.
+  Design docs/design-levelhash-cache.md;
   in-vivo A/B devnet/wsl/results/cacheab-18c-13bd833.md: **+45% blk/s (6.89→9.96),
   +81% matched/s (1,623→2,932), worst-60s 6.7× (0.672→4.500), view 134→97ms,
   save_books 83→37ms**; engine/flush −20-24% free from released CPU. Merged into
