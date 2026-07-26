@@ -22,6 +22,7 @@
 //! incremental root must equal it byte-for-byte, every block (the A2 gate). Both go through the same
 //! [`build_tree`] so they cannot diverge.
 
+use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
@@ -473,10 +474,15 @@ enum CfTarget {
 
 /// A pending write/delete to a native-trie CF, produced by the incremental update so it can be
 /// folded into any `WriteBatch` (atomically with the native-CF flush). `value == None` is a delete.
+///
+/// EVERY value written to either native-trie CF is exactly 32 bytes — a mirror row is
+/// `keccak(value)`, a trie row is a node hash, and the root marker is the root — so the payload is
+/// an inline [`B256`] rather than a heap `Vec<u8>` (s450: one fewer allocation per emitted op; the
+/// stored bytes are the same 32).
 struct NodeOp {
     target: CfTarget,
     key: Vec<u8>,
-    value: Option<Vec<u8>>,
+    value: Option<B256>,
 }
 
 /// Read a persisted tree node (leaf at `level == TREE_DEPTH`, else internal), or its level default.
@@ -513,14 +519,10 @@ fn read_node(
 /// Byte-identical output to the unbounded scan for any input — the `starts_with`
 /// guard still defines the members, the bound only prunes work outside the
 /// bucket. Node-local, value-neutral.
-#[allow(clippy::type_complexity)]
-fn read_bucket_members(
-    db: &StateDb,
-    bucket: u16,
-) -> Result<BTreeMap<(u8, Vec<u8>), Vec<u8>>, StateError> {
+fn read_bucket_members(db: &StateDb, bucket: u16) -> Result<Members, StateError> {
     let cf = db.cf_handle(CF_NATIVE_HASHED)?;
     let prefix = bucket.to_be_bytes();
-    let mut out = BTreeMap::new();
+    let mut out = Members::new();
     let mut ro = rocksdb::ReadOptions::default();
     // First key strictly after this bucket = (bucket+1) as 2 BE bytes. For the
     // last bucket (0xFFFF) there is no successor, so leave the scan unbounded
@@ -533,12 +535,22 @@ fn read_bucket_members(
     iter.seek(prefix);
     while iter.valid() {
         let (k, v) = match (iter.key(), iter.value()) {
-            (Some(k), Some(v)) if k.starts_with(&prefix) && k.len() >= 3 => {
-                (k.to_vec(), v.to_vec())
-            }
+            (Some(k), Some(v)) if k.starts_with(&prefix) && k.len() >= 3 => (k, v),
             _ => break,
         };
-        out.insert((k[2], k[3..].to_vec()), v);
+        // Hash-only mirror: every row is exactly 32 B by construction (both
+        // writers — `build_native_trie_to_cf` and `apply_native_dirty` — emit
+        // `keccak(value)`). A row of any other length is a corrupt / pre-hash-only
+        // mirror whose leaves cannot reproduce the consensus preimage anyway, so
+        // fail loudly instead of hashing garbage: trie maintenance aborts for the
+        // block (native CF writes still flush) rather than persisting a bad root.
+        if v.len() != 32 {
+            return Err(StateError::InvalidData(format!(
+                "CF_NATIVE_HASHED row for bucket {bucket} is {} B, expected a 32 B value hash",
+                v.len()
+            )));
+        }
+        out.insert((k[2], k[3..].to_vec()), B256::from_slice(v));
         iter.next();
     }
     iter.status()?;
@@ -577,8 +589,10 @@ fn read_bucket_members(
 // Composes with the trie cache and parallelism in every on/off combination.
 
 /// Decoded members of one bucket, in canonical `(cf_tag, key)` order. Values are
-/// the 32 B per-entry value hashes (hash-only mirror).
-pub(crate) type Members = BTreeMap<(u8, Vec<u8>), Vec<u8>>;
+/// the 32 B per-entry value hashes (hash-only mirror), held INLINE as [`B256`]
+/// (s450) rather than in a per-member heap `Vec<u8>`: same 32 bytes, one fewer
+/// allocation per member on every scan / merge / write-through.
+pub(crate) type Members = BTreeMap<(u8, Vec<u8>), B256>;
 
 /// Hard cap on `TORUS_PARALLEL_BUCKET_HASH` worker threads.
 const MAX_BUCKET_HASH_THREADS: usize = 64;
@@ -643,10 +657,12 @@ fn parse_member_cache_mb(v: Option<String>) -> usize {
 /// LRU budget, not exact.
 const MEMBER_ENTRY_OVERHEAD: usize = 48;
 
-/// Byte size of a member set for the LRU budget.
+/// Byte size of a member set for the LRU budget. Values are always 32 B value
+/// hashes, so the formula is unchanged from the `Vec<u8>`-valued `Members`
+/// (`v.len()` was always 32) — the LRU's eviction behaviour is identical.
 fn members_bytes(m: &Members) -> usize {
-    m.iter()
-        .map(|((_, k), v)| k.len() + v.len() + MEMBER_ENTRY_OVERHEAD)
+    m.keys()
+        .map(|(_, k)| k.len() + 32 + MEMBER_ENTRY_OVERHEAD)
         .sum()
 }
 
@@ -742,32 +758,53 @@ impl NativeMemberCache {
         Ok(())
     }
 
-    /// Resident-member lookup, marking the bucket most-recently-used. `None` on a
-    /// miss (or when disabled). The returned `Arc` is a cheap clone — workers
-    /// read it without touching the shared cache.
-    fn get(&mut self, bucket: u16) -> Option<Arc<Members>> {
+    /// Resident-member HANDOVER: remove the bucket's slot and hand its `Arc` to
+    /// the caller. `None` on a miss (or when disabled).
+    ///
+    /// s450: this used to LEND a second strong reference (`Arc::clone`), which
+    /// forced `process_bucket` to deep-clone the whole `BTreeMap` (~K/G members,
+    /// one allocation per member key) on every cache hit — the dominant per-dirty-
+    /// bucket cost as state grows. Handing the entry out instead leaves the `Arc`
+    /// uniquely owned, so the merge mutates the resident map IN PLACE with zero
+    /// copying. The set is handed back by [`Self::commit_finals`] once the batch is
+    /// durable — `apply_native_dirty` emits a `member_final` for EVERY bucket it
+    /// took, including buckets whose membership did not change.
+    ///
+    /// Safety of the removal: a missing entry can only cause a re-scan, never a
+    /// wrong answer, so every error path (which invalidates the whole cache
+    /// anyway) and any caller that forgets to commit degrade to correct-but-cold.
+    /// The `ensure_usable` root guard still authenticates whatever stays resident.
+    fn take(&mut self, bucket: u16) -> Option<(Arc<Members>, usize)> {
         let i = self.inner.as_mut()?;
-        let (members, old_seq) = {
-            let slot = i.map.get(&bucket)?;
-            (Arc::clone(&slot.members), slot.seq)
-        };
-        i.recency.remove(&old_seq);
-        i.clock += 1;
-        let new_seq = i.clock;
-        i.recency.insert(new_seq, bucket);
-        i.map.get_mut(&bucket).expect("slot present").seq = new_seq;
-        Some(members)
+        let slot = i.map.remove(&bucket)?;
+        i.recency.remove(&slot.seq);
+        i.total_bytes = i.total_bytes.saturating_sub(slot.bytes);
+        Some((slot.members, slot.bytes))
     }
 
     /// Write-through a committed block's per-bucket member sets and advance the
     /// image root, then evict LRU to the byte budget. MUST be called only after
     /// the batch carrying the same mirror ops is durable. Returns evictions done.
-    pub(crate) fn commit_finals(&mut self, finals: Vec<(u16, Members)>, root: B256) -> usize {
+    ///
+    /// Each final carries its own LRU byte size, computed by `process_bucket`
+    /// during a pass it was already making over the members (s450) — this used to
+    /// be a fourth full `Theta(members)` walk per dirty bucket via
+    /// [`members_bytes`]. The value is identical (debug-asserted against
+    /// `members_bytes` at the point of production).
+    pub(crate) fn commit_finals(
+        &mut self,
+        finals: Vec<(u16, Members, usize)>,
+        root: B256,
+    ) -> usize {
         let Some(i) = self.inner.as_mut() else {
             return 0;
         };
-        for (bucket, members) in finals {
-            let bytes = members_bytes(&members);
+        for (bucket, members, bytes) in finals {
+            debug_assert_eq!(
+                bytes,
+                members_bytes(&members),
+                "member-set byte size carried from process_bucket must equal members_bytes"
+            );
             if let Some(old) = i.map.remove(&bucket) {
                 i.total_bytes = i.total_bytes.saturating_sub(old.bytes);
                 i.recency.remove(&old.seq);
@@ -809,63 +846,90 @@ struct BucketOutcome {
     mirror_ops: Vec<NodeOp>,
     /// Whether this bucket paid a CF_NATIVE_HASHED prefix-scan (miss / no cache).
     scanned: bool,
-    /// Post-block member set to write through into the member cache (present iff
-    /// the member cache is enabled AND the bucket was scanned or changed).
-    member_final: Option<Members>,
+    /// Post-block member set to write through into the member cache, with its LRU
+    /// byte size (present iff the member cache is enabled).
+    member_final: Option<(Members, usize)>,
 }
+
+/// One dirty entry, BORROWED from the caller's dirty map: `(cf_tag, native key,
+/// Some(new value) | None = delete)`. s450: the grouping used to clone the key and
+/// value out of a map that had itself already cloned them out of the overlay.
+type DirtyRef<'d> = (u8, &'d [u8], Option<&'d [u8]>);
+
+/// One bucket's unit of work: its id, its (borrowed) dirty entries in canonical
+/// order, and the member set handed over by the cache on a hit (with the LRU byte
+/// size the cache had already computed for it).
+type BucketWork<'d> = (u16, Vec<DirtyRef<'d>>, Option<(Arc<Members>, usize)>);
 
 /// Pure per-bucket work (runs serially or on a worker thread): apply this
 /// block's edits to the bucket's members, emit mirror ops, and — when the
 /// membership actually changes (ALWAYS on the uncached `elide == false` path) —
 /// recompute the leaf hash. Output is identical whether the base members come
-/// from a member-cache hit (`base_hit`) or a fresh mirror scan.
+/// from a member-cache hit (`base`) or a fresh mirror scan.
 fn process_bucket(
     db: &StateDb,
     bucket: u16,
-    entries: &[((u8, Vec<u8>), Option<Vec<u8>>)],
-    base_hit: Option<&Arc<Members>>,
+    entries: &[DirtyRef<'_>],
+    base: Option<(Arc<Members>, usize)>,
     member_enabled: bool,
     elide: bool,
     defaults: &[B256; TREE_DEPTH + 1],
 ) -> Result<BucketOutcome, StateError> {
-    let scanned = base_hit.is_none();
-    let mut members: Members = match base_hit {
-        Some(arc) => (**arc).clone(),
+    let scanned = base.is_none();
+    // LRU byte size of the base set, when the cache handed one over — reusable
+    // verbatim if this block turns out to change nothing (s450).
+    let base_bytes = base.as_ref().map(|(_, b)| *b);
+    let mut members: Members = match base {
+        // The cache HANDS the slot over (`NativeMemberCache::take` removes it), so
+        // the strong count is 1 and `try_unwrap` moves the map out without copying
+        // a single member. The `unwrap_or_else` arm is the old deep clone, kept as
+        // a correctness fallback in case the `Arc` is ever shared again.
+        Some((arc, _)) => Arc::try_unwrap(arc).unwrap_or_else(|shared| (*shared).clone()),
         None => read_bucket_members(db, bucket)?,
     };
 
     let mut mirror_ops: Vec<NodeOp> = Vec::new();
     let mut bucket_changed = false;
-    for ((tag, key), val) in entries {
-        let mk = mirror_key(bucket, *tag, key);
+    // ONE reusable probe key: `BTreeMap<(u8, Vec<u8>), _>` lookups need an owned
+    // tuple, so refill this buffer per entry instead of allocating a fresh
+    // `key.clone()` for every get / remove (s450).
+    let mut probe: (u8, Vec<u8>) = (0, Vec::new());
+    for (tag, key, val) in entries {
+        probe.0 = *tag;
+        probe.1.clear();
+        probe.1.extend_from_slice(key);
         match val {
             Some(v) => {
                 // Hash-only mirror: members / mirror rows hold keccak(value); the
                 // clean-write elision compares stored hash == hash of the new value
                 // (identical semantics — a keccak collision is a broken world anyway).
                 let vh = keccak256(v);
-                if elide
-                    && members.get(&(*tag, key.clone())).map(|m| m.as_slice())
-                        == Some(vh.as_slice())
-                {
-                    continue; // clean rewrite — idempotent (cached path elides)
+                match members.get_mut(&probe) {
+                    Some(slot) => {
+                        if elide && *slot == vh {
+                            continue; // clean rewrite — idempotent (cached path elides)
+                        }
+                        *slot = vh; // in-place update: no key allocation
+                    }
+                    None => {
+                        members.insert((*tag, key.to_vec()), vh);
+                    }
                 }
-                members.insert((*tag, key.clone()), vh.as_slice().to_vec());
                 mirror_ops.push(NodeOp {
                     target: CfTarget::Mirror,
-                    key: mk,
-                    value: Some(vh.as_slice().to_vec()),
+                    key: mirror_key(bucket, *tag, key),
+                    value: Some(vh),
                 });
                 bucket_changed = true;
             }
             None => {
-                let was_present = members.remove(&(*tag, key.clone())).is_some();
+                let was_present = members.remove(&probe).is_some();
                 if elide && !was_present {
                     continue; // delete of absent — idempotent (cached path elides)
                 }
                 mirror_ops.push(NodeOp {
                     target: CfTarget::Mirror,
-                    key: mk,
+                    key: mirror_key(bucket, *tag, key),
                     value: None,
                 });
                 bucket_changed = true;
@@ -873,13 +937,18 @@ fn process_bucket(
         }
     }
 
+    // The leaf rebuild already walks every member, so the write-through's LRU byte
+    // size is accumulated here rather than in a separate `members_bytes` pass
+    // (s450) — same formula, same value (debug-asserted in `commit_finals`).
+    let mut leaf_bytes = 0usize;
     let leaf = if bucket_changed {
         if members.is_empty() {
             defaults[TREE_DEPTH]
         } else {
             let mut data = Vec::new();
             for ((tag, key), v) in &members {
-                frame_entry(&mut data, *tag, key, v);
+                frame_entry(&mut data, *tag, key, v.as_slice());
+                leaf_bytes += key.len() + 32 + MEMBER_ENTRY_OVERHEAD;
             }
             keccak256(&data)
         }
@@ -887,15 +956,21 @@ fn process_bucket(
         defaults[TREE_DEPTH] // unused when !bucket_changed
     };
 
-    // Write through when the member set is now authoritative for this bucket:
-    // a scan gives us the exact mirror contents (populate), and any real change
-    // gives us the new post-block set. An unchanged HIT needs no write (the
-    // cache already holds the identical set).
-    let member_final = if member_enabled && (scanned || bucket_changed) {
-        Some(members)
-    } else {
-        None
-    };
+    // Hand the member set back whenever the cache is enabled: either we scanned
+    // (the set is now authoritative — populate) or the cache HANDED US ITS SLOT
+    // and must get it back, including when nothing changed (s450: `take` removes,
+    // so an unchanged hit returning `None` here would silently drop a live
+    // bucket). Byte size: from the leaf walk if the bucket changed, else the size
+    // the cache already had (the set is untouched); a fresh scan whose entries all
+    // elided is the only case that still has to measure.
+    let member_final = member_enabled.then(|| {
+        let bytes = if bucket_changed {
+            leaf_bytes
+        } else {
+            base_bytes.unwrap_or_else(|| members_bytes(&members))
+        };
+        (members, bytes)
+    });
 
     Ok(BucketOutcome {
         changed: bucket_changed,
@@ -910,10 +985,9 @@ fn process_bucket(
 /// across `parallel` scoped worker threads — and collect into a bucket-ordered
 /// map (the deterministic merge key). Identical output regardless of thread
 /// count: leaf hashes are pure per-bucket functions and the fold is serial.
-#[allow(clippy::type_complexity)]
 fn run_buckets(
     db: &StateDb,
-    work: Vec<(u16, Vec<((u8, Vec<u8>), Option<Vec<u8>>)>, Option<Arc<Members>>)>,
+    mut work: Vec<BucketWork<'_>>,
     member_enabled: bool,
     elide: bool,
     defaults: &[B256; TREE_DEPTH + 1],
@@ -923,10 +997,13 @@ fn run_buckets(
     // L3 flush-pipe (a): serial unless parallelism is enabled AND the dirty-bucket
     // count exceeds the adaptive threshold. `min_buckets == 1` (default) is the
     // pre-existing `work.len() <= 1` gate. Output is byte-identical on either path.
+    //
+    // The cached member set is MOVED into `process_bucket` (`hit.take()`) rather
+    // than lent, so the merge can consume the `Arc` instead of deep-cloning it.
     if parallel <= 1 || work.len() <= min_buckets.max(1) {
         let mut out = BTreeMap::new();
-        for (b, entries, hit) in &work {
-            let o = process_bucket(db, *b, entries, hit.as_ref(), member_enabled, elide, defaults)?;
+        for (b, entries, hit) in &mut work {
+            let o = process_bucket(db, *b, entries, hit.take(), member_enabled, elide, defaults)?;
             out.insert(*b, o);
         }
         return Ok(out);
@@ -934,8 +1011,10 @@ fn run_buckets(
 
     let nthreads = parallel.min(work.len());
     let chunk_size = work.len().div_ceil(nthreads);
-    let chunks: Vec<&[(u16, Vec<((u8, Vec<u8>), Option<Vec<u8>>)>, Option<Arc<Members>>)]> =
-        work.chunks(chunk_size).collect();
+    // `chunks_mut` (was `chunks`) so each worker can MOVE its buckets' member
+    // sets out of its own disjoint slice; the chunks stay non-overlapping, so the
+    // partition and hence the per-bucket work is unchanged.
+    let chunks: Vec<&mut [BucketWork<'_>]> = work.chunks_mut(chunk_size).collect();
 
     // Contain worker panics so a bug in one worker fails the apply cleanly
     // (nothing is appended to the batch) instead of unwinding the exec thread.
@@ -945,12 +1024,12 @@ fn run_buckets(
             .map(|chunk| {
                 s.spawn(move || -> Result<Vec<(u16, BucketOutcome)>, StateError> {
                     let mut v = Vec::with_capacity(chunk.len());
-                    for (b, entries, hit) in chunk {
+                    for (b, entries, hit) in chunk.iter_mut() {
                         let o = process_bucket(
                             db,
                             *b,
                             entries,
-                            hit.as_ref(),
+                            hit.take(),
                             member_enabled,
                             elide,
                             defaults,
@@ -1022,8 +1101,9 @@ pub struct NativeTrieApply {
     /// Committed trie node changes — folded into the trie cache post-commit
     /// (`Some` iff the trie cache was used).
     pub(crate) trie_changed: Option<BTreeMap<(usize, usize), B256>>,
-    /// Per-bucket member sets to write through into the member cache post-commit.
-    pub(crate) member_finals: Vec<(u16, Members)>,
+    /// Per-bucket member sets (with their LRU byte size) to write through into the
+    /// member cache post-commit.
+    pub(crate) member_finals: Vec<(u16, Members, usize)>,
 }
 
 /// rank-root round-3: THE unified native-trie append. Computes all mirror + tree
@@ -1033,27 +1113,38 @@ pub struct NativeTrieApply {
 /// leaf hashing — in ANY combination, always byte-identical to the serial
 /// uncached path. The caller applies `trie_changed` / `member_finals` to the
 /// caches ONLY after the batch commits, and invalidates on any failure.
+///
+/// `dirty` is generic over how it owns its bytes so the consensus flush can pass a
+/// map BORROWED straight out of the overlay (`K = V = &[u8]`), while tests and the
+/// standalone helpers keep passing owned `Vec<u8>` maps — same code, no copies on
+/// the hot path.
 #[allow(clippy::too_many_arguments)]
-pub fn apply_native_dirty(
+pub fn apply_native_dirty<K, V>(
     db: &StateDb,
     batch: &mut WriteBatch,
-    dirty: &BTreeMap<(u8, Vec<u8>), Option<Vec<u8>>>,
+    dirty: &BTreeMap<(u8, K), Option<V>>,
     trie_cache: Option<&mut NativeTrieCache>,
     member_cache: Option<&mut NativeMemberCache>,
     parallel: usize,
     min_buckets: usize,
-) -> Result<NativeTrieApply, StateError> {
+) -> Result<NativeTrieApply, StateError>
+where
+    K: Borrow<[u8]>,
+    V: Borrow<[u8]>,
+{
     let defaults = default_nodes();
 
-    // 1. Group dirty entries by bucket (canonical, sorted).
-    #[allow(clippy::type_complexity)]
-    let mut by_bucket: BTreeMap<u16, Vec<((u8, Vec<u8>), Option<Vec<u8>>)>> = BTreeMap::new();
+    // 1. Group dirty entries by bucket (canonical, sorted). The grouped entries
+    //    BORROW `dirty`'s keys and values (s450) — they were cloned here before,
+    //    a second copy of a set the caller had already copied.
+    let mut by_bucket: BTreeMap<u16, Vec<DirtyRef<'_>>> = BTreeMap::new();
     for ((tag, key), val) in dirty {
+        let key: &[u8] = key.borrow();
         let b = bucket_id(*tag, key);
         by_bucket
             .entry(b)
             .or_default()
-            .push(((*tag, key.clone()), val.clone()));
+            .push((*tag, key, val.as_ref().map(Borrow::borrow)));
     }
 
     // 2. The cached path reads siblings from the in-RAM trie image AND elides
@@ -1072,8 +1163,10 @@ pub fn apply_native_dirty(
     };
 
     // 3. Member cache: validate (self-authenticating on the persisted root) and
-    //    pre-fetch resident member sets on the MAIN thread, so workers only ever
-    //    read immutable `Arc<Members>` snapshots.
+    //    HAND OVER resident member sets on the MAIN thread (s450: `take`, not a
+    //    lent `Arc::clone`), so each worker owns its bucket's set outright and
+    //    merges into it without copying. Every taken set is handed back through
+    //    `member_finals` after the batch commits.
     let mut member_cache = member_cache;
     let member_enabled = member_cache.as_ref().is_some_and(|c| c.is_enabled());
     if member_enabled {
@@ -1083,12 +1176,14 @@ pub fn apply_native_dirty(
             .ensure_usable(db)?;
     }
     let (mut member_hits, mut member_misses) = (0usize, 0usize);
-    #[allow(clippy::type_complexity)]
-    let mut work: Vec<(u16, Vec<((u8, Vec<u8>), Option<Vec<u8>>)>, Option<Arc<Members>>)> =
-        Vec::with_capacity(by_bucket.len());
+    let mut work: Vec<BucketWork<'_>> = Vec::with_capacity(by_bucket.len());
     for (b, entries) in by_bucket {
         let hit = if member_enabled {
-            match member_cache.as_deref_mut().expect("member cache present").get(b) {
+            match member_cache
+                .as_deref_mut()
+                .expect("member cache present")
+                .take(b)
+            {
                 Some(arc) => {
                     member_hits += 1;
                     Some(arc)
@@ -1112,7 +1207,7 @@ pub fn apply_native_dirty(
     let mut changed: BTreeMap<(usize, usize), B256> = BTreeMap::new();
     let mut rehashed = 0usize;
     let mut bucket_scans = 0usize;
-    let mut member_finals: Vec<(u16, Members)> = Vec::new();
+    let mut member_finals: Vec<(u16, Members, usize)> = Vec::new();
     for (bucket, o) in outcomes {
         if o.scanned {
             bucket_scans += 1;
@@ -1122,8 +1217,8 @@ pub fn apply_native_dirty(
             rehashed += 1;
             changed.insert((TREE_DEPTH, bucket as usize), o.leaf);
         }
-        if let Some(m) = o.member_final {
-            member_finals.push((bucket, m));
+        if let Some((m, bytes)) = o.member_final {
+            member_finals.push((bucket, m, bytes));
         }
     }
 
@@ -1137,7 +1232,7 @@ pub fn apply_native_dirty(
     if changed.is_empty() {
         for op in &ops {
             match &op.value {
-                Some(v) => batch.put_cf(mirror_cf, &op.key, v),
+                Some(v) => batch.put_cf(mirror_cf, &op.key, v.as_slice()),
                 None => batch.delete_cf(mirror_cf, &op.key),
             }
         }
@@ -1194,7 +1289,7 @@ pub fn apply_native_dirty(
             ops.push(NodeOp {
                 target: CfTarget::Trie,
                 key,
-                value: Some(value.as_slice().to_vec()),
+                value: Some(*value),
             });
         }
     }
@@ -1203,7 +1298,7 @@ pub fn apply_native_dirty(
     ops.push(NodeOp {
         target: CfTarget::Trie,
         key: ROOT_KEY.to_vec(),
-        value: Some(root.as_slice().to_vec()),
+        value: Some(root),
     });
 
     // 9. Append (infallible now — everything above committed to memory first).
@@ -1213,7 +1308,7 @@ pub fn apply_native_dirty(
             CfTarget::Trie => trie_cf,
         };
         match &op.value {
-            Some(v) => batch.put_cf(cf, &op.key, v),
+            Some(v) => batch.put_cf(cf, &op.key, v.as_slice()),
             None => batch.delete_cf(cf, &op.key),
         }
     }
@@ -2149,16 +2244,16 @@ mod tests {
     fn read_bucket_members_bounded_skips_tombstones() {
         // Old, UNBOUNDED scan — the code before L3 #2, kept here as the A-side
         // oracle so the witness proves identical membership and measures cost.
-        fn read_unbounded(db: &StateDb, bucket: u16) -> BTreeMap<(u8, Vec<u8>), Vec<u8>> {
+        fn read_unbounded(db: &StateDb, bucket: u16) -> Members {
             let cf = db.cf_handle(CF_NATIVE_HASHED).unwrap();
             let prefix = bucket.to_be_bytes();
-            let mut out = BTreeMap::new();
+            let mut out = Members::new();
             let mut iter = db.inner().raw_iterator_cf(cf);
             iter.seek(prefix);
             while iter.valid() {
                 let (k, v) = match (iter.key(), iter.value()) {
                     (Some(k), Some(v)) if k.starts_with(&prefix) && k.len() >= 3 => {
-                        (k.to_vec(), v.to_vec())
+                        (k.to_vec(), B256::from_slice(v))
                     }
                     _ => break,
                 };
@@ -2288,6 +2383,585 @@ mod tests {
         );
     }
 
+    // ---- s450 char-pins: dense-bucket characterization gates ----
+    //
+    // The natural key distribution at test scale puts <1 member in almost every
+    // bucket, so the member-clone / member-merge paths are barely exercised by
+    // the round-3 suite. These pins DELIBERATELY construct buckets with several
+    // members each (by searching the keccak bucket assignment for collisions),
+    // replay a multi-block sequence at several dirty-set sizes across ALL 6
+    // native-root CFs (inserts, updates, clean rewrites, deletes, bucket-
+    // emptying), and pin the exact root per block plus the exact persisted
+    // trie + mirror bytes. Any change that perturbs a preimage byte, the member
+    // merge order, or bucket assignment breaks them.
+
+    /// Deterministic dense-bucket corpus for `tag`: scan `i in 0..scan`, group the
+    /// generated keys by [`bucket_id`], and return the first `want` buckets (in
+    /// bucket order) holding at least `per` keys, truncated to `per` keys each.
+    fn dense_buckets(tag: u8, scan: u32, want: usize, per: usize) -> Vec<(u16, Vec<Vec<u8>>)> {
+        let mut by_bucket: BTreeMap<u16, Vec<Vec<u8>>> = BTreeMap::new();
+        for i in 0..scan {
+            let mut key = i.to_le_bytes().to_vec();
+            key.push(0xC0 ^ tag);
+            if i % 3 == 0 {
+                key.extend_from_slice(b"xx"); // vary key length (framing coverage)
+            }
+            by_bucket.entry(bucket_id(tag, &key)).or_default().push(key);
+        }
+        by_bucket
+            .into_iter()
+            .filter(|(_, ks)| ks.len() >= per)
+            .map(|(b, mut ks)| {
+                ks.truncate(per);
+                (b, ks)
+            })
+            .take(want)
+            .collect()
+    }
+
+    /// Members per dense bucket in the char-pin corpus.
+    const CHARPIN_PER_BUCKET: usize = 6;
+    /// Dense buckets per CF in the char-pin corpus.
+    const CHARPIN_BUCKETS_PER_CF: usize = 120;
+
+    /// Flat `(cf_index, key)` corpus over all 6 native-root CFs, every key living
+    /// in a bucket shared with `CHARPIN_PER_BUCKET - 1` others of the same CF.
+    fn charpin_corpus() -> Vec<(usize, Vec<u8>)> {
+        let mut out = Vec::new();
+        for (cfi, (_, tag)) in NATIVE_ROOT_CFS.iter().enumerate() {
+            for (_, keys) in dense_buckets(*tag, 100_000, CHARPIN_BUCKETS_PER_CF, CHARPIN_PER_BUCKET)
+            {
+                for k in keys {
+                    out.push((cfi, k));
+                }
+            }
+        }
+        out
+    }
+
+    /// One block of `(cf_index, key, Some(value) | None = delete)` ops.
+    type Block = Vec<(usize, Vec<u8>, Option<Vec<u8>>)>;
+
+    /// The pinned block sequence: an insert-everything block, then blocks of
+    /// 1 / 10 / 500 / 2000 dirty entries mixing updates and deletes, then a block
+    /// that empties whole buckets.
+    fn charpin_sequence(corpus: &[(usize, Vec<u8>)]) -> Vec<Block> {
+        let mut seq: Vec<Block> = Vec::new();
+        let val = |round: u32, i: usize, len: usize| -> Vec<u8> {
+            let mut v = vec![0u8; len];
+            v[0] = round as u8;
+            v[1] = (i & 0xff) as u8;
+            v[2] = ((i >> 8) & 0xff) as u8;
+            v
+        };
+        // Block 0: insert the whole corpus (every bucket becomes multi-member).
+        seq.push(
+            corpus
+                .iter()
+                .enumerate()
+                .map(|(i, (cfi, k))| (*cfi, k.clone(), Some(val(0, i, 8 + i % 37))))
+                .collect(),
+        );
+        // Blocks 1..4: 1 / 10 / 500 / 2000 dirty entries, updates + deletes.
+        let mut rng = 0x5150_4A50_C0FF_EE01u64;
+        for (idx, size) in [1usize, 10, 500, 2000].into_iter().enumerate() {
+            let round = idx as u32 + 1;
+            let mut ops = Vec::new();
+            let mut used = std::collections::HashSet::new();
+            while ops.len() < size {
+                let i = (xorshift(&mut rng) % corpus.len() as u64) as usize;
+                if !used.insert(i) {
+                    continue;
+                }
+                let (cfi, k) = &corpus[i];
+                // 1-in-5 deletes; the rest updates with round-varying lengths.
+                if xorshift(&mut rng).is_multiple_of(5) {
+                    ops.push((*cfi, k.clone(), None));
+                } else {
+                    ops.push((*cfi, k.clone(), Some(val(round, i, 4 + (i % 53)))));
+                }
+            }
+            ops.sort();
+            seq.push(ops);
+        }
+        // Final block: delete every key of the first 20 dense buckets — drives
+        // whole buckets to empty (leaf -> default, node deletions).
+        seq.push(
+            corpus
+                .iter()
+                .take(20 * CHARPIN_PER_BUCKET)
+                .map(|(cfi, k)| (*cfi, k.clone(), None))
+                .collect(),
+        );
+        seq
+    }
+
+    /// Byte digest of a CF's full contents (length-framed, so it pins bytes AND
+    /// boundaries).
+    fn dump_digest(db: &StateDb, cf_name: &str) -> B256 {
+        let mut buf = Vec::new();
+        for (k, v) in dump(db, cf_name) {
+            buf.extend_from_slice(&(k.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&k);
+            buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&v);
+        }
+        keccak256(&buf)
+    }
+
+    /// Replay `seq` on a fresh DB with the given config, returning the per-block
+    /// roots and the final (trie, mirror) CF digests.
+    fn charpin_replay(
+        seq: &[Block],
+        trie_on: bool,
+        member_bytes: usize,
+        parallel: usize,
+    ) -> (Vec<B256>, B256, B256) {
+        let (db, _d) = temp_db();
+        build_native_trie_to_cf(&db).unwrap();
+        let mut trie = trie_on.then(NativeTrieCache::default);
+        let mut member = (member_bytes > 0).then(|| NativeMemberCache::with_budget(member_bytes));
+        let mut roots = Vec::with_capacity(seq.len());
+        for ops in seq {
+            let dirty = apply_ops(&db, ops);
+            let (root, _rh, _sc) = commit_native_trie_incremental_full(
+                &db,
+                &dirty,
+                trie.as_mut(),
+                member.as_mut(),
+                parallel,
+            )
+            .unwrap();
+            assert_eq!(
+                root,
+                native_root_full(&db).unwrap(),
+                "incremental root != full-scan oracle"
+            );
+            roots.push(root);
+        }
+        (
+            roots,
+            dump_digest(&db, CF_NATIVE_TRIE),
+            dump_digest(&db, CF_NATIVE_HASHED),
+        )
+    }
+
+    // Captured from the pre-refactor (31a5739) serial-uncached path. CONSENSUS
+    // PINS: only a deliberate, fleet-uniform preimage change may move these.
+    const CHARPIN_FINAL_ROOT: &str =
+        "a221f2cd2bdcd308d77d521bee3e8c99efb9e64cbb652441b916943e2227695a";
+    const CHARPIN_SEQ_DIGEST: &str =
+        "b9292d39a785674b1ad0396339202b181435ec783aa6c0e74369f56bf982700a";
+    const CHARPIN_TRIE_DIGEST: &str =
+        "81dea124a20c5e6d23d358c9cb7f17a214092466d7ed21c6fe6e7258d67102d6";
+    const CHARPIN_MIRROR_DIGEST: &str =
+        "6af9f5181d1e592c88fdcfbad2a3bb2f8ad1fa90b7df96e2d2ea7d5d74f3b09a";
+
+    /// CHAR-PIN: exact per-block roots and exact persisted trie/mirror bytes for a
+    /// dense-bucket multi-block sequence over all 6 native-root CFs — under every
+    /// cache/parallelism combination (member cache OFF / tiny-evicting = MISS-heavy /
+    /// roomy = HIT-heavy). The constants are consensus-visible: a diff here means a
+    /// preimage moved.
+    #[test]
+    fn charpin_dense_bucket_roots_and_bytes() {
+        let corpus = charpin_corpus();
+        assert_eq!(
+            corpus.len(),
+            6 * CHARPIN_BUCKETS_PER_CF * CHARPIN_PER_BUCKET,
+            "dense corpus shape changed — the pins below no longer apply"
+        );
+        let seq = charpin_sequence(&corpus);
+        assert_eq!(seq.len(), 6, "sequence shape changed");
+
+        // Reference: serial, uncached.
+        let (roots, trie_digest, mirror_digest) = charpin_replay(&seq, false, 0, 1);
+        let seq_digest = {
+            let mut buf = Vec::new();
+            for r in &roots {
+                buf.extend_from_slice(r.as_slice());
+            }
+            keccak256(&buf)
+        };
+
+        assert_eq!(
+            format!("{:x}", roots[roots.len() - 1]),
+            CHARPIN_FINAL_ROOT,
+            "FINAL NATIVE ROOT CHANGED — a consensus preimage moved"
+        );
+        assert_eq!(
+            format!("{seq_digest:x}"),
+            CHARPIN_SEQ_DIGEST,
+            "per-block root sequence changed — a consensus preimage moved"
+        );
+        assert_eq!(
+            format!("{trie_digest:x}"),
+            CHARPIN_TRIE_DIGEST,
+            "persisted CF_NATIVE_TRIE bytes changed"
+        );
+        assert_eq!(
+            format!("{mirror_digest:x}"),
+            CHARPIN_MIRROR_DIGEST,
+            "persisted CF_NATIVE_HASHED bytes changed"
+        );
+
+        // Every cache / parallelism combination must reproduce the SAME pins.
+        // budget 0 = member cache disabled, 4 KiB = evicting (miss-heavy),
+        // 8 MiB = roomy (hit-heavy: the multi-member base-set path).
+        for (trie_on, mb, par) in [
+            (false, 0usize, 4usize),
+            (true, 0, 1),
+            (true, 0, 8),
+            (false, 4 * 1024, 1),
+            (true, 4 * 1024, 4),
+            (false, 8 << 20, 1),
+            (true, 8 << 20, 1),
+            (true, 8 << 20, 8),
+        ] {
+            let (r, t, m) = charpin_replay(&seq, trie_on, mb, par);
+            assert_eq!(
+                r, roots,
+                "cfg (trie={trie_on}, mb={mb}, par={par}): roots diverged"
+            );
+            assert_eq!(
+                t, trie_digest,
+                "cfg (trie={trie_on}, mb={mb}, par={par}): trie bytes diverged"
+            );
+            assert_eq!(
+                m, mirror_digest,
+                "cfg (trie={trie_on}, mb={mb}, par={par}): mirror bytes diverged"
+            );
+        }
+    }
+
+    /// CHAR-PIN: member-cache residency semantics on MULTI-MEMBER buckets — a hit
+    /// must serve the bucket without a mirror scan, an all-clean-rewrite block
+    /// (fully elided, nothing changed) must LEAVE THE BUCKET RESIDENT, and a
+    /// delete that empties a bucket must keep the oracle in agreement.
+    #[test]
+    fn charpin_member_cache_residency_and_tombstones() {
+        let (db, _d) = temp_db();
+        build_native_trie_to_cf(&db).unwrap();
+        let dense = dense_buckets(0, 100_000, 12, CHARPIN_PER_BUCKET);
+        assert_eq!(dense.len(), 12, "need 12 dense buckets");
+        let keys: Vec<Vec<u8>> = dense.iter().flat_map(|(_, ks)| ks.clone()).collect();
+
+        let mut trie = NativeTrieCache::default();
+        let mut member = NativeMemberCache::with_budget(8 << 20);
+
+        // Block 1 — insert everything (cold: every bucket scans).
+        let ops: Vec<_> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| (0usize, k.clone(), Some(vec![i as u8; 16])))
+            .collect();
+        let d = apply_ops(&db, &ops);
+        let (_r, _rh, scans_cold) =
+            commit_native_trie_incremental_full(&db, &d, Some(&mut trie), Some(&mut member), 1)
+                .unwrap();
+        assert_eq!(scans_cold, 12, "cold block must scan every dirty bucket");
+        assert_eq!(member.len(), 12, "all 12 buckets must be resident after commit");
+
+        // Block 2 — CLEAN rewrite of the same values: fully elided, nothing
+        // changes, and the buckets must STAY resident (a hit must put back what
+        // it took).
+        let d2 = apply_ops(&db, &ops);
+        let (_r2, rehashed2, scans2) =
+            commit_native_trie_incremental_full(&db, &d2, Some(&mut trie), Some(&mut member), 1)
+                .unwrap();
+        assert_eq!(scans2, 0, "resident buckets must not re-scan");
+        assert_eq!(rehashed2, 0, "clean rewrites must be fully elided");
+        assert_eq!(member.len(), 12, "an elided hit must leave the bucket resident");
+
+        // Block 3 — real updates on resident buckets: still zero scans.
+        let ops3: Vec<_> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| (0usize, k.clone(), Some(vec![(i as u8) ^ 0x5A; 24])))
+            .collect();
+        let d3 = apply_ops(&db, &ops3);
+        let (r3, _rh3, scans3) =
+            commit_native_trie_incremental_full(&db, &d3, Some(&mut trie), Some(&mut member), 1)
+                .unwrap();
+        assert_eq!(
+            scans3, 0,
+            "resident buckets must not re-scan after a real change"
+        );
+        assert_eq!(member.len(), 12, "buckets stay resident after a real change");
+        assert_eq!(r3, native_root_full(&db).unwrap(), "oracle agrees");
+
+        // Block 4 — delete EVERY member of the first 4 buckets (buckets go empty)
+        // plus a delete of an absent key, all on resident buckets.
+        let mut ops4: Vec<(usize, Vec<u8>, Option<Vec<u8>>)> = dense
+            .iter()
+            .take(4)
+            .flat_map(|(_, ks)| ks.iter().map(|k| (0usize, k.clone(), None)))
+            .collect();
+        ops4.push((0, b"charpin-absent-key".to_vec(), None));
+        let d4 = apply_ops(&db, &ops4);
+        let (r4, _rh4, _sc4) =
+            commit_native_trie_incremental_full(&db, &d4, Some(&mut trie), Some(&mut member), 1)
+                .unwrap();
+        assert_eq!(
+            r4,
+            native_root_full(&db).unwrap(),
+            "oracle agrees after emptying"
+        );
+
+        // Block 5 — re-insert into the emptied buckets; the resident (now empty)
+        // member sets must still serve without a scan and stay correct.
+        let ops5: Vec<_> = dense
+            .iter()
+            .take(4)
+            .flat_map(|(_, ks)| ks.iter().map(|k| (0usize, k.clone(), Some(vec![0x77; 9]))))
+            .collect();
+        let d5 = apply_ops(&db, &ops5);
+        let (r5, _rh5, scans5) =
+            commit_native_trie_incremental_full(&db, &d5, Some(&mut trie), Some(&mut member), 1)
+                .unwrap();
+        assert_eq!(
+            r5,
+            native_root_full(&db).unwrap(),
+            "oracle agrees after re-insert"
+        );
+        assert_eq!(scans5, 0, "emptied-but-resident buckets must not re-scan");
+    }
+
+    // ---- s450 allocation witness ----
+    //
+    // The refactor's whole claim is "fewer allocations, identical bytes". The
+    // byte half is pinned above; this counts the allocation half. A per-THREAD
+    // counting allocator (installed only in this crate's `cfg(test)` lib binary)
+    // makes the numbers exact and load-independent — unlike wall-clock, which on a
+    // busy box disagreed with itself by 5x this session.
+
+    /// Thread-scoped allocation counters. Per-thread (not global) so the count is
+    /// unaffected by whatever else the test harness runs in parallel.
+    mod alloc_count {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::cell::Cell;
+
+        thread_local! {
+            static ALLOCS: Cell<u64> = const { Cell::new(0) };
+            static BYTES: Cell<u64> = const { Cell::new(0) };
+        }
+
+        pub struct Counting;
+
+        #[inline]
+        fn bump(size: usize) {
+            let _ = ALLOCS.try_with(|c| c.set(c.get().wrapping_add(1)));
+            let _ = BYTES.try_with(|c| c.set(c.get().wrapping_add(size as u64)));
+        }
+
+        // SAFETY: every method forwards to `System` unchanged; the counters are
+        // thread-local `Cell`s with const initialisers, so they never allocate
+        // and never re-enter the allocator.
+        unsafe impl GlobalAlloc for Counting {
+            unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+                bump(l.size());
+                unsafe { System.alloc(l) }
+            }
+            unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+                unsafe { System.dealloc(p, l) }
+            }
+            unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
+                bump(l.size());
+                unsafe { System.alloc_zeroed(l) }
+            }
+            unsafe fn realloc(&self, p: *mut u8, l: Layout, new: usize) -> *mut u8 {
+                bump(new);
+                unsafe { System.realloc(p, l, new) }
+            }
+        }
+
+        /// `(allocations, bytes)` performed by `f` ON THIS THREAD.
+        pub fn measure<R>(f: impl FnOnce() -> R) -> (u64, u64, R) {
+            let a0 = ALLOCS.with(Cell::get);
+            let b0 = BYTES.with(Cell::get);
+            let r = f();
+            let a1 = ALLOCS.with(Cell::get);
+            let b1 = BYTES.with(Cell::get);
+            (a1 - a0, b1 - b0, r)
+        }
+    }
+
+    #[global_allocator]
+    static COUNTING_ALLOCATOR: alloc_count::Counting = alloc_count::Counting;
+
+    /// s450 ALLOCATION WITNESS — the copying this refactor removed, counted
+    /// exactly, on a dense-bucket DB (`CHARPIN_PER_BUCKET` members per bucket)
+    /// with warm trie + member caches, serial so every allocation lands on this
+    /// thread. Three measurements, each over the VERBATIM code shape involved:
+    ///
+    ///  A. dirty-set handoff, pre-s450: `PendingState::native_dirty`'s clone-out
+    ///     loop PLUS `apply_native_dirty`'s old `by_bucket` clone-again loop.
+    ///  B. dirty-set handoff, s450: `native_dirty_ref`'s borrow-out loop plus the
+    ///     current borrowing `by_bucket` loop.
+    ///  C. the per-bucket `Members` deep clone a member-cache HIT used to pay at
+    ///     `process_bucket` — counted on the real resident sets, which is exactly
+    ///     what the cache holds (`read_bucket_members` is how they got there).
+    ///
+    /// Plus the absolute cost of one whole cached block through the real
+    /// `apply_native_dirty`, for scale.
+    ///
+    /// NOTE: measuring `apply_native_dirty(owned)` vs `apply_native_dirty(borrowed)`
+    /// would show ZERO delta — the function is generic over `Borrow<[u8]>` and
+    /// borrows internally either way. The removed clones are in the CONSTRUCTION
+    /// of the dirty set and in the old grouping loop, which is what A/B measure.
+    ///
+    /// Run: `cargo test -p torus-state --lib alloc_witness -- --nocapture`
+    #[test]
+    fn alloc_witness_native_trie_block() {
+        let (db, _d) = temp_db();
+        build_native_trie_to_cf(&db).unwrap();
+        let dense = dense_buckets(0, 100_000, 300, CHARPIN_PER_BUCKET);
+        let keys: Vec<Vec<u8>> = dense.iter().flat_map(|(_, ks)| ks.clone()).collect();
+
+        // Seed: every bucket multi-member (CHARPIN_PER_BUCKET members each).
+        let seed_ops: Vec<_> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| (0usize, k.clone(), Some(vec![i as u8; 48])))
+            .collect();
+        let seed_dirty = apply_ops(&db, &seed_ops);
+        let mut trie = NativeTrieCache::default();
+        let mut member = NativeMemberCache::with_budget(64 << 20);
+        commit_native_trie_incremental_full(
+            &db,
+            &seed_dirty,
+            Some(&mut trie),
+            Some(&mut member),
+            1,
+        )
+        .unwrap();
+        assert_eq!(member.len(), dense.len(), "all buckets resident (warm)");
+
+        // The measured block: touch ONE key in every dense bucket (all cache
+        // hits). `pending` has the exact shape of `CfPending::writes` — the map
+        // the flush actually reads its dirty set out of.
+        let pending: BTreeMap<Vec<u8>, Vec<u8>> = dense
+            .iter()
+            .map(|(_, ks)| (ks[0].clone(), vec![0xD1; 44]))
+            .collect();
+        for (k, v) in &pending {
+            db.put_cf_raw(NATIVE_ROOT_CFS[0].0, k, v).unwrap();
+        }
+        let nb = dense.len() as u64;
+        let ne = pending.len() as u64;
+
+        // --- A: pre-s450 handoff (clone out of the overlay, then clone again) ---
+        #[allow(clippy::type_complexity)]
+        let (a_old, b_old, _) = alloc_count::measure(|| {
+            // verbatim `PendingState::native_dirty` (pre-s450)
+            let mut dirty: BTreeMap<(u8, Vec<u8>), Option<Vec<u8>>> = BTreeMap::new();
+            for (key, value) in &pending {
+                dirty.insert((0u8, key.clone()), Some(value.clone()));
+            }
+            // verbatim `apply_native_dirty` step 1 (pre-s450)
+            let mut by_bucket: BTreeMap<u16, Vec<((u8, Vec<u8>), Option<Vec<u8>>)>> =
+                BTreeMap::new();
+            for ((tag, key), val) in &dirty {
+                let b = bucket_id(*tag, key);
+                by_bucket
+                    .entry(b)
+                    .or_default()
+                    .push(((*tag, key.clone()), val.clone()));
+            }
+            by_bucket.len()
+        });
+
+        // --- B: s450 handoff (borrow out, group by reference) ---
+        let (a_new, b_new, _) = alloc_count::measure(|| {
+            // verbatim `PendingState::native_dirty_ref`
+            let mut dirty: BTreeMap<(u8, &[u8]), Option<&[u8]>> = BTreeMap::new();
+            for (key, value) in &pending {
+                dirty.insert((0u8, key.as_slice()), Some(value.as_slice()));
+            }
+            // verbatim `apply_native_dirty` step 1 (s450)
+            let mut by_bucket: BTreeMap<u16, Vec<DirtyRef<'_>>> = BTreeMap::new();
+            for ((tag, key), val) in &dirty {
+                let key: &[u8] = key.borrow();
+                let b = bucket_id(*tag, key);
+                by_bucket
+                    .entry(b)
+                    .or_default()
+                    .push((*tag, key, val.as_ref().map(Borrow::borrow)));
+            }
+            by_bucket.len()
+        });
+
+        // --- C: the per-bucket Members deep clone a HIT used to pay ---
+        let resident: Vec<Members> = dense
+            .iter()
+            .map(|(b, _)| read_bucket_members(&db, *b).unwrap())
+            .collect();
+        let (a_clone, b_clone, _) = alloc_count::measure(|| {
+            let mut sink = 0usize;
+            for m in &resident {
+                sink += m.clone().len(); // == the old `(**arc).clone()` at process_bucket
+            }
+            sink
+        });
+
+        // --- scale: one whole cached block through the real path, s450 shape ---
+        let borrowed: BTreeMap<(u8, &[u8]), Option<&[u8]>> = pending
+            .iter()
+            .map(|(k, v)| ((0u8, k.as_slice()), Some(v.as_slice())))
+            .collect();
+        let (a_block, b_block, _) = alloc_count::measure(|| {
+            let mut batch = WriteBatch::default();
+            apply_native_dirty(
+                &db,
+                &mut batch,
+                &borrowed,
+                Some(&mut trie),
+                Some(&mut member),
+                1,
+                1,
+            )
+            .unwrap()
+        });
+
+        println!(
+            "S450-ALLOC shape: dirty_entries={ne} dirty_buckets={nb} members_per_bucket={CHARPIN_PER_BUCKET}\n\
+             S450-ALLOC A dirty handoff PRE-s450 (clone + clone again)  allocs={a_old:6} bytes={b_old:8}  ({:.2}/entry)\n\
+             S450-ALLOC B dirty handoff s450     (borrow + borrow)      allocs={a_new:6} bytes={b_new:8}  ({:.2}/entry)\n\
+             S450-ALLOC   => removed                                    allocs={:6} bytes={:8}  ({:.2}/entry)\n\
+             S450-ALLOC C Members deep clone on member-cache HITS       allocs={a_clone:6} bytes={b_clone:8}  ({:.2}/bucket)\n\
+             S450-ALLOC   => removed entirely (Arc handover + try_unwrap)\n\
+             S450-ALLOC   whole cached block via apply_native_dirty     allocs={a_block:6} bytes={b_block:8}  ({:.2}/bucket)",
+            a_old as f64 / ne as f64,
+            a_new as f64 / ne as f64,
+            a_old - a_new,
+            b_old - b_new,
+            (a_old - a_new) as f64 / ne as f64,
+            a_clone as f64 / nb as f64,
+            a_block as f64 / nb as f64,
+        );
+
+        // Regression guards — loose enough to survive unrelated churn, tight
+        // enough to fail if the copying comes back.
+        assert!(
+            a_old >= a_new + 4 * ne,
+            "pre-s450 handoff must cost >= 4 allocations/entry more ({a_old} vs {a_new}, {ne} entries)"
+        );
+        assert!(
+            a_clone >= nb,
+            "the removed deep clone allocated at least once per bucket ({a_clone} over {nb})"
+        );
+        // Per-bucket ceiling for a whole cached block. At the time of writing this
+        // is ~23/bucket, almost all of it the depth-16 tree fold's per-changed-node
+        // key `Vec`s (a term in dirty-BUCKETS, not in total state size). Restoring
+        // the removed copying would add (4/entry + 7/bucket) ≈ 34/bucket and trip
+        // this.
+        assert!(
+            a_block < 30 * nb,
+            "cached block allocations regressed: {a_block} over {nb} buckets \
+             ({:.1}/bucket, ceiling 30)",
+            a_block as f64 / nb as f64
+        );
+    }
+
     /// Per-bucket cost harness (round-3 proof-bench input). Measures the marginal
     /// per-dirty-bucket cost of native-trie maintenance at ~10k dirty buckets for
     /// serial-scan / parallel-scan / member-cached (no-scan) paths. Ignored by
@@ -2375,6 +3049,21 @@ mod tests {
          -> f64 {
             let mut best = f64::INFINITY;
             for _ in 0..6 {
+                // s450: a member-cache HIT hands the resident set out of the
+                // cache, so an apply that is never committed leaves it drained.
+                // Re-warm with an idempotent (uncached, hence non-eliding) commit
+                // of the warm-up set before each timed rep — untimed, and it
+                // rewrites identical bytes so the persisted trie/root do not move.
+                if member.is_some() {
+                    commit_native_trie_incremental_full(
+                        &db,
+                        &d0,
+                        None,
+                        member.as_deref_mut(),
+                        1,
+                    )
+                    .unwrap();
+                }
                 let mut batch = WriteBatch::default();
                 let t = Instant::now();
                 apply_native_dirty(
