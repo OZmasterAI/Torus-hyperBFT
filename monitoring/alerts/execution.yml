@@ -1,0 +1,47 @@
+# Prometheus alerting rules for Torus execution / native-state-root metrics.
+# These rules use metrics exported by torus-telemetry on :9090/metrics.
+
+groups:
+  - name: torus_execution
+    rules:
+      - alert: MemberCacheEviction
+        expr: increase(torus_member_cache_evictions_total[1h]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Bucket member cache is evicting ({{ $value }} evictions/hour)"
+          description: >
+            The native-state-root bucket member cache has started evicting, which
+            means total chain state has outgrown TORUS_BUCKET_MEMBER_CACHE_MB.
+            This cache degrades on a knee, not a cliff: the FIRST eviction is the
+            early-warning signal and buys roughly a full state-growth cycle of
+            lead time before block execution slows measurably. Raise
+            TORUS_BUCKET_MEMBER_CACHE_MB (see docs/node-operator-guide.md) and
+            restart the node. Confirm the impact with
+            torus_exec_root_bucket_scans_total (rising = the cache is no longer
+            eliding CF_NATIVE_HASHED prefix scans) and
+            torus_member_cache_resident_buckets (plateaued = budget-capped).
+
+      - alert: MemberCacheHitRatioLow
+        expr: >
+          rate(torus_member_cache_hits_total[15m])
+            / clamp_min(
+                rate(torus_member_cache_hits_total[15m])
+                  + rate(torus_member_cache_misses_total[15m]),
+                1e-9)
+            < 0.5
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Bucket member cache hit ratio below 50% ({{ $value | humanizePercentage }})"
+          description: >
+            More than half of bucket-member lookups are missing the cache, so
+            native-root maintenance is re-scanning CF_NATIVE_HASHED per dirty
+            bucket instead of reusing cached members. This is the post-knee state
+            that MemberCacheEviction warns about ahead of time. Raise
+            TORUS_BUCKET_MEMBER_CACHE_MB. Sustained low hit ratio inflates the
+            untimed portion of torus_exec_flush_seconds (flush minus root minus
+            state_write minus evm_resync), because commit_finals runs after the
+            root timer stops.
