@@ -356,21 +356,42 @@ impl PendingState {
 
     /// The native-root dirty `(cf_tag, key) -> Option<value>` set these pending
     /// mutations imply — writes (`Some`) and deletes (`None`) hitting the 6
-    /// native-root CFs only.
-    fn native_dirty(&self) -> BTreeMap<(u8, Vec<u8>), Option<Vec<u8>>> {
-        let mut dirty: BTreeMap<(u8, Vec<u8>), Option<Vec<u8>>> = BTreeMap::new();
+    /// native-root CFs only, BORROWED out of the pending maps.
+    ///
+    /// s450 (double-clone elimination): the flush used to clone every dirty key
+    /// AND value out of the overlay here, and `apply_native_dirty` then cloned
+    /// both AGAIN into its per-bucket grouping — ~4 redundant allocations per
+    /// dirty entry per block, scaling with the (workload-driven) dirty-set size.
+    /// The trie consumes the dirty set READ-ONLY inside the flush, which holds
+    /// the `pending` read guard for its whole duration, so pointing at the
+    /// overlay's own key/value buffers is sound and copies nothing. Iteration
+    /// order is unchanged: `&[u8]` orders exactly like `Vec<u8>` (lexicographic
+    /// over the same bytes), and that `(tag, key)` order is what the trie's
+    /// canonical bucket grouping is defined over.
+    fn native_dirty_ref(&self) -> BTreeMap<(u8, &[u8]), Option<&[u8]>> {
+        let mut dirty: BTreeMap<(u8, &[u8]), Option<&[u8]>> = BTreeMap::new();
         for (idx, cfp) in self.cfs.iter().enumerate() {
             let Some(tag) = crate::native_trie::cf_tag(CfId(idx as u8).name()) else {
                 continue;
             };
             for (key, value) in &cfp.writes {
-                dirty.insert((tag, key.clone()), Some(value.clone()));
+                dirty.insert((tag, key.as_slice()), Some(value.as_slice()));
             }
             for key in &cfp.deletes {
-                dirty.insert((tag, key.clone()), None);
+                dirty.insert((tag, key.as_slice()), None);
             }
         }
         dirty
+    }
+
+    /// Owning twin of [`PendingState::native_dirty_ref`] for callers that outlive
+    /// the pending read guard (the public `dirty_native_keys` API). Byte-identical
+    /// content and order — it is exactly `native_dirty_ref` materialised.
+    fn native_dirty(&self) -> BTreeMap<(u8, Vec<u8>), Option<Vec<u8>>> {
+        self.native_dirty_ref()
+            .into_iter()
+            .map(|((tag, key), value)| ((tag, key.to_vec()), value.map(<[u8]>::to_vec)))
+            .collect()
     }
 }
 
@@ -612,8 +633,10 @@ impl NativeStateOverlay {
         let mut batch = WriteBatch::default();
         state.append_to_batch(raw, &mut batch)?;
 
-        // Native-root dirty map, folded into the SAME batch.
-        let dirty = state.native_dirty();
+        // Native-root dirty map, folded into the SAME batch. BORROWED from the
+        // pending maps (s450): `state`'s read guard is held for this whole
+        // function and the trie only reads the set, so nothing is copied out.
+        let dirty = state.native_dirty_ref();
         let mut write_secs = build_timer.elapsed().as_secs_f64();
 
         // Trie maintenance (rank-root round-3): the unified append computes all

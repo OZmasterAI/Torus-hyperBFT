@@ -7,6 +7,7 @@ Prometheus alerting rules for monitoring Torus-hyperBFT nodes.
 | File | Metrics Source | Description |
 |------|---------------|-------------|
 | `consensus.yml` | torus-telemetry | Block production, consensus stalls, mempool backlog |
+| `execution.yml` | torus-telemetry | Bucket member cache pressure (native state root) |
 | `node.yml` | torus-telemetry | Peer count, database size |
 | `infrastructure.yml` | node_exporter | Disk, memory, CPU (requires separate install) |
 
@@ -20,6 +21,7 @@ Add the alerting rules to your Prometheus config:
 # prometheus.yml
 rule_files:
   - "/path/to/monitoring/alerts/consensus.yml"
+  - "/path/to/monitoring/alerts/execution.yml"
   - "/path/to/monitoring/alerts/node.yml"
   - "/path/to/monitoring/alerts/infrastructure.yml"
 
@@ -134,6 +136,18 @@ amtool silence expire <silence-id>
 | SlowBlockBuild | block_build p99 > 2s for 5m | warning |
 | HighConsensusRounds | round rate spikes > 2x | warning |
 | MempoolBacklog | mempool growing 10+ min | warning |
+
+### Execution (torus-telemetry)
+
+| Alert | Condition | Severity |
+|-------|-----------|----------|
+| MemberCacheEviction | any member-cache eviction in 1h | warning |
+| MemberCacheHitRatioLow | member-cache hit ratio < 50% for 15m | warning |
+
+Both signal that total chain state has outgrown `TORUS_BUCKET_MEMBER_CACHE_MB`.
+`MemberCacheEviction` fires first — the cache degrades on a knee, not a cliff, so
+the first eviction gives roughly a full state-growth cycle of lead time to raise
+the budget before execution slows.
 
 ### Node (torus-telemetry)
 
