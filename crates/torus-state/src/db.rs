@@ -52,6 +52,24 @@ impl StateDb {
         // 1 MiB range-sync can add write-path latency spikes; the bench A/Bs 4
         // MiB or 0 (disabled). Default 1 MiB = exact-today. Node-local, perf-only.
         opts.set_bytes_per_sync(bytes_per_sync_bytes());
+        // STABILITY: the ONLY global bound on total memtable memory.
+        //
+        // `set_write_buffer_size` / `set_max_write_buffer_number` below are
+        // PER-COLUMN-FAMILY, and they are applied to every name in
+        // `ALL_CF_NAMES` (44 CFs), so the untuned sum is
+        // 43 x 128 MiB x 4 + 8 MiB x 4 = ~21.5 GiB with NO global bound — against
+        // a documented 4 GB / 8 GB-for-validators node floor
+        // (docs/node-operator-guide.md). RocksDB only approaches that sum under a
+        // broad multi-CF write burst (memtable arenas are allocated lazily, and
+        // the 4 buffer slots per CF only fill when flush falls behind), but
+        // nothing clips the tail, so a burst can OOM the node.
+        //
+        // `db_write_buffer_size` is RocksDB's DB-wide write-buffer budget: once
+        // the sum of all live memtables crosses it, RocksDB force-flushes the CF
+        // with the largest memtable instead of letting the sum keep growing.
+        // Bounds the tail without reshaping steady state (see
+        // `db_write_buffer_bytes` for the default and per-node-class guidance).
+        opts.set_db_write_buffer_size(db_write_buffer_bytes());
 
         // Per-CF tuning, shared across every column family. RocksDB ships an
         // ~8 MiB block cache and NO bloom filters by default, which is poor for
@@ -533,6 +551,25 @@ pub fn churny_cf_write_buffer_bytes() -> Option<usize> {
     parse_opt_usize_min1_mb(std::env::var("TORUS_CHURNY_CF_WRITE_BUFFER_MB").ok())
 }
 
+/// STABILITY: DB-wide memtable budget, in bytes — the global cap on the SUM of
+/// every column family's memtables (`Options::set_db_write_buffer_size`).
+/// Without it the per-CF 128 MiB x 4 buffers across 44 CFs sum to ~21.5 GiB
+/// unbounded, which no documented node class can absorb.
+///
+/// Default **1 GiB**: room for 8 simultaneously-full 128 MiB memtables, which
+/// exceeds the hot multi-CF write set, so steady-state flush behaviour is
+/// unchanged and only the burst tail is clipped. Sized against the 8 GB
+/// validator class — with the 256 MiB shared block cache it puts the DB's
+/// bounded memory at ~1.25 GiB.
+///
+/// `TORUS_DB_WRITE_BUFFER_MB` overrides in whole MiB; `0` disables the cap
+/// (RocksDB default = exact-today unbounded). Recommended per node class:
+/// `512` on a 4 GB node, default `1024` on 8 GB, `2048` on 16 GB+.
+/// Read once at DB open.
+pub fn db_write_buffer_bytes() -> usize {
+    parse_usize_mb_or(std::env::var("TORUS_DB_WRITE_BUFFER_MB").ok(), 1024)
+}
+
 /// Pure parse: a positive `i32` env value, falling back to `default` on
 /// unset / non-numeric / `< 1`.
 fn parse_positive_i32(raw: Option<String>, default: i32) -> i32 {
@@ -557,6 +594,18 @@ fn parse_opt_usize_min1_mb(raw: Option<String>) -> Option<usize> {
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&mb| mb >= 1)
         .map(|mb| mb.saturating_mul(1024 * 1024))
+}
+
+/// Pure parse: whole-MiB env value → bytes, falling back to `default_mb` MiB on
+/// unset / non-numeric. Unlike [`parse_opt_usize_min1_mb`], `0` is HONOURED
+/// (it disables the knob), matching `TORUS_BYTES_PER_SYNC_MIB`.
+fn parse_usize_mb_or(raw: Option<String>, default_mb: usize) -> usize {
+    let mb = raw
+        .as_deref()
+        .map(str::trim)
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(default_mb);
+    mb.saturating_mul(1024 * 1024)
 }
 
 /// Runtime toggle: fsync the WAL once per committed block ([`StateDb::sync_wal`]).
@@ -654,5 +703,68 @@ mod sync_wal_tests {
         assert_eq!(parse_opt_usize_min1_mb(Some("0".into())), None);
         assert_eq!(parse_opt_usize_min1_mb(Some("garbage".into())), None);
         assert_eq!(parse_opt_usize_min1_mb(Some("16".into())), Some(16 * 1024 * 1024));
+    }
+
+    // STABILITY: global memtable cap (`db_write_buffer_size`). The per-CF
+    // buffers are unbounded in SUM; this is the only DB-wide bound.
+
+    const MIB: usize = 1024 * 1024;
+
+    #[test]
+    fn db_write_buffer_defaults_to_1gib() {
+        // Unset / garbage ⇒ the 1 GiB default, NOT rocksdb's unbounded 0.
+        assert_eq!(parse_usize_mb_or(None, 1024), 1024 * MIB);
+        assert_eq!(parse_usize_mb_or(Some("garbage".into()), 1024), 1024 * MIB);
+        assert_eq!(parse_usize_mb_or(Some("".into()), 1024), 1024 * MIB);
+        assert_eq!(parse_usize_mb_or(Some("-1".into()), 1024), 1024 * MIB);
+    }
+
+    #[test]
+    fn db_write_buffer_env_overrides_in_whole_mib() {
+        // Per-node-class guidance: 512 on a 4 GB node, 2048 on 16 GB+.
+        assert_eq!(parse_usize_mb_or(Some("512".into()), 1024), 512 * MIB);
+        assert_eq!(parse_usize_mb_or(Some(" 2048 ".into()), 1024), 2048 * MIB);
+    }
+
+    #[test]
+    fn db_write_buffer_zero_disables_the_cap() {
+        // `0` is rocksdb's "disabled" sentinel — the escape hatch back to
+        // exact-today unbounded behaviour. It must NOT fall back to the default.
+        assert_eq!(parse_usize_mb_or(Some("0".into()), 1024), 0);
+    }
+
+    #[test]
+    fn db_write_buffer_cap_is_far_below_the_untuned_per_cf_sum() {
+        // The bound this knob exists to enforce. `max_write_buffer_number` is 4
+        // and every CF but CF_CONSENSUS_META (8 MiB) gets the 128 MiB buffer.
+        let untuned_sum = (ALL_CF_NAMES.len() - 1) * 128 * MIB * 4 + 8 * MIB * 4;
+        assert!(
+            untuned_sum > 20 * 1024 * MIB,
+            "untuned per-CF memtable sum {untuned_sum} should exceed 20 GiB across {} CFs",
+            ALL_CF_NAMES.len()
+        );
+        // Default cap is ~1/20th of that, and fits under the 4 GB node floor.
+        let cap = parse_usize_mb_or(None, 1024);
+        assert!(cap < untuned_sum / 20);
+        assert!(cap < 4 * 1024 * MIB);
+    }
+
+    #[test]
+    fn db_opens_and_round_trips_with_global_memtable_cap() {
+        // `set_db_write_buffer_size` is applied in `open()`: prove a real DB
+        // still opens all 44 CFs, accepts writes, and reopens with data intact.
+        let dir = tempfile::tempdir().expect("tempdir");
+        {
+            let db = StateDb::open(dir.path()).expect("open with db_write_buffer_size set");
+            assert_eq!(db.column_families().len(), ALL_CF_NAMES.len());
+            db.put_cf_raw(CF_ACCOUNTS, b"acct", b"value").expect("put");
+            db.put_cf_raw(CF_CONSENSUS_META, b"meta", b"m").expect("put");
+            db.sync_wal().expect("sync_wal");
+        }
+        let db2 = StateDb::open(dir.path()).expect("reopen");
+        assert_eq!(
+            db2.get_cf_raw(CF_ACCOUNTS, b"acct").expect("get"),
+            Some(b"value".to_vec()),
+        );
     }
 }
