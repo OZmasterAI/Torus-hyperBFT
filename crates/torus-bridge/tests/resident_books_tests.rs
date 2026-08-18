@@ -18,12 +18,12 @@
 
 use alloy_primitives::Address;
 
-use torus_bridge::native_executor::{NativeExecContext, NativeExecutor, ResidentBooks};
+use torus_bridge::native_executor::{BookMode, NativeExecContext, NativeExecutor, ResidentBooks};
 use torus_bridge::state_root::compute_native_state_root;
 use torus_core::position::NativeBalance;
 use torus_state::cf::{
     CF_CONSENSUS_META, CF_NATIVE_BALANCES, CF_NATIVE_ORDER_BOOKS, CF_NATIVE_POSITIONS,
-    CF_NATIVE_TRADES, CF_NATIVE_USER_TRADES, META_NATIVE_APPLIED_HEIGHT,
+    CF_BOOK_ORDER_ROWS, CF_NATIVE_TRADES, CF_NATIVE_USER_TRADES, META_NATIVE_APPLIED_HEIGHT,
 };
 use torus_state::{StateBackend, StateDb};
 use torus_types::{
@@ -545,6 +545,110 @@ fn advance_untouched_without_marker_write_still_rebuilds() {
         "marker (1) != holder (2) must still force a rebuild"
     );
     assert!(!holder.is_populated());
+}
+
+// ============================================================================
+// 3c. r3 restack: the untouched-block advance under mode 3 (chunked level
+//     digest). A rebuild there also drops every book's per-level chunk state
+//     (the next save re-hashes every level); the advance must keep the holder
+//     — WITH its chunk state — and the persisted rows/root of the following
+//     native blocks must be byte-identical to the per-block reload path
+//     executed over the same heights (empty blocks in between).
+// ============================================================================
+
+fn make_ctx_mode(
+    db: StateDb,
+    height: u64,
+    mode: BookMode,
+    resident: Option<&mut ResidentBooks>,
+) -> NativeExecContext {
+    NativeExecContext::new_with_mode(
+        db,
+        height,
+        1000 + height,
+        0,
+        100,
+        10,
+        addr(99),
+        addr(100),
+        addr(101),
+        mode,
+        resident,
+    )
+}
+
+/// Native blocks at heights 1, 3, 5 (the 3 script batches), empty blocks at
+/// 2 and 4. `resident`: the holder is kept across all five blocks and
+/// advanced across the empty ones (as the pipeline does after the marker
+/// write); otherwise every native block reloads from the DB.
+fn run_script_with_gaps(
+    db: StateDb,
+    mode: BookMode,
+    resident: bool,
+) -> (Vec<(Vec<u8>, Vec<u8>)>, Vec<(Vec<u8>, Vec<u8>)>, alloy_primitives::B256, Vec<usize>) {
+    let mut holder = ResidentBooks::default();
+    let batches = script_batches(1);
+    let mut writes = Vec::new();
+    for (i, batch) in batches.iter().enumerate() {
+        let height = (2 * i + 1) as u64;
+        if height > 1 {
+            // The empty block in between: standalone marker + holder advance.
+            let empty = height - 1;
+            db.put_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT, &empty.to_be_bytes())
+                .unwrap();
+            if resident {
+                assert!(holder.advance_untouched(empty), "empty block {empty} must advance");
+                assert_eq!(holder.height(), Some(empty));
+            }
+        }
+        let mut ctx = make_ctx_mode(
+            db.clone(),
+            height,
+            mode,
+            if resident { Some(&mut holder) } else { None },
+        );
+        assert!(ctx.fatal_error.is_none(), "load {height}: {:?}", ctx.fatal_error);
+        assert_eq!(
+            ctx.resident_reused(),
+            resident && height > 1,
+            "block {height}: the advanced holder must be reused (no stale rebuild)"
+        );
+        if height == 1 {
+            for t in [addr(1), addr(2), addr(3), addr(4)] {
+                fund_native(&ctx, &t, fp(1_000_000));
+            }
+        }
+        let r = NativeExecutor::execute_batch(&mut ctx, batch);
+        assert!(r.results.iter().all(|x| x.success), "block {height}");
+        writes.push(ctx.save_order_books());
+        ctx.stash_resident(&mut holder);
+        db.put_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT, &height.to_be_bytes())
+            .unwrap();
+    }
+    // A fresh reload must pass boot verify (mode 3: chunked from-scratch
+    // recompute of every level row == the rows the resident run persisted).
+    let ctx = make_ctx_mode(db.clone(), 6, mode, None);
+    assert!(ctx.fatal_error.is_none(), "final reload: {:?}", ctx.fatal_error);
+    (
+        dump_cf(&db, CF_NATIVE_ORDER_BOOKS),
+        dump_cf(&db, CF_BOOK_ORDER_ROWS),
+        compute_native_state_root(&db).expect("root"),
+        writes,
+    )
+}
+
+#[test]
+fn mode3_untouched_blocks_keep_holder_and_chunk_state_byte_identical() {
+    for mode in [BookMode::LevelAuthority, BookMode::LevelAuthorityChunked] {
+        let (_d1, db_off) = open_test_db();
+        let (_d2, db_on) = open_test_db();
+        let off = run_script_with_gaps(db_off, mode, false);
+        let on = run_script_with_gaps(db_on, mode, true);
+        assert_eq!(off.0, on.0, "{mode:?}: book/level CF diverged across untouched blocks");
+        assert_eq!(off.1, on.1, "{mode:?}: order rows diverged across untouched blocks");
+        assert_eq!(off.2, on.2, "{mode:?}: state root diverged across untouched blocks");
+        assert_eq!(off.3, on.3, "{mode:?}: write counts diverged (journal differ vs full walk)");
+    }
 }
 
 // ============================================================================
