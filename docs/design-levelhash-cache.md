@@ -307,3 +307,65 @@ gated behind the new `torus-bridge` cargo feature `save-timings`, and the
 µbench target declares `required-features = ["save-timings"]` (run with
 `cargo test -p torus-bridge --test l3_savebooks_ubench --features save-timings
 -- --ignored --nocapture`). Production builds carry zero instrumentation.
+
+## 7. Mode 3 — chunked level digest (`TORUS_BOOK_ROWS=3`, consensus-visible)
+
+The sponge cache (§0–§3) is node-local and byte-identical, but its win is
+bounded to append-only intervals: `match_at_level` bumps the epoch on every
+taker touch, so a level that is *filled from the front* every block pays the
+full O(depth) one-shot rehash on every save. With band-5 flow the top levels
+hold thousands of resting orders and the fills consume exactly that front, so
+`save_books` grows with resting depth over a run (the early→late 60 s spread).
+
+Mode 3 keeps mode 2's row layout, loader, saver and boot verify **byte for
+byte** and changes only the `level_hash` preimage (hence the root ⇒ its own
+marker byte `3`, fresh genesis, fleet-uniform — same rules as any mode flip):
+
+```text
+chunk_idx(seq)  = seq / LEVEL_CHUNK_SEQS            (64; book_rows.rs)
+chunk_digest(i) = keccak256(frames of the level's orders with seq in
+                            [64·i, 64·(i+1)), queue order)   -- same frames as mode 2
+level_hash      = keccak256(LEVEL_HASH_CHUNKED_DOMAIN ("TORUSLV2")
+                            ‖ order_count(u32 BE) ‖ total_qty_raw(i128 BE)
+                            ‖ for each NON-EMPTY chunk, idx ascending:
+                                  chunk_idx(u64 BE) ‖ chunk_digest)
+```
+
+Why seq buckets: the per-book `seq` is monotone, unique, assigned at insert
+and persisted in every row, and the queue is seq-ascending, so (a) a chunk's
+members are one contiguous queue range (binary search on seq), (b) the digest
+is a **pure function of level content** — no dependence on which mutation
+happened, so the incremental drain and a from-scratch recompute (boot verify,
+`OrderBook::level_row_data_chunked`) agree by construction, and (c) every
+mutation dirties only the chunk(s) holding the touched seq: front pops
+(fills) touch 1–2 chunks, appends 1–2, a mid cancel 1. Per dirty level the
+save costs O(dirty chunks × 64 frames) + O(n_chunks × 40 B) instead of
+O(depth) — depth-independent.
+
+Maintenance (`order_book.rs`, block "Chunked level digest"): per level a
+`BTreeMap<chunk_idx, (digest, Σqty, count)>`, built in full on the level's
+first drain and refreshed per dirty chunk afterwards; `mark_chunk_dirty` is
+called at EVERY queue-mutation site enumerated in §1.1 (`insert_order`,
+`cancel_order`, `cancel_all`, in-place `modify_order`, all three
+`match_at_level` arms, `insert_loaded_order`) — the same surface that journals
+the level, gated on the book's `level_hash_chunked` flag so modes 0/1/2 pay
+nothing. `total_qty`/`count` are Σ over chunks in ascending (== queue) order,
+i.e. the same checked `FixedPoint +=` sequence as the flat sum.
+
+Fork protection: marker byte 3 (`__book_mode__`) AND boot verify 3 — a mode-2
+node on a mode-3 DB (or vice versa) recomputes different level rows and
+fail-stops before serving or signing (message names `TORUS_BOOK_ROWS`).
+Readers (`book_reader::BookLayout::from_marker_byte(3)`) treat the layout as
+level-authority — they never recompute the digest.
+
+Verification: hand-spelled oracle + pinned vectors (`PINNED_CHUNKED_LEVELS`,
+depths 1/2/100/1000 — 3 and 17 chunks); scripted incremental-vs-scratch drain
+(`chunked_incremental_drain_matches_scratch`); randomized differential against
+a flat twin (`level_ops_chunked_vs_scratch_randomized_differential`, 5 seeds ×
+900 ops, drained every few ops, coverage-checked — a missing dirty mark at the
+partial-fill site was mutation-tested to fail it); `full_level_ops` re-seed;
+executor-level `semantic_differential_mode_3_vs_2` (identical semantics, store,
+meta/stop rows, qty‖count prefixes; different hashes and root), the 4×4
+fail-stop matrix, and `mode3_incremental_saves_survive_fresh_reload_boot_verify`
+(one resident ctx over 12 blocks of deep-level fills/cancels/modifies/
+cancel-alls, then a fresh reload whose boot verify recomputes from scratch).

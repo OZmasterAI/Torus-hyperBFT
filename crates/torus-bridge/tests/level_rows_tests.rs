@@ -324,6 +324,165 @@ fn semantic_differential_modes_0_1_2() {
 }
 
 // ============================================================================
+// 2b. Mode 3 (chunked level hash) vs mode 2: identical semantics, identical
+//     layout and node-local store, identical (qty ‖ count) prefixes — only the
+//     `level_hash` bytes (and hence the root) differ.
+// ============================================================================
+
+#[test]
+fn semantic_differential_mode_3_vs_2() {
+    let (_d2, db2) = open_test_db();
+    let (_d3, db3) = open_test_db();
+    let levels = run_script(db2, BookMode::LevelAuthority);
+    let chunked = run_script(db3, BookMode::LevelAuthorityChunked);
+
+    assert_eq!(levels.fingerprints, chunked.fingerprints, "non-book state diverged");
+    assert_eq!(levels.books_after, chunked.books_after, "in-memory books diverged");
+    assert_eq!(levels.reloaded_books, chunked.reloaded_books, "reload diverged");
+    assert_eq!(chunked.books_after.last().unwrap(), &chunked.reloaded_books);
+    assert_eq!(chunked.idle_writes, 0);
+    assert_eq!(levels.store_cf, chunked.store_cf, "node-local store must be identical");
+
+    // Same key set; meta + stop rows identical; level rows equal on
+    // qty ‖ count and differ on the hash.
+    assert_eq!(levels.book_cf.len(), chunked.book_cf.len());
+    let mut level_rows = 0usize;
+    for ((k2, v2), (k3, v3)) in levels.book_cf.iter().zip(chunked.book_cf.iter()) {
+        assert_eq!(k2, k3, "root CF key sets must match");
+        if k2.len() == 26 && k2[8] == 0x03 {
+            level_rows += 1;
+            assert_eq!(&v2[..20], &v3[..20], "qty ‖ count must match");
+            assert_ne!(&v2[20..], &v3[20..], "chunked level_hash must differ from flat");
+        } else {
+            assert_eq!(v2, v3, "meta/stop rows must be identical");
+        }
+    }
+    assert!(level_rows > 0, "script must leave level rows");
+    assert_ne!(levels.root, chunked.root, "mode 2 vs 3 roots must differ");
+}
+
+/// Mode 3 end-to-end incremental proof: ONE resident ctx across many blocks
+/// (so the books keep their chunk state and each save re-hashes only dirty
+/// chunks — deep level, front-consuming fills, cancels, in-place modifies,
+/// cancel_all), then a FRESH reload whose boot verify recomputes every level
+/// row from scratch. Any stale chunk digest written by the incremental path
+/// would fail-stop the reload.
+#[test]
+fn mode3_incremental_saves_survive_fresh_reload_boot_verify() {
+    let (_dir, db) = open_test_db();
+    let mut ctx = make_ctx(db.clone(), 1, BookMode::LevelAuthorityChunked);
+    assert!(ctx.fatal_error.is_none());
+    let traders: Vec<Address> = (1..=6).map(addr).collect();
+    for t in &traders {
+        fund_native(&ctx, t, fp(100_000_000));
+    }
+    let mut s: u64 = 0x5EED_0000_00C3;
+    let mut xs = || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    };
+    let mut placed: Vec<u128> = Vec::new();
+    for height in 1..=12u64 {
+        let mut batch: Vec<(Address, NativeAction)> = Vec::new();
+        // Deep append at ONE bid level (spans several 64-seq chunks over the
+        // run) + scattered levels.
+        for _ in 0..40 {
+            let t = traders[(xs() % 6) as usize];
+            batch.push(place(t, gtc(1, true, 100, 1 + (xs() % 3) as i64)));
+        }
+        for _ in 0..10 {
+            let t = traders[(xs() % 6) as usize];
+            batch.push(place(t, gtc(1, true, 95 + (xs() % 5) as i64, 1)));
+            batch.push(place(t, gtc(1, false, 106 + (xs() % 5) as i64, 1)));
+        }
+        // Front-consuming sells into the deep bid level (partial + full).
+        for _ in 0..3 {
+            let t = traders[(xs() % 6) as usize];
+            batch.push(place(t, gtc(1, false, 100, 2 + (xs() % 20) as i64)));
+        }
+        // Cancels + in-place modifies of earlier orders (mid-chunk edits).
+        for _ in 0..6 {
+            if !placed.is_empty() {
+                let id = placed[(xs() as usize) % placed.len()];
+                if xs() % 2 == 0 {
+                    batch.push((traders[0], NativeAction::CancelOrder { order_id: id }));
+                } else {
+                    batch.push((
+                        traders[0],
+                        NativeAction::ModifyOrder {
+                            order_id: id,
+                            new_price: None,
+                            new_qty: Some(fp(1)),
+                        },
+                    ));
+                }
+            }
+        }
+        if height % 5 == 0 {
+            batch.push((traders[1], NativeAction::CancelAllOrders { market_id: None }));
+        }
+        let r = NativeExecutor::execute_batch(&mut ctx, &batch);
+        assert!(
+            r.results.iter().filter(|x| x.success).count() >= 60,
+            "block {height}: too many failures"
+        );
+        // Track traders[0]'s RESTING orders for the next block's cancel /
+        // modify ops (sent by traders[0]; ops on already-gone ids may fail —
+        // fine for this test).
+        placed = ctx
+            .order_books
+            .get(&1)
+            .map(|b| b.orders_for_trader(&traders[0]).iter().map(|o| o.id).collect())
+            .unwrap_or_default();
+        assert!(ctx.fatal_error.is_none(), "block {height}: {:?}", ctx.fatal_error);
+        ctx.save_order_books();
+        // Move the ctx forward a block without reloading books.
+        ctx.block_height = height + 1;
+    }
+    let book = ctx.order_books.get(&1).expect("market 1 book");
+    let (levels_with_state, chunks, dirty) = book.level_chunk_stats();
+    assert!(levels_with_state > 0 && chunks > levels_with_state, "chunk state must be multi-chunk");
+    assert_eq!(dirty, 0, "everything drained");
+    assert!(book.level_hash_chunked());
+    let live_books = book_bytes(&ctx);
+    drop(ctx);
+
+    // Fresh reload: boot verify 3 recomputes every level row from scratch.
+    let ctx = make_ctx(db.clone(), 20, BookMode::LevelAuthorityChunked);
+    assert!(
+        ctx.fatal_error.is_none(),
+        "incremental mode-3 rows must survive from-scratch boot verify: {:?}",
+        ctx.fatal_error
+    );
+    assert_eq!(book_bytes(&ctx), live_books, "reloaded books must equal the live books");
+    // And explicitly: every persisted level row == from-scratch chunked digest.
+    let book = ctx.order_books.get(&1).unwrap();
+    let mut checked = 0usize;
+    for (k, v) in dump_cf(&db, CF_NATIVE_ORDER_BOOKS) {
+        if k.len() == 26 && k[8] == 0x03 && &k[..8] == &1u64.to_be_bytes() {
+            let tag = k[9];
+            let raw = torus_core::book_rows::price_dec(tag, k[10..26].try_into().unwrap());
+            let expect = book.level_row_data_chunked(tag, raw).expect("live level");
+            assert_eq!(v, expect.encode().to_vec(), "level row {tag}/{raw} stale");
+            checked += 1;
+        }
+    }
+    assert!(checked >= 3, "expected several level rows, got {checked}");
+
+    // A mode-2 node pointed at this DB must fail-stop: boot verify 3 trips
+    // first (flat digests != stored chunked digests) and names the flag; the
+    // marker would catch it too on an empty chain.
+    let wrong = make_ctx(db, 21, BookMode::LevelAuthority);
+    let err = wrong.fatal_error.as_deref().unwrap_or("");
+    assert!(
+        err.contains("TORUS_BOOK_ROWS") || err.contains("book-mode marker"),
+        "got: {err:?}"
+    );
+}
+
+// ============================================================================
 // 3. Fail-stop matrix (9 cells + marker + split-brain)
 // ============================================================================
 
@@ -358,7 +517,12 @@ fn seed_db(mode: BookMode) -> (tempfile::TempDir, StateDb) {
 
 #[test]
 fn fail_stop_matrix_all_mode_pairs() {
-    let modes = [BookMode::Classic, BookMode::OrderRows, BookMode::LevelAuthority];
+    let modes = [
+        BookMode::Classic,
+        BookMode::OrderRows,
+        BookMode::LevelAuthority,
+        BookMode::LevelAuthorityChunked,
+    ];
     for write_mode in modes {
         for load_mode in modes {
             let (_dir, db) = seed_db(write_mode);
@@ -394,8 +558,14 @@ fn book_mode_marker_catches_wrong_flag_on_empty_books() {
     // Same mode: clean.
     let ctx = make_ctx(db.clone(), 2, BookMode::LevelAuthority);
     assert!(ctx.fatal_error.is_none(), "{:?}", ctx.fatal_error);
-    // Wrong mode: fatal via the marker alone.
-    for wrong in [BookMode::Classic, BookMode::OrderRows] {
+    // Wrong mode: fatal via the marker alone (incl. mode 3, whose on-disk
+    // layout is identical to mode 2 — ONLY the marker can tell them apart on
+    // an empty chain).
+    for wrong in [
+        BookMode::Classic,
+        BookMode::OrderRows,
+        BookMode::LevelAuthorityChunked,
+    ] {
         let ctx = make_ctx(db.clone(), 2, wrong);
         let err = ctx.fatal_error.as_deref().unwrap_or("");
         assert!(
