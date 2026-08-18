@@ -5974,19 +5974,29 @@ mod crash_recovery_tests {
         assert!(app.deferred_exec.is_empty(), "queue fully drained");
     }
 
-    /// FIX 1b: the heal budget still applies to a parked boot hole. With the budget set to 0
-    /// (fail-stop on the first stalled attempt), a drain that cannot reconstruct the head-of-line
-    /// durable source must latch `exec_failed` — the park is time-bounded, never an infinite hole.
+    /// FIX 1b: the heal budget still applies to a parked boot hole. With the hole clock
+    /// backdated past the whole budget (fail-stop on the first stalled attempt), a drain that
+    /// cannot reconstruct the head-of-line durable source must latch `exec_failed` — the park
+    /// is time-bounded, never an infinite hole.
+    ///
+    /// The clock is BACKDATED rather than the budget zeroed via the process-global
+    /// `TORUS_EXEC_HOLE_BUDGET_SECS` env var: setting that var raced every parallel test that
+    /// asserts "still within budget — no latch" (`exec_hole_budget_exhaustion_latches_fail_stop`
+    /// et al. read the same env), a pre-existing full-suite flake.
     #[test]
     fn parked_durable_hole_fail_stops_on_budget_exhaustion() {
-        std::env::set_var("TORUS_EXEC_HOLE_BUDGET_SECS", "0");
         let mut app = TorusApp::stub();
 
-        // Header present, body missing, seeded as a parked hole with the clock started.
+        // Header present, body missing, seeded as a parked hole whose clock already
+        // exceeds the heal budget.
         let b5 = make_block(5, vec![sign_claim_rewards(5)]);
         persist_header_only_for_test(&app.state_db, &b5);
         app.exec_next_height = Some(5);
-        app.exec_hole_since = Some(std::time::Instant::now());
+        app.exec_hole_since = Some(
+            std::time::Instant::now()
+                .checked_sub(EXEC_HOLE_FAILSTOP_BUDGET + std::time::Duration::from_secs(1))
+                .expect("monotonic clock older than the heal budget"),
+        );
         app.deferred_exec.insert(
             5,
             DeferredExecBlock {
@@ -6002,7 +6012,6 @@ mod crash_recovery_tests {
             app.is_exec_failed(),
             "a parked hole that outlives its heal budget must latch the same fail-stop as a live hole"
         );
-        std::env::remove_var("TORUS_EXEC_HOLE_BUDGET_SECS");
     }
 
     // ---- HEAL-CHANNEL fix (part A window + part B peer pull) ----
