@@ -1070,7 +1070,11 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     {
         let data_dir = cli.data_dir.clone();
         let m = metrics.clone();
-        let db = state_db.db_arc();
+        let state_db_arc = state_db.db_arc();
+        // The split instance owns the block-tree + native-DA CFs when enabled:
+        // sample those from it (same `cf` labels, so dashboards read the live
+        // CF wherever it lives).
+        let split_db_arc = split_db.as_ref().map(|s| s.db_arc());
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(60));
             loop {
@@ -1078,6 +1082,10 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 let size = torus_state::dir_size_bytes(&data_dir);
                 m.db_size_bytes.set(size as i64);
                 for cf_name in torus_state::cf::ALL_CF_NAMES {
+                    let db = match split_db_arc.as_ref() {
+                        Some(split) if split.cf_handle(cf_name).is_some() => split,
+                        _ => &state_db_arc,
+                    };
                     let Some(cf) = db.cf_handle(cf_name) else {
                         continue;
                     };
@@ -1095,7 +1103,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
-                if let Ok(Some(v)) = db.property_int_value("rocksdb.block-cache-usage") {
+                if let Ok(Some(v)) = state_db_arc.property_int_value("rocksdb.block-cache-usage") {
                     m.rocksdb_block_cache_bytes.set(v as i64);
                 }
             }
