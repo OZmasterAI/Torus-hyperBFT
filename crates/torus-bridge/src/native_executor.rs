@@ -1111,6 +1111,15 @@ mod book_rows_toggle_tests {
 // back to a full rebuild from persisted state, which is always authoritative.
 // A fatal block (`ctx.fatal_error`) never stashes — the holder stays drained,
 // forcing a rebuild.
+//
+// UNTOUCHED BLOCKS (r2 resident-books-stale-rebuild): a committed block with
+// no native actions and no fee revenue never builds a context, so the books
+// are untouched and the holder is ALSO that block's post-state. The pipeline
+// advances the holder's height stamp with the standalone applied-height
+// marker (`ResidentBooks::advance_untouched`) — otherwise every empty block
+// between two native blocks tripped the guard (devnet: resident_height=376,
+// block_height=379 → 377/378 were empty) and forced a multi-second full
+// reload. Only a direct successor advances; anything else drains the holder.
 
 /// rank8 runtime toggle: `TORUS_RESIDENT_BOOKS=1` enables resident books;
 /// anything else (INCLUDING UNSET) keeps the per-block reload — exact-today.
@@ -1151,6 +1160,44 @@ impl ResidentBooks {
     /// Whether the holder currently carries state (test/ops introspection).
     pub fn is_populated(&self) -> bool {
         self.inner.is_some()
+    }
+
+    /// The block height whose post-state the holder reflects (None = drained).
+    pub fn height(&self) -> Option<u64> {
+        self.inner.as_ref().map(|i| i.height)
+    }
+
+    /// r2 resident-books-stale-rebuild: a committed block that skipped the
+    /// native path entirely (no native actions, no fee revenue — the pipeline
+    /// never builds a context for it) leaves every book untouched, so the
+    /// holder's state is ALSO that block's post-state. Advance the height
+    /// stamp iff `block_height` is the holder's direct successor and return
+    /// true. Call it right after the standalone applied-height marker write
+    /// for that block, so memory and the marker move together.
+    ///
+    /// Anything else — same height replayed, a skipped height, an empty
+    /// holder — is not a normal sequence: the holder is DRAINED (returns
+    /// false) and the next context rebuilds from the DB, which is always
+    /// authoritative. Strict by design: a wrong "not stale" here would be a
+    /// correctness bug; a needless rebuild is only a stall.
+    pub fn advance_untouched(&mut self, block_height: u64) -> bool {
+        match self.inner.as_mut() {
+            Some(inner) if inner.height + 1 == block_height => {
+                inner.height = block_height;
+                true
+            }
+            Some(inner) => {
+                tracing::warn!(
+                    resident_height = inner.height,
+                    block_height,
+                    "rank8: untouched block is not the resident holder's successor — draining \
+                     the holder (next block rebuilds from persisted state)"
+                );
+                self.inner = None;
+                false
+            }
+            None => false,
+        }
     }
 }
 
@@ -1539,18 +1586,32 @@ impl<T: StateBackend> NativeExecContext<T> {
         let mut reused_inner: Option<ResidentInner> = None;
         if let Some(holder) = resident {
             if let Some(inner) = holder.inner.take() {
-                let marker_ok = match Self::read_applied_marker(&state) {
+                let applied_marker = Self::read_applied_marker(&state);
+                let marker_ok = match applied_marker {
                     Some(applied) => applied == inner.height,
                     // No marker row (test envs / pre-marker DBs): the height
                     // sequence check below is the only guard available.
                     None => true,
                 };
-                if inner.height + 1 == block_height && marker_ok {
+                let height_ok = inner.height + 1 == block_height;
+                if height_ok && marker_ok {
                     reused_inner = Some(inner);
                 } else {
+                    // Attribute the trip: "height" = the holder is not the
+                    // block's predecessor (a block advanced without the holder
+                    // — see `ResidentBooks::advance_untouched`), "marker" =
+                    // the DB's applied height disagrees with memory (failed
+                    // flush / out-of-band progress), "height+marker" = both.
+                    let reason = match (height_ok, marker_ok) {
+                        (false, false) => "height+marker",
+                        (false, true) => "height",
+                        _ => "marker",
+                    };
                     tracing::warn!(
                         resident_height = inner.height,
                         block_height,
+                        applied_marker,
+                        reason,
                         "rank8: resident books stale (height/marker mismatch) — rebuilding from persisted state"
                     );
                 }
@@ -1654,6 +1715,14 @@ impl<T: StateBackend> NativeExecContext<T> {
     /// rebuilding from persisted). Test/ops introspection.
     pub fn resident_reused(&self) -> bool {
         self.resident_reused
+    }
+
+    /// rank8: whether this context ran in resident mode but had to REBUILD
+    /// from persisted state (holder empty at startup, drained after a fatal
+    /// block, or the staleness guard tripped). Metrics hook: every hit is a
+    /// full O(resting depth) reload on the exec thread.
+    pub fn resident_rebuilt(&self) -> bool {
+        self.resident && !self.resident_reused
     }
 
     /// rank8: hand the books (their journals ride inside, journal-in-book)
