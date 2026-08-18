@@ -38,6 +38,12 @@ PEER_TO_V1=/ip4/127.0.0.1/udp/$P2P1/quic-v1/p2p/$PID1
 # bench run (A3) executes against the same consensus config as idle bring-up.
 export TORUS_HASH_ONLY_PUSH_THRESHOLD="${TORUS_HASH_ONLY_PUSH_THRESHOLD:-6000000}"
 export TORUS_NATIVE_TOTAL_BLOCK_CAP="${TORUS_NATIVE_TOTAL_BLOCK_CAP:-100}"
+# Block-cap-raise sweep (r2): raising the cap above 100 needs the companion caps
+# that bind first at bs400 — TORUS_NATIVE_ORDERS_PER_BLOCK_CAP (50k default =
+# 125 actions x 400), TORUS_NATIVE_BLOCK_BYTES_CAP (6 MB, touched at cap 200) and,
+# on binaries older than r2, TORUS_VERIFIED_SENDER_CACHE_CAP (64 x cap x 2.5).
+# tools/matched-bench/run-cell.sh BLOCK_CAP=N exports the coherent bundle; the
+# compiled default stays 100 until a full-mesh bench earns the raise.
 # perf A1 (landed 8fa6ccd): skip shard custody in the execute_batch funnel.
 export TORUS_SHARD_CUSTODY="${TORUS_SHARD_CUSTODY:-0}"
 # mode-2 save-books parallel drain (node-local, byte-identical): default ON at

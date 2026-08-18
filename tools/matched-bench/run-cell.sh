@@ -22,6 +22,12 @@
 #   DATA_ROOT    devnet data root (default $HOME/torus-wsl-devnet)
 #   SENDERS      bench --senders (default 5000)   CONC  --concurrency (256)
 #   BATCH        --batch-size (400)               SUBMIT --submit-batch (1)
+#   BLOCK_CAP=N  block-cap-raise sweep bundle: exports the COHERENT set of
+#                proposer-local selection caps for an N-action native block
+#                (TORUS_NATIVE_TOTAL_BLOCK_CAP=N plus the companion caps that
+#                would otherwise bind first — see block_cap_bundle below).
+#                Applied after RECORD_ENV and before EXTRA_ENV, so EXTRA_ENV
+#                can still override any single knob. Unset => untouched (cap 100).
 #   OVERWRITE=1  allow reusing an existing non-empty results dir
 #   HEALTH_TIMEOUT (240 s)  DRAIN_TIMEOUT (180 s)
 set -uo pipefail
@@ -73,6 +79,40 @@ RECORD_ENV=(
     TORUS_COMMIT_LAG_BACKOFF_CAP=8
 )
 
+# block-cap-raise sweep bundle (r2 candidate block-cap-raise-sweep). All four
+# knobs are PROPOSER-LOCAL selection policy / node-local cache sizing
+# (validate_block rejects on none of them), so they cannot fork; run-cell.sh
+# exports the same values to all 3 nodes anyway. Companion caps, and why they
+# must move with the action cap (P3 cap-sweep verdict, mem 74c34440):
+#   TORUS_NATIVE_ORDERS_PER_BLOCK_CAP  default 50_000 binds FIRST at bs400
+#       (125 actions) => max(50_000, N*BATCH*1.25): N=100 reproduces the 50_000
+#       default exactly (clean control cell), never binding above it.
+#   TORUS_VERIFIED_SENDER_CACHE_CAP    exec trust-cache must bridge the 64-block
+#       exec queue: 64*N*2.5 (16_384 floor). The r2 binary derives this default
+#       itself; exporting it keeps env-only cells on OLDER binaries equivalent.
+#   TORUS_NATIVE_BLOCK_BYTES_CAP       6 MB default; N*BATCH*~70 B touches it at
+#       N=200 => max(6 MB, N*BATCH*150 B) CAPPED at 12 MB — MAX_BLOCK_DATA_MSG_SIZE
+#       (block-data sync codec) is 16 MB, a body above it could never be synced.
+# NOT touched: TORUS_HASH_ONLY_PUSH_THRESHOLD (env.sh 6 MB, clamped to the 4 MB
+# fleet floor) — bodies above ~4 MB (N>=150 at bs400) go out as a HASH manifest
+# and are PULLED (the S387-hardened path); the dissemination counters below
+# (manifest pushes / body-fetch exhaustion / sync fallbacks) record the cost.
+block_cap_bundle() { # $1=N -> prints K=V lines
+    local n=$1 orders bytes cache
+    orders=$(( n * BATCH * 5 / 4 )); [ "$orders" -lt 50000 ] && orders=50000
+    cache=$(( 64 * n * 5 / 2 )); [ "$cache" -lt 16384 ] && cache=16384
+    bytes=$(( n * BATCH * 150 )); [ "$bytes" -lt 6000000 ] && bytes=6000000; [ "$bytes" -gt 12000000 ] && bytes=12000000
+    printf 'TORUS_NATIVE_TOTAL_BLOCK_CAP=%s\nTORUS_NATIVE_ORDERS_PER_BLOCK_CAP=%s\nTORUS_VERIFIED_SENDER_CACHE_CAP=%s\nTORUS_NATIVE_BLOCK_BYTES_CAP=%s\n' \
+        "$n" "$orders" "$cache" "$bytes"
+}
+BLOCK_CAP=${BLOCK_CAP:-}
+if [ -n "$BLOCK_CAP" ]; then
+    [[ "$BLOCK_CAP" =~ ^[0-9]+$ ]] && [ "$BLOCK_CAP" -ge 1 ] || { echo "FATAL: BLOCK_CAP must be a positive integer" >&2; exit 2; }
+    mapfile -t BLOCK_CAP_ENV < <(block_cap_bundle "$BLOCK_CAP")
+else
+    BLOCK_CAP_ENV=()
+fi
+
 RPCS=(http://127.0.0.1:8645 http://127.0.0.1:8646 http://127.0.0.1:8647)
 METS=(9161 9162 9163)
 
@@ -120,7 +160,8 @@ PY
 }
 trap 'log "interrupted"; finish_fail; exit 130' INT TERM
 
-log "cell=$LABEL worktree=$WT markets=$MARKETS dur=${DUR}s rate=$RATE senders=$SENDERS extra_env='$EXTRA_ENV'"
+log "cell=$LABEL worktree=$WT markets=$MARKETS dur=${DUR}s rate=$RATE senders=$SENDERS block_cap='${BLOCK_CAP:-unset}' extra_env='$EXTRA_ENV'"
+[ -n "$BLOCK_CAP" ] && log "block-cap bundle (BLOCK_CAP=$BLOCK_CAP, BATCH=$BATCH): ${BLOCK_CAP_ENV[*]}"
 WT_COMMIT=$(git -C "$WT" rev-parse HEAD)
 WT_DIRTY=$(git -C "$WT" status --porcelain --untracked-files=no | wc -l)
 log "worktree commit=$WT_COMMIT dirty_files=$WT_DIRTY"
@@ -150,6 +191,7 @@ log "genesis markets=$GEN_MARKETS native_balances=$GEN_ACCTS md5=$GEN_MD5"
 # start from a clean TORUS_* env: only the record env + EXTRA_ENV reach the nodes
 for v in $(env | grep -oE '^TORUS_[A-Za-z0-9_]+'); do unset "$v"; done
 for kv in "${RECORD_ENV[@]}"; do export "$kv"; done
+for kv in "${BLOCK_CAP_ENV[@]}"; do export "$kv"; done
 for kv in $EXTRA_ENV; do export "$kv"; done
 NODE_ENV_JSON=$(env | grep -E '^TORUS_' | sort | python3 -c 'import sys,json;print(json.dumps(dict(l.rstrip("\n").split("=",1) for l in sys.stdin)))')
 log "node env: $NODE_ENV_JSON"
@@ -327,8 +369,24 @@ log "ingest: bench submitted=${BENCH_SUBMITTED:-?} actions; mempool nonce-expire
 
 # ---------------------------------------------------------------- 9. stop + collect logs
 "$WSL/stop-3val.sh" >>"$OUT/run.log" 2>&1
+# Body-dissemination / exec-pacing accounting per node (block-cap-raise sweep:
+# a raised cap is REJECTED if bodies stop disseminating, whatever matched/s says).
+#   manifest = pre-proposal HASH-ONLY manifest pushes (body set over the push floor)
+#   exhausted = body fetch exhausted retries / no remaining targets -> sync fallback
+#   sync_fallback = any "falling back to sync" (body or justify)
+#   da_outbound_fail = native-da / block-data OUTBOUND FAILURE
+#   starvation = header-first body starvation
+#   pacing = exec-backlog pacing lines (selection caps scaled down / cancels-only)
+DISSEM=""
 for i in 0 1 2; do
-    grep -E ' ERROR | WARN |panicked|FAIL-STOP|fail-stop|book mode|resident|parallel|member cache|commit-lag|S470' "$RUN_DIR/val$i.log" | head -400 > "$OUT/val$i.log.excerpt"
+    lg=$(sed -E 's/\x1b\[[0-9;]*m//g' "$RUN_DIR/val$i.log" 2>/dev/null)
+    cnt() { printf '%s' "$lg" | grep -c -E "$1"; }
+    DISSEM="$DISSEM val$i:manifest=$(cnt 'HASH-ONLY manifest push'),exhausted=$(cnt 'body fetch (exhausted|has no remaining targets)'),sync_fallback=$(cnt 'falling back to sync'),da_outbound_fail=$(cnt '(native-da|block-data) OUTBOUND FAILURE'),starvation=$(cnt 'header-first body starvation'),pacing=$(cnt 'exec-backlog pacing')"
+done
+DISSEM=${DISSEM# }
+log "dissemination/pacing log counts: $DISSEM"
+for i in 0 1 2; do
+    grep -E ' ERROR | WARN |panicked|FAIL-STOP|fail-stop|book mode|resident|parallel|member cache|commit-lag|S470|manifest|body fetch|OUTBOUND FAILURE|exec-backlog pacing' "$RUN_DIR/val$i.log" | head -400 > "$OUT/val$i.log.excerpt"
     gzip -c "$RUN_DIR/val$i.log" > "$OUT/val$i.log.gz"
 done
 
@@ -347,6 +405,7 @@ python3 "$TOOLS_DIR/summarize.py" \
     --node-env "$NODE_ENV_JSON" --env-digests "$ENV_VERIFY" --extra-env "$EXTRA_ENV" \
     --bench-cmd "${BENCH_CMD[*]}" --pids "${PIDS[*]}" \
     --evicted "$EVICTED" --bench-submitted "${BENCH_SUBMITTED:-0}" \
+    --block-cap "${BLOCK_CAP:-}" --dissem "$DISSEM" \
     | tee -a "$OUT/run.log"
 rc=${PIPESTATUS[0]}
 log "done -> $OUT/summary.json"
