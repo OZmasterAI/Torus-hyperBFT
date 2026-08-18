@@ -50,12 +50,27 @@ fn arrivals() -> &'static ArrivalNotifier {
 #[derive(Clone)]
 pub struct NativeDaStore {
     db: StateDb,
+    /// Read-only fallback (view-legs trim, r2): when the node keeps its DA CFs
+    /// in the consensus-side split instance, bodies mirrored BEFORE the split
+    /// still live in the legacy shared state DB. Reads consult `db` first,
+    /// then this; writes go to `db` only, so the legacy set only ever shrinks
+    /// (a body re-mirrored after the split lands in `db` and shadows it).
+    legacy: Option<StateDb>,
 }
 
 impl NativeDaStore {
     /// Wrap a shared state-db handle.
     pub fn new(db: StateDb) -> Self {
-        Self { db }
+        Self { db, legacy: None }
+    }
+
+    /// DA store over the split instance `db`, falling back to `legacy` (the
+    /// shared state DB, where pre-split bodies were mirrored) on read misses.
+    pub fn with_legacy_fallback(db: StateDb, legacy: StateDb) -> Self {
+        Self {
+            db,
+            legacy: Some(legacy),
+        }
     }
 
     /// Store a body, keyed by its [`compute_action_hash`]. Idempotent: re-putting
@@ -138,7 +153,7 @@ impl NativeDaStore {
 
     /// Fetch a body by action-hash. Returns `None` if absent.
     pub fn get(&self, hash: &B256) -> Result<Option<SignedNativeAction>, StateError> {
-        match self.db.get_cf_raw(CF_NATIVE_PENDING, hash.as_slice())? {
+        match self.get_raw(&hash.0)? {
             Some(bytes) => {
                 let action = bincode::deserialize(&bytes)
                     .map_err(|e| StateError::InvalidData(e.to_string()))?;
@@ -153,7 +168,13 @@ impl NativeDaStore {
     /// bytes verbatim to a requesting peer. Takes the 32-byte hash directly so the
     /// network layer needn't depend on `alloy-primitives`. Returns `None` if absent.
     pub fn get_raw(&self, hash: &[u8; 32]) -> Result<Option<Vec<u8>>, StateError> {
-        self.db.get_cf_raw(CF_NATIVE_PENDING, hash.as_slice())
+        if let Some(bytes) = self.db.get_cf_raw(CF_NATIVE_PENDING, hash.as_slice())? {
+            return Ok(Some(bytes));
+        }
+        match &self.legacy {
+            Some(legacy) => legacy.get_cf_raw(CF_NATIVE_PENDING, hash.as_slice()),
+            None => Ok(None),
+        }
     }
 
     /// Remove bodies by hash (e.g. after commit + an eviction window). Best-effort:
@@ -161,6 +182,9 @@ impl NativeDaStore {
     pub fn remove(&self, hashes: &[B256]) -> Result<(), StateError> {
         for h in hashes {
             self.db.delete_cf_raw(CF_NATIVE_PENDING, h.as_slice())?;
+            if let Some(legacy) = &self.legacy {
+                legacy.delete_cf_raw(CF_NATIVE_PENDING, h.as_slice())?;
+            }
         }
         Ok(())
     }
@@ -169,7 +193,13 @@ impl NativeDaStore {
     /// filter calls this once per manifest hash, so it must not pay `get_raw`'s
     /// multi-KB value copy just to test existence.
     pub fn contains(&self, hash: &[u8; 32]) -> Result<bool, StateError> {
-        self.db.exists_cf_raw(CF_NATIVE_PENDING, hash.as_slice())
+        if self.db.exists_cf_raw(CF_NATIVE_PENDING, hash.as_slice())? {
+            return Ok(true);
+        }
+        match &self.legacy {
+            Some(legacy) => legacy.exists_cf_raw(CF_NATIVE_PENDING, hash.as_slice()),
+            None => Ok(false),
+        }
     }
 
     /// Erasure-encode each body under `params` and persist all `n` shards into
@@ -218,10 +248,14 @@ impl NativeDaStore {
         body_hash: &[u8; 32],
         index: u16,
     ) -> Result<Option<StoredShard>, StateError> {
-        match self
-            .db
-            .get_cf_raw(CF_NATIVE_SHARDS, &shard_key(body_hash, index))?
-        {
+        let key = shard_key(body_hash, index);
+        let mut found = self.db.get_cf_raw(CF_NATIVE_SHARDS, &key)?;
+        if found.is_none() {
+            if let Some(legacy) = &self.legacy {
+                found = legacy.get_cf_raw(CF_NATIVE_SHARDS, &key)?;
+            }
+        }
+        match found {
             Some(bytes) => Ok(Some(decode_stored_shard(&bytes)?)),
             None => Ok(None),
         }
@@ -251,6 +285,53 @@ mod tests {
             .expect("raw put");
         assert!(store.contains(&present).expect("contains present"));
         assert!(!store.contains(&absent).expect("contains absent"));
+    }
+
+    /// Split layout: reads fall back to the legacy shared DB for bodies
+    /// mirrored before the split; writes land in the split instance only and
+    /// shadow the legacy copy; removes clear both.
+    #[test]
+    fn legacy_fallback_reads_and_shadowing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let legacy = StateDb::open(&dir.path().join("state")).expect("open legacy");
+        let split = StateDb::open_consensus_split(&dir.path().join("consensus-kv"))
+            .expect("open split");
+        let old_body = dummy_action(1);
+        let old_hash = compute_action_hash(&old_body);
+        NativeDaStore::new(legacy.clone())
+            .put(&old_body)
+            .expect("legacy put");
+
+        let store = NativeDaStore::with_legacy_fallback(split.clone(), legacy.clone());
+        // Pre-split body visible through the fallback (all read entry points).
+        assert!(store.contains(&old_hash.0).unwrap());
+        assert_eq!(store.get(&old_hash).unwrap().unwrap().nonce, 1);
+        assert!(store.get_raw(&old_hash.0).unwrap().is_some());
+        // Absent everywhere.
+        assert!(!store.contains(&[9u8; 32]).unwrap());
+        assert!(store.get(&B256::from([9u8; 32])).unwrap().is_none());
+
+        // New body goes to the split DB only.
+        let new_body = dummy_action(2);
+        let new_hash = compute_action_hash(&new_body);
+        store.put_batch(&[new_body]).expect("split put");
+        assert!(split
+            .get_cf_raw(CF_NATIVE_PENDING, new_hash.as_slice())
+            .unwrap()
+            .is_some());
+        assert!(legacy
+            .get_cf_raw(CF_NATIVE_PENDING, new_hash.as_slice())
+            .unwrap()
+            .is_none());
+        assert_eq!(store.get(&new_hash).unwrap().unwrap().nonce, 2);
+
+        // Remove clears both copies.
+        store.remove(&[old_hash]).expect("remove");
+        assert!(!store.contains(&old_hash.0).unwrap());
+        assert!(legacy
+            .get_cf_raw(CF_NATIVE_PENDING, old_hash.as_slice())
+            .unwrap()
+            .is_none());
     }
 
     fn dummy_action(nonce: u64) -> SignedNativeAction {

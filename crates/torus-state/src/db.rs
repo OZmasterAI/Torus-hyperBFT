@@ -32,6 +32,28 @@ pub struct StateDb {
 impl StateDb {
     /// Open (or create) the database at the given path with all column families.
     pub fn open(path: &Path) -> Result<Self, StateError> {
+        Self::open_with_cfs(path, ALL_CF_NAMES, 256 * 1024 * 1024)
+    }
+
+    /// Open (or create) the node's CONSENSUS-SIDE split instance (view-legs
+    /// trim, r2): a second RocksDB holding only the column families the
+    /// consensus thread writes on its critical path — the hotstuff block tree
+    /// (`cf_consensus_meta`) and the native-DA body/shard store — so those
+    /// small, latency-critical writes never queue behind the exec thread's
+    /// multi-MB state batches in the shared instance's write groups. Same
+    /// per-CF tuning as [`open`](Self::open) with a smaller (64 MiB) block
+    /// cache; missing CFs are simply absent (`MissingColumnFamily` on access).
+    pub fn open_consensus_split(path: &Path) -> Result<Self, StateError> {
+        Self::open_with_cfs(
+            path,
+            &[CF_CONSENSUS_META, CF_NATIVE_PENDING, CF_NATIVE_SHARDS],
+            64 * 1024 * 1024,
+        )
+    }
+
+    /// Shared opener: `cf_names` are created if missing, `cache_bytes` sizes
+    /// the LRU block cache shared by them.
+    fn open_with_cfs(path: &Path, cf_names: &[&str], cache_bytes: usize) -> Result<Self, StateError> {
         let mut opts = Options::default();
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
@@ -75,7 +97,7 @@ impl StateDb {
         // ~8 MiB block cache and NO bloom filters by default, which is poor for
         // this node's point-lookup-heavy access (account / code / native-action
         // -by-hash). A shared cache + bloom filters is the main read win here.
-        let cache = Cache::new_lru_cache(256 * 1024 * 1024); // 256 MiB shared block cache
+        let cache = Cache::new_lru_cache(cache_bytes); // shared block cache (256 MiB main DB)
         let mut bbt = BlockBasedOptions::default();
         bbt.set_block_cache(&cache);
         bbt.set_bloom_filter(10.0, false); // ~1% false positives on point lookups
@@ -118,7 +140,7 @@ impl StateDb {
             name == CF_NATIVE_ORDER_BOOKS || name == CF_NATIVE_HASHED || name == CF_BOOK_ORDER_ROWS
         };
 
-        let cf_descriptors: Vec<ColumnFamilyDescriptor> = ALL_CF_NAMES
+        let cf_descriptors: Vec<ColumnFamilyDescriptor> = cf_names
             .iter()
             .map(|name| {
                 let opts = if *name == CF_CONSENSUS_META {

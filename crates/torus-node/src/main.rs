@@ -480,6 +480,17 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&cli.data_dir)?;
     let state_db = StateDb::open(&cli.data_dir)?;
     info!("state database opened");
+    // Consensus-side split instance (default on): hotstuff block tree + native
+    // DA bodies live in their own RocksDB so the consensus thread's small
+    // per-view writes never queue behind the exec thread's multi-MB state
+    // batches (see `torus_consensus::kv_store`). `None` = legacy shared layout.
+    let split_db = torus_consensus::kv_store::open_split_db(&cli.data_dir)?;
+    let open_kv_store = |legacy: &StateDb| -> Result<RocksKVStore, String> {
+        match &split_db {
+            Some(split) => RocksKVStore::from_split(split, &legacy.db_arc()),
+            None => Ok(RocksKVStore::new(legacy.db_arc())),
+        }
+    };
 
     // 4. Genesis initialization
     let mut chain_config = if let Some(genesis_path) = &cli.genesis {
@@ -495,7 +506,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
             // Initialize hotstuff_rs replica
             let (app_state, vs_state) = genesis.to_hotstuff_genesis()?;
-            let init_kv = RocksKVStore::open_for_node(&cli.data_dir, state_db.db_arc())?;
+            let init_kv = open_kv_store(&state_db)?;
             Replica::initialize(init_kv, app_state, vs_state);
             info!("consensus replica initialized with genesis validator set");
         } else {
@@ -533,7 +544,17 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         block_gas_limit: chain_config.evm_gas_limit,
         ..MempoolConfig::default()
     };
-    let mempool = Arc::new(Mempool::new(state_db.clone(), mempool_config));
+    // Native-DA body store: over the split instance (falling back to the shared
+    // state DB for bodies mirrored before the split), or the shared DB itself.
+    let native_da_store = match &split_db {
+        Some(split) => NativeDaStore::with_legacy_fallback(split.clone(), state_db.clone()),
+        None => NativeDaStore::new(state_db.clone()),
+    };
+    let mempool = Arc::new(Mempool::with_da_store(
+        state_db.clone(),
+        mempool_config,
+        native_da_store.clone(),
+    ));
 
     let signing_key_for_app = if !cli.rpc_only {
         Some(signing_key.clone())
@@ -550,8 +571,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // Hotstuff block-tree store: its own RocksDB instance by default so the
     // consensus thread's small per-view writes never queue behind the exec
     // thread's multi-MB state batches (see `torus_consensus::kv_store`).
-    let kv_store = RocksKVStore::open_for_node(&cli.data_dir, state_db.db_arc())?
-        .with_metrics(metrics.clone());
+    let kv_store = open_kv_store(&state_db)?.with_metrics(metrics.clone());
 
     // EVM executor
     let executor = Arc::new(EvmExecutor::new(chain_config.chain_id));
@@ -591,7 +611,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     );
     // Attach the durable DA store so the swarm can SERVE native-action bodies
     // by-hash on /torus/native-da/1.0 (Phase C Task 5 — RARE pull-fallback).
-    network.set_native_da_store(NativeDaStore::new(state_db.clone()));
+    network.set_native_da_store(native_da_store.clone());
     // Wire the erasure-shard recovery pull to the network (T8-integration inc 3):
     // an ADDITIVE pre-step to the whole-body pull — on a reconstruction miss it
     // gathers erasure shards spread across DISTINCT peers before the single-source

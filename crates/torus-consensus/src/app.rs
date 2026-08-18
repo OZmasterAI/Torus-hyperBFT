@@ -2803,17 +2803,17 @@ impl TorusApp {
             return Err(hashes.len()); // no DA store wired (consensus-only observer)
         };
 
-        let mut actions: Vec<Option<torus_types::SignedNativeAction>> = vec![None; hashes.len()];
-        let mut missing: Vec<usize> = Vec::new();
-        for (i, hash) in hashes.iter().enumerate() {
-            // Read the DURABLE DA store, not the ephemeral nonce-gated mempool: a
-            // block-referenced body survives the 60s nonce window, pool eviction, and a
-            // restart (livelock root cause, mem 28e1a821).
-            match mempool.get_native_da(hash) {
-                Some(action) => actions[i] = Some(action),
-                None => missing.push(i),
-            }
-        }
+        // Read the DURABLE DA store, not the ephemeral nonce-gated mempool: a
+        // block-referenced body survives the 60s nonce window, pool eviction, and a
+        // restart (livelock root cause, mem 28e1a821). Batched: one ingress-mirror
+        // flush for the whole block instead of one per body (view-legs trim, r2).
+        let mut actions: Vec<Option<torus_types::SignedNativeAction>> =
+            mempool.get_native_da_many(hashes);
+        let mut missing: Vec<usize> = actions
+            .iter()
+            .enumerate()
+            .filter_map(|(i, a)| a.is_none().then_some(i))
+            .collect();
 
         // (1) Bounded LOCAL retry: actions are normally delivered by the proposer's
         // pre-proposal unicast push (PreProposalBundle -> BroadcastNativeActions) before
@@ -2846,13 +2846,18 @@ impl TorusApp {
                 if let Some(ref fetcher) = self.da_fetcher {
                     Self::absorb_fetched_bodies(mempool, fetcher.as_ref());
                 }
-                missing.retain(|&i| match mempool.get_native_da(&hashes[i]) {
-                    Some(action) => {
-                        actions[i] = Some(action);
-                        false
+                // Same batched read for the retry: one flush per poll, not per body.
+                let missing_hashes: Vec<torus_types::B256> =
+                    missing.iter().map(|&i| hashes[i]).collect();
+                let found = mempool.get_native_da_many(&missing_hashes);
+                let mut still_missing = Vec::with_capacity(missing.len());
+                for (&i, body) in missing.iter().zip(found) {
+                    match body {
+                        Some(action) => actions[i] = Some(action),
+                        None => still_missing.push(i),
                     }
-                    None => true,
-                });
+                }
+                missing = still_missing;
                 if missing.is_empty() {
                     break;
                 }

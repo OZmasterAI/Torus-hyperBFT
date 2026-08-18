@@ -148,14 +148,23 @@ pub struct Mempool {
 impl Mempool {
     /// Create a new mempool backed by the given state database.
     pub fn new(state: StateDb, config: MempoolConfig) -> Self {
+        // DA store shares the same RocksDB handle; every native-action body the
+        // mempool sees is mirrored here durably (decoupled from the nonce gate).
+        let da_store = NativeDaStore::new(state.clone());
+        Self::with_da_store(state, config, da_store)
+    }
+
+    /// Like [`Mempool::new`] but over an explicit DA body store — the node
+    /// passes one over its consensus-side split RocksDB instance (view-legs
+    /// trim, r2) so the leader's pre-proposal body mirror and the follower's
+    /// pre-read mirror flush never queue behind exec write groups in the
+    /// shared state DB. `state` stays the EVM/account read source.
+    pub fn with_da_store(state: StateDb, config: MempoolConfig, da_store: NativeDaStore) -> Self {
         let native_pool = native_pool::NativePool::new(
             config.native_pool_max_size,
             config.native_per_sender_cap,
             config.native_per_block_cap,
         );
-        // DA store shares the same RocksDB handle; every native-action body the
-        // mempool sees is mirrored here durably (decoupled from the nonce gate).
-        let da_store = NativeDaStore::new(state.clone());
         let verified_cap = config.verified_sender_cache_cap;
         let initial_base_fee = config.initial_base_fee;
         Self {
@@ -648,6 +657,27 @@ impl Mempool {
                 None
             }
         }
+    }
+
+    /// Batched [`Mempool::get_native_da`]: ONE ingress-mirror flush, then a
+    /// point read per hash (`None` for a miss or a store error). The compact
+    /// block reconstruct path reads a whole block's bodies (up to the block
+    /// cap) on the consensus thread; the per-hash entry point flushed before
+    /// EVERY read, i.e. up to `cap` durable writes per validate under ingest
+    /// load (view-legs trim, r2).
+    pub fn get_native_da_many(&self, hashes: &[B256]) -> Vec<Option<SignedNativeAction>> {
+        // A buffered ingress mirror (T2.2) must be observable here too — once.
+        self.flush_da_mirrors();
+        hashes
+            .iter()
+            .map(|hash| match self.da_store.get(hash) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::error!("native DA store read failed: {e}");
+                    None
+                }
+            })
+            .collect()
     }
 
     /// Presence check for a SET of native-action bodies in the durable DA
@@ -1235,6 +1265,53 @@ mod tests {
         pool.add_native_action_presigned(sender, a2).unwrap();
         assert!(pool.get_native_da(&h2).is_some(), "flush-on-read");
         assert!(raw_store.get(&h2).unwrap().is_some());
+    }
+
+    /// View-legs trim (r2): the batched DA read flushes the ingress buffer
+    /// ONCE for the whole set (a still-buffered body is observable), keeps
+    /// input order, and reports misses as `None` in place.
+    #[test]
+    fn get_native_da_many_flushes_once_and_keeps_order() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state.clone(), MempoolConfig::default());
+        let key = k256::ecdsa::SigningKey::from_slice(
+            &alloy_primitives::hex::decode(
+                "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let now = now_ms();
+        let a1 = torus_types::eip712::sign_native_action(
+            torus_types::NativeAction::ClaimRewards,
+            now,
+            &key,
+        );
+        let a2 = torus_types::eip712::sign_native_action(
+            torus_types::NativeAction::ClaimRewards,
+            now + 1,
+            &key,
+        );
+        let sender = a1.recover_sender().unwrap();
+        let (h1, h2) = (
+            torus_types::compute_action_hash(&a1),
+            torus_types::compute_action_hash(&a2),
+        );
+        pool.add_native_action_presigned(sender, a1).unwrap();
+        pool.add_native_action_presigned(sender, a2).unwrap();
+        let raw_store = NativeDaStore::new(state);
+        assert!(raw_store.get(&h1).unwrap().is_none(), "still buffered");
+
+        let absent = B256::from([0xeeu8; 32]);
+        let got = pool.get_native_da_many(&[h2, absent, h1]);
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0].as_ref().map(|a| a.nonce), Some(now + 1));
+        assert!(got[1].is_none(), "miss reported in place");
+        assert_eq!(got[2].as_ref().map(|a| a.nonce), Some(now));
+        // The one flush made both bodies durable.
+        assert!(raw_store.get(&h1).unwrap().is_some());
+        assert!(raw_store.get(&h2).unwrap().is_some());
+        assert!(pool.da_pending.lock().unwrap().actions.is_empty());
     }
 
     #[test]

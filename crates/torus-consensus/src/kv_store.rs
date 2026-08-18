@@ -26,12 +26,20 @@
 //! that also live in `cf_consensus_meta` (`native_applied_height`,
 //! `pending_rotation:*`, `validator_whitelist:*`) stay where they are.
 //! `TORUS_CONSENSUS_KV_SPLIT=0` keeps the legacy shared-CF layout.
+//!
+//! The same split instance also hosts the native-DA body/shard CFs (see
+//! `open_split_db` and `torus_state::StateDb::open_consensus_split`): the
+//! leader's pre-proposal body mirror (a ~2 MB `put_batch` at cap 100 x bs400)
+//! and the follower's pre-read mirror flush are consensus-thread writes with
+//! the same exposure. Pre-split bodies remain readable through
+//! `NativeDaStore::with_legacy_fallback`.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use hotstuff_rs::block_tree::pluggables::{KVGet, KVStore, WriteBatch};
 use rocksdb::{ColumnFamilyDescriptor, Options, DB};
+use torus_state::StateDb;
 use torus_telemetry::Metrics;
 
 const CF_NAME: &str = "cf_consensus_meta";
@@ -73,6 +81,34 @@ pub fn sync_split_store_wal() -> Result<(), rocksdb::Error> {
         Some(db) => db.flush_wal(true),
         None => Ok(()),
     }
+}
+
+/// Open the node's consensus-side split RocksDB instance under
+/// `data_dir/consensus-kv` — the hotstuff block tree plus the native-DA
+/// body/shard CFs — or `None` when `TORUS_CONSENSUS_KV_SPLIT=0` (legacy: all
+/// of it stays in the shared state DB). Publishes the handle for the
+/// commit-boundary WAL fsync. Open it ONCE per process (RocksDB LOCK).
+pub fn open_split_db(data_dir: &Path) -> Result<Option<StateDb>, String> {
+    if !consensus_kv_split_enabled() {
+        tracing::info!(
+            "consensus split store: OFF (TORUS_CONSENSUS_KV_SPLIT=0) — hotstuff KVStore and native DA stay in the shared state DB"
+        );
+        return Ok(None);
+    }
+    let split = open_split_db_at(data_dir)?;
+    // First open wins; a later (re)open in-process keeps syncing the
+    // original handle, which is the same on-disk WAL anyway.
+    let _ = SPLIT_DB.set(split.db_arc());
+    Ok(Some(split))
+}
+
+fn open_split_db_at(data_dir: &Path) -> Result<StateDb, String> {
+    let path = RocksKVStore::split_path(data_dir);
+    std::fs::create_dir_all(&path).map_err(|e| format!("create {}: {e}", path.display()))?;
+    let split = StateDb::open_consensus_split(&path)
+        .map_err(|e| format!("open consensus split store {}: {e}", path.display()))?;
+    tracing::info!(path = %path.display(), "consensus split store: ON (hotstuff block tree + native DA)");
+    Ok(split)
 }
 
 /// True iff `key` belongs to the hotstuff block tree (vs. an app key that
@@ -140,20 +176,41 @@ impl RocksKVStore {
     /// Open the node's hotstuff store: the split instance under
     /// `data_dir/consensus-kv` (default), migrating the block tree out of the
     /// legacy shared CF on first open, or the legacy shared-CF store when
-    /// `TORUS_CONSENSUS_KV_SPLIT=0`.
+    /// `TORUS_CONSENSUS_KV_SPLIT=0`. Offline tooling entry point — the node
+    /// itself calls [`open_split_db`] once and hands the same instance to both
+    /// [`RocksKVStore::from_split`] and its native-DA store.
     pub fn open_for_node(data_dir: &Path, legacy: Arc<DB>) -> Result<Self, String> {
-        if consensus_kv_split_enabled() {
-            let store = Self::open_split(data_dir, &legacy)?;
-            // First open wins; a later (re)open in-process keeps syncing the
-            // original handle, which is the same on-disk WAL anyway.
-            let _ = SPLIT_DB.set(store.db.clone());
-            Ok(store)
-        } else {
-            tracing::info!(
-                "hotstuff KVStore: legacy shared cf_consensus_meta layout (TORUS_CONSENSUS_KV_SPLIT=0)"
-            );
-            Ok(Self::new(legacy))
+        match open_split_db(data_dir)? {
+            Some(split) => Self::from_split(&split, &legacy),
+            None => Ok(Self::new(legacy)),
         }
+    }
+
+    /// The hotstuff store inside an already-open split instance (see
+    /// [`open_split_db`]). When it holds no hotstuff keys and `legacy` (the
+    /// shared state DB) does, the block tree is copied over first (one-time
+    /// migration; the legacy keys are left in place and simply never read
+    /// again). Idempotent: an already-migrated store is used as-is.
+    pub fn from_split(split: &StateDb, legacy: &Arc<DB>) -> Result<Self, String> {
+        let store = Self::new(split.db_arc());
+        let migrated = store
+            .migrate_from_legacy(legacy)
+            .map_err(|e| format!("migrate hotstuff block tree into the split store: {e}"))?;
+        match migrated {
+            Some(n) => tracing::warn!(
+                keys = n,
+                "hotstuff KVStore: migrated block tree from the shared state DB into the split store (one-time)"
+            ),
+            None => tracing::info!("hotstuff KVStore: split RocksDB instance"),
+        }
+        Ok(store)
+    }
+
+    /// Test/tooling helper: force-open the split instance under `data_dir`
+    /// (ignoring the env knob) and return its hotstuff store.
+    pub fn open_split(data_dir: &Path, legacy: &Arc<DB>) -> Result<Self, String> {
+        let split = open_split_db_at(data_dir)?;
+        Self::from_split(&split, legacy)
     }
 
     /// Read-only view of the node's hotstuff store for offline tooling
@@ -174,37 +231,6 @@ impl RocksKVStore {
             db: Arc::new(db),
             metrics: None,
         })
-    }
-
-    /// Open the split store under `data_dir/consensus-kv`. When it holds no
-    /// hotstuff keys and `legacy` (the shared state DB) does, the block tree is
-    /// copied over first (one-time migration; the legacy keys are left in place
-    /// and simply never read again). Idempotent: an already-migrated store is
-    /// opened as-is.
-    pub fn open_split(data_dir: &Path, legacy: &Arc<DB>) -> Result<Self, String> {
-        let path = Self::split_path(data_dir);
-        std::fs::create_dir_all(&path)
-            .map_err(|e| format!("create {}: {e}", path.display()))?;
-        let store =
-            Self::try_open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
-        let migrated = store.migrate_from_legacy(legacy).map_err(|e| {
-            format!(
-                "migrate hotstuff block tree into {}: {e}",
-                path.display()
-            )
-        })?;
-        match migrated {
-            Some(n) => tracing::warn!(
-                keys = n,
-                path = %path.display(),
-                "hotstuff KVStore: migrated block tree from the shared state DB into the split store (one-time)"
-            ),
-            None => tracing::info!(
-                path = %path.display(),
-                "hotstuff KVStore: split RocksDB instance"
-            ),
-        }
-        Ok(store)
     }
 
     /// Copy every hotstuff key from `legacy`'s `cf_consensus_meta` into this
