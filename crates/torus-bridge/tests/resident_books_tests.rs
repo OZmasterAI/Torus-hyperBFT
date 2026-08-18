@@ -443,6 +443,111 @@ fn fatal_context_invalidates_holder_on_stash() {
 }
 
 // ============================================================================
+// 3b. Blocks that skip the native path (no native actions, no fee revenue)
+//     leave the books untouched: the holder advances instead of going stale.
+//     (r2 resident-books-stale-rebuild: on devnet, every empty block between
+//     two native blocks tripped the guard — "resident_height=376
+//     block_height=379" — and forced a multi-second full rebuild.)
+// ============================================================================
+
+#[test]
+fn untouched_blocks_advance_holder_and_keep_reuse() {
+    let (_dir, db) = open_test_db();
+    let mut holder = ResidentBooks::default();
+
+    // Block 1 (resident): rest one order, save, stash, marker=1.
+    let mut ctx = make_ctx(db.clone(), 1, true, Some(&mut holder));
+    fund_native(&ctx, &addr(1), fp(1_000_000));
+    let r = NativeExecutor::execute_batch(&mut ctx, &[place(addr(1), gtc(1, true, 100, 5))]);
+    assert!(r.results[0].success);
+    ctx.save_order_books();
+    ctx.stash_resident(&mut holder);
+    db.put_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT, &1u64.to_be_bytes())
+        .unwrap();
+    assert_eq!(holder.height(), Some(1));
+
+    // Blocks 2 and 3 skip the native path entirely (empty blocks): the
+    // pipeline writes the standalone marker and advances the holder.
+    for h in 2..=3u64 {
+        db.put_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT, &h.to_be_bytes())
+            .unwrap();
+        assert!(holder.advance_untouched(h), "block {h} is the direct successor");
+        assert_eq!(holder.height(), Some(h));
+        assert!(holder.is_populated());
+    }
+
+    // Block 4 (resident, native): the holder is exactly the DB's post-state
+    // → reuse, NO rebuild, and the resting order is still there.
+    let ctx = make_ctx(db.clone(), 4, true, Some(&mut holder));
+    assert!(
+        ctx.resident_reused(),
+        "holder advanced across untouched blocks must be reused (no stale rebuild)"
+    );
+    let book = ctx.order_books.get(&1).expect("resident book");
+    assert_eq!(book.order_count(), 1);
+}
+
+#[test]
+fn advance_untouched_non_successor_invalidates() {
+    let (_dir, db) = open_test_db();
+    let mut holder = ResidentBooks::default();
+
+    // Empty holder: nothing to advance.
+    assert!(!holder.advance_untouched(1));
+    assert!(!holder.is_populated());
+    assert_eq!(holder.height(), None);
+
+    let mut ctx = make_ctx(db.clone(), 1, true, Some(&mut holder));
+    fund_native(&ctx, &addr(1), fp(1_000_000));
+    let r = NativeExecutor::execute_batch(&mut ctx, &[place(addr(1), gtc(1, true, 100, 5))]);
+    assert!(r.results[0].success);
+    ctx.save_order_books();
+    ctx.stash_resident(&mut holder);
+    assert_eq!(holder.height(), Some(1));
+
+    // Same height again (replayed) and a skipped height are NOT successors:
+    // the holder is drained (strict — the DB is authoritative from here).
+    assert!(!holder.advance_untouched(1), "same height is not a successor");
+    assert!(!holder.is_populated(), "non-successor advance must drain the holder");
+
+    let mut ctx = make_ctx(db.clone(), 1, true, Some(&mut holder));
+    assert!(!ctx.resident_reused());
+    ctx.save_order_books();
+    ctx.stash_resident(&mut holder);
+    assert_eq!(holder.height(), Some(1));
+    assert!(!holder.advance_untouched(3), "gap (1 → 3) is not a successor");
+    assert!(!holder.is_populated());
+}
+
+#[test]
+fn advance_untouched_without_marker_write_still_rebuilds() {
+    // The advance stamps memory only; if the standalone marker write for the
+    // empty block did not land, the marker check must still trip the guard.
+    let (_dir, db) = open_test_db();
+    let mut holder = ResidentBooks::default();
+
+    let mut ctx = make_ctx(db.clone(), 1, true, Some(&mut holder));
+    fund_native(&ctx, &addr(1), fp(1_000_000));
+    let r = NativeExecutor::execute_batch(&mut ctx, &[place(addr(1), gtc(1, true, 100, 5))]);
+    assert!(r.results[0].success);
+    ctx.save_order_books();
+    ctx.stash_resident(&mut holder);
+    db.put_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT, &1u64.to_be_bytes())
+        .unwrap();
+
+    // Block 2 empty: holder advanced, but the marker stays at 1.
+    assert!(holder.advance_untouched(2));
+    assert_eq!(holder.height(), Some(2));
+
+    let ctx = make_ctx(db.clone(), 3, true, Some(&mut holder));
+    assert!(
+        !ctx.resident_reused(),
+        "marker (1) != holder (2) must still force a rebuild"
+    );
+    assert!(!holder.is_populated());
+}
+
+// ============================================================================
 // 4. Journal-driven saves stay O(changed) on a deep resident book
 // ============================================================================
 
