@@ -369,3 +369,33 @@ meta/stop rows, qty‖count prefixes; different hashes and root), the 4×4
 fail-stop matrix, and `mode3_incremental_saves_survive_fresh_reload_boot_verify`
 (one resident ctx over 12 blocks of deep-level fills/cancels/modifies/
 cancel-alls, then a fresh reload whose boot verify recomputes from scratch).
+
+### 7.1 Restack notes (r2): parallel drain + the O(depth) term that was NOT the hash
+
+Save path: mode 3 rides the mode-2 two-pass save (`save_level_authority` —
+parallel journal drain across dirty books on `TORUS_SAVE_BOOKS_WORKERS`
+threads, then serial market-ascending writes). `drain_book` selects the
+chunked digest per book (`set_level_hash_chunked(true)`, sponge cache off)
+instead of `ensure_level_hash_cache`; the drain is a pure function of the
+book either way, so the thread layout cannot change a byte
+(`save_books_workers_matrix_mode3_chunked_byte_identical`: workers ∈
+{1,2,4,8,64} identical, parallel path engaged, fresh mode-3 reload passes
+boot verify 3, mode-2 reload of the same DB fail-stops).
+
+r1 bench finding (10 markets, band 5, 120 s): mode 3 cut early-window
+`save_books` −40 % vs mode 2 (114–124 vs 190–206 ms/blk) but was NOT flat —
+it still grew with resting depth (231 → ~1 000 ms/blk) and converged toward
+mode 2 late (832 vs 781). The level hash was already cheap; the residual
+O(depth) term was the ROW journal: `take_row_ops` re-encodes every journaled
+row through `get_order`, which located the order in its level with
+`iter().position(|o| o.id == id)` — a front-to-back scan of a level thousands
+deep, for tens of thousands of appended rows per block (O(rows × depth), the
+same in mode 2/3, and the same scan in `cancel_order` / `cancel_all` /
+in-place `modify_order`). Level queues are seq-ascending by construction, so
+`OrderBook::queue_position` now binary-searches on seq (`order_seq` probes) —
+O(log depth); measured 10.66 → 0.86 µs/row on a 7 000-deep level (release,
+`take_row_ops_timing_probe_deep_level`), depth-independent. Pure lookup:
+which order is found, every byte and every semantic is unchanged, all modes.
+Expectation for the r2 cell: mode-3 `save_books` early/late 60 s windows flat
+(rows and levels both O(ops)); the same lookup fix also lowers the mode-2
+control's late window, so compare mode 3 vs mode 2 on the SAME binary.
