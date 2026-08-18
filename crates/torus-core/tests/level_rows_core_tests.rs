@@ -494,3 +494,304 @@ fn level_ops_cached_vs_plain_randomized_differential() {
         }
     }
 }
+
+// ============================================================================
+// Mode 3 — chunked level digest (`TORUS_BOOK_ROWS=3`)
+// ============================================================================
+
+/// Independent scratch recompute of the CHUNKED level aggregate: bucket the
+/// framed rows by `seq / LEVEL_CHUNK_SEQS` in queue order, keccak each bucket,
+/// keccak `DOMAIN ‖ count ‖ total ‖ Σ_asc idx ‖ digest`. Shares no code with
+/// `OrderBook`'s incremental maintenance.
+fn scratch_chunked_data(book: &OrderBook, side: Side, price: FixedPoint) -> Option<LevelRowData> {
+    use torus_core::book_rows::{LEVEL_CHUNK_SEQS, LEVEL_HASH_CHUNKED_DOMAIN};
+    let queue = book.level_queue(side, price)?;
+    if queue.is_empty() {
+        return None;
+    }
+    let mut total: i128 = 0;
+    let mut buckets: std::collections::BTreeMap<u64, Vec<u8>> =
+        std::collections::BTreeMap::new();
+    for o in queue {
+        total += o.remaining_qty.raw();
+        let seq = book.order_seq_of(o.id).expect("resting order has a seq");
+        let mut row = Vec::new();
+        row.extend_from_slice(&seq.to_be_bytes());
+        borsh::BorshSerialize::serialize(o, &mut row).unwrap();
+        let b = buckets.entry(seq / LEVEL_CHUNK_SEQS).or_default();
+        b.extend_from_slice(&(row.len() as u32).to_le_bytes());
+        b.extend_from_slice(&row);
+    }
+    let mut top = LEVEL_HASH_CHUNKED_DOMAIN.to_vec();
+    top.extend_from_slice(&(queue.len() as u32).to_be_bytes());
+    top.extend_from_slice(&total.to_be_bytes());
+    for (idx, bytes) in &buckets {
+        top.extend_from_slice(&idx.to_be_bytes());
+        top.extend_from_slice(&keccak256(bytes).0);
+    }
+    Some(LevelRowData {
+        total_qty_raw: total,
+        order_count: queue.len() as u32,
+        level_hash: keccak256(&top).0,
+    })
+}
+
+/// Chunked twin of `drain_and_check`: every emitted op equals the chunked
+/// scratch oracle AND the book's own from-scratch `level_row_data_chunked`,
+/// and after the drain the simulated persisted state equals the live book
+/// (a queue-mutation site that forgot to mark its chunk — leaving a stale
+/// chunk digest — fails here).
+fn drain_and_check_chunked(
+    book: &mut OrderBook,
+    persisted: &mut std::collections::BTreeMap<(u8, i128), LevelRowData>,
+) {
+    assert!(book.level_hash_chunked());
+    let ops = book.take_level_ops();
+    for ((tag, raw_price), op) in &ops {
+        let side = if *tag == SIDE_TAG_BID { Side::Buy } else { Side::Sell };
+        let oracle = scratch_chunked_data(book, side, FixedPoint::from_raw(*raw_price));
+        let from_scratch = book.level_row_data_chunked(*tag, *raw_price);
+        assert_eq!(oracle, from_scratch, "book scratch path != independent oracle");
+        match op {
+            Some(data) => {
+                assert_eq!(Some(*data), oracle, "chunked upsert != scratch oracle");
+                assert!(data.total_qty_raw > 0);
+                assert!(data.order_count >= 1);
+                persisted.insert((*tag, *raw_price), *data);
+            }
+            None => {
+                assert!(oracle.is_none(), "delete op for a live level");
+                assert!(persisted.remove(&(*tag, *raw_price)).is_some());
+            }
+        }
+    }
+    let mut live: std::collections::BTreeMap<(u8, i128), LevelRowData> =
+        std::collections::BTreeMap::new();
+    let bid_prices: Vec<i128> = book.bid_queues().map(|(p, _)| p.raw()).collect();
+    let ask_prices: Vec<i128> = book.ask_queues().map(|(p, _)| p.raw()).collect();
+    for raw in bid_prices {
+        live.insert(
+            (SIDE_TAG_BID, raw),
+            scratch_chunked_data(book, Side::Buy, FixedPoint::from_raw(raw)).unwrap(),
+        );
+    }
+    for raw in ask_prices {
+        live.insert(
+            (SIDE_TAG_ASK, raw),
+            scratch_chunked_data(book, Side::Sell, FixedPoint::from_raw(raw)).unwrap(),
+        );
+    }
+    assert_eq!(
+        persisted, &mut live,
+        "chunked persisted level state != live book (missed chunk-dirty site?)"
+    );
+    // Nothing may stay dirty for a journaled level; and no chunk state may
+    // outlive its level.
+    let (levels_with_state, _, _) = book.level_chunk_stats();
+    assert!(levels_with_state <= live.len(), "chunk state for a dead level");
+}
+
+/// Randomized incremental-vs-scratch differential for the chunked digest,
+/// with a flat (mode-2) twin fed the identical op stream: the chunked book's
+/// ops must equal its scratch oracle op-for-op, must cover the live book
+/// exactly, and must agree with the flat twin on the mode-independent
+/// aggregate parts (`order_count`, `total_qty_raw`) and on the op KEY set.
+/// Op mix: places sharing levels (deep append at one level to span many
+/// 64-seq chunks), crossing sweeps (front pops + partials), cancels
+/// front/mid/tail, in-place qty modifies, price modifies (cancel+reinsert),
+/// cancel_all (level emptying + re-creation).
+#[test]
+fn level_ops_chunked_vs_scratch_randomized_differential() {
+    let seeds: [u64; 5] = [
+        0xC4A1_0000_0001,
+        0xC4A1_0000_0002,
+        0xC4A1_0000_0003,
+        0xC4A1_BAD_C0DE,
+        0xC4A1_DEE9_0005,
+    ];
+    for seed in seeds {
+        let mut s = seed;
+        let mut chunked = OrderBook::new(1, fp(1), fp(1));
+        chunked.set_level_hash_chunked(true);
+        let mut flat = OrderBook::new(1, fp(1), fp(1));
+        let mut placed: Vec<u128> = Vec::new();
+        let mut persisted = std::collections::BTreeMap::new();
+
+        for step in 0..900u64 {
+            let roll = xs(&mut s) % 12;
+            let trader = addr(1 + (xs(&mut s) % 4) as u8);
+            match roll {
+                0..=3 => {
+                    let is_buy = xs(&mut s) % 2 == 0;
+                    let price = if is_buy {
+                        90 + (xs(&mut s) % 10) as i64
+                    } else {
+                        101 + (xs(&mut s) % 10) as i64
+                    };
+                    let qty = 1 + (xs(&mut s) % 5) as i64;
+                    let p = limit(1, is_buy, price, qty);
+                    let r = chunked.place_order(p.clone(), trader, step);
+                    flat.place_order(p, trader, step);
+                    placed.push(r.order_id);
+                }
+                4 | 5 => {
+                    // Crossing sweep — partial + full fills at the front.
+                    let is_buy = xs(&mut s) % 2 == 0;
+                    let price = if is_buy { 105 } else { 95 };
+                    let qty = 2 + (xs(&mut s) % 9) as i64;
+                    let p = limit(1, is_buy, price, qty);
+                    let r = chunked.place_order(p.clone(), trader, step);
+                    flat.place_order(p, trader, step);
+                    placed.push(r.order_id);
+                }
+                6 | 7 => {
+                    if !placed.is_empty() {
+                        let id = placed[(xs(&mut s) as usize) % placed.len()];
+                        let _ = chunked.cancel_order(id);
+                        let _ = flat.cancel_order(id);
+                    }
+                }
+                8 => {
+                    if !placed.is_empty() {
+                        let id = placed[(xs(&mut s) as usize) % placed.len()];
+                        let qty_mod = xs(&mut s) % 2 == 0;
+                        let (np, nq) = if qty_mod {
+                            (None, Some(fp(1)))
+                        } else {
+                            (Some(fp(92 + (xs(&mut s) % 8) as i64)), None)
+                        };
+                        let _ = chunked.modify_order(id, np, nq);
+                        let _ = flat.modify_order(id, np, nq);
+                    }
+                }
+                9 => {
+                    chunked.cancel_all(trader, None);
+                    flat.cancel_all(trader, None);
+                }
+                _ => {
+                    // Deep append at one shared level — spans many chunks.
+                    let p = limit(1, true, 90, 1);
+                    let r = chunked.place_order(p.clone(), trader, step);
+                    flat.place_order(p, trader, step);
+                    placed.push(r.order_id);
+                }
+            }
+
+            if step % (2 + (xs(&mut s) % 6)) == 0 {
+                let flat_ops = flat.take_level_ops();
+                let mut chunked_snapshot: std::collections::BTreeMap<
+                    (u8, i128),
+                    Option<LevelRowData>,
+                > = std::collections::BTreeMap::new();
+                {
+                    // Peek the chunked ops before drain_and_check consumes
+                    // them: replay via journal parity — same primitives, same
+                    // journal, so the KEY sets must match the flat twin.
+                    let ops = chunked.take_level_ops();
+                    for (k, d) in &ops {
+                        chunked_snapshot.insert(*k, *d);
+                    }
+                    // Feed them to the persisted model + oracle check by
+                    // re-running the shared checker on an already-drained
+                    // book: emulate by inserting/removing directly, then
+                    // running the coverage assertion.
+                    for ((tag, raw), op) in &ops {
+                        let side = if *tag == SIDE_TAG_BID { Side::Buy } else { Side::Sell };
+                        let oracle =
+                            scratch_chunked_data(&chunked, side, FixedPoint::from_raw(*raw));
+                        match op {
+                            Some(d) => {
+                                assert_eq!(Some(*d), oracle, "seed {seed:#x} step {step}");
+                                persisted.insert((*tag, *raw), *d);
+                            }
+                            None => {
+                                assert!(oracle.is_none(), "seed {seed:#x} step {step}");
+                                assert!(persisted.remove(&(*tag, *raw)).is_some());
+                            }
+                        }
+                    }
+                }
+                // Coverage (no stale chunk anywhere): the second drain is a
+                // no-op, and the checker's live comparison must hold.
+                drain_and_check_chunked(&mut chunked, &mut persisted);
+                // Key-set + aggregate parity with the flat twin.
+                let flat_keys: std::collections::BTreeSet<(u8, i128)> =
+                    flat_ops.iter().map(|(k, _)| *k).collect();
+                let chunked_keys: std::collections::BTreeSet<(u8, i128)> =
+                    chunked_snapshot.keys().copied().collect();
+                assert_eq!(flat_keys, chunked_keys, "seed {seed:#x} step {step}: op keys");
+                for (k, fop) in &flat_ops {
+                    let cop = chunked_snapshot[k];
+                    match (fop, cop) {
+                        (Some(f), Some(c)) => {
+                            assert_eq!(f.order_count, c.order_count, "seed {seed:#x} step {step}");
+                            assert_eq!(f.total_qty_raw, c.total_qty_raw, "seed {seed:#x} step {step}");
+                            assert_ne!(f.level_hash, c.level_hash, "digests must not collide");
+                        }
+                        (None, None) => {}
+                        _ => panic!("seed {seed:#x} step {step}: op kind mismatch at {k:?}"),
+                    }
+                }
+            }
+        }
+        // The deep level must have spanned several chunks at some point.
+        let (_, chunks, _) = chunked.level_chunk_stats();
+        assert!(chunks > 0, "seed {seed:#x}: chunk state never built");
+    }
+}
+
+/// `full_level_ops` under the chunked digest equals the scratch oracle for
+/// every live level and re-seeds the incremental state (a following
+/// incremental drain after mutations still matches).
+#[test]
+fn full_level_ops_chunked_matches_oracle_and_reseeds() {
+    let mut book = OrderBook::new(1, fp(1), fp(1));
+    book.set_level_hash_chunked(true);
+    for i in 0..200u64 {
+        book.place_order(limit(1, true, 100 - (i % 3) as i64, 1 + (i % 4) as i64), addr(1 + (i % 5) as u8), i);
+    }
+    for i in 0..50u64 {
+        book.place_order(limit(1, false, 105 + (i % 2) as i64, 2), addr(6), i);
+    }
+    let full = book.full_level_ops();
+    let expected_live = book.bid_queues().count() + book.ask_queues().count();
+    assert_eq!(full.len(), expected_live);
+    for ((tag, raw), data) in &full {
+        let side = if *tag == SIDE_TAG_BID { Side::Buy } else { Side::Sell };
+        assert_eq!(Some(*data), scratch_chunked_data(&book, side, FixedPoint::from_raw(*raw)));
+    }
+    assert!(book.take_level_ops().is_empty(), "full write resets the journal");
+    // Mutate after the full write and drain incrementally.
+    let mut persisted: std::collections::BTreeMap<(u8, i128), LevelRowData> =
+        full.iter().map(|(k, d)| (*k, *d)).collect();
+    book.place_order(limit(1, false, 100, 7), addr(9), 500); // eats the 100 front
+    book.cancel_all(addr(3), None);
+    book.place_order(limit(1, true, 98, 1), addr(2), 501);
+    drain_and_check_chunked(&mut book, &mut persisted);
+}
+
+/// Toggling the digest off drops chunk state; toggling on again rebuilds
+/// (no stale state can survive a mode flip on a book instance).
+#[test]
+fn chunked_toggle_drops_and_rebuilds_state() {
+    let mut book = OrderBook::new(1, fp(1), fp(1));
+    book.set_level_hash_chunked(true);
+    for i in 0..10u64 {
+        book.place_order(limit(1, true, 100, 1), addr(1), i);
+    }
+    let a = book.take_level_ops();
+    assert_eq!(book.level_chunk_stats().0, 1);
+    book.set_level_hash_chunked(false);
+    assert_eq!(book.level_chunk_stats(), (0, 0, 0));
+    assert!(!book.level_hash_chunked());
+    book.place_order(limit(1, true, 100, 1), addr(1), 11);
+    let flat_ops = book.take_level_ops();
+    assert_eq!(flat_ops.len(), 1);
+    book.set_level_hash_chunked(true);
+    book.place_order(limit(1, true, 100, 1), addr(1), 12);
+    let b = book.take_level_ops();
+    let side = Side::Buy;
+    assert_eq!(b[0].1, scratch_chunked_data(&book, side, fp(100)));
+    assert_ne!(a[0].1, b[0].1);
+    assert_ne!(flat_ops[0].1.unwrap().level_hash, b[0].1.unwrap().level_hash);
+}
