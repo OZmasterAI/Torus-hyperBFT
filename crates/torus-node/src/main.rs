@@ -362,11 +362,84 @@ mod commit_lag_cap_tests {
 }
 
 // ---------------------------------------------------------------------------
+// Thread-pool bounding (P1): TORUS_CORE_BUDGET / TORUS_TOKIO_WORKERS
+// ---------------------------------------------------------------------------
+
+/// Worker-thread count for the main (consensus + libp2p) tokio runtime.
+/// `TORUS_TOKIO_WORKERS` (>= 1) wins; else the `TORUS_CORE_BUDGET` when set;
+/// else `None` = tokio's own default (host parallelism) — exact-today.
+/// Node-local: thread counts change wall-clock only, never state.
+fn resolve_tokio_workers(tokio_env: Option<&str>, budget: Option<usize>) -> Option<usize> {
+    torus_types::core_budget::parse_pool_override(tokio_env).or(budget)
+}
+
+/// Global rayon pool size to pin at startup. `None` = leave rayon to its lazy
+/// default (which itself honours `RAYON_NUM_THREADS`, else the host) —
+/// exact-today. Only when a `TORUS_CORE_BUDGET` is set AND `RAYON_NUM_THREADS`
+/// is not do we install a bounded global pool (an explicit rayon env stays the
+/// operator's call).
+fn resolve_global_rayon_threads(rayon_env: Option<&str>, budget: Option<usize>) -> Option<usize> {
+    match rayon_env.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(_) => None,
+        None => budget,
+    }
+}
+
+#[cfg(test)]
+mod pool_bounding_tests {
+    use super::{resolve_global_rayon_threads, resolve_tokio_workers};
+
+    /// Unset everything => tokio keeps its own default (host parallelism).
+    #[test]
+    fn tokio_workers_default_is_tokio_default() {
+        assert_eq!(resolve_tokio_workers(None, None), None);
+        assert_eq!(resolve_tokio_workers(Some("0"), None), None);
+        assert_eq!(resolve_tokio_workers(Some("garbage"), None), None);
+    }
+
+    /// Budget bounds the runtime; the explicit knob wins over the budget.
+    #[test]
+    fn tokio_workers_budget_then_override() {
+        assert_eq!(resolve_tokio_workers(None, Some(5)), Some(5));
+        assert_eq!(resolve_tokio_workers(Some("3"), Some(5)), Some(3));
+        assert_eq!(resolve_tokio_workers(Some("0"), Some(5)), Some(5));
+        assert_eq!(resolve_tokio_workers(Some(" 2 "), None), Some(2));
+    }
+
+    /// Global rayon is only pinned when a budget is set and rayon's own env
+    /// is absent; RAYON_NUM_THREADS (any non-empty value) is left to rayon.
+    #[test]
+    fn global_rayon_pinned_only_under_budget() {
+        assert_eq!(resolve_global_rayon_threads(None, None), None);
+        assert_eq!(resolve_global_rayon_threads(None, Some(5)), Some(5));
+        assert_eq!(resolve_global_rayon_threads(Some("4"), Some(5)), None);
+        assert_eq!(resolve_global_rayon_threads(Some(""), Some(5)), Some(5));
+        assert_eq!(resolve_global_rayon_threads(Some("4"), None), None);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
-#[tokio::main]
-async fn main() {
+/// Explicit runtime construction (replaces `#[tokio::main]`) so the main
+/// runtime's worker count can be bounded via `TORUS_TOKIO_WORKERS` /
+/// `TORUS_CORE_BUDGET`. Unset => identical to `#[tokio::main]`
+/// (`new_multi_thread().enable_all()`, host-parallelism workers).
+fn main() {
+    let budget = torus_types::core_budget::configured_core_budget();
+    let tokio_workers =
+        resolve_tokio_workers(std::env::var("TORUS_TOKIO_WORKERS").ok().as_deref(), budget);
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder.enable_all();
+    if let Some(n) = tokio_workers {
+        builder.worker_threads(n);
+    }
+    let rt = builder.build().expect("failed to build main tokio runtime");
+    rt.block_on(async_main(budget, tokio_workers));
+}
+
+async fn async_main(core_budget: Option<usize>, tokio_workers: Option<usize>) {
     let mut cli = Cli::parse();
 
     // Load config file if specified (CLI flags take precedence)
@@ -406,6 +479,35 @@ async fn main() {
         version = env!("CARGO_PKG_VERSION"),
         data_dir = %cli.data_dir.display(),
         "starting torus-node"
+    );
+
+    // 1b. Thread-pool bounding (P1). Under a TORUS_CORE_BUDGET the global rayon
+    // pool (consensus verify, per-market matching, bucket hashing) is pinned to
+    // the budget unless RAYON_NUM_THREADS already says otherwise. Must run
+    // before the first rayon use; a build failure (pool already initialised)
+    // is only logged — rayon then keeps its own default.
+    let host_parallelism = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(0);
+    let rayon_global = resolve_global_rayon_threads(
+        std::env::var("RAYON_NUM_THREADS").ok().as_deref(),
+        core_budget,
+    );
+    if let Some(n) = rayon_global {
+        if let Err(e) = rayon::ThreadPoolBuilder::new()
+            .num_threads(n)
+            .build_global()
+        {
+            warn!(threads = n, %e, "could not pin global rayon pool; rayon default stays");
+        }
+    }
+    info!(
+        host_parallelism,
+        core_budget = core_budget.map(|n| n as i64).unwrap_or(-1),
+        tokio_workers = tokio_workers.map(|n| n as i64).unwrap_or(-1),
+        rayon_global = rayon_global.map(|n| n as i64).unwrap_or(-1),
+        rayon_current = rayon::current_num_threads(),
+        "core budget: thread-pool sizing (-1 = library default / host)"
     );
 
     if let Err(e) = run(cli).await {
@@ -610,15 +712,16 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         // serial inbound task capped verified ingest at a single ecrecover at
         // a time, and the GLOBAL pool is off-limits (a shared pool starved
         // consensus verify historically, s352). Half the cores (min 2) keeps
-        // ingest parallel without starving the consensus threads.
+        // ingest parallel without starving the consensus threads. "Cores" =
+        // TORUS_CORE_BUDGET when set (shared-rig bounding), else the host;
+        // TORUS_GOSSIP_VERIFY_THREADS overrides the pool size outright.
         let gossip_verify_pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(
-                (std::thread::available_parallelism()
-                    .map(|n| n.get())
-                    .unwrap_or(8)
-                    / 2)
-                .max(2),
-            )
+            .num_threads(torus_types::core_budget::pool_threads(
+                "TORUS_GOSSIP_VERIFY_THREADS",
+                torus_types::core_budget::half_cores_min2(
+                    torus_types::core_budget::core_budget_or(8),
+                ),
+            ))
             .thread_name(|i| format!("torus-gossip-verify-{i}"))
             .build()
             .expect("build gossip verify pool");
@@ -920,12 +1023,19 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     // Spawn RPC on a dedicated tokio runtime so user traffic can never
     // starve the consensus/libp2p runtime (same idea as Hyperliquid sentries).
+    // 4 workers (exact-today), or fewer under a smaller TORUS_CORE_BUDGET;
+    // TORUS_RPC_WORKERS overrides outright.
+    let rpc_workers = torus_types::core_budget::pool_threads(
+        "TORUS_RPC_WORKERS",
+        torus_types::core_budget::core_budget_or(4).min(4),
+    );
+    info!(rpc_workers, "rpc runtime workers");
     let (rpc_addr_tx, rpc_addr_rx) = std::sync::mpsc::channel();
     std::thread::Builder::new()
         .name("rpc-runtime".into())
         .spawn(move || {
             let rt = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(4)
+                .worker_threads(rpc_workers)
                 .thread_name("rpc-worker")
                 .enable_all()
                 .build()

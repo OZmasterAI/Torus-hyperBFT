@@ -142,11 +142,12 @@ GEN_MD5=$(md5sum "$GENESIS" | cut -d' ' -f1)
 log "genesis markets=$GEN_MARKETS native_balances=$GEN_ACCTS md5=$GEN_MD5"
 
 # ---------------------------------------------------------------- 3. launch
-# start from a clean TORUS_* env: only the record env + EXTRA_ENV reach the nodes
-for v in $(env | grep -oE '^TORUS_[A-Za-z0-9_]+'); do unset "$v"; done
+# start from a clean TORUS_* (+RAYON_NUM_THREADS) env: only the record env + EXTRA_ENV reach the nodes.
+# EXTRA_ENV may also carry CPUSETS="0-5 6-11 12-17" (taskset pinning, see launch-3val.sh).
+for v in $(env | grep -oE '^(TORUS_[A-Za-z0-9_]+|RAYON_NUM_THREADS)'); do unset "$v"; done
 for kv in "${RECORD_ENV[@]}"; do export "$kv"; done
 for kv in $EXTRA_ENV; do export "$kv"; done
-NODE_ENV_JSON=$(env | grep -E '^TORUS_' | sort | python3 -c 'import sys,json;print(json.dumps(dict(l.rstrip("\n").split("=",1) for l in sys.stdin)))')
+NODE_ENV_JSON=$(env | grep -E '^(TORUS_|RAYON_NUM_THREADS=|CPUSETS=)' | sort | python3 -c 'import sys,json;print(json.dumps(dict(l.rstrip("\n").split("=",1) for l in sys.stdin)))')
 log "node env: $NODE_ENV_JSON"
 T_LAUNCH=$(date +%s)
 CLEAN=1 "$WSL/launch-3val.sh" >>"$OUT/run.log" 2>&1 || die "launch-3val.sh failed"
@@ -154,8 +155,17 @@ sleep 2
 mapfile -t PIDS < "$RUN_DIR/pids"
 log "node pids: ${PIDS[*]}"
 # verify the env actually reached each node process (fleet-uniform)
-ENV_VERIFY=$(for p in "${PIDS[@]}"; do tr '\0' '\n' < /proc/$p/environ 2>/dev/null | grep -E '^TORUS_' | sort | md5sum | cut -c1-8; done | sort -u | tr '\n' ' ')
+ENV_VERIFY=$(for p in "${PIDS[@]}"; do tr '\0' '\n' < /proc/$p/environ 2>/dev/null | grep -E '^(TORUS_|RAYON_NUM_THREADS=)' | sort | md5sum | cut -c1-8; done | sort -u | tr '\n' ' ')
 log "per-node TORUS_* env digest(s): $ENV_VERIFY (must be a single value)"
+# P1 pool bounding: prove the CPU affinity (CPUSETS= pinning via launch-3val.sh)
+# and the pool sizes each node actually came up with (thread counts + the
+# node's own "core budget" startup line).
+for i in 0 1 2; do
+    p=${PIDS[$i]}
+    cpus=$(awk '/^Cpus_allowed_list/{print $2}' /proc/$p/status 2>/dev/null)
+    nthr=$(awk '/^Threads:/{print $2}' /proc/$p/status 2>/dev/null)
+    log "val$i pid=$p Cpus_allowed_list=${cpus:-?} threads=${nthr:-?} (CPUSETS='${CPUSETS:-}')"
+done
 
 # ---------------------------------------------------------------- 4. health
 scrape_one() { curl -s -m 3 "http://127.0.0.1:$1/metrics"; }
@@ -323,7 +333,7 @@ log "ingest: bench submitted=${BENCH_SUBMITTED:-?} actions; mempool nonce-expire
 # ---------------------------------------------------------------- 9. stop + collect logs
 "$WSL/stop-3val.sh" >>"$OUT/run.log" 2>&1
 for i in 0 1 2; do
-    grep -E ' ERROR | WARN |panicked|FAIL-STOP|fail-stop|book mode|resident|parallel|member cache|commit-lag|S470' "$RUN_DIR/val$i.log" | head -400 > "$OUT/val$i.log.excerpt"
+    grep -E ' ERROR | WARN |panicked|FAIL-STOP|fail-stop|book mode|resident|parallel|member cache|commit-lag|S470|core budget|rpc runtime workers' "$RUN_DIR/val$i.log" | head -400 > "$OUT/val$i.log.excerpt"
     gzip -c "$RUN_DIR/val$i.log" > "$OUT/val$i.log.gz"
 done
 

@@ -338,15 +338,16 @@ pub(crate) fn verify_one_action(
 /// ~100 queued ingress tasks starve consensus verify at the task-queue
 /// level (s352 probe: block time 529ms→4034ms, exec verify phase 3x).
 /// Half the cores (min 2) keeps ingress off the consensus threads' backs
-/// while still parallelizing within a batch.
+/// while still parallelizing within a batch. "Cores" = `TORUS_CORE_BUDGET`
+/// when set (shared-rig bounding), else the host; `TORUS_INGRESS_VERIFY_THREADS`
+/// overrides the pool size outright.
 fn ingress_verify_pool() -> &'static rayon::ThreadPool {
     static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
     POOL.get_or_init(|| {
-        let threads = (std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(8)
-            / 2)
-        .max(2);
+        let threads = torus_types::core_budget::pool_threads(
+            "TORUS_INGRESS_VERIFY_THREADS",
+            torus_types::core_budget::half_cores_min2(torus_types::core_budget::core_budget_or(8)),
+        );
         rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
             .thread_name(|i| format!("torus-ingress-verify-{i}"))

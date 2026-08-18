@@ -6,6 +6,7 @@ pub use alloy_primitives::{Address, Bloom, Bytes, B256, U256};
 
 use serde::{Deserialize, Serialize};
 
+pub mod core_budget;
 pub mod eip712;
 
 // ============================================================================

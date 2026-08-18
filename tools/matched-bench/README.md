@@ -77,6 +77,44 @@ save_books, flush[root/state_write/evm_resync], body_persist, residual;
 exec_thread_busy_fraction; wall ms per committed block), `agreement`, `cpu`,
 `cell` (env, bench cmd), `binaries`, `genesis`, `timing`, `bench_log_tail`.
 
+## P1 pool bounding: `TORUS_CORE_BUDGET` + `CPUSETS` (shared-rig cells)
+
+Every validator used to size its pools from `available_parallelism()` = 18 on
+this box: tokio 18, global rayon 18, match workers 18, ingress verify 9, gossip
+verify 9, RocksDB bg 4 — x3 validators + the bench on the same 18 cores.
+Prior pin-vs-unpin proof (S372) put 75-85% of the in-vivo exec "ceiling" on
+contention, not algorithm. Two node-side knobs (both node-local, never
+consensus-visible — thread counts change wall-clock only) make that testable
+in cells with zero code changes per cell:
+
+| knob | effect |
+|---|---|
+| `TORUS_CORE_BUDGET=N` | size every pool as if the host had N cores: tokio workers N, global rayon N (unless `RAYON_NUM_THREADS` set), match workers N, ingress/gossip verify `max(2,N/2)`, RocksDB bg jobs `clamp(N/2,1,4)`, RPC runtime `min(4,N)`. Unset/`0` = host (exact-today). |
+| `CPUSETS=0-5/6-11/12-17` | `launch-3val.sh` runs val0/1/2 under `taskset -c` on those disjoint lists (`/` or space separated). Unset = no pinning. run-cell logs each pid's `Cpus_allowed_list` + thread count. |
+| per-pool overrides | `TORUS_TOKIO_WORKERS`, `TORUS_MATCH_WORKERS`, `TORUS_MAX_BG_JOBS`, `TORUS_INGRESS_VERIFY_THREADS`, `TORUS_GOSSIP_VERIFY_THREADS`, `TORUS_RPC_WORKERS`, `RAYON_NUM_THREADS` — each wins over the budget-derived default. |
+
+Every node logs one `core budget: thread-pool sizing` line at startup
+(host_parallelism / core_budget / tokio_workers / rayon_global / rayon_current)
+and `rpc runtime workers`; both land in `valN.log.excerpt`.
+
+Suggested cell matrix (2 reps each, 10 markets / 300 s, record shape):
+
+```
+# (a) bounded pools, unpinned: 3 x 5 cores of pool budget, 3 cores left for the bench
+run-cell.sh $WT r1-budget5-r1 10 300 76000 'TORUS_CORE_BUDGET=5'
+# (a') bounded + pinned to disjoint 5-core sets (bench floats on 15-17)
+run-cell.sh $WT r1-budget5-pin-r1 10 300 76000 'TORUS_CORE_BUDGET=5 CPUSETS=0-4/5-9/10-14'
+# (b) (a) + Phase-2 sharded prepare
+run-cell.sh $WT r1-budget5-eng-r1 10 300 76000 'TORUS_CORE_BUDGET=5 TORUS_PARALLEL_ENGINE=4'
+# (c) (a) + bigger blocks (ORDERS cap is the intended knob; TOTAL cap 100 binds silently by default)
+run-cell.sh $WT r1-budget5-cap-r1 10 300 76000 'TORUS_CORE_BUDGET=5 TORUS_NATIVE_TOTAL_BLOCK_CAP=10000 TORUS_NATIVE_ORDERS_PER_BLOCK_CAP=12000'
+```
+
+Compare per-block `exec_engine` / `exec_flush` ms, matched/s (window avg and
+best-60), worst-60 blk/s and `validators_agree` against the unbounded baseline
+cells. If a bounded combination wins on >=2 reps, promote it into `RECORD_ENV`
+here (fleet-uniform — the digest check already proves all 3 nodes got it).
+
 ## Rules baked in
 
 - matched/s ONLY from `torus_orders_matched_total` deltas; never bench-side math,

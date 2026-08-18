@@ -163,16 +163,22 @@ impl MarketWorkerPool {
     }
 
     /// Resolve the worker cap: `TORUS_MATCH_WORKERS` (clamped to >= 1) if set and
-    /// parseable, else the host parallelism, else 1.
+    /// parseable, else `TORUS_CORE_BUDGET` if set (shared-rig bounding, P1),
+    /// else the host parallelism, else 1.
     fn resolve_worker_cap() -> usize {
-        if let Ok(raw) = std::env::var("TORUS_MATCH_WORKERS") {
-            if let Ok(n) = raw.parse::<usize>() {
-                return n.max(1);
-            }
+        Self::worker_cap_from(
+            std::env::var("TORUS_MATCH_WORKERS").ok().as_deref(),
+            torus_types::core_budget::core_budget_or(1),
+        )
+    }
+
+    /// Pure form of [`Self::resolve_worker_cap`]: explicit knob (any parseable
+    /// usize, clamped to >= 1 — `0` means 1, as it always did) else `budget`.
+    fn worker_cap_from(match_workers_env: Option<&str>, budget: usize) -> usize {
+        if let Some(n) = match_workers_env.and_then(|raw| raw.parse::<usize>().ok()) {
+            return n.max(1);
         }
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
+        budget.max(1)
     }
 
     /// LPT (longest-processing-time) assignment of markets to `workers`.
@@ -319,6 +325,22 @@ mod worker_panic_containment_tests {
         let results =
             MarketWorkerPool::match_parallel(batches, 1000).expect("no worker, no panic");
         assert!(results.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod worker_cap_resolution_tests {
+    use super::*;
+
+    /// P1: the explicit knob wins (and `0` still clamps to 1 — legacy
+    /// behaviour); otherwise the cap follows the (budget-or-host) core count.
+    #[test]
+    fn explicit_knob_wins_else_budget() {
+        assert_eq!(MarketWorkerPool::worker_cap_from(Some("6"), 18), 6);
+        assert_eq!(MarketWorkerPool::worker_cap_from(Some("0"), 18), 1);
+        assert_eq!(MarketWorkerPool::worker_cap_from(Some("junk"), 18), 18);
+        assert_eq!(MarketWorkerPool::worker_cap_from(None, 5), 5);
+        assert_eq!(MarketWorkerPool::worker_cap_from(None, 0), 1);
     }
 }
 

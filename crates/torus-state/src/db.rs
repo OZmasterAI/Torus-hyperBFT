@@ -518,9 +518,23 @@ pub fn storage_key(address: &Address, index: &U256) -> [u8; 52] {
 
 /// L3 #3: DB-wide `max_background_jobs` (flush + compaction threads). Default 4
 /// (exact-today). `TORUS_MAX_BG_JOBS` overrides — e.g. `8` on an 18-core box to
-/// relieve compaction-vs-exec CPU contention. Read once at DB open.
+/// relieve compaction-vs-exec CPU contention. Under a `TORUS_CORE_BUDGET` (P1
+/// shared-rig bounding) the default shrinks to `clamp(budget / 2, 1, 4)`.
+/// Read once at DB open.
 pub fn max_background_jobs() -> i32 {
-    parse_positive_i32(std::env::var("TORUS_MAX_BG_JOBS").ok(), 4)
+    parse_positive_i32(
+        std::env::var("TORUS_MAX_BG_JOBS").ok(),
+        default_background_jobs(torus_types::core_budget::configured_core_budget()),
+    )
+}
+
+/// Pure default for [`max_background_jobs`]: 4 with no budget (exact-today);
+/// with a budget `clamp(budget / 2, 1, 4)` (5 cores -> 2, 8 -> 4, 1 -> 1).
+fn default_background_jobs(budget: Option<usize>) -> i32 {
+    match budget {
+        None => 4,
+        Some(b) => (b / 2).clamp(1, 4) as i32,
+    }
 }
 
 /// L3 #3: DB-wide `max_subcompactions` (parallelism WITHIN one compaction job).
@@ -678,6 +692,19 @@ mod sync_wal_tests {
         assert_eq!(parse_positive_i32(Some("0".into()), 4), 4);
         assert_eq!(parse_positive_i32(Some("garbage".into()), 4), 4);
         assert_eq!(parse_positive_i32(Some(" 8 ".into()), 4), 8);
+    }
+
+    /// P1: no budget => 4 (exact-today); budget => clamp(b/2, 1, 4).
+    #[test]
+    fn bg_jobs_default_follows_core_budget() {
+        assert_eq!(default_background_jobs(None), 4);
+        assert_eq!(default_background_jobs(Some(18)), 4);
+        assert_eq!(default_background_jobs(Some(8)), 4);
+        assert_eq!(default_background_jobs(Some(5)), 2);
+        assert_eq!(default_background_jobs(Some(2)), 1);
+        assert_eq!(default_background_jobs(Some(1)), 1);
+        // explicit knob still wins over the budget-derived default
+        assert_eq!(parse_positive_i32(Some("8".into()), default_background_jobs(Some(5))), 8);
     }
 
     #[test]
