@@ -136,6 +136,28 @@ for node, rs in rows.items():
             ph[k][s_ + "_ms"] = round(per_blk(s_), 2)
     ph["residual_untimed"] = {"ms": round(tot - acc, 2), "pct_of_block": round(100 * (tot - acc) / tot, 1) if tot else None}
     p["phases"] = ph
+    # early vs late (first / last 60 s of the LOADED window = until matched stops moving)
+    loaded = [r for r in sel if m(r, "orders_matched_total") < m(sel[-1], "orders_matched_total")]
+    if loaded:
+        t_end = loaded[-1]["ts"]
+        early = [r for r in sel if r["ts"] <= sel[0]["ts"] + 60]
+        late = [r for r in sel if t_end - 60 <= r["ts"] <= t_end]
+        def win(rs):
+            if len(rs) < 2:
+                return None
+            a2, b2 = rs[0], rs[-1]
+            n2 = m(b2, "exec_engine_seconds_count") - m(a2, "exec_engine_seconds_count")
+            if n2 <= 0:
+                return None
+            d = {k: round((m(b2, "exec_" + k + "_seconds_sum") - m(a2, "exec_" + k + "_seconds_sum")) / n2 * 1000, 1)
+                 for k in ["block"] + PHASES + ["phase_margin", "phase_match", "phase_settle", "root", "state_write"]}
+            d["native_blocks"] = n2
+            d["orders_placed_per_block"] = round((m(b2, "orders_placed_accepted_total") - m(a2, "orders_placed_accepted_total")) / n2)
+            d["resting_orders_end"] = m(b2, "exec_resting_orders")
+            d["span_s"] = b2["ts"] - a2["ts"]
+            return d
+        p["early_60s"] = win(early)
+        p["late_60s"] = win(late)
     p["orders_placed_per_exec_block"] = round((m(b, "orders_placed_accepted_total") - m(a, "orders_placed_accepted_total")) / nblk, 1)
     p["orders_matched_per_exec_block"] = round((m(b, "orders_matched_total") - m(a, "orders_matched_total")) / nblk, 1)
     p["actions_per_exec_block"] = round((m(b, "native_actions_processed_total") - m(a, "native_actions_processed_total")) / nblk, 1)
