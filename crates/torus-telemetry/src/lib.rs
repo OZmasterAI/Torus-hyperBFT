@@ -307,6 +307,16 @@ pub struct Metrics {
     pub view_insert_persist_seconds: Histogram,
     pub view_vote_delay_seconds: Histogram,
     pub commit_interval_seconds: Histogram,
+    /// Consensus-thread leg timers (view-legs trim, r2): the hotstuff KVStore
+    /// write (block-tree insert/update/vote-state persistence) ...
+    pub consensus_kv_write_seconds: Histogram,
+    /// ...the leader's mempool selection (`select_block_payload`) ...
+    pub propose_select_seconds: Histogram,
+    /// ...the leader's durable DA body mirror before it references bodies ...
+    pub propose_da_mirror_seconds: Histogram,
+    /// ...and the follower's `validate_block` (decode + body reconstruct +
+    /// attestation verify), i.e. `insert_persist` minus the block-tree write.
+    pub validate_block_seconds: Histogram,
 
     // Mesh watchdog (S405) — makes the S395 gossipsub degraded mode (validator
     // connected but never subscribed after a fast restart) visible on /metrics.
@@ -1136,6 +1146,34 @@ impl Metrics {
         );
 
         let commit_interval_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 15));
+
+        let consensus_kv_write_seconds = Histogram::new(exponential_buckets(0.0001, 2.0, 16));
+        registry.register(
+            "torus_consensus_kv_write_seconds",
+            "Consensus thread: one hotstuff KVStore write batch (block-tree insert/update/vote state) — the leg that stalls behind exec write groups on a shared RocksDB",
+            consensus_kv_write_seconds.clone(),
+        );
+
+        let propose_select_seconds = Histogram::new(exponential_buckets(0.0001, 2.0, 16));
+        registry.register(
+            "torus_propose_select_seconds",
+            "Leader: mempool payload selection inside produce_block (expiry sweep + pool walk + clone-out)",
+            propose_select_seconds.clone(),
+        );
+
+        let propose_da_mirror_seconds = Histogram::new(exponential_buckets(0.0001, 2.0, 16));
+        registry.register(
+            "torus_propose_da_mirror_seconds",
+            "Leader: durable native-DA body mirror inside produce_block (put_batch + optional shard custody)",
+            propose_da_mirror_seconds.clone(),
+        );
+
+        let validate_block_seconds = Histogram::new(exponential_buckets(0.0001, 2.0, 16));
+        registry.register(
+            "torus_validate_block_seconds",
+            "Follower: App::validate_block wall time (decode + body reconstruct + attestation verify); insert_persist minus the block-tree write",
+            validate_block_seconds.clone(),
+        );
         registry.register(
             "torus_commit_interval_seconds",
             "Gap between consecutive local block commits (chain cadence per node)",
@@ -1385,6 +1423,10 @@ impl Metrics {
             view_insert_persist_seconds,
             view_vote_delay_seconds,
             commit_interval_seconds,
+            consensus_kv_write_seconds,
+            propose_select_seconds,
+            propose_da_mirror_seconds,
+            validate_block_seconds,
             consensus_mesh_peers,
             consensus_subscribed_validators,
             mesh_watchdog_disconnects,

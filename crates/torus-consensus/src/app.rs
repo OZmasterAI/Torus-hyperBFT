@@ -667,6 +667,15 @@ fn sync_committed_wal(state_db: &StateDb, enabled: bool) -> bool {
             "Task B: commit-boundary WAL fsync failed (crash-durability degraded for this block)"
         );
     }
+    // The hotstuff frontier lives in the split `consensus-kv` instance by
+    // default (its own WAL): fsync it too so the committed prefix stays
+    // crash-durable end to end. No-op under the legacy shared layout.
+    if let Err(e) = crate::kv_store::sync_split_store_wal() {
+        tracing::error!(
+            %e,
+            "Task B: commit-boundary WAL fsync of the split hotstuff store failed"
+        );
+    }
     true
 }
 
@@ -3244,175 +3253,11 @@ impl TorusApp {
             Err(ValidateBlockResponse::Invalid)
         }
     }
-}
 
-impl App<RocksKVStore> for TorusApp {
-    /// Produce a block: drain mempool, build raw tx list, NO execution.
-    ///
-    /// The state_root is set to the parent's state_root (unchanged until
-    /// execution happens on the pipeline thread).
-    fn produce_block(
-        &mut self,
-        request: ProduceBlockRequest<RocksKVStore>,
-    ) -> ProduceBlockResponse {
-        // T1.5 FAIL-STOP: with the execution pipeline dead, state is frozen —
-        // do not drain the mempool or build a block on top of unexecuted
-        // history. The `App` trait has no "refuse" variant, so return an
-        // empty, datum-less response that every honest validate_block rejects
-        // (datums.len() != 1): this node's leader views time out instead of
-        // zombie-advancing the chain.
-        if self.is_exec_failed() {
-            tracing::error!(
-                "produce_block: execution pipeline dead — FAIL-STOP, refusing to build a block"
-            );
-            return ProduceBlockResponse {
-                data_hash: CryptoHash::new(Self::hash_datum(&[])),
-                data: Data::new(vec![]),
-                app_state_updates: None,
-                validator_set_updates: None,
-            };
-        }
-        let parent_header = if let Some(parent_hash) = request.parent_block() {
-            if let Ok(Some(parent_block)) = request.block_tree().block(&parent_hash) {
-                let datums = parent_block.data.vec();
-                datums
-                    .first()
-                    .and_then(|d| {
-                        bincode::deserialize::<TorusBlock>(d.bytes())
-                            .map(|b| b.header)
-                            .or_else(|_| {
-                                bincode::deserialize::<CompactBlock>(d.bytes()).map(|cb| cb.header)
-                            })
-                            .ok()
-                    })
-                    .unwrap_or_else(|| self.last_header.clone())
-            } else {
-                self.last_header.clone()
-            }
-        } else {
-            self.last_header.clone()
-        };
-        tracing::info!(
-            parent_height = parent_header.height,
-            local_height = self.last_header.height,
-            "produce_block called (CTE)"
-        );
-
-        // Exec-ceiling Option A: wire the (previously dead) block_build_seconds —
-        // covers mempool selection, DA mirror, attestation, construction, encode.
-        let build_timer = std::time::Instant::now();
-
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
-        let gas_limit = if parent_header.evm_gas_limit == 0 {
-            torus_evm::DEFAULT_BLOCK_GAS_LIMIT
-        } else {
-            parent_header.evm_gas_limit
-        };
-        let (native_with_senders, evm_txs) =
-            self.select_block_payload(parent_header.height, gas_limit, parent_header.state_root);
-
-        // Proposer guarantee (S459): durably mirror every referenced body to THIS
-        // node's DA store BEFORE committing to reference it (livelock fix, mem
-        // 28e1a821 — any validator must be able to reconstruct a compact block
-        // out-of-band). If the durable write fails, DROP the native actions from
-        // this proposal: an empty-native block cannot wedge a validator, whereas a
-        // referenced-but-unbacked body can. The re-queued batch retries next view.
-        // `native_with_senders` and `native_actions` stay consistent so the
-        // pre-proposal push below never carries a dropped body.
-        let native_with_senders = self.mirror_or_drop_native(native_with_senders);
-
-        let native_actions: Vec<torus_types::SignedNativeAction> =
-            native_with_senders.iter().map(|(_, a)| a.clone()).collect();
-
-        let sig_attestation = match self.signing_key {
-            Some(ref key) => torus_bridge::proposer::generate_sig_attestation(&native_actions, key),
-            None => [0u8; 64],
-        };
-
-        use torus_types::{Bloom, B256};
-        // Ancestry commitment: bind this proposal to the exact parent header it
-        // was built on (`parent_header`). This is the keccak canonical hash — the
-        // same value RPC `parentHash` and the fork checker compare — and it is
-        // kept consistent with the hotstuff `justify.block` the QC points at (an
-        // honest leader builds on the block its high-QC justifies).
-        let parent_hash =
-            alloy_primitives::keccak256(parent_header.canonical_header_bytes());
-        let block = TorusBlock {
-            header: TorusBlockHeader {
-                height: parent_header.height + 1,
-                parent_hash,
-                timestamp,
-                proposer: self.proposer_address,
-                state_root: parent_header.state_root,
-                receipts_root: B256::ZERO,
-                logs_bloom: Bloom::ZERO,
-                evm_gas_used: 0,
-                evm_fee_revenue: 0,
-                evm_gas_limit: parent_header.evm_gas_limit,
-                native_action_count: native_actions.len() as u32,
-                evm_tx_count: evm_txs.len() as u32,
-                base_fee_per_gas: parent_header.base_fee_per_gas,
-                epoch: parent_header.epoch,
-                validator_set_hash: parent_header.validator_set_hash,
-                sig_attestation,
-            },
-            native_actions,
-            evm_transactions: evm_txs,
-            core_writer_actions: vec![],
-        };
-
-        let height = block.header.height;
-
-        // Pre-proposal push: only needed for COMPACT proposals, whose bodies travel
-        // out-of-band. A FULL block already carries its bodies inline, so pushing them
-        // too would be a redundant double-send (Task 8). The proposer always mirrors to
-        // its own DA store above, regardless of mode.
-        if COMPACT_PROPOSALS && !native_with_senders.is_empty() {
-            if let Some(ref tx) = self.pre_proposal_tx {
-                let count = native_with_senders.len();
-                match tx.try_send(PreProposalBundle {
-                    actions: native_with_senders,
-                }) {
-                    Ok(()) => tracing::info!(count, height, "pre-proposal push sent"),
-                    Err(e) => tracing::warn!(count, height, %e, "pre-proposal push failed"),
-                }
-            }
-        }
-
-        // Note our own block's hashes too: a same-height re-proposal would
-        // overwrite the `pending_proposals` entry and silently untrack these.
-        let own_hashes: Vec<torus_types::B256> = block
-            .native_actions
-            .iter()
-            .map(torus_types::compute_action_hash)
-            .collect();
-        let encoded = encode_proposal_datum(&block, COMPACT_PROPOSALS);
-        self.pending_proposals.insert(height, block);
-        self.pending_proposals.retain(|&h, _| h + 10 > height);
-        self.in_flight_hashes.note(height, own_hashes);
-        let hash = Self::hash_datum(&encoded);
-
-        let validator_set_updates = self.epoch_validator_set_updates(height);
-
-        if let Some(ref m) = self.metrics {
-            m.block_build_seconds
-                .observe(build_timer.elapsed().as_secs_f64());
-        }
-
-        ProduceBlockResponse {
-            data_hash: CryptoHash::new(hash),
-            data: Data::new(vec![Datum::new(encoded)]),
-            app_state_updates: None,
-            validator_set_updates,
-        }
-    }
-
-    /// Validate a proposed block: structural + signature checks only, NO execution.
-    fn validate_block(
+    /// Body of [`App::validate_block`] (structural + signature checks only, NO
+    /// execution); the trait method wraps it with the `validate_block_seconds`
+    /// timer.
+    fn validate_block_inner(
         &mut self,
         request: ValidateBlockRequest<RocksKVStore>,
     ) -> ValidateBlockResponse {
@@ -3558,6 +3403,199 @@ impl App<RocksKVStore> for TorusApp {
             app_state_updates: None,
             validator_set_updates,
         }
+    }
+}
+
+impl App<RocksKVStore> for TorusApp {
+    /// Produce a block: drain mempool, build raw tx list, NO execution.
+    ///
+    /// The state_root is set to the parent's state_root (unchanged until
+    /// execution happens on the pipeline thread).
+    fn produce_block(
+        &mut self,
+        request: ProduceBlockRequest<RocksKVStore>,
+    ) -> ProduceBlockResponse {
+        // T1.5 FAIL-STOP: with the execution pipeline dead, state is frozen —
+        // do not drain the mempool or build a block on top of unexecuted
+        // history. The `App` trait has no "refuse" variant, so return an
+        // empty, datum-less response that every honest validate_block rejects
+        // (datums.len() != 1): this node's leader views time out instead of
+        // zombie-advancing the chain.
+        if self.is_exec_failed() {
+            tracing::error!(
+                "produce_block: execution pipeline dead — FAIL-STOP, refusing to build a block"
+            );
+            return ProduceBlockResponse {
+                data_hash: CryptoHash::new(Self::hash_datum(&[])),
+                data: Data::new(vec![]),
+                app_state_updates: None,
+                validator_set_updates: None,
+            };
+        }
+        let parent_header = if let Some(parent_hash) = request.parent_block() {
+            if let Ok(Some(parent_block)) = request.block_tree().block(&parent_hash) {
+                let datums = parent_block.data.vec();
+                datums
+                    .first()
+                    .and_then(|d| {
+                        bincode::deserialize::<TorusBlock>(d.bytes())
+                            .map(|b| b.header)
+                            .or_else(|_| {
+                                bincode::deserialize::<CompactBlock>(d.bytes()).map(|cb| cb.header)
+                            })
+                            .ok()
+                    })
+                    .unwrap_or_else(|| self.last_header.clone())
+            } else {
+                self.last_header.clone()
+            }
+        } else {
+            self.last_header.clone()
+        };
+        tracing::info!(
+            parent_height = parent_header.height,
+            local_height = self.last_header.height,
+            "produce_block called (CTE)"
+        );
+
+        // Exec-ceiling Option A: wire the (previously dead) block_build_seconds —
+        // covers mempool selection, DA mirror, attestation, construction, encode.
+        let build_timer = std::time::Instant::now();
+
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let gas_limit = if parent_header.evm_gas_limit == 0 {
+            torus_evm::DEFAULT_BLOCK_GAS_LIMIT
+        } else {
+            parent_header.evm_gas_limit
+        };
+        let select_timer = std::time::Instant::now();
+        let (native_with_senders, evm_txs) =
+            self.select_block_payload(parent_header.height, gas_limit, parent_header.state_root);
+        if let Some(ref m) = self.metrics {
+            m.propose_select_seconds
+                .observe(select_timer.elapsed().as_secs_f64());
+        }
+
+        // Proposer guarantee (S459): durably mirror every referenced body to THIS
+        // node's DA store BEFORE committing to reference it (livelock fix, mem
+        // 28e1a821 — any validator must be able to reconstruct a compact block
+        // out-of-band). If the durable write fails, DROP the native actions from
+        // this proposal: an empty-native block cannot wedge a validator, whereas a
+        // referenced-but-unbacked body can. The re-queued batch retries next view.
+        // `native_with_senders` and `native_actions` stay consistent so the
+        // pre-proposal push below never carries a dropped body.
+        let mirror_timer = std::time::Instant::now();
+        let native_with_senders = self.mirror_or_drop_native(native_with_senders);
+        if let Some(ref m) = self.metrics {
+            m.propose_da_mirror_seconds
+                .observe(mirror_timer.elapsed().as_secs_f64());
+        }
+
+        let native_actions: Vec<torus_types::SignedNativeAction> =
+            native_with_senders.iter().map(|(_, a)| a.clone()).collect();
+
+        let sig_attestation = match self.signing_key {
+            Some(ref key) => torus_bridge::proposer::generate_sig_attestation(&native_actions, key),
+            None => [0u8; 64],
+        };
+
+        use torus_types::{Bloom, B256};
+        // Ancestry commitment: bind this proposal to the exact parent header it
+        // was built on (`parent_header`). This is the keccak canonical hash — the
+        // same value RPC `parentHash` and the fork checker compare — and it is
+        // kept consistent with the hotstuff `justify.block` the QC points at (an
+        // honest leader builds on the block its high-QC justifies).
+        let parent_hash =
+            alloy_primitives::keccak256(parent_header.canonical_header_bytes());
+        let block = TorusBlock {
+            header: TorusBlockHeader {
+                height: parent_header.height + 1,
+                parent_hash,
+                timestamp,
+                proposer: self.proposer_address,
+                state_root: parent_header.state_root,
+                receipts_root: B256::ZERO,
+                logs_bloom: Bloom::ZERO,
+                evm_gas_used: 0,
+                evm_fee_revenue: 0,
+                evm_gas_limit: parent_header.evm_gas_limit,
+                native_action_count: native_actions.len() as u32,
+                evm_tx_count: evm_txs.len() as u32,
+                base_fee_per_gas: parent_header.base_fee_per_gas,
+                epoch: parent_header.epoch,
+                validator_set_hash: parent_header.validator_set_hash,
+                sig_attestation,
+            },
+            native_actions,
+            evm_transactions: evm_txs,
+            core_writer_actions: vec![],
+        };
+
+        let height = block.header.height;
+
+        // Pre-proposal push: only needed for COMPACT proposals, whose bodies travel
+        // out-of-band. A FULL block already carries its bodies inline, so pushing them
+        // too would be a redundant double-send (Task 8). The proposer always mirrors to
+        // its own DA store above, regardless of mode.
+        if COMPACT_PROPOSALS && !native_with_senders.is_empty() {
+            if let Some(ref tx) = self.pre_proposal_tx {
+                let count = native_with_senders.len();
+                match tx.try_send(PreProposalBundle {
+                    actions: native_with_senders,
+                }) {
+                    Ok(()) => tracing::info!(count, height, "pre-proposal push sent"),
+                    Err(e) => tracing::warn!(count, height, %e, "pre-proposal push failed"),
+                }
+            }
+        }
+
+        // Note our own block's hashes too: a same-height re-proposal would
+        // overwrite the `pending_proposals` entry and silently untrack these.
+        let own_hashes: Vec<torus_types::B256> = block
+            .native_actions
+            .iter()
+            .map(torus_types::compute_action_hash)
+            .collect();
+        let encoded = encode_proposal_datum(&block, COMPACT_PROPOSALS);
+        self.pending_proposals.insert(height, block);
+        self.pending_proposals.retain(|&h, _| h + 10 > height);
+        self.in_flight_hashes.note(height, own_hashes);
+        let hash = Self::hash_datum(&encoded);
+
+        let validator_set_updates = self.epoch_validator_set_updates(height);
+
+        if let Some(ref m) = self.metrics {
+            m.block_build_seconds
+                .observe(build_timer.elapsed().as_secs_f64());
+        }
+
+        ProduceBlockResponse {
+            data_hash: CryptoHash::new(hash),
+            data: Data::new(vec![Datum::new(encoded)]),
+            app_state_updates: None,
+            validator_set_updates,
+        }
+    }
+
+    /// Validate a proposed block: structural + signature checks only, NO execution.
+    fn validate_block(
+        &mut self,
+        request: ValidateBlockRequest<RocksKVStore>,
+    ) -> ValidateBlockResponse {
+        // View-legs trim (r2): wall time of the app-side validation, so the
+        // follower's `insert_persist` leg splits into validate vs block-tree
+        // write (`torus_consensus_kv_write_seconds`).
+        let timer = std::time::Instant::now();
+        let response = self.validate_block_inner(request);
+        if let Some(ref m) = self.metrics {
+            m.validate_block_seconds
+                .observe(timer.elapsed().as_secs_f64());
+        }
+        response
     }
 
     /// Validate a block during sync. Delegates to `validate_block`, which now

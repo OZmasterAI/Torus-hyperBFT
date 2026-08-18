@@ -59,7 +59,13 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let kv = RocksKVStore::new(db.db_arc());
+    let kv = match RocksKVStore::open_for_node(&cli.data_dir, db.db_arc()) {
+        Ok(kv) => kv,
+        Err(e) => {
+            eprintln!("torus-wedge-inject: open hotstuff store: {e}");
+            return ExitCode::from(1);
+        }
+    };
 
     match recovery::inject_hole_for_testing(kv, target) {
         Ok(victim) => {

@@ -134,7 +134,9 @@ fn run(cli: Cli) -> Result<u8, String> {
         // Exclusive open: fails on RocksDB LOCK if the node is still running.
         let db = StateDb::open(&cli.data_dir)
             .map_err(|e| format!("exclusive open (is the node stopped?): {e}"))?;
-        let kv = RocksKVStore::new(db.db_arc());
+        // Same store the node uses (split `consensus-kv` instance by default,
+        // legacy shared CF under TORUS_CONSENSUS_KV_SPLIT=0).
+        let kv = RocksKVStore::open_for_node(&cli.data_dir, db.db_arc())?;
 
         let report = recovery::inspect(kv.clone()).map_err(fmt_recovery_err)?;
         print_report(&report, cli.json);
@@ -179,7 +181,7 @@ fn run(cli: Cli) -> Result<u8, String> {
     // Read-only modes.
     let db = StateDb::open_read_only(&cli.data_dir)
         .map_err(|e| format!("read-only open: {e}"))?;
-    let kv = RocksKVStore::new(db.db_arc());
+    let kv = RocksKVStore::open_read_only_for_node(&cli.data_dir, db.db_arc())?;
     let report = recovery::inspect(kv).map_err(fmt_recovery_err)?;
 
     if let Some(out) = &cli.export_pc {

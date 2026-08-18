@@ -495,7 +495,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
             // Initialize hotstuff_rs replica
             let (app_state, vs_state) = genesis.to_hotstuff_genesis()?;
-            let init_kv = RocksKVStore::new(state_db.db_arc());
+            let init_kv = RocksKVStore::open_for_node(&cli.data_dir, state_db.db_arc())?;
             Replica::initialize(init_kv, app_state, vs_state);
             info!("consensus replica initialized with genesis validator set");
         } else {
@@ -547,7 +547,11 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Some(mempool.clone()),
         signing_key_for_app,
     );
-    let kv_store = RocksKVStore::new(state_db.db_arc());
+    // Hotstuff block-tree store: its own RocksDB instance by default so the
+    // consensus thread's small per-view writes never queue behind the exec
+    // thread's multi-MB state batches (see `torus_consensus::kv_store`).
+    let kv_store = RocksKVStore::open_for_node(&cli.data_dir, state_db.db_arc())?
+        .with_metrics(metrics.clone());
 
     // EVM executor
     let executor = Arc::new(EvmExecutor::new(chain_config.chain_id));
