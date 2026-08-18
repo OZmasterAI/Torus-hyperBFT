@@ -64,6 +64,10 @@ impl BookLayout {
             0 => Some(BookLayout::Classic),
             1 => Some(BookLayout::OrderRows),
             2 => Some(BookLayout::LevelAuthority),
+            // Mode 3 (chunked level hash, `TORUS_BOOK_ROWS=3`) shares mode 2's
+            // on-disk layout byte-for-byte (only the level_hash preimage
+            // differs) — readers decode both identically.
+            3 => Some(BookLayout::LevelAuthority),
             _ => None,
         }
     }
@@ -72,7 +76,7 @@ impl BookLayout {
         match self {
             BookLayout::Classic => "classic whole-book blobs",
             BookLayout::OrderRows => "per-order rows (TORUS_BOOK_ROWS=1)",
-            BookLayout::LevelAuthority => "level authority (TORUS_BOOK_ROWS=2)",
+            BookLayout::LevelAuthority => "level authority (TORUS_BOOK_ROWS=2/3)",
         }
     }
 
