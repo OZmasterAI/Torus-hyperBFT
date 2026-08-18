@@ -1055,7 +1055,7 @@ mod book_rows_toggle_tests {
 
     #[test]
     fn anything_else_stays_classic() {
-        for v in ["0", "true", "on", "", "yes", "3", "12", "level"] {
+        for v in ["0", "true", "on", "", "yes", "4", "12", "level"] {
             assert_eq!(parse_book_rows_mode(Some(v.to_string())), BookMode::Classic, "{v}");
         }
     }
