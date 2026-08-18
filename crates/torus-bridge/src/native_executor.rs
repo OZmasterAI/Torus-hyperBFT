@@ -688,6 +688,237 @@ mod level_hash_cache_toggle_tests {
     }
 }
 
+// ============================================================================
+// Mode-2 save: parallel journal drain across dirty books
+// (`TORUS_SAVE_BOOKS_WORKERS`, `TORUS_SAVE_BOOKS_MIN_OPS`) — node-local
+// ============================================================================
+//
+// The LevelAuthority save is, per dirty book, a DRAIN (`take_row_ops` row
+// encode + `take_level_ops` level keccak — pure functions of that ONE book,
+// including its private level-hash sponge cache) followed by CF WRITES. The
+// drain dominates the phase (docs/l3-savebooks-attribution.md) and books are
+// independent, so dirty books are drained on scoped worker threads
+// (LPT-chunked by journal length, the `market_workers` idiom — no rayon) and
+// the drained ops are then written SERIALLY in market-ascending order — the
+// exact order and bytes of the serial loop. Byte-identical by construction for
+// any worker count (differential test: `tests/save_books_parallel_tests.rs`);
+// the overlay is keyed anyway, so even the write order is belt-and-braces.
+// A worker panic propagates (resume_unwind) exactly like a serial-loop panic —
+// no fallback, no silent skip. Modes 0/1 never reach this path.
+
+/// Hard cap on save-books drain worker threads.
+const MAX_SAVE_BOOKS_WORKERS: usize = 64;
+
+/// Default work gate for the parallel drain: total journaled rows + levels
+/// across dirty books below this run the serial loop (a thread scope costs
+/// ~tens of µs; a tiny block is not worth it). Byte-identical either way.
+const DEFAULT_SAVE_BOOKS_MIN_OPS: usize = 32;
+
+/// `TORUS_SAVE_BOOKS_WORKERS`: worker cap for the mode-2 save drain. Unset /
+/// garbage → host parallelism (capped at [`MAX_SAVE_BOOKS_WORKERS`]); `0` /
+/// `1` → serial (the exact-today loop); N>=2 → N (capped). Read once per
+/// process; tests override the ctx field (`save_books_workers`) directly.
+fn save_books_workers_env() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        let host = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        parse_save_books_workers(std::env::var("TORUS_SAVE_BOOKS_WORKERS").ok(), host)
+    })
+}
+
+/// Pure parse for [`save_books_workers_env`]. `host` is the fallback for
+/// unset / garbage (same policy as the sibling knobs: never a third behaviour).
+fn parse_save_books_workers(v: Option<String>, host: usize) -> usize {
+    match v.as_deref().map(str::trim).and_then(|s| s.parse::<usize>().ok()) {
+        Some(n) if n >= 2 => n.min(MAX_SAVE_BOOKS_WORKERS),
+        Some(_) => 1,
+        None => host.clamp(1, MAX_SAVE_BOOKS_WORKERS),
+    }
+}
+
+/// `TORUS_SAVE_BOOKS_MIN_OPS`: work gate for the parallel drain (journaled
+/// rows + levels across dirty books). Unset / garbage →
+/// [`DEFAULT_SAVE_BOOKS_MIN_OPS`]; `0` = always parallel when >= 2 dirty books
+/// and >= 2 workers. Read once per process; tests override the ctx field.
+fn save_books_min_ops_env() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| parse_save_books_min_ops(std::env::var("TORUS_SAVE_BOOKS_MIN_OPS").ok()))
+}
+
+/// Pure parse for [`save_books_min_ops_env`].
+fn parse_save_books_min_ops(v: Option<String>) -> usize {
+    v.as_deref()
+        .map(str::trim)
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_SAVE_BOOKS_MIN_OPS)
+}
+
+#[cfg(test)]
+mod save_books_workers_toggle_tests {
+    use super::{
+        parse_save_books_min_ops, parse_save_books_workers, DEFAULT_SAVE_BOOKS_MIN_OPS,
+        MAX_SAVE_BOOKS_WORKERS,
+    };
+
+    /// Unset ⇒ ON at host parallelism (the change is default-on).
+    #[test]
+    fn unset_is_host_parallelism() {
+        assert_eq!(parse_save_books_workers(None, 18), 18);
+        assert_eq!(parse_save_books_workers(None, 1), 1);
+        assert_eq!(parse_save_books_workers(None, 0), 1, "host 0 clamps to 1");
+    }
+
+    /// `0` / `1` ⇒ serial — the explicit opt-out back to the exact-today loop.
+    #[test]
+    fn zero_and_one_are_serial() {
+        for v in ["0", "1", " 1 ", "0\n"] {
+            assert_eq!(parse_save_books_workers(Some(v.to_string()), 18), 1, "{v:?}");
+        }
+    }
+
+    /// N>=2 is honoured and capped.
+    #[test]
+    fn explicit_n_is_honoured_and_capped() {
+        assert_eq!(parse_save_books_workers(Some("2".to_string()), 18), 2);
+        assert_eq!(parse_save_books_workers(Some(" 4 ".to_string()), 18), 4);
+        assert_eq!(parse_save_books_workers(Some("40".to_string()), 18), 40);
+        assert_eq!(
+            parse_save_books_workers(Some("4096".to_string()), 18),
+            MAX_SAVE_BOOKS_WORKERS
+        );
+        assert_eq!(parse_save_books_workers(None, 4096), MAX_SAVE_BOOKS_WORKERS);
+    }
+
+    /// Garbage falls back to the host default, never to a third behaviour.
+    #[test]
+    fn garbage_falls_back_to_host() {
+        for v in ["", "on", "true", "-1", "2.5", "yes"] {
+            assert_eq!(parse_save_books_workers(Some(v.to_string()), 8), 8, "{v:?}");
+        }
+    }
+
+    #[test]
+    fn min_ops_default_and_override() {
+        assert_eq!(parse_save_books_min_ops(None), DEFAULT_SAVE_BOOKS_MIN_OPS);
+        assert_eq!(
+            parse_save_books_min_ops(Some("garbage".to_string())),
+            DEFAULT_SAVE_BOOKS_MIN_OPS
+        );
+        assert_eq!(parse_save_books_min_ops(Some("0".to_string())), 0);
+        assert_eq!(parse_save_books_min_ops(Some(" 500 ".to_string())), 500);
+    }
+}
+
+/// Pass-1 output of the mode-2 save for ONE dirty book: its drained journals
+/// (row upserts/deletes for the node-local store, level upserts/deletes for
+/// the root CF), ready for the serial market-ascending write pass. `rows_ns`
+/// / `levels_ns` are the drain times (0 unless `timed`).
+struct DrainedBook {
+    market_id: MarketId,
+    row_ops: Vec<(OrderId, Option<Vec<u8>>)>,
+    level_ops: Vec<((u8, i128), Option<LevelRowData>)>,
+    rows_ns: u128,
+    levels_ns: u128,
+}
+
+/// Drain one book's journals (mode 2). Enables/refreshes (or drops, budget 0)
+/// its private level-hash sponge cache first — byte-identical output in both
+/// states. Pure over the book: no state access, safe on any thread.
+fn drain_book(
+    market_id: MarketId,
+    book: &mut OrderBook,
+    level_cache_per_book: usize,
+    timed: bool,
+) -> DrainedBook {
+    if level_cache_per_book > 0 {
+        book.ensure_level_hash_cache(level_cache_per_book);
+    } else {
+        book.disable_level_hash_cache();
+    }
+    let t = timed.then(std::time::Instant::now);
+    let row_ops = book.take_row_ops();
+    let rows_ns = t.map(|t| t.elapsed().as_nanos()).unwrap_or(0);
+    let t = timed.then(std::time::Instant::now);
+    let level_ops = book.take_level_ops();
+    let levels_ns = t.map(|t| t.elapsed().as_nanos()).unwrap_or(0);
+    DrainedBook {
+        market_id,
+        row_ops,
+        level_ops,
+        rows_ns,
+        levels_ns,
+    }
+}
+
+/// Drain `books` on up to `workers` scoped threads (LPT by journal length —
+/// heaviest book first onto the least-loaded worker; deterministic layout).
+/// Returns the drained books sorted by market id plus the per-worker MAX of
+/// the row / level drain times (the phase's wall-clock contribution when
+/// `timed`). A worker panic is re-raised on the caller (after every worker
+/// has been joined) exactly as the serial loop would have panicked.
+fn drain_books_parallel(
+    books: Vec<(MarketId, &mut OrderBook)>,
+    workers: usize,
+    level_cache_per_book: usize,
+    timed: bool,
+) -> (Vec<DrainedBook>, u128, u128) {
+    let n = books.len();
+    let workers = workers.clamp(1, n.max(1));
+    let weights: Vec<(MarketId, usize)> = books
+        .iter()
+        .map(|(id, b)| (*id, b.journaled_rows() + b.journaled_levels()))
+        .collect();
+    let assignment = MarketWorkerPool::assign_chunks(&weights, workers);
+    let mut chunks: Vec<Vec<(MarketId, &mut OrderBook)>> =
+        (0..workers).map(|_| Vec::new()).collect();
+    for ((id, book), w) in books.into_iter().zip(assignment) {
+        chunks[w].push((id, book));
+    }
+    let mut out: Vec<DrainedBook> = Vec::with_capacity(n);
+    let (mut max_rows_ns, mut max_levels_ns) = (0u128, 0u128);
+    std::thread::scope(|s| {
+        let handles: Vec<_> = chunks
+            .into_iter()
+            .filter(|c| !c.is_empty())
+            .map(|chunk| {
+                s.spawn(move || {
+                    let mut drained = Vec::with_capacity(chunk.len());
+                    let (mut rows_ns, mut levels_ns) = (0u128, 0u128);
+                    for (id, book) in chunk {
+                        let d = drain_book(id, book, level_cache_per_book, timed);
+                        rows_ns += d.rows_ns;
+                        levels_ns += d.levels_ns;
+                        drained.push(d);
+                    }
+                    (drained, rows_ns, levels_ns)
+                })
+            })
+            .collect();
+        let mut panic_payload: Option<Box<dyn std::any::Any + Send>> = None;
+        for h in handles {
+            match h.join() {
+                Ok((drained, rows_ns, levels_ns)) => {
+                    out.extend(drained);
+                    max_rows_ns = max_rows_ns.max(rows_ns);
+                    max_levels_ns = max_levels_ns.max(levels_ns);
+                }
+                Err(payload) => {
+                    if panic_payload.is_none() {
+                        panic_payload = Some(payload);
+                    }
+                }
+            }
+        }
+        if let Some(payload) = panic_payload {
+            std::panic::resume_unwind(payload);
+        }
+    });
+    out.sort_unstable_by_key(|d| d.market_id);
+    (out, max_rows_ns, max_levels_ns)
+}
+
 // Frozen key layouts — single source of truth in torus-core.
 use torus_core::book_rows::{
     book_meta_key, book_order_key, book_stop_key, level_row_key_tagged, LevelRowData,
@@ -936,6 +1167,17 @@ pub struct NativeExecContext<T: StateBackend = StateDb> {
     /// reachable only via an explicit `TORUS_LEVEL_HASH_CACHE=0`.
     /// Node-local, byte-identical output; tests may override per ctx.
     pub level_hash_cache_bytes: usize,
+    /// Mode-2 save drain worker cap (`TORUS_SAVE_BOOKS_WORKERS`; default =
+    /// host parallelism). 1 = serial exact-today loop. Node-local, output
+    /// byte-identical for any value; tests may override per ctx.
+    pub save_books_workers: usize,
+    /// Mode-2 save parallel-drain work gate (`TORUS_SAVE_BOOKS_MIN_OPS`):
+    /// journaled rows + levels across dirty books must reach this to spawn
+    /// workers. Perf-only; tests may override per ctx.
+    pub save_books_min_ops: usize,
+    /// Worker threads the LAST `save_order_books` drained on (1 = serial
+    /// path, including modes 0/1 and gated-out blocks). Test/metrics hook.
+    last_save_workers: usize,
     /// L3 save-books attribution (µbench-only, feature `save-timings`): when
     /// set, the mode-2 `save_order_books` arm accumulates per-sub-step
     /// timings into `last_save_timings`. Compiled out of production builds.
@@ -1219,11 +1461,20 @@ impl<T: StateBackend> NativeExecContext<T> {
             resident: resident_mode,
             resident_reused,
             level_hash_cache_bytes: level_hash_cache_env_bytes(),
+            save_books_workers: save_books_workers_env(),
+            save_books_min_ops: save_books_min_ops_env(),
+            last_save_workers: 1,
             #[cfg(feature = "save-timings")]
             collect_save_timings: false,
             #[cfg(feature = "save-timings")]
             last_save_timings: SaveTimings::default(),
         }
+    }
+
+    /// Worker threads the last `save_order_books` drained dirty books on
+    /// (1 = serial path). Test/ops introspection.
+    pub fn last_save_workers(&self) -> usize {
+        self.last_save_workers
     }
 
     /// rank8: whether this context reused the holder's resident state (vs
@@ -1774,7 +2025,7 @@ impl<T: StateBackend> NativeExecContext<T> {
     ///           stops + meta shared.
     pub fn save_order_books(&mut self) -> usize {
         use torus_state::cf::{
-            CF_BOOK_ORDER_ROWS, CF_NATIVE_MARKETS, CF_NATIVE_ORDER_BOOKS,
+            CF_NATIVE_MARKETS, CF_NATIVE_ORDER_BOOKS,
         };
 
         let mut written = 0;
@@ -1805,6 +2056,16 @@ impl<T: StateBackend> NativeExecContext<T> {
             (self.level_hash_cache_bytes / self.order_books.len().max(1)).max(1)
         } else {
             0
+        };
+        // Mode 2: two-pass save (parallel journal drain across dirty books,
+        // then serial market-ascending writes) — see `save_level_authority`.
+        // Modes 0/1 keep the per-market loop below.
+        let dirty = if matches!(self.book_mode, BookMode::LevelAuthority) {
+            written += self.save_level_authority(&dirty, level_cache_per_book, timed, &mut acc);
+            Vec::new()
+        } else {
+            self.last_save_workers = 1;
+            dirty
         };
         for market_id in dirty {
             let Some(book) = self.order_books.get_mut(&market_id) else {
@@ -1853,86 +2114,9 @@ impl<T: StateBackend> NativeExecContext<T> {
                     written += Self::diff_stop_rows(&self.state, market_id, book);
                     written += Self::write_meta_if_moved(&self.state, market_id, book);
                 }
-                BookMode::LevelAuthority => {
-                    // L3: enable/refresh (or actively drop, when budget = 0)
-                    // the level-hash sponge cache before draining level ops.
-                    // Byte-identical output in both states.
-                    if level_cache_per_book > 0 {
-                        book.ensure_level_hash_cache(level_cache_per_book);
-                    } else {
-                        book.disable_level_hash_cache();
-                    }
-                    let mut rows_written = 0usize;
-                    let mut rows_deleted = 0usize;
-                    let t_rows = timed.then(std::time::Instant::now);
-                    for (order_id, op) in book.take_row_ops() {
-                        let key = book_order_key(market_id, order_id);
-                        let res = match &op {
-                            Some(bytes) => {
-                                rows_written += 1;
-                                self.state.put_cf_raw(CF_BOOK_ORDER_ROWS, &key, bytes)
-                            }
-                            None => {
-                                rows_deleted += 1;
-                                self.state.delete_cf_raw(CF_BOOK_ORDER_ROWS, &key)
-                            }
-                        };
-                        if let Err(e) = res {
-                            tracing::error!(
-                                market_id, order_id = %order_id, %e,
-                                "3c: node-local order row write failed"
-                            );
-                        }
-                    }
-                    if let Some(t) = t_rows {
-                        acc.rows_ns += t.elapsed().as_nanos();
-                    }
-                    let mut levels_written = 0usize;
-                    let mut levels_deleted = 0usize;
-                    let t_levels = timed.then(std::time::Instant::now);
-                    for ((tag, raw_price), op) in book.take_level_ops() {
-                        let key = level_row_key_tagged(market_id, tag, raw_price);
-                        let res = match &op {
-                            Some(data) => {
-                                levels_written += 1;
-                                self.state.put_cf_raw(
-                                    CF_NATIVE_ORDER_BOOKS,
-                                    &key,
-                                    &data.encode(),
-                                )
-                            }
-                            None => {
-                                levels_deleted += 1;
-                                self.state.delete_cf_raw(CF_NATIVE_ORDER_BOOKS, &key)
-                            }
-                        };
-                        match res {
-                            Ok(()) => written += 1,
-                            Err(e) => tracing::error!(
-                                market_id, %e, "3c: level row write failed"
-                            ),
-                        }
-                    }
-                    if let Some(t) = t_levels {
-                        acc.levels_ns += t.elapsed().as_nanos();
-                    }
-                    let t_stops = timed.then(std::time::Instant::now);
-                    written += Self::diff_stop_rows(&self.state, market_id, book);
-                    if let Some(t) = t_stops {
-                        acc.stops_ns += t.elapsed().as_nanos();
-                    }
-                    let t_meta = timed.then(std::time::Instant::now);
-                    written += Self::write_meta_if_moved(&self.state, market_id, book);
-                    if let Some(t) = t_meta {
-                        acc.meta_ns += t.elapsed().as_nanos();
-                    }
-                    if let Some(ref m) = self.metrics {
-                        m.exec_book_rows_written.inc_by(rows_written as u64);
-                        m.exec_book_rows_deleted.inc_by(rows_deleted as u64);
-                        m.exec_book_levels_written.inc_by(levels_written as u64);
-                        m.exec_book_levels_deleted.inc_by(levels_deleted as u64);
-                    }
-                }
+                // Mode 2 is saved by the two-pass path above (`dirty` is
+                // empty here under LevelAuthority).
+                BookMode::LevelAuthority => {}
             }
         }
 
@@ -1967,6 +2151,164 @@ impl<T: StateBackend> NativeExecContext<T> {
         #[cfg(not(feature = "save-timings"))]
         let _ = acc;
 
+        written
+    }
+
+    /// Mode 2 (LevelAuthority) save, two passes:
+    ///
+    ///   pass 1 — DRAIN every dirty book's journals (`take_row_ops` +
+    ///            `take_level_ops`, incl. its private level-hash cache) —
+    ///            on `save_books_workers` scoped threads when >= 2 dirty
+    ///            books, >= 2 workers and the journaled work reaches
+    ///            `save_books_min_ops`; otherwise inline, market-ascending;
+    ///   pass 2 — WRITE the drained ops + stop diff + meta SERIALLY in
+    ///            market-ascending order (`write_drained_book`).
+    ///
+    /// The drain is a pure function of each book, so pass 1's thread layout
+    /// cannot change any byte; pass 2 is the exact serial write sequence.
+    /// Returns the number of root-CF writes (test hook, as before). Records
+    /// the worker count actually used in `last_save_workers`.
+    fn save_level_authority(
+        &mut self,
+        dirty: &[MarketId],
+        level_cache_per_book: usize,
+        timed: bool,
+        acc: &mut SaveTimings,
+    ) -> usize {
+        // Pass 1: gather `&mut` handles to the dirty books (disjoint map
+        // entries — one `&mut` each), sorted by market id.
+        let dirty_set = &self.dirty_books;
+        let mut books: Vec<(MarketId, &mut OrderBook)> = self
+            .order_books
+            .iter_mut()
+            .filter(|(id, _)| dirty_set.contains(id))
+            .map(|(id, b)| (*id, b))
+            .collect();
+        books.sort_unstable_by_key(|(id, _)| *id);
+        debug_assert!(books.len() <= dirty.len());
+        let total_ops: usize = books
+            .iter()
+            .map(|(_, b)| b.journaled_rows() + b.journaled_levels())
+            .sum();
+        let workers = self.save_books_workers.min(books.len()).max(1);
+        let parallel = workers >= 2 && total_ops >= self.save_books_min_ops;
+        let drained: Vec<DrainedBook> = if parallel {
+            let (drained, rows_ns, levels_ns) =
+                drain_books_parallel(books, workers, level_cache_per_book, timed);
+            // Wall-clock attribution: the slowest worker's drain time.
+            acc.rows_ns += rows_ns;
+            acc.levels_ns += levels_ns;
+            drained
+        } else {
+            let mut out = Vec::with_capacity(books.len());
+            for (id, book) in books {
+                let d = drain_book(id, book, level_cache_per_book, timed);
+                acc.rows_ns += d.rows_ns;
+                acc.levels_ns += d.levels_ns;
+                out.push(d);
+            }
+            out
+        };
+        self.last_save_workers = if parallel { workers } else { 1 };
+
+        // Pass 2: serial writes, market ascending (`drained` is sorted).
+        let mut written = 0usize;
+        for d in drained {
+            let Some(book) = self.order_books.get(&d.market_id) else {
+                // Cannot happen: every drained book was borrowed from the
+                // map in pass 1 and nothing removed it since.
+                continue;
+            };
+            written += Self::write_drained_book(
+                &self.state,
+                self.metrics.as_deref(),
+                book,
+                d,
+                timed,
+                acc,
+            );
+        }
+        written
+    }
+
+    /// Mode-2 pass 2 for one book: node-local order rows, root-CF level rows,
+    /// stop diff, meta-if-moved, funnel metrics — the exact per-market write
+    /// sequence of the former single-pass loop. Returns root-CF writes.
+    fn write_drained_book(
+        state: &T,
+        metrics: Option<&torus_telemetry::Metrics>,
+        book: &OrderBook,
+        drained: DrainedBook,
+        timed: bool,
+        acc: &mut SaveTimings,
+    ) -> usize {
+        use torus_state::cf::{CF_BOOK_ORDER_ROWS, CF_NATIVE_ORDER_BOOKS};
+        let market_id = drained.market_id;
+        let mut written = 0usize;
+        let mut rows_written = 0usize;
+        let mut rows_deleted = 0usize;
+        let t_rows = timed.then(std::time::Instant::now);
+        for (order_id, op) in drained.row_ops {
+            let key = book_order_key(market_id, order_id);
+            let res = match &op {
+                Some(bytes) => {
+                    rows_written += 1;
+                    state.put_cf_raw(CF_BOOK_ORDER_ROWS, &key, bytes)
+                }
+                None => {
+                    rows_deleted += 1;
+                    state.delete_cf_raw(CF_BOOK_ORDER_ROWS, &key)
+                }
+            };
+            if let Err(e) = res {
+                tracing::error!(
+                    market_id, order_id = %order_id, %e,
+                    "3c: node-local order row write failed"
+                );
+            }
+        }
+        if let Some(t) = t_rows {
+            acc.rows_ns += t.elapsed().as_nanos();
+        }
+        let mut levels_written = 0usize;
+        let mut levels_deleted = 0usize;
+        let t_levels = timed.then(std::time::Instant::now);
+        for ((tag, raw_price), op) in drained.level_ops {
+            let key = level_row_key_tagged(market_id, tag, raw_price);
+            let res = match &op {
+                Some(data) => {
+                    levels_written += 1;
+                    state.put_cf_raw(CF_NATIVE_ORDER_BOOKS, &key, &data.encode())
+                }
+                None => {
+                    levels_deleted += 1;
+                    state.delete_cf_raw(CF_NATIVE_ORDER_BOOKS, &key)
+                }
+            };
+            match res {
+                Ok(()) => written += 1,
+                Err(e) => tracing::error!(market_id, %e, "3c: level row write failed"),
+            }
+        }
+        if let Some(t) = t_levels {
+            acc.levels_ns += t.elapsed().as_nanos();
+        }
+        let t_stops = timed.then(std::time::Instant::now);
+        written += Self::diff_stop_rows(state, market_id, book);
+        if let Some(t) = t_stops {
+            acc.stops_ns += t.elapsed().as_nanos();
+        }
+        let t_meta = timed.then(std::time::Instant::now);
+        written += Self::write_meta_if_moved(state, market_id, book);
+        if let Some(t) = t_meta {
+            acc.meta_ns += t.elapsed().as_nanos();
+        }
+        if let Some(m) = metrics {
+            m.exec_book_rows_written.inc_by(rows_written as u64);
+            m.exec_book_rows_deleted.inc_by(rows_deleted as u64);
+            m.exec_book_levels_written.inc_by(levels_written as u64);
+            m.exec_book_levels_deleted.inc_by(levels_deleted as u64);
+        }
         written
     }
 
