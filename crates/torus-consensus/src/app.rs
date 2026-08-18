@@ -1501,6 +1501,9 @@ impl ExecutionContext {
                 m.exec_load_books_seconds
                     .observe(load_books_timer.elapsed().as_secs_f64());
                 m.exec_resting_orders.set(ctx.resting_order_count() as i64);
+                if ctx.resident_rebuilt() {
+                    m.exec_resident_rebuilds.inc();
+                }
             }
             ctx.metrics = self.metrics.clone();
             // O3: with a background writer present, fills buffer their
@@ -1732,6 +1735,20 @@ impl ExecutionContext {
         // write here.
         if !(has_native || computed_fee_revenue > 0) {
             write_native_applied_height(&self.state_db, height);
+            // r2 resident-books-stale-rebuild: this block never built a context,
+            // so the order books are untouched — the rank8 resident holder is
+            // still exactly this block's post-state. Advance its height stamp in
+            // step with the marker just written; otherwise the NEXT native block
+            // sees holder.height + 1 != height and pays a full O(resting depth)
+            // reload (the "resident books stale" multi-second stall proven on
+            // devnet with empty blocks between native ones). Successor-only:
+            // any other sequence drains the holder (rebuild = safe direction).
+            // Should the marker put above have failed, the guard's marker
+            // check still trips next block — memory never outranks the DB.
+            self.resident_books
+                .lock()
+                .expect("resident-books mutex poisoned (exec thread panicked mid-block)")
+                .advance_untouched(height);
         }
         if let Some(ref m) = self.metrics {
             m.exec_body_persist_seconds
@@ -8131,6 +8148,75 @@ mod crash_recovery_tests {
             recorded.as_slice(),
             &1u64.to_be_bytes(),
             "replay guard must skip the second commit (nonce height stays 1)",
+        );
+    }
+
+    /// r2 resident-books-stale-rebuild: a committed block that skips the native
+    /// path entirely (no native actions, no fee revenue) leaves the order books
+    /// untouched, so the rank8 resident holder must ADVANCE with it (in step
+    /// with the standalone applied-height marker) instead of falling behind and
+    /// tripping the staleness guard on the next native block (devnet:
+    /// "resident_height=376 block_height=379" → multi-second full rebuild).
+    #[test]
+    fn empty_blocks_advance_resident_holder_with_marker() {
+        use torus_bridge::native_executor::{NativeExecContext, ResidentBooks};
+        let (config, state_db) = make_test_config_and_db();
+        let exec_ctx = make_exec_ctx(&config, &state_db);
+
+        // Height 1: empty block through the pipeline (marker=1, header persisted).
+        exec_ctx.execute_committed_block(&make_block(1, vec![]), vec![]);
+        assert_eq!(read_native_applied_height(&state_db), Some(1));
+
+        // Seed the holder as if height 1 had been executed resident (post-state
+        // of height 1, classic mode = the pipeline's default).
+        let mut holder = ResidentBooks::default();
+        let mut seed = NativeExecContext::new_with_modes(
+            state_db.clone(),
+            1,
+            1001,
+            0,
+            config.epoch_length,
+            config.max_validators,
+            Address::ZERO,
+            config.treasury_address,
+            config.dev_pool_address,
+            false,
+            Some(&mut holder),
+        );
+        seed.save_order_books();
+        seed.stash_resident(&mut holder);
+        assert_eq!(holder.height(), Some(1));
+        *exec_ctx.resident_books.lock().unwrap() = holder;
+
+        // Heights 2 and 3: empty blocks — the holder must track the marker.
+        for h in 2..=3u64 {
+            exec_ctx.execute_committed_block(&make_block(h, vec![]), vec![]);
+            assert_eq!(read_native_applied_height(&state_db), Some(h));
+            assert_eq!(
+                exec_ctx.resident_books.lock().unwrap().height(),
+                Some(h),
+                "holder must advance across the untouched block {h}"
+            );
+        }
+
+        // Height 4 (native, resident): the guard passes — no rebuild.
+        let mut holder = std::mem::take(&mut *exec_ctx.resident_books.lock().unwrap());
+        let ctx = NativeExecContext::new_with_modes(
+            state_db.clone(),
+            4,
+            1004,
+            0,
+            config.epoch_length,
+            config.max_validators,
+            Address::ZERO,
+            config.treasury_address,
+            config.dev_pool_address,
+            false,
+            Some(&mut holder),
+        );
+        assert!(
+            ctx.resident_reused(),
+            "holder advanced through empty blocks must be reused at the next native block"
         );
     }
 

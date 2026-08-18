@@ -266,6 +266,12 @@ pub struct Metrics {
     /// depth-vs-cost correlation (the funnel `orders_resting` counter is a
     /// monotonic event count, not current depth).
     pub exec_resting_orders: Gauge,
+    /// r2 resident-books-stale-rebuild: rank8 resident-mode contexts that had
+    /// to REBUILD the books from persisted state (holder empty/drained or the
+    /// staleness guard tripped). Each is a full O(resting depth) reload on the
+    /// exec thread; the pipeline advances the holder across untouched blocks so
+    /// this should stay at 1 (startup) per process under a normal sequence.
+    pub exec_resident_rebuilds: Counter,
     /// Committed blocks handed to the exec channel but not yet fully executed.
     /// Pinned near the channel bound (64) = execution is the bottleneck.
     pub exec_queue_depth: Gauge,
@@ -1047,6 +1053,14 @@ impl Metrics {
             exec_resting_orders.clone(),
         );
 
+        let exec_resident_rebuilds = Counter::default();
+        registry.register(
+            "torus_exec_resident_rebuilds",
+            "rank8 resident-mode blocks that rebuilt the order books from persisted state \
+             (holder empty/drained or staleness guard tripped) — full reload on the exec thread",
+            exec_resident_rebuilds.clone(),
+        );
+
         let exec_queue_depth = Gauge::default();
         registry.register(
             "torus_exec_queue_depth",
@@ -1400,6 +1414,7 @@ impl Metrics {
             commit_body_encode_seconds,
             commit_persist_write_seconds,
             exec_resting_orders,
+            exec_resident_rebuilds,
             exec_queue_depth,
             exec_throttle_tier,
             exec_dispatch_deferred,
@@ -1569,6 +1584,7 @@ mod tests {
             "torus_commit_body_encode_seconds",
             "torus_commit_persist_write_seconds",
             "torus_exec_resting_orders",
+            "torus_exec_resident_rebuilds",
             "torus_exec_queue_depth",
             "torus_exec_throttle_tier",
             "torus_exec_dispatch_deferred",
