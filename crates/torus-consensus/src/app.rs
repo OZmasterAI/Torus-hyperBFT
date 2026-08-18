@@ -2380,7 +2380,11 @@ impl TorusApp {
         let (last_header, parked_hole) = Self::replay_committed(&state_db, &exec_ctx);
 
         // Spawn execution pipeline: bounded channel (64 blocks) for backpressure.
-        let (exec_tx, exec_rx) = std::sync::mpsc::sync_channel(64);
+        // The depth is shared with the mempool trust-cache sizing
+        // (`verified_sender_cache_in_flight_floor` = depth * block cap) so the
+        // two cannot drift apart.
+        let (exec_tx, exec_rx) =
+            std::sync::mpsc::sync_channel(torus_mempool::rate_limit::EXEC_QUEUE_DEPTH);
         let exec_handle = std::thread::Builder::new()
             .name("torus-execution".into())
             .spawn(move || execution_loop(exec_rx, exec_ctx))
