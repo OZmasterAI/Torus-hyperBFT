@@ -511,6 +511,14 @@ mod parallel_engine_toggle_tests {
 // consensus-committed via the per-level keccak commitment inside the level
 // row; the node-local store is verified against it at boot.
 //
+// LevelAuthorityChunked (`TORUS_BOOK_ROWS=3`): IDENTICAL key/value layout and
+// load/save/verify machinery to mode 2, but the `level_hash` preimage is the
+// CHUNKED digest (`torus_core::book_rows::LevelRowData` docs): frames are
+// bucketed by `seq / 64` so a dirty level costs O(touched chunks) instead of
+// O(resting depth) at save time. Different digest ⇒ different state root ⇒
+// its own marker byte (3): a mode-2 node restarted as mode 3 (or vice versa)
+// fail-stops at the marker AND at boot verify 3 (recomputed level rows differ).
+//
 // ############################ CONSENSUS WARNING ############################
 // `CF_NATIVE_ORDER_BOOKS` is one of the 6 native-state-root CFs. Each mode
 // stores DIFFERENT keys/values, so THE MODE CHANGES THE STATE-ROOT FORMAT:
@@ -543,6 +551,9 @@ pub enum BookMode {
     OrderRows,
     /// 3c level rows in the root CF + node-local order rows (`TORUS_BOOK_ROWS=2`).
     LevelAuthority,
+    /// Mode 2's layout with the CHUNKED, depth-independent `level_hash`
+    /// preimage (`TORUS_BOOK_ROWS=3`). Consensus-visible; fresh genesis.
+    LevelAuthorityChunked,
 }
 
 impl BookMode {
@@ -552,7 +563,22 @@ impl BookMode {
             BookMode::Classic => 0,
             BookMode::OrderRows => 1,
             BookMode::LevelAuthority => 2,
+            BookMode::LevelAuthorityChunked => 3,
         }
+    }
+
+    /// Both level-authority variants share the row layout, loader, saver and
+    /// boot verify; they differ only in the `level_hash` preimage.
+    fn is_level_authority(self) -> bool {
+        matches!(
+            self,
+            BookMode::LevelAuthority | BookMode::LevelAuthorityChunked
+        )
+    }
+
+    /// True for the chunked-digest variant (mode 3).
+    fn level_hash_chunked(self) -> bool {
+        matches!(self, BookMode::LevelAuthorityChunked)
     }
 
     fn describe(self) -> &'static str {
@@ -560,13 +586,17 @@ impl BookMode {
             BookMode::Classic => "classic (whole-book blobs)",
             BookMode::OrderRows => "order rows (TORUS_BOOK_ROWS=1)",
             BookMode::LevelAuthority => "level authority (TORUS_BOOK_ROWS=2)",
+            BookMode::LevelAuthorityChunked => {
+                "level authority, chunked level hash (TORUS_BOOK_ROWS=3)"
+            }
         }
     }
 }
 
-/// Runtime mode: `TORUS_BOOK_ROWS=1` → OrderRows, `=2` → LevelAuthority;
-/// anything else (INCLUDING UNSET) → Classic — byte-identical state root to
-/// today. Read once per process. Fleet-uniform, fresh genesis to change.
+/// Runtime mode: `TORUS_BOOK_ROWS=1` → OrderRows, `=2` → LevelAuthority,
+/// `=3` → LevelAuthorityChunked; anything else (INCLUDING UNSET) → Classic —
+/// byte-identical state root to today. Read once per process. Fleet-uniform,
+/// fresh genesis to change.
 fn book_mode() -> BookMode {
     static MODE: std::sync::OnceLock<BookMode> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| parse_book_rows_mode(std::env::var("TORUS_BOOK_ROWS").ok()))
@@ -577,6 +607,7 @@ fn parse_book_rows_mode(v: Option<String>) -> BookMode {
     match v.as_deref().map(str::trim) {
         Some("1") => BookMode::OrderRows,
         Some("2") => BookMode::LevelAuthority,
+        Some("3") => BookMode::LevelAuthorityChunked,
         _ => BookMode::Classic,
     }
 }
@@ -830,9 +861,20 @@ fn drain_book(
     market_id: MarketId,
     book: &mut OrderBook,
     level_cache_per_book: usize,
+    chunked: bool,
     timed: bool,
 ) -> DrainedBook {
-    if level_cache_per_book > 0 {
+    if chunked {
+        // Mode 3: chunked digest (idempotent select; the load path already
+        // set it for rebuilt books — this covers books created since, e.g. a
+        // market's first order). Never uses the sponge cache: the chunked
+        // digest is depth-independent by construction.
+        book.set_level_hash_chunked(true);
+        book.disable_level_hash_cache();
+    } else if level_cache_per_book > 0 {
+        // L3: enable/refresh (or actively drop, when budget = 0) the
+        // level-hash sponge cache before draining level ops. Byte-identical
+        // output in both states.
         book.ensure_level_hash_cache(level_cache_per_book);
     } else {
         book.disable_level_hash_cache();
@@ -862,6 +904,7 @@ fn drain_books_parallel(
     books: Vec<(MarketId, &mut OrderBook)>,
     workers: usize,
     level_cache_per_book: usize,
+    chunked: bool,
     timed: bool,
 ) -> (Vec<DrainedBook>, u128, u128) {
     let n = books.len();
@@ -887,7 +930,7 @@ fn drain_books_parallel(
                     let mut drained = Vec::with_capacity(chunk.len());
                     let (mut rows_ns, mut levels_ns) = (0u128, 0u128);
                     for (id, book) in chunk {
-                        let d = drain_book(id, book, level_cache_per_book, timed);
+                        let d = drain_book(id, book, level_cache_per_book, chunked, timed);
                         rows_ns += d.rows_ns;
                         levels_ns += d.levels_ns;
                         drained.push(d);
@@ -982,8 +1025,37 @@ mod book_rows_toggle_tests {
     }
 
     #[test]
+    fn three_is_level_authority_chunked_with_marker_three() {
+        assert_eq!(
+            parse_book_rows_mode(Some("3".to_string())),
+            BookMode::LevelAuthorityChunked
+        );
+        assert_eq!(
+            parse_book_rows_mode(Some(" 3\n".to_string())),
+            BookMode::LevelAuthorityChunked
+        );
+        assert_eq!(BookMode::LevelAuthorityChunked.marker_byte(), 3);
+        assert!(BookMode::LevelAuthorityChunked.is_level_authority());
+        assert!(BookMode::LevelAuthorityChunked.level_hash_chunked());
+        assert!(BookMode::LevelAuthority.is_level_authority());
+        assert!(!BookMode::LevelAuthority.level_hash_chunked());
+        // Distinct marker bytes across all modes (a wrong-flag restart must be
+        // caught by the marker even before content sniffing).
+        let bytes: std::collections::BTreeSet<u8> = [
+            BookMode::Classic,
+            BookMode::OrderRows,
+            BookMode::LevelAuthority,
+            BookMode::LevelAuthorityChunked,
+        ]
+        .into_iter()
+        .map(BookMode::marker_byte)
+        .collect();
+        assert_eq!(bytes.len(), 4);
+    }
+
+    #[test]
     fn anything_else_stays_classic() {
-        for v in ["0", "true", "on", "", "yes", "3", "12", "level"] {
+        for v in ["0", "true", "on", "", "yes", "4", "12", "level"] {
             assert_eq!(parse_book_rows_mode(Some(v.to_string())), BookMode::Classic, "{v}");
         }
     }
@@ -1399,7 +1471,9 @@ impl<T: StateBackend> NativeExecContext<T> {
             None => match book_mode {
                 BookMode::Classic => Self::load_order_books(&state),
                 BookMode::OrderRows => Self::load_order_books_rows(&state),
-                BookMode::LevelAuthority => Self::load_order_books_levels(&state),
+                BookMode::LevelAuthority | BookMode::LevelAuthorityChunked => {
+                    Self::load_order_books_levels(&state, book_mode.level_hash_chunked())
+                }
             },
         };
 
@@ -1759,6 +1833,7 @@ impl<T: StateBackend> NativeExecContext<T> {
     /// Returns (books, next_global_order_id, fatal error).
     fn load_order_books_levels(
         state: &T,
+        chunked: bool,
     ) -> (HashMap<MarketId, OrderBook>, u128, Option<String>) {
         use torus_state::cf::{CF_BOOK_ORDER_ROWS, CF_NATIVE_ORDER_BOOKS};
 
@@ -1781,7 +1856,7 @@ impl<T: StateBackend> NativeExecContext<T> {
         for (key, value) in entries {
             if key.len() == 8 {
                 return fail(
-                    "3c: TORUS_BOOK_ROWS=2 but cf_native_order_books holds classic \
+                    "3c: TORUS_BOOK_ROWS=2/3 but cf_native_order_books holds classic \
                      whole-book blobs — the flag must match the DB's history \
                      (fleet-uniform; enabling it needs a fresh genesis)"
                         .to_string(),
@@ -1789,7 +1864,7 @@ impl<T: StateBackend> NativeExecContext<T> {
             }
             if key.len() == 25 && key[8] == ROW_TAG_ORDER {
                 return fail(
-                    "3c: TORUS_BOOK_ROWS=2 but cf_native_order_books holds per-order \
+                    "3c: TORUS_BOOK_ROWS=2/3 but cf_native_order_books holds per-order \
                      rows — the DB was written under TORUS_BOOK_ROWS=1 (fleet-uniform; \
                      changing the mode needs a fresh genesis)"
                         .to_string(),
@@ -1899,10 +1974,14 @@ impl<T: StateBackend> NativeExecContext<T> {
             };
             let orders = store_orders.remove(&market_id).unwrap_or_default();
             let stop_bytes = acc.stops.clone();
-            let book = match Self::rebuild_book(market_id, meta, orders, acc.stops) {
+            let mut book = match Self::rebuild_book(market_id, meta, orders, acc.stops) {
                 Ok(b) => b,
                 Err(e) => return fail(format!("3c: {e}")),
             };
+            // Mode 3: select the chunked digest BEFORE any drain so every
+            // later mutation marks its chunk (boot verify below recomputes
+            // from scratch either way).
+            book.set_level_hash_chunked(chunked);
 
             // -- Boot verify 1: meta row bytes --
             let recomputed_meta = book_meta_value(&book);
@@ -1940,8 +2019,11 @@ impl<T: StateBackend> NativeExecContext<T> {
             if recomputed != acc.levels {
                 return fail(format!(
                     "3c: market {market_id}: recomputed level rows != root-committed \
-                     level rows (node-local order store corrupt/stale — refusing to \
-                     serve or sign)"
+                     level rows (node-local order store corrupt/stale, or this node's \
+                     TORUS_BOOK_ROWS={} does not match the mode the DB was written \
+                     under — the level_hash preimage differs between modes 2 and 3; \
+                     refusing to serve or sign)",
+                    if chunked { 3 } else { 2 }
                 ));
             }
 
@@ -1958,15 +2040,23 @@ impl<T: StateBackend> NativeExecContext<T> {
 
     /// Read-only recompute of EVERY non-empty level's row data for a book
     /// (boot verify / staleness-guard verify — does NOT touch the journals).
+    /// Uses the digest the book is configured for (flat mode 2 / chunked
+    /// mode 3), computed FROM SCRATCH — independent of any incremental state.
     fn live_level_rows(book: &OrderBook) -> Vec<((u8, i128), LevelRowData)> {
         use torus_core::book_rows::{SIDE_TAG_ASK, SIDE_TAG_BID};
+        let chunked = book.level_hash_chunked();
         let mut out = Vec::new();
         for (tag, prices) in [
             (SIDE_TAG_BID, book.bid_queues().map(|(p, _)| p.raw()).collect::<Vec<_>>()),
             (SIDE_TAG_ASK, book.ask_queues().map(|(p, _)| p.raw()).collect::<Vec<_>>()),
         ] {
             for raw in prices {
-                if let Some(data) = book.level_row_data(tag, raw) {
+                let data = if chunked {
+                    book.level_row_data_chunked(tag, raw)
+                } else {
+                    book.level_row_data(tag, raw)
+                };
+                if let Some(data) = data {
                     out.push(((tag, raw), data));
                 }
             }
@@ -2053,6 +2143,8 @@ impl<T: StateBackend> NativeExecContext<T> {
         let level_cache_per_book = if matches!(self.book_mode, BookMode::LevelAuthority)
             && self.level_hash_cache_bytes > 0
         {
+            // (Mode 3 never uses the sponge cache: its digest is
+            // depth-independent by construction, so the arm below disables it.)
             (self.level_hash_cache_bytes / self.order_books.len().max(1)).max(1)
         } else {
             0
@@ -2060,7 +2152,7 @@ impl<T: StateBackend> NativeExecContext<T> {
         // Mode 2: two-pass save (parallel journal drain across dirty books,
         // then serial market-ascending writes) — see `save_level_authority`.
         // Modes 0/1 keep the per-market loop below.
-        let dirty = if matches!(self.book_mode, BookMode::LevelAuthority) {
+        let dirty = if self.book_mode.is_level_authority() {
             written += self.save_level_authority(&dirty, level_cache_per_book, timed, &mut acc);
             Vec::new()
         } else {
@@ -2114,9 +2206,9 @@ impl<T: StateBackend> NativeExecContext<T> {
                     written += Self::diff_stop_rows(&self.state, market_id, book);
                     written += Self::write_meta_if_moved(&self.state, market_id, book);
                 }
-                // Mode 2 is saved by the two-pass path above (`dirty` is
-                // empty here under LevelAuthority).
-                BookMode::LevelAuthority => {}
+                // Modes 2/3 are saved by the two-pass path above (`dirty` is
+                // empty here under either level-authority variant).
+                BookMode::LevelAuthority | BookMode::LevelAuthorityChunked => {}
             }
         }
 
@@ -2192,9 +2284,10 @@ impl<T: StateBackend> NativeExecContext<T> {
             .sum();
         let workers = self.save_books_workers.min(books.len()).max(1);
         let parallel = workers >= 2 && total_ops >= self.save_books_min_ops;
+        let chunked = self.book_mode.level_hash_chunked();
         let drained: Vec<DrainedBook> = if parallel {
             let (drained, rows_ns, levels_ns) =
-                drain_books_parallel(books, workers, level_cache_per_book, timed);
+                drain_books_parallel(books, workers, level_cache_per_book, chunked, timed);
             // Wall-clock attribution: the slowest worker's drain time.
             acc.rows_ns += rows_ns;
             acc.levels_ns += levels_ns;
@@ -2202,7 +2295,7 @@ impl<T: StateBackend> NativeExecContext<T> {
         } else {
             let mut out = Vec::with_capacity(books.len());
             for (id, book) in books {
-                let d = drain_book(id, book, level_cache_per_book, timed);
+                let d = drain_book(id, book, level_cache_per_book, chunked, timed);
                 acc.rows_ns += d.rows_ns;
                 acc.levels_ns += d.levels_ns;
                 out.push(d);
@@ -2399,6 +2492,9 @@ impl<T: StateBackend> NativeExecContext<T> {
             return written;
         }
 
+        // Mode 3: full writes emit the chunked digest (and re-seed the
+        // book's incremental chunk state).
+        book.set_level_hash_chunked(mode.level_hash_chunked());
         let row_ops = book.full_row_ops();
         let level_ops = book.full_level_ops();
         let meta = book_meta_value(book);
@@ -2419,7 +2515,7 @@ impl<T: StateBackend> NativeExecContext<T> {
                     keep_root.insert(book_order_key(market_id, *id).to_vec());
                 }
             }
-            BookMode::LevelAuthority => {
+            BookMode::LevelAuthority | BookMode::LevelAuthorityChunked => {
                 for (id, _) in &row_ops {
                     keep_store.insert(book_order_key(market_id, *id).to_vec());
                 }
@@ -2441,7 +2537,7 @@ impl<T: StateBackend> NativeExecContext<T> {
                 }
             }
         }
-        if mode == BookMode::LevelAuthority {
+        if mode.is_level_authority() {
             if let Ok(existing) = state.iterate_cf(CF_BOOK_ORDER_ROWS, Some(&prefix)) {
                 for (key, _) in existing {
                     if !keep_store.contains(&key) {
@@ -2473,7 +2569,7 @@ impl<T: StateBackend> NativeExecContext<T> {
                     written += 1;
                 }
             }
-            BookMode::LevelAuthority => {
+            BookMode::LevelAuthority | BookMode::LevelAuthorityChunked => {
                 for (id, bytes) in &row_ops {
                     let _ = state.put_cf_raw(
                         CF_BOOK_ORDER_ROWS,

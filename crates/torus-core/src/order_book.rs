@@ -287,6 +287,37 @@ pub struct OrderBook {
     /// The cache itself. `None` = disabled (default; `take_level_ops` runs
     /// today's exact one-shot path). Never serialized.
     level_hash_cache: Option<Box<LevelHashCache>>,
+
+    // ---- Chunked level digest (mode 3, `TORUS_BOOK_ROWS=3`) ----
+    //
+    // See `book_rows::LevelRowData` for the preimage and the impl block
+    // "Chunked level digest" below for the maintenance contract. All of this
+    // is in-RAM bookkeeping: never serialized, never part of any row.
+    /// Which `level_hash` `take_level_ops` / `full_level_ops` emit: `false` =
+    /// the flat mode-2 digest (exact-today), `true` = the chunked mode-3
+    /// digest. Set by the executor for its mode BEFORE the first drain; the
+    /// dirty-chunk marks below are only recorded while this is on.
+    level_hash_chunked: bool,
+    /// Per-level chunk aggregates (`chunk_idx → (digest, Σqty, count)`),
+    /// built in full on a level's first drain and maintained incrementally
+    /// afterwards. A level with NO entry is (re)built from its queue.
+    level_chunks: HashMap<(u8, i128), BTreeMap<u64, ChunkAgg>>,
+    /// `(side_tag, raw_price, chunk_idx)` of every chunk touched since its
+    /// level was last drained — recorded at EVERY queue-mutation site (the
+    /// same sites that journal the level). Drained per level by
+    /// `take_level_ops`; a mark whose level is not journaled stays until it is.
+    dirty_chunks: BTreeSet<(u8, i128, u64)>,
+}
+
+/// One chunk's aggregate for the chunked level digest: the keccak of its
+/// member frames plus the parts of the level aggregate it contributes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ChunkAgg {
+    digest: [u8; 32],
+    /// Σ `remaining_qty` over the chunk's members, accumulated front→back.
+    qty: FixedPoint,
+    /// Member count (>= 1: empty chunks are removed, never stored).
+    count: u32,
 }
 
 impl OrderBook {
@@ -311,6 +342,9 @@ impl OrderBook {
             level_exists: HashSet::new(),
             level_epoch: HashMap::new(),
             level_hash_cache: None,
+            level_hash_chunked: false,
+            level_chunks: HashMap::new(),
+            dirty_chunks: BTreeSet::new(),
         }
     }
 
@@ -563,9 +597,7 @@ impl OrderBook {
             .get_mut(&loc.price)
             .ok_or(CoreError::OrderNotFound(order_id))?;
 
-        let pos = queue
-            .iter()
-            .position(|o| o.id == order_id)
+        let pos = Self::queue_position(queue, &self.order_seq, order_id)
             .ok_or(CoreError::OrderNotFound(order_id))?;
 
         let order = queue.remove(pos).unwrap();
@@ -581,7 +613,7 @@ impl OrderBook {
             }
         }
 
-        self.order_seq.remove(&order_id);
+        let seq = self.order_seq.remove(&order_id);
         self.row_journal.insert(order_id);
         self.level_journal
             .insert((crate::book_rows::side_tag(order.side), order.price.raw()));
@@ -591,6 +623,14 @@ impl OrderBook {
             &mut self.level_epoch,
             crate::book_rows::side_tag(order.side),
             order.price.raw(),
+        );
+        // Mode 3: the removed frame's chunk is dirty.
+        Self::mark_chunk_dirty(
+            self.level_hash_chunked,
+            &mut self.dirty_chunks,
+            crate::book_rows::side_tag(order.side),
+            order.price.raw(),
+            seq,
         );
         Ok(order)
     }
@@ -604,6 +644,7 @@ impl OrderBook {
 
         let mut cancelled = Vec::with_capacity(order_ids.len());
         let cache_on = self.level_hash_cache.is_some();
+        let chunked_on = self.level_hash_chunked;
         for order_id in order_ids {
             if let Some(loc) = self.order_index.remove(&order_id) {
                 let book = match loc.side {
@@ -611,9 +652,9 @@ impl OrderBook {
                     Side::Sell => &mut self.asks,
                 };
                 if let Some(queue) = book.get_mut(&loc.price) {
-                    if let Some(pos) = queue.iter().position(|o| o.id == order_id) {
+                    if let Some(pos) = Self::queue_position(queue, &self.order_seq, order_id) {
                         cancelled.push(queue.remove(pos).unwrap());
-                        self.order_seq.remove(&order_id);
+                        let seq = self.order_seq.remove(&order_id);
                         self.row_journal.insert(order_id);
                         self.level_journal
                             .insert((crate::book_rows::side_tag(loc.side), loc.price.raw()));
@@ -623,6 +664,14 @@ impl OrderBook {
                             &mut self.level_epoch,
                             crate::book_rows::side_tag(loc.side),
                             loc.price.raw(),
+                        );
+                        // Mode 3: the removed frame's chunk is dirty.
+                        Self::mark_chunk_dirty(
+                            chunked_on,
+                            &mut self.dirty_chunks,
+                            crate::book_rows::side_tag(loc.side),
+                            loc.price.raw(),
+                            seq,
                         );
                     }
                     if queue.is_empty() {
@@ -656,12 +705,14 @@ impl OrderBook {
                     .clone();
 
                 let cache_on = self.level_hash_cache.is_some();
+                let chunked_on = self.level_hash_chunked;
                 let book = match loc.side {
                     Side::Buy => &mut self.bids,
                     Side::Sell => &mut self.asks,
                 };
                 if let Some(queue) = book.get_mut(&loc.price) {
-                    if let Some(order) = queue.iter_mut().find(|o| o.id == order_id) {
+                    let pos = Self::queue_position(queue, &self.order_seq, order_id);
+                    if let Some(order) = pos.and_then(|p| queue.get_mut(p)) {
                         if new_q > FixedPoint::ZERO && new_q < order.remaining_qty {
                             order.remaining_qty = new_q;
                             let out = order.clone();
@@ -676,6 +727,15 @@ impl OrderBook {
                                 &mut self.level_epoch,
                                 crate::book_rows::side_tag(loc.side),
                                 loc.price.raw(),
+                            );
+                            // Mode 3: the rewritten frame's chunk is dirty
+                            // (seq kept ⇒ same chunk).
+                            Self::mark_chunk_dirty(
+                                chunked_on,
+                                &mut self.dirty_chunks,
+                                crate::book_rows::side_tag(loc.side),
+                                loc.price.raw(),
+                                self.order_seq.get(&order_id).copied(),
                             );
                             return Ok(out);
                         }
@@ -749,7 +809,43 @@ impl OrderBook {
             Side::Buy => &self.bids,
             Side::Sell => &self.asks,
         };
-        book.get(&loc.price)?.iter().find(|o| o.id == order_id)
+        let queue = book.get(&loc.price)?;
+        let pos = Self::queue_position(queue, &self.order_seq, order_id)?;
+        queue.get(pos)
+    }
+
+    /// Position of `order_id` in its level queue.
+    ///
+    /// Level queues are seq-ascending by construction (`insert_order` appends
+    /// with the monotone `next_seq`, `insert_loaded_order` asserts ascending,
+    /// in-place modifies keep the seq, matching pops the FRONT), so the order
+    /// is found by binary search on seq — O(log depth) `order_seq` probes
+    /// instead of a front-to-back scan. `take_row_ops` re-encodes EVERY
+    /// journaled row through `get_order`; on levels thousands deep with tens
+    /// of thousands of appended rows per block that scan was O(rows × depth)
+    /// per save. Pure lookup: never changes which order is found. Falls back
+    /// to the linear scan if the seq probe does not land on `order_id`
+    /// (cannot happen while the invariant holds; asserted in debug).
+    #[inline]
+    fn queue_position(
+        queue: &VecDeque<Order>,
+        order_seq: &HashMap<OrderId, u64>,
+        order_id: OrderId,
+    ) -> Option<usize> {
+        if let Some(&seq) = order_seq.get(&order_id) {
+            let pos = queue.partition_point(|o| {
+                order_seq.get(&o.id).is_some_and(|&s| s < seq)
+            });
+            let hit = queue.get(pos).is_some_and(|o| o.id == order_id);
+            debug_assert!(
+                hit,
+                "queue_position: seq probe missed order {order_id} (level queue not seq-ascending?)"
+            );
+            if hit {
+                return Some(pos);
+            }
+        }
+        queue.iter().position(|o| o.id == order_id)
     }
 
     /// Total resting orders on the book.
@@ -856,6 +952,7 @@ impl OrderBook {
         let mut fills = Vec::new();
         let mut self_trade_cancels = Vec::new();
         let cache_on = self.level_hash_cache.is_some();
+        let chunked_on = self.level_hash_chunked;
 
         match taker.side {
             Side::Buy => {
@@ -882,6 +979,8 @@ impl OrderBook {
                         &mut self.level_journal,
                         &mut self.level_epoch,
                         cache_on,
+                        &mut self.dirty_chunks,
+                        chunked_on,
                     );
                     if self.asks.get(&best_ask).is_none_or(|q| q.is_empty()) {
                         self.asks.remove(&best_ask);
@@ -912,6 +1011,8 @@ impl OrderBook {
                         &mut self.level_journal,
                         &mut self.level_epoch,
                         cache_on,
+                        &mut self.dirty_chunks,
+                        chunked_on,
                     );
                     if self.bids.get(&best_bid).is_none_or(|q| q.is_empty()) {
                         self.bids.remove(&best_bid);
@@ -940,11 +1041,16 @@ impl OrderBook {
         level_journal: &mut BTreeSet<(u8, i128)>,
         level_epoch: &mut HashMap<(u8, i128), u64>,
         cache_on: bool,
+        dirty_chunks: &mut BTreeSet<(u8, i128, u64)>,
+        chunked_on: bool,
     ) {
+        let tag = crate::book_rows::side_tag(maker_side);
+        let raw_price = price.raw();
         // Every path below mutates this maker level (self-trade pop, partial
         // fill, full fill) — journal it once up front. Every such mutation
         // touches the FRONT of the queue, so the cached level-hash prefix is
-        // invalidated at the same guard (L3).
+        // invalidated at the same guard (L3). Mode 3 marks the touched
+        // maker's chunk per iteration below (its seq is known there).
         if taker.remaining_qty > FixedPoint::ZERO && !queue.is_empty() {
             level_journal.insert((crate::book_rows::side_tag(maker_side), price.raw()));
             Self::bump_level_epoch(
@@ -964,7 +1070,8 @@ impl OrderBook {
                 if let Some(ids) = trader_orders.get_mut(&cancelled.trader) {
                     ids.retain(|&id| id != cancelled.id);
                 }
-                order_seq.remove(&cancelled.id);
+                let seq = order_seq.remove(&cancelled.id);
+                Self::mark_chunk_dirty(chunked_on, dirty_chunks, tag, raw_price, seq);
                 row_journal.insert(cancelled.id);
                 // A5: hand the whole cancelled order back so the executor can
                 // release its remaining order-margin reservation.
@@ -997,8 +1104,16 @@ impl OrderBook {
             maker.remaining_qty -= fill_qty;
 
             // Maker row changed either way: partial fill rewrites it,
-            // full fill deletes it.
+            // full fill deletes it. Mode 3: either way its frame's chunk is
+            // dirty (partial = bytes changed, full = frame gone).
             row_journal.insert(maker_id);
+            Self::mark_chunk_dirty(
+                chunked_on,
+                dirty_chunks,
+                tag,
+                raw_price,
+                order_seq.get(&maker_id).copied(),
+            );
             if maker.remaining_qty == FixedPoint::ZERO {
                 let filled = queue.pop_front().unwrap();
                 order_index.remove(&filled.id);
@@ -1028,6 +1143,30 @@ impl OrderBook {
         }
     }
 
+    /// Mode 3: record that the chunk holding `seq` on level `(tag, raw_price)`
+    /// changed. Called from EVERY queue-mutation site (append, front pop,
+    /// mid-queue removal, in-place qty change) — the same surface that
+    /// journals the level. Gated on `chunked_on` so modes 0/1/2 pay nothing.
+    /// `seq == None` cannot happen for a resting order (every resting order
+    /// has a seq) — debug-asserted; in release it marks nothing, which is
+    /// still safe only because the level is journaled and would be rebuilt
+    /// in full if it had no chunk state.
+    #[inline]
+    fn mark_chunk_dirty(
+        chunked_on: bool,
+        dirty_chunks: &mut BTreeSet<(u8, i128, u64)>,
+        tag: u8,
+        raw_price: i128,
+        seq: Option<u64>,
+    ) {
+        if chunked_on {
+            debug_assert!(seq.is_some(), "queue-mutated order has no seq");
+            if let Some(seq) = seq {
+                dirty_chunks.insert((tag, raw_price, seq / crate::book_rows::LEVEL_CHUNK_SEQS));
+            }
+        }
+    }
+
     /// Insert an order into the book (at the back of its price level queue).
     /// Assigns the order's insertion sequence (queue-priority persistence)
     /// and journals its row + level.
@@ -1052,6 +1191,14 @@ impl OrderBook {
         self.row_journal.insert(id);
         self.level_journal
             .insert((crate::book_rows::side_tag(side), price.raw()));
+        // Mode 3: the appended frame's chunk is dirty.
+        Self::mark_chunk_dirty(
+            self.level_hash_chunked,
+            &mut self.dirty_chunks,
+            crate::book_rows::side_tag(side),
+            price.raw(),
+            Some(seq),
+        );
     }
 
     /// Would placing an order at `price` cross the spread?
@@ -1340,7 +1487,18 @@ impl OrderBook {
             Side::Buy => &mut self.bids,
             Side::Sell => &mut self.asks,
         };
-        book.entry(price).or_default().push_back(order);
+        let queue = book.entry(price).or_default();
+        // Mode 3 relies on queue order == ascending seq (chunk members are a
+        // contiguous queue range found by binary search on seq) — the loader
+        // owns that ordering; assert it in debug.
+        debug_assert!(
+            queue
+                .back()
+                .and_then(|o| self.order_seq.get(&o.id))
+                .is_none_or(|&prev| prev < seq),
+            "insert_loaded_order: seq {seq} not ascending within its level"
+        );
+        queue.push_back(order);
         self.order_index.insert(id, OrderLocation { side, price });
         self.trader_orders.entry(trader).or_default().push(id);
         self.order_seq.insert(id, seq);
@@ -1350,6 +1508,16 @@ impl OrderBook {
         self.level_exists
             .insert((crate::book_rows::side_tag(side), price.raw()));
         debug_assert!(seq < self.next_seq, "loaded seq {seq} >= meta next_seq");
+        // Mode 3: a load is not a mutation (no journal), but if chunk state
+        // already exists for this level (test fixtures) it is now stale —
+        // mark the chunk so the next drain of the level refreshes it.
+        Self::mark_chunk_dirty(
+            self.level_hash_chunked,
+            &mut self.dirty_chunks,
+            crate::book_rows::side_tag(side),
+            price.raw(),
+            Some(seq),
+        );
     }
 
     /// Drain the row journal into row ops, O(touched since last save):
@@ -1449,6 +1617,9 @@ impl OrderBook {
     pub fn take_level_ops(
         &mut self,
     ) -> Vec<((u8, i128), Option<crate::book_rows::LevelRowData>)> {
+        if self.level_hash_chunked {
+            return self.take_level_ops_chunked();
+        }
         let keys = std::mem::take(&mut self.level_journal);
         // Move the cache out to sidestep the &self/&mut cache split borrow.
         let mut cache = self.level_hash_cache.take();
@@ -1702,6 +1873,10 @@ impl OrderBook {
     /// without computing any aggregates (no keccak spent).
     pub fn discard_level_ops(&mut self) {
         self.level_journal.clear();
+        // Mode 3 bookkeeping is meaningless without level rows; keep it from
+        // leaking if a chunked book is ever drained this way.
+        self.dirty_chunks.clear();
+        self.level_chunks.clear();
     }
 
     /// Classic mode never persists per-order rows: drop journaled ids without
@@ -1732,6 +1907,21 @@ impl OrderBook {
             )
             .collect();
         let mut ops = Vec::with_capacity(keys.len());
+        if self.level_hash_chunked {
+            // Mode 3: rebuild EVERY level's chunk state from its queue (the
+            // full write is the reference point for later incremental
+            // drains) and emit the chunked digest.
+            self.level_chunks.clear();
+            self.dirty_chunks.clear();
+            for key in keys {
+                let data = self
+                    .rebuild_level_chunks(key)
+                    .expect("non-empty level must aggregate");
+                self.level_exists.insert(key);
+                ops.push((key, data));
+            }
+            return ops;
+        }
         for key in keys {
             let data = self
                 .level_row_data(key.0, key.1)
@@ -1740,6 +1930,299 @@ impl OrderBook {
             ops.push((key, data));
         }
         ops
+    }
+}
+
+// ============================================================================
+// Chunked level digest (mode 3, `TORUS_BOOK_ROWS=3`) — depth-independent
+// level-hash maintenance.
+//
+// The flat mode-2 digest keccaks EVERY frame of a dirty level (O(depth) per
+// touched level; with band-5 flow the top levels hold thousands of orders and
+// fills consume the FRONT, so the append-only sponge cache misses). Mode 3
+// buckets a level's frames by `chunk_idx = seq / LEVEL_CHUNK_SEQS` (absolute
+// per-book seq — monotone, unique, persisted with each row) and commits
+//
+//   level_hash = keccak(DOMAIN ‖ count ‖ total_qty ‖ Σ_asc (idx ‖ chunk_digest))
+//
+// (`book_rows::LevelRowData`). Because the queue is seq-ascending, a chunk's
+// members are one contiguous queue range (binary search on seq), and because
+// the digest is a pure function of level content, only the chunk(s) whose
+// members changed need re-hashing: every queue-mutation site marks
+// `(level, seq / 64)` dirty (`mark_chunk_dirty` — the same surface that
+// journals the level, docs/design-levelhash-cache.md §1.1), and the drain
+// re-hashes just those chunks plus the top hash (n_chunks × 40 B). A level
+// with no chunk state (first drain after boot / level creation) is built in
+// full — the mode-2 cost, once. The from-scratch `level_row_data_chunked` is
+// the boot-verify / oracle path and MUST equal the incremental result for
+// every content (property-tested in `level_rows_core_tests`).
+//
+// Chunk state, dirty marks and the mode flag are node-local RAM: never
+// serialized, never part of any row. Determinism: every validator runs the
+// same mode (marker byte 3 + boot verify fail-stop) and computes the same
+// pure function of the same content.
+// ============================================================================
+
+impl OrderBook {
+    /// Select the level-hash preimage `take_level_ops` / `full_level_ops`
+    /// emit: `true` = chunked (mode 3), `false` = flat (mode 2, default).
+    /// The executor sets this for its mode BEFORE the first drain. Turning
+    /// it off drops all chunk state.
+    pub fn set_level_hash_chunked(&mut self, on: bool) {
+        if !on {
+            self.level_chunks.clear();
+            self.dirty_chunks.clear();
+        }
+        self.level_hash_chunked = on;
+    }
+
+    /// Whether the chunked (mode 3) level digest is selected.
+    pub fn level_hash_chunked(&self) -> bool {
+        self.level_hash_chunked
+    }
+
+    /// Test/metrics hook: `(levels with chunk state, total stored chunks,
+    /// pending dirty marks)`.
+    pub fn level_chunk_stats(&self) -> (usize, usize, usize) {
+        (
+            self.level_chunks.len(),
+            self.level_chunks.values().map(|c| c.len()).sum(),
+            self.dirty_chunks.len(),
+        )
+    }
+
+    /// From-scratch chunked (mode 3) aggregate of one price level — a pure
+    /// function of the level's content, `None` if the level has no resting
+    /// orders. O(orders in the level). Boot verify / oracle path; the drain
+    /// path (`take_level_ops`) reaches the same bytes incrementally.
+    pub fn level_row_data_chunked(
+        &self,
+        tag: u8,
+        raw_price: i128,
+    ) -> Option<crate::book_rows::LevelRowData> {
+        let price = FixedPoint::from_raw(raw_price);
+        let side_book = if tag == crate::book_rows::SIDE_TAG_BID {
+            &self.bids
+        } else {
+            &self.asks
+        };
+        let queue = side_book.get(&price).filter(|q| !q.is_empty())?;
+        let mut chunks = BTreeMap::new();
+        Self::rebuild_all_chunks(queue, &self.order_seq, &mut chunks);
+        Some(Self::chunked_top(&chunks))
+    }
+
+    /// Mode-3 drain: for every journaled level, refresh only its dirty chunks
+    /// (or build the whole chunk state if the level has none) and re-derive
+    /// the top hash. Emptied levels drop their chunk state and emit a delete
+    /// iff a row was persisted (mirrors the flat path).
+    fn take_level_ops_chunked(
+        &mut self,
+    ) -> Vec<((u8, i128), Option<crate::book_rows::LevelRowData>)> {
+        let keys = std::mem::take(&mut self.level_journal);
+        let mut ops = Vec::with_capacity(keys.len());
+        let mut dirty_scratch: Vec<u64> = Vec::new();
+        for key in keys {
+            let (tag, raw_price) = key;
+            // Take this level's dirty marks (leave marks of other levels).
+            dirty_scratch.clear();
+            let lo = (tag, raw_price, 0u64);
+            let hi = (tag, raw_price, u64::MAX);
+            dirty_scratch.extend(self.dirty_chunks.range(lo..=hi).map(|k| k.2));
+            for idx in &dirty_scratch {
+                self.dirty_chunks.remove(&(tag, raw_price, *idx));
+            }
+
+            let price = FixedPoint::from_raw(raw_price);
+            let side_book = if tag == crate::book_rows::SIDE_TAG_BID {
+                &self.bids
+            } else {
+                &self.asks
+            };
+            let queue = side_book.get(&price).filter(|q| !q.is_empty());
+            let data = match queue {
+                None => {
+                    self.level_chunks.remove(&key);
+                    None
+                }
+                Some(queue) => match self.level_chunks.entry(key) {
+                    std::collections::hash_map::Entry::Vacant(v) => {
+                        let mut chunks = BTreeMap::new();
+                        Self::rebuild_all_chunks(queue, &self.order_seq, &mut chunks);
+                        let data = Self::chunked_top(&chunks);
+                        v.insert(chunks);
+                        Some(data)
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut o) => {
+                        let chunks = o.get_mut();
+                        for &idx in &dirty_scratch {
+                            Self::rebuild_one_chunk(queue, &self.order_seq, chunks, idx);
+                        }
+                        Some(Self::chunked_top(chunks))
+                    }
+                },
+            };
+            match data {
+                Some(data) => {
+                    self.level_exists.insert(key);
+                    ops.push((key, Some(data)));
+                }
+                None => {
+                    if self.level_exists.remove(&key) {
+                        ops.push((key, None));
+                    }
+                }
+            }
+        }
+        ops
+    }
+
+    /// Full (re)build of one level's chunk state from its queue and the
+    /// chunked aggregate; `None` if the level is empty (state dropped).
+    fn rebuild_level_chunks(&mut self, key: (u8, i128)) -> Option<crate::book_rows::LevelRowData> {
+        let (tag, raw_price) = key;
+        let price = FixedPoint::from_raw(raw_price);
+        let side_book = if tag == crate::book_rows::SIDE_TAG_BID {
+            &self.bids
+        } else {
+            &self.asks
+        };
+        let Some(queue) = side_book.get(&price).filter(|q| !q.is_empty()) else {
+            self.level_chunks.remove(&key);
+            return None;
+        };
+        let chunks = self.level_chunks.entry(key).or_default();
+        chunks.clear();
+        Self::rebuild_all_chunks(queue, &self.order_seq, chunks);
+        Some(Self::chunked_top(chunks))
+    }
+
+    /// Hash EVERY chunk of a level from its queue (one front→back walk,
+    /// grouping consecutive frames by `seq / LEVEL_CHUNK_SEQS`) into `chunks`
+    /// (cleared first).
+    fn rebuild_all_chunks(
+        queue: &VecDeque<Order>,
+        order_seq: &HashMap<OrderId, u64>,
+        chunks: &mut BTreeMap<u64, ChunkAgg>,
+    ) {
+        chunks.clear();
+        let mut scratch: Vec<u8> = Vec::with_capacity(8 + 112);
+        let mut preimage: Vec<u8> = Vec::with_capacity(
+            crate::book_rows::LEVEL_CHUNK_SEQS as usize * 160,
+        );
+        let mut cur: Option<u64> = None;
+        let mut qty = FixedPoint::ZERO;
+        let mut count: u32 = 0;
+        for order in queue {
+            let seq = *order_seq
+                .get(&order.id)
+                .expect("resting order must have a seq");
+            let idx = seq / crate::book_rows::LEVEL_CHUNK_SEQS;
+            if cur != Some(idx) {
+                if let Some(prev) = cur {
+                    chunks.insert(
+                        prev,
+                        ChunkAgg {
+                            digest: alloy_primitives::keccak256(&preimage).0,
+                            qty,
+                            count,
+                        },
+                    );
+                }
+                debug_assert!(
+                    cur.is_none_or(|prev| prev < idx),
+                    "level queue must be seq-ascending (chunk {idx} after {cur:?})"
+                );
+                cur = Some(idx);
+                preimage.clear();
+                qty = FixedPoint::ZERO;
+                count = 0;
+            }
+            qty += order.remaining_qty;
+            count += 1;
+            Self::encode_order_row_into(&mut scratch, seq, order);
+            preimage.extend_from_slice(&(scratch.len() as u32).to_le_bytes());
+            preimage.extend_from_slice(&scratch);
+        }
+        if let Some(prev) = cur {
+            chunks.insert(
+                prev,
+                ChunkAgg {
+                    digest: alloy_primitives::keccak256(&preimage).0,
+                    qty,
+                    count,
+                },
+            );
+        }
+    }
+
+    /// Re-hash ONE chunk of a level from its queue: binary-search the
+    /// contiguous member range by seq (the queue is seq-ascending), keccak its
+    /// frames, and upsert — or remove the chunk if it has no members left.
+    /// O(log depth) seq lookups + O(members of the chunk).
+    fn rebuild_one_chunk(
+        queue: &VecDeque<Order>,
+        order_seq: &HashMap<OrderId, u64>,
+        chunks: &mut BTreeMap<u64, ChunkAgg>,
+        idx: u64,
+    ) {
+        let seq_of = |o: &Order| -> u64 {
+            *order_seq
+                .get(&o.id)
+                .expect("resting order must have a seq")
+        };
+        let lo_seq = idx * crate::book_rows::LEVEL_CHUNK_SEQS;
+        let hi_seq = lo_seq + crate::book_rows::LEVEL_CHUNK_SEQS; // exclusive
+        let start = queue.partition_point(|o| seq_of(o) < lo_seq);
+        let end = queue.partition_point(|o| seq_of(o) < hi_seq);
+        if start == end {
+            chunks.remove(&idx);
+            return;
+        }
+        let mut scratch: Vec<u8> = Vec::with_capacity(8 + 112);
+        let mut preimage: Vec<u8> = Vec::with_capacity((end - start) * 160);
+        let mut qty = FixedPoint::ZERO;
+        for order in queue.range(start..end) {
+            qty += order.remaining_qty;
+            Self::encode_order_row_into(&mut scratch, seq_of(order), order);
+            preimage.extend_from_slice(&(scratch.len() as u32).to_le_bytes());
+            preimage.extend_from_slice(&scratch);
+        }
+        chunks.insert(
+            idx,
+            ChunkAgg {
+                digest: alloy_primitives::keccak256(&preimage).0,
+                qty,
+                count: (end - start) as u32,
+            },
+        );
+    }
+
+    /// The mode-3 top hash + aggregate over a level's chunk state:
+    /// `keccak(DOMAIN ‖ count(u32 BE) ‖ total_qty(i128 BE) ‖ Σ_asc idx(u64 BE) ‖ digest)`.
+    /// `count`/`total_qty` are Σ over chunks in ascending idx (== queue) order,
+    /// so the qty sum is the same front→back `+=` sequence as the flat path.
+    fn chunked_top(chunks: &BTreeMap<u64, ChunkAgg>) -> crate::book_rows::LevelRowData {
+        debug_assert!(!chunks.is_empty(), "chunked_top on an empty level");
+        let mut total = FixedPoint::ZERO;
+        let mut count: u32 = 0;
+        for c in chunks.values() {
+            total += c.qty;
+            count += c.count;
+        }
+        let mut preimage: Vec<u8> = Vec::with_capacity(8 + 4 + 16 + chunks.len() * 40);
+        preimage.extend_from_slice(&crate::book_rows::LEVEL_HASH_CHUNKED_DOMAIN);
+        preimage.extend_from_slice(&count.to_be_bytes());
+        preimage.extend_from_slice(&total.raw().to_be_bytes());
+        for (idx, c) in chunks {
+            preimage.extend_from_slice(&idx.to_be_bytes());
+            preimage.extend_from_slice(&c.digest);
+        }
+        crate::book_rows::LevelRowData {
+            total_qty_raw: total.raw(),
+            order_count: count,
+            level_hash: alloy_primitives::keccak256(&preimage).0,
+        }
     }
 }
 
@@ -2094,6 +2577,9 @@ impl BorshDeserialize for OrderBook {
             level_exists: HashSet::new(),
             level_epoch: HashMap::new(),
             level_hash_cache: None,
+            level_hash_chunked: false,
+            level_chunks: HashMap::new(),
+            dirty_chunks: BTreeSet::new(),
         };
 
         for _ in 0..order_count {
@@ -3825,5 +4311,382 @@ mod level_preimage_characterization {
             OrderBook::encode_order_row_into(&mut reused, seq, &o);
             assert_eq!(reused, fresh, "byte drift on cross-order reuse");
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Mode 3 (chunked digest) — independent oracle + pinned vectors.
+    // ------------------------------------------------------------------
+
+    /// Hand-spelled mode-3 oracle: bucket the level's frames by
+    /// `seq / 64` in queue order, keccak each bucket, then keccak
+    /// `DOMAIN ‖ count(u32 BE) ‖ total(i128 BE) ‖ Σ_asc idx(u64 BE) ‖ digest`.
+    /// Shares NO code with the implementation (own framing, own grouping).
+    fn chunked_oracle(ob: &OrderBook, side: Side, raw_price: i128) -> Option<crate::book_rows::LevelRowData> {
+        let queue = ob.level_queue(side, FixedPoint::from_raw(raw_price))?;
+        if queue.is_empty() {
+            return None;
+        }
+        let mut buckets: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+        let mut total: i128 = 0;
+        for o in queue {
+            total += o.remaining_qty.raw();
+            let seq = ob.order_seq_of(o.id).expect("resting order has a seq");
+            let mut row = Vec::new();
+            row.extend_from_slice(&seq.to_be_bytes());
+            borsh::BorshSerialize::serialize(o, &mut row).unwrap();
+            let b = buckets.entry(seq / 64).or_default();
+            b.extend_from_slice(&(row.len() as u32).to_le_bytes());
+            b.extend_from_slice(&row);
+        }
+        let mut top: Vec<u8> = b"TORUSLV2".to_vec();
+        top.extend_from_slice(&(queue.len() as u32).to_be_bytes());
+        top.extend_from_slice(&total.to_be_bytes());
+        for (idx, bytes) in &buckets {
+            top.extend_from_slice(&idx.to_be_bytes());
+            top.extend_from_slice(&alloy_primitives::keccak256(bytes).0);
+        }
+        Some(crate::book_rows::LevelRowData {
+            total_qty_raw: total,
+            order_count: queue.len() as u32,
+            level_hash: alloy_primitives::keccak256(&top).0,
+        })
+    }
+
+    /// PIN 3 — mode-3 `level_row_data_chunked` output at depths 1 / 2 / 100 /
+    /// 1000 on the same fixture as PIN 1 (seqs 500.. ⇒ chunk boundaries at
+    /// 512, 576, …, so depth 100 spans 3 chunks and depth 1000 spans 17).
+    /// Consensus bytes for `TORUS_BOOK_ROWS=3`.
+    const PINNED_CHUNKED_LEVELS: [(usize, &str, i128, u32); 4] = [
+        (
+            1,
+            "92057f3fe1a90d2c43999af96afc36b42aa622345f3d79aaafeae8814dcc1855",
+            607_536,
+            1,
+        ),
+        (
+            2,
+            "1ae40f8b2c58bdfa7e898dc6fd1c523f7829906bfb286beec16b98b75a3d3939",
+            1_430_002,
+            2,
+        ),
+        (
+            100,
+            "4d6803930eba3b71d8c3e728eabc7380ecc8a0a2bef1371a1571dc8ae7c5a7d1",
+            51_292_508,
+            100,
+        ),
+        (
+            1000,
+            "d4785c1dabd2df08f8589170f542279efeba37c5677caed2b62058dd1ff7be0a",
+            491_881_418,
+            1000,
+        ),
+    ];
+
+    #[test]
+    #[ignore]
+    fn dump_chunked_pins() {
+        for depth in [1usize, 2, 100, 1000] {
+            let ob = fixture_book(depth);
+            let d = ob
+                .level_row_data_chunked(crate::book_rows::SIDE_TAG_BID, LEVEL_PRICE_RAW)
+                .expect("level exists");
+            println!(
+                "PIN_CHUNKED ({}, \"{}\", {}, {}),",
+                depth,
+                hex32(&d.level_hash),
+                d.total_qty_raw,
+                d.order_count
+            );
+        }
+    }
+
+    #[test]
+    fn level_row_data_chunked_matches_oracle_and_pins() {
+        for (depth, hash_hex, total, count) in PINNED_CHUNKED_LEVELS {
+            let ob = fixture_book(depth);
+            let d = ob
+                .level_row_data_chunked(crate::book_rows::SIDE_TAG_BID, LEVEL_PRICE_RAW)
+                .expect("level exists");
+            assert_eq!(
+                Some(d),
+                chunked_oracle(&ob, Side::Buy, LEVEL_PRICE_RAW),
+                "chunked oracle mismatch @depth {depth}"
+            );
+            // Aggregate parts are mode-independent.
+            let flat = ob
+                .level_row_data(crate::book_rows::SIDE_TAG_BID, LEVEL_PRICE_RAW)
+                .unwrap();
+            assert_eq!(d.total_qty_raw, flat.total_qty_raw);
+            assert_eq!(d.order_count, flat.order_count);
+            assert_ne!(d.level_hash, flat.level_hash, "modes must not collide");
+            assert_eq!(hex32(&d.level_hash), hash_hex, "chunked level_hash drift @depth {depth}");
+            assert_eq!(d.total_qty_raw, total);
+            assert_eq!(d.order_count, count);
+        }
+    }
+
+    /// The incremental drain (`take_level_ops` with the chunked digest
+    /// selected) must reproduce the from-scratch chunked digest AND the
+    /// hand oracle after every class of mutation: build, front pops (fills),
+    /// mid removal (cancel), in-place qty change, tail append, cancel_all,
+    /// and re-creation of an emptied level.
+    #[test]
+    fn chunked_incremental_drain_matches_scratch() {
+        let tag = crate::book_rows::SIDE_TAG_BID;
+        let mut ob = fixture_book(300);
+        ob.set_level_hash_chunked(true);
+        // First drain: level journal is empty (loads do not journal) — force
+        // via a real mutation: append one order through insert_order.
+        let check = |ob: &mut OrderBook, what: &str| {
+            let ops = ob.take_level_ops();
+            let got = ops
+                .iter()
+                .find(|(k, _)| *k == (tag, LEVEL_PRICE_RAW))
+                .map(|(_, d)| *d)
+                .unwrap_or_else(|| panic!("{what}: level not drained"));
+            let scratch = ob.level_row_data_chunked(tag, LEVEL_PRICE_RAW);
+            let oracle = chunked_oracle(ob, Side::Buy, LEVEL_PRICE_RAW);
+            assert_eq!(got, scratch, "{what}: incremental != scratch");
+            assert_eq!(got, oracle, "{what}: incremental != oracle");
+        };
+        let mut o = fixture_order(300);
+        o.id = 100_000;
+        ob.insert_order(o);
+        check(&mut ob, "initial build + append");
+        // Nothing dirty ⇒ no op for this level.
+        assert!(ob.take_level_ops().is_empty());
+
+        // Front pops: cross with a sell that eats 5 makers (fills at front).
+        let taker = PlaceOrderParams {
+            market_id: 1,
+            is_buy: false,
+            price: FixedPoint::from_raw(LEVEL_PRICE_RAW),
+            quantity: {
+                let q = ob.level_queue(Side::Buy, FixedPoint::from_raw(LEVEL_PRICE_RAW)).unwrap();
+                let mut sum = FixedPoint::ZERO;
+                for m in q.iter().take(5) {
+                    sum += m.remaining_qty;
+                }
+                sum + FixedPoint::from_raw(1) // + partial on the 6th
+            },
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::IOC,
+            reduce_only: false,
+            client_order_id: None,
+        };
+        let r = ob.place_order(taker, Address::from([0xEE; 20]), 7);
+        assert!(r.fills.len() + r.self_trade_cancels.len() >= 6, "taker must consume the front");
+        check(&mut ob, "front pops + partial");
+        let (levels, chunks, dirty) = ob.level_chunk_stats();
+        assert_eq!((levels, dirty), (1, 0));
+        assert!(chunks >= 5, "300 orders over 64-seq chunks ⇒ >= 5 chunks");
+
+        // Mid removal + in-place decrease + tail append in one interval.
+        let mid_id = ob
+            .level_queue(Side::Buy, FixedPoint::from_raw(LEVEL_PRICE_RAW))
+            .unwrap()[150]
+            .id;
+        ob.cancel_order(mid_id).unwrap();
+        let some_id = ob
+            .level_queue(Side::Buy, FixedPoint::from_raw(LEVEL_PRICE_RAW))
+            .unwrap()[40]
+            .id;
+        ob.modify_order(some_id, None, Some(FixedPoint::from_raw(1))).unwrap();
+        let mut o2 = fixture_order(301);
+        o2.id = 100_001;
+        ob.insert_order(o2);
+        check(&mut ob, "mid cancel + in-place modify + append");
+
+        // Only the touched chunks were re-hashed: assert by dirty-count
+        // bookkeeping — after drain nothing is pending.
+        assert_eq!(ob.level_chunk_stats().2, 0);
+
+        // Cancel-all of the taker-side traders empties nothing here; empty the
+        // level completely via cancel_all per trader, then re-create it.
+        let traders: Vec<Address> = ob
+            .level_queue(Side::Buy, FixedPoint::from_raw(LEVEL_PRICE_RAW))
+            .unwrap()
+            .iter()
+            .map(|o| o.trader)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        for t in traders {
+            ob.cancel_all(t, None);
+        }
+        assert!(ob.level_queue(Side::Buy, FixedPoint::from_raw(LEVEL_PRICE_RAW)).is_none());
+        let ops = ob.take_level_ops();
+        assert!(
+            ops.iter().any(|(k, d)| *k == (tag, LEVEL_PRICE_RAW) && d.is_none()),
+            "emptied level must emit a delete"
+        );
+        assert_eq!(ob.level_chunk_stats(), (0, 0, 0));
+        let mut o3 = fixture_order(302);
+        o3.id = 100_002;
+        ob.insert_order(o3);
+        check(&mut ob, "re-created level");
+    }
+}
+
+// ============================================================================
+// Queue lookup by id (binary search on seq) — correctness + timing probe
+// ============================================================================
+//
+// Every level queue is seq-ascending (appends take `next_seq`, loads assert
+// ascending, in-place modifies keep the seq, matches pop the FRONT), so an
+// order can be located in its level in O(log depth) seq probes instead of a
+// front-to-back scan. `take_row_ops` re-encodes EVERY journaled row through
+// `get_order` — with tens of thousands of appended rows per block on levels
+// thousands deep, the scan was the O(depth) term left in save_books after the
+// chunked digest. Pure lookup change: bytes/semantics untouched.
+#[cfg(test)]
+mod queue_lookup_tests {
+    use super::*;
+
+    fn fp(n: i64) -> FixedPoint {
+        FixedPoint::from_raw(n as i128 * FixedPoint::SCALE)
+    }
+    fn addr(n: u8) -> Address {
+        Address::from([n; 20])
+    }
+    /// Distinct trader per `i` modulo 4096 (the book caps resting orders per
+    /// trader at `MAX_ORDERS_PER_TRADER_PER_MARKET`).
+    fn trader(i: usize) -> Address {
+        let mut b = [0u8; 20];
+        b[0] = 0xAA;
+        b[18] = ((i >> 8) & 0x0F) as u8;
+        b[19] = (i & 0xFF) as u8;
+        Address::from(b)
+    }
+    fn params(is_buy: bool, price: i64, qty: i64) -> PlaceOrderParams {
+        PlaceOrderParams {
+            market_id: 1,
+            is_buy,
+            price: fp(price),
+            quantity: fp(qty),
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::GTC,
+            reduce_only: false,
+            client_order_id: None,
+        }
+    }
+
+    /// Deep level, ids looked up at every position, then interleaved cancels
+    /// (mid), fills (front), in-place qty modify, cancel_all and a
+    /// loaded-order book: `get_order` / cancel / modify must always resolve
+    /// the right order (and never a neighbour) — the lookup must agree with a
+    /// brute-force scan at every step.
+    #[test]
+    fn id_lookup_agrees_with_linear_scan_under_mutation() {
+        let mut ob = OrderBook::new(1, fp(1), fp(1));
+        let mut ids: Vec<OrderId> = Vec::new();
+        for i in 0..2_000usize {
+            let r = ob.place_order(params(true, 100 - (i % 3) as i64, 5), trader(i % 90), i as u64);
+            assert_eq!(r.status, OrderStatus::Resting);
+            ids.push(r.order_id);
+        }
+        let brute = |ob: &OrderBook, id: OrderId| -> Option<Order> {
+            ob.bid_queues()
+                .chain(ob.ask_queues())
+                .flat_map(|(_, q)| q.iter())
+                .find(|o| o.id == id)
+                .cloned()
+        };
+        let check_all = |ob: &OrderBook, ids: &[OrderId]| {
+            for &id in ids {
+                assert_eq!(ob.get_order(id).cloned(), brute(ob, id), "id {id}");
+            }
+        };
+        check_all(&ob, &ids);
+
+        // Mid-queue cancels (every 5th), then verify + the cancelled are gone.
+        let mut alive: Vec<OrderId> = Vec::new();
+        for (i, &id) in ids.iter().enumerate() {
+            if i % 5 == 3 {
+                let o = ob.cancel_order(id).expect("cancel");
+                assert_eq!(o.id, id);
+                assert!(ob.get_order(id).is_none());
+                assert!(brute(&ob, id).is_none());
+            } else {
+                alive.push(id);
+            }
+        }
+        check_all(&ob, &alive);
+
+        // Front fills: a sell sweeps part of the top bid level.
+        let r = ob.place_order(params(false, 100, 300), addr(9), 5_000);
+        assert!(!r.fills.is_empty());
+        alive.retain(|&id| brute(&ob, id).is_some());
+        check_all(&ob, &alive);
+        assert!(ob.get_order(999_999).is_none());
+
+        // In-place qty decrease keeps the position; the row is found.
+        let victim = alive[alive.len() / 2];
+        let o = ob.modify_order(victim, None, Some(fp(1))).expect("modify");
+        assert_eq!(o.id, victim);
+        assert_eq!(ob.get_order(victim).unwrap().remaining_qty, fp(1));
+        check_all(&ob, &alive);
+
+        // cancel_all for one trader.
+        let gone = ob.cancel_all(trader(4), None);
+        assert!(!gone.is_empty());
+        for o in &gone {
+            assert!(ob.get_order(o.id).is_none());
+        }
+        alive.retain(|&id| brute(&ob, id).is_some());
+        check_all(&ob, &alive);
+
+        // Loaded book (persisted seqs restored) resolves ids too — including
+        // ids that are NOT ascending with seq (loader gets seq-ordered rows).
+        let mut loaded = OrderBook::new(1, fp(1), fp(1));
+        let mut rows: Vec<(u64, Order)> = ob
+            .bid_queues()
+            .flat_map(|(_, q)| q.iter())
+            .map(|o| (ob.order_seq_of(o.id).unwrap(), o.clone()))
+            .collect();
+        rows.sort_by_key(|(s, o)| (o.price.raw(), *s));
+        for (seq, o) in rows {
+            loaded.insert_loaded_order(o, seq);
+        }
+        for &id in &alive {
+            assert_eq!(loaded.get_order(id).cloned(), brute(&loaded, id), "loaded id {id}");
+        }
+        // And a Classic (borsh) round trip re-assigns seqs in queue order.
+        let bytes = borsh::to_vec(&ob).unwrap();
+        let rt: OrderBook = borsh::from_slice(&bytes).unwrap();
+        for &id in &alive {
+            assert_eq!(rt.get_order(id).cloned(), brute(&rt, id), "borsh id {id}");
+        }
+    }
+
+    /// Timing probe (run with `--ignored --nocapture`): a 5 000-deep level,
+    /// 2 000 rows appended and journaled in one "block", then `take_row_ops`.
+    /// Before the seq binary search this was O(rows × depth) (~10 M order
+    /// compares); after, O(rows × log depth).
+    #[test]
+    #[ignore]
+    fn take_row_ops_timing_probe_deep_level() {
+        let mut ob = OrderBook::new(1, fp(1), fp(1));
+        for i in 0..5_000u64 {
+            let r = ob.place_order(params(true, 100, 5), trader(i as usize), i);
+            assert_eq!(r.status, OrderStatus::Resting);
+        }
+        let _ = ob.take_row_ops();
+        for i in 0..2_000u64 {
+            let r = ob.place_order(params(true, 100, 5), trader(2_048 + i as usize), 10_000 + i);
+            assert_eq!(r.status, OrderStatus::Resting);
+        }
+        let t = std::time::Instant::now();
+        let ops = ob.take_row_ops();
+        let el = t.elapsed();
+        assert_eq!(ops.len(), 2_000);
+        eprintln!(
+            "take_row_ops: {} rows on a {}-deep level: {:?} ({:.2} µs/row)",
+            ops.len(),
+            ob.order_count(),
+            el,
+            el.as_secs_f64() * 1e6 / ops.len() as f64
+        );
     }
 }

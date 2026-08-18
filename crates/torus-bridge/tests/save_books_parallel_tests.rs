@@ -216,12 +216,16 @@ struct RunResult {
     /// Final full dumps across all interesting CFs.
     dumps: Vec<(&'static str, Vec<u8>, Vec<u8>)>,
     oracle: B256,
+    /// The universe DB (kept alive with its tempdir) for post-run reloads.
+    _dir: tempfile::TempDir,
+    db: StateDb,
 }
 
 /// One mode-2 universe (resident books, serial flush) with the save drain
 /// worker cap chosen PER BLOCK by `workers_for(height)`. `cache_mb` = level
 /// hash cache budget (0 = off). `min_ops` = parallel work gate.
 fn run_universe(
+    mode: BookMode,
     workers_for: &dyn Fn(u64) -> usize,
     min_ops: usize,
     cache_mb: usize,
@@ -229,7 +233,7 @@ fn run_universe(
     blocks: usize,
     per_block: usize,
 ) -> RunResult {
-    let (_dir, db) = open_test_db();
+    let (dir, db) = open_test_db();
     {
         let ctx0 = NativeExecContext::new_with_mode(
             db.clone(),
@@ -241,7 +245,7 @@ fn run_universe(
             addr(99),
             addr(100),
             addr(101),
-            BookMode::LevelAuthority,
+            mode,
             None,
         );
         for t in [addr(1), addr(2), addr(3), addr(4), addr(5), addr(6)] {
@@ -271,7 +275,7 @@ fn run_universe(
             addr(99),
             addr(100),
             addr(101),
-            BookMode::LevelAuthority,
+            mode,
             Some(&mut books),
         );
         ctx.level_hash_cache_bytes = cache_mb * 1024 * 1024;
@@ -329,6 +333,8 @@ fn run_universe(
         workers_used,
         dumps,
         oracle: native_root_full(&db).unwrap(),
+        _dir: dir,
+        db,
     }
 }
 
@@ -368,10 +374,10 @@ fn assert_identical(label: &str, base: &RunResult, other: &RunResult) {
 #[test]
 fn save_books_workers_matrix_byte_identical_cache_on() {
     let seed = 0x5A7E_B00C_5EEDu64;
-    let serial = run_universe(&|_| 1, 0, 64, seed, 30, 40);
+    let serial = run_universe(BookMode::LevelAuthority, &|_| 1, 0, 64, seed, 30, 40);
     assert!(serial.workers_used.iter().all(|&w| w == 1), "serial run must not spawn");
     for workers in [2usize, 3, 4, 8, 64] {
-        let par = run_universe(&move |_| workers, 0, 64, seed, 30, 40);
+        let par = run_universe(BookMode::LevelAuthority, &move |_| workers, 0, 64, seed, 30, 40);
         let label = format!("cache=on workers={workers}");
         assert_identical(&label, &serial, &par);
         // The parallel path must actually have engaged on the multi-book
@@ -393,9 +399,9 @@ fn save_books_workers_matrix_byte_identical_cache_on() {
 #[test]
 fn save_books_workers_matrix_byte_identical_cache_off() {
     let seed = 0xBAD_CAFE_0FF5u64;
-    let serial = run_universe(&|_| 1, 0, 0, seed, 24, 40);
+    let serial = run_universe(BookMode::LevelAuthority, &|_| 1, 0, 0, seed, 24, 40);
     for workers in [2usize, 4, 16] {
-        let par = run_universe(&move |_| workers, 0, 0, seed, 24, 40);
+        let par = run_universe(BookMode::LevelAuthority, &move |_| workers, 0, 0, seed, 24, 40);
         assert_identical(&format!("cache=off workers={workers}"), &serial, &par);
         assert!(par.workers_used.iter().filter(|&&w| w >= 2).count() >= 20);
         // No cache anywhere: stats are None for every book in both runs.
@@ -414,9 +420,9 @@ fn save_books_workers_matrix_byte_identical_cache_off() {
 #[test]
 fn save_books_alternating_workers_equals_serial() {
     let seed = 0xA17E_12A7_1234u64;
-    let serial = run_universe(&|_| 1, 0, 64, seed, 30, 40);
+    let serial = run_universe(BookMode::LevelAuthority, &|_| 1, 0, 64, seed, 30, 40);
     let pattern = [1usize, 4, 1, 8, 2, 3, 64, 1, 5];
-    let alt = run_universe(&move |h| pattern[(h as usize) % pattern.len()], 0, 64, seed, 30, 40);
+    let alt = run_universe(BookMode::LevelAuthority, &move |h| pattern[(h as usize) % pattern.len()], 0, 64, seed, 30, 40);
     assert_identical("alternating", &serial, &alt);
     // Sanity: the pattern really alternated serial and parallel saves.
     assert!(alt.workers_used.iter().any(|&w| w == 1));
@@ -432,13 +438,13 @@ fn save_books_work_gate_and_single_book_are_serial() {
     let seed = 0x6A7E_0001u64;
     // A gate far above any block's journaled work ⇒ serial every block,
     // still byte-identical to the ungated parallel run.
-    let gated = run_universe(&|_| 8, 1_000_000, 64, seed, 12, 40);
+    let gated = run_universe(BookMode::LevelAuthority, &|_| 8, 1_000_000, 64, seed, 12, 40);
     assert!(
         gated.workers_used.iter().all(|&w| w == 1),
         "gate must keep the serial path: {:?}",
         gated.workers_used
     );
-    let open = run_universe(&|_| 8, 0, 64, seed, 12, 40);
+    let open = run_universe(BookMode::LevelAuthority, &|_| 8, 0, 64, seed, 12, 40);
     assert!(open.workers_used.iter().any(|&w| w >= 2));
     assert_identical("gate vs open", &gated, &open);
 
@@ -467,4 +473,81 @@ fn save_books_work_gate_and_single_book_are_serial() {
     let written = ctx.save_order_books();
     assert!(written > 0);
     assert_eq!(ctx.last_save_workers(), 1, "one dirty book must drain inline");
+}
+
+// ============================================================================
+// 5. Mode 3 (chunked level hash) rides the same two-pass parallel drain
+// ============================================================================
+
+/// Mode 3 (`TORUS_BOOK_ROWS=3`, chunked depth-independent level digest) is
+/// saved by the same two-pass path as mode 2: pass 1 drains each dirty
+/// book's journals (re-hashing only its dirty 64-seq chunks) on worker
+/// threads, pass 2 writes serially. Contract: byte-identical persisted state
+/// and post-save in-memory books for ANY worker count; the parallel path
+/// provably engages; the sponge cache is never used (stats None even with a
+/// cache budget); the result differs from mode 2 (different preimage); and a
+/// fresh reload under mode 3 passes boot verify 3 (from-scratch chunked
+/// recompute of every level row == the persisted rows written by the
+/// incremental parallel drains).
+#[test]
+fn save_books_workers_matrix_mode3_chunked_byte_identical() {
+    let seed = 0xC4A1_4EDB_00C5u64;
+    let serial = run_universe(BookMode::LevelAuthorityChunked, &|_| 1, 0, 64, seed, 30, 40);
+    assert!(serial.workers_used.iter().all(|&w| w == 1), "serial run must not spawn");
+    // Mode 3 never engages the sponge cache, even with a budget.
+    assert!(serial
+        .post_books
+        .iter()
+        .flatten()
+        .all(|(_, _, stats)| stats.is_none()));
+    for workers in [2usize, 4, 8, 64] {
+        let par = run_universe(BookMode::LevelAuthorityChunked, &move |_| workers, 0, 64, seed, 30, 40);
+        let label = format!("mode3 workers={workers}");
+        assert_identical(&label, &serial, &par);
+        let engaged = par.workers_used.iter().filter(|&&w| w >= 2).count();
+        assert!(
+            engaged >= 25,
+            "{label}: parallel drain engaged on only {engaged}/30 blocks: {:?}",
+            par.workers_used
+        );
+        assert!(par
+            .post_books
+            .iter()
+            .flatten()
+            .all(|(_, _, stats)| stats.is_none()));
+
+        // Fresh reload from the parallel-drained DB under mode 3: boot
+        // verify 3 recomputes every level row FROM SCRATCH (chunked oracle)
+        // and must accept the incrementally maintained rows.
+        let ctx = NativeExecContext::new_with_mode(
+            par.db.clone(), 31, 1031, 0, 100, 10, addr(99), addr(100), addr(101),
+            BookMode::LevelAuthorityChunked, None,
+        );
+        assert!(
+            ctx.fatal_error.is_none(),
+            "{label}: mode-3 reload boot verify failed: {:?}",
+            ctx.fatal_error
+        );
+        assert!(!ctx.order_books.is_empty(), "{label}: reload found no books");
+        // And a mode-2 reload of the same DB must fail-stop (marker/preimage
+        // mismatch) — the fleets cannot silently mix.
+        let ctx2 = NativeExecContext::new_with_mode(
+            par.db.clone(), 31, 1031, 0, 100, 10, addr(99), addr(100), addr(101),
+            BookMode::LevelAuthority, None,
+        );
+        assert!(ctx2.fatal_error.is_some(), "{label}: mode-2 reload of a mode-3 DB must fail-stop");
+    }
+
+    // Different preimage from mode 2 over the same batches: the level rows
+    // (and hence the roots) differ, while the node-local order rows agree.
+    let mode2 = run_universe(BookMode::LevelAuthority, &|_| 1, 0, 64, seed, 30, 40);
+    assert_ne!(mode2.oracle, serial.oracle, "mode 3 must not equal mode 2's root");
+    let rows = |r: &RunResult| -> Vec<(Vec<u8>, Vec<u8>)> {
+        r.dumps
+            .iter()
+            .filter(|(cf, _, _)| *cf == CF_BOOK_ORDER_ROWS)
+            .map(|(_, k, v)| (k.clone(), v.clone()))
+            .collect()
+    };
+    assert_eq!(rows(&mode2), rows(&serial), "node-local order rows must be mode-independent");
 }
