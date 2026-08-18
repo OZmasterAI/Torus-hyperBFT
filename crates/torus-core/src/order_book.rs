@@ -597,9 +597,7 @@ impl OrderBook {
             .get_mut(&loc.price)
             .ok_or(CoreError::OrderNotFound(order_id))?;
 
-        let pos = queue
-            .iter()
-            .position(|o| o.id == order_id)
+        let pos = Self::queue_position(queue, &self.order_seq, order_id)
             .ok_or(CoreError::OrderNotFound(order_id))?;
 
         let order = queue.remove(pos).unwrap();
@@ -654,7 +652,7 @@ impl OrderBook {
                     Side::Sell => &mut self.asks,
                 };
                 if let Some(queue) = book.get_mut(&loc.price) {
-                    if let Some(pos) = queue.iter().position(|o| o.id == order_id) {
+                    if let Some(pos) = Self::queue_position(queue, &self.order_seq, order_id) {
                         cancelled.push(queue.remove(pos).unwrap());
                         let seq = self.order_seq.remove(&order_id);
                         self.row_journal.insert(order_id);
@@ -713,7 +711,8 @@ impl OrderBook {
                     Side::Sell => &mut self.asks,
                 };
                 if let Some(queue) = book.get_mut(&loc.price) {
-                    if let Some(order) = queue.iter_mut().find(|o| o.id == order_id) {
+                    let pos = Self::queue_position(queue, &self.order_seq, order_id);
+                    if let Some(order) = pos.and_then(|p| queue.get_mut(p)) {
                         if new_q > FixedPoint::ZERO && new_q < order.remaining_qty {
                             order.remaining_qty = new_q;
                             let out = order.clone();
@@ -810,7 +809,43 @@ impl OrderBook {
             Side::Buy => &self.bids,
             Side::Sell => &self.asks,
         };
-        book.get(&loc.price)?.iter().find(|o| o.id == order_id)
+        let queue = book.get(&loc.price)?;
+        let pos = Self::queue_position(queue, &self.order_seq, order_id)?;
+        queue.get(pos)
+    }
+
+    /// Position of `order_id` in its level queue.
+    ///
+    /// Level queues are seq-ascending by construction (`insert_order` appends
+    /// with the monotone `next_seq`, `insert_loaded_order` asserts ascending,
+    /// in-place modifies keep the seq, matching pops the FRONT), so the order
+    /// is found by binary search on seq — O(log depth) `order_seq` probes
+    /// instead of a front-to-back scan. `take_row_ops` re-encodes EVERY
+    /// journaled row through `get_order`; on levels thousands deep with tens
+    /// of thousands of appended rows per block that scan was O(rows × depth)
+    /// per save. Pure lookup: never changes which order is found. Falls back
+    /// to the linear scan if the seq probe does not land on `order_id`
+    /// (cannot happen while the invariant holds; asserted in debug).
+    #[inline]
+    fn queue_position(
+        queue: &VecDeque<Order>,
+        order_seq: &HashMap<OrderId, u64>,
+        order_id: OrderId,
+    ) -> Option<usize> {
+        if let Some(&seq) = order_seq.get(&order_id) {
+            let pos = queue.partition_point(|o| {
+                order_seq.get(&o.id).is_some_and(|&s| s < seq)
+            });
+            let hit = queue.get(pos).is_some_and(|o| o.id == order_id);
+            debug_assert!(
+                hit,
+                "queue_position: seq probe missed order {order_id} (level queue not seq-ascending?)"
+            );
+            if hit {
+                return Some(pos);
+            }
+        }
+        queue.iter().position(|o| o.id == order_id)
     }
 
     /// Total resting orders on the book.
@@ -4491,5 +4526,167 @@ mod level_preimage_characterization {
         o3.id = 100_002;
         ob.insert_order(o3);
         check(&mut ob, "re-created level");
+    }
+}
+
+// ============================================================================
+// Queue lookup by id (binary search on seq) — correctness + timing probe
+// ============================================================================
+//
+// Every level queue is seq-ascending (appends take `next_seq`, loads assert
+// ascending, in-place modifies keep the seq, matches pop the FRONT), so an
+// order can be located in its level in O(log depth) seq probes instead of a
+// front-to-back scan. `take_row_ops` re-encodes EVERY journaled row through
+// `get_order` — with tens of thousands of appended rows per block on levels
+// thousands deep, the scan was the O(depth) term left in save_books after the
+// chunked digest. Pure lookup change: bytes/semantics untouched.
+#[cfg(test)]
+mod queue_lookup_tests {
+    use super::*;
+
+    fn fp(n: i64) -> FixedPoint {
+        FixedPoint::from_raw(n as i128 * FixedPoint::SCALE)
+    }
+    fn addr(n: u8) -> Address {
+        Address::from([n; 20])
+    }
+    /// Distinct trader per `i` modulo 4096 (the book caps resting orders per
+    /// trader at `MAX_ORDERS_PER_TRADER_PER_MARKET`).
+    fn trader(i: usize) -> Address {
+        let mut b = [0u8; 20];
+        b[0] = 0xAA;
+        b[18] = ((i >> 8) & 0x0F) as u8;
+        b[19] = (i & 0xFF) as u8;
+        Address::from(b)
+    }
+    fn params(is_buy: bool, price: i64, qty: i64) -> PlaceOrderParams {
+        PlaceOrderParams {
+            market_id: 1,
+            is_buy,
+            price: fp(price),
+            quantity: fp(qty),
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::GTC,
+            reduce_only: false,
+            client_order_id: None,
+        }
+    }
+
+    /// Deep level, ids looked up at every position, then interleaved cancels
+    /// (mid), fills (front), in-place qty modify, cancel_all and a
+    /// loaded-order book: `get_order` / cancel / modify must always resolve
+    /// the right order (and never a neighbour) — the lookup must agree with a
+    /// brute-force scan at every step.
+    #[test]
+    fn id_lookup_agrees_with_linear_scan_under_mutation() {
+        let mut ob = OrderBook::new(1, fp(1), fp(1));
+        let mut ids: Vec<OrderId> = Vec::new();
+        for i in 0..2_000usize {
+            let r = ob.place_order(params(true, 100 - (i % 3) as i64, 5), trader(i % 90), i as u64);
+            assert_eq!(r.status, OrderStatus::Resting);
+            ids.push(r.order_id);
+        }
+        let brute = |ob: &OrderBook, id: OrderId| -> Option<Order> {
+            ob.bid_queues()
+                .chain(ob.ask_queues())
+                .flat_map(|(_, q)| q.iter())
+                .find(|o| o.id == id)
+                .cloned()
+        };
+        let check_all = |ob: &OrderBook, ids: &[OrderId]| {
+            for &id in ids {
+                assert_eq!(ob.get_order(id).cloned(), brute(ob, id), "id {id}");
+            }
+        };
+        check_all(&ob, &ids);
+
+        // Mid-queue cancels (every 5th), then verify + the cancelled are gone.
+        let mut alive: Vec<OrderId> = Vec::new();
+        for (i, &id) in ids.iter().enumerate() {
+            if i % 5 == 3 {
+                let o = ob.cancel_order(id).expect("cancel");
+                assert_eq!(o.id, id);
+                assert!(ob.get_order(id).is_none());
+                assert!(brute(&ob, id).is_none());
+            } else {
+                alive.push(id);
+            }
+        }
+        check_all(&ob, &alive);
+
+        // Front fills: a sell sweeps part of the top bid level.
+        let r = ob.place_order(params(false, 100, 300), addr(9), 5_000);
+        assert!(!r.fills.is_empty());
+        alive.retain(|&id| brute(&ob, id).is_some());
+        check_all(&ob, &alive);
+        assert!(ob.get_order(999_999).is_none());
+
+        // In-place qty decrease keeps the position; the row is found.
+        let victim = alive[alive.len() / 2];
+        let o = ob.modify_order(victim, None, Some(fp(1))).expect("modify");
+        assert_eq!(o.id, victim);
+        assert_eq!(ob.get_order(victim).unwrap().remaining_qty, fp(1));
+        check_all(&ob, &alive);
+
+        // cancel_all for one trader.
+        let gone = ob.cancel_all(trader(4), None);
+        assert!(!gone.is_empty());
+        for o in &gone {
+            assert!(ob.get_order(o.id).is_none());
+        }
+        alive.retain(|&id| brute(&ob, id).is_some());
+        check_all(&ob, &alive);
+
+        // Loaded book (persisted seqs restored) resolves ids too — including
+        // ids that are NOT ascending with seq (loader gets seq-ordered rows).
+        let mut loaded = OrderBook::new(1, fp(1), fp(1));
+        let mut rows: Vec<(u64, Order)> = ob
+            .bid_queues()
+            .flat_map(|(_, q)| q.iter())
+            .map(|o| (ob.order_seq_of(o.id).unwrap(), o.clone()))
+            .collect();
+        rows.sort_by_key(|(s, o)| (o.price.raw(), *s));
+        for (seq, o) in rows {
+            loaded.insert_loaded_order(o, seq);
+        }
+        for &id in &alive {
+            assert_eq!(loaded.get_order(id).cloned(), brute(&loaded, id), "loaded id {id}");
+        }
+        // And a Classic (borsh) round trip re-assigns seqs in queue order.
+        let bytes = borsh::to_vec(&ob).unwrap();
+        let rt: OrderBook = borsh::from_slice(&bytes).unwrap();
+        for &id in &alive {
+            assert_eq!(rt.get_order(id).cloned(), brute(&rt, id), "borsh id {id}");
+        }
+    }
+
+    /// Timing probe (run with `--ignored --nocapture`): a 5 000-deep level,
+    /// 2 000 rows appended and journaled in one "block", then `take_row_ops`.
+    /// Before the seq binary search this was O(rows × depth) (~10 M order
+    /// compares); after, O(rows × log depth).
+    #[test]
+    #[ignore]
+    fn take_row_ops_timing_probe_deep_level() {
+        let mut ob = OrderBook::new(1, fp(1), fp(1));
+        for i in 0..5_000u64 {
+            let r = ob.place_order(params(true, 100, 5), trader(i as usize), i);
+            assert_eq!(r.status, OrderStatus::Resting);
+        }
+        let _ = ob.take_row_ops();
+        for i in 0..2_000u64 {
+            let r = ob.place_order(params(true, 100, 5), trader(2_048 + i as usize), 10_000 + i);
+            assert_eq!(r.status, OrderStatus::Resting);
+        }
+        let t = std::time::Instant::now();
+        let ops = ob.take_row_ops();
+        let el = t.elapsed();
+        assert_eq!(ops.len(), 2_000);
+        eprintln!(
+            "take_row_ops: {} rows on a {}-deep level: {:?} ({:.2} µs/row)",
+            ops.len(),
+            ob.order_count(),
+            el,
+            el.as_secs_f64() * 1e6 / ops.len() as f64
+        );
     }
 }
