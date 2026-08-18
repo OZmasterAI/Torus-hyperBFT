@@ -15,7 +15,8 @@ ap = argparse.ArgumentParser()
 for a in ["out", "label", "worktree", "commit", "dirty", "markets", "dur", "rate", "senders",
           "t-bench0", "t-bench1", "t-drain", "drained", "bench-rc", "idle-blks", "md5-node",
           "md5-bench", "genesis-md5", "genesis-markets", "genesis-accounts", "node-env",
-          "env-digests", "extra-env", "bench-cmd", "pids", "evicted", "bench-submitted"]:
+          "env-digests", "extra-env", "bench-cmd", "pids", "evicted", "bench-submitted",
+          "block-cap", "dissem"]:
     ap.add_argument("--" + a, default="")
 A = ap.parse_args()
 OUT = A.out
@@ -195,6 +196,37 @@ if len(agree_rows) == 3:
 else:
     agreement["validators_agree"] = False
 
+# ---------------------------------------------------------------- dissemination / pacing
+# run-cell.sh passes "val0:manifest=N,exhausted=N,sync_fallback=N,da_outbound_fail=N,starvation=N,pacing=N val1:... val2:..."
+# (node log line counts). Block-cap-raise sweep gate: a raised cap is REJECTED when
+# bodies stop disseminating (exhausted / sync_fallback / da_outbound_fail > 0 under
+# load), whatever matched/s says.
+def parse_dissem(raw):
+    out = {}
+    for tok in (raw or "").split():
+        if ":" not in tok:
+            continue
+        node, kvs = tok.split(":", 1)
+        d = {}
+        for kv in kvs.split(","):
+            if "=" in kv:
+                k, v = kv.split("=", 1)
+                try:
+                    d[k] = int(v)
+                except ValueError:
+                    d[k] = None
+        out[node] = d
+    return out
+
+dissem = parse_dissem(A.dissem)
+if dissem:
+    dissem["raw"] = A.dissem.strip()   # re-fed verbatim by resummarize.sh
+    fail_keys = ("exhausted", "sync_fallback", "da_outbound_fail", "starvation")
+    dissem["total_failures"] = sum((d.get(k) or 0) for n, d in dissem.items() if n.startswith("val") for k in fail_keys)
+    dissem["total_manifest_pushes"] = sum((d.get("manifest") or 0) for n, d in dissem.items() if n.startswith("val"))
+    dissem["total_pacing_lines"] = sum((d.get("pacing") or 0) for n, d in dissem.items() if n.startswith("val"))
+    dissem["dissemination_clean"] = dissem["total_failures"] == 0
+
 # ---------------------------------------------------------------- cpu
 cpu = {}
 try:
@@ -228,6 +260,7 @@ summary = {
     "binaries": {"torus_node_md5": A.md5_node, "bench_throughput_md5": A.md5_bench},
     "genesis": {"md5": A.genesis_md5, "markets": int(A.genesis_markets or 0), "native_balances": int(A.genesis_accounts or 0)},
     "cell": {"markets": int(A.markets), "duration_s": int(A.dur), "rate_total": int(A.rate), "senders": int(A.senders),
+             "block_cap": int(A.block_cap) if A.block_cap else None,
              "extra_env": A.extra_env, "node_env": json.loads(A.node_env) if A.node_env else {},
              "env_digests_per_node": A.env_digests.split(), "bench_cmd": A.bench_cmd, "node_pids": A.pids.split()},
     "timing": {"t_bench0": t0, "t_bench1": t1, "t_drain": td, "bench_wall_s": t1 - t0, "drain_s": td - t1,
@@ -241,6 +274,10 @@ summary = {
         "blk_s_avg": v0.get("blk_s_benchwin"),
         "blk_s_worst60": v0.get("blk_s_worst60"),
         "peak_exec_queue_depth": v0.get("peak_exec_queue_depth"),
+        "txs_per_block_avg": phase.get("val0", {}).get("txs_per_block_avg"),
+        "actions_per_exec_block": phase.get("val0", {}).get("actions_per_exec_block"),
+        "consensus_timeouts": v0.get("delta_consensus_timeout_total_total"),
+        "dissemination_clean": dissem.get("dissemination_clean") if dissem else None,
         "validators_agree": agreement.get("validators_agree"),
     },
     "ingest": {"bench_submitted_actions": int(A.bench_submitted or 0),
@@ -250,6 +287,7 @@ summary = {
     "funnel_by_node": funnel,
     "phase_by_node": phase,
     "agreement": agreement,
+    "dissemination": dissem,
     "cpu": cpu,
     "bench_log_tail": bench_tail,
 }
@@ -257,7 +295,8 @@ with open(os.path.join(OUT, "summary.json"), "w") as f:
     json.dump(summary, f, indent=1)
 h = summary["headline"]
 print(f"SUMMARY {A.label}: matched/s avg={h['matched_s_avg']} best60={h['matched_s_best60']} "
-      f"placed/s={h['placed_s_avg']} blk/s={h['blk_s_avg']} agree={h['validators_agree']} "
+      f"placed/s={h['placed_s_avg']} blk/s={h['blk_s_avg']} txs/blk={h['txs_per_block_avg']} "
+      f"timeouts={h['consensus_timeouts']} dissem_clean={h['dissemination_clean']} agree={h['validators_agree']} "
       f"drained={summary['timing']['drained']} bench_rc={A.bench_rc}")
 p0 = phase.get("val0", {})
 if p0:

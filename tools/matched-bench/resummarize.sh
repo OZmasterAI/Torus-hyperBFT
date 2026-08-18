@@ -14,4 +14,5 @@ python3 "$T/summarize.py" --out "$D" --label "$(j .label)" --worktree "$(j .work
   --env-digests "$(j '.cell.env_digests_per_node|join(" ")')" --extra-env "$(j .cell.extra_env)" \
   --bench-cmd "$(j .cell.bench_cmd)" --pids "$(j '.cell.node_pids|join(" ")')" \
   --evicted "$(j '.ingest.mempool_nonce_expired_evictions_per_node|map(tostring)|join(" ")')" \
-  --bench-submitted "$(j .ingest.bench_submitted_actions)"
+  --bench-submitted "$(j .ingest.bench_submitted_actions)" \
+  --block-cap "$(j '.cell.block_cap // ""')" --dissem "$(j '.dissemination.raw // ""')"
