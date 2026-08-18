@@ -183,7 +183,7 @@ impl MarketWorkerPool {
     /// each input index, its worker index in `[0, workers)`. Pure over the
     /// `(market_id, count)` pairs and independent of their input order, so chunk
     /// layout is reproducible.
-    fn assign_chunks(markets: &[(MarketId, usize)], workers: usize) -> Vec<usize> {
+    pub(crate) fn assign_chunks(markets: &[(MarketId, usize)], workers: usize) -> Vec<usize> {
         let workers = workers.max(1);
         let n = markets.len();
 

@@ -1397,6 +1397,13 @@ impl OrderBook {
         self.row_journal.len()
     }
 
+    /// Number of journaled (touched-since-last-save) price levels — the
+    /// mode-2 save's LPT weight hint (`take_level_ops` work is O(touched
+    /// levels) journal work + hashing) and a test/metrics hook.
+    pub fn journaled_levels(&self) -> usize {
+        self.level_journal.len()
+    }
+
     /// The consensus aggregate of one price level (level-row VALUE parts), or
     /// `None` if the level has no resting orders. O(orders in the level):
     /// sums `remaining_qty` and keccaks the framed order rows front→back.

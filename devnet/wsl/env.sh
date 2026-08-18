@@ -40,6 +40,10 @@ export TORUS_HASH_ONLY_PUSH_THRESHOLD="${TORUS_HASH_ONLY_PUSH_THRESHOLD:-6000000
 export TORUS_NATIVE_TOTAL_BLOCK_CAP="${TORUS_NATIVE_TOTAL_BLOCK_CAP:-100}"
 # perf A1 (landed 8fa6ccd): skip shard custody in the execute_batch funnel.
 export TORUS_SHARD_CUSTODY="${TORUS_SHARD_CUSTODY:-0}"
+# mode-2 save-books parallel drain (node-local, byte-identical): default ON at
+# host parallelism; set TORUS_SAVE_BOOKS_WORKERS=1 for the serial loop, N>=2
+# to cap the drain threads (TORUS_SAVE_BOOKS_MIN_OPS = work gate, default 32).
+# Left unset here on purpose — the binary default is the measured config.
 
 METRICS_PORTS="$MET0 $MET1 $MET2"
 RPC_URLS="http://localhost:$RPC0 http://localhost:$RPC1 http://localhost:$RPC2"
