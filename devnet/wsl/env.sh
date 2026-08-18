@@ -44,6 +44,10 @@ export TORUS_SHARD_CUSTODY="${TORUS_SHARD_CUSTODY:-0}"
 # host parallelism; set TORUS_SAVE_BOOKS_WORKERS=1 for the serial loop, N>=2
 # to cap the drain threads (TORUS_SAVE_BOOKS_MIN_OPS = work gate, default 32).
 # Left unset here on purpose — the binary default is the measured config.
+# view-legs trim (r2): hotstuff block tree + native-DA bodies live in a split
+# RocksDB instance (<data-dir>/consensus-kv) by default so consensus-thread
+# writes never queue behind exec write groups; TORUS_CONSENSUS_KV_SPLIT=0
+# restores the legacy shared-CF layout (A/B control). Left unset = default on.
 
 METRICS_PORTS="$MET0 $MET1 $MET2"
 RPC_URLS="http://localhost:$RPC0 http://localhost:$RPC1 http://localhost:$RPC2"
