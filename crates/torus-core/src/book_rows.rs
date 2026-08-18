@@ -46,6 +46,20 @@ pub const SIDE_TAG_ASK: u8 = 0x01;
 /// Byte length of a level-row value: qty(16) ‖ count(4) ‖ hash(32).
 pub const LEVEL_ROW_VALUE_LEN: usize = 52;
 
+/// Chunked level digest (`TORUS_BOOK_ROWS=3`, mode-3 `level_hash`): number
+/// of consecutive queue seqs per chunk. A level's frames are bucketed by
+/// `seq / LEVEL_CHUNK_SEQS` (absolute per-book seq, monotone and persisted
+/// with every row), so a mutation dirties only the chunk(s) holding the
+/// touched seq(s) and the digest cost per dirty level is O(chunk) + O(chunks),
+/// independent of resting depth. CONSENSUS-VISIBLE: changing it changes every
+/// mode-3 `level_hash`.
+pub const LEVEL_CHUNK_SEQS: u64 = 64;
+
+/// Domain separator prefixed to the mode-3 top-level preimage, so a chunked
+/// digest can never collide with a mode-2 (flat frame concat) digest of any
+/// level content.
+pub const LEVEL_HASH_CHUNKED_DOMAIN: [u8; 8] = *b"TORUSLV2";
+
 /// Canonical side byte for level-row keys.
 pub const fn side_tag(side: Side) -> u8 {
     match side {
@@ -207,11 +221,29 @@ impl BookMetaRow {
 
 /// One price level's consensus aggregate — the level-row VALUE parts.
 ///
-/// `level_hash` is the order-identity commitment:
+/// `level_hash` is the order-identity commitment. Its preimage depends on the
+/// book mode (fleet-uniform, fresh genesis to change — see
+/// `torus_bridge::native_executor::BookMode`):
+///
+/// **Mode 2 (`TORUS_BOOK_ROWS=2`, flat):**
 /// `keccak256(for each order in queue front→back: row_len(u32 LE) ‖ seq(8 BE) ‖ borsh(Order))`
 /// where `seq(8 BE) ‖ borsh(Order)` is byte-identical to the order-row VALUE
 /// and `row_len` is that payload's length (framing makes concatenation
 /// injective).
+///
+/// **Mode 3 (`TORUS_BOOK_ROWS=3`, chunked — depth-independent maintenance):**
+/// the same frames, bucketed by `chunk_idx = seq / LEVEL_CHUNK_SEQS`:
+/// ```text
+/// chunk_digest(i) = keccak256(frames of the level's orders with seq in
+///                             [i·64, (i+1)·64), in queue (= seq) order)
+/// level_hash      = keccak256(LEVEL_HASH_CHUNKED_DOMAIN ‖ order_count(u32 BE)
+///                             ‖ total_qty_raw(i128 BE)
+///                             ‖ for each NON-EMPTY chunk, idx ascending:
+///                                   chunk_idx(u64 BE) ‖ chunk_digest)
+/// ```
+/// A pure function of level content (no dependence on mutation history), so
+/// the incremental maintenance in `OrderBook::take_level_ops` and the
+/// from-scratch `OrderBook::level_row_data_chunked` (boot verify) agree.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LevelRowData {
     /// Sum of member `remaining_qty` raws (> 0 by invariant).
