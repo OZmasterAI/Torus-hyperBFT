@@ -317,6 +317,11 @@ pub struct Metrics {
     /// ...and the follower's `validate_block` (decode + body reconstruct +
     /// attestation verify), i.e. `insert_persist` minus the block-tree write.
     pub validate_block_seconds: Histogram,
+    /// View timeouts attributed to the leg that was outstanding at the deadline
+    /// (label `phase`: leader_no_proposal / leader_built_no_propose /
+    /// leader_awaiting_qc / follower_no_proposal / follower_no_insert /
+    /// follower_no_vote / follower_voted) — fed by `ViewMetricsRecorder`.
+    pub view_timeouts_by_phase: Family<Vec<(String, String)>, Counter>,
 
     // Mesh watchdog (S405) — makes the S395 gossipsub degraded mode (validator
     // connected but never subscribed after a fast restart) visible on /metrics.
@@ -1174,6 +1179,13 @@ impl Metrics {
             "Follower: App::validate_block wall time (decode + body reconstruct + attestation verify); insert_persist minus the block-tree write",
             validate_block_seconds.clone(),
         );
+
+        let view_timeouts_by_phase = Family::<Vec<(String, String)>, Counter>::default();
+        registry.register(
+            "torus_view_timeouts_by_phase",
+            "View timeouts by the leg outstanding at the deadline (phase label; see ViewMetricsRecorder::view_timeout)",
+            view_timeouts_by_phase.clone(),
+        );
         registry.register(
             "torus_commit_interval_seconds",
             "Gap between consecutive local block commits (chain cadence per node)",
@@ -1427,6 +1439,7 @@ impl Metrics {
             propose_select_seconds,
             propose_da_mirror_seconds,
             validate_block_seconds,
+            view_timeouts_by_phase,
             consensus_mesh_peers,
             consensus_subscribed_validators,
             mesh_watchdog_disconnects,

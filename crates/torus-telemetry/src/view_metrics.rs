@@ -37,6 +37,11 @@ struct ViewState {
     vote_observed: bool,
     /// Previous CommitBlock event time, for the commit interval gap.
     last_commit_at: Option<SystemTime>,
+    /// Are we the leader of the current view (set by `note_leader` right after
+    /// `start_view`)? Drives the timeout attribution.
+    is_leader: bool,
+    /// Did we broadcast a proposal in the current view?
+    proposed_this_view: bool,
     /// Our outstanding proposal awaiting certification: broadcast time and
     /// block hash. Survives view transitions — under leader rotation the PC
     /// for our block is assembled by the next leader, and we only learn of it
@@ -78,7 +83,48 @@ impl ViewMetricsRecorder {
         s.insert_observed = false;
         s.vote_observed = false;
         s.self_insert_at = None;
+        s.is_leader = false;
+        s.proposed_this_view = false;
         self.metrics.consensus_view.set(view as i64);
+    }
+
+    /// Record whether THIS replica leads the view just started (the StartView
+    /// event names the leader; the caller compares it to its own key). Only
+    /// used to attribute timeouts.
+    pub fn note_leader(&self, is_leader: bool) {
+        self.state.lock().unwrap().is_leader = is_leader;
+    }
+
+    /// ViewTimeout: attribute the timed-out view to the leg that was still
+    /// outstanding (`torus_view_timeouts_by_phase{phase=...}`) — the recorder
+    /// still holds the timed-out view's state because StartView for the next
+    /// view is published after the timeout. Returns the phase label.
+    pub fn view_timeout(&self, view: u64) -> &'static str {
+        let s = self.state.lock().unwrap();
+        let phase = if s.is_leader {
+            if s.proposed_this_view {
+                "leader_awaiting_qc"
+            } else if s.self_insert_at.is_some() {
+                "leader_built_no_propose"
+            } else {
+                "leader_no_proposal"
+            }
+        } else if s.proposal_received_at.is_none() {
+            "follower_no_proposal"
+        } else if !s.insert_observed {
+            "follower_no_insert"
+        } else if !s.vote_observed {
+            "follower_no_vote"
+        } else {
+            "follower_voted"
+        };
+        drop(s);
+        self.metrics
+            .view_timeouts_by_phase
+            .get_or_create(&vec![("phase".to_string(), phase.to_string())])
+            .inc();
+        tracing::warn!(view, phase, "view timeout");
+        phase
     }
 
     /// Propose (leader): time from view start to proposal broadcast. Also
@@ -101,6 +147,7 @@ impl ViewMetricsRecorder {
                     .observe(secs_between(inserted, ts));
             }
         }
+        s.proposed_this_view = true;
         s.last_propose = Some((ts, block_hash));
     }
 
@@ -215,6 +262,52 @@ mod tests {
             .unwrap()
             .parse()
             .unwrap()
+    }
+
+    /// Timeout attribution follows the recorder's per-view state.
+    #[test]
+    fn view_timeout_attribution_by_phase() {
+        let (m, r) = rec();
+        // Follower that never saw a proposal.
+        r.start_view(t(0), 1);
+        assert_eq!(r.view_timeout(1), "follower_no_proposal");
+        // Follower with a proposal but no insert.
+        r.start_view(t(100), 2);
+        r.receive_proposal(t(110));
+        assert_eq!(r.view_timeout(2), "follower_no_insert");
+        // Follower inserted, never voted.
+        r.start_view(t(200), 3);
+        r.receive_proposal(t(210));
+        r.insert_block(t(220));
+        assert_eq!(r.view_timeout(3), "follower_no_vote");
+        // Follower fully done (waiting on the QC / next view).
+        r.start_view(t(300), 4);
+        r.receive_proposal(t(310));
+        r.insert_block(t(320));
+        r.phase_vote(t(325));
+        assert_eq!(r.view_timeout(4), "follower_voted");
+        // Leader that never built.
+        r.start_view(t(400), 5);
+        r.note_leader(true);
+        assert_eq!(r.view_timeout(5), "leader_no_proposal");
+        // Leader that built but never broadcast.
+        r.start_view(t(500), 6);
+        r.note_leader(true);
+        r.insert_block(t(510));
+        assert_eq!(r.view_timeout(6), "leader_built_no_propose");
+        // Leader that proposed and waited on the QC.
+        r.start_view(t(600), 7);
+        r.note_leader(true);
+        r.insert_block(t(610));
+        r.propose(t(620), [7u8; 32]);
+        assert_eq!(r.view_timeout(7), "leader_awaiting_qc");
+        // Leadership flag resets with the next StartView.
+        r.start_view(t(700), 8);
+        assert_eq!(r.view_timeout(8), "follower_no_proposal");
+
+        let text = m.encode();
+        assert!(text.contains("torus_view_timeouts_by_phase_total{phase=\"follower_no_proposal\"} 2"), "{text}");
+        assert!(text.contains("torus_view_timeouts_by_phase_total{phase=\"leader_awaiting_qc\"} 1"), "{text}");
     }
 
     #[test]

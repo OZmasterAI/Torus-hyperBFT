@@ -839,6 +839,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let rec_insert = view_rec.clone();
     let rec_vote = view_rec.clone();
     let rec_commit = view_rec.clone();
+    let rec_timeout = view_rec.clone();
     // Own headers loop back via broadcast self-delivery; proposal_arrival is a
     // follower metric, so filter them out by origin.
     let own_hotstuff_vk = verifying_key;
@@ -856,6 +857,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // of trusting the committed_height+1 heuristic + plain IWRR.
             leader_state_for_view.observe_start_view(ev.view.int(), ev.leader);
             rec_start.start_view(ev.timestamp, ev.view.int());
+            rec_start.note_leader(ev.leader == own_hotstuff_vk);
         })
         .on_propose(move |ev: &ProposeEvent| {
             rec_propose.propose(ev.timestamp, ev.proposal.block.hash.bytes())
@@ -873,8 +875,11 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         })
         .on_insert_block(move |ev: &InsertBlockEvent| rec_insert.insert_block(ev.timestamp))
         .on_phase_vote(move |ev: &PhaseVoteEvent| rec_vote.phase_vote(ev.timestamp))
-        .on_view_timeout(move |_ev: &ViewTimeoutEvent| {
+        .on_view_timeout(move |ev: &ViewTimeoutEvent| {
             timeout_counter.inc();
+            // Attribute the timeout to the leg still outstanding (view-legs
+            // trim, r2): torus_view_timeouts_by_phase{phase=...} + a warn line.
+            rec_timeout.view_timeout(ev.view.int());
         })
         .on_commit_block(move |event: &CommitBlockEvent| {
             rec_commit.commit_block(event.timestamp);
