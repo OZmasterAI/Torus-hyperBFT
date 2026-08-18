@@ -32,6 +32,7 @@ fn now_ms() -> u64 {
 pub use crate::error::MempoolError;
 pub use crate::evm_pool::EvmPoolEntry;
 pub use crate::native_pool::is_cancel;
+pub use crate::native_pool::SelectedNative;
 
 /// Mempool configuration.
 #[derive(Clone, Debug)]
@@ -724,6 +725,23 @@ impl Mempool {
         Ok(())
     }
 
+    /// [`Self::mirror_native_to_da`] with caller-supplied action hashes (the
+    /// pool's precomputed ones — view-legs trim, r2): skips one full
+    /// serialise+keccak pass over the block body on the leader's produce path.
+    /// Same one-batch write, same requeue-on-failure semantics (the failed
+    /// batch is cloned into the retry buffer only on the error path).
+    pub fn mirror_native_to_da_keyed(
+        &self,
+        items: &[(B256, &SignedNativeAction)],
+    ) -> Result<(), StateError> {
+        if let Err(e) = self.da_store.put_batch_keyed(items) {
+            tracing::error!("native DA store batch write failed: {e}");
+            self.requeue_failed_da_batch(items.iter().map(|(_, a)| (*a).clone()).collect());
+            return Err(e);
+        }
+        Ok(())
+    }
+
     /// Additionally custody erasure shards for a proposed block's bodies (Sprint 5
     /// T5). Thin pass-through to [`NativeDaStore::put_shards_batch`] under the
     /// caller-supplied `(k, n)` (derived from the live validator set). ADDITIVE and
@@ -879,6 +897,53 @@ impl Mempool {
             .read()
             .unwrap()
             .select_for_block_with_senders_excluding(limit, exclude, bytes_cap, orders_cap)
+    }
+
+    /// [`Self::select_native_for_block_with_senders_excluding`] with the pool's
+    /// precomputed action hash per selection ([`SelectedNative`]) — same
+    /// flush-before-select, expiry sweep, walk and budgets.
+    pub fn select_native_with_hashes_excluding(
+        &self,
+        limit: usize,
+        exclude: &std::collections::HashSet<B256>,
+        bytes_cap: usize,
+        orders_cap: usize,
+    ) -> Vec<SelectedNative> {
+        self.flush_da_mirrors();
+        {
+            let mut pool = self.native.write().unwrap();
+            let evicted = pool.evict_expired(now_ms());
+            if evicted > 0 {
+                tracing::info!(evicted, "evicted nonce-expired native actions from pool");
+            }
+        }
+        self.native
+            .read()
+            .unwrap()
+            .select_with_hashes_excluding(limit, exclude, bytes_cap, orders_cap)
+    }
+
+    /// [`Self::select_native_cancels_for_block_with_senders_excluding`] with the
+    /// pool's precomputed action hash per selection ([`SelectedNative`]).
+    pub fn select_native_cancels_with_hashes_excluding(
+        &self,
+        limit: usize,
+        exclude: &std::collections::HashSet<B256>,
+        bytes_cap: usize,
+        orders_cap: usize,
+    ) -> Vec<SelectedNative> {
+        self.flush_da_mirrors();
+        {
+            let mut pool = self.native.write().unwrap();
+            let evicted = pool.evict_expired(now_ms());
+            if evicted > 0 {
+                tracing::info!(evicted, "evicted nonce-expired native actions from pool");
+            }
+        }
+        self.native
+            .read()
+            .unwrap()
+            .select_cancels_with_hashes_excluding(limit, exclude, bytes_cap, orders_cap)
     }
 
     /// Cancels-only variant of

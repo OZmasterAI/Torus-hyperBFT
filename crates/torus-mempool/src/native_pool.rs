@@ -22,6 +22,19 @@ use crate::error::MempoolError;
 /// tie order the stable sort preserved.
 type SortKey = (u8, Address, u64, u64);
 
+/// One selected native action together with the pool's PRECOMPUTED action
+/// hash (view-legs trim, r2). `compute_action_hash` re-serialises and keccaks
+/// the whole body (~75 us for a 400-order batch); the pool already paid that
+/// at insert, so selection hands the hash out instead of making the leader
+/// recompute it for the in-flight ledger, the DA mirror key and the compact
+/// proposal. Invariant: `hash == compute_action_hash(&action)`.
+#[derive(Clone, Debug)]
+pub struct SelectedNative {
+    pub sender: Address,
+    pub hash: B256,
+    pub action: SignedNativeAction,
+}
+
 /// Entry in the native action pool with pre-recovered sender and dedup hash.
 pub(crate) struct NativePoolEntry {
     pub sender: Address,
@@ -317,12 +330,80 @@ impl NativePool {
         bytes_cap: usize,
         orders_cap: usize,
     ) -> Vec<(Address, SignedNativeAction)> {
+        self.select_with_hashes_excluding(limit, exclude, bytes_cap, orders_cap)
+            .into_iter()
+            .map(|s| (s.sender, s.action))
+            .collect()
+    }
+
+    /// [`Self::select_for_block_with_senders_excluding`] returning the pool's
+    /// precomputed action hash alongside each selection (see [`SelectedNative`]).
+    /// Same walk, budgets, per-sender cap and order — only the return shape differs.
+    pub fn select_with_hashes_excluding(
+        &self,
+        limit: usize,
+        exclude: &HashSet<B256>,
+        bytes_cap: usize,
+        orders_cap: usize,
+    ) -> Vec<SelectedNative> {
+        self.select_entries_excluding(limit, exclude, bytes_cap, orders_cap, false)
+    }
+
+    /// Cancels-ONLY selection (Package D rank 1, deepest exec-backlog pacing
+    /// tier): the same walk, budgets, and per-sender cap as
+    /// [`Self::select_for_block_with_senders_excluding`], but the scan stops at
+    /// the first non-cancel entry. Cancels sort FIRST in [`SortKey`] (priority
+    /// byte 0), so this touches exactly the pooled cancel prefix and never
+    /// walks the (possibly huge) non-cancel tail. Non-destructive like every
+    /// selection: paced-out non-cancels stay pooled and remain fully
+    /// selectable by the normal path — pacing defers, never sheds.
+    pub fn select_cancels_for_block_with_senders_excluding(
+        &self,
+        limit: usize,
+        exclude: &HashSet<B256>,
+        bytes_cap: usize,
+        orders_cap: usize,
+    ) -> Vec<(Address, SignedNativeAction)> {
+        self.select_cancels_with_hashes_excluding(limit, exclude, bytes_cap, orders_cap)
+            .into_iter()
+            .map(|s| (s.sender, s.action))
+            .collect()
+    }
+
+    /// [`Self::select_cancels_for_block_with_senders_excluding`] returning the
+    /// pool's precomputed action hash alongside each selection.
+    pub fn select_cancels_with_hashes_excluding(
+        &self,
+        limit: usize,
+        exclude: &HashSet<B256>,
+        bytes_cap: usize,
+        orders_cap: usize,
+    ) -> Vec<SelectedNative> {
+        self.select_entries_excluding(limit, exclude, bytes_cap, orders_cap, true)
+    }
+
+    /// The one selection walk behind every `select_*_excluding` entry point.
+    /// `cancels_only` ends the scan at the first non-cancel entry (cancels sort
+    /// first, so nothing selectable remains beyond it in that mode).
+    fn select_entries_excluding(
+        &self,
+        limit: usize,
+        exclude: &HashSet<B256>,
+        bytes_cap: usize,
+        orders_cap: usize,
+        cancels_only: bool,
+    ) -> Vec<SelectedNative> {
         let mut block_counts: HashMap<Address, usize> = HashMap::new();
         let mut selected = Vec::new();
         let mut bytes_used: usize = 0;
         let mut orders_used: usize = 0;
 
         for entry in self.entries.values() {
+            if cancels_only && !entry.is_cancel {
+                // Cancels sort first: the first non-cancel ends the cancel
+                // prefix — nothing selectable remains beyond it in this mode.
+                break;
+            }
             if selected.len() >= limit {
                 break;
             }
@@ -351,61 +432,11 @@ impl NativePool {
                 *block_counts.entry(entry.sender).or_insert(0) += 1;
                 bytes_used = bytes_used.saturating_add(entry.encoded_len);
                 orders_used = orders_used.saturating_add(entry_orders);
-                selected.push((entry.sender, entry.action.clone()));
-            }
-        }
-
-        selected
-    }
-
-    /// Cancels-ONLY selection (Package D rank 1, deepest exec-backlog pacing
-    /// tier): the same walk, budgets, and per-sender cap as
-    /// [`Self::select_for_block_with_senders_excluding`], but the scan stops at
-    /// the first non-cancel entry. Cancels sort FIRST in [`SortKey`] (priority
-    /// byte 0), so this touches exactly the pooled cancel prefix and never
-    /// walks the (possibly huge) non-cancel tail. Non-destructive like every
-    /// selection: paced-out non-cancels stay pooled and remain fully
-    /// selectable by the normal path — pacing defers, never sheds.
-    pub fn select_cancels_for_block_with_senders_excluding(
-        &self,
-        limit: usize,
-        exclude: &HashSet<B256>,
-        bytes_cap: usize,
-        orders_cap: usize,
-    ) -> Vec<(Address, SignedNativeAction)> {
-        let mut block_counts: HashMap<Address, usize> = HashMap::new();
-        let mut selected = Vec::new();
-        let mut bytes_used: usize = 0;
-        let mut orders_used: usize = 0;
-
-        for entry in self.entries.values() {
-            if !entry.is_cancel {
-                // Cancels sort first: the first non-cancel ends the cancel
-                // prefix — nothing selectable remains beyond it in this mode.
-                break;
-            }
-            if selected.len() >= limit {
-                break;
-            }
-            // In-flight exclusion before the budget gates, exactly like the
-            // normal path: an excluded entry must neither charge nor trip them.
-            if exclude.contains(&entry.action_hash) {
-                continue;
-            }
-            if bytes_used.saturating_add(entry.encoded_len) > bytes_cap {
-                // Deterministic prefix, same rule as the normal path.
-                break;
-            }
-            let entry_orders = crate::rate_limit::order_count(&entry.action.action);
-            if orders_used.saturating_add(entry_orders) > orders_cap {
-                break;
-            }
-            let count = block_counts.get(&entry.sender).copied().unwrap_or(0);
-            if count < self.max_per_block {
-                *block_counts.entry(entry.sender).or_insert(0) += 1;
-                bytes_used = bytes_used.saturating_add(entry.encoded_len);
-                orders_used = orders_used.saturating_add(entry_orders);
-                selected.push((entry.sender, entry.action.clone()));
+                selected.push(SelectedNative {
+                    sender: entry.sender,
+                    hash: entry.action_hash,
+                    action: entry.action.clone(),
+                });
             }
         }
 
@@ -971,6 +1002,56 @@ mod tests {
             pool.select_for_block_with_senders_excluding(5, &exclude, usize::MAX, usize::MAX);
         assert_eq!(third.len(), 1, "only the fresh action is selected");
         assert_eq!(third[0].1.nonce, 99);
+    }
+
+    /// View-legs trim (r2): the hash-carrying selection is the SAME selection
+    /// (order, senders, actions) as the tuple entry point, and every carried
+    /// hash equals `compute_action_hash` of its action — for both the normal
+    /// and the cancels-only walk.
+    #[test]
+    fn hash_carrying_selection_matches_tuple_selection_and_hashes() {
+        let mut pool = NativePool::new(100, 64, 16);
+        for i in 0..3u8 {
+            let sender = Address::repeat_byte(10 + i);
+            pool.insert(sender, make_action(i as u64 + 1, NativeAction::ClaimRewards))
+                .unwrap();
+            pool.insert(
+                sender,
+                make_action(
+                    i as u64 + 100,
+                    NativeAction::CancelOrder {
+                        order_id: i as u128,
+                    },
+                ),
+            )
+            .unwrap();
+        }
+        let exclude: HashSet<B256> = HashSet::new();
+        let tuple = pool.select_for_block_with_senders_excluding(10, &exclude, usize::MAX, usize::MAX);
+        let hashed = pool.select_with_hashes_excluding(10, &exclude, usize::MAX, usize::MAX);
+        assert_eq!(tuple.len(), 6);
+        assert_eq!(hashed.len(), tuple.len());
+        for ((sender, action), sel) in tuple.iter().zip(&hashed) {
+            assert_eq!(*sender, sel.sender);
+            assert_eq!(action.nonce, sel.action.nonce);
+            assert_eq!(sel.hash, compute_action_hash(&sel.action));
+        }
+        let cancels_t =
+            pool.select_cancels_for_block_with_senders_excluding(10, &exclude, usize::MAX, usize::MAX);
+        let cancels_h = pool.select_cancels_with_hashes_excluding(10, &exclude, usize::MAX, usize::MAX);
+        assert_eq!(cancels_t.len(), 3);
+        assert_eq!(cancels_h.len(), 3);
+        for ((sender, action), sel) in cancels_t.iter().zip(&cancels_h) {
+            assert_eq!(*sender, sel.sender);
+            assert_eq!(action.nonce, sel.action.nonce);
+            assert!(is_cancel(&sel.action.action));
+            assert_eq!(sel.hash, compute_action_hash(&sel.action));
+        }
+        // Exclusion by the carried hash behaves like exclusion by a recomputed one.
+        let ex: HashSet<B256> = hashed.iter().map(|s| s.hash).collect();
+        assert!(pool
+            .select_with_hashes_excluding(10, &ex, usize::MAX, usize::MAX)
+            .is_empty());
     }
 
     /// Rank-1 (Package D) exec-backlog pacing, deepest tier: cancels-only

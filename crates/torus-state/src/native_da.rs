@@ -100,13 +100,26 @@ impl NativeDaStore {
     /// wakes on the consensus hot path (S395 floor shave #1). Empty input is a
     /// no-op. Same idempotent overwrite semantics as `put`.
     pub fn put_batch(&self, actions: &[SignedNativeAction]) -> Result<(), StateError> {
-        if actions.is_empty() {
+        let keyed: Vec<(B256, &SignedNativeAction)> = actions
+            .iter()
+            .map(|a| (compute_action_hash(a), a))
+            .collect();
+        self.put_batch_keyed(&keyed)
+    }
+
+    /// [`put_batch`](Self::put_batch) with caller-supplied keys: each body is
+    /// stored under the given hash, which MUST equal `compute_action_hash` of
+    /// that body (the pool computes it once at insert; the leader hands it
+    /// through so the produce path skips a full serialise+keccak pass —
+    /// view-legs trim, r2). Empty input is a no-op.
+    pub fn put_batch_keyed(&self, items: &[(B256, &SignedNativeAction)]) -> Result<(), StateError> {
+        if items.is_empty() {
             return Ok(());
         }
         let mut batch = rocksdb::WriteBatch::default();
         let cf = self.db.cf_handle(CF_NATIVE_PENDING)?;
-        for action in actions {
-            let hash = compute_action_hash(action);
+        for (hash, action) in items {
+            debug_assert_eq!(*hash, compute_action_hash(action), "DA key must be the body hash");
             let bytes =
                 bincode::serialize(action).map_err(|e| StateError::InvalidData(e.to_string()))?;
             batch.put_cf(cf, hash.as_slice(), &bytes);
@@ -332,6 +345,20 @@ mod tests {
             .get_cf_raw(CF_NATIVE_PENDING, old_hash.as_slice())
             .unwrap()
             .is_none());
+    }
+
+    /// `put_batch_keyed` stores under the caller's key and is observationally
+    /// identical to `put_batch` when the key is the body hash.
+    #[test]
+    fn put_batch_keyed_matches_put_batch() {
+        let (_dir, store) = temp_store();
+        let a = dummy_action(41);
+        let h = compute_action_hash(&a);
+        store.put_batch_keyed(&[(h, &a)]).expect("keyed put");
+        assert_eq!(store.get(&h).unwrap().unwrap().nonce, 41);
+        assert!(store.contains(&h.0).unwrap());
+        // Empty input is a no-op, not an error.
+        store.put_batch_keyed(&[]).expect("empty keyed put");
     }
 
     fn dummy_action(nonce: u64) -> SignedNativeAction {

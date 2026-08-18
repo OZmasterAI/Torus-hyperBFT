@@ -561,15 +561,50 @@ where
 /// (a stale same-height re-proposal, a partial/other action set) rejects the
 /// cache so the caller falls back to the all-or-nothing DA reconstruction.
 ///
-/// Cost: O(n) `compute_action_hash` over the cached actions — the same order as
-/// the DA reconstruction's per-hash lookup it replaces, never heavier.
-fn cached_matches_compact(cached: &TorusBlock, compact: &CompactBlock) -> bool {
-    cached.native_actions.len() == compact.native_action_hashes.len()
-        && cached
+/// Cost: O(n) hash compares — the cached proposal carries its action hashes
+/// (computed once when it entered the in-flight window, view-legs trim r2), so
+/// no body is re-serialised or re-hashed here.
+fn cached_matches_compact(cached: &PendingProposal, compact: &CompactBlock) -> bool {
+    cached.hashes.len() == compact.native_action_hashes.len()
+        && cached.hashes == compact.native_action_hashes
+}
+
+/// A proposal in the in-flight window (`pending_proposals`) together with its
+/// native-action hashes, computed ONCE when it entered (view-legs trim, r2):
+/// the leader's own block takes them from the pool selection, a validated
+/// compact proposal from the datum, a validated full block from one pass. The
+/// exclusion set for the next selection and the commit-time cache check then
+/// read them instead of re-hashing every in-flight body per proposal (each
+/// pass over a cap-100 x bs400 block is ~7 ms of serialise+keccak).
+/// Invariant: `hashes[i] == compute_action_hash(&block.native_actions[i])`.
+struct PendingProposal {
+    block: TorusBlock,
+    hashes: Vec<torus_types::B256>,
+}
+
+impl PendingProposal {
+    fn new(block: TorusBlock, hashes: Vec<torus_types::B256>) -> Self {
+        debug_assert_eq!(hashes.len(), block.native_actions.len());
+        debug_assert!(
+            block
+                .native_actions
+                .iter()
+                .map(torus_types::compute_action_hash)
+                .eq(hashes.iter().copied()),
+            "pending proposal hashes must be the bodies' action hashes"
+        );
+        Self { block, hashes }
+    }
+
+    /// Compute the hashes here (one pass) — for callers without precomputed ones.
+    fn from_block(block: TorusBlock) -> Self {
+        let hashes = block
             .native_actions
             .iter()
             .map(torus_types::compute_action_hash)
-            .eq(compact.native_action_hashes.iter().copied())
+            .collect();
+        Self { block, hashes }
+    }
 }
 
 fn persist_block_header(state_db: &StateDb, block: &TorusBlock) {
@@ -1693,7 +1728,7 @@ pub struct TorusApp {
     last_validator_set: ValidatorSet,
     cached_vs_updates: Option<(u64, Option<ValidatorSetUpdates>)>,
     pending_slashes: Vec<PendingSlash>,
-    pending_proposals: std::collections::HashMap<u64, TorusBlock>,
+    pending_proposals: std::collections::HashMap<u64, PendingProposal>,
     in_flight_hashes: InFlightHashLedger,
     #[allow(dead_code)]
     treasury_address: Address,
@@ -1846,9 +1881,35 @@ const COMPACT_PROPOSALS: bool = true;
 /// to validators (T7), and fetched on a miss via the rare pull-fallback (T6). This
 /// shrinks the proposal so it fits `max_consensus_message_size` at 400k orders/sec.
 /// All validators must emit the SAME encoding (see [`COMPACT_PROPOSALS`]).
+#[cfg(test)]
 fn encode_proposal_datum(block: &TorusBlock, compact: bool) -> Vec<u8> {
     if compact {
         bincode::serialize(&CompactBlock::from_block(block)).expect("serialize CompactBlock")
+    } else {
+        bincode::serialize(block).expect("serialize TorusBlock")
+    }
+}
+
+/// [`encode_proposal_datum`] with the block's native-action hashes supplied by
+/// the caller (the pool's precomputed ones — view-legs trim, r2), so the
+/// compact datum is built without re-hashing every body. Byte-identical to
+/// `encode_proposal_datum` for the same block (the hashes ARE
+/// `compute_action_hash` of the bodies; `CompactBlock::from_block` computes
+/// exactly those).
+fn encode_proposal_datum_with_hashes(
+    block: &TorusBlock,
+    hashes: &[torus_types::B256],
+    compact: bool,
+) -> Vec<u8> {
+    if compact {
+        debug_assert_eq!(hashes.len(), block.native_actions.len());
+        let compact_block = CompactBlock {
+            header: block.header.clone(),
+            native_action_hashes: hashes.to_vec(),
+            evm_transactions: block.evm_transactions.clone(),
+            core_writer_actions: block.core_writer_actions.clone(),
+        };
+        bincode::serialize(&compact_block).expect("serialize CompactBlock")
     } else {
         bincode::serialize(block).expect("serialize TorusBlock")
     }
@@ -3049,34 +3110,41 @@ impl TorusApp {
     /// counts the drop. No mempool wired (test/edge) ⇒ pass-through unchanged.
     fn mirror_or_drop_native(
         &self,
-        native_with_senders: Vec<(torus_types::Address, torus_types::SignedNativeAction)>,
-    ) -> Vec<(torus_types::Address, torus_types::SignedNativeAction)> {
-        if native_with_senders.is_empty() {
-            return native_with_senders;
+        selected: Vec<torus_mempool::SelectedNative>,
+    ) -> Vec<torus_mempool::SelectedNative> {
+        if selected.is_empty() {
+            return selected;
         }
         let Some(ref mempool) = self.mempool else {
-            return native_with_senders;
+            return selected;
         };
-        let actions: Vec<torus_types::SignedNativeAction> =
-            native_with_senders.iter().map(|(_, a)| a.clone()).collect();
-        match mempool.mirror_native_to_da(&actions) {
+        // Keyed by the pool's precomputed hashes: no clone of the bodies and no
+        // serialise+keccak pass just to derive the DA keys (view-legs trim, r2).
+        let keyed: Vec<(torus_types::B256, &torus_types::SignedNativeAction)> =
+            selected.iter().map(|s| (s.hash, &s.action)).collect();
+        match mempool.mirror_native_to_da_keyed(&keyed) {
             Ok(()) => {
                 // T5 (recovery-path erasure): the whole-body mirror above is the
                 // durability guarantee; ADDITIONALLY custody erasure shards so a
                 // lagging peer can reconstruct from k sources instead of pulling the
                 // whole body from one (kills the s338 hotspot). Best-effort — see
-                // `custody_native_shards_best_effort`.
-                self.custody_native_shards_best_effort(
-                    mempool,
-                    &actions,
-                    self.last_header.height.saturating_add(1),
-                );
-                native_with_senders
+                // `custody_native_shards_best_effort`. The owned copy is only
+                // materialised when custody is actually on.
+                if shard_custody_enabled() {
+                    let actions: Vec<torus_types::SignedNativeAction> =
+                        selected.iter().map(|s| s.action.clone()).collect();
+                    self.custody_native_shards_best_effort(
+                        mempool,
+                        &actions,
+                        self.last_header.height.saturating_add(1),
+                    );
+                }
+                selected
             }
             Err(e) => {
                 tracing::error!(
                     %e,
-                    count = actions.len(),
+                    count = keyed.len(),
                     "produce_block: durable body mirror FAILED — proposing without native actions"
                 );
                 if let Some(ref m) = self.metrics {
@@ -3149,10 +3217,23 @@ impl TorusApp {
     ///   store (already fail-closed to `MissingData` on a miss).
     ///
     /// Returns the decoded block, or the `ValidateBlockResponse` to short-circuit.
+    #[cfg(test)]
     fn decode_proposal_and_ensure_durable(
         &mut self,
         datum_bytes: &[u8],
     ) -> Result<TorusBlock, ValidateBlockResponse> {
+        self.decode_proposal_with_hashes(datum_bytes)
+            .map(|p| p.block)
+    }
+
+    /// [`decode_proposal_and_ensure_durable`] proper: the decoded block plus
+    /// its native-action hashes — taken from the compact datum (the exact set
+    /// the bodies were reconstructed by) or computed once for a full block —
+    /// so the in-flight window never re-hashes them (view-legs trim, r2).
+    fn decode_proposal_with_hashes(
+        &mut self,
+        datum_bytes: &[u8],
+    ) -> Result<PendingProposal, ValidateBlockResponse> {
         if let Ok(block) = bincode::deserialize::<TorusBlock>(datum_bytes) {
             tracing::info!(
                 height = block.header.height,
@@ -3186,7 +3267,7 @@ impl TorusApp {
                     );
                 }
             }
-            Ok(block)
+            Ok(PendingProposal::from_block(block))
         } else if let Ok(compact) = bincode::deserialize::<CompactBlock>(datum_bytes) {
             tracing::info!(
                 height = compact.header.height,
@@ -3247,12 +3328,18 @@ impl TorusApp {
                 }
             }
 
-            Ok(TorusBlock {
-                header: compact.header,
-                native_actions,
-                evm_transactions: compact.evm_transactions,
-                core_writer_actions: compact.core_writer_actions,
-            })
+            // The bodies were fetched BY these hashes from the content-addressed
+            // DA store (`put_batch` keys by `compute_action_hash`), so they are the
+            // bodies' hashes: carry them, don't recompute.
+            Ok(PendingProposal::new(
+                TorusBlock {
+                    header: compact.header,
+                    native_actions,
+                    evm_transactions: compact.evm_transactions,
+                    core_writer_actions: compact.core_writer_actions,
+                },
+                compact.native_action_hashes,
+            ))
         } else {
             tracing::warn!("validate_block: REJECTED -- deserialization failed");
             Err(ValidateBlockResponse::Invalid)
@@ -3305,10 +3392,11 @@ impl TorusApp {
         // every referenced native body is durable in THIS node's DA store, or we
         // short-circuit (MissingData / Invalid). See
         // `decode_proposal_and_ensure_durable`.
-        let torus_block = match self.decode_proposal_and_ensure_durable(datum_bytes) {
-            Ok(block) => block,
+        let pending = match self.decode_proposal_with_hashes(datum_bytes) {
+            Ok(pending) => pending,
             Err(response) => return response,
         };
+        let torus_block = &pending.block;
 
         if !torus_block.evm_transactions.is_empty()
             && decode_all_txs(&torus_block.evm_transactions).is_err()
@@ -3400,7 +3488,7 @@ impl TorusApp {
             }
         }
 
-        self.pending_proposals.insert(height, torus_block);
+        self.pending_proposals.insert(height, pending);
         self.pending_proposals.retain(|&h, _| h + 10 > height);
 
         let validator_set_updates = self.epoch_validator_set_updates(height);
@@ -3500,8 +3588,13 @@ impl App<RocksKVStore> for TorusApp {
                 .observe(mirror_timer.elapsed().as_secs_f64());
         }
 
+        // The pool's precomputed hashes ride along (view-legs trim, r2): they key
+        // the in-flight ledger, the compact datum and our pending entry — no
+        // re-serialise+keccak pass over the body for any of them.
+        let own_hashes: Vec<torus_types::B256> =
+            native_with_senders.iter().map(|s| s.hash).collect();
         let native_actions: Vec<torus_types::SignedNativeAction> =
-            native_with_senders.iter().map(|(_, a)| a.clone()).collect();
+            native_with_senders.iter().map(|s| s.action.clone()).collect();
 
         let sig_attestation = match self.signing_key {
             Some(ref key) => torus_bridge::proposer::generate_sig_attestation(&native_actions, key),
@@ -3550,7 +3643,10 @@ impl App<RocksKVStore> for TorusApp {
             if let Some(ref tx) = self.pre_proposal_tx {
                 let count = native_with_senders.len();
                 match tx.try_send(PreProposalBundle {
-                    actions: native_with_senders,
+                    actions: native_with_senders
+                        .into_iter()
+                        .map(|s| (s.sender, s.action))
+                        .collect(),
                 }) {
                     Ok(()) => tracing::info!(count, height, "pre-proposal push sent"),
                     Err(e) => tracing::warn!(count, height, %e, "pre-proposal push failed"),
@@ -3560,15 +3656,11 @@ impl App<RocksKVStore> for TorusApp {
 
         // Note our own block's hashes too: a same-height re-proposal would
         // overwrite the `pending_proposals` entry and silently untrack these.
-        let own_hashes: Vec<torus_types::B256> = block
-            .native_actions
-            .iter()
-            .map(torus_types::compute_action_hash)
-            .collect();
-        let encoded = encode_proposal_datum(&block, COMPACT_PROPOSALS);
-        self.pending_proposals.insert(height, block);
+        let encoded = encode_proposal_datum_with_hashes(&block, &own_hashes, COMPACT_PROPOSALS);
+        self.in_flight_hashes.note(height, own_hashes.iter().copied());
+        self.pending_proposals
+            .insert(height, PendingProposal::new(block, own_hashes));
         self.pending_proposals.retain(|&h, _| h + 10 > height);
-        self.in_flight_hashes.note(height, own_hashes);
         let hash = Self::hash_datum(&encoded);
 
         let validator_set_updates = self.epoch_validator_set_updates(height);
@@ -3689,7 +3781,7 @@ impl App<RocksKVStore> for TorusApp {
                 Some(cached) if cached_matches_compact(&cached, &compact) => {
                     let ready = TorusBlock {
                         header: compact.header.clone(),
-                        native_actions: cached.native_actions,
+                        native_actions: cached.block.native_actions,
                         evm_transactions: compact.evm_transactions.clone(),
                         core_writer_actions: compact.core_writer_actions.clone(),
                     };
@@ -3880,10 +3972,7 @@ impl TorusApp {
         parent_height: u64,
         gas_limit: u64,
         parent_state_root: torus_types::B256,
-    ) -> (
-        Vec<(torus_types::Address, torus_types::SignedNativeAction)>,
-        Vec<Vec<u8>>,
-    ) {
+    ) -> (Vec<torus_mempool::SelectedNative>, Vec<Vec<u8>>) {
         let lag = parent_height.saturating_sub(self.last_header.height);
         if lag > Self::CATCH_UP_LAG_THRESHOLD {
             tracing::warn!(
@@ -3905,10 +3994,11 @@ impl TorusApp {
         // does not re-select them for N+1/N+2 before N commits and calls
         // `remove_committed_native` — the root cause of duplicate native inclusion
         // (memory 282f9818). `pending_proposals` is exactly that in-flight window.
+        // The cached per-proposal hashes (see `PendingProposal`) — no re-hash.
         let mut in_flight: std::collections::HashSet<torus_types::B256> = self
             .pending_proposals
             .values()
-            .flat_map(|b| b.native_actions.iter().map(torus_types::compute_action_hash))
+            .flat_map(|p| p.hashes.iter().copied())
             .collect();
         // Union the hash ledger: covers compact proposals whose bodies never
         // reconstructed (MissingData) — absent from `pending_proposals` but
@@ -3959,7 +4049,7 @@ impl TorusApp {
                         "exec-backlog pacing: scaled native selection caps for this proposal"
                     );
                 }
-                mempool.select_native_for_block_with_senders_excluding(
+                mempool.select_native_with_hashes_excluding(
                     action_cap,
                     &in_flight,
                     bytes_cap,
@@ -3973,7 +4063,7 @@ impl TorusApp {
                     "exec-backlog pacing: deepest tier — proposing CANCELS ONLY \
                      (new orders stay pooled until execution catches up)"
                 );
-                mempool.select_native_cancels_for_block_with_senders_excluding(
+                mempool.select_native_cancels_with_hashes_excluding(
                     torus_mempool::rate_limit::native_total_block_cap(),
                     &in_flight,
                     torus_mempool::rate_limit::native_block_bytes_cap(),
@@ -4696,7 +4786,7 @@ mod exec_throttle_tests {
         assert!(
             paced
                 .iter()
-                .all(|(_, a)| torus_mempool::is_cancel(&a.action)),
+                .all(|s| torus_mempool::is_cancel(&s.action.action)),
             "no new orders may be placed at the deepest tier"
         );
 
@@ -4751,7 +4841,7 @@ mod exec_throttle_tests {
         }
         let (paced, _evm) = app.select_block_payload(0, 30_000_000, B256::ZERO);
         assert_eq!(paced.len(), 1, "deep deferred buffer alone must pace to cancels-only");
-        assert!(torus_mempool::is_cancel(&paced[0].1.action));
+        assert!(torus_mempool::is_cancel(&paced[0].action.action));
 
         app.deferred_exec.clear();
         let (full, _evm) = app.select_block_payload(0, 30_000_000, B256::ZERO);
@@ -6523,6 +6613,49 @@ mod crash_recovery_tests {
             compact_datum.len() < full_datum.len(),
             "compact datum must be smaller (bodies are out-of-band, not inline)"
         );
+
+        // View-legs trim (r2): the hash-carrying encoder (what produce_block now
+        // emits, keyed by the pool's precomputed hashes) is BYTE-IDENTICAL to the
+        // recomputing one — a wire/consensus no-op.
+        let hashes: Vec<B256> = block
+            .native_actions
+            .iter()
+            .map(torus_types::compute_action_hash)
+            .collect();
+        assert_eq!(
+            encode_proposal_datum_with_hashes(&block, &hashes, true),
+            compact_datum
+        );
+        assert_eq!(
+            encode_proposal_datum_with_hashes(&block, &hashes, false),
+            full_datum
+        );
+    }
+
+    /// View-legs trim (r2): the commit-time cache check compares the pending
+    /// proposal's carried hashes to the committed compact reference — same
+    /// verdicts as re-hashing the bodies (match, stale subset, reordered).
+    #[test]
+    fn cached_matches_compact_by_carried_hashes() {
+        let actions: Vec<SignedNativeAction> = (0..4).map(sign_claim_rewards).collect();
+        let block = make_block(9, actions.clone());
+        let compact = CompactBlock::from_block(&block);
+        let pending = PendingProposal::from_block(block.clone());
+        assert!(cached_matches_compact(&pending, &compact));
+
+        // Same-height stale re-proposal with fewer actions must NOT match.
+        let stale = PendingProposal::from_block(make_block(9, actions[..3].to_vec()));
+        assert!(!cached_matches_compact(&stale, &compact));
+
+        // Same set, different order: the reference is ordered — no match.
+        let mut reordered = actions.clone();
+        reordered.swap(0, 1);
+        let reordered = PendingProposal::from_block(make_block(9, reordered));
+        assert!(!cached_matches_compact(&reordered, &compact));
+
+        // Constructing with explicit hashes agrees with the from_block pass.
+        let explicit = PendingProposal::new(block, compact.native_action_hashes.clone());
+        assert!(cached_matches_compact(&explicit, &compact));
     }
 
     #[test]
@@ -6614,9 +6747,13 @@ mod crash_recovery_tests {
             torus_mempool::MempoolConfig::default(),
         ));
         let actions: Vec<SignedNativeAction> = (0..5).map(sign_claim_rewards).collect();
-        let with_senders: Vec<(torus_types::Address, SignedNativeAction)> = actions
+        let with_senders: Vec<torus_mempool::SelectedNative> = actions
             .iter()
-            .map(|a| (a.recover_sender().unwrap(), a.clone()))
+            .map(|a| torus_mempool::SelectedNative {
+                sender: a.recover_sender().unwrap(),
+                hash: torus_types::compute_action_hash(a),
+                action: a.clone(),
+            })
             .collect();
 
         let app = TorusApp::new(state_db.clone(), &config, None, Some(mempool.clone()), None);
@@ -8531,7 +8668,8 @@ mod crash_recovery_tests {
         // devnet "proposer executed 40 of its own 59" state.
         let stale_actions: Vec<SignedNativeAction> = (1..=40u64).map(sign_claim_rewards).collect();
         let stale_block = make_block(130, stale_actions);
-        app.pending_proposals.insert(130, stale_block);
+        app.pending_proposals
+            .insert(130, PendingProposal::from_block(stale_block));
 
         let committed = committed_compact_block(&committed_block);
         app.on_committed_block(&committed, committed.hash);
