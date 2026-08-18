@@ -56,10 +56,15 @@ GENESIS="$WT/devnet/wsl/genesis-3val.json"
 WSL="$WT/devnet/wsl"
 RUN_DIR="$DATA_ROOT/run"
 
-# RE-PROOF5 record cell (R190) node env. EXTRA_ENV entries are applied AFTER
-# these, so a cell can override any of them (e.g. EXTRA_ENV='TORUS_PARALLEL_SETTLE=0').
+# RE-PROOF5 record cell (R190) node env, with TORUS_BOOK_ROWS bumped 2 -> 3
+# after the r2 merge (level-hash-seq-chunked: mode 3 chunked level digest,
+# consensus-visible, fleet-uniform, fresh genesis — all three hold here since
+# every cell is CLEAN=1 with one env for all 3 nodes). The node-code default
+# stays Classic (unset). EXTRA_ENV entries are applied AFTER these, so a cell
+# can override any of them (e.g. EXTRA_ENV='TORUS_BOOK_ROWS=2' for a mode-2
+# control, or 'TORUS_PARALLEL_SETTLE=0').
 RECORD_ENV=(
-    TORUS_BOOK_ROWS=2
+    TORUS_BOOK_ROWS=3
     TORUS_RESIDENT_BOOKS=1
     TORUS_NATIVE_ROOT_CACHE=1
     TORUS_PARALLEL_SETTLE=1

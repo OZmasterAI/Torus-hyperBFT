@@ -32,9 +32,11 @@ tools/matched-bench/run-cell.sh /home/18c/projects/wt/matched-bench nosettle-r1 
    weighted 100k-account genesis: first N pre-seeded markets (ids 1..N), or
    synthetic `S<k>-USD` rows past the base's 100. Funded accounts untouched.
 4. `CLEAN=1 launch-3val.sh` with the RE-PROOF5 record-cell env
-   (`TORUS_BOOK_ROWS=2 TORUS_RESIDENT_BOOKS=1 TORUS_NATIVE_ROOT_CACHE=1
+   (`TORUS_BOOK_ROWS=3 TORUS_RESIDENT_BOOKS=1 TORUS_NATIVE_ROOT_CACHE=1
    TORUS_PARALLEL_SETTLE=1 TORUS_PARALLEL_BUCKET_HASH=4
-   TORUS_BUCKET_MEMBER_CACHE_MB=256 TORUS_COMMIT_LAG_BACKOFF_CAP=8`) — ambient
+   TORUS_BUCKET_MEMBER_CACHE_MB=256 TORUS_COMMIT_LAG_BACKOFF_CAP=8`; R190 ran
+   `TORUS_BOOK_ROWS=2` — the harness moved to mode 3 with the r2 merge, pass
+   `EXTRA_ENV='TORUS_BOOK_ROWS=2'` for a mode-2 control) — ambient
    `TORUS_*` vars are unset first, `EXTRA_ENV` is applied last (so it overrides).
    Verifies via `/proc/<pid>/environ` that all 3 nodes got the same env.
 5. Waits for health (all 3 committing, peers>=2), probes idle blk/s for 10 s.
