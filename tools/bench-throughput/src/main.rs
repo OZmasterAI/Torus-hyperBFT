@@ -134,6 +134,15 @@ enum Command {
         /// per-market parallel matching entirely (S372/S395).
         #[arg(long, default_value_t = 1)]
         markets: u64,
+        /// LOCALITY shape: give every sender a FIXED set of K distinct markets
+        /// and spread only its own orders over that set, instead of letting
+        /// every order draw uniformly from 1..=markets. Sender `i` owns
+        /// `((i*K + j) mod markets) + 1` for `j in 0..K` — deterministic, K
+        /// distinct ids, every market owned by ~the same number of senders
+        /// (see `market_plan_tests`). 0 (default) = today's uniform shape, so
+        /// prior cells stay reproducible. K >= markets clamps to uniform.
+        #[arg(long, default_value_t = 0)]
+        markets_per_sender: u64,
         /// A4 economic load shape: margin-targeted sizing, balanced one-side-per-
         /// (sender,market) maker/taker flow around a fixed mid, and interleaved
         /// cancel-alls so per-sender margin reaches a steady state instead of
@@ -294,11 +303,12 @@ fn sign_payload_batch(
     submit_batch: usize,
     mut last_nonce: u64,
     bin: bool,
-    markets: u64,
+    plan: MarketPlan,
+    sender_idx: usize,
 ) -> (Vec<String>, u64) {
     let mut payloads = Vec::with_capacity(submit_batch);
     for _ in 0..submit_batch {
-        let action = random_place_order_action(rng, markets, batch_size);
+        let action = random_place_order_action(rng, plan, sender_idx, batch_size);
         let base = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -335,14 +345,15 @@ fn pregen_ammo(
     count: usize,
     bin: bool,
     base_nonce: u64,
-    markets: u64,
+    plan: MarketPlan,
+    sender_idx: usize,
 ) -> Vec<Vec<String>> {
     let mut nonce = base_nonce;
     let mut ammo = Vec::with_capacity(count);
     for _ in 0..count {
         let mut payloads = Vec::with_capacity(submit_batch);
         for _ in 0..submit_batch {
-            let action = random_place_order_action(rng, markets, batch_size);
+            let action = random_place_order_action(rng, plan, sender_idx, batch_size);
             let signed = sign_one(action, nonce, key, session, mode);
             nonce += 1;
             let bytes = if bin {
@@ -614,21 +625,20 @@ fn econ_place_order(
 fn econ_action(
     rng: &mut impl Rng,
     sender_idx: usize,
-    markets: u64,
+    plan: MarketPlan,
     batch_size: usize,
     shape: &EconShape,
 ) -> NativeAction {
     if shape.cancel_fraction > 0.0 && rng.gen_bool(shape.cancel_fraction) {
         return NativeAction::CancelAllOrders { market_id: None };
     }
-    let markets = markets.max(1);
     if batch_size <= 1 {
-        let market_id = rng.gen_range(1..=markets);
+        let market_id = plan.pick(rng, sender_idx);
         return NativeAction::PlaceOrder(econ_place_order(rng, sender_idx, market_id, shape));
     }
     let orders: Vec<PlaceOrderParams> = (0..batch_size)
         .map(|_| {
-            let market_id = rng.gen_range(1..=markets);
+            let market_id = plan.pick(rng, sender_idx);
             econ_place_order(rng, sender_idx, market_id, shape)
         })
         .collect();
@@ -752,7 +762,7 @@ mod econ_shape_tests {
         let never = EconShape::new(1500, 0, 5, 0.5, 0.0);
         for _ in 0..500 {
             assert!(!matches!(
-                econ_action(&mut rng, 3, 10, 8, &never),
+                econ_action(&mut rng, 3, MarketPlan::uniform(10), 8, &never),
                 NativeAction::CancelAllOrders { .. }
             ));
         }
@@ -760,7 +770,7 @@ mod econ_shape_tests {
         let some = EconShape::new(1500, 0, 5, 0.5, 0.2);
         for _ in 0..2000 {
             if matches!(
-                econ_action(&mut rng, 3, 10, 8, &some),
+                econ_action(&mut rng, 3, MarketPlan::uniform(10), 8, &some),
                 NativeAction::CancelAllOrders { market_id: None }
             ) {
                 cancels += 1;
@@ -781,7 +791,7 @@ mod econ_shape_tests {
             let mut rng = StdRng::seed_from_u64(seed);
             (0..100)
                 .map(|_| {
-                    format!("{:?}", econ_action(&mut rng, 9, 10, 4, &shape))
+                    format!("{:?}", econ_action(&mut rng, 9, MarketPlan::uniform(10), 4, &shape))
                 })
                 .collect()
         };
@@ -794,16 +804,171 @@ mod econ_shape_tests {
     fn batch_carries_batch_size_orders_across_markets() {
         let shape = default_shape();
         let mut rng = StdRng::seed_from_u64(15);
-        match econ_action(&mut rng, 4, 10, 400, &shape) {
+        match econ_action(&mut rng, 4, MarketPlan::uniform(10), 400, &shape) {
             NativeAction::PlaceOrderBatch(orders) => {
                 assert_eq!(orders.len(), 400);
                 assert!(orders.iter().all(|o| (1..=10).contains(&o.market_id)));
             }
             other => panic!("expected PlaceOrderBatch, got {other:?}"),
         }
-        match econ_action(&mut rng, 4, 10, 1, &shape) {
+        match econ_action(&mut rng, 4, MarketPlan::uniform(10), 1, &shape) {
             NativeAction::PlaceOrder(_) => {}
             other => panic!("batch_size 1 must emit a plain PlaceOrder, got {other:?}"),
+        }
+    }
+}
+
+/// Which markets one bench sender is allowed to touch (`--markets-per-sender`).
+///
+/// `per_sender == 0` (the default) is the legacy shape: every ORDER draws a
+/// market uniformly from `1..=markets`, so all 5000 senders collide on all
+/// books. `per_sender == K > 0` is the LOCALITY shape: sender `i` only ever
+/// touches the K distinct ids `((i*K + j) mod markets) + 1, j in 0..K`.
+///
+/// The stride assignment (rather than `hash(i) -> K ids`) is deliberate: it is
+/// a pure function of the sender index (reproducible across processes and
+/// reps), the K ids are distinct by construction whenever `K <= markets`, and
+/// every market ends up owned by `floor` or `ceil` of `senders*K/markets`
+/// senders — a hash would leave some books empty at small sender counts, and an
+/// empty book silently skews matched/s.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MarketPlan {
+    markets: u64,
+    per_sender: u64,
+}
+
+impl MarketPlan {
+    fn new(markets: u64, per_sender: u64) -> Self {
+        let markets = markets.max(1);
+        Self {
+            markets,
+            per_sender: per_sender.min(markets),
+        }
+    }
+
+    /// Legacy uniform plan (every sender may touch every market).
+    #[cfg(test)]
+    fn uniform(markets: u64) -> Self {
+        Self::new(markets, 0)
+    }
+
+    /// `sender_idx`'s fixed market set, in assignment order.
+    fn markets_for(&self, sender_idx: usize) -> Vec<u64> {
+        if self.per_sender == 0 {
+            return (1..=self.markets).collect();
+        }
+        let start = (sender_idx as u64).wrapping_mul(self.per_sender) % self.markets;
+        (0..self.per_sender)
+            .map(|j| (start + j) % self.markets + 1)
+            .collect()
+    }
+
+    /// One market id for the next order of `sender_idx`.
+    fn pick(&self, rng: &mut impl Rng, sender_idx: usize) -> u64 {
+        if self.per_sender == 0 {
+            return rng.gen_range(1..=self.markets);
+        }
+        let start = (sender_idx as u64).wrapping_mul(self.per_sender) % self.markets;
+        (start + rng.gen_range(0..self.per_sender)) % self.markets + 1
+    }
+}
+
+#[cfg(test)]
+mod market_plan_tests {
+    use super::*;
+
+    // --markets-per-sender 0 (default) must keep TODAY's shape: every order
+    // draws uniformly from 1..=markets, and the whole range is used.
+    #[test]
+    fn per_sender_zero_is_the_legacy_uniform_shape() {
+        let plan = MarketPlan::new(10, 0);
+        assert_eq!(plan.markets_for(7), (1..=10).collect::<Vec<u64>>());
+        let mut rng = StdRng::seed_from_u64(1);
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..5_000 {
+            seen.insert(plan.pick(&mut rng, 7));
+        }
+        assert_eq!(seen, (1..=10).collect::<std::collections::BTreeSet<u64>>());
+    }
+
+    // The per-sender set is a pure function of the sender index: same set on
+    // every call, in every process, for the whole run.
+    #[test]
+    fn assignment_is_deterministic_and_distinct() {
+        let plan = MarketPlan::new(300, 3);
+        for i in [0usize, 1, 42, 4_999, 100_000] {
+            let a = plan.markets_for(i);
+            assert_eq!(a, plan.markets_for(i), "sender {i} set must be stable");
+            assert_eq!(a.len(), 3, "sender {i} must get exactly K ids");
+            let uniq: std::collections::BTreeSet<u64> = a.iter().copied().collect();
+            assert_eq!(uniq.len(), 3, "sender {i} ids must be distinct: {a:?}");
+            assert!(a.iter().all(|m| (1..=300).contains(m)), "ids in range: {a:?}");
+        }
+    }
+
+    // pick() may only ever return an id from that sender's fixed set.
+    #[test]
+    fn pick_stays_inside_the_senders_set() {
+        let plan = MarketPlan::new(300, 4);
+        let mut rng = StdRng::seed_from_u64(7);
+        for sender in [0usize, 3, 77, 1_234] {
+            let set: std::collections::BTreeSet<u64> =
+                plan.markets_for(sender).into_iter().collect();
+            let mut hit = std::collections::BTreeSet::new();
+            for _ in 0..2_000 {
+                let m = plan.pick(&mut rng, sender);
+                assert!(set.contains(&m), "sender {sender} strayed to market {m}");
+                hit.insert(m);
+            }
+            assert_eq!(hit, set, "sender {sender} must exercise its whole set");
+        }
+    }
+
+    // Coverage: with senders * K >= markets every market is owned by someone
+    // (a market nobody trades is a dead book that skews matched/s).
+    #[test]
+    fn every_market_is_covered_and_load_is_even() {
+        let plan = MarketPlan::new(300, 3);
+        let mut count = vec![0usize; 301];
+        for s in 0..5_000usize {
+            for m in plan.markets_for(s) {
+                count[m as usize] += 1;
+            }
+        }
+        assert!(count[1..].iter().all(|&c| c > 0), "every market must be covered");
+        let lo = *count[1..].iter().min().unwrap();
+        let hi = *count[1..].iter().max().unwrap();
+        assert!(hi - lo <= 1, "sender-per-market load must be even, got {lo}..{hi}");
+    }
+
+    // K >= markets degenerates to the uniform shape instead of erroring.
+    #[test]
+    fn per_sender_at_or_above_markets_clamps_to_all_markets() {
+        let plan = MarketPlan::new(8, 99);
+        assert_eq!(plan.markets_for(3), (1..=8).collect::<Vec<u64>>());
+        assert_eq!(MarketPlan::new(0, 5).markets_for(0), vec![1]);
+    }
+
+    // The locality shape must reach the real generators: with K=1 an econ batch
+    // of 400 orders lands on ONE book, and the legacy generator honours it too.
+    #[test]
+    fn econ_and_legacy_batches_honour_the_plan() {
+        let shape = EconShape::new(1500, 0, 5, 0.5, 0.0);
+        let plan = MarketPlan::new(300, 1);
+        let mut rng = StdRng::seed_from_u64(3);
+        match econ_action(&mut rng, 9, plan, 400, &shape) {
+            NativeAction::PlaceOrderBatch(orders) => {
+                let want = plan.markets_for(9)[0];
+                assert!(orders.iter().all(|o| o.market_id == want), "K=1 must be single-book");
+            }
+            other => panic!("expected PlaceOrderBatch, got {other:?}"),
+        }
+        match random_place_order_action(&mut rng, plan, 11, 50) {
+            NativeAction::PlaceOrderBatch(orders) => {
+                let want = plan.markets_for(11)[0];
+                assert!(orders.iter().all(|o| o.market_id == want));
+            }
+            other => panic!("expected PlaceOrderBatch, got {other:?}"),
         }
     }
 }
@@ -811,20 +976,25 @@ mod econ_shape_tests {
 /// Build one action carrying `batch_size` orders. `batch_size <= 1` returns a plain
 /// `PlaceOrder` (the legacy single path) for apples-to-apples A/B runs.
 ///
-/// `markets` > 1 spreads orders uniformly across market ids `1..=markets`
-/// (per ORDER, so one PlaceOrderBatch fans out to many books) — a single-market
-/// load shape skips `MarketWorkerPool::match_parallel` entirely
-/// (market_workers.rs single-market fast path) and measures one book's
-/// sequential ceiling, not the chain's (S372 finding, S395 knob).
-fn random_place_order_action(rng: &mut impl Rng, markets: u64, batch_size: usize) -> NativeAction {
-    let markets = markets.max(1);
+/// `plan` spreads orders across market ids (per ORDER, so one PlaceOrderBatch
+/// fans out to many books) — a single-market load shape skips
+/// `MarketWorkerPool::match_parallel` entirely (market_workers.rs single-market
+/// fast path) and measures one book's sequential ceiling, not the chain's
+/// (S372 finding, S395 knob). With `--markets-per-sender K` the fan-out is
+/// restricted to this sender's own K books (locality shape).
+fn random_place_order_action(
+    rng: &mut impl Rng,
+    plan: MarketPlan,
+    sender_idx: usize,
+    batch_size: usize,
+) -> NativeAction {
     if batch_size <= 1 {
-        let market_id = rng.gen_range(1..=markets);
+        let market_id = plan.pick(rng, sender_idx);
         return random_place_order(rng, market_id);
     }
     let orders: Vec<PlaceOrderParams> = (0..batch_size)
         .map(|_| {
-            let market_id = rng.gen_range(1..=markets);
+            let market_id = plan.pick(rng, sender_idx);
             match random_place_order(rng, market_id) {
                 NativeAction::PlaceOrder(p) => p,
                 _ => unreachable!(),
@@ -1901,11 +2071,22 @@ async fn run_consensus(
     rate: usize,
     sign_mode: SignMode,
     markets: u64,
+    markets_per_sender: u64,
     econ: Option<EconShape>,
     rate_total: f64,
     metrics_urls_str: &str,
     sweep_bodies: bool,
 ) {
+    // Locality plan: 0 = today's uniform draw over 1..=markets (default).
+    let plan = MarketPlan::new(markets, markets_per_sender);
+    if plan.per_sender > 0 {
+        println!(
+            "Market plan: {} markets, {} per sender (locality shape) — sender 0 owns {:?}",
+            plan.markets,
+            plan.per_sender,
+            plan.markets_for(0)
+        );
+    }
     let rpc_urls: Vec<String> = rpc_urls_str
         .split(',')
         .map(|s| s.trim().to_string())
@@ -2047,7 +2228,7 @@ async fn run_consensus(
             tokio::time::sleep(Duration::from_millis(750)).await;
             probe_nonce += 1;
             let canary = sign_native_action_with_session(
-                random_place_order_action(&mut StdRng::from_entropy(), 1, 1),
+                random_place_order_action(&mut StdRng::from_entropy(), MarketPlan::new(1, 0), 0, 1),
                 probe_nonce,
                 canary_key,
             );
@@ -2094,7 +2275,7 @@ async fn run_consensus(
             for _ in 0..3 {
                 let (p, _) = sign_payload_batch(
                     &mut rng, &calib_key, &calib_session, sign_mode, batch_size,
-                    submit_batch, 0, bin, markets,
+                    submit_batch, 0, bin, plan, 0,
                 );
                 n += p.len() as u64;
             }
@@ -2150,7 +2331,7 @@ async fn run_consensus(
         println!("Pre-signing {pre_sign} payloads x {num_senders} senders...");
         let t0 = Instant::now();
         let mut handles = Vec::with_capacity(num_senders);
-        for sk in &keys {
+        for (sender_idx, sk) in keys.iter().enumerate() {
             let key = sk.signing_key.clone();
             let session = sk.session_key.clone();
             handles.push(tokio::task::spawn_blocking(move || {
@@ -2165,7 +2346,8 @@ async fn run_consensus(
                     pre_sign,
                     bin,
                     base_nonce,
-                    markets,
+                    plan,
+                    sender_idx,
                 )
             }));
         }
@@ -2380,7 +2562,7 @@ async fn run_consensus(
                     let mut batch_actions = Vec::with_capacity(submit_batch);
                     for _ in 0..submit_batch {
                         let action =
-                            econ_action(&mut rng, sender_idx, markets, batch_size, &shape);
+                            econ_action(&mut rng, sender_idx, plan, batch_size, &shape);
                         let base = SystemTime::now()
                             .duration_since(UNIX_EPOCH)
                             .unwrap()
@@ -2486,7 +2668,8 @@ async fn run_consensus(
                             submit_batch,
                             last_nonce,
                             bin,
-                            markets,
+                            plan,
+                            sender_idx,
                         );
                         last_nonce = n;
                         if pregen_tx.blocking_send(payloads).is_err() {
@@ -2922,6 +3105,7 @@ async fn main() {
             rate,
             sign_mode,
             markets,
+            markets_per_sender,
             econ,
             target_margin,
             cross_fraction,
@@ -2964,6 +3148,7 @@ async fn main() {
                 rate,
                 mode,
                 markets,
+                markets_per_sender,
                 econ_shape,
                 rate_total,
                 &metrics_urls,
@@ -2987,7 +3172,7 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{fire_interval, pregen_ammo, sign_one, sign_payload_batch, SignMode};
+    use super::{fire_interval, pregen_ammo, sign_one, sign_payload_batch, MarketPlan, SignMode};
     use super::{summarize_included, SweptBlock};
     use rand::{rngs::StdRng, SeedableRng};
 
@@ -2996,9 +3181,11 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(7);
         let key = k256::ecdsa::SigningKey::from_slice(&[0x11; 32]).unwrap();
         let ed = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]);
-        let (p1, n1) = sign_payload_batch(&mut rng, &key, &ed, SignMode::Eip712, 3, 4, 0, false, 1);
+        let plan = MarketPlan::new(1, 0);
+        let (p1, n1) =
+            sign_payload_batch(&mut rng, &key, &ed, SignMode::Eip712, 3, 4, 0, false, plan, 0);
         let (p2, n2) =
-            sign_payload_batch(&mut rng, &key, &ed, SignMode::Eip712, 3, 4, n1, false, 1);
+            sign_payload_batch(&mut rng, &key, &ed, SignMode::Eip712, 3, 4, n1, false, plan, 0);
         assert_eq!(p1.len(), 4);
         assert_eq!(p2.len(), 4);
         assert!(n2 > n1, "nonce watermark must advance across batches");
@@ -3058,7 +3245,8 @@ mod tests {
             3,
             false,
             BASE,
-            1,
+            MarketPlan::new(1, 0),
+            0,
         );
         assert_eq!(ammo.len(), 3, "one payload-vec per requested count");
         assert!(
