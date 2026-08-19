@@ -1289,6 +1289,9 @@ pub struct SaveTimings {
     pub levels_ns: u128,
     /// diff_stop_rows — the per-market RocksDB prefix seek over stop rows.
     pub stops_ns: u128,
+    /// r8: how many of this block's dirty markets actually ran that seek
+    /// (the rest had a clean stops-dirty flag and skipped it entirely).
+    pub stop_scans: u32,
     /// write_meta_if_moved — the per-market RocksDB meta point read + compare.
     pub meta_ns: u128,
     /// counter row + book-mode marker (once) + loop overhead.
@@ -2403,6 +2406,10 @@ impl<T: StateBackend> NativeExecContext<T> {
             acc.levels_ns += t.elapsed().as_nanos();
         }
         let t_stops = timed.then(std::time::Instant::now);
+        // r8: attribute the seek only when it actually runs.
+        if book.stops_dirty() {
+            acc.stop_scans += 1;
+        }
         written += Self::diff_stop_rows(state, market_id, book);
         if let Some(t) = t_stops {
             acc.stops_ns += t.elapsed().as_nanos();
@@ -2424,20 +2431,42 @@ impl<T: StateBackend> NativeExecContext<T> {
     /// Shared modes 1/2: pending stops are immutable per id → put new ids,
     /// delete gone ids. Stateless diff against the persisted stop rows (one
     /// bounded prefix scan over `market ‖ 0x02` — the stop set is tiny).
+    ///
+    /// r8: the scan is SKIPPED when the book's stops-dirty flag is clear.
+    /// That is byte-exact, not an approximation: the diff only ever puts ids
+    /// the persisted set lacks and deletes ids the live set lacks, so with
+    /// `pending_stops` unchanged since the last diff that fully succeeded
+    /// (persisted == live at that point) both sets are empty and the diff is
+    /// a no-op returning 0. Stop rows are immutable per id, so an unchanged
+    /// id can never need a rewrite either. Books start dirty and every
+    /// `pending_stops` mutation re-dirties them, so the only way to reach
+    /// here clean is "provably nothing to write". The flag is node-local
+    /// (never hashed); a validator that skips and one that scans emit the
+    /// same rows.
     fn diff_stop_rows(state: &T, market_id: MarketId, book: &OrderBook) -> usize {
         use torus_state::cf::CF_NATIVE_ORDER_BOOKS;
+        if !book.stops_dirty() {
+            return 0;
+        }
         let mut prefix = [0u8; 9];
         prefix[..8].copy_from_slice(&market_id.to_be_bytes());
         prefix[8] = ROW_TAG_STOP;
-        let persisted: std::collections::HashSet<u128> = state
-            .iterate_cf(CF_NATIVE_ORDER_BOOKS, Some(&prefix))
-            .map(|rows| {
-                rows.iter()
+        // `ok` gates the flag clear below: any failed read/put/delete leaves
+        // the book dirty so the NEXT block retries the full diff.
+        let mut ok = true;
+        let persisted: std::collections::HashSet<u128> =
+            match state.iterate_cf(CF_NATIVE_ORDER_BOOKS, Some(&prefix)) {
+                Ok(rows) => rows
+                    .iter()
                     .filter(|(k, _)| k.len() == 25 && k[8] == ROW_TAG_STOP)
                     .map(|(k, _)| u128::from_be_bytes(k[9..25].try_into().unwrap()))
-                    .collect()
-            })
-            .unwrap_or_default();
+                    .collect(),
+                Err(e) => {
+                    tracing::error!(market_id, %e, "stop row scan failed");
+                    ok = false;
+                    std::collections::HashSet::new()
+                }
+            };
 
         let mut written = 0usize;
         let stops = book.stop_rows();
@@ -2448,6 +2477,7 @@ impl<T: StateBackend> NativeExecContext<T> {
                 let key = book_stop_key(market_id, id);
                 if let Err(e) = state.put_cf_raw(CF_NATIVE_ORDER_BOOKS, &key, &bytes) {
                     tracing::error!(market_id, stop_id = %id, %e, "stop row put failed");
+                    ok = false;
                 } else {
                     written += 1;
                 }
@@ -2459,9 +2489,13 @@ impl<T: StateBackend> NativeExecContext<T> {
             let key = book_stop_key(market_id, id);
             if let Err(e) = state.delete_cf_raw(CF_NATIVE_ORDER_BOOKS, &key) {
                 tracing::error!(market_id, stop_id = %id, %e, "stop row delete failed");
+                ok = false;
             } else {
                 written += 1;
             }
+        }
+        if ok {
+            book.mark_stops_clean();
         }
         written
     }

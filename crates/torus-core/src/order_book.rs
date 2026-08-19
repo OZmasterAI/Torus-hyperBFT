@@ -244,6 +244,17 @@ pub struct OrderBook {
     trader_orders: HashMap<Address, Vec<OrderId>>,
     /// Pending stop orders.
     pending_stops: Vec<StopOrder>,
+    /// r8: does `pending_stops` possibly differ from the stop rows last
+    /// persisted for this market? SET by every mutation of `pending_stops`
+    /// (place / trigger cascade / cancel-all removal / row restore), CLEARED
+    /// by the save path after a stop-row diff that fully succeeded. Starts
+    /// DIRTY so a book's first save always reconciles against whatever rows
+    /// the DB already holds. Node-local bookkeeping ONLY: never serialized,
+    /// never hashed, not part of any state root — two validators may hold
+    /// different flag values for the same book and still write identical
+    /// rows. `AtomicBool` (Relaxed) rather than `Cell` so `OrderBook` stays
+    /// `Sync`; the save path clears it through a shared `&OrderBook`.
+    stops_dirty: std::sync::atomic::AtomicBool,
     pub tick_size: FixedPoint,
     pub lot_size: FixedPoint,
     next_id: OrderId,
@@ -329,6 +340,9 @@ impl OrderBook {
             order_index: HashMap::new(),
             trader_orders: HashMap::new(),
             pending_stops: Vec::new(),
+            // r8: conservative default — a book that has never diffed its
+            // stop rows must scan once before it may skip.
+            stops_dirty: std::sync::atomic::AtomicBool::new(true),
             tick_size,
             lot_size,
             next_id: 1,
@@ -430,6 +444,7 @@ impl OrderBook {
                         };
                     }
                 }
+                self.mark_stops_dirty(); // r8: stop set moved -> next save must diff
                 self.pending_stops.push(StopOrder {
                     id: order_id,
                     trader,
@@ -466,6 +481,7 @@ impl OrderBook {
                         };
                     }
                 }
+                self.mark_stops_dirty(); // r8: stop set moved -> next save must diff
                 self.pending_stops.push(StopOrder {
                     id: order_id,
                     trader,
@@ -681,8 +697,15 @@ impl OrderBook {
             }
         }
 
-        // Also remove pending stops for this trader
+        // Also remove pending stops for this trader. r8: only a retain that
+        // actually DROPPED a stop moves the persisted set — a cancel-all by a
+        // trader with no stops (the overwhelmingly common case) leaves the
+        // stop rows byte-identical, so it must not dirty the flag.
+        let before = self.pending_stops.len();
         self.pending_stops.retain(|s| s.trader != trader);
+        if self.pending_stops.len() != before {
+            self.mark_stops_dirty();
+        }
 
         cancelled
     }
@@ -1285,6 +1308,8 @@ impl OrderBook {
             if triggered.is_empty() {
                 break;
             }
+            // r8: the retain above just removed `triggered` from the stop set.
+            self.mark_stops_dirty();
 
             let prev_price = current_price;
             for stop in triggered {
@@ -1400,7 +1425,37 @@ impl OrderBook {
         }
         let id = stop.id;
         self.pending_stops.push(stop);
+        // r8: a reload is conservative — the rebuilt book must diff its stop
+        // rows once before it is allowed to skip the scan.
+        self.mark_stops_dirty();
         Ok(id)
+    }
+
+    // ---- r8: stops-dirty flag (node-local; see the field's doc) ----
+
+    /// `true` when `pending_stops` may differ from the stop rows persisted
+    /// for this market — i.e. when the save path's `market ‖ 0x02` prefix
+    /// seek + diff can still produce row ops. When this is `false` the diff
+    /// is provably a no-op and the save path skips the seek entirely.
+    pub fn stops_dirty(&self) -> bool {
+        self.stops_dirty.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Force the stop-row diff on the next save. Called by every
+    /// `pending_stops` mutation, by the reload path, and by tests that want
+    /// the pre-r8 always-scan behaviour.
+    pub fn mark_stops_dirty(&self) {
+        self.stops_dirty
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The save path calls this after a stop-row diff in which every read and
+    /// write SUCCEEDED: the persisted rows now equal `pending_stops`, so the
+    /// next diff is a no-op until something touches the stop set again. Never
+    /// call it after a failed/partial diff — the flag must stay dirty then.
+    pub fn mark_stops_clean(&self) {
+        self.stops_dirty
+            .store(false, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -2564,6 +2619,9 @@ impl BorshDeserialize for OrderBook {
             order_index: HashMap::new(),
             trader_orders: HashMap::new(),
             pending_stops: Vec::new(),
+            // r8: conservative default — a book that has never diffed its
+            // stop rows must scan once before it may skip.
+            stops_dirty: std::sync::atomic::AtomicBool::new(true),
             tick_size,
             lot_size,
             next_id,
@@ -2682,6 +2740,121 @@ mod tests {
             reduce_only: false,
             client_order_id: None,
         }
+    }
+
+    // ====================================================================
+    // r8: stops-dirty flag — the save path's stop-row prefix-scan skip
+    // ====================================================================
+
+    /// The flag must be SET by every mutation of `pending_stops` (place a
+    /// stop / trigger cascade / cancel-all that removes one / row restore),
+    /// must stay CLEAR across ordinary non-stop flow, and a fresh book must
+    /// start DIRTY (its first save has to reconcile against whatever stop
+    /// rows the DB already holds for that market). `diff_stop_rows` skips its
+    /// bounded `market ‖ 0x02` prefix seek exactly when this is clear, so a
+    /// missed set here is a persistence bug, not just a perf one.
+    #[test]
+    fn stops_dirty_flag_tracks_every_pending_stop_mutation() {
+        let mut ob = book();
+        assert!(ob.stops_dirty(), "a fresh book must start dirty");
+        ob.mark_stops_clean();
+        assert!(!ob.stops_dirty());
+
+        // 1. Ordinary resting flow never touches the stop set.
+        ob.place_order(limit_buy(fp(100), fp(5)), addr(1), 1);
+        ob.place_order(limit_sell(fp(101), fp(5)), addr(2), 2);
+        assert!(!ob.stops_dirty(), "resting limit orders must not dirty stops");
+
+        // 2. cancel_all for a trader that has orders but NO stops: clean.
+        ob.cancel_all(addr(2), None);
+        assert!(!ob.stops_dirty(), "cancel_all removing no stop must stay clean");
+        ob.place_order(limit_sell(fp(101), fp(5)), addr(2), 3);
+        ob.mark_stops_clean();
+
+        // 3. Placing a stop dirties it.
+        let stop_buy = PlaceOrderParams {
+            market_id: 1,
+            is_buy: true,
+            price: FixedPoint::ZERO,
+            quantity: fp(1),
+            order_type: OrderType::StopMarket { trigger: fp(200) },
+            time_in_force: TimeInForce::GTC,
+            reduce_only: false,
+            client_order_id: None,
+        };
+        let r = ob.place_order(stop_buy, addr(1), 4);
+        assert_eq!(r.status, OrderStatus::PendingTrigger);
+        assert!(ob.stops_dirty(), "placing a stop must dirty the stop set");
+        ob.mark_stops_clean();
+
+        // 4. A trade that does NOT reach the trigger leaves it clean.
+        ob.place_order(market_sell(fp(2)), addr(3), 5);
+        assert_eq!(ob.last_trade_price(), Some(fp(100)));
+        assert!(!ob.stops_dirty(), "a non-triggering trade must not dirty stops");
+
+        // 5. A trade that DOES reach the trigger dirties it (cascade path).
+        // Sweep the 101 ask (prints 101, below the trigger) and leave a
+        // remainder RESTING at 250 for the next order to print through.
+        ob.place_order(limit_buy(fp(250), fp(8)), addr(3), 6);
+        assert_eq!(ob.last_trade_price(), Some(fp(101)));
+        assert!(!ob.stops_dirty(), "a 101 print must not fire a 200 stop");
+        ob.mark_stops_clean();
+        ob.place_order(limit_sell(fp(250), fp(1)), addr(4), 7); // prints 250
+        assert_eq!(ob.last_trade_price(), Some(fp(250)));
+        assert!(ob.stops_dirty(), "a triggered stop must dirty the stop set");
+        assert_eq!(ob.pending_stop_count(), 0);
+        ob.mark_stops_clean();
+
+        // 6. cancel_all that DOES remove a stop dirties it.
+        let ltp = ob.last_trade_price().expect("ltp");
+        let stop_sell = PlaceOrderParams {
+            market_id: 1,
+            is_buy: false,
+            price: FixedPoint::ZERO,
+            quantity: fp(1),
+            order_type: OrderType::StopMarket { trigger: ltp - fp(50) },
+            time_in_force: TimeInForce::GTC,
+            reduce_only: false,
+            client_order_id: None,
+        };
+        // NB (pre-existing): `cancel_all` short-circuits when the trader has
+        // no RESTING order, so the stop sweep only runs for a trader that has
+        // one — give addr(5) a resting order so the sweep is reached.
+        ob.place_order(limit_buy(fp(90), fp(1)), addr(5), 8);
+        let r = ob.place_order(stop_sell, addr(5), 9);
+        assert_eq!(r.status, OrderStatus::PendingTrigger);
+        assert_eq!(ob.pending_stop_count(), 1);
+        ob.mark_stops_clean();
+        ob.cancel_all(addr(5), None);
+        assert_eq!(ob.pending_stop_count(), 0);
+        assert!(ob.stops_dirty(), "cancel_all removing a stop must dirty it");
+    }
+
+    /// A book rebuilt from persisted stop rows is DIRTY: the reload path is
+    /// conservative, so the first save after a reload always re-reconciles.
+    #[test]
+    fn restored_stop_rows_leave_the_book_dirty() {
+        let mut src = book();
+        let stop = PlaceOrderParams {
+            market_id: 1,
+            is_buy: true,
+            price: FixedPoint::ZERO,
+            quantity: fp(1),
+            order_type: OrderType::StopMarket { trigger: fp(200) },
+            time_in_force: TimeInForce::GTC,
+            reduce_only: false,
+            client_order_id: None,
+        };
+        src.place_order(stop, addr(1), 1);
+        let rows = src.stop_rows();
+        assert_eq!(rows.len(), 1);
+
+        let mut dst = book();
+        dst.mark_stops_clean();
+        assert!(!dst.stops_dirty());
+        dst.restore_stop_row(&rows[0].1).expect("restore stop row");
+        assert!(dst.stops_dirty(), "a restored stop row must dirty the book");
+        assert_eq!(dst.stop_rows(), rows);
     }
 
     // ====================================================================
