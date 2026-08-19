@@ -15,4 +15,9 @@ python3 "$T/summarize.py" --out "$D" --label "$(j .label)" --worktree "$(j .work
   --bench-cmd "$(j .cell.bench_cmd)" --pids "$(j '.cell.node_pids|join(" ")')" \
   --evicted "$(j '.ingest.mempool_nonce_expired_evictions_per_node|map(tostring)|join(" ")')" \
   --bench-submitted "$(j .ingest.bench_submitted_actions)" \
-  --block-cap "$(j '.cell.block_cap // ""')" --dissem "$(j '.dissemination.raw // ""')"
+  --block-cap "$(j '.cell.block_cap // ""')" --dissem "$(j '.dissemination.raw // ""')" \
+  --markets-per-sender "$(j '.cell.markets_per_sender // ""')" \
+  --drain-timeout "$(j '.timing.drain_timeout_s // ""')" \
+  --digest-quiescent "$(j 'if .agreement.state_digest_quiescent == false then "0" else "1" end')" \
+  --digest-secs "$(j '(.agreement.state_digest_seconds_per_node // [])|map(tostring)|join(" ")')" \
+  --digest-heights "$(j '(.agreement.state_digest_heights // [])|map(tostring)|join(" ")')"
