@@ -50,6 +50,12 @@ export TORUS_SHARD_CUSTODY="${TORUS_SHARD_CUSTODY:-0}"
 # host parallelism; set TORUS_SAVE_BOOKS_WORKERS=1 for the serial loop, N>=2
 # to cap the drain threads (TORUS_SAVE_BOOKS_MIN_OPS = work gate, default 32).
 # Left unset here on purpose — the binary default is the measured config.
+# r5 root-and-save-workers sweep: TORUS_SAVE_BOOKS_WORKERS is capped per block
+# at the DIRTY BOOK count (10 on a 10-market cell, whatever the host width) and
+# TORUS_PARALLEL_BUCKET_HASH at the dirty-bucket count; the nodes publish the
+# engaged counts as torus_exec_save_books_workers / torus_exec_root_bucket_hash_workers.
+# tools/matched-bench/sweep-workers.sh sweeps both (+ TORUS_BUCKET_MEMBER_CACHE_MB)
+# through run-cell.sh; a winner is promoted into run-cell.sh RECORD_ENV, not here.
 
 METRICS_PORTS="$MET0 $MET1 $MET2"
 RPC_URLS="http://localhost:$RPC0 http://localhost:$RPC1 http://localhost:$RPC2"

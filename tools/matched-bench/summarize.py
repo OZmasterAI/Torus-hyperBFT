@@ -164,6 +164,23 @@ for node, rs in rows.items():
     p["actions_per_exec_block"] = round((m(b, "native_actions_processed_total") - m(a, "native_actions_processed_total")) / nblk, 1)
     dbc = m(b, "exec_root_dirty_buckets_count") - m(a, "exec_root_dirty_buckets_count")
     p["dirty_buckets_per_flush"] = round((m(b, "exec_root_dirty_buckets_sum") - m(a, "exec_root_dirty_buckets_sum")) / dbc, 1) if dbc else None
+    # r5 root-and-save-workers sweep: bucket-member cache effectiveness over the
+    # window (hits / (hits+misses), evictions per flush) and the worker counts
+    # the parallel bucket-hash / save-books drain ACTUALLY ran on (gauges: last
+    # flush; we report the max seen and the value at the end of the window, so
+    # a cell can prove TORUS_PARALLEL_BUCKET_HASH / TORUS_SAVE_BOOKS_WORKERS
+    # engaged as intended — both are capped by dirty buckets / dirty books).
+    mch = m(b, "member_cache_hits_total") - m(a, "member_cache_hits_total")
+    mcm = m(b, "member_cache_misses_total") - m(a, "member_cache_misses_total")
+    mce = m(b, "member_cache_evictions_total") - m(a, "member_cache_evictions_total")
+    p["member_cache"] = {"hits": int(mch), "misses": int(mcm), "evictions": int(mce),
+                         "hit_ratio": round(mch / (mch + mcm), 4) if (mch + mcm) > 0 else None,
+                         "evictions_per_flush": round(mce / dbc, 1) if dbc else None,
+                         "resident_buckets_end": int(m(b, "member_cache_resident_buckets"))}
+    p["workers"] = {"root_bucket_hash_last": int(m(b, "exec_root_bucket_hash_workers")),
+                    "root_bucket_hash_max": int(max(m(r, "exec_root_bucket_hash_workers") for r in sel)),
+                    "save_books_last": int(m(b, "exec_save_books_workers")),
+                    "save_books_max": int(max(m(r, "exec_save_books_workers") for r in sel))}
     cic = m(b, "commit_interval_seconds_count") - m(a, "commit_interval_seconds_count")
     p["commit_interval_ms_avg"] = round((m(b, "commit_interval_seconds_sum") - m(a, "commit_interval_seconds_sum")) / cic * 1000, 1) if cic else None
     # r4 commit-persist: consensus-thread commit-time durable persist (whole call /
@@ -284,6 +301,11 @@ summary = {
         "consensus_timeouts": v0.get("delta_consensus_timeout_total_total"),
         "dissemination_clean": dissem.get("dissemination_clean") if dissem else None,
         "validators_agree": agreement.get("validators_agree"),
+        "root_ms": phase.get("val0", {}).get("phases", {}).get("flush", {}).get("root_ms"),
+        "save_books_ms": phase.get("val0", {}).get("phases", {}).get("save_books", {}).get("ms"),
+        "workers": phase.get("val0", {}).get("workers"),
+        "member_cache_hit_ratio": phase.get("val0", {}).get("member_cache", {}).get("hit_ratio"),
+        "load1_max": None,  # filled below once cpu is parsed
     },
     "ingest": {"bench_submitted_actions": int(A.bench_submitted or 0),
                "val0_actions_processed": int(v0.get("delta_native_actions_processed_total", 0)),
@@ -296,6 +318,7 @@ summary = {
     "cpu": cpu,
     "bench_log_tail": bench_tail,
 }
+summary["headline"]["load1_max"] = cpu.get("load1_max")
 with open(os.path.join(OUT, "summary.json"), "w") as f:
     json.dump(summary, f, indent=1)
 h = summary["headline"]
@@ -307,3 +330,9 @@ p0 = phase.get("val0", {})
 if p0:
     print(f"PHASE val0: block_ms={p0['block_ms']} wall/committed={p0['wall_ms_per_committed_block']} " +
           " ".join(f"{k}={v['ms']}({v['pct_of_block']}%)" for k, v in p0["phases"].items()))
+    w = p0.get("workers", {}); mc = p0.get("member_cache", {})
+    print(f"WORKERS val0: root_bucket_hash last/max={w.get('root_bucket_hash_last')}/{w.get('root_bucket_hash_max')} "
+          f"save_books last/max={w.get('save_books_last')}/{w.get('save_books_max')} "
+          f"dirty_buckets/flush={p0.get('dirty_buckets_per_flush')} member_cache hit_ratio={mc.get('hit_ratio')} "
+          f"evictions/flush={mc.get('evictions_per_flush')} resident={mc.get('resident_buckets_end')} "
+          f"load1_max={cpu.get('load1_max')}")

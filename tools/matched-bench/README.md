@@ -82,6 +82,31 @@ tools/matched-bench/run-cell.sh /home/18c/projects/wt/matched-bench nosettle-r1 
 10. `stop-3val.sh`; node logs gzipped into the result dir + an excerpt.
 11. `summarize.py` -> `summary.json` (+ `analysis-valN.txt` from the awk scripts).
 
+## r5 root-and-save-workers sweep (`sweep-workers.sh`, `compare.py`)
+
+`sweep-workers.sh <worktree> <prefix> [DUR=120] [REPS=2] [MARKETS=10] [RATE=76000]`
+runs the worker-pool env cells SERIALLY through `run-cell.sh` (reps
+interleaved so box drift does not bias one cell): `ctl` (record env),
+`pbh8` / `pbh12` (`TORUS_PARALLEL_BUCKET_HASH`), `pbh8-mc512` (+
+`TORUS_BUCKET_MEMBER_CACHE_MB=512`), `sbw4` / `sbw8`
+(`TORUS_SAVE_BOOKS_WORKERS`); `CELLS='name:K=V K=V|...'` overrides the list
+(e.g. the best-combo cell). All three knobs are node-local and byte-neutral by
+construction (any worker count / cache size ⇒ identical roots and state —
+`round3_*` / `flushpipe_*` tests in `torus-state`, `save_books_parallel_tests`
+in `torus-bridge`), but the 3-validator agreement + state digest stays mandatory
+per cell. The nodes publish `torus_exec_root_bucket_hash_workers` and
+`torus_exec_save_books_workers` (worker threads the LAST flush / save drain
+actually ran on: 1 = serial or gated; else `min(env, dirty buckets)` /
+`min(env, dirty books)`) — `summary.json` `phase_by_node.valN.workers`
+(+ `headline.workers`) proves the value that engaged, since e.g. the default
+`TORUS_SAVE_BOOKS_WORKERS` (host = 18) is capped at 10 dirty books on a
+10-market cell. `phase_by_node.valN.member_cache` adds hit ratio / evictions
+per flush / resident buckets; `headline.root_ms`, `headline.save_books_ms`,
+`headline.load1_max` are the sweep's decision numbers.
+`compare.py <result-dir>...` prints one line per cell (matched/s, best60,
+root/state_write/save_books/block ms, engaged workers, mc hit ratio, load1,
+agree) plus a per-cell mean over reps.
+
 ## Result dir `/home/18c/bench-results-matched/<label>/`
 
 `summary.json` keys: `headline` (matched_s_avg = window average over the bench
