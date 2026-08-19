@@ -1078,12 +1078,83 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    // 12b. r3 exec-write-stall-attribution: DB-wide RocksDB runtime snapshot
+    // (write-controller state, LSM totals, statistics tickers/histograms) into
+    // the UNLABELLED torus_rocksdb_* gauges, on a cadence fine enough for a
+    // 300 s bench cell (default every 5 s; TORUS_ROCKSDB_STATS_INTERVAL_SECS).
+    {
+        let m = metrics.clone();
+        let sdb = state_db.clone();
+        let every = rocksdb_stats_interval_secs(std::env::var("TORUS_ROCKSDB_STATS_INTERVAL_SECS").ok());
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(every));
+            loop {
+                interval.tick().await;
+                let snap = sdb.runtime_stats();
+                publish_rocksdb_stats(&m.rocksdb, &snap);
+            }
+        });
+    }
+
     // 13. Wait for shutdown signal
     info!("node is running — press Ctrl+C to shut down");
     tokio::signal::ctrl_c().await?;
     info!("shutdown signal received, stopping...");
 
     Ok(())
+}
+
+/// Pure parse of `TORUS_ROCKSDB_STATS_INTERVAL_SECS` (default 5; `< 1` or
+/// garbage => 5).
+fn rocksdb_stats_interval_secs(raw: Option<String>) -> u64 {
+    match raw.as_deref().map(str::trim).and_then(|s| s.parse::<u64>().ok()) {
+        Some(n) if n >= 1 => n,
+        _ => 5,
+    }
+}
+
+/// Copy one [`torus_state::RocksdbRuntimeStats`] snapshot into the unlabelled
+/// `torus_rocksdb_*` gauges. Ticker / histogram gauges are left untouched when
+/// the DB was opened without statistics (they stay at 0, visibly).
+fn publish_rocksdb_stats(
+    g: &torus_telemetry::RocksdbStatMetrics,
+    s: &torus_state::RocksdbRuntimeStats,
+) {
+    let i = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
+    let f = |v: f64| if v.is_finite() { v.round() as i64 } else { 0 };
+    g.memtable_bytes_all.set(i(s.memtable_bytes_all));
+    g.immutable_memtables_all.set(i(s.immutable_memtables_all));
+    g.l0_files_max.set(i(s.l0_files_max));
+    g.pending_compaction_bytes_all.set(i(s.pending_compaction_bytes_all));
+    g.delayed_write_rate.set(i(s.delayed_write_rate));
+    g.write_stopped.set(i(s.write_stopped));
+    g.running_compactions.set(i(s.running_compactions));
+    g.running_flushes.set(i(s.running_flushes));
+    if let Some(t) = &s.tickers {
+        g.stall_micros.set(i(t.stall_micros));
+        g.write_self.set(i(t.write_self));
+        g.write_other.set(i(t.write_other));
+        g.bytes_written.set(i(t.bytes_written));
+        g.wal_bytes.set(i(t.wal_bytes));
+        g.flush_write_bytes.set(i(t.flush_write_bytes));
+        g.compact_read_bytes.set(i(t.compact_read_bytes));
+        g.compact_write_bytes.set(i(t.compact_write_bytes));
+        g.compaction_cpu_micros.set(i(t.compaction_cpu_micros));
+    }
+    if let Some(h) = &s.histograms {
+        g.db_write_count.set(i(h.db_write.count));
+        g.db_write_sum_micros.set(i(h.db_write.sum));
+        g.db_write_p99_micros.set(f(h.db_write.p99));
+        g.db_write_max_micros.set(f(h.db_write.max));
+        g.write_stall_count.set(i(h.write_stall.count));
+        g.write_stall_sum_micros.set(i(h.write_stall.sum));
+        g.write_stall_p99_micros.set(f(h.write_stall.p99));
+        g.write_stall_max_micros.set(f(h.write_stall.max));
+        g.flush_count.set(i(h.flush.count));
+        g.flush_sum_micros.set(i(h.flush.sum));
+        g.compaction_count.set(i(h.compaction.count));
+        g.compaction_sum_micros.set(i(h.compaction.sum));
+    }
 }
 
 // Hex encoding helper for logging (no external hex crate needed)
@@ -1097,6 +1168,49 @@ mod hex {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn rocksdb_stats_interval_parse() {
+        assert_eq!(rocksdb_stats_interval_secs(None), 5);
+        assert_eq!(rocksdb_stats_interval_secs(Some("0".into())), 5);
+        assert_eq!(rocksdb_stats_interval_secs(Some("x".into())), 5);
+        assert_eq!(rocksdb_stats_interval_secs(Some(" 2 ".into())), 2);
+    }
+
+    /// r3 exec-write-stall-attribution: end-to-end wiring — a real DB opened
+    /// with tickers on, a few puts, one snapshot, published into the metrics,
+    /// and the encoded /metrics text carries NON-ZERO unlabelled
+    /// torus_rocksdb_* samples (the thing the bench sampler read as 0 before).
+    #[test]
+    fn rocksdb_snapshot_publishes_nonzero_unlabelled_gauges() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tuning = torus_state::DbTuning {
+            stats_level: 2,
+            ..Default::default()
+        };
+        let db = torus_state::StateDb::open_with_tuning(dir.path(), &tuning).expect("open");
+        for i in 0..4u32 {
+            db.put_cf_raw(torus_state::cf::CF_ACCOUNTS, &i.to_be_bytes(), &[9u8; 128])
+                .expect("put");
+        }
+        let m = torus_telemetry::Metrics::new();
+        publish_rocksdb_stats(&m.rocksdb, &db.runtime_stats());
+        let text = m.encode();
+        let val = |name: &str| -> i64 {
+            text.lines()
+                .find_map(|l| {
+                    let mut it = l.split_whitespace();
+                    (it.next() == Some(name)).then(|| it.next().unwrap_or("0").parse().unwrap_or(0))
+                })
+                .unwrap_or_else(|| panic!("{name} missing from /metrics:\n{text}"))
+        };
+        assert!(val("torus_rocksdb_memtable_bytes_all") > 0);
+        assert!(val("torus_rocksdb_write_self") >= 4);
+        assert!(val("torus_rocksdb_bytes_written") >= 4 * 128);
+        assert!(val("torus_rocksdb_db_write_count") >= 4);
+        assert_eq!(val("torus_rocksdb_stall_micros"), 0);
+        assert_eq!(val("torus_rocksdb_write_stopped"), 0);
+    }
 
     #[test]
     fn archive_and_retention_mutually_exclusive() {
