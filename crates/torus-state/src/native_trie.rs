@@ -985,6 +985,8 @@ fn process_bucket(
 /// across `parallel` scoped worker threads — and collect into a bucket-ordered
 /// map (the deterministic merge key). Identical output regardless of thread
 /// count: leaf hashes are pure per-bucket functions and the fold is serial.
+/// Also returns the worker count actually used (1 = serial path, including
+/// the min-buckets gate) — telemetry only, never consulted for any byte.
 fn run_buckets(
     db: &StateDb,
     mut work: Vec<BucketWork<'_>>,
@@ -993,7 +995,7 @@ fn run_buckets(
     defaults: &[B256; TREE_DEPTH + 1],
     parallel: usize,
     min_buckets: usize,
-) -> Result<BTreeMap<u16, BucketOutcome>, StateError> {
+) -> Result<(BTreeMap<u16, BucketOutcome>, usize), StateError> {
     // L3 flush-pipe (a): serial unless parallelism is enabled AND the dirty-bucket
     // count exceeds the adaptive threshold. `min_buckets == 1` (default) is the
     // pre-existing `work.len() <= 1` gate. Output is byte-identical on either path.
@@ -1006,7 +1008,7 @@ fn run_buckets(
             let o = process_bucket(db, *b, entries, hit.take(), member_enabled, elide, defaults)?;
             out.insert(*b, o);
         }
-        return Ok(out);
+        return Ok((out, 1));
     }
 
     let nthreads = parallel.min(work.len());
@@ -1058,7 +1060,7 @@ fn run_buckets(
             out.insert(b, o);
         }
     }
-    Ok(out)
+    Ok((out, nthreads))
 }
 
 /// Unchanged-sibling hash for the tree fold: from the in-RAM trie image (cached
@@ -1098,6 +1100,10 @@ pub struct NativeTrieApply {
     pub bucket_scans: usize,
     pub member_hits: usize,
     pub member_misses: usize,
+    /// Worker threads the per-bucket rehash actually ran on (1 = serial path,
+    /// including the `min_buckets` gate; otherwise `min(parallel, buckets)`).
+    /// Telemetry only — output bytes are identical for every value.
+    pub bucket_hash_workers: usize,
     /// Committed trie node changes — folded into the trie cache post-commit
     /// (`Some` iff the trie cache was used).
     pub(crate) trie_changed: Option<BTreeMap<(usize, usize), B256>>,
@@ -1200,7 +1206,8 @@ where
     }
 
     // 4. Per-bucket rehash (serial or scoped-thread parallel; identical output).
-    let outcomes = run_buckets(db, work, member_enabled, elide, &defaults, parallel, min_buckets)?;
+    let (outcomes, bucket_hash_workers) =
+        run_buckets(db, work, member_enabled, elide, &defaults, parallel, min_buckets)?;
 
     // 5. Merge deterministically in bucket order.
     let mut ops: Vec<NodeOp> = Vec::new();
@@ -1246,6 +1253,7 @@ where
             bucket_scans,
             member_hits,
             member_misses,
+            bucket_hash_workers,
             trie_changed: if elide { Some(changed) } else { None },
             member_finals,
         });
@@ -1319,6 +1327,7 @@ where
         bucket_scans,
         member_hits,
         member_misses,
+        bucket_hash_workers,
         trie_changed: if elide { Some(changed) } else { None },
         member_finals,
     })
@@ -2010,6 +2019,66 @@ mod tests {
             native_root_full(&db_serial).unwrap(),
             "threshold boundary: root != serial-uncached full-scan oracle"
         );
+    }
+
+    /// r5 root-and-save-workers sweep: the apply reports the bucket-hash worker
+    /// count it ACTUALLY ran on (`bucket_hash_workers`), so a node can publish it
+    /// as a gauge and a bench cell can prove `TORUS_PARALLEL_BUCKET_HASH=N` took
+    /// effect. Serial (parallel<=1 or gated by min_buckets) ⇒ 1; parallel ⇒
+    /// min(N, dirty buckets). Pure telemetry — root + persisted bytes are
+    /// identical for every configuration (asserted).
+    #[test]
+    fn round3_apply_reports_bucket_hash_workers() {
+        let mut ops = Vec::new();
+        for i in 0..24u32 {
+            ops.push((1usize, key_for(1, i), Some(vec![0xC1u8 ^ (i as u8); 40])));
+        }
+        let mk = || {
+            let (db, d) = temp_db();
+            seed(&db);
+            build_native_trie_to_cf(&db).unwrap();
+            let dirty = apply_ops(&db, &ops);
+            (db, d, dirty)
+        };
+        let (_db0, _d0, dirty0) = mk();
+        let k = dirty_bucket_count(&dirty0);
+        assert!(k >= 3, "need >= 3 dirty buckets (got {k})");
+
+        // (parallel, min_buckets) -> expected reported workers
+        let cases: [(usize, usize, usize); 5] = [
+            (1, 1, 1),                 // serial
+            (4, 1, 4.min(k)),          // parallel engaged, N < buckets
+            (64, 1, k),                // parallel engaged, capped by dirty buckets
+            (4, k, 1),                 // gated out by the engagement threshold
+            (2, k - 1, 2),             // just above the threshold
+        ];
+        let mut ref_root: Option<B256> = None;
+        let mut ref_trie: Option<Vec<(Vec<u8>, Vec<u8>)>> = None;
+        for (parallel, min_buckets, want) in cases {
+            let (db, _d, dirty) = mk();
+            assert_eq!(dirty, dirty0, "twin DBs must derive identical dirty maps");
+            let mut batch = WriteBatch::default();
+            let apply =
+                apply_native_dirty(&db, &mut batch, &dirty, None, None, parallel, min_buckets)
+                    .unwrap();
+            db.write(batch).unwrap();
+            assert_eq!(
+                apply.bucket_hash_workers, want,
+                "parallel={parallel} min_buckets={min_buckets} k={k}: reported workers"
+            );
+            let trie = dump(&db, CF_NATIVE_TRIE);
+            match (&ref_root, &ref_trie) {
+                (Some(r), Some(t)) => {
+                    assert_eq!(&apply.root, r, "parallel={parallel}: root diverged");
+                    assert_eq!(&trie, t, "parallel={parallel}: trie CF diverged");
+                }
+                _ => {
+                    assert_eq!(apply.root, native_root_full(&db).unwrap());
+                    ref_root = Some(apply.root);
+                    ref_trie = Some(trie);
+                }
+            }
+        }
     }
 
     fn xorshift(s: &mut u64) -> u64 {

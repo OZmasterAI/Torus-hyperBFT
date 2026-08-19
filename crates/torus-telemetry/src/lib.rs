@@ -224,6 +224,15 @@ pub struct Metrics {
     /// the eviction-pressure witness (near the budget-implied cap ⇒ evicting ⇒
     /// misses are cold re-scans, not cold-start).
     pub member_cache_resident_buckets: Gauge,
+    /// r5 root-and-save-workers sweep: worker threads the LAST parallel
+    /// bucket-hash (native-root maintenance) actually ran on — 1 = serial /
+    /// gated, else `min(TORUS_PARALLEL_BUCKET_HASH, dirty buckets)`. Proves an
+    /// env cell took effect on each node; byte-neutral by construction.
+    pub exec_root_bucket_hash_workers: Gauge,
+    /// r5 root-and-save-workers sweep: worker threads the LAST mode-2
+    /// save-books drain actually ran on — 1 = serial / gated / modes 0-1, else
+    /// `min(TORUS_SAVE_BOOKS_WORKERS, dirty books)`. Same purpose as above.
+    pub exec_save_books_workers: Gauge,
     /// 3c: per-cf-tag native-root dirty entries per flush (funnel attribution
     /// of the post-3c dirty-set composition). Indexed by the frozen cf_tag
     /// order: balances / order_books / positions / oracle / staking_delegations
@@ -947,6 +956,20 @@ impl Metrics {
             member_cache_resident_buckets.clone(),
         );
 
+        let exec_root_bucket_hash_workers = Gauge::default();
+        registry.register(
+            "torus_exec_root_bucket_hash_workers",
+            "Worker threads the last parallel bucket-hash (native root) ran on (1 = serial/gated; else min(TORUS_PARALLEL_BUCKET_HASH, dirty buckets))",
+            exec_root_bucket_hash_workers.clone(),
+        );
+
+        let exec_save_books_workers = Gauge::default();
+        registry.register(
+            "torus_exec_save_books_workers",
+            "Worker threads the last mode-2 save-books drain ran on (1 = serial/gated; else min(TORUS_SAVE_BOOKS_WORKERS, dirty books))",
+            exec_save_books_workers.clone(),
+        );
+
         // 3c: per-cf-tag dirty-entry attribution (frozen NATIVE_ROOT_CFS order).
         let exec_dirty_entries_by_cf: [Counter; 6] = Default::default();
         for (i, suffix) in [
@@ -1387,6 +1410,8 @@ impl Metrics {
             member_cache_misses,
             member_cache_evictions,
             member_cache_resident_buckets,
+            exec_root_bucket_hash_workers,
+            exec_save_books_workers,
             exec_dirty_entries_by_cf,
             exec_book_rows_written,
             exec_book_rows_deleted,
@@ -1572,6 +1597,23 @@ mod tests {
             "torus_exec_queue_depth",
             "torus_exec_throttle_tier",
             "torus_exec_dispatch_deferred",
+        ] {
+            assert!(text.contains(name), "{name} not registered:\n{text}");
+        }
+    }
+
+    /// r5 root-and-save-workers sweep: the two worker-pool gauges must be
+    /// registered so a bench cell can PROVE from /metrics which worker count
+    /// each node's mode-2 save drain and parallel bucket-hash actually used
+    /// (`TORUS_SAVE_BOOKS_WORKERS` / `TORUS_PARALLEL_BUCKET_HASH` are capped by
+    /// dirty books / dirty buckets, so the env value alone is not the answer).
+    #[test]
+    fn worker_pool_gauges_register() {
+        let m = Metrics::new();
+        let text = m.encode();
+        for name in [
+            "torus_exec_save_books_workers",
+            "torus_exec_root_bucket_hash_workers",
         ] {
             assert!(text.contains(name), "{name} not registered:\n{text}");
         }

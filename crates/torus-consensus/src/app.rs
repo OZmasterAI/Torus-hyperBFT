@@ -1539,6 +1539,10 @@ impl ExecutionContext {
             if let Some(ref m) = self.metrics {
                 m.exec_save_books_seconds
                     .observe(save_books_timer.elapsed().as_secs_f64());
+                // r5 root-and-save-workers sweep: worker threads the drain
+                // actually used (1 = serial / gated), so a cell can prove its
+                // TORUS_SAVE_BOOKS_WORKERS value took effect on every node.
+                m.exec_save_books_workers.set(ctx.last_save_workers() as i64);
                 // L3: publish the level-hash sponge cache effectiveness, summed
                 // across all books, right after the save that populates it. None
                 // when TORUS_LEVEL_HASH_CACHE is off ⇒ skip (gauges stay at 0).
@@ -1616,6 +1620,10 @@ impl ExecutionContext {
                         m.member_cache_evictions.inc_by(stats.member_evictions as u64);
                         m.member_cache_resident_buckets
                             .set(stats.member_resident_buckets as i64);
+                        // r5 root-and-save-workers sweep: bucket-hash workers
+                        // actually used by this flush (1 = serial / gated).
+                        m.exec_root_bucket_hash_workers
+                            .set(stats.bucket_hash_workers as i64);
                         // 3c: per-cf-tag dirty-entry attribution.
                         for (i, n) in stats.dirty_entries_by_cf.iter().enumerate() {
                             m.exec_dirty_entries_by_cf[i].inc_by(*n as u64);

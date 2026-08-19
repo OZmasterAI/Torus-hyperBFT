@@ -663,6 +663,7 @@ impl NativeStateOverlay {
             member_evictions: 0,
             member_resident_buckets: 0,
             dirty_entries_by_cf: [0; 6],
+            bucket_hash_workers: 1,
         };
         // 3c funnel attribution: dirty-entry composition per cf_tag.
         for (tag, _) in dirty.keys() {
@@ -687,6 +688,7 @@ impl NativeStateOverlay {
                     stats.bucket_scans = a.bucket_scans;
                     stats.member_hits = a.member_hits;
                     stats.member_misses = a.member_misses;
+                    stats.bucket_hash_workers = a.bucket_hash_workers;
                     apply_out = Some(a);
                     Ok(())
                 }
@@ -790,6 +792,10 @@ pub struct NativeFlushStats {
     /// NATIVE_ROOT_CFS order) — funnel attribution of the dirty-set
     /// composition.
     pub dirty_entries_by_cf: [usize; 6],
+    /// r5 root-and-save-workers sweep: worker threads the parallel bucket-hash
+    /// actually ran on this flush (1 = serial / gated / no dirty set; else
+    /// `min(TORUS_PARALLEL_BUCKET_HASH, dirty buckets)`). Telemetry only.
+    pub bucket_hash_workers: usize,
 }
 
 impl StateBackend for NativeStateOverlay {
