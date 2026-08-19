@@ -186,12 +186,13 @@ mod tests {
         writer
             .send(vec![(CF_NATIVE_TRADES, b"a".to_vec(), b"1".to_vec())])
             .expect("send");
-        // Wait for the writer to consume it (bounded spin, no sleep-forever).
-        for _ in 0..1000 {
-            if writer.queued_batches() == 0 {
-                break;
-            }
-            std::thread::yield_now();
+        // Wait for the writer to consume it: TIME-bounded (5 s), not a fixed
+        // spin count — 1000 `yield_now`s can elapse before the writer thread is
+        // even scheduled on a loaded box (flaked 2x under a sibling cargo test
+        // at load1 ~11), which is a scheduling artefact, not a queue bug.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while writer.queued_batches() != 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
         assert_eq!(writer.queued_batches(), 0);
     }
