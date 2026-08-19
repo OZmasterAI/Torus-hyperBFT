@@ -131,6 +131,16 @@ fn state_dump(ctx: &NativeExecContext) -> Vec<(String, Vec<u8>, Vec<u8>)> {
 /// Run `batches` through one context (fresh DB) with the given settle mode,
 /// then fingerprint the world.
 fn run_batches(batches: &[Vec<(Address, NativeAction)>], parallel: bool) -> RunFingerprint {
+    run_batches_workers(batches, parallel, None)
+}
+
+/// `run_batches` with the pass-A settle worker cap pinned. `None` = the
+/// production cap (host parallelism / `TORUS_SETTLE_WORKERS`).
+fn run_batches_workers(
+    batches: &[Vec<(Address, NativeAction)>],
+    parallel: bool,
+    settle_workers: Option<usize>,
+) -> RunFingerprint {
     let (_dir, db) = open_test_db();
     let mut ctx = make_ctx(db);
     for n in 1..=32u8 {
@@ -140,7 +150,8 @@ fn run_batches(batches: &[Vec<(Address, NativeAction)>], parallel: bool) -> RunF
     let mut results = Vec::new();
     let mut total_gas = Vec::new();
     for batch in batches {
-        let r = NativeExecutor::execute_batch_settle_mode(&mut ctx, batch, parallel);
+        let r =
+            NativeExecutor::execute_batch_settle_workers(&mut ctx, batch, parallel, settle_workers);
         assert!(
             ctx.fatal_error.is_none(),
             "no batch here may go fatal: {:?}",
@@ -299,6 +310,47 @@ fn parallel_settle_state_identical_to_sequential_50x() {
             "parallel settle diverged from sequential on run {run}"
         );
     }
+}
+
+/// R6 (settle pass A: LPT-chunked workers): pass A no longer spawns one
+/// thread per market — markets are packed into at most `max_workers` chunks
+/// and each worker computes its chunk's plans sequentially. The chunk layout
+/// is a SCHEDULING decision only: pass B still applies plans in market-id
+/// order, so every worker cap — including 1 (fully serial pass A) and a cap
+/// far above the market count (the old thread-per-market shape) — must be
+/// byte-identical to sequential settlement.
+#[test]
+fn parallel_settle_identical_across_worker_caps() {
+    let batches = fuzz_batches(0xC3C3_5EED);
+    let golden = run_batches(&batches, false);
+    assert!(golden.trade_index > 20, "scenario too weak");
+
+    // 6 markets in the fixture: 1 = serial pass A, 2/3/5 = real packing with
+    // multiple markets per worker, 6 = one market per worker, 64 = cap above
+    // the market count (must clamp, no empty workers).
+    for cap in [1usize, 2, 3, 5, 6, 64] {
+        for run in 0..3 {
+            let par = run_batches_workers(&batches, true, Some(cap));
+            assert_eq!(
+                golden, par,
+                "chunked settle diverged from sequential at cap={cap} (run {run})"
+            );
+        }
+    }
+}
+
+/// Same contract on the second seed, and additionally cap-vs-cap (not just
+/// cap-vs-sequential) so a bug that shifted BOTH paths equally still shows.
+#[test]
+fn parallel_settle_worker_cap_invariant_second_seed() {
+    let batches = fuzz_batches(0xDEAD_BEEF_0042);
+    let one = run_batches_workers(&batches, true, Some(1));
+    assert!(one.trade_index > 20, "scenario too weak");
+    for cap in [2usize, 4, 32] {
+        let many = run_batches_workers(&batches, true, Some(cap));
+        assert_eq!(one, many, "settle cap=1 != cap={cap}");
+    }
+    assert_eq!(run_batches(&batches, false), one, "cap=1 != sequential");
 }
 
 /// A second seed, fewer reps — different fill/reject mix, same contract.
