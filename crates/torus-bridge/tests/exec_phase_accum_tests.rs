@@ -66,13 +66,16 @@ fn gtc(market_id: MarketId, is_buy: bool, price: i64, qty: i64) -> PlaceOrderPar
     }
 }
 
-fn place(sender: Address, p: PlaceOrderParams) -> (Address, NativeAction) {
+/// One signed action as `execute_batch` takes them.
+type SignedAction = (Address, NativeAction);
+
+fn place(sender: Address, p: PlaceOrderParams) -> SignedAction {
     (sender, NativeAction::PlaceOrder(p))
 }
 
 /// Three markets, resting ladder then a crossing storm — enough fills that the
 /// parallel settle path engages when forced.
-fn batches() -> (Vec<(Address, NativeAction)>, Vec<(Address, NativeAction)>) {
+fn batches() -> (Vec<SignedAction>, Vec<SignedAction>) {
     let mut seed = Vec::new();
     for m in 1..=3u64 {
         for lvl in 0..4i64 {
