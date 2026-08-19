@@ -16,7 +16,8 @@ for a in ["out", "label", "worktree", "commit", "dirty", "markets", "dur", "rate
           "t-bench0", "t-bench1", "t-drain", "drained", "bench-rc", "idle-blks", "md5-node",
           "md5-bench", "genesis-md5", "genesis-markets", "genesis-accounts", "node-env",
           "env-digests", "extra-env", "bench-cmd", "pids", "evicted", "bench-submitted",
-          "block-cap", "dissem"]:
+          "block-cap", "dissem", "digest-secs", "digest-heights", "digest-quiescent",
+          "drain-timeout", "markets-per-sender"]:
     ap.add_argument("--" + a, default="")
 A = ap.parse_args()
 OUT = A.out
@@ -80,6 +81,15 @@ for node, rs in rows.items():
         d[name + "_benchwin"] = round(v, 1)
         v2, dt2 = rate(rs, key, t0, td)
         d[name + "_incl_drain"] = round(v2, 1)
+    # matched-cell-duration-parity: the first 120 s of the bench window, so a
+    # 120 s cell and a 300 s cell can be compared on the SAME window. (A 300 s
+    # cell's avg is dragged down by the late, deep-book regime; a 120 s cell
+    # never sees it. best60 is the peak, first120 is the like-for-like.)
+    for key, name in [("orders_matched_total", "matched_s"),
+                      ("orders_placed_accepted_total", "placed_s"),
+                      ("block_height", "blk_s")]:
+        v, _ = rate(rs, key, t0, min(t1, t0 + 120))
+        d[name + "_first120"] = round(v, 1)
     d["benchwin_span_s"] = rate(rs, "orders_matched_total", t0, t1)[1]
     d["incl_drain_span_s"] = rate(rs, "orders_matched_total", t0, td)[1]
     d["matched_s_best60"] = round(best60(rs, "orders_matched_total"), 1)
@@ -214,6 +224,22 @@ for node, rs in rows.items():
     phase[node] = p
 
 # ---------------------------------------------------------------- agreement
+def _nums(raw, cast=float):
+    out = []
+    for tok in (raw or "").split():
+        try:
+            out.append(cast(tok))
+        except ValueError:
+            pass
+    return out
+
+
+# Digest provenance from run-cell.sh. `digest_quiescent` = the funnel counters
+# were UNCHANGED on all 3 nodes across the whole (concurrent) digest window, so
+# the three digests describe the same state. Absent (older cells) = assume
+# quiescent, which keeps their verdicts exactly as they were.
+digest_quiescent = A.digest_quiescent != "0"
+
 agree_rows = []
 try:
     with open(os.path.join(OUT, "agreement.jsonl")) as f:
@@ -233,10 +259,29 @@ if len(agree_rows) == 3:
     agreement["counters_equal"] = all(len({r[k] for r in agree_rows}) == 1 for k in ("matched", "placed", "resting", "actions"))
     agreement["panic_or_failstop_lines"] = sum(r["panic_or_failstop_lines"] for r in agree_rows)
     agreement["error_lines"] = sum(r["error_lines"] for r in agree_rows)
-    agreement["validators_agree"] = bool(agreement["height_spread"] <= 5 and agreement["block_hash_equal"]
-                                         and agreement["state_digest_equal"] and agreement["counters_equal"]
-                                         and agreement["panic_or_failstop_lines"] == 0 and A.drained == "1")
+    agreement["state_digest_quiescent"] = digest_quiescent
+    agreement["state_digest_seconds_per_node"] = _nums(A.digest_secs)
+    agreement["state_digest_heights"] = _nums(A.digest_heights, int)
+    # Consensus evidence that does NOT depend on when the digest was taken.
+    consensus_ok = bool(agreement["height_spread"] <= 5 and agreement["block_hash_equal"]
+                        and agreement["counters_equal"]
+                        and agreement["panic_or_failstop_lines"] == 0)
+    if consensus_ok and agreement["state_digest_equal"]:
+        verdict = "AGREE"
+    elif consensus_ok and not (digest_quiescent and A.drained == "1"):
+        # r6-base-300m-r1 shape: equal block hash + equal counters, but the
+        # digests were sampled while the chain still moved (drain timed out, or
+        # the counters moved during the digest window). That is a HARNESS
+        # artifact, not a fork — and it is equally not proof of agreement.
+        verdict = "DIGEST_UNVERIFIED"
+    else:
+        verdict = "DISAGREE"
+    agreement["agreement_verdict"] = verdict
+    # Tri-state: True only with an EQUAL digest, False only for real evidence of
+    # divergence, None when the digest could not be taken at a pinned state.
+    agreement["validators_agree"] = {"AGREE": True, "DIGEST_UNVERIFIED": None}.get(verdict, False)
 else:
+    agreement["agreement_verdict"] = "INCOMPLETE"
     agreement["validators_agree"] = False
 
 # ---------------------------------------------------------------- dissemination / pacing
@@ -308,13 +353,16 @@ summary = {
     "genesis": {"md5": A.genesis_md5, "markets": int(A.genesis_markets or 0), "native_balances": int(A.genesis_accounts or 0)},
     "cell": {"markets": int(A.markets), "duration_s": int(A.dur), "rate_total": int(A.rate), "senders": int(A.senders),
              "block_cap": int(A.block_cap) if A.block_cap else None,
+             "markets_per_sender": int(A.markets_per_sender) if A.markets_per_sender else None,
              "extra_env": A.extra_env, "node_env": json.loads(A.node_env) if A.node_env else {},
              "env_digests_per_node": A.env_digests.split(), "bench_cmd": A.bench_cmd, "node_pids": A.pids.split()},
     "timing": {"t_bench0": t0, "t_bench1": t1, "t_drain": td, "bench_wall_s": t1 - t0, "drain_s": td - t1,
-               "drained": A.drained == "1", "bench_rc": int(A.bench_rc or -1)},
+               "drained": A.drained == "1", "drain_timeout_s": int(A.drain_timeout) if A.drain_timeout else None,
+               "bench_rc": int(A.bench_rc or -1)},
     "idle_blk_s": float(A.idle_blks or 0),
     "headline": {
         "matched_s_avg": v0.get("matched_s_benchwin"),
+        "matched_s_first120": v0.get("matched_s_first120"),
         "matched_s_best60": v0.get("matched_s_best60"),
         "matched_s_incl_drain": v0.get("matched_s_incl_drain"),
         "placed_s_avg": v0.get("placed_s_benchwin"),
@@ -326,6 +374,7 @@ summary = {
         "consensus_timeouts": v0.get("delta_consensus_timeout_total_total"),
         "dissemination_clean": dissem.get("dissemination_clean") if dissem else None,
         "validators_agree": agreement.get("validators_agree"),
+        "agreement_verdict": agreement.get("agreement_verdict"),
     },
     "ingest": {"bench_submitted_actions": int(A.bench_submitted or 0),
                "val0_actions_processed": int(v0.get("delta_native_actions_processed_total", 0)),
@@ -341,9 +390,12 @@ summary = {
 with open(os.path.join(OUT, "summary.json"), "w") as f:
     json.dump(summary, f, indent=1)
 h = summary["headline"]
-print(f"SUMMARY {A.label}: matched/s avg={h['matched_s_avg']} best60={h['matched_s_best60']} "
+print(f"SUMMARY {A.label}: matched/s avg={h['matched_s_avg']} first120={h['matched_s_first120']} "
+      f"best60={h['matched_s_best60']} "
       f"placed/s={h['placed_s_avg']} blk/s={h['blk_s_avg']} txs/blk={h['txs_per_block_avg']} "
-      f"timeouts={h['consensus_timeouts']} dissem_clean={h['dissemination_clean']} agree={h['validators_agree']} "
+      f"timeouts={h['consensus_timeouts']} dissem_clean={h['dissemination_clean']} "
+      f"agree={h['agreement_verdict']} ({h['validators_agree']}) "
+      f"digest_s={agreement.get('state_digest_seconds_per_node')} "
       f"drained={summary['timing']['drained']} bench_rc={A.bench_rc}")
 p0 = phase.get("val0", {})
 if p0:

@@ -17,6 +17,18 @@ tools/matched-bench/run-cell.sh /home/18c/projects/wt/matched-bench base-10m-r1 
 tools/matched-bench/run-cell.sh /home/18c/projects/wt/matched-bench nosettle-r1 10 300 76000 'TORUS_PARALLEL_SETTLE=0'
 ```
 
+300-market cell (locality shape, 3 markets per sender):
+
+```
+MPS=3 tools/matched-bench/run-cell.sh /home/18c/projects/wt/matched-bench loc3-300m-r1 300 120 76000
+```
+
+Harness self-test (offline, ~8 s, no devnet / no cargo):
+
+```
+python3 tools/matched-bench/test_harness.py
+```
+
 ## What it does, in order
 
 1. Pre-flight: refuses to run if a bench, a `cargo build`, or a devnet is
@@ -66,32 +78,89 @@ tools/matched-bench/run-cell.sh /home/18c/projects/wt/matched-bench nosettle-r1 
    --batch-size 400 --submit-batch 1 --format bin --concurrency 256 --duration D
    --target-margin 1500 --cross-fraction 0.5 --cancel-fraction 0.05 --band 5
    --rate-total R`. Override `SENDERS`, `CONC`, `BATCH`, `SUBMIT` via env.
+   `MPS=K` appends `--markets-per-sender K` (LOCALITY shape, see below) and is
+   recorded as `cell.markets_per_sender`; unset = flag omitted = the uniform
+   shape every campaign cell so far used. `MPS` needs a `bench-throughput` built
+   at or after `cand/r6-harness-300m-digest-and-parity` — **rebuild the bench
+   binary before using it.**
 8. Drain: waits until placed/matched/actions/resting counters are UNCHANGED on all
-   3 nodes for `QUIET_S` (10) consecutive seconds with exec queue 0 (the mempool
-   / exec-queue gauges alone read 0 while actions are still in flight — the
-   first smoke run proved that).
+   3 nodes for `QUIET_S` (10) consecutive seconds (the mempool / exec-queue
+   gauges alone read 0 while actions are still in flight — the first smoke run
+   proved that; idle empty blocks keep exec queue at 1-2, so it is not required
+   to be 0). `DRAIN_TIMEOUT` defaults to `180 + 2*MARKETS` s — 180 s is enough
+   at 10 markets and far too short at 300 (r6-base-300m-r1 ended `drained=0`
+   with ~20.8k nonce-expired evictions per node, and the digest taken on top of
+   that was worthless).
 9. Agreement (`agreement.jsonl`): heights, block hash + header stateRoot at
    `min(height)-5` via `eth_getBlockByNumber` on every node, a sha256 state
    digest per node (every market's `torus_getOrderBook` + `torus_getOpenInterest`
    + `torus_getBalances` of 50 bench senders), matched/placed/resting/actions
    counters (must be identical), `panicked|FAIL-STOP` and `ERROR` line counts.
-   `validators_agree` = spread<=5 AND hashes equal AND digests equal AND
-   counters equal AND zero panic/fail-stop AND drained. NOTE: the executed
-   native state root is not exposed by RPC/metrics (headers carry the parent's
-   root, 0x0 on this branch), so the RPC state digest is the determinism check.
+   NOTE: the executed native state root is not exposed by RPC/metrics (headers
+   carry the parent's root, 0x0 on this branch), so the RPC state digest is the
+   determinism check.
+
+   **The digest is only evidence if all 3 nodes are digested over the same
+   state.** `digest-node.sh` fans one node's per-market/per-account RPCs out
+   `DIGEST_PAR` (8) ways while keeping the stream in market-id order (part files
+   concatenated in glob order, never completion order — pinned by
+   `test_harness.py`), `run-cell.sh` runs all three nodes CONCURRENTLY, and the
+   funnel counters are snapshotted either side of that window. 300 markets: ~4
+   min/node serial -> well under 1 min/node, all three inside one window.
+   Per-RPC timeout is `RPC_TIMEOUT` (60 s, was 10 s).
+
+   Verdict (`agreement.agreement_verdict`, mirrored in `headline`):
+
+   | verdict | meaning | `validators_agree` |
+   |---|---|---|
+   | `AGREE` | spread<=5, hashes equal, counters equal, **digests equal**, no panic/fail-stop | `true` |
+   | `DIGEST_UNVERIFIED` | all of the above except the digest, AND the digest window was not quiescent (counters moved) or the cell never drained | `null` |
+   | `DISAGREE` | anything else — hash/counter/height divergence, panic, or unequal digests taken over a pinned state | `false` |
+   | `INCOMPLETE` | fewer than 3 node rows | `false` |
+
+   `AGREE` is never reported without an equal digest. `DIGEST_UNVERIFIED` is the
+   r6-base-300m-r1 shape (equal block hash + equal counters, digests sampled
+   minutes apart while the chain still moved): a harness artifact, so it is NOT
+   `false`, but it is NOT proof of determinism either — such a cell must be
+   re-run before any determinism claim. `agreement` also carries
+   `state_digest_quiescent`, `state_digest_seconds_per_node` and
+   `state_digest_heights`; `timing` carries `drained` + `drain_timeout_s`.
 10. `stop-3val.sh`; node logs gzipped into the result dir + an excerpt.
 11. `summarize.py` -> `summary.json` (+ `analysis-valN.txt` from the awk scripts).
 
 ## Result dir `/home/18c/bench-results-matched/<label>/`
 
 `summary.json` keys: `headline` (matched_s_avg = window average over the bench
-window on val0, matched_s_best60 = best sliding 60 s over the whole sample,
-placed_s_avg, blk_s_avg, blk_s_worst60, peak_exec_queue_depth, validators_agree),
+window on val0, matched_s_first120 = the SAME average restricted to the first
+120 s of the bench window, matched_s_best60 = best sliding 60 s over the whole
+sample, placed_s_avg, blk_s_avg, blk_s_worst60, peak_exec_queue_depth,
+validators_agree, agreement_verdict),
 `funnel_by_node`, `phase_by_node` (per-NATIVE-block ms and % of block / % of wall
 for evm, verify, replay_guard, load_books, engine[margin/match/settle],
 save_books, flush[root/state_write/evm_resync], body_persist, residual;
 exec_thread_busy_fraction; wall ms per committed block), `agreement`, `cpu`,
 `cell` (env, bench cmd), `binaries`, `genesis`, `timing`, `bench_log_tail`.
+
+## Cell-duration parity (`first120`)
+
+A 300 s cell's `matched_s_avg` is dragged down by the late deep-book regime a
+120 s cell never reaches, so the two durations are NOT comparable on `avg`.
+Every summary therefore also carries `matched_s_first120` / `placed_s_first120`
+/ `blk_s_first120` (same counter deltas, window `[t_bench0, t_bench0+120]`) —
+compare cells of different durations on `first120`, never on `avg`. On a 120 s
+cell `first120 == avg` by construction. `resummarize.sh <dir>` backfills these
+onto any existing result dir.
+
+## Load-shape locality (`--markets-per-sender` / `MPS`)
+
+By default every ORDER draws its market uniformly from `1..=MARKETS`, so all
+5000 senders touch all 300 books and every block dirties every book. `MPS=K`
+gives sender `i` the fixed set `((i*K + j) mod MARKETS) + 1, j in 0..K` instead:
+deterministic (pure function of the sender index, identical across reps and
+processes), K distinct ids, and every market owned by within-one the same number
+of senders — so no book goes dead. `K >= MARKETS` degenerates to the uniform
+shape; `K = 0` (default) IS the uniform shape. Pinned by `market_plan_tests` in
+`tools/bench-throughput/src/main.rs`.
 
 ## Rules baked in
 
@@ -99,7 +168,10 @@ exec_thread_busy_fraction; wall ms per committed block), `agreement`, `cpu`,
   never placed/s (cheap resting orders — the p3 trap).
 - n=1 is not a result: run >=2 reps per cell.
 - Never two benches at once; never build while a bench runs (pre-flight guards).
-- Determinism is sacred: `validators_agree=false` = candidate REJECTED.
+- Determinism is sacred: `agreement_verdict=DISAGREE` = candidate REJECTED.
+  `DIGEST_UNVERIFIED` is not a rejection and not an acceptance — re-run the cell.
+- Compare cells of equal duration on `matched_s_avg`; compare across durations
+  on `matched_s_first120`.
 
 ## RocksDB write-stall attribution (r3 exec-write-stall-attribution)
 
