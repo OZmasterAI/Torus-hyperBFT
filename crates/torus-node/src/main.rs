@@ -534,6 +534,24 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         ..MempoolConfig::default()
     };
     let mempool = Arc::new(Mempool::new(state_db.clone(), mempool_config));
+    // r4: log the effective native block-selection bundle + direct-push floor
+    // once at startup so a bench/ops snapshot (`nodeenv-*.txt`, journal) shows
+    // the caps this proposer actually runs. All of these are proposer-local
+    // selection policy / node-local sizing / transport send policy —
+    // validate_block rejects on none of them, so mixed values across the
+    // fleet cannot fork; the log exists so a mixed fleet is VISIBLE, not to
+    // gate anything.
+    {
+        use torus_mempool::rate_limit as rl;
+        info!(
+            native_total_block_cap = rl::native_total_block_cap(),
+            native_orders_per_block_cap = rl::native_orders_per_block_cap(),
+            native_block_bytes_cap = rl::native_block_bytes_cap(),
+            verified_sender_cache_cap = rl::verified_sender_cache_cap(),
+            direct_push_body_bytes = torus_network::caps::direct_push_body_bytes(),
+            "native block-selection caps (proposer-local; compiled default = r3 cap-200 bundle)"
+        );
+    }
 
     let signing_key_for_app = if !cli.rpc_only {
         Some(signing_key.clone())
@@ -695,6 +713,15 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     .collect();
                 network_for_pre_proposal.broadcast_native_action_hashes(hashes);
             } else {
+                // r4: one INFO line per full-body push (mirrors the manifest
+                // path's line in swarm.rs) so a bench can count which
+                // dissemination mode each proposal took and see the body-set
+                // size against the direct-push floor.
+                tracing::info!(
+                    count = bundle.actions.len(),
+                    bytes = payload.len(),
+                    "pre-proposal FULL-BODY push (under the direct-push floor)"
+                );
                 network_for_pre_proposal.broadcast_native_actions(payload);
             }
         }
