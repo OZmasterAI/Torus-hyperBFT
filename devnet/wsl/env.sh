@@ -36,14 +36,22 @@ PEER_TO_V1=/ip4/127.0.0.1/udp/$P2P1/quic-v1/p2p/$PID1
 
 # node runtime env — mirror the S415/S458 devnet body-push tuning so a later
 # bench run (A3) executes against the same consensus config as idle bring-up.
-export TORUS_HASH_ONLY_PUSH_THRESHOLD="${TORUS_HASH_ONLY_PUSH_THRESHOLD:-6000000}"
-export TORUS_NATIVE_TOTAL_BLOCK_CAP="${TORUS_NATIVE_TOTAL_BLOCK_CAP:-100}"
-# Block-cap-raise sweep (r2): raising the cap above 100 needs the companion caps
-# that bind first at bs400 — TORUS_NATIVE_ORDERS_PER_BLOCK_CAP (50k default =
-# 125 actions x 400), TORUS_NATIVE_BLOCK_BYTES_CAP (6 MB, touched at cap 200) and,
-# on binaries older than r2, TORUS_VERIFIED_SENDER_CACHE_CAP (64 x cap x 2.5).
-# tools/matched-bench/run-cell.sh BLOCK_CAP=N exports the coherent bundle; the
-# compiled default stays 100 until a full-mesh bench earns the raise.
+# r4: the direct-push body floor is 8 MB (torus_network::caps
+# DIRECT_PUSH_BODY_BYTES, env TORUS_DIRECT_PUSH_BODY_BYTES; was the pinned 4 MB
+# pre-O5 fleet floor that clamped the old 6000000 here to 4 MB), so the
+# threshold is set AT the floor: every pre-proposal body set the codec can
+# carry (cap 200 ~5.6 MB, cap 300 ~7-8 MB at bs400) is pushed directly; only
+# larger sets fall back to the HASH manifest + chunked pull.
+export TORUS_HASH_ONLY_PUSH_THRESHOLD="${TORUS_HASH_ONLY_PUSH_THRESHOLD:-8000000}"
+# r4: the compiled default IS the r3 cap-200 bundle (NATIVE_TOTAL_BLOCK_CAP 200,
+# ORDERS_PER_BLOCK 100k, BLOCK_BYTES 12 MB, trust-cache 32k) — leave the cap
+# UNSET here so the node runs its compiled default; export
+# TORUS_NATIVE_TOTAL_BLOCK_CAP=100 (or run-cell.sh BLOCK_CAP=100) for the
+# cap-100 control. All of these are proposer-local selection policy /
+# node-local sizing (validate_block rejects on none) — mixed values cannot fork.
+# tools/matched-bench/run-cell.sh BLOCK_CAP=N still exports the coherent bundle
+# for sweep cells (BLOCK_CAP=200 == the compiled defaults, byte-for-byte).
+if [ -n "${TORUS_NATIVE_TOTAL_BLOCK_CAP:-}" ]; then export TORUS_NATIVE_TOTAL_BLOCK_CAP; fi
 # perf A1 (landed 8fa6ccd): skip shard custody in the execute_batch funnel.
 export TORUS_SHARD_CUSTODY="${TORUS_SHARD_CUSTODY:-0}"
 # mode-2 save-books parallel drain (node-local, byte-identical): default ON at
