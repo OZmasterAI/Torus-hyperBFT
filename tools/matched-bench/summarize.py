@@ -267,6 +267,10 @@ if dissem:
     fail_keys = ("exhausted", "sync_fallback", "da_outbound_fail", "starvation")
     dissem["total_failures"] = sum((d.get(k) or 0) for n, d in dissem.items() if n.startswith("val") for k in fail_keys)
     dissem["total_manifest_pushes"] = sum((d.get("manifest") or 0) for n, d in dissem.items() if n.startswith("val"))
+    # r4: full-body (direct) pushes vs manifest pushes = which dissemination path
+    # the proposals took; body_push_max_bytes vs the 8 MB direct-push floor.
+    dissem["total_body_pushes"] = sum((d.get("body_push") or 0) for n, d in dissem.items() if n.startswith("val"))
+    dissem["body_push_max_bytes"] = max([(d.get("body_push_max_bytes") or 0) for n, d in dissem.items() if n.startswith("val")] or [0])
     dissem["total_pacing_lines"] = sum((d.get("pacing") or 0) for n, d in dissem.items() if n.startswith("val"))
     dissem["dissemination_clean"] = dissem["total_failures"] == 0
 

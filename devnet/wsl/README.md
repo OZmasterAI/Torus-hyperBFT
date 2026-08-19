@@ -45,8 +45,9 @@ CLEAN=1 ./devnet/wsl/launch-3val.sh
 ```
 
 `WINDOW=30` (health scrape gap) and `DATA_ROOT=$HOME/torus-wsl-devnet` are
-overridable via env. The node runtime env (`TORUS_HASH_ONLY_PUSH_THRESHOLD=6000000`,
-`TORUS_NATIVE_TOTAL_BLOCK_CAP=100`) is set in `env.sh` to match the S415/S458
+overridable via env. The node runtime env (`TORUS_HASH_ONLY_PUSH_THRESHOLD=8000000` — at the r4
+8 MB direct-push floor; the block cap is left at the compiled r4 default of 200 unless
+`TORUS_NATIVE_TOTAL_BLOCK_CAP` is exported) is set in `env.sh`, evolved from the S415/S458
 devnet body-push tuning so a later bench (A3) runs against the same config.
 
 ## Notes for the funnel bench (A3)

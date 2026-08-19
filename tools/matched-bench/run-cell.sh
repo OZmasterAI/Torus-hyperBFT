@@ -28,8 +28,10 @@
 #                would otherwise bind first — see block_cap_bundle below).
 #                Applied after RECORD_ENV and before EXTRA_ENV, so EXTRA_ENV
 #                can still override any single knob. DEFAULT 200 since the r3
-#                merge (block-cap-raise-sweep winner); BLOCK_CAP=100 is the
-#                cap-100 control (reproduces the compiled node defaults exactly).
+#                merge (block-cap-raise-sweep winner); since r4 the COMPILED
+#                node defaults ARE the cap-200 bundle (BLOCK_CAP=200 exports
+#                exactly the compiled values); BLOCK_CAP=100 is the pre-r4
+#                cap-100 control.
 #   OVERWRITE=1  allow reusing an existing non-empty results dir
 #   HEALTH_TIMEOUT (240 s)  DRAIN_TIMEOUT (180 s)
 set -uo pipefail
@@ -95,10 +97,13 @@ RECORD_ENV=(
 #   TORUS_NATIVE_BLOCK_BYTES_CAP       6 MB default; N*BATCH*~70 B touches it at
 #       N=200 => max(6 MB, N*BATCH*150 B) CAPPED at 12 MB — MAX_BLOCK_DATA_MSG_SIZE
 #       (block-data sync codec) is 16 MB, a body above it could never be synced.
-# NOT touched: TORUS_HASH_ONLY_PUSH_THRESHOLD (env.sh 6 MB, clamped to the 4 MB
-# fleet floor) — bodies above ~4 MB (N>=150 at bs400) go out as a HASH manifest
-# and are PULLED (the S387-hardened path); the dissemination counters below
-# (manifest pushes / body-fetch exhaustion / sync fallbacks) record the cost.
+# NOT touched: TORUS_HASH_ONLY_PUSH_THRESHOLD — r4 raised the direct-push body
+# floor 4 MB -> 8 MB (TORUS_DIRECT_PUSH_BODY_BYTES) and env.sh sets the
+# threshold AT it (8000000), so cap-200/300 body sets (~5.6-8 MB at bs400) stay
+# on the direct push path; only larger sets go out as a HASH manifest and are
+# PULLED (the S387-hardened path). The dissemination counters below (manifest
+# pushes / body-fetch exhaustion / sync fallbacks) record which path a cell took;
+# EXTRA_ENV='TORUS_DIRECT_PUSH_BODY_BYTES=4194304' reproduces the pre-r4 clamp.
 block_cap_bundle() { # $1=N -> prints K=V lines
     local n=$1 orders bytes cache
     orders=$(( n * BATCH * 5 / 4 )); [ "$orders" -lt 50000 ] && orders=50000
@@ -108,8 +113,12 @@ block_cap_bundle() { # $1=N -> prints K=V lines
         "$n" "$orders" "$cache" "$bytes"
 }
 # r3 merge: the harness defaults to the block-cap-raise-sweep winner (cap 200).
-# The compiled node default stays 100 (WAN dissemination guard — the raise is
-# env-only until a full-mesh bench earns it); BLOCK_CAP=100 = control cell.
+# r4: the compiled node defaults are now that same bundle (rate_limit.rs
+# NATIVE_TOTAL_BLOCK_CAP 200 / ORDERS_PER_BLOCK 100_000 / BLOCK_BYTES 12 MB /
+# derived trust-cache 32_000 — unit-pinned against this function's N=200 output
+# in rate_limit.rs `compiled_defaults_reproduce_the_r3_cap200_bundle`), so the
+# BLOCK_CAP=200 export is a no-op on r4+ binaries and keeps OLDER binaries
+# equivalent; BLOCK_CAP=100 = the pre-r4 control cell.
 BLOCK_CAP=${BLOCK_CAP:-200}
 if [ -n "$BLOCK_CAP" ]; then
     [[ "$BLOCK_CAP" =~ ^[0-9]+$ ]] && [ "$BLOCK_CAP" -ge 1 ] || { echo "FATAL: BLOCK_CAP must be a positive integer" >&2; exit 2; }
@@ -377,6 +386,8 @@ log "ingest: bench submitted=${BENCH_SUBMITTED:-?} actions; mempool nonce-expire
 # Body-dissemination / exec-pacing accounting per node (block-cap-raise sweep:
 # a raised cap is REJECTED if bodies stop disseminating, whatever matched/s says).
 #   manifest = pre-proposal HASH-ONLY manifest pushes (body set over the push floor)
+#   body_push = pre-proposal FULL-BODY pushes (r4 log line; body set under the floor)
+#   body_push_max_bytes = largest full-body push payload seen (vs the 8 MB floor)
 #   exhausted = body fetch exhausted retries / no remaining targets -> sync fallback
 #   sync_fallback = any "falling back to sync" (body or justify)
 #   da_outbound_fail = native-da / block-data OUTBOUND FAILURE
@@ -386,12 +397,13 @@ DISSEM=""
 for i in 0 1 2; do
     lg=$(sed -E 's/\x1b\[[0-9;]*m//g' "$RUN_DIR/val$i.log" 2>/dev/null)
     cnt() { printf '%s' "$lg" | grep -c -E "$1"; }
-    DISSEM="$DISSEM val$i:manifest=$(cnt 'HASH-ONLY manifest push'),exhausted=$(cnt 'body fetch (exhausted|has no remaining targets)'),sync_fallback=$(cnt 'falling back to sync'),da_outbound_fail=$(cnt '(native-da|block-data) OUTBOUND FAILURE'),starvation=$(cnt 'header-first body starvation'),pacing=$(cnt 'exec-backlog pacing')"
+    bpmax=$(printf '%s' "$lg" | grep -E 'FULL-BODY push' | grep -oE 'bytes=[0-9]+' | cut -d= -f2 | sort -n | tail -1); bpmax=${bpmax:-0}
+    DISSEM="$DISSEM val$i:manifest=$(cnt 'HASH-ONLY manifest push'),body_push=$(cnt 'FULL-BODY push'),body_push_max_bytes=$bpmax,exhausted=$(cnt 'body fetch (exhausted|has no remaining targets)'),sync_fallback=$(cnt 'falling back to sync'),da_outbound_fail=$(cnt '(native-da|block-data) OUTBOUND FAILURE'),starvation=$(cnt 'header-first body starvation'),pacing=$(cnt 'exec-backlog pacing')"
 done
 DISSEM=${DISSEM# }
 log "dissemination/pacing log counts: $DISSEM"
 for i in 0 1 2; do
-    grep -E ' ERROR | WARN |panicked|FAIL-STOP|fail-stop|book mode|resident|parallel|member cache|commit-lag|S470|manifest|body fetch|OUTBOUND FAILURE|exec-backlog pacing' "$RUN_DIR/val$i.log" | head -400 > "$OUT/val$i.log.excerpt"
+    grep -E ' ERROR | WARN |panicked|FAIL-STOP|fail-stop|book mode|resident|parallel|member cache|commit-lag|S470|manifest|FULL-BODY push|native block-selection caps|body fetch|OUTBOUND FAILURE|exec-backlog pacing' "$RUN_DIR/val$i.log" | head -400 > "$OUT/val$i.log.excerpt"
     gzip -c "$RUN_DIR/val$i.log" > "$OUT/val$i.log.gz"
 done
 
