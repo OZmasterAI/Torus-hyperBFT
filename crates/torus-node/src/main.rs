@@ -549,7 +549,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             native_block_bytes_cap = rl::native_block_bytes_cap(),
             verified_sender_cache_cap = rl::verified_sender_cache_cap(),
             direct_push_body_bytes = torus_network::caps::direct_push_body_bytes(),
-            "native block-selection caps (proposer-local; compiled default = r3 cap-200 bundle)"
+            parallel_bucket_hash_threads = torus_state::native_trie::parallel_bucket_hash_threads(),
+            "native block-selection caps (proposer-local; compiled default = r3 cap-200 bundle) + root bucket-hash workers (node-local, value-neutral; default 8)"
         );
     }
 

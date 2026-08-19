@@ -563,8 +563,10 @@ fn read_bucket_members(db: &StateDb, bucket: u16) -> Result<Members, StateError>
 // ============================================================================
 //
 // Both cut the PER-BUCKET term of native-root maintenance (mirror scan + keccak
-// + path), are node-local + VALUE-NEUTRAL (persisted bytes AND the root are
-// byte-identical to the serial/uncached path for any input), and default OFF.
+// + path) and are node-local + VALUE-NEUTRAL (persisted bytes AND the root are
+// byte-identical to the serial/uncached path for any input). The parallel
+// rehash defaults ON at [`DEFAULT_BUCKET_HASH_THREADS`] workers (matched-200k
+// r5 sweep); the member cache still defaults OFF.
 //
 // PARALLELISM & DETERMINISM: dirty buckets are independent, so each bucket's
 // member-merge + leaf hash is computed on a worker thread (scoped threads — the
@@ -597,9 +599,23 @@ pub(crate) type Members = BTreeMap<(u8, Vec<u8>), B256>;
 /// Hard cap on `TORUS_PARALLEL_BUCKET_HASH` worker threads.
 const MAX_BUCKET_HASH_THREADS: usize = 64;
 
+/// Compiled default for `TORUS_PARALLEL_BUCKET_HASH` (unset / garbage).
+///
+/// matched-200k r5 `root-and-save-workers-sweep` (2026-08-19, 3-validator
+/// devnet, 10 markets, cap 200, mode 3): 8 workers = 48.2k matched/s avg
+/// (n=3) vs 43.5k (n=3) at the previous harness value 4 = **+10.8 %**, state
+/// digests equal on all 3 nodes; 12 workers only +3 % more. The parallel
+/// path is value-neutral (root byte-identical to serial for any thread
+/// count), so this is node-local tuning, not consensus. Set `"1"` (or `"0"`)
+/// to opt back into the serial path; `TORUS_BUCKET_HASH_MIN_BUCKETS` still
+/// gates engagement on the dirty-set size (l3-diagnosis §1: at ~226 dirty
+/// buckets scoped-thread spawn cost ~2 ms/flush can outweigh the win).
+pub const DEFAULT_BUCKET_HASH_THREADS: usize = 8;
+
 /// `TORUS_PARALLEL_BUCKET_HASH` = worker-thread count for dirty-bucket leaf
-/// hashing. `>= 2` enables the parallel path (capped at [`MAX_BUCKET_HASH_THREADS`]);
-/// unset / `"1"` / garbage → `1` (serial = exact-today). Read once per process.
+/// hashing. `>= 2` = that many workers (capped at [`MAX_BUCKET_HASH_THREADS`]);
+/// `"1"` / `"0"` = serial; unset / garbage = [`DEFAULT_BUCKET_HASH_THREADS`].
+/// Read once per process.
 pub fn parallel_bucket_hash_threads() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| parse_parallel_threads(std::env::var("TORUS_PARALLEL_BUCKET_HASH").ok()))
@@ -609,7 +625,8 @@ pub fn parallel_bucket_hash_threads() -> usize {
 fn parse_parallel_threads(v: Option<String>) -> usize {
     match v.as_deref().map(str::trim).and_then(|s| s.parse::<usize>().ok()) {
         Some(n) if n >= 2 => n.min(MAX_BUCKET_HASH_THREADS),
-        _ => 1,
+        Some(_) => 1,
+        None => DEFAULT_BUCKET_HASH_THREADS,
     }
 }
 
@@ -1910,14 +1927,23 @@ mod tests {
     // ---- rank-root round-3: parallel rehash + bucket-member cache gates ----
 
     #[test]
-    fn round3_parse_parallel_threads_default_off_and_capped() {
-        assert_eq!(parse_parallel_threads(None), 1);
+    fn round3_parse_parallel_threads_default_on_and_capped() {
+        // matched-200k r5 sweep: unset => the compiled default (8 workers,
+        // +10.8 % matched/s n=3 vs n=3 at cap 200, agreement clean).
+        assert_eq!(DEFAULT_BUCKET_HASH_THREADS, 8);
+        assert_eq!(parse_parallel_threads(None), DEFAULT_BUCKET_HASH_THREADS);
+        // explicit "1" / "0" = serial opt-out (the pre-r5 "off" path)
         assert_eq!(parse_parallel_threads(Some("1".into())), 1);
+        assert_eq!(parse_parallel_threads(Some("0".into())), 1);
         assert_eq!(parse_parallel_threads(Some(" 6 ".into())), 6);
         assert_eq!(parse_parallel_threads(Some("2".into())), 2);
-        // garbage / non-positive → serial
-        for v in ["0", "-3", "on", "", "x", "true"] {
-            assert_eq!(parse_parallel_threads(Some(v.into())), 1, "{v}");
+        // garbage => the compiled default (same idiom as the block-cap env knobs)
+        for v in ["-3", "on", "", "x", "true"] {
+            assert_eq!(
+                parse_parallel_threads(Some(v.into())),
+                DEFAULT_BUCKET_HASH_THREADS,
+                "{v}"
+            );
         }
         // capped
         assert_eq!(

@@ -56,6 +56,14 @@ TORUS_COMMIT_LAG_BACKOFF_CAP=8`, plus since the r3 merge the `BLOCK_CAP=200` bun
 (`TORUS_NATIVE_TOTAL_BLOCK_CAP=200 TORUS_NATIVE_ORDERS_PER_BLOCK_CAP=100000
 TORUS_NATIVE_BLOCK_BYTES_CAP=12000000 TORUS_VERIFIED_SENDER_CACHE_CAP=32000`).
 
+> **Post-campaign (2026-08-19):** two of these were promoted to compiled defaults on
+> `perf/matched-200k` — the cap-200 bundle (r4 commits: `NATIVE_TOTAL_BLOCK_CAP` 200 /
+> `ORDERS_PER_BLOCK` 100_000 / `BLOCK_BYTES` 12 MB / trust-cache 32_000 / 8 MB direct-push
+> floor) and `TORUS_PARALLEL_BUCKET_HASH` unset = **8** (`DEFAULT_BUCKET_HASH_THREADS`; `"1"`
+> = serial opt-out). The runner still exports both so env-only cells on older binaries stay
+> equivalent; `BLOCK_CAP=100` / `EXTRA_ENV='TORUS_PARALLEL_BUCKET_HASH=4'` are the pre-flip
+> controls. Mode 3 / resident books / root cache / parallel settle / member cache remain env.
+
 Cell discipline: candidate cells 10 markets / 120 s, >= 2 reps, same-binary control where the
 change is env-gated; the merged head is confirmed with one 300 s cell; markets-track items add
 300-market / 120 s cells. Results: `/home/18c/bench-results-matched/<label>/summary.json`.

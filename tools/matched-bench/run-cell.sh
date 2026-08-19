@@ -73,12 +73,18 @@ RUN_DIR="$DATA_ROOT/run"
 # stays Classic (unset). EXTRA_ENV entries are applied AFTER these, so a cell
 # can override any of them (e.g. EXTRA_ENV='TORUS_BOOK_ROWS=2' for a mode-2
 # control, or 'TORUS_PARALLEL_SETTLE=0').
+# TORUS_PARALLEL_BUCKET_HASH: 4 -> 8 after the r5 root-and-save-workers sweep
+# (+10.8 % n=3 vs n=3, agreement clean); 8 is ALSO the compiled default now
+# (DEFAULT_BUCKET_HASH_THREADS), the explicit export keeps env-only cells on
+# OLDER binaries equivalent. EXTRA_ENV='TORUS_PARALLEL_BUCKET_HASH=4' = the
+# pre-r5 control; '=1' = serial. Leave TORUS_SAVE_BOOKS_WORKERS at the host
+# default (4 is a -34 % cliff, r5).
 RECORD_ENV=(
     TORUS_BOOK_ROWS=3
     TORUS_RESIDENT_BOOKS=1
     TORUS_NATIVE_ROOT_CACHE=1
     TORUS_PARALLEL_SETTLE=1
-    TORUS_PARALLEL_BUCKET_HASH=4
+    TORUS_PARALLEL_BUCKET_HASH=8
     TORUS_BUCKET_MEMBER_CACHE_MB=256
     TORUS_COMMIT_LAG_BACKOFF_CAP=8
 )
