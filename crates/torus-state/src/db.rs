@@ -27,14 +27,204 @@ pub const KECCAK_EMPTY: B256 = B256::new([
 #[derive(Clone)]
 pub struct StateDb {
     db: Arc<DB>,
+    /// The DB-wide `Options` the instance was opened with, kept alive so the
+    /// RocksDB `Statistics` object it owns (tickers + histograms) can be read
+    /// at runtime (`runtime_stats`). `None` for wrapped/read-only handles.
+    opts: Option<Arc<Options>>,
+    /// Statistics level the instance was opened with (0 = none, 1 = tickers,
+    /// 2 = tickers + histograms). Decides which parts of `runtime_stats` are
+    /// meaningful.
+    stats_level: u8,
+}
+
+/// r3 exec-write-stall-attribution: node-local RocksDB tuning read once at DB
+/// open. Every default is EXACT-TODAY except `stats_level` (tickers on so the
+/// stall / write-group counters are scrapeable). None of these affect the
+/// on-disk format or consensus state — they change only when a write waits.
+///
+/// Env:
+/// - `TORUS_ROCKSDB_STATS` — `0` off, `1` tickers only (default), `2` RocksDB's
+///   own default level (`ExceptDetailedTimers`: adds the db.write / write.stall
+///   / flush / compaction histograms at the cost of two clock reads per op).
+/// - `TORUS_ROCKSDB_L0_SLOWDOWN` / `TORUS_ROCKSDB_L0_STOP` — per-CF
+///   `level0_slowdown_writes_trigger` / `level0_stop_writes_trigger` (RocksDB
+///   defaults 20 / 36 when unset). A DB-wide slowdown throttles EVERY writer,
+///   the exec thread included, so raising them trades read amplification for
+///   write latency.
+/// - `TORUS_ROCKSDB_MAX_WRITE_BUFFERS` — per-CF `max_write_buffer_number`
+///   (default 4 = exact-today; RocksDB slows writes at `n-1` unflushed
+///   memtables and stops at `n`).
+/// - `TORUS_ROCKSDB_PIPELINED_WRITE` — `enable_pipelined_write` (WAL and
+///   memtable stages of consecutive write groups overlap; default off).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DbTuning {
+    pub stats_level: u8,
+    pub l0_slowdown_trigger: Option<i32>,
+    pub l0_stop_trigger: Option<i32>,
+    pub max_write_buffer_number: i32,
+    pub pipelined_write: bool,
+}
+
+impl Default for DbTuning {
+    fn default() -> Self {
+        Self::from_raw(None, None, None, None, None)
+    }
+}
+
+impl DbTuning {
+    /// Read every knob from the environment (once, at DB open).
+    pub fn from_env() -> Self {
+        let v = |k: &str| std::env::var(k).ok();
+        Self::from_raw(
+            v("TORUS_ROCKSDB_STATS"),
+            v("TORUS_ROCKSDB_L0_SLOWDOWN"),
+            v("TORUS_ROCKSDB_L0_STOP"),
+            v("TORUS_ROCKSDB_MAX_WRITE_BUFFERS"),
+            v("TORUS_ROCKSDB_PIPELINED_WRITE"),
+        )
+    }
+
+    /// Pure parse of the raw env strings (unit-testable without touching
+    /// process-global state).
+    pub fn from_raw(
+        stats: Option<String>,
+        l0_slowdown: Option<String>,
+        l0_stop: Option<String>,
+        max_write_buffers: Option<String>,
+        pipelined: Option<String>,
+    ) -> Self {
+        let pos_i32 = |raw: Option<String>| -> Option<i32> {
+            raw.as_deref()
+                .map(str::trim)
+                .and_then(|s| s.parse::<i32>().ok())
+                .filter(|&n| n >= 1)
+        };
+        Self {
+            stats_level: parse_rocksdb_stats_level(stats),
+            l0_slowdown_trigger: pos_i32(l0_slowdown),
+            l0_stop_trigger: pos_i32(l0_stop),
+            // Below 2 the DB could not switch memtables at all; clamp.
+            max_write_buffer_number: pos_i32(max_write_buffers).unwrap_or(4).max(2),
+            pipelined_write: matches!(
+                pipelined.as_deref().map(str::trim),
+                Some("1" | "true" | "TRUE" | "yes" | "on")
+            ),
+        }
+    }
+}
+
+/// Pure parse of `TORUS_ROCKSDB_STATS`: unset / garbage => 1 (tickers only),
+/// `0` off, `2` (or more) => 2 (histograms too; never the mutex-timing levels).
+pub fn parse_rocksdb_stats_level(raw: Option<String>) -> u8 {
+    match raw.as_deref().map(str::trim).and_then(|s| s.parse::<u8>().ok()) {
+        Some(0) => 0,
+        Some(1) => 1,
+        Some(_) => 2,
+        None => 1,
+    }
+}
+
+/// Cumulative RocksDB statistics tickers (present when the DB was opened with
+/// `stats_level >= 1`). All counters are since-open.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RocksdbTickers {
+    /// `rocksdb.stall.micros`: total time writers spent blocked/delayed by the
+    /// write controller (L0 / memtable / pending-compaction triggers).
+    pub stall_micros: u64,
+    /// `rocksdb.write.self`: writes that led their write group.
+    pub write_self: u64,
+    /// `rocksdb.write.other`: writes that rode as followers behind another
+    /// thread's write group (the head-of-line-blocking signature).
+    pub write_other: u64,
+    /// `rocksdb.bytes.written` (through Put/Write).
+    pub bytes_written: u64,
+    /// `rocksdb.wal.bytes`.
+    pub wal_bytes: u64,
+    /// `rocksdb.flush.write.bytes`.
+    pub flush_write_bytes: u64,
+    /// `rocksdb.compact.read.bytes` / `rocksdb.compact.write.bytes`.
+    pub compact_read_bytes: u64,
+    pub compact_write_bytes: u64,
+    /// `rocksdb.compaction.total.time.cpu_micros`.
+    pub compaction_cpu_micros: u64,
+}
+
+/// One RocksDB histogram, reduced to the fields the sampler exports.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct RocksdbHist {
+    pub count: u64,
+    pub sum: u64,
+    pub p99: f64,
+    pub max: f64,
+}
+
+/// RocksDB latency histograms (present when `stats_level >= 2`).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct RocksdbHistograms {
+    /// `rocksdb.db.write.micros`: end-to-end DB write latency incl. group wait.
+    pub db_write: RocksdbHist,
+    /// `rocksdb.db.write.stall`: per-write stall time.
+    pub write_stall: RocksdbHist,
+    /// `rocksdb.db.flush.micros`.
+    pub flush: RocksdbHist,
+    /// `rocksdb.compaction.times.micros`.
+    pub compaction: RocksdbHist,
+}
+
+/// DB-wide runtime snapshot: write-controller state + LSM shape aggregated
+/// over every column family (the per-CF labelled families stay for the deep
+/// dive; these unlabelled totals are what a `$1==name` scraper can read).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RocksdbRuntimeStats {
+    /// Sum of `rocksdb.cur-size-all-mem-tables` over all CFs.
+    pub memtable_bytes_all: u64,
+    /// Sum of `rocksdb.num-immutable-mem-table` over all CFs (flush backlog).
+    pub immutable_memtables_all: u64,
+    /// Max `rocksdb.num-files-at-level0` over all CFs (the slowdown trigger
+    /// fires per CF, so the max is the one that matters).
+    pub l0_files_max: u64,
+    /// Sum of `rocksdb.estimate-pending-compaction-bytes` over all CFs.
+    pub pending_compaction_bytes_all: u64,
+    /// `rocksdb.actual-delayed-write-rate` (0 = no write delay in force).
+    pub delayed_write_rate: u64,
+    /// `rocksdb.is-write-stopped` (1 while writes are fully stopped).
+    pub write_stopped: u64,
+    /// `rocksdb.num-running-compactions` / `rocksdb.num-running-flushes`.
+    pub running_compactions: u64,
+    pub running_flushes: u64,
+    /// `rocksdb.block-cache-usage`.
+    pub block_cache_bytes: u64,
+    pub tickers: Option<RocksdbTickers>,
+    pub histograms: Option<RocksdbHistograms>,
 }
 
 impl StateDb {
-    /// Open (or create) the database at the given path with all column families.
+    /// Open (or create) the database at the given path with all column families,
+    /// with the tuning knobs read from the environment ([`DbTuning::from_env`]).
     pub fn open(path: &Path) -> Result<Self, StateError> {
+        Self::open_with_tuning(path, &DbTuning::from_env())
+    }
+
+    /// Open (or create) the database with explicit tuning (tests / tooling).
+    pub fn open_with_tuning(path: &Path, tuning: &DbTuning) -> Result<Self, StateError> {
         let mut opts = Options::default();
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
+        // r3 exec-write-stall-attribution: RocksDB's own statistics. Level 1
+        // (default) = tickers only — stall micros, write self/other (write-group
+        // followers), WAL/flush/compaction bytes, compaction CPU. Level 2 adds
+        // the db.write / write.stall / flush / compaction histograms.
+        if tuning.stats_level >= 1 {
+            opts.enable_statistics();
+            opts.set_statistics_level(if tuning.stats_level >= 2 {
+                rocksdb::statistics::StatsLevel::ExceptDetailedTimers
+            } else {
+                rocksdb::statistics::StatsLevel::ExceptHistogramOrTimers
+            });
+        }
+        if tuning.pipelined_write {
+            opts.set_enable_pipelined_write(true);
+        }
         // DB-wide: parallelize flush/compaction and smooth fsync spikes during
         // heavy block writes. (Stock defaults run only 2 background jobs.)
         //
@@ -86,7 +276,16 @@ impl StateDb {
         let mut cf_opts = Options::default();
         cf_opts.set_block_based_table_factory(&bbt);
         cf_opts.set_write_buffer_size(128 * 1024 * 1024); // 128 MiB memtable
-        cf_opts.set_max_write_buffer_number(4);
+        cf_opts.set_max_write_buffer_number(tuning.max_write_buffer_number);
+        // r3: write-controller triggers (unset = RocksDB defaults 20 / 36 =
+        // exact-today). A slowdown on ANY CF throttles every writer of the
+        // instance, the exec thread's small header/body puts included.
+        if let Some(n) = tuning.l0_slowdown_trigger {
+            cf_opts.set_level_zero_slowdown_writes_trigger(n);
+        }
+        if let Some(n) = tuning.l0_stop_trigger {
+            cf_opts.set_level_zero_stop_writes_trigger(n);
+        }
         cf_opts.set_compression_type(DBCompressionType::Lz4);
         cf_opts.set_bottommost_compression_type(DBCompressionType::Zstd);
         cf_opts.set_level_compaction_dynamic_level_bytes(true);
@@ -133,12 +332,82 @@ impl StateDb {
             .collect();
 
         let db = DB::open_cf_descriptors(&opts, path, cf_descriptors)?;
-        Ok(Self { db: Arc::new(db) })
+        Ok(Self {
+            db: Arc::new(db),
+            opts: (tuning.stats_level >= 1).then(|| Arc::new(opts)),
+            stats_level: tuning.stats_level,
+        })
     }
 
     /// Wrap an already-opened RocksDB instance (e.g., a read-only snapshot DB).
     pub fn from_existing_db(db: DB) -> Self {
-        Self { db: Arc::new(db) }
+        Self {
+            db: Arc::new(db),
+            opts: None,
+            stats_level: 0,
+        }
+    }
+
+    /// r3 exec-write-stall-attribution: one DB-wide runtime snapshot — the
+    /// write-controller state and LSM shape aggregated over every CF, plus the
+    /// RocksDB statistics tickers (`stats_level >= 1`) and latency histograms
+    /// (`stats_level >= 2`). Cheap enough to sample every few seconds (a few
+    /// hundred property lookups; each takes the DB mutex briefly).
+    pub fn runtime_stats(&self) -> RocksdbRuntimeStats {
+        let db = &self.db;
+        let mut s = RocksdbRuntimeStats::default();
+        for cf_name in ALL_CF_NAMES {
+            let Some(cf) = db.cf_handle(cf_name) else {
+                continue;
+            };
+            let prop = |name: &str| -> u64 {
+                db.property_int_value_cf(cf, name).ok().flatten().unwrap_or(0)
+            };
+            s.memtable_bytes_all += prop("rocksdb.cur-size-all-mem-tables");
+            s.immutable_memtables_all += prop("rocksdb.num-immutable-mem-table");
+            s.l0_files_max = s.l0_files_max.max(prop("rocksdb.num-files-at-level0"));
+            s.pending_compaction_bytes_all += prop("rocksdb.estimate-pending-compaction-bytes");
+        }
+        let dbprop = |name: &str| -> u64 { db.property_int_value(name).ok().flatten().unwrap_or(0) };
+        s.delayed_write_rate = dbprop("rocksdb.actual-delayed-write-rate");
+        s.write_stopped = dbprop("rocksdb.is-write-stopped");
+        s.running_compactions = dbprop("rocksdb.num-running-compactions");
+        s.running_flushes = dbprop("rocksdb.num-running-flushes");
+        s.block_cache_bytes = dbprop("rocksdb.block-cache-usage");
+
+        if let Some(opts) = &self.opts {
+            use rocksdb::statistics::{Histogram, Ticker};
+            let t = |ticker: Ticker| opts.get_ticker_count(ticker);
+            s.tickers = Some(RocksdbTickers {
+                stall_micros: t(Ticker::StallMicros),
+                write_self: t(Ticker::WriteDoneBySelf),
+                write_other: t(Ticker::WriteDoneByOther),
+                bytes_written: t(Ticker::BytesWritten),
+                wal_bytes: t(Ticker::WalFileBytes),
+                flush_write_bytes: t(Ticker::FlushWriteBytes),
+                compact_read_bytes: t(Ticker::CompactReadBytes),
+                compact_write_bytes: t(Ticker::CompactWriteBytes),
+                compaction_cpu_micros: t(Ticker::CompactionCpuTotalTime),
+            });
+            if self.stats_level >= 2 {
+                let h = |hist: Histogram| {
+                    let d = opts.get_histogram_data(hist);
+                    RocksdbHist {
+                        count: d.count(),
+                        sum: d.sum(),
+                        p99: d.p99(),
+                        max: d.max(),
+                    }
+                };
+                s.histograms = Some(RocksdbHistograms {
+                    db_write: h(Histogram::DbWrite),
+                    write_stall: h(Histogram::WriteStall),
+                    flush: h(Histogram::FlushTime),
+                    compaction: h(Histogram::CompactionTime),
+                });
+            }
+        }
+        s
     }
 
     /// Open the database read-only (all column families). Works against a LIVE
@@ -152,7 +421,11 @@ impl StateDb {
             .map(|name| ColumnFamilyDescriptor::new(*name, Options::default()))
             .collect();
         let db = DB::open_cf_descriptors_read_only(&opts, path, cf_descriptors, false)?;
-        Ok(Self { db: Arc::new(db) })
+        Ok(Self {
+            db: Arc::new(db),
+            opts: None,
+            stats_level: 0,
+        })
     }
 
     /// Destroy the database at the given path (for testing).
@@ -187,6 +460,18 @@ impl StateDb {
     /// Atomically apply a WriteBatch to the database.
     pub fn write(&self, batch: WriteBatch) -> Result<(), StateError> {
         self.db.write(batch)?;
+        Ok(())
+    }
+
+    /// Atomically apply a WriteBatch with explicit [`rocksdb::WriteOptions`]
+    /// (e.g. `low_pri` for the background trade writer so compaction
+    /// back-pressure lands on it instead of the exec / consensus threads).
+    pub fn write_with(
+        &self,
+        batch: WriteBatch,
+        opts: &rocksdb::WriteOptions,
+    ) -> Result<(), StateError> {
+        self.db.write_opt(batch, opts)?;
         Ok(())
     }
 
@@ -766,5 +1051,158 @@ mod sync_wal_tests {
             db2.get_cf_raw(CF_ACCOUNTS, b"acct").expect("get"),
             Some(b"value".to_vec()),
         );
+    }
+
+    // ------------------------------------------------------------------
+    // r3 exec-write-stall-attribution: RocksDB statistics + write-controller
+    // knobs + a DB-wide runtime-stats snapshot (the bench sampler used to read
+    // 0 because the only gauges were per-CF labelled families).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn rocksdb_stats_level_parses_and_defaults_to_tickers() {
+        // Default (unset / garbage) = 1 = tickers only (cheap: no timers on the
+        // exec hot path). 0 = off, 2 = RocksDB's own default level with the
+        // db.write / write.stall / flush / compaction histograms.
+        assert_eq!(parse_rocksdb_stats_level(None), 1);
+        assert_eq!(parse_rocksdb_stats_level(Some("garbage".into())), 1);
+        assert_eq!(parse_rocksdb_stats_level(Some("".into())), 1);
+        assert_eq!(parse_rocksdb_stats_level(Some("0".into())), 0);
+        assert_eq!(parse_rocksdb_stats_level(Some("1".into())), 1);
+        assert_eq!(parse_rocksdb_stats_level(Some(" 2 ".into())), 2);
+        // Anything above 2 clamps to 2 (never the mutex-timing levels).
+        assert_eq!(parse_rocksdb_stats_level(Some("9".into())), 2);
+    }
+
+    #[test]
+    fn db_tuning_defaults_are_exact_today() {
+        let t = DbTuning::from_raw(None, None, None, None, None);
+        assert_eq!(t.stats_level, 1);
+        assert_eq!(t.l0_slowdown_trigger, None);
+        assert_eq!(t.l0_stop_trigger, None);
+        assert_eq!(t.max_write_buffer_number, 4);
+        assert!(!t.pipelined_write);
+        assert_eq!(t, DbTuning::default());
+    }
+
+    #[test]
+    fn db_tuning_parses_env_shapes() {
+        let t = DbTuning::from_raw(
+            Some("2".into()),
+            Some("40".into()),
+            Some("64".into()),
+            Some("6".into()),
+            Some("1".into()),
+        );
+        assert_eq!(t.stats_level, 2);
+        assert_eq!(t.l0_slowdown_trigger, Some(40));
+        assert_eq!(t.l0_stop_trigger, Some(64));
+        assert_eq!(t.max_write_buffer_number, 6);
+        assert!(t.pipelined_write);
+        // Garbage / zero fall back to exact-today.
+        let g = DbTuning::from_raw(
+            Some("x".into()),
+            Some("0".into()),
+            Some("-3".into()),
+            Some("1".into()),
+            Some("0".into()),
+        );
+        assert_eq!(g.stats_level, 1);
+        assert_eq!(g.l0_slowdown_trigger, None);
+        assert_eq!(g.l0_stop_trigger, None);
+        // max_write_buffer_number below 2 is nonsense for a live DB: clamp to 2.
+        assert_eq!(g.max_write_buffer_number, 2);
+        assert!(!g.pipelined_write);
+    }
+
+    #[test]
+    fn runtime_stats_are_none_when_statistics_off() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let t = DbTuning {
+            stats_level: 0,
+            ..DbTuning::default()
+        };
+        let db = StateDb::open_with_tuning(dir.path(), &t).expect("open");
+        db.put_cf_raw(CF_ACCOUNTS, b"k", b"v").expect("put");
+        let s = db.runtime_stats();
+        assert!(s.tickers.is_none(), "no statistics object => no tickers");
+        assert!(s.histograms.is_none());
+        // The DB-wide property snapshot is available regardless of statistics.
+        assert!(s.memtable_bytes_all > 0, "one put must show up in some memtable");
+        assert_eq!(s.write_stopped, 0);
+    }
+
+    #[test]
+    fn runtime_stats_tickers_count_writes_and_bytes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let t = DbTuning {
+            stats_level: 1,
+            ..DbTuning::default()
+        };
+        let db = StateDb::open_with_tuning(dir.path(), &t).expect("open");
+        for i in 0..8u32 {
+            db.put_cf_raw(CF_ACCOUNTS, &i.to_be_bytes(), &[7u8; 256]).expect("put");
+        }
+        let s = db.runtime_stats();
+        let tk = s.tickers.expect("tickers on at level 1");
+        assert!(tk.write_self >= 8, "8 solo writes => write.self >= 8, got {}", tk.write_self);
+        assert!(tk.bytes_written >= 8 * 256, "bytes.written {}", tk.bytes_written);
+        assert!(tk.wal_bytes >= 8 * 256, "wal.bytes {}", tk.wal_bytes);
+        assert_eq!(tk.stall_micros, 0, "an idle temp DB never stalls");
+        // Level 1 = tickers only: histograms are absent.
+        assert!(s.histograms.is_none(), "level 1 must not report histograms");
+    }
+
+    #[test]
+    fn runtime_stats_histograms_present_at_level_2() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let t = DbTuning {
+            stats_level: 2,
+            ..DbTuning::default()
+        };
+        let db = StateDb::open_with_tuning(dir.path(), &t).expect("open");
+        for i in 0..8u32 {
+            db.put_cf_raw(CF_ACCOUNTS, &i.to_be_bytes(), &[7u8; 256]).expect("put");
+        }
+        let s = db.runtime_stats();
+        let h = s.histograms.expect("histograms on at level 2");
+        assert!(h.db_write.count >= 8, "db.write.micros count {}", h.db_write.count);
+        assert_eq!(h.write_stall.count, 0);
+    }
+
+    #[test]
+    fn open_applies_write_controller_knobs_and_round_trips() {
+        // Non-default triggers + pipelined write must still open all CFs and
+        // survive a reopen (node-local options, no format impact).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let t = DbTuning {
+            stats_level: 1,
+            l0_slowdown_trigger: Some(40),
+            l0_stop_trigger: Some(64),
+            max_write_buffer_number: 6,
+            pipelined_write: true,
+        };
+        {
+            let db = StateDb::open_with_tuning(dir.path(), &t).expect("open");
+            assert_eq!(db.column_families().len(), ALL_CF_NAMES.len());
+            db.put_cf_raw(CF_ACCOUNTS, b"acct", b"value").expect("put");
+        }
+        let db2 = StateDb::open(dir.path()).expect("reopen with defaults");
+        assert_eq!(
+            db2.get_cf_raw(CF_ACCOUNTS, b"acct").expect("get"),
+            Some(b"value".to_vec()),
+        );
+    }
+
+    #[test]
+    fn write_with_low_pri_lands_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = StateDb::open(dir.path()).expect("open");
+        let mut batch = WriteBatch::default();
+        batch.put_cf(db.cf_handle(CF_ACCOUNTS).unwrap(), b"lp", b"v");
+        let mut wo = rocksdb::WriteOptions::default();
+        wo.set_low_pri(true);
+        db.write_with(batch, &wo).expect("low-pri write");
+        assert_eq!(db.get_cf_raw(CF_ACCOUNTS, b"lp").unwrap(), Some(b"v".to_vec()));
     }
 }
