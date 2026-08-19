@@ -111,7 +111,12 @@ for node, rs in rows.items():
 
 # ---------------------------------------------------------------- phase breakdown
 PHASES = ["evm", "verify", "replay_guard", "load_books", "engine", "save_books", "flush", "body_persist"]
-SUB = {"engine": ["phase_margin", "phase_match", "phase_settle"], "flush": ["root", "state_write", "evm_resync"]}
+# r7 state-write-build-vs-db-split: state_write is reported alongside its two
+# halves — state_write_build (serializing the pending maps into the WriteBatch)
+# and state_write_db (the atomic rocksdb write: WAL + memtable). build + db ==
+# state_write to rounding; both are 0.0 on a pre-r7 binary.
+SUB = {"engine": ["phase_margin", "phase_match", "phase_settle"],
+       "flush": ["root", "state_write", "state_write_build", "state_write_db", "evm_resync"]}
 phase = {}
 for node, rs in rows.items():
     if not rs:
@@ -145,6 +150,13 @@ for node, rs in rows.items():
                  "pct_of_wall": round(100 * dsum(k) / span, 1) if span else None}
         for s_ in SUB.get(k, []):
             ph[k][s_ + "_ms"] = round(per_blk(s_), 2)
+    # r7: batch size handed to RocksDB per native block, and the db-write
+    # throughput it implies (None on a pre-r7 binary).
+    bbc = m(b, "exec_state_write_batch_bytes_count") - m(a, "exec_state_write_batch_bytes_count")
+    bbs = m(b, "exec_state_write_batch_bytes_sum") - m(a, "exec_state_write_batch_bytes_sum")
+    ph["flush"]["state_write_batch_kb"] = round(bbs / bbc / 1024, 1) if bbc else None
+    dbs = dsum("state_write_db")
+    ph["flush"]["state_write_db_mb_per_s"] = round(bbs / dbs / 1e6, 1) if dbs > 0 else None
     ph["residual_untimed"] = {"ms": round(tot - acc, 2), "pct_of_block": round(100 * (tot - acc) / tot, 1) if tot else None}
     p["phases"] = ph
     # early vs late (first / last 60 s of the LOADED window = until matched stops moving)
@@ -161,7 +173,8 @@ for node, rs in rows.items():
             if n2 <= 0:
                 return None
             d = {k: round((m(b2, "exec_" + k + "_seconds_sum") - m(a2, "exec_" + k + "_seconds_sum")) / n2 * 1000, 1)
-                 for k in ["block"] + PHASES + ["phase_margin", "phase_match", "phase_settle", "root", "state_write"]}
+                 for k in ["block"] + PHASES + ["phase_margin", "phase_match", "phase_settle", "root", "state_write",
+                                                "state_write_build", "state_write_db"]}
             d["native_blocks"] = n2
             d["orders_placed_per_block"] = round((m(b2, "orders_placed_accepted_total") - m(a2, "orders_placed_accepted_total")) / n2)
             d["resting_orders_end"] = m(b2, "exec_resting_orders")
