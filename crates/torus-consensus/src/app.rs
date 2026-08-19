@@ -57,6 +57,47 @@ struct PendingSlash {
 struct CommittedBlockMsg {
     torus_block: TorusBlock,
     pending_slashes: Vec<PendingSlash>,
+    /// Which node-local durable rows (`CF_BLOCK_HEADERS` / `CF_BLOCK_BODIES`)
+    /// the dispatcher ALREADY wrote for this block (`persist_committed_block_durably`,
+    /// FIX 1a). Execution skips the corresponding exec-time re-encode + put —
+    /// the same bytes would land in the same key. `Default` (both `false`) =
+    /// "not known durable" ⇒ execution writes them, exactly as before.
+    durable: DurableRows,
+}
+
+/// Which of a committed block's node-local durable rows are known to be on
+/// disk already. Produced by [`persist_committed_block_durably`] (both `true`
+/// only when its single WriteBatch returned `Ok`) and carried to the exec thread
+/// so it can skip the redundant exec-time rewrite. Neither CF is part of any
+/// consensus root: this is a pure node-local I/O saving, never a state /
+/// determinism change.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct DurableRows {
+    /// `CF_BLOCK_HEADERS[height]` (hash ‖ header JSON) is durable.
+    header: bool,
+    /// `CF_BLOCK_BODIES[height]` (body record, see `torus_state::block_body`) is durable.
+    body: bool,
+}
+
+/// `TORUS_EXEC_REWRITE_DURABLE_ROWS`: kill-switch for the exec-time skip. Unset /
+/// empty / `"0"` ⇒ FALSE = execution trusts the dispatch-time durable rows and
+/// skips the redundant re-encode + put (default). Any other non-empty value
+/// ⇒ dispatch reports both rows as NOT durable and execution rewrites them,
+/// byte-identical to the pre-skip behavior (bisect lever only).
+fn parse_exec_rewrite_durable_rows_toggle(raw: Option<String>) -> bool {
+    match raw {
+        Some(v) => {
+            let t = v.trim();
+            !t.is_empty() && t != "0"
+        }
+        None => false,
+    }
+}
+
+/// Effective kill-switch state (fresh read per dispatch, like
+/// [`nonblocking_exec_dispatch`]: once per committed block, the read is noise).
+fn exec_rewrite_durable_rows() -> bool {
+    parse_exec_rewrite_durable_rows_toggle(std::env::var("TORUS_EXEC_REWRITE_DURABLE_ROWS").ok())
 }
 
 /// Regime-B strict-order execution: how a committed block's bodies reach the
@@ -572,22 +613,38 @@ fn cached_matches_compact(cached: &TorusBlock, compact: &CompactBlock) -> bool {
             .eq(compact.native_action_hashes.iter().copied())
 }
 
-fn persist_block_header(state_db: &StateDb, block: &TorusBlock) {
+/// The `CF_BLOCK_HEADERS` record for a block: `[0..32]` = keccak of the
+/// canonical header bytes (the committed block hash, read by
+/// `detect_conflicting_commit`), `[32..]` = serde-JSON of the header. ONE
+/// encoder for every writer of that CF (commit-time FIX 1a batch, exec-time
+/// standalone put), so the bytes are identical whichever path lands first.
+fn header_record_bytes(block: &TorusBlock) -> Option<Vec<u8>> {
     let block_hash = alloy_primitives::keccak256(block.header.canonical_header_bytes());
     let header_json = match serde_json::to_vec(&block.header) {
         Ok(j) => j,
         Err(e) => {
             tracing::error!(%e, "failed to serialize block header");
-            return;
+            return None;
         }
     };
     let mut data = Vec::with_capacity(32 + header_json.len());
     data.extend_from_slice(block_hash.as_slice());
     data.extend_from_slice(&header_json);
+    Some(data)
+}
+
+/// Write `CF_BLOCK_HEADERS[height] = hash ‖ header JSON`. Returns whether the
+/// put succeeded (best-effort: a failure is loud, never fatal).
+fn persist_block_header(state_db: &StateDb, block: &TorusBlock) -> bool {
+    let Some(data) = header_record_bytes(block) else {
+        return false;
+    };
     if let Err(e) = state_db.put_cf_raw(CF_BLOCK_HEADERS, &block.header.height.to_be_bytes(), &data)
     {
         tracing::error!(%e, height = block.header.height, "failed to persist block header");
+        return false;
     }
+    true
 }
 
 /// FIX 1a (crash-safety, commit->execute kill-window durability). Persist a
@@ -609,37 +666,116 @@ fn persist_block_header(state_db: &StateDb, block: &TorusBlock) {
 ///
 /// Writing header+body here makes every committed-and-dispatched block durably
 /// reconstructable on restart, regardless of where in the execute path a crash
-/// lands. The execution-time writes are kept (idempotent, same bytes; they also
-/// cover the boot-replay execute path and the EVM receipts/indices that are only
-/// known post-execution). Best-effort like the execution-time writes: a failure
-/// is loud but does not abort the commit (a still-missing body degrades to the
-/// same heal-able hole, never a silent state loss).
-fn persist_committed_block_durably(state_db: &StateDb, block: &TorusBlock) {
-    // Header first (find_last_committed_height scans CF_BLOCK_HEADERS): a crash
-    // between this and execution then still exposes the committed height so the
-    // gap is visible and replayable, rather than silently vanishing.
-    persist_block_header(state_db, block);
-    match serde_json::to_vec(&block.body()) {
-        Ok(body_bytes) => {
-            if let Err(e) = state_db.put_cf_raw(
-                CF_BLOCK_BODIES,
-                &block.header.height.to_be_bytes(),
-                &body_bytes,
-            ) {
-                tracing::error!(
-                    %e,
-                    height = block.header.height,
-                    "FIX1a: failed to persist committed block body at commit time (crash-recovery may hole here)"
-                );
-            }
+/// lands. Best-effort: a failure is loud but does not abort the commit (a
+/// still-missing body degrades to the same heal-able hole, never a silent state
+/// loss).
+///
+/// r4 commit-persist (consensus critical path):
+/// * The body is stored as a `torus_state::block_body` record — by default the
+///   tagged bin (bincode wire) encoding written straight from the borrowed
+///   block (no deep clone of the 25–80k `PlaceOrderParams` in a full block, no
+///   multi-MB JSON text on the HotStuff thread). Every reader decodes both the
+///   legacy JSON and the tagged bin record.
+/// * Header + body + the commit-manifest prune (the manifest is redundant once
+///   the body is durable) ride ONE atomic `WriteBatch` — one RocksDB write group
+///   on the consensus thread instead of three, so the HotStuff thread queues
+///   behind concurrent writers (the exec flush, the background trade writer)
+///   once per commit, not three times. Crash semantics are at least as strong
+///   as the separate puts: header and body appear together, so a crash can
+///   never leave the header (committed height visible to
+///   `find_last_committed_height`) without its body; on a failed batch the
+///   manifest is KEPT since the body is not durable.
+/// * Returns which rows landed ([`DurableRows`]). The dispatcher forwards that
+///   to the exec thread, which SKIPS its own (previously idempotent-repeat)
+///   header/body rewrite for a row reported durable — the exec-time rewrite of
+///   a full block body cost 66–269 ms of deep-clone + JSON encode + put on the
+///   exec critical chain per block, for bytes already in the same key. A row
+///   that failed here (`false`) still gets the exec-time write, so the
+///   boot-replay / block-sync / RPC readers see exactly the coverage they had
+///   before. The EVM arm's `commit_block_metadata` (receipts/indices, only
+///   known post-execution) is untouched.
+#[cfg(test)]
+fn persist_committed_block_durably(state_db: &StateDb, block: &TorusBlock) -> DurableRows {
+    persist_committed_block_durably_timed(state_db, block, None)
+}
+
+/// [`persist_committed_block_durably`] with the consensus-thread timers
+/// (`torus_commit_persist_seconds` = whole call, `torus_commit_body_encode_seconds`
+/// = the body-record encode alone, `torus_commit_persist_write_seconds` = the
+/// WriteBatch write alone).
+fn persist_committed_block_durably_timed(
+    state_db: &StateDb,
+    block: &TorusBlock,
+    metrics: Option<&torus_telemetry::Metrics>,
+) -> DurableRows {
+    let persist_timer = std::time::Instant::now();
+    let height_key = block.header.height.to_be_bytes();
+    let mut batch = rocksdb::WriteBatch::default();
+    let mut header = false;
+    let mut body = false;
+
+    // Header first in the batch (find_last_committed_height scans CF_BLOCK_HEADERS):
+    // header and body land atomically, so a crash between this write and
+    // execution still exposes the committed height AND its body for the replay.
+    match (state_db.cf_handle(CF_BLOCK_HEADERS), header_record_bytes(block)) {
+        (Ok(cf), Some(header_bytes)) => {
+            batch.put_cf(cf, height_key, &header_bytes);
+            header = true;
         }
-        Err(e) => {
+        (Err(e), _) => {
+            tracing::error!(%e, height = block.header.height, "FIX1a: header CF missing");
+        }
+        (_, None) => {}
+    }
+
+    let encode_timer = std::time::Instant::now();
+    let body_record = torus_state::block_body::encode_body_record(block);
+    if let Some(m) = metrics {
+        m.commit_body_encode_seconds
+            .observe(encode_timer.elapsed().as_secs_f64());
+    }
+    match (state_db.cf_handle(CF_BLOCK_BODIES), body_record) {
+        (Ok(cf), Ok(body_bytes)) => {
+            batch.put_cf(cf, height_key, &body_bytes);
+            body = true;
+        }
+        (Err(e), _) => {
+            tracing::error!(%e, height = block.header.height, "FIX1a: body CF missing");
+        }
+        (_, Err(e)) => {
             tracing::error!(
                 %e,
                 height = block.header.height,
                 "FIX1a: failed to serialize committed block body at commit time"
             );
         }
+    }
+
+    // The body is durable in this same batch; the commit manifest that guarded
+    // the heal channel for this height is redundant — drop it in the batch so
+    // `CF_COMMIT_MANIFEST` stays bounded to the committed-but-not-yet-dispatched
+    // window. Only when the body is actually in the batch: a still-missing body
+    // keeps its manifest for the heal pull. (A missing manifest CF is harmless:
+    // the CF merely grows.)
+    if body {
+        if let Ok(cf) = state_db.cf_handle(CF_COMMIT_MANIFEST) {
+            batch.delete_cf(cf, height_key);
+        }
+    }
+
+    let write_timer = std::time::Instant::now();
+    if let Err(e) = state_db.write(batch) {
+        header = false;
+        body = false;
+        tracing::error!(
+            %e,
+            height = block.header.height,
+            "FIX1a: failed to persist committed block header+body at commit time (crash-recovery may hole here)"
+        );
+    }
+    if let Some(m) = metrics {
+        m.commit_persist_write_seconds
+            .observe(write_timer.elapsed().as_secs_f64());
     }
 
     // Task B (Option C): now that this block's header+body are in the shared WAL
@@ -649,6 +785,11 @@ fn persist_committed_block_durably(state_db: &StateDb, block: &TorusBlock) {
     // power-loss, not just a process kill). This is the LAST durability step at
     // the commit boundary. Gated OFF by default ⇒ byte-identical to today.
     sync_committed_wal(state_db, torus_state::db::sync_wal_on_commit_enabled());
+    if let Some(m) = metrics {
+        m.commit_persist_seconds
+            .observe(persist_timer.elapsed().as_secs_f64());
+    }
+    DurableRows { header, body }
 }
 
 /// Task B (Option C): fsync the shared RocksDB WAL at the commit boundary, iff
@@ -695,18 +836,6 @@ fn persist_commit_manifest(state_db: &StateDb, height: u64, datum_bytes: &[u8]) 
             height,
             "failed to persist commit manifest at commit time (a boot-parked hole here could not heal from peers)"
         );
-    }
-}
-
-/// Best-effort prune of a committed height's manifest once its body is durable in
-/// `CF_BLOCK_BODIES` (i.e. at `dispatch_to_exec`, after
-/// [`persist_committed_block_durably`]). Keeps [`CF_COMMIT_MANIFEST`] bounded to
-/// the committed-but-not-yet-dispatched window: a still-parked hole never
-/// dispatches, so its manifest is retained for the heal; a healthy in-order block
-/// drops its (now-redundant) manifest immediately.
-fn prune_commit_manifest(state_db: &StateDb, height: u64) {
-    if let Err(e) = state_db.delete_cf_raw(CF_COMMIT_MANIFEST, &height.to_be_bytes()) {
-        tracing::warn!(%e, height, "failed to prune commit manifest (harmless; grows the CF)");
     }
 }
 
@@ -849,7 +978,7 @@ fn load_replay_header(state_db: &StateDb, height: u64) -> Option<TorusBlockHeade
 /// Returns `None` when the body is missing (never persisted / pruned) OR corrupt.
 fn load_replay_body(state_db: &StateDb, height: u64) -> Option<TorusBlockBody> {
     match state_db.get_cf_raw(CF_BLOCK_BODIES, &height.to_be_bytes()) {
-        Ok(Some(data)) => match serde_json::from_slice(&data) {
+        Ok(Some(data)) => match torus_state::block_body::decode_body_record(&data) {
             Ok(b) => Some(b),
             Err(e) => {
                 tracing::error!(%e, height, "crash recovery: failed to deserialize block body");
@@ -1015,10 +1144,24 @@ fn detect_parent_link_violation(
 // ---- Execution pipeline ----
 
 impl ExecutionContext {
+    /// Execute a committed block whose durable rows are NOT known to be on disk
+    /// (boot crash-replay, tests): the exec-time header/body writes run, exactly
+    /// as before. The live dispatch path uses
+    /// [`Self::execute_committed_block_with`] with the dispatcher's
+    /// [`DurableRows`] to skip the redundant rewrite.
     fn execute_committed_block(
         &self,
         torus_block: &TorusBlock,
         pending_slashes: Vec<PendingSlash>,
+    ) {
+        self.execute_committed_block_with(torus_block, pending_slashes, DurableRows::default())
+    }
+
+    fn execute_committed_block_with(
+        &self,
+        torus_block: &TorusBlock,
+        pending_slashes: Vec<PendingSlash>,
+        durable: DurableRows,
     ) {
         let height = torus_block.header.height;
 
@@ -1183,7 +1326,11 @@ impl ExecutionContext {
                     tracing::error!(%e, height, "EVM execution failed for committed block");
                 }
             }
-        } else {
+        } else if !durable.header {
+            // Native-only block whose header the dispatcher did NOT already land
+            // (boot crash-replay, or a failed dispatch-time batch): write it here.
+            // When `durable.header` the same hash‖JSON bytes are already at this
+            // key (`persist_committed_block_durably`), so the rewrite is skipped.
             persist_block_header(&self.state_db, torus_block);
         }
         if let Some(ref m) = self.metrics {
@@ -1527,8 +1674,24 @@ impl ExecutionContext {
         // ---- Persist block body for RPC queries ----
         // PROFILER (s470): commit-callback body persistence (block-body JSON
         // write + the standalone marker below for non-native blocks).
+        //
+        // r4 commit-persist: when the dispatcher already landed this exact body
+        // (`durable.body`, `persist_committed_block_durably` at commit time), the
+        // deep clone + encode + put below would put byte-identical bytes at the
+        // same key — 66–269 ms per full block on the exec critical chain, plus MBs
+        // of WAL/memtable per block per validator. Skip it. Rows NOT reported
+        // durable (boot crash-replay, a failed dispatch batch,
+        // `TORUS_EXEC_REWRITE_DURABLE_ROWS=1`) are still written here — as the
+        // same `torus_state::block_body` record the dispatcher would have written
+        // (borrowed encode, no clone) — so the crash-replay / block-sync / RPC
+        // readers keep exactly their old coverage.
         let body_persist_timer = std::time::Instant::now();
-        if let Ok(body_bytes) = serde_json::to_vec(&torus_block.body()) {
+        let body_bytes = if durable.body {
+            None
+        } else {
+            torus_state::block_body::encode_body_record(torus_block).ok()
+        };
+        if let Some(body_bytes) = body_bytes {
             // L3 flush-pipe (b): with the post-flush writer present, hand this
             // block's body KV to the background writer instead of doing the
             // RocksDB put on the exec critical chain. SAFE: the AUTHORITATIVE
@@ -1595,13 +1758,14 @@ fn execution_loop(rx: std::sync::mpsc::Receiver<CommittedBlockMsg>, ctx: Executi
         let CommittedBlockMsg {
             torus_block,
             pending_slashes,
+            durable,
         } = msg;
         let height = torus_block.header.height;
         // T1.5: contain execution panics — a panic here must become a
         // controlled fail-stop (latch + loop exit), not silent thread death
         // with consensus zombie-advancing while state is frozen.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            ctx.execute_committed_block(&torus_block, pending_slashes)
+            ctx.execute_committed_block_with(&torus_block, pending_slashes, durable)
         }));
         if result.is_err() {
             ctx.exec_failed.store(true, Ordering::SeqCst);
@@ -1752,6 +1916,12 @@ pub struct TorusApp {
     /// re-encode/re-write on the consensus thread. Heights reach dispatch
     /// strictly in ascending order, so a single `Option<u64>` suffices.
     exec_prepared_height: Option<u64>,
+    /// Which durable rows the once-per-height preparation of
+    /// `exec_prepared_height` actually landed (`persist_committed_block_durably`),
+    /// forwarded on the `CommittedBlockMsg` so a rank-2 Full-park retry of the
+    /// same height reports the same (still-true) durability instead of
+    /// re-persisting or falling back to "unknown ⇒ rewrite at exec".
+    exec_prepared_durable: DurableRows,
 }
 
 /// Actions the proposer pushes to validators via unicast before broadcasting CompactBlock.
@@ -2438,6 +2608,7 @@ impl TorusApp {
             exec_hole_retries: 0,
             exec_queue_len,
             exec_prepared_height: None,
+            exec_prepared_durable: DurableRows::default(),
         };
 
         // FIX 1b: a boot replay hole PARKS instead of latching a pre-network
@@ -4200,16 +4371,26 @@ impl TorusApp {
             // execution), and boot crash-recovery fail-stopped on the committed-but-
             // bodiless height (devnet t12-final-a/c). The block is fully materialized
             // here (bodies reconstructed from the durable DA store), so this write is
-            // authoritative; the execution-time writes remain as idempotent repeats.
-            persist_committed_block_durably(&self.state_db, &torus_block);
-
-            // The body is now durable in `CF_BLOCK_BODIES`; the commit manifest that
-            // guarded the heal channel for this height is redundant. Drop it (best
-            // effort) so `CF_COMMIT_MANIFEST` stays bounded to the committed-but-not-
-            // yet-dispatched window. A still-parked hole never reaches here, so its
-            // manifest is retained for the pull. (A rank-2 backpressure park is safe
-            // too: the body write above already covers the crash-replay window.)
-            prune_commit_manifest(&self.state_db, height);
+            // authoritative.
+            // The rows it lands are reported to the exec thread, which SKIPS its own
+            // (formerly idempotent-repeat) header/body rewrite for them; a row that
+            // failed here is still rewritten at exec, as before.
+            // `TORUS_EXEC_REWRITE_DURABLE_ROWS=1` forces the pre-skip rewrite (bisect).
+            // The commit manifest that guarded the heal channel for this height is
+            // pruned INSIDE the same WriteBatch (redundant once the body is durable),
+            // keeping `CF_COMMIT_MANIFEST` bounded to the committed-but-not-yet-
+            // dispatched window; a still-parked hole never reaches here, so its
+            // manifest is retained for the pull.
+            let durable = persist_committed_block_durably_timed(
+                &self.state_db,
+                &torus_block,
+                self.metrics.as_deref(),
+            );
+            self.exec_prepared_durable = if exec_rewrite_durable_rows() {
+                DurableRows::default()
+            } else {
+                durable
+            };
 
             tracing::info!(
                 height,
@@ -4243,6 +4424,7 @@ impl TorusApp {
             let msg = CommittedBlockMsg {
                 torus_block,
                 pending_slashes,
+                durable: self.exec_prepared_durable,
             };
             // inc BEFORE the (possibly blocking) send so a consensus thread stalled
             // on a full channel is visible as depth ≥ the bound, not hidden.
@@ -4272,6 +4454,7 @@ impl TorusApp {
                         let CommittedBlockMsg {
                             torus_block,
                             pending_slashes,
+                            durable: _,
                         } = msg;
                         return DispatchOutcome::Full(torus_block, pending_slashes);
                     }
@@ -5839,6 +6022,216 @@ mod crash_recovery_tests {
             .unwrap();
         let expected = alloy_primitives::keccak256(&block.header.canonical_header_bytes());
         assert_eq!(&raw[..32], expected.as_slice(), "header record must prefix the block hash");
+    }
+
+    /// r4 commit-persist RED-first: the commit-time persist writes the body as a
+    /// TAGGED BIN record (`torus_state::block_body`, tag 0x01 + bincode wire
+    /// encoding — no JSON text, no clone), prunes the height's commit manifest in
+    /// the SAME WriteBatch, reports both rows durable, and the crash-replay reader
+    /// decodes the record. RED on pre-r4 code: the body row was JSON (`{`), the
+    /// manifest was pruned by a separate delete, and the fn returned `()`.
+    #[test]
+    fn commit_persist_writes_tagged_bin_record_and_prunes_manifest_atomically() {
+        let (_config, state_db) = make_test_config_and_db();
+        let block = make_block(9, vec![sign_claim_rewards(9), sign_claim_rewards(9)]);
+        let key = 9u64.to_be_bytes();
+        persist_commit_manifest(&state_db, 9, b"datum-9");
+        assert!(state_db.get_cf_raw(CF_COMMIT_MANIFEST, &key).unwrap().is_some());
+
+        let durable = persist_committed_block_durably(&state_db, &block);
+        assert_eq!(
+            durable,
+            DurableRows {
+                header: true,
+                body: true
+            },
+            "both rows land in the single WriteBatch"
+        );
+
+        let raw_body = state_db.get_cf_raw(CF_BLOCK_BODIES, &key).unwrap().unwrap();
+        assert_eq!(
+            raw_body[0],
+            torus_state::block_body::BODY_RECORD_TAG_BIN_V1,
+            "default body record is the tagged bin (wire) encoding, not JSON"
+        );
+        assert_eq!(
+            &raw_body[1..],
+            &bincode::serialize(&block.body()).unwrap()[..],
+            "payload after the tag IS the bincode wire encoding of the body"
+        );
+        assert!(
+            state_db.get_cf_raw(CF_COMMIT_MANIFEST, &key).unwrap().is_none(),
+            "commit manifest pruned in the same batch as the durable body"
+        );
+        let b = load_replay_body(&state_db, 9).expect("crash-replay reader decodes the bin record");
+        assert_eq!(b.native_actions.len(), 2);
+        assert_eq!(
+            torus_types::compute_action_hash(&b.native_actions[1]),
+            torus_types::compute_action_hash(&block.native_actions[1]),
+            "actions round-trip hash-for-hash"
+        );
+        assert_eq!(load_replay_header(&state_db, 9).unwrap().native_action_count, 2);
+    }
+
+    /// r4 commit-persist: crash-replay must decode BOTH record formats — heights
+    /// written before the upgrade (legacy JSON) and after (tagged bin) — and the
+    /// two must yield the same actions for the same block.
+    #[test]
+    fn crash_replay_reads_legacy_json_and_tagged_bin_bodies() {
+        let (_config, state_db) = make_test_config_and_db();
+        let b2 = make_block(2, vec![sign_claim_rewards(2)]);
+        let b3 = make_block(3, vec![sign_claim_rewards(3), sign_claim_rewards(33)]);
+        persist_block_for_test(&state_db, &b2); // legacy JSON writer
+        persist_committed_block_durably(&state_db, &b3); // tagged bin writer
+        assert_eq!(
+            state_db.get_cf_raw(CF_BLOCK_BODIES, &2u64.to_be_bytes()).unwrap().unwrap()[0],
+            b'{'
+        );
+        assert_eq!(
+            state_db.get_cf_raw(CF_BLOCK_BODIES, &3u64.to_be_bytes()).unwrap().unwrap()[0],
+            torus_state::block_body::BODY_RECORD_TAG_BIN_V1
+        );
+        let r2 = load_replay_body(&state_db, 2).expect("legacy JSON body decodes");
+        let r3 = load_replay_body(&state_db, 3).expect("tagged bin body decodes");
+        assert_eq!(r2.native_actions.len(), 1);
+        assert_eq!(r3.native_actions.len(), 2);
+        let hashes = |v: &[SignedNativeAction]| -> Vec<torus_types::B256> {
+            v.iter().map(torus_types::compute_action_hash).collect()
+        };
+        assert_eq!(hashes(&r2.native_actions), hashes(&b2.native_actions));
+        assert_eq!(hashes(&r3.native_actions), hashes(&b3.native_actions));
+
+        // And the same block written in both formats decodes to the same actions.
+        let legacy = torus_state::block_body::encode_body_record_as(
+            &b3,
+            torus_state::block_body::BodyRecordFormat::LegacyJson,
+        )
+        .unwrap();
+        state_db.put_cf_raw(CF_BLOCK_BODIES, &3u64.to_be_bytes(), &legacy).unwrap();
+        let r3_legacy = load_replay_body(&state_db, 3).unwrap();
+        assert_eq!(hashes(&r3_legacy.native_actions), hashes(&r3.native_actions));
+    }
+
+    /// r4 commit-persist / body-persist-skip RED-first: a NON-EMPTY native block
+    /// whose header+body the dispatcher already made durable
+    /// (`persist_committed_block_durably` ⇒ both rows `true`) must NOT be
+    /// re-encoded / re-written by execution. Proven by tagging both durable rows
+    /// with a trailing sentinel BEFORE exec: a rewrite would replace the row
+    /// (sentinel gone); the skip leaves the tagged bytes intact. Execution itself
+    /// is unaffected (applied advances, no fail-stop).
+    #[test]
+    fn exec_skips_header_and_body_rewrite_when_dispatch_rows_are_durable() {
+        let (config, state_db) = make_test_config_and_db();
+        for h in 1..=2u64 {
+            persist_block_for_test(&state_db, &make_block(h, vec![]));
+        }
+        write_native_applied_height(&state_db, 2);
+
+        let b3 = make_block(3, vec![sign_claim_rewards(3)]);
+        let durable = persist_committed_block_durably(&state_db, &b3);
+        assert_eq!(
+            durable,
+            DurableRows {
+                header: true,
+                body: true
+            }
+        );
+
+        // Tag both rows so an exec-time rewrite is observable.
+        let key = 3u64.to_be_bytes();
+        let mut tagged_header = state_db.get_cf_raw(CF_BLOCK_HEADERS, &key).unwrap().unwrap();
+        tagged_header.extend_from_slice(b"#dispatch-row");
+        state_db.put_cf_raw(CF_BLOCK_HEADERS, &key, &tagged_header).unwrap();
+        let mut tagged_body = state_db.get_cf_raw(CF_BLOCK_BODIES, &key).unwrap().unwrap();
+        tagged_body.extend_from_slice(b"#dispatch-row");
+        state_db.put_cf_raw(CF_BLOCK_BODIES, &key, &tagged_body).unwrap();
+
+        let exec_ctx = make_exec_ctx(&config, &state_db);
+        exec_ctx.execute_committed_block_with(&b3, vec![], durable);
+
+        assert!(
+            !exec_ctx.exec_failed.load(std::sync::atomic::Ordering::SeqCst),
+            "execution must succeed"
+        );
+        assert_eq!(read_native_applied_height(&state_db), Some(3), "block 3 executed");
+        assert_eq!(
+            state_db.get_cf_raw(CF_BLOCK_BODIES, &key).unwrap().unwrap(),
+            tagged_body,
+            "exec must NOT rewrite CF_BLOCK_BODIES when dispatch reported the body durable"
+        );
+        assert_eq!(
+            state_db.get_cf_raw(CF_BLOCK_HEADERS, &key).unwrap().unwrap(),
+            tagged_header,
+            "exec must NOT rewrite CF_BLOCK_HEADERS when dispatch reported the header durable"
+        );
+    }
+
+    /// body-persist-skip safety: the SAME block executed with rows NOT known durable
+    /// (`DurableRows::default()` — the boot crash-replay / `execute_committed_block`
+    /// path, or a dispatch whose batch failed) still gets both exec-time writes
+    /// (the body as the tagged bin record), and the body row round-trips through
+    /// the crash-replay reader. Partial flags are honored per row.
+    #[test]
+    fn exec_rewrites_rows_not_reported_durable() {
+        let (config, state_db) = make_test_config_and_db();
+        for h in 1..=2u64 {
+            persist_block_for_test(&state_db, &make_block(h, vec![]));
+        }
+        write_native_applied_height(&state_db, 2);
+        let key = 3u64.to_be_bytes();
+
+        // (a) nothing durable ⇒ both rows written by exec.
+        let b3 = make_block(3, vec![sign_claim_rewards(3)]);
+        assert!(state_db.get_cf_raw(CF_BLOCK_BODIES, &key).unwrap().is_none());
+        assert!(state_db.get_cf_raw(CF_BLOCK_HEADERS, &key).unwrap().is_none());
+        let exec_ctx = make_exec_ctx(&config, &state_db);
+        exec_ctx.execute_committed_block(&b3, vec![]);
+        assert_eq!(read_native_applied_height(&state_db), Some(3));
+        let raw = state_db.get_cf_raw(CF_BLOCK_BODIES, &key).unwrap().unwrap();
+        assert_eq!(raw[0], torus_state::block_body::BODY_RECORD_TAG_BIN_V1);
+        let body = load_replay_body(&state_db, 3).expect("exec-time body write must land");
+        assert_eq!(body.native_actions.len(), 1);
+        assert_eq!(
+            load_replay_header(&state_db, 3).expect("exec-time header write must land").height,
+            3
+        );
+
+        // (b) header durable, body NOT (a failed dispatch body write): exec rewrites
+        // only the body row.
+        let mut b4 = make_block(4, vec![sign_claim_rewards(4)]);
+        b4.header.parent_hash = alloy_primitives::keccak256(b3.header.canonical_header_bytes());
+        let key4 = 4u64.to_be_bytes();
+        assert!(persist_block_header(&state_db, &b4));
+        let mut tagged_header = state_db.get_cf_raw(CF_BLOCK_HEADERS, &key4).unwrap().unwrap();
+        tagged_header.extend_from_slice(b"#dispatch-row");
+        state_db.put_cf_raw(CF_BLOCK_HEADERS, &key4, &tagged_header).unwrap();
+        exec_ctx.execute_committed_block_with(
+            &b4,
+            vec![],
+            DurableRows {
+                header: true,
+                body: false,
+            },
+        );
+        assert_eq!(read_native_applied_height(&state_db), Some(4));
+        assert_eq!(
+            load_replay_body(&state_db, 4).expect("body must be written when not durable").native_actions.len(),
+            1
+        );
+        assert_eq!(
+            state_db.get_cf_raw(CF_BLOCK_HEADERS, &key4).unwrap().unwrap(),
+            tagged_header,
+            "header reported durable must not be rewritten even when the body is"
+        );
+    }
+
+    #[test]
+    fn parse_exec_rewrite_durable_rows_toggle_default_off() {
+        assert!(!parse_exec_rewrite_durable_rows_toggle(None));
+        assert!(!parse_exec_rewrite_durable_rows_toggle(Some("".into())));
+        assert!(!parse_exec_rewrite_durable_rows_toggle(Some("0".into())));
+        assert!(parse_exec_rewrite_durable_rows_toggle(Some("1".into())));
+        assert!(parse_exec_rewrite_durable_rows_toggle(Some("true".into())));
     }
 
     /// Task B/2 RED-first (Option C, crash-durable commit). The commit boundary
@@ -8664,6 +9057,47 @@ mod crash_recovery_tests {
         let (tx, rx) = std::sync::mpsc::sync_channel::<CommittedBlockMsg>(64);
         app.exec_tx = Some(tx);
         (app, rx, mempool)
+    }
+
+    /// r4 commit-persist: the live dispatch path (`on_committed_block` →
+    /// `dispatch_to_exec`) persists header+body durably FIRST and hands the exec
+    /// thread a message that reports both rows durable, so exec skips the redundant
+    /// rewrite. The rows must really be on disk when the message is sent, and the
+    /// commit manifest for that height must be gone (pruned in the same batch).
+    #[test]
+    fn dispatch_reports_durable_rows_after_persisting_them() {
+        let (config, state_db) = make_test_config_and_db();
+        let (mut app, rx, mempool) = app_with_recording_exec(&config, &state_db);
+
+        let a5 = vec![sign_claim_rewards(5)];
+        let _ = mempool.mirror_native_to_da(&a5);
+        let b5 = make_block(5, a5);
+        app.exec_next_height = Some(5);
+
+        let c5 = committed_compact_block(&b5);
+        app.on_committed_block(&c5, c5.hash);
+
+        let msg = rx.try_recv().expect("height 5 must reach execution");
+        assert_eq!(msg.torus_block.header.height, 5);
+        assert_eq!(
+            msg.durable,
+            DurableRows {
+                header: true,
+                body: true
+            },
+            "dispatch must report both durable rows so exec skips the rewrite"
+        );
+        let key = 5u64.to_be_bytes();
+        assert!(
+            state_db.get_cf_raw(CF_BLOCK_HEADERS, &key).unwrap().is_some(),
+            "header row must already be durable when the message is sent"
+        );
+        let body = load_replay_body(&state_db, 5).expect("body row must already be durable");
+        assert_eq!(body.native_actions.len(), 1);
+        assert!(
+            state_db.get_cf_raw(CF_COMMIT_MANIFEST, &key).unwrap().is_none(),
+            "commit manifest pruned at dispatch (same batch as the durable body)"
+        );
     }
 
     /// RED-first (out-of-order delivery): the execution pipeline must NEVER

@@ -166,6 +166,11 @@ for node, rs in rows.items():
     p["dirty_buckets_per_flush"] = round((m(b, "exec_root_dirty_buckets_sum") - m(a, "exec_root_dirty_buckets_sum")) / dbc, 1) if dbc else None
     cic = m(b, "commit_interval_seconds_count") - m(a, "commit_interval_seconds_count")
     p["commit_interval_ms_avg"] = round((m(b, "commit_interval_seconds_sum") - m(a, "commit_interval_seconds_sum")) / cic * 1000, 1) if cic else None
+    # r4 commit-persist: consensus-thread commit-time durable persist (whole call /
+    # body-record encode / WriteBatch write), ms per commit.
+    cpc = m(b, "commit_persist_seconds_count") - m(a, "commit_persist_seconds_count")
+    for name in ("commit_persist", "commit_body_encode", "commit_persist_write"):
+        p[name + "_ms_avg"] = round((m(b, name + "_seconds_sum") - m(a, name + "_seconds_sum")) / cpc * 1000, 2) if cpc else None
     btc = m(b, "block_transactions_count_count") - m(a, "block_transactions_count_count")
     p["txs_per_block_avg"] = round((m(b, "block_transactions_count_sum") - m(a, "block_transactions_count_sum")) / btc, 1) if btc else None
     phase[node] = p

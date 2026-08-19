@@ -2,6 +2,7 @@
 
 pub mod backend;
 pub mod bg_writer;
+pub mod block_body;
 pub mod cf;
 pub mod db;
 pub mod erasure;

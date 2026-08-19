@@ -121,7 +121,9 @@ fn get_body(state: &RpcState, height: u64) -> Result<Option<TorusBlockBody>, Rpc
     let key = height.to_be_bytes();
     match state.state.get_cf_raw(CF_BLOCK_BODIES, &key)? {
         Some(bytes) => {
-            let body: TorusBlockBody = serde_json::from_slice(&bytes)
+            // Legacy JSON or tagged bin record (r4 commit-persist): the codec
+            // dispatches on the first byte.
+            let body: TorusBlockBody = torus_state::block_body::decode_body_record(&bytes)
                 .map_err(|e| RpcError::Internal(format!("body decode: {e}")))?;
             Ok(Some(body))
         }

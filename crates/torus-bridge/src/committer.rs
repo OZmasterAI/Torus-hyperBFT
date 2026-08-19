@@ -102,9 +102,10 @@ impl BlockCommitter {
         batch.put_cf(cf_headers, height_key, &header_data);
 
         // 4. Store block body.
-        let body = block.body();
-        let body_bytes =
-            serde_json::to_vec(&body).map_err(|e| BridgeError::Serialization(e.to_string()))?;
+        // Same `CF_BLOCK_BODIES` record codec as the commit-time / exec-time
+        // native writers (legacy JSON or tagged bin, borrowed encode).
+        let body_bytes = torus_state::block_body::encode_body_record(block)
+            .map_err(BridgeError::Serialization)?;
         batch.put_cf(cf_bodies, height_key, &body_bytes);
 
         // 5. Store receipts (key = height(8) || tx_index(4)).
@@ -165,9 +166,10 @@ impl BlockCommitter {
         header_data.extend_from_slice(&header_json);
         batch.put_cf(cf_headers, height_key, &header_data);
 
-        let body = block.body();
-        let body_bytes =
-            serde_json::to_vec(&body).map_err(|e| BridgeError::Serialization(e.to_string()))?;
+        // Same `CF_BLOCK_BODIES` record codec as the commit-time / exec-time
+        // native writers (legacy JSON or tagged bin, borrowed encode).
+        let body_bytes = torus_state::block_body::encode_body_record(block)
+            .map_err(BridgeError::Serialization)?;
         batch.put_cf(cf_bodies, height_key, &body_bytes);
 
         for receipt in receipts {
