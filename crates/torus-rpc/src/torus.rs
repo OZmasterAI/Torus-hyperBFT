@@ -1323,7 +1323,9 @@ impl TorusApiServer for RpcState {
             Ok(None) => return Ok(None),
             Err(e) => return Err(ErrorObjectOwned::from(RpcError::State(e))),
         };
-        let body: torus_types::TorusBlockBody = serde_json::from_slice(&data)
+        // Records are either legacy JSON or the tagged bin record (r4
+        // commit-persist); the codec dispatches on the first byte.
+        let body: torus_types::TorusBlockBody = torus_state::block_body::decode_body_record(&data)
             .map_err(|e| RpcError::Internal(format!("body decode: {e}")))
             .map_err(ErrorObjectOwned::from)?;
         let native_actions: Vec<serde_json::Value> = body

@@ -1859,6 +1859,87 @@ mod tests {
         handle.stop().unwrap();
     }
 
+    /// r4 commit-persist: `torus_getBlockBody` (and the eth body reader) must
+    /// serve a body stored as the TAGGED BIN record identically to one stored as
+    /// the legacy JSON record — the on-disk record format is a node-local detail
+    /// the RPC surface never exposes.
+    #[tokio::test]
+    async fn torus_get_block_body_reads_legacy_json_and_tagged_bin_records() {
+        let (_dir, state, mempool, executor) = setup();
+        let key = k256::ecdsa::SigningKey::from_slice(
+            &hex::decode("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80")
+                .unwrap(),
+        )
+        .unwrap();
+        let orders: Vec<torus_types::PlaceOrderParams> = (0..3)
+            .map(|i| torus_types::PlaceOrderParams {
+                market_id: 1,
+                is_buy: i % 2 == 0,
+                price: torus_types::FixedPoint::from_raw(1_000_000_000 + i as i128),
+                quantity: torus_types::FixedPoint::from_raw(100_000_000),
+                order_type: torus_types::OrderType::Limit,
+                time_in_force: torus_types::TimeInForce::GTC,
+                reduce_only: false,
+                client_order_id: Some(i as u64),
+            })
+            .collect();
+        let signed = torus_types::eip712::sign_native_action(
+            torus_types::NativeAction::PlaceOrderBatch(orders),
+            1_700_000_000_000,
+            &key,
+        );
+        let body = TorusBlockBody {
+            native_actions: vec![signed],
+            evm_transactions: vec![],
+            core_writer_actions: vec![],
+        };
+        // Height 1: legacy JSON record (the pre-r4 writer). Height 2: tagged bin.
+        store_header(&state, &test_header(1, 0, 1_000_000_000));
+        store_body(&state, 1, &body);
+        store_header(&state, &test_header(2, 0, 1_000_000_000));
+        let bin = torus_state::block_body::encode_body_record_owned_as(
+            &body,
+            torus_state::block_body::BodyRecordFormat::BinV1,
+        )
+        .unwrap();
+        assert_eq!(bin[0], torus_state::block_body::BODY_RECORD_TAG_BIN_V1);
+        state
+            .put_cf_raw(CF_BLOCK_BODIES, &2u64.to_be_bytes(), &bin)
+            .unwrap();
+        assert_eq!(
+            state.get_cf_raw(CF_BLOCK_BODIES, &1u64.to_be_bytes()).unwrap().unwrap()[0],
+            b'{',
+            "height 1 is the legacy JSON record"
+        );
+
+        let (handle, addr) = start_server(state, mempool, executor).await;
+        use jsonrpsee::core::client::ClientT;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+        let b1: RpcBlockBody = client
+            .request::<Option<RpcBlockBody>, _>("torus_getBlockBody", jsonrpsee::rpc_params![1u64])
+            .await
+            .unwrap()
+            .unwrap();
+        let b2: RpcBlockBody = client
+            .request::<Option<RpcBlockBody>, _>("torus_getBlockBody", jsonrpsee::rpc_params![2u64])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(b1.native_action_count, 1);
+        assert_eq!(b2.native_action_count, 1);
+        assert_eq!(
+            b1.native_actions, b2.native_actions,
+            "same body, different on-disk record format ⇒ identical RPC payload"
+        );
+        assert_eq!(
+            b1.native_actions[0],
+            serde_json::to_value(&body.native_actions[0]).unwrap()
+        );
+        handle.stop().unwrap();
+    }
+
     #[tokio::test]
     async fn eth_get_transaction_receipt() {
         let (_dir, state, mempool, executor) = setup();
