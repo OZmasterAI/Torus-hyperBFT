@@ -15,6 +15,15 @@
 # All throughput numbers come from NODE Prometheus counters
 # (torus_orders_matched_total etc.) — never from bench-side math, never placed/s.
 #
+# DURATION PARITY (r5): matched/s decays ~2x across a 300 s run (resting orders
+# 0.25M -> 1.2M grow engine-untimed / save_books / state_write / body_persist), so a
+# 300 s cell's window-avg is NOT comparable to a 120 s cell's. summarize.py always
+# emits headline.matched_s_first120 (window-avg over the first 120 s of the bench
+# window == matched_s_avg for a DUR=120 cell), early60 / late60 and
+# decay_ratio = late60/early60. Compare cells at EQUAL DUR: use first120 when a
+# 300 s run is compared against 120 s cells. Merged-confirm convention:
+# 2 x DUR=120 + 1 x DUR=300, record BOTH numbers (first120 and 300 s avg).
+#
 # Optional env overrides:
 #   TARGET_DIR   cargo target dir holding torus-node + bench-throughput
 #                (default /home/18c/.cargo-target-matched)

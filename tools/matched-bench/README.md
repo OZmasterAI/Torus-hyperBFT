@@ -85,15 +85,56 @@ tools/matched-bench/run-cell.sh /home/18c/projects/wt/matched-bench nosettle-r1 
 ## Result dir `/home/18c/bench-results-matched/<label>/`
 
 `summary.json` keys: `headline` (matched_s_avg = window average over the bench
-window on val0, matched_s_best60 = best sliding 60 s over the whole sample,
-placed_s_avg, blk_s_avg, blk_s_worst60, peak_exec_queue_depth, validators_agree),
+window on val0, matched_s_first120 = window average over the FIRST 120 s of the
+bench window, matched_s_early60 / matched_s_late60 = first / last 60 s of the
+bench window, decay_ratio = late60/early60, matched_s_best60 = best sliding 60 s
+over the whole sample, placed_s_avg, blk_s_avg, blk_s_worst60,
+peak_exec_queue_depth, validators_agree),
 `funnel_by_node`, `phase_by_node` (per-NATIVE-block ms and % of block / % of wall
 for evm, verify, replay_guard, load_books, engine[margin/match/settle],
 save_books, flush[root/state_write/evm_resync], body_persist, residual;
 exec_thread_busy_fraction; wall ms per committed block), `agreement`, `cpu`,
 `cell` (env, bench cmd), `binaries`, `genesis`, `timing`, `bench_log_tail`.
 
+## Duration parity: compare cells at EQUAL DUR (r5)
+
+matched/s is NOT stationary across a run: it decays ~2x over 300 s
+(r3-merged-confirm val0: early60 35.9k -> late60 19.8k, `decay_ratio` 0.55)
+because engine-untimed, save_books, state_write and body_persist all grow with
+resting orders (0.25M -> 1.2M). So a 300 s cell's `matched_s_avg` is
+systematically LOWER than a 120 s cell's for the same binary — r3's 300 s
+merged-confirm read 32.7k while its own 120 s pair read 40.4k / 42.5k, and
+that alone inflated every r4 headline delta (+10..+35% vs like-for-like
+-13..+13%).
+
+`summarize.py` therefore always emits, per node and on the headline:
+
+| field | window on val0 | use |
+|---|---|---|
+| `matched_s_avg` | whole bench window `[t_bench0, t_bench1]` | unchanged; the cell's own number |
+| `matched_s_first120` | `[t_bench0, t_bench0+120]` (== `matched_s_avg` for a DUR=120 cell) | the like-for-like number when a 300 s run is compared with 120 s cells |
+| `matched_s_early60` / `matched_s_late60` | `[t_bench0, t_bench0+60]` / `[t_bench1-60, t_bench1]` | both under submit load |
+| `decay_ratio` | `late60 / early60` | first-class metric for late-run levers (order-index-map, engine-untimed, trade diet): they must raise `decay_ratio`, not just early60 |
+
+Round bookkeeping rules:
+
+- The round "best" MUST be compared at equal DUR. Candidate cells run at
+  DUR=120; the merged-confirm is **2 x DUR=120 + 1 x DUR=300**, and the round
+  record carries BOTH numbers: the 120 s pair (+ the 300 s run's `first120`)
+  as the comparable base for the next round's +8% rule, and the 300 s
+  `matched_s_avg` (+ `decay_ratio`) as the endurance number.
+- Baseline pool at 120 s (r3/r4 binaries): 34.6k-42.5k, sd ~2.9k. r3-merged-
+  confirm (300 s) first120 = **38 145** (avg 32 682, decay 0.55) — use 38.1k,
+  not 32.7k, as the r3 base.
+- Existing result dirs get the new fields with `tools/matched-bench/backfill-parity.sh
+  <result-dir>...` (backs up `summary.json` to `summary.json.pre-parity`, then
+  re-runs `resummarize.sh`; `matched_s_avg` and every other field are unchanged).
+- Unit test: `python3 tools/matched-bench/tests/test_summarize.py`.
+
 ## Rules baked in
+
+- Compare cells at EQUAL DUR (`matched_s_first120` for a 300 s run vs 120 s
+  cells); never a 300 s avg against a 120 s avg.
 
 - matched/s ONLY from `torus_orders_matched_total` deltas; never bench-side math,
   never placed/s (cheap resting orders — the p3 trap).
