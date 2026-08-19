@@ -5,6 +5,10 @@ Every rate below is computed from NODE Prometheus counter deltas sampled at
 1 Hz (sampler.csv), never from the bench's own accounting. Headline
 matched/s = window average over the bench window [t_bench0, t_bench1] on val0;
 best-60s = max over all sliding 60 s windows of the whole sample (bench+drain).
+Duration parity: matched_s_first120 = window average over [t_bench0, t_bench0+120]
+(the like-for-like number when comparing a 300 s cell with 120 s cells — matched/s
+decays ~2x across a 300 s run as resting orders grow); early60 / late60 = first / last
+60 s of the bench window; decay_ratio = late60 / early60. matched_s_avg is unchanged.
 Phase breakdown = per-executed-block ms from histogram _sum deltas over the
 bench+drain window (so every loaded block is included), divided by the
 torus_exec_block_seconds_count delta (per-phase count == block count by design).
@@ -82,6 +86,19 @@ for node, rs in rows.items():
         d[name + "_incl_drain"] = round(v2, 1)
     d["benchwin_span_s"] = rate(rs, "orders_matched_total", t0, t1)[1]
     d["incl_drain_span_s"] = rate(rs, "orders_matched_total", t0, td)[1]
+    # Duration parity (r5): matched/s decays ~2x across a 300 s run as resting orders pile up
+    # (0.25M -> 1.2M), so a 300 s cell's window-avg is NOT comparable to a 120 s cell's.
+    # first120 = window-avg over the first 120 s of the bench window (== matched_s_avg for a
+    # 120 s cell) is the like-for-like number for round bookkeeping; early60 / late60 = the
+    # first / last 60 s of the bench window (both under submit load); decay_ratio = late60/early60.
+    v_f120, dt_f120 = rate(rs, "orders_matched_total", t0, min(t0 + 120, t1))
+    d["matched_s_first120"] = round(v_f120, 1)
+    d["first120_span_s"] = dt_f120
+    v_e60, _ = rate(rs, "orders_matched_total", t0, min(t0 + 60, t1))
+    v_l60, _ = rate(rs, "orders_matched_total", max(t1 - 60, t0), t1)
+    d["matched_s_early60"] = round(v_e60, 1)
+    d["matched_s_late60"] = round(v_l60, 1)
+    d["decay_ratio"] = round(v_l60 / v_e60, 3) if v_e60 > 0 else None
     d["matched_s_best60"] = round(best60(rs, "orders_matched_total"), 1)
     d["placed_s_best60"] = round(best60(rs, "orders_placed_accepted_total"), 1)
     d["blk_s_best60"] = round(best60(rs, "block_height"), 3)
@@ -273,6 +290,10 @@ summary = {
     "idle_blk_s": float(A.idle_blks or 0),
     "headline": {
         "matched_s_avg": v0.get("matched_s_benchwin"),
+        "matched_s_first120": v0.get("matched_s_first120"),
+        "matched_s_early60": v0.get("matched_s_early60"),
+        "matched_s_late60": v0.get("matched_s_late60"),
+        "decay_ratio": v0.get("decay_ratio"),
         "matched_s_best60": v0.get("matched_s_best60"),
         "matched_s_incl_drain": v0.get("matched_s_incl_drain"),
         "placed_s_avg": v0.get("placed_s_benchwin"),
@@ -299,7 +320,8 @@ summary = {
 with open(os.path.join(OUT, "summary.json"), "w") as f:
     json.dump(summary, f, indent=1)
 h = summary["headline"]
-print(f"SUMMARY {A.label}: matched/s avg={h['matched_s_avg']} best60={h['matched_s_best60']} "
+print(f"SUMMARY {A.label}: matched/s avg={h['matched_s_avg']} first120={h['matched_s_first120']} "
+      f"decay={h['decay_ratio']} best60={h['matched_s_best60']} "
       f"placed/s={h['placed_s_avg']} blk/s={h['blk_s_avg']} txs/blk={h['txs_per_block_avg']} "
       f"timeouts={h['consensus_timeouts']} dissem_clean={h['dissemination_clean']} agree={h['validators_agree']} "
       f"drained={summary['timing']['drained']} bench_rc={A.bench_rc}")
