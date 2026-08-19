@@ -360,6 +360,12 @@ pub struct Metrics {
     pub rocksdb_pending_compaction_bytes: Family<Vec<(String, String)>, Gauge>,
     /// Shared block-cache usage (DB-wide).
     pub rocksdb_block_cache_bytes: Gauge,
+    /// r9: 1 when this node writes the per-block native state batch with
+    /// `disable_wal` (`TORUS_STATE_WRITE_WALOFF`), 0 otherwise. Set ONCE at
+    /// startup from the resolved toggle. Proves the running BINARY honours the
+    /// knob — the bench runner's env digest only proves the var was exported,
+    /// which an older binary would happily ignore.
+    pub state_write_waloff: Gauge,
     /// Cumulative pre-compression vs on-wire bytes per `/2.0` zstd wire path
     /// (labels: `path`, `kind`={pre,wire}). Refreshed from
     /// `torus_network::codec::wire_compression_stats`; ratio = pre/wire in PromQL.
@@ -1398,6 +1404,13 @@ impl Metrics {
             rocksdb_block_cache_bytes.clone(),
         );
 
+        let state_write_waloff = Gauge::default();
+        registry.register(
+            "torus_state_write_waloff",
+            "1 when the per-block state batch is written with disable_wal (TORUS_STATE_WRITE_WALOFF)",
+            state_write_waloff.clone(),
+        );
+
         let wire_compression_bytes = Family::<Vec<(String, String)>, Gauge>::default();
         registry.register(
             "torus_wire_compression_bytes",
@@ -1607,6 +1620,7 @@ impl Metrics {
             rocksdb_memtable_bytes,
             rocksdb_pending_compaction_bytes,
             rocksdb_block_cache_bytes,
+            state_write_waloff,
             wire_compression_bytes,
             gossipsub_slow_peer_events,
             gossipsub_slow_peer_failed_messages,
@@ -1777,6 +1791,27 @@ mod tests {
         }
     }
 
+
+    /// r9 state-write-db-writeopts-waloff: the bench must be able to prove the
+    /// RUNNING BINARY honours `TORUS_STATE_WRITE_WALOFF`, not merely that the
+    /// env var reached the process (an older binary would ignore it and still
+    /// show the var in the runner's env digest). This gauge is set once at
+    /// startup from the resolved toggle, so summary.json can attribute a cell.
+    #[test]
+    fn state_write_waloff_gauge_registers() {
+        let m = Metrics::new();
+        m.state_write_waloff.set(1);
+        let text = m.encode();
+        assert!(
+            text.contains("torus_state_write_waloff"),
+            "gauge not registered:\n{text}"
+        );
+        assert!(
+            text.lines()
+                .any(|l| l.starts_with("torus_state_write_waloff ") && l.ends_with(" 1")),
+            "gauge must encode its value:\n{text}"
+        );
+    }
     /// RocksDB runtime state (S405 BS-3): per-CF L0/memtable/pending-compaction
     /// gauges and the shared block-cache gauge must be registered so the
     /// uptime-accumulating propose cost can be correlated with storage state.

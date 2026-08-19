@@ -63,11 +63,21 @@ pub struct DbTuning {
     pub l0_stop_trigger: Option<i32>,
     pub max_write_buffer_number: i32,
     pub pipelined_write: bool,
+    /// Flush every column family at ONE consistent point (`atomic_flush`).
+    ///
+    /// Off by default (RocksDB's default, exact-today). Turned on together with
+    /// [`state_write_waloff_enabled`], because WAL-off writes are recoverable
+    /// only up to the last memtable flush: without `atomic_flush` each CF picks
+    /// its own recovery point, so a crash could restore the applied-height
+    /// marker (`CF_CONSENSUS_META`) ahead of the native CFs it was written with
+    /// — undetectable state loss that would fork the node. With it, the marker
+    /// and the state it describes always come back together.
+    pub atomic_flush: bool,
 }
 
 impl Default for DbTuning {
     fn default() -> Self {
-        Self::from_raw(None, None, None, None, None)
+        Self::from_raw(None, None, None, None, None, None)
     }
 }
 
@@ -81,6 +91,9 @@ impl DbTuning {
             v("TORUS_ROCKSDB_L0_STOP"),
             v("TORUS_ROCKSDB_MAX_WRITE_BUFFERS"),
             v("TORUS_ROCKSDB_PIPELINED_WRITE"),
+            // Same knob as the write-side WAL-off toggle: the two are one
+            // feature (see the `atomic_flush` field docs).
+            v("TORUS_STATE_WRITE_WALOFF"),
         )
     }
 
@@ -92,6 +105,7 @@ impl DbTuning {
         l0_stop: Option<String>,
         max_write_buffers: Option<String>,
         pipelined: Option<String>,
+        state_write_waloff: Option<String>,
     ) -> Self {
         let pos_i32 = |raw: Option<String>| -> Option<i32> {
             raw.as_deref()
@@ -109,6 +123,7 @@ impl DbTuning {
                 pipelined.as_deref().map(str::trim),
                 Some("1" | "true" | "TRUE" | "yes" | "on")
             ),
+            atomic_flush: parse_state_write_waloff(state_write_waloff),
         }
     }
 }
@@ -224,6 +239,20 @@ impl StateDb {
         }
         if tuning.pipelined_write {
             opts.set_enable_pipelined_write(true);
+        }
+        // r9 state-write-db-writeopts-waloff: REQUIRED companion to writing the
+        // per-block state batch with `disable_wal`. Without a WAL, the only
+        // durable record of a write is the memtable flush, and RocksDB flushes
+        // each column family independently — so the applied-height marker
+        // (`CF_CONSENSUS_META`) could come back from a crash AHEAD of the native
+        // CFs written in the same batch, i.e. the node would believe height H is
+        // applied while its state is missing writes: silent divergence, then a
+        // fork. `atomic_flush` gives all CFs one common recovery point, so the
+        // marker never outruns the state and `replay_gap` re-executes the rest
+        // from the (still WAL'd, still fsync-able) headers/bodies.
+        // Default OFF ⇒ exact-today.
+        if tuning.atomic_flush {
+            opts.set_atomic_flush(true);
         }
         // DB-wide: parallelize flush/compaction and smooth fsync spikes during
         // heavy block writes. (Stock defaults run only 2 background jobs.)
@@ -905,6 +934,63 @@ pub fn sync_wal_on_commit_enabled() -> bool {
     *ENABLED.get_or_init(|| parse_sync_wal_toggle(std::env::var("TORUS_SYNC_WAL_ON_COMMIT").ok()))
 }
 
+/// Runtime toggle: write the per-block native state batch with `disable_wal`
+/// (r9 `state-write-db-writeopts-waloff`).
+///
+/// Default **OFF** ⇒ byte-identical to today (the batch goes to the WAL first,
+/// then the memtable).
+///
+/// WHY: r8 split `state_write` into batch BUILD vs RocksDB WRITE and measured
+/// 87% of it in the write — 322.6 ms of 372.7 ms for an 11.36 MB batch at 300
+/// markets (~36 MB/s), scaling with batch bytes. Every state byte is written
+/// twice (WAL, then memtable→SST); `disable_wal` removes one of those copies
+/// and the write amplification it feeds into flush/compaction.
+///
+/// DURABILITY CONTRACT when ON (node-local; no consensus surface, roots and
+/// matching semantics unchanged):
+///  * The state batch — native CFs + trie/mirror + the applied-height marker —
+///    is no longer WAL-backed, so a hard crash rewinds it to the last memtable
+///    flush. [`DbTuning::atomic_flush`] is enabled by the same knob so that
+///    rewind is CONSISTENT across CFs (marker and state rewind together).
+///  * Committed block headers and bodies are written by a SEPARATE batch on the
+///    consensus thread (`persist_committed_block_durably`) which keeps its WAL
+///    (and its optional `TORUS_SYNC_WAL_ON_COMMIT` fsync). They remain the
+///    durable replay source.
+///  * On restart the node reads the (rewound) applied height and `replay_gap`
+///    re-executes `(applied, committed]` from those headers/bodies. A height it
+///    cannot reconstruct is a FAIL-STOP, never a silent skip — the failure mode
+///    is "this node must resync", not a fork.
+///  * ONE degraded corner: when the commit-time header write already FAILED,
+///    `execute_committed_block` folds that header into this (now WAL-less) flush
+///    batch instead. A crash there loses the header together with the state it
+///    describes, so the replay hits a hole and fail-stops. That needs a
+///    commit-persist error AND a crash, and still ends in resync, not a fork.
+///
+/// Set `TORUS_STATE_WRITE_WALOFF` to `1`/`true`/`yes`/`on` to enable.
+pub fn state_write_waloff_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| parse_state_write_waloff(std::env::var("TORUS_STATE_WRITE_WALOFF").ok()))
+}
+
+/// Pure parse of `TORUS_STATE_WRITE_WALOFF` (default OFF), split from the
+/// `OnceLock` reader so the default is unit-testable without process-global env.
+fn parse_state_write_waloff(raw: Option<String>) -> bool {
+    match raw {
+        Some(v) => matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "on"),
+        None => false,
+    }
+}
+
+/// [`rocksdb::WriteOptions`] for the per-block state batch. `waloff == false`
+/// yields the stock default (exactly what `StateDb::write` uses today).
+pub fn state_write_options(waloff: bool) -> rocksdb::WriteOptions {
+    let mut wo = rocksdb::WriteOptions::default();
+    if waloff {
+        wo.disable_wal(true);
+    }
+    wo
+}
+
 /// Pure parse of the `TORUS_SYNC_WAL_ON_COMMIT` value (default OFF). Split from
 /// the `OnceLock` reader so the default and accepted spellings are unit-testable
 /// without touching process-global state.
@@ -1076,12 +1162,13 @@ mod sync_wal_tests {
 
     #[test]
     fn db_tuning_defaults_are_exact_today() {
-        let t = DbTuning::from_raw(None, None, None, None, None);
+        let t = DbTuning::from_raw(None, None, None, None, None, None);
         assert_eq!(t.stats_level, 1);
         assert_eq!(t.l0_slowdown_trigger, None);
         assert_eq!(t.l0_stop_trigger, None);
         assert_eq!(t.max_write_buffer_number, 4);
         assert!(!t.pipelined_write);
+        assert!(!t.atomic_flush);
         assert_eq!(t, DbTuning::default());
     }
 
@@ -1093,6 +1180,7 @@ mod sync_wal_tests {
             Some("64".into()),
             Some("6".into()),
             Some("1".into()),
+            None,
         );
         assert_eq!(t.stats_level, 2);
         assert_eq!(t.l0_slowdown_trigger, Some(40));
@@ -1106,6 +1194,7 @@ mod sync_wal_tests {
             Some("-3".into()),
             Some("1".into()),
             Some("0".into()),
+            None,
         );
         assert_eq!(g.stats_level, 1);
         assert_eq!(g.l0_slowdown_trigger, None);
@@ -1181,6 +1270,7 @@ mod sync_wal_tests {
             l0_stop_trigger: Some(64),
             max_write_buffer_number: 6,
             pipelined_write: true,
+            atomic_flush: false,
         };
         {
             let db = StateDb::open_with_tuning(dir.path(), &t).expect("open");
@@ -1204,5 +1294,117 @@ mod sync_wal_tests {
         wo.set_low_pri(true);
         db.write_with(batch, &wo).expect("low-pri write");
         assert_eq!(db.get_cf_raw(CF_ACCOUNTS, b"lp").unwrap(), Some(b"v".to_vec()));
+    }
+}
+
+#[cfg(test)]
+mod state_write_waloff_tests {
+    use super::*;
+
+    // r9 state-write-db-writeopts-waloff: the per-block state batch is written
+    // with explicit WriteOptions so the WAL double-write can be skipped. r8
+    // measured 87% of `state_write` in the RocksDB write itself (300m: 322.6 of
+    // 372.7 ms for an 11.36 MB batch => ~36 MB/s), a cost that scales with batch
+    // BYTES — the WAL is written first and then the same bytes go to the memtable.
+
+    #[test]
+    fn state_write_waloff_defaults_off() {
+        // Unset => exact-today (WAL on) => durability byte-identical to today.
+        assert!(!parse_state_write_waloff(None));
+    }
+
+    #[test]
+    fn state_write_waloff_parses_truthy_spellings() {
+        assert!(parse_state_write_waloff(Some("1".to_string())));
+        assert!(parse_state_write_waloff(Some("true".to_string())));
+        assert!(parse_state_write_waloff(Some(" on ".to_string())));
+        assert!(!parse_state_write_waloff(Some("0".to_string())));
+        assert!(!parse_state_write_waloff(Some("".to_string())));
+    }
+
+    /// CROSS-CF RECOVERY CONSISTENCY (why this knob is more than `disable_wal`):
+    /// the state batch spans the native CFs, the trie CFs AND `CF_CONSENSUS_META`
+    /// (the applied-height marker). With the WAL off each CF would otherwise
+    /// recover to its OWN last-flushed point, so a crash could leave the marker
+    /// at height H while the native CFs are durable only through H-k — silent
+    /// state loss the node cannot detect (it would keep building on a wrong root
+    /// => FORK). `atomic_flush` makes RocksDB flush all CFs at one consistent
+    /// point, so marker and state always agree and `replay_gap` heals the rest
+    /// from the still-WAL'd headers/bodies.
+    #[test]
+    fn db_tuning_turns_on_atomic_flush_with_waloff() {
+        let off = DbTuning::from_raw(None, None, None, None, None, None);
+        assert!(!off.atomic_flush, "default must stay exact-today");
+
+        let on = DbTuning::from_raw(None, None, None, None, None, Some("1".to_string()));
+        assert!(
+            on.atomic_flush,
+            "WAL-off REQUIRES atomic_flush for cross-CF recovery consistency"
+        );
+    }
+
+    /// MECHANISM PROOF: `disable_wal` really skips the WAL write. The rows stay
+    /// visible (memtable), but `wal.bytes` must not grow by the payload — that
+    /// skipped write is the ~35 MB/s cost this candidate targets.
+    #[test]
+    fn disable_wal_write_lands_rows_without_growing_the_wal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tuning = DbTuning {
+            stats_level: 1,
+            ..DbTuning::default()
+        };
+        let db = StateDb::open_with_tuning(dir.path(), &tuning).expect("open");
+
+        let payload = vec![0x5Au8; 4096];
+        let before = db.runtime_stats().tickers.expect("tickers").wal_bytes;
+
+        let mut batch = WriteBatch::default();
+        for i in 0..64u32 {
+            batch.put_cf(db.cf_handle(CF_ACCOUNTS).unwrap(), i.to_be_bytes(), &payload);
+        }
+        db.write_with(batch, &state_write_options(true))
+            .expect("wal-off write");
+
+        let after = db.runtime_stats().tickers.expect("tickers").wal_bytes;
+        // Every row is readable straight away — WAL-off changes durability, not visibility.
+        for i in 0..64u32 {
+            assert_eq!(
+                db.get_cf_raw(CF_ACCOUNTS, &i.to_be_bytes()).unwrap(),
+                Some(payload.clone()),
+                "row {i} must be live in the memtable"
+            );
+        }
+        assert!(
+            after - before < 64 * 4096,
+            "wal.bytes grew by {} — the 256 KiB payload must NOT have been WAL-written",
+            after - before
+        );
+    }
+
+    /// The same batch WITH the WAL on DOES grow `wal.bytes` — i.e. the assertion
+    /// above measures a real difference, not a dead ticker.
+    #[test]
+    fn wal_on_write_does_grow_the_wal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tuning = DbTuning {
+            stats_level: 1,
+            ..DbTuning::default()
+        };
+        let db = StateDb::open_with_tuning(dir.path(), &tuning).expect("open");
+
+        let payload = vec![0x5Au8; 4096];
+        let before = db.runtime_stats().tickers.expect("tickers").wal_bytes;
+        let mut batch = WriteBatch::default();
+        for i in 0..64u32 {
+            batch.put_cf(db.cf_handle(CF_ACCOUNTS).unwrap(), i.to_be_bytes(), &payload);
+        }
+        db.write_with(batch, &state_write_options(false))
+            .expect("wal-on write");
+        let after = db.runtime_stats().tickers.expect("tickers").wal_bytes;
+        assert!(
+            after - before >= 64 * 4096,
+            "wal.bytes grew by only {} — expected the full payload",
+            after - before
+        );
     }
 }

@@ -527,6 +527,18 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // 5. Build components
     let metrics = Arc::new(torus_telemetry::Metrics::new());
 
+    // r9 state-write-db-writeopts-waloff: publish the resolved WAL-off toggle
+    // once, as a gauge AND a log line, so a bench cell can prove the RUNNING
+    // BINARY honours `TORUS_STATE_WRITE_WALOFF` (the runner's env digest only
+    // proves the var was exported — an older binary would ignore it).
+    let state_write_waloff = torus_state::db::state_write_waloff_enabled();
+    metrics.state_write_waloff.set(i64::from(state_write_waloff));
+    tracing::info!(
+        state_write_waloff,
+        "r9 state-write WAL mode: per-block state batch disable_wal={} (atomic_flush follows the same knob)",
+        state_write_waloff
+    );
+
     // Mempool (created before app so consensus can drain it during block production)
     let mempool_config = MempoolConfig {
         chain_id: chain_config.chain_id,

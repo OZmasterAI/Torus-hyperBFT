@@ -626,6 +626,34 @@ impl NativeStateOverlay {
         trie_cache: Option<&mut crate::native_trie::NativeTrieCache>,
         member_cache: Option<&mut crate::native_trie::NativeMemberCache>,
     ) -> Result<NativeFlushStats, StateError> {
+        self.flush_with_native_trie_stats_waloff(
+            target,
+            applied_height,
+            trie_cache,
+            member_cache,
+            crate::db::state_write_waloff_enabled(),
+        )
+    }
+
+    /// [`flush_with_native_trie_stats`] with the WAL-off decision passed in
+    /// explicitly (r9 `state-write-db-writeopts-waloff`). The public entry point
+    /// above reads the process-wide `TORUS_STATE_WRITE_WALOFF` toggle; this seam
+    /// lets the tests drive both arms in one process and assert the persisted
+    /// bytes are identical either way.
+    ///
+    /// `waloff` changes ONLY the batch's [`rocksdb::WriteOptions`] — the batch
+    /// contents, their order, the trie/mirror maintenance and the applied-height
+    /// marker are untouched, so the native root is bit-for-bit the same. See
+    /// [`crate::db::state_write_waloff_enabled`] for the durability contract.
+    #[allow(clippy::too_many_arguments)]
+    pub fn flush_with_native_trie_stats_waloff(
+        &self,
+        target: &StateDb,
+        applied_height: Option<u64>,
+        trie_cache: Option<&mut crate::native_trie::NativeTrieCache>,
+        member_cache: Option<&mut crate::native_trie::NativeMemberCache>,
+        waloff: bool,
+    ) -> Result<NativeFlushStats, StateError> {
         let state = self.pending.read().unwrap();
         let raw = target.inner();
 
@@ -724,7 +752,10 @@ impl NativeStateOverlay {
         // appended: this is the batch RocksDB actually gets.
         stats.batch_bytes = batch.size_in_bytes();
         let write_timer = std::time::Instant::now();
-        let write_result = target.write(batch);
+        // r9: `waloff` only sets `disable_wal` on the WriteOptions. `waloff ==
+        // false` is `WriteOptions::default()`, which is exactly what
+        // `StateDb::write` applies — so the default path is unchanged.
+        let write_result = target.write_with(batch, &crate::db::state_write_options(waloff));
         stats.write_db_seconds = write_timer.elapsed().as_secs_f64();
         // Legacy total kept intact so `torus_exec_state_write_seconds` stays
         // comparable across the split.
@@ -1539,6 +1570,93 @@ mod tests {
             stats.batch_bytes >= 64 * 512,
             "batch_bytes {} must cover the 32 KiB of values written",
             stats.batch_bytes
+        );
+    }
+
+    /// r9 state-write-db-writeopts-waloff: DETERMINISM. The WAL is a durability
+    /// mechanism, never a state mechanism — flushing the identical workload with
+    /// the WAL off must leave byte-identical persisted state: same native root,
+    /// same applied-height marker, same rows. This is the consensus-safety proof
+    /// for the knob (a divergent root here would be a fork).
+    #[test]
+    fn waloff_flush_persists_byte_identical_state() {
+        let payload = vec![0x3Cu8; 256];
+        let run = |waloff: bool| {
+            let (db, _dir) = temp_db();
+            let overlay = NativeStateOverlay::new(db.clone());
+            for i in 0u32..48 {
+                StateBackend::put_cf_raw(&overlay, CF_NATIVE_BALANCES, &i.to_be_bytes(), &payload)
+                    .unwrap();
+            }
+            overlay
+                .flush_with_native_trie_stats_waloff(&db, Some(11), None, None, waloff)
+                .unwrap();
+
+            let root = crate::native_trie::native_root_full(&db).unwrap();
+            let marker = StateDb::get_cf_raw(
+                &db,
+                crate::cf::CF_CONSENSUS_META,
+                crate::cf::META_NATIVE_APPLIED_HEIGHT,
+            )
+            .unwrap();
+            let rows: Vec<Option<Vec<u8>>> = (0u32..48)
+                .map(|i| StateDb::get_cf_raw(&db, CF_NATIVE_BALANCES, &i.to_be_bytes()).unwrap())
+                .collect();
+            (root, marker, rows)
+        };
+
+        let (root_on, marker_on, rows_on) = run(false);
+        let (root_off, marker_off, rows_off) = run(true);
+
+        assert_eq!(root_on, root_off, "WAL-off must not perturb the native root");
+        assert_eq!(
+            marker_on, marker_off,
+            "applied-height marker must be identical"
+        );
+        assert_eq!(marker_off, Some(11u64.to_be_bytes().to_vec()));
+        assert_eq!(rows_on, rows_off, "every persisted row must be identical");
+        assert!(rows_off.iter().all(|r| r.as_deref() == Some(&payload[..])));
+    }
+
+    /// MECHANISM: with the knob on, the flush's RocksDB write skips the WAL, so
+    /// `wal.bytes` does not grow by the batch — while `batch_bytes` (what the
+    /// r8 split reports) still covers the payload. This is the 322 ms/blk lever.
+    #[test]
+    fn waloff_flush_skips_the_wal_write() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tuning = crate::db::DbTuning {
+            stats_level: 1,
+            ..Default::default()
+        };
+        let db = StateDb::open_with_tuning(dir.path(), &tuning).expect("open");
+        let overlay = NativeStateOverlay::new(db.clone());
+        let payload = vec![0x77u8; 4096];
+        for i in 0u32..64 {
+            StateBackend::put_cf_raw(&overlay, CF_NATIVE_BALANCES, &i.to_be_bytes(), &payload)
+                .unwrap();
+        }
+
+        let before = db.runtime_stats().tickers.expect("tickers").wal_bytes;
+        let stats = overlay
+            .flush_with_native_trie_stats_waloff(&db, Some(3), None, None, true)
+            .unwrap();
+        let after = db.runtime_stats().tickers.expect("tickers").wal_bytes;
+
+        assert!(
+            stats.batch_bytes >= 64 * 4096,
+            "batch_bytes {} must cover the 256 KiB payload",
+            stats.batch_bytes
+        );
+        assert!(
+            after - before < stats.batch_bytes as u64,
+            "wal.bytes grew {} for a {}-byte batch — the WAL write was NOT skipped",
+            after - before,
+            stats.batch_bytes
+        );
+        // The rows are live regardless (memtable), and so is the marker.
+        assert_eq!(
+            StateDb::get_cf_raw(&db, CF_NATIVE_BALANCES, &7u32.to_be_bytes()).unwrap(),
+            Some(payload.clone())
         );
     }
 }
