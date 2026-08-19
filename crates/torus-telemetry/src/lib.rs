@@ -250,6 +250,17 @@ pub struct Metrics {
     /// PROFILER (s470): commit-callback persistence — block-body JSON write to
     /// CF_BLOCK_BODIES (+ standalone applied-height marker on non-native blocks).
     pub exec_body_persist_seconds: Histogram,
+    /// r4 commit-persist: CONSENSUS-thread commit-time durable persist
+    /// (`persist_committed_block_durably`, FIX 1a: header + body record + manifest
+    /// prune in ONE WriteBatch). Wall time on the single HotStuff thread per commit.
+    pub commit_persist_seconds: Histogram,
+    /// r4 commit-persist: the body-record ENCODE alone inside the commit persist
+    /// (CPU: borrowed bin/JSON encode of the block payload), split from the write.
+    pub commit_body_encode_seconds: Histogram,
+    /// r4 commit-persist: the RocksDB WriteBatch write alone inside the commit
+    /// persist — a long value here is a write-group / write-controller wait
+    /// behind another thread's batch, not encode cost.
+    pub commit_persist_write_seconds: Histogram,
     /// PROFILER (s470): total resting orders across all books, sampled once per
     /// block right after the load/rebuild. Book-depth axis for the
     /// depth-vs-cost correlation (the funnel `orders_resting` counter is a
@@ -1010,6 +1021,25 @@ impl Metrics {
             exec_body_persist_seconds.clone(),
         );
 
+        let commit_persist_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
+        registry.register(
+            "torus_commit_persist_seconds",
+            "Consensus thread: commit-time durable header+body+manifest persist (one WriteBatch, FIX 1a)",
+            commit_persist_seconds.clone(),
+        );
+        let commit_body_encode_seconds = Histogram::new(exponential_buckets(0.0005, 2.0, 14));
+        registry.register(
+            "torus_commit_body_encode_seconds",
+            "Consensus thread: body-record encode alone inside the commit-time persist",
+            commit_body_encode_seconds.clone(),
+        );
+        let commit_persist_write_seconds = Histogram::new(exponential_buckets(0.0005, 2.0, 14));
+        registry.register(
+            "torus_commit_persist_write_seconds",
+            "Consensus thread: RocksDB WriteBatch write alone inside the commit-time persist",
+            commit_persist_write_seconds.clone(),
+        );
+
         let exec_resting_orders = Gauge::default();
         registry.register(
             "torus_exec_resting_orders",
@@ -1366,6 +1396,9 @@ impl Metrics {
             exec_evm_seconds,
             exec_load_books_seconds,
             exec_body_persist_seconds,
+            commit_persist_seconds,
+            commit_body_encode_seconds,
+            commit_persist_write_seconds,
             exec_resting_orders,
             exec_queue_depth,
             exec_throttle_tier,
@@ -1532,6 +1565,9 @@ mod tests {
             "torus_exec_evm_seconds",
             "torus_exec_load_books_seconds",
             "torus_exec_body_persist_seconds",
+            "torus_commit_persist_seconds",
+            "torus_commit_body_encode_seconds",
+            "torus_commit_persist_write_seconds",
             "torus_exec_resting_orders",
             "torus_exec_queue_depth",
             "torus_exec_throttle_tier",
