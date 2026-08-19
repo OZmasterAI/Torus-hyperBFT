@@ -1258,6 +1258,60 @@ pub struct NativeExecContext<T: StateBackend = StateDb> {
     /// L3 save-books attribution (µbench-only): last block's sub-step timings.
     #[cfg(feature = "save-timings")]
     pub last_save_timings: SaveTimings,
+
+    /// r6 engine-untimed-attribution: nanosecond accumulators for the exec
+    /// sub-phases, summed across every `execute_batch` call this context
+    /// serves (a block makes two: pre-EVM and post-EVM). Node-local
+    /// instrumentation only — never read by execution, never part of the
+    /// state root. The caller (`app.rs`) observes them once per block and
+    /// derives the residual against the engine wall clock.
+    pub phase_accum: ExecPhaseAccum,
+}
+
+/// r6 engine-untimed-attribution: per-block nanosecond accumulators for the
+/// exec sub-phases that `exec_phase_margin/match/settle` never covered.
+///
+/// The four *top-level* spans (`phase1_actions`, `margin`, `match`, `settle`)
+/// are DISJOINT and together cover everything `execute_batch` does except its
+/// own flat-action build and bookkeeping; [`Self::timed_total_ns`] sums them.
+/// `settle_pass_a`, `settle_pass_b` and `cache_flush` are NESTED inside
+/// `settle_ns` and must not be added to the total again.
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExecPhaseAccum {
+    /// Phase 1: the non-PlaceOrder action loop (cancels, modifies, transfers,
+    /// governance…) executed inline before the order pipeline.
+    pub phase1_actions_ns: u128,
+    /// Phase 2: margin reservation + market partition (mirrors
+    /// `exec_phase_margin_seconds`).
+    pub margin_ns: u128,
+    /// Phase 3: parallel per-market matching (mirrors
+    /// `exec_phase_match_seconds`).
+    pub match_ns: u128,
+    /// Phase 4: settlement AND the end-of-call cache flush (mirrors
+    /// `exec_phase_settle_seconds`).
+    pub settle_ns: u128,
+    /// Nested in `settle_ns`: parallel settle pass A (scoped-thread per-market
+    /// plan compute). Stays 0 on the canonical sequential path.
+    pub settle_pass_a_ns: u128,
+    /// Nested in `settle_ns`: settle pass B — the single-threaded
+    /// deterministic apply, or the whole sequential loop.
+    pub settle_pass_b_ns: u128,
+    /// Nested in `settle_ns`: `pos_cache.flush_all` + `bal_cache.flush_all`.
+    pub cache_flush_ns: u128,
+}
+
+impl ExecPhaseAccum {
+    /// Sum of the DISJOINT top-level spans — what the caller subtracts from
+    /// the engine wall clock (together with the post-engine tail) to get the
+    /// untimed residual.
+    pub fn timed_total_ns(&self) -> u128 {
+        self.phase1_actions_ns + self.margin_ns + self.match_ns + self.settle_ns
+    }
+
+    /// Seconds view of a nanosecond accumulator field, for `Histogram::observe`.
+    pub fn secs(ns: u128) -> f64 {
+        ns as f64 / 1e9
+    }
 }
 
 /// L3 save-books attribution (µbench-only): breakdown of the mode-2
@@ -1542,6 +1596,7 @@ impl<T: StateBackend> NativeExecContext<T> {
             collect_save_timings: false,
             #[cfg(feature = "save-timings")]
             last_save_timings: SaveTimings::default(),
+            phase_accum: ExecPhaseAccum::default(),
         }
     }
 
@@ -2860,6 +2915,10 @@ impl NativeExecutor {
         let mut total_gas = 0u64;
 
         // ---- Phase 1: Partition and execute non-PlaceOrder actions ----
+        // r6: this loop was inside the untimed engine share — cancels walk the
+        // book and write tombstones, so a cancel-heavy block pays here and
+        // nowhere else in the phase table.
+        let phase1_timer = std::time::Instant::now();
         let mut place_order_indices: Vec<usize> = Vec::new();
 
         for (i, (sender, entry)) in flat.iter().enumerate() {
@@ -2872,6 +2931,7 @@ impl NativeExecutor {
                 }
             }
         }
+        ctx.phase_accum.phase1_actions_ns += phase1_timer.elapsed().as_nanos();
 
         if place_order_indices.is_empty() {
             return NativeBatchResult { results, total_gas };
@@ -3063,9 +3123,11 @@ impl NativeExecutor {
             }
         }
 
+        let margin_elapsed = margin_timer.elapsed();
+        ctx.phase_accum.margin_ns += margin_elapsed.as_nanos();
         if let Some(ref m) = ctx.metrics {
             m.exec_phase_margin_seconds
-                .observe(margin_timer.elapsed().as_secs_f64());
+                .observe(margin_elapsed.as_secs_f64());
         }
 
         // ---- Phase 3: Parallel matching ----
@@ -3118,9 +3180,11 @@ impl NativeExecutor {
                 return NativeBatchResult { results, total_gas };
             }
         };
+        let match_elapsed = match_timer.elapsed();
+        ctx.phase_accum.match_ns += match_elapsed.as_nanos();
         if let Some(ref m) = ctx.metrics {
             m.exec_phase_match_seconds
-                .observe(match_timer.elapsed().as_secs_f64());
+                .observe(match_elapsed.as_secs_f64());
         }
 
         // ---- Phase 4: settlement ----
@@ -3180,16 +3244,22 @@ impl NativeExecutor {
         // sees authoritative state. A flush failure means committed fills are
         // not in the overlay — that block must never be applied, so latch the
         // fatal (the committer halts the execution pipeline on it).
+        // r6: the two sorted flush_all walks are the tail of Phase 4 and were
+        // only ever visible lumped into `exec_phase_settle_seconds`.
+        let cache_flush_timer = std::time::Instant::now();
         if let Err(e) = pos_cache.flush_all(&ctx.positions) {
             ctx.fatal_error = Some(format!("position cache flush failed: {e}"));
         }
         if let Err(e) = bal_cache.flush_all(&ctx.positions) {
             ctx.fatal_error = Some(format!("balance cache flush failed: {e}"));
         }
+        ctx.phase_accum.cache_flush_ns += cache_flush_timer.elapsed().as_nanos();
 
+        let settle_elapsed = settle_timer.elapsed();
+        ctx.phase_accum.settle_ns += settle_elapsed.as_nanos();
         if let Some(ref m) = ctx.metrics {
             m.exec_phase_settle_seconds
-                .observe(settle_timer.elapsed().as_secs_f64());
+                .observe(settle_elapsed.as_secs_f64());
         }
 
         NativeBatchResult { results, total_gas }
@@ -3322,6 +3392,11 @@ impl NativeExecutor {
         bal_cache: &mut BalanceCache,
         pos_cache: &mut PositionCache,
     ) {
+        // r6: the canonical loop IS the apply pass — attribute it to pass B so
+        // the sequential and parallel paths land in the same histogram (the
+        // parallel path's pass A stays 0 here, which is how the phase table
+        // shows which settle path a cell ran).
+        let pass_b_timer = std::time::Instant::now();
         for mbr in market_results {
             let market_id = mbr.market_id;
 
@@ -3477,6 +3552,7 @@ impl NativeExecutor {
                 }
             }
         }
+        ctx.phase_accum.settle_pass_b_ns += pass_b_timer.elapsed().as_nanos();
     }
 
     /// C3: deterministic parallel Phase-4 settlement.
@@ -3539,6 +3615,10 @@ impl NativeExecutor {
         pos_cache: &mut PositionCache,
     ) {
         // ---- Pass A: pure per-market plans on scoped threads ----
+        // r6: pass A is the parallel half (one scoped thread PER MARKET, no
+        // chunking); pass B below is the serial apply. Splitting them tells
+        // whether the settle cost is spawn/join or the serial diet.
+        let pass_a_timer = std::time::Instant::now();
         let plans: Vec<Result<MarketSettlePlan, String>> = {
             let positions = &ctx.positions;
             let margin_configs = &ctx.margin_configs;
@@ -3585,6 +3665,8 @@ impl NativeExecutor {
             })
         };
 
+        ctx.phase_accum.settle_pass_a_ns += pass_a_timer.elapsed().as_nanos();
+
         // Fallback triggers: a worker panic, or ANY position-side fill
         // application failure (backend read error — sick-node territory).
         // Workers borrowed only, so no shared state has mutated and the books
@@ -3616,6 +3698,7 @@ impl NativeExecutor {
         let plans: Vec<MarketSettlePlan> = plans.into_iter().map(|p| p.unwrap()).collect();
 
         // ---- Pass B: deterministic apply, markets ascending by id ----
+        let pass_b_timer = std::time::Instant::now();
         for (mbr, plan) in market_results.into_iter().zip(plans) {
             let market_id = mbr.market_id;
 
@@ -3723,6 +3806,7 @@ impl NativeExecutor {
                 }
             }
         }
+        ctx.phase_accum.settle_pass_b_ns += pass_b_timer.elapsed().as_nanos();
     }
 
     /// C3 pass-A worker: compute one market's settlement plan. PURE with
