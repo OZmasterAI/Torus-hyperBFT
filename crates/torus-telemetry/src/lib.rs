@@ -205,8 +205,18 @@ pub struct Metrics {
     /// rank-root: flush breakdown — native trie maintenance (bucket rehash +
     /// path propagation) inside the atomic flush.
     pub exec_root_seconds: Histogram,
-    /// rank-root: flush breakdown — WriteBatch build + RocksDB write.
+    /// rank-root: flush breakdown — WriteBatch build + RocksDB write
+    /// (== build + db below; kept unsplit for series continuity).
     pub exec_state_write_seconds: Histogram,
+    /// r7: state_write split — serializing the pending overlay maps into the
+    /// WriteBatch. CPU-bound, parallelizable.
+    pub exec_state_write_build_seconds: Histogram,
+    /// r7: state_write split — the atomic `rocksdb::write(batch)` alone
+    /// (WAL + memtable; where a write stall lands).
+    pub exec_state_write_db_seconds: Histogram,
+    /// r7: bytes in the WriteBatch handed to RocksDB per native block — the
+    /// denominator for the db-write time (bytes/s achieved).
+    pub exec_state_write_batch_bytes: Histogram,
     /// rank-root: flush breakdown — post-flush EVM account resync.
     pub exec_evm_resync_seconds: Histogram,
     /// rank-root: buckets rehashed per block by the native-trie maintenance
@@ -1035,6 +1045,27 @@ impl Metrics {
             exec_state_write_seconds.clone(),
         );
 
+        let exec_state_write_build_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
+        registry.register(
+            "torus_exec_state_write_build_seconds",
+            "state_write split: serializing the pending overlay maps into the WriteBatch",
+            exec_state_write_build_seconds.clone(),
+        );
+
+        let exec_state_write_db_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
+        registry.register(
+            "torus_exec_state_write_db_seconds",
+            "state_write split: the atomic rocksdb write(batch) alone (WAL + memtable)",
+            exec_state_write_db_seconds.clone(),
+        );
+
+        let exec_state_write_batch_bytes = Histogram::new(exponential_buckets(4096.0, 2.0, 20));
+        registry.register(
+            "torus_exec_state_write_batch_bytes",
+            "Bytes in the WriteBatch handed to RocksDB per native block",
+            exec_state_write_batch_bytes.clone(),
+        );
+
         let exec_evm_resync_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
         registry.register(
             "torus_exec_evm_resync_seconds",
@@ -1526,6 +1557,9 @@ impl Metrics {
             exec_flush_seconds,
             exec_root_seconds,
             exec_state_write_seconds,
+            exec_state_write_build_seconds,
+            exec_state_write_db_seconds,
+            exec_state_write_batch_bytes,
             exec_evm_resync_seconds,
             exec_root_dirty_buckets,
             exec_root_bucket_scans,
@@ -1793,6 +1827,39 @@ mod tests {
             "torus_commit_persist_seconds",
         ] {
             assert!(text.contains(name), "{name} not registered:\n{text}");
+        }
+    }
+
+    /// r7 state-write-build-vs-db-split: `torus_exec_state_write_seconds` lumps
+    /// the WriteBatch build with the RocksDB write. The two split series plus
+    /// the batch-size histogram must be registered so the bench can tell a
+    /// serialization cost (-> parallel bucket encode) from a WAL/memtable cost
+    /// (-> WriteOptions lever).
+    #[test]
+    fn state_write_split_metrics_register() {
+        let m = Metrics::new();
+        m.exec_state_write_build_seconds.observe(0.01);
+        m.exec_state_write_db_seconds.observe(0.02);
+        m.exec_state_write_batch_bytes.observe(1024.0);
+        let text = m.encode();
+        for name in [
+            "torus_exec_state_write_seconds",
+            "torus_exec_state_write_build_seconds",
+            "torus_exec_state_write_db_seconds",
+            "torus_exec_state_write_batch_bytes",
+        ] {
+            assert!(text.contains(name), "{name} not registered:\n{text}");
+        }
+        // The bench reads _sum/_count deltas; both must be emitted.
+        for suffix in ["_sum", "_count"] {
+            for base in [
+                "torus_exec_state_write_build_seconds",
+                "torus_exec_state_write_db_seconds",
+                "torus_exec_state_write_batch_bytes",
+            ] {
+                let name = format!("{base}{suffix}");
+                assert!(text.contains(&name), "{name} not emitted:\n{text}");
+            }
         }
     }
 

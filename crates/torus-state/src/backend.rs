@@ -637,7 +637,10 @@ impl NativeStateOverlay {
         // pending maps (s450): `state`'s read guard is held for this whole
         // function and the trie only reads the set, so nothing is copied out.
         let dirty = state.native_dirty_ref();
-        let mut write_secs = build_timer.elapsed().as_secs_f64();
+        // r7: the batch BUILD (serializing the pending maps) is a different
+        // lever from the RocksDB WRITE (WAL + memtable), so keep the two
+        // timers apart instead of summing them into one `write_seconds`.
+        let write_build_secs = build_timer.elapsed().as_secs_f64();
 
         // Trie maintenance (rank-root round-3): the unified append computes all
         // ops fallibly BEFORE appending, so on Err nothing was appended and the
@@ -656,6 +659,9 @@ impl NativeStateOverlay {
         let mut stats = NativeFlushStats {
             root_seconds: 0.0,
             write_seconds: 0.0,
+            write_build_seconds: write_build_secs,
+            write_db_seconds: 0.0,
+            batch_bytes: 0,
             dirty_buckets: 0,
             bucket_scans: 0,
             member_hits: 0,
@@ -714,10 +720,15 @@ impl NativeStateOverlay {
             batch.put_cf(cf, crate::cf::META_NATIVE_APPLIED_HEIGHT, marker);
         }
 
+        // Measured AFTER the trie/mirror puts and the applied-height marker were
+        // appended: this is the batch RocksDB actually gets.
+        stats.batch_bytes = batch.size_in_bytes();
         let write_timer = std::time::Instant::now();
         let write_result = target.write(batch);
-        write_secs += write_timer.elapsed().as_secs_f64();
-        stats.write_seconds = write_secs;
+        stats.write_db_seconds = write_timer.elapsed().as_secs_f64();
+        // Legacy total kept intact so `torus_exec_state_write_seconds` stays
+        // comparable across the split.
+        stats.write_seconds = stats.write_build_seconds + stats.write_db_seconds;
 
         match write_result {
             Ok(()) => {
@@ -772,8 +783,20 @@ impl NativeStateOverlay {
 pub struct NativeFlushStats {
     /// Native-trie maintenance time (bucket rehash + path propagation).
     pub root_seconds: f64,
-    /// WriteBatch build + atomic RocksDB write time.
+    /// WriteBatch build + atomic RocksDB write time
+    /// (== `write_build_seconds` + `write_db_seconds`; kept for continuity of
+    /// the `torus_exec_state_write_seconds` series across the r7 split).
     pub write_seconds: f64,
+    /// r7 split: serializing the pending overlay maps into the WriteBatch
+    /// (`append_to_batch`) — CPU, parallelizable.
+    pub write_build_seconds: f64,
+    /// r7 split: the atomic `rocksdb::write(batch)` alone — WAL + memtable,
+    /// where a write stall shows up. Includes the trie/mirror puts appended
+    /// during the root phase (their *append* cost is in `root_seconds`).
+    pub write_db_seconds: f64,
+    /// r7 split: size of the batch handed to RocksDB, measured after the
+    /// trie/mirror puts and the applied-height marker were appended.
+    pub batch_bytes: usize,
     /// Buckets rehashed (uncached: distinct dirty buckets; cached: post-elision).
     pub dirty_buckets: usize,
     /// rank-root round-3: CF_NATIVE_HASHED prefix-scans performed this flush.
@@ -1468,5 +1491,54 @@ mod tests {
         StateBackend::put_cf_raw(&overlay, cf, b"k2", b"v2").unwrap();
         overlay.revert_to_checkpoint();
         assert_eq!(overlay.pending_write_count(), 0);
+    }
+
+    /// r7 state-write-build-vs-db-split: `write_seconds` used to lump the
+    /// WriteBatch *build* (serializing the pending maps — parallelizable) with
+    /// the RocksDB *write* (WAL + memtable — a WriteOptions/WAL lever). The two
+    /// are now reported separately and must still sum to the old total, so the
+    /// existing `torus_exec_state_write_seconds` series stays comparable across
+    /// the split. `batch_bytes` is the batch handed to RocksDB, measured after
+    /// the trie/mirror puts and the applied-height marker were appended.
+    #[test]
+    fn flush_stats_split_build_and_db_write() {
+        let (db, _dir) = temp_db();
+        let cf = CF_NATIVE_BALANCES;
+        let overlay = NativeStateOverlay::new(db.clone());
+        // Enough payload that the batch is unambiguously non-empty.
+        let payload = vec![0xABu8; 512];
+        for i in 0u32..64 {
+            StateBackend::put_cf_raw(&overlay, cf, &i.to_be_bytes(), &payload).unwrap();
+        }
+
+        let stats = overlay
+            .flush_with_native_trie_stats(&db, Some(7), None, None)
+            .unwrap();
+
+        assert!(
+            stats.write_build_seconds > 0.0,
+            "batch build must be timed: {}",
+            stats.write_build_seconds
+        );
+        assert!(
+            stats.write_db_seconds > 0.0,
+            "rocksdb write must be timed: {}",
+            stats.write_db_seconds
+        );
+        let sum = stats.write_build_seconds + stats.write_db_seconds;
+        assert!(
+            (sum - stats.write_seconds).abs() < 1e-9,
+            "build ({}) + db ({}) = {} must equal the legacy total {}",
+            stats.write_build_seconds,
+            stats.write_db_seconds,
+            sum,
+            stats.write_seconds
+        );
+        // 64 rows x 512-byte values, plus keys, trie/mirror puts and the marker.
+        assert!(
+            stats.batch_bytes >= 64 * 512,
+            "batch_bytes {} must cover the 32 KiB of values written",
+            stats.batch_bytes
+        );
     }
 }
