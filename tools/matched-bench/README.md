@@ -44,7 +44,10 @@ tools/matched-bench/run-cell.sh /home/18c/projects/wt/matched-bench nosettle-r1 
    `TORUS_NATIVE_ORDERS_PER_BLOCK_CAP=max(50000, N*BATCH*1.25)`,
    `TORUS_VERIFIED_SENDER_CACHE_CAP=max(16384, 64*N*2.5)`,
    `TORUS_NATIVE_BLOCK_BYTES_CAP=clamp(N*BATCH*150, 6 MB, 12 MB)`; `BLOCK_CAP=100`
-   reproduces today's defaults exactly (control cell). The summary gains
+   reproduces the compiled node defaults exactly (control cell). Since the r3
+   merge the harness DEFAULTS to `BLOCK_CAP=200` (the sweep winner: +28% matched/s
+   vs the same-binary cap-100 control); the node-code default stays 100 (WAN
+   dissemination guard, env-only raise until a full-mesh bench earns it). The summary gains
    `cell.block_cap`, `headline.txs_per_block_avg`, `headline.consensus_timeouts`,
    `headline.dissemination_clean` and a `dissemination` block (per-node counts of
    HASH-ONLY manifest pushes, body-fetch exhaustion, sync fallbacks, DA outbound

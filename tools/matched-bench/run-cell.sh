@@ -27,7 +27,9 @@
 #                (TORUS_NATIVE_TOTAL_BLOCK_CAP=N plus the companion caps that
 #                would otherwise bind first — see block_cap_bundle below).
 #                Applied after RECORD_ENV and before EXTRA_ENV, so EXTRA_ENV
-#                can still override any single knob. Unset => untouched (cap 100).
+#                can still override any single knob. DEFAULT 200 since the r3
+#                merge (block-cap-raise-sweep winner); BLOCK_CAP=100 is the
+#                cap-100 control (reproduces the compiled node defaults exactly).
 #   OVERWRITE=1  allow reusing an existing non-empty results dir
 #   HEALTH_TIMEOUT (240 s)  DRAIN_TIMEOUT (180 s)
 set -uo pipefail
@@ -105,7 +107,10 @@ block_cap_bundle() { # $1=N -> prints K=V lines
     printf 'TORUS_NATIVE_TOTAL_BLOCK_CAP=%s\nTORUS_NATIVE_ORDERS_PER_BLOCK_CAP=%s\nTORUS_VERIFIED_SENDER_CACHE_CAP=%s\nTORUS_NATIVE_BLOCK_BYTES_CAP=%s\n' \
         "$n" "$orders" "$cache" "$bytes"
 }
-BLOCK_CAP=${BLOCK_CAP:-}
+# r3 merge: the harness defaults to the block-cap-raise-sweep winner (cap 200).
+# The compiled node default stays 100 (WAN dissemination guard — the raise is
+# env-only until a full-mesh bench earns it); BLOCK_CAP=100 = control cell.
+BLOCK_CAP=${BLOCK_CAP:-200}
 if [ -n "$BLOCK_CAP" ]; then
     [[ "$BLOCK_CAP" =~ ^[0-9]+$ ]] && [ "$BLOCK_CAP" -ge 1 ] || { echo "FATAL: BLOCK_CAP must be a positive integer" >&2; exit 2; }
     mapfile -t BLOCK_CAP_ENV < <(block_cap_bundle "$BLOCK_CAP")
