@@ -100,3 +100,27 @@ exec_thread_busy_fraction; wall ms per committed block), `agreement`, `cpu`,
 - n=1 is not a result: run >=2 reps per cell.
 - Never two benches at once; never build while a bench runs (pre-flight guards).
 - Determinism is sacred: `validators_agree=false` = candidate REJECTED.
+
+## RocksDB write-stall attribution (r3 exec-write-stall-attribution)
+
+`phase_by_node.<val>.rocksdb` in `summary.json` (and the matching
+`torus_rocksdb_*` columns of `sampler.csv`) carry the DB-wide picture over the
+window: `stall_ms_per_s` / `stall_ms_per_native_block` (RocksDB
+`rocksdb.stall.micros` — write-controller stalls: L0 / memtable / pending-
+compaction triggers), `writes_per_s_self` vs `writes_per_s_other` (write-group
+leaders vs followers: a high `other` share = writes queueing behind another
+thread's batch), WAL / flush / compaction MB/s and compaction CPU cores, memtable
+/ immutable / L0-max / pending-compaction gauges, `delayed_write_rate`,
+`write_stopped`, `trade_writer_queued_batches`. With
+`EXTRA_ENV='TORUS_ROCKSDB_STATS=2'` the node also exports RocksDB's own
+`db.write.micros` / `db.write.stall` histograms (`db_write_ms_avg`,
+`write_stall_ms_avg`, `db_write_p99_ms_last`). Two split timers:
+`exec_body_persist_put_ms_per_call` (the exec-time body put alone, encode
+excluded) and `commit_persist_ms_per_call` (consensus-thread FIX 1a batch).
+
+Node knobs the cell can A/B via `EXTRA_ENV` (all node-local, format-neutral):
+`TORUS_BG_WRITER_CHUNK_KVS` (default 2048; `0` = one trade batch per block as
+before r3), `TORUS_BG_WRITER_LOW_PRI` (default 1), `TORUS_ROCKSDB_STATS`
+(0/1/2, default 1), `TORUS_ROCKSDB_L0_SLOWDOWN` / `TORUS_ROCKSDB_L0_STOP`
+(RocksDB 20/36 when unset), `TORUS_ROCKSDB_MAX_WRITE_BUFFERS` (4),
+`TORUS_ROCKSDB_PIPELINED_WRITE` (0), `TORUS_ROCKSDB_STATS_INTERVAL_SECS` (5).
