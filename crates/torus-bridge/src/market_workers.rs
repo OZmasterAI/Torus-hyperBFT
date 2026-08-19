@@ -165,14 +165,56 @@ impl MarketWorkerPool {
     /// Resolve the worker cap: `TORUS_MATCH_WORKERS` (clamped to >= 1) if set and
     /// parseable, else the host parallelism, else 1.
     fn resolve_worker_cap() -> usize {
-        if let Ok(raw) = std::env::var("TORUS_MATCH_WORKERS") {
-            if let Ok(n) = raw.parse::<usize>() {
-                return n.max(1);
+        Self::resolve_worker_cap_named(None)
+    }
+
+    /// Resolve a worker cap from `primary` (an env var name, e.g.
+    /// `TORUS_SETTLE_WORKERS`) if set and parseable, else `TORUS_MATCH_WORKERS`,
+    /// else the host parallelism, else 1. Always >= 1. Resolved per call —
+    /// cheap and stateless, so a phase can be capped independently without a
+    /// process-global toggle.
+    pub(crate) fn resolve_worker_cap_named(primary: Option<&str>) -> usize {
+        for var in primary
+            .into_iter()
+            .chain(std::iter::once("TORUS_MATCH_WORKERS"))
+        {
+            if let Ok(raw) = std::env::var(var) {
+                if let Ok(n) = raw.parse::<usize>() {
+                    return n.max(1);
+                }
             }
         }
         std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1)
+    }
+
+    /// Pack `markets` (`(market_id, weight)` in caller order) into at most
+    /// `max_workers` non-empty chunks of INPUT INDICES via [`Self::assign_chunks`].
+    ///
+    /// Each returned chunk lists its indices ascending, so when the caller's
+    /// slice is market-id sorted a worker walks its markets in market-id order.
+    /// Empty chunks are dropped (possible when `max_workers` exceeds the market
+    /// count), and chunk order follows worker index — the layout is a pure
+    /// function of the `(id, weight)` pairs and independent of input order.
+    ///
+    /// This is a SCHEDULING primitive: callers must reassemble results by input
+    /// index so that the chunk layout cannot leak into observable output.
+    pub(crate) fn chunk_indices(
+        markets: &[(MarketId, usize)],
+        max_workers: usize,
+    ) -> Vec<Vec<usize>> {
+        if markets.is_empty() {
+            return Vec::new();
+        }
+        let workers = max_workers.max(1).min(markets.len());
+        let assignment = Self::assign_chunks(markets, workers);
+        let mut chunks: Vec<Vec<usize>> = vec![Vec::new(); workers];
+        for (i, &w) in assignment.iter().enumerate() {
+            chunks[w].push(i);
+        }
+        chunks.retain(|c| !c.is_empty());
+        chunks
     }
 
     /// LPT (longest-processing-time) assignment of markets to `workers`.
@@ -418,5 +460,101 @@ mod capped_chunking_tests {
             "panic payload must be preserved, got: {}",
             err.message
         );
+    }
+}
+
+#[cfg(test)]
+mod chunk_indices_tests {
+    use super::*;
+
+    /// Every input index lands in exactly one chunk, and each chunk lists its
+    /// indices ascending (so a worker walks its markets in market-id order
+    /// when the input slice is market-id sorted).
+    #[test]
+    fn covers_every_index_once_ascending() {
+        let markets: Vec<(MarketId, usize)> = (0..17u64)
+            .map(|i| (i as MarketId, (i as usize * 7) % 13))
+            .collect();
+        for workers in [1usize, 2, 3, 5, 8, 17, 64] {
+            let chunks = MarketWorkerPool::chunk_indices(&markets, workers);
+            assert!(
+                chunks.iter().all(|c| !c.is_empty()),
+                "workers={workers}: empty chunk emitted"
+            );
+            assert!(chunks.len() <= workers.min(markets.len()));
+            for c in &chunks {
+                let mut sorted = c.clone();
+                sorted.sort_unstable();
+                assert_eq!(&sorted, c, "workers={workers}: chunk not ascending");
+            }
+            let mut all: Vec<usize> = chunks.iter().flatten().copied().collect();
+            all.sort_unstable();
+            assert_eq!(
+                all,
+                (0..markets.len()).collect::<Vec<_>>(),
+                "workers={workers}: index coverage"
+            );
+        }
+    }
+
+    /// Cap 1 (and 0, clamped) means one chunk holding everything in input order.
+    #[test]
+    fn cap_one_is_one_sequential_chunk() {
+        let markets: Vec<(MarketId, usize)> = (0..6u64).map(|i| (i as MarketId, 3)).collect();
+        for workers in [0usize, 1] {
+            let chunks = MarketWorkerPool::chunk_indices(&markets, workers);
+            assert_eq!(chunks, vec![vec![0, 1, 2, 3, 4, 5]], "workers={workers}");
+        }
+    }
+
+    /// Pure and input-order independent: the same (id, weight) multiset yields
+    /// the same partition of market ids regardless of slice order.
+    #[test]
+    fn partition_is_input_order_independent() {
+        let a: Vec<(MarketId, usize)> = vec![(1, 10), (2, 1), (3, 7), (4, 7), (5, 2)];
+        let b: Vec<(MarketId, usize)> = vec![(4, 7), (1, 10), (5, 2), (3, 7), (2, 1)];
+        let part = |m: &[(MarketId, usize)]| -> Vec<Vec<MarketId>> {
+            let mut p: Vec<Vec<MarketId>> = MarketWorkerPool::chunk_indices(m, 3)
+                .into_iter()
+                .map(|c| {
+                    let mut v: Vec<MarketId> = c.into_iter().map(|i| m[i].0).collect();
+                    v.sort_unstable();
+                    v
+                })
+                .collect();
+            p.sort();
+            p
+        };
+        assert_eq!(part(&a), part(&b));
+    }
+
+    /// LPT actually balances: one fat market must not be joined by the next
+    /// fattest while a free worker exists.
+    #[test]
+    fn lpt_balances_skewed_weights() {
+        let markets: Vec<(MarketId, usize)> = vec![(1, 100), (2, 90), (3, 5), (4, 5)];
+        let chunks = MarketWorkerPool::chunk_indices(&markets, 2);
+        assert_eq!(chunks.len(), 2);
+        let loads: Vec<usize> = chunks
+            .iter()
+            .map(|c| c.iter().map(|&i| markets[i].1).sum())
+            .collect();
+        assert!(
+            loads.iter().max().unwrap() - loads.iter().min().unwrap() <= 10,
+            "unbalanced LPT chunks: {loads:?}"
+        );
+    }
+
+    #[test]
+    fn empty_input_yields_no_chunks() {
+        assert!(MarketWorkerPool::chunk_indices(&[], 4).is_empty());
+    }
+
+    /// The settle path resolves its cap from `TORUS_SETTLE_WORKERS` first and
+    /// falls back to the matching cap; both clamp to >= 1.
+    #[test]
+    fn named_cap_falls_back_and_clamps() {
+        assert!(MarketWorkerPool::resolve_worker_cap_named(None) >= 1);
+        assert!(MarketWorkerPool::resolve_worker_cap_named(Some("TORUS_NO_SUCH_VAR_XYZ")) >= 1);
     }
 }

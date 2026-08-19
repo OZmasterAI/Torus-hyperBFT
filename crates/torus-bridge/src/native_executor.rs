@@ -351,9 +351,25 @@ fn parallel_settle_min_fills() -> usize {
 enum SettleMode {
     /// Env toggle + work gate (the live `execute_batch` path).
     Auto,
-    /// Pinned by the caller (tests / A-B benches): true = parallel whenever
-    /// >=2 markets have work, false = always the sequential loop.
-    Force(bool),
+    /// Pinned by the caller (tests / A-B benches): `parallel = true` runs the
+    /// parallel path whenever >=2 markets have work, `false` always runs the
+    /// sequential loop. `workers` pins the pass-A chunk-worker cap (`None` =
+    /// the production cap); it is a scheduling knob only — every value must
+    /// produce byte-identical state.
+    Force {
+        parallel: bool,
+        workers: Option<usize>,
+    },
+}
+
+/// R6: pass-A settle worker cap. `TORUS_SETTLE_WORKERS` overrides, else
+/// `TORUS_MATCH_WORKERS`, else host parallelism (min 1). Read per block —
+/// the resolution is a couple of env lookups against a per-block cost of
+/// hundreds of ms of plan compute.
+fn settle_worker_cap() -> usize {
+    crate::market_workers::MarketWorkerPool::resolve_worker_cap_named(Some(
+        "TORUS_SETTLE_WORKERS",
+    ))
 }
 
 #[cfg(test)]
@@ -2764,7 +2780,26 @@ impl NativeExecutor {
         actions: &[(Address, NativeAction)],
         parallel: bool,
     ) -> NativeBatchResult {
-        Self::execute_batch_inner(ctx, actions, SettleMode::Force(parallel), EngineMode::Force(0))
+        Self::execute_batch_settle_workers(ctx, actions, parallel, None)
+    }
+
+    /// R6: `execute_batch_settle_mode` with the pass-A settle worker cap
+    /// pinned too (`None` = production cap). Pass A packs markets into at most
+    /// `workers` chunks; the layout is pure scheduling, so the differential
+    /// tests pin every cap from 1 (serial pass A) upwards and demand
+    /// byte-identical state. Env-free so it cannot race other test threads.
+    pub fn execute_batch_settle_workers<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+        actions: &[(Address, NativeAction)],
+        parallel: bool,
+        workers: Option<usize>,
+    ) -> NativeBatchResult {
+        Self::execute_batch_inner(
+            ctx,
+            actions,
+            SettleMode::Force { parallel, workers },
+            EngineMode::Force(0),
+        )
     }
 
     /// L3-ENG: `execute_batch` with the engine thread count pinned explicitly
@@ -2783,11 +2818,22 @@ impl NativeExecutor {
             Self::execute_batch_inner(
                 ctx,
                 actions,
-                SettleMode::Force(true),
+                SettleMode::Force {
+                    parallel: true,
+                    workers: None,
+                },
                 EngineMode::Force(threads),
             )
         } else {
-            Self::execute_batch_inner(ctx, actions, SettleMode::Force(false), EngineMode::Force(0))
+            Self::execute_batch_inner(
+                ctx,
+                actions,
+                SettleMode::Force {
+                    parallel: false,
+                    workers: None,
+                },
+                EngineMode::Force(0),
+            )
         }
     }
 
@@ -3138,7 +3184,7 @@ impl NativeExecutor {
         // semantics that the parallel path must reproduce byte-for-byte.
         let use_parallel = market_results.len() >= 2
             && match settle_mode {
-                SettleMode::Force(parallel) => parallel,
+                SettleMode::Force { parallel, .. } => parallel,
                 SettleMode::Auto => {
                     let total_fills: usize = market_results
                         .iter()
@@ -3153,6 +3199,14 @@ impl NativeExecutor {
                 }
             };
         if use_parallel {
+            // R6: pass-A worker cap. Pinned caps come from `SettleMode::Force`
+            // (tests / A-B benches); production resolves it from the env.
+            let settle_workers = match settle_mode {
+                SettleMode::Force {
+                    workers: Some(w), ..
+                } => w.max(1),
+                _ => settle_worker_cap(),
+            };
             Self::settle_market_results_parallel(
                 ctx,
                 market_results,
@@ -3161,6 +3215,7 @@ impl NativeExecutor {
                 &mut total_gas,
                 &mut bal_cache,
                 &mut pos_cache,
+                settle_workers,
             );
         } else {
             Self::settle_market_results_sequential(
@@ -3481,8 +3536,10 @@ impl NativeExecutor {
 
     /// C3: deterministic parallel Phase-4 settlement.
     ///
-    /// Pass A (parallel, scoped thread per market — same pool shape as
-    /// Phase-3 matching): a PURE compute of each market's settle plan. Workers
+    /// Pass A (parallel, markets LPT-packed across at most `max_workers`
+    /// scoped threads — same pool shape as Phase-3 matching): a PURE compute
+    /// of each market's settle plan. Chunking is scheduling only; plans are
+    /// scattered back by input index, so pass B is unaffected. Workers
     /// only BORROW (`&MarketBatchResult`, `&[PreparedOrder]`, `&PositionManager`)
     /// and mutate nothing shared:
     ///   - position transitions land in a per-market `PositionCache` — position
@@ -3537,52 +3594,112 @@ impl NativeExecutor {
         total_gas: &mut u64,
         bal_cache: &mut BalanceCache,
         pos_cache: &mut PositionCache,
+        max_workers: usize,
     ) {
-        // ---- Pass A: pure per-market plans on scoped threads ----
+        // ---- Pass A: pure per-market plans on CAPPED chunk workers ----
+        //
+        // R6: this used to spawn one scoped thread PER MARKET. At 300 markets
+        // that is 300 threads on ~5 free cores plus 300x thread prologue for
+        // work that is often only a few fills wide. Markets are now packed by
+        // the same deterministic LPT chunker the matching pool and the
+        // save-books drain use (`MarketWorkerPool::chunk_indices`), and each
+        // worker computes its chunk's plans sequentially.
+        //
+        // Chunk layout is SCHEDULING ONLY: results are scattered back by input
+        // index, so `plans[i]` always belongs to `market_results[i]` no matter
+        // how markets were packed. `compute_market_settle_plan` is pure in
+        // (`&PositionManager` reads, market config, this market's
+        // `MarketBatchResult` + `PreparedOrder`s, block height, timestamp) and
+        // writes only into its own fresh `PositionCache` — no pass-A plan can
+        // observe another market's pass-A output, so packing several markets
+        // onto one worker cannot change any plan. Pass B is untouched.
         let plans: Vec<Result<MarketSettlePlan, String>> = {
             let positions = &ctx.positions;
             let margin_configs = &ctx.margin_configs;
             let (block_height, timestamp) = (ctx.block_height, ctx.timestamp);
-            std::thread::scope(|s| {
-                let handles: Vec<_> = market_results
-                    .iter()
-                    .map(|mbr| {
-                        let prepared: &[PreparedOrder<'_>] = market_batches
-                            .get(&mbr.market_id)
-                            .map(|v| v.as_slice())
-                            .unwrap_or(&[]);
-                        let cfg = margin_configs.get(&mbr.market_id);
-                        s.spawn(move || {
-                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                Self::compute_market_settle_plan(
-                                    positions,
-                                    cfg,
-                                    mbr,
-                                    prepared,
-                                    block_height,
-                                    timestamp,
-                                )
-                            }))
-                            .map_err(|payload| {
-                                if let Some(s) = payload.downcast_ref::<&'static str>() {
-                                    (*s).to_string()
-                                } else if let Some(s) = payload.downcast_ref::<String>() {
-                                    s.clone()
-                                } else {
-                                    "non-string panic payload".to_string()
-                                }
+            let mrs: &[crate::market_workers::MarketBatchResult] = &market_results;
+
+            // Per-market weight for the LPT packer: plan cost is one pass over
+            // the market's orders plus two position round-trips per fill.
+            let weights: Vec<(MarketId, usize)> = mrs
+                .iter()
+                .map(|mbr| {
+                    let fills: usize = mbr.results.iter().map(|r| r.result.fills.len()).sum();
+                    (mbr.market_id, mbr.results.len() + 2 * fills)
+                })
+                .collect();
+
+            // One market's contained plan compute. `&` so it can be shared by
+            // every worker (copy-captures only the two u64s and the refs).
+            let plan_for = |i: usize| -> Result<MarketSettlePlan, String> {
+                let mbr = &mrs[i];
+                let prepared: &[PreparedOrder<'_>] = market_batches
+                    .get(&mbr.market_id)
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[]);
+                let cfg = margin_configs.get(&mbr.market_id);
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    Self::compute_market_settle_plan(
+                        positions,
+                        cfg,
+                        mbr,
+                        prepared,
+                        block_height,
+                        timestamp,
+                    )
+                }))
+                .map_err(|payload| {
+                    if let Some(s) = payload.downcast_ref::<&'static str>() {
+                        (*s).to_string()
+                    } else if let Some(s) = payload.downcast_ref::<String>() {
+                        s.clone()
+                    } else {
+                        "non-string panic payload".to_string()
+                    }
+                })
+            };
+
+            let chunks =
+                crate::market_workers::MarketWorkerPool::chunk_indices(&weights, max_workers);
+
+            if chunks.len() <= 1 {
+                // One worker (cap 1, or a single market): no scope, no spawn.
+                (0..mrs.len()).map(plan_for).collect()
+            } else {
+                let mut slots: Vec<Option<Result<MarketSettlePlan, String>>> =
+                    (0..mrs.len()).map(|_| None).collect();
+                let plan_for = &plan_for;
+                let chunk_out: Vec<Vec<(usize, Result<MarketSettlePlan, String>)>> =
+                    std::thread::scope(|s| {
+                        let handles: Vec<_> = chunks
+                            .into_iter()
+                            .map(|chunk| {
+                                s.spawn(move || {
+                                    chunk
+                                        .into_iter()
+                                        .map(|i| (i, plan_for(i)))
+                                        .collect::<Vec<_>>()
+                                })
                             })
-                        })
-                    })
-                    .collect();
-                handles
+                            .collect();
+                        handles
+                            .into_iter()
+                            .map(|h| h.join().unwrap_or_default())
+                            .collect()
+                    });
+                // A worker thread that died OUTSIDE the per-market containment
+                // yields an empty vec; its markets stay `None` and become the
+                // fallback trigger below (never a silently skipped market).
+                for out in chunk_out {
+                    for (i, plan) in out {
+                        slots[i] = Some(plan);
+                    }
+                }
+                slots
                     .into_iter()
-                    .map(|h| {
-                        h.join()
-                            .unwrap_or_else(|_| Err("settle worker thread died".to_string()))
-                    })
+                    .map(|p| p.unwrap_or_else(|| Err("settle worker thread died".to_string())))
                     .collect()
-            })
+            }
         };
 
         // Fallback triggers: a worker panic, or ANY position-side fill
