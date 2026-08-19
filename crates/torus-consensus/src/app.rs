@@ -1638,6 +1638,14 @@ impl ExecutionContext {
                     if let Some(ref m) = self.metrics {
                         m.exec_root_seconds.observe(stats.root_seconds);
                         m.exec_state_write_seconds.observe(stats.write_seconds);
+                        // r7: build (serialize pending maps) vs db (WAL +
+                        // memtable) — which half the ~380-400 ms/blk at 300m is.
+                        m.exec_state_write_build_seconds
+                            .observe(stats.write_build_seconds);
+                        m.exec_state_write_db_seconds
+                            .observe(stats.write_db_seconds);
+                        m.exec_state_write_batch_bytes
+                            .observe(stats.batch_bytes as f64);
                         m.exec_root_dirty_buckets.observe(stats.dirty_buckets as f64);
                         m.exec_root_bucket_scans.inc_by(stats.bucket_scans as u64);
                         m.member_cache_hits.inc_by(stats.member_hits as u64);

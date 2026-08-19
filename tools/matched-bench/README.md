@@ -89,7 +89,7 @@ window on val0, matched_s_best60 = best sliding 60 s over the whole sample,
 placed_s_avg, blk_s_avg, blk_s_worst60, peak_exec_queue_depth, validators_agree),
 `funnel_by_node`, `phase_by_node` (per-NATIVE-block ms and % of block / % of wall
 for evm, verify, replay_guard, load_books, engine[margin/match/settle],
-save_books, flush[root/state_write/evm_resync], body_persist, residual;
+save_books, flush[root/state_write{build,db}/evm_resync], body_persist, residual;
 exec_thread_busy_fraction; wall ms per committed block), `agreement`, `cpu`,
 `cell` (env, bench cmd), `binaries`, `genesis`, `timing`, `bench_log_tail`.
 
@@ -117,6 +117,26 @@ thread's batch), WAL / flush / compaction MB/s and compaction CPU cores, memtabl
 `write_stall_ms_avg`, `db_write_p99_ms_last`). Two split timers:
 `exec_body_persist_put_ms_per_call` (the exec-time body put alone, encode
 excluded) and `commit_persist_ms_per_call` (consensus-thread FIX 1a batch).
+
+## Flush `state_write` split (r7 state-write-build-vs-db-split)
+
+`phase_by_node.<val>.phases.flush` splits the old lumped `state_write_ms` into:
+
+- `state_write_build_ms` — serializing the pending overlay maps into the
+  `WriteBatch` (`append_to_batch`). CPU, parallelizable -> a parallel
+  bucket-encode lever.
+- `state_write_db_ms` — the atomic `rocksdb::write(batch)` alone (WAL +
+  memtable, where a write stall lands) -> a `WriteOptions`/WAL/memtable lever.
+  The trie/mirror puts appended during the root phase ride in this batch; their
+  *append* cost stays in `root_ms`.
+- `state_write_batch_kb` — mean bytes handed to RocksDB per native block, and
+  `state_write_db_mb_per_s` — the throughput that implies.
+
+`state_write_build_ms + state_write_db_ms == state_write_ms` to rounding by
+construction; `state_write_ms` is unchanged so the series stays comparable
+across the split. On a pre-r7 binary the three new fields read 0.0 / null.
+Metric names: `torus_exec_state_write_build_seconds`,
+`torus_exec_state_write_db_seconds`, `torus_exec_state_write_batch_bytes`.
 
 Node knobs the cell can A/B via `EXTRA_ENV` (all node-local, format-neutral):
 `TORUS_BG_WRITER_CHUNK_KVS` (default 2048; `0` = one trade batch per block as
