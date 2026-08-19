@@ -200,6 +200,31 @@ pub struct Metrics {
     pub exec_phase_margin_seconds: Histogram,
     pub exec_phase_match_seconds: Histogram,
     pub exec_phase_settle_seconds: Histogram,
+    /// r6 engine-untimed-attribution: the spans inside `exec_engine_seconds`
+    /// that margin/match/settle never covered. Unlike the three above (one
+    /// observation per `execute_batch` call that carries orders), these are
+    /// accumulated in nanoseconds on the exec context and observed EXACTLY
+    /// ONCE PER NATIVE BLOCK, so `_sum / _count` is ms-per-block directly and
+    /// `_count` tracks `exec_engine_seconds_count`.
+    ///
+    /// Phase-1 loop: every non-PlaceOrder action (cancels, modifies, deposits,
+    /// governance) executed inline before the order pipeline.
+    pub exec_phase1_actions_seconds: Histogram,
+    /// Parallel settle pass A: the per-market pure settle-plan compute on
+    /// scoped threads. Zero when the canonical sequential loop ran.
+    pub exec_settle_pass_a_seconds: Histogram,
+    /// Settle pass B: the single-threaded deterministic apply (both the
+    /// parallel path's apply pass and the whole sequential loop).
+    pub exec_settle_pass_b_seconds: Histogram,
+    /// End-of-`execute_batch` position + balance cache `flush_all` into the
+    /// overlay (nested inside `exec_phase_settle_seconds`).
+    pub exec_cache_flush_seconds: Histogram,
+    /// Post-engine tail on the exec thread: core-writer drain, governance,
+    /// fee distribution and the epoch boundary.
+    pub exec_post_engine_tail_seconds: Histogram,
+    /// The residual: engine wall clock minus (phase1 + margin + match +
+    /// settle + tail). Whatever this holds is the next thing to instrument.
+    pub exec_engine_untimed_seconds: Histogram,
     pub exec_save_books_seconds: Histogram,
     pub exec_flush_seconds: Histogram,
     /// rank-root: flush breakdown — native trie maintenance (bucket rehash +
@@ -1007,6 +1032,50 @@ impl Metrics {
             exec_phase_settle_seconds.clone(),
         );
 
+        // r6 engine-untimed-attribution: observed once per native block from
+        // the exec context's nanosecond accumulators.
+        let exec_phase1_actions_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
+        registry.register(
+            "torus_exec_phase1_actions_seconds",
+            "Exec sub-phase: Phase-1 non-PlaceOrder action loop (cancels, modifies, transfers)",
+            exec_phase1_actions_seconds.clone(),
+        );
+
+        let exec_settle_pass_a_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
+        registry.register(
+            "torus_exec_settle_pass_a_seconds",
+            "Exec sub-phase: parallel settle pass A (per-market plan compute on scoped threads)",
+            exec_settle_pass_a_seconds.clone(),
+        );
+
+        let exec_settle_pass_b_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
+        registry.register(
+            "torus_exec_settle_pass_b_seconds",
+            "Exec sub-phase: settle pass B (single-threaded deterministic apply; = whole sequential loop)",
+            exec_settle_pass_b_seconds.clone(),
+        );
+
+        let exec_cache_flush_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
+        registry.register(
+            "torus_exec_cache_flush_seconds",
+            "Exec sub-phase: position + balance cache flush_all into the overlay (inside settle)",
+            exec_cache_flush_seconds.clone(),
+        );
+
+        let exec_post_engine_tail_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
+        registry.register(
+            "torus_exec_post_engine_tail_seconds",
+            "Exec sub-phase: core-writer drain + governance + fee distribution + epoch boundary",
+            exec_post_engine_tail_seconds.clone(),
+        );
+
+        let exec_engine_untimed_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
+        registry.register(
+            "torus_exec_engine_untimed_seconds",
+            "Exec sub-phase residual: engine total minus phase1/margin/match/settle/tail",
+            exec_engine_untimed_seconds.clone(),
+        );
+
         let exec_save_books_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
         registry.register(
             "torus_exec_save_books_seconds",
@@ -1522,6 +1591,12 @@ impl Metrics {
             exec_phase_margin_seconds,
             exec_phase_match_seconds,
             exec_phase_settle_seconds,
+            exec_phase1_actions_seconds,
+            exec_settle_pass_a_seconds,
+            exec_settle_pass_b_seconds,
+            exec_cache_flush_seconds,
+            exec_post_engine_tail_seconds,
+            exec_engine_untimed_seconds,
             exec_save_books_seconds,
             exec_flush_seconds,
             exec_root_seconds,
@@ -1720,6 +1795,26 @@ mod tests {
             "torus_exec_queue_depth",
             "torus_exec_throttle_tier",
             "torus_exec_dispatch_deferred",
+        ] {
+            assert!(text.contains(name), "{name} not registered:\n{text}");
+        }
+    }
+
+    /// r6 engine-untimed-attribution: the six sub-timers that decompose the
+    /// share of `torus_exec_engine_seconds` no other histogram accounted for.
+    /// All are observed exactly once per native block (from per-block
+    /// accumulators), so `_sum / _count` is directly ms-per-block.
+    #[test]
+    fn engine_untimed_attribution_metrics_register() {
+        let m = Metrics::new();
+        let text = m.encode();
+        for name in [
+            "torus_exec_phase1_actions_seconds",
+            "torus_exec_settle_pass_a_seconds",
+            "torus_exec_settle_pass_b_seconds",
+            "torus_exec_cache_flush_seconds",
+            "torus_exec_post_engine_tail_seconds",
+            "torus_exec_engine_untimed_seconds",
         ] {
             assert!(text.contains(name), "{name} not registered:\n{text}");
         }
