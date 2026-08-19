@@ -22,6 +22,10 @@
 #   DATA_ROOT    devnet data root (default $HOME/torus-wsl-devnet)
 #   SENDERS      bench --senders (default 5000)   CONC  --concurrency (256)
 #   BATCH        --batch-size (400)               SUBMIT --submit-batch (1)
+#   MPS=K        bench --markets-per-sender K (LOCALITY shape: each sender gets
+#                a fixed set of K markets instead of drawing uniformly over all
+#                of them). Unset (default) = flag omitted = today's uniform
+#                shape. Recorded as cell.markets_per_sender in summary.json.
 #   BLOCK_CAP=N  block-cap-raise sweep bundle: exports the COHERENT set of
 #                proposer-local selection caps for an N-action native block
 #                (TORUS_NATIVE_TOTAL_BLOCK_CAP=N plus the companion caps that
@@ -33,10 +37,16 @@
 #                exactly the compiled values); BLOCK_CAP=100 is the pre-r4
 #                cap-100 control.
 #   OVERWRITE=1  allow reusing an existing non-empty results dir
-#   HEALTH_TIMEOUT (240 s)  DRAIN_TIMEOUT (180 s)
+#   HEALTH_TIMEOUT (240 s)
+#   DRAIN_TIMEOUT  default 180 + 2*MARKETS s (300 markets => 780 s). A 300-market
+#                  cell does NOT drain inside 180 s — r6-base-300m-r1 ended with
+#                  drained=0 and ~20.8k nonce-expired evictions/node, which then
+#                  poisoned the state digest.
+#   DIGEST_PAR   per-node parallel RPCs during the state digest (default 8)
+#   RPC_TIMEOUT  per-RPC curl timeout in the agreement step (default 60 s)
 set -uo pipefail
 
-usage() { sed -n '2,27p' "$0"; exit 2; }
+usage() { sed -n '2,46p' "$0"; exit 2; }
 [ $# -ge 2 ] || usage
 
 WT=$(cd "$1" && pwd) || { echo "FATAL: worktree '$1' not found" >&2; exit 2; }
@@ -55,8 +65,14 @@ SENDERS=${SENDERS:-5000}
 CONC=${CONC:-256}
 BATCH=${BATCH:-400}
 SUBMIT=${SUBMIT:-1}
+MPS=${MPS:-}
 HEALTH_TIMEOUT=${HEALTH_TIMEOUT:-240}
-DRAIN_TIMEOUT=${DRAIN_TIMEOUT:-180}
+# Drain scales with the market count: the mempool backlog at 300 markets needs
+# far longer than 180 s to execute, and a cell that stops draining early is
+# digested mid-flight (see step 8).
+DRAIN_TIMEOUT=${DRAIN_TIMEOUT:-$(( 180 + 2 * MARKETS ))}
+DIGEST_PAR=${DIGEST_PAR:-8}
+RPC_TIMEOUT=${RPC_TIMEOUT:-60}
 OUT="$RESULTS_ROOT/$LABEL"
 
 SRC_NODE="$TARGET_DIR/release/torus-node"
@@ -145,6 +161,8 @@ die() { log "FATAL: $*"; finish_fail; exit 1; }
 [ -x "$WSL/launch-3val.sh" ] || { echo "FATAL: $WSL/launch-3val.sh missing" >&2; exit 1; }
 for t in jq curl python3 md5sum awk; do command -v $t >/dev/null || { echo "FATAL: need $t" >&2; exit 1; }; done
 [[ "$MARKETS" =~ ^[0-9]+$ && "$DUR" =~ ^[0-9]+$ && "$RATE" =~ ^[0-9]+$ ]] || usage
+[ -z "$MPS" ] || [[ "$MPS" =~ ^[0-9]+$ ]] || { echo "FATAL: MPS must be an integer" >&2; exit 2; }
+[ -x "$TOOLS_DIR/digest-node.sh" ] || { echo "FATAL: $TOOLS_DIR/digest-node.sh missing" >&2; exit 1; }
 
 if pgrep -f "bench-throughput consensus" >/dev/null; then echo "FATAL: a bench is already running" >&2; exit 1; fi
 if pgrep -f "cargo build" >/dev/null; then echo "FATAL: a cargo build is running — never bench while building" >&2; exit 1; fi
@@ -180,7 +198,8 @@ PY
 }
 trap 'log "interrupted"; finish_fail; exit 130' INT TERM
 
-log "cell=$LABEL worktree=$WT markets=$MARKETS dur=${DUR}s rate=$RATE senders=$SENDERS block_cap='${BLOCK_CAP:-unset}' extra_env='$EXTRA_ENV'"
+log "cell=$LABEL worktree=$WT markets=$MARKETS dur=${DUR}s rate=$RATE senders=$SENDERS block_cap='${BLOCK_CAP:-unset}' mps='${MPS:-unset}' extra_env='$EXTRA_ENV'"
+log "drain_timeout=${DRAIN_TIMEOUT}s digest_par=$DIGEST_PAR rpc_timeout=${RPC_TIMEOUT}s"
 [ -n "$BLOCK_CAP" ] && log "block-cap bundle (BLOCK_CAP=$BLOCK_CAP, BATCH=$BATCH): ${BLOCK_CAP_ENV[*]}"
 WT_COMMIT=$(git -C "$WT" rev-parse HEAD)
 WT_DIRTY=$(git -C "$WT" status --porcelain --untracked-files=no | wc -l)
@@ -307,6 +326,10 @@ sleep 3
 BENCH_CMD=("$BENCH" consensus --rpc-urls "${RPCS[0]}" --econ --senders "$SENDERS" --sender-offset 60 \
     --markets "$MARKETS" --batch-size "$BATCH" --submit-batch "$SUBMIT" --format bin --concurrency "$CONC" \
     --duration "$DUR" --target-margin 1500 --cross-fraction 0.5 --cancel-fraction 0.05 --band 5 --rate-total "$RATE")
+# LOCALITY shape (unset = flag omitted = uniform draw over 1..=MARKETS, i.e. the
+# shape every campaign cell so far used). Needs a bench-throughput built at or
+# after cand/r6-harness-300m-digest-and-parity.
+[ -n "$MPS" ] && BENCH_CMD+=(--markets-per-sender "$MPS")
 log "bench: ${BENCH_CMD[*]}"
 T_BENCH0=$(date +%s)
 "${BENCH_CMD[@]}" > "$OUT/bench.log" 2>&1 & BENCH_PID=$!
@@ -345,7 +368,7 @@ kill "$CPU_PID" 2>/dev/null; CPU_PID=""
 # ---------------------------------------------------------------- 8. after-snapshots + agreement
 for i in 0 1 2; do scrape_one "${METS[$i]}" > "$OUT/metrics-after-val$i.txt"; done
 rpc() { # $1=url $2=method $3=params-json
-    curl -s -m 10 -H 'content-type: application/json' "$1" \
+    curl -s -m "$RPC_TIMEOUT" -H 'content-type: application/json' "$1" \
         -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$2\",\"params\":$3}"
 }
 declare -a HGT
@@ -353,20 +376,53 @@ for i in 0 1 2; do HGT[$i]=$(mval torus_block_height < "$OUT/metrics-after-val$i
 HMIN=$(printf '%s\n' "${HGT[@]}" | sort -n | head -1); HMAX=$(printf '%s\n' "${HGT[@]}" | sort -n | tail -1)
 HCMP=$(( HMIN - 5 )); HHEX=$(printf '0x%x' "$HCMP")
 log "heights after drain: ${HGT[*]} (spread $((HMAX-HMIN))); comparing block $HCMP on all nodes"
+
+# --- state digest -----------------------------------------------------------
+# The digest is the ONLY determinism check that sees executed native state (the
+# header stateRoot is 0x0 on this branch). It is therefore only worth anything
+# when all three nodes are digested over the SAME state:
+#   * the per-market RPCs run DIGEST_PAR-way parallel inside each node
+#     (digest-node.sh, order-stable), and
+#   * the three nodes are digested CONCURRENTLY, in one window, and
+#   * the funnel counters are snapshotted either side of that window: if they
+#     moved, the digest is flagged NOT quiescent and summarize.py reports
+#     DIGEST_UNVERIFIED instead of pretending the fleet forked.
+# At 300 markets the old serial loop was ~4 min/node (~12 min end to end) —
+# val0 and val2 were digested minutes apart (r6-base-300m-r1).
+"$BENCH" gen-accounts --offset 60 --count 50 2>/dev/null | awk '{print $2}' > "$OUT/digest-accounts.txt"
+DIG_ACCTS=$(grep -c . "$OUT/digest-accounts.txt")
+funnel_snapshot() {
+    for i in 0 1 2; do
+        scrape_one "${METS[$i]}" | extract "torus_orders_placed_accepted_total torus_orders_matched_total torus_native_actions_processed_total torus_orders_resting_total"
+    done
+}
+declare -a DHGT DIGSHA DIGSECS
+Q_BEFORE=$(funnel_snapshot)
+for i in 0 1 2; do
+    h=$(scrape_one "${METS[$i]}" | mval torus_block_height); DHGT[$i]=${h%.*}
+done
+log "state digest: $MARKETS markets + $DIG_ACCTS accounts, 3 nodes CONCURRENTLY (par=$DIGEST_PAR/node, rpc timeout ${RPC_TIMEOUT}s), heights ${DHGT[*]}"
+TDIG0=$(date +%s)
+for i in 0 1 2; do
+    "$TOOLS_DIR/digest-node.sh" "${RPCS[$i]}" "$MARKETS" "$OUT/digest-accounts.txt" \
+        "$OUT/state-digest-val$i.txt" "$DIGEST_PAR" "$RPC_TIMEOUT" > "$OUT/digest-val$i.out" 2>>"$OUT/run.log" &
+done
+wait
+TDIG1=$(date +%s)
+Q_AFTER=$(funnel_snapshot)
+if [ "$Q_BEFORE" = "$Q_AFTER" ]; then DIGEST_QUIESCENT=1; else DIGEST_QUIESCENT=0; fi
+for i in 0 1 2; do
+    sha=""; secs=""; read -r sha secs < "$OUT/digest-val$i.out" || true
+    DIGSHA[$i]=${sha:-ERR}; DIGSECS[$i]=${secs:-0}
+done
+log "state digest done in $((TDIG1 - TDIG0))s wall (per node: ${DIGSECS[*]} s), quiescent=$DIGEST_QUIESCENT"
+[ "$DIGEST_QUIESCENT" = 1 ] || log "WARNING: funnel counters MOVED during the digest — digest is NOT a determinism proof for this cell"
+
 : > "$OUT/agreement.jsonl"
 for i in 0 1 2; do
     blk=$(rpc "${RPCS[$i]}" eth_getBlockByNumber "[\"$HHEX\",false]")
     bh=$(printf '%s' "$blk" | jq -r '.result.hash // "ERR"'); sr=$(printf '%s' "$blk" | jq -r '.result.stateRoot // "ERR"')
-    # state digest: every market's order book + open interest + 50 sender balances
-    dig=$( {
-        for m in $(seq 1 "$MARKETS"); do
-            rpc "${RPCS[$i]}" torus_getOrderBook "[\"$(printf '0x%x' "$m")\"]" | jq -cS '.result // .error'
-            rpc "${RPCS[$i]}" torus_getOpenInterest "[\"$(printf '0x%x' "$m")\"]" | jq -cS '.result // .error'
-        done
-        "$BENCH" gen-accounts --offset 60 --count 50 2>/dev/null | awk '{print $2}' | while read -r a; do
-            rpc "${RPCS[$i]}" torus_getBalances "[\"$a\"]" | jq -cS '.result // .error'
-        done
-    } | tee "$OUT/state-digest-val$i.txt" | sha256sum | cut -d' ' -f1)
+    dig=${DIGSHA[$i]}
     matched=$(mval torus_orders_matched_total < "$OUT/metrics-after-val$i.txt")
     placed=$(mval torus_orders_placed_accepted_total < "$OUT/metrics-after-val$i.txt")
     resting=$(mval torus_orders_resting_total < "$OUT/metrics-after-val$i.txt")
@@ -374,8 +430,8 @@ for i in 0 1 2; do
     lg="$RUN_DIR/val$i.log"
     panics=$(grep -c -E 'panicked|FAIL-STOP|fail-stop|Latching fail-stop|conflicting blocks' "$lg" 2>/dev/null); panics=${panics:-0}
     errors=$(grep -c ' ERROR ' "$lg" 2>/dev/null); errors=${errors:-0}
-    printf '{"node":"val%s","height":%s,"cmp_height":%s,"block_hash":"%s","header_state_root":"%s","state_digest":"%s","matched":%s,"placed":%s,"resting":%s,"actions":%s,"panic_or_failstop_lines":%s,"error_lines":%s}\n' \
-        "$i" "${HGT[$i]}" "$HCMP" "$bh" "$sr" "$dig" "${matched%.*}" "${placed%.*}" "${resting%.*}" "${actions%.*}" "$panics" "$errors" >> "$OUT/agreement.jsonl"
+    printf '{"node":"val%s","height":%s,"cmp_height":%s,"block_hash":"%s","header_state_root":"%s","state_digest":"%s","digest_height":%s,"digest_seconds":%s,"matched":%s,"placed":%s,"resting":%s,"actions":%s,"panic_or_failstop_lines":%s,"error_lines":%s}\n' \
+        "$i" "${HGT[$i]}" "$HCMP" "$bh" "$sr" "$dig" "${DHGT[$i]}" "${DIGSECS[$i]}" "${matched%.*}" "${placed%.*}" "${resting%.*}" "${actions%.*}" "$panics" "$errors" >> "$OUT/agreement.jsonl"
 done
 cat "$OUT/agreement.jsonl" >> "$OUT/run.log"
 
@@ -429,6 +485,8 @@ python3 "$TOOLS_DIR/summarize.py" \
     --bench-cmd "${BENCH_CMD[*]}" --pids "${PIDS[*]}" \
     --evicted "$EVICTED" --bench-submitted "${BENCH_SUBMITTED:-0}" \
     --block-cap "${BLOCK_CAP:-}" --dissem "$DISSEM" \
+    --drain-timeout "$DRAIN_TIMEOUT" --markets-per-sender "${MPS:-}" \
+    --digest-quiescent "$DIGEST_QUIESCENT" --digest-secs "${DIGSECS[*]}" --digest-heights "${DHGT[*]}" \
     | tee -a "$OUT/run.log"
 rc=${PIPESTATUS[0]}
 log "done -> $OUT/summary.json"
