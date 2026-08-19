@@ -8,6 +8,10 @@ counters are chosen so every derived number is exact, and asserts:
   * the r6 engine-untimed sub-timers (phase1_actions / settle_pass_a /
     settle_pass_b / cache_flush / post_engine_tail / engine_untimed) appear
     under phases.engine as ms-per-native-block;
+  * the r7 flush split (state_write_build / state_write_db) appears under
+    phases.flush AT THE SAME TIME as the r6 engine sub-timers — the two
+    landed on separate branches and share one SUB table, so a restack that
+    drops either half must fail here;
   * a PRE-r6 sampler.csv (columns absent) still summarizes, with the new
     sub-timers reported as 0.0 rather than crashing.
 
@@ -43,6 +47,9 @@ PER_BLK = {
     "exec_phase_settle_seconds": 0.090,
     "exec_root_seconds": 0.120,
     "exec_state_write_seconds": 0.070,
+    # r7 flush split: build + db == state_write
+    "exec_state_write_build_seconds": 0.040,
+    "exec_state_write_db_seconds": 0.030,
     "exec_evm_resync_seconds": 0.010,
     # r6 sub-timers
     "exec_phase1_actions_seconds": 0.015,
@@ -160,10 +167,23 @@ def main():
         )
         close(acc, eng["ms"], "engine sub-timer sum")
 
+        # r7 flush split survives alongside the r6 engine sub-timers
+        fl = s["phase_by_node"]["val0"]["phases"]["flush"]
+        close(fl["ms"], 200.0, "flush ms/blk")
+        close(fl["state_write_ms"], 70.0, "state_write_ms")
+        close(fl["state_write_build_ms"], 40.0, "state_write_build_ms")
+        close(fl["state_write_db_ms"], 30.0, "state_write_db_ms")
+        close(
+            fl["state_write_build_ms"] + fl["state_write_db_ms"],
+            fl["state_write_ms"],
+            "state_write build+db == state_write",
+        )
+
         # late/early windows carry the new keys too
         late = s["phase_by_node"]["val0"].get("late_60s")
         if late is not None:
             assert "engine_untimed" in late, "late_60s must carry engine_untimed"
+            assert "state_write_build" in late, "late_60s must carry state_write_build"
 
     with tempfile.TemporaryDirectory() as out:
         write_fixture(out, include_r6=False)
@@ -182,6 +202,10 @@ def main():
                 k,
                 eng[k],
             )
+        # the r7 flush split is independent of the r6 columns
+        fl = s["phase_by_node"]["val0"]["phases"]["flush"]
+        close(fl["state_write_build_ms"], 40.0, "state_write_build_ms (pre-r6)")
+        close(fl["state_write_db_ms"], 30.0, "state_write_db_ms (pre-r6)")
 
     print("test_summarize.py: OK")
 
