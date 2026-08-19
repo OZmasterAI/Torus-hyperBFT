@@ -173,7 +173,8 @@ for node, rs in rows.items():
             if n2 <= 0:
                 return None
             d = {k: round((m(b2, "exec_" + k + "_seconds_sum") - m(a2, "exec_" + k + "_seconds_sum")) / n2 * 1000, 1)
-                 for k in ["block"] + PHASES + ["phase_margin", "phase_match", "phase_settle", "root", "state_write"]}
+                 for k in ["block"] + PHASES + ["phase_margin", "phase_match", "phase_settle", "root", "state_write",
+                                                "state_write_build", "state_write_db"]}
             d["native_blocks"] = n2
             d["orders_placed_per_block"] = round((m(b2, "orders_placed_accepted_total") - m(a2, "orders_placed_accepted_total")) / n2)
             d["resting_orders_end"] = m(b2, "exec_resting_orders")
