@@ -284,6 +284,14 @@ pub struct Metrics {
     /// background writer but not yet written (`TORUS_ASYNC_POST_FLUSH`). Sustained
     /// growth = RocksDB stalling behind exec (backpressure onto the exec chain).
     pub post_flush_writer_queued_batches: Gauge,
+    /// r3 exec-write-stall-attribution: the RocksDB put inside the exec-time
+    /// body persist ONLY (the surrounding `exec_body_persist_seconds` also
+    /// covers the body JSON encode). Split so a wait behind another thread's
+    /// write group shows as put-time, not encode-time.
+    pub exec_body_persist_write_seconds: Histogram,
+    /// r3: DB-wide RocksDB runtime state + statistics (unlabelled, sampled every
+    /// few seconds; the per-CF labelled families above stay for the deep dive).
+    pub rocksdb: RocksdbStatMetrics,
     /// L3 level-hash sponge cache (`TORUS_LEVEL_HASH_CACHE`, default-off): cumulative
     /// O(tail) sponge extensions summed across every book, sampled per block after
     /// `save_order_books`. Set-as-Gauge of a monotonic sum (see `misses`/`seeds`).
@@ -402,6 +410,135 @@ pub struct Metrics {
     /// `TORUS_D2L_BATCH_MAX_BYTES` cap against real traffic (design §7 flags
     /// the per-order bincode size as unmeasured).
     pub d2l_envelope_bytes: Histogram,
+}
+
+/// r3 exec-write-stall-attribution: DB-wide RocksDB runtime state and
+/// statistics, exported as UNLABELLED gauges (`torus_rocksdb_*`) so a
+/// `$1==name` scraper (tools/matched-bench/run-cell.sh `extract`) can read
+/// them — the earlier per-CF `Family` gauges carry a `{cf=...}` label and read
+/// as 0 in that pipeline. Cumulative tickers/histogram sums are set-as-gauge
+/// (rate them client-side over the 1 Hz samples). Filled from
+/// `torus_state::StateDb::runtime_stats()` by the node's sampler.
+#[derive(Clone)]
+pub struct RocksdbStatMetrics {
+    // Write-controller / LSM shape (properties; always available).
+    /// Sum of cur-size-all-mem-tables over every CF.
+    pub memtable_bytes_all: Gauge,
+    /// Sum of num-immutable-mem-table over every CF (flush backlog).
+    pub immutable_memtables_all: Gauge,
+    /// Max num-files-at-level0 over every CF (the per-CF slowdown trigger).
+    pub l0_files_max: Gauge,
+    /// Sum of estimate-pending-compaction-bytes over every CF.
+    pub pending_compaction_bytes_all: Gauge,
+    /// actual-delayed-write-rate (bytes/s; 0 = no delay in force).
+    pub delayed_write_rate: Gauge,
+    /// is-write-stopped (1 while writes are fully stopped).
+    pub write_stopped: Gauge,
+    pub running_compactions: Gauge,
+    pub running_flushes: Gauge,
+    // Statistics tickers (TORUS_ROCKSDB_STATS >= 1; cumulative since open).
+    /// rocksdb.stall.micros — total writer time lost to the write controller.
+    pub stall_micros: Gauge,
+    /// rocksdb.write.self — writes that led their write group.
+    pub write_self: Gauge,
+    /// rocksdb.write.other — writes that waited as followers behind another
+    /// thread's write group (the head-of-line-blocking signature).
+    pub write_other: Gauge,
+    pub bytes_written: Gauge,
+    pub wal_bytes: Gauge,
+    pub flush_write_bytes: Gauge,
+    pub compact_read_bytes: Gauge,
+    pub compact_write_bytes: Gauge,
+    pub compaction_cpu_micros: Gauge,
+    // Statistics histograms (TORUS_ROCKSDB_STATS >= 2), reduced to count / sum
+    // (micros) / p99 / max per RocksDB histogram.
+    pub db_write_count: Gauge,
+    pub db_write_sum_micros: Gauge,
+    pub db_write_p99_micros: Gauge,
+    pub db_write_max_micros: Gauge,
+    pub write_stall_count: Gauge,
+    pub write_stall_sum_micros: Gauge,
+    pub write_stall_p99_micros: Gauge,
+    pub write_stall_max_micros: Gauge,
+    pub flush_count: Gauge,
+    pub flush_sum_micros: Gauge,
+    pub compaction_count: Gauge,
+    pub compaction_sum_micros: Gauge,
+}
+
+impl RocksdbStatMetrics {
+    /// Every metric name this block registers, in registration order (used by
+    /// the sampler wiring test and by tools/matched-bench/run-cell.sh).
+    pub const NAMES: [&'static str; 29] = [
+        "torus_rocksdb_memtable_bytes_all",
+        "torus_rocksdb_immutable_memtables_all",
+        "torus_rocksdb_l0_files_max",
+        "torus_rocksdb_pending_compaction_bytes_all",
+        "torus_rocksdb_delayed_write_rate",
+        "torus_rocksdb_write_stopped",
+        "torus_rocksdb_running_compactions",
+        "torus_rocksdb_running_flushes",
+        "torus_rocksdb_stall_micros",
+        "torus_rocksdb_write_self",
+        "torus_rocksdb_write_other",
+        "torus_rocksdb_bytes_written",
+        "torus_rocksdb_wal_bytes",
+        "torus_rocksdb_flush_write_bytes",
+        "torus_rocksdb_compact_read_bytes",
+        "torus_rocksdb_compact_write_bytes",
+        "torus_rocksdb_compaction_cpu_micros",
+        "torus_rocksdb_db_write_count",
+        "torus_rocksdb_db_write_sum_micros",
+        "torus_rocksdb_db_write_p99_micros",
+        "torus_rocksdb_db_write_max_micros",
+        "torus_rocksdb_write_stall_count",
+        "torus_rocksdb_write_stall_sum_micros",
+        "torus_rocksdb_write_stall_p99_micros",
+        "torus_rocksdb_write_stall_max_micros",
+        "torus_rocksdb_flush_count",
+        "torus_rocksdb_flush_sum_micros",
+        "torus_rocksdb_compaction_count",
+        "torus_rocksdb_compaction_sum_micros",
+    ];
+
+    fn register(registry: &mut Registry) -> Self {
+        let mk = |registry: &mut Registry, name: &'static str, help: &str| -> Gauge {
+            let g = Gauge::default();
+            registry.register(name, help, g.clone());
+            g
+        };
+        Self {
+            memtable_bytes_all: mk(registry, Self::NAMES[0], "RocksDB memtable bytes summed over all CFs"),
+            immutable_memtables_all: mk(registry, Self::NAMES[1], "RocksDB immutable (unflushed) memtables summed over all CFs"),
+            l0_files_max: mk(registry, Self::NAMES[2], "RocksDB max L0 file count over all CFs (per-CF slowdown trigger)"),
+            pending_compaction_bytes_all: mk(registry, Self::NAMES[3], "RocksDB estimated pending compaction bytes summed over all CFs"),
+            delayed_write_rate: mk(registry, Self::NAMES[4], "RocksDB actual delayed write rate (bytes/s; 0 = no delay in force)"),
+            write_stopped: mk(registry, Self::NAMES[5], "RocksDB is-write-stopped (1 while writes are stopped)"),
+            running_compactions: mk(registry, Self::NAMES[6], "RocksDB running compactions"),
+            running_flushes: mk(registry, Self::NAMES[7], "RocksDB running flushes"),
+            stall_micros: mk(registry, Self::NAMES[8], "RocksDB rocksdb.stall.micros (cumulative writer stall time)"),
+            write_self: mk(registry, Self::NAMES[9], "RocksDB rocksdb.write.self (write-group leaders, cumulative)"),
+            write_other: mk(registry, Self::NAMES[10], "RocksDB rocksdb.write.other (write-group followers, cumulative)"),
+            bytes_written: mk(registry, Self::NAMES[11], "RocksDB rocksdb.bytes.written (cumulative)"),
+            wal_bytes: mk(registry, Self::NAMES[12], "RocksDB rocksdb.wal.bytes (cumulative)"),
+            flush_write_bytes: mk(registry, Self::NAMES[13], "RocksDB rocksdb.flush.write.bytes (cumulative)"),
+            compact_read_bytes: mk(registry, Self::NAMES[14], "RocksDB rocksdb.compact.read.bytes (cumulative)"),
+            compact_write_bytes: mk(registry, Self::NAMES[15], "RocksDB rocksdb.compact.write.bytes (cumulative)"),
+            compaction_cpu_micros: mk(registry, Self::NAMES[16], "RocksDB compaction CPU micros (cumulative)"),
+            db_write_count: mk(registry, Self::NAMES[17], "RocksDB db.write.micros histogram count (TORUS_ROCKSDB_STATS>=2)"),
+            db_write_sum_micros: mk(registry, Self::NAMES[18], "RocksDB db.write.micros histogram sum (TORUS_ROCKSDB_STATS>=2)"),
+            db_write_p99_micros: mk(registry, Self::NAMES[19], "RocksDB db.write.micros p99 (TORUS_ROCKSDB_STATS>=2)"),
+            db_write_max_micros: mk(registry, Self::NAMES[20], "RocksDB db.write.micros max (TORUS_ROCKSDB_STATS>=2)"),
+            write_stall_count: mk(registry, Self::NAMES[21], "RocksDB db.write.stall histogram count (TORUS_ROCKSDB_STATS>=2)"),
+            write_stall_sum_micros: mk(registry, Self::NAMES[22], "RocksDB db.write.stall histogram sum (TORUS_ROCKSDB_STATS>=2)"),
+            write_stall_p99_micros: mk(registry, Self::NAMES[23], "RocksDB db.write.stall p99 (TORUS_ROCKSDB_STATS>=2)"),
+            write_stall_max_micros: mk(registry, Self::NAMES[24], "RocksDB db.write.stall max (TORUS_ROCKSDB_STATS>=2)"),
+            flush_count: mk(registry, Self::NAMES[25], "RocksDB db.flush.micros histogram count (TORUS_ROCKSDB_STATS>=2)"),
+            flush_sum_micros: mk(registry, Self::NAMES[26], "RocksDB db.flush.micros histogram sum (TORUS_ROCKSDB_STATS>=2)"),
+            compaction_count: mk(registry, Self::NAMES[27], "RocksDB compaction.times.micros histogram count (TORUS_ROCKSDB_STATS>=2)"),
+            compaction_sum_micros: mk(registry, Self::NAMES[28], "RocksDB compaction.times.micros histogram sum (TORUS_ROCKSDB_STATS>=2)"),
+        }
+    }
 }
 
 impl Metrics {
@@ -1084,6 +1221,15 @@ impl Metrics {
             post_flush_writer_queued_batches.clone(),
         );
 
+        let exec_body_persist_write_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
+        registry.register(
+            "torus_exec_body_persist_write_seconds",
+            "Exec phase: the RocksDB put inside the body persist only (excludes the body JSON encode)",
+            exec_body_persist_write_seconds.clone(),
+        );
+
+        let rocksdb = RocksdbStatMetrics::register(&mut registry);
+
         let exec_level_hash_cache_hits = Gauge::default();
         registry.register(
             "torus_exec_level_hash_cache_hits",
@@ -1405,6 +1551,8 @@ impl Metrics {
             exec_dispatch_deferred,
             trade_writer_queued_batches,
             post_flush_writer_queued_batches,
+            exec_body_persist_write_seconds,
+            rocksdb,
             exec_level_hash_cache_hits,
             exec_level_hash_cache_misses,
             exec_level_hash_cache_seeds,
@@ -1612,6 +1760,37 @@ mod tests {
             "torus_rocksdb_memtable_bytes",
             "torus_rocksdb_pending_compaction_bytes",
             "torus_rocksdb_block_cache_bytes",
+        ] {
+            assert!(text.contains(name), "{name} not registered:\n{text}");
+        }
+    }
+
+    /// r3 exec-write-stall-attribution: the DB-wide unlabelled RocksDB gauges
+    /// (every name in `RocksdbStatMetrics::NAMES`) and the two new write-latency
+    /// histograms must be registered, and the gauge names must be plain
+    /// `torus_rocksdb_*` (no `{cf=...}` label) so `run-cell.sh`'s `$1==name`
+    /// extract sees them.
+    #[test]
+    fn rocksdb_dbwide_stat_metrics_register_unlabelled() {
+        let m = Metrics::new();
+        m.rocksdb.stall_micros.set(123);
+        m.rocksdb.write_other.set(7);
+        m.rocksdb.l0_files_max.set(3);
+        m.exec_body_persist_write_seconds.observe(0.01);
+        m.commit_persist_seconds.observe(0.02);
+        let text = m.encode();
+        for name in RocksdbStatMetrics::NAMES {
+            assert!(text.contains(name), "{name} not registered:\n{text}");
+        }
+        assert_eq!(RocksdbStatMetrics::NAMES.len(), 29);
+        // Unlabelled sample lines: `<name> <value>` — exactly what the bench
+        // scraper's `$1==name` awk reads.
+        assert!(text.contains("torus_rocksdb_stall_micros 123"), "{text}");
+        assert!(text.contains("torus_rocksdb_write_other 7"), "{text}");
+        assert!(text.contains("torus_rocksdb_l0_files_max 3"), "{text}");
+        for name in [
+            "torus_exec_body_persist_write_seconds",
+            "torus_commit_persist_seconds",
         ] {
             assert!(text.contains(name), "{name} not registered:\n{text}");
         }

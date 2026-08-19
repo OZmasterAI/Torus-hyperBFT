@@ -173,6 +173,44 @@ for node, rs in rows.items():
         p[name + "_ms_avg"] = round((m(b, name + "_seconds_sum") - m(a, name + "_seconds_sum")) / cpc * 1000, 2) if cpc else None
     btc = m(b, "block_transactions_count_count") - m(a, "block_transactions_count_count")
     p["txs_per_block_avg"] = round((m(b, "block_transactions_count_sum") - m(a, "block_transactions_count_sum")) / btc, 1) if btc else None
+    # r3 exec-write-stall-attribution: the two split write timers (ms per call) and
+    # the DB-wide RocksDB picture over the window (rates from cumulative tickers;
+    # gauges as window mean/max). All 0/None on a pre-r3 binary.
+    def per_call(k):
+        c = m(b, k + "_seconds_count") - m(a, k + "_seconds_count")
+        return round((m(b, k + "_seconds_sum") - m(a, k + "_seconds_sum")) / c * 1000, 2) if c else None
+    p["exec_body_persist_put_ms_per_call"] = per_call("exec_body_persist_write")
+    p["commit_persist_ms_per_call"] = per_call("commit_persist")
+    def rk(k):
+        return (m(b, "rocksdb_" + k) - m(a, "rocksdb_" + k)) / span if span else 0.0
+    def gstat(k, scale=1.0):
+        vals = [m(r, k) * scale for r in sel]
+        return {"mean": round(sum(vals) / len(vals), 1), "max": round(max(vals), 1)} if vals else None
+    dbw = m(b, "rocksdb_db_write_count") - m(a, "rocksdb_db_write_count")
+    ws = m(b, "rocksdb_write_stall_count") - m(a, "rocksdb_write_stall_count")
+    p["rocksdb"] = {
+        "stall_ms_per_s": round(rk("stall_micros") / 1000.0, 2),
+        "stall_ms_per_native_block": round((m(b, "rocksdb_stall_micros") - m(a, "rocksdb_stall_micros")) / 1000.0 / nblk, 2),
+        "writes_per_s_self": round(rk("write_self"), 1),
+        "writes_per_s_other": round(rk("write_other"), 1),
+        "wal_mb_per_s": round(rk("wal_bytes") / 1e6, 2),
+        "bytes_written_mb_per_s": round(rk("bytes_written") / 1e6, 2),
+        "flush_write_mb_per_s": round(rk("flush_write_bytes") / 1e6, 2),
+        "compact_read_mb_per_s": round(rk("compact_read_bytes") / 1e6, 2),
+        "compact_write_mb_per_s": round(rk("compact_write_bytes") / 1e6, 2),
+        "compaction_cpu_cores": round(rk("compaction_cpu_micros") / 1e6, 3),
+        "db_write_ms_avg": round((m(b, "rocksdb_db_write_sum_micros") - m(a, "rocksdb_db_write_sum_micros")) / dbw / 1000.0, 3) if dbw else None,
+        "write_stall_ms_avg": round((m(b, "rocksdb_write_stall_sum_micros") - m(a, "rocksdb_write_stall_sum_micros")) / ws / 1000.0, 3) if ws else None,
+        "db_write_p99_ms_last": round(m(b, "rocksdb_db_write_p99_micros") / 1000.0, 3),
+        "memtable_mb": gstat("rocksdb_memtable_bytes_all", 1e-6),
+        "immutable_memtables": gstat("rocksdb_immutable_memtables_all"),
+        "l0_files_max": gstat("rocksdb_l0_files_max"),
+        "pending_compaction_mb": gstat("rocksdb_pending_compaction_bytes_all", 1e-6),
+        "delayed_write_rate": gstat("rocksdb_delayed_write_rate"),
+        "write_stopped": gstat("rocksdb_write_stopped"),
+        "running_compactions": gstat("rocksdb_running_compactions"),
+        "trade_writer_queued_batches": gstat("trade_writer_queued_batches"),
+    }
     phase[node] = p
 
 # ---------------------------------------------------------------- agreement
