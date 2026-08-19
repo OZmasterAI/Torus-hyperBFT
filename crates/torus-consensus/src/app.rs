@@ -1554,13 +1554,54 @@ impl ExecutionContext {
                 }
                 return;
             }
+            // r6 engine-untimed-attribution: the post-engine tail runs on the
+            // exec thread inside the engine window but outside every
+            // execute_batch phase timer — time it separately.
+            let tail_timer = std::time::Instant::now();
             let _ = NativeExecutor::drain_core_writer(&mut ctx);
             NativeExecutor::process_governance(&mut ctx);
             NativeExecutor::distribute_fees(&mut ctx, computed_fee_revenue);
             NativeExecutor::process_epoch_boundary(&mut ctx);
+            let tail_ns = tail_timer.elapsed().as_nanos();
+            let engine_secs = engine_timer.elapsed().as_secs_f64();
+
+            // Sub-phase decomposition of `exec_engine_seconds`, observed ONCE
+            // per native block from the context's accumulators (which sum both
+            // execute_batch calls), so `_sum / _count` is ms-per-block and
+            // every `_count` matches `exec_engine_seconds_count`. The residual
+            // is what no timer covers yet — clamped at 0 because the
+            // accumulators and the engine clock are read at different points.
+            let accum = ctx.phase_accum;
+            let secs = torus_bridge::native_executor::ExecPhaseAccum::secs;
+            let tail_secs = secs(tail_ns);
+            let untimed_secs =
+                (engine_secs - secs(accum.timed_total_ns()) - tail_secs).max(0.0);
+            tracing::debug!(
+                height,
+                engine_ms = engine_secs * 1e3,
+                phase1_actions_ms = secs(accum.phase1_actions_ns) * 1e3,
+                margin_ms = secs(accum.margin_ns) * 1e3,
+                match_ms = secs(accum.match_ns) * 1e3,
+                settle_ms = secs(accum.settle_ns) * 1e3,
+                settle_pass_a_ms = secs(accum.settle_pass_a_ns) * 1e3,
+                settle_pass_b_ms = secs(accum.settle_pass_b_ns) * 1e3,
+                cache_flush_ms = secs(accum.cache_flush_ns) * 1e3,
+                post_engine_tail_ms = tail_secs * 1e3,
+                engine_untimed_ms = untimed_secs * 1e3,
+                "r6 exec engine sub-phase attribution"
+            );
             if let Some(ref m) = self.metrics {
-                m.exec_engine_seconds
-                    .observe(engine_timer.elapsed().as_secs_f64());
+                m.exec_engine_seconds.observe(engine_secs);
+                m.exec_phase1_actions_seconds
+                    .observe(secs(accum.phase1_actions_ns));
+                m.exec_settle_pass_a_seconds
+                    .observe(secs(accum.settle_pass_a_ns));
+                m.exec_settle_pass_b_seconds
+                    .observe(secs(accum.settle_pass_b_ns));
+                m.exec_cache_flush_seconds
+                    .observe(secs(accum.cache_flush_ns));
+                m.exec_post_engine_tail_seconds.observe(tail_secs);
+                m.exec_engine_untimed_seconds.observe(untimed_secs);
             }
 
             let save_books_timer = std::time::Instant::now();
@@ -8306,6 +8347,36 @@ mod crash_recovery_tests {
             text.contains("torus_exec_queue_depth 0"),
             "queue gauge must stay 0 on the direct-call path:\n{text}",
         );
+    }
+
+    /// r6 engine-untimed-attribution: the six sub-timers that decompose
+    /// `exec_engine_seconds` must ALSO observe exactly once per native block
+    /// (they are fed from per-block accumulators, not per-`execute_batch`
+    /// call), so `_sum / _count` in summarize.py's phase table is directly
+    /// ms-per-block and lines up with `exec_engine_seconds_count`.
+    #[test]
+    fn engine_untimed_sub_timers_observe_per_block() {
+        let (config, state_db) = make_test_config_and_db();
+        let mut exec_ctx = make_exec_ctx(&config, &state_db);
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
+        exec_ctx.metrics = Some(metrics.clone());
+
+        exec_ctx.execute_committed_block(&make_block(1, vec![sign_claim_rewards(7)]), vec![]);
+
+        let text = metrics.encode();
+        for name in [
+            "torus_exec_phase1_actions_seconds",
+            "torus_exec_settle_pass_a_seconds",
+            "torus_exec_settle_pass_b_seconds",
+            "torus_exec_cache_flush_seconds",
+            "torus_exec_post_engine_tail_seconds",
+            "torus_exec_engine_untimed_seconds",
+        ] {
+            assert!(
+                text.contains(&format!("{name}_count 1")),
+                "{name} must observe exactly once per native block:\n{text}",
+            );
+        }
     }
 
     /// Task 3 (RED first): the pull-fallback poll budget must be ≥ 1 s so a body that
