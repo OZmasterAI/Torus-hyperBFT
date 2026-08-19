@@ -316,7 +316,8 @@ fn async_post_flush_enabled() -> bool {
 /// Rank 2 memory bound: total bincode bytes of `ExecSource::Ready` bodies the
 /// `deferred_exec` park may hold before further Ready parks DEMOTE to
 /// `ExecSource::Compact` (hash references, rematerialized from the durable DA
-/// store on drain). 64 MiB ≈ ~10 full 6 MB (`NATIVE_BLOCK_BYTES_CAP`) bodies.
+/// store on drain). 64 MiB ≈ ~5 full 12 MB (`NATIVE_BLOCK_BYTES_CAP`, r4) bodies
+/// (~10 at the pre-r4 6 MB cap; typical cap-200 bs400 bodies are ~5.6 MB).
 const DEFERRED_EXEC_READY_BYTES_DEFAULT: usize = 64 * 1024 * 1024;
 
 /// Parse `TORUS_DEFERRED_EXEC_READY_BYTES` (rank 2): the Ready-park byte

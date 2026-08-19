@@ -75,3 +75,29 @@ fn max_pull_chunk_fits_native_da_codec() {
         torus_network::caps::MAX_NATIVE_DA_MSG_SIZE
     );
 }
+
+/// r4 (block-cap-200 default + direct-push floor): the mempool's compiled
+/// per-block BODY budget must stay carriable by every recovery rung of the
+/// network ladder, and the shard read cap must admit the worst-case k=2 shard
+/// of such a body. `torus_network::caps` pins the mempool value as a literal
+/// (it cannot dep the mempool); this is the cross-crate equality that keeps
+/// that mirror honest.
+#[test]
+fn compiled_block_bytes_cap_fits_the_dissemination_ladder() {
+    use torus_mempool::rate_limit::NATIVE_BLOCK_BYTES_CAP;
+    use torus_network::caps::{
+        direct_push_body_bytes, DIRECT_PUSH_BODY_BYTES, MAX_BLOCK_DATA_MSG_SIZE,
+        MAX_DIRECT_MSG_SIZE, MAX_NATIVE_DA_SHARDS_MSG_SIZE,
+    };
+    // caps.rs `shard_cap_admits_worst_case_shard` mirrors this literal.
+    assert_eq!(NATIVE_BLOCK_BYTES_CAP, 12_000_000, "update the caps.rs mirror literal too");
+    // A full body must sync (block-data codec) — the last-resort rung.
+    assert!(NATIVE_BLOCK_BYTES_CAP + 64 * 1024 <= MAX_BLOCK_DATA_MSG_SIZE);
+    // Worst-case single shard (k = f+1 = 2 at n=3) + proof + header fits the shard cap.
+    assert!(NATIVE_BLOCK_BYTES_CAP / 2 + 8 * 32 + 64 <= MAX_NATIVE_DA_SHARDS_MSG_SIZE);
+    // The direct-push floor (default and effective) leaves framing headroom
+    // under our own direct codec cap, so a body set exactly at the floor is
+    // still readable by every same-build peer.
+    assert!(DIRECT_PUSH_BODY_BYTES < MAX_DIRECT_MSG_SIZE);
+    assert!(direct_push_body_bytes() < MAX_DIRECT_MSG_SIZE);
+}
