@@ -105,11 +105,16 @@ pub const HASH_ONLY_PUSH_THRESHOLD: usize = 512 * 1024; // 512 KB
 /// measured on WAN (the view-timeout wedge it guards against is bandwidth-bound, mem
 /// f58957c6) — this makes that sweep a restart, not a rebuild/redeploy.
 ///
-/// O5: the request is CLAMPED to `caps::LEGACY_FLEET_DIRECT_MSG_FLOOR`. A threshold above
+/// O5: the request is CLAMPED to the fleet direct-push body floor. A threshold above
 /// the floor orders full-body pushes that the oldest fleet codec must reject at read time —
 /// the S388 `=6000000` deployment did exactly this: every body set in (4 MB, 6 MB] was
 /// pushed, rejected by the receiver's 4 MB codec, and survived only via pull fallback.
 /// Above-floor requests WARN once at first use and run at the floor.
+///
+/// r4: the floor is `caps::direct_push_body_bytes()` (default 8 MB, env
+/// `TORUS_DIRECT_PUSH_BODY_BYTES`, ceiling = our own 8 MiB direct codec cap minus framing)
+/// instead of the pinned pre-O5 4 MB `LEGACY_FLEET_DIRECT_MSG_FLOOR`, so a cap-200/300
+/// pre-proposal body set (~5.6-8 MB at bs400) stays on the direct push path.
 fn hash_only_push_threshold() -> usize {
     static THRESHOLD: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *THRESHOLD.get_or_init(|| {
@@ -117,7 +122,7 @@ fn hash_only_push_threshold() -> usize {
             .ok()
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or(HASH_ONLY_PUSH_THRESHOLD);
-        let floor = crate::caps::LEGACY_FLEET_DIRECT_MSG_FLOOR;
+        let floor = crate::caps::direct_push_body_bytes();
         if requested > floor {
             warn!(
                 requested,
@@ -1058,6 +1063,10 @@ mod tests {
             HASH_ONLY_PUSH_THRESHOLD < 4 * 1024 * 1024,
             "gate must engage BELOW the 4 MB /torus/direct cap"
         );
+        // r4: the effective (env-clamped) threshold can never exceed the
+        // direct-push body floor, which itself sits under our codec cap.
+        assert!(hash_only_push_threshold() <= crate::caps::direct_push_body_bytes());
+        assert!(crate::caps::direct_push_body_bytes() < crate::caps::MAX_DIRECT_MSG_SIZE);
     }
 
     /// S387 follow-up: the manifest gate honors a per-node override threshold via the
@@ -1081,13 +1090,26 @@ mod tests {
     /// clamped (pure seam — OnceLock env state is process-wide, so the clamp rule
     /// is tested parameterized). The S388 live value (6 MB > 4 MB floor) is the
     /// motivating case: it ordered pushes every receiver's codec had to reject.
+    /// r4: at the new 8 MB default floor the same 6 MB request is honored — the
+    /// cap-200 bs400 body set (~5.6 MB) stays on the direct push path.
     #[test]
     fn env_threshold_clamps_to_fleet_floor() {
-        use crate::caps::LEGACY_FLEET_DIRECT_MSG_FLOOR;
+        use crate::caps::{DIRECT_PUSH_BODY_BYTES, LEGACY_FLEET_DIRECT_MSG_FLOOR};
         // S388 live value: 6 MB requested, 4 MB fleet floor -> clamped.
         assert_eq!(
             effective_push_threshold_at(6_000_000, LEGACY_FLEET_DIRECT_MSG_FLOOR),
             LEGACY_FLEET_DIRECT_MSG_FLOOR
+        );
+        // r4 default floor (8 MB): 6 MB is honored, 8 MB exactly is honored,
+        // anything above is clamped to the floor.
+        assert_eq!(effective_push_threshold_at(6_000_000, DIRECT_PUSH_BODY_BYTES), 6_000_000);
+        assert_eq!(
+            effective_push_threshold_at(DIRECT_PUSH_BODY_BYTES, DIRECT_PUSH_BODY_BYTES),
+            DIRECT_PUSH_BODY_BYTES
+        );
+        assert_eq!(
+            effective_push_threshold_at(16_000_000, DIRECT_PUSH_BODY_BYTES),
+            DIRECT_PUSH_BODY_BYTES
         );
         // At or under the floor: honored verbatim.
         assert_eq!(
