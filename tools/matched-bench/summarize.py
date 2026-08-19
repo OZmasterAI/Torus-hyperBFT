@@ -115,8 +115,16 @@ PHASES = ["evm", "verify", "replay_guard", "load_books", "engine", "save_books",
 # halves — state_write_build (serializing the pending maps into the WriteBatch)
 # and state_write_db (the atomic rocksdb write: WAL + memtable). build + db ==
 # state_write to rounding; both are 0.0 on a pre-r7 binary.
-SUB = {"engine": ["phase_margin", "phase_match", "phase_settle"],
-       "flush": ["root", "state_write", "state_write_build", "state_write_db", "evm_resync"]}
+FLUSH_SUB_R7 = ["state_write_build", "state_write_db"]
+# r6 engine-untimed-attribution: the six sub-timers app.rs observes ONCE per
+# native block, decomposing the engine share margin/match/settle never covered.
+# phase1_actions + phase_margin + phase_match + phase_settle + post_engine_tail
+# + engine_untimed == engine (by construction); settle_pass_a / settle_pass_b /
+# cache_flush are NESTED inside phase_settle, so do not re-add them.
+ENGINE_SUB_R6 = ["phase1_actions", "settle_pass_a", "settle_pass_b", "cache_flush",
+                 "post_engine_tail", "engine_untimed"]
+SUB = {"engine": ["phase_margin", "phase_match", "phase_settle"] + ENGINE_SUB_R6,
+       "flush": ["root", "state_write"] + FLUSH_SUB_R7 + ["evm_resync"]}
 phase = {}
 for node, rs in rows.items():
     if not rs:
@@ -173,8 +181,8 @@ for node, rs in rows.items():
             if n2 <= 0:
                 return None
             d = {k: round((m(b2, "exec_" + k + "_seconds_sum") - m(a2, "exec_" + k + "_seconds_sum")) / n2 * 1000, 1)
-                 for k in ["block"] + PHASES + ["phase_margin", "phase_match", "phase_settle", "root", "state_write",
-                                                "state_write_build", "state_write_db"]}
+                 for k in ["block"] + PHASES + ["phase_margin", "phase_match", "phase_settle", "root",
+                                                "state_write"] + FLUSH_SUB_R7 + ENGINE_SUB_R6}
             d["native_blocks"] = n2
             d["orders_placed_per_block"] = round((m(b2, "orders_placed_accepted_total") - m(a2, "orders_placed_accepted_total")) / n2)
             d["resting_orders_end"] = m(b2, "exec_resting_orders")
@@ -414,3 +422,12 @@ p0 = phase.get("val0", {})
 if p0:
     print(f"PHASE val0: block_ms={p0['block_ms']} wall/committed={p0['wall_ms_per_committed_block']} " +
           " ".join(f"{k}={v['ms']}({v['pct_of_block']}%)" for k, v in p0["phases"].items()))
+
+    # r6 engine-untimed-attribution: engine internals on one line (all 0.0 on a
+    # pre-r6 node binary, which is itself the "binary is stale" tell).
+    e = p0["phases"]["engine"]
+    print("ENGINE val0: total=" + str(e["ms"]) + " = phase1_actions=" + str(e["phase1_actions_ms"]) +
+          " margin=" + str(e["phase_margin_ms"]) + " match=" + str(e["phase_match_ms"]) +
+          " settle=" + str(e["phase_settle_ms"]) + "(passA=" + str(e["settle_pass_a_ms"]) +
+          " passB=" + str(e["settle_pass_b_ms"]) + " cache_flush=" + str(e["cache_flush_ms"]) + ")" +
+          " tail=" + str(e["post_engine_tail_ms"]) + " untimed=" + str(e["engine_untimed_ms"]))
