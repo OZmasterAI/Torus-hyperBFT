@@ -198,32 +198,80 @@ pub fn native_block_bytes_cap() -> usize {
 /// (`64 * cap`) — at cap 400 the window is 64*400 = 25_600, ABOVE this 16_384
 /// default, so entries would evict before exec reads them and the exec hot path
 /// silently loses its secp256k1-recover skip (a MISS is still correct, just
-/// slower). A bench that raises the block cap should raise this in lockstep via
-/// `TORUS_VERIFIED_SENDER_CACHE_CAP` (e.g. ~40_000 keeps the ~2.5x margin at cap
-/// 400). This is NOT a clamp on the NUMBER of actions a block can carry — it never
-/// bounds selection — but it is the trust-cache sizing that keeps a raised cap
-/// fast. Default unchanged: unset env => byte-identical to today.
+/// slower). Block-cap-raise sweep (r2): the DEFAULT now follows the effective
+/// block cap — [`default_verified_sender_cache_cap`] keeps the ~2.5x margin
+/// (`64 * cap * 5/2`, never below this constant), so a `TORUS_NATIVE_TOTAL_BLOCK_CAP`
+/// raise no longer needs a lockstep `TORUS_VERIFIED_SENDER_CACHE_CAP`; an explicit
+/// env value still wins verbatim. This is NOT a clamp on the NUMBER of actions a
+/// block can carry — it never bounds selection — but it is the trust-cache sizing
+/// that keeps a raised cap fast. At cap 100 (unset env) the resolved value is
+/// exactly this constant => byte-identical to today.
 pub const VERIFIED_SENDER_CACHE_CAP: usize = 16_384;
 
-/// Parse the raw `TORUS_VERIFIED_SENDER_CACHE_CAP` value (pure, so it is unit
-/// testable without env/OnceLock state — the rank-1 parser doctrine). Unset,
-/// malformed, or `0` => the compiled default (the `FifoCache` itself floors at 1,
-/// but `0` here means "operator left it effectively unset", so we keep the safe
-/// default rather than degrade the cache to a single entry).
-pub fn parse_verified_sender_cache_cap(raw: Option<String>) -> usize {
+/// Depth of the committed-block exec queue (app.rs `sync_channel(64)`): the
+/// number of blocks that can sit between consensus commit and execution, i.e.
+/// the in-flight window the trust cache must bridge. Sizing constant only —
+/// changing the real channel depth without this drifts the cache floor.
+pub const EXEC_QUEUE_DEPTH: usize = 64;
+
+/// Hard floor of trust-cache entries needed to bridge the in-flight window at a
+/// given total block cap: `EXEC_QUEUE_DEPTH * cap` (6_400 at the compiled cap 100).
+pub fn verified_sender_cache_in_flight_floor(total_block_cap: usize) -> usize {
+    EXEC_QUEUE_DEPTH.saturating_mul(total_block_cap)
+}
+
+/// Cap-derived DEFAULT trust-cache capacity: the in-flight floor at ~2.5x margin
+/// (`64 * cap * 5 / 2`), never below [`VERIFIED_SENDER_CACHE_CAP`]. cap 100 =>
+/// 16_000 < 16_384 => the compiled default (unchanged); cap 200 => 32_000;
+/// cap 300 => 48_000; cap 400 => 64_000. Pure, so unit-testable.
+pub fn default_verified_sender_cache_cap(total_block_cap: usize) -> usize {
+    let scaled = verified_sender_cache_in_flight_floor(total_block_cap).saturating_mul(5) / 2;
+    scaled.max(VERIFIED_SENDER_CACHE_CAP)
+}
+
+/// Resolve the raw `TORUS_VERIFIED_SENDER_CACHE_CAP` value against the effective
+/// total block cap (pure, so it is unit testable without env/OnceLock state — the
+/// rank-1 parser doctrine). Unset, malformed, or `0` => the cap-derived default
+/// (the `FifoCache` itself floors at 1, but `0` here means "operator left it
+/// effectively unset", so we keep the safe default rather than degrade the cache
+/// to a single entry). An explicit positive value is honored verbatim — a
+/// too-small cache is slower (more MISS => full recover), never incorrect.
+pub fn resolve_verified_sender_cache_cap(raw: Option<String>, total_block_cap: usize) -> usize {
     match raw.and_then(|v| v.trim().parse::<usize>().ok()) {
         Some(n) if n > 0 => n,
-        _ => VERIFIED_SENDER_CACHE_CAP,
+        _ => default_verified_sender_cache_cap(total_block_cap),
     }
 }
 
+/// Cap-100 view of [`resolve_verified_sender_cache_cap`] (kept for callers/tests
+/// that pin the compiled-default contract).
+pub fn parse_verified_sender_cache_cap(raw: Option<String>) -> usize {
+    resolve_verified_sender_cache_cap(raw, NATIVE_TOTAL_BLOCK_CAP)
+}
+
 /// Effective exec trust-cache capacity: `TORUS_VERIFIED_SENDER_CACHE_CAP`
-/// overrides the compiled default PER NODE. Node-local sizing of a
+/// overrides the cap-derived default PER NODE. Node-local sizing of a
 /// performance-only cache (a HIT == a fresh recover, a MISS falls through to full
 /// recover) — it can never change the resolved sender or fork, so mixed values
-/// across nodes are safe. Read at mempool construction; unset => the default.
+/// across nodes are safe. Read at mempool construction; unset => the default for
+/// the effective `native_total_block_cap()`. An explicit value below the in-flight
+/// floor WARNs (still honored): the exec hot path would lose its recover skip.
 pub fn verified_sender_cache_cap() -> usize {
-    parse_verified_sender_cache_cap(std::env::var("TORUS_VERIFIED_SENDER_CACHE_CAP").ok())
+    let cap = native_total_block_cap();
+    let resolved =
+        resolve_verified_sender_cache_cap(std::env::var("TORUS_VERIFIED_SENDER_CACHE_CAP").ok(), cap);
+    let floor = verified_sender_cache_in_flight_floor(cap);
+    if resolved < floor {
+        tracing::warn!(
+            resolved,
+            floor,
+            total_block_cap = cap,
+            "TORUS_VERIFIED_SENDER_CACHE_CAP below the exec in-flight window \
+             (EXEC_QUEUE_DEPTH * block cap): trust-cache entries may evict before \
+             exec reads them (slower, still correct)"
+        );
+    }
+    resolved
 }
 
 /// Number of individual orders/operations an action represents.
@@ -326,6 +374,50 @@ mod tests {
             40_000,
             "surrounding whitespace tolerated"
         );
+    }
+
+    // ---- block-cap raise: trust-cache default follows the block cap ----
+
+    #[test]
+    fn verified_sender_cache_floor_tracks_exec_queue_depth_times_cap() {
+        // The exec pipeline lags up to EXEC_QUEUE_DEPTH committed blocks behind
+        // consensus; each block carries up to `cap` actions => the hard floor
+        // of entries that must survive until exec reads them.
+        assert_eq!(EXEC_QUEUE_DEPTH, 64, "mirrors app.rs sync_channel(64)");
+        assert_eq!(verified_sender_cache_in_flight_floor(100), 6_400);
+        assert_eq!(verified_sender_cache_in_flight_floor(300), 19_200);
+    }
+
+    #[test]
+    fn default_verified_sender_cache_cap_is_unchanged_at_cap_100_and_scales_above() {
+        // cap 100 (the compiled default): 64*100*2.5 = 16_000 < 16_384 => the
+        // shipped default is byte-identical.
+        assert_eq!(default_verified_sender_cache_cap(NATIVE_TOTAL_BLOCK_CAP), VERIFIED_SENDER_CACHE_CAP);
+        assert_eq!(default_verified_sender_cache_cap(100), 16_384);
+        // Never BELOW the compiled default (a lowered cap keeps the 16_384).
+        assert_eq!(default_verified_sender_cache_cap(10), 16_384);
+        assert_eq!(default_verified_sender_cache_cap(0), 16_384);
+        // Above 100 the ~2.5x in-flight margin is kept automatically, so a
+        // TORUS_NATIVE_TOTAL_BLOCK_CAP raise does not silently lose the
+        // secp256k1-recover skip on the exec hot path.
+        assert_eq!(default_verified_sender_cache_cap(150), 24_000);
+        assert_eq!(default_verified_sender_cache_cap(200), 32_000);
+        assert_eq!(default_verified_sender_cache_cap(300), 48_000);
+        assert_eq!(default_verified_sender_cache_cap(400), 64_000);
+    }
+
+    #[test]
+    fn resolve_verified_sender_cache_cap_prefers_explicit_env_over_derived_default() {
+        // Unset / malformed / 0 => the cap-derived default.
+        assert_eq!(resolve_verified_sender_cache_cap(None, 300), 48_000);
+        assert_eq!(resolve_verified_sender_cache_cap(Some("nope".into()), 300), 48_000);
+        assert_eq!(resolve_verified_sender_cache_cap(Some("0".into()), 300), 48_000);
+        // An explicit value is honored verbatim, even below the derived default
+        // (operator sizing wins; a too-small cache is slower, never incorrect).
+        assert_eq!(resolve_verified_sender_cache_cap(Some("40000".into()), 300), 40_000);
+        assert_eq!(resolve_verified_sender_cache_cap(Some("1000".into()), 300), 1_000);
+        // The legacy single-arg parser is the cap-100 view of the same seam.
+        assert_eq!(parse_verified_sender_cache_cap(None), resolve_verified_sender_cache_cap(None, 100));
     }
 
     #[test]

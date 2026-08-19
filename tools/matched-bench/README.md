@@ -39,6 +39,17 @@ tools/matched-bench/run-cell.sh /home/18c/projects/wt/matched-bench nosettle-r1 
    `EXTRA_ENV='TORUS_BOOK_ROWS=2'` for a mode-2 control) — ambient
    `TORUS_*` vars are unset first, `EXTRA_ENV` is applied last (so it overrides).
    Verifies via `/proc/<pid>/environ` that all 3 nodes got the same env.
+   `BLOCK_CAP=N` (block-cap-raise sweep) exports the coherent proposer-local
+   bundle between the two: `TORUS_NATIVE_TOTAL_BLOCK_CAP=N`,
+   `TORUS_NATIVE_ORDERS_PER_BLOCK_CAP=max(50000, N*BATCH*1.25)`,
+   `TORUS_VERIFIED_SENDER_CACHE_CAP=max(16384, 64*N*2.5)`,
+   `TORUS_NATIVE_BLOCK_BYTES_CAP=clamp(N*BATCH*150, 6 MB, 12 MB)`; `BLOCK_CAP=100`
+   reproduces today's defaults exactly (control cell). The summary gains
+   `cell.block_cap`, `headline.txs_per_block_avg`, `headline.consensus_timeouts`,
+   `headline.dissemination_clean` and a `dissemination` block (per-node counts of
+   HASH-ONLY manifest pushes, body-fetch exhaustion, sync fallbacks, DA outbound
+   failures, body starvation, exec-backlog pacing lines) — a raised cap is
+   rejected when `dissemination_clean` is false, whatever matched/s says.
 5. Waits for health (all 3 committing, peers>=2), probes idle blk/s for 10 s.
 6. Samplers: 1 Hz scrape of all 3 nodes' `/metrics` -> `sampler.csv` (wide,
    one row per node per second: funnel counters + every `torus_exec_*` phase
