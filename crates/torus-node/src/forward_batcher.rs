@@ -189,9 +189,11 @@ fn parse_d2l_batch_ms(v: Option<&str>) -> u64 {
 }
 
 /// `TORUS_D2L_BATCH_MAX_BYTES`: default 512 KB (deliberately equal to the
-/// pre-proposal `HASH_ONLY_PUSH_THRESHOLD` default), CLAMPED to the
-/// legacy-fleet 4 MB direct-codec floor — an above-floor cap orders sends the
-/// oldest fleet codec must reject at read time (the S388 lesson).
+/// pre-proposal `HASH_ONLY_PUSH_THRESHOLD` default), CLAMPED to the fleet
+/// direct-push body floor (`torus_network::caps::direct_push_body_bytes()`,
+/// r4: 8 MB default / `TORUS_DIRECT_PUSH_BODY_BYTES`; was the pinned 4 MB
+/// pre-O5 floor) — an above-floor cap orders sends the oldest fleet codec
+/// must reject at read time (the S388 lesson).
 fn parse_d2l_batch_max_bytes(v: Option<&str>, floor: usize) -> usize {
     v.and_then(|s| s.trim().parse().ok())
         .filter(|&b| b > 0)
@@ -220,7 +222,7 @@ fn d2l_batch_max_bytes() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
         let requested = std::env::var("TORUS_D2L_BATCH_MAX_BYTES").ok();
-        let floor = torus_network::caps::LEGACY_FLEET_DIRECT_MSG_FLOOR;
+        let floor = torus_network::caps::direct_push_body_bytes();
         let effective = parse_d2l_batch_max_bytes(requested.as_deref(), floor);
         if let Some(ref r) = requested {
             if r.trim().parse::<usize>().map(|b| b > floor).unwrap_or(false) {
@@ -520,6 +522,11 @@ mod tests {
         );
         assert_eq!(parse_d2l_batch_max_bytes(Some("0"), floor), 512 * 1024);
         assert_eq!(parse_d2l_batch_max_bytes(Some("junk"), floor), 512 * 1024);
+        // r4: the live floor is the env-tunable direct-push body floor (8 MB
+        // default), so 8_000_000 is now honored and only above-floor clamps.
+        let r4 = torus_network::caps::DIRECT_PUSH_BODY_BYTES;
+        assert_eq!(parse_d2l_batch_max_bytes(Some("8000000"), r4), 8_000_000);
+        assert_eq!(parse_d2l_batch_max_bytes(Some("16000000"), r4), r4);
 
         // TORUS_D2L_REFORWARD_MS — default 2000; 0 is a REAL value (off).
         assert_eq!(parse_d2l_reforward_ms(None), 2000);
