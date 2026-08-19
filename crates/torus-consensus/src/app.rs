@@ -617,7 +617,8 @@ fn cached_matches_compact(cached: &TorusBlock, compact: &CompactBlock) -> bool {
 /// canonical header bytes (the committed block hash, read by
 /// `detect_conflicting_commit`), `[32..]` = serde-JSON of the header. ONE
 /// encoder for every writer of that CF (commit-time FIX 1a batch, exec-time
-/// standalone put), so the bytes are identical whichever path lands first.
+/// standalone put, exec-time fold into the native flush batch), so the bytes
+/// are identical whichever path lands first.
 fn header_record_bytes(block: &TorusBlock) -> Option<Vec<u8>> {
     let block_hash = alloy_primitives::keccak256(block.header.canonical_header_bytes());
     let header_json = match serde_json::to_vec(&block.header) {
@@ -750,7 +751,6 @@ fn persist_committed_block_durably_timed(
             );
         }
     }
-
     // The body is durable in this same batch; the commit manifest that guarded
     // the heal channel for this height is redundant — drop it in the batch so
     // `CF_COMMIT_MANIFEST` stays bounded to the committed-but-not-yet-dispatched
@@ -1326,13 +1326,27 @@ impl ExecutionContext {
                     tracing::error!(%e, height, "EVM execution failed for committed block");
                 }
             }
-        } else if !durable.header {
-            // Native-only block whose header the dispatcher did NOT already land
-            // (boot crash-replay, or a failed dispatch-time batch): write it here.
-            // When `durable.header` the same hash‖JSON bytes are already at this
-            // key (`persist_committed_block_durably`), so the rewrite is skipped.
+        } else if !durable.header && !has_native {
+            // Empty / non-native block whose header the dispatcher did NOT
+            // already land (boot crash-replay, or a failed dispatch-time batch):
+            // no native flush batch to ride, keep the standalone header put
+            // (cheap, rare). When `durable.header` the same hash‖JSON bytes are
+            // already at this key (`persist_committed_block_durably`), so the
+            // rewrite is skipped.
             persist_block_header(&self.state_db, torus_block);
         }
+        // r3 exec-write-stall-attribution: for a native-only block whose header
+        // is NOT already durable (boot crash-replay / failed dispatch batch) the
+        // header record is NOT put here as its own RocksDB write (that single
+        // small put measured 60-90 ms/blk on the exec thread — a full
+        // write-group wait behind the background trade writer's batch, not put
+        // cost). It is folded into the native overlay below and lands in the
+        // SAME atomic flush batch as the state + applied-height marker
+        // (identical bytes; CF_BLOCK_HEADERS is not a native-root CF, so the
+        // root is untouched). On a flush failure the standalone put runs as a
+        // fallback. When `durable.header` (the live dispatch path) nothing is
+        // written at all: the commit-time FIX 1a batch already landed it.
+        let fold_header = !has_evm && has_native && !durable.header;
         if let Some(ref m) = self.metrics {
             m.exec_evm_seconds
                 .observe(evm_timer.elapsed().as_secs_f64());
@@ -1471,6 +1485,15 @@ impl ExecutionContext {
 
             let overlay = NativeStateOverlay::new(self.state_db.clone());
             overlay.seed_from_bundle(&bundle);
+            // r3: header record rides the flush batch (see `fold_header`).
+            let mut header_folded = false;
+            if fold_header {
+                if let Some(bytes) = header_record_bytes(torus_block) {
+                    header_folded = overlay
+                        .put_cf_raw(CF_BLOCK_HEADERS, &height.to_be_bytes(), &bytes)
+                        .is_ok();
+                }
+            }
 
             let (pre_evm, post_evm) = sort_native_actions(&sender_actions);
             // rank8: books come from the resident holder when
@@ -1523,6 +1546,11 @@ impl ExecutionContext {
                     "FATAL: native execution failed — halting execution pipeline (fail-stop)"
                 );
                 self.exec_failed.store(true, Ordering::SeqCst);
+                // r3: the folded header will never flush; keep the pre-fold
+                // contract (header persisted at exec) for the restart's replay.
+                if header_folded {
+                    persist_block_header(&self.state_db, torus_block);
+                }
                 return;
             }
             let _ = NativeExecutor::drain_core_writer(&mut ctx);
@@ -1624,7 +1652,19 @@ impl ExecutionContext {
                 }
                 Err(e) => {
                     tracing::error!(%e, height, "native overlay flush + applied-height marker failed (block NOT marked applied — restart will replay)");
+                    // r3: the folded header did not land with the batch; keep the
+                    // pre-fold contract (header persisted at exec) via the
+                    // standalone put so the committed height stays visible to
+                    // `find_last_committed_height` for the replay.
+                    if header_folded {
+                        persist_block_header(&self.state_db, torus_block);
+                    }
                 }
+            }
+            if fold_header && !header_folded {
+                // Header encode/put into the overlay failed: fall back to the
+                // standalone exec-time put (exact-pre-r3 behaviour).
+                persist_block_header(&self.state_db, torus_block);
             }
 
             // Phase A: native post-commit credited EVM account balances (fees / validator rewards)
@@ -1716,9 +1756,16 @@ impl ExecutionContext {
                     }
                 }
                 None => {
+                    // r3: time the put ALONE (the encode above is CPU; a long
+                    // put here is a write-group / write-controller wait).
+                    let put_timer = std::time::Instant::now();
                     let _ = self
                         .state_db
                         .put_cf_raw(CF_BLOCK_BODIES, &height.to_be_bytes(), &body_bytes);
+                    if let Some(ref m) = self.metrics {
+                        m.exec_body_persist_write_seconds
+                            .observe(put_timer.elapsed().as_secs_f64());
+                    }
                 }
             }
         }
@@ -6232,6 +6279,82 @@ mod crash_recovery_tests {
         assert!(!parse_exec_rewrite_durable_rows_toggle(Some("0".into())));
         assert!(parse_exec_rewrite_durable_rows_toggle(Some("1".into())));
         assert!(parse_exec_rewrite_durable_rows_toggle(Some("true".into())));
+    }
+
+    /// r3 exec-write-stall-attribution: the commit-time persist is ONE RocksDB
+    /// write group (header + body + manifest prune in a single WriteBatch) —
+    /// proven via the `write.self` ticker delta — and it prunes the manifest
+    /// atomically with the body write. Bytes stored are identical to the old
+    /// three separate puts (header record layout re-checked).
+    #[test]
+    fn persist_committed_block_durably_is_one_write_group_and_prunes_manifest() {
+        let (_config, state_db) = make_test_config_and_db();
+        let block = make_block(11, vec![sign_claim_rewards(1), sign_claim_rewards(2)]);
+        persist_commit_manifest(&state_db, 11, b"manifest-datum");
+        assert!(
+            state_db
+                .get_cf_raw(CF_COMMIT_MANIFEST, &11u64.to_be_bytes())
+                .unwrap()
+                .is_some(),
+            "precondition: manifest present before dispatch"
+        );
+
+        let before = state_db.runtime_stats().tickers.map(|t| t.write_self);
+        assert_eq!(
+            persist_committed_block_durably(&state_db, &block),
+            DurableRows {
+                header: true,
+                body: true
+            }
+        );
+        let after = state_db.runtime_stats().tickers.map(|t| t.write_self);
+        if let (Some(b), Some(a)) = (before, after) {
+            assert_eq!(a - b, 1, "header+body+manifest must ride ONE write group");
+        }
+
+        assert!(load_replay_header(&state_db, 11).is_some());
+        assert_eq!(load_replay_body(&state_db, 11).unwrap().native_actions.len(), 2);
+        assert!(
+            state_db
+                .get_cf_raw(CF_COMMIT_MANIFEST, &11u64.to_be_bytes())
+                .unwrap()
+                .is_none(),
+            "manifest must be pruned in the same batch as the durable body"
+        );
+        // Header record bytes: exactly what the standalone encoder produces.
+        let raw = state_db
+            .get_cf_raw(CF_BLOCK_HEADERS, &11u64.to_be_bytes())
+            .unwrap()
+            .unwrap();
+        assert_eq!(raw, header_record_bytes(&block).unwrap());
+    }
+
+    /// r3: a native-only block executed WITHOUT a prior commit-time persist (the
+    /// boot-replay / unit-test shape) still ends with its header record present
+    /// and byte-identical to the standalone encoder — the fold into the flush
+    /// batch changes which write carries the bytes, never the bytes — and the
+    /// applied-height marker lands with it.
+    #[test]
+    fn native_block_header_folded_into_flush_lands_with_marker() {
+        let (config, state_db) = make_test_config_and_db();
+        let exec_ctx = make_exec_ctx(&config, &state_db);
+        let block = make_block(5, vec![sign_claim_rewards(21), sign_claim_rewards(22)]);
+        assert!(
+            state_db
+                .get_cf_raw(CF_BLOCK_HEADERS, &5u64.to_be_bytes())
+                .unwrap()
+                .is_none(),
+            "precondition: no commit-time header for this test shape"
+        );
+
+        exec_ctx.execute_committed_block(&block, vec![]);
+
+        let raw = state_db
+            .get_cf_raw(CF_BLOCK_HEADERS, &5u64.to_be_bytes())
+            .unwrap()
+            .expect("folded header must land via the flush batch");
+        assert_eq!(raw, header_record_bytes(&block).unwrap());
+        assert_eq!(read_native_applied_height(&state_db), Some(5));
     }
 
     /// Task B/2 RED-first (Option C, crash-durable commit). The commit boundary
