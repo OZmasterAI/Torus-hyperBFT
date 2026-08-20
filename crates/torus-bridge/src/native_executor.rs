@@ -1111,6 +1111,15 @@ mod book_rows_toggle_tests {
 // back to a full rebuild from persisted state, which is always authoritative.
 // A fatal block (`ctx.fatal_error`) never stashes — the holder stays drained,
 // forcing a rebuild.
+//
+// UNTOUCHED BLOCKS (r2 resident-books-stale-rebuild): a committed block with
+// no native actions and no fee revenue never builds a context, so the books
+// are untouched and the holder is ALSO that block's post-state. The pipeline
+// advances the holder's height stamp with the standalone applied-height
+// marker (`ResidentBooks::advance_untouched`) — otherwise every empty block
+// between two native blocks tripped the guard (devnet: resident_height=376,
+// block_height=379 → 377/378 were empty) and forced a multi-second full
+// reload. Only a direct successor advances; anything else drains the holder.
 
 /// rank8 runtime toggle: `TORUS_RESIDENT_BOOKS=1` enables resident books;
 /// anything else (INCLUDING UNSET) keeps the per-block reload — exact-today.
@@ -1122,6 +1131,25 @@ fn resident_books_enabled() -> bool {
 /// Pure parse of the `TORUS_RESIDENT_BOOKS` value: only `"1"` enables.
 fn parse_resident_books_toggle(v: Option<String>) -> bool {
     matches!(v.as_deref().map(str::trim), Some("1"))
+}
+
+/// bl1 resident-books-untouched-advance kill-switch:
+/// `TORUS_RESIDENT_ADVANCE_UNTOUCHED=0` disables advancing the rank8 holder
+/// across untouched (empty / non-native) blocks — restoring the pre-candidate
+/// behaviour (holder falls behind → full rebuild at the next native block).
+/// Anything else (INCLUDING UNSET) keeps the advance ON. Node-local only:
+/// the holder is a cache of what the DB already holds; the toggle never
+/// changes state, roots or matching.
+fn advance_untouched_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        parse_advance_untouched_toggle(std::env::var("TORUS_RESIDENT_ADVANCE_UNTOUCHED").ok())
+    })
+}
+
+/// Pure parse of the `TORUS_RESIDENT_ADVANCE_UNTOUCHED` value: only `"0"` disables.
+fn parse_advance_untouched_toggle(v: Option<String>) -> bool {
+    !matches!(v.as_deref().map(str::trim), Some("0"))
 }
 
 /// rank8: cross-block resident book state. Owned by the execution pipeline
@@ -1152,6 +1180,55 @@ impl ResidentBooks {
     pub fn is_populated(&self) -> bool {
         self.inner.is_some()
     }
+
+    /// The block height whose post-state the holder reflects (None = drained).
+    pub fn height(&self) -> Option<u64> {
+        self.inner.as_ref().map(|i| i.height)
+    }
+
+    /// r2 resident-books-stale-rebuild: a committed block that skipped the
+    /// native path entirely (no native actions, no fee revenue — the pipeline
+    /// never builds a context for it) leaves every book untouched, so the
+    /// holder's state is ALSO that block's post-state. Advance the height
+    /// stamp iff `block_height` is the holder's direct successor and return
+    /// true. Call it right after the standalone applied-height marker write
+    /// for that block, so memory and the marker move together.
+    ///
+    /// Anything else — same height replayed, a skipped height, an empty
+    /// holder — is not a normal sequence: the holder is DRAINED (returns
+    /// false) and the next context rebuilds from the DB, which is always
+    /// authoritative. Strict by design: a wrong "not stale" here would be a
+    /// correctness bug; a needless rebuild is only a stall.
+    pub fn advance_untouched(&mut self, block_height: u64) -> bool {
+        self.advance_untouched_with(advance_untouched_enabled(), block_height)
+    }
+
+    /// [`Self::advance_untouched`] with the kill-switch value passed
+    /// explicitly (tests; the env-reading wrapper above is what the pipeline
+    /// calls). `enabled == false` is a pure no-op: the holder is neither
+    /// advanced nor drained, exactly the pre-candidate sequence.
+    pub fn advance_untouched_with(&mut self, enabled: bool, block_height: u64) -> bool {
+        if !enabled {
+            return false;
+        }
+        match self.inner.as_mut() {
+            Some(inner) if inner.height + 1 == block_height => {
+                inner.height = block_height;
+                true
+            }
+            Some(inner) => {
+                tracing::warn!(
+                    resident_height = inner.height,
+                    block_height,
+                    "rank8: untouched block is not the resident holder's successor — draining \
+                     the holder (next block rebuilds from persisted state)"
+                );
+                self.inner = None;
+                false
+            }
+            None => false,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1174,6 +1251,39 @@ mod resident_books_toggle_tests {
         for v in ["0", "true", "on", "", "yes", "2"] {
             assert!(!parse_resident_books_toggle(Some(v.to_string())), "{v}");
         }
+    }
+}
+
+#[cfg(test)]
+mod advance_untouched_toggle_tests {
+    use super::{parse_advance_untouched_toggle, ResidentBooks};
+
+    #[test]
+    fn default_is_on() {
+        assert!(parse_advance_untouched_toggle(None));
+    }
+
+    #[test]
+    fn zero_disables() {
+        assert!(!parse_advance_untouched_toggle(Some("0".to_string())));
+        assert!(!parse_advance_untouched_toggle(Some(" 0 ".to_string())));
+    }
+
+    #[test]
+    fn anything_else_stays_on() {
+        for v in ["1", "true", "on", "", "yes", "2"] {
+            assert!(parse_advance_untouched_toggle(Some(v.to_string())), "{v}");
+        }
+    }
+
+    /// Kill-switch semantics: with the advance disabled the holder is left
+    /// EXACTLY as before the candidate — not advanced, not drained — so the
+    /// next native block trips the height guard and rebuilds from the DB.
+    #[test]
+    fn disabled_advance_leaves_holder_untouched() {
+        let mut holder = ResidentBooks::default();
+        assert!(!holder.advance_untouched_with(false, 1));
+        assert_eq!(holder.height(), None);
     }
 }
 
@@ -1539,18 +1649,32 @@ impl<T: StateBackend> NativeExecContext<T> {
         let mut reused_inner: Option<ResidentInner> = None;
         if let Some(holder) = resident {
             if let Some(inner) = holder.inner.take() {
-                let marker_ok = match Self::read_applied_marker(&state) {
+                let applied_marker = Self::read_applied_marker(&state);
+                let marker_ok = match applied_marker {
                     Some(applied) => applied == inner.height,
                     // No marker row (test envs / pre-marker DBs): the height
                     // sequence check below is the only guard available.
                     None => true,
                 };
-                if inner.height + 1 == block_height && marker_ok {
+                let height_ok = inner.height + 1 == block_height;
+                if height_ok && marker_ok {
                     reused_inner = Some(inner);
                 } else {
+                    // Attribute the trip: "height" = the holder is not the
+                    // block's predecessor (a block advanced without the holder
+                    // — see `ResidentBooks::advance_untouched`), "marker" =
+                    // the DB's applied height disagrees with memory (failed
+                    // flush / out-of-band progress), "height+marker" = both.
+                    let reason = match (height_ok, marker_ok) {
+                        (false, false) => "height+marker",
+                        (false, true) => "height",
+                        _ => "marker",
+                    };
                     tracing::warn!(
                         resident_height = inner.height,
                         block_height,
+                        applied_marker,
+                        reason,
                         "rank8: resident books stale (height/marker mismatch) — rebuilding from persisted state"
                     );
                 }
@@ -1654,6 +1778,14 @@ impl<T: StateBackend> NativeExecContext<T> {
     /// rebuilding from persisted). Test/ops introspection.
     pub fn resident_reused(&self) -> bool {
         self.resident_reused
+    }
+
+    /// rank8: whether this context ran in resident mode but had to REBUILD
+    /// from persisted state (holder empty at startup, drained after a fatal
+    /// block, or the staleness guard tripped). Metrics hook: every hit is a
+    /// full O(resting depth) reload on the exec thread.
+    pub fn resident_rebuilt(&self) -> bool {
+        self.resident && !self.resident_reused
     }
 
     /// rank8: hand the books (their journals ride inside, journal-in-book)

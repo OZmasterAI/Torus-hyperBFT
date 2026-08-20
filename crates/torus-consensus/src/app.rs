@@ -1666,6 +1666,9 @@ impl ExecutionContext {
                 m.exec_load_books_seconds
                     .observe(load_books_timer.elapsed().as_secs_f64());
                 m.exec_resting_orders.set(ctx.resting_order_count() as i64);
+                if ctx.resident_rebuilt() {
+                    m.exec_resident_rebuilds.inc();
+                }
             }
             ctx.metrics = self.metrics.clone();
             // O3: with a background writer present, fills buffer their
@@ -2020,6 +2023,27 @@ impl ExecutionContext {
             } else {
                 write_native_applied_height(&self.state_db, height);
             }
+            // r2 resident-books-stale-rebuild: this block never built a context,
+            // so the order books are untouched — the rank8 resident holder is
+            // still exactly this block's post-state. Advance its height stamp in
+            // step with the marker just written; otherwise the NEXT native block
+            // sees holder.height + 1 != height and pays a full O(resting depth)
+            // reload (the "resident books stale" multi-second stall proven on
+            // devnet with empty blocks between native ones). Successor-only:
+            // any other sequence drains the holder (rebuild = safe direction).
+            // Should the marker put above have failed, the guard's marker
+            // check still trips next block — memory never outranks the DB.
+            // Under the bl2 pipeline the advance stays on E (the holder is an
+            // E-only object): the handoff above returned only once W RECEIVED
+            // Marker(N), so the next native block's overlay reads the marker
+            // through its parent layer (Marker jobs carry a 1-key pending set)
+            // and the guard sees N whether or not W has made it durable yet. A
+            // failed handoff returned early — the holder is NOT advanced past a
+            // marker that will never land.
+            self.resident_books
+                .lock()
+                .expect("resident-books mutex poisoned (exec thread panicked mid-block)")
+                .advance_untouched(height);
         }
         if let Some(ref m) = self.metrics {
             m.exec_body_persist_seconds
@@ -8546,6 +8570,75 @@ mod crash_recovery_tests {
         );
     }
 
+    /// r2 resident-books-stale-rebuild: a committed block that skips the native
+    /// path entirely (no native actions, no fee revenue) leaves the order books
+    /// untouched, so the rank8 resident holder must ADVANCE with it (in step
+    /// with the standalone applied-height marker) instead of falling behind and
+    /// tripping the staleness guard on the next native block (devnet:
+    /// "resident_height=376 block_height=379" → multi-second full rebuild).
+    #[test]
+    fn empty_blocks_advance_resident_holder_with_marker() {
+        use torus_bridge::native_executor::{NativeExecContext, ResidentBooks};
+        let (config, state_db) = make_test_config_and_db();
+        let exec_ctx = make_exec_ctx(&config, &state_db);
+
+        // Height 1: empty block through the pipeline (marker=1, header persisted).
+        exec_ctx.execute_committed_block(&make_block(1, vec![]), vec![]);
+        assert_eq!(read_native_applied_height(&state_db), Some(1));
+
+        // Seed the holder as if height 1 had been executed resident (post-state
+        // of height 1, classic mode = the pipeline's default).
+        let mut holder = ResidentBooks::default();
+        let mut seed = NativeExecContext::new_with_modes(
+            state_db.clone(),
+            1,
+            1001,
+            0,
+            config.epoch_length,
+            config.max_validators,
+            Address::ZERO,
+            config.treasury_address,
+            config.dev_pool_address,
+            false,
+            Some(&mut holder),
+        );
+        seed.save_order_books();
+        seed.stash_resident(&mut holder);
+        assert_eq!(holder.height(), Some(1));
+        *exec_ctx.resident_books.lock().unwrap() = holder;
+
+        // Heights 2 and 3: empty blocks — the holder must track the marker.
+        for h in 2..=3u64 {
+            exec_ctx.execute_committed_block(&make_block(h, vec![]), vec![]);
+            assert_eq!(read_native_applied_height(&state_db), Some(h));
+            assert_eq!(
+                exec_ctx.resident_books.lock().unwrap().height(),
+                Some(h),
+                "holder must advance across the untouched block {h}"
+            );
+        }
+
+        // Height 4 (native, resident): the guard passes — no rebuild.
+        let mut holder = std::mem::take(&mut *exec_ctx.resident_books.lock().unwrap());
+        let ctx = NativeExecContext::new_with_modes(
+            state_db.clone(),
+            4,
+            1004,
+            0,
+            config.epoch_length,
+            config.max_validators,
+            Address::ZERO,
+            config.treasury_address,
+            config.dev_pool_address,
+            false,
+            Some(&mut holder),
+        );
+        assert!(
+            ctx.resident_reused(),
+            "holder advanced through empty blocks must be reused at the next native block"
+        );
+    }
+
     /// Exec-ceiling Option A: executing ONE native block must observe each
     /// phase histogram exactly once and count the executed action, so the
     /// live probe's per-phase sums decompose `exec_block_seconds` cleanly
@@ -10192,6 +10285,129 @@ mod crash_recovery_tests {
         drop(ctx);
         assert_eq!(gate.received(), vec![2]);
         assert_eq!(read_native_applied_height(&state_db), Some(2));
+    }
+
+    /// bl3 resident-books-untouched-advance under the pipeline (design §2.1
+    /// step 10): an empty block's Marker job advances the rank8 holder ON E at
+    /// the hand-off, and the NEXT native block's staleness guard reads the
+    /// marker THROUGH its overlay's parent layer (the 1-key Marker pending set)
+    /// — so while W still has Marker(2) in flight (DB marker = 1) the guard sees
+    /// 2 and the holder is reused. The negative control pins that the layer is
+    /// load-bearing: the same guard over the bare DB trips (reason=marker) and
+    /// rebuilds. Kill-switch and serial-path ordering are pinned by
+    /// `empty_blocks_advance_resident_holder_with_marker` and the torus-bridge
+    /// `resident_books_tests`.
+    #[test]
+    fn exec_pipeline_empty_block_advances_resident_holder_through_parent_layer() {
+        use torus_bridge::native_executor::{NativeExecContext, ResidentBooks};
+        let (cfg, state_db) = make_test_config_and_db();
+        fund_pipeline_fixture(&state_db);
+        let blocks = pipeline_fixture_blocks();
+        let gate = crate::exec_pipeline::WorkerGate::new();
+        let ctx = pipeline_ctx(&state_db, true, Some(gate.clone()));
+
+        // Native 1 through the pipeline, drained: marker(1) durable.
+        dispatch_and_execute(&ctx, &state_db, &blocks[0]);
+        assert!(ctx.flush_worker.as_ref().unwrap().wait_idle());
+        assert_eq!(read_native_applied_height(&state_db), Some(1));
+
+        // Seed the holder as height 1's resident post-state (classic mode).
+        let mut holder = ResidentBooks::default();
+        let mut seed = NativeExecContext::new_with_modes(
+            state_db.clone(),
+            1,
+            1001,
+            0,
+            cfg.epoch_length,
+            cfg.max_validators,
+            Address::ZERO,
+            cfg.treasury_address,
+            cfg.dev_pool_address,
+            false,
+            Some(&mut holder),
+        );
+        seed.save_order_books();
+        seed.stash_resident(&mut holder);
+        assert_eq!(holder.height(), Some(1));
+        *ctx.resident_books.lock().unwrap() = holder;
+
+        // Empty 2 with W parked: the rendezvous completes (W RECEIVED Marker(2))
+        // but the marker is NOT durable. The holder must already be at 2.
+        gate.hold();
+        dispatch_and_execute(&ctx, &state_db, &blocks[1]);
+        assert!(gate.wait_received(2), "W must have taken Marker(2)");
+        assert_eq!(read_native_applied_height(&state_db), Some(1), "Marker(2) in flight, not durable");
+        assert_eq!(
+            ctx.resident_books.lock().unwrap().height(),
+            Some(2),
+            "holder must advance on E at the hand-off, not at durability"
+        );
+        let parent = ctx.last_job.lock().unwrap().clone();
+        assert_eq!(parent.as_ref().map(|p| p.height()), Some(2), "parent layer is Marker(2)");
+
+        // Negative control: the guard over the BARE DB (marker=1) must trip.
+        {
+            let mut probe = std::mem::take(&mut *ctx.resident_books.lock().unwrap());
+            let c = NativeExecContext::new_with_modes(
+                state_db.clone(),
+                3,
+                1003,
+                0,
+                cfg.epoch_length,
+                cfg.max_validators,
+                Address::ZERO,
+                cfg.treasury_address,
+                cfg.dev_pool_address,
+                false,
+                Some(&mut probe),
+            );
+            assert!(c.resident_rebuilt(), "DB-only marker read (1) vs holder (2) must rebuild");
+            // Re-seed at height 2 for the real check below (the probe drained it).
+            let mut holder = ResidentBooks::default();
+            let mut seed = NativeExecContext::new_with_modes(
+                state_db.clone(),
+                2,
+                1002,
+                0,
+                cfg.epoch_length,
+                cfg.max_validators,
+                Address::ZERO,
+                cfg.treasury_address,
+                cfg.dev_pool_address,
+                false,
+                Some(&mut holder),
+            );
+            seed.save_order_books();
+            seed.stash_resident(&mut holder);
+            assert_eq!(holder.height(), Some(2));
+            *ctx.resident_books.lock().unwrap() = holder;
+        }
+
+        // What E does for native 3: overlay layered on pending(2) = Marker(2).
+        let overlay = NativeStateOverlay::with_parent(state_db.clone(), parent);
+        let mut holder = std::mem::take(&mut *ctx.resident_books.lock().unwrap());
+        let c = NativeExecContext::new_with_modes(
+            overlay,
+            3,
+            1003,
+            0,
+            cfg.epoch_length,
+            cfg.max_validators,
+            Address::ZERO,
+            cfg.treasury_address,
+            cfg.dev_pool_address,
+            false,
+            Some(&mut holder),
+        );
+        assert!(
+            c.resident_reused() && !c.resident_rebuilt(),
+            "guard must read Marker(2) through the parent layer while W still holds it"
+        );
+
+        gate.release();
+        assert!(ctx.flush_worker.as_ref().unwrap().wait_idle());
+        assert_eq!(read_native_applied_height(&state_db), Some(2), "Marker(2) landed after release");
+        assert!(!ctx.exec_failed.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     /// Kill switch: `TORUS_EXEC_PIPELINE` unset/0 => no worker is attached, the

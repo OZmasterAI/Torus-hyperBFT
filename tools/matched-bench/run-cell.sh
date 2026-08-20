@@ -455,11 +455,15 @@ for i in 0 1 2; do
     placed=$(mval torus_orders_placed_accepted_total < "$OUT/metrics-after-val$i.txt")
     resting=$(mval torus_orders_resting_total < "$OUT/metrics-after-val$i.txt")
     actions=$(mval torus_native_actions_processed_total < "$OUT/metrics-after-val$i.txt")
+    # r3 resident-books-stale-rebuild: full O(resting depth) reloads of the rank8
+    # holder. Expect exactly 1 per process (the cold start); anything more is a
+    # mid-run "resident books stale" stall — check val$i.log.excerpt for the reason.
+    rebuilds=$(mval torus_exec_resident_rebuilds_total < "$OUT/metrics-after-val$i.txt")
     lg="$RUN_DIR/val$i.log"
     panics=$(grep -c -E 'panicked|FAIL-STOP|fail-stop|Latching fail-stop|conflicting blocks' "$lg" 2>/dev/null); panics=${panics:-0}
     errors=$(grep -c ' ERROR ' "$lg" 2>/dev/null); errors=${errors:-0}
-    printf '{"node":"val%s","height":%s,"cmp_height":%s,"block_hash":"%s","header_state_root":"%s","state_digest":"%s","digest_height":%s,"digest_seconds":%s,"matched":%s,"placed":%s,"resting":%s,"actions":%s,"panic_or_failstop_lines":%s,"error_lines":%s}\n' \
-        "$i" "${HGT[$i]}" "$HCMP" "$bh" "$sr" "$dig" "${DHGT[$i]}" "${DIGSECS[$i]}" "${matched%.*}" "${placed%.*}" "${resting%.*}" "${actions%.*}" "$panics" "$errors" >> "$OUT/agreement.jsonl"
+    printf '{"node":"val%s","height":%s,"cmp_height":%s,"block_hash":"%s","header_state_root":"%s","state_digest":"%s","digest_height":%s,"digest_seconds":%s,"matched":%s,"placed":%s,"resting":%s,"actions":%s,"resident_rebuilds":%s,"panic_or_failstop_lines":%s,"error_lines":%s}\n' \
+        "$i" "${HGT[$i]}" "$HCMP" "$bh" "$sr" "$dig" "${DHGT[$i]}" "${DIGSECS[$i]}" "${matched%.*}" "${placed%.*}" "${resting%.*}" "${actions%.*}" "${rebuilds%.*}" "$panics" "$errors" >> "$OUT/agreement.jsonl"
 done
 cat "$OUT/agreement.jsonl" >> "$OUT/run.log"
 
