@@ -115,6 +115,20 @@ impl WorkerGate {
         self.received.lock().unwrap().clone()
     }
 
+    /// Block (≤ 10 s) until W has recorded receipt of `height`. The rendezvous
+    /// `submit` returns as soon as the value is handed over, a hair BEFORE W's
+    /// thread records it here — tests must wait for the record, not assume it.
+    pub fn wait_received(&self, height: u64) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            if self.received.lock().unwrap().contains(&height) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        false
+    }
+
     fn wait_open(&self, height: u64) -> bool {
         self.received.lock().unwrap().push(height);
         let mut held = self.held.lock().unwrap();
@@ -147,6 +161,9 @@ pub struct FlushWorker {
     tx: Option<SyncSender<Job>>,
     handle: Option<JoinHandle<()>>,
     shared: Arc<Shared>,
+    /// Test gate (None in production); released on drop so a failing test
+    /// that leaves W parked fails instead of hanging the join.
+    gate: Option<Arc<WorkerGate>>,
 }
 
 /// Everything W needs to run a job; owned by the worker thread.
@@ -174,6 +191,7 @@ impl FlushWorker {
             durable_height: AtomicU64::new(durable_height_seed),
         });
         let shared_w = shared.clone();
+        let gate = env.gate.clone();
         let handle = std::thread::Builder::new()
             .name("torus-flush-worker".into())
             .spawn(move || worker_loop(rx, env, shared_w))
@@ -182,6 +200,7 @@ impl FlushWorker {
             tx: Some(tx),
             handle: Some(handle),
             shared,
+            gate,
         }
     }
 
@@ -238,6 +257,9 @@ impl FlushWorker {
 impl Drop for FlushWorker {
     fn drop(&mut self) {
         self.tx.take();
+        if let Some(g) = &self.gate {
+            g.release();
+        }
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
@@ -481,6 +503,7 @@ mod tests {
             })
             .unwrap();
         // W received 1 and is parked on the gate.
+        assert!(gate.wait_received(1));
         assert_eq!(gate.received(), vec![1]);
         assert_eq!(worker.outstanding(), 1);
 

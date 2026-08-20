@@ -1236,7 +1236,7 @@ impl ExecutionContext {
         if !sent {
             tracing::error!(
                 height,
-                "FATAL: flush worker unavailable/failed at hand-off — this block was executed on a                  non-durable base; latching fail-stop (restart replays from the durable marker)"
+                "FATAL: flush worker unavailable/failed at hand-off — this block was executed on a non-durable base; latching fail-stop (restart replays from the durable marker)"
             );
             self.exec_failed.store(true, Ordering::SeqCst);
             return false;
@@ -9961,18 +9961,17 @@ mod crash_recovery_tests {
         ctx.execute_committed_block_with(block, vec![], durable);
     }
 
-    fn dump_all_cfs(state_db: &StateDb) -> Vec<(&'static str, Vec<(Vec<u8>, Vec<u8>)>)> {
+    /// One CF's `(key, value)` rows, tagged with the CF name.
+    type CfDump = (&'static str, Vec<(Vec<u8>, Vec<u8>)>);
+
+    fn dump_all_cfs(state_db: &StateDb) -> Vec<CfDump> {
         torus_state::cf::ALL_CF_NAMES
             .iter()
             .map(|cf| (*cf, StateBackend::iterate_cf(state_db, cf, None).unwrap()))
             .collect()
     }
 
-    fn assert_dumps_equal(
-        a: &[(&'static str, Vec<(Vec<u8>, Vec<u8>)>)],
-        b: &[(&'static str, Vec<(Vec<u8>, Vec<u8>)>)],
-        what: &str,
-    ) {
+    fn assert_dumps_equal(a: &[CfDump], b: &[CfDump], what: &str) {
         for ((cf, x), (_, y)) in a.iter().zip(b.iter()) {
             assert_eq!(x, y, "{what}: CF {cf} diverged");
         }
@@ -9980,14 +9979,7 @@ mod crash_recovery_tests {
 
     /// Run the fixture OFF (serial) or ON (pipeline), drain, return the full state
     /// dump + persisted native root + the ctx's fail-stop latch.
-    fn run_pipeline_fixture(
-        on: bool,
-    ) -> (
-        StateDb,
-        Vec<(&'static str, Vec<(Vec<u8>, Vec<u8>)>)>,
-        torus_types::B256,
-        Vec<u64>,
-    ) {
+    fn run_pipeline_fixture(on: bool) -> (StateDb, Vec<CfDump>, torus_types::B256, Vec<u64>) {
         let (_cfg, state_db) = make_test_config_and_db();
         fund_pipeline_fixture(&state_db);
         let gate = crate::exec_pipeline::WorkerGate::new();
@@ -10048,6 +10040,7 @@ mod crash_recovery_tests {
 
         gate.hold();
         dispatch_and_execute(&ctx, &state_db, &blocks[0]); // native 1 -> W received, parked
+        assert!(gate.wait_received(1), "W must have taken job 1");
         assert_eq!(gate.received(), vec![1]);
         assert_eq!(ctx.exec_applied.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(read_native_applied_height(&state_db), None, "batch(1) not durable yet");
@@ -10140,6 +10133,7 @@ mod crash_recovery_tests {
 
         gate.hold();
         dispatch_and_execute(&ctx, &state_db, &first3[1]); // Marker(2) received, parked
+        assert!(gate.wait_received(2));
         let db_t = state_db.clone();
         let b3 = first3[2].clone();
         let t = std::thread::spawn(move || {
