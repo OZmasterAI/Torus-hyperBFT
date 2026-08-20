@@ -158,7 +158,12 @@ RUN_DIR="$DATA_ROOT/run"
 # OLDER binaries equivalent. EXTRA_ENV='TORUS_PARALLEL_BUCKET_HASH=4' = the
 # pre-r5 control; '=1' = serial. Leave TORUS_SAVE_BOOKS_WORKERS at the host
 # default (4 is a -34 % cliff, r5).
+# TORUS_ROCKSDB_PIPELINED_WRITE=1: s46 n=2 at cap 25, view_ms 132.6-132.9 ->
+# 119.2-121.5 (-9 %), db.write avg 7 -> 5.8 ms, matched/s +7-13 %, AGREE. A
+# RocksDB write-scheduling option (WAL and memtable writers overlap), no
+# durability change. Control = EXTRA_ENV='TORUS_ROCKSDB_PIPELINED_WRITE=0'.
 RECORD_ENV=(
+    TORUS_ROCKSDB_PIPELINED_WRITE=1
     TORUS_BOOK_ROWS=3
     TORUS_RESIDENT_BOOKS=1
     TORUS_NATIVE_ROOT_CACHE=1
