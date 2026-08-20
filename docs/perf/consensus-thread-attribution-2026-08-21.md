@@ -76,15 +76,15 @@ thread's 6–9 tiny per-view writes queue behind exec's flush batches in the sha
 
 ## 4. Two levers measured
 
-| | control (pipelined-write r1/r2) | `PIPELINED_WRITE=1` vs unpinned | DA batch read (`a3a476f`) |
+| | control (pipelined-write r1/r2) | `PIPELINED_WRITE=1` vs unpinned | DA batch read (`a3a476f`) r1 / r2 |
 |---|---|---|---|
-| view ms | 132.6–132.9 → 119.2 / 121.5 | −9 % (n=2, scatter <1 %) | 117.5 (−2.5 %) |
-| `da_reconstruct` | 22–24 | — | **14** (−37 %) |
-| `validate_block` | 14.9–15.9 | — | **9.2–10.6** |
-| HotStuff on-CPU /blk | 37–39 | — | **33–35** |
+| view ms | 132.6–132.9 → 119.2 / 121.5 | −9 % (n=2, scatter <1 %) | 117.5 / 117.6 (−2.5 %) |
+| `da_reconstruct` | 22–24 | — | **13.9–16.0 / 14.7–14.8** (−37 %) |
+| `validate_block` | 14.9–15.9 | — | **9.2–10.6 / 9.7–9.9** |
+| HotStuff on-CPU /blk | 37–39 | — | **33–35 / 35–36** |
 | db.write avg | 7.2 → 5.8 | | 5.8 |
-| matched/s | 23.5–24.8k → 26.5–26.6k | +7–13 % | 27.7k |
-| agreement | AGREE | AGREE | AGREE |
+| matched/s | 23.5–24.8k → 26.5–26.6k | +7–13 % | 27.7k / 27.0k |
+| agreement | AGREE | AGREE | AGREE / AGREE |
 
 - `TORUS_ROCKSDB_PIPELINED_WRITE=1` (`6f61f05`): now in the bench `RECORD_ENV`; node default
   unchanged pending a cap-100 / 300 s confirm.
