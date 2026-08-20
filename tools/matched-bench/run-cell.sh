@@ -399,9 +399,14 @@ if [ -n "$CRASH_KILL_AT_S" ]; then
 fi
 wait "$BENCH_PID"; BENCH_RC=$?
 if [ -n "$CRASH_PID" ]; then
+    # rc is informational: bash may already have reaped the sub-shell, and a
+    # spurious 127 from `wait` must not throw away a good cell. The ARTIFACT is
+    # the truth — crash-kill.sh writes it last, after the restart succeeded.
     wait "$CRASH_PID"; CRASH_RC=$?; CRASH_PID=""
     log "crash gate exited rc=$CRASH_RC"
-    [ "$CRASH_RC" = 0 ] || die "crash gate failed (rc=$CRASH_RC) — see run.log"
+fi
+if [ -n "$CRASH_KILL_AT_S" ] && [ ! -s "$OUT/crash-kill.json" ]; then
+    die "crash gate did not complete (no crash-kill.json) — the node was not killed+restarted, see run.log"
 fi
 T_BENCH1=$(date +%s)
 BENCH_PID=""
