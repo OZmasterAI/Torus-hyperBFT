@@ -177,3 +177,152 @@ fn accum_does_not_perturb_state() {
     let (_, seq) = run(false);
     assert_eq!(par, seq, "timing must not change consensus state");
 }
+
+// ---------------------------------------------------------------------------
+// bl4 phase1-actions-drift-attribution
+//
+// `phase1_actions_ns` alone is unreadable: it swings 55 -> 790 ms/blk WITHIN a
+// single 300 s cell (val0, bl3-merged-confirm-10m) while the action count per
+// block is pinned at the ~200-action block cap. The span therefore has to be
+// divided by the work it actually did, and the unit of that work is a
+// CANCELLED ORDER, not an action: `CancelAllOrders { market_id: None }` walks
+// every book and removes every one of the sender's resting orders, so one
+// action costs O(that sender's resting depth) and gets more expensive as the
+// book grows. These two counters are the numerator's denominators.
+//
+// Contract:
+//   * `phase1_action_count` counts EVERY non-PlaceOrder entry the Phase-1
+//     loop executed, whether it succeeded or not (a cancel for a vanished id
+//     still walks all books — that is the cost being attributed);
+//   * `phase1_orders_cancelled` counts orders actually REMOVED from a book by
+//     CancelOrder / CancelAllOrders, so it grows with depth under a fixed
+//     action mix;
+//   * both are additive across the two `execute_batch` calls a block makes;
+//   * both are node-local: adding them must not move the state root.
+// ---------------------------------------------------------------------------
+
+/// Seed a two-market ladder for `who`, then return the context so a Phase-1
+/// batch can be measured against a KNOWN resting depth.
+fn seeded_ctx(levels: i64) -> (tempfile::TempDir, NativeExecContext) {
+    let (dir, db) = open_test_db();
+    let mut ctx = make_ctx(db);
+    for n in 1..=32u8 {
+        fund_native(&ctx, &addr(n), fp(10_000_000));
+    }
+    let mut seed = Vec::new();
+    for m in 1..=2u64 {
+        for lvl in 0..levels {
+            // All resting orders belong to addr(1) so one CancelAllOrders
+            // removes exactly `2 * levels` of them.
+            seed.push(place(addr(1), gtc(m, true, 90 - lvl, 5)));
+        }
+    }
+    NativeExecutor::execute_batch_settle_mode(&mut ctx, &seed, false);
+    assert!(ctx.fatal_error.is_none(), "fatal: {:?}", ctx.fatal_error);
+    ctx.phase_accum = ExecPhaseAccum::default();
+    (dir, ctx)
+}
+
+#[test]
+fn phase1_counts_every_non_place_action() {
+    let (_dir, mut ctx) = seeded_ctx(4);
+    // 3 Phase-1 actions: two cancels for ids that do NOT rest (still walks
+    // every book — that walk is the cost) and one that does nothing else.
+    let batch: Vec<SignedAction> = vec![
+        (addr(11), NativeAction::CancelOrder { order_id: 99_001 }),
+        (addr(11), NativeAction::CancelOrder { order_id: 99_002 }),
+        (addr(11), NativeAction::CancelAllOrders { market_id: None }),
+    ];
+    NativeExecutor::execute_batch_settle_mode(&mut ctx, &batch, false);
+    let a = ctx.phase_accum;
+    assert_eq!(
+        a.phase1_action_count, 3,
+        "every non-PlaceOrder entry must be counted, hit or miss"
+    );
+    assert_eq!(
+        a.phase1_orders_cancelled, 0,
+        "addr(11) rests nothing, so nothing was removed"
+    );
+}
+
+#[test]
+fn phase1_cancelled_orders_track_book_depth() {
+    // Same ACTION count, different resting depth: the cancelled-order counter
+    // is what separates the two, and it is the only column that can tell a
+    // deepening book from a heavier action mix.
+    let mut counts = Vec::new();
+    for levels in [4i64, 12] {
+        let (_dir, mut ctx) = seeded_ctx(levels);
+        let batch: Vec<SignedAction> =
+            vec![(addr(1), NativeAction::CancelAllOrders { market_id: None })];
+        NativeExecutor::execute_batch_settle_mode(&mut ctx, &batch, false);
+        let a = ctx.phase_accum;
+        assert_eq!(a.phase1_action_count, 1, "one Phase-1 action either way");
+        counts.push(a.phase1_orders_cancelled);
+    }
+    assert_eq!(counts[0], 8, "2 markets x 4 levels resting for addr(1)");
+    assert_eq!(counts[1], 24, "2 markets x 12 levels resting for addr(1)");
+}
+
+#[test]
+fn phase1_counters_count_single_order_cancels() {
+    let (_dir, mut ctx) = seeded_ctx(4);
+    // Order ids are assigned from 1 in placement order, so 1..=3 rest.
+    let batch: Vec<SignedAction> = vec![
+        (addr(1), NativeAction::CancelOrder { order_id: 1 }),
+        (addr(1), NativeAction::CancelOrder { order_id: 2 }),
+        (addr(1), NativeAction::CancelOrder { order_id: 1 }),
+    ];
+    NativeExecutor::execute_batch_settle_mode(&mut ctx, &batch, false);
+    let a = ctx.phase_accum;
+    assert_eq!(a.phase1_action_count, 3);
+    assert_eq!(
+        a.phase1_orders_cancelled, 2,
+        "the repeat cancel of id 1 removes nothing the second time"
+    );
+}
+
+#[test]
+fn phase1_counters_are_additive_across_calls() {
+    let (_dir, mut ctx) = seeded_ctx(4);
+    let first: Vec<SignedAction> = vec![(addr(1), NativeAction::CancelOrder { order_id: 1 })];
+    let second: Vec<SignedAction> = vec![
+        (addr(1), NativeAction::CancelOrder { order_id: 2 }),
+        (addr(1), NativeAction::CancelAllOrders { market_id: None }),
+    ];
+    NativeExecutor::execute_batch_settle_mode(&mut ctx, &first, false);
+    let after_first = ctx.phase_accum;
+    assert_eq!(after_first.phase1_action_count, 1);
+    assert_eq!(after_first.phase1_orders_cancelled, 1);
+    NativeExecutor::execute_batch_settle_mode(&mut ctx, &second, false);
+    let a = ctx.phase_accum;
+    assert_eq!(a.phase1_action_count, 3, "counts must ACCUMULATE, not reset");
+    assert_eq!(
+        a.phase1_orders_cancelled, 8,
+        "1 + 1 + the 6 still resting when the cancel-all ran"
+    );
+}
+
+/// The counters are node-local instrumentation, exactly like the ns spans:
+/// a batch that cancels must still produce the same native state root as the
+/// same batch executed on the other settle path.
+#[test]
+fn phase1_counters_do_not_perturb_state() {
+    let mut roots = Vec::new();
+    for parallel in [false, true] {
+        let (_dir, mut ctx) = seeded_ctx(6);
+        let batch: Vec<SignedAction> = vec![
+            (addr(1), NativeAction::CancelOrder { order_id: 3 }),
+            (addr(1), NativeAction::CancelAllOrders { market_id: Some(1) }),
+        ];
+        NativeExecutor::execute_batch_settle_mode(&mut ctx, &batch, parallel);
+        assert!(ctx.fatal_error.is_none(), "fatal: {:?}", ctx.fatal_error);
+        assert!(ctx.phase_accum.phase1_orders_cancelled > 0);
+        ctx.save_order_books();
+        roots.push(compute_native_state_root(&ctx.state).expect("state root"));
+    }
+    assert_eq!(
+        roots[0], roots[1],
+        "Phase-1 workload counting must not change consensus state"
+    );
+}

@@ -1724,6 +1724,8 @@ impl ExecutionContext {
                 height,
                 engine_ms = engine_secs * 1e3,
                 phase1_actions_ms = secs(accum.phase1_actions_ns) * 1e3,
+                phase1_action_count = accum.phase1_action_count,
+                phase1_orders_cancelled = accum.phase1_orders_cancelled,
                 margin_ms = secs(accum.margin_ns) * 1e3,
                 match_ms = secs(accum.match_ns) * 1e3,
                 settle_ms = secs(accum.settle_ns) * 1e3,
@@ -1746,6 +1748,14 @@ impl ExecutionContext {
                     .observe(secs(accum.cache_flush_ns));
                 m.exec_post_engine_tail_seconds.observe(tail_secs);
                 m.exec_engine_untimed_seconds.observe(untimed_secs);
+                // bl4 phase1-actions-drift-attribution: the WORKLOAD behind
+                // the Phase-1 span. Same once-per-native-block cadence as the
+                // spans above, so a window delta of the counter divides the
+                // window delta of the span exactly.
+                m.exec_phase1_actions_processed
+                    .inc_by(u64::from(accum.phase1_action_count));
+                m.exec_phase1_orders_cancelled
+                    .inc_by(u64::from(accum.phase1_orders_cancelled));
             }
 
             let save_books_timer = std::time::Instant::now();

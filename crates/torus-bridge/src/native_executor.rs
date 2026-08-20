@@ -1451,6 +1451,19 @@ pub struct ExecPhaseAccum {
     pub settle_pass_b_ns: u128,
     /// Nested in `settle_ns`: `pos_cache.flush_all` + `bal_cache.flush_all`.
     pub cache_flush_ns: u128,
+    /// bl4 phase1-actions-drift-attribution: how many non-PlaceOrder entries
+    /// the Phase-1 loop executed — the DENOMINATOR for `phase1_actions_ns`.
+    /// Counted whether the action succeeded or not: a cancel for an id that no
+    /// longer rests still walks every book, and that walk is the cost being
+    /// attributed.
+    pub phase1_action_count: u32,
+    /// bl4: resting orders actually REMOVED from a book by a Phase-1
+    /// `CancelOrder` / `CancelAllOrders` — the unit of work `phase1_actions_ns`
+    /// is really spent on. One `CancelAllOrders { market_id: None }` walks
+    /// every book and removes every one of the sender's resting orders, so its
+    /// cost tracks book DEPTH while the action count stays 1. Without this
+    /// column a deepening book and a heavier action mix are indistinguishable.
+    pub phase1_orders_cancelled: u32,
 }
 
 impl ExecPhaseAccum {
@@ -3139,6 +3152,10 @@ impl NativeExecutor {
             match entry {
                 FlatAction::Place(_) => place_order_indices.push(i),
                 FlatAction::Other(action) => {
+                    // bl4: the denominator for `phase1_actions_ns`. Counted
+                    // before execution so a failing cancel (which still walks
+                    // every book) is in the denominator too.
+                    ctx.phase_accum.phase1_action_count += 1;
                     let result = Self::execute(ctx, sender, action);
                     total_gas += result.gas_used;
                     results[i] = result;
@@ -4667,6 +4684,8 @@ impl NativeExecutor {
                         let _ = ctx.positions.put_native_balance(&cancelled.trader, &bal);
                     }
                 }
+                // bl4: one order actually left a book.
+                ctx.phase_accum.phase1_orders_cancelled += 1;
                 return NativeActionResult::ok("cancel_order", 500);
             }
         }
@@ -4680,6 +4699,12 @@ impl NativeExecutor {
     ) -> NativeActionResult {
         // FIX 2 (ECON-FIND-05): Compute total margin to release from cancelled orders.
         let mut total_margin_release = FixedPoint::ZERO;
+        // bl4 phase1-actions-drift-attribution: THIS is why one Phase-1 action
+        // can cost O(book depth) — a cancel-all removes every resting order the
+        // sender holds, so its cost grows with the book while the action count
+        // stays 1. Accumulated locally and folded into `phase_accum` once, so
+        // the `order_books` borrow is never held across the update.
+        let mut orders_cancelled = 0u32;
 
         match market_id {
             Some(mid) => {
@@ -4688,6 +4713,7 @@ impl NativeExecutor {
                     if !cancelled.is_empty() {
                         ctx.dirty_books.insert(mid);
                     }
+                    orders_cancelled += cancelled.len() as u32;
                     for order in &cancelled {
                         let notional = order.price * order.remaining_qty;
                         let max_lev = ctx
@@ -4708,6 +4734,7 @@ impl NativeExecutor {
                         if !cancelled.is_empty() {
                             ctx.dirty_books.insert(mid);
                         }
+                        orders_cancelled += cancelled.len() as u32;
                         for order in &cancelled {
                             let notional = order.price * order.remaining_qty;
                             let max_lev = ctx
@@ -4731,6 +4758,7 @@ impl NativeExecutor {
                 let _ = ctx.positions.put_native_balance(sender, &bal);
             }
         }
+        ctx.phase_accum.phase1_orders_cancelled += orders_cancelled;
 
         NativeActionResult::ok("cancel_all", 500)
     }

@@ -307,6 +307,16 @@ pub struct Metrics {
     /// exec thread; the pipeline advances the holder across untouched blocks so
     /// this should stay at 1 (startup) per process under a normal sequence.
     pub exec_resident_rebuilds: Counter,
+    /// bl4 phase1-actions-drift-attribution: non-PlaceOrder actions the Phase-1
+    /// loop executed. The DENOMINATOR for `exec_phase1_actions_seconds` —
+    /// without it a rising span cannot be told from a heavier action mix.
+    pub exec_phase1_actions_processed: Counter,
+    /// bl4: resting orders REMOVED by those Phase-1 cancels. A
+    /// `CancelAllOrders` removes every one of the sender's resting orders, so
+    /// this grows with book DEPTH under a fixed action mix; span / this is the
+    /// per-unit cost that separates "more work arrived" from "each unit of
+    /// work got slower as the book grew".
+    pub exec_phase1_orders_cancelled: Counter,
     /// Committed blocks handed to the exec channel but not yet fully executed.
     /// Pinned near the channel bound (64) = execution is the bottleneck.
     pub exec_queue_depth: Gauge,
@@ -1341,6 +1351,22 @@ impl Metrics {
             exec_resident_rebuilds.clone(),
         );
 
+        let exec_phase1_actions_processed = Counter::default();
+        registry.register(
+            "torus_exec_phase1_actions_processed",
+            "non-PlaceOrder actions executed by the Phase-1 loop — the denominator \
+             for torus_exec_phase1_actions_seconds",
+            exec_phase1_actions_processed.clone(),
+        );
+
+        let exec_phase1_orders_cancelled = Counter::default();
+        registry.register(
+            "torus_exec_phase1_orders_cancelled",
+            "resting orders removed from a book by Phase-1 CancelOrder/CancelAllOrders — \
+             the unit of work the Phase-1 span is spent on (grows with book depth)",
+            exec_phase1_orders_cancelled.clone(),
+        );
+
         let exec_queue_depth = Gauge::default();
         registry.register(
             "torus_exec_queue_depth",
@@ -1765,6 +1791,8 @@ impl Metrics {
             commit_persist_write_seconds,
             exec_resting_orders,
             exec_resident_rebuilds,
+            exec_phase1_actions_processed,
+            exec_phase1_orders_cancelled,
             exec_queue_depth,
             exec_throttle_tier,
             exec_dispatch_deferred,
@@ -2000,6 +2028,25 @@ mod tests {
             "torus_exec_cache_flush_seconds",
             "torus_exec_post_engine_tail_seconds",
             "torus_exec_engine_untimed_seconds",
+        ] {
+            assert!(text.contains(name), "{name} not registered:\n{text}");
+        }
+    }
+
+    /// bl4 phase1-actions-drift-attribution: the two WORKLOAD counters that
+    /// make `torus_exec_phase1_actions_seconds` readable. The span alone
+    /// cannot tell "more cancels arrived" from "each cancel got slower as the
+    /// book deepened"; the action count is the denominator and the cancelled-
+    /// order count is the unit of work a `CancelAllOrders` actually does
+    /// (it removes every one of the sender's resting orders, so its cost
+    /// tracks book depth, not action count).
+    #[test]
+    fn phase1_workload_counters_register() {
+        let m = Metrics::new();
+        let text = m.encode();
+        for name in [
+            "torus_exec_phase1_actions_processed",
+            "torus_exec_phase1_orders_cancelled",
         ] {
             assert!(text.contains(name), "{name} not registered:\n{text}");
         }
