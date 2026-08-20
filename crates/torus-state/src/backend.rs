@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, OnceLock, RwLock};
 
 use alloy_primitives::Address;
@@ -271,6 +271,11 @@ struct PendingState {
     /// native writes back (see [`NativeStateOverlay::checkpoint`]).
     journal_log: Vec<JournalEntry>,
     checkpoints: Vec<usize>,
+    /// bl2 exec pipeline: set by [`NativeStateOverlay::freeze`] after the block's
+    /// pending set was moved out into a [`FrozenPending`]. Every later write
+    /// through this overlay (or any clone sharing the Arc) is an error — the
+    /// block is closed and its writes are owned by the flush worker.
+    frozen: bool,
 }
 
 impl PendingState {
@@ -279,7 +284,52 @@ impl PendingState {
             cfs: std::array::from_fn(|_| CfPending::default()),
             journal_log: Vec::new(),
             checkpoints: Vec::new(),
+            frozen: false,
         }
+    }
+
+    /// Layered point lookup: `Some(Some(v))` = pending write, `Some(None)` =
+    /// tombstone, `None` = not in this layer (fall through).
+    #[inline]
+    fn lookup(&self, id: CfId, key: &[u8]) -> Option<Option<&[u8]>> {
+        let cfp = self.cf(id);
+        if let Some(value) = cfp.writes.get(key) {
+            return Some(Some(value.as_slice()));
+        }
+        if cfp.deletes.contains(key) {
+            return Some(None);
+        }
+        None
+    }
+
+    /// Apply this layer's writes/tombstones (under `prefix`) on top of `merged`.
+    fn overlay_into(
+        &self,
+        id: CfId,
+        prefix: Option<&[u8]>,
+        merged: &mut BTreeMap<Vec<u8>, Vec<u8>>,
+    ) {
+        let cfp = self.cf(id);
+        for key in cfp
+            .deletes
+            .iter()
+            .filter(|k| prefix.is_none_or(|p| k.starts_with(p)))
+        {
+            merged.remove(key);
+        }
+        for (key, value) in cfp
+            .writes
+            .iter()
+            .filter(|(k, _)| prefix.is_none_or(|p| k.starts_with(p)))
+        {
+            merged.insert(key.clone(), value.clone());
+        }
+    }
+
+    fn frozen_err() -> StateError {
+        StateError::InvalidData(
+            "native overlay is frozen (block handed to the flush worker); no further writes".into(),
+        )
     }
 
     #[inline]
@@ -395,18 +445,143 @@ impl PendingState {
     }
 }
 
+/// bl2 exec pipeline (`TORUS_EXEC_PIPELINE`): the CLOSED pending set of one
+/// committed block, moved out of its [`NativeStateOverlay`] by
+/// [`NativeStateOverlay::freeze`] once the block's execution is complete.
+///
+/// Two consumers, on two threads:
+/// * the flush worker flushes it ([`FrozenPending::flush_with_native_trie_stats`])
+///   — exactly the key/value set the live overlay would have flushed, because it
+///   IS the live overlay's maps, moved not copied;
+/// * the exec thread layers it under the NEXT block's overlay
+///   ([`NativeStateOverlay::with_parent`]) so block N+1 reads block N's post-state
+///   (read-your-writes) whether or not the worker has made it durable yet. A
+///   layered read of an already-durable set returns the same bytes the DB does,
+///   so the layering is timing-independent.
+///
+/// Read-only after construction: `Sync` by construction (no interior mutability).
+pub struct FrozenPending {
+    height: u64,
+    state: PendingState,
+}
+
+impl FrozenPending {
+    /// The block height whose post-state this set completes.
+    pub fn height(&self) -> u64 {
+        self.height
+    }
+
+    /// A 1-key frozen set holding only the native applied-height marker
+    /// (`CF_CONSENSUS_META` / `META_NATIVE_APPLIED_HEIGHT` = `height`, big-endian —
+    /// byte-identical to the standalone marker write). Used for empty / non-native
+    /// blocks under the pipeline so the marker advances IN ORDER behind the previous
+    /// block's batch and is visible through the next overlay's parent layer while
+    /// the write is still in flight (resident-book staleness guard, F5/F7).
+    pub fn marker_only(height: u64) -> Self {
+        let mut state = PendingState::new();
+        let id = intern_cf(crate::cf::CF_CONSENSUS_META).expect("CF_CONSENSUS_META is registered");
+        state.cf_mut(id).writes.insert(
+            crate::cf::META_NATIVE_APPLIED_HEIGHT.to_vec(),
+            height.to_be_bytes().to_vec(),
+        );
+        Self { height, state }
+    }
+
+    /// Number of pending writes + tombstones in this set.
+    pub fn entry_count(&self) -> usize {
+        self.state
+            .cfs
+            .iter()
+            .map(|c| c.writes.len() + c.deletes.len())
+            .sum()
+    }
+
+    /// Mirror of [`NativeStateOverlay::dirty_evm_accounts`] over the frozen set.
+    pub fn dirty_evm_accounts(&self) -> Vec<Address> {
+        dirty_evm_accounts_of(&self.state)
+    }
+
+    /// Mirror of [`NativeStateOverlay::flush_with_native_trie_stats`] over the
+    /// frozen set — same code path, same batch content.
+    pub fn flush_with_native_trie_stats(
+        &self,
+        target: &StateDb,
+        applied_height: Option<u64>,
+        trie_cache: Option<&mut crate::native_trie::NativeTrieCache>,
+        member_cache: Option<&mut crate::native_trie::NativeMemberCache>,
+    ) -> Result<NativeFlushStats, StateError> {
+        flush_pending_with_native_trie_stats(
+            &self.state,
+            target,
+            applied_height,
+            trie_cache,
+            member_cache,
+        )
+    }
+}
+
+fn dirty_evm_accounts_of(state: &PendingState) -> Vec<Address> {
+    let accounts_cf = intern_cf(CF_ACCOUNTS).expect("CF_ACCOUNTS is registered");
+    let cfp = state.cf(accounts_cf);
+    let mut addrs = Vec::new();
+    for key in cfp.writes.keys() {
+        if key.len() == 20 {
+            addrs.push(Address::from_slice(key));
+        }
+    }
+    for key in &cfp.deletes {
+        if key.len() == 20 {
+            addrs.push(Address::from_slice(key));
+        }
+    }
+    addrs
+}
+
 #[derive(Clone)]
 pub struct NativeStateOverlay {
     db: StateDb,
     pending: Arc<RwLock<PendingState>>,
+    /// bl2 exec pipeline: the previous block's frozen pending set, consulted
+    /// between this overlay's own pending set and the DB on every read. `None`
+    /// on the serial path (exact-today: own pending -> DB).
+    parent: Option<Arc<FrozenPending>>,
 }
 
 impl NativeStateOverlay {
     pub fn new(db: StateDb) -> Self {
+        Self::with_parent(db, None)
+    }
+
+    /// Overlay whose reads fall through own pending -> `parent` -> DB
+    /// (see [`FrozenPending`]). The parent never flushes through this overlay:
+    /// `flush*` / `dirty_*` cover this overlay's own writes only.
+    pub fn with_parent(db: StateDb, parent: Option<Arc<FrozenPending>>) -> Self {
         Self {
             db,
             pending: Arc::new(RwLock::new(PendingState::new())),
+            parent,
         }
+    }
+
+    /// Height of the layered parent, if any (debug assertions / tests).
+    pub fn parent_height(&self) -> Option<u64> {
+        self.parent.as_ref().map(|p| p.height)
+    }
+
+    /// Close this block: MOVE the pending set out into a [`FrozenPending`] tagged
+    /// with `height`, leaving this overlay (and every clone sharing its Arc)
+    /// empty and write-rejecting. The parent link is NOT carried into the frozen
+    /// set: by the pipeline's rendezvous invariant everything below the parent is
+    /// durable when the next block starts, and the parent itself is what the
+    /// frozen set will be layered over next.
+    pub fn freeze(&self, height: u64) -> Arc<FrozenPending> {
+        let mut guard = self.pending.write().unwrap();
+        let mut state = std::mem::replace(&mut *guard, PendingState::new());
+        guard.frozen = true;
+        state.journal_log.clear();
+        state.checkpoints.clear();
+        state.frozen = false;
+        Arc::new(FrozenPending { height, state })
     }
 
     pub fn flush(&self, target: &StateDb) -> Result<(), StateError> {
@@ -541,21 +716,8 @@ impl NativeStateOverlay {
     /// `torus_state::incremental::resync_evm_accounts` so `CF_HASHED_*`/`CF_TRIE_*` keep tracking
     /// `CF_ACCOUNTS` (otherwise the incremental root drifts from the full scan — devnet-smoke find).
     pub fn dirty_evm_accounts(&self) -> Vec<Address> {
-        let accounts_cf = intern_cf(CF_ACCOUNTS).expect("CF_ACCOUNTS is registered");
         let state = self.pending.read().unwrap();
-        let cfp = state.cf(accounts_cf);
-        let mut addrs = Vec::new();
-        for key in cfp.writes.keys() {
-            if key.len() == 20 {
-                addrs.push(Address::from_slice(key));
-            }
-        }
-        for key in &cfp.deletes {
-            if key.len() == 20 {
-                addrs.push(Address::from_slice(key));
-            }
-        }
-        addrs
+        dirty_evm_accounts_of(&state)
     }
 
     /// The native-root dirty `(cf_tag, key) -> Option<value>` set this overlay would flush — writes
@@ -627,6 +789,27 @@ impl NativeStateOverlay {
         member_cache: Option<&mut crate::native_trie::NativeMemberCache>,
     ) -> Result<NativeFlushStats, StateError> {
         let state = self.pending.read().unwrap();
+        flush_pending_with_native_trie_stats(
+            &state,
+            target,
+            applied_height,
+            trie_cache,
+            member_cache,
+        )
+    }
+}
+
+/// The one flush implementation, over a borrowed pending set: shared by the live
+/// overlay (serial path, read guard held by the caller) and by [`FrozenPending`]
+/// (flush worker). Byte-identical batch content either way.
+fn flush_pending_with_native_trie_stats(
+    state: &PendingState,
+    target: &StateDb,
+    applied_height: Option<u64>,
+    trie_cache: Option<&mut crate::native_trie::NativeTrieCache>,
+    member_cache: Option<&mut crate::native_trie::NativeMemberCache>,
+) -> Result<NativeFlushStats, StateError> {
+    {
         let raw = target.inner();
 
         let build_timer = std::time::Instant::now();
@@ -822,13 +1005,17 @@ impl StateBackend for NativeStateOverlay {
         // never hold overlay entries (put/delete reject it), so it falls through
         // to the database, which reports MissingColumnFamily exactly as before.
         if let Some(id) = intern_cf(cf) {
-            let state = self.pending.read().unwrap();
-            let cfp = state.cf(id);
-            if let Some(value) = cfp.writes.get(key) {
-                return Ok(Some(value.clone()));
+            {
+                let state = self.pending.read().unwrap();
+                if let Some(hit) = state.lookup(id, key) {
+                    return Ok(hit.map(<[u8]>::to_vec));
+                }
             }
-            if cfp.deletes.contains(key) {
-                return Ok(None);
+            // bl2 exec pipeline: previous block's frozen set (read-your-writes).
+            if let Some(parent) = &self.parent {
+                if let Some(hit) = parent.state.lookup(id, key) {
+                    return Ok(hit.map(<[u8]>::to_vec));
+                }
             }
         }
         self.db.get_cf_raw(cf, key)
@@ -840,6 +1027,9 @@ impl StateBackend for NativeStateOverlay {
         // No registered-CF path changes; unknown names never occur in execution.
         let id = intern_cf(cf).ok_or_else(|| StateError::MissingColumnFamily(cf.to_string()))?;
         let mut state = self.pending.write().unwrap();
+        if state.frozen {
+            return Err(PendingState::frozen_err());
+        }
         state.record(id, key);
         let cfp = state.cf_mut(id);
         cfp.deletes.remove(key);
@@ -850,6 +1040,9 @@ impl StateBackend for NativeStateOverlay {
     fn delete_cf_raw(&self, cf: &str, key: &[u8]) -> Result<(), StateError> {
         let id = intern_cf(cf).ok_or_else(|| StateError::MissingColumnFamily(cf.to_string()))?;
         let mut state = self.pending.write().unwrap();
+        if state.frozen {
+            return Err(PendingState::frozen_err());
+        }
         state.record(id, key);
         let cfp = state.cf_mut(id);
         cfp.writes.remove(key);
@@ -867,37 +1060,18 @@ impl StateBackend for NativeStateOverlay {
             // (the DB reports MissingColumnFamily, same as pre-C2).
             return StateBackend::iterate_cf(&self.db, cf, prefix);
         };
-        let state = self.pending.read().unwrap();
-        let cfp = state.cf(id);
-
-        // Collect pending writes matching this prefix (per-CF map: no more
-        // range-scan over a composite (String, Vec<u8>) keyspace).
-        let pending_entries: BTreeMap<Vec<u8>, Vec<u8>> = cfp
-            .writes
-            .iter()
-            .filter(|(k, _)| prefix.is_none_or(|p| k.starts_with(p)))
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-
-        let tombstones: HashSet<Vec<u8>> = cfp
-            .deletes
-            .iter()
-            .filter(|k| prefix.is_none_or(|p| k.starts_with(p)))
-            .cloned()
-            .collect();
-        drop(state);
-
-        // Merge RocksDB entries with pending: RocksDB first, pending overrides
+        // Merge RocksDB entries with pending: RocksDB first, then the parent
+        // layer (bl2 exec pipeline; absent on the serial path), then this
+        // overlay's own pending set — each layer's tombstones remove and its
+        // writes override what sits below.
         let db_entries = StateBackend::iterate_cf(&self.db, cf, prefix)?;
-        let mut merged: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
-        for (key, value) in db_entries {
-            if !tombstones.contains(&key) {
-                merged.insert(key, value);
-            }
+        let mut merged: BTreeMap<Vec<u8>, Vec<u8>> = db_entries.into_iter().collect();
+        if let Some(parent) = &self.parent {
+            parent.state.overlay_into(id, prefix, &mut merged);
         }
-        for (key, value) in pending_entries {
-            merged.insert(key, value);
-        }
+        let state = self.pending.read().unwrap();
+        state.overlay_into(id, prefix, &mut merged);
+        drop(state);
         Ok(merged.into_iter().collect())
     }
 
@@ -914,6 +1088,9 @@ impl StateBackend for NativeStateOverlay {
             })
             .collect::<Result<_, _>>()?;
         let mut state = self.pending.write().unwrap();
+        if state.frozen {
+            return Err(PendingState::frozen_err());
+        }
         for (op, &id) in ops.iter().zip(ids.iter()) {
             match op {
                 AtomicWriteOp::Put { key, value, .. } => {
@@ -1107,11 +1284,12 @@ mod tests {
         assert_eq!(overlay.pending_write_count(), 1);
 
         overlay.commit_tx(&db).unwrap();
+        assert_eq!(StateDb::get_cf_raw(&db, cf, b"k1").unwrap().unwrap(), b"v1");
         assert_eq!(
-            StateDb::get_cf_raw(&db, cf, b"k1").unwrap().unwrap(),
-            b"v1"
+            overlay.pending_write_count(),
+            0,
+            "journal cleared on commit"
         );
-        assert_eq!(overlay.pending_write_count(), 0, "journal cleared on commit");
 
         // Empty commit is a no-op (must not error).
         overlay.commit_tx(&db).unwrap();
@@ -1282,14 +1460,18 @@ mod tests {
         StateBackend::put_cf_raw(&overlay, cf, b"new", b"x").unwrap();
         // Read-your-writes holds INSIDE the frame.
         assert_eq!(
-            StateBackend::get_cf_raw(&overlay, cf, b"k").unwrap().unwrap(),
+            StateBackend::get_cf_raw(&overlay, cf, b"k")
+                .unwrap()
+                .unwrap(),
             b"inner"
         );
 
         overlay.revert_to_checkpoint();
         // Overwrite rolled back to the pre-checkpoint value; the fresh key is gone.
         assert_eq!(
-            StateBackend::get_cf_raw(&overlay, cf, b"k").unwrap().unwrap(),
+            StateBackend::get_cf_raw(&overlay, cf, b"k")
+                .unwrap()
+                .unwrap(),
             b"base"
         );
         assert!(StateBackend::get_cf_raw(&overlay, cf, b"new")
@@ -1309,7 +1491,9 @@ mod tests {
         overlay.commit_checkpoint();
 
         assert_eq!(
-            StateBackend::get_cf_raw(&overlay, cf, b"k").unwrap().unwrap(),
+            StateBackend::get_cf_raw(&overlay, cf, b"k")
+                .unwrap()
+                .unwrap(),
             b"v"
         );
     }
@@ -1329,7 +1513,9 @@ mod tests {
         StateBackend::put_cf_raw(&overlay, cf, b"b", b"2").unwrap();
         overlay.commit_checkpoint(); // B returns Ok -> its write flows up to A
         assert_eq!(
-            StateBackend::get_cf_raw(&overlay, cf, b"b").unwrap().unwrap(),
+            StateBackend::get_cf_raw(&overlay, cf, b"b")
+                .unwrap()
+                .unwrap(),
             b"2"
         );
 
@@ -1370,15 +1556,31 @@ mod tests {
         use crate::cf::{CF_NATIVE_NONCES, CF_NATIVE_POSITIONS, CF_STAKING_VALIDATORS};
 
         let triples: Vec<(&str, Vec<u8>, Vec<u8>)> = vec![
-            (CF_NATIVE_BALANCES, b"\x00\x01acct".to_vec(), b"bal".to_vec()),
+            (
+                CF_NATIVE_BALANCES,
+                b"\x00\x01acct".to_vec(),
+                b"bal".to_vec(),
+            ),
             (CF_NATIVE_BALANCES, vec![0xff; 28], b"maxkey".to_vec()),
             (CF_NATIVE_BALANCES, Vec::new(), b"emptykey".to_vec()),
-            (CF_NATIVE_POSITIONS, b"trader1:mkt1".to_vec(), vec![0x00, 0xff, 0x7f]),
+            (
+                CF_NATIVE_POSITIONS,
+                b"trader1:mkt1".to_vec(),
+                vec![0x00, 0xff, 0x7f],
+            ),
             (CF_STAKING_VALIDATORS, b"val1".to_vec(), b"stake".to_vec()),
-            (CF_NATIVE_NONCES, b"sender\x00\x00\x00\x01".to_vec(), b"h".to_vec()),
+            (
+                CF_NATIVE_NONCES,
+                b"sender\x00\x00\x00\x01".to_vec(),
+                b"h".to_vec(),
+            ),
         ];
         // Overwrite + delete exercised on both paths identically.
-        let overwrite = (CF_NATIVE_BALANCES, b"\x00\x01acct".to_vec(), b"bal2".to_vec());
+        let overwrite = (
+            CF_NATIVE_BALANCES,
+            b"\x00\x01acct".to_vec(),
+            b"bal2".to_vec(),
+        );
         let delete = (CF_NATIVE_POSITIONS, b"trader1:mkt1".to_vec());
 
         // DB 1: direct StateDb writes.
@@ -1449,7 +1651,13 @@ mod tests {
         let root_before = crate::native_trie::native_root_full(&db).unwrap();
 
         let overlay = NativeStateOverlay::new(db.clone());
-        StateBackend::put_cf_raw(&overlay, CF_BOOK_ORDER_ROWS, b"\x00\x00\x00\x00\x00\x00\x00\x01\x01k", b"orderrow").unwrap();
+        StateBackend::put_cf_raw(
+            &overlay,
+            CF_BOOK_ORDER_ROWS,
+            b"\x00\x00\x00\x00\x00\x00\x00\x01\x01k",
+            b"orderrow",
+        )
+        .unwrap();
         {
             let state = overlay.pending.read().unwrap();
             assert!(
@@ -1467,9 +1675,13 @@ mod tests {
             "node-local order-row store must not perturb the native root"
         );
         assert!(
-            StateDb::get_cf_raw(&db, CF_BOOK_ORDER_ROWS, b"\x00\x00\x00\x00\x00\x00\x00\x01\x01k")
-                .unwrap()
-                .is_some(),
+            StateDb::get_cf_raw(
+                &db,
+                CF_BOOK_ORDER_ROWS,
+                b"\x00\x00\x00\x00\x00\x00\x00\x01\x01k"
+            )
+            .unwrap()
+            .is_some(),
             "the write must still be durable"
         );
     }
@@ -1539,6 +1751,201 @@ mod tests {
             stats.batch_bytes >= 64 * 512,
             "batch_bytes {} must cover the 32 KiB of values written",
             stats.batch_bytes
+        );
+    }
+
+    // ---- bl2 exec pipeline: layered overlay (FrozenPending parent) ----
+
+    /// `get_cf_raw` resolution order is own pending -> parent layer -> DB, with a
+    /// tombstone at any layer shadowing everything below it.
+    #[test]
+    fn layered_overlay_point_read_semantics() {
+        let (db, _dir) = temp_db();
+        let cf = CF_NATIVE_BALANCES;
+        StateBackend::put_cf_raw(&db, cf, b"db_only", b"d").unwrap();
+        StateBackend::put_cf_raw(&db, cf, b"parent_overrides", b"d").unwrap();
+        StateBackend::put_cf_raw(&db, cf, b"parent_deletes", b"d").unwrap();
+        StateBackend::put_cf_raw(&db, cf, b"child_overrides_all", b"d").unwrap();
+        StateBackend::put_cf_raw(&db, cf, b"child_deletes_parent_put", b"d").unwrap();
+
+        let parent_ov = NativeStateOverlay::new(db.clone());
+        StateBackend::put_cf_raw(&parent_ov, cf, b"parent_overrides", b"p").unwrap();
+        StateBackend::delete_cf_raw(&parent_ov, cf, b"parent_deletes").unwrap();
+        StateBackend::put_cf_raw(&parent_ov, cf, b"child_overrides_all", b"p").unwrap();
+        StateBackend::put_cf_raw(&parent_ov, cf, b"child_deletes_parent_put", b"p").unwrap();
+        StateBackend::put_cf_raw(&parent_ov, cf, b"parent_only", b"p").unwrap();
+        let parent = parent_ov.freeze(7);
+        assert_eq!(parent.height(), 7);
+
+        let child = NativeStateOverlay::with_parent(db.clone(), Some(parent.clone()));
+        StateBackend::put_cf_raw(&child, cf, b"child_overrides_all", b"c").unwrap();
+        StateBackend::delete_cf_raw(&child, cf, b"child_deletes_parent_put").unwrap();
+        StateBackend::put_cf_raw(&child, cf, b"child_only", b"c").unwrap();
+
+        let get = |k: &[u8]| StateBackend::get_cf_raw(&child, cf, k).unwrap();
+        assert_eq!(get(b"db_only").as_deref(), Some(&b"d"[..]));
+        assert_eq!(get(b"parent_overrides").as_deref(), Some(&b"p"[..]));
+        assert_eq!(
+            get(b"parent_deletes"),
+            None,
+            "parent tombstone shadows the DB"
+        );
+        assert_eq!(get(b"parent_only").as_deref(), Some(&b"p"[..]));
+        assert_eq!(get(b"child_overrides_all").as_deref(), Some(&b"c"[..]));
+        assert_eq!(
+            get(b"child_deletes_parent_put"),
+            None,
+            "child tombstone shadows the parent put"
+        );
+        assert_eq!(get(b"child_only").as_deref(), Some(&b"c"[..]));
+        assert_eq!(get(b"absent"), None);
+
+        // Nothing of the parent leaks into the child's own pending set (it flushes
+        // its own block's writes only).
+        assert_eq!(child.pending_write_count(), 3);
+
+        // iterate_cf merges DB < parent < child with the same shadowing rules.
+        let all = StateBackend::iterate_cf(&child, cf, None).unwrap();
+        let expect: Vec<(Vec<u8>, Vec<u8>)> = vec![
+            (b"child_only".to_vec(), b"c".to_vec()),
+            (b"child_overrides_all".to_vec(), b"c".to_vec()),
+            (b"db_only".to_vec(), b"d".to_vec()),
+            (b"parent_only".to_vec(), b"p".to_vec()),
+            (b"parent_overrides".to_vec(), b"p".to_vec()),
+        ];
+        assert_eq!(all, expect);
+        let pfx = StateBackend::iterate_cf(&child, cf, Some(b"parent_")).unwrap();
+        assert_eq!(pfx.len(), 2);
+        assert_eq!(pfx[0].0, b"parent_only");
+    }
+
+    /// A layered read of a parent that is ALREADY durable returns the same bytes the
+    /// DB does — the parent is always layered, durable or not (F1/F6), so this is
+    /// what makes the layering race-free.
+    #[test]
+    fn layered_overlay_durable_parent_is_transparent() {
+        let (db, _dir) = temp_db();
+        let cf = CF_NATIVE_BALANCES;
+        StateBackend::put_cf_raw(&db, cf, b"k_del", b"old").unwrap();
+        let parent_ov = NativeStateOverlay::new(db.clone());
+        StateBackend::put_cf_raw(&parent_ov, cf, b"k_put", b"v").unwrap();
+        StateBackend::delete_cf_raw(&parent_ov, cf, b"k_del").unwrap();
+        let parent = parent_ov.freeze(3);
+        parent
+            .flush_with_native_trie_stats(&db, Some(3), None, None)
+            .unwrap();
+
+        let layered = NativeStateOverlay::with_parent(db.clone(), Some(parent));
+        let plain = NativeStateOverlay::new(db.clone());
+        for k in [&b"k_put"[..], b"k_del", b"nope"] {
+            assert_eq!(
+                StateBackend::get_cf_raw(&layered, cf, k).unwrap(),
+                StateBackend::get_cf_raw(&plain, cf, k).unwrap(),
+                "key {:?}",
+                String::from_utf8_lossy(k)
+            );
+        }
+        assert_eq!(
+            StateBackend::iterate_cf(&layered, cf, None).unwrap(),
+            StateBackend::iterate_cf(&plain, cf, None).unwrap()
+        );
+    }
+
+    /// Freezing moves the pending set out; the overlay (and every clone sharing its
+    /// pending Arc) rejects further writes and reads as empty-over-DB.
+    #[test]
+    fn freeze_rejects_later_writes_and_empties_the_overlay() {
+        let (db, _dir) = temp_db();
+        let cf = CF_NATIVE_BALANCES;
+        let ov = NativeStateOverlay::new(db.clone());
+        let clone = ov.clone();
+        StateBackend::put_cf_raw(&ov, cf, b"a", b"1").unwrap();
+        let frozen = ov.freeze(1);
+        assert_eq!(frozen.entry_count(), 1);
+        assert_eq!(ov.pending_write_count(), 0);
+        assert!(StateBackend::put_cf_raw(&clone, cf, b"b", b"2").is_err());
+        assert!(StateBackend::delete_cf_raw(&ov, cf, b"a").is_err());
+        assert_eq!(StateBackend::get_cf_raw(&ov, cf, b"a").unwrap(), None);
+    }
+
+    /// Flushing a frozen pending set writes the SAME key/value set (state + trie +
+    /// marker) as flushing the live overlay would have.
+    #[test]
+    fn frozen_flush_identical_to_overlay_flush() {
+        use crate::cf::{CF_CONSENSUS_META, CF_NATIVE_POSITIONS, META_NATIVE_APPLIED_HEIGHT};
+        let dump = |db: &StateDb| -> Vec<Vec<(Vec<u8>, Vec<u8>)>> {
+            crate::cf::ALL_CF_NAMES
+                .iter()
+                .map(|cf| StateBackend::iterate_cf(db, cf, None).unwrap())
+                .collect()
+        };
+        let populate = |ov: &NativeStateOverlay| {
+            for i in 0..64u32 {
+                let k = format!("bal{i:03}");
+                StateBackend::put_cf_raw(ov, CF_NATIVE_BALANCES, k.as_bytes(), &i.to_be_bytes())
+                    .unwrap();
+            }
+            StateBackend::put_cf_raw(ov, CF_NATIVE_POSITIONS, b"pos", b"x").unwrap();
+            StateBackend::delete_cf_raw(ov, CF_NATIVE_BALANCES, b"bal001").unwrap();
+        };
+
+        let (db_a, _da) = temp_db();
+        let ov_a = NativeStateOverlay::new(db_a.clone());
+        populate(&ov_a);
+        ov_a.flush_with_native_trie_stats(&db_a, Some(9), None, None)
+            .unwrap();
+
+        let (db_b, _db) = temp_db();
+        let ov_b = NativeStateOverlay::new(db_b.clone());
+        populate(&ov_b);
+        let frozen = ov_b.freeze(9);
+        frozen
+            .flush_with_native_trie_stats(&db_b, Some(9), None, None)
+            .unwrap();
+
+        assert_eq!(dump(&db_a), dump(&db_b));
+        assert_eq!(
+            StateBackend::get_cf_raw(&db_b, CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT).unwrap(),
+            Some(9u64.to_be_bytes().to_vec())
+        );
+        assert_eq!(
+            crate::native_trie::persisted_native_root(&db_a).unwrap(),
+            crate::native_trie::persisted_native_root(&db_b).unwrap()
+        );
+    }
+
+    /// The 1-key marker layer (empty-block Marker job) is visible through a child
+    /// overlay's point read and flushes to exactly the applied-height marker put.
+    #[test]
+    fn marker_only_layer_reads_and_flushes_marker() {
+        use crate::cf::{CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT};
+        let (db, _dir) = temp_db();
+        let marker = FrozenPending::marker_only(42);
+        assert_eq!(marker.height(), 42);
+        assert_eq!(marker.entry_count(), 1);
+        assert!(marker.dirty_evm_accounts().is_empty());
+        let child = NativeStateOverlay::with_parent(db.clone(), Some(Arc::new(marker)));
+        assert_eq!(
+            StateBackend::get_cf_raw(&child, CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT)
+                .unwrap(),
+            Some(42u64.to_be_bytes().to_vec())
+        );
+        // DB untouched until the marker layer itself flushes.
+        assert_eq!(
+            StateDb::get_cf_raw(&db, CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT).unwrap(),
+            None
+        );
+        let frozen = FrozenPending::marker_only(42);
+        let stats = frozen
+            .flush_with_native_trie_stats(&db, Some(42), None, None)
+            .unwrap();
+        assert_eq!(
+            stats.dirty_buckets, 0,
+            "marker is a non-root CF: no trie work"
+        );
+        assert_eq!(
+            StateDb::get_cf_raw(&db, CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT).unwrap(),
+            Some(42u64.to_be_bytes().to_vec())
         );
     }
 }

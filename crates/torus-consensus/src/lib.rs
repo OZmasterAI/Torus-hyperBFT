@@ -8,6 +8,7 @@
 //! Plus genesis configuration for initial validator sets.
 
 pub mod app;
+pub mod exec_pipeline;
 pub mod genesis;
 pub mod kv_store;
 pub mod network;
