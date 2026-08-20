@@ -148,6 +148,24 @@ impl NativeDaStore {
         }
     }
 
+    /// Batched [`get`](Self::get): one RocksDB `MultiGet` for all `hashes`,
+    /// results in input order, `None` per absent hash. A present-but-undecodable
+    /// body is `Err(InvalidData)` exactly as in `get`. The hot compact-block
+    /// reconstruct path uses this instead of a per-hash `get` loop.
+    pub fn get_batch(&self, hashes: &[B256]) -> Result<Vec<Option<SignedNativeAction>>, StateError> {
+        let keys: Vec<&[u8]> = hashes.iter().map(|h| h.as_slice()).collect();
+        self.db
+            .multi_get_cf_raw(CF_NATIVE_PENDING, &keys)?
+            .into_iter()
+            .map(|slot| match slot {
+                Some(bytes) => bincode::deserialize(&bytes)
+                    .map(Some)
+                    .map_err(|e| StateError::InvalidData(e.to_string())),
+                None => Ok(None),
+            })
+            .collect()
+    }
+
     /// Fetch the raw stored bytes (`bincode(SignedNativeAction)`) by action-hash,
     /// without deserializing. The `/torus/native-da/1.0` serve path ships these
     /// bytes verbatim to a requesting peer. Takes the 32-byte hash directly so the
@@ -251,6 +269,44 @@ mod tests {
             .expect("raw put");
         assert!(store.contains(&present).expect("contains present"));
         assert!(!store.contains(&absent).expect("contains absent"));
+    }
+
+    /// `get_batch` must return one slot per input hash, in input order, with
+    /// `None` for absent keys — the single-read replacement for the per-hash
+    /// `get` loop on the hot reconstruct path.
+    #[test]
+    fn get_batch_preserves_order_and_reports_missing() {
+        let (_dir, store) = temp_store();
+        let a1 = dummy_action(1);
+        let a2 = dummy_action(2);
+        let a3 = dummy_action(3);
+        let h1 = compute_action_hash(&a1);
+        let h3 = compute_action_hash(&a3);
+        let missing = B256::repeat_byte(0xAB);
+        store.put_batch(&[a1.clone(), a2, a3.clone()]).expect("put_batch");
+
+        let got = store.get_batch(&[h1, missing, h3]).expect("get_batch");
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0].as_ref().map(compute_action_hash), Some(h1));
+        assert!(got[1].is_none(), "absent hash must read as None");
+        assert_eq!(got[2].as_ref().map(compute_action_hash), Some(h3));
+
+        assert!(store.get_batch(&[]).expect("empty get_batch").is_empty());
+    }
+
+    /// A present-but-undecodable body is an `Err`, exactly like `get`.
+    #[test]
+    fn get_batch_rejects_invalid_data() {
+        let (_dir, store) = temp_store();
+        let bad = [5u8; 32];
+        store
+            .db
+            .put_cf_raw(CF_NATIVE_PENDING, &bad, b"not-bincode")
+            .expect("raw put");
+        assert!(matches!(
+            store.get_batch(&[B256::from(bad)]),
+            Err(StateError::InvalidData(_))
+        ));
     }
 
     fn dummy_action(nonce: u64) -> SignedNativeAction {

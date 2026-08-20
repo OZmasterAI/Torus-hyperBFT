@@ -3251,8 +3251,11 @@ impl TorusApp {
         if !compact.native_action_hashes.is_empty() {
             match self.mempool {
                 Some(ref mempool) => {
-                    for hash in &compact.native_action_hashes {
-                        match mempool.get_native_da(hash) {
+                    // One batched DA read for the whole body set (see
+                    // `reconstruct_native_actions_hot`).
+                    let found = mempool.get_native_da_batch(&compact.native_action_hashes);
+                    for (hash, slot) in compact.native_action_hashes.iter().zip(found) {
+                        match slot {
                             Some(action) => native_actions.push(action),
                             None => missing.push(*hash),
                         }
@@ -3356,17 +3359,19 @@ impl TorusApp {
             return Err(hashes.len()); // no DA store wired (consensus-only observer)
         };
 
-        let mut actions: Vec<Option<torus_types::SignedNativeAction>> = vec![None; hashes.len()];
-        let mut missing: Vec<usize> = Vec::new();
-        for (i, hash) in hashes.iter().enumerate() {
-            // Read the DURABLE DA store, not the ephemeral nonce-gated mempool: a
-            // block-referenced body survives the 60s nonce window, pool eviction, and a
-            // restart (livelock root cause, mem 28e1a821).
-            match mempool.get_native_da(hash) {
-                Some(action) => actions[i] = Some(action),
-                None => missing.push(i),
-            }
-        }
+        // Read the DURABLE DA store, not the ephemeral nonce-gated mempool: a
+        // block-referenced body survives the 60s nonce window, pool eviction, and a
+        // restart (livelock root cause, mem 28e1a821). ONE batched read (single
+        // mirror flush + single RocksDB MultiGet) — the per-hash loop cost
+        // 23-31 ms per ~25-action block on the consensus thread, all hits.
+        let mut actions: Vec<Option<torus_types::SignedNativeAction>> =
+            mempool.get_native_da_batch(hashes);
+        debug_assert_eq!(actions.len(), hashes.len());
+        let mut missing: Vec<usize> = actions
+            .iter()
+            .enumerate()
+            .filter_map(|(i, a)| a.is_none().then_some(i))
+            .collect();
 
         // (1) Bounded LOCAL retry: actions are normally delivered by the proposer's
         // pre-proposal unicast push (PreProposalBundle -> BroadcastNativeActions) before
@@ -3399,7 +3404,10 @@ impl TorusApp {
                 if let Some(ref fetcher) = self.da_fetcher {
                     Self::absorb_fetched_bodies(mempool, fetcher.as_ref());
                 }
-                missing.retain(|&i| match mempool.get_native_da(&hashes[i]) {
+                // One batched read over only the still-missing hashes.
+                let still: Vec<torus_types::B256> = missing.iter().map(|&i| hashes[i]).collect();
+                let mut found = mempool.get_native_da_batch(&still).into_iter();
+                missing.retain(|&i| match found.next().flatten() {
                     Some(action) => {
                         actions[i] = Some(action);
                         false

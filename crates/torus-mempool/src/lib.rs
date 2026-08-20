@@ -650,6 +650,24 @@ impl Mempool {
         }
     }
 
+    /// Batched [`get_native_da`](Self::get_native_da): flushes buffered ingress
+    /// mirrors ONCE, then reads every hash in a single RocksDB `MultiGet`. One
+    /// slot per input hash, in order, `None` where absent. A store error logs
+    /// and reads every slot as absent (same fail-closed posture as the
+    /// per-hash read). Hot compact-block reconstruct uses this so ~25 bodies
+    /// cost one mutex take + one DB read instead of 25 each.
+    pub fn get_native_da_batch(&self, hashes: &[B256]) -> Vec<Option<SignedNativeAction>> {
+        // A buffered ingress mirror (T2.2) must be observable here too.
+        self.flush_da_mirrors();
+        match self.da_store.get_batch(hashes) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!("native DA store read failed: {e}");
+                vec![None; hashes.len()]
+            }
+        }
+    }
+
     /// Presence check for a SET of native-action bodies in the durable DA
     /// store (Package D rank 2 demotion gate): flushes buffered ingress
     /// mirrors once, then point-checks each hash WITHOUT copying bodies.
@@ -1240,6 +1258,47 @@ mod tests {
         pool.add_native_action_presigned(sender, a2).unwrap();
         assert!(pool.get_native_da(&h2).is_some(), "flush-on-read");
         assert!(raw_store.get(&h2).unwrap().is_some());
+    }
+
+    /// `get_native_da_batch` mirrors `get_native_da`: flushes the buffered
+    /// ingress mirror first (flush-before-read), then returns one slot per hash
+    /// in input order with `None` for an absent body.
+    #[test]
+    fn get_native_da_batch_flushes_and_preserves_order() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state, MempoolConfig::default());
+        let key = k256::ecdsa::SigningKey::from_slice(
+            &alloy_primitives::hex::decode(
+                "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let now = now_ms();
+        let a1 = torus_types::eip712::sign_native_action(
+            torus_types::NativeAction::ClaimRewards,
+            now,
+            &key,
+        );
+        let a2 = torus_types::eip712::sign_native_action(
+            torus_types::NativeAction::ClaimRewards,
+            now + 1,
+            &key,
+        );
+        let sender = a1.recover_sender().unwrap();
+        let h1 = torus_types::compute_action_hash(&a1);
+        let h2 = torus_types::compute_action_hash(&a2);
+        let absent = B256::repeat_byte(0xCD);
+        pool.add_native_action_presigned(sender, a1).unwrap();
+        pool.add_native_action_presigned(sender, a2).unwrap();
+
+        // Still buffered: the batch read must flush before reading.
+        let got = pool.get_native_da_batch(&[h2, absent, h1]);
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0].as_ref().map(torus_types::compute_action_hash), Some(h2));
+        assert!(got[1].is_none(), "absent body reads as None in place");
+        assert_eq!(got[2].as_ref().map(torus_types::compute_action_hash), Some(h1));
+        assert!(pool.get_native_da_batch(&[]).is_empty());
     }
 
     #[test]

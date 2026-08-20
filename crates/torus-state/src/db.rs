@@ -598,6 +598,27 @@ impl StateDb {
         Ok(self.db.get_cf(cf, key)?)
     }
 
+    /// Batched point-get from one column family: ONE RocksDB `MultiGet` for all
+    /// `keys` instead of N independent `get_cf_raw` calls. Result order matches
+    /// `keys`; any per-key RocksDB error fails the whole read (same mapping as
+    /// `get_cf_raw`). Hot reconstruct path reads ~25 native-DA bodies per block
+    /// on the consensus thread, so this trades 25 point-gets for one.
+    pub fn multi_get_cf_raw(
+        &self,
+        cf_name: &str,
+        keys: &[&[u8]],
+    ) -> Result<Vec<Option<Vec<u8>>>, StateError> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let cf = self.cf(cf_name)?;
+        self.db
+            .multi_get_cf(keys.iter().map(|k| (cf, *k)))
+            .into_iter()
+            .map(|r| r.map_err(StateError::from))
+            .collect()
+    }
+
     /// Presence check for a key in any column family without copying the value
     /// (pinned read). For hot paths that only need to know a (multi-KB) value is
     /// already local — e.g. the native-DA pre-warm filter.
