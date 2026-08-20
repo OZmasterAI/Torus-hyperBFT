@@ -44,9 +44,25 @@
 #                  poisoned the state digest.
 #   DIGEST_PAR   per-node parallel RPCs during the state digest (default 8)
 #   RPC_TIMEOUT  per-RPC curl timeout in the agreement step (default 60 s)
+#   CRASH_KILL_AT_S=N  CRASH GATE (bl3). N seconds after the bench starts, SIGKILL
+#                one devnet validator and restart it from the same data dir
+#                (tools/matched-bench/crash-kill.sh). Unset = off. Must sit
+#                INSIDE the load window (>= 10 s in, >= 30 s of load left):
+#                killing during the drain hangs the agreement probe. 40-60 on a
+#                120 s cell. The cell then also reports a crash verdict —
+#                summary.json `.crash` / `.headline.crash_gate` — which is what
+#                gates flipping TORUS_EXEC_PIPELINE on by default: the restarted
+#                node must replay from its durable applied-height marker, rewind
+#                no more than 2 blocks beyond the exec queue it already had, come
+#                back with the flush worker attached, and still AGREE with the
+#                two survivors.
+#   KILL_NODE    which validator the crash gate kills: val1 (default) or val2.
+#                NEVER val0 (it serves the bench RPC and every headline number),
+#                and never anything outside this devnet — see the guard in
+#                crash-kill.sh.
 set -uo pipefail
 
-usage() { sed -n '2,46p' "$0"; exit 2; }
+usage() { sed -n '2,62p' "$0"; exit 2; }
 [ $# -ge 2 ] || usage
 
 WT=$(cd "$1" && pwd) || { echo "FATAL: worktree '$1' not found" >&2; exit 2; }
@@ -73,6 +89,8 @@ HEALTH_TIMEOUT=${HEALTH_TIMEOUT:-240}
 DRAIN_TIMEOUT=${DRAIN_TIMEOUT:-$(( 180 + 2 * MARKETS ))}
 DIGEST_PAR=${DIGEST_PAR:-8}
 RPC_TIMEOUT=${RPC_TIMEOUT:-60}
+CRASH_KILL_AT_S=${CRASH_KILL_AT_S:-}
+KILL_NODE=${KILL_NODE:-val1}
 OUT="$RESULTS_ROOT/$LABEL"
 
 SRC_NODE="$TARGET_DIR/release/torus-node"
@@ -164,6 +182,22 @@ for t in jq curl python3 md5sum awk; do command -v $t >/dev/null || { echo "FATA
 [ -z "$MPS" ] || [[ "$MPS" =~ ^[0-9]+$ ]] || { echo "FATAL: MPS must be an integer" >&2; exit 2; }
 [ -x "$TOOLS_DIR/digest-node.sh" ] || { echo "FATAL: $TOOLS_DIR/digest-node.sh missing" >&2; exit 1; }
 
+# ---- crash gate (bl3) pre-flight: validated HERE, before anything is launched,
+# so a bad kill window can never be discovered mid-cell.
+KILL_IDX=""
+if [ -n "$CRASH_KILL_AT_S" ]; then
+    [ -x "$TOOLS_DIR/crash-kill.sh" ] || { echo "FATAL: $TOOLS_DIR/crash-kill.sh missing" >&2; exit 1; }
+    # shellcheck source=/dev/null
+    CRASH_KILL_LIB=1 source "$TOOLS_DIR/crash-kill.sh"
+    case "$KILL_NODE" in
+        val1) KILL_IDX=1 ;;
+        val2) KILL_IDX=2 ;;
+        *) echo "FATAL: KILL_NODE must be val1 or val2 (never val0 — it serves the bench RPC and every headline number)" >&2; exit 2 ;;
+    esac
+    crash_kill_at_ok "$CRASH_KILL_AT_S" "$DUR" || {
+        echo "FATAL: CRASH_KILL_AT_S=$CRASH_KILL_AT_S is not inside the load window of a ${DUR}s cell (need >= 10 and <= $((DUR-30)); killing during the drain hangs the agreement probe)" >&2; exit 2; }
+fi
+
 if pgrep -f "bench-throughput consensus" >/dev/null; then echo "FATAL: a bench is already running" >&2; exit 1; fi
 if pgrep -f "cargo build" >/dev/null; then echo "FATAL: a cargo build is running — never bench while building" >&2; exit 1; fi
 if [ -f "$RUN_DIR/pids" ] && xargs -a "$RUN_DIR/pids" -r -I{} kill -0 {} 2>/dev/null; then
@@ -177,11 +211,12 @@ fi
 mkdir -p "$OUT"
 : > "$OUT/run.log"
 
-SAMPLER_PID=""; CPU_PID=""; BENCH_PID=""
+SAMPLER_PID=""; CPU_PID=""; BENCH_PID=""; CRASH_PID=""
 finish_fail() {
     [ -n "$SAMPLER_PID" ] && kill "$SAMPLER_PID" 2>/dev/null
     [ -n "$CPU_PID" ] && kill "$CPU_PID" 2>/dev/null
     [ -n "$BENCH_PID" ] && kill "$BENCH_PID" 2>/dev/null
+    [ -n "$CRASH_PID" ] && kill "$CRASH_PID" 2>/dev/null
     "$WSL/stop-3val.sh" >>"$OUT/run.log" 2>&1 || true
     python3 - "$OUT" <<'PY' 2>/dev/null || true
 import json,sys,os,time
@@ -353,7 +388,21 @@ log "bench: ${BENCH_CMD[*]}"
 T_BENCH0=$(date +%s)
 "${BENCH_CMD[@]}" > "$OUT/bench.log" 2>&1 & BENCH_PID=$!
 cpusampler & CPU_PID=$!
+# bl3 crash gate: SIGKILL + restart one validator CRASH_KILL_AT_S into the load
+# window. Off unless CRASH_KILL_AT_S is set; the target guard lives in
+# crash-kill.sh and refuses anything but this devnet's val1/val2.
+CRASH_RC=""
+if [ -n "$CRASH_KILL_AT_S" ]; then
+    log "crash gate ARMED: SIGKILL $KILL_NODE at bench+${CRASH_KILL_AT_S}s, restart from the same data dir"
+    ( sleep "$CRASH_KILL_AT_S"; "$TOOLS_DIR/crash-kill.sh" "$WT" "$KILL_IDX" "$OUT" ) >>"$OUT/run.log" 2>&1 &
+    CRASH_PID=$!
+fi
 wait "$BENCH_PID"; BENCH_RC=$?
+if [ -n "$CRASH_PID" ]; then
+    wait "$CRASH_PID"; CRASH_RC=$?; CRASH_PID=""
+    log "crash gate exited rc=$CRASH_RC"
+    [ "$CRASH_RC" = 0 ] || die "crash gate failed (rc=$CRASH_RC) — see run.log"
+fi
 T_BENCH1=$(date +%s)
 BENCH_PID=""
 log "bench exited rc=$BENCH_RC after $((T_BENCH1 - T_BENCH0))s"
@@ -500,6 +549,19 @@ for i in 0 1 2; do
     grep -E ' ERROR | WARN |panicked|FAIL-STOP|fail-stop|book mode|resident|parallel|member cache|commit-lag|S470|manifest|FULL-BODY push|native block-selection caps|body fetch|OUTBOUND FAILURE|exec-backlog pacing' "$RUN_DIR/val$i.log" | head -400 > "$OUT/val$i.log.excerpt"
     gzip -c "$RUN_DIR/val$i.log" > "$OUT/val$i.log.gz"
 done
+
+# ---- crash gate: scan the killed node's log TAIL — everything it wrote AFTER
+# the SIGKILL (crash-kill.sh restarted it with the log appended and recorded the
+# byte offset) — and merge that into crash.json, which summarize.py turns into
+# the PASS/FAIL verdict.
+if [ -n "$CRASH_KILL_AT_S" ] && [ -s "$OUT/crash-kill.json" ]; then
+    OFFB=$(jq -r '.pre_kill.log_bytes // 0' "$OUT/crash-kill.json")
+    TAILF="$OUT/crash-restart-tail.log"
+    tail -c "+$(( OFFB + 1 ))" "$RUN_DIR/val$KILL_IDX.log" | sed -E 's/\x1b\[[0-9;]*m//g' > "$TAILF"
+    log "crash gate: scanning val$KILL_IDX log tail from byte $OFFB ($(wc -l < "$TAILF") lines)"
+    "$TOOLS_DIR/crash-kill.sh" scan "$TAILF" "$OUT/crash-kill.json" "$OUT/crash.json" "$CRASH_KILL_AT_S" \
+        | tee -a "$OUT/run.log" || log "WARNING: crash gate scan failed"
+fi
 
 # ---------------------------------------------------------------- 10. analysis
 for i in 0 1 2; do
