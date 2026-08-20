@@ -890,7 +890,10 @@ impl Mempool {
     /// (the prune-before-exec trap, mem a644ca0a). Read-then-write on the single
     /// consensus thread; concurrent peers only insert, never remove, so the
     /// captured entries are still present at prune time.
-    pub fn remove_committed_native(&self, hashes: &[B256]) {
+    ///
+    /// Returns the native pool size after the prune (read under the write lock
+    /// already held — no extra locking; feeds `torus_mempool_native_size`).
+    pub fn remove_committed_native(&self, hashes: &[B256]) -> usize {
         let restash = {
             let pool = self.native.read().unwrap();
             pool.verified_restash_keys(hashes)
@@ -898,7 +901,9 @@ impl Mempool {
         for (key, sender) in restash {
             self.cache_verified_sender(key, sender);
         }
-        self.native.write().unwrap().remove_committed(hashes);
+        let mut pool = self.native.write().unwrap();
+        pool.remove_committed(hashes);
+        pool.size()
     }
 
     /// Approximate total memory used by pooled transactions (Phase 3: 3.1.7).

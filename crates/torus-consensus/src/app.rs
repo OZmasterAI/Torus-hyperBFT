@@ -669,6 +669,36 @@ fn persist_block_header(state_db: &StateDb, block: &TorusBlock) -> bool {
     true
 }
 
+/// Consensus-thread span timer: observes `pick(metrics)` with the elapsed wall
+/// time when dropped, so a function with many exit paths (`validate_block`,
+/// `on_committed_block`) is timed on every one of them. No-op without metrics.
+struct ObserveOnDrop {
+    start: std::time::Instant,
+    metrics: Option<Arc<torus_telemetry::Metrics>>,
+    pick: fn(&torus_telemetry::Metrics) -> &torus_telemetry::Histogram,
+}
+
+impl ObserveOnDrop {
+    fn new(
+        metrics: Option<Arc<torus_telemetry::Metrics>>,
+        pick: fn(&torus_telemetry::Metrics) -> &torus_telemetry::Histogram,
+    ) -> Self {
+        Self {
+            start: std::time::Instant::now(),
+            metrics,
+            pick,
+        }
+    }
+}
+
+impl Drop for ObserveOnDrop {
+    fn drop(&mut self) {
+        if let Some(m) = &self.metrics {
+            (self.pick)(m).observe(self.start.elapsed().as_secs_f64());
+        }
+    }
+}
+
 /// FIX 1a (crash-safety, commit->execute kill-window durability). Persist a
 /// committed block's HEADER and BODY to the durable CFs AT COMMIT TIME — i.e. in
 /// `dispatch_to_exec`, BEFORE the block is handed to the execution pipeline.
@@ -3636,6 +3666,8 @@ impl TorusApp {
         actions: &[torus_types::SignedNativeAction],
         height: u64,
     ) {
+        let _custody_span =
+            ObserveOnDrop::new(self.metrics.clone(), |m| &m.validate_block_custody_seconds);
         if !shard_custody_enabled() {
             return;
         }
@@ -3671,7 +3703,18 @@ impl TorusApp {
         &mut self,
         datum_bytes: &[u8],
     ) -> Result<TorusBlock, ValidateBlockResponse> {
-        if let Ok(block) = bincode::deserialize::<TorusBlock>(datum_bytes) {
+        let decode_timer = std::time::Instant::now();
+        let full = bincode::deserialize::<TorusBlock>(datum_bytes).ok();
+        let compact = if full.is_none() {
+            bincode::deserialize::<CompactBlock>(datum_bytes).ok()
+        } else {
+            None
+        };
+        if let Some(ref m) = self.metrics {
+            m.validate_block_decode_seconds
+                .observe(decode_timer.elapsed().as_secs_f64());
+        }
+        if let Some(block) = full {
             tracing::info!(
                 height = block.header.height,
                 evm_tx_count = block.evm_transactions.len(),
@@ -3684,7 +3727,13 @@ impl TorusApp {
             // bar the compact path already guarantees. Fail-closed on error.
             if !block.native_actions.is_empty() {
                 if let Some(ref mempool) = self.mempool {
-                    if let Err(e) = mempool.mirror_native_to_da(&block.native_actions) {
+                    let da_timer = std::time::Instant::now();
+                    let mirrored = mempool.mirror_native_to_da(&block.native_actions);
+                    if let Some(ref m) = self.metrics {
+                        m.validate_block_da_reconstruct_seconds
+                            .observe(da_timer.elapsed().as_secs_f64());
+                    }
+                    if let Err(e) = mirrored {
                         tracing::warn!(
                             %e,
                             height = block.header.height,
@@ -3705,7 +3754,7 @@ impl TorusApp {
                 }
             }
             Ok(block)
-        } else if let Ok(compact) = bincode::deserialize::<CompactBlock>(datum_bytes) {
+        } else if let Some(compact) = compact {
             tracing::info!(
                 height = compact.header.height,
                 native_hashes = compact.native_action_hashes.len(),
@@ -3729,7 +3778,14 @@ impl TorusApp {
                 // a racing pre-proposal PUSH, then a SHORT bounded native-DA PULL so a
                 // genuine push miss is recovered live instead of wedging (#4 Task 1 — the
                 // un-wedge). Budget stays ≪ the 500 ms view timeout.
-                match self.reconstruct_native_actions_hot(&compact.native_action_hashes) {
+                let da_timer = std::time::Instant::now();
+                let reconstructed =
+                    self.reconstruct_native_actions_hot(&compact.native_action_hashes);
+                if let Some(ref m) = self.metrics {
+                    m.validate_block_da_reconstruct_seconds
+                        .observe(da_timer.elapsed().as_secs_f64());
+                }
+                match reconstructed {
                     Ok(actions) => actions,
                     Err(missing_count) => {
                         if let Some(ref m) = self.metrics {
@@ -3948,6 +4004,8 @@ impl App<RocksKVStore> for TorusApp {
         &mut self,
         request: ValidateBlockRequest<RocksKVStore>,
     ) -> ValidateBlockResponse {
+        let _validate_span =
+            ObserveOnDrop::new(self.metrics.clone(), |m| &m.validate_block_seconds);
         tracing::info!("validate_block called (CTE)");
 
         // T1.5 FAIL-STOP: a dead execution pipeline means committed blocks are
@@ -4000,6 +4058,8 @@ impl App<RocksKVStore> for TorusApp {
         }
 
         if !torus_block.native_actions.is_empty() {
+            let _attest_span =
+                ObserveOnDrop::new(self.metrics.clone(), |m| &m.validate_block_attest_seconds);
             if torus_block.header.sig_attestation == [0u8; 64] {
                 // Non-attested proposer: we must verify every action ourselves. Use the
                 // SAME session-aware resolver as the execution path (see ~L300) so BOTH
@@ -4129,6 +4189,8 @@ impl App<RocksKVStore> for TorusApp {
 
     /// Send committed block to the execution pipeline thread.
     fn on_committed_block(&mut self, block: &Block, _committed_hash: CryptoHash) {
+        let _commit_span =
+            ObserveOnDrop::new(self.metrics.clone(), |m| &m.on_committed_block_seconds);
         // T1.5 FAIL-STOP: once the execution pipeline is dead, do NOT advance
         // height/view or accept further finalization — consensus finalizing
         // while state is frozen is exactly the zombie-advance this latch stops.
@@ -4763,7 +4825,13 @@ impl TorusApp {
                         .iter()
                         .map(torus_types::compute_action_hash)
                         .collect();
-                    mempool.remove_committed_native(&hashes);
+                    let prune_timer = std::time::Instant::now();
+                    let pool_size = mempool.remove_committed_native(&hashes);
+                    if let Some(ref m) = self.metrics {
+                        m.mempool_remove_committed_seconds
+                            .observe(prune_timer.elapsed().as_secs_f64());
+                        m.mempool_native_size.set(pool_size as i64);
+                    }
                 }
             }
 
@@ -7396,6 +7464,39 @@ mod crash_recovery_tests {
             mempool.get_native_da(&hash).is_some(),
             "legacy TorusBlock path must mirror the body into the DA store before Valid"
         );
+    }
+
+    /// Consensus-thread attribution: the `validate_block` phase timers fire on the
+    /// decode+durability step (full `TorusBlock` path: decode, DA mirror, custody).
+    /// `validate_block` itself needs a crate-private `ValidateBlockRequest`, so the
+    /// phases reachable from here are the ones asserted.
+    #[test]
+    fn validate_block_phase_timers_observe_on_decode() {
+        let (config, state_db) = make_test_config_and_db();
+        let mempool = Arc::new(Mempool::new(
+            state_db.clone(),
+            torus_mempool::MempoolConfig::default(),
+        ));
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
+        let block = make_block(1, vec![sign_claim_rewards(1)]);
+        let datum = encode_proposal_datum(&block, false);
+        let mut app = TorusApp::new(
+            state_db.clone(),
+            &config,
+            Some(metrics.clone()),
+            Some(mempool),
+            None,
+        );
+        app.decode_proposal_and_ensure_durable(&datum)
+            .unwrap_or_else(|_| panic!("full TorusBlock must decode"));
+        let text = metrics.encode();
+        for name in [
+            "torus_validate_block_decode_seconds_count 1",
+            "torus_validate_block_da_reconstruct_seconds_count 1",
+            "torus_validate_block_custody_seconds_count 1",
+        ] {
+            assert!(text.contains(name), "{name} missing:\n{text}");
+        }
     }
 
     /// Task 3 (S459) happy-path invariant: `mirror_or_drop_native` durably stores

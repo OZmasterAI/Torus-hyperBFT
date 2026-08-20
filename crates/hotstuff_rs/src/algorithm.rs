@@ -124,7 +124,12 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
 
     /// Start an instance of the algorithm thread.
     pub(crate) fn start(self) -> JoinHandle<()> {
-        thread::spawn(move || self.execute())
+        // Named so the consensus thread is findable from /proc/<pid>/task/*/comm
+        // (≤15 chars) by the perf harness.
+        thread::Builder::new()
+            .name("hotstuff-algo".into())
+            .spawn(move || self.execute())
+            .expect("failed to spawn the hotstuff-algo consensus thread")
     }
 
     fn execute(mut self) {

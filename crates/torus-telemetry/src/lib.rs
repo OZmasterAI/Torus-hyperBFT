@@ -7,7 +7,8 @@ use prometheus_client::encoding::text::encode;
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
-use prometheus_client::metrics::histogram::{exponential_buckets, Histogram};
+pub use prometheus_client::metrics::histogram::Histogram;
+use prometheus_client::metrics::histogram::exponential_buckets;
 use prometheus_client::registry::Registry;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -296,6 +297,29 @@ pub struct Metrics {
     /// persist — a long value here is a write-group / write-controller wait
     /// behind another thread's batch, not encode cost.
     pub commit_persist_write_seconds: Histogram,
+    /// Consensus thread: whole `validate_block` (every exit path, early
+    /// returns included). Attribution of the follower's
+    /// `torus_view_insert_persist_seconds`.
+    pub validate_block_seconds: Histogram,
+    /// Consensus thread: proposal datum decode inside `validate_block`
+    /// (`TorusBlock` attempt + `CompactBlock` fallback).
+    pub validate_block_decode_seconds: Histogram,
+    /// Consensus thread: native-body DA work inside `validate_block` — compact
+    /// reconstruct (`reconstruct_native_actions_hot`, incl. any pull wait) or
+    /// the legacy inline-body DA mirror.
+    pub validate_block_da_reconstruct_seconds: Histogram,
+    /// Consensus thread: signature attestation verify (or the non-attested
+    /// `batch_verify_native_actions` path) inside `validate_block`.
+    pub validate_block_attest_seconds: Histogram,
+    /// Consensus thread: `custody_native_shards_best_effort` inside
+    /// `validate_block` (~0 when `TORUS_SHARD_CUSTODY=0`).
+    pub validate_block_custody_seconds: Histogram,
+    /// Consensus thread: whole `on_committed_block` hook (manifest persist,
+    /// durable block persist, mempool prune, exec dispatch).
+    pub on_committed_block_seconds: Histogram,
+    /// Consensus thread: `remove_committed_native` (mempool write-lock + prune)
+    /// inside the commit dispatch.
+    pub mempool_remove_committed_seconds: Histogram,
     /// PROFILER (s470): total resting orders across all books, sampled once per
     /// block right after the load/rebuild. Book-depth axis for the
     /// depth-vs-cost correlation (the funnel `orders_resting` counter is a
@@ -1325,6 +1349,48 @@ impl Metrics {
             "Consensus thread: RocksDB WriteBatch write alone inside the commit-time persist",
             commit_persist_write_seconds.clone(),
         );
+        let validate_block_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
+        registry.register(
+            "torus_validate_block_seconds",
+            "Consensus thread: whole validate_block (every exit path)",
+            validate_block_seconds.clone(),
+        );
+        let validate_block_decode_seconds = Histogram::new(exponential_buckets(0.0005, 2.0, 14));
+        registry.register(
+            "torus_validate_block_decode_seconds",
+            "Consensus thread: proposal datum decode inside validate_block",
+            validate_block_decode_seconds.clone(),
+        );
+        let validate_block_da_reconstruct_seconds = Histogram::new(exponential_buckets(0.0005, 2.0, 14));
+        registry.register(
+            "torus_validate_block_da_reconstruct_seconds",
+            "Consensus thread: native-body DA reconstruct/mirror inside validate_block (incl. any wait)",
+            validate_block_da_reconstruct_seconds.clone(),
+        );
+        let validate_block_attest_seconds = Histogram::new(exponential_buckets(0.0005, 2.0, 14));
+        registry.register(
+            "torus_validate_block_attest_seconds",
+            "Consensus thread: sig attestation / batch signature verify inside validate_block",
+            validate_block_attest_seconds.clone(),
+        );
+        let validate_block_custody_seconds = Histogram::new(exponential_buckets(0.0005, 2.0, 14));
+        registry.register(
+            "torus_validate_block_custody_seconds",
+            "Consensus thread: shard custody encode inside validate_block",
+            validate_block_custody_seconds.clone(),
+        );
+        let on_committed_block_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
+        registry.register(
+            "torus_on_committed_block_seconds",
+            "Consensus thread: whole on_committed_block hook (persist + prune + dispatch)",
+            on_committed_block_seconds.clone(),
+        );
+        let mempool_remove_committed_seconds = Histogram::new(exponential_buckets(0.0005, 2.0, 14));
+        registry.register(
+            "torus_mempool_remove_committed_seconds",
+            "Consensus thread: remove_committed_native inside the commit dispatch",
+            mempool_remove_committed_seconds.clone(),
+        );
 
         let exec_resting_orders = Gauge::default();
         registry.register(
@@ -1763,6 +1829,13 @@ impl Metrics {
             commit_persist_seconds,
             commit_body_encode_seconds,
             commit_persist_write_seconds,
+            validate_block_seconds,
+            validate_block_decode_seconds,
+            validate_block_da_reconstruct_seconds,
+            validate_block_attest_seconds,
+            validate_block_custody_seconds,
+            on_committed_block_seconds,
+            mempool_remove_committed_seconds,
             exec_resting_orders,
             exec_resident_rebuilds,
             exec_queue_depth,
@@ -1950,6 +2023,31 @@ mod tests {
         ] {
             assert!(text.contains(name), "{name} not registered:\n{text}");
         }
+    }
+
+    /// Consensus-thread attribution of `torus_view_insert_persist_seconds`: the
+    /// follower's `validate_block` phases and the `on_committed_block` hook must
+    /// be registered (present in `encode()` with zero observations) so the
+    /// harness can tell "absent series" from "zero value".
+    #[test]
+    fn consensus_thread_validate_and_commit_metrics_register() {
+        let m = Metrics::new();
+        m.validate_block_seconds.observe(0.01);
+        m.mempool_native_size.set(3);
+        let text = m.encode();
+        for name in [
+            "torus_validate_block_seconds",
+            "torus_validate_block_decode_seconds",
+            "torus_validate_block_da_reconstruct_seconds",
+            "torus_validate_block_attest_seconds",
+            "torus_validate_block_custody_seconds",
+            "torus_on_committed_block_seconds",
+            "torus_mempool_remove_committed_seconds",
+        ] {
+            assert!(text.contains(name), "{name} not registered:\n{text}");
+        }
+        assert!(text.contains("torus_validate_block_seconds_count 1"), "{text}");
+        assert!(text.contains("torus_mempool_native_size 3"), "{text}");
     }
 
     /// bl1 exec-chain-sub-100-attribution: the ruler series that make the gap
