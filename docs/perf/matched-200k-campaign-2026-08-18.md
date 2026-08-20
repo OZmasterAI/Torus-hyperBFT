@@ -304,3 +304,214 @@ Ranked by expected matched/s per unit of risk on this rig; the first three are n
 Beyond this rig: the only path to 200k is market-sharded execution (one exec thread per shard
 with deterministic cross-shard settlement), pipelined flush, and one validator per >= 16-core
 host; the scaling demonstrations in section 10 are how to make that case with numbers.
+
+---
+
+## Rounds 6+ (2026-08-19)
+
+Four more rounds (6, 7, 8, 9) on top of the round-5 tip, run by the same workflow: 3 candidates
+implemented per round, benched on the same rig, one `--no-ff` merge per round. 12 candidates,
+~40 bench cells, 4 merges, `perf/matched-200k` `49f0130 → e44a38c → 484115e → 997d59f → d1a99b2
+→ d7a073f`. Nothing pushed. Every number below is again from node Prometheus counters with
+3-validator agreement checked per cell; each figure names its cell (markets, duration).
+
+### 12. Baseline on the new-defaults head (`e44a38c`)
+
+`e44a38c` is the first head where the cap-200 bundle (`NATIVE_TOTAL_BLOCK_CAP 200` /
+`ORDERS_PER_BLOCK 100k` / `BLOCK_BYTES 12 MB` / trust-cache 32k / 8 MB direct-push floor) and
+`TORUS_PARALLEL_BUCKET_HASH=8` are **compiled defaults** rather than cell env. Rounds 6–9 are
+measured against it.
+
+| cell | markets | dur | matched/s avg | best-60 | blk/s | agreement | block ms breakdown (val0) |
+|---|---|---|---|---|---|---|---|
+| `defaults-flip-noenv-r1` | 10 | 120 s | 34,946 | 66,450 | 0.7 | yes | first no-env cell on the flipped defaults |
+| `r6-base-10m-r2` | 10 | 120 s | **42,203** | 65,177 | 1.5 | yes | block 830.1 = engine 395.1 (settle 177.2 / match 97.4 / margin 31.3) + flush 240.0 (root 94.9 + state_write 133.3) + save_books 122.9 + verify 30.7 + replay_guard 5.5 + residual 34.4; busy 0.777 |
+| `r6-base-300m-r1` | 300 | 120 s | **17,531** | 30,154 | 1.3 | **digest-unverified** (known 300 m harness artifact; hash + counters equal, 0 fail-stop) | block 1891.5 = engine 871.2 (settle 734.3 / match 71.1 / margin 35.2) + flush 801.2 (root 388.6 + state_write 369.9) + save_books 141.9 + verify 25.8 + replay_guard 4.2 + load_books 3.7 + residual 43.1; busy 0.958 |
+
+Carried record cells for the deltas below: **10 m 40,900 avg / 52,800 best-60** (300 s on
+`49f0130`), **300 m 24,439 avg / 44,853 best-60** (`r5-restack³-300m-r2` on `4aaef1d`). Note the
+same-head 300-market number (17.5 k) is far below the carried 24.4 k — the carried cell is on an
+older head with different env; this is why round 6 judged on both.
+
+### 13. Rounds 6–9 — per-candidate table
+
+`d10 %` / `d300 %` are the candidate's cell mean vs **that round's carried best** (10 m: 38,574 →
+39,054 → 41,679 → 41,679; 300 m: 24,439 → 24,958 → 25,132 → 26,515). All cells 120 s unless said.
+
+| rd | candidate | track | d10 % | d300 % | verdict | reason |
+|---|---|---|---|---|---|---|
+| 6 | `harness-300m-digest-and-parity` (`eab02ff`) | harness | +26.05 (n=2) | −29.25 (n=1) | stacked → r7 | Tools-only, disjoint files. Made the 300 m digest concurrent (53 s vs ~4 min/node) and turned `AGREE` into a real verdict. d300 is against the *older-head* carried cell, not a code regression. |
+| 6 | `engine-untimed-attribution` (`2a8d6a1`) | instrumentation | +31.2 (n=2) | −16.4 (n=1) | stacked → r7 | Timers only. Showed settle pass A = 463 of settle 699 ms at 300 m; timers were mis-placed for the new chunked pass A, so restack first. |
+| 6 | **`settle-passa-capped-chunks`** (`583badd`) | markets | +10.78 (n=1) | **+8.24 (n=2)** | **MERGED `484115e`** | Only candidate positive on the 300 m track. Settle 375/342 ms/blk vs 516 carried (−30 %) and 699–734 same-head (−50 %); engine 526/476 vs 857–871. Full agreement incl. pinned digest on both reps. |
+| 7 | **`harness-300m-digest-and-parity-restack`** (`26680ac`) | harness | +28.42 (n=2) | −1.23 (n=2) | **MERGED `997d59f`** | Unblocks the primary deliverable: `AGREE` + equal digests on 4/4 cells, `DRAIN_TIMEOUT=180+2·M`, `matched_s_first120` in every summary, `--markets-per-sender` passthrough (K=0 = byte-identical RNG draw, verified in diff). Throughput-neutral by construction. |
+| 7 | `engine-untimed-attribution-restack` (`9f4dd3a`) | instrumentation | +28.93 (n=2) | +5.04 (n=1) | stacked → r8 | Timers exact; 300 m engine 473 = phase1 30 + margin 32 + match 74 + settle 333 [passA 115 / passB 165 / cache_flush 50]. Merge conflict tree with the harness candidate → restack. |
+| 7 | `state-write-build-vs-db-split` (`8a6ce07`) | instrumentation | +25.73 (n=2) | −11.02 (n=1) | stacked → r8 | Split proved 300 m state_write 350 = build 45 + DB 305, batch 10.8 MB, 36 MB/s, `stall_micros 0`. But the split keys only populated from the candidate's own runner → restack onto the merged harness. |
+| 8 | `engine-untimed-attribution-restack²` (`555e182`) | instrumentation | +17.47 (n=2) | −2.53 (n=1) | stacked → r9 | Clean, but the flush split was the more urgent measurement (flush had become the 300 m wall). |
+| 8 | **`state-write-build-vs-db-split-restack`** (`2073028`) | instrumentation | +7.10 (n=2) | −7.70 (n=1) | **MERGED `d1a99b2`** | Lowest deltas of the round and merged anyway: it closes the harness trap (split keys now populate from the merged main-repo runner) and answers "where is state_write?" — **86 % is the RocksDB write, 14 % the WriteBatch build**, which redirects the next lever from parallelising the build to WriteOptions/WAL. |
+| 8 | `stops-dirty-flag-range-scan` (`b58c358`) | markets | +11.30 (n=1) | +1.09 (n=2) | stacked → r9 | Positive but n=1 on 10 m and inside noise on 300 m. |
+| 9 | **`engine-untimed-attribution-restack³`** (`15557a1`) | instrumentation | +10.15 (n=2) | −1.19 (n=1) | **MERGED `d7a073f`** | First binary carrying **both** the r6 engine sub-timers and the r7 flush build/db split in one `summary.json`; identities exact on all 9 node-cells; overhead 3–7 ms/blk. Both deltas are noise, as expected for timers. |
+| 9 | `stops-dirty-flag-range-scan-restack` (`a79afcd`) | markets | +16.11 (n=2) | −3.25 (n=3) | held | **Mechanism confirmed**: save_books 151.1 → 123.8 ms at 300 m (−18.1 %), 5.756 → 4.901 µs per dirty bucket (−14.9 %). Matched/s flat (sd 1040, ~1.4 σ). Below the "≥ 30 % of a phase *and* visible in matched/s" bar; carry as a stackable. |
+| 9 | `state-write-db-writeopts-waloff` (`79ea483`, default **OFF**) | markets | +26.35 (n=2) | −2.80 (n=2) | held | Largest single phase win measured in these rounds: state_write DB 323 → 210 ms at 300 m (−35 %), 63–67 MB/s. **Crash-recovery gate passed** (kill −9 val2 mid-load; restart logged an 11-block execution gap, replayed 80..90 in ~7 s, digest identical to val0/val1) — but 11 blocks of state are rewound per crash, and matched/s is flat. Needs same-binary ON/OFF control cells before any throughput credit. |
+
+Two confirm cells were **discarded as rig events, not code results**, and re-run:
+`r8-merged-confirm-10m` (native-DA dissemination collapse: 60 "body fetch exhausted 9 retries"
+lines, 16 blocks in 304 s, exec `block_ms` 541 against `wall/committed` 19,750 ms — binary md5
+byte-identical to a clean 44.9 k cell) and `r9-merged-confirm-10m` (launched 21 s after a 47 MB
+link; idle blk/s 1.5–2.4 against a healthy 12–28, `wall/committed` 1541 ms vs block 806 ms,
+124 k nonce-expiries/node). Both preserved on disk. Rig noise cost 2 of 9 confirm cells.
+
+### 14. What merged (rounds 6–9)
+
+```
+d7a073f  perf(matched): merge engine-untimed-attribution-restack-restack-restack   (r9)
+  15557a1  test(matched-bench): guard the r6-engine / r7-flush sub-timer coexistence
+  d8a6c1f  test(exec): name the signed-action tuple in exec_phase_accum_tests
+  7474ede  tools(matched-bench): scrape + report the engine sub-phase attribution
+  6333eaa  perf(exec): sub-timers for the ~390 ms/blk untimed engine share
+d1a99b2  perf(matched): merge state-write-build-vs-db-split-restack               (r8)
+  2073028  tools(matched-bench): carry the state_write split into the early/late windows
+  ca159f3  perf(obs): split flush state_write into WriteBatch build vs RocksDB write
+997d59f  perf(matched): merge harness-300m-digest-and-parity-restack              (r7)
+  26680ac  tools(matched-bench): pinned-state 300m digest, first120 window, MPS passthrough
+  121c940  tools(bench): --markets-per-sender K locality load shape (default 0 = unchanged)
+484115e  perf(matched): merge settle-passa-capped-chunks                          (r6)
+  583badd  perf(settle): LPT-chunk pass A across capped workers instead of one thread per market
+```
+
+**One of the four merges is a throughput mechanism** (r6 settle pass A). The other three are a
+harness fix and two instrumentation merges — deliberately, because after r6 the block-time mass
+moved to a phase nobody could attribute. No merged change alters matching semantics, the state
+root layout, or a consensus-visible default; `waloff` and `markets-per-sender` are both gated OFF
+by default.
+
+### 15. Best cells before vs after rounds 6–9
+
+**10 markets, 300 s confirm cells** (all `AGREE`: block hash + header root + RPC state digest +
+counters equal on all 3 nodes):
+
+| head | cell | avg | best-60 | first-120 | block ms breakdown (val0) |
+|---|---|---|---|---|---|
+| carried (`49f0130`) | r5 record | 40,900 | 52,800 | — | — |
+| `484115e` (r6) | `r6-merged-confirm-10m` | 39,054 | 50,039 | — | block 1326.1 = engine 779.4 (settle 228.0 / match 117.6 / margin 34.6) + flush 308.0 (root 107.3 + state_write 188.6) + save_books 160.1 + verify 32.7 + residual 39.5 |
+| `997d59f` (r7) | `r7-merged-confirm-10m` | 41,679 | 57,357 | 51,296 | block 1275.3 = engine 731.5 (settle 194.1) + flush 263.4 (root 91.7 + state_write 159.3) + save_books 149.2 + load_books 55.7 + verify 31.5 |
+| `d1a99b2` (r8) | `r8-merged-confirm-10m-r2` | 39,551 | 66,137 | 45,829 | block 1211.3 = engine 636.8 (settle 192.5) + flush 253.8 (root 86.9 + state_write 154.9 = build 16.5 + db 138.5; 3.76 MB/blk, 27.8 MB/s) + save_books 146.6 + load_books 102.4 |
+| **`d7a073f` (r9)** | **`r9-merged-confirm-10m-r2`** | **42,284** | **56,707** | 51,862 | block 1168.0 = engine 708.4 (**phase1_actions 391.5** + settle 191.3 [passA 63.2 / passB 120.3 / cache_flush 4.3] + match 88.6 + margin 30.4 + untimed 6.3) + flush 261.8 (root 88.0 + state_write 162.2 = build 14.8 + db 147.4; 3.97 MB/blk, 27.6 MB/s) + save_books 130.7 + verify 27.2 + residual 34.8; busy 0.913, dirty buckets/flush 3131 |
+
+10 m net: **40,900 → 42,284 avg (+3.4 %) and 52,800 → 56,707 best-60 (+7.4 %)** — inside the
+~2.9 k pool sd, i.e. **parity, not a win**. The four confirms span 39.1–42.3 k with no trend.
+The 10-market track did not move in rounds 6–9 and was never the target after r6.
+
+**300 markets, 120 s confirm cells:**
+
+| head | cell | avg | best-60 | digest | block ms breakdown (val0) |
+|---|---|---|---|---|---|
+| `e44a38c` (base) | `r6-base-300m-r1` | 17,531 | 30,154 | unverified (artifact) | block 1891.5 = engine 871.2 (settle 734.3) + flush 801.2 (root 388.6 + sw 369.9) + save_books 141.9 |
+| carried (`4aaef1d`) | r5 record | 24,439 | 44,853 | yes | block 1605 = flush 769 (root 368 + sw 359) + engine 637 (settle 516) + save_books 126 |
+| `484115e` (r6) | `r6-merged-confirm-300m` | 24,958 | 37,515 | yes | block 1556.4 = flush 819.0 (root 399.9 + sw 375.0) + engine 506.6 (settle 361.4) + save_books 148.0 |
+| `997d59f` (r7) | `r7-merged-confirm-300m` | 25,132 | 38,996 | **yes, parallel (54 s/node)** | block 1829.8 = flush 933.3 (root 457.5 + sw 423.5) + engine 583.7 (settle 410.1) + save_books 172.6 |
+| `d1a99b2` (r8) | `r8-merged-confirm-300m` | **26,515** | 43,694 | yes (73 s wall) | block 1533.4 = flush 811.7 (root 387.4 + sw 376.4 = build 52.9 + db 323.5; 12.24 MB/blk, 38.8 MB/s) + engine 487.4 (settle 337.7) + save_books 151.1 |
+| **`d7a073f` (r9)** | **`r9-merged-confirm-300m`** | **26,181** | 40,506 | yes (63 s/node) | block 1615.7 = **flush 852.7 (52.8 %: root 415.1 + state_write 390.5 = build 53.4 + db 337.2; 12.24 MB/blk, 37.2 MB/s)** + engine 522.6 (settle 369.5 [passA 125.2 / passB 185.1 / cache_flush 55.4] + phase1 34.1 + match 77.4 + margin 36.5) + save_books 155.8 + verify 29.0 + residual 48.7; busy 0.935, dirty buckets/flush 26,386 |
+
+300 m net: **+7.1 % vs the carried record (24,439 → 26,181)** and **+49.3 % vs the same-head
+`e44a38c` baseline (17,531 → 26,181)**. The like-for-like same-head figure is the honest one:
+almost all of it is r6's settle pass A (settle 734 → 370 ms/blk, −50 %; engine 871 → 523, −40 %).
+Best 300 m cell of the campaign is r8's 26,515; r9's 26,181 is −1.3 % from it, n=1, noise.
+
+**The wall moved.** At 300 markets flush is now **52.8 %** of the block against engine's 32.3 %,
+exactly inverted from the round-5 picture. Inside flush: root 415 ms (unattributed — no
+sub-timers exist) and the RocksDB write 337 ms of state_write's 391. That is where round 10 goes.
+
+### 16. "Flat cost 10 → 300 markets" — not reached
+
+The deliverable is: per-block cost within ±20 % from 10 to 300 markets **at equal fills/block**,
+with `--markets-per-sender` locality as the declared 300-market shape. Status on the final head:
+
+| phase (val0, ms/native block) | 10 m (`r9-…-10m-r2`) | 300 m (`r9-…-300m`) | Δ |
+|---|---|---|---|
+| fills / native block | 52,014 | 48,912 | −6 % (near-matched) |
+| **block** | **1168.0** | **1615.7** | **+38 %** |
+| flush root | 88.0 | 415.1 | **+372 %** |
+| flush state_write (db) | 162.2 (147.4) | 390.5 (337.2) | +141 % (+129 %) |
+| settle | 191.3 | 369.5 | +93 % |
+| — pass A / pass B / cache_flush | 63.2 / 120.3 / 4.3 | 125.2 / 185.1 / 55.4 | +98 % / +54 % / **+1189 %** |
+| save_books | 130.7 | 155.8 | +19 % |
+| verify / replay_guard / load_books | 27.2 / 4.9 / 0.2 | 29.0 / 4.2 / 2.1 | flat |
+| phase1_actions | 391.5 | 34.1 | −91 % (load shape, not markets) |
+| state_write batch | 3.97 MB/blk @ 27.6 MB/s | 12.24 MB/blk @ 37.2 MB/s | 3.1× bytes |
+
+Per fill, the 300-market block costs **~+47 %**. The residual O(markets) mass is now, in order:
+**root (+327 ms), state_write db (+190 ms), settle (+178 ms, of which cache_flush +51 ms is pure
+per-market overhead), save_books (+25 ms)**. Engine total *falls* from 10 m to 300 m only because
+`phase1_actions` collapses (391 → 34 ms) — that is a difference in the submitted action mix
+between the two cells, not a market-count effect, and it is why the engine line must not be read
+as evidence of flatness.
+
+**Declared shape vs uniform control — the honest caveat.** `--markets-per-sender K` shipped in
+r7 (`121c940`, default K=0 = byte-identical RNG draw), but **no cell in rounds 6–9 ran with
+K ≥ 1** — verified by grepping `cell.markets_per_sender` across every `summary.json` under
+`/home/18c/bench-results-matched/`: zero hits. **Every 300-market number in this report is the
+uniform control**, i.e. the *hardest* shape (each sender touches all 300 markets, so every block
+dirties positions across the whole market set: 26.4 k dirty buckets/flush vs 3.1 k at 10 m). The
+locality shape the deliverable declares has still never been measured. Flat cost is therefore
+**not reached and not yet fairly tested** — running `markets-300-locality-cell` is a
+prerequisite, not an optimisation.
+
+### 17. Remaining backlog after round 9 (ranked)
+
+1. **`root-subphase-attribution`** (instrumentation) — root is 415 ms/blk at 300 m, 26 % of the
+   block, and completely unattributed; it is now the largest single unexplained term in the
+   system. Measure before any more markets-track work, same as r6 did for the engine.
+2. **`flush-root-overlap-1deep`** (throughput) — biggest code lever left: overlap flush(N)
+   root + state_write with engine(N+1). Worth 853 ms/blk at 300 m (52.8 %) and 262 ms at 10 m
+   off the serial exec chain. The r8 split and a root split are its prerequisites.
+3. **`settle-passb-parallel-shard-apply`** (markets) — pass B is 185 ms serial at 300 m, now the
+   largest engine term; needs a deterministic shard-apply order (determinism review required).
+4. **`state-write-db-writeopts-waloff-restack`** (markets) — measured −35 % on state_write db
+   (323 → 210 ms, 63–67 MB/s) with the crash-recovery gate already passed; blocked only on
+   same-binary ON/OFF control cells at 300 m. Keep default OFF; an 11-block rewind per crash is
+   a real cost the operator must opt into.
+5. **`stops-dirty-flag-range-scan-restack²`** (markets) — mechanism proven (save_books −18 %,
+   −14.9 % per dirty bucket at 300 m), throughput flat. Merge for the phase win once it stacks.
+6. **`settle-serial-diet-passb-cacheflush`** (markets) — `cache_flush` 4.3 → 55.4 ms from 10 to
+   300 markets is the cleanest pure-O(markets) term left in the engine.
+7. **`state-write-batch-cf-breakdown-and-memtable-sweep`** (markets) — which column families own
+   the 12.24 MB/block, and whether memtable sizing moves the 37 MB/s effective write rate.
+8. **`markets-300-locality-cell`** (markets) — run the declared shape (K ≥ 1). Deliverable, not
+   an optimisation; see section 16.
+9. **`phase1-actions-fastpath-10m`** (throughput) — 391 ms/blk avg at 10 m, 316 ms in `late_60s`;
+   only bites the 10-market track.
+10. **`late-cell-drift-compaction-tuning`**, **`bucket-hash-threads-300m-sweep`**,
+    **`order-index-map`**, **`positions-bucket-by-trader`** (markets) — the long tail.
+
+Carried forward unchanged from section 11: the `ConflictingCommittedChain` fail-stop incident
+(never re-observed in rounds 6–9; the runner still greps for it every cell) and the campaign-wide
+`dissemination_clean=false` residue (2 exhausted / ~21 sync_fallback per cell) which appears on
+**every** cell of **every** round and has never correlated with a candidate.
+
+### 18. Honest statement: rig vs code, after nine rounds
+
+* **The rig did not change and it is still the binding constraint.** 18 cores shared by 3 bench
+  validators + the bench process + a live testnet validator; ~5 cores per validator; `perf(1)`
+  unavailable. Two of nine confirm cells in rounds 6–9 were lost to rig events (a dissemination
+  collapse and a link-contended launch), both proven non-code by md5-identical binaries. A ~2.9 k
+  matched/s pool sd on 120 s cells means **any single-cell delta under ~8 % is unreadable**, and
+  most of the deltas in section 13 are under 8 %.
+* **What the code actually gained in rounds 6–9:** one mechanism, settle pass A, worth **+49 % at
+  300 markets on the same head** (17.5 k → 26.2 k, settle −50 %). The 10-market track moved
+  **+3.4 %**, i.e. not at all. Three of four merges bought *measurement*, not speed — and that was
+  the right trade, because the block-time mass had moved to a phase (flush, and inside it root)
+  that no timer could see.
+* **What is now provable and was not before:** state_write is 86 % RocksDB write / 14 % batch
+  build; engine time at 300 m is settle pass B > pass A > cache_flush with `phase1_actions`
+  collapsed; 300-market cells reach full byte-identical 3-validator agreement including the RPC
+  state digest, verified concurrently in ~60 s/node instead of ~4 min/node serial.
+* **What is still not proven:** flat cost 10 → 300 markets (section 16 — and never tested on the
+  declared locality shape), and any throughput credit for `waloff` or `stops-dirty-flag`, both of
+  which show a real phase win with a flat matched/s.
+* **The 200 k target is unchanged and still out of reach on this box.** 42.3 k avg / 56.7 k
+  best-60 at 10 markets means 200 k is **4.7× the average and 3.5× the best-60**. The ceiling is
+  structural, not tuning: **one serial exec thread** where flush (853 ms at 300 m) runs after the
+  engine (523 ms) on the same thread, on ~5 cores. Pipelining flush is the last large single-box
+  lever and is worth maybe 1.5×; beyond that the only path remains market-sharded execution with
+  deterministic cross-shard settlement and one validator per ≥ 16-core host. Rounds 6–9 did not
+  change that conclusion — they made it measurable.
