@@ -373,24 +373,6 @@ CLEAN=1 "$WSL/launch-3val.sh" >>"$OUT/run.log" 2>&1 || die "launch-3val.sh faile
 sleep 2
 mapfile -t PIDS < "$RUN_DIR/pids"
 log "node pids: ${PIDS[*]}"
-# ---- HOTSTUFF_CPUS: pin each node's consensus thread -----------------------
-if [ -n "$HOTSTUFF_CPUS" ]; then
-    IFS=/ read -r -a HS_CPU <<< "$HOTSTUFF_CPUS"
-    [ "${#HS_CPU[@]}" = 3 ] || die "HOTSTUFF_CPUS must be a/b/c (one CPU list per node), got '$HOTSTUFF_CPUS'"
-    command -v taskset >/dev/null || die "HOTSTUFF_CPUS set but taskset not found"
-    for i in 0 1 2; do
-        p=${PIDS[$i]}
-        if tid=$(find_tid "$p" hotstuff-algo); then
-            if taskset -pc "${HS_CPU[$i]}" "$tid" >>"$OUT/run.log" 2>&1; then
-                log "val$i pid=$p hotstuff-algo tid=$tid Cpus_allowed_list=$(awk '/^Cpus_allowed_list/{print $2}' /proc/$p/task/$tid/status) (HOTSTUFF_CPUS='$HOTSTUFF_CPUS')"
-            else
-                log "WARNING: val$i pid=$p taskset -pc ${HS_CPU[$i]} $tid FAILED — hotstuff-algo left unpinned"
-            fi
-        else
-            log "WARNING: val$i pid=$p has no thread named hotstuff-algo (binary predates the naming?) — left unpinned (HOTSTUFF_CPUS='$HOTSTUFF_CPUS')"
-        fi
-    done
-fi
 # verify the env actually reached each node process (fleet-uniform)
 ENV_VERIFY=$(for p in "${PIDS[@]}"; do tr '\0' '\n' < /proc/$p/environ 2>/dev/null | grep -E '^TORUS_' | sort | md5sum | cut -c1-8; done | sort -u | tr '\n' ' ')
 log "per-node TORUS_* env digest(s): $ENV_VERIFY (must be a single value)"
@@ -419,6 +401,26 @@ done
 [ "$ok" = 1 ] || die "devnet not healthy after ${HEALTH_TIMEOUT}s"
 T_HEALTHY=$(date +%s)
 log "healthy after $((T_HEALTHY - T_LAUNCH))s"
+# ---- HOTSTUFF_CPUS: pin each node's consensus thread -----------------------
+if [ -n "$HOTSTUFF_CPUS" ]; then
+    IFS=/ read -r -a HS_CPU <<< "$HOTSTUFF_CPUS"
+    [ "${#HS_CPU[@]}" = 3 ] || die "HOTSTUFF_CPUS must be a/b/c (one CPU list per node), got '$HOTSTUFF_CPUS'"
+    command -v taskset >/dev/null || die "HOTSTUFF_CPUS set but taskset not found"
+    for i in 0 1 2; do
+        p=${PIDS[$i]}
+        tid=""
+        for _try in $(seq 1 20); do tid=$(find_tid "$p" hotstuff-algo) && break; sleep 0.5; done
+        if [ -n "$tid" ]; then
+            if taskset -pc "${HS_CPU[$i]}" "$tid" >>"$OUT/run.log" 2>&1; then
+                log "val$i pid=$p hotstuff-algo tid=$tid Cpus_allowed_list=$(awk '/^Cpus_allowed_list/{print $2}' /proc/$p/task/$tid/status) (HOTSTUFF_CPUS='$HOTSTUFF_CPUS')"
+            else
+                log "WARNING: val$i pid=$p taskset -pc ${HS_CPU[$i]} $tid FAILED — hotstuff-algo left unpinned"
+            fi
+        else
+            log "WARNING: val$i pid=$p has no thread named hotstuff-algo (binary predates the naming, or not spawned within 10 s) — left unpinned (HOTSTUFF_CPUS='$HOTSTUFF_CPUS')"
+        fi
+    done
+fi
 # idle probe (10 s) for idle blk/s; startup view-timeout wobble can make the
 # first probe read low, so re-probe up to 3x until the mesh settles (>=10 blk/s).
 for _try in 1 2 3; do
