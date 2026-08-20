@@ -123,8 +123,73 @@ FLUSH_SUB_R7 = ["state_write_build", "state_write_db"]
 # cache_flush are NESTED inside phase_settle, so do not re-add them.
 ENGINE_SUB_R6 = ["phase1_actions", "settle_pass_a", "settle_pass_b", "cache_flush",
                  "post_engine_tail", "engine_untimed"]
+# bl1 exec-chain-sub-100-attribution: save_books pass 1 (journal DRAIN, reads the
+# LIVE book levels -> can never leave the exec thread) vs pass 2 (overlay WRITES
+# -> the only half a flush worker could take). drain + write == save_books to
+# rounding; both 0.0 on a pre-bl1 binary AND on book modes 0/1 (no two-pass save).
+SAVE_SUB_BL1 = ["save_books_drain", "save_books_write"]
 SUB = {"engine": ["phase_margin", "phase_match", "phase_settle"] + ENGINE_SUB_R6,
+       "save_books": SAVE_SUB_BL1,
        "flush": ["root", "state_write"] + FLUSH_SUB_R7 + ["evm_resync"]}
+
+
+def hist_quantile(pairs, q):
+    """Prometheus histogram_quantile over CUMULATIVE bucket-count deltas.
+
+    `pairs` = [(le, cumulative_delta)] sorted ascending with +Inf last. Returns
+    None when the window observed nothing (never 0.0, which would read as
+    "instant" rather than "no data").
+    """
+    if not pairs:
+        return None
+    total = pairs[-1][1]
+    if total <= 0:
+        return None
+    target = q * total
+    prev_le, prev_c = 0.0, 0.0
+    for le, c in pairs:
+        if c >= target:
+            if le == float("inf"):
+                return prev_le
+            if c <= prev_c:
+                return le
+            return prev_le + (le - prev_le) * (target - prev_c) / (c - prev_c)
+        prev_le, prev_c = le, c
+    return prev_le
+
+
+def load_buckets(path, lo, hi):
+    """run-cell.sh samples selected histogram BUCKETS into buckets.csv in long
+    format (ts,node,metric,le,count). Returns {(node, metric): [(le, delta)]}
+    over [lo, hi]. Missing file (pre-bl1 harness / resummarize of an old cell)
+    => {} => every percentile below is None."""
+    first, last = {}, {}
+    try:
+        with open(path) as f:
+            for r in csv.DictReader(f):
+                try:
+                    ts = float(r["ts"])
+                    cnt = float(r["count"])
+                    le = float("inf") if r["le"].lstrip("+").lower().startswith("inf") else float(r["le"])
+                except (TypeError, ValueError, KeyError, AttributeError):
+                    continue
+                if not (lo <= ts <= hi):
+                    continue
+                k = (r["node"], r["metric"], le)
+                if k not in first:
+                    first[k] = cnt
+                last[k] = cnt
+    except OSError:
+        return {}
+    out = {}
+    for (node, metric, le), c1 in last.items():
+        out.setdefault((node, metric), []).append((le, c1 - first[(node, metric, le)]))
+    for v in out.values():
+        v.sort(key=lambda x: x[0])
+    return out
+
+
+BUCKETS = load_buckets(os.path.join(OUT, "buckets.csv"), t0, td)
 phase = {}
 for node, rs in rows.items():
     if not rs:
@@ -197,6 +262,91 @@ for node, rs in rows.items():
     p["dirty_buckets_per_flush"] = round((m(b, "exec_root_dirty_buckets_sum") - m(a, "exec_root_dirty_buckets_sum")) / dbc, 1) if dbc else None
     cic = m(b, "commit_interval_seconds_count") - m(a, "commit_interval_seconds_count")
     p["commit_interval_ms_avg"] = round((m(b, "commit_interval_seconds_sum") - m(a, "commit_interval_seconds_sum")) / cic * 1000, 1) if cic else None
+
+    # ------------------------------------------------ bl1 exec-chain ruler
+    # The campaign's PRIMARY number is the exec CRITICAL CHAIN per NATIVE
+    # block, not `block_ms` (which is diluted by empty blocks) and not
+    # wall/native (which includes idle). This section reports it, splits it
+    # from whatever a flush worker took off the exec thread, and gives the
+    # denominator (fills/native block) without which any chain number is
+    # unreadable — engine ms scales with fills, so a thinner block reads as a
+    # chain win.
+    #
+    #   chain_ms         exec-thread wall per NATIVE block (E)
+    #   pipelined_ms     flush-worker wall per native block (W); 0.0 when the
+    #                    binary has no worker, None on a pre-bl1 binary
+    #   handoff_wait_ms  E blocked handing a job to W; 0.0 on a serial binary
+    #
+    # Everything is None (never 0.0) when the series is ABSENT: a 0 ms chain
+    # would read as a spectacular — and false — win, and None is also the
+    # "your node binary is stale" tell.
+    def draw(name):
+        return m(b, name + "_sum") - m(a, name + "_sum")
+
+    def craw(name):
+        return m(b, name + "_count") - m(a, name + "_count")
+
+    def pctl(metric, q):
+        v = hist_quantile(BUCKETS.get((node, metric)), q)
+        return round(v * 1000.0, 1) if v is not None else None
+
+    nchain = craw("exec_chain_seconds")
+    nworker = craw("flush_worker_seconds")
+    bl1 = nchain > 0
+    chain_ms = round(draw("exec_chain_seconds") / nblk * 1000.0, 2) if bl1 else None
+    p["chain_ms"] = chain_ms
+    p["pipelined_ms"] = round(draw("flush_worker_seconds") / nblk * 1000.0, 2) if nworker > 0 else (0.0 if bl1 else None)
+    p["handoff_wait_ms"] = round(draw("exec_handoff_wait_seconds") / nblk * 1000.0, 2) if bl1 else None
+    p["worker_present"] = bool(nworker > 0)
+    p["flush_worker_depth_max"] = max(m(r, "flush_worker_depth") for r in sel)
+    # E time spent on NON-native (empty) blocks, expressed per native block:
+    # the whole difference between block_ms and chain_ms by construction.
+    p["empty_block_ms"] = round(tot - chain_ms, 2) if bl1 else None
+    p["gap_to_100ms"] = round(chain_ms - 100.0, 2) if bl1 else None
+    # Cadence split: how much of blk/s is native vs empty blocks.
+    p["native_blk_s"] = round(nblk / span, 3) if span else None
+    p["empty_blk_s"] = round(max(nall - nblk, 0.0) / span, 3) if span else None
+    # Independent witness for nblk (which comes from exec_engine_seconds_count):
+    # if the two ever disagree, one observe site is on the wrong predicate and
+    # every ms-per-native-block column is skewed.
+    p["native_blocks_counter"] = (
+        (m(b, "exec_native_blocks_total") - m(a, "exec_native_blocks_total"))
+        if bl1
+        else None
+    )
+    # MANDATORY next to any chain number (see above).
+    fills = m(b, "orders_matched_total") - m(a, "orders_matched_total")
+    p["fills_per_native_block"] = round(fills / nblk, 1)
+    p["engine_ms_per_1k_fills"] = round(ph["engine"]["ms"] / fills * nblk * 1000.0, 2) if fills > 0 else None
+    # Cadence percentiles from the histogram buckets (the mean above hides the
+    # long tail that decides whether a thinner-block regime is reachable).
+    p["commit_interval_ms_p50"] = pctl("torus_commit_interval_seconds_bucket", 0.50)
+    p["commit_interval_ms_p95"] = pctl("torus_commit_interval_seconds_bucket", 0.95)
+    p["chain_ms_p50"] = pctl("torus_exec_chain_seconds_bucket", 0.50)
+    p["chain_ms_p95"] = pctl("torus_exec_chain_seconds_bucket", 0.95)
+    p["handoff_wait_ms_p95"] = pctl("torus_exec_handoff_wait_seconds_bucket", 0.95)
+    p["pipelined_ms_p95"] = pctl("torus_flush_worker_seconds_bucket", 0.95)
+    # The ruler's own per-node-cell acceptance gate:
+    #   * the chain must COVER every phase still running on the exec thread
+    #     (on a serial binary that includes flush);
+    #   * the chain can never exceed the block wall (the empty-block share is
+    #     the whole difference).
+    e_phases = ["verify", "replay_guard", "load_books", "engine", "save_books"]
+    if not p["worker_present"]:
+        e_phases.append("flush")
+    e_sum = round(sum(ph[k]["ms"] for k in e_phases), 2)
+    p["chain_identity"] = {
+        "e_phases": e_phases,
+        "e_phase_sum_ms": e_sum,
+        "chain_minus_e_phases_ms": round(chain_ms - e_sum, 2) if bl1 else None,
+        "chain_covers_e_phases": (chain_ms + 0.5 >= e_sum) if bl1 else None,
+        "chain_le_block": (chain_ms <= tot + 0.5) if bl1 else None,
+        "block_minus_chain_ms": p["empty_block_ms"],
+        "save_split_covers_save_books": (
+            round(ph["save_books"]["save_books_drain_ms"] + ph["save_books"]["save_books_write_ms"], 2)
+            <= round(ph["save_books"]["ms"], 2) + 0.5
+        ),
+    }
     # r4 commit-persist: consensus-thread commit-time durable persist (whole call /
     # body-record encode / WriteBatch write), ms per commit.
     cpc = m(b, "commit_persist_seconds_count") - m(a, "commit_persist_seconds_count")
@@ -391,6 +541,16 @@ summary = {
         "blk_s_worst60": v0.get("blk_s_worst60"),
         "peak_exec_queue_depth": v0.get("peak_exec_queue_depth"),
         "txs_per_block_avg": phase.get("val0", {}).get("txs_per_block_avg"),
+        # bl1 exec-chain ruler headline: the campaign's PRIMARY number and the
+        # denominator it must always be read next to.
+        "chain_ms": phase.get("val0", {}).get("chain_ms"),
+        "gap_to_100ms": phase.get("val0", {}).get("gap_to_100ms"),
+        "pipelined_ms": phase.get("val0", {}).get("pipelined_ms"),
+        "handoff_wait_ms": phase.get("val0", {}).get("handoff_wait_ms"),
+        "fills_per_native_block": phase.get("val0", {}).get("fills_per_native_block"),
+        "engine_ms_per_1k_fills": phase.get("val0", {}).get("engine_ms_per_1k_fills"),
+        "commit_interval_ms_p50": phase.get("val0", {}).get("commit_interval_ms_p50"),
+        "commit_interval_ms_p95": phase.get("val0", {}).get("commit_interval_ms_p95"),
         "actions_per_exec_block": phase.get("val0", {}).get("actions_per_exec_block"),
         "consensus_timeouts": v0.get("delta_consensus_timeout_total_total"),
         "dissemination_clean": dissem.get("dissemination_clean") if dissem else None,
@@ -422,6 +582,21 @@ p0 = phase.get("val0", {})
 if p0:
     print(f"PHASE val0: block_ms={p0['block_ms']} wall/committed={p0['wall_ms_per_committed_block']} " +
           " ".join(f"{k}={v['ms']}({v['pct_of_block']}%)" for k, v in p0["phases"].items()))
+
+    # bl1 exec-chain ruler: the critical chain, what came off it, and the
+    # denominator. chain_ms=None means the node binary predates bl1.
+    ci = p0["chain_identity"]
+    sb = p0["phases"]["save_books"]
+    print(f"CHAIN val0: chain_ms={p0['chain_ms']} (p50={p0['chain_ms_p50']} p95={p0['chain_ms_p95']}) "
+          f"gap_to_100ms={p0['gap_to_100ms']} pipelined_ms={p0['pipelined_ms']} "
+          f"handoff_wait_ms={p0['handoff_wait_ms']} worker={p0['worker_present']} "
+          f"empty_block_ms={p0['empty_block_ms']} | fills/blk={p0['fills_per_native_block']} "
+          f"engine_ms/1k_fills={p0['engine_ms_per_1k_fills']} | "
+          f"native_blk/s={p0['native_blk_s']} empty_blk/s={p0['empty_blk_s']} "
+          f"commit_ms p50/p95={p0['commit_interval_ms_p50']}/{p0['commit_interval_ms_p95']} | "
+          f"save_books={sb['ms']}(drain={sb['save_books_drain_ms']} write={sb['save_books_write_ms']}) | "
+          f"identity covers_e={ci['chain_covers_e_phases']} le_block={ci['chain_le_block']} "
+          f"chain-e_phases={ci['chain_minus_e_phases_ms']}")
 
     # r6 engine-untimed-attribution: engine internals on one line (all 0.0 on a
     # pre-r6 node binary, which is itself the "binary is stale" tell).

@@ -1609,6 +1609,16 @@ impl ExecutionContext {
             if let Some(ref m) = self.metrics {
                 m.exec_save_books_seconds
                     .observe(save_books_timer.elapsed().as_secs_f64());
+                // bl1 exec-chain ruler: split save_books into pass 1 (journal
+                // DRAIN — reads the LIVE book levels the next block's engine
+                // mutates, so it can never leave this thread) and pass 2
+                // (overlay WRITES — the only half a flush worker could take).
+                // Observed once per native block from the context's
+                // accumulators; both 0 in book modes 0/1, which have no
+                // two-pass save.
+                let split = ctx.save_split;
+                m.exec_save_books_drain_seconds.observe(secs(split.drain_ns));
+                m.exec_save_books_write_seconds.observe(secs(split.write_ns));
                 // L3: publish the level-hash sponge cache effectiveness, summed
                 // across all books, right after the save that populates it. None
                 // when TORUS_LEVEL_HASH_CACHE is off ⇒ skip (gauges stay at 0).
@@ -1841,13 +1851,42 @@ impl ExecutionContext {
             let tx_count = torus_block.header.evm_tx_count as u64
                 + torus_block.header.native_action_count as u64;
             m.block_transactions_count.observe(tx_count as f64);
-            m.exec_block_seconds
-                .observe(block_timer.elapsed().as_secs_f64());
+            let block_secs = block_timer.elapsed().as_secs_f64();
+            m.exec_block_seconds.observe(block_secs);
+            // bl1 exec-chain-sub-100-attribution: the exec CRITICAL CHAIN per
+            // NATIVE block — `exec_block_seconds` diluted by empty blocks is
+            // not the number the campaign is driving to 100 ms.
+            //
+            // On THIS (serial) binary every stage still runs inline on the
+            // exec thread, so the chain IS the block wall (`chain_sum` is
+            // exactly the native-block share of `block_sum`) and E never
+            // blocks on a flush worker: the hand-off wait is 0 BY
+            // CONSTRUCTION, and `flush_worker_seconds` is never observed at
+            // all. A pipelining candidate (`TORUS_EXEC_PIPELINE`) moves stages
+            // out of this window and fills those two series in; summarize.py
+            // reads the difference as `pipelined_ms` / `handoff_wait_ms`.
+            //
+            // Gated on the SAME predicate as the native section above, so
+            // `exec_chain_seconds_count == exec_engine_seconds_count` and
+            // `_sum / _count` is directly ms-per-native-block.
+            if has_native || computed_fee_revenue > 0 {
+                m.exec_chain_seconds.observe(block_secs);
+                m.exec_handoff_wait_seconds
+                    .observe(SERIAL_HANDOFF_WAIT_SECS);
+                m.exec_native_blocks.inc();
+            }
         }
 
         tracing::info!(height, "execution pipeline: block done");
     }
 }
+
+/// bl1 exec-chain-sub-100-attribution: what the exec thread waits for a flush
+/// worker on a binary that has no flush worker. Kept as a named constant (not
+/// a bare `0.0`) so the observe site reads as an explicit claim about this
+/// binary rather than as a placeholder, and so a pipelining candidate has one
+/// obvious call site to replace with the measured rendezvous wait.
+const SERIAL_HANDOFF_WAIT_SECS: f64 = 0.0;
 
 fn execution_loop(rx: std::sync::mpsc::Receiver<CommittedBlockMsg>, ctx: ExecutionContext) {
     tracing::info!("execution pipeline thread started");
@@ -8377,6 +8416,135 @@ mod crash_recovery_tests {
                 "{name} must observe exactly once per native block:\n{text}",
             );
         }
+    }
+
+    /// bl1 exec-chain ruler: read one scalar sample out of an OpenMetrics
+    /// exposition (`name value`). Panics with the whole text when absent, so a
+    /// missing series is a loud test failure rather than a silent 0.
+    fn metric_value(text: &str, name: &str) -> f64 {
+        for line in text.lines() {
+            if let Some((k, v)) = line.split_once(' ') {
+                if k == name {
+                    return v
+                        .trim()
+                        .parse::<f64>()
+                        .unwrap_or_else(|e| panic!("{name} is not a number ({v:?}): {e}"));
+                }
+            }
+        }
+        panic!("metric {name} absent from exposition:\n{text}");
+    }
+
+    /// bl1 exec-chain-sub-100-attribution (RULER): the exec critical chain
+    /// per NATIVE block must be observed exactly ONCE per native block, on the
+    /// SAME clock as `exec_block_seconds`, together with its hand-off wait and
+    /// the save-books drain/write split — so `_sum / _count` is directly
+    /// ms-per-native-block and lines up with `exec_engine_seconds_count`.
+    #[test]
+    fn exec_chain_ruler_observes_once_per_native_block() {
+        let (config, state_db) = make_test_config_and_db();
+        let mut exec_ctx = make_exec_ctx(&config, &state_db);
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
+        exec_ctx.metrics = Some(metrics.clone());
+
+        exec_ctx.execute_committed_block(&make_block(1, vec![sign_claim_rewards(7)]), vec![]);
+
+        let text = metrics.encode();
+        for name in [
+            "torus_exec_chain_seconds",
+            "torus_exec_handoff_wait_seconds",
+            "torus_exec_save_books_drain_seconds",
+            "torus_exec_save_books_write_seconds",
+        ] {
+            assert!(
+                text.contains(&format!("{name}_count 1")),
+                "{name} must observe exactly once per native block:\n{text}",
+            );
+        }
+        assert_eq!(
+            metric_value(&text, "torus_exec_native_blocks_total"),
+            1.0,
+            "native-block counter must count this block:\n{text}",
+        );
+        // The chain count is the denominator summarize.py divides by; it MUST
+        // equal the engine count or every new ms-per-block column is skewed.
+        assert_eq!(
+            metric_value(&text, "torus_exec_chain_seconds_count"),
+            metric_value(&text, "torus_exec_engine_seconds_count"),
+            "chain must observe on exactly the set of blocks engine does:\n{text}",
+        );
+    }
+
+    /// bl1 exec-chain ruler, SERIAL-BINARY IDENTITIES. On a binary with no
+    /// flush worker:
+    ///   * `chain == block` for a native block (same wall clock, no stage is
+    ///     off the exec thread), so `chain_sum <= block_sum` with the whole
+    ///     difference being the empty blocks;
+    ///   * the hand-off wait exists but is identically 0 (E never blocks);
+    ///   * `flush_worker_seconds` is NEVER observed and `flush_worker_depth`
+    ///     stays 0 — the pair summarize.py and the harness drain key off.
+    /// An EMPTY block must move `exec_block_seconds` but NOT the chain, so the
+    /// ruler is never diluted by empty blocks.
+    #[test]
+    fn exec_chain_ruler_serial_identities_and_empty_blocks() {
+        let (config, state_db) = make_test_config_and_db();
+        let mut exec_ctx = make_exec_ctx(&config, &state_db);
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
+        exec_ctx.metrics = Some(metrics.clone());
+
+        let block1 = make_block(1, vec![sign_claim_rewards(7)]);
+        exec_ctx.execute_committed_block(&block1, vec![]);
+        // Empty block 2, linked to the NATIVE block 1 actually persisted above.
+        let mut block2 = make_block(2, vec![]);
+        block2.header.parent_hash =
+            alloy_primitives::keccak256(block1.header.canonical_header_bytes());
+        exec_ctx.execute_committed_block(&block2, vec![]);
+
+        let text = metrics.encode();
+        assert_eq!(
+            metric_value(&text, "torus_exec_block_seconds_count"),
+            2.0,
+            "both blocks execute:\n{text}",
+        );
+        assert_eq!(
+            metric_value(&text, "torus_exec_chain_seconds_count"),
+            1.0,
+            "the empty block must NOT be counted into the chain:\n{text}",
+        );
+        assert_eq!(
+            metric_value(&text, "torus_exec_native_blocks_total"),
+            1.0,
+            "the empty block must NOT be counted as native:\n{text}",
+        );
+
+        let chain = metric_value(&text, "torus_exec_chain_seconds_sum");
+        let block = metric_value(&text, "torus_exec_block_seconds_sum");
+        assert!(
+            chain > 0.0 && chain <= block + 1e-9,
+            "chain ({chain}) must be the native-block share of block ({block}):\n{text}",
+        );
+
+        assert_eq!(
+            metric_value(&text, "torus_exec_handoff_wait_seconds_sum"),
+            0.0,
+            "a serial binary never blocks on a flush hand-off:\n{text}",
+        );
+        assert_eq!(
+            metric_value(&text, "torus_exec_handoff_wait_seconds_count"),
+            1.0,
+            "the hand-off series must still exist (0 value, not absent):\n{text}",
+        );
+        assert_eq!(
+            metric_value(&text, "torus_flush_worker_seconds_count"),
+            0.0,
+            "a serial binary has no flush worker to observe:\n{text}",
+        );
+        assert_eq!(
+            metric_value(&text, "torus_flush_worker_depth"),
+            0.0,
+            "flush-worker depth must stay 0 on a serial binary (the harness \
+             drain waits for exactly this before the digest):\n{text}",
+        );
     }
 
     /// Task 3 (RED first): the pull-fallback poll budget must be ≥ 1 s so a body that
