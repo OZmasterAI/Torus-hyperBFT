@@ -22,31 +22,17 @@ fi
 mkdir -p "$DATA_ROOT/data" "$RUN_DIR"
 : > "$RUN_DIR/pids"
 
-start_node() { # $1=idx $2=key $3=p2pport $4=rpcport $5=metport $6=peers_csv
-    local idx=$1 key=$2 p2p=$3 rpc=$4 met=$5 peers=$6
-    local dd="$DATA_ROOT/data/val$idx"
-    local log="$RUN_DIR/val$idx.log"
-    mkdir -p "$dd"
-    echo "starting val$idx  rpc=$rpc p2p=$p2p metrics=$met"
-    nohup "$BIN" \
-        --genesis="$GENESIS" \
-        --data-dir="$dd" \
-        --validator-key="$key" \
-        --p2p-listen="/ip4/0.0.0.0/udp/$p2p/quic-v1" \
-        --p2p-private-addrs \
-        --p2p-peers="$peers" \
-        --rpc-addr="0.0.0.0:$rpc" \
-        --metrics-addr="0.0.0.0:$met" \
-        --log-level=info \
-        --native-gossip=true \
-        > "$log" 2>&1 &
-    echo $! >> "$RUN_DIR/pids"
-}
+# The node argv lives in start-node.sh so a crash-gate RESTART
+# (tools/matched-bench/crash-kill.sh) can never drift from a fresh launch —
+# in particular every node keeps its EXPLICIT --p2p-peers, without which
+# main.rs falls back to the compiled TESTNET bootstrap peers and the devnet
+# dial-storms the live seed (S395 cross-contamination, mem e9e757f8).
+source ./start-node.sh
 
-# val0 dials val1; val1 dials val0; val2 dials both. All edges use known ids.
-start_node 0 "$KEY0" "$P2P0" "$RPC0" "$MET0" "$PEER_TO_V1"
-start_node 1 "$KEY1" "$P2P1" "$RPC1" "$MET1" "$PEER_TO_V0"
-start_node 2 "$KEY2" "$P2P2" "$RPC2" "$MET2" "$PEER_TO_V0,$PEER_TO_V1"
+for idx in 0 1 2; do
+    start_node "$idx"
+    echo "$STARTED_PID" >> "$RUN_DIR/pids"
+done
 
 echo
 echo "launched pids: $(tr '\n' ' ' < "$RUN_DIR/pids")"
