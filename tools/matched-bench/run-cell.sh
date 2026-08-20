@@ -283,7 +283,7 @@ done
 # run unchanged.
 FUNNEL_COLS="torus_native_actions_processed_total torus_orders_placed_accepted_total torus_orders_matched_total torus_orders_resting_total torus_orders_rejected_margin_total torus_orders_rejected_book_total torus_orders_rejected_cancelled_total torus_orders_rejected_other_total torus_orders_self_trade_cancels_total torus_orders_cancelled_partial_fill_total torus_blocks_committed_total torus_block_height torus_exec_queue_depth"
 PHASE_COLS="torus_blocks_committed_total torus_block_height torus_orders_placed_accepted_total torus_orders_matched_total torus_orders_resting_total torus_exec_resting_orders torus_exec_load_books_seconds_sum torus_exec_load_books_seconds_count torus_exec_root_seconds_sum torus_exec_root_seconds_count torus_exec_state_write_seconds_sum torus_exec_state_write_seconds_count torus_exec_state_write_build_seconds_sum torus_exec_state_write_build_seconds_count torus_exec_state_write_db_seconds_sum torus_exec_state_write_db_seconds_count torus_exec_state_write_batch_bytes_sum torus_exec_state_write_batch_bytes_count torus_exec_evm_resync_seconds_sum torus_exec_evm_resync_seconds_count torus_exec_flush_seconds_sum torus_exec_flush_seconds_count torus_exec_root_dirty_buckets_sum torus_exec_root_dirty_buckets_count torus_exec_queue_depth torus_exec_root_bucket_scans_total torus_member_cache_hits_total torus_member_cache_misses_total torus_member_cache_evictions_total torus_member_cache_resident_buckets"
-WIDE_COLS="torus_blocks_committed_total torus_block_height torus_native_actions_processed_total torus_orders_placed_accepted_total torus_orders_matched_total torus_orders_resting_total torus_exec_resting_orders torus_orders_rejected_margin_total torus_orders_rejected_book_total torus_orders_rejected_cancelled_total torus_orders_rejected_other_total torus_exec_queue_depth torus_mempool_native_size torus_exec_block_seconds_sum torus_exec_block_seconds_count torus_exec_engine_seconds_count torus_exec_verify_seconds_count torus_exec_flush_seconds_count torus_exec_evm_seconds_sum torus_exec_verify_seconds_sum torus_exec_replay_guard_seconds_sum torus_exec_load_books_seconds_sum torus_exec_engine_seconds_sum torus_exec_phase_margin_seconds_sum torus_exec_phase_match_seconds_sum torus_exec_phase_settle_seconds_sum torus_exec_phase1_actions_seconds_sum torus_exec_phase1_actions_seconds_count torus_exec_settle_pass_a_seconds_sum torus_exec_settle_pass_b_seconds_sum torus_exec_cache_flush_seconds_sum torus_exec_post_engine_tail_seconds_sum torus_exec_engine_untimed_seconds_sum torus_exec_engine_untimed_seconds_count torus_exec_save_books_seconds_sum torus_exec_flush_seconds_sum torus_exec_root_seconds_sum torus_exec_state_write_seconds_sum torus_exec_state_write_build_seconds_sum torus_exec_state_write_build_seconds_count torus_exec_state_write_db_seconds_sum torus_exec_state_write_db_seconds_count torus_exec_state_write_batch_bytes_sum torus_exec_state_write_batch_bytes_count torus_exec_evm_resync_seconds_sum torus_exec_body_persist_seconds_sum torus_exec_root_dirty_buckets_sum torus_exec_root_dirty_buckets_count torus_exec_root_bucket_scans_total torus_member_cache_evictions_total torus_commit_interval_seconds_sum torus_commit_interval_seconds_count torus_consensus_timeout_total_total torus_consensus_view torus_block_transactions_count_sum torus_block_transactions_count_count torus_native_gossip_published_actions_total torus_native_gossip_dropped_full_total torus_rocksdb_memtable_bytes torus_rocksdb_l0_files torus_rocksdb_pending_compaction_bytes torus_db_size_bytes torus_exec_body_persist_write_seconds_sum torus_exec_body_persist_write_seconds_count torus_commit_persist_seconds_sum torus_commit_persist_seconds_count torus_commit_body_encode_seconds_sum torus_commit_persist_write_seconds_sum torus_trade_writer_queued_batches torus_rocksdb_memtable_bytes_all torus_rocksdb_immutable_memtables_all torus_rocksdb_l0_files_max torus_rocksdb_pending_compaction_bytes_all torus_rocksdb_delayed_write_rate torus_rocksdb_write_stopped torus_rocksdb_running_compactions torus_rocksdb_running_flushes torus_rocksdb_stall_micros torus_rocksdb_write_self torus_rocksdb_write_other torus_rocksdb_bytes_written torus_rocksdb_wal_bytes torus_rocksdb_flush_write_bytes torus_rocksdb_compact_read_bytes torus_rocksdb_compact_write_bytes torus_rocksdb_compaction_cpu_micros torus_rocksdb_db_write_count torus_rocksdb_db_write_sum_micros torus_rocksdb_db_write_p99_micros torus_rocksdb_db_write_max_micros torus_rocksdb_write_stall_count torus_rocksdb_write_stall_sum_micros torus_rocksdb_write_stall_p99_micros torus_rocksdb_write_stall_max_micros torus_rocksdb_flush_count torus_rocksdb_flush_sum_micros torus_rocksdb_compaction_count torus_rocksdb_compaction_sum_micros"
+WIDE_COLS="torus_blocks_committed_total torus_block_height torus_native_actions_processed_total torus_orders_placed_accepted_total torus_orders_matched_total torus_orders_resting_total torus_exec_resting_orders torus_orders_rejected_margin_total torus_orders_rejected_book_total torus_orders_rejected_cancelled_total torus_orders_rejected_other_total torus_exec_queue_depth torus_mempool_native_size torus_exec_block_seconds_sum torus_exec_block_seconds_count torus_exec_engine_seconds_count torus_exec_verify_seconds_count torus_exec_flush_seconds_count torus_exec_evm_seconds_sum torus_exec_verify_seconds_sum torus_exec_replay_guard_seconds_sum torus_exec_load_books_seconds_sum torus_exec_engine_seconds_sum torus_exec_phase_margin_seconds_sum torus_exec_phase_match_seconds_sum torus_exec_phase_settle_seconds_sum torus_exec_phase1_actions_seconds_sum torus_exec_phase1_actions_seconds_count torus_exec_settle_pass_a_seconds_sum torus_exec_settle_pass_b_seconds_sum torus_exec_cache_flush_seconds_sum torus_exec_post_engine_tail_seconds_sum torus_exec_engine_untimed_seconds_sum torus_exec_engine_untimed_seconds_count torus_exec_save_books_seconds_sum torus_exec_flush_seconds_sum torus_exec_root_seconds_sum torus_exec_state_write_seconds_sum torus_exec_state_write_build_seconds_sum torus_exec_state_write_build_seconds_count torus_exec_state_write_db_seconds_sum torus_exec_state_write_db_seconds_count torus_exec_state_write_batch_bytes_sum torus_exec_state_write_batch_bytes_count torus_exec_evm_resync_seconds_sum torus_exec_body_persist_seconds_sum torus_exec_root_dirty_buckets_sum torus_exec_root_dirty_buckets_count torus_exec_root_bucket_scans_total torus_member_cache_evictions_total torus_commit_interval_seconds_sum torus_commit_interval_seconds_count torus_exec_chain_seconds_sum torus_exec_chain_seconds_count torus_exec_handoff_wait_seconds_sum torus_exec_handoff_wait_seconds_count torus_flush_worker_seconds_sum torus_flush_worker_seconds_count torus_flush_worker_depth torus_exec_save_books_seconds_count torus_exec_save_books_drain_seconds_sum torus_exec_save_books_drain_seconds_count torus_exec_save_books_write_seconds_sum torus_exec_save_books_write_seconds_count torus_exec_native_blocks_total torus_consensus_timeout_total_total torus_consensus_view torus_block_transactions_count_sum torus_block_transactions_count_count torus_native_gossip_published_actions_total torus_native_gossip_dropped_full_total torus_rocksdb_memtable_bytes torus_rocksdb_l0_files torus_rocksdb_pending_compaction_bytes torus_db_size_bytes torus_exec_body_persist_write_seconds_sum torus_exec_body_persist_write_seconds_count torus_commit_persist_seconds_sum torus_commit_persist_seconds_count torus_commit_body_encode_seconds_sum torus_commit_persist_write_seconds_sum torus_trade_writer_queued_batches torus_rocksdb_memtable_bytes_all torus_rocksdb_immutable_memtables_all torus_rocksdb_l0_files_max torus_rocksdb_pending_compaction_bytes_all torus_rocksdb_delayed_write_rate torus_rocksdb_write_stopped torus_rocksdb_running_compactions torus_rocksdb_running_flushes torus_rocksdb_stall_micros torus_rocksdb_write_self torus_rocksdb_write_other torus_rocksdb_bytes_written torus_rocksdb_wal_bytes torus_rocksdb_flush_write_bytes torus_rocksdb_compact_read_bytes torus_rocksdb_compact_write_bytes torus_rocksdb_compaction_cpu_micros torus_rocksdb_db_write_count torus_rocksdb_db_write_sum_micros torus_rocksdb_db_write_p99_micros torus_rocksdb_db_write_max_micros torus_rocksdb_write_stall_count torus_rocksdb_write_stall_sum_micros torus_rocksdb_write_stall_p99_micros torus_rocksdb_write_stall_max_micros torus_rocksdb_flush_count torus_rocksdb_flush_sum_micros torus_rocksdb_compaction_count torus_rocksdb_compaction_sum_micros"
 
 extract() { # stdin=metrics text, $1=space-separated metric names -> csv values (0 if absent)
     awk -v names="$1" 'BEGIN{n=split(names,a," "); for(i=1;i<=n;i++) want[a[i]]=1}
@@ -291,7 +291,25 @@ extract() { # stdin=metrics text, $1=space-separated metric names -> csv values 
         END{for(i=1;i<=n;i++) printf "%s%s", (i>1?",":""), (a[i] in v ? v[a[i]] : 0); printf "\n"}'
 }
 
+# bl1 exec-chain-sub-100-attribution: histogram BUCKET series in LONG format
+# (ts,node,metric,le,count), read out of the SAME scrape as the wide row above
+# (no extra HTTP). summarize.py turns these into commit-cadence p50/p95 and
+# chain / hand-off percentiles; a cell run by an older harness simply has no
+# buckets.csv and gets None for every percentile.
+BUCKET_METRICS="torus_commit_interval_seconds_bucket torus_exec_chain_seconds_bucket torus_exec_handoff_wait_seconds_bucket torus_flush_worker_seconds_bucket"
+extract_buckets() { # stdin=metrics text, $1=bucket metric names, $2=ts, $3=node
+    awk -v names="$1" -v ts="$2" -v node="$3" 'BEGIN{n=split(names,a," "); for(i=1;i<=n;i++) want[a[i]]=1}
+        {
+            b=index($1,"{"); if(b==0) next;
+            base=substr($1,1,b-1); if(!(base in want)) next;
+            if(match($1,/le="[^"]*"/)==0) next;
+            le=substr($1,RSTART+4,RLENGTH-5);
+            printf "%s,%s,%s,%s,%s\n", ts, node, base, le, $2;
+        }'
+}
+
 echo "ts,node,$(echo $WIDE_COLS | tr ' ' ',')" > "$OUT/sampler.csv"
+echo "ts,node,metric,le,count" > "$OUT/buckets.csv"
 for i in 0 1 2; do
     echo "ts,actions_processed,placed_accepted,matched,resting,rej_margin,rej_book,rej_cancelled,rej_other,self_trade_cancels,cancelled_partial_fill,blocks_committed,block_height,exec_queue_depth" > "$OUT/funnel-val$i.csv"
     echo "ts,committed,height,placed,matched,resting,exec_resting,lb_s,lb_c,root_s,root_c,sw_s,sw_c,evm_s,evm_c,fl_s,fl_c,db_s,db_c,execq,bscan,mc_hit,mc_miss,mc_evict,mc_resident" > "$OUT/phase-val$i.csv"
@@ -304,6 +322,7 @@ sampler() {
             echo "$ts,val$i,$(printf '%s' "$M" | extract "$WIDE_COLS")" >> "$OUT/sampler.csv"
             echo "$ts,$(printf '%s' "$M" | extract "$FUNNEL_COLS")" >> "$OUT/funnel-val$i.csv"
             echo "$ts,$(printf '%s' "$M" | extract "$PHASE_COLS")" >> "$OUT/phase-val$i.csv"
+            printf '%s' "$M" | extract_buckets "$BUCKET_METRICS" "$ts" "val$i" >> "$OUT/buckets.csv"
         done
         # 1 Hz cadence: the three scrapes take ~100-300 ms; keep to a 1 s grid.
         now=$(date +%s); [ "$now" = "$ts" ] && sleep 1
@@ -352,15 +371,24 @@ while [ $(( $(date +%s) - td )) -lt "$DRAIN_TIMEOUT" ]; do
     for i in 0 1 2; do
         M=$(scrape_one "${METS[$i]}") || M=""
         cur="$cur|$(printf '%s' "$M" | extract "torus_orders_placed_accepted_total torus_orders_matched_total torus_native_actions_processed_total torus_orders_resting_total")"
+        # bl1 exec-chain-sub-100-attribution: with a flush worker
+        # (TORUS_EXEC_PIPELINE) the funnel counters can go quiet while a block's
+        # state batch is still undurable on the worker. The determinism digest
+        # and the RPC state it reads must never be taken in that window, so the
+        # drain also requires an IDLE worker on every node. Identically 0 on a
+        # serial binary (and on a pre-bl1 binary, where the gauge is absent and
+        # `mval` yields 0), so this cannot change existing behaviour.
+        wd=$(printf '%s' "$M" | mval torus_flush_worker_depth); wd=${wd%%.*}
+        q=$(( q + ${wd:-0} ))
     done
     # (exec_queue_depth is NOT required to be 0: idle empty blocks keep it at 1-2)
     if [ "$cur" = "$prev" ]; then stable=$((stable+1)); else stable=0; fi
     prev="$cur"
-    [ "$stable" -ge "$QUIET_S" ] && { DRAINED=1; break; }
+    [ "$stable" -ge "$QUIET_S" ] && [ "$q" = 0 ] && { DRAINED=1; break; }
     sleep 1
 done
 T_DRAIN=$(date +%s)
-log "drained=$DRAINED after $((T_DRAIN - T_BENCH1))s"
+log "drained=$DRAINED after $((T_DRAIN - T_BENCH1))s (flush_worker_depth sum across nodes: ${q:-0})"
 sleep 2
 kill "$SAMPLER_PID" 2>/dev/null; SAMPLER_PID=""
 kill "$CPU_PID" 2>/dev/null; CPU_PID=""

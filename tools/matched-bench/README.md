@@ -141,6 +141,8 @@ settle(pass_a/pass_b/cache_flush)/post_engine_tail/engine_untimed],
 save_books, flush[root/state_write{build,db}/evm_resync], body_persist, residual;
 exec_thread_busy_fraction; wall ms per committed block), `agreement`, `cpu`,
 `cell` (env, bench cmd), `binaries`, `genesis`, `timing`, `bench_log_tail`.
+Also written: `buckets.csv` (1 Hz histogram BUCKET samples in long format
+`ts,node,metric,le,count`) — the source of the p50/p95 columns below.
 
 ## Cell-duration parity (`first120`)
 
@@ -244,3 +246,57 @@ before r3), `TORUS_BG_WRITER_LOW_PRI` (default 1), `TORUS_ROCKSDB_STATS`
 (0/1/2, default 1), `TORUS_ROCKSDB_L0_SLOWDOWN` / `TORUS_ROCKSDB_L0_STOP`
 (RocksDB 20/36 when unset), `TORUS_ROCKSDB_MAX_WRITE_BUFFERS` (4),
 `TORUS_ROCKSDB_PIPELINED_WRITE` (0), `TORUS_ROCKSDB_STATS_INTERVAL_SECS` (5).
+
+## Exec critical chain vs 100 ms (bl1 exec-chain-sub-100-attribution)
+
+`block_ms` is the exec thread's wall per native block **including the cost of
+the empty blocks in the window**, so it is not the number the campaign is
+driving to 100 ms. `phase_by_node.<val>` now also carries the chain itself:
+
+- `chain_ms` — the SERIAL CRITICAL CHAIN on the exec thread (E) per NATIVE
+  block. `torus_exec_chain_seconds` is observed once per native block on the
+  same clock `exec_block_seconds` uses, so on a serial binary
+  `chain_ms + empty_block_ms == block_ms` exactly.
+- `empty_block_ms` — the exec-thread cost of the window's empty blocks,
+  expressed per native block (`block_ms - chain_ms`).
+- `pipelined_ms` — wall a flush worker (W) spent per native block.
+  **0.0** when the binary has no worker (the `torus_flush_worker_seconds`
+  series exists but was never observed); `worker_present` says which.
+- `handoff_wait_ms` — time E spent blocked handing a job to W. 0.0 on a serial
+  binary, where the series still exists with `_count == chain _count` — that
+  is how "zero wait" is told apart from "series absent".
+- `gap_to_100ms` = `chain_ms - 100`.
+- `fills_per_native_block` and `engine_ms_per_1k_fills` — **mandatory next to
+  any chain number.** Engine ms scales with fills, so a thinner block reads as
+  a chain win unless the denominator is on the same line.
+- `native_blk_s` / `empty_blk_s` — the cadence split (native vs empty blocks
+  per second), from `exec_block_seconds_count` vs `exec_engine_seconds_count`
+  and the `torus_exec_native_blocks_total` counter.
+- `commit_interval_ms_p50` / `_p95`, `chain_ms_p50` / `_p95`,
+  `handoff_wait_ms_p95`, `pipelined_ms_p95` — from the histogram buckets in
+  `buckets.csv` (the existing `commit_interval_ms_avg` hides the tail).
+- `phases.save_books.save_books_drain_ms` / `save_books_write_ms` — production
+  timers around pass 1 (journal DRAIN + level digests; reads the LIVE book
+  levels the next block's engine mutates, so it can never leave the exec
+  thread) and pass 2 (overlay WRITES; the only half a flush worker could take).
+  Both 0.0 in book modes 0/1, which have no two-pass save.
+- `chain_identity` — the ruler's own per-node-cell gate: `chain_covers_e_phases`
+  (the chain must cover every phase still on E — including `flush` when
+  `worker_present` is false) and `chain_le_block`.
+
+**Every one of these reads `null`, never 0.0, on a pre-bl1 node binary** — a
+0 ms chain would read as the campaign's goal reached instead of a stale
+binary. That is itself the "your node build is old" tell.
+
+The drain step additionally waits for `torus_flush_worker_depth == 0` on all
+three nodes before the state digest, so the determinism digest is never taken
+while a block's state batch is still undurable on a worker. Identically true
+on a serial (and on a pre-bl1) binary, so it changes no existing cell.
+
+Metric names: `torus_exec_chain_seconds`, `torus_exec_handoff_wait_seconds`,
+`torus_flush_worker_seconds`, `torus_flush_worker_depth`,
+`torus_exec_save_books_drain_seconds`, `torus_exec_save_books_write_seconds`,
+`torus_exec_native_blocks_total`.
+
+Fixture test: `python3 tools/matched-bench/test_summarize.py` covers a SERIAL
+and a PIPELINED binary shape plus the pre-r6 and pre-bl1 fallbacks.
