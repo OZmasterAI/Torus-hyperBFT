@@ -324,6 +324,49 @@ pub struct Metrics {
     /// covers the body JSON encode). Split so a wait behind another thread's
     /// write group shows as put-time, not encode-time.
     pub exec_body_persist_write_seconds: Histogram,
+
+    // ---------------------------------------------------------------------
+    // bl1 exec-chain-sub-100-attribution — the RULER. These six series make
+    // the exec critical chain readable against the 100 ms target and tell a
+    // serial binary apart from a pipelined one (`TORUS_EXEC_PIPELINE`).
+    // ---------------------------------------------------------------------
+    /// The SERIAL CRITICAL CHAIN on the exec thread (E) per NATIVE block — the
+    /// number this campaign drives toward 100 ms. Observed once per native
+    /// block on the SAME wall clock as `exec_block_seconds`, so on a serial
+    /// binary `_sum` is exactly the native-block share of
+    /// `exec_block_seconds_sum` (the remainder is empty blocks) and
+    /// `_count == exec_engine_seconds_count`. When a flush worker exists the
+    /// stages it owns are no longer inside this window: `flush_worker_seconds`
+    /// carries them and `exec_handoff_wait_seconds` carries what E still pays.
+    pub exec_chain_seconds: Histogram,
+    /// Time E spent BLOCKED handing a job to the flush worker (rendezvous
+    /// back-pressure = the worker, not E, is the wall). Observed once per
+    /// native block; identically 0 on a serial binary, where the series still
+    /// EXISTS (`_count == exec_chain_seconds_count`, `_sum == 0`) so the
+    /// summarizer can tell "zero wait" from "series absent / stale binary".
+    pub exec_handoff_wait_seconds: Histogram,
+    /// Wall time the flush worker (W) spent on one block's job. NEVER observed
+    /// on a serial binary (`_count == 0`) — that is how summarize.py decides
+    /// whether the phases it sees ran on E or on W.
+    pub flush_worker_seconds: Histogram,
+    /// Jobs handed to the flush worker and not yet durable. Stays 0 on a
+    /// serial binary; the bench harness waits for 0 on every node before
+    /// taking the 3-validator determinism digest.
+    pub flush_worker_depth: Gauge,
+    /// `save_order_books` pass 1 — the journal DRAIN (+ level digests). Reads
+    /// the LIVE book levels the next block's engine mutates, so it can never
+    /// leave the exec thread. Observed once per native block; 0 in book modes
+    /// 0/1, which never run the two-pass save.
+    pub exec_save_books_drain_seconds: Histogram,
+    /// `save_order_books` pass 2 — the overlay WRITES (order rows, level rows,
+    /// stop diff, meta). Touches only the overlay: the only half of save_books
+    /// a flush worker could take. drain + write == `exec_save_books_seconds`
+    /// to rounding.
+    pub exec_save_books_write_seconds: Histogram,
+    /// Native (loaded) blocks executed. Empty blocks in a window =
+    /// `exec_block_seconds_count - exec_native_blocks_total`, which splits
+    /// blk/s into native vs empty cadence.
+    pub exec_native_blocks: Counter,
     /// r3: DB-wide RocksDB runtime state + statistics (unlabelled, sampled every
     /// few seconds; the per-CF labelled families above stay for the deep dive).
     pub rocksdb: RocksdbStatMetrics,
@@ -1328,6 +1371,58 @@ impl Metrics {
             exec_body_persist_write_seconds.clone(),
         );
 
+        // bl1 exec-chain ruler. Bucket layouts: the chain spans 50 ms – 5 s
+        // (0.001 * 2^k reaches 8.192 s), the hand-off wait 1 – 500 ms (finer
+        // low end, 0.0005 * 2^k reaches 4.096 s).
+        let exec_chain_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
+        registry.register(
+            "torus_exec_chain_seconds",
+            "Exec CRITICAL CHAIN: serial wall time on the exec thread per NATIVE block (the ms this campaign drives to 100)",
+            exec_chain_seconds.clone(),
+        );
+
+        let exec_handoff_wait_seconds = Histogram::new(exponential_buckets(0.0005, 2.0, 14));
+        registry.register(
+            "torus_exec_handoff_wait_seconds",
+            "Exec chain: time the exec thread blocked handing a flush job to the worker (0 on a serial binary)",
+            exec_handoff_wait_seconds.clone(),
+        );
+
+        let flush_worker_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
+        registry.register(
+            "torus_flush_worker_seconds",
+            "Flush worker: wall time per block job off the exec chain (never observed on a serial binary)",
+            flush_worker_seconds.clone(),
+        );
+
+        let flush_worker_depth = Gauge::default();
+        registry.register(
+            "torus_flush_worker_depth",
+            "Flush jobs handed to the worker and not yet durable (0 on a serial binary; the harness drains on it)",
+            flush_worker_depth.clone(),
+        );
+
+        let exec_save_books_drain_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
+        registry.register(
+            "torus_exec_save_books_drain_seconds",
+            "save_books pass 1: journal drain + level digests (reads live book levels — cannot leave the exec thread)",
+            exec_save_books_drain_seconds.clone(),
+        );
+
+        let exec_save_books_write_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
+        registry.register(
+            "torus_exec_save_books_write_seconds",
+            "save_books pass 2: overlay writes (rows, levels, stop diff, meta) — the half a flush worker could take",
+            exec_save_books_write_seconds.clone(),
+        );
+
+        let exec_native_blocks = Counter::default();
+        registry.register(
+            "torus_exec_native_blocks",
+            "Native (loaded) blocks executed; exec_block_seconds_count minus this = empty blocks",
+            exec_native_blocks.clone(),
+        );
+
         let rocksdb = RocksdbStatMetrics::register(&mut registry);
 
         let exec_level_hash_cache_hits = Gauge::default();
@@ -1661,6 +1756,13 @@ impl Metrics {
             trade_writer_queued_batches,
             post_flush_writer_queued_batches,
             exec_body_persist_write_seconds,
+            exec_chain_seconds,
+            exec_handoff_wait_seconds,
+            flush_worker_seconds,
+            flush_worker_depth,
+            exec_save_books_drain_seconds,
+            exec_save_books_write_seconds,
+            exec_native_blocks,
             rocksdb,
             exec_level_hash_cache_hits,
             exec_level_hash_cache_misses,
@@ -1832,6 +1934,39 @@ mod tests {
         ] {
             assert!(text.contains(name), "{name} not registered:\n{text}");
         }
+    }
+
+    /// bl1 exec-chain-sub-100-attribution: the ruler series that make the gap
+    /// between today's ~1.2 s exec chain and the 100 ms target readable, and
+    /// that let a pipelined binary be told apart from a serial one. All are
+    /// registered (present in `encode()` with zero observations) so
+    /// summarize.py can distinguish "absent series" from "zero value".
+    #[test]
+    fn exec_chain_ruler_metrics_register() {
+        let m = Metrics::new();
+        let text = m.encode();
+        for name in [
+            "torus_exec_chain_seconds",
+            "torus_exec_handoff_wait_seconds",
+            "torus_flush_worker_seconds",
+            "torus_flush_worker_depth",
+            "torus_exec_save_books_drain_seconds",
+            "torus_exec_save_books_write_seconds",
+            "torus_exec_native_blocks",
+        ] {
+            assert!(text.contains(name), "{name} not registered:\n{text}");
+        }
+        // A serial binary must present the worker series as EMPTY (count 0) and
+        // the depth gauge as 0 — that pair is how the harness drain and the
+        // summarizer recognise "no flush worker on this binary".
+        assert!(
+            text.contains("torus_flush_worker_seconds_count 0"),
+            "flush_worker_seconds must start empty:\n{text}",
+        );
+        assert!(
+            text.contains("torus_flush_worker_depth 0"),
+            "flush_worker_depth must start at 0:\n{text}",
+        );
     }
 
     /// r6 engine-untimed-attribution: the six sub-timers that decompose the
