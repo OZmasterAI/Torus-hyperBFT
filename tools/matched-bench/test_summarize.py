@@ -20,6 +20,11 @@ counters are chosen so every derived number is exact, and asserts:
     series is absent, the hand-off wait is identically 0) and PIPELINED (a
     worker series exists, flush is OFF the chain, the hand-off wait is real) —
     and that the identity block tells the two apart instead of mixing them;
+  * bl3 worker-aware phase accounting: when a flush WORKER is present the flush
+    ms belong to W, not to the exec thread's block wall, so flush is reported as
+    an OFF-CHAIN line and left OUT of the per-block phase sum — otherwise
+    residual_untimed goes NEGATIVE (-212 ms on bl2 on-10m-r2) and the phase
+    percentages sum past 100 %;
   * a PRE-r6 sampler.csv (columns absent) still summarizes, with the new
     sub-timers reported as 0.0 rather than crashing;
   * a PRE-bl1 sampler.csv (no chain series at all) reports every ruler column
@@ -204,6 +209,42 @@ def close(a, b, what):
     assert a is not None and abs(a - b) < 0.05, "%s: got %r, want %r" % (what, a, b)
 
 
+def check_phase_accounting(p0, worker):
+    """bl3: the per-block phase table must ACCOUNT for the block wall, whichever
+    thread ran flush.
+
+    `block_ms` is the exec thread's own timer. With a worker attached, flush is
+    observed on W and is NOT part of that wall, so summing it into the per-block
+    breakdown drives residual_untimed negative and the percentages past 100 %.
+    """
+    ph = p0["phases"]
+    fl = ph["flush"]
+    assert fl["off_chain"] is worker, (
+        "flush.off_chain must mirror worker_present (worker=%r): %r" % (worker, fl)
+    )
+    # The flush ms themselves are unchanged either way — only where they are
+    # counted moves.
+    close(fl["ms"], 200.0, "flush ms/blk (worker=%r)" % worker)
+    close(fl["state_write_ms"], 70.0, "state_write ms (worker=%r)" % worker)
+
+    on_chain = [k for k, v in ph.items() if k != "residual_untimed" and not v.get("off_chain")]
+    assert ("flush" in on_chain) is not worker, "on-chain set: %r" % on_chain
+    acc = sum(ph[k]["ms"] for k in on_chain)
+    res = ph["residual_untimed"]["ms"]
+    close(acc + res, p0["block_ms"], "phases + residual == block_ms (worker=%r)" % worker)
+    assert res >= 0.0, "residual_untimed must never be negative: %r" % res
+
+    pcts = [ph[k]["pct_of_block"] for k in on_chain] + [ph["residual_untimed"]["pct_of_block"]]
+    assert all(x is not None for x in pcts), "on-chain phases must keep pct_of_block"
+    assert sum(pcts) <= 100.5, "phase pct sum must not exceed 100 %%: %r" % sum(pcts)
+    if worker:
+        assert fl["pct_of_block"] is None, (
+            "an off-chain phase has no share of the exec block wall: %r" % fl
+        )
+        # ...but its share of WALL time is still meaningful (that is W's load).
+        assert fl["pct_of_wall"] is not None
+
+
 def check_common_ruler(p0, s):
     """bl1 ruler columns that do NOT depend on which binary produced the cell."""
     # save_books pass split: both halves present, and they cannot exceed the
@@ -312,6 +353,10 @@ def main():
         # the chain must cover. Losing that would let a pipelined binary be
         # scored as serial (or vice versa) with nothing failing.
         assert "flush" in ci["e_phases"], "serial: flush must be on the chain: %r" % ci
+        # Serial: flush IS exec-thread work, so it stays inside the per-block
+        # accounting and the residual keeps its pre-bl3 value exactly.
+        check_phase_accounting(p0, worker=False)
+        close(p0["phases"]["residual_untimed"]["ms"], 75.0, "residual (serial)")
         close(ci["e_phase_sum_ms"], 1010.0, "e_phase_sum_ms (serial)")
         assert ci["chain_covers_e_phases"], "serial: chain must cover E phases: %r" % ci
         assert ci["chain_le_block"], "serial: chain must not exceed block: %r" % ci
@@ -342,6 +387,10 @@ def main():
             "pipelined: chain must still cover what stayed on E: %r" % ci
         )
         assert ci["chain_le_block"], "pipelined: chain must not exceed block: %r" % ci
+        # bl3: flush ran on W, so the per-block table must not spend it twice.
+        # 870 block - 825 on-chain phases = 45 ms genuinely untimed on E.
+        check_phase_accounting(p0, worker=True)
+        close(p0["phases"]["residual_untimed"]["ms"], 45.0, "residual (pipelined)")
         # The design's acceptance for a pipelined binary: the chain is at least
         # engine + verify (the two stages that can never be pipelined).
         eng_ms = p0["phases"]["engine"]["ms"]

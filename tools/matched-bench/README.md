@@ -9,6 +9,16 @@ writes a machine-readable `summary.json`.
 tools/matched-bench/run-cell.sh <worktree> <label> [MARKETS=10] [DUR=120] [RATE=76000] [EXTRA_ENV='K=V ...']
 ```
 
+The devnet is launched from `<worktree>/devnet/wsl` and, since bl4, the cell is
+also SCORED by `<worktree>/tools/matched-bench/summarize.py` — whichever copy of
+`run-cell.sh` you invoked. Before that, a harness candidate handed to the
+integration repo's runner was silently scored with the integration repo's
+summarizer, so its whole change was a no-op (bl3 10m-r1). `TOOLS_FROM_WORKTREE=0`
+restores the old behaviour, `TOOLS_DIR=<dir>` pins it, and
+`RUN_CELL_PRINT_PATHS=1` prints the resolution and exits without touching the
+devnet. `resummarize.sh <cell-dir>` re-scores an existing cell in place from its
+own `summary.json` provenance.
+
 Example (record-cell shape, 5 min, 10 markets):
 
 ```
@@ -115,6 +125,7 @@ python3 tools/matched-bench/test_harness.py
    |---|---|---|
    | `AGREE` | spread<=5, hashes equal, counters equal, **digests equal**, no panic/fail-stop | `true` |
    | `DIGEST_UNVERIFIED` | all of the above except the digest, AND the digest window was not quiescent (counters moved) or the cell never drained | `null` |
+   | `DIGEST_UNVERIFIED` | hash + header root + digest all equal, matched/placed/resting equal, and ONLY `native_actions` apart with the digests taken <= 2 blocks apart | `null` |
    | `DISAGREE` | anything else — hash/counter/height divergence, panic, or unequal digests taken over a pinned state | `false` |
    | `INCOMPLETE` | fewer than 3 node rows | `false` |
 
@@ -122,9 +133,23 @@ python3 tools/matched-bench/test_harness.py
    r6-base-300m-r1 shape (equal block hash + equal counters, digests sampled
    minutes apart while the chain still moved): a harness artifact, so it is NOT
    `false`, but it is NOT proof of determinism either — such a cell must be
-   re-run before any determinism claim. `agreement` also carries
-   `state_digest_quiescent`, `state_digest_seconds_per_node` and
-   `state_digest_heights`; `timing` carries `drained` + `drain_timeout_s`.
+   re-run before any determinism claim. The second `DIGEST_UNVERIFIED` row is
+   the same idea one counter down: `metrics-after-valN.txt` is ONE scrape per
+   node while the three digests are taken concurrently, so digests landing a
+   block or two apart move `torus_native_actions_processed_total` alone. A
+   settled-state counter apart (`matched`/`placed`/`resting`), or an action
+   counter apart with the digest heights further than 2 blocks, is still
+   `DISAGREE`. `agreement` also carries `state_digest_quiescent`,
+   `state_digest_seconds_per_node`, `state_digest_heights`,
+   `digest_height_spread` and `action_counter_skew_only`; `timing` carries
+   `drained` + `drain_timeout_s`.
+
+   **Crash cells** (`CRASH_KILL_AT_S`, below) score the counters over the
+   SURVIVORS only: Prometheus counters are process-lifetime, so the SIGKILLed
+   node restarts them at zero and can never match. `counters_equal` is the
+   survivors, `counters_equal_all_nodes` / `counters_excluded_node` /
+   `counters_compared_nodes` record exactly what was compared. The killed
+   node's *state* is not excused — see the crash gate.
 10. `stop-3val.sh`; node logs gzipped into the result dir + an excerpt.
 11. `summarize.py` -> `summary.json` (+ `analysis-valN.txt` from the awk scripts).
 
@@ -300,3 +325,88 @@ Metric names: `torus_exec_chain_seconds`, `torus_exec_handoff_wait_seconds`,
 
 Fixture test: `python3 tools/matched-bench/test_summarize.py` covers a SERIAL
 and a PIPELINED binary shape plus the pre-r6 and pre-bl1 fallbacks.
+
+## Worker-aware phase accounting (bl3)
+
+`block_ms` and every `phases.<k>.ms` come from timers on the **exec thread**.
+With `TORUS_EXEC_PIPELINE=1` the flush stage is observed on the **flush worker
+(W)** instead, so its ms are wall time on another thread and are NOT part of
+that block wall. summarize.py therefore reports flush as an **off-chain** line
+when `worker_present`:
+
+- `phases.flush.off_chain = true`, `pct_of_block = null` (it has no share of the
+  exec block), `pct_of_wall` kept (that is W's load), `ms` unchanged;
+- flush is excluded from the per-block sum, so `residual_untimed` is the exec
+  thread's genuinely untimed remainder and the percentages close at 100 %;
+- `phase_by_node.<val>.off_chain_phases` and `chain_identity.off_chain_phases`
+  name what moved.
+
+Before this, a pipelined cell reported `residual_untimed = -212 ms` and phase
+percentages summing to 134 % (bl2 `on-10m-r2`). Re-running the four bl2 cells
+through the new summarizer moves ONLY that number:
+`on-10m-r2` −212.02 → +42.35, `on-10m-r3` −201.06 → +36.82, both OFF cells
+byte-identical (+35.54 / +32.23); `block_ms`, `chain_ms`, `pipelined_ms`,
+`chain_identity` and every matched/s figure are unchanged.
+
+## Crash gate (bl3) — `CRASH_KILL_AT_S`
+
+The gate that has to pass before `TORUS_EXEC_PIPELINE` can default to ON. With
+the flush worker attached, block N's state batch **and** its applied-height
+marker are written by W while E is already executing N+1; the marker is the
+crash fence, so a `kill -9` must rewind no further than the work that was
+committed-but-unexecuted anyway (+ the depth-1 hand-off), and the restarted node
+must still converge byte-identically with the two survivors.
+
+```
+CRASH_KILL_AT_S=50 KILL_NODE=val1 \
+  tools/matched-bench/run-cell.sh /home/18c/projects/wt/matched-bench \
+  bl3-crash-on-r1 10 120 76000 'TORUS_EXEC_PIPELINE=1'
+```
+
+- `CRASH_KILL_AT_S=N` — SIGKILL the target N s into the bench window, then
+  restart it from the **same data dir** with the **same argv**
+  (`devnet/wsl/start-node.sh` is the single implementation, shared with
+  `launch-3val.sh`), appending to the same log. Must sit inside the load window
+  (`>= 10` and `<= DUR-30`): a kill during the drain hangs the agreement probe.
+  40-60 on a 120 s cell.
+- `KILL_NODE` — `val1` (default) or `val2`. **Never val0**: it serves the bench
+  RPC and every headline/phase number.
+
+Safety: `crash-kill.sh` refuses to signal anything that is not this devnet's
+val1/val2 — the pid must be listed in the devnet's own `pids` file, its
+`/proc` cmdline must carry `--data-dir=$DATA_ROOT/data/val<idx>`, and any
+testnet-shaped marker (`/testnet/data`, `.cargo-target/release/torus-node`,
+`--keystore`, `:8555`, `:9090`, `:30333`) or a pid in `$TORUS_PROTECTED_PIDS`
+is an immediate refusal. The live validator's real cmdline is a test fixture in
+`test_harness.py`. The restarted pid REPLACES its line in the pids file, so
+`stop-3val.sh` still stops the whole devnet (an orphan node would hold 8646 and
+break every later cell).
+
+`summary.json` gains a `crash` section and `headline.crash_gate`
+(`PASS` / `FAIL`, `null` on a cell that did not run the gate):
+
+- `rewind_blocks` — `committed - applied` from the node's own replay line
+  (`crash recovery: execution gap detected, replaying committed_height=… applied_height=… gap=…`);
+  `applied_height` IS the durable marker at the instant of the kill.
+- `exec_queue_depth_at_kill` — committed-but-unexecuted blocks already queued
+  on E when it died (that part of the rewind is inherent, pipeline or not).
+- `rewind_beyond_exec_queue` = the two subtracted — **what the pipeline cost.
+  Must be <= 2** (depth-1 hand-off + the in-flight batch).
+- `pipeline_flag_confirmed` — the restarted node logged
+  `bl2 exec pipeline ENABLED`. Required when the cell env has
+  `TORUS_EXEC_PIPELINE=1`, otherwise the gate crash-tested the serial path and
+  proves nothing about the flag it is meant to unblock.
+- `fail_reasons` — why a FAIL failed. A panic/fail-stop line, an unhealed
+  execution hole, or a node that never came back also fails the gate.
+
+**How the killed node is judged.** Its Prometheus counters reset on restart, so
+they are excluded from the comparison (`counters_excluded_node`) — and nothing
+else is. The gate checks by name, across ALL THREE nodes including the killed
+one: `block_hash_equal`, `header_state_root_equal`, `state_digest_equal`, a
+quiescent digest, zero panic/fail-stop lines fleet-wide, and survivor counters
+that still match each other. A forked killed node therefore still FAILs, and
+the gate keeps its teeth independently of `agreement_verdict`.
+
+Artifacts: `crash-kill.json` (record at kill time), `crash-restart-tail.log`
+(everything the node logged after the restart), `crash.json` (the merged input
+to summarize.py).

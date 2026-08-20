@@ -440,6 +440,33 @@ the r9 `waloff` crash test replayed 11 blocks in ~7 s, so this is small.
 - Depth bound: with W parked inside write(N−1), the **first** hand-off (N) blocks; `flush_worker_depth`
   never exceeds 1.
 
+### 5.1 How the live `kill -9` gate is scored (bl4)
+
+The in-process tests above cannot observe a real SIGKILL, so `CRASH_KILL_AT_S`
+(`tools/matched-bench/crash-kill.sh`) kills val1 mid-load and restarts it from the same data dir.
+Scoring it needs one distinction that cost a whole cell (`bl3-…-crash-on-r1`: gate FAIL on
+completely correct node behaviour):
+
+| evidence | killed node | survivors |
+|---|---|---|
+| block hash @ common height | **must match** | must match |
+| header state root | **must match** | must match |
+| state digest (full account/book scan) | **must match** | must match |
+| quiescent digest window + `drained` | required | required |
+| panic / fail-stop / unhealed hole lines | 0 | 0 |
+| `rewind_beyond_exec_queue` ≤ 2 | required | n/a |
+| Prometheus funnel counters (`torus_orders_matched_total`, …) | **excluded** | must match each other |
+
+Prometheus counters are process-lifetime: a SIGKILLed node restarts them at 0, so requiring
+`counters_equal` over all three made the gate unpassable regardless of behaviour. Only the counters
+are excused, and only for the node that was killed (`agreement.counters_excluded_node`); its *state*
+is judged exactly as hard as everyone else's, so a forked killed node still FAILs.
+
+Separately: `metrics-after-valN.txt` is one scrape per node while the three state digests are taken
+concurrently, so digests landing 1–2 blocks apart move `torus_native_actions_processed_total` alone.
+With hash, header root and digest all equal and every settled-state counter equal, that is
+`DIGEST_UNVERIFIED` (re-run before claiming determinism), not `DISAGREE`.
+
 ---
 
 ## 6. Ordered candidates
