@@ -9,6 +9,16 @@ writes a machine-readable `summary.json`.
 tools/matched-bench/run-cell.sh <worktree> <label> [MARKETS=10] [DUR=120] [RATE=76000] [EXTRA_ENV='K=V ...']
 ```
 
+The devnet is launched from `<worktree>/devnet/wsl` and, since bl4, the cell is
+also SCORED by `<worktree>/tools/matched-bench/summarize.py` — whichever copy of
+`run-cell.sh` you invoked. Before that, a harness candidate handed to the
+integration repo's runner was silently scored with the integration repo's
+summarizer, so its whole change was a no-op (bl3 10m-r1). `TOOLS_FROM_WORKTREE=0`
+restores the old behaviour, `TOOLS_DIR=<dir>` pins it, and
+`RUN_CELL_PRINT_PATHS=1` prints the resolution and exits without touching the
+devnet. `resummarize.sh <cell-dir>` re-scores an existing cell in place from its
+own `summary.json` provenance.
+
 Example (record-cell shape, 5 min, 10 markets):
 
 ```
@@ -115,6 +125,7 @@ python3 tools/matched-bench/test_harness.py
    |---|---|---|
    | `AGREE` | spread<=5, hashes equal, counters equal, **digests equal**, no panic/fail-stop | `true` |
    | `DIGEST_UNVERIFIED` | all of the above except the digest, AND the digest window was not quiescent (counters moved) or the cell never drained | `null` |
+   | `DIGEST_UNVERIFIED` | hash + header root + digest all equal, matched/placed/resting equal, and ONLY `native_actions` apart with the digests taken <= 2 blocks apart | `null` |
    | `DISAGREE` | anything else — hash/counter/height divergence, panic, or unequal digests taken over a pinned state | `false` |
    | `INCOMPLETE` | fewer than 3 node rows | `false` |
 
@@ -122,9 +133,23 @@ python3 tools/matched-bench/test_harness.py
    r6-base-300m-r1 shape (equal block hash + equal counters, digests sampled
    minutes apart while the chain still moved): a harness artifact, so it is NOT
    `false`, but it is NOT proof of determinism either — such a cell must be
-   re-run before any determinism claim. `agreement` also carries
-   `state_digest_quiescent`, `state_digest_seconds_per_node` and
-   `state_digest_heights`; `timing` carries `drained` + `drain_timeout_s`.
+   re-run before any determinism claim. The second `DIGEST_UNVERIFIED` row is
+   the same idea one counter down: `metrics-after-valN.txt` is ONE scrape per
+   node while the three digests are taken concurrently, so digests landing a
+   block or two apart move `torus_native_actions_processed_total` alone. A
+   settled-state counter apart (`matched`/`placed`/`resting`), or an action
+   counter apart with the digest heights further than 2 blocks, is still
+   `DISAGREE`. `agreement` also carries `state_digest_quiescent`,
+   `state_digest_seconds_per_node`, `state_digest_heights`,
+   `digest_height_spread` and `action_counter_skew_only`; `timing` carries
+   `drained` + `drain_timeout_s`.
+
+   **Crash cells** (`CRASH_KILL_AT_S`, below) score the counters over the
+   SURVIVORS only: Prometheus counters are process-lifetime, so the SIGKILLed
+   node restarts them at zero and can never match. `counters_equal` is the
+   survivors, `counters_equal_all_nodes` / `counters_excluded_node` /
+   `counters_compared_nodes` record exactly what was compared. The killed
+   node's *state* is not excused — see the crash gate.
 10. `stop-3val.sh`; node logs gzipped into the result dir + an excerpt.
 11. `summarize.py` -> `summary.json` (+ `analysis-valN.txt` from the awk scripts).
 
@@ -372,8 +397,15 @@ break every later cell).
   `TORUS_EXEC_PIPELINE=1`, otherwise the gate crash-tested the serial path and
   proves nothing about the flag it is meant to unblock.
 - `fail_reasons` — why a FAIL failed. A panic/fail-stop line, an unhealed
-  execution hole, a node that never came back, or anything other than a
-  3-node `AGREE` also fails the gate.
+  execution hole, or a node that never came back also fails the gate.
+
+**How the killed node is judged.** Its Prometheus counters reset on restart, so
+they are excluded from the comparison (`counters_excluded_node`) — and nothing
+else is. The gate checks by name, across ALL THREE nodes including the killed
+one: `block_hash_equal`, `header_state_root_equal`, `state_digest_equal`, a
+quiescent digest, zero panic/fail-stop lines fleet-wide, and survivor counters
+that still match each other. A forked killed node therefore still FAILs, and
+the gate keeps its teeth independently of `agreement_verdict`.
 
 Artifacts: `crash-kill.json` (record at kill time), `crash-restart-tail.log`
 (everything the node logged after the restart), `crash.json` (the merged input

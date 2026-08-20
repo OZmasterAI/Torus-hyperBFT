@@ -38,6 +38,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DIGEST_SH = os.path.join(HERE, "digest-node.sh")
 CRASH_KILL_SH = os.path.join(HERE, "crash-kill.sh")
 SUMMARIZE = os.path.join(HERE, "summarize.py")
+RUN_CELL_SH = os.path.join(HERE, "run-cell.sh")
 
 
 def jq_compact(obj):
@@ -567,6 +568,55 @@ class CrashKillGuardTest(unittest.TestCase):
             'nohup "$BIN"', launch, "launch-3val.sh must not keep its own copy"
         )
         self.assertIn("start-node.sh", crash, "crash-kill.sh must use it")
+
+
+# --------------------------------------------- run-cell.sh: which tools score
+class ToolsDirResolutionTest(unittest.TestCase):
+    """A candidate is scored by ITS OWN summarize.py. run-cell.sh lives in the
+    integration repo but is handed a candidate worktree; resolving the scoring
+    scripts next to the SCRIPT silently scored bl3 with the head's summarizer."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp(prefix="tools-dir-")
+        self.addCleanup(shutil.rmtree, self.d, ignore_errors=True)
+
+    def make_wt(self, with_tools=True):
+        wt = os.path.join(self.d, "wt")
+        os.makedirs(os.path.join(wt, "devnet", "wsl"), exist_ok=True)
+        if with_tools:
+            t = os.path.join(wt, "tools", "matched-bench")
+            os.makedirs(t, exist_ok=True)
+            for f in ("summarize.py", "digest-node.sh", "crash-kill.sh",
+                      "win60.awk", "phase60.awk"):
+                open(os.path.join(t, f), "w").close()
+        return wt
+
+    def paths(self, wt, env=None):
+        r = subprocess.run(
+            ["bash", RUN_CELL_SH, wt, "probe-label"],
+            capture_output=True, text=True, timeout=30,
+            env=dict(os.environ, RUN_CELL_PRINT_PATHS="1", **(env or {})),
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return dict(
+            line.split("=", 1) for line in r.stdout.split() if "=" in line
+        )
+
+    def test_scoring_scripts_come_from_the_worktree_under_test(self):
+        wt = self.make_wt()
+        self.assertEqual(self.paths(wt)["TOOLS_DIR"],
+                         os.path.join(wt, "tools", "matched-bench"))
+
+    def test_falls_back_to_its_own_dir_when_the_worktree_has_no_tools(self):
+        wt = self.make_wt(with_tools=False)
+        p = self.paths(wt)
+        self.assertEqual(p["TOOLS_DIR"], HERE)
+        self.assertEqual(p["TOOLS_FROM_WORKTREE"], "0")
+
+    def test_the_fallback_can_be_forced(self):
+        wt = self.make_wt()
+        p = self.paths(wt, env={"TOOLS_FROM_WORKTREE": "0"})
+        self.assertEqual(p["TOOLS_DIR"], HERE)
 
 
 # ------------------------------------------- summarize.py: the crash-gate verdict

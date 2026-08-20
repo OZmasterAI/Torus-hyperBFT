@@ -60,9 +60,15 @@
 #                NEVER val0 (it serves the bench RPC and every headline number),
 #                and never anything outside this devnet — see the guard in
 #                crash-kill.sh.
+#   TOOLS_FROM_WORKTREE  1 (default) scores the cell with <worktree>/tools/
+#                matched-bench/summarize.py, i.e. the CANDIDATE's own summarizer,
+#                whichever copy of run-cell.sh was invoked. 0 keeps the old
+#                behaviour (this script's own directory). TOOLS_DIR=<dir> pins it
+#                explicitly. RUN_CELL_PRINT_PATHS=1 prints the resolution and
+#                exits without touching the devnet.
 set -uo pipefail
 
-usage() { sed -n '2,62p' "$0"; exit 2; }
+usage() { sed -n '2,69p' "$0"; exit 2; }
 [ $# -ge 2 ] || usage
 
 WT=$(cd "$1" && pwd) || { echo "FATAL: worktree '$1' not found" >&2; exit 2; }
@@ -72,8 +78,29 @@ DUR=${4:-120}
 RATE=${5:-76000}
 EXTRA_ENV=${6:-}
 
-TOOLS_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-MAINREPO=$(cd "$TOOLS_DIR/../.." && pwd)
+SELF_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+MAINREPO=$(cd "$SELF_DIR/../.." && pwd)
+# A CANDIDATE is scored by ITS OWN summarizer. This script is invoked from the
+# integration repo but handed a candidate worktree, so resolving the scoring
+# scripts next to the SCRIPT scores a harness candidate with the head's
+# summarize.py -- which is how a summarize.py fix can read as a no-op.
+# TOOLS_FROM_WORKTREE=0 forces the old behaviour (score every cell with the
+# integration repo's tools); an explicit TOOLS_DIR= wins over both.
+TOOLS_FROM_WORKTREE=${TOOLS_FROM_WORKTREE:-1}
+if [ -n "${TOOLS_DIR:-}" ]; then
+    TOOLS_DIR=$(cd "$TOOLS_DIR" && pwd) || { echo "FATAL: TOOLS_DIR not found" >&2; exit 2; }
+    TOOLS_FROM_WORKTREE=explicit
+elif [ "$TOOLS_FROM_WORKTREE" = 1 ] && [ -f "$WT/tools/matched-bench/summarize.py" ]; then
+    TOOLS_DIR="$WT/tools/matched-bench"
+else
+    [ "$TOOLS_FROM_WORKTREE" = 1 ] && TOOLS_FROM_WORKTREE=0
+    TOOLS_DIR="$SELF_DIR"
+fi
+if [ -n "${RUN_CELL_PRINT_PATHS:-}" ]; then
+    printf 'WT=%s\nSELF_DIR=%s\nTOOLS_DIR=%s\nTOOLS_FROM_WORKTREE=%s\nMAINREPO=%s\n' \
+        "$WT" "$SELF_DIR" "$TOOLS_DIR" "$TOOLS_FROM_WORKTREE" "$MAINREPO"
+    exit 0
+fi
 TARGET_DIR=${TARGET_DIR:-/home/18c/.cargo-target-matched}
 RESULTS_ROOT=${RESULTS_ROOT:-/home/18c/bench-results-matched}
 export DATA_ROOT=${DATA_ROOT:-$HOME/torus-wsl-devnet}
