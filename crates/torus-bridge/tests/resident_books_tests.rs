@@ -626,11 +626,9 @@ fn make_ctx_mode(
 /// 2 and 4. `resident`: the holder is kept across all five blocks and
 /// advanced across the empty ones (as the pipeline does after the marker
 /// write); otherwise every native block reloads from the DB.
-fn run_script_with_gaps(
-    db: StateDb,
-    mode: BookMode,
-    resident: bool,
-) -> (Vec<(Vec<u8>, Vec<u8>)>, Vec<(Vec<u8>, Vec<u8>)>, alloy_primitives::B256, Vec<usize>) {
+type GapRun = (Vec<(Vec<u8>, Vec<u8>)>, Vec<(Vec<u8>, Vec<u8>)>, alloy_primitives::B256, Vec<usize>);
+
+fn run_script_with_gaps(db: StateDb, mode: BookMode, resident: bool) -> GapRun {
     let mut holder = ResidentBooks::default();
     let batches = script_batches(1);
     let mut writes = Vec::new();
