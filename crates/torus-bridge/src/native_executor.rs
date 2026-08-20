@@ -1282,6 +1282,33 @@ pub struct NativeExecContext<T: StateBackend = StateDb> {
     /// state root. The caller (`app.rs`) observes them once per block and
     /// derives the residual against the engine wall clock.
     pub phase_accum: ExecPhaseAccum,
+
+    /// bl1 exec-chain-sub-100-attribution: PRODUCTION (always compiled)
+    /// nanosecond split of `save_order_books` into its two passes. Unlike the
+    /// `save-timings` accumulators above — a µbench-only feature compiled out
+    /// of the node — these ship in release builds (two `Instant::now()` pairs
+    /// per block) because deciding whether pass 2 is worth moving off the exec
+    /// thread needs the PRODUCTION share, not a µbench's. Node-local
+    /// instrumentation: never read by execution, never part of the state root.
+    pub save_split: SaveSplitAccum,
+}
+
+/// bl1 exec-chain-sub-100-attribution: per-block nanosecond split of
+/// `save_order_books` (two-pass / level-authority path only).
+///
+/// The two spans are DISJOINT and together cover the whole two-pass save, so
+/// `drain_ns + write_ns` is bounded by `exec_save_books_seconds`. Only pass 2
+/// could ever move off the exec thread: pass 1 reads the LIVE book levels the
+/// next block's engine mutates.
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SaveSplitAccum {
+    /// Pass 1: journal drain (`take_row_ops` / `take_level_ops`) + level
+    /// digests, inline or on the scoped drain workers (wall clock of the
+    /// whole pass, so the parallel path records elapsed time, not CPU time).
+    pub drain_ns: u128,
+    /// Pass 2: the serial market-ascending overlay writes (order rows, level
+    /// rows, stop diff, meta).
+    pub write_ns: u128,
 }
 
 /// r6 engine-untimed-attribution: per-block nanosecond accumulators for the
@@ -1613,6 +1640,7 @@ impl<T: StateBackend> NativeExecContext<T> {
             #[cfg(feature = "save-timings")]
             last_save_timings: SaveTimings::default(),
             phase_accum: ExecPhaseAccum::default(),
+            save_split: SaveSplitAccum::default(),
         }
     }
 
@@ -2356,6 +2384,9 @@ impl<T: StateBackend> NativeExecContext<T> {
         let workers = self.save_books_workers.min(books.len()).max(1);
         let parallel = workers >= 2 && total_ops >= self.save_books_min_ops;
         let chunked = self.book_mode.level_hash_chunked();
+        // bl1 exec-chain ruler: pass 1 (DRAIN) wall clock. Production timer —
+        // one `Instant::now()` pair per block, not per book.
+        let drain_timer = std::time::Instant::now();
         let drained: Vec<DrainedBook> = if parallel {
             let (drained, rows_ns, levels_ns) =
                 drain_books_parallel(books, workers, level_cache_per_book, chunked, timed);
@@ -2373,9 +2404,13 @@ impl<T: StateBackend> NativeExecContext<T> {
             }
             out
         };
+        self.save_split.drain_ns += drain_timer.elapsed().as_nanos();
         self.last_save_workers = if parallel { workers } else { 1 };
 
         // Pass 2: serial writes, market ascending (`drained` is sorted).
+        // bl1 exec-chain ruler: pass 2 (WRITE) wall clock — the only half of
+        // save_books a flush worker could take.
+        let write_timer = std::time::Instant::now();
         let mut written = 0usize;
         for d in drained {
             let Some(book) = self.order_books.get(&d.market_id) else {
@@ -2392,6 +2427,7 @@ impl<T: StateBackend> NativeExecContext<T> {
                 acc,
             );
         }
+        self.save_split.write_ns += write_timer.elapsed().as_nanos();
         written
     }
 
