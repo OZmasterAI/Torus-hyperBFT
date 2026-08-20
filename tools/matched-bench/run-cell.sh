@@ -458,7 +458,7 @@ for i in 0 1 2; do
     # r3 resident-books-stale-rebuild: full O(resting depth) reloads of the rank8
     # holder. Expect exactly 1 per process (the cold start); anything more is a
     # mid-run "resident books stale" stall — check val$i.log.excerpt for the reason.
-    rebuilds=$(mval torus_exec_resident_rebuilds < "$OUT/metrics-after-val$i.txt")
+    rebuilds=$(mval torus_exec_resident_rebuilds_total < "$OUT/metrics-after-val$i.txt")
     lg="$RUN_DIR/val$i.log"
     panics=$(grep -c -E 'panicked|FAIL-STOP|fail-stop|Latching fail-stop|conflicting blocks' "$lg" 2>/dev/null); panics=${panics:-0}
     errors=$(grep -c ' ERROR ' "$lg" 2>/dev/null); errors=${errors:-0}
