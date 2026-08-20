@@ -17,7 +17,7 @@ pub mod snapshot;
 pub mod trie;
 pub mod trie_cursor;
 
-pub use backend::{AtomicWriteOp, NativeFlushStats, NativeStateOverlay, StateBackend};
+pub use backend::{AtomicWriteOp, FrozenPending, NativeFlushStats, NativeStateOverlay, StateBackend};
 pub use bg_writer::{BackgroundCfWriter, BgWriterPolicy, RawCfKv};
 pub use db::{DbTuning, RocksdbHist, RocksdbHistograms, RocksdbRuntimeStats, RocksdbTickers, StateDb};
 pub use error::StateError;
