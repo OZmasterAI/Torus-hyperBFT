@@ -500,3 +500,116 @@ fn resident_rows_save_is_incremental_via_journal() {
         "200 seeded + 1 new (front of 89 partially filled, still resting)"
     );
 }
+
+// ============================================================================
+// bl2 exec pipeline (F5/F7): the staleness guard reads the applied-height
+// marker THROUGH the overlay, so with the previous block's frozen pending set
+// (which carries the marker) layered under the next overlay, the holder is
+// reused while the flush worker is still writing the previous block. Without
+// the layer the same DB state (marker lagging) trips the guard — the control
+// arm pins that the layer is what makes the difference.
+// ============================================================================
+
+type PipelineLayerFixture = (
+    tempfile::TempDir,
+    StateDb,
+    ResidentBooks,
+    std::sync::Arc<torus_state::FrozenPending>,
+);
+
+fn pipeline_layer_fixture() -> PipelineLayerFixture {
+    use torus_state::NativeStateOverlay;
+    let (dir, db) = open_test_db();
+    // The durable marker lags one block behind (block 0 applied, block 1 on W).
+    db.put_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT, &0u64.to_be_bytes())
+        .unwrap();
+    let mut holder = ResidentBooks::default();
+    let ov1 = NativeStateOverlay::new(db.clone());
+    let mut ctx: NativeExecContext<NativeStateOverlay> = NativeExecContext::new_with_modes(
+        ov1.clone(),
+        1,
+        1001,
+        0,
+        100,
+        10,
+        addr(99),
+        addr(100),
+        addr(101),
+        true,
+        Some(&mut holder),
+    );
+    ctx.positions
+        .put_native_balance(
+            &addr(1),
+            &NativeBalance {
+                available: fp(1_000_000),
+                order_margin: FixedPoint::ZERO,
+            },
+        )
+        .unwrap();
+    let r = NativeExecutor::execute_batch(&mut ctx, &[place(addr(1), gtc(1, true, 100, 5))]);
+    assert!(r.results[0].success);
+    ctx.save_order_books();
+    ctx.stash_resident(&mut holder);
+    assert!(holder.is_populated());
+    // Exec-thread fast path: marker 1 into the overlay, freeze (hand to W).
+    ov1.put_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT, &1u64.to_be_bytes())
+        .unwrap();
+    let frozen = ov1.freeze(1);
+    (dir, db, holder, frozen)
+}
+
+#[test]
+fn resident_guard_sees_marker_through_parent_layer() {
+    use torus_state::NativeStateOverlay;
+    let (_dir, db, mut holder, frozen) = pipeline_layer_fixture();
+    // DB marker still 0 (batch(1) not durable), holder says 1.
+    assert_eq!(
+        db.get_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT)
+            .unwrap(),
+        Some(0u64.to_be_bytes().to_vec())
+    );
+    let ov2 = NativeStateOverlay::with_parent(db.clone(), Some(frozen));
+    let ctx: NativeExecContext<NativeStateOverlay> = NativeExecContext::new_with_modes(
+        ov2,
+        2,
+        1002,
+        0,
+        100,
+        10,
+        addr(99),
+        addr(100),
+        addr(101),
+        true,
+        Some(&mut holder),
+    );
+    assert!(
+        ctx.resident_reused(),
+        "guard must pass: marker 1 is visible through the parent layer while W still writes it"
+    );
+    assert_eq!(ctx.order_books.get(&1).unwrap().order_count(), 1);
+}
+
+#[test]
+fn resident_guard_without_parent_layer_rebuilds_control() {
+    use torus_state::NativeStateOverlay;
+    let (_dir, db, mut holder, _frozen) = pipeline_layer_fixture();
+    let ov2 = NativeStateOverlay::new(db.clone());
+    let ctx: NativeExecContext<NativeStateOverlay> = NativeExecContext::new_with_modes(
+        ov2,
+        2,
+        1002,
+        0,
+        100,
+        10,
+        addr(99),
+        addr(100),
+        addr(101),
+        true,
+        Some(&mut holder),
+    );
+    assert!(
+        !ctx.resident_reused(),
+        "control: with the lagging DB marker and no layer the guard trips (rebuild)"
+    );
+}

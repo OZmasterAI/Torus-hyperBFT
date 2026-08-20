@@ -272,7 +272,12 @@ fn worker_loop(rx: Receiver<Job>, env: WorkerEnv, shared: Arc<Shared>) {
         let wall = timer.elapsed().as_secs_f64();
         if let Some(m) = &env.metrics {
             m.flush_worker_seconds.observe(wall);
-            m.exec_flush_seconds.observe(wall);
+            // `exec_flush_seconds` keeps its serial meaning (one observation per
+            // NATIVE block) so the per-phase table's `flush` column stays
+            // comparable; Marker jobs are not native blocks.
+            if matches!(job, Job::Flush { .. }) {
+                m.exec_flush_seconds.observe(wall);
+            }
         }
         match result {
             Ok(Ok(())) => {
