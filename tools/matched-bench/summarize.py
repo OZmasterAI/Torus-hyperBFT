@@ -280,6 +280,11 @@ if len(agree_rows) == 3:
     agreement["counters_equal"] = all(len({r[k] for r in agree_rows}) == 1 for k in ("matched", "placed", "resting", "actions"))
     agreement["panic_or_failstop_lines"] = sum(r["panic_or_failstop_lines"] for r in agree_rows)
     agreement["error_lines"] = sum(r["error_lines"] for r in agree_rows)
+    # bl1 resident-books-untouched-advance: full O(resting depth) reloads of
+    # the rank8 holder per validator (torus_exec_resident_rebuilds). Exactly 1
+    # per process = the cold start; more = a mid-run "resident books stale"
+    # stall landed in the cell. Absent on pre-candidate cells -> None.
+    agreement["resident_rebuilds_per_node"] = [r.get("resident_rebuilds") for r in agree_rows]
     agreement["state_digest_quiescent"] = digest_quiescent
     agreement["state_digest_seconds_per_node"] = _nums(A.digest_secs)
     agreement["state_digest_heights"] = _nums(A.digest_heights, int)
@@ -396,6 +401,7 @@ summary = {
         "dissemination_clean": dissem.get("dissemination_clean") if dissem else None,
         "validators_agree": agreement.get("validators_agree"),
         "agreement_verdict": agreement.get("agreement_verdict"),
+        "exec_resident_rebuilds": agreement.get("resident_rebuilds_per_node"),
     },
     "ingest": {"bench_submitted_actions": int(A.bench_submitted or 0),
                "val0_actions_processed": int(v0.get("delta_native_actions_processed_total", 0)),
@@ -416,6 +422,7 @@ print(f"SUMMARY {A.label}: matched/s avg={h['matched_s_avg']} first120={h['match
       f"placed/s={h['placed_s_avg']} blk/s={h['blk_s_avg']} txs/blk={h['txs_per_block_avg']} "
       f"timeouts={h['consensus_timeouts']} dissem_clean={h['dissemination_clean']} "
       f"agree={h['agreement_verdict']} ({h['validators_agree']}) "
+      f"resident_rebuilds={h['exec_resident_rebuilds']} "
       f"digest_s={agreement.get('state_digest_seconds_per_node')} "
       f"drained={summary['timing']['drained']} bench_rc={A.bench_rc}")
 p0 = phase.get("val0", {})

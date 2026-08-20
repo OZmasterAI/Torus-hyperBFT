@@ -519,6 +519,51 @@ fn advance_untouched_non_successor_invalidates() {
     assert!(!holder.is_populated());
 }
 
+/// Kill-switch (`TORUS_RESIDENT_ADVANCE_UNTOUCHED=0`): the advance is a no-op
+/// that leaves the holder EXACTLY as before the candidate — populated, height
+/// unchanged — so the next native block trips the height guard and rebuilds
+/// from the DB (the pre-candidate stall, by choice). It must NOT drain.
+#[test]
+fn advance_untouched_kill_switch_restores_pre_candidate_rebuild() {
+    let (_dir, db) = open_test_db();
+    let mut holder = ResidentBooks::default();
+
+    let mut ctx = make_ctx(db.clone(), 1, true, Some(&mut holder));
+    fund_native(&ctx, &addr(1), fp(1_000_000));
+    let r = NativeExecutor::execute_batch(&mut ctx, &[place(addr(1), gtc(1, true, 100, 5))]);
+    assert!(r.results[0].success);
+    ctx.save_order_books();
+    ctx.stash_resident(&mut holder);
+    db.put_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT, &1u64.to_be_bytes())
+        .unwrap();
+    assert_eq!(holder.height(), Some(1));
+
+    // Empty block 2 with the switch OFF: marker moves, holder does not.
+    db.put_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT, &2u64.to_be_bytes())
+        .unwrap();
+    assert!(!holder.advance_untouched_with(false, 2));
+    assert_eq!(holder.height(), Some(1), "disabled advance must not move the stamp");
+    assert!(holder.is_populated(), "disabled advance must not drain");
+
+    // Native block 3: guard trips (height+marker) → rebuild from DB, same
+    // resting order, byte-identical state — just the old stall.
+    let ctx = make_ctx(db.clone(), 3, true, Some(&mut holder));
+    assert!(!ctx.resident_reused(), "pre-candidate behaviour is a rebuild");
+    assert!(ctx.resident_rebuilt());
+    assert_eq!(ctx.order_books.get(&1).expect("book").order_count(), 1);
+
+    // And with the switch ON the same sequence reuses.
+    let mut holder = ResidentBooks::default();
+    let mut ctx = make_ctx(db.clone(), 3, true, Some(&mut holder));
+    ctx.save_order_books();
+    ctx.stash_resident(&mut holder);
+    db.put_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT, &4u64.to_be_bytes())
+        .unwrap();
+    assert!(holder.advance_untouched_with(true, 4));
+    let ctx = make_ctx(db.clone(), 5, true, Some(&mut holder));
+    assert!(ctx.resident_reused());
+}
+
 #[test]
 fn advance_untouched_without_marker_write_still_rebuilds() {
     // The advance stamps memory only; if the standalone marker write for the
