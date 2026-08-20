@@ -322,3 +322,59 @@ through the new summarizer moves ONLY that number:
 `on-10m-r2` −212.02 → +42.35, `on-10m-r3` −201.06 → +36.82, both OFF cells
 byte-identical (+35.54 / +32.23); `block_ms`, `chain_ms`, `pipelined_ms`,
 `chain_identity` and every matched/s figure are unchanged.
+
+## Crash gate (bl3) — `CRASH_KILL_AT_S`
+
+The gate that has to pass before `TORUS_EXEC_PIPELINE` can default to ON. With
+the flush worker attached, block N's state batch **and** its applied-height
+marker are written by W while E is already executing N+1; the marker is the
+crash fence, so a `kill -9` must rewind no further than the work that was
+committed-but-unexecuted anyway (+ the depth-1 hand-off), and the restarted node
+must still converge byte-identically with the two survivors.
+
+```
+CRASH_KILL_AT_S=50 KILL_NODE=val1 \
+  tools/matched-bench/run-cell.sh /home/18c/projects/wt/matched-bench \
+  bl3-crash-on-r1 10 120 76000 'TORUS_EXEC_PIPELINE=1'
+```
+
+- `CRASH_KILL_AT_S=N` — SIGKILL the target N s into the bench window, then
+  restart it from the **same data dir** with the **same argv**
+  (`devnet/wsl/start-node.sh` is the single implementation, shared with
+  `launch-3val.sh`), appending to the same log. Must sit inside the load window
+  (`>= 10` and `<= DUR-30`): a kill during the drain hangs the agreement probe.
+  40-60 on a 120 s cell.
+- `KILL_NODE` — `val1` (default) or `val2`. **Never val0**: it serves the bench
+  RPC and every headline/phase number.
+
+Safety: `crash-kill.sh` refuses to signal anything that is not this devnet's
+val1/val2 — the pid must be listed in the devnet's own `pids` file, its
+`/proc` cmdline must carry `--data-dir=$DATA_ROOT/data/val<idx>`, and any
+testnet-shaped marker (`/testnet/data`, `.cargo-target/release/torus-node`,
+`--keystore`, `:8555`, `:9090`, `:30333`) or a pid in `$TORUS_PROTECTED_PIDS`
+is an immediate refusal. The live validator's real cmdline is a test fixture in
+`test_harness.py`. The restarted pid REPLACES its line in the pids file, so
+`stop-3val.sh` still stops the whole devnet (an orphan node would hold 8646 and
+break every later cell).
+
+`summary.json` gains a `crash` section and `headline.crash_gate`
+(`PASS` / `FAIL`, `null` on a cell that did not run the gate):
+
+- `rewind_blocks` — `committed - applied` from the node's own replay line
+  (`crash recovery: execution gap detected, replaying committed_height=… applied_height=… gap=…`);
+  `applied_height` IS the durable marker at the instant of the kill.
+- `exec_queue_depth_at_kill` — committed-but-unexecuted blocks already queued
+  on E when it died (that part of the rewind is inherent, pipeline or not).
+- `rewind_beyond_exec_queue` = the two subtracted — **what the pipeline cost.
+  Must be <= 2** (depth-1 hand-off + the in-flight batch).
+- `pipeline_flag_confirmed` — the restarted node logged
+  `bl2 exec pipeline ENABLED`. Required when the cell env has
+  `TORUS_EXEC_PIPELINE=1`, otherwise the gate crash-tested the serial path and
+  proves nothing about the flag it is meant to unblock.
+- `fail_reasons` — why a FAIL failed. A panic/fail-stop line, an unhealed
+  execution hole, a node that never came back, or anything other than a
+  3-node `AGREE` also fails the gate.
+
+Artifacts: `crash-kill.json` (record at kill time), `crash-restart-tail.log`
+(everything the node logged after the restart), `crash.json` (the merged input
+to summarize.py).
