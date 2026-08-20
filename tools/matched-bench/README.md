@@ -136,7 +136,8 @@ window on val0, matched_s_first120 = the SAME average restricted to the first
 sample, placed_s_avg, blk_s_avg, blk_s_worst60, peak_exec_queue_depth,
 validators_agree, agreement_verdict),
 `funnel_by_node`, `phase_by_node` (per-NATIVE-block ms and % of block / % of wall
-for evm, verify, replay_guard, load_books, engine[margin/match/settle],
+for evm, verify, replay_guard, load_books, engine[phase1_actions/margin/match/
+settle(pass_a/pass_b/cache_flush)/post_engine_tail/engine_untimed],
 save_books, flush[root/state_write{build,db}/evm_resync], body_persist, residual;
 exec_thread_busy_fraction; wall ms per committed block), `agreement`, `cpu`,
 `cell` (env, bench cmd), `binaries`, `genesis`, `timing`, `bench_log_tail`.
@@ -161,6 +162,33 @@ processes), K distinct ids, and every market owned by within-one the same number
 of senders — so no book goes dead. `K >= MARKETS` degenerates to the uniform
 shape; `K = 0` (default) IS the uniform shape. Pinned by `market_plan_tests` in
 `tools/bench-throughput/src/main.rs`.
+## Engine sub-phase attribution (r6 engine-untimed-attribution)
+
+`phase_by_node.<val>.phases.engine` now decomposes the engine share that
+`phase_margin`/`phase_match`/`phase_settle` never covered. The six new
+histograms are observed ONCE PER NATIVE BLOCK (app.rs sums nanosecond
+accumulators carried on the exec context across both `execute_batch` calls),
+so every `_count` equals `torus_exec_engine_seconds_count` and `_sum/_count`
+is ms-per-block directly:
+
+- `phase1_actions_ms` — the Phase-1 non-PlaceOrder action loop (cancels,
+  modifies, transfers); a cancel-heavy block pays here and nowhere else.
+- `settle_pass_a_ms` / `settle_pass_b_ms` — the parallel settle split
+  (scoped-thread per-market plan compute vs the serial deterministic apply).
+  `pass_a = 0` means the cell ran the canonical sequential settle.
+- `cache_flush_ms` — `pos_cache`/`bal_cache` `flush_all` into the overlay.
+  NESTED inside `phase_settle_ms` along with pass A / pass B, so never add
+  those three back into the block total.
+- `post_engine_tail_ms` — core-writer drain + governance + fees + epoch.
+- `engine_untimed_ms` — the residual: engine minus (phase1 + margin + match +
+  settle + tail). Whatever is left is the next thing worth instrumenting.
+
+Identity the phase table satisfies by construction:
+`phase1_actions + phase_margin + phase_match + phase_settle +
+post_engine_tail + engine_untimed == engine`.
+`summarize.py` prints them on an `ENGINE val0:` line. All six read `0.0` on a
+pre-r6 node binary — which is itself the 'binary is stale' tell.
+Harness self-test: `python3 tools/matched-bench/test_summarize.py`.
 
 ## Rules baked in
 
