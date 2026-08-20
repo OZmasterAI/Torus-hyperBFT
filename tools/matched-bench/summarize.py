@@ -440,6 +440,37 @@ def _nums(raw, cast=float):
 # quiescent, which keeps their verdicts exactly as they were.
 digest_quiescent = A.digest_quiescent != "0"
 
+
+def crash_record(path):
+    """The raw crash.json (crash-kill.sh's record + run-cell.sh's log scan), or
+    None when this cell never ran the kill -9 gate. Read BEFORE the agreement
+    verdict because who was killed changes how the funnel counters are read."""
+    try:
+        with open(path) as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return raw if raw.get("enabled") else None
+
+
+CRASH_RAW = crash_record(os.path.join(OUT, "crash.json"))
+# Prometheus counters are PROCESS lifetime: the SIGKILLed node restarts them at
+# 0, so on a crash cell it can never match the two survivors no matter how
+# perfectly it reconverged. Exclude it from the counter comparison; its state is
+# judged on block hash + header root + state digest instead (crash_gate below).
+KILLED_NODE = None
+if CRASH_RAW is not None:
+    KILLED_NODE = CRASH_RAW.get("kill_node")
+    if not KILLED_NODE and CRASH_RAW.get("kill_idx") is not None:
+        KILLED_NODE = "val%d" % int(CRASH_RAW["kill_idx"])
+
+# A digest sampled a block or two off its peers moves the ACTION counter alone —
+# metrics-after is one scrape, the three digests are concurrent. Wider than this
+# is not a scrape skew, it is two chains.
+MAX_DIGEST_HEIGHT_SKEW = 2
+COUNTER_KEYS = ("matched", "placed", "resting", "actions")
+SETTLED_COUNTER_KEYS = ("matched", "placed", "resting")
+
 agree_rows = []
 try:
     with open(os.path.join(OUT, "agreement.jsonl")) as f:
@@ -456,7 +487,11 @@ if len(agree_rows) == 3:
     agreement["block_hash_equal"] = len({r["block_hash"] for r in agree_rows}) == 1 and agree_rows[0]["block_hash"] != "ERR"
     agreement["header_state_root_equal"] = len({r["header_state_root"] for r in agree_rows}) == 1
     agreement["state_digest_equal"] = len({r["state_digest"] for r in agree_rows}) == 1
-    agreement["counters_equal"] = all(len({r[k] for r in agree_rows}) == 1 for k in ("matched", "placed", "resting", "actions"))
+    agreement["counters_equal_all_nodes"] = all(len({r[k] for r in agree_rows}) == 1 for k in COUNTER_KEYS)
+    scored_rows = [r for r in agree_rows if r["node"] != KILLED_NODE]
+    agreement["counters_excluded_node"] = KILLED_NODE if len(scored_rows) < len(agree_rows) else None
+    agreement["counters_compared_nodes"] = [r["node"] for r in scored_rows]
+    agreement["counters_equal"] = all(len({r[k] for r in scored_rows}) == 1 for k in COUNTER_KEYS)
     agreement["panic_or_failstop_lines"] = sum(r["panic_or_failstop_lines"] for r in agree_rows)
     agreement["error_lines"] = sum(r["error_lines"] for r in agree_rows)
     # bl1 resident-books-untouched-advance: full O(resting depth) reloads of
@@ -467,12 +502,33 @@ if len(agree_rows) == 3:
     agreement["state_digest_quiescent"] = digest_quiescent
     agreement["state_digest_seconds_per_node"] = _nums(A.digest_secs)
     agreement["state_digest_heights"] = _nums(A.digest_heights, int)
+    dh = agreement["state_digest_heights"]
+    agreement["digest_height_spread"] = (max(dh) - min(dh)) if len(dh) == len(agree_rows) else None
+    # The digests were NOT taken at one pinned instant of one pinned height.
+    digest_unpinned = bool(not digest_quiescent or A.drained != "1"
+                           or (agreement["digest_height_spread"] or 0) > 0)
+    # ...and the only counter apart is the action counter, by no more than the
+    # scrape skew that explains it. Every settled-state counter still agrees.
+    agreement["action_counter_skew_only"] = bool(
+        not agreement["counters_equal"]
+        and all(len({r[k] for r in scored_rows}) == 1 for k in SETTLED_COUNTER_KEYS)
+        and digest_unpinned
+        and (agreement["digest_height_spread"] or 0) <= MAX_DIGEST_HEIGHT_SKEW)
     # Consensus evidence that does NOT depend on when the digest was taken.
     consensus_ok = bool(agreement["height_spread"] <= 5 and agreement["block_hash_equal"]
                         and agreement["counters_equal"]
                         and agreement["panic_or_failstop_lines"] == 0)
     if consensus_ok and agreement["state_digest_equal"]:
         verdict = "AGREE"
+    elif (agreement["action_counter_skew_only"] and agreement["height_spread"] <= 5
+          and agreement["block_hash_equal"] and agreement["header_state_root_equal"]
+          and agreement["state_digest_equal"]
+          and agreement["panic_or_failstop_lines"] == 0):
+        # Same hash, same header root, same digest on all three; only
+        # torus_native_actions_processed_total apart, and the digests were not
+        # taken at one pinned height. A sampling artifact, not a fork — and not
+        # proof of agreement either.
+        verdict = "DIGEST_UNVERIFIED"
     elif consensus_ok and not (digest_quiescent and A.drained == "1"):
         # r6-base-300m-r1 shape: equal block hash + equal counters, but the
         # digests were sampled while the chain still moved (drain timed out, or
@@ -509,13 +565,8 @@ else:
 MAX_REWIND_BEYOND_EXEC_QUEUE = 2
 
 
-def crash_gate(path, agreement, node_env):
-    try:
-        with open(path) as f:
-            raw = json.load(f)
-    except (OSError, ValueError):
-        return None
-    if not raw.get("enabled"):
+def crash_gate(raw, agreement, node_env):
+    if raw is None:
         return None
     r = raw.get("restart") or {}
     pre = raw.get("pre_kill") or {}
@@ -546,8 +597,28 @@ def crash_gate(path, agreement, node_env):
         fail.append("panic/fail-stop after the restart")
     if int(r.get("hole_lines") or 0) > 0:
         fail.append("unhealed execution hole after the restart")
-    if agreement.get("agreement_verdict") != "AGREE":
-        fail.append("3-node agreement %s" % agreement.get("agreement_verdict"))
+    # Fork evidence is MANDATORY for all THREE nodes, the killed one included:
+    # only its process-lifetime COUNTERS are excused (they reset on restart),
+    # never its state. Checked here by name rather than via the one-word verdict
+    # so the gate keeps its own teeth if the verdict rules ever loosen.
+    out["counters_excluded_node"] = agreement.get("counters_excluded_node")
+    out["counters_compared_nodes"] = agreement.get("counters_compared_nodes")
+    for key, what in (("block_hash_equal", "block hash"),
+                      ("header_state_root_equal", "header state root"),
+                      ("state_digest_equal", "state digest")):
+        if not agreement.get(key):
+            fail.append("%s differs across the 3 nodes (fork)" % what)
+    if not agreement.get("state_digest_quiescent"):
+        fail.append("state digest was not taken at a quiescent chain")
+    if int(agreement.get("panic_or_failstop_lines") or 0) > 0:
+        fail.append("panic/fail-stop somewhere in the 3-node run")
+    # The survivors must still agree with each other on the funnel; only the
+    # killed node is exempt.
+    if not agreement.get("counters_equal"):
+        fail.append("funnel counters differ among %s"
+                    % (agreement.get("counters_compared_nodes") or "the nodes"))
+    if agreement.get("agreement_verdict") == "INCOMPLETE":
+        fail.append("3-node agreement INCOMPLETE")
     if flag_expected and not r.get("pipeline_enabled_line"):
         fail.append("flush worker was NOT attached after the restart")
     out["fail_reasons"] = fail
@@ -555,7 +626,7 @@ def crash_gate(path, agreement, node_env):
     return out
 
 
-crash = crash_gate(os.path.join(OUT, "crash.json"), agreement, NODE_ENV)
+crash = crash_gate(CRASH_RAW, agreement, NODE_ENV)
 
 # ---------------------------------------------------------------- dissemination / pacing
 # run-cell.sh passes "val0:manifest=N,exhausted=N,sync_fallback=N,da_outbound_fail=N,starvation=N,pacing=N val1:... val2:..."
@@ -693,11 +764,15 @@ if crash:
           f"{crash['rewind_beyond_exec_queue']}/{crash['max_rewind_beyond_exec_queue']}) "
           f"worker_attached={crash.get('pipeline_flag_confirmed')} "
           f"agree={agreement.get('agreement_verdict')} "
+          f"(counters over {crash.get('counters_compared_nodes')}, "
+          f"val{crash.get('kill_idx')} judged on digest/hash/root) "
           f"reasons={crash['fail_reasons'] or 'none'}")
 p0 = phase.get("val0", {})
 if p0:
     print(f"PHASE val0: block_ms={p0['block_ms']} wall/committed={p0['wall_ms_per_committed_block']} " +
-          " ".join(f"{k}={v['ms']}({v['pct_of_block']}%)" for k, v in p0["phases"].items()))
+          " ".join(f"{k}={v['ms']}("
+                   + ("off-chain" if v["pct_of_block"] is None else f"{v['pct_of_block']}%")
+                   + ")" for k, v in p0["phases"].items()))
 
     # bl1 exec-chain ruler: the critical chain, what came off it, and the
     # denominator. chain_ms=None means the node binary predates bl1.
