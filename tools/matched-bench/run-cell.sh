@@ -60,6 +60,22 @@
 #                NEVER val0 (it serves the bench RPC and every headline number),
 #                and never anything outside this devnet — see the guard in
 #                crash-kill.sh.
+#   HOTSTUFF_CPUS=a/b/c  pin each node's "hotstuff-algo" thread (the consensus
+#                thread, named by the node binary) to CPU list a / b / c (one
+#                CPU or a range per node, taskset syntax, e.g. 2/6/10 or
+#                2-3/6-7/10-11). Applied with `taskset -pc` right after the
+#                node pids are known; a node whose binary does not name the
+#                thread is logged as a WARNING and the cell continues unpinned.
+#                If the process also runs under a cpuset, the chosen CPU must
+#                lie inside that cpuset (not enforced here). Logged in the
+#                "node env" line next to the TORUS_* vars.
+#   (schedstat)  For every node the harness snapshots
+#                /proc/<pid>/task/<tid>/schedstat (on_cpu_ns runqueue_wait_ns
+#                timeslices) of the main thread and of the threads named
+#                hotstuff-algo / torus-execution / torus-flush-worker at
+#                metrics-before, bench end and metrics-after, into
+#                $OUT/schedstat.json (summarize.py -> sched_by_node). A
+#                thread the binary does not have is recorded as null.
 #   TOOLS_FROM_WORKTREE  1 (default) scores the cell with <worktree>/tools/
 #                matched-bench/summarize.py, i.e. the CANDIDATE's own summarizer,
 #                whichever copy of run-cell.sh was invoked. 0 keeps the old
@@ -68,7 +84,7 @@
 #                exits without touching the devnet.
 set -uo pipefail
 
-usage() { sed -n '2,69p' "$0"; exit 2; }
+usage() { sed -n '2,84p' "$0"; exit 2; }
 [ $# -ge 2 ] || usage
 
 WT=$(cd "$1" && pwd) || { echo "FATAL: worktree '$1' not found" >&2; exit 2; }
@@ -118,6 +134,8 @@ DIGEST_PAR=${DIGEST_PAR:-8}
 RPC_TIMEOUT=${RPC_TIMEOUT:-60}
 CRASH_KILL_AT_S=${CRASH_KILL_AT_S:-}
 KILL_NODE=${KILL_NODE:-val1}
+HOTSTUFF_CPUS=${HOTSTUFF_CPUS:-}
+SCHED_THREADS="hotstuff-algo torus-execution torus-flush-worker"
 OUT="$RESULTS_ROOT/$LABEL"
 
 SRC_NODE="$TARGET_DIR/release/torus-node"
@@ -199,6 +217,56 @@ METS=(9161 9162 9163)
 
 log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$OUT/run.log"; }
 die() { log "FATAL: $*"; finish_fail; exit 1; }
+
+# ---- thread helpers (HOTSTUFF_CPUS pinning + schedstat snapshots) -----------
+find_tid() { # $1=pid $2=thread comm -> first matching tid on stdout, rc 1 if none
+    local t
+    for t in /proc/"$1"/task/*/; do
+        [ "$(cat "$t/comm" 2>/dev/null)" = "$2" ] && { basename "$t"; return 0; }
+    done
+    return 1
+}
+# schedstat_snapshot <phase> <pid>...: appends one
+# "phase node thread tid on_cpu_ns wait_ns slices" line per (node, thread) to
+# $OUT/schedstat.raw. thread "main" = the pid itself; a thread the binary does
+# not name gets tid=- and no counters (=> null in schedstat.json).
+schedstat_snapshot() {
+    local phase=$1 i=0 p t tid st
+    shift
+    for p in "$@"; do
+        for t in main $SCHED_THREADS; do
+            if [ "$t" = main ]; then tid=$p; else tid=$(find_tid "$p" "$t") || tid=""; fi
+            if [ -n "$tid" ] && read -r st < /proc/"$p"/task/"$tid"/schedstat 2>/dev/null; then
+                printf '%s val%s %s %s %s\n' "$phase" "$i" "$t" "$tid" "$st"
+            else
+                printf '%s val%s %s -\n' "$phase" "$i" "$t"
+            fi
+        done >> "$OUT/schedstat.raw"
+        i=$((i+1))
+    done
+}
+# schedstat_json <raw> <out.json>:
+# {"val0": {"main": {"tid": N, "before": [on_cpu_ns, wait_ns, slices], "bench_end": [...], "after": [...]},
+#           "hotstuff-algo": null | {...}, ...}, ...}
+schedstat_json() {
+    python3 - "$1" "$2" <<'PYJ'
+import json, sys
+out = {}
+for line in open(sys.argv[1]):
+    f = line.split()
+    if len(f) < 4:
+        continue
+    phase, node, thread, tid = f[:4]
+    d = out.setdefault(node, {})
+    if tid == "-" or len(f) < 7:
+        d.setdefault(thread, None)
+        continue
+    e = d.get(thread) or {"tid": int(tid)}
+    e[phase] = [int(x) for x in f[4:7]]
+    d[thread] = e
+json.dump(out, open(sys.argv[2], "w"), indent=1)
+PYJ
+}
 
 # ---------------------------------------------------------------- pre-flight
 [ -x "$SRC_NODE" ] || { echo "FATAL: missing $SRC_NODE" >&2; exit 1; }
@@ -294,13 +362,35 @@ for v in $(env | grep -oE '^TORUS_[A-Za-z0-9_]+'); do unset "$v"; done
 for kv in "${RECORD_ENV[@]}"; do export "$kv"; done
 for kv in "${BLOCK_CAP_ENV[@]}"; do export "$kv"; done
 for kv in $EXTRA_ENV; do export "$kv"; done
-NODE_ENV_JSON=$(env | grep -E '^TORUS_' | sort | python3 -c 'import sys,json;print(json.dumps(dict(l.rstrip("\n").split("=",1) for l in sys.stdin)))')
+# HOTSTUFF_CPUS is a HARNESS knob (taskset, not read by the node) but is logged
+# alongside the node env so a pinned cell is recognisable from its summary.
+# Any TORUS_* var in EXTRA_ENV (e.g. TORUS_ROCKSDB_STATS=2) is already covered.
+[ -n "$HOTSTUFF_CPUS" ] && export HOTSTUFF_CPUS
+NODE_ENV_JSON=$(env | grep -E '^(TORUS_|HOTSTUFF_CPUS=)' | sort | python3 -c 'import sys,json;print(json.dumps(dict(l.rstrip("\n").split("=",1) for l in sys.stdin)))')
 log "node env: $NODE_ENV_JSON"
 T_LAUNCH=$(date +%s)
 CLEAN=1 "$WSL/launch-3val.sh" >>"$OUT/run.log" 2>&1 || die "launch-3val.sh failed"
 sleep 2
 mapfile -t PIDS < "$RUN_DIR/pids"
 log "node pids: ${PIDS[*]}"
+# ---- HOTSTUFF_CPUS: pin each node's consensus thread -----------------------
+if [ -n "$HOTSTUFF_CPUS" ]; then
+    IFS=/ read -r -a HS_CPU <<< "$HOTSTUFF_CPUS"
+    [ "${#HS_CPU[@]}" = 3 ] || die "HOTSTUFF_CPUS must be a/b/c (one CPU list per node), got '$HOTSTUFF_CPUS'"
+    command -v taskset >/dev/null || die "HOTSTUFF_CPUS set but taskset not found"
+    for i in 0 1 2; do
+        p=${PIDS[$i]}
+        if tid=$(find_tid "$p" hotstuff-algo); then
+            if taskset -pc "${HS_CPU[$i]}" "$tid" >>"$OUT/run.log" 2>&1; then
+                log "val$i pid=$p hotstuff-algo tid=$tid Cpus_allowed_list=$(awk '/^Cpus_allowed_list/{print $2}' /proc/$p/task/$tid/status) (HOTSTUFF_CPUS='$HOTSTUFF_CPUS')"
+            else
+                log "WARNING: val$i pid=$p taskset -pc ${HS_CPU[$i]} $tid FAILED — hotstuff-algo left unpinned"
+            fi
+        else
+            log "WARNING: val$i pid=$p has no thread named hotstuff-algo (binary predates the naming?) — left unpinned (HOTSTUFF_CPUS='$HOTSTUFF_CPUS')"
+        fi
+    done
+fi
 # verify the env actually reached each node process (fleet-uniform)
 ENV_VERIFY=$(for p in "${PIDS[@]}"; do tr '\0' '\n' < /proc/$p/environ 2>/dev/null | grep -E '^TORUS_' | sort | md5sum | cut -c1-8; done | sort -u | tr '\n' ' ')
 log "per-node TORUS_* env digest(s): $ENV_VERIFY (must be a single value)"
@@ -400,6 +490,7 @@ cpusampler() {
     done
 }
 for i in 0 1 2; do scrape_one "${METS[$i]}" > "$OUT/metrics-before-val$i.txt"; done
+: > "$OUT/schedstat.raw"; schedstat_snapshot before "${PIDS[@]}"
 sampler & SAMPLER_PID=$!
 sleep 3
 
@@ -437,6 +528,8 @@ if [ -n "$CRASH_KILL_AT_S" ] && [ ! -s "$OUT/crash-kill.json" ]; then
 fi
 T_BENCH1=$(date +%s)
 BENCH_PID=""
+# a SIGKILLed+restarted node has a new pid: re-read so the snapshot follows the live process
+mapfile -t PIDS_NOW < "$RUN_DIR/pids"; schedstat_snapshot bench_end "${PIDS_NOW[@]}"
 log "bench exited rc=$BENCH_RC after $((T_BENCH1 - T_BENCH0))s"
 
 # ---------------------------------------------------------------- 7. drain
@@ -476,6 +569,8 @@ kill "$CPU_PID" 2>/dev/null; CPU_PID=""
 
 # ---------------------------------------------------------------- 8. after-snapshots + agreement
 for i in 0 1 2; do scrape_one "${METS[$i]}" > "$OUT/metrics-after-val$i.txt"; done
+mapfile -t PIDS_NOW < "$RUN_DIR/pids"; schedstat_snapshot after "${PIDS_NOW[@]}"
+schedstat_json "$OUT/schedstat.raw" "$OUT/schedstat.json" || log "WARNING: schedstat.json not written"
 rpc() { # $1=url $2=method $3=params-json
     curl -s -m "$RPC_TIMEOUT" -H 'content-type: application/json' "$1" \
         -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$2\",\"params\":$3}"

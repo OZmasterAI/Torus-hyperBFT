@@ -163,12 +163,12 @@ def hist_quantile(pairs, q):
     return prev_le
 
 
-def load_buckets(path, lo, hi):
+def read_buckets(path):
     """run-cell.sh samples selected histogram BUCKETS into buckets.csv in long
-    format (ts,node,metric,le,count). Returns {(node, metric): [(le, delta)]}
-    over [lo, hi]. Missing file (pre-bl1 harness / resummarize of an old cell)
-    => {} => every percentile below is None."""
-    first, last = {}, {}
+    format (ts,node,metric,le,count). Returns the parsed rows as
+    [(ts, node, metric, le, count)]. Missing file (pre-bl1 harness /
+    resummarize of an old cell) => [] => every percentile below is None."""
+    out = []
     try:
         with open(path) as f:
             for r in csv.DictReader(f):
@@ -178,14 +178,22 @@ def load_buckets(path, lo, hi):
                     le = float("inf") if r["le"].lstrip("+").lower().startswith("inf") else float(r["le"])
                 except (TypeError, ValueError, KeyError, AttributeError):
                     continue
-                if not (lo <= ts <= hi):
-                    continue
-                k = (r["node"], r["metric"], le)
-                if k not in first:
-                    first[k] = cnt
-                last[k] = cnt
+                out.append((ts, r["node"], r["metric"], le, cnt))
     except OSError:
-        return {}
+        return []
+    return out
+
+
+def bucket_deltas(brows, lo, hi):
+    """{(node, metric): [(le, cumulative_delta)]} over the window [lo, hi]."""
+    first, last = {}, {}
+    for ts, node, metric, le, cnt in brows:
+        if not (lo <= ts <= hi):
+            continue
+        k = (node, metric, le)
+        if k not in first:
+            first[k] = cnt
+        last[k] = cnt
     out = {}
     for (node, metric, le), c1 in last.items():
         out.setdefault((node, metric), []).append((le, c1 - first[(node, metric, le)]))
@@ -194,7 +202,64 @@ def load_buckets(path, lo, hi):
     return out
 
 
-BUCKETS = load_buckets(os.path.join(OUT, "buckets.csv"), t0, td)
+def load_buckets(path, lo, hi):
+    return bucket_deltas(read_buckets(path), lo, hi)
+
+
+def cadence(rs, lo, hi, buckets, node):
+    """Block cadence / commit-interval fields over the sampler window [lo, hi].
+
+    Returned for THREE windows per node (see phase_by_node): `load` [t0, t1]
+    (the bench is submitting), `drain` [t1, t_drain] (the chain free-runs on
+    EMPTY blocks at 20-30 blk/s while the backlog empties) and `incl_drain`
+    [t0, t_drain] (the pre-bl-sweep blend of both, kept for back-compat). The
+    blend was the trap: bl-sweep-25-2 reads 151 ms/committed block and 2.0
+    empty blk/s over incl_drain, but 231 ms / 0.29 empty blk/s under load.
+    None when the window has < 2 samples.
+    """
+    sel = [r for r in rs if lo <= r["ts"] <= hi]
+    if len(sel) < 2:
+        return None
+    a, b = sel[0], sel[-1]
+    span = b["ts"] - a["ts"]
+    nall = m(b, "exec_block_seconds_count") - m(a, "exec_block_seconds_count")
+    nblk = m(b, "exec_engine_seconds_count") - m(a, "exec_engine_seconds_count")
+    ncommit = m(b, "blocks_committed_total") - m(a, "blocks_committed_total")
+    busy = m(b, "exec_block_seconds_sum") - m(a, "exec_block_seconds_sum")
+    cic = m(b, "commit_interval_seconds_count") - m(a, "commit_interval_seconds_count")
+    cis = m(b, "commit_interval_seconds_sum") - m(a, "commit_interval_seconds_sum")
+
+    def pctl(metric, q):
+        v = hist_quantile(buckets.get((node, metric)), q)
+        return round(v * 1000.0, 1) if v is not None else None
+
+    return {
+        "window": [lo, hi],
+        "span_s": span,
+        "committed_blocks": ncommit,
+        "all_exec_blocks": nall,
+        "executed_native_blocks": nblk,
+        "wall_ms_per_committed_block": round(span / ncommit * 1000, 1) if ncommit else None,
+        "wall_ms_per_native_block": round(span / nblk * 1000, 1) if nblk else None,
+        "native_blk_s": round(nblk / span, 3) if span else None,
+        "empty_blk_s": round(max(nall - nblk, 0.0) / span, 3) if span else None,
+        "committed_blk_s": round(ncommit / span, 3) if span else None,
+        "exec_thread_busy_fraction": round(busy / span, 3) if span else None,
+        "commit_interval_ms_avg": round(cis / cic * 1000, 1) if cic else None,
+        "commit_interval_ms_p50": pctl("torus_commit_interval_seconds_bucket", 0.50),
+        "commit_interval_ms_p95": pctl("torus_commit_interval_seconds_bucket", 0.95),
+    }
+
+
+CADENCE_KEYS = ["committed_blocks", "executed_native_blocks", "wall_ms_per_committed_block",
+                "wall_ms_per_native_block", "native_blk_s", "empty_blk_s", "exec_thread_busy_fraction",
+                "commit_interval_ms_avg", "commit_interval_ms_p50", "commit_interval_ms_p95"]
+
+
+BROWS = read_buckets(os.path.join(OUT, "buckets.csv"))
+BUCKETS = bucket_deltas(BROWS, t0, td)          # exec-phase percentiles (bench+drain)
+BUCKETS_LOAD = bucket_deltas(BROWS, t0, t1)     # cadence under load
+BUCKETS_DRAIN = bucket_deltas(BROWS, t1, td)    # cadence while draining
 phase = {}
 for node, rs in rows.items():
     if not rs:
@@ -226,12 +291,31 @@ for node, rs in rows.items():
         m(b, "flush_worker_seconds_count") - m(a, "flush_worker_seconds_count")
     ) > 0
     off_chain_phases = ["flush"] if worker_present else []
-    p = {"executed_native_blocks": nblk, "all_exec_blocks": nall, "committed_blocks": ncommit, "span_s": span,
-         "wall_ms_per_committed_block": round(span / ncommit * 1000, 1) if ncommit else None,
-         "wall_ms_per_native_block": round(span / nblk * 1000, 1),
+    # Cadence is reported per WINDOW (see cadence()). The top-level cadence
+    # fields are the LOAD window [t0, t1]; `drain` and `incl_drain` sit beside
+    # them. The exec-phase ms table below (block_ms, phases, chain ruler) stays
+    # on [t0, t_drain] so every loaded block is included.
+    cad_load = cadence(rs, t0, t1, BUCKETS_LOAD, node)
+    cad_drain = cadence(rs, t1, td, BUCKETS_DRAIN, node)
+    cad_all = cadence(rs, t0, td, BUCKETS, node)
+    p = {"cadence_window": "load [t_bench0, t_bench1]",
          "block_ms": round(tot, 2),
-         "exec_thread_busy_fraction": round(dsum("block") / span, 3) if span else None,
-         "note": "ms are per NATIVE block (engine_count delta); block_ms includes the tiny cost of empty blocks in the window"}
+         "phase_window": "bench+drain [t_bench0, t_drain]",
+         "phase_window_s": span,
+         "phase_window_native_blocks": nblk,
+         "phase_window_all_exec_blocks": nall,
+         "phase_window_committed_blocks": ncommit,
+         "note": "cadence/commit fields (committed_blocks, native_blk_s, empty_blk_s, wall_ms_per_*, "
+                 "commit_interval_ms_*, exec_thread_busy_fraction) are the LOAD window; `drain` / "
+                 "`incl_drain` hold the same fields over [t_bench1, t_drain] / [t_bench0, t_drain]. "
+                 "Phase ms are per NATIVE block over the bench+drain window (engine_count delta); "
+                 "block_ms includes the tiny cost of empty blocks in that window"}
+    for k in CADENCE_KEYS:
+        p[k] = cad_load[k] if cad_load else None
+    p["span_s"] = cad_load["span_s"] if cad_load else None
+    p["all_exec_blocks"] = cad_load["all_exec_blocks"] if cad_load else None
+    p["drain"] = cad_drain
+    p["incl_drain"] = cad_all
     ph = {}
     acc = 0.0
     for k in PHASES:
@@ -287,8 +371,6 @@ for node, rs in rows.items():
     p["actions_per_exec_block"] = round((m(b, "native_actions_processed_total") - m(a, "native_actions_processed_total")) / nblk, 1)
     dbc = m(b, "exec_root_dirty_buckets_count") - m(a, "exec_root_dirty_buckets_count")
     p["dirty_buckets_per_flush"] = round((m(b, "exec_root_dirty_buckets_sum") - m(a, "exec_root_dirty_buckets_sum")) / dbc, 1) if dbc else None
-    cic = m(b, "commit_interval_seconds_count") - m(a, "commit_interval_seconds_count")
-    p["commit_interval_ms_avg"] = round((m(b, "commit_interval_seconds_sum") - m(a, "commit_interval_seconds_sum")) / cic * 1000, 1) if cic else None
 
     # ------------------------------------------------ bl1 exec-chain ruler
     # The campaign's PRIMARY number is the exec CRITICAL CHAIN per NATIVE
@@ -331,9 +413,6 @@ for node, rs in rows.items():
     # the whole difference between block_ms and chain_ms by construction.
     p["empty_block_ms"] = round(tot - chain_ms, 2) if bl1 else None
     p["gap_to_100ms"] = round(chain_ms - 100.0, 2) if bl1 else None
-    # Cadence split: how much of blk/s is native vs empty blocks.
-    p["native_blk_s"] = round(nblk / span, 3) if span else None
-    p["empty_blk_s"] = round(max(nall - nblk, 0.0) / span, 3) if span else None
     # Independent witness for nblk (which comes from exec_engine_seconds_count):
     # if the two ever disagree, one observe site is on the wrong predicate and
     # every ms-per-native-block column is skewed.
@@ -346,10 +425,6 @@ for node, rs in rows.items():
     fills = m(b, "orders_matched_total") - m(a, "orders_matched_total")
     p["fills_per_native_block"] = round(fills / nblk, 1)
     p["engine_ms_per_1k_fills"] = round(ph["engine"]["ms"] / fills * nblk * 1000.0, 2) if fills > 0 else None
-    # Cadence percentiles from the histogram buckets (the mean above hides the
-    # long tail that decides whether a thinner-block regime is reachable).
-    p["commit_interval_ms_p50"] = pctl("torus_commit_interval_seconds_bucket", 0.50)
-    p["commit_interval_ms_p95"] = pctl("torus_commit_interval_seconds_bucket", 0.95)
     p["chain_ms_p50"] = pctl("torus_exec_chain_seconds_bucket", 0.50)
     p["chain_ms_p95"] = pctl("torus_exec_chain_seconds_bucket", 0.95)
     p["handoff_wait_ms_p95"] = pctl("torus_exec_handoff_wait_seconds_bucket", 0.95)
@@ -422,6 +497,115 @@ for node, rs in rows.items():
         "trade_writer_queued_batches": gstat("trade_writer_queued_batches"),
     }
     phase[node] = p
+
+# ---------------------------------------------------------------- consensus (metrics-before/after)
+# Per-view consensus-thread means from the WHOLE-RUN metrics-before/after
+# snapshots (they bracket idle + load + drain; the sampler never carried the
+# torus_view_* series, so no per-window slicing is possible here).
+VIEW_HISTS = ["torus_view_duration_seconds", "torus_view_propose_delay_seconds",
+              "torus_view_propose_build_seconds", "torus_view_propose_finalize_seconds",
+              "torus_view_qc_collect_seconds", "torus_view_proposal_arrival_seconds",
+              "torus_view_insert_persist_seconds", "torus_view_vote_delay_seconds",
+              "torus_commit_persist_seconds", "torus_block_build_seconds",
+              # added to the node concurrently with this summarizer: None when absent
+              "torus_validate_block_seconds", "torus_validate_block_decode_seconds",
+              "torus_validate_block_da_reconstruct_seconds", "torus_validate_block_attest_seconds",
+              "torus_validate_block_custody_seconds", "torus_on_committed_block_seconds",
+              "torus_mempool_remove_committed_seconds"]
+
+
+def read_metrics(path):
+    """Unlabelled `name value` lines of a Prometheus text scrape -> {name: float}."""
+    out = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                if not line or line[0] == "#":
+                    continue
+                parts = line.split()
+                if len(parts) != 2 or "{" in parts[0]:
+                    continue
+                try:
+                    out[parts[0]] = float(parts[1])
+                except ValueError:
+                    pass
+    except OSError:
+        return {}
+    return out
+
+
+consensus = {}
+for node in ("val0", "val1", "val2"):
+    before = read_metrics(os.path.join(OUT, "metrics-before-%s.txt" % node))
+    after = read_metrics(os.path.join(OUT, "metrics-after-%s.txt" % node))
+    if not before or not after:
+        continue
+
+    def delta(k):
+        return after.get(k, 0.0) - before.get(k, 0.0)
+
+    def mean_ms(h):
+        if h + "_count" not in after:
+            return None
+        c = delta(h + "_count")
+        return round(delta(h + "_sum") / c * 1000, 2) if c > 0 else None
+
+    c = {"window": "whole run (metrics-before -> metrics-after: idle + bench + drain)"}
+    for h in VIEW_HISTS:
+        short = h[len("torus_"):-len("_seconds")]
+        c[short + "_ms"] = mean_ms(h)
+        c[short + "_count"] = delta(h + "_count") if h + "_count" in after else None
+    views = delta("torus_consensus_view")
+    committed = delta("torus_blocks_committed_total")
+    c["views"] = views
+    c["committed_blocks"] = committed
+    c["views_per_committed_block"] = round(views / committed, 3) if committed else None
+    # Consensus-thread busy estimate per view with 3 EQUAL validators: a node
+    # proposes 1 view in 3 (propose_delay) and inserts the other 2 in 3
+    # (insert_persist).
+    pd_, ip_ = c.get("view_propose_delay_ms"), c.get("view_insert_persist_ms")
+    est = (pd_ or 0.0) / 3 + (ip_ or 0.0) * 2 / 3 if (pd_ is not None or ip_ is not None) else None
+    c["consensus_thread_ms_per_view_est"] = round(est, 2) if est is not None else None
+    c["consensus_thread_ms_per_committed_block_est"] = (
+        round(est * views / committed, 2) if est is not None and committed else None)
+    consensus[node] = c
+
+# ---------------------------------------------------------------- schedstat (run-cell.sh B.2)
+# $OUT/schedstat.json: {"val0": {"hotstuff-algo": {"tid": N, "before": [on_cpu_ns,
+# runqueue_wait_ns, timeslices], "bench_end": [...], "after": [...]}, ...}, ...}
+# (thread missing => null). The LOAD window here is before -> bench_end, i.e.
+# ~3 s wider than [t0, t1] on the front; per-committed-block uses the load
+# cadence's committed_blocks.
+sched = {}
+try:
+    with open(os.path.join(OUT, "schedstat.json")) as f:
+        SCHED_RAW = json.load(f)
+except (OSError, ValueError):
+    SCHED_RAW = {}
+for node, threads in (SCHED_RAW or {}).items():
+    if not isinstance(threads, dict):
+        continue
+    ncommit = (phase.get(node) or {}).get("committed_blocks")
+    d = {"window": "load (schedstat before -> bench_end snapshots)",
+         "committed_blocks": ncommit, "threads": {}}
+    for tname, t in threads.items():
+        if not t or not t.get("before") or not t.get("bench_end"):
+            d["threads"][tname] = None
+            continue
+        b0, b1 = t["before"], t["bench_end"]
+        on_cpu = (b1[0] - b0[0]) / 1e6
+        rq = (b1[1] - b0[1]) / 1e6
+        e = {"tid": t.get("tid"),
+             "on_cpu_ms": round(on_cpu, 1),
+             "runqueue_wait_ms": round(rq, 1),
+             "timeslices": b1[2] - b0[2],
+             "on_cpu_ms_per_committed_block": round(on_cpu / ncommit, 3) if ncommit else None,
+             "runqueue_wait_ms_per_committed_block": round(rq / ncommit, 3) if ncommit else None}
+        if t.get("after"):
+            e["on_cpu_ms_whole_run"] = round((t["after"][0] - b0[0]) / 1e6, 1)
+            e["runqueue_wait_ms_whole_run"] = round((t["after"][1] - b0[1]) / 1e6, 1)
+        d["threads"][tname] = e
+    sched[node] = d
 
 # ---------------------------------------------------------------- agreement
 def _nums(raw, cast=float):
@@ -722,8 +906,17 @@ summary = {
         "handoff_wait_ms": phase.get("val0", {}).get("handoff_wait_ms"),
         "fills_per_native_block": phase.get("val0", {}).get("fills_per_native_block"),
         "engine_ms_per_1k_fills": phase.get("val0", {}).get("engine_ms_per_1k_fills"),
+        # cadence fields are the LOAD window [t_bench0, t_bench1] (bl-sweep);
+        # earlier summaries blended in the empty-block drain (see
+        # phase_by_node.<node>.incl_drain for the old values).
+        "cadence_window": "load",
+        "wall_ms_per_committed_block": phase.get("val0", {}).get("wall_ms_per_committed_block"),
+        "native_blk_s": phase.get("val0", {}).get("native_blk_s"),
+        "empty_blk_s": phase.get("val0", {}).get("empty_blk_s"),
+        "commit_interval_ms_avg": phase.get("val0", {}).get("commit_interval_ms_avg"),
         "commit_interval_ms_p50": phase.get("val0", {}).get("commit_interval_ms_p50"),
         "commit_interval_ms_p95": phase.get("val0", {}).get("commit_interval_ms_p95"),
+        "consensus_thread_ms_per_committed_block_est": consensus.get("val0", {}).get("consensus_thread_ms_per_committed_block_est"),
         "actions_per_exec_block": phase.get("val0", {}).get("actions_per_exec_block"),
         "consensus_timeouts": v0.get("delta_consensus_timeout_total_total"),
         "dissemination_clean": dissem.get("dissemination_clean") if dissem else None,
@@ -739,6 +932,8 @@ summary = {
                "note": "NONCE_WINDOW_MS=60s: backlog older than 60 s is evicted silently; submitted-processed gap = expiry"},
     "funnel_by_node": funnel,
     "phase_by_node": phase,
+    "consensus_by_node": consensus,
+    "sched_by_node": sched,
     "agreement": agreement,
     "crash": crash,
     "dissemination": dissem,
@@ -769,7 +964,8 @@ if crash:
           f"reasons={crash['fail_reasons'] or 'none'}")
 p0 = phase.get("val0", {})
 if p0:
-    print(f"PHASE val0: block_ms={p0['block_ms']} wall/committed={p0['wall_ms_per_committed_block']} " +
+    print(f"PHASE val0: block_ms={p0['block_ms']} wall/committed(load)={p0['wall_ms_per_committed_block']} "
+          f"(incl_drain={(p0['incl_drain'] or {}).get('wall_ms_per_committed_block')}) " +
           " ".join(f"{k}={v['ms']}("
                    + ("off-chain" if v["pct_of_block"] is None else f"{v['pct_of_block']}%")
                    + ")" for k, v in p0["phases"].items()))
@@ -783,8 +979,8 @@ if p0:
           f"handoff_wait_ms={p0['handoff_wait_ms']} worker={p0['worker_present']} "
           f"empty_block_ms={p0['empty_block_ms']} | fills/blk={p0['fills_per_native_block']} "
           f"engine_ms/1k_fills={p0['engine_ms_per_1k_fills']} | "
-          f"native_blk/s={p0['native_blk_s']} empty_blk/s={p0['empty_blk_s']} "
-          f"commit_ms p50/p95={p0['commit_interval_ms_p50']}/{p0['commit_interval_ms_p95']} | "
+          f"LOAD native_blk/s={p0['native_blk_s']} empty_blk/s={p0['empty_blk_s']} "
+          f"commit_ms avg/p50/p95={p0['commit_interval_ms_avg']}/{p0['commit_interval_ms_p50']}/{p0['commit_interval_ms_p95']} | "
           f"save_books={sb['ms']}(drain={sb['save_books_drain_ms']} write={sb['save_books_write_ms']}) | "
           f"identity covers_e={ci['chain_covers_e_phases']} le_block={ci['chain_le_block']} "
           f"chain-e_phases={ci['chain_minus_e_phases_ms']}")
@@ -797,3 +993,21 @@ if p0:
           " settle=" + str(e["phase_settle_ms"]) + "(passA=" + str(e["settle_pass_a_ms"]) +
           " passB=" + str(e["settle_pass_b_ms"]) + " cache_flush=" + str(e["cache_flush_ms"]) + ")" +
           " tail=" + str(e["post_engine_tail_ms"]) + " untimed=" + str(e["engine_untimed_ms"]))
+
+for node, c in consensus.items():
+    sc = (sched.get(node) or {}).get("threads") or {}
+    hs = sc.get("hotstuff-algo") or {}
+    print(f"CONSENSUS {node} (whole run): view_ms={c['view_duration_ms']} views={c['views']} "
+          f"views/committed={c['views_per_committed_block']} | propose delay={c['view_propose_delay_ms']} "
+          f"build={c['view_propose_build_ms']} finalize={c['view_propose_finalize_ms']} "
+          f"qc_collect={c['view_qc_collect_ms']} | arrival={c['view_proposal_arrival_ms']} "
+          f"insert_persist={c['view_insert_persist_ms']} vote_delay={c['view_vote_delay_ms']} | "
+          f"commit_persist={c['commit_persist_ms']} block_build={c['block_build_ms']} "
+          f"validate={c['validate_block_ms']}(decode={c['validate_block_decode_ms']} "
+          f"da={c['validate_block_da_reconstruct_ms']} attest={c['validate_block_attest_ms']} "
+          f"custody={c['validate_block_custody_ms']}) on_committed={c['on_committed_block_ms']} "
+          f"mempool_rm={c['mempool_remove_committed_ms']} | "
+          f"thread_est/view={c['consensus_thread_ms_per_view_est']} "
+          f"/committed={c['consensus_thread_ms_per_committed_block_est']}"
+          + (f" | sched hotstuff-algo on_cpu/blk={hs.get('on_cpu_ms_per_committed_block')} "
+             f"rq_wait/blk={hs.get('runqueue_wait_ms_per_committed_block')}" if hs else ""))
