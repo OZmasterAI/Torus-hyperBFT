@@ -300,3 +300,25 @@ Metric names: `torus_exec_chain_seconds`, `torus_exec_handoff_wait_seconds`,
 
 Fixture test: `python3 tools/matched-bench/test_summarize.py` covers a SERIAL
 and a PIPELINED binary shape plus the pre-r6 and pre-bl1 fallbacks.
+
+## Worker-aware phase accounting (bl3)
+
+`block_ms` and every `phases.<k>.ms` come from timers on the **exec thread**.
+With `TORUS_EXEC_PIPELINE=1` the flush stage is observed on the **flush worker
+(W)** instead, so its ms are wall time on another thread and are NOT part of
+that block wall. summarize.py therefore reports flush as an **off-chain** line
+when `worker_present`:
+
+- `phases.flush.off_chain = true`, `pct_of_block = null` (it has no share of the
+  exec block), `pct_of_wall` kept (that is W's load), `ms` unchanged;
+- flush is excluded from the per-block sum, so `residual_untimed` is the exec
+  thread's genuinely untimed remainder and the percentages close at 100 %;
+- `phase_by_node.<val>.off_chain_phases` and `chain_identity.off_chain_phases`
+  name what moved.
+
+Before this, a pipelined cell reported `residual_untimed = -212 ms` and phase
+percentages summing to 134 % (bl2 `on-10m-r2`). Re-running the four bl2 cells
+through the new summarizer moves ONLY that number:
+`on-10m-r2` −212.02 → +42.35, `on-10m-r3` −201.06 → +36.82, both OFF cells
+byte-identical (+35.54 / +32.23); `block_ms`, `chain_ms`, `pipelined_ms`,
+`chain_identity` and every matched/s figure are unchanged.

@@ -8,6 +8,10 @@ best-60s = max over all sliding 60 s windows of the whole sample (bench+drain).
 Phase breakdown = per-executed-block ms from histogram _sum deltas over the
 bench+drain window (so every loaded block is included), divided by the
 torus_exec_block_seconds_count delta (per-phase count == block count by design).
+A phase a WORKER observes (flush, under TORUS_EXEC_PIPELINE) is reported as an
+OFF-CHAIN line and left out of that per-block sum: `block_ms` is the EXEC
+thread's own timer, so counting worker ms into it drives residual_untimed
+negative and the percentages past 100 %.
 """
 import argparse, csv, json, os, statistics, sys, time
 
@@ -22,6 +26,7 @@ for a in ["out", "label", "worktree", "commit", "dirty", "markets", "dur", "rate
 A = ap.parse_args()
 OUT = A.out
 t0, t1, td = int(A.t_bench0), int(A.t_bench1), int(A.t_drain)
+NODE_ENV = json.loads(A.node_env) if A.node_env else {}
 
 # ---------------------------------------------------------------- load sampler
 rows = {"val0": [], "val1": [], "val2": []}
@@ -209,6 +214,18 @@ for node, rs in rows.items():
     def per_blk(k):
         return dsum(k) / nblk * 1000.0
     tot = per_blk("block")
+    # bl3 worker-aware accounting. `block_ms` (and every _sum below) is the
+    # EXEC thread's timer; a phase the flush WORKER observes is wall time on
+    # ANOTHER thread. Sum it into the per-block table and the accounting stops
+    # closing: on bl2 on-10m-r2 (TORUS_EXEC_PIPELINE=1) flush was 252 ms of W
+    # time against a 618 ms exec block, so residual_untimed read -212 ms and the
+    # phase percentages summed to 134 %. Off-chain phases keep their ms (that is
+    # what W cost) and their share of WALL time, but have no share of the exec
+    # block and are excluded from the per-block sum.
+    worker_present = (
+        m(b, "flush_worker_seconds_count") - m(a, "flush_worker_seconds_count")
+    ) > 0
+    off_chain_phases = ["flush"] if worker_present else []
     p = {"executed_native_blocks": nblk, "all_exec_blocks": nall, "committed_blocks": ncommit, "span_s": span,
          "wall_ms_per_committed_block": round(span / ncommit * 1000, 1) if ncommit else None,
          "wall_ms_per_native_block": round(span / nblk * 1000, 1),
@@ -218,8 +235,13 @@ for node, rs in rows.items():
     ph = {}
     acc = 0.0
     for k in PHASES:
-        v = per_blk(k); acc += v
-        ph[k] = {"ms": round(v, 2), "pct_of_block": round(100 * v / tot, 1) if tot else None,
+        v = per_blk(k)
+        off = k in off_chain_phases
+        if not off:
+            acc += v
+        ph[k] = {"ms": round(v, 2),
+                 "off_chain": off,
+                 "pct_of_block": None if off else (round(100 * v / tot, 1) if tot else None),
                  "pct_of_wall": round(100 * dsum(k) / span, 1) if span else None}
         for s_ in SUB.get(k, []):
             ph[k][s_ + "_ms"] = round(per_blk(s_), 2)
@@ -230,7 +252,12 @@ for node, rs in rows.items():
     ph["flush"]["state_write_batch_kb"] = round(bbs / bbc / 1024, 1) if bbc else None
     dbs = dsum("state_write_db")
     ph["flush"]["state_write_db_mb_per_s"] = round(bbs / dbs / 1e6, 1) if dbs > 0 else None
-    ph["residual_untimed"] = {"ms": round(tot - acc, 2), "pct_of_block": round(100 * (tot - acc) / tot, 1) if tot else None}
+    ph["residual_untimed"] = {"ms": round(tot - acc, 2),
+                              "off_chain": False,
+                              "pct_of_block": round(100 * (tot - acc) / tot, 1) if tot else None,
+                              "note": "block_ms minus the phases timed ON THE EXEC THREAD"
+                                      + (" (flush excluded: observed by the flush worker)" if worker_present else "")}
+    p["off_chain_phases"] = off_chain_phases
     p["phases"] = ph
     # early vs late (first / last 60 s of the LOADED window = until matched stops moving)
     loaded = [r for r in sel if m(r, "orders_matched_total") < m(sel[-1], "orders_matched_total")]
@@ -297,7 +324,8 @@ for node, rs in rows.items():
     p["chain_ms"] = chain_ms
     p["pipelined_ms"] = round(draw("flush_worker_seconds") / nblk * 1000.0, 2) if nworker > 0 else (0.0 if bl1 else None)
     p["handoff_wait_ms"] = round(draw("exec_handoff_wait_seconds") / nblk * 1000.0, 2) if bl1 else None
-    p["worker_present"] = bool(nworker > 0)
+    assert bool(nworker > 0) == worker_present, "worker_present must be single-sourced"
+    p["worker_present"] = worker_present
     p["flush_worker_depth_max"] = max(m(r, "flush_worker_depth") for r in sel)
     # E time spent on NON-native (empty) blocks, expressed per native block:
     # the whole difference between block_ms and chain_ms by construction.
@@ -337,6 +365,7 @@ for node, rs in rows.items():
     e_sum = round(sum(ph[k]["ms"] for k in e_phases), 2)
     p["chain_identity"] = {
         "e_phases": e_phases,
+        "off_chain_phases": off_chain_phases,
         "e_phase_sum_ms": e_sum,
         "chain_minus_e_phases_ms": round(chain_ms - e_sum, 2) if bl1 else None,
         "chain_covers_e_phases": (chain_ms + 0.5 >= e_sum) if bl1 else None,
@@ -455,6 +484,74 @@ else:
     agreement["agreement_verdict"] = "INCOMPLETE"
     agreement["validators_agree"] = False
 
+# ---------------------------------------------------------------- crash gate
+# bl3: a CRASH_KILL_AT_S cell SIGKILLs one devnet validator mid-load and restarts
+# it from the same data dir (tools/matched-bench/crash-kill.sh). run-cell.sh drops
+# the record + the post-run log scan in crash.json; this turns it into a verdict.
+#
+# What the gate proves for TORUS_EXEC_PIPELINE: the applied-height marker is the
+# crash fence, so the restarted node must replay from it, converge to the SAME
+# state as the two survivors, and rewind no further than the work that was
+# already committed-but-unexecuted at the kill.
+#
+#   rewind_blocks             committed - applied at the crash (the replay gap)
+#   exec_queue_depth_at_kill  committed-but-unexecuted blocks already queued on E
+#   rewind_beyond_exec_queue  what the PIPELINE cost on top: depth-1 hand-off
+#                             plus the in-flight batch => <= 2
+#
+# Absent crash.json => `crash` is null and the headline gate is null (NOT "FAIL"):
+# an ordinary cell simply did not run the gate.
+MAX_REWIND_BEYOND_EXEC_QUEUE = 2
+
+
+def crash_gate(path, agreement, node_env):
+    try:
+        with open(path) as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not raw.get("enabled"):
+        return None
+    r = raw.get("restart") or {}
+    pre = raw.get("pre_kill") or {}
+    out = dict(raw)
+    gap = int(r.get("gap") or 0)
+    q = pre.get("exec_queue_depth")
+    q = int(q) if q is not None else None
+    out["rewind_blocks"] = gap
+    out["exec_queue_depth_at_kill"] = q
+    out["rewind_beyond_exec_queue"] = (gap - q) if q is not None else None
+    out["max_rewind_beyond_exec_queue"] = MAX_REWIND_BEYOND_EXEC_QUEUE
+    # The gate exists to unblock the FLAG: if the restarted node came back
+    # without the flush worker, it crash-tested the serial path and proves
+    # nothing. (A flag-off crash cell is a legitimate serial control.)
+    flag_expected = node_env.get("TORUS_EXEC_PIPELINE") == "1"
+    out["pipeline_flag_expected"] = flag_expected
+    out["pipeline_flag_confirmed"] = bool(r.get("pipeline_enabled_line")) if flag_expected else None
+
+    fail = []
+    if not raw.get("restarted_pid"):
+        fail.append("killed node did not restart")
+    if out["rewind_beyond_exec_queue"] is None:
+        fail.append("no exec_queue_depth sampled at the kill — rewind unbounded")
+    elif out["rewind_beyond_exec_queue"] > MAX_REWIND_BEYOND_EXEC_QUEUE:
+        fail.append("rewind %d blocks beyond the exec queue (max %d)"
+                    % (out["rewind_beyond_exec_queue"], MAX_REWIND_BEYOND_EXEC_QUEUE))
+    if int(r.get("panic_or_failstop_lines") or 0) > 0:
+        fail.append("panic/fail-stop after the restart")
+    if int(r.get("hole_lines") or 0) > 0:
+        fail.append("unhealed execution hole after the restart")
+    if agreement.get("agreement_verdict") != "AGREE":
+        fail.append("3-node agreement %s" % agreement.get("agreement_verdict"))
+    if flag_expected and not r.get("pipeline_enabled_line"):
+        fail.append("flush worker was NOT attached after the restart")
+    out["fail_reasons"] = fail
+    out["verdict"] = "FAIL" if fail else "PASS"
+    return out
+
+
+crash = crash_gate(os.path.join(OUT, "crash.json"), agreement, NODE_ENV)
+
 # ---------------------------------------------------------------- dissemination / pacing
 # run-cell.sh passes "val0:manifest=N,exhausted=N,sync_fallback=N,da_outbound_fail=N,starvation=N,pacing=N val1:... val2:..."
 # (node log line counts). Block-cap-raise sweep gate: a raised cap is REJECTED when
@@ -525,7 +622,7 @@ summary = {
     "cell": {"markets": int(A.markets), "duration_s": int(A.dur), "rate_total": int(A.rate), "senders": int(A.senders),
              "block_cap": int(A.block_cap) if A.block_cap else None,
              "markets_per_sender": int(A.markets_per_sender) if A.markets_per_sender else None,
-             "extra_env": A.extra_env, "node_env": json.loads(A.node_env) if A.node_env else {},
+             "extra_env": A.extra_env, "node_env": NODE_ENV,
              "env_digests_per_node": A.env_digests.split(), "bench_cmd": A.bench_cmd, "node_pids": A.pids.split()},
     "timing": {"t_bench0": t0, "t_bench1": t1, "t_drain": td, "bench_wall_s": t1 - t0, "drain_s": td - t1,
                "drained": A.drained == "1", "drain_timeout_s": int(A.drain_timeout) if A.drain_timeout else None,
@@ -556,6 +653,8 @@ summary = {
         "dissemination_clean": dissem.get("dissemination_clean") if dissem else None,
         "validators_agree": agreement.get("validators_agree"),
         "agreement_verdict": agreement.get("agreement_verdict"),
+        # bl3 crash gate: None on a cell that did not run it.
+        "crash_gate": crash.get("verdict") if crash else None,
     },
     "ingest": {"bench_submitted_actions": int(A.bench_submitted or 0),
                "val0_actions_processed": int(v0.get("delta_native_actions_processed_total", 0)),
@@ -564,6 +663,7 @@ summary = {
     "funnel_by_node": funnel,
     "phase_by_node": phase,
     "agreement": agreement,
+    "crash": crash,
     "dissemination": dissem,
     "cpu": cpu,
     "bench_log_tail": bench_tail,
@@ -578,6 +678,15 @@ print(f"SUMMARY {A.label}: matched/s avg={h['matched_s_avg']} first120={h['match
       f"agree={h['agreement_verdict']} ({h['validators_agree']}) "
       f"digest_s={agreement.get('state_digest_seconds_per_node')} "
       f"drained={summary['timing']['drained']} bench_rc={A.bench_rc}")
+if crash:
+    print(f"CRASH val{crash.get('kill_idx')}: verdict={crash['verdict']} "
+          f"kill_at={crash.get('kill_at_s')}s down={crash.get('down_s')}s "
+          f"rewind={crash['rewind_blocks']} blk (exec_queue_at_kill="
+          f"{crash['exec_queue_depth_at_kill']} beyond_queue="
+          f"{crash['rewind_beyond_exec_queue']}/{crash['max_rewind_beyond_exec_queue']}) "
+          f"worker_attached={crash.get('pipeline_flag_confirmed')} "
+          f"agree={agreement.get('agreement_verdict')} "
+          f"reasons={crash['fail_reasons'] or 'none'}")
 p0 = phase.get("val0", {})
 if p0:
     print(f"PHASE val0: block_ms={p0['block_ms']} wall/committed={p0['wall_ms_per_committed_block']} " +
