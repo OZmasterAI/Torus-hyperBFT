@@ -1133,6 +1133,25 @@ fn parse_resident_books_toggle(v: Option<String>) -> bool {
     matches!(v.as_deref().map(str::trim), Some("1"))
 }
 
+/// bl1 resident-books-untouched-advance kill-switch:
+/// `TORUS_RESIDENT_ADVANCE_UNTOUCHED=0` disables advancing the rank8 holder
+/// across untouched (empty / non-native) blocks — restoring the pre-candidate
+/// behaviour (holder falls behind → full rebuild at the next native block).
+/// Anything else (INCLUDING UNSET) keeps the advance ON. Node-local only:
+/// the holder is a cache of what the DB already holds; the toggle never
+/// changes state, roots or matching.
+fn advance_untouched_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        parse_advance_untouched_toggle(std::env::var("TORUS_RESIDENT_ADVANCE_UNTOUCHED").ok())
+    })
+}
+
+/// Pure parse of the `TORUS_RESIDENT_ADVANCE_UNTOUCHED` value: only `"0"` disables.
+fn parse_advance_untouched_toggle(v: Option<String>) -> bool {
+    !matches!(v.as_deref().map(str::trim), Some("0"))
+}
+
 /// rank8: cross-block resident book state. Owned by the execution pipeline
 /// (one per node, behind a Mutex on the exec thread); handed to each block's
 /// context via [`NativeExecContext::new_with_modes`] and refilled via
@@ -1181,6 +1200,17 @@ impl ResidentBooks {
     /// authoritative. Strict by design: a wrong "not stale" here would be a
     /// correctness bug; a needless rebuild is only a stall.
     pub fn advance_untouched(&mut self, block_height: u64) -> bool {
+        self.advance_untouched_with(advance_untouched_enabled(), block_height)
+    }
+
+    /// [`Self::advance_untouched`] with the kill-switch value passed
+    /// explicitly (tests; the env-reading wrapper above is what the pipeline
+    /// calls). `enabled == false` is a pure no-op: the holder is neither
+    /// advanced nor drained, exactly the pre-candidate sequence.
+    pub fn advance_untouched_with(&mut self, enabled: bool, block_height: u64) -> bool {
+        if !enabled {
+            return false;
+        }
         match self.inner.as_mut() {
             Some(inner) if inner.height + 1 == block_height => {
                 inner.height = block_height;
@@ -1221,6 +1251,39 @@ mod resident_books_toggle_tests {
         for v in ["0", "true", "on", "", "yes", "2"] {
             assert!(!parse_resident_books_toggle(Some(v.to_string())), "{v}");
         }
+    }
+}
+
+#[cfg(test)]
+mod advance_untouched_toggle_tests {
+    use super::{parse_advance_untouched_toggle, ResidentBooks};
+
+    #[test]
+    fn default_is_on() {
+        assert!(parse_advance_untouched_toggle(None));
+    }
+
+    #[test]
+    fn zero_disables() {
+        assert!(!parse_advance_untouched_toggle(Some("0".to_string())));
+        assert!(!parse_advance_untouched_toggle(Some(" 0 ".to_string())));
+    }
+
+    #[test]
+    fn anything_else_stays_on() {
+        for v in ["1", "true", "on", "", "yes", "2"] {
+            assert!(parse_advance_untouched_toggle(Some(v.to_string())), "{v}");
+        }
+    }
+
+    /// Kill-switch semantics: with the advance disabled the holder is left
+    /// EXACTLY as before the candidate — not advanced, not drained — so the
+    /// next native block trips the height guard and rebuilds from the DB.
+    #[test]
+    fn disabled_advance_leaves_holder_untouched() {
+        let mut holder = ResidentBooks::default();
+        assert!(!holder.advance_untouched_with(false, 1));
+        assert_eq!(holder.height(), None);
     }
 }
 
