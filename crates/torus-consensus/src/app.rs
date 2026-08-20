@@ -519,13 +519,33 @@ struct ExecutionContext {
     /// trie bytes and the root are identical with or without it. Self-
     /// authenticating staleness guard (persisted-root match) — see
     /// torus_state::native_trie.
-    trie_cache: std::sync::Mutex<torus_state::native_trie::NativeTrieCache>,
+    ///
+    /// bl2 exec pipeline: `Arc` so the flush worker can own the flush while the
+    /// serial/barrier path (which only runs after `wait_idle`) keeps using the
+    /// same caches — never contended.
+    trie_cache: Arc<std::sync::Mutex<torus_state::native_trie::NativeTrieCache>>,
     /// rank-root round-3: bounded bucket-member cache eliminating the
     /// CF_NATIVE_HASHED prefix-scan on resident buckets
     /// (`TORUS_BUCKET_MEMBER_CACHE_MB`). Value-neutral; self-authenticating on
     /// the persisted root (shares the trie cache's staleness cause). Disabled
     /// (budget 0) = exact-today.
-    member_cache: std::sync::Mutex<torus_state::native_trie::NativeMemberCache>,
+    member_cache: Arc<std::sync::Mutex<torus_state::native_trie::NativeMemberCache>>,
+    /// bl2 exec pipeline (`TORUS_EXEC_PIPELINE=1`): the flush worker W.
+    /// `None` (default) = the serial exec chain, exact-today. Constructed AFTER
+    /// boot replay (`TorusApp::new`) so replay is always serial and the durable
+    /// marker is settled before `exec_next_height` reads it (design F4).
+    /// Dropped with the ExecutionContext at exec-thread exit: drains + joins
+    /// before `TorusApp::Drop` returns.
+    flush_worker: Option<crate::exec_pipeline::FlushWorker>,
+    /// bl2: E-owned LOGICAL applied height — the highest height handed to W
+    /// (or 0). The skip-check uses `max(durable marker, exec_applied)` so a
+    /// height re-delivered while its batch is still on W is skipped, not
+    /// re-executed (design F3). Only meaningful with `flush_worker`.
+    exec_applied: AtomicU64,
+    /// bl2: the frozen pending set of the most recent job handed to W (Flush
+    /// or 1-key Marker), ALWAYS layered under the next fast-path overlay,
+    /// durable or not (design F1/F6). `None` after a barrier / at start.
+    last_job: std::sync::Mutex<Option<Arc<torus_state::FrozenPending>>>,
 }
 
 // ---- Standalone helpers (used by both execution thread and crash recovery) ----
@@ -1158,6 +1178,78 @@ impl ExecutionContext {
         self.execute_committed_block_with(torus_block, pending_slashes, DurableRows::default())
     }
 
+    /// bl2 exec pipeline: attach the flush worker W (see `exec_pipeline.rs`).
+    /// Seeds W's durable height AND `exec_applied` from the durable marker, so
+    /// the skip-check is exact from the first pipelined block. `gate` is the
+    /// test hook (park / inject-failure); production passes `None`.
+    fn attach_flush_worker(&mut self, gate: Option<Arc<crate::exec_pipeline::WorkerGate>>) {
+        let applied = read_native_applied_height(&self.state_db).unwrap_or(0);
+        let env = crate::exec_pipeline::WorkerEnv {
+            state_db: self.state_db.clone(),
+            trie_cache: self.trie_cache.clone(),
+            member_cache: self.member_cache.clone(),
+            metrics: self.metrics.clone(),
+            exec_failed: self.exec_failed.clone(),
+            gate,
+        };
+        self.flush_worker = Some(crate::exec_pipeline::FlushWorker::spawn(env, applied));
+        self.exec_applied.store(applied, Ordering::SeqCst);
+        *self.last_job.lock().unwrap() = None;
+        tracing::info!(
+            applied,
+            "bl2 exec pipeline ENABLED (TORUS_EXEC_PIPELINE=1): flush worker attached after replay"
+        );
+    }
+
+    /// bl2: barrier — every path that writes the DB directly, reads it
+    /// bypassing the overlay, or must see a settled marker (EVM blocks,
+    /// slashes, epoch boundaries, non-durable rows, replay) first waits for W
+    /// to drain. Returns `false` (after latching the fail-stop) if W failed.
+    fn pipeline_barrier(&self) -> bool {
+        let Some(worker) = &self.flush_worker else {
+            return true;
+        };
+        if !worker.wait_idle() {
+            self.exec_failed.store(true, Ordering::SeqCst);
+            return false;
+        }
+        *self.last_job.lock().unwrap() = None;
+        true
+    }
+
+    /// bl2: hand a job to W with the rendezvous wait attributed to
+    /// `exec_handoff_wait_seconds`; on success advances `exec_applied` and the
+    /// parent layer. Returns `false` (fail-stop latched) if W has failed or is
+    /// gone — the caller must return WITHOUT writing anything for this height.
+    fn pipeline_handoff(&self, job: crate::exec_pipeline::Job) -> bool {
+        let Some(worker) = &self.flush_worker else {
+            return false;
+        };
+        let height = job.height();
+        let pending = match &job {
+            crate::exec_pipeline::Job::Flush { pending, .. }
+            | crate::exec_pipeline::Job::Marker { pending, .. } => pending.clone(),
+        };
+        let wait_timer = std::time::Instant::now();
+        let sent = worker.submit(job).is_ok();
+        let wait_secs = wait_timer.elapsed().as_secs_f64();
+        if !sent {
+            tracing::error!(
+                height,
+                "FATAL: flush worker unavailable/failed at hand-off — this block was executed on a                  non-durable base; latching fail-stop (restart replays from the durable marker)"
+            );
+            self.exec_failed.store(true, Ordering::SeqCst);
+            return false;
+        }
+        if let Some(ref m) = self.metrics {
+            m.exec_handoff_wait_seconds.observe(wait_secs);
+            m.flush_worker_depth.set(worker.outstanding() as i64);
+        }
+        self.exec_applied.store(height, Ordering::SeqCst);
+        *self.last_job.lock().unwrap() = Some(pending);
+        true
+    }
+
     fn execute_committed_block_with(
         &self,
         torus_block: &TorusBlock,
@@ -1188,7 +1280,20 @@ impl ExecutionContext {
             return;
         }
 
-        if let Some(applied) = read_native_applied_height(&self.state_db) {
+        // bl2 exec pipeline: the durable marker lags by the worker depth, so a
+        // height re-delivered while its batch is still on W must be recognised
+        // by E's own logical watermark (`exec_applied`), not the DB (design F3).
+        let durable_applied = read_native_applied_height(&self.state_db);
+        let logical_applied = if self.flush_worker.is_some() {
+            Some(self.exec_applied.load(Ordering::SeqCst)).filter(|a| *a > 0)
+        } else {
+            None
+        };
+        let applied = match (durable_applied, logical_applied) {
+            (Some(d), Some(l)) => Some(d.max(l)),
+            (d, l) => d.or(l),
+        };
+        if let Some(applied) = applied {
             if applied >= height {
                 // PART 2 (P0 SAFETY): before silently skipping an already-applied
                 // height, make sure this is the SAME block we finalized — not a
@@ -1229,6 +1334,29 @@ impl ExecutionContext {
         // restart-replayed (already-applied) blocks never pollute the distribution.
         let block_timer = std::time::Instant::now();
 
+        let has_evm = !torus_block.evm_transactions.is_empty();
+        let has_native = !torus_block.native_actions.is_empty();
+
+        // bl2 exec pipeline (design §2.1 step 2): a block takes the FAST PATH —
+        // flush handed to W, next block layered on this block's pending set —
+        // only when every reader/writer that bypasses the overlay is known to be
+        // absent: dispatch-durable header+body (never `fold_header`, F9), no EVM,
+        // no pending slashes (direct DB writes), not an epoch boundary (epoch
+        // inflation + consensus-thread staking writes, F2/F8). Anything else is
+        // a BARRIER: wait for W to drain, then today's serial path verbatim.
+        // Replay (`DurableRows::default()`) is therefore always serial, and W
+        // does not even exist at replay time (F4).
+        let pipelined = self.flush_worker.is_some()
+            && durable.header
+            && durable.body
+            && !has_evm
+            && pending_slashes.is_empty()
+            && !EpochManager::is_epoch_boundary(height, self.epoch_length);
+        if !pipelined && !self.pipeline_barrier() {
+            tracing::error!(height, "FATAL: flush worker failed before barrier — fail-stop");
+            return;
+        }
+
         for slash in pending_slashes {
             match self
                 .staking
@@ -1261,13 +1389,11 @@ impl ExecutionContext {
             }
         }
 
-        let has_evm = !torus_block.evm_transactions.is_empty();
-        let has_native = !torus_block.native_actions.is_empty();
-
         tracing::info!(
             height,
             has_evm,
             has_native,
+            pipelined,
             evm_tx_count = torus_block.evm_transactions.len(),
             native_count = torus_block.native_actions.len(),
             "execution pipeline: executing finalized block"
@@ -1358,12 +1484,29 @@ impl ExecutionContext {
             // One verification pass resolves every sender too (EIP-712 ecrecover or
             // session owner); `None` marks an invalid signature. Reused below so we
             // never recover the same action twice.
+            // bl2 exec pipeline: the overlay is built BEFORE verify so that the
+            // session lookup and the nonce replay guard below read through it —
+            // on the fast path its parent layer is the previous block's (possibly
+            // not yet durable) pending set, which is where a session created or a
+            // nonce consumed by block N−1 lives. On the serial path the overlay is
+            // empty with no parent, so every read is exactly the DB read it was.
+            let parent = if pipelined {
+                self.last_job.lock().unwrap().clone()
+            } else {
+                None
+            };
+            debug_assert!(
+                parent.as_ref().is_none_or(|p| p.height() + 1 == height),
+                "bl2: parent layer must be the immediate predecessor (parent={:?}, height={height})",
+                parent.as_ref().map(|p| p.height())
+            );
+            let overlay = NativeStateOverlay::with_parent(self.state_db.clone(), parent);
             let verify_timer = std::time::Instant::now();
             let resolved_senders = if has_native {
                 torus_types::eip712::batch_verify_native_actions_cached(
                     &torus_block.native_actions,
                     torus_block.header.timestamp,
-                    |pubkey| self.state_db.get_session(pubkey).ok().flatten(),
+                    |pubkey| overlay.get_session(pubkey).ok().flatten(),
                     // Exec trust-cache read (gated by --exec-trust-cache, default
                     // off): when enabled, a HIT reuses a locally-verified sender
                     // (keyed by the signature-committing key) and skips the secp256k1
@@ -1449,11 +1592,10 @@ impl ExecutionContext {
                     continue;
                 };
                 let nonce_key = torus_state::cf::native_nonce_key(&sender, signed.nonce);
-                let already_committed = self
-                    .state_db
-                    .get_cf_raw(torus_state::cf::CF_NATIVE_NONCES, &nonce_key)
-                    .unwrap_or(None)
-                    .is_some();
+                let already_committed =
+                    StateBackend::get_cf_raw(&overlay, torus_state::cf::CF_NATIVE_NONCES, &nonce_key)
+                        .unwrap_or(None)
+                        .is_some();
                 if already_committed || !seen_in_block.insert((sender, signed.nonce)) {
                     tracing::warn!(
                         %sender,
@@ -1484,7 +1626,6 @@ impl ExecutionContext {
                     .inc_by(sender_actions.len() as u64);
             }
 
-            let overlay = NativeStateOverlay::new(self.state_db.clone());
             overlay.seed_from_bundle(&bundle);
             // r3: header record rides the flush batch (see `fold_header`).
             let mut header_folded = false;
@@ -1646,6 +1787,33 @@ impl ExecutionContext {
                 );
             }
 
+            // O3: this block's buffered trade-history KVs (handed to the background
+            // writer AFTER the flush / hand-off below, never before).
+            let trades = ctx.take_pending_trades();
+
+            if pipelined {
+                // bl2 exec pipeline FAST PATH. The applied-height marker goes into
+                // the overlay too (CF_CONSENSUS_META is a non-root CF — root-
+                // neutral; the flush appends the same key/bytes again, so the
+                // final key/value set is identical to the serial batch) so the
+                // next block's resident-book staleness guard reads N through the
+                // parent layer while W is still writing it (design F5/F7).
+                let _ = overlay.put_cf_raw(
+                    CF_CONSENSUS_META,
+                    META_NATIVE_APPLIED_HEIGHT,
+                    &height.to_be_bytes(),
+                );
+                let evm_addrs = overlay.dirty_evm_accounts();
+                drop(ctx);
+                let frozen = overlay.freeze(height);
+                if !self.pipeline_handoff(crate::exec_pipeline::Job::Flush {
+                    height,
+                    pending: frozen,
+                    evm_addrs,
+                }) {
+                    return;
+                }
+            } else {
             // Flush native state, maintain the incremental native bucketed-Merkle trie, AND write the
             // native applied-height marker — all in ONE atomic batch (Phase A A2.2 + T156-F1). The
             // marker fold is the crash-safety fix: native state and "this height is applied" now
@@ -1747,13 +1915,15 @@ impl ExecutionContext {
                 m.exec_flush_seconds
                     .observe(flush_timer.elapsed().as_secs_f64());
             }
+            } // end serial flush
 
             // O3: hand this block's buffered trade-history KVs to the background
-            // writer — off the execution thread, after the atomic state flush.
-            // Keys are deterministic per block, so a crash-replay rewrite is
-            // idempotent; a hard crash can lose the last few queued batches,
+            // writer — off the execution thread, after the atomic state flush
+            // (or, on the fast path, after the hand-off to W: trade rows may land
+            // before batch(N) is durable — keys are deterministic per block and a
+            // crash-replay rewrite is idempotent, design §3.1 row 7).
+            // A hard crash can lose the last few queued batches,
             // which is a cosmetic RPC trade-history gap, never consensus state.
-            let trades = ctx.take_pending_trades();
             if !trades.is_empty() {
                 let fallback = match &self.trade_writer {
                     Some(writer) => writer.send(trades).err(),
@@ -1838,7 +2008,18 @@ impl ExecutionContext {
         // empty or pure-EVM blocks, whose re-execution is idempotent) still need a standalone marker
         // write here.
         if !(has_native || computed_fee_revenue > 0) {
-            write_native_applied_height(&self.state_db, height);
+            if pipelined {
+                // bl2: the marker must advance IN ORDER behind the previous block's
+                // batch on W (a direct put here would land before batch(N−1) and be
+                // overwritten by it), and must be visible through the next overlay's
+                // parent layer (design §2.1 step 10).
+                let pending = Arc::new(torus_state::FrozenPending::marker_only(height));
+                if !self.pipeline_handoff(crate::exec_pipeline::Job::Marker { height, pending }) {
+                    return;
+                }
+            } else {
+                write_native_applied_height(&self.state_db, height);
+            }
         }
         if let Some(ref m) = self.metrics {
             m.exec_body_persist_seconds
@@ -1871,8 +2052,12 @@ impl ExecutionContext {
             // `_sum / _count` is directly ms-per-native-block.
             if has_native || computed_fee_revenue > 0 {
                 m.exec_chain_seconds.observe(block_secs);
-                m.exec_handoff_wait_seconds
-                    .observe(SERIAL_HANDOFF_WAIT_SECS);
+                // bl2: on the fast path the REAL rendezvous wait was observed in
+                // `pipeline_handoff`; only the serial path records the 0.
+                if !pipelined {
+                    m.exec_handoff_wait_seconds
+                        .observe(SERIAL_HANDOFF_WAIT_SECS);
+                }
                 m.exec_native_blocks.inc();
             }
         }
@@ -2628,7 +2813,7 @@ impl TorusApp {
             config.dev_pool_address,
         );
         exec_validator.metrics = metrics.clone();
-        let exec_ctx = ExecutionContext {
+        let mut exec_ctx = ExecutionContext {
             state_db: state_db.clone(),
             validator: exec_validator,
             evm_executor: EvmExecutor::new(config.chain_id),
@@ -2657,12 +2842,16 @@ impl TorusApp {
             exec_failed: exec_failed.clone(),
             exec_queue_len: exec_queue_len.clone(),
             resident_books: std::sync::Mutex::new(Default::default()),
-            trie_cache: std::sync::Mutex::new(Default::default()),
-            member_cache: std::sync::Mutex::new(
+            trie_cache: Arc::new(std::sync::Mutex::new(Default::default())),
+            member_cache: Arc::new(std::sync::Mutex::new(
                 torus_state::native_trie::NativeMemberCache::with_budget(
                     torus_state::native_trie::member_cache_budget_bytes(),
                 ),
-            ),
+            )),
+            // bl2: attached below, AFTER boot replay (design F4).
+            flush_worker: None,
+            exec_applied: AtomicU64::new(0),
+            last_job: std::sync::Mutex::new(None),
         };
 
         // Phase A: ensure the persistent incremental trie exists before any commit (including
@@ -2684,6 +2873,14 @@ impl TorusApp {
         // get a bounded window to close it (see the `exec_next_height` /
         // `exec_hole_since` wiring in the struct literal below).
         let (last_header, parked_hole) = Self::replay_committed(&state_db, &exec_ctx);
+
+        // bl2 exec pipeline: the flush worker is constructed only NOW — after the
+        // (serial) boot replay — so the durable marker equals the replayed top
+        // height before `exec_next_height` / manifest parking read it (design
+        // §2.1 W.6, F4). `TORUS_EXEC_PIPELINE` unset ⇒ None ⇒ exact-today.
+        if crate::exec_pipeline::exec_pipeline_enabled() {
+            exec_ctx.attach_flush_worker(None);
+        }
 
         // Spawn execution pipeline: bounded channel (64 blocks) for backpressure.
         // The depth is shared with the mempool trust-cache sizing
@@ -7635,12 +7832,15 @@ mod crash_recovery_tests {
             exec_failed: Arc::new(AtomicBool::new(false)),
             exec_queue_len: Arc::new(AtomicU64::new(0)),
             resident_books: std::sync::Mutex::new(Default::default()),
-            trie_cache: std::sync::Mutex::new(Default::default()),
-            member_cache: std::sync::Mutex::new(
+            trie_cache: Arc::new(std::sync::Mutex::new(Default::default())),
+            member_cache: Arc::new(std::sync::Mutex::new(
                 torus_state::native_trie::NativeMemberCache::with_budget(
                     torus_state::native_trie::member_cache_budget_bytes(),
                 ),
-            ),
+            )),
+            flush_worker: None,
+            exec_applied: AtomicU64::new(0),
+            last_job: std::sync::Mutex::new(None),
         }
     }
 
@@ -9619,5 +9819,394 @@ mod crash_recovery_tests {
             app.is_exec_failed(),
             "a hole that cannot heal within the budget must latch exec_failed"
         );
+    }
+
+    // ======================================================================
+    // bl2 exec pipeline (TORUS_EXEC_PIPELINE): hazard-table tests
+    // (docs/perf/design-exec-pipeline-2026-08-20.md §5)
+    // ======================================================================
+
+    /// The adversarial block sequence every pipeline test runs (heights 1..=13,
+    /// `epoch_length` 4 so heights 4/8/12 are epoch boundaries — serial under the
+    /// pipeline). Encodes every read-your-writes hazard of the design:
+    ///   1  fund A,B (TransferToPerp)                      native
+    ///   2  empty                                          Marker job
+    ///   3  A sell 100 x1, B buy 100 x1 -> fill            native (reads 1 across an empty)
+    ///   4  ClaimRewards (epoch boundary -> barrier)       native, SERIAL
+    ///   5  A sell 101 x1 resting                          native
+    ///   6  B buy 101 x1 + DUPLICATE of 5's sell           native (nonce guard reads 5 via layer)
+    ///   7  empty                                          Marker job
+    ///   8  empty (epoch boundary)                         serial marker
+    ///   9  A CreateSession(S)                             native
+    ///  10  S-signed sell 102 x1 (verify reads 9's session via layer)   native
+    ///  11  B buy 102 x1 -> fill                           native
+    ///  12  empty (epoch boundary)                         serial marker
+    ///  13  A sell 103 x1 (balance written in 11, read across an empty)  native
+    fn pipeline_fixture_blocks() -> Vec<TorusBlock> {
+        let k_a = k256::ecdsa::SigningKey::from_slice(&[41u8; 32]).unwrap();
+        let k_b = k256::ecdsa::SigningKey::from_slice(&[42u8; 32]).unwrap();
+        let s_key = ed25519_dalek::SigningKey::from_bytes(&[43u8; 32]);
+        let deposit = U256::from(1_000 * FixedPoint::ONE.raw() as u128);
+        let order = |is_buy: bool, price: i128| torus_types::PlaceOrderParams {
+            market_id: 1,
+            is_buy,
+            price: FixedPoint::from_raw(price * FixedPoint::SCALE),
+            quantity: FixedPoint::from_raw(FixedPoint::SCALE),
+            order_type: torus_types::OrderType::Limit,
+            time_in_force: torus_types::TimeInForce::GTC,
+            reduce_only: false,
+            client_order_id: None,
+        };
+        let sign = |a: NativeAction, n: u64, k: &k256::ecdsa::SigningKey| {
+            torus_types::eip712::sign_native_action(a, n, k)
+        };
+        let sell5 = sign(NativeAction::PlaceOrder(order(false, 101)), 9_004, &k_a);
+        let session_expiry = (1000 + 9) * 1000 + 3_600_000;
+        let mut blocks = vec![
+            make_block(
+                1,
+                vec![
+                    sign(NativeAction::TransferToPerp { amount: deposit }, 9_000, &k_a),
+                    sign(NativeAction::TransferToPerp { amount: deposit }, 9_001, &k_b),
+                ],
+            ),
+            make_block(2, vec![]),
+            make_block(
+                3,
+                vec![
+                    sign(NativeAction::PlaceOrder(order(false, 100)), 9_002, &k_a),
+                    sign(NativeAction::PlaceOrder(order(true, 100)), 9_003, &k_b),
+                ],
+            ),
+            make_block(4, vec![sign_claim_rewards(4)]),
+            make_block(5, vec![sell5.clone()]),
+            make_block(
+                6,
+                vec![
+                    sign(NativeAction::PlaceOrder(order(true, 101)), 9_005, &k_b),
+                    sell5,
+                ],
+            ),
+            make_block(7, vec![]),
+            make_block(8, vec![]),
+            make_block(
+                9,
+                vec![sign(
+                    NativeAction::CreateSession {
+                        session_pubkey: s_key.verifying_key().to_bytes(),
+                        expiry: session_expiry,
+                        scope: torus_types::SessionScope::Trading,
+                    },
+                    9_006,
+                    &k_a,
+                )],
+            ),
+            make_block(
+                10,
+                vec![torus_types::eip712::sign_native_action_with_session(
+                    NativeAction::PlaceOrder(order(false, 102)),
+                    9_007,
+                    &s_key,
+                )],
+            ),
+            make_block(
+                11,
+                vec![sign(NativeAction::PlaceOrder(order(true, 102)), 9_008, &k_b)],
+            ),
+            make_block(12, vec![]),
+            make_block(
+                13,
+                vec![sign(NativeAction::PlaceOrder(order(false, 103)), 9_009, &k_a)],
+            ),
+        ];
+        link_blocks(&mut blocks);
+        blocks
+    }
+
+    /// Link `parent_hash` to the ACTUAL predecessor (fixtures are non-empty).
+    fn link_blocks(blocks: &mut [TorusBlock]) {
+        for i in 1..blocks.len() {
+            let parent = alloy_primitives::keccak256(blocks[i - 1].header.canonical_header_bytes());
+            blocks[i].header.parent_hash = parent;
+        }
+    }
+
+    /// The EVM balances the fixture's TransferToPerp actions draw from.
+    fn fund_pipeline_fixture(state_db: &StateDb) {
+        let deposit = U256::from(1_000 * FixedPoint::ONE.raw() as u128);
+        for signed in &pipeline_fixture_blocks()[0].native_actions {
+            fund_evm_balance(state_db, signed.recover_sender().unwrap(), deposit);
+        }
+    }
+
+    fn pipeline_ctx(
+        state_db: &StateDb,
+        on: bool,
+        gate: Option<Arc<crate::exec_pipeline::WorkerGate>>,
+    ) -> ExecutionContext {
+        let (mut config, _) = make_test_config_and_db();
+        config.epoch_length = 4;
+        let mut ctx = make_exec_ctx(&config, state_db);
+        if on {
+            ctx.attach_flush_worker(gate);
+        }
+        ctx
+    }
+
+    /// The LIVE dispatch path: header+body durable at commit, then exec with the
+    /// durable rows (what makes a block eligible for the fast path).
+    fn dispatch_and_execute(ctx: &ExecutionContext, state_db: &StateDb, block: &TorusBlock) {
+        let durable = persist_committed_block_durably(state_db, block);
+        assert!(durable.header && durable.body, "fixture rows must be dispatch-durable");
+        ctx.execute_committed_block_with(block, vec![], durable);
+    }
+
+    fn dump_all_cfs(state_db: &StateDb) -> Vec<(&'static str, Vec<(Vec<u8>, Vec<u8>)>)> {
+        torus_state::cf::ALL_CF_NAMES
+            .iter()
+            .map(|cf| (*cf, StateBackend::iterate_cf(state_db, cf, None).unwrap()))
+            .collect()
+    }
+
+    fn assert_dumps_equal(
+        a: &[(&'static str, Vec<(Vec<u8>, Vec<u8>)>)],
+        b: &[(&'static str, Vec<(Vec<u8>, Vec<u8>)>)],
+        what: &str,
+    ) {
+        for ((cf, x), (_, y)) in a.iter().zip(b.iter()) {
+            assert_eq!(x, y, "{what}: CF {cf} diverged");
+        }
+    }
+
+    /// Run the fixture OFF (serial) or ON (pipeline), drain, return the full state
+    /// dump + persisted native root + the ctx's fail-stop latch.
+    fn run_pipeline_fixture(
+        on: bool,
+    ) -> (
+        StateDb,
+        Vec<(&'static str, Vec<(Vec<u8>, Vec<u8>)>)>,
+        torus_types::B256,
+        Vec<u64>,
+    ) {
+        let (_cfg, state_db) = make_test_config_and_db();
+        fund_pipeline_fixture(&state_db);
+        let gate = crate::exec_pipeline::WorkerGate::new();
+        let ctx = pipeline_ctx(&state_db, on, Some(gate.clone()));
+        for b in &pipeline_fixture_blocks() {
+            dispatch_and_execute(&ctx, &state_db, b);
+        }
+        assert!(
+            !ctx.exec_failed.load(std::sync::atomic::Ordering::SeqCst),
+            "fixture must not fail-stop (on={on})"
+        );
+        drop(ctx); // drains + joins W
+        let dump = dump_all_cfs(&state_db);
+        let root = torus_state::native_trie::persisted_native_root(&state_db).unwrap();
+        (state_db, dump, root, gate.received())
+    }
+
+    /// §5 `exec_pipeline_state_identical_over_sequence`: the same sequence ON vs
+    /// OFF yields byte-identical state in EVERY CF and the same persisted native
+    /// root — across empties, an epoch boundary (serial), a duplicated action
+    /// (nonce guard through the layer), a session created in k and used by verify
+    /// in k+1, and keys written in k and read in k+2.
+    #[test]
+    fn exec_pipeline_state_identical_over_sequence() {
+        let (db_off, off, root_off, received_off) = run_pipeline_fixture(false);
+        let (db_on, on, root_on, received_on) = run_pipeline_fixture(true);
+        assert!(received_off.is_empty(), "serial binary: W never exists");
+        // Every non-boundary height went through W (Flush for native, Marker for
+        // empty); boundaries 4/8/12 were serial barriers (F2/F8).
+        assert_eq!(received_on, vec![1, 2, 3, 5, 6, 7, 9, 10, 11, 13]);
+        assert_dumps_equal(&off, &on, "pipeline ON vs OFF");
+        assert_eq!(root_off, root_on, "persisted native root must be identical");
+        assert_eq!(read_native_applied_height(&db_on), Some(13));
+        assert_eq!(read_native_applied_height(&db_off), Some(13));
+        // Sanity: the fixture actually produced fills and resting orders (the
+        // comparison is not vacuous).
+        let trades =
+            StateBackend::iterate_cf(&db_on, torus_state::cf::CF_NATIVE_TRADES, None).unwrap();
+        assert_eq!(trades.len(), 3, "fills at heights 3, 6 and 11");
+        let nonces =
+            StateBackend::iterate_cf(&db_on, torus_state::cf::CF_NATIVE_NONCES, None).unwrap();
+        assert_eq!(nonces.len(), 11, "10 distinct fixture nonces + sign_claim_rewards(4); the duplicate in 6 consumed none");
+    }
+
+    /// §5 `exec_pipeline_parked_worker_reads_previous_height` (F1/F6 + depth
+    /// bound + marker ordering): with W parked INSIDE job 1, the FIRST hand-off
+    /// after it (the empty block 2's Marker job) blocks at the rendezvous — E
+    /// cannot run two blocks ahead. Once released, block 3 (a fill that spends
+    /// balances written only by block 1) executes correctly, and the marker ends
+    /// at 3 with 2 never overwritten by batch(1).
+    #[test]
+    fn exec_pipeline_parked_worker_blocks_next_handoff_and_reads_previous_height() {
+        let (_cfg, state_db) = make_test_config_and_db();
+        fund_pipeline_fixture(&state_db);
+        let blocks = pipeline_fixture_blocks();
+        let gate = crate::exec_pipeline::WorkerGate::new();
+        let ctx = pipeline_ctx(&state_db, true, Some(gate.clone()));
+
+        gate.hold();
+        dispatch_and_execute(&ctx, &state_db, &blocks[0]); // native 1 -> W received, parked
+        assert_eq!(gate.received(), vec![1]);
+        assert_eq!(ctx.exec_applied.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(read_native_applied_height(&state_db), None, "batch(1) not durable yet");
+
+        // Block 2 must block at the hand-off (W still holds 1) — run it on a thread.
+        let db2 = state_db.clone();
+        let b2 = blocks[1].clone();
+        let b3 = blocks[2].clone();
+        let worker_thread = std::thread::spawn(move || {
+            dispatch_and_execute(&ctx, &db2, &b2);
+            dispatch_and_execute(&ctx, &db2, &b3);
+            ctx
+        });
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!worker_thread.is_finished(), "E must block on the FIRST hand-off after a parked job");
+        assert_eq!(gate.received(), vec![1], "W must not have received job 2 while parked on 1");
+        assert_eq!(read_native_applied_height(&state_db), None);
+
+        gate.release();
+        let ctx = worker_thread.join().unwrap();
+        assert!(!ctx.exec_failed.load(std::sync::atomic::Ordering::SeqCst));
+        drop(ctx);
+        assert_eq!(gate.received(), vec![1, 2, 3]);
+        assert_eq!(read_native_applied_height(&state_db), Some(3), "marker advanced in order: 1, 2, 3");
+        let trades =
+            StateBackend::iterate_cf(&state_db, torus_state::cf::CF_NATIVE_TRADES, None).unwrap();
+        assert_eq!(trades.len(), 1, "block 3's fill spent balances written by block 1");
+    }
+
+    /// §5 `exec_pipeline_redelivery_is_skipped` (F3): while batch(1) is still on
+    /// W, re-delivering block 1 must be SKIPPED by E's logical watermark — the
+    /// durable marker still says "not applied". W receives exactly one job for 1,
+    /// the deposits are debited once, no fail-stop (same hash = not a conflict).
+    #[test]
+    fn exec_pipeline_redelivery_is_skipped() {
+        let (_cfg, state_db) = make_test_config_and_db();
+        fund_pipeline_fixture(&state_db);
+        let blocks = pipeline_fixture_blocks();
+        let gate = crate::exec_pipeline::WorkerGate::new();
+        let ctx = pipeline_ctx(&state_db, true, Some(gate.clone()));
+        let a = blocks[0].native_actions[0].recover_sender().unwrap();
+        let start = read_evm_balance(&state_db, a);
+
+        gate.hold();
+        dispatch_and_execute(&ctx, &state_db, &blocks[0]);
+        assert_eq!(read_native_applied_height(&state_db), None);
+        // Re-deliver 1 (same block, same hash) — synchronous skip, no hand-off.
+        dispatch_and_execute(&ctx, &state_db, &blocks[0]);
+        assert!(!ctx.exec_failed.load(std::sync::atomic::Ordering::SeqCst), "same hash is not a conflict");
+        gate.release();
+        drop(ctx);
+        assert_eq!(gate.received(), vec![1], "exactly one job for height 1");
+        assert_eq!(
+            start - read_evm_balance(&state_db, a),
+            U256::from(1_000 * FixedPoint::ONE.raw() as u128),
+            "deposit debited exactly once"
+        );
+        assert_eq!(read_native_applied_height(&state_db), Some(1));
+    }
+
+    /// §5 `exec_pipeline_crash_before_write_replays_both` + `write_error_latches_failstop`
+    /// (C1/C3): batch(2) fails on W AFTER E already executed block 3 on top of
+    /// pending(2). E's hand-off of 3 sees the latch -> fail-stop, nothing of 2 or 3
+    /// is written (marker stays 1, no trade rows). "Restart": a fresh serial
+    /// context's `replay_committed` re-executes 2 and 3 from the dispatch-durable
+    /// bodies and lands EXACTLY the serial state.
+    #[test]
+    fn exec_pipeline_crash_before_write_replays_both_and_matches_serial() {
+        let blocks = pipeline_fixture_blocks();
+        let first3 = &blocks[..3];
+
+        // Reference: serial run of 1..=3.
+        let (_c0, db_ref) = make_test_config_and_db();
+        fund_pipeline_fixture(&db_ref);
+        let ctx_ref = pipeline_ctx(&db_ref, false, None);
+        for b in first3 {
+            dispatch_and_execute(&ctx_ref, &db_ref, b);
+        }
+        drop(ctx_ref);
+        let dump_ref = dump_all_cfs(&db_ref);
+
+        // Pipelined run that "crashes" with batch(2) undurable.
+        let (_c1, state_db) = make_test_config_and_db();
+        fund_pipeline_fixture(&state_db);
+        let gate = crate::exec_pipeline::WorkerGate::new();
+        let ctx = pipeline_ctx(&state_db, true, Some(gate.clone()));
+        dispatch_and_execute(&ctx, &state_db, &first3[0]);
+        assert!(ctx.flush_worker.as_ref().unwrap().wait_idle());
+        assert_eq!(read_native_applied_height(&state_db), Some(1));
+
+        gate.hold();
+        dispatch_and_execute(&ctx, &state_db, &first3[1]); // Marker(2) received, parked
+        let db_t = state_db.clone();
+        let b3 = first3[2].clone();
+        let t = std::thread::spawn(move || {
+            dispatch_and_execute(&ctx, &db_t, &b3); // engine(3) runs on pending(2); hand-off blocks
+            ctx
+        });
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!t.is_finished());
+        // Crash: W's write of 2 fails -> latch; E's blocked hand-off of 3 errors.
+        gate.fail_next();
+        gate.release();
+        let ctx = t.join().unwrap();
+        assert!(
+            ctx.exec_failed.load(std::sync::atomic::Ordering::SeqCst),
+            "E must latch the fail-stop when W failed under it"
+        );
+        drop(ctx);
+        assert_eq!(read_native_applied_height(&state_db), Some(1), "nothing of 2/3 durable");
+        let trades =
+            StateBackend::iterate_cf(&state_db, torus_state::cf::CF_NATIVE_TRADES, None).unwrap();
+        assert!(trades.is_empty(), "block 3's fill must not have been written");
+
+        // Restart: serial replay from the durable marker re-executes 2 and 3.
+        let ctx2 = pipeline_ctx(&state_db, false, None);
+        let (_last, parked) = TorusApp::replay_committed(&state_db, &ctx2);
+        assert_eq!(parked, None);
+        assert!(!ctx2.exec_failed.load(std::sync::atomic::Ordering::SeqCst));
+        drop(ctx2);
+        assert_eq!(read_native_applied_height(&state_db), Some(3));
+        assert_dumps_equal(&dump_ref, &dump_all_cfs(&state_db), "replay after crash vs serial");
+    }
+
+    /// §5 `exec_pipeline_fold_header_runs_serial` (F9): a block whose header is
+    /// NOT dispatch-durable (boot replay / failed dispatch batch) takes the
+    /// barrier path under the flag — W receives nothing for it, its marker and
+    /// folded header are durable synchronously — and the NEXT block's parent-link
+    /// check can assert against the persisted header (no fail-stop), then rides W.
+    #[test]
+    fn exec_pipeline_fold_header_runs_serial() {
+        let (_cfg, state_db) = make_test_config_and_db();
+        fund_pipeline_fixture(&state_db);
+        let blocks = pipeline_fixture_blocks();
+        let gate = crate::exec_pipeline::WorkerGate::new();
+        let ctx = pipeline_ctx(&state_db, true, Some(gate.clone()));
+
+        ctx.execute_committed_block_with(&blocks[0], vec![], DurableRows::default());
+        assert!(gate.received().is_empty(), "non-durable rows => serial, no W job");
+        assert_eq!(read_native_applied_height(&state_db), Some(1), "serial marker durable synchronously");
+        assert!(
+            state_db.get_cf_raw(CF_BLOCK_HEADERS, &1u64.to_be_bytes()).unwrap().is_some(),
+            "folded header landed with the serial batch"
+        );
+
+        dispatch_and_execute(&ctx, &state_db, &blocks[1]);
+        assert!(!ctx.exec_failed.load(std::sync::atomic::Ordering::SeqCst), "parent-link check passed");
+        drop(ctx);
+        assert_eq!(gate.received(), vec![2]);
+        assert_eq!(read_native_applied_height(&state_db), Some(2));
+    }
+
+    /// Kill switch: `TORUS_EXEC_PIPELINE` unset/0 => no worker is attached, the
+    /// context is the serial one (every existing test runs that path).
+    #[test]
+    fn exec_pipeline_default_off_has_no_worker() {
+        let (_cfg, state_db) = make_test_config_and_db();
+        let ctx = pipeline_ctx(&state_db, false, None);
+        assert!(ctx.flush_worker.is_none());
+        assert!(!crate::exec_pipeline::parse_exec_pipeline_toggle(None));
     }
 }
