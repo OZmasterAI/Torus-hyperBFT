@@ -89,6 +89,10 @@ The fixed tail we can move: `save_books + flush ≈ 310–390 ms/blk` (27–40 %
 `load_books` 59–80 ms that should be zero. The `residual` (28–37 ms: skip/parent checks, lock
 hand-offs, metric observes, trade hand-off) stays on E.
 
+> **Duration warning (bl4, resolved 2026-08-20).** The rows above are NOT comparable: the 300 s row
+> and the 120 s rows differ by ~250 ms/blk in `engine` for a reason that has nothing to do with the
+> code. See §1.4 — compare across durations on `phase1_drift.first120_ms`, or hold the duration fixed.
+
 ### 1.3 A self-inflicted term: resident-book rebuilds on every empty block (root cause, verified)
 
 `NativeExecContext::new_with_mode` (`torus-bridge/src/native_executor.rs:1514-1532`) reuses the
@@ -102,6 +106,38 @@ independent of fullness** (more empty blocks per native block). The fix already 
 `cand/r5-resident-books-stale-rebuild-restack-restack-restack` (196166b `advance the rank8
 resident-book holder across untouched blocks` + test 4fb0831 + telemetry 4aaef1d; 390 lines, not an
 ancestor of `perf/matched-200k`). It is candidate #1 below.
+
+### 1.4 The ~250 ms/blk `phase1_actions` swing is RUN LENGTH, not the box (bl4, settled)
+
+`phase1_actions` read 121–125 ms on every 120 s cell and 375–394 ms on every 300 s cell, on the
+*same* binaries. Neither the box nor the code moved: **phase1 grows monotonically inside a run**, and
+a 120 s cell stops before the expensive windows. Measured by re-summarizing stored result dirs with
+the bl4 `windows_60s` series (`resummarize.sh`, no new cells):
+
+| cell | dur | node md5 | phase1 ms/blk by 60 s window (loaded) | resting orders | cell avg | `first120_ms` |
+|---|---|---|---|---|---|---|
+| `bl2-merged-confirm-10m` | 300 s | 2723f158 | 56.7 → 236.0 → 402.6 → 752.1 → 975.6 | 0.62M → 1.52M | 374.8 | **136.9** |
+| `bl2-flush-1deep-…-off-10m-r1` | 120 s | 2723f158 | 49.6 → 248.1 | 0.62M → 1.05M | 115.2 | **140.8** |
+| `bl3-merged-confirm-10m` | 300 s | bcd18bdc | 55.4 → 226.0 → 465.9 → 698.0 → 790.9 | 0.63M → 1.83M | 383.9 | **129.3** |
+| `bl3-resident-books-…-off-r1` | 120 s | bcd18bdc | 57.6 → 253.3 | 0.62M → 1.05M | 125.0 | **144.0** |
+| `r9-merged-confirm-10m-r2` | 300 s | 33c423fc | 42.3 → 230.2 → 438.3 → 579.8 → 825.6 | 0.62M → 1.74M | 391.5 | **126.6** |
+
+Two same-binary pairs (2723f158, bcd18bdc) sit **3.3x apart on the cell average and within 3 % on
+`first120_ms`**. The swing is a window-truncation artefact, full stop.
+
+**Mechanism.** Phase 1 is the non-PlaceOrder action loop, and the bench interleaves
+`CancelAllOrders` (`tools/bench-throughput/src/main.rs`, `cancel_fraction`). `exec_cancel_all` with
+`market_id: None` walks **every** book and removes **every** one of the sender's resting orders
+(`native_executor.rs`), so one action costs O(that sender's resting depth) while the action count
+per block stays pinned at the ~200 block cap. Resting depth triples over a 300 s run, and so does
+phase1. This is a *property of the load shape*, not a node defect — but it means:
+
+- **Never compare `phase1_actions_ms`, `engine_ms` or `block_ms` across cell durations.** Use
+  `phase1_drift.first120_ms`, or hold the duration fixed. §1.2's own table violates this.
+- A ≥8 % verdict taken from cells of unequal length is not a verdict.
+- Whether the *unit* cost is also rising (an O(depth) cancel path = a real lever) or only the volume
+  is, is answered by `phase1_us_per_cancelled_order` — `None` on every cell that predates the bl4
+  counters, so it needs one cell on a bl4 binary. See §7.
 
 ---
 
@@ -536,6 +572,11 @@ wall (300 m). Default OFF; never a 10 m lever.
 ## 7. Open questions
 
 - pass-1 vs pass-2 share of `save_books` in production (decides candidate 4).
+- **(bl4 follow-up)** Is the Phase-1 growth of §1.4 pure VOLUME (each cancel-all removes more orders
+  as the book deepens) or is the cancel path itself O(depth) per order? One cell on a binary carrying
+  `torus_exec_phase1_orders_cancelled_total` answers it: `phase1_us_per_cancelled_order` flat across
+  windows = volume (nothing to fix in the node — fix the comparison); rising = `cancel_all`'s
+  per-book walk is a genuine ~700 ms/blk lever at depth. Every stored cell predates the counter.
 - Is ingress (RATE=76k, cap 200) already within 15 % of the exec chain at 10 m? A RATE=100k probe on
   1dcf339 answers it before candidate 3 is benched; if yes, candidate 3's win shows in `chain_ms`
   and `handoff_wait`, not matched/s, and the throughput claim must wait for the cap resweep.

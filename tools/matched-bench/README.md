@@ -192,6 +192,53 @@ post_engine_tail + engine_untimed == engine`.
 pre-r6 node binary — which is itself the 'binary is stale' tell.
 Harness self-test: `python3 tools/matched-bench/test_summarize.py`.
 
+## Phase-1 drift (bl4 phase1-actions-drift-attribution)
+
+`phase1_actions_ms` is the ONE phase column that is not comparable across cell
+durations, and the cell average hides why. `phase_by_node.<val>` therefore also
+carries:
+
+- `windows_60s` — one row per 60 s window of `[t_bench0, t_drain]`: every phase
+  in ms/native-block, `fills_per_block` / `placed_per_block` /
+  `actions_per_block`, `resting_orders_end`, and `in_bench_window` (false once
+  the bench stopped submitting — a DRAIN window runs the backlog down and
+  phase1 falls back, which would read as the drift reversing).
+- `phase1_drift` — the mechanical verdict over the LOADED windows:
+  `first_ms` / `last_ms` / `max_ms`, `growth_ratio` (max/first),
+  `resting_growth_ratio`, `first120_ms` (the block-weighted mean of windows
+  0-1 — the cell-duration parity column, see above) and `window_avg_ms`.
+  `verdict` is `grows_with_run_length` (>=2x over >=3 loaded windows), `flat`
+  (<1.5x), `inconclusive`, or `too_few_windows` — which is what a 120 s cell
+  gets, because two windows cannot resolve drift.
+- `phase1_actions_per_block` / `phase1_orders_cancelled_per_block` /
+  `phase1_us_per_cancelled_order` from the two bl4 workload counters
+  (`torus_exec_phase1_actions_processed_total`,
+  `torus_exec_phase1_orders_cancelled_total`). The span alone cannot tell
+  "more cancels arrived" from "each cancel got slower as the book deepened":
+  `CancelAllOrders { market_id: None }` walks every book and removes every one
+  of the sender's resting orders, so ONE action costs O(depth). Flat unit cost
+  + rising cancelled-orders = volume; rising unit cost = the cancel path
+  itself is the lever. All three read `None` (never `0.0`) on a pre-bl4 binary.
+
+WHAT THIS SETTLED (measured, no new cells — `resummarize.sh` over stored dirs):
+the 3x phase1_actions swing between 120 s and 300 s cells is entirely window
+truncation, NOT box contention. Within one 300 s cell phase1 climbs ~50 ->
+~800-980 ms/blk as resting depth goes ~0.62M -> ~1.8M orders; a 120 s cell
+stops after window 1. On `first120_ms` every cell agrees:
+
+| cell | dur | node md5 | cell-avg phase1 | `first120_ms` |
+|---|---|---|---|---|
+| bl2-merged-confirm-10m | 300 | 2723f158 | 374.8 | 136.9 |
+| bl2-flush-1deep-…-off-10m-r1 | 120 | 2723f158 | 115.2 | 140.8 |
+| bl3-merged-confirm-10m | 300 | bcd18bdc | 383.9 | 129.3 |
+| bl3-resident-books-…-off-r1 | 120 | bcd18bdc | 125.0 | 144.0 |
+| r9-merged-confirm-10m-r2 | 300 | 33c423fc | 391.5 | 126.6 |
+
+Two of those are SAME-BINARY pairs (2723f158, bcd18bdc): 3.3x apart on the
+cell average, within 3% on `first120_ms`. So: never compare `phase1_actions_ms`
+(or any engine/block number that contains it) across cell durations — use
+`first120_ms`, or hold the duration fixed.
+
 ## Rules baked in
 
 - matched/s ONLY from `torus_orders_matched_total` deltas; never bench-side math,
