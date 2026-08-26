@@ -58,10 +58,17 @@ pub fn parse_exec_pipeline_toggle(v: Option<String>) -> bool {
 pub enum Job {
     /// A native block: flush its frozen pending set (state + trie + marker in one
     /// atomic batch), then resync the EVM mirror for `evm_addrs` (usually empty).
+    /// Item 6a: `books` optionally carries the block's DEFERRED mode-2/3 book
+    /// save pass 2 (`save_order_books_deferred` on E); W applies it into a
+    /// sidecar pending set whose entries join the SAME atomic batch and the
+    /// SAME native-root inputs as `pending` — byte-identical durable state to
+    /// the serial on-E save, with the ~write half of save_books off E's
+    /// critical path. `None` = exactly the pre-item-6a job.
     Flush {
         height: u64,
         pending: Arc<FrozenPending>,
         evm_addrs: Vec<Address>,
+        books: Option<torus_bridge::native_executor::DeferredBookSave>,
     },
     /// An empty / non-native block: advance the applied-height marker, in order
     /// behind the previous block's batch. `pending` is the 1-key marker layer the
@@ -362,7 +369,30 @@ fn run_job(env: &WorkerEnv, job: &Job) -> Result<(), JobError> {
             height,
             pending,
             evm_addrs,
+            books,
         } => {
+            // Item 6a: apply the deferred book-save pass 2 (if any) into a
+            // sidecar overlay FIRST — reads (stop-row diff, meta compare) see
+            // heights < `height` durable plus this job's own earlier markets,
+            // exactly the view the exec thread's serial pass 2 had — then fold
+            // the sidecar into the flush below so the book bytes share the one
+            // atomic batch (and the root computation) with state + marker.
+            // `exec_save_books_write_seconds` keeps one observation per native
+            // block: E observes it on the serial save, W observes it here.
+            let sidecar = books.as_ref().map(|b| {
+                let overlay = torus_state::NativeStateOverlay::new(env.state_db.clone());
+                let t = std::time::Instant::now();
+                torus_bridge::native_executor::apply_deferred_book_save(
+                    &overlay,
+                    env.metrics.as_deref(),
+                    b,
+                );
+                if let Some(m) = &env.metrics {
+                    m.exec_save_books_write_seconds
+                        .observe(t.elapsed().as_secs_f64());
+                }
+                overlay.freeze(*height)
+            });
             let flush_result = {
                 let mut trie_cache = env
                     .trie_cache
@@ -382,7 +412,8 @@ fn run_job(env: &WorkerEnv, job: &Job) -> Result<(), JobError> {
                 } else {
                     None
                 };
-                pending.flush_with_native_trie_stats(
+                pending.flush_with_sidecar_native_trie_stats(
+                    sidecar.as_deref(),
                     &env.state_db,
                     Some(*height),
                     cache_opt,
