@@ -2873,10 +2873,16 @@ struct CachedVerdict {
     /// In-flight hash notes from the compact path, applied on the algo thread at
     /// hit time (`InFlightHashLedger` is algo-thread state; s355 guard).
     notes: Vec<(u64, Vec<torus_types::B256>)>,
-    /// `last_header.height` when the worker read committed state (sessions /
-    /// validator set) for signature verification. A hit whose basis no longer
-    /// equals the CURRENT committed height is DISCARDED (sync fallback): the
-    /// async path must never vote differently than the sync path would NOW.
+    /// The EXEC-APPLIED frontier (`read_native_applied_height`, the marker
+    /// written in / sequenced behind the same atomic batch as native state)
+    /// when the worker read applied state (sessions / validator registry) for
+    /// signature verification. A hit whose basis no longer equals the CURRENT
+    /// applied frontier is DISCARDED (sync fallback): the async path must never
+    /// vote differently than the sync path would NOW. The COMMIT frontier is
+    /// the WRONG basis here — `validate_body_checks_core` reads state written
+    /// by the exec thread, which lags commit arbitrarily and catches up (e.g.
+    /// revoking a session a later proposal's actions use) WITHOUT any new
+    /// commit (review finding, perf/matched-200k item 3).
     basis_height: u64,
 }
 
@@ -2891,9 +2897,6 @@ struct AsyncValidateShared {
     /// bytes — the same sha256 `validate_block` recomputes for `data_hash`, so a
     /// hit can never cover different bytes and forks necessarily have distinct keys.
     cache: std::sync::Mutex<std::collections::HashMap<[u8; 32], CachedVerdict>>,
-    /// Mirror of `last_header.height`, stored by the algo thread as commits apply
-    /// — the worker stamps each verdict's `basis_height` from it.
-    committed_height: AtomicU64,
     /// Mirror of `last_validator_set.validators.len()` for best-effort shard
     /// custody (erasure params). Epoch rotations refresh it; a one-block stale
     /// count at a boundary only degrades custody, never the vote.
@@ -2973,11 +2976,14 @@ impl AsyncValidateWorker {
                     if worker_shared.cache.lock().unwrap().contains_key(&key) {
                         continue; // duplicate delivery (loopback + gossip + direct)
                     }
-                    // Record the committed-state basis BEFORE reading state for
-                    // verification; re-checked after, so a commit applying mid-
-                    // validation discards the verdict instead of caching a reply
-                    // the sync path might no longer give.
-                    let basis = worker_shared.committed_height.load(Ordering::Relaxed);
+                    // Record the exec-applied basis BEFORE reading state for
+                    // verification; re-checked after, so an exec apply landing
+                    // mid-validation discards the verdict instead of caching a
+                    // reply the sync path might no longer give. Read through the
+                    // DB (not an atomic mirror): the marker shares (or is
+                    // sequenced behind) the state batch, so a snapshot showing
+                    // marker A also shows every session/staking write of <= A.
+                    let basis = read_native_applied_height(&state_db).unwrap_or(0);
                     let mut notes = Vec::new();
                     let block = match TorusApp::decode_proposal_and_ensure_durable_core(
                         Some(&mempool),
@@ -3000,8 +3006,8 @@ impl AsyncValidateWorker {
                     ) {
                         continue; // no negative caching — sync path decides
                     }
-                    if worker_shared.committed_height.load(Ordering::Relaxed) != basis {
-                        continue; // committed state moved mid-validation — discard
+                    if read_native_applied_height(&state_db).unwrap_or(0) != basis {
+                        continue; // exec applied state mid-validation — discard
                     }
                     worker_shared.insert_bounded(
                         key,
@@ -3398,7 +3404,6 @@ impl TorusApp {
             Some(old) => old.shared.clone(),
             None => Arc::new(AsyncValidateShared {
                 cache: std::sync::Mutex::new(std::collections::HashMap::new()),
-                committed_height: AtomicU64::new(self.last_header.height),
                 validator_count: AtomicUsize::new(self.last_validator_set.validators.len()),
             }),
         };
@@ -4265,13 +4270,16 @@ impl TorusApp {
         // EXACT bytes — the cache key IS the sha256 recomputed and bound to
         // `data_hash` just above, so a hit can never cover different bytes, and
         // different forks necessarily miss each other's entries. Consume-once; a
-        // verdict whose committed-state basis moved (a commit applied since the
-        // worker read sessions/validators) is DISCARDED in favor of the full
-        // sync path below. The algo-thread-only checks (fail-stop above;
+        // verdict whose exec-applied basis moved (the exec thread applied a
+        // block — session/staking writes — since the worker read them) is
+        // DISCARDED in favor of the full sync path below. The COMMIT frontier
+        // is NOT the basis: exec lags commit arbitrarily and advances without
+        // new commits. The algo-thread-only checks (fail-stop above;
         // ancestry + bookkeeping in `finish_validate`) run on EVERY path.
         if let Some(ref av) = self.async_validate {
             if let Some(verdict) = av.take_verdict(&computed) {
-                if verdict.basis_height == self.last_header.height {
+                let applied = read_native_applied_height(&self.state_db).unwrap_or(0);
+                if verdict.basis_height == applied {
                     for (height, hashes) in verdict.notes {
                         self.in_flight_hashes.note(height, hashes);
                     }
@@ -4280,8 +4288,8 @@ impl TorusApp {
                 tracing::debug!(
                     height = verdict.block.header.height,
                     basis = verdict.basis_height,
-                    committed = self.last_header.height,
-                    "async-validate verdict stale (committed state moved) — sync fallback"
+                    applied,
+                    "async-validate verdict stale (exec-applied state moved) — sync fallback"
                 );
             }
         }
@@ -4781,13 +4789,10 @@ impl App<RocksKVStore> for TorusApp {
         if height > self.last_header.height {
             self.last_header = header.clone();
             self.leader_state.set_view(height.saturating_add(1));
-            // Item 3: the committed frontier moved — async-validate verdicts based
-            // on the older committed state must not be served (stale-basis rule).
-            if let Some(ref av) = self.async_validate {
-                av.shared
-                    .committed_height
-                    .store(self.last_header.height, Ordering::Relaxed);
-            }
+            // Item 3: no async-validate invalidation here — the stale-basis rail
+            // is keyed to the EXEC-APPLIED frontier (the only state
+            // `validate_body_checks_core` reads); a commit alone changes nothing
+            // a cached verdict depends on (ancestry re-runs live at hit time).
         }
 
         // Slashes detected during THIS commit ride with THIS block into the
@@ -8282,6 +8287,95 @@ mod crash_recovery_tests {
         );
     }
 
+    /// Review finding (perf/matched-200k item 3): the stale-basis rail must key
+    /// off the EXEC-APPLIED frontier, not the commit frontier.
+    /// `validate_body_checks_core` reads state the EXEC thread writes
+    /// (sessions, staking), and exec lags commit arbitrarily — it catches up
+    /// WITHOUT any new commit. Scenario pinned here: the worker caches a Valid
+    /// verdict for a session-signed action; exec then applies blocks that
+    /// revoke that session (delete_session + applied-marker advance) while
+    /// `last_header.height` never moves; the sync path NOW rejects, so the
+    /// cached Valid must be discarded — serving it is a vote-safety divergence.
+    /// RED on the committed-frontier rail: basis==last_header.height still
+    /// holds, the cached Valid is served, and this test sees Valid.
+    #[test]
+    fn async_validate_exec_frontier_basis_invalidation_vote_flip() {
+        let (mut app, _mempool, _metrics) = make_async_validate_app();
+
+        // Register a session and build a proposal whose only action it signs.
+        let session_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let pubkey = session_key.verifying_key().to_bytes();
+        app.state_db
+            .put_session(
+                &pubkey,
+                &torus_types::SessionData {
+                    owner: Address::new([0xCD; 20]),
+                    expiry: 10_000_000,
+                    scope: torus_types::SessionScope::Trading,
+                    created_at: 0,
+                },
+            )
+            .unwrap();
+        let action = torus_types::eip712::sign_native_action_with_session(
+            NativeAction::CancelOrder { order_id: 1 },
+            1,
+            &session_key,
+        );
+        let block = make_block(5, vec![action]);
+        let datum = encode_proposal_datum(&block, false);
+        assert!(app.async_validate_handle().unwrap().submit(datum.clone()));
+        wait_for_cached(&app, 1);
+
+        // Exec catches up (no new commit): the block apply revokes the session
+        // and advances the applied marker. The commit frontier is untouched.
+        app.state_db.delete_session(&pubkey).unwrap();
+        write_native_applied_height(&app.state_db, 1);
+
+        let resp = app.validate_datum(&datum, &data_hash_of(&datum));
+        assert!(
+            matches!(resp, ValidateBlockResponse::Invalid),
+            "exec-applied frontier moved (session revoked) — the cached Valid \
+             must NOT be served; the sync path NOW rejects"
+        );
+        assert_eq!(async_cache_len(&app), 0, "stale entry is discarded");
+    }
+
+    /// Converse of the exec-frontier rail: a commit landing WITHOUT exec
+    /// catching up changes nothing `validate_body_checks_core` reads (ancestry
+    /// and fail-stop re-run live at hit time), so the verdict basis still holds
+    /// and the hit path must survive — the deep-exec-queue regime this branch
+    /// targets is exactly where commits outrun exec.
+    #[test]
+    fn async_validate_commit_without_exec_still_hits() {
+        let (mut app, _mempool, metrics) = make_async_validate_app();
+        let block = make_block(5, vec![sign_claim_rewards(1)]);
+        let datum = encode_proposal_datum(&block, false);
+        assert!(app.async_validate_handle().unwrap().submit(datum.clone()));
+        wait_for_cached(&app, 1);
+
+        // A commit applies but the exec thread has NOT caught up: the applied
+        // marker is unmoved, only the committed frontier advances.
+        app.last_header.height += 1;
+
+        let decode_before = metric_count(
+            &metrics.encode(),
+            "torus_validate_block_decode_seconds_count",
+        );
+        let resp = app.validate_datum(&datum, &data_hash_of(&datum));
+        assert!(matches!(resp, ValidateBlockResponse::Valid { .. }));
+        assert_eq!(
+            metric_count(
+                &metrics.encode(),
+                "torus_validate_block_decode_seconds_count"
+            ),
+            decode_before,
+            "applied frontier unchanged — the cached verdict must be served (hit)"
+        );
+    }
+
+    /// The applied marker moving WITHOUT any semantic state change still forces
+    /// the sync fallback (conservative direction of the rail): a discarded
+    /// verdict only costs the inline re-validation, never a wrong vote.
     #[test]
     fn async_validate_stale_state_basis_invalidation() {
         let (mut app, _mempool, metrics) = make_async_validate_app();
@@ -8290,9 +8384,9 @@ mod crash_recovery_tests {
         assert!(app.async_validate_handle().unwrap().submit(datum.clone()));
         wait_for_cached(&app, 1);
 
-        // A commit applies: the committed frontier (and the session/validator
+        // Exec applies a block: the applied frontier (and the session/validator
         // state the worker verified against) moves. The verdict's basis is stale.
-        app.last_header.height += 1;
+        write_native_applied_height(&app.state_db, 1);
 
         let decode_before = metric_count(
             &metrics.encode(),
