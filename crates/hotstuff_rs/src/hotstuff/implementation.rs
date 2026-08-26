@@ -385,17 +385,21 @@ impl<N: Network> HotStuff<N> {
                     } = app.produce_block(produce_block_request);
 
                     let block = Block::new(child_height, highest_pc, data_hash, data);
-                    block_tree.insert(
-                        &block,
-                        app_state_updates.as_ref(),
-                        validator_set_updates.as_ref(),
-                    )?;
-                    Event::InsertBlock(InsertBlockEvent {
-                        timestamp: SystemTime::now(),
-                        block: block.clone(),
-                    })
-                    .publish(&self.event_publisher);
-                    let update_result = block_tree.update(&block.justify, &self.event_publisher).unwrap_or_else(|e| {
+                    // Batched propose (perf/matched-200k): insert + update commit
+                    // in ONE atomic write batch, flushed inside
+                    // `insert_and_update` BEFORE the header broadcast below —
+                    // the safety vars (locked/highest PC) keep their pre-send
+                    // durability point. Outer `?` = insert failed (nothing
+                    // durable, do not propose); inner Err = update failed with
+                    // the insert durable, handled exactly as before.
+                    let update_result = block_tree
+                        .insert_and_update(
+                            &block,
+                            app_state_updates.as_ref(),
+                            validator_set_updates.as_ref(),
+                            &self.event_publisher,
+                        )?
+                        .unwrap_or_else(|e| {
                         if let BlockTreeError::BlockExpectedButNotFound { block: missing } = &e {
                             log::warn!("enter_view: missing block {:?} in commit chain — triggering sync", missing);
                             self.sync_needed = true;
@@ -605,19 +609,20 @@ impl<N: Network> HotStuff<N> {
 
                     // Proposer self-inserts before broadcasting: ensures the block
                     // is in the tree before QC forms and next view references it.
-                    block_tree.insert(
-                        &block,
-                        app_state_updates.as_ref(),
-                        validator_set_updates.as_ref(),
-                    )?;
-                    Event::InsertBlock(InsertBlockEvent {
-                        timestamp: SystemTime::now(),
-                        block: block.clone(),
-                    })
-                    .publish(&self.event_publisher);
-
+                    // Batched propose (perf/matched-200k): insert + update commit
+                    // in ONE atomic write batch, flushed inside
+                    // `insert_and_update` BEFORE the header broadcast below —
+                    // the safety vars (locked/highest PC) keep their pre-send
+                    // durability point. Outer `?` = insert failed (nothing
+                    // durable, do not propose); inner Err = update failed with
+                    // the insert durable, handled exactly as before.
                     let update_result = block_tree
-                        .update(&block.justify, &self.event_publisher)
+                        .insert_and_update(
+                            &block,
+                            app_state_updates.as_ref(),
+                            validator_set_updates.as_ref(),
+                            &self.event_publisher,
+                        )?
                         .unwrap_or(UpdateResult {
                             validator_set_updates: None,
                             committed_block_hashes: vec![],

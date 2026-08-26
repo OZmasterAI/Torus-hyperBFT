@@ -36,8 +36,8 @@ use ed25519_dalek::VerifyingKey;
 
 use crate::{
     events::{
-        CommitBlockEvent, Event, PruneBlockEvent, UpdateHighestPCEvent, UpdateLockedPCEvent,
-        UpdateValidatorSetEvent,
+        CommitBlockEvent, Event, InsertBlockEvent, PruneBlockEvent, UpdateHighestPCEvent,
+        UpdateLockedPCEvent, UpdateValidatorSetEvent,
     },
     hotstuff::types::PhaseCertificate,
     pacemaker::types::TimeoutCertificate,
@@ -97,6 +97,16 @@ fn note_gap_commit_deferral(block: &CryptoHash) -> Option<u64> {
 pub struct UpdateResult {
     pub validator_set_updates: Option<ValidatorSetUpdates>,
     pub committed_block_hashes: Vec<CryptoHash>,
+}
+
+/// What [`BlockTreeSingleton::update_core`] staged into the caller's write
+/// batch: the event payloads that must be published only AFTER the batch is
+/// durably committed, plus the committed blocks (with their validator set
+/// updates) from which the [`UpdateResult`] is derived.
+struct UpdateCoreOutcome {
+    update_highest_pc: Option<PhaseCertificate>,
+    update_locked_pc: Option<PhaseCertificate>,
+    committed_blocks: Vec<(CryptoHash, Option<ValidatorSetUpdates>)>,
 }
 
 /// Read and write handle into the block tree that should be owned exclusively by the algorithm thread.
@@ -283,7 +293,24 @@ impl<K: KVStore> BlockTreeSingleton<K> {
         validator_set_updates: Option<&ValidatorSetUpdates>,
     ) -> Result<(), BlockTreeError> {
         let mut wb = BlockTreeWriteBatch::new();
+        self.insert_into(&mut wb, block, app_state_updates, validator_set_updates)?;
 
+        // Atomically write the above changes to persistent storage.
+        self.write(wb);
+
+        Ok(())
+    }
+
+    /// Stage the writes of [`insert`](Self::insert) into a caller-provided `wb`
+    /// WITHOUT flushing — the batched-propose building block. The caller is
+    /// responsible for committing `wb` with [`write`](Self::write).
+    fn insert_into(
+        &mut self,
+        wb: &mut BlockTreeWriteBatch<K::WriteBatch>,
+        block: &Block,
+        app_state_updates: Option<&AppStateUpdates>,
+        validator_set_updates: Option<&ValidatorSetUpdates>,
+    ) -> Result<(), BlockTreeError> {
         // Set block, which entails setting block's fields in separate key-value pairs.
         wb.set_block(block)?;
 
@@ -302,9 +329,6 @@ impl<K: KVStore> BlockTreeSingleton<K> {
         let mut siblings = self.children(&block.justify.block).unwrap_or_default();
         siblings.push(block.hash);
         wb.set_children(&block.justify.block, &siblings)?;
-
-        // Atomically write the above changes to persistent storage.
-        self.write(wb);
 
         Ok(())
     }
@@ -333,7 +357,133 @@ impl<K: KVStore> BlockTreeSingleton<K> {
         event_publisher: &Option<Sender<Event>>,
     ) -> Result<UpdateResult, BlockTreeError> {
         let mut wb = BlockTreeWriteBatch::new();
+        let outcome = self.update_core(&mut wb, justify)?;
 
+        // Single atomic flush: highest/locked PC, the commit walk, the decided
+        // flag, AND the reputation/speculative bookkeeping (which historically
+        // each self-flushed into their own write-group entry).
+        self.write(wb);
+
+        Ok(self.finish_update(outcome, event_publisher))
+    }
+
+    /// Leader propose path (perf/matched-200k): stage [`insert`](Self::insert)
+    /// and [`update`](Self::update) into ONE write batch and commit it with a
+    /// single atomic [`write`](Self::write).
+    ///
+    /// The propose sequence historically issued 4-6 individual KV writes per
+    /// view (insert, update main batch, leader reputation, speculative
+    /// commits), each queueing separately in the RocksDB write group behind
+    /// exec-flush batches (20-25 ms/view of `propose_build - block_build`).
+    /// This method collapses them into one write-group entry.
+    ///
+    /// ## Safety-persistence ordering
+    ///
+    /// The batch — which contains every vote/lock-safety variable the update
+    /// touches (LOCKED_PC, HIGHEST_PC) together with the proposed block — is
+    /// flushed BEFORE this method returns, and callers broadcast the proposal
+    /// only after it returns. The pre-send durability point is therefore
+    /// unchanged from the sequential path.
+    ///
+    /// ## Return value and error semantics (mirrors the sequential path)
+    ///
+    /// * `Err(_)` — the insert itself failed; nothing was written, no events
+    ///   published. (Sequential analogue: `insert` returned `Err`.)
+    /// * `Ok(Err(_))` — the update core failed. The batch is discarded
+    ///   ATOMICALLY and the insert alone is re-staged and flushed, so the
+    ///   proposer can still serve the block; none of the update's writes (or
+    ///   cache mutations — the core mutates no cache before its last fallible
+    ///   step) land. (Sequential analogue: `insert` succeeded, `update`
+    ///   returned `Err`.)
+    /// * `Ok(Ok(result))` — everything committed in one batch.
+    ///
+    /// ## Events and metrics
+    ///
+    /// [`InsertBlockEvent`] is published here (not by the caller), immediately
+    /// after the flush and before the update events, preserving the sequential
+    /// event order. Note for the `torus_view_propose_build_seconds` /
+    /// `view_propose_finalize` split (both derived from
+    /// StartView->InsertBlock->Propose timestamps): InsertBlock now fires after
+    /// the single batched flush, so "build" absorbs the update+flush time that
+    /// "finalize" used to carry. Their SUM (`propose_delay`) is unchanged —
+    /// campaign comparisons must use the sum.
+    pub(crate) fn insert_and_update(
+        &mut self,
+        block: &Block,
+        app_state_updates: Option<&AppStateUpdates>,
+        validator_set_updates: Option<&ValidatorSetUpdates>,
+        event_publisher: &Option<Sender<Event>>,
+    ) -> Result<Result<UpdateResult, BlockTreeError>, BlockTreeError> {
+        let mut wb = BlockTreeWriteBatch::new();
+        self.insert_into(&mut wb, block, app_state_updates, validator_set_updates)?;
+
+        match self.update_core(&mut wb, &block.justify) {
+            Ok(outcome) => {
+                // The single per-propose flush. MUST happen before the caller
+                // sends any network message referencing this view's state.
+                self.write(wb);
+
+                Event::InsertBlock(InsertBlockEvent {
+                    timestamp: SystemTime::now(),
+                    block: block.clone(),
+                })
+                .publish(event_publisher);
+
+                Ok(Ok(self.finish_update(outcome, event_publisher)))
+            }
+            Err(update_err) => {
+                // Discard the combined batch atomically, then re-stage and
+                // flush the insert ALONE — the exact end state of the
+                // sequential `insert` (flushed) + `update` (failed, batch
+                // discarded) path. `insert_into` is deterministic and nothing
+                // was flushed, so re-running it yields identical writes.
+                drop(wb);
+                self.insert(block, app_state_updates, validator_set_updates)?;
+
+                Event::InsertBlock(InsertBlockEvent {
+                    timestamp: SystemTime::now(),
+                    block: block.clone(),
+                })
+                .publish(event_publisher);
+
+                Ok(Err(update_err))
+            }
+        }
+    }
+
+    /// The shared core of [`update`](Self::update) and
+    /// [`insert_and_update`](Self::insert_and_update): stage every write of
+    /// the update sequence into the caller's `wb` WITHOUT flushing.
+    ///
+    /// ## Contract
+    ///
+    /// * On `Ok`, the caller MUST commit `wb` via [`write`](Self::write) and
+    ///   only then publish events (via [`finish_update`](Self::finish_update)).
+    /// * On `Err`, the caller MUST discard `wb` unflushed. Every fallible step
+    ///   here runs BEFORE the first write-through cache mutation (the
+    ///   reputation/speculative section swallows its errors, exactly like the
+    ///   sequential path did), so discarding the batch cannot leave the
+    ///   caches out of sync with the KV.
+    ///
+    /// ## Read-your-writes audit (pinned by `propose_batching_tests`)
+    ///
+    /// While `wb` is pending, KV reads see pre-batch state. This is safe
+    /// because no read in this sequence depends on a key pending in `wb`:
+    /// * step 1 reads HIGHEST_PC before (possibly) staging it;
+    /// * `pc_to_lock`/`block_to_commit`/`commit` only read `justify.block` and
+    ///   its ancestors — all durable before this call (a pending
+    ///   `insert_into` block is a CHILD of `justify.block`, never read here);
+    /// * `leader_reputation`/`speculative_commits` are served by their
+    ///   write-through caches, which the `_into` setters refresh at staging
+    ///   time — intra-batch reads therefore equal post-flush reads;
+    /// * `committed_validator_set` post-flush is reproduced pre-flush by
+    ///   applying this update's committed validator-set updates in commit
+    ///   order (`effective_committed_vs` below).
+    fn update_core(
+        &mut self,
+        wb: &mut BlockTreeWriteBatch<K::WriteBatch>,
+        justify: &PhaseCertificate,
+    ) -> Result<UpdateCoreOutcome, BlockTreeError> {
         let mut update_locked_pc: Option<PhaseCertificate> = None;
         let mut update_highest_pc: Option<PhaseCertificate> = None;
         let mut committed_blocks: Vec<(CryptoHash, Option<ValidatorSetUpdates>)> = Vec::new();
@@ -352,7 +502,7 @@ impl<K: KVStore> BlockTreeSingleton<K> {
 
         // 3. Commit block(s) if needed (MonadBFT 2-chain irrevocable commit).
         if let Some(block) = invariants::block_to_commit(justify, self)? {
-            committed_blocks = self.commit(&mut wb, &block)?;
+            committed_blocks = self.commit(wb, &block)?;
         }
 
         // 4. Set validator set updates as decided if needed.
@@ -360,7 +510,20 @@ impl<K: KVStore> BlockTreeSingleton<K> {
             wb.set_validator_set_update_decided(true)?
         }
 
-        self.write(wb);
+        // The committed validator set as it will read AFTER `wb` is flushed:
+        // the current committed set plus the validator-set updates of the
+        // blocks committed in step 3, applied in commit order. The sequential
+        // path read this from the KV after its intermediate flush; computing
+        // it here keeps the reputation bookkeeping byte-identical while the
+        // commit's `set_committed_validator_set` is still pending in `wb`.
+        let effective_committed_vs = self.committed_validator_set().map(|mut vs| {
+            for (_, validator_set_updates_opt) in &committed_blocks {
+                if let Some(updates) = validator_set_updates_opt {
+                    vs.apply_updates(updates);
+                }
+            }
+            vs
+        });
 
         // MonadBFT B3: Record leader success on QC advancement.
         // Every new highest QC is a positive reputation signal — the leader of that
@@ -368,23 +531,23 @@ impl<K: KVStore> BlockTreeSingleton<K> {
         // than commit-only success, preventing the reputation death spiral where
         // commits require consecutive QC views but reputation degradation prevents them.
         if update_highest_pc.is_some() && !justify.is_genesis_pc() {
-            if let Ok(vs) = self.committed_validator_set() {
+            if let Ok(vs) = &effective_committed_vs {
                 let qc_leader = match self.leader_reputation() {
                     Ok(ref rep) => crate::pacemaker::implementation::select_leader_with_reputation(
                         justify.view,
-                        &vs,
+                        vs,
                         rep,
                     ),
-                    Err(_) => crate::pacemaker::implementation::select_leader(justify.view, &vs),
+                    Err(_) => crate::pacemaker::implementation::select_leader(justify.view, vs),
                 };
-                let _ = self.record_leader_success(&qc_leader);
+                let _ = self.record_leader_success_into(wb, &qc_leader);
             }
         }
 
         // MonadBFT B2: Promote irrevocably committed blocks from speculative list.
         // MonadBFT B3: Record leader success for reputation tracking (on commit).
         for (block_hash, _) in &committed_blocks {
-            let _ = self.promote_speculative_to_irrevocable(block_hash);
+            let _ = self.promote_speculative_to_irrevocable_into(wb, block_hash);
             // The block's justify tells us the view in which it was proposed.
             // The leader of that view gets a reputation success.
             if let Ok(block_justify) = self.block_justify(block_hash) {
@@ -395,8 +558,7 @@ impl<K: KVStore> BlockTreeSingleton<K> {
                     // who proposed the committed block. The committed block's view is in its
                     // height context. For reputation, we use the committed validator set
                     // leader selection.
-                    let committed_vs = self.committed_validator_set();
-                    if let Ok(vs) = committed_vs {
+                    if let Ok(vs) = &effective_committed_vs {
                         // The block's proposer is the leader of the view where the block was inserted.
                         // For pipelined mode, blocks are committed by 2-chain: the grandparent.
                         // The committed block was proposed in a view we can approximate from
@@ -406,30 +568,50 @@ impl<K: KVStore> BlockTreeSingleton<K> {
                             Ok(ref rep) => {
                                 crate::pacemaker::implementation::select_leader_with_reputation(
                                     proposed_view,
-                                    &vs,
+                                    vs,
                                     rep,
                                 )
                             }
                             Err(_) => {
-                                crate::pacemaker::implementation::select_leader(proposed_view, &vs)
+                                crate::pacemaker::implementation::select_leader(proposed_view, vs)
                             }
                         };
-                        let _ = self.record_leader_success(&leader);
+                        let _ = self.record_leader_success_into(wb, &leader);
                     }
                 }
             }
         }
 
-        Self::publish_update_block_tree_events(
-            event_publisher,
+        Ok(UpdateCoreOutcome {
             update_highest_pc,
             update_locked_pc,
-            &committed_blocks,
+            committed_blocks,
+        })
+    }
+
+    /// Post-flush tail shared by [`update`](Self::update) and
+    /// [`insert_and_update`](Self::insert_and_update): publish the update
+    /// events (only safe AFTER the batch is durably written), run the
+    /// best-effort pruner in its own failure-isolated batch, and derive the
+    /// [`UpdateResult`].
+    fn finish_update(
+        &mut self,
+        outcome: UpdateCoreOutcome,
+        event_publisher: &Option<Sender<Event>>,
+    ) -> UpdateResult {
+        Self::publish_update_block_tree_events(
+            event_publisher,
+            outcome.update_highest_pc,
+            outcome.update_locked_pc,
+            &outcome.committed_blocks,
         );
 
         // Collect committed block hashes (oldest to newest) for on_committed_block callbacks.
-        let committed_block_hashes: Vec<CryptoHash> =
-            committed_blocks.iter().map(|(hash, _)| *hash).collect();
+        let committed_block_hashes: Vec<CryptoHash> = outcome
+            .committed_blocks
+            .iter()
+            .map(|(hash, _)| *hash)
+            .collect();
 
         // Block-tree pruner: bound cf_consensus_meta growth by deleting blocks that
         // fell out of the retention window (no-op unless enabled via
@@ -447,15 +629,16 @@ impl<K: KVStore> BlockTreeSingleton<K> {
         // Safety: a block that updates the validator set must be followed by a block that contains a decide
         // pc. A block becomes committed immediately if its commitPC or decidePC is seen. Therefore, under normal
         // operation, at most 1 validator-set-updating block can be committed at a time.
-        let resulting_vs_update = committed_blocks
+        let resulting_vs_update = outcome
+            .committed_blocks
             .into_iter()
             .rev()
             .find_map(|(_, validator_set_updates_opt)| validator_set_updates_opt);
 
-        Ok(UpdateResult {
+        UpdateResult {
             validator_set_updates: resulting_vs_update,
             committed_block_hashes,
-        })
+        }
     }
 
     /// Advance the Locked PC (and, in lockstep, the Highest PC and the
@@ -1739,18 +1922,29 @@ impl<K: KVStore> BlockTreeSingleton<K> {
     /// Persist the speculative-commits list and refresh the write-through cache
     /// (`self.2`) in lock-step, so a cache HIT equals a fresh KV deserialize.
     fn set_speculative_commits(&mut self, commits: Vec<CryptoHash>) -> Result<(), BlockTreeError> {
-        use borsh::BorshSerialize;
         let mut wb: BlockTreeWriteBatch<K::WriteBatch> = BlockTreeWriteBatch::new();
-        wb.0.set(
-            &variables::SPECULATIVE_COMMITS,
-            &commits
-                .try_to_vec()
-                .map_err(|err| KVSetError::SerializeValueError {
-                    key: Key::HighestTC,
-                    source: err,
-                })?,
-        );
+        self.set_speculative_commits_into(&mut wb, commits)?;
         self.write(wb);
+        Ok(())
+    }
+
+    /// Stage the speculative-commits list into a caller-provided `wb` and
+    /// refresh the write-through cache (`self.2`) at staging time. Serialization
+    /// runs FIRST: on `Err` neither `wb` nor the cache is touched. The caller
+    /// must flush `wb` on every path that staged (batched-propose contract).
+    fn set_speculative_commits_into(
+        &mut self,
+        wb: &mut BlockTreeWriteBatch<K::WriteBatch>,
+        commits: Vec<CryptoHash>,
+    ) -> Result<(), BlockTreeError> {
+        use borsh::BorshSerialize;
+        let bytes = commits
+            .try_to_vec()
+            .map_err(|err| KVSetError::SerializeValueError {
+                key: Key::HighestTC,
+                source: err,
+            })?;
+        wb.0.set(&variables::SPECULATIVE_COMMITS, &bytes);
         *self.2.borrow_mut() = Some(commits);
         Ok(())
     }
@@ -1776,6 +1970,23 @@ impl<K: KVStore> BlockTreeSingleton<K> {
         commits.retain(|b| b != block);
         if commits.len() != before {
             self.set_speculative_commits(commits)?;
+        }
+        Ok(())
+    }
+
+    /// [`promote_speculative_to_irrevocable`](Self::promote_speculative_to_irrevocable),
+    /// staged into a caller-provided `wb` (batched propose path). No-op (no
+    /// staged write) when the block was not in the list.
+    fn promote_speculative_to_irrevocable_into(
+        &mut self,
+        wb: &mut BlockTreeWriteBatch<K::WriteBatch>,
+        block: &CryptoHash,
+    ) -> Result<(), BlockTreeError> {
+        let mut commits = self.speculative_commits()?;
+        let before = commits.len();
+        commits.retain(|b| b != block);
+        if commits.len() != before {
+            self.set_speculative_commits_into(wb, commits)?;
         }
         Ok(())
     }
@@ -2031,20 +2242,31 @@ impl<K: KVStore> BlockTreeSingleton<K> {
         &mut self,
         reputation: &crate::hotstuff::types::LeaderReputation,
     ) -> Result<(), BlockTreeError> {
-        use borsh::BorshSerialize;
         let mut wb: BlockTreeWriteBatch<K::WriteBatch> = BlockTreeWriteBatch::new();
-        wb.0.set(
-            &variables::LEADER_REPUTATION,
-            &reputation
-                .try_to_vec()
-                .map_err(|err| KVSetError::SerializeValueError {
-                    key: Key::HighestTC,
-                    source: err,
-                })?,
-        );
+        self.set_leader_reputation_into(&mut wb, reputation)?;
         self.write(wb);
-        // Write-through: keep the in-mem cache identical to what we just persisted,
-        // so subsequent reads are served from memory without diverging from the KV.
+        Ok(())
+    }
+
+    /// Stage the leader reputation into a caller-provided `wb` and refresh the
+    /// write-through cache (`self.1`) at staging time — the cache stays
+    /// identical to what the flushed batch will persist, so intra-batch reads
+    /// equal post-flush reads. Serialization runs FIRST: on `Err` neither `wb`
+    /// nor the cache is touched. The caller must flush `wb` on every path that
+    /// staged (batched-propose contract).
+    fn set_leader_reputation_into(
+        &mut self,
+        wb: &mut BlockTreeWriteBatch<K::WriteBatch>,
+        reputation: &crate::hotstuff::types::LeaderReputation,
+    ) -> Result<(), BlockTreeError> {
+        use borsh::BorshSerialize;
+        let bytes = reputation
+            .try_to_vec()
+            .map_err(|err| KVSetError::SerializeValueError {
+                key: Key::HighestTC,
+                source: err,
+            })?;
+        wb.0.set(&variables::LEADER_REPUTATION, &bytes);
         *self.1.borrow_mut() = Some(reputation.clone());
         Ok(())
     }
@@ -2055,6 +2277,18 @@ impl<K: KVStore> BlockTreeSingleton<K> {
         let mut rep = self.leader_reputation()?;
         rep.record_success(leader);
         self.set_leader_reputation(&rep)
+    }
+
+    /// [`record_leader_success`](Self::record_leader_success), staged into a
+    /// caller-provided `wb` (batched propose path).
+    fn record_leader_success_into(
+        &mut self,
+        wb: &mut BlockTreeWriteBatch<K::WriteBatch>,
+        leader: &VerifyingKey,
+    ) -> Result<(), BlockTreeError> {
+        let mut rep = self.leader_reputation()?;
+        rep.record_success(leader);
+        self.set_leader_reputation_into(wb, &rep)
     }
 
     /// Record a timeout for reputation tracking.
@@ -2635,5 +2869,359 @@ mod block_tree_pruner_tests {
 
         // Reset for other tests in this process.
         set_block_tree_retention(None);
+    }
+}
+
+#[cfg(test)]
+mod propose_batching_tests {
+    //! Leader propose-path write batching (perf/matched-200k).
+    //!
+    //! The leader's propose sequence historically issued 4-6 small KV writes per
+    //! view (insert, update main batch, leader reputation, speculative commits),
+    //! each entering the RocksDB write group individually. These tests pin the
+    //! batched replacement, [`BlockTreeSingleton::insert_and_update`]:
+    //!
+    //! * golden equivalence — the batched path produces a byte-identical final
+    //!   KV map and the same `UpdateResult` as the sequential
+    //!   `insert` + `update` path (this is ALSO the read-your-writes pin: during
+    //!   the batched `update` core the insert is still pending in the batch, so
+    //!   equality proves no propose-path read depends on a pending key);
+    //! * single flush — the whole sequence commits in exactly ONE
+    //!   `KVStore::write` (safety vars, block, reputation, speculative list all
+    //!   in the same atomic batch);
+    //! * error fallback — if the update core fails, the insert alone is flushed
+    //!   (legacy semantics: the proposer must still be able to serve the block)
+    //!   and NONE of the update writes leak;
+    //! * write-through caches — after the batched flush the reputation and
+    //!   speculative caches byte-equal a fresh deserialize from the KV.
+
+    use super::*;
+    use crate::block_tree::pluggables::{KVGet, KVStore, WriteBatch};
+    use crate::hotstuff::types::{Phase, PhaseCertificate};
+    use crate::types::block::Block;
+    use crate::types::data_types::{
+        BlockHeight, ChainID, CryptoHash, Data, Power, SignatureSet, ViewNumber,
+    };
+    use crate::types::validator_set::ValidatorSetState;
+    use ed25519_dalek::SigningKey;
+    use std::collections::HashMap;
+
+    /// In-memory `KVStore` that records, per `write()` call, the ordered list of
+    /// keys set in that batch — so tests can assert HOW MANY atomic batches were
+    /// committed and WHICH keys travelled together.
+    #[derive(Clone, Default)]
+    struct MemKV {
+        map: HashMap<Vec<u8>, Vec<u8>>,
+        write_log: Vec<Vec<Vec<u8>>>,
+    }
+
+    struct MemWb {
+        sets: Vec<(Vec<u8>, Vec<u8>)>,
+        deletes: Vec<Vec<u8>>,
+    }
+
+    #[derive(Clone)]
+    struct MemSnap(HashMap<Vec<u8>, Vec<u8>>);
+
+    impl WriteBatch for MemWb {
+        fn new() -> Self {
+            Self {
+                sets: Vec::new(),
+                deletes: Vec::new(),
+            }
+        }
+        fn set(&mut self, key: &[u8], value: &[u8]) {
+            self.sets.push((key.to_vec(), value.to_vec()));
+        }
+        fn delete(&mut self, key: &[u8]) {
+            self.deletes.push(key.to_vec());
+        }
+    }
+
+    impl KVGet for MemKV {
+        fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+            self.map.get(key).cloned()
+        }
+    }
+
+    impl KVGet for MemSnap {
+        fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+            self.0.get(key).cloned()
+        }
+    }
+
+    impl KVStore for MemKV {
+        type WriteBatch = MemWb;
+        type Snapshot<'a> = MemSnap;
+        fn write(&mut self, wb: MemWb) {
+            self.write_log
+                .push(wb.sets.iter().map(|(k, _)| k.clone()).collect());
+            for (k, v) in wb.sets {
+                self.map.insert(k, v);
+            }
+            for k in wb.deletes {
+                self.map.remove(&k);
+            }
+        }
+        fn clear(&mut self) {
+            self.map.clear();
+        }
+        fn snapshot<'b>(&'b self) -> MemSnap {
+            MemSnap(self.map.clone())
+        }
+    }
+
+    fn pc(view: u64, block: CryptoHash, phase: Phase) -> PhaseCertificate {
+        PhaseCertificate {
+            chain_id: ChainID::new(0),
+            view: ViewNumber::new(view),
+            block,
+            phase,
+            signatures: SignatureSet::new(0),
+        }
+    }
+
+    /// A leader-propose fixture mirroring the live sequence: an initialized tree
+    /// with a 3-block chain b0 <- b1 <- b2 (b0/b1 speculatively committed), plus
+    /// the new proposal `b3` justified by a Generic PC for b2 at view 3.
+    /// Driving `update(&b3.justify)` after inserting b3 advances HIGHEST_PC and
+    /// LOCKED_PC, 2-chain-commits b0+b1, promotes them out of the speculative
+    /// list, and records leader-reputation successes — i.e. every write class of
+    /// the propose path fires.
+    fn seeded_tree() -> (BlockTreeSingleton<MemKV>, Vec<Block>, Block) {
+        let mut vs = crate::types::validator_set::ValidatorSet::new();
+        for seed in 1u8..=4 {
+            vs.put(
+                &SigningKey::from_bytes(&[seed; 32]).verifying_key(),
+                Power::new(1),
+            );
+        }
+        let vss = ValidatorSetState::new(vs.clone(), vs, None, true);
+
+        let mut bt = BlockTreeSingleton::new(MemKV::default());
+        bt.initialize(&AppStateUpdates::new(), &vss).unwrap();
+
+        let b0 = Block::new(
+            BlockHeight::new(0),
+            PhaseCertificate::genesis_pc(),
+            CryptoHash::new([10u8; 32]),
+            Data::new(vec![]),
+        );
+        bt.insert(&b0, None, None).unwrap();
+        let b1 = Block::new(
+            BlockHeight::new(1),
+            pc(1, b0.hash, Phase::Generic),
+            CryptoHash::new([11u8; 32]),
+            Data::new(vec![]),
+        );
+        bt.insert(&b1, None, None).unwrap();
+        let b2 = Block::new(
+            BlockHeight::new(2),
+            pc(2, b1.hash, Phase::Generic),
+            CryptoHash::new([12u8; 32]),
+            Data::new(vec![]),
+        );
+        bt.insert(&b2, None, None).unwrap();
+
+        bt.add_speculative_commit(b0.hash).unwrap();
+        bt.add_speculative_commit(b1.hash).unwrap();
+
+        let b3 = Block::new(
+            BlockHeight::new(3),
+            pc(3, b2.hash, Phase::Generic),
+            CryptoHash::new([13u8; 32]),
+            Data::new(vec![]),
+        );
+        (bt, vec![b0, b1, b2], b3)
+    }
+
+    /// GOLDEN: batched `insert_and_update` == sequential `insert` then `update`,
+    /// byte-for-byte on the final KV map and on the `UpdateResult`. Because the
+    /// batched core runs `update` while the insert is still PENDING in the same
+    /// batch, equality also pins the read-your-writes audit: no read on the
+    /// propose path depends on a key that is pending in the batch.
+    #[test]
+    fn batched_propose_equals_sequential_insert_then_update() {
+        let (mut seq, blocks, b3) = seeded_tree();
+        let (mut bat, _, _) = seeded_tree();
+
+        seq.insert(&b3, None, None).unwrap();
+        let seq_result = seq.update(&b3.justify, &None).unwrap();
+
+        let bat_result = bat
+            .insert_and_update(&b3, None, None, &None)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            seq.0.map, bat.0.map,
+            "batched propose must leave a byte-identical KV map"
+        );
+        assert_eq!(
+            seq_result.committed_block_hashes,
+            bat_result.committed_block_hashes
+        );
+        assert_eq!(
+            seq_result.validator_set_updates.is_some(),
+            bat_result.validator_set_updates.is_some()
+        );
+
+        // Explicit expected state (hand-computed legacy semantics).
+        assert_eq!(
+            bat_result.committed_block_hashes,
+            vec![blocks[0].hash, blocks[1].hash],
+            "2-chain commit on PC(v3, b2) finalizes b0 and b1"
+        );
+        assert!(bat.locked_pc().unwrap() == b3.justify, "lock advances to the justify");
+        assert!(bat.highest_pc().unwrap() == b3.justify, "highest PC advances to the justify");
+        assert_eq!(bat.highest_committed_block().unwrap(), Some(blocks[1].hash));
+        assert!(bat.contains(&b3.hash));
+        assert!(
+            bat.speculative_commits().unwrap().is_empty(),
+            "committed blocks must be promoted out of the speculative list"
+        );
+    }
+
+    /// The whole propose sequence commits in exactly ONE `KVStore::write`;
+    /// the sequential path needs at least two.
+    #[test]
+    fn batched_propose_issues_one_write() {
+        let (mut seq, _, b3) = seeded_tree();
+        seq.0.write_log.clear();
+        seq.insert(&b3, None, None).unwrap();
+        seq.update(&b3.justify, &None).unwrap();
+        assert!(
+            seq.0.write_log.len() >= 2,
+            "sequential path: expected >= 2 write-group entries, got {}",
+            seq.0.write_log.len()
+        );
+
+        let (mut bat, _, b3) = seeded_tree();
+        bat.0.write_log.clear();
+        bat.insert_and_update(&b3, None, None, &None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            bat.0.write_log.len(),
+            1,
+            "batched propose must issue exactly one atomic KV write"
+        );
+    }
+
+    /// The safety-critical vars (HIGHEST_PC, LOCKED_PC) travel in the SAME
+    /// atomic batch as the proposed block, the commit frontier, the reputation
+    /// blob and the speculative list — nothing is written after the batch.
+    #[test]
+    fn safety_vars_and_block_share_one_atomic_batch() {
+        let (mut bt, _, b3) = seeded_tree();
+        bt.0.write_log.clear();
+        bt.insert_and_update(&b3, None, None, &None)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(bt.0.write_log.len(), 1);
+        let keys = &bt.0.write_log[0];
+        let contains = |k: &[u8]| keys.iter().any(|key| key == k);
+
+        assert!(contains(&variables::HIGHEST_PC), "HIGHEST_PC in the batch");
+        assert!(contains(&variables::LOCKED_PC), "LOCKED_PC in the batch");
+        assert!(
+            contains(&variables::HIGHEST_COMMITTED_BLOCK),
+            "commit frontier in the batch"
+        );
+        assert!(
+            contains(&variables::LEADER_REPUTATION),
+            "leader reputation joins the batch"
+        );
+        assert!(
+            contains(&variables::SPECULATIVE_COMMITS),
+            "speculative-commit promotion joins the batch"
+        );
+        let b3_height_key = concat(
+            &concat(&variables::BLOCKS, &b3.hash.bytes()),
+            &variables::BLOCK_HEIGHT,
+        );
+        assert!(
+            keys.iter().any(|key| key == &b3_height_key),
+            "the proposed block's insert travels in the same batch"
+        );
+    }
+
+    /// Update-core failure: the batch is discarded ATOMICALLY (no partial
+    /// update writes land) and the insert alone is re-flushed, preserving the
+    /// legacy "insert durable, update failed" contract that
+    /// `enter_view` relies on (it still broadcasts and lets sync recover).
+    #[test]
+    fn update_error_falls_back_to_insert_only_flush() {
+        let (mut bt, blocks, b3) = seeded_tree();
+
+        // Corrupt the tree so the commit walk fails AFTER the update core has
+        // already staged HIGHEST_PC and LOCKED_PC in the batch: committing b0
+        // makes `delete_siblings` read the genesis children list — delete it
+        // and the walk errors with a KVGetError.
+        let mut wb: BlockTreeWriteBatch<MemWb> = BlockTreeWriteBatch::new();
+        wb.delete_children(&PhaseCertificate::genesis_pc().block);
+        bt.write(wb);
+
+        let locked_before = bt.locked_pc().unwrap();
+        let highest_before = bt.highest_pc().unwrap();
+        let rep_bytes_before = bt.0.map.get(&variables::LEADER_REPUTATION[..]).cloned();
+        bt.0.write_log.clear();
+
+        let res = bt.insert_and_update(&b3, None, None, &None).unwrap();
+        assert!(res.is_err(), "update core must surface its error");
+
+        // Insert IS durable...
+        assert!(bt.contains(&b3.hash));
+        assert_eq!(
+            bt.0.write_log.len(),
+            1,
+            "exactly one write: the insert-only fallback batch"
+        );
+        assert!(
+            !bt.0.write_log[0]
+                .iter()
+                .any(|k| k == &variables::LOCKED_PC[..]),
+            "the fallback batch must not carry any update write"
+        );
+
+        // ...and NONE of the update writes leaked out of the discarded batch.
+        assert!(bt.locked_pc().unwrap() == locked_before, "LOCKED_PC must not leak");
+        assert!(bt.highest_pc().unwrap() == highest_before, "HIGHEST_PC must not leak");
+        assert_eq!(
+            bt.0.map.get(&variables::LEADER_REPUTATION[..]).cloned(),
+            rep_bytes_before
+        );
+
+        // Write-through caches did not diverge from the KV on the error path.
+        assert_eq!(
+            bt.speculative_commits().unwrap(),
+            vec![blocks[0].hash, blocks[1].hash],
+            "speculative cache must be untouched by the discarded batch"
+        );
+    }
+
+    /// After the batched flush, the write-through caches (leader reputation,
+    /// speculative commits) byte-equal a fresh deserialize straight from the KV
+    /// (extends `leader_rep_cache_write_through` to the batched path).
+    #[test]
+    fn caches_match_kv_after_batched_flush() {
+        let (mut bt, _, b3) = seeded_tree();
+        bt.insert_and_update(&b3, None, None, &None)
+            .unwrap()
+            .unwrap();
+
+        // A fresh singleton over the same KV has cold caches -> reads the KV.
+        let fresh = BlockTreeSingleton::new(bt.0.clone());
+        assert_eq!(
+            bt.leader_reputation().unwrap(),
+            fresh.leader_reputation().unwrap(),
+            "reputation cache must equal a fresh KV deserialize"
+        );
+        assert_eq!(
+            bt.speculative_commits().unwrap(),
+            fresh.speculative_commits().unwrap(),
+            "speculative cache must equal a fresh KV deserialize"
+        );
     }
 }
