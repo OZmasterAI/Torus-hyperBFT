@@ -636,48 +636,89 @@ impl OrderBook {
     }
 
     /// Cancel all orders for a trader. Returns cancelled orders.
+    ///
+    /// Item 6b (per-level batch removal): the naive loop ran one
+    /// `queue_position` probe + one O(queue) `VecDeque::remove` PER order —
+    /// O(orders × level depth) for a trader concentrated on deep levels, the
+    /// dominant term of the long-run `phase1_actions` growth. Instead, group
+    /// the trader's resting orders by (side, price) and sweep each touched
+    /// level's queue ONCE, extracting the trader's orders while preserving
+    /// survivor FIFO order. Observably identical to the per-order loop
+    /// (pinned by `cancel_all_batch_tests`): same cancelled vec — rebuilt in
+    /// the original `trader_orders` insertion order —, same surviving book,
+    /// same per-removed-order journal / epoch / chunk-dirt side effects, and
+    /// ids missing from `order_index` are silently skipped as before.
     pub fn cancel_all(&mut self, trader: Address, _market_id: Option<MarketId>) -> Vec<Order> {
         let order_ids = match self.trader_orders.remove(&trader) {
             Some(ids) => ids,
             None => return vec![],
         };
 
-        let mut cancelled = Vec::with_capacity(order_ids.len());
         let cache_on = self.level_hash_cache.is_some();
         let chunked_on = self.level_hash_chunked;
-        for order_id in order_ids {
+
+        // Group the resting orders by level (first-encounter level order,
+        // matching the naive loop's visit order).
+        let mut to_remove: HashSet<OrderId> = HashSet::with_capacity(order_ids.len());
+        let mut levels: Vec<(Side, FixedPoint)> = Vec::new();
+        for &order_id in &order_ids {
             if let Some(loc) = self.order_index.remove(&order_id) {
-                let book = match loc.side {
-                    Side::Buy => &mut self.bids,
-                    Side::Sell => &mut self.asks,
-                };
-                if let Some(queue) = book.get_mut(&loc.price) {
-                    if let Some(pos) = Self::queue_position(queue, &self.order_seq, order_id) {
-                        cancelled.push(queue.remove(pos).unwrap());
-                        let seq = self.order_seq.remove(&order_id);
-                        self.row_journal.insert(order_id);
-                        self.level_journal
-                            .insert((crate::book_rows::side_tag(loc.side), loc.price.raw()));
-                        // L3: removal invalidates the cached level-hash prefix.
-                        Self::bump_level_epoch(
-                            cache_on,
-                            &mut self.level_epoch,
-                            crate::book_rows::side_tag(loc.side),
-                            loc.price.raw(),
-                        );
-                        // Mode 3: the removed frame's chunk is dirty.
-                        Self::mark_chunk_dirty(
-                            chunked_on,
-                            &mut self.dirty_chunks,
-                            crate::book_rows::side_tag(loc.side),
-                            loc.price.raw(),
-                            seq,
-                        );
-                    }
-                    if queue.is_empty() {
-                        book.remove(&loc.price);
-                    }
+                to_remove.insert(order_id);
+                if !levels.contains(&(loc.side, loc.price)) {
+                    levels.push((loc.side, loc.price));
                 }
+            }
+        }
+
+        // One pass per touched level: extract the trader's orders, keep the
+        // survivors in FIFO order, apply the exact per-removed-order side
+        // effects of the naive loop (per-order epoch bump included, so L3
+        // epoch values stay provably identical).
+        let mut removed: HashMap<OrderId, Order> = HashMap::with_capacity(to_remove.len());
+        for (side, price) in levels {
+            let book = match side {
+                Side::Buy => &mut self.bids,
+                Side::Sell => &mut self.asks,
+            };
+            let Some(queue) = book.get_mut(&price) else {
+                continue;
+            };
+            let tag = crate::book_rows::side_tag(side);
+            let raw_price = price.raw();
+            let mut kept: VecDeque<Order> = VecDeque::with_capacity(queue.len());
+            for order in queue.drain(..) {
+                if to_remove.contains(&order.id) {
+                    let seq = self.order_seq.remove(&order.id);
+                    self.row_journal.insert(order.id);
+                    self.level_journal.insert((tag, raw_price));
+                    // L3: removal invalidates the cached level-hash prefix.
+                    Self::bump_level_epoch(cache_on, &mut self.level_epoch, tag, raw_price);
+                    // Mode 3: the removed frame's chunk is dirty.
+                    Self::mark_chunk_dirty(
+                        chunked_on,
+                        &mut self.dirty_chunks,
+                        tag,
+                        raw_price,
+                        seq,
+                    );
+                    removed.insert(order.id, order);
+                } else {
+                    kept.push_back(order);
+                }
+            }
+            let now_empty = kept.is_empty();
+            *queue = kept;
+            if now_empty {
+                book.remove(&price);
+            }
+        }
+
+        // Re-emit in the original `trader_orders` order (margin release and
+        // receipts consume this vec — its order is consensus-observable).
+        let mut cancelled = Vec::with_capacity(removed.len());
+        for order_id in order_ids {
+            if let Some(order) = removed.remove(&order_id) {
+                cancelled.push(order);
             }
         }
 
@@ -4640,6 +4681,10 @@ mod queue_lookup_tests {
         // Loaded book (persisted seqs restored) resolves ids too — including
         // ids that are NOT ascending with seq (loader gets seq-ordered rows).
         let mut loaded = OrderBook::new(1, fp(1), fp(1));
+        // The real loader seeds the meta next_seq BEFORE inserting rows
+        // (native_executor reads it from the meta row); `insert_loaded_order`
+        // debug-asserts seq < next_seq against that seed.
+        loaded.set_next_seq(ob.next_seq());
         let mut rows: Vec<(u64, Order)> = ob
             .bid_queues()
             .flat_map(|(_, q)| q.iter())
@@ -4688,5 +4733,361 @@ mod queue_lookup_tests {
             el,
             el.as_secs_f64() * 1e6 / ops.len() as f64
         );
+    }
+}
+
+// ============================================================================
+// Item 6b — cancel_all per-level batch removal
+// ============================================================================
+//
+// `cancel_all` used to run one `queue_position` probe + one O(queue)
+// `VecDeque::remove` PER order — O(orders × level depth) per trader, the
+// dominant term of the 13x `phase1_actions` growth over long runs. The batch
+// implementation groups the trader's resting orders by (side, price) and
+// sweeps each touched level's queue ONCE. These tests pin that the batch path
+// is observably IDENTICAL to the naive per-order loop: same cancelled vec
+// (order and contents), same surviving book structure, same journals, same
+// level epochs, same chunk-dirt, same stop set, same encoded row/level images.
+#[cfg(test)]
+mod cancel_all_batch_tests {
+    use super::*;
+
+    fn fp(n: i64) -> FixedPoint {
+        FixedPoint::from_raw(n as i128 * FixedPoint::SCALE)
+    }
+    fn addr(n: u8) -> Address {
+        Address::from([n; 20])
+    }
+    fn params(is_buy: bool, price: i64, qty: i64) -> PlaceOrderParams {
+        PlaceOrderParams {
+            market_id: 1,
+            is_buy,
+            price: fp(price),
+            quantity: fp(qty),
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::GTC,
+            reduce_only: false,
+            client_order_id: None,
+        }
+    }
+    fn stop_params(is_buy: bool, trigger: i64, qty: i64) -> PlaceOrderParams {
+        PlaceOrderParams {
+            market_id: 1,
+            is_buy,
+            price: fp(trigger),
+            quantity: fp(qty),
+            order_type: OrderType::StopMarket { trigger: fp(trigger) },
+            time_in_force: TimeInForce::GTC,
+            reduce_only: false,
+            client_order_id: None,
+        }
+    }
+
+    fn xorshift(s: &mut u64) -> u64 {
+        *s ^= *s << 13;
+        *s ^= *s >> 7;
+        *s ^= *s << 17;
+        *s
+    }
+
+    /// Test-local copy of the PRE-item-6b per-order `cancel_all` loop. The
+    /// batch implementation must be indistinguishable from this reference in
+    /// every observable.
+    fn naive_cancel_all(ob: &mut OrderBook, trader: Address) -> Vec<Order> {
+        let order_ids = match ob.trader_orders.remove(&trader) {
+            Some(ids) => ids,
+            None => return vec![],
+        };
+        let mut cancelled = Vec::with_capacity(order_ids.len());
+        let cache_on = ob.level_hash_cache.is_some();
+        let chunked_on = ob.level_hash_chunked;
+        for order_id in order_ids {
+            if let Some(loc) = ob.order_index.remove(&order_id) {
+                let book = match loc.side {
+                    Side::Buy => &mut ob.bids,
+                    Side::Sell => &mut ob.asks,
+                };
+                if let Some(queue) = book.get_mut(&loc.price) {
+                    if let Some(pos) = OrderBook::queue_position(queue, &ob.order_seq, order_id) {
+                        cancelled.push(queue.remove(pos).unwrap());
+                        let seq = ob.order_seq.remove(&order_id);
+                        ob.row_journal.insert(order_id);
+                        ob.level_journal
+                            .insert((crate::book_rows::side_tag(loc.side), loc.price.raw()));
+                        OrderBook::bump_level_epoch(
+                            cache_on,
+                            &mut ob.level_epoch,
+                            crate::book_rows::side_tag(loc.side),
+                            loc.price.raw(),
+                        );
+                        OrderBook::mark_chunk_dirty(
+                            chunked_on,
+                            &mut ob.dirty_chunks,
+                            crate::book_rows::side_tag(loc.side),
+                            loc.price.raw(),
+                            seq,
+                        );
+                    }
+                    if queue.is_empty() {
+                        book.remove(&loc.price);
+                    }
+                }
+            }
+        }
+        ob.pending_stops.retain(|s| s.trader != trader);
+        cancelled
+    }
+
+    /// EVERY observable of a book, in directly comparable form. Drains the
+    /// journals (`take_*`) and emits the full images — call once, at the end
+    /// of a scenario.
+    #[derive(Debug, PartialEq)]
+    struct Observables {
+        bids: Vec<(i128, Vec<Order>)>,
+        asks: Vec<(i128, Vec<Order>)>,
+        order_index: BTreeMap<OrderId, (u8, i128)>,
+        trader_orders: BTreeMap<Address, Vec<OrderId>>,
+        order_seq: BTreeMap<OrderId, u64>,
+        next_seq: u64,
+        level_epoch: BTreeMap<(u8, i128), u64>,
+        dirty_chunks: Vec<(u8, i128, u64)>,
+        row_ops: Vec<(OrderId, Option<Vec<u8>>)>,
+        level_ops: Vec<((u8, i128), Option<Vec<u8>>)>,
+        stops: Vec<(OrderId, Vec<u8>)>,
+        full_rows: Vec<(OrderId, Vec<u8>)>,
+        full_levels: Vec<((u8, i128), Vec<u8>)>,
+        counts: (usize, usize, usize),
+    }
+
+    fn observe(ob: &mut OrderBook) -> Observables {
+        let counts = (ob.order_count(), ob.bid_levels(), ob.ask_levels());
+        let dump_side = |side: &BTreeMap<FixedPoint, VecDeque<Order>>| {
+            side.iter()
+                .map(|(p, q)| (p.raw(), q.iter().cloned().collect::<Vec<_>>()))
+                .collect::<Vec<_>>()
+        };
+        let bids = dump_side(&ob.bids);
+        let asks = dump_side(&ob.asks);
+        let order_index = ob
+            .order_index
+            .iter()
+            .map(|(id, loc)| (*id, (crate::book_rows::side_tag(loc.side), loc.price.raw())))
+            .collect();
+        let trader_orders = ob
+            .trader_orders
+            .iter()
+            .map(|(a, ids)| (*a, ids.clone()))
+            .collect();
+        let order_seq = ob.order_seq.iter().map(|(id, s)| (*id, *s)).collect();
+        let level_epoch = ob.level_epoch.iter().map(|(k, v)| (*k, *v)).collect();
+        let dirty_chunks = ob.dirty_chunks.iter().copied().collect();
+        let stops = ob.stop_rows();
+        let row_ops = ob.take_row_ops();
+        let level_ops = ob
+            .take_level_ops()
+            .into_iter()
+            .map(|(k, d)| (k, d.map(|d| d.encode().to_vec())))
+            .collect();
+        let full_rows = ob.full_row_ops();
+        let full_levels = ob
+            .full_level_ops()
+            .into_iter()
+            .map(|(k, d)| (k, d.encode().to_vec()))
+            .collect();
+        Observables {
+            bids,
+            asks,
+            order_index,
+            trader_orders,
+            order_seq,
+            next_seq: ob.next_seq,
+            level_epoch,
+            dirty_chunks,
+            row_ops,
+            level_ops,
+            stops,
+            full_rows,
+            full_levels,
+            counts,
+        }
+    }
+
+    /// FNV-1a over the full row + level images — the "book state hash" the
+    /// item's acceptance asks for (redundant with the field-level equality
+    /// above, kept as a single scalar witness).
+    fn state_hash(o: &Observables) -> u64 {
+        let mut h: u64 = 0xcbf29ce484222325;
+        let mut eat = |bytes: &[u8]| {
+            for b in bytes {
+                h ^= *b as u64;
+                h = h.wrapping_mul(0x100000001b3);
+            }
+        };
+        for (id, v) in &o.full_rows {
+            eat(&id.to_be_bytes());
+            eat(v);
+        }
+        for ((tag, raw), v) in &o.full_levels {
+            eat(&[*tag]);
+            eat(&raw.to_be_bytes());
+            eat(v);
+        }
+        for (id, v) in &o.stops {
+            eat(&id.to_be_bytes());
+            eat(v);
+        }
+        h
+    }
+
+    /// Build a deterministic pseudo-random book: 6 traders, few distinct
+    /// prices (deep multi-trader queues), crossing sweeps (front pops + seq
+    /// gaps), scattered cancels and modifies (mid-queue gaps), stops. A pure
+    /// function of `seed`, so two calls build byte-identical twins.
+    fn build_book(seed: u64, cache: bool, chunked: bool) -> OrderBook {
+        let mut ob = OrderBook::new(1, fp(1), fp(1));
+        if chunked {
+            ob.set_level_hash_chunked(true);
+        } else if cache {
+            ob.ensure_level_hash_cache(64 * 1024);
+        }
+        let mut s = seed;
+        let mut ts: u64 = 1;
+        let mut placed: Vec<OrderId> = Vec::new();
+        for _ in 0..400 {
+            let t = addr(1 + (xorshift(&mut s) % 6) as u8);
+            ts += 1;
+            match xorshift(&mut s) % 10 {
+                0..=5 => {
+                    let is_buy = xorshift(&mut s) % 2 == 0;
+                    let price = if is_buy {
+                        96 + (xorshift(&mut s) % 4) as i64
+                    } else {
+                        101 + (xorshift(&mut s) % 4) as i64
+                    };
+                    let qty = 1 + (xorshift(&mut s) % 5) as i64;
+                    let r = ob.place_order(params(is_buy, price, qty), t, ts);
+                    if ob.get_order(r.order_id).is_some() {
+                        placed.push(r.order_id);
+                    }
+                }
+                6 => {
+                    // Crossing sweep: front pops on the far side.
+                    let is_buy = xorshift(&mut s) % 2 == 0;
+                    let price = if is_buy { 105 } else { 95 };
+                    let qty = 2 + (xorshift(&mut s) % 6) as i64;
+                    let _ = ob.place_order(params(is_buy, price, qty), t, ts);
+                }
+                7 => {
+                    if !placed.is_empty() {
+                        let victim = placed[(xorshift(&mut s) as usize) % placed.len()];
+                        let _ = ob.cancel_order(victim);
+                    }
+                }
+                8 => {
+                    if !placed.is_empty() {
+                        let victim = placed[(xorshift(&mut s) as usize) % placed.len()];
+                        let _ = ob.modify_order(victim, None, Some(fp(1)));
+                    }
+                }
+                _ => {
+                    // Buy stop, trigger far above any trade price: always
+                    // accepted (a sell stop can be trigger-rejected once a
+                    // trade printed, which would fork the twin builds).
+                    let r = ob.place_order(stop_params(true, 150, 1), t, ts);
+                    assert_eq!(r.status, OrderStatus::PendingTrigger);
+                }
+            }
+        }
+        ob
+    }
+
+    /// The randomized differential: for each cache/chunked variant and a
+    /// spread of seeds, run the batch `cancel_all` and the naive reference on
+    /// twin books, for every trader in sequence (including traders with no
+    /// orders), asserting identical cancelled vecs, identical observables and
+    /// identical state hash after EVERY cancellation.
+    #[test]
+    fn cancel_all_batch_matches_naive_randomized() {
+        for (cache, chunked) in [(false, false), (true, false), (false, true)] {
+            for seed in [7u64, 42, 0xDEAD_BEEF] {
+                let mut a = build_book(seed, cache, chunked);
+                let mut b = build_book(seed, cache, chunked);
+                let mut total_cancelled = 0usize;
+                for t in 1..=7u8 {
+                    let got = a.cancel_all(addr(t), None);
+                    let want = naive_cancel_all(&mut b, addr(t));
+                    assert_eq!(
+                        got, want,
+                        "cancelled vec diverged (trader {t}, seed {seed}, cache {cache}, chunked {chunked})"
+                    );
+                    total_cancelled += got.len();
+                }
+                assert!(
+                    total_cancelled >= 20,
+                    "vacuous differential: only {total_cancelled} orders cancelled (seed {seed})"
+                );
+                let oa = observe(&mut a);
+                let ob_ = observe(&mut b);
+                assert_eq!(
+                    oa, ob_,
+                    "observables diverged (seed {seed}, cache {cache}, chunked {chunked})"
+                );
+                assert_eq!(state_hash(&oa), state_hash(&ob_), "state hash diverged");
+            }
+        }
+    }
+
+    /// Stale trader_orders entry (id absent from order_index — e.g. filled
+    /// between place and cancel): both paths silently skip it.
+    #[test]
+    fn cancel_all_batch_skips_ids_missing_from_index() {
+        let mut a = build_book(3, false, false);
+        let mut b = build_book(3, false, false);
+        for ob in [&mut a, &mut b] {
+            ob.trader_orders.entry(addr(2)).or_default().push(999_999);
+        }
+        let got = a.cancel_all(addr(2), None);
+        let want = naive_cancel_all(&mut b, addr(2));
+        assert_eq!(got, want);
+        assert!(got.iter().all(|o| o.id != 999_999));
+        assert_eq!(observe(&mut a), observe(&mut b));
+    }
+
+    /// A trader whose removal empties levels: the emptied levels leave the
+    /// BTreeMap, survivors keep FIFO order, stops of the trader are dropped.
+    #[test]
+    fn cancel_all_batch_empties_levels_and_drops_stops() {
+        let mut ob = OrderBook::new(1, fp(1), fp(1));
+        // addr(1) alone on 98; interleaved with addr(2) on 99; a stop each.
+        let id1 = ob.place_order(params(true, 98, 5), addr(1), 1).order_id;
+        let id2 = ob.place_order(params(true, 99, 5), addr(2), 2).order_id;
+        let id3 = ob.place_order(params(true, 99, 5), addr(1), 3).order_id;
+        let id4 = ob.place_order(params(true, 99, 5), addr(2), 4).order_id;
+        assert_eq!(
+            ob.place_order(stop_params(true, 150, 1), addr(1), 5).status,
+            OrderStatus::PendingTrigger
+        );
+        assert_eq!(
+            ob.place_order(stop_params(true, 151, 1), addr(2), 6).status,
+            OrderStatus::PendingTrigger
+        );
+
+        let cancelled = ob.cancel_all(addr(1), None);
+        assert_eq!(
+            cancelled.iter().map(|o| o.id).collect::<Vec<_>>(),
+            vec![id1, id3]
+        );
+        assert_eq!(ob.bid_levels(), 1, "level 98 emptied and removed");
+        let level99: Vec<OrderId> = ob
+            .bids
+            .get(&fp(99))
+            .unwrap()
+            .iter()
+            .map(|o| o.id)
+            .collect();
+        assert_eq!(level99, vec![id2, id4], "survivor FIFO order preserved");
+        assert_eq!(ob.pending_stop_count(), 1, "only addr(2)'s stop remains");
+        assert!(ob.trader_orders.get(&addr(1)).is_none());
+        assert!(ob.order_index.get(&id1).is_none() && ob.order_index.get(&id3).is_none());
     }
 }

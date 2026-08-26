@@ -870,6 +870,52 @@ struct DrainedBook {
     levels_ns: u128,
 }
 
+/// Item 6a: one book's pass-2 payload — its drained journals plus snapshots
+/// of the two live-book inputs pass 2 needs (`stop_rows()`, meta bytes),
+/// taken on the exec thread at save time so the flush worker never touches
+/// the live book (which the next block's engine is already mutating).
+struct DeferredBook {
+    drained: DrainedBook,
+    stops: Vec<(OrderId, Vec<u8>)>,
+    meta: Vec<u8>,
+}
+
+/// Item 6a: a whole block's deferred mode-2/3 save pass 2, produced by
+/// [`NativeExecContext::save_order_books_deferred`] on the exec thread and
+/// applied by [`apply_deferred_book_save`] on the exec pipeline's flush
+/// worker (market-ascending, the exact serial write sequence). Opaque outside
+/// this module: consensus only carries it inside `Job::Flush`.
+pub struct DeferredBookSave {
+    books: Vec<DeferredBook>,
+}
+
+impl DeferredBookSave {
+    /// Number of dirty books carried (tests / logging).
+    pub fn book_count(&self) -> usize {
+        self.books.len()
+    }
+}
+
+/// Item 6a, the flush-worker half: apply a deferred pass 2 against `state` —
+/// node-local order rows, root-CF level rows, stop diff, meta-if-moved, in
+/// market-ascending order — exactly the write sequence `save_order_books`
+/// would have run on the exec thread. Returns the root-CF write count (same
+/// meaning as `save_order_books`'s return).
+pub fn apply_deferred_book_save<T: StateBackend>(
+    state: &T,
+    metrics: Option<&torus_telemetry::Metrics>,
+    save: &DeferredBookSave,
+) -> usize {
+    let mut acc = SaveTimings::default();
+    let mut written = 0usize;
+    for b in &save.books {
+        written += NativeExecContext::<T>::write_drained_book(
+            state, metrics, &b.drained, &b.stops, &b.meta, false, &mut acc,
+        );
+    }
+    written
+}
+
 /// Drain one book's journals (mode 2). Enables/refreshes (or drops, budget 0)
 /// its private level-hash sponge cache first — byte-identical output in both
 /// states. Pure over the book: no state access, safe on any thread.
@@ -1780,6 +1826,14 @@ impl<T: StateBackend> NativeExecContext<T> {
         self.resident_reused
     }
 
+    /// rank8: whether this context runs in resident-book mode at all (was
+    /// constructed with a holder). Item 6a gates the deferred book save on
+    /// this: without resident books every block reloads books THROUGH the
+    /// overlay's parent layer, which would race the worker-applied writes.
+    pub fn resident_mode(&self) -> bool {
+        self.resident
+    }
+
     /// rank8: whether this context ran in resident mode but had to REBUILD
     /// from persisted state (holder empty at startup, drained after a fatal
     /// block, or the staleness guard tripped). Metrics hook: every hit is a
@@ -2434,8 +2488,9 @@ impl<T: StateBackend> NativeExecContext<T> {
                     }
                     // Mode 1 has no level rows: drop journaled levels unhashed.
                     book.discard_level_ops();
-                    written += Self::diff_stop_rows(&self.state, market_id, book);
-                    written += Self::write_meta_if_moved(&self.state, market_id, book);
+                    written += Self::diff_stop_rows(&self.state, market_id, &book.stop_rows());
+                    written +=
+                        Self::write_meta_if_moved(&self.state, market_id, &book_meta_value(book));
                 }
                 // Modes 2/3 are saved by the two-pass path above (`dirty` is
                 // empty here under either level-authority variant).
@@ -2498,8 +2553,47 @@ impl<T: StateBackend> NativeExecContext<T> {
         timed: bool,
         acc: &mut SaveTimings,
     ) -> usize {
-        // Pass 1: gather `&mut` handles to the dirty books (disjoint map
-        // entries — one `&mut` each), sorted by market id.
+        let drained = self.drain_level_books(dirty, level_cache_per_book, timed, acc);
+
+        // Pass 2: serial writes, market ascending (`drained` is sorted).
+        // bl1 exec-chain ruler: pass 2 (WRITE) wall clock — the only half of
+        // save_books a flush worker could take (and, item 6a, the half
+        // `save_order_books_deferred` hands to it).
+        let write_timer = std::time::Instant::now();
+        let mut written = 0usize;
+        for d in drained {
+            let Some(book) = self.order_books.get(&d.market_id) else {
+                // Cannot happen: every drained book was borrowed from the
+                // map in pass 1 and nothing removed it since.
+                continue;
+            };
+            written += Self::write_drained_book(
+                &self.state,
+                self.metrics.as_deref(),
+                &d,
+                &book.stop_rows(),
+                &book_meta_value(book),
+                timed,
+                acc,
+            );
+        }
+        self.save_split.write_ns += write_timer.elapsed().as_nanos();
+        written
+    }
+
+    /// Mode-2/3 pass 1 for every dirty book: gather `&mut` handles (disjoint
+    /// map entries — one `&mut` each) sorted by market id, then DRAIN the
+    /// journals inline or on the scoped drain workers. Shared verbatim by the
+    /// serial save (`save_level_authority`) and the pipelined
+    /// `save_order_books_deferred` — the drain reads the LIVE books, so it
+    /// can never leave the exec thread in either mode.
+    fn drain_level_books(
+        &mut self,
+        dirty: &[MarketId],
+        level_cache_per_book: usize,
+        timed: bool,
+        acc: &mut SaveTimings,
+    ) -> Vec<DrainedBook> {
         let dirty_set = &self.dirty_books;
         let mut books: Vec<(MarketId, &mut OrderBook)> = self
             .order_books
@@ -2538,39 +2632,95 @@ impl<T: StateBackend> NativeExecContext<T> {
         };
         self.save_split.drain_ns += drain_timer.elapsed().as_nanos();
         self.last_save_workers = if parallel { workers } else { 1 };
+        drained
+    }
 
-        // Pass 2: serial writes, market ascending (`drained` is sorted).
-        // bl1 exec-chain ruler: pass 2 (WRITE) wall clock — the only half of
-        // save_books a flush worker could take.
-        let write_timer = std::time::Instant::now();
-        let mut written = 0usize;
-        for d in drained {
-            let Some(book) = self.order_books.get(&d.market_id) else {
-                // Cannot happen: every drained book was borrowed from the
-                // map in pass 1 and nothing removed it since.
-                continue;
-            };
-            written += Self::write_drained_book(
-                &self.state,
-                self.metrics.as_deref(),
-                book,
-                d,
-                timed,
-                acc,
-            );
+    /// Item 6a (`TORUS_EXEC_PIPELINE` fast path): run pass 1 of the mode-2/3
+    /// save on THIS thread (journal drain — reads the live books, can never
+    /// leave the exec thread) and RETURN pass 2 (the state writes) for the
+    /// flush worker instead of applying it here. Also writes the order-id
+    /// counter and the `__book_mode__` marker into `self.state` exactly as
+    /// `save_order_books` does (cheap point writes into this block's overlay,
+    /// so the next block reads them through the parent layer as today).
+    /// Returns `None` — with NO side effects — for Classic / OrderRows, which
+    /// have no two-pass save; the caller falls back to `save_order_books`.
+    ///
+    /// Why the snapshots: pass 2's only live-book reads are `stop_rows()` and
+    /// the meta bytes; they are captured HERE (block N's post-state) because
+    /// by the time the flush worker runs, block N+1's engine is already
+    /// mutating the books. The stop-row diff and the meta compare themselves
+    /// move to the worker, whose read view (heights < N durable) matches what
+    /// this thread would have read through the overlay parent.
+    pub fn save_order_books_deferred(&mut self) -> Option<DeferredBookSave> {
+        use torus_state::cf::CF_NATIVE_MARKETS;
+        if !self.book_mode.is_level_authority() {
+            return None;
         }
-        self.save_split.write_ns += write_timer.elapsed().as_nanos();
-        written
+        // Same per-book sponge-cache budget as `save_order_books` (mode 3
+        // never uses the sponge cache — depth-independent digest).
+        let level_cache_per_book = if matches!(self.book_mode, BookMode::LevelAuthority)
+            && self.level_hash_cache_bytes > 0
+        {
+            (self.level_hash_cache_bytes / self.order_books.len().max(1)).max(1)
+        } else {
+            0
+        };
+        let mut dirty: Vec<MarketId> = self.dirty_books.iter().copied().collect();
+        dirty.sort_unstable();
+        // µbench save-timings are not collected on the deferred path (pass 2
+        // runs on the worker); the production drain timer still updates
+        // `save_split.drain_ns` inside `drain_level_books`.
+        let mut acc = SaveTimings::default();
+        let drained = self.drain_level_books(&dirty, level_cache_per_book, false, &mut acc);
+        let books: Vec<DeferredBook> = drained
+            .into_iter()
+            .filter_map(|d| {
+                // Mirrors the pass-2 lookup; a drained book always exists.
+                let book = self.order_books.get(&d.market_id)?;
+                Some(DeferredBook {
+                    stops: book.stop_rows(),
+                    meta: book_meta_value(book),
+                    drained: d,
+                })
+            })
+            .collect();
+
+        // Counter + mode marker: same condition, same bytes, same placement
+        // (this overlay) as the `save_order_books` tail.
+        if self.loaded_next_global_order_id != Some(self.next_global_order_id) {
+            if let Err(e) = self.state.put_cf_raw(
+                CF_NATIVE_MARKETS,
+                Self::NEXT_GLOBAL_ORDER_ID_KEY,
+                &self.next_global_order_id.to_be_bytes(),
+            ) {
+                tracing::error!(%e, "failed to persist next_global_order_id");
+            }
+        }
+        if !self.book_mode_marker_present {
+            match self.state.put_cf_raw(
+                CF_NATIVE_MARKETS,
+                Self::BOOK_MODE_MARKER_KEY,
+                &[self.book_mode.marker_byte()],
+            ) {
+                Ok(()) => self.book_mode_marker_present = true,
+                Err(e) => tracing::error!(%e, "failed to persist __book_mode__ marker"),
+            }
+        }
+        Some(DeferredBookSave { books })
     }
 
     /// Mode-2 pass 2 for one book: node-local order rows, root-CF level rows,
     /// stop diff, meta-if-moved, funnel metrics — the exact per-market write
     /// sequence of the former single-pass loop. Returns root-CF writes.
+    /// `stops` / `meta` are the book's `stop_rows()` / `book_meta_value`
+    /// captured at save time — passed in (not read from the book) so the
+    /// item-6a flush worker can run this against its snapshots.
     fn write_drained_book(
         state: &T,
         metrics: Option<&torus_telemetry::Metrics>,
-        book: &OrderBook,
-        drained: DrainedBook,
+        drained: &DrainedBook,
+        stops: &[(OrderId, Vec<u8>)],
+        meta: &[u8],
         timed: bool,
         acc: &mut SaveTimings,
     ) -> usize {
@@ -2580,9 +2730,9 @@ impl<T: StateBackend> NativeExecContext<T> {
         let mut rows_written = 0usize;
         let mut rows_deleted = 0usize;
         let t_rows = timed.then(std::time::Instant::now);
-        for (order_id, op) in drained.row_ops {
-            let key = book_order_key(market_id, order_id);
-            let res = match &op {
+        for (order_id, op) in &drained.row_ops {
+            let key = book_order_key(market_id, *order_id);
+            let res = match op {
                 Some(bytes) => {
                     rows_written += 1;
                     state.put_cf_raw(CF_BOOK_ORDER_ROWS, &key, bytes)
@@ -2605,9 +2755,9 @@ impl<T: StateBackend> NativeExecContext<T> {
         let mut levels_written = 0usize;
         let mut levels_deleted = 0usize;
         let t_levels = timed.then(std::time::Instant::now);
-        for ((tag, raw_price), op) in drained.level_ops {
-            let key = level_row_key_tagged(market_id, tag, raw_price);
-            let res = match &op {
+        for ((tag, raw_price), op) in &drained.level_ops {
+            let key = level_row_key_tagged(market_id, *tag, *raw_price);
+            let res = match op {
                 Some(data) => {
                     levels_written += 1;
                     state.put_cf_raw(CF_NATIVE_ORDER_BOOKS, &key, &data.encode())
@@ -2626,12 +2776,12 @@ impl<T: StateBackend> NativeExecContext<T> {
             acc.levels_ns += t.elapsed().as_nanos();
         }
         let t_stops = timed.then(std::time::Instant::now);
-        written += Self::diff_stop_rows(state, market_id, book);
+        written += Self::diff_stop_rows(state, market_id, stops);
         if let Some(t) = t_stops {
             acc.stops_ns += t.elapsed().as_nanos();
         }
         let t_meta = timed.then(std::time::Instant::now);
-        written += Self::write_meta_if_moved(state, market_id, book);
+        written += Self::write_meta_if_moved(state, market_id, meta);
         if let Some(t) = t_meta {
             acc.meta_ns += t.elapsed().as_nanos();
         }
@@ -2647,7 +2797,7 @@ impl<T: StateBackend> NativeExecContext<T> {
     /// Shared modes 1/2: pending stops are immutable per id → put new ids,
     /// delete gone ids. Stateless diff against the persisted stop rows (one
     /// bounded prefix scan over `market ‖ 0x02` — the stop set is tiny).
-    fn diff_stop_rows(state: &T, market_id: MarketId, book: &OrderBook) -> usize {
+    fn diff_stop_rows(state: &T, market_id: MarketId, stops: &[(OrderId, Vec<u8>)]) -> usize {
         use torus_state::cf::CF_NATIVE_ORDER_BOOKS;
         let mut prefix = [0u8; 9];
         prefix[..8].copy_from_slice(&market_id.to_be_bytes());
@@ -2663,13 +2813,13 @@ impl<T: StateBackend> NativeExecContext<T> {
             .unwrap_or_default();
 
         let mut written = 0usize;
-        let stops = book.stop_rows();
         let mut live = std::collections::HashSet::with_capacity(stops.len());
         for (id, bytes) in stops {
+            let id = *id;
             live.insert(id);
             if !persisted.contains(&id) {
                 let key = book_stop_key(market_id, id);
-                if let Err(e) = state.put_cf_raw(CF_NATIVE_ORDER_BOOKS, &key, &bytes) {
+                if let Err(e) = state.put_cf_raw(CF_NATIVE_ORDER_BOOKS, &key, bytes) {
                     tracing::error!(market_id, stop_id = %id, %e, "stop row put failed");
                 } else {
                     written += 1;
@@ -2691,9 +2841,9 @@ impl<T: StateBackend> NativeExecContext<T> {
 
     /// Shared modes 1/2: rewrite the meta row only when its bytes moved
     /// (stateless compare against the persisted row — one point read).
-    fn write_meta_if_moved(state: &T, market_id: MarketId, book: &OrderBook) -> usize {
+    /// `meta` = `book_meta_value(book)` captured at save time (item 6a).
+    fn write_meta_if_moved(state: &T, market_id: MarketId, meta: &[u8]) -> usize {
         use torus_state::cf::CF_NATIVE_ORDER_BOOKS;
-        let meta = book_meta_value(book);
         let key = book_meta_key(market_id);
         match state.get_cf_raw(CF_NATIVE_ORDER_BOOKS, &key) {
             Ok(Some(existing)) if existing == meta => return 0,
@@ -2702,7 +2852,7 @@ impl<T: StateBackend> NativeExecContext<T> {
                 tracing::error!(market_id, %e, "meta row read failed");
             }
         }
-        if let Err(e) = state.put_cf_raw(CF_NATIVE_ORDER_BOOKS, &key, &meta) {
+        if let Err(e) = state.put_cf_raw(CF_NATIVE_ORDER_BOOKS, &key, meta) {
             tracing::error!(market_id, %e, "meta row put failed");
             return 0;
         }
