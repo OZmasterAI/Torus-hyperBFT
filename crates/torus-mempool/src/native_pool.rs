@@ -46,7 +46,13 @@ pub(crate) struct NativePool {
     entries: BTreeMap<SortKey, NativePoolEntry>,
     sender_counts: HashMap<Address, usize>,
     seen: HashSet<(Address, B256)>,
-    hash_index: HashMap<B256, SortKey>,
+    /// Multimap: action hash -> ALL live entries with that hash, in insertion
+    /// order. `compute_action_hash` omits the claimed sender, so a
+    /// gossip-TRUSTED peer can admit byte-identical signed bytes under a
+    /// different sender — `remove_committed` must find every such duplicate
+    /// without scanning the pool. `Vec` len is 1 except under that adversarial
+    /// duplicate admit.
+    hash_index: HashMap<B256, Vec<SortKey>>,
     /// Insertion counter feeding [`SortKey`] tie order.
     next_seq: u64,
     max_size: usize,
@@ -79,8 +85,12 @@ impl NativePool {
     }
 
     pub fn get_by_hash(&self, hash: &B256) -> Option<SignedNativeAction> {
+        // Duplicates (if any) are byte-identical `SignedNativeAction`s — the
+        // sender is not part of the hash — so returning the earliest-inserted
+        // copy is observationally identical to any other.
         self.hash_index
             .get(hash)
+            .and_then(|keys| keys.first())
             .and_then(|key| self.entries.get(key))
             .map(|e| e.action.clone())
     }
@@ -94,7 +104,7 @@ impl NativePool {
     pub fn verified_restash_keys(&self, hashes: &[B256]) -> Vec<(B256, Address)> {
         let mut out = Vec::new();
         for h in hashes {
-            if let Some(key) = self.hash_index.get(h) {
+            if let Some(key) = self.hash_index.get(h).and_then(|keys| keys.first()) {
                 if let Some(entry) = self.entries.get(key) {
                     if entry.verified_locally {
                         if let Some(key) = torus_types::verified_cache_key(&entry.action) {
@@ -161,10 +171,7 @@ impl NativePool {
                     Some((key, entry)) if !entry.is_cancel => *key,
                     _ => return Err(MempoolError::NativePoolFull),
                 };
-                if let Some(evicted) = self.remove_entry_by_key(&evict_key) {
-                    let dropped = HashSet::from([evicted.action_hash]);
-                    self.repoint_hash_survivors(&dropped);
-                }
+                self.remove_entry_by_key(&evict_key);
             } else {
                 return Err(MempoolError::NativePoolFull);
             }
@@ -175,7 +182,7 @@ impl NativePool {
         let seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1);
         let key: SortKey = (u8::from(!is_cancel), sender, action.nonce, seq);
-        self.hash_index.insert(action_hash, key);
+        self.hash_index.entry(action_hash).or_default().push(key);
         self.entries.insert(
             key,
             NativePoolEntry {
@@ -192,42 +199,20 @@ impl NativePool {
     }
 
     /// Remove one entry by its selection-order key, maintaining `seen`,
-    /// `sender_counts`, and `hash_index` (the mapping is dropped only when it
-    /// points at this key — a same-hash duplicate may still own it). Callers
-    /// whose removal can leave a same-hash survivor re-point it via
-    /// [`Self::repoint_hash_survivors`].
+    /// `sender_counts`, and `hash_index` (this key is dropped from the hash's
+    /// `Vec`; the mapping itself only when no same-hash duplicate survives).
+    /// The single choke point for index maintenance on every removal path.
     fn remove_entry_by_key(&mut self, key: &SortKey) -> Option<NativePoolEntry> {
         let entry = self.entries.remove(key)?;
         self.seen.remove(&(entry.sender, entry.action_hash));
         self.dec_sender_count(&entry.sender);
-        if self.hash_index.get(&entry.action_hash) == Some(key) {
-            self.hash_index.remove(&entry.action_hash);
-        }
-        Some(entry)
-    }
-
-    /// Re-point each of `hashes` at a surviving same-hash entry, preserving
-    /// `get_by_hash` for duplicate action hashes (same payload+nonce under
-    /// different signatures) after one copy is removed — the same net result
-    /// the old full `hash_index` rebuild produced. No-op for hashes still
-    /// indexed or without a survivor.
-    fn repoint_hash_survivors(&mut self, hashes: &HashSet<B256>) {
-        let mut missing: HashSet<B256> = hashes
-            .iter()
-            .filter(|hash| !self.hash_index.contains_key(*hash))
-            .copied()
-            .collect();
-        if missing.is_empty() {
-            return;
-        }
-        for (key, entry) in &self.entries {
-            if missing.remove(&entry.action_hash) {
-                self.hash_index.insert(entry.action_hash, *key);
-                if missing.is_empty() {
-                    break;
-                }
+        if let Some(keys) = self.hash_index.get_mut(&entry.action_hash) {
+            keys.retain(|k| k != key);
+            if keys.is_empty() {
+                self.hash_index.remove(&entry.action_hash);
             }
         }
+        Some(entry)
     }
 
     /// Drain up to `limit` actions in priority order with per-sender-per-block caps.
@@ -251,14 +236,11 @@ impl NativePool {
         }
 
         let mut taken = Vec::with_capacity(take_keys.len());
-        let mut dropped: HashSet<B256> = HashSet::new();
         for key in &take_keys {
             if let Some(entry) = self.remove_entry_by_key(key) {
-                dropped.insert(entry.action_hash);
                 taken.push(entry.action);
             }
         }
-        self.repoint_hash_survivors(&dropped);
 
         taken
     }
@@ -436,16 +418,20 @@ impl NativePool {
     }
 
     /// Remove actions that were included in a committed block.
+    ///
+    /// O(k log n) in committed actions via `hash_index` — no pool scan (the
+    /// old O(pool) scan under the commit-path write lock cost ~9.3 ms/commit
+    /// at 200k pool, `torus_mempool_remove_committed_seconds`). Taking the
+    /// `Vec` out of the index first removes ALL same-hash duplicates, exactly
+    /// like the scan did; `remove_entry_by_key`'s index maintenance then sees
+    /// the hash already unindexed and no-ops.
     pub fn remove_committed(&mut self, hashes: &[B256]) {
-        let to_remove: HashSet<B256> = hashes.iter().copied().collect();
-        let keys: Vec<SortKey> = self
-            .entries
-            .iter()
-            .filter(|(_, entry)| to_remove.contains(&entry.action_hash))
-            .map(|(key, _)| *key)
-            .collect();
-        for key in &keys {
-            self.remove_entry_by_key(key);
+        for hash in hashes {
+            if let Some(keys) = self.hash_index.remove(hash) {
+                for key in &keys {
+                    self.remove_entry_by_key(key);
+                }
+            }
         }
     }
 
@@ -457,6 +443,31 @@ impl NativePool {
                 let _ = self.insert(sender, action);
             }
         }
+    }
+
+    /// Test-only invariant check: `hash_index` <-> `entries` is an exact
+    /// bijection — every indexed key resolves to a live entry with that hash,
+    /// no key is indexed twice, no empty `Vec` lingers, and every live entry
+    /// is indexed under its hash exactly once.
+    #[cfg(test)]
+    fn assert_index_consistent(&self) {
+        let mut indexed: HashSet<SortKey> = HashSet::new();
+        for (hash, keys) in &self.hash_index {
+            assert!(!keys.is_empty(), "empty Vec left in hash_index for {hash}");
+            for key in keys {
+                let entry = self
+                    .entries
+                    .get(key)
+                    .unwrap_or_else(|| panic!("indexed key {key:?} has no entry"));
+                assert_eq!(&entry.action_hash, hash, "entry indexed under wrong hash");
+                assert!(indexed.insert(*key), "key {key:?} indexed twice");
+            }
+        }
+        assert_eq!(
+            indexed.len(),
+            self.entries.len(),
+            "every live entry must be indexed exactly once"
+        );
     }
 
     fn dec_sender_count(&mut self, sender: &Address) {
@@ -1103,5 +1114,149 @@ mod tests {
             usize::MAX,
         );
         assert_eq!(all.len(), 7);
+    }
+
+    /// `compute_action_hash` covers action+nonce+signature but NOT the claimed
+    /// sender, so a gossip-TRUSTED peer can admit byte-identical signed bytes
+    /// under a different sender: two live entries, one hash. `remove_committed`
+    /// must remove ALL of them — a single-slot-index rewrite would leave a
+    /// re-selectable duplicate survivor (re-proposal/liveness bug).
+    #[test]
+    fn remove_committed_removes_all_same_hash_duplicates() {
+        let mut pool = NativePool::new(100, 64, 16);
+        let action = make_action(1, NativeAction::ClaimRewards);
+        let hash = compute_action_hash(&action);
+        pool.insert(Address::repeat_byte(1), action.clone()).unwrap();
+        pool.insert(Address::repeat_byte(2), action).unwrap();
+        assert_eq!(pool.size(), 2, "same-hash duplicates coexist");
+        pool.assert_index_consistent();
+
+        pool.remove_committed(&[hash]);
+        assert_eq!(pool.size(), 0, "ALL same-hash duplicates removed");
+        assert!(pool.get_by_hash(&hash).is_none());
+        pool.assert_index_consistent();
+    }
+
+    #[test]
+    fn index_consistent_across_insert_remove_reinsert() {
+        let mut pool = NativePool::new(100, 64, 16);
+        let sender = Address::repeat_byte(1);
+        let action = make_action(1, NativeAction::ClaimRewards);
+        let hash = compute_action_hash(&action);
+
+        pool.insert(sender, action.clone()).unwrap();
+        pool.remove_committed(&[hash]);
+        assert_eq!(pool.size(), 0);
+        pool.assert_index_consistent();
+
+        // seen/sender_counts cleaned: same (sender, action) insertable again.
+        pool.insert(sender, action).unwrap();
+        assert_eq!(pool.get_by_hash(&hash).unwrap().nonce, 1);
+        pool.assert_index_consistent();
+
+        pool.remove_committed(&[hash]);
+        assert_eq!(pool.size(), 0, "second commit empties the pool again");
+        pool.assert_index_consistent();
+    }
+
+    #[test]
+    fn remove_committed_unknown_hash_is_noop() {
+        let mut pool = NativePool::new(100, 64, 16);
+        let sender = Address::repeat_byte(1);
+        let action = make_action(1, NativeAction::ClaimRewards);
+        let hash = compute_action_hash(&action);
+        pool.insert(sender, action).unwrap();
+
+        pool.remove_committed(&[B256::ZERO, B256::repeat_byte(0xAB)]);
+        assert_eq!(pool.size(), 1);
+        assert!(pool.get_by_hash(&hash).is_some());
+        pool.assert_index_consistent();
+
+        // Subsequent inserts unaffected.
+        pool.insert(sender, make_action(2, NativeAction::ClaimRewards))
+            .unwrap();
+        assert_eq!(pool.size(), 2);
+        pool.assert_index_consistent();
+    }
+
+    /// Cap-2 pool: an incoming cancel evicts the back non-cancel
+    /// (`insert_verified` eviction branch). The evicted entry must leave the
+    /// index; the survivors must stay removable by hash.
+    #[test]
+    fn eviction_path_keeps_index_consistent() {
+        let mut pool = NativePool::new(2, 64, 16);
+        let kept_action = make_action(1, NativeAction::ClaimRewards);
+        let kept_hash = compute_action_hash(&kept_action);
+        // Larger sender sorts to the back of the non-cancel range -> evicted.
+        let evicted_action = make_action(2, NativeAction::ClaimRewards);
+        let evicted_hash = compute_action_hash(&evicted_action);
+        let cancel = make_action(3, NativeAction::CancelOrder { order_id: 1 });
+        let cancel_hash = compute_action_hash(&cancel);
+
+        pool.insert(Address::repeat_byte(1), kept_action).unwrap();
+        pool.insert(Address::repeat_byte(2), evicted_action).unwrap();
+        pool.insert(Address::repeat_byte(3), cancel).unwrap();
+        assert_eq!(pool.size(), 2);
+        pool.assert_index_consistent();
+        assert!(
+            pool.get_by_hash(&evicted_hash).is_none(),
+            "evicted entry left the index"
+        );
+
+        // remove_committed on the evicted hash is a no-op.
+        pool.remove_committed(&[evicted_hash]);
+        assert_eq!(pool.size(), 2);
+        pool.assert_index_consistent();
+
+        // Remaining entries still removable by hash.
+        pool.remove_committed(&[kept_hash, cancel_hash]);
+        assert_eq!(pool.size(), 0);
+        pool.assert_index_consistent();
+    }
+
+    /// After one same-hash duplicate is removed (drain), the survivor must
+    /// remain findable and later removable — the guarantee
+    /// `repoint_hash_survivors` used to provide under the single-slot index.
+    #[test]
+    fn duplicate_survivor_findable_after_partial_removal() {
+        let mut pool = NativePool::new(100, 64, 16);
+        let action = make_action(1, NativeAction::ClaimRewards);
+        let hash = compute_action_hash(&action);
+        pool.insert(Address::repeat_byte(1), action.clone()).unwrap();
+        pool.insert(Address::repeat_byte(2), action).unwrap();
+
+        let drained = pool.drain(1);
+        assert_eq!(drained.len(), 1);
+        assert_eq!(pool.size(), 1);
+        assert!(pool.get_by_hash(&hash).is_some(), "survivor still indexed");
+        pool.assert_index_consistent();
+
+        pool.remove_committed(&[hash]);
+        assert_eq!(pool.size(), 0);
+        assert!(pool.get_by_hash(&hash).is_none());
+        pool.assert_index_consistent();
+    }
+
+    /// Same-hash duplicates share a nonce, so they expire together; the index
+    /// must be empty afterwards and both copies re-insertable.
+    #[test]
+    fn evict_expired_with_duplicates_keeps_index_consistent() {
+        use torus_types::eip712::NONCE_WINDOW_MS;
+        let mut pool = NativePool::new(100, 64, 16);
+        let now: u64 = 10 * NONCE_WINDOW_MS;
+        let stale = make_action(now - 2 * NONCE_WINDOW_MS, NativeAction::ClaimRewards);
+        let hash = compute_action_hash(&stale);
+        pool.insert(Address::repeat_byte(1), stale.clone()).unwrap();
+        pool.insert(Address::repeat_byte(2), stale.clone()).unwrap();
+
+        assert_eq!(pool.evict_expired(now), 2);
+        assert_eq!(pool.size(), 0);
+        assert!(pool.get_by_hash(&hash).is_none());
+        pool.assert_index_consistent();
+
+        pool.insert(Address::repeat_byte(1), stale.clone()).unwrap();
+        pool.insert(Address::repeat_byte(2), stale).unwrap();
+        assert_eq!(pool.size(), 2);
+        pool.assert_index_consistent();
     }
 }
