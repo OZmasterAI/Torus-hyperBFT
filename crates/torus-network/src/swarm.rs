@@ -502,6 +502,11 @@ pub struct SharedState {
     /// leader. `None` (tests/observers, or `TORUS_D2L_BATCH=0`) falls back to
     /// the envelope's original target.
     pub(crate) leader_resolver: RwLock<Option<LeaderResolver>>,
+    /// Item 3 (TORUS_ASYNC_VALIDATE): callback installed by torus-node (bridge
+    /// `set_validate_tee`) that receives the datum bytes of every inbound
+    /// proposal/body ON THE NETWORK THREAD, feeding the speculative validate
+    /// worker. `None` (flag off, tests, observers) = zero-cost no-op.
+    pub(crate) validate_tee: RwLock<Option<Arc<dyn Fn(Vec<u8>) + Send + Sync>>>,
 }
 
 /// Capacity of the B2 dual-path dedup LRU. Sized for arrival skew, not
@@ -2150,7 +2155,7 @@ fn handle_command(
     match cmd {
         NetworkCommand::Broadcast { message } => {
             // Self-delivery (hotstuff_rs expects proposer to receive its own broadcast)
-            enqueue_inbound(&shared.inbound, *local_key, message.clone());
+            enqueue_inbound(shared, *local_key, message.clone());
             // B2 consensus isolation: fan the broadcast over /torus/direct to
             // every registered validator, reusing the vote-path machinery
             // (pending-send buffering, redial, OutboundFailure re-enqueue,
@@ -2681,7 +2686,7 @@ fn send_direct(
     message: hotstuff_rs::networking::messages::Message,
 ) -> DirectSendOutcome {
     if target == local_key {
-        enqueue_inbound(&shared.inbound, *local_key, message);
+        enqueue_inbound(shared, *local_key, message);
         return DirectSendOutcome::SelfDelivered;
     }
     let peer_id = shared.peer_map.read().unwrap().get_peer_id(target).copied();
@@ -2840,17 +2845,49 @@ fn enqueue_native_da_shard(shared: &SharedState, source: Vec<u8>, resp: NativeDa
 /// whether the message was actually enqueued (false = dropped on a full
 /// queue) so the B2 dedup only records DELIVERED messages.
 fn enqueue_inbound(
-    inbound: &Mutex<VecDeque<(VerifyingKey, hotstuff_rs::networking::messages::Message)>>,
+    shared: &SharedState,
     sender: VerifyingKey,
     msg: hotstuff_rs::networking::messages::Message,
 ) -> bool {
-    let mut queue = inbound.lock().unwrap();
+    // Item 3 (TORUS_ASYNC_VALIDATE): tee proposal/body datum bytes to the
+    // speculative validate worker ON THIS (network) thread — every algo-thread-
+    // bound message funnels through here (gossip, direct fan, loopback,
+    // header-first body responses), so by the time the hotstuff-algo thread
+    // calls `validate_block` the heavy verdict is usually a cache hit. Teeing a
+    // message the bounded queue then DROPS is harmless (the entry ages out, or a
+    // redelivery hits it).
+    tee_proposal_datum(shared, &msg);
+    let mut queue = shared.inbound.lock().unwrap();
     if queue.len() >= MAX_INBOUND_QUEUE {
         warn!("inbound queue full ({MAX_INBOUND_QUEUE}), dropping incoming message");
         return false;
     }
     queue.push_back((sender, msg));
     true
+}
+
+/// Item 3 (TORUS_ASYNC_VALIDATE): hand the datum bytes of an inbound proposal
+/// (full, recovery-response, or header-first body response) to the installed
+/// validate tee. Runs ON THE NETWORK THREAD — teeing on the algo thread would
+/// move the work back onto the thread being relieved. One `RwLock` read when no
+/// tee is installed (flag off).
+fn tee_proposal_datum(shared: &SharedState, msg: &hotstuff_rs::networking::messages::Message) {
+    use hotstuff_rs::hotstuff::messages::HotStuffMessage;
+    use hotstuff_rs::networking::messages::{Message, ProgressMessage};
+    let tee = { shared.validate_tee.read().unwrap().clone() };
+    let Some(tee) = tee else { return };
+    let block = match msg {
+        Message::ProgressMessage(ProgressMessage::HotStuffMessage(m)) => match m {
+            HotStuffMessage::Proposal(p) => &p.block,
+            HotStuffMessage::ProposalResponse(r) => &r.proposal.block,
+            HotStuffMessage::BlockDataResponse(r) => &r.block,
+            _ => return,
+        },
+        _ => return,
+    };
+    if let Some(datum) = block.data.vec().first() {
+        tee(datum.bytes().clone());
+    }
 }
 
 /// Outcome of a consensus-message enqueue attempt (B2).
@@ -2922,7 +2959,7 @@ fn enqueue_consensus_inbound(
         }
         return ConsensusEnqueue::Duplicate;
     }
-    if !enqueue_inbound(&shared.inbound, sender, msg) {
+    if !enqueue_inbound(shared, sender, msg) {
         return ConsensusEnqueue::QueueFull;
     }
     if dedup {
@@ -3296,7 +3333,56 @@ mod tests {
             consensus_dedup: Mutex::new(ConsensusDedup::with_cap(CONSENSUS_DEDUP_CAP)),
             outbound_forward_batches: Mutex::new(HashMap::new()),
             leader_resolver: RwLock::new(None),
+            validate_tee: RwLock::new(None),
         }
+    }
+
+    /// Item 3 (TORUS_ASYNC_VALIDATE): an inbound Proposal's datum bytes reach the
+    /// installed validate tee at enqueue time, ON the enqueueing (network) thread;
+    /// non-proposal messages tee nothing.
+    #[test]
+    fn validate_tee_receives_proposal_datum_on_enqueue() {
+        use hotstuff_rs::hotstuff::messages::{HotStuffMessage, Proposal};
+        use hotstuff_rs::hotstuff::types::PhaseCertificate;
+        use hotstuff_rs::types::block::Block;
+        use hotstuff_rs::types::data_types::{
+            BlockHeight, ChainID, CryptoHash, Data, Datum, ViewNumber,
+        };
+
+        let shared = test_shared();
+        let seen: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        *shared.validate_tee.write().unwrap() =
+            Some(Arc::new(move |bytes: Vec<u8>| sink.lock().unwrap().push(bytes)));
+
+        let datum = vec![7u8, 8, 9];
+        let block = Block::new(
+            BlockHeight::new(1),
+            PhaseCertificate::genesis_pc(),
+            CryptoHash::new([0u8; 32]),
+            Data::new(vec![Datum::new(datum.clone())]),
+        );
+        let msg: hotstuff_rs::networking::messages::Message = HotStuffMessage::Proposal(Proposal {
+            chain_id: ChainID::new(0),
+            view: ViewNumber::new(1),
+            block,
+            tc: None,
+            nec: None,
+        })
+        .into();
+        assert!(enqueue_inbound(&shared, test_vk(1), msg));
+        assert_eq!(seen.lock().unwrap().as_slice(), &[datum]);
+
+        // A non-proposal message tees nothing.
+        let nv: hotstuff_rs::networking::messages::Message =
+            hotstuff_rs::pacemaker::messages::PacemakerMessage::AdvanceView(
+                hotstuff_rs::pacemaker::messages::AdvanceView {
+                    progress_certificate: PhaseCertificate::genesis_pc().into(),
+                },
+            )
+            .into();
+        assert!(enqueue_inbound(&shared, test_vk(1), nv));
+        assert_eq!(seen.lock().unwrap().len(), 1);
     }
 
     #[test]

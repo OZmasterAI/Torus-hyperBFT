@@ -224,6 +224,7 @@ impl LibP2PNetwork {
             // node-installed leader-hint callback (set_leader_resolver).
             outbound_forward_batches: Mutex::new(HashMap::new()),
             leader_resolver: RwLock::new(None),
+            validate_tee: RwLock::new(None),
         });
 
         let (command_tx, command_rx) = mpsc::unbounded_channel();
@@ -418,6 +419,13 @@ impl LibP2PNetwork {
     /// cheap clone over the shared StateDb.
     pub fn set_native_da_store(&self, store: torus_state::NativeDaStore) {
         *self.shared.native_da.write().unwrap() = Some(store);
+    }
+
+    /// Item 3 (TORUS_ASYNC_VALIDATE): install the network-thread proposal-datum
+    /// tee feeding the speculative validate worker. Called once at startup by
+    /// torus-node when the flag is on; never installed (zero-cost no-op) when off.
+    pub fn set_validate_tee(&self, tee: Arc<dyn Fn(Vec<u8>) + Send + Sync>) {
+        *self.shared.validate_tee.write().unwrap() = Some(tee);
     }
 
     /// Issue a RARE pull-fallback fetch for missing native-action bodies by-hash
@@ -691,6 +699,7 @@ mod tests {
             // B1: no in-flight forward envelopes, no leader resolver.
             outbound_forward_batches: Mutex::new(HashMap::new()),
             leader_resolver: RwLock::new(None),
+            validate_tee: RwLock::new(None),
         })
     }
 

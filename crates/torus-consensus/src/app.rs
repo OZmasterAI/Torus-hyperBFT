@@ -26,7 +26,7 @@ use hotstuff_rs::types::block::Block;
 use hotstuff_rs::types::data_types::{CryptoHash, Data, Datum, Power};
 use hotstuff_rs::types::update_sets::ValidatorSetUpdates;
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, RwLock};
 use std::thread::JoinHandle;
@@ -178,6 +178,32 @@ fn parse_shard_custody_toggle(raw: Option<String>) -> bool {
         Some(v) => v.trim() != "0",
         None => true,
     }
+}
+
+/// Item 3 (perf/matched-200k): `TORUS_ASYNC_VALIDATE=1` moves the heavy stage of
+/// `validate_block` (decode + DA durability + EVM decode + sig/attest verify) off
+/// the hotstuff-algo thread onto the `torus-async-validate` worker, fed at body
+/// arrival on the NETWORK thread. Anything else (INCLUDING UNSET) keeps the
+/// byte-identical sync path. Resolved ONCE at `TorusApp::new` and logged there
+/// (`log_async_validate_resolution`).
+fn async_validate_enabled() -> bool {
+    parse_async_validate_toggle(std::env::var("TORUS_ASYNC_VALIDATE").ok())
+}
+
+/// Pure parse of the `TORUS_ASYNC_VALIDATE` value: only `"1"` enables (same
+/// idiom as `parse_exec_pipeline_toggle`).
+fn parse_async_validate_toggle(v: Option<String>) -> bool {
+    matches!(v.as_deref().map(str::trim), Some("1"))
+}
+
+/// Log the `TORUS_ASYNC_VALIDATE` resolution — fired once at startup in BOTH
+/// states (TORUS_MATCH_WORKERS lesson: an unlogged knob makes bench results
+/// un-analyzable). Split from `TorusApp::new` so the line is unit-testable.
+fn log_async_validate_resolution(enabled: bool) {
+    tracing::info!(
+        enabled,
+        "TORUS_ASYNC_VALIDATE resolved at startup (speculative validate_block body work off the consensus thread)"
+    );
 }
 
 #[cfg(test)]
@@ -2281,6 +2307,10 @@ pub struct TorusApp {
     /// when the mempool or fetcher is absent (consensus-only tests) — a miss
     /// then fails the view without a handoff, same as before BS-4a.
     da_recovery: Option<DaRecoveryWorker>,
+    /// Item 3 (`TORUS_ASYNC_VALIDATE=1`): speculative body validation off the
+    /// hotstuff-algo thread. `None` with the flag off (the default) — the
+    /// validate path is then byte-identical to before the flag existed.
+    async_validate: Option<AsyncValidateWorker>,
     /// Regime-B strict-order execution. The next committed height the execution
     /// pipeline must receive. Blocks are handed to `exec_tx` STRICTLY in
     /// ascending height with NO gaps: native matching is order-dependent, so
@@ -2830,6 +2860,196 @@ impl Drop for DaRecoveryWorker {
     }
 }
 
+// ============== TORUS_ASYNC_VALIDATE (item 3, perf/matched-200k) ==============
+
+/// A heavy-stage verdict the `torus-async-validate` worker produced for one EXACT
+/// datum byte-string. Only fully-Valid heavy stages are cached — any failure
+/// (decode, durability, EVM, signatures) caches NOTHING, so the sync path always
+/// re-derives negative verdicts itself (no negative caching, no stale rejects).
+struct CachedVerdict {
+    /// The decoded (and, for compact proposals, reconstructed) block. Its bodies
+    /// are durable in the DA store — the worker met the S459 bar before caching.
+    block: TorusBlock,
+    /// In-flight hash notes from the compact path, applied on the algo thread at
+    /// hit time (`InFlightHashLedger` is algo-thread state; s355 guard).
+    notes: Vec<(u64, Vec<torus_types::B256>)>,
+    /// `last_header.height` when the worker read committed state (sessions /
+    /// validator set) for signature verification. A hit whose basis no longer
+    /// equals the CURRENT committed height is DISCARDED (sync fallback): the
+    /// async path must never vote differently than the sync path would NOW.
+    basis_height: u64,
+}
+
+/// Bound on cached verdicts. Entries also age out under the same `h + 10`
+/// sliding window as `pending_proposals`; past the cap new verdicts are dropped
+/// (harmless — the sync fallback covers them).
+const ASYNC_VALIDATE_CACHE_CAP: usize = 32;
+
+/// State shared between the algo thread and the async-validate worker.
+struct AsyncValidateShared {
+    /// Consume-once verdicts keyed by `TorusApp::hash_datum` of the EXACT datum
+    /// bytes — the same sha256 `validate_block` recomputes for `data_hash`, so a
+    /// hit can never cover different bytes and forks necessarily have distinct keys.
+    cache: std::sync::Mutex<std::collections::HashMap<[u8; 32], CachedVerdict>>,
+    /// Mirror of `last_header.height`, stored by the algo thread as commits apply
+    /// — the worker stamps each verdict's `basis_height` from it.
+    committed_height: AtomicU64,
+    /// Mirror of `last_validator_set.validators.len()` for best-effort shard
+    /// custody (erasure params). Epoch rotations refresh it; a one-block stale
+    /// count at a boundary only degrades custody, never the vote.
+    validator_count: AtomicUsize,
+}
+
+impl AsyncValidateShared {
+    /// Insert a verdict, bounded: evict entries left behind by the height window
+    /// and drop (do not insert) past the cap — a dropped verdict just means the
+    /// sync fallback validates that proposal, exactly as with the flag off.
+    fn insert_bounded(&self, key: [u8; 32], verdict: CachedVerdict) {
+        let mut cache = self.cache.lock().unwrap();
+        let height = verdict.block.header.height;
+        cache.retain(|_, v| v.block.header.height + 10 > height);
+        if cache.len() >= ASYNC_VALIDATE_CACHE_CAP {
+            tracing::warn!(height, "async-validate cache full — dropping verdict (sync fallback)");
+            return;
+        }
+        cache.insert(key, verdict);
+    }
+}
+
+/// Cloneable feed into the async-validate worker. torus-node hands it to the
+/// network layer, which tees inbound proposal datum bytes at enqueue time (ON the
+/// network thread — teeing on the algo thread would move the work back onto the
+/// thread being relieved).
+#[derive(Clone)]
+pub struct AsyncValidateHandle {
+    tx: std::sync::mpsc::SyncSender<Vec<u8>>,
+}
+
+impl AsyncValidateHandle {
+    /// Non-blocking submit of one proposal datum for speculative validation.
+    /// Returns `true` iff queued; a full queue or dead worker drops the bytes —
+    /// harmless, the algo thread's sync fallback validates the proposal instead.
+    pub fn submit(&self, datum_bytes: Vec<u8>) -> bool {
+        self.tx.try_send(datum_bytes).is_ok()
+    }
+}
+
+/// The `torus-async-validate` worker (DaRecoveryWorker pattern: named thread,
+/// bounded queue, shutdown flag, join-on-drop). Owns Arc/clone handles only, so
+/// it needs nothing from the `TorusApp` moved into the algo thread.
+struct AsyncValidateWorker {
+    tx: std::sync::mpsc::SyncSender<Vec<u8>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+    shutdown: Arc<AtomicBool>,
+    shared: Arc<AsyncValidateShared>,
+}
+
+impl AsyncValidateWorker {
+    fn spawn(
+        shared: Arc<AsyncValidateShared>,
+        mempool: Arc<Mempool>,
+        da_fetcher: Option<Arc<dyn NativeDaFetcher>>,
+        metrics: Option<Arc<torus_telemetry::Metrics>>,
+        state_db: StateDb,
+        staking: StakingManager,
+    ) -> Self {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(WORKER_QUEUE_CAP);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let worker_shutdown = shutdown.clone();
+        let worker_shared = shared.clone();
+        let handle = std::thread::Builder::new()
+            .name("torus-async-validate".into())
+            .spawn(move || {
+                while let Ok(datum_bytes) = rx.recv() {
+                    if worker_shutdown.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    // Drop-wake sentinel (see `Drop`): an empty datum is never a
+                    // real proposal (bincode decode would fail anyway).
+                    if datum_bytes.is_empty() {
+                        continue;
+                    }
+                    let key = TorusApp::hash_datum(&datum_bytes);
+                    if worker_shared.cache.lock().unwrap().contains_key(&key) {
+                        continue; // duplicate delivery (loopback + gossip + direct)
+                    }
+                    // Record the committed-state basis BEFORE reading state for
+                    // verification; re-checked after, so a commit applying mid-
+                    // validation discards the verdict instead of caching a reply
+                    // the sync path might no longer give.
+                    let basis = worker_shared.committed_height.load(Ordering::Relaxed);
+                    let mut notes = Vec::new();
+                    let block = match TorusApp::decode_proposal_and_ensure_durable_core(
+                        Some(&mempool),
+                        da_fetcher.as_ref(),
+                        None, // misses are NOT handed to DA recovery here: the sync
+                        // fallback re-runs the bounded wait and does the handoff
+                        &metrics,
+                        worker_shared.validator_count.load(Ordering::Relaxed),
+                        &datum_bytes,
+                        &mut notes,
+                    ) {
+                        Ok(block) => block,
+                        Err(_) => continue, // no negative caching — sync path decides
+                    };
+                    if !TorusApp::validate_body_checks_core(
+                        &block,
+                        &state_db,
+                        &staking,
+                        metrics.clone(),
+                    ) {
+                        continue; // no negative caching — sync path decides
+                    }
+                    if worker_shared.committed_height.load(Ordering::Relaxed) != basis {
+                        continue; // committed state moved mid-validation — discard
+                    }
+                    worker_shared.insert_bounded(
+                        key,
+                        CachedVerdict {
+                            block,
+                            notes,
+                            basis_height: basis,
+                        },
+                    );
+                }
+            })
+            .expect("spawn torus-async-validate thread");
+        Self {
+            tx,
+            handle: Some(handle),
+            shutdown,
+            shared,
+        }
+    }
+
+    fn handle(&self) -> AsyncValidateHandle {
+        AsyncValidateHandle {
+            tx: self.tx.clone(),
+        }
+    }
+
+    /// Consume-once verdict lookup for the algo thread.
+    fn take_verdict(&self, key: &[u8; 32]) -> Option<CachedVerdict> {
+        self.shared.cache.lock().unwrap().remove(key)
+    }
+}
+
+impl Drop for AsyncValidateWorker {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+        // Wake a parked recv(): tee handles cloned into the network layer keep the
+        // channel alive, so (unlike DaRecoveryWorker) dropping our sender is not
+        // guaranteed to error the recv. An empty sentinel always wakes it; if the
+        // queue is full the worker is awake already.
+        let _ = self.tx.try_send(Vec::new());
+        if let Some(h) = self.handle.take() {
+            if h.join().is_err() {
+                tracing::warn!("async-validate worker thread panicked");
+            }
+        }
+    }
+}
+
 /// Bounded LOCAL retry on the hot validate path (BS-4a): ONE 20 ms wake-on-arrival
 /// slice, just enough to catch the racing pre-proposal PUSH that lands right after
 /// the CompactBlock (the common case; keeps recovery rare). OPEN QUESTION: the
@@ -3009,6 +3229,7 @@ impl TorusApp {
             da_fetcher: None,
             shard_fetcher: None,
             da_recovery: None,
+            async_validate: None,
             exec_next_height: None,
             deferred_exec: std::collections::BTreeMap::new(),
             exec_hole_since: None,
@@ -3018,6 +3239,15 @@ impl TorusApp {
             exec_prepared_height: None,
             exec_prepared_durable: DurableRows::default(),
         };
+
+        // Item 3 (TORUS_ASYNC_VALIDATE): resolved ONCE here and LOGGED in both
+        // states — an unlogged knob makes bench results un-analyzable
+        // (TORUS_MATCH_WORKERS lesson). Default OFF = byte-identical sync path.
+        let async_validate = async_validate_enabled();
+        log_async_validate_resolution(async_validate);
+        if async_validate {
+            app.enable_async_validate();
+        }
 
         // FIX 1b: a boot replay hole PARKS instead of latching a pre-network
         // fail-stop. Seed the strict-order execution queue with the committed
@@ -3143,6 +3373,61 @@ impl TorusApp {
             ));
         }
         self.da_fetcher = Some(fetcher);
+        // Item 3: the async-validate worker captures the fetcher at spawn (like
+        // DaRecoveryWorker) — re-spawn it so speculative compact reconstruction
+        // can absorb pre-warm pulls. The shared cache survives the re-spawn.
+        if self.async_validate.is_some() {
+            self.enable_async_validate();
+        }
+    }
+
+    /// Item 3: spawn (or re-spawn, preserving the shared verdict cache) the
+    /// `torus-async-validate` worker. Called from `new()` when
+    /// `TORUS_ASYNC_VALIDATE=1` and again by `set_native_da_fetcher`. Requires a
+    /// mempool (the durable DA store) — without one there is nothing to make
+    /// durable off-thread, so the sync path stays authoritative.
+    fn enable_async_validate(&mut self) {
+        let Some(ref mempool) = self.mempool else {
+            tracing::warn!(
+                "TORUS_ASYNC_VALIDATE=1 but no mempool/DA store wired — staying on the sync validate path"
+            );
+            return;
+        };
+        let shared = match self.async_validate.take() {
+            // Re-spawn: keep cache + counters; dropping `old` joins its thread.
+            Some(old) => old.shared.clone(),
+            None => Arc::new(AsyncValidateShared {
+                cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+                committed_height: AtomicU64::new(self.last_header.height),
+                validator_count: AtomicUsize::new(self.last_validator_set.validators.len()),
+            }),
+        };
+        self.async_validate = Some(AsyncValidateWorker::spawn(
+            shared,
+            mempool.clone(),
+            self.da_fetcher.clone(),
+            self.metrics.clone(),
+            self.state_db.clone(),
+            self.staking.clone(),
+        ));
+    }
+
+    /// Item 3: the network-thread feed into the async-validate worker, or `None`
+    /// with `TORUS_ASYNC_VALIDATE` off. torus-node wires this into the swarm's
+    /// inbound-enqueue tee AFTER `set_native_da_fetcher` (which re-spawns the
+    /// worker, invalidating earlier handles).
+    pub fn async_validate_handle(&self) -> Option<AsyncValidateHandle> {
+        self.async_validate.as_ref().map(|w| w.handle())
+    }
+
+    /// Item 3: mirror the active validator-set size into the async-validate
+    /// worker's shared snapshot (erasure custody params off-thread).
+    fn refresh_async_validate_validator_count(&self) {
+        if let Some(ref av) = self.async_validate {
+            av.shared
+                .validator_count
+                .store(self.last_validator_set.validators.len(), Ordering::Relaxed);
+        }
     }
 
     /// T8-integration increment 2: attach the OPTIONAL erasure-shard recovery
@@ -3372,11 +3657,34 @@ impl TorusApp {
     /// `Err(missing_count)` so the caller votes MissingData — NOT Invalid, no
     /// blacklisting (mem 28e1a821 lineage): the block is simply re-proposed next
     /// view. Only call with a non-empty `hashes`.
+    /// Thin self-wrapper over the core, kept for the `reconstruct_*` tests
+    /// (production callers go through `decode_proposal_and_ensure_durable_core`).
+    #[cfg(test)]
     fn reconstruct_native_actions_hot(
         &self,
         hashes: &[torus_types::B256],
     ) -> Result<Vec<torus_types::SignedNativeAction>, usize> {
-        let Some(ref mempool) = self.mempool else {
+        Self::reconstruct_native_actions_hot_core(
+            self.mempool.as_ref(),
+            self.da_fetcher.as_ref(),
+            self.da_recovery.as_ref(),
+            &self.metrics,
+            hashes,
+        )
+    }
+
+    /// Static core of `reconstruct_native_actions_hot`, shared with the
+    /// `torus-async-validate` worker. The worker passes `da_recovery: None`: a
+    /// worker-side miss caches nothing, and the sync fallback (which re-runs this
+    /// with the recovery worker wired) owns the miss handoff.
+    fn reconstruct_native_actions_hot_core(
+        mempool: Option<&Arc<Mempool>>,
+        da_fetcher: Option<&Arc<dyn NativeDaFetcher>>,
+        da_recovery: Option<&DaRecoveryWorker>,
+        metrics: &Option<Arc<torus_telemetry::Metrics>>,
+        hashes: &[torus_types::B256],
+    ) -> Result<Vec<torus_types::SignedNativeAction>, usize> {
+        let Some(mempool) = mempool else {
             return Err(hashes.len()); // no DA store wired (consensus-only observer)
         };
 
@@ -3422,7 +3730,7 @@ impl TorusApp {
                 // arrive in the fetcher inbound. Absorb them into the DA store here, in the
                 // fast local retry, so a pre-warmed body is picked up WITHOUT the redundant
                 // hot network fetch below — the common case once the proposer pushes hashes.
-                if let Some(ref fetcher) = self.da_fetcher {
+                if let Some(fetcher) = da_fetcher {
                     Self::absorb_fetched_bodies(mempool, fetcher.as_ref());
                 }
                 // One batched read over only the still-missing hashes.
@@ -3448,12 +3756,12 @@ impl TorusApp {
         // budget) and fail THIS view — MissingData, re-proposed next view, by which
         // point the worker has the bodies durably local. mem 7efe7062.
         if !missing.is_empty() {
-            if let Some(ref worker) = self.da_recovery {
+            if let Some(worker) = da_recovery {
                 // Count only batches the worker actually queued: a dead worker or
                 // full queue must not paint the A/B handoff signal green while
                 // recovery is silently dropped (final-review finding 1).
                 if worker.submit(missing.iter().map(|&i| hashes[i]).collect()) {
-                    if let Some(ref m) = self.metrics {
+                    if let Some(m) = metrics.as_ref() {
                         m.native_da_recovery_handoffs.inc();
                     }
                 }
@@ -3545,6 +3853,7 @@ impl TorusApp {
         let diff = EpochManager::compute_validator_set_diff(&self.last_validator_set, &capped_set);
         if diff.is_empty() {
             self.last_validator_set = capped_set;
+            self.refresh_async_validate_validator_count();
             self.cached_vs_updates = Some((height, None));
             return None;
         }
@@ -3602,6 +3911,7 @@ impl TorusApp {
         );
         self.last_validator_set = capped_set;
         self.leader_state.sync_validators(&self.last_validator_set);
+        self.refresh_async_validate_validator_count();
         self.cached_vs_updates = Some((height, Some(updates.clone())));
         Some(updates)
     }
@@ -3695,16 +4005,35 @@ impl TorusApp {
         actions: &[torus_types::SignedNativeAction],
         height: u64,
     ) {
+        Self::custody_native_shards_core(
+            self.metrics.clone(),
+            self.last_validator_set.validators.len(),
+            mempool,
+            actions,
+            height,
+        )
+    }
+
+    /// Static core of `custody_native_shards_best_effort`, shared with the
+    /// `torus-async-validate` worker (which snapshots the validator count via
+    /// `AsyncValidateShared`). Best-effort by contract — never fails the vote —
+    /// so a one-epoch-stale count only degrades custody, never correctness.
+    fn custody_native_shards_core(
+        metrics: Option<Arc<torus_telemetry::Metrics>>,
+        validator_count: usize,
+        mempool: &torus_mempool::Mempool,
+        actions: &[torus_types::SignedNativeAction],
+        height: u64,
+    ) {
         let _custody_span =
-            ObserveOnDrop::new(self.metrics.clone(), |m| &m.validate_block_custody_seconds);
+            ObserveOnDrop::new(metrics, |m| &m.validate_block_custody_seconds);
         if !shard_custody_enabled() {
             return;
         }
         if actions.is_empty() {
             return;
         }
-        let n = self.last_validator_set.validators.len();
-        let params = torus_state::ErasureParams::for_validator_set(n);
+        let params = torus_state::ErasureParams::for_validator_set(validator_count);
         if let Err(e) = mempool.mirror_native_shards(actions, params) {
             tracing::warn!(
                 %e,
@@ -3732,6 +4061,39 @@ impl TorusApp {
         &mut self,
         datum_bytes: &[u8],
     ) -> Result<TorusBlock, ValidateBlockResponse> {
+        let mut in_flight_notes = Vec::new();
+        let result = Self::decode_proposal_and_ensure_durable_core(
+            self.mempool.as_ref(),
+            self.da_fetcher.as_ref(),
+            self.da_recovery.as_ref(),
+            &self.metrics,
+            self.last_validator_set.validators.len(),
+            datum_bytes,
+            &mut in_flight_notes,
+        );
+        // Apply the compact-path in-flight notes REGARDLESS of outcome — a
+        // MissingData proposal's actions are on the wire and must still be
+        // excluded from the next leader's selection (s355, mem c0f4f938).
+        for (height, hashes) in in_flight_notes {
+            self.in_flight_hashes.note(height, hashes);
+        }
+        result
+    }
+
+    /// Static core of `decode_proposal_and_ensure_durable`, shared with the
+    /// `torus-async-validate` worker. Instead of mutating the (algo-thread-only)
+    /// `InFlightHashLedger` directly, compact-path hash notes are pushed into
+    /// `in_flight_notes` for the caller to apply on the algo thread.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_proposal_and_ensure_durable_core(
+        mempool: Option<&Arc<Mempool>>,
+        da_fetcher: Option<&Arc<dyn NativeDaFetcher>>,
+        da_recovery: Option<&DaRecoveryWorker>,
+        metrics: &Option<Arc<torus_telemetry::Metrics>>,
+        validator_count: usize,
+        datum_bytes: &[u8],
+        in_flight_notes: &mut Vec<(u64, Vec<torus_types::B256>)>,
+    ) -> Result<TorusBlock, ValidateBlockResponse> {
         let decode_timer = std::time::Instant::now();
         let full = bincode::deserialize::<TorusBlock>(datum_bytes).ok();
         let compact = if full.is_none() {
@@ -3739,7 +4101,7 @@ impl TorusApp {
         } else {
             None
         };
-        if let Some(ref m) = self.metrics {
+        if let Some(m) = metrics.as_ref() {
             m.validate_block_decode_seconds
                 .observe(decode_timer.elapsed().as_secs_f64());
         }
@@ -3755,10 +4117,10 @@ impl TorusApp {
             // to the durable DA store so this node meets the same local-durability
             // bar the compact path already guarantees. Fail-closed on error.
             if !block.native_actions.is_empty() {
-                if let Some(ref mempool) = self.mempool {
+                if let Some(mempool) = mempool {
                     let da_timer = std::time::Instant::now();
                     let mirrored = mempool.mirror_native_to_da(&block.native_actions);
-                    if let Some(ref m) = self.metrics {
+                    if let Some(m) = metrics.as_ref() {
                         m.validate_block_da_reconstruct_seconds
                             .observe(da_timer.elapsed().as_secs_f64());
                     }
@@ -3775,7 +4137,9 @@ impl TorusApp {
                     // distinct shard sources. Proposer-only custody left a SINGLE
                     // source, so every lagging peer fell back to whole-body pull (the
                     // s338 hotspot). Best-effort, never fails the vote.
-                    self.custody_native_shards_best_effort(
+                    Self::custody_native_shards_core(
+                        metrics.clone(),
+                        validator_count,
                         mempool,
                         &block.native_actions,
                         block.header.height,
@@ -3795,10 +4159,10 @@ impl TorusApp {
             // `pending_proposals`, yet its actions are in flight on the wire — the
             // next leader must still exclude them from selection or they are
             // re-included 2–4x (the s355 duplicate-inclusion tail, mem c0f4f938).
-            self.in_flight_hashes.note(
+            in_flight_notes.push((
                 compact.header.height,
-                compact.native_action_hashes.iter().copied(),
-            );
+                compact.native_action_hashes.clone(),
+            ));
 
             let native_actions = if compact.native_action_hashes.is_empty() {
                 vec![]
@@ -3808,16 +4172,21 @@ impl TorusApp {
                 // genuine push miss is recovered live instead of wedging (#4 Task 1 — the
                 // un-wedge). Budget stays ≪ the 500 ms view timeout.
                 let da_timer = std::time::Instant::now();
-                let reconstructed =
-                    self.reconstruct_native_actions_hot(&compact.native_action_hashes);
-                if let Some(ref m) = self.metrics {
+                let reconstructed = Self::reconstruct_native_actions_hot_core(
+                    mempool,
+                    da_fetcher,
+                    da_recovery,
+                    metrics,
+                    &compact.native_action_hashes,
+                );
+                if let Some(m) = metrics.as_ref() {
                     m.validate_block_da_reconstruct_seconds
                         .observe(da_timer.elapsed().as_secs_f64());
                 }
                 match reconstructed {
                     Ok(actions) => actions,
                     Err(missing_count) => {
-                        if let Some(ref m) = self.metrics {
+                        if let Some(m) = metrics.as_ref() {
                             m.missing_action_rejections.inc();
                         }
                         tracing::warn!(
@@ -3841,8 +4210,10 @@ impl TorusApp {
             // instead of the proposer being the lone source (s338 hotspot).
             // Best-effort, never fails the vote.
             if !native_actions.is_empty() {
-                if let Some(ref mempool) = self.mempool {
-                    self.custody_native_shards_best_effort(
+                if let Some(mempool) = mempool {
+                    Self::custody_native_shards_core(
+                        metrics.clone(),
+                        validator_count,
                         mempool,
                         &native_actions,
                         compact.header.height,
@@ -3859,6 +4230,202 @@ impl TorusApp {
         } else {
             tracing::warn!("validate_block: REJECTED -- deserialization failed");
             Err(ValidateBlockResponse::Invalid)
+        }
+    }
+
+    /// Everything `validate_block` does after the structural datum-count check:
+    /// hash binding, decode + durability, body checks, ancestry, bookkeeping.
+    /// Split out (a) so tests can drive it without the crate-private
+    /// `ValidateBlockRequest`, and (b) to host the TORUS_ASYNC_VALIDATE hit path.
+    fn validate_datum(
+        &mut self,
+        datum_bytes: &[u8],
+        data_hash: &CryptoHash,
+    ) -> ValidateBlockResponse {
+        // T1.5 FAIL-STOP (re-checked so direct callers get it too; on the
+        // `validate_block` path the first check already returned).
+        if self.is_exec_failed() {
+            tracing::error!(
+                "validate_block: execution pipeline dead — FAIL-STOP, refusing to vote"
+            );
+            return ValidateBlockResponse::Invalid;
+        }
+
+        let computed = Self::hash_datum(datum_bytes);
+        if *data_hash != CryptoHash::new(computed) {
+            tracing::warn!(
+                datum_len = datum_bytes.len(),
+                "validate_block: REJECTED -- data_hash mismatch"
+            );
+            return ValidateBlockResponse::Invalid;
+        }
+
+        // TORUS_ASYNC_VALIDATE hit path: the worker already ran the heavy stage
+        // (decode + DA durability + EVM decode + sig/attest verify) for these
+        // EXACT bytes — the cache key IS the sha256 recomputed and bound to
+        // `data_hash` just above, so a hit can never cover different bytes, and
+        // different forks necessarily miss each other's entries. Consume-once; a
+        // verdict whose committed-state basis moved (a commit applied since the
+        // worker read sessions/validators) is DISCARDED in favor of the full
+        // sync path below. The algo-thread-only checks (fail-stop above;
+        // ancestry + bookkeeping in `finish_validate`) run on EVERY path.
+        if let Some(ref av) = self.async_validate {
+            if let Some(verdict) = av.take_verdict(&computed) {
+                if verdict.basis_height == self.last_header.height {
+                    for (height, hashes) in verdict.notes {
+                        self.in_flight_hashes.note(height, hashes);
+                    }
+                    return self.finish_validate(verdict.block);
+                }
+                tracing::debug!(
+                    height = verdict.block.header.height,
+                    basis = verdict.basis_height,
+                    committed = self.last_header.height,
+                    "async-validate verdict stale (committed state moved) — sync fallback"
+                );
+            }
+        }
+
+        // Decode the proposal (TorusBlock new format, CompactBlock fallback) and
+        // enforce the S459 body-durability invariant before we may vote `Valid`:
+        // every referenced native body is durable in THIS node's DA store, or we
+        // short-circuit (MissingData / Invalid). See
+        // `decode_proposal_and_ensure_durable`.
+        let torus_block = match self.decode_proposal_and_ensure_durable(datum_bytes) {
+            Ok(block) => block,
+            Err(response) => return response,
+        };
+
+        if !Self::validate_body_checks_core(
+            &torus_block,
+            &self.state_db,
+            &self.staking,
+            self.metrics.clone(),
+        ) {
+            return ValidateBlockResponse::Invalid;
+        }
+
+        self.finish_validate(torus_block)
+    }
+
+    /// Body validity checks shared by the sync path and the
+    /// `torus-async-validate` worker: EVM tx decode + native
+    /// signature/attestation verification. Pure reads of committed state
+    /// (`state_db` sessions, `staking` validator registry); records
+    /// `torus_validate_block_attest_seconds` on the CALLING thread — the thread
+    /// where the work actually runs.
+    fn validate_body_checks_core(
+        torus_block: &TorusBlock,
+        state_db: &StateDb,
+        staking: &StakingManager,
+        metrics: Option<Arc<torus_telemetry::Metrics>>,
+    ) -> bool {
+        if !torus_block.evm_transactions.is_empty()
+            && decode_all_txs(&torus_block.evm_transactions).is_err()
+        {
+            tracing::warn!("validate_block: REJECTED -- invalid EVM transactions");
+            return false;
+        }
+
+        if !torus_block.native_actions.is_empty() {
+            let _attest_span =
+                ObserveOnDrop::new(metrics, |m| &m.validate_block_attest_seconds);
+            if torus_block.header.sig_attestation == [0u8; 64] {
+                // Non-attested proposer: we must verify every action ourselves. Use the
+                // SAME session-aware resolver as the execution path (see ~L300) so BOTH
+                // EIP-712 and ed25519 *session* signatures are checked against committed
+                // session state. The old code called `recover_sender`, which returns Err
+                // for every `ActionSignature::Session` (eip712.rs:765) and thus blanket-
+                // rejected all session actions on non-attested blocks — the deterministic
+                // root cause of the reject-loop (mem 41e06912). `None` == bad sig /
+                // missing / expired / out-of-scope session.
+                //
+                // Reads committed state (identical across validators at this height) so
+                // the verdict is deterministic and cannot fork WITHIN a block. NOTE:
+                // this is a CONSENSUS VALIDITY CHANGE — deploy to ALL validators
+                // together; a mixed old/new set disagrees on these blocks and forks.
+                // Same-block CreateSession+order still rejects here (defect A, tracked
+                // separately) — strictly better than rejecting all session blocks.
+                let resolved = torus_types::eip712::batch_verify_native_actions(
+                    &torus_block.native_actions,
+                    torus_block.header.timestamp,
+                    |pubkey| state_db.get_session(pubkey).ok().flatten(),
+                );
+                if let Some(i) = resolved.iter().position(|s| s.is_none()) {
+                    tracing::warn!(
+                        index = i,
+                        "validate_block: REJECTED -- invalid native action signature"
+                    );
+                    return false;
+                }
+            } else {
+                let proposer_addr = torus_block.header.proposer;
+                let proposer_pubkey = match staking.get_validator(&proposer_addr) {
+                    Ok(Some(val)) => match ed25519_dalek::VerifyingKey::from_bytes(&val.pubkey) {
+                        Ok(vk) => vk,
+                        Err(_) => {
+                            tracing::warn!(%proposer_addr, "validate_block: REJECTED -- invalid proposer pubkey");
+                            return false;
+                        }
+                    },
+                    _ => {
+                        tracing::warn!(%proposer_addr, "validate_block: REJECTED -- proposer not in validator set");
+                        return false;
+                    }
+                };
+                if !torus_bridge::proposer::verify_sig_attestation(
+                    &torus_block.native_actions,
+                    &torus_block.header.sig_attestation,
+                    &proposer_pubkey,
+                ) {
+                    tracing::warn!(%proposer_addr, "validate_block: REJECTED -- invalid sig attestation");
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Algo-thread tail of `validate_block`, shared by the sync path and the
+    /// TORUS_ASYNC_VALIDATE hit path: ancestry check against the LIVE
+    /// `last_header` (never cached — it mutates as commits apply), pending
+    /// bookkeeping, epoch validator-set updates.
+    fn finish_validate(&mut self, torus_block: TorusBlock) -> ValidateBlockResponse {
+        // Ancestry check (best-effort, voting time): if our latest committed
+        // header IS the claimed parent (its height is H-1), the proposal's
+        // `parent_hash` MUST equal the keccak canonical hash of that header. A
+        // mismatch means the proposer built on a DIFFERENT height-(H-1) block than
+        // we finalized — the exact fork/equivocation the hash-level fork checker
+        // exists to catch — so refuse to vote.
+        //
+        // When our `last_header` is NOT the parent (we are behind, or the parent
+        // is still pending in the header-first fast path) we cannot cheaply
+        // resolve the parent here, so we DEFER rather than reject (preserving
+        // liveness): the hotstuff justify QC still constrains ancestry at the
+        // consensus level, and the commit-time check in `execute_committed_block`
+        // re-verifies the link authoritatively once the parent is applied.
+        let height = torus_block.header.height;
+        if height > 0 && self.last_header.height + 1 == height {
+            let expected_parent =
+                alloy_primitives::keccak256(self.last_header.canonical_header_bytes());
+            if torus_block.header.parent_hash != expected_parent {
+                tracing::warn!(
+                    height,
+                    claimed_parent = %torus_block.header.parent_hash,
+                    expected_parent = %expected_parent,
+                    "validate_block: REJECTED -- parent_hash does not match locally-known parent (ancestry violation)"
+                );
+                return ValidateBlockResponse::Invalid;
+            }
+        }
+
+        self.pending_proposals.insert(height, torus_block);
+        self.pending_proposals.retain(|&h, _| h + 10 > height);
+
+        let validator_set_updates = self.epoch_validator_set_updates(height);
+        ValidateBlockResponse::Valid {
+            app_state_updates: None,
+            validator_set_updates,
         }
     }
 }
@@ -4058,127 +4625,7 @@ impl App<RocksKVStore> for TorusApp {
             return ValidateBlockResponse::Invalid;
         }
 
-        let datum_bytes = datums[0].bytes();
-
-        let computed = Self::hash_datum(datum_bytes);
-        if block.data_hash != CryptoHash::new(computed) {
-            tracing::warn!(
-                datum_len = datum_bytes.len(),
-                "validate_block: REJECTED -- data_hash mismatch"
-            );
-            return ValidateBlockResponse::Invalid;
-        }
-
-        // Decode the proposal (TorusBlock new format, CompactBlock fallback) and
-        // enforce the S459 body-durability invariant before we may vote `Valid`:
-        // every referenced native body is durable in THIS node's DA store, or we
-        // short-circuit (MissingData / Invalid). See
-        // `decode_proposal_and_ensure_durable`.
-        let torus_block = match self.decode_proposal_and_ensure_durable(datum_bytes) {
-            Ok(block) => block,
-            Err(response) => return response,
-        };
-
-        if !torus_block.evm_transactions.is_empty()
-            && decode_all_txs(&torus_block.evm_transactions).is_err()
-        {
-            tracing::warn!("validate_block: REJECTED -- invalid EVM transactions");
-            return ValidateBlockResponse::Invalid;
-        }
-
-        if !torus_block.native_actions.is_empty() {
-            let _attest_span =
-                ObserveOnDrop::new(self.metrics.clone(), |m| &m.validate_block_attest_seconds);
-            if torus_block.header.sig_attestation == [0u8; 64] {
-                // Non-attested proposer: we must verify every action ourselves. Use the
-                // SAME session-aware resolver as the execution path (see ~L300) so BOTH
-                // EIP-712 and ed25519 *session* signatures are checked against committed
-                // session state. The old code called `recover_sender`, which returns Err
-                // for every `ActionSignature::Session` (eip712.rs:765) and thus blanket-
-                // rejected all session actions on non-attested blocks — the deterministic
-                // root cause of the reject-loop (mem 41e06912). `None` == bad sig /
-                // missing / expired / out-of-scope session.
-                //
-                // Reads `self.state_db` (committed state, identical across validators at
-                // this height) so the verdict is deterministic and cannot fork WITHIN a
-                // block. NOTE: this is a CONSENSUS VALIDITY CHANGE — deploy to ALL
-                // validators together; a mixed old/new set disagrees on these blocks and
-                // forks. Same-block CreateSession+order still rejects here (defect A,
-                // tracked separately) — strictly better than rejecting all session blocks.
-                let resolved = torus_types::eip712::batch_verify_native_actions(
-                    &torus_block.native_actions,
-                    torus_block.header.timestamp,
-                    |pubkey| self.state_db.get_session(pubkey).ok().flatten(),
-                );
-                if let Some(i) = resolved.iter().position(|s| s.is_none()) {
-                    tracing::warn!(
-                        index = i,
-                        "validate_block: REJECTED -- invalid native action signature"
-                    );
-                    return ValidateBlockResponse::Invalid;
-                }
-            } else {
-                let proposer_addr = torus_block.header.proposer;
-                let proposer_pubkey = match self.staking.get_validator(&proposer_addr) {
-                    Ok(Some(val)) => match ed25519_dalek::VerifyingKey::from_bytes(&val.pubkey) {
-                        Ok(vk) => vk,
-                        Err(_) => {
-                            tracing::warn!(%proposer_addr, "validate_block: REJECTED -- invalid proposer pubkey");
-                            return ValidateBlockResponse::Invalid;
-                        }
-                    },
-                    _ => {
-                        tracing::warn!(%proposer_addr, "validate_block: REJECTED -- proposer not in validator set");
-                        return ValidateBlockResponse::Invalid;
-                    }
-                };
-                if !torus_bridge::proposer::verify_sig_attestation(
-                    &torus_block.native_actions,
-                    &torus_block.header.sig_attestation,
-                    &proposer_pubkey,
-                ) {
-                    tracing::warn!(%proposer_addr, "validate_block: REJECTED -- invalid sig attestation");
-                    return ValidateBlockResponse::Invalid;
-                }
-            }
-        }
-
-        // Ancestry check (best-effort, voting time): if our latest committed
-        // header IS the claimed parent (its height is H-1), the proposal's
-        // `parent_hash` MUST equal the keccak canonical hash of that header. A
-        // mismatch means the proposer built on a DIFFERENT height-(H-1) block than
-        // we finalized — the exact fork/equivocation the hash-level fork checker
-        // exists to catch — so refuse to vote.
-        //
-        // When our `last_header` is NOT the parent (we are behind, or the parent
-        // is still pending in the header-first fast path) we cannot cheaply
-        // resolve the parent here, so we DEFER rather than reject (preserving
-        // liveness): the hotstuff justify QC still constrains ancestry at the
-        // consensus level, and the commit-time check in `execute_committed_block`
-        // re-verifies the link authoritatively once the parent is applied.
-        let height = torus_block.header.height;
-        if height > 0 && self.last_header.height + 1 == height {
-            let expected_parent =
-                alloy_primitives::keccak256(self.last_header.canonical_header_bytes());
-            if torus_block.header.parent_hash != expected_parent {
-                tracing::warn!(
-                    height,
-                    claimed_parent = %torus_block.header.parent_hash,
-                    expected_parent = %expected_parent,
-                    "validate_block: REJECTED -- parent_hash does not match locally-known parent (ancestry violation)"
-                );
-                return ValidateBlockResponse::Invalid;
-            }
-        }
-
-        self.pending_proposals.insert(height, torus_block);
-        self.pending_proposals.retain(|&h, _| h + 10 > height);
-
-        let validator_set_updates = self.epoch_validator_set_updates(height);
-        ValidateBlockResponse::Valid {
-            app_state_updates: None,
-            validator_set_updates,
-        }
+        self.validate_datum(datums[0].bytes(), &block.data_hash)
     }
 
     /// Validate a block during sync. Delegates to `validate_block`, which now
@@ -4334,6 +4781,13 @@ impl App<RocksKVStore> for TorusApp {
         if height > self.last_header.height {
             self.last_header = header.clone();
             self.leader_state.set_view(height.saturating_add(1));
+            // Item 3: the committed frontier moved — async-validate verdicts based
+            // on the older committed state must not be served (stale-basis rule).
+            if let Some(ref av) = self.async_validate {
+                av.shared
+                    .committed_height
+                    .store(self.last_header.height, Ordering::Relaxed);
+            }
         }
 
         // Slashes detected during THIS commit ride with THIS block into the
@@ -7526,6 +7980,406 @@ mod crash_recovery_tests {
         ] {
             assert!(text.contains(name), "{name} missing:\n{text}");
         }
+    }
+
+    // ============== TORUS_ASYNC_VALIDATE (item 3, perf/matched-200k) ==============
+    //
+    // Speculative body validation OFF the hotstuff-algo thread: the heavy stage
+    // (decode + DA durability + EVM decode + sig/attest verify) runs on the
+    // `torus-async-validate` worker at body arrival; `validate_block` then finds a
+    // consume-once verdict in a cache keyed by the sha256 of the EXACT datum bytes
+    // (the same recompute the sync path does for `data_hash`). Flag OFF (default)
+    // = byte-identical sync behavior; any miss or doubt = full sync fallback.
+
+    /// Parse `name N` (histogram `_count` line) out of `Metrics::encode()` text.
+    fn metric_count(text: &str, name: &str) -> u64 {
+        text.lines()
+            .find_map(|l| l.strip_prefix(name).and_then(|rest| rest.trim().parse().ok()))
+            .unwrap_or(0)
+    }
+
+    fn make_async_validate_app() -> (TorusApp, Arc<Mempool>, Arc<torus_telemetry::Metrics>) {
+        let (config, state_db) = make_test_config_and_db();
+        let mempool = Arc::new(Mempool::new(
+            state_db.clone(),
+            torus_mempool::MempoolConfig::default(),
+        ));
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
+        let mut app = TorusApp::new(
+            state_db,
+            &config,
+            Some(metrics.clone()),
+            Some(mempool.clone()),
+            None,
+        );
+        app.enable_async_validate();
+        (app, mempool, metrics)
+    }
+
+    fn async_cache_len(app: &TorusApp) -> usize {
+        app.async_validate
+            .as_ref()
+            .expect("async-validate worker running")
+            .shared
+            .cache
+            .lock()
+            .unwrap()
+            .len()
+    }
+
+    /// Wait (bounded) until the worker has cached `n` verdicts.
+    fn wait_for_cached(app: &TorusApp, n: usize) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while async_cache_len(app) < n {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "async-validate worker did not cache the verdict in time"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    fn data_hash_of(datum: &[u8]) -> CryptoHash {
+        CryptoHash::new(TorusApp::hash_datum(datum))
+    }
+
+    #[test]
+    fn parse_async_validate_toggle_only_1_enables() {
+        assert!(parse_async_validate_toggle(Some("1".to_string())));
+        assert!(parse_async_validate_toggle(Some(" 1 ".to_string())));
+        assert!(!parse_async_validate_toggle(None));
+        for v in ["0", "true", "yes", "on", "", "11", "garbage"] {
+            assert!(
+                !parse_async_validate_toggle(Some(v.to_string())),
+                "only \"1\" may enable; got enabled for {v:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn async_validate_flag_off_parity() {
+        // TORUS_ASYNC_VALIDATE unset (tests never set it): no worker, no cache,
+        // and the validate path runs (and times) everything on the calling thread.
+        let (config, state_db) = make_test_config_and_db();
+        let mempool = Arc::new(Mempool::new(
+            state_db.clone(),
+            torus_mempool::MempoolConfig::default(),
+        ));
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
+        let mut app = TorusApp::new(
+            state_db,
+            &config,
+            Some(metrics.clone()),
+            Some(mempool.clone()),
+            None,
+        );
+        assert!(
+            app.async_validate.is_none(),
+            "flag off must spawn NO worker and populate NO cache"
+        );
+
+        // Full inline TorusBlock datum: Valid, all phase timers observe HERE.
+        let block = make_block(5, vec![sign_claim_rewards(1)]);
+        let datum = encode_proposal_datum(&block, false);
+        let resp = app.validate_datum(&datum, &data_hash_of(&datum));
+        assert!(matches!(resp, ValidateBlockResponse::Valid { .. }));
+        let text = metrics.encode();
+        for name in [
+            "torus_validate_block_decode_seconds_count",
+            "torus_validate_block_da_reconstruct_seconds_count",
+            "torus_validate_block_custody_seconds_count",
+            "torus_validate_block_attest_seconds_count",
+        ] {
+            assert_eq!(
+                metric_count(&text, name),
+                1,
+                "{name} must observe on the calling thread"
+            );
+        }
+
+        // Compact datum whose bodies were delivered out-of-band: Valid too.
+        let actions = vec![sign_claim_rewards(2)];
+        mempool.mirror_native_to_da(&actions).unwrap();
+        let block2 = make_block(5, actions);
+        let datum2 = encode_proposal_datum(&block2, true);
+        let resp2 = app.validate_datum(&datum2, &data_hash_of(&datum2));
+        assert!(matches!(resp2, ValidateBlockResponse::Valid { .. }));
+
+        // data_hash mismatch still rejects.
+        let resp3 = app.validate_datum(&datum, &CryptoHash::new([7u8; 32]));
+        assert!(matches!(resp3, ValidateBlockResponse::Invalid));
+    }
+
+    #[test]
+    fn async_validate_cache_hit_skips_heavy_path() {
+        let (mut app, _mempool, metrics) = make_async_validate_app();
+        let block = make_block(5, vec![sign_claim_rewards(1)]);
+        let datum = encode_proposal_datum(&block, false);
+
+        let handle = app
+            .async_validate_handle()
+            .expect("flag on: tee handle available");
+        assert!(handle.submit(datum.clone()));
+        wait_for_cached(&app, 1);
+
+        // The worker recorded the heavy-stage timers while validating.
+        let text = metrics.encode();
+        assert_eq!(metric_count(&text, "torus_validate_block_decode_seconds_count"), 1);
+        assert_eq!(
+            metric_count(&text, "torus_validate_block_da_reconstruct_seconds_count"),
+            1
+        );
+        assert_eq!(metric_count(&text, "torus_validate_block_attest_seconds_count"), 1);
+
+        let resp = app.validate_datum(&datum, &data_hash_of(&datum));
+        assert!(matches!(resp, ValidateBlockResponse::Valid { .. }));
+
+        // HIT: the heavy stage did NOT re-run on the calling thread.
+        let text = metrics.encode();
+        assert_eq!(metric_count(&text, "torus_validate_block_decode_seconds_count"), 1);
+        assert_eq!(
+            metric_count(&text, "torus_validate_block_da_reconstruct_seconds_count"),
+            1
+        );
+        assert_eq!(metric_count(&text, "torus_validate_block_attest_seconds_count"), 1);
+        assert_eq!(async_cache_len(&app), 0, "verdicts are consume-once");
+        assert!(
+            app.pending_proposals.contains_key(&5),
+            "hit path still records the pending proposal"
+        );
+    }
+
+    #[test]
+    fn async_validate_cache_miss_falls_back_sync() {
+        let (mut app, _mempool, metrics) = make_async_validate_app();
+        let block = make_block(5, vec![sign_claim_rewards(1)]);
+        let datum = encode_proposal_datum(&block, false);
+
+        // Nothing submitted: cache is EMPTY — full sync fallback on this thread.
+        let resp = app.validate_datum(&datum, &data_hash_of(&datum));
+        assert!(matches!(resp, ValidateBlockResponse::Valid { .. }));
+        let text = metrics.encode();
+        assert_eq!(
+            metric_count(&text, "torus_validate_block_decode_seconds_count"),
+            1,
+            "miss must run the sync heavy path on the calling thread"
+        );
+    }
+
+    #[test]
+    fn async_validate_wrong_body_poisoned_cache_rejected() {
+        let (mut app, _mempool, _metrics) = make_async_validate_app();
+        let block = make_block(5, vec![sign_claim_rewards(1)]);
+        let datum = encode_proposal_datum(&block, false);
+        assert!(app.async_validate_handle().unwrap().submit(datum.clone()));
+        wait_for_cached(&app, 1);
+
+        // Attacker hands us DIFFERENT bytes (a forged attestation) with a
+        // self-consistent data_hash. The recomputed key must MISS the cached Valid
+        // verdict and the sync path must reject.
+        let mut tampered_block = block.clone();
+        tampered_block.header.sig_attestation = [1u8; 64];
+        let tampered = bincode::serialize(&tampered_block).unwrap();
+        assert_ne!(tampered, datum);
+        let resp = app.validate_datum(&tampered, &data_hash_of(&tampered));
+        assert!(
+            matches!(resp, ValidateBlockResponse::Invalid),
+            "Valid must never be served for bytes that were not themselves validated"
+        );
+        assert_eq!(
+            async_cache_len(&app),
+            1,
+            "the good entry must not be consumed by the tampered bytes"
+        );
+    }
+
+    #[test]
+    fn async_validate_cross_fork_no_reuse() {
+        let (mut app, _mempool, metrics) = make_async_validate_app();
+        // Two blocks at the SAME height with different bodies (different forks).
+        let block_a = make_block(5, vec![sign_claim_rewards(1)]);
+        let block_b = make_block(5, vec![sign_claim_rewards(2)]);
+        let datum_a = encode_proposal_datum(&block_a, false);
+        let datum_b = encode_proposal_datum(&block_b, false);
+        let handle = app.async_validate_handle().unwrap();
+        assert!(handle.submit(datum_a.clone()));
+        assert!(handle.submit(datum_b.clone()));
+        wait_for_cached(&app, 2);
+
+        // Fork A's verdict serves ONLY fork A, and only once.
+        let resp = app.validate_datum(&datum_a, &data_hash_of(&datum_a));
+        assert!(matches!(resp, ValidateBlockResponse::Valid { .. }));
+        assert_eq!(async_cache_len(&app), 1, "A consumed; B untouched");
+
+        // Re-validating the SAME bytes after consumption falls back sync and agrees.
+        let decode_before = metric_count(
+            &metrics.encode(),
+            "torus_validate_block_decode_seconds_count",
+        );
+        let resp = app.validate_datum(&datum_a, &data_hash_of(&datum_a));
+        assert!(matches!(resp, ValidateBlockResponse::Valid { .. }));
+        assert_eq!(
+            metric_count(
+                &metrics.encode(),
+                "torus_validate_block_decode_seconds_count"
+            ),
+            decode_before + 1,
+            "consumed entry must NOT be re-served — sync fallback re-decodes"
+        );
+
+        // Fork B is served from ITS OWN entry (no cross-fork reuse, no sync re-run).
+        let decode_before = metric_count(
+            &metrics.encode(),
+            "torus_validate_block_decode_seconds_count",
+        );
+        let resp = app.validate_datum(&datum_b, &data_hash_of(&datum_b));
+        assert!(matches!(resp, ValidateBlockResponse::Valid { .. }));
+        assert_eq!(
+            metric_count(
+                &metrics.encode(),
+                "torus_validate_block_decode_seconds_count"
+            ),
+            decode_before,
+            "fork B hits its own cached verdict"
+        );
+        assert_eq!(async_cache_len(&app), 0);
+    }
+
+    #[test]
+    fn async_validate_sync_checks_survive_cache_hit() {
+        use std::sync::atomic::Ordering;
+        // (a) the exec fail-stop latch beats a cached Valid verdict.
+        let (mut app, _mempool, _metrics) = make_async_validate_app();
+        let block = make_block(5, vec![sign_claim_rewards(1)]);
+        let datum = encode_proposal_datum(&block, false);
+        assert!(app.async_validate_handle().unwrap().submit(datum.clone()));
+        wait_for_cached(&app, 1);
+        app.exec_failed.store(true, Ordering::SeqCst);
+        let resp = app.validate_datum(&datum, &data_hash_of(&datum));
+        assert!(
+            matches!(resp, ValidateBlockResponse::Invalid),
+            "fail-stop must never be bypassed by the async path"
+        );
+
+        // (b) the ancestry check runs on the algo thread EVERY time — a cached
+        // heavy-stage verdict for a block whose parent_hash contradicts our
+        // applied parent is still rejected (a cached ancestry verdict would be
+        // stale by construction: last_header mutates as commits apply).
+        let (mut app2, _mempool2, _metrics2) = make_async_validate_app();
+        let mut bad = make_block(1, vec![sign_claim_rewards(3)]);
+        bad.header.parent_hash = B256::from([9u8; 32]);
+        let bad_datum = bincode::serialize(&bad).unwrap();
+        assert!(app2.async_validate_handle().unwrap().submit(bad_datum.clone()));
+        wait_for_cached(&app2, 1);
+        assert_eq!(
+            app2.last_header.height, 0,
+            "precondition: our applied header is the claimed parent height"
+        );
+        let resp = app2.validate_datum(&bad_datum, &data_hash_of(&bad_datum));
+        assert!(
+            matches!(resp, ValidateBlockResponse::Invalid),
+            "ancestry violation must reject despite a cached Valid heavy-stage verdict"
+        );
+    }
+
+    #[test]
+    fn async_validate_stale_state_basis_invalidation() {
+        let (mut app, _mempool, metrics) = make_async_validate_app();
+        let block = make_block(5, vec![sign_claim_rewards(1)]);
+        let datum = encode_proposal_datum(&block, false);
+        assert!(app.async_validate_handle().unwrap().submit(datum.clone()));
+        wait_for_cached(&app, 1);
+
+        // A commit applies: the committed frontier (and the session/validator
+        // state the worker verified against) moves. The verdict's basis is stale.
+        app.last_header.height += 1;
+
+        let decode_before = metric_count(
+            &metrics.encode(),
+            "torus_validate_block_decode_seconds_count",
+        );
+        let resp = app.validate_datum(&datum, &data_hash_of(&datum));
+        assert!(matches!(resp, ValidateBlockResponse::Valid { .. }));
+        assert_eq!(
+            metric_count(
+                &metrics.encode(),
+                "torus_validate_block_decode_seconds_count"
+            ),
+            decode_before + 1,
+            "stale-basis entry must NOT be served — full sync fallback"
+        );
+        assert_eq!(async_cache_len(&app), 0, "stale entry is discarded");
+    }
+
+    #[test]
+    fn async_validate_compact_hit_notes_in_flight() {
+        let (mut app, mempool, metrics) = make_async_validate_app();
+        let actions = vec![sign_claim_rewards(4)];
+        mempool.mirror_native_to_da(&actions).unwrap();
+        let action_hash = torus_types::compute_action_hash(&actions[0]);
+        let block = make_block(5, actions);
+        let datum = encode_proposal_datum(&block, true);
+        assert!(app.async_validate_handle().unwrap().submit(datum.clone()));
+        wait_for_cached(&app, 1);
+
+        let da_before = metric_count(
+            &metrics.encode(),
+            "torus_validate_block_da_reconstruct_seconds_count",
+        );
+        let resp = app.validate_datum(&datum, &data_hash_of(&datum));
+        assert!(matches!(resp, ValidateBlockResponse::Valid { .. }));
+        assert_eq!(
+            metric_count(
+                &metrics.encode(),
+                "torus_validate_block_da_reconstruct_seconds_count"
+            ),
+            da_before,
+            "compact hit skips the DA reconstruct on the calling thread"
+        );
+        assert!(
+            app.in_flight_hashes
+                .by_height
+                .get(&5)
+                .is_some_and(|s| s.contains(&action_hash)),
+            "compact hit must still note in-flight hashes (s355 duplicate-inclusion guard)"
+        );
+    }
+
+    #[test]
+    fn async_validate_resolution_is_logged_at_startup() {
+        // TORUS_MATCH_WORKERS lesson: an unlogged knob makes bench results
+        // un-analyzable. The resolution line must fire in BOTH states.
+        use std::io::Write;
+        #[derive(Clone, Default)]
+        struct Buf(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buf {
+            type Writer = Buf;
+            fn make_writer(&'a self) -> Buf {
+                self.clone()
+            }
+        }
+        let buf = Buf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            log_async_validate_resolution(true);
+            log_async_validate_resolution(false);
+        });
+        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert!(out.contains("TORUS_ASYNC_VALIDATE"), "startup log missing:\n{out}");
+        assert!(out.contains("enabled=true"), "enabled state not logged:\n{out}");
+        assert!(out.contains("enabled=false"), "disabled state not logged:\n{out}");
     }
 
     /// Task 3 (S459) happy-path invariant: `mirror_or_drop_native` durably stores
