@@ -5,7 +5,7 @@ Follow-up to `consensus-thread-attribution-2026-08-21.md` and `block-latency-cam
 @ `1e41bea` (binary md5 `f4f57db1`), bench worktree `/home/18c/projects/wt/matched-bench`.
 All cells: 10 markets, 120 s, RATE=76000, batch 400 orders/action, 3-val devnet on the shared
 18-core box. Results under `~/bench-results-matched/s55-gap-*`. Analysis script:
-session scratchpad `gap_attr.py` (steady-window slicing of `sampler.csv` + the s46 view timers).
+`tools/matched-bench/gap_attr.py` (steady-window slicing of `sampler.csv` + the s46 view timers).
 
 ## 1. The question
 
@@ -38,7 +38,7 @@ session ran them there.
 | `s55-gap-100-r2` | 100 | 527 | 1.45 | 20.1 % | 766 | 36.6k | 147 + 74 ms |
 | `s55-gap-100-oldenv-r1` (backoff 8, no rocksdb stats, pipelined write off) | 100 | 656 | 1.64 | 22.1 % | 1076 | 26.7k | 200 + 88 ms |
 | `s55-gap-100-r1` | 100 | 967 | 1.76 | 35.8 % | 1706 | 13.5k | 281 + 131 ms |
-| `s55-gap-100-db02d93-newenv-r1` | 100 | PENDING | | | | | |
+| `s55-gap-100-db02d93-newenv-r1` (old binary `bcd18bdc`, byte-identical to the sweep, new env) | 100 | 550 | 1.54 | 24.3 % | 845 | 33.3k | (harness predates schedstat) |
 
 Every cell AGREE, 0 panics, drained, `rebuilds [1,1,1]`. Box load1 avg 22–25 in all cells (the
 cell's own three validators + bench). The pool never starved in any cap-100 cell: it grew
@@ -71,21 +71,25 @@ so views/block goes 1.01 → 1.22–1.76: **+22 % to +76 % of the interval is de
 13.5k–36.6k matched/s (the old head's two reps were 456/458). Longer views → more timeouts →
 abandoned proposals → longer effective views. n=1 at cap 100 is meaningless; n=2 is barely readable.
 
-**(d) Not the env, not exec.** Cell A (old env: backoff cap 8, no RocksDB stats, pipelined write
-off) lands inside the new-env spread. Exec busy is 0.33–0.64 at cap 100; the flush worker and exec
-thread are not on the critical path.
+**(d) Not the code, not the env, not exec.** Cell A (1e41bea, old env: backoff cap 8, no RocksDB
+stats, pipelined write off) and cell B (the sweep's own `db02d93` binary, md5 `bcd18bdc`, rebuilt
+and verified byte-identical, new env) both land inside today's spread (26.7k / 33.3k; 656 / 550
+ms/view). The same binary did 456–458 ms/view and 46–48k three weeks ago. Today's box state, not a
+commit and not a flag, moved cap 100 from ~460 to 530–970 ms/view; the cap-25 twin on the same day
+is inside its s50 band. Exec busy is 0.33–0.64 at cap 100; the flush worker and exec thread are not
+on the critical path. **The 46–48k cap-100 figure is not reproducible on demand and must not be
+carried as a baseline.**
 
 ## 5. What this says about the "cap-100 matched/s at cap-25 blockspeed" question
 
 The interval at cap 100 is not exec-coupled; it is (HotStuff-thread per-block cost) × ~2.5 ×
 (1 + dead-view fraction). Two levers, in order:
 
-1. **The timeout cliff is the cheap one.** Raising `timeout_base_ms` (genesis) or making the base
-   scale with the recent view mean removes the 22–76 % dead-view term at cap 100 for zero
-   per-block cost. It costs recovery latency on real leader failure; the Task A stall multiplier
-   already handles the lockstep-stall case. A genesis-only A/B (`timeout_base_ms` 500 vs 1500 at
-   cap 100, n≥3) is the next cell.
-2. **Per-order work on the HotStuff thread is the structural one.** Items 1 (write-group) and 3
+1. ~~The timeout cliff~~ — **tested, null** (§7). Raising `timeout_base_ms` to 1500 removes the
+   dead views (views/block 1.5 → 1.1, timeouts 24 % → 3 %) but the surviving views get longer by
+   the same amount: ms per full block −20 % ± 50 %, matched/s +5 % ± 40 %. The timeout was
+   chopping a fixed per-block wall into more views, not adding to it.
+2. **Per-order work on the HotStuff thread is the only lever.** Items 1 (write-group) and 3
    (off-thread validate) from the next-steps list, plus the three unlisted items (skip DA re-mirror
    on produce, cache action hashes in `pending_proposals`, drop the duplicate body write), all
    attack the ~4 µs/order. Off-thread validate alone removes the DA reconstruct + attest share.
@@ -94,12 +98,40 @@ The interval at cap 100 is not exec-coupled; it is (HotStuff-thread per-block co
 Cap 25 with batch 1000 (same orders/block as cap ~62) is still worth one cell: it isolates whether
 the thread cost is per action or per order, which decides whether bigger batches are free.
 
-## 6. Harness notes
+## 6. Timeout-cliff A/B (same day, same binary `f4f57db1`, same env, cap 100)
+
+`TIMEOUT_BASE_MS` passthrough added to `devnet/wsl/gen-3val-genesis.sh` (sets
+`.consensus.timeout_base_ms`; the runner resolves the generator from the **worktree**, so the
+worktree copy must carry it — two cells were lost to that, quarantined as `*-INVALID-*`).
+
+| arm | cell | views/blk | ms/view | ms/blk | matched/s | timeout % of views | thread CPU + rq per block |
+|---|---|---|---|---|---|---|---|
+| 500 | `s55-gap-100-r1` | 1.76 | 967 | 1706 | 13.5k | 35.8 | 281 + 131 |
+| 500 | `s55-gap-100-r2` | 1.45 | 527 | 766 | 36.6k | 20.1 | 147 + 74 |
+| 500 | `s55-to500-100-ctl-r1` | 1.42 | 508 | 723 | 38.9k | 19.5 | 142 + 83 |
+| 500 | `s55-to500-100-ctl-r3` | 1.35 | 485 | 654 | 42.9k | 19.5 | 131 + 74 |
+| 1500 | `s55-to1500-100-r1` | 1.05 | 667 | 698 | 41.5k | 0.6 | 128 + 76 |
+| 1500 | `s55-to1500-100-r2` | 1.13 | 1000 | 1127 | 26.1k | 9.8 | 189 + 160 |
+| 1500 | `s55-to1500-100-r3` | 1.01 | 488 | 494 | 36.4k | 0.0 | 95 + 59 |
+| **mean 500 (n=4)** | | 1.50 | 622 | 962 (sd 498) | 33.0k (sd 13.2k) | 23.7 | 175 + 91 |
+| **mean 1500 (n=3)** | | 1.07 | 718 | 773 (sd 323) | 34.7k (sd 7.8k) | 3.4 | 137 + 98 |
+
+**Verdict: null on throughput.** Dead views are gone, view length absorbs them. The invariant across
+all seven cells, both arms, is **ms per full block ≈ 3.2 × (HotStuff thread on-CPU + runqueue wait
+per block)** (range 3.2–4.1). The thread's per-block cost is what varies between identical cells
+(154–412 ms), and it varies in on-CPU time, not only in runqueue wait — the same work takes 2–3×
+longer to execute on a bad cell. That is the box (cache/memory contention from the cell's own
+three validators + bench + RocksDB compaction), and it is the variance source at cap 100.
+
+## 7. Harness notes
 
 - `gap_attr.py`: steady-window slice, histogram tail (`torus_view_duration_seconds` buckets >512 ms,
   >1.024 s, >2.048 s), idle-stripped stage estimates. Worth folding into `summarize.py`
   (`steady_window` sibling of `load`, plus per-block schedstat over the steady window).
 - `db02d93`'s harness predates the view timers and schedstat, so cell B carries only the sampler
   counters.
+- The whole-run `consensus_by_node` stage timers cannot be compared across cells with different
+  idle-view counts (the 1500 arm has ~40 % fewer idle views, so every stage average rises ~1.5×
+  from mix alone). Only steady-window sampler deltas and schedstat-per-steady-block are comparable.
 - Driver scripts must be launched with argv free of `run-cell.sh` / `cargo build` / their own
   name (pgrep guard trap; cost two dead commands this session).

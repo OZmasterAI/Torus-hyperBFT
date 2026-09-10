@@ -76,7 +76,16 @@ else
     jq --argjson vals "$VALS" '.validators = $vals' "$FULL" > "$OUT"
 fi
 
+# 4. Optional pacemaker base timeout override (s55 timeout-cliff A/B). Genesis
+#    field, so all three validators agree; default untouched (500 ms).
+if [ -n "${TIMEOUT_BASE_MS:-}" ]; then
+    [[ "$TIMEOUT_BASE_MS" =~ ^[0-9]+$ ]] && [ "$TIMEOUT_BASE_MS" -ge 100 ] \
+        || { echo "FATAL: TIMEOUT_BASE_MS must be an integer >= 100 (got '$TIMEOUT_BASE_MS')" >&2; exit 1; }
+    tmp=$(mktemp) && jq --argjson t "$TIMEOUT_BASE_MS" '.consensus.timeout_base_ms = $t' "$OUT" > "$tmp" && mv "$tmp" "$OUT"
+fi
+
 echo "wrote $OUT"
+echo "  timeout_ms = $(jq '.consensus.timeout_base_ms' "$OUT")"
 echo "  chain_id   = $(jq '.chain_id' "$OUT")"
 echo "  validators = $(jq '.validators|length' "$OUT")  ($(jq -r '.validators[].address' "$OUT" | tr '\n' ' '))"
 echo "  native_bal = $(jq '.native_balances|length' "$OUT")"
