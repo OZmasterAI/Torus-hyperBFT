@@ -140,6 +140,15 @@ thread at `before` / `bench_end` / `after`. For the bench window, the val0
 waiting for a CPU, and everything else — blocked on I/O, a socket, a channel or
 a lock.
 
+**Coverage limit: there is no cap-200 schedstat, anywhere.** Snapshots landed in
+the runner in `d951236` on 2026-08-21; every one of the 136 cap-200 cells ran
+2026-08-18 to 08-20 and predates it. Of the cells that carry `schedstat.json`,
+36 are cap 25 and 8 are cap 100. The section-5 result is therefore established at
+cap 25 and cap 100 only, and cap 200 — the regime holding the 55,718 record, the
+branch's own 50–53k cells, and the point at which the block cap stops binding —
+has no thread-level attribution at all. New cap-200 cells capture it
+automatically; old ones cannot be retrofitted.
+
 Seven pairs have schedstat, spanning cap 25 and cap 100:
 
 | cell | cap | matched/s | wall/blk | onCPU | rq wait | **blocked** | blocked % |
@@ -192,6 +201,10 @@ handoff, or a mempool lock — which schedstat cannot distinguish.
   distinction between a socket read, an exec-pipeline handoff and a lock. This
   needs either an off-CPU profile (`offcputime`/eBPF) on a live cell, or
   in-process instrumentation around the suspected waits.
+- **Whether section 5 holds at cap 200.** No cap-200 cell carries schedstat, so
+  the blocked-time result is unverified in the regime that holds every
+  high-water number. This is the cheapest open question: one new cap-200 cell
+  answers it.
 - Nothing here establishes a cause for the QUIC `Send Queue full` lines in
   `base-off-cap100-v2-r1`. That cell is consistent with the starvation picture
   but has not been screened against this population.
