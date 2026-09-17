@@ -132,26 +132,76 @@ null: the campaign was optimizing a component that was not binding. It is also
 consistent with the s55 timeout A/B being null — raising `timeout_base_ms`
 removes dead views but does not touch the non-exec cost that sets view duration.
 
-## 5. What is not explained
+## 5. The non-exec window is HotStuff-thread *blocked* time
+
+`schedstat.json` carries `[on_cpu_ns, runqueue_wait_ns, timeslices]` per named
+thread at `before` / `bench_end` / `after`. For the bench window, the val0
+`hotstuff-algo` thread gives a three-way split of the block interval: on-CPU,
+waiting for a CPU, and everything else — blocked on I/O, a socket, a channel or
+a lock.
+
+Seven pairs have schedstat, spanning cap 25 and cap 100:
+
+| cell | cap | matched/s | wall/blk | onCPU | rq wait | **blocked** | blocked % |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| s48-items126-25-r2 | 25 | 20,990 | 244.7 | 31.1 | 28.8 | 184.8 | 76 % |
+| s48-items126-25-r1 | 25 | 1,372 | 1347.8 | 33.1 | 22.4 | 1292.3 | 96 % |
+| s50-control-…-udpbuf8m-r0 | 25 | 23,858 | 236.6 | 41.8 | 21.3 | 173.5 | 73 % |
+| s50-control-…-udpbuf8m-r2 | 25 | 4,160 | 1007.9 | 32.1 | 17.1 | 958.7 | 95 % |
+| s50-items21-25-sep-r2 | 25 | 21,440 | 254.9 | 45.6 | 18.3 | 190.9 | 75 % |
+| s50-items21-25-sep-r1 | 25 | 3,160 | 573.4 | 37.7 | 14.2 | 521.5 | 91 % |
+| s55-gap-100-r2 | 100 | 36,801 | 452.3 | 79.8 | 40.4 | 332.1 | 73 % |
+| s55-gap-100-r1 | 100 | 14,493 | 636.4 | 96.6 | 45.1 | 494.6 | 78 % |
+
+Two results, without exception across all seven pairs:
+
+**Blocked time is 71–96 % of the block interval in every cell**, fast or slow.
+On-CPU time is comparatively stable (31–50 ms at cap 25, 76–137 ms at cap 100)
+and runqueue wait is small (14–116 ms).
+
+**Within every pair, the slow cell's extra wall time is almost entirely extra
+blocked time.** For `s55-gap-100`, +184.1 ms wall against +162.5 ms blocked —
+88 %, with on-CPU contributing only +16.8 and runqueue wait +4.7. For
+`s50-items21`, +318.5 ms wall against +330.6 ms blocked. For `s48-items126`,
++1103 ms against +1108 ms.
+
+A high blocked fraction is not by itself pathological: a BFT consensus thread is
+*expected* to spend most of a view waiting for a quorum of votes. The finding is
+about the **variance**. Cell-to-cell throughput variance is variance in blocked
+time, and almost nothing else.
+
+This refines s55, which attributed cell variance to box contention visible "in
+on-CPU time not just rq-wait". On this data on-CPU barely moves between a cell
+and its 2.5x-slower twin; the movement is in blocked time.
+
+The consequence for the optimization backlog is direct. Execution, engine,
+`save_books` and root hashing are on-CPU work; on-CPU work is a minority of the
+block interval and is not the source of the variance. Attributing that variance
+requires knowing *what the thread blocks on* — socket read, exec-pipeline
+handoff, or a mempool lock — which schedstat cannot distinguish.
+
+## 6. What is not explained
 
 - Residual spread among screen-passing 10-market cap-200 cells is **2.61x**
   (n=87, median 45,634, min 21,362, max 55,718).
 - `corr(matched/s, exec ms per action)` is **-0.44** once market count is
   controlled. An earlier uncontrolled figure of -0.83 was a 300-market vs
   10-market confound and should not be quoted.
-- The non-exec window has not been split into HotStuff-thread on-CPU, runqueue
-  wait, and network wait. That split decides between box contention and
-  dissemination and is the next cut; `schedstat.json` in these cells is the
-  intended source.
+- **What the HotStuff thread blocks on.** Section 5 localises the variance to
+  blocked time but cannot name the blocking call. schedstat gives no
+  distinction between a socket read, an exec-pipeline handoff and a lock. This
+  needs either an off-CPU profile (`offcputime`/eBPF) on a live cell, or
+  in-process instrumentation around the suspected waits.
 - Nothing here establishes a cause for the QUIC `Send Queue full` lines in
   `base-off-cap100-v2-r1`. That cell is consistent with the starvation picture
   but has not been screened against this population.
 
-## 6. Consequences for the open work
+## 7. Consequences for the open work
 
-1. **Do not pursue exec-side levers for cap-100 throughput.** Section 4 shows
-   execution is not the binding constraint there. This affects backlog items 2
-   and 4 of the s55 next-steps list.
+1. **Do not pursue exec-side levers for throughput variance.** Sections 4 and 5
+   show execution is not the binding constraint and on-CPU work is not where the
+   variance lives. This affects backlog items 2 and 4 of the s55 next-steps
+   list, and it applies at cap 25 and cap 100 alike.
 2. **Apply the section-3 screen before any A/B verdict**, and report it with the
    cell. It would have rejected the worst historical cells outright.
 3. **The screen does not rescue cap-100 pairing.** Both s55 cells passed it and
@@ -159,3 +209,8 @@ removes dead views but does not touch the non-exec cost that sets view duration.
    remains the better-behaved operating point for A/Bs.
 4. **Re-read historical verdicts.** Any conclusion drawn from a single cell in
    the screen-FAIL group is unsafe; that group's spread is 110x.
+5. **The next cut is an off-CPU profile, not another A/B.** Until the blocking
+   call is named, any throughput A/B on this rig is measuring a 71-96 % term
+   nobody can attribute. Two prior sessions touched adjacent ground and should
+   be read first: s353 (dedicated 4-thread ingress pool, "starvation FIXED") and
+   S391 (`fix/hotstuff-idle-cpu-spin`).
