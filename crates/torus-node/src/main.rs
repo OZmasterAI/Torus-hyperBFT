@@ -621,6 +621,21 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     app.set_native_da_fetcher(Arc::new(NetworkDaFetcher {
         network: network.clone(),
     }));
+    // Item 3 (TORUS_ASYNC_VALIDATE): with the flag on, tee inbound proposal/body
+    // datum bytes ON THE NETWORK THREAD into the speculative validate worker, so
+    // the hotstuff-algo thread may find a ready heavy-stage verdict instead of
+    // doing the DA reconstruct + sig verify inline. Installed ONCE, AFTER
+    // set_native_da_fetcher, which re-spawns the worker (earlier handles would go
+    // stale). Flag off (the default): no handle exists and nothing is installed;
+    // the network path still pays a OnceLock presence check per inbound message.
+    // Experimental flag-ON gates remain pending: chain-id/view/QC admission before
+    // teeing, pre-verification DA write amplification, and duplicate metrics.
+    if let Some(validate_tee) = app.async_validate_handle() {
+        network.set_validate_tee(Arc::new(move |datum: Vec<u8>| {
+            let _ = validate_tee.submit(datum);
+        }));
+        info!("TORUS_ASYNC_VALIDATE: network-thread proposal tee installed");
+    }
 
     // Spawn inbound native action gossip → mempool task
     if let Some(mut native_rx) = network.take_native_action_rx() {
