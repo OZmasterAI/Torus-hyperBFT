@@ -186,6 +186,30 @@ block interval and is not the source of the variance. Attributing that variance
 requires knowing *what the thread blocks on* — socket read, exec-pipeline
 handoff, or a mempool lock — which schedstat cannot distinguish.
 
+### Cross-validator check: it is not peer CPU either
+
+schedstat covers all three validators, so the aggregate CPU the whole devnet
+spends per block is measurable. For the s55 cap-100 pair:
+
+| | slow (14,493/s) | fast (36,801/s) |
+| --- | --- | --- |
+| wall ms/block | 636 | 452 |
+| val0 / val1 / val2 exec on-CPU | 63.6 / 70.5 / 69.4 | 122.4 / 140.2 / 140.8 |
+| val0 / val1 / val2 hotstuff on-CPU | 96.6 / 101.5 / 99.5 | 79.8 / 87.5 / 87.6 |
+| **all-node on-CPU per block** | **501.1 (79 %)** | **658.3 (146 %)** |
+
+The fast cell does *more* aggregate work per block in *less* wall time: 1.46
+cores' worth running concurrently against 0.79. The slow cell has all three
+validators together consuming less than a single core while blocks take 636 ms.
+
+This closes the last "it is really just contention" reading. The blocked time is
+not the consensus thread waiting for its own execution, nor for its peers'
+execution, nor for a CPU. The system is idle and slow at the same time.
+
+For the s58 cap-200 control the same sum is 2061 ms per 962 ms block (214 %),
+with `torus-execution` at 460-532 ms per node — so at cap 200 the box genuinely
+is busy, and the 73 % blocked figure there coexists with real parallel work.
+
 ## 6. Cap 200 confirmed, and the off-CPU route is a dead end
 
 Two cells at branch head `4076355` (cap 200, 10 markets, 120 s, rate 76000,
