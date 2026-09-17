@@ -452,8 +452,79 @@ def main():
             "pre-bl1 save split must be 0.0, got %r" % sb
         )
 
+
+# ------------------------------------------------- s58: load-windowed view timers
+# consensus_by_node has always been computed from the metrics-before/after
+# scrapes, which bracket idle + load + drain. Idle views are fast and numerous
+# (the ramp alone commits ~100 near-empty blocks), so every per-view stage mean
+# is diluted toward the idle value and an A/B reads as a no-op: across the s55
+# fast/slow pair view_duration differed 16 % while matched/s differed 2.54x.
+# These fixtures pin the LOAD-window slice, which needs the torus_view_* series
+# in sampler.csv.
+VIEW_IDLE = {"views": 100, "arrival_s": 1.0, "duration_s": 2.0}   # 10 ms / 20 ms
+VIEW_LOAD = {"views": 20, "arrival_s": 4.0, "duration_s": 6.0}    # 200 ms / 300 ms
+
+
+def write_view_fixture(out, with_view_cols=True):
+    """Three samples: idle [900,1000], load [1000,1010].
+
+    Whole-run arrival mean is 5.0 s / 120 views = 41.67 ms; the LOAD mean is
+    4.0 s / 20 views = 200.00 ms. A summarizer that reports the whole-run
+    number cannot tell the two apart.
+    """
+    cols = ["torus_blocks_committed_total", "torus_exec_block_seconds_count",
+            "torus_exec_engine_seconds_count", "torus_consensus_view"]
+    idle = [50.0, 50.0, 50.0, float(VIEW_IDLE["views"])]
+    load0 = list(idle)
+    load1 = [70.0, 70.0, 70.0, float(VIEW_IDLE["views"] + VIEW_LOAD["views"])]
+    if with_view_cols:
+        for short, ikey in (("view_proposal_arrival", "arrival_s"),
+                            ("view_duration", "duration_s")):
+            cols += ["torus_%s_seconds_sum" % short, "torus_%s_seconds_count" % short]
+            idle += [0.0, 0.0]
+            load0 += [VIEW_IDLE[ikey], float(VIEW_IDLE["views"])]
+            load1 += [VIEW_IDLE[ikey] + VIEW_LOAD[ikey],
+                      float(VIEW_IDLE["views"] + VIEW_LOAD["views"])]
+    with open(os.path.join(out, "sampler.csv"), "w") as f:
+        f.write("ts,node," + ",".join(cols) + "\n")
+        for node in ("val0", "val1", "val2"):
+            for ts, vals in ((900, idle), (1000, load0), (1010, load1)):
+                f.write("%d,%s,%s\n" % (ts, node, ",".join("%r" % v for v in vals)))
+    open(os.path.join(out, "agreement.jsonl"), "w").close()
+
+
+def check_view_window():
+    with tempfile.TemporaryDirectory() as out:
+        write_view_fixture(out, with_view_cols=True)
+        s = run(out)
+        c = s["consensus_by_node"]["val0"]
+        assert "load" in c, "consensus_by_node must carry a `load` window sibling"
+        ld = c["load"]
+        assert ld is not None, "load window must resolve when the view series is sampled"
+        assert ld["view_proposal_arrival_ms"] == 200.00, (
+            "load-window arrival must be 200.00 ms (4.0 s / 20 views), got %r -- "
+            "a whole-run mean would read 41.67" % ld["view_proposal_arrival_ms"])
+        assert ld["view_duration_ms"] == 300.00, (
+            "load-window view_duration must be 300.00 ms, got %r" % ld["view_duration_ms"])
+        assert ld["views"] == 20, "load window saw %r views, expected 20" % ld["views"]
+
+    # A sampler predating the torus_view_* columns must report None, not 0.0:
+    # a 0 ms arrival would read as the wait having been eliminated.
+    with tempfile.TemporaryDirectory() as out:
+        write_view_fixture(out, with_view_cols=False)
+        s = run(out)
+        c = s["consensus_by_node"]["val0"]
+        assert c.get("load") is None, (
+            "pre-s58 sampler must report consensus load window as None, got %r"
+            % c.get("load"))
+
+
+def main_s58():
+    """s58 additions, invoked from __main__ after main()."""
+    check_view_window()
     print("test_summarize.py: OK")
 
 
 if __name__ == "__main__":
     main()
+    main_s58()

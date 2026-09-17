@@ -570,6 +570,49 @@ for node in ("val0", "val1", "val2"):
         round(est * views / committed, 2) if est is not None and committed else None)
     consensus[node] = c
 
+# ---------------------------------------------------------------- consensus, LOAD window (s58)
+# The block above reads metrics-before/after, which bracket idle + load + drain.
+# Idle views are fast and numerous -- the ramp alone commits ~100 near-empty
+# blocks -- so every per-view stage mean is pulled toward the idle value and an
+# A/B reads as a no-op: across the s55 fast/slow pair view_duration differed
+# 16 % while matched/s differed 2.54x. When the sampler carries the torus_view_*
+# series (added to WIDE_COLS in s58) the same means can be sliced to [t0, t1].
+# Cells recorded before that report None -- never 0.0, which would read as the
+# arrival wait having been eliminated rather than never measured.
+def consensus_window(rs, lo, hi):
+    sel = [r for r in rs if lo <= r["ts"] <= hi]
+    if len(sel) < 2:
+        return None
+    a, b = sel[0], sel[-1]
+    if "torus_view_duration_seconds_count" not in a:
+        return None
+    out = {"window": [lo, hi], "span_s": b["ts"] - a["ts"]}
+    for h in VIEW_HISTS:
+        short = h[len("torus_"):-len("_seconds")]
+        ck = short + "_seconds_count"
+        if ("torus_" + ck) not in a:
+            out[short + "_ms"] = None
+            out[short + "_count"] = None
+            continue
+        c = m(b, ck) - m(a, ck)
+        tot = m(b, short + "_seconds_sum") - m(a, short + "_seconds_sum")
+        out[short + "_ms"] = round(tot / c * 1000, 2) if c > 0 else None
+        out[short + "_count"] = c
+    views = m(b, "consensus_view") - m(a, "consensus_view")
+    committed = m(b, "blocks_committed_total") - m(a, "blocks_committed_total")
+    out["views"] = views
+    out["committed_blocks"] = committed
+    out["views_per_committed_block"] = round(views / committed, 3) if committed else None
+    return out
+
+
+for _node, _rs in rows.items():
+    if not _rs:
+        continue
+    _entry = consensus.setdefault(
+        _node, {"window": "sampler only (no metrics-before/after scrape)"})
+    _entry["load"] = consensus_window(_rs, t0, t1)
+
 # ---------------------------------------------------------------- schedstat (run-cell.sh B.2)
 # $OUT/schedstat.json: {"val0": {"hotstuff-algo": {"tid": N, "before": [on_cpu_ns,
 # runqueue_wait_ns, timeslices], "bench_end": [...], "after": [...]}, ...}, ...}
@@ -994,20 +1037,37 @@ if p0:
           " passB=" + str(e["settle_pass_b_ms"]) + " cache_flush=" + str(e["cache_flush_ms"]) + ")" +
           " tail=" + str(e["post_engine_tail_ms"]) + " untimed=" + str(e["engine_untimed_ms"]))
 
-for node, c in consensus.items():
+class _CTol(dict):
+    """Missing whole-run stage keys print as None (sampler-only nodes)."""
+    def __missing__(self, k):
+        return None
+
+
+for node, c0 in consensus.items():
     sc = (sched.get(node) or {}).get("threads") or {}
     hs = sc.get("hotstuff-algo") or {}
-    print(f"CONSENSUS {node} (whole run): view_ms={c['view_duration_ms']} views={c['views']} "
-          f"views/committed={c['views_per_committed_block']} | propose delay={c['view_propose_delay_ms']} "
-          f"build={c['view_propose_build_ms']} finalize={c['view_propose_finalize_ms']} "
-          f"qc_collect={c['view_qc_collect_ms']} | arrival={c['view_proposal_arrival_ms']} "
-          f"insert_persist={c['view_insert_persist_ms']} vote_delay={c['view_vote_delay_ms']} | "
-          f"commit_persist={c['commit_persist_ms']} block_build={c['block_build_ms']} "
-          f"validate={c['validate_block_ms']}(decode={c['validate_block_decode_ms']} "
-          f"da={c['validate_block_da_reconstruct_ms']} attest={c['validate_block_attest_ms']} "
-          f"custody={c['validate_block_custody_ms']}) on_committed={c['on_committed_block_ms']} "
-          f"mempool_rm={c['mempool_remove_committed_ms']} | "
-          f"thread_est/view={c['consensus_thread_ms_per_view_est']} "
-          f"/committed={c['consensus_thread_ms_per_committed_block_est']}"
-          + (f" | sched hotstuff-algo on_cpu/blk={hs.get('on_cpu_ms_per_committed_block')} "
-             f"rq_wait/blk={hs.get('runqueue_wait_ms_per_committed_block')}" if hs else ""))
+    c = _CTol(c0)
+    if "view_duration_ms" in c0:
+        print(f"CONSENSUS {node} (whole run): view_ms={c['view_duration_ms']} views={c['views']} "
+              f"views/committed={c['views_per_committed_block']} | propose delay={c['view_propose_delay_ms']} "
+              f"build={c['view_propose_build_ms']} finalize={c['view_propose_finalize_ms']} "
+              f"qc_collect={c['view_qc_collect_ms']} | arrival={c['view_proposal_arrival_ms']} "
+              f"insert_persist={c['view_insert_persist_ms']} vote_delay={c['view_vote_delay_ms']} | "
+              f"commit_persist={c['commit_persist_ms']} block_build={c['block_build_ms']} "
+              f"validate={c['validate_block_ms']}(decode={c['validate_block_decode_ms']} "
+              f"da={c['validate_block_da_reconstruct_ms']} attest={c['validate_block_attest_ms']} "
+              f"custody={c['validate_block_custody_ms']}) on_committed={c['on_committed_block_ms']} "
+              f"mempool_rm={c['mempool_remove_committed_ms']} | "
+              f"thread_est/view={c['consensus_thread_ms_per_view_est']} "
+              f"/committed={c['consensus_thread_ms_per_committed_block_est']}"
+              + (f" | sched hotstuff-algo on_cpu/blk={hs.get('on_cpu_ms_per_committed_block')} "
+                 f"rq_wait/blk={hs.get('runqueue_wait_ms_per_committed_block')}" if hs else ""))
+    ld = c0.get("load")
+    if ld:
+        print(f"CONSENSUS {node} (LOAD window): view_ms={ld.get('view_duration_ms')} "
+              f"views={ld.get('views')} views/committed={ld.get('views_per_committed_block')} | "
+              f"arrival={ld.get('view_proposal_arrival_ms')} "
+              f"propose delay={ld.get('view_propose_delay_ms')} "
+              f"build={ld.get('view_propose_build_ms')} "
+              f"qc_collect={ld.get('view_qc_collect_ms')} "
+              f"insert_persist={ld.get('view_insert_persist_ms')}")
