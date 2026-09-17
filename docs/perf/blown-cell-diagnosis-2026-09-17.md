@@ -2,8 +2,8 @@
 
 ## Scope and method
 
-Log-only analysis of retained cells in `~/bench-results-matched` (258 cell
-directories). No benchmark cells were run. The population is every cell with a
+Analysis of retained cells in `~/bench-results-matched` (258 cell
+directories) plus two cells run at branch head in s58 (section 6). The population is every cell with a
 `summary.json` and a `sampler.csv`: 136 at cap 200, 15 at cap 100.
 
 The prior plan was to read the single failed baseline cell
@@ -140,14 +140,11 @@ thread at `before` / `bench_end` / `after`. For the bench window, the val0
 waiting for a CPU, and everything else — blocked on I/O, a socket, a channel or
 a lock.
 
-**Coverage limit: there is no cap-200 schedstat, anywhere.** Snapshots landed in
-the runner in `d951236` on 2026-08-21; every one of the 136 cap-200 cells ran
-2026-08-18 to 08-20 and predates it. Of the cells that carry `schedstat.json`,
-36 are cap 25 and 8 are cap 100. The section-5 result is therefore established at
-cap 25 and cap 100 only, and cap 200 — the regime holding the 55,718 record, the
-branch's own 50–53k cells, and the point at which the block cap stops binding —
-has no thread-level attribution at all. New cap-200 cells capture it
-automatically; old ones cannot be retrofitted.
+**Coverage limit, now closed (see section 6).** No *historical* cap-200 cell has
+schedstat: snapshots landed in the runner in `d951236` on 2026-08-21, and every
+one of the 136 cap-200 cells ran 2026-08-18 to 08-20. Of the historical cells
+that carry `schedstat.json`, 36 are cap 25 and 8 are cap 100. Two cells run in
+s58 at branch head close the gap.
 
 Seven pairs have schedstat, spanning cap 25 and cap 100:
 
@@ -189,7 +186,48 @@ block interval and is not the source of the variance. Attributing that variance
 requires knowing *what the thread blocks on* — socket read, exec-pipeline
 handoff, or a mempool lock — which schedstat cannot distinguish.
 
-## 6. What is not explained
+## 6. Cap 200 confirmed, and the off-CPU route is a dead end
+
+Two cells at branch head `4076355` (cap 200, 10 markets, 120 s, rate 76000,
+`TORUS_ASYNC_VALIDATE` off), run 2026-09-17/18 on an idle box with loadavg
+gated below 1.5. Node binary verified byte-identical to the frozen s57
+candidate (`7b8375e1...`) and distinct from its baseline (`121a77c0...`).
+
+| | profiled (`s58-cap200-offcpu-r2`) | control (`s58-cap200-ctl-r1`) |
+| --- | --- | --- |
+| matched/s | 2,624 | **36,726** |
+| agreement | DIGEST_UNVERIFIED | AGREE |
+| wall ms/block | 2082.0 | 962.1 |
+| actions absorbed | 2,043 / 54,258 | 22,362 / 46,300 |
+| hotstuff on-CPU ms/blk | 138.6 | 190.6 |
+| hotstuff rq-wait ms/blk | 55.0 | 70.9 |
+| **hotstuff blocked ms/blk** | 1888.4 (**91 %**) | 700.6 (**73 %**) |
+
+**Section 5 generalises to cap 200.** The clean cell sits at 73 % blocked,
+inside the 73-78 % band the clean cap-25 and cap-100 cells occupy; the degraded
+one sits at 91 %, alongside the 91-96 % blown cells. The result is not an
+artefact of the smaller caps.
+
+**`offcputime-bpfcc` cannot be used on this workload.** The only difference
+between the two cells is the profiler, and it cost **14x throughput**. The probe
+fires on every context switch and this workload switches constantly, so the
+instrument destroys what it measures. Two further notes for whoever tries again:
+
+- `-t <TID>` silently matches nothing in this bcc build (bcc 0.29, kernel
+  6.8.0-106). It returned zero stacks for a plain `sleep` target as well.
+  Whole-system and `-p <PID>` modes work and do resolve Rust frames — the
+  binary is not stripped (110k symbols). Filter by the thread name, which
+  folded output carries as the first frame.
+- The section-3 screen does **not** catch this failure. Both cells pass it
+  (VPB 1.19 and 1.30, timeout 13.4 % and 12.1 %) despite a 14x throughput gap.
+  The screen detects the timeout-cliff mode of section 2 and nothing else. A
+  cell can be clean by every consensus-health measure and still be worthless.
+
+Naming the blocking call therefore needs a method whose overhead is bounded:
+in-process instrumentation around the suspected waits, or a sampling profiler,
+not exhaustive context-switch tracing. That work is not done.
+
+## 7. What is not explained
 
 - Residual spread among screen-passing 10-market cap-200 cells is **2.61x**
   (n=87, median 45,634, min 21,362, max 55,718).
@@ -201,15 +239,11 @@ handoff, or a mempool lock — which schedstat cannot distinguish.
   distinction between a socket read, an exec-pipeline handoff and a lock. This
   needs either an off-CPU profile (`offcputime`/eBPF) on a live cell, or
   in-process instrumentation around the suspected waits.
-- **Whether section 5 holds at cap 200.** No cap-200 cell carries schedstat, so
-  the blocked-time result is unverified in the regime that holds every
-  high-water number. This is the cheapest open question: one new cap-200 cell
-  answers it.
 - Nothing here establishes a cause for the QUIC `Send Queue full` lines in
   `base-off-cap100-v2-r1`. That cell is consistent with the starvation picture
   but has not been screened against this population.
 
-## 7. Consequences for the open work
+## 8. Consequences for the open work
 
 1. **Do not pursue exec-side levers for throughput variance.** Sections 4 and 5
    show execution is not the binding constraint and on-CPU work is not where the
