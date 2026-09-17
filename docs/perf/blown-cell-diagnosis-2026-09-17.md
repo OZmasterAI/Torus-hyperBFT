@@ -251,7 +251,53 @@ Naming the blocking call therefore needs a method whose overhead is bounded:
 in-process instrumentation around the suspected waits, or a sampling profiler,
 not exhaustive context-switch tracing. That work is not done.
 
-## 7. What is not explained
+## 7. First load-windowed attribution
+
+`s58-cap200-loadwin-r1` (41,872 matched/s, AGREE, cap 200, commit `fce94b0`) is
+the first cell scored with the load-window slice of section 6's fix.
+
+| stage | whole-run ms | LOAD ms | ratio | n (load) |
+| --- | --- | --- | --- | --- |
+| view_duration | 312.48 | **745.31** | 2.39x | 169 |
+| view_proposal_arrival (follower) | 168.49 | **443.84** | 2.63x | 109 |
+| view_propose_delay (leader) | 150.97 | 410.15 | 2.72x | 55 |
+| view_propose_build | 118.10 | 320.95 | 2.72x | 55 |
+| view_qc_collect | 82.29 | 236.39 | 2.87x | 38 |
+| block_build | 82.89 | 231.34 | 2.79x | 55 |
+| view_insert_persist | 80.13 | 166.59 | 2.08x | 72 |
+| on_committed_block | 43.32 | 149.69 | 3.46x | 115 |
+| commit_persist | 16.73 | 58.01 | 3.47x | 115 |
+| validate_block_da_reconstruct | 49.80 | 49.87 | **1.00x** | 99 |
+| mempool_remove_committed | 25.65 | 27.77 | **1.08x** | 100 |
+| validate_block_attest | 9.52 | 9.61 | **1.01x** | 99 |
+
+Two structural results.
+
+**The dilution is real and large.** Every stage that fires on *every view* was
+understated 2.4-3.5x by the whole-run window. Stages that fire only on *loaded*
+blocks sit at ~1.0x, because idle views skip them and there was nothing to
+dilute. That split is exactly what the section-6 fix predicted, and it is why
+three sessions of stage-table reading found nothing: the table was reporting a
+number roughly 2.5x too small for every stage that mattered.
+
+**Block building is the largest identified on-critical-path component.** The
+leader spends 410 ms from view start to having proposed, of which 321 ms is
+building the proposal and 231 ms is `block_build` proper. Followers then spend
+444 ms — 60 % of the 745 ms view — waiting for that proposal to arrive. The
+arrival wait is therefore not an independent cost; it is mostly the leader's
+build time observed from the other side.
+
+`views_per_committed_block` is 1.667 under load against 1.214 whole-run, so the
+dead views of section 2 concentrate in the load window, as that section implies.
+
+This redirects the backlog. s55 item 2 — cache action hashes in
+`pending_proposals` (recomputed per produce and per dispatch) and skip the DA
+re-mirror on produce — targets exactly this build path. Exec-side items run
+*after* commit and are not on the view's critical path at all.
+
+Single cell. Needs repeats before any of it is quoted as a magnitude.
+
+## 8. What is not explained
 
 - Residual spread among screen-passing 10-market cap-200 cells is **2.61x**
   (n=87, median 45,634, min 21,362, max 55,718).
@@ -267,7 +313,7 @@ not exhaustive context-switch tracing. That work is not done.
   `base-off-cap100-v2-r1`. That cell is consistent with the starvation picture
   but has not been screened against this population.
 
-## 8. Consequences for the open work
+## 9. Consequences for the open work
 
 1. **Do not pursue exec-side levers for throughput variance.** Sections 4 and 5
    show execution is not the binding constraint and on-CPU work is not where the
