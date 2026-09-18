@@ -25,6 +25,16 @@ pub struct Metrics {
     pub blocks_committed: Counter,
     pub block_height: Gauge,
     pub block_build_seconds: Histogram,
+    // Producer-only consecutive wall-time stages; parent decode is outside total.
+    pub block_build_parent_decode_seconds: Histogram,
+    pub block_build_selection_seconds: Histogram,
+    pub block_build_mirror_seconds: Histogram,
+    pub block_build_attestation_seconds: Histogram,
+    pub block_build_assemble_seconds: Histogram,
+    pub block_build_encode_seconds: Histogram,
+    pub block_build_bookkeeping_seconds: Histogram,
+    pub block_build_epoch_seconds: Histogram,
+
 
     // Transaction metrics
     pub evm_txs_processed: Counter,
@@ -672,6 +682,62 @@ impl Metrics {
             "torus_block_build_seconds",
             "Time to build a block",
             block_build_seconds.clone(),
+        );
+
+        let block_build_parent_decode_seconds = Histogram::new(exponential_buckets(0.0001, 2.0, 18));
+        registry.register(
+            "torus_block_build_parent_decode_seconds",
+            "Producer parent block lookup and header decode; outside block_build_seconds",
+            block_build_parent_decode_seconds.clone(),
+        );
+
+        let block_build_selection_seconds = Histogram::new(exponential_buckets(0.0001, 2.0, 18));
+        registry.register(
+            "torus_block_build_selection_seconds",
+            "Producer exclusion hashes and native/EVM selection, including buffered DA flush",
+            block_build_selection_seconds.clone(),
+        );
+
+        let block_build_mirror_seconds = Histogram::new(exponential_buckets(0.0001, 2.0, 18));
+        registry.register(
+            "torus_block_build_mirror_seconds",
+            "Producer selected-body clone, durable mirror, and nested shard custody",
+            block_build_mirror_seconds.clone(),
+        );
+
+        let block_build_attestation_seconds = Histogram::new(exponential_buckets(0.0001, 2.0, 18));
+        registry.register(
+            "torus_block_build_attestation_seconds",
+            "Producer selected-body clone and signature attestation",
+            block_build_attestation_seconds.clone(),
+        );
+
+        let block_build_assemble_seconds = Histogram::new(exponential_buckets(0.0001, 2.0, 18));
+        registry.register(
+            "torus_block_build_assemble_seconds",
+            "Producer header construction and pre-proposal push enqueue",
+            block_build_assemble_seconds.clone(),
+        );
+
+        let block_build_encode_seconds = Histogram::new(exponential_buckets(0.0001, 2.0, 18));
+        registry.register(
+            "torus_block_build_encode_seconds",
+            "Producer own action hashes and proposal datum encoding",
+            block_build_encode_seconds.clone(),
+        );
+
+        let block_build_bookkeeping_seconds = Histogram::new(exponential_buckets(0.0001, 2.0, 18));
+        registry.register(
+            "torus_block_build_bookkeeping_seconds",
+            "Producer proposal cache, in-flight ledger, and encoded datum hash",
+            block_build_bookkeeping_seconds.clone(),
+        );
+
+        let block_build_epoch_seconds = Histogram::new(exponential_buckets(0.0001, 2.0, 18));
+        registry.register(
+            "torus_block_build_epoch_seconds",
+            "Producer epoch validator-set update calculation",
+            block_build_epoch_seconds.clone(),
         );
 
         let evm_txs_processed = Counter::default();
@@ -1734,6 +1800,15 @@ impl Metrics {
             blocks_committed,
             block_height,
             block_build_seconds,
+            block_build_parent_decode_seconds,
+            block_build_selection_seconds,
+            block_build_mirror_seconds,
+            block_build_attestation_seconds,
+            block_build_assemble_seconds,
+            block_build_encode_seconds,
+            block_build_bookkeeping_seconds,
+            block_build_epoch_seconds,
+
             evm_txs_processed,
             native_actions_processed,
             consensus_rounds,
@@ -2036,6 +2111,14 @@ mod tests {
         m.mempool_native_size.set(3);
         let text = m.encode();
         for name in [
+            "torus_block_build_parent_decode_seconds",
+            "torus_block_build_selection_seconds",
+            "torus_block_build_mirror_seconds",
+            "torus_block_build_attestation_seconds",
+            "torus_block_build_assemble_seconds",
+            "torus_block_build_encode_seconds",
+            "torus_block_build_bookkeeping_seconds",
+            "torus_block_build_epoch_seconds",
             "torus_validate_block_seconds",
             "torus_validate_block_decode_seconds",
             "torus_validate_block_da_reconstruct_seconds",

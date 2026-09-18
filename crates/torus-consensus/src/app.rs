@@ -4442,6 +4442,7 @@ impl App<RocksKVStore> for TorusApp {
                 validator_set_updates: None,
             };
         }
+        let parent_decode_started = std::time::Instant::now();
         let parent_header = if let Some(parent_hash) = request.parent_block() {
             if let Ok(Some(parent_block)) = request.block_tree().block(&parent_hash) {
                 let datums = parent_block.data.vec();
@@ -4462,6 +4463,7 @@ impl App<RocksKVStore> for TorusApp {
         } else {
             self.last_header.clone()
         };
+        let parent_decode_elapsed = parent_decode_started.elapsed();
         tracing::info!(
             parent_height = parent_header.height,
             local_height = self.last_header.height,
@@ -4484,6 +4486,7 @@ impl App<RocksKVStore> for TorusApp {
         };
         let (native_with_senders, evm_txs) =
             self.select_block_payload(parent_header.height, gas_limit, parent_header.state_root);
+        let selection_done = std::time::Instant::now();
 
         // Proposer guarantee (S459): durably mirror every referenced body to THIS
         // node's DA store BEFORE committing to reference it (livelock fix, mem
@@ -4494,6 +4497,7 @@ impl App<RocksKVStore> for TorusApp {
         // `native_with_senders` and `native_actions` stay consistent so the
         // pre-proposal push below never carries a dropped body.
         let native_with_senders = self.mirror_or_drop_native(native_with_senders);
+        let mirror_done = std::time::Instant::now();
 
         let native_actions: Vec<torus_types::SignedNativeAction> =
             native_with_senders.iter().map(|(_, a)| a.clone()).collect();
@@ -4503,6 +4507,7 @@ impl App<RocksKVStore> for TorusApp {
             None => [0u8; 64],
         };
 
+        let attestation_done = std::time::Instant::now();
         use torus_types::{Bloom, B256};
         // Ancestry commitment: bind this proposal to the exact parent header it
         // was built on (`parent_header`). This is the keccak canonical hash — the
@@ -4553,6 +4558,7 @@ impl App<RocksKVStore> for TorusApp {
             }
         }
 
+        let assemble_done = std::time::Instant::now();
         // Note our own block's hashes too: a same-height re-proposal would
         // overwrite the `pending_proposals` entry and silently untrack these.
         let own_hashes: Vec<torus_types::B256> = block
@@ -4561,16 +4567,30 @@ impl App<RocksKVStore> for TorusApp {
             .map(torus_types::compute_action_hash)
             .collect();
         let encoded = encode_proposal_datum(&block, COMPACT_PROPOSALS);
+        let encode_done = std::time::Instant::now();
         self.pending_proposals.insert(height, block);
         self.pending_proposals.retain(|&h, _| h + 10 > height);
         self.in_flight_hashes.note(height, own_hashes);
         let hash = Self::hash_datum(&encoded);
 
+        let bookkeeping_done = std::time::Instant::now();
         let validator_set_updates = self.epoch_validator_set_updates(height);
+        let epoch_done = std::time::Instant::now();
 
         if let Some(ref m) = self.metrics {
             m.block_build_seconds
                 .observe(build_timer.elapsed().as_secs_f64());
+            // Record after the existing total, keeping its original boundaries.
+            // Every normal produce call observes every stage, including empty
+            // selections and disabled custody; counts share one denominator.
+            m.block_build_parent_decode_seconds.observe(parent_decode_elapsed.as_secs_f64());
+            m.block_build_selection_seconds.observe(selection_done.duration_since(build_timer).as_secs_f64());
+            m.block_build_mirror_seconds.observe(mirror_done.duration_since(selection_done).as_secs_f64());
+            m.block_build_attestation_seconds.observe(attestation_done.duration_since(mirror_done).as_secs_f64());
+            m.block_build_assemble_seconds.observe(assemble_done.duration_since(attestation_done).as_secs_f64());
+            m.block_build_encode_seconds.observe(encode_done.duration_since(assemble_done).as_secs_f64());
+            m.block_build_bookkeeping_seconds.observe(bookkeeping_done.duration_since(encode_done).as_secs_f64());
+            m.block_build_epoch_seconds.observe(epoch_done.duration_since(bookkeeping_done).as_secs_f64());
         }
 
         ProduceBlockResponse {
