@@ -35,7 +35,7 @@ hashing or DA writes. No accepted stable baseline or hardware ceiling follows.
 | 3. Proposal construction | One accepted hash-cache candidate at 51,608.1 fills/s, with lower construction time but larger backlog. Default-off DA reuse and finer timers are tested and frozen. | Repeated hash comparison and same-binary DA OFF/ON cells before promotion. |
 | 4. Largest remaining cost | Execution/flush timing and growing cancellation cost motivate a bounded cancellation candidate; local mechanism gains repeated. | Resolve gated-path fallback regressions/control noise, then measure live eligibility and matched-rate/latency A/Bs. |
 | 5. Sustained and varied load | Balanced locality generator, workload manifests and burst schedules passed tests. | Depth preparation, phase scoring, and fresh sustained/deep/multimarket/burst runs. |
-| 6. Separate machines | Host/access details requested; no remote actions performed. | One validator per host and independent load generation with declared hardware/network/storage. |
+| 6. Separate machines | Owner confirmed no remote hosts are available; continue on this machine only. | Cross-machine validation is unavailable and cannot be inferred from local results. |
 | 7. Architecture | Flush-pipeline recovery evidence, cancellation experiments and a default-off WAL-budget candidate are being assessed. | Promote only after deterministic state/recovery and repeated throughput evidence; no 200k claim. |
 
 Stages 3–7 do not replace stage-1/2 acceptance. A passing regression test proves
@@ -394,8 +394,9 @@ Semantic verification is distinct from performance acceptance.
 
 ## Resume order
 
-1. Obtain capacity without altering retained evidence unless cleanup is authorized;
-   obtain three SSH host aliases/directories for separate-machine work.
+1. Keep sufficient local capacity without deleting future retained runs unless
+   authorized. The owner restored 89 GiB and specified local-only work; remote
+   hosts are unavailable.
 2. Rebaseline the latest frozen recovery runtime with three accepted controls.
 3. Rebase and verify the isolated hash/DA candidates onto that runtime; freeze
    separate node-only builds and run interleaved same-workload comparisons.
@@ -411,3 +412,57 @@ versus one accepted 49,242.8 control. This is not a repeat-proven improvement,
 a stable hardware ceiling, or an apples-to-apples 200k cross-chain comparison.
 Stages 1–7 remain partially completed; no new repository is justified by the
 current evidence, and no branch was pushed.
+
+
+## Resumed after owner cleanup
+
+The owner executed the supplied explicit six-directory deletion command and
+reported 89 GiB free. The six old campaign data paths are absent; summaries,
+logs, metrics and frozen binaries remain. This removed physical DB/WAL evidence
+for those six runs; their saved observations remain historical evidence. The owner subsequently authorized cleanup of completed campaign databases
+after their results are saved: “Yes, clean up completed campaign databases.”
+Logs, metrics, digests, summaries and frozen binaries must be retained. Only
+finished campaign database directories are in scope; active data is excluded.
+
+A fresh 120-second, ten-market, cap-200 control on frozen runtime `b60097a`
+completed as `s60-viewbound-cap200-r1`, with unchanged generator and
+`TORUS_BODY_FETCH_TRACE=1`. No runtime settings or acceptance rules were relaxed.
+
+Owner scope clarification: “Use this machine for now; no remote hosts available.”
+Continue local optimization and report its shared-host limitations. Do not wait
+for SSH details or provision remote machines. Stage 6 is unavailable, not passed.
+
+This supersedes the earlier pending cleanup decision. Record each exact
+deletion through Torus authorization using the owner quote; verify saved
+evidence and stopped processes before removing a completed run’s data.
+
+
+### Current-condition rebaseline
+
+| Cell | Runtime | Actual load s | Fills/s | Drain s | Verdict |
+| --- | --- | ---: | ---: | ---: | --- |
+| s60-viewbound-cap200-r1 | b60097a | 131 | 19,579.2 | 50 | ACCEPT: liveness PASS, AGREE, clean dissemination |
+| s60-recovery-cap200-r3 | 9af0eea | 126 | 11,210.5 | 205 timeout | REJECT: liveness FAIL, dissemination failures, no drain |
+
+The new accepted control is much slower than the earlier 49–52k results.
+Generator, genesis and workload settings match. Broad execution-phase and
+DB-write inflation accompanies fewer generator acknowledgments. Scheduler
+runqueue delay per executed native block did not rise. This is not yet an
+attribution to the header-view or buffer fix, or a measured hardware limit.
+The old runtime comparison stalled at commit count 61 despite successful sync
+responses and empty execution queues; its throughput cannot establish a valid
+speed ranking. Issue `aea43673-9a35-4439-a16f-c9f79b26fbc6` tracks this gap.
+
+Both completed database directories were removed under the owner's cleanup
+authorization after required evidence was checked and per-run retention/storage
+inventories saved. `rm -r -- EXACT_PATH` succeeded. The tool rejected `rm -rf`
+style commands, so forced deletion is unnecessary. Torus authorization must use
+the launch cwd `/home/18c/projects/Torus-hyperBFT` because the Bash hook sees that
+scope even when the execution tool specifies a different workdir. This is a
+scope-recording detail; permission came from the owner's explicit instruction.
+
+Latest-base integrations are prepared without changing their original patches:
+hash `3495652` on `perf/cached-proposal-hashes-viewbound`, DA/timers `5ddc427` on
+`perf/proposal-attribution-viewbound`. Both are based on main `d3e1370` and retain
+the latest consensus fixes. Fresh integration verification and live comparisons
+are required; original candidate branches and frozen artifacts remain intact.
