@@ -648,3 +648,40 @@ passed receipt `947e3f01-aee7-43c3-abb8-30a5d1d1dc17`. No default flag changed.
 Later local worker trials must keep settlement fixed: control ENGINE=0,
 MATCH_WORKERS=18, SETTLE_WORKERS=18; treatment changes only MATCH_WORKERS=4.
 Matching already runs in parallel by market; these are caps, not new parallelism.
+
+### Clean control and proposal-storage pair
+
+`s60-viewbound-asyncsample-cap200-r3` is the clean replacement control: **ACCEPT**,
+30,480.6 fills/s over 134 seconds, first120 30,167.0, drain 32 seconds, peak
+execution queue 19, commit interval p95 5233.8 ms. Valid quiescent agreement and
+clean dissemination; runtime b60097a and runner 13a1944. Its 8.90 GiB databases
+were cleaned after preserving evidence.
+
+The same frozen `proposal-attribution-viewbound-rebuild1` binary and b03004d
+runner produced this first DA pair (old generator, 120s nominal, 10 markets,
+cap 200, requested 76,000 actions/s, BODY_FETCH_TRACE=1):
+
+| Run | DA ensure | Verdict | Fills/s | Actual load seconds | Drain seconds | Peak execution queue | Commit p95 ms |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
+| s60-da-off-cap200-r2 | 0 | ACCEPT | 38,273.9 | 130 | 46 | 60 | 3407.6 |
+| s60-da-on-cap200-r1 | 1 | ACCEPT | 37,966.3 | 133 | 48 | 64 | 3682.6 |
+
+Both established liveness, quiescent agreement and clean dissemination. No
+throughput gain is established; DA ensure remains default OFF. Per-validator
+load-window mirror time/proposal was 49.70/47.73/53.57 ms OFF versus
+44.05/41.19/53.01 ms ON. Counts differ (94/95/94 versus 74/76/71), and ON fills
+per native block grew from 44,743 to 53,942. These means do not isolate storage
+cost. Selection and encode remained substantial; the next body-copy trial uses
+DA OFF to keep that setting fixed.
+
+The first `s60-da-off-cap200-r1` attempt failed before node launch: a missing
+weighted genesis exposed inherited exported OUT in its child generator. No
+database was created. The successful pair reused the exact control weighted
+base and produced genesis MD5 `478d698b5b331837fd7d0c378ece9f46`.
+Fix `1038e62` isolates child output; three actual-script regression fixtures and
+shell/diff checks passed receipt `0692d82b-b8fd-4dda-abe4-abea21d25495`.
+
+Optional depth observer integration `998d1eb` on the workload branch passed five
+actual Bash lifecycle fixtures, receipt `6aee4cb0-12a5-48c2-a5c2-a54f5e94d4ac`.
+It defaults OFF, observes val1 on the declared nominal schedule, preserves
+partial status, and stops/reaps on failure or EXIT. It does not affect acceptance.
