@@ -207,9 +207,23 @@ impl StateDb {
 
     /// Open (or create) the database with explicit tuning (tests / tooling).
     pub fn open_with_tuning(path: &Path, tuning: &DbTuning) -> Result<Self, StateError> {
+        Self::open_with_creation(path, tuning, true)
+    }
+
+    /// Open an existing database for offline tooling, refusing missing paths or
+    /// column families instead of silently creating an empty replacement. Require
+    /// complete WAL recovery: maintenance must not bless a truncated recovery.
+    pub fn open_existing(path: &Path) -> Result<Self, StateError> {
+        Self::open_with_creation(path, &DbTuning::from_env(), false)
+    }
+
+    fn open_with_creation(path: &Path, tuning: &DbTuning, create: bool) -> Result<Self, StateError> {
         let mut opts = Options::default();
-        opts.create_if_missing(true);
-        opts.create_missing_column_families(true);
+        opts.create_if_missing(create);
+        opts.create_missing_column_families(create);
+        if !create {
+            opts.set_wal_recovery_mode(rocksdb::DBRecoveryMode::AbsoluteConsistency);
+        }
         // r3 exec-write-stall-attribution: RocksDB's own statistics. Level 1
         // (default) = tickers only — stall micros, write self/other (write-group
         // followers), WAL/flush/compaction bytes, compaction CPU. Level 2 adds
