@@ -833,3 +833,42 @@ entry using a shared process clock and full identities. Routing, retries and
 validation are unchanged. Duplicate messages and future-view buffer redelivery
 can make pairing ambiguous. Qualification is in progress; neither the failure
 cause nor a performance improvement has been established.
+
+### Instrumented body-fetch reproduction
+
+Diagnostic runtime `bb3409b` passed all 95 HotStuff and 111 network library tests
+and a separate node build (receipt `5053b605-8b19-4dff-8e40-8161e6d78ec3`). Frozen
+node SHA256 is `7562c4cb4dac5dff7c1f46c49cdc5b6cf349bd859f399c5e5b6c05b77fd9e528`;
+the scheduled generator remains unchanged. `s60-fetch-timing-10m-r1` uses the
+same five-minute ten-market stage-5 shape with tracing and depth observation.
+It measured 36,295.5 fills/s over 310 seconds, first120 46,390.4, best60 54,746.5,
+drain 158 seconds and commit p95 4,020.9 ms. Liveness passed and state agreed,
+but val0 and val1 each exhausted one body fetch: REJECT. Extra tracing makes
+this a diagnostic cell, not an isolated throughput comparison. Its 30.16 GiB
+completed databases were inventoried and cleaned; all evidence was retained.
+
+The external `analyze_fetch_timing.py` passed 18 synthetic fixtures with stable
+source hashes (receipt `c2bc8544-80d0-4be7-ac54-80dbb30478d3`). Complete logs parsed
+without errors and all three process scopes were eligible. Unique observed
+response pairs numbered 830/827/787; their admission-to-handler p95 was
+14.139/13.226/14.200 ms. These statistics include startup, idle and drain and
+exclude ambiguous repeated keys, so they do not characterize failure tails.
+Selected body-message admissions had no drops and maximum ordinary queue depths
+7/9/7; this does not measure the separate poller-to-algorithm queue.
+
+The retained `s60-fetch-timing-10m-r1.expiry-traces.txt` gives two distinct cases:
+
+- Val0 admitted response `GEu17YN...`, view 768, at 12:10:06.685894 UTC, expired
+  its tracker at 06.694304, and handled the response at 06.694428. The next
+  admission for that key was at 07.471367. A response was queued before expiry;
+  the generic parser still conservatively excludes the repeated key from its
+  latency distribution. This supports investigating message/timer ordering.
+- Val1 expired `CaEbsdC...` in its current view 770 at 12:10:09.980130 UTC.
+  Its first response admission followed at 10.060822, with handler entry at
+  10.102073. Reordering already-queued messages alone cannot explain or prevent
+  this case. The earlier serving/send/transport delay is not yet isolated.
+
+Do not infer that either change is fixed, increase a timeout from these two
+examples alone, or bypass the ordinary chain/genesis/view filters by rerouting
+messages. A bounded scheduling experiment and separate delay attribution remain
+under review. Cancellation correctness tests are being qualified independently.
