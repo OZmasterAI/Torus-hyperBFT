@@ -617,3 +617,34 @@ reuse. Two source reviews found no blocker. Frozen artifact `proposal-body-reuse
 has node SHA256 `8a644d2f46bd4eeec434e8c79ba886e15ba3a0ad90a9a351824bb9fefaf3bc60`
 and the unchanged generator. This remains an unmeasured candidate, not a promoted
 performance improvement.
+
+### Repaired-harness live cells and additional qualification
+
+`s60-hashes-asyncsample-cap200-r1` (frozen3495652, runner7556118) is **ACCEPT**:
+27,658.5 fills/s over132seconds, first12028,634.5, drain48seconds, peakexecqueue65,
+commit-intervalp953805.0ms. Digest snapshots are valid/quiescent; livenessPASS,
+AGREE and clean dissemination. This is the first accepted latest-base hash run
+with the corrected sampler. It does not reproduce the historical51.6k result.
+
+`s60-viewbound-asyncsample-cap200-r2` (b60097a) passes the automated health gates
+at32,681.7fills/s over133seconds withdrain40, but is **excluded from performance
+comparison**: root created the engine-mode3-matrix worktree during active load.
+Checkout CPU/metadata IO impact was not measured. A separate audit JSON records
+this interference; retain the health result and repeat cleanly. Both cells'
+databases were cleaned after saved evidence and retention inventories.
+
+Scheduled-accounting/report commit `0b6f9fa` passed49Rust and98Python tests,
+summarizer/shell checks and a separate generator-onlybuild, receipt
+`6b760859-9d41-400b-ae4d-02b3e3fcb361`. Frozen `viewbound-scheduled-generator`
+combines verifiedb60097a with generatorSHA256
+`9c210f31cefdb4febb111e7f21d62628f98fdedf727b59e6372028c9cc73d4a6`.
+Current control/hash comparisons continue using the old frozen generator.
+
+Test-only `0d928aa` on `test/engine-mode3-matrix` closes the resident mode3
+parallel-engine gap: each mode2/3 compares its own serial baseline with2/4/8
+workers across resident handoff, roots/CFbytes/results/errors/gas/IDs/trades,
+including interleaved cross-market margin exhaustion. Full8-test engine suite
+passed receipt `947e3f01-aee7-43c3-abb8-30a5d1d1dc17`. No default flag changed.
+Later local worker trials must keep settlement fixed: control ENGINE=0,
+MATCH_WORKERS=18, SETTLE_WORKERS=18; treatment changes only MATCH_WORKERS=4.
+Matching already runs in parallel by market; these are caps, not new parallelism.
