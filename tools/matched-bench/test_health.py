@@ -242,16 +242,16 @@ class CollectionTest(unittest.TestCase):
             self.assertGreater(result['send_queue_full_bytes'], 1000000)
 
     def test_sampler_marks_missing_metrics_instead_of_silent_zero_health(self):
-        script = Path(__file__).with_name('run-cell.sh').read_text()
-        function = script[script.index('extract() {'):script.index('# bl1 exec-chain-sub-100-attribution: histogram BUCKET')]
+        from sample_metrics import parse_metrics as parse_sampler_metrics
         values = sample()
-        columns = ' '.join(values) + ' scrape_valid'
-        command = function + '\nextract "$1"\n'
         text = ''.join(f'{k} {v}\n' for k, v in values.items())
-        good = subprocess.run(['bash', '-c', command, 'test', columns], input=text, text=True, capture_output=True, check=True)
-        bad = subprocess.run(['bash', '-c', command, 'test', columns], input='', text=True, capture_output=True, check=True)
-        self.assertEqual(good.stdout.strip().split(',')[-1], '1')
-        self.assertEqual(bad.stdout.strip().split(',')[-1], '0')
+        good, _ = parse_sampler_metrics(text, set())
+        bad, _ = parse_sampler_metrics('', set())
+        self.assertEqual(good['scrape_valid'], '1')
+        self.assertEqual(bad['scrape_valid'], '0')
+        self.assertEqual({k: float(good[k]) for k in values}, values)
+        self.assertTrue(all(k not in bad for k in values))
+
 
 
 if __name__ == '__main__':
