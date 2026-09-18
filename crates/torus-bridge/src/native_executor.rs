@@ -312,6 +312,126 @@ struct MarketSettlePlan {
     maker_releases: Vec<(Address, FixedPoint)>,
 }
 
+/// Opt-in attribution for an actual parallel pass B, never its sequential
+/// fallback. The default path does no inventory, new clock reads, or logging.
+fn settle_passb_diagnostic_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(enabled) = settle_passb_diagnostic_tests::enabled_override() {
+        return enabled;
+    }
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        parse_settle_passb_diagnostic(std::env::var("TORUS_SETTLE_PASSB_DIAG").ok().as_deref())
+    })
+}
+
+fn parse_settle_passb_diagnostic(raw: Option<&str>) -> bool {
+    raw == Some("1")
+}
+
+#[derive(Debug, Default)]
+struct SettlePassBDiagnostic {
+    inventory_ns: u128,
+    position_merge_ns: u128,
+    balance_apply_ns: u128,
+    trade_route_ns: u128,
+    pass_b_ns: u128,
+    residual_ns: u128,
+    timing_valid: bool,
+    markets_merged: u64,
+    orders_visited: u64,
+    failed_orders: u64,
+    balance_attempts: u64,
+    balance_read_errors: u64,
+    trade_route_calls: u64,
+    planned_balance_events: u64,
+    planned_unique_senders: u64,
+    planned_top1_events: u64,
+    planned_top4_events: u64,
+}
+
+impl SettlePassBDiagnostic {
+    // Read-only inventory in exactly the later pass-B visitation shape. No
+    // balance reads: positive pre-clamp releases count even when live balances
+    // will clamp them to zero; Some(ZERO) PnL events count as well. Later read
+    // failures can truncate actual work, so these are PLANNED event counts.
+    fn inventory(
+        market_results: &[crate::market_workers::MarketBatchResult],
+        plans: &[MarketSettlePlan],
+        market_batches: &HashMap<MarketId, Vec<PreparedOrder<'_>>>,
+    ) -> Self {
+        let started = std::time::Instant::now();
+        let mut senders: HashMap<Address, u64> = HashMap::new();
+        for (market, plan) in market_results.iter().zip(plans) {
+            let Some(prepared) = market_batches.get(&market.market_id) else { continue; };
+            for ((_, prep), order) in market.results.iter().zip(prepared).zip(&plan.orders) {
+                if order.margin_release > FixedPoint::ZERO {
+                    *senders.entry(prep.sender).or_default() += 1;
+                }
+                for (_, trader, _) in &order.pnl_events {
+                    *senders.entry(*trader).or_default() += 1;
+                }
+            }
+            for (trader, _) in &plan.maker_releases {
+                *senders.entry(*trader).or_default() += 1;
+            }
+        }
+        let mut result = Self { planned_unique_senders: senders.len() as u64, ..Self::default() };
+        let mut top = [0u64; 4];
+        for count in senders.into_values() {
+            result.planned_balance_events += count;
+            let mut candidate = count;
+            for slot in &mut top {
+                if candidate > *slot {
+                    std::mem::swap(&mut candidate, slot);
+                }
+            }
+        }
+        result.planned_top1_events = top[0];
+        result.planned_top4_events = top.iter().sum();
+        result.inventory_ns = started.elapsed().as_nanos();
+        result
+    }
+
+    fn note_balance_read(diag: &mut Option<Self>, failed: bool) {
+        if let Some(diag) = diag {
+            diag.balance_attempts += 1;
+            diag.balance_read_errors += u64::from(failed);
+        }
+    }
+
+    fn finish(&mut self, pass_b_ns: u128) {
+        self.pass_b_ns = pass_b_ns;
+        let attributed = self.position_merge_ns + self.balance_apply_ns + self.trade_route_ns;
+        self.timing_valid = attributed <= pass_b_ns;
+        self.residual_ns = pass_b_ns.saturating_sub(attributed);
+    }
+
+    fn emit(self, block_height: u64) {
+        tracing::info!(
+            target: "torus_bridge::settle_passb_diag",
+            schema = 1, block_height,
+            inventory_ns = self.inventory_ns, pass_b_ns = self.pass_b_ns,
+            position_merge_ns = self.position_merge_ns, balance_apply_ns = self.balance_apply_ns,
+            trade_route_ns = self.trade_route_ns, residual_ns = self.residual_ns,
+            timing_valid = self.timing_valid,
+            markets_merged = self.markets_merged, orders_visited = self.orders_visited,
+            failed_orders = self.failed_orders, balance_attempts = self.balance_attempts,
+            balance_read_errors = self.balance_read_errors, trade_route_calls = self.trade_route_calls,
+            planned_balance_events = self.planned_balance_events,
+            planned_unique_senders = self.planned_unique_senders,
+            planned_top1_events = self.planned_top1_events, planned_top4_events = self.planned_top4_events,
+            "parallel settlement pass-B attribution"
+        );
+        #[cfg(test)]
+        settle_passb_diagnostic_tests::record(self);
+    }
+}
+
+#[cfg(test)]
+#[path = "settle_passb_diagnostic_tests.rs"]
+mod settle_passb_diagnostic_tests;
+
 /// C3 runtime toggle: `TORUS_PARALLEL_SETTLE=1` enables the parallel settle
 /// path; anything else (INCLUDING UNSET) keeps today's sequential loop.
 /// Default OFF — unset env is byte-identical to the pre-C3 serial semantics.
@@ -3983,6 +4103,11 @@ impl NativeExecutor {
         }
         let plans: Vec<MarketSettlePlan> = plans.into_iter().map(|p| p.unwrap()).collect();
 
+        // Inventory is deliberately outside the existing pass-B timer, after
+        // the fallback decision. Only the opt-in diagnostic visits it.
+        let mut diagnostic = settle_passb_diagnostic_enabled().then(||
+            SettlePassBDiagnostic::inventory(&market_results, &plans, market_batches));
+
         // ---- Pass B: deterministic apply, markets ascending by id ----
         let pass_b_timer = std::time::Instant::now();
         for (mbr, plan) in market_results.into_iter().zip(plans) {
@@ -3999,7 +4124,12 @@ impl NativeExecutor {
 
             // This market's position mutations become part of the batch cache
             // (disjoint keys across markets; single sorted flush at call end).
+            let position_timer = diagnostic.as_ref().map(|_| std::time::Instant::now());
             pos_cache.merge_disjoint(plan.pos_cache);
+            if let (Some(diag), Some(timer)) = (diagnostic.as_mut(), position_timer) {
+                diag.position_merge_ns += timer.elapsed().as_nanos();
+                diag.markets_merged += 1;
+            }
 
             let prepared = match market_batches.get(&market_id) {
                 Some(p) => p,
@@ -4010,6 +4140,9 @@ impl NativeExecutor {
                 mbr.results.iter().zip(prepared.iter()).zip(plan.orders)
             {
                 let result = &match_result.result;
+                if let Some(diag) = diagnostic.as_mut() {
+                    diag.orders_visited += 1;
+                }
 
                 // Funnel (perf A1): STP maker cancels already happened in the
                 // book during matching — same site as sequential.
@@ -4020,8 +4153,11 @@ impl NativeExecutor {
 
                 // Taker-side margin release (amount precomputed; clamp here,
                 // where the balance authority lives).
+                let balance_timer = diagnostic.as_ref().map(|_| std::time::Instant::now());
                 if oplan.margin_release > FixedPoint::ZERO {
-                    if let Ok(mut bal) = bal_cache.load(&ctx.positions, &prep.sender) {
+                    let loaded = bal_cache.load(&ctx.positions, &prep.sender);
+                    SettlePassBDiagnostic::note_balance_read(&mut diagnostic, loaded.is_err());
+                    if let Ok(mut bal) = loaded {
                         let release = oplan.margin_release.min(bal.order_margin);
                         bal.order_margin -= release;
                         bal.available += release;
@@ -4040,7 +4176,9 @@ impl NativeExecutor {
                 // failure (if any) stands.
                 let mut fill_failed: Option<String> = None;
                 for (side, trader, pnl) in &oplan.pnl_events {
-                    match bal_cache.load(&ctx.positions, trader) {
+                    let loaded = bal_cache.load(&ctx.positions, trader);
+                    SettlePassBDiagnostic::note_balance_read(&mut diagnostic, loaded.is_err());
+                    match loaded {
                         Ok(mut bal) => {
                             bal.available += *pnl;
                             bal_cache.set(trader, bal);
@@ -4055,7 +4193,15 @@ impl NativeExecutor {
                     fill_failed = oplan.fill_error;
                 }
 
+                // Close before the failure continue: failed orders are still
+                // part of balance-application time and attempted-read counts.
+                if let (Some(diag), Some(timer)) = (diagnostic.as_mut(), balance_timer) {
+                    diag.balance_apply_ns += timer.elapsed().as_nanos();
+                }
                 if let Some(err) = fill_failed {
+                    if let Some(diag) = diagnostic.as_mut() {
+                        diag.failed_orders += 1;
+                    }
                     results[prep.index] = NativeActionResult::err("place_order", err);
                     // Funnel (perf A1): died on fill application, not on the book.
                     if let Some(ref m) = ctx.metrics {
@@ -4066,10 +4212,17 @@ impl NativeExecutor {
 
                 // Persist trades: stamp the definitive per-block index into
                 // the worker-built bytes, then route exactly like persist_trade.
+                let trade_timer = diagnostic.as_ref().map(|_| std::time::Instant::now());
+                if let Some(diag) = diagnostic.as_mut() {
+                    diag.trade_route_calls += oplan.trades.len() as u64;
+                }
                 for mut kvs in oplan.trades {
                     kvs.stamp_trade_index(ctx.trade_index);
                     Self::route_trade_kvs(ctx, kvs);
                     ctx.trade_index += 1;
+                }
+                if let (Some(diag), Some(timer)) = (diagnostic.as_mut(), trade_timer) {
+                    diag.trade_route_ns += timer.elapsed().as_nanos();
                 }
 
                 if let Some(ref m) = ctx.metrics {
@@ -4083,16 +4236,27 @@ impl NativeExecutor {
 
             // A5 maker/STP releases — amounts precomputed by the worker in the
             // canonical order; clamps applied here against live balances.
+            let balance_timer = diagnostic.as_ref().map(|_| std::time::Instant::now());
             for (trader, amount) in plan.maker_releases {
-                if let Ok(mut bal) = bal_cache.load(&ctx.positions, &trader) {
+                let loaded = bal_cache.load(&ctx.positions, &trader);
+                SettlePassBDiagnostic::note_balance_read(&mut diagnostic, loaded.is_err());
+                if let Ok(mut bal) = loaded {
                     let release = amount.min(bal.order_margin);
                     bal.order_margin -= release;
                     bal.available += release;
                     bal_cache.set(&trader, bal);
                 }
             }
+            if let (Some(diag), Some(timer)) = (diagnostic.as_mut(), balance_timer) {
+                diag.balance_apply_ns += timer.elapsed().as_nanos();
+            }
         }
-        ctx.phase_accum.settle_pass_b_ns += pass_b_timer.elapsed().as_nanos();
+        let pass_b_ns = pass_b_timer.elapsed().as_nanos();
+        ctx.phase_accum.settle_pass_b_ns += pass_b_ns;
+        if let Some(mut diag) = diagnostic {
+            diag.finish(pass_b_ns);
+            diag.emit(ctx.block_height);
+        }
     }
 
     /// C3 pass-A worker: compute one market's settlement plan. PURE with
