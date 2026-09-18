@@ -3930,7 +3930,9 @@ impl TorusApp {
     /// S459 proposer guarantee. Ensure every selected native body is in THIS
     /// node's DA store before it can be referenced by our proposal. Default:
     /// unconditional mirror; experimental flag: exact-byte reuse. On success the
-    /// selection is returned unchanged; on a durable-write failure the batch is
+    /// selection and the bodies cloned for DA are returned in the same order;
+    /// the caller moves those bodies into its block instead of cloning again.
+    /// On a durable-write failure the batch is
     /// re-queued (inside `mirror_native_to_da`) and this returns an EMPTY selection
     /// so `produce_block` proposes empty-native this view — a block that cannot wedge
     /// a validator — instead of referencing a body no node durably holds. A metric
@@ -3938,15 +3940,18 @@ impl TorusApp {
     fn mirror_or_drop_native(
         &self,
         native_with_senders: Vec<(torus_types::Address, torus_types::SignedNativeAction)>,
-    ) -> Vec<(torus_types::Address, torus_types::SignedNativeAction)> {
+    ) -> (
+        Vec<(torus_types::Address, torus_types::SignedNativeAction)>,
+        Vec<torus_types::SignedNativeAction>,
+    ) {
         if native_with_senders.is_empty() {
-            return native_with_senders;
+            return (native_with_senders, Vec::new());
         }
-        let Some(ref mempool) = self.mempool else {
-            return native_with_senders;
-        };
         let actions: Vec<torus_types::SignedNativeAction> =
             native_with_senders.iter().map(|(_, a)| a.clone()).collect();
+        let Some(ref mempool) = self.mempool else {
+            return (native_with_senders, actions);
+        };
         let mirrored = if self.proposal_da_ensure {
             let started = std::time::Instant::now();
             mempool.ensure_native_da(&actions).map(|stats| {
@@ -3975,7 +3980,7 @@ impl TorusApp {
                     &actions,
                     self.last_header.height.saturating_add(1),
                 );
-                native_with_senders
+                (native_with_senders, actions)
             }
             Err(e) => {
                 tracing::error!(
@@ -3986,7 +3991,7 @@ impl TorusApp {
                 if let Some(ref m) = self.metrics {
                     m.proposer_body_mirror_failures.inc();
                 }
-                Vec::new()
+                (Vec::new(), Vec::new())
             }
         }
     }
@@ -4527,11 +4532,9 @@ impl App<RocksKVStore> for TorusApp {
         // referenced-but-unbacked body can. The re-queued batch retries next view.
         // `native_with_senders` and `native_actions` stay consistent so the
         // pre-proposal push below never carries a dropped body.
-        let native_with_senders = self.mirror_or_drop_native(native_with_senders);
+        let (native_with_senders, native_actions) =
+            self.mirror_or_drop_native(native_with_senders);
         let mirror_done = std::time::Instant::now();
-
-        let native_actions: Vec<torus_types::SignedNativeAction> =
-            native_with_senders.iter().map(|(_, a)| a.clone()).collect();
 
         let sig_attestation = match self.signing_key {
             Some(ref key) => torus_bridge::proposer::generate_sig_attestation(&native_actions, key),
@@ -8647,31 +8650,81 @@ mod crash_recovery_tests {
     /// silent regression would re-open the leader half of the wedge).
     #[test]
     fn produce_block_bodies_durable() {
-        let (config, state_db) = make_test_config_and_db();
-        let mempool = Arc::new(Mempool::new(
-            state_db.clone(),
-            torus_mempool::MempoolConfig::default(),
-        ));
-        let actions: Vec<SignedNativeAction> = (0..5).map(sign_claim_rewards).collect();
-        let with_senders: Vec<(torus_types::Address, SignedNativeAction)> = actions
-            .iter()
-            .map(|a| (a.recover_sender().unwrap(), a.clone()))
-            .collect();
-
-        let app = TorusApp::new(state_db.clone(), &config, None, Some(mempool.clone()), None);
-        let kept = app.mirror_or_drop_native(with_senders.clone());
-        assert_eq!(
-            kept.len(),
-            with_senders.len(),
-            "a healthy durable mirror keeps every selected action"
-        );
-        for a in &actions {
-            let hash = torus_types::compute_action_hash(a);
-            assert!(
-                mempool.get_native_da(&hash).is_some(),
-                "every proposed body must be durable in the DA store after mirror_or_drop_native"
+        for ensure in [false, true] {
+            let (config, state_db) = make_test_config_and_db();
+            let mempool = Arc::new(Mempool::new(
+                state_db.clone(),
+                torus_mempool::MempoolConfig::default(),
+            ));
+            let batch = torus_types::eip712::sign_native_action(
+                big_order_batch_action(7, 3).action,
+                7,
+                &k256::ecdsa::SigningKey::from_slice(&[7; 32]).unwrap(),
             );
+            // Deliberately unsorted, with an owned order vector in the middle.
+            let actions = vec![sign_claim_rewards(9), batch, sign_claim_rewards(2)];
+            let with_senders: Vec<_> = actions
+                .iter()
+                .map(|a| (a.recover_sender().unwrap(), a.clone()))
+                .collect();
+            let expected_push = bincode::serialize(&with_senders).unwrap();
+            let reference = make_block(1, actions.clone());
+            let mut app =
+                TorusApp::new(state_db.clone(), &config, None, Some(mempool.clone()), None);
+            app.proposal_da_ensure = ensure;
+            app.last_validator_set = make_validator_set(4);
+            let (kept, bodies) = app.mirror_or_drop_native(with_senders);
+            assert_eq!(bincode::serialize(&kept).unwrap(), expected_push);
+
+            // Transfer push ownership while the separately owned block is alive.
+            // Both encodings must match the pre-refactor ordered selection.
+            let block = make_block(1, bodies);
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            assert!(tx.try_send(PreProposalBundle { actions: kept }).is_ok());
+            assert_eq!(
+                bincode::serialize(&rx.try_recv().unwrap().actions).unwrap(),
+                expected_push
+            );
+            for compact in [false, true] {
+                assert_eq!(
+                    encode_proposal_datum(&block, compact),
+                    encode_proposal_datum(&reference, compact)
+                );
+            }
+            for action in &actions {
+                let hash = torus_types::compute_action_hash(action);
+                let durable = mempool.get_native_da(&hash).unwrap();
+                assert_eq!(
+                    bincode::serialize(&durable).unwrap(),
+                    bincode::serialize(action).unwrap()
+                );
+                if shard_custody_enabled() {
+                    for index in 0..4 {
+                        assert!(mempool.get_shard(&hash, index).is_some());
+                    }
+                }
+            }
+            assert_eq!(mempool.da_flush_failures(), 0);
         }
+    }
+
+    #[test]
+    fn proposal_body_reuse_without_mempool_and_empty_selection() {
+        let (config, state_db) = make_test_config_and_db();
+        let app = TorusApp::new(state_db, &config, None, None, None);
+        let action = sign_claim_rewards(1);
+        let selected = vec![(action.recover_sender().unwrap(), action.clone())];
+        let (kept, bodies) = app.mirror_or_drop_native(selected.clone());
+        assert_eq!(
+            bincode::serialize(&kept).unwrap(),
+            bincode::serialize(&selected).unwrap()
+        );
+        assert_eq!(
+            bincode::serialize(&bodies).unwrap(),
+            bincode::serialize(&vec![action]).unwrap()
+        );
+        let (kept, bodies) = app.mirror_or_drop_native(Vec::new());
+        assert!(kept.is_empty() && bodies.is_empty());
     }
 
     #[test]
@@ -8696,9 +8749,11 @@ mod crash_recovery_tests {
         ));
         let mut app = TorusApp::new(state_db.clone(), &config, None, Some(pool.clone()), None);
         app.proposal_da_ensure = true;
+        let (kept, bodies) = app.mirror_or_drop_native(selected.clone());
+        assert_eq!(kept.len(), actions.len());
         assert_eq!(
-            app.mirror_or_drop_native(selected.clone()).len(),
-            actions.len()
+            bincode::serialize(&bodies).unwrap(),
+            bincode::serialize(&actions).unwrap()
         );
         for action in &actions {
             assert!(pool
@@ -8720,24 +8775,41 @@ mod crash_recovery_tests {
         ));
         app.mempool = Some(failed_pool.clone());
         app.proposal_da_ensure = false;
+        let (kept, bodies) = app.mirror_or_drop_native(selected.clone());
         assert!(
-            app.mirror_or_drop_native(selected.clone()).is_empty(),
+            kept.is_empty() && bodies.is_empty(),
             "flag-off still does its unconditional write"
         );
         app.proposal_da_ensure = true;
+        let (kept, bodies) = app.mirror_or_drop_native(selected);
         assert_eq!(
-            app.mirror_or_drop_native(selected).len(),
+            kept.len(),
             actions.len(),
             "verified existing bytes need no write"
         );
+        assert_eq!(
+            bincode::serialize(&bodies).unwrap(),
+            bincode::serialize(&actions).unwrap()
+        );
         let missing = sign_claim_rewards(3);
-        assert!(app
-            .mirror_or_drop_native(vec![(missing.recover_sender().unwrap(), missing)])
-            .is_empty());
+        // A mixed present/missing batch must be dropped in full, not partially
+        // returned for either block construction or pre-proposal push.
+        let mixed = vec![
+            (actions[0].recover_sender().unwrap(), actions[0].clone()),
+            (missing.recover_sender().unwrap(), missing),
+        ];
+        let (kept, bodies) = app.mirror_or_drop_native(mixed);
+        assert!(kept.is_empty() && bodies.is_empty());
         assert_eq!(
             failed_pool.da_flush_failures(),
             2,
             "both failed writes queue their full batches"
+        );
+        failed_pool.flush_da_mirrors();
+        assert_eq!(
+            failed_pool.da_flush_failures(),
+            3,
+            "failed bodies remain queued for retry"
         );
     }
 
