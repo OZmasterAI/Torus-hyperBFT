@@ -651,15 +651,57 @@ where
 /// (a stale same-height re-proposal, a partial/other action set) rejects the
 /// cache so the caller falls back to the all-or-nothing DA reconstruction.
 ///
-/// Cost: O(n) `compute_action_hash` over the cached actions — the same order as
-/// the DA reconstruction's per-hash lookup it replaces, never heavier.
-fn cached_matches_compact(cached: &TorusBlock, compact: &CompactBlock) -> bool {
-    cached.native_actions.len() == compact.native_action_hashes.len()
-        && cached
-            .native_actions
-            .iter()
-            .map(torus_types::compute_action_hash)
-            .eq(compact.native_action_hashes.iter().copied())
+/// Hashes are derived once from the owned, immutable proposal body. Comparing
+/// the ordered vectors preserves the completeness gate without rehashing bodies.
+fn cached_matches_compact(cached: &PendingProposal, compact: &CompactBlock) -> bool {
+    cached.block.native_actions.len() == compact.native_action_hashes.len()
+        && cached.native_action_hashes() == compact.native_action_hashes.as_slice()
+}
+
+/// A proposal body and its ordered content addresses share one lifetime. The
+/// body has no mutable accessor: replacing a proposal constructs a new cache,
+/// and consuming it into execution ends the cache's lifetime. Hashes are always
+/// computed lazily from signed bodies, never accepted from a peer unchecked.
+/// Successful validation alone does not add a hashing pass to the follower path.
+struct PendingProposal {
+    block: TorusBlock,
+    native_action_hashes: std::sync::OnceLock<Vec<torus_types::B256>>,
+}
+
+impl PendingProposal {
+    fn new(block: TorusBlock) -> Self {
+        Self {
+            block,
+            native_action_hashes: std::sync::OnceLock::new(),
+        }
+    }
+
+    fn native_action_hashes(&self) -> &[torus_types::B256] {
+        self.native_action_hashes.get_or_init(|| {
+            self.block.native_actions.iter()
+                .map(torus_types::compute_action_hash).collect()
+        })
+    }
+
+    fn into_block(self) -> TorusBlock {
+        self.block
+    }
+
+    /// Same wire format as `CompactBlock::from_block`, reusing the addresses
+    /// already derived for selection exclusion and commit cache matching.
+    fn encode(&self, compact: bool) -> Vec<u8> {
+        if compact {
+            let compact = CompactBlock {
+                header: self.block.header.clone(),
+                native_action_hashes: self.native_action_hashes().to_vec(),
+                evm_transactions: self.block.evm_transactions.clone(),
+                core_writer_actions: self.block.core_writer_actions.clone(),
+            };
+            bincode::serialize(&compact).expect("serialize CompactBlock")
+        } else {
+            bincode::serialize(&self.block).expect("serialize TorusBlock")
+        }
+    }
 }
 
 /// The `CF_BLOCK_HEADERS` record for a block: `[0..32]` = keccak of the
@@ -2251,7 +2293,7 @@ pub struct TorusApp {
     last_validator_set: ValidatorSet,
     cached_vs_updates: Option<(u64, Option<ValidatorSetUpdates>)>,
     pending_slashes: Vec<PendingSlash>,
-    pending_proposals: std::collections::HashMap<u64, TorusBlock>,
+    pending_proposals: std::collections::HashMap<u64, PendingProposal>,
     in_flight_hashes: InFlightHashLedger,
     #[allow(dead_code)]
     treasury_address: Address,
@@ -2414,6 +2456,7 @@ const COMPACT_PROPOSALS: bool = true;
 /// to validators (T7), and fetched on a miss via the rare pull-fallback (T6). This
 /// shrinks the proposal so it fits `max_consensus_message_size` at 400k orders/sec.
 /// All validators must emit the SAME encoding (see [`COMPACT_PROPOSALS`]).
+#[cfg(test)]
 fn encode_proposal_datum(block: &TorusBlock, compact: bool) -> Vec<u8> {
     if compact {
         bincode::serialize(&CompactBlock::from_block(block)).expect("serialize CompactBlock")
@@ -4405,7 +4448,8 @@ impl TorusApp {
             }
         }
 
-        self.pending_proposals.insert(height, torus_block);
+        self.pending_proposals
+            .insert(height, PendingProposal::new(torus_block));
         self.pending_proposals.retain(|&h, _| h + 10 > height);
 
         let validator_set_updates = self.epoch_validator_set_updates(height);
@@ -4555,15 +4599,12 @@ impl App<RocksKVStore> for TorusApp {
 
         // Note our own block's hashes too: a same-height re-proposal would
         // overwrite the `pending_proposals` entry and silently untrack these.
-        let own_hashes: Vec<torus_types::B256> = block
-            .native_actions
-            .iter()
-            .map(torus_types::compute_action_hash)
-            .collect();
-        let encoded = encode_proposal_datum(&block, COMPACT_PROPOSALS);
-        self.pending_proposals.insert(height, block);
+        let pending = PendingProposal::new(block);
+        let encoded = pending.encode(COMPACT_PROPOSALS);
+        self.in_flight_hashes
+            .note(height, pending.native_action_hashes().iter().copied());
+        self.pending_proposals.insert(height, pending);
         self.pending_proposals.retain(|&h, _| h + 10 > height);
-        self.in_flight_hashes.note(height, own_hashes);
         let hash = Self::hash_datum(&encoded);
 
         let validator_set_updates = self.epoch_validator_set_updates(height);
@@ -4700,6 +4741,7 @@ impl App<RocksKVStore> for TorusApp {
             let height = compact.header.height;
             match self.pending_proposals.remove(&height) {
                 Some(cached) if cached_matches_compact(&cached, &compact) => {
+                    let cached = cached.into_block();
                     let ready = TorusBlock {
                         header: compact.header.clone(),
                         native_actions: cached.native_actions,
@@ -4925,7 +4967,7 @@ impl TorusApp {
         let mut in_flight: std::collections::HashSet<torus_types::B256> = self
             .pending_proposals
             .values()
-            .flat_map(|b| b.native_actions.iter().map(torus_types::compute_action_hash))
+            .flat_map(|b| b.native_action_hashes().iter().copied())
             .collect();
         // Union the hash ledger: covers compact proposals whose bodies never
         // reconstructed (MissingData) — absent from `pending_proposals` but
@@ -7821,6 +7863,112 @@ mod crash_recovery_tests {
         let applied = read_native_applied_height(&state_db);
         assert_eq!(applied, Some(1), "replay should set applied height to 1");
         assert_eq!(app.last_header.height, 1, "last_header should be updated");
+    }
+
+    #[test]
+    fn pending_proposal_encoding_matches_existing_wire_format() {
+        for actions in [
+            vec![],
+            vec![sign_claim_rewards(1), big_order_batch_action(2, 400)],
+        ] {
+            let mut block = make_block(7, actions);
+            block.evm_transactions = vec![vec![1, 2, 3], vec![4, 5]];
+            block.header.evm_tx_count = 2;
+            block.core_writer_actions = vec![torus_types::CoreWriterAction::PermanentStake {
+                amount: torus_types::U256::from(42),
+            }];
+            let pending = PendingProposal::new(block.clone());
+            assert!(pending.native_action_hashes.get().is_none());
+            for compact in [false, true] {
+                assert_eq!(
+                    pending.encode(compact),
+                    encode_proposal_datum(&block, compact)
+                );
+                assert_eq!(pending.native_action_hashes.get().is_some(), compact);
+            }
+        }
+    }
+
+    #[test]
+    fn pending_proposal_match_rejects_reordered_replaced_and_resigned_bodies() {
+        let block = make_block(7, vec![sign_claim_rewards(1), sign_claim_rewards(2)]);
+        let committed = CompactBlock::from_block(&block);
+        let shorter = PendingProposal::new(make_block(7, vec![sign_claim_rewards(1)]));
+        assert!(!cached_matches_compact(&shorter, &committed));
+        assert!(shorter.native_action_hashes.get().is_none());
+        assert!(cached_matches_compact(
+            &PendingProposal::new(block.clone()),
+            &committed
+        ));
+
+        let mut reordered = block.clone();
+        reordered.native_actions.swap(0, 1);
+        assert!(!cached_matches_compact(
+            &PendingProposal::new(reordered),
+            &committed
+        ));
+
+        let mut replaced = block.clone();
+        replaced.native_actions[0] = sign_claim_rewards(3);
+        assert!(!cached_matches_compact(
+            &PendingProposal::new(replaced),
+            &committed
+        ));
+
+        let mut resigned = block;
+        let torus_types::ActionSignature::Eip712(ref mut signature) =
+            resigned.native_actions[0].signature
+        else {
+            panic!("fixture must have an EIP-712 signature");
+        };
+        signature.r[0] ^= 1;
+        assert!(!cached_matches_compact(
+            &PendingProposal::new(resigned),
+            &committed
+        ));
+    }
+
+    #[test]
+    fn pending_proposal_selection_excludes_validated_bodies_and_missing_body_ledger() {
+        let (config, state_db) = make_test_config_and_db();
+        let mempool = Arc::new(Mempool::new(
+            state_db.clone(),
+            torus_mempool::MempoolConfig::default(),
+        ));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let actions: Vec<_> = (0..3).map(|i| sign_claim_rewards(now + i)).collect();
+        for action in &actions {
+            mempool
+                .add_native_action_presigned(action.recover_sender().unwrap(), action.clone())
+                .unwrap();
+        }
+        let mut app = TorusApp::new(state_db, &config, None, Some(mempool), None);
+        // Full-block validation has no compact hash note. Its cached body alone
+        // must still exclude the action from the next proposal.
+        assert!(matches!(
+            app.finish_validate(make_block(5, vec![actions[0].clone()])),
+            ValidateBlockResponse::Valid { .. }
+        ));
+        let missing_hash = torus_types::compute_action_hash(&actions[1]);
+        app.in_flight_hashes.note(6, [missing_hash]);
+        let (selected, _) = app.select_block_payload(0, 30_000_000, B256::ZERO);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(
+            torus_types::compute_action_hash(&selected[0].1),
+            torus_types::compute_action_hash(&actions[2])
+        );
+
+        // Cleanup releases the body and its cache together; the independent
+        // missing-body ledger continues to exclude its action.
+        app.pending_proposals.remove(&5);
+        let (selected, _) = app.select_block_payload(0, 30_000_000, B256::ZERO);
+        assert_eq!(selected.len(), 2);
+        assert!(selected
+            .iter()
+            .all(|(_, action)| torus_types::compute_action_hash(action) != missing_hash));
     }
 
     #[test]
@@ -10750,7 +10898,8 @@ mod crash_recovery_tests {
         // devnet "proposer executed 40 of its own 59" state.
         let stale_actions: Vec<SignedNativeAction> = (1..=40u64).map(sign_claim_rewards).collect();
         let stale_block = make_block(130, stale_actions);
-        app.pending_proposals.insert(130, stale_block);
+        app.pending_proposals
+            .insert(130, PendingProposal::new(stale_block));
 
         let committed = committed_compact_block(&committed_block);
         app.on_committed_block(&committed, committed.hash);
