@@ -685,3 +685,36 @@ Optional depth observer integration `998d1eb` on the workload branch passed five
 actual Bash lifecycle fixtures, receipt `6aee4cb0-12a5-48c2-a5c2-a54f5e94d4ac`.
 It defaults OFF, observes val1 on the declared nominal schedule, preserves
 partial status, and stops/reaps on failure or EXIT. It does not affect acceptance.
+
+### Body-copy and WAL-budget screening
+
+`s60-body-reuse-daoff-cap200-r1` (runtime2f1b832, runner526d9b7) is **ACCEPT**:
+30,944.6 fills/s over131seconds, first12030,422.8, drain35seconds, peakqueue65,
+commitp953710.5ms. It did not outperform the preceding DA-OFF control38,273.9;
+no promotion. Retained evidence includes quiescent agreement and clean
+dissemination; 9.87GiB completed databases were removed after inventory.
+
+The first same-binary WAL pair uses runtimeb0a57ce, runner8030686, frozen
+`wal-budget` node SHA256 `b629b6c424922d4253f6dd002326114cecad8ccce1286b39dc903a30cafef14d`,
+old generator, BODY_FETCH_TRACE=1, and the same nominal120s/10market/cap200 shape.
+
+| Run | WAL threshold MiB | Verdict | Fills/s | Actual load seconds | Drain seconds | Peak queue | Commit p95 ms | Completed database GiB |
+| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| s60-wal-auto-cap200-r1 | 0 (automatic) | ACCEPT | 29,116.7 | 128 | 42 | 6 | 7065.6 | 10.47 |
+| s60-wal-1024-cap200-r1 | 1024 | ACCEPT | 35,392.9 | 130 | 42 | 58 | 3884.4 | 2.61 |
+
+Both passed liveness, quiescent agreement and dissemination. Automatic control
+had an unusually slow idle cadence (later probes8.1/4.4blocks/s); treatment had
+27.8blocks/s. The throughput difference requires repetition, not promotion.
+The soft threshold did reduce retained log-file bytes:10.47billion to1.78billion
+across all validators, while SST bytes rose0.77billion to1.02billion. During load,
+per-node WAL bytes written actually rose from2.53–2.60GB to2.77–2.95GB, with more
+flush/compaction output. This is reduced retention, not reduced bytes written.
+Completed database inventories and all measurement artifacts were retained;
+only databases were cleaned under standing authorization.
+
+The external campaign driver now accepts an explicit recorded `--runner-env`
+allowlist for BAND/CROSS_FRACTION/CANCEL_FRACTION/MPS/RATE_SCHEDULE/DEPTH_OBSERVER.
+Five parser fixtures covered accepted/default mappings and unsupported/malformed/
+duplicate rejection before launch. Both WAL arms used the same updated driver
+SHA256 `f2f7d1e9b6dd065e3c3a86171b0294b03142af0d70e23a83b7a50df64a887e95`.
