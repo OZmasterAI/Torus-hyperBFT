@@ -1,7 +1,8 @@
 # Strict live replay qualification
 
-Candidate based on f4c2d12. Source and tests prepared; no tests or live cells
-executed for this attempt yet. This changes only the benchmark harness.
+Harness based on f4c2d12, committed as 441e967 with genesis fix f99e15c.
+Offline harness/health/summarizer tests passed, as did three genesis fixtures.
+This changes only the benchmark harness; the measured node remains frozen 9af0eea.
 
 `CRASH_REQUIRE_REPLAY=1` requires a positive restart replay log gap with
 consistent committed/applied heights. With `TORUS_EXEC_PIPELINE=1`, the worker
@@ -23,7 +24,7 @@ frozen binary, a short qualification attempt is:
 
 ```bash
 CRASH_KILL_AT_S=25 CRASH_REQUIRE_REPLAY=1 KILL_NODE=val1 \
-TARGET_DIR=/home/18c/.cargo-target-matched \
+TARGET_DIR=/home/18c/bench-results-matched/s60-campaign-20260918/artifacts/recovery \
 DATA_ROOT=/home/18c/torus-pipeline-qualification \
 RESULTS_ROOT=/home/18c/bench-results-matched/s60-campaign-20260918 \
 BLOCK_CAP=200 SENDERS=5000 CONC=256 BATCH=400 SUBMIT=1 \
@@ -62,3 +63,19 @@ worker attachment below the replay tip, missing and failed metric evidence,
 stubbed curl timeout after partial output, failure precedence, and throughput
 liveness remaining UNKNOWN across a restart despite a crash PASS. No runtime
 fault hook, storage mutation, or node behavior change is included.
+
+## Observed short qualification
+
+`s60-pipeline-replay45-r3` (nominal45s, actual58s, killval1+15s, pipeline1)
+replayed from applied783 to committed784, gap1, and attached its worker at784.
+The separate strict crash gate passed and all validators agreed at height790.
+The full run was REJECT: commit progress stopped with pending actions and
+empty execution/flush queues; drain timed out after208s. No panic/fail-stop
+was observed. Thus this is positive replay evidence, not healthy post-restart
+liveness. Preserve the failed cell; pipeline remains defaultOFF.
+
+Artifacts: `/home/18c/bench-results-matched/s60-pipeline-replay45-r3/`; frozen
+binary/config provenance and rawlogs under the campaign root. The two earlier
+45s labels never launched validators (invalidkilloffset, then inheritedgenesis
+OUT). Neither is a replay attempt. See [deterministic C1 design](c1-pending-parent-qualification-design-2026-09-18.md)
+for the stronger pending-parent test still needed.
