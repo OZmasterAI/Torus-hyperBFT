@@ -30,11 +30,11 @@ hashing or DA writes. No accepted stable baseline or hardware ceiling follows.
 
 | Stage | Current evidence | Remaining work |
 | --- | --- | --- |
-| 1. Body retrieval and recovery | Authenticated body/sync fixes plus view-bound header voting and corrected future-buffer accounting are committed and tested. One later restart drained and agreed; an earlier run replayed one block but stalled. | Identify the earlier stall's cause and complete healthy positive-replay/C1 qualification. |
+| 1. Body retrieval and recovery | Authenticated body/sync fixes plus view-bound header voting and corrected future-buffer accounting are committed and tested. One later restart drained and agreed; an earlier run replayed one block but stalled. | Identify the earlier stall's cause and complete healthy positive-replay/C1 qualification. Queued-response scheduling is tested, but its live OFF/ON pair both failed on late arrivals; outbound-stage attribution is next. |
 | 2. Healthy baseline | Corrected collection produced accepted current-runtime controls, but results vary. Five-minute 10- and 50-market controls both failed dissemination despite completed drain and agreement. | Three accepted repeats on the final selected runtime; diagnose longer-run body-fetch exhaustion. |
 | 3. Proposal construction | Historical hash-cache result remains 51,608.1 fills/s. Current DA OFF/ON and body-reuse screening did not establish a throughput gain. | Repeat hash comparison and any promising combination before promotion. |
-| 4. Largest remaining cost | Worker/cache screening found no confirmed overall gain. Sustained depth observations support revising cancellation grouping; new candidate passed source review. | Test and benchmark the revised cancellation path, including shallow and overflow cases, then measure live throughput and latency. |
-| 5. Sustained and varied load | Five-minute 10-market baseline/cache and 50-market baseline completed with depth observations. Cache arm accepted at 34,563.5 fills/s; both baselines failed dissemination. | Locality, deeper books, bursts and healthy matched-duration repeats. |
+| 4. Largest remaining cost | Worker/cache screening found no confirmed overall gain. Sustained depth observations support revising cancellation grouping; new candidate passed source review. | Revised cancellation passed 248 tests and an accepted five-minute live cell at 38,142.7 fills/s; the fresh control failed dissemination, so a healthy gain remains unproven. Integer-margin follow-up and finer pass-B attribution are tested and frozen; their live cells remain pending. |
+| 5. Sustained and varied load | Five-minute 10-market baseline/cache and 50-market baseline completed with depth observations. Cache arm accepted at 34,563.5 fills/s; both baselines failed dissemination. | Locality50/MPS3 completed at an accepted 33,233.1 fills/s. Deeper books, bursts and healthy matched-duration repeats remain. |
 | 6. Separate machines | Owner confirmed no remote hosts are available; continue on this machine only. | Cross-machine validation is unavailable and cannot be inferred from local results. |
 | 7. Architecture | Flush-pipeline recovery evidence, cancellation experiments and a default-off WAL-budget candidate are being assessed. | Promote only after deterministic state/recovery and repeated throughput evidence; no 200k claim. |
 
@@ -1007,3 +1007,16 @@ review found no blocker. The identified node is frozen in
 `artifacts/settle-passb-attribution` with SHA256
 `d14e0c7f10c64bbdef0b61dba09d7f1aa65d8b8aa193fb75e86a8239a909f4c9`.
 Live attribution is still pending; no performance improvement is claimed.
+
+
+The separate cancel-all integer-margin candidate is committed at `f2a7164` on
+`perf/cancel-margin-integer`, based on accepted queue-compaction `f890e06`.
+It hoists borrowed config lookup once per nonempty cancelled market and
+replaces scaled general division with exactly equivalent raw integer-leverage
+division. Per-order multiplication, tier selection, rounding, ordered addition,
+clamps and zero-leverage panic/mutation boundaries remain unchanged. Receipt
+`3a69134a` passed 47 arithmetic, real-StateDb oracle, matching and persistence
+tests plus a separate node build. Independent review found no blocker. The
+identified node is frozen in `artifacts/cancel-margin-integer`, SHA256
+`9d5072ae89c4709c0715e6dfddc4f02f9dadfadc02e191ea045a2fe1e305c327`.
+No microbenchmark or live performance gain has yet been measured for this step.
