@@ -385,7 +385,7 @@ is an immediate refusal. The live validator's real cmdline is a test fixture in
 break every later cell).
 
 `summary.json` gains a `crash` section and `headline.crash_gate`
-(`PASS` / `FAIL`, `null` on a cell that did not run the gate):
+(`PASS` / `FAIL` / `UNKNOWN`, `null` on a cell that did not run the gate):
 
 - `rewind_blocks` — `committed - applied` from the node's own replay line
   (`crash recovery: execution gap detected, replaying committed_height=… applied_height=… gap=…`);
@@ -409,9 +409,25 @@ quiescent digest, zero panic/fail-stop lines fleet-wide, and survivor counters
 that still match each other. A forked killed node therefore still FAILs, and
 the gate keeps its teeth independently of `agreement_verdict`.
 
+Set `CRASH_REQUIRE_REPLAY=1` to require a positive, consistent restart replay
+log gap and (when the pipeline is enabled) worker attachment at or above that
+committed tip. Default `0` retains legacy zero-rewind scoring. Missing or
+failed pre-kill scrapes now produce UNKNOWN instead of invented zero metrics.
+A five-second curl timeout is bounded and its partial response is not trusted.
+Strict replay is timing-dependent qualification; the kill is not atomic with
+the scrape and does not establish the C1 pending-parent crash window.
+
+There is no committed-versus-durable-applied gap wait: current metrics expose
+an execution handoff height and a process commit counter, not the durable
+marker pair. The killed node's counter reset still makes throughput liveness
+UNKNOWN, even when the separate crash verdict passes. See
+[strict replay qualification](../../docs/perf/strict-crash-replay-2026-09-18.md)
+for a short command, evidence requirements and remaining limitations.
+
 Artifacts: `crash-kill.json` (record at kill time), `crash-restart-tail.log`
 (everything the node logged after the restart), `crash.json` (the merged input
-to summarize.py).
+to summarize.py), plus `crash-pre-kill.json`, `crash-pre-kill-metrics.txt`
+and `crash-pre-kill-metrics.stderr` for the bounded scrape evidence.
 
 ## Liveness and benchmark acceptance
 

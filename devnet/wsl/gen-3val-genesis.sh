@@ -39,7 +39,9 @@ command -v jq >/dev/null || { echo "FATAL: jq not installed" >&2; exit 1; }
 # 1. Materialise the weighted 100k-account genesis (adds ~100k bulk senders).
 if [ "${FORCE:-0}" = 1 ] || [ ! -f "$FULL" ]; then
     echo "building weighted-full genesis (100k bulk senders)..."
-    BIN="$BIN" "$REPO/testnet/gen-weighted-genesis.sh"
+    # OUT belongs to this wrapper's final genesis, even when exported by the
+    # caller. The nested generator must materialise the separate weighted base.
+    BIN="$BIN" OUT="$FULL" "$REPO/testnet/gen-weighted-genesis.sh"
 else
     echo "reusing existing $FULL"
 fi
