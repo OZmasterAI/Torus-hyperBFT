@@ -2,6 +2,7 @@
 import math
 
 from health import MAX_SAMPLE_GAP_S, NODES
+from sampled_recovery import recovery_report
 
 COUNTERS = {
     'torus_native_actions_processed_total': 'processed_actions',
@@ -99,21 +100,26 @@ def accounting_counts(records, errors, phases):
     return counts, problems
 
 
-def scheduled_report(workload, observed, provenance, accounting, errors, rows):
+def scheduled_report(workload, observed, provenance, accounting, errors, rows, audit=(), audit_errors=()):
     if not provenance.get('required'):
         return None
     report = {'valid': False, 'problems': [], 'phases': [],
               'note': 'Node rates use sampled counter endpoints without interpolation; replicas are separate. '
                       'HTTP attempts are not server admission, ACK cohorts may finish in later phases, '
                       'and phase execution may process earlier submissions. Matched units are fill records.',
-              'recovery': {'status': 'not_evaluated',
-                           'reason': 'Per-phase backlog is descriptive; final drain does not prove recovery within a zero-rate phase.'}}
+              'recovery': {'status': 'unverified', 'phases': [], 'reason': 'schedule provenance unverified'}}
     if not provenance.get('valid'):
         report['problems'] = ['schedule provenance unverified']
         return report
     phases = workload['rate_schedule']
     counts, problems = accounting_counts(accounting, errors, phases)
     report['problems'].extend(problems)
+    recovery_errors = list(audit_errors)
+    if problems:
+        recovery_errors.append('scheduled submission accounting unverified')
+    report['recovery'] = recovery_report(phases, observed, rows, audit, recovery_errors)
+    if report['recovery']['status'] == 'unverified':
+        report['problems'].append('within-phase recovery evidence unverified')
     for i, (phase, boundary) in enumerate(zip(phases, observed)):
         duration = phase['end_s'] - phase['start_s']
         lo, hi = boundary['planned_unix_s'], boundary['planned_unix_s'] + duration

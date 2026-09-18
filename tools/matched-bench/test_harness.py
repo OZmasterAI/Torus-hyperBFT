@@ -388,7 +388,7 @@ class SummarizeTest(unittest.TestCase):
         s, _ = run_summarize(self.d, extra=["--bench-cmd", command])
         self.assertEqual(s["validity"], before)
         self.assertEqual(s["scheduled_evidence"]["phases"][0]["generator"]["acked_actions"], 3)
-        self.assertEqual(s["scheduled_evidence"]["recovery"]["status"], "not_evaluated")
+        self.assertEqual(s["scheduled_evidence"]["recovery"]["status"], "unverified")
         with open(os.path.join(self.d, "bench.log"), "a") as f:
             f.write("RATE_SCHEDULE_ACCOUNTING {truncated\n")
         s, _ = run_summarize(self.d, extra=["--bench-cmd", command])

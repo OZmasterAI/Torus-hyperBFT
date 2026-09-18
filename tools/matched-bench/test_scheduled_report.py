@@ -6,7 +6,7 @@ from workload import parse_workload, schedule_provenance
 
 
 def sample(ts, value=0):
-    return dict(ts=ts, scrape_valid=1,
+    return dict(ts=ts, scrape_valid=1, torus_orders_resting_total=0,
                 **{k: value for k in COUNTERS}, **{k: 0 for k in GAUGES})
 
 
@@ -24,7 +24,11 @@ class ScheduledReportTests(unittest.TestCase):
         accounting = [dict(schema=1, phases=counts, complete=True, observed_elapsed_s=22)]
         rows = {node: [sample(t, (t-1000)*factor) for t in range(1000, 1021)]
                 for node, factor in [('val0', 1), ('val1', 2), ('val2', 3)]}
-        return workload, observed, provenance, accounting, [], rows
+        audit = [dict(node=node, ts=r['ts'], started_wall=r['ts'], completed_wall=r['ts']+.1,
+                      started_monotonic=r['ts']-900, completed_monotonic=r['ts']-900+.1,
+                      request_seconds=.1, scrape_valid=1, curl_returncode=0, error=None)
+                 for node, samples in rows.items() for r in samples]
+        return workload, observed, provenance, accounting, [], rows, audit, []
 
     def test_cohorts_and_replicas_remain_separate(self):
         result = scheduled_report(*self.fixture())
@@ -35,7 +39,7 @@ class ScheduledReportTests(unittest.TestCase):
         self.assertEqual(first['nodes']['val0']['rates']['matched_fill_records']['per_second'], 1)
         self.assertEqual(first['nodes']['val2']['rates']['matched_fill_records']['per_second'], 3)
         self.assertEqual(pause['generator']['http_started_actions_s'], 0)
-        self.assertEqual(result['recovery']['status'], 'not_evaluated')
+        self.assertEqual(result['recovery']['status'], 'not_observed_before_phase_end')
 
     def test_missing_duplicate_malformed_and_unsettled_accounting(self):
         for mutation in ('missing', 'duplicate', 'negative', 'unsettled', 'abandoned', 'inconsistent', 'zero_starts', 'impossible_actions'):
@@ -52,7 +56,9 @@ class ScheduledReportTests(unittest.TestCase):
                 record['phases'][0]['queued_requests'] += 1
                 record['phases'][0]['outstanding_requests' if mutation == 'unsettled' else 'abandoned_requests'] += 1
             with self.subTest(mutation=mutation):
-                self.assertFalse(scheduled_report(*args)['valid'])
+                result = scheduled_report(*args)
+                self.assertFalse(result['valid'])
+                self.assertEqual(result['recovery']['status'], 'unverified')
 
     def test_no_interpolation_and_actual_sample_span(self):
         result = node_window([sample(t, t) for t in range(1001, 1010)], 1000, 1010)

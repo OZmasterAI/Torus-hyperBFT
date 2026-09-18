@@ -79,11 +79,33 @@ rates, not end-to-end cohort latencies. A valid report proves neither achievemen
 of the requested rate nor a throughput improvement.
 
 The existing whole-cell acceptance checks are unchanged: this descriptive report
-cannot upgrade a rejection. Recovery certification is deferred and explicitly
-reported as `not_evaluated`; a zero-rate phase shows observed backlog but does not
-claim sustained quiet recovery, and final drain cannot establish recovery before
-that phase ended. Stage 5 comparisons require valid phase evidence in addition
-to the existing accepted-cell checks.
+cannot upgrade a rejection. `scheduled_evidence.recovery` evaluates explicit
+zero-rate phases using the independent collector's `sampler-diagnostics.jsonl`.
+CSV rows must match unique audit records; missing/ambiguous audits, invalid
+metrics, counter resets, sample gaps over five seconds, or wall/monotonic clock
+offset changes above 50ms make recovery `unverified`. Older collectors without
+the audit remain resummarizable but cannot establish this recovery claim.
+Incomplete or invalid scheduled submission accounting also leaves recovery
+unverified, even when node counters look quiet.
+
+Each validator must have unchanged placed/matched/processed/resting counters,
+empty mempool and flush worker, and execution queue <=2. Real observations form
+a conservative interval from the first response completion to the latest
+request start. The three intervals must overlap for at least ten monotonic
+seconds, with actual commit growth on every validator between observations
+wholly inside that overlap. The report processes actual completion events; it
+does not repeat stale samples, extend another node's evidence to the current
+time, or use later observations to backdate confirmation. All supporting
+requests and confirmation must finish strictly before the phase ends.
+
+Results are `observed`, `not_observed_before_phase_end` (censored), or
+`unverified`, with supporting per-node records and confirmation delay. No zero
+phases means `not_applicable`. Renewed activity after the first observed interval
+is explicit; an observed interval does not prove permanent drainage or absence
+of outstanding network requests. Final drain cannot establish earlier phase
+recovery. Stage 5 comparisons require valid phase evidence and appropriate
+recovery results in addition to the existing accepted-cell checks; neither
+proves that the preceding requested burst was actually achieved.
 
 For example, a proposed deep-book burst cell (not a measured result):
 

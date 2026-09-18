@@ -17,6 +17,7 @@ import argparse, csv, json, os, statistics, sys, time
 from health import assess_liveness, acceptance, DEFAULT_STALL_S
 from workload import schedule_provenance
 from scheduled_report import scheduled_report
+from sampled_recovery import read_audit
 
 ap = argparse.ArgumentParser()
 for a in ["out", "label", "worktree", "commit", "dirty", "markets", "dur", "rate", "senders",
@@ -955,8 +956,11 @@ validity = acceptance(liveness, drained, int(A.bench_rc or -1),
                       dissem.get('dissemination_clean'), crash)
 schedule_evidence = schedule_provenance(WORKLOAD, RATE_PHASES, RATE_PHASE_ERRORS,
                                        A.bench_cmd, int(A.dur or 0))
+recovery_audit, recovery_audit_errors = (read_audit(os.path.join(OUT, "sampler-diagnostics.jsonl"))
+    if schedule_evidence['required'] else ([], []))
 scheduled_evidence = scheduled_report(WORKLOAD, RATE_PHASES, schedule_evidence,
-                                      RATE_ACCOUNTING, RATE_ACCOUNTING_ERRORS, rows)
+                                      RATE_ACCOUNTING, RATE_ACCOUNTING_ERRORS, rows,
+                                      recovery_audit, recovery_audit_errors)
 if schedule_evidence['required'] and not schedule_evidence['valid']:
     validity['accepted'] = False
     validity['unverified_reasons'].append('rate schedule provenance unverified')
