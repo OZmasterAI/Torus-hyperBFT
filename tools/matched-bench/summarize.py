@@ -15,6 +15,7 @@ negative and the percentages past 100 %.
 """
 import argparse, csv, json, os, statistics, sys, time
 from health import assess_liveness, acceptance, DEFAULT_STALL_S
+from wal_budget import provenance as wal_budget_provenance
 
 ap = argparse.ArgumentParser()
 for a in ["out", "label", "worktree", "commit", "dirty", "markets", "dur", "rate", "senders",
@@ -938,6 +939,7 @@ summary = {
              "block_cap": int(A.block_cap) if A.block_cap else None,
              "markets_per_sender": int(A.markets_per_sender) if A.markets_per_sender else None,
              "extra_env": A.extra_env, "node_env": NODE_ENV,
+             "wal_budget": wal_budget_provenance(NODE_ENV),
              "env_digests_per_node": A.env_digests.split(), "bench_cmd": A.bench_cmd, "node_pids": A.pids.split()},
     "timing": {"t_bench0": t0, "t_bench1": t1, "t_drain": td, "bench_wall_s": t1 - t0, "drain_s": td - t1,
                "drained": drained, "drained_reported": A.drained == "1", "drain_timeout_s": int(A.drain_timeout) if A.drain_timeout else None,

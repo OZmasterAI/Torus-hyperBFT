@@ -15,7 +15,15 @@ if [ -f "$RUN_DIR/pids" ] && xargs -a "$RUN_DIR/pids" -r -I{} kill -0 {} 2>/dev/
     exit 1
 fi
 
-if [ "${CLEAN:-0}" = 1 ]; then
+if [ "${FRESH_ONLY:-0}" = 1 ]; then
+    # Atomically claim a new data directory; never enter the cleanup path,
+    # even if a caller also sets CLEAN=1. A preflight check alone has a race.
+    mkdir -p "$DATA_ROOT"
+    mkdir "$DATA_ROOT/data" || {
+        echo "FATAL: FRESH_ONLY requires a new DATA_ROOT/data path; existing data was not touched" >&2
+        exit 1
+    }
+elif [ "${CLEAN:-0}" = 1 ]; then
     echo "CLEAN=1 — wiping data dirs for fresh genesis init"
     rm -rf "$DATA_ROOT/data"
 fi

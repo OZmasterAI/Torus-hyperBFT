@@ -163,6 +163,7 @@ RUN_DIR="$DATA_ROOT/run"
 # RocksDB write-scheduling option (WAL and memtable writers overlap), no
 # durability change. Control = EXTRA_ENV='TORUS_ROCKSDB_PIPELINED_WRITE=0'.
 RECORD_ENV=(
+    TORUS_ROCKSDB_MAX_TOTAL_WAL_MB=0
     TORUS_ROCKSDB_PIPELINED_WRITE=1
     TORUS_BOOK_ROWS=3
     TORUS_RESIDENT_BOOKS=1
@@ -298,6 +299,15 @@ if [ -n "$CRASH_KILL_AT_S" ]; then
         echo "FATAL: CRASH_KILL_AT_S=$CRASH_KILL_AT_S is not inside the load window of a ${DUR}s cell (need >= 10 and <= $((DUR-30)); killing during the drain hangs the agreement probe)" >&2; exit 2; }
 fi
 
+# WAL-budget treatment is restricted to future fresh databases. Preflight
+# before staging/cleanup/launch; EXTRA_ENV has the same last-value precedence
+# as the node environment below. An inherited TORUS_* setting is ignored.
+WAL_BUDGET_MIB=0
+for kv in $EXTRA_ENV; do
+    case "$kv" in TORUS_ROCKSDB_MAX_TOTAL_WAL_MB=*) WAL_BUDGET_MIB=${kv#*=} ;; esac
+done
+WAL_BUDGET_MIB=$(python3 "$SELF_DIR/wal_budget.py" "$WAL_BUDGET_MIB" "$DATA_ROOT/data") || exit 2
+
 if pgrep -f "bench-throughput consensus" >/dev/null; then echo "FATAL: a bench is already running" >&2; exit 1; fi
 if pgrep -f "cargo build" >/dev/null; then echo "FATAL: a cargo build is running — never bench while building" >&2; exit 1; fi
 if [ -f "$RUN_DIR/pids" ] && xargs -a "$RUN_DIR/pids" -r -I{} kill -0 {} 2>/dev/null; then
@@ -367,6 +377,7 @@ for v in $(env | grep -oE '^TORUS_[A-Za-z0-9_]+'); do unset "$v"; done
 for kv in "${RECORD_ENV[@]}"; do export "$kv"; done
 for kv in "${BLOCK_CAP_ENV[@]}"; do export "$kv"; done
 for kv in $EXTRA_ENV; do export "$kv"; done
+export TORUS_ROCKSDB_MAX_TOTAL_WAL_MB="$WAL_BUDGET_MIB"
 # HOTSTUFF_CPUS is a HARNESS knob (taskset, not read by the node) but is logged
 # alongside the node env so a pinned cell is recognisable from its summary.
 # Any TORUS_* var in EXTRA_ENV (e.g. TORUS_ROCKSDB_STATS=2) is already covered.
@@ -374,7 +385,13 @@ for kv in $EXTRA_ENV; do export "$kv"; done
 NODE_ENV_JSON=$(env | grep -E '^(TORUS_|HOTSTUFF_CPUS=)' | sort | python3 -c 'import sys,json;print(json.dumps(dict(l.rstrip("\n").split("=",1) for l in sys.stdin)))')
 log "node env: $NODE_ENV_JSON"
 T_LAUNCH=$(date +%s)
-CLEAN=1 "$WSL/launch-3val.sh" >>"$OUT/run.log" 2>&1 || die "launch-3val.sh failed"
+if [ "$WAL_BUDGET_MIB" != 0 ]; then
+    # The launcher atomically claims the path, closing the preflight/launch
+    # race without ever executing its cleanup branch for this experiment.
+    FRESH_ONLY=1 CLEAN=0 "$WSL/launch-3val.sh" >>"$OUT/run.log" 2>&1 || die "fresh launch-3val.sh failed"
+else
+    CLEAN=1 "$WSL/launch-3val.sh" >>"$OUT/run.log" 2>&1 || die "launch-3val.sh failed"
+fi
 sleep 2
 mapfile -t PIDS < "$RUN_DIR/pids"
 log "node pids: ${PIDS[*]}"
