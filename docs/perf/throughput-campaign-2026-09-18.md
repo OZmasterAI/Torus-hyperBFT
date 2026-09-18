@@ -992,3 +992,18 @@ and send-request initiation. The network loop's biased preference for commands
 also leaves actual swarm polling/codec/delivery unresolved after initiation;
 source alone does not prove starvation. Completed OFF/ON databases occupied
 19.10/29.28 GiB and were inventoried and cleaned; all evidence remains.
+
+
+### Finer settlement attribution qualified
+
+Runtime `c43909f` on `diag/settle-passb-attribution` adds the default-off
+`TORUS_SETTLE_PASSB_DIAG=1` diagnostic: disjoint position-merge, balance-apply
+and trade-routing spans, residual validity and actual work counts. Planned
+sender concentration is inventoried outside the existing pass-B timer; it is
+not successful work or CPU share. Receipt `e56bcce8` passed five actual-loop
+OFF/ON fixtures and sixteen parallel-engine/settlement integration tests, plus
+a separate node build after cleaning alternate-worktree packages. Independent
+review found no blocker. The identified node is frozen in
+`artifacts/settle-passb-attribution` with SHA256
+`d14e0c7f10c64bbdef0b61dba09d7f1aa65d8b8aa193fb75e86a8239a909f4c9`.
+Live attribution is still pending; no performance improvement is claimed.
