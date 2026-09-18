@@ -58,8 +58,32 @@ Late queued HTTP tasks are skipped at their first poll, while in-flight requests
 may complete. Scheduled first-round spacing also replaces the legacy random
 jitter draw, so use the same declared schedule for scheduled A/B comparisons;
 scalar and scheduled action streams are not byte-identical.
-Phase-specific throughput/recovery analysis remains separate from
-the existing whole-cell acceptance checks.
+`RATE_SCHEDULE_ACCOUNTING` records HTTP-start requests/actions, ACKed actions,
+response errors, expired-task skips and unfinished/abandoned requests per phase.
+ACKs belong to the phase where their request started, even if they complete later.
+HTTP starts are attempted submissions, not proof of server admission; a transport
+error does not prove rejection. Once senders finish, scheduled runs wait at most
+12 seconds for queued HTTP tasks; remaining requests keep accounting incomplete.
+Unscheduled runs retain their existing two-second grace and action/RNG behavior.
+
+`summary.scheduled_evidence` separately reports these cohorts and each validator's
+sampled processed actions/s, accepted placements/s, matched **fill records/s**,
+commits/s and first/peak/last mempool, execution and flush backlog. Boundaries use
+the generator's nominal Unix phase start, not the shell process-launch timestamp.
+Actual sample endpoints/span and uncovered edges remain visible; no interpolation
+or replica sums are used. Missing metrics, gaps over five seconds, resets or
+incomplete accounting make this report invalid. Old scheduled generators without
+the accounting record remain resummarizable with explicitly incomplete evidence.
+Phase execution can process earlier submissions; these are wall-window output
+rates, not end-to-end cohort latencies. A valid report proves neither achievement
+of the requested rate nor a throughput improvement.
+
+The existing whole-cell acceptance checks are unchanged: this descriptive report
+cannot upgrade a rejection. Recovery certification is deferred and explicitly
+reported as `not_evaluated`; a zero-rate phase shows observed backlog but does not
+claim sustained quiet recovery, and final drain cannot establish recovery before
+that phase ended. Stage 5 comparisons require valid phase evidence in addition
+to the existing accepted-cell checks.
 
 For example, a proposed deep-book burst cell (not a measured result):
 

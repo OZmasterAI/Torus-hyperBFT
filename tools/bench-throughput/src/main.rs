@@ -9,6 +9,7 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use tokio::sync::Semaphore;
 mod rate_schedule;
+mod rate_accounting;
 
 use torus_types::{
     eip712::{sign_native_action, sign_native_action_with_session},
@@ -1598,7 +1599,7 @@ async fn submit_payloads(
     req_id: u64,
     bin: bool,
     submitted: &AtomicU64,
-) {
+) -> Option<usize> {
     let result = if payloads.len() == 1 && !bin {
         submit_native_action(client, url, &payloads[0], req_id)
             .await
@@ -1609,6 +1610,7 @@ async fn submit_payloads(
     match result {
         Ok(accepted) => {
             submitted.fetch_add(accepted as u64, Ordering::Relaxed);
+            Some(accepted)
         }
         // Surface the first few rejection reasons instead of silently dropping —
         // a bench that reports 0 with no reason is how saturated/rejected runs get
@@ -1617,6 +1619,7 @@ async fn submit_payloads(
             if SUBMIT_ERRS.fetch_add(1, Ordering::Relaxed) < 5 {
                 eprintln!("[submit] {e}");
             }
+            None
         }
     }
 }
@@ -2216,6 +2219,33 @@ mod scheduled_dispatch_tests {
         assert_eq!(semaphore.available_permits(), 1);
         assert!(submit_before_deadline(Instant::now() + Duration::from_secs(60), async {}).await);
     }
+
+    #[tokio::test]
+    async fn scheduled_accounting_checks_task_entry_and_tracks_late_ack_cohort() {
+        let accounting = rate_accounting::Accounting::new(2);
+        let mut expired = accounting.queue(0, 3);
+        let submit = async { expired.start(); expired.finish(Some(3)); };
+        if !submit_before_deadline(Instant::now(), submit).await { expired.skip(); }
+        let mut live = accounting.queue(0, 4);
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            submit_before_deadline(Instant::now() + Duration::from_secs(60), async {
+                live.start();
+                ack_rx.await.unwrap();
+                live.finish(Some(2));
+            }).await
+        });
+        // Another phase can finish before the first phase's ACK arrives.
+        accounting.queue(1, 1).skip();
+        ack_tx.send(()).unwrap();
+        assert!(task.await.unwrap());
+        let counts = accounting.snapshot();
+        assert_eq!(counts[0].http_started_actions, 4);
+        assert_eq!(counts[0].acked_actions, 2);
+        assert_eq!(counts[0].skipped_expired_actions, 3);
+        assert_eq!(counts[1].acked_actions, 0);
+        assert!(counts.iter().all(|c| c.outstanding_requests == 0));
+    }
 }
 
 async fn scheduled_slot(
@@ -2449,6 +2479,8 @@ async fn run_consensus(
 
     let submitted = Arc::new(AtomicU64::new(0));
     let scheduled_late_actions = Arc::new(AtomicU64::new(0));
+    let scheduled_accounting = rate_schedule.as_ref()
+        .map(|s| rate_accounting::Accounting::new(s.phases.len()));
 
     // Ammo strategy. Pre-sign stamps every nonce up front (now + window/2); if
     // signing ALL of it outlasts the nonce window the ammo is "too old" on arrival
@@ -2732,6 +2764,7 @@ async fn run_consensus(
         let mut scheduled_pacer = rate_schedule.as_ref().map(|schedule|
             rate_schedule::Pacer::new(schedule.clone(), sender_idx, num_senders, submit_batch));
         let scheduled_late_actions = rate_schedule.as_ref().map(|_| scheduled_late_actions.clone());
+        let scheduled_accounting = scheduled_accounting.clone();
         let sender_ammo = if !stream {
             std::mem::take(&mut ammo[sender_idx])
         } else {
@@ -2817,7 +2850,7 @@ async fn run_consensus(
                         Err(_) => break, // signer panicked — stop this sender
                     };
                     let http_deadline = scheduled_permit.as_ref().map(|(_, phase)|
-                        start_time + scheduled_pacer.as_ref().unwrap().phase_end(*phase));
+                        (start_time + scheduled_pacer.as_ref().unwrap().phase_end(*phase), *phase));
                     let permit = if let Some((permit, phase)) = scheduled_permit {
                         let pacer = scheduled_pacer.as_mut().unwrap();
                         if pacer.poll(start_time.elapsed()) != rate_schedule::Step::Ready(phase) {
@@ -2837,12 +2870,18 @@ async fn run_consensus(
                     req_id += 1;
                     let client = client.clone();
                     let submitted = submitted.clone();
-                    if let Some(deadline) = http_deadline {
+                    if let Some((deadline, phase)) = http_deadline {
                         let late_actions = scheduled_late_actions.as_ref().unwrap().clone();
+                        let mut ticket = scheduled_accounting.as_ref().unwrap().queue(phase, payloads.len());
                         tokio::spawn(async move {
                             let _permit = permit;
-                            let submit = submit_payloads(&client, &url, &payloads, req_id, bin, &submitted);
+                            let submit = async {
+                                ticket.start();
+                                let accepted = submit_payloads(&client, &url, &payloads, req_id, bin, &submitted).await;
+                                ticket.finish(accepted);
+                            };
                             if !submit_before_deadline(deadline, submit).await {
+                                ticket.skip();
                                 late_actions.fetch_add(payloads.len() as u64, Ordering::Relaxed);
                             }
                         });
@@ -2981,8 +3020,22 @@ async fn run_consensus(
     }
     if let Some(reporter) = schedule_reporter { let _ = reporter.await; }
 
-    // Wait for remaining in-flight requests to drain
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Scheduled cohorts need bounded completion evidence, including HTTP tasks
+    // not yet polled. Legacy unscheduled timing remains exactly unchanged.
+    if let Some(accounting) = &scheduled_accounting {
+        accounting.wait(Duration::from_secs(12)).await;
+        let counts = accounting.snapshot();
+        let complete = counts.iter().all(|c| c.outstanding_requests == 0 && c.abandoned_requests == 0);
+        println!("RATE_SCHEDULE_ACCOUNTING {}", serde_json::json!({
+            "schema": 1, "phases": counts, "complete": complete,
+            "observed_elapsed_s": start_time.elapsed().as_secs_f64(),
+            "completion_wait_budget_s": 12,
+            "cohort": "HTTP start phase; ACK may complete later",
+            "errors": "response/transport errors do not prove non-admission"
+        }));
+    } else {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
     monitor_handle.abort();
     if rate_schedule.is_some() {
         println!("RATE_SCHEDULE_LATE_ACTIONS_SKIPPED {}", scheduled_late_actions.load(Ordering::Relaxed));

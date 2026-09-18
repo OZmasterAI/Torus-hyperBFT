@@ -344,6 +344,7 @@ class SummarizeTest(unittest.TestCase):
         self.assertIsNone(s["cell"]["markets_per_sender"])
         self.assertIsNone(s["cell"]["workload"])
         self.assertEqual(s["cell"]["rate_schedule_observed"], [])
+        self.assertIsNone(s["scheduled_evidence"])
 
     def test_workload_and_observed_phase_provenance_survive_resummarizing(self):
         from workload import parse_workload
@@ -374,6 +375,25 @@ class SummarizeTest(unittest.TestCase):
         s, _ = run_summarize(self.d, extra=["--bench-cmd", command])
         self.assertTrue(s["cell"]["rate_schedule_provenance"]["valid"])
         self.assertNotIn("rate schedule provenance unverified", s["validity"]["unverified_reasons"])
+        # New descriptive evidence never upgrades or relaxes existing gates.
+        before = s["validity"]
+        self.assertFalse(s["scheduled_evidence"]["valid"])
+        from scheduled_report import COUNT_FIELDS
+        counts = [{k: 0 for k in COUNT_FIELDS} for _ in workload["rate_schedule"]]
+        counts[0].update(queued_requests=1, http_started_requests=1, http_started_actions=4,
+                         completed_requests=1, completed_actions=4, acked_actions=3)
+        accounting = dict(schema=1, phases=counts, complete=True, observed_elapsed_s=301)
+        with open(os.path.join(self.d, "bench.log"), "a") as f:
+            f.write("RATE_SCHEDULE_ACCOUNTING " + json.dumps(accounting) + "\n")
+        s, _ = run_summarize(self.d, extra=["--bench-cmd", command])
+        self.assertEqual(s["validity"], before)
+        self.assertEqual(s["scheduled_evidence"]["phases"][0]["generator"]["acked_actions"], 3)
+        self.assertEqual(s["scheduled_evidence"]["recovery"]["status"], "not_evaluated")
+        with open(os.path.join(self.d, "bench.log"), "a") as f:
+            f.write("RATE_SCHEDULE_ACCOUNTING {truncated\n")
+        s, _ = run_summarize(self.d, extra=["--bench-cmd", command])
+        self.assertEqual(s["validity"], before)
+        self.assertFalse(s["scheduled_evidence"]["valid"])
 
     # --- bl4: metrics-after is one scrape, the 3 digests are concurrent ---
     # torus_native_actions_processed_total keeps ticking between them, so a

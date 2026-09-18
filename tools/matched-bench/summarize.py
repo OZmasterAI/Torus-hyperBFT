@@ -16,6 +16,7 @@ negative and the percentages past 100 %.
 import argparse, csv, json, os, statistics, sys, time
 from health import assess_liveness, acceptance, DEFAULT_STALL_S
 from workload import schedule_provenance
+from scheduled_report import scheduled_report
 
 ap = argparse.ArgumentParser()
 for a in ["out", "label", "worktree", "commit", "dirty", "markets", "dur", "rate", "senders",
@@ -36,6 +37,8 @@ if os.path.exists(workload_path):
         WORKLOAD = json.load(f)
 RATE_PHASES = []
 RATE_PHASE_ERRORS = []
+RATE_ACCOUNTING = []
+RATE_ACCOUNTING_ERRORS = []
 bench_log = os.path.join(OUT, "bench.log")
 if WORKLOAD and WORKLOAD.get("rate_schedule") and os.path.exists(bench_log):
     with open(bench_log, errors="replace") as f:
@@ -45,6 +48,11 @@ if WORKLOAD and WORKLOAD.get("rate_schedule") and os.path.exists(bench_log):
                     RATE_PHASES.append(json.loads(line[len("RATE_SCHEDULE_PHASE "):]))
                 except ValueError:
                     RATE_PHASE_ERRORS.append({"line": line_number, "error": "invalid phase JSON"})
+            elif line.startswith("RATE_SCHEDULE_ACCOUNTING "):
+                try:
+                    RATE_ACCOUNTING.append(json.loads(line[len("RATE_SCHEDULE_ACCOUNTING "):]))
+                except ValueError:
+                    RATE_ACCOUNTING_ERRORS.append(f"invalid accounting JSON at line {line_number}")
 
 # ---------------------------------------------------------------- load sampler
 rows = {"val0": [], "val1": [], "val2": []}
@@ -947,6 +955,8 @@ validity = acceptance(liveness, drained, int(A.bench_rc or -1),
                       dissem.get('dissemination_clean'), crash)
 schedule_evidence = schedule_provenance(WORKLOAD, RATE_PHASES, RATE_PHASE_ERRORS,
                                        A.bench_cmd, int(A.dur or 0))
+scheduled_evidence = scheduled_report(WORKLOAD, RATE_PHASES, schedule_evidence,
+                                      RATE_ACCOUNTING, RATE_ACCOUNTING_ERRORS, rows)
 if schedule_evidence['required'] and not schedule_evidence['valid']:
     validity['accepted'] = False
     validity['unverified_reasons'].append('rate schedule provenance unverified')
@@ -1013,7 +1023,8 @@ summary = {
     "ingest": {"bench_submitted_actions": int(A.bench_submitted or 0),
                "val0_actions_processed": int(v0.get("delta_native_actions_processed_total", 0)),
                "mempool_nonce_expired_evictions_per_node": [int(x) for x in A.evicted.split()],
-               "note": "NONCE_WINDOW_MS=60s: backlog older than 60 s is evicted silently; submitted-processed gap = expiry"},
+               "note": "Submitted counts ACKed actions; processed counts execution-eligible actions. Differences can include pending work, expiry, replay filtering, and observation boundaries; the gap alone does not identify a cause."},
+    "scheduled_evidence": scheduled_evidence,
     "funnel_by_node": funnel,
     "phase_by_node": phase,
     "consensus_by_node": consensus,
