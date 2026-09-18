@@ -28,15 +28,15 @@ hashing or DA writes. No accepted stable baseline or hardware ceiling follows.
 
 ## Seven stages
 
-| Stage | Work and evidence needed | Status at report creation |
+| Stage | Current evidence | Remaining work |
 | --- | --- | --- |
-| 1. Body retrieval and sync | Trace missing body/QC ancestry, reproduce demonstrated failure paths, preserve certificate/validation checks, test bounded recovery and collect a fresh live result. | Retained stall diagnosed only to retrieval/recovery; runtime fixes are under development/review. Initial live cause and successful recovery are not established here. |
-| 2. Healthy cap 200 baseline | Freeze node, generator, genesis, configuration and scorer; repeat the same 120s/10-market/cap 200 shape at least three times with full acceptance. Retain failed attempts. | All four retained cells rejected. Fresh baseline work is in progress; no result incorporated yet. |
-| 3. Proposal construction | Measure and A/B cached action hashes; avoid duplicate DA writes only if body availability and durability obligations remain satisfied. | Hash-cache work is under development. Duplicate DA write removal is a conditional candidate, not an implemented or measured gain. |
-| 4. Largest remaining cost | Remeasure load and steady windows after accepted stage-3 changes; select the largest limiting stage with queues, work counts and CPU/I/O evidence. | Proposed. Sustained cancellation, settlement pass B/cache flush, root maintenance and DB writes are candidates, not current proven bottlenecks. |
-| 5. Sustained and varied load | Longer runs, larger books, 10/100/300 markets, explicit locality, bursts and recovery; retain actual load shape and all acceptance evidence. | Proposed; historical results are not fresh campaign acceptance. |
-| 6. Separate machines | Compare the accepted configuration with one validator per host and independently provisioned load generation; record hardware, network and storage. | Host/access details have been requested; no response received as of report creation. No remote runs performed. |
-| 7. Architecture | Choose worker, persistence or execution experiments from the measured limiting stage; prove deterministic state and recovery before accepting speed. | Conditional roadmap only. No claim that new sharding or a particular hardware size is necessary or sufficient for 200k. |
+| 1. Body retrieval and recovery | Authenticated body/sync fixes plus view-bound header voting and corrected future-buffer accounting are committed and tested. One later restart drained and agreed; an earlier run replayed one block but stalled. | Identify the earlier stall's cause and complete healthy positive-replay/C1 qualification. |
+| 2. Healthy baseline | One accepted recovery control at 49,242.8 fills/s; a second was UNVERIFIED because of a sampling gap. | Three accepted repeats on the final frozen runtime; latest view fixes have no full baseline cell yet. |
+| 3. Proposal construction | One accepted hash-cache candidate at 51,608.1 fills/s, with lower construction time but larger backlog. Default-off DA reuse and finer timers are tested and frozen. | Repeated hash comparison and same-binary DA OFF/ON cells before promotion. |
+| 4. Largest remaining cost | Execution/flush timing and growing cancellation cost motivate a bounded cancellation candidate; local mechanism gains repeated. | Resolve gated-path fallback regressions/control noise, then measure live eligibility and matched-rate/latency A/Bs. |
+| 5. Sustained and varied load | Balanced locality generator, workload manifests and burst schedules passed tests. | Depth preparation, phase scoring, and fresh sustained/deep/multimarket/burst runs. |
+| 6. Separate machines | Host/access details requested; no remote actions performed. | One validator per host and independent load generation with declared hardware/network/storage. |
+| 7. Architecture | Flush-pipeline recovery evidence, cancellation experiments and a default-off WAL-budget candidate are being assessed. | Promote only after deterministic state/recovery and repeated throughput evidence; no 200k claim. |
 
 Stages 3–7 do not replace stage-1/2 acceptance. A passing regression test proves
 its exercised behavior; it does not prove that the retained live stall is fixed.
@@ -323,9 +323,9 @@ All 92 HotStuff library tests and a separate node-only release build passed
 the cause of the retained stall. Frozen node SHA256:
 `0c45c479bdeac981f48aa0f016d99d3e8d42376c131fc1400f1c49b0a02bcdd7`.
 The unchanged generator is retained. `s60-viewbound-replay45-r1` used
-`TORUS_WEDGE_DIAG=1`, nominal45s/actual60s, and kill+15s. It completed drain
-in57s with final AGREE and clean dissemination. No replay gap occurred
-(worker attached at586, pre-kill execution/flush queues both0), so its strict
+`TORUS_WEDGE_DIAG=1`, nominal 45 s / actual 60 s, and kill at +15 s. It completed drain
+in 57 s with final AGREE and clean dissemination. No replay gap occurred
+(worker attached at 586, pre-kill execution/flush queues both 0), so its strict
 crash verdict is FAIL and overall verdict REJECT. Liveness is UNKNOWN after
 the restart counter reset. This is observed healthy restart/drain in one run,
 not positive-replay qualification, proof of the older stall's cause, or an
@@ -333,19 +333,81 @@ accepted throughput comparison. The pipeline remains default OFF.
 
 The cancellation mechanism experiment now has two independent fixture-seed
 runs: five deep levels with 16 middle targets per level gave paired baseline/
-forced-grouping medians 1.648/1.721 at depth8192 and 1.971/1.957 at depth32768.
+forced-grouping medians 1.648/1.721 at depth 8192 and 1.971/1.957 at depth 32768.
 Identical-code controls were near parity in those cases; sparse one-order-per-
 level controls remained skewed and inconclusive. A bounded allocation-free
 multilevel gate is isolated on `perf/cancel-level-compaction`, with 11 passing
-differential tests (receipt `68ec19a1-b0b6-4b67-90b2-c6735d8e6e2d`). Its actual
-gated-path timing and whole-chain acceptance remain pending. These microbench
-ratios are not matched-throughput gains.
+differential tests (receipt `68ec19a1-b0b6-4b67-90b2-c6735d8e6e2d`). Actual gated-path timing subsequently found a dispersed-layout regression;
+the refinement below reduced that issue but did not earn acceptance. Whole-chain
+validation remains pending. These microbench ratios are not matched-throughput gains.
 
 
-After retaining the second short recovery cell, free space is about13GiB.
+After retaining the second short recovery cell, free space is about 13 GiB.
 The live-run capacity guard now prevents further cells. No campaign database
 has been deleted or flushed. A separate default-off WAL-budget candidate for
-newly created databases is being prepared; it cannot reclaim existing retained
-data and its soft flush trigger is not a guaranteed disk bound. Larger repeat
+newly created databases is verified and frozen; it cannot reclaim existing
+retained data and its soft flush trigger is not a guaranteed disk bound. Larger repeat
 and varied-load matrices remain pending storage capacity/retention and remote
 host details.
+
+
+## Fresh-database WAL budget
+
+Commit `b0a57ce` on `perf/wal-budget` adds the optional
+`TORUS_ROCKSDB_MAX_TOTAL_WAL_MB` setting on top of runtime `b60097a`.
+Unset/zero preserves RocksDB's automatic policy. A positive value triggers
+ordinary flushing of column families that retain old WAL files; it does not
+disable WAL or change atomic state/marker batches or fsync policy. More flushes
+could increase compaction and latency, so no throughput benefit is claimed.
+
+The benchmark records the setting and atomically refuses existing data paths
+for positive-budget runs. Receipt `8d837342-6089-427c-9d9f-96895e08ed9a`
+covers 76 Python tests, summarizer checks, four WAL tests, 131 state tests
+(two ignored), shell checks and a separate node-only release build. New temporary
+fixtures observed an automatic cold-CF flush, then preserved acknowledged rows,
+a cold sentinel and the atomic state/applied marker after SIGKILL. This does
+not establish power-loss durability or pipeline C1 qualification.
+
+The frozen artifact is `artifacts/wal-budget/release/torus-node`, SHA256
+`b629b6c424922d4253f6dd002326114cecad8ccce1286b39dc903a30cafef14d`.
+It retains the unchanged generator. A same-binary automatic/1024-MiB comparison
+with fresh databases is pending capacity. No existing campaign DB was opened
+for maintenance, flushed or deleted.
+
+
+## Final cancellation comparison in this local pass
+
+The first actual multilevel gate (`ca30eea`) was rejected: its dispersed case
+had baseline/candidate ratio 0.915 with near-parity identical-code controls.
+A four-length scan/removal crossover retained dense-middle gains of 1.674 and
+1.839 at depths 8192 and 32768, and brought dispersed cancellation to 0.987.
+But the sixth-level fallback measured 0.938 (AA 1.030 / BB 1.005), while edge
+controls were noisy. The candidate remains on `perf/cancel-level-compaction`,
+unmerged and without performance acceptance. Further threshold tuning without
+repeat diagnosis and live activation measurements would overfit these fixtures.
+
+Receipt `ce7b778d-5d7a-4a00-bc6d-c22c6ee9f8fb` passed 121 core unit tests,
+89 integration tests, and the isolated benchmark command. Seven ordinary-suite
+tests were ignored; the selected multilevel microbenchmark was run explicitly.
+Results and manifests are retained as `cancel-multilevel-crossover4-r1.*`.
+Semantic verification is distinct from performance acceptance.
+
+## Resume order
+
+1. Obtain capacity without altering retained evidence unless cleanup is authorized;
+   obtain three SSH host aliases/directories for separate-machine work.
+2. Rebaseline the latest frozen recovery runtime with three accepted controls.
+3. Rebase and verify the isolated hash/DA candidates onto that runtime; freeze
+   separate node-only builds and run interleaved same-workload comparisons.
+4. Test the fresh-DB WAL budget with storage and latency measurements; qualify
+   positive replay plus healthy drain and the deterministic C1 scenario before
+   enabling the execution pipeline.
+5. Use measured costs and cancellation eligibility to choose the next change,
+   then run the sustained, depth, market-count and burst matrix on local and
+   separate-machine configurations.
+
+Best accepted full-load result remains 51,608.1 fills/s from one hash-cache cell
+versus one accepted 49,242.8 control. This is not a repeat-proven improvement,
+a stable hardware ceiling, or an apples-to-apples 200k cross-chain comparison.
+Stages 1–7 remain partially completed; no new repository is justified by the
+current evidence, and no branch was pushed.
