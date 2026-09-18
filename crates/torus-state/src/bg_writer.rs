@@ -45,6 +45,91 @@ use crate::error::StateError;
 /// consts from [`crate::cf`].
 pub type RawCfKv = (&'static str, Vec<u8>, Vec<u8>);
 
+/// A trade-history row with its existing fixed-size key stored inline.
+/// Values retain their original allocation; neither variant belongs to a root CF.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeferredTradeRow {
+    Primary { key: [u8; 20], value: Vec<u8> },
+    User { key: [u8; 32], value: Vec<u8> },
+}
+
+impl DeferredTradeRow {
+    pub fn as_parts(&self) -> (&'static str, &[u8], &[u8]) {
+        match self {
+            Self::Primary { key, value } => (crate::cf::CF_NATIVE_TRADES, key, value),
+            Self::User { key, value } => (crate::cf::CF_NATIVE_USER_TRADES, key, value),
+        }
+    }
+
+    pub fn into_raw(self) -> RawCfKv {
+        match self {
+            Self::Primary { key, value } => (crate::cf::CF_NATIVE_TRADES, key.to_vec(), value),
+            Self::User { key, value } => (crate::cf::CF_NATIVE_USER_TRADES, key.to_vec(), value),
+        }
+    }
+}
+
+/// One ordered batch, with a single representation for its entire lifetime.
+/// The legacy raw API and other CF writers continue to use `Raw`.
+#[derive(Debug)]
+pub enum DeferredTradeBatch {
+    Raw(Vec<RawCfKv>),
+    Fixed(Vec<DeferredTradeRow>),
+}
+
+impl DeferredTradeBatch {
+    pub fn empty(fixed_keys: bool) -> Self {
+        if fixed_keys {
+            Self::Fixed(Vec::new())
+        } else {
+            Self::Raw(Vec::new())
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Raw(rows) => rows.len(),
+            Self::Fixed(rows) => rows.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Drain without changing the next batch's representation.
+    pub fn take(&mut self) -> Self {
+        match self {
+            Self::Raw(rows) => Self::Raw(std::mem::take(rows)),
+            Self::Fixed(rows) => Self::Fixed(std::mem::take(rows)),
+        }
+    }
+
+    /// Compatibility conversion only; the typed production writer never uses it.
+    pub fn into_raw(self) -> Vec<RawCfKv> {
+        match self {
+            Self::Raw(rows) => rows,
+            Self::Fixed(rows) => rows.into_iter().map(DeferredTradeRow::into_raw).collect(),
+        }
+    }
+
+    pub fn for_each_row(&self, mut visit: impl FnMut(&'static str, &[u8], &[u8])) {
+        match self {
+            Self::Raw(rows) => {
+                for (cf, key, value) in rows {
+                    visit(*cf, key, value);
+                }
+            }
+            Self::Fixed(rows) => {
+                for row in rows {
+                    let (cf, key, value) = row.as_parts();
+                    visit(cf, key, value);
+                }
+            }
+        }
+    }
+}
+
 /// Default `TORUS_BG_WRITER_CHUNK_KVS`: rows per RocksDB write group. 2048
 /// small rows is a ~1-3 ms memtable insert, i.e. the longest a foreground
 /// writer can be held behind this thread.
@@ -103,7 +188,7 @@ impl Default for BgWriterPolicy {
 }
 
 pub struct BackgroundCfWriter {
-    tx: Option<SyncSender<Vec<RawCfKv>>>,
+    tx: Option<SyncSender<DeferredTradeBatch>>,
     handle: Option<JoinHandle<()>>,
     queued: Arc<AtomicUsize>,
 }
@@ -123,7 +208,7 @@ impl BackgroundCfWriter {
         queue_cap: usize,
         policy: BgWriterPolicy,
     ) -> Self {
-        let (tx, rx) = sync_channel::<Vec<RawCfKv>>(queue_cap);
+        let (tx, rx) = sync_channel::<DeferredTradeBatch>(queue_cap);
         let queued = Arc::new(AtomicUsize::new(0));
         let drained = queued.clone();
         let handle = std::thread::Builder::new()
@@ -132,7 +217,13 @@ impl BackgroundCfWriter {
                 // recv() returns every queued batch even after the sender is
                 // dropped, then errors — drain-on-shutdown falls out for free.
                 while let Ok(kvs) = rx.recv() {
-                    if let Err(e) = write_kvs_chunked(&db, &kvs, policy) {
+                    let written = match &kvs {
+                        DeferredTradeBatch::Raw(rows) => write_kvs_chunked(&db, rows, policy),
+                        DeferredTradeBatch::Fixed(rows) => {
+                            write_trade_rows_chunked(&db, rows, policy)
+                        }
+                    };
+                    if let Err(e) = written {
                         tracing::error!(%e, n = kvs.len(), "background CF writer: batch failed");
                     }
                     drained.fetch_sub(1, Ordering::Relaxed);
@@ -149,6 +240,13 @@ impl BackgroundCfWriter {
     /// Queue a batch. If the writer is gone the batch is handed back so the
     /// caller can write it synchronously instead of losing it.
     pub fn send(&self, kvs: Vec<RawCfKv>) -> Result<(), Vec<RawCfKv>> {
+        self.send_batch(DeferredTradeBatch::Raw(kvs))
+            .map_err(DeferredTradeBatch::into_raw)
+    }
+
+    /// Queue an ordered trade batch without converting inline keys to vectors.
+    /// A disconnected receiver returns the same owned batch for fallback.
+    pub fn send_batch(&self, kvs: DeferredTradeBatch) -> Result<(), DeferredTradeBatch> {
         let Some(tx) = &self.tx else {
             return Err(kvs);
         };
@@ -195,6 +293,51 @@ fn write_kvs_chunked(db: &StateDb, kvs: &[RawCfKv], policy: BgWriterPolicy) -> R
     }
     Ok(())
 }
+
+/// Same row-level policy as raw batches, including boundaries inside a fill's
+/// primary/maker/taker triple. RocksDB borrows the keys directly from each row.
+fn write_trade_rows_chunked(
+    db: &StateDb,
+    rows: &[DeferredTradeRow],
+    policy: BgWriterPolicy,
+) -> Result<(), StateError> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let mut wo = WriteOptions::default();
+    wo.set_low_pri(policy.low_pri);
+    for_trade_chunks(rows, policy.chunk_kvs, |part| {
+        let mut batch = WriteBatch::default();
+        for row in part {
+            let (cf, key, value) = row.as_parts();
+            batch.put_cf(db.cf_handle(cf)?, key, value);
+        }
+        db.write_with(batch, &wo)
+    })
+}
+
+fn for_trade_chunks<E>(
+    rows: &[DeferredTradeRow],
+    chunk_rows: usize,
+    mut write: impl FnMut(&[DeferredTradeRow]) -> Result<(), E>,
+) -> Result<(), E> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let chunk = if chunk_rows == 0 {
+        rows.len()
+    } else {
+        chunk_rows
+    };
+    for part in rows.chunks(chunk) {
+        write(part)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "fixed_trade_key_tests.rs"]
+mod fixed_trade_key_tests;
 
 #[cfg(test)]
 mod tests {

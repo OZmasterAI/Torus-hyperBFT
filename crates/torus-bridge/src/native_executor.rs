@@ -22,11 +22,26 @@ use torus_economics::{
     EpochManager, GovernanceManager, RewardDistributor, StakingManager, ValidatorStatus,
 };
 use torus_state::cf::{CF_NATIVE_TRADES, CF_NATIVE_USER_TRADES};
-use torus_state::{RawCfKv, StateBackend, StateDb};
+use torus_state::{DeferredTradeBatch, DeferredTradeRow, RawCfKv, StateBackend, StateDb};
 use torus_types::{
     FixedPoint, MarketId, NativeAction, OrderId, OrderType, PlaceOrderParams, PublicKey,
     SessionScope, Side, TimeInForce, ValidatorInfo, ValidatorSet, VoteOption, U256,
 };
+
+fn deferred_trade_fixed_keys_flag(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+fn deferred_trade_fixed_keys_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| deferred_trade_fixed_keys_flag(
+        std::env::var("TORUS_DEFERRED_TRADE_FIXED_KEYS").ok().as_deref(),
+    ))
+}
+
+#[cfg(test)]
+#[path = "deferred_trade_fixed_keys_tests.rs"]
+mod deferred_trade_fixed_keys_tests;
 
 use crate::market_workers::{MarketWorkerPool, MatchRequest};
 
@@ -1333,8 +1348,9 @@ pub struct NativeExecContext<T: StateBackend = StateDb> {
     /// background writer after all exec phases. Off by default: every existing
     /// caller keeps inline writes.
     pub defer_trades: bool,
-    /// Raw trade-history KVs buffered while `defer_trades` is set.
-    pending_trades: Vec<RawCfKv>,
+    /// One ordered representation, chosen at context construction and retained
+    /// across drains. Public compatibility drain still returns raw KVs.
+    pending_trades: DeferredTradeBatch,
 
     /// Optional metrics handle for Prometheus instrumentation.
     pub metrics: Option<std::sync::Arc<torus_telemetry::Metrics>>,
@@ -1748,7 +1764,7 @@ impl<T: StateBackend> NativeExecContext<T> {
             total_native_fees: 0,
             trade_index: 0,
             defer_trades: false,
-            pending_trades: Vec::new(),
+            pending_trades: DeferredTradeBatch::empty(deferred_trade_fixed_keys_enabled()),
             metrics: None,
             fatal_error: load_error,
             book_mode,
@@ -1822,7 +1838,13 @@ impl<T: StateBackend> NativeExecContext<T> {
     /// Drain the trade-history KVs buffered under `defer_trades`. The caller
     /// owns durability from here (background writer, or synchronous fallback).
     pub fn take_pending_trades(&mut self) -> Vec<RawCfKv> {
-        std::mem::take(&mut self.pending_trades)
+        self.take_pending_trade_batch().into_raw()
+    }
+
+    /// Production drain preserving fixed keys through the background writer.
+    /// Both drain APIs empty the same ordered buffer, retaining its mode.
+    pub fn take_pending_trade_batch(&mut self) -> DeferredTradeBatch {
+        self.pending_trades.take()
     }
 
     /// PROFILER (s470): total resting orders across every loaded book. Sampled
@@ -4605,12 +4627,18 @@ impl NativeExecutor {
     /// inline overlay PUTs — exactly the classic persist_trade tail.
     fn route_trade_kvs<T: StateBackend>(ctx: &mut NativeExecContext<T>, kvs: TradeKvs) {
         if ctx.defer_trades {
-            ctx.pending_trades
-                .push((CF_NATIVE_TRADES, kvs.trade_key.to_vec(), kvs.trade_data));
-            ctx.pending_trades
-                .push((CF_NATIVE_USER_TRADES, kvs.maker_key.to_vec(), kvs.maker_data));
-            ctx.pending_trades
-                .push((CF_NATIVE_USER_TRADES, kvs.taker_key.to_vec(), kvs.taker_data));
+            match &mut ctx.pending_trades {
+                DeferredTradeBatch::Raw(rows) => {
+                    rows.push((CF_NATIVE_TRADES, kvs.trade_key.to_vec(), kvs.trade_data));
+                    rows.push((CF_NATIVE_USER_TRADES, kvs.maker_key.to_vec(), kvs.maker_data));
+                    rows.push((CF_NATIVE_USER_TRADES, kvs.taker_key.to_vec(), kvs.taker_data));
+                }
+                DeferredTradeBatch::Fixed(rows) => {
+                    rows.push(DeferredTradeRow::Primary { key: kvs.trade_key, value: kvs.trade_data });
+                    rows.push(DeferredTradeRow::User { key: kvs.maker_key, value: kvs.maker_data });
+                    rows.push(DeferredTradeRow::User { key: kvs.taker_key, value: kvs.taker_data });
+                }
+            }
         } else {
             let _ = ctx
                 .state
