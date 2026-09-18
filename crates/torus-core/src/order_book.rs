@@ -642,9 +642,19 @@ impl OrderBook {
             None => return vec![],
         };
 
-        // Group only concentrated cancellations on proven deep levels.
-        // Classification allocates nothing; shallow/sparse cases use the old loop.
-        if self.cancel_all_should_group(&order_ids) {
+        // Keep the original small-batch loop. Production-sized larger batches
+        // classify while removing the authoritative index entries, so a thin or
+        // sixth level cannot discard a whole preliminary lookup pass.
+        if (32..=MAX_ORDERS_PER_TRADER_PER_MARKET).contains(&order_ids.len())
+            && self.order_index.len() >= 1_024
+        {
+            return self.cancel_all_hybrid(trader, order_ids);
+        }
+        // Preserve the existing full/deep single-level path for load-style
+        // states above the normal per-trader limit (including recovery/tests).
+        if order_ids.len() > MAX_ORDERS_PER_TRADER_PER_MARKET
+            && self.cancel_all_legacy_should_group(&order_ids)
+        {
             return self.cancel_all_by_level(trader, order_ids);
         }
 
@@ -693,10 +703,10 @@ impl OrderBook {
         cancelled
     }
 
-    fn cancel_all_should_group(&self, order_ids: &[OrderId]) -> bool {
-        // Preserve the measured single-level gate and its cheap small/sparse
-        // rejection. The separate multilevel experiment engages only after a
-        // mismatch proves the old single-level path would reject this set.
+    fn cancel_all_legacy_should_group(&self, order_ids: &[OrderId]) -> bool {
+        // Historical classifier retained for test provenance and synthetic
+        // >200-target single-level states. Normal batches use the hybrid path;
+        // the multilevel branch below cannot engage above200 targets.
         if order_ids.len() < 32 || self.order_index.len() < 1_024 {
             return false;
         }
@@ -785,86 +795,199 @@ impl OrderBook {
             }
         }
         let mut cancelled: Vec<Option<Order>> = vec![None; order_ids.len()];
-        let cache_on = self.level_hash_cache.is_some();
-        let chunked_on = self.level_hash_chunked;
         for ((tag, price), targets) in levels {
-            let book = if tag == crate::book_rows::side_tag(Side::Buy) {
-                &mut self.bids
-            } else {
-                &mut self.asks
-            };
-            let Some(queue) = book.get_mut(&price) else {
+            self.cancel_all_remove_level(tag, price, &targets, &mut cancelled);
+        }
+        self.pending_stops.retain(|s| s.trader != trader);
+        cancelled.into_iter().flatten().collect()
+    }
+
+    /// Per-level eligibility keeps the previously tested count/depth guards.
+    /// The movement-cost decision remains inside cancel_all_remove_level.
+    fn cancel_all_level_can_compact(depth: usize, count: usize) -> bool {
+        (depth >= 1_024 && count >= 32) || (depth >= 8_192 && count >= 16)
+    }
+
+    fn cancel_all_hybrid(&mut self, trader: Address, order_ids: Vec<OrderId>) -> Vec<Order> {
+        // At most five deferred queues and 200 target/output slots. Shallow
+        // queues do not consume a slot. Once selected, a queue is never mutated
+        // until all its targets have been collected; overflow queues always use
+        // ordinary removal. No helper below looks up a removed index entry.
+        type DeferredLevel = ((u8, FixedPoint), Vec<(usize, OrderId)>);
+        let mut levels: [Option<DeferredLevel>; 5] = std::array::from_fn(|_| None);
+        let mut used = 0;
+        let mut cancelled = vec![None; order_ids.len()];
+        for (output, order_id) in order_ids.into_iter().enumerate() {
+            let Some(loc) = self.order_index.remove(&order_id) else {
                 continue;
             };
-            let mut positions: Vec<(usize, usize)> = targets
-                .iter()
-                .filter_map(|&(output, id)| {
-                    Self::queue_position(queue, &self.order_seq, id).map(|pos| (pos, output))
-                })
-                .collect();
-            positions.sort_unstable_by_key(|&(pos, _)| pos);
-
-            // Estimate both removal directions: front prefixes are cheapest in
-            // ascending order, tail suffixes in descending order. Neither should
-            // force a full scan (or repeated shifts in the wrong direction).
-            let mut remaining = queue.len();
-            let mut reverse_shifts = 0usize;
-            for &(pos, _) in positions.iter().rev() {
-                reverse_shifts = reverse_shifts.saturating_add(pos.min(remaining - 1 - pos));
-                remaining -= 1;
+            let tag = crate::book_rows::side_tag(loc.side);
+            let key = (tag, loc.price);
+            if let Some(group) = levels[..used]
+                .iter_mut()
+                .flatten()
+                .find(|(candidate, _)| *candidate == key)
+            {
+                group.1.push((output, order_id));
+                continue;
             }
-            let forward_shifts =
-                positions
-                    .iter()
-                    .enumerate()
-                    .fold(0usize, |sum, (removed, &(pos, _))| {
-                        sum.saturating_add((pos - removed).min(queue.len() - 1 - pos))
-                    });
-            // Movement count is not CPU cost: VecDeque::remove uses memmove,
-            // while retain branches over every survivor. The one-length
-            // threshold regressed dispersed16/depth8192 in the actual-gate
-            // microbenchmark. Four lengths keeps that shape on removals and
-            // still compacts dense-middle16 (~8 lengths). Hypothesis to retest.
-            if forward_shifts.min(reverse_shifts) > queue.len().saturating_mul(4) {
-                let mut targets = positions.iter().peekable();
-                let mut position = 0usize;
-                // VecDeque::retain compacts in place, preserves survivor FIFO,
-                // and needs neither a replacement queue nor survivor hash probes.
-                queue.retain(|order| {
-                    let remove = targets.peek().is_some_and(|&&(pos, _)| pos == position);
-                    position += 1;
-                    if remove {
-                        let &(_, output) = targets.next().unwrap();
-                        cancelled[output] = Some(order.clone());
-                    }
-                    !remove
-                });
-            } else if reverse_shifts < forward_shifts {
-                for &(pos, output) in positions.iter().rev() {
-                    cancelled[output] = queue.remove(pos);
-                }
+            let book = if tag == crate::book_rows::side_tag(Side::Buy) {
+                &self.bids
             } else {
-                for (removed, &(pos, output)) in positions.iter().enumerate() {
-                    cancelled[output] = queue.remove(pos - removed);
+                &self.asks
+            };
+            if used < levels.len()
+                && book
+                    .get(&loc.price)
+                    .is_some_and(|queue| queue.len() >= 1_024)
+            {
+                levels[used] = Some((key, vec![(output, order_id)]));
+                used += 1;
+            } else {
+                cancelled[output] = self.cancel_all_remove_one(tag, loc.price, order_id);
+            }
+        }
+        for ((tag, price), targets) in levels.into_iter().flatten() {
+            let book = if tag == crate::book_rows::side_tag(Side::Buy) {
+                &self.bids
+            } else {
+                &self.asks
+            };
+            let depth = book.get(&price).map_or(0, VecDeque::len);
+            if Self::cancel_all_level_can_compact(depth, targets.len()) {
+                self.cancel_all_remove_level(tag, price, &targets, &mut cancelled);
+            } else {
+                // Below the per-level count/depth guard, retain original target
+                // order and ordinary removal; no sorting or queue scan.
+                for (output, id) in targets {
+                    cancelled[output] = self.cancel_all_remove_one(tag, price, id);
                 }
-            }
-            if queue.is_empty() {
-                book.remove(&price);
-            }
-
-            // Same per-removed-order effects as the original loop. In particular,
-            // bump once per order, not once per level, even when compacting.
-            for (_, output) in positions {
-                let order_id = cancelled[output].as_ref().unwrap().id;
-                let seq = self.order_seq.remove(&order_id);
-                self.row_journal.insert(order_id);
-                self.level_journal.insert((tag, price.raw()));
-                Self::bump_level_epoch(cache_on, &mut self.level_epoch, tag, price.raw());
-                Self::mark_chunk_dirty(chunked_on, &mut self.dirty_chunks, tag, price.raw(), seq);
             }
         }
         self.pending_stops.retain(|s| s.trader != trader);
         cancelled.into_iter().flatten().collect()
+    }
+
+    /// Ordinary queue removal after the caller has removed order_index exactly
+    /// once. Preserve the baseline's missing-row and empty-level behavior.
+    fn cancel_all_remove_one(&mut self, tag: u8, price: FixedPoint, id: OrderId) -> Option<Order> {
+        let book = if tag == crate::book_rows::side_tag(Side::Buy) {
+            &mut self.bids
+        } else {
+            &mut self.asks
+        };
+        let queue = book.get_mut(&price)?;
+        let removed =
+            Self::queue_position(queue, &self.order_seq, id).and_then(|pos| queue.remove(pos));
+        if queue.is_empty() {
+            book.remove(&price);
+        }
+        if removed.is_some() {
+            let seq = self.order_seq.remove(&id);
+            self.row_journal.insert(id);
+            self.level_journal.insert((tag, price.raw()));
+            Self::bump_level_epoch(
+                self.level_hash_cache.is_some(),
+                &mut self.level_epoch,
+                tag,
+                price.raw(),
+            );
+            Self::mark_chunk_dirty(
+                self.level_hash_chunked,
+                &mut self.dirty_chunks,
+                tag,
+                price.raw(),
+                seq,
+            );
+        }
+        removed
+    }
+
+    /// Remove one deferred queue's targets. order_seq remains authoritative for
+    /// FIFO positions until removals finish; order_index was removed by caller.
+    fn cancel_all_remove_level(
+        &mut self,
+        tag: u8,
+        price: FixedPoint,
+        targets: &[(usize, OrderId)],
+        cancelled: &mut [Option<Order>],
+    ) {
+        let cache_on = self.level_hash_cache.is_some();
+        let chunked_on = self.level_hash_chunked;
+        let book = if tag == crate::book_rows::side_tag(Side::Buy) {
+            &mut self.bids
+        } else {
+            &mut self.asks
+        };
+        let Some(queue) = book.get_mut(&price) else {
+            return;
+        };
+        let mut positions: Vec<(usize, usize)> = targets
+            .iter()
+            .filter_map(|&(output, id)| {
+                Self::queue_position(queue, &self.order_seq, id).map(|pos| (pos, output))
+            })
+            .collect();
+        positions.sort_unstable_by_key(|&(pos, _)| pos);
+
+        // Estimate both removal directions: front prefixes are cheapest in
+        // ascending order, tail suffixes in descending order. Neither should
+        // force a full scan (or repeated shifts in the wrong direction).
+        let mut remaining = queue.len();
+        let mut reverse_shifts = 0usize;
+        for &(pos, _) in positions.iter().rev() {
+            reverse_shifts = reverse_shifts.saturating_add(pos.min(remaining - 1 - pos));
+            remaining -= 1;
+        }
+        let forward_shifts =
+            positions
+                .iter()
+                .enumerate()
+                .fold(0usize, |sum, (removed, &(pos, _))| {
+                    sum.saturating_add((pos - removed).min(queue.len() - 1 - pos))
+                });
+        // Movement count is not CPU cost: VecDeque::remove uses memmove,
+        // while retain branches over every survivor. The one-length
+        // threshold regressed dispersed16/depth8192 in the actual-gate
+        // microbenchmark. Four lengths keeps that shape on removals and
+        // still compacts dense-middle16 (~8 lengths). Hypothesis to retest.
+        if forward_shifts.min(reverse_shifts) > queue.len().saturating_mul(4) {
+            let mut targets = positions.iter().peekable();
+            let mut position = 0usize;
+            // VecDeque::retain compacts in place, preserves survivor FIFO,
+            // and needs neither a replacement queue nor survivor hash probes.
+            queue.retain(|order| {
+                let remove = targets.peek().is_some_and(|&&(pos, _)| pos == position);
+                position += 1;
+                if remove {
+                    let &(_, output) = targets.next().unwrap();
+                    cancelled[output] = Some(order.clone());
+                }
+                !remove
+            });
+        } else if reverse_shifts < forward_shifts {
+            for &(pos, output) in positions.iter().rev() {
+                cancelled[output] = queue.remove(pos);
+            }
+        } else {
+            for (removed, &(pos, output)) in positions.iter().enumerate() {
+                cancelled[output] = queue.remove(pos - removed);
+            }
+        }
+        if queue.is_empty() {
+            book.remove(&price);
+        }
+
+        // Same per-removed-order effects as the original loop. In particular,
+        // bump once per order, not once per level, even when compacting.
+        for (_, output) in positions {
+            let order_id = cancelled[output].as_ref().unwrap().id;
+            let seq = self.order_seq.remove(&order_id);
+            self.row_journal.insert(order_id);
+            self.level_journal.insert((tag, price.raw()));
+            Self::bump_level_epoch(cache_on, &mut self.level_epoch, tag, price.raw());
+            Self::mark_chunk_dirty(chunked_on, &mut self.dirty_chunks, tag, price.raw(), seq);
+        }
     }
 
     /// Modify an order (cancel-and-replace).
@@ -4982,7 +5105,7 @@ mod cancel_all_compaction_tests {
                             .status,
                         OrderStatus::PendingTrigger
                     );
-                    assert!(book.cancel_all_should_group(&book.trader_orders[&addr(1)]));
+                    assert!(book.cancel_all_legacy_should_group(&book.trader_orders[&addr(1)]));
                 }
                 for _ in 0..2 {
                     assert_eq!(observe(&mut a), observe(&mut b));
@@ -5021,7 +5144,7 @@ mod cancel_all_compaction_tests {
                 let mut b = shaped_book_on_side(1_024, 1_024, "front", cache, chunked, side);
                 for book in [&mut a, &mut b] {
                     book.trader_orders.get_mut(&addr(1)).unwrap().reverse();
-                    assert!(book.cancel_all_should_group(&book.trader_orders[&addr(1)]));
+                    assert!(book.cancel_all_legacy_should_group(&book.trader_orders[&addr(1)]));
                 }
                 for _ in 0..2 {
                     assert_eq!(observe(&mut a), observe(&mut b));
@@ -5050,7 +5173,7 @@ mod cancel_all_compaction_tests {
                         for book in [&mut a, &mut b] {
                             book.trader_orders.get_mut(&addr(1)).unwrap().reverse();
                             assert_eq!(
-                                book.cancel_all_should_group(&book.trader_orders[&addr(1)]),
+                                book.cancel_all_legacy_should_group(&book.trader_orders[&addr(1)]),
                                 depth == 1_024 && count == 32,
                                 "fixture must exercise both gate outcomes"
                             );
@@ -5204,7 +5327,7 @@ mod cancel_all_compaction_tests {
                 // price order and each queue's FIFO ordering.
                 book.trader_orders.get_mut(&addr(1)).unwrap().reverse();
                 assert_eq!(
-                    book.cancel_all_should_group(&book.trader_orders[&addr(1)]),
+                    book.cancel_all_legacy_should_group(&book.trader_orders[&addr(1)]),
                     count >= 16
                 );
                 assert_eq!(book.trader_orders[&addr(1)].len(), 5 * count);
@@ -5233,6 +5356,281 @@ mod cancel_all_compaction_tests {
             // row/level journal and full persisted row/level bytes.
             assert_eq!(observe(&mut actual), observe(&mut expected));
         }
+    }
+
+    /// Mode3 fixtures combine deep queues with thin occupied price levels.
+    /// Aggregate depths mirror the observed book; target ownership/positions
+    /// are controlled hypotheses because the RPC snapshot has no trader IDs.
+    fn mixed_book(levels: &[(usize, usize)], layout: &str, side: Side) -> OrderBook {
+        let mut book = OrderBook::new(1, fp(1), fp(1));
+        book.set_level_hash_chunked(true);
+        let mut global = 0usize;
+        let mut target_ids = Vec::new();
+        for (level, &(depth, count)) in levels.iter().enumerate() {
+            assert!(count <= depth);
+            let positions: BTreeSet<_> = (0..count)
+                .map(|i| match layout {
+                    "front" => i,
+                    "back" => depth - count + i,
+                    "middle" => (depth - count) / 2 + i,
+                    "spread" => i * depth / count,
+                    _ => panic!("unknown mixed fixture layout"),
+                })
+                .collect();
+            let mut local_target = 0;
+            for position in 0..depth {
+                let id = global as OrderId + 1;
+                let target = positions.contains(&position);
+                if target {
+                    target_ids.push((local_target, level, id));
+                    local_target += 1;
+                }
+                book.insert_order(Order {
+                    id,
+                    trader: if target {
+                        addr(1)
+                    } else {
+                        background_trader(global)
+                    },
+                    side,
+                    price: fp(99 + level as i64),
+                    remaining_qty: fp(1 + (global % 7) as i64),
+                    original_qty: fp(8),
+                    order_type: OrderType::Limit,
+                    time_in_force: TimeInForce::GTC,
+                    timestamp: global as u64,
+                    reduce_only: global % 3 == 0,
+                    client_order_id: Some(global as u64),
+                });
+                global += 1;
+            }
+        }
+        // Interleave all touched levels, reverse FIFO within each, and start
+        // with the last level. Neither grouping order nor sorted position order
+        // may leak into the public cancellation result.
+        target_ids.sort_unstable();
+        book.trader_orders.insert(
+            addr(1),
+            target_ids.into_iter().rev().map(|(_, _, id)| id).collect(),
+        );
+        book.set_next_order_id(global as OrderId + 1);
+        book
+    }
+
+    fn assert_mixed_cancel(mut actual: OrderBook) {
+        assert!(actual.level_hash_chunked());
+        let mut expected = clone_bench_fixture(&actual);
+        for book in [&mut actual, &mut expected] {
+            for trader in [addr(1), addr(250)] {
+                assert_eq!(
+                    book.place_order(stop_params(true, 150, 1), trader, 1_000_000)
+                        .status,
+                    OrderStatus::PendingTrigger
+                );
+            }
+            let _ = book.take_row_ops();
+            let _ = book.take_level_ops();
+            assert!(book.level_chunk_stats().0 > 0);
+        }
+        let got = actual.cancel_all(addr(1), None);
+        let want = naive_cancel_all(&mut expected, addr(1));
+        assert_eq!(got, want);
+        assert_eq!(actual.pending_stop_count(), 1);
+        let actual_state = observe(&mut actual);
+        let expected_state = observe(&mut expected);
+        assert_eq!(actual_state, expected_state);
+        assert_eq!(state_hash(&actual_state), state_hash(&expected_state));
+        // Encoded level rows contain the real mode3 level_hash commitment.
+        // Check incremental drain outputs against from-scratch hashing too.
+        for ((tag, price), encoded) in &actual_state.level_ops {
+            assert_eq!(
+                *encoded,
+                actual
+                    .level_row_data_chunked(*tag, *price)
+                    .map(|row| row.encode().to_vec())
+            );
+        }
+        // A later append/save exercises the retained chunk cache after deletion.
+        for book in [&mut actual, &mut expected] {
+            book.insert_order(Order {
+                id: book.next_order_id(),
+                trader: addr(250),
+                side: Side::Buy,
+                price: fp(99),
+                remaining_qty: fp(3),
+                original_qty: fp(3),
+                order_type: OrderType::Limit,
+                time_in_force: TimeInForce::GTC,
+                timestamp: 2_000_000,
+                reduce_only: false,
+                client_order_id: None,
+            });
+        }
+        assert_eq!(observe(&mut actual), observe(&mut expected));
+    }
+
+    #[test]
+    fn cancel_all_compaction_hybrid_mixed_mode3_matches_naive() {
+        // Two actual late-snapshot depths plus eight thin levels; first thin
+        // level empties. Total40 targets is below the historical80 batch gate.
+        let levels = [
+            (1, 1),
+            (10, 1),
+            (12, 1),
+            (23, 1),
+            (26, 1),
+            (40, 1),
+            (80, 1),
+            (787, 1),
+            (38_142, 16),
+            (47_903, 16),
+        ];
+        for (layout, side) in [
+            ("middle", Side::Buy),
+            ("front", Side::Sell),
+            ("back", Side::Buy),
+            ("spread", Side::Sell),
+        ] {
+            let book = mixed_book(&levels, layout, side);
+            assert_eq!(book.trader_orders[&addr(1)].len(), 40);
+            assert!(!book.cancel_all_legacy_should_group(&book.trader_orders[&addr(1)]));
+            assert_mixed_cancel(book);
+        }
+    }
+
+    #[test]
+    fn cancel_all_compaction_hybrid_partial_and_overflow_match_naive() {
+        for levels in [
+            // One deep group eligible, one below16; no whole-batch veto.
+            vec![(8_192, 15), (8_192, 17), (1, 1), (23, 1)],
+            // Six eligible groups exceed the five deferred-queue slots.
+            vec![(8_192, 16); 6],
+            // Larger batch with no eligible group: all ordinary removals.
+            vec![(8_192, 8), (8_192, 8), (32, 8), (32, 8)],
+            // Original small-batch loop remains in use.
+            vec![(8_192, 8), (8_192, 8), (10, 1)],
+            // Depth/count boundaries, with a second thin queue preventing the
+            // historical all-one-level shortcut.
+            vec![(1_023, 32), (1, 1)],
+            vec![(1_024, 31), (1, 1)],
+            vec![(1_024, 32), (1, 1)],
+            vec![(8_191, 16), (8_192, 16)],
+        ] {
+            assert_mixed_cancel(mixed_book(&levels, "middle", Side::Sell));
+        }
+    }
+
+    #[test]
+    fn cancel_all_compaction_hybrid_level_guards_and_stale_indexes() {
+        for (depth, count, eligible) in [
+            (1_023, 32, false),
+            (1_024, 31, false),
+            (1_024, 32, true),
+            (8_191, 16, false),
+            (8_192, 15, false),
+            (8_192, 16, true),
+        ] {
+            assert_eq!(
+                OrderBook::cancel_all_level_can_compact(depth, count),
+                eligible
+            );
+        }
+        let mut book = mixed_book(&[(8_192, 16), (8_192, 16), (1, 1)], "middle", Side::Buy);
+        let ids = book.trader_orders.get_mut(&addr(1)).unwrap();
+        ids.push(ids[0]); // authoritative removal prevents duplicate output
+        ids.push(OrderId::MAX); // missing index is skipped
+        assert_mixed_cancel(book);
+    }
+
+    fn mixed_bench_fixture(
+        depth: usize,
+        count: usize,
+        layout: &str,
+        _levels: usize,
+        chunked: bool,
+    ) -> OrderBook {
+        assert!(chunked);
+        let (levels, positions) = match layout {
+            "mixed_middle" | "mixed_spread" | "mixed_under_count" => {
+                let second_depth = if depth == 38_142 { 47_903 } else { depth };
+                let thin_count = if layout == "mixed_under_count" { 2 } else { 1 };
+                (
+                    vec![
+                        (5, thin_count),
+                        (10, thin_count),
+                        (12, thin_count),
+                        (23, thin_count),
+                        (26, thin_count),
+                        (40, thin_count),
+                        (80, thin_count),
+                        (787, thin_count),
+                        (depth, count),
+                        (second_depth, count),
+                    ],
+                    if layout == "mixed_spread" {
+                        "spread"
+                    } else {
+                        "middle"
+                    },
+                )
+            }
+            "mixed_15_17" => (
+                vec![
+                    (5, 1),
+                    (10, 1),
+                    (12, 1),
+                    (23, 1),
+                    (26, 1),
+                    (40, 1),
+                    (80, 1),
+                    (787, 1),
+                    (depth, 15),
+                    (depth, 17),
+                ],
+                "middle",
+            ),
+            "under_count" => {
+                let mut levels = vec![(32, 4); 10];
+                // Unrelated deep liquidity prevents the global-small-book
+                // guard hiding overhead on ten ordinary touched levels.
+                levels.push((8_192, 0));
+                (levels, "middle")
+            }
+            "six_deep" => {
+                let mut levels = vec![(32, 1); 4];
+                levels.extend([(depth, count); 6]);
+                (levels, "middle")
+            }
+            _ => panic!("unknown mixed benchmark"),
+        };
+        mixed_book(&levels, positions, Side::Buy)
+    }
+
+    /// Hypothesis only: actual depth, synthetic ownership. Keep balanced paired
+    /// construction/preparation/execution, independent hash seeds and AA/BB.
+    #[test]
+    #[ignore = "run explicitly in release on an idle host; hybrid experiment"]
+    fn cancel_all_compaction_hybrid_microbenchmark() {
+        let cases = [
+            (8_192, 16, "mixed_middle", 10, true),
+            (38_142, 16, "mixed_middle", 10, true),
+            (38_142, 16, "mixed_spread", 10, true),
+            (8_192, 16, "mixed_15_17", 10, true),
+            (8_192, 8, "mixed_under_count", 10, true),
+            (32, 4, "under_count", 10, true),
+            (8_192, 16, "six_deep", 10, true),
+        ];
+        // Mixed fixture CSV depth/count columns denote the configured deep
+        // groups (or ordinary groups in under_count), not every price level.
+        run_cancel_bench_with_fixture(
+            &cases,
+            [
+                ("AB_hybrid", bench_baseline, bench_candidate),
+                ("AA", bench_baseline, bench_baseline),
+                ("BB_hybrid", bench_candidate, bench_candidate),
+            ],
+            mixed_bench_fixture,
+        );
     }
 
     fn bench_case_fixture(
@@ -5276,7 +5674,7 @@ mod cancel_all_compaction_tests {
         actual.trader_orders.get_mut(&addr(1)).unwrap().reverse();
         let count = actual.trader_orders[&addr(1)].len();
         assert_eq!(
-            actual.cancel_all_should_group(&actual.trader_orders[&addr(1)]),
+            actual.cancel_all_legacy_should_group(&actual.trader_orders[&addr(1)]),
             group
         );
         let mut expected = clone_bench_fixture(&actual);
@@ -5299,16 +5697,16 @@ mod cancel_all_compaction_tests {
     }
 
     #[test]
-    fn cancel_all_compaction_multilevel_fallbacks_match_naive() {
+    fn cancel_all_compaction_legacy_declined_shapes_match_naive() {
         for (layout, levels) in [("uneven15", 5), ("shallow", 5), ("middle", 6)] {
             check_multilevel_cancel(bench_case_fixture(8_192, 16, layout, levels, true), false);
         }
     }
 
     #[test]
-    fn cancel_all_compaction_multilevel_gate_boundaries() {
-        // Gate-only boundary probes avoid repeatedly encoding the whole deep
-        // book. Differential cases above check both accepted/rejected mutation.
+    fn cancel_all_compaction_legacy_multilevel_gate_boundaries() {
+        // Historical predicate witnesses; hybrid decisions are per-level and
+        // have separate boundary tests. Preserve old experiment provenance.
         for (depth, count, levels, expected) in [
             (8_191, 16, 5, false),
             (8_192, 16, 5, true),
@@ -5319,7 +5717,7 @@ mod cancel_all_compaction_tests {
         ] {
             let book = bench_case_fixture(depth, count, "middle", levels, true);
             assert_eq!(
-                book.cancel_all_should_group(&book.trader_orders[&addr(1)]),
+                book.cancel_all_legacy_should_group(&book.trader_orders[&addr(1)]),
                 expected,
                 "depth={depth}, count={count}, levels={levels}"
             );
@@ -5335,7 +5733,7 @@ mod cancel_all_compaction_tests {
                 book.insert_order(order); //81 or201 total
             }
             assert_eq!(
-                book.cancel_all_should_group(&book.trader_orders[&addr(1)]),
+                book.cancel_all_legacy_should_group(&book.trader_orders[&addr(1)]),
                 expected
             );
         }
@@ -5451,17 +5849,15 @@ mod cancel_all_compaction_tests {
         cases: &[(usize, usize, &str, usize, bool)],
         comparisons: [(&str, BenchCancel, BenchCancel); 3],
     ) {
-        use std::hint::black_box;
-        println!("mode,depth_per_level,targets_per_level,layout,level_groups,comparison,stratum,n,left_median_ns,right_median_ns,paired_left_over_right");
-        for &(depth, count, layout, levels, chunked) in cases {
-            let mut samples: [Vec<BenchSample>; 3] = std::array::from_fn(|_| Vec::new());
-            for seed in 0..2 {
-                // Fresh randomized hash seeds per seed, shared by every clone
-                // in this block. No seeded workload RNG is involved.
+        run_cancel_bench_with_fixture(
+            cases,
+            comparisons,
+            |depth, count, layout, levels, chunked| {
                 let fixture = bench_case_fixture(depth, count, layout, levels, chunked);
                 assert_eq!(fixture.trader_orders[&addr(1)].len(), count * levels);
+                // Historical gate witness, not the hybrid's per-level decision.
                 assert_eq!(
-                    fixture.cancel_all_should_group(&fixture.trader_orders[&addr(1)]),
+                    fixture.cancel_all_legacy_should_group(&fixture.trader_orders[&addr(1)]),
                     !matches!(layout, "levels" | "uneven15" | "shallow")
                         && ((levels == 1 && depth >= 1_024 && count >= 32)
                             || ((2..=5).contains(&levels)
@@ -5469,6 +5865,25 @@ mod cancel_all_compaction_tests {
                                 && count >= 16
                                 && (80..=200).contains(&(levels * count))))
                 );
+                fixture
+            },
+        );
+    }
+
+    fn run_cancel_bench_with_fixture(
+        cases: &[(usize, usize, &str, usize, bool)],
+        comparisons: [(&str, BenchCancel, BenchCancel); 3],
+        make_fixture: impl Fn(usize, usize, &str, usize, bool) -> OrderBook,
+    ) {
+        use std::hint::black_box;
+        println!("mode,depth_per_level,targets_per_level,layout,level_groups,comparison,stratum,n,left_median_ns,right_median_ns,paired_left_over_right");
+        for &(depth, count, layout, levels, chunked) in cases {
+            let mut samples: [Vec<BenchSample>; 3] = std::array::from_fn(|_| Vec::new());
+            for seed in 0..2 {
+                // Fresh randomized hash seeds per seed, shared by every clone
+                // in this block. No seeded workload RNG is involved.
+                let fixture = make_fixture(depth, count, layout, levels, chunked);
+                let target_count = fixture.trader_orders[&addr(1)].len();
                 for schedule in 0..8 {
                     // Rotate comparison order so AB is not always measured
                     // before controls. Each comparison still sees all orders.
@@ -5498,7 +5913,7 @@ mod cancel_all_compaction_tests {
                         }
                         // Retain both result buffers until BOTH timers stop.
                         assert_eq!(returned[0], returned[1]);
-                        assert_eq!(returned[0].as_ref().unwrap().len(), count * levels);
+                        assert_eq!(returned[0].as_ref().unwrap().len(), target_count);
                         samples[comparison].push(BenchSample {
                             left_ns: times[0],
                             right_ns: times[1],

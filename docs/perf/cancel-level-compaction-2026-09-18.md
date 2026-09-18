@@ -1,5 +1,10 @@
 # Adaptive cancel-all queue compaction candidate
 
+Current follow-up: `perf/cancel-levels-viewbound` at base `47f3a30` contains a
+new, unverified per-level hybrid described at the end of this document. The
+measurements below belong to their named historical revisions; none verifies
+this source or establishes a live throughput gain.
+
 Based on `3cc958b`, isolated branch `perf/cancel-level-compaction`. This is an
 independent execution-path hypothesis, not evidence that cancel-all currently
 limits chain throughput.
@@ -262,3 +267,132 @@ candidate isolated pending repeated fallback diagnosis and live eligibility
 frequency. Passing correctness tests and a successful benchmark exit do not
 constitute performance acceptance. No main-branch merge or chain-throughput
 gain is claimed.
+
+## Sustained-depth follow-up: bounded per-level hybrid (unverified)
+
+New scoped issue `b9b82951-1b48-4104-9cad-6f3ff190dad0`, attempt
+`bbbbb094-ab12-4cf2-b5d5-8c51d9e20cdc`, follows the original cancellation issue
+`63bb4ed3-4665-44c1-b902-b7d51d195f23`. The old failed and incomplete microbenchmark
+acceptance remains in force. This is a new source hypothesis, with no tests,
+benchmarks, runtime artifact, or live result yet.
+
+The sustained control `s60-sustained-base-10m-r1` ran nominal300/actual310 seconds
+with BAND5, CROSS0.5, CANCEL0.05, uniform10 markets,5000 senders and batch400.
+Its four depth snapshots reported0/832100/1375197/1789380 resting orders. At
+nonzero offsets,40 queues (two per side per market) contained98.42/99.72/99.50%
+of all orders. There were99/98/98 occupied levels overall, and individual sides
+had2..8 occupied levels. At offset300, market1 bid counts were
+`[5,10,12,23,26,787,38142,47903]`. Source evidence is the small raw artifact
+`/home/18c/bench-results-matched/s60-sustained-base-10m-r1/depth/depth.jsonl`.
+
+Fills slowed across the three100-second windows and phase1 cost grew, but that
+correlation does not identify cancellation as the cause. The control was
+rejected for a validator body-exhaustion/sync-fallback event; it later drained
+in107 seconds with agreement. Aggregate snapshots expose neither trader IDs
+nor queue positions. The mean late resting ownership was35.8 orders per
+sender/market, and the generator fixes one side per sender/market. This does
+not measure how often any cancel gate activates.
+
+The historical classifier rejects a whole batch if it has fewer than80 targets
+across levels, any touched queue is too shallow, any group has fewer than16
+orders, or a sixth group appears. Its rejected probing work precedes the old
+per-order loop. For the six-level96-target fixture, the classifier performs82
+index gets and five level lookups before falling back to96 index removals.
+That is real repeated work; it is only a possible explanation of the historical
+0.938 ratio, not an attribution established by measurement.
+
+The new normal-size path applies to32..200 targets when the global index has
+at least1024 entries. It removes each authoritative index entry exactly once
+while collecting at most five deferred queues in a fixed metadata array.
+Queues below1024 depth do not consume a slot. Thin queues and queues beyond the
+five-slot limit use ordinary removal; they no longer veto deferred queues.
+Every target from an already deferred queue joins that queue, so it remains
+untouched until its positions are resolved from `order_seq`. Helpers never
+look up an index entry that the collection pass already removed.
+
+Each deferred queue independently qualifies for the existing removal-cost
+comparison at32 targets/depth1024 or16 targets/depth8192. Below those guards,
+its targets use ordinary removal in their original relative order. Qualifying
+queues retain the previous ascending/descending shift estimate and compact only
+when the cheaper estimate exceeds four queue lengths. No crossover constant
+has been lowered. Output slots restore original cross-queue cancellation order.
+Per-order row/level journal effects, epoch increments, sequence removal and dirty
+chunk marks remain attached to successful removals. Pending stops retain the
+same public-method behavior. The original <32/small-book loop and the historical
+single-deep-level path for synthetic states above200 targets remain available.
+
+Logical target storage is bounded by the production200-target limit, with at
+most five target vectors plus the result slots. This removes the whole-batch
+lookup probe, but adds bounded classification, vector/result-slot allocation
+and some level lookups on batches that ultimately use ordinary removal. There
+is no claim of zero fallback overhead. Earlier low-target deep queues can fill
+the five slots before later hot queues; this conservative bound is deliberate
+and must be evaluated, not hidden as an unconditional optimization.
+
+New differential fixtures use actual Mode3 state and two late observed depths,
+38142/47903, together with eight thin levels. Ownership is synthetic:16 targets
+per deep queue, one per thin level,40 total. Front/back/middle/spread positions,
+interleaved reversed trader-index order, a fully removed thin level and active
+stops check exact returned orders, survivor FIFO, auxiliary maps, epochs, dirty
+chunks, journals and encoded row/level images. Incrementally emitted Mode3
+level hashes are also compared with from-scratch `level_row_data_chunked`, then
+a following append/save checks cache validity. Other fixtures cover15/17 partial
+eligibility, six-deep-group overflow, larger batches with only under-count
+groups, original small batches, depth/count boundaries and duplicate/missing
+index IDs. Legacy gate witnesses are named as historical evidence rather than
+as assertions that the hybrid chooses the same path.
+
+The new ignored `cancel_all_compaction_hybrid_microbenchmark` reuses the same
+balanced16-sample paired AB/AA/BB machinery and shared-RandomState fixture clones.
+Seven Mode3 cases cover ten touched levels: two deep queues at8192 and at the
+observed38142/47903 depths with16 middle targets; observed-depth dispersed16;
+8192-depth15/17 partial eligibility;8192-depth8-target groups plus enough thin
+targets to reach32 overall; ten ordinary shallow queues with an unrelated deep
+queue to keep the global-size fast rejection inactive; and six deep groups plus
+four thin groups. CSV `depth_per_level`/`targets_per_level` describe configured
+deep groups, not every queue; layout names and this fixture description specify
+the unequal depths/counts. Historical micro entrypoints remain available, but
+running them on this source measures the new hybrid arm, not an old revision.
+
+Root-scheduled commands (not run by the implementing agent):
+
+```sh
+cargo test -p torus-core cancel_all_compaction -- --test-threads=1
+cargo test -p torus-core
+cargo test --release -p torus-core cancel_all_compaction_hybrid_microbenchmark -- --ignored --nocapture --test-threads=1
+```
+
+Semantic verification, control/order-stratum review, repeated fallback cost
+checks, and actual live activation and duration-matched chain evidence are
+still required before acceptance or integration.
+
+### First hybrid qualification and mechanism screen
+
+Root corrected the stale-ID fixture to `OrderId::MAX` after its initial compile
+failure, then qualified 124 core library tests, 89 core integration tests and
+33 bridge persistence/row/resident tests in release mode. Receipt
+`5ec6b86f-95c8-4ad3-a0a3-30b0a9ce25fc`; eight ignored cases were not included.
+The production implementation did not change in that correction.
+
+The idle-host seven-case screen completed in 85.20 seconds, with a separately
+prepared test binary SHA256
+`5ba3d5d6f5d8d2ede907687186516868890e090da0e1763d58f71fc2a84a1209`.
+Manifest and full strata are retained as `cancel-hybrid-micro-r1.*` under the
+campaign directory. Paired left/right ratios above one favor the hybrid in AB;
+AA and BB compare each implementation with itself.
+
+| Shape | AB hybrid | AA | BB hybrid |
+| --- | ---: | ---: | ---: |
+| 8192-deep, 16 middle targets, mixed thin levels | 1.819 | 0.916 | 0.932 |
+| Observed deep sizes, 16 middle targets | 4.573 | 1.107 | 1.004 |
+| Observed deep sizes, dispersed targets | 1.203 | 1.044 | 1.012 |
+| 8192-deep, 15/17 partial eligibility | 1.319 | 0.996 | 0.924 |
+| Deep queues below target-count threshold | 0.949 | 0.954 | 1.007 |
+| Ten shallow queues, unrelated deep liquidity | 0.837 | 1.078 | 0.996 |
+| Six deep queues, deferred-slot overflow | 2.030 | 1.020 | 0.998 |
+
+Deep middle cases have substantial mechanism headroom, while shallow fallback
+regresses. Control noise also matters, especially in the first and partial cases.
+No node binary or live gain is claimed. The next revision should remove eager
+result-slot allocation and redundant shallow-queue lookup where no grouping is
+needed, preserving once-only index removal and every tested state invariant.
