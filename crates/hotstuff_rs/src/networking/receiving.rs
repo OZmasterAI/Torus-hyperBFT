@@ -265,52 +265,37 @@ impl ProgressMessageBuffer {
         msg: M,
         sender: VerifyingKey,
     ) -> bool {
-        // Try to cache the message.
-        let bytes_requested = mem::size_of::<VerifyingKey>() as u64 + msg.size();
-        let new_buffer_size = self.buffer_size.int().checked_add(bytes_requested);
-        let buffer_will_be_overloaded =
-            new_buffer_size.is_none() || new_buffer_size.unwrap() > self.buffer_capacity.int();
-        let cache_message_if_buffer_will_be_overloaded = self.buffer.keys().max().is_none()
-            || self
-                .buffer
-                .keys()
-                .max()
-                .is_some_and(|max_view| msg.view() < *max_view);
-
-        // We only need to make space in the buffer if:
-        // (1) It will be overloaded after storing the message, and
-        // (2) We want to store this message in the buffer, i.e., if the message's view is lower than that of
-        //     the highest-viewed message stored in the buffer.
-        // Otherwise we ignore the message to avoid overloading the buffer.
-        if buffer_will_be_overloaded && cache_message_if_buffer_will_be_overloaded {
-            self.remove_highest_viewed_msgs(bytes_requested);
+        let Some(bytes_requested) = (mem::size_of::<VerifyingKey>() as u64).checked_add(msg.size()) else {
+            return false;
         };
+        // Reject an individually oversized message before evicting useful work.
+        if bytes_requested > self.buffer_capacity.int() {
+            return false;
+        }
+        let free_bytes = self.buffer_capacity.int() - self.buffer_size.int();
+        if bytes_requested > free_bytes {
+            if !self.buffer.last_key_value().is_some_and(|(view, _)| msg.view() < *view) {
+                return false;
+            }
+            // Reclaim only the deficit, retaining highest-view-first eviction.
+            self.remove_highest_viewed_msgs(bytes_requested - free_bytes);
+        }
 
-        // We only store the message in the buffer if either:
-        // (1) There is no risk of overloading the buffer upon storing this message, or
-        // (2) The buffer might be overloaded, but we have already made space for the new message.
-        if !buffer_will_be_overloaded || cache_message_if_buffer_will_be_overloaded {
-            let msg_queue = if let Some(msg_queue) = self.buffer.get_mut(&msg.view()) {
-                msg_queue
-            } else {
-                self.buffer.insert(msg.view(), VecDeque::new());
-                // Safety: this key has just been inserted.
-                self.buffer.get_mut(&msg.view()).unwrap()
-            };
-
-            self.buffer_size += bytes_requested;
-            msg_queue.push_back((sender, msg.into()));
-            return true;
-        };
-        false
+        self.buffer_size += bytes_requested;
+        self.buffer.entry(msg.view()).or_default().push_back((sender, msg.into()));
+        true
     }
 
     /// If there are messages for this view in the buffer, remove and return the message at the front
     /// of the queue.
     fn get_msg(&mut self, view: &ViewNumber) -> Option<(VerifyingKey, ProgressMessage)> {
-        self.buffer
-            .get_mut(view)
-            .and_then(|msg_queue| msg_queue.pop_front())
+        let queue = self.buffer.get_mut(view)?;
+        let message = queue.pop_front()?;
+        self.buffer_size -= mem::size_of::<VerifyingKey>() as u64 + message.1.size();
+        if queue.is_empty() {
+            self.buffer.remove(view);
+        }
+        Some(message)
     }
 
     /// Given the number of bytes that need to be removed, removes just enough highest-viewed messages
@@ -360,7 +345,13 @@ impl ProgressMessageBuffer {
 
     /// Remove all messages for views less than the current view.
     fn remove_expired_msgs(&mut self, cur_view: ViewNumber) {
-        self.buffer = self.buffer.split_off(&cur_view)
+        let retained = self.buffer.split_off(&cur_view);
+        let expired = mem::replace(&mut self.buffer, retained);
+        for queue in expired.into_values() {
+            for (_, msg) in queue {
+                self.buffer_size -= mem::size_of::<VerifyingKey>() as u64 + msg.size();
+            }
+        }
     }
 }
 
@@ -448,6 +439,139 @@ impl BlockSyncServerStub {
 pub enum BlockSyncRequestReceiveError {
     Disconnected,
     NotAvailable,
+}
+
+#[cfg(test)]
+mod progress_message_buffer_tests {
+    use super::*;
+    use crate::hotstuff::messages::{BlockDataRequest, HotStuffMessage, ProposalHeader};
+    use crate::hotstuff::types::PhaseCertificate;
+    use crate::types::data_types::{BlockHeight, CryptoHash};
+
+    fn sender() -> VerifyingKey {
+        ed25519_dalek::SigningKey::from_bytes(&[1; 32]).verifying_key()
+    }
+
+    fn request(view: u64, id: u8) -> HotStuffMessage {
+        BlockDataRequest {
+            chain_id: ChainID::new(0),
+            view: ViewNumber::new(view),
+            block_hash: CryptoHash::new([id; 32]),
+        }.into()
+    }
+
+    fn header(view: u64) -> HotStuffMessage {
+        ProposalHeader {
+            chain_id: ChainID::new(0),
+            view: ViewNumber::new(view),
+            block_hash: CryptoHash::new([0; 32]),
+            height: BlockHeight::new(0),
+            data_hash: CryptoHash::new([0; 32]),
+            justify: PhaseCertificate::genesis_pc(),
+            tc: None,
+            nec: None,
+            has_validator_set_updates: false,
+        }.into()
+    }
+
+    fn entry_size(msg: &HotStuffMessage) -> u64 {
+        mem::size_of::<VerifyingKey>() as u64 + msg.size()
+    }
+
+    fn assert_accounted(buffer: &ProgressMessageBuffer) {
+        let queued_bytes: u64 = buffer.buffer.values().map(|queue| {
+            assert!(!queue.is_empty(), "empty views must not affect eviction priority");
+            queue.iter().map(|(_, msg)| mem::size_of::<VerifyingKey>() as u64 + msg.size()).sum::<u64>()
+        }).sum();
+        assert_eq!(buffer.buffer_size.int(), queued_bytes);
+        assert!(queued_bytes <= buffer.buffer_capacity.int());
+    }
+
+    #[test]
+    fn delivery_releases_capacity_preserves_fifo_and_removes_empty_views() {
+        let size = entry_size(&request(1, 1));
+        let mut buffer = ProgressMessageBuffer::new(BufferSize::new(2 * size));
+        // Repeated drain/refill catches occupancy accumulating across views.
+        for view in 1..=4 {
+            assert!(buffer.insert(request(view, 1), sender()));
+            assert!(buffer.insert(request(view, 2), sender()));
+            assert_accounted(&buffer);
+            for id in [1, 2] {
+                let (_, msg) = buffer.get_msg(&ViewNumber::new(view)).unwrap();
+                assert!(matches!(msg, ProgressMessage::HotStuffMessage(HotStuffMessage::BlockDataRequest(req))
+                    if req.block_hash == CryptoHash::new([id; 32])));
+                assert_accounted(&buffer);
+            }
+            assert!(buffer.buffer.is_empty());
+            assert!(buffer.get_msg(&ViewNumber::new(view)).is_none());
+            assert_eq!(buffer.buffer_size.int(), 0);
+        }
+    }
+
+    #[test]
+    fn expiration_releases_only_older_views_and_allows_refill() {
+        let size = entry_size(&request(1, 1));
+        let mut buffer = ProgressMessageBuffer::new(BufferSize::new(4 * size));
+        for view in [1, 1, 2, 3] {
+            assert!(buffer.insert(request(view, 1), sender()));
+        }
+        buffer.remove_expired_msgs(ViewNumber::new(2));
+        assert_accounted(&buffer);
+        assert_eq!(buffer.buffer_size.int(), 2 * size);
+        assert!(buffer.buffer.contains_key(&ViewNumber::new(2)));
+        assert!(buffer.buffer.contains_key(&ViewNumber::new(3)));
+        buffer.remove_expired_msgs(ViewNumber::new(2));
+        assert_accounted(&buffer);
+        assert!(buffer.insert(request(4, 1), sender()));
+        assert!(buffer.insert(request(5, 1), sender()));
+        assert_accounted(&buffer);
+        buffer.remove_expired_msgs(ViewNumber::new(6));
+        assert_accounted(&buffer);
+        assert_eq!(buffer.buffer_size.int(), 0);
+        assert!(buffer.insert(request(7, 1), sender()));
+        assert_accounted(&buffer);
+    }
+
+    #[test]
+    fn eviction_reclaims_only_deficit_from_highest_view() {
+        let small = entry_size(&request(4, 1));
+        let large = entry_size(&header(3));
+        assert!(large > small);
+        // There is already room for large-small bytes. Only one request needs eviction.
+        let mut buffer = ProgressMessageBuffer::new(BufferSize::new(2 * small + large));
+        for view in [4, 5, 6] {
+            assert!(buffer.insert(request(view, 1), sender()));
+        }
+        assert!(buffer.insert(header(3), sender()));
+        assert_accounted(&buffer);
+        assert_eq!(buffer.buffer_size.int(), buffer.buffer_capacity.int());
+        assert!(buffer.buffer.contains_key(&ViewNumber::new(3)));
+        assert!(buffer.buffer.contains_key(&ViewNumber::new(4)));
+        assert!(buffer.buffer.contains_key(&ViewNumber::new(5)));
+        assert!(!buffer.buffer.contains_key(&ViewNumber::new(6)));
+        // Equal/higher views do not displace existing messages at capacity.
+        assert!(!buffer.insert(request(5, 2), sender()));
+        assert!(!buffer.insert(request(9, 2), sender()));
+        assert_accounted(&buffer);
+    }
+
+    #[test]
+    fn oversized_messages_are_rejected_without_eviction_even_when_empty() {
+        let small = entry_size(&request(5, 1));
+        let large = entry_size(&header(1));
+        assert!(large > small);
+        let mut buffer = ProgressMessageBuffer::new(BufferSize::new(small));
+        assert!(!buffer.insert(header(1), sender()));
+        assert_accounted(&buffer);
+        assert!(buffer.insert(request(5, 1), sender()));
+        assert!(!buffer.insert(header(1), sender()));
+        assert_accounted(&buffer);
+        assert!(buffer.get_msg(&ViewNumber::new(5)).is_some());
+        assert_accounted(&buffer);
+        let mut zero = ProgressMessageBuffer::new(BufferSize::new(0));
+        assert!(!zero.insert(request(1, 1), sender()));
+        assert_accounted(&zero);
+    }
 }
 
 #[cfg(test)]
