@@ -1068,3 +1068,44 @@ explicit pre/post external hashes under receipt `f0bda1ff`. Producer emission
 may follow consumer completion; local IDs and startup scopes identify joins.
 Actual queue residence has only a conservative zero lower bound, and initiation
 is not delivery. A live outbound diagnostic follows the completed settlement run.
+
+### Outbound diagnostic result and next candidates
+
+`s60-body-send-stages-10m-r1` completed with PASS/AGREE and a 134-second drain,
+but strict REJECT: val2 exhausted two body fetches and fell back twice. Its
+33,631.9 fills/s over 312 seconds, first120 42,903.3, best60 47,987.3 and commit
+p95 4,037.5 ms are diagnostic observations, not an accepted performance result.
+This nominal 300-second ten-market run used frozen `14449bc`, scheduled generator
+`9c210f31`, runner `998d1eb`, cap200/rate76000, BODYFETCH1/BODY_SEND_TRACE1,
+BODY_BEFORE_EXPIRY0, DEPTH1 and ENGINE0/MATCH18/SETTLE18. Completed databases
+occupied 27.22 GiB; logs, metrics, digests, binaries and analyses were retained
+before authorized cleanup.
+
+The qualified outbound analyzer parsed 19,610 diagnostic records without parse
+errors. Whole-log command counts were 3,212/3,215/3,379 for val0/1/2; one accepted
+enqueue on each of val1 and val2 lacked a consumer record and remains censored.
+These windows include idle and drain. Observed pre-enqueue to dequeue p95 was
+12.648/10.177/16.060 ms, with maxima 410.411/164.690/521.373 ms. Inner encode p95
+was 18/23/22 microseconds and send-request initiation p95 7/8/7 microseconds.
+The handoff interval includes preparation and possible post-pop descheduling;
+it is an upper bound, not an exact queue residence measurement.
+
+For the val2 view-700 expiry (`SnfiUus...`) at 14:30:05.530491 UTC, the first
+observed response admission was 5.542 ms later. Val0 response command 17414
+spent 410.411 ms between pre-enqueue and observed dequeue, then completed
+send-request initiation at 14:30:04.763468. Another response was initiated at
+04.766797. Repeated responses prevent unique wire pairing, and the remaining
+gap includes unmeasured swarm polling, outer codec, delivery and receiver
+pre-admission work. It is not established transport latency or proof of
+biased-select starvation. For view 702 (`ptxdd2e...`), expiry was 14:30:08.310256
+and first observed response admission 08.509603, 199.347 ms later; the first
+retained response enqueue toward val2 was already after expiry at 08.489888.
+The full analyses and the 266-line expiry excerpt remain in the campaign.
+
+The separately qualified `f2a7164` integer-margin candidate is next in the same
+300-second ten-market workload. A source candidate on top of it,
+`perf/deferred-trade-fixed-keys`, preserves fixed-size trade keys through the
+background writer under exact default-off `TORUS_DEFERRED_TRADE_FIXED_KEYS=1`.
+Independent review found no blocker; runtime qualification and same-binary
+OFF/ON measurements remain pending. It preserves the existing durability
+contract and has no abrupt-crash qualification or speed claim.
