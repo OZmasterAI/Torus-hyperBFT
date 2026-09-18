@@ -236,8 +236,20 @@ impl Mempool {
 
     /// Set the node metrics handle. Called once at startup.
     pub fn set_metrics(&self, metrics: std::sync::Arc<torus_telemetry::Metrics>) {
+        // Serialize initialization with native mutations, including admission
+        // before the metrics handle was attached.
+        let pool = self.native.read().unwrap();
         if self.metrics.set(metrics).is_err() {
             tracing::warn!("mempool metrics already set");
+        }
+        self.publish_native_pool_size(&pool);
+    }
+
+    /// Publish while the native lock is held. Setting a size captured after
+    /// unlocking could overwrite a newer mutation's gauge with a stale value.
+    fn publish_native_pool_size(&self, pool: &native_pool::NativePool) {
+        if let Some(metrics) = self.metrics.get() {
+            metrics.mempool_native_size.set(pool.size() as i64);
         }
     }
 
@@ -580,7 +592,9 @@ impl Mempool {
 
         {
             let mut pool = self.native.write().unwrap();
-            pool.insert_verified(sender, action, verified_locally)?;
+            let result = pool.insert_verified(sender, action, verified_locally);
+            self.publish_native_pool_size(&pool);
+            result?;
         }
 
         // Seed only after a successful insert, so a rejected (dup/full) action
@@ -603,7 +617,9 @@ impl Mempool {
         if evicted > 0 {
             tracing::info!(evicted, "evicted nonce-expired native actions from pool");
         }
-        pool.drain(limit)
+        let actions = pool.drain(limit);
+        self.publish_native_pool_size(&pool);
+        actions
     }
 
     /// Re-insert previously drained native actions (e.g., after reorg).
@@ -615,6 +631,7 @@ impl Mempool {
         let _ = self.mirror_native_to_da(&actions);
         let mut pool = self.native.write().unwrap();
         pool.reinsert(actions);
+        self.publish_native_pool_size(&pool);
     }
 
     /// Current native pool size.
@@ -856,6 +873,7 @@ impl Mempool {
         {
             let mut pool = self.native.write().unwrap();
             let evicted = pool.evict_expired(now_ms());
+            self.publish_native_pool_size(&pool);
             if evicted > 0 {
                 tracing::info!(evicted, "evicted nonce-expired native actions from pool");
             }
@@ -888,6 +906,7 @@ impl Mempool {
         {
             let mut pool = self.native.write().unwrap();
             let evicted = pool.evict_expired(now_ms());
+            self.publish_native_pool_size(&pool);
             if evicted > 0 {
                 tracing::info!(evicted, "evicted nonce-expired native actions from pool");
             }
@@ -910,7 +929,8 @@ impl Mempool {
     /// captured entries are still present at prune time.
     ///
     /// Returns the native pool size after the prune (read under the write lock
-    /// already held — no extra locking; feeds `torus_mempool_native_size`).
+    /// already held — no extra locking). The gauge is updated here under the
+    /// same lock; callers must not republish this snapshot after it is released.
     pub fn remove_committed_native(&self, hashes: &[B256]) -> usize {
         let restash = {
             let pool = self.native.read().unwrap();
@@ -921,6 +941,7 @@ impl Mempool {
         }
         let mut pool = self.native.write().unwrap();
         pool.remove_committed(hashes);
+        self.publish_native_pool_size(&pool);
         pool.size()
     }
 
@@ -1084,6 +1105,104 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let state = StateDb::open(dir.path()).unwrap();
         (dir, state)
+    }
+
+    fn gauge_test_action(nonce: u64) -> SignedNativeAction {
+        let key = SigningKey::from_slice(&[7; 32]).unwrap();
+        torus_types::eip712::sign_native_action(
+            torus_types::NativeAction::ClaimRewards,
+            nonce,
+            &key,
+        )
+    }
+
+    #[test]
+    fn native_size_gauge_initializes_from_existing_pool() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state, MempoolConfig::default());
+        let action = gauge_test_action(now_ms());
+        pool.submit_native_action(action.recover_sender().unwrap(), action)
+            .unwrap();
+        let metrics = std::sync::Arc::new(torus_telemetry::Metrics::new());
+        pool.set_metrics(metrics.clone());
+        assert_eq!(metrics.mempool_native_size.get(), 1);
+        // Reattaching must keep the original handle current.
+        pool.set_metrics(std::sync::Arc::new(torus_telemetry::Metrics::new()));
+        pool.drain_native(10);
+        assert_eq!(metrics.mempool_native_size.get(), 0);
+    }
+
+    #[test]
+    fn native_size_gauge_tracks_admission_drain_reinsert_and_commit() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state, MempoolConfig {
+            native_pool_max_size: 2,
+            native_per_sender_cap: 3,
+            native_per_block_cap: 2,
+            ..MempoolConfig::default()
+        });
+        let metrics = std::sync::Arc::new(torus_telemetry::Metrics::new());
+        pool.set_metrics(metrics.clone());
+        let now = now_ms();
+        let first = gauge_test_action(now);
+        let second = gauge_test_action(now + 1);
+        let sender = first.recover_sender().unwrap();
+        assert_eq!(metrics.mempool_native_size.get(), 0);
+        pool.add_native_action_presigned(sender, first.clone()).unwrap();
+        assert_eq!(metrics.mempool_native_size.get(), 1);
+        assert!(pool.add_native_action_presigned(sender, first.clone()).is_err());
+        assert_eq!(metrics.mempool_native_size.get(), 1);
+        pool.add_native_action_from_gossip_trusted(sender, second.clone()).unwrap();
+        assert_eq!(metrics.mempool_native_size.get(), 2);
+        assert!(pool.submit_native_action(sender, gauge_test_action(now + 2)).is_err());
+        assert_eq!(metrics.mempool_native_size.get(), 2);
+        // Selection alone does not remove live actions.
+        assert_eq!(pool.select_native_for_block(10).len(), 2);
+        assert_eq!(metrics.mempool_native_size.get(), 2);
+        let drained = pool.drain_native(1);
+        assert_eq!(drained.len(), 1);
+        assert_eq!(metrics.mempool_native_size.get(), 1);
+        pool.reinsert_native(drained);
+        assert_eq!(metrics.mempool_native_size.get(), 2);
+        let first_hash = torus_types::compute_action_hash(&first);
+        assert_eq!(pool.remove_committed_native(&[first_hash]), 1);
+        assert_eq!(metrics.mempool_native_size.get(), 1);
+        // Unknown/repeated commits must not decrement an already-current gauge.
+        pool.remove_committed_native(&[first_hash]);
+        assert_eq!(metrics.mempool_native_size.get(), 1);
+        pool.remove_committed_native(&[torus_types::compute_action_hash(&second)]);
+        assert_eq!(metrics.mempool_native_size.get(), 0);
+        assert_eq!(pool.native_pool_size(), 0);
+    }
+
+    #[test]
+    fn native_size_gauge_clears_on_expiry_without_a_native_commit() {
+        // Every public expiry path must publish even if it selects no actions
+        // and no subsequent nonempty native block commits (the stale-drain case).
+        for selector in 0..3 {
+            let (_dir, state) = setup();
+            let pool = Mempool::new(state, MempoolConfig::default());
+            let metrics = std::sync::Arc::new(torus_telemetry::Metrics::new());
+            pool.set_metrics(metrics.clone());
+            let expired = gauge_test_action(1);
+            // Internal preverified admission intentionally bypasses the public
+            // nonce gate; no wall-clock sleep is needed to exercise expiry.
+            pool.submit_native_action(expired.recover_sender().unwrap(), expired)
+                .unwrap();
+            assert_eq!(metrics.mempool_native_size.get(), 1);
+            let exclude = std::collections::HashSet::new();
+            match selector {
+                0 => assert!(pool.drain_native(10).is_empty()),
+                1 => assert!(pool.select_native_for_block_with_senders_excluding(
+                    10, &exclude, usize::MAX, usize::MAX,
+                ).is_empty()),
+                _ => assert!(pool.select_native_cancels_for_block_with_senders_excluding(
+                    10, &exclude, usize::MAX, usize::MAX,
+                ).is_empty()),
+            }
+            assert_eq!(pool.native_pool_size(), 0);
+            assert_eq!(metrics.mempool_native_size.get(), 0);
+        }
     }
 
     #[test]

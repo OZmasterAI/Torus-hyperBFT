@@ -5292,11 +5292,10 @@ impl TorusApp {
                         .map(torus_types::compute_action_hash)
                         .collect();
                     let prune_timer = std::time::Instant::now();
-                    let pool_size = mempool.remove_committed_native(&hashes);
+                    mempool.remove_committed_native(&hashes);
                     if let Some(ref m) = self.metrics {
                         m.mempool_remove_committed_seconds
                             .observe(prune_timer.elapsed().as_secs_f64());
-                        m.mempool_native_size.set(pool_size as i64);
                     }
                 }
             }
