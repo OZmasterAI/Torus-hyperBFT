@@ -38,6 +38,10 @@
 #                cap-100 control.
 #   OVERWRITE=1  allow reusing an existing non-empty results dir
 #   HEALTH_TIMEOUT (240 s)
+#   DEPTH_OBSERVER=1  opt-in bounded val1 order-book depth observations at
+#                declared T_BENCH0 + 0/100/200/DUR (interior offsets only).
+#                Nominal end is DUR, not the unknown actual generator exit.
+#                Raw evidence/status only; never changes strict acceptance.
 #   DRAIN_TIMEOUT  default 180 + 2*MARKETS s (300 markets => 780 s). A 300-market
 #                  cell does NOT drain inside 180 s — r6-base-300m-r1 ended with
 #                  drained=0 and ~20.8k nonce-expired evictions/node, which then
@@ -129,6 +133,7 @@ BAND=${BAND:-5}
 CROSS_FRACTION=${CROSS_FRACTION:-0.5}
 CANCEL_FRACTION=${CANCEL_FRACTION:-0.05}
 RATE_SCHEDULE=${RATE_SCHEDULE:-}
+DEPTH_OBSERVER=${DEPTH_OBSERVER:-0}
 HEALTH_TIMEOUT=${HEALTH_TIMEOUT:-240}
 # Drain scales with the market count: the mempool backlog at 300 markets needs
 # far longer than 180 s to execute, and a cell that stops draining early is
@@ -284,6 +289,11 @@ PYJ
 for t in jq curl python3 md5sum awk; do command -v $t >/dev/null || { echo "FATAL: need $t" >&2; exit 1; }; done
 [[ "$MARKETS" =~ ^[0-9]+$ && "$DUR" =~ ^[0-9]+$ && "$RATE" =~ ^[0-9]+$ ]] || usage
 [ -z "$MPS" ] || [[ "$MPS" =~ ^[0-9]+$ ]] || { echo "FATAL: MPS must be an integer" >&2; exit 2; }
+[[ "$DEPTH_OBSERVER" = 0 || "$DEPTH_OBSERVER" = 1 ]] || { echo "FATAL: DEPTH_OBSERVER must be 0 or 1" >&2; exit 2; }
+if [ "$DEPTH_OBSERVER" = 1 ]; then
+    [ -r "$SELF_DIR/sample_depth.py" ] && [ "$DUR" -gt 0 ] && [ "$DUR" -le 86400 ] && [ "$MARKETS" -ge 1 ] && [ "$MARKETS" -le 300 ] \
+        || { echo "FATAL: depth observer needs its helper, duration 1..86400 and markets 1..300" >&2; exit 2; }
+fi
 WORKLOAD_JSON=$(python3 "$SELF_DIR/workload.py" "$BAND" "$CROSS_FRACTION" "$CANCEL_FRACTION" "$RATE_SCHEDULE" "$DUR") || exit 2
 [ -x "$TOOLS_DIR/digest-node.sh" ] || { echo "FATAL: $TOOLS_DIR/digest-node.sh missing" >&2; exit 1; }
 
@@ -317,7 +327,7 @@ mkdir -p "$OUT"
 printf '%s\n' "$WORKLOAD_JSON" > "$OUT/workload.json"
 : > "$OUT/run.log"
 
-SAMPLER_PID=""; CPU_PID=""; BENCH_PID=""; CRASH_PID=""
+SAMPLER_PID=""; CPU_PID=""; BENCH_PID=""; CRASH_PID=""; DEPTH_PID=""
 stop_sampler() {
     [ -n "$SAMPLER_PID" ] || return 0
     local pid="$SAMPLER_PID" rc=0
@@ -328,7 +338,35 @@ stop_sampler() {
     SAMPLER_PID=""
     return "$rc"
 }
+start_depth_observer() {
+    local offsets="0" point enabled=false
+    for point in 100 200; do
+        [ "$point" -lt "$DUR" ] && offsets+=",$point"
+    done
+    offsets+=",end"
+    [ "$DEPTH_OBSERVER" = 1 ] && enabled=true
+    printf '{"enabled":%s,"node":"val1","url":"%s","start_unix":%s,"nominal_duration_seconds":%s,"nominal_end_unix":%s,"offsets":"%s","parent_pid":%s,"affects_acceptance":false}\n' \
+        "$enabled" "${RPCS[1]}" "$T_BENCH0" "$DUR" "$((T_BENCH0 + DUR))" "$offsets" "$$" > "$OUT/depth-observer.json"
+    [ "$DEPTH_OBSERVER" = 1 ] || return 0
+    log "depth observer: val1 declared start=$T_BENCH0 offsets=$offsets nominal end=+$DUR; non-atomic optional evidence"
+    DEPTH_OBSERVER=1 python3 "$SELF_DIR/sample_depth.py" --url "${RPCS[1]}" \
+        --markets "$MARKETS" --start-unix "$T_BENCH0" --duration "$DUR" \
+        --offsets "$offsets" --parent-pid "$$" --out "$OUT/depth" \
+        >"$OUT/depth-observer.log" 2>&1 & DEPTH_PID=$!
+}
+finish_depth_observer() {
+    [ -n "$DEPTH_PID" ] || return 0
+    local mode="${1:-wait}" pid="$DEPTH_PID" rc=0
+    [ "$mode" = wait ] || kill "$pid" 2>/dev/null || true
+    wait "$pid" || rc=$?
+    DEPTH_PID=""
+    printf '{"exit_code":%s,"finish_mode":"%s","affects_acceptance":false}\n' \
+        "$rc" "$mode" > "$OUT/depth-observer-exit.json"
+    log "depth observer exited rc=$rc mode=$mode (optional evidence; see depth/manifest.json)"
+    return 0
+}
 finish_fail() {
+    finish_depth_observer stop
     stop_sampler || true
     [ -n "$CPU_PID" ] && kill "$CPU_PID" 2>/dev/null
     [ -n "$BENCH_PID" ] && kill "$BENCH_PID" 2>/dev/null
@@ -348,6 +386,7 @@ json.dump(d,open(p,'w'),indent=1)
 PY
 }
 trap 'log "interrupted"; finish_fail; exit 130' INT TERM
+trap 'finish_depth_observer stop' EXIT
 
 log "cell=$LABEL worktree=$WT markets=$MARKETS dur=${DUR}s rate=$RATE senders=$SENDERS block_cap='${BLOCK_CAP:-unset}' mps='${MPS:-unset}' extra_env='$EXTRA_ENV'"
 log "drain_timeout=${DRAIN_TIMEOUT}s digest_par=$DIGEST_PAR rpc_timeout=${RPC_TIMEOUT}s"
@@ -507,6 +546,7 @@ BENCH_CMD=("$BENCH" consensus --rpc-urls "${RPCS[0]}" --econ --senders "$SENDERS
 log "bench: ${BENCH_CMD[*]}"
 T_BENCH0=$(date +%s)
 "${BENCH_CMD[@]}" > "$OUT/bench.log" 2>&1 & BENCH_PID=$!
+start_depth_observer
 cpusampler & CPU_PID=$!
 # bl3 crash gate: SIGKILL + restart one validator CRASH_KILL_AT_S into the load
 # window. Off unless CRASH_KILL_AT_S is set; the target guard lives in
@@ -550,6 +590,9 @@ log "drained=$DRAINED after $((T_DRAIN - T_BENCH1))s (evidence: drain.json and d
 sleep 2
 stop_sampler || die "metrics sampler failed (see sampler.log)"
 kill "$CPU_PID" 2>/dev/null; CPU_PID=""
+# Keep normal depth collection through its nominal end before digest RPCs.
+# A failed generator must not make us wait for the unused planned load window.
+if [ "$BENCH_RC" = 0 ]; then finish_depth_observer wait; else finish_depth_observer stop; fi
 
 # ---------------------------------------------------------------- 8. after-snapshots + agreement
 for i in 0 1 2; do scrape_one "${METS[$i]}" > "$OUT/metrics-after-val$i.txt"; done
