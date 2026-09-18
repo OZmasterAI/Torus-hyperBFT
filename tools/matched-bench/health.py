@@ -200,8 +200,11 @@ def acceptance(liveness, drained, bench_rc, agreement, dissemination_clean, cras
         failed.append('dissemination failures')
     elif dissemination_clean is None:
         unknown.append('dissemination unverified')
-    if crash is not None and crash['verdict'] != 'PASS':
-        failed.append('crash gate failed')
+    if crash is not None:
+        if crash['verdict'] == 'FAIL':
+            failed.append('crash gate failed')
+        elif crash['verdict'] != 'PASS':
+            unknown.append('crash gate unverified')
     verdict = 'REJECT' if failed else 'UNVERIFIED' if unknown else 'ACCEPT'
     return {'verdict': verdict, 'accepted': verdict == 'ACCEPT',
             'fail_reasons': failed, 'unverified_reasons': unknown}

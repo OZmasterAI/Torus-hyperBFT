@@ -799,9 +799,12 @@ def crash_gate(raw, agreement, node_env):
     r = raw.get("restart") or {}
     pre = raw.get("pre_kill") or {}
     out = dict(raw)
-    gap = int(r.get("gap") or 0)
-    q = pre.get("exec_queue_depth")
-    q = int(q) if q is not None else None
+    def uint(value):
+        return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+    gap_value = uint(r.get("gap"))
+    gap = gap_value if gap_value is not None else 0
+    q = uint(pre.get("exec_queue_depth"))
     out["rewind_blocks"] = gap
     out["exec_queue_depth_at_kill"] = q
     out["rewind_beyond_exec_queue"] = (gap - q) if q is not None else None
@@ -813,11 +816,33 @@ def crash_gate(raw, agreement, node_env):
     out["pipeline_flag_expected"] = flag_expected
     out["pipeline_flag_confirmed"] = bool(r.get("pipeline_enabled_line")) if flag_expected else None
 
-    fail = []
+    fail, unknown = [], []
+    out["require_replay"] = raw.get("require_replay") is True
+    # Old artifacts may lack explicit scrape status; validate their actual
+    # fields too. A missing scrape must never masquerade as an idle queue.
+    missing = [key for key in ("block_height", "blocks_committed",
+                              "exec_queue_depth", "flush_worker_depth", "matched")
+               if uint(pre.get(key)) is None]
+    if missing or pre.get("metrics_status") == "UNKNOWN" or pre.get("scrape_rc", 0) != 0:
+        unknown.append("pre-kill metrics unavailable or invalid" +
+                       (": " + ", ".join(missing) if missing else ""))
+    if out["require_replay"]:
+        applied = uint(r.get("applied_height_at_crash"))
+        committed = uint(r.get("committed_height_at_crash"))
+        replay_valid = (r.get("replay_line_found") is True and
+                        gap_value is not None and gap_value > 0 and
+                        applied is not None and committed is not None and
+                        committed - applied == gap_value)
+        if not replay_valid:
+            fail.append("strict replay requires a positive, consistent restart replay gap")
+        if replay_valid and flag_expected:
+            attached = uint(r.get("worker_attached_applied"))
+            if attached is None or attached < committed:
+                fail.append("worker attachment does not prove replay reached the committed tip")
     if not raw.get("restarted_pid"):
         fail.append("killed node did not restart")
     if out["rewind_beyond_exec_queue"] is None:
-        fail.append("no exec_queue_depth sampled at the kill — rewind unbounded")
+        unknown.append("no exec_queue_depth sampled at the kill — rewind unbounded")
     elif out["rewind_beyond_exec_queue"] > MAX_REWIND_BEYOND_EXEC_QUEUE:
         fail.append("rewind %d blocks beyond the exec queue (max %d)"
                     % (out["rewind_beyond_exec_queue"], MAX_REWIND_BEYOND_EXEC_QUEUE))
@@ -850,7 +875,8 @@ def crash_gate(raw, agreement, node_env):
     if flag_expected and not r.get("pipeline_enabled_line"):
         fail.append("flush worker was NOT attached after the restart")
     out["fail_reasons"] = fail
-    out["verdict"] = "FAIL" if fail else "PASS"
+    out["unknown_reasons"] = unknown
+    out["verdict"] = "FAIL" if fail else "UNKNOWN" if unknown else "PASS"
     return out
 
 
@@ -1022,7 +1048,8 @@ if crash:
           f"agree={agreement.get('agreement_verdict')} "
           f"(counters over {crash.get('counters_compared_nodes')}, "
           f"val{crash.get('kill_idx')} judged on digest/hash/root) "
-          f"reasons={crash['fail_reasons'] or 'none'}")
+          f"reasons={crash['fail_reasons'] or 'none'} "
+          f"unknown={crash.get('unknown_reasons') or 'none'}")
 p0 = phase.get("val0", {})
 if p0:
     print(f"PHASE val0: block_ms={p0['block_ms']} wall/committed(load)={p0['wall_ms_per_committed_block']} "

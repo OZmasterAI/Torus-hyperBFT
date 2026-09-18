@@ -150,6 +150,16 @@ json.dump({
 ' "${gap:-}" "${app:-}" "${com:-}" "${watt:-}" "${panics:-0}" "${holes:-0}" "${errs:-0}" "${pipe:-0}"
 }
 
+# crash_capture_metrics <url> <out-dir>; curl is bounded even on a stalled node.
+crash_capture_metrics() {
+    # A timeout, HTTP failure, absent or invalid metric is UNKNOWN, never zero.
+    # Keep the raw scrape and curl exit code for independent review.
+    local scrape_rc=0 url=$1 out=$2
+    curl -fsS -m 5 "$url" > "$out/crash-pre-kill-metrics.txt" 2> "$out/crash-pre-kill-metrics.stderr" || scrape_rc=$?
+    python3 "$(dirname "${BASH_SOURCE[0]}")/crash_metrics.py" "$scrape_rc" \
+        < "$out/crash-pre-kill-metrics.txt" > "$out/crash-pre-kill.json"
+}
+
 if [ "${CRASH_KILL_LIB:-0}" = 1 ]; then
     return 0 2>/dev/null || exit 0
 fi
@@ -182,6 +192,8 @@ WT=$(cd "$1" && pwd) || exit 2
 IDX=$2
 OUT=$3
 KILL_WAIT=${KILL_WAIT:-15}
+CRASH_REQUIRE_REPLAY=${CRASH_REQUIRE_REPLAY:-0}
+case "$CRASH_REQUIRE_REPLAY" in 0|1) ;; *) echo "crash-kill: CRASH_REQUIRE_REPLAY must be 0 or 1" >&2; exit 2 ;; esac
 
 # shellcheck source=/dev/null
 source "$WT/devnet/wsl/env.sh"
@@ -197,17 +209,10 @@ PID=${PIDS[$IDX]:-}
 CMDLINE=$(crash_read_cmdline "$PID")
 crash_target_ok "$IDX" "$PID" "$CMDLINE" "$DATA_ROOT" "$PIDSF" || exit 1
 
-mval() { awk -v m="$1" '$1==m {print $2; f=1} END{if(!f) print 0}'; }
-M=$(curl -s -m 5 "http://127.0.0.1:$MET/metrics") || M=""
-snap() { printf '%s' "$M" | mval "$1" | cut -d. -f1; }
-PRE_H=$(snap torus_block_height)
-PRE_C=$(snap torus_blocks_committed_total)
-PRE_Q=$(snap torus_exec_queue_depth)
-PRE_W=$(snap torus_flush_worker_depth)
-PRE_M=$(snap torus_orders_matched_total)
+crash_capture_metrics "http://127.0.0.1:$MET/metrics" "$OUT" || exit 1
 LOG_BYTES=$(stat -c%s "$LOG" 2>/dev/null || echo 0)
 
-echo "crash-kill: SIGKILL val$IDX pid=$PID (height=$PRE_H exec_queue=$PRE_Q flush_worker=$PRE_W log_bytes=$LOG_BYTES)"
+echo "crash-kill: SIGKILL val$IDX pid=$PID (metrics=$OUT/crash-pre-kill.json log_bytes=$LOG_BYTES)"
 T_KILL=$(date +%s.%N)
 kill -9 "$PID" 2>/dev/null
 for _ in $(seq 1 "$KILL_WAIT"); do kill -0 "$PID" 2>/dev/null || break; sleep 1; done
@@ -225,15 +230,16 @@ crash_replace_pid_line "$PIDSF" "$IDX" "$STARTED_PID" || {
 DOWN=$(awk -v a="$T_KILL" -v b="$T_UP" 'BEGIN{printf "%.2f", b-a}')
 echo "crash-kill: val$IDX back as pid=$STARTED_PID after ${DOWN}s"
 
-python3 - "$OUT/crash-kill.json" <<PY
+python3 - "$OUT/crash-kill.json" "$OUT/crash-pre-kill.json" <<PY
 import json, sys
+pre = json.load(open(sys.argv[2]))
+pre["log_bytes"] = $LOG_BYTES
 json.dump({
+ "require_replay": bool($CRASH_REQUIRE_REPLAY),
  "enabled": True,
  "kill_node": "val$IDX", "kill_idx": $IDX,
  "killed_pid": $PID, "restarted_pid": $STARTED_PID,
  "kill_ts": float("$T_KILL"), "restart_ts": float("$T_UP"), "down_s": float("$DOWN"),
- "pre_kill": {"block_height": $PRE_H, "blocks_committed": $PRE_C,
-              "exec_queue_depth": $PRE_Q, "flush_worker_depth": $PRE_W,
-              "matched": $PRE_M, "log_bytes": $LOG_BYTES},
+ "pre_kill": pre,
 }, open(sys.argv[1], "w"), indent=1)
 PY

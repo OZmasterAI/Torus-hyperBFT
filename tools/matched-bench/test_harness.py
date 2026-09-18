@@ -34,6 +34,9 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from crash_metrics import METRICS, parse_snapshot
+from health import acceptance, assess_liveness
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 DIGEST_SH = os.path.join(HERE, "digest-node.sh")
 CRASH_KILL_SH = os.path.join(HERE, "crash-kill.sh")
@@ -638,12 +641,14 @@ def write_crash(
     restarted_pid=2002,
     replay_found=True,
     pipeline_line=True,
+    require_replay=False,
 ):
     """The crash.json run-cell.sh drops next to summary.json after a
     CRASH_KILL_AT_S cell (crash-kill.sh's record + the post-run log scan)."""
     applied = 1000
     obj = {
         "enabled": True,
+        "require_replay": require_replay,
         "kill_node": "val1",
         "kill_idx": 1,
         "kill_at_s": 50,
@@ -652,6 +657,8 @@ def write_crash(
         "down_s": 1.4,
         "pre_kill": {
             "block_height": applied + gap,
+            "blocks_committed": applied + gap,
+            "matched": 10000,
             "exec_queue_depth": queue,
             "flush_worker_depth": 1,
             "log_bytes": 4096,
@@ -670,6 +677,70 @@ def write_crash(
     }
     with open(os.path.join(d, "crash.json"), "w") as f:
         json.dump(obj, f)
+
+
+class CrashMetricsTest(unittest.TestCase):
+    def snapshot(self, value="0"):
+        return "\n".join(f"{name} {value}" for name in METRICS.values())
+
+    def test_valid_zero_and_scientific_metrics(self):
+        for value, expected in (("0", 0), ("1.2e3", 1200)):
+            parsed = parse_snapshot(self.snapshot(value), 0)
+            self.assertEqual(parsed["metrics_status"], "OK")
+            self.assertEqual(parsed["exec_queue_depth"], expected)
+
+    def test_missing_invalid_duplicate_metrics_stay_unknown(self):
+        for value in ("", "NaN", "Inf", "-1", "1.5", "junk"):
+            parsed = parse_snapshot(self.snapshot(value), 0)
+            self.assertEqual(parsed["metrics_status"], "UNKNOWN")
+            self.assertIsNone(parsed["exec_queue_depth"])
+        parsed = parse_snapshot(self.snapshot() + "\ntorus_exec_queue_depth 1", 0)
+        self.assertIsNone(parsed["exec_queue_depth"])
+        self.assertEqual(parse_snapshot("", 0)["metrics_status"], "UNKNOWN")
+
+    def test_http_failure_discards_even_a_complete_response(self):
+        parsed = parse_snapshot(self.snapshot("7"), 22)
+        self.assertEqual(parsed["metrics_status"], "UNKNOWN")
+        self.assertTrue(all(parsed[key] is None for key in METRICS))
+
+    def test_curl_timeout_discards_partial_valid_body(self):
+        with tempfile.TemporaryDirectory() as out:
+            # No network or signals: simulate curl timeout after partial output.
+            script = r'''source "$1"
+                curl() { printf '%s\n' "$*" >&2; printf 'torus_exec_queue_depth 7\n'; return 28; }
+                crash_capture_metrics http://unused "$2"
+            '''
+            result = subprocess.run(["bash", "-c", script, "_", CRASH_KILL_SH, out],
+                                    env=dict(os.environ, CRASH_KILL_LIB="1"),
+                                    capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            with open(os.path.join(out, "crash-pre-kill.json")) as f:
+                parsed = json.load(f)
+            self.assertEqual(parsed["scrape_rc"], 28)
+            self.assertEqual(parsed["metrics_status"], "UNKNOWN")
+            self.assertIsNone(parsed["exec_queue_depth"])
+            with open(os.path.join(out, "crash-pre-kill-metrics.stderr")) as f:
+                self.assertIn("-fsS -m 5", f.read())
+
+    def test_crash_pass_does_not_waive_restart_counter_reset(self):
+        rows = {}
+        for node in ("val0", "val1", "val2"):
+            rows[node] = [{"ts": t, "torus_blocks_committed_total":
+                          (t + 10 if node != "val1" or t < 2 else t),
+                          "torus_mempool_native_size": 0,
+                          "torus_exec_queue_depth": 0, "torus_flush_worker_depth": 0}
+                         for t in range(4)]
+        live = assess_liveness(rows, 0, 3)
+        self.assertEqual(live["verdict"], "UNKNOWN")
+        result = acceptance(live, True, 0, "AGREE", True, {"verdict": "PASS"})
+        self.assertEqual(result["verdict"], "UNVERIFIED")
+        self.assertFalse(result["accepted"])
+
+    def test_unknown_crash_evidence_keeps_acceptance_unverified(self):
+        result = acceptance({"verdict": "PASS"}, True, 0, "AGREE", True,
+                            {"verdict": "UNKNOWN"})
+        self.assertEqual(result["verdict"], "UNVERIFIED")
+        self.assertIn("crash gate unverified", result["unverified_reasons"])
 
 
 class CrashGateSummaryTest(unittest.TestCase):
@@ -766,6 +837,53 @@ class CrashGateSummaryTest(unittest.TestCase):
         s, _ = run_summarize(self.d, extra=self.ON)
         self.assertEqual(s["crash"]["rewind_blocks"], 0)
         self.assertEqual(s["crash"]["verdict"], "PASS")
+
+    def test_strict_replay_rejects_zero_or_missing_replay(self):
+        for gap, found in ((0, True), (0, False), (3, False)):
+            with self.subTest(gap=gap, found=found):
+                write_crash(self.d, gap=gap, replay_found=found, require_replay=True)
+                s, _ = run_summarize(self.d, extra=self.ON)
+                self.assertEqual(s["crash"]["verdict"], "FAIL")
+
+    def test_strict_positive_replay_passes(self):
+        write_crash(self.d, require_replay=True)
+        s, _ = run_summarize(self.d, extra=self.ON)
+        self.assertEqual(s["crash"]["verdict"], "PASS")
+        self.assertTrue(s["crash"]["require_replay"])
+
+    def change_crash(self, change):
+        path = os.path.join(self.d, "crash.json")
+        with open(path) as f:
+            data = json.load(f)
+        change(data)
+        with open(path, "w") as f:
+            json.dump(data, f)
+
+    def test_strict_replay_requires_consistent_heights_and_completion(self):
+        for field, value in (("gap", 2), ("applied_height_at_crash", None),
+                             ("committed_height_at_crash", 999),
+                             ("worker_attached_applied", 1002)):
+            with self.subTest(field=field):
+                write_crash(self.d, require_replay=True)
+                self.change_crash(lambda d: d["restart"].update({field: value}))
+                s, _ = run_summarize(self.d, extra=self.ON)
+                self.assertEqual(s["crash"]["verdict"], "FAIL")
+
+    def test_missing_or_failed_pre_kill_scrape_is_unknown(self):
+        for patch in ({"exec_queue_depth": None}, {"block_height": None},
+                      {"metrics_status": "UNKNOWN"}, {"scrape_rc": 28}):
+            with self.subTest(patch=patch):
+                write_crash(self.d, require_replay=True)
+                self.change_crash(lambda d: d["pre_kill"].update(patch))
+                s, _ = run_summarize(self.d, extra=self.ON)
+                self.assertEqual(s["crash"]["verdict"], "UNKNOWN")
+                self.assertTrue(s["crash"]["unknown_reasons"])
+
+    def test_missing_scrape_does_not_hide_fork_failure(self):
+        write_crash(self.d, queue=None, require_replay=True)
+        write_agreement(self.d, ["a", "b", "b"])
+        s, _ = run_summarize(self.d, extra=self.ON)
+        self.assertEqual(s["crash"]["verdict"], "FAIL")
 
     # ---- bl4: the killed node's counters RESET; the survivors' do not -------
     # Real shape from bl3-...-crash-on-r1: val1 was SIGKILLed at t=50 s and came

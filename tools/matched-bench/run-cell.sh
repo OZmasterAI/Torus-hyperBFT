@@ -56,6 +56,9 @@
 #                no more than 2 blocks beyond the exec queue it already had, come
 #                back with the flush worker attached, and still AGREE with the
 #                two survivors.
+#   CRASH_REQUIRE_REPLAY=1  Require a positive, internally consistent restart
+#                replay gap; default 0 preserves legacy zero-rewind scoring.
+#                Timing-dependent qualification, not a forced C1 crash window.
 #   KILL_NODE    which validator the crash gate kills: val1 (default) or val2.
 #                NEVER val0 (it serves the bench RPC and every headline number),
 #                and never anything outside this devnet — see the guard in
@@ -133,6 +136,11 @@ DRAIN_TIMEOUT=${DRAIN_TIMEOUT:-$(( 180 + 2 * MARKETS ))}
 DIGEST_PAR=${DIGEST_PAR:-8}
 RPC_TIMEOUT=${RPC_TIMEOUT:-60}
 CRASH_KILL_AT_S=${CRASH_KILL_AT_S:-}
+export CRASH_REQUIRE_REPLAY=${CRASH_REQUIRE_REPLAY:-0}
+case "$CRASH_REQUIRE_REPLAY" in 0|1) ;; *) echo "FATAL: CRASH_REQUIRE_REPLAY must be 0 or 1" >&2; exit 2 ;; esac
+if [ "$CRASH_REQUIRE_REPLAY" = 1 ] && [ -z "$CRASH_KILL_AT_S" ]; then
+    echo "FATAL: CRASH_REQUIRE_REPLAY=1 requires CRASH_KILL_AT_S" >&2; exit 2
+fi
 KILL_NODE=${KILL_NODE:-val1}
 HOTSTUFF_CPUS=${HOTSTUFF_CPUS:-}
 SCHED_THREADS="hotstuff-algo torus-execution torus-flush-worker"
@@ -526,7 +534,7 @@ cpusampler & CPU_PID=$!
 # crash-kill.sh and refuses anything but this devnet's val1/val2.
 CRASH_RC=""
 if [ -n "$CRASH_KILL_AT_S" ]; then
-    log "crash gate ARMED: SIGKILL $KILL_NODE at bench+${CRASH_KILL_AT_S}s, restart from the same data dir"
+    log "crash gate ARMED: SIGKILL $KILL_NODE at bench+${CRASH_KILL_AT_S}s, restart from the same data dir (require_replay=$CRASH_REQUIRE_REPLAY)"
     ( sleep "$CRASH_KILL_AT_S"; "$TOOLS_DIR/crash-kill.sh" "$WT" "$KILL_IDX" "$OUT" ) >>"$OUT/run.log" 2>&1 &
     CRASH_PID=$!
 fi
