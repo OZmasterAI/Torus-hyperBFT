@@ -2468,6 +2468,19 @@ impl<N: Network> HotStuff<N> {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn exhaust_body_fetch_for_test(&mut self, hash: &CryptoHash) {
+        let (last_request, retries, _) = self.body_fetch_tracker.get_mut(hash)
+            .expect("fixture must first authenticate a real proposal header");
+        *last_request = Instant::now() - BODY_RETRY_INTERVAL * 2;
+        *retries = MAX_BODY_RETRIES_TOTAL;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn make_missing_pc_check_due_for_test(&mut self) {
+        self.last_missing_pc_check = Instant::now() - BODY_RETRY_INTERVAL * 2;
+    }
+
     /// Re-request bodies for stale pending headers; trigger block sync after max retries.
     /// The proposer is asked first (`MAX_BODY_RETRIES` attempts), then the request
     /// rotates across the other committed validators.
@@ -3073,57 +3086,65 @@ mod sync_recovery_tests {
 
     #[test]
     fn future_header_recovers_early_and_votes_once_on_buffered_same_view_delivery() {
-        use crate::hotstuff::header_fast_path_regression_test::proposer_for;
-        use crate::networking::messages::ProgressMessage;
-        use crate::networking::receiving::ProgressMessageStub;
-        use crate::types::data_types::BufferSize;
-        let keys = signing_keys(&[1, 2, 3, 4]);
-        let set = validator_set(&keys);
-        let (mut tree, vss) = steady_block_tree(&set);
-        let view = ViewNumber::new(1);
-        let future = ViewNumber::new(2);
-        let origin = proposer_for(future, &keys, &vss, &tree);
-        let local = keys.iter().find(|key| key.verifying_key() != origin).unwrap().clone();
-        let mut hotstuff = hotstuff_at(view, local, vss);
-        let (events, rx_events) = std::sync::mpsc::channel();
-        hotstuff.event_publisher = Some(events);
-        let block = Block::new(BlockHeight::new(0), PhaseCertificate::genesis_pc(),
-            CryptoHash::new([93; 32]), Data::new(vec![]));
-        let header = recovery_header(&block, future);
-        let (tx, rx) = std::sync::mpsc::channel();
-        let mut receiver = ProgressMessageStub::new(rx, BufferSize::new(1024 * 1024));
-        tx.send((origin, ProgressMessage::HotStuffMessage(header.clone().into()))).unwrap();
-        let (sender, received) = receiver.recv(ChainID::new(0), view,
-            Instant::now() + Duration::from_secs(1)).unwrap();
-        let ProgressMessage::HotStuffMessage(message) = received else { panic!("header expected") };
-        let mut app = RecoveryApp { calls: 0, valid: true, reject_below: 0 };
-        hotstuff.on_receive_msg(message, &sender, &mut tree, &mut app).unwrap();
-        assert_eq!(tree.highest_view_voted().unwrap(), None);
-        assert!(matches!(hotstuff.proposal_status, ProposalStatus::WaitingForProposal));
-        assert!(hotstuff.body_fetch_tracker.contains_key(&block.hash));
-        hotstuff.on_receive_msg(HotStuffMessage::BlockDataResponse(BlockDataResponse {
-            view: future, block: block.clone(),
-        }), &origin, &mut tree, &mut app).unwrap();
-        assert!(tree.contains(&block.hash));
-        assert_eq!(app.calls, 1);
-        assert_eq!(tree.highest_view_voted().unwrap(), None);
+        for bounded in [false, true] {
+            use crate::hotstuff::header_fast_path_regression_test::proposer_for;
+            use crate::networking::messages::ProgressMessage;
+            use crate::networking::receiving::ProgressMessageStub;
+            use crate::types::data_types::BufferSize;
+            let keys = signing_keys(&[1, 2, 3, 4]);
+            let set = validator_set(&keys);
+            let (mut tree, vss) = steady_block_tree(&set);
+            let view = ViewNumber::new(1);
+            let future = ViewNumber::new(2);
+            let origin = proposer_for(future, &keys, &vss, &tree);
+            let local = keys.iter().find(|key| key.verifying_key() != origin).unwrap().clone();
+            let mut hotstuff = hotstuff_at(view, local, vss);
+            let (events, rx_events) = std::sync::mpsc::channel();
+            hotstuff.event_publisher = Some(events);
+            let block = Block::new(BlockHeight::new(0), PhaseCertificate::genesis_pc(),
+                CryptoHash::new([93; 32]), Data::new(vec![]));
+            let header = recovery_header(&block, future);
+            let (tx, rx) = std::sync::mpsc::channel();
+            let mut receiver = ProgressMessageStub::new(rx, BufferSize::new(1024 * 1024));
+            tx.send((origin, ProgressMessage::HotStuffMessage(header.clone().into()))).unwrap();
+            let (sender, received) = if bounded {
+                receiver.recv_before_body_retry(ChainID::new(0), view, Instant::now())
+            } else {
+                receiver.recv(ChainID::new(0), view, Instant::now() + Duration::from_secs(1))
+            }.unwrap();
+            let ProgressMessage::HotStuffMessage(message) = received else { panic!("header expected") };
+            let mut app = RecoveryApp { calls: 0, valid: true, reject_below: 0 };
+            hotstuff.on_receive_msg(message, &sender, &mut tree, &mut app).unwrap();
+            assert_eq!(tree.highest_view_voted().unwrap(), None);
+            assert!(matches!(hotstuff.proposal_status, ProposalStatus::WaitingForProposal));
+            assert!(hotstuff.body_fetch_tracker.contains_key(&block.hash));
+            hotstuff.on_receive_msg(HotStuffMessage::BlockDataResponse(BlockDataResponse {
+                view: future, block: block.clone(),
+            }), &origin, &mut tree, &mut app).unwrap();
+            assert!(tree.contains(&block.hash));
+            assert_eq!(app.calls, 1);
+            assert_eq!(tree.highest_view_voted().unwrap(), None);
 
-        // The receive queue already cached this future header. A non-proposer
-        // enters its view, then consumes it without requiring a network resend.
-        hotstuff.enter_view(ViewInfo::new(future, Instant::now() + Duration::from_secs(60)),
-            &mut tree, &mut app).unwrap();
-        let (sender, received) = receiver.recv(ChainID::new(0), future,
-            Instant::now() + Duration::from_secs(1)).unwrap();
-        let ProgressMessage::HotStuffMessage(message) = received else { panic!("cached header expected") };
-        hotstuff.on_receive_msg(message, &sender, &mut tree, &mut app).unwrap();
-        hotstuff.on_receive_msg(header.into(), &origin, &mut tree, &mut app).unwrap();
-        assert_eq!(tree.last_voted_proposal().unwrap(), Some((future, block.hash)));
-        let votes: Vec<_> = rx_events.try_iter().filter_map(|event| match event {
-            Event::PhaseVote(event) => Some(event.vote), _ => None,
-        }).collect();
-        assert_eq!(votes.len(), 1, "same-view delivery votes once, retransmission cannot double-vote");
-        assert_eq!(votes[0].view, future);
-        assert_eq!(votes[0].block, block.hash);
+            // The receive queue already cached this future header. A non-proposer
+            // enters its view, then consumes it without requiring a network resend.
+            hotstuff.enter_view(ViewInfo::new(future, Instant::now() + Duration::from_secs(60)),
+                &mut tree, &mut app).unwrap();
+            let (sender, received) = if bounded {
+                receiver.recv_before_body_retry(ChainID::new(0), future, Instant::now())
+            } else {
+                receiver.recv(ChainID::new(0), future, Instant::now() + Duration::from_secs(1))
+            }.unwrap();
+            let ProgressMessage::HotStuffMessage(message) = received else { panic!("cached header expected") };
+            hotstuff.on_receive_msg(message, &sender, &mut tree, &mut app).unwrap();
+            hotstuff.on_receive_msg(header.into(), &origin, &mut tree, &mut app).unwrap();
+            assert_eq!(tree.last_voted_proposal().unwrap(), Some((future, block.hash)));
+            let votes: Vec<_> = rx_events.try_iter().filter_map(|event| match event {
+                Event::PhaseVote(event) => Some(event.vote), _ => None,
+            }).collect();
+            assert_eq!(votes.len(), 1, "same-view delivery votes once, retransmission cannot double-vote");
+            assert_eq!(votes[0].view, future);
+            assert_eq!(votes[0].block, block.hash);
+        }
     }
 
     #[test]

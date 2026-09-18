@@ -26,7 +26,7 @@ use crate::{
         receiving::{ProgressMessageReceiveError, ProgressMessageStub},
         sending::SenderHandle,
     },
-    pacemaker::implementation::{Pacemaker, PacemakerConfiguration},
+    pacemaker::implementation::{Pacemaker, PacemakerConfiguration, ViewInfo},
     types::data_types::{BufferSize, ChainID, ViewNumber},
 };
 
@@ -154,6 +154,13 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
         }
         // S444 LIVE RECONCILE watchdog cadence (see step 9 in the loop).
         let mut last_feed_reconcile = Instant::now();
+        let body_before_expiry = body_before_expiry_enabled(
+            std::env::var("TORUS_BODY_BEFORE_EXPIRY").ok().as_deref(),
+        );
+        if body_before_expiry {
+            log::info!("body receive before expiry enabled: max_raw_envelopes={}",
+                ProgressMessageStub::MAX_BEFORE_RETRY_ENVELOPES);
+        }
 
         loop {
             // 1. Check whether the library user has issued a shutdown command. If so, break.
@@ -222,97 +229,9 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
                 log::error!("HotStuff poll_block_data_responses error: {:?}", e);
             }
 
-            // 6c. Retry stale body fetches (proposer first, then rotate across the
-            // other validators); trigger sync after max retries.
-            self.hotstuff.tick_pending_body_retries(&self.block_tree);
-            // 6d. S426: retry by-hash fetches for unknown justify blocks (a QC that
-            // formed on an undisseminated block); fall back to sync on exhaustion.
-            self.hotstuff.tick_justify_fetch_retries(&self.block_tree);
-            // 6e. S432: follower body-starvation heal — if our (view-current)
-            // highest_pc points at a block whose body we never obtained, by-hash
-            // fetch it (or walk back a parked block's missing parent) instead of
-            // waiting for the 60s no-progress sync timeout. Self-throttled.
-            if let Err(e) = self.hotstuff.tick_missing_pc_block_fetch(&self.block_tree) {
-                log::error!("HotStuff tick_missing_pc_block_fetch error: {:?}", e);
-            }
-            if self.hotstuff.take_sync_needed() {
-                if let Err(e) = self.block_sync_client.trigger_sync(&mut self.block_tree) {
-                    log::error!(
-                        "BlockSync trigger_sync (body retry exhausted) error: {:?}",
-                        e
-                    );
-                }
-            }
-
-            // 7. Poll the network for incoming messages.
-            // Use a short deadline during active sync so we don't park for 500ms between batches.
-            let recv_deadline = if self.block_sync_client.has_pending_sync()
-                || self.hotstuff.has_deferred_proposal()
-                || self.hotstuff.has_pending_body_fetches()
-                || self.hotstuff.has_pending_justify_fetches()
-                || self.hotstuff.has_deferred_sync_retries()
-            {
-                std::cmp::min(
-                    view_info.deadline,
-                    Instant::now() + Duration::from_millis(10),
-                )
-            } else {
-                view_info.deadline
-            };
-            match self
-                .pm_stub
-                .recv(self.chain_id, view_info.view, recv_deadline)
-            {
-                Ok((origin, msg)) => match msg {
-                    ProgressMessage::HotStuffMessage(msg) => {
-                        if let Err(e) = self.hotstuff.on_receive_msg(
-                            msg,
-                            &origin,
-                            &mut self.block_tree,
-                            &mut self.app,
-                        ) {
-                            log::error!(
-                                "HotStuff on_receive_msg error: {:?} — dropping message",
-                                e
-                            );
-                        }
-                        if self.hotstuff.take_sync_needed() {
-                            if let Err(e) =
-                                self.block_sync_client.trigger_sync(&mut self.block_tree)
-                            {
-                                log::error!("BlockSync trigger_sync error: {:?}", e);
-                            }
-                        }
-                    }
-                    ProgressMessage::PacemakerMessage(msg) => {
-                        if let Err(e) =
-                            self.pacemaker
-                                .on_receive_msg(msg, &origin, &mut self.block_tree)
-                        {
-                            log::error!(
-                                "Pacemaker on_receive_msg error: {:?} — dropping message",
-                                e
-                            );
-                        }
-                    }
-                    ProgressMessage::BlockSyncAdvertiseMessage(msg) => {
-                        if let Err(e) = self.block_sync_client.on_receive_msg(
-                            msg,
-                            &origin,
-                            &mut self.block_tree,
-                        ) {
-                            log::error!(
-                                "BlockSync on_receive_msg error: {:?} — dropping message",
-                                e
-                            );
-                        }
-                    }
-                },
-                Err(ProgressMessageReceiveError::Disconnected) => {
-                    panic!("The poller has disconnected!")
-                }
-                Err(ProgressMessageReceiveError::Timeout) => {}
-            }
+            // The experimental path has the same single ordinary dispatch slot;
+            // only its ordering versus retry maintenance and receive budget differ.
+            self.poll_progress_and_retry(view_info.clone(), body_before_expiry);
 
             // 8. Let the block sync client update its internal state, and trigger sync if needed.
             if let Err(e) = self.block_sync_client.tick(&mut self.block_tree) {
@@ -349,4 +268,124 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
             }
         }
     }
+
+    fn poll_progress_and_retry(&mut self, view_info: ViewInfo, body_before_expiry: bool) {
+        // Capture once: when idle, maintenance must still arm missing-PC recovery
+        // before waiting. Freshly armed fetches cannot expire in that same tick.
+        let body_before_expiry = body_before_expiry
+            && (self.hotstuff.has_pending_body_fetches()
+                || self.hotstuff.has_pending_justify_fetches());
+        if !body_before_expiry {
+            self.tick_body_retries();
+        }
+        // 7. Poll the network for incoming messages.
+        // Use a short deadline during active sync so we don't park for 500ms between batches.
+        let recv_deadline = if self.block_sync_client.has_pending_sync()
+            || self.hotstuff.has_deferred_proposal()
+            || self.hotstuff.has_pending_body_fetches()
+            || self.hotstuff.has_pending_justify_fetches()
+            || self.hotstuff.has_deferred_sync_retries()
+        {
+            std::cmp::min(
+                view_info.deadline,
+                Instant::now() + Duration::from_millis(10),
+            )
+        } else {
+            view_info.deadline
+        };
+        let received = if body_before_expiry {
+            self.pm_stub.recv_before_body_retry(self.chain_id, view_info.view, recv_deadline)
+        } else {
+            self.pm_stub.recv(self.chain_id, view_info.view, recv_deadline)
+        };
+        match received {
+            Ok((origin, msg)) => match msg {
+                ProgressMessage::HotStuffMessage(msg) => {
+                    if let Err(e) = self.hotstuff.on_receive_msg(
+                        msg,
+                        &origin,
+                        &mut self.block_tree,
+                        &mut self.app,
+                    ) {
+                        log::error!(
+                            "HotStuff on_receive_msg error: {:?} — dropping message",
+                            e
+                        );
+                    }
+                    if self.hotstuff.take_sync_needed() {
+                        if let Err(e) =
+                            self.block_sync_client.trigger_sync(&mut self.block_tree)
+                        {
+                            log::error!("BlockSync trigger_sync error: {:?}", e);
+                        }
+                    }
+                }
+                ProgressMessage::PacemakerMessage(msg) => {
+                    if let Err(e) =
+                        self.pacemaker
+                            .on_receive_msg(msg, &origin, &mut self.block_tree)
+                    {
+                        log::error!(
+                            "Pacemaker on_receive_msg error: {:?} — dropping message",
+                            e
+                        );
+                    }
+                }
+                ProgressMessage::BlockSyncAdvertiseMessage(msg) => {
+                    if let Err(e) = self.block_sync_client.on_receive_msg(
+                        msg,
+                        &origin,
+                        &mut self.block_tree,
+                    ) {
+                        log::error!(
+                            "BlockSync on_receive_msg error: {:?} — dropping message",
+                            e
+                        );
+                    }
+                }
+            },
+            Err(ProgressMessageReceiveError::Disconnected) => {
+                panic!("The poller has disconnected!")
+            }
+            Err(ProgressMessageReceiveError::Timeout) => {}
+        }
+
+        if body_before_expiry {
+            self.tick_body_retries();
+        }
+    }
+
+    fn tick_body_retries(&mut self) {
+        // 6c. Retry stale body fetches (proposer first, then rotate across the
+        // other validators); trigger sync after max retries.
+        self.hotstuff.tick_pending_body_retries(&self.block_tree);
+        // 6d. S426: retry by-hash fetches for unknown justify blocks (a QC that
+        // formed on an undisseminated block); fall back to sync on exhaustion.
+        self.hotstuff.tick_justify_fetch_retries(&self.block_tree);
+        // 6e. S432: follower body-starvation heal — if our (view-current)
+        // highest_pc points at a block whose body we never obtained, by-hash
+        // fetch it (or walk back a parked block's missing parent) instead of
+        // waiting for the 60s no-progress sync timeout. Self-throttled.
+        if let Err(e) = self.hotstuff.tick_missing_pc_block_fetch(&self.block_tree) {
+            log::error!("HotStuff tick_missing_pc_block_fetch error: {:?}", e);
+        }
+        if self.hotstuff.take_sync_needed() {
+            if let Err(e) = self.block_sync_client.trigger_sync(&mut self.block_tree) {
+                log::error!(
+                    "BlockSync trigger_sync (body retry exhausted) error: {:?}",
+                    e
+                );
+            }
+        }
+    }
 }
+
+// Only the explicit value 1 enables this experiment. Parse separately so tests
+// never mutate process-global environment variables.
+fn body_before_expiry_enabled(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+#[cfg(test)]
+#[path = "body_before_expiry_tests.rs"]
+mod body_before_expiry_tests;

@@ -134,6 +134,10 @@ fn is_chain_neutral_genesis_body(message: &ProgressMessage) -> bool {
 pub(crate) struct ProgressMessageStub {
     receiver: Receiver<(VerifyingKey, ProgressMessage)>,
     msg_buffer: ProgressMessageBuffer,
+    // Tests synchronize only after the initial empty-channel observation so
+    // producer scheduling cannot accidentally exercise the ready-message path.
+    #[cfg(test)]
+    before_retry_wait: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl ProgressMessageStub {
@@ -146,6 +150,8 @@ impl ProgressMessageStub {
         Self {
             receiver,
             msg_buffer,
+            #[cfg(test)]
+            before_retry_wait: None,
         }
     }
 
@@ -171,48 +177,8 @@ impl ProgressMessageStub {
         while Instant::now() < deadline {
             match self.receiver.recv_timeout(deadline - Instant::now()) {
                 Ok((sender, msg)) => {
-                    if msg.chain_id() != chain_id && !is_chain_neutral_genesis_body(&msg) {
-                        continue;
-                    }
-
-                    // If the message is for a future view then cache it.
-                    //
-                    // Note:
-                    // If `msg` is a Pacemaker Message and `msg.view > cur_view`, then we will cache the message *and*
-                    // return it. This is to give the message two opportunities to be processed: 1. When the message is
-                    // first received, and 2. When the replica is in `msg.view` and therefore caught up with the validator
-                    // set.
-                    //
-                    // This behavior is not absolutely necessary, but helps with liveness.
-                    if msg.view().is_some_and(|view| view > cur_view) {
-                        match msg.clone() {
-                            ProgressMessage::HotStuffMessage(msg) => {
-                                self.msg_buffer.insert(msg, sender);
-                            }
-                            ProgressMessage::PacemakerMessage(msg) => {
-                                self.msg_buffer.insert(msg, sender);
-                            }
-                            ProgressMessage::BlockSyncAdvertiseMessage(_) => (),
-                        }
-                    }
-
-                    // Return the message if either:
-                    // 1. It is a HotStuff message for the current view, or
-                    // 1b. It is a block data fetch message (viewless — body may arrive after view advances), or
-                    // 2. If it is a Pacemaker message for the current view or a future view, or
-                    // 3. If it is a BlockSyncAdvertise message.
-                    let return_msg = match &msg {
-                        ProgressMessage::HotStuffMessage(hotstuff_msg) => {
-                            hotstuff_msg.view() == cur_view || hotstuff_msg.is_block_data_msg()
-                        }
-                        ProgressMessage::PacemakerMessage(pacemaker_msg) => {
-                            pacemaker_msg.view() >= cur_view
-                        }
-                        ProgressMessage::BlockSyncAdvertiseMessage(_) => true,
-                    };
-
-                    if return_msg {
-                        return Ok((sender, msg));
+                    if let Some(message) = self.filter_message(chain_id, cur_view, sender, msg) {
+                        return Ok(message);
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => thread::yield_now(),
@@ -223,6 +189,92 @@ impl ProgressMessageStub {
         }
 
         Err(ProgressMessageReceiveError::Timeout)
+    }
+
+    /// Experimental ordinary receive before body expiry. Inspect at most eight
+    /// raw channel envelopes, including rejected and future-only messages.
+    /// Ready messages are considered even after the view deadline; waiting is
+    /// allowed only while the original deadline remains in the future.
+    pub(crate) fn recv_before_body_retry(
+        &mut self,
+        chain_id: ChainID,
+        cur_view: ViewNumber,
+        deadline: Instant,
+    ) -> Result<(VerifyingKey, ProgressMessage), ProgressMessageReceiveError> {
+        self.msg_buffer.remove_expired_msgs(cur_view);
+        if let Some(message) = self.msg_buffer.get_msg(&cur_view) {
+            return Ok(message);
+        }
+        for _ in 0..Self::MAX_BEFORE_RETRY_ENVELOPES {
+            let (sender, msg) = match self.receiver.try_recv() {
+                Ok(message) => message,
+                Err(TryRecvError::Disconnected) => {
+                    return Err(ProgressMessageReceiveError::Disconnected);
+                }
+                Err(TryRecvError::Empty) => {
+                    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                        return Err(ProgressMessageReceiveError::Timeout);
+                    };
+                    #[cfg(test)]
+                    if let Some(before_wait) = self.before_retry_wait.take() {
+                        before_wait();
+                    }
+                    match self.receiver.recv_timeout(remaining) {
+                        Ok(message) => message,
+                        Err(RecvTimeoutError::Timeout) => {
+                            return Err(ProgressMessageReceiveError::Timeout);
+                        }
+                        Err(RecvTimeoutError::Disconnected) => {
+                            return Err(ProgressMessageReceiveError::Disconnected);
+                        }
+                    }
+                }
+            };
+            if let Some(message) = self.filter_message(chain_id, cur_view, sender, msg) {
+                return Ok(message);
+            }
+        }
+        Err(ProgressMessageReceiveError::Timeout)
+    }
+
+    pub(crate) const MAX_BEFORE_RETRY_ENVELOPES: usize = 8;
+
+    /// Both receive policies share the existing chain/view/buffering decisions.
+    /// A future-view recovery message is still cached AND delivered immediately.
+    fn filter_message(
+        &mut self,
+        chain_id: ChainID,
+        cur_view: ViewNumber,
+        sender: VerifyingKey,
+        msg: ProgressMessage,
+    ) -> Option<(VerifyingKey, ProgressMessage)> {
+        if msg.chain_id() != chain_id && !is_chain_neutral_genesis_body(&msg) {
+            return None;
+        }
+
+        // Future messages retain their second opportunity when the local view
+        // catches up (including recovery messages delivered immediately below).
+        if msg.view().is_some_and(|view| view > cur_view) {
+            match msg.clone() {
+                ProgressMessage::HotStuffMessage(msg) => {
+                    self.msg_buffer.insert(msg, sender);
+                }
+                ProgressMessage::PacemakerMessage(msg) => {
+                    self.msg_buffer.insert(msg, sender);
+                }
+                ProgressMessage::BlockSyncAdvertiseMessage(_) => (),
+            }
+        }
+        let return_msg = match &msg {
+            ProgressMessage::HotStuffMessage(hotstuff_msg) => {
+                hotstuff_msg.view() == cur_view || hotstuff_msg.is_block_data_msg()
+            }
+            ProgressMessage::PacemakerMessage(pacemaker_msg) => {
+                pacemaker_msg.view() >= cur_view
+            }
+            ProgressMessage::BlockSyncAdvertiseMessage(_) => true,
+        };
+        return_msg.then_some((sender, msg))
     }
 }
 
@@ -590,44 +642,59 @@ mod genesis_body_filter_tests {
         }))
     }
 
+    fn receive(receiver: &mut ProgressMessageStub, bounded: bool, chain: ChainID)
+        -> Result<(VerifyingKey, ProgressMessage), ProgressMessageReceiveError>
+    {
+        if bounded {
+            receiver.recv_before_body_retry(chain, ViewNumber::new(5), Instant::now())
+        } else {
+            receiver.recv(chain, ViewNumber::new(5), Instant::now() + Duration::from_secs(1))
+        }
+    }
+
     #[test]
     fn nonzero_chain_receives_only_structurally_valid_genesis_body_exception() {
-        let chain = ChainID::new(7778);
-        let parent = Block::new(BlockHeight::new(0), PhaseCertificate::genesis_pc(),
-            CryptoHash::new([9; 32]), Data::new(vec![]));
-        let sender = SigningKey::from_bytes(&[1; 32]).verifying_key();
-        let (tx, rx) = mpsc::channel();
-        let mut receiver = ProgressMessageStub::new(rx, BufferSize::new(1024 * 1024));
-        let mut forged_hash = parent.clone();
-        forged_hash.hash = CryptoHash::new([99; 32]);
-        let wrong_height = Block::new(BlockHeight::new(1), PhaseCertificate::genesis_pc(),
-            parent.data_hash, Data::new(vec![]));
-        let mut non_genesis_pc = PhaseCertificate::genesis_pc();
-        non_genesis_pc.view = ViewNumber::new(2);
-        let non_genesis = Block::new(BlockHeight::new(0), non_genesis_pc,
-            parent.data_hash, Data::new(vec![]));
-        let wrong_request = ProgressMessage::HotStuffMessage(HotStuffMessage::BlockDataRequest(BlockDataRequest {
-            chain_id: ChainID::new(0), view: ViewNumber::new(1), block_hash: parent.hash,
-        }));
-        let wrong_header = ProgressMessage::HotStuffMessage(HotStuffMessage::ProposalHeader(ProposalHeader {
-            chain_id: ChainID::new(0), view: ViewNumber::new(1), block_hash: parent.hash,
-            height: parent.height, data_hash: parent.data_hash, justify: parent.justify.clone(),
-            tc: None, nec: None, has_validator_set_updates: false,
-        }));
-        for msg in [response(forged_hash), response(wrong_height), response(non_genesis), wrong_request, wrong_header] {
-            assert!(!is_chain_neutral_genesis_body(&msg));
-            tx.send((sender, msg)).unwrap();
+        for bounded in [false, true] {
+            let chain = ChainID::new(7778);
+            let parent = Block::new(BlockHeight::new(0), PhaseCertificate::genesis_pc(),
+                CryptoHash::new([9; 32]), Data::new(vec![]));
+            let sender = SigningKey::from_bytes(&[1; 32]).verifying_key();
+            let (tx, rx) = mpsc::channel();
+            let mut receiver = ProgressMessageStub::new(rx, BufferSize::new(1024 * 1024));
+            let mut forged_hash = parent.clone();
+            forged_hash.hash = CryptoHash::new([99; 32]);
+            let wrong_height = Block::new(BlockHeight::new(1), PhaseCertificate::genesis_pc(),
+                parent.data_hash, Data::new(vec![]));
+            let mut non_genesis_pc = PhaseCertificate::genesis_pc();
+            non_genesis_pc.view = ViewNumber::new(2);
+            let non_genesis = Block::new(BlockHeight::new(0), non_genesis_pc,
+                parent.data_hash, Data::new(vec![]));
+            let wrong_request = ProgressMessage::HotStuffMessage(HotStuffMessage::BlockDataRequest(BlockDataRequest {
+                chain_id: ChainID::new(0), view: ViewNumber::new(1), block_hash: parent.hash,
+            }));
+            let wrong_header = ProgressMessage::HotStuffMessage(HotStuffMessage::ProposalHeader(ProposalHeader {
+                chain_id: ChainID::new(0), view: ViewNumber::new(1), block_hash: parent.hash,
+                height: parent.height, data_hash: parent.data_hash, justify: parent.justify.clone(),
+                tc: None, nec: None, has_validator_set_updates: false,
+            }));
+            for msg in [response(forged_hash), response(wrong_height), response(non_genesis), wrong_request, wrong_header] {
+                assert!(!is_chain_neutral_genesis_body(&msg));
+                tx.send((sender, msg)).unwrap();
+            }
+            tx.send((sender, response(parent.clone()))).unwrap();
+            let (_, received) = receive(&mut receiver, bounded, chain).expect("genesis body must cross nonzero-chain filter even late");
+            assert!(matches!(received, ProgressMessage::HotStuffMessage(HotStuffMessage::BlockDataResponse(r))
+                if r.block.hash == parent.hash && r.block.justify.is_genesis_pc()));
+            // A same-chain request must retain ordinary delivery semantics.
+            tx.send((sender, ProgressMessage::HotStuffMessage(HotStuffMessage::BlockDataRequest(BlockDataRequest {
+                chain_id: chain, view: ViewNumber::new(1), block_hash: parent.hash,
+            })))).unwrap();
+            let (_, received) = receive(&mut receiver, bounded, chain).unwrap();
+            assert!(matches!(received, ProgressMessage::HotStuffMessage(HotStuffMessage::BlockDataRequest(r)) if r.chain_id == chain));
         }
-        tx.send((sender, response(parent.clone()))).unwrap();
-        let (_, received) = receiver.recv(chain, ViewNumber::new(5),
-            Instant::now() + Duration::from_secs(1)).expect("genesis body must cross nonzero-chain filter even late");
-        assert!(matches!(received, ProgressMessage::HotStuffMessage(HotStuffMessage::BlockDataResponse(r))
-            if r.block.hash == parent.hash && r.block.justify.is_genesis_pc()));
-        // A same-chain request must retain ordinary delivery semantics.
-        tx.send((sender, ProgressMessage::HotStuffMessage(HotStuffMessage::BlockDataRequest(BlockDataRequest {
-            chain_id: chain, view: ViewNumber::new(1), block_hash: parent.hash,
-        })))).unwrap();
-        let (_, received) = receiver.recv(chain, ViewNumber::new(5), Instant::now() + Duration::from_secs(1)).unwrap();
-        assert!(matches!(received, ProgressMessage::HotStuffMessage(HotStuffMessage::BlockDataRequest(r)) if r.chain_id == chain));
     }
 }
+
+#[cfg(test)]
+#[path = "before_retry_receive_tests.rs"]
+mod before_retry_receive_tests;
