@@ -520,10 +520,108 @@ pub(crate) fn wedge_diag_enabled() -> bool {
 }
 
 /// Opt-in payload-free diagnostics for body-fetch recovery. Disabled by default.
-pub(crate) fn body_fetch_trace_enabled() -> bool {
+#[doc(hidden)]
+pub fn body_fetch_trace_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var("TORUS_BODY_FETCH_TRACE")
         .map(|value| value == "1").unwrap_or(false))
+}
+
+/// Process-local body-fetch diagnostic clock, shared with the network adapter.
+/// `mono_us` is comparable only within one process lifetime. `seq` is unique
+/// within that lifetime, but is not a cross-thread timestamp ordering promise.
+/// Wall time is signed Unix microseconds and may jump independently of `mono_us`.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub struct BodyFetchTraceStamp {
+    pub pid: u32,
+    pub seq: u64,
+    pub mono_us: u128,
+    pub unix_us: i128,
+}
+
+impl BodyFetchTraceStamp {
+    /// Capture only inside the opt-in trace branch; performs no allocation.
+    pub fn capture() -> Self {
+        use std::sync::{atomic::{AtomicU64, Ordering}, OnceLock};
+        use std::time::Instant;
+        static START: OnceLock<Instant> = OnceLock::new();
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        let start = START.get_or_init(Instant::now);
+        let mono_us = start.elapsed().as_micros();
+        let unix_us = match SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
+            Ok(delta) => delta.as_micros() as i128,
+            Err(error) => -(error.duration().as_micros() as i128),
+        };
+        Self {
+            pid: std::process::id(),
+            seq: SEQUENCE.fetch_add(1, Ordering::Relaxed),
+            mono_us,
+            unix_us,
+        }
+    }
+}
+
+impl std::fmt::Display for BodyFetchTraceStamp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "pid={} seq={} mono_us={} unix_us={}",
+            self.pid, self.seq, self.mono_us, self.unix_us)
+    }
+}
+
+/// Full, unpadded base64 identity; formatting uses a fixed stack buffer.
+#[doc(hidden)]
+pub struct BodyFetchTraceId(pub [u8; 32]);
+
+impl std::fmt::Display for BodyFetchTraceId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut encoded = [0u8; 44];
+        let len = STANDARD_NO_PAD.encode_slice(self.0, &mut encoded)
+            .map_err(|_| std::fmt::Error)?;
+        f.write_str(std::str::from_utf8(&encoded[..len]).map_err(|_| std::fmt::Error)?)
+    }
+}
+
+#[cfg(test)]
+mod body_fetch_trace_tests {
+    use super::*;
+
+    #[test]
+    fn clock_schema_and_sequential_samples_are_consistent() {
+        let first = BodyFetchTraceStamp::capture();
+        let second = BodyFetchTraceStamp::capture();
+        assert_eq!(first.pid, std::process::id());
+        assert_eq!(second.pid, first.pid);
+        assert!(second.seq > first.seq);
+        assert!(second.mono_us >= first.mono_us);
+        // Do not require wall-clock monotonicity (NTP/manual adjustment).
+        let fixed = BodyFetchTraceStamp { pid: 7, seq: 8, mono_us: 9, unix_us: -10 };
+        assert_eq!(fixed.to_string(), "pid=7 seq=8 mono_us=9 unix_us=-10");
+    }
+
+    #[test]
+    fn full_identity_round_trips_even_when_prefixes_collide() {
+        let first = [0u8; 32];
+        let mut second = first;
+        second[31] = 1;
+        let first_encoded = BodyFetchTraceId(first).to_string();
+        let second_encoded = BodyFetchTraceId(second).to_string();
+        assert_eq!(&first_encoded[..7], &second_encoded[..7]);
+        assert_ne!(first_encoded, second_encoded);
+        assert_eq!(first_encoded.len(), 43);
+        assert_eq!(STANDARD_NO_PAD.decode(first_encoded).unwrap(), first);
+        assert_eq!(STANDARD_NO_PAD.decode(second_encoded).unwrap(), second);
+    }
+
+    #[test]
+    fn clock_sequence_is_shared_between_threads() {
+        let workers: Vec<_> = (0..4).map(|_| std::thread::spawn(|| {
+            (0..8).map(|_| BodyFetchTraceStamp::capture().seq).collect::<Vec<_>>()
+        })).collect();
+        let samples: Vec<_> = workers.into_iter().flat_map(|worker| worker.join().unwrap()).collect();
+        let unique: std::collections::HashSet<_> = samples.iter().copied().collect();
+        assert_eq!(unique.len(), samples.len());
+    }
 }
 
 /// Short human-readable prefix of a block hash for wedge diagnostic lines.

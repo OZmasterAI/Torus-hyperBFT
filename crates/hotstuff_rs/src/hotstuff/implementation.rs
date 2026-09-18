@@ -2102,17 +2102,20 @@ impl<N: Network> HotStuff<N> {
         origin: &VerifyingKey,
         block_tree: &mut BlockTreeSingleton<K>,
     ) -> Result<(), HotStuffError> {
+        let trace_entry = crate::logging::body_fetch_trace_enabled()
+            .then(crate::logging::BodyFetchTraceStamp::capture);
         let block = if let Some(block) = self.pending_bodies.get(&req.block_hash) {
             Some(block.clone())
         } else {
             block_tree.block(&req.block_hash)?
         };
 
-        if crate::logging::body_fetch_trace_enabled()
-            && (block.is_none() || block.as_ref().is_some_and(|b| b.justify.is_genesis_pc()))
-        {
-            log::info!("body_fetch_diag serve: request_view={} local_view={} hash={} found={} height={:?}",
-                req.view.int(), self.view_info.view.int(), crate::logging::block_prefix(&req.block_hash),
+        if let Some(entry) = trace_entry {
+            let lookup_done = crate::logging::BodyFetchTraceStamp::capture();
+            log::info!("body_fetch_diag serve: {} lookup_done_seq={} lookup_done_mono_us={} lookup_done_unix_us={} peer={} request_view={} local_view={} hash={} found={} height={:?}",
+                entry, lookup_done.seq, lookup_done.mono_us, lookup_done.unix_us,
+                crate::logging::BodyFetchTraceId(origin.to_bytes()),
+                req.view.int(), self.view_info.view.int(), crate::logging::BodyFetchTraceId(req.block_hash.bytes()),
                 block.is_some(), block.as_ref().map(|b| b.height.int()));
         }
         if let Some(block) = block {
@@ -2132,10 +2135,12 @@ impl<N: Network> HotStuff<N> {
     fn on_receive_block_data_response<K: KVStore>(
         &mut self,
         resp: BlockDataResponse,
-        _origin: &VerifyingKey,
+        origin: &VerifyingKey,
         block_tree: &mut BlockTreeSingleton<K>,
         app: &mut impl App<K>,
     ) -> Result<(), HotStuffError> {
+        let trace_entry = crate::logging::body_fetch_trace_enabled()
+            .then(crate::logging::BodyFetchTraceStamp::capture);
         let block = resp.block;
         let block_hash = block.hash;
 
@@ -2147,12 +2152,11 @@ impl<N: Network> HotStuff<N> {
         // block never implies a vote (safe_pc gates any vote independently).
         let tracked_as_body = self.pending_headers.contains_key(&block_hash);
         let tracked_as_justify = self.justify_fetch_tracker.contains_key(&block_hash);
-        if crate::logging::body_fetch_trace_enabled()
-            && (!tracked_as_body || self.body_fetch_tracker.get(&block_hash).is_some_and(|(_, count, _)| *count > 0))
-        {
-            log::info!("body_fetch_diag receive: response_view={} local_view={} hash={} height={} parent={} tracked_header={} tracked_justify={} deferred={} retries={:?}",
-                resp.view.int(), self.view_info.view.int(), crate::logging::block_prefix(&block_hash),
-                block.height.int(), crate::logging::block_prefix(&block.justify.block), tracked_as_body,
+        if let Some(entry) = trace_entry {
+            log::info!("body_fetch_diag receive: {} peer={} response_view={} local_view={} hash={} height={} parent={} tracked_header={} tracked_justify={} deferred={} retries={:?}",
+                entry, crate::logging::BodyFetchTraceId(origin.to_bytes()),
+                resp.view.int(), self.view_info.view.int(), crate::logging::BodyFetchTraceId(block_hash.bytes()),
+                block.height.int(), crate::logging::BodyFetchTraceId(block.justify.block.bytes()), tracked_as_body,
                 tracked_as_justify, self.deferred_bodies.contains_key(&block_hash),
                 self.body_fetch_tracker.get(&block_hash).map(|(_, count, _)| *count));
         }

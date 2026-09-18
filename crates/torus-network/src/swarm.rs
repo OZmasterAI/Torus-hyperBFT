@@ -2859,6 +2859,18 @@ fn enqueue_inbound(
     // Admission/cache poisoning, pre-verification DA writes, and duplicate
     // validation histogram observations remain flag-ON gates.
     tee_proposal_datum(shared, &msg);
+    if hotstuff_rs::logging::body_fetch_trace_enabled() {
+        if let Some(meta) = body_fetch_trace_metadata(&msg) {
+            return enqueue_body_fetch_traced(shared, sender, msg, meta, |record| {
+                info!("body_fetch_diag admission: {} kind={} peer={} view={} hash={} admitted={} queue_depth_before={} queue_depth_after={}",
+                    record.stamp, record.meta.kind,
+                    hotstuff_rs::logging::BodyFetchTraceId(sender.to_bytes()),
+                    record.meta.view, hotstuff_rs::logging::BodyFetchTraceId(record.meta.hash),
+                    record.admitted, record.depth_before, record.depth_after);
+            });
+        }
+    }
+    // Keep the disabled path's allocation, queue and logging behavior unchanged.
     let mut queue = shared.inbound.lock().unwrap();
     if queue.len() >= MAX_INBOUND_QUEUE {
         warn!("inbound queue full ({MAX_INBOUND_QUEUE}), dropping incoming message");
@@ -2866,6 +2878,64 @@ fn enqueue_inbound(
     }
     queue.push_back((sender, msg));
     true
+}
+
+#[derive(Clone, Copy)]
+struct BodyFetchTraceMetadata {
+    kind: &'static str,
+    view: u64,
+    hash: [u8; 32],
+}
+
+fn body_fetch_trace_metadata(
+    msg: &hotstuff_rs::networking::messages::Message,
+) -> Option<BodyFetchTraceMetadata> {
+    use hotstuff_rs::hotstuff::messages::HotStuffMessage;
+    use hotstuff_rs::networking::messages::{Message, ProgressMessage};
+    let Message::ProgressMessage(ProgressMessage::HotStuffMessage(msg)) = msg else {
+        return None;
+    };
+    let (kind, view, hash) = match msg {
+        HotStuffMessage::ProposalHeader(header) => ("header", header.view, header.block_hash),
+        HotStuffMessage::BlockDataRequest(request) => ("request", request.view, request.block_hash),
+        HotStuffMessage::BlockDataResponse(response) => ("response", response.view, response.block.hash),
+        _ => return None,
+    };
+    Some(BodyFetchTraceMetadata { kind, view: view.int(), hash: hash.bytes() })
+}
+
+struct BodyFetchAdmissionTrace {
+    stamp: hotstuff_rs::logging::BodyFetchTraceStamp,
+    meta: BodyFetchTraceMetadata,
+    admitted: bool,
+    depth_before: usize,
+    depth_after: usize,
+}
+
+/// Only called with tracing enabled. Capture fixed-size metadata at the queue
+/// boundary, then release its mutex before formatting or invoking the logger.
+/// This is post-decode/tee admission, not a timestamp of bytes arriving on wire.
+fn enqueue_body_fetch_traced(
+    shared: &SharedState,
+    sender: VerifyingKey,
+    msg: hotstuff_rs::networking::messages::Message,
+    meta: BodyFetchTraceMetadata,
+    emit: impl FnOnce(BodyFetchAdmissionTrace),
+) -> bool {
+    let mut queue = shared.inbound.lock().unwrap();
+    let depth_before = queue.len();
+    let admitted = depth_before < MAX_INBOUND_QUEUE;
+    let stamp = hotstuff_rs::logging::BodyFetchTraceStamp::capture();
+    if admitted {
+        queue.push_back((sender, msg));
+    }
+    let depth_after = queue.len();
+    drop(queue);
+    if !admitted {
+        warn!("inbound queue full ({MAX_INBOUND_QUEUE}), dropping incoming message");
+    }
+    emit(BodyFetchAdmissionTrace { stamp, meta, admitted, depth_before, depth_after });
+    admitted
 }
 
 /// Item 3 (TORUS_ASYNC_VALIDATE): hand the datum bytes of an inbound proposal
@@ -3336,6 +3406,80 @@ mod tests {
             leader_resolver: RwLock::new(None),
             validate_tee: OnceLock::new(),
         }
+    }
+
+    #[test]
+    fn body_fetch_trace_classifies_full_identities_without_changing_messages() {
+        use hotstuff_rs::hotstuff::messages::{
+            BlockDataRequest, BlockDataResponse, HotStuffMessage, Proposal, ProposalHeader,
+        };
+        use hotstuff_rs::hotstuff::types::PhaseCertificate;
+        use hotstuff_rs::types::block::Block;
+        use hotstuff_rs::types::data_types::{BlockHeight, ChainID, CryptoHash, Data, Datum, ViewNumber};
+        let proposal = Proposal {
+            chain_id: ChainID::new(7), view: ViewNumber::new(42),
+            block: Block::new(BlockHeight::new(3), PhaseCertificate::genesis_pc(),
+                CryptoHash::new([2; 32]), Data::new(vec![Datum::new(vec![9, 8, 7])])),
+            tc: None, nec: None,
+        };
+        let hash = proposal.block.hash.bytes();
+        let messages = [
+            ("header", HotStuffMessage::ProposalHeader(ProposalHeader::from_proposal(&proposal, false))),
+            ("request", HotStuffMessage::BlockDataRequest(BlockDataRequest {
+                chain_id: proposal.chain_id, view: proposal.view, block_hash: proposal.block.hash,
+            })),
+            ("response", HotStuffMessage::BlockDataResponse(BlockDataResponse {
+                view: proposal.view, block: proposal.block.clone(),
+            })),
+        ];
+        let shared = test_shared();
+        for (index, (kind, message)) in messages.into_iter().enumerate() {
+            let message = message.into();
+            let meta = body_fetch_trace_metadata(&message).unwrap();
+            let expected = message.try_to_vec().unwrap();
+            let mut emitted = 0;
+            assert!(enqueue_body_fetch_traced(&shared, test_vk(1), message, meta, |record| {
+                // The real production emission boundary must not hold the mutex.
+                assert!(shared.inbound.try_lock().is_ok());
+                emitted += 1;
+                assert_eq!(record.meta.kind, kind);
+                assert_eq!(record.meta.hash, hash);
+                assert_eq!(record.meta.view, 42);
+                assert!(record.admitted);
+                assert_eq!(record.depth_before, index);
+                assert_eq!(record.depth_after, index + 1);
+                assert_eq!(record.stamp.pid, std::process::id());
+            }));
+            assert_eq!(emitted, 1);
+            assert_eq!(shared.inbound.lock().unwrap().back().unwrap().1.try_to_vec().unwrap(), expected);
+        }
+        assert!(body_fetch_trace_metadata(&HotStuffMessage::Proposal(proposal).into()).is_none());
+    }
+
+    #[test]
+    fn body_fetch_trace_emits_drop_after_unlock_without_evicting_or_enqueuing() {
+        use hotstuff_rs::hotstuff::messages::{BlockDataRequest, HotStuffMessage};
+        use hotstuff_rs::types::data_types::{ChainID, CryptoHash, ViewNumber};
+        let shared = test_shared();
+        let message: hotstuff_rs::networking::messages::Message =
+            HotStuffMessage::BlockDataRequest(BlockDataRequest {
+                chain_id: ChainID::new(1), view: ViewNumber::new(9), block_hash: CryptoHash::new([5; 32]),
+            }).into();
+        let meta = body_fetch_trace_metadata(&message).unwrap();
+        let original_sender = test_vk(1);
+        shared.inbound.lock().unwrap().resize_with(MAX_INBOUND_QUEUE, || (original_sender, message.clone()));
+        let expected = message.try_to_vec().unwrap();
+        let mut emitted = 0;
+        assert!(!enqueue_body_fetch_traced(&shared, test_vk(2), message, meta, |record| {
+            emitted += 1;
+            let queue = shared.inbound.try_lock().expect("logger runs outside queue lock");
+            assert!(!record.admitted);
+            assert_eq!(record.depth_before, MAX_INBOUND_QUEUE);
+            assert_eq!(record.depth_after, MAX_INBOUND_QUEUE);
+            assert_eq!(queue.len(), MAX_INBOUND_QUEUE);
+            assert!(queue.iter().all(|(sender, msg)| *sender == original_sender && msg.try_to_vec().unwrap() == expected));
+        }));
+        assert_eq!(emitted, 1);
     }
 
     /// Item 3 (TORUS_ASYNC_VALIDATE): an inbound Proposal's datum bytes reach the
