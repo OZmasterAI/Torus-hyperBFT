@@ -951,3 +951,44 @@ were block 1,799.25 ms, engine 1,004.78 ms (phase1 379.44 ms), save-books
 264.18 ms and flush 415.70 ms. Evidence is retained. Recurring dissemination
 failures make the already-qualified body-before-expiry same-binary OFF/ON
 experiment the next priority.
+
+
+### Body-before-expiry OFF/ON diagnostic pair
+
+Both cells use the same frozen `110ebfc` binary and scheduled generator, with
+the same 300-second ten-market stage-5 workload, cap200/rate76000,
+ENGINE0/MATCH18/SETTLE18, BODYFETCH1 and depth observation. Only
+`TORUS_BODY_BEFORE_EXPIRY` changes from explicit0 to1.
+
+| Cell | Verdict | Full-load fills/s | Measured seconds | First120 | Best60 | Drain seconds | Commit p95 ms |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `s60-body-before-off-10m-r1` | REJECT: dissemination | 27,237.8 | 312 | 39,765.4 | 46,150.9 | 39 | 8,059.5 |
+| `s60-body-before-on-10m-r1` | REJECT: dissemination | 35,749.6 | 313 | 44,308.8 | 50,485.0 | 148 | 3,763.7 |
+
+Both passed liveness and quiescent agreement; val1 exhausted one body fetch
+and used sync fallback in each. OFF idle probes were 2.5/2.8/0.8 blocks/s,
+whereas ON started at25.2. This pair does not establish a healthy throughput
+gain or resolve the dissemination issue. The policy remains default-off.
+
+The unchanged conservative timing analyzer parsed both complete log sets with
+zero errors and all process scopes eligible. Every expiry prefix resolved to
+one observed full hash; repeated request/response keys remain ambiguous for
+pairing. Small full-hash chronology excerpts are retained alongside the full
+analysis reports:
+
+- OFF val1 expired `oNntict...`, view308, at13:30:25.114178 UTC. Its first
+  response admission stamp was25.557292, 443.114 ms later; handler entry was
+ 25.561744. Val2 had already completed a successful lookup for val1 at
+ 23.899721, but duplicates prevent assigning that serve to this response.
+  The 1.658-second wall gap is not established transport latency.
+- ON val1 expired `+5+sMYm...`, view842, at13:40:16.181039 UTC. Its first
+  response admission stamp was16.202283, 21.244 ms later; the first handler
+  stamp was16.342949. Again, the response was not admitted before expiry.
+
+This pair reproduces the late-arrival class that the bounded receive-order
+policy cannot alone prevent; it does not invalidate the exercised queued-body
+behavior. The next diagnostic separates command enqueue/dequeue, serialization
+and send-request initiation. The network loop's biased preference for commands
+also leaves actual swarm polling/codec/delivery unresolved after initiation;
+source alone does not prove starvation. Completed OFF/ON databases occupied
+19.10/29.28 GiB and were inventoried and cleaned; all evidence remains.
