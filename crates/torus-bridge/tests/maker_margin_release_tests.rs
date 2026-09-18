@@ -20,9 +20,12 @@
 
 use alloy_primitives::Address;
 
-use torus_bridge::native_executor::{NativeExecContext, NativeExecutor};
+use torus_bridge::native_executor::{NativeActionResult, NativeExecContext, NativeExecutor};
+use torus_core::margin::{effective_max_leverage, MarginTier, MarketMarginConfig};
+use torus_core::order_book::OrderBook;
 use torus_core::position::NativeBalance;
-use torus_state::StateDb;
+use torus_state::cf::CF_NATIVE_BALANCES;
+use torus_state::{StateBackend, StateDb};
 use torus_types::{
     FixedPoint, MarketId, NativeAction, OrderType, PlaceOrderParams, TimeInForce,
 };
@@ -393,4 +396,314 @@ fn same_batch_is_deterministic_across_runs() {
     // Conservation: no reservation may be stranded for fully-settled traders.
     // C's sell fully filled -> C restored exactly.
     assert_eq!(first[2], (fp(FUNDING).raw(), 0), "C fully restored");
+}
+
+// Frozen f890e06 oracle: intentionally retain the original per-order config
+// lookup and general FixedPoint division, plus mutation and clamp ordering.
+fn legacy_cancel_all_margin(
+    ctx: &mut NativeExecContext,
+    sender: &Address,
+    market_id: Option<MarketId>,
+) -> NativeActionResult {
+    // FIX 2 (ECON-FIND-05): Compute total margin to release from cancelled orders.
+    let mut total_margin_release = FixedPoint::ZERO;
+
+    match market_id {
+        Some(mid) => {
+            if let Some(book) = ctx.order_books.get_mut(&mid) {
+                let cancelled = book.cancel_all(*sender, Some(mid));
+                if !cancelled.is_empty() {
+                    ctx.dirty_books.insert(mid);
+                }
+                for order in &cancelled {
+                    let notional = order.price * order.remaining_qty;
+                    let max_lev = ctx
+                        .margin_configs
+                        .get(&mid)
+                        .map(|c| effective_max_leverage(&c.tiers, notional))
+                        .unwrap_or(20);
+                    let lev_fp = FixedPoint::from_raw(max_lev as i128 * FixedPoint::SCALE);
+                    total_margin_release += notional / lev_fp;
+                }
+            }
+        }
+        None => {
+            let market_ids: Vec<MarketId> = ctx.order_books.keys().copied().collect();
+            for mid in market_ids {
+                if let Some(book) = ctx.order_books.get_mut(&mid) {
+                    let cancelled = book.cancel_all(*sender, None);
+                    if !cancelled.is_empty() {
+                        ctx.dirty_books.insert(mid);
+                    }
+                    for order in &cancelled {
+                        let notional = order.price * order.remaining_qty;
+                        let max_lev = ctx
+                            .margin_configs
+                            .get(&mid)
+                            .map(|c| effective_max_leverage(&c.tiers, notional))
+                            .unwrap_or(20);
+                        let lev_fp = FixedPoint::from_raw(max_lev as i128 * FixedPoint::SCALE);
+                        total_margin_release += notional / lev_fp;
+                    }
+                }
+            }
+        }
+    }
+
+    if total_margin_release > FixedPoint::ZERO {
+        if let Ok(mut bal) = ctx.positions.get_native_balance(sender) {
+            let release = total_margin_release.min(bal.order_margin);
+            bal.order_margin -= release;
+            bal.available += release;
+            let _ = ctx.positions.put_native_balance(sender, &bal);
+        }
+    }
+
+    NativeActionResult {
+        action_type: "cancel_all",
+        success: true,
+        error: None,
+        gas_used: 500,
+    }
+}
+
+fn cancel_integer_fixture(clamp: bool) -> (tempfile::TempDir, NativeExecContext) {
+    let (dir, db) = open_test_db();
+    let mut ctx = make_ctx(db);
+    let maker = addr(1);
+    let taker = addr(2);
+    let other = addr(3);
+    for trader in [maker, taker, other] {
+        fund_native(&ctx, &trader, fp(1_000_000));
+    }
+    for mid in 1..=3 {
+        let mut book = OrderBook::new(mid, FixedPoint::from_raw(1), FixedPoint::from_raw(1));
+        book.set_level_hash_chunked(true);
+        ctx.order_books.insert(mid, book);
+    }
+    let mut tiered = MarketMarginConfig::new(1, 999);
+    // The config's scalar max_leverage is not the selected tier leverage.
+    tiered.tiers = vec![
+        MarginTier {
+            max_notional: fp(100),
+            max_leverage: 3,
+        },
+        MarginTier {
+            max_notional: fp(200),
+            max_leverage: 7,
+        },
+        MarginTier {
+            max_notional: FixedPoint::MAX,
+            max_leverage: 31,
+        },
+    ];
+    ctx.margin_configs.insert(1, tiered);
+    let mut empty = MarketMarginConfig::new(2, 999);
+    empty.tiers.clear(); // explicit empty config =>1x; absent market3=>20x
+    ctx.margin_configs.insert(2, empty);
+
+    let orders = [
+        limit(
+            1,
+            true,
+            1,
+            FixedPoint::from_raw(100 * FixedPoint::SCALE - 1),
+        ),
+        limit(1, true, 1, fp(100)),
+        limit(
+            1,
+            true,
+            1,
+            FixedPoint::from_raw(100 * FixedPoint::SCALE + 1),
+        ),
+        limit(
+            1,
+            true,
+            1,
+            FixedPoint::from_raw(201 * FixedPoint::SCALE + 3),
+        ),
+        limit(2, true, 2, FixedPoint::from_raw(2 * FixedPoint::SCALE + 3)),
+        limit(3, true, 3, FixedPoint::from_raw(3 * FixedPoint::SCALE + 7)),
+    ];
+    let actions: Vec<_> = orders.into_iter().map(|p| place(maker, p)).collect();
+    let result = NativeExecutor::execute_batch_settle_mode(&mut ctx, &actions, false);
+    assert!(
+        result.results.iter().all(|r| r.success),
+        "{:?}",
+        result.results
+    );
+    let rest = NativeExecutor::execute_batch_settle_mode(
+        &mut ctx,
+        &[place(other, limit(1, true, 1, fp(5)))],
+        false,
+    );
+    assert!(rest.results[0].success);
+    let mut consume = limit(1, false, 1, FixedPoint::from_raw(FixedPoint::SCALE + 1));
+    consume.time_in_force = TimeInForce::IOC;
+    let fill = NativeExecutor::execute_batch_settle_mode(&mut ctx, &[place(taker, consume)], false);
+    assert!(fill.results[0].success);
+    assert!(ctx.order_books[&1]
+        .orders_for_trader(&maker)
+        .iter()
+        .any(|order| order.remaining_qty < order.original_qty));
+    if clamp {
+        let mut balance = bal(&ctx, &maker);
+        balance.order_margin = FixedPoint::from_raw(7);
+        ctx.positions.put_native_balance(&maker, &balance).unwrap();
+    }
+    for book in ctx.order_books.values_mut() {
+        let _ = book.take_row_ops();
+        let _ = book.take_level_ops();
+    }
+    ctx.dirty_books.clear();
+    (dir, ctx)
+}
+
+fn assert_cancel_integer_state(actual: &mut NativeExecContext, expected: &mut NativeExecContext) {
+    // Real stored bytes, including every funded trader rather than just the
+    // cancel sender. No re-encoding a decoded balance hides field differences.
+    let balances = |ctx: &NativeExecContext| -> std::collections::BTreeMap<_, _> {
+        ctx.state
+            .iterate_cf(CF_NATIVE_BALANCES, None)
+            .unwrap()
+            .into_iter()
+            .collect()
+    };
+    assert_eq!(balances(actual), balances(expected));
+    assert_eq!(actual.dirty_books, expected.dirty_books);
+    let mut mids: Vec<_> = actual.order_books.keys().copied().collect();
+    mids.sort_unstable();
+    let mut expected_mids: Vec<_> = expected.order_books.keys().copied().collect();
+    expected_mids.sort_unstable();
+    assert_eq!(mids, expected_mids);
+    for mid in mids {
+        let a = actual.order_books.get_mut(&mid).unwrap();
+        let e = expected.order_books.get_mut(&mid).unwrap();
+        assert_eq!(a.full_row_ops(), e.full_row_ops(), "rows market={mid}");
+        assert_eq!(a.stop_rows(), e.stop_rows());
+        assert_eq!(
+            a.take_row_ops(),
+            e.take_row_ops(),
+            "row journal market={mid}"
+        );
+        let levels = |book: &mut OrderBook| {
+            book.take_level_ops()
+                .into_iter()
+                .map(|(key, row)| (key, row.map(|row| row.encode().to_vec())))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(levels(a), levels(e), "level journal market={mid}");
+        let full_levels = |book: &mut OrderBook| {
+            book.full_level_ops()
+                .into_iter()
+                .map(|(key, row)| (key, row.encode().to_vec()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            full_levels(a),
+            full_levels(e),
+            "mode3 commitments market={mid}"
+        );
+        assert_eq!(a.order_count(), e.order_count());
+        assert_eq!(a.next_order_id(), e.next_order_id());
+    }
+}
+
+#[test]
+fn cancel_all_integer_margin_real_state_matches_legacy() {
+    for market in [Some(1), Some(2), Some(3), Some(999), None] {
+        for clamp in [false, true] {
+            let (_actual_dir, mut actual) = cancel_integer_fixture(clamp);
+            let (_expected_dir, mut expected) = cancel_integer_fixture(clamp);
+            let sender = addr(1);
+            let old_balance = bal(&actual, &sender);
+            let result = NativeExecutor::execute(
+                &mut actual,
+                &sender,
+                &NativeAction::CancelAllOrders { market_id: market },
+            );
+            let reference = legacy_cancel_all_margin(&mut expected, &sender, market);
+            assert_eq!(
+                (
+                    result.action_type,
+                    result.success,
+                    result.error,
+                    result.gas_used
+                ),
+                (
+                    reference.action_type,
+                    reference.success,
+                    reference.error,
+                    reference.gas_used
+                )
+            );
+            if clamp && market != Some(999) {
+                assert_bal(
+                    &actual,
+                    &sender,
+                    old_balance.available + FixedPoint::from_raw(7),
+                    FixedPoint::ZERO,
+                    "clamped cancel-all",
+                );
+            }
+            assert_cancel_integer_state(&mut actual, &mut expected);
+            // Repeating an empty cancellation leaves balances and books equal.
+            NativeExecutor::execute(
+                &mut actual,
+                &sender,
+                &NativeAction::CancelAllOrders { market_id: market },
+            );
+            legacy_cancel_all_margin(&mut expected, &sender, market);
+            assert_cancel_integer_state(&mut actual, &mut expected);
+        }
+    }
+}
+
+#[test]
+fn cancel_all_integer_margin_zero_preserves_mutation_boundary() {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    let (_actual_dir, mut actual) = cancel_integer_fixture(false);
+    let (_expected_dir, mut expected) = cancel_integer_fixture(false);
+    for ctx in [&mut actual, &mut expected] {
+        ctx.margin_configs.get_mut(&1).unwrap().tiers = vec![MarginTier {
+            max_notional: FixedPoint::MAX,
+            max_leverage: 0,
+        }];
+    }
+    let sender = addr(1);
+    let before = actual
+        .state
+        .get_cf_raw(CF_NATIVE_BALANCES, sender.as_slice())
+        .unwrap();
+    let new = catch_unwind(AssertUnwindSafe(|| {
+        NativeExecutor::execute(
+            &mut actual,
+            &sender,
+            &NativeAction::CancelAllOrders { market_id: Some(1) },
+        )
+    }))
+    .unwrap_err();
+    let old = catch_unwind(AssertUnwindSafe(|| {
+        legacy_cancel_all_margin(&mut expected, &sender, Some(1))
+    }))
+    .unwrap_err();
+    let panic_text = |payload: &Box<dyn std::any::Any + Send>| {
+        payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+            .unwrap()
+    };
+    assert_eq!(panic_text(&new), panic_text(&old));
+    assert!(panic_text(&new).starts_with("FixedPoint division error"));
+    assert!(actual.order_books[&1].orders_for_trader(&sender).is_empty());
+    assert!(actual.dirty_books.contains(&1));
+    assert_eq!(
+        actual
+            .state
+            .get_cf_raw(CF_NATIVE_BALANCES, sender.as_slice())
+            .unwrap(),
+        before
+    );
+    assert_cancel_integer_state(&mut actual, &mut expected);
 }
