@@ -575,3 +575,45 @@ were inserted into PHASE_COLS while its header and positional phase60.awk stayed
 unchanged. This shifts the old per-phase analysis for EVM resync, flush, dirty
 buckets and queue depth. Named-column wide CSV and headline/scoring are unaffected.
 Preserve old artifacts; use wide CSV for those historical phase measurements.
+
+### Collector live follow-up and digest correction
+
+Phase mapping fix `8c142cb` passed the distinct-value collector-to-AWK fixture,
+summarizer and shell checks, receipt `a8d4c97f-4ebe-4b46-9ac5-f6de3b9892b8`.
+
+`s60-viewbound-asyncsample-cap200-r1` used frozen b60097a and harness 8c142cb:
+37,078.5 fills/s over 131 seconds, drain 66 seconds, liveness PASS, **REJECT**
+for one val2 body-fetch exhaustion/sync fallback. Collector samples were all
+valid with at most two seconds between observations on each validator.
+
+This cell also exposed a harness regression: removing the old extract helper
+left a call in funnel_snapshot. Both failed snapshots became empty strings;
+their equality falsely marked digest quiescence. The reported AGREE therefore
+lacks a valid quiescence proof. Original artifacts remain untouched, with a
+separate campaign audit JSON explaining the defect. This run is ineligible for
+performance comparison. Its roughly 12 GiB databases were cleaned after evidence
+and inventory were saved under the owner's standing authorization.
+
+Fix `f7a1b68` makes digest snapshots require successful HTTP, four unique finite
+counters on every node, and two complete nonempty equal snapshots. Receipt
+`02e6a14e-5bcb-4160-a8fb-7ddcee5c1a5b` passed 88 Python tests plus summarizer,
+shell and diff checks. The new tests execute the production shell functions and
+comparison, including failed responses with valid-looking bodies, missing helpers,
+empty observations and failures on any validator. Independent review passed.
+The sampler issue was reopened for this regression and resolved only after these
+checks; a new live cell is still required.
+
+### Isolated proposer body reuse
+
+Runtime `2f1b832` on `perf/proposal-body-reuse` retains the action vector cloned
+for DA mirroring and moves it into the proposal, removing a second deep clone.
+The original sender/action pairs remain separately owned for preproposal push.
+Both DA modes preserve ordering, custody and full-batch write-failure requeue.
+
+Full release consensus tests, a targeted mempool requeue regression and a separate
+node build passed receipt `fdd7a4a0-bcbb-477a-b298-cc71c8dccd58`. The five changed
+generated packages were cleaned before testing/building to avoid stale target
+reuse. Two source reviews found no blocker. Frozen artifact `proposal-body-reuse`
+has node SHA256 `8a644d2f46bd4eeec434e8c79ba886e15ba3a0ad90a9a351824bb9fefaf3bc60`
+and the unchanged generator. This remains an unmeasured candidate, not a promoted
+performance improvement.
