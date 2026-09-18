@@ -177,3 +177,43 @@ Compact consensus-body push (`TORUS_BODY_PUSH_MAX_BYTES=65536`) already exists a
 remains default OFF. It is a separate experiment from the multi-megabyte native
 body pre-push. A candidate may test it after the genesis transport correction;
 no performance or safety default is promoted from inspection alone.
+
+## First accepted recovery control
+
+Runtime fixes are committed as `3bd7c01` (mempool gauge) and `9af0eea`
+(authenticated body recovery, genesis transport and sync certificates).
+The final recovery verification passed 85 HotStuff tests and a separate node-only
+release build; the unchanged metric/app integration had passed 83 mempool and
+146 consensus tests (one ignored).
+
+`s60-recovery-cap200-r1` used the frozen `9af0eea` node, unchanged s58 generator,
+120 s nominal / 127 s actual load, ten markets, cap 200, rate 76,000, and
+`TORUS_BODY_FETCH_TRACE=1`. It **ACCEPTED**: 49,242.8 actual matched orders/s
+throughout the load window, liveness PASS, clean dissemination (zero exhausted,
+sync fallback, outbound DA failures or starvation), drain established in 57 s,
+and final validator AGREE. Best60 was 71,670.7; that is supplemental and does not
+establish sustained 71.7k. One accepted cell does not establish repeatability or
+isolate which recovery change prevented the older failure. The original height
+584 stall remains unproven as a specific root cause.
+
+Fresh startup was healthy after seven seconds. The trace observed genesis-body
+serving; all three nodes later reached zero pending work and equal native flow
+counts. Native execution queue depth peaked at 56. Load-window construction
+averaged 176–179 ms across nodes. Execution engine averaged 450–471 ms per native
+block and flush 233–241 ms over the separate bench-plus-drain window; these are
+not directly comparable timer boundaries. Cancellation/phase1 rose with book
+depth, supporting a separate sustained-execution experiment. No hardware ceiling
+or architecture requirement follows from this single result.
+
+Artifacts: `/home/18c/bench-results-matched/s60-recovery-cap200-r1/`, with raw logs,
+manifest and frozen binaries under `s60-campaign-20260918/`. Node SHA256:
+`49282cf7794d67137fade41b52da5d712ebb0245fad20cce3e5cf024696d93e7`.
+Generator SHA256: `ce06befbab9e87f9e98d0f45a7c18e506d7764f1709be532550f5b342c064528`.
+Temporary database retention is tracked separately; logs, metrics, digests,
+summaries and binary/configuration provenance remain the comparison evidence.
+
+Source review found a generator locality defect: parity of global sender index
+can give a market only one side when sender assignment repeats with an even
+period (including MPS=1/10 markets and MPS=3/300 markets). A separate candidate
+alternates actual per-market owners, preserving the uniform default workload.
+Locality cells must use the corrected, explicitly identified generator.
