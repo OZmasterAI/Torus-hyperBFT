@@ -3,7 +3,9 @@
 Objective: demonstrate at least **200,000 actual matched orders/s** under a
 declared sustained workload with healthy consensus, completed execution, and
 validator agreement. This document is a campaign roadmap and report skeleton,
-not a claim that the target or any new performance improvement has been reached.
+not a claim that the target or a repeatable throughput improvement has been reached.
+The current counter measures fill events; see the metric definition below before
+comparing the target with another chain's order-processing claims.
 
 ## Starting evidence
 
@@ -15,7 +17,7 @@ The four retained cap 200 cells produced 41,871.8 / 25,959.6 / 22,787.3 /
 48,622.9 matched orders/s. **All four are rejected for dissemination failures**;
 the third also stalled with pending actions. Equal final state did not prove
 liveness or completed drain. See [retained-log diagnosis](stall-584-diagnosis-2026-09-18.md)
-and [repeat provenance and timing](cap 200-loadwin-repeats-2026-09-18.md).
+and [repeat provenance and timing](cap200-loadwin-repeats-2026-09-18.md).
 
 In the three advancing runs, steady-window block construction measured
 200.3–384.5 ms across validators; proposal construction measured 274.5–553.4 ms.
@@ -160,9 +162,11 @@ DA mirroring remains: successful pool selection does not prove the buffered
 mirror has become durable.
 
 An independent cancel-all candidate is isolated on
-`perf/cancel-level-compaction`. Its initial release microbenchmark improved deep
-dense same-level cancellation up to 5.9x but regressed several shallow and sparse
-cases; that unrestricted policy was rejected. A narrower gate is under test.
+`perf/cancel-level-compaction`. Its initial release microbenchmark suggested faster deep
+dense cancellation but regressed shallow/sparse cases; that unrestricted policy
+was rejected. Later review found setup-order, hash-seed and codegen confounds,
+so those speedup estimates are not accepted evidence. A narrower production
+gate and balanced A/A, A/B and B/B diagnostics are under test.
 The initial 114-test core suite passed with 4 ignored tests. These microbenchmarks
 are not chain throughput results and do not justify accepting the candidate.
 
@@ -255,3 +259,42 @@ health/harness/summarizer tests, shell syntax, and a separate node build pass.
 The frozen artifact is ready for a same-binary OFF/ON comparison; it has no live
 performance result. Offline retention tooling, if later present on that branch,
 is separate from this already-frozen runtime.
+
+
+## Current readiness and remaining constraints
+
+As of the latest local work, stage 1 has tested runtime fixes and one accepted
+control; stage 2 still lacks three accepted control repeats. Stage 3 has one
+accepted hash-cache cell and a verified, frozen DA attribution candidate, with
+repeat and OFF/ON comparisons pending. These are prerequisites for choosing a
+production optimization, not completed throughput stages.
+
+Stage-5 preparation is committed as `a8d9542` on
+`perf/bench-locality-balance`: corrected actual-owner side balance, unchanged
+default uniform action bytes, workload manifests, configurable price/cancel
+shape, and optional economic rate schedules with strict provenance. Forty-six
+Rust tests and 76 Python tests passed; no live burst/locality result exists.
+Depth seeding and phase-specific achieved-rate/recovery scoring remain open.
+
+Strict replay qualification is on `test/strict-crash-replay` (`441e967`), with
+the fresh-worktree nested-genesis output fix `f99e15c`. Harness verification
+passed, as did three tiny genesis fixture regressions. A first 45-second label
+was rejected before launch for an invalid kill offset; the second stopped
+before validator launch because the weighted-genesis child inherited final
+`OUT`. Neither is live recovery evidence. The corrected third attempt, `s60-pipeline-replay45-r3`, used kill offset
+15 seconds and the frozen recovery node. It observed positive replay:
+applied height 783, committed height 784, gap 1, worker attached at 784.
+All validators agreed at height 790, with no panic/fail-stop. The separate
+strict crash verdict is PASS, but the full cell is REJECT: progress stopped
+with pending mempools and empty execution/flush queues, and drain timed out
+after 208 seconds. This is evidence of one successful replay, not healthy
+post-restart liveness or deterministic pending-parent C1 coverage. The pipeline
+remains default OFF. Stall issue `879b6055-5220-4352-a25c-74ff0e807bd9`
+is under investigation; transport and consensus causes remain hypotheses.
+
+Retained databases currently limit the larger matrix: about 21 GiB remained
+before the short replay attempt. A cleanup decision is pending; no retained
+campaign database has been deleted or flushed. Offline all-CF flushing would
+change physical WAL evidence and also requires that retention decision.
+Separate-machine testing remains pending host/access details; no remote run
+or infrastructure provisioning has occurred.
