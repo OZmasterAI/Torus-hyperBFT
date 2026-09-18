@@ -30,10 +30,10 @@ hashing or DA writes. No accepted stable baseline or hardware ceiling follows.
 
 | Stage | Current evidence | Remaining work |
 | --- | --- | --- |
-| 1. Body retrieval and recovery | Authenticated body/sync fixes plus view-bound header voting and corrected future-buffer accounting are committed and tested. One later restart drained and agreed; an earlier run replayed one block but stalled. | Identify the earlier stall's cause and complete healthy positive-replay/C1 qualification. Queued-response scheduling is tested, but its live OFF/ON pair both failed on late arrivals; outbound-stage attribution is next. |
+| 1. Body retrieval and recovery | Authenticated body/sync fixes plus view-bound header voting and corrected future-buffer accounting are committed and tested. One later restart drained and agreed; an earlier run replayed one block but stalled. Outbound timing captured late body requests/responses and local handoff delays. | Identify the earlier stall's cause and complete healthy positive-replay/C1 qualification. Queued-response scheduling did not fix late arrivals. Actual swarm-poll and receiver-stage diagnostics have passed source review but remain untested. |
 | 2. Healthy baseline | Corrected collection produced accepted current-runtime controls, but results vary. Five-minute 10- and 50-market controls both failed dissemination despite completed drain and agreement. | Three accepted repeats on the final selected runtime; diagnose longer-run body-fetch exhaustion. |
 | 3. Proposal construction | Historical hash-cache result remains 51,608.1 fills/s. Current DA OFF/ON and body-reuse screening did not establish a throughput gain. | Repeat hash comparison and any promising combination before promotion. |
-| 4. Largest remaining cost | Worker/cache screening found no confirmed overall gain. Sustained depth observations support revising cancellation grouping; new candidate passed source review. | Revised cancellation passed 248 tests and an accepted five-minute live cell at 38,142.7 fills/s; the fresh control failed dissemination, so a healthy gain remains unproven. Integer-margin follow-up and finer pass-B attribution are tested and frozen; their live cells remain pending. |
+| 4. Largest remaining cost | Revised cancellation passed 248 tests and an accepted five-minute cell at 38,142.7 fills/s. Integer-margin follow-up passed 47 tests and an accepted 38,610.6 cell. Fixed-key trade routing passed 56 test executions and an accepted same-binary OFF/ON pair at 32,786.3 / 40,819.2 fills/s. | Repeat the promising fixed-key pair in reversed order; a single pair does not establish a repeatable gain. The feature remains default off. |
 | 5. Sustained and varied load | Five-minute 10-market baseline/cache and 50-market baseline completed with depth observations. Cache arm accepted at 34,563.5 fills/s; both baselines failed dissemination. | Locality50/MPS3 completed at an accepted 33,233.1 fills/s. Deeper books, bursts and healthy matched-duration repeats remain. |
 | 6. Separate machines | Owner confirmed no remote hosts are available; continue on this machine only. | Cross-machine validation is unavailable and cannot be inferred from local results. |
 | 7. Architecture | Flush-pipeline recovery evidence, cancellation experiments and a default-off WAL-budget candidate are being assessed. | Promote only after deterministic state/recovery and repeated throughput evidence; no 200k claim. |
@@ -1152,3 +1152,60 @@ and scheduled generator `9c210f31`. Exact flag plus typed-writer and integer-mar
 helper symbols establish binary identity; the optimized drain helper has no
 standalone symbol. Same-binary OFF/ON live evaluation follows. The feature stays
 default off, with no abrupt-crash qualification or performance gain asserted.
+
+### Fixed-key OFF/ON result and session stop
+
+Both `s60-fixed-keys-off-10m-r1` and `s60-fixed-keys-on-10m-r1` are ACCEPT:
+liveness PASS, AGREE, completed drain and clean dissemination on all validators.
+The frozen `0571fba` node and scheduled generator hashes, runner `998d1eb`,
+ten-market genesis, nominal 300-second workload, cap200/rate76000,
+BODYFETCH1/DEPTH1 and ENGINE0/MATCH18/SETTLE18 match. Only
+`TORUS_DEFERRED_TRADE_FIXED_KEYS=0/1` differs in the node configuration.
+
+| Observation | OFF | ON |
+| --- | ---: | ---: |
+| Full-load fills/s | 32,786.3 | 40,819.2 |
+| Actual load window (s) | 312 | 308 |
+| First120 fills/s | 40,209.9 | 41,764.7 |
+| Best60 fills/s | 46,574.5 | 56,509.4 |
+| Drain (s) | 105 | 104 |
+| Commit interval p95 (ms) | 4,187.0 | 3,779.7 |
+| Peak execution queue | 66 | 54 |
+| Val0 engine ms/native block, bench+drain | 816.68 | 651.81 |
+| Val0 pass-B ms/native block, bench+drain | 155.80 | 104.01 |
+| Val1 pass-B ms/native block, bench+drain | 163.76 | 119.40 |
+| Val2 pass-B ms/native block, bench+drain | 162.74 | 114.85 |
+| Val0 engine ms/1,000 fills, bench+drain | 15.70 | 11.97 |
+
+The observed full-window difference is +24.5%. This is a promising single pair,
+not a repeatable gain claim: matching, save-books and flush costs also changed,
+and the preceding separate `f2a7164` margin run was already 38,610.6 fills/s.
+Do not attribute the entire difference to allocation removal. Repeat ON then
+OFF before promotion. The 56,509.4 best minute is supplemental; it is not a
+full-window record or an apples-to-apples comparison to historical 51,608.1 over
+about two minutes. No default switch or abrupt-crash qualification was made.
+
+Sampled trade-writer queue maxima were 2 OFF and 3 ON; final snapshots were 1
+and 2 respectively on every node. This gauge is updated at application handoff,
+not continuously by the writer, and is not part of the harness's execution-drain
+gate. These values neither prove stuck writes nor establish actual writer
+completion; orderly writer drain/reopen is covered by the qualification tests.
+OFF/ON databases occupied 25.81/31.66 GiB and were cleaned after evidence retention.
+
+The owner requested stopping after this next step and wrapping up. No additional
+benchmark or build was started after ON. Resume with a reversed fixed-key repeat,
+then deeper books (`CROSS_FRACTION=.25`) and the 300-second burst schedule
+`0:30000,60:120000,120:0,240:30000`. Use generator phase timestamps and recovery
+phase `index == 2` to measure catch-up during the pause, not final drain.
+
+`/home/18c/projects/wt/swarm-poll-stages` on `diag/swarm-poll-stages` retains four
+uncommitted diagnostic source/doc paths based on `14449bc`. Independent review
+found no blocker, but its nine authored runtime fixtures, full network suite and
+node build are UNRUN. The external `analyze_swarm_poll.py` and
+`test_analyze_swarm_poll.py` have 20 authored fixtures, source review passed, and
+are also UNRUN. The campaign's `pending-swarm-poll-source.tar.gz` and
+`pending-swarm-poll-source-manifest.json` preserve the exact six files and hashes.
+Runtime issue `8428153c`, attempt `52de45d1`; parser issue `2c565549`, latest
+attempt `31f400d8`. Qualify these before any live use. Shared-target contents are
+the fixed-key build, so clean affected alternate packages including `torus-state`
+before the next network build. Keep node and generator builds separate.
