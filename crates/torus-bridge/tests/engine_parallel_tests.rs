@@ -106,7 +106,7 @@ fn state_dump_db(db: &StateDb) -> Vec<(String, Vec<u8>, Vec<u8>)> {
         CF_NATIVE_MARKETS,
         CF_NATIVE_TRADES,
         CF_NATIVE_USER_TRADES,
-        // Node-local order-row store (mode-2 combo cell; empty otherwise).
+        // Node-local order-row store (mode-2/3 combo cells; empty otherwise).
         CF_BOOK_ORDER_ROWS,
     ];
     let mut out = Vec::new();
@@ -459,28 +459,31 @@ fn cross_market_margin_exhaustion_mid_batch_identical() {
 // 3. Full-combo cell: LevelAuthority book mode + resident books + engine
 // ============================================================================
 
-/// The bench-standard flags that touch `execute_batch`/`save_order_books`
-/// are TORUS_BOOK_ROWS=2 and TORUS_RESIDENT_BOOKS=1 (root-cache/bucket-hash/
-/// member-cache act at flush time, after exec returns). Pin both explicitly
-/// (constructor-pinned — no env races) across TWO blocks with resident
-/// handoff, and require byte-identity of the full world including the
-/// node-local order-row store.
+/// Pin both level-authority modes (2 and current record-cell mode 3) with
+/// resident books across TWO blocks. Compare each mode against its OWN serial
+/// root: mode 3 intentionally has a different level-hash preimage from mode 2.
+/// Constructor/engine arguments avoid environment races. Include shared-trader
+/// cross-market folds and a poor sender exhausting margin between markets.
 #[test]
 fn full_combo_level_authority_resident_identical() {
-    let batches_b1 = fuzz_batches(0xC0DE_C0DE ^ 0x1357_9BDF);
-    let run = |threads: usize| -> (Vec<(String, Vec<u8>, Vec<u8>)>, B256, u128, u32) {
+    let mut batches_b1 = fuzz_batches(0xC0DE_C0DE ^ 0x1357_9BDF);
+    let mut margin_batch = Vec::new();
+    for market in 1..=4 {
+        margin_batch.push(place(addr(40), gtc(market, true, 99, 4)));
+        margin_batch.push(place(addr(41), gtc(market, true, 100, 2)));
+    }
+    batches_b1.push(margin_batch);
+    let run = |mode: BookMode, threads: usize| -> Vec<RunFingerprint> {
         let (_dir, db) = open_test_db();
         let mut resident = ResidentBooks::default();
-        // NB `trade_index` is PER-BLOCK (fresh context each height) — sum it
-        // across blocks for the scenario-strength assertion.
-        let mut trades_total = 0u32;
-        let mut next_id_last = 0u128;
+        let mut fingerprints = Vec::new();
         // Fund via a throwaway ctx (positions live on the shared db).
         {
             let ctx = make_ctx(db.clone());
             for n in 1..=48u8 {
                 fund_native(&ctx, &addr(n), fp(1_000_000));
             }
+            fund_native(&ctx, &addr(40), fp(30));
         }
         for (height, batch_set) in [(1u64, &batches_b1[..2]), (2u64, &batches_b1[2..])] {
             let mut ctx = NativeExecContext::new_with_mode(
@@ -493,31 +496,60 @@ fn full_combo_level_authority_resident_identical() {
                 addr(99),
                 addr(100),
                 addr(101),
-                BookMode::LevelAuthority,
+                mode,
                 Some(&mut resident),
             );
             assert!(ctx.fatal_error.is_none(), "load fatal: {:?}", ctx.fatal_error);
+            let mut results = Vec::new();
+            let mut total_gas = Vec::new();
             for batch in batch_set {
-                NativeExecutor::execute_batch_engine_mode(&mut ctx, batch, threads);
+                let result = NativeExecutor::execute_batch_engine_mode(&mut ctx, batch, threads);
                 assert!(ctx.fatal_error.is_none(), "fatal: {:?}", ctx.fatal_error);
+                results.push(
+                    result.results.iter().map(|r| (r.success, r.error.clone())).collect(),
+                );
+                total_gas.push(result.total_gas);
             }
             ctx.save_order_books();
             ctx.stash_resident(&mut resident);
-            trades_total += ctx.trade_index;
-            next_id_last = ctx.next_global_order_id;
+            fingerprints.push(RunFingerprint {
+                cf_dump: state_dump_db(&db),
+                results,
+                total_gas,
+                trade_index: ctx.trade_index,
+                next_global_order_id: ctx.next_global_order_id,
+                state_root: compute_native_state_root(&db).expect("state root"),
+            });
         }
-        let root = compute_native_state_root(&db).expect("state root");
-        (state_dump_db(&db), root, next_id_last, trades_total)
+        fingerprints
     };
 
-    let golden = run(0);
-    assert!(golden.3 > 40, "combo scenario too weak: {} trades", golden.3);
-    for threads in [2usize, 4, 8] {
-        let par = run(threads);
-        assert_eq!(golden.1, par.1, "state root diverged (threads={threads})");
-        assert_eq!(golden.0, par.0, "cf dump diverged (threads={threads})");
-        assert_eq!(golden.2, par.2, "next order id diverged (threads={threads})");
-        assert_eq!(golden.3, par.3, "trade index diverged (threads={threads})");
+    for mode in [BookMode::LevelAuthority, BookMode::LevelAuthorityChunked] {
+        let golden = run(mode, 0);
+        let trades_total: u32 = golden.iter().map(|block| block.trade_index).sum();
+        assert!(
+            trades_total > 40,
+            "{mode:?}: combo scenario too weak: {trades_total} trades"
+        );
+        let margin_results = golden.last().unwrap().results.last().unwrap();
+        assert!(
+            margin_results[0].0,
+            "{mode:?}: poor sender's first order must pass"
+        );
+        for index in [2, 4, 6] {
+            assert!(
+                !margin_results[index].0,
+                "{mode:?}: later market must exhaust margin"
+            );
+            assert!(margin_results[index]
+                .1
+                .as_deref()
+                .unwrap()
+                .starts_with("insufficient margin"));
+        }
+        for threads in [2usize, 4, 8] {
+            assert_eq!(golden, run(mode, threads), "{mode:?}: threads={threads}");
+        }
     }
 }
 
