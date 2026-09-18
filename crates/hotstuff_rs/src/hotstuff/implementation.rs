@@ -1815,6 +1815,10 @@ impl<N: Network> HotStuff<N> {
         block_tree: &mut BlockTreeSingleton<K>,
         app: &mut impl App<K>,
     ) -> Result<(), HotStuffError> {
+        // Headers bypass receive-side view filtering so delayed bodies and
+        // ancestors can still be recovered. Only the authenticated leader's
+        // header for our CURRENT view may consume that view's vote/status.
+        let header_is_current = header.view == self.view_info.view;
         // Equivocation detection (same as on_receive_proposal).
         let proposal_key = (header.view, *origin);
         if let Some(first_hash) = self.seen_proposals.get(&proposal_key) {
@@ -1961,14 +1965,16 @@ impl<N: Network> HotStuff<N> {
                 // signers, which by definition hold the block).
                 self.request_justify_block(header.justify.block, header.justify.view, origin);
             }
-            match self.proposal_status {
-                ProposalStatus::WaitingForProposal => {
-                    self.proposal_status = ProposalStatus::OneLeaderProposed { leader: *origin }
+            if header_is_current {
+                match self.proposal_status {
+                    ProposalStatus::WaitingForProposal => {
+                        self.proposal_status = ProposalStatus::OneLeaderProposed { leader: *origin }
+                    }
+                    ProposalStatus::OneLeaderProposed { leader: _ } => {
+                        self.proposal_status = ProposalStatus::AllLeadersProposed
+                    }
+                    _ => {}
                 }
-                ProposalStatus::OneLeaderProposed { leader: _ } => {
-                    self.proposal_status = ProposalStatus::AllLeadersProposed
-                }
-                _ => {}
             }
             return Ok(());
         }
@@ -1991,7 +1997,7 @@ impl<N: Network> HotStuff<N> {
 
         // Vote on the header (same voting logic as on_receive_proposal).
         let validator_set_state = block_tree.validator_set_state()?;
-        if is_phase_voter(
+        if header_is_current && is_phase_voter(
             &self.config.keypair.public(),
             &validator_set_state,
             &header.justify,
@@ -2007,7 +2013,7 @@ impl<N: Network> HotStuff<N> {
             let phase_vote = PhaseVote::new(
                 &self.config.keypair,
                 self.config.chain_id,
-                self.view_info.view,
+                header.view,
                 header.block_hash,
                 vote_phase,
             );
@@ -2020,7 +2026,7 @@ impl<N: Network> HotStuff<N> {
             self.sender_handle
                 .send::<HotStuffMessage>(vote_recipient, phase_vote.clone().into());
 
-            block_tree.set_vote_state_atomic(self.view_info.view, header.block_hash)?;
+            block_tree.set_vote_state_atomic(header.view, header.block_hash)?;
             // T1.3 observability: this vote was cast before `app.validate_block` ran on the body
             // (unless the block is already in the tree, in which case it was validated on
             // insertion). If the body later turns out app-invalid, `try_insert_body` increments
@@ -2073,15 +2079,17 @@ impl<N: Network> HotStuff<N> {
             }
         }
 
-        // Update proposal status.
-        match self.proposal_status {
-            ProposalStatus::WaitingForProposal => {
-                self.proposal_status = ProposalStatus::OneLeaderProposed { leader: *origin }
+        // Out-of-view recovery must not suppress this view's proposal/nudge.
+        if header_is_current {
+            match self.proposal_status {
+                ProposalStatus::WaitingForProposal => {
+                    self.proposal_status = ProposalStatus::OneLeaderProposed { leader: *origin }
+                }
+                ProposalStatus::OneLeaderProposed { leader: _ } => {
+                    self.proposal_status = ProposalStatus::AllLeadersProposed
+                }
+                _ => {}
             }
-            ProposalStatus::OneLeaderProposed { leader: _ } => {
-                self.proposal_status = ProposalStatus::AllLeadersProposed
-            }
-            _ => {}
         }
 
         Ok(())
@@ -3005,6 +3013,136 @@ mod sync_recovery_tests {
             } else {
                 ValidateBlockResponse::Invalid
             }
+        }
+    }
+
+    fn recovery_header(block: &Block, view: ViewNumber) -> ProposalHeader {
+        ProposalHeader {
+            chain_id: ChainID::new(0), view, block_hash: block.hash, height: block.height,
+            data_hash: block.data_hash, justify: block.justify.clone(),
+            tc: None, nec: None, has_validator_set_updates: false,
+        }
+    }
+
+    #[test]
+    fn stale_header_recovers_body_without_consuming_current_vote_or_status() {
+        use crate::hotstuff::header_fast_path_regression_test::proposer_for;
+        let keys = signing_keys(&[1, 2, 3, 4]);
+        let set = validator_set(&keys);
+        let (mut tree, vss) = steady_block_tree(&set);
+        let view = ViewNumber::new(2);
+        let stale_view = ViewNumber::new(1);
+        let stale_origin = proposer_for(stale_view, &keys, &vss, &tree);
+        let current_origin = proposer_for(view, &keys, &vss, &tree);
+        let mut hotstuff = hotstuff_at(view, keys[0].clone(), vss);
+        let (tx, rx) = std::sync::mpsc::channel();
+        hotstuff.event_publisher = Some(tx);
+        let stale = Block::new(BlockHeight::new(0), PhaseCertificate::genesis_pc(),
+            CryptoHash::new([91; 32]), Data::new(vec![]));
+        let current = Block::new(BlockHeight::new(0), PhaseCertificate::genesis_pc(),
+            CryptoHash::new([92; 32]), Data::new(vec![]));
+        let mut app = RecoveryApp { calls: 0, valid: false, reject_below: 0 };
+        hotstuff.on_receive_msg(recovery_header(&stale, stale_view).into(),
+            &stale_origin, &mut tree, &mut app).unwrap();
+        assert_eq!(tree.highest_view_voted().unwrap(), None);
+        assert!(matches!(hotstuff.proposal_status, ProposalStatus::WaitingForProposal));
+        assert!(hotstuff.pending_headers.contains_key(&stale.hash));
+        assert!(hotstuff.body_fetch_tracker.contains_key(&stale.hash));
+        assert_eq!(app.calls, 0);
+        hotstuff.on_receive_msg(HotStuffMessage::BlockDataResponse(BlockDataResponse {
+            view: stale_view, block: stale.clone(),
+        }), &stale_origin, &mut tree, &mut app).unwrap();
+        assert_eq!(app.calls, 1, "late body still requires application validation");
+        assert!(!tree.contains(&stale.hash));
+        assert_eq!(hotstuff.header_vote_invalid_count(), 0, "stale header never voted");
+
+        hotstuff.on_receive_msg(recovery_header(&current, view).into(),
+            &current_origin, &mut tree, &mut app).unwrap();
+        assert_eq!(tree.last_voted_proposal().unwrap(), Some((view, current.hash)));
+        let votes: Vec<_> = rx.try_iter().filter_map(|event| match event {
+            Event::PhaseVote(event) => Some(event.vote), _ => None,
+        }).collect();
+        assert_eq!(votes.len(), 1);
+        assert_eq!(votes[0].view, view);
+        assert_eq!(votes[0].block, current.hash);
+    }
+
+    #[test]
+    fn future_header_recovers_early_and_votes_once_on_buffered_same_view_delivery() {
+        use crate::hotstuff::header_fast_path_regression_test::proposer_for;
+        use crate::networking::messages::ProgressMessage;
+        use crate::networking::receiving::ProgressMessageStub;
+        use crate::types::data_types::BufferSize;
+        let keys = signing_keys(&[1, 2, 3, 4]);
+        let set = validator_set(&keys);
+        let (mut tree, vss) = steady_block_tree(&set);
+        let view = ViewNumber::new(1);
+        let future = ViewNumber::new(2);
+        let origin = proposer_for(future, &keys, &vss, &tree);
+        let local = keys.iter().find(|key| key.verifying_key() != origin).unwrap().clone();
+        let mut hotstuff = hotstuff_at(view, local, vss);
+        let (events, rx_events) = std::sync::mpsc::channel();
+        hotstuff.event_publisher = Some(events);
+        let block = Block::new(BlockHeight::new(0), PhaseCertificate::genesis_pc(),
+            CryptoHash::new([93; 32]), Data::new(vec![]));
+        let header = recovery_header(&block, future);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut receiver = ProgressMessageStub::new(rx, BufferSize::new(1024 * 1024));
+        tx.send((origin, ProgressMessage::HotStuffMessage(header.clone().into()))).unwrap();
+        let (sender, received) = receiver.recv(ChainID::new(0), view,
+            Instant::now() + Duration::from_secs(1)).unwrap();
+        let ProgressMessage::HotStuffMessage(message) = received else { panic!("header expected") };
+        let mut app = RecoveryApp { calls: 0, valid: true, reject_below: 0 };
+        hotstuff.on_receive_msg(message, &sender, &mut tree, &mut app).unwrap();
+        assert_eq!(tree.highest_view_voted().unwrap(), None);
+        assert!(matches!(hotstuff.proposal_status, ProposalStatus::WaitingForProposal));
+        assert!(hotstuff.body_fetch_tracker.contains_key(&block.hash));
+        hotstuff.on_receive_msg(HotStuffMessage::BlockDataResponse(BlockDataResponse {
+            view: future, block: block.clone(),
+        }), &origin, &mut tree, &mut app).unwrap();
+        assert!(tree.contains(&block.hash));
+        assert_eq!(app.calls, 1);
+        assert_eq!(tree.highest_view_voted().unwrap(), None);
+
+        // The receive queue already cached this future header. A non-proposer
+        // enters its view, then consumes it without requiring a network resend.
+        hotstuff.enter_view(ViewInfo::new(future, Instant::now() + Duration::from_secs(60)),
+            &mut tree, &mut app).unwrap();
+        let (sender, received) = receiver.recv(ChainID::new(0), future,
+            Instant::now() + Duration::from_secs(1)).unwrap();
+        let ProgressMessage::HotStuffMessage(message) = received else { panic!("cached header expected") };
+        hotstuff.on_receive_msg(message, &sender, &mut tree, &mut app).unwrap();
+        hotstuff.on_receive_msg(header.into(), &origin, &mut tree, &mut app).unwrap();
+        assert_eq!(tree.last_voted_proposal().unwrap(), Some((future, block.hash)));
+        let votes: Vec<_> = rx_events.try_iter().filter_map(|event| match event {
+            Event::PhaseVote(event) => Some(event.vote), _ => None,
+        }).collect();
+        assert_eq!(votes.len(), 1, "same-view delivery votes once, retransmission cannot double-vote");
+        assert_eq!(votes[0].view, future);
+        assert_eq!(votes[0].block, block.hash);
+    }
+
+    #[test]
+    fn unsafe_out_of_view_headers_recover_justify_without_changing_current_status() {
+        use crate::hotstuff::header_fast_path_regression_test::proposer_for;
+        for header_view in [ViewNumber::new(2), ViewNumber::new(4)] {
+            let keys = signing_keys(&[1, 2, 3, 4]);
+            let set = validator_set(&keys);
+            let (mut tree, vss) = steady_block_tree(&set);
+            let origin = proposer_for(header_view, &keys, &vss, &tree);
+            let mut hotstuff = hotstuff_at(ViewNumber::new(3), keys[0].clone(), vss);
+            let missing = CryptoHash::new([94; 32]);
+            let block = Block::new(BlockHeight::new(1),
+                generic_pc(ViewNumber::new(1), missing, &keys, &set),
+                CryptoHash::new([95; 32]), Data::new(vec![]));
+            let mut app = RecoveryApp { calls: 0, valid: true, reject_below: 0 };
+            hotstuff.on_receive_msg(recovery_header(&block, header_view).into(),
+                &origin, &mut tree, &mut app).unwrap();
+            assert!(matches!(hotstuff.proposal_status, ProposalStatus::WaitingForProposal));
+            assert!(hotstuff.justify_fetch_tracker.contains_key(&missing));
+            assert!(hotstuff.take_sync_needed());
+            assert_eq!(tree.highest_view_voted().unwrap(), None);
+            assert_eq!(app.calls, 0);
         }
     }
 
