@@ -1102,6 +1102,17 @@ and first observed response admission 08.509603, 199.347 ms later; the first
 retained response enqueue toward val2 was already after expiry at 08.489888.
 The full analyses and the 266-line expiry excerpt remain in the campaign.
 
+Independent excerpt review further finds that val2 initiated view-702 requests
+toward val1 at 14:30:07.188390, 07.296100 and 07.396046. Val1 had successfully
+served the same body to val0 by 07.438821, yet its first retained request admission
+from val2 was 08.486709, after expiry. Lookup then took four microseconds. Val0
+had admitted a request from val2 at 07.528335, but its first retained serve to
+val2 began at 08.591044 (12-microsecond lookup). These repeated-key endpoint
+chronologies support neither global body unavailability nor slow lookup as the
+explanation; they do not uniquely pair individual request instances. A next
+diagnostic should observe actual swarm poll attempts, including Pending, and
+receiver-local decode/admission boundaries before changing scheduling policy.
+
 The separately qualified `f2a7164` integer-margin candidate is next in the same
 300-second ten-market workload. A source candidate on top of it,
 `perf/deferred-trade-fixed-keys`, preserves fixed-size trade keys through the
@@ -1109,3 +1120,24 @@ background writer under exact default-off `TORUS_DEFERRED_TRADE_FIXED_KEYS=1`.
 Independent review found no blocker; runtime qualification and same-binary
 OFF/ON measurements remain pending. It preserves the existing durability
 contract and has no abrupt-crash qualification or speed claim.
+
+### Integer-margin live result
+
+`s60-cancel-margin-10m-r1`, frozen `f2a7164`, is ACCEPT: 38,610.6 fills/s over
+307 seconds, first120 44,369.9, best60 54,776.2, drain 134 seconds and commit
+p95 3,931.3 ms. All validators passed liveness, agreed and had clean dissemination.
+The nominal 300-second ten-market workload retained cap200/rate76000,
+BODYFETCH1/DEPTH1, ENGINE0/MATCH18/SETTLE18, runner `998d1eb` and generator
+`9c210f31`. Peak execution queue was 60. Completed databases occupied 30.98 GiB
+and were cleaned after evidence retention.
+
+The prior accepted `f890e06` cancellation run was 38,142.7 fills/s over 310 seconds.
+This single subsequent result is only about 1.2% higher; it does not establish
+a repeatable margin-arithmetic gain. Val0 bench-plus-drain engine cost was
+752.68 ms/native block, phase1 272.97, passB 137.65, save-books 212.91 and flush
+320.79. Late-window phase1 still grew to 457.4 ms, so sustained deep-book cost
+remains. The 54.8k minute is not a full-window record, and this five-minute cell
+is not directly comparable to the historical 51.6k approximately two-minute run.
+
+Fixed-key runtime qualification now follows this cell. The next network
+diagnostic remains a separate branch; no network scheduling policy is changed.
