@@ -31,10 +31,10 @@ hashing or DA writes. No accepted stable baseline or hardware ceiling follows.
 | Stage | Current evidence | Remaining work |
 | --- | --- | --- |
 | 1. Body retrieval and recovery | Authenticated body/sync fixes plus view-bound header voting and corrected future-buffer accounting are committed and tested. One later restart drained and agreed; an earlier run replayed one block but stalled. | Identify the earlier stall's cause and complete healthy positive-replay/C1 qualification. |
-| 2. Healthy baseline | One accepted recovery control at 49,242.8 fills/s; a second was UNVERIFIED because of a sampling gap. | Three accepted repeats on the final frozen runtime; latest view fixes have no full baseline cell yet. |
-| 3. Proposal construction | One accepted hash-cache candidate at 51,608.1 fills/s, with lower construction time but larger backlog. Default-off DA reuse and finer timers are tested and frozen. | Repeated hash comparison and same-binary DA OFF/ON cells before promotion. |
-| 4. Largest remaining cost | Execution/flush timing and growing cancellation cost motivate a bounded cancellation candidate; local mechanism gains repeated. | Resolve gated-path fallback regressions/control noise, then measure live eligibility and matched-rate/latency A/Bs. |
-| 5. Sustained and varied load | Balanced locality generator, workload manifests and burst schedules passed tests. | Depth preparation, phase scoring, and fresh sustained/deep/multimarket/burst runs. |
+| 2. Healthy baseline | Corrected collection produced accepted current-runtime controls, but results vary. Five-minute 10- and 50-market controls both failed dissemination despite completed drain and agreement. | Three accepted repeats on the final selected runtime; diagnose longer-run body-fetch exhaustion. |
+| 3. Proposal construction | Historical hash-cache result remains 51,608.1 fills/s. Current DA OFF/ON and body-reuse screening did not establish a throughput gain. | Repeat hash comparison and any promising combination before promotion. |
+| 4. Largest remaining cost | Worker/cache screening found no confirmed overall gain. Sustained depth observations support revising cancellation grouping; new candidate passed source review. | Test and benchmark the revised cancellation path, including shallow and overflow cases, then measure live throughput and latency. |
+| 5. Sustained and varied load | Five-minute 10-market baseline/cache and 50-market baseline completed with depth observations. Cache arm accepted at 34,563.5 fills/s; both baselines failed dissemination. | Locality, deeper books, bursts and healthy matched-duration repeats. |
 | 6. Separate machines | Owner confirmed no remote hosts are available; continue on this machine only. | Cross-machine validation is unavailable and cannot be inferred from local results. |
 | 7. Architecture | Flush-pipeline recovery evidence, cancellation experiments and a default-off WAL-budget candidate are being assessed. | Promote only after deterministic state/recovery and repeated throughput evidence; no 200k claim. |
 
@@ -809,3 +809,27 @@ will distinguish remote serving from local queue delay before any routing change
 All completed databases above were inventoried then cleaned under authorization;
 sustained baseline22.17GiB and cache27.13GiB. Logs, raw counters, digests, depth
 snapshots, failure excerpts and frozen binaries remain retained.
+
+### Sustained 50-market control and diagnostic qualification
+
+`s60-sustained-base-50m-r1` used the same sustained baseline artifact, stage-5
+runner and settings, changing only market count to 50. It measured 31,247.1
+fills/s over 307 seconds, first120 34,653.2 and best60 38,870.1. Drain completed
+in 169 seconds, liveness passed and quiescent state agreed. Val2 recorded one
+body-fetch exhaustion and sync fallback, so the verdict is REJECT. Commit p95
+was 4,608 ms; this is diagnostic evidence, not an accepted gain.
+
+Val0 bench-plus-drain phase means per native block were engine 705.07 ms,
+save-books 191.31 ms and flush 664.52 ms, against total block 1,659.83 ms.
+Flush accounted for 40% of that measured total. These phase means include drain
+and must not be described as load-only timings. The depth observer completed
+all four snapshots. The completed databases occupied 30.37 GiB; inventory and
+measurement artifacts were retained before their authorized deletion.
+
+The isolated `diag/body-fetch-queue-time` candidate passed independent source
+review. With the existing trace flag enabled, it records ordinary queue
+admission, successful/missing serve lookup timing and every response-handler
+entry using a shared process clock and full identities. Routing, retries and
+validation are unchanged. Duplicate messages and future-view buffer redelivery
+can make pairing ambiguous. Qualification is in progress; neither the failure
+cause nor a performance improvement has been established.
