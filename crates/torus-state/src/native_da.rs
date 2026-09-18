@@ -52,6 +52,20 @@ pub struct NativeDaStore {
     db: StateDb,
 }
 
+/// Logical body bytes inspected/written, excluding keys and storage overhead.
+/// Reads are pinned: `bytes_read` does not mean a Rust-owned copy was allocated.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct NativeDaEnsureStats {
+    pub bodies_checked: usize,
+    pub bytes_read: usize,
+    pub bodies_written: usize,
+    pub bytes_written: usize,
+    pub read_fallback_chunks: usize,
+}
+
+const ENSURE_READ_MAX_BODIES: usize = 32;
+const ENSURE_READ_MAX_BYTES: usize = 1_048_576;
+
 impl NativeDaStore {
     /// Wrap a shared state-db handle.
     pub fn new(db: StateDb) -> Self {
@@ -105,6 +119,47 @@ impl NativeDaStore {
         *generation = generation.wrapping_add(1);
         notifier.arrived.notify_all();
         Ok(())
+    }
+
+    /// Proposer-only candidate: ensure every locally supplied body is present
+    /// byte-for-byte. A key hit alone is NOT a durability/content proof.
+    /// Read errors fall back to writing the affected chunk; write errors remain
+    /// errors. All necessary writes share one atomic batch and ordinary WAL
+    /// semantics, exactly as `put_batch` (no additional fsync guarantee).
+    ///
+    /// Current production DA storage does not prune bodies. A future concurrent
+    /// delete/prune path must coordinate with this read-before-write operation;
+    /// a positive read must remain valid while the proposal references the body.
+    pub fn ensure_present_batch(
+        &self,
+        actions: &[SignedNativeAction],
+    ) -> Result<NativeDaEnsureStats, StateError> {
+        if actions.is_empty() {
+            return Ok(NativeDaEnsureStats::default());
+        }
+        let cf = self.db.cf_handle(CF_NATIVE_PENDING)?;
+        ensure_present_with_io(
+            actions,
+            cf,
+            |hashes| {
+                self.db
+                    .inner()
+                    .batched_multi_get_cf(cf, hashes.iter().map(|h| h.as_slice()), false)
+                    .into_iter()
+                    .map(|slot| slot.map_err(StateError::from))
+                    .collect()
+            },
+            |batch| self.db.write(batch),
+            || {
+                let notifier = arrivals();
+                let mut generation = notifier
+                    .generation
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                *generation = generation.wrapping_add(1);
+                notifier.arrived.notify_all();
+            },
+        )
     }
 
     /// Snapshot the arrival generation. Take it BEFORE checking the store for
@@ -246,6 +301,68 @@ impl NativeDaStore {
     }
 }
 
+/// Private IO boundary makes read-error fallback and failed-write notification
+/// behavior testable without process-global fault switches or storage corruption.
+fn ensure_present_with_io<V: AsRef<[u8]>>(
+    actions: &[SignedNativeAction],
+    cf: &rocksdb::ColumnFamily,
+    mut read: impl FnMut(&[B256]) -> Result<Vec<Option<V>>, StateError>,
+    write: impl FnOnce(rocksdb::WriteBatch) -> Result<(), StateError>,
+    notify: impl FnOnce(),
+) -> Result<NativeDaEnsureStats, StateError> {
+    let mut stats = NativeDaEnsureStats::default();
+    let mut batch = rocksdb::WriteBatch::default();
+    let mut next = 0;
+    while next < actions.len() {
+        let mut hashes = Vec::with_capacity(ENSURE_READ_MAX_BODIES);
+        let mut expected = Vec::with_capacity(ENSURE_READ_MAX_BODIES);
+        let mut encoded_bytes = 0usize;
+        // Transient encoded buffers are bounded by 32 bodies and 1 MiB plus
+        // one body. Pinned reads avoid copying the stored values into Rust Vecs.
+        // The final missing-body batch remains bounded by the input payload,
+        // as it is in the existing unconditional put_batch implementation.
+        while next < actions.len()
+            && hashes.len() < ENSURE_READ_MAX_BODIES
+            && encoded_bytes < ENSURE_READ_MAX_BYTES
+        {
+            let action = &actions[next];
+            let bytes =
+                bincode::serialize(action).map_err(|e| StateError::InvalidData(e.to_string()))?;
+            hashes.push(compute_action_hash(action));
+            encoded_bytes = encoded_bytes.saturating_add(bytes.len());
+            expected.push(bytes);
+            next += 1;
+        }
+        stats.bodies_checked += hashes.len();
+        let present = match read(&hashes) {
+            Ok(rows) if rows.len() == hashes.len() => Some(rows),
+            // No read failure (or malformed adapter response) may become a
+            // false positive: writing the complete chunk is the safe fallback.
+            _ => {
+                stats.read_fallback_chunks += 1;
+                None
+            }
+        };
+        for (i, (hash, bytes)) in hashes.iter().zip(&expected).enumerate() {
+            let stored = present.as_ref().and_then(|rows| rows[i].as_ref());
+            if let Some(stored) = stored {
+                stats.bytes_read += stored.as_ref().len();
+                if stored.as_ref() == bytes.as_slice() {
+                    continue;
+                }
+            }
+            batch.put_cf(cf, hash.as_slice(), bytes);
+            stats.bodies_written += 1;
+            stats.bytes_written += bytes.len();
+        }
+    }
+    if stats.bodies_written > 0 {
+        write(batch)?;
+        notify();
+    }
+    Ok(stats)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,6 +436,167 @@ mod tests {
                 r: [0u8; 32],
                 s: [0u8; 32],
             }),
+        }
+    }
+
+    #[test]
+    fn ensure_present_all_hits_does_not_write_and_mixed_rows_repair() {
+        let (_dir, store) = temp_store();
+        let actions: Vec<_> = (1..=4).map(dummy_action).collect();
+        let hashes: Vec<_> = actions.iter().map(compute_action_hash).collect();
+        store.put(&actions[0]).unwrap();
+        store
+            .db
+            .put_cf_raw(CF_NATIVE_PENDING, hashes[2].as_slice(), b"junk")
+            .unwrap();
+        store
+            .db
+            .put_cf_raw(
+                CF_NATIVE_PENDING,
+                hashes[3].as_slice(),
+                &bincode::serialize(&dummy_action(999)).unwrap(),
+            )
+            .unwrap();
+        let stats = store.ensure_present_batch(&actions).unwrap();
+        assert_eq!(stats.bodies_checked, 4);
+        assert_eq!(
+            stats.bodies_written, 3,
+            "one missing, junk, and valid wrong body"
+        );
+        for (action, hash) in actions.iter().zip(&hashes) {
+            assert_eq!(
+                store.get_raw(&hash.0).unwrap().unwrap(),
+                bincode::serialize(action).unwrap()
+            );
+        }
+        let sequence = store.db.inner().latest_sequence_number();
+        let stats = store.ensure_present_batch(&actions).unwrap();
+        assert_eq!(stats.bodies_written, 0);
+        assert_eq!(stats.bytes_written, 0);
+        assert_eq!(
+            store.db.inner().latest_sequence_number(),
+            sequence,
+            "all-hit call must not rewrite"
+        );
+    }
+
+    #[test]
+    fn ensure_present_survives_reopen_and_not_an_in_memory_presence_cache() {
+        let (dir, store) = temp_store();
+        let actions = vec![dummy_action(10), dummy_action(11)];
+        store.ensure_present_batch(&actions).unwrap();
+        drop(store);
+        let store = NativeDaStore::new(StateDb::open(dir.path()).unwrap());
+        assert_eq!(
+            store.ensure_present_batch(&actions).unwrap().bodies_written,
+            0
+        );
+        store.remove(&[compute_action_hash(&actions[0])]).unwrap();
+        assert_eq!(
+            store.ensure_present_batch(&actions).unwrap().bodies_written,
+            1
+        );
+    }
+
+    #[test]
+    fn ensure_present_read_errors_write_every_unverified_body_once_then_notify() {
+        let (_dir, store) = temp_store();
+        let actions: Vec<_> = (0..70).map(dummy_action).collect();
+        let calls = std::cell::Cell::new(0);
+        let writes = std::cell::Cell::new(0);
+        let notified = std::cell::Cell::new(false);
+        let stats = ensure_present_with_io::<Vec<u8>>(
+            &actions,
+            store.db.cf_handle(CF_NATIVE_PENDING).unwrap(),
+            |hashes| {
+                assert!(hashes.len() <= ENSURE_READ_MAX_BODIES);
+                calls.set(calls.get() + 1);
+                Err(StateError::InvalidData("injected read error".into()))
+            },
+            |batch| {
+                writes.set(writes.get() + 1);
+                store.db.write(batch)
+            },
+            || {
+                assert_eq!(writes.get(), 1, "wake only after successful write");
+                notified.set(true);
+            },
+        )
+        .unwrap();
+        assert_eq!(calls.get(), 3);
+        assert_eq!(stats.read_fallback_chunks, 3);
+        assert_eq!(stats.bodies_written, actions.len());
+        assert!(notified.get());
+        assert!(store
+            .get_batch(&actions.iter().map(compute_action_hash).collect::<Vec<_>>())
+            .unwrap()
+            .iter()
+            .all(Option::is_some));
+    }
+
+    #[test]
+    fn ensure_present_failed_write_never_notifies_or_claims_success() {
+        let (_dir, store) = temp_store();
+        let action = dummy_action(20);
+        let notified = std::cell::Cell::new(false);
+        let result = ensure_present_with_io::<Vec<u8>>(
+            std::slice::from_ref(&action),
+            store.db.cf_handle(CF_NATIVE_PENDING).unwrap(),
+            |_| Err(StateError::InvalidData("injected read error".into())),
+            |_| Err(StateError::InvalidData("injected write error".into())),
+            || notified.set(true),
+        );
+        assert!(result.is_err());
+        assert!(!notified.get());
+        assert!(store.get(&compute_action_hash(&action)).unwrap().is_none());
+    }
+
+    #[test]
+    fn ensure_present_verified_hits_do_not_write_or_notify() {
+        let (_dir, store) = temp_store();
+        let action = dummy_action(21);
+        let expected = bincode::serialize(&action).unwrap();
+        let stats = ensure_present_with_io(
+            std::slice::from_ref(&action),
+            store.db.cf_handle(CF_NATIVE_PENDING).unwrap(),
+            |_| Ok(vec![Some(expected.clone())]),
+            |_| panic!("verified hits must not write"),
+            || panic!("no newly written rows to notify"),
+        )
+        .unwrap();
+        assert_eq!(stats.bodies_written, 0);
+        assert_eq!(stats.bytes_read, expected.len());
+    }
+
+    #[test]
+    fn ensure_present_stale_miss_racing_an_ingress_write_is_safe() {
+        let (_dir, store) = temp_store();
+        let actions = vec![dummy_action(22), dummy_action(23)];
+        let stats = ensure_present_with_io::<Vec<u8>>(
+            &actions,
+            store.db.cf_handle(CF_NATIVE_PENDING).unwrap(),
+            |hashes| {
+                let rows = hashes
+                    .iter()
+                    .map(|h| store.get_raw(&h.0))
+                    .collect::<Result<Vec<_>, _>>()?;
+                // Another ingress writer lands AFTER our miss snapshot.
+                store.put_batch(&actions)?;
+                Ok(rows)
+            },
+            |batch| store.db.write(batch),
+            || {},
+        )
+        .unwrap();
+        assert_eq!(stats.bodies_written, 2, "stale misses safely write again");
+        for action in &actions {
+            assert_eq!(
+                store
+                    .get_raw(&compute_action_hash(action).0)
+                    .unwrap()
+                    .unwrap(),
+                bincode::serialize(action).unwrap()
+            );
         }
     }
 

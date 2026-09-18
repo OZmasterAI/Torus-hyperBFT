@@ -729,6 +729,23 @@ impl Mempool {
         Ok(())
     }
 
+    /// Proposer-only exact-byte reuse of already persisted DA bodies. This does
+    /// not trust the ingress buffer (another flusher may currently own it).
+    /// On failure retain the same full-batch retry guarantee as the mirror.
+    pub fn ensure_native_da(
+        &self,
+        actions: &[SignedNativeAction],
+    ) -> Result<torus_state::native_da::NativeDaEnsureStats, StateError> {
+        match self.da_store.ensure_present_batch(actions) {
+            Ok(stats) => Ok(stats),
+            Err(e) => {
+                tracing::error!("native DA ensure write failed: {e}");
+                self.requeue_failed_da_batch(actions.to_vec());
+                Err(e)
+            }
+        }
+    }
+
     /// Additionally custody erasure shards for a proposed block's bodies (Sprint 5
     /// T5). Thin pass-through to [`NativeDaStore::put_shards_batch`] under the
     /// caller-supplied `(k, n)` (derived from the live validator set). ADDITIVE and
@@ -1573,6 +1590,69 @@ mod tests {
             0,
             "a successful mirror must not bump the failure counter"
         );
+    }
+
+    #[test]
+    fn ensure_native_da_persists_while_an_ingress_batch_is_in_flight() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state.clone(), MempoolConfig::default());
+        let store = NativeDaStore::new(state);
+        let action = torus_types::eip712::sign_native_action(
+            torus_types::NativeAction::ClaimRewards,
+            now_ms(),
+            &SigningKey::from_slice(&[7; 32]).unwrap(),
+        );
+        pool.mirror_to_da(&action);
+        // Model a flusher paused after taking the buffer but before its write.
+        let in_flight = {
+            let mut pending = pool.da_pending.lock().unwrap();
+            pending.first_at = None;
+            std::mem::take(&mut pending.actions)
+        };
+        assert_eq!(in_flight.len(), 1);
+        let hash = torus_types::compute_action_hash(&action);
+        assert!(store.get(&hash).unwrap().is_none());
+        let stats = pool
+            .ensure_native_da(std::slice::from_ref(&action))
+            .unwrap();
+        assert_eq!(
+            stats.bodies_written, 1,
+            "empty pending buffer is not a durability proof"
+        );
+        assert!(store.get(&hash).unwrap().is_some());
+        store.put_batch(&in_flight).unwrap(); // late ingress write is idempotent
+        assert_eq!(pool.ensure_native_da(&in_flight).unwrap().bodies_written, 0);
+        assert_eq!(pool.da_flush_failures(), 0);
+    }
+
+    #[test]
+    fn ensure_native_da_write_failure_requeues_full_batch() {
+        let dir = TempDir::new().unwrap();
+        drop(StateDb::open(dir.path()).unwrap());
+        let state = StateDb::open_read_only(dir.path()).unwrap();
+        let pool = Mempool::new(state, MempoolConfig::default());
+        let actions: Vec<_> = (0..2)
+            .map(|i| {
+                torus_types::eip712::sign_native_action(
+                    torus_types::NativeAction::ClaimRewards,
+                    now_ms() + i,
+                    &SigningKey::from_slice(&[7; 32]).unwrap(),
+                )
+            })
+            .collect();
+        assert!(
+            pool.ensure_native_da(&actions).is_err(),
+            "read-only DB rejects missing-body writes"
+        );
+        assert_eq!(pool.da_flush_failures(), 1);
+        let pending = pool.da_pending.lock().unwrap();
+        let hashes = |v: &[SignedNativeAction]| {
+            v.iter()
+                .map(torus_types::compute_action_hash)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(hashes(&pending.actions), hashes(&actions));
+        assert!(pending.first_at.is_some());
     }
 
     /// The re-queued (failed) batch is the OLDEST pending work, so it must land at
