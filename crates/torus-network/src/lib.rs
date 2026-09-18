@@ -13,6 +13,8 @@
 
 pub mod behaviour;
 pub mod bridge;
+#[doc(hidden)]
+pub mod body_send_trace;
 pub mod caps;
 pub mod codec;
 pub mod config;

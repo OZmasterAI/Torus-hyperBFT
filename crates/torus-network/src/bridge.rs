@@ -617,6 +617,10 @@ impl Network for LibP2PNetwork {
     }
 
     fn send(&mut self, peer: VerifyingKey, message: Message) {
+        if crate::body_send_trace::enabled() {
+            let _ = crate::body_send_trace::enqueue(&self.command_tx, peer, message, true);
+            return;
+        }
         let _ = self.command_tx.send(NetworkCommand::Send {
             target: peer,
             message,

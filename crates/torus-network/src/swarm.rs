@@ -38,6 +38,13 @@ pub enum NetworkCommand {
         target: VerifyingKey,
         message: hotstuff_rs::networking::messages::Message,
     },
+    /// Local diagnostic envelope only; never serialized onto the wire.
+    #[doc(hidden)]
+    SendTraced {
+        target: VerifyingKey,
+        message: hotstuff_rs::networking::messages::Message,
+        trace: Box<crate::body_send_trace::BodySendTrace>,
+    },
     RegisterPeer {
         vk: VerifyingKey,
         peer_id: PeerId,
@@ -982,7 +989,13 @@ pub async fn run_swarm_with_config(
             biased;
 
             // P1: consensus commands (outbound) — highest priority to prevent starvation
-            cmd = command_rx.recv() => SwarmAction::Command(cmd.map(Box::new)),
+            cmd = command_rx.recv() => {
+                let mut cmd = cmd;
+                if let Some(NetworkCommand::SendTraced { trace, .. }) = cmd.as_mut() {
+                    trace.dequeued(command_rx.len());
+                }
+                SwarmAction::Command(cmd.map(Box::new))
+            },
 
             // P2: swarm events (consensus inbound, connections, gossip)
             event = swarm.select_next_some() => SwarmAction::Event(Box::new(event)),
@@ -2208,6 +2221,10 @@ fn handle_command(
         NetworkCommand::Send { target, message } => {
             send_direct(swarm, shared, local_key, &target, message);
         }
+        NetworkCommand::SendTraced { target, message, mut trace } => {
+            send_direct_observed(swarm, shared, local_key, &target, message, Some(&mut trace));
+            trace.emit();
+        }
         NetworkCommand::RegisterPeer { vk, peer_id } => {
             shared.peer_map.write().unwrap().insert(vk, peer_id);
             debug!("Registered peer mapping: {peer_id}");
@@ -2686,8 +2703,22 @@ fn send_direct(
     target: &VerifyingKey,
     message: hotstuff_rs::networking::messages::Message,
 ) -> DirectSendOutcome {
+    send_direct_observed(swarm, shared, local_key, target, message, None)
+}
+
+fn send_direct_observed(
+    swarm: &mut Swarm<TorusBehaviour>,
+    shared: &SharedState,
+    local_key: &VerifyingKey,
+    target: &VerifyingKey,
+    message: hotstuff_rs::networking::messages::Message,
+    mut trace: Option<&mut crate::body_send_trace::BodySendTrace>,
+) -> DirectSendOutcome {
     if target == local_key {
         enqueue_inbound(shared, *local_key, message);
+        if let Some(trace) = trace.as_deref_mut() {
+            trace.finish("self_delivered");
+        }
         return DirectSendOutcome::SelfDelivered;
     }
     let peer_id = shared.peer_map.read().unwrap().get_peer_id(target).copied();
@@ -2703,6 +2734,9 @@ fn send_direct(
             if let Some(ref m) = shared.metrics {
                 m.pending_sends_enqueued.inc();
             }
+            if let Some(trace) = trace.as_deref_mut() {
+                trace.finish("buffered_unmapped");
+            }
             return DirectSendOutcome::Buffered;
         }
     };
@@ -2717,23 +2751,67 @@ fn send_direct(
             m.pending_sends_enqueued.inc();
         }
         let _ = swarm.dial(pid);
+        if let Some(trace) = trace.as_deref_mut() {
+            trace.finish("buffered_disconnected");
+        }
         return DirectSendOutcome::Buffered;
     }
-    let Ok(payload) = message.try_to_vec() else {
+    send_direct_connected(swarm, shared, local_key, target, pid, message, trace)
+}
+
+/// Connected branch, split only to exercise the actual encoding/initiation and
+/// tracking operations without opening network sockets in diagnostic fixtures.
+fn send_direct_connected(
+    swarm: &mut Swarm<TorusBehaviour>,
+    shared: &SharedState,
+    local_key: &VerifyingKey,
+    target: &VerifyingKey,
+    pid: PeerId,
+    message: hotstuff_rs::networking::messages::Message,
+    mut trace: Option<&mut crate::body_send_trace::BodySendTrace>,
+) -> DirectSendOutcome {
+    if let Some(trace) = trace.as_deref_mut() {
+        trace.encode_begin = Some(hotstuff_rs::logging::BodyFetchTraceStamp::capture());
+    }
+    let encoded = message.try_to_vec();
+    if let Some(trace) = trace.as_deref_mut() {
+        trace.encode_end = Some(hotstuff_rs::logging::BodyFetchTraceStamp::capture());
+    }
+    let Ok(payload) = encoded else {
+        if let Some(trace) = trace.as_deref_mut() {
+            trace.finish("encode_failed");
+        }
         return DirectSendOutcome::EncodeFailed;
     };
+    if let Some(trace) = trace.as_deref_mut() {
+        trace.payload_bytes = Some(payload.len());
+    }
     let req = DirectRequest {
         sender_key: local_key.to_bytes(),
         payload,
     };
+    if let Some(trace) = trace.as_deref_mut() {
+        trace.send_begin = Some(hotstuff_rs::logging::BodyFetchTraceStamp::capture());
+    }
     let req_id = swarm.behaviour_mut().direct.send_request(&pid, req);
+    if let Some(trace) = trace.as_deref_mut() {
+        trace.send_end = Some(hotstuff_rs::logging::BodyFetchTraceStamp::capture());
+        trace.tracking_begin = Some(hotstuff_rs::logging::BodyFetchTraceStamp::capture());
+    }
     shared
         .outbound_direct
         .lock()
         .unwrap()
         .insert(req_id, (*target, message));
+    if let Some(trace) = trace.as_deref_mut() {
+        trace.tracking_end = Some(hotstuff_rs::logging::BodyFetchTraceStamp::capture());
+        trace.request_id = Some(req_id);
+    }
     if let Some(ref m) = shared.metrics {
         m.gossip_messages_sent.inc();
+    }
+    if let Some(trace) = trace.as_deref_mut() {
+        trace.finish("initiated");
     }
     DirectSendOutcome::Sent
 }
@@ -4514,6 +4592,89 @@ mod tests {
             key.public().to_peer_id(),
             libp2p::swarm::Config::with_tokio_executor(),
         )
+    }
+
+    #[tokio::test]
+    async fn body_send_trace_buffered_and_self_delivery_preserve_bytes() {
+        use crate::body_send_trace::{tests::messages, BodySendTrace};
+        let local = test_vk(70);
+        let target = test_vk(71);
+        for mapped in [false, true] {
+            let shared = test_shared();
+            let mut swarm = test_swarm();
+            if mapped {
+                shared.peer_map.write().unwrap().insert(target, test_peer(71));
+            }
+            for message in messages() {
+                let expected = message.try_to_vec().unwrap();
+                let mut trace = BodySendTrace::new(target, &message).unwrap();
+                trace.dequeued(0);
+                assert!(matches!(
+                    send_direct_observed(&mut swarm, &shared, &local, &target, message, Some(&mut trace)),
+                    DirectSendOutcome::Buffered
+                ));
+                let buffered = shared.pending_sends.lock().unwrap().flush(&target);
+                assert_eq!(buffered.len(), 1);
+                assert_eq!(buffered[0].try_to_vec().unwrap(), expected);
+                let value = trace.snapshot();
+                assert_eq!(value["outcome"], if mapped { "buffered_disconnected" } else { "buffered_unmapped" });
+                assert!(value["encode_begin"].is_null());
+                assert!(value["request_id"].is_null());
+                assert!(shared.outbound_direct.lock().unwrap().is_empty());
+                // Formatting happens after every queue/peer map lock is released.
+                assert!(shared.pending_sends.try_lock().is_ok());
+                assert!(shared.peer_map.try_write().is_ok());
+                trace.emit();
+            }
+        }
+        let shared = test_shared();
+        let mut swarm = test_swarm();
+        for message in messages() {
+            let expected = message.try_to_vec().unwrap();
+            let mut trace = BodySendTrace::new(local, &message).unwrap();
+            assert!(matches!(
+                send_direct_observed(&mut swarm, &shared, &local, &local, message, Some(&mut trace)),
+                DirectSendOutcome::SelfDelivered
+            ));
+            let (sender, delivered) = shared.inbound.lock().unwrap().pop_front().unwrap();
+            assert_eq!(sender, local);
+            assert_eq!(delivered.try_to_vec().unwrap(), expected);
+            assert_eq!(trace.snapshot()["outcome"], "self_delivered");
+        }
+    }
+
+    #[tokio::test]
+    async fn body_send_trace_actual_encode_initiation_and_tracking_preserve_message() {
+        use crate::body_send_trace::{tests::messages, BodySendTrace};
+        let shared = test_shared();
+        let mut swarm = test_swarm();
+        let local = test_vk(70);
+        let target = test_vk(71);
+        for message in messages() {
+            let expected = message.try_to_vec().unwrap();
+            let mut trace = BodySendTrace::new(target, &message).unwrap();
+            trace.dequeued(0);
+            // Invoke the exact connected branch with an inert dummy transport.
+            // send_request queues libp2p work; no swarm poll/socket is required.
+            assert!(matches!(send_direct_connected(
+                &mut swarm, &shared, &local, &target, test_peer(71), message,
+                Some(&mut trace),
+            ), DirectSendOutcome::Sent));
+            let id = trace.request_id.unwrap();
+            let (tracked_target, tracked) = shared.outbound_direct.lock().unwrap().remove(&id).unwrap();
+            assert_eq!(tracked_target, target);
+            assert_eq!(tracked.try_to_vec().unwrap(), expected);
+            assert_eq!(trace.payload_bytes, Some(expected.len()));
+            let value = trace.snapshot();
+            assert_eq!(value["outcome"], "initiated");
+            let stages = ["pre_enqueue", "dequeue", "encode_begin", "encode_end", "send_begin", "send_end", "tracking_begin", "tracking_end", "finished"];
+            for pair in stages.windows(2) {
+                assert!(value[pair[0]]["seq"].as_u64().unwrap() < value[pair[1]]["seq"].as_u64().unwrap());
+                assert!(value[pair[0]]["mono_us"].as_u64().unwrap() <= value[pair[1]]["mono_us"].as_u64().unwrap());
+            }
+            assert!(shared.outbound_direct.try_lock().is_ok());
+            trace.emit();
+        }
     }
 
     /// B2 (RED first): the direct-fan target set is the intersection of the
