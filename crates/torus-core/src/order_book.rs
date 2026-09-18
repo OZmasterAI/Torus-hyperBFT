@@ -809,14 +809,15 @@ impl OrderBook {
     }
 
     fn cancel_all_hybrid(&mut self, trader: Address, order_ids: Vec<OrderId>) -> Vec<Order> {
-        // At most five deferred queues and 200 target/output slots. Shallow
-        // queues do not consume a slot. Once selected, a queue is never mutated
-        // until all its targets have been collected; overflow queues always use
-        // ordinary removal. No helper below looks up a removed index entry.
+        // At most five deferred queues and 200 targets. Until the first deep
+        // queue, use only the baseline-shaped result vector. Promotion retains
+        // already removed orders, including prefixes with missing index IDs.
         type DeferredLevel = ((u8, FixedPoint), Vec<(usize, OrderId)>);
         let mut levels: [Option<DeferredLevel>; 5] = std::array::from_fn(|_| None);
         let mut used = 0;
-        let mut cancelled = vec![None; order_ids.len()];
+        let mut cancelled = Vec::with_capacity(order_ids.len());
+        let mut deferred: Option<Vec<Option<Order>>> = None;
+        let output_count = order_ids.len();
         for (output, order_id) in order_ids.into_iter().enumerate() {
             let Some(loc) = self.order_index.remove(&order_id) else {
                 continue;
@@ -832,40 +833,66 @@ impl OrderBook {
                 continue;
             }
             let book = if tag == crate::book_rows::side_tag(Side::Buy) {
-                &self.bids
+                &mut self.bids
             } else {
-                &self.asks
+                &mut self.asks
             };
-            if used < levels.len()
-                && book
-                    .get(&loc.price)
-                    .is_some_and(|queue| queue.len() >= 1_024)
-            {
+            let Some(queue) = book.get_mut(&loc.price) else {
+                continue;
+            };
+            if used < levels.len() && queue.len() >= 1_024 {
+                if deferred.is_none() {
+                    let mut slots = vec![None; output_count];
+                    // No earlier target was deferred. Compacting successful
+                    // prefix outputs into slots0..len is safe: len<=output,
+                    // so every later original-position slot remains disjoint.
+                    for (slot, order) in slots.iter_mut().zip(cancelled.drain(..)) {
+                        *slot = Some(order);
+                    }
+                    deferred = Some(slots);
+                }
                 levels[used] = Some((key, vec![(output, order_id)]));
                 used += 1;
-            } else {
-                cancelled[output] = self.cancel_all_remove_one(tag, loc.price, order_id);
+                continue;
             }
-        }
-        for ((tag, price), targets) in levels.into_iter().flatten() {
-            let book = if tag == crate::book_rows::side_tag(Side::Buy) {
-                &self.bids
-            } else {
-                &self.asks
-            };
-            let depth = book.get(&price).map_or(0, VecDeque::len);
-            if Self::cancel_all_level_can_compact(depth, targets.len()) {
-                self.cancel_all_remove_level(tag, price, &targets, &mut cancelled);
-            } else {
-                // Below the per-level count/depth guard, retain original target
-                // order and ordinary removal; no sorting or queue scan.
-                for (output, id) in targets {
-                    cancelled[output] = self.cancel_all_remove_one(tag, price, id);
+            // Classify and remove through the same mutable queue lookup. Only
+            // deletion of an emptied level needs another tree operation.
+            let removed = Self::queue_position(queue, &self.order_seq, order_id)
+                .and_then(|pos| queue.remove(pos));
+            if queue.is_empty() {
+                book.remove(&loc.price);
+            }
+            if let Some(order) = removed {
+                self.cancel_all_record_removal(tag, loc.price, order_id);
+                if let Some(slots) = deferred.as_mut() {
+                    slots[output] = Some(order);
+                } else {
+                    cancelled.push(order);
                 }
             }
         }
+        if let Some(mut slots) = deferred {
+            for ((tag, price), targets) in levels.into_iter().flatten() {
+                let book = if tag == crate::book_rows::side_tag(Side::Buy) {
+                    &self.bids
+                } else {
+                    &self.asks
+                };
+                let depth = book.get(&price).map_or(0, VecDeque::len);
+                if Self::cancel_all_level_can_compact(depth, targets.len()) {
+                    self.cancel_all_remove_level(tag, price, &targets, &mut slots);
+                } else {
+                    for (output, id) in targets {
+                        slots[output] = self.cancel_all_remove_one(tag, price, id);
+                    }
+                }
+            }
+            // Reuse the original result buffer; all-shallow batches never
+            // allocate slots or perform this result collection at all.
+            cancelled.extend(slots.into_iter().flatten());
+        }
         self.pending_stops.retain(|s| s.trader != trader);
-        cancelled.into_iter().flatten().collect()
+        cancelled
     }
 
     /// Ordinary queue removal after the caller has removed order_index exactly
@@ -883,24 +910,28 @@ impl OrderBook {
             book.remove(&price);
         }
         if removed.is_some() {
-            let seq = self.order_seq.remove(&id);
-            self.row_journal.insert(id);
-            self.level_journal.insert((tag, price.raw()));
-            Self::bump_level_epoch(
-                self.level_hash_cache.is_some(),
-                &mut self.level_epoch,
-                tag,
-                price.raw(),
-            );
-            Self::mark_chunk_dirty(
-                self.level_hash_chunked,
-                &mut self.dirty_chunks,
-                tag,
-                price.raw(),
-                seq,
-            );
+            self.cancel_all_record_removal(tag, price, id);
         }
         removed
+    }
+
+    fn cancel_all_record_removal(&mut self, tag: u8, price: FixedPoint, id: OrderId) {
+        let seq = self.order_seq.remove(&id);
+        self.row_journal.insert(id);
+        self.level_journal.insert((tag, price.raw()));
+        Self::bump_level_epoch(
+            self.level_hash_cache.is_some(),
+            &mut self.level_epoch,
+            tag,
+            price.raw(),
+        );
+        Self::mark_chunk_dirty(
+            self.level_hash_chunked,
+            &mut self.dirty_chunks,
+            tag,
+            price.raw(),
+            seq,
+        );
     }
 
     /// Remove one deferred queue's targets. order_seq remains authoritative for
@@ -5540,6 +5571,48 @@ mod cancel_all_compaction_tests {
         ids.push(ids[0]); // authoritative removal prevents duplicate output
         ids.push(OrderId::MAX); // missing index is skipped
         assert_mixed_cancel(book);
+    }
+
+    #[test]
+    fn cancel_all_compaction_hybrid_all_shallow_matches_naive() {
+        // All touched queues are shallow, but unrelated deep liquidity keeps
+        // the global-size rejection inactive. No deferred slots are needed.
+        let mut book = mixed_bench_fixture(32, 4, "under_count", 10, true);
+        let ids = book.trader_orders.get_mut(&addr(1)).unwrap();
+        ids.insert(0, OrderId::MAX);
+        ids.insert(2, ids[1]);
+        assert_mixed_cancel(book);
+    }
+
+    #[test]
+    fn cancel_all_compaction_hybrid_late_promotion_preserves_sparse_prefix() {
+        for deep_count in [1, 16] {
+            let mut book = mixed_book(
+                &[(32, 16), (32, 16), (8_192, deep_count)],
+                "middle",
+                Side::Sell,
+            );
+            let mut ids = book.trader_orders.remove(&addr(1)).unwrap();
+            // Force32 successful shallow removals before the first deep queue.
+            // Missing/duplicate prefix IDs mean successful-result offsets no
+            // longer equal original trader-index positions at promotion.
+            ids.sort_by_key(|id| book.order_index[id].price);
+            ids.insert(0, OrderId::MAX);
+            ids.insert(2, ids[1]);
+            let absent_queue_id = OrderId::MAX - 1;
+            book.order_index.insert(
+                absent_queue_id,
+                OrderLocation {
+                    side: Side::Sell,
+                    price: fp(999),
+                },
+            );
+            ids.insert(4, absent_queue_id);
+            book.trader_orders.insert(addr(1), ids);
+            // One case promotes then removes ordinarily; the other uses the
+            // existing16/depth8192 compaction eligibility and movement guard.
+            assert_mixed_cancel(book);
+        }
     }
 
     fn mixed_bench_fixture(

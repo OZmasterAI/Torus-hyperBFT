@@ -396,3 +396,66 @@ regresses. Control noise also matters, especially in the first and partial cases
 No node binary or live gain is claimed. The next revision should remove eager
 result-slot allocation and redundant shallow-queue lookup where no grouping is
 needed, preserving once-only index removal and every tested state invariant.
+
+### Follow-up: lazy deferred results and one ordinary queue lookup
+
+Issue `b08510cb-380b-42f8-9305-ddb4407826cc`, attempt
+`bc939e56-6903-4430-b3f6-7d37165ba777`, records the shallow0.837 ratio as a
+separate performance finding following the semantic resolution of `b9b82951`.
+The first-run table and artifacts above remain evidence for `1367cb6`, not this
+revision. Eager optional result slots/result collection and a repeated shallow
+level lookup are observed source costs; their contribution to the measured
+regression is a hypothesis, not isolated attribution.
+
+The revision starts with a baseline-shaped `Vec<Order>` and accumulates ordinary
+successful removals directly. The first selected deep queue lazily creates the
+deferred slots, moving the successful prefix into their beginning. Missing or
+duplicate IDs can make that prefix shorter than the original index position;
+this is safe because no earlier target was deferred, all prefix outputs precede
+all later targets, and the prefix length cannot exceed the current position.
+Later targets keep their original-position slots. After deferred removal, results
+extend the original vector using its retained capacity. With no deferred queue,
+there is no slot allocation, promotion or final flattening pass.
+
+Classification and ordinary removal now share the same mutable queue lookup.
+Removing an emptied price level remains a separate tree operation. A shared
+record-removal helper preserves sequence deletion, row/level journals, per-order
+epoch increment and dirty chunk marks without an index relookup. No whole-batch
+classifier, queue-count limit, depth/count guard or movement threshold changes.
+
+Two additional Mode3 differentials cover all-shallow touched queues with
+unrelated deep liquidity, and late promotion after32 successful shallow removals
+interspersed with missing IDs, a duplicate, and an index pointing to an absent
+queue. Late promotion exercises both one-target ordinary removal and the existing
+16-target deep eligibility. They reuse ordered-output, FIFO, metadata, journal,
+incremental/from-scratch level commitment and following-save comparisons.
+The seven benchmark cases and balanced AB/AA/BB schedule remain unchanged.
+
+This removes the extra representation on all-shallow batches, not on every
+all-ordinary batch: a selected deep queue that ultimately has too few targets
+still causes promotion. Deep cases now retain both result-buffer capacity and
+slot storage during processing; repeated measurements must check their cost as
+well as shallow fallback. Independent review found no blocker. The revised
+implementation passed 126 core library, 89 core integration and 33 bridge tests
+(248 total; receipt `2bed8e38-848d-415b-afc5-e987b1814386`). A separate node-only
+build after cleaning affected packages passed receipt
+`bed520bd-7481-4ec4-87f2-eee39e38913a`; the new production
+`cancel_all_record_removal` symbol was positively identified.
+
+The unchanged seven-case screen completed in 81.73 seconds on an idle host.
+Artifacts: `cancel-fallback-micro-r1.*`; test binary SHA256
+`6450c15aa03d37c4ddd41522990be00eaecfa07bd26d55a7338a8a23cc893624`.
+
+| Shape | AB hybrid | AA | BB hybrid |
+| --- | ---: | ---: | ---: |
+| 8192-deep, 16 middle targets, mixed thin levels | 2.017 | 0.978 | 1.180 |
+| Observed deep sizes, 16 middle targets | 3.515 | 0.924 | 0.965 |
+| Observed deep sizes, dispersed targets | 1.188 | 1.039 | 1.008 |
+| 8192-deep, 15/17 partial eligibility | 1.552 | 0.929 | 1.067 |
+| Deep queues below target-count threshold | 0.989 | 0.974 | 0.967 |
+| Ten shallow queues, unrelated deep liquidity | 0.982 | 0.924 | 1.050 |
+| Six deep queues, deferred-slot overflow | 1.948 | 1.051 | 0.877 |
+
+Deep-case mechanism gains persist. Shallow fallback is closer to parity, with
+noisy controls; this does not prove absence of small regressions. A live
+equal-duration comparison is required before promotion or any chain-speed claim.
