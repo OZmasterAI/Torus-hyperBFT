@@ -163,6 +163,7 @@ RUN_DIR="$DATA_ROOT/run"
 # RocksDB write-scheduling option (WAL and memtable writers overlap), no
 # durability change. Control = EXTRA_ENV='TORUS_ROCKSDB_PIPELINED_WRITE=0'.
 RECORD_ENV=(
+    TORUS_PROPOSAL_DA_ENSURE=0
     TORUS_ROCKSDB_PIPELINED_WRITE=1
     TORUS_BOOK_ROWS=3
     TORUS_RESIDENT_BOOKS=1
