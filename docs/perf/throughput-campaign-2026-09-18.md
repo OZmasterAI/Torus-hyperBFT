@@ -909,3 +909,32 @@ regressions are gone. Full tables and provenance are in the candidate's
 result exists yet. The body-before-expiry candidate has separately passed
 source review and is undergoing root-scheduled tests/build; no runtime is
 promoted or combined on the basis of these mechanism results.
+
+
+### Cancellation live screen and qualified body-receive experiment
+
+`s60-cancel-lazy-10m-r1` is ACCEPT: 38,142.7 fills/s over 310 measured seconds
+(nominal 300), first120 46,205.6, best60 48,825.8, drain 138 seconds and commit
+p95 4,403.2 ms. It uses frozen `f890e06`, the scheduled generator and runner
+`998d1eb`, with ten markets, cap200/rate76000, depth observation and unchanged
+ENGINE0/MATCH18/SETTLE18/BODYFETCH1 settings. Liveness, quiescent agreement and
+body dissemination passed. No baseline-relative gain is established yet; a
+fresh identically shaped baseline is the next cell.
+
+Four depth snapshots completed with resting counts 0 / 902,430 / 1,551,186 /
+2,009,214. Val0 bench-plus-drain native-block means were engine 817.16 ms,
+phase1 276.36 ms, save-books 243.62 ms and flush 339.86 ms, against block
+1,501.93 ms. Completed databases occupied 29.33 GiB and were inventoried and
+cleaned; logs, metrics, digests, provenance and frozen binaries remain.
+
+The body-before-expiry experiment is separately committed at `110ebfc` and
+frozen as `artifacts/body-before-expiry`, node SHA256
+`f8bfeec80686abf4385a6907aef0c6146797e6822a56a7e98a77c68e850e168d`.
+Receipt `3bcb0276` covers 112 HotStuff and 111 network tests plus a separately
+built and positively identified node. The fixtures include the actual algorithm
+path and deterministic empty-channel arrival, timeout and disconnect cases.
+The default-off `TORUS_BODY_BEFORE_EXPIRY=1` policy gives a bounded receive
+opportunity before pending-body expiry; it preserves message filters and
+ordinary handlers. A same-binary OFF/ON live diagnostic remains pending.
+It targets already-queued responses, not responses that first arrive after
+expiry, and is not yet promoted.
