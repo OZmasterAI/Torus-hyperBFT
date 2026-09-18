@@ -342,6 +342,38 @@ class SummarizeTest(unittest.TestCase):
         s, _ = run_summarize(self.d)
         self.assertEqual(s["agreement"]["agreement_verdict"], "AGREE")
         self.assertIsNone(s["cell"]["markets_per_sender"])
+        self.assertIsNone(s["cell"]["workload"])
+        self.assertEqual(s["cell"]["rate_schedule_observed"], [])
+
+    def test_workload_and_observed_phase_provenance_survive_resummarizing(self):
+        from workload import parse_workload
+        write_cell(self.d, 1_000, 1_000)
+        write_agreement(self.d, ["same"] * 3)
+        workload = parse_workload("1", ".2", ".05", "0:1000,120:0,180:2000", 300)
+        with open(os.path.join(self.d, "workload.json"), "w") as f:
+            json.dump(workload, f)
+        observed = {"index": 1, "start_s": 120, "end_s": 180, "rate_total": 0,
+                    "observed_elapsed_s": 120.01, "planned_unix_s": BENCH_START + 120}
+        with open(os.path.join(self.d, "bench.log"), "a") as f:
+            f.write("\nRATE_SCHEDULE_PHASE " + json.dumps(observed) + "\n")
+            f.write("RATE_SCHEDULE_PHASE {truncated\n")
+        command = "bench consensus --econ --rate-schedule 0:1000,120:0,180:2000"
+        for _ in range(2):
+            s, _ = run_summarize(self.d, extra=["--bench-cmd", command])
+            self.assertEqual(s["cell"]["workload"], workload)
+            self.assertEqual(s["cell"]["rate_schedule_observed"], [observed])
+            self.assertEqual(len(s["cell"]["rate_schedule_parse_errors"]), 1)
+            self.assertFalse(s["cell"]["rate_schedule_provenance"]["valid"])
+            self.assertFalse(s["validity"]["accepted"])
+            self.assertIn("rate schedule provenance unverified", s["validity"]["unverified_reasons"])
+        with open(os.path.join(self.d, "bench.log"), "w") as f:
+            for index, phase in enumerate(workload["rate_schedule"]):
+                record = dict(phase, index=index, observed_elapsed_s=phase["start_s"] + .01,
+                              planned_unix_s=BENCH_START + phase["start_s"])
+                f.write("RATE_SCHEDULE_PHASE " + json.dumps(record) + "\n")
+        s, _ = run_summarize(self.d, extra=["--bench-cmd", command])
+        self.assertTrue(s["cell"]["rate_schedule_provenance"]["valid"])
+        self.assertNotIn("rate schedule provenance unverified", s["validity"]["unverified_reasons"])
 
     # --- bl4: metrics-after is one scrape, the 3 digests are concurrent ---
     # torus_native_actions_processed_total keeps ticking between them, so a

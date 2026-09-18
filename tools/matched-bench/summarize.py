@@ -15,6 +15,7 @@ negative and the percentages past 100 %.
 """
 import argparse, csv, json, os, statistics, sys, time
 from health import assess_liveness, acceptance, DEFAULT_STALL_S
+from workload import schedule_provenance
 
 ap = argparse.ArgumentParser()
 for a in ["out", "label", "worktree", "commit", "dirty", "markets", "dur", "rate", "senders",
@@ -28,6 +29,22 @@ A = ap.parse_args()
 OUT = A.out
 t0, t1, td = int(A.t_bench0), int(A.t_bench1), int(A.t_drain)
 NODE_ENV = json.loads(A.node_env) if A.node_env else {}
+WORKLOAD = None
+workload_path = os.path.join(OUT, "workload.json")
+if os.path.exists(workload_path):
+    with open(workload_path) as f:
+        WORKLOAD = json.load(f)
+RATE_PHASES = []
+RATE_PHASE_ERRORS = []
+bench_log = os.path.join(OUT, "bench.log")
+if WORKLOAD and WORKLOAD.get("rate_schedule") and os.path.exists(bench_log):
+    with open(bench_log, errors="replace") as f:
+        for line_number, line in enumerate(f, 1):
+            if line.startswith("RATE_SCHEDULE_PHASE "):
+                try:
+                    RATE_PHASES.append(json.loads(line[len("RATE_SCHEDULE_PHASE "):]))
+                except ValueError:
+                    RATE_PHASE_ERRORS.append({"line": line_number, "error": "invalid phase JSON"})
 
 # ---------------------------------------------------------------- load sampler
 rows = {"val0": [], "val1": [], "val2": []}
@@ -928,6 +945,13 @@ drained = A.drained == "1" and liveness['verdict'] != 'FAIL'
 validity = acceptance(liveness, drained, int(A.bench_rc or -1),
                       agreement.get('agreement_verdict'),
                       dissem.get('dissemination_clean'), crash)
+schedule_evidence = schedule_provenance(WORKLOAD, RATE_PHASES, RATE_PHASE_ERRORS,
+                                       A.bench_cmd, int(A.dur or 0))
+if schedule_evidence['required'] and not schedule_evidence['valid']:
+    validity['accepted'] = False
+    validity['unverified_reasons'].append('rate schedule provenance unverified')
+    if validity['verdict'] != 'REJECT':
+        validity['verdict'] = 'UNVERIFIED'
 summary = {
     "status": "OK" if validity['accepted'] else "INVALID" if validity['verdict'] == 'REJECT' else "UNVERIFIED",
     "label": A.label, "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -935,6 +959,9 @@ summary = {
     "binaries": {"torus_node_md5": A.md5_node, "bench_throughput_md5": A.md5_bench},
     "genesis": {"md5": A.genesis_md5, "markets": int(A.genesis_markets or 0), "native_balances": int(A.genesis_accounts or 0)},
     "cell": {"markets": int(A.markets), "duration_s": int(A.dur), "rate_total": int(A.rate), "senders": int(A.senders),
+             "workload": WORKLOAD, "rate_schedule_observed": RATE_PHASES,
+             "rate_schedule_parse_errors": RATE_PHASE_ERRORS,
+             "rate_schedule_provenance": schedule_evidence,
              "block_cap": int(A.block_cap) if A.block_cap else None,
              "markets_per_sender": int(A.markets_per_sender) if A.markets_per_sender else None,
              "extra_env": A.extra_env, "node_env": NODE_ENV,

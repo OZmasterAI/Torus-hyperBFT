@@ -8,6 +8,7 @@ use k256::ecdsa::SigningKey;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use tokio::sync::Semaphore;
+mod rate_schedule;
 
 use torus_types::{
     eip712::{sign_native_action, sign_native_action_with_session},
@@ -175,6 +176,10 @@ enum Command {
         /// integer per-sender --rate cannot express). 0 = fall back to --rate.
         #[arg(long, default_value_t = 0.0)]
         rate_total: f64,
+        /// Econ only: absolute integer-second phase starts and aggregate actions/s,
+        /// e.g. 0:76000,30:120000,60:0,90:76000. Scheduled zero pauses submission.
+        #[arg(long, requires = "econ")]
+        rate_schedule: Option<String>,
         /// #32: comma-separated node Prometheus `/metrics` endpoints (e.g.
         /// http://localhost:9161,http://localhost:9162). When set, the mission
         /// funnel counters' delta over the timed window (placed/s, matched/s)
@@ -511,7 +516,7 @@ mod ammo_plan_tests {
 //     stretch T.
 //
 // CROSSING SHAPE: every (sender, market) pair trades ONE side only
-// (parity of sender_idx + market_id), so a sender can never self-trade (STP
+// (legacy parity for uniform plans; assigned-owner rank for locality), so a sender can never self-trade (STP
 // cancels would leak margin without producing a fill). Each order is priced off
 // a fixed per-run mid: passive (rests) at mid -/+ d and aggressive (crosses) at
 // mid +/- d, d ~ U[1, band] ticks, aggressive with probability --cross-fraction.
@@ -568,7 +573,7 @@ impl EconShape {
     }
 }
 
-/// Fixed side per (sender, market): a sender only ever buys or only ever sells
+/// Legacy uniform-plan side per (sender, market): a sender only ever buys or only ever sells
 /// in a given market, so its taker orders can never hit its own resting orders
 /// (STP maker-cancels leak margin and produce no fill). Parity splits every
 /// market's senders 50/50 buyers/sellers, so aggregate flow is balanced and
@@ -587,9 +592,10 @@ fn econ_place_order(
     rng: &mut impl Rng,
     sender_idx: usize,
     market_id: u64,
+    plan: MarketPlan,
     shape: &EconShape,
 ) -> PlaceOrderParams {
-    let is_buy = econ_side_is_buy(sender_idx, market_id);
+    let is_buy = plan.econ_side_is_buy(sender_idx, market_id);
     let aggressive = rng.gen_bool(shape.cross_fraction);
     let d = rng.gen_range(1..=shape.band as i128);
     // Aggressive buy above mid / aggressive sell below mid cross the opposing
@@ -634,12 +640,12 @@ fn econ_action(
     }
     if batch_size <= 1 {
         let market_id = plan.pick(rng, sender_idx);
-        return NativeAction::PlaceOrder(econ_place_order(rng, sender_idx, market_id, shape));
+        return NativeAction::PlaceOrder(econ_place_order(rng, sender_idx, market_id, plan, shape));
     }
     let orders: Vec<PlaceOrderParams> = (0..batch_size)
         .map(|_| {
             let market_id = plan.pick(rng, sender_idx);
-            econ_place_order(rng, sender_idx, market_id, shape)
+            econ_place_order(rng, sender_idx, market_id, plan, shape)
         })
         .collect();
     NativeAction::PlaceOrderBatch(orders)
@@ -683,7 +689,7 @@ mod econ_shape_tests {
         for sender_idx in 0..50 {
             for _ in 0..200 {
                 let market_id = rng.gen_range(1..=10);
-                let p = econ_place_order(&mut rng, sender_idx, market_id, &shape);
+                let p = econ_place_order(&mut rng, sender_idx, market_id, MarketPlan::uniform(10), &shape);
                 let m = phase2_margin(&p);
                 assert!(
                     m >= lo && m <= hi,
@@ -719,7 +725,7 @@ mod econ_shape_tests {
         for &(sender_idx, market_id) in &[(0usize, 1u64), (7, 3), (42, 10)] {
             let want = econ_side_is_buy(sender_idx, market_id);
             for _ in 0..100 {
-                let p = econ_place_order(&mut rng, sender_idx, market_id, &shape);
+                let p = econ_place_order(&mut rng, sender_idx, market_id, MarketPlan::uniform(10), &shape);
                 assert_eq!(p.is_buy, want, "side must never flip for a (sender, market)");
             }
         }
@@ -738,8 +744,8 @@ mod econ_shape_tests {
         let passive = EconShape::new(1500, 0, 5, 0.0, 0.0);
         for sender_idx in 0..20 {
             for market_id in 1..=4u64 {
-                let a = econ_place_order(&mut rng, sender_idx, market_id, &aggr);
-                let p = econ_place_order(&mut rng, sender_idx, market_id, &passive);
+                let a = econ_place_order(&mut rng, sender_idx, market_id, MarketPlan::uniform(4), &aggr);
+                let p = econ_place_order(&mut rng, sender_idx, market_id, MarketPlan::uniform(4), &passive);
                 if a.is_buy {
                     assert!(a.price > mid, "aggressive buy must cross above mid");
                 } else {
@@ -852,14 +858,32 @@ impl MarketPlan {
         Self::new(markets, 0)
     }
 
+    /// Alternate the actual owners of each market, not all possible senders.
+    /// In the flattened assignment slots i*K+j, market m occurs at
+    /// (m-1)+q*N. Its owners therefore have ranks q=0,1,... with no gaps:
+    /// alternating q gives exactly equal sides for an even owner count and
+    /// a difference of one for an odd count. A sender's side stays fixed.
+    fn econ_side_is_buy(&self, sender_idx: usize, market_id: u64) -> bool {
+        if self.per_sender == 0 || self.per_sender == self.markets {
+            // Preserve the existing default/full-market workload exactly.
+            return econ_side_is_buy(sender_idx, market_id);
+        }
+        let slots = sender_idx as u128 * self.per_sender as u128;
+        let markets = self.markets as u128;
+        let offset = (market_id as u128 - 1 + markets - slots % markets) % markets;
+        debug_assert!(offset < self.per_sender as u128, "market outside sender's plan");
+        let owner_rank = (slots + offset) / markets;
+        (owner_rank + market_id as u128) % 2 == 0
+    }
+
     /// `sender_idx`'s fixed market set, in assignment order.
     fn markets_for(&self, sender_idx: usize) -> Vec<u64> {
         if self.per_sender == 0 {
             return (1..=self.markets).collect();
         }
-        let start = (sender_idx as u64).wrapping_mul(self.per_sender) % self.markets;
+        let start = sender_idx as u128 * self.per_sender as u128 % self.markets as u128;
         (0..self.per_sender)
-            .map(|j| (start + j) % self.markets + 1)
+            .map(|j| ((start + j as u128) % self.markets as u128 + 1) as u64)
             .collect()
     }
 
@@ -868,14 +892,117 @@ impl MarketPlan {
         if self.per_sender == 0 {
             return rng.gen_range(1..=self.markets);
         }
-        let start = (sender_idx as u64).wrapping_mul(self.per_sender) % self.markets;
-        (start + rng.gen_range(0..self.per_sender)) % self.markets + 1
+        let start = sender_idx as u128 * self.per_sender as u128 % self.markets as u128;
+        ((start + rng.gen_range(0..self.per_sender) as u128) % self.markets as u128 + 1) as u64
     }
 }
 
 #[cfg(test)]
 mod market_plan_tests {
     use super::*;
+
+    #[test]
+    fn locality_sides_balance_actual_market_owners() {
+        // Include the two formerly one-sided shapes, non-divisor K, odd owner
+        // counts, and markets with too few owners to support opposing flow.
+        for (markets, per_sender, senders) in [
+            (10, 1, 5_000), (300, 3, 5_000), (10, 3, 51),
+            (7, 3, 101), (9, 8, 17), (10, 1, 3),
+        ] {
+            let plan = MarketPlan::new(markets, per_sender);
+            let mut counts = vec![[0usize; 2]; markets as usize + 1];
+            for sender in 0..senders {
+                for market in plan.markets_for(sender) {
+                    let side = usize::from(plan.econ_side_is_buy(sender, market));
+                    counts[market as usize][side] += 1;
+                    // Every sender-count prefix must remain balanced, not just
+                    // the final round multiple of the assignment period.
+                    let [sell, buy] = counts[market as usize];
+                    assert!(sell.abs_diff(buy) <= 1,
+                        "N={markets} K={per_sender} sender={sender} market={market}: {sell}/{buy}");
+                }
+            }
+            for [sell, buy] in &counts[1..] {
+                if sell + buy >= 2 {
+                    assert!(*sell > 0 && *buy > 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn locality_econ_generation_uses_fixed_balanced_sides() {
+        let shape = EconShape::new(1500, 0, 1, 0.5, 0.0);
+        for (markets, per_sender) in [(10, 1), (300, 3), (7, 3)] {
+            let plan = MarketPlan::new(markets, per_sender);
+            for sender in 0..200 {
+                let mut rng = StdRng::seed_from_u64(sender as u64);
+                for _ in 0..2 {
+                    let NativeAction::PlaceOrderBatch(orders) =
+                        econ_action(&mut rng, sender, plan, 32, &shape)
+                    else { panic!("expected placement batch") };
+                    for order in orders {
+                        assert!(plan.markets_for(sender).contains(&order.market_id));
+                        assert_eq!(order.is_buy, plan.econ_side_is_buy(sender, order.market_id));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn uniform_econ_actions_remain_byte_identical_to_legacy_generator() {
+        // Freeze the pre-fix action generation here, including RNG consumption.
+        fn legacy_order(rng: &mut impl Rng, sender: usize, market: u64, shape: &EconShape) -> PlaceOrderParams {
+            let is_buy = (sender as u64).wrapping_add(market) % 2 == 0;
+            let aggressive = rng.gen_bool(shape.cross_fraction);
+            let d = rng.gen_range(1..=shape.band as i128);
+            let price_units = if is_buy == aggressive { shape.mid as i128 + d } else { shape.mid as i128 - d };
+            let price = FixedPoint::from_raw(price_units * FixedPoint::SCALE);
+            let target = FixedPoint::from_raw(shape.target_margin as i128 * FixedPoint::SCALE);
+            let leverage = FixedPoint::from_raw(NATIVE_DEFAULT_LEVERAGE * FixedPoint::SCALE);
+            let quantity = (target * leverage / price).max(FixedPoint::ONE);
+            PlaceOrderParams {
+                market_id: market, is_buy, price, quantity, order_type: OrderType::Limit,
+                time_in_force: TimeInForce::GTC, reduce_only: false, client_order_id: None,
+            }
+        }
+        fn legacy_action(rng: &mut impl Rng, sender: usize, markets: u64, batch: usize, shape: &EconShape) -> NativeAction {
+            if shape.cancel_fraction > 0.0 && rng.gen_bool(shape.cancel_fraction) {
+                return NativeAction::CancelAllOrders { market_id: None };
+            }
+            if batch <= 1 {
+                let market = rng.gen_range(1..=markets);
+                return NativeAction::PlaceOrder(legacy_order(rng, sender, market, shape));
+            }
+            NativeAction::PlaceOrderBatch((0..batch).map(|_| {
+                let market = rng.gen_range(1..=markets);
+                legacy_order(rng, sender, market, shape)
+            }).collect())
+        }
+        let shape = EconShape::new(1500, 0, 5, 0.5, 0.05);
+        for batch in [1, 4, 400] {
+            for sender in [0, 9, 42] {
+                let mut legacy_rng = StdRng::seed_from_u64(23);
+                let mut current_rng = legacy_rng.clone();
+                for _ in 0..64 {
+                    assert_eq!(
+                        bincode::serialize(&econ_action(&mut current_rng, sender, MarketPlan::uniform(10), batch, &shape)).unwrap(),
+                        bincode::serialize(&legacy_action(&mut legacy_rng, sender, 10, batch, &shape)).unwrap(),
+                    );
+                }
+            }
+        }
+        // Explicit K>=N already used legacy sides and must continue to do so.
+        for k in [10, 99] {
+            let plan = MarketPlan::new(10, k);
+            for sender in 0..50 {
+                for market in plan.markets_for(sender) {
+                    assert_eq!(plan.econ_side_is_buy(sender, market), econ_side_is_buy(sender, market));
+                }
+            }
+        }
+    }
 
     // --markets-per-sender 0 (default) must keep TODAY's shape: every order
     // draws uniformly from 1..=markets, and the whole range is used.
@@ -2057,6 +2184,63 @@ torus_rpc_requests_total{method=\"eth_blockNumber\"} 555
     }
 }
 
+async fn submit_before_deadline(deadline: Instant, submit: impl std::future::Future<Output = ()>) -> bool {
+    // This check runs when the HTTP task is first polled, not when it is queued.
+    // Once started, an in-flight request is allowed to complete across a boundary.
+    if Instant::now() >= deadline { return false; }
+    submit.await;
+    true
+}
+
+#[cfg(test)]
+mod scheduled_dispatch_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn delayed_task_does_not_start_http_and_releases_its_permit() {
+        let semaphore = Arc::new(Semaphore::new(1));
+        let permit = semaphore.clone().acquire_owned().await.unwrap();
+        let started = Arc::new(AtomicU64::new(0));
+        let count = started.clone();
+        let (release, delayed) = tokio::sync::oneshot::channel();
+        let deadline = Instant::now();
+        let task = tokio::spawn(async move {
+            let _permit = permit;
+            delayed.await.unwrap();
+            submit_before_deadline(deadline, async move { count.fetch_add(1, Ordering::Relaxed); }).await
+        });
+        assert_eq!(semaphore.available_permits(), 0);
+        release.send(()).unwrap();
+        assert!(!task.await.unwrap());
+        assert_eq!(started.load(Ordering::Relaxed), 0);
+        assert_eq!(semaphore.available_permits(), 1);
+        assert!(submit_before_deadline(Instant::now() + Duration::from_secs(60), async {}).await);
+    }
+}
+
+async fn scheduled_slot(
+    pacer: &mut rate_schedule::Pacer,
+    start: Instant,
+    semaphore: &Arc<Semaphore>,
+) -> Option<(tokio::sync::OwnedSemaphorePermit, usize)> {
+    loop {
+        match pacer.poll(start.elapsed()) {
+            rate_schedule::Step::Done => return None,
+            rate_schedule::Step::Wait(wait) => tokio::time::sleep(wait).await,
+            rate_schedule::Step::Ready(phase) => {
+                let remaining = pacer.phase_end(phase).saturating_sub(start.elapsed());
+                if let Ok(Ok(permit)) = tokio::time::timeout(remaining, semaphore.clone().acquire_owned()).await {
+                    if pacer.poll(start.elapsed()) == rate_schedule::Step::Ready(phase) {
+                        return Some((permit, phase));
+                    }
+                    // A delayed permit cannot dispatch work under an expired phase.
+                    drop(permit);
+                }
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_consensus(
     rpc_urls_str: &str,
@@ -2074,6 +2258,7 @@ async fn run_consensus(
     markets_per_sender: u64,
     econ: Option<EconShape>,
     rate_total: f64,
+    rate_schedule: Option<Arc<rate_schedule::RateSchedule>>,
     metrics_urls_str: &str,
     sweep_bodies: bool,
 ) {
@@ -2086,6 +2271,9 @@ async fn run_consensus(
             plan.per_sender,
             plan.markets_for(0)
         );
+        if econ.is_some() && plan.per_sender < plan.markets {
+            println!("Locality sides: per-market-owner-rank-v1 (odd owner counts differ by one)");
+        }
     }
     let rpc_urls: Vec<String> = rpc_urls_str
         .split(',')
@@ -2160,7 +2348,9 @@ async fn run_consensus(
             shape.cross_fraction * 100.0,
             shape.cancel_fraction * 100.0,
         );
-        if rate_total > 0.0 {
+        if let Some(schedule) = &rate_schedule {
+            println!("Rate: {} scheduled phases (aggregate actions/s; overrides --rate-total and --rate; zero pauses)", schedule.phases.len());
+        } else if rate_total > 0.0 {
             println!(
                 "Rate: {rate_total:.1} actions/s aggregate ({:.3}/s per sender)",
                 rate_total / num_senders as f64
@@ -2258,6 +2448,7 @@ async fn run_consensus(
     }
 
     let submitted = Arc::new(AtomicU64::new(0));
+    let scheduled_late_actions = Arc::new(AtomicU64::new(0));
 
     // Ammo strategy. Pre-sign stamps every nonce up front (now + window/2); if
     // signing ALL of it outlasts the nonce window the ammo is "too old" on arrival
@@ -2380,10 +2571,26 @@ async fn run_consensus(
     let scrape_live = scrape_on && start_metrics.is_some();
 
     let start_block = fetch_block_number(&client, &rpc_urls[0]).await.unwrap_or(0);
-    let deadline = Instant::now() + Duration::from_secs(duration_secs);
-    let start_time = Instant::now();
+    let schedule_start = Instant::now();
+    let deadline = schedule_start + Duration::from_secs(duration_secs);
+    let start_time = if rate_schedule.is_some() { schedule_start } else { Instant::now() };
     let semaphore = Arc::new(Semaphore::new(concurrency));
     let rpc_urls = Arc::new(rpc_urls);
+    let schedule_reporter = rate_schedule.as_ref().map(|schedule| {
+        let schedule = schedule.clone();
+        let unix_start = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64()
+            - start_time.elapsed().as_secs_f64();
+        tokio::spawn(async move {
+            for (index, phase) in schedule.phases.iter().enumerate() {
+                tokio::time::sleep(phase.start.saturating_sub(start_time.elapsed())).await;
+                println!("RATE_SCHEDULE_PHASE {}", serde_json::json!({
+                    "index": index, "start_s": phase.start.as_secs(), "end_s": phase.end.as_secs(),
+                    "rate_total": phase.rate, "observed_elapsed_s": start_time.elapsed().as_secs_f64(),
+                    "planned_unix_s": unix_start + phase.start.as_secs_f64()
+                }));
+            }
+        })
+    });
 
     // Live block monitor. #34/#35: it polls ONLY cheap endpoints inside the
     // timed window — block height (for block-time stats) and, when enabled, the
@@ -2504,7 +2711,9 @@ async fn run_consensus(
     // Econ pacing: `--rate-total` divides an aggregate actions/s budget across
     // all senders with a f64 interval (per-sender rates below 1/s are the norm
     // at thousands of senders); otherwise the legacy integer per-sender --rate.
-    let econ_pace: Option<Duration> = if rate_total > 0.0 {
+    let econ_pace: Option<Duration> = if rate_schedule.is_some() {
+        None
+    } else if rate_total > 0.0 {
         Some(Duration::from_secs_f64(
             num_senders as f64 * submit_batch as f64 / rate_total,
         ))
@@ -2520,6 +2729,9 @@ async fn run_consensus(
         let submitted = submitted.clone();
         let semaphore = semaphore.clone();
         let url_count = urls.len();
+        let mut scheduled_pacer = rate_schedule.as_ref().map(|schedule|
+            rate_schedule::Pacer::new(schedule.clone(), sender_idx, num_senders, submit_batch));
+        let scheduled_late_actions = rate_schedule.as_ref().map(|_| scheduled_late_actions.clone());
         let sender_ammo = if !stream {
             std::mem::take(&mut ammo[sender_idx])
         } else {
@@ -2541,15 +2753,20 @@ async fn run_consensus(
                 let mut rng = StdRng::seed_from_u64(0xEC0A_0000_0000_0000 ^ sender_idx as u64);
                 // Phase jitter: spread the fleet uniformly over one pace
                 // interval so paced fires don't arrive as a synchronized burst.
-                if let Some(iv) = econ_pace {
+                if let Some(iv) = econ_pace.filter(|_| scheduled_pacer.is_none()) {
                     let jitter = iv.mul_f64(rng.gen_range(0.0..1.0));
                     let left = deadline.saturating_duration_since(Instant::now());
                     tokio::time::sleep(jitter.min(left)).await;
                 }
                 let mut last_nonce = 0u64;
                 let mut next_fire = Instant::now();
+                let mut pending_scheduled_actions: Option<Vec<NativeAction>> = None;
                 while Instant::now() < deadline {
-                    if let Some(iv) = econ_pace {
+                    let scheduled_permit = if let Some(pacer) = scheduled_pacer.as_mut() {
+                        let Some(slot) = scheduled_slot(pacer, start_time, &semaphore).await else { break };
+                        Some(slot)
+                    } else { None };
+                    if let Some(iv) = econ_pace.filter(|_| scheduled_pacer.is_none()) {
                         let now = Instant::now();
                         if now < next_fire {
                             tokio::time::sleep(next_fire - now).await;
@@ -2560,9 +2777,16 @@ async fn run_consensus(
                     // (the expensive ECDSA/serialize part). Nonces are wall-clock
                     // ms, strictly increasing per sender.
                     let mut batch_actions = Vec::with_capacity(submit_batch);
-                    for _ in 0..submit_batch {
-                        let action =
-                            econ_action(&mut rng, sender_idx, plan, batch_size, &shape);
+                    if scheduled_pacer.is_some() && pending_scheduled_actions.is_none() {
+                        pending_scheduled_actions = Some((0..submit_batch)
+                            .map(|_| econ_action(&mut rng, sender_idx, plan, batch_size, &shape)).collect());
+                    }
+                    for i in 0..submit_batch {
+                        let action = if let Some(actions) = &pending_scheduled_actions {
+                            actions[i].clone()
+                        } else {
+                            econ_action(&mut rng, sender_idx, plan, batch_size, &shape)
+                        };
                         let base = SystemTime::now()
                             .duration_since(UNIX_EPOCH)
                             .unwrap()
@@ -2592,16 +2816,42 @@ async fn run_consensus(
                         Ok(p) => p,
                         Err(_) => break, // signer panicked — stop this sender
                     };
-                    let permit = semaphore.clone().acquire_owned().await.unwrap();
+                    let http_deadline = scheduled_permit.as_ref().map(|(_, phase)|
+                        start_time + scheduled_pacer.as_ref().unwrap().phase_end(*phase));
+                    let permit = if let Some((permit, phase)) = scheduled_permit {
+                        let pacer = scheduled_pacer.as_mut().unwrap();
+                        if pacer.poll(start_time.elapsed()) != rate_schedule::Step::Ready(phase) {
+                            // Signing crossed a boundary. Preserve unsigned actions
+                            // and re-sign with fresh nonces at their next eligible slot.
+                            drop(permit);
+                            continue;
+                        }
+                        pacer.dispatched(start_time.elapsed());
+                        pending_scheduled_actions = None;
+                        permit
+                    } else {
+                        semaphore.clone().acquire_owned().await.unwrap()
+                    };
                     let url = urls[url_idx % url_count].clone();
                     url_idx += 1;
                     req_id += 1;
                     let client = client.clone();
                     let submitted = submitted.clone();
-                    tokio::spawn(async move {
-                        let _permit = permit;
-                        submit_payloads(&client, &url, &payloads, req_id, bin, &submitted).await;
-                    });
+                    if let Some(deadline) = http_deadline {
+                        let late_actions = scheduled_late_actions.as_ref().unwrap().clone();
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            let submit = submit_payloads(&client, &url, &payloads, req_id, bin, &submitted);
+                            if !submit_before_deadline(deadline, submit).await {
+                                late_actions.fetch_add(payloads.len() as u64, Ordering::Relaxed);
+                            }
+                        });
+                    } else {
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            submit_payloads(&client, &url, &payloads, req_id, bin, &submitted).await;
+                        });
+                    }
                 }
                 return;
             }
@@ -2729,10 +2979,14 @@ async fn run_consensus(
     for h in sender_handles {
         let _ = h.await;
     }
+    if let Some(reporter) = schedule_reporter { let _ = reporter.await; }
 
     // Wait for remaining in-flight requests to drain
     tokio::time::sleep(Duration::from_secs(2)).await;
     monitor_handle.abort();
+    if rate_schedule.is_some() {
+        println!("RATE_SCHEDULE_LATE_ACTIONS_SKIPPED {}", scheduled_late_actions.load(Ordering::Relaxed));
+    }
 
     let total_elapsed = start_time.elapsed();
     let final_submitted = submitted.load(Ordering::Relaxed);
@@ -3113,6 +3367,7 @@ async fn main() {
             econ_mid,
             band,
             rate_total,
+            rate_schedule,
             metrics_urls,
             sweep_bodies,
         } => {
@@ -3135,6 +3390,16 @@ async fn main() {
             let econ_shape = econ.then(|| {
                 EconShape::new(target_margin, econ_mid, band, cross_fraction, cancel_fraction)
             });
+            let rate_schedule = rate_schedule.map(|raw| {
+                if !econ || concurrency == 0 {
+                    eprintln!("--rate-schedule requires --econ and positive --concurrency");
+                    std::process::exit(2);
+                }
+                Arc::new(rate_schedule::RateSchedule::parse(&raw, duration).unwrap_or_else(|error| {
+                    eprintln!("invalid --rate-schedule: {error}");
+                    std::process::exit(2);
+                }))
+            });
             run_consensus(
                 &rpc_urls,
                 senders,
@@ -3151,6 +3416,7 @@ async fn main() {
                 markets_per_sender,
                 econ_shape,
                 rate_total,
+                rate_schedule,
                 &metrics_urls,
                 sweep_bodies,
             )

@@ -125,6 +125,10 @@ CONC=${CONC:-256}
 BATCH=${BATCH:-400}
 SUBMIT=${SUBMIT:-1}
 MPS=${MPS:-}
+BAND=${BAND:-5}
+CROSS_FRACTION=${CROSS_FRACTION:-0.5}
+CANCEL_FRACTION=${CANCEL_FRACTION:-0.05}
+RATE_SCHEDULE=${RATE_SCHEDULE:-}
 HEALTH_TIMEOUT=${HEALTH_TIMEOUT:-240}
 # Drain scales with the market count: the mempool backlog at 300 markets needs
 # far longer than 180 s to execute, and a cell that stops draining early is
@@ -280,6 +284,7 @@ PYJ
 for t in jq curl python3 md5sum awk; do command -v $t >/dev/null || { echo "FATAL: need $t" >&2; exit 1; }; done
 [[ "$MARKETS" =~ ^[0-9]+$ && "$DUR" =~ ^[0-9]+$ && "$RATE" =~ ^[0-9]+$ ]] || usage
 [ -z "$MPS" ] || [[ "$MPS" =~ ^[0-9]+$ ]] || { echo "FATAL: MPS must be an integer" >&2; exit 2; }
+WORKLOAD_JSON=$(python3 "$SELF_DIR/workload.py" "$BAND" "$CROSS_FRACTION" "$CANCEL_FRACTION" "$RATE_SCHEDULE" "$DUR") || exit 2
 [ -x "$TOOLS_DIR/digest-node.sh" ] || { echo "FATAL: $TOOLS_DIR/digest-node.sh missing" >&2; exit 1; }
 
 # ---- crash gate (bl3) pre-flight: validated HERE, before anything is launched,
@@ -309,6 +314,7 @@ if [ -d "$OUT" ] && [ -n "$(ls -A "$OUT" 2>/dev/null)" ] && [ "${OVERWRITE:-0}" 
     echo "FATAL: $OUT exists and is non-empty (pick a new label or OVERWRITE=1)" >&2; exit 1
 fi
 mkdir -p "$OUT"
+printf '%s\n' "$WORKLOAD_JSON" > "$OUT/workload.json"
 : > "$OUT/run.log"
 
 SAMPLER_PID=""; CPU_PID=""; BENCH_PID=""; CRASH_PID=""
@@ -512,7 +518,8 @@ sleep 3
 # ---------------------------------------------------------------- 6. bench
 BENCH_CMD=("$BENCH" consensus --rpc-urls "${RPCS[0]}" --econ --senders "$SENDERS" --sender-offset 60 \
     --markets "$MARKETS" --batch-size "$BATCH" --submit-batch "$SUBMIT" --format bin --concurrency "$CONC" \
-    --duration "$DUR" --target-margin 1500 --cross-fraction 0.5 --cancel-fraction 0.05 --band 5 --rate-total "$RATE")
+    --duration "$DUR" --target-margin 1500 --cross-fraction "$CROSS_FRACTION" --cancel-fraction "$CANCEL_FRACTION" --band "$BAND" --rate-total "$RATE")
+[ -z "$RATE_SCHEDULE" ] || BENCH_CMD+=(--rate-schedule "$RATE_SCHEDULE")
 # LOCALITY shape (unset = flag omitted = uniform draw over 1..=MARKETS, i.e. the
 # shape every campaign cell so far used). Needs a bench-throughput built at or
 # after cand/r6-harness-300m-digest-and-parity.

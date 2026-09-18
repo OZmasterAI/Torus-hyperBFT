@@ -35,10 +35,45 @@ tools/matched-bench/run-cell.sh /home/18c/projects/wt/matched-bench nosettle-r1 
 MPS=3 tools/matched-bench/run-cell.sh /home/18c/projects/wt/matched-bench loc3-300m-r1 300 120 76000
 ```
 
+Economic workload overrides retain the default command when unset:
+`BAND=5`, `CROSS_FRACTION=0.5`, `CANCEL_FRACTION=0.05`. Bands must be integers
+in `1..29999`; fractions must be finite and within `[0,1]`. Effective values
+are saved to `workload.json` and `summary.json` under `cell.workload`.
+
+Optional `RATE_SCHEDULE='0:76000,30:120000,60:0,90:76000'` appends
+`--rate-schedule` to the economic generator. Offsets are absolute integer seconds
+from its timed-window start; rates are aggregate **actions/s**. The first phase
+must start at zero, offsets must strictly increase and precede `DUR`, rates must
+be finite and nonnegative, and there may be at most 64 phases. This overrides
+the scalar `RATE` argument. The runner requires schedule text without whitespace
+so its recorded command is unambiguous. Scheduled zero pauses new dispatch
+(in-flight work can continue); zero without a schedule keeps the existing
+unbounded behavior.
+The built benchmark must support the new flag. Planned boundaries are in the
+workload manifest; observed timer boundaries are JSON lines in `bench.log` and
+`cell.rate_schedule_observed`. These are requested load phases, not achieved
+throughput. Scheduled acceptance requires complete, consistent phase records
+observed within their intended intervals (`cell.rate_schedule_provenance`).
+Late queued HTTP tasks are skipped at their first poll, while in-flight requests
+may complete. Scheduled first-round spacing also replaces the legacy random
+jitter draw, so use the same declared schedule for scheduled A/B comparisons;
+scalar and scheduled action streams are not byte-identical.
+Phase-specific throughput/recovery analysis remains separate from
+the existing whole-cell acceptance checks.
+
+For example, a proposed deep-book burst cell (not a measured result):
+
+```
+BAND=1 CROSS_FRACTION=0.2 CANCEL_FRACTION=0.05 \
+RATE_SCHEDULE='0:76000,30:120000,60:0,90:76000' \
+tools/matched-bench/run-cell.sh /path/to/worktree deep-burst 10 120 76000
+```
+
 Harness self-test (offline, ~8 s, no devnet / no cargo):
 
 ```
 python3 tools/matched-bench/test_harness.py
+python3 tools/matched-bench/test_workload.py
 ```
 
 ## What it does, in order
