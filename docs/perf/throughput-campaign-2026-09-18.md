@@ -753,3 +753,59 @@ manifest; the new CachedBalance production
 symbol was confirmed with nm. No speed result yet. The main tradeoff is scanning
 all cached entries at flush, including clean rejected senders, and possible
 extra entry padding; rejection-heavy workloads need consideration.
+
+### Cache screening and first sustained pair
+
+Short `s60-balance-cache-cap200-r1` is ACCEPT at38,620.0fills/s over131s,
+drain29s, peakqueue66, commitp953686.4ms. Bracketing control
+`s60-workers18-engine0-cap200-r2` is ACCEPT at38,764.1over130s, drain42,
+peak63, p953205.1. Both agree quiescently with clean dissemination. The cache
+change has not established an overall throughput gain. Against worker-controlr1,
+load-window pass-B milliseconds/1000fills decreased from2.613/3.004/3.034 across
+validators to2.281/2.714/2.701, but total engine cost did not consistently improve.
+
+The sustained pair uses stage5 runner998d1eb, new generator0b6f9fa, nominal300s,
+10markets, requested76000actions/s, cap200, ENGINE0/MATCH18/SETTLE18/BODYFETCH1,
+uniform senders, cross.5/cancel.05/band5 and optional val1 depth observer ON.
+The label suffix10m denotes ten markets, not ten minutes.
+
+| Run | Runtime | Verdict | Fills/s | Actual seconds | Drain seconds | First120 fills/s | Commit p95 ms |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
+| s60-sustained-base-10m-r1 | b60097a | REJECT | 30,773.4 | 310 | 107 | 40,272.0 | 5063.1 |
+| s60-sustained-cache-10m-r1 | e4340d8 | ACCEPT | 34,563.5 | 313 | 167 | 40,358.4 | 4064.7 |
+
+Both maintained liveness and established quiescent agreement. The baseline has
+one val2 body-fetch exhaustion/sync fallback, so it cannot establish a healthy
+speed comparison. Cache has clean dissemination but a longer drain; no promotion.
+Complete four-point depth observations succeeded on both arms. Approximate
+cross-market resting counts (sequential RPC reads, not atomic snapshots) were:
+
+| Nominal offset seconds | Baseline resting orders | Cache resting orders |
+| ---: | ---: | ---: |
+| 0 | 0 | 0 |
+| 100 | 832,100 | 840,688 |
+| 200 | 1,375,197 | 1,503,449 |
+| 300 | 1,789,380 | 1,941,510 |
+
+Val0 actual sampled100s windows yielded baseline41,596/27,653/25,233fills/s and
+cache40,518/36,248/27,713. Phase1 milliseconds/1000fills grew1.09/4.13/9.88 in
+baseline and1.02/4.55/10.87 in cache. This supports investigating cancellation
+growth, not attributing every Phase1 cost to it. Baseline whole-run engine960.65ms
+included329.71ms Phase1; save236.55ms and flush442.29ms were also substantial.
+
+In baseline snapshots100/200/300, two deep queues per side per market held
+98.42%/99.72%/99.50% of resting orders alongside many thin queues. The old
+all-batch cancellation gate can reject useful deep-level work when a thin or
+sixth group is present; exact live activation is unmeasured. A new isolated
+`perf/cancel-levels-viewbound` branch carries the prior candidate on the current
+recovery base for a bounded per-level revision; no untested runtime is promoted.
+
+Baseline val2 expired prefixiwk8LDI in current view1030 at11:24:02.415UTC and
+handled matching-prefix responses about2.157s later. Handler timestamps do not
+prove transport arrival timing. Ordinary body traffic shares the progress queue;
+expiry precedes its next dequeue. Peer excerpts and a separate diagnostic branch
+will distinguish remote serving from local queue delay before any routing change.
+
+All completed databases above were inventoried then cleaned under authorization;
+sustained baseline22.17GiB and cache27.13GiB. Logs, raw counters, digests, depth
+snapshots, failure excerpts and frozen binaries remain retained.
