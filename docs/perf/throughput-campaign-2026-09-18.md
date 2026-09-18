@@ -872,3 +872,40 @@ Do not infer that either change is fixed, increase a timeout from these two
 examples alone, or bypass the ordinary chain/genesis/view filters by rerouting
 messages. A bounded scheduling experiment and separate delay attribution remain
 under review. Cancellation correctness tests are being qualified independently.
+
+### Locality control and cancellation candidate ready for live qualification
+
+`s60-locality-base-50m-mps3-r1` used frozen baseline `b60097a`, the scheduled
+generator and stage-5 runner `998d1eb`, with nominal 300 seconds, 50 markets,
+`MPS=3`, depth observation and the same ENGINE0/MATCH18/SETTLE18/BODYFETCH1
+settings. It is ACCEPT at 33,233.1 fills/s over 313 seconds, first120 43,064.2,
+best60 48,046.8, drain 35 seconds and commit p95 4,746.5 ms. Liveness, quiescent
+agreement and dissemination all passed. Locality changes the workload, and the
+preceding uniform 50-market control failed dissemination; this is not a clean
+speed-gain comparison.
+
+All four depth snapshots completed. Their sequential cross-market resting
+counts were 92 / 989,493 / 1,512,425 / 1,890,089 at nominal 0/100/200/300 seconds.
+These are not atomic snapshots. Val0 bench-plus-drain phase means per native
+block were engine 500.99 ms (phase1 52.75 ms), save-books 232.65 ms and flush
+328.74 ms against block 1,172.56 ms. Completed databases occupied 22.07 GiB;
+they were inventoried and cleaned while retaining the measurement evidence.
+
+Cancellation runtime `f890e06` on `perf/cancel-levels-viewbound` is now tested,
+committed and frozen as `artifacts/cancel-levels-lazy`. It independently groups
+eligible deep queues and lazily allocates deferred output only when a deep
+queue is selected; shallow removals share one queue lookup. The revised code
+passed 248 core/integration/persistence tests (receipt `2bed8e38`) and a separate
+node build (`bed520bd`). Positive production-symbol verification identifies the
+new helper. Node SHA256:
+`ce4c332c3590395f390706688ad228b92a1bb18245e20d0ae4dca4dfee8128ac`.
+
+The unchanged seven-case micro screen retains deep-case headroom: paired ratios
+2.017/3.515 for middle removals, 1.188 dispersed, 1.552 partial eligibility and
+1.948 six-deep overflow. Deep under-count and shallow cases measured 0.989/0.982.
+Shallow AA/BB controls were 0.924/1.050; noisy near-parity is not proof that all
+regressions are gone. Full tables and provenance are in the candidate's
+`docs/perf/cancel-level-compaction-2026-09-18.md`. No live cancellation throughput
+result exists yet. The body-before-expiry candidate has separately passed
+source review and is undergoing root-scheduled tests/build; no runtime is
+promoted or combined on the basis of these mechanism results.
