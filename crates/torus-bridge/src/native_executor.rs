@@ -103,39 +103,52 @@ pub struct EpochBoundaryResult {
 /// same treatment via `PositionCache`. `flush_all` runs at the end of the call, so the
 /// *next* `execute_batch` call and all post-batch consumers (`drain_core_writer`,
 /// `save_order_books`, block-end flush) see a fully materialized overlay. Flush order is
-/// over distinct per-sender keys, so it is state-independent of iteration order; the map
-/// is otherwise never iterated.
+/// over distinct per-sender keys, so it is state-independent of iteration order.
 struct BalanceCache {
-    map: HashMap<Address, NativeBalance>,
-    dirty: std::collections::HashSet<Address>,
+    map: HashMap<Address, CachedBalance>,
+}
+
+struct CachedBalance {
+    value: NativeBalance,
+    dirty: bool,
+}
+
+impl CachedBalance {
+    /// Call only where the old cache wrote a balance, including zero-valued
+    /// releases/PnL events. Reading or rejecting a reservation stays clean.
+    fn update(&mut self, change: impl FnOnce(&mut NativeBalance)) {
+        // NativeBalance is two fixed-point scalars. Retain this small stack
+        // copy so checked arithmetic that panics cannot partially change the
+        // cached value or its dirty flag (the old load/modify/set contract).
+        let mut value = self.value.clone();
+        change(&mut value);
+        self.value = value;
+        self.dirty = true;
+    }
 }
 
 impl BalanceCache {
     fn new() -> Self {
         Self {
             map: HashMap::new(),
-            dirty: std::collections::HashSet::new(),
         }
     }
 
-    /// Return the sender's balance, reading through to `positions` on a miss.
+    /// Borrow the sender's entry with one map lookup, reading through on a miss.
+    /// Loading alone never marks it dirty; the caller must explicitly write.
     fn load<T: StateBackend>(
         &mut self,
         positions: &PositionManager<T>,
         addr: &Address,
-    ) -> Result<NativeBalance, CoreError> {
-        if let Some(bal) = self.map.get(addr) {
-            return Ok(bal.clone());
+    ) -> Result<&mut CachedBalance, CoreError> {
+        match self.map.entry(*addr) {
+            std::collections::hash_map::Entry::Occupied(entry) => Ok(entry.into_mut()),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                // A failed read must not insert a default or suppress a retry.
+                let value = positions.get_native_balance(addr)?;
+                Ok(entry.insert(CachedBalance { value, dirty: false }))
+            }
         }
-        let bal = positions.get_native_balance(addr)?;
-        self.map.insert(*addr, bal.clone());
-        Ok(bal)
-    }
-
-    /// Update the cached balance and mark it dirty (write-back — no overlay PUT yet).
-    fn set(&mut self, addr: &Address, bal: NativeBalance) {
-        self.map.insert(*addr, bal);
-        self.dirty.insert(*addr);
     }
 
     /// L3-ENG: absorb a Phase-2 worker's cache. Caller guarantees the key
@@ -143,7 +156,6 @@ impl BalanceCache {
     /// cannot affect any entry and the result equals the serial cache.
     fn merge_disjoint(&mut self, other: BalanceCache) {
         self.map.extend(other.map);
-        self.dirty.extend(other.dirty);
     }
 
     /// Flush every pending dirty balance to the overlay (end of the `execute_batch` call).
@@ -153,14 +165,20 @@ impl BalanceCache {
         &mut self,
         positions: &PositionManager<T>,
     ) -> Result<(), CoreError> {
-        let mut addrs: Vec<Address> = self.dirty.iter().copied().collect();
+        let mut addrs: Vec<Address> = self.map.iter()
+            .filter_map(|(addr, entry)| entry.dirty.then_some(*addr))
+            .collect();
         addrs.sort();
         for addr in &addrs {
             if let Some(bal) = self.map.get(addr) {
-                positions.put_native_balance(addr, bal)?;
+                positions.put_native_balance(addr, &bal.value)?;
             }
         }
-        self.dirty.clear();
+        // Keep EVERY dirty flag until the entire sorted flush succeeds, so a
+        // partial write failure retries the same full set as the old cache.
+        for entry in self.map.values_mut() {
+            entry.dirty = false;
+        }
         Ok(())
     }
 }
@@ -168,6 +186,10 @@ impl BalanceCache {
 // ============================================================================
 // C3 — deterministic parallel Phase-4 settlement: plumbing types
 // ============================================================================
+
+#[cfg(test)]
+#[path = "balance_cache_tests.rs"]
+mod balance_cache_tests;
 
 /// C2/C3: one Phase-2-prepared PlaceOrder flowing through matching (Phase 3)
 /// and settlement (Phase 4). `params` borrows the caller's committed action
@@ -3290,8 +3312,8 @@ impl NativeExecutor {
 
                 if order_margin_required > FixedPoint::ZERO {
                     match bal_cache.load(&ctx.positions, sender) {
-                        Ok(mut bal) => {
-                            if bal.available < order_margin_required {
+                        Ok(entry) => {
+                            if entry.value.available < order_margin_required {
                                 // Funnel (perf A1): died pre-book on the margin reserve.
                                 if let Some(ref m) = ctx.metrics {
                                     m.orders_rejected_margin.inc();
@@ -3300,14 +3322,15 @@ impl NativeExecutor {
                                     "place_order",
                                     format!(
                                         "insufficient margin: need {order_margin_required}, have {}",
-                                        bal.available
+                                        entry.value.available
                                     ),
                                 );
                                 continue;
                             }
-                            bal.available -= order_margin_required;
-                            bal.order_margin += order_margin_required;
-                            bal_cache.set(sender, bal);
+                            entry.update(|bal| {
+                                bal.available -= order_margin_required;
+                                bal.order_margin += order_margin_required;
+                            });
                         }
                         Err(e) => {
                             // Funnel (perf A1): died pre-book on a balance read error.
@@ -3540,23 +3563,24 @@ impl NativeExecutor {
                                     };
                                     if required > FixedPoint::ZERO {
                                         match cache.load(positions, sender) {
-                                            Ok(mut bal) => {
-                                                if bal.available < required {
+                                            Ok(entry) => {
+                                                if entry.value.available < required {
                                                     out.push((
                                                         i,
                                                         PrepOutcome::Reject {
                                                             margin: true,
                                                             msg: format!(
                                                                 "insufficient margin: need {required}, have {}",
-                                                                bal.available
+                                                                entry.value.available
                                                             ),
                                                         },
                                                     ));
                                                     continue;
                                                 }
-                                                bal.available -= required;
-                                                bal.order_margin += required;
-                                                cache.set(sender, bal);
+                                                entry.update(|bal| {
+                                                    bal.available -= required;
+                                                    bal.order_margin += required;
+                                                });
                                             }
                                             Err(e) => {
                                                 out.push((
@@ -3681,11 +3705,12 @@ impl NativeExecutor {
                     };
 
                     if margin_to_release > FixedPoint::ZERO {
-                        if let Ok(mut bal) = bal_cache.load(&ctx.positions, &prep.sender) {
-                            let release = margin_to_release.min(bal.order_margin);
-                            bal.order_margin -= release;
-                            bal.available += release;
-                            bal_cache.set(&prep.sender, bal);
+                        if let Ok(entry) = bal_cache.load(&ctx.positions, &prep.sender) {
+                            entry.update(|bal| {
+                                let release = margin_to_release.min(bal.order_margin);
+                                bal.order_margin -= release;
+                                bal.available += release;
+                            });
                         }
                     }
                 }
@@ -3767,11 +3792,12 @@ impl NativeExecutor {
             for (trader, amount) in
                 Self::maker_margin_releases(ctx, market_id, mbr.results.iter().map(|m| &m.result))
             {
-                if let Ok(mut bal) = bal_cache.load(&ctx.positions, &trader) {
-                    let release = amount.min(bal.order_margin);
-                    bal.order_margin -= release;
-                    bal.available += release;
-                    bal_cache.set(&trader, bal);
+                if let Ok(entry) = bal_cache.load(&ctx.positions, &trader) {
+                    entry.update(|bal| {
+                        let release = amount.min(bal.order_margin);
+                        bal.order_margin -= release;
+                        bal.available += release;
+                    });
                 }
             }
         }
@@ -4021,11 +4047,12 @@ impl NativeExecutor {
                 // Taker-side margin release (amount precomputed; clamp here,
                 // where the balance authority lives).
                 if oplan.margin_release > FixedPoint::ZERO {
-                    if let Ok(mut bal) = bal_cache.load(&ctx.positions, &prep.sender) {
-                        let release = oplan.margin_release.min(bal.order_margin);
-                        bal.order_margin -= release;
-                        bal.available += release;
-                        bal_cache.set(&prep.sender, bal);
+                    if let Ok(entry) = bal_cache.load(&ctx.positions, &prep.sender) {
+                        entry.update(|bal| {
+                            let release = oplan.margin_release.min(bal.order_margin);
+                            bal.order_margin -= release;
+                            bal.available += release;
+                        });
                     }
                 }
 
@@ -4041,9 +4068,8 @@ impl NativeExecutor {
                 let mut fill_failed: Option<String> = None;
                 for (side, trader, pnl) in &oplan.pnl_events {
                     match bal_cache.load(&ctx.positions, trader) {
-                        Ok(mut bal) => {
-                            bal.available += *pnl;
-                            bal_cache.set(trader, bal);
+                        Ok(entry) => {
+                            entry.update(|bal| bal.available += *pnl);
                         }
                         Err(e) => {
                             fill_failed = Some(format!("{side} fill failed: {e}"));
@@ -4084,11 +4110,12 @@ impl NativeExecutor {
             // A5 maker/STP releases — amounts precomputed by the worker in the
             // canonical order; clamps applied here against live balances.
             for (trader, amount) in plan.maker_releases {
-                if let Ok(mut bal) = bal_cache.load(&ctx.positions, &trader) {
-                    let release = amount.min(bal.order_margin);
-                    bal.order_margin -= release;
-                    bal.available += release;
-                    bal_cache.set(&trader, bal);
+                if let Ok(entry) = bal_cache.load(&ctx.positions, &trader) {
+                    entry.update(|bal| {
+                        let release = amount.min(bal.order_margin);
+                        bal.order_margin -= release;
+                        bal.available += release;
+                    });
                 }
             }
         }
@@ -4234,9 +4261,7 @@ impl NativeExecutor {
             price,
             MarginType::Cross,
         )? {
-            let mut bal = bal_cache.load(positions, trader)?;
-            bal.available += pnl;
-            bal_cache.set(trader, bal);
+            bal_cache.load(positions, trader)?.update(|bal| bal.available += pnl);
         }
         Ok(())
     }
