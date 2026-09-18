@@ -938,3 +938,16 @@ opportunity before pending-body expiry; it preserves message filters and
 ordinary handlers. A same-binary OFF/ON live diagnostic remains pending.
 It targets already-queued responses, not responses that first arrive after
 expiry, and is not yet promoted.
+
+
+The fresh `s60-cancel-control-10m-r1` baseline measured 32,072.9 fills/s over
+309 seconds, first120 41,030.9, best60 46,285.2, drain 130 seconds and commit
+p95 6,114.7 ms. Liveness and agreement passed, but val1 exhausted one body
+fetch and val2 exhausted two, each with sync fallback: REJECT. Consequently,
+the accepted cancellation candidate versus this rejected baseline does not
+establish a healthy A/B throughput gain. All four depth snapshots completed
+(0 / 885,806 / 1,415,629 / 1,842,191 resting orders). Val0 bench-plus-drain means
+were block 1,799.25 ms, engine 1,004.78 ms (phase1 379.44 ms), save-books
+264.18 ms and flush 415.70 ms. Evidence is retained. Recurring dissemination
+failures make the already-qualified body-before-expiry same-binary OFF/ON
+experiment the next priority.
