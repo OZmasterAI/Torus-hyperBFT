@@ -188,12 +188,13 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
             self.block_sync_client.poll_worker_results();
 
             // 6. Process pending sync blocks — drain the batch for faster catch-up.
+            let mut sync_progress = false;
             for _ in 0..Self::MAX_SYNC_BLOCKS_PER_TICK {
                 match self
                     .block_sync_client
                     .process_pending_block(&mut self.block_tree, &mut self.app)
                 {
-                    Ok(true) => {}
+                    Ok(true) => sync_progress = true,
                     Ok(false) => break,
                     Err(e) => {
                         log::error!(
@@ -203,6 +204,14 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
                         break;
                     }
                 }
+            }
+
+            // Bodies parked by HotStuff may now have their parents via sync.
+            // Continue the bounded pass across ticks even when sync has ended.
+            if let Err(e) = self.hotstuff.poll_deferred_bodies_after_sync(
+                sync_progress, &mut self.block_tree, &mut self.app,
+            ) {
+                log::error!("HotStuff deferred bodies after sync error: {:?}", e);
             }
 
             // 6b. Poll the dedicated block-data channel for body responses.
@@ -241,6 +250,7 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
                 || self.hotstuff.has_deferred_proposal()
                 || self.hotstuff.has_pending_body_fetches()
                 || self.hotstuff.has_pending_justify_fetches()
+                || self.hotstuff.has_deferred_sync_retries()
             {
                 std::cmp::min(
                     view_info.deadline,

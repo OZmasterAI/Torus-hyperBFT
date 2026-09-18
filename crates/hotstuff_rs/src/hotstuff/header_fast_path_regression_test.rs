@@ -70,17 +70,17 @@ use crate::types::validator_set::{ValidatorSet, ValidatorSetState};
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Default)]
-struct MemKV {
+pub(super) struct MemKV {
     map: HashMap<Vec<u8>, Vec<u8>>,
 }
 
-struct MemWb {
+pub(super) struct MemWb {
     sets: Vec<(Vec<u8>, Vec<u8>)>,
     deletes: Vec<Vec<u8>>,
 }
 
 #[derive(Clone)]
-struct MemSnap(HashMap<Vec<u8>, Vec<u8>>);
+pub(super) struct MemSnap(HashMap<Vec<u8>, Vec<u8>>);
 
 impl WriteBatch for MemWb {
     fn new() -> Self {
@@ -133,7 +133,7 @@ impl KVStore for MemKV {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
-struct NullNetwork;
+pub(super) struct NullNetwork;
 
 impl Network for NullNetwork {
     fn init_validator_set(&mut self, _validator_set: ValidatorSet) {}
@@ -191,7 +191,7 @@ impl App<MemKV> for RejectingApp {
 const CHAIN_ID: ChainID = ChainID::new(0);
 
 /// Deterministic signing keys from fixed seed bytes.
-fn signing_keys(seeds: &[u8]) -> Vec<SigningKey> {
+pub(super) fn signing_keys(seeds: &[u8]) -> Vec<SigningKey> {
     seeds
         .iter()
         .map(|s| SigningKey::from_bytes(&[*s; 32]))
@@ -199,7 +199,7 @@ fn signing_keys(seeds: &[u8]) -> Vec<SigningKey> {
 }
 
 /// Build a `ValidatorSet` from signing keys, each with power 1.
-fn validator_set(keys: &[SigningKey]) -> ValidatorSet {
+pub(super) fn validator_set(keys: &[SigningKey]) -> ValidatorSet {
     let mut vs = ValidatorSet::new();
     for k in keys {
         vs.put(&k.verifying_key(), Power::new(1));
@@ -208,7 +208,7 @@ fn validator_set(keys: &[SigningKey]) -> ValidatorSet {
 }
 
 /// A steady-state (no in-flight VS transition) block tree over `set`.
-fn steady_block_tree(set: &ValidatorSet) -> (BlockTreeSingleton<MemKV>, ValidatorSetState) {
+pub(super) fn steady_block_tree(set: &ValidatorSet) -> (BlockTreeSingleton<MemKV>, ValidatorSetState) {
     let vss = ValidatorSetState::new(set.clone(), set.clone(), None, true);
     let mut block_tree = BlockTreeSingleton::new(MemKV::default());
     block_tree
@@ -219,7 +219,7 @@ fn steady_block_tree(set: &ValidatorSet) -> (BlockTreeSingleton<MemKV>, Validato
 
 /// Manually assemble a quorum-signed Generic `PhaseCertificate` for
 /// `block`/`view` (exactly as the `PhaseVoteCollector` would).
-fn generic_pc(
+pub(super) fn generic_pc(
     view: ViewNumber,
     block: CryptoHash,
     signers: &[SigningKey],
@@ -262,7 +262,7 @@ fn header_for(block: &Block, view: ViewNumber) -> ProposalHeader {
 
 /// Find the proposer for `view`, computed exactly as `on_receive_msg`'s
 /// entry gate computes it.
-fn proposer_for<K: KVStore>(
+pub(super) fn proposer_for<K: KVStore>(
     view: ViewNumber,
     keys: &[SigningKey],
     vss: &ValidatorSetState,
@@ -277,7 +277,7 @@ fn proposer_for<K: KVStore>(
 
 /// A `HotStuff` participant at `view` whose keypair is `local` (must be in the
 /// committed validator set for it to phase-vote).
-fn hotstuff_at(
+pub(super) fn hotstuff_at(
     view: ViewNumber,
     local: SigningKey,
     vss: ValidatorSetState,

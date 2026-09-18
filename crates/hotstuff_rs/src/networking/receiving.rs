@@ -80,6 +80,22 @@ pub(crate) fn start_polling<N: Network + 'static>(
     )
 }
 
+fn is_chain_neutral_genesis_body(message: &ProgressMessage) -> bool {
+    use crate::hotstuff::messages::HotStuffMessage;
+    use crate::types::block::Block;
+    // Legacy body responses have no outer chain ID; they derive it from the
+    // justify. The universal genesis PC deliberately carries chain 0, even on
+    // nonzero chains. Admit only structurally bound height-zero bodies here.
+    // HotStuff still requires a tracked hash before validation/insertion; an
+    // unsolicited push is only parked until a local-chain header claims it.
+    matches!(message,
+        ProgressMessage::HotStuffMessage(HotStuffMessage::BlockDataResponse(response))
+        if response.block.height.int() == 0
+            && response.block.justify.is_genesis_pc()
+            && response.block.hash == Block::hash(response.block.height,
+                &response.block.justify, &response.block.data_hash))
+}
+
 /// A receiving end for [`ProgressMessage`](ProgressMessage)s.
 ///
 /// ## View-aware buffering
@@ -155,7 +171,7 @@ impl ProgressMessageStub {
         while Instant::now() < deadline {
             match self.receiver.recv_timeout(deadline - Instant::now()) {
                 Ok((sender, msg)) => {
-                    if msg.chain_id() != chain_id {
+                    if msg.chain_id() != chain_id && !is_chain_neutral_genesis_body(&msg) {
                         continue;
                     }
 
@@ -432,4 +448,62 @@ impl BlockSyncServerStub {
 pub enum BlockSyncRequestReceiveError {
     Disconnected,
     NotAvailable,
+}
+
+#[cfg(test)]
+mod genesis_body_filter_tests {
+    use super::*;
+    use std::time::Duration;
+    use crate::hotstuff::messages::{BlockDataRequest, BlockDataResponse, HotStuffMessage, ProposalHeader};
+    use crate::hotstuff::types::PhaseCertificate;
+    use crate::types::block::Block;
+    use crate::types::crypto_primitives::SigningKey;
+    use crate::types::data_types::{BlockHeight, CryptoHash, Data};
+
+    fn response(block: Block) -> ProgressMessage {
+        ProgressMessage::HotStuffMessage(HotStuffMessage::BlockDataResponse(BlockDataResponse {
+            view: ViewNumber::new(1), block,
+        }))
+    }
+
+    #[test]
+    fn nonzero_chain_receives_only_structurally_valid_genesis_body_exception() {
+        let chain = ChainID::new(7778);
+        let parent = Block::new(BlockHeight::new(0), PhaseCertificate::genesis_pc(),
+            CryptoHash::new([9; 32]), Data::new(vec![]));
+        let sender = SigningKey::from_bytes(&[1; 32]).verifying_key();
+        let (tx, rx) = mpsc::channel();
+        let mut receiver = ProgressMessageStub::new(rx, BufferSize::new(1024 * 1024));
+        let mut forged_hash = parent.clone();
+        forged_hash.hash = CryptoHash::new([99; 32]);
+        let wrong_height = Block::new(BlockHeight::new(1), PhaseCertificate::genesis_pc(),
+            parent.data_hash, Data::new(vec![]));
+        let mut non_genesis_pc = PhaseCertificate::genesis_pc();
+        non_genesis_pc.view = ViewNumber::new(2);
+        let non_genesis = Block::new(BlockHeight::new(0), non_genesis_pc,
+            parent.data_hash, Data::new(vec![]));
+        let wrong_request = ProgressMessage::HotStuffMessage(HotStuffMessage::BlockDataRequest(BlockDataRequest {
+            chain_id: ChainID::new(0), view: ViewNumber::new(1), block_hash: parent.hash,
+        }));
+        let wrong_header = ProgressMessage::HotStuffMessage(HotStuffMessage::ProposalHeader(ProposalHeader {
+            chain_id: ChainID::new(0), view: ViewNumber::new(1), block_hash: parent.hash,
+            height: parent.height, data_hash: parent.data_hash, justify: parent.justify.clone(),
+            tc: None, nec: None, has_validator_set_updates: false,
+        }));
+        for msg in [response(forged_hash), response(wrong_height), response(non_genesis), wrong_request, wrong_header] {
+            assert!(!is_chain_neutral_genesis_body(&msg));
+            tx.send((sender, msg)).unwrap();
+        }
+        tx.send((sender, response(parent.clone()))).unwrap();
+        let (_, received) = receiver.recv(chain, ViewNumber::new(5),
+            Instant::now() + Duration::from_secs(1)).expect("genesis body must cross nonzero-chain filter even late");
+        assert!(matches!(received, ProgressMessage::HotStuffMessage(HotStuffMessage::BlockDataResponse(r))
+            if r.block.hash == parent.hash && r.block.justify.is_genesis_pc()));
+        // A same-chain request must retain ordinary delivery semantics.
+        tx.send((sender, ProgressMessage::HotStuffMessage(HotStuffMessage::BlockDataRequest(BlockDataRequest {
+            chain_id: chain, view: ViewNumber::new(1), block_hash: parent.hash,
+        })))).unwrap();
+        let (_, received) = receiver.recv(chain, ViewNumber::new(5), Instant::now() + Duration::from_secs(1)).unwrap();
+        assert!(matches!(received, ProgressMessage::HotStuffMessage(HotStuffMessage::BlockDataRequest(r)) if r.chain_id == chain));
+    }
 }

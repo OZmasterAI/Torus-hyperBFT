@@ -117,6 +117,12 @@ pub(crate) struct HotStuff<N: Network> {
         std::collections::HashMap<CryptoHash, (Instant, u8, VerifyingKey, ViewNumber)>,
     /// Hybrid pipelining: bodies received but parent not yet in tree. Retried after each insertion.
     deferred_bodies: PendingBodies,
+    /// Hashes to reconsider after block sync supplies parent state. No body
+    /// payloads are duplicated; each algorithm tick attempts at most eight.
+    deferred_sync_retries: VecDeque<CryptoHash>,
+    /// Sync changed the tree during a sweep. Finish it before taking a new
+    /// snapshot, so repeated sync batches cannot starve later entries.
+    deferred_sync_refresh: bool,
     /// True when enter_view succeeded but proposal production failed (parent block not yet in tree).
     /// The algorithm loop should retry the proposal after polling messages.
     proposal_deferred: bool,
@@ -176,6 +182,8 @@ impl<N: Network> HotStuff<N> {
             header_vote_invalid_count: 0,
             justify_fetch_tracker: std::collections::HashMap::new(),
             deferred_bodies: PendingBodies::new(),
+            deferred_sync_retries: VecDeque::new(),
+            deferred_sync_refresh: false,
             proposal_deferred: false,
             last_missing_pc_check: Instant::now(),
             body_push_max_bytes: body_push_max_bytes_from_env(),
@@ -2092,6 +2100,13 @@ impl<N: Network> HotStuff<N> {
             block_tree.block(&req.block_hash)?
         };
 
+        if crate::logging::body_fetch_trace_enabled()
+            && (block.is_none() || block.as_ref().is_some_and(|b| b.justify.is_genesis_pc()))
+        {
+            log::info!("body_fetch_diag serve: request_view={} local_view={} hash={} found={} height={:?}",
+                req.view.int(), self.view_info.view.int(), crate::logging::block_prefix(&req.block_hash),
+                block.is_some(), block.as_ref().map(|b| b.height.int()));
+        }
         if let Some(block) = block {
             let resp = BlockDataResponse {
                 view: req.view,
@@ -2120,10 +2135,19 @@ impl<N: Network> HotStuff<N> {
         // as a by-hash justify recovery (justify_fetch_tracker, S426). The justify
         // fetch has no pending header — that missing header is the whole problem —
         // so it must be admitted here explicitly. Insertion still goes through the
-        // normal is_correct/validate_block path in try_insert_body; receiving a
+        // authenticated-metadata/validate_block path in try_insert_body; receiving a
         // block never implies a vote (safe_pc gates any vote independently).
         let tracked_as_body = self.pending_headers.contains_key(&block_hash);
         let tracked_as_justify = self.justify_fetch_tracker.contains_key(&block_hash);
+        if crate::logging::body_fetch_trace_enabled()
+            && (!tracked_as_body || self.body_fetch_tracker.get(&block_hash).is_some_and(|(_, count, _)| *count > 0))
+        {
+            log::info!("body_fetch_diag receive: response_view={} local_view={} hash={} height={} parent={} tracked_header={} tracked_justify={} deferred={} retries={:?}",
+                resp.view.int(), self.view_info.view.int(), crate::logging::block_prefix(&block_hash),
+                block.height.int(), crate::logging::block_prefix(&block.justify.block), tracked_as_body,
+                tracked_as_justify, self.deferred_bodies.contains_key(&block_hash),
+                self.body_fetch_tracker.get(&block_hash).map(|(_, count, _)| *count));
+        }
         if !tracked_as_body && !tracked_as_justify {
             // L3 v2 (body push): an unsolicited pushed body can legitimately
             // beat its own header (the leader pushes immediately after the
@@ -2134,6 +2158,24 @@ impl<N: Network> HotStuff<N> {
             // or voted here, and bodies that no header ever claims simply age
             // out of the FIFO buffer.
             self.park_pushed_body(block, block_tree);
+            return Ok(());
+        }
+
+        // A requested hash does not authenticate the peer's other fields.
+        // Drop substituted metadata without cancelling the legitimate fetch.
+        let parent_missing = !block.justify.is_genesis_pc()
+            && !block_tree.contains(&block.justify.block);
+        // The parent's height determines the QC's validator set. Until that
+        // metadata arrives, authenticate the requested hash and defer signature
+        // verification rather than incorrectly testing against the current set.
+        let metadata_correct = if parent_missing {
+            self.body_metadata_is_bound(&block)
+        } else {
+            self.body_metadata_is_correct(&block, block_tree)?
+        };
+        if !metadata_correct {
+            log::warn!("dropping body with unauthenticated metadata: hash={}",
+                crate::logging::block_prefix(&block_hash));
             return Ok(());
         }
 
@@ -2217,6 +2259,34 @@ impl<N: Network> HotStuff<N> {
         self.pushed_bodies.remove(idx).map(|(_, block)| block)
     }
 
+    /// Bind metadata to the requested hash or an already authenticated header.
+    /// No validator-set choice is possible for a missing parent, so this cheap
+    /// structural gate also protects bodies parked pending ancestor recovery.
+    fn body_metadata_is_bound(&self, block: &Block) -> bool {
+        if let Some(header) = self.pending_headers.get(&block.hash) {
+            return header.block_hash == block.hash
+                && header.height == block.height
+                && header.data_hash == block.data_hash
+                && header.justify == block.justify;
+        }
+        (block.justify.chain_id == self.config.chain_id || block.justify.is_genesis_pc())
+            && block.justify.is_block_justify()
+            && block.hash == Block::hash(block.height, &block.justify, &block.data_hash)
+    }
+
+    /// Header-bound QCs were already authenticated. By-hash ancestor recovery
+    /// has no such header and verifies its QC once the parent is present, so
+    /// certificate validation can select the correct historical validator set.
+    fn body_metadata_is_correct<K: KVStore>(
+        &self,
+        block: &Block,
+        block_tree: &BlockTreeSingleton<K>,
+    ) -> Result<bool, HotStuffError> {
+        Ok(self.body_metadata_is_bound(block)
+            && (self.pending_headers.contains_key(&block.hash)
+                || block.justify.is_correct(block_tree)?))
+    }
+
     /// Attempt to validate and insert a block body. Returns true on success, false if
     /// the parent state isn't available yet.
     fn try_insert_body<K: KVStore>(
@@ -2230,6 +2300,15 @@ impl<N: Network> HotStuff<N> {
         } else {
             Some(&block.justify.block)
         };
+        // app_view builds a state overlay but does not prove that the named
+        // parent exists. Keep orphans deferred until their ancestry can be
+        // inspected and commit processing can follow the parent link.
+        if parent_block.is_some_and(|parent| !block_tree.contains(parent)) {
+            return Ok(false);
+        }
+        if !self.body_metadata_is_correct(&block, block_tree)? {
+            return Ok(false);
+        }
         let app_view = match block_tree.app_view(parent_block) {
             Ok(v) => v,
             Err(_) => return Ok(false),
@@ -2326,6 +2405,44 @@ impl<N: Network> HotStuff<N> {
         Ok(())
     }
 
+    /// Sync inserts blocks outside HotStuff's body-arrival handler. Schedule a
+    /// parent-first pass over parked bodies when it makes progress, then consume
+    /// a bounded portion per tick. Failed validation remains deferred and is not
+    /// tight-looped; another body arrival or sync update can retry it.
+    pub(crate) fn poll_deferred_bodies_after_sync<K: KVStore>(
+        &mut self,
+        sync_progress: bool,
+        block_tree: &mut BlockTreeSingleton<K>,
+        app: &mut impl App<K>,
+    ) -> Result<(), HotStuffError> {
+        self.deferred_sync_refresh |= sync_progress;
+        if self.deferred_sync_retries.is_empty() && self.deferred_sync_refresh {
+            self.deferred_sync_refresh = false;
+            let mut ordered: Vec<_> = self.deferred_bodies.values()
+                .map(|b| (b.height.int(), b.hash.bytes(), b.hash)).collect();
+            ordered.sort_unstable_by_key(|(height, bytes, _)| (*height, *bytes));
+            self.deferred_sync_retries = ordered.into_iter().map(|(_, _, hash)| hash).collect();
+        }
+        for _ in 0..MAX_DEFERRED_SYNC_RETRIES_PER_TICK {
+            let Some(hash) = self.deferred_sync_retries.pop_front() else { break };
+            let Some(block) = self.deferred_bodies.get(&hash).cloned() else { continue };
+            // Sync may have inserted this very body. Avoid duplicate insert,
+            // which would append its hash to the parent's child list again.
+            if block_tree.contains(&hash) || self.try_insert_body(block, block_tree, app)? {
+                self.deferred_bodies.remove(&hash);
+                self.pending_headers.remove(&hash);
+                self.body_fetch_tracker.remove(&hash);
+                self.justify_fetch_tracker.remove(&hash);
+                self.header_voted.remove(&hash);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn has_deferred_sync_retries(&self) -> bool {
+        !self.deferred_sync_retries.is_empty() || self.deferred_sync_refresh
+    }
+
     /// Poll the dedicated block-data channel for body responses.
     /// Called from the algorithm loop between consensus message processing steps.
     pub(crate) fn poll_block_data_responses<K: KVStore>(
@@ -2359,6 +2476,13 @@ impl<N: Network> HotStuff<N> {
                     MAX_BODY_RETRIES_TOTAL,
                     hash
                 );
+                if crate::logging::body_fetch_trace_enabled() {
+                    log::info!("body_fetch_diag expired: hash={} local_view={} header_view={:?} height={:?} stored={} deferred={}",
+                        crate::logging::block_prefix(hash), self.view_info.view.int(),
+                        self.pending_headers.get(hash).map(|h| h.view.int()),
+                        self.pending_headers.get(hash).map(|h| h.height.int()),
+                        block_tree.contains(hash), self.deferred_bodies.contains_key(hash));
+                }
                 expired.push(*hash);
                 continue;
             }
@@ -2623,6 +2747,8 @@ impl<N: Network> HotStuff<N> {
     }
 }
 
+pub(crate) const MAX_DEFERRED_SYNC_RETRIES_PER_TICK: usize = 8;
+
 /// Cadence of body-fetch re-requests for a stale pending header. S391: was
 /// 300ms — with 3 proposer attempts a single lost first request cost 900ms
 /// (nearly two 500ms view timeouts) before any other validator was asked.
@@ -2853,4 +2979,261 @@ pub(crate) enum RecoveryState {
         tc: crate::pacemaker::types::TimeoutCertificate,
         ne_collector: NECollector,
     },
+}
+
+#[cfg(test)]
+mod sync_recovery_tests {
+    use super::*;
+    use crate::hotstuff::header_fast_path_regression_test::{
+        generic_pc, hotstuff_at, signing_keys, steady_block_tree, validator_set, MemKV,
+    };
+    use crate::hotstuff::types::PhaseCertificate;
+    use crate::types::data_types::Data;
+
+    struct RecoveryApp { calls: usize, valid: bool, reject_below: u64 }
+    impl App<MemKV> for RecoveryApp {
+        fn produce_block(&mut self, _: ProduceBlockRequest<MemKV>) -> ProduceBlockResponse {
+            unreachable!()
+        }
+        fn validate_block_for_sync(&mut self, _: ValidateBlockRequest<MemKV>) -> ValidateBlockResponse {
+            unreachable!("HotStuff retry uses normal validation")
+        }
+        fn validate_block(&mut self, request: ValidateBlockRequest<MemKV>) -> ValidateBlockResponse {
+            self.calls += 1;
+            if self.valid && request.proposed_block().height.int() >= self.reject_below {
+                ValidateBlockResponse::Valid { app_state_updates: None, validator_set_updates: None }
+            } else {
+                ValidateBlockResponse::Invalid
+            }
+        }
+    }
+
+    #[test]
+    fn by_hash_previous_set_body_defers_certificate_until_parent_arrives() {
+        let old_keys = signing_keys(&[1, 2, 3, 4]);
+        let old_set = validator_set(&old_keys);
+        let new_keys = signing_keys(&[11, 12, 13, 14]);
+        let new_set = validator_set(&new_keys);
+        let vss = ValidatorSetState::new(new_set, old_set.clone(), Some(BlockHeight::new(2)), true);
+        let mut tree = BlockTreeSingleton::new(MemKV::default());
+        tree.initialize(&crate::types::update_sets::AppStateUpdates::new(), &vss).unwrap();
+        let view = ViewNumber::new(4);
+        let origin = new_keys[1].verifying_key();
+        let mut hotstuff = hotstuff_at(view, new_keys[0].clone(), vss);
+        let parent = Block::new(BlockHeight::new(0), PhaseCertificate::genesis_pc(),
+            CryptoHash::new([9; 32]), Data::new(vec![]));
+        let child = Block::new(BlockHeight::new(1),
+            generic_pc(ViewNumber::new(1), parent.hash, &old_keys, &old_set),
+            CryptoHash::new([10; 32]), Data::new(vec![]));
+        assert!(!child.justify.is_correct(&tree).unwrap(),
+            "missing parent makes certificate verification use the new set");
+        hotstuff.justify_fetch_tracker.insert(child.hash, (Instant::now(), 0, origin, view));
+        let mut app = RecoveryApp { calls: 0, valid: true, reject_below: 0 };
+        hotstuff.on_receive_msg(BlockDataResponse { view, block: child.clone() }.into(),
+            &origin, &mut tree, &mut app).unwrap();
+        assert_eq!(app.calls, 0);
+        assert!(!tree.contains(&child.hash));
+        assert!(hotstuff.deferred_bodies.contains_key(&child.hash));
+        assert!(hotstuff.justify_fetch_tracker.contains_key(&parent.hash),
+            "ancestor retrieval must be armed before certificate-set choice is possible");
+        // Parent arrives through sync; its stored height now identifies the old
+        // validator set. Only then may the child's QC and app data be accepted.
+        tree.insert(&parent, None, None).unwrap();
+        assert!(child.justify.is_correct(&tree).unwrap());
+        hotstuff.poll_deferred_bodies_after_sync(true, &mut tree, &mut app).unwrap();
+        assert!(tree.contains(&child.hash));
+        assert_eq!(app.calls, 1);
+        assert!(!hotstuff.deferred_bodies.contains_key(&child.hash));
+        assert_eq!(tree.highest_view_voted().unwrap(), None);
+    }
+
+    #[test]
+    fn by_hash_body_requires_correct_certificate_without_a_header() {
+        let keys = signing_keys(&[1, 2, 3, 4]);
+        let set = validator_set(&keys);
+        let (mut tree, vss) = steady_block_tree(&set);
+        let view = ViewNumber::new(1);
+        let origin = keys[1].verifying_key();
+        let mut hotstuff = hotstuff_at(view, keys[0].clone(), vss);
+        let parent = Block::new(BlockHeight::new(0), PhaseCertificate::genesis_pc(),
+            CryptoHash::new([9; 32]), Data::new(vec![]));
+        tree.insert(&parent, None, None).unwrap();
+        let mut unsigned_pc = generic_pc(view, parent.hash, &keys, &set);
+        unsigned_pc.signatures = crate::types::data_types::SignatureSet::new(set.len());
+        let forged = Block::new(BlockHeight::new(1), unsigned_pc,
+            CryptoHash::new([10; 32]), Data::new(vec![]));
+        hotstuff.justify_fetch_tracker.insert(forged.hash, (Instant::now(), 0, origin, view));
+        let mut app = RecoveryApp { calls: 0, valid: true, reject_below: 0 };
+        hotstuff.on_receive_msg(BlockDataResponse { view, block: forged.clone() }.into(),
+            &origin, &mut tree, &mut app).unwrap();
+        assert_eq!(app.calls, 0);
+        assert!(!tree.contains(&forged.hash));
+        assert!(hotstuff.justify_fetch_tracker.contains_key(&forged.hash));
+        assert!(!hotstuff.deferred_bodies.contains_key(&forged.hash));
+    }
+
+    #[test]
+    fn tracked_body_rejects_substituted_metadata_without_abandoning_fetch() {
+        use crate::hotstuff::header_fast_path_regression_test::proposer_for;
+        let keys = signing_keys(&[1, 2, 3, 4]);
+        let set = validator_set(&keys);
+        let (mut tree, vss) = steady_block_tree(&set);
+        let view = ViewNumber::new(1);
+        let origin = proposer_for(view, &keys, &vss, &tree);
+        let mut hotstuff = hotstuff_at(view, keys[0].clone(), vss);
+        let good = Block::new(BlockHeight::new(0), PhaseCertificate::genesis_pc(),
+            CryptoHash::new([9; 32]), Data::new(vec![]));
+        let header = ProposalHeader {
+            chain_id: hotstuff.config.chain_id, view, block_hash: good.hash,
+            height: good.height, data_hash: good.data_hash, justify: good.justify.clone(),
+            tc: None, nec: None, has_validator_set_updates: false,
+        };
+        let mut app = RecoveryApp { calls: 0, valid: true, reject_below: 0 };
+        hotstuff.on_receive_msg(header.into(), &origin, &mut tree, &mut app).unwrap();
+        for field in 0..3 {
+            let mut forged = good.clone();
+            match field {
+                0 => forged.height = BlockHeight::new(99),
+                1 => forged.data_hash = CryptoHash::new([88; 32]),
+                _ => forged.justify.view = ViewNumber::new(99),
+            }
+            hotstuff.on_receive_msg(BlockDataResponse { view, block: forged }.into(),
+                &origin, &mut tree, &mut app).unwrap();
+            assert_eq!(app.calls, 0, "substituted metadata must not reach app validation");
+            assert!(!tree.contains(&good.hash));
+            assert!(hotstuff.body_fetch_tracker.contains_key(&good.hash));
+            assert!(!hotstuff.deferred_bodies.contains_key(&good.hash));
+        }
+        hotstuff.on_receive_msg(BlockDataResponse { view, block: good.clone() }.into(),
+            &origin, &mut tree, &mut app).unwrap();
+        assert!(tree.contains(&good.hash));
+        assert_eq!(app.calls, 1);
+        assert!(!hotstuff.body_fetch_tracker.contains_key(&good.hash));
+    }
+
+    #[test]
+    fn nonzero_chain_genesis_body_requires_local_header_before_insertion() {
+        use crate::hotstuff::header_fast_path_regression_test::proposer_for;
+        use crate::networking::messages::ProgressMessage;
+        use crate::networking::receiving::ProgressMessageStub;
+        use crate::types::data_types::BufferSize;
+        for push_first in [true, false] {
+            let keys = signing_keys(&[1, 2, 3, 4]);
+            let set = validator_set(&keys);
+            let (mut tree, vss) = steady_block_tree(&set);
+            let view = ViewNumber::new(1);
+            let origin = proposer_for(view, &keys, &vss, &tree);
+            let mut hotstuff = hotstuff_at(view, keys[0].clone(), vss);
+            let chain = ChainID::new(7778);
+            hotstuff.config.chain_id = chain;
+            let block = Block::new(BlockHeight::new(0), PhaseCertificate::genesis_pc(),
+                CryptoHash::new([9; 32]), Data::new(vec![]));
+            let body = HotStuffMessage::BlockDataResponse(BlockDataResponse { view, block: block.clone() });
+            let header = HotStuffMessage::ProposalHeader(ProposalHeader {
+                chain_id: chain, view, block_hash: block.hash, height: block.height,
+                data_hash: block.data_hash, justify: block.justify.clone(),
+                tc: None, nec: None, has_validator_set_updates: false,
+            });
+            let messages = if push_first { [body, header] } else { [header, body] };
+            let (tx, rx) = std::sync::mpsc::channel();
+            let mut receiver = ProgressMessageStub::new(rx, BufferSize::new(1024 * 1024));
+            let mut app = RecoveryApp { calls: 0, valid: true, reject_below: 0 };
+            for (index, msg) in messages.into_iter().enumerate() {
+                tx.send((origin, ProgressMessage::HotStuffMessage(msg))).unwrap();
+                let (sender, received) = receiver.recv(chain, view, Instant::now() + Duration::from_secs(1)).unwrap();
+                let ProgressMessage::HotStuffMessage(msg) = received else { panic!("wrong message type") };
+                hotstuff.on_receive_msg(msg, &sender, &mut tree, &mut app).unwrap();
+                if index == 0 {
+                    assert!(!tree.contains(&block.hash), "both a local header and validated body are required");
+                    assert_eq!(app.calls, 0);
+                    if push_first {
+                        assert_eq!(tree.highest_view_voted().unwrap(), None, "unclaimed genesis push must not vote");
+                    }
+                }
+            }
+            assert!(tree.contains(&block.hash));
+            assert_eq!(app.calls, 1, "body must pass app validation");
+        }
+    }
+
+    #[test]
+    fn deferred_bodies_resume_when_parent_arrives_via_sync() {
+        let keys = signing_keys(&[1, 2, 3, 4]);
+        let set = validator_set(&keys);
+        let (mut tree, vss) = steady_block_tree(&set);
+        let mut hotstuff = hotstuff_at(ViewNumber::new(4), keys[0].clone(), vss);
+        let parent = Block::new(BlockHeight::new(0), PhaseCertificate::genesis_pc(),
+            CryptoHash::new([1; 32]), Data::new(vec![]));
+        let child = Block::new(BlockHeight::new(1),
+            generic_pc(ViewNumber::new(1), parent.hash, &keys, &set),
+            CryptoHash::new([2; 32]), Data::new(vec![]));
+        let grandchild = Block::new(BlockHeight::new(2),
+            generic_pc(ViewNumber::new(2), child.hash, &keys, &set),
+            CryptoHash::new([3; 32]), Data::new(vec![]));
+        // Bodies already admitted by the tracked response path, waiting for
+        // an absent ancestor; inserting that ancestor through sync emits no
+        // HotStuff body-arrival callback.
+        hotstuff.deferred_bodies.insert(child.hash, child.clone());
+        hotstuff.deferred_bodies.insert(grandchild.hash, grandchild.clone());
+        let mut app = RecoveryApp { calls: 0, valid: true, reject_below: 0 };
+        hotstuff.poll_deferred_bodies_after_sync(true, &mut tree, &mut app).unwrap();
+        assert_eq!(app.calls, 0, "missing parent must still gate app validation");
+        tree.insert(&parent, None, None).unwrap();
+        hotstuff.poll_deferred_bodies_after_sync(true, &mut tree, &mut app).unwrap();
+        assert!(tree.contains(&child.hash) && tree.contains(&grandchild.hash));
+        assert!(hotstuff.deferred_bodies.is_empty());
+        assert_eq!(app.calls, 2);
+        assert_eq!(tree.highest_view_voted().unwrap(), None, "recovery must not vote");
+    }
+
+    #[test]
+    fn continuous_sync_does_not_starve_ready_deferred_suffix() {
+        let keys = signing_keys(&[1, 2, 3, 4]);
+        let set = validator_set(&keys);
+        let (mut tree, vss) = steady_block_tree(&set);
+        let mut hotstuff = hotstuff_at(ViewNumber::new(4), keys[0].clone(), vss);
+        let parent = Block::new(BlockHeight::new(0), PhaseCertificate::genesis_pc(),
+            CryptoHash::new([250; 32]), Data::new(vec![]));
+        tree.insert(&parent, None, None).unwrap();
+        for i in 0..MAX_DEFERRED_SYNC_RETRIES_PER_TICK {
+            let invalid = Block::new(BlockHeight::new(0), PhaseCertificate::genesis_pc(),
+                CryptoHash::new([i as u8; 32]), Data::new(vec![]));
+            hotstuff.deferred_bodies.insert(invalid.hash, invalid);
+        }
+        let child = Block::new(BlockHeight::new(1),
+            generic_pc(ViewNumber::new(1), parent.hash, &keys, &set),
+            CryptoHash::new([251; 32]), Data::new(vec![]));
+        hotstuff.deferred_bodies.insert(child.hash, child.clone());
+        let mut app = RecoveryApp { calls: 0, valid: true, reject_below: 1 };
+        hotstuff.poll_deferred_bodies_after_sync(true, &mut tree, &mut app).unwrap();
+        assert!(!tree.contains(&child.hash), "first tick consumes rejected prefix");
+        hotstuff.poll_deferred_bodies_after_sync(true, &mut tree, &mut app).unwrap();
+        assert!(tree.contains(&child.hash), "new sync must not restart the rejected prefix");
+        assert_eq!(app.calls, MAX_DEFERRED_SYNC_RETRIES_PER_TICK + 1);
+    }
+
+    #[test]
+    fn deferred_sync_retry_is_bounded_and_keeps_app_validation() {
+        let keys = signing_keys(&[1, 2, 3, 4]);
+        let set = validator_set(&keys);
+        let (mut tree, vss) = steady_block_tree(&set);
+        let mut hotstuff = hotstuff_at(ViewNumber::new(4), keys[0].clone(), vss);
+        let count = MAX_DEFERRED_SYNC_RETRIES_PER_TICK * 2 + 1;
+        for i in 0..count {
+            let block = Block::new(BlockHeight::new(0), PhaseCertificate::genesis_pc(),
+                CryptoHash::new([i as u8; 32]), Data::new(vec![]));
+            hotstuff.deferred_bodies.insert(block.hash, block);
+        }
+        let mut app = RecoveryApp { calls: 0, valid: false, reject_below: 0 };
+        hotstuff.poll_deferred_bodies_after_sync(true, &mut tree, &mut app).unwrap();
+        assert_eq!(app.calls, MAX_DEFERRED_SYNC_RETRIES_PER_TICK);
+        assert!(hotstuff.has_deferred_sync_retries());
+        for _ in 0..3 {
+            hotstuff.poll_deferred_bodies_after_sync(false, &mut tree, &mut app).unwrap();
+        }
+        assert_eq!(app.calls, count, "one attempt per body per sync-triggered pass");
+        assert!(!hotstuff.has_deferred_sync_retries());
+        assert_eq!(hotstuff.deferred_bodies.len(), count);
+        assert!(hotstuff.deferred_bodies.keys().all(|h| !tree.contains(h)));
+    }
 }

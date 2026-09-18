@@ -519,6 +519,13 @@ pub(crate) fn wedge_diag_enabled() -> bool {
     })
 }
 
+/// Opt-in payload-free diagnostics for body-fetch recovery. Disabled by default.
+pub(crate) fn body_fetch_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("TORUS_BODY_FETCH_TRACE")
+        .map(|value| value == "1").unwrap_or(false))
+}
+
 /// Short human-readable prefix of a block hash for wedge diagnostic lines.
 pub(crate) fn block_prefix(hash: &crate::types::data_types::CryptoHash) -> String {
     first_seven_base64_chars(&hash.bytes())

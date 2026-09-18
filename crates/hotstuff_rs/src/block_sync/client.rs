@@ -338,11 +338,15 @@ impl<N: Network> BlockSyncClient<N> {
         // blocks), so re-running it for a present block is idempotent — a pure no-op
         // when nothing new can commit, and the missing commit when the hole is below.
         loop {
-            let front_known = self
-                .pending_sync
-                .as_ref()
-                .and_then(|s| s.pending_blocks.front().cloned())
-                .filter(|b| block_tree.contains(&b.hash));
+            let front_hash = self.pending_sync.as_ref()
+                .and_then(|s| s.pending_blocks.front().map(|b| b.hash));
+            // Only the hash came from the peer. Its other fields are still
+            // unvalidated and may not belong to that hash, so re-drive the
+            // canonical stored block rather than trusting its wire justify.
+            let front_known = match front_hash {
+                Some(hash) => block_tree.block(&hash)?,
+                None => None,
+            };
             let known = match front_known {
                 Some(b) => b,
                 None => break,
@@ -388,15 +392,16 @@ impl<N: Network> BlockSyncClient<N> {
         let block = match session.pending_blocks.pop_front() {
             Some(b) => b,
             None => {
-                // All remaining blocks were already known (and re-driven above).
+                // A body may already be present while the response's terminal QC
+                // is new. Re-drive that QC before deciding this batch made no
+                // progress; block.justify alone is one certificate behind it.
+                self.apply_response_highest_pc(block_tree, app)?;
                 self.request_next_batch(block_tree)?;
                 return Ok(true);
             }
         };
 
         let peer = session.peer;
-        let chain_id = self.config.chain_id;
-
         // Validate cryptographic correctness only (hashes, signatures).
         // safe_block() is intentionally skipped: synced blocks come from the peer's
         // committed chain which may diverge from our locked_pc branch. The lock
@@ -526,29 +531,7 @@ impl<N: Network> BlockSyncClient<N> {
             let session = self.pending_sync.as_mut().unwrap();
             session.blocks_synced += 1;
 
-            // Apply highest_pc from the response if valid
-            if let Some(ref highest_pc) = session.highest_pc.clone() {
-                if highest_pc.is_correct(block_tree)? && safe_pc(highest_pc, block_tree, chain_id)?
-                {
-                    let update_result2 = block_tree
-                        .update(highest_pc, &self.event_publisher)
-                        .unwrap_or(UpdateResult {
-                            validator_set_updates: None,
-                            committed_block_hashes: vec![],
-                        });
-                    if !update_result2.committed_block_hashes.is_empty() {
-                        if let Err(e) = crate::committed_feed::feed_committed_blocks_to_app(
-                            block_tree, app,
-                        ) {
-                            log::error!("app feed after sync highest_pc commit failed: {:?}", e);
-                        }
-                    }
-                    if let Some(vs_updates) = update_result2.validator_set_updates {
-                        self.validator_set_update_handle
-                            .update_validator_set(vs_updates);
-                    }
-                }
-            }
+            self.apply_response_highest_pc(block_tree, app)?;
 
             log::info!(
                 "block_sync: block inserted, blocks_synced={}",
@@ -569,6 +552,35 @@ impl<N: Network> BlockSyncClient<N> {
         }
 
         Ok(true)
+    }
+
+    /// Apply the terminal certificate independently of whether the batch's
+    /// bodies needed insertion. All certificate and lock checks are unchanged.
+    fn apply_response_highest_pc<K: KVStore>(
+        &mut self,
+        block_tree: &mut BlockTreeSingleton<K>,
+        app: &mut impl App<K>,
+    ) -> Result<(), BlockSyncClientError> {
+        let highest_pc = self.pending_sync.as_ref().and_then(|s| s.highest_pc.clone());
+        if let Some(highest_pc) = highest_pc {
+            if highest_pc.is_correct(block_tree)?
+                && safe_pc(&highest_pc, block_tree, self.config.chain_id)?
+            {
+                let update_result = block_tree.update(&highest_pc, &self.event_publisher)?;
+                if !update_result.committed_block_hashes.is_empty() {
+                    if let Err(e) = crate::committed_feed::feed_committed_blocks_to_app(block_tree, app) {
+                        log::error!("app feed after sync highest_pc commit failed: {:?}", e);
+                    }
+                    if let Some(session) = self.pending_sync.as_mut() {
+                        session.blocks_synced += update_result.committed_block_hashes.len() as u64;
+                    }
+                }
+                if let Some(vs_updates) = update_result.validator_set_updates {
+                    self.validator_set_update_handle.update_validator_set(vs_updates);
+                }
+            }
+        }
+        Ok(())
     }
 
     fn on_receive_advertise_block<K: KVStore>(
@@ -1725,6 +1737,76 @@ mod fatal_violation_wiring_tests {
             "the committed-conflict branch must invoke App::on_fatal_safety_violation \
              so the host can latch fail-stop and halt the process"
         );
+    }
+
+    #[test]
+    fn known_sync_bodies_still_apply_terminal_certificate() {
+        use borsh::BorshSerialize;
+        use crate::hotstuff::types::Phase;
+        use crate::types::crypto_primitives::Keypair;
+        use crate::types::data_types::{SignatureSet, ViewNumber};
+
+        let set = validator_set();
+        let key = SigningKey::from_bytes(&[1u8; 32]);
+        let vss = ValidatorSetState::new(set.clone(), set.clone(), None, true);
+        let mut tree = BlockTreeSingleton::new(MemKV::default());
+        tree.initialize(&AppStateUpdates::new(), &vss).unwrap();
+        let certify = |view: u64, hash| {
+            let view = ViewNumber::new(view);
+            let mut signatures = SignatureSet::new(1);
+            let message = (CHAIN_ID, view, hash, Phase::Generic).try_to_vec().unwrap();
+            signatures.set(0, Some(Keypair::new(key.clone()).sign(&message)));
+            PhaseCertificate { chain_id: CHAIN_ID, view, block: hash, phase: Phase::Generic, signatures }
+        };
+        let mut blocks = Vec::new();
+        let mut justify = PhaseCertificate::genesis_pc();
+        for h in 0..3 {
+            let block = Block::new(BlockHeight::new(h), justify,
+                CryptoHash::new([h as u8; 32]), Data::new(vec![]));
+            tree.insert(&block, None, None).unwrap();
+            justify = certify(h + 1, block.hash);
+            blocks.push(block);
+        }
+        let terminal_pc = justify;
+        let make_session = |pc| PendingSyncSession {
+            peer: key.verifying_key(), pending_blocks: VecDeque::from(blocks.clone()),
+            highest_pc: Some(pc), blocks_synced: 0, init_height: BlockHeight::new(0),
+            fetch_iterations: 1, session_start: Instant::now(), awaiting_fetch: false,
+            last_fetch_start_height: Some(BlockHeight::new(0)), is_backfill: false,
+        };
+        // A peer cannot smuggle an unverified justify through the known-hash
+        // fast path. The stored block's certificate must be used instead.
+        let mut forged_body = blocks[2].clone();
+        forged_body.justify = PhaseCertificate {
+            chain_id: CHAIN_ID, view: ViewNumber::new(999), block: blocks[2].hash,
+            phase: Phase::Generic, signatures: SignatureSet::new(1),
+        };
+        let mut forged_session = make_session(PhaseCertificate::genesis_pc());
+        forged_session.pending_blocks = VecDeque::from(vec![forged_body]);
+        let mut forged_cli = client();
+        forged_cli.pending_sync = Some(forged_session);
+        let mut app = FatalRecordingApp { fatal_called: false };
+        forged_cli.process_pending_block(&mut tree, &mut app).unwrap();
+        assert_eq!(tree.highest_pc().unwrap().view, ViewNumber::new(2),
+            "known hash must not authenticate peer-supplied certificate fields");
+        assert_eq!(tree.highest_committed_block_height().unwrap(), Some(BlockHeight::new(0)));
+
+        // An invalid terminal certificate must not be admitted merely because
+        // every accompanying body was validated earlier.
+        let mut cli = client();
+        let mut bad_pc = terminal_pc.clone();
+        bad_pc.signatures = SignatureSet::new(1);
+        cli.pending_sync = Some(make_session(bad_pc));
+        let mut app = FatalRecordingApp { fatal_called: false };
+        cli.process_pending_block(&mut tree, &mut app).unwrap();
+        assert_eq!(tree.highest_committed_block_height().unwrap(), Some(BlockHeight::new(0)));
+
+        cli.pending_sync = Some(make_session(terminal_pc.clone()));
+        cli.process_pending_block(&mut tree, &mut app).unwrap();
+        assert!(tree.highest_pc().unwrap() == terminal_pc);
+        assert_eq!(tree.highest_committed_block_height().unwrap(), Some(BlockHeight::new(1)),
+            "terminal QC, not the already-known tip body's justify, commits the next ancestor");
+        assert!(!app.fatal_called);
     }
 
     /// s428 BACKFILL FIX (RED first — `request_sync` returned `()` and reset the
