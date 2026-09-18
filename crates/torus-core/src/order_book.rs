@@ -642,9 +642,9 @@ impl OrderBook {
             None => return vec![],
         };
 
-        // Group only concentrated cancellations on a demonstrably deep level.
-        // Shallow/sparse cases cannot amortize the extra allocations and probes.
-        if self.cancel_all_has_deep_shared_level(&order_ids) {
+        // Group only concentrated cancellations on proven deep levels.
+        // Classification allocates nothing; shallow/sparse cases use the old loop.
+        if self.cancel_all_should_group(&order_ids) {
             return self.cancel_all_by_level(trader, order_ids);
         }
 
@@ -693,13 +693,11 @@ impl OrderBook {
         cancelled
     }
 
-    fn cancel_all_has_deep_shared_level(&self, order_ids: &[OrderId]) -> bool {
-        // The initial microbenchmark showed gains for 32/200 cancellations at
-        // depth 8192, but regressions for 4 cancellations and shallow levels.
-        // These are conservative performance gates, not validity limits.
-        const MIN_CANCELS: usize = 32;
-        const MIN_DEPTH: usize = 1_024;
-        if order_ids.len() < MIN_CANCELS || self.order_index.len() < MIN_DEPTH {
+    fn cancel_all_should_group(&self, order_ids: &[OrderId]) -> bool {
+        // Preserve the measured single-level gate and its cheap small/sparse
+        // rejection. The separate multilevel experiment engages only after a
+        // mismatch proves the old single-level path would reject this set.
+        if order_ids.len() < 32 || self.order_index.len() < 1_024 {
             return false;
         }
         let Some(first) = self.order_index.get(&order_ids[0]) else {
@@ -709,20 +707,69 @@ impl OrderBook {
             Side::Buy => &self.bids,
             Side::Sell => &self.asks,
         };
-        if !side
-            .get(&first.price)
-            .is_some_and(|queue| queue.len() >= MIN_DEPTH)
-        {
+        let Some(queue) = side.get(&first.price) else {
+            return false;
+        };
+        if queue.len() < 1_024 {
             return false;
         }
-        // Do not pay grouping allocations for many unrelated shallow levels
-        // merely because the whole book is large. Mixed levels conservatively
-        // keep the original path, even when a subset could benefit.
-        order_ids[1..].iter().all(|id| {
-            self.order_index
-                .get(id)
-                .is_some_and(|loc| loc.side == first.side && loc.price == first.price)
-        })
+        for (index, id) in order_ids.iter().enumerate().skip(1) {
+            let Some(loc) = self.order_index.get(id) else {
+                return false;
+            };
+            if loc.side != first.side || loc.price != first.price {
+                // Only the >=16-per-level forced measurements had enough
+                // headroom to justify this experiment. Bound failed probes and
+                // later grouping allocations even for synthetic loaded books.
+                if !(80..=200).contains(&order_ids.len()) || queue.len() < 8_192 {
+                    return false;
+                }
+                return self.cancel_all_has_bounded_deep_levels(order_ids, first, index);
+            }
+        }
+        true
+    }
+
+    fn cancel_all_has_bounded_deep_levels(
+        &self,
+        order_ids: &[OrderId],
+        first: &OrderLocation,
+        same_level_prefix: usize,
+    ) -> bool {
+        // No heap allocation in classification. The caller has already proved
+        // the first level's depth and counted its prefix. At most 200 targets,
+        // five distinct (side, price) groups, and five level lookups overall.
+        let mut groups = [(Side::Buy, FixedPoint::ZERO, 0usize); 5];
+        groups[0] = (first.side, first.price, same_level_prefix);
+        let mut used = 1;
+        for id in &order_ids[same_level_prefix..] {
+            let Some(loc) = self.order_index.get(id) else {
+                return false;
+            };
+            if let Some(group) = groups[..used]
+                .iter()
+                .position(|(side, price, _)| *side == loc.side && *price == loc.price)
+            {
+                groups[group].2 += 1;
+                continue;
+            }
+            if used == groups.len() {
+                return false;
+            }
+            let side = match loc.side {
+                Side::Buy => &self.bids,
+                Side::Sell => &self.asks,
+            };
+            if !side
+                .get(&loc.price)
+                .is_some_and(|queue| queue.len() >= 8_192)
+            {
+                return false;
+            }
+            groups[used] = (loc.side, loc.price, 1);
+            used += 1;
+        }
+        groups[..used].iter().all(|(_, _, count)| *count >= 16)
     }
 
     fn cancel_all_by_level(&mut self, trader: Address, order_ids: Vec<OrderId>) -> Vec<Order> {
@@ -4930,7 +4977,7 @@ mod cancel_all_compaction_tests {
                             .status,
                         OrderStatus::PendingTrigger
                     );
-                    assert!(book.cancel_all_has_deep_shared_level(&book.trader_orders[&addr(1)]));
+                    assert!(book.cancel_all_should_group(&book.trader_orders[&addr(1)]));
                 }
                 for _ in 0..2 {
                     assert_eq!(observe(&mut a), observe(&mut b));
@@ -4969,7 +5016,7 @@ mod cancel_all_compaction_tests {
                 let mut b = shaped_book_on_side(1_024, 1_024, "front", cache, chunked, side);
                 for book in [&mut a, &mut b] {
                     book.trader_orders.get_mut(&addr(1)).unwrap().reverse();
-                    assert!(book.cancel_all_has_deep_shared_level(&book.trader_orders[&addr(1)]));
+                    assert!(book.cancel_all_should_group(&book.trader_orders[&addr(1)]));
                 }
                 for _ in 0..2 {
                     assert_eq!(observe(&mut a), observe(&mut b));
@@ -4998,9 +5045,7 @@ mod cancel_all_compaction_tests {
                         for book in [&mut a, &mut b] {
                             book.trader_orders.get_mut(&addr(1)).unwrap().reverse();
                             assert_eq!(
-                                book.cancel_all_has_deep_shared_level(
-                                    &book.trader_orders[&addr(1)]
-                                ),
+                                book.cancel_all_should_group(&book.trader_orders[&addr(1)]),
                                 depth == 1_024 && count == 32,
                                 "fixture must exercise both gate outcomes"
                             );
@@ -5126,7 +5171,7 @@ mod cancel_all_compaction_tests {
     fn bench_candidate(book: &mut OrderBook, trader: Address) -> Vec<Order> {
         book.cancel_all(trader, None)
     }
-    /// Experimental C arm only: bypass the production all-one-level gate.
+    /// Experimental C arm only: bypass the production eligibility gate.
     /// Match the public method's trader-index removal and empty-trader return.
     /// This is never selected by production cancel_all.
     #[inline(never)]
@@ -5153,7 +5198,10 @@ mod cancel_all_compaction_tests {
                 // Cross-level output order intentionally differs from both
                 // price order and each queue's FIFO ordering.
                 book.trader_orders.get_mut(&addr(1)).unwrap().reverse();
-                assert!(!book.cancel_all_has_deep_shared_level(&book.trader_orders[&addr(1)]));
+                assert_eq!(
+                    book.cancel_all_should_group(&book.trader_orders[&addr(1)]),
+                    count >= 16
+                );
                 assert_eq!(book.trader_orders[&addr(1)].len(), 5 * count);
                 book.set_next_order_id((depth * 5 + 1) as OrderId);
                 for trader in [addr(1), addr(250)] {
@@ -5179,6 +5227,112 @@ mod cancel_all_compaction_tests {
             // Includes every surviving FIFO queue, index/seq/epoch/dirty chunk,
             // row/level journal and full persisted row/level bytes.
             assert_eq!(observe(&mut actual), observe(&mut expected));
+        }
+    }
+
+    fn bench_case_fixture(
+        depth: usize,
+        count: usize,
+        layout: &str,
+        levels: usize,
+        chunked: bool,
+    ) -> OrderBook {
+        let base_layout = if matches!(layout, "uneven15" | "shallow") {
+            "middle"
+        } else {
+            layout
+        };
+        let mut book = shaped_book_levels(
+            depth,
+            count,
+            base_layout,
+            !chunked,
+            chunked,
+            Side::Buy,
+            levels,
+        );
+        if layout == "uneven15" {
+            // Keep total80: redistribute one target from level99 to103,
+            // yielding15/16/16/16/17, rather than tripping the total79 gate.
+            let id = book.trader_orders[&addr(1)][0];
+            let mut moved = book.cancel_order(id).unwrap();
+            moved.price = fp(103);
+            book.insert_order(moved);
+        } else if layout == "shallow" {
+            // Only a later level is shallow; first-level depth still passes.
+            let id = book.bids[&fp(100)].front().unwrap().id;
+            assert_ne!(book.get_order(id).unwrap().trader, addr(1));
+            book.cancel_order(id).unwrap();
+        }
+        book
+    }
+
+    fn check_multilevel_cancel(mut actual: OrderBook, group: bool) {
+        actual.trader_orders.get_mut(&addr(1)).unwrap().reverse();
+        let count = actual.trader_orders[&addr(1)].len();
+        assert_eq!(
+            actual.cancel_all_should_group(&actual.trader_orders[&addr(1)]),
+            group
+        );
+        let mut expected = clone_bench_fixture(&actual);
+        for book in [&mut actual, &mut expected] {
+            let _ = book.take_row_ops();
+            let _ = book.take_level_ops();
+        }
+        let got = actual.cancel_all(addr(1), None);
+        assert_eq!(got.len(), count);
+        assert_eq!(got, naive_cancel_all(&mut expected, addr(1)));
+        assert_eq!(actual.order_count(), expected.order_count());
+        assert_eq!(observe(&mut actual), observe(&mut expected));
+    }
+
+    #[test]
+    fn cancel_all_compaction_multilevel_layouts_match_naive() {
+        for layout in ["front", "back", "spread"] {
+            check_multilevel_cancel(bench_case_fixture(8_192, 16, layout, 5, true), true);
+        }
+    }
+
+    #[test]
+    fn cancel_all_compaction_multilevel_fallbacks_match_naive() {
+        for (layout, levels) in [("uneven15", 5), ("shallow", 5), ("middle", 6)] {
+            check_multilevel_cancel(bench_case_fixture(8_192, 16, layout, levels, true), false);
+        }
+    }
+
+    #[test]
+    fn cancel_all_compaction_multilevel_gate_boundaries() {
+        // Gate-only boundary probes avoid repeatedly encoding the whole deep
+        // book. Differential cases above check both accepted/rejected mutation.
+        for (depth, count, levels, expected) in [
+            (8_191, 16, 5, false),
+            (8_192, 16, 5, true),
+            (8_192, 15, 5, false),
+            (8_192, 40, 5, true),
+            (8_192, 40, 2, true),
+            (8_192, 16, 6, false),
+        ] {
+            let book = bench_case_fixture(depth, count, "middle", levels, true);
+            assert_eq!(
+                book.cancel_all_should_group(&book.trader_orders[&addr(1)]),
+                expected,
+                "depth={depth}, count={count}, levels={levels}"
+            );
+        }
+        for (initial, delta, expected) in [(16, -1, false), (16, 1, true), (40, 1, false)] {
+            let mut book = bench_case_fixture(8_192, initial, "middle", 5, true);
+            let id = book.trader_orders[&addr(1)][0];
+            if delta < 0 {
+                book.cancel_order(id).unwrap(); //79 total
+            } else {
+                let mut order = book.get_order(id).unwrap().clone();
+                order.id = 5 * 8_192 + 1;
+                book.insert_order(order); //81 or201 total
+            }
+            assert_eq!(
+                book.cancel_all_should_group(&book.trader_orders[&addr(1)]),
+                expected
+            );
         }
     }
 
@@ -5264,6 +5418,30 @@ mod cancel_all_compaction_tests {
         );
     }
 
+    /// Production gate cost and actual compaction behavior on mixed levels.
+    #[test]
+    #[ignore = "run explicitly in release on an idle host; gated experiment"]
+    fn cancel_all_compaction_multilevel_microbenchmark() {
+        let cases = [
+            (8_192, 16, "middle", 5, true),
+            (32_768, 16, "middle", 5, true),
+            (8_192, 16, "front", 5, true),
+            (8_192, 16, "back", 5, true),
+            (8_192, 16, "spread", 5, true),
+            (8_192, 16, "uneven15", 5, true),
+            (8_192, 16, "shallow", 5, true),
+            (8_192, 16, "middle", 6, true),
+        ];
+        run_cancel_bench(
+            &cases,
+            [
+                ("AB_gated", bench_baseline, bench_candidate),
+                ("AA", bench_baseline, bench_baseline),
+                ("BB_gated", bench_candidate, bench_candidate),
+            ],
+        );
+    }
+
     fn run_cancel_bench(
         cases: &[(usize, usize, &str, usize, bool)],
         comparisons: [(&str, BenchCancel, BenchCancel); 3],
@@ -5275,12 +5453,16 @@ mod cancel_all_compaction_tests {
             for seed in 0..2 {
                 // Fresh randomized hash seeds per seed, shared by every clone
                 // in this block. No seeded workload RNG is involved.
-                let fixture =
-                    shaped_book_levels(depth, count, layout, !chunked, chunked, Side::Buy, levels);
+                let fixture = bench_case_fixture(depth, count, layout, levels, chunked);
                 assert_eq!(fixture.trader_orders[&addr(1)].len(), count * levels);
                 assert_eq!(
-                    fixture.cancel_all_has_deep_shared_level(&fixture.trader_orders[&addr(1)]),
-                    levels == 1 && layout != "levels" && depth >= 1_024 && count >= 32
+                    fixture.cancel_all_should_group(&fixture.trader_orders[&addr(1)]),
+                    !matches!(layout, "levels" | "uneven15" | "shallow")
+                        && ((levels == 1 && depth >= 1_024 && count >= 32)
+                            || ((2..=5).contains(&levels)
+                                && depth >= 8_192
+                                && count >= 16
+                                && (80..=200).contains(&(levels * count))))
                 );
                 for schedule in 0..8 {
                     // Rotate comparison order so AB is not always measured

@@ -10,7 +10,7 @@ candidate always swept touched levels, hashed every survivor and allocated a
 replacement queue. It shipped together with deferred book-save sidecars, and
 the combined candidate regressed; its measurements do not isolate cancellation.
 
-This revision groups only sets of at least 32 targets whose index locations all
+The frozen single-level baseline `f2654bc` groups only sets of at least32 targets whose index locations all
 prove they share a single level with at least 1024 orders. Small cancellations
 and globally shallow books reject the gate with two length checks. A sparse
 first target level rejects after one index and level lookup, before any grouping
@@ -64,9 +64,9 @@ flat-cache depth8192 one-target/distinct-level and 32-target/middle cases;
 chunked mode3 shallow32/four targets; chunked depth8192 one-target/distinct-level,
 32-target/middle and 200-target/middle; and five deep levels each8192 orders with
 8 or16 middle targets PER LEVEL (40/80 cancellations total). The five-level
-cases explicitly assert the current all-one-level gate is inactive. They test
-fallback cost under a more relevant band5 shape; they cannot demonstrate a
-multilevel compaction benefit. This remains an engine microbenchmark, not a
+cases asserted the baseline all-one-level gate was inactive. At the revised
+source, the16-target case asserts the new gate is active; the8-target case
+remains fallback. Historical r1 timings refer exclusively to `f2654bc`. This remains an engine microbenchmark, not a
 simulation of the full ten-market workload.
 
 A separate ignored `cancel_all_compaction_forced_grouping_microbenchmark`
@@ -82,8 +82,8 @@ its results cannot be labelled as production candidate behavior.
 shapes before timing, covering bids and asks, reversed cross-level target order,
 primed row/chunk persistence, target and other-trader pending stops, exact
 cancelled-order returns, remaining FIFO queues, indices, epochs, dirty chunks,
-journals and complete persisted row/level images. Production gate inactivity is
-asserted for each fixture. These new checks passed in the parent-run focused suite described below.
+journals and complete persisted row/level images. Baseline gate inactivity was asserted for each fixture; the revised tests
+expect activation only at16 targets per level. These new checks passed in the parent-run focused suite described below.
 
 Background trader addresses encode their group in eight bytes with a distinct
 prefix, avoiding the prior u8 wrap/collision above50800 orders. Each background
@@ -145,7 +145,7 @@ separate arm medians.
 | mode3 five levels32768/8 middle | AC forced | 1.277 | 1.002 | 1.078 |
 | mode3 five levels32768/16 middle | AC forced | 1.971 | 1.028 | 1.036 |
 
-The actual production gate still rejects both five-level shapes: AB ratios were
+The frozen baseline production gate rejected both five-level shapes: AB ratios were
 1.059 and1.032 at8192/8 and8192/16. Forced C bypasses this gate in test code only.
 Its16-target gains warrant an actual gated experiment, not promotion. Eight-
 target gains are smaller and exposed to control variation. Sparse/distinct-
@@ -154,3 +154,52 @@ AA1.348/BB1.175. Their apparent AB regression/gain is unresolved. This does not
 establish default-band5 activation frequency, sustained engine improvement or
 chain matched/s. The exact r1 source is committed as a reviewable baseline
 before the separate multilevel gate change.
+
+## Bounded multilevel extension: rejected on performance
+
+A separate attempt preserves the >=32/depth1024 single-level gate. At the first
+mismatching level, it considers multilevel grouping only for80..200 total
+cancellations and first-level depth>=8192. A fixed stack array counts at most
+five `(side, price)` groups; every new level must have depth>=8192, and every
+group must contain>=16 targets. Missing locations, a shallow group or a sixth
+group reject. There is no allocation during classification. At most201 index
+probes occur for a multilevel attempt (the first mismatch is re-read), and at
+most five level lookups; resulting grouped allocations remain bounded by200
+targets and five groups. Existing synthetic single-level fixtures retain their
+prior behavior independently of the new multilevel cap.
+
+The40-target/five-level case still rejects at its first mismatch. This narrow
+extension tests the stronger16-per-level forced signal; it does not assume
+activation is frequent under default band5 or improve the8-per-level case.
+
+New differential tests compare front/back/dispersed five-level cancellations
+against the exact baseline, and fallback cases with15/16/16/16/17 targets,
+one8191-deep later level, and six deep levels. Gate-only checks cover depth
+8191/8192, targets per level15/16, total79/80/81/200/201 and two/five/six groups.
+The separate `cancel_all_compaction_multilevel_microbenchmark` measures the
+actual gated AB path with AA/BB controls on five-level middle8192/32768, front,
+back, dispersed and the three fallback shapes. Parent verification receipt
+`d30c35c4-821e-43be-99c6-393ed1ab5966` passed all11 focused tests. Its actual-gate
+microbenchmark completed; the performance result below rejects this revision.
+Earlier fair/forced r1 logs remain tied exclusively to baseline `f2654bc`.
+
+Torus attempt `0bab8fae-aab5-4b25-be0f-e79c9fcd03d5`:
+
+```sh
+cargo test -p torus-core --lib cancel_all_compaction -- --test-threads=1
+cargo test --release -p torus-core --lib cancel_all_compaction_multilevel_microbenchmark -- --ignored --nocapture --test-threads=1
+```
+
+This experiment was REJECTED on performance, not promoted. The actual-gate
+artifact is `cancel-multilevel-gated-r1.log` in the campaign directory above.
+Mode3 five-level middle16 paired AB ratios were1.634 atdepth8192 and1.895 at32768.
+However, depth8192/five-level dispersed16 regressed to0.915 with clean controls
+AA0.993 andBB0.999. Declined uneven15/shallow/sixth-level cases were near parity.
+Root recorded performance rejection event `79a6fb54`. Passing semantic tests and
+middle-only speedups do not override this representative-layout regression.
+This source is committed before the separate retain-cost threshold experiment.
+
+The earlier forced second repeat also completed: middle8192/16 AC1.721,
+AA0.975, CC0.973; middle32768/16 AC1.957, AA1.002, CC1.070. At8 targets per level,
+AC was1.159 at8192 and1.225 at32768. These remain test-only middle-layout results
+and do not establish live throughput or production acceptance.
