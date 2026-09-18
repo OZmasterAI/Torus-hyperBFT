@@ -79,3 +79,11 @@ binary/config provenance and rawlogs under the campaign root. The two earlier
 45s labels never launched validators (invalidkilloffset, then inheritedgenesis
 OUT). Neither is a replay attempt. See [deterministic C1 design](c1-pending-parent-qualification-design-2026-09-18.md)
 for the stronger pending-parent test still needed.
+
+The follow-up `s60-viewbound-replay45-r1` used frozen runtime `b60097a`
+(header-view voting and future-buffer accounting fixes), with extra wedge
+diagnostics. It completed drain in57s and final AGREE with clean dissemination,
+but had no replay gap: worker attachment586, pre-kill execution/flush queues0.
+Strict crash verdict FAIL, overall REJECT, liveness UNKNOWN after counter reset.
+This is healthy restart/drain evidence for one cell, not positive replay or a
+throughput result. It does not prove what caused the earlier stalled cell.
