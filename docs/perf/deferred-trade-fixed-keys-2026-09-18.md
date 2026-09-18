@@ -130,5 +130,26 @@ found no blocker. No abrupt-crash or live throughput qualification is implied.
 Binary identity checks find the exact flag, typed writer helper and integer-margin
 base helper; unrelated body-send, body-before-expiry and pass-B diagnostics are
 absent. The production drain helper has no standalone symbol in this optimized
-binary, so it is not used as an identity requirement. Same-binary OFF/ON live
-measurements remain pending.
+binary, so it is not used as an identity requirement.
+
+## First live OFF/ON pair
+
+Frozen runtime `0571fba`, node SHA256
+`b6f804a23bcbcf10b5f57018c0d94b86af6947231fbb236161e0a4d3dbfd9d1c`, passed both
+nominal 300-second ten-market cells on runner `998d1eb`, generator `9c210f31`,
+cap200/rate76000, DEPTH1/BODYFETCH1 and ENGINE0/MATCH18/SETTLE18. Only the fixed-key
+flag changed. `s60-fixed-keys-off-10m-r1` averaged 32,786.3 fills/s over 312 seconds;
+`s60-fixed-keys-on-10m-r1` averaged 40,819.2 over 308 seconds. Both were ACCEPT,
+PASS/AGREE and dissemination-clean, with drains of 105/104 seconds. Commit-interval
+p95 was 4,187.0/3,779.7 ms. Val0 pass B was 155.80/104.01 ms per native block over
+bench plus drain, and engine time per 1,000 fills was 15.70/11.97 ms.
+
+The +24.5% observed difference is promising but needs reversed-order repeats:
+other phases also changed, and the preceding margin-only run already reached
+38,610.6. Keep default OFF; do not attribute the entire difference to allocation
+removal or claim abrupt-crash qualification. ON's best minute, 56,509.4 fills/s,
+is supplemental, not the full-window result. All logs, metrics, digests and frozen
+binaries were retained before authorized completed-database cleanup.
+
+The owner requested stopping after this comparison. Next session should repeat
+ON then OFF before promotion and continue deeper-book and burst-recovery cells.
