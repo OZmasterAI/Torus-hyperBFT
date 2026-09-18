@@ -180,6 +180,12 @@ fn parse_shard_custody_toggle(raw: Option<String>) -> bool {
     }
 }
 
+/// Experimental proposer-only exact-byte DA reuse. Default OFF; resolved once
+/// per app so the control and candidate can use the same binary.
+fn parse_proposal_da_ensure_toggle(raw: Option<String>) -> bool {
+    matches!(raw.as_deref().map(str::trim), Some("1"))
+}
+
 /// Item 3 (perf/matched-200k): `TORUS_ASYNC_VALIDATE=1` moves the heavy stage of
 /// `validate_block` (decode + DA durability + EVM decode + sig/attest verify) off
 /// the hotstuff-algo thread onto the `torus-async-validate` worker, fed at body
@@ -2262,6 +2268,7 @@ pub struct TorusApp {
     mempool: Option<Arc<Mempool>>,
     #[allow(dead_code)]
     signing_key: Option<ed25519_dalek::SigningKey>,
+    proposal_da_ensure: bool,
     exec_tx: Option<SyncSender<CommittedBlockMsg>>,
     exec_handle: Option<JoinHandle<()>>,
     /// T1.5 fail-stop latch, shared with the execution pipeline thread. Once
@@ -3208,6 +3215,9 @@ impl TorusApp {
             signing_key,
             metrics,
             mempool,
+            proposal_da_ensure: parse_proposal_da_ensure_toggle(
+                std::env::var("TORUS_PROPOSAL_DA_ENSURE").ok(),
+            ),
             exec_tx: Some(exec_tx),
             exec_handle: Some(exec_handle),
             exec_failed,
@@ -3231,6 +3241,10 @@ impl TorusApp {
         // states — an unlogged knob makes bench results un-analyzable
         // (TORUS_MATCH_WORKERS lesson). Default OFF = synchronous validation.
         let async_validate = async_validate_enabled();
+        tracing::info!(
+            enabled = app.proposal_da_ensure,
+            "TORUS_PROPOSAL_DA_ENSURE resolved at startup (proposer exact-byte DA reuse)"
+        );
         log_async_validate_resolution(async_validate);
         if async_validate {
             app.enable_async_validate();
@@ -3913,8 +3927,9 @@ impl Drop for TorusApp {
 }
 
 impl TorusApp {
-    /// S459 proposer guarantee. Durably mirror every selected native body to THIS
-    /// node's DA store before it can be referenced by our proposal. On success the
+    /// S459 proposer guarantee. Ensure every selected native body is in THIS
+    /// node's DA store before it can be referenced by our proposal. Default:
+    /// unconditional mirror; experimental flag: exact-byte reuse. On success the
     /// selection is returned unchanged; on a durable-write failure the batch is
     /// re-queued (inside `mirror_native_to_da`) and this returns an EMPTY selection
     /// so `produce_block` proposes empty-native this view — a block that cannot wedge
@@ -3932,7 +3947,23 @@ impl TorusApp {
         };
         let actions: Vec<torus_types::SignedNativeAction> =
             native_with_senders.iter().map(|(_, a)| a.clone()).collect();
-        match mempool.mirror_native_to_da(&actions) {
+        let mirrored = if self.proposal_da_ensure {
+            let started = std::time::Instant::now();
+            mempool.ensure_native_da(&actions).map(|stats| {
+                tracing::info!(
+                    bodies_checked = stats.bodies_checked,
+                    bytes_read = stats.bytes_read,
+                    bodies_written = stats.bodies_written,
+                    bytes_written = stats.bytes_written,
+                    read_fallback_chunks = stats.read_fallback_chunks,
+                    elapsed_us = started.elapsed().as_micros() as u64,
+                    "proposer native DA ensure complete"
+                );
+            })
+        } else {
+            mempool.mirror_native_to_da(&actions)
+        };
+        match mirrored {
             Ok(()) => {
                 // T5 (recovery-path erasure): the whole-body mirror above is the
                 // durability guarantee; ADDITIONALLY custody erasure shards so a
@@ -8641,6 +8672,73 @@ mod crash_recovery_tests {
                 "every proposed body must be durable in the DA store after mirror_or_drop_native"
             );
         }
+    }
+
+    #[test]
+    fn proposal_da_ensure_defaults_off_and_only_one_enables() {
+        for raw in [None, Some("0"), Some("true"), Some("")] {
+            assert!(!parse_proposal_da_ensure_toggle(raw.map(str::to_owned)));
+        }
+        assert!(parse_proposal_da_ensure_toggle(Some(" 1 ".into())));
+    }
+
+    #[test]
+    fn proposal_da_ensure_keeps_bodies_and_drops_on_write_failure() {
+        let (config, state_db) = make_test_config_and_db();
+        let actions = vec![sign_claim_rewards(1), sign_claim_rewards(2)];
+        let selected: Vec<_> = actions
+            .iter()
+            .map(|a| (a.recover_sender().unwrap(), a.clone()))
+            .collect();
+        let pool = Arc::new(Mempool::new(
+            state_db.clone(),
+            torus_mempool::MempoolConfig::default(),
+        ));
+        let mut app = TorusApp::new(state_db.clone(), &config, None, Some(pool.clone()), None);
+        app.proposal_da_ensure = true;
+        assert_eq!(
+            app.mirror_or_drop_native(selected.clone()).len(),
+            actions.len()
+        );
+        for action in &actions {
+            assert!(pool
+                .get_native_da(&torus_types::compute_action_hash(action))
+                .is_some());
+        }
+
+        // Separate read-only DA handle makes an actual missing-body write fail.
+        let (_readonly_config, readonly_db) = make_test_config_and_db();
+        torus_state::NativeDaStore::new(readonly_db.clone())
+            .put_batch(&actions)
+            .unwrap();
+        let path = readonly_db.inner().path().to_path_buf();
+        drop(readonly_db);
+        let readonly = StateDb::open_read_only(&path).unwrap();
+        let failed_pool = Arc::new(Mempool::new(
+            readonly,
+            torus_mempool::MempoolConfig::default(),
+        ));
+        app.mempool = Some(failed_pool.clone());
+        app.proposal_da_ensure = false;
+        assert!(
+            app.mirror_or_drop_native(selected.clone()).is_empty(),
+            "flag-off still does its unconditional write"
+        );
+        app.proposal_da_ensure = true;
+        assert_eq!(
+            app.mirror_or_drop_native(selected).len(),
+            actions.len(),
+            "verified existing bytes need no write"
+        );
+        let missing = sign_claim_rewards(3);
+        assert!(app
+            .mirror_or_drop_native(vec![(missing.recover_sender().unwrap(), missing)])
+            .is_empty());
+        assert_eq!(
+            failed_pool.da_flush_failures(),
+            2,
+            "both failed writes queue their full batches"
+        );
     }
 
     /// T8-integration piece 4 (RED-first): a VALIDATING peer that decodes a full
