@@ -718,3 +718,38 @@ allowlist for BAND/CROSS_FRACTION/CANCEL_FRACTION/MPS/RATE_SCHEDULE/DEPTH_OBSERV
 Five parser fixtures covered accepted/default mappings and unsupported/malformed/
 duplicate rejection before launch. Both WAL arms used the same updated driver
 SHA256 `f2f7d1e9b6dd065e3c3a86171b0294b03142af0d70e23a83b7a50df64a887e95`.
+
+### Worker screening and balance-cache qualification
+
+The worker trials use the same frozenb60097a binary and MAIN8bfe6d7 runner,
+old generator, nominal120s/10market/cap200/76000requested actions/s, and
+BODY_FETCH_TRACE=1. Settlement stays explicitly capped at18 throughout.
+
+| Run | Matching cap | Preparation workers | Verdict | Fills/s | Load seconds | Drain seconds | Peak queue | Commit p95 ms |
+| --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| s60-workers18-engine0-cap200-r1 | 18 | 0 | ACCEPT | 43,619.4 | 128 | 68 | 57 | 3690.7 |
+| s60-workers4-engine0-cap200-r1 | 4 | 0 | ACCEPT | 38,213.0 | 129 | 41 | 63 | 3883.3 |
+| s60-workers18-engine4-cap200-r1 | 18 | 4 | ACCEPT | 34,202.9 | 129 | 68 | 14 | 4437.3 |
+
+All passed liveness, quiescent agreement and clean dissemination. Neither
+treatment establishes an improvement. ENGINE4 had slow idle probes0.3/1.7blocks/s,
+versus25.9 and29.6 in the other cells; its best60 of55,752.4 does not describe
+full-window throughput. Keep matching's existing cap and preparation disabled.
+The same baseline runtime now has widely varying healthy results; these single
+screening arms do not establish causal regressions or a hardware ceiling.
+
+An isolated additional candidate, `e4340d8` on `perf/balance-cache-inplace`, updates
+one borrowed cached balance entry and stores its dirty flag beside the value,
+removing repeated map reinsertion and dirty-set hashing. It retains the small
+temporary scalar copy to preserve panic atomicity, every mutation's canonical
+order, read-error retries, clean rejected reservations, zero-event writes,
+disjoint sender merges and full-set retry after partial flush failure.
+
+Five focused and37 integration release tests plus a separate node-only build
+passed receipt `fc9af5df-634d-4b13-8823-a02c02fd5485`; independent review found no
+blocker. Frozen `balance-cache-inplace` node SHA256
+`cb54f9bf150af6f2e33e608d8921ebb58944fbdb7ca00669bb7d1b3c1b82c48c` is recorded in the artifact
+manifest; the new CachedBalance production
+symbol was confirmed with nm. No speed result yet. The main tradeoff is scanning
+all cached entries at flush, including clean rejected senders, and possible
+extra entry padding; rejection-heavy workloads need consideration.
