@@ -322,9 +322,14 @@ All 92 HotStuff library tests and a separate node-only release build passed
 (receipt `7ce69082-16c3-407f-9625-86d3d4579fae`). Neither source fix proves
 the cause of the retained stall. Frozen node SHA256:
 `0c45c479bdeac981f48aa0f016d99d3e8d42376c131fc1400f1c49b0a02bcdd7`.
-The unchanged generator is retained. `s60-viewbound-replay45-r1` is the pending
-short crash qualification with `TORUS_WEDGE_DIAG=1`; its result must be assessed
-separately from throughput acceptance.
+The unchanged generator is retained. `s60-viewbound-replay45-r1` used
+`TORUS_WEDGE_DIAG=1`, nominal45s/actual60s, and kill+15s. It completed drain
+in57s with final AGREE and clean dissemination. No replay gap occurred
+(worker attached at586, pre-kill execution/flush queues both0), so its strict
+crash verdict is FAIL and overall verdict REJECT. Liveness is UNKNOWN after
+the restart counter reset. This is observed healthy restart/drain in one run,
+not positive-replay qualification, proof of the older stall's cause, or an
+accepted throughput comparison. The pipeline remains default OFF.
 
 The cancellation mechanism experiment now has two independent fixture-seed
 runs: five deep levels with 16 middle targets per level gave paired baseline/
@@ -335,3 +340,12 @@ multilevel gate is isolated on `perf/cancel-level-compaction`, with 11 passing
 differential tests (receipt `68ec19a1-b0b6-4b67-90b2-c6735d8e6e2d`). Its actual
 gated-path timing and whole-chain acceptance remain pending. These microbench
 ratios are not matched-throughput gains.
+
+
+After retaining the second short recovery cell, free space is about13GiB.
+The live-run capacity guard now prevents further cells. No campaign database
+has been deleted or flushed. A separate default-off WAL-budget candidate for
+newly created databases is being prepared; it cannot reclaim existing retained
+data and its soft flush trigger is not a guaranteed disk bound. Larger repeat
+and varied-load matrices remain pending storage capacity/retention and remote
+host details.
