@@ -655,7 +655,15 @@ where
 /// the ordered vectors preserves the completeness gate without rehashing bodies.
 fn cached_matches_compact(cached: &PendingProposal, compact: &CompactBlock) -> bool {
     cached.block.native_actions.len() == compact.native_action_hashes.len()
-        && cached.native_action_hashes() == compact.native_action_hashes.as_slice()
+        && match cached.native_action_hashes.get() {
+            Some(hashes) => hashes == &compact.native_action_hashes,
+            // The commit path immediately consumes this entry. A cold cache
+            // has no future reuse here: preserve streaming mismatch rejection
+            // and avoid allocating an otherwise unused vector.
+            None => cached.block.native_actions.iter()
+                .map(torus_types::compute_action_hash)
+                .eq(compact.native_action_hashes.iter().copied()),
+        }
 }
 
 /// A proposal body and its ordered content addresses share one lifetime. The
@@ -7896,6 +7904,14 @@ mod crash_recovery_tests {
         let shorter = PendingProposal::new(make_block(7, vec![sign_claim_rewards(1)]));
         assert!(!cached_matches_compact(&shorter, &committed));
         assert!(shorter.native_action_hashes.get().is_none());
+        let cold = PendingProposal::new(block.clone());
+        assert!(cached_matches_compact(&cold, &committed));
+        assert!(cold.native_action_hashes.get().is_none());
+        cold.native_action_hashes();
+        assert!(cached_matches_compact(&cold, &committed));
+        let mut reordered_compact = committed.clone();
+        reordered_compact.native_action_hashes.swap(0, 1);
+        assert!(!cached_matches_compact(&cold, &reordered_compact));
         assert!(cached_matches_compact(
             &PendingProposal::new(block.clone()),
             &committed
