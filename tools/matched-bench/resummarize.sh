@@ -7,7 +7,7 @@ j() { jq -r "$@" "$D/summary.json"; }
 python3 "$T/summarize.py" --out "$D" --label "$(j .label)" --worktree "$(j .worktree)" --commit "$(j .commit)" \
   --dirty "$(j .dirty_files)" --markets "$(j .cell.markets)" --dur "$(j .cell.duration_s)" --rate "$(j .cell.rate_total)" \
   --senders "$(j .cell.senders)" --t-bench0 "$(j .timing.t_bench0)" --t-bench1 "$(j .timing.t_bench1)" \
-  --t-drain "$(j .timing.t_drain)" --drained "$([ "$(j .timing.drained)" = true ] && echo 1 || echo 0)" \
+  --t-drain "$(j .timing.t_drain)" --drained "$([ "$(j '.timing.drained_reported // .timing.drained')" = true ] && echo 1 || echo 0)" \
   --bench-rc "$(j .timing.bench_rc)" --idle-blks "$(j .idle_blk_s)" --md5-node "$(j .binaries.torus_node_md5)" \
   --md5-bench "$(j .binaries.bench_throughput_md5)" --genesis-md5 "$(j .genesis.md5)" --genesis-markets "$(j .genesis.markets)" \
   --genesis-accounts "$(j .genesis.native_balances)" --node-env "$(jq -c .cell.node_env "$D/summary.json")" \

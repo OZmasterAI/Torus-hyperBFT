@@ -14,6 +14,7 @@ thread's own timer, so counting worker ms into it drives residual_untimed
 negative and the percentages past 100 %.
 """
 import argparse, csv, json, os, statistics, sys, time
+from health import assess_liveness, acceptance, DEFAULT_STALL_S
 
 ap = argparse.ArgumentParser()
 for a in ["out", "label", "worktree", "commit", "dirty", "markets", "dur", "rate", "senders",
@@ -888,7 +889,11 @@ if dissem:
     dissem["total_body_pushes"] = sum((d.get("body_push") or 0) for n, d in dissem.items() if n.startswith("val"))
     dissem["body_push_max_bytes"] = max([(d.get("body_push_max_bytes") or 0) for n, d in dissem.items() if n.startswith("val")] or [0])
     dissem["total_pacing_lines"] = sum((d.get("pacing") or 0) for n, d in dissem.items() if n.startswith("val"))
-    dissem["dissemination_clean"] = dissem["total_failures"] == 0
+    evidence_complete = all(
+        isinstance(dissem.get(n, {}).get(k), int) and dissem[n][k] >= 0
+        for n in ('val0', 'val1', 'val2') for k in fail_keys)
+    dissem["dissemination_clean"] = (False if dissem["total_failures"] > 0 else
+                                     True if evidence_complete else None)
 
 # ---------------------------------------------------------------- cpu
 cpu = {}
@@ -916,8 +921,15 @@ except OSError:
     pass
 
 v0 = funnel.get("val0", {})
+liveness = assess_liveness(rows, t0, td, DEFAULT_STALL_S)
+# Keep the runner's historical observation for audit, but a known stall cannot
+# count as a successfully drained performance cell. Agreement stays independent.
+drained = A.drained == "1" and liveness['verdict'] != 'FAIL'
+validity = acceptance(liveness, drained, int(A.bench_rc or -1),
+                      agreement.get('agreement_verdict'),
+                      dissem.get('dissemination_clean'), crash)
 summary = {
-    "status": "OK" if (A.bench_rc == "0" and v0) else "DEGRADED",
+    "status": "OK" if validity['accepted'] else "INVALID" if validity['verdict'] == 'REJECT' else "UNVERIFIED",
     "label": A.label, "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
     "worktree": A.worktree, "commit": A.commit, "dirty_files": int(A.dirty or 0),
     "binaries": {"torus_node_md5": A.md5_node, "bench_throughput_md5": A.md5_bench},
@@ -928,7 +940,7 @@ summary = {
              "extra_env": A.extra_env, "node_env": NODE_ENV,
              "env_digests_per_node": A.env_digests.split(), "bench_cmd": A.bench_cmd, "node_pids": A.pids.split()},
     "timing": {"t_bench0": t0, "t_bench1": t1, "t_drain": td, "bench_wall_s": t1 - t0, "drain_s": td - t1,
-               "drained": A.drained == "1", "drain_timeout_s": int(A.drain_timeout) if A.drain_timeout else None,
+               "drained": drained, "drained_reported": A.drained == "1", "drain_timeout_s": int(A.drain_timeout) if A.drain_timeout else None,
                "bench_rc": int(A.bench_rc or -1)},
     "idle_blk_s": float(A.idle_blks or 0),
     "headline": {
@@ -965,6 +977,8 @@ summary = {
         "dissemination_clean": dissem.get("dissemination_clean") if dissem else None,
         "validators_agree": agreement.get("validators_agree"),
         "agreement_verdict": agreement.get("agreement_verdict"),
+        "liveness_verdict": liveness['verdict'],
+        "benchmark_accepted": validity['accepted'],
         "exec_resident_rebuilds": agreement.get("resident_rebuilds_per_node"),
         # bl3 crash gate: None on a cell that did not run it.
         "crash_gate": crash.get("verdict") if crash else None,
@@ -978,6 +992,8 @@ summary = {
     "consensus_by_node": consensus,
     "sched_by_node": sched,
     "agreement": agreement,
+    "liveness": liveness,
+    "validity": validity,
     "crash": crash,
     "dissemination": dissem,
     "cpu": cpu,
@@ -994,6 +1010,8 @@ print(f"SUMMARY {A.label}: matched/s avg={h['matched_s_avg']} first120={h['match
       f"resident_rebuilds={h['exec_resident_rebuilds']} "
       f"digest_s={agreement.get('state_digest_seconds_per_node')} "
       f"drained={summary['timing']['drained']} bench_rc={A.bench_rc}")
+print(f"VALIDITY {A.label}: {validity['verdict']} liveness={liveness['verdict']} "
+      f"reasons={validity['fail_reasons'] + validity['unverified_reasons']}")
 if crash:
     print(f"CRASH val{crash.get('kill_idx')}: verdict={crash['verdict']} "
           f"kill_at={crash.get('kill_at_s')}s down={crash.get('down_s')}s "

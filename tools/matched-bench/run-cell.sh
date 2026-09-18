@@ -444,10 +444,17 @@ FUNNEL_COLS="torus_native_actions_processed_total torus_orders_placed_accepted_t
 PHASE_COLS="torus_blocks_committed_total torus_block_height torus_orders_placed_accepted_total torus_orders_matched_total torus_orders_resting_total torus_exec_resting_orders torus_exec_load_books_seconds_sum torus_exec_load_books_seconds_count torus_exec_root_seconds_sum torus_exec_root_seconds_count torus_exec_state_write_seconds_sum torus_exec_state_write_seconds_count torus_exec_state_write_build_seconds_sum torus_exec_state_write_build_seconds_count torus_exec_state_write_db_seconds_sum torus_exec_state_write_db_seconds_count torus_exec_state_write_batch_bytes_sum torus_exec_state_write_batch_bytes_count torus_exec_evm_resync_seconds_sum torus_exec_evm_resync_seconds_count torus_exec_flush_seconds_sum torus_exec_flush_seconds_count torus_exec_root_dirty_buckets_sum torus_exec_root_dirty_buckets_count torus_exec_queue_depth torus_exec_root_bucket_scans_total torus_member_cache_hits_total torus_member_cache_misses_total torus_member_cache_evictions_total torus_member_cache_resident_buckets"
 WIDE_COLS="torus_blocks_committed_total torus_block_height torus_native_actions_processed_total torus_orders_placed_accepted_total torus_orders_matched_total torus_orders_resting_total torus_exec_resting_orders torus_orders_rejected_margin_total torus_orders_rejected_book_total torus_orders_rejected_cancelled_total torus_orders_rejected_other_total torus_exec_queue_depth torus_mempool_native_size torus_exec_block_seconds_sum torus_exec_block_seconds_count torus_exec_engine_seconds_count torus_exec_verify_seconds_count torus_exec_flush_seconds_count torus_exec_evm_seconds_sum torus_exec_verify_seconds_sum torus_exec_replay_guard_seconds_sum torus_exec_load_books_seconds_sum torus_exec_engine_seconds_sum torus_exec_phase_margin_seconds_sum torus_exec_phase_match_seconds_sum torus_exec_phase_settle_seconds_sum torus_exec_phase1_actions_seconds_sum torus_exec_phase1_actions_seconds_count torus_exec_settle_pass_a_seconds_sum torus_exec_settle_pass_b_seconds_sum torus_exec_cache_flush_seconds_sum torus_exec_post_engine_tail_seconds_sum torus_exec_engine_untimed_seconds_sum torus_exec_engine_untimed_seconds_count torus_exec_save_books_seconds_sum torus_exec_flush_seconds_sum torus_exec_root_seconds_sum torus_exec_state_write_seconds_sum torus_exec_state_write_build_seconds_sum torus_exec_state_write_build_seconds_count torus_exec_state_write_db_seconds_sum torus_exec_state_write_db_seconds_count torus_exec_state_write_batch_bytes_sum torus_exec_state_write_batch_bytes_count torus_exec_evm_resync_seconds_sum torus_exec_body_persist_seconds_sum torus_exec_root_dirty_buckets_sum torus_exec_root_dirty_buckets_count torus_exec_root_bucket_scans_total torus_member_cache_evictions_total torus_commit_interval_seconds_sum torus_commit_interval_seconds_count torus_exec_chain_seconds_sum torus_exec_chain_seconds_count torus_exec_handoff_wait_seconds_sum torus_exec_handoff_wait_seconds_count torus_flush_worker_seconds_sum torus_flush_worker_seconds_count torus_flush_worker_depth torus_exec_save_books_seconds_count torus_exec_save_books_drain_seconds_sum torus_exec_save_books_drain_seconds_count torus_exec_save_books_write_seconds_sum torus_exec_save_books_write_seconds_count torus_exec_native_blocks_total torus_consensus_timeout_total_total torus_consensus_view torus_block_transactions_count_sum torus_block_transactions_count_count torus_native_gossip_published_actions_total torus_native_gossip_dropped_full_total torus_rocksdb_memtable_bytes torus_rocksdb_l0_files torus_rocksdb_pending_compaction_bytes torus_db_size_bytes torus_exec_body_persist_write_seconds_sum torus_exec_body_persist_write_seconds_count torus_commit_persist_seconds_sum torus_commit_persist_seconds_count torus_commit_body_encode_seconds_sum torus_commit_persist_write_seconds_sum torus_trade_writer_queued_batches torus_rocksdb_memtable_bytes_all torus_rocksdb_immutable_memtables_all torus_rocksdb_l0_files_max torus_rocksdb_pending_compaction_bytes_all torus_rocksdb_delayed_write_rate torus_rocksdb_write_stopped torus_rocksdb_running_compactions torus_rocksdb_running_flushes torus_rocksdb_stall_micros torus_rocksdb_write_self torus_rocksdb_write_other torus_rocksdb_bytes_written torus_rocksdb_wal_bytes torus_rocksdb_flush_write_bytes torus_rocksdb_compact_read_bytes torus_rocksdb_compact_write_bytes torus_rocksdb_compaction_cpu_micros torus_rocksdb_db_write_count torus_rocksdb_db_write_sum_micros torus_rocksdb_db_write_p99_micros torus_rocksdb_db_write_max_micros torus_rocksdb_write_stall_count torus_rocksdb_write_stall_sum_micros torus_rocksdb_write_stall_p99_micros torus_rocksdb_write_stall_max_micros torus_rocksdb_flush_count torus_rocksdb_flush_sum_micros torus_rocksdb_compaction_count torus_rocksdb_compaction_sum_micros torus_view_duration_seconds_sum torus_view_duration_seconds_count torus_view_propose_delay_seconds_sum torus_view_propose_delay_seconds_count torus_view_propose_build_seconds_sum torus_view_propose_build_seconds_count torus_view_propose_finalize_seconds_sum torus_view_propose_finalize_seconds_count torus_view_qc_collect_seconds_sum torus_view_qc_collect_seconds_count torus_view_proposal_arrival_seconds_sum torus_view_proposal_arrival_seconds_count torus_view_insert_persist_seconds_sum torus_view_insert_persist_seconds_count torus_view_vote_delay_seconds_sum torus_view_vote_delay_seconds_count torus_block_build_seconds_sum torus_block_build_seconds_count torus_validate_block_seconds_sum torus_validate_block_seconds_count torus_validate_block_decode_seconds_sum torus_validate_block_decode_seconds_count torus_validate_block_da_reconstruct_seconds_sum torus_validate_block_da_reconstruct_seconds_count torus_validate_block_attest_seconds_sum torus_validate_block_attest_seconds_count torus_validate_block_custody_seconds_sum torus_validate_block_custody_seconds_count torus_on_committed_block_seconds_sum torus_on_committed_block_seconds_count torus_mempool_remove_committed_seconds_sum torus_mempool_remove_committed_seconds_count"
 
-extract() { # stdin=metrics text, $1=space-separated metric names -> csv values (0 if absent)
-    awk -v names="$1" 'BEGIN{n=split(names,a," "); for(i=1;i<=n;i++) want[a[i]]=1}
+extract() { # Missing optional metrics remain 0; scrape_valid preserves health evidence.
+    awk -v names="$1" 'BEGIN{
+            n=split(names,a," "); for(i=1;i<=n;i++) want[a[i]]=1;
+            nr=split("torus_blocks_committed_total torus_mempool_native_size torus_exec_queue_depth torus_flush_worker_depth torus_orders_placed_accepted_total torus_orders_matched_total torus_native_actions_processed_total torus_orders_resting_total",req," ");
+        }
         ($1 in want){v[$1]=$2}
-        END{for(i=1;i<=n;i++) printf "%s%s", (i>1?",":""), (a[i] in v ? v[a[i]] : 0); printf "\n"}'
+        END{
+            valid=1; for(i=1;i<=nr;i++) if(!(req[i] in v) || v[req[i]] !~ /^[0-9]+([.][0-9]+)?([eE][+-]?[0-9]+)?$/) valid=0;
+            v["scrape_valid"]=valid;
+            for(i=1;i<=n;i++) printf "%s%s", (i>1?",":""), (a[i] in v ? v[a[i]] : 0); printf "\n";
+        }'
 }
 
 # bl1 exec-chain-sub-100-attribution: histogram BUCKET series in LONG format
@@ -467,6 +474,7 @@ extract_buckets() { # stdin=metrics text, $1=bucket metric names, $2=ts, $3=node
         }'
 }
 
+WIDE_COLS="$WIDE_COLS scrape_valid"
 echo "ts,node,$(echo $WIDE_COLS | tr ' ' ',')" > "$OUT/sampler.csv"
 echo "ts,node,metric,le,count" > "$OUT/buckets.csv"
 for i in 0 1 2; do
@@ -540,36 +548,18 @@ mapfile -t PIDS_NOW < "$RUN_DIR/pids"; schedstat_snapshot bench_end "${PIDS_NOW[
 log "bench exited rc=$BENCH_RC after $((T_BENCH1 - T_BENCH0))s"
 
 # ---------------------------------------------------------------- 7. drain
-# The mempool/exec-queue gauges can read 0 while actions are still in flight
-# (forward batcher, deferred-exec park, consensus stalls), so "drained" means:
-# placed/matched/actions/resting counters UNCHANGED on all 3 nodes for QUIET_S
-# consecutive polls. Idle empty blocks keep flowing (exec queue may read 1-2).
+# Counter quiescence alone also describes a wedged chain. Require complete
+# scrapes, quiet native counters, no pending native/flush work, and commit
+# progress on every validator during the quiet interval. Empty blocks may leave
+# the execution queue at 1-2. health.py retains all drain observations.
 QUIET_S=${QUIET_S:-10}
-log "draining (order/action counters quiescent for ${QUIET_S}s on all nodes, timeout ${DRAIN_TIMEOUT}s)"
-td=$(date +%s); DRAINED=0; stable=0; prev=""
-while [ $(( $(date +%s) - td )) -lt "$DRAIN_TIMEOUT" ]; do
-    cur=""; q=0
-    for i in 0 1 2; do
-        M=$(scrape_one "${METS[$i]}") || M=""
-        cur="$cur|$(printf '%s' "$M" | extract "torus_orders_placed_accepted_total torus_orders_matched_total torus_native_actions_processed_total torus_orders_resting_total")"
-        # bl1 exec-chain-sub-100-attribution: with a flush worker
-        # (TORUS_EXEC_PIPELINE) the funnel counters can go quiet while a block's
-        # state batch is still undurable on the worker. The determinism digest
-        # and the RPC state it reads must never be taken in that window, so the
-        # drain also requires an IDLE worker on every node. Identically 0 on a
-        # serial binary (and on a pre-bl1 binary, where the gauge is absent and
-        # `mval` yields 0), so this cannot change existing behaviour.
-        wd=$(printf '%s' "$M" | mval torus_flush_worker_depth); wd=${wd%%.*}
-        q=$(( q + ${wd:-0} ))
-    done
-    # (exec_queue_depth is NOT required to be 0: idle empty blocks keep it at 1-2)
-    if [ "$cur" = "$prev" ]; then stable=$((stable+1)); else stable=0; fi
-    prev="$cur"
-    [ "$stable" -ge "$QUIET_S" ] && [ "$q" = 0 ] && { DRAINED=1; break; }
-    sleep 1
-done
+log "draining (quiet counters, no pending work, per-node commit progress for ${QUIET_S}s; timeout ${DRAIN_TIMEOUT}s)"
+DRAINED=0
+if python3 "$TOOLS_DIR/health.py" drain --out "$OUT" --timeout "$DRAIN_TIMEOUT" --quiet "$QUIET_S" \
+    --urls "http://127.0.0.1:${METS[0]}/metrics" "http://127.0.0.1:${METS[1]}/metrics" "http://127.0.0.1:${METS[2]}/metrics" \
+    >>"$OUT/run.log" 2>&1; then DRAINED=1; fi
 T_DRAIN=$(date +%s)
-log "drained=$DRAINED after $((T_DRAIN - T_BENCH1))s (flush_worker_depth sum across nodes: ${q:-0})"
+log "drained=$DRAINED after $((T_DRAIN - T_BENCH1))s (evidence: drain.json and drain-samples.jsonl)"
 sleep 2
 kill "$SAMPLER_PID" 2>/dev/null; SAMPLER_PID=""
 kill "$CPU_PID" 2>/dev/null; CPU_PID=""
@@ -670,14 +660,8 @@ log "ingest: bench submitted=${BENCH_SUBMITTED:-?} actions; mempool nonce-expire
 #   da_outbound_fail = native-da / block-data OUTBOUND FAILURE
 #   starvation = header-first body starvation
 #   pacing = exec-backlog pacing lines (selection caps scaled down / cancels-only)
-DISSEM=""
-for i in 0 1 2; do
-    lg=$(sed -E 's/\x1b\[[0-9;]*m//g' "$RUN_DIR/val$i.log" 2>/dev/null)
-    cnt() { printf '%s' "$lg" | grep -c -E "$1"; }
-    bpmax=$(printf '%s' "$lg" | grep -E 'FULL-BODY push' | grep -oE 'bytes=[0-9]+' | cut -d= -f2 | sort -n | tail -1); bpmax=${bpmax:-0}
-    DISSEM="$DISSEM val$i:manifest=$(cnt 'HASH-ONLY manifest push'),body_push=$(cnt 'FULL-BODY push'),body_push_max_bytes=$bpmax,exhausted=$(cnt 'body fetch (exhausted|has no remaining targets)'),sync_fallback=$(cnt 'falling back to sync'),da_outbound_fail=$(cnt '(native-da|block-data) OUTBOUND FAILURE'),starvation=$(cnt 'header-first body starvation'),pacing=$(cnt 'exec-backlog pacing')"
-done
-DISSEM=${DISSEM# }
+DISSEM=$(python3 "$TOOLS_DIR/collect_logs.py" --logs "$RUN_DIR/val0.log" "$RUN_DIR/val1.log" "$RUN_DIR/val2.log" \
+    --out "$OUT/log-summary.json") || { log "log collection failed"; exit 1; }
 log "dissemination/pacing log counts: $DISSEM"
 for i in 0 1 2; do
     grep -E ' ERROR | WARN |panicked|FAIL-STOP|fail-stop|book mode|resident|parallel|member cache|commit-lag|S470|manifest|FULL-BODY push|native block-selection caps|body fetch|OUTBOUND FAILURE|exec-backlog pacing' "$RUN_DIR/val$i.log" | head -400 > "$OUT/val$i.log.excerpt"
@@ -718,4 +702,7 @@ python3 "$TOOLS_DIR/summarize.py" \
     | tee -a "$OUT/run.log"
 rc=${PIPESTATUS[0]}
 log "done -> $OUT/summary.json"
-exit $rc
+[ "$rc" = 0 ] || exit "$rc"
+# A successful report write is not benchmark acceptance. Preserve artifacts and
+# return nonzero for stalled, undrained, inconsistent or unverified cells.
+python3 "$TOOLS_DIR/health.py" accept "$OUT/summary.json"

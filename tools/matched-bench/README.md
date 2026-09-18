@@ -22,7 +22,9 @@ own `summary.json` provenance.
 Example (record-cell shape, 5 min, 10 markets):
 
 ```
-CARGO_TARGET_DIR=/home/18c/.cargo-target-matched cargo build --release -p torus-node -p bench-throughput   # in the worktree, BEFORE — never while a bench runs
+# Build separately: a combined build unifies features and changes the node.
+CARGO_TARGET_DIR=/home/18c/.cargo-target-matched cargo build --release -p torus-node
+CARGO_TARGET_DIR=/home/18c/.cargo-target-matched cargo build --release -p bench-throughput
 tools/matched-bench/run-cell.sh /home/18c/projects/wt/matched-bench base-10m-r1 10 300 76000
 tools/matched-bench/run-cell.sh /home/18c/projects/wt/matched-bench nosettle-r1 10 300 76000 'TORUS_PARALLEL_SETTLE=0'
 ```
@@ -93,14 +95,14 @@ python3 tools/matched-bench/test_harness.py
    shape every campaign cell so far used. `MPS` needs a `bench-throughput` built
    at or after `cand/r6-harness-300m-digest-and-parity` — **rebuild the bench
    binary before using it.**
-8. Drain: waits until placed/matched/actions/resting counters are UNCHANGED on all
-   3 nodes for `QUIET_S` (10) consecutive seconds (the mempool / exec-queue
-   gauges alone read 0 while actions are still in flight — the first smoke run
-   proved that; idle empty blocks keep exec queue at 1-2, so it is not required
-   to be 0). `DRAIN_TIMEOUT` defaults to `180 + 2*MARKETS` s — 180 s is enough
-   at 10 markets and far too short at 300 (r6-base-300m-r1 ended `drained=0`
-   with ~20.8k nonce-expired evictions per node, and the digest taken on top of
-   that was worthless).
+8. Drain: requires complete scrapes and unchanged placed/matched/actions/resting
+   counters on all three nodes for `QUIET_S` (10) wall-clock seconds, plus empty
+   native mempools, idle flush workers, execution queues <=2, and at least one
+   new commit on **every** node during that quiet interval. Idle empty blocks
+   can leave 1–2 execution entries in flight. Missing metrics, counter resets,
+   or gaps over 5 seconds restart the interval. `drain-samples.jsonl` retains
+   observations and `drain.json` records the result. `DRAIN_TIMEOUT` defaults to
+   `180 + 2*MARKETS` seconds; reaching it does not establish drain.
 9. Agreement (`agreement.jsonl`): heights, block hash + header stateRoot at
    `min(height)-5` via `eth_getBlockByNumber` on every node, a sha256 state
    digest per node (every market's `torus_getOrderBook` + `torus_getOpenInterest`
@@ -410,3 +412,40 @@ the gate keeps its teeth independently of `agreement_verdict`.
 Artifacts: `crash-kill.json` (record at kill time), `crash-restart-tail.log`
 (everything the node logged after the restart), `crash.json` (the merged input
 to summarize.py).
+
+## Liveness and benchmark acceptance
+
+`AGREE` describes state consistency independently of performance acceptance.
+`liveness.verdict` checks all three validators over bench start through drain:
+30 seconds of unchanged commits with continuously pending work is `FAIL`, even
+if progress later resumes. Missing metrics, counter resets, gaps over 5 seconds,
+and incomplete window coverage are `UNKNOWN` unless a stall is already proven.
+A complete window with no commits fails even with empty pending-work gauges.
+The 30-second threshold is an operational rejection rule, not a calibrated
+performance-noise screen or a claim that shorter pauses are harmless.
+
+`validity.verdict` is `ACCEPT`, `REJECT`, or `UNVERIFIED`. Acceptance requires
+liveness PASS, established drain, successful load generation, AGREE, complete
+clean dissemination evidence, and a passing crash gate when present. The runner
+preserves results and exits **2** for rejected/unverified cells. Report creation
+and `resummarize.sh` can still succeed; use `health.py accept <summary.json>`
+when a report's acceptance should control a script's exit status. Crash-induced
+counter resets currently make performance liveness UNKNOWN; the separate crash
+verdict remains available.
+
+`timing.drained_reported` preserves the original runner observation; a proven
+stall clears `timing.drained`. Re-scoring cannot recover missing scrape evidence
+that an older sampler already replaced with zero. Copy historical results before
+re-scoring if their original summaries must be retained.
+
+`collect_logs.py` streams logs once for dissemination counts and records queue
+warning counts/bytes in `log-summary.json`. It avoids whole-log shell variables;
+it does not change node logging or repair dissemination failures.
+
+Regression checks (no devnet or build):
+
+```sh
+python3 tools/matched-bench/test_health.py
+python3 tools/matched-bench/test_summarize.py
+python3 tools/matched-bench/test_harness.py
+```
