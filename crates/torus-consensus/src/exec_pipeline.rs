@@ -164,6 +164,7 @@ pub struct FlushWorker {
     /// Test gate (None in production); released on drop so a failing test
     /// that leaves W parked fails instead of hanging the join.
     gate: Option<Arc<WorkerGate>>,
+    qualification: Option<Arc<crate::c1_qualification::Qualification>>,
 }
 
 /// Everything W needs to run a job; owned by the worker thread.
@@ -183,6 +184,15 @@ impl FlushWorker {
     /// Spawn W. `durable_height_seed` is the durable applied-height marker at
     /// construction (after boot replay — design §2.1 W.6).
     pub fn spawn(env: WorkerEnv, durable_height_seed: u64) -> Self {
+        Self::spawn_qualified(env, durable_height_seed, None)
+    }
+
+    /// Internal qualification seam; the public WorkerEnv literal API stays unchanged.
+    pub(crate) fn spawn_qualified(
+        env: WorkerEnv,
+        durable_height_seed: u64,
+        qualification: Option<Arc<crate::c1_qualification::Qualification>>,
+    ) -> Self {
         let (tx, rx) = sync_channel::<Job>(0);
         let shared = Arc::new(Shared {
             outstanding: Mutex::new(0),
@@ -192,15 +202,17 @@ impl FlushWorker {
         });
         let shared_w = shared.clone();
         let gate = env.gate.clone();
+        let qualification_w = qualification.clone();
         let handle = std::thread::Builder::new()
             .name("torus-flush-worker".into())
-            .spawn(move || worker_loop(rx, env, shared_w))
+            .spawn(move || worker_loop(rx, env, shared_w, qualification_w))
             .expect("spawn flush worker thread");
         Self {
             tx: Some(tx),
             handle: Some(handle),
             shared,
             gate,
+            qualification,
         }
     }
 
@@ -256,6 +268,7 @@ impl FlushWorker {
 
 impl Drop for FlushWorker {
     fn drop(&mut self) {
+        if let Some(q) = &self.qualification { q.invalidate("flush worker teardown"); }
         self.tx.take();
         if let Some(g) = &self.gate {
             g.release();
@@ -276,7 +289,10 @@ fn finish_job(shared: &Shared, metrics: &Option<Arc<torus_telemetry::Metrics>>) 
     shared.idle.notify_all();
 }
 
-fn worker_loop(rx: Receiver<Job>, env: WorkerEnv, shared: Arc<Shared>) {
+fn worker_loop(
+    rx: Receiver<Job>, env: WorkerEnv, shared: Arc<Shared>,
+    qualification: Option<Arc<crate::c1_qualification::Qualification>>,
+) {
     tracing::info!("flush worker thread started (TORUS_EXEC_PIPELINE)");
     while let Ok(job) = rx.recv() {
         let height = job.height();
@@ -286,6 +302,10 @@ fn worker_loop(rx: Receiver<Job>, env: WorkerEnv, shared: Arc<Shared>) {
         let inject_fail = env.gate.as_ref().is_some_and(|g| g.wait_open(height));
         let timer = std::time::Instant::now();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if let Some(q) = &qualification {
+                q.before_write(&env.state_db, height, matches!(job, Job::Flush { .. }))
+                    .map_err(JobError::Write)?;
+            }
             if inject_fail {
                 return Err(JobError::Write("injected write failure (test gate)".into()));
             }
@@ -328,6 +348,7 @@ fn worker_loop(rx: Receiver<Job>, env: WorkerEnv, shared: Arc<Shared>) {
                 return;
             }
             Err(_) => {
+                if let Some(q) = &qualification { q.invalidate("flush worker panic"); }
                 tracing::error!(height, "FATAL: flush worker PANICKED — latching fail-stop");
                 shared.failed.store(true, Ordering::SeqCst);
                 env.exec_failed.store(true, Ordering::SeqCst);

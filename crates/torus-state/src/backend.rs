@@ -568,6 +568,29 @@ impl NativeStateOverlay {
         self.parent.as_ref().map(|p| p.height)
     }
 
+    /// Qualification-only read with the same precedence as `get_cf_raw`.
+    /// Returns the parent height ONLY when that exact lookup supplied the value.
+    /// No observer is installed on ordinary reads. Callers must use the returned
+    /// bytes for their real decision, rather than performing a diagnostic probe.
+    pub fn get_cf_raw_with_parent_source(
+        &self, cf: &str, key: &[u8],
+    ) -> Result<(Option<Vec<u8>>, Option<u64>), StateError> {
+        if let Some(id) = intern_cf(cf) {
+            {
+                let state = self.pending.read().unwrap();
+                if let Some(hit) = state.lookup(id, key) {
+                    return Ok((hit.map(<[u8]>::to_vec), None));
+                }
+            }
+            if let Some(parent) = &self.parent {
+                if let Some(hit) = parent.state.lookup(id, key) {
+                    return Ok((hit.map(<[u8]>::to_vec), Some(parent.height)));
+                }
+            }
+        }
+        self.db.get_cf_raw(cf, key).map(|value| (value, None))
+    }
+
     /// Close this block: MOVE the pending set out into a [`FrozenPending`] tagged
     /// with `height`, leaving this overlay (and every clone sharing its Arc)
     /// empty and write-rejecting. The parent link is NOT carried into the frozen
@@ -1752,6 +1775,27 @@ mod tests {
             "batch_bytes {} must cover the 32 KiB of values written",
             stats.batch_bytes
         );
+    }
+
+    #[test]
+    fn qualification_parent_source_matches_real_read_precedence() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = StateDb::open(dir.path()).unwrap();
+        let cf = CF_NATIVE_BALANCES;
+        StateBackend::put_cf_raw(&db, cf, b"db", b"durable").unwrap();
+        StateBackend::put_cf_raw(&db, cf, b"deleted", b"durable").unwrap();
+        let parent = NativeStateOverlay::new(db.clone());
+        parent.put_cf_raw(cf, b"parent", b"pending").unwrap();
+        parent.delete_cf_raw(cf, b"deleted").unwrap();
+        let child = NativeStateOverlay::with_parent(db, Some(parent.freeze(5)));
+        child.put_cf_raw(cf, b"own", b"child").unwrap();
+        for (key, source) in [(b"db".as_slice(), None), (b"missing".as_slice(), None), (b"parent".as_slice(), Some(5)), (b"deleted".as_slice(), Some(5)), (b"own".as_slice(), None)] {
+            let observed = child.get_cf_raw_with_parent_source(cf, key).unwrap();
+            assert_eq!(observed.0, child.get_cf_raw(cf, key).unwrap());
+            assert_eq!(observed.1, source);
+        }
+        child.put_cf_raw(cf, b"parent", b"overridden").unwrap();
+        assert_eq!(child.get_cf_raw_with_parent_source(cf, b"parent").unwrap(), (Some(b"overridden".to_vec()), None));
     }
 
     // ---- bl2 exec pipeline: layered overlay (FrozenPending parent) ----

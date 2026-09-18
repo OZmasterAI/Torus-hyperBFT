@@ -565,6 +565,7 @@ struct ExecutionContext {
     /// Dropped with the ExecutionContext at exec-thread exit: drains + joins
     /// before `TorusApp::Drop` returns.
     flush_worker: Option<crate::exec_pipeline::FlushWorker>,
+    c1_qualification: Option<Arc<crate::c1_qualification::Qualification>>,
     /// bl2: E-owned LOGICAL applied height — the highest height handed to W
     /// (or 0). The skip-check uses `max(durable marker, exec_applied)` so a
     /// height re-delivered while its batch is still on W is skipped, not
@@ -1250,7 +1251,9 @@ impl ExecutionContext {
             exec_failed: self.exec_failed.clone(),
             gate,
         };
-        self.flush_worker = Some(crate::exec_pipeline::FlushWorker::spawn(env, applied));
+        self.flush_worker = Some(crate::exec_pipeline::FlushWorker::spawn_qualified(
+            env, applied, self.c1_qualification.clone(),
+        ));
         self.exec_applied.store(applied, Ordering::SeqCst);
         *self.last_job.lock().unwrap() = None;
         tracing::info!(
@@ -1410,6 +1413,9 @@ impl ExecutionContext {
             && !has_evm
             && pending_slashes.is_empty()
             && !EpochManager::is_epoch_boundary(height, self.epoch_length);
+        if let Some(q) = &self.c1_qualification {
+            if !q.check_eligibility(height, pipelined && has_native) { return; }
+        }
         if !pipelined && !self.pipeline_barrier() {
             tracing::error!(height, "FATAL: flush worker failed before barrier — fail-stop");
             return;
@@ -1559,6 +1565,11 @@ impl ExecutionContext {
                 parent.as_ref().map(|p| p.height())
             );
             let overlay = NativeStateOverlay::with_parent(self.state_db.clone(), parent);
+            if let Some(q) = &self.c1_qualification {
+                let marker = StateBackend::get_cf_raw(&overlay, CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT).ok().flatten();
+                let hash = alloy_primitives::keccak256(torus_block.header.canonical_header_bytes());
+                if !q.begin_child(&self.state_db, height, overlay.parent_height(), hash.as_slice(), marker, pipelined) { return; }
+            }
             let verify_timer = std::time::Instant::now();
             let resolved_senders = if has_native {
                 torus_types::eip712::batch_verify_native_actions_cached(
@@ -1650,10 +1661,18 @@ impl ExecutionContext {
                     continue;
                 };
                 let nonce_key = torus_state::cf::native_nonce_key(&sender, signed.nonce);
-                let already_committed =
+                let already_committed = if let Some(q) = self.c1_qualification.as_ref()
+                    .filter(|q| q.selected_nonce(height, &nonce_key)) {
+                    let (value, source) = match overlay.get_cf_raw_with_parent_source(torus_state::cf::CF_NATIVE_NONCES, &nonce_key) {
+                        Ok(read) => read,
+                        Err(_) => { q.invalidate("C1 real nonce read failed"); return; }
+                    };
+                    if !q.nonce_read(&self.state_db, height, &nonce_key, source, &value) { return; }
+                    value.is_some()
+                } else {
                     StateBackend::get_cf_raw(&overlay, torus_state::cf::CF_NATIVE_NONCES, &nonce_key)
-                        .unwrap_or(None)
-                        .is_some();
+                        .unwrap_or(None).is_some()
+                };
                 if already_committed || !seen_in_block.insert((sender, signed.nonce)) {
                     tracing::warn!(
                         %sender,
@@ -1837,6 +1856,11 @@ impl ExecutionContext {
             // the staleness guard rebuilds from the DB next block.
             ctx.stash_resident(&mut resident_books);
             drop(resident_books);
+            // No resident/trie mutex is held. READY is before child marker,
+            // freezing, or handoff, and can only end via SIGKILL/fail-stop.
+            if let Some(q) = &self.c1_qualification {
+                if !q.computed_child(&self.state_db, height) { return; }
+            }
 
             let flush_timer = std::time::Instant::now();
             for (sender, nonce) in &consumed_nonces {
@@ -3132,6 +3156,7 @@ impl TorusApp {
             )),
             // bl2: attached below, AFTER boot replay (design F4).
             flush_worker: None,
+            c1_qualification: None,
             exec_applied: AtomicU64::new(0),
             last_job: std::sync::Mutex::new(None),
         };
@@ -3160,6 +3185,14 @@ impl TorusApp {
         // (serial) boot replay — so the durable marker equals the replayed top
         // height before `exec_next_height` / manifest parking read it (design
         // §2.1 W.6, F4). `TORUS_EXEC_PIPELINE` unset ⇒ None ⇒ exact-today.
+        if std::env::var_os(crate::c1_qualification::ENV).is_some()
+            && !crate::exec_pipeline::exec_pipeline_enabled() {
+            panic!("C1 qualification requires explicitly enabled execution pipeline");
+        }
+        // Qualification is armed only AFTER serial boot replay, never during it.
+        exec_ctx.c1_qualification = crate::c1_qualification::Qualification::from_env(
+            &state_db, exec_failed.clone(), signing_key.as_ref().map(|key| key.verifying_key().to_bytes()),
+        ).unwrap_or_else(|error| panic!("invalid C1 qualification: {error}"));
         if crate::exec_pipeline::exec_pipeline_enabled() {
             exec_ctx.attach_flush_worker(None);
         }
@@ -9055,6 +9088,7 @@ mod crash_recovery_tests {
                 ),
             )),
             flush_worker: None,
+            c1_qualification: None,
             exec_applied: AtomicU64::new(0),
             last_job: std::sync::Mutex::new(None),
         }
@@ -11449,6 +11483,255 @@ mod crash_recovery_tests {
         drop(ctx2);
         assert_eq!(read_native_applied_height(&state_db), Some(3));
         assert_dumps_equal(&dump_ref, &dump_all_cfs(&state_db), "replay after crash vs serial");
+    }
+
+    // Deterministic C1: actual nonce read from pending native block5 while W
+    // is parked before its atomic write, then real process kill + serial replay.
+    fn c1_config(evidence: std::path::PathBuf, timeout: std::time::Duration) -> crate::c1_qualification::Config {
+        let block = pipeline_fixture_blocks().remove(4);
+        let action = &block.native_actions[0];
+        crate::c1_qualification::Config {
+            run_id: "c1-fixture".into(), validator: "00".repeat(32), parent: 5,
+            nonce_key: torus_state::cf::native_nonce_key(&action.recover_sender().unwrap(), action.nonce).to_vec(),
+            evidence, timeout,
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn c1_pending_parent_subprocess_child() {
+        let Some(root) = std::env::var_os("C1_FIXTURE_ROOT") else { return; };
+        let root = std::path::PathBuf::from(root);
+        let mode = std::env::var("C1_FIXTURE_MODE").unwrap();
+        assert!(std::env::var_os(crate::c1_qualification::ENV).is_none(), "restart must explicitly disable arming");
+        let path = root.join("db");
+        if mode == "park" {
+            assert!(!path.exists(), "park fixture requires a NEW database");
+            let db = StateDb::open(&path).unwrap();
+            fund_pipeline_fixture(&db);
+            let mut ctx = pipeline_ctx(&db, false, None);
+            let blocks = pipeline_fixture_blocks();
+            for block in &blocks[..4] { dispatch_and_execute(&ctx, &db, block); }
+            assert_eq!(read_native_applied_height(&db), Some(4));
+            let q = crate::c1_qualification::Qualification::arm(
+                c1_config(root.join("evidence.jsonl"), std::time::Duration::from_secs(30)),
+                &db, ctx.exec_failed.clone(), &"00".repeat(32),
+            ).unwrap();
+            ctx.c1_qualification = Some(q);
+            ctx.attach_flush_worker(None);
+            for block in &blocks[4..6] { dispatch_and_execute(&ctx, &db, block); }
+            panic!("C1 child returned without SIGKILL (qualification invalid)");
+        } else {
+            assert_eq!(mode, "replay");
+            assert!(path.exists());
+            let db = StateDb::open(&path).unwrap();
+            let before = read_native_applied_height(&db);
+            assert_eq!(before, Some(4));
+            let ctx = pipeline_ctx(&db, false, None);
+            assert!(ctx.flush_worker.is_none() && ctx.c1_qualification.is_none());
+            assert!(crate::c1_qualification::Qualification::from_env(&db, ctx.exec_failed.clone(), None).unwrap().is_none());
+            let (last, parked) = TorusApp::replay_committed(&db, &ctx);
+            assert_eq!(parked, None);
+            assert_eq!(last.height, 6);
+            assert_eq!(read_native_applied_height(&db), Some(6));
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+            let proof = serde_json::json!({"pid": std::process::id(), "before": before,
+                "after": 6, "hook_disabled": true, "worker_attached": false, "replay_through": last.height});
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(root.join("replay.json")).unwrap();
+            file.write_all(&serde_json::to_vec(&proof).unwrap()).unwrap();
+            file.sync_all().unwrap();
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn c1_pending_parent_sigkill_replays_to_serial_reference() {
+        use std::{process::{Child, Command, Stdio}, time::{Duration, Instant}};
+        use std::os::unix::process::ExitStatusExt;
+        struct KillChild(Child);
+        impl Drop for KillChild { fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); } }
+        let root = tempfile::tempdir().unwrap();
+        let command = |mode: &str| {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command.args(["--exact", "app::crash_recovery_tests::c1_pending_parent_subprocess_child", "--nocapture"])
+                .env("C1_FIXTURE_ROOT", root.path()).env("C1_FIXTURE_MODE", mode).stdin(Stdio::null());
+            for (name, _) in std::env::vars_os() {
+                if name.to_string_lossy().starts_with("TORUS_") { command.env_remove(name); }
+            }
+            command.env_remove(crate::c1_qualification::ENV);
+            let file = std::fs::File::create(root.path().join(format!("{mode}.log"))).unwrap();
+            command.stdout(file.try_clone().unwrap()).stderr(file);
+            command
+        };
+        let mut child = KillChild(command("park").spawn().unwrap());
+        let deadline = Instant::now() + Duration::from_secs(35);
+        let evidence = root.path().join("evidence.jsonl");
+        let records = loop {
+            assert!(child.0.try_wait().unwrap().is_none(), "C1 child exited before READY: {}", std::fs::read_to_string(root.path().join("park.log")).unwrap());
+            assert!(Instant::now() < deadline, "C1 readiness timeout");
+            let text = std::fs::read_to_string(&evidence).unwrap_or_default();
+            let rows: Vec<serde_json::Value> = text.lines().filter_map(|line| serde_json::from_str(line).ok()).collect();
+            assert!(!rows.iter().any(|r| r["event"] == "INVALID"), "invalid evidence: {text}");
+            if rows.last().is_some_and(|r| r["event"] == "READY") { break rows; }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(records.iter().map(|r| r["event"].as_str().unwrap()).collect::<Vec<_>>(), vec!["ARMED", "W_PARKED", "PARENT_READ", "READY"]);
+        let ready = records.last().unwrap();
+        assert_eq!(ready["identity"]["pid"].as_u64(), Some(child.0.id() as u64));
+        for (i, row) in records.iter().enumerate() {
+            assert_eq!(row["identity"], ready["identity"]);
+            assert_eq!(row["sequence"].as_u64(), Some(i as u64 + 1));
+        }
+        assert_eq!(ready["identity"]["run_id"], "c1-fixture");
+        let stat = std::fs::read_to_string(format!("/proc/{}/stat", child.0.id())).unwrap();
+        let ticks = stat.rsplit_once(") ").unwrap().1.split_whitespace().nth(19).unwrap();
+        assert_eq!(ready["identity"]["process_start_ticks"], ticks);
+        assert_eq!(ready["identity"]["kernel_boot_id"], std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap().trim());
+        let blocks = pipeline_fixture_blocks();
+        for (field, block) in [("parent_hash", &blocks[4]), ("child_hash", &blocks[5])] {
+            assert_eq!(ready[field], crate::c1_qualification::hex(alloy_primitives::keccak256(block.header.canonical_header_bytes()).as_slice()));
+        }
+        assert_eq!(ready["detail"]["durable_marker"], 4);
+        assert_eq!(ready["detail"]["nonce_witness"]["source"], "nonce_replay_guard");
+        assert_eq!(ready["detail"]["nonce_witness"]["durable_value_absent"], true);
+        assert_eq!(ready["identity"]["parent"], 5); assert_eq!(ready["identity"]["child"], 6);
+        let selected = c1_config(root.path().join("unused"), Duration::from_secs(30));
+        assert_eq!(ready["detail"]["nonce_witness"]["key_hash"], crate::c1_qualification::hex(alloy_primitives::keccak256(&selected.nonce_key).as_slice()));
+        assert_eq!(ready["detail"]["nonce_witness"]["value_hash"], crate::c1_qualification::hex(alloy_primitives::keccak256(5u64.to_be_bytes()).as_slice()));
+        let expires: u128 = ready["identity"]["deadline_unix_ms"].as_str().unwrap().parse().unwrap();
+        assert!(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() < expires,
+            "READY must authorize a kill before its explicit deadline");
+        let boot_expires: u128 = ready["identity"]["deadline_boot_ms"].as_str().unwrap().parse().unwrap();
+        assert!(crate::c1_qualification::boot_millis().unwrap() < boot_expires);
+        child.0.kill().unwrap();
+        assert_eq!(child.0.wait().unwrap().signal(), Some(9));
+        let observed_dead_unix_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+        let observed_dead_boot_ms = crate::c1_qualification::boot_millis().unwrap();
+        assert!(observed_dead_unix_ms < expires && observed_dead_boot_ms < boot_expires,
+            "actual death must be observed before both qualification deadlines");
+        let kill = serde_json::json!({"identity": ready["identity"], "signal": 9,
+            "observed_dead_unix_ms": observed_dead_unix_ms.to_string(), "observed_dead_boot_ms": observed_dead_boot_ms.to_string()});
+        std::fs::write(root.path().join("kill.json"), serde_json::to_vec(&kill).unwrap()).unwrap();
+        // Re-read complete evidence after death; a timeout/publication race may
+        // never be accepted based on an earlier READY snapshot.
+        let text = std::fs::read_to_string(&evidence).unwrap();
+        let final_records: Vec<serde_json::Value> = text.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+        assert_eq!(records, final_records, "qualification changed before SIGKILL");
+        let mut replay = KillChild(command("replay").spawn().unwrap());
+        let end = Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Some(status) = replay.0.try_wait().unwrap() {
+                assert!(status.success(), "restart failed: {}", std::fs::read_to_string(root.path().join("replay.log")).unwrap()); break;
+            }
+            assert!(Instant::now() < end, "restart timeout");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let proof: serde_json::Value = serde_json::from_slice(&std::fs::read(root.path().join("replay.json")).unwrap()).unwrap();
+        assert_eq!(proof["before"], 4); assert_eq!(proof["after"], 6);
+        assert_eq!(proof["hook_disabled"], true); assert_eq!(proof["worker_attached"], false);
+        let recovered = StateDb::open(&root.path().join("db")).unwrap();
+        let reference_dir = tempfile::tempdir().unwrap();
+        let reference = StateDb::open(reference_dir.path()).unwrap();
+        fund_pipeline_fixture(&reference);
+        let serial = pipeline_ctx(&reference, false, None);
+        for block in &blocks[..6] { dispatch_and_execute(&serial, &reference, block); }
+        drop(serial);
+        assert_dumps_equal(&dump_all_cfs(&reference), &dump_all_cfs(&recovered), "C1 SIGKILL replay vs serial");
+        assert_eq!(torus_state::native_trie::persisted_native_root(&reference).unwrap(), torus_state::native_trie::persisted_native_root(&recovered).unwrap());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn c1_pending_parent_timeout_never_writes_parked_native_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = StateDb::open(&dir.path().join("db")).unwrap();
+        fund_pipeline_fixture(&db);
+        let blocks = pipeline_fixture_blocks();
+        let mut ctx = pipeline_ctx(&db, false, None);
+        for block in &blocks[..4] { dispatch_and_execute(&ctx, &db, block); }
+        let q = crate::c1_qualification::Qualification::arm(
+            c1_config(dir.path().join("timeout.jsonl"), std::time::Duration::from_millis(250)),
+            &db, ctx.exec_failed.clone(), &"00".repeat(32),
+        ).unwrap();
+        ctx.c1_qualification = Some(q.clone()); ctx.attach_flush_worker(None);
+        dispatch_and_execute(&ctx, &db, &blocks[4]);
+        assert!(!ctx.flush_worker.as_ref().unwrap().wait_idle());
+        assert!(ctx.exec_failed.load(Ordering::SeqCst));
+        assert_eq!(read_native_applied_height(&db), Some(4));
+        let key = c1_config(dir.path().join("unused"), std::time::Duration::from_secs(1)).nonce_key;
+        assert_eq!(db.get_cf_raw(torus_state::cf::CF_NATIVE_NONCES, &key).unwrap(), None);
+        drop(ctx);
+        let text = std::fs::read_to_string(dir.path().join("timeout.jsonl")).unwrap();
+        assert!(text.contains("INVALID")); assert!(!text.contains("READY"));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn c1_refuses_wrong_job_marker_identity_and_stale_artifact() {
+        use crate::c1_qualification::{Qualification, marker};
+        for (case, changed_marker, height, flush) in [
+            ("missing", None, 5, true), ("malformed", Some(vec![1]), 5, true),
+            ("behind", Some(3u64.to_be_bytes().to_vec()), 5, true),
+            ("written", Some(5u64.to_be_bytes().to_vec()), 5, true),
+            ("markerjob", Some(4u64.to_be_bytes().to_vec()), 5, false),
+            ("wrongheight", Some(4u64.to_be_bytes().to_vec()), 6, true),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = StateDb::open(&dir.path().join("db")).unwrap();
+            db.put_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT, &4u64.to_be_bytes()).unwrap();
+            let failed = Arc::new(AtomicBool::new(false));
+            let config = c1_config(dir.path().join("events"), std::time::Duration::from_secs(10));
+            assert!(Qualification::arm(config.clone(), &db, failed.clone(), &"11".repeat(32)).is_err());
+            let q = Qualification::arm(config.clone(), &db, failed.clone(), &"00".repeat(32)).unwrap();
+            assert!(Qualification::arm(config, &db, failed.clone(), &"00".repeat(32)).is_err(), "stale artifact must not overwrite");
+            match changed_marker {
+                Some(value) => db.put_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT, &value).unwrap(),
+                None => db.delete_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT).unwrap(),
+            }
+            let before = db.get_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT).unwrap();
+            assert!(q.before_write(&db, height, flush).is_err(), "{case}");
+            assert!(failed.load(Ordering::SeqCst));
+            assert_eq!(db.get_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT).unwrap(), before);
+            let text = std::fs::read_to_string(dir.path().join("events")).unwrap();
+            assert!(text.contains("INVALID")); assert!(!text.contains("READY"));
+            let _ = marker(&db); // malformed/missing are errors, never a fabricated zero.
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn c1_rejects_wrong_parent_and_diagnostic_read_and_tears_down_without_write() {
+        for wrong_parent in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = StateDb::open(&dir.path().join("db")).unwrap();
+            fund_pipeline_fixture(&db);
+            let blocks = pipeline_fixture_blocks();
+            let mut ctx = pipeline_ctx(&db, false, None);
+            for block in &blocks[..4] { dispatch_and_execute(&ctx, &db, block); }
+            let config = c1_config(dir.path().join("events"), std::time::Duration::from_secs(10));
+            let q = crate::c1_qualification::Qualification::arm(config, &db, ctx.exec_failed.clone(), &"00".repeat(32)).unwrap();
+            ctx.c1_qualification = Some(q.clone()); ctx.attach_flush_worker(None);
+            dispatch_and_execute(&ctx, &db, &blocks[4]);
+            let durable = persist_committed_block_durably(&db, &blocks[5]);
+            assert!(durable.header && durable.body);
+            let overlay = NativeStateOverlay::with_parent(db.clone(), ctx.last_job.lock().unwrap().clone());
+            let parent = if wrong_parent { Some(4) } else { Some(5) };
+            let hash = alloy_primitives::keccak256(blocks[5].header.canonical_header_bytes());
+            let begun = q.begin_child(&db, 6, parent, hash.as_slice(), Some(5u64.to_be_bytes().to_vec()), true);
+            assert_eq!(begun, !wrong_parent);
+            if !wrong_parent {
+                // Probing the same real parent value diagnostically does NOT
+                // pass through the replay-guard observer, so READY must fail.
+                let config = c1_config(dir.path().join("unused"), std::time::Duration::from_secs(1));
+                assert_eq!(overlay.get_cf_raw_with_parent_source(torus_state::cf::CF_NATIVE_NONCES, &config.nonce_key).unwrap(), (Some(5u64.to_be_bytes().to_vec()), Some(5)));
+                assert!(!q.computed_child(&db, 6));
+            }
+            drop(ctx); // cancels W; there is no release or successful write path.
+            assert_eq!(read_native_applied_height(&db), Some(4));
+            let text = std::fs::read_to_string(dir.path().join("events")).unwrap();
+            assert!(!text.contains("READY")); assert!(text.contains("INVALID"));
+        }
     }
 
     /// §5 `exec_pipeline_fold_header_runs_serial` (F9): a block whose header is
