@@ -466,3 +466,112 @@ hash `3495652` on `perf/cached-proposal-hashes-viewbound`, DA/timers `5ddc427` o
 `perf/proposal-attribution-viewbound`. Both are based on main `d3e1370` and retain
 the latest consensus fixes. Fresh integration verification and live comparisons
 are required; original candidate branches and frozen artifacts remain intact.
+
+
+### Build identity and host observations
+
+Hash integration `3495652` passed 149 consensus tests (one ignored) and a separate
+node build, receipt `247ed19c-d694-492b-a191-b557cc180422`. Its frozen node SHA256
+is `4e28a137ccd640842c415b1e8584b57b1309ac1115444a2c47bb94957bdb2fd5`.
+Hash docs-only follow-up `bdeed23` corrects historical cache descriptions.
+
+DA integration source tests passed receipt `2778f6a7-7dbd-4071-8036-a68792303435`,
+but artifact inspection found its node was byte-identical to the hash-only node
+and lacked the DA flag. The shared Cargo target had reused a stale executable.
+`artifacts/proposal-attribution-viewbound/manifest.json` is explicitly invalid;
+no DA cell used it. Rebuild verification cleans only relevant generated package
+outputs, then requires both the DA flag and producer metric in the node binary.
+Do not treat a successful Cargo exit alone as artifact provenance.
+
+The first hash driver invocation was stopped during cooldown before creating a
+label or launching nodes. The host's hourly `fstrim /` was active around 08:18 UTC,
+with I/O wait; this is an observed current wait cause, not proof of the earlier
+throughput drop. Driver startup now waits for both load1 < 1.5 and no active
+`fstrim`, and records its source SHA256.
+
+A separate read-only host observer records raw CPU/steal/iowait, PSI,
+MemAvailable/Dirty/Writeback and root-device diskstats every two seconds. Six
+fixture tests passed and independent review found no blocker for fresh labels.
+Its runtime overhead has not been measured; future comparisons should all use
+it consistently. Earlier cells lack these observations. It writes exclusively
+to a fresh per-label JSONL, stops on completed manifest/deadline, and flags
+missing/reset data instead of substituting zero.
+
+
+The repaired DA artifact is now frozen separately at
+`artifacts/proposal-attribution-viewbound-rebuild1`, node SHA256
+`a4be85236cf8f7ee6746a3d2a27f69cbbb9d724ddc8f9523e66e406e81641ef8`.
+Forced rebuild receipt `147896d0-028e-4f3c-a49d-f5b21086f090` and positive
+identity receipt `80f4f186-d888-4a56-97c3-80c373011ddb` passed. The original
+invalid artifact remains marked invalid; no DA cell has run yet.
+
+### Hash integration first live cell: unverified sampling
+
+`s60-hashes-viewbound-cap200-r1` ran runtime `3495652` for an actual 132-second
+load window: 30,942.3 fills/s, first120 30,733.4, drain 52 seconds, AGREE and
+clean dissemination. It is **UNVERIFIED**, not accepted: all three validators
+have a common six-second sampler gap from epoch 1789720203 to 1789720209.
+Commit counts advance by two/one/one during that gap. The independent host
+observer continued with a maximum interval of 2.099 seconds, so this does not
+look like a machine-wide six-second observation pause. No acceptance rule
+was relaxed and the historical run remains unverified.
+
+The existing collector timestamps a cycle before three serial scrapes, each
+allowed three seconds, then runs multiple shell/awk parsers per node. A slow
+endpoint can delay and backdate observations for all nodes. A bounded independent
+per-node collector is being prepared, with explicit invalid timeout rows,
+accurate response-completion timestamps, diagnostics and complete subprocess
+cleanup. New repeats will use the corrected collector on both arms.
+
+The host observer covers about 130 seconds wholly inside the load interval:
+reported CPU ticks were 54.2% user, 19.9% system, 23.5% idle, 1.3% iowait and
+zero steal; minimum available RAM was 67.1 GiB. These counters do not identify
+a cause or prove unused effective CPU capacity. During the sampling gap there
+was writeback and increased I/O pressure. The run's DB was cleaned only after
+its evidence and retention inventory were saved; raw node and host logs remain.
+
+
+### C1 pending-parent fixture qualification
+
+Commit `93b94ce` on `test/c1-pending-parent` implements the default-off
+`TORUS_C1_QUALIFICATION` hook and deterministic subprocess fixture. Receipt
+`70a3bccf-e6a4-4724-99fe-939ad6c4eafe` passed 132 state tests (two ignored),
+152 consensus tests (one ignored), and a separate node build. The node's C1
+flag was positively checked before freezing; SHA256 is
+`bea89230c7edd2bab2781f24ccaeea86188b4fd42625072c0bed64d35a7b49e1`.
+
+The fixture parks the flush worker before writing N, proves that actual execution
+of N+1 uses nonce state supplied only by pending N, then SIGKILLs the process
+before wall and boot-clock deadlines. Restart explicitly disables the hook,
+replays from the durable marker, and matches every CF row and native root
+against serial execution. Invalidation, timeout and teardown never release a
+parked write. Independent review closed a deadline race and preserved the
+public WorkerEnv API.
+
+This qualifies the exercised nonce/replay-guard dependency and subprocess
+recovery. It is not a three-validator C1 run, proof of every economic read path,
+power-loss test, or throughput measurement. Both hook and execution pipeline
+remain default-off; live C1 orchestration is a separate follow-up.
+
+### Independent sampler qualification
+
+Commit `f969b3d` replaces serial shell sampling with independent bounded node
+requests and response-completion timestamps. CSV integer timestamps and health
+rules remain unchanged; precise timing and curl failures are retained in
+`sampler-diagnostics.jsonl`. Partial or failed HTTP responses cannot count as
+valid samples. Shutdown cancels and reaps in-flight curl children.
+
+Receipt `0a3af7cf-7480-4f99-910d-8a363c1f605e` passed 81 Python harness tests,
+summarizer regression, shell syntax and diff checks. The first verification
+timed out in a Python 3.12 mock-server teardown and hit an obsolete shell-parser
+test; both test defects were corrected before the passing run. Coverage includes
+a delayed endpoint while other nodes advance, malformed required metrics,
+legacy AWK parser parity, partial responses, full pipe buffers and CLI SIGTERM.
+This is collector qualification, not a performance gain or retrospective change
+to previous UNVERIFIED runs.
+
+A separate historical phase CSV defect was found: six state-write detail fields
+were inserted into PHASE_COLS while its header and positional phase60.awk stayed
+unchanged. This shifts the old per-phase analysis for EVM resync, flush, dirty
+buckets and queue depth. Named-column wide CSV and headline/scoring are unaffected.
+Preserve old artifacts; use wide CSV for those historical phase measurements.
