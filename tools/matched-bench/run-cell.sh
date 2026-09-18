@@ -399,7 +399,7 @@ ENV_VERIFY=$(for p in "${PIDS[@]}"; do tr '\0' '\n' < /proc/$p/environ 2>/dev/nu
 log "per-node TORUS_* env digest(s): $ENV_VERIFY (must be a single value)"
 
 # ---------------------------------------------------------------- 4. health
-scrape_one() { curl -s -m 3 "http://127.0.0.1:$1/metrics"; }
+scrape_one() { curl -fsS -m 3 "http://127.0.0.1:$1/metrics"; }
 mval() { awk -v m="$1" '$1==m {print $2; f=1} END{if(!f) print 0}'; }
 
 log "waiting for health (all 3 committing, peers>=2, timeout ${HEALTH_TIMEOUT}s)"
@@ -579,13 +579,39 @@ log "heights after drain: ${HGT[*]} (spread $((HMAX-HMIN))); comparing block $HC
 # val0 and val2 were digested minutes apart (r6-base-300m-r1).
 "$BENCH" gen-accounts --offset 60 --count 50 2>/dev/null | awk '{print $2}' > "$OUT/digest-accounts.txt"
 DIG_ACCTS=$(grep -c . "$OUT/digest-accounts.txt")
+funnel_counters() {
+    # Missing/failed metrics are unavailable evidence, never fabricated zeros.
+    python3 -c '
+import math, re, sys
+wanted = ("torus_orders_placed_accepted_total", "torus_orders_matched_total",
+          "torus_native_actions_processed_total", "torus_orders_resting_total")
+values = {}
+for line in sys.stdin:
+    fields = line.split()
+    if fields and fields[0] in wanted:
+        if fields[0] in values or len(fields) < 2:
+            sys.exit(1)
+        values[fields[0]] = fields[1]
+if not all(name in values and
+           re.fullmatch(r"[0-9]+([.][0-9]+)?([eE][+-]?[0-9]+)?", values[name]) and
+           math.isfinite(float(values[name])) for name in wanted):
+    sys.exit(1)
+print(",".join(values[name] for name in wanted))'
+}
 funnel_snapshot() {
+    local i metrics row snapshot=""
     for i in 0 1 2; do
-        scrape_one "${METS[$i]}" | extract "torus_orders_placed_accepted_total torus_orders_matched_total torus_native_actions_processed_total torus_orders_resting_total"
+        metrics=$(scrape_one "${METS[$i]}") || return 1
+        row=$(printf '%s\n' "$metrics" | funnel_counters) || return 1
+        [ -n "$row" ] || return 1
+        snapshot+="${snapshot:+$'\n'}$row"
     done
+    # Emit only a complete three-node snapshot, never a successful partial one.
+    printf '%s\n' "$snapshot"
 }
 declare -a DHGT DIGSHA DIGSECS
-Q_BEFORE=$(funnel_snapshot)
+Q_BEFORE_OK=0
+if Q_BEFORE=$(funnel_snapshot); then Q_BEFORE_OK=1; fi
 for i in 0 1 2; do
     h=$(scrape_one "${METS[$i]}" | mval torus_block_height); DHGT[$i]=${h%.*}
 done
@@ -597,14 +623,15 @@ for i in 0 1 2; do
 done
 wait
 TDIG1=$(date +%s)
-Q_AFTER=$(funnel_snapshot)
-if [ "$Q_BEFORE" = "$Q_AFTER" ]; then DIGEST_QUIESCENT=1; else DIGEST_QUIESCENT=0; fi
+Q_AFTER_OK=0
+if Q_AFTER=$(funnel_snapshot); then Q_AFTER_OK=1; fi
+if [ "$Q_BEFORE_OK" = 1 ] && [ "$Q_AFTER_OK" = 1 ] && [ -n "$Q_BEFORE" ] && [ "$Q_BEFORE" = "$Q_AFTER" ]; then DIGEST_QUIESCENT=1; else DIGEST_QUIESCENT=0; fi
 for i in 0 1 2; do
     sha=""; secs=""; read -r sha secs < "$OUT/digest-val$i.out" || true
     DIGSHA[$i]=${sha:-ERR}; DIGSECS[$i]=${secs:-0}
 done
 log "state digest done in $((TDIG1 - TDIG0))s wall (per node: ${DIGSECS[*]} s), quiescent=$DIGEST_QUIESCENT"
-[ "$DIGEST_QUIESCENT" = 1 ] || log "WARNING: funnel counters MOVED during the digest — digest is NOT a determinism proof for this cell"
+[ "$DIGEST_QUIESCENT" = 1 ] || log "WARNING: funnel counters moved or snapshot evidence was unavailable during the digest — digest is NOT a determinism proof for this cell"
 
 : > "$OUT/agreement.jsonl"
 for i in 0 1 2; do
