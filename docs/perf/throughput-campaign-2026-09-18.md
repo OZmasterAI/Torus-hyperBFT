@@ -298,3 +298,40 @@ campaign database has been deleted or flushed. Offline all-CF flushing would
 change physical WAL evidence and also requires that retention decision.
 Separate-machine testing remains pending host/access details; no remote run
 or infrastructure provisioning has occurred.
+
+
+## Follow-up consensus fixes after the short replay stall
+
+The retained replay cell did not remain completely disconnected: QUIC links
+recovered, and later sync requests succeeded on all validators. This rules
+against permanent total transport isolation. Missing consecutive progress
+remains unexplained; the configured exponential timeout can reach 128 seconds,
+and the retained logs do not identify each vote's signer and certified view.
+
+Source review found two independent defects, now committed on the main campaign
+branch: `09f3449` binds header votes and proposal-status updates to the header's
+matching local view; `b60097a` releases future-message buffer occupancy on
+delivery/expiry, rejects oversized entries before eviction, and evicts only the
+actual deficit. Out-of-view headers still retain authenticated certificate,
+lock and body-recovery handling. A receiver-level regression exercises early
+future delivery followed by its cached matching-view replay and exactly one
+vote. Existing accounted-message sizes are unchanged; this is not a new
+heap-memory sizing policy.
+
+All 92 HotStuff library tests and a separate node-only release build passed
+(receipt `7ce69082-16c3-407f-9625-86d3d4579fae`). Neither source fix proves
+the cause of the retained stall. Frozen node SHA256:
+`0c45c479bdeac981f48aa0f016d99d3e8d42376c131fc1400f1c49b0a02bcdd7`.
+The unchanged generator is retained. `s60-viewbound-replay45-r1` is the pending
+short crash qualification with `TORUS_WEDGE_DIAG=1`; its result must be assessed
+separately from throughput acceptance.
+
+The cancellation mechanism experiment now has two independent fixture-seed
+runs: five deep levels with 16 middle targets per level gave paired baseline/
+forced-grouping medians 1.648/1.721 at depth8192 and 1.971/1.957 at depth32768.
+Identical-code controls were near parity in those cases; sparse one-order-per-
+level controls remained skewed and inconclusive. A bounded allocation-free
+multilevel gate is isolated on `perf/cancel-level-compaction`, with 11 passing
+differential tests (receipt `68ec19a1-b0b6-4b67-90b2-c6735d8e6e2d`). Its actual
+gated-path timing and whole-chain acceptance remain pending. These microbench
+ratios are not matched-throughput gains.
