@@ -1020,3 +1020,51 @@ tests plus a separate node build. Independent review found no blocker. The
 identified node is frozen in `artifacts/cancel-margin-integer`, SHA256
 `9d5072ae89c4709c0715e6dfddc4f02f9dadfadc02e191ea045a2fe1e305c327`.
 No microbenchmark or live performance gain has yet been measured for this step.
+
+
+### Accepted pass-B attribution and outbound diagnostic readiness
+
+`s60-settle-passb-10m-r1` is ACCEPT at 35,933.6 fills/s over 312 seconds,
+first120 40,271.9, best60 44,491.2, drain 185 seconds and commit p95 3,865.1 ms.
+All validators passed liveness, agreed and had clean dissemination. This is
+an instrumented nominal 300-second ten-market run of frozen `c43909f` with
+`TORUS_SETTLE_PASSB_DIAG=1`, BODYFETCH1, DEPTH1 and unchanged ENGINE0/MATCH18/SETTLE18,
+cap200/rate76000. It is diagnostic evidence, not a speedup claim.
+
+The qualified offline transform (`f0bda1ff`, script SHA256 prefix `df596ce3`) parsed 271
+complete invocations on each validator with zero parse errors or invalid timing
+partitions. Bench-plus-drain completion-log windows give:
+
+| Validator | Whole pass B ms/invocation | Position merge | Balance apply | Trade route | Residual | Inventory outside B |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| val0 | 166.54 | 5.51 | 30.80 | 81.40 | 48.83 | 15.19 |
+| val1 | 182.95 | 8.08 | 28.21 | 92.43 | 54.22 | 13.12 |
+| val2 | 194.09 | 7.66 | 31.64 | 94.96 | 59.83 | 11.56 |
+
+Trade routing is 48.9–50.5% of pass B; balances 15.4–18.5%, merging 3.3–4.4%,
+and residual 29.3–30.8%. Each validator reports 15,524,527 routed fills and
+16,035,318 balance attempts with no read errors or failed orders. Median
+per-invocation planned top-one/top-four sender event fractions are 0.57%/2.26%;
+these describe planned event concentration, not CPU share or a sharding speedup.
+Inventory and detailed clocks perturb execution. Completion-log boundaries
+differ from metric snapshots. The 271 invocations also differ from 285 native
+blocks: val0's existing metric reports pass B 158.42 ms/native block inside engine
+993.80 ms, with phase 1 482.02 ms. Phase1 remains a larger total-engine cost.
+
+Source review identifies three fixed-key-to-Vec allocations per deferred fill
+in trade routing. Preserving fixed-size keys through the existing writer is
+therefore the next scoped settlement experiment; aggregate routing time does
+not prove allocation is its whole cost. The 29.21 GiB completed databases were
+inventoried and cleaned, retaining all diagnostic evidence.
+
+Outbound diagnostic runtime `14449bc` is now qualified, committed and frozen in
+`artifacts/body-send-stages`, node SHA256
+`248cb4ba552cd65e23d5f5207e6736bbefb6ac63dfac4e4a207cc0ebc737536e`.
+Receipt `249cf648` passed 118 network and 112 HotStuff tests plus a separate node build.
+The default-off `TORUS_BODY_SEND_TRACE=1` records local enqueue/dequeue, inner
+serialization, request initiation and tracking, without changing wire/routing
+or biased selection. Its offline analyzer passed 17 synthetic fixtures with
+explicit pre/post external hashes under receipt `f0bda1ff`. Producer emission
+may follow consumer completion; local IDs and startup scopes identify joins.
+Actual queue residence has only a conservative zero lower bound, and initiation
+is not delivery. A live outbound diagnostic follows the completed settlement run.
