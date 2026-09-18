@@ -1141,3 +1141,14 @@ is not directly comparable to the historical 51.6k approximately two-minute run.
 
 Fixed-key runtime qualification now follows this cell. The next network
 diagnostic remains a separate branch; no network scheduling policy is changed.
+
+Fixed-key candidate `0571fba` is now qualified and committed. Receipt `fc92801b`
+passed five focused bridge tests, 12 background-writer tests, 19 bridge integration
+tests OFF and the same 19 ON, and the consensus deferred-writer test ON (56 test
+executions, 37 unique tests), followed by a separate node build. Independent
+review found no blocker. Frozen `artifacts/deferred-trade-fixed-keys` has node
+SHA256 `b6f804a23bcbcf10b5f57018c0d94b86af6947231fbb236161e0a4d3dbfd9d1c`
+and scheduled generator `9c210f31`. Exact flag plus typed-writer and integer-margin
+helper symbols establish binary identity; the optimized drain helper has no
+standalone symbol. Same-binary OFF/ON live evaluation follows. The feature stays
+default off, with no abrupt-crash qualification or performance gain asserted.
