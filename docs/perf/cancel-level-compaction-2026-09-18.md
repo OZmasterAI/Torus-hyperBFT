@@ -203,3 +203,62 @@ The earlier forced second repeat also completed: middle8192/16 AC1.721,
 AA0.975, CC0.973; middle32768/16 AC1.957, AA1.002, CC1.070. At8 targets per level,
 AC was1.159 at8192 and1.225 at32768. These remain test-only middle-layout results
 and do not establish live throughput or production acceptance.
+
+## Four-length retain threshold: verified semantics, performance not accepted
+
+Rejected multilevel source and its receipt are preserved in `ca30eea`.
+The next experiment changes only the retain-versus-removal cost threshold:
+`min(forward_shifts, reverse_shifts) > queue.len().saturating_mul(4)`.
+Classification, grouping, outputs, journal effects and benchmark cases are
+unchanged. It introduces no new probes or allocations.
+
+The existing estimate counts moved orders, not CPU time. `VecDeque::remove`
+can use bulk memory movement; `retain` evaluates a branch per surviving order.
+That makes a higher crossover plausible, without proving this caused the
+observed dispersed regression. Exact estimator arithmetic for16 targets:
+
+| Depth | Layout | Min estimated shifts | Shifts/depth | Retain at4x |
+| ---: | --- | ---: | ---: | --- |
+| 8192 | dispersed | 32725 | 3.994751 | no |
+| 8192 | middle | 65408 | 7.984375 | yes |
+| 32768 | dispersed | 131029 | 3.998688 | no |
+| 32768 | middle | 262016 | 7.996094 | yes |
+
+These are cost-model calculations, not measured timings. The factor4 is an
+experimental margin between the two observed shapes, not a calibrated general
+CPU model. Existing dense32/200 cases remain eligible for retain; shallow,
+sparse and rejected multilevel sets still follow the same paths. The same11
+differential tests and actual-gate AB/AA/BB cases must be rerun, including all
+front/back/dispersed and declined shapes. The full core suite and the same benchmark have now run; results below do
+not justify promotion.
+
+Torus attempt: `7f9b3698-771c-4d88-bac8-36ad01e8248c`. Its initial evidence text
+mistyped the8192/dispersed estimate as32711; the exact value is32725 as above.
+
+
+Receipt `ce7b778d-5d7a-4a00-bc6d-c22c6ee9f8fb` passed the full release core
+suite (121 unit tests and 89 integration tests; seven ignored tests total),
+the isolated benchmark command, and diff checks with unchanged source.
+Artifact: `cancel-multilevel-crossover4-r1.log` and its source/binary manifest.
+Ratios are paired baseline/candidate medians; above one favors the candidate.
+
+| Case | AB | AA | BB |
+| --- | ---: | ---: | ---: |
+| Five levels, middle, depth 8192 | 1.674 | 0.970 | 1.013 |
+| Five levels, middle, depth 32768 | 1.839 | 1.020 | 1.046 |
+| Five levels, front, depth 8192 | 1.684 | 0.890 | 1.047 |
+| Five levels, back, depth 8192 | 1.364 | 1.164 | 1.050 |
+| Five levels, dispersed, depth 8192 | 0.987 | 0.966 | 0.960 |
+| Declined uneven 15-target group | 1.006 | 0.982 | 1.053 |
+| Declined shallow group | 0.989 | 0.972 | 1.018 |
+| Declined sixth level | 0.938 | 1.030 | 1.005 |
+
+The earlier dispersed regression is reduced to near parity in this run, and
+middle-layout gains persist. However, the sixth-level fallback is about 6%
+slower despite substantially closer identical-code controls. Front/back
+controls also remain noisy. This does not establish whether the fallback
+cost is stable; the previous gate run measured 0.984 for that case. Keep the
+candidate isolated pending repeated fallback diagnosis and live eligibility
+frequency. Passing correctness tests and a successful benchmark exit do not
+constitute performance acceptance. No main-branch merge or chain-throughput
+gain is claimed.

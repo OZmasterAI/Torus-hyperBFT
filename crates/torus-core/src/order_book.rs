@@ -820,7 +820,12 @@ impl OrderBook {
                     .fold(0usize, |sum, (removed, &(pos, _))| {
                         sum.saturating_add((pos - removed).min(queue.len() - 1 - pos))
                     });
-            if forward_shifts.min(reverse_shifts) > queue.len() {
+            // Movement count is not CPU cost: VecDeque::remove uses memmove,
+            // while retain branches over every survivor. The one-length
+            // threshold regressed dispersed16/depth8192 in the actual-gate
+            // microbenchmark. Four lengths keeps that shape on removals and
+            // still compacts dense-middle16 (~8 lengths). Hypothesis to retest.
+            if forward_shifts.min(reverse_shifts) > queue.len().saturating_mul(4) {
                 let mut targets = positions.iter().peekable();
                 let mut position = 0usize;
                 // VecDeque::retain compacts in place, preserves survivor FIFO,
