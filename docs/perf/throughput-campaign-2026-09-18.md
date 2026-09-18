@@ -217,3 +217,41 @@ can give a market only one side when sender assignment repeats with an even
 period (including MPS=1/10 markets and MPS=3/300 markets). A separate candidate
 alternates actual per-market owners, preserving the uniform default workload.
 Locality cells must use the corrected, explicitly identified generator.
+
+## Hash-cache comparison in progress
+
+The unchanged `torus_orders_matched_total` counter measures **fill events**, not
+unique orders or two order legs. See [metric definitions and load generation](matched-fill-units-and-generator-2026-09-18.md).
+Historical values above retain that counter definition. They do not establish
+an equivalent cross-chain order-processing rate.
+
+| Cell | Frozen runtime | Actual load | Matched fills/s | Verdict | Drain |
+| --- | --- | --- | --- | --- | --- |
+| `s60-recovery-cap200-r1` | `9af0eea` | 127 s | 49,242.8 | ACCEPT | 57 s |
+| `s60-hashes-cap200-r1` | `388f7cd` | 127 s | 51,608.1 | ACCEPT | 93 s |
+| `s60-recovery-cap200-r2` | `9af0eea` | 128 s | 48,226.3 | UNVERIFIED | 46 s |
+
+The hash candidate passed 149 consensus tests (one ignored); its final narrow
+cold-cache refinement passed three focused regressions and a separate node build.
+The first live candidate reduced load-window construction means to 127–147 ms
+from 176–179 ms. Its execution queue peaked at 61 versus 56, and its longer drain
+prevents treating faster construction as an equivalent sustained-throughput gain.
+The candidate remains isolated pending repeated comparisons.
+
+The second control had clean dissemination, completed drain, and AGREE. Its
+sampler has a six-second gap on all nodes at 03:08:25–03:08:31 UTC, exceeding the
+five-second evidence limit; each observed commit counter increased by one across
+that gap. No stall was demonstrated, but the original UNVERIFIED verdict is
+retained rather than changing acceptance to admit this result.
+
+Each cell's `summary.commit` identifies the harness worktree. Its frozen runtime
+is identified by the campaign `artifacts/*/manifest.json` and per-cell
+`*.artifact-provenance.json`, tied to the measured binary hash. The hash node's
+SHA256 is `d6dfe515cb76175817056447407ff606957317f3653f705ee60ccf531cb7c6f7`.
+
+Producer-stage attribution plus default-off exact-byte DA reuse is prepared on
+`perf/proposal-attribution` at `0444b7e`. All four changed library suites,
+health/harness/summarizer tests, shell syntax, and a separate node build pass.
+The frozen artifact is ready for a same-binary OFF/ON comparison; it has no live
+performance result. Offline retention tooling, if later present on that branch,
+is separate from this already-frozen runtime.
