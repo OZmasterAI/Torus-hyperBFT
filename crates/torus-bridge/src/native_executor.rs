@@ -2410,7 +2410,7 @@ impl<T: StateBackend> NativeExecContext<T> {
                     match borsh::to_vec(&*book) {
                         Ok(data) => {
                             if let Err(e) =
-                                self.state.put_cf_raw(CF_NATIVE_ORDER_BOOKS, &key, &data)
+                                self.state.put_cf_raw_owned(CF_NATIVE_ORDER_BOOKS, &key, data)
                             {
                                 tracing::error!(market_id, %e, "failed to persist order book");
                             } else {
@@ -2428,9 +2428,9 @@ impl<T: StateBackend> NativeExecContext<T> {
                 BookMode::OrderRows => {
                     for (order_id, op) in book.take_row_ops() {
                         let key = book_order_key(market_id, order_id);
-                        let res = match &op {
+                        let res = match op {
                             Some(bytes) => {
-                                self.state.put_cf_raw(CF_NATIVE_ORDER_BOOKS, &key, bytes)
+                                self.state.put_cf_raw_owned(CF_NATIVE_ORDER_BOOKS, &key, bytes)
                             }
                             None => self.state.delete_cf_raw(CF_NATIVE_ORDER_BOOKS, &key),
                         };
@@ -2592,10 +2592,10 @@ impl<T: StateBackend> NativeExecContext<T> {
         let t_rows = timed.then(std::time::Instant::now);
         for (order_id, op) in drained.row_ops {
             let key = book_order_key(market_id, order_id);
-            let res = match &op {
+            let res = match op {
                 Some(bytes) => {
                     rows_written += 1;
-                    state.put_cf_raw(CF_BOOK_ORDER_ROWS, &key, bytes)
+                    state.put_cf_raw_owned(CF_BOOK_ORDER_ROWS, &key, bytes)
                 }
                 None => {
                     rows_deleted += 1;
