@@ -1239,3 +1239,62 @@ but dissemination failures prevent acceptance. Thus the reversed pair contains
 no accepted performance comparison and provides no basis for default promotion.
 Its completed databases occupied 30.09 GiB. Deeper-book and burst screening
 will use fixed keys OFF while the network diagnostic is qualified separately.
+
+`s60-deeper-fixed-off-10m-r1` is ACCEPT: 17,625.2 fills/s over 306 seconds,
+first120 24,948.6, best60 30,925.8; drain 176 seconds, PASS/AGREE and clean
+dissemination. Only the crossing fraction changes to 0.25 from the fixed-key OFF
+workload; fixed keys remain OFF. This is a distinct workload, not a comparable
+optimization gain. The 23.57 GiB completed databases were retained then removed.
+
+Val0 bench-plus-drain engine averaged 1,050.41 ms/native block, including
+711.10 ms in phase1 actions; save-books was 262.00 ms and flush 288.01 ms.
+Early-to-late 60-second load windows showed phase1 increasing 122.5→805.4 ms
+while matching fell 110.1→83.3 and settlement 140.4→100.5 ms/native block.
+The early and late windows contained 64 and 41 native blocks respectively;
+resting-order gauges at their ends were 1,903,852 and 4,459,037. These observed
+phase timings prioritize finer cancellation/action attribution, not a claim
+that every phase1 nanosecond is book removal. No RocksDB write-stall time was
+reported. The writer queue gauge remains outside the strict drain gate.
+
+`s60-burst-fixed-off-10m-r1` is ACCEPT: 32,008.5 fills/s over its entire
+304-second load interval (including the intentional pause), first120 44,021.8,
+best60 59,763.3; final drain 86 seconds, PASS/AGREE, clean dissemination.
+The configured schedule is `0:30000,60:120000,120:0,240:30000` with fixed keys
+OFF and the ordinary 0.5 crossing fraction. Requested rates are not achieved
+admission or matching rates. Completed databases occupied 23.34 GiB.
+
+Generator-anchored phase index 2 has valid sampled recovery evidence: confirmation
+48.47 seconds after pause start, with a common quiet span of 10.99 seconds and
+commit deltas 253/252/254 on val0/1/2 wholly inside that span. No renewed activity
+was observed before the pause ended. This establishes one sampled pause recovery,
+not permanent absence of in-flight work, writer completion, or sustained 120k
+execution. The phase evidence does not change the ordinary acceptance gate.
+
+### Swarm diagnostic qualification and first live result
+
+Runtime `080c4fa` passed 127 network library tests and a separate node build
+under receipt `cb235577`. Its external analyzer passed 20 fixtures with hashes
+checked before/after; the receipt in the analyzer issue's scope is `8a1d4cb6`.
+The frozen node SHA256 is
+`4c325452a0df310776c56a7e47b523af6906d4a4022e9f091144a3e20497f386`.
+It is based on the body-send diagnostic branch, not the later fixed-key runtime;
+do not attribute a cross-binary throughput difference to this instrumentation.
+
+`s60-swarm-poll-10m-r1` is ACCEPT: 41,723.7 fills/s over 306 seconds, drain
+176 seconds, PASS/AGREE and clean dissemination. BODY_FETCH_TRACE,
+BODY_SEND_TRACE and SWARM_POLL_TRACE are ON; BODY_BEFORE_EXPIRY is OFF.
+No network selection policy was changed. The parser accepted all 21,063 records
+with zero errors and all three process scopes eligible. Its full analysis and
+separate load-window extraction are retained beside the manifest. Completed
+databases occupied 34.92 GiB and were removed after retention.
+
+For fully contained load-window poll aggregates, maximum completed interpoll
+gaps were 453.165 / 451.592 / 503.732 ms on val0/1/2. These maxima describe
+previous-poll-return to next-poll-entry, not pure CPU or transport latency.
+Actual poll-call maxima were 352.121 / 294.779 / 338.398 ms, including any
+descheduling inside calls. Sampled event-to-admission p95 was 52 / 46 / 48 us;
+maxima were 1.768 / 9.416 / 37.203 ms. Queue-lock and validation-tee p95 were
+at most one microsecond. The receiver observations are rate-limited, and their
+start excludes outer codec/dispatch. Whole-log gaps near four seconds include
+quiet drain intervals. This healthy cell does not reproduce the earlier expiry
+failure or prove biased-selection starvation; scheduling defaults stay unchanged.
