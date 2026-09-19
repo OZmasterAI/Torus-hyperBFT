@@ -122,6 +122,15 @@ Existing experimental pipeline/async-validation defaults, genesis rules,
 validation predicates, consensus header authority, DA writes and matching
 semantics remain as in the record lineage. No hardware ceiling is inferred.
 
-Still required for the integrated candidate: final node build, qualification of
-any subsequent changes, and a frozen artifact/evidence manifest. A later benchmark
-session requires renewed authorization; the current session must not measure it.
+The integrated standalone node built successfully at `6099a68` after cleaning
+the affected project packages. Compilation from the integration worktree was
+observed for every affected package. Receipt
+`1ed3190a-4abc-4fb9-94c4-2708809c258b`; build duration was 76.5 seconds, not a
+performance measurement. No generator was built and the node was not launched.
+
+Frozen checkpoint artifact:
+`/home/18c/bench-results-matched/s61-implementation-20260919/candidate-6099a68/`.
+It contains `torus-node`, `SHA256SUMS` and `manifest.json`; binary SHA256 is
+`47a8d64d31c6c1186a5da9fac66eab1cf83365f7b90bd2d5790f625c54a12d0b`.
+Further implementation continues; later changes need their own qualification.
+A later benchmark session requires authorization; this session must not measure it.
