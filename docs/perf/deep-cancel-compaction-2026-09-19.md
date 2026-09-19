@@ -28,9 +28,21 @@ persistence preparation, result checks and destruction are outside timing.
 | 32768 | 8 | back | 2.111 | 1.140 | 0.947 |
 
 Ratio >1 favors the candidate. All shapes use five price levels and chunked
-commitments. The deep eight-target dispersed case clearly regresses; other cases
-do not establish a convincing benefit against controls. Endpoint cases have
-short timings and visible order/control noise. Reject this policy; keep it
+commitments. The deep eight-target dispersed case clearly regresses; the dispersed
+16/32-target cases do not establish a benefit. Endpoint eight-target cases
+improve about 2.1x, although short timings show visible order/control noise.
+Reject this combined policy; keep it
 isolated for provenance, default OFF, with no chain throughput claim.
 Raw logs, strata, source/binary hashes and analysis remain under
 `/home/18c/bench-results-matched/s60-campaign-20260918/deep-compaction-micro-r1/`.
+
+
+A second experiment separates eligibility from movement policy: keep
+budget four for every depth and only lower eligibility to eight targets at
+32768 depth. This keeps the endpoint grouping opportunity while testing whether
+the dispersed regression came from aggressive compaction. Qualification passed 127 core tests under `a960e68c`, then 10 enabled margin
+and 27 native integration tests plus a separate release node build under
+`187c5329-0541-4cbd-bbaf-253c2aee6927`. Fresh balanced micro-r2 ratios for
+dispersed 8/16/32 targets are 0.999/1.000/0.973; endpoints 1.798/1.597 with
+noisy controls (back AA 0.782). This supports experimental live screening only,
+not a throughput claim. Default remains OFF.

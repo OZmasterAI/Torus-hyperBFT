@@ -807,7 +807,7 @@ impl OrderBook {
         }
         let mut cancelled: Vec<Option<Order>> = vec![None; order_ids.len()];
         for ((tag, price), targets) in levels {
-            self.cancel_all_remove_level(tag, price, &targets, &mut cancelled, false);
+            self.cancel_all_remove_level(tag, price, &targets, &mut cancelled);
         }
         self.pending_stops.retain(|s| s.trader != trader);
         cancelled.into_iter().flatten().collect()
@@ -893,7 +893,7 @@ impl OrderBook {
                 if Self::cancel_all_level_can_compact(depth, targets.len())
                     || (deep && depth >= 32_768 && targets.len() >= 8)
                 {
-                    self.cancel_all_remove_level(tag, price, &targets, &mut slots, deep);
+                    self.cancel_all_remove_level(tag, price, &targets, &mut slots);
                 } else {
                     for (output, id) in targets {
                         slots[output] = self.cancel_all_remove_one(tag, price, id);
@@ -955,7 +955,6 @@ impl OrderBook {
         price: FixedPoint,
         targets: &[(usize, OrderId)],
         cancelled: &mut [Option<Order>],
-        deep: bool,
     ) {
         let cache_on = self.level_hash_cache.is_some();
         let chunked_on = self.level_hash_chunked;
@@ -996,10 +995,7 @@ impl OrderBook {
         // threshold regressed dispersed16/depth8192 in the actual-gate
         // microbenchmark. Four lengths keeps that shape on removals and
         // still compacts dense-middle16 (~8 lengths). Hypothesis to retest.
-        // Experimental policy only for very deep queues. Output order and
-        // all bookkeeping remain identical whichever removal path is selected.
-        let movement_budget = if deep && queue.len() >= 32_768 { 1 } else { 4 };
-        if forward_shifts.min(reverse_shifts) > queue.len().saturating_mul(movement_budget) {
+        if forward_shifts.min(reverse_shifts) > queue.len().saturating_mul(4) {
             let mut targets = positions.iter().peekable();
             let mut position = 0usize;
             // VecDeque::retain compacts in place, preserves survivor FIFO,
