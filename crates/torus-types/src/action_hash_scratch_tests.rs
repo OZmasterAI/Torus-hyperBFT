@@ -606,3 +606,78 @@ fn legacy_compute_action_hash(action: &SignedNativeAction) -> B256 {
     }
     alloy_primitives::keccak256(&data)
 }
+
+// Frozen pre-scratch trust-cache key: intentionally omits the content hash's
+// signature tag and rejects sessions before encoding any action bytes.
+fn legacy_verified_cache_key(action: &SignedNativeAction) -> Option<B256> {
+    let ActionSignature::Eip712(sig) = &action.signature else {
+        return None;
+    };
+    let mut data = legacy_canonical_bytes(&action.action);
+    data.extend_from_slice(&action.nonce.to_be_bytes());
+    data.push(sig.v);
+    data.extend_from_slice(&sig.r);
+    data.extend_from_slice(&sig.s);
+    Some(alloy_primitives::keccak256(&data))
+}
+
+#[test]
+fn trust_cache_scratch_matches_frozen_key_for_all_actions_and_signatures() {
+    let mut scratch = vec![0xa5; 1024];
+    for (i, action) in actions().into_iter().enumerate() {
+        for session in [false, true] {
+            for nonce in [0, 1, u64::MAX] {
+                let action = signed(action.clone(), session, nonce);
+                let expected = legacy_verified_cache_key(&action);
+                assert_eq!(verified_cache_key(&action), expected, "wrapper {i}");
+                assert_eq!(
+                    verified_cache_key_with_scratch(&action, &mut scratch),
+                    expected,
+                    "scratch {i}"
+                );
+                if session {
+                    assert!(scratch.is_empty());
+                } else {
+                    assert_ne!(expected.unwrap(), compute_action_hash(&action));
+                }
+                // Dirty bytes and Session None must not contaminate the next key.
+                scratch.extend_from_slice(&[0x5a; 19]);
+            }
+        }
+    }
+}
+
+#[test]
+fn trust_cache_scratch_reuses_capacity_and_commits_each_signature_field() {
+    let large = signed(
+        NativeAction::PlaceOrderBatch((0..1024).map(order_params).collect()),
+        false,
+        u64::MAX,
+    );
+    let small = signed(NativeAction::ClaimRewards, false, 1);
+    let session = signed(NativeAction::ClaimRewards, true, 1);
+    let mut scratch = Vec::new();
+    verified_cache_key_with_scratch(&large, &mut scratch).unwrap();
+    let allocation = (scratch.as_ptr(), scratch.capacity());
+    for action in [&small, &session, &large, &small] {
+        assert_eq!(
+            verified_cache_key_with_scratch(action, &mut scratch),
+            legacy_verified_cache_key(action)
+        );
+        assert_eq!((scratch.as_ptr(), scratch.capacity()), allocation);
+    }
+    let original = verified_cache_key(&small).unwrap();
+    for field in 0..4 {
+        let mut changed = small.clone();
+        let ActionSignature::Eip712(sig) = &mut changed.signature else { unreachable!() };
+        match field {
+            0 => sig.v ^= 1,
+            1 => sig.r[0] ^= 1,
+            2 => sig.s[31] ^= 1,
+            _ => changed.nonce ^= 1,
+        }
+        let key = verified_cache_key_with_scratch(&changed, &mut scratch).unwrap();
+        assert_eq!(Some(key), legacy_verified_cache_key(&changed));
+        assert_ne!(key, original);
+    }
+}

@@ -113,11 +113,14 @@ impl NativePool {
     /// (`verified_cache_key` returns `None`).
     pub fn verified_restash_keys(&self, hashes: &[B256]) -> Vec<(B256, Address)> {
         let mut out = Vec::new();
+        let mut scratch = Vec::new();
         for h in hashes {
             if let Some(key) = self.hash_index.get(h).and_then(|keys| keys.first()) {
                 if let Some(entry) = self.entries.get(key) {
                     if entry.verified_locally {
-                        if let Some(key) = torus_types::verified_cache_key(&entry.action) {
+                        if let Some(key) = torus_types::verified_cache_key_with_scratch(
+                            &entry.action, &mut scratch,
+                        ) {
                             out.push((key, entry.sender));
                         }
                     }

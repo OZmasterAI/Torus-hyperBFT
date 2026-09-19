@@ -976,15 +976,29 @@ mod action_hash_scratch_tests;
 /// fresh resolve — `None` is returned for those and they are always fully
 /// re-verified. Used IDENTICALLY at populate (mempool) and read (`batch_verify_native_actions`).
 pub fn verified_cache_key(action: &SignedNativeAction) -> Option<B256> {
+    if !matches!(&action.signature, ActionSignature::Eip712(_)) {
+        return None;
+    }
+    verified_cache_key_with_scratch(action, &mut Vec::with_capacity(64))
+}
+
+/// Same trust-cache identity and eligibility as [`verified_cache_key`], using
+/// a batch-local preimage buffer. Clears the buffer even for an ineligible
+/// session action. This encoding intentionally differs from the content hash.
+pub fn verified_cache_key_with_scratch(
+    action: &SignedNativeAction,
+    data: &mut Vec<u8>,
+) -> Option<B256> {
+    data.clear();
     let ActionSignature::Eip712(sig) = &action.signature else {
         return None;
     };
-    let mut data = action.action.canonical_bytes();
+    action.action.append_canonical_bytes(data);
     data.extend_from_slice(&action.nonce.to_be_bytes());
     data.push(sig.v);
     data.extend_from_slice(&sig.r);
     data.extend_from_slice(&sig.s);
-    Some(alloy_primitives::keccak256(&data))
+    Some(alloy_primitives::keccak256(&*data))
 }
 
 // ============================================================================

@@ -1102,9 +1102,13 @@ fn batch_verify_impl(
     // would produce, so the dominant ecrecover below is skipped.
     // `verified_cache_key` returns None for session / non-EIP-712 actions, which
     // are never short-circuited.
+    let mut cache_key_scratch = Vec::new();
     let cache_hits: Vec<Option<Address>> = actions
         .iter()
-        .map(|action| crate::verified_cache_key(action).and_then(|k| verified_lookup(&k)))
+        .map(|action| {
+            crate::verified_cache_key_with_scratch(action, &mut cache_key_scratch)
+                .and_then(|k| verified_lookup(&k))
+        })
         .collect();
 
     // Phase 1: recover EIP-712 senders for cache MISSES only, under the chosen
