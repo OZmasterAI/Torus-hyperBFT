@@ -24,6 +24,13 @@ pub enum AtomicWriteOp<'a> {
 pub trait StateBackend: Clone + Send + Sync {
     fn get_cf_raw(&self, cf: &str, key: &[u8]) -> Result<Option<Vec<u8>>, StateError>;
     fn put_cf_raw(&self, cf: &str, key: &[u8], value: &[u8]) -> Result<(), StateError>;
+
+    /// Store a consumed value. Backends that retain writes may take ownership
+    /// of its allocation; the default preserves the borrowed write contract.
+    fn put_cf_raw_owned(&self, cf: &str, key: &[u8], value: Vec<u8>) -> Result<(), StateError> {
+        self.put_cf_raw(cf, key, &value)
+    }
+
     fn delete_cf_raw(&self, cf: &str, key: &[u8]) -> Result<(), StateError>;
 
     /// Iterate entries in a column family. `prefix: Some(p)` returns only keys
@@ -1037,6 +1044,19 @@ impl StateBackend for NativeStateOverlay {
         Ok(())
     }
 
+    fn put_cf_raw_owned(&self, cf: &str, key: &[u8], value: Vec<u8>) -> Result<(), StateError> {
+        let id = intern_cf(cf).ok_or_else(|| StateError::MissingColumnFamily(cf.to_string()))?;
+        let mut state = self.pending.write().unwrap();
+        if state.frozen {
+            return Err(PendingState::frozen_err());
+        }
+        state.record(id, key);
+        let cfp = state.cf_mut(id);
+        cfp.deletes.remove(key);
+        cfp.writes.insert(key.to_vec(), value);
+        Ok(())
+    }
+
     fn delete_cf_raw(&self, cf: &str, key: &[u8]) -> Result<(), StateError> {
         let id = intern_cf(cf).ok_or_else(|| StateError::MissingColumnFamily(cf.to_string()))?;
         let mut state = self.pending.write().unwrap();
@@ -1120,6 +1140,198 @@ mod tests {
         let dir = tempfile::tempdir().expect("create tempdir");
         let db = StateDb::open(dir.path()).expect("open db");
         (db, dir)
+    }
+
+    #[test]
+    fn owned_put_retains_value_allocation_through_freeze() {
+        let (db, _dir) = temp_db();
+        let overlay = NativeStateOverlay::new(db);
+        let cf = CF_NATIVE_BALANCES;
+        let id = intern_cf(cf).unwrap();
+        let mut key = b"owned".to_vec();
+        let mut value = Vec::with_capacity(4096);
+        value.extend_from_slice(b"serialized-body");
+        let allocation = (value.as_ptr(), value.capacity());
+        overlay.put_cf_raw_owned(cf, &key, value).unwrap();
+        key.fill(0); // key remains borrowed at the API and is still copied.
+        {
+            let state = overlay.pending.read().unwrap();
+            let stored = state.cf(id).writes.get(b"owned".as_slice()).unwrap();
+            assert_eq!((stored.as_ptr(), stored.capacity()), allocation);
+            assert_eq!(stored, b"serialized-body");
+        }
+        let frozen = overlay.freeze(1);
+        let stored = frozen.state.cf(id).writes.get(b"owned".as_slice()).unwrap();
+        assert_eq!((stored.as_ptr(), stored.capacity()), allocation);
+    }
+
+    #[test]
+    fn owned_put_mixed_writes_deletes_and_nested_rollback_match_borrowed() {
+        let (db, _dir) = temp_db();
+        let cf = CF_NATIVE_BALANCES;
+        db.put_cf_raw(cf, b"base", b"database").unwrap();
+        let borrowed = NativeStateOverlay::new(db.clone());
+        let mixed = NativeStateOverlay::new(db);
+        for (overlay, owned) in [(&borrowed, false), (&mixed, true)] {
+            let put = |key: &[u8], value: &[u8]| {
+                if owned {
+                    overlay.put_cf_raw_owned(cf, key, value.to_vec()).unwrap();
+                } else {
+                    overlay.put_cf_raw(cf, key, value).unwrap();
+                }
+            };
+            overlay.put_cf_raw(cf, b"old", b"original").unwrap();
+            overlay.delete_cf_raw(cf, b"base").unwrap();
+            put(b"retained", b"owned-before-checkpoint");
+            overlay.checkpoint();
+            put(b"old", b"overwrite");
+            put(b"base", b"resurrect");
+            overlay.delete_cf_raw(cf, b"retained").unwrap();
+            put(b"retained", b"resurrect-owned");
+            overlay.checkpoint();
+            overlay
+                .put_cf_raw(cf, b"old", b"borrowed-overwrite")
+                .unwrap();
+            put(b"fresh", b"inner");
+            overlay.commit_checkpoint();
+            overlay.revert_to_checkpoint();
+            assert_eq!(
+                overlay.get_cf_raw(cf, b"old").unwrap(),
+                Some(b"original".to_vec())
+            );
+            assert_eq!(
+                overlay.get_cf_raw(cf, b"retained").unwrap(),
+                Some(b"owned-before-checkpoint".to_vec())
+            );
+            assert_eq!(overlay.get_cf_raw(cf, b"base").unwrap(), None);
+            assert_eq!(overlay.get_cf_raw(cf, b"fresh").unwrap(), None);
+            // Retain a successful owned overwrite and an empty value.
+            overlay.checkpoint();
+            put(b"old", b"committed");
+            put(b"empty", b"");
+            overlay.commit_checkpoint();
+        }
+        assert_eq!(
+            borrowed.iterate_cf(cf, None).unwrap(),
+            mixed.iterate_cf(cf, None).unwrap()
+        );
+        assert_eq!(borrowed.pending_write_count(), mixed.pending_write_count());
+        mixed.discard_tx();
+        assert_eq!(
+            mixed.get_cf_raw(cf, b"base").unwrap(),
+            Some(b"database".to_vec())
+        );
+        assert_eq!(mixed.get_cf_raw(cf, b"old").unwrap(), None);
+    }
+
+    #[test]
+    fn owned_put_parent_reads_and_frozen_flush_match_borrowed_root_and_rows() {
+        let (old_db, _old_dir) = temp_db();
+        let (owned_db, _owned_dir) = temp_db();
+        for (db, owned) in [(&old_db, false), (&owned_db, true)] {
+            let cf = CF_NATIVE_BALANCES;
+            db.put_cf_raw(cf, b"deleted", b"base").unwrap();
+            crate::native_trie::build_native_trie_to_cf(db).unwrap();
+            let put = |overlay: &NativeStateOverlay, key: &[u8], value: &[u8]| {
+                if owned {
+                    overlay.put_cf_raw_owned(cf, key, value.to_vec()).unwrap();
+                } else {
+                    overlay.put_cf_raw(cf, key, value).unwrap();
+                }
+            };
+            let parent_overlay = NativeStateOverlay::new(db.clone());
+            put(&parent_overlay, b"parent", b"previous-block");
+            put(&parent_overlay, b"shadow", b"parent-value");
+            parent_overlay.delete_cf_raw(cf, b"deleted").unwrap();
+            let parent = parent_overlay.freeze(1);
+            let child = NativeStateOverlay::with_parent(db.clone(), Some(parent.clone()));
+            assert_eq!(
+                child.get_cf_raw(cf, b"parent").unwrap(),
+                Some(b"previous-block".to_vec())
+            );
+            assert_eq!(child.get_cf_raw(cf, b"deleted").unwrap(), None);
+            child.checkpoint();
+            put(&child, b"parent", b"reverted-child");
+            child.revert_to_checkpoint();
+            assert_eq!(
+                child.get_cf_raw(cf, b"parent").unwrap(),
+                Some(b"previous-block".to_vec())
+            );
+            put(&child, b"shadow", b"child-value");
+            put(&child, b"deleted", b"revived");
+            put(&child, b"empty", b"");
+            child.delete_cf_raw(cf, b"parent").unwrap();
+            parent
+                .flush_with_native_trie_stats(db, Some(1), None, None)
+                .unwrap();
+            if owned {
+                child
+                    .freeze(2)
+                    .flush_with_native_trie_stats(db, Some(2), None, None)
+                    .unwrap();
+            } else {
+                child
+                    .flush_with_native_trie_stats(db, Some(2), None, None)
+                    .unwrap();
+            }
+            assert_eq!(
+                crate::native_trie::persisted_native_root(db).unwrap(),
+                crate::native_trie::native_root_full(db).unwrap()
+            );
+        }
+        // Includes the state rows, trie/bucket rows and applied-height marker.
+        for cf in crate::cf::ALL_CF_NAMES {
+            assert_eq!(
+                StateBackend::iterate_cf(&old_db, cf, None).unwrap(),
+                StateBackend::iterate_cf(&owned_db, cf, None).unwrap(),
+                "CF {cf}"
+            );
+        }
+    }
+
+    #[test]
+    fn owned_put_default_delegation_and_overlay_errors_match_borrowed() {
+        let (db, _dir) = temp_db();
+        let cf = CF_NATIVE_BALANCES;
+        // StateDb has no owned override: exercise the default trait delegation.
+        StateBackend::put_cf_raw_owned(&db, cf, b"key", b"owned".to_vec()).unwrap();
+        assert_eq!(db.get_cf_raw(cf, b"key").unwrap(), Some(b"owned".to_vec()));
+        StateBackend::put_cf_raw_owned(&db, cf, b"key", vec![]).unwrap();
+        assert_eq!(db.get_cf_raw(cf, b"key").unwrap(), Some(vec![]));
+        let missing = "missing-owned-cf";
+        assert_eq!(
+            StateBackend::put_cf_raw_owned(&db, missing, b"k", vec![1])
+                .unwrap_err()
+                .to_string(),
+            db.put_cf_raw(missing, b"k", &[1]).unwrap_err().to_string()
+        );
+        let overlay = NativeStateOverlay::new(db);
+        for frozen in [false, true] {
+            if frozen {
+                overlay.freeze(1);
+            }
+            assert_eq!(
+                overlay
+                    .put_cf_raw_owned(missing, b"k", vec![1])
+                    .unwrap_err()
+                    .to_string(),
+                overlay
+                    .put_cf_raw(missing, b"k", &[1])
+                    .unwrap_err()
+                    .to_string()
+            );
+            if frozen {
+                let clone = overlay.clone();
+                assert_eq!(
+                    clone
+                        .put_cf_raw_owned(cf, b"k", vec![1])
+                        .unwrap_err()
+                        .to_string(),
+                    overlay.put_cf_raw(cf, b"k", &[1]).unwrap_err().to_string()
+                );
+            }
+            assert_eq!(overlay.pending_write_count(), 0);
+        }
     }
 
     #[test]
