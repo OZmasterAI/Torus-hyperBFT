@@ -46,3 +46,21 @@ and 27 native integration tests plus a separate release node build under
 dispersed 8/16/32 targets are 0.999/1.000/0.973; endpoints 1.798/1.597 with
 noisy controls (back AA 0.782). This supports experimental live screening only,
 not a throughput claim. Default remains OFF.
+
+
+## Same-binary live screening outcome
+
+Frozen node SHA256 `b97c2cd29414dfb2ec9098b4d648a875c51de2b64634fb29f117e10e04ceedf4`
+from `5cf2d0c` ran OFF then ON, each at nominal 300 seconds, ten markets,
+crossing fraction 0.25, with cancellation attribution ON and fixed keys OFF.
+`s60-deep-policy-off-300-r1` ACCEPT: 17,528.4 fills/s over 306s, drain130.
+`s60-deep-policy-on-300-r1` ACCEPT: 16,451.1 fills/s over 306s, drain95.
+Both passed liveness, agreement and dissemination checks. The candidate is
+6.15% lower in this pair; it has not earned promotion and stays default OFF.
+
+Whole-log val0 cancel-book time was 183.80s OFF versus 135.43s ON, but these
+runs processed different work: 6254/7779 completed calls, 253/291 blocks and
+4,045,126/3,929,889 canceled orders. ON also had slower idle chain probes
+before load (last probe1.0 versus OFF27.9blk/s). These observations do not
+isolate causal cost savings or prove a causal throughput regression. A reversed
+repeat would be needed before revisiting this candidate; no default is changed.
