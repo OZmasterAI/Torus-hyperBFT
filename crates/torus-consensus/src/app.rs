@@ -705,13 +705,17 @@ impl PendingProposal {
     /// already derived for selection exclusion and commit cache matching.
     fn encode(&self, compact: bool) -> Vec<u8> {
         if compact {
-            let compact = CompactBlock {
-                header: self.block.header.clone(),
-                native_action_hashes: self.native_action_hashes().to_vec(),
-                evm_transactions: self.block.evm_transactions.clone(),
-                core_writer_actions: self.block.core_writer_actions.clone(),
-            };
-            bincode::serialize(&compact).expect("serialize CompactBlock")
+            // Bincode encodes structs and fixed tuples as the same field
+            // sequence (no names or field-count prefix). Borrow the fields in
+            // CompactBlock's wire order instead of cloning every payload.
+            // Differential wire-format tests pin this to CompactBlock itself.
+            bincode::serialize(&(
+                &self.block.header,
+                self.native_action_hashes(),
+                &self.block.evm_transactions,
+                &self.block.core_writer_actions,
+            ))
+            .expect("serialize CompactBlock")
         } else {
             bincode::serialize(&self.block).expect("serialize TorusBlock")
         }
@@ -7899,6 +7903,46 @@ mod crash_recovery_tests {
                     encode_proposal_datum(&block, compact)
                 );
                 assert_eq!(pending.native_action_hashes.get().is_some(), compact);
+            }
+        }
+    }
+
+    #[test]
+    fn pending_proposal_borrowed_encoding_matches_owned_for_inline_payloads() {
+        let evm_payloads = [
+            vec![],
+            vec![vec![]],
+            vec![vec![0x12; 131_072], vec![], vec![0x34; 257]],
+        ];
+        let core_payloads = [
+            vec![],
+            vec![torus_types::CoreWriterAction::PermanentStake {
+                amount: U256::from(42),
+            }; 3],
+        ];
+        for actions in [vec![], vec![sign_claim_rewards(1), sign_claim_rewards(2)]] {
+            for evm in &evm_payloads {
+                for core in &core_payloads {
+                    let mut block = make_block(7, actions.clone());
+                    block.header.evm_tx_count = evm.len() as u32;
+                    block.evm_transactions = evm.clone();
+                    block.core_writer_actions = core.clone();
+                    let pending = PendingProposal::new(block.clone());
+                    let encoded = pending.encode(true);
+                    let owned = CompactBlock::from_block(&block);
+                    assert_eq!(encoded, bincode::serialize(&owned).unwrap());
+                    let decoded: CompactBlock = bincode::deserialize(&encoded).unwrap();
+                    assert_eq!(decoded.native_action_hashes, owned.native_action_hashes);
+                    assert_eq!(decoded.evm_transactions, block.evm_transactions);
+                    assert_eq!(
+                        bincode::serialize(&decoded.core_writer_actions).unwrap(),
+                        bincode::serialize(&block.core_writer_actions).unwrap()
+                    );
+                    assert_eq!(
+                        pending.encode(false),
+                        bincode::serialize(&block).unwrap()
+                    );
+                }
             }
         }
     }
