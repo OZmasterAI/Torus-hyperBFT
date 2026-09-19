@@ -41,6 +41,7 @@ load generator is running. Account remaining percentage is not exposed.
 | Executor allocation | Pre-size flattened actions and place-order indices from valid batch lengths; preserve execution and skip order | `90e04d2` |
 | Trade writer | Accept packed byte-arena batches alongside the old raw-row API, preserving queue and write-chunk behavior | `e4cf9a4` |
 | Trade history | Build fixed-size rows and use packed production handoff instead of six small key/value allocations per fill | `5582366` |
+| Reserve arithmetic | Extend exact raw integer-leverage division to per-order reservation/release and single cancellation, retaining old rounding and panic order | `796a70e` |
 
 The cancellation implementation and eligibility proof are in
 [cancel-batch-2026-09-19.md](cancel-batch-2026-09-19.md). The integer arithmetic
@@ -100,6 +101,11 @@ one unique-test total. Ignored timing probes remained ignored.
   the encoder oracle, eight settlement, three deferred-trade and one consensus
   writer test passed (`b20a69ca-d657-49f3-9378-b029ee6e09ac`). Details and memory
   tradeoffs: [packed-trade-history-2026-09-19.md](packed-trade-history-2026-09-19.md).
+- Reserve arithmetic extension: four arithmetic differential tests and 38
+  maker-accounting/matching/settlement tests passed. Receipt
+  `86ddf6b9-2147-45e7-a3dc-587d5dabfb70`. The original i256 formula remains
+  the test oracle; this is exact SCALE cancellation for a u32 leverage divisor,
+  with nonpositive quantity/price gates and zero-divisor panic behavior retained.
 
 The initial broad network run exposed the existing ban-file race: 128 tests
 passed and `ban_list_persistence` failed. That issue is now fixed and the latest
