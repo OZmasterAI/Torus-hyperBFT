@@ -1339,8 +1339,11 @@ Changing margin/balance handling alone therefore cannot materially shorten those
 calls. Matching and settlement already have parallel execution paths; increasing
 those worker counts is not a demonstrated fix for this serial action cost.
 
-The next architectural experiment should target queue removal representation or
-safe action partitioning across markets. A representation change must preserve
+Before choosing a larger rewrite, split book cancellation timing into index and
+position lookup, queue removal/compaction, and journal/commitment bookkeeping.
+The current diagnostic attributes the entire book operation; it does not prove
+that memory movement alone dominates it. Queue representation and safe action
+partitioning across markets are the next architectural hypotheses to evaluate. A representation change must preserve
 FIFO, canonical cancellation output, row journals, incremental commitments and
 recovery. Market partitioning must account for shared trader balances, order and
 error precedence, and deterministic merge order; treating markets as independent
@@ -1415,3 +1418,68 @@ gain claim or proof of causal throughput regression. A reversed repeat remains
 necessary if this candidate is revisited. The experiment has not solved the
 measured cancellation bottleneck or established a route to200k by threshold
 changes alone.
+
+
+### Sustained baseline and final screening outcome
+
+`s60-sustained-fixed-off-600-r1` used the original frozen fixed-key artifact with
+fixed keys and pipeline OFF, nominal 600 seconds and ordinary crossing fraction
+0.5. It observed **34,215.2 fills/s over 613 seconds**, first120 46,495.4 and
+best60 57,242.2. Drain 101 seconds, liveness PASS and state agreement AGREE.
+It is **REJECT**, because val2 exhausted one body fetch and fell back to sync
+at 04:09:05.716085 UTC, inside load. The scorer's two dissemination-failure counts
+are the exhaustion and fallback of this one episode, not two independent faults.
+The 53.57 GiB completed databases were removed after evidence retention.
+
+Same-run val0 windows, sampled wholly inside the load interval:
+
+| Metric | First120 seconds | Last120 seconds |
+| --- | ---: | ---: |
+| Fills/s | 46,495.4 | 25,530.8 |
+| Engine elapsed ms/completed engine block | 390.84 | 976.26 |
+| Phase1 actions ms/completed engine block | 64.59 | 573.07 |
+| Matching ms/completed engine block | 87.65 | 107.66 |
+| Settlement ms/completed engine block | 171.65 | 246.02 |
+| Save-books ms/observation | 106.93 | 210.63 |
+| Flush ms/observation | 222.61 | 364.80 |
+| Resting orders at window end | 1,110,957 | 1,858,731 |
+| Execution queue at window end | 25 | 53 |
+
+The first window has 144 engine/native observations. The last has 69 engine and
+68 native/save/flush observations at the scrape boundary; each histogram uses
+its matching count. These are elapsed timings, not CPU attribution. No RocksDB
+stall time increment was reported in either window. Full per-node windows and
+minute bins are retained in the cell's `.windows.json`. Offered/ACKed actions
+were 210,120; processed actions 92,733; nonce-expired evictions were
+118,174/118,202/118,096. ACKs do not establish execution of the offered load.
+
+This continuation completed ten chain cells and two isolated microbenchmarks.
+The compact, committed results inventory is
+[`throughput-campaign-2026-09-19-results.json`](throughput-campaign-2026-09-19-results.json).
+The resource audit intersects six recorded Torus verification intervals with
+all twelve benchmark intervals, using the entire runner lifetime rather than
+only load/drain: **zero overlaps**. Its receipt is
+`/home/18c/bench-results-matched/s60-campaign-20260918/scheduler-overlap-audit.json`.
+This confirms the recorded project checks were separate; the host remains shared.
+
+| Requested step | Outcome | Remaining gate |
+| --- | --- | --- |
+| 1. Reversed fixed-key pair | Both cells rejected; prior one-pair gain unconfirmed | Healthy repeated pairs |
+| 2. Deeper book and burst | Both accepted; burst pause recovery observed | Repeats before generalization |
+| 3. Network diagnostics | Runtime/parser qualified and one healthy live cell analyzed | Reproduce failed dissemination with this tracing |
+| 4. Default decision | Fixed keys remain OFF | Repeatable accepted benefit |
+| 5. Measured bottleneck | Cancel-book attribution established; two threshold policies tested | No demonstrated end-to-end optimization gain |
+| 6. Recovery | Positive one-block replay and final state agreement | Liveness failed; controlled three-validator C1 remains unqualified |
+| 7. Sustained test | Ten-minute nominal baseline measured | Rejected on dissemination; no accepted sustained claim |
+| 8. Route toward 200k | Prioritize book-operation sub-stages, then representation/market partition hypotheses | Determinism/recovery checks and dedicated-host measurements before architecture claims |
+
+No feature defaults, consensus rules or acceptance gates were relaxed. No 200k
+result or hardware ceiling is established. The next most useful work is a failed
+long-run capture with the qualified network tracing, finer cancellation-book
+attribution, and controlled C1 qualification. Retest a code change with matched
+workloads and reversed order before revisiting promotion. All completed databases
+from this continuation are gone; compressed logs, metrics, digests, frozen
+binaries, manifests and analysis remain. Three redundant raw logs from the
+failed fixed-key ON repeat were removed only after their gzip copies were proven
+to decompress to identical bytes, recorded in
+`duplicate-raw-log-retention-20260919.json`.

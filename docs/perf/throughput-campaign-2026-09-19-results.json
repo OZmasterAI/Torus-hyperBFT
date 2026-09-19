@@ -1,0 +1,218 @@
+{
+  "scope": "2026-09-19 continuation; ten chain cells, distinct workloads and runtimes; no cross-workload gain claims",
+  "campaign_root": "/home/18c/bench-results-matched/s60-campaign-20260918",
+  "cells": [
+    {
+      "label": "s60-fixed-keys-on-10m-r2",
+      "verdict": "REJECT",
+      "fills_s": 3431.5,
+      "first120_fills_s": 6241.4,
+      "best60_fills_s": 12482.8,
+      "measured_load_s": 305,
+      "drain_s": 70,
+      "liveness": "FAIL",
+      "agreement": "AGREE",
+      "dissemination_clean": false,
+      "fail_reasons": [
+        "drain not established",
+        "liveness failed",
+        "dissemination failures"
+      ],
+      "crash_gate": null,
+      "binaries": {
+        "torus-node": "b6f804a23bcbcf10b5f57018c0d94b86af6947231fbb236161e0a4d3dbfd9d1c",
+        "bench-throughput": "9c210f31cefdb4febb111e7f21d62628f98fdedf727b59e6372028c9cc73d4a6"
+      },
+      "summary_sha256": "cfb4f50508c5aa885b8c2814702b4a864a0f4147f8798047a1e33bef956a3f7e",
+      "database_removed": true
+    },
+    {
+      "label": "s60-fixed-keys-off-10m-r2",
+      "verdict": "REJECT",
+      "fills_s": 36646.7,
+      "first120_fills_s": 52703.3,
+      "best60_fills_s": 58836.9,
+      "measured_load_s": 307,
+      "drain_s": 70,
+      "liveness": "PASS",
+      "agreement": "AGREE",
+      "dissemination_clean": false,
+      "fail_reasons": [
+        "dissemination failures"
+      ],
+      "crash_gate": null,
+      "binaries": {
+        "torus-node": "b6f804a23bcbcf10b5f57018c0d94b86af6947231fbb236161e0a4d3dbfd9d1c",
+        "bench-throughput": "9c210f31cefdb4febb111e7f21d62628f98fdedf727b59e6372028c9cc73d4a6"
+      },
+      "summary_sha256": "4093ddcbdde9f9b9119c5b46fb190a83ff8a097b0b6b7de9d9767208b14ccfe4",
+      "database_removed": true
+    },
+    {
+      "label": "s60-deeper-fixed-off-10m-r1",
+      "verdict": "ACCEPT",
+      "fills_s": 17625.2,
+      "first120_fills_s": 24948.6,
+      "best60_fills_s": 30925.8,
+      "measured_load_s": 306,
+      "drain_s": 176,
+      "liveness": "PASS",
+      "agreement": "AGREE",
+      "dissemination_clean": true,
+      "fail_reasons": [],
+      "crash_gate": null,
+      "binaries": {
+        "torus-node": "b6f804a23bcbcf10b5f57018c0d94b86af6947231fbb236161e0a4d3dbfd9d1c",
+        "bench-throughput": "9c210f31cefdb4febb111e7f21d62628f98fdedf727b59e6372028c9cc73d4a6"
+      },
+      "summary_sha256": "3b2944799cf34e1b5ae718215e258eba1f728f3c6fe97cf740ef19f7937cbe3f",
+      "database_removed": true
+    },
+    {
+      "label": "s60-burst-fixed-off-10m-r1",
+      "verdict": "ACCEPT",
+      "fills_s": 32008.5,
+      "first120_fills_s": 44021.8,
+      "best60_fills_s": 59763.3,
+      "measured_load_s": 304,
+      "drain_s": 86,
+      "liveness": "PASS",
+      "agreement": "AGREE",
+      "dissemination_clean": true,
+      "fail_reasons": [],
+      "crash_gate": null,
+      "binaries": {
+        "torus-node": "b6f804a23bcbcf10b5f57018c0d94b86af6947231fbb236161e0a4d3dbfd9d1c",
+        "bench-throughput": "9c210f31cefdb4febb111e7f21d62628f98fdedf727b59e6372028c9cc73d4a6"
+      },
+      "summary_sha256": "26fd5b5d3e39305e3c51318294a3ddd0e3ecc600d1d750f89f03e98e0eed99ce",
+      "database_removed": true
+    },
+    {
+      "label": "s60-swarm-poll-10m-r1",
+      "verdict": "ACCEPT",
+      "fills_s": 41723.7,
+      "first120_fills_s": 50081.8,
+      "best60_fills_s": 58558.2,
+      "measured_load_s": 306,
+      "drain_s": 176,
+      "liveness": "PASS",
+      "agreement": "AGREE",
+      "dissemination_clean": true,
+      "fail_reasons": [],
+      "crash_gate": null,
+      "binaries": {
+        "torus-node": "4c325452a0df310776c56a7e47b523af6906d4a4022e9f091144a3e20497f386",
+        "bench-throughput": "9c210f31cefdb4febb111e7f21d62628f98fdedf727b59e6372028c9cc73d4a6"
+      },
+      "summary_sha256": "6be35d674a9c99975e09390bf8df5fea241946e6cda8af308d3ad588afe87ebb",
+      "database_removed": true
+    },
+    {
+      "label": "s60-cancel-attribution-deeper-r1",
+      "verdict": "ACCEPT",
+      "fills_s": 17009.1,
+      "first120_fills_s": 26505.4,
+      "best60_fills_s": 30689.6,
+      "measured_load_s": 308,
+      "drain_s": 137,
+      "liveness": "PASS",
+      "agreement": "AGREE",
+      "dissemination_clean": true,
+      "fail_reasons": [],
+      "crash_gate": null,
+      "binaries": {
+        "torus-node": "c99af0289f10fb79810e4fd14954c12c7f6d53c78cf7f51068475ce5f97740f2",
+        "bench-throughput": "9c210f31cefdb4febb111e7f21d62628f98fdedf727b59e6372028c9cc73d4a6"
+      },
+      "summary_sha256": "4fdeae3ed8fb4cc8cb544c81eaf3e5540f6f77ca61a7a336cb9ae61771f43eda",
+      "database_removed": true
+    },
+    {
+      "label": "s60-pipeline-replay-120-r1",
+      "verdict": "REJECT",
+      "fills_s": 34245.1,
+      "first120_fills_s": 34273.7,
+      "best60_fills_s": 61881.7,
+      "measured_load_s": 125,
+      "drain_s": 71,
+      "liveness": "FAIL",
+      "agreement": "AGREE",
+      "dissemination_clean": true,
+      "fail_reasons": [
+        "drain not established",
+        "liveness failed"
+      ],
+      "crash_gate": "PASS",
+      "binaries": {
+        "torus-node": "b6f804a23bcbcf10b5f57018c0d94b86af6947231fbb236161e0a4d3dbfd9d1c",
+        "bench-throughput": "9c210f31cefdb4febb111e7f21d62628f98fdedf727b59e6372028c9cc73d4a6"
+      },
+      "summary_sha256": "031f0b2d22ef939d1f10c90ab07afc5b30fa477c18e92f7faf1328baebd5fae3",
+      "database_removed": true
+    },
+    {
+      "label": "s60-deep-policy-off-300-r1",
+      "verdict": "ACCEPT",
+      "fills_s": 17528.4,
+      "first120_fills_s": 26324.3,
+      "best60_fills_s": 31750.1,
+      "measured_load_s": 306,
+      "drain_s": 130,
+      "liveness": "PASS",
+      "agreement": "AGREE",
+      "dissemination_clean": true,
+      "fail_reasons": [],
+      "crash_gate": null,
+      "binaries": {
+        "torus-node": "b97c2cd29414dfb2ec9098b4d648a875c51de2b64634fb29f117e10e04ceedf4",
+        "bench-throughput": "9c210f31cefdb4febb111e7f21d62628f98fdedf727b59e6372028c9cc73d4a6"
+      },
+      "summary_sha256": "bcae77fc90143bc3a323ea4cb5c025dca2c2ef50fc0f6de24d66ba90ad06be51",
+      "database_removed": true
+    },
+    {
+      "label": "s60-deep-policy-on-300-r1",
+      "verdict": "ACCEPT",
+      "fills_s": 16451.1,
+      "first120_fills_s": 26424.8,
+      "best60_fills_s": 32213.1,
+      "measured_load_s": 306,
+      "drain_s": 95,
+      "liveness": "PASS",
+      "agreement": "AGREE",
+      "dissemination_clean": true,
+      "fail_reasons": [],
+      "crash_gate": null,
+      "binaries": {
+        "torus-node": "b97c2cd29414dfb2ec9098b4d648a875c51de2b64634fb29f117e10e04ceedf4",
+        "bench-throughput": "9c210f31cefdb4febb111e7f21d62628f98fdedf727b59e6372028c9cc73d4a6"
+      },
+      "summary_sha256": "eb65b7af6473a67f6850851cfaf41fca4332558e58005e16ec8cc640d73bb1be",
+      "database_removed": true
+    },
+    {
+      "label": "s60-sustained-fixed-off-600-r1",
+      "verdict": "REJECT",
+      "fills_s": 34215.2,
+      "first120_fills_s": 46495.4,
+      "best60_fills_s": 57242.2,
+      "measured_load_s": 613,
+      "drain_s": 101,
+      "liveness": "PASS",
+      "agreement": "AGREE",
+      "dissemination_clean": false,
+      "fail_reasons": [
+        "dissemination failures"
+      ],
+      "crash_gate": null,
+      "binaries": {
+        "torus-node": "b6f804a23bcbcf10b5f57018c0d94b86af6947231fbb236161e0a4d3dbfd9d1c",
+        "bench-throughput": "9c210f31cefdb4febb111e7f21d62628f98fdedf727b59e6372028c9cc73d4a6"
+      },
+      "summary_sha256": "7284029fcef39c90999b92a24668c5219733cb52a82b7beabb08fac24f908c73",
+      "database_removed": true
+    }
+  ],
+  "recorded_verification_benchmark_overlaps": []
+}
