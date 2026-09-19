@@ -20,6 +20,8 @@ use torus_types::{
 use crate::error::CoreError;
 use crate::position::{borsh_read_address, borsh_read_fp, borsh_write_address, borsh_write_fp};
 
+mod cancel_batch;
+
 const MAX_ORDERS_PER_TRADER_PER_MARKET: usize = 200;
 
 // ============================================================================
@@ -641,6 +643,11 @@ impl OrderBook {
             Some(ids) => ids,
             None => return vec![],
         };
+
+        if let Some(cancelled) = self.try_cancel_all_batch(&order_ids) {
+            self.pending_stops.retain(|s| s.trader != trader);
+            return cancelled;
+        }
 
         let mut cancelled = Vec::with_capacity(order_ids.len());
         let cache_on = self.level_hash_cache.is_some();
