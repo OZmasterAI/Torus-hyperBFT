@@ -45,6 +45,9 @@ mod deferred_trade_fixed_keys_tests;
 
 use crate::market_workers::{MarketWorkerPool, MatchRequest};
 
+#[path = "cancel_all_diag.rs"]
+mod cancel_all_diag;
+
 // ============================================================================
 // Result types
 // ============================================================================
@@ -4706,15 +4709,24 @@ impl NativeExecutor {
         sender: &Address,
         market_id: Option<MarketId>,
     ) -> NativeActionResult {
+        let mut diagnostic = cancel_all_diag::enabled().then(cancel_all_diag::Diagnostic::default);
+        let diagnostic_started = diagnostic.as_ref().map(|_| std::time::Instant::now());
         // FIX 2 (ECON-FIND-05): Compute total margin to release from cancelled orders.
         let mut total_margin_release = FixedPoint::ZERO;
 
         match market_id {
             Some(mid) => {
                 if let Some(book) = ctx.order_books.get_mut(&mid) {
+                    let book_started = diagnostic.as_ref().map(|_| std::time::Instant::now());
                     let cancelled = book.cancel_all(*sender, Some(mid));
+                    if let (Some(d), Some(start)) = (diagnostic.as_mut(), book_started) {
+                        d.book_ns += start.elapsed().as_nanos();
+                        d.markets += 1;
+                        d.orders += cancelled.len() as u64;
+                    }
                     if !cancelled.is_empty() {
                         ctx.dirty_books.insert(mid);
+                        let margin_started = diagnostic.as_ref().map(|_| std::time::Instant::now());
                         let cfg = ctx.margin_configs.get(&mid);
                         for order in &cancelled {
                             let notional = order.price * order.remaining_qty;
@@ -4724,6 +4736,9 @@ impl NativeExecutor {
                             total_margin_release +=
                                 Self::cancel_all_margin_at_leverage(notional, max_lev);
                         }
+                        if let (Some(d), Some(start)) = (diagnostic.as_mut(), margin_started) {
+                            d.margin_ns += start.elapsed().as_nanos();
+                        }
                     }
                 }
             }
@@ -4731,9 +4746,17 @@ impl NativeExecutor {
                 let market_ids: Vec<MarketId> = ctx.order_books.keys().copied().collect();
                 for mid in market_ids {
                     if let Some(book) = ctx.order_books.get_mut(&mid) {
+                        let book_started = diagnostic.as_ref().map(|_| std::time::Instant::now());
                         let cancelled = book.cancel_all(*sender, None);
+                        if let (Some(d), Some(start)) = (diagnostic.as_mut(), book_started) {
+                            d.book_ns += start.elapsed().as_nanos();
+                            d.markets += 1;
+                            d.orders += cancelled.len() as u64;
+                        }
                         if !cancelled.is_empty() {
                             ctx.dirty_books.insert(mid);
+                            let margin_started =
+                                diagnostic.as_ref().map(|_| std::time::Instant::now());
                             let cfg = ctx.margin_configs.get(&mid);
                             for order in &cancelled {
                                 let notional = order.price * order.remaining_qty;
@@ -4743,21 +4766,36 @@ impl NativeExecutor {
                                 total_margin_release +=
                                     Self::cancel_all_margin_at_leverage(notional, max_lev);
                             }
+                            if let (Some(d), Some(start)) = (diagnostic.as_mut(), margin_started) {
+                                d.margin_ns += start.elapsed().as_nanos();
+                            }
                         }
                     }
                 }
             }
         }
 
+        let balance_started = diagnostic.as_ref().map(|_| std::time::Instant::now());
         if total_margin_release > FixedPoint::ZERO {
             if let Ok(mut bal) = ctx.positions.get_native_balance(sender) {
                 let release = total_margin_release.min(bal.order_margin);
                 bal.order_margin -= release;
                 bal.available += release;
-                let _ = ctx.positions.put_native_balance(sender, &bal);
+                let written = ctx.positions.put_native_balance(sender, &bal);
+                if let Some(d) = diagnostic.as_mut() {
+                    d.balance_write_errors += u64::from(written.is_err());
+                }
+            } else if let Some(d) = diagnostic.as_mut() {
+                d.balance_read_errors += 1;
             }
         }
 
+        if let (Some(d), Some(start)) = (diagnostic.as_mut(), balance_started) {
+            d.balance_ns += start.elapsed().as_nanos();
+        }
+        if let (Some(d), Some(start)) = (diagnostic, diagnostic_started) {
+            d.emit(start, ctx.block_height, market_id);
+        }
         NativeActionResult::ok("cancel_all", 500)
     }
 
