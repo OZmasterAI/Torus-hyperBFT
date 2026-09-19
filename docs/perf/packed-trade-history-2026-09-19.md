@@ -34,3 +34,7 @@ Tradeoffs: `TradeKvs` grows to 297 inline bytes. Packing copies rows into an are
 and arena growth may move its contents. The legacy drain adds conversion copies.
 Allocation removal does not establish a net throughput or latency improvement;
 no benchmark was run.
+
+The existing trade microbenchmark's source now calls the production packed drain
+instead of measuring the legacy allocating conversion. The harness was not run
+or separately compiled during this session; this is only a two-line API update.

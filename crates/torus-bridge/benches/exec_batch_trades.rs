@@ -3,7 +3,7 @@
 //! buys (200 fills = 600 trade-history KVs per block). A/B the per-fill
 //! trade-persist cost: inline overlay PUTs (pre-O3) vs deferred buffering
 //! (`ctx.defer_trades`, the live path with a background writer). The deferred
-//! variant times `take_pending_trades` too — the handoff the exec thread pays;
+//! variant times `take_pending_trade_batch` too — the handoff the exec thread pays;
 //! the RocksDB write itself is off-thread and intentionally not measured.
 
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
@@ -107,7 +107,7 @@ fn bench_trades(c: &mut Criterion, name: &str, defer: bool) {
                 let result = NativeExecutor::execute_batch(&mut ctx, &buys);
                 assert!(result.results.iter().all(|r| r.success));
                 // The exec thread's full O3 cost includes the buffer handoff.
-                let pending = ctx.take_pending_trades();
+                let pending = ctx.take_pending_trade_batch();
                 if defer {
                     assert_eq!(pending.len(), FILLS_PER_BLOCK * 3);
                 } else {
