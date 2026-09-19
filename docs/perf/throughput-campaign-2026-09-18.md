@@ -1396,3 +1396,22 @@ chain gains. Micro logs, manifests, frozen test binaries, hashes and all order
 strata are retained in `deep-compaction-micro-r1` and `deep-compaction-micro-r2`.
 The second candidate will receive enabled integration checks and a separate
 node build before a same-binary live OFF/ON comparison. It remains default OFF.
+
+
+The narrower policy qualified with 37 enabled bridge tests and a separate node
+build (`187c5329`), then was frozen as `5cf2d0c`, node SHA256
+`b97c2cd29414dfb2ec9098b4d648a875c51de2b64634fb29f117e10e04ceedf4`.
+Same-binary deep300 screening accepted both cells: OFF **17,528.4 fills/s** over
+306 seconds, drain130; ON **16,451.1** over306, drain95. Both PASS/AGREE with
+clean dissemination. ON is 6.15% lower in this pair; no promotion is warranted.
+The candidate remains isolated and default OFF. OFF/ON completed databases
+were 25.61/28.61GiB and were retained then removed.
+
+Whole-log val0 cancel-book elapsed time was 183.80s OFF versus135.43s ON, but
+completed calls were6254/7779, blocks253/291, canceled orders4,045,126/3,929,889.
+The ON run also had slow idle probes before load (final1.0 versus27.9blk/s).
+Different processed work and startup behavior prevent a causal per-call/engine
+gain claim or proof of causal throughput regression. A reversed repeat remains
+necessary if this candidate is revisited. The experiment has not solved the
+measured cancellation bottleneck or established a route to200k by threshold
+changes alone.
