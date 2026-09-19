@@ -1914,7 +1914,7 @@ impl ExecutionContext {
 
             // O3: this block's buffered trade-history KVs (handed to the background
             // writer AFTER the flush / hand-off below, never before).
-            let trades = ctx.take_pending_trades();
+            let trades = ctx.take_pending_trade_batch();
 
             if pipelined {
                 // bl2 exec pipeline FAST PATH. The applied-height marker goes into
@@ -2051,12 +2051,12 @@ impl ExecutionContext {
             // which is a cosmetic RPC trade-history gap, never consensus state.
             if !trades.is_empty() {
                 let fallback = match &self.trade_writer {
-                    Some(writer) => writer.send(trades).err(),
+                    Some(writer) => writer.send_packed(trades).err(),
                     None => Some(trades),
                 };
                 // Writer gone (or absent): write synchronously so no rows are lost.
                 if let Some(kvs) = fallback {
-                    for (cf, key, value) in &kvs {
+                    for (cf, key, value) in kvs.iter() {
                         let _ = self.state_db.put_cf_raw(cf, key, value);
                     }
                 }

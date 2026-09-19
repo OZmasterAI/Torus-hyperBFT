@@ -143,7 +143,7 @@ fn defer_on_buffers_trades_and_bytes_match_inline() {
         "deferred mode must not write CF_NATIVE_USER_TRADES during exec"
     );
 
-    let pending = ctx_b.take_pending_trades();
+    let pending = ctx_b.take_pending_trade_batch();
     assert_eq!(
         pending.len(),
         9,
@@ -154,10 +154,15 @@ fn defer_on_buffers_trades_and_bytes_match_inline() {
         "take_pending_trades must drain the buffer"
     );
 
-    // Apply the buffered KVs (as the background writer would) and compare.
-    for (cf, key, value) in &pending {
-        db_b.put_cf_raw(cf, key, value).unwrap();
-    }
+    // Use the real packed writer across row boundaries, then drain on shutdown.
+    let writer = torus_state::BackgroundCfWriter::spawn_with_policy(
+        db_b.clone(),
+        "packed-trade-test",
+        1,
+        torus_state::BgWriterPolicy { chunk_kvs: 2, low_pri: false },
+    );
+    writer.send_packed(pending).unwrap();
+    drop(writer);
     assert_eq!(
         cf_rows(&db_b, CF_NATIVE_TRADES),
         ref_trades,

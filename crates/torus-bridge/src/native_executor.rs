@@ -22,7 +22,7 @@ use torus_economics::{
     EpochManager, GovernanceManager, RewardDistributor, StakingManager, ValidatorStatus,
 };
 use torus_state::cf::{CF_NATIVE_TRADES, CF_NATIVE_USER_TRADES};
-use torus_state::{RawCfKv, StateBackend, StateDb};
+use torus_state::{PackedCfBatch, RawCfKv, StateBackend, StateDb};
 use torus_types::{
     FixedPoint, MarketId, NativeAction, OrderId, OrderType, PlaceOrderParams, PublicKey,
     SessionScope, Side, TimeInForce, ValidatorInfo, ValidatorSet, VoteOption, U256,
@@ -189,12 +189,16 @@ struct PreparedOrder<'a> {
 /// byte-identical to the sequential path's inline `persist_trade` calls.
 struct TradeKvs {
     trade_key: [u8; 20],
-    trade_data: Vec<u8>,
+    trade_data: [u8; 65],
     maker_key: [u8; 32],
-    maker_data: Vec<u8>,
+    maker_data: [u8; 74],
     taker_key: [u8; 32],
-    taker_data: Vec<u8>,
+    taker_data: [u8; 74],
 }
+
+#[cfg(test)]
+#[path = "trade_kvs_tests.rs"]
+mod trade_kvs_tests;
 
 impl TradeKvs {
     /// Byte-identical to the classic inline `persist_trade` construction.
@@ -218,28 +222,27 @@ impl TradeKvs {
         let quantity_raw = fill.quantity.raw();
 
         // Borsh-serialize trade data (matches StoredTrade layout).
-        // 16+16+16+1+8+8 = 65 bytes exactly (the classic with_capacity(64)
-        // paid one realloc per fill).
-        let mut trade_data = Vec::with_capacity(65);
-        trade_data.extend_from_slice(&trade_id.to_le_bytes());
-        trade_data.extend_from_slice(&price_raw.to_le_bytes());
-        trade_data.extend_from_slice(&quantity_raw.to_le_bytes());
-        trade_data.push(taker_side);
-        trade_data.extend_from_slice(&block_height.to_le_bytes());
-        trade_data.extend_from_slice(&timestamp.to_le_bytes());
+        // Fixed-width rows need no separate heap allocation per fill.
+        let mut trade_data = [0u8; 65];
+        trade_data[..16].copy_from_slice(&trade_id.to_le_bytes());
+        trade_data[16..32].copy_from_slice(&price_raw.to_le_bytes());
+        trade_data[32..48].copy_from_slice(&quantity_raw.to_le_bytes());
+        trade_data[48] = taker_side;
+        trade_data[49..57].copy_from_slice(&block_height.to_le_bytes());
+        trade_data[57..65].copy_from_slice(&timestamp.to_le_bytes());
 
         // Secondary index: per-user trades (descending block order).
         // 16+8+16+16+1+1+8+8 = 74 bytes exactly.
         let desc_block = u64::MAX - block_height;
-        let mut maker_data = Vec::with_capacity(74);
-        maker_data.extend_from_slice(&trade_id.to_le_bytes());
-        maker_data.extend_from_slice(&market_id.to_le_bytes());
-        maker_data.extend_from_slice(&price_raw.to_le_bytes());
-        maker_data.extend_from_slice(&quantity_raw.to_le_bytes());
-        maker_data.push(taker_side);
-        maker_data.push(0u8); // role: maker
-        maker_data.extend_from_slice(&block_height.to_le_bytes());
-        maker_data.extend_from_slice(&timestamp.to_le_bytes());
+        let mut maker_data = [0u8; 74];
+        maker_data[..16].copy_from_slice(&trade_id.to_le_bytes());
+        maker_data[16..24].copy_from_slice(&market_id.to_le_bytes());
+        maker_data[24..40].copy_from_slice(&price_raw.to_le_bytes());
+        maker_data[40..56].copy_from_slice(&quantity_raw.to_le_bytes());
+        maker_data[56] = taker_side;
+        maker_data[57] = 0u8; // role: maker
+        maker_data[58..66].copy_from_slice(&block_height.to_le_bytes());
+        maker_data[66..74].copy_from_slice(&timestamp.to_le_bytes());
 
         let mut maker_key = [0u8; 32];
         maker_key[..20].copy_from_slice(fill.maker.as_slice());
@@ -247,7 +250,7 @@ impl TradeKvs {
         maker_key[28..32].copy_from_slice(&trade_index.to_be_bytes());
 
         // Taker entry (flip role byte at offset 57: 16+8+16+16+1)
-        let mut taker_data = maker_data.clone();
+        let mut taker_data = maker_data;
         taker_data[57] = 1u8; // role: taker
         let mut taker_key = [0u8; 32];
         taker_key[..20].copy_from_slice(fill.taker.as_slice());
@@ -1333,8 +1336,8 @@ pub struct NativeExecContext<T: StateBackend = StateDb> {
     /// background writer after all exec phases. Off by default: every existing
     /// caller keeps inline writes.
     pub defer_trades: bool,
-    /// Raw trade-history KVs buffered while `defer_trades` is set.
-    pending_trades: Vec<RawCfKv>,
+    /// Trade-history rows packed into one byte arena while deferring writes.
+    pending_trades: PackedCfBatch,
 
     /// Optional metrics handle for Prometheus instrumentation.
     pub metrics: Option<std::sync::Arc<torus_telemetry::Metrics>>,
@@ -1748,7 +1751,7 @@ impl<T: StateBackend> NativeExecContext<T> {
             total_native_fees: 0,
             trade_index: 0,
             defer_trades: false,
-            pending_trades: Vec::new(),
+            pending_trades: PackedCfBatch::default(),
             metrics: None,
             fatal_error: load_error,
             book_mode,
@@ -1821,7 +1824,14 @@ impl<T: StateBackend> NativeExecContext<T> {
 
     /// Drain the trade-history KVs buffered under `defer_trades`. The caller
     /// owns durability from here (background writer, or synchronous fallback).
+    /// Legacy allocating representation; execution uses the packed drain below.
     pub fn take_pending_trades(&mut self) -> Vec<RawCfKv> {
+        self.take_pending_trade_batch().into_raw()
+    }
+
+    /// Drain trade rows without allocating a separate key/value Vec per row.
+    /// The caller owns the same post-flush durability and fallback obligations.
+    pub fn take_pending_trade_batch(&mut self) -> PackedCfBatch {
         std::mem::take(&mut self.pending_trades)
     }
 
@@ -4627,11 +4637,11 @@ impl NativeExecutor {
     fn route_trade_kvs<T: StateBackend>(ctx: &mut NativeExecContext<T>, kvs: TradeKvs) {
         if ctx.defer_trades {
             ctx.pending_trades
-                .push((CF_NATIVE_TRADES, kvs.trade_key.to_vec(), kvs.trade_data));
+                .push(CF_NATIVE_TRADES, &kvs.trade_key, &kvs.trade_data);
             ctx.pending_trades
-                .push((CF_NATIVE_USER_TRADES, kvs.maker_key.to_vec(), kvs.maker_data));
+                .push(CF_NATIVE_USER_TRADES, &kvs.maker_key, &kvs.maker_data);
             ctx.pending_trades
-                .push((CF_NATIVE_USER_TRADES, kvs.taker_key.to_vec(), kvs.taker_data));
+                .push(CF_NATIVE_USER_TRADES, &kvs.taker_key, &kvs.taker_data);
         } else {
             let _ = ctx
                 .state
