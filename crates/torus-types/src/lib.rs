@@ -485,10 +485,11 @@ pub struct CompactBlock {
 
 impl CompactBlock {
     pub fn from_block(block: &TorusBlock) -> Self {
+        let mut hash_scratch = Vec::new();
         let hashes = block
             .native_actions
             .iter()
-            .map(compute_action_hash)
+            .map(|action| compute_action_hash_with_scratch(action, &mut hash_scratch))
             .collect();
         Self {
             header: block.header.clone(),
@@ -673,16 +674,24 @@ impl NativeAction {
     /// Each variant has a unique 1-byte tag followed by fixed-width big-endian fields.
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(64);
+        self.append_canonical_bytes(&mut buf);
+        buf
+    }
+
+    /// Append the exact canonical encoding to an existing buffer, preserving
+    /// its prefix. Callers that need replacement rather than concatenation
+    /// must clear the buffer first. No serde or wire format is involved.
+    pub fn append_canonical_bytes(&self, buf: &mut Vec<u8>) {
         match self {
             NativeAction::PlaceOrder(p) => {
                 buf.push(0);
-                Self::encode_place_order_params(&mut buf, p);
+                Self::encode_place_order_params(buf, p);
             }
             NativeAction::PlaceOrderBatch(orders) => {
                 buf.push(25);
                 buf.extend_from_slice(&(orders.len() as u32).to_be_bytes());
                 for p in orders {
-                    Self::encode_place_order_params(&mut buf, p);
+                    Self::encode_place_order_params(buf, p);
                 }
             }
             NativeAction::CancelOrder { order_id } => {
@@ -883,7 +892,6 @@ impl NativeAction {
                 buf.extend_from_slice(session_pubkey);
             }
         }
-        buf
     }
 }
 
@@ -914,7 +922,17 @@ pub struct SignedNativeAction {
 /// reconstruction. This RE-KEYS every stored/dedup hash — all validators must run
 /// this build and relaunch on fresh genesis with wiped data dirs.
 pub fn compute_action_hash(action: &SignedNativeAction) -> B256 {
-    let mut data = action.action.canonical_bytes();
+    compute_action_hash_with_scratch(action, &mut Vec::with_capacity(64))
+}
+
+/// Same content address as [`compute_action_hash`], reusing a caller-owned
+/// canonical-preimage buffer. Clears prior contents before encoding and leaves
+/// the complete signed preimage in `data`. Capacity is retained; prefer a
+/// batch-local buffer so a single large action is not retained indefinitely.
+/// This is not a signature verifier or a replacement for `verified_cache_key`.
+pub fn compute_action_hash_with_scratch(action: &SignedNativeAction, data: &mut Vec<u8>) -> B256 {
+    data.clear();
+    action.action.append_canonical_bytes(data);
     data.extend_from_slice(&action.nonce.to_be_bytes());
     // Domain-separated signature commitment. The leading tag byte keeps the two
     // variants' encodings disjoint so an EIP-712 action can never share a preimage
@@ -935,8 +953,11 @@ pub fn compute_action_hash(action: &SignedNativeAction) -> B256 {
             data.extend_from_slice(&sig.0);
         }
     }
-    alloy_primitives::keccak256(&data)
+    alloy_primitives::keccak256(&*data)
 }
+
+#[cfg(test)]
+mod action_hash_scratch_tests;
 
 /// Signature-committing key for the exec trust-cache, or `None` when the action
 /// is not eligible for caching.
