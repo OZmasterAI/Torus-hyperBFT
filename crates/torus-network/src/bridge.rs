@@ -170,9 +170,13 @@ fn encode_pre_proposal_push(
         })
     } else {
         // The threshold comparison bounds this conversion by usize::MAX.
-        let mut payload = Vec::with_capacity(encoded_len as usize);
-        bincode::serialize_into(&mut payload, actions)?;
-        Ok(NetworkCommand::BroadcastNativeActions { payload })
+        let capacity = (encoded_len as usize)
+            .checked_add(1)
+            .ok_or(bincode::ErrorKind::SizeLimit)?;
+        let mut envelope = Vec::with_capacity(capacity);
+        envelope.push(crate::swarm::PRE_PROPOSAL_BATCH_MARKER);
+        bincode::serialize_into(&mut envelope, actions)?;
+        Ok(NetworkCommand::BroadcastNativeActions { envelope })
     }
 }
 
@@ -430,10 +434,10 @@ impl LibP2PNetwork {
         let Ok(command) = encode_pre_proposal_push(actions, hash_only_push_threshold()) else {
             return;
         };
-        if let NetworkCommand::BroadcastNativeActions { ref payload } = command {
+        if let NetworkCommand::BroadcastNativeActions { ref envelope } = command {
             tracing::info!(
                 count = actions.len(),
-                bytes = payload.len(),
+                bytes = envelope.len() - 1,
                 "pre-proposal FULL-BODY push (under the direct-push floor)"
             );
         }
@@ -441,9 +445,12 @@ impl LibP2PNetwork {
     }
 
     pub fn broadcast_native_actions(&self, payload: Vec<u8>) {
+        let mut envelope = Vec::with_capacity(payload.len() + 1);
+        envelope.push(crate::swarm::PRE_PROPOSAL_BATCH_MARKER);
+        envelope.extend_from_slice(&payload);
         let _ = self
             .command_tx
-            .send(NetworkCommand::BroadcastNativeActions { payload });
+            .send(NetworkCommand::BroadcastNativeActions { envelope });
     }
 
     /// Push only the action HASHES (a tiny manifest) for an oversized pre-proposal batch;
@@ -766,8 +773,10 @@ mod tests {
                 usize::MAX,
             ] {
                 match encode_pre_proposal_push(&actions, threshold).unwrap() {
-                    NetworkCommand::BroadcastNativeActions { payload } => {
+                    NetworkCommand::BroadcastNativeActions { envelope } => {
                         assert!(!should_push_hashes_only_at(legacy.len(), threshold));
+                        assert_eq!(envelope[0], crate::swarm::PRE_PROPOSAL_BATCH_MARKER);
+                        let payload = &envelope[1..];
                         assert_eq!(payload, legacy);
                         let back: Vec<(torus_types::Address, SignedNativeAction)> =
                             bincode::deserialize(&payload).unwrap();
@@ -784,6 +793,29 @@ mod tests {
                     _ => panic!("unexpected command"),
                 }
             }
+        }
+    }
+
+    #[test]
+    fn raw_native_push_wrapper_preserves_envelope_bytes() {
+        let (command_tx, mut command_rx) = mpsc::unbounded_channel();
+        let local = test_signing_key(1).verifying_key();
+        let net = LibP2PNetwork {
+            command_tx,
+            shared: shared_with_validators(&[local]),
+            native_inbound_rx: None,
+            evm_inbound_rx: None,
+            local_key: local,
+        };
+        for payload in [vec![], vec![1, 2, 3], vec![0xfd; 65_536]] {
+            net.broadcast_native_actions(payload.clone());
+            let NetworkCommand::BroadcastNativeActions { envelope } =
+                command_rx.try_recv().unwrap()
+            else {
+                panic!("wrong push command");
+            };
+            assert_eq!(envelope[0], crate::swarm::PRE_PROPOSAL_BATCH_MARKER);
+            assert_eq!(&envelope[1..], payload);
         }
     }
 

@@ -88,9 +88,9 @@ pub enum NetworkCommand {
         target: VerifyingKey,
         payload: Vec<u8>,
     },
-    /// Proposer pushes batched actions to all validators via req/res before CompactBlock proposal.
+    /// Proposer pushes an already marker-prefixed batch envelope before CompactBlock.
     BroadcastNativeActions {
-        payload: Vec<u8>,
+        envelope: Vec<u8>,
     },
     /// Proposer pushes only the action HASHES (a tiny manifest) when the body set is too
     /// big to disseminate within the view; validators PULL the bodies by-hash (pre-warm).
@@ -122,7 +122,7 @@ pub enum NetworkCommand {
 /// Marker byte prefixed to forwarded native action payloads in DirectRequest.
 const FORWARD_ACTION_MARKER: u8 = 0xFE;
 /// Marker byte for batched pre-proposal action payloads (CompactBlock dissemination).
-const PRE_PROPOSAL_BATCH_MARKER: u8 = 0xFD;
+pub(crate) const PRE_PROPOSAL_BATCH_MARKER: u8 = 0xFD;
 /// Marker byte for a HASH-ONLY pre-proposal manifest (`bincode(Vec<[u8;32]>)`): the body
 /// set was too big to disseminate within the view, so the proposer pushes only the hashes
 /// and validators PULL the bodies (pre-warm). Phase 2.3 (#5) — un-wedges bs≈500.
@@ -160,10 +160,10 @@ fn parse_forwarded_evm_tx(payload: &[u8]) -> Option<&[u8]> {
 fn encode_forward_batch(
     pairs: &[(torus_types::Address, torus_types::SignedNativeAction)],
 ) -> Option<Vec<u8>> {
-    let body = bincode::serialize(pairs).ok()?;
-    let mut envelope = Vec::with_capacity(1 + body.len());
+    let body_len = usize::try_from(bincode::serialized_size(pairs).ok()?).ok()?;
+    let mut envelope = Vec::with_capacity(body_len.checked_add(1)?);
     envelope.push(PRE_PROPOSAL_BATCH_MARKER);
-    envelope.extend_from_slice(&body);
+    bincode::serialize_into(&mut envelope, pairs).ok()?;
     Some(envelope)
 }
 
@@ -2326,12 +2326,9 @@ fn handle_command(
                 warn!("ForwardEvmTx: leader not in peer map");
             }
         }
-        NetworkCommand::BroadcastNativeActions { payload } => {
-            // Full-body push (the fast common case for small batches): wrap the bodies in
-            // the batch marker and fan them out. The receiver mirrors bodies to its durable
-            // DA store, keeping the hot-path pull rare.
-            let mut envelope = vec![PRE_PROPOSAL_BATCH_MARKER];
-            envelope.extend_from_slice(&payload);
+        NetworkCommand::BroadcastNativeActions { envelope } => {
+            // Framed on the pre-proposal worker: share the final allocation
+            // without copying a full body on the swarm event loop.
             fan_native_push(swarm, shared, local_key, envelope, true);
         }
         NetworkCommand::BroadcastNativeActionHashes { hashes } => {
@@ -5222,7 +5219,10 @@ mod tests {
         let mut swarm = test_swarm();
         let body = vec![PRE_PROPOSAL_BATCH_MARKER; 65_536];
         let pointer = body.as_ptr();
-        fan_native_push(&mut swarm, &shared, &local, body, true);
+        handle_command(
+            NetworkCommand::BroadcastNativeActions { envelope: body },
+            &mut swarm, &shared, &local, &gossipsub::IdentTopic::new(CONSENSUS_TOPIC),
+        );
         let retained = shared
             .recent_native_bundles
             .lock()
