@@ -159,3 +159,16 @@ It contains `torus-node`, `SHA256SUMS` and `manifest.json`; binary SHA256 is
 `47a8d64d31c6c1186a5da9fac66eab1cf83365f7b90bd2d5790f625c54a12d0b`.
 Further implementation continues; later changes need their own qualification.
 A later benchmark session requires authorization; this session must not measure it.
+
+Second integrated checkpoint: `f8f692e`, including all 22 implementation commits
+listed above, built successfully after another affected-package cleanup. Receipt
+`25eb4dc6-6c69-4510-9be5-aac6c9699113` also includes four integer-margin and eight
+parallel-settlement tests on this combined source. Compilation from the root
+worktree was observed; build duration was 73.05 seconds. The standalone node
+was not launched and no generator or benchmark was built.
+
+Frozen artifact directory:
+`/home/18c/bench-results-matched/s61-implementation-20260919/candidate-f8f692e/`.
+The binary is 47,999,536 bytes; SHA256 is
+`bade8c32bd46103851eadb30b32429b9941f98422af8299ef019d9f99793bda4`.
+This remains an unmeasured candidate, not a new record.
