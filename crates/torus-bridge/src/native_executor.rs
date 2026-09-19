@@ -106,15 +106,20 @@ pub struct EpochBoundaryResult {
 /// over distinct per-sender keys, so it is state-independent of iteration order; the map
 /// is otherwise never iterated.
 struct BalanceCache {
-    map: HashMap<Address, NativeBalance>,
-    dirty: std::collections::HashSet<Address>,
+    map: HashMap<Address, CachedBalance>,
+    dirty: Vec<Address>,
+}
+
+struct CachedBalance {
+    balance: NativeBalance,
+    dirty: bool,
 }
 
 impl BalanceCache {
     fn new() -> Self {
         Self {
             map: HashMap::new(),
-            dirty: std::collections::HashSet::new(),
+            dirty: Vec::new(),
         }
     }
 
@@ -124,18 +129,40 @@ impl BalanceCache {
         positions: &PositionManager<T>,
         addr: &Address,
     ) -> Result<NativeBalance, CoreError> {
-        if let Some(bal) = self.map.get(addr) {
-            return Ok(bal.clone());
+        if let Some(entry) = self.map.get(addr) {
+            return Ok(entry.balance.clone());
         }
         let bal = positions.get_native_balance(addr)?;
-        self.map.insert(*addr, bal.clone());
+        self.map.insert(
+            *addr,
+            CachedBalance {
+                balance: bal.clone(),
+                dirty: false,
+            },
+        );
         Ok(bal)
     }
 
     /// Update the cached balance and mark it dirty (write-back — no overlay PUT yet).
     fn set(&mut self, addr: &Address, bal: NativeBalance) {
-        self.map.insert(*addr, bal);
-        self.dirty.insert(*addr);
+        use std::collections::hash_map::Entry;
+        match self.map.entry(*addr) {
+            Entry::Occupied(mut slot) => {
+                let entry = slot.get_mut();
+                entry.balance = bal;
+                if !entry.dirty {
+                    entry.dirty = true;
+                    self.dirty.push(*addr);
+                }
+            }
+            Entry::Vacant(slot) => {
+                slot.insert(CachedBalance {
+                    balance: bal,
+                    dirty: true,
+                });
+                self.dirty.push(*addr);
+            }
+        }
     }
 
     /// L3-ENG: absorb a Phase-2 worker's cache. Caller guarantees the key
@@ -153,17 +180,27 @@ impl BalanceCache {
         &mut self,
         positions: &PositionManager<T>,
     ) -> Result<(), CoreError> {
-        let mut addrs: Vec<Address> = self.dirty.iter().copied().collect();
-        addrs.sort();
-        for addr in &addrs {
-            if let Some(bal) = self.map.get(addr) {
-                positions.put_native_balance(addr, bal)?;
+        self.dirty.sort_unstable();
+        for addr in &self.dirty {
+            if let Some(entry) = self.map.get(addr) {
+                positions.put_native_balance(addr, &entry.balance)?;
             }
         }
-        self.dirty.clear();
+        // A partial flush must leave EVERY entry dirty, including writes that
+        // succeeded before the error. Only a wholly successful flush resets
+        // the flags/list, preserving the original all-dirty retry behavior.
+        for addr in self.dirty.drain(..) {
+            if let Some(entry) = self.map.get_mut(&addr) {
+                entry.dirty = false;
+            }
+        }
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "balance_cache_tests.rs"]
+mod balance_cache_tests;
 
 // ============================================================================
 // C3 — deterministic parallel Phase-4 settlement: plumbing types
