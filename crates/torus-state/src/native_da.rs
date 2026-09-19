@@ -15,7 +15,7 @@
 use std::sync::{Condvar, Mutex, OnceLock};
 
 use alloy_primitives::B256;
-use torus_types::{compute_action_hash, SignedNativeAction};
+use torus_types::{compute_action_hash, compute_action_hash_with_scratch, SignedNativeAction};
 
 use crate::cf::{CF_NATIVE_PENDING, CF_NATIVE_SHARDS};
 use crate::db::StateDb;
@@ -90,8 +90,9 @@ impl NativeDaStore {
         }
         let mut batch = rocksdb::WriteBatch::default();
         let cf = self.db.cf_handle(CF_NATIVE_PENDING)?;
+        let mut hash_scratch = Vec::with_capacity(64);
         for action in actions {
-            let hash = compute_action_hash(action);
+            let hash = compute_action_hash_with_scratch(action, &mut hash_scratch);
             let bytes =
                 bincode::serialize(action).map_err(|e| StateError::InvalidData(e.to_string()))?;
             batch.put_cf(cf, hash.as_slice(), &bytes);
@@ -213,8 +214,9 @@ impl NativeDaStore {
             .map_err(|e| StateError::InvalidData(e.to_string()))?;
         let mut batch = rocksdb::WriteBatch::default();
         let cf = self.db.cf_handle(CF_NATIVE_SHARDS)?;
+        let mut hash_scratch = Vec::with_capacity(64);
         for action in actions {
-            let hash = compute_action_hash(action);
+            let hash = compute_action_hash_with_scratch(action, &mut hash_scratch);
             let body =
                 bincode::serialize(action).map_err(|e| StateError::InvalidData(e.to_string()))?;
             let enc = encode(&body, params).map_err(|e| StateError::InvalidData(e.to_string()))?;
@@ -319,6 +321,56 @@ mod tests {
                 r: [0u8; 32],
                 s: [0u8; 32],
             }),
+        }
+    }
+
+    #[test]
+    fn batch_hash_scratch_preserves_body_and_shard_bytes_across_reuse_and_reopen() {
+        use crate::StateBackend;
+        use torus_types::{ActionSignature, Ed25519Sig, FixedPoint, NativeAction,
+            OrderType, PlaceOrderParams, TimeInForce};
+        let (dir, actual) = temp_store();
+        let (_reference_dir, reference) = temp_store();
+        let large = SignedNativeAction {
+            action: NativeAction::PlaceOrderBatch(vec![PlaceOrderParams {
+                market_id: 7, is_buy: true, price: FixedPoint::from_raw(123_000_000),
+                quantity: FixedPoint::from_raw(100_000_011),
+                order_type: OrderType::StopLimit {
+                    trigger: FixedPoint::from_raw(200_000_000),
+                    limit: FixedPoint::from_raw(123_000_000),
+                },
+                time_in_force: TimeInForce::GTC, reduce_only: false, client_order_id: Some(42),
+            }; 400]),
+            nonce: u64::MAX,
+            signature: ActionSignature::Session {
+                session_pubkey: [7; 32], sig: Ed25519Sig([9; 64]),
+            },
+        };
+        let mut small_session = dummy_action(3);
+        small_session.signature = large.signature.clone();
+        // Repeated first body also pins the existing idempotent overwrite.
+        let actions = vec![dummy_action(1), large, small_session, dummy_action(1)];
+        let params = ErasureParams::new(2, 3);
+        actual.put_batch(&actions).unwrap();
+        actual.put_shards_batch(&actions, params).unwrap();
+        for action in &actions {
+            reference.put(action).unwrap();
+            reference.put_shards_batch(std::slice::from_ref(action), params).unwrap();
+        }
+        for cf in [CF_NATIVE_PENDING, CF_NATIVE_SHARDS] {
+            assert_eq!(actual.db.iterate_cf(cf, None).unwrap(), reference.db.iterate_cf(cf, None).unwrap());
+        }
+        drop(actual);
+        let reopened = NativeDaStore::new(StateDb::open(dir.path()).unwrap());
+        for action in &actions {
+            let hash = compute_action_hash(action);
+            assert_eq!(reopened.get_raw(&hash.0).unwrap().unwrap(), bincode::serialize(action).unwrap());
+            for i in 0..params.n as u16 {
+                let shard = reopened.get_shard(&hash.0, i).unwrap().unwrap();
+                assert!(shard.verify());
+                assert_eq!(encode_stored_shard(&shard).unwrap(),
+                    encode_stored_shard(&reference.get_shard(&hash.0, i).unwrap().unwrap()).unwrap());
+            }
         }
     }
 
