@@ -45,7 +45,12 @@ impl libp2p::request_response::Codec for BorshCodec {
     where
         T: AsyncRead + Unpin + Send,
     {
-        read_frame(protocol, io, Self::MAX_MSG_SIZE).await
+        if is_v2_protocol(protocol) {
+            read_frame(protocol, io, Self::MAX_MSG_SIZE).await
+        } else {
+            let (sender_key, payload) = read_raw_payload::<_, 32>(io, Self::MAX_MSG_SIZE).await?;
+            Ok(DirectRequest { sender_key, payload })
+        }
     }
 
     async fn read_response<T>(
@@ -68,7 +73,11 @@ impl libp2p::request_response::Codec for BorshCodec {
     where
         T: AsyncWrite + Unpin + Send,
     {
-        write_frame(protocol, io, &req, WirePath::Direct).await
+        if is_v2_protocol(protocol) {
+            write_frame(protocol, io, &req, WirePath::Direct).await
+        } else {
+            write_raw_payload(io, &req.sender_key, &req.payload).await
+        }
     }
 
     async fn write_response<T>(
@@ -259,6 +268,91 @@ where
     Ok(())
 }
 
+/// Raw Borsh structs used here consist of a fixed header followed by Vec<u8>.
+/// Read into the final payload allocation instead of allocating a whole frame
+/// and copying it again during Borsh decoding. N is 32 (sender) or 8 (view).
+async fn read_raw_payload<T, const N: usize>(
+    io: &mut T,
+    max_size: usize,
+) -> io::Result<([u8; N], Vec<u8>)>
+where
+    T: AsyncRead + Unpin + Send,
+{
+    assert!(N <= 32);
+    let mut length = [0u8; 4];
+    io.read_exact(&mut length).await?;
+    let frame_len = u32::from_be_bytes(length) as usize;
+    if frame_len > max_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "message too large",
+        ));
+    }
+    let header_len = N + 4;
+    let mut header = [0u8; 36];
+    // Consume the complete advertised frame before reporting malformed Borsh,
+    // as the generic decoder does. A truncated frame must remain UnexpectedEof.
+    if frame_len < header_len {
+        io.read_exact(&mut header[..frame_len]).await?;
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "short payload header",
+        ));
+    }
+    io.read_exact(&mut header[..header_len]).await?;
+    let payload_len = u32::from_le_bytes(header[N..header_len].try_into().unwrap()) as usize;
+    let remaining = frame_len - header_len;
+    if payload_len != remaining {
+        let mut left = remaining;
+        let mut discard = [0u8; 1024];
+        while left != 0 {
+            let count = left.min(discard.len());
+            io.read_exact(&mut discard[..count]).await?;
+            left -= count;
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "payload length mismatch",
+        ));
+    }
+    let mut fixed = [0u8; N];
+    fixed.copy_from_slice(&header[..N]);
+    let mut payload = vec![0u8; payload_len];
+    io.read_exact(&mut payload).await?;
+    Ok((fixed, payload))
+}
+
+/// Emit byte-identical raw Borsh framing without copying the body into a
+/// second serialized Vec. Header and body use two writes, as the generic path.
+async fn write_raw_payload<T, const N: usize>(
+    io: &mut T,
+    fixed: &[u8; N],
+    payload: &[u8],
+) -> io::Result<()>
+where
+    T: AsyncWrite + Unpin + Send,
+{
+    assert!(N <= 32);
+    let invalid = || {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "payload length exceeds wire format",
+        )
+    };
+    let payload_len = u32::try_from(payload.len()).map_err(|_| invalid())?;
+    let frame_len = payload_len
+        .checked_add((N + 4) as u32)
+        .ok_or_else(invalid)?;
+    let mut header = [0u8; 40];
+    header[..4].copy_from_slice(&frame_len.to_be_bytes());
+    header[4..N + 4].copy_from_slice(fixed);
+    header[N + 4..N + 8].copy_from_slice(&payload_len.to_le_bytes());
+    io.write_all(&header[..N + 8]).await?;
+    io.write_all(payload).await?;
+    io.close().await?;
+    Ok(())
+}
+
 /// Request on the dedicated `/torus/block-data/1.0` protocol.
 #[derive(borsh::BorshSerialize, borsh::BorshDeserialize, Debug, Clone)]
 pub struct BlockDataNetRequest {
@@ -306,7 +400,15 @@ impl libp2p::request_response::Codec for BlockDataCodec {
     where
         T: AsyncRead + Unpin + Send,
     {
-        read_frame(protocol, io, Self::MAX_MSG_SIZE).await
+        if is_v2_protocol(protocol) {
+            read_frame(protocol, io, Self::MAX_MSG_SIZE).await
+        } else {
+            let (view, payload) = read_raw_payload::<_, 8>(io, Self::MAX_MSG_SIZE).await?;
+            Ok(BlockDataNetResponse {
+                view: u64::from_le_bytes(view),
+                payload,
+            })
+        }
     }
 
     async fn write_request<T>(
@@ -330,7 +432,11 @@ impl libp2p::request_response::Codec for BlockDataCodec {
     where
         T: AsyncWrite + Unpin + Send,
     {
-        write_frame(protocol, io, &res, WirePath::BlockData).await
+        if is_v2_protocol(protocol) {
+            write_frame(protocol, io, &res, WirePath::BlockData).await
+        } else {
+            write_raw_payload(io, &res.view.to_le_bytes(), &res.payload).await
+        }
     }
 }
 
@@ -534,6 +640,324 @@ impl libp2p::request_response::Codec for NativeDaShardsCodec {
 mod tests {
     use super::*;
     use borsh::{BorshDeserialize, BorshSerialize};
+
+    fn legacy_frame(value: &impl BorshSerialize) -> Vec<u8> {
+        let body = value.try_to_vec().unwrap();
+        let mut frame = (body.len() as u32).to_be_bytes().to_vec();
+        frame.extend_from_slice(&body);
+        frame
+    }
+
+    #[test]
+    fn raw_payload_codecs_match_legacy_bytes_and_size_boundaries() {
+        use futures::io::Cursor;
+        use libp2p::request_response::Codec as _;
+        futures::executor::block_on(async {
+            for len in [0, 1, 31, 65_536, MAX_DIRECT_MSG_SIZE - 36] {
+                let req = DirectRequest {
+                    sender_key: [0xa7; 32],
+                    payload: (0..len).map(|i| (i % 251) as u8).collect(),
+                };
+                let expected = legacy_frame(&req);
+                let proto = StreamProtocol::new("/torus/direct/1.0");
+                let mut out = Cursor::new(Vec::new());
+                BorshCodec
+                    .write_request(&proto, &mut out, req)
+                    .await
+                    .unwrap();
+                assert_eq!(out.get_ref(), &expected);
+                out.set_position(0);
+                let actual = BorshCodec.read_request(&proto, &mut out).await.unwrap();
+                let legacy: DirectRequest =
+                    read_length_prefixed_borsh(&mut Cursor::new(expected), MAX_DIRECT_MSG_SIZE)
+                        .await
+                        .unwrap();
+                assert_eq!(actual.sender_key, legacy.sender_key);
+                assert_eq!(actual.payload, legacy.payload);
+            }
+            for len in [0, 1, 31, 65_536, MAX_BLOCK_DATA_MSG_SIZE - 12] {
+                let resp = BlockDataNetResponse {
+                    view: 0x1234_5678_9abc_def0,
+                    payload: (0..len).map(|i| (i % 251) as u8).collect(),
+                };
+                let expected = legacy_frame(&resp);
+                let proto = StreamProtocol::new("/torus/block-data/1.0");
+                let mut out = Cursor::new(Vec::new());
+                BlockDataCodec
+                    .write_response(&proto, &mut out, resp)
+                    .await
+                    .unwrap();
+                assert_eq!(out.get_ref(), &expected);
+                out.set_position(0);
+                let actual = BlockDataCodec
+                    .read_response(&proto, &mut out)
+                    .await
+                    .unwrap();
+                let legacy: BlockDataNetResponse =
+                    read_length_prefixed_borsh(&mut Cursor::new(expected), MAX_BLOCK_DATA_MSG_SIZE)
+                        .await
+                        .unwrap();
+                assert_eq!(actual.view, legacy.view);
+                assert_eq!(actual.payload, legacy.payload);
+            }
+        });
+    }
+
+    #[test]
+    fn raw_payload_malformed_frames_preserve_errors_and_consumption() {
+        use futures::io::Cursor;
+        use libp2p::request_response::Codec as _;
+        futures::executor::block_on(async {
+            // Differentially exercise every truncation of short frames, invalid
+            // inner lengths, trailing bytes, and bytes belonging to a next frame.
+            for direct in [false, true] {
+                let (fixed, cap) = if direct {
+                    (32, MAX_DIRECT_MSG_SIZE)
+                } else {
+                    (8, MAX_BLOCK_DATA_MSG_SIZE)
+                };
+                let valid = if direct {
+                    legacy_frame(&DirectRequest {
+                        sender_key: [7; 32],
+                        payload: vec![9; 19],
+                    })
+                } else {
+                    legacy_frame(&BlockDataNetResponse {
+                        view: 7,
+                        payload: vec![9; 19],
+                    })
+                };
+                let mut frames = Vec::new();
+                for inner in [0, 1, 18, 19, 20, u32::MAX] {
+                    let mut wire = valid.clone();
+                    wire[4 + fixed..8 + fixed].copy_from_slice(&inner.to_le_bytes());
+                    for end in 0..=wire.len() {
+                        frames.push(wire[..end].to_vec());
+                    }
+                    wire.extend_from_slice(&valid);
+                    frames.push(wire);
+                }
+                for outer in [
+                    0,
+                    1,
+                    fixed as u32,
+                    fixed as u32 + 3,
+                    (cap + 1) as u32,
+                    u32::MAX,
+                ] {
+                    let mut wire = valid.clone();
+                    wire[..4].copy_from_slice(&outer.to_be_bytes());
+                    frames.push(wire);
+                }
+                for wire in frames {
+                    let mut reference = Cursor::new(wire.clone());
+                    let mut candidate = Cursor::new(wire);
+                    if direct {
+                        let old: io::Result<DirectRequest> =
+                            read_length_prefixed_borsh(&mut reference, cap).await;
+                        let new = BorshCodec
+                            .read_request(&StreamProtocol::new("/torus/direct/1.0"), &mut candidate)
+                            .await;
+                        assert_eq!(
+                            old.as_ref().err().map(io::Error::kind),
+                            new.as_ref().err().map(io::Error::kind)
+                        );
+                        if let (Ok(a), Ok(b)) = (old, new) {
+                            assert_eq!(a.sender_key, b.sender_key);
+                            assert_eq!(a.payload, b.payload);
+                        }
+                    } else {
+                        let old: io::Result<BlockDataNetResponse> =
+                            read_length_prefixed_borsh(&mut reference, cap).await;
+                        let new = BlockDataCodec
+                            .read_response(
+                                &StreamProtocol::new("/torus/block-data/1.0"),
+                                &mut candidate,
+                            )
+                            .await;
+                        assert_eq!(
+                            old.as_ref().err().map(io::Error::kind),
+                            new.as_ref().err().map(io::Error::kind)
+                        );
+                        if let (Ok(a), Ok(b)) = (old, new) {
+                            assert_eq!(a.view, b.view);
+                            assert_eq!(a.payload, b.payload);
+                        }
+                    }
+                    assert_eq!(reference.position(), candidate.position());
+                }
+            }
+        });
+    }
+
+    struct FragmentedIo {
+        cursor: futures::io::Cursor<Vec<u8>>,
+        pending: bool,
+        source_start: usize,
+        source_len: usize,
+        borrowed_bytes: usize,
+        closed: bool,
+        fail_at: Option<u64>,
+        fail_close: bool,
+    }
+
+    impl FragmentedIo {
+        fn new(source: &[u8]) -> Self {
+            Self {
+                cursor: futures::io::Cursor::new(Vec::new()),
+                pending: false,
+                source_start: source.as_ptr() as usize,
+                source_len: source.len(),
+                borrowed_bytes: 0,
+                closed: false,
+                fail_at: None,
+                fail_close: false,
+            }
+        }
+
+        fn yield_once(&mut self, cx: &mut std::task::Context<'_>) -> bool {
+            self.pending = !self.pending;
+            if self.pending {
+                cx.waker().wake_by_ref();
+            }
+            self.pending
+        }
+    }
+
+    impl AsyncRead for FragmentedIo {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut [u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            if self.yield_once(cx) {
+                return std::task::Poll::Pending;
+            }
+            let len = buf.len().min(7);
+            std::pin::Pin::new(&mut self.cursor).poll_read(cx, &mut buf[..len])
+        }
+    }
+
+    impl AsyncWrite for FragmentedIo {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            if self.yield_once(cx) {
+                return std::task::Poll::Pending;
+            }
+            let mut len = buf.len().min(7);
+            if let Some(limit) = self.fail_at {
+                if self.cursor.position() >= limit {
+                    return std::task::Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+                }
+                len = len.min((limit - self.cursor.position()) as usize);
+            }
+            let pos = buf.as_ptr() as usize;
+            if pos >= self.source_start && pos + len <= self.source_start + self.source_len {
+                self.borrowed_bytes += len;
+            }
+            std::pin::Pin::new(&mut self.cursor).poll_write(cx, &buf[..len])
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_close(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            if self.yield_once(cx) {
+                return std::task::Poll::Pending;
+            }
+            self.closed = true;
+            std::task::Poll::Ready(if self.fail_close {
+                Err(io::ErrorKind::BrokenPipe.into())
+            } else {
+                Ok(())
+            })
+        }
+    }
+
+    #[test]
+    fn raw_payload_fragmented_io_borrows_body_and_propagates_write_errors() {
+        use libp2p::request_response::Codec as _;
+        futures::executor::block_on(async {
+            for direct in [false, true] {
+                for fail_at in [None, Some(0), Some(3), Some(45)] {
+                    for fail_close in [false, true] {
+                        let payload = vec![0x9d; 4096];
+                        let mut io = FragmentedIo::new(&payload);
+                        io.fail_at = fail_at;
+                        io.fail_close = fail_close;
+                        let (expected, result) = if direct {
+                            let req = DirectRequest {
+                                sender_key: [7; 32],
+                                payload,
+                            };
+                            let expected = legacy_frame(&req);
+                            (
+                                expected,
+                                BorshCodec
+                                    .write_request(
+                                        &StreamProtocol::new("/torus/direct/1.0"),
+                                        &mut io,
+                                        req,
+                                    )
+                                    .await,
+                            )
+                        } else {
+                            let resp = BlockDataNetResponse { view: 7, payload };
+                            let expected = legacy_frame(&resp);
+                            (
+                                expected,
+                                BlockDataCodec
+                                    .write_response(
+                                        &StreamProtocol::new("/torus/block-data/1.0"),
+                                        &mut io,
+                                        resp,
+                                    )
+                                    .await,
+                            )
+                        };
+                        if fail_at.is_some() || fail_close {
+                            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+                            assert_eq!(io.closed, fail_at.is_none());
+                            continue;
+                        }
+                        result.unwrap();
+                        assert!(io.closed);
+                        assert_eq!(
+                            io.borrowed_bytes, 4096,
+                            "writer must see original allocation"
+                        );
+                        assert_eq!(io.cursor.get_ref(), &expected);
+                        io.cursor.set_position(0);
+                        let payload = if direct {
+                            BorshCodec
+                                .read_request(&StreamProtocol::new("/torus/direct/1.0"), &mut io)
+                                .await
+                                .unwrap()
+                                .payload
+                        } else {
+                            BlockDataCodec
+                                .read_response(
+                                    &StreamProtocol::new("/torus/block-data/1.0"),
+                                    &mut io,
+                                )
+                                .await
+                                .unwrap()
+                                .payload
+                        };
+                        assert_eq!(payload, vec![0x9d; 4096]);
+                    }
+                }
+            }
+        });
+    }
 
     /// The `/torus/native-da/1.0` request/response wire format round-trips through
     /// the length-prefixed borsh codec, including the empty/not-found cases.
