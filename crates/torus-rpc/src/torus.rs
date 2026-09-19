@@ -276,11 +276,11 @@ fn verify_one_action_with(
     chain_id: u64,
     state_db: &torus_state::StateDb,
     current_time_ms: u64,
+    action_bytes: &mut Vec<u8>,
 ) -> Result<
     (
         alloy_primitives::Address,
         torus_types::SignedNativeAction,
-        Vec<u8>,
         alloy_primitives::B256,
     ),
     String,
@@ -294,16 +294,15 @@ fn verify_one_action_with(
             state_db.get_session(pubkey).ok().flatten()
         })
         .map_err(|e| format!("signature verification failed: {e}"))?;
-    // Canonical bytes stay serde_json regardless of ingress format: the
-    // action hash, gossip body, and leader-forward payload all derive here.
-    // T2.4: computed exactly ONCE per ingress action — every endpoint
-    // (single, batch-JSON, batch-bin) reuses the returned `action_bytes` /
-    // `hash` instead of re-serializing + re-hashing on its own. The hash
-    // DEFINITION (keccak over the serde_json canonical re-serialization) is
-    // consensus-facing and unchanged.
-    let action_bytes = serde_json::to_vec(&action).map_err(|e| format!("serialize action: {e}"))?;
-    let hash = keccak256(&action_bytes);
-    Ok((sender, action, action_bytes, hash))
+    // Acknowledgements remain keccak(canonical JSON), including for binary
+    // ingress. The parsed action feeds admission/forwarding; those paths do
+    // not need these bytes. Reuse task-local scratch and return only the hash
+    // so completed batch results do not retain every action's JSON allocation.
+    action_bytes.clear();
+    serde_json::to_writer(&mut *action_bytes, &action)
+        .map_err(|e| format!("serialize action: {e}"))?;
+    let hash = keccak256(&*action_bytes);
+    Ok((sender, action, hash))
 }
 
 /// JSON-ingress wrapper shared by the single-action endpoint and tests.
@@ -316,7 +315,6 @@ pub(crate) fn verify_one_action(
     (
         alloy_primitives::Address,
         torus_types::SignedNativeAction,
-        Vec<u8>,
         alloy_primitives::B256,
     ),
     String,
@@ -327,6 +325,7 @@ pub(crate) fn verify_one_action(
         chain_id,
         state_db,
         current_time_ms,
+        &mut Vec::new(),
     )
 }
 
@@ -476,13 +475,14 @@ impl RpcState {
             let out = ingress_verify_pool().install(|| {
                 to_verify
                     .into_par_iter()
-                    .map(|signed_action| {
+                    .map_init(Vec::new, |action_bytes, signed_action| {
                         verify_one_action_with(
                             decode,
                             &signed_action,
                             chain_id,
                             &state_db,
                             current_time_ms,
+                            action_bytes,
                         )
                     })
                     .collect::<Vec<_>>()
@@ -520,7 +520,7 @@ impl RpcState {
                         .expect("one verified result per proceed slot"),
                 };
                 match item {
-                    Ok((sender, action, _action_bytes, hash)) => {
+                    Ok((sender, action, hash)) => {
                         let insert_t0 = std::time::Instant::now();
                         // B1: the leader-forward now carries the PARSED action
                         // (structured tuple, no JSON re-encode), so keep a copy
@@ -1102,14 +1102,14 @@ impl TorusApiServer for RpcState {
         // Offload deserialization + ECDSA verification to the blocking thread pool
         // so heavy crypto doesn't starve the async runtime under load.
         // T2.4: same shared verify path as the batch endpoints — the canonical
-        // bytes + action hash are computed ONCE there (at first decode) and the
+        // JSON acknowledgement hash is computed ONCE there and the
         // hash reused below for the ack, instead of this endpoint
         // re-serializing serde_json + keccak in its own copy of the pipeline.
         // (B1: the leader-forward now carries the parsed action itself, so the
         // canonical bytes are no longer needed for the forward payload.)
         let state_db = self.state.clone();
         let chain_id = self.chain_id;
-        let (sender, action, _action_bytes, hash) = tokio::task::spawn_blocking(move || {
+        let (sender, action, hash) = tokio::task::spawn_blocking(move || {
             let current_time_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("system clock before epoch")
@@ -1879,6 +1879,196 @@ fn parse_proposal_status(s: &str) -> Result<ProposalStatus, RpcError> {
         _ => Err(RpcError::InvalidParams(format!(
             "unknown proposal status: {s}"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod ack_scratch_tests {
+    use super::*;
+    use alloy_primitives::{Address, B256};
+    use torus_types::{ActionSignature, NativeAction, SignedNativeAction};
+
+    const NOW: u64 = 1_000_000;
+
+    // Independent pre-change oracle: allocate canonical JSON with to_vec.
+    fn old_verify(
+        decode: DecodeFn,
+        payload: &str,
+        state: &torus_state::StateDb,
+    ) -> Result<(Address, Vec<u8>, B256), String> {
+        let bytes = parse_bytes(payload).map_err(|e| format!("invalid hex: {e}"))?;
+        let action = decode(&bytes)?;
+        torus_mempool::rate_limit::validate_batch_size(&action.action)?;
+        validate_known_markets(&action.action, state)?;
+        let sender = action
+            .validate_with_sessions(NOW, torus_types::eip712::TORUS_CHAIN_ID, |key| {
+                state.get_session(key).ok().flatten()
+            })
+            .map_err(|e| format!("signature verification failed: {e}"))?;
+        let bytes = serde_json::to_vec(&action).map_err(|e| format!("serialize action: {e}"))?;
+        let hash = keccak256(&bytes);
+        Ok((sender, bytes, hash))
+    }
+
+    fn fixtures(state: &torus_state::StateDb) -> Vec<SignedNativeAction> {
+        use torus_types::{FixedPoint, OrderType, PlaceOrderParams, TimeInForce};
+        state
+            .put_cf_raw(CF_NATIVE_MARKETS, &1u64.to_be_bytes(), b"market")
+            .unwrap();
+        let key = k256::ecdsa::SigningKey::from_slice(&[7; 32]).unwrap();
+        let sign = |action, nonce| torus_types::eip712::sign_native_action(action, nonce, &key);
+        let order = PlaceOrderParams {
+            market_id: 1,
+            is_buy: true,
+            price: FixedPoint::from_raw(1_000_000_000),
+            quantity: FixedPoint::from_raw(100_000_000),
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::GTC,
+            reduce_only: false,
+            client_order_id: Some(42),
+        };
+        let session = torus_types::eip712::sign_native_action_with_session(
+            NativeAction::CancelOrder { order_id: 42 },
+            NOW,
+            &([8u8; 32].into()),
+        );
+        let ActionSignature::Session { session_pubkey, .. } = &session.signature else {
+            panic!("expected session signature")
+        };
+        state
+            .put_session(
+                session_pubkey,
+                &torus_types::SessionData {
+                    owner: Address::from([9; 20]),
+                    expiry: NOW + 60_000,
+                    scope: torus_types::SessionScope::Full,
+                    created_at: NOW,
+                },
+            )
+            .unwrap();
+        let mut invalid_session = session.clone();
+        if let ActionSignature::Session { sig, .. } = &mut invalid_session.signature {
+            sig.0[0] ^= 1;
+        }
+        let mut unknown_market = order.clone();
+        unknown_market.market_id = 99;
+        vec![
+            sign(NativeAction::PlaceOrderBatch(vec![order; 400]), NOW),
+            invalid_session,
+            sign(NativeAction::ClaimRewards, NOW),
+            sign(NativeAction::PlaceOrder(unknown_market), NOW),
+            session,
+            sign(NativeAction::ClaimRewards, 0),
+            sign(NativeAction::PlaceOrderBatch(vec![]), NOW),
+            sign(NativeAction::CancelOrder { order_id: 3 }, NOW),
+        ]
+    }
+
+    fn payloads(actions: &[SignedNativeAction], binary: bool) -> Vec<String> {
+        let mut out: Vec<_> = actions
+            .iter()
+            .map(|action| {
+                let bytes = if binary {
+                    bincode::serialize(action).unwrap()
+                } else {
+                    serde_json::to_vec(action).unwrap()
+                };
+                format!("0x{}", hex::encode(bytes))
+            })
+            .collect();
+        out.insert(2, "0xzz".to_string());
+        out.insert(4, "0x00".to_string());
+        out
+    }
+
+    #[test]
+    fn acknowledgement_scratch_matches_old_json_and_binary_oracle() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = torus_state::StateDb::open(dir.path()).unwrap();
+        let actions = fixtures(&state);
+        for binary in [false, true] {
+            let decode = if binary {
+                decode_action_bin
+            } else {
+                decode_action_json
+            };
+            let mut scratch = Vec::new();
+            let mut allocation = None;
+            let mut successes = 0;
+            for payload in payloads(&actions, binary) {
+                let expected = old_verify(decode, &payload, &state);
+                let actual = verify_one_action_with(
+                    decode,
+                    &payload,
+                    torus_types::eip712::TORUS_CHAIN_ID,
+                    &state,
+                    NOW,
+                    &mut scratch,
+                )
+                .map(|(sender, action, hash)| {
+                    let old_bytes = serde_json::to_vec(&action).unwrap();
+                    assert_eq!(
+                        scratch, old_bytes,
+                        "scratch must reset after large bodies/errors"
+                    );
+                    (sender, old_bytes, hash)
+                });
+                assert_eq!(
+                    actual, expected,
+                    "binary={binary}, including exact error text"
+                );
+                successes += usize::from(actual.is_ok());
+                // First body is largest. Later successes and failures must not
+                // discard its reusable allocation or grow it for smaller bodies.
+                let current = (scratch.as_ptr(), scratch.capacity());
+                if let Some(first) = allocation {
+                    assert_eq!(current, first);
+                } else {
+                    assert!(actual.is_ok(), "largest body must populate the scratch");
+                    allocation = Some(current);
+                }
+            }
+            assert_eq!(successes, 4, "both signature types must reach JSON hashing");
+        }
+    }
+
+    #[test]
+    fn acknowledgement_scratch_parallel_results_preserve_index_order() {
+        use rayon::prelude::*;
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = torus_state::StateDb::open(dir.path()).unwrap();
+        let actions = fixtures(&state);
+        for binary in [false, true] {
+            let decode = if binary {
+                decode_action_bin
+            } else {
+                decode_action_json
+            };
+            let inputs = payloads(&actions, binary);
+            let expected: Vec<_> = inputs
+                .iter()
+                .map(|p| old_verify(decode, p, &state))
+                .collect();
+            let actual: Vec<_> = ingress_verify_pool().install(|| {
+                inputs
+                    .into_par_iter()
+                    .map_init(Vec::new, |scratch, payload| {
+                        verify_one_action_with(
+                            decode,
+                            &payload,
+                            torus_types::eip712::TORUS_CHAIN_ID,
+                            &state,
+                            NOW,
+                            scratch,
+                        )
+                        .map(|(sender, action, hash)| {
+                            (sender, serde_json::to_vec(&action).unwrap(), hash)
+                        })
+                    })
+                    .collect()
+            });
+            assert_eq!(actual, expected);
+        }
     }
 }
 

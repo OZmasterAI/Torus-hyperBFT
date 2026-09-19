@@ -1105,7 +1105,7 @@ mod tests {
             let d_keccak = t.elapsed();
 
             let t = std::time::Instant::now();
-            let (_, _, _, _hash) =
+            let (_, _, _hash) =
                 crate::torus::verify_one_action(&payload, TORUS_CHAIN_ID, &state, now_ms).unwrap();
             let d_total = t.elapsed();
 
@@ -1315,6 +1315,113 @@ mod tests {
             .await;
         assert!(over.is_err(), "oversize batch must be a call-level error");
         handle.stop().unwrap();
+    }
+
+    #[tokio::test]
+    async fn submit_ack_scratch_mixed_signatures_and_errors_preserve_order() {
+        use jsonrpsee::core::client::ClientT;
+        use torus_types::{ActionSignature, NativeAction};
+        for binary in [false, true] {
+            let (_dir, state, mempool, executor) = setup();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+            let key = k256::ecdsa::SigningKey::from_slice(&[7; 32]).unwrap();
+            let eip =
+                torus_types::eip712::sign_native_action(NativeAction::ClaimRewards, now, &key);
+            let session = torus_types::eip712::sign_native_action_with_session(
+                NativeAction::CancelOrder { order_id: 42 },
+                now + 1,
+                &([8u8; 32].into()),
+            );
+            let ActionSignature::Session { session_pubkey, .. } = &session.signature else {
+                panic!("expected session signature")
+            };
+            state
+                .put_session(
+                    session_pubkey,
+                    &torus_types::SessionData {
+                        owner: Address::from([9; 20]),
+                        expiry: now + 60_000,
+                        scope: torus_types::SessionScope::Full,
+                        created_at: now,
+                    },
+                )
+                .unwrap();
+            let mut bad_session = session.clone();
+            if let ActionSignature::Session { sig, .. } = &mut bad_session.signature {
+                sig.0[0] ^= 1;
+            }
+            let tail =
+                torus_types::eip712::sign_native_action(NativeAction::ClaimRewards, now + 2, &key);
+            let encode = |a: &torus_types::SignedNativeAction| {
+                let bytes = if binary {
+                    bincode::serialize(a).unwrap()
+                } else {
+                    serde_json::to_vec(a).unwrap()
+                };
+                format!("0x{}", hex::encode(bytes))
+            };
+            let payloads = vec![
+                encode(&eip),
+                "0xzz".to_string(),
+                encode(&session),
+                encode(&bad_session),
+                "0x00".to_string(),
+                encode(&tail),
+            ];
+            let (handle, addr) = start_server(state, mempool.clone(), executor).await;
+            let client = jsonrpsee::http_client::HttpClientBuilder::default()
+                .build(format!("http://{addr}"))
+                .unwrap();
+            let method = if binary {
+                "torus_submitNativeActionsBin"
+            } else {
+                "torus_submitNativeActions"
+            };
+            let results: Vec<RpcSubmitResult> = client
+                .request(method, jsonrpsee::rpc_params![payloads])
+                .await
+                .unwrap();
+            assert_eq!(results.len(), 6);
+            for (index, action) in [(0, &eip), (2, &session), (5, &tail)] {
+                // The original allocating serializer is the acknowledgement oracle.
+                let expected = alloy_primitives::keccak256(serde_json::to_vec(action).unwrap());
+                assert_eq!(
+                    results[index].hash.as_deref(),
+                    Some(format!("{expected:#x}").as_str())
+                );
+                assert!(results[index].error.is_none());
+            }
+            for (index, prefix) in [
+                (1, "invalid hex:"),
+                (3, "signature verification failed:"),
+                (4, "invalid action encoding:"),
+            ] {
+                assert!(results[index].hash.is_none());
+                assert!(results[index].error.as_deref().unwrap().starts_with(prefix));
+            }
+            assert_eq!(mempool.native_pool_size(), 3);
+            // Single-submit still hashes canonical JSON and admits exactly once.
+            let single = torus_types::eip712::sign_native_action_with_session(
+                NativeAction::CancelOrder { order_id: 43 },
+                now + 3,
+                &([8u8; 32].into()),
+            );
+            let old_bytes = serde_json::to_vec(&single).unwrap();
+            let expected = alloy_primitives::keccak256(&old_bytes);
+            let result: String = client
+                .request(
+                    "torus_submitNativeAction",
+                    jsonrpsee::rpc_params![format!("0x{}", hex::encode(old_bytes))],
+                )
+                .await
+                .unwrap();
+            assert_eq!(result, format!("{expected:#x}"));
+            assert_eq!(mempool.native_pool_size(), 4);
+            handle.stop().unwrap();
+        }
     }
 
     /// Sprint 5 Task 4: with the native pool at capacity, non-cancel actions
