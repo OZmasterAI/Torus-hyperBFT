@@ -3,7 +3,7 @@
 //! Task 3.1.4: Hardens the native pool that previously had no per-sender
 //! limits and no dedup. Adds pool size cap with priority-based eviction.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use alloy_primitives::{Address, B256};
 use torus_types::{compute_action_hash, NativeAction, SignedNativeAction};
@@ -21,6 +21,14 @@ use crate::error::MempoolError;
 /// `(priority, sender, nonce)` iterate in insertion order — precisely the
 /// tie order the stable sort preserved.
 type SortKey = (u8, Address, u64, u64);
+
+/// Same identity as SortKey, ordered by nonce for expiry-prefix removal.
+/// No stale heap entries: every insert/remove maintains this exact live index.
+type ExpiryKey = (u64, u8, Address, u64);
+
+fn expiry_key(&(priority, sender, nonce, seq): &SortKey) -> ExpiryKey {
+    (nonce, priority, sender, seq)
+}
 
 /// Entry in the native action pool with pre-recovered sender and dedup hash.
 pub(crate) struct NativePoolEntry {
@@ -44,6 +52,7 @@ pub(crate) struct NativePoolEntry {
 pub(crate) struct NativePool {
     /// Entries in selection order (see [`SortKey`]) — incrementally sorted.
     entries: BTreeMap<SortKey, NativePoolEntry>,
+    expiry_index: BTreeSet<ExpiryKey>,
     sender_counts: HashMap<Address, usize>,
     seen: HashSet<(Address, B256)>,
     /// Multimap: action hash -> ALL live entries with that hash, in insertion
@@ -64,6 +73,7 @@ impl NativePool {
     pub fn new(max_size: usize, max_per_sender: usize, max_per_block: usize) -> Self {
         Self {
             entries: BTreeMap::new(),
+            expiry_index: BTreeSet::new(),
             sender_counts: HashMap::new(),
             seen: HashSet::new(),
             hash_index: HashMap::new(),
@@ -183,6 +193,7 @@ impl NativePool {
         self.next_seq = self.next_seq.wrapping_add(1);
         let key: SortKey = (u8::from(!is_cancel), sender, action.nonce, seq);
         self.hash_index.entry(action_hash).or_default().push(key);
+        self.expiry_index.insert(expiry_key(&key));
         self.entries.insert(
             key,
             NativePoolEntry {
@@ -204,6 +215,7 @@ impl NativePool {
     /// The single choke point for index maintenance on every removal path.
     fn remove_entry_by_key(&mut self, key: &SortKey) -> Option<NativePoolEntry> {
         let entry = self.entries.remove(key)?;
+        self.expiry_index.remove(&expiry_key(key));
         self.seen.remove(&(entry.sender, entry.action_hash));
         self.dec_sender_count(&entry.sender);
         if let Some(keys) = self.hash_index.get_mut(&entry.action_hash) {
@@ -403,18 +415,21 @@ impl NativePool {
     /// from the selection/drain wrappers. Returns the number evicted.
     pub fn evict_expired(&mut self, now_ms: u64) -> usize {
         use torus_types::eip712::NONCE_WINDOW_MS;
-        let expired: Vec<SortKey> = self
-            .entries
-            .iter()
-            .filter(|(_, entry)| entry.action.nonce.saturating_add(NONCE_WINDOW_MS) < now_ms)
-            .map(|(key, _)| *key)
-            .collect();
-        // Same-hash duplicates share the nonce, so they expire together — no
-        // surviving entry can need a hash_index re-point here.
-        for key in &expired {
-            self.remove_entry_by_key(key);
+        // nonce.saturating_add(window) < now is equivalent to nonce <
+        // now-window when subtraction succeeds; otherwise nothing is expired.
+        // In particular, nonce+window==now and saturated u64::MAX stay live.
+        let Some(cutoff) = now_ms.checked_sub(NONCE_WINDOW_MS) else {
+            return 0;
+        };
+        let mut removed = 0;
+        while let Some(&(nonce, priority, sender, seq)) = self.expiry_index.first() {
+            if nonce >= cutoff {
+                break;
+            }
+            self.remove_entry_by_key(&(priority, sender, nonce, seq));
+            removed += 1;
         }
-        expired.len()
+        removed
     }
 
     /// Remove actions that were included in a committed block.
@@ -451,6 +466,10 @@ impl NativePool {
     /// is indexed under its hash exactly once.
     #[cfg(test)]
     fn assert_index_consistent(&self) {
+        assert_eq!(self.expiry_index.len(), self.entries.len());
+        for key in self.entries.keys() {
+            assert!(self.expiry_index.contains(&expiry_key(key)), "missing expiry key");
+        }
         let mut indexed: HashSet<SortKey> = HashSet::new();
         for (hash, keys) in &self.hash_index {
             assert!(!keys.is_empty(), "empty Vec left in hash_index for {hash}");
@@ -559,6 +578,126 @@ mod tests {
             usize::MAX,
         );
         assert_eq!(all.len(), 10);
+    }
+
+    fn evict_expired_reference(pool: &mut NativePool, now: u64) -> usize {
+        let keys: Vec<_> = pool
+            .entries
+            .iter()
+            .filter(|(_, entry)| {
+                entry
+                    .action
+                    .nonce
+                    .saturating_add(torus_types::eip712::NONCE_WINDOW_MS)
+                    < now
+            })
+            .map(|(key, _)| *key)
+            .collect();
+        for key in &keys {
+            pool.remove_entry_by_key(key);
+        }
+        keys.len()
+    }
+
+    fn assert_same_pool(left: &NativePool, right: &NativePool) {
+        left.assert_index_consistent();
+        right.assert_index_consistent();
+        assert_eq!(left.sender_counts, right.sender_counts);
+        assert_eq!(left.seen, right.seen);
+        assert_eq!(left.hash_index, right.hash_index);
+        assert_eq!(left.expiry_index, right.expiry_index);
+        assert_eq!(left.next_seq, right.next_seq);
+        assert_eq!(
+            left.entries.keys().collect::<Vec<_>>(),
+            right.entries.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            bincode::serialize(&left.select_for_block_with_senders(usize::MAX)).unwrap(),
+            bincode::serialize(&right.select_for_block_with_senders(usize::MAX)).unwrap()
+        );
+    }
+
+    #[test]
+    fn expiry_index_matches_saturating_strict_boundary_reference() {
+        use torus_types::eip712::NONCE_WINDOW_MS as W;
+        for now in [0, 1, W - 1, W, W + 1, 3 * W, u64::MAX - 1, u64::MAX] {
+            let mut candidate = NativePool::new(100, 100, 100);
+            let mut reference = NativePool::new(100, 100, 100);
+            for nonce in [
+                0,
+                1,
+                W,
+                2 * W,
+                u64::MAX - W - 1,
+                u64::MAX - W,
+                u64::MAX - 1,
+                u64::MAX,
+            ] {
+                for sender in [Address::repeat_byte(1), Address::repeat_byte(2)] {
+                    let action = make_action(nonce, NativeAction::ClaimRewards);
+                    candidate.insert(sender, action.clone()).unwrap();
+                    reference.insert(sender, action).unwrap();
+                }
+            }
+            assert_eq!(
+                candidate.evict_expired(now),
+                evict_expired_reference(&mut reference, now)
+            );
+            assert_same_pool(&candidate, &reference);
+            assert_eq!(candidate.evict_expired(now), 0);
+        }
+    }
+
+    #[test]
+    fn expiry_index_remains_exact_through_mixed_pool_mutations() {
+        let mut candidate = NativePool::new(40, 8, 3);
+        let mut reference = NativePool::new(40, 8, 3);
+        let mut rng = 0xcafe_babe_8642_7531u64;
+        for step in 0..2000u64 {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            let sender = Address::repeat_byte((rng % 8) as u8);
+            let nonce = (rng >> 9) % 100_000;
+            let action = make_action(
+                nonce,
+                if rng & 1 == 0 {
+                    NativeAction::CancelAllOrders { market_id: None }
+                } else {
+                    NativeAction::ClaimRewards
+                },
+            );
+            let a = candidate.insert_verified(sender, action.clone(), rng & 4 == 0);
+            let b = reference.insert_verified(sender, action, rng & 4 == 0);
+            assert_eq!(format!("{a:?}"), format!("{b:?}"));
+            match step % 5 {
+                0 => {
+                    let now = (rng >> 5) % 170_000;
+                    assert_eq!(
+                        candidate.evict_expired(now),
+                        evict_expired_reference(&mut reference, now)
+                    );
+                }
+                1 => {
+                    let hashes: Vec<_> = reference
+                        .entries
+                        .values()
+                        .take(3)
+                        .map(|e| e.action_hash)
+                        .collect();
+                    candidate.remove_committed(&hashes);
+                    reference.remove_committed(&hashes);
+                }
+                2 => {
+                    assert_eq!(
+                        bincode::serialize(&candidate.drain(3)).unwrap(),
+                        bincode::serialize(&reference.drain(3)).unwrap()
+                    );
+                }
+                _ => {}
+            }
+            assert_same_pool(&candidate, &reference);
+        }
     }
 
     #[test]
