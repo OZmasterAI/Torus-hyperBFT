@@ -18,7 +18,7 @@ pub mod trie;
 pub mod trie_cursor;
 
 pub use backend::{AtomicWriteOp, FrozenPending, NativeFlushStats, NativeStateOverlay, StateBackend};
-pub use bg_writer::{BackgroundCfWriter, BgWriterPolicy, RawCfKv};
+pub use bg_writer::{BackgroundCfWriter, BgWriterPolicy, PackedCfBatch, RawCfKv};
 pub use db::{DbTuning, RocksdbHist, RocksdbHistograms, RocksdbRuntimeStats, RocksdbTickers, StateDb};
 pub use error::StateError;
 pub use native_da::NativeDaStore;
