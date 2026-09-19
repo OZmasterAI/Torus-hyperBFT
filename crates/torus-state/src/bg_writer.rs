@@ -45,6 +45,86 @@ use crate::error::StateError;
 /// consts from [`crate::cf`].
 pub type RawCfKv = (&'static str, Vec<u8>, Vec<u8>);
 
+/// Owned CF rows backed by one byte arena instead of a key/value allocation
+/// for every row. Insertion order and duplicate keys are preserved.
+#[derive(Debug, Default)]
+pub struct PackedCfBatch {
+    bytes: Vec<u8>,
+    rows: Vec<PackedCfRow>,
+}
+
+#[derive(Debug)]
+struct PackedCfRow {
+    cf: &'static str,
+    start: usize,
+    key_end: usize,
+    end: usize,
+}
+
+impl PackedCfBatch {
+    /// Copy a row into the shared byte arena. Empty keys and values are valid.
+    pub fn push(&mut self, cf: &'static str, key: &[u8], value: &[u8]) {
+        let start = self.bytes.len();
+        self.bytes.extend_from_slice(key);
+        let key_end = self.bytes.len();
+        self.bytes.extend_from_slice(value);
+        self.rows.push(PackedCfRow {
+            cf,
+            start,
+            key_end,
+            end: self.bytes.len(),
+        });
+    }
+
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// Borrow rows in insertion order without allocating per-row buffers.
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = (&'static str, &[u8], &[u8])> {
+        self.rows.iter().map(|row| {
+            (
+                row.cf,
+                &self.bytes[row.start..row.key_end],
+                &self.bytes[row.key_end..row.end],
+            )
+        })
+    }
+
+    /// Convert for legacy callers that require separately owned raw rows.
+    pub fn into_raw(self) -> Vec<RawCfKv> {
+        self.iter()
+            .map(|(cf, key, value)| (cf, key.to_vec(), value.to_vec()))
+            .collect()
+    }
+}
+
+#[derive(Debug)]
+enum CfBatch {
+    Raw(Vec<RawCfKv>),
+    Packed(PackedCfBatch),
+}
+
+impl CfBatch {
+    fn len(&self) -> usize {
+        match self {
+            Self::Raw(kvs) => kvs.len(),
+            Self::Packed(kvs) => kvs.len(),
+        }
+    }
+
+    fn write(&self, db: &StateDb, policy: BgWriterPolicy) -> Result<(), StateError> {
+        match self {
+            Self::Raw(kvs) => write_kvs_chunked(db, kvs, policy),
+            Self::Packed(kvs) => write_rows_chunked(db, kvs.iter(), policy),
+        }
+    }
+}
+
 /// Default `TORUS_BG_WRITER_CHUNK_KVS`: rows per RocksDB write group. 2048
 /// small rows is a ~1-3 ms memtable insert, i.e. the longest a foreground
 /// writer can be held behind this thread.
@@ -103,7 +183,7 @@ impl Default for BgWriterPolicy {
 }
 
 pub struct BackgroundCfWriter {
-    tx: Option<SyncSender<Vec<RawCfKv>>>,
+    tx: Option<SyncSender<CfBatch>>,
     handle: Option<JoinHandle<()>>,
     queued: Arc<AtomicUsize>,
 }
@@ -123,7 +203,7 @@ impl BackgroundCfWriter {
         queue_cap: usize,
         policy: BgWriterPolicy,
     ) -> Self {
-        let (tx, rx) = sync_channel::<Vec<RawCfKv>>(queue_cap);
+        let (tx, rx) = sync_channel::<CfBatch>(queue_cap);
         let queued = Arc::new(AtomicUsize::new(0));
         let drained = queued.clone();
         let handle = std::thread::Builder::new()
@@ -132,7 +212,7 @@ impl BackgroundCfWriter {
                 // recv() returns every queued batch even after the sender is
                 // dropped, then errors — drain-on-shutdown falls out for free.
                 while let Ok(kvs) = rx.recv() {
-                    if let Err(e) = write_kvs_chunked(&db, &kvs, policy) {
+                    if let Err(e) = kvs.write(&db, policy) {
                         tracing::error!(%e, n = kvs.len(), "background CF writer: batch failed");
                     }
                     drained.fetch_sub(1, Ordering::Relaxed);
@@ -149,6 +229,23 @@ impl BackgroundCfWriter {
     /// Queue a batch. If the writer is gone the batch is handed back so the
     /// caller can write it synchronously instead of losing it.
     pub fn send(&self, kvs: Vec<RawCfKv>) -> Result<(), Vec<RawCfKv>> {
+        self.send_batch(CfBatch::Raw(kvs))
+            .map_err(|batch| match batch {
+                CfBatch::Raw(kvs) => kvs,
+                CfBatch::Packed(_) => unreachable!("send_batch returns the original batch"),
+            })
+    }
+
+    /// Queue packed rows with the same backpressure and handback as [`Self::send`].
+    pub fn send_packed(&self, kvs: PackedCfBatch) -> Result<(), PackedCfBatch> {
+        self.send_batch(CfBatch::Packed(kvs))
+            .map_err(|batch| match batch {
+                CfBatch::Packed(kvs) => kvs,
+                CfBatch::Raw(_) => unreachable!("send_batch returns the original batch"),
+            })
+    }
+
+    fn send_batch(&self, kvs: CfBatch) -> Result<(), CfBatch> {
         let Some(tx) = &self.tx else {
             return Err(kvs);
         };
@@ -179,16 +276,37 @@ impl Drop for BackgroundCfWriter {
 /// policy. Stops at the first failing chunk (rows before it are already
 /// durable; the caller logs, and the writer's loss model already tolerates a
 /// partial tail).
-fn write_kvs_chunked(db: &StateDb, kvs: &[RawCfKv], policy: BgWriterPolicy) -> Result<(), StateError> {
-    if kvs.is_empty() {
+fn write_kvs_chunked(
+    db: &StateDb,
+    kvs: &[RawCfKv],
+    policy: BgWriterPolicy,
+) -> Result<(), StateError> {
+    write_rows_chunked(
+        db,
+        kvs.iter()
+            .map(|(cf, key, value)| (*cf, key.as_slice(), value.as_slice())),
+        policy,
+    )
+}
+
+fn write_rows_chunked<'a>(
+    db: &StateDb,
+    mut rows: impl ExactSizeIterator<Item = (&'static str, &'a [u8], &'a [u8])>,
+    policy: BgWriterPolicy,
+) -> Result<(), StateError> {
+    if rows.len() == 0 {
         return Ok(());
     }
     let mut wo = WriteOptions::default();
     wo.set_low_pri(policy.low_pri);
-    let chunk = if policy.chunk_kvs == 0 { kvs.len() } else { policy.chunk_kvs };
-    for part in kvs.chunks(chunk) {
+    let chunk = if policy.chunk_kvs == 0 {
+        rows.len()
+    } else {
+        policy.chunk_kvs
+    };
+    while rows.len() != 0 {
         let mut batch = WriteBatch::default();
-        for (cf_name, key, value) in part {
+        for (cf_name, key, value) in rows.by_ref().take(chunk) {
             batch.put_cf(db.cf_handle(cf_name)?, key, value);
         }
         db.write_with(batch, &wo)?;
@@ -205,6 +323,225 @@ mod tests {
         let dir = tempfile::tempdir().expect("create temp dir");
         let db = StateDb::open(dir.path()).expect("open db");
         (dir, db)
+    }
+
+    fn pack(rows: &[RawCfKv]) -> PackedCfBatch {
+        let mut packed = PackedCfBatch::default();
+        for (cf, key, value) in rows {
+            packed.push(cf, key, value);
+        }
+        packed
+    }
+
+    // Independent original writer, retaining slice chunking as the oracle.
+    fn old_write(db: &StateDb, rows: &[RawCfKv], policy: BgWriterPolicy) -> Result<(), StateError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut wo = WriteOptions::default();
+        wo.set_low_pri(policy.low_pri);
+        let chunk = if policy.chunk_kvs == 0 {
+            rows.len()
+        } else {
+            policy.chunk_kvs
+        };
+        for part in rows.chunks(chunk) {
+            let mut batch = WriteBatch::default();
+            for (cf, key, value) in part {
+                batch.put_cf(db.cf_handle(cf)?, key, value);
+            }
+            db.write_with(batch, &wo)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn packed_rows_roundtrip_take_and_borrow_without_row_allocations() {
+        let rows = vec![
+            (CF_NATIVE_TRADES, vec![], vec![]),
+            (CF_NATIVE_TRADES, b"key".to_vec(), vec![0, 1, 255]),
+            (CF_NATIVE_USER_TRADES, vec![], b"value".to_vec()),
+            (CF_NATIVE_TRADES, b"key".to_vec(), vec![]),
+        ];
+        let mut packed = pack(&rows);
+        assert_eq!(packed.len(), rows.len());
+        assert_eq!(
+            packed.bytes.len(),
+            rows.iter().map(|(_, k, v)| k.len() + v.len()).sum::<usize>()
+        );
+        assert!(!packed.is_empty());
+        let mut iter = packed.iter();
+        for (i, (cf, key, value)) in rows.iter().enumerate() {
+            assert_eq!(iter.len(), rows.len() - i);
+            assert_eq!(iter.next(), Some((*cf, key.as_slice(), value.as_slice())));
+        }
+        assert_eq!(iter.len(), 0);
+        assert!(iter.next().is_none());
+        drop(iter);
+        let moved = std::mem::take(&mut packed);
+        assert!(packed.is_empty());
+        assert_eq!(moved.into_raw(), rows);
+        assert!(packed.into_raw().is_empty());
+    }
+
+    #[test]
+    fn packed_writes_match_original_bytes_and_write_groups_under_policies() {
+        let rows = vec![
+            (CF_NATIVE_TRADES, vec![], vec![]),
+            (CF_NATIVE_TRADES, b"key".to_vec(), b"first".to_vec()),
+            (CF_NATIVE_USER_TRADES, b"key".to_vec(), vec![0, 255]),
+            (CF_NATIVE_TRADES, b"key".to_vec(), b"last".to_vec()),
+            (CF_NATIVE_USER_TRADES, b"empty".to_vec(), vec![]),
+        ];
+        for chunk_kvs in [0, 1, 2, 8] {
+            for low_pri in [false, true] {
+                let policy = BgWriterPolicy { chunk_kvs, low_pri };
+                let (_old_dir, old) = open_test_db();
+                let dir = tempfile::tempdir().unwrap();
+                let db = StateDb::open_with_tuning(
+                    dir.path(),
+                    &crate::db::DbTuning {
+                        stats_level: 1,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                old_write(&old, &rows, policy).unwrap();
+                let before = db.runtime_stats().tickers.unwrap().write_self;
+                write_rows_chunked(&db, PackedCfBatch::default().iter(), policy).unwrap();
+                assert_eq!(db.runtime_stats().tickers.unwrap().write_self, before);
+                write_rows_chunked(&db, pack(&rows).iter(), policy).unwrap();
+                let groups = if chunk_kvs == 0 {
+                    1
+                } else {
+                    rows.len().div_ceil(chunk_kvs)
+                };
+                assert_eq!(
+                    db.runtime_stats().tickers.unwrap().write_self - before,
+                    groups as u64
+                );
+                for (cf, key, _) in &rows {
+                    assert_eq!(
+                        db.get_cf_raw(cf, key).unwrap(),
+                        old.get_cf_raw(cf, key).unwrap()
+                    );
+                }
+                assert_eq!(
+                    db.get_cf_raw(CF_NATIVE_TRADES, b"key").unwrap(),
+                    Some(b"last".to_vec())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn packed_missing_cf_preserves_original_partial_chunk_failure() {
+        let rows = vec![
+            (CF_NATIVE_TRADES, b"a".to_vec(), b"one".to_vec()),
+            (CF_NATIVE_USER_TRADES, b"b".to_vec(), b"two".to_vec()),
+            (CF_NATIVE_TRADES, b"c".to_vec(), b"three".to_vec()),
+            ("missing-test-cf", b"bad".to_vec(), vec![]),
+            (
+                CF_NATIVE_TRADES,
+                b"tail".to_vec(),
+                b"must-not-write".to_vec(),
+            ),
+        ];
+        for chunk_kvs in [0, 1, 2, 3, 8] {
+            for low_pri in [false, true] {
+                let policy = BgWriterPolicy { chunk_kvs, low_pri };
+                let (_old_dir, old) = open_test_db();
+                let (_dir, db) = open_test_db();
+                let expected = old_write(&old, &rows, policy).unwrap_err();
+                let actual = write_rows_chunked(&db, pack(&rows).iter(), policy).unwrap_err();
+                assert_eq!(actual.to_string(), expected.to_string());
+                let committed_rows = if chunk_kvs == 0 {
+                    0
+                } else {
+                    (3 / chunk_kvs) * chunk_kvs
+                };
+                for (i, (cf, key, value)) in rows.iter().enumerate().filter(|(i, _)| *i != 3) {
+                    let got = db.get_cf_raw(cf, key).unwrap();
+                    assert_eq!(got, old.get_cf_raw(cf, key).unwrap());
+                    assert_eq!(
+                        got,
+                        if i < committed_rows {
+                            Some(value.clone())
+                        } else {
+                            None
+                        }
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn packed_and_raw_queue_drains_in_order_after_failed_batch() {
+        for queue_cap in [0, 1] {
+            let (_dir, db) = open_test_db();
+            let writer = BackgroundCfWriter::spawn_with_policy(
+                db.clone(),
+                "packed-drain",
+                queue_cap,
+                BgWriterPolicy {
+                    chunk_kvs: 2,
+                    low_pri: true,
+                },
+            );
+            let queued = writer.queued.clone();
+            writer.send_packed(PackedCfBatch::default()).unwrap();
+            writer
+                .send_packed(pack(&[("missing-test-cf", vec![], vec![])]))
+                .unwrap();
+            for i in 0..16u8 {
+                let rows = vec![
+                    (CF_NATIVE_TRADES, vec![i], vec![i, i]),
+                    (CF_NATIVE_USER_TRADES, b"latest".to_vec(), vec![i]),
+                ];
+                if i % 2 == 0 {
+                    writer.send_packed(pack(&rows)).unwrap();
+                } else {
+                    writer.send(rows).unwrap();
+                }
+            }
+            drop(writer); // deterministic drain/join, including failure decrement
+            assert_eq!(queued.load(Ordering::Relaxed), 0);
+            for i in 0..16u8 {
+                assert_eq!(
+                    db.get_cf_raw(CF_NATIVE_TRADES, &[i]).unwrap(),
+                    Some(vec![i, i])
+                );
+            }
+            assert_eq!(
+                db.get_cf_raw(CF_NATIVE_USER_TRADES, b"latest").unwrap(),
+                Some(vec![15])
+            );
+        }
+    }
+
+    #[test]
+    fn packed_send_failure_returns_original_allocation_and_counter() {
+        for disconnected in [false, true] {
+            let (tx, rx) = sync_channel::<CfBatch>(1);
+            drop(rx);
+            let writer = BackgroundCfWriter {
+                tx: if disconnected { Some(tx) } else { None },
+                handle: None,
+                queued: Arc::new(AtomicUsize::new(0)),
+            };
+            let rows = vec![(CF_NATIVE_TRADES, b"key".to_vec(), b"value".to_vec())];
+            let packed = pack(&rows);
+            let allocations = (packed.bytes.as_ptr(), packed.rows.as_ptr());
+            let returned = writer.send_packed(packed).unwrap_err();
+            assert_eq!(
+                (returned.bytes.as_ptr(), returned.rows.as_ptr()),
+                allocations
+            );
+            assert_eq!(returned.into_raw(), rows);
+            assert_eq!(writer.send(rows.clone()).unwrap_err(), rows);
+            assert_eq!(writer.queued_batches(), 0);
+        }
     }
 
     #[test]
