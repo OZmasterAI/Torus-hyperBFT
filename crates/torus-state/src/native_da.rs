@@ -91,10 +91,14 @@ impl NativeDaStore {
         let mut batch = rocksdb::WriteBatch::default();
         let cf = self.db.cf_handle(CF_NATIVE_PENDING)?;
         let mut hash_scratch = Vec::with_capacity(64);
+        let mut bytes = Vec::new();
         for action in actions {
             let hash = compute_action_hash_with_scratch(action, &mut hash_scratch);
-            let bytes =
-                bincode::serialize(action).map_err(|e| StateError::InvalidData(e.to_string()))?;
+            bytes.clear();
+            bincode::serialize_into(&mut bytes, action)
+                .map_err(|e| StateError::InvalidData(e.to_string()))?;
+            // WriteBatch copies the value into its owned representation before
+            // returning, so the next action can safely reuse this buffer.
             batch.put_cf(cf, hash.as_slice(), &bytes);
         }
         self.db.write(batch)?;
@@ -215,10 +219,14 @@ impl NativeDaStore {
         let mut batch = rocksdb::WriteBatch::default();
         let cf = self.db.cf_handle(CF_NATIVE_SHARDS)?;
         let mut hash_scratch = Vec::with_capacity(64);
+        let mut body = Vec::new();
         for action in actions {
             let hash = compute_action_hash_with_scratch(action, &mut hash_scratch);
-            let body =
-                bincode::serialize(action).map_err(|e| StateError::InvalidData(e.to_string()))?;
+            body.clear();
+            bincode::serialize_into(&mut body, action)
+                .map_err(|e| StateError::InvalidData(e.to_string()))?;
+            // EncodedBody owns its shards; no body-buffer borrow survives this
+            // iteration. All shards still enter the same atomic WriteBatch.
             let enc = encode(&body, params).map_err(|e| StateError::InvalidData(e.to_string()))?;
             for i in 0..enc.params.n {
                 let stored = StoredShard::from_encoded_body(&enc, i);
@@ -324,6 +332,36 @@ mod tests {
         }
     }
 
+    // Frozen 6a51413 shard batch oracle: keep allocating bincode::serialize
+    // independent of the reusable production serializer.
+    fn legacy_put_shards_batch(
+        store: &NativeDaStore,
+        actions: &[SignedNativeAction],
+        params: ErasureParams,
+    ) -> Result<(), StateError> {
+        if actions.is_empty() {
+            return Ok(());
+        }
+        params
+            .validate()
+            .map_err(|e| StateError::InvalidData(e.to_string()))?;
+        let mut batch = rocksdb::WriteBatch::default();
+        let cf = store.db.cf_handle(CF_NATIVE_SHARDS)?;
+        for action in actions {
+            let hash = compute_action_hash(action);
+            let body =
+                bincode::serialize(action).map_err(|e| StateError::InvalidData(e.to_string()))?;
+            let enc = encode(&body, params).map_err(|e| StateError::InvalidData(e.to_string()))?;
+            for i in 0..enc.params.n {
+                let stored = StoredShard::from_encoded_body(&enc, i);
+                let bytes = encode_stored_shard(&stored)?;
+                batch.put_cf(cf, shard_key(&hash.0, i as u16), &bytes);
+            }
+        }
+        store.db.write(batch)?;
+        Ok(())
+    }
+
     #[test]
     fn batch_hash_scratch_preserves_body_and_shard_bytes_across_reuse_and_reopen() {
         use crate::StateBackend;
@@ -355,8 +393,8 @@ mod tests {
         actual.put_shards_batch(&actions, params).unwrap();
         for action in &actions {
             reference.put(action).unwrap();
-            reference.put_shards_batch(std::slice::from_ref(action), params).unwrap();
         }
+        legacy_put_shards_batch(&reference, &actions, params).unwrap();
         for cf in [CF_NATIVE_PENDING, CF_NATIVE_SHARDS] {
             assert_eq!(actual.db.iterate_cf(cf, None).unwrap(), reference.db.iterate_cf(cf, None).unwrap());
         }
