@@ -288,3 +288,46 @@ fn flush_writes_in_sorted_key_order() {
     cache.flush_all(&pm).unwrap();
     assert_eq!(ops.lock().unwrap().len(), 5, "second flush re-wrote clean entries");
 }
+
+#[test]
+fn owned_position_and_balance_writes_match_legacy_borsh_bytes() {
+    use torus_core::position::Position;
+    use torus_state::NativeStateOverlay;
+    let (dir, pm) = setup();
+    let overlay = NativeStateOverlay::new(pm.state().clone());
+    let owned = PositionManager::new(overlay.clone());
+    for (i, margin_type) in [MarginType::Cross, MarginType::Isolated].into_iter().enumerate() {
+        let position = Position {
+            trader: addr(i as u8 + 1),
+            market_id: u64::MAX - i as u64,
+            is_long: i == 0,
+            size: FixedPoint::MAX,
+            entry_price: FixedPoint::MIN,
+            realized_pnl: FixedPoint::from_raw(-1),
+            isolated_margin: FixedPoint::ZERO,
+            margin_type,
+        };
+        let balance = torus_core::position::NativeBalance {
+            available: FixedPoint::MIN,
+            order_margin: FixedPoint::MAX,
+        };
+        let position_bytes = borsh::to_vec(&position).unwrap();
+        let balance_bytes = borsh::to_vec(&balance).unwrap();
+        assert_eq!(position_bytes.len(), 95);
+        assert_eq!(balance_bytes.len(), 33);
+        let key = position_key(&position.trader, position.market_id);
+        owned.put_position(&position).unwrap();
+        owned.put_native_balance(&position.trader, &balance).unwrap();
+        assert_eq!(overlay.get_cf_raw(CF_NATIVE_POSITIONS, &key).unwrap(), Some(position_bytes.clone()));
+        assert_eq!(overlay.get_cf_raw(CF_NATIVE_BALANCES, position.trader.as_slice()).unwrap(), Some(balance_bytes.clone()));
+        // Direct StateDb uses the default owned-to-borrowed delegation.
+        pm.put_position(&position).unwrap();
+        pm.put_native_balance(&position.trader, &balance).unwrap();
+        assert_eq!(pm.state().get_cf_raw(CF_NATIVE_POSITIONS, &key).unwrap(), Some(position_bytes));
+        assert_eq!(pm.state().get_cf_raw(CF_NATIVE_BALANCES, position.trader.as_slice()).unwrap(), Some(balance_bytes));
+    }
+    drop(owned);
+    drop(overlay);
+    drop(pm);
+    drop(dir);
+}

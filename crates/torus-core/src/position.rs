@@ -242,8 +242,11 @@ impl<T: StateBackend> PositionManager<T> {
 
     pub fn put_position(&self, pos: &Position) -> Result<(), CoreError> {
         let key = position_key(&pos.trader, pos.market_id);
-        let data = borsh::to_vec(pos).map_err(|e| CoreError::Borsh(e.to_string()))?;
-        self.state.put_cf_raw(CF_NATIVE_POSITIONS, &key, &data)?;
+        // Capacity hint matches the fixed v1 layout; Vec can still grow if the
+        // codec changes. Avoid retaining borsh::to_vec's 1 KiB starter buffer.
+        let mut data = Vec::with_capacity(95);
+        pos.serialize(&mut data).map_err(|e| CoreError::Borsh(e.to_string()))?;
+        self.state.put_cf_raw_owned(CF_NATIVE_POSITIONS, &key, data)?;
         Ok(())
     }
 
@@ -285,9 +288,10 @@ impl<T: StateBackend> PositionManager<T> {
         trader: &Address,
         bal: &NativeBalance,
     ) -> Result<(), CoreError> {
-        let data = borsh::to_vec(bal).map_err(|e| CoreError::Borsh(e.to_string()))?;
+        let mut data = Vec::with_capacity(33); // fixed v1 layout, growable hint
+        bal.serialize(&mut data).map_err(|e| CoreError::Borsh(e.to_string()))?;
         self.state
-            .put_cf_raw(CF_NATIVE_BALANCES, trader.as_slice(), &data)?;
+            .put_cf_raw_owned(CF_NATIVE_BALANCES, trader.as_slice(), data)?;
         Ok(())
     }
 
