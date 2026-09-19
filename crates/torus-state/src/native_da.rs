@@ -154,9 +154,21 @@ impl NativeDaStore {
     /// body is `Err(InvalidData)` exactly as in `get`. The hot compact-block
     /// reconstruct path uses this instead of a per-hash `get` loop.
     pub fn get_batch(&self, hashes: &[B256]) -> Result<Vec<Option<SignedNativeAction>>, StateError> {
-        let keys: Vec<&[u8]> = hashes.iter().map(|h| h.as_slice()).collect();
-        self.db
-            .multi_get_cf_raw(CF_NATIVE_PENDING, &keys)?
+        if hashes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let cf = self.db.cf_handle(CF_NATIVE_PENDING)?;
+        // Decode directly from pinned values: the generic raw MultiGet copies
+        // each full body into a temporary Vec that this path would discard.
+        // Input is deliberately not sorted; duplicates and caller order matter.
+        // Collect storage errors before decoding, as the old raw helper did.
+        let pinned = self
+            .db
+            .inner()
+            .batched_multi_get_cf(cf, hashes.iter().map(|hash| hash.as_slice()), false)
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?;
+        pinned
             .into_iter()
             .map(|slot| match slot {
                 Some(bytes) => bincode::deserialize(&bytes)
@@ -309,6 +321,50 @@ mod tests {
             store.get_batch(&[B256::from(bad)]),
             Err(StateError::InvalidData(_))
         ));
+    }
+
+    #[test]
+    fn pinned_batch_matches_single_reads_for_unsorted_duplicates_and_sst_values() {
+        use torus_types::{FixedPoint, NativeAction, OrderType, PlaceOrderParams, TimeInForce};
+        let (dir, store) = temp_store();
+        let mut large = dummy_action(2);
+        large.action = NativeAction::PlaceOrderBatch(vec![PlaceOrderParams {
+            market_id: 7,
+            is_buy: true,
+            price: FixedPoint::from_raw(123_000_000),
+            quantity: FixedPoint::from_raw(100_000_000),
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::GTC,
+            reduce_only: false,
+            client_order_id: None,
+        }; 400]);
+        let actions = [dummy_action(1), large, dummy_action(3)];
+        store.put_batch(&actions).unwrap();
+        let mut hashes: Vec<_> = actions.iter().map(compute_action_hash).collect();
+        hashes.sort_unstable();
+        hashes.reverse();
+        hashes.insert(1, B256::repeat_byte(0xAB));
+        hashes.extend_from_within(0..3);
+        let check = |store: &NativeDaStore| {
+            let expected: Vec<_> = hashes.iter().map(|hash| store.get(hash).unwrap()).collect();
+            let got = store.get_batch(&hashes).unwrap();
+            assert_eq!(bincode::serialize(&got).unwrap(), bincode::serialize(&expected).unwrap());
+            assert_eq!(got.len(), hashes.len());
+            assert!(store.get_batch(&[]).unwrap().is_empty());
+        };
+        check(&store); // memtable values
+        let cf = store.db.cf_handle(CF_NATIVE_PENDING).unwrap();
+        store.db.inner().flush_cf(cf).unwrap();
+        store.db.inner().compact_range_cf(cf, None::<&[u8]>, None::<&[u8]>);
+        check(&store); // SST values and block-cache pins
+        drop(store);
+        let reopened = NativeDaStore::new(StateDb::open(dir.path()).unwrap());
+        check(&reopened);
+        // Overwrite and delete after prior reads; pins must not escape decoding.
+        reopened.db.put_cf_raw(CF_NATIVE_PENDING, hashes[0].as_slice(), b"bad").unwrap();
+        assert!(matches!(reopened.get_batch(&hashes), Err(StateError::InvalidData(_))));
+        reopened.remove(&[hashes[0]]).unwrap();
+        check(&reopened);
     }
 
     fn dummy_action(nonce: u64) -> SignedNativeAction {
