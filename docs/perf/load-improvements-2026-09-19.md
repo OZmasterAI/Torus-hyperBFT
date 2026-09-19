@@ -36,6 +36,11 @@ load generator is running. Account remaining percentage is not exposed.
 | Proposal hash loops | Extend scratch reuse to lazy proposal hashes, cold commit comparisons, commit pruning and hash-only network pushes | `1364d74` |
 | DA reads | Decode native batches from RocksDB pinned values, avoiding temporary full-body Vec copies and preserving input order | `fe83745` |
 | DA writes | Reuse batch-local bincode buffers for body and shard custody writes, omitting per-action allocations and size walks | `c1e32b7` |
+| DA serving | Fetch raw response bodies in bounded 16-hash batches, retaining input slots and independent-read fallback on storage errors | `778f059` |
+| RPC acknowledgements | Reuse task-local JSON scratch and retain only parsed actions and acknowledgement hashes after verification | `8a34358` |
+| Executor allocation | Pre-size flattened actions and place-order indices from valid batch lengths; preserve execution and skip order | `90e04d2` |
+| Trade writer | Accept packed byte-arena batches alongside the old raw-row API, preserving queue and write-chunk behavior | `e4cf9a4` |
+| Trade history | Build fixed-size rows and use packed production handoff instead of six small key/value allocations per fill | `5582366` |
 
 The cancellation implementation and eligibility proof are in
 [cancel-batch-2026-09-19.md](cancel-batch-2026-09-19.md). The integer arithmetic
@@ -81,6 +86,20 @@ one unique-test total. Ignored timing probes remained ignored.
 - DA serialization scratch: nine tests passed against an independent legacy
   shard serializer and unchanged single-body writer. Receipt
   `3851ba4b-e302-4aa1-9d8a-6d955a466d66` in the cancellation-agent scope.
+- DA serving: five network DA checks, including a >4 MiB codec/reconstruction
+  fixture, and ten integrated state DA tests passed. Receipt
+  `5137a30a-4421-4bf2-a793-0234e8574026`. Aggregate-error fallback was reviewed
+  in source; no storage I/O failure was injected.
+- RPC: all 62 correctness tests passed, including old JSON hash/error parity,
+  both signature forms and actual JSON/binary endpoints. The existing unignored
+  `verify_breakdown_by_batch_size` timing probe was explicitly skipped. Receipt
+  `7f4b1d4c-9fed-4c66-bae1-33fd90c86330`.
+- Executor pre-sizing: all 19 matching tests passed, including batch-cap and
+  hand-flattened equivalence cases. Receipt `b15f3400-3d24-4cd7-9a34-58a0efa033ab`.
+- Packed history: 12 writer tests passed (`9b8bf7d2-62d6-4f0c-8925-970b5e62f006`);
+  the encoder oracle, eight settlement, three deferred-trade and one consensus
+  writer test passed (`b20a69ca-d657-49f3-9378-b029ee6e09ac`). Details and memory
+  tradeoffs: [packed-trade-history-2026-09-19.md](packed-trade-history-2026-09-19.md).
 
 The initial broad network run exposed the existing ban-file race: 128 tests
 passed and `ban_list_persistence` failed. That issue is now fixed and the latest
