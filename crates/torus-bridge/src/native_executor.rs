@@ -4339,7 +4339,7 @@ impl NativeExecutor {
         let max_lev = cfg
             .map(|c| effective_max_leverage(&c.tiers, notional))
             .unwrap_or(20);
-        notional / FixedPoint::from_raw(max_lev as i128 * FixedPoint::SCALE)
+        Self::margin_at_integer_leverage(notional, max_lev)
     }
 
     /// A5: margin releases owed to RESTING (maker) orders that were consumed
@@ -4677,8 +4677,7 @@ impl NativeExecutor {
                     .get(&market_id)
                     .map(|c| effective_max_leverage(&c.tiers, notional))
                     .unwrap_or(20);
-                let lev_fp = FixedPoint::from_raw(max_lev as i128 * FixedPoint::SCALE);
-                let margin_to_release = notional / lev_fp;
+                let margin_to_release = Self::margin_at_integer_leverage(notional, max_lev);
 
                 if margin_to_release > FixedPoint::ZERO {
                     if let Ok(mut bal) = ctx.positions.get_native_balance(&cancelled.trader) {
@@ -4715,7 +4714,7 @@ impl NativeExecutor {
                                 .map(|c| effective_max_leverage(&c.tiers, notional))
                                 .unwrap_or(20);
                             total_margin_release +=
-                                Self::cancel_all_margin_at_leverage(notional, max_lev);
+                                Self::margin_at_integer_leverage(notional, max_lev);
                         }
                     }
                 }
@@ -4734,7 +4733,7 @@ impl NativeExecutor {
                                     .map(|c| effective_max_leverage(&c.tiers, notional))
                                     .unwrap_or(20);
                                 total_margin_release +=
-                                    Self::cancel_all_margin_at_leverage(notional, max_lev);
+                                    Self::margin_at_integer_leverage(notional, max_lev);
                             }
                         }
                     }
@@ -4754,12 +4753,12 @@ impl NativeExecutor {
         NativeActionResult::ok("cancel_all", 500)
     }
 
-    /// Cancel-all only: dividing raw notional by positive integer leverage
+    /// Dividing raw notional by positive integer leverage
     /// exactly cancels SCALE in the general fixed-point division. Signed
     /// truncation is unchanged for every i128; a u32 divisor cannot be -1,
     /// so checked_div can fail only at zero. Preserve the original panic text
     /// and keep this call after each order's multiplication and tier lookup.
-    fn cancel_all_margin_at_leverage(notional: FixedPoint, leverage: u32) -> FixedPoint {
+    fn margin_at_integer_leverage(notional: FixedPoint, leverage: u32) -> FixedPoint {
         notional
             .raw()
             .checked_div(i128::from(leverage))
@@ -5734,11 +5733,101 @@ fn decode_time_in_force(code: u8) -> TimeInForce {
 }
 
 #[cfg(test)]
-mod cancel_all_integer_margin_tests {
+mod integer_margin_tests {
     use super::*;
+    use torus_core::margin::MarginTier;
 
     fn legacy(notional: FixedPoint, leverage: u32) -> FixedPoint {
         notional / FixedPoint::from_raw(i128::from(leverage) * FixedPoint::SCALE)
+    }
+
+    // Frozen reservation formula, including early exits and tier lookup order.
+    fn legacy_reserve(
+        cfg: Option<&MarketMarginConfig>,
+        price: FixedPoint,
+        qty: FixedPoint,
+    ) -> FixedPoint {
+        if price <= FixedPoint::ZERO || qty <= FixedPoint::ZERO {
+            return FixedPoint::ZERO;
+        }
+        let notional = price * qty;
+        let max_lev = cfg
+            .map(|c| effective_max_leverage(&c.tiers, notional))
+            .unwrap_or(20);
+        notional / FixedPoint::from_raw(max_lev as i128 * FixedPoint::SCALE)
+    }
+
+    #[test]
+    fn reserve_integer_margin_matches_legacy_tiers_and_rounding() {
+        let default = MarketMarginConfig::new(1, 999);
+        let mut tiered = MarketMarginConfig::new(1, 999);
+        tiered.tiers = vec![
+            MarginTier {
+                max_notional: FixedPoint::from_raw(100 * FixedPoint::SCALE),
+                max_leverage: 3,
+            },
+            MarginTier {
+                max_notional: FixedPoint::from_raw(200 * FixedPoint::SCALE),
+                max_leverage: 7,
+            },
+        ]; // Above the final tier falls back to 1x, not the scalar 999.
+        let mut empty = MarketMarginConfig::new(1, 999);
+        empty.tiers.clear();
+        let mut quantities = vec![1, 19, 20, 21, FixedPoint::SCALE - 1, i128::MAX];
+        for boundary in [100, 200, 100_000, 1_000_000, 10_000_000] {
+            let raw = boundary * FixedPoint::SCALE;
+            quantities.extend([raw - 1, raw, raw + 1]);
+        }
+        for cfg in [None, Some(&default), Some(&tiered), Some(&empty)] {
+            for &raw in &quantities {
+                // ONE hits exact tier boundaries; subunit prices also exercise
+                // multiplication truncation before leverage division.
+                for price in [
+                    FixedPoint::ONE,
+                    FixedPoint::from_raw(1),
+                    FixedPoint::from_raw(FixedPoint::SCALE / 3 + 1),
+                ] {
+                    let qty = FixedPoint::from_raw(raw);
+                    assert_eq!(
+                        NativeExecutor::reserve_for_qty_cfg(cfg, price, qty),
+                        legacy_reserve(cfg, price, qty),
+                        "price={price:?} qty={qty:?} config={cfg:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reserve_integer_margin_preserves_early_exits_and_panic_order() {
+        let mut zero = MarketMarginConfig::new(1, 999);
+        zero.tiers = vec![MarginTier {
+            max_notional: FixedPoint::MAX,
+            max_leverage: 0,
+        }];
+        let outcome = |f: &dyn Fn() -> FixedPoint| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).map_err(|payload| {
+                payload
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+                    .expect("string panic payload")
+            })
+        };
+        for cfg in [None, Some(&zero)] {
+            for p in [i128::MIN, -1, 0, 1, FixedPoint::SCALE, i128::MAX] {
+                for q in [i128::MIN, -1, 0, 1, FixedPoint::SCALE, i128::MAX] {
+                    let price = FixedPoint::from_raw(p);
+                    let qty = FixedPoint::from_raw(q);
+                    let expected = outcome(&|| legacy_reserve(cfg, price, qty));
+                    let actual = outcome(&|| NativeExecutor::reserve_for_qty_cfg(cfg, price, qty));
+                    if p <= 0 || q <= 0 {
+                        assert_eq!(actual, Ok(FixedPoint::ZERO));
+                    }
+                    assert_eq!(actual, expected, "price={p} qty={q} config={cfg:?}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -5766,7 +5855,7 @@ mod cancel_all_integer_margin_tests {
             for leverage in leverages {
                 let notional = FixedPoint::from_raw(raw);
                 assert_eq!(
-                    NativeExecutor::cancel_all_margin_at_leverage(notional, leverage),
+                    NativeExecutor::margin_at_integer_leverage(notional, leverage),
                     legacy(notional, leverage),
                     "raw={raw} leverage={leverage}"
                 );
@@ -5781,7 +5870,7 @@ mod cancel_all_integer_margin_tests {
             let notional = FixedPoint::from_raw(bits as i128);
             let leverage = (bits as u32).max(1);
             assert_eq!(
-                NativeExecutor::cancel_all_margin_at_leverage(notional, leverage),
+                NativeExecutor::margin_at_integer_leverage(notional, leverage),
                 legacy(notional, leverage)
             );
         }
@@ -5802,7 +5891,7 @@ mod cancel_all_integer_margin_tests {
             let notional = FixedPoint::from_raw(raw);
             let old = std::panic::catch_unwind(|| legacy(notional, 0)).unwrap_err();
             let new = std::panic::catch_unwind(|| {
-                NativeExecutor::cancel_all_margin_at_leverage(notional, 0)
+                NativeExecutor::margin_at_integer_leverage(notional, 0)
             })
             .unwrap_err();
             let old = text(old);
