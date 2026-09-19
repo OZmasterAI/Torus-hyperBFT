@@ -4,7 +4,9 @@
 //! Ban list is persisted as a JSON file in the data directory.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use libp2p::PeerId;
@@ -34,6 +36,122 @@ pub struct BanEntry {
     pub banned_at: u64,
     pub expires_at: Option<u64>,
     pub reason: String,
+}
+
+#[derive(Default)]
+struct PendingBans {
+    latest: Option<Vec<BanEntry>>,
+    stopping: bool,
+}
+
+/// At most one active write and one replaceable pending snapshot. The owner
+/// starts this worker only on its first permanent-ban save.
+struct BanWriter {
+    pending: Arc<(Mutex<PendingBans>, Condvar)>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl BanWriter {
+    fn spawn(
+        mut write: impl FnMut(&[BanEntry]) -> io::Result<()> + Send + 'static,
+    ) -> io::Result<Self> {
+        let pending = Arc::new((Mutex::new(PendingBans::default()), Condvar::new()));
+        let worker_pending = pending.clone();
+        let thread = std::thread::Builder::new()
+            .name("torus-ban-writer".into())
+            .spawn(move || loop {
+                let snapshot = {
+                    let (lock, wake) = &*worker_pending;
+                    let mut pending = lock.lock().unwrap();
+                    while pending.latest.is_none() && !pending.stopping {
+                        pending = wake.wait(pending).unwrap();
+                    }
+                    match pending.latest.take() {
+                        Some(snapshot) => snapshot,
+                        None => break,
+                    }
+                };
+                // No lock is held during serialization or file I/O.
+                if let Err(e) = write(&snapshot) {
+                    tracing::warn!(%e, "failed to save ban list");
+                }
+            })?;
+        Ok(Self {
+            pending,
+            thread: Some(thread),
+        })
+    }
+
+    fn submit(&self, snapshot: Vec<BanEntry>) {
+        let (lock, wake) = &*self.pending;
+        let superseded = lock.lock().unwrap().latest.replace(snapshot);
+        // Drop a superseded allocation outside the worker's critical section.
+        drop(superseded);
+        wake.notify_one();
+    }
+}
+
+impl Drop for BanWriter {
+    fn drop(&mut self) {
+        let (lock, wake) = &*self.pending;
+        lock.lock().unwrap().stopping = true;
+        wake.notify_one();
+        // Only owner shutdown waits for I/O. Drain the newest queued snapshot
+        // before returning, rather than leaving a detached writer behind.
+        if let Some(thread) = self.thread.take() {
+            if thread.join().is_err() {
+                tracing::warn!("ban-list writer panicked");
+            }
+        }
+    }
+}
+
+/// Stage in the target directory, then replace the visible file atomically.
+/// This guarantees complete-file visibility, not power-loss durability (no fsync).
+fn replace_ban_file(
+    path: &Path,
+    write: impl FnOnce(&mut std::fs::File) -> io::Result<()>,
+) -> io::Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let filename = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "ban file needs a filename"))?;
+    let (temp_path, mut file) = loop {
+        let mut name = filename.to_os_string();
+        name.push(format!(
+            ".tmp-{}-{}",
+            std::process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+        ));
+        let temp_path = parent.join(name);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+        {
+            Ok(file) => break (temp_path, file),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    };
+    let result = write(&mut file);
+    drop(file);
+    let result = result.and_then(|()| std::fs::rename(&temp_path, path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    result
+}
+
+fn write_bans(path: &Path, entries: &[BanEntry]) -> io::Result<()> {
+    let json = serde_json::to_vec_pretty(entries).map_err(io::Error::other)?;
+    replace_ban_file(path, |file| file.write_all(&json))
 }
 
 /// Per-peer score tracking.
@@ -105,6 +223,7 @@ pub struct PeerScoring {
     temp_bans: HashMap<PeerId, Instant>,
     perm_bans: HashMap<PeerId, String>, // peer_id -> reason
     ban_file: Option<PathBuf>,
+    ban_writer: Option<BanWriter>,
 }
 
 impl PeerScoring {
@@ -114,6 +233,7 @@ impl PeerScoring {
             temp_bans: HashMap::new(),
             perm_bans: HashMap::new(),
             ban_file,
+            ban_writer: None,
         };
         scoring.load_bans();
         scoring
@@ -245,13 +365,21 @@ impl PeerScoring {
 
     /// Save ban list to JSON file.
     ///
-    /// FIX CONS-FIND-29: File I/O is offloaded to a background OS thread via
-    /// `std::thread::spawn` so it does not block the async event loop.
-    fn save_bans(&self) {
-        let path = match &self.ban_file {
-            Some(p) => p.clone(),
-            None => return,
-        };
+    /// One lazy background worker serializes writes and coalesces queued
+    /// snapshots, keeping file I/O off the async event loop.
+    fn save_bans(&mut self) {
+        if self.ban_writer.is_none() {
+            let Some(path) = self.ban_file.clone() else {
+                return;
+            };
+            match BanWriter::spawn(move |entries| write_bans(&path, entries)) {
+                Ok(writer) => self.ban_writer = Some(writer),
+                Err(e) => {
+                    tracing::warn!(%e, "failed to start ban-list writer");
+                    return;
+                }
+            }
+        }
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -269,16 +397,7 @@ impl PeerScoring {
             })
             .collect();
 
-        std::thread::spawn(move || {
-            if let Ok(json) = serde_json::to_string_pretty(&entries) {
-                if let Some(parent) = path.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                if let Err(e) = std::fs::write(&path, json) {
-                    tracing::warn!(%e, "failed to save ban list");
-                }
-            }
-        });
+        self.ban_writer.as_ref().unwrap().submit(entries);
     }
 }
 
@@ -441,19 +560,142 @@ mod tests {
                 scoring.penalize(&peer, PENALTY_INVALID_CONSENSUS_MSG, "attack");
             }
             assert!(scoring.permanently_banned_peers().contains(&peer));
+            scoring.penalize(&test_peer(9), 200, "second peer");
+            scoring.penalize(&peer, 20, "latest reason");
         }
 
-        // Wait for background thread to flush ban file to disk.
-        for _ in 0..100 {
-            if ban_file.exists() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-
-        // Reload and check persistence
+        // Owner shutdown drains the latest snapshot; no existence polling or
+        // sleeps can mistake a newly-created file for a completed write.
         let mut scoring2 = PeerScoring::new(Some(ban_file));
         let peer = test_peer(8);
         assert!(scoring2.is_banned(&peer));
+        assert!(scoring2.is_banned(&test_peer(9)));
+        assert_eq!(scoring2.perm_bans[&peer], "latest reason");
+        assert!(
+            scoring2.ban_writer.is_none(),
+            "loading does not start a writer"
+        );
+    }
+
+    fn ban_snapshot(reason: &str) -> Vec<BanEntry> {
+        vec![BanEntry {
+            peer_id: test_peer(1).to_string(),
+            permanent: true,
+            banned_at: 1,
+            expires_at: None,
+            reason: reason.to_owned(),
+        }]
+    }
+
+    #[test]
+    fn ban_writer_starts_only_for_configured_permanent_bans() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bans.json");
+        let mut scoring = PeerScoring::new(Some(path.clone()));
+        assert!(scoring.ban_writer.is_none());
+        scoring.penalize(&test_peer(1), 100, "temporary");
+        assert!(scoring.ban_writer.is_none());
+        assert!(!path.exists());
+        scoring.penalize(&test_peer(2), 200, "permanent");
+        assert!(scoring.ban_writer.is_some());
+        drop(scoring);
+        let entries: Vec<BanEntry> = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].peer_id, test_peer(2).to_string());
+        let mut memory_only = PeerScoring::new(None);
+        memory_only.penalize(&test_peer(3), 200, "no persistence configured");
+        assert!(memory_only.ban_writer.is_none());
+        assert!(memory_only.is_banned(&test_peer(3)));
+    }
+
+    #[test]
+    fn ban_writer_coalesces_latest_and_drains_after_success_or_failure() {
+        use std::sync::mpsc::sync_channel;
+        for fail_first in [false, true] {
+            let (entered_tx, entered_rx) = sync_channel(1);
+            let (release_tx, release_rx) = sync_channel(1);
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let observed = calls.clone();
+            let mut first = true;
+            let writer = BanWriter::spawn(move |entries| {
+                observed
+                    .lock()
+                    .unwrap()
+                    .push((entries[0].reason.clone(), std::thread::current().id()));
+                if first {
+                    first = false;
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+                    if fail_first {
+                        return Err(io::Error::other("injected write failure"));
+                    }
+                }
+                Ok(())
+            })
+            .unwrap();
+            writer.submit(ban_snapshot("active"));
+            entered_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+            // The writer is held inside its first I/O call. Submissions must
+            // stay nonblocking and retain only the newest pending snapshot.
+            for i in 0..100 {
+                writer.submit(ban_snapshot(&format!("pending-{i}")));
+            }
+            let pending_reason = writer.pending.0.lock().unwrap().latest.as_ref().unwrap()[0]
+                .reason
+                .clone();
+            release_tx.send(()).unwrap();
+            drop(writer); // Includes the pending latest snapshot, not just active I/O.
+            assert_eq!(pending_reason, "pending-99");
+            let calls = calls.lock().unwrap();
+            assert_eq!(calls.len(), 2);
+            assert_eq!(calls[0].0, "active");
+            assert_eq!(calls[1].0, "pending-99");
+            assert_eq!(calls[0].1, calls[1].1);
+            assert_ne!(calls[0].1, std::thread::current().id());
+        }
+    }
+
+    #[test]
+    fn ban_file_replacement_preserves_complete_old_file_until_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bans.json");
+        write_bans(&path, &ban_snapshot("old")).unwrap();
+        let old = std::fs::read(&path).unwrap();
+        let error = replace_ban_file(&path, |file| {
+            file.write_all(b"partial JSON")?;
+            assert_eq!(std::fs::read(&path).unwrap(), old);
+            Err(io::Error::other("injected partial write failure"))
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(std::fs::read(&path).unwrap(), old);
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "failed temporary file removed"
+        );
+        let next = serde_json::to_vec_pretty(&ban_snapshot("new")).unwrap();
+        replace_ban_file(&path, |file| {
+            file.write_all(&next)?;
+            assert_eq!(std::fs::read(&path).unwrap(), old);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), next);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn ban_file_failed_rename_cleans_temp_and_writer_can_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bans.json");
+        std::fs::create_dir(&path).unwrap();
+        assert!(write_bans(&path, &ban_snapshot("blocked")).is_err());
+        assert!(path.is_dir());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        std::fs::remove_dir(&path).unwrap();
+        write_bans(&path, &ban_snapshot("recovered")).unwrap();
+        let entries: Vec<BanEntry> = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(entries[0].reason, "recovered");
     }
 }
