@@ -4687,16 +4687,15 @@ impl NativeExecutor {
                     let cancelled = book.cancel_all(*sender, Some(mid));
                     if !cancelled.is_empty() {
                         ctx.dirty_books.insert(mid);
-                    }
-                    for order in &cancelled {
-                        let notional = order.price * order.remaining_qty;
-                        let max_lev = ctx
-                            .margin_configs
-                            .get(&mid)
-                            .map(|c| effective_max_leverage(&c.tiers, notional))
-                            .unwrap_or(20);
-                        let lev_fp = FixedPoint::from_raw(max_lev as i128 * FixedPoint::SCALE);
-                        total_margin_release += notional / lev_fp;
+                        let cfg = ctx.margin_configs.get(&mid);
+                        for order in &cancelled {
+                            let notional = order.price * order.remaining_qty;
+                            let max_lev = cfg
+                                .map(|c| effective_max_leverage(&c.tiers, notional))
+                                .unwrap_or(20);
+                            total_margin_release +=
+                                Self::cancel_all_margin_at_leverage(notional, max_lev);
+                        }
                     }
                 }
             }
@@ -4707,16 +4706,15 @@ impl NativeExecutor {
                         let cancelled = book.cancel_all(*sender, None);
                         if !cancelled.is_empty() {
                             ctx.dirty_books.insert(mid);
-                        }
-                        for order in &cancelled {
-                            let notional = order.price * order.remaining_qty;
-                            let max_lev = ctx
-                                .margin_configs
-                                .get(&mid)
-                                .map(|c| effective_max_leverage(&c.tiers, notional))
-                                .unwrap_or(20);
-                            let lev_fp = FixedPoint::from_raw(max_lev as i128 * FixedPoint::SCALE);
-                            total_margin_release += notional / lev_fp;
+                            let cfg = ctx.margin_configs.get(&mid);
+                            for order in &cancelled {
+                                let notional = order.price * order.remaining_qty;
+                                let max_lev = cfg
+                                    .map(|c| effective_max_leverage(&c.tiers, notional))
+                                    .unwrap_or(20);
+                                total_margin_release +=
+                                    Self::cancel_all_margin_at_leverage(notional, max_lev);
+                            }
                         }
                     }
                 }
@@ -4733,6 +4731,20 @@ impl NativeExecutor {
         }
 
         NativeActionResult::ok("cancel_all", 500)
+    }
+
+    /// Cancel-all only: dividing raw notional by positive integer leverage
+    /// exactly cancels SCALE in the general fixed-point division. Signed
+    /// truncation is unchanged for every i128; a u32 divisor cannot be -1,
+    /// so checked_div can fail only at zero. Preserve the original panic text
+    /// and keep this call after each order's multiplication and tier lookup.
+    fn cancel_all_margin_at_leverage(notional: FixedPoint, leverage: u32) -> FixedPoint {
+        notional
+            .raw()
+            .checked_div(i128::from(leverage))
+            .map(FixedPoint::from_raw)
+            .ok_or(torus_types::ArithmeticError::DivisionByZero)
+            .expect("FixedPoint division error")
     }
 
     fn exec_modify_order<T: StateBackend>(
@@ -5697,5 +5709,84 @@ fn decode_time_in_force(code: u8) -> TimeInForce {
         2 => TimeInForce::FOK,
         3 => TimeInForce::PostOnly,
         _ => TimeInForce::GTC,
+    }
+}
+
+#[cfg(test)]
+mod cancel_all_integer_margin_tests {
+    use super::*;
+
+    fn legacy(notional: FixedPoint, leverage: u32) -> FixedPoint {
+        notional / FixedPoint::from_raw(i128::from(leverage) * FixedPoint::SCALE)
+    }
+
+    #[test]
+    fn cancel_all_integer_margin_matches_general_division_extremes() {
+        let values = [
+            i128::MIN,
+            i128::MIN + 1,
+            -FixedPoint::SCALE - 1,
+            -FixedPoint::SCALE,
+            -31,
+            -1,
+            0,
+            1,
+            19,
+            20,
+            21,
+            FixedPoint::SCALE - 1,
+            FixedPoint::SCALE,
+            FixedPoint::SCALE + 1,
+            i128::MAX - 1,
+            i128::MAX,
+        ];
+        let leverages = [1, 2, 3, 5, 7, 20, 31, 50, u32::MAX];
+        for raw in values {
+            for leverage in leverages {
+                let notional = FixedPoint::from_raw(raw);
+                assert_eq!(
+                    NativeExecutor::cancel_all_margin_at_leverage(notional, leverage),
+                    legacy(notional, leverage),
+                    "raw={raw} leverage={leverage}"
+                );
+            }
+        }
+        // Deterministic broad raw-value coverage, including negative values.
+        let mut bits = 0x7d21_975a_ffff_0011_ee42_189f_5555_aaabu128;
+        for _ in 0..512 {
+            bits ^= bits << 13;
+            bits ^= bits >> 7;
+            bits ^= bits << 17;
+            let notional = FixedPoint::from_raw(bits as i128);
+            let leverage = (bits as u32).max(1);
+            assert_eq!(
+                NativeExecutor::cancel_all_margin_at_leverage(notional, leverage),
+                legacy(notional, leverage)
+            );
+        }
+    }
+
+    #[test]
+    fn cancel_all_integer_margin_zero_preserves_panic() {
+        fn text(payload: Box<dyn std::any::Any + Send>) -> String {
+            if let Some(s) = payload.downcast_ref::<String>() {
+                s.clone()
+            } else if let Some(s) = payload.downcast_ref::<&str>() {
+                (*s).to_owned()
+            } else {
+                panic!("unexpected panic payload")
+            }
+        }
+        for raw in [i128::MIN, -1, 0, 1, i128::MAX] {
+            let notional = FixedPoint::from_raw(raw);
+            let old = std::panic::catch_unwind(|| legacy(notional, 0)).unwrap_err();
+            let new = std::panic::catch_unwind(|| {
+                NativeExecutor::cancel_all_margin_at_leverage(notional, 0)
+            })
+            .unwrap_err();
+            let old = text(old);
+            assert!(old.starts_with("FixedPoint division error"));
+            assert_eq!(text(new), old);
+        }
     }
 }
