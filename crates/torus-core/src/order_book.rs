@@ -636,7 +636,18 @@ impl OrderBook {
     }
 
     /// Cancel all orders for a trader. Returns cancelled orders.
-    pub fn cancel_all(&mut self, trader: Address, _market_id: Option<MarketId>) -> Vec<Order> {
+    pub fn cancel_all(&mut self, trader: Address, market_id: Option<MarketId>) -> Vec<Order> {
+        self.cancel_all_with_deep_compaction(trader, market_id, Self::deep_cancel_compaction_enabled())
+    }
+
+    fn deep_cancel_compaction_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var("TORUS_CANCEL_COMPACT_DEEP").ok().as_deref() == Some("1"))
+    }
+
+    fn cancel_all_with_deep_compaction(
+        &mut self, trader: Address, _market_id: Option<MarketId>, deep: bool,
+    ) -> Vec<Order> {
         let order_ids = match self.trader_orders.remove(&trader) {
             Some(ids) => ids,
             None => return vec![],
@@ -648,7 +659,7 @@ impl OrderBook {
         if (32..=MAX_ORDERS_PER_TRADER_PER_MARKET).contains(&order_ids.len())
             && self.order_index.len() >= 1_024
         {
-            return self.cancel_all_hybrid(trader, order_ids);
+            return self.cancel_all_hybrid(trader, order_ids, deep);
         }
         // Preserve the existing full/deep single-level path for load-style
         // states above the normal per-trader limit (including recovery/tests).
@@ -796,7 +807,7 @@ impl OrderBook {
         }
         let mut cancelled: Vec<Option<Order>> = vec![None; order_ids.len()];
         for ((tag, price), targets) in levels {
-            self.cancel_all_remove_level(tag, price, &targets, &mut cancelled);
+            self.cancel_all_remove_level(tag, price, &targets, &mut cancelled, false);
         }
         self.pending_stops.retain(|s| s.trader != trader);
         cancelled.into_iter().flatten().collect()
@@ -808,7 +819,7 @@ impl OrderBook {
         (depth >= 1_024 && count >= 32) || (depth >= 8_192 && count >= 16)
     }
 
-    fn cancel_all_hybrid(&mut self, trader: Address, order_ids: Vec<OrderId>) -> Vec<Order> {
+    fn cancel_all_hybrid(&mut self, trader: Address, order_ids: Vec<OrderId>, deep: bool) -> Vec<Order> {
         // At most five deferred queues and 200 targets. Until the first deep
         // queue, use only the baseline-shaped result vector. Promotion retains
         // already removed orders, including prefixes with missing index IDs.
@@ -879,8 +890,10 @@ impl OrderBook {
                     &self.asks
                 };
                 let depth = book.get(&price).map_or(0, VecDeque::len);
-                if Self::cancel_all_level_can_compact(depth, targets.len()) {
-                    self.cancel_all_remove_level(tag, price, &targets, &mut slots);
+                if Self::cancel_all_level_can_compact(depth, targets.len())
+                    || (deep && depth >= 32_768 && targets.len() >= 8)
+                {
+                    self.cancel_all_remove_level(tag, price, &targets, &mut slots, deep);
                 } else {
                     for (output, id) in targets {
                         slots[output] = self.cancel_all_remove_one(tag, price, id);
@@ -942,6 +955,7 @@ impl OrderBook {
         price: FixedPoint,
         targets: &[(usize, OrderId)],
         cancelled: &mut [Option<Order>],
+        deep: bool,
     ) {
         let cache_on = self.level_hash_cache.is_some();
         let chunked_on = self.level_hash_chunked;
@@ -982,7 +996,10 @@ impl OrderBook {
         // threshold regressed dispersed16/depth8192 in the actual-gate
         // microbenchmark. Four lengths keeps that shape on removals and
         // still compacts dense-middle16 (~8 lengths). Hypothesis to retest.
-        if forward_shifts.min(reverse_shifts) > queue.len().saturating_mul(4) {
+        // Experimental policy only for very deep queues. Output order and
+        // all bookkeeping remain identical whichever removal path is selected.
+        let movement_budget = if deep && queue.len() >= 32_768 { 1 } else { 4 };
+        if forward_shifts.min(reverse_shifts) > queue.len().saturating_mul(movement_budget) {
             let mut targets = positions.iter().peekable();
             let mut position = 0usize;
             // VecDeque::retain compacts in place, preserves survivor FIFO,
@@ -5329,6 +5346,72 @@ mod cancel_all_compaction_tests {
     #[inline(never)]
     fn bench_candidate(book: &mut OrderBook, trader: Address) -> Vec<Order> {
         book.cancel_all(trader, None)
+    }
+
+    #[inline(never)]
+    fn bench_deep_off(book: &mut OrderBook, trader: Address) -> Vec<Order> {
+        book.cancel_all_with_deep_compaction(trader, None, false)
+    }
+
+    #[inline(never)]
+    fn bench_deep_on(book: &mut OrderBook, trader: Address) -> Vec<Order> {
+        book.cancel_all_with_deep_compaction(trader, None, true)
+    }
+
+    #[test]
+    fn cancel_deep_policy_preserves_orders_journals_and_commitments() {
+        for (depth, count, layout, side) in [
+            (32_767, 8, "spread", Side::Buy),
+            (32_768, 7, "spread", Side::Buy),
+            (32_768, 8, "spread", Side::Buy),
+            (32_768, 16, "spread", Side::Sell),
+            (32_768, 32, "middle", Side::Buy),
+            (32_768, 8, "front", Side::Sell),
+            (32_768, 8, "back", Side::Buy),
+        ] {
+            let mut reference = shaped_book_levels(depth, count, layout, false, true, side, 5);
+            let mut off = clone_bench_fixture(&reference);
+            let mut on = clone_bench_fixture(&reference);
+            for book in [&mut reference, &mut off, &mut on] {
+                book.trader_orders.get_mut(&addr(1)).unwrap().reverse();
+                let _ = observe(book);
+            }
+            let expected = naive_cancel_all(&mut reference, addr(1));
+            assert_eq!(off.cancel_all_with_deep_compaction(addr(1), None, false), expected);
+            assert_eq!(on.cancel_all_with_deep_compaction(addr(1), None, true), expected);
+            let expected_state = observe(&mut reference);
+            assert_eq!(observe(&mut off), expected_state);
+            assert_eq!(observe(&mut on), expected_state);
+            assert!(on.cancel_all_with_deep_compaction(addr(1), None, true).is_empty());
+            for book in [&mut reference, &mut off, &mut on] {
+                book.set_next_order_id((5 * depth + 1) as OrderId);
+                assert_eq!(book.place_order(params(side == Side::Buy, 99, 2), addr(250), 10_000).status,
+                    OrderStatus::Resting);
+            }
+            let appended_state = observe(&mut reference);
+            assert_eq!(observe(&mut off), appended_state);
+            assert_eq!(observe(&mut on), appended_state);
+        }
+    }
+
+    #[test]
+    #[ignore = "run explicitly on an idle host; balanced deep-policy experiment"]
+    fn cancel_deep_policy_microbenchmark() {
+        let cases = [
+            (8_192, 16, "spread", 5, true),
+            (32_768, 8, "spread", 5, true),
+            (32_768, 16, "spread", 5, true),
+            (32_768, 32, "spread", 5, true),
+            (32_768, 8, "front", 5, true),
+            (32_768, 8, "back", 5, true),
+        ];
+        run_cancel_bench_with_fixture(&cases, [
+            ("AB_deep", bench_deep_off, bench_deep_on),
+            ("AA_current", bench_deep_off, bench_deep_off),
+            ("BB_deep", bench_deep_on, bench_deep_on),
+        ], |depth, count, layout, levels, chunked| {
+            shaped_book_levels(depth, count, layout, false, chunked, Side::Buy, levels)
+        });
     }
     /// Experimental C arm only: bypass the production eligibility gate.
     /// Match the public method's trader-index removal and empty-trader return.
