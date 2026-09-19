@@ -193,7 +193,7 @@ pub(crate) struct ForwardBatchInFlight {
     pub(crate) target: VerifyingKey,
     /// The full 0xFD envelope, kept for re-send (≤ the D2L byte cap; the map
     /// holds at most `PUSH_MAX_INFLIGHT` entries).
-    pub(crate) envelope: Vec<u8>,
+    pub(crate) envelope: Arc<Vec<u8>>,
     /// How many times this envelope has already been re-sent.
     pub(crate) attempt: u8,
 }
@@ -204,7 +204,7 @@ pub(crate) struct ForwardBatchInFlight {
 fn plan_forward_batch_retry(
     inflight: ForwardBatchInFlight,
     resolved_leader: Option<VerifyingKey>,
-) -> Option<(VerifyingKey, Vec<u8>, u8)> {
+) -> Option<(VerifyingKey, Arc<Vec<u8>>, u8)> {
     if inflight.attempt >= FORWARD_BATCH_MAX_RETRIES {
         return None;
     }
@@ -226,7 +226,7 @@ fn resolve_forward_leader(shared: &SharedState) -> Option<VerifyingKey> {
 }
 
 /// Push `item` into a bounded ring, evicting the oldest when at `cap`.
-fn push_bounded(ring: &mut VecDeque<Vec<u8>>, item: Vec<u8>, cap: usize) {
+fn push_bounded<T>(ring: &mut VecDeque<T>, item: T, cap: usize) {
     if ring.len() >= cap {
         ring.pop_front();
     }
@@ -252,7 +252,7 @@ const PUSH_QUEUE_CAP: usize = 512;
 /// the policy is unit-testable without a live swarm.
 pub struct PushScheduler<Id: std::hash::Hash + Eq + Copy> {
     inflight: HashSet<Id>,
-    queue: VecDeque<(PeerId, Vec<u8>)>,
+    queue: VecDeque<(PeerId, Arc<Vec<u8>>)>,
     max_inflight: usize,
     queue_cap: usize,
 }
@@ -286,9 +286,9 @@ impl<Id: std::hash::Hash + Eq + Copy> PushScheduler<Id> {
 
     /// Queue a push for later dispatch (the cap was reached). Bounded: when full, drops
     /// the OLDEST queued push and returns `true` so the caller can log the drop.
-    fn enqueue(&mut self, pid: PeerId, envelope: Vec<u8>) -> bool {
+    fn enqueue(&mut self, pid: PeerId, envelope: impl Into<Arc<Vec<u8>>>) -> bool {
         let dropped = self.queue.len() >= self.queue_cap && self.queue.pop_front().is_some();
-        self.queue.push_back((pid, envelope));
+        self.queue.push_back((pid, envelope.into()));
         dropped
     }
 
@@ -297,7 +297,7 @@ impl<Id: std::hash::Hash + Eq + Copy> PushScheduler<Id> {
     /// any); the caller sends it and calls [`Self::record`] with the new id. Returns `None`
     /// for an untracked id (a consensus/forward send on the shared protocol) or an empty
     /// queue.
-    fn complete(&mut self, id: Id) -> Option<(PeerId, Vec<u8>)> {
+    fn complete(&mut self, id: Id) -> Option<(PeerId, Arc<Vec<u8>>)> {
         if self.inflight.remove(&id) {
             self.queue.pop_front()
         } else {
@@ -417,7 +417,7 @@ pub struct SharedState {
     /// Bounded ring of recent pre-proposal action bundle envelopes (Task 4).
     /// Re-pushed to a validator that (re)connects after the original push, so its
     /// mempool catches up before the next CompactBlock it must reconstruct.
-    pub recent_native_bundles: Mutex<VecDeque<Vec<u8>>>,
+    pub recent_native_bundles: Mutex<VecDeque<Arc<Vec<u8>>>>,
     /// Durable native-action DA store handle, used to SERVE bodies by-hash on the
     /// `/torus/native-da/1.0` protocol (Task 5). `None` until attached at startup
     /// via `LibP2PNetwork::set_native_da_store` (a cheap clone over the same
@@ -439,7 +439,7 @@ pub struct SharedState {
     /// `ConnectionEstablished` so a push is DELIVERED on (re)connect instead of
     /// dropped under load — hardening the push-primary that feeds every validator's
     /// DA store (push covers the common case so the pull-fallback stays rare).
-    pub pending_native_pushes: Mutex<PendingSendQueue<Vec<u8>>>,
+    pub pending_native_pushes: Mutex<PendingSendQueue<Arc<Vec<u8>>>>,
     /// Bounded-in-flight scheduler for native-action pushes (#4 Task 3): caps concurrent
     /// `direct.send_request` pushes to `PUSH_MAX_INFLIGHT` so the push loop can't exhaust
     /// quinn's bidi-stream window (the `max sub-streams reached` storm). Overflow is queued
@@ -2046,7 +2046,7 @@ fn handle_event(
                         for envelope in queued_pushes {
                             let req = DirectRequest {
                                 sender_key: local_key.to_bytes(),
-                                payload: envelope,
+                                payload: envelope.into(),
                             };
                             swarm.behaviour_mut().direct.send_request(&peer_id, req);
                         }
@@ -2069,7 +2069,7 @@ fn handle_event(
                     // validator's mempool catches up before the next CompactBlock it
                     // must reconstruct. Validator-gated; dedup is free on the receiver.
                     if shared.validators.read().unwrap().contains(&vk.to_bytes()) {
-                        let bundles: Vec<Vec<u8>> = shared
+                        let bundles: Vec<Arc<Vec<u8>>> = shared
                             .recent_native_bundles
                             .lock()
                             .unwrap()
@@ -2081,7 +2081,7 @@ fn handle_event(
                             for envelope in bundles {
                                 let req = DirectRequest {
                                     sender_key: local_key.to_bytes(),
-                                    payload: envelope,
+                                    payload: envelope.into(),
                                 };
                                 swarm.behaviour_mut().direct.send_request(&peer_id, req);
                                 if let Some(ref m) = shared.metrics {
@@ -2288,7 +2288,7 @@ fn handle_command(
                 envelope.extend_from_slice(&payload);
                 let req = DirectRequest {
                     sender_key: local_key.to_bytes(),
-                    payload: envelope,
+                    payload: envelope.into(),
                 };
                 swarm.behaviour_mut().direct.send_request(&pid, req);
             } else {
@@ -2319,7 +2319,7 @@ fn handle_command(
             if let Some(pid) = peer_id {
                 let req = DirectRequest {
                     sender_key: local_key.to_bytes(),
-                    payload: encode_forwarded_evm(&payload),
+                    payload: encode_forwarded_evm(&payload).into(),
                 };
                 swarm.behaviour_mut().direct.send_request(&pid, req);
             } else {
@@ -2483,6 +2483,7 @@ fn fan_native_push(
     retain_for_repush: bool,
 ) {
     let bytes = envelope.len();
+    let envelope = Arc::new(envelope);
     // Resolve every mapped peer (validators + RPC nodes that also reconstruct bodies),
     // tagging validator membership and skipping self.
     let targets: Vec<(VerifyingKey, PeerId, bool)> = {
@@ -2517,7 +2518,7 @@ fn fan_native_push(
             if sched.has_capacity() {
                 let req = DirectRequest {
                     sender_key: local_key.to_bytes(),
-                    payload: envelope.clone(),
+                    payload: envelope.clone().into(),
                 };
                 let id = swarm.behaviour_mut().direct.send_request(&pid, req);
                 sched.record(id);
@@ -2581,9 +2582,10 @@ fn send_forward_batch(
     shared: &SharedState,
     local_key: &VerifyingKey,
     target: &VerifyingKey,
-    envelope: Vec<u8>,
+    envelope: impl Into<Arc<Vec<u8>>>,
     attempt: u8,
 ) {
+    let envelope = envelope.into();
     let peer_id = shared.peer_map.read().unwrap().get_peer_id(target).copied();
     let Some(pid) = peer_id else {
         warn!("ForwardNativeActionBatch: leader not in peer map — dropping (pool retains; sweep re-sends)");
@@ -2596,7 +2598,7 @@ fn send_forward_batch(
     if sched.has_capacity() {
         let req = DirectRequest {
             sender_key: local_key.to_bytes(),
-            payload: envelope.clone(),
+            payload: envelope.clone().into(),
         };
         let id = swarm.behaviour_mut().direct.send_request(&pid, req);
         sched.record(id);
@@ -2645,7 +2647,7 @@ fn dispatch_next_push(
     if let Some((pid, payload)) = next {
         let req = DirectRequest {
             sender_key: local_key.to_bytes(),
-            payload,
+            payload: payload.into(),
         };
         let id = swarm.behaviour_mut().direct.send_request(&pid, req);
         shared.push_scheduler.lock().unwrap().record(id);
@@ -2798,7 +2800,7 @@ fn send_direct_connected(
     }
     let req = DirectRequest {
         sender_key: local_key.to_bytes(),
-        payload,
+        payload: payload.into(),
     };
     if let Some(trace) = trace.as_deref_mut() {
         trace.send_begin = Some(hotstuff_rs::logging::BodyFetchTraceStamp::capture());
@@ -4134,8 +4136,8 @@ mod tests {
     fn push_queues_until_peer_connected() {
         let shared = test_shared();
         let vk = test_vk(7);
-        let env1 = vec![PRE_PROPOSAL_BATCH_MARKER, 1, 2, 3];
-        let env2 = vec![PRE_PROPOSAL_BATCH_MARKER, 4, 5, 6];
+        let env1 = Arc::new(vec![PRE_PROPOSAL_BATCH_MARKER, 1, 2, 3]);
+        let env2 = Arc::new(vec![PRE_PROPOSAL_BATCH_MARKER, 4, 5, 6]);
 
         // Two pushes while the target is disconnected -> both queued, none dropped.
         shared
@@ -4262,7 +4264,7 @@ mod tests {
         );
 
         // Oldest ([1]) was dropped; FIFO order preserved for the rest ([2] then [3]).
-        assert_eq!(sched.complete(1).unwrap().1, vec![2u8]);
+        assert_eq!(*sched.complete(1).unwrap().1, vec![2u8]);
     }
 
     /// #4 Task 3: the in-flight cap must stay well under the raised QUIC stream window
@@ -5204,6 +5206,61 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn native_push_fanout_reconnect_and_scheduler_share_one_allocation() {
+        let shared = test_shared();
+        let local = test_vk(61);
+        let peers = [test_vk(62), test_vk(63)];
+        for (i, vk) in peers.iter().enumerate() {
+            shared.validators.write().unwrap().insert(vk.to_bytes());
+            shared
+                .peer_map
+                .write()
+                .unwrap()
+                .insert(*vk, test_peer(i as u8 + 62));
+        }
+        let mut swarm = test_swarm();
+        let body = vec![PRE_PROPOSAL_BATCH_MARKER; 65_536];
+        let pointer = body.as_ptr();
+        fan_native_push(&mut swarm, &shared, &local, body, true);
+        let retained = shared
+            .recent_native_bundles
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap();
+        assert_eq!(retained.as_ptr(), pointer);
+        let weak = Arc::downgrade(&retained);
+        let mut flushed = Vec::new();
+        for peer in &peers {
+            let mut queued = shared.pending_native_pushes.lock().unwrap().flush(peer);
+            assert_eq!(queued.len(), 1);
+            assert!(Arc::ptr_eq(&retained, &queued[0]));
+            flushed.append(&mut queued);
+        }
+        let mut scheduler: PushScheduler<u64> = PushScheduler::new(1, 1);
+        scheduler.record(1);
+        assert!(!scheduler.enqueue(test_peer(62), flushed.pop().unwrap()));
+        assert!(scheduler.enqueue(test_peer(63), flushed.pop().unwrap()));
+        let (_, scheduled) = scheduler.complete(1).unwrap();
+        assert!(Arc::ptr_eq(&retained, &scheduled));
+        let inflight = ForwardBatchInFlight {
+            target: peers[0],
+            envelope: scheduled,
+            attempt: 0,
+        };
+        let (_, retry, attempt) = plan_forward_batch_retry(inflight, Some(peers[1])).unwrap();
+        assert_eq!(attempt, 1);
+        assert!(Arc::ptr_eq(&retained, &retry));
+        drop(retained);
+        assert!(weak.upgrade().is_some());
+        drop(retry);
+        assert!(
+            weak.upgrade().is_none(),
+            "queue/retry eviction must release all owners"
+        );
+    }
+
     /// B1: an envelope whose leader is not in the peer map is DROPPED (with
     /// the drop metric), never queued — the mempool retains every action and
     /// the re-forward sweep re-sends to the current leader, so buffering here
@@ -5239,7 +5296,7 @@ mod tests {
         let new_leader = test_vk(65);
         let mk = |attempt| ForwardBatchInFlight {
             target: orig,
-            envelope: vec![PRE_PROPOSAL_BATCH_MARKER, 7],
+            envelope: Arc::new(vec![PRE_PROPOSAL_BATCH_MARKER, 7]),
             attempt,
         };
 
@@ -5247,7 +5304,7 @@ mod tests {
         let (target, envelope, attempt) =
             plan_forward_batch_retry(mk(0), Some(new_leader)).expect("first failure retries");
         assert_eq!(target, new_leader, "retry goes to the CURRENT leader");
-        assert_eq!(envelope, vec![PRE_PROPOSAL_BATCH_MARKER, 7]);
+        assert_eq!(*envelope, vec![PRE_PROPOSAL_BATCH_MARKER, 7]);
         assert_eq!(attempt, 1);
 
         // No resolver installed: fall back to the original target.

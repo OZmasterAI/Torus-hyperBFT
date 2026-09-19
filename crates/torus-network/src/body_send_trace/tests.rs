@@ -85,11 +85,11 @@ fn body_send_trace_request_response_bytes_and_disabled_command_parity() {
         assert_eq!(trace.meta.view, 42);
         let wire_plain = crate::codec::DirectRequest {
             sender_key: target().to_bytes(),
-            payload: plain.try_to_vec().unwrap(),
+            payload: plain.try_to_vec().unwrap().into(),
         };
         let wire_traced = crate::codec::DirectRequest {
             sender_key: target().to_bytes(),
-            payload: traced.try_to_vec().unwrap(),
+            payload: traced.try_to_vec().unwrap().into(),
         };
         assert_eq!(
             wire_plain.try_to_vec().unwrap(),

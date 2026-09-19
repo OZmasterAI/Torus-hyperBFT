@@ -4,12 +4,62 @@ use async_trait::async_trait;
 use futures::prelude::*;
 use libp2p::StreamProtocol;
 
+/// Immutable direct-message bytes. One-off/inbound messages keep their Vec;
+/// fanout messages share that Vec allocation across peers and retry queues.
+/// Ownership is local only: Borsh always emits the original byte-vector format.
+#[derive(Debug, Clone)]
+pub enum DirectPayload {
+    Owned(Vec<u8>),
+    Shared(std::sync::Arc<Vec<u8>>),
+}
+
+impl PartialEq for DirectPayload {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+impl Eq for DirectPayload {}
+
+impl From<Vec<u8>> for DirectPayload {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self::Owned(bytes)
+    }
+}
+
+impl From<std::sync::Arc<Vec<u8>>> for DirectPayload {
+    fn from(bytes: std::sync::Arc<Vec<u8>>) -> Self {
+        Self::Shared(bytes)
+    }
+}
+
+impl std::ops::Deref for DirectPayload {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Owned(bytes) => bytes,
+            Self::Shared(bytes) => bytes,
+        }
+    }
+}
+
+impl borsh::BorshSerialize for DirectPayload {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> io::Result<()> {
+        borsh::BorshSerialize::serialize(&**self, writer)
+    }
+}
+
+impl borsh::BorshDeserialize for DirectPayload {
+    fn deserialize_reader<R: std::io::Read>(reader: &mut R) -> io::Result<Self> {
+        Vec::<u8>::deserialize_reader(reader).map(Self::Owned)
+    }
+}
+
 /// Borsh-encoded direct message for peer-to-peer delivery.
 /// Used by the `send()` method of the Network trait.
 #[derive(borsh::BorshSerialize, borsh::BorshDeserialize, Debug)]
 pub struct DirectRequest {
     pub sender_key: [u8; 32],
-    pub payload: Vec<u8>,
+    pub payload: DirectPayload,
 }
 
 /// Acknowledgment for a direct message.
@@ -49,7 +99,10 @@ impl libp2p::request_response::Codec for BorshCodec {
             read_frame(protocol, io, Self::MAX_MSG_SIZE).await
         } else {
             let (sender_key, payload) = read_raw_payload::<_, 32>(io, Self::MAX_MSG_SIZE).await?;
-            Ok(DirectRequest { sender_key, payload })
+            Ok(DirectRequest {
+                sender_key,
+                payload: payload.into(),
+            })
         }
     }
 
@@ -641,6 +694,62 @@ mod tests {
     use super::*;
     use borsh::{BorshDeserialize, BorshSerialize};
 
+    #[derive(BorshSerialize, BorshDeserialize)]
+    struct LegacyDirectRequest {
+        sender_key: [u8; 32],
+        payload: Vec<u8>,
+    }
+
+    #[test]
+    fn shared_direct_payload_preserves_legacy_wire_and_allocation() {
+        use futures::io::Cursor;
+        use libp2p::request_response::Codec as _;
+        use std::sync::Arc;
+        futures::executor::block_on(async {
+            for len in [0, 31, 65_536] {
+                for protocol in ["/torus/direct/1.0", "/torus/direct/2.0"] {
+                    let payload: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+                    let mut writer = FragmentedIo::new(&payload);
+                    let bytes_ptr = payload.as_ptr();
+                    let shared = Arc::new(payload);
+                    let weak = Arc::downgrade(&shared);
+                    let request = DirectRequest {
+                        sender_key: [7; 32],
+                        payload: shared.clone().into(),
+                    };
+                    assert_eq!(request.payload.as_ptr(), bytes_ptr);
+                    let legacy = LegacyDirectRequest {
+                        sender_key: request.sender_key,
+                        payload: shared.as_ref().clone(),
+                    };
+                    assert_eq!(request.try_to_vec().unwrap(), legacy.try_to_vec().unwrap());
+                    drop(shared);
+                    let mut expected = Cursor::new(Vec::new());
+                    let proto = StreamProtocol::new(protocol);
+                    write_frame(&proto, &mut expected, &legacy, WirePath::Direct)
+                        .await
+                        .unwrap();
+                    BorshCodec
+                        .write_request(&proto, &mut writer, request)
+                        .await
+                        .unwrap();
+                    assert_eq!(writer.cursor.get_ref(), expected.get_ref());
+                    if !is_v2_protocol(&proto) {
+                        assert_eq!(writer.borrowed_bytes, len);
+                    }
+                    assert!(
+                        weak.upgrade().is_none(),
+                        "last outbound owner released after write"
+                    );
+                    writer.cursor.set_position(0);
+                    let decoded = BorshCodec.read_request(&proto, &mut writer).await.unwrap();
+                    assert_eq!(&*decoded.payload, &legacy.payload);
+                    assert!(matches!(decoded.payload, DirectPayload::Owned(_)));
+                }
+            }
+        });
+    }
+
     fn legacy_frame(value: &impl BorshSerialize) -> Vec<u8> {
         let body = value.try_to_vec().unwrap();
         let mut frame = (body.len() as u32).to_be_bytes().to_vec();
@@ -656,7 +765,7 @@ mod tests {
             for len in [0, 1, 31, 65_536, MAX_DIRECT_MSG_SIZE - 36] {
                 let req = DirectRequest {
                     sender_key: [0xa7; 32],
-                    payload: (0..len).map(|i| (i % 251) as u8).collect(),
+                    payload: (0..len).map(|i| (i % 251) as u8).collect::<Vec<_>>().into(),
                 };
                 let expected = legacy_frame(&req);
                 let proto = StreamProtocol::new("/torus/direct/1.0");
@@ -719,7 +828,7 @@ mod tests {
                 let valid = if direct {
                     legacy_frame(&DirectRequest {
                         sender_key: [7; 32],
-                        payload: vec![9; 19],
+                        payload: vec![9; 19].into(),
                     })
                 } else {
                     legacy_frame(&BlockDataNetResponse {
@@ -896,7 +1005,7 @@ mod tests {
                         let (expected, result) = if direct {
                             let req = DirectRequest {
                                 sender_key: [7; 32],
-                                payload,
+                                payload: payload.into(),
                             };
                             let expected = legacy_frame(&req);
                             (
@@ -941,7 +1050,7 @@ mod tests {
                                 .read_request(&StreamProtocol::new("/torus/direct/1.0"), &mut io)
                                 .await
                                 .unwrap()
-                                .payload
+                                .payload.to_vec()
                         } else {
                             BlockDataCodec
                                 .read_response(
@@ -1072,7 +1181,7 @@ mod tests {
             // Direct (push) codec dispatches on /2.0 the same way.
             let req = DirectRequest {
                 sender_key: [7u8; 32],
-                payload: vec![42u8; 64 * 1024],
+                payload: vec![42u8; 64 * 1024].into(),
             };
             let proto_v2 = StreamProtocol::new("/torus/direct/2.0");
             let mut codec = BorshCodec;
