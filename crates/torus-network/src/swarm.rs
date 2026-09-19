@@ -325,17 +325,28 @@ fn serve_native_da_bodies(store: Option<&NativeDaStore>, hashes: &[[u8; 32]]) ->
     let Some(store) = store else {
         return vec![Vec::new(); hashes.len()];
     };
-    hashes
-        .iter()
-        .map(|h| match store.get_raw(h) {
-            Ok(Some(bytes)) => bytes,
-            Ok(None) => Vec::new(),
+    let mut bodies = Vec::with_capacity(hashes.len());
+    // Bound temporary MultiGet arrays even if a peer sends a larger request
+    // than our normal client chunks. Every response slot still follows input.
+    for chunk in hashes.chunks(crate::bridge::NATIVE_DA_FETCH_CHUNK) {
+        match store.get_raw_batch(chunk) {
+            Ok(slots) => bodies.extend(slots.into_iter().map(Option::unwrap_or_default)),
             Err(e) => {
-                warn!(?e, "native-da serve: DA store read failed");
-                Vec::new()
+                warn!(?e, "native-da serve: batch read failed; retrying individual bodies");
+                // An aggregate error must not hide the other healthy bodies.
+                // Retain the original independent per-key error behavior.
+                bodies.extend(chunk.iter().map(|h| match store.get_raw(h) {
+                    Ok(Some(bytes)) => bytes,
+                    Ok(None) => Vec::new(),
+                    Err(e) => {
+                        warn!(?e, "native-da serve: DA store read failed");
+                        Vec::new()
+                    }
+                }));
             }
-        })
-        .collect()
+        }
+    }
+    bodies
 }
 
 /// Serve ONE erasure shard for `(body_hash, shard_index)` from the durable shard
@@ -4018,7 +4029,7 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let db = StateDb::open(dir.path()).expect("open db");
-        let store = NativeDaStore::new(db);
+        let store = NativeDaStore::new(db.clone());
 
         let action = SignedNativeAction {
             action: NativeAction::ClaimRewards,
@@ -4049,6 +4060,35 @@ mod tests {
         // No store attached -> one empty entry per requested hash.
         let none = serve_native_da_bodies(None, &[known, unknown]);
         assert_eq!(none, vec![Vec::<u8>::new(), Vec::<u8>::new()]);
+
+        // Raw serving must preserve even undecodable values, duplicates and
+        // caller order across the bounded MultiGet chunk boundary.
+        let malformed = [0xDE; 32];
+        let empty = [0xEF; 32];
+        db.put_cf_raw(torus_state::cf::CF_NATIVE_PENDING, &malformed, b"not-bincode")
+            .unwrap();
+        db.put_cf_raw(torus_state::cf::CF_NATIVE_PENDING, &empty, b"")
+            .unwrap();
+        let hashes: Vec<_> = [malformed, known, unknown, empty, known]
+            .into_iter()
+            .cycle()
+            .take(crate::bridge::NATIVE_DA_FETCH_CHUNK * 2 + 3)
+            .collect();
+        let legacy: Vec<_> = hashes
+            .iter()
+            .map(|hash| store.get_raw(hash).unwrap().unwrap_or_default())
+            .collect();
+        assert_eq!(serve_native_da_bodies(Some(&store), &hashes), legacy);
+        assert_eq!(
+            serve_native_da_bodies(None, &hashes),
+            vec![Vec::<u8>::new(); hashes.len()]
+        );
+        assert!(serve_native_da_bodies(Some(&store), &[]).is_empty());
+        assert_eq!(
+            store.get_raw_batch(&[empty, unknown]).unwrap(),
+            vec![Some(Vec::new()), None]
+        );
+        assert!(store.get_raw_batch(&[]).unwrap().is_empty());
     }
 
     /// T7: a custodied shard is served `present=true` and the shipped

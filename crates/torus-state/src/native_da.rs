@@ -191,6 +191,14 @@ impl NativeDaStore {
         self.db.get_cf_raw(CF_NATIVE_PENDING, hash.as_slice())
     }
 
+    /// Raw batched reads for DA serving. Preserve request order and duplicates;
+    /// values are returned verbatim, including undecodable stored bytes.
+    /// A storage error fails the batch, allowing callers to retry per key.
+    pub fn get_raw_batch(&self, hashes: &[[u8; 32]]) -> Result<Vec<Option<Vec<u8>>>, StateError> {
+        let keys: Vec<&[u8]> = hashes.iter().map(|hash| hash.as_slice()).collect();
+        self.db.multi_get_cf_raw(CF_NATIVE_PENDING, &keys)
+    }
+
     /// Remove bodies by hash (e.g. after commit + an eviction window). Best-effort:
     /// absent keys are silently skipped.
     pub fn remove(&self, hashes: &[B256]) -> Result<(), StateError> {
