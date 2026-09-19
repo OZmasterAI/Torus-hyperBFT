@@ -3078,7 +3078,28 @@ impl NativeExecutor {
         // Flatten any PlaceOrderBatch into individual (sender, PlaceOrder) entries so the
         // per-market parallel matching pipeline treats batched and singly-submitted orders
         // identically. Deterministic: actions in slice order, orders in batch order.
-        let mut flat: Vec<(Address, FlatAction<'_>)> = Vec::with_capacity(actions.len());
+        // Count entries without walking batch contents, so expanded batches do
+        // not repeatedly grow and copy either vector. Invalid batches contribute
+        // nothing, matching the execution loop below. On count overflow retain
+        // the original capacities and let the original push path handle growth.
+        let (flat_capacity, place_capacity) = actions
+            .iter()
+            .try_fold((0usize, 0usize), |(flat, places), (_, action)| {
+                let (entries, place_entries) = match action {
+                    NativeAction::PlaceOrder(_) => (1, 1),
+                    NativeAction::PlaceOrderBatch(orders) => {
+                        if torus_types::batch_len_within_cap(orders.len()) {
+                            (orders.len(), orders.len())
+                        } else {
+                            (0, 0)
+                        }
+                    }
+                    _ => (1, 0),
+                };
+                Some((flat.checked_add(entries)?, places.checked_add(place_entries)?))
+            })
+            .unwrap_or((actions.len(), 0));
+        let mut flat: Vec<(Address, FlatAction<'_>)> = Vec::with_capacity(flat_capacity);
         let mut skipped_batches = 0usize;
         for (sender, action) in actions {
             match action {
@@ -3133,7 +3154,7 @@ impl NativeExecutor {
         // book and write tombstones, so a cancel-heavy block pays here and
         // nowhere else in the phase table.
         let phase1_timer = std::time::Instant::now();
-        let mut place_order_indices: Vec<usize> = Vec::new();
+        let mut place_order_indices: Vec<usize> = Vec::with_capacity(place_capacity);
 
         for (i, (sender, entry)) in flat.iter().enumerate() {
             match entry {
