@@ -660,12 +660,15 @@ fn cached_matches_compact(cached: &PendingProposal, compact: &CompactBlock) -> b
             // The commit path immediately consumes this entry. A cold cache
             // has no future reuse here: preserve streaming mismatch rejection
             // and avoid allocating an otherwise unused vector.
-            None => cached
-                .block
-                .native_actions
-                .iter()
-                .map(torus_types::compute_action_hash)
-                .eq(compact.native_action_hashes.iter().copied()),
+            None => {
+                let mut scratch = Vec::new();
+                cached
+                    .block
+                    .native_actions
+                    .iter()
+                    .map(|action| torus_types::compute_action_hash_with_scratch(action, &mut scratch))
+                    .eq(compact.native_action_hashes.iter().copied())
+            }
         }
 }
 
@@ -689,10 +692,11 @@ impl PendingProposal {
 
     fn native_action_hashes(&self) -> &[torus_types::B256] {
         self.native_action_hashes.get_or_init(|| {
+            let mut scratch = Vec::new();
             self.block
                 .native_actions
                 .iter()
-                .map(torus_types::compute_action_hash)
+                .map(|action| torus_types::compute_action_hash_with_scratch(action, &mut scratch))
                 .collect()
         })
     }
@@ -5347,10 +5351,11 @@ impl TorusApp {
 
             if !torus_block.native_actions.is_empty() {
                 if let Some(ref mempool) = self.mempool {
+                    let mut scratch = Vec::new();
                     let hashes: Vec<torus_types::B256> = torus_block
                         .native_actions
                         .iter()
-                        .map(torus_types::compute_action_hash)
+                        .map(|action| torus_types::compute_action_hash_with_scratch(action, &mut scratch))
                         .collect();
                     let prune_timer = std::time::Instant::now();
                     mempool.remove_committed_native(&hashes);

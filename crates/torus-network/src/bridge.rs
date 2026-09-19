@@ -162,10 +162,11 @@ fn encode_pre_proposal_push(
 ) -> bincode::Result<NetworkCommand> {
     let encoded_len = bincode::serialized_size(actions)?;
     if encoded_len > threshold as u64 {
+        let mut scratch = Vec::new();
         Ok(NetworkCommand::BroadcastNativeActionHashes {
             hashes: actions
                 .iter()
-                .map(|(_, a)| torus_types::compute_action_hash(a).0)
+                .map(|(_, a)| torus_types::compute_action_hash_with_scratch(a, &mut scratch).0)
                 .collect(),
         })
     } else {
