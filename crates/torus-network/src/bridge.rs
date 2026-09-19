@@ -153,6 +153,29 @@ fn should_push_hashes_only_at(encoded_len: usize, threshold: usize) -> bool {
     encoded_len > threshold
 }
 
+/// Select the existing transport from the exact wire size before materializing
+/// a body buffer. The hash-only path needs no full body encoding; the body path
+/// reuses the size pass to allocate once and serialize directly into that Vec.
+fn encode_pre_proposal_push(
+    actions: &[(torus_types::Address, torus_types::SignedNativeAction)],
+    threshold: usize,
+) -> bincode::Result<NetworkCommand> {
+    let encoded_len = bincode::serialized_size(actions)?;
+    if encoded_len > threshold as u64 {
+        Ok(NetworkCommand::BroadcastNativeActionHashes {
+            hashes: actions
+                .iter()
+                .map(|(_, a)| torus_types::compute_action_hash(a).0)
+                .collect(),
+        })
+    } else {
+        // The threshold comparison bounds this conversion by usize::MAX.
+        let mut payload = Vec::with_capacity(encoded_len as usize);
+        bincode::serialize_into(&mut payload, actions)?;
+        Ok(NetworkCommand::BroadcastNativeActions { payload })
+    }
+}
+
 impl LibP2PNetwork {
     /// Create a new LibP2PNetwork. Must be called from within a tokio runtime.
     /// Spawns a background task to drive the libp2p swarm.
@@ -396,6 +419,25 @@ impl LibP2PNetwork {
         let _ = self
             .command_tx
             .send(NetworkCommand::ForwardEvmTx { target, payload });
+    }
+
+    /// Push proposal bodies or their hash manifest using the configured byte
+    /// threshold. Called on the existing pre-proposal worker, off consensus.
+    pub fn broadcast_pre_proposal_actions(
+        &self,
+        actions: &[(torus_types::Address, torus_types::SignedNativeAction)],
+    ) {
+        let Ok(command) = encode_pre_proposal_push(actions, hash_only_push_threshold()) else {
+            return;
+        };
+        if let NetworkCommand::BroadcastNativeActions { ref payload } = command {
+            tracing::info!(
+                count = actions.len(),
+                bytes = payload.len(),
+                "pre-proposal FULL-BODY push (under the direct-push floor)"
+            );
+        }
+        let _ = self.command_tx.send(command);
     }
 
     pub fn broadcast_native_actions(&self, payload: Vec<u8>) {
@@ -673,6 +715,77 @@ impl Network for LibP2PNetwork {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pre_proposal_encoding_matches_legacy_at_transport_boundaries() {
+        use torus_types::{ActionSignature, NativeAction, Signature, SignedNativeAction};
+        let sign = |action, nonce| SignedNativeAction {
+            action,
+            nonce,
+            signature: ActionSignature::Eip712(Signature {
+                v: 27,
+                r: [1; 32],
+                s: [2; 32],
+            }),
+        };
+        // A nested body exercises variable-size fields without relying on
+        // admission or signature validity; this seam encodes existing bodies.
+        let small = sign(NativeAction::ClaimRewards, 1);
+        let large = sign(
+            NativeAction::PlaceOrderBatch(vec![
+                torus_types::PlaceOrderParams {
+                    market_id: 1,
+                    is_buy: true,
+                    price: torus_types::FixedPoint::from_raw(123_000_000),
+                    quantity: torus_types::FixedPoint::from_raw(100_000_000),
+                    order_type: torus_types::OrderType::Limit,
+                    time_in_force: torus_types::TimeInForce::GTC,
+                    reduce_only: false,
+                    client_order_id: Some(42),
+                };
+                400
+            ]),
+            2,
+        );
+        for bodies in [
+            vec![],
+            vec![small.clone()],
+            vec![large.clone(), small, large],
+        ] {
+            let actions: Vec<_> = bodies
+                .into_iter()
+                .enumerate()
+                .map(|(i, a)| (torus_types::Address::repeat_byte(i as u8), a))
+                .collect();
+            let legacy = bincode::serialize(&actions).unwrap();
+            for threshold in [
+                0,
+                legacy.len() - 1,
+                legacy.len(),
+                legacy.len() + 1,
+                usize::MAX,
+            ] {
+                match encode_pre_proposal_push(&actions, threshold).unwrap() {
+                    NetworkCommand::BroadcastNativeActions { payload } => {
+                        assert!(!should_push_hashes_only_at(legacy.len(), threshold));
+                        assert_eq!(payload, legacy);
+                        let back: Vec<(torus_types::Address, SignedNativeAction)> =
+                            bincode::deserialize(&payload).unwrap();
+                        assert_eq!(bincode::serialize(&back).unwrap(), legacy);
+                    }
+                    NetworkCommand::BroadcastNativeActionHashes { hashes } => {
+                        assert!(should_push_hashes_only_at(legacy.len(), threshold));
+                        let expected: Vec<_> = actions
+                            .iter()
+                            .map(|(_, a)| torus_types::compute_action_hash(a).0)
+                            .collect();
+                        assert_eq!(hashes, expected);
+                    }
+                    _ => panic!("unexpected command"),
+                }
+            }
+        }
+    }
 
     /// Minimal [`SharedState`] carrying a fixed validator set — enough to drive
     /// `fetch_native_actions_from_validators` without a live swarm. Only `validators`
