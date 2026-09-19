@@ -28,6 +28,7 @@ use crate::peer_scoring::{
     REWARD_BLOCK_RELAY,
 };
 use crate::pending_send::PendingSendQueue;
+use crate::swarm_poll_trace::ReceiveTrace;
 use crate::tx_gossip::TxGossipState;
 
 pub enum NetworkCommand {
@@ -984,7 +985,9 @@ pub async fn run_swarm_with_config(
     let (shard_serve_tx, mut shard_serve_rx) = mpsc::unbounded_channel::<DaShardServeDone>();
     let da_serve = DaServePool::new(da_serve_tx, shard_serve_tx);
 
+    let mut poll_trace = crate::swarm_poll_trace::enabled().then(crate::swarm_poll_trace::PollTrace::new);
     loop {
+        if let Some(trace) = poll_trace.as_mut() { trace.maybe_emit(); }
         let action = tokio::select! {
             biased;
 
@@ -998,7 +1001,7 @@ pub async fn run_swarm_with_config(
             },
 
             // P2: swarm events (consensus inbound, connections, gossip)
-            event = swarm.select_next_some() => SwarmAction::Event(Box::new(event)),
+            event = crate::swarm_poll_trace::observe(swarm.select_next_some(), &mut poll_trace) => SwarmAction::Event(Box::new(event)),
 
             // P2.5: completed off-loop DA serves — tiny send_response calls, kept
             // prompt so pull latency stays low without store reads on the loop.
@@ -1111,6 +1114,9 @@ pub async fn run_swarm_with_config(
             }
         };
 
+        if let SwarmAction::Command(command) = &action {
+            if let Some(trace) = poll_trace.as_mut() { trace.command(command.is_none()); }
+        }
         match action {
             SwarmAction::Event(event) => {
                 handle_event(
@@ -1447,9 +1453,11 @@ fn handle_event(
             peer,
             ..
         })) => {
+            let mut receive_trace = ReceiveTrace::start();
             // Ban gate — validator-set peers exempt (s350 FIX B): /torus/direct
             // carries consensus unicasts; refusing a validator stalls quorum.
             if should_drop_banned_gossip(&mut *peer_scoring, shared, &peer) {
+                if let Some(trace) = receive_trace.as_mut() { trace.outcome = "banned"; }
                 let _ = swarm
                     .behaviour_mut()
                     .direct
@@ -1463,6 +1471,7 @@ fn handle_event(
                 {
                     Some(vk) => vk,
                     None => {
+                        if let Some(trace) = receive_trace.as_mut() { trace.outcome = "sender_rejected"; }
                         let _ = swarm
                             .behaviour_mut()
                             .direct
@@ -1534,12 +1543,13 @@ fn handle_event(
                 if let Some(ref tx) = shared.evm_tx_inbound {
                     let _ = tx.send(raw_rlp.to_vec());
                 }
-            } else if handle_consensus_direct(
+            } else if handle_consensus_direct_traced(
                 &request.payload,
                 sender_vk,
                 shared,
                 &mut *peer_scoring,
                 &peer,
+                receive_trace.as_mut(),
             ) {
                 // Consumed as a hotstuff consensus message (vote path and, with
                 // B2, the direct-fan broadcast path — dedup'd against the
@@ -2928,6 +2938,15 @@ fn enqueue_inbound(
     sender: VerifyingKey,
     msg: hotstuff_rs::networking::messages::Message,
 ) -> bool {
+    enqueue_inbound_traced(shared, sender, msg, None)
+}
+
+fn enqueue_inbound_traced(
+    shared: &SharedState,
+    sender: VerifyingKey,
+    msg: hotstuff_rs::networking::messages::Message,
+    mut trace: Option<&mut ReceiveTrace>,
+) -> bool {
     // Item 3 (TORUS_ASYNC_VALIDATE): tee proposal/body datum bytes to the
     // speculative validate worker ON THIS (network) thread — every algo-thread-
     // bound message funnels through here (gossip, direct fan, loopback,
@@ -2936,10 +2955,12 @@ fn enqueue_inbound(
     // this tee still precedes chain-id/view/QC admission and queue capacity checks.
     // Admission/cache poisoning, pre-verification DA writes, and duplicate
     // validation histogram observations remain flag-ON gates.
+    if let Some(t) = trace.as_deref_mut() { t.tee_begin_us = Some(ReceiveTrace::stamp()); }
     tee_proposal_datum(shared, &msg);
+    if let Some(t) = trace.as_deref_mut() { t.tee_end_us = Some(ReceiveTrace::stamp()); }
     if hotstuff_rs::logging::body_fetch_trace_enabled() {
         if let Some(meta) = body_fetch_trace_metadata(&msg) {
-            return enqueue_body_fetch_traced(shared, sender, msg, meta, |record| {
+            return enqueue_body_fetch_traced_stages(shared, sender, msg, meta, trace, |record| {
                 info!("body_fetch_diag admission: {} kind={} peer={} view={} hash={} admitted={} queue_depth_before={} queue_depth_after={}",
                     record.stamp, record.meta.kind,
                     hotstuff_rs::logging::BodyFetchTraceId(sender.to_bytes()),
@@ -2949,8 +2970,15 @@ fn enqueue_inbound(
         }
     }
     // Keep the disabled path's allocation, queue and logging behavior unchanged.
+    if let Some(t) = trace.as_deref_mut() { t.lock_begin_us = Some(ReceiveTrace::stamp()); }
     let mut queue = shared.inbound.lock().unwrap();
-    if queue.len() >= MAX_INBOUND_QUEUE {
+    if let Some(t) = trace.as_deref_mut() { t.lock_acquired_us = Some(ReceiveTrace::stamp()); }
+    let full = queue.len() >= MAX_INBOUND_QUEUE;
+    if let Some(t) = trace.as_deref_mut() {
+        t.admission_us = Some(ReceiveTrace::stamp());
+        if t.kind.is_some() { t.outcome = if full { "queue_full" } else { "admitted" }; }
+    }
+    if full {
         warn!("inbound queue full ({MAX_INBOUND_QUEUE}), dropping incoming message");
         return false;
     }
@@ -3000,10 +3028,28 @@ fn enqueue_body_fetch_traced(
     meta: BodyFetchTraceMetadata,
     emit: impl FnOnce(BodyFetchAdmissionTrace),
 ) -> bool {
+    enqueue_body_fetch_traced_stages(shared, sender, msg, meta, None, emit)
+}
+
+fn enqueue_body_fetch_traced_stages(
+    shared: &SharedState,
+    sender: VerifyingKey,
+    msg: hotstuff_rs::networking::messages::Message,
+    meta: BodyFetchTraceMetadata,
+    mut trace: Option<&mut ReceiveTrace>,
+    emit: impl FnOnce(BodyFetchAdmissionTrace),
+) -> bool {
+    if let Some(t) = trace.as_deref_mut() { t.lock_begin_us = Some(ReceiveTrace::stamp()); }
     let mut queue = shared.inbound.lock().unwrap();
+    if let Some(t) = trace.as_deref_mut() { t.lock_acquired_us = Some(ReceiveTrace::stamp()); }
     let depth_before = queue.len();
     let admitted = depth_before < MAX_INBOUND_QUEUE;
     let stamp = hotstuff_rs::logging::BodyFetchTraceStamp::capture();
+    if let Some(t) = trace.as_deref_mut() {
+        t.admission_us = Some(ReceiveTrace::stamp());
+        t.admission_seq = Some(stamp.seq);
+        t.outcome = if admitted { "admitted" } else { "queue_full" };
+    }
     if admitted {
         queue.push_back((sender, msg));
     }
@@ -3095,6 +3141,16 @@ fn enqueue_consensus_inbound(
     msg: hotstuff_rs::networking::messages::Message,
     payload: &[u8],
 ) -> ConsensusEnqueue {
+    enqueue_consensus_inbound_traced(shared, sender, msg, payload, None)
+}
+
+fn enqueue_consensus_inbound_traced(
+    shared: &SharedState,
+    sender: VerifyingKey,
+    msg: hotstuff_rs::networking::messages::Message,
+    payload: &[u8],
+    mut trace: Option<&mut ReceiveTrace>,
+) -> ConsensusEnqueue {
     let dedup = shared.consensus_direct_fan && dedup_applies(&msg);
     if dedup
         && shared
@@ -3106,9 +3162,10 @@ fn enqueue_consensus_inbound(
         if let Some(ref m) = shared.metrics {
             m.consensus_dedup_dropped.inc();
         }
+        if let Some(t) = trace.as_deref_mut() { if t.kind.is_some() { t.outcome = "duplicate"; } }
         return ConsensusEnqueue::Duplicate;
     }
-    if !enqueue_inbound(shared, sender, msg) {
+    if !enqueue_inbound_traced(shared, sender, msg, trace) {
         return ConsensusEnqueue::QueueFull;
     }
     if dedup {
@@ -3134,10 +3191,35 @@ fn handle_consensus_direct(
     peer_scoring: &mut PeerScoring,
     peer: &PeerId,
 ) -> bool {
+    handle_consensus_direct_traced(payload, sender_vk, shared, peer_scoring, peer, None)
+}
+
+fn handle_consensus_direct_traced(
+    payload: &[u8],
+    sender_vk: VerifyingKey,
+    shared: &SharedState,
+    peer_scoring: &mut PeerScoring,
+    peer: &PeerId,
+    mut trace: Option<&mut ReceiveTrace>,
+) -> bool {
+    if let Some(t) = trace.as_deref_mut() {
+        t.sender = Some(sender_vk.to_bytes());
+        t.decode_begin_us = Some(ReceiveTrace::stamp());
+    }
     let Ok(msg) = hotstuff_rs::networking::messages::Message::try_from_slice(payload) else {
+        if let Some(t) = trace.as_deref_mut() {
+            t.decode_end_us = Some(ReceiveTrace::stamp());
+            t.outcome = "decode_error";
+        }
         return false;
     };
-    if enqueue_consensus_inbound(shared, sender_vk, msg, payload) == ConsensusEnqueue::Duplicate {
+    if let Some(t) = trace.as_deref_mut() {
+        t.decode_end_us = Some(ReceiveTrace::stamp());
+        if let Some(meta) = body_fetch_trace_metadata(&msg) {
+            t.kind = Some(meta.kind); t.hash = Some(meta.hash); t.view = Some(meta.view);
+        }
+    }
+    if enqueue_consensus_inbound_traced(shared, sender_vk, msg, payload, trace) == ConsensusEnqueue::Duplicate {
         debug!(%peer, "dual-path duplicate consensus message (direct after gossip) — dropped");
     }
     // The delivery itself was valid either way — dual-path duplicates are a
@@ -3484,6 +3566,60 @@ mod tests {
             leader_resolver: RwLock::new(None),
             validate_tee: OnceLock::new(),
         }
+    }
+
+    #[test]
+    fn swarm_receive_trace_stages_correlate_local_instances() {
+        let shared = test_shared();
+        let sender = test_vk(54); let peer = test_peer(54);
+        let mut scoring = PeerScoring::new(None);
+        let message = test_block_data_response_message();
+        let bytes = message.try_to_vec().unwrap();
+        for id in [101, 102] {
+            let mut trace = ReceiveTrace::for_test(id);
+            assert!(handle_consensus_direct_traced(&bytes, sender, &shared, &mut scoring, &peer, Some(&mut trace)));
+            assert_eq!(trace.kind, Some("response"));
+            assert_eq!(trace.outcome, "admitted");
+            assert_eq!(trace.sender, Some(sender.to_bytes()));
+            let value = serde_json::to_value(&trace).unwrap();
+            assert_eq!(value["id"], id);
+            let stamps: Vec<u128> = ["event_us", "decode_begin_us", "decode_end_us", "tee_begin_us", "tee_end_us", "lock_begin_us", "lock_acquired_us", "admission_us"]
+                .iter().map(|name| value[*name].as_u64().unwrap() as u128).collect();
+            assert!(stamps.windows(2).all(|pair| pair[0] <= pair[1]));
+        }
+        let queue = shared.inbound.lock().unwrap();
+        assert_eq!(queue.len(), 2);
+        for (_, queued) in queue.iter() { assert_eq!(queued.try_to_vec().unwrap(), bytes); }
+    }
+
+    #[test]
+    fn swarm_receive_trace_filtered_errors_and_full_queue_preserve_behavior() {
+        let shared = test_shared();
+        let sender = test_vk(54); let peer = test_peer(54);
+        let mut scoring = PeerScoring::new(None);
+        let mut error = ReceiveTrace::for_test(1);
+        assert!(!handle_consensus_direct_traced(&[], sender, &shared, &mut scoring, &peer, Some(&mut error)));
+        assert_eq!(error.outcome, "decode_error");
+        assert!(error.decode_end_us.is_some()); assert!(error.tee_begin_us.is_none());
+        assert!(error.admission_us.is_none()); assert!(shared.inbound.lock().unwrap().is_empty());
+        let mut filtered = ReceiveTrace::for_test(2);
+        assert!(handle_consensus_direct_traced(&test_consensus_message().try_to_vec().unwrap(), sender, &shared, &mut scoring, &peer, Some(&mut filtered)));
+        assert!(filtered.kind.is_none()); assert_eq!(filtered.outcome, "filtered");
+        let message = test_block_data_request_message();
+        shared.inbound.lock().unwrap().resize_with(MAX_INBOUND_QUEUE, || (sender, message.clone()));
+        let mut full = ReceiveTrace::for_test(3);
+        assert!(handle_consensus_direct_traced(&message.try_to_vec().unwrap(), sender, &shared, &mut scoring, &peer, Some(&mut full)));
+        assert_eq!(full.outcome, "queue_full"); assert!(full.admission_us.is_some());
+        assert_eq!(shared.inbound.lock().unwrap().len(), MAX_INBOUND_QUEUE);
+        // Exercise linkage to the existing admission sequence independently of env.
+        shared.inbound.lock().unwrap().clear();
+        let meta = body_fetch_trace_metadata(&message).unwrap();
+        let mut exact = ReceiveTrace::for_test(4); exact.kind = Some("request");
+        let mut seq = None;
+        assert!(enqueue_body_fetch_traced_stages(&shared, sender, message, meta, Some(&mut exact), |record| {
+            seq = Some(record.stamp.seq); assert!(shared.inbound.try_lock().is_ok());
+        }));
+        assert_eq!(exact.admission_seq, seq); assert_eq!(exact.outcome, "admitted");
     }
 
     #[test]

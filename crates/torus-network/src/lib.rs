@@ -23,6 +23,7 @@ pub mod peer;
 pub mod peer_scoring;
 pub mod pending_send;
 pub mod swarm;
+mod swarm_poll_trace;
 pub mod sync;
 pub mod transport;
 pub mod tx_gossip;
