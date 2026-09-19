@@ -1298,3 +1298,101 @@ at most one microsecond. The receiver observations are rate-limited, and their
 start excludes outer codec/dispatch. Whole-log gaps near four seconds include
 quiet drain intervals. This healthy cell does not reproduce the earlier expiry
 failure or prove biased-selection starvation; scheduling defaults stay unchanged.
+
+### Cancellation attribution and next experiment
+
+Default-off `TORUS_CANCEL_ALL_DIAG` runtime `cad99c7`, based on `0571fba`,
+passed 49 test executions (39 unique) and a separate node build under receipt
+`bc2febfa`. Frozen node SHA256:
+`c99af0289f10fb79810e4fd14954c12c7f6d53c78cf7f51068475ce5f97740f2`.
+`s60-cancel-attribution-deeper-r1` is ACCEPT: 17,009.1 fills/s over 308 seconds,
+drain 137 seconds, PASS/AGREE, clean dissemination, crossing fraction 0.25 and
+fixed keys OFF. The 27.46 GiB completed databases were removed after retention.
+
+Across complete logs, each node recorded 7,329 completed cancel-all calls in
+275 blocks and 4,327,789 removed orders. Every timing partition was valid and
+no balance-read/write error was recorded. Book removal accounts for
+99.39% / 99.33% / 99.38% of cancel-all elapsed time on val0/1/2; margin
+calculation accounts for 0.24% / 0.33% / 0.26%, balance handling 0.26% / 0.24% /
+0.21%. These are fractions of completed cancellation calls, not total engine
+time or CPU-only samples. Logging follows each elapsed timestamp.
+
+A default-off deep-compaction candidate is being tested on a separate branch.
+It changes eligibility and movement-cost thresholds only for queues at least
+32,768 orders deep, using the existing stable compaction algorithm. Correctness,
+balanced microbenchmarks and same-binary chain comparisons are required before
+any promotion. No gain has been established.
+
+### Resource isolation and the route toward 200k
+
+Builds, test suites, database deletion, and full-log analysis are scheduled outside
+live load/drain intervals. The burst run ended at 02:32:04 UTC before network
+verification began at 02:32:36; the swarm run ended at 02:47:12 before cancellation
+verification began at 02:47:43. Source inspection/editing during a run is light
+activity, but this remains a shared host, not an exclusive-hardware experiment.
+Offline analysis did overlap compilation after the swarm benchmark had ended.
+
+The current evidence does not establish sustained 200k fills/s or a hardware
+ceiling. Longer queues increase serial phase1 cost in the deeper workload;
+completed cancel-all calls overwhelmingly spend time removing book orders.
+Changing margin/balance handling alone therefore cannot materially shorten those
+calls. Matching and settlement already have parallel execution paths; increasing
+those worker counts is not a demonstrated fix for this serial action cost.
+
+The next architectural experiment should target queue removal representation or
+safe action partitioning across markets. A representation change must preserve
+FIFO, canonical cancellation output, row journals, incremental commitments and
+recovery. Market partitioning must account for shared trader balances, order and
+error precedence, and deterministic merge order; treating markets as independent
+without those checks would be unsound. Neither design is implemented or qualified
+by this campaign. Prototype against the retained workload shapes and serial
+oracle before chain comparisons, then require matched-duration/order repeats,
+deep/burst screening, forced replay and snapshot/state-sync checks.
+
+Dedicated validators on separate machines remain a separate measurement needed
+to distinguish shared-host contention from algorithmic cost. No machines were
+provisioned. Network expiry remains a reliability gate: a healthy diagnostic run
+is not a reproduced fix for the failed reversed pair. Keep fixed keys and the
+execution pipeline default OFF pending their own acceptance and recovery gates.
+
+
+### Positive replay with a remaining liveness failure
+
+`s60-pipeline-replay-120-r1` used the frozen fixed-key runtime with fixed keys OFF
+and pipeline ON, duration 120 seconds and guarded val1 kill at +60. Restart
+observed durable height 692 and committed height 693, replayed one block, then
+attached the flush worker at 693. No replay holes, panic/fail-stop or error lines
+were recorded. The crash-specific gate is PASS and final state agreement is
+AGREE: all three nodes had digest
+`55dbac96f5a5713bff80c96c79cb7029fd4ce3dcddb285a18ee11eb66ff1fbf1`.
+The restarted node's reset counters are excluded only from counter comparison.
+
+The complete cell remains REJECT: val0 had a 30-second commit gap and val1 a
+51-second gap. The raw drain probe reached quiet advancing counters after
+66.83 seconds (71-second harness interval), but effective summary drain remains
+false under the liveness rule. Its 34,245.1 fills/s over 125 seconds is not an
+accepted throughput result. This is positive replay plus final convergence,
+not a healthy recovery qualification, controlled C1 pending-parent proof, or
+power-loss durability test. Pipeline stays default OFF. The 12.54 GiB completed
+databases were removed after evidence retention.
+
+
+### Deep cancellation threshold experiments
+
+The first candidate, isolated commit `c2526d9`, combined an eight-target gate at
+depth >=32768 with a movement budget of one queue length. It passed 127 core and
+10 enabled margin tests (`2997f617`), but the balanced release microbenchmark
+rejected the combined policy. Current/candidate paired ratios for dispersed
+8/16/32 targets were 0.728/0.908/0.948; endpoint eight-target cases were about
+2.1. Two independent fixture seeds, 16 pairs, all construction/preparation/
+execution orders and AA/BB controls were retained. No node was built for it.
+
+The second candidate preserves the existing four-length movement budget and
+changes only the deep eight-target eligibility. Its full core suite passed
+127 tests (`a960e68c`). Fresh balanced microbenchmark ratios for dispersed
+8/16/32 targets were 0.999/1.000/0.973; endpoints were 1.798/1.597. Endpoint
+controls remain noisy (back AA 0.782), so these are screening signals, not robust
+chain gains. Micro logs, manifests, frozen test binaries, hashes and all order
+strata are retained in `deep-compaction-micro-r1` and `deep-compaction-micro-r2`.
+The second candidate will receive enabled integration checks and a separate
+node build before a same-binary live OFF/ON comparison. It remains default OFF.
