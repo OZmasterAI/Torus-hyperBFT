@@ -1209,3 +1209,33 @@ Runtime issue `8428153c`, attempt `52de45d1`; parser issue `2c565549`, latest
 attempt `31f400d8`. Qualify these before any live use. Shared-target contents are
 the fixed-key build, so clean affected alternate packages including `torus-state`
 before the next network build. Keep node and generator builds separate.
+
+### Resumed campaign: 2026-09-19
+
+The owner resumed steps 1–8 with a nine-hour limit, starting 01:50:04 UTC and
+ending no later than 10:50:04 UTC (12:50 Berlin), or earlier if usage runs out.
+Project-only stale-build/log/database cleanup is explicitly authorized.
+
+The first reversed-order cell, `s60-fixed-keys-on-10m-r2`, is REJECT:
+3,431.5 fills/s over 305 seconds, first120 6,241.4, best60 12,482.8.
+It used the same frozen runtime, generator, runner and workload as r1. Liveness
+failed on all nodes, including observed commit gaps up to 181 seconds. Body-fetch
+exhaustions/fallbacks were 7/7, 6/6 and 7/7 on val0/1/2. The generator exited
+successfully and final validator state agreed, but these do not establish
+healthy execution of the offered load. Nonce-expired mempool evictions were
+144,228 / 112,011 / 141,996 of 152,512 submitted actions.
+
+The live drain probe reported quiet advancing counters after about 66 seconds
+(70-second harness interval). The summary deliberately marks effective drain
+false when load-plus-drain liveness fails; this is an existing acceptance rule,
+not contradictory raw measurements. Keep the REJECT verdict unchanged.
+Completed databases occupied 10.34 GiB and were removed after evidence retention.
+The OFF r2 control follows. This failed ON cell does not isolate fixed keys as
+the cause, and the feature remains default OFF.
+
+`s60-fixed-keys-off-10m-r2` is also REJECT: 36,646.7 fills/s over 307 seconds,
+first120 52,703.3, best60 58,836.9. Liveness PASS, drain 70 seconds, AGREE,
+but dissemination failures prevent acceptance. Thus the reversed pair contains
+no accepted performance comparison and provides no basis for default promotion.
+Its completed databases occupied 30.09 GiB. Deeper-book and burst screening
+will use fixed keys OFF while the network diagnostic is qualified separately.
