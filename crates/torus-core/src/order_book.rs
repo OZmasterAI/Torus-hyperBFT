@@ -22,6 +22,9 @@ use crate::position::{borsh_read_address, borsh_read_fp, borsh_write_address, bo
 
 mod cancel_batch;
 
+#[cfg(test)]
+mod matching_entry_tests;
+
 const MAX_ORDERS_PER_TRADER_PER_MARKET: usize = 200;
 
 // ============================================================================
@@ -964,14 +967,15 @@ impl OrderBook {
         match taker.side {
             Side::Buy => {
                 while taker.remaining_qty > FixedPoint::ZERO {
-                    let best_ask = match self.asks.keys().next().copied() {
-                        Some(p) => p,
+                    let mut level = match self.asks.first_entry() {
+                        Some(entry) => entry,
                         None => break,
                     };
+                    let best_ask = *level.key();
                     if !is_market && best_ask > taker.price {
                         break;
                     }
-                    let queue = self.asks.get_mut(&best_ask).unwrap();
+                    let queue = level.get_mut();
                     Self::match_at_level(
                         taker,
                         queue,
@@ -989,21 +993,22 @@ impl OrderBook {
                         &mut self.dirty_chunks,
                         chunked_on,
                     );
-                    if self.asks.get(&best_ask).is_none_or(|q| q.is_empty()) {
-                        self.asks.remove(&best_ask);
+                    if level.get().is_empty() {
+                        level.remove_entry();
                     }
                 }
             }
             Side::Sell => {
                 while taker.remaining_qty > FixedPoint::ZERO {
-                    let best_bid = match self.bids.keys().next_back().copied() {
-                        Some(p) => p,
+                    let mut level = match self.bids.last_entry() {
+                        Some(entry) => entry,
                         None => break,
                     };
+                    let best_bid = *level.key();
                     if !is_market && best_bid < taker.price {
                         break;
                     }
-                    let queue = self.bids.get_mut(&best_bid).unwrap();
+                    let queue = level.get_mut();
                     Self::match_at_level(
                         taker,
                         queue,
@@ -1021,8 +1026,8 @@ impl OrderBook {
                         &mut self.dirty_chunks,
                         chunked_on,
                     );
-                    if self.bids.get(&best_bid).is_none_or(|q| q.is_empty()) {
-                        self.bids.remove(&best_bid);
+                    if level.get().is_empty() {
+                        level.remove_entry();
                     }
                 }
             }
