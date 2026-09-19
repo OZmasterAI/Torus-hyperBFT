@@ -347,8 +347,15 @@ pub fn genesis_parent_header() -> TorusBlockHeader {
 fn attestation_digest(actions: &[SignedNativeAction]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
+    let mut encoded = Vec::new();
     for action in actions {
-        hasher.update(bincode::serialize(action).unwrap_or_default());
+        encoded.clear();
+        // Keep one call-local buffer instead of sizing and allocating a fresh
+        // body for each action. A serialization error contributes no bytes,
+        // exactly like the previous serialize(...).unwrap_or_default().
+        if bincode::serialize_into(&mut encoded, action).is_ok() {
+            hasher.update(&encoded);
+        }
     }
     hasher.finalize().into()
 }
@@ -400,6 +407,66 @@ mod tests {
                 r: [0u8; 32],
                 s: [0u8; 32],
             }),
+        }
+    }
+
+    #[test]
+    fn attestation_reused_serialization_matches_legacy_digest_and_signature() {
+        use ed25519_dalek::Signer;
+        use sha2::{Digest, Sha256};
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        let small = make_test_signed_action(1);
+        let mut large = make_test_signed_action(2);
+        large.action = NativeAction::PlaceOrderBatch(vec![
+            torus_types::PlaceOrderParams {
+                market_id: 3,
+                is_buy: false,
+                price: torus_types::FixedPoint::from_raw(123_000_000),
+                quantity: torus_types::FixedPoint::from_raw(100_000_000),
+                order_type: torus_types::OrderType::StopLimit {
+                    trigger: torus_types::FixedPoint::from_raw(110_000_000),
+                    limit: torus_types::FixedPoint::from_raw(109_000_000),
+                },
+                time_in_force: torus_types::TimeInForce::GTC,
+                reduce_only: true,
+                client_order_id: Some(42),
+            };
+            400
+        ]);
+        let mut session = large.clone();
+        session.signature = ActionSignature::Session {
+            session_pubkey: [8; 32],
+            sig: torus_types::Ed25519Sig([9; 64]),
+        };
+        for actions in [
+            vec![],
+            vec![small.clone()],
+            vec![
+                small.clone(),
+                large.clone(),
+                small.clone(),
+                session.clone(),
+                small.clone(),
+            ],
+            vec![session, large, small],
+        ] {
+            let mut legacy = Sha256::new();
+            for action in &actions {
+                legacy.update(bincode::serialize(action).unwrap_or_default());
+            }
+            let legacy: [u8; 32] = legacy.finalize().into();
+            assert_eq!(attestation_digest(&actions), legacy);
+            let expected = if actions.is_empty() {
+                [0; 64]
+            } else {
+                key.sign(&legacy).to_bytes()
+            };
+            assert_eq!(generate_sig_attestation(&actions, &key), expected);
+            assert!(verify_sig_attestation(
+                &actions,
+                &expected,
+                &key.verifying_key()
+            ));
         }
     }
 
