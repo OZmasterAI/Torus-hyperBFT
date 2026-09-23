@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use borsh::BorshSerialize;
 use ed25519_dalek::{SigningKey, VerifyingKey};
@@ -224,6 +224,7 @@ impl LibP2PNetwork {
             // node-installed leader-hint callback (set_leader_resolver).
             outbound_forward_batches: Mutex::new(HashMap::new()),
             leader_resolver: RwLock::new(None),
+            validate_tee: OnceLock::new(),
         });
 
         let (command_tx, command_rx) = mpsc::unbounded_channel();
@@ -418,6 +419,21 @@ impl LibP2PNetwork {
     /// cheap clone over the shared StateDb.
     pub fn set_native_da_store(&self, store: torus_state::NativeDaStore) {
         *self.shared.native_da.write().unwrap() = Some(store);
+    }
+
+    /// Item 3 (TORUS_ASYNC_VALIDATE): install the network-thread proposal-datum
+    /// tee feeding the speculative validate worker. Called once at startup by
+    /// torus-node after the DA fetcher is wired when the experimental flag is on.
+    /// When off, nothing is installed; inbound messages still pay a presence check.
+    /// Admission, pre-verification DA writes, and metrics gates remain pending.
+    ///
+    /// # Panics
+    /// Panics if a tee was already installed, including through a network clone.
+    pub fn set_validate_tee(&self, tee: Arc<dyn Fn(Vec<u8>) + Send + Sync>) {
+        assert!(
+            self.shared.validate_tee.set(tee).is_ok(),
+            "validate tee may only be installed once at startup"
+        );
     }
 
     /// Issue a RARE pull-fallback fetch for missing native-action bodies by-hash
@@ -691,7 +707,30 @@ mod tests {
             // B1: no in-flight forward envelopes, no leader resolver.
             outbound_forward_batches: Mutex::new(HashMap::new()),
             leader_resolver: RwLock::new(None),
+            validate_tee: OnceLock::new(),
         })
+    }
+
+    #[test]
+    fn validate_tee_install_once_rejects_replacement_across_clones() {
+        let (command_tx, _command_rx) = mpsc::unbounded_channel();
+        let net = LibP2PNetwork {
+            command_tx,
+            shared: shared_with_validators(&[]),
+            native_inbound_rx: None,
+            evm_inbound_rx: None,
+            local_key: test_signing_key(1).verifying_key(),
+        };
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        net.set_validate_tee(Arc::new(move |bytes| sink.lock().unwrap().push(bytes)));
+        let cloned = net.clone();
+        let repeated = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cloned.set_validate_tee(Arc::new(|_| panic!("replacement must not run")));
+        }));
+        assert!(repeated.is_err(), "a second install must explicitly fail");
+        net.shared.validate_tee.get().expect("first hook retained")(vec![7, 8, 9]);
+        assert_eq!(*seen.lock().unwrap(), vec![vec![7, 8, 9]]);
     }
 
     fn test_signing_key(seed: u8) -> SigningKey {

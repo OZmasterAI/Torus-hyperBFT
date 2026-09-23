@@ -50,11 +50,11 @@ start_node() {
         --genesis="$GENESIS" \
         --data-dir="$dd" \
         --validator-key="$key" \
-        --p2p-listen="/ip4/0.0.0.0/udp/$p2p/quic-v1" \
+        --p2p-listen="/ip4/127.0.0.1/udp/$p2p/quic-v1" \
         --p2p-private-addrs \
         --p2p-peers="$peers" \
-        --rpc-addr="0.0.0.0:$rpc" \
-        --metrics-addr="0.0.0.0:$met" \
+        --rpc-addr="127.0.0.1:$rpc" \
+        --metrics-addr="127.0.0.1:$met" \
         --log-level=info \
         --native-gossip=true \
         >> "$log" 2>&1 &
