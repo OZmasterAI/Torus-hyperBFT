@@ -11,10 +11,14 @@ campaign. Its frozen record binary remains intact. The separate 51,608.1 fills/s
 record used `388f7cd` and a 127-second window; those durations are not comparable.
 The previous campaign report lives on `perf/matched-200k-next` at `c7c8542`.
 
-The user prohibited new benchmarks and set a hard stop of September 19, 2026,
-12:45 Berlin (10:45 UTC), superseding the initial approximate deadline.
-Only root schedules builds/checks; agents edit isolated worktrees. No node or
-load generator is running. Account remaining percentage is not exposed.
+The original session prohibited new benchmarks and ended before its September
+19 deadline. On September 23, the user authorized completion of the three
+interrupted patches, correctness checks, integration, a fresh standalone node
+build, and this report. No benchmarks or load runs were authorized or launched.
+**All future performance/load runs must use cap 200, never a lower cap.**
+Small and zero caps in correctness fixtures remain necessary boundary tests;
+they are not performance/load runs. The resumed work used sequential builds
+and checks in the designated worktrees.
 
 ## Implemented changes
 
@@ -49,7 +53,7 @@ proof and mutation-boundary qualification are in
 [cancel-all-integer-margin-2026-09-18.md](cancel-all-integer-margin-2026-09-18.md).
 The latter is a port of `f2a7164`, not a new arithmetic discovery.
 
-## Correctness evidence so far
+## Correctness evidence
 
 Counts below describe separate checks and include overlap; do not add them into
 one unique-test total. Ignored timing probes remained ignored.
@@ -157,8 +161,8 @@ Frozen checkpoint artifact:
 `/home/18c/bench-results-matched/s61-implementation-20260919/candidate-6099a68/`.
 It contains `torus-node`, `SHA256SUMS` and `manifest.json`; binary SHA256 is
 `47a8d64d31c6c1186a5da9fac66eab1cf83365f7b90bd2d5790f625c54a12d0b`.
-Further implementation continues; later changes need their own qualification.
-A later benchmark session requires authorization; this session must not measure it.
+This historical checkpoint predates the completed implementation below.
+A later benchmark session requires authorization and must use cap 200.
 
 Second integrated checkpoint: `f8f692e`, including all 22 implementation commits
 listed above, built successfully after another affected-package cleanup. Receipt
@@ -172,3 +176,149 @@ Frozen artifact directory:
 The binary is 47,999,536 bytes; SHA256 is
 `bade8c32bd46103851eadb30b32429b9941f98422af8299ef019d9f99793bda4`.
 This remains an unmeasured candidate, not a new record.
+
+## Usage-limit stop and later committed changes
+
+Active work reached the usage limit around 08:12 Berlin (06:12 UTC), before the
+12:45 Berlin deadline. The final already-launched trie check finished at
+06:12:49 UTC. The status exchange resumed after the deadline; no further
+implementation or checks were started. No build, test, node or load generator
+was running when the final handoff was saved.
+
+At the September 19 stop, committed source was `105ba3a`, containing 28
+implementation commits. These six changes postdated the frozen `f8f692e` node:
+
+| Area | Change | Commit |
+| --- | --- | --- |
+| State ownership | Add compatible owned-value puts; overlay moves values while preserving undo/freeze/error behavior | `bdc335d` |
+| Book persistence | Move consumed Classic and order-row serialized buffers into overlay | `ee79f89` |
+| Matching | Reuse occupied best-price entry through matching and remove only afterward | `2386826` |
+| Balance cache | Track first-dirty senders with entry flags and a retained vector; preserve complete retry set on failure | `9cf45f7` |
+| Typed persistence | Serialize positions/balances into 95/33-byte-capacity buffers and transfer ownership | `43be807` |
+| Trust-cache hashing | Reuse batch-local buffers while preserving distinct EIP-712 keys and session exclusion | `105ba3a` |
+
+Evidence: owned API 32 backend tests (`38288137-1153-4595-aca0-2c407c0f765d`);
+book save 12 tests (`a1c3400a-4bca-4208-834e-d33ca8a6d623`); occupied matching
+142 tests, three ignored (`81c39e98-253a-40e3-9a2a-39c3544d70cb`); balance cache
+four tests (`5ba339c1-5f06-41fa-aeec-5da4318063af`). Combined root qualification
+passed 183 tests: 64 types, 85 mempool, seven position-cache, eight engine,
+11 maker-margin, eight settlement; one timing probe ignored. Receipt
+`7e2c8946-830c-49f1-ae9f-98a4c1d5e9ba`. No performance measurements.
+
+Ownership retains producer capacity. Order rows start at 120 bytes; Classic
+book blobs may retain Borsh growth slack. Small balance/position encoders avoid
+Borsh's default 1 KiB buffer. Balance flags add entry padding and an extra lookup
+per dirty sender after a successful flush; net workload benefit is unmeasured.
+
+Historical unfinished state preserved at the September 19 stop:
+
+- Root `native_pool.rs`: one sender-count lookup per selection and zero-cap
+  test. Uncommitted and untested. Issue `eb9253db-fa94-4ba3-996c-10bcbab6e216`.
+- `s61-cancel-path`: trie parent-vector reuse and oracle tests. Uncommitted;
+  26 tests passed, one ignored, allocation witness explicitly skipped under
+  receipt `2303eab8-f46a-4b6e-8a27-7e8fa058d8cc`. Initial compile failed due to
+  stale types artifacts; targeted types/state cleanup fixed the build. Torus
+  resolution was rejected because its attempt already had a failure outcome;
+  issue `2b3b58ab-58bb-4c39-bfeb-20b57f8e6795` remains unresolved in the tracker.
+- `s61-block-path`: consensus packed write-batch candidate and tests. Interrupted
+  by quota; uncommitted, unreviewed final patch, uncompiled and untested.
+  Issue `34778fd5-1441-4862-bc6a-a44bc20ebd5e`.
+
+Patch backups, including untracked test files, are in
+`/home/18c/bench-results-matched/s61-implementation-20260919/stop-handoff/`.
+The September 23 completion below supersedes those pending statuses. The
+original backups and frozen binaries remain intact.
+
+
+## September 23 completion
+
+The integration worktree and branch were verified at the expected `105ba3a`
+before edits. Both auxiliary worktrees matched the handoff. Review covered all
+pending production changes and both untracked test files.
+
+- Mempool selection: `7ef271e`. One sender-count entry lookup replaces the
+  repeated lookup in each selection loop; a zero sender cap returns empty.
+  Existing exclusion, byte/order budget, prefix and cancellation ordering are
+  preserved. The zero-cap test now checks expiry, dedup, hash and sender indexes
+  before and after re-enabling selection. All 86 mempool tests passed under
+  receipt `a4a897b7-e369-4ace-8ce6-8c662294ba1d`.
+- Trie parent reuse: `3a9e53a` (source-worktree commit `43ce385`). Sorted child
+  indices remain sorted after division by two, so adjacent dedup produces the
+  same parent sequence as the old BTreeSet. Independent legacy and full-tree
+  oracles check roots, changed nodes, sibling reads and every injected read
+  failure boundary. The fresh check passed 29 tests, one ignored, under receipt
+  `2d2f940b-7cd5-4d02-b2c0-8cdda15499ca`; this includes three backend flush tests
+  beyond the former 26-test scope. The allocation witness was explicitly
+  skipped. Fresh attempt `a682081a-1a85-4f2e-b471-d3b7e70a7948` resolved
+  successfully as event `4c7d467f-af05-43c7-b110-f11fb1bc6916`; the earlier
+  failed attempt remains historical.
+
+- Consensus KV writes: `d73320e` (source-worktree commit `7826d36`). Keys and
+  values share an owned byte arena; ordered offsets preserve duplicate-key and
+  delete/set semantics, deferred CF lookup, and one RocksDB write per batch.
+  All 159 consensus tests passed, one ignored, under receipt
+  `68d290ef-f131-4e12-a5c8-3468bcb1bc28`. All four new tests executed, covering
+  legacy raw-CF byte equivalence, input ownership, snapshots, clones, reopen,
+  abandoned batches, missing CF and actual read-only write failures. Tracker
+  resolution saved as event `9998a503-2075-444c-881d-2f5ac7d21b6e`.
+
+Affected project crates were cleaned before each worktree's check, and expected
+new test names were checked. The KV receipt truncated the compilation header;
+its fresh dependency file contains the new test module but uses relative paths,
+so it does not independently establish the absolute compilation directory.
+The integrated check below retains full logs to preserve compilation evidence.
+
+The parent vector retains its largest level capacity until propagation returns.
+The consensus byte arena can retain growth slack and copies existing bytes when
+it grows; both the arena and RocksDB's batch coexist until the write completes.
+These allocation changes have no measured throughput or latency benefit yet.
+The new KV tests cover logical storage and injected read-only errors, not
+physical power-loss or disk-full fault injection. Multi-validator performance, long-running load,
+and end-to-end state parity under load remain unqualified for this candidate.
+
+
+### Final integrated verification and standalone artifact
+
+All three patches are integrated at
+`d73320e445a752e7ee99bd77fdf2c458157e0f4f`, bringing the implementation count to
+31 implementation commits beyond the record base, plus harness and
+documentation commits.
+After cleaning all 13 node project packages, the combined source passed:
+
+| Check | Passed | Ignored |
+| --- | ---: | ---: |
+| `cargo test --release -p torus-mempool --lib` | 86 | 0 |
+| `cargo test --release -p torus-state --lib native_trie -- --skip alloc_witness_native_trie_block` | 29 | 1 |
+| `cargo test --release -p torus-consensus --lib` | 159 | 1 |
+
+This is 274 passing tests in the final combined check; earlier checks overlap.
+The allocation witness was explicitly skipped and timing probes stayed ignored.
+The following standalone build then succeeded:
+
+```sh
+CARGO_TARGET_DIR=/home/18c/.cargo-target-matched cargo build --release -p torus-node
+```
+
+Receipt `d8210b30-b218-4151-8230-167c12f8321e`, run
+`6c275922-9a56-4a0a-8624-c4865d68b3b2`, covers these checks and the build with
+unchanged source. Full logs confirm all 13 node project crates compiled from
+this integration worktree and every new test executed. The build emitted an
+unused `state` parameter warning in RPC and a dependency future-compatibility
+warning for `proc-macro-error2`; neither failed the build.
+
+The fresh frozen artifact is:
+`/home/18c/bench-results-matched/s61-implementation-20260919/candidate-d73320e/`.
+
+- Binary: `torus-node`, 47,991,352 bytes.
+- Source revision: `d73320e445a752e7ee99bd77fdf2c458157e0f4f`.
+- SHA256: `fdc2fb563573b9ae413da7c26cc6a1dc1f88921e6d57be3f68e8f22b163116ec`.
+- Provenance: `manifest.json`, `SHA256SUMS`, `verification.json`, full test/build
+  logs, Cargo/Rust versions, and the report-only diff present during the build.
+
+The source code exactly matches the recorded revision. The only dirty file
+during verification/build was this report; the final report commit changes no
+compiled source. The copied binary's checksum was checked against the build
+output and `SHA256SUMS`. No generator was built, and the node was not launched.
+All five requested implementation tasks are complete. Performance improvement
+and multi-validator load parity remain unmeasured; any authorized future run
+must use **cap 200**.
