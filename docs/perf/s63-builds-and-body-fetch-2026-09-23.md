@@ -178,3 +178,38 @@ about 2 s every 2 minutes.
 - The remaining open items above still apply: host-state regime, proving the
   body-fetch fix live, disk-limited long cells, and the pre-existing
   integration test failure.
+
+## Steps 3–4 and the combined build (18:35–23:04)
+
+All cells: cap 200, 300 s, rate 76,000, `TORUS_EXEC_PIPELINE=1` in every
+arm, interleaved, shared global bench lock and per-cell host sampler.
+
+**Step 3, book-save deferral** (`124a842`, pass 2 of save_books moved to the
+flush worker; port of 4298728 part a): `books` 48,066 (1 fallback) ·
+57,766 · 54,521 vs `work` 48,544 · 50,174 · 52,474, so +6 % mean. That is not
+conclusive: the ranges overlap, and two control idle probes read 4.4 and 2.3.
+Exec-thread save_books fell from 162–175 ms to 115–127 ms.
+
+**Step 4, batched cancel-all** (`58c9eb4`, `TORUS_CANCEL_BATCH=1`, same binary
+on/off): 60,749 · 52,596 · 57,710 vs 57,907 · 53,019 · 57,441, so +1.6 %
+(noise). The mechanism is confirmed: phase1_actions fell from 257–301 ms to
+103–108 ms, engine time dropped about 100 ms, and exec busy fell from 0.93
+to 0.79–0.88. Native blocks/s stayed capped near 1.07, so execution stopped
+being the binding limit.
+
+**Combined working line** (`19adf42` = merges of both, all suites green) with
+`TORUS_EXEC_PIPELINE=1 TORUS_CANCEL_BATCH=1`, 4 cells per arm:
+
+| Arm | Matched/s | Mean | chain_ms | Native blk/s | Peak / steady RSS |
+| --- | --- | ---: | --- | --- | --- |
+| combined | 60,953 · 59,322 · 60,410 · 65,656 | **61.6k** | 683–747 | 1.08–1.16 | 6.5–7.6 / 4.1–4.7 GB |
+| `ac8782c` + pipeline | 55,925 · 57,931 · 57,552 · 56,308 | 56.9k | 856–928 | 0.96–1.08 | 6.2–7.0 / 3.9–4.3 GB |
+
+The combined build wins by **+8.2 %** (+9.6 % steady-window). The ranges are
+disjoint, all 8 cells were accepted with AGREE, and there were 0 body-fetch
+exhaustions. This is the new record: mean 61.6k, best cell 65,656. The
+frozen binary is `artifacts/combo63` (sha256 `a5fb0800…`).
+
+Execution runs at 78–82 % busy with the queue no longer full, so the next
+bottleneck is on the consensus side: view timeouts (125–158 per node per
+cell) and proposal cadence.
