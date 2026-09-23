@@ -213,3 +213,36 @@ frozen binary is `artifacts/combo63` (sha256 `a5fb0800…`).
 Execution runs at 78–82 % busy with the queue no longer full, so the next
 bottleneck is on the consensus side: view timeouts (125–158 per node per
 cell) and proposal cadence.
+
+## New baseline setup and validation (23:10)
+
+- Working line `perf/s63-body-fetch` now also carries the loopback devnet
+  binding (`dddcd9b`) and the merged s60 harness/docs branch (`260847d`,
+  91 harness tests pass). The benchmark harness runs from this worktree.
+  `testnet/genesis-weighted-full.json` (gitignored) was copied in with md5
+  `51a74a7b…`, unchanged.
+- Validation cell `s63-check-combo-r1` (`combo63`, both flags, new harness):
+  **59,404 matched/s, accepted**, idle_blk_s 24.8, AGREE, 0 exhaustions. It
+  falls within the combined build's 59.3–65.7k range.
+- Campaign tooling is copied into `tools/matched-bench/campaign/`.
+
+## Next
+
+1. **Crash gate for the record configuration.** Run `combo63` with
+   `TORUS_EXEC_PIPELINE=1 TORUS_CANCEL_BATCH=1`, cap 200, 300 s, and
+   `run_cell.py --crash-at 60` (val1 SIGKILL at +60 s). Pass criteria: replay
+   found, AGREE, no fail-stop, no stalls. The killed node reads UNKNOWN
+   liveness, a known harness gap.
+2. **Then default both flags on** (`TORUS_EXEC_PIPELINE`,
+   `TORUS_CANCEL_BATCH`), with `=0` as the kill switch. Update the flag-parse
+   tests and re-run the suites.
+3. **Consensus bottleneck.** The first candidate is `TORUS_ASYNC_VALIDATE=1`
+   (`4076355`, already on this line, never benchmarked ON). It moves
+   validate_block and DA reconstruction off the HotStuff thread. Re-check its
+   vote-safety tests (`a69e37b` basis rule) before a same-binary on/off A/B.
+   Profile view timeouts and proposal arrival on the combined build.
+4. Harness: exclude the planned kill window from the liveness check.
+5. Open: `progress_and_validator_set_update_test` (pre-existing failure);
+   main (`cte-architecture`) has 4 commits not on this line, including
+   `NATIVE_TOTAL_BLOCK_CAP` 100 → 1000, to reconcile before merging;
+   `dockerd` 400–500 % CPU spikes every 2 min during cells.
