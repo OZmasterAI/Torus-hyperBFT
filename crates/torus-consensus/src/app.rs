@@ -3312,7 +3312,7 @@ impl TorusApp {
         // bl2 exec pipeline: the flush worker is constructed only NOW — after the
         // (serial) boot replay — so the durable marker equals the replayed top
         // height before `exec_next_height` / manifest parking read it (design
-        // §2.1 W.6, F4). `TORUS_EXEC_PIPELINE` unset ⇒ None ⇒ exact-today.
+        // §2.1 W.6, F4). Default ON; `TORUS_EXEC_PIPELINE=0` ⇒ None ⇒ serial chain.
         if crate::exec_pipeline::exec_pipeline_enabled() {
             exec_ctx.attach_flush_worker(None);
         }
@@ -12615,13 +12615,14 @@ mod crash_recovery_tests {
         assert_dumps_equal(&dump_ref, &dump_all_cfs(&state_db), "rebuild after deferred parent vs serial");
     }
 
-    /// Kill switch: `TORUS_EXEC_PIPELINE` unset/0 => no worker is attached, the
+    /// Kill switch: `TORUS_EXEC_PIPELINE=0` => no worker is attached, the
     /// context is the serial one (every existing test runs that path).
     #[test]
-    fn exec_pipeline_default_off_has_no_worker() {
+    fn exec_pipeline_kill_switch_has_no_worker() {
         let (_cfg, state_db) = make_test_config_and_db();
         let ctx = pipeline_ctx(&state_db, false, None);
         assert!(ctx.flush_worker.is_none());
-        assert!(!crate::exec_pipeline::parse_exec_pipeline_toggle(None));
+        assert!(!crate::exec_pipeline::parse_exec_pipeline_toggle(Some("0".to_string())));
+        assert!(crate::exec_pipeline::parse_exec_pipeline_toggle(None));
     }
 }

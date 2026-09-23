@@ -1321,19 +1321,19 @@ impl ResidentBooks {
     }
 }
 
-/// s63 runtime toggle: `TORUS_CANCEL_BATCH=1` executes each maximal run of
-/// consecutive `CancelAllOrders` in Phase 1 (deferred places do not break a
-/// run) with one book compaction per touched level instead of one per
-/// action. Anything else (INCLUDING UNSET) keeps today's per-action loop.
+/// s63 runtime toggle, default ON since s64: each maximal run of consecutive
+/// `CancelAllOrders` in Phase 1 (deferred places do not break a run) executes
+/// with one book compaction per touched level instead of one per action.
+/// `TORUS_CANCEL_BATCH=0` is the kill switch back to the per-action loop.
 /// State-equivalent either way; read once per process.
 fn cancel_batch_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| parse_cancel_batch_toggle(std::env::var("TORUS_CANCEL_BATCH").ok()))
 }
 
-/// Pure parse of the `TORUS_CANCEL_BATCH` value: only `"1"` enables.
+/// Pure parse of the `TORUS_CANCEL_BATCH` value: only `"0"` disables.
 fn parse_cancel_batch_toggle(v: Option<String>) -> bool {
-    matches!(v.as_deref().map(str::trim), Some("1"))
+    !matches!(v.as_deref().map(str::trim), Some("0"))
 }
 
 #[cfg(test)]
@@ -1341,20 +1341,20 @@ mod cancel_batch_toggle_tests {
     use super::parse_cancel_batch_toggle;
 
     #[test]
-    fn default_is_off() {
-        assert!(!parse_cancel_batch_toggle(None));
+    fn default_is_on() {
+        assert!(parse_cancel_batch_toggle(None));
     }
 
     #[test]
-    fn one_enables() {
-        assert!(parse_cancel_batch_toggle(Some("1".to_string())));
-        assert!(parse_cancel_batch_toggle(Some(" 1 ".to_string())));
+    fn zero_disables() {
+        assert!(!parse_cancel_batch_toggle(Some("0".to_string())));
+        assert!(!parse_cancel_batch_toggle(Some(" 0 ".to_string())));
     }
 
     #[test]
-    fn anything_else_stays_off() {
-        for v in ["0", "true", "on", "", "yes", "2"] {
-            assert!(!parse_cancel_batch_toggle(Some(v.to_string())), "{v}");
+    fn anything_else_stays_on() {
+        for v in ["1", " 1 ", "true", "on", "", "yes", "2"] {
+            assert!(parse_cancel_batch_toggle(Some(v.to_string())), "{v}");
         }
     }
 }

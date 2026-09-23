@@ -42,16 +42,16 @@ use torus_state::native_trie::{NativeMemberCache, NativeTrieCache};
 use torus_state::{FrozenPending, StateDb};
 use torus_types::Address;
 
-/// Kill switch: `TORUS_EXEC_PIPELINE=1` enables the flush worker; anything else
-/// (INCLUDING UNSET) keeps the serial exec chain — exact-today. Default OFF
-/// until two agreeing 3-validator cells + the crash gate exist (design §2.1).
+/// Default ON (s64): the flush worker is attached unless `TORUS_EXEC_PIPELINE=0`,
+/// the kill switch that restores the serial exec chain. Flipped after the s63
+/// agreeing 3-validator cells and the s64 crash gate (design §2.1).
 pub fn exec_pipeline_enabled() -> bool {
     parse_exec_pipeline_toggle(std::env::var("TORUS_EXEC_PIPELINE").ok())
 }
 
-/// Pure parse of the `TORUS_EXEC_PIPELINE` value: only `"1"` enables.
+/// Pure parse of the `TORUS_EXEC_PIPELINE` value: only `"0"` disables.
 pub fn parse_exec_pipeline_toggle(v: Option<String>) -> bool {
-    matches!(v.as_deref().map(str::trim), Some("1"))
+    !matches!(v.as_deref().map(str::trim), Some("0"))
 }
 
 /// One unit of work for W, in commit order.
@@ -492,13 +492,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn toggle_default_off_only_one_enables() {
-        assert!(!parse_exec_pipeline_toggle(None));
-        for v in ["0", "", "true", "on", "yes", "2"] {
-            assert!(!parse_exec_pipeline_toggle(Some(v.to_string())), "{v}");
+    fn toggle_default_on_only_zero_disables() {
+        assert!(parse_exec_pipeline_toggle(None));
+        for v in ["1", " 1 ", "", "true", "on", "yes", "2"] {
+            assert!(parse_exec_pipeline_toggle(Some(v.to_string())), "{v}");
         }
-        assert!(parse_exec_pipeline_toggle(Some("1".to_string())));
-        assert!(parse_exec_pipeline_toggle(Some(" 1 ".to_string())));
+        assert!(!parse_exec_pipeline_toggle(Some("0".to_string())));
+        assert!(!parse_exec_pipeline_toggle(Some(" 0 ".to_string())));
     }
 
     fn temp_env(gate: Option<Arc<WorkerGate>>) -> (WorkerEnv, tempfile::TempDir) {
