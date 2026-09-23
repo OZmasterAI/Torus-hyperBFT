@@ -58,10 +58,17 @@ pub fn parse_exec_pipeline_toggle(v: Option<String>) -> bool {
 pub enum Job {
     /// A native block: flush its frozen pending set (state + trie + marker in one
     /// atomic batch), then resync the EVM mirror for `evm_addrs` (usually empty).
+    /// `books` optionally carries the block's DEFERRED mode-2/3 book-save pass 2
+    /// (`save_order_books_deferred` on E; s63 port of item 6a): W applies it
+    /// into a sidecar pending set whose entries join the SAME atomic batch and
+    /// the SAME native-root inputs as `pending` — byte-identical durable state
+    /// to the serial on-E save, with the write half of save_books off E's
+    /// critical path. `None` = exactly the pre-port job.
     Flush {
         height: u64,
         pending: Arc<FrozenPending>,
         evm_addrs: Vec<Address>,
+        books: Option<torus_bridge::native_executor::DeferredBookSave>,
     },
     /// An empty / non-native block: advance the applied-height marker, in order
     /// behind the previous block's batch. `pending` is the 1-key marker layer the
@@ -278,7 +285,7 @@ fn finish_job(shared: &Shared, metrics: &Option<Arc<torus_telemetry::Metrics>>) 
 
 fn worker_loop(rx: Receiver<Job>, env: WorkerEnv, shared: Arc<Shared>) {
     tracing::info!("flush worker thread started (TORUS_EXEC_PIPELINE)");
-    while let Ok(job) = rx.recv() {
+    while let Ok(mut job) = rx.recv() {
         let height = job.height();
         if let Some(m) = &env.metrics {
             m.flush_worker_depth.set(*shared.outstanding.lock().unwrap() as i64);
@@ -289,7 +296,7 @@ fn worker_loop(rx: Receiver<Job>, env: WorkerEnv, shared: Arc<Shared>) {
             if inject_fail {
                 return Err(JobError::Write("injected write failure (test gate)".into()));
             }
-            run_job(&env, &job)
+            run_job(&env, &mut job)
         }));
         let wall = timer.elapsed().as_secs_f64();
         if let Some(m) = &env.metrics {
@@ -346,7 +353,7 @@ enum JobError {
     TrieStale(String),
 }
 
-fn run_job(env: &WorkerEnv, job: &Job) -> Result<(), JobError> {
+fn run_job(env: &WorkerEnv, job: &mut Job) -> Result<(), JobError> {
     match job {
         Job::Marker { height, pending } => {
             // Exactly today's `write_native_applied_height` bytes, sequenced
@@ -362,7 +369,32 @@ fn run_job(env: &WorkerEnv, job: &Job) -> Result<(), JobError> {
             height,
             pending,
             evm_addrs,
+            books,
         } => {
+            // Deferred book save: apply pass 2 (if any) into a sidecar overlay
+            // FIRST — its reads (stop-row diff, meta compare) see heights <
+            // `height` durable (W flushes strictly in order) plus this job's own
+            // earlier markets, exactly the view E's serial pass 2 had — then fold
+            // the sidecar into the flush below so the book bytes share the ONE
+            // atomic batch (and the root computation) with state + marker. The
+            // frozen `pending` is never mutated. The payload is TAKEN so the
+            // drained row bytes move into the sidecar (owned puts, as on E).
+            // `exec_save_books_write_seconds` keeps one observation per native
+            // block: E observes it on the serial save, W observes it here.
+            let sidecar = books.take().map(|b| {
+                let overlay = torus_state::NativeStateOverlay::new(env.state_db.clone());
+                let t = std::time::Instant::now();
+                torus_bridge::native_executor::apply_deferred_book_save(
+                    &overlay,
+                    env.metrics.as_deref(),
+                    b,
+                );
+                if let Some(m) = &env.metrics {
+                    m.exec_save_books_write_seconds
+                        .observe(t.elapsed().as_secs_f64());
+                }
+                overlay.freeze(*height)
+            });
             let flush_result = {
                 let mut trie_cache = env
                     .trie_cache
@@ -382,7 +414,8 @@ fn run_job(env: &WorkerEnv, job: &Job) -> Result<(), JobError> {
                 } else {
                     None
                 };
-                pending.flush_with_native_trie_stats(
+                pending.flush_with_sidecar_native_trie_stats(
+                    sidecar.as_deref(),
                     &env.state_db,
                     Some(*height),
                     cache_opt,

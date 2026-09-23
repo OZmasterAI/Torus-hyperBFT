@@ -574,6 +574,17 @@ struct ExecutionContext {
     /// or 1-key Marker), ALWAYS layered under the next fast-path overlay,
     /// durable or not (design F1/F6). `None` after a barrier / at start.
     last_job: std::sync::Mutex<Option<Arc<torus_state::FrozenPending>>>,
+    /// Deferred book save (s63 port of item 6a): whether `last_job` is a
+    /// `Job::Flush` whose book-save pass 2 rides W's sidecar — i.e. its book
+    /// bytes are NOT in the parent layer. A next block that would REBUILD its
+    /// books (resident holder not the predecessor) must then barrier first,
+    /// so the reload reads them from the DB. Cleared by every barrier.
+    last_job_books_deferred: AtomicBool,
+    /// Test-only stand-in for the process-global `TORUS_BOOK_ROWS` +
+    /// `TORUS_RESIDENT_BOOKS=1` (`OnceLock`s in production): `Some(mode)` builds
+    /// every native context in `mode` with the resident holder attached.
+    #[cfg(test)]
+    test_book_mode: Option<torus_bridge::native_executor::BookMode>,
 }
 
 // ---- Standalone helpers (used by both execution thread and crash recovery) ----
@@ -1317,6 +1328,7 @@ impl ExecutionContext {
         self.flush_worker = Some(crate::exec_pipeline::FlushWorker::spawn(env, applied));
         self.exec_applied.store(applied, Ordering::SeqCst);
         *self.last_job.lock().unwrap() = None;
+        self.last_job_books_deferred.store(false, Ordering::SeqCst);
         tracing::info!(
             applied,
             "bl2 exec pipeline ENABLED (TORUS_EXEC_PIPELINE=1): flush worker attached after replay"
@@ -1336,6 +1348,7 @@ impl ExecutionContext {
             return false;
         }
         *self.last_job.lock().unwrap() = None;
+        self.last_job_books_deferred.store(false, Ordering::SeqCst);
         true
     }
 
@@ -1352,6 +1365,10 @@ impl ExecutionContext {
             crate::exec_pipeline::Job::Flush { pending, .. }
             | crate::exec_pipeline::Job::Marker { pending, .. } => pending.clone(),
         };
+        let books_deferred = matches!(
+            &job,
+            crate::exec_pipeline::Job::Flush { books: Some(_), .. }
+        );
         let wait_timer = std::time::Instant::now();
         let sent = worker.submit(job).is_ok();
         let wait_secs = wait_timer.elapsed().as_secs_f64();
@@ -1369,6 +1386,8 @@ impl ExecutionContext {
         }
         self.exec_applied.store(height, Ordering::SeqCst);
         *self.last_job.lock().unwrap() = Some(pending);
+        self.last_job_books_deferred
+            .store(books_deferred, Ordering::SeqCst);
         true
     }
 
@@ -1771,19 +1790,62 @@ impl ExecutionContext {
             // context constructor scans cf_native_order_books and rebuilds
             // EVERY resting order into memory — O(total resting depth) per
             // block. Attribute it explicitly (near-zero when resident reuse hits).
+            // Deferred book save hazard guard: the parent job's book bytes ride
+            // W's sidecar, NOT the parent layer. If this block would rebuild its
+            // books (holder is not the predecessor's post-state — drained or
+            // skipped; unreachable in the normal sequence), wait for W first so
+            // the reload reads them from the DB. Resident reuse (the normal
+            // case) never reads persisted books, so it never waits here.
+            if pipelined
+                && self.last_job_books_deferred.load(Ordering::SeqCst)
+                && resident_books.height() != height.checked_sub(1)
+            {
+                tracing::warn!(
+                    height,
+                    resident_height = ?resident_books.height(),
+                    "deferred book save: resident books will rebuild after a deferred parent — \
+                     waiting for the flush worker first"
+                );
+                if !self.pipeline_barrier() {
+                    tracing::error!(
+                        height,
+                        "FATAL: flush worker failed before resident-book rebuild barrier — fail-stop"
+                    );
+                    return;
+                }
+            }
             let load_books_timer = std::time::Instant::now();
-            let mut ctx = NativeExecContext::new_env(
-                overlay.clone(),
-                torus_block.header.height,
-                torus_block.header.timestamp,
-                torus_block.header.epoch,
-                self.epoch_length,
-                self.max_validators,
-                torus_block.header.proposer,
-                self.treasury_address,
-                self.dev_pool_address,
-                &mut resident_books,
-            );
+            #[cfg(test)]
+            let test_book_mode = self.test_book_mode;
+            #[cfg(not(test))]
+            let test_book_mode: Option<torus_bridge::native_executor::BookMode> = None;
+            let mut ctx = match test_book_mode {
+                Some(mode) => NativeExecContext::new_with_mode(
+                    overlay.clone(),
+                    torus_block.header.height,
+                    torus_block.header.timestamp,
+                    torus_block.header.epoch,
+                    self.epoch_length,
+                    self.max_validators,
+                    torus_block.header.proposer,
+                    self.treasury_address,
+                    self.dev_pool_address,
+                    mode,
+                    Some(&mut resident_books),
+                ),
+                None => NativeExecContext::new_env(
+                    overlay.clone(),
+                    torus_block.header.height,
+                    torus_block.header.timestamp,
+                    torus_block.header.epoch,
+                    self.epoch_length,
+                    self.max_validators,
+                    torus_block.header.proposer,
+                    self.treasury_address,
+                    self.dev_pool_address,
+                    &mut resident_books,
+                ),
+            };
             if let Some(ref m) = self.metrics {
                 m.exec_load_books_seconds
                     .observe(load_books_timer.elapsed().as_secs_f64());
@@ -1871,7 +1933,24 @@ impl ExecutionContext {
             }
 
             let save_books_timer = std::time::Instant::now();
-            ctx.save_order_books();
+            // Deferred book save (s63 port of item 6a, origin 4298728):
+            // pipelined + resident books + level-authority mode (2/3) → pass 1
+            // (drain) runs here, pass 2 (the state writes) rides Job::Flush to W,
+            // joining W's one atomic batch and the root computation (see
+            // exec_pipeline.rs / native_executor.rs). Every other combination is
+            // exactly the serial save. Resident gating: without resident books
+            // the NEXT block reloads books through this overlay's parent layer,
+            // which must then already hold the book bytes — those nodes keep the
+            // on-thread pass 2. `save_order_books_deferred` returns None (no side
+            // effects) for Classic / OrderRows.
+            let deferred_books = if pipelined && ctx.resident_mode() {
+                ctx.save_order_books_deferred()
+            } else {
+                None
+            };
+            if deferred_books.is_none() {
+                ctx.save_order_books();
+            }
             if let Some(ref m) = self.metrics {
                 m.exec_save_books_seconds
                     .observe(save_books_timer.elapsed().as_secs_f64());
@@ -1884,7 +1963,12 @@ impl ExecutionContext {
                 // two-pass save.
                 let split = ctx.save_split;
                 m.exec_save_books_drain_seconds.observe(secs(split.drain_ns));
-                m.exec_save_books_write_seconds.observe(secs(split.write_ns));
+                // Deferred blocks: the write half runs on W, which observes
+                // `exec_save_books_write_seconds` when it applies the sidecar —
+                // still ONE observation per native block.
+                if deferred_books.is_none() {
+                    m.exec_save_books_write_seconds.observe(secs(split.write_ns));
+                }
                 // L3: publish the level-hash sponge cache effectiveness, summed
                 // across all books, right after the save that populates it. None
                 // when TORUS_LEVEL_HASH_CACHE is off ⇒ skip (gauges stay at 0).
@@ -1935,6 +2019,7 @@ impl ExecutionContext {
                     height,
                     pending: frozen,
                     evm_addrs,
+                    books: deferred_books,
                 }) {
                     return;
                 }
@@ -3199,6 +3284,9 @@ impl TorusApp {
             flush_worker: None,
             exec_applied: AtomicU64::new(0),
             last_job: std::sync::Mutex::new(None),
+            last_job_books_deferred: AtomicBool::new(false),
+            #[cfg(test)]
+            test_book_mode: None,
         };
 
         // Phase A: ensure the persistent incremental trie exists before any commit (including
@@ -9453,6 +9541,9 @@ mod crash_recovery_tests {
             flush_worker: None,
             exec_applied: AtomicU64::new(0),
             last_job: std::sync::Mutex::new(None),
+            last_job_books_deferred: AtomicBool::new(false),
+            #[cfg(test)]
+            test_book_mode: None,
         }
     }
 
@@ -11997,6 +12088,531 @@ mod crash_recovery_tests {
         assert!(ctx.flush_worker.as_ref().unwrap().wait_idle());
         assert_eq!(read_native_applied_height(&state_db), Some(2), "Marker(2) landed after release");
         assert!(!ctx.exec_failed.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    // ======================================================================
+    // s63 port of item 6a (origin 4298728): book-save pass 2 deferred to W
+    // ======================================================================
+
+    /// The deferred mode-2 book save (`save_order_books_deferred`) rides
+    /// `Job::Flush` to the REAL flush worker, which applies it as a sidecar of
+    /// the block's one atomic batch. Pins, against a serial reference over the
+    /// same blocks:
+    ///   (1) byte-identical final state in EVERY CF and the same persisted
+    ///       native root (books entered the root computation on W);
+    ///   (2) atomicity/thread attribution — while W holds job N parked, NONE
+    ///       of block N's book bytes (nor its marker) is durable, and they
+    ///       appear only after release: the write half provably ran on W;
+    ///   (3) crash — an injected W write failure durably lands NOTHING of the
+    ///       block (no book bytes, no marker) and latches the shared
+    ///       fail-stop, so restart-replay re-executes from the marker.
+    #[test]
+    fn exec_pipeline_deferred_books_atomic_and_match_serial() {
+        use torus_bridge::native_executor::{
+            BookMode, NativeExecContext, NativeExecutor, ResidentBooks,
+        };
+        use torus_state::cf::{CF_BOOK_ORDER_ROWS, CF_NATIVE_ORDER_BOOKS};
+        use torus_state::native_trie::{
+            build_native_trie_to_cf, persisted_native_root, NativeMemberCache,
+        };
+
+        let a = Address::from([61u8; 20]);
+        let b = Address::from([62u8; 20]);
+        let deposit = U256::from(1_000 * FixedPoint::ONE.raw() as u128);
+        let order = |is_buy: bool, price: i128, qty: i128| torus_types::PlaceOrderParams {
+            market_id: 1,
+            is_buy,
+            price: FixedPoint::from_raw(price * FixedPoint::SCALE),
+            quantity: FixedPoint::from_raw(qty * FixedPoint::SCALE),
+            order_type: torus_types::OrderType::Limit,
+            time_in_force: torus_types::TimeInForce::GTC,
+            reduce_only: false,
+            client_order_id: None,
+        };
+        let amount = U256::from(500 * FixedPoint::ONE.raw() as u128);
+        let blocks: Vec<Vec<(Address, NativeAction)>> = vec![
+            vec![
+                (a, NativeAction::TransferToPerp { amount }),
+                (b, NativeAction::TransferToPerp { amount }),
+                (a, NativeAction::PlaceOrder(order(false, 100, 1))),
+                (a, NativeAction::PlaceOrder(order(false, 101, 2))),
+                (b, NativeAction::PlaceOrder(order(true, 99, 1))),
+                (
+                    b,
+                    NativeAction::PlaceOrder(torus_types::PlaceOrderParams {
+                        order_type: torus_types::OrderType::StopMarket {
+                            trigger: FixedPoint::from_raw(150 * FixedPoint::SCALE),
+                        },
+                        ..order(true, 100, 1)
+                    }),
+                ),
+            ],
+            // Fill and cancel-all in SEPARATE blocks: within one block the
+            // engine's phase 1 (cancels) runs before the match phase.
+            vec![(b, NativeAction::PlaceOrder(order(true, 100, 1)))], // fills A's sell
+            vec![(a, NativeAction::CancelAllOrders { market_id: None })],
+        ];
+
+        // Execute one block on a leg: engine + save (serial or deferred) +
+        // stash; the caller owns the flush (serial or via W).
+        let exec_block = |db: &StateDb,
+                          books: &mut ResidentBooks,
+                          height: u64,
+                          batch: &[(Address, NativeAction)],
+                          deferred: bool| {
+            let overlay = NativeStateOverlay::new(db.clone());
+            let mut ctx = NativeExecContext::new_with_mode(
+                overlay.clone(),
+                height,
+                1_000 + height,
+                0,
+                100,
+                10,
+                Address::ZERO,
+                Address::ZERO,
+                Address::ZERO,
+                BookMode::LevelAuthority,
+                Some(books),
+            );
+            assert!(ctx.fatal_error.is_none(), "load {height}: {:?}", ctx.fatal_error);
+            NativeExecutor::execute_batch(&mut ctx, batch);
+            assert!(ctx.fatal_error.is_none(), "exec {height}: {:?}", ctx.fatal_error);
+            let _ = NativeExecutor::drain_core_writer(&mut ctx);
+            let save = if deferred {
+                Some(ctx.save_order_books_deferred().expect("mode 2 must defer"))
+            } else {
+                ctx.save_order_books();
+                None
+            };
+            ctx.stash_resident(books);
+            (overlay.freeze(height), save)
+        };
+        let dump_books = |db: &StateDb| -> Vec<(&'static str, Vec<u8>, Vec<u8>)> {
+            let mut out = Vec::new();
+            for cf in [CF_NATIVE_ORDER_BOOKS, CF_BOOK_ORDER_ROWS] {
+                for (k, v) in StateBackend::iterate_cf(db, cf, None).unwrap() {
+                    out.push((cf, k, v));
+                }
+            }
+            out
+        };
+        let fund = |db: &StateDb| {
+            fund_evm_balance(db, a, deposit);
+            fund_evm_balance(db, b, deposit);
+            build_native_trie_to_cf(db).unwrap();
+        };
+        let spawn_worker = |db: &StateDb,
+                            gate: Arc<crate::exec_pipeline::WorkerGate>,
+                            exec_failed: Arc<std::sync::atomic::AtomicBool>| {
+            crate::exec_pipeline::FlushWorker::spawn(
+                crate::exec_pipeline::WorkerEnv {
+                    state_db: db.clone(),
+                    trie_cache: Arc::new(std::sync::Mutex::new(Default::default())),
+                    member_cache: Arc::new(std::sync::Mutex::new(
+                        NativeMemberCache::with_budget(0),
+                    )),
+                    metrics: None,
+                    exec_failed,
+                    gate: Some(gate),
+                },
+                0,
+            )
+        };
+
+        // ---- Serial reference (save + flush on "E"). ----
+        let (_c0, db_ref) = make_test_config_and_db();
+        fund(&db_ref);
+        let mut books_ref = ResidentBooks::default();
+        for (i, batch) in blocks.iter().enumerate() {
+            let h = (i + 1) as u64;
+            let (frozen, save) = exec_block(&db_ref, &mut books_ref, h, batch, false);
+            assert!(save.is_none());
+            frozen
+                .flush_with_native_trie_stats(&db_ref, Some(h), None, None)
+                .unwrap();
+        }
+        let dump_ref = dump_all_cfs(&db_ref);
+        let root_ref = persisted_native_root(&db_ref).unwrap();
+        let trades = StateBackend::iterate_cf(&db_ref, torus_state::cf::CF_NATIVE_TRADES, None)
+            .unwrap();
+        assert!(!trades.is_empty(), "fixture must produce a fill (not vacuous)");
+        assert!(!dump_books(&db_ref).is_empty(), "fixture must persist book rows");
+
+        // ---- Deferred through the real W (differential + hold ordering). ----
+        let (_c1, db_w) = make_test_config_and_db();
+        fund(&db_w);
+        let gate = crate::exec_pipeline::WorkerGate::new();
+        let exec_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker = spawn_worker(&db_w, gate.clone(), exec_failed.clone());
+        let mut books_w = ResidentBooks::default();
+
+        for h in [1u64, 2] {
+            let (frozen, save) =
+                exec_block(&db_w, &mut books_w, h, &blocks[(h - 1) as usize], true);
+            let save = save.unwrap();
+            assert!(save.book_count() >= 1, "block {h} dirtied market 1");
+            worker
+                .submit(crate::exec_pipeline::Job::Flush {
+                    height: h,
+                    pending: frozen,
+                    evm_addrs: vec![],
+                    books: Some(save),
+                })
+                .unwrap();
+            assert!(worker.wait_idle());
+            assert_eq!(read_native_applied_height(&db_w), Some(h));
+        }
+        let books_after_2 = dump_books(&db_w);
+        assert!(!books_after_2.is_empty(), "W applied the book sidecars");
+
+        gate.hold();
+        let (frozen3, save3) = exec_block(&db_w, &mut books_w, 3, &blocks[2], true);
+        worker
+            .submit(crate::exec_pipeline::Job::Flush {
+                height: 3,
+                pending: frozen3,
+                evm_addrs: vec![],
+                books: Some(save3.unwrap()),
+            })
+            .unwrap();
+        assert!(gate.wait_received(3), "W must have taken job 3");
+        // Parked: NOTHING of block 3 is durable — E wrote no book byte itself.
+        assert_eq!(read_native_applied_height(&db_w), Some(2), "marker(3) in flight");
+        assert_eq!(
+            dump_books(&db_w),
+            books_after_2,
+            "no block-3 book byte may be durable while W holds the job"
+        );
+        gate.release();
+        assert!(worker.wait_idle());
+        drop(worker);
+        assert!(!exec_failed.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(read_native_applied_height(&db_w), Some(3));
+        assert_dumps_equal(&dump_ref, &dump_all_cfs(&db_w), "deferred-through-W vs serial");
+        assert_eq!(
+            root_ref,
+            persisted_native_root(&db_w).unwrap(),
+            "native root must be identical with books applied on W"
+        );
+
+        // ---- Crash: injected W write failure = nothing durable + fail-stop. ----
+        let (_c2, db_c) = make_test_config_and_db();
+        fund(&db_c);
+        let gate_c = crate::exec_pipeline::WorkerGate::new();
+        let failed_c = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_c = spawn_worker(&db_c, gate_c.clone(), failed_c.clone());
+        let mut books_c = ResidentBooks::default();
+        let (frozen, save) = exec_block(&db_c, &mut books_c, 1, &blocks[0], true);
+        gate_c.fail_next();
+        worker_c
+            .submit(crate::exec_pipeline::Job::Flush {
+                height: 1,
+                pending: frozen,
+                evm_addrs: vec![],
+                books: save,
+            })
+            .unwrap();
+        assert!(!worker_c.wait_idle(), "wait_idle must report the failure");
+        assert!(worker_c.failed());
+        assert!(
+            failed_c.load(std::sync::atomic::Ordering::SeqCst),
+            "shared fail-stop latched"
+        );
+        drop(worker_c);
+        assert_eq!(read_native_applied_height(&db_c), None, "marker must not advance");
+        assert!(
+            dump_books(&db_c).is_empty(),
+            "no book byte may be durable after an injected W write failure"
+        );
+    }
+
+    /// Book-heavy sequence for the END-TO-END deferred-save tests (through
+    /// `execute_committed_block_with`, epoch_length 4 → 4/8/12 are serial
+    /// barriers). Covers resting sprays over several levels, a stop order,
+    /// partial fills, a multi-level sweep, cancel-alls and empties:
+    ///   1  fund A,B                                             native
+    ///   2  A sells 100x3, 101x2, 102x1; B buys 99x1 + stop      native (deferred)
+    ///   3  B buy 100x1 -> PARTIAL fill of A's 100x3            native (deferred, reads 2's books)
+    ///   4  empty (epoch boundary)                               serial marker
+    ///   5  B buy 101x3 -> sweeps 100x2 + partial 101           native (deferred)
+    ///   6  empty                                                Marker job
+    ///   7  A cancel-all mkt 1; B buy 97x2                       native (deferred)
+    ///   8  A sell 97x1 -> fills B's 99 bid (epoch boundary)    native, SERIAL
+    ///   9  A sell 96x1 -> partial of B's 97x2 level             native (deferred)
+    ///  10  B cancel-all (stop + 97 remainder)                   native (deferred)
+    ///  11  A sell 105x2 resting                                 native (deferred)
+    ///  12  empty (epoch boundary)                               serial marker
+    ///  13  B buy 105x1 -> partial fill, 105x1 stays resting     native (deferred)
+    fn book_fixture_blocks() -> Vec<TorusBlock> {
+        let k_a = k256::ecdsa::SigningKey::from_slice(&[51u8; 32]).unwrap();
+        let k_b = k256::ecdsa::SigningKey::from_slice(&[52u8; 32]).unwrap();
+        let deposit = U256::from(1_000 * FixedPoint::ONE.raw() as u128);
+        let order = |is_buy: bool, price: i128, qty: i128| torus_types::PlaceOrderParams {
+            market_id: 1,
+            is_buy,
+            price: FixedPoint::from_raw(price * FixedPoint::SCALE),
+            quantity: FixedPoint::from_raw(qty * FixedPoint::SCALE),
+            order_type: torus_types::OrderType::Limit,
+            time_in_force: torus_types::TimeInForce::GTC,
+            reduce_only: false,
+            client_order_id: None,
+        };
+        let stop = torus_types::PlaceOrderParams {
+            order_type: torus_types::OrderType::StopMarket {
+                trigger: FixedPoint::from_raw(150 * FixedPoint::SCALE),
+            },
+            ..order(true, 100, 1)
+        };
+        let sign = |a: NativeAction, n: u64, k: &k256::ecdsa::SigningKey| {
+            torus_types::eip712::sign_native_action(a, n, k)
+        };
+        let place = |o: torus_types::PlaceOrderParams| NativeAction::PlaceOrder(o);
+        let mut blocks = vec![
+            make_block(
+                1,
+                vec![
+                    sign(NativeAction::TransferToPerp { amount: deposit }, 1, &k_a),
+                    sign(NativeAction::TransferToPerp { amount: deposit }, 1, &k_b),
+                ],
+            ),
+            make_block(
+                2,
+                vec![
+                    sign(place(order(false, 100, 3)), 2, &k_a),
+                    sign(place(order(false, 101, 2)), 3, &k_a),
+                    sign(place(order(false, 102, 1)), 4, &k_a),
+                    sign(place(order(true, 99, 1)), 2, &k_b),
+                    sign(place(stop), 3, &k_b),
+                ],
+            ),
+            make_block(3, vec![sign(place(order(true, 100, 1)), 4, &k_b)]),
+            make_block(4, vec![]),
+            make_block(5, vec![sign(place(order(true, 101, 3)), 5, &k_b)]),
+            make_block(6, vec![]),
+            make_block(
+                7,
+                vec![
+                    sign(NativeAction::CancelAllOrders { market_id: Some(1) }, 5, &k_a),
+                    sign(place(order(true, 97, 2)), 6, &k_b),
+                ],
+            ),
+            make_block(8, vec![sign(place(order(false, 97, 1)), 6, &k_a)]),
+            make_block(9, vec![sign(place(order(false, 96, 1)), 7, &k_a)]),
+            make_block(
+                10,
+                vec![sign(NativeAction::CancelAllOrders { market_id: None }, 7, &k_b)],
+            ),
+            make_block(11, vec![sign(place(order(false, 105, 2)), 8, &k_a)]),
+            make_block(12, vec![]),
+            make_block(13, vec![sign(place(order(true, 105, 1)), 8, &k_b)]),
+        ];
+        link_blocks(&mut blocks);
+        blocks
+    }
+
+    fn fund_book_fixture(state_db: &StateDb) {
+        let deposit = U256::from(1_000 * FixedPoint::ONE.raw() as u128);
+        for signed in &book_fixture_blocks()[0].native_actions {
+            fund_evm_balance(state_db, signed.recover_sender().unwrap(), deposit);
+        }
+    }
+
+    /// `pipeline_ctx` with the book mode pinned (resident books forced on) —
+    /// the test stand-in for `TORUS_BOOK_ROWS` + `TORUS_RESIDENT_BOOKS=1`,
+    /// which are process-global `OnceLock`s in production.
+    fn book_pipeline_ctx(
+        state_db: &StateDb,
+        on: bool,
+        gate: Option<Arc<crate::exec_pipeline::WorkerGate>>,
+        mode: torus_bridge::native_executor::BookMode,
+    ) -> ExecutionContext {
+        let mut ctx = pipeline_ctx(state_db, false, None);
+        ctx.test_book_mode = Some(mode);
+        if on {
+            ctx.attach_flush_worker(gate);
+        }
+        ctx
+    }
+
+    fn dump_book_cfs(db: &StateDb) -> Vec<CfDump> {
+        [torus_state::cf::CF_NATIVE_ORDER_BOOKS, torus_state::cf::CF_BOOK_ORDER_ROWS]
+            .iter()
+            .map(|cf| (*cf, StateBackend::iterate_cf(db, cf, None).unwrap()))
+            .collect()
+    }
+
+    /// Book-CF rows visible THROUGH a frozen set only (layered over an empty
+    /// DB) — i.e. the book bytes E itself wrote into block N's overlay.
+    fn frozen_book_rows(frozen: &Arc<torus_state::FrozenPending>) -> usize {
+        let (_c, empty) = make_test_config_and_db();
+        let probe = NativeStateOverlay::with_parent(empty, Some(frozen.clone()));
+        [torus_state::cf::CF_NATIVE_ORDER_BOOKS, torus_state::cf::CF_BOOK_ORDER_ROWS]
+            .iter()
+            .map(|cf| StateBackend::iterate_cf(&probe, cf, None).unwrap().len())
+            .sum()
+    }
+
+    fn run_book_fixture(
+        on: bool,
+        mode: torus_bridge::native_executor::BookMode,
+    ) -> (StateDb, Vec<CfDump>, torus_types::B256, Vec<u64>) {
+        let (_cfg, state_db) = make_test_config_and_db();
+        fund_book_fixture(&state_db);
+        let gate = crate::exec_pipeline::WorkerGate::new();
+        let ctx = book_pipeline_ctx(&state_db, on, Some(gate.clone()), mode);
+        for b in &book_fixture_blocks() {
+            dispatch_and_execute(&ctx, &state_db, b);
+            if on && !b.native_actions.is_empty() {
+                let h = b.header.height;
+                if !EpochManager::is_epoch_boundary(h, 4) {
+                    // Deferral is ACTIVE: E handed W a frozen set with NO book
+                    // bytes — they ride the job's sidecar instead.
+                    let last = ctx.last_job.lock().unwrap().clone().expect("fast path");
+                    assert_eq!(last.height(), h);
+                    assert_eq!(frozen_book_rows(&last), 0, "h{h}: book writes must be deferred to W");
+                }
+            }
+        }
+        assert!(
+            !ctx.exec_failed.load(std::sync::atomic::Ordering::SeqCst),
+            "book fixture must not fail-stop (on={on}, {mode:?})"
+        );
+        drop(ctx);
+        let dump = dump_all_cfs(&state_db);
+        let root = torus_state::native_trie::persisted_native_root(&state_db).unwrap();
+        (state_db, dump, root, gate.received())
+    }
+
+    /// END-TO-END (real `execute_committed_block_with` + real W): with the
+    /// pipeline ON under level-authority modes 2 AND 3 + resident books, the
+    /// deferred book save lands byte-identical state in EVERY CF and the same
+    /// persisted native root as the serial (pipeline OFF) run, over a sequence
+    /// with partial fills, a multi-level sweep, stops, cancel-alls, empties
+    /// and serial barrier blocks interleaved. Also pins that deferral really
+    /// engaged on every fast-path native block (no book bytes in E's frozen set).
+    #[test]
+    fn exec_pipeline_deferred_books_end_to_end_match_serial() {
+        use torus_bridge::native_executor::BookMode;
+        for mode in [BookMode::LevelAuthority, BookMode::LevelAuthorityChunked] {
+            let (db_off, off, root_off, received_off) = run_book_fixture(false, mode);
+            let (db_on, on, root_on, received_on) = run_book_fixture(true, mode);
+            assert!(received_off.is_empty());
+            assert_eq!(received_on, vec![1, 2, 3, 5, 6, 7, 9, 10, 11, 13], "{mode:?}");
+            assert_dumps_equal(&off, &on, "deferred books ON vs OFF");
+            assert_eq!(root_off, root_on, "{mode:?}: persisted native root must be identical");
+            assert_eq!(read_native_applied_height(&db_on), Some(13));
+            let trades =
+                StateBackend::iterate_cf(&db_on, torus_state::cf::CF_NATIVE_TRADES, None).unwrap();
+            assert!(trades.len() >= 5, "{mode:?}: fixture fills (not vacuous): {}", trades.len());
+            let books = dump_book_cfs(&db_on);
+            assert!(!books[0].1.is_empty() && !books[1].1.is_empty(), "{mode:?}: book rows persisted");
+            assert_eq!(dump_book_cfs(&db_off), books);
+        }
+    }
+
+    /// Crash-before-write under deferral: W's write of native 2 (with its book
+    /// sidecar) fails AFTER E executed native 3 on top of pending(2). Nothing of
+    /// 2/3 is durable (marker 1, no book bytes beyond block 1's), the fail-stop
+    /// latches, and a serial restart-replay lands EXACTLY the serial state.
+    #[test]
+    fn exec_pipeline_deferred_books_crash_before_write_replays_and_matches_serial() {
+        use torus_bridge::native_executor::BookMode;
+        let mode = BookMode::LevelAuthorityChunked;
+        let blocks = book_fixture_blocks();
+        let first3 = &blocks[..3];
+
+        let (_c0, db_ref) = make_test_config_and_db();
+        fund_book_fixture(&db_ref);
+        let ctx_ref = book_pipeline_ctx(&db_ref, false, None, mode);
+        for b in first3 {
+            dispatch_and_execute(&ctx_ref, &db_ref, b);
+        }
+        drop(ctx_ref);
+        let dump_ref = dump_all_cfs(&db_ref);
+
+        let (_c1, state_db) = make_test_config_and_db();
+        fund_book_fixture(&state_db);
+        let gate = crate::exec_pipeline::WorkerGate::new();
+        let ctx = book_pipeline_ctx(&state_db, true, Some(gate.clone()), mode);
+        dispatch_and_execute(&ctx, &state_db, &first3[0]);
+        assert!(ctx.flush_worker.as_ref().unwrap().wait_idle());
+        assert_eq!(read_native_applied_height(&state_db), Some(1));
+        let books_after_1 = dump_book_cfs(&state_db);
+
+        gate.hold();
+        dispatch_and_execute(&ctx, &state_db, &first3[1]); // Flush(2)+books received, parked
+        assert!(gate.wait_received(2));
+        let db_t = state_db.clone();
+        let b3 = first3[2].clone();
+        let t = std::thread::spawn(move || {
+            dispatch_and_execute(&ctx, &db_t, &b3); // engine(3) on pending(2); hand-off blocks
+            ctx
+        });
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!t.is_finished());
+        gate.fail_next();
+        gate.release();
+        let ctx = t.join().unwrap();
+        assert!(ctx.exec_failed.load(std::sync::atomic::Ordering::SeqCst));
+        drop(ctx);
+        assert_eq!(read_native_applied_height(&state_db), Some(1), "nothing of 2/3 durable");
+        assert_eq!(dump_book_cfs(&state_db), books_after_1, "no book byte of 2/3 durable");
+
+        let ctx2 = book_pipeline_ctx(&state_db, false, None, mode);
+        let (_last, parked) = TorusApp::replay_committed(&state_db, &ctx2);
+        assert_eq!(parked, None);
+        assert!(!ctx2.exec_failed.load(std::sync::atomic::Ordering::SeqCst));
+        drop(ctx2);
+        assert_eq!(read_native_applied_height(&state_db), Some(3));
+        assert_dumps_equal(&dump_ref, &dump_all_cfs(&state_db), "replay after crash vs serial");
+    }
+
+    /// Stale-parent guard: if the resident holder is NOT the predecessor's
+    /// post-state while the parent job carried deferred book writes (holder
+    /// drained), the next block would rebuild its books from the DB + a parent
+    /// layer that lacks those bytes. E must instead BARRIER (wait for W) before
+    /// loading — it blocks while W is parked, and the final state equals serial.
+    #[test]
+    fn exec_pipeline_deferred_books_rebuild_waits_for_worker() {
+        use torus_bridge::native_executor::BookMode;
+        let mode = BookMode::LevelAuthority;
+        let blocks = book_fixture_blocks();
+        let first3 = &blocks[..3];
+
+        let (_c0, db_ref) = make_test_config_and_db();
+        fund_book_fixture(&db_ref);
+        let ctx_ref = book_pipeline_ctx(&db_ref, false, None, mode);
+        for b in first3 {
+            dispatch_and_execute(&ctx_ref, &db_ref, b);
+        }
+        drop(ctx_ref);
+        let dump_ref = dump_all_cfs(&db_ref);
+
+        let (_c1, state_db) = make_test_config_and_db();
+        fund_book_fixture(&state_db);
+        let gate = crate::exec_pipeline::WorkerGate::new();
+        let ctx = book_pipeline_ctx(&state_db, true, Some(gate.clone()), mode);
+        dispatch_and_execute(&ctx, &state_db, &first3[0]);
+        assert!(ctx.flush_worker.as_ref().unwrap().wait_idle());
+
+        gate.hold();
+        dispatch_and_execute(&ctx, &state_db, &first3[1]); // deferred books of 2 parked on W
+        assert!(gate.wait_received(2));
+        ctx.resident_books.lock().unwrap().invalidate(); // force a rebuild for 3
+        let db_t = state_db.clone();
+        let b3 = first3[2].clone();
+        let t = std::thread::spawn(move || {
+            dispatch_and_execute(&ctx, &db_t, &b3);
+            ctx
+        });
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!t.is_finished(), "E must wait for W before rebuilding books");
+        gate.release();
+        let ctx = t.join().unwrap();
+        assert!(!ctx.exec_failed.load(std::sync::atomic::Ordering::SeqCst));
+        drop(ctx);
+        assert_eq!(read_native_applied_height(&state_db), Some(3));
+        assert_dumps_equal(&dump_ref, &dump_all_cfs(&state_db), "rebuild after deferred parent vs serial");
     }
 
     /// Kill switch: `TORUS_EXEC_PIPELINE` unset/0 => no worker is attached, the

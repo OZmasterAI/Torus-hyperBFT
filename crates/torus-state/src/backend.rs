@@ -517,8 +517,35 @@ impl FrozenPending {
         trie_cache: Option<&mut crate::native_trie::NativeTrieCache>,
         member_cache: Option<&mut crate::native_trie::NativeMemberCache>,
     ) -> Result<NativeFlushStats, StateError> {
+        self.flush_with_sidecar_native_trie_stats(
+            None,
+            target,
+            applied_height,
+            trie_cache,
+            member_cache,
+        )
+    }
+
+    /// Deferred book save (port of item 6a): [`Self::flush_with_native_trie_stats`]
+    /// with an optional SIDECAR pending set folded in — the flush worker's
+    /// worker-side book writes. The sidecar's entries join the SAME atomic batch
+    /// and the SAME native-root dirty set as this frozen set's own entries, so
+    /// the persisted bytes, the state root and the marker atomicity are exactly
+    /// what the serial save-on-exec-thread would have produced. The sidecar is
+    /// appended AFTER the main set (and overrides it in the dirty map) — in
+    /// practice the key sets are disjoint: under deferral the exec thread writes
+    /// NO book-CF key into its overlay. Neither set is mutated (`&self`).
+    pub fn flush_with_sidecar_native_trie_stats(
+        &self,
+        sidecar: Option<&FrozenPending>,
+        target: &StateDb,
+        applied_height: Option<u64>,
+        trie_cache: Option<&mut crate::native_trie::NativeTrieCache>,
+        member_cache: Option<&mut crate::native_trie::NativeMemberCache>,
+    ) -> Result<NativeFlushStats, StateError> {
         flush_pending_with_native_trie_stats(
             &self.state,
+            sidecar.map(|s| &s.state),
             target,
             applied_height,
             trie_cache,
@@ -798,6 +825,7 @@ impl NativeStateOverlay {
         let state = self.pending.read().unwrap();
         flush_pending_with_native_trie_stats(
             &state,
+            None,
             target,
             applied_height,
             trie_cache,
@@ -811,6 +839,7 @@ impl NativeStateOverlay {
 /// (flush worker). Byte-identical batch content either way.
 fn flush_pending_with_native_trie_stats(
     state: &PendingState,
+    sidecar: Option<&PendingState>,
     target: &StateDb,
     applied_height: Option<u64>,
     trie_cache: Option<&mut crate::native_trie::NativeTrieCache>,
@@ -822,11 +851,23 @@ fn flush_pending_with_native_trie_stats(
         let build_timer = std::time::Instant::now();
         let mut batch = WriteBatch::default();
         state.append_to_batch(raw, &mut batch)?;
+        // Deferred book save: the sidecar (worker-side book writes) joins the
+        // SAME atomic batch, appended after the main set (last-wins on the — in
+        // practice disjoint — key sets).
+        if let Some(side) = sidecar {
+            side.append_to_batch(raw, &mut batch)?;
+        }
 
         // Native-root dirty map, folded into the SAME batch. BORROWED from the
         // pending maps (s450): `state`'s read guard is held for this whole
         // function and the trie only reads the set, so nothing is copied out.
-        let dirty = state.native_dirty_ref();
+        let mut dirty = state.native_dirty_ref();
+        // Deferred book save: the sidecar's root-CF entries enter the ROOT
+        // computation exactly as if the exec thread had written them into its
+        // overlay (same canonical (tag, key) order — BTreeMap merge).
+        if let Some(side) = sidecar {
+            dirty.extend(side.native_dirty_ref());
+        }
         // r7: the batch BUILD (serializing the pending maps) is a different
         // lever from the RocksDB WRITE (WAL + memtable), so keep the two
         // timers apart instead of summing them into one `write_seconds`.
@@ -2158,6 +2199,113 @@ mod tests {
         assert_eq!(
             StateDb::get_cf_raw(&db, CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT).unwrap(),
             Some(42u64.to_be_bytes().to_vec())
+        );
+    }
+
+    /// s63 (port of item 6a, 4298728): flushing a frozen set WITH a sidecar
+    /// (the flush worker's deferred book writes) is byte-identical — every CF,
+    /// the persisted native root, the marker — to flushing ONE overlay holding
+    /// the union of both write sets. The sidecar's root-CF entries really enter
+    /// the root computation (negative control: dropping the sidecar changes
+    /// it), and neither frozen set is mutated by the flush (read-only / Sync).
+    #[test]
+    fn sidecar_flush_identical_to_combined_overlay_flush() {
+        use crate::cf::{
+            CF_BOOK_ORDER_ROWS, CF_CONSENSUS_META, CF_NATIVE_ORDER_BOOKS, CF_NATIVE_POSITIONS,
+            META_NATIVE_APPLIED_HEIGHT,
+        };
+        let dump = |db: &StateDb| -> Vec<Vec<(Vec<u8>, Vec<u8>)>> {
+            crate::cf::ALL_CF_NAMES
+                .iter()
+                .map(|cf| StateBackend::iterate_cf(db, cf, None).unwrap())
+                .collect()
+        };
+        let put_main = |ov: &NativeStateOverlay| {
+            for i in 0..16u32 {
+                let k = format!("bal{i:03}");
+                StateBackend::put_cf_raw(ov, CF_NATIVE_BALANCES, k.as_bytes(), &i.to_be_bytes())
+                    .unwrap();
+            }
+            StateBackend::put_cf_raw(ov, CF_NATIVE_POSITIONS, b"pos", b"x").unwrap();
+        };
+        let put_books = |ov: &NativeStateOverlay| {
+            // Root CF (level rows / meta / stops)...
+            for i in 0..8u32 {
+                let k = format!("lvl{i:03}");
+                StateBackend::put_cf_raw(ov, CF_NATIVE_ORDER_BOOKS, k.as_bytes(), &i.to_be_bytes())
+                    .unwrap();
+            }
+            StateBackend::delete_cf_raw(ov, CF_NATIVE_ORDER_BOOKS, b"gone").unwrap();
+            // ...and the node-local order-row store (owned put, as pass 2 does).
+            StateBackend::put_cf_raw_owned(ov, CF_BOOK_ORDER_ROWS, b"row1", b"r".to_vec())
+                .unwrap();
+        };
+        // A pre-existing book row the sidecar deletes (tombstone must land).
+        let seed = |db: &StateDb| {
+            StateDb::put_cf_raw(db, CF_NATIVE_ORDER_BOOKS, b"gone", b"old").unwrap();
+            crate::native_trie::build_native_trie_to_cf(db).unwrap();
+        };
+
+        // Combined reference: one overlay carries both write sets.
+        let (db_a, _da) = temp_db();
+        seed(&db_a);
+        let ov = NativeStateOverlay::new(db_a.clone());
+        put_main(&ov);
+        put_books(&ov);
+        ov.freeze(5)
+            .flush_with_native_trie_stats(&db_a, Some(5), None, None)
+            .unwrap();
+
+        // Split: main frozen set + book sidecar, one flush.
+        let (db_b, _db) = temp_db();
+        seed(&db_b);
+        let main = NativeStateOverlay::new(db_b.clone());
+        put_main(&main);
+        let side = NativeStateOverlay::new(db_b.clone());
+        put_books(&side);
+        let main_frozen = main.freeze(5);
+        let side_frozen = side.freeze(5);
+        let (main_n, side_n) = (main_frozen.entry_count(), side_frozen.entry_count());
+        main_frozen
+            .flush_with_sidecar_native_trie_stats(Some(&side_frozen), &db_b, Some(5), None, None)
+            .unwrap();
+        assert_eq!(main_frozen.entry_count(), main_n, "flush must not mutate the frozen set");
+        assert_eq!(side_frozen.entry_count(), side_n, "flush must not mutate the sidecar");
+
+        assert_eq!(dump(&db_a), dump(&db_b), "sidecar flush must be byte-identical");
+        let root_a = crate::native_trie::persisted_native_root(&db_a).unwrap();
+        assert_eq!(root_a, crate::native_trie::persisted_native_root(&db_b).unwrap());
+        assert_eq!(
+            StateDb::get_cf_raw(&db_b, CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT).unwrap(),
+            Some(5u64.to_be_bytes().to_vec()),
+            "marker rides the same batch"
+        );
+
+        // `None` sidecar == the plain flush (the pre-port entry point).
+        let (db_n, _dn) = temp_db();
+        seed(&db_n);
+        let plain = NativeStateOverlay::new(db_n.clone());
+        put_main(&plain);
+        plain
+            .freeze(5)
+            .flush_with_sidecar_native_trie_stats(None, &db_n, Some(5), None, None)
+            .unwrap();
+
+        // Negative control: without the sidecar the root differs — proof the
+        // sidecar's CF_NATIVE_ORDER_BOOKS entries participate in the root.
+        let (db_c, _dc) = temp_db();
+        seed(&db_c);
+        let main_only = NativeStateOverlay::new(db_c.clone());
+        put_main(&main_only);
+        main_only
+            .freeze(5)
+            .flush_with_native_trie_stats(&db_c, Some(5), None, None)
+            .unwrap();
+        assert_eq!(dump(&db_n), dump(&db_c), "None sidecar must equal the plain flush");
+        assert_ne!(
+            root_a,
+            crate::native_trie::persisted_native_root(&db_c).unwrap(),
+            "book rows must be root-visible"
         );
     }
 }
