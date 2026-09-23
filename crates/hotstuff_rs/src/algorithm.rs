@@ -285,6 +285,7 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
             || self.hotstuff.has_pending_body_fetches()
             || self.hotstuff.has_pending_justify_fetches()
             || self.hotstuff.has_deferred_sync_retries()
+            || self.hotstuff.has_missing_data_retries()
         {
             std::cmp::min(
                 view_info.deadline,
@@ -368,6 +369,14 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
         // waiting for the 60s no-progress sync timeout. Self-throttled.
         if let Err(e) = self.hotstuff.tick_missing_pc_block_fetch(&self.block_tree) {
             log::error!("HotStuff tick_missing_pc_block_fetch error: {:?}", e);
+        }
+        // 6f. s63: re-validate parked bodies whose validation returned
+        // MissingData (parent present); fall back to sync after 3 s. Self-throttled.
+        if let Err(e) = self
+            .hotstuff
+            .tick_missing_data_retries(&mut self.block_tree, &mut self.app)
+        {
+            log::error!("HotStuff tick_missing_data_retries error: {:?}", e);
         }
         if self.hotstuff.take_sync_needed() {
             if let Err(e) = self.block_sync_client.trigger_sync(&mut self.block_tree) {

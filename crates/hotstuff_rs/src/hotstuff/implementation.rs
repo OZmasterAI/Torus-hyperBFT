@@ -96,8 +96,17 @@ pub(crate) struct HotStuff<N: Network> {
     pending_bodies: PendingBodies,
     /// Hybrid pipelining: headers received but body not yet fetched. Maps block_hash → header.
     pending_headers: PendingHeaders,
-    /// Hybrid pipelining: tracks body fetch retries. Maps block_hash → (last_request_time, retry_count, origin_peer).
-    body_fetch_tracker: std::collections::HashMap<CryptoHash, (Instant, u8, VerifyingKey)>,
+    /// Hybrid pipelining: tracks body fetch retries. Maps block_hash →
+    /// (last_request_time, retry_count, origin_peer, first_request_time). The
+    /// first-request time bounds the s63 wall-clock budget ([`BODY_FETCH_DEADLINE`]).
+    body_fetch_tracker: std::collections::HashMap<CryptoHash, (Instant, u8, VerifyingKey, Instant)>,
+    /// s63: parked bodies whose app validation returned `MissingData` (out-of-band
+    /// data not yet local) while their parent IS in the tree. Nothing else re-runs
+    /// validation for them, so [`tick_missing_data_retries`](Self::tick_missing_data_retries)
+    /// re-validates every [`MISSING_DATA_RETRY_INTERVAL`] and falls back to sync after
+    /// [`MISSING_DATA_RETRY_DEADLINE`]. Maps block_hash → (first_seen, last_try);
+    /// bounded by [`MISSING_DATA_RETRY_CAP`].
+    missing_data_retries: std::collections::HashMap<CryptoHash, (Instant, Instant)>,
     /// T1.3 observability: block hashes this replica phase-voted for on the header fast path
     /// *before* `app.validate_block` ran (validation is deferred until the body arrives in
     /// [`try_insert_body`](Self::try_insert_body)). Entries are removed as soon as the body's
@@ -178,6 +187,7 @@ impl<N: Network> HotStuff<N> {
             pending_bodies: PendingBodies::new(),
             pending_headers: PendingHeaders::new(),
             body_fetch_tracker: std::collections::HashMap::new(),
+            missing_data_retries: std::collections::HashMap::new(),
             header_voted: HashSet::new(),
             header_vote_invalid_count: 0,
             justify_fetch_tracker: std::collections::HashMap::new(),
@@ -2058,7 +2068,10 @@ impl<N: Network> HotStuff<N> {
             self.pending_headers.insert(block_hash, header);
             let inserted_from_push = match self.take_pushed_body(&block_hash) {
                 Some(block) => {
-                    let inserted = self.try_insert_body(block, block_tree, app)?;
+                    // Any non-insert (incl. MissingData) falls through to the
+                    // normal fetch, whose response re-validates the body.
+                    let inserted =
+                        self.try_insert_body(block, block_tree, app)? == BodyInsert::Inserted;
                     if inserted {
                         self.pending_headers.remove(&block_hash);
                         self.drain_deferred_bodies(block_tree, app)?;
@@ -2074,8 +2087,9 @@ impl<N: Network> HotStuff<N> {
                     block_hash,
                 };
                 self.sender_handle.request_block_data(*origin, req);
+                let now = Instant::now();
                 self.body_fetch_tracker
-                    .insert(block_hash, (Instant::now(), 0, *origin));
+                    .insert(block_hash, (now, 0, *origin, now));
             }
         }
 
@@ -2158,7 +2172,7 @@ impl<N: Network> HotStuff<N> {
                 resp.view.int(), self.view_info.view.int(), crate::logging::BodyFetchTraceId(block_hash.bytes()),
                 block.height.int(), crate::logging::BodyFetchTraceId(block.justify.block.bytes()), tracked_as_body,
                 tracked_as_justify, self.deferred_bodies.contains_key(&block_hash),
-                self.body_fetch_tracker.get(&block_hash).map(|(_, count, _)| *count));
+                self.body_fetch_tracker.get(&block_hash).map(|(_, count, _, _)| *count));
         }
         if !tracked_as_body && !tracked_as_justify {
             // L3 v2 (body push): an unsolicited pushed body can legitimately
@@ -2191,12 +2205,18 @@ impl<N: Network> HotStuff<N> {
             return Ok(());
         }
 
-        if self.try_insert_body(block.clone(), block_tree, app)? {
+        let outcome = self.try_insert_body(block.clone(), block_tree, app)?;
+        if outcome == BodyInsert::Inserted {
             self.pending_headers.remove(&block_hash);
             self.body_fetch_tracker.remove(&block_hash);
             self.justify_fetch_tracker.remove(&block_hash);
             self.drain_deferred_bodies(block_tree, app)?;
         } else {
+            // s63: MissingData (parent IS in the tree) parks exactly as before,
+            // but is also scheduled for re-validation so it cannot wedge.
+            if outcome == BodyInsert::MissingData {
+                self.note_missing_data(block_hash, Instant::now());
+            }
             // Parent state isn't available yet, so this body can't be inserted.
             // Before parking it, actively fetch the MISSING PARENT by hash so the
             // gap closes on its own instead of waiting for the 60s no-progress
@@ -2299,14 +2319,14 @@ impl<N: Network> HotStuff<N> {
                 || block.justify.is_correct(block_tree)?))
     }
 
-    /// Attempt to validate and insert a block body. Returns true on success, false if
-    /// the parent state isn't available yet.
+    /// Attempt to validate and insert a block body. See [`BodyInsert`] for the
+    /// outcomes; only `Inserted` means the block is now in the tree.
     fn try_insert_body<K: KVStore>(
         &mut self,
         block: Block,
         block_tree: &mut BlockTreeSingleton<K>,
         app: &mut impl App<K>,
-    ) -> Result<bool, HotStuffError> {
+    ) -> Result<BodyInsert, HotStuffError> {
         let parent_block = if block.justify.is_genesis_pc() {
             None
         } else {
@@ -2316,14 +2336,14 @@ impl<N: Network> HotStuff<N> {
         // parent exists. Keep orphans deferred until their ancestry can be
         // inspected and commit processing can follow the parent link.
         if parent_block.is_some_and(|parent| !block_tree.contains(parent)) {
-            return Ok(false);
+            return Ok(BodyInsert::Deferred);
         }
         if !self.body_metadata_is_correct(&block, block_tree)? {
-            return Ok(false);
+            return Ok(BodyInsert::Deferred);
         }
         let app_view = match block_tree.app_view(parent_block) {
             Ok(v) => v,
-            Err(_) => return Ok(false),
+            Err(_) => return Ok(BodyInsert::Deferred),
         };
         let validate_block_request = ValidateBlockRequest::new(&block, app_view);
         let validation = app.validate_block(validate_block_request);
@@ -2370,7 +2390,8 @@ impl<N: Network> HotStuff<N> {
             let _ = self
                 .phase_vote_collectors
                 .update_validator_sets(&validator_set_state);
-            Ok(true)
+            self.missing_data_retries.remove(&block.hash);
+            Ok(BodyInsert::Inserted)
         } else {
             // T1.3 metric: this replica phase-voted on the block's header before the app could
             // validate the body (the header-first fast-path relaxation), and the body has now
@@ -2386,8 +2407,31 @@ impl<N: Network> HotStuff<N> {
                 );
             }
             log::warn!("body validation failed for block hash={:?}", block.hash);
-            Ok(false)
+            Ok(if app_invalid { BodyInsert::Invalid } else { BodyInsert::MissingData })
         }
+    }
+
+    /// s63: start (or keep) re-validating a parked body whose validation returned
+    /// `MissingData` with its parent in the tree. Nothing else re-runs validation
+    /// for such a body (no parent fetch is armed, and `drain_deferred_bodies`
+    /// only runs after another insert or sync), which wedged a follower for 54 s
+    /// until the 60 s no-progress sync. `first_seen` is kept across re-parks so
+    /// the [`MISSING_DATA_RETRY_DEADLINE`] cannot be extended. At
+    /// [`MISSING_DATA_RETRY_CAP`] the body is not tracked and sync is requested.
+    fn note_missing_data(&mut self, hash: CryptoHash, now: Instant) {
+        if self.missing_data_retries.contains_key(&hash) {
+            return;
+        }
+        if self.missing_data_retries.len() >= MISSING_DATA_RETRY_CAP {
+            log::warn!(
+                "MissingData retry map full ({}); not tracking {} — falling back to sync",
+                MISSING_DATA_RETRY_CAP,
+                crate::logging::block_prefix(&hash)
+            );
+            self.sync_needed = true;
+            return;
+        }
+        self.missing_data_retries.insert(hash, (now, now));
     }
 
     /// After a successful body insertion, process any deferred bodies whose
@@ -2406,11 +2450,15 @@ impl<N: Network> HotStuff<N> {
                     Some(b) => b.clone(),
                     None => continue,
                 };
-                if self.try_insert_body(block, block_tree, app)? {
-                    self.deferred_bodies.remove(&hash);
-                    self.pending_headers.remove(&hash);
-                    self.body_fetch_tracker.remove(&hash);
-                    progress = true;
+                match self.try_insert_body(block, block_tree, app)? {
+                    BodyInsert::Inserted => {
+                        self.deferred_bodies.remove(&hash);
+                        self.pending_headers.remove(&hash);
+                        self.body_fetch_tracker.remove(&hash);
+                        progress = true;
+                    }
+                    BodyInsert::MissingData => self.note_missing_data(hash, Instant::now()),
+                    BodyInsert::Deferred | BodyInsert::Invalid => {}
                 }
             }
         }
@@ -2440,12 +2488,22 @@ impl<N: Network> HotStuff<N> {
             let Some(block) = self.deferred_bodies.get(&hash).cloned() else { continue };
             // Sync may have inserted this very body. Avoid duplicate insert,
             // which would append its hash to the parent's child list again.
-            if block_tree.contains(&hash) || self.try_insert_body(block, block_tree, app)? {
-                self.deferred_bodies.remove(&hash);
-                self.pending_headers.remove(&hash);
-                self.body_fetch_tracker.remove(&hash);
-                self.justify_fetch_tracker.remove(&hash);
-                self.header_voted.remove(&hash);
+            let outcome = if block_tree.contains(&hash) {
+                BodyInsert::Inserted
+            } else {
+                self.try_insert_body(block, block_tree, app)?
+            };
+            match outcome {
+                BodyInsert::Inserted => {
+                    self.deferred_bodies.remove(&hash);
+                    self.pending_headers.remove(&hash);
+                    self.body_fetch_tracker.remove(&hash);
+                    self.justify_fetch_tracker.remove(&hash);
+                    self.header_voted.remove(&hash);
+                    self.missing_data_retries.remove(&hash);
+                }
+                BodyInsert::MissingData => self.note_missing_data(hash, Instant::now()),
+                BodyInsert::Deferred | BodyInsert::Invalid => {}
             }
         }
         Ok(())
@@ -2470,10 +2528,13 @@ impl<N: Network> HotStuff<N> {
 
     #[cfg(test)]
     pub(crate) fn exhaust_body_fetch_for_test(&mut self, hash: &CryptoHash) {
-        let (last_request, retries, _) = self.body_fetch_tracker.get_mut(hash)
+        let (last_request, retries, _, first_request) = self.body_fetch_tracker.get_mut(hash)
             .expect("fixture must first authenticate a real proposal header");
-        *last_request = Instant::now() - BODY_RETRY_INTERVAL * 2;
+        let now = Instant::now();
+        *last_request = now - BODY_RETRY_INTERVAL * 2;
         *retries = MAX_BODY_RETRIES_TOTAL;
+        // s63: exhaustion also requires the wall-clock budget to be spent.
+        *first_request = now - BODY_FETCH_DEADLINE - BODY_RETRY_INTERVAL;
     }
 
     #[cfg(test)]
@@ -2482,20 +2543,44 @@ impl<N: Network> HotStuff<N> {
     }
 
     /// Re-request bodies for stale pending headers; trigger block sync after max retries.
-    /// The proposer is asked first (`MAX_BODY_RETRIES` attempts), then the request
-    /// rotates across the other committed validators.
+    /// Fast phase: the proposer is asked first (`MAX_BODY_RETRIES` attempts), then the
+    /// request rotates across the other committed validators, every
+    /// `BODY_RETRY_INTERVAL`, for `MAX_BODY_RETRIES_TOTAL` attempts. s63 slow phase:
+    /// then every `BODY_RETRY_SLOW_INTERVAL`, alternating proposer / others, until
+    /// `BODY_FETCH_DEADLINE` since the first request; only then fall back to sync.
     pub(crate) fn tick_pending_body_retries<K: KVStore>(
         &mut self,
         block_tree: &BlockTreeSingleton<K>,
     ) {
-        let now = Instant::now();
+        self.tick_pending_body_retries_at(block_tree, Instant::now());
+    }
+
+    /// [`tick_pending_body_retries`](Self::tick_pending_body_retries) with an
+    /// injectable clock (test seam).
+    pub(crate) fn tick_pending_body_retries_at<K: KVStore>(
+        &mut self,
+        block_tree: &BlockTreeSingleton<K>,
+        now: Instant,
+    ) {
         let me = self.config.keypair.public();
         let mut expired = Vec::new();
-        for (hash, (last_req, count, origin)) in self.body_fetch_tracker.iter_mut() {
-            if now.duration_since(*last_req) < BODY_RETRY_INTERVAL {
+        let mut arrived = Vec::new();
+        for (hash, (last_req, count, origin, first_req)) in self.body_fetch_tracker.iter_mut() {
+            // s63: after the fast attempts, a slow phase runs until the
+            // wall-clock budget since the FIRST request is spent.
+            let slow = *count >= MAX_BODY_RETRIES_TOTAL;
+            let deadline_spent = now.duration_since(*first_req) >= BODY_FETCH_DEADLINE;
+            let interval = if slow { BODY_RETRY_SLOW_INTERVAL } else { BODY_RETRY_INTERVAL };
+            if now.duration_since(*last_req) < interval && !(slow && deadline_spent) {
                 continue;
             }
-            if *count >= MAX_BODY_RETRIES_TOTAL {
+            if slow && block_tree.contains(hash) {
+                // Inserted by another path (block sync) during the extended
+                // budget: stop quietly — no request, no sync fallback.
+                arrived.push(*hash);
+                continue;
+            }
+            if slow && deadline_spent {
                 log::warn!(
                     "body fetch exhausted {} retries (proposer + rotation) for {:?} — falling back to sync",
                     MAX_BODY_RETRIES_TOTAL,
@@ -2521,9 +2606,12 @@ impl<N: Network> HotStuff<N> {
                             .collect()
                     })
                     .unwrap_or_default();
-                let Some(target) =
+                let target = if slow {
+                    Some(slow_body_fetch_target(*count - MAX_BODY_RETRIES_TOTAL, origin, &others))
+                } else {
                     rotated_body_fetch_target(*count, MAX_BODY_RETRIES, origin, &others)
-                else {
+                };
+                let Some(target) = target else {
                     log::warn!(
                         "body fetch has no remaining targets for {:?} — falling back to sync",
                         hash
@@ -2538,15 +2626,21 @@ impl<N: Network> HotStuff<N> {
                 };
                 self.sender_handle.request_block_data(target, req);
                 *last_req = now;
-                *count += 1;
+                *count = count.saturating_add(1);
                 log::debug!(
-                    "body fetch retry {} (target rotation) for {:?}",
+                    "body fetch retry {} ({}) for {:?}",
                     count,
+                    if slow { "slow phase" } else { "target rotation" },
                     hash
                 );
             } else {
                 expired.push(*hash);
             }
+        }
+        for hash in &arrived {
+            self.body_fetch_tracker.remove(hash);
+            self.pending_headers.remove(hash);
+            self.header_voted.remove(hash);
         }
         for hash in &expired {
             self.body_fetch_tracker.remove(hash);
@@ -2562,6 +2656,97 @@ impl<N: Network> HotStuff<N> {
 
     pub(crate) fn has_pending_body_fetches(&self) -> bool {
         !self.body_fetch_tracker.is_empty()
+    }
+
+    pub(crate) fn has_missing_data_retries(&self) -> bool {
+        !self.missing_data_retries.is_empty()
+    }
+
+    /// s63: re-validate parked `MissingData` bodies (see
+    /// [`note_missing_data`](Self::note_missing_data)). Runs on the body-retry
+    /// tick cadence; each body is re-validated at most once per
+    /// [`MISSING_DATA_RETRY_INTERVAL`] (the app does a hot local retry plus a
+    /// short bounded DA pull inside `validate_block`, so re-calling it re-pulls).
+    /// On success the body is inserted and parked children are drained. After
+    /// [`MISSING_DATA_RETRY_DEADLINE`] of `MissingData` the body stays parked,
+    /// is no longer re-validated here, and block sync is requested.
+    pub(crate) fn tick_missing_data_retries<K: KVStore>(
+        &mut self,
+        block_tree: &mut BlockTreeSingleton<K>,
+        app: &mut impl App<K>,
+    ) -> Result<(), HotStuffError> {
+        if self.missing_data_retries.is_empty() {
+            return Ok(());
+        }
+        self.tick_missing_data_retries_at(block_tree, app, Instant::now())
+    }
+
+    /// [`tick_missing_data_retries`](Self::tick_missing_data_retries) with an
+    /// injectable clock (test seam).
+    pub(crate) fn tick_missing_data_retries_at<K: KVStore>(
+        &mut self,
+        block_tree: &mut BlockTreeSingleton<K>,
+        app: &mut impl App<K>,
+        now: Instant,
+    ) -> Result<(), HotStuffError> {
+        let hashes: Vec<CryptoHash> = self.missing_data_retries.keys().cloned().collect();
+        let mut inserted_any = false;
+        for hash in hashes {
+            // An earlier iteration's insert may already have resolved this one.
+            let Some(&(first_seen, last_try)) = self.missing_data_retries.get(&hash) else {
+                continue;
+            };
+            let Some(block) = self.deferred_bodies.get(&hash).cloned() else {
+                // No longer parked: resolved or dropped by another path.
+                self.missing_data_retries.remove(&hash);
+                continue;
+            };
+            if block_tree.contains(&hash) {
+                // Inserted by block sync: settle exactly like the post-sync poll.
+                self.missing_data_retries.remove(&hash);
+                self.deferred_bodies.remove(&hash);
+                self.pending_headers.remove(&hash);
+                self.body_fetch_tracker.remove(&hash);
+                self.justify_fetch_tracker.remove(&hash);
+                self.header_voted.remove(&hash);
+                continue;
+            }
+            if now.duration_since(last_try) < MISSING_DATA_RETRY_INTERVAL {
+                continue;
+            }
+            match self.try_insert_body(block, block_tree, app)? {
+                BodyInsert::Inserted => {
+                    // `try_insert_body` already cleared the retry entry.
+                    self.deferred_bodies.remove(&hash);
+                    self.pending_headers.remove(&hash);
+                    self.body_fetch_tracker.remove(&hash);
+                    self.justify_fetch_tracker.remove(&hash);
+                    inserted_any = true;
+                }
+                BodyInsert::MissingData => {
+                    if now.duration_since(first_seen) >= MISSING_DATA_RETRY_DEADLINE {
+                        log::warn!(
+                            "body validation still MissingData after {:?} for {} — falling back to sync",
+                            MISSING_DATA_RETRY_DEADLINE,
+                            crate::logging::block_prefix(&hash)
+                        );
+                        self.missing_data_retries.remove(&hash);
+                        self.sync_needed = true;
+                    } else if let Some(entry) = self.missing_data_retries.get_mut(&hash) {
+                        entry.1 = now;
+                    }
+                }
+                // Parent state gone or the app now rejects it: back to the
+                // pre-s63 handling (stays parked, no further re-validation).
+                BodyInsert::Deferred | BodyInsert::Invalid => {
+                    self.missing_data_retries.remove(&hash);
+                }
+            }
+        }
+        if inserted_any {
+            self.drain_deferred_bodies(block_tree, app)?;
+        }
+        Ok(())
     }
 
     /// S426: send a by-hash `BlockDataRequest` for an unknown justify block to the
@@ -2774,6 +2959,23 @@ impl<N: Network> HotStuff<N> {
 
 pub(crate) const MAX_DEFERRED_SYNC_RETRIES_PER_TICK: usize = 8;
 
+/// Outcome of [`HotStuff::try_insert_body`]. s63: `MissingData` is split out
+/// from the old `false` so callers can schedule re-validation; `Deferred` and
+/// `Invalid` keep exactly the pre-s63 handling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BodyInsert {
+    /// Validated and inserted into the block tree.
+    Inserted,
+    /// Parent not in the tree, metadata not authenticated, or parent state
+    /// unavailable; the app was not asked.
+    Deferred,
+    /// The app rejected the block.
+    Invalid,
+    /// The app lacks out-of-band data (e.g. native action bodies); the block is
+    /// not invalid and validation should be retried.
+    MissingData,
+}
+
 /// Cadence of body-fetch re-requests for a stale pending header. S391: was
 /// 300ms — with 3 proposer attempts a single lost first request cost 900ms
 /// (nearly two 500ms view timeouts) before any other validator was asked.
@@ -2786,6 +2988,24 @@ pub(crate) const MAX_BODY_RETRIES: u8 = 2;
 /// rotated across the other validators (Sprint 3 T3 — a non-serving proposer
 /// must not defeat the fetch when another validator holds the body).
 pub(crate) const MAX_BODY_RETRIES_TOTAL: u8 = 9;
+/// s63 slow phase: once the [`MAX_BODY_RETRIES_TOTAL`] fast attempts are
+/// spent, keep re-requesting at this cadence (alternating proposer / other
+/// validators) until [`BODY_FETCH_DEADLINE`].
+pub(crate) const BODY_RETRY_SLOW_INTERVAL: Duration = Duration::from_millis(500);
+/// s63 wall-clock body-fetch budget, measured from the FIRST request. In all 10
+/// observed exhaustions the body existed and reached the requester within
+/// 3.45 s of the old ~1 s give-up (serving consensus thread blocked 1-4 s,
+/// transport delays 0.5-3.4 s); giving up at ~1 s sent every one of them to
+/// block sync. Give-up now requires BOTH the fast attempt count AND this budget.
+pub(crate) const BODY_FETCH_DEADLINE: Duration = Duration::from_secs(4);
+/// s63: re-validation cadence for parked `MissingData` bodies.
+pub(crate) const MISSING_DATA_RETRY_INTERVAL: Duration = Duration::from_millis(500);
+/// s63: how long a parked body may keep returning `MissingData` before this
+/// replica stops re-validating it and falls back to block sync.
+pub(crate) const MISSING_DATA_RETRY_DEADLINE: Duration = Duration::from_secs(3);
+/// s63: bound on tracked `MissingData` retries (entries are two `Instant`s;
+/// bodies themselves live in `deferred_bodies`).
+pub(crate) const MISSING_DATA_RETRY_CAP: usize = 64;
 
 /// L3 v2 (body push): hard cap on the effective push threshold, enforced at
 /// the decision point regardless of the env value. Transport safety: a legacy
@@ -2857,6 +3077,23 @@ pub(crate) fn rotated_body_fetch_target(
     }
     let idx = (attempt - max_origin_retries) as usize % others.len();
     Some(others[idx])
+}
+
+/// s63 slow-phase target for slow attempt `slow_attempt` (0-based, counted
+/// after the [`MAX_BODY_RETRIES_TOTAL`] fast attempts): even attempts go to
+/// `origin` (the proposer — the likely holder; in a 3-validator net the only
+/// "other" is the other follower, which usually lacks the body), odd attempts
+/// rotate across the other validators.
+pub(crate) fn slow_body_fetch_target(
+    slow_attempt: u8,
+    origin: &VerifyingKey,
+    others: &[VerifyingKey],
+) -> VerifyingKey {
+    if slow_attempt % 2 == 0 || others.is_empty() {
+        *origin
+    } else {
+        others[(slow_attempt / 2) as usize % others.len()]
+    }
 }
 
 #[cfg(test)]
@@ -3398,5 +3635,359 @@ mod sync_recovery_tests {
         assert!(!hotstuff.has_deferred_sync_retries());
         assert_eq!(hotstuff.deferred_bodies.len(), count);
         assert!(hotstuff.deferred_bodies.keys().all(|h| !tree.contains(h)));
+    }
+}
+
+/// s63 regression tests: wall-clock body-fetch budget (Fix 1) and `MissingData`
+/// validation retry (Fix 2). Time is injected through the `_at(now)` tick seams.
+#[cfg(test)]
+mod s63_body_fetch_tests {
+    use super::*;
+    use crate::hotstuff::header_fast_path_regression_test::{
+        generic_pc, hotstuff_at, proposer_for, signing_keys, steady_block_tree, validator_set,
+        MemKV,
+    };
+    use crate::hotstuff::types::PhaseCertificate;
+    use crate::networking::messages::Message;
+    use crate::types::data_types::Data;
+    use crate::types::update_sets::ValidatorSetUpdates;
+    use crate::types::validator_set::ValidatorSet;
+    use std::sync::{Arc, Mutex};
+
+    /// Records the TARGET of every dedicated-protocol body request.
+    #[derive(Clone, Default)]
+    struct TargetNet {
+        requests: Arc<Mutex<Vec<(VerifyingKey, CryptoHash)>>>,
+    }
+    impl Network for TargetNet {
+        fn init_validator_set(&mut self, _: ValidatorSet) {}
+        fn update_validator_set(&mut self, _: ValidatorSetUpdates) {}
+        fn broadcast(&mut self, _: Message) {}
+        fn send(&mut self, _: VerifyingKey, _: Message) {}
+        fn recv(&mut self) -> Option<(VerifyingKey, Message)> {
+            None
+        }
+        fn request_block_data(&mut self, peer: VerifyingKey, request: BlockDataRequest) {
+            self.requests.lock().unwrap().push((peer, request.block_hash));
+        }
+    }
+    impl TargetNet {
+        fn take(&self) -> Vec<VerifyingKey> {
+            self.requests.lock().unwrap().drain(..).map(|(peer, _)| peer).collect()
+        }
+    }
+
+    /// App whose `validate_block` returns `MissingData` for the first
+    /// `missing_left` calls (then `Valid`), or always `Invalid`.
+    struct ScriptedApp {
+        calls: usize,
+        missing_left: usize,
+        invalid: bool,
+    }
+    impl App<MemKV> for ScriptedApp {
+        fn produce_block(&mut self, _: ProduceBlockRequest<MemKV>) -> ProduceBlockResponse {
+            unreachable!()
+        }
+        fn validate_block_for_sync(&mut self, _: ValidateBlockRequest<MemKV>) -> ValidateBlockResponse {
+            unreachable!("HotStuff body path uses normal validation")
+        }
+        fn validate_block(&mut self, _: ValidateBlockRequest<MemKV>) -> ValidateBlockResponse {
+            self.calls += 1;
+            if self.invalid {
+                ValidateBlockResponse::Invalid
+            } else if self.missing_left > 0 {
+                self.missing_left -= 1;
+                ValidateBlockResponse::MissingData
+            } else {
+                ValidateBlockResponse::Valid { app_state_updates: None, validator_set_updates: None }
+            }
+        }
+    }
+
+    struct FetchFixture {
+        hotstuff: HotStuff<TargetNet>,
+        net: TargetNet,
+        tree: BlockTreeSingleton<MemKV>,
+        hash: CryptoHash,
+        origin: VerifyingKey,
+        others: Vec<VerifyingKey>,
+    }
+
+    /// A follower that received a real proposal header (so the body fetch is
+    /// armed exactly as in production), with the tracker pinned to
+    /// `(t0, count, origin, first)` for deterministic timing.
+    fn fetch_fixture(t0: Instant, count: u8, first: Instant) -> FetchFixture {
+        let keys = signing_keys(&[1, 2, 3, 4]);
+        let set = validator_set(&keys);
+        let (mut tree, vss) = steady_block_tree(&set);
+        let view = ViewNumber::new(1);
+        let origin = proposer_for(view, &keys, &vss, &tree);
+        let local = keys.iter().find(|k| k.verifying_key() != origin).unwrap().clone();
+        let me = local.verifying_key();
+        let net = TargetNet::default();
+        let mut hotstuff = HotStuff::new(
+            HotStuffConfiguration { chain_id: ChainID::new(0), keypair: Keypair::new(local) },
+            ViewInfo::new(view, Instant::now() + Duration::from_secs(3600)),
+            SenderHandle::new(net.clone()),
+            ValidatorSetUpdateHandle::new(net.clone()),
+            vss,
+            None,
+        );
+        let block = Block::new(BlockHeight::new(0), PhaseCertificate::genesis_pc(),
+            CryptoHash::new([71; 32]), Data::new(vec![]));
+        let header = ProposalHeader {
+            chain_id: ChainID::new(0), view, block_hash: block.hash, height: block.height,
+            data_hash: block.data_hash, justify: block.justify.clone(),
+            tc: None, nec: None, has_validator_set_updates: false,
+        };
+        let mut app = ScriptedApp { calls: 0, missing_left: 0, invalid: false };
+        hotstuff.on_receive_msg(header.into(), &origin, &mut tree, &mut app).unwrap();
+        assert_eq!(net.take(), vec![origin], "initial request goes to the proposer");
+        *hotstuff.body_fetch_tracker.get_mut(&block.hash).expect("fetch armed") =
+            (t0, count, origin, first);
+        // Same derivation (and order) as the tick.
+        let others = tree.committed_validator_set().unwrap().validators()
+            .filter(|vk| **vk != me && **vk != origin).cloned().collect();
+        FetchFixture { hotstuff, net, tree, hash: block.hash, origin, others }
+    }
+
+    impl FetchFixture {
+        fn tick(&mut self, now: Instant) -> Vec<VerifyingKey> {
+            self.hotstuff.tick_pending_body_retries_at(&self.tree, now);
+            self.net.take()
+        }
+        fn tracked(&self) -> bool {
+            self.hotstuff.body_fetch_tracker.contains_key(&self.hash)
+        }
+    }
+
+    const MS: fn(u64) -> Duration = Duration::from_millis;
+
+    /// Test 1: the fast phase is unchanged (9 attempts at 100 ms: 2 at the
+    /// proposer, then rotation); after that the fetch does NOT give up before
+    /// 4 s — it keeps re-requesting every 500 ms, alternating proposer / others.
+    #[test]
+    fn body_fetch_continues_at_slow_cadence_until_wall_clock_deadline() {
+        let t0 = Instant::now();
+        let mut f = fetch_fixture(t0, 0, t0);
+        assert_eq!(f.others.len(), 2);
+        for k in 1..=MAX_BODY_RETRIES_TOTAL as u64 {
+            let expected = if k <= MAX_BODY_RETRIES as u64 {
+                f.origin
+            } else {
+                f.others[(k - 1 - MAX_BODY_RETRIES as u64) as usize % f.others.len()]
+            };
+            assert_eq!(f.tick(t0 + MS(100 * k)), vec![expected], "fast attempt {k}");
+        }
+        // 9 attempts spent at t0+900ms. Old behaviour gave up at the next tick.
+        assert!(f.tick(t0 + MS(1000)).is_empty());
+        assert!(f.tracked(), "must not give up after 9 attempts while < 4 s elapsed");
+        assert!(!f.hotstuff.take_sync_needed());
+        assert!(f.tick(t0 + MS(1399)).is_empty(), "slow cadence is 500 ms");
+        let slow = [
+            (1400, f.origin), (1900, f.others[0]), (2400, f.origin),
+            (2900, f.others[1]), (3400, f.origin), (3900, f.others[0]),
+        ];
+        for (at, target) in slow {
+            assert_eq!(f.tick(t0 + MS(at - 1)), vec![], "not yet due at {}ms", at - 1);
+            assert_eq!(f.tick(t0 + MS(at)), vec![target], "slow attempt at {at}ms");
+            assert!(f.tracked());
+        }
+        assert!(f.tick(t0 + MS(3999)).is_empty());
+        assert!(f.tracked(), "deadline not reached at 3.999 s");
+        assert!(!f.hotstuff.take_sync_needed());
+        // Test 2 (first half): deadline reached with the attempt count spent.
+        assert!(f.tick(t0 + MS(4000)).is_empty(), "give-up sends no request");
+        assert!(!f.tracked());
+        assert!(!f.hotstuff.pending_headers.contains_key(&f.hash));
+        assert!(f.hotstuff.take_sync_needed(), "falls back to sync");
+    }
+
+    /// Test 2: give-up requires BOTH `attempts >= MAX_BODY_RETRIES_TOTAL` AND
+    /// `>= BODY_FETCH_DEADLINE` since the first request.
+    #[test]
+    fn body_fetch_gives_up_only_when_attempts_and_deadline_are_both_spent() {
+        // Attempts spent, deadline spent -> exhausted at once, even though the
+        // slow interval since the last request has not elapsed.
+        let t0 = Instant::now();
+        let mut f = fetch_fixture(t0 + MS(3900), MAX_BODY_RETRIES_TOTAL + 6, t0);
+        assert!(f.tick(t0 + BODY_FETCH_DEADLINE).is_empty());
+        assert!(!f.tracked());
+        assert!(f.hotstuff.take_sync_needed());
+
+        // Deadline long spent but attempts NOT spent -> keep the fast phase.
+        let t0 = Instant::now();
+        let first = t0.checked_sub(Duration::from_secs(10)).unwrap();
+        let mut f = fetch_fixture(t0, 3, first);
+        assert_eq!(f.tick(t0 + MS(100)), vec![f.others[1]], "rotation continues");
+        assert!(f.tracked());
+        assert!(!f.hotstuff.take_sync_needed());
+        assert_eq!(f.hotstuff.body_fetch_tracker[&f.hash].1, 4);
+    }
+
+    /// Slow-phase retries stop quietly once the block reached the tree by
+    /// another path (e.g. block sync) — no wasted requests, no sync fallback.
+    #[test]
+    fn slow_phase_drops_fetch_once_block_is_in_tree() {
+        let t0 = Instant::now();
+        let mut f = fetch_fixture(t0, MAX_BODY_RETRIES_TOTAL, t0);
+        let block = Block::new(BlockHeight::new(0), PhaseCertificate::genesis_pc(),
+            CryptoHash::new([71; 32]), Data::new(vec![]));
+        f.tree.insert(&block, None, None).unwrap();
+        assert!(f.tick(t0 + BODY_RETRY_SLOW_INTERVAL).is_empty());
+        assert!(!f.tracked());
+        assert!(!f.hotstuff.pending_headers.contains_key(&f.hash));
+        assert!(!f.hotstuff.take_sync_needed());
+    }
+
+    /// The budget must cover the observed s63 lateness (<= 3.45 s after the
+    /// old ~1 s give-up would have needed ~4.45 s; 4 s saved all 10 because the
+    /// earliest-arriving copies landed well inside it) and outlast the fast phase.
+    #[test]
+    fn slow_phase_constants_are_consistent() {
+        assert!(BODY_FETCH_DEADLINE > BODY_RETRY_INTERVAL * MAX_BODY_RETRIES_TOTAL as u32);
+        assert!(BODY_RETRY_SLOW_INTERVAL > BODY_RETRY_INTERVAL);
+        assert!(BODY_FETCH_DEADLINE >= Duration::from_millis(3500));
+    }
+
+    struct MissingFixture {
+        hotstuff: HotStuff<crate::hotstuff::header_fast_path_regression_test::NullNetwork>,
+        tree: BlockTreeSingleton<MemKV>,
+        parent: Block,
+        child: Block,
+        origin: VerifyingKey,
+        view: ViewNumber,
+    }
+
+    fn missing_fixture() -> MissingFixture {
+        let keys = signing_keys(&[1, 2, 3, 4]);
+        let set = validator_set(&keys);
+        let (tree, vss) = steady_block_tree(&set);
+        let view = ViewNumber::new(4);
+        let hotstuff = hotstuff_at(view, keys[0].clone(), vss);
+        let parent = Block::new(BlockHeight::new(0), PhaseCertificate::genesis_pc(),
+            CryptoHash::new([31; 32]), Data::new(vec![]));
+        let child = Block::new(BlockHeight::new(1),
+            generic_pc(ViewNumber::new(1), parent.hash, &keys, &set),
+            CryptoHash::new([32; 32]), Data::new(vec![]));
+        MissingFixture { hotstuff, tree, parent, child, origin: keys[1].verifying_key(), view }
+    }
+
+    impl MissingFixture {
+        /// Deliver `block` through the tracked (by-hash) body-response path.
+        fn deliver(&mut self, block: &Block, app: &mut ScriptedApp) {
+            self.hotstuff.justify_fetch_tracker
+                .insert(block.hash, (Instant::now(), 0, self.origin, self.view));
+            self.hotstuff.on_receive_msg(
+                BlockDataResponse { view: self.view, block: block.clone() }.into(),
+                &self.origin, &mut self.tree, app).unwrap();
+        }
+        fn tick(&mut self, app: &mut ScriptedApp, now: Instant) {
+            self.hotstuff.tick_missing_data_retries_at(&mut self.tree, app, now).unwrap();
+        }
+    }
+
+    /// Test 3: MissingData then Valid -> the retry tick inserts the body, and
+    /// the child that parked behind it ("parent already parked") is drained.
+    #[test]
+    fn missing_data_body_is_inserted_by_retry_tick_and_child_drains() {
+        let mut f = missing_fixture();
+        let mut app = ScriptedApp { calls: 0, missing_left: 1, invalid: false };
+        let t = Instant::now();
+        let (parent, child) = (f.parent.clone(), f.child.clone());
+        f.deliver(&parent, &mut app);
+        assert_eq!(app.calls, 1);
+        assert!(!f.tree.contains(&parent.hash));
+        assert!(f.hotstuff.deferred_bodies.contains_key(&parent.hash), "still parked as today");
+        assert!(f.hotstuff.missing_data_retries.contains_key(&parent.hash));
+        f.deliver(&child, &mut app);
+        assert_eq!(app.calls, 1, "child parks behind its parked parent");
+        assert!(f.hotstuff.deferred_bodies.contains_key(&child.hash));
+        assert!(!f.hotstuff.missing_data_retries.contains_key(&child.hash),
+            "only MissingData outcomes are retried");
+
+        f.tick(&mut app, t + MS(400));
+        assert_eq!(app.calls, 1, "retry is throttled to the 500 ms cadence");
+        f.tick(&mut app, Instant::now() + MISSING_DATA_RETRY_INTERVAL);
+        assert!(f.tree.contains(&parent.hash) && f.tree.contains(&child.hash));
+        assert_eq!(app.calls, 3);
+        assert!(f.hotstuff.deferred_bodies.is_empty());
+        assert!(f.hotstuff.missing_data_retries.is_empty());
+        assert!(!f.hotstuff.take_sync_needed());
+        assert_eq!(f.tree.highest_view_voted().unwrap(), None, "recovery must not vote");
+    }
+
+    /// Test 4: a body that stays MissingData for >= 3 s flags sync and is no
+    /// longer re-validated (it stays parked for the sync path).
+    #[test]
+    fn persistent_missing_data_falls_back_to_sync_and_stops_retrying() {
+        let mut f = missing_fixture();
+        let mut app = ScriptedApp { calls: 0, missing_left: usize::MAX, invalid: false };
+        let parent = f.parent.clone();
+        f.deliver(&parent, &mut app);
+        let t = Instant::now();
+        assert!(!f.hotstuff.take_sync_needed());
+        for k in 1..=4u32 {
+            f.tick(&mut app, t + MS(600) * k);
+            assert_eq!(app.calls, 1 + k as usize, "retry {k}");
+            assert!(!f.hotstuff.take_sync_needed(), "no sync before 3 s (retry {k})");
+            assert!(f.hotstuff.missing_data_retries.contains_key(&parent.hash));
+        }
+        f.tick(&mut app, t + MS(3000));
+        assert_eq!(app.calls, 6);
+        assert!(f.hotstuff.take_sync_needed(), ">= 3 s of MissingData falls back to sync");
+        assert!(!f.hotstuff.missing_data_retries.contains_key(&parent.hash));
+        assert!(f.hotstuff.deferred_bodies.contains_key(&parent.hash));
+        f.tick(&mut app, t + Duration::from_secs(10));
+        assert_eq!(app.calls, 6, "no longer retried");
+    }
+
+    /// Test 5: Invalid bodies are parked as before but NOT retried.
+    #[test]
+    fn invalid_body_is_not_added_to_missing_data_retries() {
+        let mut f = missing_fixture();
+        let mut app = ScriptedApp { calls: 0, missing_left: 0, invalid: true };
+        let parent = f.parent.clone();
+        f.deliver(&parent, &mut app);
+        assert_eq!(app.calls, 1);
+        assert!(f.hotstuff.deferred_bodies.contains_key(&parent.hash));
+        assert!(f.hotstuff.missing_data_retries.is_empty());
+        f.tick(&mut app, Instant::now() + Duration::from_secs(1));
+        assert_eq!(app.calls, 1);
+        assert!(!f.hotstuff.take_sync_needed());
+    }
+
+    /// A tracked MissingData body later inserted by another path (block sync)
+    /// is dropped from the retry map without re-validation or a sync flag.
+    #[test]
+    fn missing_data_entry_dropped_when_block_arrives_by_other_path() {
+        let mut f = missing_fixture();
+        let mut app = ScriptedApp { calls: 0, missing_left: usize::MAX, invalid: false };
+        let parent = f.parent.clone();
+        f.deliver(&parent, &mut app);
+        assert!(f.hotstuff.missing_data_retries.contains_key(&parent.hash));
+        f.tree.insert(&parent, None, None).unwrap();
+        f.tick(&mut app, Instant::now() + MISSING_DATA_RETRY_INTERVAL);
+        assert_eq!(app.calls, 1);
+        assert!(f.hotstuff.missing_data_retries.is_empty());
+        assert!(!f.hotstuff.take_sync_needed());
+    }
+
+    /// The retry map is bounded: at the cap a new MissingData body is not
+    /// tracked and sync is flagged instead (never unbounded growth).
+    #[test]
+    fn missing_data_retry_map_is_bounded() {
+        let mut f = missing_fixture();
+        let now = Instant::now();
+        for i in 0..MISSING_DATA_RETRY_CAP {
+            f.hotstuff.missing_data_retries
+                .insert(CryptoHash::new([i as u8; 32]), (now, now));
+        }
+        let mut app = ScriptedApp { calls: 0, missing_left: 1, invalid: false };
+        let parent = f.parent.clone();
+        f.deliver(&parent, &mut app);
+        assert_eq!(f.hotstuff.missing_data_retries.len(), MISSING_DATA_RETRY_CAP);
+        assert!(!f.hotstuff.missing_data_retries.contains_key(&parent.hash));
+        assert!(f.hotstuff.take_sync_needed());
     }
 }
