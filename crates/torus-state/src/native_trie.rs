@@ -1123,6 +1123,43 @@ pub struct NativeTrieApply {
     pub(crate) member_finals: Vec<(u16, Members, usize)>,
 }
 
+/// Propagate changed leaves upward in canonical parent order. The fixed-level
+/// BTreeMap range is index-sorted, and index / 2 is monotone, so adjacent
+/// deduplication gives the same ascending parents as the former BTreeSet.
+/// Reuse the scratch allocation across levels; finish collection before
+/// inserting at the next level. Sibling reads remain left then right.
+fn propagate_changed_nodes(
+    changed: &mut BTreeMap<(usize, usize), B256>,
+    mut read_sibling: impl FnMut(usize, usize) -> Result<B256, StateError>,
+) -> Result<(), StateError> {
+    let mut parents = Vec::new();
+    for level in (1..=TREE_DEPTH).rev() {
+        parents.clear();
+        parents.extend(
+            changed
+                .range((level, 0)..(level + 1, 0))
+                .map(|(&(_, i), _)| i / 2),
+        );
+        parents.dedup();
+        for &p in &parents {
+            let left = match changed.get(&(level, 2 * p)) {
+                Some(v) => *v,
+                None => read_sibling(level, 2 * p)?,
+            };
+            let right = match changed.get(&(level, 2 * p + 1)) {
+                Some(v) => *v,
+                None => read_sibling(level, 2 * p + 1)?,
+            };
+            changed.insert((level - 1, p), hash_pair(&left, &right));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "native_trie_parent_tests.rs"]
+mod parent_tests;
+
 /// rank-root round-3: THE unified native-trie append. Computes all mirror + tree
 /// ops fallibly (nothing appended on `Err`), optionally using the trie node
 /// cache (sibling reads from RAM + clean-write elision), the bucket-member cache
@@ -1270,24 +1307,9 @@ where
 
     // 7. Propagate up, level by level (serial → deterministic). A parent
     //    recomputes from its changed children and its unchanged siblings.
-    for level in (1..=TREE_DEPTH).rev() {
-        let level_indices: Vec<usize> = changed
-            .range((level, 0)..(level + 1, 0))
-            .map(|(&(_, i), _)| i)
-            .collect();
-        let parents: BTreeSet<usize> = level_indices.iter().map(|i| i / 2).collect();
-        for p in parents {
-            let left = match changed.get(&(level, 2 * p)) {
-                Some(v) => *v,
-                None => sibling_node(db, trie_inner, level, 2 * p, &defaults)?,
-            };
-            let right = match changed.get(&(level, 2 * p + 1)) {
-                Some(v) => *v,
-                None => sibling_node(db, trie_inner, level, 2 * p + 1, &defaults)?,
-            };
-            changed.insert((level - 1, p), hash_pair(&left, &right));
-        }
-    }
+    propagate_changed_nodes(&mut changed, |level, index| {
+        sibling_node(db, trie_inner, level, index, &defaults)
+    })?;
 
     // 8. Emit tree-node ops (delete-to-default discipline) + root marker.
     for ((level, index), value) in &changed {
