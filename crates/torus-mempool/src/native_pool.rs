@@ -237,15 +237,18 @@ impl NativePool {
     /// — the incremental [`SortKey`] iteration order (T2.3), no re-sort.
     /// Excess actions from rate-limited senders stay in pool for next block.
     pub fn drain(&mut self, limit: usize) -> Vec<SignedNativeAction> {
+        if self.max_per_block == 0 {
+            return Vec::new();
+        }
         let mut block_counts: HashMap<Address, usize> = HashMap::new();
         let mut take_keys: Vec<SortKey> = Vec::new();
         for (key, entry) in &self.entries {
             if take_keys.len() >= limit {
                 break;
             }
-            let count = block_counts.get(&entry.sender).copied().unwrap_or(0);
-            if count < self.max_per_block {
-                *block_counts.entry(entry.sender).or_insert(0) += 1;
+            let count = block_counts.entry(entry.sender).or_insert(0);
+            if *count < self.max_per_block {
+                *count += 1;
                 take_keys.push(*key);
             }
         }
@@ -265,6 +268,9 @@ impl NativePool {
     /// Uses the same priority order as `drain`. Read-only (T2.3): callers select
     /// from a shared snapshot under the read lock — no sort, no index rebuild.
     pub fn select_for_block(&self, limit: usize) -> Vec<SignedNativeAction> {
+        if self.max_per_block == 0 {
+            return Vec::new();
+        }
         let mut block_counts: HashMap<Address, usize> = HashMap::new();
         let mut selected = Vec::new();
 
@@ -272,9 +278,9 @@ impl NativePool {
             if selected.len() >= limit {
                 break;
             }
-            let count = block_counts.get(&entry.sender).copied().unwrap_or(0);
-            if count < self.max_per_block {
-                *block_counts.entry(entry.sender).or_insert(0) += 1;
+            let count = block_counts.entry(entry.sender).or_insert(0);
+            if *count < self.max_per_block {
+                *count += 1;
                 selected.push(entry.action.clone());
             }
         }
@@ -314,6 +320,9 @@ impl NativePool {
         bytes_cap: usize,
         orders_cap: usize,
     ) -> Vec<(Address, SignedNativeAction)> {
+        if self.max_per_block == 0 {
+            return Vec::new();
+        }
         let mut block_counts: HashMap<Address, usize> = HashMap::new();
         let mut selected = Vec::new();
         let mut bytes_used: usize = 0;
@@ -343,9 +352,9 @@ impl NativePool {
                 // first and count 1 each, so cancels-first is preserved.
                 break;
             }
-            let count = block_counts.get(&entry.sender).copied().unwrap_or(0);
-            if count < self.max_per_block {
-                *block_counts.entry(entry.sender).or_insert(0) += 1;
+            let count = block_counts.entry(entry.sender).or_insert(0);
+            if *count < self.max_per_block {
+                *count += 1;
                 bytes_used = bytes_used.saturating_add(entry.encoded_len);
                 orders_used = orders_used.saturating_add(entry_orders);
                 selected.push((entry.sender, entry.action.clone()));
@@ -370,6 +379,9 @@ impl NativePool {
         bytes_cap: usize,
         orders_cap: usize,
     ) -> Vec<(Address, SignedNativeAction)> {
+        if self.max_per_block == 0 {
+            return Vec::new();
+        }
         let mut block_counts: HashMap<Address, usize> = HashMap::new();
         let mut selected = Vec::new();
         let mut bytes_used: usize = 0;
@@ -397,9 +409,9 @@ impl NativePool {
             if orders_used.saturating_add(entry_orders) > orders_cap {
                 break;
             }
-            let count = block_counts.get(&entry.sender).copied().unwrap_or(0);
-            if count < self.max_per_block {
-                *block_counts.entry(entry.sender).or_insert(0) += 1;
+            let count = block_counts.entry(entry.sender).or_insert(0);
+            if *count < self.max_per_block {
+                *count += 1;
                 bytes_used = bytes_used.saturating_add(entry.encoded_len);
                 orders_used = orders_used.saturating_add(entry_orders);
                 selected.push((entry.sender, entry.action.clone()));
@@ -530,6 +542,42 @@ mod tests {
             nonce,
             signature: sig(),
         }
+    }
+
+    #[test]
+    fn zero_sender_block_cap_leaves_every_selection_empty_and_pool_intact() {
+        let mut pool = NativePool::new(100, 64, 0);
+        for i in 1..=4u8 {
+            let sender = Address::repeat_byte(i);
+            pool.insert(sender, make_action(1, NativeAction::ClaimRewards))
+                .unwrap();
+            pool.insert(
+                sender,
+                make_action(2, NativeAction::CancelOrder { order_id: i as u128 }),
+            ).unwrap();
+        }
+        for limit in [0, 1, usize::MAX] {
+            assert!(pool.select_for_block(limit).is_empty());
+            assert!(pool.select_for_block_with_senders(limit).is_empty());
+            assert!(pool.select_cancels_for_block_with_senders_excluding(
+                limit, &HashSet::new(), usize::MAX, usize::MAX,
+            ).is_empty());
+            assert!(pool.drain(limit).is_empty());
+            assert_eq!(pool.size(), 8);
+            assert_eq!(pool.expiry_index.len(), 8);
+            assert_eq!(pool.seen.len(), 8);
+            assert_eq!(pool.hash_index.values().map(Vec::len).sum::<usize>(), 8);
+            assert_eq!(pool.sender_counts.len(), 4);
+            assert!(pool.sender_counts.values().all(|&count| count == 2));
+        }
+        pool.max_per_block = 1;
+        assert_eq!(pool.select_for_block(8).len(), 4);
+        assert_eq!(pool.drain(8).len(), 4);
+        assert_eq!(pool.size(), 4);
+        assert_eq!(pool.expiry_index.len(), 4);
+        assert_eq!(pool.seen.len(), 4);
+        assert_eq!(pool.hash_index.values().map(Vec::len).sum::<usize>(), 4);
+        assert!(pool.sender_counts.values().all(|&count| count == 1));
     }
 
     #[test]
