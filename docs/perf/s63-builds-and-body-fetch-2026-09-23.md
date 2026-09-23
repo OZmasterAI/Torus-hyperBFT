@@ -105,6 +105,12 @@ cells. The same binary also ran about 15 % faster in the afternoon.
 `load1`, node CPU and non-node load are indistinguishable between the two
 periods, so the trigger is host state the harness does not record.
 
+**Cause (per the user, same day):** another workload of the user's was running
+on this host during the morning. The morning cells therefore measured
+interference, not the builds. Afternoon cells are the valid baseline. The
+harness's "load minus node CPU" estimate did not reveal this interference, so
+cells from step 4 onward carry a per-process host sampler.
+
 ## Current profile of the working line (A/B cells)
 
 Execution is the bottleneck. The exec thread is 97 % busy and there is no
