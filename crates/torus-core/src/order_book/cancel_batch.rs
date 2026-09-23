@@ -61,6 +61,103 @@ fn compact_to_ends<T>(queue: &mut VecDeque<T>, targets: &[Target], split: usize)
     }
 }
 
+/// How one level's position-sorted, distinct targets leave its queue.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Removal {
+    /// `compact_to_ends` with this split, then pop both ends.
+    Compact(usize),
+    /// `VecDeque::remove` from the highest position down.
+    Reverse,
+    /// `VecDeque::remove` from the lowest position up.
+    Forward,
+}
+
+/// A swap moves up to three Order-sized values. Only compact when its
+/// movement bound beats either direction of repeated removal. This is a work
+/// bound, not a claim about measured CPU time.
+fn choose_removal(len: usize, targets: &[Target]) -> Removal {
+    let (split, affected_survivors) = end_split(len, targets);
+    let forward_shifts = targets.iter().enumerate().fold(0usize, |sum, (i, target)| {
+        sum.saturating_add((target.position - i).min(len - 1 - target.position))
+    });
+    let reverse_shifts = targets
+        .iter()
+        .enumerate()
+        .rev()
+        .fold(0usize, |sum, (i, target)| {
+            let remaining = len - (targets.len() - 1 - i);
+            sum.saturating_add(target.position.min(remaining - 1 - target.position))
+        });
+    if forward_shifts.min(reverse_shifts) > affected_survivors.saturating_mul(3) {
+        Removal::Compact(split)
+    } else if reverse_shifts < forward_shifts {
+        Removal::Reverse
+    } else {
+        Removal::Forward
+    }
+}
+
+/// Moves every target out of `queue` into `cancelled[target.output]`,
+/// keeping survivors in FIFO order. Compaction leaves the cancelled values
+/// at the ends in unspecified order; `output_of` maps each popped order id
+/// back to its slot. No allocation, no per-survivor lookups.
+fn remove_targets(
+    queue: &mut VecDeque<Order>,
+    targets: &[Target],
+    cancelled: &mut [Option<Order>],
+    output_of: impl Fn(OrderId) -> usize,
+) {
+    match choose_removal(queue.len(), targets) {
+        Removal::Compact(split) => {
+            compact_to_ends(queue, targets, split);
+            for front in [true, false] {
+                let count = if front { split } else { targets.len() - split };
+                for _ in 0..count {
+                    let order = if front {
+                        queue.pop_front()
+                    } else {
+                        queue.pop_back()
+                    }
+                    .expect("compaction moved target to endpoint");
+                    let slot = output_of(order.id);
+                    cancelled[slot] = Some(order);
+                }
+            }
+        }
+        Removal::Reverse => {
+            for target in targets.iter().rev() {
+                cancelled[target.output] = queue.remove(target.position);
+            }
+        }
+        Removal::Forward => {
+            for (removed, target) in targets.iter().enumerate() {
+                cancelled[target.output] = queue.remove(target.position - removed);
+            }
+        }
+    }
+}
+
+/// Binary-search a sorted `(id, output)` table for a cancelled order's slot.
+fn output_slot(by_id: &[(OrderId, usize)], id: OrderId) -> usize {
+    let slot = by_id
+        .binary_search_by_key(&id, |&(id, _)| id)
+        .expect("endpoint is a cancellation target");
+    by_id[slot].1
+}
+
+/// `cancel_all_many`'s read-only plan over the untouched book.
+struct ManyPlan {
+    /// Per sender: its slice of the output slots — `None` for a repeat or a
+    /// sender without a `trader_orders` entry (sequential early return).
+    ranges: Vec<Option<std::ops::Range<usize>>>,
+    /// Targets sorted by level, then queue position.
+    targets: Vec<Target>,
+    /// `(side_tag, price, end)`: level groups as exclusive ends into `targets`.
+    levels: Vec<(u8, FixedPoint, usize)>,
+    /// Sorted `(order id, output slot)`.
+    by_id: Vec<(OrderId, usize)>,
+}
+
 impl OrderBook {
     /// Cheap, conservative admission sample. Do not allocate a batch plan for
     /// shallow or scattered targets just because unrelated levels are deep.
@@ -163,49 +260,9 @@ impl OrderBook {
                 &mut self.asks
             };
             let queue = book.get_mut(&price).expect("preflight found level");
-            let len = queue.len();
-            let (split, affected_survivors) = end_split(len, &targets);
-            let forward_shifts = targets.iter().enumerate().fold(0usize, |sum, (i, target)| {
-                sum.saturating_add((target.position - i).min(len - 1 - target.position))
+            remove_targets(queue, &targets, &mut cancelled, |id| {
+                output_slot(&output_by_id, id)
             });
-            let reverse_shifts =
-                targets
-                    .iter()
-                    .enumerate()
-                    .rev()
-                    .fold(0usize, |sum, (i, target)| {
-                        let remaining = len - (targets.len() - 1 - i);
-                        sum.saturating_add(target.position.min(remaining - 1 - target.position))
-                    });
-            // A swap moves up to three Order-sized values. Only compact when
-            // its movement bound beats either direction of repeated removal.
-            // This is a work bound, not a claim about measured CPU time.
-            if forward_shifts.min(reverse_shifts) > affected_survivors.saturating_mul(3) {
-                compact_to_ends(queue, &targets, split);
-                for front in [true, false] {
-                    let count = if front { split } else { targets.len() - split };
-                    for _ in 0..count {
-                        let order = if front {
-                            queue.pop_front()
-                        } else {
-                            queue.pop_back()
-                        }
-                        .expect("compaction moved target to endpoint");
-                        let slot = output_by_id
-                            .binary_search_by_key(&order.id, |&(id, _)| id)
-                            .expect("endpoint is a cancellation target");
-                        cancelled[output_by_id[slot].1] = Some(order);
-                    }
-                }
-            } else if reverse_shifts < forward_shifts {
-                for target in targets.iter().rev() {
-                    cancelled[target.output] = queue.remove(target.position);
-                }
-            } else {
-                for (removed, target) in targets.iter().enumerate() {
-                    cancelled[target.output] = queue.remove(target.position - removed);
-                }
-            }
             if queue.is_empty() {
                 book.remove(&price);
             }
@@ -239,20 +296,206 @@ impl OrderBook {
         }
         Some(cancelled)
     }
+
+    /// Cancel-all for a run of senders, state-equivalent to
+    /// `senders.iter().map(|s| self.cancel_all(*s, None)).collect()`: the
+    /// same per-sender results (a repeated sender gets the empty result its
+    /// second sequential call gets), the same survivor FIFO order, journals,
+    /// epochs, dirty chunks and stops. Each touched level is compacted ONCE
+    /// for the union of all senders' targets instead of once per sender.
+    ///
+    /// Falls back to the sequential loop — before any mutation — when fewer
+    /// than two senders own orders or any index is stale/shared, so unusual
+    /// states keep their exact sequential behavior.
+    pub fn cancel_all_many(&mut self, senders: &[Address]) -> Vec<Vec<Order>> {
+        match self.plan_cancel_all_many(senders) {
+            Some(plan) => self.apply_cancel_all_many(senders, plan),
+            None => senders.iter().map(|s| self.cancel_all(*s, None)).collect(),
+        }
+    }
+
+    /// Read-only. Planning memory scales with the run's targets, never with
+    /// queue depth; each target costs the same seq binary search the
+    /// sequential path pays, and survivors are never looked up.
+    fn plan_cancel_all_many(&self, senders: &[Address]) -> Option<ManyPlan> {
+        // Only a sender's first occurrence can find a trader_orders entry.
+        let mut first = vec![false; senders.len()];
+        let mut by_sender: Vec<(Address, usize)> = senders
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(k, s)| (s, k))
+            .collect();
+        by_sender.sort_unstable();
+        for (i, &(sender, k)) in by_sender.iter().enumerate() {
+            first[k] = i == 0 || by_sender[i - 1].0 != sender;
+        }
+        let mut ranges = vec![None; senders.len()];
+        let mut total = 0usize;
+        let mut owners = 0usize;
+        for (k, sender) in senders.iter().enumerate() {
+            if let Some(ids) = self.trader_orders.get(sender).filter(|_| first[k]) {
+                ranges[k] = Some(total..total + ids.len());
+                total += ids.len();
+                owners += usize::from(!ids.is_empty());
+            }
+        }
+        if owners < 2 {
+            return None;
+        }
+
+        let mut keyed: Vec<(u8, FixedPoint, Target)> = Vec::with_capacity(total);
+        let mut by_id: Vec<(OrderId, usize)> = Vec::with_capacity(total);
+        for (sender, range) in senders.iter().zip(&ranges) {
+            let Some(range) = range else { continue };
+            for (output, id) in (range.start..).zip(&self.trader_orders[sender]) {
+                let loc = self.order_index.get(id)?;
+                let queue = match loc.side {
+                    Side::Buy => self.bids.get(&loc.price),
+                    Side::Sell => self.asks.get(&loc.price),
+                }?;
+                let seq = self.order_seq.get(id)?;
+                let position = queue.partition_point(|order| {
+                    self.order_seq.get(&order.id).is_some_and(|s| s < seq)
+                });
+                if queue.get(position).is_none_or(|order| order.id != *id) {
+                    return None;
+                }
+                keyed.push((
+                    crate::book_rows::side_tag(loc.side),
+                    loc.price,
+                    Target { position, output },
+                ));
+                by_id.push((*id, output));
+            }
+        }
+        by_id.sort_unstable_by_key(|&(id, _)| id);
+        if by_id.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+            return None;
+        }
+        keyed.sort_unstable_by_key(|&(tag, price, target)| (tag, price, target.position));
+
+        let mut levels = Vec::new();
+        let mut start = 0;
+        for i in 0..keyed.len() {
+            let (tag, price, _) = keyed[i];
+            if keyed
+                .get(i + 1)
+                .is_some_and(|next| (next.0, next.1) == (tag, price))
+            {
+                continue;
+            }
+            // Epoch overflow must hit the sequential path's exact
+            // panic/wrap point, so leave it to that path.
+            if self.level_hash_cache.is_some()
+                && self
+                    .level_epoch
+                    .get(&(tag, price.raw()))
+                    .copied()
+                    .unwrap_or(0)
+                    .checked_add((i + 1 - start) as u64)
+                    .is_none()
+            {
+                return None;
+            }
+            levels.push((tag, price, i + 1));
+            start = i + 1;
+        }
+        Some(ManyPlan {
+            ranges,
+            targets: keyed.into_iter().map(|(_, _, target)| target).collect(),
+            levels,
+            by_id,
+        })
+    }
+
+    fn apply_cancel_all_many(&mut self, senders: &[Address], plan: ManyPlan) -> Vec<Vec<Order>> {
+        let ManyPlan {
+            ranges,
+            targets,
+            levels,
+            by_id,
+        } = plan;
+        let mut cancelled: Vec<Option<Order>> = vec![None; by_id.len()];
+        let mut start = 0;
+        for (tag, price, end) in levels {
+            let book = if tag == crate::book_rows::side_tag(Side::Buy) {
+                &mut self.bids
+            } else {
+                &mut self.asks
+            };
+            let queue = book.get_mut(&price).expect("plan found level");
+            remove_targets(queue, &targets[start..end], &mut cancelled, |id| {
+                output_slot(&by_id, id)
+            });
+            if queue.is_empty() {
+                book.remove(&price);
+            }
+            start = end;
+        }
+
+        // Per-order effects in the sequential order: sender, then its
+        // trader_orders list — independent of grouping and compaction.
+        let cache_on = self.level_hash_cache.is_some();
+        let chunked_on = self.level_hash_chunked;
+        let mut cancelled = cancelled
+            .into_iter()
+            .map(|order| order.expect("plan located every target"));
+        let mut stop_owners = Vec::new();
+        let mut out = Vec::with_capacity(senders.len());
+        for (sender, range) in senders.iter().zip(ranges) {
+            let Some(range) = range else {
+                out.push(Vec::new());
+                continue;
+            };
+            self.trader_orders.remove(sender);
+            stop_owners.push(*sender);
+            let orders: Vec<Order> = cancelled.by_ref().take(range.len()).collect();
+            for order in &orders {
+                let loc = self
+                    .order_index
+                    .remove(&order.id)
+                    .expect("plan found index");
+                let seq = self.order_seq.remove(&order.id);
+                let tag = crate::book_rows::side_tag(loc.side);
+                self.row_journal.insert(order.id);
+                self.level_journal.insert((tag, loc.price.raw()));
+                Self::bump_level_epoch(cache_on, &mut self.level_epoch, tag, loc.price.raw());
+                Self::mark_chunk_dirty(
+                    chunked_on,
+                    &mut self.dirty_chunks,
+                    tag,
+                    loc.price.raw(),
+                    seq,
+                );
+            }
+            out.push(orders);
+        }
+        // Each owner's `retain` in the sequential loop, as one stable pass.
+        stop_owners.sort_unstable();
+        if !stop_owners.is_empty() {
+            self.pending_stops
+                .retain(|stop| stop_owners.binary_search(&stop.trader).is_err());
+        }
+        out
+    }
 }
+
+#[cfg(test)]
+mod many_tests;
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn addr(n: u8) -> Address {
+    pub(super) fn addr(n: u8) -> Address {
         Address::from([n; 20])
     }
-    fn fp(n: i64) -> FixedPoint {
+    pub(super) fn fp(n: i64) -> FixedPoint {
         FixedPoint::from_raw(n as i128 * FixedPoint::SCALE)
     }
 
-    fn order(id: u64, trader: Address, side: Side, price: i64) -> Order {
+    pub(super) fn order(id: u64, trader: Address, side: Side, price: i64) -> Order {
         Order {
             id: id as OrderId,
             trader,
@@ -415,7 +658,7 @@ mod tests {
         book
     }
 
-    fn assert_same(a: &mut OrderBook, b: &mut OrderBook) {
+    pub(super) fn assert_same(a: &mut OrderBook, b: &mut OrderBook) {
         assert_eq!(borsh::to_vec(a).unwrap(), borsh::to_vec(b).unwrap());
         assert_eq!(a.next_seq, b.next_seq);
         assert_eq!(a.order_seq, b.order_seq);

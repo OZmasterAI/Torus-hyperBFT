@@ -1271,6 +1271,48 @@ impl ResidentBooks {
     }
 }
 
+/// s63 runtime toggle: `TORUS_CANCEL_BATCH=1` executes each maximal run of
+/// consecutive `CancelAllOrders` in Phase 1 (deferred places do not break a
+/// run) with one book compaction per touched level instead of one per
+/// action. Anything else (INCLUDING UNSET) keeps today's per-action loop.
+/// State-equivalent either way; read once per process.
+fn cancel_batch_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| parse_cancel_batch_toggle(std::env::var("TORUS_CANCEL_BATCH").ok()))
+}
+
+/// Pure parse of the `TORUS_CANCEL_BATCH` value: only `"1"` enables.
+fn parse_cancel_batch_toggle(v: Option<String>) -> bool {
+    matches!(v.as_deref().map(str::trim), Some("1"))
+}
+
+#[cfg(test)]
+mod cancel_batch_toggle_tests {
+    use super::parse_cancel_batch_toggle;
+
+    #[test]
+    fn default_is_off() {
+        assert!(!parse_cancel_batch_toggle(None));
+    }
+
+    #[test]
+    fn one_enables() {
+        assert!(parse_cancel_batch_toggle(Some("1".to_string())));
+        assert!(parse_cancel_batch_toggle(Some(" 1 ".to_string())));
+    }
+
+    #[test]
+    fn anything_else_stays_off() {
+        for v in ["0", "true", "on", "", "yes", "2"] {
+            assert!(!parse_cancel_batch_toggle(Some(v.to_string())), "{v}");
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "cancel_batch_exec_tests.rs"]
+mod cancel_batch_exec_tests;
+
 #[cfg(test)]
 mod resident_books_toggle_tests {
     use super::parse_resident_books_toggle;
@@ -3036,7 +3078,13 @@ impl NativeExecutor {
         ctx: &mut NativeExecContext<T>,
         actions: &[(Address, NativeAction)],
     ) -> NativeBatchResult {
-        Self::execute_batch_inner(ctx, actions, SettleMode::Auto, EngineMode::Auto)
+        Self::execute_batch_inner(
+            ctx,
+            actions,
+            SettleMode::Auto,
+            EngineMode::Auto,
+            cancel_batch_enabled(),
+        )
     }
 
     /// `execute_batch` with the Phase-4 settle mode pinned explicitly —
@@ -3069,6 +3117,7 @@ impl NativeExecutor {
             actions,
             SettleMode::Force { parallel, workers },
             EngineMode::Force(0),
+            cancel_batch_enabled(),
         )
     }
 
@@ -3093,6 +3142,7 @@ impl NativeExecutor {
                     workers: None,
                 },
                 EngineMode::Force(threads),
+                cancel_batch_enabled(),
             )
         } else {
             Self::execute_batch_inner(
@@ -3103,8 +3153,30 @@ impl NativeExecutor {
                     workers: None,
                 },
                 EngineMode::Force(0),
+                cancel_batch_enabled(),
             )
         }
+    }
+
+    /// s63: `execute_batch` with the Phase-1 cancel-all batching pinned
+    /// (`TORUS_CANCEL_BATCH` ignored) and the canonical serial engine/settle
+    /// path. For the flag-on/flag-off differential tests (per-process env
+    /// vars race across test threads; this doesn't).
+    pub fn execute_batch_cancel_mode<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+        actions: &[(Address, NativeAction)],
+        cancel_batch: bool,
+    ) -> NativeBatchResult {
+        Self::execute_batch_inner(
+            ctx,
+            actions,
+            SettleMode::Force {
+                parallel: false,
+                workers: None,
+            },
+            EngineMode::Force(0),
+            cancel_batch,
+        )
     }
 
     fn execute_batch_inner<T: StateBackend>(
@@ -3112,6 +3184,7 @@ impl NativeExecutor {
         actions: &[(Address, NativeAction)],
         settle_mode: SettleMode,
         engine_mode: EngineMode,
+        cancel_batch: bool,
     ) -> NativeBatchResult {
         // One flattened executable entry: either a PlaceOrder's params (single or
         // batch-expanded) or any other action. C2: everything is BORROWED from the
@@ -3203,13 +3276,57 @@ impl NativeExecutor {
         let phase1_timer = std::time::Instant::now();
         let mut place_order_indices: Vec<usize> = Vec::with_capacity(place_capacity);
 
-        for (i, (sender, entry)) in flat.iter().enumerate() {
-            match entry {
-                FlatAction::Place(_) => place_order_indices.push(i),
-                FlatAction::Other(action) => {
-                    let result = Self::execute(ctx, sender, action);
-                    total_gas += result.gas_used;
-                    results[i] = result;
+        if !cancel_batch {
+            for (i, (sender, entry)) in flat.iter().enumerate() {
+                match entry {
+                    FlatAction::Place(_) => place_order_indices.push(i),
+                    FlatAction::Other(action) => {
+                        let result = Self::execute(ctx, sender, action);
+                        total_gas += result.gas_used;
+                        results[i] = result;
+                    }
+                }
+            }
+        } else {
+            // s63 (`TORUS_CANCEL_BATCH=1`): a maximal run of CancelAllOrders
+            // executes as one book pass per market. Places only record their
+            // index here (they run in Phase 2 either way), so they do not end
+            // a run; every other action does, because it may read or mutate a
+            // book or a balance a later cancel-all depends on.
+            let mut run: Vec<(usize, Address, Option<MarketId>)> = Vec::new();
+            let mut i = 0;
+            while i < n {
+                let (sender, entry) = &flat[i];
+                match entry {
+                    FlatAction::Place(_) => {
+                        place_order_indices.push(i);
+                        i += 1;
+                    }
+                    FlatAction::Other(NativeAction::CancelAllOrders { .. }) => {
+                        run.clear();
+                        while i < n {
+                            match &flat[i].1 {
+                                FlatAction::Place(_) => place_order_indices.push(i),
+                                FlatAction::Other(NativeAction::CancelAllOrders { market_id }) => {
+                                    run.push((i, flat[i].0, *market_id))
+                                }
+                                FlatAction::Other(_) => break,
+                            }
+                            i += 1;
+                        }
+                        for (k, result) in
+                            Self::exec_cancel_all_run(ctx, &run).into_iter().enumerate()
+                        {
+                            total_gas += result.gas_used;
+                            results[run[k].0] = result;
+                        }
+                    }
+                    FlatAction::Other(action) => {
+                        let result = Self::execute(ctx, sender, action);
+                        total_gas += result.gas_used;
+                        results[i] = result;
+                        i += 1;
+                    }
                 }
             }
         }
@@ -4798,6 +4915,82 @@ impl NativeExecutor {
         }
 
         NativeActionResult::ok("cancel_all", 500)
+    }
+
+    /// s63: a run of consecutive `CancelAllOrders` (`run` = flat index,
+    /// sender, market), state-equivalent to `exec_cancel_all` per action in
+    /// run order. Book work goes first: one `OrderBook::cancel_all_many` per
+    /// market over the run's senders targeting it, in run order (a repeated
+    /// sender gets the empty result the sequential second call gets). Then,
+    /// per action in run order, exactly `exec_cancel_all`'s bookkeeping:
+    /// dirty marks, the margin sum over the same market and order sequence,
+    /// and one balance release. Book removal never reads balances and a
+    /// release never touches a book, so hoisting the book work changes no
+    /// value and no write sequence.
+    fn exec_cancel_all_run<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+        run: &[(usize, Address, Option<MarketId>)],
+    ) -> Vec<NativeActionResult> {
+        if let [(_, sender, market_id)] = run {
+            return vec![Self::exec_cancel_all(ctx, sender, *market_id)];
+        }
+        // The order `exec_cancel_all` iterates for `None`. Cancels never add
+        // or remove books, so every action of the run would see this order.
+        let market_ids: Vec<MarketId> = ctx.order_books.keys().copied().collect();
+        // cancelled[m][k]: the orders action k removed from market_ids[m].
+        let mut cancelled: Vec<Vec<Vec<torus_core::order_book::Order>>> =
+            Vec::with_capacity(market_ids.len());
+        let mut members: Vec<usize> = Vec::with_capacity(run.len());
+        let mut senders: Vec<Address> = Vec::with_capacity(run.len());
+        for mid in &market_ids {
+            members.clear();
+            senders.clear();
+            for (k, &(_, sender, target)) in run.iter().enumerate() {
+                if target.is_none_or(|t| t == *mid) {
+                    members.push(k);
+                    senders.push(sender);
+                }
+            }
+            let mut per_action = vec![Vec::new(); run.len()];
+            if !senders.is_empty() {
+                let book = ctx.order_books.get_mut(mid).expect("key just listed");
+                for (&k, orders) in members.iter().zip(book.cancel_all_many(&senders)) {
+                    per_action[k] = orders;
+                }
+            }
+            cancelled.push(per_action);
+        }
+
+        let mut results = Vec::with_capacity(run.len());
+        for (k, (_, sender, _)) in run.iter().enumerate() {
+            // FIX 2 (ECON-FIND-05): same release as `exec_cancel_all`.
+            let mut total_margin_release = FixedPoint::ZERO;
+            for (m, mid) in market_ids.iter().enumerate() {
+                let orders = &cancelled[m][k];
+                if orders.is_empty() {
+                    continue;
+                }
+                ctx.dirty_books.insert(*mid);
+                let cfg = ctx.margin_configs.get(mid);
+                for order in orders {
+                    let notional = order.price * order.remaining_qty;
+                    let max_lev = cfg
+                        .map(|c| effective_max_leverage(&c.tiers, notional))
+                        .unwrap_or(20);
+                    total_margin_release += Self::margin_at_integer_leverage(notional, max_lev);
+                }
+            }
+            if total_margin_release > FixedPoint::ZERO {
+                if let Ok(mut bal) = ctx.positions.get_native_balance(sender) {
+                    let release = total_margin_release.min(bal.order_margin);
+                    bal.order_margin -= release;
+                    bal.available += release;
+                    let _ = ctx.positions.put_native_balance(sender, &bal);
+                }
+            }
+            results.push(NativeActionResult::ok("cancel_all", 500));
+        }
+        results
     }
 
     /// Dividing raw notional by positive integer leverage
