@@ -128,3 +128,47 @@ pipelining. Per native block, chain_ms is 1,070–1,180, broken down as:
   with ~113 GB free.
 - `progress_and_validator_set_update_test` fails on the working line (it
   stalls after the validator set grows).
+
+## Step 4: exec pipeline on the working line (15:05–16:24)
+
+Same binary (`ac8782c`), `TORUS_EXEC_PIPELINE=1` vs unset, interleaved
+on/off/off/on/on/off, cap 200, 300 s. Cells:
+`~/bench-results-matched/s63-pipe-{on,off}-r{1,2,3}`. Every cell also has a
+per-second host sampler under `s63-pipe-20260923/<label>-host/` (pidstat
+threads/host, vmstat, iostat, meminfo, UDP counters, sockets).
+
+| Arm | Matched/s | chain_ms | Native blk/s | HotStuff rq_wait/blk | Peak RSS |
+| --- | --- | --- | --- | --- | --- |
+| on | 54,745 · 55,276 · 56,627 | 926–936 (343 overlapped) | 0.97–1.03 | 89–95 ms | 5.8–6.9 GB |
+| off | 49,058 · 47,047 | 1,075–1,103 | 0.86–0.92 | 77–84 ms | 5.1–5.7 GB |
+
+`off-r1` (31,137) started with idle_blk_s 1.9 (host not settled), so it is
+kept but excluded. On clean cells the pipeline gains **+15.6 %**, the ranges
+are disjoint, and all 6 cells are accepted with AGREE. Handoff wait is about
+2 ms. Steady RSS is unchanged.
+
+**Crash gate** (val1 SIGKILLed at +60 s, down ~1.05 s, same binary):
+
+| Arm | Crash gate | Replay | Agreement | Stalls | Matched/s |
+| --- | --- | --- | --- | --- | ---: |
+| on | PASS | gap 2, worker reattached | AGREE | none | 49,366 |
+| off | PASS | gap 5 | AGREE | none | 40,133 |
+
+Both verdicts are UNVERIFIED only because the liveness detector marks the
+killed node UNKNOWN: its metrics are missing during the planned restart.
+That node committed as many blocks as its peers. The s60 post-restart stalls
+(30–51 s) did not recur. Both cells are n=1.
+
+**Host disturbance seen in every cell:** `dockerd` spikes to 400–500 % CPU for
+about 2 s every 2 minutes.
+
+## Next
+
+- Decide whether to make the exec pipeline the default on the working line,
+  with `TORUS_EXEC_PIPELINE=0` as the kill switch. The design's precondition
+  (§2.1: two agreeing 3-validator cells plus the crash gate) is now met.
+- Harness: exclude the planned kill window from the liveness check, so crash
+  cells can get a PASS verdict.
+- The remaining open items above still apply: host-state regime, proving the
+  body-fetch fix live, disk-limited long cells, and the pre-existing
+  integration test failure.
