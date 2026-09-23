@@ -52,27 +52,54 @@ impl KVGet for RocksKVStore {
 // --- WriteBatch ---
 
 enum WriteOp {
-    Set(Vec<u8>, Vec<u8>),
-    Delete(Vec<u8>),
+    Set {
+        start: usize,
+        key_end: usize,
+        end: usize,
+    },
+    Delete {
+        start: usize,
+        end: usize,
+    },
 }
 
 /// Buffered write batch. Operations are collected and applied atomically
 /// when passed to [`KVStore::write`].
 pub struct RocksWriteBatch {
+    bytes: Vec<u8>,
     ops: Vec<WriteOp>,
 }
 
 impl WriteBatch for RocksWriteBatch {
     fn new() -> Self {
-        Self { ops: Vec::new() }
+        Self {
+            bytes: Vec::new(),
+            ops: Vec::new(),
+        }
     }
 
     fn set(&mut self, key: &[u8], value: &[u8]) {
-        self.ops.push(WriteOp::Set(key.to_vec(), value.to_vec()));
+        // Keys and values remain owned by this batch, but share one arena.
+        // Reserve once so a single row cannot trigger separate key/value growth.
+        self.bytes.reserve(key.len().saturating_add(value.len()));
+        let start = self.bytes.len();
+        self.bytes.extend_from_slice(key);
+        let key_end = self.bytes.len();
+        self.bytes.extend_from_slice(value);
+        self.ops.push(WriteOp::Set {
+            start,
+            key_end,
+            end: self.bytes.len(),
+        });
     }
 
     fn delete(&mut self, key: &[u8]) {
-        self.ops.push(WriteOp::Delete(key.to_vec()));
+        let start = self.bytes.len();
+        self.bytes.extend_from_slice(key);
+        self.ops.push(WriteOp::Delete {
+            start,
+            end: self.bytes.len(),
+        });
     }
 }
 
@@ -105,8 +132,14 @@ impl KVStore for RocksKVStore {
         let mut batch = rocksdb::WriteBatch::default();
         for op in wb.ops {
             match op {
-                WriteOp::Set(k, v) => batch.put_cf(cf, &k, &v),
-                WriteOp::Delete(k) => batch.delete_cf(cf, &k),
+                WriteOp::Set {
+                    start,
+                    key_end,
+                    end,
+                } => {
+                    batch.put_cf(cf, &wb.bytes[start..key_end], &wb.bytes[key_end..end]);
+                }
+                WriteOp::Delete { start, end } => batch.delete_cf(cf, &wb.bytes[start..end]),
             }
         }
         self.db.write(batch).expect("RocksDB write failed");
@@ -135,6 +168,10 @@ impl KVStore for RocksKVStore {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "kv_store_packed_tests.rs"]
+mod packed_tests;
 
 #[cfg(test)]
 mod tests {
