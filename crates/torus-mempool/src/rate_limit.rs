@@ -114,6 +114,54 @@ pub fn native_total_block_cap() -> usize {
 /// actions from all peers, so this must be large enough for the full mesh.
 pub const NATIVE_POOL_MAX_SIZE: usize = 65536;
 
+// ---- s65 item B: node-side admission limit ----
+//
+// Under overload the pool used to accept everything: ~35% of submitted actions
+// then expired unused after NONCE_WINDOW_MS, having cost every node a signature
+// check, a gossip hop and a DA write. With the limit on, RPC ingress sheds
+// non-cancels BEFORE verification ("busy, retry") once the pool already holds
+// more than `horizon` worth of recent commit throughput.
+
+/// How many seconds of commit history the admission rate is measured over.
+pub const ADMISSION_RATE_WINDOW_MS: u64 = 10_000;
+
+/// Parse `TORUS_ADMISSION_HORIZON_MS`: the milliseconds of recent commit
+/// throughput the native pool may hold before ingress sheds. Unset, `0`, or
+/// unparsable => 0 = limit OFF (the pre-s65 behaviour).
+pub fn parse_admission_horizon_ms(raw: Option<String>) -> u64 {
+    raw.and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0)
+}
+
+/// Effective admission horizon for this node (node-local policy; mixed values
+/// across validators are safe — it only decides what ingress accepts).
+pub fn admission_horizon_ms() -> u64 {
+    parse_admission_horizon_ms(std::env::var("TORUS_ADMISSION_HORIZON_MS").ok())
+}
+
+/// Default floor under the admission limit: 4 full blocks, so a cold node (no
+/// commits measured yet) or a briefly stalled chain never sheds a normal load.
+pub fn admission_floor() -> usize {
+    4 * native_total_block_cap()
+}
+
+/// Pool size at which ingress starts shedding, or `None` when the limit is
+/// off. `committed` = native actions committed within the last
+/// `window_elapsed_ms` (at most [`ADMISSION_RATE_WINDOW_MS`]); the limit is that
+/// rate times `horizon_ms`, never below `floor`.
+pub fn admission_limit(
+    horizon_ms: u64,
+    floor: usize,
+    committed: usize,
+    window_elapsed_ms: u64,
+) -> Option<usize> {
+    if horizon_ms == 0 {
+        return None;
+    }
+    let elapsed = window_elapsed_ms.clamp(1_000, ADMISSION_RATE_WINDOW_MS) as u128;
+    let by_rate = (committed as u128 * horizon_ms as u128 / elapsed) as usize;
+    Some(by_rate.max(floor))
+}
+
 /// Max pending native actions per sender in the pool. With non-destructive
 /// selection (actions stay until commit), this must cover burst submissions.
 pub const NATIVE_PER_SENDER_CAP: usize = 512;
@@ -342,6 +390,45 @@ pub fn validate_batch_size(action: &NativeAction) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn admission_horizon_parse_defaults_off() {
+        assert_eq!(parse_admission_horizon_ms(None), 0);
+        assert_eq!(parse_admission_horizon_ms(Some("0".into())), 0);
+        assert_eq!(parse_admission_horizon_ms(Some("abc".into())), 0);
+        assert_eq!(parse_admission_horizon_ms(Some("".into())), 0);
+        assert_eq!(parse_admission_horizon_ms(Some("10000".into())), 10_000);
+        assert_eq!(parse_admission_horizon_ms(Some(" 5000 ".into())), 5_000);
+    }
+
+    #[test]
+    fn admission_limit_off_when_horizon_zero() {
+        assert_eq!(admission_limit(0, 800, 2_200, 10_000), None);
+    }
+
+    #[test]
+    fn admission_limit_is_commit_rate_times_horizon() {
+        // 2,200 actions committed over 10 s = 220/s; 10 s horizon => 2,200.
+        assert_eq!(admission_limit(10_000, 800, 2_200, 10_000), Some(2_200));
+        // Same rate measured over 5 s of history.
+        assert_eq!(admission_limit(10_000, 800, 1_100, 5_000), Some(2_200));
+    }
+
+    #[test]
+    fn admission_limit_never_below_floor() {
+        // Cold node: nothing committed yet.
+        assert_eq!(admission_limit(10_000, 800, 0, 0), Some(800));
+        // Slow chain: 50 actions in 10 s => 50 by rate, floor wins.
+        assert_eq!(admission_limit(10_000, 800, 50, 10_000), Some(800));
+    }
+
+    #[test]
+    fn admission_limit_rate_window_is_clamped() {
+        // Under 1 s of history counts as 1 s (no rate spike from one block).
+        assert_eq!(admission_limit(10_000, 0, 200, 10), Some(2_000));
+        // Over the window counts as the window.
+        assert_eq!(admission_limit(10_000, 0, 2_200, 60_000), Some(2_200));
+    }
     // ---- PlaceOrderBatch caps (Phase B, Task B3) ----
 
     fn sample_params() -> torus_types::PlaceOrderParams {

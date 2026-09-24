@@ -10,23 +10,25 @@ use torus_types::{compute_action_hash, NativeAction, SignedNativeAction};
 
 use crate::error::MempoolError;
 
-/// Selection-order key (T2.3): `(cancel-priority, sender, nonce, seq)`.
+/// Selection-order key: `(cancel-priority, seq, sender, nonce)`.
 ///
 /// A `BTreeMap` over this key IS the pool's selection order, maintained
-/// incrementally at insert/remove instead of a full `sort_by` plus
-/// `hash_index` rebuild under the write lock on every `produce_block`.
-/// Iteration reproduces the previous stable
-/// `sort_by(cancel-priority, sender, nonce)` EXACTLY: `seq` is a
-/// monotonically increasing insertion counter, so entries with equal
-/// `(priority, sender, nonce)` iterate in insertion order — precisely the
-/// tie order the stable sort preserved.
-type SortKey = (u8, Address, u64, u64);
+/// incrementally at insert/remove (T2.3). Cancels first, then ARRIVAL order:
+/// `seq` is a monotonically increasing insertion counter, unique per entry,
+/// so `sender` and `nonce` only complete the entry's identity.
+///
+/// s65 item B: the key used to be `(priority, sender, nonce, seq)`, which
+/// served the lowest sender address first; under load a fixed high-address
+/// band never reached a block and expired. Arrival order cannot be gamed by
+/// choice of address or of the client-chosen nonce timestamp. Selection is
+/// proposer-local (blocks carry their order), so this cannot fork.
+type SortKey = (u8, u64, Address, u64);
 
 /// Same identity as SortKey, ordered by nonce for expiry-prefix removal.
 /// No stale heap entries: every insert/remove maintains this exact live index.
 type ExpiryKey = (u64, u8, Address, u64);
 
-fn expiry_key(&(priority, sender, nonce, seq): &SortKey) -> ExpiryKey {
+fn expiry_key(&(priority, seq, sender, nonce): &SortKey) -> ExpiryKey {
     (nonce, priority, sender, seq)
 }
 
@@ -40,12 +42,18 @@ pub(crate) struct NativePoolEntry {
     /// block body (bodies are bincode, app.rs `block_bytes`). Computed once at
     /// insert so byte-capped selection is O(1) per entry.
     pub encoded_len: usize,
-    /// True iff THIS node verified the signature and resolved `sender` from it
-    /// (RPC ingress or gossip-RECOVER) — the only entries eligible to seed the
-    /// exec trust-cache. False for gossip-TRUSTED admits (sender claimed by a
-    /// peer, not re-derived here), which must never be short-circuited at exec.
+    /// The exec trust-cache key (`torus_types::verified_cache_key`) iff THIS node
+    /// verified the signature and resolved `sender` from it (RPC ingress or
+    /// gossip-RECOVER) AND the signature kind is cacheable (EIP-712) — the only
+    /// entries eligible to seed the exec trust-cache. `None` for gossip-TRUSTED
+    /// admits (sender claimed by a peer, not re-derived here), which must never
+    /// be short-circuited at exec, and for session actions.
     /// See `docs/plans/double-verify-trust-cache-impl.md`.
-    pub verified_locally: bool,
+    ///
+    /// s65 item C: stored at insert (ingress already derives it) so the
+    /// commit-time restash is a lookup, not a canonical re-encode + keccak of
+    /// every committed action on the consensus thread (~30 ms per commit).
+    pub restash_key: Option<B256>,
 }
 
 /// Native action pool with per-sender tracking, dedup, and size limits.
@@ -113,16 +121,11 @@ impl NativePool {
     /// (`verified_cache_key` returns `None`).
     pub fn verified_restash_keys(&self, hashes: &[B256]) -> Vec<(B256, Address)> {
         let mut out = Vec::new();
-        let mut scratch = Vec::new();
         for h in hashes {
             if let Some(key) = self.hash_index.get(h).and_then(|keys| keys.first()) {
                 if let Some(entry) = self.entries.get(key) {
-                    if entry.verified_locally {
-                        if let Some(key) = torus_types::verified_cache_key_with_scratch(
-                            &entry.action, &mut scratch,
-                        ) {
-                            out.push((key, entry.sender));
-                        }
+                    if let Some(restash) = entry.restash_key {
+                        out.push((restash, entry.sender));
                     }
                 }
             }
@@ -153,6 +156,23 @@ impl NativePool {
         sender: Address,
         action: SignedNativeAction,
         verified_locally: bool,
+    ) -> Result<B256, MempoolError> {
+        let restash_key = if verified_locally {
+            torus_types::verified_cache_key(&action)
+        } else {
+            None
+        };
+        self.insert_with_restash_key(sender, action, restash_key)
+    }
+
+    /// [`insert_verified`](Self::insert_verified) with the trust-cache key the
+    /// caller already derived (`Some` only for a locally verified, cacheable
+    /// action), so it is not recomputed here under the pool write lock.
+    pub fn insert_with_restash_key(
+        &mut self,
+        sender: Address,
+        action: SignedNativeAction,
+        restash_key: Option<B256>,
     ) -> Result<B256, MempoolError> {
         let action_hash = compute_action_hash(&action);
         let is_cancel = is_cancel(&action.action);
@@ -194,7 +214,7 @@ impl NativePool {
         self.seen.insert((sender, action_hash));
         let seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1);
-        let key: SortKey = (u8::from(!is_cancel), sender, action.nonce, seq);
+        let key: SortKey = (u8::from(!is_cancel), seq, sender, action.nonce);
         self.hash_index.entry(action_hash).or_default().push(key);
         self.expiry_index.insert(expiry_key(&key));
         self.entries.insert(
@@ -205,7 +225,7 @@ impl NativePool {
                 action_hash,
                 is_cancel,
                 encoded_len,
-                verified_locally,
+                restash_key,
             },
         );
 
@@ -233,8 +253,8 @@ impl NativePool {
     /// Drain up to `limit` actions in priority order with per-sender-per-block caps.
     ///
     /// Cancellations first (highest priority), then remaining actions.
-    /// Within each priority group, ordered by (sender, nonce) for determinism
-    /// — the incremental [`SortKey`] iteration order (T2.3), no re-sort.
+    /// Within each priority group, in arrival order — the incremental
+    /// [`SortKey`] iteration order (T2.3), no re-sort.
     /// Excess actions from rate-limited senders stay in pool for next block.
     pub fn drain(&mut self, limit: usize) -> Vec<SignedNativeAction> {
         if self.max_per_block == 0 {
@@ -441,7 +461,7 @@ impl NativePool {
             if nonce >= cutoff {
                 break;
             }
-            self.remove_entry_by_key(&(priority, sender, nonce, seq));
+            self.remove_entry_by_key(&(priority, seq, sender, nonce));
             removed += 1;
         }
         removed
@@ -840,12 +860,12 @@ mod tests {
         );
     }
 
-    /// T2.3: the incremental BTreeMap order must reproduce the previous STABLE
-    /// `sort_by(cancel-priority, sender, nonce)` EXACTLY for identical pool
-    /// state — including insertion-order ties (equal priority, sender, nonce)
-    /// — since the proposer's selection order feeds the block body.
+    /// T2.3 / s65 item B: the incremental BTreeMap order must equal a STABLE
+    /// sort by cancel-priority alone — cancels first, then arrival order,
+    /// never by sender — since the proposer's selection order feeds the block
+    /// body.
     #[test]
-    fn selection_order_identical_to_reference_stable_sort() {
+    fn selection_order_is_cancels_first_then_arrival_order() {
         let mut pool = NativePool::new(100, 64, 16);
         // Shuffled inserts across senders/nonces with cancels interleaved,
         // plus a deliberate tie: same sender + nonce, two distinct cancels.
@@ -885,17 +905,12 @@ mod tests {
             pool.insert(*sender, action.clone()).unwrap();
         }
 
-        // Reference = the previous algorithm verbatim: a STABLE sort of the
-        // inserted list by (cancel-priority, sender, nonce).
+        // Reference (s65 item B): a STABLE sort of the inserted list by
+        // cancel-priority only — cancels first, otherwise arrival order. The
+        // sender address must play no part (it used to, which starved
+        // high-address senders under load).
         let mut reference = inserts.clone();
-        reference.sort_by(|(sa, aa), (sb, ab)| {
-            let a_pri = if is_cancel(&aa.action) { 0u8 } else { 1 };
-            let b_pri = if is_cancel(&ab.action) { 0u8 } else { 1 };
-            a_pri
-                .cmp(&b_pri)
-                .then_with(|| sa.cmp(sb))
-                .then_with(|| aa.nonce.cmp(&ab.nonce))
-        });
+        reference.sort_by_key(|(_, a)| if is_cancel(&a.action) { 0u8 } else { 1 });
 
         let selected = pool.select_for_block_with_senders(inserts.len());
         let got: Vec<(Address, B256)> = selected
@@ -908,7 +923,7 @@ mod tests {
             .collect();
         assert_eq!(
             got, want,
-            "incremental selection order must equal the reference stable sort"
+            "selection order must be cancels first, then arrival order"
         );
 
         // Drain follows the identical order.
@@ -916,6 +931,44 @@ mod tests {
         let drained_hashes: Vec<B256> = drained.iter().map(compute_action_hash).collect();
         let want_hashes: Vec<B256> = want.iter().map(|(_, h)| *h).collect();
         assert_eq!(drained_hashes, want_hashes, "drain order matches too");
+    }
+
+    /// s65 item B: under a full block, the sender that ARRIVED first wins the
+    /// slot regardless of its address. The old `(priority, sender, ...)` key
+    /// always served the lowest address first, so a fixed high-address band
+    /// expired under load.
+    #[test]
+    fn earlier_arrival_beats_lower_address_for_a_scarce_slot() {
+        let mut pool = NativePool::new(100, 64, 16);
+        let high = Address::repeat_byte(0xee);
+        let low = Address::repeat_byte(0x01);
+        pool.insert(high, make_action(10, NativeAction::ClaimRewards)).unwrap();
+        pool.insert(low, make_action(11, NativeAction::ClaimRewards)).unwrap();
+
+        let one_slot = pool.select_for_block_with_senders(1);
+        assert_eq!(one_slot.len(), 1);
+        assert_eq!(one_slot[0].0, high, "first arrival must take the only slot");
+    }
+
+    /// s65 item C: the commit-time restash returns the key stored at insert,
+    /// never a recomputation (a deliberately wrong stored key comes back
+    /// verbatim), and nothing for entries stored without one.
+    #[test]
+    fn restash_returns_stored_key_without_recomputing() {
+        let mut pool = NativePool::new(100, 64, 16);
+        let stored = B256::repeat_byte(0xab);
+        let a = make_action(1, NativeAction::ClaimRewards);
+        let b = make_action(2, NativeAction::ClaimRewards);
+        let ha = pool
+            .insert_with_restash_key(Address::repeat_byte(1), a, Some(stored))
+            .unwrap();
+        let hb = pool
+            .insert_with_restash_key(Address::repeat_byte(2), b, None)
+            .unwrap();
+        assert_eq!(
+            pool.verified_restash_keys(&[ha, hb]),
+            vec![(stored, Address::repeat_byte(1))]
+        );
     }
 
     #[test]

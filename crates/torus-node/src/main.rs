@@ -566,7 +566,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Some(mempool.clone()),
         signing_key_for_app,
     );
-    let kv_store = RocksKVStore::new(state_db.db_arc());
+    let kv_store = RocksKVStore::new(state_db.db_arc()).with_metrics(metrics.clone());
 
     // EVM executor
     let executor = Arc::new(EvmExecutor::new(chain_config.chain_id));

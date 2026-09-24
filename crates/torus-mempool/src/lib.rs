@@ -69,6 +69,13 @@ pub struct MempoolConfig {
     // ---- Memory budget (Phase 3: 3.1.7) ----
     /// Maximum combined memory for EVM + native pools in bytes (0 = unlimited).
     pub max_memory_bytes: usize,
+    // ---- Admission limit (s65 item B) ----
+    /// Milliseconds of recent commit throughput the native pool may hold before
+    /// RPC ingress sheds non-cancels pre-verify. 0 = off;
+    /// `TORUS_ADMISSION_HORIZON_MS` env override.
+    pub native_admission_horizon_ms: u64,
+    /// The admission limit never drops below this many pooled actions.
+    pub native_admission_floor: usize,
 }
 
 impl Default for MempoolConfig {
@@ -87,6 +94,8 @@ impl Default for MempoolConfig {
             native_per_sender_cap: rate_limit::NATIVE_PER_SENDER_CAP,
             verified_sender_cache_cap: rate_limit::verified_sender_cache_cap(),
             max_memory_bytes: 64 * 1024 * 1024, // 64 MB default
+            native_admission_horizon_ms: rate_limit::admission_horizon_ms(),
+            native_admission_floor: rate_limit::admission_floor(),
         }
     }
 }
@@ -143,6 +152,10 @@ pub struct Mempool {
     /// fork. DO NOT unify the two keys. MISS => full recover + slash. See
     /// `docs/plans/double-verify-trust-cache-impl.md`.
     verified_senders: RwLock<FifoCache<B256, Address>>,
+    /// s65 item B: `(time, native actions committed)` per commit over the last
+    /// [`rate_limit::ADMISSION_RATE_WINDOW_MS`] — the rate the admission limit
+    /// follows.
+    native_commit_log: std::sync::Mutex<std::collections::VecDeque<(std::time::Instant, usize)>>,
 }
 
 impl Mempool {
@@ -175,7 +188,49 @@ impl Mempool {
             native_gossip_enabled: std::sync::atomic::AtomicBool::new(false),
             metrics: std::sync::OnceLock::new(),
             verified_senders: RwLock::new(FifoCache::new(verified_cap)),
+            native_commit_log: std::sync::Mutex::new(std::collections::VecDeque::new()),
         }
+    }
+
+    /// Pool size at which RPC ingress sheds non-cancels before verification
+    /// (s65 item B), or `None` when the admission limit is off.
+    pub fn native_admission_limit(&self) -> Option<usize> {
+        self.native_admission_limit_at(std::time::Instant::now())
+    }
+
+    fn native_admission_limit_at(&self, now: std::time::Instant) -> Option<usize> {
+        if self.config.native_admission_horizon_ms == 0 {
+            return None;
+        }
+        let mut log = self.native_commit_log.lock().unwrap();
+        trim_commit_log(&mut log, now);
+        let committed = log.iter().map(|(_, n)| n).sum();
+        let elapsed_ms = log
+            .front()
+            .map(|(t, _)| now.duration_since(*t).as_millis() as u64)
+            .unwrap_or(0);
+        rate_limit::admission_limit(
+            self.config.native_admission_horizon_ms,
+            self.config.native_admission_floor,
+            committed,
+            elapsed_ms,
+        )
+    }
+
+    /// True when the native pool already holds at least the admission limit:
+    /// new non-cancels would likely expire before inclusion.
+    pub fn native_admission_backlogged(&self) -> bool {
+        self.native_admission_limit()
+            .is_some_and(|limit| self.native.read().unwrap().size() >= limit)
+    }
+
+    fn record_native_commits_at(&self, now: std::time::Instant, committed: usize) {
+        if self.config.native_admission_horizon_ms == 0 {
+            return;
+        }
+        let mut log = self.native_commit_log.lock().unwrap();
+        log.push_back((now, committed));
+        trim_commit_log(&mut log, now);
     }
 
     /// Record a locally-verified `key -> sender` mapping in the exec trust-cache.
@@ -592,7 +647,7 @@ impl Mempool {
 
         {
             let mut pool = self.native.write().unwrap();
-            let result = pool.insert_verified(sender, action, verified_locally);
+            let result = pool.insert_with_restash_key(sender, action, cache_key);
             self.publish_native_pool_size(&pool);
             result?;
         }
@@ -942,7 +997,10 @@ impl Mempool {
         let mut pool = self.native.write().unwrap();
         pool.remove_committed(hashes);
         self.publish_native_pool_size(&pool);
-        pool.size()
+        let size = pool.size();
+        drop(pool);
+        self.record_native_commits_at(std::time::Instant::now(), hashes.len());
+        size
     }
 
     /// Approximate total memory used by pooled transactions (Phase 3: 3.1.7).
@@ -1044,6 +1102,20 @@ impl Mempool {
                 "pruned stale txs on block commit"
             );
         }
+    }
+}
+
+/// Drop commit-log entries older than the admission rate window.
+fn trim_commit_log(
+    log: &mut std::collections::VecDeque<(std::time::Instant, usize)>,
+    now: std::time::Instant,
+) {
+    let window = std::time::Duration::from_millis(rate_limit::ADMISSION_RATE_WINDOW_MS);
+    while log
+        .front()
+        .is_some_and(|(t, _)| now.saturating_duration_since(*t) > window)
+    {
+        log.pop_front();
     }
 }
 
@@ -2063,6 +2135,50 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(pool.evm_pool_size(), 1);
+    }
+
+    /// s65 item B: the admission limit is off by default and, when on, follows
+    /// the commits recorded over the last 10 s.
+    #[test]
+    fn admission_limit_follows_recent_commits() {
+        use std::time::{Duration, Instant};
+        let (_dir, state) = setup();
+        let off = Mempool::new(
+            state.clone(),
+            MempoolConfig {
+                native_admission_horizon_ms: 0,
+                ..MempoolConfig::default()
+            },
+        );
+        let t0 = Instant::now();
+        off.record_native_commits_at(t0, 1_000);
+        assert_eq!(off.native_admission_limit_at(t0), None);
+        assert!(!off.native_admission_backlogged());
+
+        let on = Mempool::new(
+            state,
+            MempoolConfig {
+                native_admission_horizon_ms: 10_000,
+                native_admission_floor: 800,
+                ..MempoolConfig::default()
+            },
+        );
+        // Cold: floor.
+        assert_eq!(on.native_admission_limit_at(t0), Some(800));
+        // 1,100 + 1,100 committed across 10 s => 220/s => 10 s horizon = 2,200.
+        on.record_native_commits_at(t0, 1_100);
+        on.record_native_commits_at(t0 + Duration::from_secs(5), 1_100);
+        assert_eq!(
+            on.native_admission_limit_at(t0 + Duration::from_secs(10)),
+            Some(2_200)
+        );
+        // 15 s later both entries left the 10 s window: back to the floor.
+        assert_eq!(
+            on.native_admission_limit_at(t0 + Duration::from_secs(25)),
+            Some(800)
+        );
+        // An empty pool is never backlogged at a non-zero limit.
+        assert!(!on.native_admission_backlogged());
     }
 
     #[test]
