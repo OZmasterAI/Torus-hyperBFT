@@ -1198,11 +1198,13 @@ impl<N: Network> HotStuff<N> {
                     &validator_set_state,
                     reputation.as_ref(),
                 );
+                // FIX CONS-FIND-16: Atomic write of vote state to prevent crash inconsistency.
+                // s65: persist BEFORE sending. If the process dies between the two, a vote that
+                // left the node but was never recorded would let the restarted replica vote
+                // again in this view (possibly for another block).
+                block_tree.set_vote_state_atomic(self.view_info.view, proposal.block.hash)?;
                 self.sender_handle
                     .send::<HotStuffMessage>(vote_recipient, phase_vote.clone().into());
-
-                // FIX CONS-FIND-16: Atomic write of vote state to prevent crash inconsistency.
-                block_tree.set_vote_state_atomic(self.view_info.view, proposal.block.hash)?;
 
                 // MonadBFT: Update local_tip (paper Alg 1, line 13: local_tip ← GetTip(p)).
                 // For fresh proposals: tip is the proposal itself.
@@ -1353,10 +1355,12 @@ impl<N: Network> HotStuff<N> {
                 &validator_set_state,
                 reputation.as_ref(),
             );
+            // s65: persist BEFORE sending. If the process dies between the two, a vote that
+            // left the node but was never recorded would let the restarted replica vote
+            // again in this view (possibly for another block).
+            block_tree.set_highest_view_phase_voted(self.view_info.view)?;
             self.sender_handle
                 .send::<HotStuffMessage>(vote_recipient, vote.clone().into());
-
-            block_tree.set_highest_view_phase_voted(self.view_info.view)?;
             Event::PhaseVote(PhaseVoteEvent {
                 timestamp: SystemTime::now(),
                 vote: vote.clone(),
@@ -2033,10 +2037,12 @@ impl<N: Network> HotStuff<N> {
                 &validator_set_state,
                 reputation.as_ref(),
             );
+            // s65: persist BEFORE sending. If the process dies between the two, a vote that
+            // left the node but was never recorded would let the restarted replica vote
+            // again in this view (possibly for another block).
+            block_tree.set_vote_state_atomic(header.view, header.block_hash)?;
             self.sender_handle
                 .send::<HotStuffMessage>(vote_recipient, phase_vote.clone().into());
-
-            block_tree.set_vote_state_atomic(header.view, header.block_hash)?;
             // T1.3 observability: this vote was cast before `app.validate_block` ran on the body
             // (unless the block is already in the tree, in which case it was validated on
             // insertion). If the body later turns out app-invalid, `try_insert_body` increments
