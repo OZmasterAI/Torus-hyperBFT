@@ -724,9 +724,14 @@ impl<N: Network> HotStuff<N> {
             // header is polled; that copy is then dropped once on arrival.
             let me = self.config.keypair.public();
             let key = (header.view, header.block_hash);
-            self.on_receive_proposal_header(header, &me, block_tree, app)?;
-            self.inline_self_header = Some(key);
+            // The commits are already durable, so the feed runs even if the
+            // inline vote fails; the loopback copy is then kept as a retry.
+            let voted = self.on_receive_proposal_header(header, &me, block_tree, app);
+            if voted.is_ok() {
+                self.inline_self_header = Some(key);
+            }
             self.process_update_result(update_result, block_tree, app);
+            voted?;
         }
         Ok(())
     }
