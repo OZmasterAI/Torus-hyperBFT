@@ -5,8 +5,10 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 
 use hotstuff_rs::block_tree::pluggables::{KVGet, KVStore, WriteBatch};
+use hotstuff_rs::block_tree::variables::HIGHEST_VIEW_PHASE_VOTED;
 use rocksdb::{ColumnFamilyDescriptor, Options, DB};
 
 const CF_NAME: &str = "cf_consensus_meta";
@@ -18,6 +20,9 @@ const CF_NAME: &str = "cf_consensus_meta";
 #[derive(Clone)]
 pub struct RocksKVStore {
     db: Arc<DB>,
+    /// When set, vote-state writes are timed into
+    /// `torus_vote_state_write_seconds` (s65 item A).
+    metrics: Option<Arc<torus_telemetry::Metrics>>,
 }
 
 impl RocksKVStore {
@@ -26,7 +31,14 @@ impl RocksKVStore {
     /// The database must already have the `cf_consensus_meta` column family
     /// (e.g., opened via `torus_state::StateDb`).
     pub fn new(db: Arc<DB>) -> Self {
-        Self { db }
+        Self { db, metrics: None }
+    }
+
+    /// Time vote-state writes (the batch carrying `HIGHEST_VIEW_PHASE_VOTED`),
+    /// which since f05b20e happen before the vote is sent.
+    pub fn with_metrics(mut self, metrics: Arc<torus_telemetry::Metrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// Open a standalone consensus database (useful for testing).
@@ -38,7 +50,10 @@ impl RocksKVStore {
         opts.create_missing_column_families(true);
         let cf = ColumnFamilyDescriptor::new(CF_NAME, Options::default());
         let db = DB::open_cf_descriptors(&opts, path, vec![cf]).expect("open consensus DB");
-        Self { db: Arc::new(db) }
+        Self {
+            db: Arc::new(db),
+            metrics: None,
+        }
     }
 }
 
@@ -125,6 +140,16 @@ impl KVStore for RocksKVStore {
     type Snapshot<'a> = RocksSnapshot<'a>;
 
     fn write(&mut self, wb: RocksWriteBatch) {
+        let started = self
+            .metrics
+            .as_ref()
+            .filter(|_| {
+                wb.ops.iter().any(|op| {
+                    matches!(op, WriteOp::Set { start, key_end, .. }
+                        if wb.bytes[*start..*key_end] == HIGHEST_VIEW_PHASE_VOTED[..])
+                })
+            })
+            .map(|m| (m, Instant::now()));
         let cf = self
             .db
             .cf_handle(CF_NAME)
@@ -143,6 +168,10 @@ impl KVStore for RocksKVStore {
             }
         }
         self.db.write(batch).expect("RocksDB write failed");
+        if let Some((m, t)) = started {
+            m.vote_state_write_seconds
+                .observe(t.elapsed().as_secs_f64());
+        }
     }
 
     fn clear(&mut self) {

@@ -290,6 +290,10 @@ pub struct Metrics {
     /// (`persist_committed_block_durably`, FIX 1a: header + body record + manifest
     /// prune in ONE WriteBatch). Wall time on the single HotStuff thread per commit.
     pub commit_persist_seconds: Histogram,
+    /// s65 item A: consensus-thread write of the vote state
+    /// (`highest_view_voted` [+ `last_voted_proposal`]), which since f05b20e
+    /// happens BEFORE the vote is sent. 10 us buckets.
+    pub vote_state_write_seconds: Histogram,
     /// r4 commit-persist: the body-record ENCODE alone inside the commit persist
     /// (CPU: borrowed bin/JSON encode of the block payload), split from the write.
     pub commit_body_encode_seconds: Histogram,
@@ -1337,6 +1341,13 @@ impl Metrics {
             "Consensus thread: commit-time durable header+body+manifest persist (one WriteBatch, FIX 1a)",
             commit_persist_seconds.clone(),
         );
+
+        let vote_state_write_seconds = Histogram::new(exponential_buckets(0.00001, 2.0, 15));
+        registry.register(
+            "torus_vote_state_write_seconds",
+            "Consensus thread: vote-state write, done before the vote is sent (s65)",
+            vote_state_write_seconds.clone(),
+        );
         let commit_body_encode_seconds = Histogram::new(exponential_buckets(0.0005, 2.0, 14));
         registry.register(
             "torus_commit_body_encode_seconds",
@@ -1827,6 +1838,7 @@ impl Metrics {
             exec_load_books_seconds,
             exec_body_persist_seconds,
             commit_persist_seconds,
+            vote_state_write_seconds,
             commit_body_encode_seconds,
             commit_persist_write_seconds,
             validate_block_seconds,
@@ -1974,6 +1986,25 @@ mod tests {
         m.blocks_committed.inc();
         let encoded = m.encode();
         assert!(encoded.contains("torus_blocks_committed"));
+    }
+
+    /// s65 item A: the vote-state write histogram must be registered with
+    /// sub-millisecond buckets, so the cost of persisting a vote before it is
+    /// sent (f05b20e) is measurable in microseconds.
+    #[test]
+    fn vote_state_write_metric_registers_with_fine_buckets() {
+        let m = Metrics::new();
+        m.vote_state_write_seconds.observe(0.00002);
+        let text = m.encode();
+        assert!(
+            text.contains("torus_vote_state_write_seconds_count 1"),
+            "torus_vote_state_write_seconds not registered:\n{text}"
+        );
+        assert!(
+            text.contains("torus_vote_state_write_seconds_bucket{le=\"0.00001\"} 0")
+                && text.contains("torus_vote_state_write_seconds_bucket{le=\"0.00002\"} 1"),
+            "vote-state write buckets must start at 10 us:\n{text}"
+        );
     }
 
     /// Ingress-verify-fix Option A: the admit sub-phase histograms must be

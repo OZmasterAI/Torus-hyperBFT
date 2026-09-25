@@ -185,3 +185,31 @@ fn packed_batch_read_only_write_failure_keeps_original_panic_and_rows() {
     assert_eq!(store.get(b"existing"), Some(b"old".to_vec()));
     assert_eq!(store.get(b"new"), None);
 }
+
+/// s65 item A: only batches carrying the vote-state key are timed into
+/// `torus_vote_state_write_seconds`; every other consensus write is not.
+#[test]
+fn vote_state_writes_are_timed_and_other_writes_are_not() {
+    use hotstuff_rs::block_tree::variables::HIGHEST_VIEW_PHASE_VOTED;
+    let dir = TempDir::new().unwrap();
+    let metrics = Arc::new(torus_telemetry::Metrics::new());
+    let mut store = RocksKVStore::open(dir.path()).with_metrics(metrics.clone());
+
+    store.write(pack(&[LegacyOp::Set(b"other".to_vec(), b"v".to_vec())]));
+    assert!(metrics
+        .encode()
+        .contains("torus_vote_state_write_seconds_count 0"));
+
+    store.write(pack(&[
+        LegacyOp::Set(HIGHEST_VIEW_PHASE_VOTED.to_vec(), 7u64.to_le_bytes().to_vec()),
+        LegacyOp::Set(b"last-voted".to_vec(), b"x".to_vec()),
+    ]));
+    assert!(metrics
+        .encode()
+        .contains("torus_vote_state_write_seconds_count 1"));
+    assert_eq!(
+        store.get(&HIGHEST_VIEW_PHASE_VOTED),
+        Some(7u64.to_le_bytes().to_vec()),
+        "timing must not change what is written"
+    );
+}

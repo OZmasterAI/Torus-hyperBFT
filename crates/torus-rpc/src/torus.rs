@@ -34,6 +34,13 @@ use crate::error::RpcError;
 use crate::types::*;
 use crate::RpcState;
 
+/// Per-item reply when a non-cancel is shed because the native pool is full.
+pub(crate) const POOL_FULL_PREVERIFY_MSG: &str = "mempool: pool full (pre-verify)";
+/// Per-item reply when a non-cancel is shed by the admission limit (s65 item B):
+/// the pool already holds more than the chain can include soon. Retryable.
+pub(crate) const ADMISSION_BUSY_MSG: &str =
+    "mempool: busy, admission limit reached (pre-verify), retry later";
+
 // ============================================================================
 // Internal deserialization helpers
 // ============================================================================
@@ -407,7 +414,17 @@ impl RpcState {
         // actions are doomed at admission — shed them after a decode-only
         // pass instead of paying signature verification. Cancels proceed to
         // full verification (admission evicts a non-cancel to make room).
-        let mut slots: Vec<SubmitSlot> = if self.mempool.native_pool_is_full() {
+        // s65 item B: the same pre-verify shed when the pool already holds
+        // more than the admission limit (recent commit rate x horizon), with a
+        // retryable "busy" instead of "pool full".
+        let shed_msg = if self.mempool.native_pool_is_full() {
+            Some(POOL_FULL_PREVERIFY_MSG)
+        } else if self.mempool.native_admission_backlogged() {
+            Some(ADMISSION_BUSY_MSG)
+        } else {
+            None
+        };
+        let mut slots: Vec<SubmitSlot> = if let Some(shed_msg) = shed_msg {
             let screened = tokio::task::spawn_blocking(move || {
                 signed_actions
                     .into_iter()
@@ -419,9 +436,7 @@ impl RpcState {
                             Ok(action) if torus_mempool::is_cancel(&action.action) => {
                                 SubmitSlot::Proceed(signed_action)
                             }
-                            Ok(_) => {
-                                SubmitSlot::Rejected("mempool: pool full (pre-verify)".to_string())
-                            }
+                            Ok(_) => SubmitSlot::Rejected(shed_msg.to_string()),
                             Err(e) => SubmitSlot::Rejected(e),
                         }
                     })
@@ -433,10 +448,10 @@ impl RpcState {
             })?;
             for slot in &screened {
                 if let SubmitSlot::Rejected(msg) = slot {
-                    self.count_admit_reject(if msg.ends_with("(pre-verify)") {
-                        "pool_full_preverify"
-                    } else {
-                        "verify_failed"
+                    self.count_admit_reject(match msg.as_str() {
+                        POOL_FULL_PREVERIFY_MSG => "pool_full_preverify",
+                        ADMISSION_BUSY_MSG => "backlog_preverify",
+                        _ => "verify_failed",
                     });
                 }
             }
@@ -1099,6 +1114,20 @@ impl TorusApiServer for RpcState {
             .ok_or_else(|| {
                 ErrorObjectOwned::from(RpcError::Internal("server overloaded, try again".into()))
             })?;
+        // s65 item B: this endpoint honours the admission limit too, with the
+        // same decode-only screen as the batch pipeline (cancels still pass).
+        if self.mempool.native_admission_backlogged() {
+            let is_cancel = parse_bytes(&signed_action)
+                .ok()
+                .and_then(|bytes| decode_action_json(&bytes).ok())
+                .is_some_and(|a| torus_mempool::is_cancel(&a.action));
+            if !is_cancel {
+                self.count_admit_reject("backlog_preverify");
+                return Err(ErrorObjectOwned::from(RpcError::Internal(
+                    ADMISSION_BUSY_MSG.into(),
+                )));
+            }
+        }
         // Offload deserialization + ECDSA verification to the blocking thread pool
         // so heavy crypto doesn't starve the async runtime under load.
         // T2.4: same shared verify path as the batch endpoints — the canonical

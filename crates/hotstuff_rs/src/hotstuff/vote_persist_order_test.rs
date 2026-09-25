@@ -47,28 +47,29 @@ use crate::types::data_types::{
 use crate::types::update_sets::{AppStateUpdates, ValidatorSetUpdates};
 use crate::types::validator_set::{ValidatorSet, ValidatorSetState};
 
-const CHAIN_ID: ChainID = ChainID::new(0);
-const PERSIST: &str = "persist_vote_state";
-const SEND: &str = "send_vote";
+pub(crate) const CHAIN_ID: ChainID = ChainID::new(0);
+pub(crate) const PERSIST: &str = "persist_vote_state";
+pub(crate) const SEND: &str = "send_vote";
+pub(crate) const BROADCAST_HEADER: &str = "broadcast_header";
 
-type OrderLog = Arc<Mutex<Vec<&'static str>>>;
+pub(crate) type OrderLog = Arc<Mutex<Vec<&'static str>>>;
 
 // ---------------------------------------------------------------------------
 // KV store that logs every write of the vote-state key.
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
-struct OrderKV {
+pub(crate) struct OrderKV {
     map: HashMap<Vec<u8>, Vec<u8>>,
     log: OrderLog,
 }
 
-struct OrderWb {
+pub(crate) struct OrderWb {
     sets: Vec<(Vec<u8>, Vec<u8>)>,
     deletes: Vec<Vec<u8>>,
 }
 
-struct OrderSnap(HashMap<Vec<u8>, Vec<u8>>);
+pub(crate) struct OrderSnap(HashMap<Vec<u8>, Vec<u8>>);
 
 impl WriteBatch for OrderWb {
     fn new() -> Self {
@@ -124,14 +125,21 @@ impl KVStore for OrderKV {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
-struct OrderNetwork {
-    log: OrderLog,
+pub(crate) struct OrderNetwork {
+    pub(crate) log: OrderLog,
 }
 
 impl Network for OrderNetwork {
     fn init_validator_set(&mut self, _validator_set: ValidatorSet) {}
     fn update_validator_set(&mut self, _updates: ValidatorSetUpdates) {}
-    fn broadcast(&mut self, _message: Message) {}
+    fn broadcast(&mut self, message: Message) {
+        if let Message::ProgressMessage(ProgressMessage::HotStuffMessage(
+            HotStuffMessage::ProposalHeader(_),
+        )) = message
+        {
+            self.log.lock().unwrap().push(BROADCAST_HEADER);
+        }
+    }
     fn send(&mut self, _peer: VerifyingKey, message: Message) {
         if let Message::ProgressMessage(ProgressMessage::HotStuffMessage(
             HotStuffMessage::PhaseVote(_),
@@ -182,7 +190,7 @@ struct Fixture {
 }
 
 /// An initialized 4-validator block tree whose KV store appends to `log`.
-fn base_tree() -> (Vec<SigningKey>, ValidatorSet, ValidatorSetState, BlockTreeSingleton<OrderKV>, OrderLog) {
+pub(crate) fn base_tree() -> (Vec<SigningKey>, ValidatorSet, ValidatorSetState, BlockTreeSingleton<OrderKV>, OrderLog) {
     let keys = signing_keys(&[1, 2, 3, 4]);
     let set = validator_set(&keys);
     let vss = ValidatorSetState::new(set.clone(), set.clone(), None, true);
@@ -199,7 +207,7 @@ fn base_tree() -> (Vec<SigningKey>, ValidatorSet, ValidatorSetState, BlockTreeSi
 
 /// A quorum-signed `PhaseCertificate` of any `phase` (as `generic_pc`, which
 /// is Generic-only).
-fn pc(
+pub(crate) fn pc(
     view: ViewNumber,
     block: CryptoHash,
     phase: Phase,
@@ -252,7 +260,7 @@ fn fixture() -> Fixture {
 }
 
 /// Replica `key` at `view`, whose network appends to `log`.
-fn replica(
+pub(crate) fn replica(
     key: &SigningKey,
     vss: &ValidatorSetState,
     log: &OrderLog,

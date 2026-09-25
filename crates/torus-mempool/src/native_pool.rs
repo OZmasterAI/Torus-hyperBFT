@@ -20,6 +20,11 @@ use crate::error::MempoolError;
 /// monotonically increasing insertion counter, so entries with equal
 /// `(priority, sender, nonce)` iterate in insertion order — precisely the
 /// tie order the stable sort preserved.
+///
+/// s66: an arrival-order key `(priority, seq, sender, nonce)` (s65 item B,
+/// meant to stop high-address senders starving) collapsed throughput under
+/// overload (s66-abcfix-abc-r1: 3.4k matched/s, 15 txs/blk, gossip flood) and
+/// was reverted; the same binary with this key ran 56k (s66-bisect-noarr-r1).
 type SortKey = (u8, Address, u64, u64);
 
 /// Same identity as SortKey, ordered by nonce for expiry-prefix removal.
@@ -40,12 +45,18 @@ pub(crate) struct NativePoolEntry {
     /// block body (bodies are bincode, app.rs `block_bytes`). Computed once at
     /// insert so byte-capped selection is O(1) per entry.
     pub encoded_len: usize,
-    /// True iff THIS node verified the signature and resolved `sender` from it
-    /// (RPC ingress or gossip-RECOVER) — the only entries eligible to seed the
-    /// exec trust-cache. False for gossip-TRUSTED admits (sender claimed by a
-    /// peer, not re-derived here), which must never be short-circuited at exec.
+    /// The exec trust-cache key (`torus_types::verified_cache_key`) iff THIS node
+    /// verified the signature and resolved `sender` from it (RPC ingress or
+    /// gossip-RECOVER) AND the signature kind is cacheable (EIP-712) — the only
+    /// entries eligible to seed the exec trust-cache. `None` for gossip-TRUSTED
+    /// admits (sender claimed by a peer, not re-derived here), which must never
+    /// be short-circuited at exec, and for session actions.
     /// See `docs/plans/double-verify-trust-cache-impl.md`.
-    pub verified_locally: bool,
+    ///
+    /// s65 item C: stored at insert (ingress already derives it) so the
+    /// commit-time restash is a lookup, not a canonical re-encode + keccak of
+    /// every committed action on the consensus thread (~30 ms per commit).
+    pub restash_key: Option<B256>,
 }
 
 /// Native action pool with per-sender tracking, dedup, and size limits.
@@ -113,16 +124,11 @@ impl NativePool {
     /// (`verified_cache_key` returns `None`).
     pub fn verified_restash_keys(&self, hashes: &[B256]) -> Vec<(B256, Address)> {
         let mut out = Vec::new();
-        let mut scratch = Vec::new();
         for h in hashes {
             if let Some(key) = self.hash_index.get(h).and_then(|keys| keys.first()) {
                 if let Some(entry) = self.entries.get(key) {
-                    if entry.verified_locally {
-                        if let Some(key) = torus_types::verified_cache_key_with_scratch(
-                            &entry.action, &mut scratch,
-                        ) {
-                            out.push((key, entry.sender));
-                        }
+                    if let Some(restash) = entry.restash_key {
+                        out.push((restash, entry.sender));
                     }
                 }
             }
@@ -153,6 +159,23 @@ impl NativePool {
         sender: Address,
         action: SignedNativeAction,
         verified_locally: bool,
+    ) -> Result<B256, MempoolError> {
+        let restash_key = if verified_locally {
+            torus_types::verified_cache_key(&action)
+        } else {
+            None
+        };
+        self.insert_with_restash_key(sender, action, restash_key)
+    }
+
+    /// [`insert_verified`](Self::insert_verified) with the trust-cache key the
+    /// caller already derived (`Some` only for a locally verified, cacheable
+    /// action), so it is not recomputed here under the pool write lock.
+    pub fn insert_with_restash_key(
+        &mut self,
+        sender: Address,
+        action: SignedNativeAction,
+        restash_key: Option<B256>,
     ) -> Result<B256, MempoolError> {
         let action_hash = compute_action_hash(&action);
         let is_cancel = is_cancel(&action.action);
@@ -205,7 +228,7 @@ impl NativePool {
                 action_hash,
                 is_cancel,
                 encoded_len,
-                verified_locally,
+                restash_key,
             },
         );
 
@@ -916,6 +939,27 @@ mod tests {
         let drained_hashes: Vec<B256> = drained.iter().map(compute_action_hash).collect();
         let want_hashes: Vec<B256> = want.iter().map(|(_, h)| *h).collect();
         assert_eq!(drained_hashes, want_hashes, "drain order matches too");
+    }
+
+    /// s65 item C: the commit-time restash returns the key stored at insert,
+    /// never a recomputation (a deliberately wrong stored key comes back
+    /// verbatim), and nothing for entries stored without one.
+    #[test]
+    fn restash_returns_stored_key_without_recomputing() {
+        let mut pool = NativePool::new(100, 64, 16);
+        let stored = B256::repeat_byte(0xab);
+        let a = make_action(1, NativeAction::ClaimRewards);
+        let b = make_action(2, NativeAction::ClaimRewards);
+        let ha = pool
+            .insert_with_restash_key(Address::repeat_byte(1), a, Some(stored))
+            .unwrap();
+        let hb = pool
+            .insert_with_restash_key(Address::repeat_byte(2), b, None)
+            .unwrap();
+        assert_eq!(
+            pool.verified_restash_keys(&[ha, hb]),
+            vec![(stored, Address::repeat_byte(1))]
+        );
     }
 
     #[test]

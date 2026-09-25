@@ -186,4 +186,7 @@ mod pc_discard_regression_test;
 mod iter2_lock_safety_test;
 
 #[cfg(test)]
-mod vote_persist_order_test;
+pub(crate) mod vote_persist_order_test;
+
+#[cfg(test)]
+mod leader_feed_order_test;

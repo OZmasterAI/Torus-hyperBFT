@@ -148,6 +148,14 @@ pub(crate) struct HotStuff<N: Network> {
     /// [`BODY_PUSH_HARD_CAP_BYTES`]. 0 = OFF — exact-today behavior (header +
     /// solicited fetch only).
     body_push_max_bytes: u64,
+    /// s65 item C: when true, a leader broadcasts its header and casts its own
+    /// vote BEFORE running the app commit feed for the blocks its justify just
+    /// committed (see [`finish_leader_proposal`](Self::finish_leader_proposal)).
+    /// Read once from `TORUS_DEFER_COMMIT_FEED` (`1` enables). Default OFF.
+    defer_commit_feed: bool,
+    /// s65 item C: `(view, block)` of the leader's own header that was already
+    /// processed inline; its loopback copy is dropped once on arrival.
+    inline_self_header: Option<(ViewNumber, CryptoHash)>,
     /// L3 v2 (body push): unsolicited pushed bodies that arrived BEFORE their
     /// header, parked until [`on_receive_proposal_header`](Self::on_receive_proposal_header)
     /// consumes them (or FIFO eviction reclaims the slot). Bounded by
@@ -197,8 +205,17 @@ impl<N: Network> HotStuff<N> {
             proposal_deferred: false,
             last_missing_pc_check: Instant::now(),
             body_push_max_bytes: body_push_max_bytes_from_env(),
+            defer_commit_feed: defer_commit_feed_from_env(),
+            inline_self_header: None,
             pushed_bodies: VecDeque::new(),
         }
+    }
+
+    /// Test-only override of the deferred-commit-feed flag (bypasses the
+    /// process-global env cache).
+    #[cfg(test)]
+    pub(crate) fn set_defer_commit_feed(&mut self, on: bool) {
+        self.defer_commit_feed = on;
     }
 
     /// Test-only override of the body-push threshold, bypassing the
@@ -422,25 +439,13 @@ impl<N: Network> HotStuff<N> {
                         }
                         UpdateResult { validator_set_updates: None, committed_block_hashes: vec![] }
                     });
-                    self.process_update_result(update_result, block_tree, app);
-
-                    let proposal = Proposal {
-                        chain_id: self.config.chain_id,
-                        view: self.view_info.view,
+                    self.finish_leader_proposal(
                         block,
-                        tc: None,
-                        nec: None,
-                    };
-                    self.broadcast_proposal_as_header(
-                        &proposal,
                         validator_set_updates.is_some(),
+                        update_result,
                         block_tree,
-                    );
-                    Event::Propose(ProposeEvent {
-                        timestamp: SystemTime::now(),
-                        proposal,
-                    })
-                    .publish(&self.event_publisher);
+                        app,
+                    )?;
                 }
             }
             return Ok(());
@@ -640,27 +645,13 @@ impl<N: Network> HotStuff<N> {
                             validator_set_updates: None,
                             committed_block_hashes: vec![],
                         });
-                    self.process_update_result(update_result, block_tree, app);
-
-                    let proposal = Proposal {
-                        chain_id: self.config.chain_id,
-                        view: self.view_info.view,
+                    self.finish_leader_proposal(
                         block,
-                        tc: None,
-                        nec: None,
-                    };
-
-                    self.broadcast_proposal_as_header(
-                        &proposal,
                         validator_set_updates.is_some(),
+                        update_result,
                         block_tree,
-                    );
-
-                    Event::Propose(ProposeEvent {
-                        timestamp: SystemTime::now(),
-                        proposal,
-                    })
-                    .publish(&self.event_publisher);
+                        app,
+                    )?;
                 }
                 // Produce and broadcast a Nudge.
                 Phase::Prepare | Phase::Precommit | Phase::Commit => {
@@ -682,6 +673,66 @@ impl<N: Network> HotStuff<N> {
             }
         }
 
+        Ok(())
+    }
+
+    /// Broadcast a leader's freshly produced `block` and deliver the commits in
+    /// `update_result` (from `block_tree.update(&block.justify)`) to the app.
+    ///
+    /// s65 item C: the commit feed (`on_committed_block`: body record, manifest,
+    /// mempool prune, exec dispatch — ~120 ms per leader view under load) used to
+    /// run BEFORE the header went out, and votes for view v go to leader(v+1),
+    /// which needs every validator's vote (3/3 at n=3). With `defer_commit_feed`
+    /// the header goes out first and the leader votes on its own block inline,
+    /// then the feed runs — overlapping the followers' vote path instead of
+    /// delaying it. `block_tree.update` (lock, highest PC, durable commit) still
+    /// runs before the broadcast, so safety state is unchanged; a crash between
+    /// the commit write and the feed is covered by the durable-frontier replay
+    /// (S444). OFF = exact pre-s65 order.
+    fn finish_leader_proposal<K: KVStore>(
+        &mut self,
+        block: Block,
+        has_validator_set_updates: bool,
+        update_result: UpdateResult,
+        block_tree: &mut BlockTreeSingleton<K>,
+        app: &mut impl App<K>,
+    ) -> Result<(), HotStuffError> {
+        let deferred = if self.defer_commit_feed {
+            Some(update_result)
+        } else {
+            self.process_update_result(update_result, block_tree, app);
+            None
+        };
+        let proposal = Proposal {
+            chain_id: self.config.chain_id,
+            view: self.view_info.view,
+            block,
+            tc: None,
+            nec: None,
+        };
+        self.broadcast_proposal_as_header(&proposal, has_validator_set_updates, block_tree);
+        let own_header = deferred
+            .is_some()
+            .then(|| ProposalHeader::from_proposal(&proposal, has_validator_set_updates));
+        Event::Propose(ProposeEvent {
+            timestamp: SystemTime::now(),
+            proposal,
+        })
+        .publish(&self.event_publisher);
+        if let (Some(update_result), Some(header)) = (deferred, own_header) {
+            // Vote on our own block now rather than when the loopback copy of the
+            // header is polled; that copy is then dropped once on arrival.
+            let me = self.config.keypair.public();
+            let key = (header.view, header.block_hash);
+            // The commits are already durable, so the feed runs even if the
+            // inline vote fails; the loopback copy is then kept as a retry.
+            let voted = self.on_receive_proposal_header(header, &me, block_tree, app);
+            if voted.is_ok() {
+                self.inline_self_header = Some(key);
+            }
+            self.process_update_result(update_result, block_tree, app);
+            voted?;
+        }
         Ok(())
     }
 
@@ -1829,6 +1880,15 @@ impl<N: Network> HotStuff<N> {
         block_tree: &mut BlockTreeSingleton<K>,
         app: &mut impl App<K>,
     ) -> Result<(), HotStuffError> {
+        // s65 item C: the leader already processed its own header inline
+        // (finish_leader_proposal); drop the loopback copy once, so it cannot
+        // advance `proposal_status` a second time.
+        if self.inline_self_header == Some((header.view, header.block_hash))
+            && *origin == self.config.keypair.public()
+        {
+            self.inline_self_header = None;
+            return Ok(());
+        }
         // Headers bypass receive-side view filtering so delayed bodies and
         // ancestors can still be recovered. Only the authenticated leader's
         // header for our CURRENT view may consume that view's vote/status.
@@ -3035,6 +3095,17 @@ pub(crate) fn parse_body_push_max_bytes(raw: Option<String>) -> u64 {
     raw.and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(0)
         .min(BODY_PUSH_HARD_CAP_BYTES)
+}
+
+/// `TORUS_DEFER_COMMIT_FEED`: only `1` enables (s65 item C, default OFF).
+pub(crate) fn parse_defer_commit_feed(raw: Option<String>) -> bool {
+    matches!(raw.as_deref().map(str::trim), Some("1"))
+}
+
+/// Cached env read of `TORUS_DEFER_COMMIT_FEED`.
+fn defer_commit_feed_from_env() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| parse_defer_commit_feed(std::env::var("TORUS_DEFER_COMMIT_FEED").ok()))
 }
 
 /// Cached env read of the body-push threshold (bytes). Read once per process,
