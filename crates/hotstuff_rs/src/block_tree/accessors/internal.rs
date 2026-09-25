@@ -2636,4 +2636,110 @@ mod block_tree_pruner_tests {
         // Reset for other tests in this process.
         set_block_tree_retention(None);
     }
+
+    /// Insert an uncommitted block at `height` justified by `parent`; `tag`
+    /// makes siblings at the same height hash differently.
+    fn insert_uncommitted(
+        bt: &mut BlockTreeSingleton<MemKV>,
+        height: u64,
+        parent: CryptoHash,
+        tag: u8,
+    ) -> CryptoHash {
+        let justify = PhaseCertificate {
+            chain_id: ChainID::new(0),
+            view: ViewNumber::new(100 + tag as u64),
+            block: parent,
+            phase: Phase::Generic,
+            signatures: SignatureSet::new(0),
+        };
+        let block = Block::new(
+            BlockHeight::new(height),
+            justify,
+            CryptoHash::new([tag; 32]),
+            Data::new(vec![]),
+        );
+        bt.insert(&block, None, None).unwrap();
+        block.hash
+    }
+
+    /// s66 sync-serve fail-stop (s65-abc-ctl-r1, height 776): `NEWEST_BLOCK` is
+    /// the last INSERTED block on any branch, so a late body for an abandoned
+    /// sibling below the committed tip becomes "newest". The speculative walk
+    /// then descends from that sibling through already-committed heights, and
+    /// the client's committed-conflict check fail-stops on the sibling.
+    /// A response for heights above the tip must hold only blocks above it.
+    #[test]
+    fn sync_serve_never_returns_a_stale_sibling_below_the_committed_tip() {
+        let mut bt = BlockTreeSingleton::new(MemKV::default());
+        let hashes = seed_committed_chain(&mut bt, 6); // committed 0..=5
+        let spec = insert_uncommitted(&mut bt, 6, hashes[5], 0xB6);
+        set_highest_pc_on(&mut bt, spec);
+        let _stale = insert_uncommitted(&mut bt, 3, hashes[2], 0xA3); // inserted last
+
+        let served = bt
+            .snapshot()
+            .blocks_from_height_to_newest(BlockHeight::new(6), 64)
+            .unwrap();
+        let heights: Vec<u64> = served.iter().map(|b| b.height.int()).collect();
+        assert!(
+            served.iter().all(|b| b.height.int() > 5),
+            "sync serve returned blocks at or below the committed tip: heights {heights:?}"
+        );
+        assert_eq!(
+            served.iter().map(|b| b.hash).collect::<Vec<_>>(),
+            vec![spec],
+            "expected only the speculative block extending the committed tip"
+        );
+    }
+
+    /// The normal case is unchanged: a newest block that extends the committed
+    /// tip is served with its uncommitted ancestors, oldest first.
+    #[test]
+    fn sync_serve_returns_the_speculative_chain_above_the_committed_tip() {
+        let mut bt = BlockTreeSingleton::new(MemKV::default());
+        let hashes = seed_committed_chain(&mut bt, 6); // committed 0..=5
+        let h6 = insert_uncommitted(&mut bt, 6, hashes[5], 0xB6);
+        let h7 = insert_uncommitted(&mut bt, 7, h6, 0xB7);
+
+        let served = bt
+            .snapshot()
+            .blocks_from_height_to_newest(BlockHeight::new(6), 64)
+            .unwrap();
+        assert_eq!(
+            served.iter().map(|b| b.hash).collect::<Vec<_>>(),
+            vec![h6, h7]
+        );
+    }
+
+    /// With nothing above the committed tip (newest IS the tip), a request for
+    /// heights above the tip gets nothing — never the committed chain again.
+    #[test]
+    fn sync_serve_returns_nothing_when_newest_is_the_committed_tip() {
+        let mut bt = BlockTreeSingleton::new(MemKV::default());
+        let hashes = seed_committed_chain(&mut bt, 6); // committed 0..=5, newest = h5
+        set_highest_pc_on(&mut bt, hashes[5]);
+
+        let served = bt
+            .snapshot()
+            .blocks_from_height_to_newest(BlockHeight::new(6), 64)
+            .unwrap();
+        let heights: Vec<u64> = served.iter().map(|b| b.height.int()).collect();
+        assert!(
+            served.is_empty(),
+            "expected nothing above the tip, got heights {heights:?}"
+        );
+    }
+
+    fn set_highest_pc_on(bt: &mut BlockTreeSingleton<MemKV>, block: CryptoHash) {
+        let pc = PhaseCertificate {
+            chain_id: ChainID::new(0),
+            view: ViewNumber::new(200),
+            block,
+            phase: Phase::Generic,
+            signatures: SignatureSet::new(0),
+        };
+        let mut wb = BlockTreeWriteBatch::new();
+        wb.set_highest_pc(&pc).unwrap();
+        bt.write(wb);
+    }
 }

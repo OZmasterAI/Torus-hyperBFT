@@ -86,45 +86,77 @@ impl<S: KVGet> BlockTreeSnapshot<S> {
     /// or genesis.
     ///
     /// The returned chain goes from blocks of higher height (newest block) to blocks of lower height.
+    ///
+    /// s66: `NEWEST_BLOCK` is the last block INSERTED on any branch, so it can be an
+    /// abandoned sibling below the committed tip (a late body fetch after a view
+    /// change). Walking back from it descends through committed heights and serves
+    /// that sibling as speculative, which the client's committed-conflict check
+    /// fail-stops on. A walk that reaches the committed height is therefore a dead
+    /// branch and is discarded; the highest PC's branch is tried instead.
     fn blocks_from_newest_to_committed(&self) -> Result<Vec<Block>, BlockTreeError> {
-        let mut res = Vec::new();
-        if let Some(newest_block) = self.0.newest_block()? {
-            let mut cursor = newest_block;
-            loop {
-                // S426: best-effort serve. A QC can form on a block whose body this
-                // node never obtained (votes are cast on the header before the body
-                // arrives), leaving a gap in the speculative chain. On a missing
-                // body, stop the walk and return the (newest-side) portion gathered
-                // so far rather than propagating Err — the sync server would
-                // otherwise send no response at all, wedging the requesting peer.
-                let block = match self.0.block(&cursor)? {
-                    Some(block) => block,
-                    None => {
-                        log::debug!(
-                            "sync serve: speculative block {:?} missing — truncating walk",
-                            cursor
-                        );
-                        break;
-                    }
-                };
-                let block_justify = block.justify.clone();
-                res.push(block);
-
-                if let Some(highest_committed_block) = self.0.highest_committed_block()? {
-                    if block_justify.block == highest_committed_block {
-                        break;
-                    }
-                }
-
-                if block_justify == PhaseCertificate::genesis_pc() {
-                    break;
-                }
-
-                cursor = block_justify.block;
+        let committed_height = match self.0.highest_committed_block()? {
+            Some(committed) => self.0.block_height(&committed)?,
+            None => None,
+        };
+        if let Some(newest) = self.0.newest_block()? {
+            if let Some(chain) = self.speculative_chain_from(newest, committed_height)? {
+                return Ok(chain);
+            }
+            let highest_pc_block = self.0.highest_pc()?.block;
+            if let Some(chain) = self.speculative_chain_from(highest_pc_block, committed_height)? {
+                return Ok(chain);
             }
         }
+        Ok(Vec::new())
+    }
 
-        Ok(res)
+    /// Walk back from `start` to (not including) the highest committed block.
+    /// `None` when the walk reaches a block at or below `committed_height`: that
+    /// branch does not extend the committed tip.
+    fn speculative_chain_from(
+        &self,
+        start: CryptoHash,
+        committed_height: Option<BlockHeight>,
+    ) -> Result<Option<Vec<Block>>, BlockTreeError> {
+        let mut res = Vec::new();
+        let mut cursor = start;
+        loop {
+            // S426: best-effort serve. A QC can form on a block whose body this
+            // node never obtained (votes are cast on the header before the body
+            // arrives), leaving a gap in the speculative chain. On a missing
+            // body, stop the walk and return the (newest-side) portion gathered
+            // so far rather than propagating Err — the sync server would
+            // otherwise send no response at all, wedging the requesting peer.
+            let block = match self.0.block(&cursor)? {
+                Some(block) => block,
+                None => {
+                    log::debug!(
+                        "sync serve: speculative block {:?} missing — truncating walk",
+                        cursor
+                    );
+                    break;
+                }
+            };
+            if committed_height.is_some_and(|h| block.height <= h) {
+                return Ok(None);
+            }
+            let block_justify = block.justify.clone();
+            res.push(block);
+
+            if let Some(highest_committed_block) = self.0.highest_committed_block()? {
+                if block_justify.block == highest_committed_block {
+                    break;
+                }
+            }
+
+            if block_justify == PhaseCertificate::genesis_pc() {
+                break;
+            }
+
+            cursor = block_justify.block;
+        }
+
+        Ok(Some(res))
     }
 
     pub(crate) fn highest_committed_block_height(
