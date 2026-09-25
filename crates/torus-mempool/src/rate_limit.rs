@@ -125,11 +125,16 @@ pub const NATIVE_POOL_MAX_SIZE: usize = 65536;
 /// How many seconds of commit history the admission rate is measured over.
 pub const ADMISSION_RATE_WINDOW_MS: u64 = 10_000;
 
+/// Default admission horizon. Campaign s66-abc3 (cap 200, n=3): expired
+/// actions 17-18% vs 29-50% with the limit off, throughput within noise.
+pub const DEFAULT_ADMISSION_HORIZON_MS: u64 = 20_000;
+
 /// Parse `TORUS_ADMISSION_HORIZON_MS`: the milliseconds of recent commit
-/// throughput the native pool may hold before ingress sheds. Unset, `0`, or
-/// unparsable => 0 = limit OFF (the pre-s65 behaviour).
+/// throughput the native pool may hold before ingress sheds. `0` = limit OFF
+/// (kill switch, the pre-s65 behaviour); unset or unparsable => the default.
 pub fn parse_admission_horizon_ms(raw: Option<String>) -> u64 {
-    raw.and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0)
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_ADMISSION_HORIZON_MS)
 }
 
 /// Effective admission horizon for this node (node-local policy; mixed values
@@ -392,11 +397,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn admission_horizon_parse_defaults_off() {
-        assert_eq!(parse_admission_horizon_ms(None), 0);
+    fn admission_horizon_parse_defaults_on() {
+        assert_eq!(parse_admission_horizon_ms(None), 20_000);
+        assert_eq!(parse_admission_horizon_ms(Some("abc".into())), 20_000);
+        assert_eq!(parse_admission_horizon_ms(Some("".into())), 20_000);
         assert_eq!(parse_admission_horizon_ms(Some("0".into())), 0);
-        assert_eq!(parse_admission_horizon_ms(Some("abc".into())), 0);
-        assert_eq!(parse_admission_horizon_ms(Some("".into())), 0);
         assert_eq!(parse_admission_horizon_ms(Some("10000".into())), 10_000);
         assert_eq!(parse_admission_horizon_ms(Some(" 5000 ".into())), 5_000);
     }

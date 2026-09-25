@@ -71,7 +71,7 @@ pub struct MempoolConfig {
     pub max_memory_bytes: usize,
     // ---- Admission limit (s65 item B) ----
     /// Milliseconds of recent commit throughput the native pool may hold before
-    /// RPC ingress sheds non-cancels pre-verify. 0 = off;
+    /// RPC ingress sheds non-cancels pre-verify. Default 20 s; 0 = off;
     /// `TORUS_ADMISSION_HORIZON_MS` env override.
     pub native_admission_horizon_ms: u64,
     /// The admission limit never drops below this many pooled actions.
