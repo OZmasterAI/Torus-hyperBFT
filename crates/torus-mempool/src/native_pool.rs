@@ -22,13 +22,13 @@ use crate::error::MempoolError;
 /// band never reached a block and expired. Arrival order cannot be gamed by
 /// choice of address or of the client-chosen nonce timestamp. Selection is
 /// proposer-local (blocks carry their order), so this cannot fork.
-type SortKey = (u8, u64, Address, u64);
+type SortKey = (u8, Address, u64, u64);
 
 /// Same identity as SortKey, ordered by nonce for expiry-prefix removal.
 /// No stale heap entries: every insert/remove maintains this exact live index.
 type ExpiryKey = (u64, u8, Address, u64);
 
-fn expiry_key(&(priority, seq, sender, nonce): &SortKey) -> ExpiryKey {
+fn expiry_key(&(priority, sender, nonce, seq): &SortKey) -> ExpiryKey {
     (nonce, priority, sender, seq)
 }
 
@@ -214,7 +214,7 @@ impl NativePool {
         self.seen.insert((sender, action_hash));
         let seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1);
-        let key: SortKey = (u8::from(!is_cancel), seq, sender, action.nonce);
+        let key: SortKey = (u8::from(!is_cancel), sender, action.nonce, seq);
         self.hash_index.entry(action_hash).or_default().push(key);
         self.expiry_index.insert(expiry_key(&key));
         self.entries.insert(
@@ -461,7 +461,7 @@ impl NativePool {
             if nonce >= cutoff {
                 break;
             }
-            self.remove_entry_by_key(&(priority, seq, sender, nonce));
+            self.remove_entry_by_key(&(priority, sender, nonce, seq));
             removed += 1;
         }
         removed
