@@ -42,3 +42,32 @@ The scored cells reached 77.5k and 74.0k matched/s, against about 61.7k for
 the s67 control under the same settings. Timers cannot plausibly add ~20%.
 There is no same-day control cell, so this run supports no throughput claim.
 Run `main42c` back to back with this binary before reading anything into it.
+
+## Follow-up: proposer writes only missing DA bodies (`cc81630`)
+
+Campaign `~/bench-results-matched/s68-daskip-20260927`: one warm-up cell, then
+ABBA, n=3 per arm. `t` is the timers binary `04a60f2` (sha `3d2478e7`); `skip`
+is `cc81630` (sha `3f23d1c6`). Settings match the first campaign. All seven
+cells were accepted, AGREE, PASS.
+
+| arm | matched/s (r1 / r2 / r3) | mean | block_build | mirror | encode | propose_build | arrival | view |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| t | 58.5k / 69.3k / 73.7k | 67.1k | 186.6 | 83.6 | 24.5 | 258.6 | 340.5 | 589.4 |
+| skip | 69.2k / 72.3k / 61.5k | 67.7k | 130.2 | 46.6 | 1.3 | 212.3 | 319.2 | 581.2 |
+
+Timings are LOAD-window means in ms, averaged over the three nodes and three
+cells.
+
+- **The mechanism works.** block_build fell by 56 ms (30%) and the leader's
+  propose_build by 46 ms. The proposer wrote only 250–510 bodies per run out
+  of ~77k processed actions (under 1%), so the skip applies almost every
+  time.
+- **Encode fell to ~1 ms** because the hashes are now reused. Hashing moved
+  into the mirror phase instead. The mirror phase that remains (~45 ms) is the
+  body clone, the hashing and the MultiGet.
+- **Throughput did not change.** Means are 67.7k vs 67.1k; each arm spans more
+  than 10k across its own cells. View duration moved by 8 ms, which is noise.
+- **This is the second null** (after the s67 vote-state DB): removing
+  consensus-thread time on the leader does not raise matched/s at cap 200.
+  Leader block building is on the view's path, but it is not what limits
+  throughput.
