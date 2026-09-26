@@ -519,9 +519,28 @@ def check_view_window():
             % c.get("load"))
 
 
+def check_view_hists_sampled():
+    """Every VIEW_HISTS series must be in run-cell.sh WIDE_COLS, else the LOAD
+    window silently reports None for it. s68 adds the block_build phases."""
+    import ast
+    import re
+    here = os.path.dirname(os.path.abspath(__file__))
+    with open(os.path.join(here, "summarize.py")) as f:
+        src = f.read()
+    hists = ast.literal_eval(re.search(r"^VIEW_HISTS = (\[.*?\])", src, re.S | re.M).group(1))
+    with open(os.path.join(here, "run-cell.sh")) as f:
+        wide = set(re.search(r'^WIDE_COLS="([^"]+)"', f.read(), re.M).group(1).split())
+    for phase in ("parent", "select", "mirror", "attest", "encode"):
+        assert "torus_block_build_%s_seconds" % phase in hists, (
+            "VIEW_HISTS is missing torus_block_build_%s_seconds" % phase)
+    missing = [h + s for h in hists for s in ("_sum", "_count") if h + s not in wide]
+    assert not missing, "VIEW_HISTS series not sampled in WIDE_COLS: %r" % missing
+
+
 def main_s58():
     """s58 additions, invoked from __main__ after main()."""
     check_view_window()
+    check_view_hists_sampled()
     print("test_summarize.py: OK")
 
 

@@ -4574,58 +4574,12 @@ impl TorusApp {
     }
 }
 
-impl App<RocksKVStore> for TorusApp {
-    /// Produce a block: drain mempool, build raw tx list, NO execution.
-    ///
-    /// The state_root is set to the parent's state_root (unchanged until
-    /// execution happens on the pipeline thread).
-    fn produce_block(
-        &mut self,
-        request: ProduceBlockRequest<RocksKVStore>,
-    ) -> ProduceBlockResponse {
-        // T1.5 FAIL-STOP: with the execution pipeline dead, state is frozen —
-        // do not drain the mempool or build a block on top of unexecuted
-        // history. The `App` trait has no "refuse" variant, so return an
-        // empty, datum-less response that every honest validate_block rejects
-        // (datums.len() != 1): this node's leader views time out instead of
-        // zombie-advancing the chain.
-        if self.is_exec_failed() {
-            tracing::error!(
-                "produce_block: execution pipeline dead — FAIL-STOP, refusing to build a block"
-            );
-            return ProduceBlockResponse {
-                data_hash: CryptoHash::new(Self::hash_datum(&[])),
-                data: Data::new(vec![]),
-                app_state_updates: None,
-                validator_set_updates: None,
-            };
-        }
-        let parent_header = if let Some(parent_hash) = request.parent_block() {
-            if let Ok(Some(parent_block)) = request.block_tree().block(&parent_hash) {
-                let datums = parent_block.data.vec();
-                datums
-                    .first()
-                    .and_then(|d| {
-                        bincode::deserialize::<TorusBlock>(d.bytes())
-                            .map(|b| b.header)
-                            .or_else(|_| {
-                                bincode::deserialize::<CompactBlock>(d.bytes()).map(|cb| cb.header)
-                            })
-                            .ok()
-                    })
-                    .unwrap_or_else(|| self.last_header.clone())
-            } else {
-                self.last_header.clone()
-            }
-        } else {
-            self.last_header.clone()
-        };
-        tracing::info!(
-            parent_height = parent_header.height,
-            local_height = self.last_header.height,
-            "produce_block called (CTE)"
-        );
-
+impl TorusApp {
+    /// Everything `produce_block` does after resolving the parent header, split
+    /// out so tests can drive it (`ProduceBlockRequest::new` is crate-private to
+    /// hotstuff_rs). Each phase has its own `torus_block_build_*_seconds` timer
+    /// nested inside `block_build_seconds` (s68).
+    fn build_proposal(&mut self, parent_header: TorusBlockHeader) -> ProduceBlockResponse {
         // Exec-ceiling Option A: wire the (previously dead) block_build_seconds —
         // covers mempool selection, DA mirror, attestation, construction, encode.
         let build_timer = std::time::Instant::now();
@@ -4640,8 +4594,11 @@ impl App<RocksKVStore> for TorusApp {
         } else {
             parent_header.evm_gas_limit
         };
-        let (native_with_senders, evm_txs) =
-            self.select_block_payload(parent_header.height, gas_limit, parent_header.state_root);
+        let (native_with_senders, evm_txs) = {
+            let _select_span =
+                ObserveOnDrop::new(self.metrics.clone(), |m| &m.block_build_select_seconds);
+            self.select_block_payload(parent_header.height, gas_limit, parent_header.state_root)
+        };
 
         // Proposer guarantee (S459): durably mirror every referenced body to THIS
         // node's DA store BEFORE committing to reference it (livelock fix, mem
@@ -4651,13 +4608,26 @@ impl App<RocksKVStore> for TorusApp {
         // referenced-but-unbacked body can. The re-queued batch retries next view.
         // `native_with_senders` and `native_actions` stay consistent so the
         // pre-proposal push below never carries a dropped body.
-        let (native_with_senders, native_actions) = self.mirror_or_drop_native(native_with_senders);
-
-        let sig_attestation = match self.signing_key {
-            Some(ref key) => torus_bridge::proposer::generate_sig_attestation(&native_actions, key),
-            None => [0u8; 64],
+        let (native_with_senders, native_actions) = {
+            let _mirror_span =
+                ObserveOnDrop::new(self.metrics.clone(), |m| &m.block_build_mirror_seconds);
+            self.mirror_or_drop_native(native_with_senders)
         };
 
+        let sig_attestation = {
+            let _attest_span =
+                ObserveOnDrop::new(self.metrics.clone(), |m| &m.block_build_attest_seconds);
+            match self.signing_key {
+                Some(ref key) => {
+                    torus_bridge::proposer::generate_sig_attestation(&native_actions, key)
+                }
+                None => [0u8; 64],
+            }
+        };
+
+        // Construction, pre-proposal push, proposal encode, ledger note, datum hash.
+        let encode_span =
+            ObserveOnDrop::new(self.metrics.clone(), |m| &m.block_build_encode_seconds);
         use torus_types::{Bloom, B256};
         // Ancestry commitment: bind this proposal to the exact parent header it
         // was built on (`parent_header`). This is the keccak canonical hash — the
@@ -4717,6 +4687,7 @@ impl App<RocksKVStore> for TorusApp {
         self.pending_proposals.insert(height, pending);
         self.pending_proposals.retain(|&h, _| h + 10 > height);
         let hash = Self::hash_datum(&encoded);
+        drop(encode_span);
 
         let validator_set_updates = self.epoch_validator_set_updates(height);
 
@@ -4731,6 +4702,66 @@ impl App<RocksKVStore> for TorusApp {
             app_state_updates: None,
             validator_set_updates,
         }
+    }
+}
+
+impl App<RocksKVStore> for TorusApp {
+    /// Produce a block: drain mempool, build raw tx list, NO execution.
+    ///
+    /// The state_root is set to the parent's state_root (unchanged until
+    /// execution happens on the pipeline thread).
+    fn produce_block(
+        &mut self,
+        request: ProduceBlockRequest<RocksKVStore>,
+    ) -> ProduceBlockResponse {
+        // T1.5 FAIL-STOP: with the execution pipeline dead, state is frozen —
+        // do not drain the mempool or build a block on top of unexecuted
+        // history. The `App` trait has no "refuse" variant, so return an
+        // empty, datum-less response that every honest validate_block rejects
+        // (datums.len() != 1): this node's leader views time out instead of
+        // zombie-advancing the chain.
+        if self.is_exec_failed() {
+            tracing::error!(
+                "produce_block: execution pipeline dead — FAIL-STOP, refusing to build a block"
+            );
+            return ProduceBlockResponse {
+                data_hash: CryptoHash::new(Self::hash_datum(&[])),
+                data: Data::new(vec![]),
+                app_state_updates: None,
+                validator_set_updates: None,
+            };
+        }
+        let parent_header = {
+            let _parent_span =
+                ObserveOnDrop::new(self.metrics.clone(), |m| &m.block_build_parent_seconds);
+            if let Some(parent_hash) = request.parent_block() {
+                if let Ok(Some(parent_block)) = request.block_tree().block(&parent_hash) {
+                    let datums = parent_block.data.vec();
+                    datums
+                        .first()
+                        .and_then(|d| {
+                            bincode::deserialize::<TorusBlock>(d.bytes())
+                                .map(|b| b.header)
+                                .or_else(|_| {
+                                    bincode::deserialize::<CompactBlock>(d.bytes())
+                                        .map(|cb| cb.header)
+                                })
+                                .ok()
+                        })
+                        .unwrap_or_else(|| self.last_header.clone())
+                } else {
+                    self.last_header.clone()
+                }
+            } else {
+                self.last_header.clone()
+            }
+        };
+        tracing::info!(
+            parent_height = parent_header.height,
+            local_height = self.last_header.height,
+            "produce_block called (CTE)"
+        );
+        self.build_proposal(parent_header)
     }
 
     /// Validate a proposed block: structural + signature checks only, NO execution.
@@ -8237,6 +8268,70 @@ mod crash_recovery_tests {
         assert!(selected
             .iter()
             .all(|(_, action)| torus_types::compute_action_hash(action) != missing_hash));
+    }
+
+    /// s68: `build_proposal` splits the leader's `block_build` into phases.
+    /// Each phase observes exactly once per proposal, and the phases nest
+    /// inside the whole-build timer.
+    #[test]
+    fn build_proposal_observes_every_phase_once() {
+        let (config, state_db) = make_test_config_and_db();
+        let mempool = Arc::new(Mempool::new(
+            state_db.clone(),
+            torus_mempool::MempoolConfig::default(),
+        ));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let action = sign_claim_rewards(now);
+        mempool
+            .add_native_action_presigned(action.recover_sender().unwrap(), action)
+            .unwrap();
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
+        let mut app = TorusApp::new(
+            state_db,
+            &config,
+            Some(metrics.clone()),
+            Some(mempool),
+            None,
+        );
+
+        let parent = app.last_header.clone();
+        let resp = app.build_proposal(parent.clone());
+        assert_eq!(resp.data.vec().len(), 1);
+        let height = parent.height + 1;
+        assert_eq!(
+            app.pending_proposals[&height].block.native_actions.len(),
+            1,
+            "the pooled action must be proposed"
+        );
+
+        let text = metrics.encode();
+        let phases = [
+            "torus_block_build_select_seconds",
+            "torus_block_build_mirror_seconds",
+            "torus_block_build_attest_seconds",
+            "torus_block_build_encode_seconds",
+        ];
+        for name in phases.iter().copied().chain(["torus_block_build_seconds"]) {
+            assert_eq!(
+                metric_count(&text, &format!("{name}_count")),
+                1,
+                "{name} must observe once per proposal"
+            );
+        }
+        let sum = |name: &str| -> f64 {
+            text.lines()
+                .find_map(|l| l.strip_prefix(&format!("{name}_sum ")))
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap()
+        };
+        let phase_total: f64 = phases.iter().map(|n| sum(n)).sum();
+        assert!(
+            phase_total <= sum("torus_block_build_seconds"),
+            "phases ({phase_total}) must nest inside block_build"
+        );
     }
 
     #[test]
