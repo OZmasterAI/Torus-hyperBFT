@@ -18,7 +18,7 @@ use hotstuff_rs::types::data_types::{BufferSize, ChainID, EpochLength};
 use serde::Deserialize;
 use tracing::{error, info, warn};
 
-use torus_consensus::{NativeDaFetcher, RocksKVStore, TorusApp};
+use torus_consensus::{open_vote_db, NativeDaFetcher, RocksKVStore, TorusApp};
 use torus_evm::EvmExecutor;
 use torus_genesis::Genesis;
 use torus_mempool::{Mempool, MempoolConfig};
@@ -480,6 +480,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&cli.data_dir)?;
     let state_db = StateDb::open(&cli.data_dir)?;
     info!("state database opened");
+    // Vote state gets its own DB inside data_dir (wiping data_dir wipes both),
+    // so the pre-send vote save does not queue behind exec writes (s67).
+    let vote_db = open_vote_db(&cli.data_dir.join("vote_state"))?;
 
     // 4. Genesis initialization
     let mut chain_config = if let Some(genesis_path) = &cli.genesis {
@@ -495,7 +498,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
             // Initialize hotstuff_rs replica
             let (app_state, vs_state) = genesis.to_hotstuff_genesis()?;
-            let init_kv = RocksKVStore::new(state_db.db_arc());
+            let init_kv = RocksKVStore::new(state_db.db_arc()).with_vote_db(vote_db.clone());
             Replica::initialize(init_kv, app_state, vs_state);
             info!("consensus replica initialized with genesis validator set");
         } else {
@@ -566,7 +569,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Some(mempool.clone()),
         signing_key_for_app,
     );
-    let kv_store = RocksKVStore::new(state_db.db_arc()).with_metrics(metrics.clone());
+    let kv_store = RocksKVStore::new(state_db.db_arc())
+        .with_vote_db(vote_db)
+        .with_metrics(metrics.clone());
 
     // EVM executor
     let executor = Arc::new(EvmExecutor::new(chain_config.chain_id));

@@ -17,6 +17,6 @@ pub mod slashing;
 
 pub use app::{LeaderState, NativeDaFetcher, PreProposalBundle, TorusApp};
 pub use genesis::GenesisConfig;
-pub use kv_store::RocksKVStore;
+pub use kv_store::{open_vote_db, RocksKVStore};
 pub use network::ChannelNetwork;
 pub use slashing::{DoubleSignDetector, DoubleSignEvidence, DowntimeTracker};
