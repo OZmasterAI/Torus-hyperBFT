@@ -161,6 +161,10 @@ pub struct Metrics {
     /// validator) rather than referencing a body no validator could reconstruct.
     /// Monotonic; 0 on a healthy store.
     pub proposer_body_mirror_failures: Counter,
+    /// Selected bodies the proposer had to write because the DA store did not
+    /// already hold them (s68). Ingest stores most bodies first; the rest are
+    /// skipped.
+    pub proposer_body_mirror_written: Counter,
     /// Native-DA pull-fallback fetches issued (Phase C Task 6). Must stay LOW under
     /// load — push covers the common case; a high rate signals push is failing.
     pub native_da_pull_requests: Counter,
@@ -1056,6 +1060,13 @@ impl Metrics {
             proposer_body_mirror_failures.clone(),
         );
 
+        let proposer_body_mirror_written = Counter::default();
+        registry.register(
+            "torus_proposer_body_mirror_written",
+            "Selected native bodies produce_block wrote because the DA store lacked them (s68)",
+            proposer_body_mirror_written.clone(),
+        );
+
         let native_da_pull_requests = Counter::default();
         registry.register(
             "torus_native_da_pull_requests",
@@ -1834,6 +1845,7 @@ impl Metrics {
             native_bundle_repushed,
             missing_action_rejections,
             proposer_body_mirror_failures,
+            proposer_body_mirror_written,
             native_da_pull_requests,
             native_da_pull_recovered,
             native_da_shard_recovered,
