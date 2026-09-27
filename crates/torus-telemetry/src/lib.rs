@@ -446,6 +446,10 @@ pub struct Metrics {
     pub view_proposal_arrival_seconds: Histogram,
     pub view_insert_persist_seconds: Histogram,
     pub view_vote_delay_seconds: Histogram,
+    /// Collector (s70): first generic vote received for a view to its PC...
+    pub view_vote_gather_seconds: Histogram,
+    /// ...and that PC to our next StartView (update/commit feed + AdvanceView).
+    pub view_qc_to_advance_seconds: Histogram,
     pub view_entry_slack_seconds: Histogram,
     pub view_timeout_after_seconds: Histogram,
     pub view_entered_past_deadline: Counter,
@@ -1650,6 +1654,18 @@ impl Metrics {
             "Follower: proposal arrival to phase vote sent",
             view_vote_delay_seconds.clone(),
         );
+        let view_vote_gather_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 15));
+        registry.register(
+            "torus_view_vote_gather_seconds",
+            "Collector: first phase vote received for a view to its PC collected (s70)",
+            view_vote_gather_seconds.clone(),
+        );
+        let view_qc_to_advance_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 15));
+        registry.register(
+            "torus_view_qc_to_advance_seconds",
+            "Collector: PC collected to our next StartView (update/commit feed + AdvanceView) (s70)",
+            view_qc_to_advance_seconds.clone(),
+        );
         let view_entry_slack_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 15));
         registry.register(
             "torus_view_entry_slack_seconds",
@@ -1960,6 +1976,8 @@ impl Metrics {
             view_proposal_arrival_seconds,
             view_insert_persist_seconds,
             view_vote_delay_seconds,
+            view_vote_gather_seconds,
+            view_qc_to_advance_seconds,
             view_entry_slack_seconds,
             view_timeout_after_seconds,
             view_entered_past_deadline,

@@ -10,8 +10,9 @@ use std::time::Duration;
 use clap::Parser;
 use ed25519_dalek::SigningKey;
 use hotstuff_rs::events::{
-    CommitBlockEvent, InsertBlockEvent, PhaseVoteEvent, ProposeEvent, ReceiveProposalEvent,
-    ReceiveProposalHeaderEvent, StartViewEvent, UpdateHighestPCEvent, ViewTimeoutEvent,
+    CollectPCEvent, CommitBlockEvent, InsertBlockEvent, PhaseVoteEvent, ProposeEvent,
+    ReceivePhaseVoteEvent, ReceiveProposalEvent, ReceiveProposalHeaderEvent, StartViewEvent,
+    UpdateHighestPCEvent, ViewTimeoutEvent,
 };
 use hotstuff_rs::replica::{Configuration, Replica, ReplicaSpec};
 use hotstuff_rs::types::data_types::{BufferSize, ChainID, EpochLength};
@@ -831,6 +832,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let rec_header = view_rec.clone();
     let rec_insert = view_rec.clone();
     let rec_vote = view_rec.clone();
+    let rec_vote_rx = view_rec.clone();
+    let rec_pc = view_rec.clone();
     let rec_timeout = view_rec.clone();
     let rec_commit = view_rec.clone();
     // Own headers loop back via broadcast self-delivery; proposal_arrival is a
@@ -849,8 +852,15 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // RPC d2l forward hint stays correct during timeout churn instead
             // of trusting the committed_height+1 heuristic + plain IWRR.
             leader_state_for_view.observe_start_view(ev.view.int(), ev.leader);
-            rec_start.start_view(ev.timestamp, ev.view.int());
+            let closed = rec_start.start_view(ev.timestamp, ev.view.int());
             rec_start.view_entry_slack(ev.deadline_slack_secs);
+            // s70: one line per closed view, joined across validators by
+            // tools/matched-bench/gap_attr.py.
+            if let Some(closed) =
+                closed.filter(|_| hotstuff_rs::logging::body_fetch_trace_enabled())
+            {
+                info!("body_fetch_diag view_close: {closed}");
+            }
         })
         .on_propose(move |ev: &ProposeEvent| {
             rec_propose.propose(ev.timestamp, ev.proposal.block.hash.bytes())
@@ -868,6 +878,18 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         })
         .on_insert_block(move |ev: &InsertBlockEvent| rec_insert.insert_block(ev.timestamp))
         .on_phase_vote(move |ev: &PhaseVoteEvent| rec_vote.phase_vote(ev.timestamp))
+        // s70: collector side of qc_collect (phased-mode votes during
+        // validator-set updates are left out).
+        .on_receive_phase_vote(move |ev: &ReceivePhaseVoteEvent| {
+            if ev.phase_vote.phase.is_generic() {
+                rec_vote_rx.receive_phase_vote(ev.timestamp, ev.phase_vote.view.int());
+            }
+        })
+        .on_collect_pc(move |ev: &CollectPCEvent| {
+            if ev.phase_certificate.phase.is_generic() {
+                rec_pc.collect_pc(ev.timestamp, ev.phase_certificate.view.int());
+            }
+        })
         .on_view_timeout(move |ev: &ViewTimeoutEvent| {
             timeout_counter.inc();
             rec_timeout.view_timeout(ev.timestamp);

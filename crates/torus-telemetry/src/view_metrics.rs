@@ -20,8 +20,63 @@ fn secs_between(earlier: SystemTime, later: SystemTime) -> f64 {
         .unwrap_or(0.0)
 }
 
+/// Unix microseconds (signed, like `BodyFetchTraceStamp`), `-` when absent.
+struct Us(Option<SystemTime>);
+
+impl std::fmt::Display for Us {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0.map(|t| t.duration_since(SystemTime::UNIX_EPOCH)) {
+            None => f.write_str("-"),
+            Some(Ok(d)) => write!(f, "{}", d.as_micros()),
+            Some(Err(e)) => write!(f, "-{}", e.duration().as_micros()),
+        }
+    }
+}
+
+/// One closed view as this node saw it (s70), returned by `start_view` so the
+/// node can log it under `TORUS_BODY_FETCH_TRACE`; the three validators' lines
+/// join per view offline (tools/matched-bench/gap_attr.py).
+pub struct ViewTrace {
+    view: u64,
+    start: SystemTime,
+    end: SystemTime,
+    propose: Option<SystemTime>,
+    proposal_rx: Option<SystemTime>,
+    vote: Option<SystemTime>,
+    timeout: Option<SystemTime>,
+    /// PC collected in this view: its view, first vote received for it, PC time.
+    pc: Option<(u64, Option<SystemTime>, SystemTime)>,
+}
+
+impl std::fmt::Display for ViewTrace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "view={} start_us={} end_us={} propose_us={} proposal_rx_us={} vote_us={} timeout_us={} ",
+            self.view,
+            Us(Some(self.start)),
+            Us(Some(self.end)),
+            Us(self.propose),
+            Us(self.proposal_rx),
+            Us(self.vote),
+            Us(self.timeout)
+        )?;
+        match self.pc {
+            Some((view, first, pc)) => write!(
+                f,
+                "pc_view={view} first_vote_rx_us={} pc_us={}",
+                Us(first),
+                Us(Some(pc))
+            ),
+            None => f.write_str("pc_view=- first_vote_rx_us=- pc_us=-"),
+        }
+    }
+}
+
 #[derive(Default)]
 struct ViewState {
+    /// The current view number (from StartView), for the closed-view trace.
+    view: u64,
     /// When the current view started (StartView event).
     view_started_at: Option<SystemTime>,
     /// When the leader's proposal (or proposal header) first arrived this view.
@@ -33,13 +88,21 @@ struct ViewState {
     /// for the build/finalize split; leadership is only confirmed there, so a
     /// block-sync insert that never leads to a Propose records nothing.
     self_insert_at: Option<SystemTime>,
-    /// Guards `view_vote_delay_seconds` against duplicate-vote double counts.
-    vote_observed: bool,
-    /// We proposed in the current view (timeout classification, s68).
-    proposed_this_view: bool,
-    /// The current view's timeout was already classified (the pacemaker
-    /// re-emits ViewTimeout on later ticks of the same view).
-    timeout_observed: bool,
+    /// Our first vote after the received proposal; guards
+    /// `view_vote_delay_seconds` against duplicate-vote double counts.
+    vote_sent_at: Option<SystemTime>,
+    /// When we proposed in the current view (timeout classification, s68).
+    propose_at: Option<SystemTime>,
+    /// First ViewTimeout of the current view; the view is classified once (the
+    /// pacemaker re-emits ViewTimeout on later ticks of the same view).
+    timeout_at: Option<SystemTime>,
+    /// Collector (s70): first generic vote received, keyed by the vote's view.
+    /// Votes can precede our entry into that view, so it survives StartView.
+    first_vote: Option<(u64, SystemTime)>,
+    /// Collector (s70): the last PC we assembled, until StartView moves past it.
+    pc_collected: Option<(u64, SystemTime)>,
+    /// The PC assembled in the current view, for the closed-view trace.
+    trace_pc: Option<(u64, Option<SystemTime>, SystemTime)>,
     /// Previous CommitBlock event time, for the commit interval gap.
     last_commit_at: Option<SystemTime>,
     /// Our outstanding proposal awaiting certification: broadcast time and
@@ -67,25 +130,48 @@ impl ViewMetricsRecorder {
         }
     }
 
-    /// StartView: closes the previous view (observing its full duration),
-    /// resets per-view state and updates the `torus_consensus_view` gauge.
-    /// `last_propose` deliberately survives — our block's certification
-    /// arrives after the view transition under leader rotation.
-    pub fn start_view(&self, ts: SystemTime, view: u64) {
+    /// StartView: closes the previous view (observing its full duration and
+    /// returning its trace), resets per-view state and updates the
+    /// `torus_consensus_view` gauge. `last_propose` deliberately survives — our
+    /// block's certification arrives after the view transition under leader
+    /// rotation. Moving past a view we collected the PC for observes
+    /// `view_qc_to_advance_seconds`.
+    pub fn start_view(&self, ts: SystemTime, view: u64) -> Option<ViewTrace> {
         let mut s = self.state.lock().unwrap();
-        if let Some(prev) = s.view_started_at {
+        if let Some((pc_view, collected)) = s.pc_collected {
+            if view > pc_view {
+                self.metrics
+                    .view_qc_to_advance_seconds
+                    .observe(secs_between(collected, ts));
+                s.pc_collected = None;
+            }
+        }
+        let closed = s.view_started_at.map(|start| {
             self.metrics
                 .view_duration_seconds
-                .observe(secs_between(prev, ts));
-        }
+                .observe(secs_between(start, ts));
+            ViewTrace {
+                view: s.view,
+                start,
+                end: ts,
+                propose: s.propose_at,
+                proposal_rx: s.proposal_received_at,
+                vote: s.vote_sent_at,
+                timeout: s.timeout_at,
+                pc: s.trace_pc,
+            }
+        });
+        s.view = view;
         s.view_started_at = Some(ts);
         s.proposal_received_at = None;
         s.insert_observed = false;
-        s.vote_observed = false;
+        s.vote_sent_at = None;
         s.self_insert_at = None;
-        s.proposed_this_view = false;
-        s.timeout_observed = false;
+        s.propose_at = None;
+        s.timeout_at = None;
+        s.trace_pc = None;
         self.metrics.consensus_view.set(view as i64);
+        closed
     }
 
     /// StartView companion (s68): the entered view's pacemaker deadline minus
@@ -104,20 +190,20 @@ impl ViewMetricsRecorder {
     /// proposal it did not vote for, or its vote sent without a next view.
     pub fn view_timeout(&self, ts: SystemTime) {
         let mut s = self.state.lock().unwrap();
-        if s.timeout_observed {
+        if s.timeout_at.is_some() {
             return;
         }
-        s.timeout_observed = true;
+        s.timeout_at = Some(ts);
         if let Some(started) = s.view_started_at {
             self.metrics
                 .view_timeout_after_seconds
                 .observe(secs_between(started, ts));
         }
-        let class = if s.proposed_this_view {
+        let class = if s.propose_at.is_some() {
             &self.metrics.view_timeout_leader
         } else if s.proposal_received_at.is_none() {
             &self.metrics.view_timeout_no_proposal
-        } else if !s.vote_observed {
+        } else if s.vote_sent_at.is_none() {
             &self.metrics.view_timeout_no_vote
         } else {
             &self.metrics.view_timeout_after_vote
@@ -149,7 +235,7 @@ impl ViewMetricsRecorder {
             self.metrics.view_proposals_uncertified.inc();
         }
         s.last_propose = Some((ts, block_hash));
-        s.proposed_this_view = true;
+        s.propose_at = Some(ts);
     }
 
     /// UpdateHighestPC: when the newly stored PC certifies OUR outstanding
@@ -183,7 +269,7 @@ impl ViewMetricsRecorder {
         }
         s.proposal_received_at = Some(ts);
         s.insert_observed = false;
-        s.vote_observed = false;
+        s.vote_sent_at = None;
     }
 
     /// InsertBlock: proposal arrival to persisted insert (validate + block
@@ -213,15 +299,44 @@ impl ViewMetricsRecorder {
     /// the body insert that may still be in flight (hash-only pipeline).
     pub fn phase_vote(&self, ts: SystemTime) {
         let mut s = self.state.lock().unwrap();
-        if s.vote_observed {
+        if s.vote_sent_at.is_some() {
             return;
         }
         if let Some(received) = s.proposal_received_at {
             self.metrics
                 .view_vote_delay_seconds
                 .observe(secs_between(received, ts));
-            s.vote_observed = true;
+            s.vote_sent_at = Some(ts);
         }
+    }
+
+    /// ReceivePhaseVote (collector, generic phase only): keep the first vote
+    /// arrival for the newest view seen; a late vote for an older view never
+    /// replaces it.
+    pub fn receive_phase_vote(&self, ts: SystemTime, view: u64) {
+        let mut s = self.state.lock().unwrap();
+        if s.first_vote.map_or(true, |(v, _)| view > v) {
+            s.first_vote = Some((view, ts));
+        }
+    }
+
+    /// CollectPC (collector, generic phase only): first vote for the PC's view
+    /// to the PC (`view_vote_gather_seconds`), and arm the PC -> next StartView
+    /// clock (`view_qc_to_advance_seconds`).
+    pub fn collect_pc(&self, ts: SystemTime, view: u64) {
+        let mut s = self.state.lock().unwrap();
+        let first = match s.first_vote {
+            Some((v, at)) if v == view => {
+                s.first_vote = None;
+                self.metrics
+                    .view_vote_gather_seconds
+                    .observe(secs_between(at, ts));
+                Some(at)
+            }
+            _ => None,
+        };
+        s.pc_collected = Some((view, ts));
+        s.trace_pc = Some((view, first, ts));
     }
 
     /// CommitBlock: gap between consecutive local commits (chain cadence as
@@ -276,6 +391,8 @@ mod tests {
             "torus_view_proposal_arrival_seconds",
             "torus_view_insert_persist_seconds",
             "torus_view_vote_delay_seconds",
+            "torus_view_vote_gather_seconds",
+            "torus_view_qc_to_advance_seconds",
             "torus_commit_interval_seconds",
         ] {
             assert!(text.contains(name), "{name} not registered:\n{text}");
@@ -525,6 +642,75 @@ mod tests {
         r.propose(t(1250), [3u8; 32]); // [2] was never certified
         let text = m.encode();
         assert_eq!(sample(&text, "torus_view_proposals_uncertified_total"), 1.0);
+    }
+
+    /// s70 proposal->QC split, collector side: first generic vote received for
+    /// view v to the PC for v (vote gather), then that PC to our next StartView
+    /// (update/commit feed + AdvanceView broadcast + pacemaker entry).
+    #[test]
+    fn collector_vote_gather_and_qc_to_advance() {
+        let (m, r) = rec();
+        r.start_view(t(0), 5);
+        r.receive_phase_vote(t(10), 4); // stale vote for an older view: not the baseline
+        r.receive_phase_vote(t(20), 5);
+        r.receive_phase_vote(t(35), 5); // later votes keep the first arrival
+        r.collect_pc(t(40), 5);
+        r.start_view(t(100), 6);
+        r.start_view(t(400), 7); // no PC collected in view 6: nothing more
+        let text = m.encode();
+        assert_eq!(sample(&text, "torus_view_vote_gather_seconds_count"), 1.0);
+        assert!((sample(&text, "torus_view_vote_gather_seconds_sum") - 0.02).abs() < 1e-9);
+        assert_eq!(sample(&text, "torus_view_qc_to_advance_seconds_count"), 1.0);
+        assert!((sample(&text, "torus_view_qc_to_advance_seconds_sum") - 0.06).abs() < 1e-9);
+    }
+
+    /// A PC for a view with no recorded vote (votes arrived before a restart,
+    /// or were for another view) observes no gather, but still arms the
+    /// advance clock; a StartView that does not move past the PC's view does
+    /// not consume it.
+    #[test]
+    fn pc_without_vote_baseline_only_times_advance() {
+        let (m, r) = rec();
+        r.start_view(t(0), 8);
+        r.receive_phase_vote(t(5), 7);
+        r.collect_pc(t(50), 8);
+        r.start_view(t(60), 8); // re-entry of the same view: not an advance
+        r.start_view(t(90), 9);
+        let text = m.encode();
+        assert_eq!(sample(&text, "torus_view_vote_gather_seconds_count"), 0.0);
+        assert_eq!(sample(&text, "torus_view_qc_to_advance_seconds_count"), 1.0);
+        assert!((sample(&text, "torus_view_qc_to_advance_seconds_sum") - 0.04).abs() < 1e-9);
+    }
+
+    /// StartView closes the previous view into one trace record with every
+    /// timestamp this node saw in it (unix us; `-` when absent), so the three
+    /// validators' lines can be joined per view offline.
+    #[test]
+    fn start_view_returns_closed_view_trace() {
+        let (_m, r) = rec();
+        assert!(
+            r.start_view(t(1_000), 3).is_none(),
+            "no previous view to close"
+        );
+        r.receive_proposal(t(1_020));
+        r.phase_vote(t(1_030));
+        r.receive_phase_vote(t(1_031), 3);
+        r.collect_pc(t(1_045), 3);
+        let tr = r.start_view(t(1_050), 4).expect("view 3 closed");
+        assert_eq!(
+            tr.to_string(),
+            "view=3 start_us=1000000 end_us=1050000 propose_us=- proposal_rx_us=1020000 \
+             vote_us=1030000 timeout_us=- pc_view=3 first_vote_rx_us=1031000 pc_us=1045000"
+        );
+        // Leader view that timed out: propose and timeout, no PC.
+        r.propose(t(1_060), [1u8; 32]);
+        r.view_timeout(t(2_250));
+        let tr = r.start_view(t(2_260), 5).unwrap();
+        assert_eq!(
+            tr.to_string(),
+            "view=4 start_us=1050000 end_us=2260000 propose_us=1060000 proposal_rx_us=- \
+             vote_us=- timeout_us=2250000 pc_view=- first_vote_rx_us=- pc_us=-"
+        );
     }
 
     #[test]

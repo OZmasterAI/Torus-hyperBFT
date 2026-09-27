@@ -10,6 +10,8 @@ STAGES = [
     "block_build",
     "view_propose_finalize",
     "view_qc_collect",
+    "view_vote_gather",
+    "view_qc_to_advance",
     "view_proposal_arrival",
     "view_vote_delay",
     "view_insert_persist",
@@ -137,10 +139,6 @@ def main(cell):
     print("  EXEC val0: " + "  ".join(f"{k}={pb[k]}" for k in keys if k in pb))
 
 
-for cell in sys.argv[1:]:
-    main(cell)
-
-
 def hist_tail(cell, name="torus_view_duration_seconds"):
     import re
     def h(path):
@@ -170,5 +168,106 @@ def hist_tail(cell, name="torus_view_duration_seconds"):
         print(f"  VIEW TAIL {node} (whole run): views {n:.0f} mean {1000*(s1-s0)/n:.0f} ms | >512ms {gt512:.0f} ({100*gt512/n:.1f}%) | >1.024s {gt1024:.0f} | >2.048s {gt2048:.0f} | slow-view wall >= {lb_ms/1000:.1f} s of {(s1-s0):.0f} s total view time")
 
 
-for cell in sys.argv[1:]:
-    hist_tail(cell)
+def _kv(text):
+    return {k: (None if v == "-" else int(v)) for k, v in (f.split("=", 1) for f in text.split())}
+
+
+def _node_logs(cell):
+    for sub in ("run", ""):
+        paths = {n: os.path.join(cell, sub, n + ".log") for n in ("val0", "val1", "val2")}
+        if all(os.path.exists(p) for p in paths.values()):
+            return paths
+    return None
+
+
+def _stats(xs):
+    xs = sorted(xs)
+    pick = lambda q: xs[min(len(xs) - 1, int(q * len(xs)))]
+    return dict(n=len(xs), p50=pick(0.5), p90=pick(0.9), mean=round(sum(xs) / len(xs), 2))
+
+
+def view_join(cell, window=None):
+    """s70 proposal->QC split: join each validator's `view_close` trace line
+    (TORUS_BODY_FETCH_TRACE=1) per view into critical-path segments, ms.
+    L = the view's leader (the node that proposed), N = the collector (the node
+    whose PC is for that view; under rotation the next leader). `window` is
+    (t0, t1) unix seconds on L's view start. None when the logs are absent."""
+    paths = _node_logs(cell)
+    if not paths:
+        return None
+    closes, votes_at = {}, {}  # node -> view -> record; (node, view) -> [admission unix_us]
+    for node, path in paths.items():
+        closes[node] = {}
+        with open(path, errors="replace") as f:
+            for line in f:
+                if "body_fetch_diag view_close: " in line:
+                    r = _kv(line.split("body_fetch_diag view_close: ", 1)[1])
+                    closes[node][r["view"]] = r
+                elif "body_fetch_diag admission: " in line and " kind=vote " in line:
+                    a = dict(x.split("=", 1) for x in line.split("admission: ", 1)[1].split())
+                    votes_at.setdefault((node, int(a["view"])), []).append(int(a["unix_us"]))
+    pcs = {r["pc_view"]: (node, r) for node, vs in closes.items() for r in vs.values() if r["pc_view"] is not None}
+    segs = {k: [] for k in ("propose", "header_rx_last", "vote_sent_last", "vote_to_pc", "vote_queue",
+                            "vote_gather", "pc_to_advance", "advance_to_leader", "cycle")}
+    joined = no_pc = 0
+    last_voter = {}
+    ms = lambda a, b: (b - a) / 1000.0
+    for view in sorted({v for vs in closes.values() for v in vs}):
+        lead = [n for n in closes if closes[n].get(view, {}).get("propose_us") is not None]
+        if len(lead) != 1:
+            continue
+        L, lr = lead[0], closes[lead[0]][view]
+        if window and not window[0] <= lr["start_us"] / 1e6 <= window[1]:
+            continue
+        if view not in pcs:
+            no_pc += 1
+            continue
+        N, nr = pcs[view]
+        recs = {n: closes[n].get(view) for n in closes}
+        rx = [r["proposal_rx_us"] for n, r in recs.items() if n != L and r and r["proposal_rx_us"] is not None]
+        sent = {n: r["vote_us"] for n, r in recs.items() if r and r["vote_us"] is not None}
+        if not rx or not sent:
+            continue
+        joined += 1
+        last = max(sent, key=sent.get)
+        role = "leader" if last == L else "collector" if last == N else "follower"
+        last_voter[role] = last_voter.get(role, 0) + 1
+        segs["propose"].append(ms(lr["start_us"], lr["propose_us"]))
+        segs["header_rx_last"].append(ms(lr["propose_us"], max(rx)))
+        segs["vote_sent_last"].append(ms(lr["propose_us"], sent[last]))
+        segs["vote_to_pc"].append(ms(sent[last], nr["pc_us"]))
+        if votes_at.get((N, view)):
+            segs["vote_queue"].append(ms(max(votes_at[(N, view)]), nr["pc_us"]))
+        if nr["first_vote_rx_us"] is not None:
+            segs["vote_gather"].append(ms(nr["first_vote_rx_us"], nr["pc_us"]))
+        segs["pc_to_advance"].append(ms(nr["pc_us"], nr["end_us"]))
+        if L != N:
+            segs["advance_to_leader"].append(ms(nr["end_us"], lr["end_us"]))
+        segs["cycle"].append(ms(lr["start_us"], nr["end_us"]))
+    return dict(joined=joined, no_pc=no_pc, last_voter=last_voter,
+                segments={k: _stats(v) for k, v in segs.items() if v})
+
+
+def print_view_join(cell):
+    window = None
+    try:
+        t = json.load(open(os.path.join(cell, "summary.json")))["timing"]
+        window = (t["t_bench0"], t["t_bench1"])
+    except (OSError, ValueError, KeyError):
+        pass
+    j = view_join(cell, window)
+    if j is None:
+        return
+    print(f"  PROPOSAL->QC JOIN ms ({'load window' if window else 'whole run'}; "
+          f"{j['joined']} views joined, {j['no_pc']} without a PC; last voter {j['last_voter']}):")
+    for k, v in j["segments"].items():
+        print(f"    {k.ljust(20)} p50 {v['p50']:8.1f}  p90 {v['p90']:8.1f}  mean {v['mean']:8.1f}  n {v['n']}")
+
+
+if __name__ == "__main__":
+    for cell in sys.argv[1:]:
+        main(cell)
+    for cell in sys.argv[1:]:
+        hist_tail(cell)
+    for cell in sys.argv[1:]:
+        print_view_join(cell)

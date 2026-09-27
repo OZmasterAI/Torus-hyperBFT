@@ -539,6 +539,8 @@ def check_view_hists_sampled():
               "torus_view_timeout_no_vote_total", "torus_view_timeout_after_vote_total",
               "torus_view_timeout_leader_total", "torus_view_proposals_uncertified_total"):
         assert c in counters, "VIEW_COUNTERS is missing %s" % c
+    for name in ("torus_view_vote_gather_seconds", "torus_view_qc_to_advance_seconds"):
+        assert name in hists, "VIEW_HISTS is missing %s (s70 proposal->QC split)" % name
     for phase in ("parent", "select", "mirror", "attest", "encode"):
         assert "torus_block_build_%s_seconds" % phase in hists, (
             "VIEW_HISTS is missing torus_block_build_%s_seconds" % phase)
