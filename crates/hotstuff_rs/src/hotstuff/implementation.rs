@@ -156,6 +156,15 @@ pub(crate) struct HotStuff<N: Network> {
     /// s65 item C: `(view, block)` of the leader's own header that was already
     /// processed inline; its loopback copy is dropped once on arrival.
     inline_self_header: Option<(ViewNumber, CryptoHash)>,
+    /// s72 fix D: when true, a leader whose proposal is deferred for a missing
+    /// parent body skips the app commit feed when that body is inserted, and
+    /// that retried proposal (only) uses item C's order (header and own vote
+    /// before the feed). Read once from `TORUS_DEFER_PARENT_FEED` (`1`
+    /// enables). Default OFF.
+    defer_parent_feed: bool,
+    /// s72 fix D: a body insert committed blocks whose feed was skipped; run by
+    /// [`run_pending_commit_feed`](Self::run_pending_commit_feed).
+    commit_feed_pending: bool,
     /// L3 v2 (body push): unsolicited pushed bodies that arrived BEFORE their
     /// header, parked until [`on_receive_proposal_header`](Self::on_receive_proposal_header)
     /// consumes them (or FIFO eviction reclaims the slot). Bounded by
@@ -207,6 +216,8 @@ impl<N: Network> HotStuff<N> {
             body_push_max_bytes: body_push_max_bytes_from_env(),
             defer_commit_feed: defer_commit_feed_from_env(),
             inline_self_header: None,
+            defer_parent_feed: defer_parent_feed_from_env(),
+            commit_feed_pending: false,
             pushed_bodies: VecDeque::new(),
         }
     }
@@ -216,6 +227,36 @@ impl<N: Network> HotStuff<N> {
     #[cfg(test)]
     pub(crate) fn set_defer_commit_feed(&mut self, on: bool) {
         self.defer_commit_feed = on;
+    }
+
+    /// Test-only override of the deferred-parent-feed flag.
+    #[cfg(test)]
+    pub(crate) fn set_defer_parent_feed(&mut self, on: bool) {
+        self.defer_parent_feed = on;
+    }
+
+    /// s72 fix D: a parent-body insert skipped the app feed and
+    /// [`run_pending_commit_feed`](Self::run_pending_commit_feed) has not run yet.
+    pub(crate) fn has_pending_commit_feed(&self) -> bool {
+        self.commit_feed_pending
+    }
+
+    /// s72 fix D: run the app commit feed a parent-body insert skipped. The
+    /// algorithm loop calls this right after the proposal retry (step 4), so
+    /// the feed follows the header broadcast, or runs one pass later when no
+    /// proposal happened. The feed replays from the durable frontier, so it
+    /// delivers every committed height once, whatever ran in between.
+    pub(crate) fn run_pending_commit_feed<K: KVStore>(
+        &mut self,
+        block_tree: &mut BlockTreeSingleton<K>,
+        app: &mut impl App<K>,
+    ) {
+        if !std::mem::take(&mut self.commit_feed_pending) {
+            return;
+        }
+        if let Err(e) = crate::committed_feed::feed_committed_blocks_to_app(block_tree, app) {
+            log::error!("deferred app feed after parent-body insert failed: {:?}", e);
+        }
     }
 
     /// Test-only override of the body-push threshold, bypassing the
@@ -704,7 +745,10 @@ impl<N: Network> HotStuff<N> {
         block_tree: &mut BlockTreeSingleton<K>,
         app: &mut impl App<K>,
     ) -> Result<(), HotStuffError> {
-        let deferred = if self.defer_commit_feed {
+        // s72 fix D: a retry after a skipped parent-body feed needs this order
+        // too, or the feed run here would deliver the skipped heights before
+        // the broadcast. Other proposals keep their order.
+        let deferred = if self.defer_commit_feed || self.commit_feed_pending {
             Some(update_result)
         } else {
             self.process_update_result(update_result, block_tree, app);
@@ -2457,7 +2501,34 @@ impl<N: Network> HotStuff<N> {
                         committed_block_hashes: vec![],
                     }
                 });
-            self.process_update_result(update_result, block_tree, app);
+            // s72 fix D: our deferred proposal is waiting on exactly this block.
+            // Skip the feed (on_committed_block: materialize, durable persist,
+            // exec dispatch) so the retried proposal goes out first; the commit
+            // itself is already durable and the loop runs the feed right after.
+            // Fails open: the insert and commit are already durable, so a
+            // highest_pc read error must not skip the rest of this function.
+            if self.defer_parent_feed
+                && self.proposal_deferred
+                && !update_result.committed_block_hashes.is_empty()
+                && matches!(block_tree.highest_pc(), Ok(pc) if pc.block == block.hash)
+            {
+                log::info!(
+                    "parent_feed_deferred: height={} committed={}",
+                    block.height.int(),
+                    update_result.committed_block_hashes.len()
+                );
+                self.commit_feed_pending = true;
+                self.process_update_result(
+                    UpdateResult {
+                        committed_block_hashes: vec![],
+                        ..update_result
+                    },
+                    block_tree,
+                    app,
+                );
+            } else {
+                self.process_update_result(update_result, block_tree, app);
+            }
 
             let validator_set_state = block_tree.validator_set_state()?;
             let _ = self
@@ -3107,6 +3178,12 @@ pub(crate) fn parse_body_push_max_bytes(raw: Option<String>) -> u64 {
 /// `TORUS_DEFER_COMMIT_FEED`: only `1` enables (s65 item C, default OFF).
 pub(crate) fn parse_defer_commit_feed(raw: Option<String>) -> bool {
     matches!(raw.as_deref().map(str::trim), Some("1"))
+}
+
+/// Cached env read of `TORUS_DEFER_PARENT_FEED` (s72 fix D, `1` enables).
+fn defer_parent_feed_from_env() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| parse_defer_commit_feed(std::env::var("TORUS_DEFER_PARENT_FEED").ok()))
 }
 
 /// Cached env read of `TORUS_DEFER_COMMIT_FEED`.

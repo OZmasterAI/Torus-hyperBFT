@@ -190,6 +190,10 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
                     log::error!("HotStuff enter_view error (view={}): {:?} — will retry after polling messages", view_info.view.int(), e);
                 }
             }
+            // s72 fix D: a parent-body insert may have skipped the app feed
+            // so the retried proposal above could go out first; run it now.
+            self.hotstuff
+                .run_pending_commit_feed(&mut self.block_tree, &mut self.app);
 
             // 5. Poll the sync worker for fetched blocks (non-blocking).
             self.block_sync_client.poll_worker_results();
@@ -244,7 +248,11 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
             // without feeding — an unknown cousin of the min-height exec-feed
             // gap. Surface it LOUDLY, then heal it (the feed delivers in order).
             // Cost when healthy: three point reads per second.
-            if last_feed_reconcile.elapsed() >= Duration::from_secs(1) {
+            // A feed skipped by fix D this pass is not a lost height: leave it to
+            // `run_pending_commit_feed` after the next proposal retry.
+            if last_feed_reconcile.elapsed() >= Duration::from_secs(1)
+                && !self.hotstuff.has_pending_commit_feed()
+            {
                 last_feed_reconcile = Instant::now();
                 match crate::committed_feed::feed_committed_blocks_to_app(
                     &mut self.block_tree,
