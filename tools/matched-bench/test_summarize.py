@@ -530,6 +530,15 @@ def check_view_hists_sampled():
     hists = ast.literal_eval(re.search(r"^VIEW_HISTS = (\[.*?\])", src, re.S | re.M).group(1))
     with open(os.path.join(here, "run-cell.sh")) as f:
         wide = set(re.search(r'^WIDE_COLS="([^"]+)"', f.read(), re.M).group(1).split())
+    for name in ("torus_view_entry_slack_seconds", "torus_view_timeout_after_seconds"):
+        assert name in hists, "VIEW_HISTS is missing %s" % name
+    counters = ast.literal_eval(re.search(r"^VIEW_COUNTERS = (\[.*?\])", src, re.S | re.M).group(1))
+    missing_counters = [c for c in counters if c not in wide]
+    assert not missing_counters, "VIEW_COUNTERS not sampled in WIDE_COLS: %r" % missing_counters
+    for c in ("torus_view_entered_past_deadline_total", "torus_view_timeout_no_proposal_total",
+              "torus_view_timeout_no_vote_total", "torus_view_timeout_after_vote_total",
+              "torus_view_timeout_leader_total", "torus_view_proposals_uncertified_total"):
+        assert c in counters, "VIEW_COUNTERS is missing %s" % c
     for phase in ("parent", "select", "mirror", "attest", "encode"):
         assert "torus_block_build_%s_seconds" % phase in hists, (
             "VIEW_HISTS is missing torus_block_build_%s_seconds" % phase)

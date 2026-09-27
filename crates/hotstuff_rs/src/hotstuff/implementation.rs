@@ -515,10 +515,17 @@ impl<N: Network> HotStuff<N> {
             reputation.as_ref(),
         );
 
+        let now = Instant::now();
+        let deadline_slack_secs = if self.view_info.deadline >= now {
+            (self.view_info.deadline - now).as_secs_f64()
+        } else {
+            -(now - self.view_info.deadline).as_secs_f64()
+        };
         Event::StartView(StartViewEvent {
             timestamp: SystemTime::now(),
             view: self.view_info.view,
             leader: view_leader,
+            deadline_slack_secs,
         })
         .publish(&self.event_publisher);
 
