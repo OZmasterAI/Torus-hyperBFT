@@ -5,7 +5,7 @@
   "consensus": {
     "protocol": "hotstuff",
     "epoch_length": 100,
-    "timeout_base_ms": 500,
+    "timeout_base_ms": 1200,
     "timeout_max_ms": 30000,
     "reputation_leader_selection": false
   },

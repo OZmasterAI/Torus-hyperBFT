@@ -311,7 +311,7 @@ fn default_chain_config() -> ChainConfig {
         fee_dev_pool_bps: 4500,
         treasury_address: Address::ZERO,
         dev_pool_address: Address::ZERO,
-        timeout_base_ms: 500,
+        timeout_base_ms: 1200,
         backoff_factor: 2,
         backoff_cap: 8,
         commit_lag_backoff_cap: 0,

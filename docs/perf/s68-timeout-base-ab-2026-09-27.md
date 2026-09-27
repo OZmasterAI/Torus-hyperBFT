@@ -51,3 +51,40 @@ Uncertified own proposals: 34–38 → 3–5.
 A real crashed leader would cost ~1.2 s+ per view instead of ~0.5 s. A crash
 cell (`--crash-at 60`) should confirm that rejoin and liveness stay
 acceptable. This is a genesis (consensus) parameter.
+
+## s69 follow-up: crash cells, confirmation pairs, adopted (2026-09-27)
+
+Same binary (`90fcbf2`, sha `eadad6c7`) and settings throughout.
+
+**Crash cells** (`~/bench-results-matched/s69-tcrash-20260927`, `--crash-at 60`,
+val1 killed and restarted). Both passed the crash gate: AGREE, replay found,
+no fail-stop or holes. Survivor freeze, from the 1 s sampler:
+
+| arm | freeze | val1 ready | survivor views in freeze | matched/s (whole / outside freeze) |
+| --- | --- | --- | --- | --- |
+| 1200 | 37 s | +28.8 s | 12 | 53.5k / 60.4k |
+| 500 | 62 s | +27.6 s | 20 | 54.0k / 67.2k |
+
+The freeze ends at the first survivor view boundary after the restarted node
+can vote. The doubling backoff puts those boundaries at 15.5 / 31.5 / 63.5 s
+(500) and 18 / 37.2 / 75.6 s (1200). At 500, val1 was up at +28 s but missed
+the 31.5 s view, as in s64. So 37 vs 62 s reflects where the ~28 s restart
+lands, not a structural gain. If a restart took more than ~33 s, 1200 would
+wait until ~76 s. The fix for rejoin is view sync plus a faster RocksDB open,
+not the timeout base.
+
+**Confirmation** (`~/bench-results-matched/s69-tbase2-20260927`: warm-up, then
+ABBA, run after host services were stopped). All cells ACCEPT/AGREE/PASS.
+- base: 66.1k, 62.9k. t1200: 68.0k, 68.2k. Warm-up (500): 64.8k.
+- One same-day normal cell before that (`s69-tcrash-ctl-r1`, 500) scored 61.4k.
+
+Pooled with the s68 cells: 500 = 62.4 / 68.0 / 66.1 / 61.4 / 66.1 / 62.9
+(mean 64.5k); 1200 = 67.6 / 73.4 / 68.3 / 68.0 / 68.2 (mean 69.1k, +7%).
+1200 won all 5 ABBA pairs (one-sided sign test p ≈ 0.03).
+
+**Adopted:** `timeout_base_ms` 1200 in `devnet/genesis.json`,
+`devnet/ab-harness/devnet-genesis.json`, `testnet/genesis-weighted-base.json`,
+the `ChainConfig` serde default and the node's no-genesis fallback. The
+matched bench caches `testnet/genesis-weighted-full.json`; regenerate it
+(`FORCE=1`) or delete it, or cells keep running 500. A 500 control arm now
+needs `TIMEOUT_BASE_MS=500`.

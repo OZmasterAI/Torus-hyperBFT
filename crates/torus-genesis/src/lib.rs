@@ -707,6 +707,27 @@ mod tests {
         }
     }
 
+    /// s69: the shipped genesis files (devnet, A/B harness, and the testnet
+    /// base the matched bench derives from) use the 1200 ms view-timeout base.
+    #[test]
+    fn shipped_genesis_files_use_1200ms_timeout_base() {
+        for (name, json) in [
+            ("devnet/genesis.json", include_str!("../../../devnet/genesis.json")),
+            (
+                "devnet/ab-harness/devnet-genesis.json",
+                include_str!("../../../devnet/ab-harness/devnet-genesis.json"),
+            ),
+            (
+                "testnet/genesis-weighted-base.json",
+                include_str!("../../../testnet/genesis-weighted-base.json"),
+            ),
+        ] {
+            let genesis = Genesis::from_json(json).unwrap_or_else(|e| panic!("{name}: {e:?}"));
+            assert_eq!(genesis.consensus.timeout_base_ms, 1200, "{name}");
+            assert_eq!(genesis.chain_config().timeout_base_ms, 1200, "{name}");
+        }
+    }
+
     /// S470 knob default: a genesis whose consensus section omits
     /// `commit_lag_backoff_cap` (every genesis written before S470) must map
     /// to a ChainConfig with the commit-lag backoff OFF — the exact pre-S470
