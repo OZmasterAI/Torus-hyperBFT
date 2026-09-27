@@ -3008,13 +3008,26 @@ fn body_fetch_trace_metadata(
 ) -> Option<BodyFetchTraceMetadata> {
     use hotstuff_rs::hotstuff::messages::HotStuffMessage;
     use hotstuff_rs::networking::messages::{Message, ProgressMessage};
-    let Message::ProgressMessage(ProgressMessage::HotStuffMessage(msg)) = msg else {
+    use hotstuff_rs::pacemaker::messages::{PacemakerMessage, ProgressCertificate};
+    let Message::ProgressMessage(msg) = msg else {
         return None;
     };
     let (kind, view, hash) = match msg {
-        HotStuffMessage::ProposalHeader(header) => ("header", header.view, header.block_hash),
-        HotStuffMessage::BlockDataRequest(request) => ("request", request.view, request.block_hash),
-        HotStuffMessage::BlockDataResponse(response) => ("response", response.view, response.block.hash),
+        ProgressMessage::HotStuffMessage(msg) => match msg {
+            HotStuffMessage::ProposalHeader(header) => ("header", header.view, header.block_hash),
+            HotStuffMessage::BlockDataRequest(request) => ("request", request.view, request.block_hash),
+            HotStuffMessage::BlockDataResponse(response) => ("response", response.view, response.block.hash),
+            // s70 proposal->QC split: vote arrivals at the collector.
+            HotStuffMessage::PhaseVote(vote) => ("vote", vote.view, vote.block),
+            _ => return None,
+        },
+        // s70: the collector's AdvanceView reaching the other validators.
+        ProgressMessage::PacemakerMessage(PacemakerMessage::AdvanceView(advance)) => {
+            match &advance.progress_certificate {
+                ProgressCertificate::PhaseCertificate(pc) => ("advance_view", pc.view, pc.block),
+                ProgressCertificate::TimeoutCertificate(_) => return None,
+            }
+        }
         _ => return None,
     };
     Some(BodyFetchTraceMetadata { kind, view: view.int(), hash: hash.bytes() })
@@ -3678,6 +3691,31 @@ mod tests {
             assert_eq!(shared.inbound.lock().unwrap().back().unwrap().1.try_to_vec().unwrap(), expected);
         }
         assert!(body_fetch_trace_metadata(&HotStuffMessage::Proposal(proposal).into()).is_none());
+    }
+
+    /// s70 proposal->QC split: votes and PC-carrying AdvanceViews get admission
+    /// lines too, so the collector's vote arrivals and the leader's AdvanceView
+    /// arrival can be joined against the per-view trace across validators.
+    #[test]
+    fn body_fetch_trace_classifies_votes_and_pc_advance_views() {
+        use hotstuff_rs::hotstuff::messages::{HotStuffMessage, PhaseVote};
+        use hotstuff_rs::hotstuff::types::{Phase, PhaseCertificate};
+        use hotstuff_rs::pacemaker::messages::PacemakerMessage;
+        use hotstuff_rs::types::data_types::{ChainID, CryptoHash, SignatureBytes, ViewNumber};
+        let vote: hotstuff_rs::networking::messages::Message = HotStuffMessage::PhaseVote(PhaseVote {
+            chain_id: ChainID::new(7), view: ViewNumber::new(42), block: CryptoHash::new([2; 32]),
+            phase: Phase::Generic, signature: SignatureBytes::new([0; 64]),
+        }).into();
+        let meta = body_fetch_trace_metadata(&vote).expect("vote classified");
+        assert_eq!((meta.kind, meta.view, meta.hash), ("vote", 42, [2; 32]));
+
+        let mut pc = PhaseCertificate::genesis_pc();
+        pc.view = ViewNumber::new(43);
+        pc.block = CryptoHash::new([3; 32]);
+        let advance: hotstuff_rs::networking::messages::Message =
+            PacemakerMessage::advance_view(pc.into()).into();
+        let meta = body_fetch_trace_metadata(&advance).expect("PC advance view classified");
+        assert_eq!((meta.kind, meta.view, meta.hash), ("advance_view", 43, [3; 32]));
     }
 
     #[test]

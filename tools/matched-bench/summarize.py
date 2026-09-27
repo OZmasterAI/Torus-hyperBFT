@@ -518,7 +518,9 @@ VIEW_HISTS = ["torus_view_duration_seconds", "torus_view_propose_delay_seconds",
               "torus_block_build_mirror_seconds", "torus_block_build_attest_seconds",
               "torus_block_build_encode_seconds",
               # s68: pacemaker deadline diagnosis
-              "torus_view_entry_slack_seconds", "torus_view_timeout_after_seconds"]
+              "torus_view_entry_slack_seconds", "torus_view_timeout_after_seconds",
+              # s70: collector split of qc_collect
+              "torus_view_vote_gather_seconds", "torus_view_qc_to_advance_seconds"]
 # s68: per-view counters sliced to the same windows (delta, not mean).
 VIEW_COUNTERS = ["torus_view_entered_past_deadline_total", "torus_view_timeout_no_proposal_total",
                  "torus_view_timeout_no_vote_total", "torus_view_timeout_after_vote_total",
