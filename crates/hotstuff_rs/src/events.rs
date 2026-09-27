@@ -268,6 +268,10 @@ pub struct StartViewEvent {
     /// Lets external observers (e.g. an RPC leader hint) follow the pacemaker's
     /// actual choice instead of re-deriving plain IWRR locally.
     pub leader: VerifyingKey,
+    /// The view's pacemaker deadline minus the entry time, in seconds; zero or
+    /// negative when the view is entered at or past its deadline, which then
+    /// times out on the next tick (s68 diagnosis).
+    pub deadline_slack_secs: f64,
 }
 
 /// The replica's view, with a given [`ViewNumber`], timed out.

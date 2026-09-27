@@ -446,6 +446,14 @@ pub struct Metrics {
     pub view_proposal_arrival_seconds: Histogram,
     pub view_insert_persist_seconds: Histogram,
     pub view_vote_delay_seconds: Histogram,
+    pub view_entry_slack_seconds: Histogram,
+    pub view_timeout_after_seconds: Histogram,
+    pub view_entered_past_deadline: Counter,
+    pub view_timeout_no_proposal: Counter,
+    pub view_timeout_no_vote: Counter,
+    pub view_timeout_after_vote: Counter,
+    pub view_timeout_leader: Counter,
+    pub view_proposals_uncertified: Counter,
     pub commit_interval_seconds: Histogram,
 
     // Mesh watchdog (S405) — makes the S395 gossipsub degraded mode (validator
@@ -1642,6 +1650,30 @@ impl Metrics {
             "Follower: proposal arrival to phase vote sent",
             view_vote_delay_seconds.clone(),
         );
+        let view_entry_slack_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 15));
+        registry.register(
+            "torus_view_entry_slack_seconds",
+            "Pacemaker: deadline minus now at view entry, positive slack only (s68)",
+            view_entry_slack_seconds.clone(),
+        );
+        let view_timeout_after_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 15));
+        registry.register(
+            "torus_view_timeout_after_seconds",
+            "View start to ViewTimeout; near zero = entered past its deadline (s68)",
+            view_timeout_after_seconds.clone(),
+        );
+        let view_entered_past_deadline = Counter::default();
+        registry.register("torus_view_entered_past_deadline", "Views entered at or past their pacemaker deadline (s68)", view_entered_past_deadline.clone());
+        let view_timeout_no_proposal = Counter::default();
+        registry.register("torus_view_timeout_no_proposal", "Timed-out views where no proposal had arrived (s68)", view_timeout_no_proposal.clone());
+        let view_timeout_no_vote = Counter::default();
+        registry.register("torus_view_timeout_no_vote", "Timed-out views where a proposal arrived but no vote was sent (s68)", view_timeout_no_vote.clone());
+        let view_timeout_after_vote = Counter::default();
+        registry.register("torus_view_timeout_after_vote", "Timed-out views where this node had already voted (s68)", view_timeout_after_vote.clone());
+        let view_timeout_leader = Counter::default();
+        registry.register("torus_view_timeout_leader", "Timed-out views where this node was the proposer (s68)", view_timeout_leader.clone());
+        let view_proposals_uncertified = Counter::default();
+        registry.register("torus_view_proposals_uncertified", "Own proposals replaced by the next before any PC certified them (s68)", view_proposals_uncertified.clone());
 
         let commit_interval_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 15));
         registry.register(
@@ -1928,6 +1960,14 @@ impl Metrics {
             view_proposal_arrival_seconds,
             view_insert_persist_seconds,
             view_vote_delay_seconds,
+            view_entry_slack_seconds,
+            view_timeout_after_seconds,
+            view_entered_past_deadline,
+            view_timeout_no_proposal,
+            view_timeout_no_vote,
+            view_timeout_after_vote,
+            view_timeout_leader,
+            view_proposals_uncertified,
             commit_interval_seconds,
             consensus_mesh_peers,
             consensus_subscribed_validators,

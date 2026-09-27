@@ -516,7 +516,13 @@ VIEW_HISTS = ["torus_view_duration_seconds", "torus_view_propose_delay_seconds",
               # s68: leader produce_block phases (block_build splits into these)
               "torus_block_build_parent_seconds", "torus_block_build_select_seconds",
               "torus_block_build_mirror_seconds", "torus_block_build_attest_seconds",
-              "torus_block_build_encode_seconds"]
+              "torus_block_build_encode_seconds",
+              # s68: pacemaker deadline diagnosis
+              "torus_view_entry_slack_seconds", "torus_view_timeout_after_seconds"]
+# s68: per-view counters sliced to the same windows (delta, not mean).
+VIEW_COUNTERS = ["torus_view_entered_past_deadline_total", "torus_view_timeout_no_proposal_total",
+                 "torus_view_timeout_no_vote_total", "torus_view_timeout_after_vote_total",
+                 "torus_view_timeout_leader_total", "torus_view_proposals_uncertified_total"]
 
 
 def read_metrics(path):
@@ -603,6 +609,9 @@ def consensus_window(rs, lo, hi):
         tot = m(b, short + "_seconds_sum") - m(a, short + "_seconds_sum")
         out[short + "_ms"] = round(tot / c * 1000, 2) if c > 0 else None
         out[short + "_count"] = c
+    for k in VIEW_COUNTERS:
+        short = k[len("torus_"):]
+        out[short] = (m(b, short) - m(a, short)) if k in a else None
     views = m(b, "consensus_view") - m(a, "consensus_view")
     committed = m(b, "blocks_committed_total") - m(a, "blocks_committed_total")
     out["views"] = views
@@ -1093,6 +1102,17 @@ for node, c0 in consensus.items():
               f"build={ld.get('view_propose_build_ms')} "
               f"qc_collect={ld.get('view_qc_collect_ms')} "
               f"insert_persist={ld.get('view_insert_persist_ms')}")
+        if ld.get("view_timeout_leader_total") is not None:
+            print(f"VIEW_TIMEOUTS {node} (LOAD window): views={ld.get('views')} "
+                  f"entered_past_deadline={ld.get('view_entered_past_deadline_total')} "
+                  f"slack_ms={ld.get('view_entry_slack_ms')} "
+                  f"timeout_after_ms={ld.get('view_timeout_after_ms')} "
+                  f"n={ld.get('view_timeout_after_count')} | "
+                  f"no_proposal={ld.get('view_timeout_no_proposal_total')} "
+                  f"no_vote={ld.get('view_timeout_no_vote_total')} "
+                  f"after_vote={ld.get('view_timeout_after_vote_total')} "
+                  f"leader={ld.get('view_timeout_leader_total')} "
+                  f"uncertified={ld.get('view_proposals_uncertified_total')}")
         if ld.get("block_build_select_ms") is not None:
             print(f"BLOCK_BUILD {node} (LOAD window): total={ld.get('block_build_ms')} "
                   f"(parent={ld.get('block_build_parent_ms')} "

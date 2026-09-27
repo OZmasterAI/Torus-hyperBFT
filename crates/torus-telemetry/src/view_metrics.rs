@@ -35,6 +35,11 @@ struct ViewState {
     self_insert_at: Option<SystemTime>,
     /// Guards `view_vote_delay_seconds` against duplicate-vote double counts.
     vote_observed: bool,
+    /// We proposed in the current view (timeout classification, s68).
+    proposed_this_view: bool,
+    /// The current view's timeout was already classified (the pacemaker
+    /// re-emits ViewTimeout on later ticks of the same view).
+    timeout_observed: bool,
     /// Previous CommitBlock event time, for the commit interval gap.
     last_commit_at: Option<SystemTime>,
     /// Our outstanding proposal awaiting certification: broadcast time and
@@ -78,7 +83,46 @@ impl ViewMetricsRecorder {
         s.insert_observed = false;
         s.vote_observed = false;
         s.self_insert_at = None;
+        s.proposed_this_view = false;
+        s.timeout_observed = false;
         self.metrics.consensus_view.set(view as i64);
+    }
+
+    /// StartView companion (s68): the entered view's pacemaker deadline minus
+    /// the entry time, signed. A view entered at or past its deadline times out
+    /// on the next tick; those are counted, positive slack is observed.
+    pub fn view_entry_slack(&self, slack_secs: f64) {
+        if slack_secs > 0.0 {
+            self.metrics.view_entry_slack_seconds.observe(slack_secs);
+        } else {
+            self.metrics.view_entered_past_deadline.inc();
+        }
+    }
+
+    /// ViewTimeout (s68): once per view, observe view start -> timeout and
+    /// classify by what this node had seen: its own proposal, no proposal, a
+    /// proposal it did not vote for, or its vote sent without a next view.
+    pub fn view_timeout(&self, ts: SystemTime) {
+        let mut s = self.state.lock().unwrap();
+        if s.timeout_observed {
+            return;
+        }
+        s.timeout_observed = true;
+        if let Some(started) = s.view_started_at {
+            self.metrics
+                .view_timeout_after_seconds
+                .observe(secs_between(started, ts));
+        }
+        let class = if s.proposed_this_view {
+            &self.metrics.view_timeout_leader
+        } else if s.proposal_received_at.is_none() {
+            &self.metrics.view_timeout_no_proposal
+        } else if !s.vote_observed {
+            &self.metrics.view_timeout_no_vote
+        } else {
+            &self.metrics.view_timeout_after_vote
+        };
+        class.inc();
     }
 
     /// Propose (leader): time from view start to proposal broadcast. Also
@@ -101,7 +145,11 @@ impl ViewMetricsRecorder {
                     .observe(secs_between(inserted, ts));
             }
         }
+        if s.last_propose.is_some() {
+            self.metrics.view_proposals_uncertified.inc();
+        }
         s.last_propose = Some((ts, block_hash));
+        s.proposed_this_view = true;
     }
 
     /// UpdateHighestPC: when the newly stored PC certifies OUR outstanding
@@ -415,6 +463,68 @@ mod tests {
         let text = m.encode();
         assert_eq!(sample(&text, "torus_commit_interval_seconds_count"), 1.0);
         assert!((sample(&text, "torus_commit_interval_seconds_sum") - 0.4).abs() < 1e-9);
+    }
+
+    /// s68 pacemaker diagnosis: the entered view's deadline slack. A view
+    /// entered at or past its deadline is counted; positive slack is observed.
+    #[test]
+    fn view_entry_slack_counts_views_entered_past_deadline() {
+        let (m, r) = rec();
+        r.view_entry_slack(0.4);
+        r.view_entry_slack(-0.12);
+        r.view_entry_slack(0.0);
+        let text = m.encode();
+        assert_eq!(sample(&text, "torus_view_entry_slack_seconds_count"), 1.0);
+        assert!((sample(&text, "torus_view_entry_slack_seconds_sum") - 0.4).abs() < 1e-9);
+        assert_eq!(sample(&text, "torus_view_entered_past_deadline_total"), 2.0);
+    }
+
+    /// Each timed-out view is classified once, by what this node had seen when
+    /// the deadline fired, and the time from view start to timeout is observed.
+    #[test]
+    fn view_timeout_classified_once_per_view() {
+        let (m, r) = rec();
+        r.start_view(t(0), 1);
+        r.view_timeout(t(5)); // nothing arrived: instant burn
+        r.view_timeout(t(9)); // repeat tick in the same view: ignored
+        r.start_view(t(10), 2);
+        r.receive_proposal(t(40));
+        r.view_timeout(t(510)); // proposal but no vote
+        r.start_view(t(520), 3);
+        r.receive_proposal(t(550));
+        r.phase_vote(t(560));
+        r.view_timeout(t(1020)); // voted, no next view
+        r.start_view(t(1030), 4);
+        r.propose(t(1100), [4u8; 32]);
+        r.view_timeout(t(1530)); // our own proposal never certified in time
+        let text = m.encode();
+        assert_eq!(sample(&text, "torus_view_timeout_no_proposal_total"), 1.0);
+        assert_eq!(sample(&text, "torus_view_timeout_no_vote_total"), 1.0);
+        assert_eq!(sample(&text, "torus_view_timeout_after_vote_total"), 1.0);
+        assert_eq!(sample(&text, "torus_view_timeout_leader_total"), 1.0);
+        assert_eq!(sample(&text, "torus_view_timeout_after_seconds_count"), 4.0);
+        assert!(
+            (sample(&text, "torus_view_timeout_after_seconds_sum") - (0.005 + 0.5 + 0.5 + 0.5))
+                .abs()
+                < 1e-9
+        );
+    }
+
+    /// A proposal replaced by our next one before any PC certified it is
+    /// counted as uncertified (the explorers' orphaned proposal). A certified
+    /// proposal is not.
+    #[test]
+    fn uncertified_proposals_counted_when_replaced() {
+        let (m, r) = rec();
+        r.start_view(t(0), 1);
+        r.propose(t(50), [1u8; 32]);
+        r.update_highest_pc(t(300), [1u8; 32]);
+        r.start_view(t(600), 4);
+        r.propose(t(650), [2u8; 32]);
+        r.start_view(t(1200), 7);
+        r.propose(t(1250), [3u8; 32]); // [2] was never certified
+        let text = m.encode();
+        assert_eq!(sample(&text, "torus_view_proposals_uncertified_total"), 1.0);
     }
 
     #[test]
