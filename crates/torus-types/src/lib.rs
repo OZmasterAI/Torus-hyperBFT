@@ -1229,7 +1229,7 @@ pub struct ChainConfig {
 }
 
 fn default_timeout_base_ms() -> u64 {
-    500
+    1200
 }
 
 fn default_backoff_factor() -> u32 {
@@ -1333,6 +1333,27 @@ mod tests {
         // The pre-existing backoff defaults are unchanged by S470.
         assert_eq!(config.backoff_factor, 2);
         assert_eq!(config.backoff_cap, 8);
+    }
+
+    /// s69: a ChainConfig without `timeout_base_ms` gets the 1200 ms base
+    /// (s68/s69 A/B: 5/5 pairs won over 500, dead views -85%).
+    #[test]
+    fn chain_config_timeout_base_defaults_to_1200() {
+        let json = r#"{
+            "chain_id": 1,
+            "chain_name": "t",
+            "evm_gas_limit": 1,
+            "base_fee_per_gas": 1,
+            "epoch_length": 1,
+            "max_validators": 1,
+            "min_stake": "0x0",
+            "fee_burn_bps": 0,
+            "fee_validator_bps": 0,
+            "fee_treasury_bps": 0,
+            "fee_dev_pool_bps": 0
+        }"#;
+        let config: ChainConfig = serde_json::from_str(json).expect("legacy config must parse");
+        assert_eq!(config.timeout_base_ms, 1200);
     }
 
     #[test]
