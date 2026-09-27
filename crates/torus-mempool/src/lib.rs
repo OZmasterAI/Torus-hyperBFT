@@ -784,6 +784,33 @@ impl Mempool {
         Ok(())
     }
 
+    /// Proposer variant of [`Self::mirror_native_to_da`] (s68): write only the
+    /// bodies the DA store does not already hold. `hashes[i]` must be the action
+    /// hash of `actions[i]`. Ingest normally stored them already; a body still
+    /// buffered, re-queued after a failed flush, or in a concurrent flush reads
+    /// as absent and is written here. If the presence check itself fails, every
+    /// body is written, as before. Returns how many bodies were written; on a
+    /// write failure only the absent bodies are re-queued and the error returned.
+    pub fn mirror_missing_native_to_da(
+        &self,
+        actions: &[SignedNativeAction],
+        hashes: &[B256],
+    ) -> Result<usize, StateError> {
+        debug_assert_eq!(actions.len(), hashes.len());
+        let absent: Vec<SignedNativeAction> = match self.da_store.missing(hashes) {
+            Ok(positions) => positions.into_iter().map(|i| actions[i].clone()).collect(),
+            Err(e) => {
+                tracing::warn!("native DA presence check failed, writing every body: {e}");
+                actions.to_vec()
+            }
+        };
+        if absent.is_empty() {
+            return Ok(0);
+        }
+        self.mirror_native_to_da(&absent)?;
+        Ok(absent.len())
+    }
+
     /// Additionally custody erasure shards for a proposed block's bodies (Sprint 5
     /// T5). Thin pass-through to [`NativeDaStore::put_shards_batch`] under the
     /// caller-supplied `(k, n)` (derived from the live validator set). ADDITIVE and
@@ -1645,6 +1672,69 @@ mod tests {
             0,
             "a successful mirror must not bump the failure counter"
         );
+    }
+
+    /// s68: the proposer writes only bodies the DA store does not already hold.
+    /// Healthy store: the absent body is written and counted, the present one is
+    /// not rewritten. Read-only store: bodies already stored need no write, so an
+    /// all-present selection succeeds; with one absent body the write fails and
+    /// ONLY that body is re-queued.
+    #[test]
+    fn mirror_missing_native_to_da_writes_only_absent_bodies() {
+        let key = k256::ecdsa::SigningKey::from_slice(
+            &alloy_primitives::hex::decode(
+                "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let now = now_ms();
+        let stored = torus_types::eip712::sign_native_action(
+            torus_types::NativeAction::ClaimRewards,
+            now,
+            &key,
+        );
+        let absent = torus_types::eip712::sign_native_action(
+            torus_types::NativeAction::ClaimRewards,
+            now + 1,
+            &key,
+        );
+        let hashes = vec![
+            torus_types::compute_action_hash(&stored),
+            torus_types::compute_action_hash(&absent),
+        ];
+        let both = vec![stored.clone(), absent.clone()];
+
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state.clone(), MempoolConfig::default());
+        pool.mirror_native_to_da(std::slice::from_ref(&stored)).unwrap();
+        assert_eq!(pool.mirror_missing_native_to_da(&both, &hashes).unwrap(), 1);
+        assert!(NativeDaStore::new(state).get(&hashes[1]).unwrap().is_some());
+        assert_eq!(pool.da_flush_failures(), 0);
+
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let rw = StateDb::open(dir.path()).unwrap();
+            NativeDaStore::new(rw).put(&stored).unwrap();
+        }
+        let readonly = StateDb::open_read_only(dir.path()).unwrap();
+        let pool = Mempool::new(readonly, MempoolConfig::default());
+        assert_eq!(
+            pool.mirror_missing_native_to_da(std::slice::from_ref(&stored), &hashes[..1])
+                .unwrap(),
+            0,
+            "an already-stored body must not be rewritten"
+        );
+        assert_eq!(pool.da_flush_failures(), 0);
+        assert!(pool.mirror_missing_native_to_da(&both, &hashes).is_err());
+        assert_eq!(pool.da_flush_failures(), 1);
+        let pending = pool.da_pending.lock().unwrap();
+        let requeued: Vec<B256> = pending
+            .actions
+            .iter()
+            .map(torus_types::compute_action_hash)
+            .collect();
+        assert_eq!(requeued, vec![hashes[1]], "only the absent body is re-queued");
     }
 
     /// The re-queued (failed) batch is the OLDEST pending work, so it must land at

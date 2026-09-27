@@ -512,7 +512,11 @@ VIEW_HISTS = ["torus_view_duration_seconds", "torus_view_propose_delay_seconds",
               "torus_validate_block_seconds", "torus_validate_block_decode_seconds",
               "torus_validate_block_da_reconstruct_seconds", "torus_validate_block_attest_seconds",
               "torus_validate_block_custody_seconds", "torus_on_committed_block_seconds",
-              "torus_mempool_remove_committed_seconds"]
+              "torus_mempool_remove_committed_seconds",
+              # s68: leader produce_block phases (block_build splits into these)
+              "torus_block_build_parent_seconds", "torus_block_build_select_seconds",
+              "torus_block_build_mirror_seconds", "torus_block_build_attest_seconds",
+              "torus_block_build_encode_seconds"]
 
 
 def read_metrics(path):
@@ -1089,3 +1093,10 @@ for node, c0 in consensus.items():
               f"build={ld.get('view_propose_build_ms')} "
               f"qc_collect={ld.get('view_qc_collect_ms')} "
               f"insert_persist={ld.get('view_insert_persist_ms')}")
+        if ld.get("block_build_select_ms") is not None:
+            print(f"BLOCK_BUILD {node} (LOAD window): total={ld.get('block_build_ms')} "
+                  f"(parent={ld.get('block_build_parent_ms')} "
+                  f"select={ld.get('block_build_select_ms')} "
+                  f"mirror={ld.get('block_build_mirror_ms')} "
+                  f"attest={ld.get('block_build_attest_ms')} "
+                  f"encode={ld.get('block_build_encode_ms')}) n={ld.get('block_build_count')}")

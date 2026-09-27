@@ -183,6 +183,30 @@ impl NativeDaStore {
             .collect()
     }
 
+    /// Positions in `hashes` whose body is absent, in input order, from one
+    /// pinned `MultiGet` that never decodes or copies a present body. A present
+    /// key is exactly as durable as a fresh `put` would make it (same DB, same
+    /// write options), so the proposer writes only these positions (s68).
+    pub fn missing(&self, hashes: &[B256]) -> Result<Vec<usize>, StateError> {
+        if hashes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let cf = self.db.cf_handle(CF_NATIVE_PENDING)?;
+        let mut missing = Vec::new();
+        for (i, slot) in self
+            .db
+            .inner()
+            .batched_multi_get_cf(cf, hashes.iter().map(|hash| hash.as_slice()), false)
+            .into_iter()
+            .enumerate()
+        {
+            if slot?.is_none() {
+                missing.push(i);
+            }
+        }
+        Ok(missing)
+    }
+
     /// Fetch the raw stored bytes (`bincode(SignedNativeAction)`) by action-hash,
     /// without deserializing. The `/torus/native-da/1.0` serve path ships these
     /// bytes verbatim to a requesting peer. Takes the 32-byte hash directly so the
@@ -322,6 +346,24 @@ mod tests {
         assert_eq!(got[2].as_ref().map(compute_action_hash), Some(h3));
 
         assert!(store.get_batch(&[]).expect("empty get_batch").is_empty());
+    }
+
+    /// `missing` reports the input positions whose body is absent, in input
+    /// order (duplicates included), without decoding any present body. The
+    /// proposer uses it to write only the bodies ingest has not already stored.
+    #[test]
+    fn missing_reports_absent_positions_in_input_order() {
+        let (_dir, store) = temp_store();
+        let a1 = dummy_action(1);
+        let a3 = dummy_action(3);
+        let h1 = compute_action_hash(&a1);
+        let h2 = compute_action_hash(&dummy_action(2));
+        let h3 = compute_action_hash(&a3);
+        store.put_batch(&[a1, a3]).expect("put_batch");
+
+        assert_eq!(store.missing(&[h1, h2, h3, h2]).expect("missing"), vec![1, 3]);
+        assert!(store.missing(&[h1, h3]).expect("all present").is_empty());
+        assert!(store.missing(&[]).expect("empty input").is_empty());
     }
 
     /// A present-but-undecodable body is an `Err`, exactly like `get`.

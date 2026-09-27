@@ -25,6 +25,11 @@ pub struct Metrics {
     pub blocks_committed: Counter,
     pub block_height: Gauge,
     pub block_build_seconds: Histogram,
+    pub block_build_parent_seconds: Histogram,
+    pub block_build_select_seconds: Histogram,
+    pub block_build_mirror_seconds: Histogram,
+    pub block_build_attest_seconds: Histogram,
+    pub block_build_encode_seconds: Histogram,
 
     // Transaction metrics
     pub evm_txs_processed: Counter,
@@ -156,6 +161,10 @@ pub struct Metrics {
     /// validator) rather than referencing a body no validator could reconstruct.
     /// Monotonic; 0 on a healthy store.
     pub proposer_body_mirror_failures: Counter,
+    /// Selected bodies the proposer had to write because the DA store did not
+    /// already hold them (s68). Ingest stores most bodies first; the rest are
+    /// skipped.
+    pub proposer_body_mirror_written: Counter,
     /// Native-DA pull-fallback fetches issued (Phase C Task 6). Must stay LOW under
     /// load — push covers the common case; a high rate signals push is failing.
     pub native_da_pull_requests: Counter,
@@ -677,6 +686,36 @@ impl Metrics {
             "Time to build a block",
             block_build_seconds.clone(),
         );
+        let block_build_parent_seconds = Histogram::new(exponential_buckets(0.0005, 2.0, 14));
+        registry.register(
+            "torus_block_build_parent_seconds",
+            "Consensus thread: parent block read + datum decode, before the whole-build timer in produce_block",
+            block_build_parent_seconds.clone(),
+        );
+        let block_build_select_seconds = Histogram::new(exponential_buckets(0.0005, 2.0, 14));
+        registry.register(
+            "torus_block_build_select_seconds",
+            "Consensus thread: select_block_payload (in-flight set, mempool select, EVM drain) in produce_block",
+            block_build_select_seconds.clone(),
+        );
+        let block_build_mirror_seconds = Histogram::new(exponential_buckets(0.0005, 2.0, 14));
+        registry.register(
+            "torus_block_build_mirror_seconds",
+            "Consensus thread: proposer DA body mirror + shard custody in produce_block",
+            block_build_mirror_seconds.clone(),
+        );
+        let block_build_attest_seconds = Histogram::new(exponential_buckets(0.0005, 2.0, 14));
+        registry.register(
+            "torus_block_build_attest_seconds",
+            "Consensus thread: proposer sig attestation over all native bodies in produce_block",
+            block_build_attest_seconds.clone(),
+        );
+        let block_build_encode_seconds = Histogram::new(exponential_buckets(0.0005, 2.0, 14));
+        registry.register(
+            "torus_block_build_encode_seconds",
+            "Consensus thread: block construction, pre-proposal push, proposal encode + datum hash in produce_block",
+            block_build_encode_seconds.clone(),
+        );
 
         let evm_txs_processed = Counter::default();
         registry.register(
@@ -1019,6 +1058,13 @@ impl Metrics {
             "torus_proposer_body_mirror_failures",
             "produce_block proposals that dropped native actions on a durable DA mirror failure (S459)",
             proposer_body_mirror_failures.clone(),
+        );
+
+        let proposer_body_mirror_written = Counter::default();
+        registry.register(
+            "torus_proposer_body_mirror_written",
+            "Selected native bodies produce_block wrote because the DA store lacked them (s68)",
+            proposer_body_mirror_written.clone(),
         );
 
         let native_da_pull_requests = Counter::default();
@@ -1745,6 +1791,11 @@ impl Metrics {
             blocks_committed,
             block_height,
             block_build_seconds,
+            block_build_parent_seconds,
+            block_build_select_seconds,
+            block_build_mirror_seconds,
+            block_build_attest_seconds,
+            block_build_encode_seconds,
             evm_txs_processed,
             native_actions_processed,
             consensus_rounds,
@@ -1794,6 +1845,7 @@ impl Metrics {
             native_bundle_repushed,
             missing_action_rejections,
             proposer_body_mirror_failures,
+            proposer_body_mirror_written,
             native_da_pull_requests,
             native_da_pull_recovered,
             native_da_shard_recovered,
@@ -2079,6 +2131,23 @@ mod tests {
         }
         assert!(text.contains("torus_validate_block_seconds_count 1"), "{text}");
         assert!(text.contains("torus_mempool_native_size 3"), "{text}");
+    }
+
+    /// s68: the leader's `produce_block` phases, so the ~180 ms loaded
+    /// `block_build` can be split. Registered with zero observations so the
+    /// harness can tell "absent series" from "zero value".
+    #[test]
+    fn block_build_phase_metrics_register() {
+        let text = Metrics::new().encode();
+        for name in [
+            "torus_block_build_parent_seconds",
+            "torus_block_build_select_seconds",
+            "torus_block_build_mirror_seconds",
+            "torus_block_build_attest_seconds",
+            "torus_block_build_encode_seconds",
+        ] {
+            assert!(text.contains(name), "{name} not registered:\n{text}");
+        }
     }
 
     /// bl1 exec-chain-sub-100-attribution: the ruler series that make the gap
