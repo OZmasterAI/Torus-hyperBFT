@@ -26,7 +26,10 @@ use crate::{
         receiving::{ProgressMessageReceiveError, ProgressMessageStub},
         sending::SenderHandle,
     },
-    pacemaker::implementation::{Pacemaker, PacemakerConfiguration, ViewInfo},
+    pacemaker::{
+        implementation::{Pacemaker, PacemakerConfiguration, ViewInfo},
+        messages::{PacemakerMessage, ProgressCertificate},
+    },
     types::data_types::{BufferSize, ChainID, ViewNumber},
 };
 
@@ -42,6 +45,10 @@ pub(crate) struct Algorithm<N: Network + 'static, K: KVStore, A: App<K> + 'stati
     pacemaker: Pacemaker<N>,
     block_sync_client: BlockSyncClient<N>,
     shutdown_signal: Receiver<()>,
+    /// s70 collector local advance: our own key when enabled (the origin the
+    /// AdvanceView loopback would carry), `None` with
+    /// `TORUS_COLLECTOR_LOCAL_ADVANCE=0`.
+    local_advance_origin: Option<VerifyingKey>,
 }
 
 impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
@@ -64,6 +71,12 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
         shutdown_signal: Receiver<()>,
         event_publisher: Option<Sender<Event>>,
     ) -> Self {
+        let local_advance_origin = collector_local_advance_enabled(
+            std::env::var("TORUS_COLLECTOR_LOCAL_ADVANCE")
+                .ok()
+                .as_deref(),
+        )
+        .then(|| hotstuff_config.keypair.public());
         let pm_stub = ProgressMessageStub::new(progress_msg_receiver, progress_msg_buffer_capacity);
         let msg_sender: SenderHandle<N> = SenderHandle::new(network.clone());
         let validator_set_update_handle = ValidatorSetUpdateHandle::new(network);
@@ -119,6 +132,7 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
             pacemaker,
             block_sync_client,
             shutdown_signal,
+            local_advance_origin,
         }
     }
 
@@ -313,6 +327,7 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
                             e
                         );
                     }
+                    self.apply_local_advance();
                     if self.hotstuff.take_sync_needed() {
                         if let Err(e) =
                             self.block_sync_client.trigger_sync(&mut self.block_tree)
@@ -356,6 +371,27 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
         }
     }
 
+    /// s70: hand the generic PC we just collected (and broadcast) to our own
+    /// pacemaker as the AdvanceView its loopback would deliver: same PC, same
+    /// origin, same handler, minus the inbound-queue wait. Guarded by the
+    /// receive filter's precondition (not older than the current view); the
+    /// later loopback copy is then a no-op view-wise.
+    fn apply_local_advance(&mut self) {
+        let Some(pc) = self.hotstuff.take_local_advance() else {
+            return;
+        };
+        let Some(origin) = self.local_advance_origin else {
+            return;
+        };
+        if pc.view < self.pacemaker.query().view {
+            return;
+        }
+        let msg = PacemakerMessage::advance_view(ProgressCertificate::PhaseCertificate(pc));
+        if let Err(e) = self.pacemaker.on_receive_msg(msg, &origin, &mut self.block_tree) {
+            log::error!("Pacemaker local advance error: {:?} — waiting for the loopback", e);
+        }
+    }
+
     fn tick_body_retries(&mut self) {
         // 6c. Retry stale body fetches (proposer first, then rotate across the
         // other validators); trigger sync after max retries.
@@ -395,6 +431,15 @@ fn body_before_expiry_enabled(value: Option<&str>) -> bool {
     value == Some("1")
 }
 
+/// `TORUS_COLLECTOR_LOCAL_ADVANCE`: on by default, `0` is the kill switch.
+fn collector_local_advance_enabled(value: Option<&str>) -> bool {
+    value != Some("0")
+}
+
 #[cfg(test)]
 #[path = "body_before_expiry_tests.rs"]
 mod body_before_expiry_tests;
+
+#[cfg(test)]
+#[path = "local_advance_tests.rs"]
+mod local_advance_tests;

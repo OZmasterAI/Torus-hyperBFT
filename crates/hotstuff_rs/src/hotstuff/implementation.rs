@@ -38,7 +38,7 @@ use crate::{
             ProposalRequest, ProposalResponse,
         },
         roles::{is_phase_voter, new_view_recipients_with_reputation, view_leader_with_reputation},
-        types::{valid_nec, NECollector, Phase, PhaseVoteCollector},
+        types::{valid_nec, NECollector, Phase, PhaseCertificate, PhaseVoteCollector},
     },
     networking::{
         network::{Network, ValidatorSetUpdateHandle},
@@ -92,6 +92,11 @@ pub(crate) struct HotStuff<N: Network> {
     /// Maps (view, leader) → first block hash seen from that leader in that view.
     seen_proposals: std::collections::HashMap<(ViewNumber, VerifyingKey), CryptoHash>,
     sync_needed: bool,
+    /// s70: the generic PC we just collected and broadcast in an AdvanceView,
+    /// for the algorithm loop to hand to our own pacemaker directly instead of
+    /// waiting for the broadcast's loopback delivery. Drained by
+    /// `take_local_advance`.
+    local_advance: Option<PhaseCertificate>,
     /// Hybrid pipelining: full blocks stored locally by the proposer after broadcasting header.
     pending_bodies: PendingBodies,
     /// Hybrid pipelining: headers received but body not yet fetched. Maps block_hash → header.
@@ -192,6 +197,7 @@ impl<N: Network> HotStuff<N> {
             ne_sent_views: HashSet::new(),
             seen_proposals: std::collections::HashMap::new(),
             sync_needed: false,
+            local_advance: None,
             pending_bodies: PendingBodies::new(),
             pending_headers: PendingHeaders::new(),
             body_fetch_tracker: std::collections::HashMap::new(),
@@ -230,6 +236,10 @@ impl<N: Network> HotStuff<N> {
     #[cfg(test)]
     pub(crate) fn pushed_body_buffer_len(&self) -> usize {
         self.pushed_bodies.len()
+    }
+
+    pub(crate) fn take_local_advance(&mut self) -> Option<PhaseCertificate> {
+        self.local_advance.take()
     }
 
     pub(crate) fn take_sync_needed(&mut self) -> bool {
@@ -1565,6 +1575,7 @@ impl<N: Network> HotStuff<N> {
                     );
                     self.sender_handle
                         .broadcast::<crate::networking::messages::Message>(advance_msg.into());
+                    self.local_advance = Some(new_pc);
                 }
             }
         }
