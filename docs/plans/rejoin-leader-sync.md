@@ -133,8 +133,51 @@ The new code logs every leader-skip, so the next run answers this directly.
 2. **Boot `enter_view`.** It also sends `NewView{init-1}` and may re-run
    leader recovery. Check that the `highest_view_proposed` guard covers a
    crash between proposing and persisting the entered view. The stateright
-   model should include this.
+   model should include this. **Answered (Model, below):** there is no such
+   window. `enter_view` persists the entered view before it proposes.
 3. **Review finding 4 (B+C gap).** A future header with an unknown justify
    block neither parks nor skips, so a rejoiner behind on both view and blocks
    still waits for the next header. Extend C's parking to future headers, or
    leave it? Decide after the A/B shows whether it occurs.
+
+## Model
+
+`crates/hotstuff_rs/tests/stateright_rejoin_leader_sync.rs` extends the s74
+round-skip model (`stateright_rejoin_view_sync.rs`, kept as the B-only
+baseline). It uses n=3, f=0 and leader(v) = v mod 3, and each replica keeps
+its own view.
+- **enter_view** runs in production order: send NewView{prev} to
+  leader(prev+1), then take the view, then persist the entered view, then
+  propose if leader. The persist and the proposal are separate steps, so a
+  crash can fall between them.
+- **Delivery** is queued: a NewView can arrive late, repeatedly, or after the
+  receiver restarts.
+- **Boot:** the replica restarts at entered+1. With fix A it runs
+  enter_view(init); without fix A it stays silent in init.
+- **Leader skip:** the rule from step 4 of `on_receive_new_view`.
+- **Kept from the s74 model:** round-skip B, vote decide/persist/send as
+  separate steps, and a Byzantine extra block per view.
+
+Results:
+- **Safety holds.** Proposal views strictly increase per replica, across
+  restarts, and so do sent vote views. This holds with fix A and round-skip
+  on, and with both off. The regular suite runs to depth 12 in ~1 s. The
+  `--ignored` exhaustive run (views ≤ 3, 1 crash) takes ~131 s and
+  explores 14.3 M unique states.
+- **Coverage is reached.** A restarted replica proposes after a leader skip,
+  and a restarted replica proposes at boot. Without fix A, neither ever
+  happens.
+- **The mutation is caught.** `propose_before_persist` fails the proposal
+  property in 5 steps: propose in v, crash, restart in v, then the boot
+  enter_view proposes again. Without fix A it is also caught (restart below
+  v, then time out into v). So the persist order already guarded proposals;
+  fix A only makes the second proposal immediate.
+- **Scenarios** (s74 v423/v570): the rejoiner restarted at v−2 skips on the
+  queued NewView and proposes in v, and the rejoiner restarted at v proposes
+  at boot. Neither needs a timeout, and neither happens without fix A.
+
+Residual risk (same class as votes): the entered-view write is not fsync'd.
+SIGKILL keeps it, but power loss can lose it. After a power loss, the leader
+can propose a second block in v. Other replicas then record equivocation
+evidence against an honest node. Fsyncing that write before proposing would
+close this.
