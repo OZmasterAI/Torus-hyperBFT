@@ -642,8 +642,8 @@ pub struct Replica<K: KVStore> {
     algorithm_shutdown: Sender<()>,
     block_sync_server: Option<JoinHandle<()>>,
     block_sync_server_shutdown: Sender<()>,
-    /// s72 option 3 (`TORUS_BODY_SERVE_THREAD=1`): the block-data server and
-    /// its shutdown signal.
+    /// s72 option 3 (on unless `TORUS_BODY_SERVE_THREAD=0`): the block-data
+    /// server and its shutdown signal.
     block_data_server: Option<(JoinHandle<()>, Sender<()>)>,
     block_sync_worker: Option<JoinHandle<()>>,
     block_sync_worker_shutdown: Sender<()>,

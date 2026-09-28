@@ -82,3 +82,45 @@ Options if revisited:
 - Serve block-data requests off the algo thread, so a stalled algo thread
   cannot starve body fetches (helps flag-off tails too).
 - Attack the other half of the wait: validate (~57 ms, DA reconstruct ~48).
+
+## 6. Option 3: serve block-data requests off the algorithm thread (f9b013e)
+
+`TORUS_BODY_SERVE_THREAD`: the poller routes `BlockDataRequest`s to a
+`BlockDataServer` thread that reads the block from a `BlockTreeCamera`
+snapshot and replies itself; misses go to the algorithm thread as before.
+Design: `docs/plans/s72-body-serve-thread.md`.
+
+A/B `~/bench-results-matched/s72-bst-20260928`, one binary (sha256
+`9cdd817e…`), s70 settings, rounds r1-r3 with three arms (rotated order),
+r4-r6 with srv/srvd only (alternating). All 16 cells ACCEPT/AGREE/PASS,
+sync_fallback 0 everywhere.
+
+| arm | cells (matched/s) | mean | median |
+|---|---|---|---|
+| off | 67.0 / 66.4 / 67.3k | 66.9k | 67.0k |
+| srv (serve thread) | 65.4 / 70.3 / 71.1 / 69.1 / 65.2 / 65.8k | 67.8k | 67.4k |
+| srvd (serve + D) | 74.5 / 74.9 / 52.0 / 66.0 / 68.0 / 59.4k | 65.8k | 67.0k |
+
+Per view (r1-r3, mean ms): leader serve queue off 12-18, srv 3-4, srvd 2-9;
+next leader StartView -> produce_block off 74-90, srv 82-90, srvd 49-50;
+leader propose off-r3 305, srvd 237-252. With the serve thread, D's saving is
+real and no longer shifts onto body delivery, but the node that just ran a
+deferred feed votes later on the next header in slow views (mean +65-90 ms,
+p90 +200-500 ms in srvd-r1/r2), and the exec queue sits at its bound 22-36 %
+of the time (off 0-11 %).
+
+Bad minutes (per-minute mean cycle 900-1250 ms against ~650-800) occur in
+every arm and in the s70 binary (off-r1, srv-r2, s70-ladv-on-r1, srvd-r3
+twice). Not explained by exec-queue saturation, start load, UDP receive-buffer
+drops (75-105/s in every cell, fewer in srvd-r3's bad minutes), timeouts or
+Send Queue floods. Open.
+
+### Verdict
+
+- Serve thread: adopted, on by default (`TORUS_BODY_SERVE_THREAD=0` turns it
+  off). Throughput neutral within cell noise; bodies keep flowing while the
+  algorithm thread is busy.
+- D on top: fails the pre-declared rule (needed >= 4/6 pair wins and >= +3k
+  mean and median; got 3/6, mean -2.0k, median -0.1k). Stays off. Revisit only
+  with the refinement that lets queued headers/votes go ahead of the deferred
+  feed.

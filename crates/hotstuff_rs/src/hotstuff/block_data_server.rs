@@ -3,8 +3,8 @@
 //! The algorithm thread handles one progress message per loop pass and can be
 //! busy for 100 ms to 1+ s (validate, the app commit feed, a blocking exec
 //! dispatch), so a body request queued behind it can outlive the requester's
-//! retry budget. With `TORUS_BODY_SERVE_THREAD=1` the poller routes body
-//! requests here instead: the block is read from a [`BlockTreeCamera`]
+//! retry budget. The poller routes body requests here instead (on by default;
+//! `TORUS_BODY_SERVE_THREAD=0` restores the algorithm-thread path): the block is read from a [`BlockTreeCamera`]
 //! snapshot (as the block-sync server does) and sent straight back. A miss is
 //! forwarded unchanged to the algorithm thread, whose handler also covers
 //! bodies held only in memory (`pending_bodies`).
@@ -115,12 +115,14 @@ impl<N: Network + 'static, K: KVStore> BlockDataServer<N, K> {
     }
 }
 
-/// `TORUS_BODY_SERVE_THREAD`: only `1` enables (s72 option 3, default OFF).
+/// `TORUS_BODY_SERVE_THREAD`: on by default (s72-bst A/B: all cells pass,
+/// throughput neutral, serve queue 4-6x lower); only `0` turns it off.
+pub(crate) fn parse_body_serve_thread(raw: Option<String>) -> bool {
+    !matches!(raw.as_deref().map(str::trim), Some("0"))
+}
+
 pub(crate) fn body_serve_thread_from_env() -> bool {
-    matches!(
-        std::env::var("TORUS_BODY_SERVE_THREAD").ok().as_deref().map(str::trim),
-        Some("1")
-    )
+    parse_body_serve_thread(std::env::var("TORUS_BODY_SERVE_THREAD").ok())
 }
 
 #[cfg(test)]
@@ -292,6 +294,18 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// s72: on by default after the s72-bst A/B; only `0` turns it off.
+    #[test]
+    fn serve_thread_is_on_unless_explicitly_disabled() {
+        use super::parse_body_serve_thread;
+        assert!(parse_body_serve_thread(None));
+        assert!(parse_body_serve_thread(Some("1".into())));
+        assert!(parse_body_serve_thread(Some("".into())));
+        assert!(parse_body_serve_thread(Some(" junk ".into())));
+        assert!(!parse_body_serve_thread(Some("0".into())));
+        assert!(!parse_body_serve_thread(Some(" 0 ".into())));
     }
 
     #[test]
