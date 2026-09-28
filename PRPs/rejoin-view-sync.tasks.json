@@ -1,0 +1,11 @@
+{
+  "prp": "rejoin-view-sync",
+  "created": "2026-09-28T17:30:00",
+  "tasks": [
+    {"id": 1, "name": "HotStuff records a view-skip request", "status": "pending", "files": ["crates/hotstuff_rs/src/hotstuff/implementation.rs"], "validate": "cargo test -p hotstuff_rs --lib sync_recovery_tests", "depends_on": []},
+    {"id": 2, "name": "Pacemaker::skip_to_view", "status": "pending", "files": ["crates/hotstuff_rs/src/pacemaker/implementation.rs"], "validate": "cargo test -p hotstuff_rs --lib skip_to_view", "depends_on": []},
+    {"id": 3, "name": "Algorithm wiring", "status": "pending", "files": ["crates/hotstuff_rs/src/algorithm.rs", "crates/hotstuff_rs/src/rejoin_view_sync_tests.rs"], "validate": "cargo test -p hotstuff_rs --lib rejoin_view_sync", "depends_on": [1, 2]},
+    {"id": 4, "name": "Stateright rejoin model", "status": "pending", "files": ["crates/hotstuff_rs/tests/stateright_rejoin_view_sync.rs"], "validate": "cargo test -p hotstuff_rs --test stateright_rejoin_view_sync", "depends_on": []},
+    {"id": 5, "name": "Suites and crash A/B", "status": "pending", "files": [], "validate": "cargo test --release -p hotstuff_rs --no-fail-fast", "depends_on": [3, 4]}
+  ]
+}

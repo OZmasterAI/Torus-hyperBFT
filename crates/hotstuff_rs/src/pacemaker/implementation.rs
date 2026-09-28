@@ -553,6 +553,8 @@ impl<N: Network> Pacemaker<N> {
     ///
     /// This function should only be called if `next_view` is greater than the current view. Otherwise, an
     /// [`UpdateViewError`] will be returned.
+    ///
+    /// s74: [`skip_to_view`](Self::skip_to_view) is the rejoin (round-skip) entry point.
     fn update_view(
         &mut self,
         next_view: ViewNumber,
@@ -655,6 +657,30 @@ impl<N: Network> Pacemaker<N> {
         self.state.bracha_timeout_voters = self.state.bracha_timeout_voters.split_off(&cutoff_view);
 
         Ok(())
+    }
+
+    /// s74 rejoin view sync: enter `view` ahead of the local schedule because
+    /// HotStuff checked leader(`view`)'s header for it (see
+    /// `HotStuff::take_view_skip`). Same arguments and deadline rules as the
+    /// AdvanceView path. Returns `false` (nothing changes) unless `view` is
+    /// ahead of the current view, at most [`MAX_ROUND_SKIP_VIEWS`] ahead, and
+    /// in the same epoch: leaving an epoch needs a certificate.
+    pub(crate) fn skip_to_view(
+        &mut self,
+        view: ViewNumber,
+        validator_set_state: &ValidatorSetState,
+        highest_qc_view: ViewNumber,
+        committed_view: ViewNumber,
+    ) -> Result<bool, PacemakerError> {
+        let cur_view = self.view_info.view;
+        if view <= cur_view
+            || view.int() - cur_view.int() > MAX_ROUND_SKIP_VIEWS
+            || epoch(cur_view, self.config.epoch_length) != epoch(view, self.config.epoch_length)
+        {
+            return Ok(false);
+        }
+        self.update_view(view, validator_set_state, highest_qc_view, committed_view)?;
+        Ok(true)
     }
 
     /// Extend the timeout of the current view, which must be an Epoch-Change View.
@@ -1242,6 +1268,13 @@ fn commit_lag_exponent(
         .min(cap as u64) as u32
 }
 
+/// s74 rejoin view sync: the furthest a checked future-view header may pull a
+/// replica ahead. A rejoining node trails the survivors by a few views (4 in
+/// the s64/s74 crash cells); the bound keeps the leader of a far-future view,
+/// which may be Byzantine at n >= 4, from parking an honest replica far ahead
+/// of the rest (liveness; safety never depended on it).
+pub(crate) const MAX_ROUND_SKIP_VIEWS: u64 = 16;
+
 /// Check whether `view` is an epoch-change view given the configured `epoch_length`.
 /// FIX CONS-FIND-20: Guard against epoch_length=0 to prevent division by zero.
 fn is_epoch_change_view(view: &ViewNumber, epoch_length: EpochLength) -> bool {
@@ -1489,6 +1522,58 @@ fn update_view_jump_rebases_stale_schedule() {
         .update_view(ViewNumber::new(39_001), &vss, ViewNumber::new(39_000), ViewNumber::new(39_000))
         .unwrap();
     assert!(pacemaker.query().deadline <= Instant::now() + max_view_time * 2);
+}
+
+/// s74 rejoin view sync: a restarted replica at local view 610 that checked
+/// leader(614)'s header enters 614 at once, with a fresh bounded deadline
+/// (not the survivors' remaining backed-off wait).
+#[test]
+fn skip_to_view_enters_future_view_with_bounded_deadline() {
+    let (mut pacemaker, vss) = test_pacemaker(610);
+    let max_view_time = Duration::from_millis(500);
+    assert!(pacemaker
+        .skip_to_view(ViewNumber::new(614), &vss, ViewNumber::new(613), ViewNumber::new(612))
+        .unwrap());
+    assert_eq!(pacemaker.query().view, ViewNumber::new(614));
+    assert!(pacemaker.query().deadline > Instant::now());
+    assert!(pacemaker.query().deadline <= Instant::now() + max_view_time * 2);
+}
+
+/// A skip never moves the view backwards or sideways, and never leaves the
+/// current epoch (that needs a certificate). Landing on the epoch-change view
+/// itself is what a timeout into it does, so it is allowed.
+#[test]
+fn skip_to_view_refuses_non_increasing_and_cross_epoch() {
+    let (mut pacemaker, vss) = test_pacemaker(610);
+    for view in [609, 610] {
+        assert!(!pacemaker
+            .skip_to_view(ViewNumber::new(view), &vss, ViewNumber::new(609), ViewNumber::new(609))
+            .unwrap());
+        assert_eq!(pacemaker.query().view, ViewNumber::new(610));
+    }
+
+    // Bounded distance: a leader of a far-future view cannot pull us arbitrarily
+    // far ahead (liveness at n >= 4, where such a leader may be Byzantine).
+    let (mut pacemaker, vss) = test_pacemaker(610);
+    let too_far = 610 + MAX_ROUND_SKIP_VIEWS + 1;
+    assert!(!pacemaker
+        .skip_to_view(ViewNumber::new(too_far), &vss, ViewNumber::new(609), ViewNumber::new(609))
+        .unwrap());
+    assert_eq!(pacemaker.query().view, ViewNumber::new(610));
+    assert!(pacemaker
+        .skip_to_view(ViewNumber::new(610 + MAX_ROUND_SKIP_VIEWS), &vss, ViewNumber::new(609), ViewNumber::new(609))
+        .unwrap());
+
+    // 100k-view epochs: 99_991..=100_000 is epoch 1, 100_001 starts epoch 2.
+    let (mut pacemaker, vss) = test_pacemaker(99_990);
+    assert!(!pacemaker
+        .skip_to_view(ViewNumber::new(100_001), &vss, ViewNumber::new(99_989), ViewNumber::new(99_989))
+        .unwrap());
+    assert_eq!(pacemaker.query().view, ViewNumber::new(99_990));
+    assert!(pacemaker
+        .skip_to_view(ViewNumber::new(100_000), &vss, ViewNumber::new(99_989), ViewNumber::new(99_989))
+        .unwrap());
+    assert_eq!(pacemaker.query().view, ViewNumber::new(100_000));
 }
 
 /// A fast QC run (advancing far ahead of the wall-clock schedule) must not

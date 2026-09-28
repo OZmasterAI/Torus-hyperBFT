@@ -291,7 +291,12 @@ impl ProgressMessageStub {
         }
         let return_msg = match &msg {
             ProgressMessage::HotStuffMessage(hotstuff_msg) => {
-                hotstuff_msg.view() == cur_view || hotstuff_msg.is_block_data_msg()
+                hotstuff_msg.view() == cur_view
+                    || hotstuff_msg.is_block_data_msg()
+                    // s75 fix A: a future NewView tells leader(view + 1) that
+                    // its sender entered that view; the rejoiner may lead it.
+                    || (matches!(hotstuff_msg, HotStuffMessage::NewView(_))
+                        && hotstuff_msg.view() > cur_view)
             }
             ProgressMessage::PacemakerMessage(pacemaker_msg) => {
                 pacemaker_msg.view() >= cur_view

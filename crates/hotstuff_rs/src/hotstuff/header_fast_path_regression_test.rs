@@ -299,7 +299,7 @@ pub(crate) fn hotstuff_at(
 
 /// Like [`hotstuff_at`], but wires an event publisher so a test can observe the
 /// ORDER in which block-tree updates and phase-votes are emitted.
-fn hotstuff_at_with_events(
+pub(crate) fn hotstuff_at_with_events(
     view: ViewNumber,
     local: SigningKey,
     vss: ValidatorSetState,

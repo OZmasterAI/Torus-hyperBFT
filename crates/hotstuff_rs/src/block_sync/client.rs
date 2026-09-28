@@ -131,6 +131,12 @@ impl<N: Network> BlockSyncClient<N> {
         self.pending_sync.is_some()
     }
 
+    /// Test-only: the pending sync ended (as when its blocks were inserted).
+    #[cfg(test)]
+    pub(crate) fn finish_pending_sync(&mut self) {
+        self.pending_sync = None;
+    }
+
     pub(crate) fn trigger_sync<K: KVStore>(
         &mut self,
         block_tree: &mut BlockTreeSingleton<K>,

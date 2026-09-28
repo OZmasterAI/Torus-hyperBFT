@@ -19,7 +19,10 @@ use crate::{
     block_sync::client::{BlockSyncClient, BlockSyncClientConfiguration},
     block_tree::{accessors::internal::BlockTreeSingleton, pluggables::KVStore},
     events::*,
-    hotstuff::implementation::{HotStuff, HotStuffConfiguration},
+    hotstuff::{
+        implementation::{HotStuff, HotStuffConfiguration},
+        messages::ProposalHeader,
+    },
     networking::{
         messages::ProgressMessage,
         network::{Network, ValidatorSetUpdateHandle},
@@ -89,10 +92,18 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
         .expect("Failed to create a new Pacemaker!");
 
         let init_view_info = pacemaker.query();
+        // s75 fix A (boot): on a restart, HotStuff starts one view behind so
+        // the first loop pass runs the ordinary enter_view(init_view): the
+        // replica proposes there if it leads it, and sends the NewView for
+        // init_view - 1. A fresh chain (init view 0) starts as before.
+        let hotstuff_view_info = match init_view.int() {
+            0 => init_view_info.clone(),
+            v => ViewInfo::new(ViewNumber::new(v - 1), init_view_info.deadline),
+        };
 
         let hotstuff = HotStuff::new(
             hotstuff_config,
-            init_view_info.clone(),
+            hotstuff_view_info,
             msg_sender.clone(),
             validator_set_update_handle.clone(),
             block_tree
@@ -237,6 +248,15 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
             // only its ordering versus retry maintenance and receive budget differ.
             self.poll_progress_and_retry(view_info.clone(), body_before_expiry);
 
+            // 7b. s74 fix C: a current-view header parked for an unknown
+            // justify block votes once any step above has inserted that block.
+            if let Err(e) = self
+                .hotstuff
+                .redispatch_parked_header(&mut self.block_tree, &mut self.app)
+            {
+                log::error!("HotStuff redispatch_parked_header error: {:?}", e);
+            }
+
             // 8. Let the block sync client update its internal state, and trigger sync if needed.
             if let Err(e) = self.block_sync_client.tick(&mut self.block_tree) {
                 log::error!("BlockSync tick error: {:?} — continuing", e);
@@ -294,6 +314,7 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
             || self.hotstuff.has_pending_justify_fetches()
             || self.hotstuff.has_deferred_sync_retries()
             || self.hotstuff.has_missing_data_retries()
+            || self.hotstuff.has_parked_header()
         {
             std::cmp::min(
                 view_info.deadline,
@@ -327,6 +348,12 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
                         {
                             log::error!("BlockSync trigger_sync error: {:?}", e);
                         }
+                    }
+                    if let Some((header, origin)) = self.hotstuff.take_view_skip() {
+                        self.skip_to_header_view(header, origin);
+                    }
+                    if let Some(view) = self.hotstuff.take_leader_skip() {
+                        self.skip_to_leader_view(view);
                     }
                 }
                 ProgressMessage::PacemakerMessage(msg) => {
@@ -362,6 +389,82 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
         if body_before_expiry {
             self.tick_body_retries();
         }
+    }
+
+    /// s74 rejoin view sync (round-skip): HotStuff checked leader(w)'s header
+    /// for a future view w. Move the pacemaker (which owns the view) to w,
+    /// let HotStuff enter it, then re-dispatch the header so it votes through
+    /// the ordinary current-view path (once: `highest_view_voted` guards it).
+    fn skip_to_header_view(&mut self, header: ProposalHeader, origin: VerifyingKey) {
+        let view = header.view;
+        let cause = format!("leader header {}", crate::logging::block_prefix(&header.block_hash));
+        if !self.enter_skipped_view(view, &cause) {
+            return;
+        }
+        if let Err(e) =
+            self.hotstuff
+                .on_receive_msg(header.into(), &origin, &mut self.block_tree, &mut self.app)
+        {
+            log::error!("round-skip: header re-dispatch (view {}) error: {:?}", view.int(), e);
+        }
+        if self.hotstuff.take_sync_needed() {
+            if let Err(e) = self.block_sync_client.trigger_sync(&mut self.block_tree) {
+                log::error!("BlockSync trigger_sync error: {:?}", e);
+            }
+        }
+    }
+
+    /// s75 fix A (leader sync): NewViews from more than f power say their
+    /// senders entered `view`, which this replica leads but is behind on
+    /// (restarted below the survivors). Entering it proposes (`enter_view`).
+    fn skip_to_leader_view(&mut self, view: ViewNumber) {
+        self.enter_skipped_view(view, "NewViews (leader-skip)");
+        if self.hotstuff.take_sync_needed() {
+            if let Err(e) = self.block_sync_client.trigger_sync(&mut self.block_tree) {
+                log::error!("BlockSync trigger_sync error: {:?}", e);
+            }
+        }
+    }
+
+    /// Move the pacemaker (which owns the view) to `view`, then let HotStuff
+    /// enter it. True when HotStuff is now at `view`.
+    fn enter_skipped_view(&mut self, view: ViewNumber, cause: &str) -> bool {
+        let frontier = (|| {
+            Ok::<_, crate::block_tree::accessors::internal::BlockTreeError>((
+                self.block_tree.validator_set_state()?,
+                self.block_tree.highest_pc()?.view,
+                self.block_tree.committed_qc_view()?,
+            ))
+        })();
+        let (validator_set_state, highest_qc_view, committed_view) = match frontier {
+            Ok(frontier) => frontier,
+            Err(e) => {
+                log::error!("round-skip to view {}: block tree read failed: {:?}", view.int(), e);
+                return false;
+            }
+        };
+        let from = self.pacemaker.query().view;
+        match self.pacemaker.skip_to_view(view, &validator_set_state, highest_qc_view, committed_view) {
+            Ok(true) => log::info!(
+                "round-skip: entered view {} from {} on {}",
+                view.int(),
+                from.int(),
+                cause,
+            ),
+            Ok(false) => return false,
+            Err(e) => {
+                log::error!("round-skip to view {}: pacemaker error: {:?}", view.int(), e);
+                return false;
+            }
+        }
+        let view_info = self.pacemaker.query().clone();
+        if let Err(e) = self.hotstuff.enter_view(view_info, &mut self.block_tree, &mut self.app) {
+            log::error!("round-skip: HotStuff enter_view({}) error: {:?}", view.int(), e);
+            // A failure after HotStuff already took the view still counts;
+            // otherwise the loop retries enter_view (is_view_outdated).
+            return !self.hotstuff.is_view_outdated(self.pacemaker.query());
+        }
+        true
     }
 
     fn tick_body_retries(&mut self) {
@@ -406,3 +509,7 @@ fn body_before_expiry_enabled(value: Option<&str>) -> bool {
 #[cfg(test)]
 #[path = "body_before_expiry_tests.rs"]
 mod body_before_expiry_tests;
+
+#[cfg(test)]
+#[path = "rejoin_view_sync_tests.rs"]
+mod rejoin_view_sync_tests;

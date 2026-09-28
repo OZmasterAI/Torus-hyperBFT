@@ -16,13 +16,21 @@ use crate::types::crypto_primitives::Keypair;
 use crate::types::data_types::{BlockHeight, CryptoHash, Data, EpochLength};
 use std::sync::mpsc;
 
-struct CountingApp {
+pub(super) struct CountingApp {
     calls: usize,
     valid: bool,
+    /// s75: leader tests opt in to producing (empty) blocks.
+    pub(super) produce: bool,
 }
 impl App<MemKV> for CountingApp {
     fn produce_block(&mut self, _: ProduceBlockRequest<MemKV>) -> ProduceBlockResponse {
-        panic!("receive/retry fixture must not produce a proposal")
+        assert!(self.produce, "receive/retry fixture must not produce a proposal");
+        ProduceBlockResponse {
+            data_hash: CryptoHash::new([0; 32]),
+            data: Data::new(vec![]),
+            app_state_updates: None,
+            validator_set_updates: None,
+        }
     }
     fn validate_block(&mut self, _: ValidateBlockRequest<MemKV>) -> ValidateBlockResponse {
         self.calls += 1;
@@ -40,63 +48,23 @@ impl App<MemKV> for CountingApp {
     }
 }
 
-type TestAlgorithm = Algorithm<NullNetwork, MemKV, CountingApp>;
-struct Fixture {
-    algorithm: TestAlgorithm,
-    messages: Sender<(VerifyingKey, ProgressMessage)>,
+pub(super) type TestAlgorithm = Algorithm<NullNetwork, MemKV, CountingApp>;
+pub(super) struct Fixture {
+    pub(super) algorithm: TestAlgorithm,
+    pub(super) messages: Sender<(VerifyingKey, ProgressMessage)>,
     commands: Receiver<SyncCommand>,
     origin: VerifyingKey,
     body: Block,
 }
 
-fn fixture() -> Fixture {
+pub(super) fn fixture() -> Fixture {
     let keys = signing_keys(&[1, 2, 3, 4]);
     let set = validator_set(&keys);
     let (tree, vss) = steady_block_tree(&set);
     let view = ViewNumber::new(1);
     let origin = proposer_for(view, &keys, &vss, &tree);
-    let keypair = Keypair::new(keys[0].clone());
     let chain = ChainID::new(0);
-    let (messages, receiver) = mpsc::channel();
-    let (worker_commands, commands) = mpsc::channel();
-    let (_, worker_results) = mpsc::channel();
-    let (_, shutdown) = mpsc::channel();
-    let mut algorithm = Algorithm::new(
-        chain,
-        HotStuffConfiguration {
-            chain_id: chain,
-            keypair: keypair.clone(),
-        },
-        PacemakerConfiguration {
-            chain_id: chain,
-            keypair,
-            epoch_length: EpochLength::new(100),
-            max_view_time: Duration::from_secs(1),
-            backoff_factor: 1,
-            backoff_cap: 0,
-            commit_lag_cap: 0,
-        },
-        BlockSyncClientConfiguration {
-            chain_id: chain,
-            request_limit: 32,
-            response_timeout: Duration::from_secs(1),
-            blacklist_expiry_time: Duration::from_secs(60),
-            block_sync_trigger_min_view_difference: 10,
-            block_sync_trigger_timeout: Duration::from_secs(60),
-        },
-        tree,
-        CountingApp {
-            calls: 0,
-            valid: true,
-        },
-        NullNetwork,
-        receiver,
-        BufferSize::new(1_000_000),
-        worker_commands,
-        worker_results,
-        shutdown,
-        None,
-    );
+    let (mut algorithm, messages, commands) = new_algorithm(tree);
     algorithm.hotstuff = hotstuff_at(view, keys[0].clone(), vss);
     // A real signed advertisement makes fallback observable as a worker command.
     algorithm
@@ -123,6 +91,58 @@ fn fixture() -> Fixture {
             Data::new(vec![]),
         ),
     }
+}
+
+/// `Algorithm::new` for keys[0] of the 4-key test set over `tree`, exactly as
+/// a node boots (HotStuff and the pacemaker at the tree's init view).
+pub(super) fn new_algorithm(
+    tree: BlockTreeSingleton<MemKV>,
+) -> (TestAlgorithm, Sender<(VerifyingKey, ProgressMessage)>, Receiver<SyncCommand>) {
+    let keys = signing_keys(&[1, 2, 3, 4]);
+    let keypair = Keypair::new(keys[0].clone());
+    let chain = ChainID::new(0);
+    let (messages, receiver) = mpsc::channel();
+    let (worker_commands, commands) = mpsc::channel();
+    let (_, worker_results) = mpsc::channel();
+    let (_, shutdown) = mpsc::channel();
+    let algorithm = Algorithm::new(
+        chain,
+        HotStuffConfiguration {
+            chain_id: chain,
+            keypair: keypair.clone(),
+        },
+        PacemakerConfiguration {
+            chain_id: chain,
+            keypair,
+            epoch_length: EpochLength::new(100),
+            max_view_time: Duration::from_secs(1),
+            backoff_factor: 1,
+            backoff_cap: 0,
+            commit_lag_cap: 0,
+        },
+        BlockSyncClientConfiguration {
+            chain_id: chain,
+            request_limit: 32,
+            response_timeout: Duration::from_secs(1),
+            blacklist_expiry_time: Duration::from_secs(60),
+            block_sync_trigger_min_view_difference: 10,
+            block_sync_trigger_timeout: Duration::from_secs(60),
+        },
+        tree,
+        CountingApp {
+            calls: 0,
+            valid: true,
+            produce: false,
+        },
+        NullNetwork,
+        receiver,
+        BufferSize::new(1_000_000),
+        worker_commands,
+        worker_results,
+        shutdown,
+        None,
+    );
+    (algorithm, messages, commands)
 }
 
 fn header(body: &Block, view: ViewNumber) -> ProposalHeader {
