@@ -801,7 +801,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         .backoff_factor(chain_config.backoff_factor)
         .backoff_cap(chain_config.backoff_cap)
         .commit_lag_cap(commit_lag_cap)
-        .progress_msg_buffer_capacity(BufferSize::new(1024))
+        .progress_msg_buffer_capacity(BufferSize::new(PROGRESS_MSG_BUFFER_BYTES))
         .block_sync_request_limit(128)
         .block_sync_server_advertise_time(Duration::new(10, 0))
         .block_sync_response_timeout(Duration::new(3, 0))
@@ -1206,10 +1206,45 @@ mod hex {
     }
 }
 
+/// Bytes of future-view consensus messages buffered until the local view
+/// reaches them (hotstuff_rs counts `size_of` the message + the sender key).
+/// 1 MiB holds a full reconnect flush (256 queued sends) from each of 3
+/// peers with headroom; the scaffold's 1024 held one header (s75 fix E).
+const PROGRESS_MSG_BUFFER_BYTES: u64 = 1 << 20;
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::Parser;
+
+    /// s75 fix E: on reconnect every peer flushes up to 256 queued direct
+    /// sends (torus-network `PendingSendQueue`), possibly all for views ahead
+    /// of a restarted replica. The buffer must hold such a flush from each
+    /// peer; at 1024 bytes it held one header or three votes, and the
+    /// survivors' votes for the view the rejoiner collects were evicted
+    /// (s75-mc-abcd-r1 rejoin 2: 74.6 s freeze).
+    #[test]
+    fn progress_buffer_holds_a_full_reconnect_flush_from_three_peers() {
+        use hotstuff_rs::hotstuff::messages::{
+            BlockDataResponse, NewView, PhaseVote, ProposalHeader,
+        };
+        use hotstuff_rs::types::crypto_primitives::VerifyingKey;
+        use std::mem::size_of;
+        let largest = [
+            size_of::<ProposalHeader>(),
+            size_of::<PhaseVote>(),
+            size_of::<NewView>(),
+            size_of::<BlockDataResponse>(),
+        ]
+        .into_iter()
+        .max()
+        .unwrap();
+        let flush = 3 * 256 * (size_of::<VerifyingKey>() + largest) as u64;
+        assert!(
+            PROGRESS_MSG_BUFFER_BYTES >= flush,
+            "buffer {PROGRESS_MSG_BUFFER_BYTES} B < one reconnect flush from 3 peers {flush} B"
+        );
+    }
 
     #[test]
     fn rocksdb_stats_interval_parse() {
