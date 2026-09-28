@@ -56,6 +56,23 @@
 #                no more than 2 blocks beyond the exec queue it already had, come
 #                back with the flush worker attached, and still AGREE with the
 #                two survivors.
+#   CRASH_KILL_AT_S=a,b,c...  MULTI-CRASH (s75): kill+restart the same node once
+#                per offset, sequentially (e.g. "60,180,300,420,540" with
+#                DUR=660: five rejoins in one cell). Every offset must pass the
+#                single-kill window rule above, offsets must strictly increase
+#                and sit >= 90 s apart. Kill 1 writes exactly the single-kill
+#                files (crash-kill.json, crash.json, crash-restart-tail.log);
+#                kill k>=2 writes crash-kill-<k>.json, crash-<k>.json and
+#                crash-restart-tail-<k>.log, each log tail cut at the NEXT
+#                kill's byte offset (so crash.json then covers kill 1's window
+#                only; the union of all tails is still everything after kill 1).
+#                summary.json gains .crash_kills (one entry per kill) and the
+#                headline crash_gate FAILs if ANY kill fails. A failed kill
+#                stops the sequence and fails the cell (as for a single kill);
+#                if a kill+restart overran so that < 60 s would separate the
+#                restart from the next kill, the remaining kills are SKIPPED
+#                (logged, crash-kill.skipped). Per-kill chain freeze:
+#                tools/matched-bench/crash-freeze.py <results-dir>.
 #   KILL_NODE    which validator the crash gate kills: val1 (default) or val2.
 #                NEVER val0 (it serves the bench RPC and every headline number),
 #                and never anything outside this devnet — see the guard in
@@ -84,7 +101,7 @@
 #                exits without touching the devnet.
 set -uo pipefail
 
-usage() { sed -n '2,84p' "$0"; exit 2; }
+usage() { sed -n '2,101p' "$0"; exit 2; }
 [ $# -ge 2 ] || usage
 
 WT=$(cd "$1" && pwd) || { echo "FATAL: worktree '$1' not found" >&2; exit 2; }
@@ -294,8 +311,9 @@ if [ -n "$CRASH_KILL_AT_S" ]; then
         val2) KILL_IDX=2 ;;
         *) echo "FATAL: KILL_NODE must be val1 or val2 (never val0 — it serves the bench RPC and every headline number)" >&2; exit 2 ;;
     esac
-    crash_kill_at_ok "$CRASH_KILL_AT_S" "$DUR" || {
-        echo "FATAL: CRASH_KILL_AT_S=$CRASH_KILL_AT_S is not inside the load window of a ${DUR}s cell (need >= 10 and <= $((DUR-30)); killing during the drain hangs the agreement probe)" >&2; exit 2; }
+    crash_kill_list_ok "$CRASH_KILL_AT_S" "$DUR" || {
+        echo "FATAL: CRASH_KILL_AT_S=$CRASH_KILL_AT_S is not a valid kill list for a ${DUR}s cell (each offset >= 10 and <= $((DUR-30)); killing during the drain hangs the agreement probe; a list must strictly increase with >= ${CRASH_KILL_MIN_GAP_S}s between kills)" >&2; exit 2; }
+    IFS=, read -r -a CRASH_AT <<< "$CRASH_KILL_AT_S"
 fi
 
 if pgrep -f "bench-throughput consensus" >/dev/null; then echo "FATAL: a bench is already running" >&2; exit 1; fi
@@ -509,11 +527,40 @@ T_BENCH0=$(date +%s)
 cpusampler & CPU_PID=$!
 # bl3 crash gate: SIGKILL + restart one validator CRASH_KILL_AT_S into the load
 # window. Off unless CRASH_KILL_AT_S is set; the target guard lives in
-# crash-kill.sh and refuses anything but this devnet's val1/val2.
+# crash-kill.sh and refuses anything but this devnet's val1/val2 — and runs on
+# EVERY kill (one crash-kill.sh invocation per offset, on the current pid).
+# s75 multi-crash: kills run in order, each offset measured from this sub-shell's start. A
+# failed kill ends the sequence (the record check below then fails the cell); a
+# kill that would land < CRASH_KILL_MIN_UP_S after the previous restart ends it
+# too, as a logged SKIP (crash-kill.skipped = first skipped k).
+crash_sequence() {
+    local t0 k at rec now due prev_up="" since
+    t0=$(date +%s.%N)
+    for k in $(seq 1 "${#CRASH_AT[@]}"); do
+        at=${CRASH_AT[$((k-1))]}
+        rec=$(crash_seq_name crash-kill "$k" json)
+        now=$(date +%s.%N)
+        due=$(awk -v a="$t0" -v b="$at" -v n="$now" 'BEGIN{d=a+b; printf "%.3f", (d>n ? d : n)}')
+        if [ -n "$prev_up" ]; then
+            since=$(awk -v d="$due" -v u="$prev_up" 'BEGIN{printf "%.1f", d-u}')
+            if awk -v s="$since" -v m="$CRASH_KILL_MIN_UP_S" 'BEGIN{exit !(s<m)}'; then
+                echo "crash gate: WARNING SKIPPING kills $k..${#CRASH_AT[@]} of ${#CRASH_AT[@]}: kill $k (bench+${at}s) would land ${since}s after kill $((k-1))'s restart (< ${CRASH_KILL_MIN_UP_S}s) — the previous kill+restart overran"
+                echo "$k" > "$OUT/crash-kill.skipped"
+                return 0
+            fi
+        fi
+        sleep "$(awk -v d="$due" -v n="$now" 'BEGIN{printf "%.3f", d-n}')"
+        echo "crash gate: kill $k/${#CRASH_AT[@]} at bench+${at}s -> $rec"
+        "$TOOLS_DIR/crash-kill.sh" "$WT" "$KILL_IDX" "$OUT" "$rec" && [ -s "$OUT/$rec" ] || {
+            echo "crash gate: kill $k/${#CRASH_AT[@]} FAILED — no further kills"; return 1; }
+        prev_up=$(jq -r '.restart_ts' "$OUT/$rec" 2>/dev/null) || prev_up=""
+        [[ "$prev_up" =~ ^[0-9.]+$ ]] || prev_up=$(date +%s.%N)
+    done
+}
 CRASH_RC=""
 if [ -n "$CRASH_KILL_AT_S" ]; then
-    log "crash gate ARMED: SIGKILL $KILL_NODE at bench+${CRASH_KILL_AT_S}s, restart from the same data dir"
-    ( sleep "$CRASH_KILL_AT_S"; "$TOOLS_DIR/crash-kill.sh" "$WT" "$KILL_IDX" "$OUT" ) >>"$OUT/run.log" 2>&1 &
+    log "crash gate ARMED: SIGKILL $KILL_NODE at bench+${CRASH_KILL_AT_S}s (${#CRASH_AT[@]} kill(s)), restart from the same data dir"
+    crash_sequence >>"$OUT/run.log" 2>&1 &
     CRASH_PID=$!
 fi
 wait "$BENCH_PID"; BENCH_RC=$?
@@ -526,6 +573,18 @@ if [ -n "$CRASH_PID" ]; then
 fi
 if [ -n "$CRASH_KILL_AT_S" ] && [ ! -s "$OUT/crash-kill.json" ]; then
     die "crash gate did not complete (no crash-kill.json) — the node was not killed+restarted, see run.log"
+fi
+# multi-crash: every planned kill needs its record, except a logged SKIP tail.
+CRASH_DONE=0
+if [ -n "$CRASH_KILL_AT_S" ]; then
+    CRASH_SKIP_FROM=$(cat "$OUT/crash-kill.skipped" 2>/dev/null)
+    for k in $(seq 1 "${#CRASH_AT[@]}"); do
+        rec=$(crash_seq_name crash-kill "$k" json)
+        if [ -s "$OUT/$rec" ]; then CRASH_DONE=$k; continue; fi
+        [ -n "$CRASH_SKIP_FROM" ] && [ "$k" -ge "$CRASH_SKIP_FROM" ] && break
+        die "crash gate kill $k/${#CRASH_AT[@]} did not complete (no $rec) — see run.log"
+    done
+    [ "$CRASH_DONE" = "${#CRASH_AT[@]}" ] || log "WARNING: crash gate ran only $CRASH_DONE of ${#CRASH_AT[@]} planned kills (kills $CRASH_SKIP_FROM.. SKIPPED, see run.log)"
 fi
 T_BENCH1=$(date +%s)
 BENCH_PID=""
@@ -684,14 +743,24 @@ done
 # ---- crash gate: scan the killed node's log TAIL — everything it wrote AFTER
 # the SIGKILL (crash-kill.sh restarted it with the log appended and recorded the
 # byte offset) — and merge that into crash.json, which summarize.py turns into
-# the PASS/FAIL verdict.
+# the PASS/FAIL verdict. Multi-crash: kill k's tail runs from ITS offset up to
+# kill k+1's offset (the last one to EOF), into crash-<k>.json; a single kill
+# is scanned exactly as before.
 if [ -n "$CRASH_KILL_AT_S" ] && [ -s "$OUT/crash-kill.json" ]; then
-    OFFB=$(jq -r '.pre_kill.log_bytes // 0' "$OUT/crash-kill.json")
-    TAILF="$OUT/crash-restart-tail.log"
-    tail -c "+$(( OFFB + 1 ))" "$RUN_DIR/val$KILL_IDX.log" | sed -E 's/\x1b\[[0-9;]*m//g' > "$TAILF"
-    log "crash gate: scanning val$KILL_IDX log tail from byte $OFFB ($(wc -l < "$TAILF") lines)"
-    "$TOOLS_DIR/crash-kill.sh" scan "$TAILF" "$OUT/crash-kill.json" "$OUT/crash.json" "$CRASH_KILL_AT_S" \
-        | tee -a "$OUT/run.log" || log "WARNING: crash gate scan failed"
+    for k in $(seq 1 "$CRASH_DONE"); do
+        REC="$OUT/$(crash_seq_name crash-kill "$k" json)"
+        OFFB=$(jq -r '.pre_kill.log_bytes // 0' "$REC")
+        TAILF="$OUT/$(crash_seq_name crash-restart-tail "$k" log)"
+        if [ "$k" -lt "$CRASH_DONE" ]; then
+            NEXTB=$(jq -r '.pre_kill.log_bytes // 0' "$OUT/$(crash_seq_name crash-kill $((k+1)) json)")
+            tail -c "+$(( OFFB + 1 ))" "$RUN_DIR/val$KILL_IDX.log" | head -c "$(( NEXTB > OFFB ? NEXTB - OFFB : 0 ))"
+        else
+            tail -c "+$(( OFFB + 1 ))" "$RUN_DIR/val$KILL_IDX.log"
+        fi | sed -E 's/\x1b\[[0-9;]*m//g' > "$TAILF"
+        log "crash gate: scanning val$KILL_IDX log tail of kill $k from byte $OFFB ($(wc -l < "$TAILF") lines)"
+        "$TOOLS_DIR/crash-kill.sh" scan "$TAILF" "$REC" "$OUT/$(crash_seq_name crash "$k" json)" "${CRASH_AT[$((k-1))]}" \
+            | tee -a "$OUT/run.log" || log "WARNING: crash gate scan of kill $k failed"
+    done
 fi
 
 # ---------------------------------------------------------------- 10. analysis

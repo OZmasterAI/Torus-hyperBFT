@@ -23,6 +23,7 @@ time when they broke:
    later cell in the campaign dies in pre-flight.
 """
 
+import gzip
 import hashlib
 import json
 import os
@@ -31,6 +32,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -553,6 +555,103 @@ class CrashKillGuardTest(unittest.TestCase):
         self.assertFalse(at_ok(200, 120), "must never land in the drain")
         self.assertFalse(at_ok("x", 120))
 
+    # ---- s75 multi-crash: CRASH_KILL_AT_S="60,180,300,420,540" ------------
+    def lib(self, fn, *args):
+        r = subprocess.run(
+            [
+                "bash",
+                "-c",
+                'source "$1"; shift; fn=$1; shift; "$fn" "$@"',
+                "_",
+                CRASH_KILL_SH,
+                fn,
+                *[str(a) for a in args],
+            ],
+            capture_output=True,
+            text=True,
+            env=dict(os.environ, CRASH_KILL_LIB="1"),
+            timeout=30,
+        )
+        return r.returncode == 0, r.stdout.strip()
+
+    def test_kill_list_accepts_a_spaced_increasing_list(self):
+        self.assertTrue(self.lib("crash_kill_list_ok", "60,180,300,420,540", 660)[0])
+        self.assertTrue(
+            self.lib("crash_kill_list_ok", "60,150", 300)[0],
+            "exactly 90 s apart is allowed",
+        )
+
+    def test_kill_list_single_int_keeps_todays_rule(self):
+        self.assertTrue(self.lib("crash_kill_list_ok", "50", 120)[0])
+        self.assertTrue(self.lib("crash_kill_list_ok", "60", 300)[0])
+        self.assertFalse(self.lib("crash_kill_list_ok", "5", 120)[0])
+        self.assertFalse(self.lib("crash_kill_list_ok", "115", 120)[0])
+
+    def test_kill_list_must_strictly_increase(self):
+        self.assertFalse(self.lib("crash_kill_list_ok", "60,300,180", 660)[0])
+        self.assertFalse(self.lib("crash_kill_list_ok", "180,180", 660)[0])
+
+    def test_kill_list_needs_90s_between_kills(self):
+        """A rejoin takes up to ~40 s; closer kills measure one freeze twice."""
+        self.assertFalse(self.lib("crash_kill_list_ok", "60,149", 660)[0])
+        self.assertFalse(self.lib("crash_kill_list_ok", "60,180,240", 660)[0])
+
+    def test_every_kill_must_sit_inside_the_load_window(self):
+        self.assertFalse(
+            self.lib("crash_kill_list_ok", "60,180,640", 660)[0],
+            "last kill must leave >= 30 s of load",
+        )
+        self.assertFalse(self.lib("crash_kill_list_ok", "5,180", 660)[0])
+        self.assertTrue(self.lib("crash_kill_list_ok", "60,180,630", 660)[0])
+
+    def test_kill_list_rejects_malformed_input(self):
+        for bad in ("", "60,,180", "60,", ",60", "60 180", "60;180", "x", "60,1e2"):
+            self.assertFalse(
+                self.lib("crash_kill_list_ok", bad, 660)[0], "%r must be refused" % bad
+            )
+
+    def test_record_names_keep_kill_one_on_the_legacy_files(self):
+        """Kill 1 writes exactly what a single-kill cell always wrote, so
+        summarize.py's crash gate and every older analysis script still work."""
+        for stem, k, ext, want in (
+            ("crash-kill", 1, "json", "crash-kill.json"),
+            ("crash-kill", 2, "json", "crash-kill-2.json"),
+            ("crash", 1, "json", "crash.json"),
+            ("crash", 5, "json", "crash-5.json"),
+            ("crash-restart-tail", 3, "log", "crash-restart-tail-3.log"),
+        ):
+            ok, out = self.lib("crash_seq_name", stem, k, ext)
+            self.assertTrue(ok)
+            self.assertEqual(out, want)
+        for name, seq in (
+            ("crash-kill.json", "1"),
+            ("crash-kill-2.json", "2"),
+            ("crash-kill-12.json", "12"),
+        ):
+            ok, out = self.lib("crash_record_seq", name)
+            self.assertTrue(ok)
+            self.assertEqual(out, seq)
+        self.assertFalse(self.lib("crash_record_seq", "crash-kill-x.json")[0])
+        self.assertFalse(self.lib("crash_record_seq", "../evil.json")[0])
+
+    def test_guard_runs_before_the_sigkill_in_every_invocation(self):
+        """Multi-crash kills by invoking crash-kill.sh once per kill; each
+        invocation must re-run crash_target_ok on the CURRENT pid before
+        `kill -9`, never reuse an earlier verdict."""
+        with open(CRASH_KILL_SH) as f:
+            src = f.read()
+        cli = src[
+            src.index(
+                "# ------------------------------------------------------------------ CLI"
+            ) :
+        ]
+        self.assertIn("crash_target_ok", cli)
+        self.assertLess(cli.index("crash_target_ok"), cli.index("kill -9"))
+        with open(RUN_CELL_SH) as f:
+            run_cell = f.read()
+        self.assertIn("crash_kill_list_ok", run_cell)
+        self.assertNotIn("kill -9", run_cell, "run-cell.sh must never SIGKILL itself")
+
     def test_restart_uses_the_same_argv_as_launch(self):
         """launch-3val.sh and crash-kill.sh must start a node through ONE
         implementation: a restart with different flags is not a crash gate."""
@@ -638,15 +737,21 @@ def write_crash(
     restarted_pid=2002,
     replay_found=True,
     pipeline_line=True,
+    name="crash.json",
+    seq=None,
+    kill_at=50,
+    kill_ts=None,
+    restart_ts=None,
 ):
     """The crash.json run-cell.sh drops next to summary.json after a
-    CRASH_KILL_AT_S cell (crash-kill.sh's record + the post-run log scan)."""
+    CRASH_KILL_AT_S cell (crash-kill.sh's record + the post-run log scan).
+    s75 multi-crash: kill k>=2 lands in crash-<k>.json with kill_seq=k."""
     applied = 1000
     obj = {
         "enabled": True,
         "kill_node": "val1",
         "kill_idx": 1,
-        "kill_at_s": 50,
+        "kill_at_s": kill_at,
         "killed_pid": 1002,
         "restarted_pid": restarted_pid,
         "down_s": 1.4,
@@ -668,7 +773,12 @@ def write_crash(
             "error_lines": 0,
         },
     }
-    with open(os.path.join(d, "crash.json"), "w") as f:
+    if seq is not None:
+        obj["kill_seq"] = seq
+    if kill_ts is not None:
+        obj["kill_ts"] = kill_ts
+        obj["restart_ts"] = restart_ts if restart_ts is not None else kill_ts + 1.4
+    with open(os.path.join(d, name), "w") as f:
         json.dump(obj, f)
 
 
@@ -862,6 +972,244 @@ class CrashGateSummaryTest(unittest.TestCase):
         self.assertEqual(a["counters_compared_nodes"], ["val0", "val1", "val2"])
         self.assertFalse(a["counters_equal"])
         self.assertEqual(a["agreement_verdict"], "DISAGREE")
+
+
+# ------------------------------------ run-cell.sh: s75 multi-crash kill sequence
+STUB_CRASH_KILL = r"""#!/usr/bin/env bash
+# stub: records its call, writes the record like crash-kill.sh, never kills.
+echo "$4" >> "$3/calls"
+n=$(wc -l < "$3/calls")
+[ "$n" = "${STUB_FAIL_AT:-0}" ] && exit 1
+sleep "${STUB_SLEEP:-0}"
+printf '{"enabled": true, "restart_ts": %s}\n' "$(date +%s.%N)" > "$3/$4"
+"""
+
+
+class CrashSequenceTest(unittest.TestCase):
+    """run-cell.sh's crash_sequence, run for real against a stub crash-kill.sh:
+    kills in order, stop at the first failure, skip (never back-to-back) when
+    a kill+restart overran into the next kill's slot."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp(prefix="crash-seq-")
+        self.addCleanup(shutil.rmtree, self.d, ignore_errors=True)
+        with open(RUN_CELL_SH) as f:
+            src = f.read()
+        a = src.index("crash_sequence() {")
+        self.fn = src[a:src.index("\n}\n", a) + 3]
+        with open(os.path.join(self.d, "crash-kill.sh"), "w") as f:
+            f.write(STUB_CRASH_KILL)
+        os.chmod(os.path.join(self.d, "crash-kill.sh"), 0o755)
+
+    def run_seq(self, at, min_up, **env):
+        script = ('source "$1"; ' + self.fn +
+                  '\nCRASH_AT=(%s); CRASH_KILL_MIN_UP_S=%s; crash_sequence' % (" ".join(at), min_up))
+        r = subprocess.run(
+            ["bash", "-c", script, "_", CRASH_KILL_SH], capture_output=True, text=True,
+            env=dict(os.environ, CRASH_KILL_LIB="1", TOOLS_DIR=self.d, OUT=self.d,
+                     WT=self.d, KILL_IDX="1", **env), timeout=60)
+        try:
+            with open(os.path.join(self.d, "calls")) as f:
+                calls = f.read().split()
+        except OSError:
+            calls = []
+        return r.returncode, calls, r.stdout
+
+    def test_kills_run_in_order_with_their_record_names(self):
+        rc, calls, _ = self.run_seq(["0", "0.2", "0.4"], 0)
+        self.assertEqual(rc, 0)
+        self.assertEqual(calls, ["crash-kill.json", "crash-kill-2.json", "crash-kill-3.json"])
+
+    def test_a_failed_kill_stops_the_sequence(self):
+        rc, calls, out = self.run_seq(["0", "0.2", "0.4"], 0, STUB_FAIL_AT="2")
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(calls, ["crash-kill.json", "crash-kill-2.json"])
+        self.assertIn("FAILED", out)
+        self.assertFalse(os.path.exists(os.path.join(self.d, "crash-kill-2.json")))
+
+    def test_an_overrun_skips_the_remaining_kills(self):
+        """kill 1 takes 1.5 s, kill 2 was due 1 s in: < min-up since kill 1's
+        restart -> kills 2..3 are skipped, loudly, never fired back-to-back."""
+        rc, calls, out = self.run_seq(["0", "1", "2"], 5, STUB_SLEEP="1.5")
+        self.assertEqual(rc, 0)
+        self.assertEqual(calls, ["crash-kill.json"])
+        self.assertIn("SKIPPING kills 2..3", out)
+        with open(os.path.join(self.d, "crash-kill.skipped")) as f:
+            self.assertEqual(f.read().strip(), "2")
+
+
+# ------------------------------------ summarize.py: s75 multi-crash per-kill list
+class MultiCrashSummaryTest(unittest.TestCase):
+    """CRASH_KILL_AT_S="60,180,..." kills val1 several times in one cell. Kill 1
+    stays in crash.json (the legacy gate); kill k>=2 lands in crash-<k>.json.
+    The headline gate must FAIL when ANY kill went wrong, not just the first."""
+
+    ON = CrashGateSummaryTest.ON
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp(prefix="multi-crash-summ-")
+        self.addCleanup(shutil.rmtree, self.d, ignore_errors=True)
+        write_cell(self.d, 1_000, 1_000)
+        write_agreement(self.d, ["same"] * 3)
+        write_crash(self.d, seq=1, kill_at=60, kill_ts=BENCH_START + 60.0)
+
+    def kill(self, k, **kw):
+        at = 60 + 120 * (k - 1)
+        write_crash(self.d, name="crash-%d.json" % k, seq=k, kill_at=at,
+                    kill_ts=BENCH_START + at + 0.25, **kw)
+
+    def test_single_kill_cell_has_no_per_kill_list(self):
+        s, _ = run_summarize(self.d, extra=self.ON)
+        self.assertNotIn("crash_kills", s)
+        self.assertEqual(s["headline"]["crash_gate"], "PASS")
+
+    def test_per_kill_list_is_reported_in_order(self):
+        self.kill(2)
+        self.kill(3, gap=1, queue=1)
+        s, out = run_summarize(self.d, extra=self.ON)
+        ks = s["crash_kills"]
+        self.assertEqual([k["kill_seq"] for k in ks], [1, 2, 3])
+        self.assertEqual([k["kill_at_s"] for k in ks], [60, 180, 300])
+        for k in ks:
+            for key in ("kill_ts", "restart_ts", "down_s", "rewind_blocks",
+                        "rewind_beyond_exec_queue", "panic_or_failstop_lines",
+                        "error_lines", "hole_lines", "verdict", "fail_reasons"):
+                self.assertIn(key, k)
+            self.assertEqual(k["verdict"], "PASS", k)
+        self.assertEqual(ks[1]["kill_ts"], BENCH_START + 180.25)
+        self.assertEqual(ks[2]["rewind_blocks"], 1)
+        self.assertEqual(s["crash"]["verdict"], "PASS")
+        self.assertEqual(s["headline"]["crash_gate"], "PASS")
+        self.assertIn("kill 3", out)
+
+    def test_kills_sort_numerically_not_lexically(self):
+        self.kill(10)
+        self.kill(2)
+        s, _ = run_summarize(self.d, extra=self.ON)
+        self.assertEqual([k["kill_seq"] for k in s["crash_kills"]], [1, 2, 10])
+
+    def test_a_panic_after_a_later_kill_fails_the_headline(self):
+        self.kill(2, panics=1)
+        self.kill(3)
+        s, _ = run_summarize(self.d, extra=self.ON)
+        ks = s["crash_kills"]
+        self.assertEqual(ks[0]["verdict"], "PASS")
+        self.assertEqual(ks[1]["verdict"], "FAIL")
+        self.assertEqual(ks[1]["panic_or_failstop_lines"], 1)
+        self.assertEqual(s["crash"]["verdict"], "FAIL")
+        self.assertEqual(s["headline"]["crash_gate"], "FAIL")
+        self.assertTrue(any("kill 2" in r and "panic" in r
+                            for r in s["crash"]["fail_reasons"]),
+                        s["crash"]["fail_reasons"])
+        self.assertFalse(s["validity"]["accepted"])
+
+    def test_a_later_kill_that_never_restarted_fails(self):
+        self.kill(2, restarted_pid=None)
+        s, _ = run_summarize(self.d, extra=self.ON)
+        self.assertEqual(s["crash_kills"][1]["verdict"], "FAIL")
+        self.assertEqual(s["headline"]["crash_gate"], "FAIL")
+
+    def test_a_later_kill_with_an_unbounded_rewind_fails(self):
+        self.kill(2, gap=8, queue=3)
+        s, _ = run_summarize(self.d, extra=self.ON)
+        self.assertEqual(s["crash_kills"][1]["rewind_beyond_exec_queue"], 5)
+        self.assertEqual(s["headline"]["crash_gate"], "FAIL")
+
+    def test_a_later_kill_without_the_pipeline_line_fails_when_flag_on(self):
+        self.kill(2, pipeline_line=False)
+        s, _ = run_summarize(self.d, extra=self.ON)
+        self.assertEqual(s["headline"]["crash_gate"], "FAIL")
+
+    def test_a_kill_record_without_its_log_scan_fails(self):
+        """crash-kill-2.json exists (the kill happened) but the post-cell scan
+        never produced crash-2.json: that kill is unverified, never silently
+        dropped from the list."""
+        self.kill(2)
+        os.rename(os.path.join(self.d, "crash-2.json"),
+                  os.path.join(self.d, "crash-kill-2.json"))
+        s, _ = run_summarize(self.d, extra=self.ON)
+        ks = s["crash_kills"]
+        self.assertEqual([k["kill_seq"] for k in ks], [1, 2])
+        self.assertEqual(ks[1]["verdict"], "FAIL")
+        self.assertEqual(s["headline"]["crash_gate"], "FAIL")
+
+
+# ------------------------------------------------ crash-freeze.py: per-kill freeze
+CRASH_FREEZE = os.path.join(HERE, "crash-freeze.py")
+
+
+def commit_line(t, h, ansi=True):
+    """The val0 line crash-freeze.py reads, in the devnet's ANSI fmt::layer()."""
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(t)) + (
+        ".%06dZ" % round((t % 1) * 1e6))
+    if not ansi:
+        return ("%s  INFO torus_consensus::app: on_committed_block: sending to "
+                "execution pipeline height=%d evm_txs=0 native=200\n" % (stamp, h))
+    return ("\x1b[2m%s\x1b[0m \x1b[32m INFO\x1b[0m \x1b[2mtorus_consensus::app"
+            "\x1b[0m\x1b[2m:\x1b[0m on_committed_block: sending to execution "
+            "pipeline \x1b[3mheight\x1b[0m\x1b[2m=\x1b[0m%d \x1b[3mevm_txs\x1b[0m"
+            "\x1b[2m=\x1b[0m0\n" % (stamp, h))
+
+
+class CrashFreezeTest(unittest.TestCase):
+    """Per-kill chain freeze: window k = [kill_ts_k, kill_ts_{k+1}), the last
+    one ends at bench end; max gap between consecutive val0 commits, with the
+    stretch that straddles the kill counted in kill k's window."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp(prefix="crash-freeze-")
+        self.addCleanup(shutil.rmtree, self.d, ignore_errors=True)
+        T = BENCH_START
+        # commits every 0.5 s, frozen (t0+60.2, t0+95.2) and (t0+180.1, t0+200.1)
+        ts = [T + i * 0.5 for i in range(0, 601)]
+        ts = [t for t in ts if not (T + 60.2 < t < T + 95.2)
+              and not (T + 180.1 < t < T + 200.1)]
+        ts = sorted(set(ts) | {T + 60.2, T + 95.2, T + 180.1, T + 200.1})
+        with gzip.open(os.path.join(self.d, "val0.log.gz"), "wt") as f:
+            for h, t in enumerate(ts, start=100):
+                f.write(commit_line(t, h, ansi=h % 2 == 0))
+                if h % 7 == 0:  # the node logs some heights twice
+                    f.write(commit_line(t + 0.001, h))
+        with open(os.path.join(self.d, "summary.json"), "w") as f:
+            json.dump({"timing": {"t_bench0": T, "t_bench1": T + 300}}, f)
+        write_crash(self.d, seq=1, kill_at=60, kill_ts=T + 60.0,
+                    restart_ts=T + 61.0)
+        write_crash(self.d, name="crash-2.json", seq=2, kill_at=180,
+                    kill_ts=T + 180.0, restart_ts=T + 181.5)
+
+    def run_freeze(self):
+        r = subprocess.run([sys.executable, CRASH_FREEZE, self.d, "--json"],
+                           capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return json.loads(r.stdout)
+
+    def test_per_kill_freeze_from_the_val0_commit_log(self):
+        j = self.run_freeze()
+        self.assertEqual(j["source"], "val0.log.gz")
+        ks = j["kills"]
+        self.assertEqual([k["kill_seq"] for k in ks], [1, 2])
+        self.assertAlmostEqual(ks[0]["max_commit_gap_s"], 35.0, places=2)
+        self.assertAlmostEqual(ks[0]["restart_to_first_commit_s"], 34.2, places=2)
+        self.assertAlmostEqual(ks[0]["window_end_ts"], BENCH_START + 180.0)
+        self.assertAlmostEqual(ks[1]["max_commit_gap_s"], 20.0, places=2)
+        self.assertAlmostEqual(ks[1]["restart_to_first_commit_s"], 18.6, places=2)
+        self.assertAlmostEqual(ks[1]["window_end_ts"], BENCH_START + 300.0)
+        self.assertAlmostEqual(ks[0]["down_s"], 1.4)
+
+    def test_falls_back_to_the_1hz_sampler(self):
+        os.remove(os.path.join(self.d, "val0.log.gz"))
+        write_cell(self.d, 1_000, 1_000)  # committed +10 every second
+        j = self.run_freeze()
+        self.assertEqual(j["source"], "sampler.csv")
+        self.assertEqual([k["max_commit_gap_s"] for k in j["kills"]], [1, 1])
+
+    def test_tsv_output(self):
+        r = subprocess.run([sys.executable, CRASH_FREEZE, self.d],
+                           capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        rows = [l.split("\t") for l in r.stdout.splitlines() if not l.startswith("#")]
+        self.assertEqual(rows[0][0], "kill_seq")
+        self.assertEqual(len(rows), 3)
 
 
 # The exact shape the node writes after a kill -9 restart (r9 waloff crash proof,
