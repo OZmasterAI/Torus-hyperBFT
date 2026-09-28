@@ -8,7 +8,8 @@
 //! holder — which runs `load_order_books_levels` — and prints its phase split
 //! (`NativeExecContext::load_timings`).
 //!
-//! Run in RELEASE (debug-build numbers were ~55x off in s450):
+//! Run in RELEASE (debug-build numbers were ~55x off in s450); compare
+//! `TORUS_LOAD_BOOKS_WORKERS=1` (serial) against the default (host threads):
 //!   cargo test --release -p torus-bridge --test load_books_ubench -- --ignored --nocapture
 
 use std::time::Instant;
@@ -114,8 +115,8 @@ fn profile(per_market: u64) {
         t.elapsed().as_secs_f64()
     );
     println!(
-        "{:>3} | {:>8} {:>7} | {:>9} {:>9} {:>9} {:>9} | {:>9}",
-        "rep", "orders", "levels", "root_ms", "store_ms", "rebuild_ms", "verify_ms", "total_ms"
+        "{:>3} | {:>8} {:>7} | {:>7} {:>8} {:>11} {:>10} {:>9} | {:>8}",
+        "rep", "orders", "levels", "root_ms", "store_ms", "rebuild_cpu", "verify_cpu", "books_ms", "total_ms"
     );
     for rep in 0..3 {
         let mut empty = ResidentBooks::default();
@@ -127,7 +128,7 @@ fn profile(per_market: u64) {
         assert_eq!(c.resting_order_count() as u64, per_market * N_MARKETS);
         let ms = |ns: u128| ns / 1_000_000;
         println!(
-            "{:>3} | {:>8} {:>7} | {:>9} {:>9} {:>9} {:>9} | {:>9}",
+            "{:>3} | {:>8} {:>7} | {:>7} {:>8} {:>11} {:>10} {:>9} | {:>8}",
             rep,
             lt.orders,
             lt.levels,
@@ -135,6 +136,7 @@ fn profile(per_market: u64) {
             ms(lt.store_scan_ns),
             ms(lt.rebuild_ns),
             ms(lt.verify_ns),
+            ms(lt.books_wall_ns),
             total
         );
     }

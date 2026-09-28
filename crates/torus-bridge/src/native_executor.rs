@@ -202,6 +202,10 @@ impl BalanceCache {
 #[path = "balance_cache_tests.rs"]
 mod balance_cache_tests;
 
+#[cfg(test)]
+#[path = "load_books_parallel_tests.rs"]
+mod load_books_parallel_tests;
+
 // ============================================================================
 // C3 — deterministic parallel Phase-4 settlement: plumbing types
 // ============================================================================
@@ -815,7 +819,20 @@ fn save_books_workers_env() -> usize {
     })
 }
 
-/// Pure parse for [`save_books_workers_env`]. `host` is the fallback for
+/// `TORUS_LOAD_BOOKS_WORKERS`: worker threads for the boot-time per-market
+/// book rebuild + verify (s74). Same policy as `TORUS_SAVE_BOOKS_WORKERS`:
+/// unset / garbage = host parallelism, `1` = the serial load.
+fn load_books_workers_env() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        let host = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        parse_save_books_workers(std::env::var("TORUS_LOAD_BOOKS_WORKERS").ok(), host)
+    })
+}
+
+/// Pure parse for [`save_books_workers_env`] and [`load_books_workers_env`]. `host` is the fallback for
 /// unset / garbage (same policy as the sibling knobs: never a third behaviour).
 fn parse_save_books_workers(v: Option<String>, host: usize) -> usize {
     match v.as_deref().map(str::trim).and_then(|s| s.parse::<usize>().ok()) {
@@ -1612,10 +1629,13 @@ pub struct LoadTimings {
     pub root_scan_ns: u128,
     /// Node-local order-row store scan incl. parse.
     pub store_scan_ns: u128,
-    /// `rebuild_book` across markets (sort + insert).
+    /// `rebuild_book` summed across markets (sort + insert; CPU time).
     pub rebuild_ns: u128,
-    /// Boot verify: meta, stop and level rows (incl. level_hash) recomputed.
+    /// Boot verify summed across markets: meta, stop and level rows (incl.
+    /// level_hash) recomputed (CPU time).
     pub verify_ns: u128,
+    /// Wall time of the per-market rebuild + verify phase (parallel).
+    pub books_wall_ns: u128,
     pub markets: u32,
     pub orders: u64,
     pub levels: u64,
@@ -1852,6 +1872,7 @@ impl<T: StateBackend> NativeExecContext<T> {
                         &state,
                         book_mode.level_hash_chunked(),
                         &mut load_timings,
+                        load_books_workers_env(),
                     )
                 }
             },
@@ -2241,6 +2262,7 @@ impl<T: StateBackend> NativeExecContext<T> {
         state: &T,
         chunked: bool,
         timings: &mut LoadTimings,
+        workers: usize,
     ) -> (HashMap<MarketId, OrderBook>, u128, Option<String>) {
         use torus_state::cf::{CF_BOOK_ORDER_ROWS, CF_NATIVE_ORDER_BOOKS};
 
@@ -2359,10 +2381,7 @@ impl<T: StateBackend> NativeExecContext<T> {
             );
         }
 
-        // ---- Rebuild + boot verification ----
-        let mut books = HashMap::new();
-        let mut max_order_id: u128 = 0;
-
+        // ---- Rebuild + boot verification (per market, on worker threads) ----
         // Orders for a market that has no root presence at all: fatal.
         for mid in store_orders.keys() {
             if !roots.contains_key(mid) {
@@ -2375,26 +2394,38 @@ impl<T: StateBackend> NativeExecContext<T> {
 
         let mut market_ids: Vec<MarketId> = roots.keys().copied().collect();
         market_ids.sort_unstable();
+        type Orders = Vec<(u64, torus_core::order_book::Order)>;
+        let work: Vec<(MarketId, RootAcc, Orders)> = market_ids
+            .into_iter()
+            .map(|id| {
+                let acc = roots.remove(&id).unwrap();
+                (id, acc, store_orders.remove(&id).unwrap_or_default())
+            })
+            .collect();
+        for (_, acc, orders) in &work {
+            timings.markets += 1;
+            timings.orders += orders.len() as u64;
+            timings.levels += acc.levels.len() as u64;
+        }
 
-        for market_id in market_ids {
-            let acc = roots.remove(&market_id).unwrap();
+        // One market: rebuild + boot verify, a pure function of that market's
+        // rows. s74: markets run on scoped worker threads (the ~1 s rebuild and
+        // ~1 s verify at ~1M resting orders were serial); results are consumed
+        // in market-ascending order below, so the first error reported — and
+        // every book — is exactly the serial loop's.
+        type Loaded = Result<(OrderBook, u128, u128), String>;
+        let load_market = move |market_id: MarketId, acc: RootAcc, orders: Orders| -> Loaded {
             let Some((meta, stored_meta_bytes)) = acc.meta else {
-                return fail(format!(
+                return Err(format!(
                     "3c: market {market_id} has stop/level rows but no meta row \
                      (corrupt row store)"
                 ));
             };
-            let orders = store_orders.remove(&market_id).unwrap_or_default();
-            timings.markets += 1;
-            timings.orders += orders.len() as u64;
-            timings.levels += acc.levels.len() as u64;
             let stop_bytes = acc.stops.clone();
             let t0 = std::time::Instant::now();
-            let mut book = match Self::rebuild_book(market_id, meta, orders, acc.stops) {
-                Ok(b) => b,
-                Err(e) => return fail(format!("3c: {e}")),
-            };
-            timings.rebuild_ns += t0.elapsed().as_nanos();
+            let mut book = Self::rebuild_book(market_id, meta, orders, acc.stops)
+                .map_err(|e| format!("3c: {e}"))?;
+            let rebuild_ns = t0.elapsed().as_nanos();
             let t0 = std::time::Instant::now();
             // Mode 3: select the chunked digest BEFORE any drain so every
             // later mutation marks its chunk (boot verify below recomputes
@@ -2404,7 +2435,7 @@ impl<T: StateBackend> NativeExecContext<T> {
             // -- Boot verify 1: meta row bytes --
             let recomputed_meta = book_meta_value(&book);
             if recomputed_meta != stored_meta_bytes {
-                return fail(format!(
+                return Err(format!(
                     "3c: market {market_id}: recomputed meta row != root-committed \
                      meta row (node-local order store corrupt/stale — refusing to \
                      serve or sign)"
@@ -2419,7 +2450,7 @@ impl<T: StateBackend> NativeExecContext<T> {
             let mut stored_stops = stop_bytes;
             stored_stops.sort_by_key(|(id, _)| *id);
             if live_stops != stored_stops {
-                return fail(format!(
+                return Err(format!(
                     "3c: market {market_id}: rebuilt stop set != root-committed stop \
                      rows (corrupt row store)"
                 ));
@@ -2435,7 +2466,7 @@ impl<T: StateBackend> NativeExecContext<T> {
                 );
             }
             if recomputed != acc.levels {
-                return fail(format!(
+                return Err(format!(
                     "3c: market {market_id}: recomputed level rows != root-committed \
                      level rows (node-local order store corrupt/stale, or this node's \
                      TORUS_BOOK_ROWS={} does not match the mode the DB was written \
@@ -2444,8 +2475,72 @@ impl<T: StateBackend> NativeExecContext<T> {
                     if chunked { 3 } else { 2 }
                 ));
             }
-            timings.verify_ns += t0.elapsed().as_nanos();
+            Ok((book, rebuild_ns, t0.elapsed().as_nanos()))
+        };
 
+        let workers = workers.clamp(1, work.len().max(1));
+        let t_books = std::time::Instant::now();
+        let results: Vec<(MarketId, Loaded)> = if workers == 1 {
+            work.into_iter()
+                .map(|(id, acc, orders)| (id, load_market(id, acc, orders)))
+                .collect()
+        } else {
+            // LPT by rows to rebuild/verify — the save-drain idiom.
+            let weights: Vec<(MarketId, usize)> = work
+                .iter()
+                .map(|(id, acc, orders)| (*id, orders.len() + acc.levels.len()))
+                .collect();
+            let assignment = MarketWorkerPool::assign_chunks(&weights, workers);
+            let mut chunks: Vec<Vec<(MarketId, RootAcc, Orders)>> =
+                (0..workers).map(|_| Vec::new()).collect();
+            for (item, w) in work.into_iter().zip(assignment) {
+                chunks[w].push(item);
+            }
+            let load_market = &load_market;
+            let mut out: Vec<(MarketId, Loaded)> = Vec::new();
+            std::thread::scope(|s| {
+                let handles: Vec<_> = chunks
+                    .into_iter()
+                    .filter(|c| !c.is_empty())
+                    .map(|chunk| {
+                        s.spawn(move || {
+                            chunk
+                                .into_iter()
+                                .map(|(id, acc, orders)| (id, load_market(id, acc, orders)))
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                    .collect();
+                // Join every worker; re-raise a panic like the serial loop.
+                let mut panic_payload: Option<Box<dyn std::any::Any + Send>> = None;
+                for h in handles {
+                    match h.join() {
+                        Ok(loaded) => out.extend(loaded),
+                        Err(payload) => {
+                            if panic_payload.is_none() {
+                                panic_payload = Some(payload);
+                            }
+                        }
+                    }
+                }
+                if let Some(payload) = panic_payload {
+                    std::panic::resume_unwind(payload);
+                }
+            });
+            out.sort_by_key(|(id, _)| *id);
+            out
+        };
+        timings.books_wall_ns = t_books.elapsed().as_nanos();
+
+        let mut books = HashMap::new();
+        let mut max_order_id: u128 = 0;
+        for (market_id, loaded) in results {
+            let (book, rebuild_ns, verify_ns) = match loaded {
+                Ok(loaded) => loaded,
+                Err(e) => return fail(e),
+            };
+            timings.rebuild_ns += rebuild_ns;
+            timings.verify_ns += verify_ns;
             let book_next_id = book.next_order_id();
             if book_next_id > max_order_id {
                 max_order_id = book_next_id;
@@ -2460,8 +2555,10 @@ impl<T: StateBackend> NativeExecContext<T> {
             levels = timings.levels,
             root_scan_ms = %ms(timings.root_scan_ns),
             store_scan_ms = %ms(timings.store_scan_ns),
-            rebuild_ms = %ms(timings.rebuild_ns),
-            verify_ms = %ms(timings.verify_ns),
+            workers,
+            books_wall_ms = %ms(timings.books_wall_ns),
+            rebuild_cpu_ms = %ms(timings.rebuild_ns),
+            verify_cpu_ms = %ms(timings.verify_ns),
             total_ms = %load_start.elapsed().as_millis(),
             "load_books: order books loaded from DB (level authority)"
         );
