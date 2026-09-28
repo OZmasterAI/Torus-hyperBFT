@@ -323,6 +323,11 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
         } else {
             view_info.deadline
         };
+        // s75 fix D: wake for a due header re-send even inside a long view.
+        let recv_deadline = match self.hotstuff.next_header_resend() {
+            Some(due) => std::cmp::min(recv_deadline, due),
+            None => recv_deadline,
+        };
         let received = if body_before_expiry {
             self.pm_stub.recv_before_body_retry(self.chain_id, view_info.view, recv_deadline)
         } else {
@@ -468,6 +473,9 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
     }
 
     fn tick_body_retries(&mut self) {
+        // 6a. s75 fix D: a leader stuck in its own view re-sends its header
+        // directly to the other validators (self-throttled to the interval).
+        self.hotstuff.tick_header_resend(&self.block_tree);
         // 6c. Retry stale body fetches (proposer first, then rotate across the
         // other validators); trigger sync after max retries.
         self.hotstuff.tick_pending_body_retries(&self.block_tree);

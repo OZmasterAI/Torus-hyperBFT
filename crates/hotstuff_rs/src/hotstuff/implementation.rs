@@ -111,6 +111,11 @@ pub(crate) struct HotStuff<N: Network> {
     /// s75 fix A: the view those senders' power (> f) asks this replica to
     /// skip to; taken by the algorithm loop.
     leader_skip: Option<ViewNumber>,
+    /// s75 fix D: this leader's last proposed header and when to re-send it
+    /// directly (see [`tick_header_resend_at`](Self::tick_header_resend_at)).
+    header_resend: Option<(ProposalHeader, Instant)>,
+    /// `TORUS_HEADER_RESEND_MS` (default 3 s; `None` = off).
+    header_resend_interval: Option<Duration>,
     /// Hybrid pipelining: full blocks stored locally by the proposer after broadcasting header.
     pending_bodies: PendingBodies,
     /// Hybrid pipelining: headers received but body not yet fetched. Maps block_hash → header.
@@ -225,6 +230,8 @@ impl<N: Network> HotStuff<N> {
             parked_header: None,
             leader_skip_senders: std::collections::HashMap::new(),
             leader_skip: None,
+            header_resend: None,
+            header_resend_interval: header_resend_from_env(),
             pending_bodies: PendingBodies::new(),
             pending_headers: PendingHeaders::new(),
             body_fetch_tracker: std::collections::HashMap::new(),
@@ -275,6 +282,69 @@ impl<N: Network> HotStuff<N> {
     /// power asked it to skip to. Taken once.
     pub(crate) fn take_leader_skip(&mut self) -> Option<ViewNumber> {
         self.leader_skip.take()
+    }
+
+    /// Test-only override of the header re-send interval (`None` = off).
+    #[cfg(test)]
+    pub(crate) fn set_header_resend_interval(&mut self, interval: Option<Duration>) {
+        self.header_resend_interval = interval;
+    }
+
+    /// Test-only: arm a header re-send due at `due` (as after proposing).
+    #[cfg(test)]
+    pub(crate) fn arm_header_resend(&mut self, header: ProposalHeader, due: Instant) {
+        self.header_resend_interval = Some(Duration::from_secs(3));
+        self.header_resend = Some((header, due));
+    }
+
+    /// s75 fix D: when the next re-send of this leader's current-view header
+    /// is due; the algorithm loop keeps its receive wait below it.
+    pub(crate) fn next_header_resend(&self) -> Option<Instant> {
+        self.header_resend
+            .as_ref()
+            .filter(|(header, _)| header.view == self.view_info.view)
+            .map(|(_, due)| *due)
+    }
+
+    pub(crate) fn tick_header_resend<K: KVStore>(&mut self, block_tree: &BlockTreeSingleton<K>) {
+        self.tick_header_resend_at(block_tree, Instant::now());
+    }
+
+    /// s75 fix D: a leader still in its own view one interval after
+    /// proposing (a normal view ends in ~1 s) re-sends its header DIRECTLY to
+    /// every other validator, then every interval. The proposal itself is
+    /// gossiped, which a disconnected peer (a validator restarting) never
+    /// receives; direct sends are queued per peer and flushed on reconnect,
+    /// so the rejoiner can vote (or round-skip to the view). A repeat from
+    /// the same leader is not equivocation and votes at most once
+    /// (`highest_view_voted`). Off with `TORUS_HEADER_RESEND_MS=0`.
+    pub(crate) fn tick_header_resend_at<K: KVStore>(
+        &mut self,
+        block_tree: &BlockTreeSingleton<K>,
+        now: Instant,
+    ) {
+        let (Some(interval), Some(due)) = (self.header_resend_interval, self.next_header_resend())
+        else {
+            return;
+        };
+        if now < due {
+            return;
+        }
+        let Some((header, due)) = self.header_resend.as_mut() else { return };
+        *due = now + interval;
+        let header = header.clone();
+        let me = self.config.keypair.public();
+        let Ok(validator_set) = block_tree.committed_validator_set() else { return };
+        let peers: Vec<VerifyingKey> = validator_set.validators().filter(|vk| **vk != me).copied().collect();
+        log::info!(
+            "header re-send: view={} block={} to {} validators (still in own view)",
+            header.view.int(),
+            crate::logging::block_prefix(&header.block_hash),
+            peers.len(),
+        );
+        for peer in peers {
+            self.sender_handle.send::<HotStuffMessage>(peer, header.clone().into());
+        }
     }
 
     /// s74 fix C: a header is parked; the algorithm loop keeps its receive
@@ -902,6 +972,9 @@ impl<N: Network> HotStuff<N> {
         self.sender_handle
             .store_block_for_serving(proposal.block.hash, proposal.block.clone());
         let header = ProposalHeader::from_proposal(proposal, has_validator_set_updates);
+        self.header_resend = self
+            .header_resend_interval
+            .map(|interval| (header.clone(), Instant::now() + interval));
         self.sender_handle
             .broadcast::<HotStuffMessage>(header.into());
         if should_push_body(body_payload_len(&proposal.block), self.body_push_max_bytes) {
@@ -2347,7 +2420,11 @@ impl<N: Network> HotStuff<N> {
                 }
                 None => false,
             };
-            if !inserted_from_push {
+            // A repeat of the header (s75 fix D re-send, retransmission)
+            // keeps a running fetch: re-requesting would reset its budget,
+            // and a 3 s re-send inside the 4 s deadline would never let it
+            // fall back to sync.
+            if !inserted_from_push && !self.body_fetch_tracker.contains_key(&block_hash) {
                 let req = BlockDataRequest {
                     chain_id,
                     view,
@@ -3341,6 +3418,22 @@ fn defer_parent_feed_from_env() -> bool {
 /// `TORUS_ROUND_SKIP`: on by default (s74 rejoin view sync); only `0` turns it off.
 pub(crate) fn parse_round_skip(raw: Option<String>) -> bool {
     !matches!(raw.as_deref().map(str::trim), Some("0"))
+}
+
+/// `TORUS_HEADER_RESEND_MS` (s75 fix D): the stuck-leader header re-send
+/// interval; default 3000, `0` turns it off, unparsable keeps the default.
+pub(crate) fn parse_header_resend_ms(raw: Option<String>) -> Option<Duration> {
+    match raw.as_deref().map(str::trim).map(str::parse::<u64>) {
+        Some(Ok(0)) => None,
+        Some(Ok(ms)) => Some(Duration::from_millis(ms)),
+        _ => Some(Duration::from_millis(3000)),
+    }
+}
+
+/// Cached env read of `TORUS_HEADER_RESEND_MS`.
+fn header_resend_from_env() -> Option<Duration> {
+    static INTERVAL: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
+    *INTERVAL.get_or_init(|| parse_header_resend_ms(std::env::var("TORUS_HEADER_RESEND_MS").ok()))
 }
 
 /// Cached env read of `TORUS_ROUND_SKIP`.
@@ -4683,5 +4776,178 @@ mod s63_body_fetch_tests {
         assert_eq!(f.hotstuff.missing_data_retries.len(), MISSING_DATA_RETRY_CAP);
         assert!(!f.hotstuff.missing_data_retries.contains_key(&parent.hash));
         assert!(f.hotstuff.take_sync_needed());
+    }
+}
+
+#[cfg(test)]
+mod header_resend_tests {
+    //! s75 fix D: a leader still in its own view re-sends its header
+    //! directly (queued for a disconnected peer, flushed on reconnect) to
+    //! every other validator, so a replica that missed the gossiped copy
+    //! while down can still vote.
+    use super::*;
+    use crate::hotstuff::header_fast_path_regression_test::{
+        proposer_for, signing_keys, steady_block_tree, validator_set, MemKV,
+    };
+    use crate::hotstuff::types::PhaseCertificate;
+    use crate::networking::messages::{Message, ProgressMessage};
+    use crate::types::data_types::Data;
+    use crate::types::update_sets::ValidatorSetUpdates;
+    use crate::types::validator_set::ValidatorSet;
+    use std::sync::{Arc, Mutex};
+
+    /// Records the target of every direct-sent `ProposalHeader` and every
+    /// body request.
+    #[derive(Clone, Default)]
+    struct DirectNet {
+        headers: Arc<Mutex<Vec<(VerifyingKey, ProposalHeader)>>>,
+        body_requests: Arc<Mutex<Vec<CryptoHash>>>,
+    }
+    impl Network for DirectNet {
+        fn init_validator_set(&mut self, _: ValidatorSet) {}
+        fn update_validator_set(&mut self, _: ValidatorSetUpdates) {}
+        fn broadcast(&mut self, _: Message) {}
+        fn send(&mut self, peer: VerifyingKey, message: Message) {
+            if let Message::ProgressMessage(ProgressMessage::HotStuffMessage(
+                HotStuffMessage::ProposalHeader(header),
+            )) = message
+            {
+                self.headers.lock().unwrap().push((peer, header));
+            }
+        }
+        fn recv(&mut self) -> Option<(VerifyingKey, Message)> {
+            None
+        }
+        fn request_block_data(&mut self, _: VerifyingKey, request: BlockDataRequest) {
+            self.body_requests.lock().unwrap().push(request.block_hash);
+        }
+    }
+    impl DirectNet {
+        fn take(&self) -> Vec<(VerifyingKey, ProposalHeader)> {
+            self.headers.lock().unwrap().drain(..).collect()
+        }
+    }
+
+    const VIEW: u64 = 5;
+
+    /// leader(VIEW) has just proposed (header broadcast) in VIEW.
+    fn proposed(interval: Option<Duration>) -> (HotStuff<DirectNet>, BlockTreeSingleton<MemKV>, DirectNet, ProposalHeader, Instant) {
+        let keys = signing_keys(&[1, 2, 3, 4]);
+        let set = validator_set(&keys);
+        let (tree, vss) = steady_block_tree(&set);
+        let view = ViewNumber::new(VIEW);
+        let leader = proposer_for(view, &keys, &vss, &tree);
+        let me = keys.iter().find(|key| key.verifying_key() == leader).unwrap().clone();
+        let net = DirectNet::default();
+        let mut hotstuff = HotStuff::new(
+            HotStuffConfiguration { chain_id: ChainID::new(0), keypair: Keypair::new(me) },
+            ViewInfo::new(view, Instant::now() + Duration::from_secs(3600)),
+            SenderHandle::new(net.clone()),
+            ValidatorSetUpdateHandle::new(net.clone()),
+            vss,
+            None,
+        );
+        hotstuff.set_header_resend_interval(interval);
+        let block = Block::new(BlockHeight::new(0), PhaseCertificate::genesis_pc(),
+            CryptoHash::new([97; 32]), Data::new(vec![]));
+        let proposal = Proposal { chain_id: ChainID::new(0), view, block, tc: None, nec: None };
+        let start = Instant::now();
+        hotstuff.broadcast_proposal_as_header(&proposal, false, &tree);
+        let header = ProposalHeader::from_proposal(&proposal, false);
+        assert!(net.take().is_empty(), "the proposal itself is gossiped, not direct-sent");
+        (hotstuff, tree, net, header, start)
+    }
+
+    #[test]
+    fn stuck_leader_resends_its_header_directly_to_each_validator() {
+        let (mut hotstuff, tree, net, header, start) = proposed(Some(Duration::from_secs(3)));
+        let me = hotstuff.config.keypair.public();
+        hotstuff.tick_header_resend_at(&tree, start + Duration::from_millis(2900));
+        assert!(net.take().is_empty(), "not due yet");
+
+        hotstuff.tick_header_resend_at(&tree, start + Duration::from_millis(3100));
+        let sent = net.take();
+        assert_eq!(sent.len(), 3, "one copy per other validator");
+        assert!(sent.iter().all(|(peer, h)| *peer != me && *h == header));
+
+        hotstuff.tick_header_resend_at(&tree, start + Duration::from_millis(3200));
+        assert!(net.take().is_empty(), "next copy is one interval later");
+        hotstuff.tick_header_resend_at(&tree, start + Duration::from_millis(6200));
+        assert_eq!(net.take().len(), 3);
+    }
+
+    #[test]
+    fn no_resend_after_the_view_moves_on_or_when_disabled() {
+        let (mut hotstuff, tree, net, _, start) = proposed(Some(Duration::from_secs(3)));
+        hotstuff.view_info = ViewInfo::new(ViewNumber::new(VIEW + 1), Instant::now() + Duration::from_secs(60));
+        hotstuff.tick_header_resend_at(&tree, start + Duration::from_secs(4));
+        assert!(net.take().is_empty(), "view moved on");
+        assert_eq!(hotstuff.next_header_resend(), None);
+
+        let (mut hotstuff, tree, net, _, start) = proposed(None);
+        hotstuff.tick_header_resend_at(&tree, start + Duration::from_secs(60));
+        assert!(net.take().is_empty(), "TORUS_HEADER_RESEND_MS=0");
+        assert_eq!(hotstuff.next_header_resend(), None);
+    }
+
+    #[test]
+    fn next_header_resend_is_due_one_interval_after_the_proposal() {
+        let (hotstuff, _, _, _, start) = proposed(Some(Duration::from_secs(3)));
+        let due = hotstuff.next_header_resend().expect("armed after proposing");
+        assert!(due >= start + Duration::from_secs(3) && due <= Instant::now() + Duration::from_secs(3));
+    }
+
+    #[test]
+    fn header_resend_flag_defaults_to_3s_and_zero_disables() {
+        assert_eq!(parse_header_resend_ms(None), Some(Duration::from_millis(3000)));
+        assert_eq!(parse_header_resend_ms(Some("0".into())), None);
+        assert_eq!(parse_header_resend_ms(Some(" 1500 ".into())), Some(Duration::from_millis(1500)));
+        assert_eq!(parse_header_resend_ms(Some("junk".into())), Some(Duration::from_millis(3000)));
+    }
+
+    struct NoBodyApp;
+    impl App<MemKV> for NoBodyApp {
+        fn produce_block(&mut self, _: ProduceBlockRequest<MemKV>) -> ProduceBlockResponse {
+            unreachable!("follower")
+        }
+        fn validate_block(&mut self, _: ValidateBlockRequest<MemKV>) -> ValidateBlockResponse {
+            unreachable!("the body never arrives")
+        }
+        fn validate_block_for_sync(&mut self, _: ValidateBlockRequest<MemKV>) -> ValidateBlockResponse {
+            unreachable!("the body never arrives")
+        }
+    }
+
+    /// Review of fix D, finding 1: a re-sent copy of a header whose body is
+    /// still being fetched must not re-request it nor reset the fetch budget
+    /// (every 3 s < the 4 s BODY_FETCH_DEADLINE: the fallback to sync would
+    /// never fire).
+    #[test]
+    fn repeated_header_keeps_the_running_body_fetch() {
+        let (leader_hotstuff, tree, _, header, _) = proposed(Some(Duration::from_secs(3)));
+        let leader = leader_hotstuff.config.keypair.public();
+        let keys = signing_keys(&[1, 2, 3, 4]);
+        let set = validator_set(&keys);
+        let (_, vss) = steady_block_tree(&set);
+        let me = keys.iter().find(|key| key.verifying_key() != leader).unwrap().clone();
+        let net = DirectNet::default();
+        let mut follower = HotStuff::new(
+            HotStuffConfiguration { chain_id: ChainID::new(0), keypair: Keypair::new(me) },
+            ViewInfo::new(ViewNumber::new(VIEW), Instant::now() + Duration::from_secs(3600)),
+            SenderHandle::new(net.clone()),
+            ValidatorSetUpdateHandle::new(net.clone()),
+            vss,
+            None,
+        );
+        let mut tree = tree;
+        follower.on_receive_msg(header.clone().into(), &leader, &mut tree, &mut NoBodyApp).unwrap();
+        let first = *follower.body_fetch_tracker.get(&header.block_hash).expect("fetch started");
+        assert_eq!(net.body_requests.lock().unwrap().len(), 1);
+
+        std::thread::sleep(Duration::from_millis(5));
+        follower.on_receive_msg(header.clone().into(), &leader, &mut tree, &mut NoBodyApp).unwrap();
+        assert_eq!(net.body_requests.lock().unwrap().len(), 1, "no second request for a running fetch");
+        let again = *follower.body_fetch_tracker.get(&header.block_hash).unwrap();
+        assert!(again.0 == first.0 && again.1 == first.1 && again.3 == first.3, "fetch budget not reset");
     }
 }

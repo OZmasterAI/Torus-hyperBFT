@@ -288,3 +288,23 @@ fn restarted_replica_enters_its_init_view_on_the_first_pass() {
         "fresh chain (init view 0) unchanged"
     );
 }
+
+/// s75 fix D: a leader in a long (backed-off) view must wake for its header
+/// re-send instead of sleeping in the receive until the view deadline.
+#[test]
+fn due_header_resend_keeps_the_receive_wait_short() {
+    let mut r = rejoin(false);
+    let view = r.view();
+    r.f.algorithm.block_sync_client.finish_pending_sync();
+    r.f.algorithm
+        .hotstuff
+        .arm_header_resend(header_for(&body(98), view), Instant::now() + Duration::from_millis(100));
+    let started = Instant::now();
+    r.f.algorithm
+        .poll_progress_and_retry(ViewInfo::new(view, Instant::now() + Duration::from_secs(2)), false);
+    assert!(
+        started.elapsed() < Duration::from_millis(800),
+        "receive waited {:?} past a due header re-send",
+        started.elapsed()
+    );
+}
