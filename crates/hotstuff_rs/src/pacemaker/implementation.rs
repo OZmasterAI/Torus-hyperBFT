@@ -1194,6 +1194,10 @@ pub fn select_leader_reputation_weighted(
 /// entry has `view == highest_qc_view + 1`. Consult sites that must stay
 /// neutral on the happy path evaluate `backoff_multiplier(view,
 /// highest_qc_view + 1, ..)` — see [`PacemakerConfiguration::stall_multiplier`].
+///
+/// Test oracle only: `stall_multiplier` inlines this formula and adds the
+/// commit-lag exponent (S470).
+#[cfg(test)]
 fn backoff_multiplier(view: ViewNumber, highest_qc_view: ViewNumber, factor: u32, cap: u32) -> u32 {
     factor
         .saturating_pow(backoff_exponent(view, highest_qc_view, cap))
