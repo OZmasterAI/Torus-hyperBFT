@@ -1516,6 +1516,9 @@ pub struct NativeExecContext<T: StateBackend = StateDb> {
     /// L3 save-books attribution (µbench-only): last block's sub-step timings.
     #[cfg(feature = "save-timings")]
     pub last_save_timings: SaveTimings,
+    /// s74 boot profile: phase timings of this ctx's mode-2/3 book load
+    /// (all zero when the books came from the resident holder).
+    pub load_timings: LoadTimings,
 
     /// r6 engine-untimed-attribution: nanosecond accumulators for the exec
     /// sub-phases, summed across every `execute_batch` call this context
@@ -1597,6 +1600,25 @@ impl ExecPhaseAccum {
     pub fn secs(ns: u128) -> f64 {
         ns as f64 / 1e9
     }
+}
+
+/// s74 boot profile: phase timings of the mode-2/3 book load
+/// (`load_order_books_levels`), the one-time cost a restarted node pays on
+/// its first replayed block (~4.5 s at ~1M resting orders). Node-local
+/// instrumentation; logged once per load and kept on the ctx.
+#[derive(Default, Clone, Copy, Debug)]
+pub struct LoadTimings {
+    /// Root-CF scan (meta/stop/level rows) incl. parse.
+    pub root_scan_ns: u128,
+    /// Node-local order-row store scan incl. parse.
+    pub store_scan_ns: u128,
+    /// `rebuild_book` across markets (sort + insert).
+    pub rebuild_ns: u128,
+    /// Boot verify: meta, stop and level rows (incl. level_hash) recomputed.
+    pub verify_ns: u128,
+    pub markets: u32,
+    pub orders: u64,
+    pub levels: u64,
 }
 
 /// L3 save-books attribution (µbench-only): breakdown of the mode-2
@@ -1819,13 +1841,18 @@ impl<T: StateBackend> NativeExecContext<T> {
         // means this node's flag disagrees with the DB's history. Loading
         // "what we can" would silently diverge from the fleet, so latch a
         // fatal instead: the committer fail-stops before flushing anything.
+        let mut load_timings = LoadTimings::default();
         let (order_books, scanned_next_id, mut load_error) = match reused_inner {
             Some(inner) => (inner.books, inner.next_global_order_id, None),
             None => match book_mode {
                 BookMode::Classic => Self::load_order_books(&state),
                 BookMode::OrderRows => Self::load_order_books_rows(&state),
                 BookMode::LevelAuthority | BookMode::LevelAuthorityChunked => {
-                    Self::load_order_books_levels(&state, book_mode.level_hash_chunked())
+                    Self::load_order_books_levels(
+                        &state,
+                        book_mode.level_hash_chunked(),
+                        &mut load_timings,
+                    )
                 }
             },
         };
@@ -1895,6 +1922,7 @@ impl<T: StateBackend> NativeExecContext<T> {
             collect_save_timings: false,
             #[cfg(feature = "save-timings")]
             last_save_timings: SaveTimings::default(),
+            load_timings,
             phase_accum: ExecPhaseAccum::default(),
             save_split: SaveSplitAccum::default(),
         }
@@ -2212,11 +2240,14 @@ impl<T: StateBackend> NativeExecContext<T> {
     fn load_order_books_levels(
         state: &T,
         chunked: bool,
+        timings: &mut LoadTimings,
     ) -> (HashMap<MarketId, OrderBook>, u128, Option<String>) {
         use torus_state::cf::{CF_BOOK_ORDER_ROWS, CF_NATIVE_ORDER_BOOKS};
 
         let fail = |msg: String| (HashMap::new(), 1, Some(msg));
 
+        let load_start = std::time::Instant::now();
+        let t0 = load_start;
         // ---- Root CF scan: meta + stops + level rows (consensus) ----
         #[derive(Default)]
         struct RootAcc {
@@ -2281,6 +2312,8 @@ impl<T: StateBackend> NativeExecContext<T> {
             }
         }
 
+        timings.root_scan_ns = t0.elapsed().as_nanos();
+        let t0 = std::time::Instant::now();
         // ---- Node-local order-row store scan ----
         let mut store_orders: HashMap<MarketId, Vec<(u64, torus_core::order_book::Order)>> =
             HashMap::new();
@@ -2314,6 +2347,7 @@ impl<T: StateBackend> NativeExecContext<T> {
             }
         }
 
+        timings.store_scan_ns = t0.elapsed().as_nanos();
         // Split-brain: an order store with content while the root CF commits
         // no books at all.
         if store_nonempty && roots.is_empty() {
@@ -2351,11 +2385,17 @@ impl<T: StateBackend> NativeExecContext<T> {
                 ));
             };
             let orders = store_orders.remove(&market_id).unwrap_or_default();
+            timings.markets += 1;
+            timings.orders += orders.len() as u64;
+            timings.levels += acc.levels.len() as u64;
             let stop_bytes = acc.stops.clone();
+            let t0 = std::time::Instant::now();
             let mut book = match Self::rebuild_book(market_id, meta, orders, acc.stops) {
                 Ok(b) => b,
                 Err(e) => return fail(format!("3c: {e}")),
             };
+            timings.rebuild_ns += t0.elapsed().as_nanos();
+            let t0 = std::time::Instant::now();
             // Mode 3: select the chunked digest BEFORE any drain so every
             // later mutation marks its chunk (boot verify below recomputes
             // from scratch either way).
@@ -2404,6 +2444,7 @@ impl<T: StateBackend> NativeExecContext<T> {
                     if chunked { 3 } else { 2 }
                 ));
             }
+            timings.verify_ns += t0.elapsed().as_nanos();
 
             let book_next_id = book.next_order_id();
             if book_next_id > max_order_id {
@@ -2412,6 +2453,18 @@ impl<T: StateBackend> NativeExecContext<T> {
             books.insert(market_id, book);
         }
 
+        let ms = |ns: u128| ns / 1_000_000;
+        tracing::info!(
+            markets = timings.markets,
+            orders = timings.orders,
+            levels = timings.levels,
+            root_scan_ms = %ms(timings.root_scan_ns),
+            store_scan_ms = %ms(timings.store_scan_ns),
+            rebuild_ms = %ms(timings.rebuild_ns),
+            verify_ms = %ms(timings.verify_ns),
+            total_ms = %load_start.elapsed().as_millis(),
+            "load_books: order books loaded from DB (level authority)"
+        );
         let next_id = if max_order_id > 0 { max_order_id } else { 1 };
         (books, next_id, None)
     }
