@@ -13,7 +13,7 @@ OFF-CHAIN line and left out of that per-block sum: `block_ms` is the EXEC
 thread's own timer, so counting worker ms into it drives residual_untimed
 negative and the percentages past 100 %.
 """
-import argparse, csv, json, os, statistics, sys, time
+import argparse, csv, json, os, re, statistics, sys, time
 from health import assess_liveness, acceptance, DEFAULT_STALL_S
 
 ap = argparse.ArgumentParser()
@@ -808,26 +808,18 @@ else:
 MAX_REWIND_BEYOND_EXEC_QUEUE = 2
 
 
-def crash_gate(raw, agreement, node_env):
-    if raw is None:
-        return None
+def kill_checks(raw, out):
+    """The part of the gate that ONE kill's record + log scan decides on its
+    own (shared by crash.json and every s75 multi-crash crash-<k>.json):
+    fills the rewind fields into `out`, returns the failures."""
     r = raw.get("restart") or {}
     pre = raw.get("pre_kill") or {}
-    out = dict(raw)
     gap = int(r.get("gap") or 0)
     q = pre.get("exec_queue_depth")
     q = int(q) if q is not None else None
     out["rewind_blocks"] = gap
     out["exec_queue_depth_at_kill"] = q
     out["rewind_beyond_exec_queue"] = (gap - q) if q is not None else None
-    out["max_rewind_beyond_exec_queue"] = MAX_REWIND_BEYOND_EXEC_QUEUE
-    # The gate exists to unblock the FLAG: if the restarted node came back
-    # without the flush worker, it crash-tested the serial path and proves
-    # nothing. (A flag-off crash cell is a legitimate serial control.)
-    flag_expected = node_env.get("TORUS_EXEC_PIPELINE") == "1"
-    out["pipeline_flag_expected"] = flag_expected
-    out["pipeline_flag_confirmed"] = bool(r.get("pipeline_enabled_line")) if flag_expected else None
-
     fail = []
     if not raw.get("restarted_pid"):
         fail.append("killed node did not restart")
@@ -840,6 +832,23 @@ def crash_gate(raw, agreement, node_env):
         fail.append("panic/fail-stop after the restart")
     if int(r.get("hole_lines") or 0) > 0:
         fail.append("unhealed execution hole after the restart")
+    return fail
+
+
+def crash_gate(raw, agreement, node_env):
+    if raw is None:
+        return None
+    r = raw.get("restart") or {}
+    out = dict(raw)
+    fail = kill_checks(raw, out)
+    out["max_rewind_beyond_exec_queue"] = MAX_REWIND_BEYOND_EXEC_QUEUE
+    # The gate exists to unblock the FLAG: if the restarted node came back
+    # without the flush worker, it crash-tested the serial path and proves
+    # nothing. (A flag-off crash cell is a legitimate serial control.)
+    flag_expected = node_env.get("TORUS_EXEC_PIPELINE") == "1"
+    out["pipeline_flag_expected"] = flag_expected
+    out["pipeline_flag_confirmed"] = bool(r.get("pipeline_enabled_line")) if flag_expected else None
+
     # Fork evidence is MANDATORY for all THREE nodes, the killed one included:
     # only its process-lifetime COUNTERS are excused (they reset on restart),
     # never its state. Checked here by name rather than via the one-word verdict
@@ -870,6 +879,54 @@ def crash_gate(raw, agreement, node_env):
 
 
 crash = crash_gate(CRASH_RAW, agreement, NODE_ENV)
+
+# s75 multi-crash (CRASH_KILL_AT_S="60,180,..."): kill 1 is crash.json above;
+# kill k>=2 is crash-<k>.json (its record + a scan of ITS log window). A kill
+# whose scan is missing falls back to its bare crash-kill-<k>.json record and
+# FAILs as unverified. Each kill is judged on its own evidence (kill_checks +
+# the flush-worker line); the fleet-wide agreement checks stay on `crash`.
+# ANY failed kill fails the headline gate. Single-kill cells: `crash_kills`
+# is absent and nothing below changes their output.
+KILL_FIELDS = ("kill_seq", "kill_at_s", "kill_ts", "restart_ts", "down_s", "restarted_pid")
+SCAN_FIELDS = ("replay_line_found", "pipeline_enabled_line", "panic_or_failstop_lines",
+               "hole_lines", "error_lines")
+
+
+def crash_kill_list(out_dir, first, node_env):
+    seqs = set()
+    for name in os.listdir(out_dir):
+        m = re.fullmatch(r"crash(?:-kill)?-(\d+)\.json", name)
+        if m and int(m.group(1)) >= 2:
+            seqs.add(int(m.group(1)))
+    if first is None or not seqs:
+        return None
+    flag_expected = node_env.get("TORUS_EXEC_PIPELINE") == "1"
+    kills = []
+    for k in [1] + sorted(seqs):
+        raw = first if k == 1 else crash_record(os.path.join(out_dir, "crash-%d.json" % k))
+        scanned = raw is not None
+        if raw is None:
+            raw = crash_record(os.path.join(out_dir, "crash-kill-%d.json" % k)) or {}
+        e = {f: raw.get(f) for f in KILL_FIELDS}
+        e["kill_seq"] = e["kill_seq"] or k
+        fail = kill_checks(raw, e)
+        r = raw.get("restart") or {}
+        e.update({f: r.get(f) for f in SCAN_FIELDS})
+        if not scanned:
+            fail.append("no post-restart log scan (crash-%d.json missing)" % k)
+        elif flag_expected and not r.get("pipeline_enabled_line"):
+            fail.append("flush worker was NOT attached after the restart")
+        e["fail_reasons"] = fail
+        e["verdict"] = "FAIL" if fail else "PASS"
+        kills.append(e)
+    return kills
+
+
+crash_kills = crash_kill_list(OUT, CRASH_RAW, NODE_ENV)
+if crash is not None and crash_kills:
+    for e in crash_kills[1:]:
+        crash["fail_reasons"] += ["kill %s: %s" % (e["kill_seq"], f) for f in e["fail_reasons"]]
+    crash["verdict"] = "FAIL" if crash["fail_reasons"] else "PASS"
 
 # ---------------------------------------------------------------- dissemination / pacing
 # run-cell.sh passes "val0:manifest=N,exhausted=N,sync_fallback=N,da_outbound_fail=N,starvation=N,pacing=N val1:... val2:..."
@@ -1014,6 +1071,8 @@ summary = {
     "cpu": cpu,
     "bench_log_tail": bench_tail,
 }
+if crash_kills:
+    summary["crash_kills"] = crash_kills
 with open(os.path.join(OUT, "summary.json"), "w") as f:
     json.dump(summary, f, indent=1)
 h = summary["headline"]
@@ -1038,6 +1097,12 @@ if crash:
           f"(counters over {crash.get('counters_compared_nodes')}, "
           f"val{crash.get('kill_idx')} judged on digest/hash/root) "
           f"reasons={crash['fail_reasons'] or 'none'}")
+    for e in crash_kills or []:
+        print(f"CRASH kill {e['kill_seq']}: verdict={e['verdict']} at={e['kill_at_s']}s "
+              f"down={e['down_s']}s rewind={e['rewind_blocks']} blk "
+              f"(beyond_queue={e['rewind_beyond_exec_queue']}) "
+              f"panics={e['panic_or_failstop_lines']} errors={e['error_lines']} "
+              f"reasons={e['fail_reasons'] or 'none'}")
 p0 = phase.get("val0", {})
 if p0:
     print(f"PHASE val0: block_ms={p0['block_ms']} wall/committed(load)={p0['wall_ms_per_committed_block']} "

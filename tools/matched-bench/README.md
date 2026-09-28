@@ -413,6 +413,33 @@ Artifacts: `crash-kill.json` (record at kill time), `crash-restart-tail.log`
 (everything the node logged after the restart), `crash.json` (the merged input
 to summarize.py).
 
+**Multi-crash (s75).** `CRASH_KILL_AT_S` also takes a comma list — several
+rejoins in one cell instead of one per cell:
+
+```
+CRASH_KILL_AT_S=60,180,300,420,540 tools/matched-bench/run-cell.sh <wt> <label> 10 660
+tools/matched-bench/crash-freeze.py /home/18c/bench-results-matched/<label>
+```
+
+- Pre-flight: every offset passes the single-kill window rule, offsets strictly
+  increase, consecutive kills >= 90 s apart (`crash_kill_list_ok`).
+- Kills run sequentially, one `crash-kill.sh` invocation (and one
+  `crash_target_ok` check) per kill. A failed kill stops the sequence and fails
+  the cell. A kill that would land < 60 s after the previous restart (the
+  kill+restart overran) is SKIPPED with the rest — logged in run.log and
+  `crash-kill.skipped` (first skipped k); never back-to-back kills.
+- Kill 1 keeps the single-kill files; kill k>=2 writes `crash-kill-<k>.json`
+  (`kill_seq`: k), `crash-restart-tail-<k>.log`, `crash-<k>.json`. Each tail is
+  cut at the next kill's `log_bytes`, so `crash.json` then covers kill 1's
+  window only (a single-kill cell scans exactly as before).
+- `summary.json` gains `crash_kills` (per kill: `kill_seq`, `kill_ts`,
+  `restart_ts`, `down_s`, rewind fields, panic/hole/error counts, `verdict`,
+  `fail_reasons`); `headline.crash_gate` FAILs if ANY kill fails.
+- `crash-freeze.py` — per-kill chain freeze over `[kill_ts_k, kill_ts_{k+1})`
+  (last window to bench end): `down_s`, restart -> first new val0 commit, and the
+  longest val0 commit gap. Commit times come from `val0.log.gz` (µs), falling
+  back to the 1 Hz `sampler.csv` counter.
+
 ## Liveness and benchmark acceptance
 
 `AGREE` describes state consistency independently of performance acceptance.

@@ -2,8 +2,9 @@
 # crash-kill.sh — SIGKILL exactly ONE devnet validator mid-cell and restart it
 # from the same data dir. This is the crash gate for `TORUS_EXEC_PIPELINE`.
 #
-#   crash-kill.sh <worktree> <idx 1|2> <out-dir>
+#   crash-kill.sh <worktree> <idx 1|2> <out-dir> [record=crash-kill.json]
 #   CRASH_KILL_LIB=1 source crash-kill.sh      # functions only (unit tests)
+#   (multi-crash: run-cell.sh runs this once per kill; kill k>=2 -> crash-kill-<k>.json)
 #
 # Why: with the flush worker attached, block N's state batch + applied-height
 # marker are written by W while E already runs N+1. The applied-height marker is
@@ -11,7 +12,8 @@
 # were committed-but-unexecuted anyway, plus the depth-1 hand-off, and the
 # restarted node must converge byte-identically with the two survivors.
 #
-# What it records (crash-kill.json in <out-dir>): the target's counters right
+# What it records (crash-kill.json in <out-dir>, or the given record name, with
+# "kill_seq" = k parsed from it): the target's counters right
 # before the kill (block height, exec queue depth, flush-worker depth), the byte
 # offset of its log at that moment (so run-cell.sh scans only the post-restart
 # tail), and the restart. summarize.py turns run-cell.sh's merged crash.json into
@@ -86,6 +88,53 @@ crash_kill_at_ok() {
     [ "$dur" -ge 40 ] || return 1
     [ "$at" -le $(( dur - 30 )) ] || return 1
     return 0
+}
+
+# s75 multi-crash: CRASH_KILL_AT_S may be a comma list ("60,180,300,420,540").
+# A rejoin takes up to ~40 s (s74 freezes: 35 s), so kills closer than this
+# would land inside the previous kill's freeze and measure it twice.
+CRASH_KILL_MIN_GAP_S=90
+# Run-time floor (run-cell.sh): if kill k-1's kill+restart overran so that
+# fewer than this many seconds separate its restart from kill k, the remaining
+# kills are SKIPPED — never kill back-to-back.
+CRASH_KILL_MIN_UP_S=60
+
+# crash_kill_list_ok <at[,at...]> <dur_s> — every offset passes crash_kill_at_ok,
+# offsets strictly increase, and consecutive ones sit >= CRASH_KILL_MIN_GAP_S
+# apart. A single integer is exactly crash_kill_at_ok.
+crash_kill_list_ok() {
+    local list=${1-} dur=${2-} at prev=""
+    case "$list" in ''|,*|*,|*,,*|*[!0-9,]*) return 1 ;; esac
+    for at in ${list//,/ }; do
+        crash_kill_at_ok "$at" "$dur" || return 1
+        if [ -n "$prev" ]; then
+            [ "$at" -gt "$prev" ] || return 1
+            [ $(( 10#$at - 10#$prev )) -ge "$CRASH_KILL_MIN_GAP_S" ] || return 1
+        fi
+        prev=$at
+    done
+    return 0
+}
+
+# crash_seq_name <stem> <k> <ext> — per-kill artifact names. Kill 1 keeps the
+# single-kill names (crash-kill.json, crash.json, crash-restart-tail.log) so
+# summarize.py's crash gate and older analysis scripts read it unchanged; kill
+# k>=2 gets <stem>-<k>.<ext>.
+crash_seq_name() {
+    if [ "$2" = 1 ]; then printf '%s.%s\n' "$1" "$3"; else printf '%s-%s.%s\n' "$1" "$2" "$3"; fi
+}
+
+# crash_record_seq <record-name> — the kill_seq a record name stands for
+# (crash-kill.json -> 1, crash-kill-<k>.json -> k); anything else is refused.
+crash_record_seq() {
+    case "${1-}" in
+        crash-kill.json) echo 1 ;;
+        crash-kill-*.json)
+            local k=${1#crash-kill-}; k=${k%.json}
+            case "$k" in ''|*[!0-9]*) return 1 ;; esac
+            echo "$k" ;;
+        *) return 1 ;;
+    esac
 }
 
 # crash_replace_pid_line <pids_file> <idx> <new_pid> — REPLACE, never append:
@@ -177,10 +226,12 @@ PY
     exit $?
 fi
 
-[ $# -ge 3 ] || { sed -n '2,6p' "$0" >&2; exit 2; }
+[ $# -ge 3 ] || { sed -n '2,7p' "$0" >&2; exit 2; }
 WT=$(cd "$1" && pwd) || exit 2
 IDX=$2
 OUT=$3
+REC=${4:-crash-kill.json}
+SEQ=$(crash_record_seq "$REC") || { echo "crash-kill: bad record name '$REC' (crash-kill.json or crash-kill-<k>.json)" >&2; exit 2; }
 KILL_WAIT=${KILL_WAIT:-15}
 
 # shellcheck source=/dev/null
@@ -225,10 +276,10 @@ crash_replace_pid_line "$PIDSF" "$IDX" "$STARTED_PID" || {
 DOWN=$(awk -v a="$T_KILL" -v b="$T_UP" 'BEGIN{printf "%.2f", b-a}')
 echo "crash-kill: val$IDX back as pid=$STARTED_PID after ${DOWN}s"
 
-python3 - "$OUT/crash-kill.json" <<PY
+python3 - "$OUT/$REC" <<PY
 import json, sys
 json.dump({
- "enabled": True,
+ "enabled": True, "kill_seq": $SEQ,
  "kill_node": "val$IDX", "kill_idx": $IDX,
  "killed_pid": $PID, "restarted_pid": $STARTED_PID,
  "kill_ts": float("$T_KILL"), "restart_ts": float("$T_UP"), "down_s": float("$DOWN"),
