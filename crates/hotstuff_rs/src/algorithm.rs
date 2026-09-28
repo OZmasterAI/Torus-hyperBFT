@@ -240,6 +240,15 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
             // only its ordering versus retry maintenance and receive budget differ.
             self.poll_progress_and_retry(view_info.clone(), body_before_expiry);
 
+            // 7b. s74 fix C: a current-view header parked for an unknown
+            // justify block votes once any step above has inserted that block.
+            if let Err(e) = self
+                .hotstuff
+                .redispatch_parked_header(&mut self.block_tree, &mut self.app)
+            {
+                log::error!("HotStuff redispatch_parked_header error: {:?}", e);
+            }
+
             // 8. Let the block sync client update its internal state, and trigger sync if needed.
             if let Err(e) = self.block_sync_client.tick(&mut self.block_tree) {
                 log::error!("BlockSync tick error: {:?} — continuing", e);

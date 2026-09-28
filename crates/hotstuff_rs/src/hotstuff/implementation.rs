@@ -100,6 +100,11 @@ pub(crate) struct HotStuff<N: Network> {
     /// s74: the header (and its authenticated origin) that requested a skip;
     /// re-dispatched by the algorithm loop after entering its view.
     view_skip: Option<(ProposalHeader, VerifyingKey)>,
+    /// s74 fix C: a current-view header dropped only because its justify
+    /// block is unknown (proposed while this replica was down); re-evaluated
+    /// by [`redispatch_parked_header`](Self::redispatch_parked_header) once
+    /// that block is inserted while still in the view.
+    parked_header: Option<(ProposalHeader, VerifyingKey)>,
     /// Hybrid pipelining: full blocks stored locally by the proposer after broadcasting header.
     pending_bodies: PendingBodies,
     /// Hybrid pipelining: headers received but body not yet fetched. Maps block_hash → header.
@@ -211,6 +216,7 @@ impl<N: Network> HotStuff<N> {
             sync_needed: false,
             round_skip: round_skip_from_env(),
             view_skip: None,
+            parked_header: None,
             pending_bodies: PendingBodies::new(),
             pending_headers: PendingHeaders::new(),
             body_fetch_tracker: std::collections::HashMap::new(),
@@ -255,6 +261,31 @@ impl<N: Network> HotStuff<N> {
     /// pacemaker to skip to its view. Taken once.
     pub(crate) fn take_view_skip(&mut self) -> Option<(ProposalHeader, VerifyingKey)> {
         self.view_skip.take()
+    }
+
+    /// s74 fix C: re-evaluate a parked current-view header once its justify
+    /// block is in the tree (any insert path: by-hash fetch, body, sync). The
+    /// header re-runs every check; it is discarded when the view moves on.
+    pub(crate) fn redispatch_parked_header<K: KVStore>(
+        &mut self,
+        block_tree: &mut BlockTreeSingleton<K>,
+        app: &mut impl App<K>,
+    ) -> Result<(), HotStuffError> {
+        let Some((header, _)) = &self.parked_header else { return Ok(()) };
+        if header.view != self.view_info.view {
+            self.parked_header = None;
+            return Ok(());
+        }
+        if !block_tree.contains(&header.justify.block) {
+            return Ok(());
+        }
+        let (header, origin) = self.parked_header.take().expect("checked above");
+        log::info!(
+            "re-dispatching parked header: view={} justify_block_prefix={} now known",
+            header.view.int(),
+            crate::logging::block_prefix(&header.justify.block),
+        );
+        self.on_receive_msg(header.into(), &origin, block_tree, app)
     }
 
     /// s72 fix D: a parent-body insert skipped the app feed and
@@ -2111,6 +2142,9 @@ impl<N: Network> HotStuff<N> {
                 // rotates across the committed validators (a superset of the QC's
                 // signers, which by definition hold the block).
                 self.request_justify_block(header.justify.block, header.justify.view, origin);
+                if justify_correct && header_is_current {
+                    self.parked_header = Some((header.clone(), *origin));
+                }
             }
             if header_is_current {
                 match self.proposal_status {
@@ -3614,6 +3648,102 @@ mod sync_recovery_tests {
         for value in ["0", " 0 "] {
             assert!(!parse_round_skip(Some(value.into())), "{value:?}");
         }
+    }
+
+    /// s74 fix C: leader(`view`)'s current-view header whose justify is a
+    /// QC on a block this replica never obtained (proposed while it was
+    /// down). `signers` sets how many keys sign the QC.
+    struct ParkCase {
+        hotstuff: HotStuff<crate::hotstuff::header_fast_path_regression_test::NullNetwork>,
+        tree: BlockTreeSingleton<MemKV>,
+        origin: VerifyingKey,
+        header: ProposalHeader,
+        justify_block: Block,
+        events: std::sync::mpsc::Receiver<Event>,
+    }
+
+    fn park_case(signers: usize) -> ParkCase {
+        use crate::hotstuff::header_fast_path_regression_test::proposer_for;
+        let keys = signing_keys(&[1, 2, 3, 4]);
+        let set = validator_set(&keys);
+        let (tree, vss) = steady_block_tree(&set);
+        let view = ViewNumber::new(3);
+        let origin = proposer_for(view, &keys, &vss, &tree);
+        let local = keys.iter().find(|key| key.verifying_key() != origin).unwrap().clone();
+        let mut hotstuff = hotstuff_at(view, local, vss);
+        let (tx, events) = std::sync::mpsc::channel();
+        hotstuff.event_publisher = Some(tx);
+        let justify_block = Block::new(BlockHeight::new(0), PhaseCertificate::genesis_pc(),
+            CryptoHash::new([94; 32]), Data::new(vec![]));
+        let block = Block::new(BlockHeight::new(1),
+            generic_pc(ViewNumber::new(2), justify_block.hash, &keys[..signers], &set),
+            CryptoHash::new([95; 32]), Data::new(vec![]));
+        let header = recovery_header(&block, view);
+        ParkCase { hotstuff, tree, origin, header, justify_block, events }
+    }
+
+    impl ParkCase {
+        fn receive(&mut self) {
+            let mut app = RecoveryApp { calls: 0, valid: true, reject_below: 0 };
+            self.hotstuff.on_receive_msg(self.header.clone().into(), &self.origin,
+                &mut self.tree, &mut app).unwrap();
+        }
+        fn redispatch(&mut self) {
+            let mut app = RecoveryApp { calls: 0, valid: true, reject_below: 0 };
+            self.hotstuff.redispatch_parked_header(&mut self.tree, &mut app).unwrap();
+        }
+        fn phase_votes(&self) -> Vec<PhaseVote> {
+            self.events.try_iter().filter_map(|event| match event {
+                Event::PhaseVote(event) => Some(event.vote), _ => None,
+            }).collect()
+        }
+    }
+
+    /// s74 bb-serial-r1 view 424: the header was dropped for an unknown
+    /// justify block, the block arrived 10 ms later, and the header was never
+    /// re-evaluated (38 s freeze). Now it is parked and votes once the block
+    /// is in the tree.
+    #[test]
+    fn parked_header_votes_once_its_justify_block_arrives() {
+        let mut c = park_case(4);
+        c.receive();
+        assert_eq!(c.tree.highest_view_voted().unwrap(), None, "dropped: justify block unknown");
+        assert!(c.hotstuff.justify_fetch_tracker.contains_key(&c.justify_block.hash));
+
+        c.redispatch();
+        assert!(c.phase_votes().is_empty(), "block still missing: stays parked, no vote");
+
+        c.tree.insert(&c.justify_block, None, None).unwrap();
+        c.redispatch();
+        assert_eq!(c.tree.last_voted_proposal().unwrap(),
+            Some((c.header.view, c.header.block_hash)));
+        c.redispatch();
+        assert_eq!(c.phase_votes().len(), 1, "re-dispatched once, votes once");
+    }
+
+    #[test]
+    fn parked_header_is_dropped_when_the_view_moves_on() {
+        let mut c = park_case(4);
+        c.receive();
+        c.hotstuff.view_info = ViewInfo::new(ViewNumber::new(4), Instant::now() + Duration::from_secs(60));
+        c.tree.insert(&c.justify_block, None, None).unwrap();
+        c.redispatch();
+        assert!(c.hotstuff.parked_header.is_none(), "discarded once the view moved on");
+        assert_eq!(c.tree.highest_view_voted().unwrap(), None);
+        assert!(c.phase_votes().is_empty());
+    }
+
+    /// Only an unknown justify block parks a header: an incorrect QC (too few
+    /// signatures) is dropped for good even once its block is known.
+    #[test]
+    fn header_with_incorrect_justify_is_not_parked() {
+        let mut c = park_case(1);
+        c.receive();
+        assert!(c.hotstuff.parked_header.is_none(), "incorrect justify: nothing parked");
+        c.tree.insert(&c.justify_block, None, None).unwrap();
+        c.redispatch();
+        assert_eq!(c.tree.highest_view_voted().unwrap(), None);
+        assert!(c.phase_votes().is_empty());
     }
 
     #[test]
