@@ -263,16 +263,25 @@ impl<N: Network> HotStuff<N> {
         self.view_skip.take()
     }
 
+    /// s74 fix C: a header is parked; the algorithm loop keeps its receive
+    /// wait short so the re-check is not left until the view deadline.
+    pub(crate) fn has_parked_header(&self) -> bool {
+        self.parked_header.is_some()
+    }
+
     /// s74 fix C: re-evaluate a parked current-view header once its justify
     /// block is in the tree (any insert path: by-hash fetch, body, sync). The
-    /// header re-runs every check; it is discarded when the view moves on.
+    /// header re-runs every check; it is discarded when the view moves on or
+    /// this replica already voted in it (e.g. through a retransmitted copy).
     pub(crate) fn redispatch_parked_header<K: KVStore>(
         &mut self,
         block_tree: &mut BlockTreeSingleton<K>,
         app: &mut impl App<K>,
     ) -> Result<(), HotStuffError> {
         let Some((header, _)) = &self.parked_header else { return Ok(()) };
-        if header.view != self.view_info.view {
+        if header.view != self.view_info.view
+            || block_tree.highest_view_voted()?.is_some_and(|voted| voted >= header.view)
+        {
             self.parked_header = None;
             return Ok(());
         }
@@ -3709,6 +3718,7 @@ mod sync_recovery_tests {
         c.receive();
         assert_eq!(c.tree.highest_view_voted().unwrap(), None, "dropped: justify block unknown");
         assert!(c.hotstuff.justify_fetch_tracker.contains_key(&c.justify_block.hash));
+        assert!(c.hotstuff.parked_header.is_some());
 
         c.redispatch();
         assert!(c.phase_votes().is_empty(), "block still missing: stays parked, no vote");
@@ -3717,8 +3727,28 @@ mod sync_recovery_tests {
         c.redispatch();
         assert_eq!(c.tree.last_voted_proposal().unwrap(),
             Some((c.header.view, c.header.block_hash)));
+        assert_eq!(c.tree.highest_pc().unwrap().view, ViewNumber::new(2),
+            "the justify QC went through the lock update before the vote");
         c.redispatch();
         assert_eq!(c.phase_votes().len(), 1, "re-dispatched once, votes once");
+    }
+
+    /// A retransmitted copy that votes once the block is known makes the
+    /// parked copy redundant: it is discarded, not re-dispatched (which would
+    /// re-arm the body fetch and push back its deadline).
+    #[test]
+    fn parked_header_is_discarded_once_the_view_is_voted() {
+        let mut c = park_case(4);
+        c.receive();
+        c.tree.insert(&c.justify_block, None, None).unwrap();
+        c.receive();
+        assert_eq!(c.phase_votes().len(), 1, "the retransmission votes");
+        c.redispatch();
+        assert!(c.hotstuff.parked_header.is_none());
+        let redispatched = c.events.try_iter()
+            .filter(|event| matches!(event, Event::ReceiveProposalHeader(_)))
+            .count();
+        assert_eq!(redispatched, 0, "no second pass through the header path");
     }
 
     #[test]

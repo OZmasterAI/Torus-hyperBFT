@@ -306,6 +306,7 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
             || self.hotstuff.has_pending_justify_fetches()
             || self.hotstuff.has_deferred_sync_retries()
             || self.hotstuff.has_missing_data_retries()
+            || self.hotstuff.has_parked_header()
         {
             std::cmp::min(
                 view_info.deadline,

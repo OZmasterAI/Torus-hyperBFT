@@ -57,15 +57,19 @@ fn leader(view: ViewNumber, f: &Fixture) -> VerifyingKey {
 /// `LOCAL_VIEW`, and a safe header (genesis justify) from leader(w) for the
 /// first view w >= LOCAL_VIEW + 2 that keys[0] does not lead.
 fn rejoin(round_skip: bool) -> Rejoin {
+    rejoin_at(LOCAL_VIEW, round_skip)
+}
+
+fn rejoin_at(local_view: u64, round_skip: bool) -> Rejoin {
     let keys = signing_keys(&[1, 2, 3, 4]);
     let (_, vss) = steady_block_tree(&validator_set(&keys));
     let mut f = fixture();
     let me = keys[0].verifying_key();
-    let future = (LOCAL_VIEW + 2..)
+    let future = (local_view + 2..)
         .map(ViewNumber::new)
         .find(|view| leader(*view, &f) != me)
         .unwrap();
-    let local = ViewNumber::new(LOCAL_VIEW);
+    let local = ViewNumber::new(local_view);
     f.algorithm.pacemaker = Pacemaker::new(
         PacemakerConfiguration {
             chain_id: ChainID::new(0),
@@ -162,4 +166,44 @@ fn round_skip_off_keeps_view_and_withholds_vote() {
     assert_eq!(r.view(), ViewNumber::new(LOCAL_VIEW));
     assert!(r.votes().is_empty());
     assert_eq!(r.f.algorithm.block_tree.highest_view_voted().unwrap(), None);
+}
+
+/// s74 fix C (review finding 1): once the justify block of a parked header has
+/// arrived through a path other than the receive (sync, block-data channel,
+/// retry tick), the receive must not wait out the view deadline before the
+/// loop re-checks the header: that wait is the freeze fix C removes.
+#[test]
+fn parked_header_keeps_the_receive_wait_short() {
+    use crate::hotstuff::header_fast_path_regression_test::generic_pc;
+    let keys = signing_keys(&[1, 2, 3, 4]);
+    let set = validator_set(&keys);
+    let me = keys[0].verifying_key();
+    let probe = fixture();
+    let view = (LOCAL_VIEW..)
+        .map(ViewNumber::new)
+        .find(|view| leader(*view, &probe) != me)
+        .unwrap();
+    let mut r = rejoin_at(view.int(), false);
+    let origin = leader(view, &r.f);
+    let justify_block = body(94);
+    let block = Block::new(
+        BlockHeight::new(1),
+        generic_pc(ViewNumber::new(view.int() - 1), justify_block.hash, &keys, &set),
+        CryptoHash::new([95; 32]),
+        Data::new(vec![]),
+    );
+    r.deliver(origin, header_for(&block, view));
+    assert!(r.votes().is_empty(), "parked: justify block unknown");
+    r.f.algorithm.block_tree.insert(&justify_block, None, None).unwrap();
+
+    // The justify block arrived through sync, which has ended.
+    r.f.algorithm.block_sync_client.finish_pending_sync();
+    let started = Instant::now();
+    let view_info = ViewInfo::new(view, Instant::now() + Duration::from_secs(2));
+    r.f.algorithm.poll_progress_and_retry(view_info, false);
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "receive waited {:?} with a header parked",
+        started.elapsed()
+    );
 }
