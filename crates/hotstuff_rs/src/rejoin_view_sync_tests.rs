@@ -1,14 +1,14 @@
 //! s74 rejoin view sync (round-skip), end to end through the algorithm loop: a
 //! replica that restarted behind the survivors receives leader(w)'s header for
 //! a future view w, enters w through the pacemaker and votes exactly once.
-use super::body_before_expiry_tests::{fixture, Fixture};
+use super::body_before_expiry_tests::{fixture, new_algorithm, Fixture};
 use super::*;
 use crate::events::Event;
 use crate::hotstuff::header_fast_path_regression_test::{
     hotstuff_at_with_events, proposer_for, signing_keys, steady_block_tree, validator_set,
     NullNetwork,
 };
-use crate::hotstuff::messages::{PhaseVote, ProposalHeader};
+use crate::hotstuff::messages::{NewView, PhaseVote, ProposalHeader};
 use crate::hotstuff::types::PhaseCertificate;
 use crate::types::block::Block;
 use crate::types::crypto_primitives::Keypair;
@@ -205,5 +205,86 @@ fn parked_header_keeps_the_receive_wait_short() {
         started.elapsed() < Duration::from_millis(500),
         "receive waited {:?} with a header parked",
         started.elapsed()
+    );
+}
+
+/// s75 fix A: the rejoiner leads the survivors' view w (they entered it by
+/// timeout, so no header exists). Their NewViews for w - 1 reach it after
+/// reconnect; it skips to w and proposes there once.
+#[test]
+fn rejoining_leader_skips_to_its_view_on_new_views_and_proposes() {
+    let keys = signing_keys(&[1, 2, 3, 4]);
+    let me = keys[0].verifying_key();
+    let probe = fixture();
+    let w = (LOCAL_VIEW + 2..)
+        .map(ViewNumber::new)
+        .find(|view| leader(*view, &probe) == me)
+        .unwrap();
+    let mut r = rejoin(true);
+    r.f.algorithm.app.produce = true;
+    for key in &keys[1..3] {
+        let new_view = NewView {
+            chain_id: ChainID::new(0),
+            view: ViewNumber::new(w.int() - 1),
+            highest_pc: PhaseCertificate::genesis_pc(),
+        };
+        r.f.messages
+            .send((key.verifying_key(), ProgressMessage::HotStuffMessage(new_view.into())))
+            .unwrap();
+        r.poll();
+    }
+    assert_eq!(r.view(), w, "the pacemaker entered the view this replica leads");
+    assert!(!r.f.algorithm.hotstuff.is_view_outdated(r.f.algorithm.pacemaker.query()));
+    assert_eq!(r.f.algorithm.block_tree.highest_view_entered().unwrap(), w);
+    let proposals = r.events.try_iter()
+        .filter(|event| matches!(event, Event::Propose(p) if p.proposal.view == w))
+        .count();
+    assert_eq!(proposals, 1, "proposed once in w");
+}
+
+#[test]
+fn leader_skip_off_keeps_view() {
+    let keys = signing_keys(&[1, 2, 3, 4]);
+    let me = keys[0].verifying_key();
+    let probe = fixture();
+    let w = (LOCAL_VIEW + 2..)
+        .map(ViewNumber::new)
+        .find(|view| leader(*view, &probe) == me)
+        .unwrap();
+    let mut r = rejoin(false);
+    for key in &keys[1..4] {
+        let new_view = NewView {
+            chain_id: ChainID::new(0),
+            view: ViewNumber::new(w.int() - 1),
+            highest_pc: PhaseCertificate::genesis_pc(),
+        };
+        r.f.messages
+            .send((key.verifying_key(), ProgressMessage::HotStuffMessage(new_view.into())))
+            .unwrap();
+        r.poll();
+    }
+    assert_eq!(r.view(), ViewNumber::new(LOCAL_VIEW));
+}
+
+/// s75 fix A (boot): a restarted replica runs the ordinary enter_view for
+/// its init view on the first loop pass (so it proposes there if it leads
+/// it, and sends the NewView for init - 1). A fresh chain is unchanged.
+#[test]
+fn restarted_replica_enters_its_init_view_on_the_first_pass() {
+    let set = validator_set(&signing_keys(&[1, 2, 3, 4]));
+    let (mut tree, _) = steady_block_tree(&set);
+    tree.set_highest_view_entered(ViewNumber::new(5)).unwrap();
+    let (algorithm, _, _) = new_algorithm(tree);
+    assert_eq!(algorithm.pacemaker.query().view, ViewNumber::new(6));
+    assert!(
+        algorithm.hotstuff.is_view_outdated(algorithm.pacemaker.query()),
+        "the first loop pass runs enter_view(6)"
+    );
+
+    let (tree, _) = steady_block_tree(&set);
+    let (algorithm, _, _) = new_algorithm(tree);
+    assert!(
+        !algorithm.hotstuff.is_view_outdated(algorithm.pacemaker.query()),
+        "fresh chain (init view 0) unchanged"
     );
 }

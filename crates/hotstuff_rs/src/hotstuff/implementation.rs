@@ -105,6 +105,12 @@ pub(crate) struct HotStuff<N: Network> {
     /// by [`redispatch_parked_header`](Self::redispatch_parked_header) once
     /// that block is inserted while still in the view.
     parked_header: Option<(ProposalHeader, VerifyingKey)>,
+    /// s75 fix A (leader sync): validators whose NewView said they entered a
+    /// view this replica leads but has not reached, per view (above ours).
+    leader_skip_senders: std::collections::HashMap<ViewNumber, HashSet<VerifyingKey>>,
+    /// s75 fix A: the view those senders' power (> f) asks this replica to
+    /// skip to; taken by the algorithm loop.
+    leader_skip: Option<ViewNumber>,
     /// Hybrid pipelining: full blocks stored locally by the proposer after broadcasting header.
     pending_bodies: PendingBodies,
     /// Hybrid pipelining: headers received but body not yet fetched. Maps block_hash → header.
@@ -217,6 +223,8 @@ impl<N: Network> HotStuff<N> {
             round_skip: round_skip_from_env(),
             view_skip: None,
             parked_header: None,
+            leader_skip_senders: std::collections::HashMap::new(),
+            leader_skip: None,
             pending_bodies: PendingBodies::new(),
             pending_headers: PendingHeaders::new(),
             body_fetch_tracker: std::collections::HashMap::new(),
@@ -261,6 +269,12 @@ impl<N: Network> HotStuff<N> {
     /// pacemaker to skip to its view. Taken once.
     pub(crate) fn take_view_skip(&mut self) -> Option<(ProposalHeader, VerifyingKey)> {
         self.view_skip.take()
+    }
+
+    /// s75 fix A: the view this replica leads that NewViews from more than f
+    /// power asked it to skip to. Taken once.
+    pub(crate) fn take_leader_skip(&mut self) -> Option<ViewNumber> {
+        self.leader_skip.take()
     }
 
     /// s74 fix C: a header is parked; the algorithm loop keeps its receive
@@ -1717,6 +1731,59 @@ impl<N: Network> HotStuff<N> {
             let _ = self
                 .phase_vote_collectors
                 .update_validator_sets(&validator_set_state);
+        }
+
+        // 4. s75 fix A (leader sync): the sender entered `w = view + 1`. A
+        //    replica that leads w but is behind (restarted below the
+        //    survivors' view) never proposes there, so the survivors wait out
+        //    w's timeout. NewViews from more than f power ask the pacemaker to
+        //    skip to w (forward only, same caps as round-skip); entering w
+        //    proposes on the highest PC applied in step 2.
+        //    For the NEXT view only when no proposal was seen in this one: a
+        //    live leader(w) still collecting this view's votes must not leave
+        //    on a follower's early NewView (it would lose this view's QC).
+        let w = ViewNumber::new(new_view.view.int() + 1);
+        let local = self.view_info.view.int();
+        let behind = w.int() > local
+            && w.int() - local <= crate::pacemaker::implementation::MAX_ROUND_SKIP_VIEWS
+            && (w.int() > local + 1
+                || matches!(self.proposal_status, ProposalStatus::WaitingForProposal));
+        if self.round_skip && behind {
+            let validator_set_state = block_tree.validator_set_state()?;
+            let reputation = block_tree.leader_reputation().ok();
+            let set = validator_set_state.committed_validator_set();
+            if set.power(origin).is_some()
+                && is_proposer_with_reputation(
+                    &self.config.keypair.public(),
+                    w,
+                    &validator_set_state,
+                    reputation.as_ref(),
+                )
+            {
+                let current = self.view_info.view;
+                self.leader_skip_senders.retain(|view, _| *view > current);
+                let senders = self.leader_skip_senders.entry(w).or_default();
+                senders.insert(*origin);
+                let power: u128 = senders
+                    .iter()
+                    .filter_map(|sender| set.power(sender))
+                    .map(|power| power.int() as u128)
+                    .sum();
+                let f = (set.total_power().int() as u128).saturating_sub(1) / 3;
+                if power > f {
+                    // The proposal carries our highest PC; the sender's was
+                    // applied in step 2 only if its block is known.
+                    log::info!(
+                        "leader-skip: NewViews for view {} (power {} > f {}); own highest_pc view {}, sender's {}",
+                        w.int(),
+                        power,
+                        f,
+                        block_tree.highest_pc()?.view.int(),
+                        new_view.highest_pc.view.int(),
+                    );
+                    self.leader_skip = Some(w);
+                }
+            }
         }
 
         Ok(())
@@ -3657,6 +3724,135 @@ mod sync_recovery_tests {
         for value in ["0", " 0 "] {
             assert!(!parse_round_skip(Some(value.into())), "{value:?}");
         }
+    }
+
+    /// s75 fix A: a replica at `local` that is (or, with `leader=false`, is
+    /// not) leader(w), w = local + 2, receives NewViews for w - 1 from the
+    /// survivors entering w by timeout.
+    struct LeadCase {
+        hotstuff: HotStuff<crate::hotstuff::header_fast_path_regression_test::NullNetwork>,
+        tree: BlockTreeSingleton<MemKV>,
+        others: Vec<VerifyingKey>,
+        w: ViewNumber,
+    }
+
+    fn lead_case(local: u64, leader: bool) -> LeadCase {
+        lead_case_ahead(local, 2, leader)
+    }
+
+    /// Like [`lead_case`] with w = local + `ahead`.
+    fn lead_case_ahead(local: u64, ahead: u64, leader: bool) -> LeadCase {
+        use crate::hotstuff::header_fast_path_regression_test::proposer_for;
+        let keys = signing_keys(&[1, 2, 3, 4]);
+        let set = validator_set(&keys);
+        let (tree, vss) = steady_block_tree(&set);
+        let w = ViewNumber::new(local + ahead);
+        let lead = proposer_for(w, &keys, &vss, &tree);
+        let me = keys.iter().find(|key| (key.verifying_key() == lead) == leader).unwrap().clone();
+        let others = keys.iter().map(|key| key.verifying_key())
+            .filter(|key| *key != me.verifying_key()).collect();
+        let mut hotstuff = hotstuff_at(ViewNumber::new(local), me, vss);
+        hotstuff.set_round_skip(true);
+        LeadCase { hotstuff, tree, others, w }
+    }
+
+    impl LeadCase {
+        fn new_view(&mut self, from: VerifyingKey, view: ViewNumber) {
+            let new_view = NewView {
+                chain_id: ChainID::new(0), view, highest_pc: PhaseCertificate::genesis_pc(),
+            };
+            let mut app = RecoveryApp { calls: 0, valid: true, reject_below: 0 };
+            self.hotstuff.on_receive_msg(HotStuffMessage::NewView(new_view), &from,
+                &mut self.tree, &mut app).unwrap();
+        }
+        fn prev(&self) -> ViewNumber {
+            ViewNumber::new(self.w.int() - 1)
+        }
+    }
+
+    /// s74 bb-serial-r1 v423 / rv-skip-r3 v570: the rejoiner led the
+    /// survivors' view and nobody proposed. Their NewViews say they entered w.
+    #[test]
+    fn new_views_above_f_power_request_a_leader_skip() {
+        let mut c = lead_case(1, true);
+        let (a, b, prev) = (c.others[0], c.others[1], c.prev());
+        c.new_view(a, prev);
+        assert_eq!(c.hotstuff.take_leader_skip(), None, "1 of 4 equal validators is not > f");
+        c.new_view(a, prev);
+        assert_eq!(c.hotstuff.take_leader_skip(), None, "a repeat from the same validator counts once");
+        c.new_view(b, prev);
+        assert_eq!(c.hotstuff.take_leader_skip(), Some(c.w));
+        assert_eq!(c.hotstuff.take_leader_skip(), None, "taken once");
+    }
+
+    #[test]
+    fn leader_skip_refused_when_not_leader_not_ahead_outsider_or_disabled() {
+        let mut c = lead_case(1, false);
+        for from in c.others.clone() {
+            let prev = c.prev();
+            c.new_view(from, prev);
+        }
+        assert_eq!(c.hotstuff.take_leader_skip(), None, "not leader(w)");
+
+        // Already in w (which it leads): nothing to skip to.
+        let mut c = lead_case(1, true);
+        c.hotstuff.view_info = ViewInfo::new(c.w, Instant::now() + Duration::from_secs(60));
+        for from in c.others.clone() {
+            let prev = c.prev();
+            c.new_view(from, prev);
+        }
+        assert_eq!(c.hotstuff.take_leader_skip(), None, "w is not ahead of the local view");
+
+        let mut c = lead_case(1, true);
+        let outsiders: Vec<_> = signing_keys(&[7, 8]).iter().map(|key| key.verifying_key()).collect();
+        let (prev, a) = (c.prev(), c.others[0]);
+        for from in outsiders {
+            c.new_view(from, prev);
+        }
+        c.new_view(a, prev);
+        assert_eq!(c.hotstuff.take_leader_skip(), None, "non-validators carry no power");
+
+        let mut c = lead_case(1, true);
+        c.hotstuff.set_round_skip(false);
+        for from in c.others.clone() {
+            let prev = c.prev();
+            c.new_view(from, prev);
+        }
+        assert_eq!(c.hotstuff.take_leader_skip(), None, "TORUS_ROUND_SKIP=0");
+    }
+
+    /// Review of fix A, finding 1: leader(v+1) still in v collecting v's votes
+    /// must not leave v on a follower's early NewView{v} (it would drop late
+    /// votes and lose QC(v)). A replica that saw no proposal in v (pattern A:
+    /// restarted at v while the survivors are in v+1) still skips.
+    #[test]
+    fn next_view_leader_skip_only_when_no_proposal_was_seen() {
+        let mut c = lead_case_ahead(5, 1, true);
+        let (a, b, prev) = (c.others[0], c.others[1], c.prev());
+        c.hotstuff.proposal_status = ProposalStatus::OneLeaderProposed { leader: a };
+        c.new_view(a, prev);
+        c.new_view(b, prev);
+        assert_eq!(c.hotstuff.take_leader_skip(), None, "proposal seen in v: stay and collect");
+
+        let mut c = lead_case_ahead(5, 1, true);
+        let (a, b, prev) = (c.others[0], c.others[1], c.prev());
+        c.new_view(a, prev);
+        c.new_view(b, prev);
+        assert_eq!(c.hotstuff.take_leader_skip(), Some(c.w), "no proposal seen in v");
+    }
+
+    /// Review of fix A, finding 3: no tally for views past the pacemaker's
+    /// skip cap (bounded memory; such a skip would be refused anyway).
+    #[test]
+    fn leader_skip_ignores_views_past_the_skip_cap() {
+        use crate::pacemaker::implementation::MAX_ROUND_SKIP_VIEWS;
+        let mut c = lead_case_ahead(5, MAX_ROUND_SKIP_VIEWS + 1, true);
+        for from in c.others.clone() {
+            let prev = c.prev();
+            c.new_view(from, prev);
+        }
+        assert_eq!(c.hotstuff.take_leader_skip(), None);
+        assert!(c.hotstuff.leader_skip_senders.is_empty());
     }
 
     /// s74 fix C: leader(`view`)'s current-view header whose justify is a
