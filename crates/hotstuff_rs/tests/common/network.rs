@@ -11,7 +11,7 @@ use std::{
 
 use ed25519_dalek::VerifyingKey;
 use hotstuff_rs::{
-    hotstuff::messages::HotStuffMessage,
+    hotstuff::messages::{BlockDataRequest, HotStuffMessage},
     networking::{
         messages::{Message, ProgressMessage},
         network::Network,
@@ -148,6 +148,13 @@ impl Network for NetworkStub {
             Err(TryRecvError::Empty) => None,
             Err(TryRecvError::Disconnected) => panic!(),
         }
+    }
+
+    /// Same route as the production `LibP2PNetwork`: a direct `HotStuffMessage::BlockDataRequest`.
+    /// The peer answers with a `BlockDataResponse` through `send`, so the body filter and
+    /// `body_delay` apply to the reply.
+    fn request_block_data(&mut self, peer: VerifyingKey, request: BlockDataRequest) {
+        self.send(peer, HotStuffMessage::BlockDataRequest(request).into());
     }
 }
 
