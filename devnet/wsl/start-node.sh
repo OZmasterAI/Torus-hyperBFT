@@ -21,6 +21,32 @@
 # launch-3val.sh appends, crash-kill.sh replaces the one line.
 
 # shellcheck disable=SC2154
+# node_cpus <idx> — this validator's CPU list from NODE_CPUS=a/b/c (taskset -c
+# syntax per node, e.g. 0-5/6-10/11-15); empty = unpinned (s75 item 5).
+node_cpus() {
+    [ -n "${NODE_CPUS-}" ] || return 0
+    local -a cpus
+    IFS=/ read -r -a cpus <<< "$NODE_CPUS"
+    printf '%s' "${cpus[$1]-}"
+}
+
+# cpu_list_ok <list> <ncpu> — taskset -c list (N or N-M items, comma-joined),
+# every CPU below ncpu and every range ascending.
+cpu_list_ok() {
+    local list=${1-} ncpu=${2-} item lo hi
+    [ -n "$list" ] || return 1
+    case "$list" in *,,*|,*|*,) return 1 ;; esac
+    local IFS=,
+    for item in $list; do
+        case "$item" in
+            *[!0-9-]*|-*|*-|*-*-*|'') return 1 ;;
+            *-*) lo=${item%-*}; hi=${item#*-} ;;
+            *) lo=$item; hi=$item ;;
+        esac
+        [ "$lo" -le "$hi" ] && [ "$hi" -lt "$ncpu" ] || return 1
+    done
+}
+
 node_var() { local v="$1$2"; printf '%s' "${!v-}"; }
 
 # val0 dials val1; val1 dials val0; val2 dials both. All edges use known ids.
@@ -35,7 +61,7 @@ node_peers() {
 
 start_node() {
     local idx=${1-} mode=${2:-truncate}
-    local key p2p rpc met peers dd log
+    local key p2p rpc met peers dd log cpus
     peers=$(node_peers "$idx") || { echo "start_node: bad validator index '$idx'" >&2; return 1; }
     key=$(node_var KEY "$idx"); p2p=$(node_var P2P "$idx")
     rpc=$(node_var RPC "$idx"); met=$(node_var MET "$idx")
@@ -45,8 +71,11 @@ start_node() {
     log="$RUN_DIR/val$idx.log"
     mkdir -p "$dd" "$RUN_DIR"
     [ "$mode" = append ] || : > "$log"
-    echo "starting val$idx  rpc=$rpc p2p=$p2p metrics=$met (log: $mode)"
-    nohup "$BIN" \
+    cpus=$(node_cpus "$idx")
+    echo "starting val$idx  rpc=$rpc p2p=$p2p metrics=$met (log: $mode)${cpus:+ cpus=$cpus}"
+    # NODE_CPUS pins the whole process from exec (every thread inherits it);
+    # taskset execs the node, so the pid and /proc cmdline stay the node's.
+    nohup ${cpus:+taskset -c "$cpus"} "$BIN" \
         --genesis="$GENESIS" \
         --data-dir="$dd" \
         --validator-key="$key" \

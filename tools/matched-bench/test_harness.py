@@ -1286,6 +1286,71 @@ class CrashScanTest(unittest.TestCase):
         self.assertEqual(j["gap"], 11)
 
 
+# ------------------------------------------------ s75 item 5: CPU pinning
+START_NODE_SH = os.path.join(
+    os.path.dirname(os.path.dirname(HERE)), "devnet", "wsl", "start-node.sh"
+)
+
+
+def start_node_fn(snippet, env=None):
+    """Run a snippet with devnet/wsl/start-node.sh sourced."""
+    return subprocess.run(
+        ["bash", "-c", 'source "$1"; shift; ' + snippet, "_", START_NODE_SH],
+        capture_output=True, text=True, timeout=30,
+        env=dict(os.environ, **(env or {})),
+    )
+
+
+class NodePinningTest(unittest.TestCase):
+    """NODE_CPUS=a/b/c pins each validator's WHOLE process (every thread,
+    from exec) through start_node, so the fresh launch and the crash-gate
+    restart are pinned identically; BENCH_CPUS pins the bench client."""
+
+    def test_node_cpus_picks_this_validators_list(self):
+        r = start_node_fn('node_cpus 1', {"NODE_CPUS": "0-5/6-10/11-15"})
+        self.assertEqual((r.returncode, r.stdout), (0, "6-10"))
+        r = start_node_fn('node_cpus 2', {"NODE_CPUS": "0-5/6-10/11-15"})
+        self.assertEqual(r.stdout, "11-15")
+        env = dict(os.environ)
+        env.pop("NODE_CPUS", None)
+        r = subprocess.run(
+            ["bash", "-c", 'source "$1"; node_cpus 0', "_", START_NODE_SH],
+            capture_output=True, text=True, timeout=30, env=env,
+        )
+        self.assertEqual((r.returncode, r.stdout), (0, ""), "unset = unpinned")
+
+    def test_cpu_list_ok_accepts_taskset_lists_inside_the_host(self):
+        for good in ("0-5", "6-10", "16,17", "3", "0-1,4"):
+            self.assertEqual(start_node_fn(f'cpu_list_ok "{good}" 18').returncode, 0, good)
+        for bad in ("", "18", "16-18", "5-3", "a", "1,,2", "-1", "0-"):
+            self.assertNotEqual(start_node_fn(f'cpu_list_ok "{bad}" 18').returncode, 0, bad)
+
+    def test_start_node_launches_under_the_nodes_cpu_list(self):
+        d = tempfile.mkdtemp(prefix="start-node-pin-")
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        fake = os.path.join(d, "fake-node")
+        with open(fake, "w") as f:
+            f.write("#!/bin/sh\nawk '/^Cpus_allowed_list/{print \"CPUS=\" $2}' /proc/self/status\n")
+        os.chmod(fake, 0o755)
+        env = {
+            "BIN": fake, "GENESIS": "g", "DATA_ROOT": d, "RUN_DIR": d,
+            "PEER_TO_V0": "p0", "PEER_TO_V1": "p1",
+            "KEY1": "k", "P2P1": "1", "RPC1": "2", "MET1": "3",
+        }
+        snippet = 'start_node 1 && wait "$STARTED_PID"; cat "$RUN_DIR/val1.log"'
+        r = start_node_fn(snippet, dict(env, NODE_CPUS="0/1/0"))
+        self.assertIn("CPUS=1\n", r.stdout, r.stdout + r.stderr)
+        r = start_node_fn(snippet, env)
+        allowed = open("/proc/self/status").read().split("Cpus_allowed_list:")[1].split()[0]
+        self.assertIn(f"CPUS={allowed}\n", r.stdout, "unset NODE_CPUS keeps today's affinity")
+
+    def test_run_cell_pins_the_bench_client_and_exports_node_cpus(self):
+        with open(RUN_CELL_SH) as f:
+            rc = f.read()
+        self.assertIn('BENCH_CMD=(taskset -c "$BENCH_CPUS")', rc)
+        self.assertIn("export NODE_CPUS", rc)
+
+
 if __name__ == "__main__":
     if not os.path.exists(DIGEST_SH):
         print("NOTE: %s missing — digest tests will fail" % DIGEST_SH)

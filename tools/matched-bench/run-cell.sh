@@ -77,6 +77,14 @@
 #                NEVER val0 (it serves the bench RPC and every headline number),
 #                and never anything outside this devnet — see the guard in
 #                crash-kill.sh.
+#   NODE_CPUS=a/b/c  pin each validator's WHOLE process (every thread, from
+#                exec) to CPU list a / b / c (taskset -c syntax per node, e.g.
+#                0-5/6-10/11-15). Applied by devnet/wsl/start-node.sh, so the
+#                crash-gate restart is pinned the same way. Unset = unpinned.
+#   BENCH_CPUS=list  pin the bench client (taskset -c list, e.g. 16-17).
+#                Both are validated against nproc before anything launches,
+#                logged in the "node env" line, and each node's resulting
+#                Cpus_allowed_list is logged once it is healthy (s75 item 5).
 #   HOTSTUFF_CPUS=a/b/c  pin each node's "hotstuff-algo" thread (the consensus
 #                thread, named by the node binary) to CPU list a / b / c (one
 #                CPU or a range per node, taskset syntax, e.g. 2/6/10 or
@@ -152,6 +160,8 @@ RPC_TIMEOUT=${RPC_TIMEOUT:-60}
 CRASH_KILL_AT_S=${CRASH_KILL_AT_S:-}
 KILL_NODE=${KILL_NODE:-val1}
 HOTSTUFF_CPUS=${HOTSTUFF_CPUS:-}
+NODE_CPUS=${NODE_CPUS:-}
+BENCH_CPUS=${BENCH_CPUS:-}
 SCHED_THREADS="hotstuff-algo torus-execution torus-flush-worker"
 OUT="$RESULTS_ROOT/$LABEL"
 
@@ -299,6 +309,23 @@ for t in jq curl python3 md5sum awk; do command -v $t >/dev/null || { echo "FATA
 [ -z "$MPS" ] || [[ "$MPS" =~ ^[0-9]+$ ]] || { echo "FATAL: MPS must be an integer" >&2; exit 2; }
 [ -x "$TOOLS_DIR/digest-node.sh" ] || { echo "FATAL: $TOOLS_DIR/digest-node.sh missing" >&2; exit 1; }
 
+# ---- CPU pinning pre-flight (s75 item 5): validated before anything launches.
+if [ -n "$NODE_CPUS$BENCH_CPUS" ]; then
+    command -v taskset >/dev/null || { echo "FATAL: NODE_CPUS/BENCH_CPUS set but taskset not found" >&2; exit 2; }
+    # shellcheck source=/dev/null
+    source "$WSL/start-node.sh"
+    NCPU=$(nproc)
+    if [ -n "$NODE_CPUS" ]; then
+        IFS=/ read -r -a _node_cpus <<< "$NODE_CPUS"
+        [ "${#_node_cpus[@]}" = 3 ] || { echo "FATAL: NODE_CPUS must be a/b/c (one CPU list per node), got '$NODE_CPUS'" >&2; exit 2; }
+        for _c in "${_node_cpus[@]}"; do
+            cpu_list_ok "$_c" "$NCPU" || { echo "FATAL: NODE_CPUS: bad CPU list '$_c' (taskset -c syntax, CPUs 0..$((NCPU-1)))" >&2; exit 2; }
+        done
+    fi
+    [ -z "$BENCH_CPUS" ] || cpu_list_ok "$BENCH_CPUS" "$NCPU" \
+        || { echo "FATAL: BENCH_CPUS: bad CPU list '$BENCH_CPUS' (taskset -c syntax, CPUs 0..$((NCPU-1)))" >&2; exit 2; }
+fi
+
 # ---- crash gate (bl3) pre-flight: validated HERE, before anything is launched,
 # so a bad kill window can never be discovered mid-cell.
 KILL_IDX=""
@@ -405,7 +432,10 @@ for kv in $EXTRA_ENV; do export "$kv"; done
 # alongside the node env so a pinned cell is recognisable from its summary.
 # Any TORUS_* var in EXTRA_ENV (e.g. TORUS_ROCKSDB_STATS=2) is already covered.
 [ -n "$HOTSTUFF_CPUS" ] && export HOTSTUFF_CPUS
-NODE_ENV_JSON=$(env | grep -E '^(TORUS_|HOTSTUFF_CPUS=)' | sort | python3 -c 'import sys,json;print(json.dumps(dict(l.rstrip("\n").split("=",1) for l in sys.stdin)))')
+# start-node.sh (launch AND crash restart) reads NODE_CPUS from the environment.
+[ -n "$NODE_CPUS" ] && export NODE_CPUS
+[ -n "$BENCH_CPUS" ] && export BENCH_CPUS
+NODE_ENV_JSON=$(env | grep -E '^(TORUS_|HOTSTUFF_CPUS=|NODE_CPUS=|BENCH_CPUS=)' | sort | python3 -c 'import sys,json;print(json.dumps(dict(l.rstrip("\n").split("=",1) for l in sys.stdin)))')
 log "node env: $NODE_ENV_JSON"
 T_LAUNCH=$(date +%s)
 CLEAN=1 "$WSL/launch-3val.sh" >>"$OUT/run.log" 2>&1 || die "launch-3val.sh failed"
@@ -440,6 +470,11 @@ done
 [ "$ok" = 1 ] || die "devnet not healthy after ${HEALTH_TIMEOUT}s"
 T_HEALTHY=$(date +%s)
 log "healthy after $((T_HEALTHY - T_LAUNCH))s"
+if [ -n "$NODE_CPUS" ]; then
+    for i in 0 1 2; do
+        log "val$i pid=${PIDS[$i]} Cpus_allowed_list=$(awk '/^Cpus_allowed_list/{print $2}' /proc/${PIDS[$i]}/status) (NODE_CPUS='$NODE_CPUS')"
+    done
+fi
 # ---- HOTSTUFF_CPUS: pin each node's consensus thread -----------------------
 if [ -n "$HOTSTUFF_CPUS" ]; then
     IFS=/ read -r -a HS_CPU <<< "$HOTSTUFF_CPUS"
@@ -514,7 +549,9 @@ sleep 3
 kill -0 "$SAMPLER_PID" 2>/dev/null || die "metrics sampler exited (see sampler.log)"
 
 # ---------------------------------------------------------------- 6. bench
-BENCH_CMD=("$BENCH" consensus --rpc-urls "${RPCS[0]}" --econ --senders "$SENDERS" --sender-offset 60 \
+BENCH_CMD=()
+[ -n "$BENCH_CPUS" ] && BENCH_CMD=(taskset -c "$BENCH_CPUS")
+BENCH_CMD+=("$BENCH" consensus --rpc-urls "${RPCS[0]}" --econ --senders "$SENDERS" --sender-offset 60 \
     --markets "$MARKETS" --batch-size "$BATCH" --submit-batch "$SUBMIT" --format bin --concurrency "$CONC" \
     --duration "$DUR" --target-margin 1500 --cross-fraction 0.5 --cancel-fraction 0.05 --band 5 --rate-total "$RATE")
 # LOCALITY shape (unset = flag omitted = uniform draw over 1..=MARKETS, i.e. the
