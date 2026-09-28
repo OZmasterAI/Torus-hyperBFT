@@ -1,0 +1,43 @@
+{
+  "prp": "s72-body-serve-thread",
+  "created": "2026-09-28T09:00:00",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Failing tests for block-data server and poller routing",
+      "status": "pending",
+      "files": [
+        "crates/hotstuff_rs/src/hotstuff/block_data_server.rs",
+        "crates/hotstuff_rs/src/networking/receiving.rs"
+      ],
+      "validate": "cargo test -p hotstuff_rs --lib block_data_server poller_routes",
+      "depends_on": []
+    },
+    {
+      "id": 2,
+      "name": "BlockDataServer and poller routing",
+      "status": "pending",
+      "files": [
+        "crates/hotstuff_rs/src/hotstuff/block_data_server.rs",
+        "crates/hotstuff_rs/src/networking/receiving.rs",
+        "crates/hotstuff_rs/src/hotstuff/mod.rs"
+      ],
+      "validate": "cargo test -p hotstuff_rs --lib block_data",
+      "depends_on": [
+        1
+      ]
+    },
+    {
+      "id": 3,
+      "name": "Replica wiring and shutdown",
+      "status": "pending",
+      "files": [
+        "crates/hotstuff_rs/src/replica.rs"
+      ],
+      "validate": "cargo test -p hotstuff_rs -- --test-threads=1",
+      "depends_on": [
+        2
+      ]
+    }
+  ]
+}

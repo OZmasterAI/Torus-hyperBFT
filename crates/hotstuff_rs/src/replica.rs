@@ -134,7 +134,10 @@ use crate::{
     },
     event_bus::*,
     events::*,
-    hotstuff::implementation::HotStuffConfiguration,
+    hotstuff::{
+        block_data_server::{body_serve_thread_from_env, BlockDataServer},
+        implementation::HotStuffConfiguration,
+    },
     networking::{network::Network, receiving::start_polling},
     pacemaker::implementation::PacemakerConfiguration,
     types::{
@@ -488,8 +491,32 @@ impl<K: KVStore, A: App<K> + 'static, N: Network + 'static> ReplicaSpec<K, A, N>
             self.configuration.into();
 
         let (poller_shutdown, poller_shutdown_receiver) = mpsc::channel();
-        let (poller, progress_msgs, block_sync_requests, block_sync_responses) =
-            start_polling(self.network.clone(), poller_shutdown_receiver);
+        let serve_off_thread = body_serve_thread_from_env();
+        let (
+            poller,
+            progress_msgs,
+            block_sync_requests,
+            block_sync_responses,
+            block_data_requests,
+            progress_fallback,
+        ) = start_polling(
+            self.network.clone(),
+            poller_shutdown_receiver,
+            serve_off_thread,
+        );
+        // s72 option 3: body requests are served on their own thread.
+        let block_data_server = serve_off_thread.then(|| {
+            let (shutdown, shutdown_receiver) = mpsc::channel();
+            let server = BlockDataServer::new(
+                chain_id,
+                BlockTreeCamera::new(self.kv_store.clone()),
+                block_data_requests,
+                progress_fallback,
+                self.network.clone(),
+                shutdown_receiver,
+            );
+            (server.start(), shutdown)
+        });
 
         let event_handlers = EventHandlers::new(
             log_events,
@@ -596,6 +623,7 @@ impl<K: KVStore, A: App<K> + 'static, N: Network + 'static> ReplicaSpec<K, A, N>
             algorithm_shutdown,
             block_sync_server: Some(block_sync_server),
             block_sync_server_shutdown,
+            block_data_server,
             block_sync_worker: Some(block_sync_worker),
             block_sync_worker_shutdown: worker_shutdown,
             event_bus,
@@ -614,6 +642,9 @@ pub struct Replica<K: KVStore> {
     algorithm_shutdown: Sender<()>,
     block_sync_server: Option<JoinHandle<()>>,
     block_sync_server_shutdown: Sender<()>,
+    /// s72 option 3 (`TORUS_BODY_SERVE_THREAD=1`): the block-data server and
+    /// its shutdown signal.
+    block_data_server: Option<(JoinHandle<()>, Sender<()>)>,
     block_sync_worker: Option<JoinHandle<()>>,
     block_sync_worker_shutdown: Sender<()>,
     event_bus: Option<JoinHandle<()>>,
@@ -664,6 +695,12 @@ impl<K: KVStore> Drop for Replica<K> {
 
         self.block_sync_server_shutdown.send(()).unwrap();
         self.block_sync_server.take().unwrap().join().unwrap();
+
+        // Also fed by the poller, so it stops before it.
+        if let Some((server, shutdown)) = self.block_data_server.take() {
+            let _ = shutdown.send(());
+            server.join().unwrap();
+        }
 
         self.poller_shutdown.send(()).unwrap();
         self.poller.take().unwrap().join().unwrap();
