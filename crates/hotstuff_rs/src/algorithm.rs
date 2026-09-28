@@ -19,7 +19,10 @@ use crate::{
     block_sync::client::{BlockSyncClient, BlockSyncClientConfiguration},
     block_tree::{accessors::internal::BlockTreeSingleton, pluggables::KVStore},
     events::*,
-    hotstuff::implementation::{HotStuff, HotStuffConfiguration},
+    hotstuff::{
+        implementation::{HotStuff, HotStuffConfiguration},
+        messages::ProposalHeader,
+    },
     networking::{
         messages::ProgressMessage,
         network::{Network, ValidatorSetUpdateHandle},
@@ -328,6 +331,9 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
                             log::error!("BlockSync trigger_sync error: {:?}", e);
                         }
                     }
+                    if let Some((header, origin)) = self.hotstuff.take_view_skip() {
+                        self.skip_to_header_view(header, origin);
+                    }
                 }
                 ProgressMessage::PacemakerMessage(msg) => {
                     if let Err(e) =
@@ -361,6 +367,55 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
 
         if body_before_expiry {
             self.tick_body_retries();
+        }
+    }
+
+    /// s74 rejoin view sync (round-skip): HotStuff checked leader(w)'s header
+    /// for a future view w. Move the pacemaker (which owns the view) to w,
+    /// let HotStuff enter it, then re-dispatch the header so it votes through
+    /// the ordinary current-view path (once: `highest_view_voted` guards it).
+    fn skip_to_header_view(&mut self, header: ProposalHeader, origin: VerifyingKey) {
+        let view = header.view;
+        let frontier = (|| {
+            Ok::<_, crate::block_tree::accessors::internal::BlockTreeError>((
+                self.block_tree.validator_set_state()?,
+                self.block_tree.highest_pc()?.view,
+                self.block_tree.committed_qc_view()?,
+            ))
+        })();
+        let (validator_set_state, highest_qc_view, committed_view) = match frontier {
+            Ok(frontier) => frontier,
+            Err(e) => {
+                log::error!("round-skip to view {}: block tree read failed: {:?}", view.int(), e);
+                return;
+            }
+        };
+        let from = self.pacemaker.query().view;
+        match self.pacemaker.skip_to_view(view, &validator_set_state, highest_qc_view, committed_view) {
+            Ok(true) => log::info!(
+                "round-skip: entered view {} from {} on leader header {}",
+                view.int(),
+                from.int(),
+                crate::logging::block_prefix(&header.block_hash),
+            ),
+            Ok(false) => return,
+            Err(e) => {
+                log::error!("round-skip to view {}: pacemaker error: {:?}", view.int(), e);
+                return;
+            }
+        }
+        let view_info = self.pacemaker.query().clone();
+        if let Err(e) = self.hotstuff.enter_view(view_info, &mut self.block_tree, &mut self.app) {
+            // The loop retries enter_view (is_view_outdated); the receive
+            // buffer still holds this header for view w.
+            log::error!("round-skip: HotStuff enter_view({}) error: {:?}", view.int(), e);
+            return;
+        }
+        if let Err(e) =
+            self.hotstuff
+                .on_receive_msg(header.into(), &origin, &mut self.block_tree, &mut self.app)
+        {
+            log::error!("round-skip: header re-dispatch (view {}) error: {:?}", view.int(), e);
         }
     }
 
@@ -406,3 +461,7 @@ fn body_before_expiry_enabled(value: Option<&str>) -> bool {
 #[cfg(test)]
 #[path = "body_before_expiry_tests.rs"]
 mod body_before_expiry_tests;
+
+#[cfg(test)]
+#[path = "rejoin_view_sync_tests.rs"]
+mod rejoin_view_sync_tests;

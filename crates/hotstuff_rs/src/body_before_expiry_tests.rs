@@ -16,7 +16,7 @@ use crate::types::crypto_primitives::Keypair;
 use crate::types::data_types::{BlockHeight, CryptoHash, Data, EpochLength};
 use std::sync::mpsc;
 
-struct CountingApp {
+pub(super) struct CountingApp {
     calls: usize,
     valid: bool,
 }
@@ -40,16 +40,16 @@ impl App<MemKV> for CountingApp {
     }
 }
 
-type TestAlgorithm = Algorithm<NullNetwork, MemKV, CountingApp>;
-struct Fixture {
-    algorithm: TestAlgorithm,
-    messages: Sender<(VerifyingKey, ProgressMessage)>,
+pub(super) type TestAlgorithm = Algorithm<NullNetwork, MemKV, CountingApp>;
+pub(super) struct Fixture {
+    pub(super) algorithm: TestAlgorithm,
+    pub(super) messages: Sender<(VerifyingKey, ProgressMessage)>,
     commands: Receiver<SyncCommand>,
     origin: VerifyingKey,
     body: Block,
 }
 
-fn fixture() -> Fixture {
+pub(super) fn fixture() -> Fixture {
     let keys = signing_keys(&[1, 2, 3, 4]);
     let set = validator_set(&keys);
     let (tree, vss) = steady_block_tree(&set);

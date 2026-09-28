@@ -92,6 +92,14 @@ pub(crate) struct HotStuff<N: Network> {
     /// Maps (view, leader) → first block hash seen from that leader in that view.
     seen_proposals: std::collections::HashMap<(ViewNumber, VerifyingKey), CryptoHash>,
     sync_needed: bool,
+    /// s74 rejoin view sync: when true, a checked header for a FUTURE view
+    /// requests a pacemaker skip to that view (see
+    /// [`take_view_skip`](Self::take_view_skip)). Read once from
+    /// `TORUS_ROUND_SKIP` (on unless `0`).
+    round_skip: bool,
+    /// s74: the header (and its authenticated origin) that requested a skip;
+    /// re-dispatched by the algorithm loop after entering its view.
+    view_skip: Option<(ProposalHeader, VerifyingKey)>,
     /// Hybrid pipelining: full blocks stored locally by the proposer after broadcasting header.
     pending_bodies: PendingBodies,
     /// Hybrid pipelining: headers received but body not yet fetched. Maps block_hash → header.
@@ -201,6 +209,8 @@ impl<N: Network> HotStuff<N> {
             ne_sent_views: HashSet::new(),
             seen_proposals: std::collections::HashMap::new(),
             sync_needed: false,
+            round_skip: round_skip_from_env(),
+            view_skip: None,
             pending_bodies: PendingBodies::new(),
             pending_headers: PendingHeaders::new(),
             body_fetch_tracker: std::collections::HashMap::new(),
@@ -233,6 +243,18 @@ impl<N: Network> HotStuff<N> {
     #[cfg(test)]
     pub(crate) fn set_defer_parent_feed(&mut self, on: bool) {
         self.defer_parent_feed = on;
+    }
+
+    /// Test-only override of the round-skip flag.
+    #[cfg(test)]
+    pub(crate) fn set_round_skip(&mut self, on: bool) {
+        self.round_skip = on;
+    }
+
+    /// s74 rejoin view sync: the checked future-view header that asks the
+    /// pacemaker to skip to its view. Taken once.
+    pub(crate) fn take_view_skip(&mut self) -> Option<(ProposalHeader, VerifyingKey)> {
+        self.view_skip.take()
     }
 
     /// s72 fix D: a parent-body insert skipped the app feed and
@@ -2122,6 +2144,23 @@ impl<N: Network> HotStuff<N> {
 
         // Vote on the header (same voting logic as on_receive_proposal).
         let validator_set_state = block_tree.validator_set_state()?;
+
+        // s74 rejoin view sync (round-skip): a replica that is BEHIND (e.g. just
+        // restarted) and has checked leader(w)'s header for a future view w
+        // (leader, integrity, safe justify, lock updated above) asks the
+        // pacemaker to enter w; the algorithm loop then re-dispatches this
+        // header, which votes through the ordinary current-view path below.
+        // A header carrying a TC/NEC never skips: this path validates neither.
+        if self.round_skip
+            && header.view > self.view_info.view
+            && header.tc.is_none()
+            && header.nec.is_none()
+            && is_phase_voter(&self.config.keypair.public(), &validator_set_state, &header.justify)
+            && block_tree.highest_view_voted()?.is_none_or(|voted| voted < header.view)
+            && self.view_skip.as_ref().is_none_or(|(kept, _)| kept.view < header.view)
+        {
+            self.view_skip = Some((header.clone(), *origin));
+        }
         if header_is_current && is_phase_voter(
             &self.config.keypair.public(),
             &validator_set_state,
@@ -3186,6 +3225,17 @@ fn defer_parent_feed_from_env() -> bool {
     *ON.get_or_init(|| parse_defer_commit_feed(std::env::var("TORUS_DEFER_PARENT_FEED").ok()))
 }
 
+/// `TORUS_ROUND_SKIP`: on by default (s74 rejoin view sync); only `0` turns it off.
+pub(crate) fn parse_round_skip(raw: Option<String>) -> bool {
+    !matches!(raw.as_deref().map(str::trim), Some("0"))
+}
+
+/// Cached env read of `TORUS_ROUND_SKIP`.
+fn round_skip_from_env() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| parse_round_skip(std::env::var("TORUS_ROUND_SKIP").ok()))
+}
+
 /// Cached env read of `TORUS_DEFER_COMMIT_FEED`.
 fn defer_commit_feed_from_env() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -3436,6 +3486,111 @@ mod sync_recovery_tests {
             chain_id: ChainID::new(0), view, block_hash: block.hash, height: block.height,
             data_hash: block.data_hash, justify: block.justify.clone(),
             tc: None, nec: None, has_validator_set_updates: false,
+        }
+    }
+
+    /// s74 rejoin view sync: a replica at `local_view` and leader(`future_view`)'s
+    /// safe header (genesis justify) for `future_view`, with round-skip on.
+    struct SkipCase {
+        hotstuff: HotStuff<crate::hotstuff::header_fast_path_regression_test::NullNetwork>,
+        tree: BlockTreeSingleton<MemKV>,
+        origin: VerifyingKey,
+        header: ProposalHeader,
+        events: std::sync::mpsc::Receiver<Event>,
+    }
+
+    fn skip_case(local_view: u64, future_view: u64) -> SkipCase {
+        use crate::hotstuff::header_fast_path_regression_test::proposer_for;
+        let keys = signing_keys(&[1, 2, 3, 4]);
+        let set = validator_set(&keys);
+        let (tree, vss) = steady_block_tree(&set);
+        let future = ViewNumber::new(future_view);
+        let origin = proposer_for(future, &keys, &vss, &tree);
+        let local = keys.iter().find(|key| key.verifying_key() != origin).unwrap().clone();
+        let mut hotstuff = hotstuff_at(ViewNumber::new(local_view), local, vss);
+        hotstuff.set_round_skip(true);
+        let (tx, events) = std::sync::mpsc::channel();
+        hotstuff.event_publisher = Some(tx);
+        let block = Block::new(BlockHeight::new(0), PhaseCertificate::genesis_pc(),
+            CryptoHash::new([94; 32]), Data::new(vec![]));
+        SkipCase { hotstuff, tree, origin, header: recovery_header(&block, future), events }
+    }
+
+    impl SkipCase {
+        fn receive(&mut self, header: ProposalHeader) {
+            let mut app = RecoveryApp { calls: 0, valid: true, reject_below: 0 };
+            self.hotstuff.on_receive_msg(header.into(), &self.origin, &mut self.tree, &mut app).unwrap();
+        }
+        fn phase_votes(&self) -> Vec<PhaseVote> {
+            self.events.try_iter().filter_map(|event| match event {
+                Event::PhaseVote(event) => Some(event.vote), _ => None,
+            }).collect()
+        }
+    }
+
+    #[test]
+    fn future_header_requests_view_skip_without_voting() {
+        let mut c = skip_case(1, 5);
+        c.receive(c.header.clone());
+        let (header, origin) = c.hotstuff.take_view_skip().expect("safe future header requests a skip");
+        assert!(header == c.header, "the checked header is kept for re-dispatch");
+        assert_eq!(origin, c.origin);
+        assert!(c.hotstuff.take_view_skip().is_none(), "the request is taken once");
+        assert_eq!(c.tree.highest_view_voted().unwrap(), None, "no vote before entering the view");
+        assert!(c.phase_votes().is_empty());
+    }
+
+    #[test]
+    fn view_skip_refused_for_tc_nec_voted_current_or_disabled() {
+        use crate::hotstuff::types::NoEndorsementCertificate;
+        use crate::pacemaker::types::TimeoutCertificate;
+        use crate::types::data_types::SignatureSet;
+
+        // The header path validates neither a TC nor an NEC: such headers never skip.
+        let mut c = skip_case(1, 5);
+        let mut with_tc = c.header.clone();
+        with_tc.tc = Some(TimeoutCertificate {
+            chain_id: ChainID::new(0), view: ViewNumber::new(4), signatures: SignatureSet::genesis(),
+            high_tip: None, high_qc: None, high_tip_is_winner: false, voter_metadata: vec![],
+        });
+        c.receive(with_tc);
+        assert!(c.hotstuff.take_view_skip().is_none(), "header with a TC");
+
+        let mut c = skip_case(1, 5);
+        let mut with_nec = c.header.clone();
+        with_nec.nec = Some(NoEndorsementCertificate {
+            view: ViewNumber::new(5), high_tip_qc_view: ViewNumber::new(3), signatures: SignatureSet::genesis(),
+        });
+        c.receive(with_nec);
+        assert!(c.hotstuff.take_view_skip().is_none(), "header with an NEC");
+
+        // Already voted at the header's view (e.g. before a crash): never again at <= w.
+        let mut c = skip_case(1, 5);
+        c.tree.set_vote_state_atomic(ViewNumber::new(5), CryptoHash::new([7; 32])).unwrap();
+        c.receive(c.header.clone());
+        assert!(c.hotstuff.take_view_skip().is_none(), "already voted at w");
+
+        // A current-view header takes the ordinary path: one vote, no skip.
+        let mut c = skip_case(5, 5);
+        c.receive(c.header.clone());
+        assert!(c.hotstuff.take_view_skip().is_none(), "current-view header");
+        assert_eq!(c.phase_votes().len(), 1);
+
+        // Kill switch off.
+        let mut c = skip_case(1, 5);
+        c.hotstuff.set_round_skip(false);
+        c.receive(c.header.clone());
+        assert!(c.hotstuff.take_view_skip().is_none(), "TORUS_ROUND_SKIP=0");
+    }
+
+    #[test]
+    fn round_skip_flag_defaults_on_and_only_zero_disables() {
+        assert!(parse_round_skip(None));
+        for value in ["1", "", "true", "yes"] {
+            assert!(parse_round_skip(Some(value.into())), "{value:?}");
+        }
+        for value in ["0", " 0 "] {
+            assert!(!parse_round_skip(Some(value.into())), "{value:?}");
         }
     }
 
