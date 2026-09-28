@@ -79,6 +79,10 @@ struct Led {
 
 /// Enter view 3 as its leader over the g <- p chain.
 fn lead_view_3(defer: bool) -> Led {
+    lead_view_3_with(defer, false)
+}
+
+fn lead_view_3_with(defer: bool, defer_parent_feed: bool) -> Led {
     let (keys, set, vss, mut block_tree, log) = base_tree();
     let g = Block::new(
         BlockHeight::new(0),
@@ -109,6 +113,7 @@ fn lead_view_3(defer: bool) -> Led {
         .clone();
     let mut leader = replica(&leader_key, &vss, &log, view);
     leader.set_defer_commit_feed(defer);
+    leader.set_defer_parent_feed(defer_parent_feed);
     let mut app = LeaderApp { log: log.clone() };
     leader
         .enter_view(
@@ -209,4 +214,17 @@ fn loopback_copy_of_inline_header_is_dropped() {
         "the loopback copy must be a silent no-op; got {:?}",
         led.log.lock().unwrap()
     );
+}
+
+/// s72 fix D only reorders the proposal retried after a skipped parent-body
+/// feed; an ordinary proposal keeps the default order with its flag on.
+#[test]
+fn parent_feed_flag_alone_keeps_default_order_for_ordinary_proposals() {
+    let led = lead_view_3_with(false, true);
+    assert!(
+        index_of(&led.events, FEED) < index_of(&led.events, BROADCAST_HEADER),
+        "got {:?}",
+        led.events
+    );
+    assert!(!led.events.contains(&SEND), "got {:?}", led.events);
 }

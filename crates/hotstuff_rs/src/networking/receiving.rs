@@ -12,6 +12,7 @@ use ed25519_dalek::VerifyingKey;
 
 use crate::{
     block_sync::messages::{BlockSyncMessage, BlockSyncRequest, BlockSyncResponse},
+    hotstuff::messages::{BlockDataRequest, HotStuffMessage},
     types::data_types::{BufferSize, ChainID, ViewNumber},
 };
 
@@ -28,19 +29,29 @@ use super::{
 /// 2. Block sync requests (processed by [`BlockSyncServer`][crate::block_sync::server::BlockSyncServer]),
 ///    and
 /// 3. Block sync responses (processed by [`BlockSyncClient`][crate::block_sync::client::BlockSyncClient]).
+///
+/// s72 option 3: with `route_block_data`, body requests go to their own
+/// channel for the [`BlockDataServer`](crate::hotstuff::block_data_server::BlockDataServer)
+/// instead of the progress channel. The last return value is a sender into the
+/// progress channel, for the server to hand misses to the algorithm thread.
 #[allow(clippy::type_complexity)]
 pub(crate) fn start_polling<N: Network + 'static>(
     mut network: N,
     shutdown_signal: Receiver<()>,
+    route_block_data: bool,
 ) -> (
     JoinHandle<()>,
     Receiver<(VerifyingKey, ProgressMessage)>,
     Receiver<(VerifyingKey, BlockSyncRequest)>,
     Receiver<(VerifyingKey, BlockSyncResponse)>,
+    Receiver<(VerifyingKey, BlockDataRequest)>,
+    mpsc::Sender<(VerifyingKey, ProgressMessage)>,
 ) {
     let (to_progress_msg_receiver, progress_msg_receiver) = mpsc::channel();
     let (to_sync_request_receiver, sync_request_receiver) = mpsc::channel();
     let (to_sync_response_receiver, sync_response_receiver) = mpsc::channel();
+    let (to_block_data_receiver, block_data_receiver) = mpsc::channel();
+    let progress_fallback = to_progress_msg_receiver.clone();
 
     let poller_thread = thread::spawn(move || loop {
         match shutdown_signal.try_recv() {
@@ -53,6 +64,18 @@ pub(crate) fn start_polling<N: Network + 'static>(
 
         if let Some((origin, msg)) = network.recv() {
             match msg {
+                Message::ProgressMessage(ProgressMessage::HotStuffMessage(
+                    HotStuffMessage::BlockDataRequest(req),
+                )) if route_block_data => {
+                    // If the server thread is gone, serve on the algorithm
+                    // thread as before rather than drop the request.
+                    if let Err(mpsc::SendError((origin, req))) =
+                        to_block_data_receiver.send((origin, req))
+                    {
+                        let _ = to_progress_msg_receiver
+                            .send((origin, HotStuffMessage::from(req).into()));
+                    }
+                }
                 Message::ProgressMessage(p_msg) => {
                     let _ = to_progress_msg_receiver.send((origin, p_msg));
                 }
@@ -77,11 +100,12 @@ pub(crate) fn start_polling<N: Network + 'static>(
         progress_msg_receiver,
         sync_request_receiver,
         sync_response_receiver,
+        block_data_receiver,
+        progress_fallback,
     )
 }
 
 fn is_chain_neutral_genesis_body(message: &ProgressMessage) -> bool {
-    use crate::hotstuff::messages::HotStuffMessage;
     use crate::types::block::Block;
     // Legacy body responses have no outer chain ID; they derive it from the
     // justify. The universal genesis PC deliberately carries chain 0, even on
@@ -491,6 +515,124 @@ impl BlockSyncServerStub {
 pub enum BlockSyncRequestReceiveError {
     Disconnected,
     NotAvailable,
+}
+
+#[cfg(test)]
+mod poller_routes_tests {
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use super::*;
+    use crate::hotstuff::messages::{BlockDataRequest, HotStuffMessage, ProposalHeader};
+    use crate::hotstuff::types::PhaseCertificate;
+    use crate::types::data_types::{BlockHeight, CryptoHash};
+    use crate::types::update_sets::ValidatorSetUpdates;
+    use crate::types::validator_set::ValidatorSet;
+
+    /// Hands out queued messages from `recv`.
+    #[derive(Clone, Default)]
+    struct QueueNet(Arc<Mutex<VecDeque<(VerifyingKey, Message)>>>);
+
+    impl Network for QueueNet {
+        fn init_validator_set(&mut self, _validator_set: ValidatorSet) {}
+        fn update_validator_set(&mut self, _updates: ValidatorSetUpdates) {}
+        fn broadcast(&mut self, _message: Message) {}
+        fn send(&mut self, _peer: VerifyingKey, _message: Message) {}
+        fn recv(&mut self) -> Option<(VerifyingKey, Message)> {
+            self.0.lock().unwrap().pop_front()
+        }
+    }
+
+    fn peer() -> VerifyingKey {
+        ed25519_dalek::SigningKey::from_bytes(&[3; 32]).verifying_key()
+    }
+
+    fn request() -> BlockDataRequest {
+        BlockDataRequest {
+            chain_id: ChainID::new(0),
+            view: ViewNumber::new(4),
+            block_hash: CryptoHash::new([5; 32]),
+        }
+    }
+
+    fn header() -> HotStuffMessage {
+        ProposalHeader {
+            chain_id: ChainID::new(0),
+            view: ViewNumber::new(4),
+            block_hash: CryptoHash::new([6; 32]),
+            height: BlockHeight::new(0),
+            data_hash: CryptoHash::new([0; 32]),
+            justify: PhaseCertificate::genesis_pc(),
+            tc: None,
+            nec: None,
+            has_validator_set_updates: false,
+        }
+        .into()
+    }
+
+    fn queued() -> QueueNet {
+        let net = QueueNet::default();
+        for msg in [HotStuffMessage::from(request()), header()] {
+            net.0
+                .lock()
+                .unwrap()
+                .push_back((peer(), Message::ProgressMessage(msg.into())));
+        }
+        net
+    }
+
+    const WAIT: Duration = Duration::from_secs(5);
+
+    #[test]
+    fn poller_routes_block_data_requests_to_their_own_channel() {
+        let (shutdown, shutdown_rx) = mpsc::channel();
+        let (poller, progress, _sync_req, _sync_resp, block_data, _fallback) =
+            start_polling(queued(), shutdown_rx, true);
+        let (_, req) = block_data.recv_timeout(WAIT).expect("request routed to the server");
+        assert!(req == request());
+        let (_, msg) = progress.recv_timeout(WAIT).expect("header on the progress channel");
+        assert!(matches!(msg, ProgressMessage::HotStuffMessage(HotStuffMessage::ProposalHeader(_))));
+        assert!(progress.recv_timeout(Duration::from_millis(100)).is_err(), "the request must not also reach progress");
+        shutdown.send(()).unwrap();
+        poller.join().unwrap();
+    }
+
+    #[test]
+    fn poller_falls_back_to_progress_when_the_server_is_gone() {
+        let net = QueueNet::default();
+        let (shutdown, shutdown_rx) = mpsc::channel();
+        let (poller, progress, _sync_req, _sync_resp, block_data, fallback) =
+            start_polling(net.clone(), shutdown_rx, true);
+        drop(block_data);
+        net.0.lock().unwrap().push_back((
+            peer(),
+            Message::ProgressMessage(HotStuffMessage::from(request()).into()),
+        ));
+        let (_, msg) = progress.recv_timeout(WAIT).expect("request served on the algo path");
+        assert!(matches!(msg, ProgressMessage::HotStuffMessage(HotStuffMessage::BlockDataRequest(_))));
+        // The returned fallback sender feeds the same progress channel.
+        fallback
+            .send((peer(), HotStuffMessage::from(request()).into()))
+            .unwrap();
+        assert!(progress.recv_timeout(WAIT).is_ok());
+        shutdown.send(()).unwrap();
+        poller.join().unwrap();
+    }
+
+    #[test]
+    fn poller_keeps_block_data_requests_on_progress_when_off() {
+        let (shutdown, shutdown_rx) = mpsc::channel();
+        let (poller, progress, _sync_req, _sync_resp, block_data, _fallback) =
+            start_polling(queued(), shutdown_rx, false);
+        let (_, first) = progress.recv_timeout(WAIT).expect("request on progress");
+        assert!(matches!(first, ProgressMessage::HotStuffMessage(HotStuffMessage::BlockDataRequest(_))));
+        let (_, second) = progress.recv_timeout(WAIT).expect("header on progress");
+        assert!(matches!(second, ProgressMessage::HotStuffMessage(HotStuffMessage::ProposalHeader(_))));
+        assert!(block_data.recv_timeout(Duration::from_millis(100)).is_err());
+        shutdown.send(()).unwrap();
+        poller.join().unwrap();
+    }
 }
 
 #[cfg(test)]

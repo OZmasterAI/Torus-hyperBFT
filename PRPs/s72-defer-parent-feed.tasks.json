@@ -1,0 +1,30 @@
+{
+  "prp": "s72-defer-parent-feed",
+  "created": "2026-09-27T22:30:00",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Failing tests for parent-body feed order",
+      "status": "pending",
+      "files": ["crates/hotstuff_rs/src/hotstuff/parent_feed_order_test.rs", "crates/hotstuff_rs/src/hotstuff/mod.rs"],
+      "validate": "cargo test -p hotstuff_rs parent_feed_order",
+      "depends_on": []
+    },
+    {
+      "id": 2,
+      "name": "Flag, pending bit and deferral in try_insert_body",
+      "status": "pending",
+      "files": ["crates/hotstuff_rs/src/hotstuff/implementation.rs"],
+      "validate": "cargo test -p hotstuff_rs feed_order",
+      "depends_on": [1]
+    },
+    {
+      "id": 3,
+      "name": "Flush pending feed from the algo loop",
+      "status": "pending",
+      "files": ["crates/hotstuff_rs/src/algorithm.rs"],
+      "validate": "cargo test -p hotstuff_rs -- --test-threads=1",
+      "depends_on": [2]
+    }
+  ]
+}
