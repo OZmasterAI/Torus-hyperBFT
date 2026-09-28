@@ -56,6 +56,12 @@ pub struct StateDb {
 ///   memtables and stops at `n`).
 /// - `TORUS_ROCKSDB_PIPELINED_WRITE` — `enable_pipelined_write` (WAL and
 ///   memtable stages of consecutive write groups overlap; default off).
+/// - `TORUS_ROCKSDB_MAX_TOTAL_WAL_MB` — whole-MiB WAL flush trigger (default
+///   512; invalid values fall back to it). `0` restores RocksDB's automatic
+///   threshold (4x aggregate CF buffer capacity, ~86 GiB here), under which a
+///   cold CF pins every WAL segment since open: s74 crash A/B, restart DB open
+///   20.5 s -> 7.9 s. A soft flush trigger, not a hard disk limit; WAL
+///   durability is unchanged.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DbTuning {
     pub stats_level: u8,
@@ -63,6 +69,7 @@ pub struct DbTuning {
     pub l0_stop_trigger: Option<i32>,
     pub max_write_buffer_number: i32,
     pub pipelined_write: bool,
+    pub max_total_wal_size: Option<u64>,
 }
 
 impl Default for DbTuning {
@@ -75,13 +82,21 @@ impl DbTuning {
     /// Read every knob from the environment (once, at DB open).
     pub fn from_env() -> Self {
         let v = |k: &str| std::env::var(k).ok();
-        Self::from_raw(
+        let mut tuning = Self::from_raw(
             v("TORUS_ROCKSDB_STATS"),
             v("TORUS_ROCKSDB_L0_SLOWDOWN"),
             v("TORUS_ROCKSDB_L0_STOP"),
             v("TORUS_ROCKSDB_MAX_WRITE_BUFFERS"),
             v("TORUS_ROCKSDB_PIPELINED_WRITE"),
-        )
+        );
+        let raw = v("TORUS_ROCKSDB_MAX_TOTAL_WAL_MB");
+        tuning.max_total_wal_size = parse_max_total_wal_mib(raw.as_deref());
+        if let Some(value) = raw.as_deref() {
+            if valid_wal_mib(value).is_none() {
+                tracing::warn!(value, "invalid TORUS_ROCKSDB_MAX_TOTAL_WAL_MB; using the {DEFAULT_MAX_TOTAL_WAL_MIB} MiB default");
+            }
+        }
+        tuning
     }
 
     /// Pure parse of the raw env strings (unit-testable without touching
@@ -109,8 +124,27 @@ impl DbTuning {
                 pipelined.as_deref().map(str::trim),
                 Some("1" | "true" | "TRUE" | "yes" | "on")
             ),
+            max_total_wal_size: parse_max_total_wal_mib(None),
         }
     }
+}
+
+pub const DEFAULT_MAX_TOTAL_WAL_MIB: u64 = 512;
+
+/// `max_total_wal_size` in bytes: unset or invalid => the 512 MiB default,
+/// `0` => None (RocksDB's automatic threshold), N => N MiB (checked).
+pub fn parse_max_total_wal_mib(raw: Option<&str>) -> Option<u64> {
+    let mib = raw.and_then(valid_wal_mib).unwrap_or(DEFAULT_MAX_TOTAL_WAL_MIB);
+    Some(mib << 20).filter(|&bytes| bytes > 0)
+}
+
+/// ASCII digits whose MiB value fits in u64 bytes; anything else is invalid.
+fn valid_wal_mib(raw: &str) -> Option<u64> {
+    let raw = raw.trim();
+    if raw.is_empty() || !raw.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    raw.parse::<u64>().ok().filter(|&mib| mib.checked_mul(1 << 20).is_some())
 }
 
 /// Pure parse of `TORUS_ROCKSDB_STATS`: unset / garbage => 1 (tickers only),
@@ -224,6 +258,9 @@ impl StateDb {
         }
         if tuning.pipelined_write {
             opts.set_enable_pipelined_write(true);
+        }
+        if let Some(bytes) = tuning.max_total_wal_size.filter(|&bytes| bytes > 0) {
+            opts.set_max_total_wal_size(bytes);
         }
         // DB-wide: parallelize flush/compaction and smooth fsync spikes during
         // heavy block writes. (Stock defaults run only 2 background jobs.)
@@ -1202,6 +1239,7 @@ mod sync_wal_tests {
             l0_stop_trigger: Some(64),
             max_write_buffer_number: 6,
             pipelined_write: true,
+            max_total_wal_size: None,
         };
         {
             let db = StateDb::open_with_tuning(dir.path(), &t).expect("open");
