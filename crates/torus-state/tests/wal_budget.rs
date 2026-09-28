@@ -19,13 +19,17 @@ const MIB: u64 = 1 << 20;
 const ROWS: u64 = 64;
 const VALUE_BYTES: usize = 64 * 1024;
 
+const DEFAULT: Option<u64> = Some(512 * MIB);
+
 #[test]
-fn wal_budget_parser_preserves_defaults_and_checks_overflow() {
-    assert_eq!(DbTuning::default().max_total_wal_size, None);
-    assert_eq!(parse_max_total_wal_mib(None), None);
+fn wal_budget_parser_defaults_to_512_mib_and_checks_overflow() {
+    // s74 crash A/B: unset caps the WAL at 512 MiB; explicit 0 opts out.
+    assert_eq!(DbTuning::default().max_total_wal_size, DEFAULT);
+    assert_eq!(parse_max_total_wal_mib(None), DEFAULT);
+    for value in ["0", "000", " 0 "] {
+        assert_eq!(parse_max_total_wal_mib(Some(value)), None, "{value}");
+    }
     for value in [
-        "0",
-        "000",
         "",
         "-1",
         "+1",
@@ -35,7 +39,7 @@ fn wal_budget_parser_preserves_defaults_and_checks_overflow() {
         "18446744073709551615",
         "17592186044416",
     ] {
-        assert_eq!(parse_max_total_wal_mib(Some(value)), None, "{value}");
+        assert_eq!(parse_max_total_wal_mib(Some(value)), DEFAULT, "{value}");
     }
     assert_eq!(parse_max_total_wal_mib(Some(" 1024 ")), Some(1024 * MIB));
     assert_eq!(
@@ -77,6 +81,9 @@ fn wal_budget_unset_zero_and_explicit_options_are_persisted() {
         let _db = StateDb::open_with_tuning(dir.path(), &tuning).unwrap();
         assert_eq!(persisted_wal_option(dir.path()), expected);
     }
+    let dir = tempfile::tempdir().unwrap();
+    let _db = StateDb::open_with_tuning(dir.path(), &DbTuning::default()).unwrap();
+    assert_eq!(persisted_wal_option(dir.path()), 512 * MIB);
 }
 
 fn cold_sst_bytes(db: &StateDb) -> u64 {
