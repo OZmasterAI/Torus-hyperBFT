@@ -180,3 +180,40 @@ compare it on one binary.
 3. **Kill-switch plumbing.** Is it a `hotstuff_rs` `Configuration` field set
    by `torus-node` from env, or read directly? Follow how
    `TORUS_BODY_SERVE_THREAD` and `TORUS_DEFER_PARENT_FEED` are wired.
+
+## Review follow-up (s74, commit after 1da934e)
+
+The read-only review of 1da934e found no safety issue. Changes made:
+
+- **M1 (liveness at n≥4).** `Pacemaker::skip_to_view` now refuses skips of
+  more than `MAX_ROUND_SKIP_VIEWS = 16` views. The rejoin gap was 4 views in
+  the crash cells. This bounds how far the leader of a far-future view (which
+  may be Byzantine at n≥4) can pull an honest replica.
+- **M2 (weak model).** The stateright model now has these features:
+  - vote decide, persist and send are separate steps, with crashes allowed
+    between them;
+  - `highest_view_entered` persistence can lag, so a restart can come back at
+    or below a voted view;
+  - delivery is block-aware;
+  - the mutation is send-before-persist, which is caught.
+
+  The regular suite explores to depth 12. An `--ignored` exhaustive check
+  (MAX_VIEW 3, 1 crash) passed in about 390 s.
+- **L1.** A repeat header from the same leader no longer moves
+  `proposal_status` from `OneLeaderProposed` to `AllLeadersProposed`, at both
+  header-path sites.
+- **L2.** If `enter_view` fails after HotStuff already took view w, the
+  header is still re-dispatched.
+- **Nits.**
+  - `take_sync_needed` is now handled after the re-dispatch.
+  - The ineffective `view_skip` condition is removed.
+  - The test comments are corrected.
+- **Not changed.**
+  - L3: a timeout vote and then a phase vote at w. This is not a safety issue
+    under the lock-based `safe_pc`, and it already happens within a view.
+  - The duplicate body re-request on a repeated header is a pre-existing,
+    performance-only issue.
+
+**Note (review):** the skip also fires in the healthy case. When leader(v+1)'s
+header arrives before AdvanceView(QC(v)), its justify is QC(v), so the skip
+is harmless and saves a round trip.

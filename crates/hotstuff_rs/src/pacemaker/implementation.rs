@@ -663,8 +663,8 @@ impl<N: Network> Pacemaker<N> {
     /// HotStuff checked leader(`view`)'s header for it (see
     /// `HotStuff::take_view_skip`). Same arguments and deadline rules as the
     /// AdvanceView path. Returns `false` (nothing changes) unless `view` is
-    /// ahead of the current view and in the same epoch: leaving an epoch
-    /// needs a certificate.
+    /// ahead of the current view, at most [`MAX_ROUND_SKIP_VIEWS`] ahead, and
+    /// in the same epoch: leaving an epoch needs a certificate.
     pub(crate) fn skip_to_view(
         &mut self,
         view: ViewNumber,
@@ -674,6 +674,7 @@ impl<N: Network> Pacemaker<N> {
     ) -> Result<bool, PacemakerError> {
         let cur_view = self.view_info.view;
         if view <= cur_view
+            || view.int() - cur_view.int() > MAX_ROUND_SKIP_VIEWS
             || epoch(cur_view, self.config.epoch_length) != epoch(view, self.config.epoch_length)
         {
             return Ok(false);
@@ -1267,6 +1268,13 @@ fn commit_lag_exponent(
         .min(cap as u64) as u32
 }
 
+/// s74 rejoin view sync: the furthest a checked future-view header may pull a
+/// replica ahead. A rejoining node trails the survivors by a few views (4 in
+/// the s64/s74 crash cells); the bound keeps the leader of a far-future view,
+/// which may be Byzantine at n >= 4, from parking an honest replica far ahead
+/// of the rest (liveness; safety never depended on it).
+pub(crate) const MAX_ROUND_SKIP_VIEWS: u64 = 16;
+
 /// Check whether `view` is an epoch-change view given the configured `epoch_length`.
 /// FIX CONS-FIND-20: Guard against epoch_length=0 to prevent division by zero.
 fn is_epoch_change_view(view: &ViewNumber, epoch_length: EpochLength) -> bool {
@@ -1543,6 +1551,18 @@ fn skip_to_view_refuses_non_increasing_and_cross_epoch() {
             .unwrap());
         assert_eq!(pacemaker.query().view, ViewNumber::new(610));
     }
+
+    // Bounded distance: a leader of a far-future view cannot pull us arbitrarily
+    // far ahead (liveness at n >= 4, where such a leader may be Byzantine).
+    let (mut pacemaker, vss) = test_pacemaker(610);
+    let too_far = 610 + MAX_ROUND_SKIP_VIEWS + 1;
+    assert!(!pacemaker
+        .skip_to_view(ViewNumber::new(too_far), &vss, ViewNumber::new(609), ViewNumber::new(609))
+        .unwrap());
+    assert_eq!(pacemaker.query().view, ViewNumber::new(610));
+    assert!(pacemaker
+        .skip_to_view(ViewNumber::new(610 + MAX_ROUND_SKIP_VIEWS), &vss, ViewNumber::new(609), ViewNumber::new(609))
+        .unwrap());
 
     // 100k-view epochs: 99_991..=100_000 is epoch 1, 100_001 starts epoch 2.
     let (mut pacemaker, vss) = test_pacemaker(99_990);

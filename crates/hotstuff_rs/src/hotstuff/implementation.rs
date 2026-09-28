@@ -2117,7 +2117,9 @@ impl<N: Network> HotStuff<N> {
                     ProposalStatus::WaitingForProposal => {
                         self.proposal_status = ProposalStatus::OneLeaderProposed { leader: *origin }
                     }
-                    ProposalStatus::OneLeaderProposed { leader: _ } => {
+                    // A repeat from the same leader (re-dispatch after a round-skip, buffer
+                    // replay, retransmission) is not a second leader (s74).
+                    ProposalStatus::OneLeaderProposed { leader } if leader != *origin => {
                         self.proposal_status = ProposalStatus::AllLeadersProposed
                     }
                     _ => {}
@@ -2157,7 +2159,6 @@ impl<N: Network> HotStuff<N> {
             && header.nec.is_none()
             && is_phase_voter(&self.config.keypair.public(), &validator_set_state, &header.justify)
             && block_tree.highest_view_voted()?.is_none_or(|voted| voted < header.view)
-            && self.view_skip.as_ref().is_none_or(|(kept, _)| kept.view < header.view)
         {
             self.view_skip = Some((header.clone(), *origin));
         }
@@ -2255,7 +2256,9 @@ impl<N: Network> HotStuff<N> {
                 ProposalStatus::WaitingForProposal => {
                     self.proposal_status = ProposalStatus::OneLeaderProposed { leader: *origin }
                 }
-                ProposalStatus::OneLeaderProposed { leader: _ } => {
+                // A repeat from the same leader (re-dispatch after a round-skip, buffer
+                // replay, retransmission) is not a second leader (s74).
+                ProposalStatus::OneLeaderProposed { leader } if leader != *origin => {
                     self.proposal_status = ProposalStatus::AllLeadersProposed
                 }
                 _ => {}
@@ -3564,11 +3567,14 @@ mod sync_recovery_tests {
         c.receive(with_nec);
         assert!(c.hotstuff.take_view_skip().is_none(), "header with an NEC");
 
-        // Already voted at the header's view (e.g. before a crash): never again at <= w.
-        let mut c = skip_case(1, 5);
-        c.tree.set_vote_state_atomic(ViewNumber::new(5), CryptoHash::new([7; 32])).unwrap();
-        c.receive(c.header.clone());
-        assert!(c.hotstuff.take_view_skip().is_none(), "already voted at w");
+        // Already voted at (or above) the header's view, e.g. before a crash:
+        // never again at <= w.
+        for voted in [5, 6] {
+            let mut c = skip_case(1, 5);
+            c.tree.set_vote_state_atomic(ViewNumber::new(voted), CryptoHash::new([7; 32])).unwrap();
+            c.receive(c.header.clone());
+            assert!(c.hotstuff.take_view_skip().is_none(), "already voted at {voted} >= w");
+        }
 
         // A current-view header takes the ordinary path: one vote, no skip.
         let mut c = skip_case(5, 5);
@@ -3581,6 +3587,22 @@ mod sync_recovery_tests {
         c.hotstuff.set_round_skip(false);
         c.receive(c.header.clone());
         assert!(c.hotstuff.take_view_skip().is_none(), "TORUS_ROUND_SKIP=0");
+    }
+
+    /// After a round-skip the same leader's header arrives at the current view
+    /// more than once (re-dispatch, receive-buffer replay, retransmission). A
+    /// repeat from the SAME leader must not count as a second leader, or a
+    /// two-leader (validator-set transition) view would drop the other
+    /// leader's proposal as `AllLeadersProposed`.
+    #[test]
+    fn duplicate_header_from_same_leader_is_not_a_second_leader() {
+        let mut c = skip_case(5, 5);
+        c.receive(c.header.clone());
+        c.receive(c.header.clone());
+        assert!(
+            matches!(c.hotstuff.proposal_status, ProposalStatus::OneLeaderProposed { leader } if leader == c.origin),
+            "a repeated header from one leader leaves OneLeaderProposed"
+        );
     }
 
     #[test]

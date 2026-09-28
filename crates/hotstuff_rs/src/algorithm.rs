@@ -406,16 +406,24 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
         }
         let view_info = self.pacemaker.query().clone();
         if let Err(e) = self.hotstuff.enter_view(view_info, &mut self.block_tree, &mut self.app) {
-            // The loop retries enter_view (is_view_outdated); the receive
-            // buffer still holds this header for view w.
             log::error!("round-skip: HotStuff enter_view({}) error: {:?}", view.int(), e);
-            return;
+            // A failure after HotStuff already took view w still lets the
+            // header vote below; otherwise the loop retries enter_view
+            // (is_view_outdated) and the receive buffer holds the header.
+            if self.hotstuff.is_view_outdated(self.pacemaker.query()) {
+                return;
+            }
         }
         if let Err(e) =
             self.hotstuff
                 .on_receive_msg(header.into(), &origin, &mut self.block_tree, &mut self.app)
         {
             log::error!("round-skip: header re-dispatch (view {}) error: {:?}", view.int(), e);
+        }
+        if self.hotstuff.take_sync_needed() {
+            if let Err(e) = self.block_sync_client.trigger_sync(&mut self.block_tree) {
+                log::error!("BlockSync trigger_sync error: {:?}", e);
+            }
         }
     }
 

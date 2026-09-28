@@ -135,8 +135,11 @@ fn rejoining_replica_skips_to_leader_header_and_votes_once() {
     assert_eq!((votes[0].view, votes[0].block), (w, header.block_hash));
     assert_eq!(r.f.algorithm.block_tree.highest_view_voted().unwrap(), Some(w));
 
-    // The receive buffer's cached copy, a retransmission, a stale header for
-    // w-1 and a conflicting header at w from the same leader: never again <= w.
+    // Never again <= w. The retransmission is refused by the persisted
+    // voted-view guard (same block, so equivocation detection does not fire);
+    // the conflicting header at w by equivocation detection; the w-1 header
+    // by being stale. The first poll drains the receive buffer's cached copy
+    // of the header, if any (same guard as the retransmission).
     r.poll();
     r.deliver(origin, header.clone());
     let stale = ViewNumber::new(w.int() - 1);
