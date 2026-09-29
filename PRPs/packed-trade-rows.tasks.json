@@ -1,0 +1,13 @@
+{
+  "prp": "packed-trade-rows",
+  "created": "2026-09-30T01:00:00+02:00",
+  "tasks": [
+    {"id": 1, "name": "torus-state trade_rows codec", "status": "pending", "files": ["crates/torus-state/src/trade_rows.rs", "crates/torus-state/src/lib.rs"], "validate": "cargo test --release -p torus-state trade_rows", "depends_on": []},
+    {"id": 2, "name": "executor collects TradeFill records per block", "status": "pending", "files": ["crates/torus-bridge/src/native_executor.rs", "crates/torus-bridge/tests/trade_defer_tests.rs", "crates/torus-bridge/src/trade_kvs_tests.rs", "crates/torus-bridge/src/cancel_batch_exec_tests.rs", "tools/bench-throughput/src/main.rs"], "validate": "cargo test --release -p torus-bridge", "depends_on": [1]},
+    {"id": 3, "name": "bg_writer encode closure off exec thread", "status": "pending", "files": ["crates/torus-state/src/bg_writer.rs"], "validate": "cargo test --release -p torus-state bg_writer", "depends_on": []},
+    {"id": 4, "name": "app.rs block-end hand-off", "status": "pending", "files": ["crates/torus-consensus/src/app.rs"], "validate": "cargo test --release -p torus-consensus", "depends_on": [1, 2, 3]},
+    {"id": 5, "name": "format marker + wipe before replay", "status": "pending", "files": ["crates/torus-consensus/src/app.rs", "crates/torus-state/src/cf.rs"], "validate": "cargo test --release -p torus-consensus trade_history_format", "depends_on": [1]},
+    {"id": 6, "name": "RPC readers decode packed rows", "status": "pending", "files": ["crates/torus-rpc/src/torus.rs", "crates/torus-rpc/src/lib.rs"], "validate": "cargo test --release -p torus-rpc", "depends_on": [1]},
+    {"id": 7, "name": "workspace tests + full-load cell", "status": "pending", "files": [], "validate": "cargo test --release --workspace", "depends_on": [2, 3, 4, 5, 6]}
+  ]
+}
